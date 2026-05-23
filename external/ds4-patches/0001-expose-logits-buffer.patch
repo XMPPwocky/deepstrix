@@ -1,0 +1,34 @@
+diff --git a/ds4.c b/ds4.c
+index 51410e3..26745c1 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -17462,6 +17462,14 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
+     return k;
+ }
+ 
++/* deepstrix patch: full-vocab logits accessor. */
++int ds4_session_logits_buffer(ds4_session *s, const float **out_ptr, int *out_n) {
++    if (!s || !out_ptr || !out_n) return 0;
++    *out_ptr = s->logits;
++    *out_n = (int)DS4_N_VOCAB;
++    return 1;
++}
++
+ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
+     if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
+ 
+diff --git a/ds4.h b/ds4.h
+index 950d8dc..2ba1083 100644
+--- a/ds4.h
++++ b/ds4.h
+@@ -168,6 +168,10 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
+ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
+ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
++/* deepstrix patch: expose the raw logits buffer for full-vocab dumps.
++ * Sets *out_ptr to the live logits vector and *out_n to vocab size.
++ * Pointer is valid until the next session evaluation. */
++int ds4_session_logits_buffer(ds4_session *s, const float **out_ptr, int *out_n);
+ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+                                         int max_tokens, int eos_token,
