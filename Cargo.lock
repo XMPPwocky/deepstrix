@@ -307,6 +307,8 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "color-eyre",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "v4flash-hip",
