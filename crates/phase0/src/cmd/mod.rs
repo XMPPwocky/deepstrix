@@ -1,4 +1,5 @@
 pub mod gate_a;
+pub mod gate_b;
 pub mod gate_c;
 pub mod gate_d;
 pub mod gate_e;

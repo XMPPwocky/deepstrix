@@ -54,6 +54,10 @@ enum Cmd {
         #[arg(long, default_value_t = 50)]
         iterations: u32,
     },
+    /// Gate B: gfx1100 binary vs gfx1151 native on Strix iGPU.
+    GateB,
+    #[command(hide = true)]
+    GateBProbe,
 }
 
 fn main() -> eyre::Result<()> {
@@ -73,5 +77,7 @@ fn main() -> eyre::Result<()> {
         Cmd::GateC { iterations } => cmd::gate_c::run(iterations),
         Cmd::GateE { iterations } => cmd::gate_e::run(iterations),
         Cmd::GateD { iterations } => cmd::gate_d::run(iterations),
+        Cmd::GateB => cmd::gate_b::run(),
+        Cmd::GateBProbe => cmd::gate_b::probe_to_stdout(),
     }
 }

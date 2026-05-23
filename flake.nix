@@ -42,7 +42,7 @@
           export HIP_CLANG_PATH=${rocm.llvm.clang}/bin
           export HIP_DEVICE_LIB_PATH=${rocm.rocm-device-libs}/amdgcn/bitcode
           export HIPCC=${rocm.hipcc}/bin/hipcc
-          export DEEPSTRIX_GFX_TARGETS="gfx1201 gfx1151"
+          export DEEPSTRIX_GFX_TARGETS="gfx1201 gfx1151 gfx1100"
           echo "deepstrix dev shell — ROCm ${rocm.clr.version}, hipcc ${rocm.hipcc.version}, rustc $(rustc --version)"
           echo "Devices:" && rocminfo 2>/dev/null | grep -E '^\s*Name:\s*gfx' | sort -u || echo "  rocminfo failed — check /dev/kfd"
         '';
