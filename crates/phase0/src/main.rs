@@ -27,18 +27,28 @@ enum Cmd {
         #[arg(long, default_value_t = 1000)]
         iterations: u32,
     },
-    // Gate-A/B/C/D/E land in later commits.
+    /// Gate A: HSA_OVERRIDE_GFX_VERSION compatibility with dual-device
+    /// process. Spawns child probes per-config.
+    GateA,
+    /// Internal: emit a single ToolchainReport to stdout as JSON. Used by
+    /// `gate-a` to read env-dependent state from a fresh process.
+    #[command(hide = true)]
+    GateAProbe,
 }
 
 fn main() -> eyre::Result<()> {
     v4flash_hip::install_panic_handler()?;
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Toolchain => cmd::toolchain::run(),
         Cmd::Pingpong { iterations } => cmd::pingpong::run(iterations),
+        Cmd::GateA => cmd::gate_a::run(),
+        Cmd::GateAProbe => cmd::gate_a::probe_to_stdout(),
     }
 }

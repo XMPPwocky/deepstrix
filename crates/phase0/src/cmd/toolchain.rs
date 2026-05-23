@@ -6,12 +6,15 @@
 //! - Embedded hsaco load test: load `hello` for each device's reported arch,
 //!   launch it, verify it writes 42. This is the "does --genco produce blobs
 //!   hipModuleLoadData accepts" check from the design doc's Phase 0 list.
+//!
+//! `collect_report` is the reusable core; `run` prints + writes JSON to
+//! `results/`; gate_a's probe subcommand emits JSON to stdout instead.
 
 use std::env;
 use std::ffi::c_void;
 
 use color_eyre::eyre::{self, eyre};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use v4flash_hip::{Device, DeviceBuffer, Event, LaunchConfig, Module, Stream};
 
 use crate::results;
@@ -19,15 +22,15 @@ use crate::results;
 const HELLO_GFX1201: &[u8] = include_bytes!(env!("KERNEL_HELLO_GFX1201"));
 const HELLO_GFX1151: &[u8] = include_bytes!(env!("KERNEL_HELLO_GFX1151"));
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ToolchainReport {
-    pub gate: &'static str,
+    pub gate: String,
     pub timestamp: u64,
     pub env: Env,
     pub devices: Vec<DeviceReport>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Env {
     pub hsa_override_gfx_version: Option<String>,
     pub hip_visible_devices: Option<String>,
@@ -38,7 +41,7 @@ pub struct Env {
     pub hipcc: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct DeviceReport {
     pub id: i32,
     pub name: String,
@@ -61,7 +64,9 @@ pub struct DeviceReport {
     pub hello_kernel_error: Option<String>,
 }
 
-pub fn run() -> eyre::Result<()> {
+/// Collect the report. `verbose` toggles human-readable stdout printing
+/// — set false when emitting JSON to stdout (e.g. gate-a probes).
+pub fn collect_report(verbose: bool) -> eyre::Result<ToolchainReport> {
     let env = Env {
         hsa_override_gfx_version: env::var("HSA_OVERRIDE_GFX_VERSION").ok(),
         hip_visible_devices: env::var("HIP_VISIBLE_DEVICES").ok(),
@@ -72,16 +77,20 @@ pub fn run() -> eyre::Result<()> {
         hipcc: env::var("HIPCC").ok(),
     };
 
-    println!("== environment ==");
-    println!("HSA_OVERRIDE_GFX_VERSION = {:?}", env.hsa_override_gfx_version);
-    println!("HIP_VISIBLE_DEVICES      = {:?}", env.hip_visible_devices);
-    println!("ROCR_VISIBLE_DEVICES     = {:?}", env.rocr_visible_devices);
-    println!("GPU_DEVICE_ORDINAL       = {:?}", env.gpu_device_ordinal);
-    println!("ROCM_PATH                = {:?}", env.rocm_path);
-    println!("HIPCC                    = {:?}", env.hipcc);
+    if verbose {
+        println!("== environment ==");
+        println!("HSA_OVERRIDE_GFX_VERSION = {:?}", env.hsa_override_gfx_version);
+        println!("HIP_VISIBLE_DEVICES      = {:?}", env.hip_visible_devices);
+        println!("ROCR_VISIBLE_DEVICES     = {:?}", env.rocr_visible_devices);
+        println!("GPU_DEVICE_ORDINAL       = {:?}", env.gpu_device_ordinal);
+        println!("ROCM_PATH                = {:?}", env.rocm_path);
+        println!("HIPCC                    = {:?}", env.hipcc);
+    }
 
     let devices = Device::all()?;
-    println!("\n== devices ({}) ==", devices.len());
+    if verbose {
+        println!("\n== devices ({}) ==", devices.len());
+    }
 
     let mut device_reports = Vec::new();
     for dev in &devices {
@@ -108,21 +117,23 @@ pub fn run() -> eyre::Result<()> {
             hello_kernel_error: None,
         };
 
-        println!(
-            "[{}] {:?} ({}) — {} MiB, {} MPC, integrated={}, pci={:04x}:{:02x}:{:02x}, cc={}.{}, clock={:.0}MHz",
-            dev.id,
-            props.name,
-            props.gcn_arch_name,
-            report.total_global_mem_mib,
-            props.multi_processor_count,
-            props.integrated,
-            props.pci_domain_id,
-            props.pci_bus_id,
-            props.pci_device_id,
-            props.major,
-            props.minor,
-            report.clock_rate_mhz,
-        );
+        if verbose {
+            println!(
+                "[{}] {:?} ({}) — {} MiB, {} MPC, integrated={}, pci={:04x}:{:02x}:{:02x}, cc={}.{}, clock={:.0}MHz",
+                dev.id,
+                props.name,
+                props.gcn_arch_name,
+                report.total_global_mem_mib,
+                props.multi_processor_count,
+                props.integrated,
+                props.pci_domain_id,
+                props.pci_bus_id,
+                props.pci_device_id,
+                props.major,
+                props.minor,
+                report.clock_rate_mhz,
+            );
+        }
 
         let image = match props.gcn_arch_name.as_str() {
             s if s.starts_with("gfx1201") => Some(HELLO_GFX1201),
@@ -134,20 +145,26 @@ pub fn run() -> eyre::Result<()> {
             None => {
                 report.hello_kernel_error =
                     Some(format!("no embedded hsaco for {}", props.gcn_arch_name));
-                println!(
-                    "    hello kernel: SKIP (no hsaco built for {})",
-                    props.gcn_arch_name
-                );
+                if verbose {
+                    println!(
+                        "    hello kernel: SKIP (no hsaco built for {})",
+                        props.gcn_arch_name
+                    );
+                }
             }
             Some(blob) => match try_hello(*dev, blob) {
                 Ok(v) => {
                     report.hello_kernel_loaded = true;
                     report.hello_kernel_result = Some(v);
-                    println!("    hello kernel: OK (wrote {})", v);
+                    if verbose {
+                        println!("    hello kernel: OK (wrote {})", v);
+                    }
                 }
                 Err(e) => {
                     report.hello_kernel_error = Some(format!("{e:#}"));
-                    println!("    hello kernel: FAIL ({e:#})");
+                    if verbose {
+                        println!("    hello kernel: FAIL ({e:#})");
+                    }
                 }
             },
         }
@@ -155,13 +172,16 @@ pub fn run() -> eyre::Result<()> {
         device_reports.push(report);
     }
 
-    let report = ToolchainReport {
-        gate: "toolchain",
+    Ok(ToolchainReport {
+        gate: "toolchain".into(),
         timestamp: results::now_unix(),
         env,
         devices: device_reports,
-    };
+    })
+}
 
+pub fn run() -> eyre::Result<()> {
+    let report = collect_report(true)?;
     let path = results::write("toolchain", &report)?;
     println!("\nwrote {}", path.display());
     Ok(())
@@ -179,8 +199,6 @@ fn try_hello(dev: Device, image: &[u8]) -> eyre::Result<i32> {
     let mut buf: DeviceBuffer<i32> = DeviceBuffer::new(dev.id, 1)?;
     buf.fill_zero()?;
 
-    // Argument is a single i32 pointer; HIP wants &mut *mut c_void in the
-    // kernelParams slice. We pass &mut raw_ptr.
     let mut raw_ptr = buf.raw();
     let mut args: [*mut c_void; 1] = [&mut raw_ptr as *mut _ as *mut c_void];
 
