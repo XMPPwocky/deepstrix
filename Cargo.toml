@@ -22,5 +22,6 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 color-eyre = "0.6.5"
 thiserror = "2.0.18"
+memmap2 = "0.9.10"
 # eyre is re-exported by color-eyre; library code uses eyre::Result and binaries
 # install the color-eyre handler in main().

@@ -5,5 +5,7 @@
 //! anything else that doesn't directly touch the GPU.
 
 pub mod gguf;
+pub mod mapped;
 
 pub use gguf::{Gguf, GgufError, GgufTensor, GgufType, GgufValue};
+pub use mapped::MappedGguf;
