@@ -1,0 +1,10 @@
+/target/
+/result
+/result-*
+.direnv/
+.envrc.local
+*.swp
+*.swo
+
+# Phase 0 measurement outputs — machine-specific; final summary lives in docs/PHASE0.md
+/results/
