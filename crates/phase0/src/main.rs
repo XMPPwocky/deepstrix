@@ -19,14 +19,13 @@ struct Cli {
 enum Cmd {
     /// Print hipcc/ROCm/device info; launch hello kernel on each device.
     Toolchain,
-    /// Measure cross-device round-trip floor via host-bounce memcpy.
+    /// Decompose the cross-device sync floor: empty kernel launch,
+    /// same-device double memcpy, host-bounce with pinned/unpinned and
+    /// payload sweep. See cmd/pingpong.rs for the layered measurements.
     Pingpong {
-        /// Number of timed iterations per device pair.
+        /// Number of timed iterations per (test × payload × variant) cell.
         #[arg(long, default_value_t = 1000)]
         iterations: u32,
-        /// Payload size in bytes (must be multiple of 4).
-        #[arg(long, default_value_t = 4096)]
-        payload_bytes: usize,
     },
     // Gate-A/B/C/D/E land in later commits.
 }
@@ -40,8 +39,6 @@ fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Toolchain => cmd::toolchain::run(),
-        Cmd::Pingpong { iterations, payload_bytes } => {
-            cmd::pingpong::run(iterations, payload_bytes)
-        }
+        Cmd::Pingpong { iterations } => cmd::pingpong::run(iterations),
     }
 }
