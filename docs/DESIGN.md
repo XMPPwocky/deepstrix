@@ -1,5 +1,9 @@
 # V4 Flash Heterogeneous Inference Engine — Design Doc (v2)
 
+## Phase 0 status: complete
+
+All five Phase 0 gates passed; full measurement results in [`PHASE0.md`](PHASE0.md). The doc below has been updated inline to reflect measured numbers — search for **[P0 measured]** for the load-bearing reconciliations.
+
 ## 0. Changes from v1
 
 This is a substantial rewrite. The following load-bearing claims from v1 were wrong and have been corrected:
@@ -47,7 +51,7 @@ A high-throughput single-token decode engine for DeepSeek V4 Flash on AMD Radeon
 | INT8 matrix | 389 / 779 TOPS |
 | INT4 matrix | 779 / 1557 TOPS |
 | VRAM | 16 GB GDDR6 @ 20 Gbps, 256-bit |
-| VRAM bandwidth | 644 GB/s |
+| VRAM bandwidth | 644 GB/s theoretical, **~605 GB/s sustained on Q8_0 GEMV (94%) [P0 measured]** |
 | Infinity Cache (3rd gen) | 64 MB |
 | TDP | 304 W |
 | ROCm target | gfx1201, officially supported in ROCm 7.0.2+ |
@@ -66,12 +70,12 @@ A high-throughput single-token decode engine for DeepSeek V4 Flash on AMD Radeon
 | INT4 matrix (WMMA) | ~237.6 TOPS |
 | FP8 matrix | NOT supported (RDNA 3.5 lacks FP8 WMMA) |
 | Unified memory | 128 GB LPDDR5X-8000, 256-bit |
-| LPDDR5X bandwidth | 256 GB/s theoretical, ~212-215 GB/s measured |
+| LPDDR5X bandwidth | 256 GB/s theoretical, **~230 GB/s sustained on Q8_0 GEMV [P0 measured]** (doc's 212-215 was conservative) |
 | Allocatable to iGPU | up to 96 GB (UMA setting) |
 | Infinity Cache (MALL) | 32 MB, hardware-managed memory-side cache |
 | CPU↔iGPU memory copy | ~84 GB/s measured |
 | TDP | configurable 45-120W |
-| ROCm target | gfx1151 (NOT in official support matrix); depends on Phase 0 outcome — see §8 |
+| ROCm target | **gfx1151 native, no override [P0 measured]**. ROCm 7.2.3 supports it directly; `HSA_OVERRIDE_GFX_VERSION=11.5.1` actively breaks the runtime |
 
 ### 2.3 Interconnect — Oculink (PCIe 4.0 x4)
 
@@ -79,16 +83,17 @@ A high-throughput single-token decode engine for DeepSeek V4 Flash on AMD Radeon
 |---|---|
 | Theoretical bandwidth | 64 Gbps = 8 GB/s |
 | Effective bandwidth | ~7 GB/s after PCIe overhead |
-| Per-transfer setup latency | ~1-5 μs (no Thunderbolt protocol translation) |
-| Round-trip event sync | unknown; must measure in Phase 0. Estimate 10-30 μs but unverified for dGPU+iGPU UMA topology. |
+| Per-transfer setup latency | **~5 μs submission + ~5 μs HSA signal propagation (one-way) [P0 measured]** |
+| Round-trip event sync | **~11 μs steady-state amortized [P0 measured]** (27-38 μs for one-shot RTT with host poll). Symmetric. |
+| Cross-device peer-copy rule | **MUST queue on source device's stream [P0 measured]** — queuing on dst-stream silently returns zeros for dGPU→iGPU. |
 
 ### 2.4 Implications for design
 
 - Single-token decode is bandwidth-bound on weight reads, not compute.
 - Compute headroom enables parallel kernels, speculative work, prefill (batch >> 1).
-- Cross-device sync overhead may exceed assumed budget. Minimize sync points; measure before assuming.
+- Cross-device sync overhead **does not exceed assumed budget [P0 measured]** — ~11 μs steady-state, well within the doc's 10-30 μs estimate. Minimize sync points anyway; each 11 μs adds up.
 - FP8 only exists on 9070 XT. iGPU side stays on FP16/BF16/Q-quantized.
-- Cache behavior is observable but not directly controllable. All cache-strategy claims below are best-effort.
+- Cache behavior is observable but not directly controllable. **MALL holds ~24 MB effective on Strix (not the 32 MB spec) [P0 measured]**; non-temporal bypass via `__builtin_nontemporal_load` confirmed working.
 
 ## 3. Target Model: DeepSeek V4 Flash
 
@@ -175,20 +180,21 @@ Per-token: 43 × 393 μs = 16.9 ms + ~1 ms LM head = **~56 tok/s**. Worst case ~
 
 ### 4.3 Cache strategy (best-effort, not invariant)
 
-**Strix MALL (32 MB):**
-- Target residency: W_up + W_gate for top-N predicted routed experts (~35 MB for N=8, slightly overflows; reduce to N=7 for 30.5 MB if overflow is empirically bad).
-- W_down streams through LPDDR5X with non-temporal hints to avoid polluting MALL (`hipMemAllocationTypeUncached` or per-load asm hints — exact mechanism is a Phase 0 experiment).
-- These are *hints to the cache controller*, not guaranteed residency. Phase 0 measures actual MALL behavior under our access pattern; if MALL aggressively evicts under concurrent CPU traffic, fall back to no-cache assumption.
+**Strix MALL: ~24 MB effective capacity [P0 measured]** (less than the 32 MB spec; the cache curve drops sharply between 24 and 32 MiB working sets).
+- Target residency: W_up + W_gate for top-**N=6** predicted routed experts (≈ 20.9 MB, fits comfortably). Doc's original N=8 (~35 MB) and N=7 (~30.5 MB) both overflow effective MALL.
+- W_down streams through LPDDR5X with **`__builtin_nontemporal_load`** non-temporal hints. **Confirmed bypassing MALL on Strix [P0 measured]** (511 GB/s → 207 GB/s, ~DRAM rate). Doc's bypass plan is viable.
+- MALL **evicts under interleaved write traffic [P0 measured]** (511 GB/s drops to 121 GB/s after 32 MB pollution). Therefore the non-temporal hint for W_down is **load-bearing**, not optional; otherwise W_down reads will evict the W_up/W_gate residency we want.
 
-**9070 XT Infinity Cache (64 MB):**
-- No deliberate strategy. The cache may opportunistically help with KV cache reuse (compressed KV is small enough), shared expert reuse between consecutive layers (~27 MB fits comfortably), tile reuse within a kernel. None of these are part of the critical-path argument.
+**9070 XT Infinity Cache: ~64 MB effective [P0 measured]** (matches spec; holds 32 MiB happily at 1037 GB/s, 64 MiB at 1126 GB/s).
+- Shared expert weights (~27 MB) DO benefit from IC across consecutive layers when there's no pollution [P0 measured]. Worth designing around explicitly rather than treating as opportunistic.
+- IC also evicts under pollution (32 MiB pollute → 48 MiB read drops 998 → 448). Streaming attention weights while shared expert is supposed to stay resident is the risk; either time-separate them or accept partial residency.
 - v1 claimed "attention weight reuse across consecutive layers." This was wrong; consecutive layers use different attention weights.
 
 ### 4.4 Speculative routing (load-bearing in Phase 3)
 
 For learned-router layers, true top-6 depends on the post-attention MoE input, which doesn't exist at t=0. Naive design: wait for attention, run router, then read experts. This serializes MoE bandwidth after attention and tanks throughput.
 
-Solution: predict top-N ⊇ top-6 at t=0 using a distilled router head trained on offline routing data, prefetch those N experts' W_up/W_gate into MALL during attention, then verify against the true router. Three outcomes:
+Solution: predict top-N ⊇ top-6 at t=0 using a distilled router head trained on offline routing data, prefetch those N experts' W_up/W_gate into MALL during attention, then verify against the true router. **N=6 [P0-revised]** — see §4.3 for why (was N=8 in v2 but effective MALL is 24 MB, not 32 MB). N=6 means top-N coverage of top-6 is harder to achieve; the hit rate target needs re-evaluation against the actual routing distribution. Three outcomes:
 
 | Outcome | Frequency target | Cost |
 |---|---|---|
@@ -247,8 +253,9 @@ v4flash-engine/
 
 Synchronization model:
 - Each device has `compute` and `transfer` streams.
-- Cross-device dependencies via HIP events. **Phase 0 must verify** that `hipStreamWaitEvent` works correctly across the dGPU↔iGPU boundary with UMA on one side.
-- Fallback if peer access/events don't work: host-pinned bounce buffers with `hipMemcpyAsync` to host, then `hipMemcpyAsync` from host to other device. Adds ~5-10 μs per transfer but is the safe path.
+- Cross-device dependencies via HIP events — **verified working across dGPU↔iGPU [P0 measured]**, no host-bounce fallback needed.
+- **Peer-copies must be queued on the source device's stream [P0 load-bearing rule]**. Queuing on dst-stream silently returns zeros for dGPU→iGPU. See `memory/project-peer-copy-stream-rule.md`. Hypothesis: HIP's default event-record fence scope is agent, not system, so PCIe peer reads see stale VRAM unless the source agent's DMA engine handles the copy.
+- Steady-state cross-device sync cost is **~11 μs amortized [P0 measured]** (was estimated 10-30 μs).
 
 ### 5.3 Kernels (HIP C++)
 
@@ -296,12 +303,12 @@ Note: rocm branch is community-maintained; antirez doesn't have AMD hardware. Do
 ## 7. Build system
 
 ### 7.1 Toolchain
-- ROCm 7.2.3 stable, `/opt/rocm`
+- ROCm 7.2.3 stable (via nixpkgs `rocmPackages`)
 - HIPCC for kernel compilation
-- Rust stable 1.83+
-- `cubecl-hip-sys` or hand-rolled bindgen against ROCm 7.2.3
+- Rust stable 1.83+ (in practice 1.95+ from nixpkgs)
+- Hand-rolled FFI in `v4flash-hip` crate (subset surface; ~25 functions)
 - Linux kernel ≥ 6.18.4
-- Strix Halo: `HSA_OVERRIDE_GFX_VERSION=11.5.1` *if* Phase 0 confirms it doesn't break dual-device
+- **No HSA override [P0 measured]** — `HSA_OVERRIDE_GFX_VERSION=11.5.1` BREAKS the runtime (hipErrorLaunchFailure). ROCm 7.2.3 supports gfx1151 natively.
 
 ### 7.2 Per-target kernel compilation
 
@@ -313,11 +320,11 @@ hipcc -O3 --genco --offload-arch=gfx1201 \
 
 hipcc -O3 --genco --offload-arch=gfx1151 \
     kernels/foo.hip -o foo_gfx1151.hsaco
-
-# If gfx1100-on-gfx1151 is empirically faster AND HSA override works:
-hipcc -O3 --genco --offload-arch=gfx1100 \
-    kernels/foo.hip -o foo_gfx1100.hsaco
 ```
+
+**[P0 measured]** `hipcc --genco` actually produces a CCOB (clang offload bundle), not a raw ELF. `hipModuleLoadData` accepts CCOB blobs directly — no unbundling needed.
+
+**gfx1100 binary path dropped [P0 measured]**: Gate B confirmed gfx1100 on Strix iGPU is *identical* (1.00×) speed to native gfx1151 for our DRAM-bound Q8_0 GEMV workload. The "2-6×" claim from llm-tracker doesn't apply here (it was for compute-bound ops with poor gfx1151 codegen).
 
 Embedded HSACO blobs via `include_bytes!` in Rust. Load at runtime via `hipModuleLoadData` to the appropriate device context.
 
@@ -343,7 +350,7 @@ which = "6"
 
 ## 8. Implementation phases
 
-**Phase 0 is a hard gate. Do not proceed to Phase 1 until all Phase 0 measurements are complete and the architecture decisions below are made based on real numbers.**
+**Phase 0 status: COMPLETE [P0 measured].** All five gates passed; full report in [`PHASE0.md`](PHASE0.md). Phase 1 is unblocked.
 
 ### Phase 0: Hardware viability gates (1 week)
 
@@ -393,7 +400,11 @@ Five required measurements / decisions:
 - Build hello-world ping-pong between devices, characterize actual cross-device latency.
 - Replace soft numbers in §2 with measured numbers.
 
-**Phase 0 exit criteria:** §2 bandwidth/latency numbers measured. §4.3 cache strategy validated or revised. §5.3 kernel target list locked. Architecture decision (single-process vs two-process) made.
+**Phase 0 exit criteria — MET [P0 measured]:**
+- §2 bandwidth/latency numbers measured: ✓ (see PHASE0.md tables)
+- §4.3 cache strategy: REVISED — MALL effective 24 MB (not 32), top-N = 6 (not 8), non-temporal bypass for W_down confirmed working
+- §5.3 kernel target list locked: ✓ — gfx1201 + gfx1151 native only; gfx1100 path dropped (no speedup)
+- Architecture decision: **single-process, no override**
 
 ### Phase 1: Single-device naive decode (1 week)
 - Load V4 Flash GGUF on Strix iGPU only. Ignore the 9070 XT.
