@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/v4flash-hip",
     "crates/phase0",
+    "crates/phase1",
 ]
 
 [workspace.package]
