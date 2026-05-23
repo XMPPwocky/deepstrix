@@ -48,6 +48,12 @@ enum Cmd {
         #[arg(long, default_value_t = 200)]
         iterations: u32,
     },
+    /// Gate D: MALL / Infinity Cache characterization. Sweep buffer
+    /// sizes, measure cached vs polluted vs non-temporal bandwidth.
+    GateD {
+        #[arg(long, default_value_t = 50)]
+        iterations: u32,
+    },
 }
 
 fn main() -> eyre::Result<()> {
@@ -66,5 +72,6 @@ fn main() -> eyre::Result<()> {
         Cmd::GateAProbe => cmd::gate_a::probe_to_stdout(),
         Cmd::GateC { iterations } => cmd::gate_c::run(iterations),
         Cmd::GateE { iterations } => cmd::gate_e::run(iterations),
+        Cmd::GateD { iterations } => cmd::gate_d::run(iterations),
     }
 }
