@@ -12,6 +12,7 @@
 # ds4-dump build artifacts
 external/ds4-dump/*.o
 external/ds4-dump/ds4-dump-logits
+external/ds4-dump/ds4-dump-tokenize
 
 # Phase 1 reference outputs — captured logits live outside the repo (huge);
 # only docs/PHASE1_REFERENCE.md (with SHA256s) is checked in.
