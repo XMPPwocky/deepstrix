@@ -551,6 +551,8 @@ name = "v4flash-core"
 version = "0.0.0"
 dependencies = [
  "color-eyre",
+ "serde",
+ "serde_json",
  "thiserror",
  "tracing",
 ]
