@@ -1,13 +1,47 @@
-//! Phase 0 gate dispatcher. Subcommands are added incrementally; this
-//! commit (#2) only verifies that the build.rs pipeline embeds an hsaco for
-//! each target gfx arch.
+//! phase0 — Hardware viability gate dispatcher. See docs/DESIGN.md §8
+//! for what each gate measures.
 
-const HELLO_GFX1201: &[u8] = include_bytes!(env!("KERNEL_HELLO_GFX1201"));
-const HELLO_GFX1151: &[u8] = include_bytes!(env!("KERNEL_HELLO_GFX1151"));
+use clap::{Parser, Subcommand};
+use color_eyre::eyre;
+use tracing_subscriber::EnvFilter;
 
-fn main() {
-    println!("phase0 build artifacts:");
-    println!("  hello@gfx1201: {} bytes", HELLO_GFX1201.len());
-    println!("  hello@gfx1151: {} bytes", HELLO_GFX1151.len());
-    println!("(subcommands land in commit 4)");
+mod cmd;
+mod results;
+
+#[derive(Parser)]
+#[command(name = "phase0", about = "deepstrix Phase 0 hardware viability gates")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Print hipcc/ROCm/device info; launch hello kernel on each device.
+    Toolchain,
+    /// Measure cross-device round-trip floor via host-bounce memcpy.
+    Pingpong {
+        /// Number of timed iterations per device pair.
+        #[arg(long, default_value_t = 1000)]
+        iterations: u32,
+        /// Payload size in bytes (must be multiple of 4).
+        #[arg(long, default_value_t = 4096)]
+        payload_bytes: usize,
+    },
+    // Gate-A/B/C/D/E land in later commits.
+}
+
+fn main() -> eyre::Result<()> {
+    v4flash_hip::install_panic_handler()?;
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .init();
+
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Toolchain => cmd::toolchain::run(),
+        Cmd::Pingpong { iterations, payload_bytes } => {
+            cmd::pingpong::run(iterations, payload_bytes)
+        }
+    }
 }
