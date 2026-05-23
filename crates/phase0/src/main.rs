@@ -34,6 +34,14 @@ enum Cmd {
     /// `gate-a` to read env-dependent state from a fresh process.
     #[command(hide = true)]
     GateAProbe,
+    /// Gate C: peer access, peer bandwidth, cross-device event sync RTT,
+    /// cache coherency. The decisive test for whether peer-direct beats
+    /// host-bounce.
+    GateC {
+        /// Iterations for RTT measurement.
+        #[arg(long, default_value_t = 1000)]
+        iterations: u32,
+    },
 }
 
 fn main() -> eyre::Result<()> {
@@ -50,5 +58,6 @@ fn main() -> eyre::Result<()> {
         Cmd::Pingpong { iterations } => cmd::pingpong::run(iterations),
         Cmd::GateA => cmd::gate_a::run(),
         Cmd::GateAProbe => cmd::gate_a::probe_to_stdout(),
+        Cmd::GateC { iterations } => cmd::gate_c::run(iterations),
     }
 }

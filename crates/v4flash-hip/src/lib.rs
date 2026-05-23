@@ -28,6 +28,13 @@ pub use event::Event;
 pub use module::{Function, LaunchConfig, Module};
 pub use stream::Stream;
 
+/// Block until all work on the *current* device finishes. Stronger than
+/// `Stream::synchronize` — affects every stream on the device. Useful
+/// for forcing full L2 flush / memory fence at agent or system scope.
+pub fn device_synchronize() -> color_eyre::eyre::Result<()> {
+    error::check_eyre(unsafe { sys::hipDeviceSynchronize() }, "hipDeviceSynchronize")
+}
+
 /// Install the color-eyre panic + error report hooks. Binaries call this
 /// once from main. Idempotent.
 pub fn install_panic_handler() -> color_eyre::eyre::Result<()> {
