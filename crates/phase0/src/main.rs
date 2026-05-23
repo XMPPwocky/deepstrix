@@ -42,6 +42,12 @@ enum Cmd {
         #[arg(long, default_value_t = 1000)]
         iterations: u32,
     },
+    /// Gate E: effective Q8_0 GEMV bandwidth vs theoretical. Output
+    /// efficiency ratio scales all bandwidth-derived perf targets.
+    GateE {
+        #[arg(long, default_value_t = 200)]
+        iterations: u32,
+    },
 }
 
 fn main() -> eyre::Result<()> {
@@ -59,5 +65,6 @@ fn main() -> eyre::Result<()> {
         Cmd::GateA => cmd::gate_a::run(),
         Cmd::GateAProbe => cmd::gate_a::probe_to_stdout(),
         Cmd::GateC { iterations } => cmd::gate_c::run(iterations),
+        Cmd::GateE { iterations } => cmd::gate_e::run(iterations),
     }
 }
