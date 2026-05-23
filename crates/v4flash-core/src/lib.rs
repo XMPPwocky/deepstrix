@@ -6,6 +6,8 @@
 
 pub mod gguf;
 pub mod mapped;
+pub mod tokenizer;
 
 pub use gguf::{Gguf, GgufError, GgufTensor, GgufType, GgufValue};
 pub use mapped::MappedGguf;
+pub use tokenizer::BpeVocab;
