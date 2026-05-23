@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/v4flash-core",
     "crates/v4flash-hip",
     "crates/phase0",
     "crates/phase1",
@@ -20,5 +21,6 @@ clap = { version = "4.6.1", features = ["derive"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 color-eyre = "0.6.5"
+thiserror = "2.0.18"
 # eyre is re-exported by color-eyre; library code uses eyre::Result and binaries
 # install the color-eyre handler in main().
