@@ -1,0 +1,139 @@
+diff --git a/ds4.c b/ds4.c
+index 26745c1..7cfeaf9 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -2696,6 +2696,40 @@ static void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token,
+     }
+ }
+ 
++/* deepstrix patch: activation dump globals + helpers + setter.
++ * Single-threaded; emits only when a callback is registered AND we're inside
++ * the canonical CPU-decode forward path (layer is set non-negative by the
++ * layer-forward prologue and cleared by its epilogue). */
++static ds4_activation_dump_fn g_ds4_dump_fn = NULL;
++static void *g_ds4_dump_ud = NULL;
++static int g_ds4_dump_layer = -1;
++static int g_ds4_dump_pos = -1;
++
++void ds4_set_activation_dump(ds4_activation_dump_fn fn, void *ud) {
++    g_ds4_dump_fn = fn;
++    g_ds4_dump_ud = ud;
++}
++
++static inline void ds4_dump_emit(const char *tag, const void *data,
++                                 ds4_dump_dtype dtype, int ndim,
++                                 const int64_t *shape) {
++    if (!g_ds4_dump_fn || g_ds4_dump_layer < 0) return;
++    g_ds4_dump_fn(g_ds4_dump_ud, tag, data, dtype, ndim, shape,
++                  g_ds4_dump_layer, g_ds4_dump_pos);
++}
++
++static inline void ds4_dump_emit_1d(const char *tag, const void *data,
++                                    ds4_dump_dtype dtype, int64_t n) {
++    const int64_t shape[1] = {n};
++    ds4_dump_emit(tag, data, dtype, 1, shape);
++}
++
++static inline void ds4_dump_emit_2d(const char *tag, const void *data,
++                                    ds4_dump_dtype dtype, int64_t d0, int64_t d1) {
++    const int64_t shape[2] = {d0, d1};
++    ds4_dump_emit(tag, data, dtype, 2, shape);
++}
++
+ /* RMSNorm without a learned scale, used by hyper-connection control vectors. */
+ static void rms_norm_no_weight(float *out, const float *x, uint64_t n, float eps) {
+     double ss = 0.0;
+@@ -5708,11 +5742,13 @@ static void layer_ffn_one_decode_scratch(
+                                   scratch->hc_flat,
+                                   false);
+     if (profile) t_hc = now_sec() - t0;
++    ds4_dump_emit_1d("ffn_cur", scratch->ffn_cur, DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_EMBD);
+ 
+     t0 = profile ? now_sec() : 0.0;
+     const float *ffn_norm = tensor_data(model, layer->ffn_norm);
+     rms_norm_weight(scratch->ffn_norm, scratch->ffn_cur, ffn_norm, DS4_N_EMBD, DS4_RMS_EPS);
+     if (profile) t_norm = now_sec() - t0;
++    ds4_dump_emit_1d("ffn_input_norm", scratch->ffn_norm, DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_EMBD);
+ 
+     t0 = profile ? now_sec() : 0.0;
+     layer_routed_moe_one_prealloc(scratch->ffn_moe,
+@@ -7467,6 +7503,18 @@ static void layer_forward_raw_swa_one(
+     float post[4];
+     float comb[16];
+ 
++    /* deepstrix dump: enter layer/pos; emit input residual + weights at pos=0. */
++    g_ds4_dump_layer = (int)il;
++    g_ds4_dump_pos = (int)pos;
++    ds4_dump_emit_2d("layer_input_residual", inp_hc, DS4_DUMP_DTYPE_F32,
++                     (int64_t)n_hc, (int64_t)DS4_N_EMBD);
++    if (pos == 0) {
++        ds4_dump_emit_1d("weight:attn_norm", tensor_data(model, layer->attn_norm),
++                         DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_EMBD);
++        ds4_dump_emit_1d("weight:ffn_norm", tensor_data(model, layer->ffn_norm),
++                         DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_EMBD);
++    }
++
+     double t0 = profile ? now_sec() : 0.0;
+     memcpy(scratch->attn_residual, inp_hc, (size_t)n_hc * DS4_N_EMBD * sizeof(inp_hc[0]));
+     hc_pre_from_state_one_scratch(model,
+@@ -7477,9 +7525,11 @@ static void layer_forward_raw_swa_one(
+                                   scratch->hc_flat,
+                                   false);
+     if (profile) t_hc = now_sec() - t0;
++    ds4_dump_emit_1d("attn_cur", scratch->attn_cur, DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_EMBD);
+ 
+     t0 = profile ? now_sec() : 0.0;
+     layer_attn_norm_one(scratch->attn_norm, model, layer, scratch->attn_cur);
++    ds4_dump_emit_1d("attn_input_norm", scratch->attn_norm, DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_EMBD);
+     const uint32_t ratio = cache->compress_ratio;
+     layer_q_projection_with_lora_one_decode_scratch(model, layer,
+                                                     scratch->attn_norm,
+@@ -7582,6 +7632,13 @@ static void layer_forward_raw_swa_one(
+                                  steering_dirs, steering_ffn_scale, scratch);
+     if (profile) t_ffn = now_sec() - t0;
+ 
++    /* deepstrix dump: layer output residual; clear context to prevent
++     * spurious emits from helpers reached outside this layer scope. */
++    ds4_dump_emit_2d("layer_output_residual", out_hc, DS4_DUMP_DTYPE_F32,
++                     (int64_t)n_hc, (int64_t)DS4_N_EMBD);
++    g_ds4_dump_layer = -1;
++    g_ds4_dump_pos = -1;
++
+     if (profile) {
+         fprintf(stderr,
+                 "ds4: decode detail layer %u attn hc=%.3f q=%.3f kv=%.3f rope=%.3f compress=%.3f indexer=%.3f attn_rows=%.3f inv_rope=%.3f out=%.3f post=%.3f ffn=%.3f total=%.3f ms\n",
+diff --git a/ds4.h b/ds4.h
+index 2ba1083..eef5187 100644
+--- a/ds4.h
++++ b/ds4.h
+@@ -55,6 +55,30 @@ typedef struct ds4_session ds4_session;
+ 
+ typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
+ 
++/* deepstrix patch: activation dump hooks used by Phase 2 kernel ports for
++ * canonical correctness validation. Single-threaded only. The callback fires
++ * at canonical CPU-decode intermediates whenever an evaluation is routed
++ * through forward_token_raw_swa_cpu_decode_scratch (CPU backend +
++ * ds4_session_eval). Tags with `weight:` prefix fire once per layer at
++ * token_pos==0. */
++typedef enum {
++    DS4_DUMP_DTYPE_F32 = 0,
++    DS4_DUMP_DTYPE_F16 = 1,
++    DS4_DUMP_DTYPE_FP8 = 2,
++    DS4_DUMP_DTYPE_I32 = 3,
++} ds4_dump_dtype;
++
++typedef void (*ds4_activation_dump_fn)(void *ud,
++                                       const char *tag,
++                                       const void *data,
++                                       ds4_dump_dtype dtype,
++                                       int ndim,
++                                       const int64_t *shape,
++                                       int layer,
++                                       int token_pos);
++
++void ds4_set_activation_dump(ds4_activation_dump_fn fn, void *ud);
++
+ typedef struct {
+     const char *model_path;
+     const char *mtp_path;
