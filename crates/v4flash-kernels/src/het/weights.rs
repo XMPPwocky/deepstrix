@@ -49,6 +49,13 @@ pub struct DgpuLayerWeights {
     // FFN norm + shared expert
     pub ffn_norm: DeviceBuffer<f32>,
     pub shared: SharedExpertWeights,
+
+    // M14L: compressor migrated to dGPU. Loaded here instead of on iGPU
+    // because (a) 9070 XT has 2.6× the BW of Strix iGPU → f16 matvec is
+    // faster locally, and (b) attn_input_norm is computed on dGPU, so
+    // running compressor on dGPU eliminates a 16-byte peer push and
+    // the iGPU.compressor.wait it gates.
+    pub compressor: Option<CompressorWeights>,
 }
 
 pub struct IgpuLayerWeights {
@@ -205,6 +212,38 @@ impl DgpuLayerWeights {
             )?,
         };
 
+        // M14L: compressor weights now on dGPU.
+        let compressor = if ratio > 0 {
+            let comp_width = if ratio == 4 { 1024 } else { 512 };
+            Some(CompressorWeights {
+                wkv: load_to_device(
+                    gguf,
+                    &format!("blk.{layer}.attn_compressor_kv.weight"),
+                    device_id,
+                )?,
+                wgate: load_to_device(
+                    gguf,
+                    &format!("blk.{layer}.attn_compressor_gate.weight"),
+                    device_id,
+                )?,
+                ape: load_to_device(
+                    gguf,
+                    &format!("blk.{layer}.attn_compressor_ape.weight"),
+                    device_id,
+                )?,
+                norm: load_f32_weight(
+                    gguf,
+                    &format!("blk.{layer}.attn_compressor_norm.weight"),
+                    device_id,
+                    N_HEAD_DIM as usize,
+                )?,
+                width: comp_width,
+                head_dim: N_HEAD_DIM,
+            })
+        } else {
+            None
+        };
+
         Ok(DgpuLayerWeights {
             layer_idx: layer,
             ratio,
@@ -226,6 +265,7 @@ impl DgpuLayerWeights {
             rope_params,
             ffn_norm,
             shared,
+            compressor,
         })
     }
 }
@@ -307,37 +347,10 @@ impl IgpuLayerWeights {
             None
         };
 
-        // Load compressor weights on iGPU (M13.5).
-        let compressor = if ratio > 0 {
-            let comp_width = if ratio == 4 { 1024 } else { 512 };
-            Some(CompressorWeights {
-                wkv: load_to_device(
-                    gguf,
-                    &format!("blk.{layer}.attn_compressor_kv.weight"),
-                    device_id,
-                )?,
-                wgate: load_to_device(
-                    gguf,
-                    &format!("blk.{layer}.attn_compressor_gate.weight"),
-                    device_id,
-                )?,
-                ape: load_to_device(
-                    gguf,
-                    &format!("blk.{layer}.attn_compressor_ape.weight"),
-                    device_id,
-                )?,
-                norm: load_f32_weight(
-                    gguf,
-                    &format!("blk.{layer}.attn_compressor_norm.weight"),
-                    device_id,
-                    N_HEAD_DIM as usize,
-                )?,
-                width: comp_width,
-                head_dim: N_HEAD_DIM,
-            })
-        } else {
-            None
-        };
+        // M14L: attn compressor moved to dGPU. Field kept (None) so the
+        // IgpuLayerWeights shape is unchanged for non-compressor consumers
+        // (indexer_compressor below remains iGPU-resident).
+        let compressor: Option<CompressorWeights> = None;
         let indexer_compressor = if ratio == 4 {
             Some(CompressorWeights {
                 wkv: load_to_device(

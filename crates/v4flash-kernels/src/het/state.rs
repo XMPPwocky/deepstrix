@@ -84,8 +84,10 @@ impl HetModelState {
         for layer in 0..N_LAYER {
             let ratio = COMPRESS_RATIOS[layer as usize];
             let compressor = if ratio > 0 {
+                // M14L: attn compressor state moved to dGPU so the compressor
+                // can run there alongside attn_input_norm with no peer push.
                 Some(HetCompressorState::alloc(
-                    igpu_device,
+                    dgpu_device,
                     dgpu_device,
                     ratio,
                     N_HEAD_DIM,

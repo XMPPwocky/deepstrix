@@ -281,72 +281,33 @@ impl HeterogeneousEngine {
         // `comp_kv_append` kernel.
         // ============================================================
         let comp_fires_boundary = ratio > 0 && (pos + 1) % ratio == 0;
-        let parallel_pre = matches!(self.mode, ExecMode::HetParallel);
-        let sev_pre = &self.sync_events.layers[layer as usize];
+        let _parallel_pre = matches!(self.mode, ExecMode::HetParallel);
+        let _sev_pre = &self.sync_events.layers[layer as usize];
 
+        // M14L: compressor runs entirely on dGPU. attn_input_norm is
+        // already local; weights + state + scratch all on dGPU; no peer
+        // pushes (was: dGPU→iGPU attn_input_norm push, iGPU→dGPU
+        // comp_row push).
         if ratio > 0 {
-            if parallel_pre {
-                // Record the upstream event first, then bracket the wait
-                // separately from the work so the perfetto timeline shows
-                // wait time as its own slice instead of inflating the
-                // peer_push stage with idle stream time.
-                sev_pre.attn_in_ready.record(&de.compute)?;
-                let _t_wait = de
-                    .events
-                    .stage("dgpu.peer_push_attn_input_norm.wait", &de.xfer)?;
-                de.xfer.wait_event(&sev_pre.attn_in_ready)?;
-                _t_wait.end()?;
-            } else {
-                de.compute.synchronize()?;
-            }
-            let _t_peer_ain_pre = de.events.stage(
-                "dgpu.peer_push_attn_input_norm",
-                &de.xfer,
-            )?;
-            let _s_peer_ain_pre = debug_span!("peer_push_attn_input_norm").entered();
-            peer_push_f32(
-                &dgpu_scratch.attn_input_norm,
-                &mut igpu_scratch.attn_input_norm_recv,
-                &de.xfer,
-            )?;
-            if parallel_pre {
-                sev_pre.attn_in_pushed.record(&de.xfer)?;
-            } else {
-                de.xfer.synchronize()?;
-            }
-            drop(_s_peer_ain_pre);
-            _t_peer_ain_pre.end()?;
+            let _t_comp = de.events.stage("dgpu.compressor", &de.compute)?;
+            let _s_comp = debug_span!("compressor_dgpu", ratio).entered();
 
-            // iGPU compressor.
-            self.igpu.device.set_current()?;
-            let ie_c = &self.igpu;
-            if parallel_pre {
-                let _t_wait =
-                    ie_c.events.stage("igpu.compressor.wait", &ie_c.compute)?;
-                ie_c.compute.wait_event(&sev_pre.attn_in_pushed)?;
-                _t_wait.end()?;
-            }
-            let _t_comp = ie_c.events.stage("igpu.compressor", &ie_c.compute)?;
-            let _s_comp = debug_span!("compressor", ratio).entered();
-
-            let cw = ilw
+            let cw = dlw
                 .compressor
                 .as_ref()
-                .ok_or_else(|| eyre!("L{layer}: missing compressor weights (iGPU)"))?;
+                .ok_or_else(|| eyre!("L{layer}: missing compressor weights (dGPU)"))?;
             let comp_width = cw.width;
             let pos_mod = pos % ratio;
             let row = if ratio == 4 { 4 + pos_mod } else { pos_mod };
             {
-                // M14h: paired matvec — kv + gate fused into single launch,
-                // sharing activation reads.
-                let _t = ie_c.events.stage("k.compressor.f16_pair", &ie_c.compute)?;
-                ie_c.f16.matvec_pair(
-                    &ie_c.compute,
-                    &mut igpu_scratch.kv_cur,
-                    &mut igpu_scratch.sc_cur,
+                let _t = de.events.stage("k.compressor_d.f16_pair", &de.compute)?;
+                de.f16.matvec_pair(
+                    &de.compute,
+                    &mut dgpu_scratch.kv_cur,
+                    &mut dgpu_scratch.sc_cur,
                     &cw.wkv.buffer,
                     &cw.wgate.buffer,
-                    &igpu_scratch.attn_input_norm_recv,
+                    &dgpu_scratch.attn_input_norm,
                     comp_width,
                     N_EMBD,
                 )?;
@@ -356,13 +317,13 @@ impl HeterogeneousEngine {
                 .as_mut()
                 .ok_or_else(|| eyre!("L{layer}: missing compressor state"))?;
             {
-                let _t = ie_c.events.stage("k.compressor.state_write", &ie_c.compute)?;
-                ie_c.compressor_state_write.launch(
-                    &ie_c.compute,
+                let _t = de.events.stage("k.compressor_d.state_write", &de.compute)?;
+                de.compressor_state_write.launch(
+                    &de.compute,
                     &mut cs.state_kv,
                     &mut cs.state_score,
-                    &igpu_scratch.kv_cur,
-                    &igpu_scratch.sc_cur,
+                    &dgpu_scratch.kv_cur,
+                    &dgpu_scratch.sc_cur,
                     &cw.ape.buffer,
                     comp_width,
                     row,
@@ -371,102 +332,65 @@ impl HeterogeneousEngine {
             }
 
             if comp_fires_boundary {
-                ie_c.compressor_pool.launch(
-                    &ie_c.compute,
-                    &mut igpu_scratch.pooled,
+                de.compressor_pool.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.pooled,
                     &cs.state_kv,
                     &cs.state_score,
                     N_HEAD_DIM,
                     ratio,
                 )?;
-                ie_c.rms_w.launch_weighted(
-                    &ie_c.compute,
-                    &mut igpu_scratch.comp_row,
-                    &igpu_scratch.pooled,
+                de.rms_w.launch_weighted(
+                    &de.compute,
+                    &mut dgpu_scratch.comp_row,
+                    &dgpu_scratch.pooled,
                     &cw.norm,
                     N_HEAD_DIM,
                     RMS_EPS,
                 )?;
                 let comp_pos = pos + 1 - ratio;
-                ie_c.rope.launch_forward(
-                    &ie_c.compute,
-                    &mut igpu_scratch.comp_row,
+                de.rope.launch_forward(
+                    &de.compute,
+                    &mut dgpu_scratch.comp_row,
                     1,
                     N_HEAD_DIM,
                     N_ROT,
                     comp_pos,
-                    &ilw.rope_params,
+                    &dlw.rope_params,
                 )?;
-                ie_c.fp8.launch(
-                    &ie_c.compute,
-                    &mut igpu_scratch.comp_row,
+                de.fp8.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.comp_row,
                     N_HEAD_DIM - N_ROT,
                 )?;
-                ie_c.f16rt.launch(
-                    &ie_c.compute,
-                    &mut igpu_scratch.comp_row,
+                de.f16rt.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.comp_row,
                     N_HEAD_DIM,
                 )?;
                 if ratio == 4 {
-                    ie_c.compressor_shuffle.launch(
-                        &ie_c.compute,
+                    de.compressor_shuffle.launch(
+                        &de.compute,
                         &mut cs.state_kv,
                         &mut cs.state_score,
                         comp_width,
                     )?;
                 }
 
-                // Peer push comp_row back to dGPU.
-                if parallel_pre {
-                    sev_pre.comp_row_ready.record(&ie_c.compute)?;
-                    let _t_wait =
-                        ie_c.events.stage("igpu.peer_push_comp_row.wait", &ie_c.xfer)?;
-                    ie_c.xfer.wait_event(&sev_pre.comp_row_ready)?;
-                    _t_wait.end()?;
-                } else {
-                    ie_c.compute.synchronize()?;
-                }
-                let _t_push = ie_c.events.stage("igpu.peer_push_comp_row", &ie_c.xfer)?;
-                peer_push_f32(
-                    &igpu_scratch.comp_row,
-                    &mut dgpu_scratch.comp_row_recv,
-                    &ie_c.xfer,
-                )?;
-                if parallel_pre {
-                    sev_pre.comp_row_arrived.record(&ie_c.xfer)?;
-                } else {
-                    ie_c.xfer.synchronize()?;
-                }
-                _t_push.end()?;
-            }
-            drop(_s_comp);
-            _t_comp.end()?;
-            self.dgpu.device.set_current()?;
-
-            // dGPU: append comp_row to comp_kv on boundary.
-            if comp_fires_boundary {
-                if parallel_pre {
-                    let _t_wait = de
-                        .events
-                        .stage("dgpu.comp_kv_append.wait", &de.compute)?;
-                    de.compute.wait_event(&sev_pre.comp_row_arrived)?;
-                    _t_wait.end()?;
-                }
+                // No peer push needed — append directly into local comp_kv.
                 let _t_append = de.events.stage("dgpu.comp_kv_append", &de.compute)?;
-                let cs = ls
-                    .compressor
-                    .as_mut()
-                    .ok_or_else(|| eyre!("L{layer}: missing compressor state"))?;
                 de.comp_kv_append.launch(
                     &de.compute,
                     &mut cs.comp_kv,
-                    &dgpu_scratch.comp_row_recv,
+                    &dgpu_scratch.comp_row,
                     cs.n_comp,
                     N_HEAD_DIM,
                 )?;
                 cs.n_comp += 1;
                 _t_append.end()?;
             }
+            drop(_s_comp);
+            _t_comp.end()?;
         }
 
         // ============================================================

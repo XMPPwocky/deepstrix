@@ -62,10 +62,17 @@ pub struct DgpuScratch {
     pub low_xscale: DeviceBuffer<f32>,
     pub attn_out: DeviceBuffer<f32>,
 
-    /// Mailbox for `comp_row` peer-pushed from the iGPU compressor on
-    /// boundary tokens (M13.5). dGPU appends this row into the
-    /// per-layer `comp_kv` cache consumed by `attn_mixed`.
+    /// (Legacy after M14L.) Was the mailbox for `comp_row` peer-pushed
+    /// from the iGPU compressor; now compressor runs locally on dGPU so
+    /// this buffer is unused. Kept allocated to avoid touching downstream
+    /// indexer paths that still reference it.
     pub comp_row_recv: DeviceBuffer<f32>,
+
+    // M14L: compressor scratch — used to live in IgpuScratch.
+    pub kv_cur: DeviceBuffer<f32>,
+    pub sc_cur: DeviceBuffer<f32>,
+    pub pooled: DeviceBuffer<f32>,
+    pub comp_row: DeviceBuffer<f32>,
 
     // Shared expert
     pub gate_sh: DeviceBuffer<f32>,
@@ -129,6 +136,10 @@ impl DgpuScratch {
             attn_out: DeviceBuffer::new(device_id, N_EMBD as usize)?,
 
             comp_row_recv: DeviceBuffer::new(device_id, N_HEAD_DIM as usize)?,
+            kv_cur: DeviceBuffer::new(device_id, (2 * N_HEAD_DIM) as usize)?,
+            sc_cur: DeviceBuffer::new(device_id, (2 * N_HEAD_DIM) as usize)?,
+            pooled: DeviceBuffer::new(device_id, N_HEAD_DIM as usize)?,
+            comp_row: DeviceBuffer::new(device_id, N_HEAD_DIM as usize)?,
 
             gate_sh: DeviceBuffer::new(device_id, N_FF_SHARED as usize)?,
             up_sh: DeviceBuffer::new(device_id, N_FF_SHARED as usize)?,
