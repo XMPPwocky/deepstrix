@@ -173,23 +173,60 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
         dgpu.id, igpu.id, v4flash_kernels::forward::N_LAYER
     );
 
-    // M15 debug: print any post-warmup token >2x the median so we can
-    // see whether outliers cluster (e.g. KV-cache reallocation) or are
-    // random (e.g. dGPU power state / page faults).
+    // Per-decile latency. Reads from the same `sorted` Vec the
+    // min/median/max came from — n is small enough that
+    // sorted[idx_at_pct] is a perfectly good quantile estimate. p99
+    // included because it's the load-bearing "occasional slow token"
+    // metric (a single bad token at 3× median drags the avg far more
+    // than the median moves).
+    eprintln!("BENCH percentiles (ms):");
+    let pcts: [(f64, &str); 12] = [
+        (0.0, "p0  "),
+        (10.0, "p10 "),
+        (20.0, "p20 "),
+        (30.0, "p30 "),
+        (40.0, "p40 "),
+        (50.0, "p50 "),
+        (60.0, "p60 "),
+        (70.0, "p70 "),
+        (80.0, "p80 "),
+        (90.0, "p90 "),
+        (99.0, "p99 "),
+        (100.0, "p100"),
+    ];
+    let n = sorted.len() as f64;
+    for (p, label) in pcts {
+        // p in [0,100]; index in [0, len-1].
+        let idx = ((p / 100.0) * (n - 1.0)).round() as usize;
+        let us = sorted[idx];
+        let tps = 1_000_000.0 / us as f64;
+        eprintln!(
+            "  {label} {:>7.2} ms  ({:>5.2} tok/s)",
+            us as f64 / 1000.0,
+            tps
+        );
+    }
+
+    // Print any post-warmup token >2x the median for fault diagnosis.
     let outlier_thresh = median_us.saturating_mul(2);
-    eprintln!("BENCH outliers (>{:.2}ms):", outlier_thresh as f64 / 1000.0);
-    let mut n_outliers = 0;
-    for (i, &t) in token_us.iter().enumerate() {
-        if (i as i32) < warmup {
-            continue;
+    let outliers: Vec<(usize, u64)> = token_us
+        .iter()
+        .enumerate()
+        .filter(|(i, &t)| (*i as i32) >= warmup && t > outlier_thresh)
+        .map(|(i, &t)| (i, t))
+        .collect();
+    if !outliers.is_empty() {
+        eprintln!("BENCH outliers (>{:.2}ms):", outlier_thresh as f64 / 1000.0);
+        for (i, t) in outliers.iter().take(20) {
+            eprintln!(
+                "  T{} (idx-after-warmup {}): {:.2}ms",
+                i,
+                i - warmup as usize,
+                *t as f64 / 1000.0
+            );
         }
-        if t > outlier_thresh {
-            eprintln!("  T{} (idx-after-warmup {}): {:.2}ms", i, i - warmup as usize, t as f64 / 1000.0);
-            n_outliers += 1;
-            if n_outliers >= 20 {
-                eprintln!("  ...truncated at 20 outliers");
-                break;
-            }
+        if outliers.len() > 20 {
+            eprintln!("  ...{} more outliers truncated", outliers.len() - 20);
         }
     }
 
