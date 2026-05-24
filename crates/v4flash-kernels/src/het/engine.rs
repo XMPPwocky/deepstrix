@@ -250,6 +250,12 @@ pub struct HeterogeneousEngine {
     /// q8_quantize_low → q8_matvec_b). Skips the leading rope_inverse,
     /// which takes per-token `pos`.
     pub dgpu_output_proj_post_rope_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    /// M15.1: per-layer captured graphs for the dGPU ffn_combine block
+    /// (2 kernels: vec_add (ffn_moe_recv += ffn_shared) followed by
+    /// hc_post writing residual_next). Safe to capture because the
+    /// end-of-token extra swap keeps each layer's residual/residual_next
+    /// pointing to stable physical buffers.
+    pub dgpu_ffn_combine_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
 }
 
 impl HeterogeneousEngine {
@@ -306,6 +312,16 @@ impl HeterogeneousEngine {
             std::mem::swap(&mut dgpu_scratch.residual, &mut dgpu_scratch.residual_next);
         }
         self.forward_head(dgpu_scratch, &weights.global)?;
+        // M15.1: N_LAYER (43) is odd, so 43 in-loop swaps leave
+        // residual/residual_next inverted from token start. Without an
+        // extra swap, every token's layer 0 would read from a different
+        // physical DeviceBuffer than the previous token's layer 0,
+        // making it impossible to capture mhc_pre_attn / mhc_post_ffn
+        // into HIP graphs (the captured pointer would be wrong on
+        // alternating tokens). One extra swap here restores the
+        // initial state so layer N always operates on the same
+        // physical buffers across every token.
+        std::mem::swap(&mut dgpu_scratch.residual, &mut dgpu_scratch.residual_next);
         self.dgpu.device.set_current()?;
         self.dgpu.compute.synchronize()?;
         let token_elapsed_us = token_start.elapsed().as_micros() as u64;
@@ -440,6 +456,7 @@ impl HeterogeneousEngine {
         let mut dgpu_shared_expert_graphs = Vec::with_capacity(N_LAYER as usize);
         let mut dgpu_q_chain_pre_rope_graphs = Vec::with_capacity(N_LAYER as usize);
         let mut dgpu_output_proj_post_rope_graphs = Vec::with_capacity(N_LAYER as usize);
+        let mut dgpu_ffn_combine_graphs = Vec::with_capacity(N_LAYER as usize);
         for _ in 0..N_LAYER {
             igpu_moe_graphs.push(std::sync::Mutex::new(None));
             dgpu_mhc_pre_attn_graphs.push(std::sync::Mutex::new(None));
@@ -447,6 +464,7 @@ impl HeterogeneousEngine {
             dgpu_shared_expert_graphs.push(std::sync::Mutex::new(None));
             dgpu_q_chain_pre_rope_graphs.push(std::sync::Mutex::new(None));
             dgpu_output_proj_post_rope_graphs.push(std::sync::Mutex::new(None));
+            dgpu_ffn_combine_graphs.push(std::sync::Mutex::new(None));
         }
 
         Ok(Self {
@@ -461,6 +479,7 @@ impl HeterogeneousEngine {
             dgpu_shared_expert_graphs,
             dgpu_q_chain_pre_rope_graphs,
             dgpu_output_proj_post_rope_graphs,
+            dgpu_ffn_combine_graphs,
         })
     }
 

@@ -71,54 +71,70 @@ impl HeterogeneousEngine {
         self.dgpu.device.set_current()?;
         let de = &self.dgpu;
 
-        // mhc_pre_attn is NOT captured: it reads `dgpu_scratch.residual`,
-        // whose underlying DeviceBuffer pointer is rotated by the
-        // `mem::swap(residual, residual_next)` at the end of every
-        // layer. A captured graph would freeze the wrong physical pointer.
+        // M15.1: capture mhc_pre_attn (5 kernels). Reads
+        // `dgpu_scratch.residual` which is technically swapped per layer,
+        // but the engine's end-of-token extra swap restores the initial
+        // state so layer N's `residual` always points to the same
+        // physical buffer across tokens — the captured pointer stays
+        // valid.
         let _t_mhc_pre = de.events.stage("dgpu.mhc_pre_attn", &de.compute)?;
         let _s_mhc_pre = debug_span!("mhc_pre_attn").entered();
-        de.rms_nw.launch(
-            &de.compute,
-            &mut dgpu_scratch.flat,
-            &dgpu_scratch.residual,
-            1,
-            HC_DIM,
-            RMS_EPS,
-        )?;
-        de.f16.matvec(
-            &de.compute,
-            &mut dgpu_scratch.mix,
-            &dlw.hc_attn_fn.buffer,
-            &dgpu_scratch.flat,
-            HC_MIX_DIM,
-            HC_DIM,
-        )?;
-        de.hc_sinkhorn.launch(
-            &de.compute,
-            &mut dgpu_scratch.split,
-            &dgpu_scratch.mix,
-            &dlw.hc_attn_scale,
-            &dlw.hc_attn_base,
-            N_HC,
-            SINKHORN_ITERS,
-            SINKHORN_EPS,
-        )?;
-        de.hc_weighted.launch(
-            &de.compute,
-            &mut dgpu_scratch.attn_cur,
-            &dgpu_scratch.residual,
-            &dgpu_scratch.split,
-            N_EMBD,
-            N_HC,
-        )?;
-        de.rms_w.launch_weighted(
-            &de.compute,
-            &mut dgpu_scratch.attn_input_norm,
-            &dgpu_scratch.attn_cur,
-            &dlw.attn_norm,
-            N_EMBD,
-            RMS_EPS,
-        )?;
+        {
+            let graph_slot = &self.dgpu_mhc_pre_attn_graphs[layer as usize];
+            let mut guard = graph_slot.lock().unwrap();
+            if guard.is_none() {
+                de.compute
+                    .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                de.rms_nw.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.flat,
+                    &dgpu_scratch.residual,
+                    1,
+                    HC_DIM,
+                    RMS_EPS,
+                )?;
+                de.f16.matvec(
+                    &de.compute,
+                    &mut dgpu_scratch.mix,
+                    &dlw.hc_attn_fn.buffer,
+                    &dgpu_scratch.flat,
+                    HC_MIX_DIM,
+                    HC_DIM,
+                )?;
+                de.hc_sinkhorn.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.split,
+                    &dgpu_scratch.mix,
+                    &dlw.hc_attn_scale,
+                    &dlw.hc_attn_base,
+                    N_HC,
+                    SINKHORN_ITERS,
+                    SINKHORN_EPS,
+                )?;
+                de.hc_weighted.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.attn_cur,
+                    &dgpu_scratch.residual,
+                    &dgpu_scratch.split,
+                    N_EMBD,
+                    N_HC,
+                )?;
+                de.rms_w.launch_weighted(
+                    &de.compute,
+                    &mut dgpu_scratch.attn_input_norm,
+                    &dgpu_scratch.attn_cur,
+                    &dlw.attn_norm,
+                    N_EMBD,
+                    RMS_EPS,
+                )?;
+                let graph = de.compute.end_capture()?;
+                let exec = graph.instantiate()?;
+                exec.launch(&de.compute)?;
+                *guard = Some(exec);
+            } else {
+                guard.as_ref().unwrap().launch(&de.compute)?;
+            }
+        }
         drop(_s_mhc_pre);
         _t_mhc_pre.end()?;
 
@@ -835,24 +851,39 @@ impl HeterogeneousEngine {
         }
         let _t_combine = de.events.stage("dgpu.ffn_combine", &de.compute)?;
         let _s_combine = debug_span!("ffn_combine").entered();
-        de.vec_add.launch(
-            &de.compute,
-            &mut dgpu_scratch.ffn_moe_recv,
-            &dgpu_scratch.ffn_shared,
-            N_EMBD,
-        )?;
-
-        // mHC post ffn → residual_next (M13.3: read post/comb from split)
-        de.hc_post.launch_from_split(
-            &de.compute,
-            &mut dgpu_scratch.residual_next,
-            &dgpu_scratch.ffn_moe_recv,
-            &dgpu_scratch.after_attn_hc,
-            &dgpu_scratch.split,
-            N_HC,
-            N_EMBD,
-            N_HC,
-        )?;
+        {
+            // M15.1: capture (vec_add → hc_post writing residual_next).
+            // Stable per-layer pointers thanks to the end-of-token
+            // extra swap.
+            let graph_slot = &self.dgpu_ffn_combine_graphs[layer as usize];
+            let mut guard = graph_slot.lock().unwrap();
+            if guard.is_none() {
+                de.compute
+                    .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                de.vec_add.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.ffn_moe_recv,
+                    &dgpu_scratch.ffn_shared,
+                    N_EMBD,
+                )?;
+                de.hc_post.launch_from_split(
+                    &de.compute,
+                    &mut dgpu_scratch.residual_next,
+                    &dgpu_scratch.ffn_moe_recv,
+                    &dgpu_scratch.after_attn_hc,
+                    &dgpu_scratch.split,
+                    N_HC,
+                    N_EMBD,
+                    N_HC,
+                )?;
+                let graph = de.compute.end_capture()?;
+                let exec = graph.instantiate()?;
+                exec.launch(&de.compute)?;
+                *guard = Some(exec);
+            } else {
+                guard.as_ref().unwrap().launch(&de.compute)?;
+            }
+        }
         drop(_s_combine);
         _t_combine.end()?;
         if serial {
