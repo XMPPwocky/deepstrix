@@ -51,16 +51,29 @@ Per-kernel ports validate against the **M2 activation dump** (the canonical ds4-
 
 Per layer L=0..42 (regular layers, in `L<LL>/T<TTTT>/`):
 
-| Tag                       | Shape                | Dtype | When           |
-|---------------------------|----------------------|-------|----------------|
-| `layer_input_residual`    | `[n_hc, n_embd]`     | f32   | per (L, T)     |
-| `attn_cur`                | `[n_embd]`           | f32   | per (L, T)     |
-| `attn_input_norm`         | `[n_embd]`           | f32   | per (L, T)     |
-| `ffn_cur`                 | `[n_embd]`           | f32   | per (L, T)     |
-| `ffn_input_norm`          | `[n_embd]`           | f32   | per (L, T)     |
-| `layer_output_residual`   | `[n_hc, n_embd]`     | f32   | per (L, T)     |
-| `weight:attn_norm`        | `[n_embd]`           | f32   | per L (pos=0)  |
-| `weight:ffn_norm`         | `[n_embd]`           | f32   | per L (pos=0)  |
+| Tag                       | Shape                              | Dtype | When           |
+|---------------------------|------------------------------------|-------|----------------|
+| `layer_input_residual`    | `[n_hc, n_embd]`                   | f32   | per (L, T)     |
+| `attn_cur`                | `[n_embd]`                         | f32   | per (L, T)     |
+| `attn_input_norm`         | `[n_embd]`                         | f32   | per (L, T)     |
+| `q_a_out`                 | `[n_lora_q=1024]`                  | f32   | per (L, T)     |
+| `q_a_normed`              | `[n_lora_q=1024]`                  | f32   | per (L, T)     |
+| `q_b_out`                 | `[n_head*n_head_dim=32768]`        | f32   | per (L, T)     |
+| `q_head_normed`           | `[32768]`                          | f32   | per (L, T)     |
+| `q_post_rope`             | `[32768]`                          | f32   | per (L, T)     |
+| `kv_raw_out`              | `[n_head_dim=512]`                 | f32   | per (L, T)     |
+| `kv_normed`               | `[512]`                            | f32   | per (L, T)     |
+| `kv_post_rope`            | `[512]`                            | f32   | per (L, T)     |
+| `ffn_cur`                 | `[n_embd]`                         | f32   | per (L, T)     |
+| `ffn_input_norm`          | `[n_embd]`                         | f32   | per (L, T)     |
+| `layer_output_residual`   | `[n_hc, n_embd]`                   | f32   | per (L, T)     |
+| `weight:attn_norm`        | `[n_embd]`                         | f32   | per L (pos=0)  |
+| `weight:ffn_norm`         | `[n_embd]`                         | f32   | per L (pos=0)  |
+| `weight:q_a_norm`         | `[1024]`                           | f32   | per L (pos=0)  |
+| `weight:kv_a_norm`        | `[512]`                            | f32   | per L (pos=0)  |
+| `weight:rope_params`      | `[6]`                              | f32   | per L (pos=0)  |
+
+`weight:rope_params` packs `[freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow]` — `beta_fast=32`, `beta_slow=1` are hardcoded DeepSeek-V4 defaults in the 0004 patch (ds4 does not parameterise these). `n_ctx_orig` is `DS4_ROPE_ORIG_CTX=65536` when `ext_factor != 0`, 0 otherwise; the dump does not carry it (it's layer-invariant and only consulted in the compressed-layer branch).
 
 Synthetic L=43 (head bucket — added by 0003 patch, in `L43/T<TTTT>/` and `L43/weight/`):
 
@@ -102,15 +115,25 @@ See `crates/v4flash-kernels/tests/rms_norm.rs` for the template.
 
 `max_abs_diff` between our HIP kernel output and the ds4-CPU reference. Float32 arithmetic, so a few ULPs (~1e-6) are expected; the budget per kernel depends on accumulation depth and order sensitivity.
 
-| Kernel                        | Threshold | Measured (gfx1151) | Extra gate            | Notes                                       |
-|-------------------------------|----------:|-------------------:|-----------------------|---------------------------------------------|
-| `rms_norm_weighted`           |    1.0e-4 |             3.8e-6 | —                     | n=4096; double partials, f32 final scale    |
-| `q8_0_matvec` (output head)   |    5.0e-3 |             3.8e-5 | argmax 51/51          | k=4096, n_rows=129280; ds4-faithful Q8_0    |
-| (future) `rope_tail`          |     TBD   |                TBD | —                     |                                             |
-| (future) `iq2_xxs_matmul`     |     TBD   |                TBD | —                     |                                             |
-| (future) `attention_*`        |     TBD   |                TBD | softmax-stable        | Softmax tightens the budget vs raw matmul   |
+| Kernel                        | Threshold | Measured (gfx1151) | Extra gate            | Notes                                                            |
+|-------------------------------|----------:|-------------------:|-----------------------|------------------------------------------------------------------|
+| `rms_norm_weighted`           |    1.0e-4 |             3.8e-6 | —                     | n=4096; double partials, f32 final scale                         |
+| `q8_0_matvec` (output head)   |    5.0e-3 |             3.8e-5 | argmax 51/51          | k=4096, n_rows=129280; ds4-faithful Q8_0                         |
+| `rms_norm_no_weight`          |    1.0e-4 |             3.8e-6 | —                     | n_rows=64, n=512; reused by M10 for output_flat (n_rows=1, n=16384) |
+| `rope_tail` (KV stripe)       |    5.0e-5 |             6.9e-6 | —                     | n_head=1, head_dim=512, n_rot=64; YaRN ramp on 41/43 layers      |
+| `rope_tail` (Q stripe)        |    5.0e-5 |             2.4e-5 | —                     | n_head=64, head_dim=512, n_rot=64; same kernel, larger fan-out   |
+| `q_lora_chain` (M4 chain)     |    5.0e-2 |             1.7e-2 | mean<1e-4             | matvec→rms→matvec→rms_nw→rope; rms amplifies spiky matvec noise  |
+| `kv_chain` (M4 chain)         |    5.0e-3 |             1.7e-3 | mean<1e-5             | matvec→rms→rope; same amplification mechanism on spiky kv_raw    |
+| (future) `iq2_xxs_matmul`     |     TBD   |                TBD | —                     |                                                                  |
+| (future) `attention_*`        |     TBD   |                TBD | softmax-stable        | Softmax tightens the budget vs raw matmul                        |
 
 For Q8_0 specifically, the *argmax-match* check on every logit row is the production correctness gate — FP threshold backs it up but the discrete check is what guarantees "we pick the same greedy token as ds4 in every position."
+
+For the M4 chain oracles, the **mean_abs** is the regression signal, not max_abs. The chain composes 3 (KV) or 5 (Q) kernels; max_abs is dominated by single elements at "spiky" (L, T) positions where a 15σ outlier in the matvec output gets amplified ~10–17x by the subsequent rms_norm (which divides by RMS — small RMS = large 1/RMS = large scale on any noise). The mean_abs stays at f32-ULP (~1e-5 / ~1e-6) across all 1.1–71.9 million element comparisons, confirming the bulk of every output matches ds4 bit-for-bit. The per-stage diagnostics in `tests/attention_setup_chain.rs` log exactly where the amplification kicks in; downstream attention's softmax tolerates ~1% noise on Q/KV values that are O(1)–O(10) in magnitude.
+
+`rms_norm_no_weight`'s standalone test exercises the per-head case (n_rows=64, n=512). The same kernel handles `output_flat` in M10 (n_rows=1, n=16384) — the per-row strided loop has no n cap beyond what fits in 256-thread shared-memory reductions.
+
+`rope_tail`'s inverse path (one extra kernel arg flipping `sin_sign`) is unused by M4 but exercised by the attention output projection's pre-multiply in M5+.
 
 Rationale per threshold should land in each kernel's test docstring.
 
