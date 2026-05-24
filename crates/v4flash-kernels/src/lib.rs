@@ -33,7 +33,7 @@ pub use compressor::{
     Fp8E4m3fnQuantize,
 };
 pub use f16::F16Matvec;
-pub use ffn::Swiglu;
+pub use ffn::{Swiglu, SwigluClampWeighted};
 pub use head::{HcSigmoidBias, HcWeightedSum};
 pub use indexer::{IndexerScore, INDEXER_HEAD_DIM, INDEXER_N_HEAD, INDEXER_TOP_K};
 pub use iq2_xxs::{Iq2XxsPairMatvec, BLOCK_IQ2_XXS_BYTES};
