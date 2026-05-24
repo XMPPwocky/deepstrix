@@ -93,15 +93,19 @@ pub struct Anchor {
 }
 
 impl Anchor {
-    /// Record a timing event on `stream` and capture the host wall-time
-    /// at approximately the same moment. The two times will diverge by
-    /// a few μs (the latency between hipEventRecord and clock_gettime),
-    /// which is well within perfetto's display resolution.
+    /// Record a timing event on `stream`, wait for it to actually fire,
+    /// then capture the host wall-time. `host_ns` thus reflects when the
+    /// anchor event physically completed on the GPU — not when it was
+    /// queued. This matters across streams: queue depths differ at
+    /// startup, so a queue-time capture leaves each track on its own
+    /// uncorrelated wall-clock origin and the perfetto UI shows the
+    /// tracks visibly shifted.
     pub fn new(stream: &Stream, device: Device) -> eyre::Result<Self> {
         device.set_current()?;
         let event = Event::new()?;
-        let host_ns = now_ns();
         event.record(stream)?;
+        stream.synchronize()?;
+        let host_ns = now_ns();
         Ok(Self { event, host_ns })
     }
 
@@ -178,6 +182,28 @@ impl DeviceTimingExporter {
         this.declare_track(this.igpu_compute.uuid, "igpu.compute (device)")?;
         this.declare_track(this.igpu_xfer.uuid, "igpu.xfer (device)")?;
         Ok(this)
+    }
+
+    /// Re-record the per-stream anchors and capture fresh host wall-times.
+    /// Bounds dGPU/iGPU clock drift in long traces — each call resets the
+    /// reference frame, so subsequent events on a track are measured from
+    /// the most recent anchor on that same track. Call once per
+    /// `forward_token` (after emit_slice for the current token's events
+    /// completes) to bound drift to a single token's duration.
+    pub fn re_anchor(
+        &mut self,
+        dgpu: Device,
+        dgpu_compute_stream: &Stream,
+        dgpu_xfer_stream: &Stream,
+        igpu: Device,
+        igpu_compute_stream: &Stream,
+        igpu_xfer_stream: &Stream,
+    ) -> eyre::Result<()> {
+        self.dgpu_compute.anchor = Anchor::new(dgpu_compute_stream, dgpu)?;
+        self.dgpu_xfer.anchor = Anchor::new(dgpu_xfer_stream, dgpu)?;
+        self.igpu_compute.anchor = Anchor::new(igpu_compute_stream, igpu)?;
+        self.igpu_xfer.anchor = Anchor::new(igpu_xfer_stream, igpu)?;
+        Ok(())
     }
 
     fn declare_track(&mut self, uuid: u64, name: &str) -> eyre::Result<()> {

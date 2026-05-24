@@ -216,7 +216,7 @@ pub struct HeterogeneousEngine {
     /// EventPools at the end of each `forward_token` into per-stream
     /// perfetto tracks. Enable by calling
     /// [`HeterogeneousEngine::attach_perfetto`].
-    pub perfetto: Option<DeviceTimingExporter>,
+    pub perfetto: Option<std::sync::Mutex<DeviceTimingExporter>>,
 }
 
 impl HeterogeneousEngine {
@@ -280,7 +280,8 @@ impl HeterogeneousEngine {
         // Emit device-time perfetto tracks (if enabled) before the
         // summary harvest — this only reads events that have already
         // completed (we sync on the last event inside for_each_pair).
-        if let Some(exp) = &self.perfetto {
+        if let Some(exp_lock) = &self.perfetto {
+            let mut exp = exp_lock.lock().unwrap();
             self.dgpu.events.for_each_pair(|name, s, e| {
                 let track = if name.contains(".xfer") || name.contains(".peer_push") {
                     &exp.dgpu_xfer
@@ -297,6 +298,19 @@ impl HeterogeneousEngine {
                 };
                 exp.emit_slice(track, name, s, e)
             })?;
+            // Re-anchor for the next token to bound dGPU/iGPU clock drift.
+            // All streams are already synced at this point (compute via
+            // `self.dgpu.compute.synchronize()` above, igpu via the various
+            // readbacks inside forward_layer), so Anchor::new's per-stream
+            // synchronize is essentially free.
+            exp.re_anchor(
+                self.dgpu.device,
+                &self.dgpu.compute,
+                &self.dgpu.xfer,
+                self.igpu.device,
+                &self.igpu.compute,
+                &self.igpu.xfer,
+            )?;
         }
 
         // Harvest per-kernel timings.
@@ -414,7 +428,7 @@ impl HeterogeneousEngine {
             &self.igpu.compute,
             &self.igpu.xfer,
         )?;
-        self.perfetto = Some(exporter);
+        self.perfetto = Some(std::sync::Mutex::new(exporter));
         Ok(())
     }
 }
