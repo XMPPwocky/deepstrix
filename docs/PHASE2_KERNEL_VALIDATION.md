@@ -160,9 +160,14 @@ See `crates/v4flash-kernels/tests/rms_norm.rs` for the template.
 | `hc_sigmoid_bias` (M10)       |    1.0e-5 |             2.2e-6 | —                     | sigmoid_stable(pre*scale+base)+ε; CPU/GPU expf gap dominates noise |
 | `hc_weighted_sum` (M10)       |    5.0e-2 |             1.0e-2 | mean<1e-4             | 4-stream weighted-add over 4096; head + future per-layer hc_pre   |
 | `head_chain` (M10)            |    5.0e-2 |             1.0e-2 | mean<1e-4             | rms_no_weight→F16 matvec→sigmoid_bias→hc_weighted_sum vs output_embd |
-| (deferred) `iq2_xxs_experts`  |     TBD   |                TBD | —                     | Routed gate/up; complex codebook dequant; M11 expected            |
-| (deferred) `q2_k_experts`     |     TBD   |                TBD | —                     | Routed down + accumulate-over-experts; K-quants superblock; M11   |
-| (future) `iq2_xxs_matmul`     |     TBD   |                TBD | —                     |                                                                  |
+| `q8_k_quantize` (M11)         |     0     |                  0 | bit-exact             | f32→Q8_K activation packer; 8.98M samples; CPU-port match exact   |
+| `iq2_xxs_pair_matvec` (M11)   |    1.0e-5 |             9.5e-7 | mean<1e-6             | F32 reduction-tree order vs CPU sequential; integer bsum bit-exact |
+| `q2_k_accumulate_matvec` (M11)|    1.0e-5 |             3.6e-7 | mean<1e-6             | Routed down + per-expert accumulator; integer bsum bit-exact      |
+| `routed_moe` chain (M11)      |    5.0e-2 |             3.0e-6 | mean<1e-3             | Full MoE: q8_k → iq2_xxs_pair × 6 → swiglu+clamp → q8_k → q2_k × 6 |
+| `hc_sinkhorn` (M11)           |    —      |              —     | folded into mhc_chain | 24-element single-thread Sinkhorn; n_hc=4 iters=20                |
+| `hc_post` (M11)               |    —      |              —     | folded into mhc_chain | block_out × post + sum(comb · residual); per-(dst,embd) thread    |
+| `mhc_chain` attn_cur (M11)    |    5.0e-2 |             1.7e-6 | mean<1e-5             | layer_input_residual → rms_nw → F16 matvec → sinkhorn → weighted_sum |
+| `mhc_chain` ffn_cur (M11)     |    5.0e-2 |             1.6e-6 | mean<1e-5             | + hc_post(attn_out) → same chain on FFN side                      |
 
 For Q8_0 specifically, the *argmax-match* check on every logit row is the production correctness gate — FP threshold backs it up but the discrete check is what guarantees "we pick the same greedy token as ds4 in every position."
 
@@ -179,6 +184,21 @@ For M7: the CSA producer loop is closed. Our compressor (composing F16 matvec×2
 For M6: `attention_mixed` is the generalised softmax that subsumes the SWA case. When `n_comp == 0` and `mask == None`, it reduces bit-for-bit to `attention_swa` (verified in block 1 of the oracle: max_abs=2.86e-6 matches M5). The masked-comp path uses `expf(-INFINITY - max_score) = 0` to drop masked rows from both denom and axpy — no explicit branching in phase 3/4. M6's scoping is **consumer-first**: `comp_kv_row` and `comp_allowed_mask` are dumped from ds4 and consumed directly by the kernel test, so the mixed_one softmax is validated standalone before the *producers* (compressor + indexer) land in M7. After M7, the same chain test runs end-to-end with our own kernel-produced comp_kv + comp_allowed, closing the loop.
 
 For M10 (head ops): `hc_sigmoid_bias` and `hc_weighted_sum` close the L43 head chain — from the final layer's HC residual through the head's RMS norm + F16 matvec + sigmoid + 4-stream weighted blend, ending at `output_embd` which feeds directly into M3's `rms_norm_weighted` + `q8_0_matvec` head projection. With M10 head ops done, the full forward pass from M4's attention setup through M9's shared expert + M3's output head is composed of validated HIP kernels for the SWA layers (L=0,1) and for the shared-expert path on every layer. What remains for end-to-end forward: routed-expert kernels (IQ2_XXS gate/up + Q2_K down, deferred to M11) and the per-layer mHC pre/post Sinkhorn composition (also deferred to M11).
+
+For M11 (kernel completeness): three routed-expert quant kernels (`q8_k_quantize`, `iq2_xxs_pair_matvec`, `q2_k_accumulate_matvec`) plus a SwiGLU variant with two-sided clamp + per-expert weight close out the MoE math. The `routed_moe` chain oracle composes the full per-token routed pipeline (q8_k → iq2_xxs paired × 6 selected experts → swiglu+clamp+weight → q8_k(mid) × 6 → q2_k_accumulate × 6) and matches ds4's `ffn_moe` tag at max=5.5e-4, mean=3.0e-6 across 51 tokens. The IQ2_XXS implementation borrows the `__builtin_amdgcn_sudot4` dp4a from M3's Q8_0 path and ports CUDA's SIMD-video intrinsics (`__vcmpne4`, `__vsub4`) to portable byte-mask + scalar negation since HIP doesn't expose them. The per-layer mHC composition is closed by `hc_sinkhorn` (a tiny single-thread kernel running the 20-iter alternating row/col Sinkhorn normalisation) and `hc_post` (per-(dst, embd) thread blending block_out via post + residual via comb). The `mhc_chain` oracle validates both sub-chains (hc_pre_attn → attn_cur and hc_post_attn + hc_pre_ffn → ffn_cur) across all 43 layers × 51 tokens at max=4.4e-3, mean=1.6e-6. With M11 done, the V4-Flash forward pass is fully covered kernel-by-kernel:
+  - **Embedding**: trivial F16 row read into F32 (one-line kernel, will land with the M11.6 orchestrator).
+  - **Per-layer mHC pre/post**: M11 (hc_sinkhorn + hc_post + reused M2/M7/M10 kernels).
+  - **Attention setup (Q/KV LoRA + RoPE)**: M4.
+  - **Attention compute (SWA + mixed softmax)**: M5 + M6.
+  - **CSA producers (compressor + indexer)**: M7.
+  - **Output projection (grouped Q8_0 + Q8_0)**: M5.
+  - **MoE router (hash-gate + learned)**: M8.
+  - **Shared expert (Q8_0 + SwiGLU)**: M9.
+  - **Routed experts (IQ2_XXS + Q2_K + SwiGLU+clamp+weight + accumulator)**: M11.
+  - **Head ops (RMS + F16 + sigmoid+bias + weighted_sum)**: M10.
+  - **Vocab projection (Q8_0)**: M3.
+
+What remains: the top-level orchestrator that calls these in sequence per token, holds the 86 GB of weights across the 80 GB iGPU budget (mmap'd routed-expert tensors streamed per layer), and emits logits to byte-compare against `logits.f32`. This is integration work — every component is now validated, the only risk is the buffer-management plumbing. Phase 1 M12 owns the orchestrator + the full validation suite + the performance pass.
 
 Rationale per threshold should land in each kernel's test docstring.
 
