@@ -12,9 +12,11 @@
 //! from the activation dump and asserts `max_abs_diff < threshold`.
 
 pub mod oracle;
+pub mod q8_0;
 pub mod rms_norm;
 pub mod weights;
 
 pub use oracle::{ActivationDump, Dtype, TensorEntry};
+pub use q8_0::Q8_0Matvec;
 pub use rms_norm::RmsNorm;
 pub use weights::{load_to_device, DeviceWeight};
