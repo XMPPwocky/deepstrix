@@ -180,3 +180,67 @@ extern "C" __global__ void iq2_xxs_pair_matvec_par(
         up[row]   = u_sum;
     }
 }
+
+// Fused variant: paired iq2 matvec → silu_clamp(g) * clamp(u) * expert_w[slot]
+// → writes directly to mid[slot * n_rows + row], skipping the intermediate
+// gate_cat / up_cat buffers and the standalone swiglu_clamp_weighted kernel.
+// (M14e — eliminates ~192 KiB/layer of memory round-trip + one launch per
+// layer.)
+//
+// Mirrors swiglu_clamp_weighted semantics:
+//   g = min(g, clamp)
+//   u = clamp(u, -clamp, clamp)
+//   mid = silu(g) * u * expert_w[slot]
+//
+// `clamp <= 1e-6` disables clamping (matches stand-alone kernel).
+//
+// Launch geometry identical to iq2_xxs_pair_matvec_par:
+//   grid:  (n_rows / 8, 1, 1)
+//   block: (256, 1, 1)
+extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu(
+        float        * __restrict__ mid,         // [n_experts, n_rows]
+        const uint8_t * __restrict__ gate_w,
+        const uint8_t * __restrict__ up_w,
+        const uint8_t * __restrict__ xq,
+        const float  * __restrict__ expert_w,    // [n_experts]
+        unsigned int    slot,
+        float           clamp,
+        unsigned int    n_rows,
+        unsigned int    n_blocks) {
+    const unsigned int row_in_block = threadIdx.x / 32u;
+    const unsigned int lane         = threadIdx.x & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    if (row >= n_rows) return;
+
+    const unsigned int block_lane = lane >> 1u;
+    const unsigned int ib32_lo    = (lane & 1u) * 4u;
+
+    const uint8_t* gate_row_base = gate_w + (uint64_t)row * n_blocks * BLOCK_IQ2_XXS_BYTES;
+    const uint8_t* up_row_base   = up_w   + (uint64_t)row * n_blocks * BLOCK_IQ2_XXS_BYTES;
+
+    float g_sum = 0.0f;
+    float u_sum = 0.0f;
+
+    for (unsigned int b = block_lane; b < n_blocks; b += 16u) {
+        const uint8_t* w_g = gate_row_base + (uint64_t)b * BLOCK_IQ2_XXS_BYTES;
+        const uint8_t* w_u = up_row_base   + (uint64_t)b * BLOCK_IQ2_XXS_BYTES;
+        const uint8_t* y   = xq            + (uint64_t)b * BLOCK_Q8_K_BYTES;
+        g_sum += dot_block_half(w_g, y, ib32_lo);
+        u_sum += dot_block_half(w_u, y, ib32_lo);
+    }
+
+    g_sum = warp_sum_f32_par(g_sum);
+    u_sum = warp_sum_f32_par(u_sum);
+
+    if (lane == 0) {
+        const float ew = expert_w[slot];
+        if (clamp > 1.0e-6f) {
+            if (g_sum > clamp)  g_sum = clamp;
+            if (u_sum > clamp)  u_sum = clamp;
+            if (u_sum < -clamp) u_sum = -clamp;
+        }
+        const float sig = 1.0f / (1.0f + expf(-g_sum));
+        mid[(uint64_t)slot * (uint64_t)n_rows + (uint64_t)row] =
+            g_sum * sig * u_sum * ew;
+    }
+}

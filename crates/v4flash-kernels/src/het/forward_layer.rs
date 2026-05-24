@@ -792,35 +792,25 @@ impl HeterogeneousEngine {
                 BLOCKS_Q8K_GATE_IN,
             )?;
         }
+        // M14e: per-slot iq2_pair fused with swiglu_clamp_weighted — writes
+        // directly into d_mid_cat[slot, :], no gate_cat/up_cat round-trip
+        // and no separate swiglu launch.
         for slot in 0..N_EXPERT_USED {
             let e = selected[slot] as usize;
-            let _t = ie.events.stage("k.moe.iq2_pair", &ie.compute)?;
-            ie.iq2.launch_with_full_offsets(
+            let _t = ie.events.stage("k.moe.iq2_fused", &ie.compute)?;
+            ie.iq2.launch_fused_swiglu(
                 &ie.compute,
-                &mut igpu_scratch.d_gate_cat,
-                slot * (N_FF_EXP as usize),
-                &mut igpu_scratch.d_up_cat,
-                slot * (N_FF_EXP as usize),
+                &mut igpu_scratch.d_mid_cat,
                 &ilw.routed.gate.buffer,
                 e * gbpe,
                 &ilw.routed.up.buffer,
                 e * ubpe,
                 &igpu_scratch.d_xq_q8k,
-                N_FF_EXP,
-                BLOCKS_Q8K_GATE_IN,
-            )?;
-        }
-        {
-            let _t = ie.events.stage("k.moe.swiglu_cw", &ie.compute)?;
-            ie.swiglu_cw.launch(
-                &ie.compute,
-                &mut igpu_scratch.d_mid_cat,
-                &igpu_scratch.d_gate_cat,
-                &igpu_scratch.d_up_cat,
                 &igpu_scratch.d_ew,
+                slot as u32,
                 SWIGLU_CLAMP_EXP,
                 N_FF_EXP,
-                N_EXPERT_USED as u32,
+                BLOCKS_Q8K_GATE_IN,
             )?;
         }
         let mid_blocks_bytes = (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
