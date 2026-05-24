@@ -18,5 +18,5 @@ pub mod weights;
 
 pub use oracle::{ActivationDump, Dtype, TensorEntry};
 pub use q8_0::Q8_0Matvec;
-pub use rms_norm::RmsNorm;
+pub use rms_norm::{RmsNorm, RmsNormNoWeight};
 pub use weights::{load_to_device, DeviceWeight};
