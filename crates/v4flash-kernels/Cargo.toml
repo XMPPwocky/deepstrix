@@ -19,3 +19,7 @@ v4flash-core = { path = "../v4flash-core" }
 
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "deepstrix-complete"
+path = "src/bin/complete.rs"

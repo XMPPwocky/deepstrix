@@ -22,7 +22,7 @@
 
 #include <hip/hip_runtime.h>
 
-#define ATTN_MIXED_MAX_KEYS 144  // 128 raw + 14 comp + headroom for M1 prompt
+#define ATTN_MIXED_MAX_KEYS 256  // 128 raw (SWA cap) + 128 comp (longest practical)
 
 extern "C" __global__ void attention_mixed(
         float          * out,

@@ -108,6 +108,11 @@ pub const N_INDEXER_HEAD: u32 = 64;
 pub const N_INDEXER_HEAD_DIM: u32 = 128;
 pub const INDEXER_TOP_K: u32 = 512;
 
+/// Sliding-window attention size. Once a layer's raw KV cache reaches this
+/// many rows, pushing a new row evicts the oldest (memmove-style slide).
+/// Mirrors ds4's `DS4_N_SWA = 128`. Applies to all layers (dense + mixed).
+pub const SWA_WINDOW: u32 = 128;
+
 /// Compress ratios per layer (from GGUF metadata
 /// `deepseek4.attention.compress_ratios`). Length 43.
 pub const COMPRESS_RATIOS: [u32; 43] = [
@@ -1176,9 +1181,22 @@ impl Engine {
         let mut kv_host = vec![0f32; N_HEAD_DIM as usize];
         self.stream.synchronize()?;
         scratch.kv_normed.copy_to_host(&mut kv_host)?;
-        let off = (ls.n_raw as usize) * (N_HEAD_DIM as usize);
-        ls.kv_cache_host[off..off + (N_HEAD_DIM as usize)].copy_from_slice(&kv_host);
-        ls.n_raw += 1;
+        // SWA push: if cache has reached SWA_WINDOW (128), evict the oldest
+        // row by shifting [1..128) → [0..127) and writing the new row at
+        // slot 127. Mirrors `kv_cache_push_raw` (ds4.c:6387) memmove path.
+        let stride = N_HEAD_DIM as usize;
+        if ls.n_raw < SWA_WINDOW {
+            let off = (ls.n_raw as usize) * stride;
+            ls.kv_cache_host[off..off + stride].copy_from_slice(&kv_host);
+            ls.n_raw += 1;
+        } else {
+            // Evict-oldest slide.
+            let total = (SWA_WINDOW as usize) * stride;
+            ls.kv_cache_host.copy_within(stride..total, 0);
+            let last_off = ((SWA_WINDOW - 1) as usize) * stride;
+            ls.kv_cache_host[last_off..last_off + stride].copy_from_slice(&kv_host);
+            // n_raw stays at SWA_WINDOW.
+        }
         // Re-upload entire KV cache shadow (simplest; small).
         ls.kv_cache.copy_from_host(&ls.kv_cache_host)?;
 

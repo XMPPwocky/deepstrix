@@ -47,6 +47,7 @@ fn run(path: &str, show_tensors: bool, key_filter: Option<&str>) -> eyre::Result
 
     if let Some(key) = key_filter {
         match g.metadata(key) {
+            Some(GgufValue::String(s)) => println!("{s}"),
             Some(v) => print_value(&format!("{key}"), v, 0),
             None => println!("  (no metadata key {key:?})"),
         }

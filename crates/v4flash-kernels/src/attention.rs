@@ -18,13 +18,18 @@ const ATTENTION_MIXED_GFX1201: &[u8] = include_bytes!(env!("KERNEL_ATTENTION_MIX
 const ATTENTION_MIXED_GFX1151: &[u8] = include_bytes!(env!("KERNEL_ATTENTION_MIXED_GFX1151"));
 
 /// Compile-time max for the kernel's shared-memory `scores`/`weights`
-/// arrays. Matches the SWA window size in ds4 (`DS4_N_SWA = 128`).
+/// arrays. Matches the SWA window size (`SWA_WINDOW = 128`); the
+/// forward orchestrator caps `n_raw` at this value via memmove-eviction
+/// so this is never exceeded.
 pub const ATTN_SWA_MAX_KV: u32 = 128;
 
 /// Compile-time max for `attention_mixed`'s `scores`/`weights` arrays;
-/// must cover `n_raw + n_comp`. For V4 Flash + the M1 prompt, the worst
-/// case is ratio==4 with n_raw=128 (cap) + n_comp ≤ 14 → 142, rounded to 144.
-pub const ATTN_MIXED_MAX_KEYS: u32 = 144;
+/// must cover `n_raw + n_comp`. Raw is permanently capped at SWA_WINDOW
+/// (128) by the forward orchestrator's sliding eviction; comp grows
+/// unbounded until cap_comp (set per allocation in `ModelState::alloc`).
+/// 256 covers up to 128 raw + 128 comp = 512 tokens at ratio=4, which is
+/// our practical near-term demo bound.
+pub const ATTN_MIXED_MAX_KEYS: u32 = 256;
 
 pub struct AttentionSwa {
     module: Module,
