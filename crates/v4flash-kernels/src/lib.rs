@@ -21,7 +21,7 @@ pub mod rope;
 pub mod weights;
 
 pub use attention::{AttentionMixed, AttentionSwa, ATTN_MIXED_MAX_KEYS, ATTN_SWA_MAX_KV};
-pub use compressor::CompressorPool;
+pub use compressor::{CompressorPool, Fp8E4m3fnQuantize};
 pub use f16::F16Matvec;
 pub use oracle::{ActivationDump, Dtype, TensorEntry};
 pub use q8_0::{Q8_0GroupedMatvec, Q8_0Matvec};
