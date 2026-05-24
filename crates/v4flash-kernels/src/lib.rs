@@ -15,6 +15,7 @@ pub mod attention;
 pub mod compressor;
 pub mod f16;
 pub mod ffn;
+pub mod head;
 pub mod indexer;
 pub mod oracle;
 pub mod q8_0;
@@ -29,6 +30,7 @@ pub use compressor::{
 };
 pub use f16::F16Matvec;
 pub use ffn::Swiglu;
+pub use head::{HcSigmoidBias, HcWeightedSum};
 pub use indexer::{IndexerScore, INDEXER_HEAD_DIM, INDEXER_N_HEAD, INDEXER_TOP_K};
 pub use oracle::{ActivationDump, Dtype, TensorEntry};
 pub use q8_0::{Q8_0GroupedMatvec, Q8_0Matvec};
