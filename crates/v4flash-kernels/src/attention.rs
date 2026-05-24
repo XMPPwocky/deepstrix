@@ -14,9 +14,17 @@ use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
 const ATTENTION_SWA_GFX1201: &[u8] = include_bytes!(env!("KERNEL_ATTENTION_SWA_GFX1201"));
 const ATTENTION_SWA_GFX1151: &[u8] = include_bytes!(env!("KERNEL_ATTENTION_SWA_GFX1151"));
 
+const ATTENTION_MIXED_GFX1201: &[u8] = include_bytes!(env!("KERNEL_ATTENTION_MIXED_GFX1201"));
+const ATTENTION_MIXED_GFX1151: &[u8] = include_bytes!(env!("KERNEL_ATTENTION_MIXED_GFX1151"));
+
 /// Compile-time max for the kernel's shared-memory `scores`/`weights`
 /// arrays. Matches the SWA window size in ds4 (`DS4_N_SWA = 128`).
 pub const ATTN_SWA_MAX_KV: u32 = 128;
+
+/// Compile-time max for `attention_mixed`'s `scores`/`weights` arrays;
+/// must cover `n_raw + n_comp`. For V4 Flash + the M1 prompt, the worst
+/// case is ratio==4 with n_raw=128 (cap) + n_comp ≤ 14 → 142, rounded to 144.
+pub const ATTN_MIXED_MAX_KEYS: u32 = 144;
 
 pub struct AttentionSwa {
     module: Module,
@@ -106,6 +114,141 @@ impl AttentionSwa {
             &mut n_head_v as *mut _ as *mut c_void,
             &mut head_dim_v as *mut _ as *mut c_void,
             &mut n_kv_v as *mut _ as *mut c_void,
+            &mut kq_scale_v as *mut _ as *mut c_void,
+        ];
+
+        let cfg = LaunchConfig {
+            grid: (n_head, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+}
+
+/// Mixed-attention compute — mirrors ds4's `layer_attention_mixed_one_decode_scratch`
+/// (ds4.c:6738). Extends [`AttentionSwa`] with compressed-KV rows and an
+/// optional per-comp-row allow mask. Used by V4 Flash layers L≥2 (ratio>0).
+///
+/// When `n_comp == 0` and `mask` is `None`, this reduces to the SWA case
+/// bit-for-bit — useful for covering all attention paths with one kernel.
+pub struct AttentionMixed {
+    module: Module,
+}
+
+impl AttentionMixed {
+    pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            ATTENTION_MIXED_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            ATTENTION_MIXED_GFX1151
+        } else {
+            return Err(eyre!("unsupported arch for attention_mixed kernel: {arch}"));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    /// Launch the mixed-attention kernel.
+    ///
+    /// - `out`:     `[n_head * head_dim]`
+    /// - `q`:       `[n_head * head_dim]` (post-RoPE)
+    /// - `raw_kv`:  `[n_raw * head_dim]`  (f16-precision values in f32 cells)
+    /// - `comp_kv`: `[n_comp * head_dim]` or `None` when `n_comp == 0`
+    /// - `mask`:    `[n_comp]` i32 (0 = blocked, 1 = permitted) or `None` = all-permit
+    /// - `sinks`:   `[n_head]`
+    /// - `n_raw + n_comp ≤ ATTN_MIXED_MAX_KEYS`
+    pub fn launch(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<f32>,
+        comp_kv: Option<&DeviceBuffer<f32>>,
+        mask: Option<&DeviceBuffer<i32>>,
+        sinks: &DeviceBuffer<f32>,
+        n_head: u32,
+        head_dim: u32,
+        n_raw: u32,
+        n_comp: u32,
+    ) -> eyre::Result<()> {
+        if n_raw + n_comp > ATTN_MIXED_MAX_KEYS {
+            return Err(eyre!(
+                "attention_mixed: n_raw+n_comp={} exceeds kernel cap {ATTN_MIXED_MAX_KEYS}",
+                n_raw + n_comp
+            ));
+        }
+        if n_raw == 0 {
+            return Err(eyre!("attention_mixed: n_raw must be > 0"));
+        }
+        if n_comp > 0 && comp_kv.is_none() {
+            return Err(eyre!(
+                "attention_mixed: n_comp={n_comp} but comp_kv is None"
+            ));
+        }
+
+        let needed_out = (n_head as usize) * (head_dim as usize);
+        if out.len() < needed_out || q.len() < needed_out {
+            return Err(eyre!(
+                "attention_mixed: out/q have {}/{} elems, need {}",
+                out.len(),
+                q.len(),
+                needed_out
+            ));
+        }
+        if raw_kv.len() < (n_raw as usize) * (head_dim as usize) {
+            return Err(eyre!(
+                "attention_mixed: raw_kv has {} elems, need n_raw*head_dim={}",
+                raw_kv.len(),
+                (n_raw as usize) * (head_dim as usize)
+            ));
+        }
+        if let Some(ck) = comp_kv {
+            if ck.len() < (n_comp as usize) * (head_dim as usize) {
+                return Err(eyre!(
+                    "attention_mixed: comp_kv has {} elems, need n_comp*head_dim={}",
+                    ck.len(),
+                    (n_comp as usize) * (head_dim as usize)
+                ));
+            }
+        }
+        if let Some(m) = mask {
+            if m.len() < n_comp as usize {
+                return Err(eyre!(
+                    "attention_mixed: mask has {} elems, need n_comp={n_comp}",
+                    m.len()
+                ));
+            }
+        }
+
+        let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
+        let function = self.module.get_function("attention_mixed")?;
+
+        let null_ptr: *mut c_void = std::ptr::null_mut();
+
+        let mut out_ptr = out.raw();
+        let mut q_ptr = q.raw();
+        let mut raw_kv_ptr = raw_kv.raw();
+        let mut comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(null_ptr);
+        let mut mask_ptr = mask.map(|b| b.raw()).unwrap_or(null_ptr);
+        let mut sinks_ptr = sinks.raw();
+        let mut n_head_v = n_head;
+        let mut head_dim_v = head_dim;
+        let mut n_raw_v = n_raw;
+        let mut n_comp_v = n_comp;
+        let mut kq_scale_v = kq_scale;
+
+        let mut args: [*mut c_void; 11] = [
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut raw_kv_ptr as *mut _ as *mut c_void,
+            &mut comp_kv_ptr as *mut _ as *mut c_void,
+            &mut mask_ptr as *mut _ as *mut c_void,
+            &mut sinks_ptr as *mut _ as *mut c_void,
+            &mut n_head_v as *mut _ as *mut c_void,
+            &mut head_dim_v as *mut _ as *mut c_void,
+            &mut n_raw_v as *mut _ as *mut c_void,
+            &mut n_comp_v as *mut _ as *mut c_void,
             &mut kq_scale_v as *mut _ as *mut c_void,
         ];
 
