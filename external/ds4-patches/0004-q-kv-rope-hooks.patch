@@ -1,0 +1,88 @@
+diff --git a/ds4.c b/ds4.c
+--- a/ds4.c
++++ b/ds4.c
+@@ -4688,10 +4688,25 @@
+         ds4_cpu_decode_scratch  * scratch) {
+     const float *q_a_norm = tensor_data(model, layer->attn_q_a_norm);
+ 
++    /* deepstrix dump: Q LoRA factor norm weight (deduped at pos==0). */
++    if (g_ds4_dump_pos == 0) {
++        ds4_dump_emit_1d("weight:q_a_norm", q_a_norm,
++                         DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_LORA_Q);
++    }
++
+     matvec_q8_0_decode_scratch(scratch->qr, model, layer->attn_q_a, norm, scratch);
++    ds4_dump_emit_1d("q_a_out", scratch->qr, DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_LORA_Q);
++
+     rms_norm_weight(qr_norm, scratch->qr, q_a_norm, 1024, DS4_RMS_EPS);
++    ds4_dump_emit_1d("q_a_normed", qr_norm, DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_LORA_Q);
++
+     matvec_q8_0_decode_scratch(q, model, layer->attn_q_b, qr_norm, scratch);
++    ds4_dump_emit_1d("q_b_out", q, DS4_DUMP_DTYPE_F32,
++                     (int64_t)((uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM));
++
+     head_rms_norm_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
++    ds4_dump_emit_1d("q_head_normed", q, DS4_DUMP_DTYPE_F32,
++                     (int64_t)((uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM));
+ }
+ 
+ static void layer_kv_projection_normed_one_decode_scratch(
+@@ -4702,8 +4717,17 @@
+         ds4_cpu_decode_scratch  * scratch) {
+     const float *kv_norm = tensor_data(model, layer->attn_kv_a_norm);
+ 
++    /* deepstrix dump: KV factor norm weight (deduped at pos==0). */
++    if (g_ds4_dump_pos == 0) {
++        ds4_dump_emit_1d("weight:kv_a_norm", kv_norm,
++                         DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_HEAD_DIM);
++    }
++
+     matvec_q8_0_decode_scratch(scratch->kv_raw, model, layer->attn_kv, normed, scratch);
++    ds4_dump_emit_1d("kv_raw_out", scratch->kv_raw, DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_HEAD_DIM);
++
+     rms_norm_weight(kv, scratch->kv_raw, kv_norm, DS4_N_HEAD_DIM, DS4_RMS_EPS);
++    ds4_dump_emit_1d("kv_normed", kv, DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_HEAD_DIM);
+ }
+ 
+ static float rope_yarn_ramp(float low, float high, int i0) {
+@@ -7544,9 +7568,40 @@
+                                                   scratch);
+     if (profile) t_kv = now_sec() - t0;
+ 
++    /* deepstrix dump: per-layer RoPE parameters (deduped at pos==0).
++     * 6 floats: [freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow].
++     * beta_fast/beta_slow are hardcoded to DeepSeek-V4 defaults (32, 1) since
++     * ds4 does not parameterise them; M4 RoPE port treats them as a side-channel. */
++    if (pos == 0) {
++        const bool _ds4_dump_compressed = ds4_layer_compress_ratio(il) != 0;
++        const float _ds4_dump_freq_base = layer_rope_freq_base(il);
++        const float _ds4_dump_freq_scale = layer_rope_freq_scale(il);
++        const float _ds4_dump_ext_factor =
++            _ds4_dump_compressed && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
++        float _ds4_dump_attn_factor = 1.0f;
++        if (_ds4_dump_ext_factor != 0.0f && _ds4_dump_freq_scale > 0.0f) {
++            _ds4_dump_attn_factor /=
++                1.0f + 0.1f * logf(1.0f / _ds4_dump_freq_scale);
++        }
++        const float _ds4_dump_rope_params[6] = {
++            _ds4_dump_freq_base,
++            _ds4_dump_freq_scale,
++            _ds4_dump_ext_factor,
++            _ds4_dump_attn_factor,
++            32.0f,  /* beta_fast */
++            1.0f,   /* beta_slow */
++        };
++        ds4_dump_emit_1d("weight:rope_params", _ds4_dump_rope_params,
++                         DS4_DUMP_DTYPE_F32, 6);
++    }
++
+     t0 = profile ? now_sec() : 0.0;
+     rope_tail_layer_inplace(scratch->q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
++    ds4_dump_emit_1d("q_post_rope", scratch->q, DS4_DUMP_DTYPE_F32,
++                     (int64_t)((uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM));
+     rope_tail_layer_inplace(scratch->kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
++    ds4_dump_emit_1d("kv_post_rope", scratch->kv, DS4_DUMP_DTYPE_F32,
++                     (int64_t)((uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM));
+     dsv4_fp8_kv_quantize_row_inplace_cpu(scratch->kv, DS4_N_HEAD_DIM, DS4_N_ROT);
+ 
+     kv_cache_push_raw(cache, scratch->kv);
