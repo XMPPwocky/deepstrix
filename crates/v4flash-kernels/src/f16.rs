@@ -14,6 +14,10 @@ const F16_MATVEC_NARROW_GFX1201: &[u8] =
     include_bytes!(env!("KERNEL_F16_MATVEC_NARROW_GFX1201"));
 const F16_MATVEC_NARROW_GFX1151: &[u8] =
     include_bytes!(env!("KERNEL_F16_MATVEC_NARROW_GFX1151"));
+const F16_MATVEC_PAIR_GFX1201: &[u8] =
+    include_bytes!(env!("KERNEL_F16_MATVEC_PAIR_GFX1201"));
+const F16_MATVEC_PAIR_GFX1151: &[u8] =
+    include_bytes!(env!("KERNEL_F16_MATVEC_PAIR_GFX1151"));
 
 const GEMV_ROWS_PER_BLOCK: u32 = 8;
 const GEMV_WARP_LANES: u32 = 32;
@@ -30,20 +34,96 @@ const NARROW_ROWS_THRESHOLD: u32 = 64;
 pub struct F16Matvec {
     wide: Module,
     narrow: Module,
+    pair: Module,
 }
 
 impl F16Matvec {
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
-        let (wide_img, narrow_img): (&[u8], &[u8]) = if arch.starts_with("gfx1201") {
-            (F16_MATVEC_GFX1201, F16_MATVEC_NARROW_GFX1201)
+        let (wide_img, narrow_img, pair_img): (&[u8], &[u8], &[u8]) = if arch.starts_with("gfx1201") {
+            (
+                F16_MATVEC_GFX1201,
+                F16_MATVEC_NARROW_GFX1201,
+                F16_MATVEC_PAIR_GFX1201,
+            )
         } else if arch.starts_with("gfx1151") {
-            (F16_MATVEC_GFX1151, F16_MATVEC_NARROW_GFX1151)
+            (
+                F16_MATVEC_GFX1151,
+                F16_MATVEC_NARROW_GFX1151,
+                F16_MATVEC_PAIR_GFX1151,
+            )
         } else {
             return Err(eyre!("unsupported arch for f16_matvec: {arch}"));
         };
         let wide = Module::load_data(wide_img)?;
         let narrow = Module::load_data(narrow_img)?;
-        Ok(Self { wide, narrow })
+        let pair = Module::load_data(pair_img)?;
+        Ok(Self { wide, narrow, pair })
+    }
+
+    /// Paired matvec: `kv[r] = W_kv[r] · x`, `gate[r] = W_gate[r] · x` for
+    /// r in 0..n_rows. Single launch; activation reads shared in cache;
+    /// half2/float2-vectorized loads with two independent accumulators
+    /// per output (M14h).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_pair(
+        &self,
+        stream: &Stream,
+        kv: &mut DeviceBuffer<f32>,
+        gate: &mut DeviceBuffer<f32>,
+        kv_w: &DeviceBuffer<u8>,
+        gate_w: &DeviceBuffer<u8>,
+        x: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+    ) -> eyre::Result<()> {
+        let expected = (n_rows as usize) * (k as usize) * 2;
+        if kv_w.byte_len() != expected || gate_w.byte_len() != expected {
+            return Err(eyre!(
+                "f16 matvec_pair: weight bytes mismatch (kv={}, gate={}, expected={})",
+                kv_w.byte_len(),
+                gate_w.byte_len(),
+                expected
+            ));
+        }
+        if kv.len() < n_rows as usize || gate.len() < n_rows as usize {
+            return Err(eyre!(
+                "f16 matvec_pair: out len short (kv={}, gate={}, n_rows={n_rows})",
+                kv.len(),
+                gate.len()
+            ));
+        }
+        if x.len() < k as usize {
+            return Err(eyre!("f16 matvec_pair: x len {} < k {k}", x.len()));
+        }
+        if k % 2 != 0 {
+            return Err(eyre!("f16 matvec_pair: k={k} must be even for half2 loads"));
+        }
+
+        let function = self.pair.get_function("f16_matvec_pair")?;
+        let mut kv_ptr = kv.raw();
+        let mut g_ptr = gate.raw();
+        let mut kvw_ptr = kv_w.raw();
+        let mut gw_ptr = gate_w.raw();
+        let mut x_ptr = x.raw();
+        let mut k_v = k;
+        let mut nr_v = n_rows;
+        let mut args: [*mut c_void; 7] = [
+            &mut kv_ptr as *mut _ as *mut c_void,
+            &mut g_ptr as *mut _ as *mut c_void,
+            &mut kvw_ptr as *mut _ as *mut c_void,
+            &mut gw_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut k_v as *mut _ as *mut c_void,
+            &mut nr_v as *mut _ as *mut c_void,
+        ];
+        let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
+        let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
 
     /// `out[r] = sum_i f32(weight[r, i]) * x[i]` for `r in 0..n_rows`.

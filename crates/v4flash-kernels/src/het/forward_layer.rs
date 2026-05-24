@@ -337,21 +337,14 @@ impl HeterogeneousEngine {
             let pos_mod = pos % ratio;
             let row = if ratio == 4 { 4 + pos_mod } else { pos_mod };
             {
-                let _t = ie_c.events.stage("k.compressor.f16_kv", &ie_c.compute)?;
-                ie_c.f16.matvec(
+                // M14h: paired matvec — kv + gate fused into single launch,
+                // sharing activation reads.
+                let _t = ie_c.events.stage("k.compressor.f16_pair", &ie_c.compute)?;
+                ie_c.f16.matvec_pair(
                     &ie_c.compute,
                     &mut igpu_scratch.kv_cur,
-                    &cw.wkv.buffer,
-                    &igpu_scratch.attn_input_norm_recv,
-                    comp_width,
-                    N_EMBD,
-                )?;
-            }
-            {
-                let _t = ie_c.events.stage("k.compressor.f16_gate", &ie_c.compute)?;
-                ie_c.f16.matvec(
-                    &ie_c.compute,
                     &mut igpu_scratch.sc_cur,
+                    &cw.wkv.buffer,
                     &cw.wgate.buffer,
                     &igpu_scratch.attn_input_norm_recv,
                     comp_width,
