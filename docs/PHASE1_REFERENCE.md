@@ -20,7 +20,7 @@ This is the immutable baseline. Every Phase 1 milestone (M2+) validates ported k
   - iGPU: AMD Radeon 8060S Graphics (Strix Halo, gfx1151) — HIP device 1
   - dGPU: AMD Radeon RX 9070 XT (gfx1201) — HIP device 0 (NOT used for inference; 16 GiB VRAM is too small for 86 GiB model)
 - ds4 submodule: `external/ds4` @ branch `rocm` (initial: 7a751eb)
-- ds4 patches applied: `external/ds4-patches/{0001-expose-logits-buffer, 0002-activation-dump-callback, 0003-output-head-hooks, 0004-q-kv-rope-hooks, 0005-attention-hooks}.patch`
+- ds4 patches applied: `external/ds4-patches/{0001-expose-logits-buffer, 0002-activation-dump-callback, 0003-output-head-hooks, 0004-q-kv-rope-hooks, 0005-attention-hooks, 0006-comp-mask-hooks}.patch`
 
 ## Model
 
@@ -68,15 +68,16 @@ Captured by `external/ds4-dump/ds4-dump-activations` using the 0002 patch (`ds4_
   - Both are bit-deterministic across reruns of their respective paths.
 - The M2 dump becomes the canonical reference for kernel ports because every intermediate tensor is captured along *one consistent* trajectory.
 - Storage: `reference/v4flash-cpu-activations/` (gitignored, persistent btrfs)
-  - **M5 (current) dump:**
-    - `manifest.json` SHA256: `4a825d6642afb9bd4c2ec08c22c279f217954c69ee12c55f01bd7f9873f2ba6f`
-    - logits.f32 SHA256: `bd3176ea0644067caf7a455db332874e62c23838963f561cac2d2b4b59a2ea0a` (unchanged from M2/M3/M4 — ds4 patch is byte-clean when callback is null)
-    - aggregate SHA over `sort -u` of all `*.bin` files (one number summarizing the whole tree): `5fb7896cc232e292eb6f7ac879e33073c5dc81706f2eadb4c7383c60f624d96b`
-    - 47,113 tensors (M4 superset: + 5 act tags × 43 layers × 51 tokens + 1 weight tag × 43 layers)
+  - **M6 (current) dump:**
+    - `manifest.json` SHA256: `0b10242d2a371a46426979cf18037d58f586889368ad36046fa7e0efb0feba70`
+    - logits.f32 SHA256: `bd3176ea0644067caf7a455db332874e62c23838963f561cac2d2b4b59a2ea0a` (unchanged from M2-M5 — ds4 patch is byte-clean when callback is null)
+    - aggregate SHA over `sort -u` of all `*.bin` files: `fb740e8fb29b283c4adce36b51e68987e16cb694d87d2fb43a50b38c6684179b`
+    - 48,541 tensors (M5 superset: + comp_kv_row at ratio==4 layers ~14 entries/layer × 21 layers, + comp_allowed_mask at ratio==4 layers ~54 entries/layer × 21 layers)
   - Previous SHAs preserved for archaeology:
     - M3: manifest `a2e8b85b...`, aggregate `d033b20460bc...`
     - M4: manifest `df0e4f36...`, aggregate `95cd30f2...`
-    - All bit-identical for the prior tag subset (spot-checks on `L17/T0005/attn_input_norm.bin`, `L43/T0006/output_norm.bin`, `L17/T0005/q_a_out.bin`, `L17/weight/rope_params.bin` confirm).
+    - M5: manifest `4a825d66...`, aggregate `5fb7896c...`
+    - All bit-identical for prior tag subsets (spot-checks confirm).
 - Tag set per layer L=0..42 (regular layers), per token position:
   - `layer_input_residual` (n_hc × n_embd = 4 × 4096 f32)
   - `attn_cur` (n_embd f32)
@@ -96,6 +97,9 @@ Captured by `external/ds4-dump/ds4-dump-activations` using the 0002 patch (`ds4_
     - `attn_heads_inv_rope` (32768 f32) — post inverse `rope_tail_layer_inplace`
     - `attn_out_low` (n_groups × n_lora_o = 8 × 1024 = 8192 f32) — post grouped Q8_0 matvec (`attn_output_a`), pre `attn_output_b` back-projection
     - `attn_out` (n_embd = 4096 f32) — post full grouped output projection (= input to HC-post composition, M10)
+  - **M6 mixed-attention side channels (added by 0006 patch):**
+    - `comp_kv_row` (n_head_dim = 512 f32) — sparse per-token: fires only when the compressor pushes a row (ratio==4 layers: every 4 tokens from T=3; ratio==128: never in this 57-token prompt). f16-roundtripped post-FP8 value that mixed_one consumes.
+    - `comp_allowed_mask` (n_comp i32) — only at ratio==4 layers (L=2,4,…,42), per token from T=3 onwards (when n_comp ≥ 1). i32 0/1 re-encoding of the indexer's bool mask. **Only dump tag using `DS4_DUMP_DTYPE_I32`.**
   - `ffn_cur` (n_embd f32)
   - `ffn_input_norm` (n_embd f32) — output of layer→ffn RMSNorm
   - `layer_output_residual` (n_hc × n_embd f32)
