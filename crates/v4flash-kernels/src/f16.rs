@@ -10,25 +10,40 @@ use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
 
 const F16_MATVEC_GFX1201: &[u8] = include_bytes!(env!("KERNEL_F16_MATVEC_GFX1201"));
 const F16_MATVEC_GFX1151: &[u8] = include_bytes!(env!("KERNEL_F16_MATVEC_GFX1151"));
+const F16_MATVEC_NARROW_GFX1201: &[u8] =
+    include_bytes!(env!("KERNEL_F16_MATVEC_NARROW_GFX1201"));
+const F16_MATVEC_NARROW_GFX1151: &[u8] =
+    include_bytes!(env!("KERNEL_F16_MATVEC_NARROW_GFX1151"));
 
 const GEMV_ROWS_PER_BLOCK: u32 = 8;
 const GEMV_WARP_LANES: u32 = 32;
+const NARROW_BLOCK_THREADS: u32 = 256;
+
+/// Below this `n_rows` the original 8-rows-per-block kernel under-fills
+/// the GPU (e.g. n_rows=24 → 3 blocks) and the per-row latency chain
+/// dominates. The narrow variant (1 row per block, 256 threads
+/// cooperating) is faster. Calibrated against the mhc_pre_* calls
+/// (n_rows=24, k=16384) on gfx1201; threshold conservative enough that
+/// the larger compressor matvecs (n_rows≥256) still take the wide path.
+const NARROW_ROWS_THRESHOLD: u32 = 64;
 
 pub struct F16Matvec {
-    module: Module,
+    wide: Module,
+    narrow: Module,
 }
 
 impl F16Matvec {
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
-        let image: &[u8] = if arch.starts_with("gfx1201") {
-            F16_MATVEC_GFX1201
+        let (wide_img, narrow_img): (&[u8], &[u8]) = if arch.starts_with("gfx1201") {
+            (F16_MATVEC_GFX1201, F16_MATVEC_NARROW_GFX1201)
         } else if arch.starts_with("gfx1151") {
-            F16_MATVEC_GFX1151
+            (F16_MATVEC_GFX1151, F16_MATVEC_NARROW_GFX1151)
         } else {
             return Err(eyre!("unsupported arch for f16_matvec: {arch}"));
         };
-        let module = Module::load_data(image)?;
-        Ok(Self { module })
+        let wide = Module::load_data(wide_img)?;
+        let narrow = Module::load_data(narrow_img)?;
+        Ok(Self { wide, narrow })
     }
 
     /// `out[r] = sum_i f32(weight[r, i]) * x[i]` for `r in 0..n_rows`.
@@ -64,8 +79,6 @@ impl F16Matvec {
             ));
         }
 
-        let function = self.module.get_function("f16_matvec")?;
-
         let mut out_ptr = out.raw();
         let mut w_ptr = weight.raw();
         let mut x_ptr = x.raw();
@@ -79,13 +92,24 @@ impl F16Matvec {
             &mut n_rows_v as *mut _ as *mut c_void,
         ];
 
-        let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
-        let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
-        let cfg = LaunchConfig {
-            grid: (grid_x, 1, 1),
-            block: (block_x, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        if n_rows < NARROW_ROWS_THRESHOLD {
+            let function = self.narrow.get_function("f16_matvec_narrow")?;
+            let cfg = LaunchConfig {
+                grid: (n_rows, 1, 1),
+                block: (NARROW_BLOCK_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { function.launch_raw(cfg, stream, &mut args) }
+        } else {
+            let function = self.wide.get_function("f16_matvec")?;
+            let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
+            let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
+            let cfg = LaunchConfig {
+                grid: (grid_x, 1, 1),
+                block: (block_x, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { function.launch_raw(cfg, stream, &mut args) }
+        }
     }
 }
