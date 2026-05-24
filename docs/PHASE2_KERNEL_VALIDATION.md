@@ -156,6 +156,9 @@ See `crates/v4flash-kernels/tests/rms_norm.rs` for the template.
 | `hca_chain` (M7 close-loop)   |    1.0e-1 |             3.4e-2 | mean<1e-3             | our compressor+indexer+M6 mixed_attn+M5 outproj; attn_out vs ds4 |
 | `router_hash_gate` (M8)       |    5.0e-5 |             5.8e-7 | exact selection       | L=0,1,2 hash-gate; tid2eid lookup + softplus-sqrt + normalise   |
 | `router_learned` (M8)         |    5.0e-5 |             1.1e-5 | exact selection       | L=3..42 learned router; matvec + softplus + sqrt + topk + normalise |
+| `shared_expert` (M9)          |    5.0e-2 |             1.7e-2 | mean<1e-5             | Q8_0 gate+up+down + plain SwiGLU; 43 layers × 51 tokens × 4096    |
+| (deferred) `iq2_xxs_experts`  |     TBD   |                TBD | —                     | Routed gate/up; complex codebook dequant; M11 expected            |
+| (deferred) `q2_k_experts`     |     TBD   |                TBD | —                     | Routed down + accumulate-over-experts; K-quants superblock; M11   |
 | (future) `iq2_xxs_matmul`     |     TBD   |                TBD | —                     |                                                                  |
 
 For Q8_0 specifically, the *argmax-match* check on every logit row is the production correctness gate — FP threshold backs it up but the discrete check is what guarantees "we pick the same greedy token as ds4 in every position."
