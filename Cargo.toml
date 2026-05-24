@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/v4flash-core",
     "crates/v4flash-hip",
+    "crates/v4flash-kernels",
     "crates/phase0",
     "crates/phase1",
 ]

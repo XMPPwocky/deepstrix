@@ -1,0 +1,20 @@
+[package]
+name = "v4flash-kernels"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+color-eyre = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+memmap2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+v4flash-hip = { path = "../v4flash-hip" }
+
+[lib]
+path = "src/lib.rs"

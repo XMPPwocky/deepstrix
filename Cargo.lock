@@ -578,6 +578,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "v4flash-kernels"
+version = "0.0.0"
+dependencies = [
+ "color-eyre",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+ "v4flash-hip",
+]
+
+[[package]]
 name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
