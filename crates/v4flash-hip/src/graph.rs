@@ -29,6 +29,12 @@ pub struct Graph {
     raw: sys::hipGraph_t,
 }
 
+// SAFETY: HIP graph handles are reference-counted on the runtime side and
+// safe to move/share across threads as long as no two threads call
+// hipGraph* on the same handle concurrently. We don't.
+unsafe impl Send for Graph {}
+unsafe impl Sync for Graph {}
+
 impl Graph {
     /// Build an empty graph.
     pub fn new() -> eyre::Result<Self> {
@@ -111,6 +117,11 @@ impl Drop for Graph {
 pub struct GraphExec {
     raw: sys::hipGraphExec_t,
 }
+
+// SAFETY: same reasoning as Graph — we serialize all use behind &mut
+// borrows or external locks.
+unsafe impl Send for GraphExec {}
+unsafe impl Sync for GraphExec {}
 
 impl GraphExec {
     pub fn raw(&self) -> sys::hipGraphExec_t {

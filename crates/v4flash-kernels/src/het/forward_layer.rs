@@ -71,151 +71,137 @@ impl HeterogeneousEngine {
         self.dgpu.device.set_current()?;
         let de = &self.dgpu;
 
+        // mhc_pre_attn is NOT captured: it reads `dgpu_scratch.residual`,
+        // whose underlying DeviceBuffer pointer is rotated by the
+        // `mem::swap(residual, residual_next)` at the end of every
+        // layer. A captured graph would freeze the wrong physical pointer.
         let _t_mhc_pre = de.events.stage("dgpu.mhc_pre_attn", &de.compute)?;
         let _s_mhc_pre = debug_span!("mhc_pre_attn").entered();
-        {
-            let _t = de.events.stage("k.mhc_pre_attn.rms_nw", &de.compute)?;
-            de.rms_nw.launch(
-                &de.compute,
-                &mut dgpu_scratch.flat,
-                &dgpu_scratch.residual,
-                1,
-                HC_DIM,
-                RMS_EPS,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.mhc_pre_attn.f16_matvec", &de.compute)?;
-            de.f16.matvec(
-                &de.compute,
-                &mut dgpu_scratch.mix,
-                &dlw.hc_attn_fn.buffer,
-                &dgpu_scratch.flat,
-                HC_MIX_DIM,
-                HC_DIM,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.mhc_pre_attn.sinkhorn", &de.compute)?;
-            de.hc_sinkhorn.launch(
-                &de.compute,
-                &mut dgpu_scratch.split,
-                &dgpu_scratch.mix,
-                &dlw.hc_attn_scale,
-                &dlw.hc_attn_base,
-                N_HC,
-                SINKHORN_ITERS,
-                SINKHORN_EPS,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.mhc_pre_attn.hc_weighted", &de.compute)?;
-            de.hc_weighted.launch(
-                &de.compute,
-                &mut dgpu_scratch.attn_cur,
-                &dgpu_scratch.residual,
-                &dgpu_scratch.split,
-                N_EMBD,
-                N_HC,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.mhc_pre_attn.rms_w", &de.compute)?;
-            de.rms_w.launch_weighted(
-                &de.compute,
-                &mut dgpu_scratch.attn_input_norm,
-                &dgpu_scratch.attn_cur,
-                &dlw.attn_norm,
-                N_EMBD,
-                RMS_EPS,
-            )?;
-        }
+        de.rms_nw.launch(
+            &de.compute,
+            &mut dgpu_scratch.flat,
+            &dgpu_scratch.residual,
+            1,
+            HC_DIM,
+            RMS_EPS,
+        )?;
+        de.f16.matvec(
+            &de.compute,
+            &mut dgpu_scratch.mix,
+            &dlw.hc_attn_fn.buffer,
+            &dgpu_scratch.flat,
+            HC_MIX_DIM,
+            HC_DIM,
+        )?;
+        de.hc_sinkhorn.launch(
+            &de.compute,
+            &mut dgpu_scratch.split,
+            &dgpu_scratch.mix,
+            &dlw.hc_attn_scale,
+            &dlw.hc_attn_base,
+            N_HC,
+            SINKHORN_ITERS,
+            SINKHORN_EPS,
+        )?;
+        de.hc_weighted.launch(
+            &de.compute,
+            &mut dgpu_scratch.attn_cur,
+            &dgpu_scratch.residual,
+            &dgpu_scratch.split,
+            N_EMBD,
+            N_HC,
+        )?;
+        de.rms_w.launch_weighted(
+            &de.compute,
+            &mut dgpu_scratch.attn_input_norm,
+            &dgpu_scratch.attn_cur,
+            &dlw.attn_norm,
+            N_EMBD,
+            RMS_EPS,
+        )?;
         drop(_s_mhc_pre);
         _t_mhc_pre.end()?;
 
         // ============================================================
         // dGPU: Q LoRA chain → q_post_rope
         // ============================================================
+        // M15: q_chain prefix (6 kernels) captured into a graph — all
+        // params are layer-constant and all I/O buffers are non-swapped
+        // scratch. The trailing rope_forward takes per-token `pos` so
+        // stays a direct launch.
         let _t_q = de.events.stage("dgpu.q_chain", &de.compute)?;
         let _s_q = debug_span!("q_chain").entered();
         {
-            let _t = de.events.stage("k.q_chain.q8_quantize_in", &de.compute)?;
-            de.q8.quantize_input(
-                &de.compute,
-                &mut dgpu_scratch.xq_n_embd,
-                &mut dgpu_scratch.xscale_n_embd,
-                &dgpu_scratch.attn_input_norm,
-                N_EMBD,
-            )?;
+            let graph_slot = &self.dgpu_q_chain_pre_rope_graphs[layer as usize];
+            let mut guard = graph_slot.lock().unwrap();
+            if guard.is_none() {
+                de.compute
+                    .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                de.q8.quantize_input(
+                    &de.compute,
+                    &mut dgpu_scratch.xq_n_embd,
+                    &mut dgpu_scratch.xscale_n_embd,
+                    &dgpu_scratch.attn_input_norm,
+                    N_EMBD,
+                )?;
+                de.q8.matvec(
+                    &de.compute,
+                    &mut dgpu_scratch.qr,
+                    &dlw.attn_q_a.buffer,
+                    &dgpu_scratch.xq_n_embd,
+                    &dgpu_scratch.xscale_n_embd,
+                    N_LORA_Q,
+                    N_EMBD,
+                )?;
+                de.rms_w.launch_weighted(
+                    &de.compute,
+                    &mut dgpu_scratch.qr_normed,
+                    &dgpu_scratch.qr,
+                    &dlw.q_a_norm,
+                    N_LORA_Q,
+                    RMS_EPS,
+                )?;
+                de.q8.quantize_input(
+                    &de.compute,
+                    &mut dgpu_scratch.qr_xq,
+                    &mut dgpu_scratch.qr_xscale,
+                    &dgpu_scratch.qr_normed,
+                    N_LORA_Q,
+                )?;
+                de.q8.matvec(
+                    &de.compute,
+                    &mut dgpu_scratch.q,
+                    &dlw.attn_q_b.buffer,
+                    &dgpu_scratch.qr_xq,
+                    &dgpu_scratch.qr_xscale,
+                    Q_FLAT,
+                    N_LORA_Q,
+                )?;
+                de.rms_nw.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.q_normed,
+                    &dgpu_scratch.q,
+                    N_HEAD,
+                    N_HEAD_DIM,
+                    RMS_EPS,
+                )?;
+                let graph = de.compute.end_capture()?;
+                let exec = graph.instantiate()?;
+                exec.launch(&de.compute)?;
+                *guard = Some(exec);
+            } else {
+                guard.as_ref().unwrap().launch(&de.compute)?;
+            }
         }
-        {
-            let _t = de.events.stage("k.q_chain.q8_matvec_qa", &de.compute)?;
-            de.q8.matvec(
-                &de.compute,
-                &mut dgpu_scratch.qr,
-                &dlw.attn_q_a.buffer,
-                &dgpu_scratch.xq_n_embd,
-                &dgpu_scratch.xscale_n_embd,
-                N_LORA_Q,
-                N_EMBD,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.q_chain.rms_w_qa", &de.compute)?;
-            de.rms_w.launch_weighted(
-                &de.compute,
-                &mut dgpu_scratch.qr_normed,
-                &dgpu_scratch.qr,
-                &dlw.q_a_norm,
-                N_LORA_Q,
-                RMS_EPS,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.q_chain.q8_quantize_qr", &de.compute)?;
-            de.q8.quantize_input(
-                &de.compute,
-                &mut dgpu_scratch.qr_xq,
-                &mut dgpu_scratch.qr_xscale,
-                &dgpu_scratch.qr_normed,
-                N_LORA_Q,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.q_chain.q8_matvec_qb", &de.compute)?;
-            de.q8.matvec(
-                &de.compute,
-                &mut dgpu_scratch.q,
-                &dlw.attn_q_b.buffer,
-                &dgpu_scratch.qr_xq,
-                &dgpu_scratch.qr_xscale,
-                Q_FLAT,
-                N_LORA_Q,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.q_chain.rms_nw_heads", &de.compute)?;
-            de.rms_nw.launch(
-                &de.compute,
-                &mut dgpu_scratch.q_normed,
-                &dgpu_scratch.q,
-                N_HEAD,
-                N_HEAD_DIM,
-                RMS_EPS,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.q_chain.rope_fwd", &de.compute)?;
-            de.rope.launch_forward(
-                &de.compute,
-                &mut dgpu_scratch.q_normed,
-                N_HEAD,
-                N_HEAD_DIM,
-                N_ROT,
-                pos,
-                &dlw.rope_params,
-            )?;
-        }
+        de.rope.launch_forward(
+            &de.compute,
+            &mut dgpu_scratch.q_normed,
+            N_HEAD,
+            N_HEAD_DIM,
+            N_ROT,
+            pos,
+            &dlw.rope_params,
+        )?;
         drop(_s_q);
         _t_q.end()?;
 
@@ -433,64 +419,65 @@ impl HeterogeneousEngine {
         // ============================================================
         // dGPU: Output projection
         // ============================================================
+        // M15: output_proj suffix (4 kernels after rope_inv) captured.
+        // rope_inv takes per-token `pos` and stays a direct launch.
         let _t_out = de.events.stage("dgpu.output_proj", &de.compute)?;
         let _s_out = debug_span!("output_proj").entered();
+        de.rope.launch_inverse(
+            &de.compute,
+            &mut dgpu_scratch.heads,
+            N_HEAD,
+            N_HEAD_DIM,
+            N_ROT,
+            pos,
+            &dlw.rope_params,
+        )?;
         {
-            let _t = de.events.stage("k.output_proj.rope_inv", &de.compute)?;
-            de.rope.launch_inverse(
-                &de.compute,
-                &mut dgpu_scratch.heads,
-                N_HEAD,
-                N_HEAD_DIM,
-                N_ROT,
-                pos,
-                &dlw.rope_params,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.output_proj.q8_quantize_heads", &de.compute)?;
-            de.q8.quantize_input(
-                &de.compute,
-                &mut dgpu_scratch.heads_xq,
-                &mut dgpu_scratch.heads_xscale,
-                &dgpu_scratch.heads,
-                Q_FLAT,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.output_proj.q8_grouped_a", &de.compute)?;
-            de.q8_grouped.matvec_grouped(
-                &de.compute,
-                &mut dgpu_scratch.low,
-                &dlw.attn_output_a.buffer,
-                &dgpu_scratch.heads_xq,
-                &dgpu_scratch.heads_xscale,
-                GROUP_DIM,
-                RANK,
-                N_GROUPS,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.output_proj.q8_quantize_low", &de.compute)?;
-            de.q8.quantize_input(
-                &de.compute,
-                &mut dgpu_scratch.low_xq,
-                &mut dgpu_scratch.low_xscale,
-                &dgpu_scratch.low,
-                OUT_LOW,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.output_proj.q8_matvec_b", &de.compute)?;
-            de.q8.matvec(
-                &de.compute,
-                &mut dgpu_scratch.attn_out,
-                &dlw.attn_output_b.buffer,
-                &dgpu_scratch.low_xq,
-                &dgpu_scratch.low_xscale,
-                N_EMBD,
-                OUT_LOW,
-            )?;
+            let graph_slot = &self.dgpu_output_proj_post_rope_graphs[layer as usize];
+            let mut guard = graph_slot.lock().unwrap();
+            if guard.is_none() {
+                de.compute
+                    .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                de.q8.quantize_input(
+                    &de.compute,
+                    &mut dgpu_scratch.heads_xq,
+                    &mut dgpu_scratch.heads_xscale,
+                    &dgpu_scratch.heads,
+                    Q_FLAT,
+                )?;
+                de.q8_grouped.matvec_grouped(
+                    &de.compute,
+                    &mut dgpu_scratch.low,
+                    &dlw.attn_output_a.buffer,
+                    &dgpu_scratch.heads_xq,
+                    &dgpu_scratch.heads_xscale,
+                    GROUP_DIM,
+                    RANK,
+                    N_GROUPS,
+                )?;
+                de.q8.quantize_input(
+                    &de.compute,
+                    &mut dgpu_scratch.low_xq,
+                    &mut dgpu_scratch.low_xscale,
+                    &dgpu_scratch.low,
+                    OUT_LOW,
+                )?;
+                de.q8.matvec(
+                    &de.compute,
+                    &mut dgpu_scratch.attn_out,
+                    &dlw.attn_output_b.buffer,
+                    &dgpu_scratch.low_xq,
+                    &dgpu_scratch.low_xscale,
+                    N_EMBD,
+                    OUT_LOW,
+                )?;
+                let graph = de.compute.end_capture()?;
+                let exec = graph.instantiate()?;
+                exec.launch(&de.compute)?;
+                *guard = Some(exec);
+            } else {
+                guard.as_ref().unwrap().launch(&de.compute)?;
+            }
         }
         drop(_s_out);
         _t_out.end()?;
@@ -518,52 +505,66 @@ impl HeterogeneousEngine {
         // ============================================================
         // dGPU: mHC pre ffn → ffn_input_norm
         // ============================================================
+        // M15: capture mhc_pre_ffn block (5 kernels, layer-constant params)
+        // into a HIP graph on first call; replay thereafter.
         let _t_mhc_pre_ffn = de.events.stage("dgpu.mhc_pre_ffn", &de.compute)?;
         let _s_mhc_pre_ffn = debug_span!("mhc_pre_ffn").entered();
-        de.rms_nw.launch(
-            &de.compute,
-            &mut dgpu_scratch.flat,
-            &dgpu_scratch.after_attn_hc,
-            1,
-            HC_DIM,
-            RMS_EPS,
-        )?;
-        de.f16.matvec(
-            &de.compute,
-            &mut dgpu_scratch.mix,
-            &dlw.hc_ffn_fn.buffer,
-            &dgpu_scratch.flat,
-            HC_MIX_DIM,
-            HC_DIM,
-        )?;
-        de.hc_sinkhorn.launch(
-            &de.compute,
-            &mut dgpu_scratch.split,
-            &dgpu_scratch.mix,
-            &dlw.hc_ffn_scale,
-            &dlw.hc_ffn_base,
-            N_HC,
-            SINKHORN_ITERS,
-            SINKHORN_EPS,
-        )?;
-        de.hc_weighted.launch(
-            &de.compute,
-            &mut dgpu_scratch.ffn_cur,
-            &dgpu_scratch.after_attn_hc,
-            &dgpu_scratch.split,
-            N_EMBD,
-            N_HC,
-        )?;
-        // M13.3: split layout [w(4), post(4), comb(16)] stays on device.
-        // The mhc_post_ffn step below reads post/comb directly from it.
-        de.rms_w.launch_weighted(
-            &de.compute,
-            &mut dgpu_scratch.ffn_input_norm,
-            &dgpu_scratch.ffn_cur,
-            &dlw.ffn_norm,
-            N_EMBD,
-            RMS_EPS,
-        )?;
+        {
+            let graph_slot = &self.dgpu_mhc_pre_ffn_graphs[layer as usize];
+            let mut guard = graph_slot.lock().unwrap();
+            if guard.is_none() {
+                de.compute
+                    .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                de.rms_nw.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.flat,
+                    &dgpu_scratch.after_attn_hc,
+                    1,
+                    HC_DIM,
+                    RMS_EPS,
+                )?;
+                de.f16.matvec(
+                    &de.compute,
+                    &mut dgpu_scratch.mix,
+                    &dlw.hc_ffn_fn.buffer,
+                    &dgpu_scratch.flat,
+                    HC_MIX_DIM,
+                    HC_DIM,
+                )?;
+                de.hc_sinkhorn.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.split,
+                    &dgpu_scratch.mix,
+                    &dlw.hc_ffn_scale,
+                    &dlw.hc_ffn_base,
+                    N_HC,
+                    SINKHORN_ITERS,
+                    SINKHORN_EPS,
+                )?;
+                de.hc_weighted.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.ffn_cur,
+                    &dgpu_scratch.after_attn_hc,
+                    &dgpu_scratch.split,
+                    N_EMBD,
+                    N_HC,
+                )?;
+                de.rms_w.launch_weighted(
+                    &de.compute,
+                    &mut dgpu_scratch.ffn_input_norm,
+                    &dgpu_scratch.ffn_cur,
+                    &dlw.ffn_norm,
+                    N_EMBD,
+                    RMS_EPS,
+                )?;
+                let graph = de.compute.end_capture()?;
+                let exec = graph.instantiate()?;
+                exec.launch(&de.compute)?;
+                *guard = Some(exec);
+            } else {
+                guard.as_ref().unwrap().launch(&de.compute)?;
+            }
+        }
         drop(_s_mhc_pre_ffn);
         _t_mhc_pre_ffn.end()?;
 
@@ -653,7 +654,7 @@ impl HeterogeneousEngine {
             self.dgpu.device.set_current()?;
             let _t_shared = de.events.stage("dgpu.shared_expert", &de.compute)?;
             let _s_shared = debug_span!("shared_expert").entered();
-            issue_shared_expert(de, dgpu_scratch, dlw)?;
+            self.issue_shared_expert_graph(de, dgpu_scratch, dlw, layer)?;
             drop(_s_shared);
             _t_shared.end()?;
             self.igpu.device.set_current()?;
@@ -698,76 +699,85 @@ impl HeterogeneousEngine {
         // once, q8k_quantize + q2k accumulate then drain the cat via the
         // d_midq_cat staging buffer. Eliminates ~600μs/layer of host
         // round-trips (M13.4 inner-loop refactor).
-        let _t_moe = ie.events.stage("igpu.routed_moe", &ie.compute)?;
-        let _s_moe = debug_span!("routed_moe").entered();
-        {
-            let _t = ie.events.stage("k.moe.q8k_xq", &ie.compute)?;
-            ie.q8k.launch(
-                &ie.compute,
-                &mut igpu_scratch.d_xq_q8k,
-                &igpu_scratch.ffn_input_norm_recv,
-                BLOCKS_Q8K_GATE_IN,
-            )?;
-        }
-        // M14j: single batched iq2_fused launch handles all N_EXPERT_USED
-        // slots via grid.y, reading expert indices from d_selected. For
-        // the hash router we have to push the host-computed selection to
-        // d_selected first (learned router already wrote it device-side).
+        //
+        // M15: the 4-kernel core (q8k_xq → iq2_fused → q8k_mid → q2k_down)
+        // is captured into a per-layer HIP graph on the first call and
+        // replayed thereafter. All kernel params are device pointers +
+        // layer-constant scalars, so the captured graph stays valid for
+        // every subsequent token. Hash-router host-copy of `selected`
+        // stays OUTSIDE the captured region.
         if ilw.is_hash_router {
             igpu_scratch.d_selected.copy_from_host(&selected)?;
         }
-        {
-            let _t = ie.events.stage("k.moe.iq2_fused_batch", &ie.compute)?;
-            ie.iq2.launch_fused_swiglu_batch(
-                &ie.compute,
-                &mut igpu_scratch.d_mid_cat,
-                &ilw.routed.gate.buffer,
-                &ilw.routed.up.buffer,
-                &igpu_scratch.d_xq_q8k,
-                &igpu_scratch.d_ew,
-                &igpu_scratch.d_selected,
-                gbpe as u32,
-                ubpe as u32,
-                N_EXPERT_USED as u32,
-                SWIGLU_CLAMP_EXP,
-                N_FF_EXP,
-                BLOCKS_Q8K_GATE_IN,
-            )?;
-        }
         let mid_blocks_bytes = (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
-        // M14k.4: batched q8k_mid — the kernel is already block-parallel
-        // (one workgroup per Q8_K super-block), so quantizing all
-        // N_EXPERT_USED slots in one launch just means passing the whole
-        // d_mid_cat as input and asking for N_EXPERT_USED * BLOCKS_Q8K_DOWN_IN
-        // blocks of output. Layout matches because d_mid_cat /
-        // d_midq_cat are both packed slot-major and the per-slot stride
-        // matches the kernel's per-block stride.
+        let _t_moe = ie.events.stage("igpu.routed_moe", &ie.compute)?;
+        let _s_moe = debug_span!("routed_moe").entered();
         {
-            let _t = ie.events.stage("k.moe.q8k_mid_batch", &ie.compute)?;
-            ie.q8k.launch(
-                &ie.compute,
-                &mut igpu_scratch.d_midq_cat,
-                &igpu_scratch.d_mid_cat,
-                BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32),
-            )?;
-        }
-        {
-            // M14k.5: batched q2k_down — single launch loops over all 6
-            // slots internally per workgroup, writes summed ffn_moe
-            // directly. Eliminates 5 launches + 5 boundary syncs per layer.
-            let _t = ie.events.stage("k.moe.q2k_down_batch", &ie.compute)?;
-            ie.q2k.launch_batched(
-                &ie.compute,
-                &mut igpu_scratch.ffn_moe,
-                &ilw.routed.down.buffer,
-                &igpu_scratch.d_midq_cat,
-                &igpu_scratch.d_selected,
-                dbpe as u32,
-                mid_blocks_bytes as u32,
-                N_EXPERT_USED as u32,
-                N_EMBD,
-                BLOCKS_Q8K_DOWN_IN,
-            )?;
+            let graph_slot = &self.igpu_moe_graphs[layer as usize];
+            let mut guard = graph_slot.lock().unwrap();
+            if guard.is_none() {
+                // First call for this layer: capture the 4-kernel
+                // sub-pipeline. begin_capture / end_capture bracket only
+                // the launches we want in the graph; per-kernel event
+                // staging is OUTSIDE the capture so the event-record
+                // nodes don't become part of the replayed graph (they
+                // would re-record the same pool events on every replay,
+                // corrupting the per-token harvest).
+                ie.compute
+                    .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                ie.q8k.launch(
+                    &ie.compute,
+                    &mut igpu_scratch.d_xq_q8k,
+                    &igpu_scratch.ffn_input_norm_recv,
+                    BLOCKS_Q8K_GATE_IN,
+                )?;
+                ie.iq2.launch_fused_swiglu_batch(
+                    &ie.compute,
+                    &mut igpu_scratch.d_mid_cat,
+                    &ilw.routed.gate.buffer,
+                    &ilw.routed.up.buffer,
+                    &igpu_scratch.d_xq_q8k,
+                    &igpu_scratch.d_ew,
+                    &igpu_scratch.d_selected,
+                    gbpe as u32,
+                    ubpe as u32,
+                    N_EXPERT_USED as u32,
+                    SWIGLU_CLAMP_EXP,
+                    N_FF_EXP,
+                    BLOCKS_Q8K_GATE_IN,
+                )?;
+                ie.q8k.launch(
+                    &ie.compute,
+                    &mut igpu_scratch.d_midq_cat,
+                    &igpu_scratch.d_mid_cat,
+                    BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32),
+                )?;
+                ie.q2k.launch_batched(
+                    &ie.compute,
+                    &mut igpu_scratch.ffn_moe,
+                    &ilw.routed.down.buffer,
+                    &igpu_scratch.d_midq_cat,
+                    &igpu_scratch.d_selected,
+                    dbpe as u32,
+                    mid_blocks_bytes as u32,
+                    N_EXPERT_USED as u32,
+                    N_EMBD,
+                    BLOCKS_Q8K_DOWN_IN,
+                )?;
+                let graph = ie.compute.end_capture()?;
+                let exec = graph.instantiate()?;
+                // Stream-capture only RECORDS — it does not execute.
+                // Launch the freshly instantiated graph now so the
+                // first-token forward pass actually runs this layer's
+                // MoE pipeline.
+                exec.launch(&ie.compute)?;
+                *guard = Some(exec);
+            } else {
+                guard
+                    .as_ref()
+                    .unwrap()
+                    .launch(&ie.compute)?;
+            }
         }
         // Keep `selected` referenced even if we no longer index by it in
         // this block, so the host-side parity computation isn't elided.
@@ -811,7 +821,7 @@ impl HeterogeneousEngine {
         if !parallel {
             let _t_shared = de.events.stage("dgpu.shared_expert", &de.compute)?;
             let _s_shared = debug_span!("shared_expert").entered();
-            issue_shared_expert(de, dgpu_scratch, dlw)?;
+            self.issue_shared_expert_graph(de, dgpu_scratch, dlw, layer)?;
             drop(_s_shared);
             _t_shared.end()?;
         }
@@ -847,6 +857,35 @@ impl HeterogeneousEngine {
         _t_combine.end()?;
         if serial {
             de.compute.synchronize()?;
+        }
+        Ok(())
+    }
+}
+
+impl HeterogeneousEngine {
+    /// M15: capture the dGPU shared-expert chain (6 kernels, all
+    /// layer-constant params) into a HIP graph on first call; replay
+    /// thereafter. Caller is responsible for the surrounding events
+    /// stage and span.
+    fn issue_shared_expert_graph(
+        &self,
+        de: &DeviceEngine,
+        dgpu_scratch: &mut DgpuScratch,
+        dlw: &DgpuLayerWeights,
+        layer: i32,
+    ) -> eyre::Result<()> {
+        let graph_slot = &self.dgpu_shared_expert_graphs[layer as usize];
+        let mut guard = graph_slot.lock().unwrap();
+        if guard.is_none() {
+            de.compute
+                .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+            issue_shared_expert(de, dgpu_scratch, dlw)?;
+            let graph = de.compute.end_capture()?;
+            let exec = graph.instantiate()?;
+            exec.launch(&de.compute)?;
+            *guard = Some(exec);
+        } else {
+            guard.as_ref().unwrap().launch(&de.compute)?;
         }
         Ok(())
     }

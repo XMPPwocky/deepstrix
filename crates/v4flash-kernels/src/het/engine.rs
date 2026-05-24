@@ -8,7 +8,7 @@
 //! been wired yet.
 
 use color_eyre::eyre;
-use v4flash_hip::{Device, Event, Stream};
+use v4flash_hip::{Device, Event, GraphExec, Stream};
 
 use crate::forward::N_LAYER;
 
@@ -217,6 +217,39 @@ pub struct HeterogeneousEngine {
     /// perfetto tracks. Enable by calling
     /// [`HeterogeneousEngine::attach_perfetto`].
     pub perfetto: Option<std::sync::Mutex<DeviceTimingExporter>>,
+
+    /// M15: per-layer captured HIP graphs for the iGPU routed-MoE
+    /// sub-pipeline (q8k_xq → iq2_fused_swiglu_batch → q8k_mid_batch →
+    /// q2k_down_batch). All 4 launches have device-resident inputs and
+    /// layer-constant scalar params, so the graph captures once on the
+    /// first call to each layer and replays for every subsequent token.
+    /// Each layer slot is `None` until the first forward_layer call
+    /// initializes it.
+    pub igpu_moe_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    /// M15: per-layer captured graphs for the dGPU mHC pre-attn block
+    /// (5 kernels: rms_nw → f16_matvec → hc_sinkhorn → hc_weighted →
+    /// rms_w_weighted). All inputs are device-resident; scalar params
+    /// are layer-constant.
+    pub dgpu_mhc_pre_attn_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    /// M15: per-layer captured graphs for the dGPU mHC pre-ffn block
+    /// (5 kernels, same shape as pre-attn but using the ffn-side
+    /// projection / scale / base / norm weights).
+    pub dgpu_mhc_pre_ffn_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    /// M15: per-layer captured graphs for the dGPU shared-expert chain
+    /// (6 kernels: q8_quantize → q8 gate matvec → q8 up matvec → swiglu
+    /// → q8_quantize_mid → q8 down matvec). All inputs are
+    /// device-resident; scalar params are layer-constant.
+    pub dgpu_shared_expert_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    /// M15: per-layer captured graphs for the dGPU Q-chain prefix
+    /// (6 kernels: q8_quantize → q8_matvec_qa → rms_w_qa → q8_quantize_qr
+    /// → q8_matvec_qb → rms_nw_heads). Stops before rope_forward, which
+    /// takes per-token `pos` and is launched directly.
+    pub dgpu_q_chain_pre_rope_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    /// M15: per-layer captured graphs for the dGPU output-projection
+    /// suffix (4 kernels: q8_quantize_heads → q8_grouped_matvec_a →
+    /// q8_quantize_low → q8_matvec_b). Skips the leading rope_inverse,
+    /// which takes per-token `pos`.
+    pub dgpu_output_proj_post_rope_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
 }
 
 impl HeterogeneousEngine {
@@ -401,12 +434,33 @@ impl HeterogeneousEngine {
 
         let sync_events = HetSyncEvents::alloc(dgpu_device, igpu_device)?;
 
+        let mut igpu_moe_graphs = Vec::with_capacity(N_LAYER as usize);
+        let mut dgpu_mhc_pre_attn_graphs = Vec::with_capacity(N_LAYER as usize);
+        let mut dgpu_mhc_pre_ffn_graphs = Vec::with_capacity(N_LAYER as usize);
+        let mut dgpu_shared_expert_graphs = Vec::with_capacity(N_LAYER as usize);
+        let mut dgpu_q_chain_pre_rope_graphs = Vec::with_capacity(N_LAYER as usize);
+        let mut dgpu_output_proj_post_rope_graphs = Vec::with_capacity(N_LAYER as usize);
+        for _ in 0..N_LAYER {
+            igpu_moe_graphs.push(std::sync::Mutex::new(None));
+            dgpu_mhc_pre_attn_graphs.push(std::sync::Mutex::new(None));
+            dgpu_mhc_pre_ffn_graphs.push(std::sync::Mutex::new(None));
+            dgpu_shared_expert_graphs.push(std::sync::Mutex::new(None));
+            dgpu_q_chain_pre_rope_graphs.push(std::sync::Mutex::new(None));
+            dgpu_output_proj_post_rope_graphs.push(std::sync::Mutex::new(None));
+        }
+
         Ok(Self {
             dgpu,
             igpu,
             mode,
             sync_events,
             perfetto: None,
+            igpu_moe_graphs,
+            dgpu_mhc_pre_attn_graphs,
+            dgpu_mhc_pre_ffn_graphs,
+            dgpu_shared_expert_graphs,
+            dgpu_q_chain_pre_rope_graphs,
+            dgpu_output_proj_post_rope_graphs,
         })
     }
 
