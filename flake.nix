@@ -64,6 +64,8 @@
           rocm.rocm-device-libs
           rocm.rocm-comgr
           rocm.clang
+
+          pkgs.llama-cpp-rocm
         ];
 
         shellHook = ''

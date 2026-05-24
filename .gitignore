@@ -18,3 +18,9 @@ external/ds4-dump/ds4-dump-activations
 # Phase 1 reference outputs — captured logits live outside the repo (huge);
 # only docs/PHASE1_REFERENCE.md (with SHA256s) is checked in.
 /reference/
+
+# scratch/ HIP probes: source committed, binaries ignored.
+/scratch/svm_probe
+/scratch/svm_probe_many
+/scratch/svm_probe_hostmem
+/scratch/plain_probe_many
