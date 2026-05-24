@@ -785,22 +785,26 @@ impl HeterogeneousEngine {
                 BLOCKS_Q8K_GATE_IN,
             )?;
         }
-        // M14e: per-slot iq2_pair fused with swiglu_clamp_weighted — writes
-        // directly into d_mid_cat[slot, :], no gate_cat/up_cat round-trip
-        // and no separate swiglu launch.
-        for slot in 0..N_EXPERT_USED {
-            let e = selected[slot] as usize;
-            let _t = ie.events.stage("k.moe.iq2_fused", &ie.compute)?;
-            ie.iq2.launch_fused_swiglu(
+        // M14j: single batched iq2_fused launch handles all N_EXPERT_USED
+        // slots via grid.y, reading expert indices from d_selected. For
+        // the hash router we have to push the host-computed selection to
+        // d_selected first (learned router already wrote it device-side).
+        if ilw.is_hash_router {
+            igpu_scratch.d_selected.copy_from_host(&selected)?;
+        }
+        {
+            let _t = ie.events.stage("k.moe.iq2_fused_batch", &ie.compute)?;
+            ie.iq2.launch_fused_swiglu_batch(
                 &ie.compute,
                 &mut igpu_scratch.d_mid_cat,
                 &ilw.routed.gate.buffer,
-                e * gbpe,
                 &ilw.routed.up.buffer,
-                e * ubpe,
                 &igpu_scratch.d_xq_q8k,
                 &igpu_scratch.d_ew,
-                slot as u32,
+                &igpu_scratch.d_selected,
+                gbpe as u32,
+                ubpe as u32,
+                N_EXPERT_USED as u32,
                 SWIGLU_CLAMP_EXP,
                 N_FF_EXP,
                 BLOCKS_Q8K_GATE_IN,
