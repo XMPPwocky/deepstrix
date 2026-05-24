@@ -13,6 +13,8 @@ use v4flash_hip::{sys, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const ROUTER_TOPK_GFX1201: &[u8] = include_bytes!(env!("KERNEL_ROUTER_TOPK_GFX1201"));
 const ROUTER_TOPK_GFX1151: &[u8] = include_bytes!(env!("KERNEL_ROUTER_TOPK_GFX1151"));
+const ROUTER_TOPK_PAR_GFX1201: &[u8] = include_bytes!(env!("KERNEL_ROUTER_TOPK_PAR_GFX1201"));
+const ROUTER_TOPK_PAR_GFX1151: &[u8] = include_bytes!(env!("KERNEL_ROUTER_TOPK_PAR_GFX1151"));
 
 /// Hard caps mirroring the kernel `#define`s. If the architecture ever
 /// changes these, both have to move in lock-step.
@@ -25,6 +27,22 @@ pub struct RouterTopk {
 
 impl RouterTopk {
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        // Use the M14b parallel variant by default — same numerics for
+        // tie-free inputs as the serial reference, ~10× faster.
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            ROUTER_TOPK_PAR_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            ROUTER_TOPK_PAR_GFX1151
+        } else {
+            return Err(eyre!("unsupported arch for router_topk: {arch}"));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    /// Construct using the original serial kernel — used by the
+    /// regression test that compares serial vs parallel outputs.
+    pub fn for_arch_serial(arch: &str) -> eyre::Result<Self> {
         let image: &[u8] = if arch.starts_with("gfx1201") {
             ROUTER_TOPK_GFX1201
         } else if arch.starts_with("gfx1151") {
@@ -87,7 +105,12 @@ impl RouterTopk {
             }
         }
 
-        let function = self.module.get_function("router_topk")?;
+        // The parallel variant exports `router_topk_par`; the serial
+        // variant exports `router_topk`. Try the par name first.
+        let function = self
+            .module
+            .get_function("router_topk_par")
+            .or_else(|_| self.module.get_function("router_topk"))?;
         let mut sel_ptr = selected.raw();
         let mut w_ptr = weights.raw();
         let mut l_ptr = logits.raw();

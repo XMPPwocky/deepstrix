@@ -23,6 +23,8 @@ const HC_SINKHORN_GFX1201: &[u8] = include_bytes!(env!("KERNEL_HC_SINKHORN_GFX12
 const HC_SINKHORN_GFX1151: &[u8] = include_bytes!(env!("KERNEL_HC_SINKHORN_GFX1151"));
 const HC_POST_GFX1201: &[u8] = include_bytes!(env!("KERNEL_HC_POST_GFX1201"));
 const HC_POST_GFX1151: &[u8] = include_bytes!(env!("KERNEL_HC_POST_GFX1151"));
+const HC_SINKHORN_PAR_GFX1201: &[u8] = include_bytes!(env!("KERNEL_HC_SINKHORN_PAR_GFX1201"));
+const HC_SINKHORN_PAR_GFX1151: &[u8] = include_bytes!(env!("KERNEL_HC_SINKHORN_PAR_GFX1151"));
 
 /// `w[i] = sigmoid_stable(pre[i] * scale[0] + base[i]) + DS4_HC_EPS`.
 pub struct HcSigmoidBias {
@@ -129,21 +131,29 @@ impl HcWeightedSum {
 
 /// Per-layer mHC Sinkhorn split. Mirrors `hc_split_sinkhorn_one`
 /// (ds4.c:4220). Output is 2*n_hc + n_hc*n_hc = 24 floats for n_hc=4.
+///
+/// Holds both kernel images: the original single-thread variant (used
+/// for general `n_hc`) and the M14a 16-thread shared-mem variant
+/// specialized for `n_hc=4` (V4-Flash's only configuration). The
+/// `launch()` entry point auto-picks the parallel version when
+/// applicable.
 pub struct HcSinkhorn {
-    module: Module,
+    serial: Module,
+    par: Module,
 }
 
 impl HcSinkhorn {
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
-        let image: &[u8] = if arch.starts_with("gfx1201") {
-            HC_SINKHORN_GFX1201
+        let (serial_img, par_img): (&[u8], &[u8]) = if arch.starts_with("gfx1201") {
+            (HC_SINKHORN_GFX1201, HC_SINKHORN_PAR_GFX1201)
         } else if arch.starts_with("gfx1151") {
-            HC_SINKHORN_GFX1151
+            (HC_SINKHORN_GFX1151, HC_SINKHORN_PAR_GFX1151)
         } else {
             return Err(eyre!("unsupported arch for hc_sinkhorn: {arch}"));
         };
-        let module = Module::load_data(image)?;
-        Ok(Self { module })
+        let serial = Module::load_data(serial_img)?;
+        let par = Module::load_data(par_img)?;
+        Ok(Self { serial, par })
     }
 
     pub fn launch(
@@ -157,7 +167,28 @@ impl HcSinkhorn {
         iters: u32,
         eps: f32,
     ) -> eyre::Result<()> {
-        let function = self.module.get_function("hc_sinkhorn")?;
+        // V4-Flash always uses n_hc=4. Take the M14a parallel path.
+        // Other n_hc values still work via the original single-thread
+        // kernel (only exercised by older oracle tests, if any).
+        let (function, cfg) = if n_hc == 4 {
+            (
+                self.par.get_function("hc_sinkhorn_par")?,
+                LaunchConfig {
+                    grid: (1, 1, 1),
+                    block: (16, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+            )
+        } else {
+            (
+                self.serial.get_function("hc_sinkhorn")?,
+                LaunchConfig {
+                    grid: (1, 1, 1),
+                    block: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+            )
+        };
         let mut out_ptr = out.raw();
         let mut mix_ptr = mix.raw();
         let mut sc_ptr = scale.raw();
@@ -174,11 +205,6 @@ impl HcSinkhorn {
             &mut it as *mut _ as *mut c_void,
             &mut ep as *mut _ as *mut c_void,
         ];
-        let cfg = LaunchConfig {
-            grid: (1, 1, 1),
-            block: (1, 1, 1),
-            shared_mem_bytes: 0,
-        };
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
 }
