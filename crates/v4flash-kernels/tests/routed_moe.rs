@@ -31,7 +31,13 @@ const N_EXPERT_USED: usize = 6;
 const N_BLOCKS_GATE_IN: u32 = N_EMBD / 256; // 16
 const N_BLOCKS_DOWN_IN: u32 = N_FF_EXP / 256; // 8
 const SWIGLU_CLAMP_EXP: f32 = 10.0;
-const TEST_LAYER: i32 = 3;
+// Set via `MOE_TEST_LAYER=N` env var for cross-layer validation. Default L=3.
+fn test_layer() -> i32 {
+    std::env::var("MOE_TEST_LAYER")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(3)
+}
 
 fn dump_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -89,6 +95,9 @@ fn routed_moe_oracle() -> eyre::Result<()> {
     let arch = device.properties()?.gcn_arch_name;
     eprintln!("using device {} ({arch}); n_tokens={n_tokens}", device.id);
 
+    #[allow(non_snake_case)]
+    let TL = test_layer();
+    eprintln!("MOE_TEST_LAYER={TL}");
     let q8k = Q8KQuantize::for_arch(&arch)?;
     let iq2 = Iq2XxsPairMatvec::for_arch(&arch)?;
     let swiglu_cw = SwigluClampWeighted::for_arch(&arch)?;
@@ -97,9 +106,9 @@ fn routed_moe_oracle() -> eyre::Result<()> {
 
     // Verify dtypes.
     for (name, want) in [
-        (format!("blk.{TEST_LAYER}.ffn_gate_exps.weight"), GgufType::IQ2_XXS),
-        (format!("blk.{TEST_LAYER}.ffn_up_exps.weight"), GgufType::IQ2_XXS),
-        (format!("blk.{TEST_LAYER}.ffn_down_exps.weight"), GgufType::Q2_K),
+        (format!("blk.{TL}.ffn_gate_exps.weight"), GgufType::IQ2_XXS),
+        (format!("blk.{TL}.ffn_up_exps.weight"), GgufType::IQ2_XXS),
+        (format!("blk.{TL}.ffn_down_exps.weight"), GgufType::Q2_K),
     ] {
         let t = gguf.gguf().tensor(&name).ok_or_else(|| eyre!("{name} missing"))?;
         if t.dtype != want {
@@ -109,17 +118,17 @@ fn routed_moe_oracle() -> eyre::Result<()> {
 
     let gate_t = gguf
         .gguf()
-        .tensor(&format!("blk.{TEST_LAYER}.ffn_gate_exps.weight"))
+        .tensor(&format!("blk.{TL}.ffn_gate_exps.weight"))
         .unwrap();
     let down_t = gguf
         .gguf()
-        .tensor(&format!("blk.{TEST_LAYER}.ffn_down_exps.weight"))
+        .tensor(&format!("blk.{TL}.ffn_down_exps.weight"))
         .unwrap();
     let gate_all = gguf.tensor_bytes(gate_t).ok_or_else(|| eyre!("gate bytes"))?;
     let up_all = gguf
         .tensor_bytes(
             gguf.gguf()
-                .tensor(&format!("blk.{TEST_LAYER}.ffn_up_exps.weight"))
+                .tensor(&format!("blk.{TL}.ffn_up_exps.weight"))
                 .unwrap(),
         )
         .ok_or_else(|| eyre!("up bytes"))?;
@@ -173,8 +182,8 @@ fn routed_moe_oracle() -> eyre::Result<()> {
 
     for token in 0..n_tokens {
         let sel_e = dump
-            .tensor("expert_selected", TEST_LAYER, token)
-            .ok_or_else(|| eyre!("missing expert_selected L{TEST_LAYER} T{token}"))?;
+            .tensor("expert_selected", TL, token)
+            .ok_or_else(|| eyre!("missing expert_selected L{TL} T{token}"))?;
         let sel_e_bytes = dump.read_bytes(sel_e)?;
         assert_eq!(sel_e_bytes.len(), N_EXPERT_USED * 4);
         let mut sel_ids = [0i32; 6];
@@ -187,8 +196,8 @@ fn routed_moe_oracle() -> eyre::Result<()> {
             ]);
         }
         let sel_w = dump
-            .tensor("expert_weight_out", TEST_LAYER, token)
-            .ok_or_else(|| eyre!("missing expert_weight_out L{TEST_LAYER} T{token}"))?;
+            .tensor("expert_weight_out", TL, token)
+            .ok_or_else(|| eyre!("missing expert_weight_out L{TL} T{token}"))?;
         let expert_w_host = dump.read_f32(sel_w)?;
         d_ew.copy_from_host(&expert_w_host)?;
 
@@ -207,8 +216,8 @@ fn routed_moe_oracle() -> eyre::Result<()> {
         }
 
         let x_entry = dump
-            .tensor("ffn_input_norm", TEST_LAYER, token)
-            .ok_or_else(|| eyre!("missing ffn_input_norm L{TEST_LAYER} T{token}"))?;
+            .tensor("ffn_input_norm", TL, token)
+            .ok_or_else(|| eyre!("missing ffn_input_norm L{TL} T{token}"))?;
         let x = dump.read_f32(x_entry)?;
         d_x.copy_from_host(&x)?;
         q8k.launch(&stream, &mut d_xq, &d_x, N_BLOCKS_GATE_IN)?;
@@ -271,8 +280,8 @@ fn routed_moe_oracle() -> eyre::Result<()> {
         d_out.copy_to_host(&mut got)?;
 
         let exp_entry = dump
-            .tensor("ffn_moe", TEST_LAYER, token)
-            .ok_or_else(|| eyre!("missing ffn_moe L{TEST_LAYER} T{token}"))?;
+            .tensor("ffn_moe", TL, token)
+            .ok_or_else(|| eyre!("missing ffn_moe L{TL} T{token}"))?;
         let expected = dump.read_f32(exp_entry)?;
         stats.update(&got, &expected);
         if (token % 10) == 0 {
