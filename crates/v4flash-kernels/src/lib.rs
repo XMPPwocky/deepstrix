@@ -12,6 +12,7 @@
 //! from the activation dump and asserts `max_abs_diff < threshold`.
 
 pub mod attention;
+pub mod compressor;
 pub mod f16;
 pub mod oracle;
 pub mod q8_0;
@@ -20,6 +21,7 @@ pub mod rope;
 pub mod weights;
 
 pub use attention::{AttentionMixed, AttentionSwa, ATTN_MIXED_MAX_KEYS, ATTN_SWA_MAX_KV};
+pub use compressor::CompressorPool;
 pub use f16::F16Matvec;
 pub use oracle::{ActivationDump, Dtype, TensorEntry};
 pub use q8_0::{Q8_0GroupedMatvec, Q8_0Matvec};
