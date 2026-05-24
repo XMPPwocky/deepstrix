@@ -70,11 +70,17 @@ static const char *dtype_name(ds4_dump_dtype dt) {
     return "?";
 }
 
+/* Max layer index seen via the dump callback. ds4 has DS4_N_LAYER=43 real
+ * layers (indices 0..42), plus one synthetic "layer 43" used by the 0003
+ * patch as the head/tail bucket. Sized with headroom for future synthetic
+ * buckets if more emerge. */
+#define DUMP_MAX_LAYERS 64
+
 struct dump_state {
     const char *out_dir;
     FILE *manifest;          /* the running JSON array (one line per tensor) */
     int manifest_count;       /* number of tensors emitted so far */
-    char weight_seen[64][43]; /* (tag_hash_low_bits, layer) bitmap for weight dedup */
+    char weight_seen[64][DUMP_MAX_LAYERS]; /* (tag_hash_low_bits, layer) bitmap for weight dedup */
 };
 
 /* Tiny hash for weight tag dedup. Tags are stable short strings. */
@@ -122,7 +128,7 @@ static void on_activation(void *ud, const char *tag, const void *data,
 
     if (is_weight) {
         /* Dedup: emit once per (layer, tag). */
-        if (layer < 0 || layer >= 43) return;
+        if (layer < 0 || layer >= DUMP_MAX_LAYERS) return;
         unsigned h = weight_hash(short_tag);
         if (st->weight_seen[h][layer]) return;
         st->weight_seen[h][layer] = 1;

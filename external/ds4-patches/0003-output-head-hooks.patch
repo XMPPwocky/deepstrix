@@ -1,0 +1,61 @@
+diff --git a/ds4.c b/ds4.c
+index 7cfeaf9..f60ea0d 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -7698,7 +7698,19 @@ static void forward_token_raw_swa_cpu_decode_scratch(
+     }
+ 
+     if (logits) {
++        /* deepstrix dump: head outputs use synthetic layer = DS4_N_LAYER (43),
++         * with the current token position. Emit weight:output_norm once at
++         * pos==0 (deduped by the dumper). */
++        g_ds4_dump_layer = (int)DS4_N_LAYER;
++        g_ds4_dump_pos = (int)pos;
++        if (pos == 0) {
++            ds4_dump_emit_1d("weight:output_norm",
++                             tensor_data(model, weights->output_norm),
++                             DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_EMBD);
++        }
+         output_logits_one_decode_scratch(logits, model, weights, cur, scratch);
++        g_ds4_dump_layer = -1;
++        g_ds4_dump_pos = -1;
+     }
+ }
+ 
+@@ -8029,18 +8041,36 @@ static void output_logits_one_decode_scratch(
+     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * n_hc;
+ 
+     rms_norm_no_weight(scratch->output_flat, inp_hc, hc_dim, DS4_RMS_EPS);
++    /* deepstrix dump: post no-weight RMS of the 4-stream HC residual. */
++    ds4_dump_emit_2d("output_flat", scratch->output_flat, DS4_DUMP_DTYPE_F32,
++                     (int64_t)n_hc, (int64_t)DS4_N_EMBD);
++
+     matvec_f16(scratch->output_pre, model, weights->output_hc_fn, scratch->output_flat);
++    /* deepstrix dump: post f16 matvec — small per-stream control values used
++     * by the HC weight sigmoid. Shape is n_hc (only the first n_hc entries
++     * are read by the sigmoid loop below). */
++    ds4_dump_emit_1d("output_pre", scratch->output_pre, DS4_DUMP_DTYPE_F32, (int64_t)n_hc);
+ 
+     const float *scale = tensor_data(model, weights->output_hc_scale);
+     const float *base = tensor_data(model, weights->output_hc_base);
+     for (uint32_t i = 0; i < n_hc; i++) {
+         scratch->output_weights[i] = sigmoid_stable(scratch->output_pre[i] * scale[0] + base[i]) + DS4_HC_EPS;
+     }
++    /* deepstrix dump: post sigmoid — the HC mixing weights. */
++    ds4_dump_emit_1d("output_hc_weights", scratch->output_weights,
++                     DS4_DUMP_DTYPE_F32, (int64_t)n_hc);
+ 
+     hc_weighted_sum_one(scratch->output_embd, inp_hc, scratch->output_weights, DS4_N_EMBD, n_hc);
++    /* deepstrix dump: HC streams weighted into a single embedding row. */
++    ds4_dump_emit_1d("output_embd", scratch->output_embd, DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_EMBD);
++
+     rms_norm_weight(scratch->output_norm, scratch->output_embd,
+                     tensor_data(model, weights->output_norm),
+                     DS4_N_EMBD, DS4_RMS_EPS);
++    /* deepstrix dump: post-RMS-weight; this is the input to the Q8_0
++     * output-projection matvec — the M3 kernel oracle input. */
++    ds4_dump_emit_1d("output_norm", scratch->output_norm, DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_EMBD);
++
+     matvec_q8_0_decode_scratch(logits, model, weights->output, scratch->output_norm, scratch);
+ }
+ 
