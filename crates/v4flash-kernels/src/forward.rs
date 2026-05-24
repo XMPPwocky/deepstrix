@@ -613,7 +613,7 @@ pub fn load_f32_weight(
     if t.dtype != GgufType::F32 {
         return Err(eyre!("{name}: dtype {:?} != F32", t.dtype));
     }
-    let bytes = gguf.tensor_bytes(t).ok_or_else(|| eyre!("{name} bytes"))?;
+    let bytes = gguf.read_tensor(t)?;
     if bytes.len() != expected_len * 4 {
         return Err(eyre!(
             "{name}: have {} bytes, expected {}",
@@ -638,7 +638,7 @@ pub fn load_i32_tensor(gguf: &MappedGguf, name: &str) -> eyre::Result<Vec<i32>> 
     if t.dtype != GgufType::I32 {
         return Err(eyre!("{name}: dtype {:?} != I32", t.dtype));
     }
-    let bytes = gguf.tensor_bytes(t).ok_or_else(|| eyre!("{name} bytes"))?;
+    let bytes = gguf.read_tensor(t)?;
     Ok(bytes
         .chunks_exact(4)
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -888,9 +888,7 @@ impl LayerWeights {
                     if t.dtype != GgufType::F32 {
                         return Err(eyre!("{bias_name} dtype {:?} != F32", t.dtype));
                     }
-                    let bytes = gguf
-                        .tensor_bytes(t)
-                        .ok_or_else(|| eyre!("{bias_name} bytes"))?;
+                    let bytes = gguf.read_tensor(t)?;
                     Some(
                         bytes
                             .chunks_exact(4)

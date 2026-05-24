@@ -16,6 +16,7 @@
 use std::path::PathBuf;
 
 use color_eyre::eyre::{self, eyre};
+use color_eyre::eyre::WrapErr;
 use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::{
@@ -68,7 +69,7 @@ fn load_f32_weight(
     if t.dtype != GgufType::F32 {
         return Err(eyre!("tensor {name} has dtype {:?}", t.dtype));
     }
-    let bytes = gguf.tensor_bytes(t).ok_or_else(|| eyre!("bytes missing"))?;
+    let bytes = gguf.read_tensor(t).wrap_err("bytes missing")?;
     let mut v = vec![0f32; expected_len];
     for (i, c) in bytes.chunks_exact(4).enumerate() {
         v[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);

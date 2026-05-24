@@ -40,7 +40,7 @@ fn open_and_read_first_tensor() {
         t.name, t.dtype.name(), t.byte_size, t.abs_offset
     );
 
-    let mmap_bytes = m.tensor_bytes(t).expect("tensor_bytes");
+    let mmap_bytes = m.read_tensor(t).expect("read_tensor");
     assert_eq!(mmap_bytes.len(), t.byte_size as usize);
 
     // Cross-check: pread the same range from the file and compare.
@@ -87,7 +87,8 @@ fn tensor_by_name() {
         .map(|t| t.name.clone())
         .expect("expected token_embd.weight or output.weight to exist in gemma");
 
-    let bytes = m.tensor_bytes_by_name(&head_name).expect("bytes");
+    let t = m.gguf().tensor(&head_name).expect("tensor by name");
+    let bytes = m.read_tensor(t).expect("bytes");
     assert!(bytes.len() > 0);
     eprintln!("{}: {} bytes", head_name, bytes.len());
 }

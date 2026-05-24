@@ -54,8 +54,8 @@ pub fn load_to_device(
     if tensor.byte_size == 0 {
         return Err(eyre!("tensor `{name}` has zero byte_size"));
     }
-    let mut host: Vec<u8> = Vec::with_capacity(tensor.byte_size as usize);
-    gguf.read_tensor_into(tensor, &mut host)
+    let host = gguf
+        .read_tensor(tensor)
         .wrap_err_with(|| format!("pread `{name}`"))?;
 
     let mut buffer: DeviceBuffer<u8> =

@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 use color_eyre::eyre::{self, eyre};
+use color_eyre::eyre::WrapErr;
 use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::{weights, ActivationDump, Dtype, F16Matvec};
@@ -101,7 +102,7 @@ fn learned_router_oracle() -> eyre::Result<()> {
             .tensor(&format!("blk.{layer}.exp_probs_b.bias"))
         {
             Some(t) if t.dtype == GgufType::F32 => {
-                let bytes = gguf.tensor_bytes(t).ok_or_else(|| eyre!("bias bytes"))?;
+                let bytes = gguf.read_tensor(t).wrap_err("bias bytes")?;
                 Some(
                     bytes
                         .chunks_exact(4)

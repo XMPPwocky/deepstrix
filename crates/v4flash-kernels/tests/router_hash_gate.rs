@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 
 use color_eyre::eyre::{self, eyre};
+use color_eyre::eyre::WrapErr;
 use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::{weights, ActivationDump, Dtype, F16Matvec};
@@ -135,8 +136,7 @@ fn hash_gate_router_oracle() -> eyre::Result<()> {
             ));
         }
         let tid2eid_bytes = gguf
-            .tensor_bytes(tid2eid_tensor)
-            .ok_or_else(|| eyre!("tid2eid bytes missing"))?;
+            .read_tensor(tid2eid_tensor).wrap_err("tid2eid bytes missing")?;
         // Shape: [n_used=6, vocab]; flat layout tid2eid[token * n_used + slot].
         let tid2eid: Vec<i32> = tid2eid_bytes
             .chunks_exact(4)

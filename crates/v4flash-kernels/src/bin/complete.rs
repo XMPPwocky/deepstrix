@@ -238,10 +238,11 @@ fn main() -> eyre::Result<()> {
     if token_embd_t.dtype != GgufType::F16 {
         return Err(eyre!("token_embd dtype {:?} != F16", token_embd_t.dtype));
     }
-    let token_embd_bytes = gguf
-        .tensor_bytes(token_embd_t)
-        .ok_or_else(|| eyre!("token_embd bytes missing"))?;
+    // token_embd is read into host memory once and kept for the
+    // session — `embed_lookup` indexes into it per token. ~1 GB.
+    let token_embd_bytes = gguf.read_tensor(token_embd_t)?;
     eprintln!("token_embd: {} bytes", token_embd_bytes.len());
+    let token_embd_bytes: &[u8] = &token_embd_bytes;
 
     let rope = |layer: i32| -> eyre::Result<RopeParams> { Ok(rope_for_layer(layer)) };
 

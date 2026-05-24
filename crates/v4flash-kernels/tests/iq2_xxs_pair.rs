@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 
 use color_eyre::eyre::{self, eyre};
+use color_eyre::eyre::WrapErr;
 use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::iq2_xxs_tables::cpu_dot_iq2_xxs_q8_k;
@@ -49,11 +50,11 @@ fn pick_device() -> eyre::Result<Device> {
 
 /// Slice raw bytes for one expert from a 3D GGUF tensor `[in_dim, out_dim, n_experts]`
 /// of IQ2_XXS format (block_size=256, block_bytes=66).
-fn expert_bytes<'a>(
-    gguf: &'a MappedGguf,
+fn expert_bytes(
+    gguf: &MappedGguf,
     name: &str,
     expert: u32,
-) -> eyre::Result<&'a [u8]> {
+) -> eyre::Result<Vec<u8>> {
     let t = gguf
         .gguf()
         .tensor(name)
@@ -72,8 +73,8 @@ fn expert_bytes<'a>(
     let bytes_per_expert = out_dim * row_bytes;
     let total_bytes = bytes_per_expert * n_experts;
     let all = gguf
-        .tensor_bytes(t)
-        .ok_or_else(|| eyre!("tensor {name} bytes missing"))?;
+        .read_tensor(t)
+        .wrap_err("tensor {name} bytes missing")?;
     if all.len() != total_bytes {
         return Err(eyre!(
             "tensor {name}: have {} bytes, expected {} ({} per expert × {} experts)",
@@ -84,7 +85,7 @@ fn expert_bytes<'a>(
         ));
     }
     let off = (expert as usize) * bytes_per_expert;
-    Ok(&all[off..off + bytes_per_expert])
+    Ok(all[off..off + bytes_per_expert].to_vec())
 }
 
 fn run_oracle(variant: &str) -> eyre::Result<()> {
@@ -146,8 +147,8 @@ fn run_oracle(variant: &str) -> eyre::Result<()> {
                 &format!("blk.{layer}.ffn_up_exps.weight"),
                 expert,
             )?;
-            d_gate_w.copy_from_host(g_bytes)?;
-            d_up_w.copy_from_host(u_bytes)?;
+            d_gate_w.copy_from_host(&g_bytes)?;
+            d_up_w.copy_from_host(&u_bytes)?;
 
             matvec.launch(
                 &stream,

@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 
 use color_eyre::eyre::{self, eyre};
+use color_eyre::eyre::WrapErr;
 use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::q2_k::cpu_dot_q2_k_q8_k;
@@ -44,11 +45,11 @@ fn pick_device() -> eyre::Result<Device> {
     devices.first().copied().ok_or_else(|| eyre!("no HIP devices"))
 }
 
-fn expert_bytes<'a>(
-    gguf: &'a MappedGguf,
+fn expert_bytes(
+    gguf: &MappedGguf,
     name: &str,
     expert: u32,
-) -> eyre::Result<&'a [u8]> {
+) -> eyre::Result<Vec<u8>> {
     let t = gguf
         .gguf()
         .tensor(name)
@@ -67,8 +68,8 @@ fn expert_bytes<'a>(
     let bytes_per_expert = out_dim * row_bytes;
     let total_bytes = bytes_per_expert * n_experts;
     let all = gguf
-        .tensor_bytes(t)
-        .ok_or_else(|| eyre!("tensor {name} bytes missing"))?;
+        .read_tensor(t)
+        .wrap_err("tensor {name} bytes missing")?;
     if all.len() != total_bytes {
         return Err(eyre!(
             "tensor {name}: have {} bytes, expected {}",
@@ -77,7 +78,7 @@ fn expert_bytes<'a>(
         ));
     }
     let off = (expert as usize) * bytes_per_expert;
-    Ok(&all[off..off + bytes_per_expert])
+    Ok(all[off..off + bytes_per_expert].to_vec())
 }
 
 #[test]
@@ -131,7 +132,7 @@ fn q2_k_accumulate_oracle() -> eyre::Result<()> {
                 &format!("blk.{layer}.ffn_down_exps.weight"),
                 expert,
             )?;
-            d_w.copy_from_host(w_bytes)?;
+            d_w.copy_from_host(&w_bytes)?;
 
             // zero_init=true: first launch writes; subsequent launches would add.
             matvec.launch(

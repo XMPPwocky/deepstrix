@@ -831,7 +831,7 @@ name = "v4flash-core"
 version = "0.0.0"
 dependencies = [
  "color-eyre",
- "memmap2",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",

@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 
 use color_eyre::eyre::{self, eyre};
+use color_eyre::eyre::WrapErr;
 use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::{
@@ -124,17 +125,16 @@ fn routed_moe_oracle() -> eyre::Result<()> {
         .gguf()
         .tensor(&format!("blk.{TL}.ffn_down_exps.weight"))
         .unwrap();
-    let gate_all = gguf.tensor_bytes(gate_t).ok_or_else(|| eyre!("gate bytes"))?;
+    let gate_all = gguf.read_tensor(gate_t).wrap_err("gate bytes")?;
     let up_all = gguf
-        .tensor_bytes(
+        .read_tensor(
             gguf.gguf()
                 .tensor(&format!("blk.{TL}.ffn_up_exps.weight"))
                 .unwrap(),
         )
-        .ok_or_else(|| eyre!("up bytes"))?;
+        .wrap_err("up bytes")?;
     let down_all = gguf
-        .tensor_bytes(down_t)
-        .ok_or_else(|| eyre!("down bytes"))?;
+        .read_tensor(down_t).wrap_err("down bytes")?;
 
     let gate_bytes_per_expert =
         (N_FF_EXP as usize) * (N_BLOCKS_GATE_IN as usize) * BLOCK_IQ2_XXS_BYTES;
