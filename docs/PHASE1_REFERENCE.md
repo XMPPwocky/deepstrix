@@ -68,21 +68,30 @@ Captured by `external/ds4-dump/ds4-dump-activations` using the 0002 patch (`ds4_
   - Both are bit-deterministic across reruns of their respective paths.
 - The M2 dump becomes the canonical reference for kernel ports because every intermediate tensor is captured along *one consistent* trajectory.
 - Storage: `reference/v4flash-cpu-activations/` (gitignored, persistent btrfs)
-  - `manifest.json` SHA256: `d6604b9f94535504e2e251089b4bf8b45cdfc34b6a899985233a183d9208cd01`
-  - logits.f32 SHA256: `bd3176ea0644067caf7a455db332874e62c23838963f561cac2d2b4b59a2ea0a`
-  - aggregate SHA over `sort -u` of all `*.bin` files (one number summarizing the whole tree): `691c04013ef3a38a4f92d53a1df1f0eb13e72e06fc2f6e264f47ca3eee06a606`
-  - 14,792 tensors (51 token positions × 43 layers × 6 activation tags + 43 layers × 2 weight tags)
-  - 489 MB on disk
-- Tag set (per token position per layer):
+  - `manifest.json` SHA256: `a2e8b85b8eb0c722c170f996080c7af714e82dda9eac52d71d3f75b381ea4a02`
+  - logits.f32 SHA256: `bd3176ea0644067caf7a455db332874e62c23838963f561cac2d2b4b59a2ea0a` (unchanged from M2 — ds4 patch is byte-clean when callback is null)
+  - aggregate SHA over `sort -u` of all `*.bin` files (one number summarizing the whole tree): `d033b20460bc464387c964d7f2ffebea627d793759fabceaefeb8e90e6b2d3e1`
+  - 15,078 tensors (M2 baseline 14,792 + 5 head tags × 57 token positions in L43 + 1 head weight = +286)
+  - ~510 MB on disk
+- Tag set per layer L=0..42 (regular layers), per token position:
   - `layer_input_residual` (n_hc × n_embd = 4 × 4096 f32)
   - `attn_cur` (n_embd f32)
   - `attn_input_norm` (n_embd f32) — output of layer→attn RMSNorm
   - `ffn_cur` (n_embd f32)
   - `ffn_input_norm` (n_embd f32) — output of layer→ffn RMSNorm
   - `layer_output_residual` (n_hc × n_embd f32)
+- Tag set at synthetic L=43 (head bucket — 0003 patch), per token position:
+  - `output_flat` (n_hc × n_embd f32) — post `rms_norm_no_weight` of the HC residual
+  - `output_pre` (n_hc f32) — post `matvec_f16` against `output_hc_fn`
+  - `output_hc_weights` (n_hc f32) — post sigmoid; the 4 HC mixing weights
+  - `output_embd` (n_embd f32) — post `hc_weighted_sum_one`
+  - `output_norm` (n_embd f32) — post `rms_norm_weight`; **M3 Q8_0 matvec oracle input**
 - Per-layer weights (in `L<LL>/weight/`, deduped):
-  - `attn_norm.bin` — per-layer attention RMSNorm scale (n_embd f32)
-  - `ffn_norm.bin` — per-layer FFN RMSNorm scale (n_embd f32)
+  - `attn_norm.bin`, `ffn_norm.bin` — per-layer RMSNorm scales (L=0..42)
+  - `output_norm.bin` — head RMSNorm scale (L=43 only)
+
+**Logit-row ↔ output_norm token mapping** (used by M3 Q8_0 oracle):
+- `logits.f32` row k (k=0..50, 51 rows total) ↔ `L43/T<6+k>/output_norm.bin` — the `output_norm` at position `6+k` is the input that ds4's Q8_0 matvec consumed to produce logit row k.
 - Determinism: rerunning produces bit-identical manifest + every `.bin` file (verified by spot-check SHA on `L17/T0005/attn_input_norm.bin`).
 - Reproduction:
   ```bash
