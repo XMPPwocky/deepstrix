@@ -1,0 +1,36 @@
+diff --git a/ds4.c b/ds4.c
+--- a/ds4.c
++++ b/ds4.c
+@@ -7638,6 +7638,12 @@
+                                                  pos,
+                                                  scratch)) {
+             kv_cache_push_comp(cache->attn_comp_kv, &cache->n_comp, cache->comp_cap, DS4_N_HEAD_DIM, scratch->comp);
++            /* deepstrix dump (M6): the just-pushed compressed KV row,
++             * f16-roundtripped post-FP8 value that mixed_one consumes.
++             * Fires once per `ratio` tokens. */
++            ds4_dump_emit_1d("comp_kv_row",
++                             cache->attn_comp_kv + (uint64_t)(cache->n_comp - 1) * DS4_N_HEAD_DIM,
++                             DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_HEAD_DIM);
+         }
+ 
+         if (ratio == 4) {
+@@ -7672,6 +7678,19 @@
+                                                                  il, pos,
+                                                                  scratch);
+         if (profile) t_indexer = now_sec() - t0;
++        /* deepstrix dump (M6): the indexer's per-comp-row allow mask,
++         * re-encoded as i32 (0/1) since the dump dtype enum supports i32
++         * but not bool. Only fires when there are compressed rows to mask. */
++        if (comp_allowed != NULL && cache->n_comp > 0) {
++            int32_t mask_i32[1024];
++            uint32_t n = cache->n_comp;
++            if (n > 1024) n = 1024;
++            for (uint32_t r = 0; r < n; r++) {
++                mask_i32[r] = comp_allowed[r] ? 1 : 0;
++            }
++            ds4_dump_emit_1d("comp_allowed_mask", mask_i32,
++                             DS4_DUMP_DTYPE_I32, (int64_t)n);
++        }
+     }
+ 
+     t0 = profile ? now_sec() : 0.0;
