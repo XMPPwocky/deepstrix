@@ -32,10 +32,11 @@ use crate::router_topk::RouterTopk;
 use super::perfetto::DeviceTimingExporter;
 use super::trace::EventPool;
 
-/// Per-device EventPool capacity (events; up to half this many start/end
-/// pairs per token). 43 layers × ~12 stages × 2 = ~1000 events; pad to
-/// 2048 to leave headroom for the head + ad-hoc scopes.
-pub const EVENT_POOL_CAPACITY: usize = 2048;
+/// Per-device EventPool capacity. With wait-vs-work split bracketing
+/// (a ".wait" pair before each cross-stream wait + the original work
+/// pair) we have up to ~20 pairs per layer × 43 layers ≈ 1700 events.
+/// Pad to 4096 for headroom.
+pub const EVENT_POOL_CAPACITY: usize = 4096;
 
 /// Execution policy for [`HeterogeneousEngine::forward_token`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

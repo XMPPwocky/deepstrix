@@ -247,17 +247,25 @@ impl HeterogeneousEngine {
         let sev_pre = &self.sync_events.layers[layer as usize];
 
         if ratio > 0 {
+            if parallel_pre {
+                // Record the upstream event first, then bracket the wait
+                // separately from the work so the perfetto timeline shows
+                // wait time as its own slice instead of inflating the
+                // peer_push stage with idle stream time.
+                sev_pre.attn_in_ready.record(&de.compute)?;
+                let _t_wait = de
+                    .events
+                    .stage("dgpu.peer_push_attn_input_norm.wait", &de.xfer)?;
+                de.xfer.wait_event(&sev_pre.attn_in_ready)?;
+                _t_wait.end()?;
+            } else {
+                de.compute.synchronize()?;
+            }
             let _t_peer_ain_pre = de.events.stage(
                 "dgpu.peer_push_attn_input_norm",
                 &de.xfer,
             )?;
             let _s_peer_ain_pre = debug_span!("peer_push_attn_input_norm").entered();
-            if parallel_pre {
-                sev_pre.attn_in_ready.record(&de.compute)?;
-                de.xfer.wait_event(&sev_pre.attn_in_ready)?;
-            } else {
-                de.compute.synchronize()?;
-            }
             peer_push_f32(
                 &dgpu_scratch.attn_input_norm,
                 &mut igpu_scratch.attn_input_norm_recv,
@@ -274,6 +282,12 @@ impl HeterogeneousEngine {
             // iGPU compressor.
             self.igpu.device.set_current()?;
             let ie_c = &self.igpu;
+            if parallel_pre {
+                let _t_wait =
+                    ie_c.events.stage("igpu.compressor.wait", &ie_c.compute)?;
+                ie_c.compute.wait_event(&sev_pre.attn_in_pushed)?;
+                _t_wait.end()?;
+            }
             let _t_comp = ie_c.events.stage("igpu.compressor", &ie_c.compute)?;
             let _s_comp = debug_span!("compressor", ratio).entered();
 
@@ -284,10 +298,6 @@ impl HeterogeneousEngine {
             let comp_width = cw.width;
             let pos_mod = pos % ratio;
             let row = if ratio == 4 { 4 + pos_mod } else { pos_mod };
-
-            if parallel_pre {
-                ie_c.compute.wait_event(&sev_pre.attn_in_pushed)?;
-            }
             ie_c.f16.matvec(
                 &ie_c.compute,
                 &mut igpu_scratch.kv_cur,
@@ -369,10 +379,14 @@ impl HeterogeneousEngine {
                 // Peer push comp_row back to dGPU.
                 if parallel_pre {
                     sev_pre.comp_row_ready.record(&ie_c.compute)?;
+                    let _t_wait =
+                        ie_c.events.stage("igpu.peer_push_comp_row.wait", &ie_c.xfer)?;
                     ie_c.xfer.wait_event(&sev_pre.comp_row_ready)?;
+                    _t_wait.end()?;
                 } else {
                     ie_c.compute.synchronize()?;
                 }
+                let _t_push = ie_c.events.stage("igpu.peer_push_comp_row", &ie_c.xfer)?;
                 peer_push_f32(
                     &igpu_scratch.comp_row,
                     &mut dgpu_scratch.comp_row_recv,
@@ -383,6 +397,7 @@ impl HeterogeneousEngine {
                 } else {
                     ie_c.xfer.synchronize()?;
                 }
+                _t_push.end()?;
             }
             drop(_s_comp);
             _t_comp.end()?;
@@ -391,8 +406,13 @@ impl HeterogeneousEngine {
             // dGPU: append comp_row to comp_kv on boundary.
             if comp_fires_boundary {
                 if parallel_pre {
+                    let _t_wait = de
+                        .events
+                        .stage("dgpu.comp_kv_append.wait", &de.compute)?;
                     de.compute.wait_event(&sev_pre.comp_row_arrived)?;
+                    _t_wait.end()?;
                 }
+                let _t_append = de.events.stage("dgpu.comp_kv_append", &de.compute)?;
                 let cs = ls
                     .compressor
                     .as_mut()
@@ -405,6 +425,7 @@ impl HeterogeneousEngine {
                     N_HEAD_DIM,
                 )?;
                 cs.n_comp += 1;
+                _t_append.end()?;
             }
         }
 
@@ -577,14 +598,18 @@ impl HeterogeneousEngine {
         let parallel = matches!(self.mode, ExecMode::HetParallel);
         let sev = &self.sync_events.layers[layer as usize];
 
-        let _t_peer_ain = de.events.stage("dgpu.peer_push_ffn_input_norm", &de.xfer)?;
-        let _s_peer_ain = debug_span!("peer_push_ffn_input_norm").entered();
         if parallel {
             sev.ain_ready.record(&de.compute)?;
+            let _t_wait = de
+                .events
+                .stage("dgpu.peer_push_ffn_input_norm.wait", &de.xfer)?;
             de.xfer.wait_event(&sev.ain_ready)?;
+            _t_wait.end()?;
         } else {
             de.compute.synchronize()?;
         }
+        let _t_peer_ain = de.events.stage("dgpu.peer_push_ffn_input_norm", &de.xfer)?;
+        let _s_peer_ain = debug_span!("peer_push_ffn_input_norm").entered();
         peer_push_f32(
             &dgpu_scratch.ffn_input_norm,
             &mut igpu_scratch.ffn_input_norm_recv,
@@ -604,11 +629,13 @@ impl HeterogeneousEngine {
         self.igpu.device.set_current()?;
         let ie = &self.igpu;
 
+        if parallel {
+            let _t_wait = ie.events.stage("igpu.router.wait", &ie.compute)?;
+            ie.compute.wait_event(&sev.ain_pushed)?;
+            _t_wait.end()?;
+        }
         let _t_router = ie.events.stage("igpu.router", &ie.compute)?;
         let _s_router = debug_span!("router").entered();
-        if parallel {
-            ie.compute.wait_event(&sev.ain_pushed)?;
-        }
         ie.f16.matvec(
             &ie.compute,
             &mut igpu_scratch.router_logits,
@@ -757,14 +784,18 @@ impl HeterogeneousEngine {
         // ============================================================
         // iGPU → dGPU: peer push ffn_moe (16 KB)
         // ============================================================
-        let _t_peer_moe = ie.events.stage("igpu.peer_push_ffn_moe", &ie.xfer)?;
-        let _s_peer_moe = debug_span!("peer_push_ffn_moe").entered();
         if parallel {
             sev.moe_done.record(&ie.compute)?;
+            let _t_wait = ie
+                .events
+                .stage("igpu.peer_push_ffn_moe.wait", &ie.xfer)?;
             ie.xfer.wait_event(&sev.moe_done)?;
+            _t_wait.end()?;
         } else {
             ie.compute.synchronize()?;
         }
+        let _t_peer_moe = ie.events.stage("igpu.peer_push_ffn_moe", &ie.xfer)?;
+        let _s_peer_moe = debug_span!("peer_push_ffn_moe").entered();
         peer_push_f32(
             &igpu_scratch.ffn_moe,
             &mut dgpu_scratch.ffn_moe_recv,
@@ -793,11 +824,13 @@ impl HeterogeneousEngine {
 
         // ffn_moe_recv += ffn_shared. In parallel mode wait for the
         // peer copy to land before doing the add.
+        if parallel {
+            let _t_wait = de.events.stage("dgpu.ffn_combine.wait", &de.compute)?;
+            de.compute.wait_event(&sev.moe_arrived)?;
+            _t_wait.end()?;
+        }
         let _t_combine = de.events.stage("dgpu.ffn_combine", &de.compute)?;
         let _s_combine = debug_span!("ffn_combine").entered();
-        if parallel {
-            de.compute.wait_event(&sev.moe_arrived)?;
-        }
         de.vec_add.launch(
             &de.compute,
             &mut dgpu_scratch.ffn_moe_recv,
