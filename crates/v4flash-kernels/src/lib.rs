@@ -23,7 +23,8 @@ pub mod weights;
 
 pub use attention::{AttentionMixed, AttentionSwa, ATTN_MIXED_MAX_KEYS, ATTN_SWA_MAX_KV};
 pub use compressor::{
-    CompressorPool, CompressorStateShuffleR4, CompressorStateWrite, Fp8E4m3fnQuantize,
+    CompressorPool, CompressorStateShuffleR4, CompressorStateWrite, F16Roundtrip,
+    Fp8E4m3fnQuantize,
 };
 pub use f16::F16Matvec;
 pub use indexer::{IndexerScore, INDEXER_HEAD_DIM, INDEXER_N_HEAD, INDEXER_TOP_K};

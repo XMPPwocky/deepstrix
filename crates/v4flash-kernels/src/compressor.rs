@@ -28,6 +28,9 @@ const COMPRESSOR_STATE_SHUFFLE_GFX1201: &[u8] =
 const COMPRESSOR_STATE_SHUFFLE_GFX1151: &[u8] =
     include_bytes!(env!("KERNEL_COMPRESSOR_STATE_SHUFFLE_GFX1151"));
 
+const F16_ROUNDTRIP_GFX1201: &[u8] = include_bytes!(env!("KERNEL_F16_ROUNDTRIP_GFX1201"));
+const F16_ROUNDTRIP_GFX1151: &[u8] = include_bytes!(env!("KERNEL_F16_ROUNDTRIP_GFX1151"));
+
 /// Per-output-dim softmax-weighted average over the compressor state
 /// buffer. One workgroup, head_dim threads.
 pub struct CompressorPool {
@@ -272,6 +275,50 @@ impl CompressorStateShuffleR4 {
         let grid_y = width.div_ceil(block_x);
         let cfg = LaunchConfig {
             grid: (4, grid_y, 1),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+}
+
+/// In-place per-element `f32 → f16 → f32` round-trip. Mirrors ds4's
+/// `f16_round_inplace_cpu` (ds4.c:1586) used implicitly by
+/// `kv_cache_push_comp` when storing compressed KV in the cache.
+pub struct F16Roundtrip {
+    module: Module,
+}
+
+impl F16Roundtrip {
+    pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            F16_ROUNDTRIP_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            F16_ROUNDTRIP_GFX1151
+        } else {
+            return Err(eyre!("unsupported arch for f16_roundtrip: {arch}"));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    pub fn launch(
+        &self,
+        stream: &Stream,
+        x: &mut DeviceBuffer<f32>,
+        n: u32,
+    ) -> eyre::Result<()> {
+        let function = self.module.get_function("f16_roundtrip")?;
+        let mut x_ptr = x.raw();
+        let mut n_v = n;
+        let mut args: [*mut c_void; 2] = [
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut n_v as *mut _ as *mut c_void,
+        ];
+        let block_x = 256u32;
+        let grid_x = n.div_ceil(block_x);
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
