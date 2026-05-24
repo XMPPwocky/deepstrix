@@ -1,0 +1,23 @@
+diff --git a/ds4.c b/ds4.c
+--- a/ds4.c
++++ b/ds4.c
+@@ -5463,6 +5463,19 @@
+         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+     }
+ 
++    /* deepstrix dump (M8): router outputs — selected expert IDs (i32 [6])
++     * and post-norm router weights (f32 [6]). Fires for every layer
++     * per token. Validates both the hash-gate (L0-2) and learned-router
++     * (L3-42) paths. */
++    {
++        int32_t _ds4_dump_selected[DS4_N_EXPERT_USED];
++        for (int _i = 0; _i < DS4_N_EXPERT_USED; _i++) _ds4_dump_selected[_i] = selected[_i];
++        ds4_dump_emit_1d("expert_selected", _ds4_dump_selected,
++                         DS4_DUMP_DTYPE_I32, (int64_t)DS4_N_EXPERT_USED);
++        ds4_dump_emit_1d("expert_weight_out", expert_weight,
++                         DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_EXPERT_USED);
++    }
++
+     matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
+                                         layer->ffn_gate_exps,
+                                         layer->ffn_up_exps,
