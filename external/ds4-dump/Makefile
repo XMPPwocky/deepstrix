@@ -16,7 +16,7 @@ DS4_OBJS := $(DS4_DIR)/ds4.o $(DS4_DIR)/ds4_cuda.o
 
 .PHONY: all clean
 
-all: ds4-dump-logits ds4-dump-tokenize
+all: ds4-dump-logits ds4-dump-tokenize ds4-dump-activations
 
 # Build ds4's .o files if missing, by delegating to its Makefile.
 $(DS4_DIR)/ds4.o $(DS4_DIR)/ds4_cuda.o:
@@ -35,5 +35,12 @@ dump_tokenize.o: dump_tokenize.c $(DS4_DIR)/ds4.h
 ds4-dump-tokenize: dump_tokenize.o $(DS4_OBJS)
 	$(HIPCC) $(HIPLDFLAGS) -o $@ $^
 
+dump_activations.o: dump_activations.c $(DS4_DIR)/ds4.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+ds4-dump-activations: dump_activations.o $(DS4_OBJS)
+	$(HIPCC) $(HIPLDFLAGS) -o $@ $^
+
 clean:
-	rm -f dump_logits.o ds4-dump-logits dump_tokenize.o ds4-dump-tokenize
+	rm -f dump_logits.o ds4-dump-logits dump_tokenize.o ds4-dump-tokenize \
+	      dump_activations.o ds4-dump-activations
