@@ -33,10 +33,10 @@ use super::perfetto::DeviceTimingExporter;
 use super::trace::EventPool;
 
 /// Per-device EventPool capacity. With wait-vs-work split bracketing
-/// (a ".wait" pair before each cross-stream wait + the original work
-/// pair) we have up to ~20 pairs per layer × 43 layers ≈ 1700 events.
-/// Pad to 4096 for headroom.
-pub const EVENT_POOL_CAPACITY: usize = 4096;
+/// plus per-kernel timing inside the heavy stages (mhc_pre_attn,
+/// mhc_pre_ffn, output_proj, q_chain, routed_moe — see forward_layer.rs)
+/// we approach ~70 pairs/layer × 43 layers ≈ 6000 events per device.
+pub const EVENT_POOL_CAPACITY: usize = 8192;
 
 /// Execution policy for [`HeterogeneousEngine::forward_token`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

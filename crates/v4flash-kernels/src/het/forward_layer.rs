@@ -73,46 +73,63 @@ impl HeterogeneousEngine {
 
         let _t_mhc_pre = de.events.stage("dgpu.mhc_pre_attn", &de.compute)?;
         let _s_mhc_pre = debug_span!("mhc_pre_attn").entered();
-        de.rms_nw
-            .launch(&de.compute, &mut dgpu_scratch.flat, &dgpu_scratch.residual, 1, HC_DIM, RMS_EPS)?;
-        de.f16.matvec(
-            &de.compute,
-            &mut dgpu_scratch.mix,
-            &dlw.hc_attn_fn.buffer,
-            &dgpu_scratch.flat,
-            HC_MIX_DIM,
-            HC_DIM,
-        )?;
-        de.hc_sinkhorn.launch(
-            &de.compute,
-            &mut dgpu_scratch.split,
-            &dgpu_scratch.mix,
-            &dlw.hc_attn_scale,
-            &dlw.hc_attn_base,
-            N_HC,
-            SINKHORN_ITERS,
-            SINKHORN_EPS,
-        )?;
-        de.hc_weighted.launch(
-            &de.compute,
-            &mut dgpu_scratch.attn_cur,
-            &dgpu_scratch.residual,
-            &dgpu_scratch.split,
-            N_EMBD,
-            N_HC,
-        )?;
-
-        // M13.3: post/comb live at known offsets in `split` (layout
-        // [w(4), post(4), comb(16)]); no extraction needed. We pass the
-        // packed split buffer to hc_post via `launch_from_split` later.
-        de.rms_w.launch_weighted(
-            &de.compute,
-            &mut dgpu_scratch.attn_input_norm,
-            &dgpu_scratch.attn_cur,
-            &dlw.attn_norm,
-            N_EMBD,
-            RMS_EPS,
-        )?;
+        {
+            let _t = de.events.stage("k.mhc_pre_attn.rms_nw", &de.compute)?;
+            de.rms_nw.launch(
+                &de.compute,
+                &mut dgpu_scratch.flat,
+                &dgpu_scratch.residual,
+                1,
+                HC_DIM,
+                RMS_EPS,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.mhc_pre_attn.f16_matvec", &de.compute)?;
+            de.f16.matvec(
+                &de.compute,
+                &mut dgpu_scratch.mix,
+                &dlw.hc_attn_fn.buffer,
+                &dgpu_scratch.flat,
+                HC_MIX_DIM,
+                HC_DIM,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.mhc_pre_attn.sinkhorn", &de.compute)?;
+            de.hc_sinkhorn.launch(
+                &de.compute,
+                &mut dgpu_scratch.split,
+                &dgpu_scratch.mix,
+                &dlw.hc_attn_scale,
+                &dlw.hc_attn_base,
+                N_HC,
+                SINKHORN_ITERS,
+                SINKHORN_EPS,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.mhc_pre_attn.hc_weighted", &de.compute)?;
+            de.hc_weighted.launch(
+                &de.compute,
+                &mut dgpu_scratch.attn_cur,
+                &dgpu_scratch.residual,
+                &dgpu_scratch.split,
+                N_EMBD,
+                N_HC,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.mhc_pre_attn.rms_w", &de.compute)?;
+            de.rms_w.launch_weighted(
+                &de.compute,
+                &mut dgpu_scratch.attn_input_norm,
+                &dgpu_scratch.attn_cur,
+                &dlw.attn_norm,
+                N_EMBD,
+                RMS_EPS,
+            )?;
+        }
         drop(_s_mhc_pre);
         _t_mhc_pre.end()?;
 
@@ -121,63 +138,84 @@ impl HeterogeneousEngine {
         // ============================================================
         let _t_q = de.events.stage("dgpu.q_chain", &de.compute)?;
         let _s_q = debug_span!("q_chain").entered();
-        de.q8.quantize_input(
-            &de.compute,
-            &mut dgpu_scratch.xq_n_embd,
-            &mut dgpu_scratch.xscale_n_embd,
-            &dgpu_scratch.attn_input_norm,
-            N_EMBD,
-        )?;
-        de.q8.matvec(
-            &de.compute,
-            &mut dgpu_scratch.qr,
-            &dlw.attn_q_a.buffer,
-            &dgpu_scratch.xq_n_embd,
-            &dgpu_scratch.xscale_n_embd,
-            N_LORA_Q,
-            N_EMBD,
-        )?;
-        de.rms_w.launch_weighted(
-            &de.compute,
-            &mut dgpu_scratch.qr_normed,
-            &dgpu_scratch.qr,
-            &dlw.q_a_norm,
-            N_LORA_Q,
-            RMS_EPS,
-        )?;
-        de.q8.quantize_input(
-            &de.compute,
-            &mut dgpu_scratch.qr_xq,
-            &mut dgpu_scratch.qr_xscale,
-            &dgpu_scratch.qr_normed,
-            N_LORA_Q,
-        )?;
-        de.q8.matvec(
-            &de.compute,
-            &mut dgpu_scratch.q,
-            &dlw.attn_q_b.buffer,
-            &dgpu_scratch.qr_xq,
-            &dgpu_scratch.qr_xscale,
-            Q_FLAT,
-            N_LORA_Q,
-        )?;
-        de.rms_nw.launch(
-            &de.compute,
-            &mut dgpu_scratch.q_normed,
-            &dgpu_scratch.q,
-            N_HEAD,
-            N_HEAD_DIM,
-            RMS_EPS,
-        )?;
-        de.rope.launch_forward(
-            &de.compute,
-            &mut dgpu_scratch.q_normed,
-            N_HEAD,
-            N_HEAD_DIM,
-            N_ROT,
-            pos,
-            &dlw.rope_params,
-        )?;
+        {
+            let _t = de.events.stage("k.q_chain.q8_quantize_in", &de.compute)?;
+            de.q8.quantize_input(
+                &de.compute,
+                &mut dgpu_scratch.xq_n_embd,
+                &mut dgpu_scratch.xscale_n_embd,
+                &dgpu_scratch.attn_input_norm,
+                N_EMBD,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.q_chain.q8_matvec_qa", &de.compute)?;
+            de.q8.matvec(
+                &de.compute,
+                &mut dgpu_scratch.qr,
+                &dlw.attn_q_a.buffer,
+                &dgpu_scratch.xq_n_embd,
+                &dgpu_scratch.xscale_n_embd,
+                N_LORA_Q,
+                N_EMBD,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.q_chain.rms_w_qa", &de.compute)?;
+            de.rms_w.launch_weighted(
+                &de.compute,
+                &mut dgpu_scratch.qr_normed,
+                &dgpu_scratch.qr,
+                &dlw.q_a_norm,
+                N_LORA_Q,
+                RMS_EPS,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.q_chain.q8_quantize_qr", &de.compute)?;
+            de.q8.quantize_input(
+                &de.compute,
+                &mut dgpu_scratch.qr_xq,
+                &mut dgpu_scratch.qr_xscale,
+                &dgpu_scratch.qr_normed,
+                N_LORA_Q,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.q_chain.q8_matvec_qb", &de.compute)?;
+            de.q8.matvec(
+                &de.compute,
+                &mut dgpu_scratch.q,
+                &dlw.attn_q_b.buffer,
+                &dgpu_scratch.qr_xq,
+                &dgpu_scratch.qr_xscale,
+                Q_FLAT,
+                N_LORA_Q,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.q_chain.rms_nw_heads", &de.compute)?;
+            de.rms_nw.launch(
+                &de.compute,
+                &mut dgpu_scratch.q_normed,
+                &dgpu_scratch.q,
+                N_HEAD,
+                N_HEAD_DIM,
+                RMS_EPS,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.q_chain.rope_fwd", &de.compute)?;
+            de.rope.launch_forward(
+                &de.compute,
+                &mut dgpu_scratch.q_normed,
+                N_HEAD,
+                N_HEAD_DIM,
+                N_ROT,
+                pos,
+                &dlw.rope_params,
+            )?;
+        }
         drop(_s_q);
         _t_q.end()?;
 
@@ -298,37 +336,46 @@ impl HeterogeneousEngine {
             let comp_width = cw.width;
             let pos_mod = pos % ratio;
             let row = if ratio == 4 { 4 + pos_mod } else { pos_mod };
-            ie_c.f16.matvec(
-                &ie_c.compute,
-                &mut igpu_scratch.kv_cur,
-                &cw.wkv.buffer,
-                &igpu_scratch.attn_input_norm_recv,
-                comp_width,
-                N_EMBD,
-            )?;
-            ie_c.f16.matvec(
-                &ie_c.compute,
-                &mut igpu_scratch.sc_cur,
-                &cw.wgate.buffer,
-                &igpu_scratch.attn_input_norm_recv,
-                comp_width,
-                N_EMBD,
-            )?;
+            {
+                let _t = ie_c.events.stage("k.compressor.f16_kv", &ie_c.compute)?;
+                ie_c.f16.matvec(
+                    &ie_c.compute,
+                    &mut igpu_scratch.kv_cur,
+                    &cw.wkv.buffer,
+                    &igpu_scratch.attn_input_norm_recv,
+                    comp_width,
+                    N_EMBD,
+                )?;
+            }
+            {
+                let _t = ie_c.events.stage("k.compressor.f16_gate", &ie_c.compute)?;
+                ie_c.f16.matvec(
+                    &ie_c.compute,
+                    &mut igpu_scratch.sc_cur,
+                    &cw.wgate.buffer,
+                    &igpu_scratch.attn_input_norm_recv,
+                    comp_width,
+                    N_EMBD,
+                )?;
+            }
             let cs = ls
                 .compressor
                 .as_mut()
                 .ok_or_else(|| eyre!("L{layer}: missing compressor state"))?;
-            ie_c.compressor_state_write.launch(
-                &ie_c.compute,
-                &mut cs.state_kv,
-                &mut cs.state_score,
-                &igpu_scratch.kv_cur,
-                &igpu_scratch.sc_cur,
-                &cw.ape.buffer,
-                comp_width,
-                row,
-                pos_mod,
-            )?;
+            {
+                let _t = ie_c.events.stage("k.compressor.state_write", &ie_c.compute)?;
+                ie_c.compressor_state_write.launch(
+                    &ie_c.compute,
+                    &mut cs.state_kv,
+                    &mut cs.state_score,
+                    &igpu_scratch.kv_cur,
+                    &igpu_scratch.sc_cur,
+                    &cw.ape.buffer,
+                    comp_width,
+                    row,
+                    pos_mod,
+                )?;
+            }
 
             if comp_fires_boundary {
                 ie_c.compressor_pool.launch(
@@ -471,48 +518,63 @@ impl HeterogeneousEngine {
         // ============================================================
         let _t_out = de.events.stage("dgpu.output_proj", &de.compute)?;
         let _s_out = debug_span!("output_proj").entered();
-        de.rope.launch_inverse(
-            &de.compute,
-            &mut dgpu_scratch.heads,
-            N_HEAD,
-            N_HEAD_DIM,
-            N_ROT,
-            pos,
-            &dlw.rope_params,
-        )?;
-        de.q8.quantize_input(
-            &de.compute,
-            &mut dgpu_scratch.heads_xq,
-            &mut dgpu_scratch.heads_xscale,
-            &dgpu_scratch.heads,
-            Q_FLAT,
-        )?;
-        de.q8_grouped.matvec_grouped(
-            &de.compute,
-            &mut dgpu_scratch.low,
-            &dlw.attn_output_a.buffer,
-            &dgpu_scratch.heads_xq,
-            &dgpu_scratch.heads_xscale,
-            GROUP_DIM,
-            RANK,
-            N_GROUPS,
-        )?;
-        de.q8.quantize_input(
-            &de.compute,
-            &mut dgpu_scratch.low_xq,
-            &mut dgpu_scratch.low_xscale,
-            &dgpu_scratch.low,
-            OUT_LOW,
-        )?;
-        de.q8.matvec(
-            &de.compute,
-            &mut dgpu_scratch.attn_out,
-            &dlw.attn_output_b.buffer,
-            &dgpu_scratch.low_xq,
-            &dgpu_scratch.low_xscale,
-            N_EMBD,
-            OUT_LOW,
-        )?;
+        {
+            let _t = de.events.stage("k.output_proj.rope_inv", &de.compute)?;
+            de.rope.launch_inverse(
+                &de.compute,
+                &mut dgpu_scratch.heads,
+                N_HEAD,
+                N_HEAD_DIM,
+                N_ROT,
+                pos,
+                &dlw.rope_params,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.output_proj.q8_quantize_heads", &de.compute)?;
+            de.q8.quantize_input(
+                &de.compute,
+                &mut dgpu_scratch.heads_xq,
+                &mut dgpu_scratch.heads_xscale,
+                &dgpu_scratch.heads,
+                Q_FLAT,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.output_proj.q8_grouped_a", &de.compute)?;
+            de.q8_grouped.matvec_grouped(
+                &de.compute,
+                &mut dgpu_scratch.low,
+                &dlw.attn_output_a.buffer,
+                &dgpu_scratch.heads_xq,
+                &dgpu_scratch.heads_xscale,
+                GROUP_DIM,
+                RANK,
+                N_GROUPS,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.output_proj.q8_quantize_low", &de.compute)?;
+            de.q8.quantize_input(
+                &de.compute,
+                &mut dgpu_scratch.low_xq,
+                &mut dgpu_scratch.low_xscale,
+                &dgpu_scratch.low,
+                OUT_LOW,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.output_proj.q8_matvec_b", &de.compute)?;
+            de.q8.matvec(
+                &de.compute,
+                &mut dgpu_scratch.attn_out,
+                &dlw.attn_output_b.buffer,
+                &dgpu_scratch.low_xq,
+                &dgpu_scratch.low_xscale,
+                N_EMBD,
+                OUT_LOW,
+            )?;
+        }
         drop(_s_out);
         _t_out.end()?;
 
@@ -636,20 +698,19 @@ impl HeterogeneousEngine {
         }
         let _t_router = ie.events.stage("igpu.router", &ie.compute)?;
         let _s_router = debug_span!("router").entered();
-        ie.f16.matvec(
-            &ie.compute,
-            &mut igpu_scratch.router_logits,
-            &ilw.ffn_gate_inp.buffer,
-            &igpu_scratch.ffn_input_norm_recv,
-            N_EXPERT,
-            N_EMBD,
-        )?;
-
-        // M13.3: device-side router_topk for learned routers. Hash
-        // router (L≤2) still needs host topk because it indexes
-        // `tid2eid` with `token_id`. Either way we have to host-sync to
-        // get `selected[]` for the per-expert MoE pointer offsets.
+        {
+            let _t = ie.events.stage("k.router.f16_matvec", &ie.compute)?;
+            ie.f16.matvec(
+                &ie.compute,
+                &mut igpu_scratch.router_logits,
+                &ilw.ffn_gate_inp.buffer,
+                &igpu_scratch.ffn_input_norm_recv,
+                N_EXPERT,
+                N_EMBD,
+            )?;
+        }
         if !ilw.is_hash_router {
+            let _t = ie.events.stage("k.router.topk", &ie.compute)?;
             ie.router_topk.launch(
                 &ie.compute,
                 &mut igpu_scratch.d_selected,
@@ -722,14 +783,18 @@ impl HeterogeneousEngine {
         // round-trips (M13.4 inner-loop refactor).
         let _t_moe = ie.events.stage("igpu.routed_moe", &ie.compute)?;
         let _s_moe = debug_span!("routed_moe").entered();
-        ie.q8k.launch(
-            &ie.compute,
-            &mut igpu_scratch.d_xq_q8k,
-            &igpu_scratch.ffn_input_norm_recv,
-            BLOCKS_Q8K_GATE_IN,
-        )?;
+        {
+            let _t = ie.events.stage("k.moe.q8k_xq", &ie.compute)?;
+            ie.q8k.launch(
+                &ie.compute,
+                &mut igpu_scratch.d_xq_q8k,
+                &igpu_scratch.ffn_input_norm_recv,
+                BLOCKS_Q8K_GATE_IN,
+            )?;
+        }
         for slot in 0..N_EXPERT_USED {
             let e = selected[slot] as usize;
+            let _t = ie.events.stage("k.moe.iq2_pair", &ie.compute)?;
             ie.iq2.launch_with_full_offsets(
                 &ie.compute,
                 &mut igpu_scratch.d_gate_cat,
@@ -745,27 +810,34 @@ impl HeterogeneousEngine {
                 BLOCKS_Q8K_GATE_IN,
             )?;
         }
-        ie.swiglu_cw.launch(
-            &ie.compute,
-            &mut igpu_scratch.d_mid_cat,
-            &igpu_scratch.d_gate_cat,
-            &igpu_scratch.d_up_cat,
-            &igpu_scratch.d_ew,
-            SWIGLU_CLAMP_EXP,
-            N_FF_EXP,
-            N_EXPERT_USED as u32,
-        )?;
+        {
+            let _t = ie.events.stage("k.moe.swiglu_cw", &ie.compute)?;
+            ie.swiglu_cw.launch(
+                &ie.compute,
+                &mut igpu_scratch.d_mid_cat,
+                &igpu_scratch.d_gate_cat,
+                &igpu_scratch.d_up_cat,
+                &igpu_scratch.d_ew,
+                SWIGLU_CLAMP_EXP,
+                N_FF_EXP,
+                N_EXPERT_USED as u32,
+            )?;
+        }
         let mid_blocks_bytes = (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
         for slot in 0..N_EXPERT_USED {
-            ie.q8k.launch_with_offsets(
-                &ie.compute,
-                &mut igpu_scratch.d_midq_cat,
-                slot * mid_blocks_bytes,
-                &igpu_scratch.d_mid_cat,
-                slot * (N_FF_EXP as usize),
-                BLOCKS_Q8K_DOWN_IN,
-            )?;
+            {
+                let _t = ie.events.stage("k.moe.q8k_mid", &ie.compute)?;
+                ie.q8k.launch_with_offsets(
+                    &ie.compute,
+                    &mut igpu_scratch.d_midq_cat,
+                    slot * mid_blocks_bytes,
+                    &igpu_scratch.d_mid_cat,
+                    slot * (N_FF_EXP as usize),
+                    BLOCKS_Q8K_DOWN_IN,
+                )?;
+            }
             let e = selected[slot] as usize;
+            let _t = ie.events.stage("k.moe.q2k_down", &ie.compute)?;
             ie.q2k.launch_with_full_offsets(
                 &ie.compute,
                 &mut igpu_scratch.ffn_moe,
