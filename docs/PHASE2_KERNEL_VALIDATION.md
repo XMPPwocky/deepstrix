@@ -64,6 +64,11 @@ Per layer L=0..42 (regular layers, in `L<LL>/T<TTTT>/`):
 | `kv_raw_out`              | `[n_head_dim=512]`                 | f32   | per (L, T)     |
 | `kv_normed`               | `[512]`                            | f32   | per (L, T)     |
 | `kv_post_rope`            | `[512]`                            | f32   | per (L, T)     |
+| `kv_cached_row`           | `[512]`                            | f32   | per (L, T)     |
+| `attn_heads`              | `[n_head*n_head_dim=32768]`        | f32   | per (L, T)     |
+| `attn_heads_inv_rope`     | `[32768]`                          | f32   | per (L, T)     |
+| `attn_out_low`            | `[n_groups*rank=8192]`             | f32   | per (L, T)     |
+| `attn_out`                | `[n_embd=4096]`                    | f32   | per (L, T)     |
 | `ffn_cur`                 | `[n_embd]`                         | f32   | per (L, T)     |
 | `ffn_input_norm`          | `[n_embd]`                         | f32   | per (L, T)     |
 | `layer_output_residual`   | `[n_hc, n_embd]`                   | f32   | per (L, T)     |
@@ -72,6 +77,7 @@ Per layer L=0..42 (regular layers, in `L<LL>/T<TTTT>/`):
 | `weight:q_a_norm`         | `[1024]`                           | f32   | per L (pos=0)  |
 | `weight:kv_a_norm`        | `[512]`                            | f32   | per L (pos=0)  |
 | `weight:rope_params`      | `[6]`                              | f32   | per L (pos=0)  |
+| `weight:attn_sinks`       | `[n_head=64]`                      | f32   | per L (pos=0)  |
 
 `weight:rope_params` packs `[freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow]` — `beta_fast=32`, `beta_slow=1` are hardcoded DeepSeek-V4 defaults in the 0004 patch (ds4 does not parameterise these). `n_ctx_orig` is `DS4_ROPE_ORIG_CTX=65536` when `ext_factor != 0`, 0 otherwise; the dump does not carry it (it's layer-invariant and only consulted in the compressed-layer branch).
 
@@ -124,8 +130,10 @@ See `crates/v4flash-kernels/tests/rms_norm.rs` for the template.
 | `rope_tail` (Q stripe)        |    5.0e-5 |             2.4e-5 | —                     | n_head=64, head_dim=512, n_rot=64; same kernel, larger fan-out   |
 | `q_lora_chain` (M4 chain)     |    5.0e-2 |             1.7e-2 | mean<1e-4             | matvec→rms→matvec→rms_nw→rope; rms amplifies spiky matvec noise  |
 | `kv_chain` (M4 chain)         |    5.0e-3 |             1.7e-3 | mean<1e-5             | matvec→rms→rope; same amplification mechanism on spiky kv_raw    |
+| `attention_swa`               |    1.0e-3 |             2.9e-6 | —                     | sink-aware softmax + axpy; L=0,1 only (pure SWA); f32-ULP floor  |
+| `q8_0_grouped_matvec`         |    2.0e-2 |             1.2e-2 | mean<1e-4             | attn_output_a; n_groups=8 × group_dim=4096 → 8 × rank=1024       |
+| `swa_attention_chain` (M5)    |    1.0e-1 |             2.2e-2 | mean<1e-3             | attention_swa → inv_rope → grouped_q8_0 → q8_0; L=0,1 only       |
 | (future) `iq2_xxs_matmul`     |     TBD   |                TBD | —                     |                                                                  |
-| (future) `attention_*`        |     TBD   |                TBD | softmax-stable        | Softmax tightens the budget vs raw matmul                        |
 
 For Q8_0 specifically, the *argmax-match* check on every logit row is the production correctness gate — FP threshold backs it up but the discrete check is what guarantees "we pick the same greedy token as ds4 in every position."
 
@@ -133,7 +141,9 @@ For the M4 chain oracles, the **mean_abs** is the regression signal, not max_abs
 
 `rms_norm_no_weight`'s standalone test exercises the per-head case (n_rows=64, n=512). The same kernel handles `output_flat` in M10 (n_rows=1, n=16384) — the per-row strided loop has no n cap beyond what fits in 256-thread shared-memory reductions.
 
-`rope_tail`'s inverse path (one extra kernel arg flipping `sin_sign`) is unused by M4 but exercised by the attention output projection's pre-multiply in M5+.
+`rope_tail`'s inverse path (one extra kernel arg flipping `sin_sign`) is now exercised by M5's attention chain (inverse RoPE before the grouped output projection).
+
+For M5: `attention_swa` is the validated SWA-only softmax — it sits at f32-ULP because the value-side axpy order matches CPU (parallelised across `head_dim`, not across rows), and the dot-product reduction's tree-vs-sequential order difference is microscopic post-softmax. Coverage is L=0, L=1 only (ratio==0 layers in V4 Flash); M6 extends the same softmax body to L=2..42 by adding compressed-KV rows in `layer_attention_mixed_one`. `kv_cached_row` represents the f16-roundtripped post-FP8 KV that the cache stores — the Rust test accumulates rows across tokens to reconstruct the cache without needing an FP8 implementation.
 
 Rationale per threshold should land in each kernel's test docstring.
 
