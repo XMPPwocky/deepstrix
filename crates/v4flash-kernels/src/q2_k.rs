@@ -163,6 +163,68 @@ impl Q2KAccumulateMatvec {
     }
 }
 
+impl Q2KAccumulateMatvec {
+    /// Batched variant: single launch loops over all `n_used` slots
+    /// internally per workgroup. Writes summed result directly (no
+    /// accumulate). Eliminates 5 launches + 5 boundary syncs per layer.
+    /// (M14k.5)
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        w_base: &DeviceBuffer<u8>,
+        xq_base: &DeviceBuffer<u8>,
+        selected: &DeviceBuffer<i32>,
+        dbpe: u32,
+        xq_slot_stride: u32,
+        n_used: u32,
+        n_rows: u32,
+        n_blocks_in: u32,
+    ) -> eyre::Result<()> {
+        if n_rows % 8 != 0 {
+            return Err(eyre!("q2_k_matvec_par_batched: n_rows={n_rows} not %8"));
+        }
+        if out.len() < n_rows as usize {
+            return Err(eyre!(
+                "q2_k batched out: len {} < n_rows {n_rows}",
+                out.len()
+            ));
+        }
+        if (selected.len() as u32) < n_used {
+            return Err(eyre!("selected len {} < n_used {n_used}", selected.len()));
+        }
+
+        let function = self.module.get_function("q2_k_matvec_par_batched")?;
+        let mut out_ptr = out.raw();
+        let mut w_ptr = w_base.raw();
+        let mut xq_ptr = xq_base.raw();
+        let mut sel_ptr = selected.raw();
+        let mut dbpe_v = dbpe;
+        let mut xq_stride_v = xq_slot_stride;
+        let mut nu = n_used;
+        let mut nr = n_rows;
+        let mut nb = n_blocks_in;
+        let mut args: [*mut c_void; 9] = [
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut w_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut sel_ptr as *mut _ as *mut c_void,
+            &mut dbpe_v as *mut _ as *mut c_void,
+            &mut xq_stride_v as *mut _ as *mut c_void,
+            &mut nu as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+}
+
 /// CPU port of `dev_dot_q2_K_q8_K_block` (ds4_cuda.cu:7296). Used by oracle.
 pub fn cpu_dot_q2_k_q8_k(n_blocks: usize, w_bytes: &[u8], y_bytes: &[u8]) -> f32 {
     assert_eq!(w_bytes.len(), n_blocks * BLOCK_Q2_K_BYTES);

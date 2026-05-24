@@ -827,21 +827,27 @@ impl HeterogeneousEngine {
                 BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32),
             )?;
         }
-        for slot in 0..N_EXPERT_USED {
-            let e = selected[slot] as usize;
-            let _t = ie.events.stage("k.moe.q2k_down", &ie.compute)?;
-            ie.q2k.launch_with_full_offsets(
+        {
+            // M14k.5: batched q2k_down — single launch loops over all 6
+            // slots internally per workgroup, writes summed ffn_moe
+            // directly. Eliminates 5 launches + 5 boundary syncs per layer.
+            let _t = ie.events.stage("k.moe.q2k_down_batch", &ie.compute)?;
+            ie.q2k.launch_batched(
                 &ie.compute,
                 &mut igpu_scratch.ffn_moe,
                 &ilw.routed.down.buffer,
-                e * dbpe,
                 &igpu_scratch.d_midq_cat,
-                slot * mid_blocks_bytes,
+                &igpu_scratch.d_selected,
+                dbpe as u32,
+                mid_blocks_bytes as u32,
+                N_EXPERT_USED as u32,
                 N_EMBD,
                 BLOCKS_Q8K_DOWN_IN,
-                slot == 0,
             )?;
         }
+        // Keep `selected` referenced even if we no longer index by it in
+        // this block, so the host-side parity computation isn't elided.
+        let _ = &selected;
         drop(_s_moe);
         _t_moe.end()?;
 
