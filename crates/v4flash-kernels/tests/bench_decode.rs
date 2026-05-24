@@ -102,20 +102,32 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
     // repeats the last.
     let max_inp_pos = dump.n_logit_rows as i32 + PROMPT_TOKENS.len() as i32 - 2;
 
-    let mut token_us: Vec<u64> = Vec::with_capacity(n_positions as usize);
-    let bench_start = Instant::now();
+    // Preload all per-position input residuals up front so the bench
+    // loop measures only inference time, not first-touch disk I/O.
+    // Without this, the first post-warmup token always spikes to
+    // 300-400ms as the OS reads a fresh dump file.
+    eprintln!("preloading {} input residuals...", n_positions);
+    let mut inputs: Vec<Vec<f32>> = Vec::with_capacity(n_positions as usize);
     for pos in 0..n_positions {
         let inp_pos = pos.min(max_inp_pos);
-        let token_id = if (pos as usize) < PROMPT_TOKENS.len() {
-            PROMPT_TOKENS[pos as usize]
-        } else {
-            0
-        };
         let inp_entry = dump
             .tensor("layer_input_residual", 0, inp_pos)
             .ok_or_else(|| eyre!("missing layer_input_residual L0 T{inp_pos}"))?;
         let input_hc = dump.read_f32(inp_entry)?;
         assert_eq!(input_hc.len(), HC_DIM as usize);
+        inputs.push(input_hc);
+    }
+    eprintln!("preloaded.");
+
+    let mut token_us: Vec<u64> = Vec::with_capacity(n_positions as usize);
+    let bench_start = Instant::now();
+    for pos in 0..n_positions {
+        let token_id = if (pos as usize) < PROMPT_TOKENS.len() {
+            PROMPT_TOKENS[pos as usize]
+        } else {
+            0
+        };
+        let input_hc = &inputs[pos as usize];
 
         let t = Instant::now();
         engine.forward_token(
@@ -123,7 +135,7 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
             &mut igpu_scratch,
             &mut state,
             &weights,
-            &input_hc,
+            input_hc,
             pos as u32,
             token_id,
         )?;
@@ -160,6 +172,26 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
         "BENCH context: dGPU={} (gfx1201) + iGPU={} (gfx1151), V4-Flash {} layers, HetParallel mode",
         dgpu.id, igpu.id, v4flash_kernels::forward::N_LAYER
     );
+
+    // M15 debug: print any post-warmup token >2x the median so we can
+    // see whether outliers cluster (e.g. KV-cache reallocation) or are
+    // random (e.g. dGPU power state / page faults).
+    let outlier_thresh = median_us.saturating_mul(2);
+    eprintln!("BENCH outliers (>{:.2}ms):", outlier_thresh as f64 / 1000.0);
+    let mut n_outliers = 0;
+    for (i, &t) in token_us.iter().enumerate() {
+        if (i as i32) < warmup {
+            continue;
+        }
+        if t > outlier_thresh {
+            eprintln!("  T{} (idx-after-warmup {}): {:.2}ms", i, i - warmup as usize, t as f64 / 1000.0);
+            n_outliers += 1;
+            if n_outliers >= 20 {
+                eprintln!("  ...truncated at 20 outliers");
+                break;
+            }
+        }
+    }
 
     Ok(())
 }
