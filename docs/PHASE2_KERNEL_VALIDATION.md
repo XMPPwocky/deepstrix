@@ -47,7 +47,9 @@ Per-kernel ports validate against the **M2 activation dump** (the canonical ds4-
 - Weight tensors live under `L<LL>/weight/<tag>.bin` and are emitted once per layer (deduped — the ds4 patch fires the `weight:` hook only at `pos == 0`).
 - Per-token activations live under `L<LL>/T<TTTT>/<tag>.bin`.
 
-## Tag catalog (as of M2)
+## Tag catalog
+
+Per layer L=0..42 (regular layers, in `L<LL>/T<TTTT>/`):
 
 | Tag                       | Shape                | Dtype | When           |
 |---------------------------|----------------------|-------|----------------|
@@ -60,7 +62,22 @@ Per-kernel ports validate against the **M2 activation dump** (the canonical ds4-
 | `weight:attn_norm`        | `[n_embd]`           | f32   | per L (pos=0)  |
 | `weight:ffn_norm`         | `[n_embd]`           | f32   | per L (pos=0)  |
 
-Future milestones add hook sites for Q/KV/RoPE, attention, MoE, mHC, output projection — see `docs/DESIGN.md` and `ds4.c:7438` for the canonical operations.
+Synthetic L=43 (head bucket — added by 0003 patch, in `L43/T<TTTT>/` and `L43/weight/`):
+
+| Tag                       | Shape                | Dtype | When           |
+|---------------------------|----------------------|-------|----------------|
+| `output_flat`             | `[n_hc, n_embd]`     | f32   | per T          |
+| `output_pre`              | `[n_hc]`             | f32   | per T          |
+| `output_hc_weights`       | `[n_hc]`             | f32   | per T          |
+| `output_embd`             | `[n_embd]`           | f32   | per T          |
+| `output_norm`             | `[n_embd]`           | f32   | per T          |
+| `weight:output_norm`      | `[n_embd]`           | f32   | pos=0          |
+
+**Logit-row ↔ output_norm-token mapping** (for Q8_0 oracle):
+- `logits.f32` row k (0..50) was produced from `L43/T<6+k>/output_norm.bin`.
+- Prefill consumes positions T0..T6 (no logits written); decode positions T7..T56 each produce one logit row matching the eval after that position. Row 0 = "predict the next token after seeing the prompt" = output of the eval at T6.
+
+Future milestones add hook sites for Q/KV/RoPE (inside `layer_q_projection_with_lora_*`), attention (inside `layer_attention_*`), MoE (inside `layer_routed_moe_*` and `layer_shared_ffn_*`), mHC (`hc_*` helpers). See `docs/DESIGN.md` and `ds4.c:7438` for the canonical operations.
 
 ## Per-kernel test pattern
 
@@ -85,13 +102,15 @@ See `crates/v4flash-kernels/tests/rms_norm.rs` for the template.
 
 `max_abs_diff` between our HIP kernel output and the ds4-CPU reference. Float32 arithmetic, so a few ULPs (~1e-6) are expected; the budget per kernel depends on accumulation depth and order sensitivity.
 
-| Kernel                        | Threshold | Measured (gfx1151) | Notes                                       |
-|-------------------------------|----------:|-------------------:|---------------------------------------------|
-| `rms_norm_weighted`           |    1.0e-4 |             3.8e-6 | n=4096; double partials, f32 final scale    |
-| (future) `rope_tail`          |     TBD   |                TBD |                                             |
-| (future) `q8_0_matmul`        |     TBD   |                TBD | Looser — depends on tile-reduce order       |
-| (future) `iq2_xxs_matmul`     |     TBD   |                TBD |                                             |
-| (future) `attention_*`        |     TBD   |                TBD | Softmax tightens the budget vs raw matmul   |
+| Kernel                        | Threshold | Measured (gfx1151) | Extra gate            | Notes                                       |
+|-------------------------------|----------:|-------------------:|-----------------------|---------------------------------------------|
+| `rms_norm_weighted`           |    1.0e-4 |             3.8e-6 | —                     | n=4096; double partials, f32 final scale    |
+| `q8_0_matvec` (output head)   |    5.0e-3 |             3.8e-5 | argmax 51/51          | k=4096, n_rows=129280; ds4-faithful Q8_0    |
+| (future) `rope_tail`          |     TBD   |                TBD | —                     |                                             |
+| (future) `iq2_xxs_matmul`     |     TBD   |                TBD | —                     |                                             |
+| (future) `attention_*`        |     TBD   |                TBD | softmax-stable        | Softmax tightens the budget vs raw matmul   |
+
+For Q8_0 specifically, the *argmax-match* check on every logit row is the production correctness gate — FP threshold backs it up but the discrete check is what guarantees "we pick the same greedy token as ds4 in every position."
 
 Rationale per threshold should land in each kernel's test docstring.
 
