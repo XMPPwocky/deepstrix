@@ -34,7 +34,7 @@ const ROUTER_WEIGHT_EPS: f32 = 6.103515625e-5;
 use super::engine::{DeviceEngine, ExecMode, HeterogeneousEngine};
 use super::scratch::{DgpuScratch, IgpuScratch};
 use super::state::HetLayerState;
-use super::sync::peer_push_f32;
+use super::sync::{peer_push_f32, peer_push_i32};
 use super::weights::{DgpuLayerWeights, IgpuLayerWeights};
 use tracing::debug_span;
 
@@ -585,15 +585,31 @@ impl HeterogeneousEngine {
         _t_mhc_pre_ffn.end()?;
 
         // ============================================================
-        // dGPU → iGPU: peer push ffn_input_norm (16 KB)
+        // M16: router → dGPU. dGPU has 2.6× iGPU BW so the matvec is
+        // ~1.5 ms faster across the model, and running router on the
+        // dGPU side lifts it off the iGPU's critical path.
         //
-        // HetSingleStream: synchronize → push → synchronize.
-        // HetParallel: record event on compute, xfer stream waits and
-        //   queues push, records "pushed" event for iGPU to wait on.
+        // Order on dGPU (all on de.compute, FIFO):
+        //   1. router_logits = matvec(ffn_gate_inp, ffn_input_norm)
+        //   2. learned: router_topk → d_selected, d_ew
+        //      hash:    host sync, readback router_logits, hash select,
+        //               write back d_selected and d_ew.
+        //   3. record selected_ready event.
+        //
+        // dGPU.xfer pushes both ffn_input_norm (for MoE q8k_xq) and
+        // d_selected/d_ew (for iq2 + q2k) to iGPU in FIFO order:
+        //   xfer: wait ain_ready → push ffn_input_norm
+        //         wait selected_ready → push d_selected → push d_ew
+        //         record selected_pushed
+        //
+        // iGPU.compute waits selected_pushed (which transitively
+        // covers ain_pushed since both pushes are on the same xfer
+        // stream), then runs the MoE graph.
         // ============================================================
         let parallel = matches!(self.mode, ExecMode::HetParallel);
         let sev = &self.sync_events.layers[layer as usize];
 
+        // Mark ffn_input_norm ready, queue its peer push on xfer.
         if parallel {
             sev.ain_ready.record(&de.compute)?;
             let _t_wait = de
@@ -619,86 +635,108 @@ impl HeterogeneousEngine {
         drop(_s_peer_ain);
         _t_peer_ain.end()?;
 
-        // ============================================================
-        // iGPU: router → topk → selected (HOST READBACK REQUIRED)
-        // ============================================================
-        self.igpu.device.set_current()?;
-        let ie = &self.igpu;
-
-        if parallel {
-            let _t_wait = ie.events.stage("igpu.router.wait", &ie.compute)?;
-            ie.compute.wait_event(&sev.ain_pushed)?;
-            _t_wait.end()?;
-        }
-        let _t_router = ie.events.stage("igpu.router", &ie.compute)?;
-        let _s_router = debug_span!("router").entered();
+        // M16: router on dGPU.compute.
+        let _t_router = de.events.stage("dgpu.router", &de.compute)?;
+        let _s_router = debug_span!("router_dgpu").entered();
         {
-            let _t = ie.events.stage("k.router.f16_matvec", &ie.compute)?;
-            ie.f16.matvec(
-                &ie.compute,
-                &mut igpu_scratch.router_logits,
-                &ilw.ffn_gate_inp.buffer,
-                &igpu_scratch.ffn_input_norm_recv,
+            let _t = de.events.stage("k.router.f16_matvec", &de.compute)?;
+            de.f16.matvec(
+                &de.compute,
+                &mut dgpu_scratch.router_logits,
+                &dlw.ffn_gate_inp.buffer,
+                &dgpu_scratch.ffn_input_norm,
                 N_EXPERT,
                 N_EMBD,
             )?;
         }
-        if !ilw.is_hash_router {
-            let _t = ie.events.stage("k.router.topk", &ie.compute)?;
-            ie.router_topk.launch(
-                &ie.compute,
-                &mut igpu_scratch.d_selected,
-                &mut igpu_scratch.d_ew,
-                &igpu_scratch.router_logits,
-                ilw.router_bias_dev.as_ref(),
+        if !dlw.is_hash_router {
+            let _t = de.events.stage("k.router.topk", &de.compute)?;
+            de.router_topk.launch(
+                &de.compute,
+                &mut dgpu_scratch.d_selected,
+                &mut dgpu_scratch.d_ew,
+                &dgpu_scratch.router_logits,
+                dlw.router_bias_dev.as_ref(),
                 N_EXPERT,
                 N_EXPERT_USED as u32,
                 EXPERT_WEIGHT_SCALE,
                 ROUTER_WEIGHT_EPS,
             )?;
+        } else {
+            // Hash router: host sync the router matvec, read 6 chosen
+            // logits, write back d_selected and d_ew on dGPU.compute.
+            // The shared expert that runs after this will be FIFO-
+            // serialized behind the copy_from_host; the iGPU MoE
+            // wait depends on selected_pushed which depends on these
+            // writes via stream-FIFO.
+            de.compute.synchronize()?;
+            dgpu_scratch
+                .router_logits
+                .copy_to_host(&mut dgpu_scratch.router_logits_host)?;
+            let tid2eid = dlw
+                .tid2eid
+                .as_ref()
+                .ok_or_else(|| eyre!("L{layer}: hash router but no tid2eid"))?;
+            let (sel, w) =
+                hash_router_select(tid2eid, token_id, &dgpu_scratch.router_logits_host);
+            dgpu_scratch.d_selected.copy_from_host(&sel)?;
+            dgpu_scratch.d_ew.copy_from_host(&w)?;
         }
         drop(_s_router);
         _t_router.end()?;
 
-        // M13.4 KEY REORDER: queue dGPU shared-expert kernels NOW —
-        // BEFORE we host-block on iGPU compute for the topk readback.
-        // The kernels are enqueued on de.compute (which is asynchronous
-        // from the host's perspective), so dGPU starts executing the
-        // shared expert in parallel with the iGPU MoE pipeline. This
-        // is where the M13 overlap actually materializes.
+        // M16: push d_selected and d_ew to iGPU on dGPU.xfer (FIFO
+        // after ffn_input_norm push).
         if parallel {
-            self.dgpu.device.set_current()?;
+            sev.selected_ready.record(&de.compute)?;
+            let _t_wait = de
+                .events
+                .stage("dgpu.peer_push_selected.wait", &de.xfer)?;
+            de.xfer.wait_event(&sev.selected_ready)?;
+            _t_wait.end()?;
+        } else {
+            de.compute.synchronize()?;
+        }
+        let _t_peer_sel = de.events.stage("dgpu.peer_push_selected", &de.xfer)?;
+        let _s_peer_sel = debug_span!("peer_push_selected").entered();
+        peer_push_i32(
+            &dgpu_scratch.d_selected,
+            &mut igpu_scratch.d_selected,
+            &de.xfer,
+        )?;
+        peer_push_f32(
+            &dgpu_scratch.d_ew,
+            &mut igpu_scratch.d_ew,
+            &de.xfer,
+        )?;
+        if parallel {
+            sev.selected_pushed.record(&de.xfer)?;
+        } else {
+            de.xfer.synchronize()?;
+        }
+        drop(_s_peer_sel);
+        _t_peer_sel.end()?;
+
+        // dGPU shared expert can now run on de.compute (after router,
+        // before / in parallel with iGPU MoE). It uses the same
+        // ffn_input_norm input as the router.
+        if parallel {
             let _t_shared = de.events.stage("dgpu.shared_expert", &de.compute)?;
             let _s_shared = debug_span!("shared_expert").entered();
             self.issue_shared_expert_graph(de, dgpu_scratch, dlw, layer)?;
             drop(_s_shared);
             _t_shared.end()?;
-            self.igpu.device.set_current()?;
         }
 
-        // Now host-block on iGPU compute to get selected[].
-        let selected: [i32; N_EXPERT_USED] = if ilw.is_hash_router {
-            ie.compute.synchronize()?;
-            igpu_scratch
-                .router_logits
-                .copy_to_host(&mut igpu_scratch.router_logits_host)?;
-            let tid2eid = ilw
-                .tid2eid
-                .as_ref()
-                .ok_or_else(|| eyre!("L{layer}: hash router but no tid2eid"))?;
-            let (sel, w) =
-                hash_router_select(tid2eid, token_id, &igpu_scratch.router_logits_host);
-            igpu_scratch.d_ew.copy_from_host(&w)?;
-            sel
-        } else {
-            ie.compute.synchronize()?;
-            igpu_scratch
-                .d_selected
-                .copy_to_host(&mut igpu_scratch.host_selected)?;
-            let mut arr = [0i32; N_EXPERT_USED];
-            arr.copy_from_slice(&igpu_scratch.host_selected[..N_EXPERT_USED]);
-            arr
-        };
+        // Switch to iGPU for the MoE.
+        self.igpu.device.set_current()?;
+        let ie = &self.igpu;
+
+        if parallel {
+            let _t_wait = ie.events.stage("igpu.moe.wait", &ie.compute)?;
+            ie.compute.wait_event(&sev.selected_pushed)?;
+            _t_wait.end()?;
+        }
 
         let gbpe = ilw.routed.gate_bytes_per_expert;
         let ubpe = ilw.routed.up_bytes_per_expert;
@@ -720,11 +758,11 @@ impl HeterogeneousEngine {
         // is captured into a per-layer HIP graph on the first call and
         // replayed thereafter. All kernel params are device pointers +
         // layer-constant scalars, so the captured graph stays valid for
-        // every subsequent token. Hash-router host-copy of `selected`
-        // stays OUTSIDE the captured region.
-        if ilw.is_hash_router {
-            igpu_scratch.d_selected.copy_from_host(&selected)?;
-        }
+        // every subsequent token.
+        //
+        // M16: d_selected and d_ew are now peer-pushed from dGPU (router
+        // ran there) and arrive via the selected_pushed event already
+        // waited on above — no more host copy_from_host here.
         let mid_blocks_bytes = (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
         let _t_moe = ie.events.stage("igpu.routed_moe", &ie.compute)?;
         let _s_moe = debug_span!("routed_moe").entered();
@@ -795,9 +833,8 @@ impl HeterogeneousEngine {
                     .launch(&ie.compute)?;
             }
         }
-        // Keep `selected` referenced even if we no longer index by it in
-        // this block, so the host-side parity computation isn't elided.
-        let _ = &selected;
+        // (M16: `selected` no longer materialized on host — d_selected
+        // is fully device-side and peer-pushed from dGPU above.)
         drop(_s_moe);
         _t_moe.end()?;
 

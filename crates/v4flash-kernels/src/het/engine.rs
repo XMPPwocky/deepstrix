@@ -166,6 +166,12 @@ pub struct LayerSyncEvents {
     pub attn_in_pushed: Event,
     pub comp_row_ready: Event,
     pub comp_row_arrived: Event,
+    /// M16: router runs on dGPU; this fires (dGPU compute) once
+    /// selected/d_ew are written and ready for peer-push to iGPU.
+    pub selected_ready: Event,
+    /// M16: fires (dGPU xfer) once selected/d_ew have been pushed to
+    /// the iGPU's d_selected/d_ew. iGPU MoE waits on this.
+    pub selected_pushed: Event,
 }
 
 pub struct HetSyncEvents {
@@ -184,6 +190,8 @@ impl HetSyncEvents {
             let ain_pushed = Event::new_no_timing()?;
             let attn_in_ready = Event::new_no_timing()?;
             let attn_in_pushed = Event::new_no_timing()?;
+            let selected_ready = Event::new_no_timing()?;
+            let selected_pushed = Event::new_no_timing()?;
             igpu.set_current()?;
             let moe_done = Event::new_no_timing()?;
             let moe_arrived = Event::new_no_timing()?;
@@ -198,6 +206,8 @@ impl HetSyncEvents {
                 attn_in_pushed,
                 comp_row_ready,
                 comp_row_arrived,
+                selected_ready,
+                selected_pushed,
             });
         }
         Ok(Self { layers })

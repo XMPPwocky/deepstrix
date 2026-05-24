@@ -56,6 +56,17 @@ pub struct DgpuLayerWeights {
     // running compressor on dGPU eliminates a 16-byte peer push and
     // the iGPU.compressor.wait it gates.
     pub compressor: Option<CompressorWeights>,
+
+    // M16: router migrated to dGPU. The dGPU has 2.6× iGPU BW so the
+    // router matvec is ~1.5 ms faster; more importantly running it on
+    // dGPU lifts it off the iGPU's critical path (iGPU.router.wait was
+    // gating MoE start). After the router runs on dGPU, the resulting
+    // selected/d_ew are peer-pushed to iGPU and the MoE pipeline starts
+    // there immediately upon their arrival.
+    pub is_hash_router: bool,
+    pub ffn_gate_inp: DeviceWeight,
+    pub tid2eid: Option<Vec<i32>>,
+    pub router_bias_dev: Option<DeviceBuffer<f32>>,
 }
 
 pub struct IgpuLayerWeights {
@@ -63,8 +74,9 @@ pub struct IgpuLayerWeights {
     pub ratio: u32,
     pub is_hash_router: bool,
 
-    // Router
-    pub ffn_gate_inp: DeviceWeight,
+    // Router — M16: moved to dGPU. iGPU keeps these as None to avoid
+    // duplicate ~86 MB of router weights (was OOM'ing the system).
+    pub ffn_gate_inp: Option<DeviceWeight>,
     pub tid2eid: Option<Vec<i32>>,
     pub router_bias: Option<Vec<f32>>,
     /// Device-resident copy of `router_bias` for the M13.3 `router_topk`
@@ -244,6 +256,39 @@ impl DgpuLayerWeights {
             None
         };
 
+        // M16: router weights on dGPU.
+        let is_hash_router = layer < N_HASH_LAYERS;
+        let ffn_gate_inp =
+            load_to_device(gguf, &format!("blk.{layer}.ffn_gate_inp.weight"), device_id)?;
+        let tid2eid = if is_hash_router {
+            Some(load_i32_tensor(
+                gguf,
+                &format!("blk.{layer}.ffn_gate_tid2eid.weight"),
+            )?)
+        } else {
+            None
+        };
+        let router_bias_dev = if !is_hash_router {
+            let bias_name = format!("blk.{layer}.exp_probs_b.bias");
+            if let Some(t) = gguf.gguf().tensor(&bias_name) {
+                if t.dtype != GgufType::F32 {
+                    return Err(eyre!("{bias_name} dtype {:?} != F32", t.dtype));
+                }
+                let bytes = gguf.read_tensor(t)?;
+                let host: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let mut buf: DeviceBuffer<f32> = DeviceBuffer::new(device_id, host.len())?;
+                buf.copy_from_host(&host)?;
+                Some(buf)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(DgpuLayerWeights {
             layer_idx: layer,
             ratio,
@@ -266,6 +311,10 @@ impl DgpuLayerWeights {
             ffn_norm,
             shared,
             compressor,
+            is_hash_router,
+            ffn_gate_inp,
+            tid2eid,
+            router_bias_dev,
         })
     }
 }
@@ -282,35 +331,10 @@ impl IgpuLayerWeights {
         let ratio = COMPRESS_RATIOS[layer as usize];
         let is_hash_router = layer < N_HASH_LAYERS;
 
-        let ffn_gate_inp =
-            load_to_device(gguf, &format!("blk.{layer}.ffn_gate_inp.weight"), device_id)?;
-        let tid2eid = if is_hash_router {
-            Some(load_i32_tensor(
-                gguf,
-                &format!("blk.{layer}.ffn_gate_tid2eid.weight"),
-            )?)
-        } else {
-            None
-        };
-        let router_bias = if !is_hash_router {
-            let bias_name = format!("blk.{layer}.exp_probs_b.bias");
-            if let Some(t) = gguf.gguf().tensor(&bias_name) {
-                if t.dtype != GgufType::F32 {
-                    return Err(eyre!("{bias_name} dtype {:?} != F32", t.dtype));
-                }
-                let bytes = gguf.tensor_bytes(t).ok_or_else(|| eyre!("{bias_name} bytes"))?;
-                Some(
-                    bytes
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                        .collect::<Vec<f32>>(),
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // M16: router runs on dGPU; iGPU keeps None to free ~86 MB.
+        let ffn_gate_inp: Option<DeviceWeight> = None;
+        let tid2eid: Option<Vec<i32>> = None;
+        let router_bias: Option<Vec<f32>> = None;
 
         // Routed expert weights — fully iGPU-resident (~1.2 GiB/layer).
         let gate = load_to_device(
@@ -338,14 +362,8 @@ impl IgpuLayerWeights {
             down_bytes_per_expert,
         };
 
-        // Mirror router_bias onto device for the on-device router_topk.
-        let router_bias_dev = if let Some(b) = &router_bias {
-            let mut buf: DeviceBuffer<f32> = DeviceBuffer::new(device_id, b.len())?;
-            buf.copy_from_host(b)?;
-            Some(buf)
-        } else {
-            None
-        };
+        // M16: router_bias_dev now lives on dGPU. iGPU keeps None.
+        let router_bias_dev: Option<DeviceBuffer<f32>> = None;
 
         // M14L: attn compressor moved to dGPU. Field kept (None) so the
         // IgpuLayerWeights shape is unchanged for non-compressor consumers
