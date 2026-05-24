@@ -18,6 +18,16 @@ const COMPRESSOR_POOL_GFX1151: &[u8] = include_bytes!(env!("KERNEL_COMPRESSOR_PO
 const FP8_E4M3FN_GFX1201: &[u8] = include_bytes!(env!("KERNEL_FP8_E4M3FN_GFX1201"));
 const FP8_E4M3FN_GFX1151: &[u8] = include_bytes!(env!("KERNEL_FP8_E4M3FN_GFX1151"));
 
+const COMPRESSOR_STATE_WRITE_GFX1201: &[u8] =
+    include_bytes!(env!("KERNEL_COMPRESSOR_STATE_WRITE_GFX1201"));
+const COMPRESSOR_STATE_WRITE_GFX1151: &[u8] =
+    include_bytes!(env!("KERNEL_COMPRESSOR_STATE_WRITE_GFX1151"));
+
+const COMPRESSOR_STATE_SHUFFLE_GFX1201: &[u8] =
+    include_bytes!(env!("KERNEL_COMPRESSOR_STATE_SHUFFLE_GFX1201"));
+const COMPRESSOR_STATE_SHUFFLE_GFX1151: &[u8] =
+    include_bytes!(env!("KERNEL_COMPRESSOR_STATE_SHUFFLE_GFX1151"));
+
 /// Per-output-dim softmax-weighted average over the compressor state
 /// buffer. One workgroup, head_dim threads.
 pub struct CompressorPool {
@@ -152,6 +162,117 @@ impl Fp8E4m3fnQuantize {
         let cfg = LaunchConfig {
             grid: (n_nope / 64, 1, 1),
             block: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+}
+
+/// Combined APE-add + state-row-write. Mirrors ds4.c:6625-6630.
+pub struct CompressorStateWrite {
+    module: Module,
+}
+
+impl CompressorStateWrite {
+    pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            COMPRESSOR_STATE_WRITE_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            COMPRESSOR_STATE_WRITE_GFX1151
+        } else {
+            return Err(eyre!("unsupported arch for compressor_state_write: {arch}"));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    /// `state_kv[row, :] = kv_cur; state_score[row, :] = sc_cur + f32(ape[pos_mod, :])`.
+    /// `ape` is an F16 buffer passed as raw u8 bytes; layout matches GGUF
+    /// `[comp_width, ratio]` (`comp_width` innermost).
+    pub fn launch(
+        &self,
+        stream: &Stream,
+        state_kv: &mut DeviceBuffer<f32>,
+        state_score: &mut DeviceBuffer<f32>,
+        kv_cur: &DeviceBuffer<f32>,
+        sc_cur: &DeviceBuffer<f32>,
+        ape: &DeviceBuffer<u8>,
+        width: u32,
+        row: u32,
+        pos_mod: u32,
+    ) -> eyre::Result<()> {
+        let function = self.module.get_function("compressor_state_write")?;
+
+        let mut state_kv_ptr = state_kv.raw();
+        let mut state_sc_ptr = state_score.raw();
+        let mut kv_ptr = kv_cur.raw();
+        let mut sc_ptr = sc_cur.raw();
+        let mut ape_ptr = ape.raw();
+        let mut width_v = width;
+        let mut row_v = row;
+        let mut pos_mod_v = pos_mod;
+        let mut args: [*mut c_void; 8] = [
+            &mut state_kv_ptr as *mut _ as *mut c_void,
+            &mut state_sc_ptr as *mut _ as *mut c_void,
+            &mut kv_ptr as *mut _ as *mut c_void,
+            &mut sc_ptr as *mut _ as *mut c_void,
+            &mut ape_ptr as *mut _ as *mut c_void,
+            &mut width_v as *mut _ as *mut c_void,
+            &mut row_v as *mut _ as *mut c_void,
+            &mut pos_mod_v as *mut _ as *mut c_void,
+        ];
+
+        let block_x = 256u32;
+        let grid_x = width.div_ceil(block_x);
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+}
+
+/// State shuffle for ratio==4: copies rows 4..7 → rows 0..3 in place.
+/// Mirrors the first half of the shuffle at ds4.c:6652-6669.
+pub struct CompressorStateShuffleR4 {
+    module: Module,
+}
+
+impl CompressorStateShuffleR4 {
+    pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            COMPRESSOR_STATE_SHUFFLE_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            COMPRESSOR_STATE_SHUFFLE_GFX1151
+        } else {
+            return Err(eyre!("unsupported arch for compressor_state_shuffle: {arch}"));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    pub fn launch(
+        &self,
+        stream: &Stream,
+        state_kv: &mut DeviceBuffer<f32>,
+        state_score: &mut DeviceBuffer<f32>,
+        width: u32,
+    ) -> eyre::Result<()> {
+        let function = self.module.get_function("compressor_state_shuffle_r4")?;
+        let mut kv_ptr = state_kv.raw();
+        let mut sc_ptr = state_score.raw();
+        let mut width_v = width;
+        let mut args: [*mut c_void; 3] = [
+            &mut kv_ptr as *mut _ as *mut c_void,
+            &mut sc_ptr as *mut _ as *mut c_void,
+            &mut width_v as *mut _ as *mut c_void,
+        ];
+        let block_x = 256u32;
+        let grid_y = width.div_ceil(block_x);
+        let cfg = LaunchConfig {
+            grid: (4, grid_y, 1),
+            block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe { function.launch_raw(cfg, stream, &mut args) }
