@@ -587,6 +587,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
+ "v4flash-core",
  "v4flash-hip",
 ]
 

@@ -13,6 +13,8 @@
 
 pub mod oracle;
 pub mod rms_norm;
+pub mod weights;
 
 pub use oracle::{ActivationDump, Dtype, TensorEntry};
 pub use rms_norm::RmsNorm;
+pub use weights::{load_to_device, DeviceWeight};
