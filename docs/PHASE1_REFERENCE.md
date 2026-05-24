@@ -20,7 +20,7 @@ This is the immutable baseline. Every Phase 1 milestone (M2+) validates ported k
   - iGPU: AMD Radeon 8060S Graphics (Strix Halo, gfx1151) — HIP device 1
   - dGPU: AMD Radeon RX 9070 XT (gfx1201) — HIP device 0 (NOT used for inference; 16 GiB VRAM is too small for 86 GiB model)
 - ds4 submodule: `external/ds4` @ branch `rocm` (initial: 7a751eb)
-- ds4 patches applied: `external/ds4-patches/{0001-expose-logits-buffer, 0002-activation-dump-callback, 0003-output-head-hooks, 0004-q-kv-rope-hooks, 0005-attention-hooks, 0006-comp-mask-hooks, 0007-compressor-indexer-hooks}.patch`
+- ds4 patches applied: `external/ds4-patches/{0001-expose-logits-buffer, 0002-activation-dump-callback, 0003-output-head-hooks, 0004-q-kv-rope-hooks, 0005-attention-hooks, 0006-comp-mask-hooks, 0007-compressor-indexer-hooks, 0008-moe-router-hooks}.patch`
 
 ## Model
 
