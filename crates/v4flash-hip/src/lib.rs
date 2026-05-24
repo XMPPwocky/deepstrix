@@ -18,6 +18,7 @@ mod buffer;
 mod device;
 mod error;
 mod event;
+mod graph;
 mod module;
 mod stream;
 
@@ -25,6 +26,7 @@ pub use buffer::{DeviceBuffer, PinnedBuffer};
 pub use device::{Device, DeviceProperties};
 pub use error::{HipError, check, check_eyre};
 pub use event::Event;
+pub use graph::{kernel_node_params, Graph, GraphExec};
 pub use module::{Function, LaunchConfig, Module};
 pub use stream::Stream;
 

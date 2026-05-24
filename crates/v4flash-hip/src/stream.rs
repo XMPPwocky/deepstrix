@@ -4,6 +4,7 @@ use color_eyre::eyre;
 
 use crate::error::check_eyre;
 use crate::event::Event;
+use crate::graph::Graph;
 use crate::sys;
 
 /// A HIP stream. Created on the current device (caller must `Device::set_current`
@@ -52,6 +53,32 @@ impl Stream {
             unsafe { sys::hipStreamWaitEvent(self.raw, event.raw(), 0) },
             "hipStreamWaitEvent",
         )
+    }
+
+    /// Begin recording all subsequent async operations on this stream
+    /// into a HIP graph. Call [`Stream::end_capture`] to finalize.
+    ///
+    /// `mode` should normally be
+    /// [`sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL`] — `Global` is the
+    /// HIP default but enforces synchronization with other threads,
+    /// which the orchestrator doesn't need.
+    pub fn begin_capture(&self, mode: u32) -> eyre::Result<()> {
+        check_eyre(
+            unsafe { sys::hipStreamBeginCapture(self.raw, mode) },
+            "hipStreamBeginCapture",
+        )
+    }
+
+    /// End an active capture begun with [`begin_capture`] and return
+    /// the recorded [`Graph`].
+    pub fn end_capture(&self) -> eyre::Result<Graph> {
+        let mut raw: sys::hipGraph_t = ptr::null_mut();
+        check_eyre(
+            unsafe { sys::hipStreamEndCapture(self.raw, &mut raw) },
+            "hipStreamEndCapture",
+        )?;
+        // SAFETY: we own the returned graph; wrap in our RAII type.
+        Ok(crate::graph::Graph::from_raw(raw))
     }
 }
 

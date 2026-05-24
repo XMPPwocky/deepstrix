@@ -17,6 +17,9 @@ pub type hipStream_t = *mut c_void;
 pub type hipEvent_t = *mut c_void;
 pub type hipModule_t = *mut c_void;
 pub type hipFunction_t = *mut c_void;
+pub type hipGraph_t = *mut c_void;
+pub type hipGraphExec_t = *mut c_void;
+pub type hipGraphNode_t = *mut c_void;
 
 pub const HIP_SUCCESS: hipError_t = 0;
 
@@ -29,6 +32,32 @@ pub const HIP_EVENT_DEFAULT: c_uint = 0;
 pub const HIP_EVENT_BLOCKING_SYNC: c_uint = 1;
 pub const HIP_EVENT_DISABLE_TIMING: c_uint = 2;
 pub const HIP_EVENT_INTERPROCESS: c_uint = 4;
+
+// Stream capture modes
+pub const HIP_STREAM_CAPTURE_MODE_GLOBAL: c_uint = 0;
+pub const HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL: c_uint = 1;
+pub const HIP_STREAM_CAPTURE_MODE_RELAXED: c_uint = 2;
+
+// hipKernelNodeParams — mirrors HIP's struct used by both
+// hipGraphAddKernelNode and hipGraphExecKernelNodeSetParams.
+#[repr(C)]
+#[derive(Clone)]
+pub struct hipKernelNodeParams {
+    pub blockDim: hipDim3,
+    pub extra: *mut *mut c_void,
+    pub func: *mut c_void,
+    pub gridDim: hipDim3,
+    pub kernelParams: *mut *mut c_void,
+    pub sharedMemBytes: c_uint,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct hipDim3 {
+    pub x: c_uint,
+    pub y: c_uint,
+    pub z: c_uint,
+}
 
 // Peer-access flags (unused at present — 0)
 pub const HIP_PEER_ACCESS_DEFAULT: c_uint = 0;
@@ -273,5 +302,50 @@ unsafe extern "C" {
         stream: hipStream_t,
         kernelParams: *mut *mut c_void,
         extra: *mut *mut c_void,
+    ) -> hipError_t;
+
+    // ---- HIP graphs (M14) ----
+
+    pub fn hipStreamBeginCapture(
+        stream: hipStream_t,
+        mode: c_uint,
+    ) -> hipError_t;
+    pub fn hipStreamEndCapture(
+        stream: hipStream_t,
+        graph: *mut hipGraph_t,
+    ) -> hipError_t;
+    pub fn hipStreamIsCapturing(
+        stream: hipStream_t,
+        status: *mut c_int,
+    ) -> hipError_t;
+
+    pub fn hipGraphCreate(graph: *mut hipGraph_t, flags: c_uint) -> hipError_t;
+    pub fn hipGraphDestroy(graph: hipGraph_t) -> hipError_t;
+    pub fn hipGraphInstantiate(
+        graphExec: *mut hipGraphExec_t,
+        graph: hipGraph_t,
+        errorNode: *mut hipGraphNode_t,
+        log: *mut c_char,
+        bufferSize: usize,
+    ) -> hipError_t;
+    pub fn hipGraphExecDestroy(graphExec: hipGraphExec_t) -> hipError_t;
+    pub fn hipGraphLaunch(graphExec: hipGraphExec_t, stream: hipStream_t)
+        -> hipError_t;
+
+    pub fn hipGraphGetNodes(
+        graph: hipGraph_t,
+        nodes: *mut hipGraphNode_t,
+        numNodes: *mut usize,
+    ) -> hipError_t;
+
+    pub fn hipGraphExecKernelNodeSetParams(
+        graphExec: hipGraphExec_t,
+        node: hipGraphNode_t,
+        nodeParams: *const hipKernelNodeParams,
+    ) -> hipError_t;
+
+    pub fn hipGraphKernelNodeGetParams(
+        node: hipGraphNode_t,
+        nodeParams: *mut hipKernelNodeParams,
     ) -> hipError_t;
 }
