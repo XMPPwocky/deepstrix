@@ -20,7 +20,7 @@ This is the immutable baseline. Every Phase 1 milestone (M2+) validates ported k
   - iGPU: AMD Radeon 8060S Graphics (Strix Halo, gfx1151) — HIP device 1
   - dGPU: AMD Radeon RX 9070 XT (gfx1201) — HIP device 0 (NOT used for inference; 16 GiB VRAM is too small for 86 GiB model)
 - ds4 submodule: `external/ds4` @ branch `rocm` (initial: 7a751eb)
-- ds4 patches applied: `external/ds4-patches/0001-expose-logits-buffer.patch`
+- ds4 patches applied: `external/ds4-patches/{0001-expose-logits-buffer, 0002-activation-dump-callback, 0003-output-head-hooks, 0004-q-kv-rope-hooks}.patch`
 
 ## Model
 
@@ -68,15 +68,25 @@ Captured by `external/ds4-dump/ds4-dump-activations` using the 0002 patch (`ds4_
   - Both are bit-deterministic across reruns of their respective paths.
 - The M2 dump becomes the canonical reference for kernel ports because every intermediate tensor is captured along *one consistent* trajectory.
 - Storage: `reference/v4flash-cpu-activations/` (gitignored, persistent btrfs)
-  - `manifest.json` SHA256: `a2e8b85b8eb0c722c170f996080c7af714e82dda9eac52d71d3f75b381ea4a02`
-  - logits.f32 SHA256: `bd3176ea0644067caf7a455db332874e62c23838963f561cac2d2b4b59a2ea0a` (unchanged from M2 — ds4 patch is byte-clean when callback is null)
-  - aggregate SHA over `sort -u` of all `*.bin` files (one number summarizing the whole tree): `d033b20460bc464387c964d7f2ffebea627d793759fabceaefeb8e90e6b2d3e1`
-  - 15,078 tensors (M2 baseline 14,792 + 5 head tags × 57 token positions in L43 + 1 head weight = +286)
-  - ~510 MB on disk
+  - **M4 (current) dump:**
+    - `manifest.json` SHA256: `df0e4f3660a4f26326a8fe7d975e71946c5652d47fff0b83a6875ff78768894c`
+    - logits.f32 SHA256: `bd3176ea0644067caf7a455db332874e62c23838963f561cac2d2b4b59a2ea0a` (unchanged from M2/M3 — ds4 patch is byte-clean when callback is null)
+    - aggregate SHA over `sort -u` of all `*.bin` files (one number summarizing the whole tree): `95cd30f2780ccd3913948fb33312903c14aaa7bd89b3821e822f0abf9b83c11c`
+    - 34,815 tensors (M3 superset: + 8 act tags × 43 layers × 51 tokens + 3 weight tags × 43 layers)
+  - Previous (M3) SHAs preserved for archaeology: manifest `a2e8b85b...`, aggregate `d033b20460bc...` — both bit-identical for the M2/M3 tag subset (verified by spot-check SHAs on `L17/T0005/attn_input_norm.bin` and `L43/T0006/output_norm.bin`).
 - Tag set per layer L=0..42 (regular layers), per token position:
   - `layer_input_residual` (n_hc × n_embd = 4 × 4096 f32)
   - `attn_cur` (n_embd f32)
   - `attn_input_norm` (n_embd f32) — output of layer→attn RMSNorm
+  - **M4 attention setup (added by 0004 patch):**
+    - `q_a_out` (n_lora_q = 1024 f32) — post `matvec_q8_0(q_a)`
+    - `q_a_normed` (n_lora_q = 1024 f32) — post `rms_norm_weight` with `q_a_norm`; the Q LoRA reduction
+    - `q_b_out` (n_head × n_head_dim = 64 × 512 = 32768 f32) — post `matvec_q8_0(q_b)`
+    - `q_head_normed` (32768 f32) — post `head_rms_norm_inplace` (no-weight RMSNorm per head); RoPE input
+    - `kv_raw_out` (n_head_dim = 512 f32) — post `matvec_q8_0(kv)`
+    - `kv_normed` (n_head_dim = 512 f32) — post `rms_norm_weight` with `kv_a_norm`; RoPE input
+    - `q_post_rope` (32768 f32) — post `rope_tail_layer_inplace`; attention kernel input
+    - `kv_post_rope` (n_head_dim = 512 f32) — post `rope_tail_layer_inplace`; pre fp8 KV-cache quant
   - `ffn_cur` (n_embd f32)
   - `ffn_input_norm` (n_embd f32) — output of layer→ffn RMSNorm
   - `layer_output_residual` (n_hc × n_embd f32)
@@ -88,6 +98,10 @@ Captured by `external/ds4-dump/ds4-dump-activations` using the 0002 patch (`ds4_
   - `output_norm` (n_embd f32) — post `rms_norm_weight`; **M3 Q8_0 matvec oracle input**
 - Per-layer weights (in `L<LL>/weight/`, deduped):
   - `attn_norm.bin`, `ffn_norm.bin` — per-layer RMSNorm scales (L=0..42)
+  - **M4 (added by 0004 patch):**
+    - `q_a_norm.bin` (1024 f32) — Q LoRA factor norm
+    - `kv_a_norm.bin` (n_head_dim = 512 f32) — KV factor norm
+    - `rope_params.bin` (6 f32) — `[freq_base, freq_scale, ext_factor, attn_factor, beta_fast=32, beta_slow=1]`; YaRN parameters per layer, computed via `ds4_layer_compress_ratio(il)` etc. inside the patch so the Rust RoPE port is independent of ds4 compile-time constants
   - `output_norm.bin` — head RMSNorm scale (L=43 only)
 
 **Logit-row ↔ output_norm token mapping** (used by M3 Q8_0 oracle):

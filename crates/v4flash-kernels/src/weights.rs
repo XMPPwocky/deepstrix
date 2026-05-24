@@ -6,7 +6,7 @@
 //! deliberately the simplest thing that works.
 //!
 //! Usage:
-//! ```ignore
+//! ```text
 //! let gguf = MappedGguf::open(model_path)?;
 //! let w = weights::load_to_device(&gguf, "output.weight", device_id)?;
 //! // w.buffer is a DeviceBuffer<u8> with the raw Q8_0/Q2_K/IQ2_XXS/etc bytes
