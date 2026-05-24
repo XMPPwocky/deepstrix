@@ -331,11 +331,23 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_batch(
     // M14k: cache iq2 tables (128 B ksigns + 2 KiB grid) in LDS so the
     // inner dequant loop's hundreds of lookups per row avoid the
     // constant-cache penalty for divergent indices.
+    // M14k.3: also cache the Q8K activation (n_blocks × 292 B), which is
+    // identical across all N_EXPERT_USED workgroup-Y slices. With grid.y
+    // spawning 6 workgroups that each independently re-read xq from
+    // global memory, LDS-staging once per workgroup keeps the inner
+    // dot_q2_16 loads in scratchpad.
     __shared__ uint8_t  s_ksigns[128];
     __shared__ uint64_t s_grid[256];
+    __shared__ uint8_t  s_xq[16 * 292];  // BLOCK_Q8_K_BYTES * max n_blocks (16 for V4-Flash)
     const unsigned int tid = threadIdx.x;
     if (tid < 128) s_ksigns[tid] = ksigns_iq2xs[tid];
     if (tid < 256) s_grid[tid]   = iq2xxs_grid[tid];
+    // Cooperatively load xq into LDS. n_blocks * 292 bytes; 256 threads
+    // each grab ~18 bytes. Bound by sizeof(s_xq) at compile time.
+    const unsigned int xq_bytes = n_blocks * 292u;
+    for (unsigned int i = tid; i < xq_bytes; i += blockDim.x) {
+        s_xq[i] = xq[i];
+    }
     __syncthreads();
 
     const unsigned int slot = blockIdx.y;
@@ -362,7 +374,7 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_batch(
     for (unsigned int b = block_lane; b < n_blocks; b += 16u) {
         const uint8_t* w_g = gate_row_base + (uint64_t)b * BLOCK_IQ2_XXS_BYTES;
         const uint8_t* w_u = up_row_base   + (uint64_t)b * BLOCK_IQ2_XXS_BYTES;
-        const uint8_t* y   = xq            + (uint64_t)b * BLOCK_Q8_K_BYTES;
+        const uint8_t* y   = s_xq          + (size_t)b   * BLOCK_Q8_K_BYTES;
         g_sum += dot_block_half_lds(w_g, y, ib32_lo, s_ksigns, s_grid);
         u_sum += dot_block_half_lds(w_u, y, ib32_lo, s_ksigns, s_grid);
     }
