@@ -57,6 +57,43 @@ This is the immutable baseline. Every Phase 1 milestone (M2+) validates ported k
 
 - **Out of scope for M1.** ds4's GPU path is structurally incompatible with V4 Flash on this hardware (see `docs/PHASE1_DS4_ISSUES.md`). Phase 2+ replaces ds4's GPU path with our own kernels and allocator anyway, so a working ds4 GPU baseline was never load-bearing. CPU reference above is authoritative.
 
+### Activation dump reference (M2 oracle for kernel ports)
+
+Captured by `external/ds4-dump/ds4-dump-activations` using the 0002 patch (`ds4_set_activation_dump` callback). This is the oracle every Phase 2 kernel port validates against.
+
+- Backend: `DS4_BACKEND_CPU` — same as the M1 reference above
+- **But a different evaluation path**: this dumper feeds prompt tokens one at a time via `ds4_session_eval`, not via `ds4_session_sync`'s batched prefill. Both paths are valid ds4 outputs and both are deterministic, but they accumulate floating-point reductions in slightly different orders, which is enough to flip the greedy argmax at one low-confidence transition (position 5 of the generated sequence). Downstream tokens then diverge.
+  - M1 reference (batched prefill): `[..., 8281, 9924, 5363, 14, 778, ...]`
+  - M2 activation dump (per-token):  `[..., 8281, 10192, 39, 940, 15890, ...]`
+  - Both are bit-deterministic across reruns of their respective paths.
+- The M2 dump becomes the canonical reference for kernel ports because every intermediate tensor is captured along *one consistent* trajectory.
+- Storage: `reference/v4flash-cpu-activations/` (gitignored, persistent btrfs)
+  - `manifest.json` SHA256: `d6604b9f94535504e2e251089b4bf8b45cdfc34b6a899985233a183d9208cd01`
+  - logits.f32 SHA256: `bd3176ea0644067caf7a455db332874e62c23838963f561cac2d2b4b59a2ea0a`
+  - aggregate SHA over `sort -u` of all `*.bin` files (one number summarizing the whole tree): `691c04013ef3a38a4f92d53a1df1f0eb13e72e06fc2f6e264f47ca3eee06a606`
+  - 14,792 tensors (51 token positions × 43 layers × 6 activation tags + 43 layers × 2 weight tags)
+  - 489 MB on disk
+- Tag set (per token position per layer):
+  - `layer_input_residual` (n_hc × n_embd = 4 × 4096 f32)
+  - `attn_cur` (n_embd f32)
+  - `attn_input_norm` (n_embd f32) — output of layer→attn RMSNorm
+  - `ffn_cur` (n_embd f32)
+  - `ffn_input_norm` (n_embd f32) — output of layer→ffn RMSNorm
+  - `layer_output_residual` (n_hc × n_embd f32)
+- Per-layer weights (in `L<LL>/weight/`, deduped):
+  - `attn_norm.bin` — per-layer attention RMSNorm scale (n_embd f32)
+  - `ffn_norm.bin` — per-layer FFN RMSNorm scale (n_embd f32)
+- Determinism: rerunning produces bit-identical manifest + every `.bin` file (verified by spot-check SHA on `L17/T0005/attn_input_norm.bin`).
+- Reproduction:
+  ```bash
+  nix develop -c ./external/ds4-dump/ds4-dump-activations \
+      /persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+      "DeepSeek-V4 Flash is" \
+      reference/v4flash-cpu-activations \
+      50
+  ```
+  Wall time: ~26 s with warm page cache, ~3 min cold.
+
 ## Tokenizer cross-check
 
 `external/ds4-dump/ds4-dump-tokenize` (vocab-only) on `"DeepSeek-V4 Flash is"` returns the identical 7 token IDs as `ds4_tokenize_text` in the engine path:
