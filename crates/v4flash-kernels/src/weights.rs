@@ -31,12 +31,17 @@ pub struct DeviceWeight {
 }
 
 /// Allocate a fresh `DeviceBuffer<u8>` on `device_id` sized to the named
-/// tensor's `byte_size`, and copy the GGUF mmap bytes into it.
+/// tensor's `byte_size`, **pread**-read the bytes from the GGUF file into
+/// a transient host buffer, copy to device, drop the host buffer.
 ///
-/// Errors:
-/// - tensor not found in the GGUF
-/// - tensor's `byte_size == 0` (placeholder / corrupted entry)
-/// - HIP malloc / memcpy failure
+/// Why pread instead of mmap: bulk weight loading via mmap pages the
+/// whole tensor into the OS page cache, which on UMA double-allocates
+/// against the iGPU pool — V4-Flash's 80 GiB worth of routed experts
+/// would cause 100+ GiB of physical RAM pressure and swap thrash.
+/// pread keeps only the active tensor's bytes resident, the cache
+/// effects are bounded by the largest single tensor (~500 MB).
+///
+/// Errors: tensor not found, zero byte_size, alloc/copy failure.
 pub fn load_to_device(
     gguf: &MappedGguf,
     name: &str,
@@ -46,20 +51,24 @@ pub fn load_to_device(
         .gguf()
         .tensor(name)
         .ok_or_else(|| eyre!("tensor `{name}` not found in GGUF"))?;
-    let bytes = gguf
-        .tensor_bytes(tensor)
-        .ok_or_else(|| eyre!("tensor `{name}` has zero byte_size or invalid offset"))?;
+    if tensor.byte_size == 0 {
+        return Err(eyre!("tensor `{name}` has zero byte_size"));
+    }
+    let mut host: Vec<u8> = Vec::with_capacity(tensor.byte_size as usize);
+    gguf.read_tensor_into(tensor, &mut host)
+        .wrap_err_with(|| format!("pread `{name}`"))?;
 
     let mut buffer: DeviceBuffer<u8> =
-        DeviceBuffer::new(device_id, bytes.len()).wrap_err_with(|| {
+        DeviceBuffer::new(device_id, host.len()).wrap_err_with(|| {
             format!(
                 "alloc DeviceBuffer<u8> ({} bytes) for `{name}`",
-                bytes.len()
+                host.len()
             )
         })?;
     buffer
-        .copy_from_host(bytes)
+        .copy_from_host(&host)
         .wrap_err_with(|| format!("hipMemcpy `{name}` host→device"))?;
+    drop(host);
 
     let n_elements: u64 = tensor.dims.iter().product();
     Ok(DeviceWeight {

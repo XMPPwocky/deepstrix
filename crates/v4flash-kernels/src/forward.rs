@@ -150,12 +150,17 @@ pub struct SharedExpertWeights {
     pub down: DeviceWeight,
 }
 
-/// Per-layer routed-expert offsets into the GGUF mmap. The bytes are
-/// sliced per-token during forward_token (see `expert_slice_*` helpers).
-pub struct RoutedExpertOffsets {
-    pub gate_offset: usize,
-    pub up_offset: usize,
-    pub down_offset: usize,
+/// Per-layer routed-expert weights, iGPU-resident. ~1.2 GiB/layer × 43
+/// layers = ~52 GiB total — fits the 88 GiB budget enabled by
+/// `amdgpu.no_system_mem_limit=1`. The per-expert byte slice is
+/// addressed via pointer-offset on the kernel launch (see
+/// `Iq2XxsPairMatvec::launch_with_offsets` and
+/// `Q2KAccumulateMatvec::launch_with_offset`); no per-token host→device
+/// upload (that was too slow — see feedback memory).
+pub struct RoutedExpertWeights {
+    pub gate: DeviceWeight,
+    pub up: DeviceWeight,
+    pub down: DeviceWeight,
     pub gate_bytes_per_expert: usize,
     pub up_bytes_per_expert: usize,
     pub down_bytes_per_expert: usize,
@@ -197,7 +202,7 @@ pub struct LayerWeights {
     pub tid2eid: Option<Vec<i32>>,
     pub router_bias: Option<Vec<f32>>,
     pub shared: SharedExpertWeights,
-    pub routed: RoutedExpertOffsets,
+    pub routed: RoutedExpertWeights,
 }
 
 /// Globally-resident weights (output head + embedding). ~1.6 GB on GPU.
@@ -916,28 +921,31 @@ impl LayerWeights {
                 )?,
             };
 
-            // Routed expert offsets — bytes stay host-mmap'd.
-            let gate_t = gguf
-                .gguf()
-                .tensor(&format!("blk.{layer}.ffn_gate_exps.weight"))
-                .ok_or_else(|| eyre!("missing ffn_gate_exps L{layer}"))?;
-            let up_t = gguf
-                .gguf()
-                .tensor(&format!("blk.{layer}.ffn_up_exps.weight"))
-                .ok_or_else(|| eyre!("missing ffn_up_exps L{layer}"))?;
-            let down_t = gguf
-                .gguf()
-                .tensor(&format!("blk.{layer}.ffn_down_exps.weight"))
-                .ok_or_else(|| eyre!("missing ffn_down_exps L{layer}"))?;
+            // Routed expert weights — fully iGPU-resident (~1.2 GiB/layer).
+            let gate = load_to_device(
+                gguf,
+                &format!("blk.{layer}.ffn_gate_exps.weight"),
+                device_id,
+            )?;
+            let up = load_to_device(
+                gguf,
+                &format!("blk.{layer}.ffn_up_exps.weight"),
+                device_id,
+            )?;
+            let down = load_to_device(
+                gguf,
+                &format!("blk.{layer}.ffn_down_exps.weight"),
+                device_id,
+            )?;
             let gate_bytes_per_expert =
                 (N_FF_EXP as usize) * (BLOCKS_Q8K_GATE_IN as usize) * BLOCK_IQ2_XXS_BYTES;
             let up_bytes_per_expert = gate_bytes_per_expert;
             let down_bytes_per_expert =
                 (N_EMBD as usize) * (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q2_K_BYTES;
-            let routed = RoutedExpertOffsets {
-                gate_offset: gate_t.abs_offset as usize,
-                up_offset: up_t.abs_offset as usize,
-                down_offset: down_t.abs_offset as usize,
+            let routed = RoutedExpertWeights {
+                gate,
+                up,
+                down,
                 gate_bytes_per_expert,
                 up_bytes_per_expert,
                 down_bytes_per_expert,
@@ -1530,49 +1538,26 @@ impl Engine {
             (selected, weights_host)
         };
 
-        // === (12) Upload selected experts' bytes from gguf mmap ===
-        let gate_t = gguf
-            .gguf()
-            .tensor(&format!("blk.{}.ffn_gate_exps.weight", lw.layer_idx))
-            .ok_or_else(|| eyre!("missing ffn_gate_exps L{layer}"))?;
-        let up_t = gguf
-            .gguf()
-            .tensor(&format!("blk.{}.ffn_up_exps.weight", lw.layer_idx))
-            .ok_or_else(|| eyre!("missing ffn_up_exps L{layer}"))?;
-        let down_t = gguf
-            .gguf()
-            .tensor(&format!("blk.{}.ffn_down_exps.weight", lw.layer_idx))
-            .ok_or_else(|| eyre!("missing ffn_down_exps L{layer}"))?;
-        let gate_all = gguf
-            .tensor_bytes(gate_t)
-            .ok_or_else(|| eyre!("gate bytes"))?;
-        let up_all = gguf.tensor_bytes(up_t).ok_or_else(|| eyre!("up bytes"))?;
-        let down_all = gguf
-            .tensor_bytes(down_t)
-            .ok_or_else(|| eyre!("down bytes"))?;
+        // === (12) Routed-expert offsets — weights are iGPU-resident ===
         let gbpe = lw.routed.gate_bytes_per_expert;
         let ubpe = lw.routed.up_bytes_per_expert;
         let dbpe = lw.routed.down_bytes_per_expert;
-        for slot in 0..N_EXPERT_USED {
-            let e = selected[slot] as usize;
-            scratch.d_gate_slot[slot]
-                .copy_from_host(&gate_all[e * gbpe..(e + 1) * gbpe])?;
-            scratch.d_up_slot[slot].copy_from_host(&up_all[e * ubpe..(e + 1) * ubpe])?;
-            scratch.d_down_slot[slot]
-                .copy_from_host(&down_all[e * dbpe..(e + 1) * dbpe])?;
-        }
         scratch.d_ew.copy_from_host(&weights_host)?;
 
         // === (13) Routed MoE pipeline ===
         self.q8k
             .launch(&self.stream, &mut scratch.d_xq_q8k, &scratch.ffn_input_norm, BLOCKS_Q8K_GATE_IN)?;
+        let _ = gguf; // no longer needed for expert byte access
         for slot in 0..N_EXPERT_USED {
-            self.iq2.launch(
+            let e = selected[slot] as usize;
+            self.iq2.launch_with_offsets(
                 &self.stream,
                 &mut scratch.d_gate_e,
                 &mut scratch.d_up_e,
-                &scratch.d_gate_slot[slot],
-                &scratch.d_up_slot[slot],
+                &lw.routed.gate.buffer,
+                e * gbpe,
+                &lw.routed.up.buffer,
+                e * ubpe,
                 &scratch.d_xq_q8k,
                 N_FF_EXP,
                 BLOCKS_Q8K_GATE_IN,
@@ -1612,10 +1597,12 @@ impl Engine {
                 &scratch.d_mid_e,
                 BLOCKS_Q8K_DOWN_IN,
             )?;
-            self.q2k.launch(
+            let e = selected[slot] as usize;
+            self.q2k.launch_with_offset(
                 &self.stream,
                 &mut scratch.ffn_moe,
-                &scratch.d_down_slot[slot],
+                &lw.routed.down.buffer,
+                e * dbpe,
                 &scratch.d_midq_q8k,
                 N_EMBD,
                 BLOCKS_Q8K_DOWN_IN,

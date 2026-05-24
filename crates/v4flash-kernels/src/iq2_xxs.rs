@@ -44,30 +44,59 @@ impl Iq2XxsPairMatvec {
         n_rows: u32,
         n_blocks: u32,
     ) -> eyre::Result<()> {
+        self.launch_with_offsets(stream, gate, up, gate_w, 0, up_w, 0, xq, n_rows, n_blocks)
+    }
+
+    /// Same as [`launch`] but reads the gate/up weights starting at a
+    /// per-buffer byte offset. Used by the forward orchestrator to point
+    /// into a single resident routed-expert tensor (256 experts of
+    /// `n_rows * n_blocks * BLOCK_IQ2_XXS_BYTES` bytes each) without
+    /// allocating per-slot scratch buffers.
+    pub fn launch_with_offsets(
+        &self,
+        stream: &Stream,
+        gate: &mut DeviceBuffer<f32>,
+        up: &mut DeviceBuffer<f32>,
+        gate_w: &DeviceBuffer<u8>,
+        gate_w_offset: usize,
+        up_w: &DeviceBuffer<u8>,
+        up_w_offset: usize,
+        xq: &DeviceBuffer<u8>,
+        n_rows: u32,
+        n_blocks: u32,
+    ) -> eyre::Result<()> {
         if n_rows % 8 != 0 {
             return Err(eyre!("iq2_xxs_pair: n_rows={n_rows} must be multiple of 8"));
         }
         let row_bytes = (n_blocks as usize) * BLOCK_IQ2_XXS_BYTES;
-        if gate_w.byte_len() < (n_rows as usize) * row_bytes {
+        let need = (n_rows as usize) * row_bytes;
+        if gate_w.byte_len() < gate_w_offset + need {
             return Err(eyre!(
-                "gate_w bytes: have {}, need {}",
+                "gate_w bytes: have {}, need offset {} + {} = {}",
                 gate_w.byte_len(),
-                (n_rows as usize) * row_bytes
+                gate_w_offset,
+                need,
+                gate_w_offset + need
             ));
         }
-        if up_w.byte_len() < (n_rows as usize) * row_bytes {
+        if up_w.byte_len() < up_w_offset + need {
             return Err(eyre!(
-                "up_w bytes: have {}, need {}",
+                "up_w bytes: have {}, need offset {} + {} = {}",
                 up_w.byte_len(),
-                (n_rows as usize) * row_bytes
+                up_w_offset,
+                need,
+                up_w_offset + need
             ));
         }
 
         let function = self.module.get_function("iq2_xxs_pair_matvec")?;
         let mut g_ptr = gate.raw();
         let mut u_ptr = up.raw();
-        let mut gw_ptr = gate_w.raw();
-        let mut uw_ptr = up_w.raw();
+        // SAFETY: bounds-checked above; pointer math within the allocation.
+        let mut gw_ptr = unsafe { (gate_w.raw() as *mut u8).add(gate_w_offset) }
+            as v4flash_hip::sys::hipDeviceptr_t;
+        let mut uw_ptr = unsafe { (up_w.raw() as *mut u8).add(up_w_offset) }
+            as v4flash_hip::sys::hipDeviceptr_t;
         let mut xq_ptr = xq.raw();
         let mut nr = n_rows;
         let mut nb = n_blocks;

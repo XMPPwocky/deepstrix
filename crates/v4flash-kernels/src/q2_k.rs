@@ -40,23 +40,45 @@ impl Q2KAccumulateMatvec {
         n_blocks_in: u32,
         zero_init: bool,
     ) -> eyre::Result<()> {
+        self.launch_with_offset(stream, out, w_expert, 0, xq, n_rows, n_blocks_in, zero_init)
+    }
+
+    /// Same as [`launch`] but reads `w_expert` starting at a byte offset.
+    /// Used by the forward orchestrator to point into a single resident
+    /// down-projection tensor without per-slot scratch buffers.
+    pub fn launch_with_offset(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        w_expert: &DeviceBuffer<u8>,
+        w_expert_offset: usize,
+        xq: &DeviceBuffer<u8>,
+        n_rows: u32,
+        n_blocks_in: u32,
+        zero_init: bool,
+    ) -> eyre::Result<()> {
         if n_rows % 8 != 0 {
             return Err(eyre!(
                 "q2_k_accumulate_matvec: n_rows={n_rows} must be multiple of 8"
             ));
         }
         let row_bytes = (n_blocks_in as usize) * BLOCK_Q2_K_BYTES;
-        if w_expert.byte_len() < (n_rows as usize) * row_bytes {
+        let need = (n_rows as usize) * row_bytes;
+        if w_expert.byte_len() < w_expert_offset + need {
             return Err(eyre!(
-                "w_expert bytes: have {}, need {}",
+                "w_expert bytes: have {}, need offset {} + {} = {}",
                 w_expert.byte_len(),
-                (n_rows as usize) * row_bytes
+                w_expert_offset,
+                need,
+                w_expert_offset + need
             ));
         }
 
         let function = self.module.get_function("q2_k_accumulate_matvec")?;
         let mut out_ptr = out.raw();
-        let mut w_ptr = w_expert.raw();
+        // SAFETY: bounds-checked above.
+        let mut w_ptr = unsafe { (w_expert.raw() as *mut u8).add(w_expert_offset) }
+            as v4flash_hip::sys::hipDeviceptr_t;
         let mut x_ptr = xq.raw();
         let mut nr = n_rows;
         let mut nb = n_blocks_in;
