@@ -87,9 +87,7 @@ fn expert_bytes<'a>(
     Ok(&all[off..off + bytes_per_expert])
 }
 
-#[test]
-#[ignore]
-fn iq2_xxs_pair_oracle() -> eyre::Result<()> {
+fn run_oracle(variant: &str) -> eyre::Result<()> {
     install_panic_handler()?;
 
     let dump = ActivationDump::open(dump_dir())?;
@@ -98,9 +96,13 @@ fn iq2_xxs_pair_oracle() -> eyre::Result<()> {
     let device = pick_device()?;
     device.set_current()?;
     let arch = device.properties()?.gcn_arch_name;
-    eprintln!("using device {} ({arch})", device.id);
+    eprintln!("using device {} ({arch}), variant={variant}", device.id);
 
-    let matvec = Iq2XxsPairMatvec::for_arch(&arch)?;
+    let matvec = match variant {
+        "par" => Iq2XxsPairMatvec::for_arch(&arch)?,
+        "serial" => Iq2XxsPairMatvec::for_arch_serial(&arch)?,
+        v => return Err(eyre!("unknown variant {v}")),
+    };
     let q8k = Q8KQuantize::for_arch(&arch)?;
     let stream = Stream::new(device.id)?;
 
@@ -193,7 +195,7 @@ fn iq2_xxs_pair_oracle() -> eyre::Result<()> {
     }
 
     eprintln!(
-        "iq2_xxs_pair: max_abs_diff={:.3e}, n_nonzero={}, total={}",
+        "iq2_xxs_pair[{variant}]: max_abs_diff={:.3e}, n_nonzero={}, total={}",
         max_diff, count_diff, total
     );
     // bsum (integer) is bit-exact; the final f32 sum of `0.125 * d_b * bsum_b`
@@ -208,4 +210,18 @@ fn iq2_xxs_pair_oracle() -> eyre::Result<()> {
         THRESHOLD
     );
     Ok(())
+}
+
+#[test]
+#[ignore]
+fn iq2_xxs_pair_oracle() -> eyre::Result<()> {
+    run_oracle("par")
+}
+
+/// Regression: validate the original serial kernel still matches CPU
+/// reference. Run after touching iq2_xxs_pair_matvec.hip.
+#[test]
+#[ignore]
+fn iq2_xxs_pair_oracle_serial() -> eyre::Result<()> {
+    run_oracle("serial")
 }

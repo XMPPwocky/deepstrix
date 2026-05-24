@@ -9,6 +9,10 @@ use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
 
 const IQ2_XXS_PAIR_GFX1201: &[u8] = include_bytes!(env!("KERNEL_IQ2_XXS_PAIR_MATVEC_GFX1201"));
 const IQ2_XXS_PAIR_GFX1151: &[u8] = include_bytes!(env!("KERNEL_IQ2_XXS_PAIR_MATVEC_GFX1151"));
+const IQ2_XXS_PAIR_PAR_GFX1201: &[u8] =
+    include_bytes!(env!("KERNEL_IQ2_XXS_PAIR_MATVEC_PAR_GFX1201"));
+const IQ2_XXS_PAIR_PAR_GFX1151: &[u8] =
+    include_bytes!(env!("KERNEL_IQ2_XXS_PAIR_MATVEC_PAR_GFX1151"));
 
 pub const BLOCK_IQ2_XXS_BYTES: usize = 66;
 
@@ -17,7 +21,24 @@ pub struct Iq2XxsPairMatvec {
 }
 
 impl Iq2XxsPairMatvec {
+    /// Use the M14d parallel variant by default — 2 lanes per super-block,
+    /// all 32 warp lanes active (vs 16 in the serial kernel for n_blocks=16).
+    /// Numerics match the serial kernel within f32-ULP.
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            IQ2_XXS_PAIR_PAR_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            IQ2_XXS_PAIR_PAR_GFX1151
+        } else {
+            return Err(eyre!("unsupported arch for iq2_xxs_pair_matvec: {arch}"));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    /// Original serial kernel — kept for the serial-vs-parallel regression
+    /// test in `tests/iq2_xxs_pair.rs`.
+    pub fn for_arch_serial(arch: &str) -> eyre::Result<Self> {
         let image: &[u8] = if arch.starts_with("gfx1201") {
             IQ2_XXS_PAIR_GFX1201
         } else if arch.starts_with("gfx1151") {
@@ -89,7 +110,10 @@ impl Iq2XxsPairMatvec {
             ));
         }
 
-        let function = self.module.get_function("iq2_xxs_pair_matvec")?;
+        let function = self
+            .module
+            .get_function("iq2_xxs_pair_matvec_par")
+            .or_else(|_| self.module.get_function("iq2_xxs_pair_matvec"))?;
         let mut g_ptr = gate.raw();
         let mut u_ptr = up.raw();
         // SAFETY: bounds-checked above; pointer math within the allocation.
@@ -178,7 +202,10 @@ impl Iq2XxsPairMatvec {
             ));
         }
 
-        let function = self.module.get_function("iq2_xxs_pair_matvec")?;
+        let function = self
+            .module
+            .get_function("iq2_xxs_pair_matvec_par")
+            .or_else(|_| self.module.get_function("iq2_xxs_pair_matvec"))?;
         // SAFETY: bounds-checked above; pointer math within the allocation.
         let mut g_ptr = unsafe { (gate.raw() as *mut f32).add(gate_offset_elems) }
             as v4flash_hip::sys::hipDeviceptr_t;
