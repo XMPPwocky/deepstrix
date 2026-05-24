@@ -48,32 +48,48 @@ extern "C" __global__ void f16_matvec_pair(
     const __half *kv_row   = kv_w   + (size_t)row * (size_t)k;
     const __half *gate_row = gate_w + (size_t)row * (size_t)k;
 
-    // Each lane handles k/32 elements; pair into half2/float2 for 2x
-    // throughput per memory transaction.
-    // Pre-condition: k % 2 == 0 (always true for n_embd = 4096).
-    const __half2 *kv_h2   = reinterpret_cast<const __half2 *>(kv_row);
-    const __half2 *gate_h2 = reinterpret_cast<const __half2 *>(gate_row);
-    const float2  *x_f2    = reinterpret_cast<const float2  *>(x);
-    const uint32_t k2 = k >> 1u;  // # of half2 elements
+    // 4-way unrolled inner loop: read 4 halves + 4 floats per lane per
+    // iteration (uint64 + float4 loads), 8 independent FMAs per output.
+    // For k=4096 this gives k/4/32 = 32 loop iterations per lane (vs 64
+    // for the simpler half2 version), letting the compiler schedule
+    // around half→float conversion latency.
+    // Pre-condition: k % 4 == 0 (always true for n_embd=4096).
+    const uint64_t *kv_u64   = reinterpret_cast<const uint64_t*>(kv_row);
+    const uint64_t *gate_u64 = reinterpret_cast<const uint64_t*>(gate_row);
+    const float4   *x_f4     = reinterpret_cast<const float4  *>(x);
+    const uint32_t  k4       = k >> 2u;  // # of 4-half (uint64) blocks
 
-    // Two independent accumulators per output → more ILP.
-    float kv_acc0 = 0.0f, kv_acc1 = 0.0f;
-    float g_acc0  = 0.0f, g_acc1  = 0.0f;
+    // 4 independent accumulators per output for FMA ILP.
+    float kv_a0 = 0.0f, kv_a1 = 0.0f, kv_a2 = 0.0f, kv_a3 = 0.0f;
+    float g_a0  = 0.0f, g_a1  = 0.0f, g_a2  = 0.0f, g_a3  = 0.0f;
 
-    for (uint32_t i = lane; i < k2; i += WARP) {
-        const __half2 wkv = kv_h2[i];
-        const __half2 wg  = gate_h2[i];
-        const float2  xv  = x_f2[i];
-        const float2  fwkv = __half22float2(wkv);
-        const float2  fwg  = __half22float2(wg);
-        kv_acc0 += fwkv.x * xv.x;
-        kv_acc1 += fwkv.y * xv.y;
-        g_acc0  += fwg.x  * xv.x;
-        g_acc1  += fwg.y  * xv.y;
+    for (uint32_t i = lane; i < k4; i += WARP) {
+        const uint64_t kv_pack = kv_u64[i];
+        const uint64_t g_pack  = gate_u64[i];
+        const float4   xv      = x_f4[i];
+
+        const __half2 kv_lo = *reinterpret_cast<const __half2*>(&kv_pack);
+        const __half2 kv_hi = *(reinterpret_cast<const __half2*>(&kv_pack) + 1);
+        const __half2 g_lo  = *reinterpret_cast<const __half2*>(&g_pack);
+        const __half2 g_hi  = *(reinterpret_cast<const __half2*>(&g_pack) + 1);
+
+        const float2 fkv_lo = __half22float2(kv_lo);
+        const float2 fkv_hi = __half22float2(kv_hi);
+        const float2 fg_lo  = __half22float2(g_lo);
+        const float2 fg_hi  = __half22float2(g_hi);
+
+        kv_a0 += fkv_lo.x * xv.x;
+        kv_a1 += fkv_lo.y * xv.y;
+        kv_a2 += fkv_hi.x * xv.z;
+        kv_a3 += fkv_hi.y * xv.w;
+        g_a0  += fg_lo.x  * xv.x;
+        g_a1  += fg_lo.y  * xv.y;
+        g_a2  += fg_hi.x  * xv.z;
+        g_a3  += fg_hi.y  * xv.w;
     }
 
-    float kv_acc = kv_acc0 + kv_acc1;
-    float g_acc  = g_acc0  + g_acc1;
+    float kv_acc = (kv_a0 + kv_a1) + (kv_a2 + kv_a3);
+    float g_acc  = (g_a0  + g_a1)  + (g_a2  + g_a3);
     kv_acc = warp_sum_f32(kv_acc);
     g_acc  = warp_sum_f32(g_acc);
     if (lane == 0) {
