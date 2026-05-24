@@ -1,0 +1,82 @@
+diff --git a/ds4.c b/ds4.c
+--- a/ds4.c
++++ b/ds4.c
+@@ -6629,12 +6629,31 @@
+     memcpy(state_kv + (uint64_t)row * width, kv_cur, (size_t)width * sizeof(kv_cur[0]));
+     memcpy(state_score + (uint64_t)row * width, sc_cur, (size_t)width * sizeof(sc_cur[0]));
+ 
++    /* deepstrix dump (M7): compressor intermediates. The tag prefix is
++     * "comp" for the main attention's compressor (head_dim=512) and
++     * "index_comp" for the indexer's compressor (head_dim=128) — the same
++     * function is called from both sites with different head_dim. */
++    {
++        const char *_dpx = (head_dim == DS4_N_INDEXER_HEAD_DIM) ? "index_comp" : "comp";
++        char _dtag[64];
++        snprintf(_dtag, sizeof _dtag, "%s_state_kv_row", _dpx);
++        ds4_dump_emit_1d(_dtag, kv_cur, DS4_DUMP_DTYPE_F32, (int64_t)width);
++        snprintf(_dtag, sizeof _dtag, "%s_state_score_row", _dpx);
++        ds4_dump_emit_1d(_dtag, sc_cur, DS4_DUMP_DTYPE_F32, (int64_t)width);
++    }
++
+     if (!should_compress) {
+         return false;
+     }
+ 
+     float *pooled = scratch->comp_pooled;
+     compressor_pool_decode_state(pooled, state_kv, state_score, head_dim, compress_ratio);
++    {
++        const char *_dpx = (head_dim == DS4_N_INDEXER_HEAD_DIM) ? "index_comp" : "comp";
++        char _dtag[64];
++        snprintf(_dtag, sizeof _dtag, "%s_pool_out", _dpx);
++        ds4_dump_emit_1d(_dtag, pooled, DS4_DUMP_DTYPE_F32, (int64_t)head_dim);
++    }
+ 
+     double ss = 0.0;
+     for (uint32_t i = 0; i < head_dim; i++) ss += (double)pooled[i] * pooled[i];
+@@ -6645,9 +6664,21 @@
+ 
+     const uint32_t comp_pos = pos + 1 - compress_ratio;
+     rope_tail_layer_inplace(out_comp, 1, head_dim, DS4_N_ROT, comp_pos, il, false);
++    {
++        const char *_dpx = (head_dim == DS4_N_INDEXER_HEAD_DIM) ? "index_comp" : "comp";
++        char _dtag[64];
++        snprintf(_dtag, sizeof _dtag, "%s_pre_fp8", _dpx);
++        ds4_dump_emit_1d(_dtag, out_comp, DS4_DUMP_DTYPE_F32, (int64_t)head_dim);
++    }
+     if (head_dim == DS4_N_HEAD_DIM) {
+         dsv4_fp8_kv_quantize_row_inplace_cpu(out_comp, head_dim, DS4_N_ROT);
+     }
++    {
++        const char *_dpx = (head_dim == DS4_N_INDEXER_HEAD_DIM) ? "index_comp" : "comp";
++        char _dtag[64];
++        snprintf(_dtag, sizeof _dtag, "%s_post_fp8", _dpx);
++        ds4_dump_emit_1d(_dtag, out_comp, DS4_DUMP_DTYPE_F32, (int64_t)head_dim);
++    }
+ 
+     if (compress_ratio == 4) {
+         for (uint32_t r = 0; r < compress_ratio; r++) {
+@@ -7006,11 +7037,16 @@
+     float *scores = scratch->index_scores;
+ 
+     matvec_any_decode_scratch(q, model, layer->indexer_attn_q_b, qr_norm, scratch);
++    ds4_dump_emit_1d("indexer_q_pre_rope", q, DS4_DUMP_DTYPE_F32,
++                     (int64_t)((uint64_t)n_head * head_dim));
+     rope_tail_layer_inplace(q, n_head, head_dim, DS4_N_ROT, pos, il, false);
++    ds4_dump_emit_1d("indexer_q_post_rope", q, DS4_DUMP_DTYPE_F32,
++                     (int64_t)((uint64_t)n_head * head_dim));
+ 
+     matvec_any_decode_scratch(weights, model, layer->indexer_proj, cur, scratch);
+     const float scale = 1.0f / sqrtf((float)(head_dim * n_head));
+     for (uint32_t h = 0; h < n_head; h++) weights[h] *= scale;
++    ds4_dump_emit_1d("indexer_head_weights", weights, DS4_DUMP_DTYPE_F32, (int64_t)n_head);
+ 
+     for (uint32_t c = 0; c < n_comp; c++) {
+         const float *kv = index_comp + (uint64_t)c * head_dim;
+@@ -7023,6 +7059,7 @@
+         }
+         scores[c] = s;
+     }
++    ds4_dump_emit_1d("indexer_scores", scores, DS4_DUMP_DTYPE_F32, (int64_t)n_comp);
+ 
+     for (uint32_t k = 0; k < top_k; k++) {
+         uint32_t best = 0;
