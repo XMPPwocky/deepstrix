@@ -20,7 +20,7 @@ This is the immutable baseline. Every Phase 1 milestone (M2+) validates ported k
   - iGPU: AMD Radeon 8060S Graphics (Strix Halo, gfx1151) — HIP device 1
   - dGPU: AMD Radeon RX 9070 XT (gfx1201) — HIP device 0 (NOT used for inference; 16 GiB VRAM is too small for 86 GiB model)
 - ds4 submodule: `external/ds4` @ branch `rocm` (initial: 7a751eb)
-- ds4 patches applied: `external/ds4-patches/{0001-expose-logits-buffer, 0002-activation-dump-callback, 0003-output-head-hooks, 0004-q-kv-rope-hooks}.patch`
+- ds4 patches applied: `external/ds4-patches/{0001-expose-logits-buffer, 0002-activation-dump-callback, 0003-output-head-hooks, 0004-q-kv-rope-hooks, 0005-attention-hooks}.patch`
 
 ## Model
 
@@ -68,12 +68,15 @@ Captured by `external/ds4-dump/ds4-dump-activations` using the 0002 patch (`ds4_
   - Both are bit-deterministic across reruns of their respective paths.
 - The M2 dump becomes the canonical reference for kernel ports because every intermediate tensor is captured along *one consistent* trajectory.
 - Storage: `reference/v4flash-cpu-activations/` (gitignored, persistent btrfs)
-  - **M4 (current) dump:**
-    - `manifest.json` SHA256: `df0e4f3660a4f26326a8fe7d975e71946c5652d47fff0b83a6875ff78768894c`
-    - logits.f32 SHA256: `bd3176ea0644067caf7a455db332874e62c23838963f561cac2d2b4b59a2ea0a` (unchanged from M2/M3 — ds4 patch is byte-clean when callback is null)
-    - aggregate SHA over `sort -u` of all `*.bin` files (one number summarizing the whole tree): `95cd30f2780ccd3913948fb33312903c14aaa7bd89b3821e822f0abf9b83c11c`
-    - 34,815 tensors (M3 superset: + 8 act tags × 43 layers × 51 tokens + 3 weight tags × 43 layers)
-  - Previous (M3) SHAs preserved for archaeology: manifest `a2e8b85b...`, aggregate `d033b20460bc...` — both bit-identical for the M2/M3 tag subset (verified by spot-check SHAs on `L17/T0005/attn_input_norm.bin` and `L43/T0006/output_norm.bin`).
+  - **M5 (current) dump:**
+    - `manifest.json` SHA256: `4a825d6642afb9bd4c2ec08c22c279f217954c69ee12c55f01bd7f9873f2ba6f`
+    - logits.f32 SHA256: `bd3176ea0644067caf7a455db332874e62c23838963f561cac2d2b4b59a2ea0a` (unchanged from M2/M3/M4 — ds4 patch is byte-clean when callback is null)
+    - aggregate SHA over `sort -u` of all `*.bin` files (one number summarizing the whole tree): `5fb7896cc232e292eb6f7ac879e33073c5dc81706f2eadb4c7383c60f624d96b`
+    - 47,113 tensors (M4 superset: + 5 act tags × 43 layers × 51 tokens + 1 weight tag × 43 layers)
+  - Previous SHAs preserved for archaeology:
+    - M3: manifest `a2e8b85b...`, aggregate `d033b20460bc...`
+    - M4: manifest `df0e4f36...`, aggregate `95cd30f2...`
+    - All bit-identical for the prior tag subset (spot-checks on `L17/T0005/attn_input_norm.bin`, `L43/T0006/output_norm.bin`, `L17/T0005/q_a_out.bin`, `L17/weight/rope_params.bin` confirm).
 - Tag set per layer L=0..42 (regular layers), per token position:
   - `layer_input_residual` (n_hc × n_embd = 4 × 4096 f32)
   - `attn_cur` (n_embd f32)
@@ -87,6 +90,12 @@ Captured by `external/ds4-dump/ds4-dump-activations` using the 0002 patch (`ds4_
     - `kv_normed` (n_head_dim = 512 f32) — post `rms_norm_weight` with `kv_a_norm`; RoPE input
     - `q_post_rope` (32768 f32) — post `rope_tail_layer_inplace`; attention kernel input
     - `kv_post_rope` (n_head_dim = 512 f32) — post `rope_tail_layer_inplace`; pre fp8 KV-cache quant
+  - **M5 attention compute + output projection (added by 0005 patch):**
+    - `kv_cached_row` (n_head_dim = 512 f32) — last row of `cache->raw_kv` after `kv_cache_push_raw` (f16-roundtripped post-FP8 value that attention actually consumes)
+    - `attn_heads` (n_head × n_head_dim = 32768 f32) — per-head attention output post softmax; fires for both `rows_one` and `mixed_one` branches
+    - `attn_heads_inv_rope` (32768 f32) — post inverse `rope_tail_layer_inplace`
+    - `attn_out_low` (n_groups × n_lora_o = 8 × 1024 = 8192 f32) — post grouped Q8_0 matvec (`attn_output_a`), pre `attn_output_b` back-projection
+    - `attn_out` (n_embd = 4096 f32) — post full grouped output projection (= input to HC-post composition, M10)
   - `ffn_cur` (n_embd f32)
   - `ffn_input_norm` (n_embd f32) — output of layer→ffn RMSNorm
   - `layer_output_residual` (n_hc × n_embd f32)
@@ -102,6 +111,8 @@ Captured by `external/ds4-dump/ds4-dump-activations` using the 0002 patch (`ds4_
     - `q_a_norm.bin` (1024 f32) — Q LoRA factor norm
     - `kv_a_norm.bin` (n_head_dim = 512 f32) — KV factor norm
     - `rope_params.bin` (6 f32) — `[freq_base, freq_scale, ext_factor, attn_factor, beta_fast=32, beta_slow=1]`; YaRN parameters per layer, computed via `ds4_layer_compress_ratio(il)` etc. inside the patch so the Rust RoPE port is independent of ds4 compile-time constants
+  - **M5 (added by 0005 patch):**
+    - `attn_sinks.bin` (n_head = 64 f32) — per-head sink scores; contribute to the softmax denominator (no value vector)
   - `output_norm.bin` — head RMSNorm scale (L=43 only)
 
 **Logit-row ↔ output_norm token mapping** (used by M3 Q8_0 oracle):
