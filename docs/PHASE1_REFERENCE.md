@@ -20,7 +20,7 @@ This is the immutable baseline. Every Phase 1 milestone (M2+) validates ported k
   - iGPU: AMD Radeon 8060S Graphics (Strix Halo, gfx1151) — HIP device 1
   - dGPU: AMD Radeon RX 9070 XT (gfx1201) — HIP device 0 (NOT used for inference; 16 GiB VRAM is too small for 86 GiB model)
 - ds4 submodule: `external/ds4` @ branch `rocm` (initial: 7a751eb)
-- ds4 patches applied: `external/ds4-patches/{0001-expose-logits-buffer, 0002-activation-dump-callback, 0003-output-head-hooks, 0004-q-kv-rope-hooks, 0005-attention-hooks, 0006-comp-mask-hooks}.patch`
+- ds4 patches applied: `external/ds4-patches/{0001-expose-logits-buffer, 0002-activation-dump-callback, 0003-output-head-hooks, 0004-q-kv-rope-hooks, 0005-attention-hooks, 0006-comp-mask-hooks, 0007-compressor-indexer-hooks}.patch`
 
 ## Model
 
@@ -68,11 +68,12 @@ Captured by `external/ds4-dump/ds4-dump-activations` using the 0002 patch (`ds4_
   - Both are bit-deterministic across reruns of their respective paths.
 - The M2 dump becomes the canonical reference for kernel ports because every intermediate tensor is captured along *one consistent* trajectory.
 - Storage: `reference/v4flash-cpu-activations/` (gitignored, persistent btrfs)
-  - **M6 (current) dump:**
-    - `manifest.json` SHA256: `0b10242d2a371a46426979cf18037d58f586889368ad36046fa7e0efb0feba70`
-    - logits.f32 SHA256: `bd3176ea0644067caf7a455db332874e62c23838963f561cac2d2b4b59a2ea0a` (unchanged from M2-M5 — ds4 patch is byte-clean when callback is null)
-    - aggregate SHA over `sort -u` of all `*.bin` files: `fb740e8fb29b283c4adce36b51e68987e16cb694d87d2fb43a50b38c6684179b`
-    - 48,541 tensors (M5 superset: + comp_kv_row at ratio==4 layers ~14 entries/layer × 21 layers, + comp_allowed_mask at ratio==4 layers ~54 entries/layer × 21 layers)
+  - **M7 (current) dump:**
+    - `manifest.json` SHA256: `255b917f93ffbbe7bef2940566b1207f6521ea30fdce7076e97c0a1589175bc8`
+    - logits.f32 SHA256: `bd3176ea0644067caf7a455db332874e62c23838963f561cac2d2b4b59a2ea0a` (unchanged from M2-M6)
+    - aggregate SHA: `e675e77326c3efd230a83003af72972e1aed61ea7c0e6db4691350eba20dcddb`
+    - 57,373 tensors (M6 + 5 compressor intermediates × 41 layers + 5 indexer-compressor intermediates × 21 layers + 4 indexer-scoring tags — last group never fires on this prompt since n_comp ≤ 14 < top_k=512)
+  - Previous (M6) dump: manifest `0b10242d…`, aggregate `fb740e8f…`
   - Previous SHAs preserved for archaeology:
     - M3: manifest `a2e8b85b...`, aggregate `d033b20460bc...`
     - M4: manifest `df0e4f36...`, aggregate `95cd30f2...`
