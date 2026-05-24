@@ -1,0 +1,18 @@
+diff --git a/ds4.c b/ds4.c
+--- a/ds4.c
++++ b/ds4.c
+@@ -5802,10 +5802,14 @@
+                                   scratch->routed_xq,
+                                   scratch->routed_midq);
+     if (profile) t_routed = now_sec() - t0;
++    /* deepstrix dump (M9): routed-MoE output (sum of 6 expert outputs). */
++    ds4_dump_emit_1d("ffn_moe", scratch->ffn_moe, DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_EMBD);
+ 
+     t0 = profile ? now_sec() : 0.0;
+     layer_shared_ffn_one_decode_scratch(scratch->ffn_shared, model, layer, scratch->ffn_norm, scratch);
+     if (profile) t_shared = now_sec() - t0;
++    /* deepstrix dump (M9): shared-expert output. */
++    ds4_dump_emit_1d("ffn_shared", scratch->ffn_shared, DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_EMBD);
+ 
+     t0 = profile ? now_sec() : 0.0;
+     for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
