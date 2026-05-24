@@ -239,4 +239,53 @@ impl HcPost {
         };
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
+
+    /// Launch reading `post` and `comb` directly from a packed `split`
+    /// buffer with layout `[w(n_w), post(n_hc), comb(n_hc*n_hc)]`. This
+    /// is exactly the layout produced by `HcSinkhorn`, so callers can
+    /// skip the device→host→device extraction round-trip entirely
+    /// (M13.3).
+    pub fn launch_from_split(
+        &self,
+        stream: &Stream,
+        out_hc: &mut DeviceBuffer<f32>,
+        block_out: &DeviceBuffer<f32>,
+        residual_hc: &DeviceBuffer<f32>,
+        split: &DeviceBuffer<f32>,
+        n_w: u32,
+        n_embd: u32,
+        n_hc: u32,
+    ) -> eyre::Result<()> {
+        let function = self.module.get_function("hc_post")?;
+        let mut o_ptr = out_hc.raw();
+        let mut bo_ptr = block_out.raw();
+        let mut r_ptr = residual_hc.raw();
+        // SAFETY: caller must ensure split has length >= n_w + n_hc + n_hc*n_hc.
+        let split_base = split.raw() as *mut u8;
+        let post_offset_bytes = (n_w as usize) * 4;
+        let comb_offset_bytes = ((n_w + n_hc) as usize) * 4;
+        let mut p_ptr =
+            unsafe { split_base.add(post_offset_bytes) } as v4flash_hip::sys::hipDeviceptr_t;
+        let mut c_ptr =
+            unsafe { split_base.add(comb_offset_bytes) } as v4flash_hip::sys::hipDeviceptr_t;
+        let mut ne = n_embd;
+        let mut nh = n_hc;
+        let mut args: [*mut c_void; 7] = [
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut bo_ptr as *mut _ as *mut c_void,
+            &mut r_ptr as *mut _ as *mut c_void,
+            &mut p_ptr as *mut _ as *mut c_void,
+            &mut c_ptr as *mut _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+        ];
+        let block_x = 256u32;
+        let grid_x = n_embd.div_ceil(block_x);
+        let cfg = LaunchConfig {
+            grid: (grid_x, n_hc, 1),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
 }

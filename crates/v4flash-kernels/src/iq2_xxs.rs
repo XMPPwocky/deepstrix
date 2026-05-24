@@ -116,4 +116,95 @@ impl Iq2XxsPairMatvec {
         };
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
+
+    /// Full-offset variant: also offsets the gate/up output buffers.
+    /// Lets the MoE pipeline write each per-slot result directly into a
+    /// concatenated `[N_USED, N_FF_EXP]` buffer with zero host sync —
+    /// eliminating the per-slot copy_to_host / copy_from_host roundtrip
+    /// in the routed-MoE inner loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_with_full_offsets(
+        &self,
+        stream: &Stream,
+        gate: &mut DeviceBuffer<f32>,
+        gate_offset_elems: usize,
+        up: &mut DeviceBuffer<f32>,
+        up_offset_elems: usize,
+        gate_w: &DeviceBuffer<u8>,
+        gate_w_offset: usize,
+        up_w: &DeviceBuffer<u8>,
+        up_w_offset: usize,
+        xq: &DeviceBuffer<u8>,
+        n_rows: u32,
+        n_blocks: u32,
+    ) -> eyre::Result<()> {
+        if n_rows % 8 != 0 {
+            return Err(eyre!("iq2_xxs_pair: n_rows={n_rows} must be multiple of 8"));
+        }
+        let row_bytes = (n_blocks as usize) * BLOCK_IQ2_XXS_BYTES;
+        let need = (n_rows as usize) * row_bytes;
+        if gate_w.byte_len() < gate_w_offset + need {
+            return Err(eyre!(
+                "gate_w bytes: have {}, need offset {} + {} = {}",
+                gate_w.byte_len(),
+                gate_w_offset,
+                need,
+                gate_w_offset + need
+            ));
+        }
+        if up_w.byte_len() < up_w_offset + need {
+            return Err(eyre!(
+                "up_w bytes: have {}, need offset {} + {} = {}",
+                up_w.byte_len(),
+                up_w_offset,
+                need,
+                up_w_offset + need
+            ));
+        }
+        if gate.len() < gate_offset_elems + n_rows as usize {
+            return Err(eyre!(
+                "gate out: len {} < offset {} + n_rows {}",
+                gate.len(),
+                gate_offset_elems,
+                n_rows
+            ));
+        }
+        if up.len() < up_offset_elems + n_rows as usize {
+            return Err(eyre!(
+                "up out: len {} < offset {} + n_rows {}",
+                up.len(),
+                up_offset_elems,
+                n_rows
+            ));
+        }
+
+        let function = self.module.get_function("iq2_xxs_pair_matvec")?;
+        // SAFETY: bounds-checked above; pointer math within the allocation.
+        let mut g_ptr = unsafe { (gate.raw() as *mut f32).add(gate_offset_elems) }
+            as v4flash_hip::sys::hipDeviceptr_t;
+        let mut u_ptr = unsafe { (up.raw() as *mut f32).add(up_offset_elems) }
+            as v4flash_hip::sys::hipDeviceptr_t;
+        let mut gw_ptr = unsafe { (gate_w.raw() as *mut u8).add(gate_w_offset) }
+            as v4flash_hip::sys::hipDeviceptr_t;
+        let mut uw_ptr = unsafe { (up_w.raw() as *mut u8).add(up_w_offset) }
+            as v4flash_hip::sys::hipDeviceptr_t;
+        let mut xq_ptr = xq.raw();
+        let mut nr = n_rows;
+        let mut nb = n_blocks;
+        let mut args: [*mut c_void; 7] = [
+            &mut g_ptr as *mut _ as *mut c_void,
+            &mut u_ptr as *mut _ as *mut c_void,
+            &mut gw_ptr as *mut _ as *mut c_void,
+            &mut uw_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
 }

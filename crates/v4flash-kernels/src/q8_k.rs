@@ -54,9 +54,46 @@ impl Q8KQuantize {
             ));
         }
 
+        self.launch_with_offsets(stream, out, 0, x, 0, n_blocks)
+    }
+
+    /// Same as [`launch`] but with byte offset into `out` and element
+    /// offset into `x`. Lets the MoE pipeline write per-slot q8k blocks
+    /// into a single concatenated buffer without per-slot host copies.
+    pub fn launch_with_offsets(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<u8>,
+        out_offset_bytes: usize,
+        x: &DeviceBuffer<f32>,
+        x_offset_elems: usize,
+        n_blocks: u32,
+    ) -> eyre::Result<()> {
+        let needed_x = (n_blocks as usize) * (QK_K as usize);
+        let needed_out = (n_blocks as usize) * BLOCK_Q8_K_BYTES;
+        if x.len() < x_offset_elems + needed_x {
+            return Err(eyre!(
+                "q8_k_quantize x: len {} < offset {} + need {}",
+                x.len(),
+                x_offset_elems,
+                needed_x
+            ));
+        }
+        if out.byte_len() < out_offset_bytes + needed_out {
+            return Err(eyre!(
+                "q8_k_quantize out: bytes {} < offset {} + need {}",
+                out.byte_len(),
+                out_offset_bytes,
+                needed_out
+            ));
+        }
+
         let function = self.module.get_function("q8_k_quantize")?;
-        let mut out_ptr = out.raw();
-        let mut x_ptr = x.raw();
+        // SAFETY: bounds-checked above.
+        let mut out_ptr = unsafe { (out.raw() as *mut u8).add(out_offset_bytes) }
+            as v4flash_hip::sys::hipDeviceptr_t;
+        let mut x_ptr = unsafe { (x.raw() as *mut f32).add(x_offset_elems) }
+            as v4flash_hip::sys::hipDeviceptr_t;
         let mut n = n_blocks;
         let mut args: [*mut c_void; 3] = [
             &mut out_ptr as *mut _ as *mut c_void,

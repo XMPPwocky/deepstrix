@@ -14,6 +14,8 @@ serde_json = { workspace = true }
 memmap2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-perfetto = { workspace = true }
 v4flash-hip = { path = "../v4flash-hip" }
 v4flash-core = { path = "../v4flash-core" }
 

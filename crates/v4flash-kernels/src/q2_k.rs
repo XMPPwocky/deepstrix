@@ -44,8 +44,6 @@ impl Q2KAccumulateMatvec {
     }
 
     /// Same as [`launch`] but reads `w_expert` starting at a byte offset.
-    /// Used by the forward orchestrator to point into a single resident
-    /// down-projection tensor without per-slot scratch buffers.
     pub fn launch_with_offset(
         &self,
         stream: &Stream,
@@ -53,6 +51,37 @@ impl Q2KAccumulateMatvec {
         w_expert: &DeviceBuffer<u8>,
         w_expert_offset: usize,
         xq: &DeviceBuffer<u8>,
+        n_rows: u32,
+        n_blocks_in: u32,
+        zero_init: bool,
+    ) -> eyre::Result<()> {
+        self.launch_with_full_offsets(
+            stream,
+            out,
+            w_expert,
+            w_expert_offset,
+            xq,
+            0,
+            n_rows,
+            n_blocks_in,
+            zero_init,
+        )
+    }
+
+    /// Full-offset variant: also offsets the activation buffer `xq`.
+    /// Lets the MoE pipeline read per-slot q8k blocks from a single
+    /// concatenated mid-quant buffer (paired with
+    /// [`crate::q8_k::Q8KQuantize::launch_with_offsets`]) — no per-slot
+    /// host syncs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_with_full_offsets(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        w_expert: &DeviceBuffer<u8>,
+        w_expert_offset: usize,
+        xq: &DeviceBuffer<u8>,
+        xq_offset_bytes: usize,
         n_rows: u32,
         n_blocks_in: u32,
         zero_init: bool,
@@ -73,13 +102,25 @@ impl Q2KAccumulateMatvec {
                 w_expert_offset + need
             ));
         }
+        // xq blocks are 292 bytes per (n_blocks_in matches q8k blocks).
+        let xq_need = (n_blocks_in as usize) * 292;
+        if xq.byte_len() < xq_offset_bytes + xq_need {
+            return Err(eyre!(
+                "xq bytes: have {}, need offset {} + {} = {}",
+                xq.byte_len(),
+                xq_offset_bytes,
+                xq_need,
+                xq_offset_bytes + xq_need
+            ));
+        }
 
         let function = self.module.get_function("q2_k_accumulate_matvec")?;
         let mut out_ptr = out.raw();
         // SAFETY: bounds-checked above.
         let mut w_ptr = unsafe { (w_expert.raw() as *mut u8).add(w_expert_offset) }
             as v4flash_hip::sys::hipDeviceptr_t;
-        let mut x_ptr = xq.raw();
+        let mut x_ptr = unsafe { (xq.raw() as *mut u8).add(xq_offset_bytes) }
+            as v4flash_hip::sys::hipDeviceptr_t;
         let mut nr = n_rows;
         let mut nb = n_blocks_in;
         let mut zi: u32 = if zero_init { 1 } else { 0 };

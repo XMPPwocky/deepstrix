@@ -31,6 +31,9 @@ use v4flash_hip::{install_panic_handler, Device, DeviceBuffer};
 use v4flash_kernels::forward::{
     Engine, ModelState, ModelWeights, Scratch, COMPRESS_RATIOS, HC_DIM, N_LAYER, N_VOCAB,
 };
+use v4flash_kernels::het::{
+    DgpuScratch, ExecMode, HetModelState, HetModelWeights, HeterogeneousEngine, IgpuScratch,
+};
 use v4flash_kernels::{ActivationDump, RopeParams};
 
 const MODEL_PATH: &str =
@@ -321,4 +324,216 @@ fn forward_full_logits_oracle() -> eyre::Result<()> {
 #[allow(dead_code)]
 fn _silence_unused() {
     let _: Option<DeviceBuffer<f32>> = None;
+}
+
+fn pick_dgpu_device() -> eyre::Result<Device> {
+    for d in Device::all()? {
+        if d.properties()?.gcn_arch_name.starts_with("gfx1201") {
+            return Ok(d);
+        }
+    }
+    Err(eyre!("no gfx1201 (9070 XT) device found"))
+}
+
+fn pick_igpu_device() -> eyre::Result<Device> {
+    for d in Device::all()? {
+        if d.properties()?.gcn_arch_name.starts_with("gfx1151") {
+            return Ok(d);
+        }
+    }
+    Err(eyre!("no gfx1151 (Strix iGPU) device found"))
+}
+
+/// Het orchestrator oracle — same gating as the single-device test, run
+/// across both dGPU and iGPU in serial mode (`ExecMode::HetSingleStream`).
+/// Exit criterion for M13.1.
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let _ = fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("v4flash_kernels::het=info")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
+#[test]
+#[ignore]
+fn forward_full_logits_oracle_het_parallel() -> eyre::Result<()> {
+    run_het_oracle(ExecMode::HetParallel, "het-parallel")
+}
+
+#[test]
+#[ignore]
+fn forward_full_logits_oracle_het_single_stream() -> eyre::Result<()> {
+    run_het_oracle(ExecMode::HetSingleStream, "het-single-stream")
+}
+
+fn run_het_oracle(mode: ExecMode, label: &str) -> eyre::Result<()> {
+    install_panic_handler()?;
+    init_tracing();
+    eprintln!("=== het oracle: mode = {label} ===");
+
+    let dump = ActivationDump::open(dump_dir())?;
+    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let n_logit_rows = dump.n_logit_rows as i32;
+    let n_positions = n_logit_rows + PROMPT_LEN - 1;
+
+    let token_seq = build_token_sequence(&dump)?;
+    assert_eq!(token_seq.len(), n_positions as usize);
+
+    let dgpu = pick_dgpu_device()?;
+    let igpu = pick_igpu_device()?;
+    let dgpu_arch = dgpu.properties()?.gcn_arch_name;
+    let igpu_arch = igpu.properties()?.gcn_arch_name;
+    eprintln!(
+        "het: dGPU id={} ({}), iGPU id={} ({})",
+        dgpu.id, dgpu_arch, igpu.id, igpu_arch
+    );
+
+    let rope_for_layer = |layer: i32| -> eyre::Result<RopeParams> {
+        let entry = dump
+            .weight("rope_params", layer)
+            .ok_or_else(|| eyre!("missing weight:rope_params for L{layer}"))?;
+        let floats = dump.read_f32(entry)?;
+        let n_ctx_orig = if floats[2] != 0.0 { ROPE_ORIG_CTX } else { 0 };
+        RopeParams::from_dump_blob(&floats, n_ctx_orig)
+    };
+
+    eprintln!("loading het weights — dGPU (~9 GiB) + iGPU (~52 GiB)...");
+    let weights = HetModelWeights::load_all(&gguf, dgpu, igpu, &rope_for_layer)?;
+    eprintln!("het weights loaded.");
+
+    let engine = HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, mode)?;
+    let mut dgpu_scratch = DgpuScratch::alloc(dgpu)?;
+    let mut igpu_scratch = IgpuScratch::alloc(igpu)?;
+    let mut state = HetModelState::alloc(dgpu, igpu, n_positions as u32)?;
+
+    let logits_bytes = fs::read(dump_dir().join("logits.f32"))?;
+    let expected_len = (n_logit_rows as usize) * (N_VOCAB as usize) * 4;
+    if logits_bytes.len() != expected_len {
+        return Err(eyre!(
+            "logits.f32 size: have {}, expected {}",
+            logits_bytes.len(),
+            expected_len
+        ));
+    }
+    let mut got_logits = vec![0f32; N_VOCAB as usize];
+
+    let mut argmax_match = 0i32;
+    let mut top5_dump_argmax_in_ours = 0i32;
+    let mut top5_set_overlap_sum = 0i32;
+    let mut sum_kl_dump_ours = 0.0f64;
+    let mut max_kl_dump_ours = 0.0f64;
+    let mut max_abs: f32 = 0.0;
+    let mut sum_abs: f64 = 0.0;
+    let mut count: u64 = 0;
+
+    for layer in 0..N_LAYER {
+        let _ = COMPRESS_RATIOS[layer as usize];
+    }
+
+    for pos in 0..n_positions {
+        let token_id = token_seq[pos as usize];
+        let inp_entry = dump
+            .tensor("layer_input_residual", 0, pos)
+            .ok_or_else(|| eyre!("missing layer_input_residual L0 T{pos}"))?;
+        let input_hc = dump.read_f32(inp_entry)?;
+        assert_eq!(input_hc.len(), HC_DIM as usize);
+
+        engine.forward_token(
+            &mut dgpu_scratch,
+            &mut igpu_scratch,
+            &mut state,
+            &weights,
+            &input_hc,
+            pos as u32,
+            token_id,
+        )?;
+
+        if pos >= PROMPT_LEN - 1 {
+            let row = (pos - (PROMPT_LEN - 1)) as usize;
+            dgpu_scratch.logits.copy_to_host(&mut got_logits)?;
+
+            let row_off = row * (N_VOCAB as usize) * 4;
+            let mut expected = vec![0f32; N_VOCAB as usize];
+            for (i, c) in logits_bytes[row_off..row_off + (N_VOCAB as usize) * 4]
+                .chunks_exact(4)
+                .enumerate()
+            {
+                expected[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+
+            let g_arg = argmax(&got_logits);
+            let e_arg = argmax(&expected);
+            if g_arg == e_arg {
+                argmax_match += 1;
+            }
+            let dump_top5 = topk(&expected, 5);
+            let our_top5 = topk(&got_logits, 5);
+            let overlap: i32 = our_top5
+                .iter()
+                .filter(|i| dump_top5.contains(i))
+                .count() as i32;
+            top5_set_overlap_sum += overlap;
+            if our_top5.contains(&e_arg) {
+                top5_dump_argmax_in_ours += 1;
+            }
+            let kl = kl_divergence(&expected, &got_logits);
+            sum_kl_dump_ours += kl;
+            if kl > max_kl_dump_ours {
+                max_kl_dump_ours = kl;
+            }
+            for (g, e) in got_logits.iter().zip(expected.iter()) {
+                let d = (g - e).abs();
+                if d > max_abs {
+                    max_abs = d;
+                }
+                sum_abs += d as f64;
+                count += 1;
+            }
+            if row % 5 == 0 || g_arg != e_arg {
+                eprintln!(
+                    "het row{row:>2} T{pos:>2}: KL={kl:.4}  argmax {}  ours_top5={:?}  exp={e_arg}",
+                    if g_arg == e_arg {
+                        "OK".to_string()
+                    } else {
+                        format!("got={g_arg}")
+                    },
+                    our_top5,
+                );
+            }
+        }
+    }
+
+    let mean_abs = sum_abs / count.max(1) as f64;
+    let mean_kl = sum_kl_dump_ours / (n_logit_rows as f64);
+    let top1_pct = argmax_match as f64 / n_logit_rows as f64;
+    let dump_top1_in_ours_top5_pct = top5_dump_argmax_in_ours as f64 / n_logit_rows as f64;
+    let mean_top5_overlap = top5_set_overlap_sum as f64 / (n_logit_rows as f64 * 5.0);
+    eprintln!(
+        "HET FINAL: top1={argmax_match}/{n_logit_rows} ({:.1}%)  dump_top1_in_ours_top5={top5_dump_argmax_in_ours}/{n_logit_rows} ({:.1}%)  mean_top5_set_overlap={:.2}",
+        top1_pct * 100.0,
+        dump_top1_in_ours_top5_pct * 100.0,
+        mean_top5_overlap,
+    );
+    eprintln!(
+        "          mean_KL(dump||ours)={:.4} nats  max_KL={:.4} nats  max_abs_logit={:.3e}  mean_abs={:.3e}",
+        mean_kl, max_kl_dump_ours, max_abs, mean_abs
+    );
+    let kl_ok = mean_kl < 0.2;
+    let inclusion_ok = dump_top1_in_ours_top5_pct >= 0.90;
+    eprintln!(
+        "HET GATE: mean_KL<0.2 {} | dump_top1∈ours_top5≥90% {}",
+        if kl_ok { "PASS" } else { "FAIL" },
+        if inclusion_ok { "PASS" } else { "FAIL" },
+    );
+    assert!(kl_ok, "het mean KL {mean_kl:.4} >= 0.2 — regression");
+    assert!(
+        inclusion_ok,
+        "het dump_top1 only in ours_top5 for {:.1}% of rows (<90%)",
+        dump_top1_in_ours_top5_pct * 100.0
+    );
+    Ok(())
 }
