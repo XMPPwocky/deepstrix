@@ -14,6 +14,7 @@
 pub mod attention;
 pub mod compressor;
 pub mod f16;
+pub mod indexer;
 pub mod oracle;
 pub mod q8_0;
 pub mod rms_norm;
@@ -25,6 +26,7 @@ pub use compressor::{
     CompressorPool, CompressorStateShuffleR4, CompressorStateWrite, Fp8E4m3fnQuantize,
 };
 pub use f16::F16Matvec;
+pub use indexer::{IndexerScore, INDEXER_HEAD_DIM, INDEXER_N_HEAD, INDEXER_TOP_K};
 pub use oracle::{ActivationDump, Dtype, TensorEntry};
 pub use q8_0::{Q8_0GroupedMatvec, Q8_0Matvec};
 pub use rms_norm::{RmsNorm, RmsNormNoWeight};
