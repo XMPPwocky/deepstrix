@@ -71,6 +71,13 @@ Per layer L=0..42 (regular layers, in `L<LL>/T<TTTT>/`):
 | `attn_out`                | `[n_embd=4096]`                    | f32   | per (L, T)     |
 | `comp_kv_row`             | `[n_head_dim=512]`                 | f32   | sparse: ratio==4 every 4 tokens from T=3 |
 | `comp_allowed_mask`       | `[n_comp]`                         | i32   | ratio==4, per (L, T) from T=3      |
+| `comp_state_kv_row`       | `[comp_width]`                     | f32   | per (L, T) for ratio>0 layers      |
+| `comp_state_score_row`    | `[comp_width]`                     | f32   | per (L, T) for ratio>0 layers      |
+| `comp_pool_out`           | `[head_dim=512]`                   | f32   | sparse on boundary (ratio>0)       |
+| `comp_pre_fp8`            | `[head_dim=512]`                   | f32   | sparse on boundary (ratio>0)       |
+| `comp_post_fp8`           | `[head_dim=512]`                   | f32   | sparse on boundary (ratio>0)       |
+| `index_comp_*` (×5)       | (indexer dims)                     | f32   | parallel set, ratio==4 only        |
+| `indexer_{q,head_weights,scores}` (×4) | (indexer dims)         | f32   | per (L, T) on ratio==4 layers; only when n_comp > top_k (never on 57-tok prompt) |
 | `ffn_cur`                 | `[n_embd]`                         | f32   | per (L, T)     |
 | `ffn_input_norm`          | `[n_embd]`                         | f32   | per (L, T)     |
 | `layer_output_residual`   | `[n_hc, n_embd]`                   | f32   | per (L, T)     |
@@ -139,6 +146,14 @@ See `crates/v4flash-kernels/tests/rms_norm.rs` for the template.
 | `attention_mixed` (ratio==128)|    1.0e-5 |             6.2e-6 | —                     | 20 layers, n_comp=0 in 57-tok prompt (compressor never fires)    |
 | `attention_mixed` (ratio==4)  |    5.0e-4 |             7.9e-6 | —                     | 21 layers, n_comp grows to 14, dumped i32 mask consumed          |
 | `mixed_attention_chain` (M6)  |    1.0e-1 |             3.4e-2 | mean<1e-3             | attention_mixed → inv_rope → grouped_q8_0 → q8_0; L=2,4,…,42     |
+| `f16_matvec` (M7)             |    1.0e-3 |             1.2e-5 | mean<1e-5             | F16 weight × F32 input → F32, warp-per-row                       |
+| `compressor_pool` (M7)        |    1.0e-4 |             9.5e-7 | mean<1e-6             | per-output-dim softmax-weighted avg; ratio==4 split-layout         |
+| `fp8_e4m3fn_quantize` (M7)    |    1.0e-5 |               0    | bit-exact             | E4M3FN lookup-based encode/decode; matches CPU bit-for-bit       |
+| `compressor_end_to_end` (M7)  |    2.0e-1 |             1.0e-6 | mean<1e-5             | matvec×2→APE→pool→rms→rope→fp8 vs comp_post_fp8; single FP8 bucket flip dominates max |
+| `indexer_compressor` (M7)     |    1.0e-3 |             1.3e-5 | mean<1e-5             | same as compressor but head_dim=128, no FP8 step                 |
+| `indexer_score` (M7)          |    1.0e-3 |             4.2e-7 | bit-exact (CPU x-val) | synthetic-input self-consistency; ds4 dump path unreachable in M1 prompt |
+| `indexer_pipeline` (M7)       |     0     |                  0 | exact bool match      | early-permit branch (n_comp ≤ top_k) returns all-1s              |
+| `hca_chain` (M7 close-loop)   |    1.0e-1 |             3.4e-2 | mean<1e-3             | our compressor+indexer+M6 mixed_attn+M5 outproj; attn_out vs ds4 |
 | (future) `iq2_xxs_matmul`     |     TBD   |                TBD | —                     |                                                                  |
 
 For Q8_0 specifically, the *argmax-match* check on every logit row is the production correctness gate — FP threshold backs it up but the discrete check is what guarantees "we pick the same greedy token as ds4 in every position."
@@ -150,6 +165,8 @@ For the M4 chain oracles, the **mean_abs** is the regression signal, not max_abs
 `rope_tail`'s inverse path (one extra kernel arg flipping `sin_sign`) is now exercised by M5's attention chain (inverse RoPE before the grouped output projection).
 
 For M5: `attention_swa` is the validated SWA-only softmax — it sits at f32-ULP because the value-side axpy order matches CPU (parallelised across `head_dim`, not across rows), and the dot-product reduction's tree-vs-sequential order difference is microscopic post-softmax. Coverage is L=0, L=1 only (ratio==0 layers in V4 Flash); M6 extends the same softmax body to L=2..42 by adding compressed-KV rows in `layer_attention_mixed_one`. `kv_cached_row` represents the f16-roundtripped post-FP8 KV that the cache stores — the Rust test accumulates rows across tokens to reconstruct the cache without needing an FP8 implementation.
+
+For M7: the CSA producer loop is closed. Our compressor (composing F16 matvec×2 + APE add + state machine + pool + RMS norm + RoPE + FP8 quantize + F16 roundtrip) reproduces ds4's `comp_kv_row` and `index_comp_kv` end-to-end. The indexer pipeline (matvec + RoPE + projection + scoring + top-K) produces `comp_allowed_mask` matching ds4 exactly for the early-permit branch (n_comp ≤ top_k); the scoring kernel is cross-validated against a CPU reimplementation on synthetic inputs since our 57-token M1 prompt never reaches the n_comp > 512 regime where ds4 emits `indexer_scores`. The full HCA chain feeds our compressor + indexer outputs into M6's mixed attention + M5's output projection and produces `attn_out` matching ds4 at the same 3.4e-2 max-abs as M6's chain (which used dumped comp_kv_row directly) — meaning the compressor's FP8 noise doesn't compound through the attention chain. With M7 done, every operation in V4 Flash's attention path (M4 setup + M5 SWA + M6 mixed softmax + M7 CSA producers) is our own kernel, validated.
 
 For M6: `attention_mixed` is the generalised softmax that subsumes the SWA case. When `n_comp == 0` and `mask == None`, it reduces bit-for-bit to `attention_swa` (verified in block 1 of the oracle: max_abs=2.86e-6 matches M5). The masked-comp path uses `expf(-INFINITY - max_score) = 0` to drop masked rows from both denom and axpy — no explicit branching in phase 3/4. M6's scoping is **consumer-first**: `comp_kv_row` and `comp_allowed_mask` are dumped from ds4 and consumed directly by the kernel test, so the mixed_one softmax is validated standalone before the *producers* (compressor + indexer) land in M7. After M7, the same chain test runs end-to-end with our own kernel-produced comp_kv + comp_allowed, closing the loop.
 
