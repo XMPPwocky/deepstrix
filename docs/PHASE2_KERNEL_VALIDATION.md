@@ -154,6 +154,8 @@ See `crates/v4flash-kernels/tests/rms_norm.rs` for the template.
 | `indexer_score` (M7)          |    1.0e-3 |             4.2e-7 | bit-exact (CPU x-val) | synthetic-input self-consistency; ds4 dump path unreachable in M1 prompt |
 | `indexer_pipeline` (M7)       |     0     |                  0 | exact bool match      | early-permit branch (n_comp ≤ top_k) returns all-1s              |
 | `hca_chain` (M7 close-loop)   |    1.0e-1 |             3.4e-2 | mean<1e-3             | our compressor+indexer+M6 mixed_attn+M5 outproj; attn_out vs ds4 |
+| `router_hash_gate` (M8)       |    5.0e-5 |             5.8e-7 | exact selection       | L=0,1,2 hash-gate; tid2eid lookup + softplus-sqrt + normalise   |
+| `router_learned` (M8)         |    5.0e-5 |             1.1e-5 | exact selection       | L=3..42 learned router; matvec + softplus + sqrt + topk + normalise |
 | (future) `iq2_xxs_matmul`     |     TBD   |                TBD | —                     |                                                                  |
 
 For Q8_0 specifically, the *argmax-match* check on every logit row is the production correctness gate — FP threshold backs it up but the discrete check is what guarantees "we pick the same greedy token as ds4 in every position."
