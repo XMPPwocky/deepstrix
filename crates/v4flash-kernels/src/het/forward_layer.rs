@@ -811,18 +811,23 @@ impl HeterogeneousEngine {
             )?;
         }
         let mid_blocks_bytes = (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
+        // M14k.4: batched q8k_mid — the kernel is already block-parallel
+        // (one workgroup per Q8_K super-block), so quantizing all
+        // N_EXPERT_USED slots in one launch just means passing the whole
+        // d_mid_cat as input and asking for N_EXPERT_USED * BLOCKS_Q8K_DOWN_IN
+        // blocks of output. Layout matches because d_mid_cat /
+        // d_midq_cat are both packed slot-major and the per-slot stride
+        // matches the kernel's per-block stride.
+        {
+            let _t = ie.events.stage("k.moe.q8k_mid_batch", &ie.compute)?;
+            ie.q8k.launch(
+                &ie.compute,
+                &mut igpu_scratch.d_midq_cat,
+                &igpu_scratch.d_mid_cat,
+                BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32),
+            )?;
+        }
         for slot in 0..N_EXPERT_USED {
-            {
-                let _t = ie.events.stage("k.moe.q8k_mid", &ie.compute)?;
-                ie.q8k.launch_with_offsets(
-                    &ie.compute,
-                    &mut igpu_scratch.d_midq_cat,
-                    slot * mid_blocks_bytes,
-                    &igpu_scratch.d_mid_cat,
-                    slot * (N_FF_EXP as usize),
-                    BLOCKS_Q8K_DOWN_IN,
-                )?;
-            }
             let e = selected[slot] as usize;
             let _t = ie.events.stage("k.moe.q2k_down", &ie.compute)?;
             ie.q2k.launch_with_full_offsets(
