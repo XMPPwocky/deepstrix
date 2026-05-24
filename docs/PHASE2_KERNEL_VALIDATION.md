@@ -69,6 +69,8 @@ Per layer L=0..42 (regular layers, in `L<LL>/T<TTTT>/`):
 | `attn_heads_inv_rope`     | `[32768]`                          | f32   | per (L, T)     |
 | `attn_out_low`            | `[n_groups*rank=8192]`             | f32   | per (L, T)     |
 | `attn_out`                | `[n_embd=4096]`                    | f32   | per (L, T)     |
+| `comp_kv_row`             | `[n_head_dim=512]`                 | f32   | sparse: ratio==4 every 4 tokens from T=3 |
+| `comp_allowed_mask`       | `[n_comp]`                         | i32   | ratio==4, per (L, T) from T=3      |
 | `ffn_cur`                 | `[n_embd]`                         | f32   | per (L, T)     |
 | `ffn_input_norm`          | `[n_embd]`                         | f32   | per (L, T)     |
 | `layer_output_residual`   | `[n_hc, n_embd]`                   | f32   | per (L, T)     |
@@ -133,6 +135,10 @@ See `crates/v4flash-kernels/tests/rms_norm.rs` for the template.
 | `attention_swa`               |    1.0e-3 |             2.9e-6 | —                     | sink-aware softmax + axpy; L=0,1 only (pure SWA); f32-ULP floor  |
 | `q8_0_grouped_matvec`         |    2.0e-2 |             1.2e-2 | mean<1e-4             | attn_output_a; n_groups=8 × group_dim=4096 → 8 × rank=1024       |
 | `swa_attention_chain` (M5)    |    1.0e-1 |             2.2e-2 | mean<1e-3             | attention_swa → inv_rope → grouped_q8_0 → q8_0; L=0,1 only       |
+| `attention_mixed` (L=0,1)     |    1.0e-5 |             2.9e-6 | —                     | regression vs attention_swa; n_comp=0, mask=None                 |
+| `attention_mixed` (ratio==128)|    1.0e-5 |             6.2e-6 | —                     | 20 layers, n_comp=0 in 57-tok prompt (compressor never fires)    |
+| `attention_mixed` (ratio==4)  |    5.0e-4 |             7.9e-6 | —                     | 21 layers, n_comp grows to 14, dumped i32 mask consumed          |
+| `mixed_attention_chain` (M6)  |    1.0e-1 |             3.4e-2 | mean<1e-3             | attention_mixed → inv_rope → grouped_q8_0 → q8_0; L=2,4,…,42     |
 | (future) `iq2_xxs_matmul`     |     TBD   |                TBD | —                     |                                                                  |
 
 For Q8_0 specifically, the *argmax-match* check on every logit row is the production correctness gate — FP threshold backs it up but the discrete check is what guarantees "we pick the same greedy token as ds4 in every position."
@@ -144,6 +150,8 @@ For the M4 chain oracles, the **mean_abs** is the regression signal, not max_abs
 `rope_tail`'s inverse path (one extra kernel arg flipping `sin_sign`) is now exercised by M5's attention chain (inverse RoPE before the grouped output projection).
 
 For M5: `attention_swa` is the validated SWA-only softmax — it sits at f32-ULP because the value-side axpy order matches CPU (parallelised across `head_dim`, not across rows), and the dot-product reduction's tree-vs-sequential order difference is microscopic post-softmax. Coverage is L=0, L=1 only (ratio==0 layers in V4 Flash); M6 extends the same softmax body to L=2..42 by adding compressed-KV rows in `layer_attention_mixed_one`. `kv_cached_row` represents the f16-roundtripped post-FP8 KV that the cache stores — the Rust test accumulates rows across tokens to reconstruct the cache without needing an FP8 implementation.
+
+For M6: `attention_mixed` is the generalised softmax that subsumes the SWA case. When `n_comp == 0` and `mask == None`, it reduces bit-for-bit to `attention_swa` (verified in block 1 of the oracle: max_abs=2.86e-6 matches M5). The masked-comp path uses `expf(-INFINITY - max_score) = 0` to drop masked rows from both denom and axpy — no explicit branching in phase 3/4. M6's scoping is **consumer-first**: `comp_kv_row` and `comp_allowed_mask` are dumped from ds4 and consumed directly by the kernel test, so the mixed_one softmax is validated standalone before the *producers* (compressor + indexer) land in M7. After M7, the same chain test runs end-to-end with our own kernel-produced comp_kv + comp_allowed, closing the loop.
 
 Rationale per threshold should land in each kernel's test docstring.
 
