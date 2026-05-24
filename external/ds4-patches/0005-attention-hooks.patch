@@ -1,0 +1,53 @@
+diff --git a/ds4.c b/ds4.c
+--- a/ds4.c
++++ b/ds4.c
+@@ -5035,6 +5035,9 @@
+     memset(scratch->attn_low, 0, (size_t)n_groups * rank * sizeof(scratch->attn_low[0]));
+     matvec_q8_0_grouped_rows_decode_scratch(scratch->attn_low, model, layer->attn_output_a,
+                                             heads, n_groups, group_dim, rank, scratch);
++    /* deepstrix dump (M5): grouped Q8_0 intermediate before attn_output_b. */
++    ds4_dump_emit_1d("attn_out_low", scratch->attn_low, DS4_DUMP_DTYPE_F32,
++                     (int64_t)((uint64_t)n_groups * rank));
+     matvec_q8_0_decode_scratch(out, model, layer->attn_output_b, scratch->attn_low, scratch);
+ }
+ 
+@@ -7607,6 +7610,18 @@
+     kv_cache_push_raw(cache, scratch->kv);
+     if (profile) t_rope_cache = now_sec() - t0;
+ 
++    /* deepstrix dump (M5): the last pushed cache row — f16-roundtripped
++     * post-FP8 value that attention will consume on this and future tokens.
++     * Test code accumulates these across T to reconstruct the cache. */
++    ds4_dump_emit_1d("kv_cached_row",
++                     cache->raw_kv + (uint64_t)(cache->n_raw - 1) * DS4_N_HEAD_DIM,
++                     DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_HEAD_DIM);
++    if (pos == 0) {
++        ds4_dump_emit_1d("weight:attn_sinks",
++                         tensor_data(model, layer->attn_sinks),
++                         DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_HEAD);
++    }
++
+     if (ratio != 0) {
+         t0 = profile ? now_sec() : 0.0;
+         if (compressor_decode_one_decode_scratch(scratch->comp, model,
+@@ -7670,12 +7685,20 @@
+         layer_attention_rows_one(scratch->heads, model, layer, scratch->q, cache->raw_kv, cache->n_raw);
+     }
+     if (profile) t_attn_rows = now_sec() - t0;
++    /* deepstrix dump (M5): per-head attention output, pre-inverse-RoPE. Fires
++     * for all layers; M5 oracle gates to L0/L1 (pure SWA), M6/M7 extend. */
++    ds4_dump_emit_1d("attn_heads", scratch->heads, DS4_DUMP_DTYPE_F32,
++                     (int64_t)((uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM));
+ 
+     t0 = profile ? now_sec() : 0.0;
+     rope_tail_layer_inplace(scratch->heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, true);
+     if (profile) t_inv_rope = now_sec() - t0;
++    ds4_dump_emit_1d("attn_heads_inv_rope", scratch->heads, DS4_DUMP_DTYPE_F32,
++                     (int64_t)((uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM));
++
+     t0 = profile ? now_sec() : 0.0;
+     layer_grouped_out_one_decode_scratch(scratch->attn_out, model, layer, scratch->heads, scratch);
++    ds4_dump_emit_1d("attn_out", scratch->attn_out, DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_EMBD);
+     cpu_directional_steering_project_rows(scratch->attn_out, steering_dirs, il, 1, steering_attn_scale);
+     if (profile) t_out = now_sec() - t0;
+     t0 = profile ? now_sec() : 0.0;
