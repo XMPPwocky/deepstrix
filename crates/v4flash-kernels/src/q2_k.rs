@@ -10,6 +10,10 @@ use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
 
 const Q2_K_ACC_GFX1201: &[u8] = include_bytes!(env!("KERNEL_Q2_K_ACCUMULATE_MATVEC_GFX1201"));
 const Q2_K_ACC_GFX1151: &[u8] = include_bytes!(env!("KERNEL_Q2_K_ACCUMULATE_MATVEC_GFX1151"));
+const Q2_K_ACC_PAR_GFX1201: &[u8] =
+    include_bytes!(env!("KERNEL_Q2_K_ACCUMULATE_MATVEC_PAR_GFX1201"));
+const Q2_K_ACC_PAR_GFX1151: &[u8] =
+    include_bytes!(env!("KERNEL_Q2_K_ACCUMULATE_MATVEC_PAR_GFX1151"));
 
 pub const BLOCK_Q2_K_BYTES: usize = 84;
 
@@ -18,7 +22,22 @@ pub struct Q2KAccumulateMatvec {
 }
 
 impl Q2KAccumulateMatvec {
+    /// M14g parallel variant by default — 4 lanes per super-block, all 32
+    /// warp lanes active (vs 8 in the serial kernel for n_blocks_in=8).
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            Q2_K_ACC_PAR_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            Q2_K_ACC_PAR_GFX1151
+        } else {
+            return Err(eyre!("unsupported arch for q2_k_accumulate_matvec: {arch}"));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    /// Original serial kernel — kept for regression testing.
+    pub fn for_arch_serial(arch: &str) -> eyre::Result<Self> {
         let image: &[u8] = if arch.starts_with("gfx1201") {
             Q2_K_ACC_GFX1201
         } else if arch.starts_with("gfx1151") {
@@ -114,7 +133,10 @@ impl Q2KAccumulateMatvec {
             ));
         }
 
-        let function = self.module.get_function("q2_k_accumulate_matvec")?;
+        let function = self
+            .module
+            .get_function("q2_k_accumulate_matvec_par")
+            .or_else(|_| self.module.get_function("q2_k_accumulate_matvec"))?;
         let mut out_ptr = out.raw();
         // SAFETY: bounds-checked above.
         let mut w_ptr = unsafe { (w_expert.raw() as *mut u8).add(w_expert_offset) }
