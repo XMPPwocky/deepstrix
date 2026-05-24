@@ -70,6 +70,20 @@ impl MappedGguf {
         self.file
             .read_exact_at(dst, t.abs_offset)
             .wrap_err_with(|| format!("pread {} bytes at offset {} for {}", n, t.abs_offset, t.name))?;
+        // Immediately release the page cache for the range we just
+        // copied into the host buffer — we're about to memcpy it to a
+        // DeviceBuffer and never read it again, so leaving 86 GiB of
+        // dead weight bytes in the page cache costs kswapd cycles for
+        // the rest of the process lifetime.
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::posix_fadvise(
+                self.file.as_raw_fd(),
+                t.abs_offset as i64,
+                n as i64,
+                libc::POSIX_FADV_DONTNEED,
+            );
+        }
         Ok(())
     }
 
@@ -113,6 +127,32 @@ impl MappedGguf {
         self.mmap
             .advise(memmap2::Advice::Random)
             .wrap_err("madvise RANDOM")?;
+        Ok(())
+    }
+
+    /// Tell the kernel it can drop the file's page cache. After bulk
+    /// weight loading (when the data is now resident on a GPU as a
+    /// DeviceBuffer) the OS page cache still holds tens-of-GiB of
+    /// weight bytes we'll never read again — leaving kswapd to
+    /// constantly scan them under any memory pressure. `fadvise(DONTNEED)`
+    /// on the whole file releases those pages immediately and stops the
+    /// kswapd churn that shows up as slow-tail tokens in benchmarks.
+    pub fn drop_page_cache(&self) -> eyre::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe {
+            libc::posix_fadvise(
+                self.file.as_raw_fd(),
+                0,
+                0,
+                libc::POSIX_FADV_DONTNEED,
+            )
+        };
+        if rc != 0 {
+            return Err(eyre!(
+                "posix_fadvise(DONTNEED) on {} failed: errno {rc}",
+                self.path.display()
+            ));
+        }
         Ok(())
     }
 }
