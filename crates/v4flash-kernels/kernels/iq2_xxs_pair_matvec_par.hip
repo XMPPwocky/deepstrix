@@ -245,6 +245,72 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu(
     }
 }
 
+// LDS-cached helpers (M14k). Same algorithms as the _par helpers above,
+// but read `ksigns_iq2xs` and `iq2xxs_grid` from shared memory instead
+// of __constant__. The batched kernel cooperatively loads both tables
+// (128 B + 2048 B = 2176 B of LDS) into shared memory once per
+// workgroup, so the inner dequant loop's hundreds of lookups per row
+// avoid constant-cache divergent-access tax.
+
+__device__ __forceinline__ int32_t iq2_dp4a_8_lds(
+        uint64_t grid_val, uint32_t sign_idx,
+        const uint8_t* __restrict__ s_ksigns,
+        const int8_t* q8, int32_t acc) {
+    const uint32_t s = s_ksigns[sign_idx];
+    const uint32_t signs = s * 0x01010101u;
+    const uint32_t sm0 = expand_signs_par(signs, 0x08040201u);
+    const uint32_t sm1 = expand_signs_par(signs, 0x80402010u);
+    const int32_t g0 = cond_neg_bytes_par((int32_t)(uint32_t)grid_val, sm0);
+    const int32_t g1 = cond_neg_bytes_par((int32_t)(uint32_t)(grid_val >> 32), sm1);
+    acc = sudot4_par(g0, load_i32_unaligned_par(q8 + 0), acc);
+    acc = sudot4_par(g1, load_i32_unaligned_par(q8 + 4), acc);
+    return acc;
+}
+
+__device__ __forceinline__ int32_t dot_iq2_pair_16_lds(
+        uint8_t g0_idx, uint32_t s0_idx,
+        uint8_t g1_idx, uint32_t s1_idx,
+        const uint8_t* __restrict__ s_ksigns,
+        const uint64_t* __restrict__ s_grid,
+        const int8_t* q8) {
+    int32_t sum = 0;
+    sum = iq2_dp4a_8_lds(s_grid[g0_idx], s0_idx, s_ksigns, q8 + 0, sum);
+    sum = iq2_dp4a_8_lds(s_grid[g1_idx], s1_idx, s_ksigns, q8 + 8, sum);
+    return sum;
+}
+
+__device__ __forceinline__ float dot_block_half_lds(
+        const uint8_t* w_blk, const uint8_t* y_blk, unsigned int ib32_lo,
+        const uint8_t* __restrict__ s_ksigns,
+        const uint64_t* __restrict__ s_grid) {
+    const uint16_t wd = *(const uint16_t*)(w_blk + 0);
+    const uint16_t* q2 = (const uint16_t*)(w_blk + 2) + (size_t)ib32_lo * 4u;
+    const float yd = *(const float*)(y_blk + 0);
+    const int8_t* q8 = (const int8_t*)(y_blk + 4) + (size_t)ib32_lo * 32u;
+    const float d = f16_to_f32_par(wd) * yd;
+
+    int32_t bsum = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        q2 += 4;
+        const uint32_t ls = 2u * (aux1 >> 28) + 1u;
+        int32_t sumi = 0;
+        sumi += dot_iq2_pair_16_lds(
+            (uint8_t)(aux0 & 0xffu),         (aux1 >>  0) & 127u,
+            (uint8_t)((aux0 >>  8) & 0xffu), (aux1 >>  7) & 127u,
+            s_ksigns, s_grid, q8 + 0);
+        sumi += dot_iq2_pair_16_lds(
+            (uint8_t)((aux0 >> 16) & 0xffu), (aux1 >> 14) & 127u,
+            (uint8_t)((aux0 >> 24) & 0xffu), (aux1 >> 21) & 127u,
+            s_ksigns, s_grid, q8 + 16);
+        bsum += sumi * (int32_t)ls;
+        q8 += 32;
+    }
+    return 0.125f * d * (float)bsum;
+}
+
 // Batched variant (M14j): single launch handles all N_EXPERT_USED slots.
 // grid.y = slot; selected[slot] picks the expert index; gate_bpe/up_bpe
 // give per-expert weight byte stride. Eliminates 5 launches + 5
@@ -262,9 +328,19 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_batch(
         float           clamp,
         unsigned int    n_rows,
         unsigned int    n_blocks) {
+    // M14k: cache iq2 tables (128 B ksigns + 2 KiB grid) in LDS so the
+    // inner dequant loop's hundreds of lookups per row avoid the
+    // constant-cache penalty for divergent indices.
+    __shared__ uint8_t  s_ksigns[128];
+    __shared__ uint64_t s_grid[256];
+    const unsigned int tid = threadIdx.x;
+    if (tid < 128) s_ksigns[tid] = ksigns_iq2xs[tid];
+    if (tid < 256) s_grid[tid]   = iq2xxs_grid[tid];
+    __syncthreads();
+
     const unsigned int slot = blockIdx.y;
-    const unsigned int row_in_block = threadIdx.x / 32u;
-    const unsigned int lane         = threadIdx.x & 31u;
+    const unsigned int row_in_block = tid / 32u;
+    const unsigned int lane         = tid & 31u;
     const unsigned int row          = blockIdx.x * 8u + row_in_block;
     if (row >= n_rows) return;
 
@@ -287,8 +363,8 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_batch(
         const uint8_t* w_g = gate_row_base + (uint64_t)b * BLOCK_IQ2_XXS_BYTES;
         const uint8_t* w_u = up_row_base   + (uint64_t)b * BLOCK_IQ2_XXS_BYTES;
         const uint8_t* y   = xq            + (uint64_t)b * BLOCK_Q8_K_BYTES;
-        g_sum += dot_block_half(w_g, y, ib32_lo);
-        u_sum += dot_block_half(w_u, y, ib32_lo);
+        g_sum += dot_block_half_lds(w_g, y, ib32_lo, s_ksigns, s_grid);
+        u_sum += dot_block_half_lds(w_u, y, ib32_lo, s_ksigns, s_grid);
     }
 
     g_sum = warp_sum_f32_par(g_sum);
