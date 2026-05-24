@@ -20,6 +20,11 @@ use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
 const Q8_0_MATVEC_GFX1201: &[u8] = include_bytes!(env!("KERNEL_Q8_0_MATVEC_GFX1201"));
 const Q8_0_MATVEC_GFX1151: &[u8] = include_bytes!(env!("KERNEL_Q8_0_MATVEC_GFX1151"));
 
+const Q8_0_GROUPED_MATVEC_GFX1201: &[u8] =
+    include_bytes!(env!("KERNEL_Q8_0_GROUPED_MATVEC_GFX1201"));
+const Q8_0_GROUPED_MATVEC_GFX1151: &[u8] =
+    include_bytes!(env!("KERNEL_Q8_0_GROUPED_MATVEC_GFX1151"));
+
 /// Q8_0 packs 32 int8 quants per 2-byte f16 scale → 34 bytes per block,
 /// identical layout to ds4 / llama.cpp.
 pub const Q8_0_BLOCK_ELEMS: u32 = 32;
@@ -154,6 +159,115 @@ impl Q8_0Matvec {
 
         let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
         let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES; // 8 × 32 = 256
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+}
+
+/// Grouped Q8_0 GEMV — each output row `idx` in `[0, n_groups*rank)` reads
+/// input from group `g = idx/rank`'s 4096-element slice. Mirrors ds4's
+/// `matvec_q8_0_grouped_rows_decode_scratch` (ds4.c:3618). Used by V4 Flash
+/// for the attention output's first-stage projection (`attn_output_a`,
+/// `[n_groups*rank=8192, group_dim=4096]` Q8_0).
+///
+/// Input quantisation: the flat `n_groups*group_dim` f32 input can be
+/// quantised with the regular `Q8_0Matvec::quantize_input` (block boundaries
+/// align with group boundaries because `group_dim % 32 == 0`), producing
+/// a flat `[n_groups*group_dim]` int8 buffer and `[n_groups*blocks_per_group]`
+/// scales — bit-identical to ds4's per-group quantisation loop.
+#[allow(non_camel_case_types)]
+pub struct Q8_0GroupedMatvec {
+    module: Module,
+}
+
+impl Q8_0GroupedMatvec {
+    pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            Q8_0_GROUPED_MATVEC_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            Q8_0_GROUPED_MATVEC_GFX1151
+        } else {
+            return Err(eyre!("unsupported arch for q8_0_grouped matvec: {arch}"));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    /// `out[idx] = sum_b f16(scale_w[idx,b]) * xscale[g,b] * dot_i8x32(qs_w[idx,b], xq[g,b])`
+    /// for `idx` in `0..n_groups*rank`, where `g = idx/rank`.
+    pub fn matvec_grouped(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        group_dim: u32,
+        rank: u32,
+        n_groups: u32,
+    ) -> eyre::Result<()> {
+        if group_dim % Q8_0_BLOCK_ELEMS != 0 {
+            return Err(eyre!(
+                "q8_0 grouped matvec: group_dim={group_dim} not a multiple of 32"
+            ));
+        }
+        let blocks_per_group = group_dim / Q8_0_BLOCK_ELEMS;
+        let out_dim = n_groups * rank;
+        let expected_weight_bytes =
+            (out_dim as usize) * (blocks_per_group as usize) * (Q8_0_BLOCK_BYTES as usize);
+        if weight.byte_len() != expected_weight_bytes {
+            return Err(eyre!(
+                "q8_0 grouped matvec weight bytes: have {}, expected {} (out_dim={out_dim}, group_dim={group_dim})",
+                weight.byte_len(),
+                expected_weight_bytes
+            ));
+        }
+        let in_total = (n_groups as usize) * (group_dim as usize);
+        let scales_total = (n_groups as usize) * (blocks_per_group as usize);
+        if out.len() < out_dim as usize {
+            return Err(eyre!(
+                "q8_0 grouped matvec out len: have {}, expected {}",
+                out.len(),
+                out_dim
+            ));
+        }
+        if xq.len() < in_total || xscale.len() < scales_total {
+            return Err(eyre!(
+                "q8_0 grouped matvec xq/xscale len: xq={}, xscale={}, expected xq={}, xscale={}",
+                xq.len(),
+                xscale.len(),
+                in_total,
+                scales_total
+            ));
+        }
+
+        let function = self.module.get_function("q8_0_grouped_gemv")?;
+
+        let mut out_ptr = out.raw();
+        let mut w_ptr = weight.raw();
+        let mut xq_ptr = xq.raw();
+        let mut xs_ptr = xscale.raw();
+        let mut group_dim_v = group_dim;
+        let mut rank_v = rank;
+        let mut blocks_per_group_v = blocks_per_group;
+        let mut n_groups_v = n_groups;
+        let mut args: [*mut c_void; 8] = [
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut w_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut xs_ptr as *mut _ as *mut c_void,
+            &mut group_dim_v as *mut _ as *mut c_void,
+            &mut rank_v as *mut _ as *mut c_void,
+            &mut blocks_per_group_v as *mut _ as *mut c_void,
+            &mut n_groups_v as *mut _ as *mut c_void,
+        ];
+
+        let grid_x = out_dim.div_ceil(GEMV_ROWS_PER_BLOCK);
+        let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
         let cfg = LaunchConfig {
             grid: (grid_x, 1, 1),
             block: (block_x, 1, 1),

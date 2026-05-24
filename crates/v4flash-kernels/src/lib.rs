@@ -20,7 +20,7 @@ pub mod weights;
 
 pub use attention::{AttentionSwa, ATTN_SWA_MAX_KV};
 pub use oracle::{ActivationDump, Dtype, TensorEntry};
-pub use q8_0::Q8_0Matvec;
+pub use q8_0::{Q8_0GroupedMatvec, Q8_0Matvec};
 pub use rms_norm::{RmsNorm, RmsNormNoWeight};
 pub use rope::{RopeParams, RopeTail};
 pub use weights::{load_to_device, DeviceWeight};
