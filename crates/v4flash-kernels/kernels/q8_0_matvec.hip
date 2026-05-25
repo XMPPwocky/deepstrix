@@ -23,11 +23,13 @@ __device__ __forceinline__ int32_t load_i8x4_aligned(const int8_t* p) {
 }
 
 __device__ __forceinline__ int32_t load_i8x4_unaligned(const int8_t* p) {
-    const uint8_t* u = (const uint8_t*)p;
-    return (int32_t)((uint32_t)u[0] |
-                     ((uint32_t)u[1] << 8) |
-                     ((uint32_t)u[2] << 16) |
-                     ((uint32_t)u[3] << 24));
+    // M18: let the compiler emit the right instruction for the target.
+    // RDNA3/4 hardware supports misaligned dword loads; the prior
+    // byte-by-byte assembly defeated load coalescing and locked us to
+    // ~60% of dGPU memory peak on output_proj.
+    int32_t v;
+    __builtin_memcpy(&v, p, 4);
+    return v;
 }
 
 // AMD-specific 4-byte int8 SIMD dot-product. RDNA 3.5 + RDNA 4 both
@@ -38,14 +40,24 @@ __device__ __forceinline__ int32_t dp4a_sudot(int32_t a, int32_t b, int32_t c) {
 }
 
 __device__ __forceinline__ int32_t dot_i8x32(const int8_t* a, const int8_t* b) {
+    // M18: load 32 int8s as 2 uint4s (16 bytes each), then dp4a them 4 at
+    // a time. Both `a` (post-repack quants) and `b` (input quants) are
+    // 4-byte aligned. uint4 loads cut the load instruction count from 8
+    // to 2 per dot product.
     int32_t dot = 0;
-    #pragma unroll
-    for (uint32_t i = 0; i < 32u; i += 4u) {
-        // a (weight quants) may be unaligned by 2 bytes due to the fp16
-        // scale prefix in each Q8_0 block. b (pre-quantized input) is
-        // 4-aligned by construction.
-        dot = dp4a_sudot(load_i8x4_unaligned(a + i), load_i8x4_aligned(b + i), dot);
-    }
+    uint4 av0, av1, bv0, bv1;
+    __builtin_memcpy(&av0, a, 16);
+    __builtin_memcpy(&av1, a + 16, 16);
+    __builtin_memcpy(&bv0, b, 16);
+    __builtin_memcpy(&bv1, b + 16, 16);
+    dot = dp4a_sudot((int32_t)av0.x, (int32_t)bv0.x, dot);
+    dot = dp4a_sudot((int32_t)av0.y, (int32_t)bv0.y, dot);
+    dot = dp4a_sudot((int32_t)av0.z, (int32_t)bv0.z, dot);
+    dot = dp4a_sudot((int32_t)av0.w, (int32_t)bv0.w, dot);
+    dot = dp4a_sudot((int32_t)av1.x, (int32_t)bv1.x, dot);
+    dot = dp4a_sudot((int32_t)av1.y, (int32_t)bv1.y, dot);
+    dot = dp4a_sudot((int32_t)av1.z, (int32_t)bv1.z, dot);
+    dot = dp4a_sudot((int32_t)av1.w, (int32_t)bv1.w, dot);
     return dot;
 }
 
@@ -57,6 +69,12 @@ __device__ __forceinline__ float warp_sum_f32(float v) {
 }
 
 // 8 rows per workgroup, 32 lanes per row.
+//
+// M18 repacked layout: each row is [scales(2*blocks bytes) |
+// quants(32*blocks bytes)] with no interleaving. Quants start at a
+// 4-byte-aligned offset within the row, so dot_i8x32's int8x4 loads
+// hit hardware-aligned dword loads instead of the byte-by-byte
+// unaligned path that capped us at ~60% memory peak.
 extern "C" __global__ void q8_0_gemv_warp8(
     float* __restrict__ out,           // [M]
     const unsigned char* __restrict__ w,  // [M * blocks * 34]
@@ -71,14 +89,15 @@ extern "C" __global__ void q8_0_gemv_warp8(
     if (row >= out_dim) return;
 
     const unsigned char* wr = w + (size_t)row * blocks * 34u;
+    const __half*  scales = (const __half*)wr;
+    const int8_t*  quants = (const int8_t*)(wr + (size_t)blocks * 2u);
     float acc = 0.0f;
 
     for (uint32_t b = lane; b < blocks; b += WARP_LANES) {
-        const __half* scale_h = (const __half*)(wr + (size_t)b * 34u);
-        const int8_t* qs = (const int8_t*)(wr + (size_t)b * 34u + 2u);
-        const int8_t* xqb = xq + (size_t)b * 32u;
+        const int8_t* qs = quants + (size_t)b * 32u;       // 4-byte aligned
+        const int8_t* xqb = xq + (size_t)b * 32u;          // 4-byte aligned
         int32_t dot = dot_i8x32(qs, xqb);
-        acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+        acc += __half2float(scales[b]) * xscale[b] * (float)dot;
     }
 
     acc = warp_sum_f32(acc);

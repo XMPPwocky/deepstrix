@@ -24,11 +24,12 @@ __device__ __forceinline__ int32_t gload_i8x4_aligned(const int8_t* p) {
 }
 
 __device__ __forceinline__ int32_t gload_i8x4_unaligned(const int8_t* p) {
-    const uint8_t* u = (const uint8_t*)p;
-    return (int32_t)((uint32_t)u[0] |
-                     ((uint32_t)u[1] << 8) |
-                     ((uint32_t)u[2] << 16) |
-                     ((uint32_t)u[3] << 24));
+    // M18: memcpy lets the compiler pick the right load instruction
+    // for the target. With the M18 repacked layout the source is
+    // 4-aligned, so this folds to a single dword load.
+    int32_t v;
+    __builtin_memcpy(&v, p, 4);
+    return v;
 }
 
 __device__ __forceinline__ int32_t gdp4a_sudot(int32_t a, int32_t b, int32_t c) {
@@ -36,11 +37,21 @@ __device__ __forceinline__ int32_t gdp4a_sudot(int32_t a, int32_t b, int32_t c) 
 }
 
 __device__ __forceinline__ int32_t gdot_i8x32(const int8_t* a, const int8_t* b) {
+    // M18: 2× uint4 loads per side, 8× dp4a. See q8_0_matvec.hip for rationale.
     int32_t dot = 0;
-    #pragma unroll
-    for (uint32_t i = 0; i < 32u; i += 4u) {
-        dot = gdp4a_sudot(gload_i8x4_unaligned(a + i), gload_i8x4_aligned(b + i), dot);
-    }
+    uint4 av0, av1, bv0, bv1;
+    __builtin_memcpy(&av0, a, 16);
+    __builtin_memcpy(&av1, a + 16, 16);
+    __builtin_memcpy(&bv0, b, 16);
+    __builtin_memcpy(&bv1, b + 16, 16);
+    dot = gdp4a_sudot((int32_t)av0.x, (int32_t)bv0.x, dot);
+    dot = gdp4a_sudot((int32_t)av0.y, (int32_t)bv0.y, dot);
+    dot = gdp4a_sudot((int32_t)av0.z, (int32_t)bv0.z, dot);
+    dot = gdp4a_sudot((int32_t)av0.w, (int32_t)bv0.w, dot);
+    dot = gdp4a_sudot((int32_t)av1.x, (int32_t)bv1.x, dot);
+    dot = gdp4a_sudot((int32_t)av1.y, (int32_t)bv1.y, dot);
+    dot = gdp4a_sudot((int32_t)av1.z, (int32_t)bv1.z, dot);
+    dot = gdp4a_sudot((int32_t)av1.w, (int32_t)bv1.w, dot);
     return dot;
 }
 
@@ -71,13 +82,15 @@ extern "C" __global__ void q8_0_grouped_gemv(
     const int8_t* xq_g = xq + (size_t)g * (size_t)group_dim;
     const float*  xs_g = xscale + (size_t)g * (size_t)blocks_per_group;
 
+    // M18 repacked layout: [scales(2*blocks bytes) | quants(32*blocks bytes)] per row.
+    const __half* scales = (const __half*)wr;
+    const int8_t* quants = (const int8_t*)(wr + (size_t)blocks_per_group * 2u);
     float acc = 0.0f;
     for (uint32_t b = lane; b < blocks_per_group; b += WARP_LANES) {
-        const __half* scale_h = (const __half*)(wr + (size_t)b * 34u);
-        const int8_t* qs = (const int8_t*)(wr + (size_t)b * 34u + 2u);
+        const int8_t* qs = quants + (size_t)b * 32u;     // 4-byte aligned
         const int8_t* xqb = xq_g + (size_t)b * 32u;
         int32_t dot = gdot_i8x32(qs, xqb);
-        acc += __half2float(*scale_h) * xs_g[b] * (float)dot;
+        acc += __half2float(scales[b]) * xs_g[b] * (float)dot;
     }
 
     acc = gwarp_sum_f32(acc);

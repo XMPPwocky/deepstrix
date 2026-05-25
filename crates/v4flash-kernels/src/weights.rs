@@ -58,6 +58,27 @@ pub fn load_to_device(
         .read_tensor(tensor)
         .wrap_err_with(|| format!("pread `{name}`"))?;
 
+    // M18: repack Q8_0 weights from per-block [scale|q×32] interleaving
+    // to per-row [scales | quants] split. Same total size; result is
+    // that quants land 4-byte-aligned (versus offset+=2 mod 4 before),
+    // so the matvec inner loop can issue aligned dword loads.
+    let host = if tensor.dtype == GgufType::Q8_0 {
+        let blocks_per_row = (tensor.dims[0] as usize) / 32;
+        let row_bytes = blocks_per_row * 34;
+        if host.len() % row_bytes != 0 {
+            return Err(eyre!(
+                "{name}: byte_size {} not a multiple of row_bytes {} (blocks_per_row {})",
+                host.len(),
+                row_bytes,
+                blocks_per_row
+            ));
+        }
+        let num_rows = host.len() / row_bytes;
+        repack_q8_0(&host, num_rows, blocks_per_row)
+    } else {
+        host
+    };
+
     let mut buffer: DeviceBuffer<u8> =
         DeviceBuffer::new(device_id, host.len()).wrap_err_with(|| {
             format!(
@@ -77,4 +98,31 @@ pub fn load_to_device(
         dtype: tensor.dtype,
         shape: tensor.dims.clone(),
     })
+}
+
+/// Repack a row-major Q8_0 weight from the GGUF on-disk layout
+///   per row: [s0 q0..31 s1 q0..31 ... sN-1 q0..31]   (34 bytes/block)
+/// to a split layout
+///   per row: [s0 s1 ... sN-1 | q0..31 q0..31 ... q0..31]
+///
+/// Total bytes per row are unchanged (34·N = 2·N + 32·N). The new
+/// layout puts the quants section at an aligned offset within each
+/// row (2·N is 4-aligned for any even N, which all V4-Flash Q8_0
+/// tensors satisfy), so the matvec inner loop can use aligned 4-byte
+/// loads instead of the byte-by-byte unaligned path.
+pub fn repack_q8_0(src: &[u8], num_rows: usize, blocks_per_row: usize) -> Vec<u8> {
+    let row_bytes = blocks_per_row * 34;
+    let mut dst = Vec::with_capacity(src.len());
+    dst.resize(src.len(), 0);
+    for r in 0..num_rows {
+        let src_row = &src[r * row_bytes..(r + 1) * row_bytes];
+        let dst_row = &mut dst[r * row_bytes..(r + 1) * row_bytes];
+        let (dst_scales, dst_quants) = dst_row.split_at_mut(2 * blocks_per_row);
+        for b in 0..blocks_per_row {
+            let blk = &src_row[b * 34..(b + 1) * 34];
+            dst_scales[b * 2..(b + 1) * 2].copy_from_slice(&blk[..2]);
+            dst_quants[b * 32..(b + 1) * 32].copy_from_slice(&blk[2..]);
+        }
+    }
+    dst
 }
