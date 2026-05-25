@@ -19,6 +19,7 @@
 pub mod engine;
 pub mod forward_head;
 pub mod forward_layer;
+pub mod mtp_weights;
 pub mod perfetto;
 pub mod scratch;
 pub mod state;
@@ -27,6 +28,7 @@ pub mod trace;
 pub mod weights;
 
 pub use engine::{DeviceEngine, ExecMode, HeterogeneousEngine};
+pub use mtp_weights::{MtpRoutedExperts, MtpWeights};
 pub use scratch::{DgpuScratch, IgpuScratch};
 pub use state::{HetCompressorState, HetLayerState, HetModelState};
 pub use weights::{
