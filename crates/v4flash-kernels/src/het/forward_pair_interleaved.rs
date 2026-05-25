@@ -966,27 +966,29 @@ impl HeterogeneousEngine {
             }
         }
 
-        // M40-P5: router MOVED to iGPU. After mhc_pre_ffn writes
-        // ffn_input_norm, immediately peer-push it to iGPU and let the iGPU
-        // run its own router + MoE off the dGPU critical path. dGPU then
-        // concurrently runs shared_expert. iGPU MoE no longer waits on dGPU's
-        // shared_expert; only on the (much smaller) ffn_input_norm push.
-
-        // ===== Stages 10 + 12 + 13 reordered + de.xfer dropped =====
-        // M40-P4.7: peer pushes now happen on de.compute (the single dGPU
-        // stream). FIFO ordering handles "wait for router writes" so we
-        // dropped the selected_ready cross-stream event. The cross-device
-        // selected_pushed event stays (iGPU has to wait for the push to
-        // land before MoE).
+        // M40-P5: router MOVED to iGPU. The KEY ordering: peer-push
+        // ffn_input_norm FIRST (right after mhc_pre_ffn), record
+        // selected_pushed, THEN queue shared_expert on compute. iGPU sees
+        // ffn_input_norm right away and starts router + MoE; shared_expert
+        // on dGPU runs in parallel with all the iGPU work.
         //
-        // ORDER FIX: queue shared_expert_pair on compute BEFORE the iGPU
-        // queueing (peer pushes + 8 iGPU launches + device switches). Without
-        // this de.compute sits idle ~250 µs waiting for host to come back.
-        // With the reorder de.compute FIFOs straight from router_pair →
-        // shared_expert_pair → peer_pushes → selected_pushed.record.
+        // Cost analysis on de.compute FIFO: peer_push is tiny (~6 µs for two
+        // 16 KB pushes), so shared_expert is only delayed ~6 µs vs the
+        // "shared_expert first" order — totally negligible compared to the
+        // ~hundreds of µs of iGPU work that now overlaps.
 
-        // Stage 13: shared_expert_pair — CAPTURED (queued NOW so de.compute
-        // FIFOs straight from router_pair → shared_expert_pair → peer_pushes).
+        // Peer-push ONLY ffn_input_norm. selected_pushed is the cross-device
+        // event iGPU waits on before starting router/MoE.
+        {
+            let _t = de.events.stage("dgpu.peer_push_pair", compute)?;
+            peer_push_f32(&t0.ffn_input_norm, &mut igpu_scratch.ffn_input_norm_recv_t0, compute)?;
+            peer_push_f32(&t1.ffn_input_norm, &mut igpu_scratch.ffn_input_norm_recv_t1, compute)?;
+            evt_t0.selected_pushed.record(compute)?;
+            evt_t1.selected_pushed.record(compute)?;
+        }
+
+        // Stage 13: shared_expert_pair on dGPU — runs in parallel with iGPU
+        // router+MoE.
         {
             let _t = de.events.stage("dgpu.shared_expert_pair", compute)?;
             let graph_slot = &self.dgpu_pair_shared_expert_graphs[layer as usize];
@@ -1070,17 +1072,6 @@ impl HeterogeneousEngine {
             } else {
                 guard.as_ref().unwrap().launch(compute)?;
             }
-        }
-
-        // Peer-push ONLY ffn_input_norm now. d_selected/d_ew are computed on
-        // iGPU via router_pair_igpu (queued below on ie.compute). selected_pushed
-        // event signals iGPU that ffn_input_norm has landed; router can start.
-        {
-            let _t = de.events.stage("dgpu.peer_push_pair", compute)?;
-            peer_push_f32(&t0.ffn_input_norm, &mut igpu_scratch.ffn_input_norm_recv_t0, compute)?;
-            peer_push_f32(&t1.ffn_input_norm, &mut igpu_scratch.ffn_input_norm_recv_t1, compute)?;
-            evt_t0.selected_pushed.record(compute)?;
-            evt_t1.selected_pushed.record(compute)?;
         }
 
         // ===== iGPU ROUTER + MoE for both tokens (FIFO on ie.compute) =====
