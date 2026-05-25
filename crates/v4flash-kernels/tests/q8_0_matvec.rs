@@ -224,3 +224,205 @@ fn q8_0_matvec_output_projection_oracle() -> eyre::Result<()> {
 
     Ok(())
 }
+
+/// M40-P4.5: validate that `q8_0_gemv_pair_warp8` produces output that's
+/// **bit-identical** to two separate `q8_0_gemv_warp8` calls. Same kernel
+/// arithmetic, same W bytes, same dot products — the only difference is
+/// that we read W once and compute two columns in one launch.
+#[test]
+#[ignore]
+fn q8_0_matvec_pair_matches_two_singles() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let dump = ActivationDump::open(dump_dir())?;
+    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let device = pick_device()?;
+    device.set_current()?;
+    let arch = device.properties()?.gcn_arch_name;
+    eprintln!("pair oracle: using device {} ({arch})", device.id);
+
+    let weight = weights::load_to_device(&gguf, "output.weight", device.id)?;
+    let kernel = Q8_0Matvec::for_arch(&arch)?;
+    let stream = Stream::new(device.id)?;
+
+    let mut d_x_a: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N_EMBD as usize)?;
+    let mut d_x_b: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N_EMBD as usize)?;
+    let mut d_xq_a: DeviceBuffer<i8> = DeviceBuffer::new(device.id, N_EMBD as usize)?;
+    let mut d_xq_b: DeviceBuffer<i8> = DeviceBuffer::new(device.id, N_EMBD as usize)?;
+    let mut d_xs_a: DeviceBuffer<f32> = DeviceBuffer::new(device.id, (N_EMBD / 32) as usize)?;
+    let mut d_xs_b: DeviceBuffer<f32> = DeviceBuffer::new(device.id, (N_EMBD / 32) as usize)?;
+    let mut d_out_a: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N_VOCAB as usize)?;
+    let mut d_out_b: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N_VOCAB as usize)?;
+    let mut d_out_pair_a: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N_VOCAB as usize)?;
+    let mut d_out_pair_b: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N_VOCAB as usize)?;
+
+    let n_logit_rows = dump.n_logit_rows;
+    // Use rows 0 and 1 as t0 / t1.
+    let load_row = |dev: &mut DeviceBuffer<f32>, row: usize| -> eyre::Result<()> {
+        let token = (PROMPT_LEN_PREFILL - 1) + row as i32;
+        let onorm_entry = dump
+            .tensor("output_norm", 43, token)
+            .ok_or_else(|| eyre!("missing output_norm at L43 T{token}"))?;
+        let x_host = dump.read_f32(onorm_entry)?;
+        assert_eq!(x_host.len(), N_EMBD as usize);
+        dev.copy_from_host(&x_host)?;
+        Ok(())
+    };
+
+    let mut max_diff_a = 0f32;
+    let mut max_diff_b = 0f32;
+    let mut pair_a = vec![0f32; N_VOCAB as usize];
+    let mut pair_b = vec![0f32; N_VOCAB as usize];
+    let mut single_a = vec![0f32; N_VOCAB as usize];
+    let mut single_b = vec![0f32; N_VOCAB as usize];
+
+    let test_pairs = [(0, 1), (2, 3), (4, 5), (0, n_logit_rows - 1)];
+    for &(ra, rb) in test_pairs.iter() {
+        if rb >= n_logit_rows {
+            continue;
+        }
+        load_row(&mut d_x_a, ra)?;
+        load_row(&mut d_x_b, rb)?;
+        kernel.quantize_input(&stream, &mut d_xq_a, &mut d_xs_a, &d_x_a, N_EMBD)?;
+        kernel.quantize_input(&stream, &mut d_xq_b, &mut d_xs_b, &d_x_b, N_EMBD)?;
+
+        // Two separate singles
+        kernel.matvec(&stream, &mut d_out_a, &weight.buffer, &d_xq_a, &d_xs_a, N_VOCAB, N_EMBD)?;
+        kernel.matvec(&stream, &mut d_out_b, &weight.buffer, &d_xq_b, &d_xs_b, N_VOCAB, N_EMBD)?;
+
+        // One pair
+        kernel.matvec_pair(
+            &stream,
+            &mut d_out_pair_a,
+            &mut d_out_pair_b,
+            &weight.buffer,
+            &d_xq_a,
+            &d_xq_b,
+            &d_xs_a,
+            &d_xs_b,
+            N_VOCAB,
+            N_EMBD,
+        )?;
+        stream.synchronize()?;
+
+        d_out_a.copy_to_host(&mut single_a)?;
+        d_out_b.copy_to_host(&mut single_b)?;
+        d_out_pair_a.copy_to_host(&mut pair_a)?;
+        d_out_pair_b.copy_to_host(&mut pair_b)?;
+
+        let mut a_max = 0f32;
+        let mut b_max = 0f32;
+        for i in 0..N_VOCAB as usize {
+            a_max = a_max.max((single_a[i] - pair_a[i]).abs());
+            b_max = b_max.max((single_b[i] - pair_b[i]).abs());
+        }
+        eprintln!(
+            "pair ({ra},{rb}): max_diff a={:.3e}  b={:.3e}",
+            a_max, b_max
+        );
+        max_diff_a = max_diff_a.max(a_max);
+        max_diff_b = max_diff_b.max(b_max);
+    }
+
+    eprintln!(
+        "PAIR ORACLE OVERALL: max_diff a={:.3e}  b={:.3e}",
+        max_diff_a, max_diff_b
+    );
+    // Should be bit-identical (same arithmetic).
+    assert!(max_diff_a == 0.0, "pair col a differs from single by {max_diff_a:.3e}");
+    assert!(max_diff_b == 0.0, "pair col b differs from single by {max_diff_b:.3e}");
+    Ok(())
+}
+
+/// M40-P4.5: microbench pair vs 2-single. Expected: pair takes <2× single
+/// (because W is read once for both columns). Ideal lower bound is 1× single
+/// (perfectly BW-bound, no compute cost).
+#[test]
+#[ignore]
+fn q8_0_matvec_pair_bench() -> eyre::Result<()> {
+    use std::time::Instant;
+    install_panic_handler()?;
+    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let device = pick_device()?;
+    device.set_current()?;
+    let arch = device.properties()?.gcn_arch_name;
+
+    let weight = weights::load_to_device(&gguf, "output.weight", device.id)?;
+    let kernel = Q8_0Matvec::for_arch(&arch)?;
+    let stream = Stream::new(device.id)?;
+
+    let mut d_x_a: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N_EMBD as usize)?;
+    let mut d_x_b: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N_EMBD as usize)?;
+    let mut d_xq_a: DeviceBuffer<i8> = DeviceBuffer::new(device.id, N_EMBD as usize)?;
+    let mut d_xq_b: DeviceBuffer<i8> = DeviceBuffer::new(device.id, N_EMBD as usize)?;
+    let mut d_xs_a: DeviceBuffer<f32> = DeviceBuffer::new(device.id, (N_EMBD / 32) as usize)?;
+    let mut d_xs_b: DeviceBuffer<f32> = DeviceBuffer::new(device.id, (N_EMBD / 32) as usize)?;
+    let mut d_out_a: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N_VOCAB as usize)?;
+    let mut d_out_b: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N_VOCAB as usize)?;
+    let host_x = vec![0.5f32; N_EMBD as usize];
+    d_x_a.copy_from_host(&host_x)?;
+    d_x_b.copy_from_host(&host_x)?;
+    kernel.quantize_input(&stream, &mut d_xq_a, &mut d_xs_a, &d_x_a, N_EMBD)?;
+    kernel.quantize_input(&stream, &mut d_xq_b, &mut d_xs_b, &d_x_b, N_EMBD)?;
+    stream.synchronize()?;
+
+    const ITERS: u32 = 200;
+
+    // Warmup
+    for _ in 0..10 {
+        kernel.matvec(&stream, &mut d_out_a, &weight.buffer, &d_xq_a, &d_xs_a, N_VOCAB, N_EMBD)?;
+    }
+    stream.synchronize()?;
+
+    // 2 singles
+    let t0 = Instant::now();
+    for _ in 0..ITERS {
+        kernel.matvec(&stream, &mut d_out_a, &weight.buffer, &d_xq_a, &d_xs_a, N_VOCAB, N_EMBD)?;
+        kernel.matvec(&stream, &mut d_out_b, &weight.buffer, &d_xq_b, &d_xs_b, N_VOCAB, N_EMBD)?;
+    }
+    stream.synchronize()?;
+    let dt_2single = t0.elapsed().as_secs_f64() / ITERS as f64 * 1e6; // µs per iter
+
+    // Pair
+    let t0 = Instant::now();
+    for _ in 0..ITERS {
+        kernel.matvec_pair(
+            &stream,
+            &mut d_out_a,
+            &mut d_out_b,
+            &weight.buffer,
+            &d_xq_a,
+            &d_xq_b,
+            &d_xs_a,
+            &d_xs_b,
+            N_VOCAB,
+            N_EMBD,
+        )?;
+    }
+    stream.synchronize()?;
+    let dt_pair = t0.elapsed().as_secs_f64() / ITERS as f64 * 1e6;
+
+    // 1 single (baseline)
+    let t0 = Instant::now();
+    for _ in 0..ITERS {
+        kernel.matvec(&stream, &mut d_out_a, &weight.buffer, &d_xq_a, &d_xs_a, N_VOCAB, N_EMBD)?;
+    }
+    stream.synchronize()?;
+    let dt_1single = t0.elapsed().as_secs_f64() / ITERS as f64 * 1e6;
+
+    let w_bytes = weight.buffer.byte_len() as f64;
+    let bw_pair = (w_bytes / 1e9) / (dt_pair * 1e-6);
+    let bw_single = (w_bytes / 1e9) / (dt_1single * 1e-6);
+
+    eprintln!(
+        "Q8_0 GEMV bench (W={:.1} MB, M={}, K={}):",
+        w_bytes / 1024.0 / 1024.0,
+        N_VOCAB,
+        N_EMBD
+    );
+    eprintln!("  1 single        : {:>7.1} µs  ({:.0} GB/s W read)", dt_1single, bw_single);
+    eprintln!("  2 singles back2 : {:>7.1} µs  ({:.2}× single)", dt_2single, dt_2single / dt_1single);
+    eprintln!("  1 pair          : {:>7.1} µs  ({:.2}× single, {:.0} GB/s W read)", dt_pair, dt_pair / dt_1single, bw_pair);
+    eprintln!("  pair speedup vs 2single: {:.2}×", dt_2single / dt_pair);
+
+    Ok(())
+}

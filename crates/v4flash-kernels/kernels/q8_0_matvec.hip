@@ -90,6 +90,61 @@ extern "C" __global__ void q8_0_gemv_warp8(
     if (lane == 0) out[row] = acc;
 }
 
+// 2-wide pair GEMV: same shape as q8_0_gemv_warp8 above but processes TWO
+// input vectors against ONE weight matrix per call. Each block read of W
+// is amortized across both input columns → halves W bandwidth vs running
+// the single-input kernel twice. Used by M40-P4.5 for pair-forward where
+// t0 and t1 share weights but have different activations.
+//
+// Per row, per lane: load W block (scales[b] + 32 quants[b]) once, do TWO
+// dp4a dot products (one per input column), multiply by two different
+// xscale[b] values, accumulate into two scalars. Final 2× warp reduce →
+// two output writes.
+//
+// Reg pressure: ~doubles per-lane scalars (2 accumulators, 2 input pointers,
+// 2 scales) but fits comfortably in RDNA's 256 VGPR/wave32 budget.
+extern "C" __global__ void q8_0_gemv_pair_warp8(
+    float* __restrict__ out_a,            // [M] — output for input column A
+    float* __restrict__ out_b,            // [M] — output for input column B
+    const unsigned char* __restrict__ w,  // [M * blocks * 34] — shared
+    const int8_t* __restrict__ xq_a,      // [K] = [blocks * 32]
+    const int8_t* __restrict__ xq_b,      // [K]
+    const float* __restrict__ xscale_a,   // [blocks]
+    const float* __restrict__ xscale_b,   // [blocks]
+    uint32_t in_dim,
+    uint32_t out_dim,
+    uint32_t blocks)
+{
+    uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+
+    const unsigned char* wr = w + (size_t)row * blocks * 34u;
+    const __half*  scales = (const __half*)wr;
+    const int8_t*  quants = (const int8_t*)(wr + (size_t)blocks * 2u);
+    float acc_a = 0.0f;
+    float acc_b = 0.0f;
+
+    for (uint32_t b = lane; b < blocks; b += WARP_LANES) {
+        const int8_t* qs   = quants + (size_t)b * 32u;
+        const int8_t* xqba = xq_a + (size_t)b * 32u;
+        const int8_t* xqbb = xq_b + (size_t)b * 32u;
+        // Load W block ONCE — both dots reuse the same `qs` cache line.
+        int32_t dot_a = dot_i8x32(qs, xqba);
+        int32_t dot_b = dot_i8x32(qs, xqbb);
+        float ws = __half2float(scales[b]);
+        acc_a += ws * xscale_a[b] * (float)dot_a;
+        acc_b += ws * xscale_b[b] * (float)dot_b;
+    }
+
+    acc_a = warp_sum_f32(acc_a);
+    acc_b = warp_sum_f32(acc_b);
+    if (lane == 0) {
+        out_a[row] = acc_a;
+        out_b[row] = acc_b;
+    }
+}
+
 // Quantize FP32 input → int8 + per-block fp32 scale. Run once per token
 // before the GEMV; same approach as ds4 quantize_q8_0_f32_kernel.
 extern "C" __global__ void q8_0_quantize_f32(
