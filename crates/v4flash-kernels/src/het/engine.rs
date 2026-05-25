@@ -232,6 +232,10 @@ pub struct HeterogeneousEngine {
     /// Pre-allocated per-layer sync events for `HetParallel`. Unused in
     /// `HetSingleStream` but cheap to keep allocated.
     pub sync_events: HetSyncEvents,
+    /// M40-P3.5: second per-layer event set for token1 in the substage-
+    /// interleaved pair forward. `sync_events` is t0, this is t1. Allocated
+    /// identically to sync_events.
+    pub sync_events_t1: HetSyncEvents,
     /// Optional per-token device-time perfetto exporter. Drains the
     /// EventPools at the end of each `forward_token` into per-stream
     /// perfetto tracks. Enable by calling
@@ -700,6 +704,7 @@ impl HeterogeneousEngine {
         let _ = igpu_device.enable_peer_access(dgpu_device);
 
         let sync_events = HetSyncEvents::alloc(dgpu_device, igpu_device)?;
+        let sync_events_t1 = HetSyncEvents::alloc(dgpu_device, igpu_device)?;
 
         let mut igpu_moe_graphs = Vec::with_capacity(N_LAYER as usize);
         let mut dgpu_mhc_pre_attn_graphs = Vec::with_capacity(N_LAYER as usize);
@@ -728,6 +733,7 @@ impl HeterogeneousEngine {
             igpu,
             mode,
             sync_events,
+            sync_events_t1,
             perfetto: None,
             igpu_moe_graphs,
             dgpu_mhc_pre_attn_graphs,

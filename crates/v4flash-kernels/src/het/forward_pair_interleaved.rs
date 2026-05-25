@@ -92,22 +92,25 @@ impl HeterogeneousEngine {
             let ilw = &weights.igpu_layers[layer];
             let ls = &mut state.layers[layer];
 
-            // M40-P3 DEBUG: serialized per-token decomposition (t0 pre+post,
-            // then t1 pre+post). Lets us isolate whether the bug is in the
-            // pre/post split itself (would also fail this serial version) vs
-            // the substage interleaving (only fails interleaved).
+            // M40-P3.6: substage interleaving with EVENT-DRIVEN GPU pipeline.
+            // t0_pre queues dGPU 1-12 + pushes + iGPU MoE_t0 (all event-gated).
+            // Host returns before MoE_t0 runs. Snapshot async-copies state.
+            // t1_pre queues t1's dGPU 1-12 + pushes + iGPU MoE_t1; t1's dGPU
+            // pre work runs in parallel with t0's iGPU MoE (different devices).
+            // t0_post queues shared_expert (independent of MoE), then waits
+            // on moe_arrived_t0 (cross-stream event, no host block) before
+            // ffn_combine. Same for t1_post with moe_arrived_t1.
             //
-            // M40-P3: substage interleaving — t0_pre, snapshot, t1_pre,
-            // t0_post, t1_post. t1's dGPU pre_moe runs while t0's iGPU MoE
-            // is in flight; t0_post waits for t0's iGPU MoE result; same
-            // for t1. The per-token stash buffers (after_attn_hc, ffn_input_norm,
-            // split, ffn_moe_recv_stash) preserve t0's pre_moe outputs
-            // across t1's overwrites.
-            //
+            // All stash/restore copies are async on de.compute → FIFO orders
+            // them against the reading kernels. Host never blocks inside the
+            // per-layer loop.
+            let evt_t0 = &self.sync_events.layers[layer as usize];
+            let evt_t1 = &self.sync_events_t1.layers[layer as usize];
+
             // ===== t0 pre_moe =====
             dgpu_scratch
                 .residual
-                .copy_from_buffer(&dgpu_scratch.residual_stash_token0)?;
+                .copy_from_buffer_async(&dgpu_scratch.residual_stash_token0, &self.dgpu.compute)?;
             self.forward_pair_pre_moe(
                 dgpu_scratch,
                 igpu_scratch,
@@ -117,17 +120,19 @@ impl HeterogeneousEngine {
                 pos,
                 token_id_0,
                 /* push_t1 */ false,
+                evt_t0,
             )?;
-            // Stash t0's pre_moe outputs (will be clobbered by t1_pre_moe).
+            // Stash t0's pre_moe outputs async on de.compute (FIFO after
+            // pre_moe writes, FIFO before t1's overwrites).
             dgpu_scratch
                 .after_attn_hc_stash_t0
-                .copy_from_buffer(&dgpu_scratch.after_attn_hc)?;
+                .copy_from_buffer_async(&dgpu_scratch.after_attn_hc, &self.dgpu.compute)?;
             dgpu_scratch
                 .ffn_input_norm_stash_t0
-                .copy_from_buffer(&dgpu_scratch.ffn_input_norm)?;
+                .copy_from_buffer_async(&dgpu_scratch.ffn_input_norm, &self.dgpu.compute)?;
             dgpu_scratch
                 .split_stash_t0
-                .copy_from_buffer(&dgpu_scratch.split)?;
+                .copy_from_buffer_async(&dgpu_scratch.split, &self.dgpu.compute)?;
 
             // ===== Snapshot per-layer state (post-t0, pre-t1) =====
             ls.snapshot_async(&self.dgpu.compute, &self.igpu.compute)?;
@@ -137,7 +142,7 @@ impl HeterogeneousEngine {
             // ===== t1 pre_moe (runs in parallel with t0's iGPU MoE) =====
             dgpu_scratch
                 .residual
-                .copy_from_buffer(&dgpu_scratch.residual_stash_token1)?;
+                .copy_from_buffer_async(&dgpu_scratch.residual_stash_token1, &self.dgpu.compute)?;
             self.forward_pair_pre_moe(
                 dgpu_scratch,
                 igpu_scratch,
@@ -147,62 +152,66 @@ impl HeterogeneousEngine {
                 pos + 1,
                 token_id_1,
                 /* push_t1 */ true,
+                evt_t1,
             )?;
             dgpu_scratch
                 .after_attn_hc_stash_t1
-                .copy_from_buffer(&dgpu_scratch.after_attn_hc)?;
+                .copy_from_buffer_async(&dgpu_scratch.after_attn_hc, &self.dgpu.compute)?;
             dgpu_scratch
                 .ffn_input_norm_stash_t1
-                .copy_from_buffer(&dgpu_scratch.ffn_input_norm)?;
+                .copy_from_buffer_async(&dgpu_scratch.ffn_input_norm, &self.dgpu.compute)?;
             dgpu_scratch
                 .split_stash_t1
-                .copy_from_buffer(&dgpu_scratch.split)?;
+                .copy_from_buffer_async(&dgpu_scratch.split, &self.dgpu.compute)?;
 
             // ===== t0 post_moe — restore t0's pre_moe outputs, then run =====
             dgpu_scratch
                 .after_attn_hc
-                .copy_from_buffer(&dgpu_scratch.after_attn_hc_stash_t0)?;
+                .copy_from_buffer_async(&dgpu_scratch.after_attn_hc_stash_t0, &self.dgpu.compute)?;
             dgpu_scratch
                 .ffn_input_norm
-                .copy_from_buffer(&dgpu_scratch.ffn_input_norm_stash_t0)?;
+                .copy_from_buffer_async(&dgpu_scratch.ffn_input_norm_stash_t0, &self.dgpu.compute)?;
             dgpu_scratch
                 .split
-                .copy_from_buffer(&dgpu_scratch.split_stash_t0)?;
+                .copy_from_buffer_async(&dgpu_scratch.split_stash_t0, &self.dgpu.compute)?;
             self.forward_pair_post_moe(
                 dgpu_scratch,
                 dlw,
                 /* token */ 0,
+                evt_t0,
             )?;
             dgpu_scratch
                 .residual_next_stash_t0
-                .copy_from_buffer(&dgpu_scratch.residual_next)?;
+                .copy_from_buffer_async(&dgpu_scratch.residual_next, &self.dgpu.compute)?;
 
             // ===== t1 post_moe =====
             dgpu_scratch
                 .after_attn_hc
-                .copy_from_buffer(&dgpu_scratch.after_attn_hc_stash_t1)?;
+                .copy_from_buffer_async(&dgpu_scratch.after_attn_hc_stash_t1, &self.dgpu.compute)?;
             dgpu_scratch
                 .ffn_input_norm
-                .copy_from_buffer(&dgpu_scratch.ffn_input_norm_stash_t1)?;
+                .copy_from_buffer_async(&dgpu_scratch.ffn_input_norm_stash_t1, &self.dgpu.compute)?;
             dgpu_scratch
                 .split
-                .copy_from_buffer(&dgpu_scratch.split_stash_t1)?;
+                .copy_from_buffer_async(&dgpu_scratch.split_stash_t1, &self.dgpu.compute)?;
             self.forward_pair_post_moe(
                 dgpu_scratch,
                 dlw,
                 /* token */ 1,
+                evt_t1,
             )?;
             dgpu_scratch
                 .residual_next_stash_t1
-                .copy_from_buffer(&dgpu_scratch.residual_next)?;
+                .copy_from_buffer_async(&dgpu_scratch.residual_next, &self.dgpu.compute)?;
 
-            // For next layer's input: swap stash slots.
+            // For next layer's input: copy residual_next_stash_tN → residual_stash_tokenN.
+            // Async on de.compute so it FIFO-orders before next layer's pre_moe reads.
             dgpu_scratch
                 .residual_stash_token0
-                .copy_from_buffer(&dgpu_scratch.residual_next_stash_t0)?;
+                .copy_from_buffer_async(&dgpu_scratch.residual_next_stash_t0, &self.dgpu.compute)?;
             dgpu_scratch
                 .residual_stash_token1
-                .copy_from_buffer(&dgpu_scratch.residual_next_stash_t1)?;
+                .copy_from_buffer_async(&dgpu_scratch.residual_next_stash_t1, &self.dgpu.compute)?;
         }
 
         // ============ Head x2 ============
@@ -234,54 +243,21 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
-    /// Test-only: public wrapper around the private `forward_pair_pre_moe`
-    /// so tests/pre_post_layer_diff.rs can call it on a single layer.
-    #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_pair_pre_moe_public_debug(
-        &self,
-        dgpu_scratch: &mut DgpuScratch,
-        igpu_scratch: &mut IgpuScratch,
-        ls: &mut HetLayerState,
-        dlw: &DgpuLayerWeights,
-        ilw: &IgpuLayerWeights,
-        pos: u32,
-        token_id: i32,
-        push_t1: bool,
-    ) -> eyre::Result<()> {
-        self.forward_pair_pre_moe(
-            dgpu_scratch,
-            igpu_scratch,
-            ls,
-            dlw,
-            ilw,
-            pos,
-            token_id,
-            push_t1,
-        )
-    }
-
-    /// Test-only: public wrapper around the private `forward_pair_post_moe`.
-    #[doc(hidden)]
-    pub fn forward_pair_post_moe_public_debug(
-        &self,
-        dgpu_scratch: &mut DgpuScratch,
-        dlw: &DgpuLayerWeights,
-        token: u32,
-    ) -> eyre::Result<()> {
-        // post_moe expects ffn_moe_recv_stash_t<token> to hold the iGPU MoE
-        // output. The pre_moe (with push_t0/push_t1 flag) sent it there
-        // already; just need to ensure xfer has landed before post_moe reads.
-        // The public pre_moe debug variant doesn't sync xfer at end, so do it here.
-        self.igpu.xfer.synchronize()?;
-        self.forward_pair_post_moe(dgpu_scratch, dlw, token)
-    }
+    // M40-P3.6: public debug wrappers removed (the pre/post split is now
+    // tested end-to-end via the forward_pair_interleaved oracle).
 
     /// pre_moe: stages 1-12 inline, direct launches, no captured graphs.
     /// Reads `dgpu_scratch.residual` for this token's input HC; writes
     /// `after_attn_hc`, `ffn_input_norm`, `split`, plus pushes
     /// (ffn_input_norm, selected, d_ew) to the iGPU's per-token recv
     /// buffers (selected by `push_t1` flag).
+    ///
+    /// M40-P3.6: takes per-token `events` (sync_events for t0, sync_events_t1
+    /// for t1) and uses cross-stream event gating instead of host syncs. The
+    /// iGPU MoE is treated as an autonomous "ffn_in/selected → ffn_out" pipeline:
+    /// dGPU pushes inputs, records selected_pushed; iGPU waits on it, runs MoE,
+    /// records moe_done; iGPU.xfer waits on moe_done, pushes ffn_moe back to
+    /// dGPU, records moe_arrived. Host never blocks.
     #[allow(clippy::too_many_arguments)]
     fn forward_pair_pre_moe(
         &self,
@@ -293,6 +269,7 @@ impl HeterogeneousEngine {
         pos: u32,
         token_id: i32,
         push_t1: bool,
+        events: &crate::het::engine::LayerSyncEvents,
     ) -> eyre::Result<()> {
         let de = &self.dgpu;
         self.set_current_cached(self.dgpu.device)?;
@@ -714,17 +691,14 @@ impl HeterogeneousEngine {
         }
 
         // ===== Stages 10 + 12: peer-push ffn_input_norm + selected + d_ew to iGPU =====
-        // Per-token iGPU recv buffers so MoE_t0 and MoE_t1 don't race on the same inputs.
-        //
-        // CRITICAL: de.xfer is a DIFFERENT stream from de.compute. Without explicit
-        // ordering, the peer push on de.xfer can race ahead of the router/mhc_pre_ffn
-        // writes on de.compute and push STALE data from a previous iteration. Pair-mode
-        // uses event-driven gating (sev.ain_ready / sev.selected_ready). Here we
-        // pessimistically host-sync de.compute before queueing the pushes — simple
-        // and bullet-proof. (Bug found: L0-L2 happened to work because compute
-        // finished fast enough; L3+ raced because the ratio=128 compressor shifted
-        // timing.)
-        de.compute.synchronize()?;
+        // EVENT-DRIVEN. The router (above) wrote d_selected/d_ew on de.compute;
+        // mhc_pre_ffn (above) wrote ffn_input_norm on de.compute. We record
+        // `selected_ready` once on de.compute — it covers BOTH writes (FIFO).
+        // de.xfer waits on it, then queues all three pushes, then records
+        // `selected_pushed`. iGPU.compute waits on selected_pushed and starts MoE.
+        // No host blocks.
+        events.selected_ready.record(&de.compute)?;
+        de.xfer.wait_event(&events.selected_ready)?;
         if push_t1 {
             peer_push_f32(
                 &dgpu_scratch.ffn_input_norm,
@@ -750,18 +724,17 @@ impl HeterogeneousEngine {
             )?;
             peer_push_f32(&dgpu_scratch.d_ew, &mut igpu_scratch.d_ew_t0, &de.xfer)?;
         }
-        // Block dGPU compute on the xfer for now (simpler than events; the
-        // host won't be doing more dGPU compute on this stream until t0_post_moe
-        // runs anyway, but the xfer must land before we move on).
-        de.xfer.synchronize()?;
+        events.selected_pushed.record(&de.xfer)?;
 
         // ===== iGPU MoE for this token =====
-        // Launch MoE work on iGPU. With direct launches, kernels enqueue on
-        // ie.compute and run in FIFO. t0's MoE work is queued first; t1's
-        // is queued second (after t1_pre_moe completes). They serialize on
-        // ie.compute but run in parallel with the dGPU work between them.
+        // EVENT-GATED: ie.compute waits on selected_pushed (which transitively
+        // covers all three pushes since they're on the same xfer stream FIFO).
+        // After MoE, ie.compute records moe_done; ie.xfer waits on it then
+        // pushes ffn_moe back to dGPU and records moe_arrived. post_moe's
+        // ffn_combine waits on moe_arrived. Host never blocks.
         self.set_current_cached(self.igpu.device)?;
         let ie = &self.igpu;
+        ie.compute.wait_event(&events.selected_pushed)?;
         let gbpe = ilw.routed.gate_bytes_per_expert;
         let ubpe = ilw.routed.up_bytes_per_expert;
         let dbpe = ilw.routed.down_bytes_per_expert;
@@ -809,14 +782,15 @@ impl HeterogeneousEngine {
                 BLOCKS_Q8K_DOWN_IN,
             )?;
             // Push back to per-token recv on dGPU. ie.xfer is a different
-            // stream than ie.compute; explicitly wait for the q2k write to
-            // ffn_moe_t1 to complete on ie.compute before the xfer reads it.
-            ie.compute.synchronize()?;
+            // stream than ie.compute; event-gate the xfer on moe_done.
+            events.moe_done.record(&ie.compute)?;
+            ie.xfer.wait_event(&events.moe_done)?;
             peer_push_f32(
                 &igpu_scratch.ffn_moe_t1,
                 &mut dgpu_scratch.ffn_moe_recv_stash_t1,
                 &ie.xfer,
             )?;
+            events.moe_arrived.record(&ie.xfer)?;
         } else {
             // MoE for token0 → writes to ffn_moe_t0
             ie.q8k.launch(
@@ -858,12 +832,14 @@ impl HeterogeneousEngine {
                 N_EMBD,
                 BLOCKS_Q8K_DOWN_IN,
             )?;
-            ie.compute.synchronize()?;
+            events.moe_done.record(&ie.compute)?;
+            ie.xfer.wait_event(&events.moe_done)?;
             peer_push_f32(
                 &igpu_scratch.ffn_moe_t0,
                 &mut dgpu_scratch.ffn_moe_recv_stash_t0,
                 &ie.xfer,
             )?;
+            events.moe_arrived.record(&ie.xfer)?;
         }
         // Switch back to dGPU device for next launch.
         self.set_current_cached(self.dgpu.device)?;
@@ -875,11 +851,16 @@ impl HeterogeneousEngine {
     /// `after_attn_hc`, `split`, `residual` (all of which the caller has
     /// already restored from this token's stashes) plus the iGPU MoE output
     /// in `ffn_moe_recv_stash_t<token>`. Writes `residual_next`.
+    ///
+    /// M40-P3.6: shared_expert is queued on de.compute WITHOUT waiting for
+    /// the iGPU MoE (they're independent). vec_add (which reads ffn_moe_recv)
+    /// waits on moe_arrived via cross-stream event — no host blocks.
     fn forward_pair_post_moe(
         &self,
         dgpu_scratch: &mut DgpuScratch,
         dlw: &DgpuLayerWeights,
         token: u32,
+        events: &crate::het::engine::LayerSyncEvents,
     ) -> eyre::Result<()> {
         let de = &self.dgpu;
         self.set_current_cached(self.dgpu.device)?;
@@ -934,22 +915,21 @@ impl HeterogeneousEngine {
             N_FF_SHARED,
         )?;
 
-        // ===== Wait for the iGPU MoE for THIS token to arrive =====
-        // The peer push from iGPU.xfer landed in ffn_moe_recv_stash_t<token>.
-        // Synchronize the iGPU streams to ensure the push has completed.
-        // (Simpler than event-based; the post_moes serialize anyway.)
-        self.igpu.compute.synchronize()?;
-        self.igpu.xfer.synchronize()?;
-        // Copy this token's MoE output into the shared ffn_moe_recv that
-        // ffn_combine's vec_add reads.
+        // ===== Cross-stream event wait for this token's iGPU MoE =====
+        // ffn_moe_recv_stash_t<token> was peer-pushed by ie.xfer; moe_arrived
+        // was recorded after that push. dGPU.compute waits on it (no host
+        // block), then does a device-to-device async copy from the stash into
+        // ffn_moe_recv (which vec_add reads in-place below). The copy is
+        // FIFO-ordered with the subsequent vec_add/hc_post on the same stream.
+        de.compute.wait_event(&events.moe_arrived)?;
         if token == 0 {
             dgpu_scratch
                 .ffn_moe_recv
-                .copy_from_buffer(&dgpu_scratch.ffn_moe_recv_stash_t0)?;
+                .copy_from_buffer_async(&dgpu_scratch.ffn_moe_recv_stash_t0, &de.compute)?;
         } else {
             dgpu_scratch
                 .ffn_moe_recv
-                .copy_from_buffer(&dgpu_scratch.ffn_moe_recv_stash_t1)?;
+                .copy_from_buffer_async(&dgpu_scratch.ffn_moe_recv_stash_t1, &de.compute)?;
         }
 
         // ===== Stage 16: ffn_combine =====
