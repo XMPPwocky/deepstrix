@@ -56,6 +56,18 @@ use super::weights::{DgpuLayerWeights, HetModelWeights, IgpuLayerWeights};
 
 const ROUTER_WEIGHT_EPS: f32 = 6.103515625e-5;
 
+/// Pick a `&'static str` based on the token id at compile time. Used to
+/// dispatch fine-grained perfetto stage names to the right per-token track
+/// (events.stage requires &'static str so we can't fmt! at runtime).
+macro_rules! stage_t {
+    ($which:expr, $base:literal) => {
+        match $which {
+            TokenId::T0 => concat!($base, "_t0"),
+            TokenId::T1 => concat!($base, "_t1"),
+        }
+    };
+}
+
 /// Direction of the cross-token state-ready event used in pre_moe.
 enum KvEventDir<'a> {
     /// Token 0: record the event after our kv_append (+ optional comp_kv_append).
@@ -397,121 +409,148 @@ impl HeterogeneousEngine {
         let _t_pre = de.events.stage(pre_span_name, compute)?;
 
         // ===== Stage 1: mhc_pre_attn =====
-        de.rms_nw.launch(compute, &mut ts.flat, &ts.residual, 1, HC_DIM, RMS_EPS)?;
-        de.f16.matvec(
-            compute,
-            &mut ts.mix,
-            &dlw.hc_attn_fn.buffer,
-            &ts.flat,
-            HC_MIX_DIM,
-            HC_DIM,
-        )?;
-        de.hc_sinkhorn.launch(
-            compute,
-            &mut ts.split,
-            &ts.mix,
-            &dlw.hc_attn_scale,
-            &dlw.hc_attn_base,
-            N_HC,
-            SINKHORN_ITERS,
-            SINKHORN_EPS,
-        )?;
-        de.hc_weighted
-            .launch(compute, &mut ts.attn_cur, &ts.residual, &ts.split, N_EMBD, N_HC)?;
-        de.rms_w.launch_weighted(
-            compute,
-            &mut ts.attn_input_norm,
-            &ts.attn_cur,
-            &dlw.attn_norm,
-            N_EMBD,
-            RMS_EPS,
-        )?;
+        {
+            let _t = de.events.stage(stage_t!(which, "dgpu.mhc_pre_attn"), compute)?;
+            de.rms_nw.launch(compute, &mut ts.flat, &ts.residual, 1, HC_DIM, RMS_EPS)?;
+            de.f16.matvec(
+                compute,
+                &mut ts.mix,
+                &dlw.hc_attn_fn.buffer,
+                &ts.flat,
+                HC_MIX_DIM,
+                HC_DIM,
+            )?;
+            de.hc_sinkhorn.launch(
+                compute,
+                &mut ts.split,
+                &ts.mix,
+                &dlw.hc_attn_scale,
+                &dlw.hc_attn_base,
+                N_HC,
+                SINKHORN_ITERS,
+                SINKHORN_EPS,
+            )?;
+            de.hc_weighted.launch(
+                compute,
+                &mut ts.attn_cur,
+                &ts.residual,
+                &ts.split,
+                N_EMBD,
+                N_HC,
+            )?;
+            de.rms_w.launch_weighted(
+                compute,
+                &mut ts.attn_input_norm,
+                &ts.attn_cur,
+                &dlw.attn_norm,
+                N_EMBD,
+                RMS_EPS,
+            )?;
+        }
 
-        // ===== Stage 2: Q chain (quantize input + matvec + rms + quantize + matvec + rms_no_w) =====
-        de.q8.quantize_input(
-            compute,
-            &mut ts.xq_n_embd,
-            &mut ts.xscale_n_embd,
-            &ts.attn_input_norm,
-            N_EMBD,
-        )?;
-        de.q8.matvec(
-            compute,
-            &mut ts.qr,
-            &dlw.attn_q_a.buffer,
-            &ts.xq_n_embd,
-            &ts.xscale_n_embd,
-            N_LORA_Q,
-            N_EMBD,
-        )?;
-        de.rms_w
-            .launch_weighted(compute, &mut ts.qr_normed, &ts.qr, &dlw.q_a_norm, N_LORA_Q, RMS_EPS)?;
-        de.q8.quantize_input(
-            compute,
-            &mut ts.qr_xq,
-            &mut ts.qr_xscale,
-            &ts.qr_normed,
-            N_LORA_Q,
-        )?;
-        de.q8.matvec(
-            compute,
-            &mut ts.q,
-            &dlw.attn_q_b.buffer,
-            &ts.qr_xq,
-            &ts.qr_xscale,
-            Q_FLAT,
-            N_LORA_Q,
-        )?;
-        de.rms_nw
-            .launch(compute, &mut ts.q_normed, &ts.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
-
-        // Stage 3: rope on q_normed
-        de.rope.launch_forward(
-            compute,
-            &mut ts.q_normed,
-            N_HEAD,
-            N_HEAD_DIM,
-            N_ROT,
-            pos,
-            &dlw.rope_params,
-        )?;
+        // ===== Stage 2: Q chain =====
+        {
+            let _t = de.events.stage(stage_t!(which, "dgpu.q_chain"), compute)?;
+            de.q8.quantize_input(
+                compute,
+                &mut ts.xq_n_embd,
+                &mut ts.xscale_n_embd,
+                &ts.attn_input_norm,
+                N_EMBD,
+            )?;
+            de.q8.matvec(
+                compute,
+                &mut ts.qr,
+                &dlw.attn_q_a.buffer,
+                &ts.xq_n_embd,
+                &ts.xscale_n_embd,
+                N_LORA_Q,
+                N_EMBD,
+            )?;
+            de.rms_w.launch_weighted(
+                compute,
+                &mut ts.qr_normed,
+                &ts.qr,
+                &dlw.q_a_norm,
+                N_LORA_Q,
+                RMS_EPS,
+            )?;
+            de.q8.quantize_input(
+                compute,
+                &mut ts.qr_xq,
+                &mut ts.qr_xscale,
+                &ts.qr_normed,
+                N_LORA_Q,
+            )?;
+            de.q8.matvec(
+                compute,
+                &mut ts.q,
+                &dlw.attn_q_b.buffer,
+                &ts.qr_xq,
+                &ts.qr_xscale,
+                Q_FLAT,
+                N_LORA_Q,
+            )?;
+            de.rms_nw
+                .launch(compute, &mut ts.q_normed, &ts.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
+            // Stage 3: rope on q_normed (folded into q_chain span)
+            de.rope.launch_forward(
+                compute,
+                &mut ts.q_normed,
+                N_HEAD,
+                N_HEAD_DIM,
+                N_ROT,
+                pos,
+                &dlw.rope_params,
+            )?;
+        }
 
         // ===== Stage 4: KV chain + cache append =====
-        de.q8.matvec(
-            compute,
-            &mut ts.kv_raw,
-            &dlw.attn_kv.buffer,
-            &ts.xq_n_embd,
-            &ts.xscale_n_embd,
-            N_HEAD_DIM,
-            N_EMBD,
-        )?;
-        de.rms_w.launch_weighted(
-            compute,
-            &mut ts.kv_normed,
-            &ts.kv_raw,
-            &dlw.kv_a_norm,
-            N_HEAD_DIM,
-            RMS_EPS,
-        )?;
-        de.rope.launch_forward(
-            compute,
-            &mut ts.kv_normed,
-            1,
-            N_HEAD_DIM,
-            N_ROT,
-            pos,
-            &dlw.rope_params,
-        )?;
-        de.fp8.launch(compute, &mut ts.kv_normed, N_HEAD_DIM - N_ROT)?;
-        de.f16rt.launch(compute, &mut ts.kv_normed, N_HEAD_DIM)?;
-        de.kv_append
-            .launch(compute, &mut ls.kv_cache, &ts.kv_normed, pos, SWA_WINDOW, N_HEAD_DIM)?;
+        {
+            let _t = de.events.stage(stage_t!(which, "dgpu.kv_chain"), compute)?;
+            de.q8.matvec(
+                compute,
+                &mut ts.kv_raw,
+                &dlw.attn_kv.buffer,
+                &ts.xq_n_embd,
+                &ts.xscale_n_embd,
+                N_HEAD_DIM,
+                N_EMBD,
+            )?;
+            de.rms_w.launch_weighted(
+                compute,
+                &mut ts.kv_normed,
+                &ts.kv_raw,
+                &dlw.kv_a_norm,
+                N_HEAD_DIM,
+                RMS_EPS,
+            )?;
+            de.rope.launch_forward(
+                compute,
+                &mut ts.kv_normed,
+                1,
+                N_HEAD_DIM,
+                N_ROT,
+                pos,
+                &dlw.rope_params,
+            )?;
+            de.fp8.launch(compute, &mut ts.kv_normed, N_HEAD_DIM - N_ROT)?;
+            de.f16rt.launch(compute, &mut ts.kv_normed, N_HEAD_DIM)?;
+            de.kv_append.launch(
+                compute,
+                &mut ls.kv_cache,
+                &ts.kv_normed,
+                pos,
+                SWA_WINDOW,
+                N_HEAD_DIM,
+            )?;
+        }
         ls.n_raw = (ls.n_raw + 1).min(SWA_WINDOW);
 
         // ===== Stage 5: compressor (ratio > 0) =====
         let ratio = dlw.ratio;
         if ratio > 0 {
+            let _t = de.events.stage(stage_t!(which, "dgpu.compressor"), compute)?;
             let cw = dlw
                 .compressor
                 .as_ref()
@@ -597,105 +636,144 @@ impl HeterogeneousEngine {
         }
 
         // ===== Stage 6: attention =====
-        let n_raw = ls.n_raw;
-        if ratio == 0 {
-            de.attn_swa.launch(
-                compute,
-                &mut ts.heads,
-                &ts.q_normed,
-                &ls.kv_cache,
-                &dlw.attn_sinks,
-                N_HEAD,
-                N_HEAD_DIM,
-                n_raw,
-            )?;
-        } else {
-            let cs = ls.compressor.as_ref();
-            let n_comp = cs.map(|c| c.n_comp).unwrap_or(0);
-            let comp_kv_buf = if n_comp > 0 { cs.map(|c| &c.comp_kv) } else { None };
-            de.attn_mixed.launch(
-                compute,
-                &mut ts.heads,
-                &ts.q_normed,
-                &ls.kv_cache,
-                comp_kv_buf,
-                None,
-                &dlw.attn_sinks,
-                N_HEAD,
-                N_HEAD_DIM,
-                n_raw,
-                n_comp,
-            )?;
+        {
+            let _t = de.events.stage(stage_t!(which, "dgpu.attn_compute"), compute)?;
+            let n_raw = ls.n_raw;
+            if ratio == 0 {
+                de.attn_swa.launch(
+                    compute,
+                    &mut ts.heads,
+                    &ts.q_normed,
+                    &ls.kv_cache,
+                    &dlw.attn_sinks,
+                    N_HEAD,
+                    N_HEAD_DIM,
+                    n_raw,
+                )?;
+            } else {
+                let cs = ls.compressor.as_ref();
+                let n_comp = cs.map(|c| c.n_comp).unwrap_or(0);
+                let comp_kv_buf = if n_comp > 0 { cs.map(|c| &c.comp_kv) } else { None };
+                de.attn_mixed.launch(
+                    compute,
+                    &mut ts.heads,
+                    &ts.q_normed,
+                    &ls.kv_cache,
+                    comp_kv_buf,
+                    None,
+                    &dlw.attn_sinks,
+                    N_HEAD,
+                    N_HEAD_DIM,
+                    n_raw,
+                    n_comp,
+                )?;
+            }
         }
 
         // ===== Stage 7: output_proj =====
-        de.rope.launch_inverse(compute, &mut ts.heads, N_HEAD, N_HEAD_DIM, N_ROT, pos, &dlw.rope_params)?;
-        de.q8.quantize_input(compute, &mut ts.heads_xq, &mut ts.heads_xscale, &ts.heads, Q_FLAT)?;
-        de.q8_grouped.matvec_grouped(
-            compute,
-            &mut ts.low,
-            &dlw.attn_output_a.buffer,
-            &ts.heads_xq,
-            &ts.heads_xscale,
-            GROUP_DIM,
-            RANK,
-            N_GROUPS,
-        )?;
-        de.q8.quantize_input(compute, &mut ts.low_xq, &mut ts.low_xscale, &ts.low, OUT_LOW)?;
-        de.q8.matvec(
-            compute,
-            &mut ts.attn_out,
-            &dlw.attn_output_b.buffer,
-            &ts.low_xq,
-            &ts.low_xscale,
-            N_EMBD,
-            OUT_LOW,
-        )?;
+        {
+            let _t = de.events.stage(stage_t!(which, "dgpu.output_proj"), compute)?;
+            de.rope.launch_inverse(
+                compute,
+                &mut ts.heads,
+                N_HEAD,
+                N_HEAD_DIM,
+                N_ROT,
+                pos,
+                &dlw.rope_params,
+            )?;
+            de.q8.quantize_input(
+                compute,
+                &mut ts.heads_xq,
+                &mut ts.heads_xscale,
+                &ts.heads,
+                Q_FLAT,
+            )?;
+            de.q8_grouped.matvec_grouped(
+                compute,
+                &mut ts.low,
+                &dlw.attn_output_a.buffer,
+                &ts.heads_xq,
+                &ts.heads_xscale,
+                GROUP_DIM,
+                RANK,
+                N_GROUPS,
+            )?;
+            de.q8.quantize_input(
+                compute,
+                &mut ts.low_xq,
+                &mut ts.low_xscale,
+                &ts.low,
+                OUT_LOW,
+            )?;
+            de.q8.matvec(
+                compute,
+                &mut ts.attn_out,
+                &dlw.attn_output_b.buffer,
+                &ts.low_xq,
+                &ts.low_xscale,
+                N_EMBD,
+                OUT_LOW,
+            )?;
+        }
 
-        // ===== Stage 8: mhc_post_attn → after_attn_hc =====
-        de.hc_post.launch_from_split(
-            compute,
-            &mut ts.after_attn_hc,
-            &ts.attn_out,
-            &ts.residual,
-            &ts.split,
-            N_HC,
-            N_EMBD,
-            N_HC,
-        )?;
+        // ===== Stage 8: mhc_post_attn =====
+        {
+            let _t = de.events.stage(stage_t!(which, "dgpu.mhc_post_attn"), compute)?;
+            de.hc_post.launch_from_split(
+                compute,
+                &mut ts.after_attn_hc,
+                &ts.attn_out,
+                &ts.residual,
+                &ts.split,
+                N_HC,
+                N_EMBD,
+                N_HC,
+            )?;
+        }
 
-        // ===== Stage 9: mhc_pre_ffn → ffn_input_norm + new split =====
-        de.rms_nw.launch(compute, &mut ts.flat, &ts.after_attn_hc, 1, HC_DIM, RMS_EPS)?;
-        de.f16.matvec(
-            compute,
-            &mut ts.mix,
-            &dlw.hc_ffn_fn.buffer,
-            &ts.flat,
-            HC_MIX_DIM,
-            HC_DIM,
-        )?;
-        de.hc_sinkhorn.launch(
-            compute,
-            &mut ts.split,
-            &ts.mix,
-            &dlw.hc_ffn_scale,
-            &dlw.hc_ffn_base,
-            N_HC,
-            SINKHORN_ITERS,
-            SINKHORN_EPS,
-        )?;
-        de.hc_weighted
-            .launch(compute, &mut ts.ffn_cur, &ts.after_attn_hc, &ts.split, N_EMBD, N_HC)?;
-        de.rms_w.launch_weighted(
-            compute,
-            &mut ts.ffn_input_norm,
-            &ts.ffn_cur,
-            &dlw.ffn_norm,
-            N_EMBD,
-            RMS_EPS,
-        )?;
+        // ===== Stage 9: mhc_pre_ffn =====
+        {
+            let _t = de.events.stage(stage_t!(which, "dgpu.mhc_pre_ffn"), compute)?;
+            de.rms_nw.launch(compute, &mut ts.flat, &ts.after_attn_hc, 1, HC_DIM, RMS_EPS)?;
+            de.f16.matvec(
+                compute,
+                &mut ts.mix,
+                &dlw.hc_ffn_fn.buffer,
+                &ts.flat,
+                HC_MIX_DIM,
+                HC_DIM,
+            )?;
+            de.hc_sinkhorn.launch(
+                compute,
+                &mut ts.split,
+                &ts.mix,
+                &dlw.hc_ffn_scale,
+                &dlw.hc_ffn_base,
+                N_HC,
+                SINKHORN_ITERS,
+                SINKHORN_EPS,
+            )?;
+            de.hc_weighted.launch(
+                compute,
+                &mut ts.ffn_cur,
+                &ts.after_attn_hc,
+                &ts.split,
+                N_EMBD,
+                N_HC,
+            )?;
+            de.rms_w.launch_weighted(
+                compute,
+                &mut ts.ffn_input_norm,
+                &ts.ffn_cur,
+                &dlw.ffn_norm,
+                N_EMBD,
+                RMS_EPS,
+            )?;
+        }
 
         // ===== Stage 11: router on dGPU =====
+        let _t_router = de.events.stage(stage_t!(which, "dgpu.router"), compute)?;
         if dlw.is_hash_router {
             de.f16.matvec(
                 compute,
@@ -735,48 +813,13 @@ impl HeterogeneousEngine {
                 ROUTER_WEIGHT_EPS,
             )?;
         }
-
-        // ===== Stage 13: shared_expert on dGPU — runs in parallel with iGPU MoE =====
-        // shared_expert is queued HERE (in pre_moe) instead of post_moe so it
-        // overlaps with iGPU MoE on a different device. Reads ts.ffn_input_norm
-        // (just written above), writes ts.ffn_shared (consumed by post_moe).
-        de.q8.quantize_input(compute, &mut ts.xq_n_embd, &mut ts.xscale_n_embd, &ts.ffn_input_norm, N_EMBD)?;
-        de.q8.matvec(
-            compute,
-            &mut ts.gate_sh,
-            &dlw.shared.gate.buffer,
-            &ts.xq_n_embd,
-            &ts.xscale_n_embd,
-            N_FF_SHARED,
-            N_EMBD,
-        )?;
-        de.q8.matvec(
-            compute,
-            &mut ts.up_sh,
-            &dlw.shared.up.buffer,
-            &ts.xq_n_embd,
-            &ts.xscale_n_embd,
-            N_FF_SHARED,
-            N_EMBD,
-        )?;
-        de.swiglu.launch(compute, &mut ts.mid_sh, &ts.gate_sh, &ts.up_sh, N_FF_SHARED)?;
-        de.q8.quantize_input(compute, &mut ts.mid_sh_xq, &mut ts.mid_sh_xscale, &ts.mid_sh, N_FF_SHARED)?;
-        de.q8.matvec(
-            compute,
-            &mut ts.ffn_shared,
-            &dlw.shared.down.buffer,
-            &ts.mid_sh_xq,
-            &ts.mid_sh_xscale,
-            N_EMBD,
-            N_FF_SHARED,
-        )?;
-
-        drop(_t_pre);
+        drop(_t_router);
 
         // ===== Stages 10 + 12: peer-push ffn_input_norm + selected + d_ew to iGPU =====
-        // EVENT-GATED. `selected_ready` covers BOTH ffn_input_norm (written by
-        // mhc_pre_ffn) and d_selected/d_ew (written by router) because router
-        // follows mhc_pre_ffn in stream FIFO.
+        // RECORD selected_ready RIGHT AFTER router and queue the pushes BEFORE
+        // shared_expert. Otherwise the pushes (and hence iGPU MoE start) get
+        // pushed out behind shared_expert on de.compute_t0's FIFO — defeating
+        // the whole point of overlapping shared_expert with iGPU MoE.
         events.selected_ready.record(compute)?;
         xfer.wait_event(&events.selected_ready)?;
         let push_span_name: &'static str = match which {
@@ -802,6 +845,60 @@ impl HeterogeneousEngine {
         peer_push_f32(&ts.d_ew, ig_ew, xfer)?;
         events.selected_pushed.record(xfer)?;
         drop(_t_push);
+
+        // ===== Stage 13: shared_expert on dGPU — runs in parallel with iGPU MoE =====
+        // Queued AFTER the peer push events were already recorded, so iGPU
+        // MoE doesn't wait behind shared_expert. shared_expert reads
+        // ts.ffn_input_norm (still valid — push above also reads it but
+        // de.xfer is a separate stream and copies don't mutate the source)
+        // and writes ts.ffn_shared (consumed by post_moe).
+        let _t_shared = de.events.stage(stage_t!(which, "dgpu.shared_expert"), compute)?;
+        de.q8.quantize_input(
+            compute,
+            &mut ts.xq_n_embd,
+            &mut ts.xscale_n_embd,
+            &ts.ffn_input_norm,
+            N_EMBD,
+        )?;
+        de.q8.matvec(
+            compute,
+            &mut ts.gate_sh,
+            &dlw.shared.gate.buffer,
+            &ts.xq_n_embd,
+            &ts.xscale_n_embd,
+            N_FF_SHARED,
+            N_EMBD,
+        )?;
+        de.q8.matvec(
+            compute,
+            &mut ts.up_sh,
+            &dlw.shared.up.buffer,
+            &ts.xq_n_embd,
+            &ts.xscale_n_embd,
+            N_FF_SHARED,
+            N_EMBD,
+        )?;
+        de.swiglu
+            .launch(compute, &mut ts.mid_sh, &ts.gate_sh, &ts.up_sh, N_FF_SHARED)?;
+        de.q8.quantize_input(
+            compute,
+            &mut ts.mid_sh_xq,
+            &mut ts.mid_sh_xscale,
+            &ts.mid_sh,
+            N_FF_SHARED,
+        )?;
+        de.q8.matvec(
+            compute,
+            &mut ts.ffn_shared,
+            &dlw.shared.down.buffer,
+            &ts.mid_sh_xq,
+            &ts.mid_sh_xscale,
+            N_EMBD,
+            N_FF_SHARED,
+        )?;
+        drop(_t_shared);
+
+        drop(_t_pre);
 
         Ok(())
     }
@@ -916,30 +1013,40 @@ impl HeterogeneousEngine {
         // here without an extra param; route by stream pointer at emit time.
         // For simplicity, label by a wrapping span passed via debug_span.
         // Pick t0 if compute pointer matches dgpu.compute_t0.
-        let post_span_name: &'static str = if std::ptr::eq(
+        let is_t0 = std::ptr::eq(
             compute,
             self.dgpu
                 .compute_t0
                 .as_ref()
                 .expect("compute_t0 missing"),
-        ) {
-            "dgpu.post_moe_t0"
+        );
+        let (wait_name, combine_name): (&'static str, &'static str) = if is_t0 {
+            ("dgpu.ffn_combine.wait_t0", "dgpu.ffn_combine_t0")
         } else {
-            "dgpu.post_moe_t1"
+            ("dgpu.ffn_combine.wait_t1", "dgpu.ffn_combine_t1")
         };
-        let _t_post = de.events.stage(post_span_name, compute)?;
-        compute.wait_event(&events.moe_arrived)?;
-        de.vec_add.launch(compute, &mut ts.ffn_moe_recv, &ts.ffn_shared, N_EMBD)?;
-        de.hc_post.launch_from_split(
-            compute,
-            &mut ts.residual_next,
-            &ts.ffn_moe_recv,
-            &ts.after_attn_hc,
-            &ts.split,
-            N_HC,
-            N_EMBD,
-            N_HC,
-        )?;
+        // SEPARATE span around the wait so the trace shows exactly how long
+        // dGPU.compute_tN sat idle waiting for moe_arrived (= the iGPU pipeline
+        // for this layer's MoE). Then a separate span for the actual ffn_combine
+        // kernels (vec_add + hc_post).
+        {
+            let _t_wait = de.events.stage(wait_name, compute)?;
+            compute.wait_event(&events.moe_arrived)?;
+        }
+        {
+            let _t_combine = de.events.stage(combine_name, compute)?;
+            de.vec_add.launch(compute, &mut ts.ffn_moe_recv, &ts.ffn_shared, N_EMBD)?;
+            de.hc_post.launch_from_split(
+                compute,
+                &mut ts.residual_next,
+                &ts.ffn_moe_recv,
+                &ts.after_attn_hc,
+                &ts.split,
+                N_HC,
+                N_EMBD,
+                N_HC,
+            )?;
+        }
         Ok(())
     }
 }
