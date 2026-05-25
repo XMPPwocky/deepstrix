@@ -265,8 +265,25 @@ pub struct HeterogeneousEngine {
     /// (2 kernels: vec_add (ffn_moe_recv += ffn_shared) followed by
     /// hc_post writing residual_next). Safe to capture because the
     /// end-of-token extra swap keeps each layer's residual/residual_next
-    /// pointing to stable physical buffers.
+    /// pointing to stable physical buffers. Under M30 this is populated
+    /// ONLY for the last layer (N_LAYER-1); transitions between layers
+    /// use the combined graphs below.
     pub dgpu_ffn_combine_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    /// M30: per-layer-transition captured graphs combining ffn_combine_N
+    /// with mhc_pre_attn_{N+1} (7 kernels: vec_add → hc_post writing
+    /// residual_next of N → rms_nw of N+1 → f16_matvec → hc_sinkhorn →
+    /// hc_weighted → rms_w_weighted). One graph per transition →
+    /// `N_LAYER - 1` slots. Eliminates ~115µs/layer of host-scheduling
+    /// gap-idle between the two stages.
+    ///
+    /// Correctness: ffn_combine_N writes `residual_next` (physical buf X).
+    /// After the end-of-layer swap, layer N+1's `residual` IS buf X. So
+    /// mhc_pre_attn_{N+1} reading `residual` reads from the same physical
+    /// buffer ffn_combine_N just wrote. In the captured graph we pass
+    /// `residual_next.raw()` to BOTH stages — the device sees one buffer
+    /// throughout. HIP graph capture orders the kernels sequentially on
+    /// the stream, so the read-after-write dependency is preserved.
+    pub dgpu_combined_ffn_pre_attn_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
     /// M20: cache which HIP device is currently bound on this thread,
     /// so set_current_cached() can skip the driver call when the
     /// device hasn't actually changed. AtomicI32 (not Cell) so
@@ -337,11 +354,17 @@ impl HeterogeneousEngine {
 
         let token_start = std::time::Instant::now();
         for layer in 0..N_LAYER as usize {
+            let next_dlw = if layer + 1 < N_LAYER as usize {
+                Some(&weights.dgpu_layers[layer + 1])
+            } else {
+                None
+            };
             self.forward_layer(
                 dgpu_scratch,
                 igpu_scratch,
                 &mut state.layers[layer],
                 &weights.dgpu_layers[layer],
+                next_dlw,
                 &weights.igpu_layers[layer],
                 pos,
                 token_id,
@@ -509,6 +532,8 @@ impl HeterogeneousEngine {
         let mut dgpu_q_chain_pre_rope_graphs = Vec::with_capacity(N_LAYER as usize);
         let mut dgpu_output_proj_post_rope_graphs = Vec::with_capacity(N_LAYER as usize);
         let mut dgpu_ffn_combine_graphs = Vec::with_capacity(N_LAYER as usize);
+        let mut dgpu_combined_ffn_pre_attn_graphs =
+            Vec::with_capacity(N_LAYER as usize - 1);
         for _ in 0..N_LAYER {
             igpu_moe_graphs.push(std::sync::Mutex::new(None));
             dgpu_mhc_pre_attn_graphs.push(std::sync::Mutex::new(None));
@@ -517,6 +542,9 @@ impl HeterogeneousEngine {
             dgpu_q_chain_pre_rope_graphs.push(std::sync::Mutex::new(None));
             dgpu_output_proj_post_rope_graphs.push(std::sync::Mutex::new(None));
             dgpu_ffn_combine_graphs.push(std::sync::Mutex::new(None));
+        }
+        for _ in 0..N_LAYER - 1 {
+            dgpu_combined_ffn_pre_attn_graphs.push(std::sync::Mutex::new(None));
         }
 
         Ok(Self {
@@ -532,6 +560,7 @@ impl HeterogeneousEngine {
             dgpu_q_chain_pre_rope_graphs,
             dgpu_output_proj_post_rope_graphs,
             dgpu_ffn_combine_graphs,
+            dgpu_combined_ffn_pre_attn_graphs,
             current_device: std::sync::atomic::AtomicI32::new(-1),
             last_host_us: std::sync::atomic::AtomicU64::new(0),
             last_sync_us: std::sync::atomic::AtomicU64::new(0),

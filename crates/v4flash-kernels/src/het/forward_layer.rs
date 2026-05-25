@@ -41,12 +41,20 @@ use tracing::debug_span;
 impl HeterogeneousEngine {
     /// Run one layer in the het pipeline. Reads from
     /// `dgpu_scratch.residual` and writes to `dgpu_scratch.residual_next`.
+    ///
+    /// M30: `next_dlw` is `Some` for all layers except the last. When
+    /// present, layer N's ffn_combine is fused with layer N+1's
+    /// mhc_pre_attn into one captured graph (the combined-transition
+    /// graph). Correspondingly, mhc_pre_attn is launched standalone ONLY
+    /// for layer 0 — every other layer's mhc_pre_attn rides the previous
+    /// layer's combined graph.
     pub fn forward_layer(
         &self,
         dgpu_scratch: &mut DgpuScratch,
         igpu_scratch: &mut IgpuScratch,
         ls: &mut HetLayerState,
         dlw: &DgpuLayerWeights,
+        next_dlw: Option<&DgpuLayerWeights>,
         ilw: &IgpuLayerWeights,
         pos: u32,
         token_id: i32,
@@ -60,6 +68,8 @@ impl HeterogeneousEngine {
             ));
         }
         let ratio = dlw.ratio;
+        let is_first_layer = layer == 0;
+        let is_last_layer = next_dlw.is_none();
 
         let serial = matches!(self.mode, ExecMode::HetSingleStream);
 
@@ -71,15 +81,13 @@ impl HeterogeneousEngine {
         self.set_current_cached(self.dgpu.device)?;
         let de = &self.dgpu;
 
-        // M15.1: capture mhc_pre_attn (5 kernels). Reads
-        // `dgpu_scratch.residual` which is technically swapped per layer,
-        // but the engine's end-of-token extra swap restores the initial
-        // state so layer N's `residual` always points to the same
-        // physical buffer across tokens — the captured pointer stays
-        // valid.
-        let _t_mhc_pre = de.events.stage("dgpu.mhc_pre_attn", &de.compute)?;
-        let _s_mhc_pre = debug_span!("mhc_pre_attn").entered();
-        {
+        // M30: mhc_pre_attn for layer N is launched by the PREVIOUS
+        // layer's combined ffn_combine→mhc_pre_attn graph, except for
+        // layer 0 which has no preceding ffn_combine. The standalone
+        // mhc_pre_attn graph below only fires once per token (layer 0).
+        if is_first_layer {
+            let _t_mhc_pre = de.events.stage("dgpu.mhc_pre_attn", &de.compute)?;
+            let _s_mhc_pre = debug_span!("mhc_pre_attn").entered();
             let graph_slot = &self.dgpu_mhc_pre_attn_graphs[layer as usize];
             let mut guard = graph_slot.lock().unwrap();
             if guard.is_none() {
@@ -134,9 +142,9 @@ impl HeterogeneousEngine {
             } else {
                 guard.as_ref().unwrap().launch(&de.compute)?;
             }
+            drop(_s_mhc_pre);
+            _t_mhc_pre.end()?;
         }
-        drop(_s_mhc_pre);
-        _t_mhc_pre.end()?;
 
         // ============================================================
         // dGPU: Q LoRA chain → q_post_rope
@@ -888,10 +896,10 @@ impl HeterogeneousEngine {
         }
         let _t_combine = de.events.stage("dgpu.ffn_combine", &de.compute)?;
         let _s_combine = debug_span!("ffn_combine").entered();
-        {
+        if is_last_layer {
             // M15.1: capture (vec_add → hc_post writing residual_next).
             // Stable per-layer pointers thanks to the end-of-token
-            // extra swap.
+            // extra swap. Used ONLY for the last layer under M30.
             let graph_slot = &self.dgpu_ffn_combine_graphs[layer as usize];
             let mut guard = graph_slot.lock().unwrap();
             if guard.is_none() {
@@ -912,6 +920,86 @@ impl HeterogeneousEngine {
                     N_HC,
                     N_EMBD,
                     N_HC,
+                )?;
+                let graph = de.compute.end_capture()?;
+                let exec = graph.instantiate()?;
+                exec.launch(&de.compute)?;
+                *guard = Some(exec);
+            } else {
+                guard.as_ref().unwrap().launch(&de.compute)?;
+            }
+        } else {
+            // M30: combined ffn_combine_N + mhc_pre_attn_{N+1} graph.
+            // The mhc_pre_attn block reads from layer N+1's `residual`
+            // which is THIS layer's `residual_next` after the post-layer
+            // swap — same physical buffer. We pass `residual_next.raw()`
+            // throughout so the captured graph references one ptr.
+            let next = next_dlw.expect("M30: next_dlw required for non-last layer");
+            let graph_slot = &self.dgpu_combined_ffn_pre_attn_graphs[layer as usize];
+            let mut guard = graph_slot.lock().unwrap();
+            if guard.is_none() {
+                de.compute
+                    .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                // ffn_combine half — writes residual_next (= layer N+1's residual).
+                de.vec_add.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.ffn_moe_recv,
+                    &dgpu_scratch.ffn_shared,
+                    N_EMBD,
+                )?;
+                de.hc_post.launch_from_split(
+                    &de.compute,
+                    &mut dgpu_scratch.residual_next,
+                    &dgpu_scratch.ffn_moe_recv,
+                    &dgpu_scratch.after_attn_hc,
+                    &dgpu_scratch.split,
+                    N_HC,
+                    N_EMBD,
+                    N_HC,
+                )?;
+                // mhc_pre_attn half — reads residual_next (= layer N+1's residual
+                // after swap), uses layer N+1's hc/norm weights.
+                de.rms_nw.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.flat,
+                    &dgpu_scratch.residual_next,
+                    1,
+                    HC_DIM,
+                    RMS_EPS,
+                )?;
+                de.f16.matvec(
+                    &de.compute,
+                    &mut dgpu_scratch.mix,
+                    &next.hc_attn_fn.buffer,
+                    &dgpu_scratch.flat,
+                    HC_MIX_DIM,
+                    HC_DIM,
+                )?;
+                de.hc_sinkhorn.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.split,
+                    &dgpu_scratch.mix,
+                    &next.hc_attn_scale,
+                    &next.hc_attn_base,
+                    N_HC,
+                    SINKHORN_ITERS,
+                    SINKHORN_EPS,
+                )?;
+                de.hc_weighted.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.attn_cur,
+                    &dgpu_scratch.residual_next,
+                    &dgpu_scratch.split,
+                    N_EMBD,
+                    N_HC,
+                )?;
+                de.rms_w.launch_weighted(
+                    &de.compute,
+                    &mut dgpu_scratch.attn_input_norm,
+                    &dgpu_scratch.attn_cur,
+                    &next.attn_norm,
+                    N_EMBD,
+                    RMS_EPS,
                 )?;
                 let graph = de.compute.end_capture()?;
                 let exec = graph.instantiate()?;
