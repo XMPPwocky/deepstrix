@@ -938,13 +938,95 @@ impl HeterogeneousEngine {
             }
         }
 
-        // ===== Stages 10 + 12: peer-push to iGPU per token =====
-        // Record selected_ready on de.compute. Both xfer_t0 and xfer_t1 wait
-        // on it (it covers both t0 and t1's writes since they're FIFO on
-        // de.compute). Then each pushes to its own iGPU recv buffers in
-        // parallel on separate xfer streams.
+        // ===== Stages 10 + 12 + 13 reordered =====
+        // Record selected_ready on de.compute (covers ffn_input_norm + router
+        // writes since they're FIFO on compute).
+        //
+        // ORDER FIX: queue shared_expert_pair on compute BEFORE doing all
+        // the cross-device queueing (peer pushes + iGPU MoE launches + device
+        // switches — ~14 host calls totaling ~250 µs). Otherwise de.compute
+        // sits idle waiting for the host to come back and queue
+        // shared_expert_pair, even though everything it needs is already in
+        // place. With this reorder de.compute FIFOs straight from router_pair
+        // → shared_expert_pair without a host-induced gap.
         evt_t0.selected_ready.record(compute)?;
-        // Use same event for both — t1 also waits on it (same writes guarded).
+
+        // ===== Stage 13: shared_expert_pair (queued NOW so it FIFOs after
+        // router on de.compute) =====
+        {
+            let _t = de.events.stage("dgpu.shared_expert_pair", compute)?;
+            de.q8.quantize_input(
+                compute,
+                &mut t0.xq_n_embd,
+                &mut t0.xscale_n_embd,
+                &t0.ffn_input_norm,
+                N_EMBD,
+            )?;
+            de.q8.quantize_input(
+                compute,
+                &mut t1.xq_n_embd,
+                &mut t1.xscale_n_embd,
+                &t1.ffn_input_norm,
+                N_EMBD,
+            )?;
+            de.q8.matvec_pair(
+                compute,
+                &mut t0.gate_sh,
+                &mut t1.gate_sh,
+                &dlw.shared.gate.buffer,
+                &t0.xq_n_embd,
+                &t1.xq_n_embd,
+                &t0.xscale_n_embd,
+                &t1.xscale_n_embd,
+                N_FF_SHARED,
+                N_EMBD,
+            )?;
+            de.q8.matvec_pair(
+                compute,
+                &mut t0.up_sh,
+                &mut t1.up_sh,
+                &dlw.shared.up.buffer,
+                &t0.xq_n_embd,
+                &t1.xq_n_embd,
+                &t0.xscale_n_embd,
+                &t1.xscale_n_embd,
+                N_FF_SHARED,
+                N_EMBD,
+            )?;
+            de.swiglu
+                .launch(compute, &mut t0.mid_sh, &t0.gate_sh, &t0.up_sh, N_FF_SHARED)?;
+            de.swiglu
+                .launch(compute, &mut t1.mid_sh, &t1.gate_sh, &t1.up_sh, N_FF_SHARED)?;
+            de.q8.quantize_input(
+                compute,
+                &mut t0.mid_sh_xq,
+                &mut t0.mid_sh_xscale,
+                &t0.mid_sh,
+                N_FF_SHARED,
+            )?;
+            de.q8.quantize_input(
+                compute,
+                &mut t1.mid_sh_xq,
+                &mut t1.mid_sh_xscale,
+                &t1.mid_sh,
+                N_FF_SHARED,
+            )?;
+            de.q8.matvec_pair(
+                compute,
+                &mut t0.ffn_shared,
+                &mut t1.ffn_shared,
+                &dlw.shared.down.buffer,
+                &t0.mid_sh_xq,
+                &t1.mid_sh_xq,
+                &t0.mid_sh_xscale,
+                &t1.mid_sh_xscale,
+                N_EMBD,
+                N_FF_SHARED,
+            )?;
+        }
+
+        // Now the peer pushes + iGPU MoE — runs in parallel with the
+        // shared_expert_pair we just queued on de.compute.
         xfer_t0.wait_event(&evt_t0.selected_ready)?;
         xfer_t1.wait_event(&evt_t0.selected_ready)?;
         {
@@ -1073,87 +1155,6 @@ impl HeterogeneousEngine {
             evt_t1.moe_arrived.record(&ie.xfer)?;
         }
         self.set_current_cached(self.dgpu.device)?;
-
-        // ===== Stage 13: shared_expert (batched on de.compute) =====
-        // shared_expert uses q8 matvec_pair for all 3 ops. Reads ffn_input_norm
-        // (per-token, both still valid), writes per-token ffn_shared. Runs on
-        // de.compute IN PARALLEL with iGPU MoE (different devices). Each pair
-        // matvec reads its weight ONCE for both tokens.
-        {
-            let _t = de.events.stage("dgpu.shared_expert_pair", compute)?;
-            // quantize ffn_input_norm per token (shared xq scratch in TokenScratch)
-            de.q8.quantize_input(
-                compute,
-                &mut t0.xq_n_embd,
-                &mut t0.xscale_n_embd,
-                &t0.ffn_input_norm,
-                N_EMBD,
-            )?;
-            de.q8.quantize_input(
-                compute,
-                &mut t1.xq_n_embd,
-                &mut t1.xscale_n_embd,
-                &t1.ffn_input_norm,
-                N_EMBD,
-            )?;
-            // gate
-            de.q8.matvec_pair(
-                compute,
-                &mut t0.gate_sh,
-                &mut t1.gate_sh,
-                &dlw.shared.gate.buffer,
-                &t0.xq_n_embd,
-                &t1.xq_n_embd,
-                &t0.xscale_n_embd,
-                &t1.xscale_n_embd,
-                N_FF_SHARED,
-                N_EMBD,
-            )?;
-            // up
-            de.q8.matvec_pair(
-                compute,
-                &mut t0.up_sh,
-                &mut t1.up_sh,
-                &dlw.shared.up.buffer,
-                &t0.xq_n_embd,
-                &t1.xq_n_embd,
-                &t0.xscale_n_embd,
-                &t1.xscale_n_embd,
-                N_FF_SHARED,
-                N_EMBD,
-            )?;
-            // swiglu per-token
-            de.swiglu.launch(compute, &mut t0.mid_sh, &t0.gate_sh, &t0.up_sh, N_FF_SHARED)?;
-            de.swiglu.launch(compute, &mut t1.mid_sh, &t1.gate_sh, &t1.up_sh, N_FF_SHARED)?;
-            // quantize mid per token
-            de.q8.quantize_input(
-                compute,
-                &mut t0.mid_sh_xq,
-                &mut t0.mid_sh_xscale,
-                &t0.mid_sh,
-                N_FF_SHARED,
-            )?;
-            de.q8.quantize_input(
-                compute,
-                &mut t1.mid_sh_xq,
-                &mut t1.mid_sh_xscale,
-                &t1.mid_sh,
-                N_FF_SHARED,
-            )?;
-            // down
-            de.q8.matvec_pair(
-                compute,
-                &mut t0.ffn_shared,
-                &mut t1.ffn_shared,
-                &dlw.shared.down.buffer,
-                &t0.mid_sh_xq,
-                &t1.mid_sh_xq,
-                &t0.mid_sh_xscale,
-                &t1.mid_sh_xscale,
-                N_EMBD,
-                N_FF_SHARED,
-            )?;
-        }
 
         drop(_t_pre);
         Ok(())
