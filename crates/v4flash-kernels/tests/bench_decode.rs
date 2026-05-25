@@ -89,8 +89,12 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
     let weights = HetModelWeights::load_all(&gguf, dgpu, igpu, &rope_for_layer)?;
     eprintln!("loaded.");
 
-    let engine =
+    let mut engine =
         HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
+    if std::env::var("BENCH_KEEPALIVE").is_ok() {
+        engine.attach_keepalive(&dgpu_arch)?;
+        eprintln!("M28: dGPU keep-alive ATTACHED");
+    }
     let mut dgpu_scratch = DgpuScratch::alloc(dgpu)?;
     let mut igpu_scratch = IgpuScratch::alloc(igpu)?;
     let n_positions = n_tokens + PROMPT_TOKENS.len() as i32 - 1;
@@ -120,6 +124,8 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
     eprintln!("preloaded.");
 
     let mut token_us: Vec<u64> = Vec::with_capacity(n_positions as usize);
+    let mut token_host_us: Vec<u64> = Vec::with_capacity(n_positions as usize);
+    let mut token_sync_us: Vec<u64> = Vec::with_capacity(n_positions as usize);
     let bench_start = Instant::now();
     for pos in 0..n_positions {
         let token_id = if (pos as usize) < PROMPT_TOKENS.len() {
@@ -141,6 +147,9 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
         )?;
         let dt = t.elapsed().as_micros() as u64;
         token_us.push(dt);
+        use std::sync::atomic::Ordering;
+        token_host_us.push(engine.last_host_us.load(Ordering::Relaxed));
+        token_sync_us.push(engine.last_sync_us.load(Ordering::Relaxed));
     }
     let bench_wall = bench_start.elapsed();
 
@@ -172,6 +181,52 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
         "BENCH context: dGPU={} (gfx1201) + iGPU={} (gfx1151), V4-Flash {} layers, HetParallel mode",
         dgpu.id, igpu.id, v4flash_kernels::forward::N_LAYER
     );
+
+    // Per-token timing dump — correlate token speed against position
+    // patterns (compressor boundaries, SWA crossover, etc.). Each row
+    // shows: pos | µs | "B2" if any ratio-2 boundary fires, "B4" if
+    // any ratio-4, "SWA" if past SWA_WINDOW.
+    if std::env::var("BENCH_PER_TOKEN").is_ok() {
+        const SWA_WINDOW: u32 = 128;
+        eprintln!("BENCH per-token (after warmup):");
+        eprintln!("    pos    total      host    sync   flags");
+        for (i, &t) in token_us.iter().enumerate() {
+            if (i as i32) < warmup { continue; }
+            let pos = i as u32;
+            let h = token_host_us[i];
+            let s = token_sync_us[i];
+            let b2 = (pos + 1) % 2 == 0;
+            let b4 = (pos + 1) % 4 == 0;
+            let swa = pos >= SWA_WINDOW;
+            let flags = format!("{}{}",
+                if b4 {"B4"} else if b2 {"B2"} else {"--"},
+                if swa {" SWA"} else {""});
+            eprintln!("  T{:>3} {:>7.2}  {:>6.2}  {:>6.2}  {}",
+                pos, t as f64 / 1000.0, h as f64 / 1000.0, s as f64 / 1000.0, flags);
+        }
+    }
+
+    // M27 summary: how is total wall split between host enqueue vs
+    // device sync wait, on the slowest vs fastest tokens?
+    let warm_host: Vec<u64> = token_host_us.iter().skip(warmup as usize).copied().collect();
+    let warm_sync: Vec<u64> = token_sync_us.iter().skip(warmup as usize).copied().collect();
+    let host_avg = warm_host.iter().sum::<u64>() as f64 / warm_host.len() as f64;
+    let sync_avg = warm_sync.iter().sum::<u64>() as f64 / warm_sync.len() as f64;
+    // sort warm_us with paired host/sync indexes so we can pull split for fastest/slowest tokens.
+    let mut idx: Vec<usize> = (0..warm_us.len()).collect();
+    idx.sort_by_key(|&i| warm_us[i]);
+    let p10_i = idx[idx.len() / 10];
+    let p50_i = idx[idx.len() / 2];
+    let p90_i = idx[(idx.len() * 9) / 10];
+    let p99_i = idx[(idx.len() * 99) / 100];
+    eprintln!("BENCH host vs sync split:");
+    eprintln!("  avg:  host {:>6.2} ms  sync {:>6.2} ms  total {:>6.2}",
+        host_avg / 1000.0, sync_avg / 1000.0, (host_avg + sync_avg) / 1000.0);
+    for (label, i) in [("p10 ", p10_i), ("p50 ", p50_i), ("p90 ", p90_i), ("p99 ", p99_i)] {
+        eprintln!("  {}: host {:>6.2} ms  sync {:>6.2} ms  total {:>6.2}",
+            label, warm_host[i] as f64 / 1000.0, warm_sync[i] as f64 / 1000.0,
+            warm_us[i] as f64 / 1000.0);
+    }
 
     // Per-decile latency. Reads from the same `sorted` Vec the
     // min/median/max came from — n is small enough that

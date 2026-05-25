@@ -20,6 +20,7 @@ use crate::f16::F16Matvec;
 use crate::ffn::{Swiglu, SwigluClampWeighted, VecAddInplace};
 use crate::head::{HcPost, HcSigmoidBias, HcSinkhorn, HcWeightedSum};
 use crate::comp_kv_append::CompKvAppend;
+use crate::keep_alive::KeepAlive;
 use crate::iq2_xxs::Iq2XxsPairMatvec;
 use crate::kv_cache_append::KvCacheAppend;
 use crate::q2_k::Q2KAccumulateMatvec;
@@ -271,6 +272,18 @@ pub struct HeterogeneousEngine {
     /// device hasn't actually changed. AtomicI32 (not Cell) so
     /// HeterogeneousEngine stays Sync. `-1` = unknown.
     pub current_device: std::sync::atomic::AtomicI32,
+    /// M27 diagnostic: last forward_token's host-enqueue time (µs),
+    /// before the final dgpu.compute.synchronize(). Bench reads this
+    /// to split per-token wall into host vs device-wait.
+    pub last_host_us: std::sync::atomic::AtomicU64,
+    /// M27 diagnostic: time spent in the final synchronize() call.
+    pub last_sync_us: std::sync::atomic::AtomicU64,
+    /// M28: dGPU clock keep-alive. Tiny no-op kernel launched on a
+    /// secondary stream to keep the dGPU "busy" between idle windows
+    /// so its clock doesn't dip. Enabled by attach_keepalive(); off
+    /// by default (no overhead in the standard config).
+    pub dgpu_keepalive: Option<KeepAlive>,
+    pub dgpu_keepalive_stream: Option<Stream>,
 }
 
 impl HeterogeneousEngine {
@@ -313,6 +326,15 @@ impl HeterogeneousEngine {
         self.set_current_cached(self.dgpu.device)?;
         dgpu_scratch.residual.copy_from_host(input_hc_host)?;
 
+        // M28 tried: spawn keep-alive kernels on secondary stream to
+        // prevent dGPU clock dips. REGRESSED 24 → 14 tok/s — host
+        // time exploded (4 → 37 ms) from HIP runtime blocking on the
+        // keep-alive stream's queue. Mechanism kept around (the
+        // KeepAlive module + secondary stream alloc) but not invoked.
+        // Real clock-dip fix is sysfs setperflevel/setperfdeterminism,
+        // done outside the test process.
+        let _ = (&self.dgpu_keepalive, &self.dgpu_keepalive_stream);
+
         let token_start = std::time::Instant::now();
         for layer in 0..N_LAYER as usize {
             self.forward_layer(
@@ -338,8 +360,17 @@ impl HeterogeneousEngine {
         // physical buffers across every token.
         std::mem::swap(&mut dgpu_scratch.residual, &mut dgpu_scratch.residual_next);
         self.set_current_cached(self.dgpu.device)?;
+        // M27 diagnostic: split token wall into (host-enqueue / device-sync).
+        // host_us = time spent in this loop before the final sync. If big,
+        // OS preempted us between launches. sync_us = time the host waited
+        // for the device. If big, the device was slow (clock/thermal).
+        let host_us = token_start.elapsed().as_micros() as u64;
         self.dgpu.compute.synchronize()?;
         let token_elapsed_us = token_start.elapsed().as_micros() as u64;
+        let sync_us = token_elapsed_us.saturating_sub(host_us);
+        use std::sync::atomic::Ordering;
+        self.last_host_us.store(host_us, Ordering::Relaxed);
+        self.last_sync_us.store(sync_us, Ordering::Relaxed);
 
         // Emit device-time perfetto tracks (if enabled) before the
         // summary harvest — this only reads events that have already
@@ -502,7 +533,24 @@ impl HeterogeneousEngine {
             dgpu_output_proj_post_rope_graphs,
             dgpu_ffn_combine_graphs,
             current_device: std::sync::atomic::AtomicI32::new(-1),
+            last_host_us: std::sync::atomic::AtomicU64::new(0),
+            last_sync_us: std::sync::atomic::AtomicU64::new(0),
+            dgpu_keepalive: None,
+            dgpu_keepalive_stream: None,
         })
+    }
+
+    /// M28: attach a clock-keep-alive kernel on a secondary dGPU stream.
+    /// When attached, forward_token will spawn tiny no-op kernels on
+    /// this stream throughout each token to keep the dGPU clock from
+    /// dropping into a low-power state.
+    pub fn attach_keepalive(&mut self, arch: &str) -> eyre::Result<()> {
+        self.dgpu.device.set_current()?;
+        let ka = KeepAlive::for_arch(arch)?;
+        let stream = Stream::new(self.dgpu.device.id)?;
+        self.dgpu_keepalive = Some(ka);
+        self.dgpu_keepalive_stream = Some(stream);
+        Ok(())
     }
 
     /// M20: set the HIP device only if the cached value differs from

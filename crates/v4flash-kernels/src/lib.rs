@@ -22,6 +22,7 @@ pub mod het;
 pub mod indexer;
 pub mod iq2_xxs;
 pub mod iq2_xxs_tables;
+pub mod keep_alive;
 pub mod kv_cache_append;
 pub mod oracle;
 pub mod router_topk;
