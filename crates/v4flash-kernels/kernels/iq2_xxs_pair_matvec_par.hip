@@ -252,16 +252,29 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu(
 // workgroup, so the inner dequant loop's hundreds of lookups per row
 // avoid constant-cache divergent-access tax.
 
+// M31: branchless byte-wise conditional negation. For each byte i,
+// if sm.byte[i] == 0xff, negate pack.byte[i]; else keep.
+// Two's complement: -x = ~x + 1. So `(pack ^ sm) + (sm & 0x01010101u)`
+// XOR-flips the bytes selected by sm, then adds 1 to those bytes.
+// Replaces 4 conditional branches per call in the inner loop.
+__device__ __forceinline__ int32_t cond_neg_bytes_fast(int32_t pack, uint32_t sm) {
+    return (int32_t)(((uint32_t)pack ^ sm) + (sm & 0x01010101u));
+}
+
+// M31: per-sign expanded mask pair. `pair` packs sm0 (low 32 bits) and
+// sm1 (high 32 bits) — both byte masks of 0x00/0xff per byte. We
+// precompute this table at WG init from `ksigns_iq2xs`, replacing two
+// branch-heavy `expand_signs_par` calls per iq2_dp4a_8 invocation
+// (~32 calls per lane in the inner loop).
 __device__ __forceinline__ int32_t iq2_dp4a_8_lds(
         uint64_t grid_val, uint32_t sign_idx,
-        const uint8_t* __restrict__ s_ksigns,
+        const uint64_t* __restrict__ s_sign_pair,
         const int8_t* q8, int32_t acc) {
-    const uint32_t s = s_ksigns[sign_idx];
-    const uint32_t signs = s * 0x01010101u;
-    const uint32_t sm0 = expand_signs_par(signs, 0x08040201u);
-    const uint32_t sm1 = expand_signs_par(signs, 0x80402010u);
-    const int32_t g0 = cond_neg_bytes_par((int32_t)(uint32_t)grid_val, sm0);
-    const int32_t g1 = cond_neg_bytes_par((int32_t)(uint32_t)(grid_val >> 32), sm1);
+    const uint64_t pair = s_sign_pair[sign_idx];
+    const uint32_t sm0 = (uint32_t)pair;
+    const uint32_t sm1 = (uint32_t)(pair >> 32);
+    const int32_t g0 = cond_neg_bytes_fast((int32_t)(uint32_t)grid_val, sm0);
+    const int32_t g1 = cond_neg_bytes_fast((int32_t)(uint32_t)(grid_val >> 32), sm1);
     acc = sudot4_par(g0, load_dword_par(q8 + 0), acc);
     acc = sudot4_par(g1, load_dword_par(q8 + 4), acc);
     return acc;
@@ -270,18 +283,18 @@ __device__ __forceinline__ int32_t iq2_dp4a_8_lds(
 __device__ __forceinline__ int32_t dot_iq2_pair_16_lds(
         uint8_t g0_idx, uint32_t s0_idx,
         uint8_t g1_idx, uint32_t s1_idx,
-        const uint8_t* __restrict__ s_ksigns,
+        const uint64_t* __restrict__ s_sign_pair,
         const uint64_t* __restrict__ s_grid,
         const int8_t* q8) {
     int32_t sum = 0;
-    sum = iq2_dp4a_8_lds(s_grid[g0_idx], s0_idx, s_ksigns, q8 + 0, sum);
-    sum = iq2_dp4a_8_lds(s_grid[g1_idx], s1_idx, s_ksigns, q8 + 8, sum);
+    sum = iq2_dp4a_8_lds(s_grid[g0_idx], s0_idx, s_sign_pair, q8 + 0, sum);
+    sum = iq2_dp4a_8_lds(s_grid[g1_idx], s1_idx, s_sign_pair, q8 + 8, sum);
     return sum;
 }
 
 __device__ __forceinline__ float dot_block_half_lds(
         const uint8_t* w_blk, const uint8_t* y_blk, unsigned int ib32_lo,
-        const uint8_t* __restrict__ s_ksigns,
+        const uint64_t* __restrict__ s_sign_pair,
         const uint64_t* __restrict__ s_grid) {
     const uint16_t wd = *(const uint16_t*)(w_blk + 0);
     const uint16_t* q2 = (const uint16_t*)(w_blk + 2) + (size_t)ib32_lo * 4u;
@@ -300,11 +313,11 @@ __device__ __forceinline__ float dot_block_half_lds(
         sumi += dot_iq2_pair_16_lds(
             (uint8_t)(aux0 & 0xffu),         (aux1 >>  0) & 127u,
             (uint8_t)((aux0 >>  8) & 0xffu), (aux1 >>  7) & 127u,
-            s_ksigns, s_grid, q8 + 0);
+            s_sign_pair, s_grid, q8 + 0);
         sumi += dot_iq2_pair_16_lds(
             (uint8_t)((aux0 >> 16) & 0xffu), (aux1 >> 14) & 127u,
             (uint8_t)((aux0 >> 24) & 0xffu), (aux1 >> 21) & 127u,
-            s_ksigns, s_grid, q8 + 16);
+            s_sign_pair, s_grid, q8 + 16);
         bsum += sumi * (int32_t)ls;
         q8 += 32;
     }
@@ -336,12 +349,23 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_batch(
     // spawning 6 workgroups that each independently re-read xq from
     // global memory, LDS-staging once per workgroup keeps the inner
     // dot_q2_16 loads in scratchpad.
-    __shared__ uint8_t  s_ksigns[128];
+    // M31: replaced s_ksigns[128] (1 B/entry) with s_sign_pair[128]
+    // (8 B/entry, packed sm0|sm1<<32). Eliminates two expand_signs_par
+    // calls per iq2_dp4a_8 invocation. WG init cost: 128 expands once
+    // per launch (amortized; original did ~16K expands per WG in the
+    // inner loop).
+    __shared__ uint64_t s_sign_pair[128];
     __shared__ uint64_t s_grid[256];
     __shared__ uint8_t  s_xq[16 * 292];  // BLOCK_Q8_K_BYTES * max n_blocks (16 for V4-Flash)
     const unsigned int tid = threadIdx.x;
-    if (tid < 128) s_ksigns[tid] = ksigns_iq2xs[tid];
-    if (tid < 256) s_grid[tid]   = iq2xxs_grid[tid];
+    if (tid < 128) {
+        const uint32_t s = ksigns_iq2xs[tid];
+        const uint32_t signs = s * 0x01010101u;
+        const uint32_t sm0 = expand_signs_par(signs, 0x08040201u);
+        const uint32_t sm1 = expand_signs_par(signs, 0x80402010u);
+        s_sign_pair[tid] = ((uint64_t)sm1 << 32) | (uint64_t)sm0;
+    }
+    if (tid < 256) s_grid[tid] = iq2xxs_grid[tid];
     // Cooperatively load xq into LDS. n_blocks * 292 bytes; 256 threads
     // each grab ~18 bytes. Bound by sizeof(s_xq) at compile time.
     const unsigned int xq_bytes = n_blocks * 292u;
@@ -375,8 +399,8 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_batch(
         const uint8_t* w_g = gate_row_base + (uint64_t)b * BLOCK_IQ2_XXS_BYTES;
         const uint8_t* w_u = up_row_base   + (uint64_t)b * BLOCK_IQ2_XXS_BYTES;
         const uint8_t* y   = s_xq          + (size_t)b   * BLOCK_Q8_K_BYTES;
-        g_sum += dot_block_half_lds(w_g, y, ib32_lo, s_ksigns, s_grid);
-        u_sum += dot_block_half_lds(w_u, y, ib32_lo, s_ksigns, s_grid);
+        g_sum += dot_block_half_lds(w_g, y, ib32_lo, s_sign_pair, s_grid);
+        u_sum += dot_block_half_lds(w_u, y, ib32_lo, s_sign_pair, s_grid);
     }
 
     g_sum = warp_sum_f32_par(g_sum);
