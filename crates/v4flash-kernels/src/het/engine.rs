@@ -266,6 +266,11 @@ pub struct HeterogeneousEngine {
     /// end-of-token extra swap keeps each layer's residual/residual_next
     /// pointing to stable physical buffers.
     pub dgpu_ffn_combine_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    /// M20: cache which HIP device is currently bound on this thread,
+    /// so set_current_cached() can skip the driver call when the
+    /// device hasn't actually changed. AtomicI32 (not Cell) so
+    /// HeterogeneousEngine stays Sync. `-1` = unknown.
+    pub current_device: std::sync::atomic::AtomicI32,
 }
 
 impl HeterogeneousEngine {
@@ -305,7 +310,7 @@ impl HeterogeneousEngine {
         self.dgpu.events.reset();
         self.igpu.events.reset();
 
-        self.dgpu.device.set_current()?;
+        self.set_current_cached(self.dgpu.device)?;
         dgpu_scratch.residual.copy_from_host(input_hc_host)?;
 
         let token_start = std::time::Instant::now();
@@ -332,7 +337,7 @@ impl HeterogeneousEngine {
         // initial state so layer N always operates on the same
         // physical buffers across every token.
         std::mem::swap(&mut dgpu_scratch.residual, &mut dgpu_scratch.residual_next);
-        self.dgpu.device.set_current()?;
+        self.set_current_cached(self.dgpu.device)?;
         self.dgpu.compute.synchronize()?;
         let token_elapsed_us = token_start.elapsed().as_micros() as u64;
 
@@ -370,6 +375,12 @@ impl HeterogeneousEngine {
                 &self.igpu.compute,
                 &self.igpu.xfer,
             )?;
+            // M20: re_anchor calls device.set_current() internally for
+            // each of the 4 tracks (last is igpu.xfer → igpu). That
+            // bypasses our set_current_cached, leaving the cache stale.
+            // Invalidate so the next forward_token's first
+            // set_current_cached is forced through.
+            self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Harvest per-kernel timings.
@@ -490,7 +501,21 @@ impl HeterogeneousEngine {
             dgpu_q_chain_pre_rope_graphs,
             dgpu_output_proj_post_rope_graphs,
             dgpu_ffn_combine_graphs,
+            current_device: std::sync::atomic::AtomicI32::new(-1),
         })
+    }
+
+    /// M20: set the HIP device only if the cached value differs from
+    /// the request. Skips redundant `hipSetDevice` driver calls in the
+    /// forward_layer loop (we toggle dGPU ↔ iGPU multiple times per
+    /// layer; each unconditional set_current was a few µs of host time).
+    pub fn set_current_cached(&self, dev: Device) -> eyre::Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.current_device.load(Ordering::Relaxed) != dev.id {
+            dev.set_current()?;
+            self.current_device.store(dev.id, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Open a perfetto device-time trace file. Subsequent
@@ -512,6 +537,16 @@ impl HeterogeneousEngine {
             &self.igpu.xfer,
         )?;
         self.perfetto = Some(std::sync::Mutex::new(exporter));
+        // M20: per-stage events are skipped by default (bench mode);
+        // perfetto export needs them on. Flip both pools on now.
+        self.dgpu.events.set_enabled(true);
+        self.igpu.events.set_enabled(true);
+        // DeviceTimingExporter::open ran Anchor::new() for each track,
+        // which calls device.set_current() and leaves whichever device
+        // was set last as current — bypassing our set_current cache.
+        // Invalidate so the first set_current_cached call after
+        // attach_perfetto is forced through.
+        self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }

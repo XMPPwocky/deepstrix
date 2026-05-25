@@ -27,9 +27,21 @@ use color_eyre::eyre;
 use v4flash_hip::{Event, Stream};
 
 /// Per-device ring of HIP events for kernel-scope timing.
+///
+/// `enabled` defaults to `false`: in that state, `stage()` returns a
+/// no-op guard and recording is skipped entirely. Each suppressed
+/// stage saves a pair of `hipEventRecord` calls, which the M20
+/// profiling pass found accumulated to ~100 µs per layer transition
+/// — roughly all of the dGPU compute-stream gap between consecutive
+/// captured graphs.
+///
+/// Enable by calling [`EventPool::set_enabled`]. The orchestrator's
+/// `attach_perfetto` flips both pools on automatically; tests that
+/// need the per-kernel INFO summary should also opt in.
 pub struct EventPool {
     inner: RefCell<EventPoolInner>,
     label: &'static str,
+    enabled: std::cell::Cell<bool>,
 }
 
 struct EventPoolInner {
@@ -67,7 +79,19 @@ impl EventPool {
                 pairs: Vec::with_capacity(capacity / 2),
             }),
             label,
+            enabled: std::cell::Cell::new(false),
         })
+    }
+
+    /// Turn recording on or off. When off, `stage()` returns a no-op
+    /// guard — no HIP events are recorded and `harvest()` returns
+    /// empty.
+    pub fn set_enabled(&self, on: bool) {
+        self.enabled.set(on);
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.get()
     }
 
     /// Reset for the next token. Drops all timing pairs.
@@ -79,11 +103,24 @@ impl EventPool {
 
     /// Open a timing scope on `stream` named `name`. Records a start event
     /// immediately. Returns a guard that records the end event on drop.
+    ///
+    /// When the pool is disabled, returns a no-op guard that records
+    /// nothing — neither the start nor end HIP event is issued. This
+    /// is the hot-path fast exit for bench/production runs.
     pub fn stage<'a>(
         &'a self,
         name: &'static str,
         stream: &'a Stream,
     ) -> eyre::Result<StageScope<'a>> {
+        if !self.enabled.get() {
+            return Ok(StageScope {
+                pool: self,
+                stream,
+                name,
+                start_idx: usize::MAX,
+                done: true,           // skip record_end
+            });
+        }
         let start_idx = {
             let mut inner = self.inner.borrow_mut();
             let idx = inner.next;

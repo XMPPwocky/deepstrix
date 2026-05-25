@@ -14,7 +14,7 @@ impl HeterogeneousEngine {
         scratch: &mut DgpuScratch,
         weights: &HetGlobalWeights,
     ) -> eyre::Result<()> {
-        self.dgpu.device.set_current()?;
+        self.set_current_cached(self.dgpu.device)?;
         let de = &self.dgpu;
         de.rms_nw.launch(
             &de.compute,

@@ -68,7 +68,7 @@ impl HeterogeneousEngine {
         // ============================================================
         // dGPU: mHC pre attn → attn_cur → attn_input_norm
         // ============================================================
-        self.dgpu.device.set_current()?;
+        self.set_current_cached(self.dgpu.device)?;
         let de = &self.dgpu;
 
         // M15.1: capture mhc_pre_attn (5 kernels). Reads
@@ -729,7 +729,7 @@ impl HeterogeneousEngine {
         }
 
         // Switch to iGPU for the MoE.
-        self.igpu.device.set_current()?;
+        self.set_current_cached(self.igpu.device)?;
         let ie = &self.igpu;
 
         if parallel {
@@ -870,7 +870,7 @@ impl HeterogeneousEngine {
         // dGPU: in serial mode, issue shared expert NOW. In parallel
         // mode, it was issued earlier — just wait for ffn_moe to arrive.
         // ============================================================
-        self.dgpu.device.set_current()?;
+        self.set_current_cached(self.dgpu.device)?;
         if !parallel {
             let _t_shared = de.events.stage("dgpu.shared_expert", &de.compute)?;
             let _s_shared = debug_span!("shared_expert").entered();
