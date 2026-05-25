@@ -171,7 +171,16 @@ impl MtpWeights {
         let ffn_up_shexp = load_to_device(mtp_gguf, "mtp.0.ffn_up_shexp.weight", dgpu_id)?;
         let ffn_down_shexp = load_to_device(mtp_gguf, "mtp.0.ffn_down_shexp.weight", dgpu_id)?;
 
-        let ffn_gate_inp = load_to_device(mtp_gguf, "mtp.0.ffn_gate_inp.weight", dgpu_id)?;
+        // MTP's ffn_gate_inp is F32 [N_EMBD, N_EXPERT] in the GGUF
+        // (main model uses F16). Convert on load so the existing
+        // f16.matvec can consume it.
+        use crate::forward::N_EXPERT;
+        let ffn_gate_inp = load_f32_as_f16_device_weight(
+            mtp_gguf,
+            "mtp.0.ffn_gate_inp.weight",
+            dgpu_id,
+            (N_EMBD * N_EXPERT) as usize,
+        )?;
         let router_bias_dev = {
             let t = mtp_gguf
                 .gguf()

@@ -19,6 +19,7 @@
 pub mod engine;
 pub mod forward_head;
 pub mod forward_layer;
+pub mod forward_mtp;
 pub mod mtp_weights;
 pub mod perfetto;
 pub mod scratch;

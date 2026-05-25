@@ -78,6 +78,13 @@ pub struct DeviceEngine {
     pub q8k: Q8KQuantize,
     pub iq2: Iq2XxsPairMatvec,
     pub q2k: Q2KAccumulateMatvec,
+    /// M40-P2: Q4_K matvec kernels (par-batched + pair-swiglu-batched).
+    /// Used by the MTP draft layer — antirez's MTP GGUF stores routed
+    /// experts as Q4_K, distinct from the main model's iq2_xxs + q2_k.
+    pub q4k: crate::q4_k::Q4KMatvec,
+    /// M40-P2: broadcast/tile kernel for the MTP HC-combine stage
+    /// (expand N_EMBD vector to N_HC × N_EMBD).
+    pub broadcast: crate::broadcast::BroadcastToHc,
     pub hc_sigmoid: HcSigmoidBias,
     pub hc_weighted: HcWeightedSum,
     pub hc_sinkhorn: HcSinkhorn,
@@ -127,6 +134,8 @@ impl DeviceEngine {
             q8k: Q8KQuantize::for_arch(arch)?,
             iq2: Iq2XxsPairMatvec::for_arch(arch)?,
             q2k: Q2KAccumulateMatvec::for_arch(arch)?,
+            q4k: crate::q4_k::Q4KMatvec::for_arch(arch)?,
+            broadcast: crate::broadcast::BroadcastToHc::for_arch(arch)?,
             hc_sigmoid: HcSigmoidBias::for_arch(arch)?,
             hc_weighted: HcWeightedSum::for_arch(arch)?,
             hc_sinkhorn: HcSinkhorn::for_arch(arch)?,

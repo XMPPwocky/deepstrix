@@ -12,6 +12,7 @@
 //! from the activation dump and asserts `max_abs_diff < threshold`.
 
 pub mod attention;
+pub mod broadcast;
 pub mod comp_kv_append;
 pub mod compressor;
 pub mod f16;
@@ -35,6 +36,7 @@ pub mod rope;
 pub mod weights;
 
 pub use attention::{AttentionMixed, AttentionSwa, ATTN_MIXED_MAX_KEYS, ATTN_SWA_MAX_KV};
+pub use broadcast::BroadcastToHc;
 pub use comp_kv_append::CompKvAppend;
 pub use compressor::{
     CompressorPool, CompressorStateShuffleR4, CompressorStateWrite, F16Roundtrip,
