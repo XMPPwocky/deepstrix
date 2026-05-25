@@ -459,6 +459,12 @@ pub struct IgpuScratch {
     pub d_ew_t1: DeviceBuffer<f32>,
     pub ffn_moe_t0: DeviceBuffer<f32>,
     pub ffn_moe_t1: DeviceBuffer<f32>,
+    /// M40-P5: per-token router_logits when the router runs on iGPU.
+    pub router_logits_t0: DeviceBuffer<f32>,
+    pub router_logits_t1: DeviceBuffer<f32>,
+    /// Per-token host-readback buffer for hash-router CPU select.
+    pub router_logits_host_t0: Vec<f32>,
+    pub router_logits_host_t1: Vec<f32>,
 }
 
 impl IgpuScratch {
@@ -514,6 +520,10 @@ impl IgpuScratch {
             d_ew_t1: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
             ffn_moe_t0: DeviceBuffer::new(device_id, N_EMBD as usize)?,
             ffn_moe_t1: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            router_logits_t0: DeviceBuffer::new(device_id, N_EXPERT as usize)?,
+            router_logits_t1: DeviceBuffer::new(device_id, N_EXPERT as usize)?,
+            router_logits_host_t0: vec![0f32; N_EXPERT as usize],
+            router_logits_host_t1: vec![0f32; N_EXPERT as usize],
         })
     }
 }

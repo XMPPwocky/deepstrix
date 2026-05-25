@@ -331,10 +331,44 @@ impl IgpuLayerWeights {
         let ratio = COMPRESS_RATIOS[layer as usize];
         let is_hash_router = layer < N_HASH_LAYERS;
 
-        // M16: router runs on dGPU; iGPU keeps None to free ~86 MB.
-        let ffn_gate_inp: Option<DeviceWeight> = None;
-        let tid2eid: Option<Vec<i32>> = None;
-        let router_bias: Option<Vec<f32>> = None;
+        // M40-P5.1: router moved BACK to iGPU for pair-forward, where
+        // starting iGPU MoE doesn't have to wait for dGPU shared_expert.
+        // ffn_gate_inp is small (~2 MB/layer F16) — the 86 MB OOM from M16
+        // came from putting all the LoRA stuff on iGPU too. Just the router
+        // matvec weight is cheap. router_bias for learned routers also lives
+        // here (small, ~1 KB).
+        let ffn_gate_inp: Option<DeviceWeight> = Some(load_to_device(
+            gguf,
+            &format!("blk.{layer}.ffn_gate_inp.weight"),
+            device_id,
+        )?);
+        let tid2eid: Option<Vec<i32>> = if is_hash_router {
+            Some(load_i32_tensor(
+                gguf,
+                &format!("blk.{layer}.ffn_gate_tid2eid.weight"),
+            )?)
+        } else {
+            None
+        };
+        let router_bias: Option<Vec<f32>> = if !is_hash_router {
+            let bias_name = format!("blk.{layer}.exp_probs_b.bias");
+            if let Some(t) = gguf.gguf().tensor(&bias_name) {
+                if t.dtype != GgufType::F32 {
+                    return Err(eyre!("{bias_name} dtype {:?} != F32", t.dtype));
+                }
+                let bytes = gguf.read_tensor(t)?;
+                Some(
+                    bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Routed expert weights — fully iGPU-resident (~1.2 GiB/layer).
         let gate = load_to_device(
@@ -362,8 +396,14 @@ impl IgpuLayerWeights {
             down_bytes_per_expert,
         };
 
-        // M16: router_bias_dev now lives on dGPU. iGPU keeps None.
-        let router_bias_dev: Option<DeviceBuffer<f32>> = None;
+        // M40-P5.1: router_bias_dev mirrors router_bias on iGPU.
+        let router_bias_dev: Option<DeviceBuffer<f32>> = if let Some(b) = router_bias.as_ref() {
+            let mut buf = DeviceBuffer::<f32>::new(device_id, b.len())?;
+            buf.copy_from_host(b)?;
+            Some(buf)
+        } else {
+            None
+        };
 
         // M14L: attn compressor moved to dGPU. Field kept (None) so the
         // IgpuLayerWeights shape is unchanged for non-compressor consumers

@@ -966,82 +966,11 @@ impl HeterogeneousEngine {
             }
         }
 
-        // Stage 11: router — learned path CAPTURED. Hash router (L<3) skips
-        // capture because it needs host sync + CPU work; runs direct each time.
-        {
-            let _t = de.events.stage("dgpu.router_pair", compute)?;
-            if dlw.is_hash_router {
-                de.f16.matvec_two_inputs(
-                    compute,
-                    &mut t0.router_logits,
-                    &mut t1.router_logits,
-                    &dlw.ffn_gate_inp.buffer,
-                    &t0.ffn_input_norm,
-                    &t1.ffn_input_norm,
-                    N_EXPERT,
-                    N_EMBD,
-                )?;
-                compute.synchronize()?;
-                t0.router_logits.copy_to_host(&mut t0.router_logits_host)?;
-                t1.router_logits.copy_to_host(&mut t1.router_logits_host)?;
-                let tid2eid = dlw
-                    .tid2eid
-                    .as_ref()
-                    .ok_or_else(|| eyre!("hash router missing tid2eid"))?;
-                let (sel0, w0) = hash_router_select(tid2eid, token_id_0, &t0.router_logits_host);
-                let (sel1, w1) = hash_router_select(tid2eid, token_id_1, &t1.router_logits_host);
-                t0.d_selected.copy_from_host(&sel0)?;
-                t0.d_ew.copy_from_host(&w0)?;
-                t1.d_selected.copy_from_host(&sel1)?;
-                t1.d_ew.copy_from_host(&w1)?;
-            } else {
-                let graph_slot = &self.dgpu_pair_router_graphs[layer as usize];
-                let mut guard = graph_slot.lock().unwrap();
-                if guard.is_none() {
-                    compute.begin_capture(
-                        v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                    )?;
-                    de.f16.matvec_two_inputs(
-                        compute,
-                        &mut t0.router_logits,
-                        &mut t1.router_logits,
-                        &dlw.ffn_gate_inp.buffer,
-                        &t0.ffn_input_norm,
-                        &t1.ffn_input_norm,
-                        N_EXPERT,
-                        N_EMBD,
-                    )?;
-                    de.router_topk.launch(
-                        compute,
-                        &mut t0.d_selected,
-                        &mut t0.d_ew,
-                        &t0.router_logits,
-                        dlw.router_bias_dev.as_ref(),
-                        N_EXPERT,
-                        N_EXPERT_USED as u32,
-                        EXPERT_WEIGHT_SCALE,
-                        ROUTER_WEIGHT_EPS,
-                    )?;
-                    de.router_topk.launch(
-                        compute,
-                        &mut t1.d_selected,
-                        &mut t1.d_ew,
-                        &t1.router_logits,
-                        dlw.router_bias_dev.as_ref(),
-                        N_EXPERT,
-                        N_EXPERT_USED as u32,
-                        EXPERT_WEIGHT_SCALE,
-                        ROUTER_WEIGHT_EPS,
-                    )?;
-                    let graph = compute.end_capture()?;
-                    let exec = graph.instantiate()?;
-                    exec.launch(compute)?;
-                    *guard = Some(exec);
-                } else {
-                    guard.as_ref().unwrap().launch(compute)?;
-                }
-            }
-        }
+        // M40-P5: router MOVED to iGPU. After mhc_pre_ffn writes
+        // ffn_input_norm, immediately peer-push it to iGPU and let the iGPU
+        // run its own router + MoE off the dGPU critical path. dGPU then
+        // concurrently runs shared_expert. iGPU MoE no longer waits on dGPU's
+        // shared_expert; only on the (much smaller) ffn_input_norm push.
 
         // ===== Stages 10 + 12 + 13 reordered + de.xfer dropped =====
         // M40-P4.7: peer pushes now happen on de.compute (the single dGPU
@@ -1143,31 +1072,116 @@ impl HeterogeneousEngine {
             }
         }
 
-        // Peer pushes for both tokens on de.compute (FIFO with shared_expert).
-        // Cost of the serialization: ~6 pushes × ~1-2 µs each = ~10 µs per
-        // layer. In exchange: no cross-stream events, captured-graph friendly.
+        // Peer-push ONLY ffn_input_norm now. d_selected/d_ew are computed on
+        // iGPU via router_pair_igpu (queued below on ie.compute). selected_pushed
+        // event signals iGPU that ffn_input_norm has landed; router can start.
         {
             let _t = de.events.stage("dgpu.peer_push_pair", compute)?;
             peer_push_f32(&t0.ffn_input_norm, &mut igpu_scratch.ffn_input_norm_recv_t0, compute)?;
-            peer_push_i32(&t0.d_selected, &mut igpu_scratch.d_selected_t0, compute)?;
-            peer_push_f32(&t0.d_ew, &mut igpu_scratch.d_ew_t0, compute)?;
             peer_push_f32(&t1.ffn_input_norm, &mut igpu_scratch.ffn_input_norm_recv_t1, compute)?;
-            peer_push_i32(&t1.d_selected, &mut igpu_scratch.d_selected_t1, compute)?;
-            peer_push_f32(&t1.d_ew, &mut igpu_scratch.d_ew_t1, compute)?;
-            // Cross-device events: iGPU MoEs wait on these before starting.
             evt_t0.selected_pushed.record(compute)?;
             evt_t1.selected_pushed.record(compute)?;
         }
 
-        // ===== iGPU MoE for both tokens (FIFO on ie.compute) =====
+        // ===== iGPU ROUTER + MoE for both tokens (FIFO on ie.compute) =====
+        // M40-P5: router runs on iGPU. ie.compute waits for ffn_input_norm
+        // push, runs router for both tokens (matvec + per-token topk/hash),
+        // then proceeds straight to MoE. Whole thing happens off the dGPU
+        // critical path — dGPU does shared_expert concurrently.
         self.set_current_cached(self.igpu.device)?;
         let ie = &self.igpu;
         let gbpe = ilw.routed.gate_bytes_per_expert;
         let ubpe = ilw.routed.up_bytes_per_expert;
         let dbpe = ilw.routed.down_bytes_per_expert;
         let mid_blocks_bytes = (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
-        // t0 MoE
+
+        // Wait for both tokens' ffn_input_norm to land (FIFO on de.compute,
+        // so waiting on the later one covers both).
         ie.compute.wait_event(&evt_t0.selected_pushed)?;
+        ie.compute.wait_event(&evt_t1.selected_pushed)?;
+
+        // Router on iGPU.
+        {
+            let _t = ie.events.stage("igpu.router_pair", &ie.compute)?;
+            let ffn_gate_inp = ilw
+                .ffn_gate_inp
+                .as_ref()
+                .ok_or_else(|| eyre!("L{}: iGPU ffn_gate_inp not loaded", ilw.layer_idx))?;
+            if ilw.is_hash_router {
+                // Hash router: matvec, host-sync iGPU, CPU select, host-write back.
+                ie.f16.matvec_two_inputs(
+                    &ie.compute,
+                    &mut igpu_scratch.router_logits_t0,
+                    &mut igpu_scratch.router_logits_t1,
+                    &ffn_gate_inp.buffer,
+                    &igpu_scratch.ffn_input_norm_recv_t0,
+                    &igpu_scratch.ffn_input_norm_recv_t1,
+                    N_EXPERT,
+                    N_EMBD,
+                )?;
+                ie.compute.synchronize()?;
+                igpu_scratch
+                    .router_logits_t0
+                    .copy_to_host(&mut igpu_scratch.router_logits_host_t0)?;
+                igpu_scratch
+                    .router_logits_t1
+                    .copy_to_host(&mut igpu_scratch.router_logits_host_t1)?;
+                let tid2eid = ilw
+                    .tid2eid
+                    .as_ref()
+                    .ok_or_else(|| eyre!("hash router missing tid2eid on iGPU"))?;
+                let (sel0, w0) = hash_router_select(
+                    tid2eid,
+                    token_id_0,
+                    &igpu_scratch.router_logits_host_t0,
+                );
+                let (sel1, w1) = hash_router_select(
+                    tid2eid,
+                    token_id_1,
+                    &igpu_scratch.router_logits_host_t1,
+                );
+                igpu_scratch.d_selected_t0.copy_from_host(&sel0)?;
+                igpu_scratch.d_ew_t0.copy_from_host(&w0)?;
+                igpu_scratch.d_selected_t1.copy_from_host(&sel1)?;
+                igpu_scratch.d_ew_t1.copy_from_host(&w1)?;
+            } else {
+                ie.f16.matvec_two_inputs(
+                    &ie.compute,
+                    &mut igpu_scratch.router_logits_t0,
+                    &mut igpu_scratch.router_logits_t1,
+                    &ffn_gate_inp.buffer,
+                    &igpu_scratch.ffn_input_norm_recv_t0,
+                    &igpu_scratch.ffn_input_norm_recv_t1,
+                    N_EXPERT,
+                    N_EMBD,
+                )?;
+                ie.router_topk.launch(
+                    &ie.compute,
+                    &mut igpu_scratch.d_selected_t0,
+                    &mut igpu_scratch.d_ew_t0,
+                    &igpu_scratch.router_logits_t0,
+                    ilw.router_bias_dev.as_ref(),
+                    N_EXPERT,
+                    N_EXPERT_USED as u32,
+                    EXPERT_WEIGHT_SCALE,
+                    ROUTER_WEIGHT_EPS,
+                )?;
+                ie.router_topk.launch(
+                    &ie.compute,
+                    &mut igpu_scratch.d_selected_t1,
+                    &mut igpu_scratch.d_ew_t1,
+                    &igpu_scratch.router_logits_t1,
+                    ilw.router_bias_dev.as_ref(),
+                    N_EXPERT,
+                    N_EXPERT_USED as u32,
+                    EXPERT_WEIGHT_SCALE,
+                    ROUTER_WEIGHT_EPS,
+                )?;
+            }
+        }
+
+        // t0 MoE — no more wait_event needed (we already waited on selected_pushed
+        // and the router work is FIFO on ie.compute right above).
         {
             let _t = ie.events.stage("igpu.moe_t0", &ie.compute)?;
             ie.q8k.launch(
@@ -1215,8 +1229,7 @@ impl HeterogeneousEngine {
             peer_push_f32(&igpu_scratch.ffn_moe_t0, &mut t0.ffn_moe_recv, &ie.compute)?;
             evt_t0.moe_arrived.record(&ie.compute)?;
         }
-        // t1 MoE
-        ie.compute.wait_event(&evt_t1.selected_pushed)?;
+        // t1 MoE — already waited on selected_pushed above (before router).
         {
             let _t = ie.events.stage("igpu.moe_t1", &ie.compute)?;
             ie.q8k.launch(
