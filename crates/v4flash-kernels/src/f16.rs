@@ -234,7 +234,6 @@ impl F16Matvec {
             ));
         }
 
-        let function = self.wide.get_function("f16_matvec_two_inputs")?;
         let mut out_a_ptr = out_a.raw();
         let mut out_b_ptr = out_b.raw();
         let mut w_ptr = weight.raw();
@@ -251,13 +250,28 @@ impl F16Matvec {
             &mut k_v as *mut _ as *mut c_void,
             &mut n_rows_v as *mut _ as *mut c_void,
         ];
-        let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
-        let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
-        let cfg = LaunchConfig {
-            grid: (grid_x, 1, 1),
-            block: (block_x, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        // M40-P7: dispatch narrow variant for tiny n_rows (e.g. HC_MIX_DIM=24)
+        // — the wide variant launches only 3 WGs and runs at ~1.5% peak BW.
+        // Narrow uses 1 WG per row with 256 threads cooperating per row →
+        // better CU occupancy, ~3x faster on narrow shapes.
+        if n_rows < NARROW_ROWS_THRESHOLD {
+            let function = self.narrow.get_function("f16_matvec_narrow_two_inputs")?;
+            let cfg = LaunchConfig {
+                grid: (n_rows, 1, 1),
+                block: (NARROW_BLOCK_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { function.launch_raw(cfg, stream, &mut args) }
+        } else {
+            let function = self.wide.get_function("f16_matvec_two_inputs")?;
+            let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
+            let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
+            let cfg = LaunchConfig {
+                grid: (grid_x, 1, 1),
+                block: (block_x, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { function.launch_raw(cfg, stream, &mut args) }
+        }
     }
 }
