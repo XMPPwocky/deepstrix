@@ -239,6 +239,20 @@ impl HetLayerState {
 pub struct HetModelState {
     pub layers: Vec<HetLayerState>,
     pub n_kv_max: u32,
+    /// M40-P2: MTP layer's own KV cache + counter. Separate from the
+    /// main model's KV (positions advance independently — MTP processes
+    /// speculative future tokens that may be rejected). `None` if MTP
+    /// is disabled for this session.
+    pub mtp: Option<MtpLayerState>,
+}
+
+/// M40-P2: per-session MTP layer state. SWA-windowed raw KV cache on
+/// dGPU (same shape as a main-model layer's). Spec decode tracks
+/// `mtp_n_raw` separately so that on rejection of speculative future
+/// tokens the counter can be rolled back without copying cache bytes.
+pub struct MtpLayerState {
+    pub kv_cache: DeviceBuffer<f32>,
+    pub n_raw: u32,
 }
 
 impl HetModelState {
@@ -287,7 +301,28 @@ impl HetModelState {
                 kv_cache_backup: None,
             });
         }
-        Ok(Self { layers, n_kv_max })
+        Ok(Self {
+            layers,
+            n_kv_max,
+            mtp: None,
+        })
+    }
+
+    /// M40-P2: lazily allocate the MTP layer's KV cache on dGPU. Called
+    /// by spec-decode setup once MTP is loaded; safe to call multiple
+    /// times (no-op if already allocated).
+    pub fn alloc_mtp(&mut self, dgpu_device: Device) -> eyre::Result<()> {
+        if self.mtp.is_some() {
+            return Ok(());
+        }
+        dgpu_device.set_current()?;
+        let raw_rows = SWA_WINDOW.max(self.n_kv_max);
+        let kv_cache = DeviceBuffer::new(
+            dgpu_device.id,
+            (raw_rows as usize) * (N_HEAD_DIM as usize),
+        )?;
+        self.mtp = Some(MtpLayerState { kv_cache, n_raw: 0 });
+        Ok(())
     }
 
     /// Bulk restore_async — convenience for restoring all per-layer

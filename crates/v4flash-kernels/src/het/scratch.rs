@@ -117,6 +117,28 @@ pub struct DgpuScratch {
     /// M40-P1: held copy of token0's logits in a pair-forward so they
     /// survive token1's head pass overwriting `logits`.
     pub logits_token0: DeviceBuffer<f32>,
+
+    // ----- M40-P2: MTP draft scratch (dGPU side) -----
+    /// Embedded last token (N_EMBD floats).
+    pub mtp_embed: DeviceBuffer<f32>,
+    /// `enorm(mtp_embed)` (N_EMBD).
+    pub mtp_enorm: DeviceBuffer<f32>,
+    /// `e_proj(mtp_enorm)` (N_EMBD).
+    pub mtp_eproj: DeviceBuffer<f32>,
+    /// `mtp_eproj` repeated across N_HC rows (HC_DIM).
+    pub mtp_eproj_hc: DeviceBuffer<f32>,
+    /// Per-row RMS norm of prev_hc using `hnorm` (HC_DIM).
+    pub mtp_hnorm_hc: DeviceBuffer<f32>,
+    /// `h_proj(mtp_hnorm_hc)` per row (HC_DIM).
+    pub mtp_hproj_hc: DeviceBuffer<f32>,
+    /// `mtp_eproj_hc + mtp_hproj_hc` (HC_DIM) — input residual for the MTP layer.
+    pub mtp_input_hc: DeviceBuffer<f32>,
+    /// Ping-pong: current MTP HC state, swapping with `mtp_next_hc`
+    /// across chained draft iterations.
+    pub mtp_state_hc: DeviceBuffer<f32>,
+    pub mtp_next_hc: DeviceBuffer<f32>,
+    /// MTP head output (N_VOCAB).
+    pub mtp_logits: DeviceBuffer<f32>,
 }
 
 impl DgpuScratch {
@@ -192,6 +214,17 @@ impl DgpuScratch {
             residual_stash_token0: DeviceBuffer::new(device_id, HC_DIM as usize)?,
             residual_stash_token1: DeviceBuffer::new(device_id, HC_DIM as usize)?,
             logits_token0: DeviceBuffer::new(device_id, N_VOCAB as usize)?,
+
+            mtp_embed: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            mtp_enorm: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            mtp_eproj: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            mtp_eproj_hc: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            mtp_hnorm_hc: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            mtp_hproj_hc: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            mtp_input_hc: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            mtp_state_hc: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            mtp_next_hc: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            mtp_logits: DeviceBuffer::new(device_id, N_VOCAB as usize)?,
         })
     }
 }

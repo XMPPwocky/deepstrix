@@ -30,7 +30,7 @@ pub mod weights;
 pub use engine::{DeviceEngine, ExecMode, HeterogeneousEngine};
 pub use mtp_weights::{MtpRoutedExperts, MtpWeights};
 pub use scratch::{DgpuScratch, IgpuScratch};
-pub use state::{HetCompressorState, HetLayerState, HetModelState};
+pub use state::{HetCompressorState, HetLayerState, HetModelState, MtpLayerState};
 pub use weights::{
     DgpuLayerWeights, HetGlobalWeights, HetModelWeights, IgpuLayerWeights,
 };

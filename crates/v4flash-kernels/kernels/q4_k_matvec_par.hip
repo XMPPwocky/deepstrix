@@ -143,6 +143,75 @@ __device__ __forceinline__ float warp_sum_f32_q4k(float v) {
     return v;
 }
 
+// q4_k_pair_matvec_fused_swiglu_batch — fused gate × up × swiglu × ew
+// for routed-MoE gate+up step (the MTP equivalent of iq2's
+// pair_matvec_fused_swiglu_batch). Per slot s in [0, n_used):
+//   gate_s[r] = dot(W_gate[selected[s], r], xq)
+//   up_s[r]   = dot(W_up[selected[s], r],   xq)
+//   mid[s, r] = silu(clamp(gate_s)) * clamp(up_s) * expert_w[s]
+//
+// Layout:
+//   grid:  (n_rows / 8, n_used, 1)
+//   block: (256, 1, 1)
+//   8 rows per workgroup, 32 lanes per warp, 4 lanes per super-block,
+//   8 super-blocks per warp (for n_blocks_in = N_EMBD/256 = 16, each
+//   lane iterates 2 times over its super-block stripe).
+extern "C" __global__ void q4_k_pair_matvec_fused_swiglu_batch(
+        float          * __restrict__ mid,           // [n_used, n_rows]
+        const uint8_t  * __restrict__ gate_w_base,
+        const uint8_t  * __restrict__ up_w_base,
+        const uint8_t  * __restrict__ xq,            // [n_blocks_in * BLOCK_Q8_K_BYTES]
+        const float    * __restrict__ expert_w,      // [n_used]
+        const int      * __restrict__ selected,      // [n_used]
+        unsigned int     gate_bpe,
+        unsigned int     up_bpe,
+        float            clamp,
+        unsigned int     n_rows,
+        unsigned int     n_blocks_in) {
+    const unsigned int slot         = blockIdx.y;
+    const unsigned int row_in_block = threadIdx.x / 32u;
+    const unsigned int lane         = threadIdx.x & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    if (row >= n_rows) return;
+
+    const unsigned int block_lane = lane >> 2u;
+    const unsigned int sub        = lane & 3u;
+
+    const int e = selected[slot];
+    const uint8_t* gate_row_base = gate_w_base
+                                 + (uint64_t)e * (uint64_t)gate_bpe
+                                 + (uint64_t)row * n_blocks_in * BLOCK_Q4_K_BYTES;
+    const uint8_t* up_row_base   = up_w_base
+                                 + (uint64_t)e * (uint64_t)up_bpe
+                                 + (uint64_t)row * n_blocks_in * BLOCK_Q4_K_BYTES;
+
+    float g_sum = 0.0f;
+    float u_sum = 0.0f;
+
+    for (unsigned int b = block_lane; b < n_blocks_in; b += 8u) {
+        const uint8_t* w_g = gate_row_base + (uint64_t)b * BLOCK_Q4_K_BYTES;
+        const uint8_t* w_u = up_row_base   + (uint64_t)b * BLOCK_Q4_K_BYTES;
+        const uint8_t* y   = xq            + (uint64_t)b * BLOCK_Q8_K_BYTES;
+        g_sum += dot_block_quarter_q4k(w_g, y, sub);
+        u_sum += dot_block_quarter_q4k(w_u, y, sub);
+    }
+
+    g_sum = warp_sum_f32_q4k(g_sum);
+    u_sum = warp_sum_f32_q4k(u_sum);
+
+    if (lane == 0) {
+        const float ew = expert_w[slot];
+        if (clamp > 1.0e-6f) {
+            if (g_sum > clamp)  g_sum = clamp;
+            if (u_sum > clamp)  u_sum = clamp;
+            if (u_sum < -clamp) u_sum = -clamp;
+        }
+        const float sig = 1.0f / (1.0f + expf(-g_sum));
+        mid[(uint64_t)slot * (uint64_t)n_rows + (uint64_t)row] =
+            g_sum * sig * u_sum * ew;
+    }
+}
+
 // q4_k_matvec_par_batched — direct port of q2_k_matvec_par_batched with
 // the dot_block_quarter swap for Q4_K. Writes summed result over n_used
 // experts to out[n_rows]; routing comes from selected[n_used] (expert
