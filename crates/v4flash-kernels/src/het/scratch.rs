@@ -118,6 +118,28 @@ pub struct DgpuScratch {
     /// survive token1's head pass overwriting `logits`.
     pub logits_token0: DeviceBuffer<f32>,
 
+    // ----- M40-P3: per-token stashes for substage-interleaved pair forward -----
+    // These persist the pre_moe outputs (after_attn_hc, ffn_input_norm, split)
+    // and the post_moe outputs (residual_next) across the interleaved layer
+    // flow. token0's pre_moe writes the shared scratch buffers, we stash to
+    // _t0; token1's pre_moe overwrites; we stash to _t1; then post_moe restores
+    // each token's stash before running shared_expert/ffn_combine for that token.
+    // (Same trick as Phase 1's residual_stash but for more buffers.)
+    pub after_attn_hc_stash_t0: DeviceBuffer<f32>,
+    pub after_attn_hc_stash_t1: DeviceBuffer<f32>,
+    pub ffn_input_norm_stash_t0: DeviceBuffer<f32>,
+    pub ffn_input_norm_stash_t1: DeviceBuffer<f32>,
+    pub split_stash_t0: DeviceBuffer<f32>,
+    pub split_stash_t1: DeviceBuffer<f32>,
+    pub residual_next_stash_t0: DeviceBuffer<f32>,
+    pub residual_next_stash_t1: DeviceBuffer<f32>,
+    pub ffn_moe_recv_stash_t0: DeviceBuffer<f32>,
+    pub ffn_moe_recv_stash_t1: DeviceBuffer<f32>,
+    pub d_selected_stash_t0: DeviceBuffer<i32>,
+    pub d_selected_stash_t1: DeviceBuffer<i32>,
+    pub d_ew_stash_t0: DeviceBuffer<f32>,
+    pub d_ew_stash_t1: DeviceBuffer<f32>,
+
     // ----- M40-P2: MTP draft scratch (dGPU side) -----
     /// Embedded last token (N_EMBD floats).
     pub mtp_embed: DeviceBuffer<f32>,
@@ -215,6 +237,21 @@ impl DgpuScratch {
             residual_stash_token1: DeviceBuffer::new(device_id, HC_DIM as usize)?,
             logits_token0: DeviceBuffer::new(device_id, N_VOCAB as usize)?,
 
+            after_attn_hc_stash_t0: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            after_attn_hc_stash_t1: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            ffn_input_norm_stash_t0: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            ffn_input_norm_stash_t1: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            split_stash_t0: DeviceBuffer::new(device_id, HC_MIX_DIM as usize)?,
+            split_stash_t1: DeviceBuffer::new(device_id, HC_MIX_DIM as usize)?,
+            residual_next_stash_t0: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            residual_next_stash_t1: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            ffn_moe_recv_stash_t0: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            ffn_moe_recv_stash_t1: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            d_selected_stash_t0: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
+            d_selected_stash_t1: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
+            d_ew_stash_t0: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
+            d_ew_stash_t1: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
+
             mtp_embed: DeviceBuffer::new(device_id, N_EMBD as usize)?,
             mtp_enorm: DeviceBuffer::new(device_id, N_EMBD as usize)?,
             mtp_eproj: DeviceBuffer::new(device_id, N_EMBD as usize)?,
@@ -276,6 +313,22 @@ pub struct IgpuScratch {
     /// but the read is 24 bytes vs the previous 1 KB logits roundtrip.
     pub d_selected: DeviceBuffer<i32>,
     pub host_selected: Vec<i32>,
+
+    // ----- M40-P3: per-token recv + output buffers for substage pair -----
+    // In the substage-interleaved pair forward, we push t0's inputs and
+    // immediately start the next dGPU work; iGPU MoE_t0 consumes these
+    // buffers asynchronously. If we then push t1 to the SAME recv buffers
+    // before MoE_t0 is done reading, MoE_t0 sees t1's data. Per-token
+    // recv buffers eliminate this race. Likewise per-token ffn_moe output
+    // so the iGPU.xfer push back to dGPU.ffn_moe_recv_t0/t1 doesn't race.
+    pub ffn_input_norm_recv_t0: DeviceBuffer<f32>,
+    pub ffn_input_norm_recv_t1: DeviceBuffer<f32>,
+    pub d_selected_t0: DeviceBuffer<i32>,
+    pub d_selected_t1: DeviceBuffer<i32>,
+    pub d_ew_t0: DeviceBuffer<f32>,
+    pub d_ew_t1: DeviceBuffer<f32>,
+    pub ffn_moe_t0: DeviceBuffer<f32>,
+    pub ffn_moe_t1: DeviceBuffer<f32>,
 }
 
 impl IgpuScratch {
@@ -322,6 +375,15 @@ impl IgpuScratch {
 
             d_selected: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
             host_selected: vec![0i32; N_EXPERT_USED],
+
+            ffn_input_norm_recv_t0: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            ffn_input_norm_recv_t1: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            d_selected_t0: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
+            d_selected_t1: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
+            d_ew_t0: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
+            d_ew_t1: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
+            ffn_moe_t0: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            ffn_moe_t1: DeviceBuffer::new(device_id, N_EMBD as usize)?,
         })
     }
 }

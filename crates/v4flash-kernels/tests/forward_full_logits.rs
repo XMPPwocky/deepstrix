@@ -844,3 +844,254 @@ fn forward_pair_matches_sequential() -> eyre::Result<()> {
     );
     Ok(())
 }
+
+/// M40-P3.3: validate `forward_pair_interleaved` against sequential
+/// forward_token x2. Identical structure to forward_pair_matches_sequential
+/// but exercises the substage-interleaved path. Should produce
+/// bit-equivalent logits (same kernels, just rescheduled with per-token
+/// stash/restore).
+#[test]
+#[ignore]
+fn forward_pair_interleaved_matches_sequential() -> eyre::Result<()> {
+    install_panic_handler()?;
+    eprintln!("=== forward_pair_interleaved vs sequential oracle ===");
+
+    let dump = ActivationDump::open(dump_dir())?;
+    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let token_seq = build_token_sequence(&dump)?;
+    let dgpu = pick_dgpu_device()?;
+    let igpu = pick_igpu_device()?;
+    let dgpu_arch = dgpu.properties()?.gcn_arch_name;
+    let igpu_arch = igpu.properties()?.gcn_arch_name;
+
+    let rope_for_layer = |layer: i32| -> eyre::Result<RopeParams> {
+        let entry = dump
+            .weight("rope_params", layer)
+            .ok_or_else(|| eyre!("missing weight:rope_params for L{layer}"))?;
+        let floats = dump.read_f32(entry)?;
+        let n_ctx_orig = if floats[2] != 0.0 { ROPE_ORIG_CTX } else { 0 };
+        RopeParams::from_dump_blob(&floats, n_ctx_orig)
+    };
+
+    eprintln!("loading weights...");
+    let weights = HetModelWeights::load_all(&gguf, dgpu, igpu, &rope_for_layer)?;
+    let engine =
+        HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
+    let mut dgpu_scratch = DgpuScratch::alloc(dgpu)?;
+    let mut igpu_scratch = IgpuScratch::alloc(igpu)?;
+    let n_positions = dump.n_logit_rows as i32 + PROMPT_LEN - 1;
+
+    let pair_positions: Vec<i32> = vec![0, 2, 5, 8, 15]
+        .into_iter()
+        .filter(|&p| p < n_positions - 1)
+        .collect();
+
+    let mut total_kl_0: f64 = 0.0;
+    let mut total_kl_1: f64 = 0.0;
+    let mut max_kl_0: f64 = 0.0;
+    let mut max_kl_1: f64 = 0.0;
+    let mut all_match = true;
+
+    for &pos in pair_positions.iter() {
+        eprintln!(
+            "--- interleaved pair at pos={pos} (t0={}, t1={}) ---",
+            token_seq[pos as usize],
+            token_seq[(pos + 1) as usize]
+        );
+        let t0 = token_seq[pos as usize];
+        let t1 = token_seq[(pos + 1) as usize];
+        let inp0 = dump
+            .tensor("layer_input_residual", 0, pos)
+            .ok_or_else(|| eyre!("missing L0 input at pos {pos}"))?;
+        let inp1 = dump
+            .tensor("layer_input_residual", 0, pos + 1)
+            .ok_or_else(|| eyre!("missing L0 input at pos {}", pos + 1))?;
+        let input_hc_0 = dump.read_f32(inp0)?;
+        let input_hc_1 = dump.read_f32(inp1)?;
+
+        let mut state = HetModelState::alloc(dgpu, igpu, n_positions as u32)?;
+        for warm_pos in 0..pos {
+            let warm_t = token_seq[warm_pos as usize];
+            let warm_inp = dump
+                .tensor("layer_input_residual", 0, warm_pos)
+                .ok_or_else(|| eyre!("missing L0 input at pos {warm_pos}"))?;
+            let warm_hc = dump.read_f32(warm_inp)?;
+            engine.forward_token(
+                &mut dgpu_scratch,
+                &mut igpu_scratch,
+                &mut state,
+                &weights,
+                &warm_hc,
+                warm_pos as u32,
+                warm_t,
+            )?;
+        }
+
+        // Host-side snapshot of layer state (counters + arrays).
+        let mut h_kv: Vec<Vec<f32>> = Vec::new();
+        let mut h_state_kv: Vec<Option<Vec<f32>>> = Vec::new();
+        let mut h_state_score: Vec<Option<Vec<f32>>> = Vec::new();
+        let mut h_comp_kv: Vec<Option<Vec<f32>>> = Vec::new();
+        let mut h_idx_kv: Vec<Option<Vec<f32>>> = Vec::new();
+        let mut h_idx_score: Vec<Option<Vec<f32>>> = Vec::new();
+        let mut h_idx_comp_kv: Vec<Option<Vec<f32>>> = Vec::new();
+        let mut s_n_raw: Vec<u32> = Vec::new();
+        let mut s_n_comp: Vec<u32> = Vec::new();
+        let mut s_n_idx_comp: Vec<u32> = Vec::new();
+        for layer in state.layers.iter() {
+            let mut kv = vec![0f32; layer.kv_cache.len()];
+            layer.kv_cache.copy_to_host(&mut kv)?;
+            h_kv.push(kv);
+            s_n_raw.push(layer.n_raw);
+            if let Some(c) = layer.compressor.as_ref() {
+                let mut a = vec![0f32; c.state_kv.len()];
+                c.state_kv.copy_to_host(&mut a)?;
+                let mut b = vec![0f32; c.state_score.len()];
+                c.state_score.copy_to_host(&mut b)?;
+                let mut ck = vec![0f32; c.comp_kv.len()];
+                c.comp_kv.copy_to_host(&mut ck)?;
+                h_state_kv.push(Some(a));
+                h_state_score.push(Some(b));
+                h_comp_kv.push(Some(ck));
+                s_n_comp.push(c.n_comp);
+            } else {
+                h_state_kv.push(None);
+                h_state_score.push(None);
+                h_comp_kv.push(None);
+                s_n_comp.push(0);
+            }
+            if let Some(i) = layer.indexer_compressor.as_ref() {
+                let mut a = vec![0f32; i.state_kv.len()];
+                i.state_kv.copy_to_host(&mut a)?;
+                let mut b = vec![0f32; i.state_score.len()];
+                i.state_score.copy_to_host(&mut b)?;
+                let mut ck = vec![0f32; i.comp_kv.len()];
+                i.comp_kv.copy_to_host(&mut ck)?;
+                h_idx_kv.push(Some(a));
+                h_idx_score.push(Some(b));
+                h_idx_comp_kv.push(Some(ck));
+                s_n_idx_comp.push(i.n_comp);
+            } else {
+                h_idx_kv.push(None);
+                h_idx_score.push(None);
+                h_idx_comp_kv.push(None);
+                s_n_idx_comp.push(0);
+            }
+        }
+        let restore = |state: &mut HetModelState,
+                       engine: &HeterogeneousEngine|
+         -> eyre::Result<()> {
+            for (i, layer) in state.layers.iter_mut().enumerate() {
+                layer.n_raw = s_n_raw[i];
+                layer.kv_cache.copy_from_host(&h_kv[i])?;
+                if let Some(c) = layer.compressor.as_mut() {
+                    c.n_comp = s_n_comp[i];
+                    c.state_kv.copy_from_host(h_state_kv[i].as_ref().unwrap())?;
+                    c.state_score
+                        .copy_from_host(h_state_score[i].as_ref().unwrap())?;
+                    c.comp_kv.copy_from_host(h_comp_kv[i].as_ref().unwrap())?;
+                }
+                if let Some(idx) = layer.indexer_compressor.as_mut() {
+                    idx.n_comp = s_n_idx_comp[i];
+                    idx.state_kv.copy_from_host(h_idx_kv[i].as_ref().unwrap())?;
+                    idx.state_score
+                        .copy_from_host(h_idx_score[i].as_ref().unwrap())?;
+                    idx.comp_kv
+                        .copy_from_host(h_idx_comp_kv[i].as_ref().unwrap())?;
+                }
+            }
+            engine.invalidate_device_cache();
+            Ok(())
+        };
+
+        engine.invalidate_device_cache();
+        engine.forward_token(
+            &mut dgpu_scratch,
+            &mut igpu_scratch,
+            &mut state,
+            &weights,
+            &input_hc_0,
+            pos as u32,
+            t0,
+        )?;
+        let mut logits_seq_0 = vec![0f32; N_VOCAB as usize];
+        dgpu_scratch.logits.copy_to_host(&mut logits_seq_0)?;
+        engine.forward_token(
+            &mut dgpu_scratch,
+            &mut igpu_scratch,
+            &mut state,
+            &weights,
+            &input_hc_1,
+            (pos + 1) as u32,
+            t1,
+        )?;
+        let mut logits_seq_1 = vec![0f32; N_VOCAB as usize];
+        dgpu_scratch.logits.copy_to_host(&mut logits_seq_1)?;
+
+        restore(&mut state, &engine)?;
+        engine.forward_pair_interleaved(
+            &mut dgpu_scratch,
+            &mut igpu_scratch,
+            &mut state,
+            &weights,
+            &input_hc_0,
+            &input_hc_1,
+            pos as u32,
+            t0,
+            t1,
+        )?;
+        let mut logits_pair_0 = vec![0f32; N_VOCAB as usize];
+        let mut logits_pair_1 = vec![0f32; N_VOCAB as usize];
+        dgpu_scratch
+            .logits_token0
+            .copy_to_host(&mut logits_pair_0)?;
+        dgpu_scratch.logits.copy_to_host(&mut logits_pair_1)?;
+
+        let kl_0 = kl_divergence(&logits_seq_0, &logits_pair_0);
+        let kl_1 = kl_divergence(&logits_seq_1, &logits_pair_1);
+        let am_seq_0 = argmax(&logits_seq_0);
+        let am_pair_0 = argmax(&logits_pair_0);
+        let am_seq_1 = argmax(&logits_seq_1);
+        let am_pair_1 = argmax(&logits_pair_1);
+        eprintln!(
+            "  t0: KL={:.6} argmax seq={} pair={} {}",
+            kl_0,
+            am_seq_0,
+            am_pair_0,
+            if am_seq_0 == am_pair_0 { "OK" } else { "MISMATCH" }
+        );
+        eprintln!(
+            "  t1: KL={:.6} argmax seq={} pair={} {}",
+            kl_1,
+            am_seq_1,
+            am_pair_1,
+            if am_seq_1 == am_pair_1 { "OK" } else { "MISMATCH" }
+        );
+        if am_seq_0 != am_pair_0 || am_seq_1 != am_pair_1 {
+            all_match = false;
+        }
+        total_kl_0 += kl_0;
+        total_kl_1 += kl_1;
+        if kl_0 > max_kl_0 {
+            max_kl_0 = kl_0;
+        }
+        if kl_1 > max_kl_1 {
+            max_kl_1 = kl_1;
+        }
+    }
+    let n = pair_positions.len() as f64;
+    eprintln!(
+        "FORWARD_PAIR_INTERLEAVED ORACLE: mean_KL t0={:.6} t1={:.6}  max_KL t0={:.6} t1={:.6}",
+        total_kl_0 / n,
+        total_kl_1 / n,
+        max_kl_0,
+        max_kl_1
+    );
+    assert!(
+        all_match,
+        "forward_pair_interleaved argmax differs from sequential"
+    );
+    assert!(max_kl_0 < 0.01, "t0 max KL {max_kl_0:.6} > 0.01");
+    assert!(max_kl_1 < 0.01, "t1 max KL {max_kl_1:.6} > 0.01");
+    Ok(())
+}
