@@ -66,16 +66,9 @@ impl HeterogeneousEngine {
         self.set_current_cached(self.dgpu.device)?;
 
         let de = &self.dgpu;
-        // Per-token xfer streams (real per-token streams) — they're separate so
-        // the pushes for t0 and t1 don't FIFO behind each other on a single xfer.
-        let xfer_t0 = de
-            .xfer_t0
-            .as_ref()
-            .ok_or_else(|| eyre!("dGPU xfer_t0 missing"))?;
-        let xfer_t1 = de
-            .xfer_t1
-            .as_ref()
-            .ok_or_else(|| eyre!("dGPU xfer_t1 missing"))?;
+        // M40-P4.7: dropped per-token xfer streams. All dGPU work
+        // (including peer pushes) goes on de.compute. See pair_pre_moe_batched
+        // for rationale.
 
         // ===== Initial residual upload =====
         dgpu_scratch.t0.residual.copy_from_host(input_hc_0)?;
@@ -104,8 +97,6 @@ impl HeterogeneousEngine {
                 evt_t0,
                 evt_t1,
                 kv_evt,
-                xfer_t0,
-                xfer_t1,
             )?;
 
             // post_moe for both tokens (sequential on de.compute, each waits
@@ -225,8 +216,6 @@ impl HeterogeneousEngine {
         evt_t0: &LayerSyncEvents,
         evt_t1: &LayerSyncEvents,
         _kv_evt: &Event,
-        xfer_t0: &v4flash_hip::Stream,
-        xfer_t1: &v4flash_hip::Stream,
     ) -> eyre::Result<()> {
         let de = &self.dgpu;
         let compute = &de.compute;
@@ -938,18 +927,18 @@ impl HeterogeneousEngine {
             }
         }
 
-        // ===== Stages 10 + 12 + 13 reordered =====
-        // Record selected_ready on de.compute (covers ffn_input_norm + router
-        // writes since they're FIFO on compute).
+        // ===== Stages 10 + 12 + 13 reordered + de.xfer dropped =====
+        // M40-P4.7: peer pushes now happen on de.compute (the single dGPU
+        // stream). FIFO ordering handles "wait for router writes" so we
+        // dropped the selected_ready cross-stream event. The cross-device
+        // selected_pushed event stays (iGPU has to wait for the push to
+        // land before MoE).
         //
-        // ORDER FIX: queue shared_expert_pair on compute BEFORE doing all
-        // the cross-device queueing (peer pushes + iGPU MoE launches + device
-        // switches — ~14 host calls totaling ~250 µs). Otherwise de.compute
-        // sits idle waiting for the host to come back and queue
-        // shared_expert_pair, even though everything it needs is already in
-        // place. With this reorder de.compute FIFOs straight from router_pair
-        // → shared_expert_pair without a host-induced gap.
-        evt_t0.selected_ready.record(compute)?;
+        // ORDER FIX: queue shared_expert_pair on compute BEFORE the iGPU
+        // queueing (peer pushes + 8 iGPU launches + device switches). Without
+        // this de.compute sits idle ~250 µs waiting for host to come back.
+        // With the reorder de.compute FIFOs straight from router_pair →
+        // shared_expert_pair → peer_pushes → selected_pushed.record.
 
         // ===== Stage 13: shared_expert_pair (queued NOW so it FIFOs after
         // router on de.compute) =====
@@ -1025,23 +1014,20 @@ impl HeterogeneousEngine {
             )?;
         }
 
-        // Now the peer pushes + iGPU MoE — runs in parallel with the
-        // shared_expert_pair we just queued on de.compute.
-        xfer_t0.wait_event(&evt_t0.selected_ready)?;
-        xfer_t1.wait_event(&evt_t0.selected_ready)?;
+        // Peer pushes for both tokens on de.compute (FIFO with shared_expert).
+        // Cost of the serialization: ~6 pushes × ~1-2 µs each = ~10 µs per
+        // layer. In exchange: no cross-stream events, captured-graph friendly.
         {
-            let _t = de.events.stage("dgpu.peer_push_t0", xfer_t0)?;
-            peer_push_f32(&t0.ffn_input_norm, &mut igpu_scratch.ffn_input_norm_recv_t0, xfer_t0)?;
-            peer_push_i32(&t0.d_selected, &mut igpu_scratch.d_selected_t0, xfer_t0)?;
-            peer_push_f32(&t0.d_ew, &mut igpu_scratch.d_ew_t0, xfer_t0)?;
-            evt_t0.selected_pushed.record(xfer_t0)?;
-        }
-        {
-            let _t = de.events.stage("dgpu.peer_push_t1", xfer_t1)?;
-            peer_push_f32(&t1.ffn_input_norm, &mut igpu_scratch.ffn_input_norm_recv_t1, xfer_t1)?;
-            peer_push_i32(&t1.d_selected, &mut igpu_scratch.d_selected_t1, xfer_t1)?;
-            peer_push_f32(&t1.d_ew, &mut igpu_scratch.d_ew_t1, xfer_t1)?;
-            evt_t1.selected_pushed.record(xfer_t1)?;
+            let _t = de.events.stage("dgpu.peer_push_pair", compute)?;
+            peer_push_f32(&t0.ffn_input_norm, &mut igpu_scratch.ffn_input_norm_recv_t0, compute)?;
+            peer_push_i32(&t0.d_selected, &mut igpu_scratch.d_selected_t0, compute)?;
+            peer_push_f32(&t0.d_ew, &mut igpu_scratch.d_ew_t0, compute)?;
+            peer_push_f32(&t1.ffn_input_norm, &mut igpu_scratch.ffn_input_norm_recv_t1, compute)?;
+            peer_push_i32(&t1.d_selected, &mut igpu_scratch.d_selected_t1, compute)?;
+            peer_push_f32(&t1.d_ew, &mut igpu_scratch.d_ew_t1, compute)?;
+            // Cross-device events: iGPU MoEs wait on these before starting.
+            evt_t0.selected_pushed.record(compute)?;
+            evt_t1.selected_pushed.record(compute)?;
         }
 
         // ===== iGPU MoE for both tokens (FIFO on ie.compute) =====
@@ -1094,14 +1080,11 @@ impl HeterogeneousEngine {
                 N_EMBD,
                 BLOCKS_Q8K_DOWN_IN,
             )?;
-            evt_t0.moe_done.record(&ie.compute)?;
-        }
-        // Push back t0
-        {
-            let _t = ie.events.stage("igpu.peer_push_back_t0", &ie.xfer)?;
-            ie.xfer.wait_event(&evt_t0.moe_done)?;
-            peer_push_f32(&igpu_scratch.ffn_moe_t0, &mut t0.ffn_moe_recv, &ie.xfer)?;
-            evt_t0.moe_arrived.record(&ie.xfer)?;
+            // M40-P4.7: push back on ie.compute (FIFO with MoE) — drops
+            // ie.xfer and the cross-stream moe_done event. moe_arrived now
+            // records on ie.compute. iGPU side becomes capture-friendly.
+            peer_push_f32(&igpu_scratch.ffn_moe_t0, &mut t0.ffn_moe_recv, &ie.compute)?;
+            evt_t0.moe_arrived.record(&ie.compute)?;
         }
         // t1 MoE
         ie.compute.wait_event(&evt_t1.selected_pushed)?;
@@ -1146,13 +1129,9 @@ impl HeterogeneousEngine {
                 N_EMBD,
                 BLOCKS_Q8K_DOWN_IN,
             )?;
-            evt_t1.moe_done.record(&ie.compute)?;
-        }
-        {
-            let _t = ie.events.stage("igpu.peer_push_back_t1", &ie.xfer)?;
-            ie.xfer.wait_event(&evt_t1.moe_done)?;
-            peer_push_f32(&igpu_scratch.ffn_moe_t1, &mut t1.ffn_moe_recv, &ie.xfer)?;
-            evt_t1.moe_arrived.record(&ie.xfer)?;
+            // Push back t1 on ie.compute (FIFO).
+            peer_push_f32(&igpu_scratch.ffn_moe_t1, &mut t1.ffn_moe_recv, &ie.compute)?;
+            evt_t1.moe_arrived.record(&ie.compute)?;
         }
         self.set_current_cached(self.dgpu.device)?;
 
