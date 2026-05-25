@@ -97,7 +97,14 @@ impl HeterogeneousEngine {
             // pre/post split itself (would also fail this serial version) vs
             // the substage interleaving (only fails interleaved).
             //
-            // ===== Token 0 full layer (pre + post) =====
+            // M40-P3: substage interleaving — t0_pre, snapshot, t1_pre,
+            // t0_post, t1_post. t1's dGPU pre_moe runs while t0's iGPU MoE
+            // is in flight; t0_post waits for t0's iGPU MoE result; same
+            // for t1. The per-token stash buffers (after_attn_hc, ffn_input_norm,
+            // split, ffn_moe_recv_stash) preserve t0's pre_moe outputs
+            // across t1's overwrites.
+            //
+            // ===== t0 pre_moe =====
             dgpu_scratch
                 .residual
                 .copy_from_buffer(&dgpu_scratch.residual_stash_token0)?;
@@ -111,21 +118,23 @@ impl HeterogeneousEngine {
                 token_id_0,
                 /* push_t1 */ false,
             )?;
-            self.forward_pair_post_moe(
-                dgpu_scratch,
-                dlw,
-                /* token */ 0,
-            )?;
+            // Stash t0's pre_moe outputs (will be clobbered by t1_pre_moe).
             dgpu_scratch
-                .residual_next_stash_t0
-                .copy_from_buffer(&dgpu_scratch.residual_next)?;
+                .after_attn_hc_stash_t0
+                .copy_from_buffer(&dgpu_scratch.after_attn_hc)?;
+            dgpu_scratch
+                .ffn_input_norm_stash_t0
+                .copy_from_buffer(&dgpu_scratch.ffn_input_norm)?;
+            dgpu_scratch
+                .split_stash_t0
+                .copy_from_buffer(&dgpu_scratch.split)?;
 
-            // Snapshot per-layer state (post-t0, pre-t1).
+            // ===== Snapshot per-layer state (post-t0, pre-t1) =====
             ls.snapshot_async(&self.dgpu.compute, &self.igpu.compute)?;
             self.invalidate_device_cache();
             self.set_current_cached(self.dgpu.device)?;
 
-            // ===== Token 1 full layer (pre + post) =====
+            // ===== t1 pre_moe (runs in parallel with t0's iGPU MoE) =====
             dgpu_scratch
                 .residual
                 .copy_from_buffer(&dgpu_scratch.residual_stash_token1)?;
@@ -139,6 +148,45 @@ impl HeterogeneousEngine {
                 token_id_1,
                 /* push_t1 */ true,
             )?;
+            dgpu_scratch
+                .after_attn_hc_stash_t1
+                .copy_from_buffer(&dgpu_scratch.after_attn_hc)?;
+            dgpu_scratch
+                .ffn_input_norm_stash_t1
+                .copy_from_buffer(&dgpu_scratch.ffn_input_norm)?;
+            dgpu_scratch
+                .split_stash_t1
+                .copy_from_buffer(&dgpu_scratch.split)?;
+
+            // ===== t0 post_moe — restore t0's pre_moe outputs, then run =====
+            dgpu_scratch
+                .after_attn_hc
+                .copy_from_buffer(&dgpu_scratch.after_attn_hc_stash_t0)?;
+            dgpu_scratch
+                .ffn_input_norm
+                .copy_from_buffer(&dgpu_scratch.ffn_input_norm_stash_t0)?;
+            dgpu_scratch
+                .split
+                .copy_from_buffer(&dgpu_scratch.split_stash_t0)?;
+            self.forward_pair_post_moe(
+                dgpu_scratch,
+                dlw,
+                /* token */ 0,
+            )?;
+            dgpu_scratch
+                .residual_next_stash_t0
+                .copy_from_buffer(&dgpu_scratch.residual_next)?;
+
+            // ===== t1 post_moe =====
+            dgpu_scratch
+                .after_attn_hc
+                .copy_from_buffer(&dgpu_scratch.after_attn_hc_stash_t1)?;
+            dgpu_scratch
+                .ffn_input_norm
+                .copy_from_buffer(&dgpu_scratch.ffn_input_norm_stash_t1)?;
+            dgpu_scratch
+                .split
+                .copy_from_buffer(&dgpu_scratch.split_stash_t1)?;
             self.forward_pair_post_moe(
                 dgpu_scratch,
                 dlw,
@@ -184,6 +232,49 @@ impl HeterogeneousEngine {
         self.last_sync_us.store(sync_us, Ordering::Relaxed);
 
         Ok(())
+    }
+
+    /// Test-only: public wrapper around the private `forward_pair_pre_moe`
+    /// so tests/pre_post_layer_diff.rs can call it on a single layer.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_pair_pre_moe_public_debug(
+        &self,
+        dgpu_scratch: &mut DgpuScratch,
+        igpu_scratch: &mut IgpuScratch,
+        ls: &mut HetLayerState,
+        dlw: &DgpuLayerWeights,
+        ilw: &IgpuLayerWeights,
+        pos: u32,
+        token_id: i32,
+        push_t1: bool,
+    ) -> eyre::Result<()> {
+        self.forward_pair_pre_moe(
+            dgpu_scratch,
+            igpu_scratch,
+            ls,
+            dlw,
+            ilw,
+            pos,
+            token_id,
+            push_t1,
+        )
+    }
+
+    /// Test-only: public wrapper around the private `forward_pair_post_moe`.
+    #[doc(hidden)]
+    pub fn forward_pair_post_moe_public_debug(
+        &self,
+        dgpu_scratch: &mut DgpuScratch,
+        dlw: &DgpuLayerWeights,
+        token: u32,
+    ) -> eyre::Result<()> {
+        // post_moe expects ffn_moe_recv_stash_t<token> to hold the iGPU MoE
+        // output. The pre_moe (with push_t0/push_t1 flag) sent it there
+        // already; just need to ensure xfer has landed before post_moe reads.
+        // The public pre_moe debug variant doesn't sync xfer at end, so do it here.
+        self.igpu.xfer.synchronize()?;
+        self.forward_pair_post_moe(dgpu_scratch, dlw, token)
     }
 
     /// pre_moe: stages 1-12 inline, direct launches, no captured graphs.
@@ -624,6 +715,16 @@ impl HeterogeneousEngine {
 
         // ===== Stages 10 + 12: peer-push ffn_input_norm + selected + d_ew to iGPU =====
         // Per-token iGPU recv buffers so MoE_t0 and MoE_t1 don't race on the same inputs.
+        //
+        // CRITICAL: de.xfer is a DIFFERENT stream from de.compute. Without explicit
+        // ordering, the peer push on de.xfer can race ahead of the router/mhc_pre_ffn
+        // writes on de.compute and push STALE data from a previous iteration. Pair-mode
+        // uses event-driven gating (sev.ain_ready / sev.selected_ready). Here we
+        // pessimistically host-sync de.compute before queueing the pushes — simple
+        // and bullet-proof. (Bug found: L0-L2 happened to work because compute
+        // finished fast enough; L3+ raced because the ratio=128 compressor shifted
+        // timing.)
+        de.compute.synchronize()?;
         if push_t1 {
             peer_push_f32(
                 &dgpu_scratch.ffn_input_norm,
