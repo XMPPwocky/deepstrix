@@ -1,44 +1,23 @@
-//! M40-P4: per-token-stream substage-interleaved pair forward with
-//! cross-layer pipelining.
+//! M40-P4.5: pair forward with batched 2-wide kernels.
 //!
-//! Mental model: the iGPU is an autonomous pipeline that does ONE job —
-//! receive (ffn_input, d_selected, d_ew) for some (layer, token), produce
-//! ffn_output. iGPU.compute serializes MoEs FIFO; iGPU.xfer pushes
-//! results back FIFO. Nothing on the iGPU is per-token.
+//! Both tokens flow through ONE dGPU compute stream. Every big matvec is
+//! a 2-wide pair kernel — loads W once, computes both columns. Small ops
+//! (rms, sinkhorn, hc_weighted, rope, quantize, attn, vec_add, hc_post)
+//! still run per-token; they're cheap and would only marginally benefit
+//! from batching.
 //!
-//! The dGPU runs ALL the rest. To overlap, it has TWO compute streams
-//! (de.compute_t0 / _t1) and TWO xfer streams (de.xfer_t0 / _t1). Each
-//! token's mhc_pre_attn → q/kv → attn → output_proj → mhc_post →
-//! mhc_pre_ffn → router → shared_expert lives on its own pair of streams.
-//! Both streams write/read into per-token `TokenScratch` instances so
-//! there's no aliasing. The dGPU scheduler co-schedules t0 and t1
-//! kernels onto whatever CUs are free.
+//! Cross-layer pipelining: queue L+1's pre_moe immediately after L's
+//! post_moe ffn_combine on the same de.compute stream — when L's post_moe
+//! is blocked on wait_event(moe_arrived_L), L+1 pre_moe is already queued
+//! ready to run. Meanwhile iGPU is busy with L's MoEs (and gets L+1's
+//! MoEs queued the moment L+1's pushes complete).
 //!
-//! Cross-token state dependency:
-//!   * SHARED kv_cache: t0 writes row `pos`, t1 writes row `pos+1`
-//!     (different rows; no aliasing for the writes). But t1's attn reads
-//!     ALL rows [0..n_raw_t1] including t0's just-appended row → must
-//!     wait for t0's kv_append before t1's attn. Event:
-//!     `pair_t0_state_ready[L]` recorded on de.compute_t0 after t0's
-//!     compressor stage, waited by de.compute_t1 before attn.
-//!
-//! Cross-layer pipeline:
-//!   * Prologue: pre_moe for L=0 (both tokens) + queue iGPU MoEs
-//!   * Loop L ∈ [0, N-2]:
-//!       - post_moe (vec_add + hc_post → ts.residual_next) for L (both tokens)
-//!       - residual ← residual_next (async copy)
-//!       - pre_moe for L+1 (both tokens) + queue iGPU MoEs
-//!     This loop body keeps de.compute_t0/_t1 continuously busy: while
-//!     the dGPU is queueing L+1's pre_moe, the iGPU is still chewing L's
-//!     MoEs. When L+1's wait_event(moe_arrived) fires, it's a no-op.
-//!   * Epilogue: post_moe for L=N-1 (both tokens)
-//!   * Head twice
-//!
-//! No host syncs anywhere except the final `compute_t0.synchronize()`
-//! at the end of the function (to bound wall-time measurement).
+//! iGPU is per-token: ie.compute serializes MoE_t0 → MoE_t1 FIFO (one
+//! pipeline). Per-token recv buffers (ffn_input_norm_recv_tN, d_selected_tN,
+//! d_ew_tN, ffn_moe_tN) keep the two tokens' MoE inputs/outputs separate.
 
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, Event, Stream};
+use v4flash_hip::Event;
 
 use crate::forward::{
     hash_router_select, BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, EXPERT_WEIGHT_SCALE, GROUP_DIM,
@@ -56,36 +35,8 @@ use super::weights::{DgpuLayerWeights, HetModelWeights, IgpuLayerWeights};
 
 const ROUTER_WEIGHT_EPS: f32 = 6.103515625e-5;
 
-/// Pick a `&'static str` based on the token id at compile time. Used to
-/// dispatch fine-grained perfetto stage names to the right per-token track
-/// (events.stage requires &'static str so we can't fmt! at runtime).
-macro_rules! stage_t {
-    ($which:expr, $base:literal) => {
-        match $which {
-            TokenId::T0 => concat!($base, "_t0"),
-            TokenId::T1 => concat!($base, "_t1"),
-        }
-    };
-}
-
-/// Direction of the cross-token state-ready event used in pre_moe.
-enum KvEventDir<'a> {
-    /// Token 0: record the event after our kv_append (+ optional comp_kv_append).
-    Record(&'a Event),
-    /// Token 1: wait on token 0's event before our attention reads kv_cache.
-    Wait(&'a Event),
-}
-
-/// Which token's iGPU recv buffers to use.
-enum TokenId {
-    T0,
-    T1,
-}
-
 impl HeterogeneousEngine {
-    /// M40-P4: per-token-stream substage-interleaved pair forward with
-    /// cross-layer pipelining. Same semantics as Phase 1 `forward_pair`
-    /// (bit-equivalent to two sequential forward_token calls), much faster.
+    /// M40-P4.5: pair forward with batched 2-wide kernels.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_pair_interleaved(
         &self,
@@ -114,24 +65,14 @@ impl HeterogeneousEngine {
         self.igpu.events.reset();
         self.set_current_cached(self.dgpu.device)?;
 
-        // Streams (per-token streams allocated for dGPU in for_arch).
-        let de_compute_t0 = self
-            .dgpu
-            .compute_t0
-            .as_ref()
-            .ok_or_else(|| eyre!("dGPU compute_t0 missing"))?;
-        let de_compute_t1 = self
-            .dgpu
-            .compute_t1
-            .as_ref()
-            .ok_or_else(|| eyre!("dGPU compute_t1 missing"))?;
-        let de_xfer_t0 = self
-            .dgpu
+        let de = &self.dgpu;
+        // Per-token xfer streams (real per-token streams) — they're separate so
+        // the pushes for t0 and t1 don't FIFO behind each other on a single xfer.
+        let xfer_t0 = de
             .xfer_t0
             .as_ref()
             .ok_or_else(|| eyre!("dGPU xfer_t0 missing"))?;
-        let de_xfer_t1 = self
-            .dgpu
+        let xfer_t1 = de
             .xfer_t1
             .as_ref()
             .ok_or_else(|| eyre!("dGPU xfer_t1 missing"))?;
@@ -142,163 +83,55 @@ impl HeterogeneousEngine {
 
         let pair_start = std::time::Instant::now();
 
-        // ===== PROLOGUE: pre_moe + queue iGPU MoE for L=0 (both tokens) =====
-        {
-            let dlw = &weights.dgpu_layers[0];
-            let ilw = &weights.igpu_layers[0];
-            let ls = &mut state.layers[0];
-            let evt_t0 = &self.sync_events.layers[0];
-            let evt_t1 = &self.sync_events_t1.layers[0];
-            let kv_evt = &self.pair_t0_state_ready[0];
+        for layer in 0..N_LAYER as usize {
+            let dlw = &weights.dgpu_layers[layer];
+            let ilw = &weights.igpu_layers[layer];
+            let ls = &mut state.layers[layer];
+            let evt_t0 = &self.sync_events.layers[layer];
+            let evt_t1 = &self.sync_events_t1.layers[layer];
+            let kv_evt = &self.pair_t0_state_ready[layer];
 
-            // t0 (on de_compute_t0 / de_xfer_t0) — records kv_evt after compressor.
-            self.pair_pre_moe_one_token(
+            self.pair_pre_moe_batched(
                 &mut dgpu_scratch.t0,
+                &mut dgpu_scratch.t1,
                 igpu_scratch,
                 ls,
                 dlw,
                 ilw,
                 pos,
                 token_id_0,
-                evt_t0,
-                de_compute_t0,
-                de_xfer_t0,
-                KvEventDir::Record(kv_evt),
-                TokenId::T0,
-            )?;
-            // t1 (on de_compute_t1 / de_xfer_t1) — waits on kv_evt before attn.
-            self.pair_pre_moe_one_token(
-                &mut dgpu_scratch.t1,
-                igpu_scratch,
-                ls,
-                dlw,
-                ilw,
-                pos + 1,
                 token_id_1,
-                evt_t1,
-                de_compute_t1,
-                de_xfer_t1,
-                KvEventDir::Wait(kv_evt),
-                TokenId::T1,
-            )?;
-            // iGPU MoE for both tokens (FIFO on ie.compute).
-            self.pair_igpu_moe_one_token(
-                &mut dgpu_scratch.t0,
-                igpu_scratch,
-                ilw,
                 evt_t0,
-                TokenId::T0,
-            )?;
-            self.pair_igpu_moe_one_token(
-                &mut dgpu_scratch.t1,
-                igpu_scratch,
-                ilw,
                 evt_t1,
-                TokenId::T1,
+                kv_evt,
+                xfer_t0,
+                xfer_t1,
             )?;
-        }
 
-        // ===== STEADY STATE: L ∈ [0, N-2] — post_moe(L) + pre_moe(L+1) =====
-        for layer in 0..(N_LAYER as usize - 1) {
-            let dlw_l = &weights.dgpu_layers[layer];
-            let dlw_l1 = &weights.dgpu_layers[layer + 1];
-            let ilw_l1 = &weights.igpu_layers[layer + 1];
-            let evt_t0_l = &self.sync_events.layers[layer];
-            let evt_t1_l = &self.sync_events_t1.layers[layer];
-            let evt_t0_l1 = &self.sync_events.layers[layer + 1];
-            let evt_t1_l1 = &self.sync_events_t1.layers[layer + 1];
-            let kv_evt_l1 = &self.pair_t0_state_ready[layer + 1];
-
-            // post_moe for L on t0 (FIFO ordered on de_compute_t0).
-            self.pair_post_moe_one_token(
+            // post_moe for both tokens (sequential on de.compute, each waits
+            // for its own moe_arrived).
+            self.pair_post_moe_batched(
                 &mut dgpu_scratch.t0,
-                dlw_l,
-                evt_t0_l,
-                de_compute_t0,
-            )?;
-            // post_moe for L on t1.
-            self.pair_post_moe_one_token(
                 &mut dgpu_scratch.t1,
-                dlw_l,
-                evt_t1_l,
-                de_compute_t1,
+                dlw,
+                evt_t0,
+                evt_t1,
             )?;
 
-            // residual ← residual_next (async on the same per-token stream).
+            // residual ← residual_next for both tokens (async on de.compute,
+            // FIFO ordered after post_moe writes).
             dgpu_scratch
                 .t0
                 .residual
-                .copy_from_buffer_async(&dgpu_scratch.t0.residual_next, de_compute_t0)?;
+                .copy_from_buffer_async(&dgpu_scratch.t0.residual_next, &de.compute)?;
             dgpu_scratch
                 .t1
                 .residual
-                .copy_from_buffer_async(&dgpu_scratch.t1.residual_next, de_compute_t1)?;
-
-            // pre_moe for L+1 on both tokens. Note: ls for layer L+1.
-            let ls_l1 = &mut state.layers[layer + 1];
-            self.pair_pre_moe_one_token(
-                &mut dgpu_scratch.t0,
-                igpu_scratch,
-                ls_l1,
-                dlw_l1,
-                ilw_l1,
-                pos,
-                token_id_0,
-                evt_t0_l1,
-                de_compute_t0,
-                de_xfer_t0,
-                KvEventDir::Record(kv_evt_l1),
-                TokenId::T0,
-            )?;
-            self.pair_pre_moe_one_token(
-                &mut dgpu_scratch.t1,
-                igpu_scratch,
-                ls_l1,
-                dlw_l1,
-                ilw_l1,
-                pos + 1,
-                token_id_1,
-                evt_t1_l1,
-                de_compute_t1,
-                de_xfer_t1,
-                KvEventDir::Wait(kv_evt_l1),
-                TokenId::T1,
-            )?;
-            // Queue iGPU MoE for L+1.
-            self.pair_igpu_moe_one_token(
-                &mut dgpu_scratch.t0,
-                igpu_scratch,
-                ilw_l1,
-                evt_t0_l1,
-                TokenId::T0,
-            )?;
-            self.pair_igpu_moe_one_token(
-                &mut dgpu_scratch.t1,
-                igpu_scratch,
-                ilw_l1,
-                evt_t1_l1,
-                TokenId::T1,
-            )?;
-        }
-
-        // ===== EPILOGUE: post_moe for last layer =====
-        {
-            let last = (N_LAYER as usize) - 1;
-            let dlw = &weights.dgpu_layers[last];
-            let evt_t0 = &self.sync_events.layers[last];
-            let evt_t1 = &self.sync_events_t1.layers[last];
-            self.pair_post_moe_one_token(&mut dgpu_scratch.t0, dlw, evt_t0, de_compute_t0)?;
-            self.pair_post_moe_one_token(&mut dgpu_scratch.t1, dlw, evt_t1, de_compute_t1)?;
+                .copy_from_buffer_async(&dgpu_scratch.t1.residual_next, &de.compute)?;
         }
 
         // ===== HEAD x2 =====
-        // forward_head reads dgpu_scratch.residual + writes dgpu_scratch.logits.
-        // Stage t0's final HC into dgpu_scratch.residual, run head, save logits;
-        // then do t1. Use the main de.compute stream for the head (single-stream
-        // is fine here; the two heads run sequentially after the layers).
-        // First make sure all per-token work is done.
-        de_compute_t0.synchronize()?;
-        de_compute_t1.synchronize()?;
+        de.compute.synchronize()?;
         dgpu_scratch
             .residual
             .copy_from_buffer(&dgpu_scratch.t0.residual_next)?;
@@ -314,20 +147,18 @@ impl HeterogeneousEngine {
 
         self.set_current_cached(self.dgpu.device)?;
         let host_us = pair_start.elapsed().as_micros() as u64;
-        self.dgpu.compute.synchronize()?;
+        de.compute.synchronize()?;
         let pair_elapsed_us = pair_start.elapsed().as_micros() as u64;
         let sync_us = pair_elapsed_us.saturating_sub(host_us);
         use std::sync::atomic::Ordering;
         self.last_host_us.store(host_us, Ordering::Relaxed);
         self.last_sync_us.store(sync_us, Ordering::Relaxed);
 
-        // ===== Perfetto device-time emit (M40-P4.1) =====
-        // Route by name suffix to per-token tracks (4 dGPU + 2 iGPU).
+        // ===== Perfetto device-time emit =====
         if let Some(exp_lock) = &self.perfetto {
             let mut exp = exp_lock.lock().unwrap();
             self.dgpu.events.for_each_pair(|name, s, e| {
                 let track = if name.ends_with("_t0") {
-                    // _t0 → dgpu_compute_t0 or dgpu_xfer_t0
                     if name.contains("peer_push") || name.contains(".xfer") {
                         exp.dgpu_xfer_t0.as_ref().unwrap_or(&exp.dgpu_xfer)
                     } else {
@@ -354,7 +185,6 @@ impl HeterogeneousEngine {
                 };
                 exp.emit_slice(track, name, s, e)
             })?;
-            // Re-anchor for next pair.
             exp.re_anchor(
                 self.dgpu.device,
                 &self.dgpu.compute,
@@ -376,54 +206,65 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
-    /// pre_moe for ONE token — stages 1-12 of forward_layer, plus
-    /// shared_expert at the end (so shared_expert overlaps with iGPU MoE
-    /// instead of waiting after it). Uses caller-supplied per-token streams
-    /// and TokenScratch. KvEventDir specifies whether this token records
-    /// (t0) or waits (t1) on the cross-token kv state event.
+    /// pair_pre_moe_batched — runs stages 1-13 for BOTH tokens through ONE
+    /// dGPU compute stream using 2-wide pair kernels for big matvecs.
+    /// Small ops (rms, sinkhorn, hc_weighted, rope, fp8, kv_append, attn,
+    /// compressor) run per-token, sequentially on the same stream.
     #[allow(clippy::too_many_arguments)]
-    fn pair_pre_moe_one_token(
+    fn pair_pre_moe_batched(
         &self,
-        ts: &mut TokenScratch,
+        t0: &mut TokenScratch,
+        t1: &mut TokenScratch,
         igpu_scratch: &mut IgpuScratch,
         ls: &mut HetLayerState,
         dlw: &DgpuLayerWeights,
         ilw: &IgpuLayerWeights,
         pos: u32,
-        token_id: i32,
-        events: &LayerSyncEvents,
-        compute: &Stream,
-        xfer: &Stream,
-        kv_dir: KvEventDir<'_>,
-        which: TokenId,
+        token_id_0: i32,
+        token_id_1: i32,
+        evt_t0: &LayerSyncEvents,
+        evt_t1: &LayerSyncEvents,
+        _kv_evt: &Event,
+        xfer_t0: &v4flash_hip::Stream,
+        xfer_t1: &v4flash_hip::Stream,
     ) -> eyre::Result<()> {
         let de = &self.dgpu;
+        let compute = &de.compute;
         self.set_current_cached(self.dgpu.device)?;
-
-        // M40-P4.1: coarse perfetto stage spans, routed to per-token tracks
-        // by the "_t0" / "_t1" name suffix at emit time.
-        let pre_span_name: &'static str = match which {
-            TokenId::T0 => "dgpu.pre_moe_t0",
-            TokenId::T1 => "dgpu.pre_moe_t1",
-        };
-        let _t_pre = de.events.stage(pre_span_name, compute)?;
+        let _t_pre = de.events.stage("dgpu.pair_pre_moe", compute)?;
 
         // ===== Stage 1: mhc_pre_attn =====
+        // rms_nw per token (cheap, no weight load)
         {
-            let _t = de.events.stage(stage_t!(which, "dgpu.mhc_pre_attn"), compute)?;
-            de.rms_nw.launch(compute, &mut ts.flat, &ts.residual, 1, HC_DIM, RMS_EPS)?;
-            de.f16.matvec(
+            let _t = de.events.stage("dgpu.mhc_pre_attn_pair", compute)?;
+            de.rms_nw.launch(compute, &mut t0.flat, &t0.residual, 1, HC_DIM, RMS_EPS)?;
+            de.rms_nw.launch(compute, &mut t1.flat, &t1.residual, 1, HC_DIM, RMS_EPS)?;
+            // f16 matvec_two_inputs: one weight, two inputs → two mix vectors.
+            de.f16.matvec_two_inputs(
                 compute,
-                &mut ts.mix,
+                &mut t0.mix,
+                &mut t1.mix,
                 &dlw.hc_attn_fn.buffer,
-                &ts.flat,
+                &t0.flat,
+                &t1.flat,
                 HC_MIX_DIM,
                 HC_DIM,
             )?;
+            // Sinkhorn is small (HC_MIX_DIM=24 in, N_HC=4 out). Per-token.
             de.hc_sinkhorn.launch(
                 compute,
-                &mut ts.split,
-                &ts.mix,
+                &mut t0.split,
+                &t0.mix,
+                &dlw.hc_attn_scale,
+                &dlw.hc_attn_base,
+                N_HC,
+                SINKHORN_ITERS,
+                SINKHORN_EPS,
+            )?;
+            de.hc_sinkhorn.launch(
+                compute,
+                &mut t1.split,
+                &t1.mix,
                 &dlw.hc_attn_scale,
                 &dlw.hc_attn_base,
                 N_HC,
@@ -432,223 +273,408 @@ impl HeterogeneousEngine {
             )?;
             de.hc_weighted.launch(
                 compute,
-                &mut ts.attn_cur,
-                &ts.residual,
-                &ts.split,
+                &mut t0.attn_cur,
+                &t0.residual,
+                &t0.split,
+                N_EMBD,
+                N_HC,
+            )?;
+            de.hc_weighted.launch(
+                compute,
+                &mut t1.attn_cur,
+                &t1.residual,
+                &t1.split,
                 N_EMBD,
                 N_HC,
             )?;
             de.rms_w.launch_weighted(
                 compute,
-                &mut ts.attn_input_norm,
-                &ts.attn_cur,
+                &mut t0.attn_input_norm,
+                &t0.attn_cur,
+                &dlw.attn_norm,
+                N_EMBD,
+                RMS_EPS,
+            )?;
+            de.rms_w.launch_weighted(
+                compute,
+                &mut t1.attn_input_norm,
+                &t1.attn_cur,
                 &dlw.attn_norm,
                 N_EMBD,
                 RMS_EPS,
             )?;
         }
 
-        // ===== Stage 2: Q chain =====
+        // ===== Stage 2: Q chain (batched) =====
         {
-            let _t = de.events.stage(stage_t!(which, "dgpu.q_chain"), compute)?;
+            let _t = de.events.stage("dgpu.q_chain_pair", compute)?;
+            // quantize_input per token (no W, just rescale)
             de.q8.quantize_input(
                 compute,
-                &mut ts.xq_n_embd,
-                &mut ts.xscale_n_embd,
-                &ts.attn_input_norm,
+                &mut t0.xq_n_embd,
+                &mut t0.xscale_n_embd,
+                &t0.attn_input_norm,
                 N_EMBD,
             )?;
-            de.q8.matvec(
+            de.q8.quantize_input(
                 compute,
-                &mut ts.qr,
+                &mut t1.xq_n_embd,
+                &mut t1.xscale_n_embd,
+                &t1.attn_input_norm,
+                N_EMBD,
+            )?;
+            // attn_q_a: pair matvec
+            de.q8.matvec_pair(
+                compute,
+                &mut t0.qr,
+                &mut t1.qr,
                 &dlw.attn_q_a.buffer,
-                &ts.xq_n_embd,
-                &ts.xscale_n_embd,
+                &t0.xq_n_embd,
+                &t1.xq_n_embd,
+                &t0.xscale_n_embd,
+                &t1.xscale_n_embd,
                 N_LORA_Q,
                 N_EMBD,
             )?;
+            // rms + quantize per token
             de.rms_w.launch_weighted(
                 compute,
-                &mut ts.qr_normed,
-                &ts.qr,
+                &mut t0.qr_normed,
+                &t0.qr,
+                &dlw.q_a_norm,
+                N_LORA_Q,
+                RMS_EPS,
+            )?;
+            de.rms_w.launch_weighted(
+                compute,
+                &mut t1.qr_normed,
+                &t1.qr,
                 &dlw.q_a_norm,
                 N_LORA_Q,
                 RMS_EPS,
             )?;
             de.q8.quantize_input(
                 compute,
-                &mut ts.qr_xq,
-                &mut ts.qr_xscale,
-                &ts.qr_normed,
+                &mut t0.qr_xq,
+                &mut t0.qr_xscale,
+                &t0.qr_normed,
                 N_LORA_Q,
             )?;
-            de.q8.matvec(
+            de.q8.quantize_input(
                 compute,
-                &mut ts.q,
+                &mut t1.qr_xq,
+                &mut t1.qr_xscale,
+                &t1.qr_normed,
+                N_LORA_Q,
+            )?;
+            // attn_q_b: pair matvec (BIG — 32 MB W shared)
+            de.q8.matvec_pair(
+                compute,
+                &mut t0.q,
+                &mut t1.q,
                 &dlw.attn_q_b.buffer,
-                &ts.qr_xq,
-                &ts.qr_xscale,
+                &t0.qr_xq,
+                &t1.qr_xq,
+                &t0.qr_xscale,
+                &t1.qr_xscale,
                 Q_FLAT,
                 N_LORA_Q,
             )?;
             de.rms_nw
-                .launch(compute, &mut ts.q_normed, &ts.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
-            // Stage 3: rope on q_normed (folded into q_chain span)
+                .launch(compute, &mut t0.q_normed, &t0.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
+            de.rms_nw
+                .launch(compute, &mut t1.q_normed, &t1.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
+            // rope per-token (different pos!)
             de.rope.launch_forward(
                 compute,
-                &mut ts.q_normed,
+                &mut t0.q_normed,
                 N_HEAD,
                 N_HEAD_DIM,
                 N_ROT,
                 pos,
                 &dlw.rope_params,
             )?;
+            de.rope.launch_forward(
+                compute,
+                &mut t1.q_normed,
+                N_HEAD,
+                N_HEAD_DIM,
+                N_ROT,
+                pos + 1,
+                &dlw.rope_params,
+            )?;
         }
 
-        // ===== Stage 4: KV chain + cache append =====
+        // ===== Stage 4: KV chain (batched matvec, per-token append) =====
         {
-            let _t = de.events.stage(stage_t!(which, "dgpu.kv_chain"), compute)?;
-            de.q8.matvec(
+            let _t = de.events.stage("dgpu.kv_chain_pair", compute)?;
+            de.q8.matvec_pair(
                 compute,
-                &mut ts.kv_raw,
+                &mut t0.kv_raw,
+                &mut t1.kv_raw,
                 &dlw.attn_kv.buffer,
-                &ts.xq_n_embd,
-                &ts.xscale_n_embd,
+                &t0.xq_n_embd,
+                &t1.xq_n_embd,
+                &t0.xscale_n_embd,
+                &t1.xscale_n_embd,
                 N_HEAD_DIM,
                 N_EMBD,
             )?;
             de.rms_w.launch_weighted(
                 compute,
-                &mut ts.kv_normed,
-                &ts.kv_raw,
+                &mut t0.kv_normed,
+                &t0.kv_raw,
+                &dlw.kv_a_norm,
+                N_HEAD_DIM,
+                RMS_EPS,
+            )?;
+            de.rms_w.launch_weighted(
+                compute,
+                &mut t1.kv_normed,
+                &t1.kv_raw,
                 &dlw.kv_a_norm,
                 N_HEAD_DIM,
                 RMS_EPS,
             )?;
             de.rope.launch_forward(
                 compute,
-                &mut ts.kv_normed,
+                &mut t0.kv_normed,
                 1,
                 N_HEAD_DIM,
                 N_ROT,
                 pos,
                 &dlw.rope_params,
             )?;
-            de.fp8.launch(compute, &mut ts.kv_normed, N_HEAD_DIM - N_ROT)?;
-            de.f16rt.launch(compute, &mut ts.kv_normed, N_HEAD_DIM)?;
+            de.rope.launch_forward(
+                compute,
+                &mut t1.kv_normed,
+                1,
+                N_HEAD_DIM,
+                N_ROT,
+                pos + 1,
+                &dlw.rope_params,
+            )?;
+            de.fp8.launch(compute, &mut t0.kv_normed, N_HEAD_DIM - N_ROT)?;
+            de.fp8.launch(compute, &mut t1.kv_normed, N_HEAD_DIM - N_ROT)?;
+            de.f16rt.launch(compute, &mut t0.kv_normed, N_HEAD_DIM)?;
+            de.f16rt.launch(compute, &mut t1.kv_normed, N_HEAD_DIM)?;
             de.kv_append.launch(
                 compute,
                 &mut ls.kv_cache,
-                &ts.kv_normed,
+                &t0.kv_normed,
                 pos,
                 SWA_WINDOW,
                 N_HEAD_DIM,
             )?;
+            de.kv_append.launch(
+                compute,
+                &mut ls.kv_cache,
+                &t1.kv_normed,
+                pos + 1,
+                SWA_WINDOW,
+                N_HEAD_DIM,
+            )?;
         }
-        ls.n_raw = (ls.n_raw + 1).min(SWA_WINDOW);
+        // n_raw advances by 2 (one per token).
+        ls.n_raw = (ls.n_raw + 2).min(SWA_WINDOW);
 
         // ===== Stage 5: compressor (ratio > 0) =====
         let ratio = dlw.ratio;
         if ratio > 0 {
-            let _t = de.events.stage(stage_t!(which, "dgpu.compressor"), compute)?;
+            let _t = de.events.stage("dgpu.compressor_pair", compute)?;
             let cw = dlw
                 .compressor
                 .as_ref()
                 .ok_or_else(|| eyre!("L{}: missing compressor weights", dlw.layer_idx))?;
             let comp_width = cw.width;
-            let pos_mod = pos % ratio;
-            let row = if ratio == 4 { 4 + pos_mod } else { pos_mod };
             let cs = ls
                 .compressor
                 .as_mut()
                 .ok_or_else(|| eyre!("L{}: missing compressor state", dlw.layer_idx))?;
-            de.f16.matvec_pair(
-                compute,
-                &mut ts.kv_cur,
-                &mut ts.sc_cur,
-                &cw.wkv.buffer,
-                &cw.wgate.buffer,
-                &ts.attn_input_norm,
-                comp_width,
-                N_EMBD,
-            )?;
-            de.compressor_state_write.launch(
-                compute,
-                &mut cs.state_kv,
-                &mut cs.state_score,
-                &ts.kv_cur,
-                &ts.sc_cur,
-                &cw.ape.buffer,
-                comp_width,
-                row,
-                pos_mod,
-            )?;
-            let comp_fires_boundary = (pos + 1) % ratio == 0;
-            if comp_fires_boundary {
-                de.compressor_pool.launch(
+            // Per-token compressor matvec_pair / state_write. The existing
+            // f16.matvec_pair (1 input, 2 weights) computes kv+gate from one
+            // attn_input_norm — not the pattern we need here (2 inputs, 1
+            // weight). For now just run the compressor matvec_pair per token,
+            // accepting the redundant W reads (compressor weight is tiny:
+            // comp_width=1024, F16 → ~8 MB; per layer per pair 16 MB total).
+            //
+            // Unrolled t0 then t1 because borrow rules with `cs` (long-lived
+            // &mut) preclude a clean iter over both TokenScratches in one go.
+            // --- t0 ---
+            {
+                let p = pos;
+                let pos_mod = p % ratio;
+                let row = if ratio == 4 { 4 + pos_mod } else { pos_mod };
+                de.f16.matvec_pair(
                     compute,
-                    &mut ts.pooled,
-                    &cs.state_kv,
-                    &cs.state_score,
-                    N_HEAD_DIM,
-                    ratio,
+                    &mut t0.kv_cur,
+                    &mut t0.sc_cur,
+                    &cw.wkv.buffer,
+                    &cw.wgate.buffer,
+                    &t0.attn_input_norm,
+                    comp_width,
+                    N_EMBD,
                 )?;
-                de.rms_w.launch_weighted(
+                de.compressor_state_write.launch(
                     compute,
-                    &mut ts.comp_row,
-                    &ts.pooled,
-                    &cw.norm,
-                    N_HEAD_DIM,
-                    RMS_EPS,
+                    &mut cs.state_kv,
+                    &mut cs.state_score,
+                    &t0.kv_cur,
+                    &t0.sc_cur,
+                    &cw.ape.buffer,
+                    comp_width,
+                    row,
+                    pos_mod,
                 )?;
-                let comp_pos = pos + 1 - ratio;
-                de.rope.launch_forward(
-                    compute,
-                    &mut ts.comp_row,
-                    1,
-                    N_HEAD_DIM,
-                    N_ROT,
-                    comp_pos,
-                    &dlw.rope_params,
-                )?;
-                de.fp8.launch(compute, &mut ts.comp_row, N_HEAD_DIM - N_ROT)?;
-                de.f16rt.launch(compute, &mut ts.comp_row, N_HEAD_DIM)?;
-                if ratio == 4 {
-                    de.compressor_shuffle.launch(
+                if (p + 1) % ratio == 0 {
+                    de.compressor_pool.launch(
                         compute,
-                        &mut cs.state_kv,
-                        &mut cs.state_score,
-                        comp_width,
+                        &mut t0.pooled,
+                        &cs.state_kv,
+                        &cs.state_score,
+                        N_HEAD_DIM,
+                        ratio,
                     )?;
+                    de.rms_w.launch_weighted(
+                        compute,
+                        &mut t0.comp_row,
+                        &t0.pooled,
+                        &cw.norm,
+                        N_HEAD_DIM,
+                        RMS_EPS,
+                    )?;
+                    let comp_pos = p + 1 - ratio;
+                    de.rope.launch_forward(
+                        compute,
+                        &mut t0.comp_row,
+                        1,
+                        N_HEAD_DIM,
+                        N_ROT,
+                        comp_pos,
+                        &dlw.rope_params,
+                    )?;
+                    de.fp8.launch(compute, &mut t0.comp_row, N_HEAD_DIM - N_ROT)?;
+                    de.f16rt.launch(compute, &mut t0.comp_row, N_HEAD_DIM)?;
+                    if ratio == 4 {
+                        de.compressor_shuffle.launch(
+                            compute,
+                            &mut cs.state_kv,
+                            &mut cs.state_score,
+                            comp_width,
+                        )?;
+                    }
+                    de.comp_kv_append.launch(
+                        compute,
+                        &mut cs.comp_kv,
+                        &t0.comp_row,
+                        cs.n_comp,
+                        N_HEAD_DIM,
+                    )?;
+                    cs.n_comp += 1;
                 }
-                de.comp_kv_append
-                    .launch(compute, &mut cs.comp_kv, &ts.comp_row, cs.n_comp, N_HEAD_DIM)?;
-                cs.n_comp += 1;
+            }
+            // --- t1 ---
+            {
+                let p = pos + 1;
+                let pos_mod = p % ratio;
+                let row = if ratio == 4 { 4 + pos_mod } else { pos_mod };
+                de.f16.matvec_pair(
+                    compute,
+                    &mut t1.kv_cur,
+                    &mut t1.sc_cur,
+                    &cw.wkv.buffer,
+                    &cw.wgate.buffer,
+                    &t1.attn_input_norm,
+                    comp_width,
+                    N_EMBD,
+                )?;
+                de.compressor_state_write.launch(
+                    compute,
+                    &mut cs.state_kv,
+                    &mut cs.state_score,
+                    &t1.kv_cur,
+                    &t1.sc_cur,
+                    &cw.ape.buffer,
+                    comp_width,
+                    row,
+                    pos_mod,
+                )?;
+                if (p + 1) % ratio == 0 {
+                    de.compressor_pool.launch(
+                        compute,
+                        &mut t1.pooled,
+                        &cs.state_kv,
+                        &cs.state_score,
+                        N_HEAD_DIM,
+                        ratio,
+                    )?;
+                    de.rms_w.launch_weighted(
+                        compute,
+                        &mut t1.comp_row,
+                        &t1.pooled,
+                        &cw.norm,
+                        N_HEAD_DIM,
+                        RMS_EPS,
+                    )?;
+                    let comp_pos = p + 1 - ratio;
+                    de.rope.launch_forward(
+                        compute,
+                        &mut t1.comp_row,
+                        1,
+                        N_HEAD_DIM,
+                        N_ROT,
+                        comp_pos,
+                        &dlw.rope_params,
+                    )?;
+                    de.fp8.launch(compute, &mut t1.comp_row, N_HEAD_DIM - N_ROT)?;
+                    de.f16rt.launch(compute, &mut t1.comp_row, N_HEAD_DIM)?;
+                    if ratio == 4 {
+                        de.compressor_shuffle.launch(
+                            compute,
+                            &mut cs.state_kv,
+                            &mut cs.state_score,
+                            comp_width,
+                        )?;
+                    }
+                    de.comp_kv_append.launch(
+                        compute,
+                        &mut cs.comp_kv,
+                        &t1.comp_row,
+                        cs.n_comp,
+                        N_HEAD_DIM,
+                    )?;
+                    cs.n_comp += 1;
+                }
             }
         }
 
-        // ===== Cross-token kv-state sync =====
-        // t0: record event after kv_append + compressor are done.
-        // t1: wait on it before our attn so kv_cache row `pos` is visible.
-        match kv_dir {
-            KvEventDir::Record(evt) => evt.record(compute)?,
-            KvEventDir::Wait(evt) => compute.wait_event(evt)?,
-        }
-
-        // ===== Stage 6: attention =====
+        // ===== Stage 6: attention (per token, sequential — kv_cache shared) =====
         {
-            let _t = de.events.stage(stage_t!(which, "dgpu.attn_compute"), compute)?;
-            let n_raw = ls.n_raw;
+            let _t = de.events.stage("dgpu.attn_compute_pair", compute)?;
+            let n_raw_full = ls.n_raw;
+            // t0 sees rows [0..n_raw_full-1]; t1 sees [0..n_raw_full].
+            let n_raw_t0 = n_raw_full - 1;
+            let n_raw_t1 = n_raw_full;
             if ratio == 0 {
                 de.attn_swa.launch(
                     compute,
-                    &mut ts.heads,
-                    &ts.q_normed,
+                    &mut t0.heads,
+                    &t0.q_normed,
                     &ls.kv_cache,
                     &dlw.attn_sinks,
                     N_HEAD,
                     N_HEAD_DIM,
-                    n_raw,
+                    n_raw_t0,
+                )?;
+                de.attn_swa.launch(
+                    compute,
+                    &mut t1.heads,
+                    &t1.q_normed,
+                    &ls.kv_cache,
+                    &dlw.attn_sinks,
+                    N_HEAD,
+                    N_HEAD_DIM,
+                    n_raw_t1,
                 )?;
             } else {
                 let cs = ls.compressor.as_ref();
@@ -656,98 +682,168 @@ impl HeterogeneousEngine {
                 let comp_kv_buf = if n_comp > 0 { cs.map(|c| &c.comp_kv) } else { None };
                 de.attn_mixed.launch(
                     compute,
-                    &mut ts.heads,
-                    &ts.q_normed,
+                    &mut t0.heads,
+                    &t0.q_normed,
                     &ls.kv_cache,
                     comp_kv_buf,
                     None,
                     &dlw.attn_sinks,
                     N_HEAD,
                     N_HEAD_DIM,
-                    n_raw,
+                    n_raw_t0,
+                    n_comp,
+                )?;
+                de.attn_mixed.launch(
+                    compute,
+                    &mut t1.heads,
+                    &t1.q_normed,
+                    &ls.kv_cache,
+                    comp_kv_buf,
+                    None,
+                    &dlw.attn_sinks,
+                    N_HEAD,
+                    N_HEAD_DIM,
+                    n_raw_t1,
                     n_comp,
                 )?;
             }
         }
 
-        // ===== Stage 7: output_proj =====
+        // ===== Stage 7: output_proj (batched) =====
         {
-            let _t = de.events.stage(stage_t!(which, "dgpu.output_proj"), compute)?;
+            let _t = de.events.stage("dgpu.output_proj_pair", compute)?;
+            // rope_inverse per-token (different pos)
             de.rope.launch_inverse(
                 compute,
-                &mut ts.heads,
+                &mut t0.heads,
                 N_HEAD,
                 N_HEAD_DIM,
                 N_ROT,
                 pos,
                 &dlw.rope_params,
             )?;
+            de.rope.launch_inverse(
+                compute,
+                &mut t1.heads,
+                N_HEAD,
+                N_HEAD_DIM,
+                N_ROT,
+                pos + 1,
+                &dlw.rope_params,
+            )?;
             de.q8.quantize_input(
                 compute,
-                &mut ts.heads_xq,
-                &mut ts.heads_xscale,
-                &ts.heads,
+                &mut t0.heads_xq,
+                &mut t0.heads_xscale,
+                &t0.heads,
                 Q_FLAT,
             )?;
-            de.q8_grouped.matvec_grouped(
+            de.q8.quantize_input(
                 compute,
-                &mut ts.low,
+                &mut t1.heads_xq,
+                &mut t1.heads_xscale,
+                &t1.heads,
+                Q_FLAT,
+            )?;
+            // attn_output_a: pair grouped matvec
+            de.q8_grouped.matvec_grouped_pair(
+                compute,
+                &mut t0.low,
+                &mut t1.low,
                 &dlw.attn_output_a.buffer,
-                &ts.heads_xq,
-                &ts.heads_xscale,
+                &t0.heads_xq,
+                &t1.heads_xq,
+                &t0.heads_xscale,
+                &t1.heads_xscale,
                 GROUP_DIM,
                 RANK,
                 N_GROUPS,
             )?;
             de.q8.quantize_input(
                 compute,
-                &mut ts.low_xq,
-                &mut ts.low_xscale,
-                &ts.low,
+                &mut t0.low_xq,
+                &mut t0.low_xscale,
+                &t0.low,
                 OUT_LOW,
             )?;
-            de.q8.matvec(
+            de.q8.quantize_input(
                 compute,
-                &mut ts.attn_out,
+                &mut t1.low_xq,
+                &mut t1.low_xscale,
+                &t1.low,
+                OUT_LOW,
+            )?;
+            // attn_output_b: pair matvec
+            de.q8.matvec_pair(
+                compute,
+                &mut t0.attn_out,
+                &mut t1.attn_out,
                 &dlw.attn_output_b.buffer,
-                &ts.low_xq,
-                &ts.low_xscale,
+                &t0.low_xq,
+                &t1.low_xq,
+                &t0.low_xscale,
+                &t1.low_xscale,
                 N_EMBD,
                 OUT_LOW,
             )?;
         }
 
-        // ===== Stage 8: mhc_post_attn =====
+        // ===== Stage 8: mhc_post_attn (per-token; no W) =====
         {
-            let _t = de.events.stage(stage_t!(which, "dgpu.mhc_post_attn"), compute)?;
+            let _t = de.events.stage("dgpu.mhc_post_attn_pair", compute)?;
             de.hc_post.launch_from_split(
                 compute,
-                &mut ts.after_attn_hc,
-                &ts.attn_out,
-                &ts.residual,
-                &ts.split,
+                &mut t0.after_attn_hc,
+                &t0.attn_out,
+                &t0.residual,
+                &t0.split,
+                N_HC,
+                N_EMBD,
+                N_HC,
+            )?;
+            de.hc_post.launch_from_split(
+                compute,
+                &mut t1.after_attn_hc,
+                &t1.attn_out,
+                &t1.residual,
+                &t1.split,
                 N_HC,
                 N_EMBD,
                 N_HC,
             )?;
         }
 
-        // ===== Stage 9: mhc_pre_ffn =====
+        // ===== Stage 9: mhc_pre_ffn (batched f16 matvec, rest per-token) =====
         {
-            let _t = de.events.stage(stage_t!(which, "dgpu.mhc_pre_ffn"), compute)?;
-            de.rms_nw.launch(compute, &mut ts.flat, &ts.after_attn_hc, 1, HC_DIM, RMS_EPS)?;
-            de.f16.matvec(
+            let _t = de.events.stage("dgpu.mhc_pre_ffn_pair", compute)?;
+            de.rms_nw
+                .launch(compute, &mut t0.flat, &t0.after_attn_hc, 1, HC_DIM, RMS_EPS)?;
+            de.rms_nw
+                .launch(compute, &mut t1.flat, &t1.after_attn_hc, 1, HC_DIM, RMS_EPS)?;
+            de.f16.matvec_two_inputs(
                 compute,
-                &mut ts.mix,
+                &mut t0.mix,
+                &mut t1.mix,
                 &dlw.hc_ffn_fn.buffer,
-                &ts.flat,
+                &t0.flat,
+                &t1.flat,
                 HC_MIX_DIM,
                 HC_DIM,
             )?;
             de.hc_sinkhorn.launch(
                 compute,
-                &mut ts.split,
-                &ts.mix,
+                &mut t0.split,
+                &t0.mix,
+                &dlw.hc_ffn_scale,
+                &dlw.hc_ffn_base,
+                N_HC,
+                SINKHORN_ITERS,
+                SINKHORN_EPS,
+            )?;
+            de.hc_sinkhorn.launch(
+                compute,
+                &mut t1.split,
+                &t1.mix,
                 &dlw.hc_ffn_scale,
                 &dlw.hc_ffn_base,
                 N_HC,
@@ -756,292 +852,358 @@ impl HeterogeneousEngine {
             )?;
             de.hc_weighted.launch(
                 compute,
-                &mut ts.ffn_cur,
-                &ts.after_attn_hc,
-                &ts.split,
+                &mut t0.ffn_cur,
+                &t0.after_attn_hc,
+                &t0.split,
+                N_EMBD,
+                N_HC,
+            )?;
+            de.hc_weighted.launch(
+                compute,
+                &mut t1.ffn_cur,
+                &t1.after_attn_hc,
+                &t1.split,
                 N_EMBD,
                 N_HC,
             )?;
             de.rms_w.launch_weighted(
                 compute,
-                &mut ts.ffn_input_norm,
-                &ts.ffn_cur,
+                &mut t0.ffn_input_norm,
+                &t0.ffn_cur,
+                &dlw.ffn_norm,
+                N_EMBD,
+                RMS_EPS,
+            )?;
+            de.rms_w.launch_weighted(
+                compute,
+                &mut t1.ffn_input_norm,
+                &t1.ffn_cur,
                 &dlw.ffn_norm,
                 N_EMBD,
                 RMS_EPS,
             )?;
         }
 
-        // ===== Stage 11: router on dGPU =====
-        let _t_router = de.events.stage(stage_t!(which, "dgpu.router"), compute)?;
-        if dlw.is_hash_router {
-            de.f16.matvec(
+        // ===== Stage 11: router (batched f16 matvec, per-token topk/hash) =====
+        {
+            let _t = de.events.stage("dgpu.router_pair", compute)?;
+            de.f16.matvec_two_inputs(
                 compute,
-                &mut ts.router_logits,
+                &mut t0.router_logits,
+                &mut t1.router_logits,
                 &dlw.ffn_gate_inp.buffer,
-                &ts.ffn_input_norm,
+                &t0.ffn_input_norm,
+                &t1.ffn_input_norm,
                 N_EXPERT,
                 N_EMBD,
             )?;
-            compute.synchronize()?;
-            ts.router_logits.copy_to_host(&mut ts.router_logits_host)?;
-            let tid2eid = dlw
-                .tid2eid
-                .as_ref()
-                .ok_or_else(|| eyre!("hash router missing tid2eid"))?;
-            let (sel, w) = hash_router_select(tid2eid, token_id, &ts.router_logits_host);
-            ts.d_selected.copy_from_host(&sel)?;
-            ts.d_ew.copy_from_host(&w)?;
-        } else {
-            de.f16.matvec(
-                compute,
-                &mut ts.router_logits,
-                &dlw.ffn_gate_inp.buffer,
-                &ts.ffn_input_norm,
-                N_EXPERT,
-                N_EMBD,
-            )?;
-            de.router_topk.launch(
-                compute,
-                &mut ts.d_selected,
-                &mut ts.d_ew,
-                &ts.router_logits,
-                dlw.router_bias_dev.as_ref(),
-                N_EXPERT,
-                N_EXPERT_USED as u32,
-                EXPERT_WEIGHT_SCALE,
-                ROUTER_WEIGHT_EPS,
-            )?;
+            if dlw.is_hash_router {
+                // Hash router needs host readback. Sync, then per-token CPU select.
+                compute.synchronize()?;
+                t0.router_logits.copy_to_host(&mut t0.router_logits_host)?;
+                t1.router_logits.copy_to_host(&mut t1.router_logits_host)?;
+                let tid2eid = dlw
+                    .tid2eid
+                    .as_ref()
+                    .ok_or_else(|| eyre!("hash router missing tid2eid"))?;
+                let (sel0, w0) = hash_router_select(tid2eid, token_id_0, &t0.router_logits_host);
+                let (sel1, w1) = hash_router_select(tid2eid, token_id_1, &t1.router_logits_host);
+                t0.d_selected.copy_from_host(&sel0)?;
+                t0.d_ew.copy_from_host(&w0)?;
+                t1.d_selected.copy_from_host(&sel1)?;
+                t1.d_ew.copy_from_host(&w1)?;
+            } else {
+                de.router_topk.launch(
+                    compute,
+                    &mut t0.d_selected,
+                    &mut t0.d_ew,
+                    &t0.router_logits,
+                    dlw.router_bias_dev.as_ref(),
+                    N_EXPERT,
+                    N_EXPERT_USED as u32,
+                    EXPERT_WEIGHT_SCALE,
+                    ROUTER_WEIGHT_EPS,
+                )?;
+                de.router_topk.launch(
+                    compute,
+                    &mut t1.d_selected,
+                    &mut t1.d_ew,
+                    &t1.router_logits,
+                    dlw.router_bias_dev.as_ref(),
+                    N_EXPERT,
+                    N_EXPERT_USED as u32,
+                    EXPERT_WEIGHT_SCALE,
+                    ROUTER_WEIGHT_EPS,
+                )?;
+            }
         }
-        drop(_t_router);
 
-        // ===== Stages 10 + 12: peer-push ffn_input_norm + selected + d_ew to iGPU =====
-        // RECORD selected_ready RIGHT AFTER router and queue the pushes BEFORE
-        // shared_expert. Otherwise the pushes (and hence iGPU MoE start) get
-        // pushed out behind shared_expert on de.compute_t0's FIFO — defeating
-        // the whole point of overlapping shared_expert with iGPU MoE.
-        events.selected_ready.record(compute)?;
-        xfer.wait_event(&events.selected_ready)?;
-        let push_span_name: &'static str = match which {
-            TokenId::T0 => "dgpu.peer_push_t0",
-            TokenId::T1 => "dgpu.peer_push_t1",
-        };
-        let _t_push = de.events.stage(push_span_name, xfer)?;
-        // Per-token iGPU recv buffers (igpu_scratch).
-        let (ig_ffn_in, ig_sel, ig_ew) = match which {
-            TokenId::T0 => (
-                &mut igpu_scratch.ffn_input_norm_recv_t0,
-                &mut igpu_scratch.d_selected_t0,
-                &mut igpu_scratch.d_ew_t0,
-            ),
-            TokenId::T1 => (
-                &mut igpu_scratch.ffn_input_norm_recv_t1,
-                &mut igpu_scratch.d_selected_t1,
-                &mut igpu_scratch.d_ew_t1,
-            ),
-        };
-        peer_push_f32(&ts.ffn_input_norm, ig_ffn_in, xfer)?;
-        peer_push_i32(&ts.d_selected, ig_sel, xfer)?;
-        peer_push_f32(&ts.d_ew, ig_ew, xfer)?;
-        events.selected_pushed.record(xfer)?;
-        drop(_t_push);
+        // ===== Stages 10 + 12: peer-push to iGPU per token =====
+        // Record selected_ready on de.compute. Both xfer_t0 and xfer_t1 wait
+        // on it (it covers both t0 and t1's writes since they're FIFO on
+        // de.compute). Then each pushes to its own iGPU recv buffers in
+        // parallel on separate xfer streams.
+        evt_t0.selected_ready.record(compute)?;
+        // Use same event for both — t1 also waits on it (same writes guarded).
+        xfer_t0.wait_event(&evt_t0.selected_ready)?;
+        xfer_t1.wait_event(&evt_t0.selected_ready)?;
+        {
+            let _t = de.events.stage("dgpu.peer_push_t0", xfer_t0)?;
+            peer_push_f32(&t0.ffn_input_norm, &mut igpu_scratch.ffn_input_norm_recv_t0, xfer_t0)?;
+            peer_push_i32(&t0.d_selected, &mut igpu_scratch.d_selected_t0, xfer_t0)?;
+            peer_push_f32(&t0.d_ew, &mut igpu_scratch.d_ew_t0, xfer_t0)?;
+            evt_t0.selected_pushed.record(xfer_t0)?;
+        }
+        {
+            let _t = de.events.stage("dgpu.peer_push_t1", xfer_t1)?;
+            peer_push_f32(&t1.ffn_input_norm, &mut igpu_scratch.ffn_input_norm_recv_t1, xfer_t1)?;
+            peer_push_i32(&t1.d_selected, &mut igpu_scratch.d_selected_t1, xfer_t1)?;
+            peer_push_f32(&t1.d_ew, &mut igpu_scratch.d_ew_t1, xfer_t1)?;
+            evt_t1.selected_pushed.record(xfer_t1)?;
+        }
 
-        // ===== Stage 13: shared_expert on dGPU — runs in parallel with iGPU MoE =====
-        // Queued AFTER the peer push events were already recorded, so iGPU
-        // MoE doesn't wait behind shared_expert. shared_expert reads
-        // ts.ffn_input_norm (still valid — push above also reads it but
-        // de.xfer is a separate stream and copies don't mutate the source)
-        // and writes ts.ffn_shared (consumed by post_moe).
-        let _t_shared = de.events.stage(stage_t!(which, "dgpu.shared_expert"), compute)?;
-        de.q8.quantize_input(
-            compute,
-            &mut ts.xq_n_embd,
-            &mut ts.xscale_n_embd,
-            &ts.ffn_input_norm,
-            N_EMBD,
-        )?;
-        de.q8.matvec(
-            compute,
-            &mut ts.gate_sh,
-            &dlw.shared.gate.buffer,
-            &ts.xq_n_embd,
-            &ts.xscale_n_embd,
-            N_FF_SHARED,
-            N_EMBD,
-        )?;
-        de.q8.matvec(
-            compute,
-            &mut ts.up_sh,
-            &dlw.shared.up.buffer,
-            &ts.xq_n_embd,
-            &ts.xscale_n_embd,
-            N_FF_SHARED,
-            N_EMBD,
-        )?;
-        de.swiglu
-            .launch(compute, &mut ts.mid_sh, &ts.gate_sh, &ts.up_sh, N_FF_SHARED)?;
-        de.q8.quantize_input(
-            compute,
-            &mut ts.mid_sh_xq,
-            &mut ts.mid_sh_xscale,
-            &ts.mid_sh,
-            N_FF_SHARED,
-        )?;
-        de.q8.matvec(
-            compute,
-            &mut ts.ffn_shared,
-            &dlw.shared.down.buffer,
-            &ts.mid_sh_xq,
-            &ts.mid_sh_xscale,
-            N_EMBD,
-            N_FF_SHARED,
-        )?;
-        drop(_t_shared);
-
-        drop(_t_pre);
-
-        Ok(())
-    }
-
-    /// Queue this token's iGPU MoE on ie.compute (gated on selected_pushed)
-    /// + push ffn_moe back on ie.xfer (gated on moe_done) → ts.ffn_moe_recv,
-    /// + record moe_arrived. All event-driven; host never blocks.
-    fn pair_igpu_moe_one_token(
-        &self,
-        ts: &mut TokenScratch,
-        igpu_scratch: &mut IgpuScratch,
-        ilw: &IgpuLayerWeights,
-        events: &LayerSyncEvents,
-        which: TokenId,
-    ) -> eyre::Result<()> {
+        // ===== iGPU MoE for both tokens (FIFO on ie.compute) =====
         self.set_current_cached(self.igpu.device)?;
         let ie = &self.igpu;
-        ie.compute.wait_event(&events.selected_pushed)?;
-
-        let moe_span_name: &'static str = match which {
-            TokenId::T0 => "igpu.moe_t0",
-            TokenId::T1 => "igpu.moe_t1",
-        };
-        let _t_moe = ie.events.stage(moe_span_name, &ie.compute)?;
-
         let gbpe = ilw.routed.gate_bytes_per_expert;
         let ubpe = ilw.routed.up_bytes_per_expert;
         let dbpe = ilw.routed.down_bytes_per_expert;
         let mid_blocks_bytes = (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
-
-        let (ig_ffn_in, ig_sel, ig_ew, ig_ffn_moe) = match which {
-            TokenId::T0 => (
+        // t0 MoE
+        ie.compute.wait_event(&evt_t0.selected_pushed)?;
+        {
+            let _t = ie.events.stage("igpu.moe_t0", &ie.compute)?;
+            ie.q8k.launch(
+                &ie.compute,
+                &mut igpu_scratch.d_xq_q8k,
                 &igpu_scratch.ffn_input_norm_recv_t0,
-                &igpu_scratch.d_selected_t0,
+                BLOCKS_Q8K_GATE_IN,
+            )?;
+            ie.iq2.launch_fused_swiglu_batch(
+                &ie.compute,
+                &mut igpu_scratch.d_mid_cat,
+                &ilw.routed.gate.buffer,
+                &ilw.routed.up.buffer,
+                &igpu_scratch.d_xq_q8k,
                 &igpu_scratch.d_ew_t0,
+                &igpu_scratch.d_selected_t0,
+                gbpe as u32,
+                ubpe as u32,
+                N_EXPERT_USED as u32,
+                SWIGLU_CLAMP_EXP,
+                N_FF_EXP,
+                BLOCKS_Q8K_GATE_IN,
+            )?;
+            ie.q8k.launch(
+                &ie.compute,
+                &mut igpu_scratch.d_midq_cat,
+                &igpu_scratch.d_mid_cat,
+                BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32),
+            )?;
+            ie.q2k.launch_batched(
+                &ie.compute,
                 &mut igpu_scratch.ffn_moe_t0,
-            ),
-            TokenId::T1 => (
+                &ilw.routed.down.buffer,
+                &igpu_scratch.d_midq_cat,
+                &igpu_scratch.d_selected_t0,
+                dbpe as u32,
+                mid_blocks_bytes as u32,
+                N_EXPERT_USED as u32,
+                N_EMBD,
+                BLOCKS_Q8K_DOWN_IN,
+            )?;
+            evt_t0.moe_done.record(&ie.compute)?;
+        }
+        // Push back t0
+        {
+            let _t = ie.events.stage("igpu.peer_push_back_t0", &ie.xfer)?;
+            ie.xfer.wait_event(&evt_t0.moe_done)?;
+            peer_push_f32(&igpu_scratch.ffn_moe_t0, &mut t0.ffn_moe_recv, &ie.xfer)?;
+            evt_t0.moe_arrived.record(&ie.xfer)?;
+        }
+        // t1 MoE
+        ie.compute.wait_event(&evt_t1.selected_pushed)?;
+        {
+            let _t = ie.events.stage("igpu.moe_t1", &ie.compute)?;
+            ie.q8k.launch(
+                &ie.compute,
+                &mut igpu_scratch.d_xq_q8k,
                 &igpu_scratch.ffn_input_norm_recv_t1,
-                &igpu_scratch.d_selected_t1,
+                BLOCKS_Q8K_GATE_IN,
+            )?;
+            ie.iq2.launch_fused_swiglu_batch(
+                &ie.compute,
+                &mut igpu_scratch.d_mid_cat,
+                &ilw.routed.gate.buffer,
+                &ilw.routed.up.buffer,
+                &igpu_scratch.d_xq_q8k,
                 &igpu_scratch.d_ew_t1,
+                &igpu_scratch.d_selected_t1,
+                gbpe as u32,
+                ubpe as u32,
+                N_EXPERT_USED as u32,
+                SWIGLU_CLAMP_EXP,
+                N_FF_EXP,
+                BLOCKS_Q8K_GATE_IN,
+            )?;
+            ie.q8k.launch(
+                &ie.compute,
+                &mut igpu_scratch.d_midq_cat,
+                &igpu_scratch.d_mid_cat,
+                BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32),
+            )?;
+            ie.q2k.launch_batched(
+                &ie.compute,
                 &mut igpu_scratch.ffn_moe_t1,
-            ),
-        };
-
-        ie.q8k
-            .launch(&ie.compute, &mut igpu_scratch.d_xq_q8k, ig_ffn_in, BLOCKS_Q8K_GATE_IN)?;
-        ie.iq2.launch_fused_swiglu_batch(
-            &ie.compute,
-            &mut igpu_scratch.d_mid_cat,
-            &ilw.routed.gate.buffer,
-            &ilw.routed.up.buffer,
-            &igpu_scratch.d_xq_q8k,
-            ig_ew,
-            ig_sel,
-            gbpe as u32,
-            ubpe as u32,
-            N_EXPERT_USED as u32,
-            SWIGLU_CLAMP_EXP,
-            N_FF_EXP,
-            BLOCKS_Q8K_GATE_IN,
-        )?;
-        ie.q8k.launch(
-            &ie.compute,
-            &mut igpu_scratch.d_midq_cat,
-            &igpu_scratch.d_mid_cat,
-            BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32),
-        )?;
-        ie.q2k.launch_batched(
-            &ie.compute,
-            ig_ffn_moe,
-            &ilw.routed.down.buffer,
-            &igpu_scratch.d_midq_cat,
-            ig_sel,
-            dbpe as u32,
-            mid_blocks_bytes as u32,
-            N_EXPERT_USED as u32,
-            N_EMBD,
-            BLOCKS_Q8K_DOWN_IN,
-        )?;
-
-        events.moe_done.record(&ie.compute)?;
-        drop(_t_moe);
-        let xfer_back_name: &'static str = match which {
-            TokenId::T0 => "igpu.peer_push_back_t0",
-            TokenId::T1 => "igpu.peer_push_back_t1",
-        };
-        let _t_back = ie.events.stage(xfer_back_name, &ie.xfer)?;
-        ie.xfer.wait_event(&events.moe_done)?;
-        peer_push_f32(ig_ffn_moe, &mut ts.ffn_moe_recv, &ie.xfer)?;
-        events.moe_arrived.record(&ie.xfer)?;
-        drop(_t_back);
-
-        // Switch back to dGPU device so caller's subsequent dGPU work is on correct device.
+                &ilw.routed.down.buffer,
+                &igpu_scratch.d_midq_cat,
+                &igpu_scratch.d_selected_t1,
+                dbpe as u32,
+                mid_blocks_bytes as u32,
+                N_EXPERT_USED as u32,
+                N_EMBD,
+                BLOCKS_Q8K_DOWN_IN,
+            )?;
+            evt_t1.moe_done.record(&ie.compute)?;
+        }
+        {
+            let _t = ie.events.stage("igpu.peer_push_back_t1", &ie.xfer)?;
+            ie.xfer.wait_event(&evt_t1.moe_done)?;
+            peer_push_f32(&igpu_scratch.ffn_moe_t1, &mut t1.ffn_moe_recv, &ie.xfer)?;
+            evt_t1.moe_arrived.record(&ie.xfer)?;
+        }
         self.set_current_cached(self.dgpu.device)?;
+
+        // ===== Stage 13: shared_expert (batched on de.compute) =====
+        // shared_expert uses q8 matvec_pair for all 3 ops. Reads ffn_input_norm
+        // (per-token, both still valid), writes per-token ffn_shared. Runs on
+        // de.compute IN PARALLEL with iGPU MoE (different devices). Each pair
+        // matvec reads its weight ONCE for both tokens.
+        {
+            let _t = de.events.stage("dgpu.shared_expert_pair", compute)?;
+            // quantize ffn_input_norm per token (shared xq scratch in TokenScratch)
+            de.q8.quantize_input(
+                compute,
+                &mut t0.xq_n_embd,
+                &mut t0.xscale_n_embd,
+                &t0.ffn_input_norm,
+                N_EMBD,
+            )?;
+            de.q8.quantize_input(
+                compute,
+                &mut t1.xq_n_embd,
+                &mut t1.xscale_n_embd,
+                &t1.ffn_input_norm,
+                N_EMBD,
+            )?;
+            // gate
+            de.q8.matvec_pair(
+                compute,
+                &mut t0.gate_sh,
+                &mut t1.gate_sh,
+                &dlw.shared.gate.buffer,
+                &t0.xq_n_embd,
+                &t1.xq_n_embd,
+                &t0.xscale_n_embd,
+                &t1.xscale_n_embd,
+                N_FF_SHARED,
+                N_EMBD,
+            )?;
+            // up
+            de.q8.matvec_pair(
+                compute,
+                &mut t0.up_sh,
+                &mut t1.up_sh,
+                &dlw.shared.up.buffer,
+                &t0.xq_n_embd,
+                &t1.xq_n_embd,
+                &t0.xscale_n_embd,
+                &t1.xscale_n_embd,
+                N_FF_SHARED,
+                N_EMBD,
+            )?;
+            // swiglu per-token
+            de.swiglu.launch(compute, &mut t0.mid_sh, &t0.gate_sh, &t0.up_sh, N_FF_SHARED)?;
+            de.swiglu.launch(compute, &mut t1.mid_sh, &t1.gate_sh, &t1.up_sh, N_FF_SHARED)?;
+            // quantize mid per token
+            de.q8.quantize_input(
+                compute,
+                &mut t0.mid_sh_xq,
+                &mut t0.mid_sh_xscale,
+                &t0.mid_sh,
+                N_FF_SHARED,
+            )?;
+            de.q8.quantize_input(
+                compute,
+                &mut t1.mid_sh_xq,
+                &mut t1.mid_sh_xscale,
+                &t1.mid_sh,
+                N_FF_SHARED,
+            )?;
+            // down
+            de.q8.matvec_pair(
+                compute,
+                &mut t0.ffn_shared,
+                &mut t1.ffn_shared,
+                &dlw.shared.down.buffer,
+                &t0.mid_sh_xq,
+                &t1.mid_sh_xq,
+                &t0.mid_sh_xscale,
+                &t1.mid_sh_xscale,
+                N_EMBD,
+                N_FF_SHARED,
+            )?;
+        }
+
+        drop(_t_pre);
         Ok(())
     }
 
-    /// post_moe for ONE token: cross-stream wait on moe_arrived, then
-    /// vec_add(ts.ffn_moe_recv, ts.ffn_shared) + hc_post → ts.residual_next.
-    /// Tiny — most of the dGPU FFN work (shared_expert) was already done
-    /// in pre_moe so we don't have to wait BEHIND it before vec_add.
-    fn pair_post_moe_one_token(
+    /// pair_post_moe_batched — both tokens' ffn_combine on de.compute.
+    /// Each waits on its own moe_arrived event, then vec_add + hc_post.
+    fn pair_post_moe_batched(
         &self,
-        ts: &mut TokenScratch,
+        t0: &mut TokenScratch,
+        t1: &mut TokenScratch,
         _dlw: &DgpuLayerWeights,
-        events: &LayerSyncEvents,
-        compute: &Stream,
+        evt_t0: &LayerSyncEvents,
+        evt_t1: &LayerSyncEvents,
     ) -> eyre::Result<()> {
         let de = &self.dgpu;
-        // Span name picked by stream identity. We can't easily tell t0 vs t1
-        // here without an extra param; route by stream pointer at emit time.
-        // For simplicity, label by a wrapping span passed via debug_span.
-        // Pick t0 if compute pointer matches dgpu.compute_t0.
-        let is_t0 = std::ptr::eq(
-            compute,
-            self.dgpu
-                .compute_t0
-                .as_ref()
-                .expect("compute_t0 missing"),
-        );
-        let (wait_name, combine_name): (&'static str, &'static str) = if is_t0 {
-            ("dgpu.ffn_combine.wait_t0", "dgpu.ffn_combine_t0")
-        } else {
-            ("dgpu.ffn_combine.wait_t1", "dgpu.ffn_combine_t1")
-        };
-        // SEPARATE span around the wait so the trace shows exactly how long
-        // dGPU.compute_tN sat idle waiting for moe_arrived (= the iGPU pipeline
-        // for this layer's MoE). Then a separate span for the actual ffn_combine
-        // kernels (vec_add + hc_post).
+        let compute = &de.compute;
+        // t0
         {
-            let _t_wait = de.events.stage(wait_name, compute)?;
-            compute.wait_event(&events.moe_arrived)?;
+            let _t = de.events.stage("dgpu.ffn_combine.wait_t0", compute)?;
+            compute.wait_event(&evt_t0.moe_arrived)?;
         }
         {
-            let _t_combine = de.events.stage(combine_name, compute)?;
-            de.vec_add.launch(compute, &mut ts.ffn_moe_recv, &ts.ffn_shared, N_EMBD)?;
+            let _t = de.events.stage("dgpu.ffn_combine_t0", compute)?;
+            de.vec_add.launch(compute, &mut t0.ffn_moe_recv, &t0.ffn_shared, N_EMBD)?;
             de.hc_post.launch_from_split(
                 compute,
-                &mut ts.residual_next,
-                &ts.ffn_moe_recv,
-                &ts.after_attn_hc,
-                &ts.split,
+                &mut t0.residual_next,
+                &t0.ffn_moe_recv,
+                &t0.after_attn_hc,
+                &t0.split,
+                N_HC,
+                N_EMBD,
+                N_HC,
+            )?;
+        }
+        // t1
+        {
+            let _t = de.events.stage("dgpu.ffn_combine.wait_t1", compute)?;
+            compute.wait_event(&evt_t1.moe_arrived)?;
+        }
+        {
+            let _t = de.events.stage("dgpu.ffn_combine_t1", compute)?;
+            de.vec_add.launch(compute, &mut t1.ffn_moe_recv, &t1.ffn_shared, N_EMBD)?;
+            de.hc_post.launch_from_split(
+                compute,
+                &mut t1.residual_next,
+                &t1.ffn_moe_recv,
+                &t1.after_attn_hc,
+                &t1.split,
                 N_HC,
                 N_EMBD,
                 N_HC,
@@ -1049,10 +1211,4 @@ impl HeterogeneousEngine {
         }
         Ok(())
     }
-}
-
-// Silence unused-import lints if the file gets edited to remove some uses.
-#[allow(dead_code)]
-fn _silence_imports() {
-    let _: Option<&DeviceBuffer<f32>> = None;
 }

@@ -43,3 +43,42 @@ extern "C" __global__ void f16_matvec(
     acc = f16_warp_sum_f32(acc);
     if (lane == 0) out[row] = acc;
 }
+
+// M40-P4.5: 2-wide pair variant. One weight matrix, two input vectors,
+// two output vectors. Per-lane: load W[i] once, multiply by x_a[i] and
+// x_b[i], accumulate into two scalars. Halves W bandwidth.
+//
+// NB: this is the OPPOSITE pattern from `f16_matvec_pair` (in a separate
+// kernel file). That one shares ONE input across TWO weights (used by
+// compressor kv+gate). This new kernel shares ONE weight across TWO
+// inputs (used by pair-forward where t0 and t1 multiply against the
+// same hc_attn_fn / hc_ffn_fn / ffn_gate_inp weights).
+extern "C" __global__ void f16_matvec_two_inputs(
+        float          * __restrict__ out_a,      // [n_rows]
+        float          * __restrict__ out_b,      // [n_rows]
+        const __half   * __restrict__ weight,     // [n_rows, k]
+        const float    * __restrict__ x_a,        // [k]
+        const float    * __restrict__ x_b,        // [k]
+        unsigned int     k,
+        unsigned int     n_rows) {
+    uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= n_rows) return;
+
+    const __half *wr = weight + (size_t)row * (size_t)k;
+
+    float acc_a = 0.0f;
+    float acc_b = 0.0f;
+    for (uint32_t i = lane; i < k; i += F16_WARP_LANES) {
+        float wv = __half2float(wr[i]);
+        acc_a += wv * x_a[i];
+        acc_b += wv * x_b[i];
+    }
+
+    acc_a = f16_warp_sum_f32(acc_a);
+    acc_b = f16_warp_sum_f32(acc_b);
+    if (lane == 0) {
+        out_a[row] = acc_a;
+        out_b[row] = acc_b;
+    }
+}

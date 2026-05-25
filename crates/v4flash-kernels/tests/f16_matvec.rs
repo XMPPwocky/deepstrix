@@ -159,3 +159,91 @@ fn f16_matvec_oracle() -> eyre::Result<()> {
 
     Ok(())
 }
+
+/// M40-P4.5: f16_matvec_two_inputs vs two separate f16.matvec calls.
+/// NOT bit-exact (reduction order differs), but should be tight enough
+/// that argmax preservation holds at every output position. Tolerance
+/// 1e-3 matches the threshold for f16_matvec_oracle vs ds4.
+#[test]
+#[ignore]
+fn f16_matvec_two_inputs_matches_two_singles() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let dump = ActivationDump::open(dump_dir())?;
+    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let device = pick_device()?;
+    device.set_current()?;
+    let arch = device.properties()?.gcn_arch_name;
+    eprintln!("f16 two-inputs oracle on device {} ({arch})", device.id);
+
+    // Use an N_EMBD-wide weight that the wide kernel will pick (n_rows ≥ NARROW_ROWS_THRESHOLD).
+    // attn_compressor_kv for ratio=4 layer is 1024 × 4096 — n_rows=1024 is plenty wide.
+    let layer = 2i32;
+    let comp_width = 1024u32;
+    let wkv = weights::load_to_device(
+        &gguf,
+        &format!("blk.{}.attn_compressor_kv.weight", layer),
+        device.id,
+    )?;
+    let kernel = F16Matvec::for_arch(&arch)?;
+    let stream = Stream::new(device.id)?;
+
+    let mut d_x_a: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N_EMBD as usize)?;
+    let mut d_x_b: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N_EMBD as usize)?;
+    let mut d_out_a: DeviceBuffer<f32> = DeviceBuffer::new(device.id, comp_width as usize)?;
+    let mut d_out_b: DeviceBuffer<f32> = DeviceBuffer::new(device.id, comp_width as usize)?;
+    let mut d_out_pair_a: DeviceBuffer<f32> = DeviceBuffer::new(device.id, comp_width as usize)?;
+    let mut d_out_pair_b: DeviceBuffer<f32> = DeviceBuffer::new(device.id, comp_width as usize)?;
+
+    let test_pairs = [(0i32, 1i32), (2, 3), (4, 5), (0, 6)];
+    let mut max_diff_a = 0f32;
+    let mut max_diff_b = 0f32;
+    let mut got_a = vec![0f32; comp_width as usize];
+    let mut got_b = vec![0f32; comp_width as usize];
+    let mut got_pair_a = vec![0f32; comp_width as usize];
+    let mut got_pair_b = vec![0f32; comp_width as usize];
+    for &(ta, tb) in test_pairs.iter() {
+        let xa_entry = dump
+            .tensor("attn_input_norm", layer, ta)
+            .ok_or_else(|| eyre!("missing attn_input_norm L{layer} T{ta}"))?;
+        let xb_entry = dump
+            .tensor("attn_input_norm", layer, tb)
+            .ok_or_else(|| eyre!("missing attn_input_norm L{layer} T{tb}"))?;
+        let xa = dump.read_f32(xa_entry)?;
+        let xb = dump.read_f32(xb_entry)?;
+        d_x_a.copy_from_host(&xa)?;
+        d_x_b.copy_from_host(&xb)?;
+
+        kernel.matvec(&stream, &mut d_out_a, &wkv.buffer, &d_x_a, comp_width, N_EMBD)?;
+        kernel.matvec(&stream, &mut d_out_b, &wkv.buffer, &d_x_b, comp_width, N_EMBD)?;
+        kernel.matvec_two_inputs(
+            &stream,
+            &mut d_out_pair_a,
+            &mut d_out_pair_b,
+            &wkv.buffer,
+            &d_x_a,
+            &d_x_b,
+            comp_width,
+            N_EMBD,
+        )?;
+        stream.synchronize()?;
+        d_out_a.copy_to_host(&mut got_a)?;
+        d_out_b.copy_to_host(&mut got_b)?;
+        d_out_pair_a.copy_to_host(&mut got_pair_a)?;
+        d_out_pair_b.copy_to_host(&mut got_pair_b)?;
+        let mut a_max = 0f32;
+        let mut b_max = 0f32;
+        for i in 0..comp_width as usize {
+            a_max = a_max.max((got_a[i] - got_pair_a[i]).abs());
+            b_max = b_max.max((got_b[i] - got_pair_b[i]).abs());
+        }
+        eprintln!("pair ({ta},{tb}): max_diff a={:.3e} b={:.3e}", a_max, b_max);
+        max_diff_a = max_diff_a.max(a_max);
+        max_diff_b = max_diff_b.max(b_max);
+    }
+    eprintln!("F16 PAIR ORACLE: max_diff a={:.3e} b={:.3e}", max_diff_a, max_diff_b);
+    // Reduction-order drift — bit-exact not expected. Tolerance 1e-3 (same
+    // as f16_matvec_oracle).
+    assert!(max_diff_a < 1e-3, "f16 two-inputs col a max diff {max_diff_a:.3e} > 1e-3");
+    assert!(max_diff_b < 1e-3, "f16 two-inputs col b max diff {max_diff_b:.3e} > 1e-3");
+    Ok(())
+}

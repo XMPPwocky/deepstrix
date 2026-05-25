@@ -83,3 +83,56 @@ extern "C" __global__ void q8_0_grouped_gemv(
     acc = gwarp_sum_f32(acc);
     if (lane == 0) out[row] = acc;
 }
+
+// M40-P4.5: 2-wide pair variant. Same weight matrix, two input column-pairs.
+// Each input pair has its OWN per-group xq/xscale (groups are sliced from
+// the flat 2-token activation). Per row, per lane: load W block ONCE,
+// compute TWO dot products (one per input column), multiply by two scales,
+// accumulate into two scalars. Output to two separate buffers.
+extern "C" __global__ void q8_0_grouped_gemv_pair(
+        float        * __restrict__ out_a,
+        float        * __restrict__ out_b,
+        const unsigned char * __restrict__ w,
+        const int8_t * __restrict__ xq_a,
+        const int8_t * __restrict__ xq_b,
+        const float  * __restrict__ xscale_a,
+        const float  * __restrict__ xscale_b,
+        unsigned int   group_dim,
+        unsigned int   rank,
+        unsigned int   blocks_per_group,
+        unsigned int   n_groups)
+{
+    uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    uint32_t out_dim = n_groups * rank;
+    if (row >= out_dim) return;
+
+    uint32_t g = row / rank;
+    const unsigned char* wr = w + (size_t)row * (size_t)blocks_per_group * 34u;
+    const int8_t* xqg_a = xq_a + (size_t)g * (size_t)group_dim;
+    const int8_t* xqg_b = xq_b + (size_t)g * (size_t)group_dim;
+    const float*  xsg_a = xscale_a + (size_t)g * (size_t)blocks_per_group;
+    const float*  xsg_b = xscale_b + (size_t)g * (size_t)blocks_per_group;
+
+    const __half* scales = (const __half*)wr;
+    const int8_t* quants = (const int8_t*)(wr + (size_t)blocks_per_group * 2u);
+    float acc_a = 0.0f;
+    float acc_b = 0.0f;
+    for (uint32_t b = lane; b < blocks_per_group; b += WARP_LANES) {
+        const int8_t* qs   = quants + (size_t)b * 32u;
+        const int8_t* xqba = xqg_a + (size_t)b * 32u;
+        const int8_t* xqbb = xqg_b + (size_t)b * 32u;
+        int32_t dot_a = gdot_i8x32(qs, xqba);
+        int32_t dot_b = gdot_i8x32(qs, xqbb);
+        float ws = __half2float(scales[b]);
+        acc_a += ws * xsg_a[b] * (float)dot_a;
+        acc_b += ws * xsg_b[b] * (float)dot_b;
+    }
+
+    acc_a = gwarp_sum_f32(acc_a);
+    acc_b = gwarp_sum_f32(acc_b);
+    if (lane == 0) {
+        out_a[row] = acc_a;
+        out_b[row] = acc_b;
+    }
+}

@@ -192,4 +192,72 @@ impl F16Matvec {
             unsafe { function.launch_raw(cfg, stream, &mut args) }
         }
     }
+
+    /// M40-P4.5: 2-wide pair variant — ONE weight, TWO input vectors → TWO
+    /// outputs. Halves W bandwidth vs running `matvec` twice. NB: this is
+    /// the OPPOSITE pattern from `matvec_pair` (which shares ONE input
+    /// across TWO weights — used by compressor kv+gate).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_two_inputs(
+        &self,
+        stream: &Stream,
+        out_a: &mut DeviceBuffer<f32>,
+        out_b: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        x_a: &DeviceBuffer<f32>,
+        x_b: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+    ) -> eyre::Result<()> {
+        let expected_weight_bytes = (n_rows as usize) * (k as usize) * 2;
+        if weight.byte_len() != expected_weight_bytes {
+            return Err(eyre!(
+                "f16 matvec_two_inputs weight bytes: have {}, expected {} (n_rows={n_rows}, k={k})",
+                weight.byte_len(),
+                expected_weight_bytes
+            ));
+        }
+        if out_a.len() < n_rows as usize || out_b.len() < n_rows as usize {
+            return Err(eyre!(
+                "f16 matvec_two_inputs out lens: a={}, b={}, expected {}",
+                out_a.len(),
+                out_b.len(),
+                n_rows
+            ));
+        }
+        if x_a.len() < k as usize || x_b.len() < k as usize {
+            return Err(eyre!(
+                "f16 matvec_two_inputs x lens: a={}, b={}, expected {}",
+                x_a.len(),
+                x_b.len(),
+                k
+            ));
+        }
+
+        let function = self.wide.get_function("f16_matvec_two_inputs")?;
+        let mut out_a_ptr = out_a.raw();
+        let mut out_b_ptr = out_b.raw();
+        let mut w_ptr = weight.raw();
+        let mut x_a_ptr = x_a.raw();
+        let mut x_b_ptr = x_b.raw();
+        let mut k_v = k;
+        let mut n_rows_v = n_rows;
+        let mut args: [*mut c_void; 7] = [
+            &mut out_a_ptr as *mut _ as *mut c_void,
+            &mut out_b_ptr as *mut _ as *mut c_void,
+            &mut w_ptr as *mut _ as *mut c_void,
+            &mut x_a_ptr as *mut _ as *mut c_void,
+            &mut x_b_ptr as *mut _ as *mut c_void,
+            &mut k_v as *mut _ as *mut c_void,
+            &mut n_rows_v as *mut _ as *mut c_void,
+        ];
+        let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
+        let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
 }
