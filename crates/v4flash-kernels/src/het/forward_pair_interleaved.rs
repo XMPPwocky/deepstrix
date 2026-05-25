@@ -94,6 +94,7 @@ impl HeterogeneousEngine {
                 pos,
                 token_id_0,
                 token_id_1,
+                layer as u32,
                 evt_t0,
                 evt_t1,
                 kv_evt,
@@ -105,6 +106,7 @@ impl HeterogeneousEngine {
                 &mut dgpu_scratch.t0,
                 &mut dgpu_scratch.t1,
                 dlw,
+                layer as u32,
                 evt_t0,
                 evt_t1,
             )?;
@@ -201,6 +203,11 @@ impl HeterogeneousEngine {
     /// dGPU compute stream using 2-wide pair kernels for big matvecs.
     /// Small ops (rms, sinkhorn, hc_weighted, rope, fp8, kv_append, attn,
     /// compressor) run per-token, sequentially on the same stream.
+    ///
+    /// M40-P4.8: capturable blocks (mhc_pre_attn, q_chain, kv_chain,
+    /// output_proj, mhc_post_attn, mhc_pre_ffn, router, shared_expert)
+    /// captured into per-layer HIP graphs. Per-token rope/kv_append/attn
+    /// kernels stay outside the graphs (per-token `pos` / `n_raw` params).
     #[allow(clippy::too_many_arguments)]
     fn pair_pre_moe_batched(
         &self,
@@ -213,6 +220,7 @@ impl HeterogeneousEngine {
         pos: u32,
         token_id_0: i32,
         token_id_1: i32,
+        layer: u32,
         evt_t0: &LayerSyncEvents,
         evt_t1: &LayerSyncEvents,
         _kv_evt: &Event,
@@ -222,158 +230,178 @@ impl HeterogeneousEngine {
         self.set_current_cached(self.dgpu.device)?;
         let _t_pre = de.events.stage("dgpu.pair_pre_moe", compute)?;
 
-        // ===== Stage 1: mhc_pre_attn =====
-        // rms_nw per token (cheap, no weight load)
+        // ===== Stage 1: mhc_pre_attn — CAPTURED graph per layer =====
         {
             let _t = de.events.stage("dgpu.mhc_pre_attn_pair", compute)?;
-            de.rms_nw.launch(compute, &mut t0.flat, &t0.residual, 1, HC_DIM, RMS_EPS)?;
-            de.rms_nw.launch(compute, &mut t1.flat, &t1.residual, 1, HC_DIM, RMS_EPS)?;
-            // f16 matvec_two_inputs: one weight, two inputs → two mix vectors.
-            de.f16.matvec_two_inputs(
-                compute,
-                &mut t0.mix,
-                &mut t1.mix,
-                &dlw.hc_attn_fn.buffer,
-                &t0.flat,
-                &t1.flat,
-                HC_MIX_DIM,
-                HC_DIM,
-            )?;
-            // Sinkhorn is small (HC_MIX_DIM=24 in, N_HC=4 out). Per-token.
-            de.hc_sinkhorn.launch(
-                compute,
-                &mut t0.split,
-                &t0.mix,
-                &dlw.hc_attn_scale,
-                &dlw.hc_attn_base,
-                N_HC,
-                SINKHORN_ITERS,
-                SINKHORN_EPS,
-            )?;
-            de.hc_sinkhorn.launch(
-                compute,
-                &mut t1.split,
-                &t1.mix,
-                &dlw.hc_attn_scale,
-                &dlw.hc_attn_base,
-                N_HC,
-                SINKHORN_ITERS,
-                SINKHORN_EPS,
-            )?;
-            de.hc_weighted.launch(
-                compute,
-                &mut t0.attn_cur,
-                &t0.residual,
-                &t0.split,
-                N_EMBD,
-                N_HC,
-            )?;
-            de.hc_weighted.launch(
-                compute,
-                &mut t1.attn_cur,
-                &t1.residual,
-                &t1.split,
-                N_EMBD,
-                N_HC,
-            )?;
-            de.rms_w.launch_weighted(
-                compute,
-                &mut t0.attn_input_norm,
-                &t0.attn_cur,
-                &dlw.attn_norm,
-                N_EMBD,
-                RMS_EPS,
-            )?;
-            de.rms_w.launch_weighted(
-                compute,
-                &mut t1.attn_input_norm,
-                &t1.attn_cur,
-                &dlw.attn_norm,
-                N_EMBD,
-                RMS_EPS,
-            )?;
+            let graph_slot = &self.dgpu_pair_mhc_pre_attn_graphs[layer as usize];
+            let mut guard = graph_slot.lock().unwrap();
+            if guard.is_none() {
+                compute.begin_capture(
+                    v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                de.rms_nw.launch(compute, &mut t0.flat, &t0.residual, 1, HC_DIM, RMS_EPS)?;
+                de.rms_nw.launch(compute, &mut t1.flat, &t1.residual, 1, HC_DIM, RMS_EPS)?;
+                de.f16.matvec_two_inputs(
+                    compute,
+                    &mut t0.mix,
+                    &mut t1.mix,
+                    &dlw.hc_attn_fn.buffer,
+                    &t0.flat,
+                    &t1.flat,
+                    HC_MIX_DIM,
+                    HC_DIM,
+                )?;
+                de.hc_sinkhorn.launch(
+                    compute,
+                    &mut t0.split,
+                    &t0.mix,
+                    &dlw.hc_attn_scale,
+                    &dlw.hc_attn_base,
+                    N_HC,
+                    SINKHORN_ITERS,
+                    SINKHORN_EPS,
+                )?;
+                de.hc_sinkhorn.launch(
+                    compute,
+                    &mut t1.split,
+                    &t1.mix,
+                    &dlw.hc_attn_scale,
+                    &dlw.hc_attn_base,
+                    N_HC,
+                    SINKHORN_ITERS,
+                    SINKHORN_EPS,
+                )?;
+                de.hc_weighted.launch(
+                    compute,
+                    &mut t0.attn_cur,
+                    &t0.residual,
+                    &t0.split,
+                    N_EMBD,
+                    N_HC,
+                )?;
+                de.hc_weighted.launch(
+                    compute,
+                    &mut t1.attn_cur,
+                    &t1.residual,
+                    &t1.split,
+                    N_EMBD,
+                    N_HC,
+                )?;
+                de.rms_w.launch_weighted(
+                    compute,
+                    &mut t0.attn_input_norm,
+                    &t0.attn_cur,
+                    &dlw.attn_norm,
+                    N_EMBD,
+                    RMS_EPS,
+                )?;
+                de.rms_w.launch_weighted(
+                    compute,
+                    &mut t1.attn_input_norm,
+                    &t1.attn_cur,
+                    &dlw.attn_norm,
+                    N_EMBD,
+                    RMS_EPS,
+                )?;
+                let graph = compute.end_capture()?;
+                let exec = graph.instantiate()?;
+                exec.launch(compute)?;
+                *guard = Some(exec);
+            } else {
+                guard.as_ref().unwrap().launch(compute)?;
+            }
         }
 
         // ===== Stage 2: Q chain (batched) =====
+        // Stage 2: Q chain — pre-rope CAPTURED (rope outside, per-token pos)
         {
             let _t = de.events.stage("dgpu.q_chain_pair", compute)?;
-            // quantize_input per token (no W, just rescale)
-            de.q8.quantize_input(
-                compute,
-                &mut t0.xq_n_embd,
-                &mut t0.xscale_n_embd,
-                &t0.attn_input_norm,
-                N_EMBD,
-            )?;
-            de.q8.quantize_input(
-                compute,
-                &mut t1.xq_n_embd,
-                &mut t1.xscale_n_embd,
-                &t1.attn_input_norm,
-                N_EMBD,
-            )?;
-            // attn_q_a: pair matvec
-            de.q8.matvec_pair(
-                compute,
-                &mut t0.qr,
-                &mut t1.qr,
-                &dlw.attn_q_a.buffer,
-                &t0.xq_n_embd,
-                &t1.xq_n_embd,
-                &t0.xscale_n_embd,
-                &t1.xscale_n_embd,
-                N_LORA_Q,
-                N_EMBD,
-            )?;
-            // rms + quantize per token
-            de.rms_w.launch_weighted(
-                compute,
-                &mut t0.qr_normed,
-                &t0.qr,
-                &dlw.q_a_norm,
-                N_LORA_Q,
-                RMS_EPS,
-            )?;
-            de.rms_w.launch_weighted(
-                compute,
-                &mut t1.qr_normed,
-                &t1.qr,
-                &dlw.q_a_norm,
-                N_LORA_Q,
-                RMS_EPS,
-            )?;
-            de.q8.quantize_input(
-                compute,
-                &mut t0.qr_xq,
-                &mut t0.qr_xscale,
-                &t0.qr_normed,
-                N_LORA_Q,
-            )?;
-            de.q8.quantize_input(
-                compute,
-                &mut t1.qr_xq,
-                &mut t1.qr_xscale,
-                &t1.qr_normed,
-                N_LORA_Q,
-            )?;
-            // attn_q_b: pair matvec (BIG — 32 MB W shared)
-            de.q8.matvec_pair(
-                compute,
-                &mut t0.q,
-                &mut t1.q,
-                &dlw.attn_q_b.buffer,
-                &t0.qr_xq,
-                &t1.qr_xq,
-                &t0.qr_xscale,
-                &t1.qr_xscale,
-                Q_FLAT,
-                N_LORA_Q,
-            )?;
-            de.rms_nw
-                .launch(compute, &mut t0.q_normed, &t0.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
-            de.rms_nw
-                .launch(compute, &mut t1.q_normed, &t1.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
-            // rope per-token (different pos!)
+            let graph_slot = &self.dgpu_pair_q_chain_graphs[layer as usize];
+            let mut guard = graph_slot.lock().unwrap();
+            if guard.is_none() {
+                compute.begin_capture(
+                    v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                de.q8.quantize_input(
+                    compute,
+                    &mut t0.xq_n_embd,
+                    &mut t0.xscale_n_embd,
+                    &t0.attn_input_norm,
+                    N_EMBD,
+                )?;
+                de.q8.quantize_input(
+                    compute,
+                    &mut t1.xq_n_embd,
+                    &mut t1.xscale_n_embd,
+                    &t1.attn_input_norm,
+                    N_EMBD,
+                )?;
+                de.q8.matvec_pair(
+                    compute,
+                    &mut t0.qr,
+                    &mut t1.qr,
+                    &dlw.attn_q_a.buffer,
+                    &t0.xq_n_embd,
+                    &t1.xq_n_embd,
+                    &t0.xscale_n_embd,
+                    &t1.xscale_n_embd,
+                    N_LORA_Q,
+                    N_EMBD,
+                )?;
+                de.rms_w.launch_weighted(
+                    compute,
+                    &mut t0.qr_normed,
+                    &t0.qr,
+                    &dlw.q_a_norm,
+                    N_LORA_Q,
+                    RMS_EPS,
+                )?;
+                de.rms_w.launch_weighted(
+                    compute,
+                    &mut t1.qr_normed,
+                    &t1.qr,
+                    &dlw.q_a_norm,
+                    N_LORA_Q,
+                    RMS_EPS,
+                )?;
+                de.q8.quantize_input(
+                    compute,
+                    &mut t0.qr_xq,
+                    &mut t0.qr_xscale,
+                    &t0.qr_normed,
+                    N_LORA_Q,
+                )?;
+                de.q8.quantize_input(
+                    compute,
+                    &mut t1.qr_xq,
+                    &mut t1.qr_xscale,
+                    &t1.qr_normed,
+                    N_LORA_Q,
+                )?;
+                de.q8.matvec_pair(
+                    compute,
+                    &mut t0.q,
+                    &mut t1.q,
+                    &dlw.attn_q_b.buffer,
+                    &t0.qr_xq,
+                    &t1.qr_xq,
+                    &t0.qr_xscale,
+                    &t1.qr_xscale,
+                    Q_FLAT,
+                    N_LORA_Q,
+                )?;
+                de.rms_nw
+                    .launch(compute, &mut t0.q_normed, &t0.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
+                de.rms_nw
+                    .launch(compute, &mut t1.q_normed, &t1.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
+                let graph = compute.end_capture()?;
+                let exec = graph.instantiate()?;
+                exec.launch(compute)?;
+                *guard = Some(exec);
+            } else {
+                guard.as_ref().unwrap().launch(compute)?;
+            }
+            // rope per-token (different pos!) — stays outside the captured graph.
             de.rope.launch_forward(
                 compute,
                 &mut t0.q_normed,
@@ -394,37 +422,52 @@ impl HeterogeneousEngine {
             )?;
         }
 
-        // ===== Stage 4: KV chain (batched matvec, per-token append) =====
+        // Stage 4: KV chain — matvec+rms CAPTURED; rope+fp8+f16rt+kv_append
+        // stay outside (per-token pos, and kv_append writes are tiny anyway).
         {
             let _t = de.events.stage("dgpu.kv_chain_pair", compute)?;
-            de.q8.matvec_pair(
-                compute,
-                &mut t0.kv_raw,
-                &mut t1.kv_raw,
-                &dlw.attn_kv.buffer,
-                &t0.xq_n_embd,
-                &t1.xq_n_embd,
-                &t0.xscale_n_embd,
-                &t1.xscale_n_embd,
-                N_HEAD_DIM,
-                N_EMBD,
-            )?;
-            de.rms_w.launch_weighted(
-                compute,
-                &mut t0.kv_normed,
-                &t0.kv_raw,
-                &dlw.kv_a_norm,
-                N_HEAD_DIM,
-                RMS_EPS,
-            )?;
-            de.rms_w.launch_weighted(
-                compute,
-                &mut t1.kv_normed,
-                &t1.kv_raw,
-                &dlw.kv_a_norm,
-                N_HEAD_DIM,
-                RMS_EPS,
-            )?;
+            let graph_slot = &self.dgpu_pair_kv_chain_graphs[layer as usize];
+            let mut guard = graph_slot.lock().unwrap();
+            if guard.is_none() {
+                compute.begin_capture(
+                    v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                de.q8.matvec_pair(
+                    compute,
+                    &mut t0.kv_raw,
+                    &mut t1.kv_raw,
+                    &dlw.attn_kv.buffer,
+                    &t0.xq_n_embd,
+                    &t1.xq_n_embd,
+                    &t0.xscale_n_embd,
+                    &t1.xscale_n_embd,
+                    N_HEAD_DIM,
+                    N_EMBD,
+                )?;
+                de.rms_w.launch_weighted(
+                    compute,
+                    &mut t0.kv_normed,
+                    &t0.kv_raw,
+                    &dlw.kv_a_norm,
+                    N_HEAD_DIM,
+                    RMS_EPS,
+                )?;
+                de.rms_w.launch_weighted(
+                    compute,
+                    &mut t1.kv_normed,
+                    &t1.kv_raw,
+                    &dlw.kv_a_norm,
+                    N_HEAD_DIM,
+                    RMS_EPS,
+                )?;
+                let graph = compute.end_capture()?;
+                let exec = graph.instantiate()?;
+                exec.launch(compute)?;
+                *guard = Some(exec);
+            } else {
+                guard.as_ref().unwrap().launch(compute)?;
+            }
+            // rope/fp8/f16rt/kv_append: outside graph (per-token pos).
             de.rope.launch_forward(
                 compute,
                 &mut t0.kv_normed,
@@ -701,7 +744,7 @@ impl HeterogeneousEngine {
         // ===== Stage 7: output_proj (batched) =====
         {
             let _t = de.events.stage("dgpu.output_proj_pair", compute)?;
-            // rope_inverse per-token (different pos)
+            // rope_inverse per-token (different pos) — OUTSIDE the captured graph.
             de.rope.launch_inverse(
                 compute,
                 &mut t0.heads,
@@ -720,174 +763,224 @@ impl HeterogeneousEngine {
                 pos + 1,
                 &dlw.rope_params,
             )?;
-            de.q8.quantize_input(
-                compute,
-                &mut t0.heads_xq,
-                &mut t0.heads_xscale,
-                &t0.heads,
-                Q_FLAT,
-            )?;
-            de.q8.quantize_input(
-                compute,
-                &mut t1.heads_xq,
-                &mut t1.heads_xscale,
-                &t1.heads,
-                Q_FLAT,
-            )?;
-            // attn_output_a: pair grouped matvec
-            de.q8_grouped.matvec_grouped_pair(
-                compute,
-                &mut t0.low,
-                &mut t1.low,
-                &dlw.attn_output_a.buffer,
-                &t0.heads_xq,
-                &t1.heads_xq,
-                &t0.heads_xscale,
-                &t1.heads_xscale,
-                GROUP_DIM,
-                RANK,
-                N_GROUPS,
-            )?;
-            de.q8.quantize_input(
-                compute,
-                &mut t0.low_xq,
-                &mut t0.low_xscale,
-                &t0.low,
-                OUT_LOW,
-            )?;
-            de.q8.quantize_input(
-                compute,
-                &mut t1.low_xq,
-                &mut t1.low_xscale,
-                &t1.low,
-                OUT_LOW,
-            )?;
-            // attn_output_b: pair matvec
-            de.q8.matvec_pair(
-                compute,
-                &mut t0.attn_out,
-                &mut t1.attn_out,
-                &dlw.attn_output_b.buffer,
-                &t0.low_xq,
-                &t1.low_xq,
-                &t0.low_xscale,
-                &t1.low_xscale,
-                N_EMBD,
-                OUT_LOW,
-            )?;
+            // Post-rope output_proj — CAPTURED.
+            let graph_slot = &self.dgpu_pair_output_proj_graphs[layer as usize];
+            let mut guard = graph_slot.lock().unwrap();
+            if guard.is_none() {
+                compute.begin_capture(
+                    v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                de.q8.quantize_input(
+                    compute,
+                    &mut t0.heads_xq,
+                    &mut t0.heads_xscale,
+                    &t0.heads,
+                    Q_FLAT,
+                )?;
+                de.q8.quantize_input(
+                    compute,
+                    &mut t1.heads_xq,
+                    &mut t1.heads_xscale,
+                    &t1.heads,
+                    Q_FLAT,
+                )?;
+                de.q8_grouped.matvec_grouped_pair(
+                    compute,
+                    &mut t0.low,
+                    &mut t1.low,
+                    &dlw.attn_output_a.buffer,
+                    &t0.heads_xq,
+                    &t1.heads_xq,
+                    &t0.heads_xscale,
+                    &t1.heads_xscale,
+                    GROUP_DIM,
+                    RANK,
+                    N_GROUPS,
+                )?;
+                de.q8.quantize_input(
+                    compute,
+                    &mut t0.low_xq,
+                    &mut t0.low_xscale,
+                    &t0.low,
+                    OUT_LOW,
+                )?;
+                de.q8.quantize_input(
+                    compute,
+                    &mut t1.low_xq,
+                    &mut t1.low_xscale,
+                    &t1.low,
+                    OUT_LOW,
+                )?;
+                de.q8.matvec_pair(
+                    compute,
+                    &mut t0.attn_out,
+                    &mut t1.attn_out,
+                    &dlw.attn_output_b.buffer,
+                    &t0.low_xq,
+                    &t1.low_xq,
+                    &t0.low_xscale,
+                    &t1.low_xscale,
+                    N_EMBD,
+                    OUT_LOW,
+                )?;
+                let graph = compute.end_capture()?;
+                let exec = graph.instantiate()?;
+                exec.launch(compute)?;
+                *guard = Some(exec);
+            } else {
+                guard.as_ref().unwrap().launch(compute)?;
+            }
         }
 
-        // ===== Stage 8: mhc_post_attn (per-token; no W) =====
+        // Stage 8: mhc_post_attn — CAPTURED (2 hc_post calls).
         {
             let _t = de.events.stage("dgpu.mhc_post_attn_pair", compute)?;
-            de.hc_post.launch_from_split(
-                compute,
-                &mut t0.after_attn_hc,
-                &t0.attn_out,
-                &t0.residual,
-                &t0.split,
-                N_HC,
-                N_EMBD,
-                N_HC,
-            )?;
-            de.hc_post.launch_from_split(
-                compute,
-                &mut t1.after_attn_hc,
-                &t1.attn_out,
-                &t1.residual,
-                &t1.split,
-                N_HC,
-                N_EMBD,
-                N_HC,
-            )?;
+            let graph_slot = &self.dgpu_pair_mhc_post_attn_graphs[layer as usize];
+            let mut guard = graph_slot.lock().unwrap();
+            if guard.is_none() {
+                compute.begin_capture(
+                    v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                de.hc_post.launch_from_split(
+                    compute,
+                    &mut t0.after_attn_hc,
+                    &t0.attn_out,
+                    &t0.residual,
+                    &t0.split,
+                    N_HC,
+                    N_EMBD,
+                    N_HC,
+                )?;
+                de.hc_post.launch_from_split(
+                    compute,
+                    &mut t1.after_attn_hc,
+                    &t1.attn_out,
+                    &t1.residual,
+                    &t1.split,
+                    N_HC,
+                    N_EMBD,
+                    N_HC,
+                )?;
+                let graph = compute.end_capture()?;
+                let exec = graph.instantiate()?;
+                exec.launch(compute)?;
+                *guard = Some(exec);
+            } else {
+                guard.as_ref().unwrap().launch(compute)?;
+            }
         }
 
-        // ===== Stage 9: mhc_pre_ffn (batched f16 matvec, rest per-token) =====
+        // Stage 9: mhc_pre_ffn — CAPTURED.
         {
             let _t = de.events.stage("dgpu.mhc_pre_ffn_pair", compute)?;
-            de.rms_nw
-                .launch(compute, &mut t0.flat, &t0.after_attn_hc, 1, HC_DIM, RMS_EPS)?;
-            de.rms_nw
-                .launch(compute, &mut t1.flat, &t1.after_attn_hc, 1, HC_DIM, RMS_EPS)?;
-            de.f16.matvec_two_inputs(
-                compute,
-                &mut t0.mix,
-                &mut t1.mix,
-                &dlw.hc_ffn_fn.buffer,
-                &t0.flat,
-                &t1.flat,
-                HC_MIX_DIM,
-                HC_DIM,
-            )?;
-            de.hc_sinkhorn.launch(
-                compute,
-                &mut t0.split,
-                &t0.mix,
-                &dlw.hc_ffn_scale,
-                &dlw.hc_ffn_base,
-                N_HC,
-                SINKHORN_ITERS,
-                SINKHORN_EPS,
-            )?;
-            de.hc_sinkhorn.launch(
-                compute,
-                &mut t1.split,
-                &t1.mix,
-                &dlw.hc_ffn_scale,
-                &dlw.hc_ffn_base,
-                N_HC,
-                SINKHORN_ITERS,
-                SINKHORN_EPS,
-            )?;
-            de.hc_weighted.launch(
-                compute,
-                &mut t0.ffn_cur,
-                &t0.after_attn_hc,
-                &t0.split,
-                N_EMBD,
-                N_HC,
-            )?;
-            de.hc_weighted.launch(
-                compute,
-                &mut t1.ffn_cur,
-                &t1.after_attn_hc,
-                &t1.split,
-                N_EMBD,
-                N_HC,
-            )?;
-            de.rms_w.launch_weighted(
-                compute,
-                &mut t0.ffn_input_norm,
-                &t0.ffn_cur,
-                &dlw.ffn_norm,
-                N_EMBD,
-                RMS_EPS,
-            )?;
-            de.rms_w.launch_weighted(
-                compute,
-                &mut t1.ffn_input_norm,
-                &t1.ffn_cur,
-                &dlw.ffn_norm,
-                N_EMBD,
-                RMS_EPS,
-            )?;
+            let graph_slot = &self.dgpu_pair_mhc_pre_ffn_graphs[layer as usize];
+            let mut guard = graph_slot.lock().unwrap();
+            if guard.is_none() {
+                compute.begin_capture(
+                    v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                de.rms_nw.launch(
+                    compute,
+                    &mut t0.flat,
+                    &t0.after_attn_hc,
+                    1,
+                    HC_DIM,
+                    RMS_EPS,
+                )?;
+                de.rms_nw.launch(
+                    compute,
+                    &mut t1.flat,
+                    &t1.after_attn_hc,
+                    1,
+                    HC_DIM,
+                    RMS_EPS,
+                )?;
+                de.f16.matvec_two_inputs(
+                    compute,
+                    &mut t0.mix,
+                    &mut t1.mix,
+                    &dlw.hc_ffn_fn.buffer,
+                    &t0.flat,
+                    &t1.flat,
+                    HC_MIX_DIM,
+                    HC_DIM,
+                )?;
+                de.hc_sinkhorn.launch(
+                    compute,
+                    &mut t0.split,
+                    &t0.mix,
+                    &dlw.hc_ffn_scale,
+                    &dlw.hc_ffn_base,
+                    N_HC,
+                    SINKHORN_ITERS,
+                    SINKHORN_EPS,
+                )?;
+                de.hc_sinkhorn.launch(
+                    compute,
+                    &mut t1.split,
+                    &t1.mix,
+                    &dlw.hc_ffn_scale,
+                    &dlw.hc_ffn_base,
+                    N_HC,
+                    SINKHORN_ITERS,
+                    SINKHORN_EPS,
+                )?;
+                de.hc_weighted.launch(
+                    compute,
+                    &mut t0.ffn_cur,
+                    &t0.after_attn_hc,
+                    &t0.split,
+                    N_EMBD,
+                    N_HC,
+                )?;
+                de.hc_weighted.launch(
+                    compute,
+                    &mut t1.ffn_cur,
+                    &t1.after_attn_hc,
+                    &t1.split,
+                    N_EMBD,
+                    N_HC,
+                )?;
+                de.rms_w.launch_weighted(
+                    compute,
+                    &mut t0.ffn_input_norm,
+                    &t0.ffn_cur,
+                    &dlw.ffn_norm,
+                    N_EMBD,
+                    RMS_EPS,
+                )?;
+                de.rms_w.launch_weighted(
+                    compute,
+                    &mut t1.ffn_input_norm,
+                    &t1.ffn_cur,
+                    &dlw.ffn_norm,
+                    N_EMBD,
+                    RMS_EPS,
+                )?;
+                let graph = compute.end_capture()?;
+                let exec = graph.instantiate()?;
+                exec.launch(compute)?;
+                *guard = Some(exec);
+            } else {
+                guard.as_ref().unwrap().launch(compute)?;
+            }
         }
 
-        // ===== Stage 11: router (batched f16 matvec, per-token topk/hash) =====
+        // Stage 11: router — learned path CAPTURED. Hash router (L<3) skips
+        // capture because it needs host sync + CPU work; runs direct each time.
         {
             let _t = de.events.stage("dgpu.router_pair", compute)?;
-            de.f16.matvec_two_inputs(
-                compute,
-                &mut t0.router_logits,
-                &mut t1.router_logits,
-                &dlw.ffn_gate_inp.buffer,
-                &t0.ffn_input_norm,
-                &t1.ffn_input_norm,
-                N_EXPERT,
-                N_EMBD,
-            )?;
             if dlw.is_hash_router {
-                // Hash router needs host readback. Sync, then per-token CPU select.
+                de.f16.matvec_two_inputs(
+                    compute,
+                    &mut t0.router_logits,
+                    &mut t1.router_logits,
+                    &dlw.ffn_gate_inp.buffer,
+                    &t0.ffn_input_norm,
+                    &t1.ffn_input_norm,
+                    N_EXPERT,
+                    N_EMBD,
+                )?;
                 compute.synchronize()?;
                 t0.router_logits.copy_to_host(&mut t0.router_logits_host)?;
                 t1.router_logits.copy_to_host(&mut t1.router_logits_host)?;
@@ -902,28 +995,51 @@ impl HeterogeneousEngine {
                 t1.d_selected.copy_from_host(&sel1)?;
                 t1.d_ew.copy_from_host(&w1)?;
             } else {
-                de.router_topk.launch(
-                    compute,
-                    &mut t0.d_selected,
-                    &mut t0.d_ew,
-                    &t0.router_logits,
-                    dlw.router_bias_dev.as_ref(),
-                    N_EXPERT,
-                    N_EXPERT_USED as u32,
-                    EXPERT_WEIGHT_SCALE,
-                    ROUTER_WEIGHT_EPS,
-                )?;
-                de.router_topk.launch(
-                    compute,
-                    &mut t1.d_selected,
-                    &mut t1.d_ew,
-                    &t1.router_logits,
-                    dlw.router_bias_dev.as_ref(),
-                    N_EXPERT,
-                    N_EXPERT_USED as u32,
-                    EXPERT_WEIGHT_SCALE,
-                    ROUTER_WEIGHT_EPS,
-                )?;
+                let graph_slot = &self.dgpu_pair_router_graphs[layer as usize];
+                let mut guard = graph_slot.lock().unwrap();
+                if guard.is_none() {
+                    compute.begin_capture(
+                        v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                    )?;
+                    de.f16.matvec_two_inputs(
+                        compute,
+                        &mut t0.router_logits,
+                        &mut t1.router_logits,
+                        &dlw.ffn_gate_inp.buffer,
+                        &t0.ffn_input_norm,
+                        &t1.ffn_input_norm,
+                        N_EXPERT,
+                        N_EMBD,
+                    )?;
+                    de.router_topk.launch(
+                        compute,
+                        &mut t0.d_selected,
+                        &mut t0.d_ew,
+                        &t0.router_logits,
+                        dlw.router_bias_dev.as_ref(),
+                        N_EXPERT,
+                        N_EXPERT_USED as u32,
+                        EXPERT_WEIGHT_SCALE,
+                        ROUTER_WEIGHT_EPS,
+                    )?;
+                    de.router_topk.launch(
+                        compute,
+                        &mut t1.d_selected,
+                        &mut t1.d_ew,
+                        &t1.router_logits,
+                        dlw.router_bias_dev.as_ref(),
+                        N_EXPERT,
+                        N_EXPERT_USED as u32,
+                        EXPERT_WEIGHT_SCALE,
+                        ROUTER_WEIGHT_EPS,
+                    )?;
+                    let graph = compute.end_capture()?;
+                    let exec = graph.instantiate()?;
+                    exec.launch(compute)?;
+                    *guard = Some(exec);
+                } else {
+                    guard.as_ref().unwrap().launch(compute)?;
+                }
             }
         }
 
@@ -940,78 +1056,91 @@ impl HeterogeneousEngine {
         // With the reorder de.compute FIFOs straight from router_pair →
         // shared_expert_pair → peer_pushes → selected_pushed.record.
 
-        // ===== Stage 13: shared_expert_pair (queued NOW so it FIFOs after
-        // router on de.compute) =====
+        // Stage 13: shared_expert_pair — CAPTURED (queued NOW so de.compute
+        // FIFOs straight from router_pair → shared_expert_pair → peer_pushes).
         {
             let _t = de.events.stage("dgpu.shared_expert_pair", compute)?;
-            de.q8.quantize_input(
-                compute,
-                &mut t0.xq_n_embd,
-                &mut t0.xscale_n_embd,
-                &t0.ffn_input_norm,
-                N_EMBD,
-            )?;
-            de.q8.quantize_input(
-                compute,
-                &mut t1.xq_n_embd,
-                &mut t1.xscale_n_embd,
-                &t1.ffn_input_norm,
-                N_EMBD,
-            )?;
-            de.q8.matvec_pair(
-                compute,
-                &mut t0.gate_sh,
-                &mut t1.gate_sh,
-                &dlw.shared.gate.buffer,
-                &t0.xq_n_embd,
-                &t1.xq_n_embd,
-                &t0.xscale_n_embd,
-                &t1.xscale_n_embd,
-                N_FF_SHARED,
-                N_EMBD,
-            )?;
-            de.q8.matvec_pair(
-                compute,
-                &mut t0.up_sh,
-                &mut t1.up_sh,
-                &dlw.shared.up.buffer,
-                &t0.xq_n_embd,
-                &t1.xq_n_embd,
-                &t0.xscale_n_embd,
-                &t1.xscale_n_embd,
-                N_FF_SHARED,
-                N_EMBD,
-            )?;
-            de.swiglu
-                .launch(compute, &mut t0.mid_sh, &t0.gate_sh, &t0.up_sh, N_FF_SHARED)?;
-            de.swiglu
-                .launch(compute, &mut t1.mid_sh, &t1.gate_sh, &t1.up_sh, N_FF_SHARED)?;
-            de.q8.quantize_input(
-                compute,
-                &mut t0.mid_sh_xq,
-                &mut t0.mid_sh_xscale,
-                &t0.mid_sh,
-                N_FF_SHARED,
-            )?;
-            de.q8.quantize_input(
-                compute,
-                &mut t1.mid_sh_xq,
-                &mut t1.mid_sh_xscale,
-                &t1.mid_sh,
-                N_FF_SHARED,
-            )?;
-            de.q8.matvec_pair(
-                compute,
-                &mut t0.ffn_shared,
-                &mut t1.ffn_shared,
-                &dlw.shared.down.buffer,
-                &t0.mid_sh_xq,
-                &t1.mid_sh_xq,
-                &t0.mid_sh_xscale,
-                &t1.mid_sh_xscale,
-                N_EMBD,
-                N_FF_SHARED,
-            )?;
+            let graph_slot = &self.dgpu_pair_shared_expert_graphs[layer as usize];
+            let mut guard = graph_slot.lock().unwrap();
+            if guard.is_none() {
+                compute.begin_capture(
+                    v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                de.q8.quantize_input(
+                    compute,
+                    &mut t0.xq_n_embd,
+                    &mut t0.xscale_n_embd,
+                    &t0.ffn_input_norm,
+                    N_EMBD,
+                )?;
+                de.q8.quantize_input(
+                    compute,
+                    &mut t1.xq_n_embd,
+                    &mut t1.xscale_n_embd,
+                    &t1.ffn_input_norm,
+                    N_EMBD,
+                )?;
+                de.q8.matvec_pair(
+                    compute,
+                    &mut t0.gate_sh,
+                    &mut t1.gate_sh,
+                    &dlw.shared.gate.buffer,
+                    &t0.xq_n_embd,
+                    &t1.xq_n_embd,
+                    &t0.xscale_n_embd,
+                    &t1.xscale_n_embd,
+                    N_FF_SHARED,
+                    N_EMBD,
+                )?;
+                de.q8.matvec_pair(
+                    compute,
+                    &mut t0.up_sh,
+                    &mut t1.up_sh,
+                    &dlw.shared.up.buffer,
+                    &t0.xq_n_embd,
+                    &t1.xq_n_embd,
+                    &t0.xscale_n_embd,
+                    &t1.xscale_n_embd,
+                    N_FF_SHARED,
+                    N_EMBD,
+                )?;
+                de.swiglu
+                    .launch(compute, &mut t0.mid_sh, &t0.gate_sh, &t0.up_sh, N_FF_SHARED)?;
+                de.swiglu
+                    .launch(compute, &mut t1.mid_sh, &t1.gate_sh, &t1.up_sh, N_FF_SHARED)?;
+                de.q8.quantize_input(
+                    compute,
+                    &mut t0.mid_sh_xq,
+                    &mut t0.mid_sh_xscale,
+                    &t0.mid_sh,
+                    N_FF_SHARED,
+                )?;
+                de.q8.quantize_input(
+                    compute,
+                    &mut t1.mid_sh_xq,
+                    &mut t1.mid_sh_xscale,
+                    &t1.mid_sh,
+                    N_FF_SHARED,
+                )?;
+                de.q8.matvec_pair(
+                    compute,
+                    &mut t0.ffn_shared,
+                    &mut t1.ffn_shared,
+                    &dlw.shared.down.buffer,
+                    &t0.mid_sh_xq,
+                    &t1.mid_sh_xq,
+                    &t0.mid_sh_xscale,
+                    &t1.mid_sh_xscale,
+                    N_EMBD,
+                    N_FF_SHARED,
+                )?;
+                let graph = compute.end_capture()?;
+                let exec = graph.instantiate()?;
+                exec.launch(compute)?;
+                *guard = Some(exec);
+            } else {
+                guard.as_ref().unwrap().launch(compute)?;
+            }
         }
 
         // Peer pushes for both tokens on de.compute (FIFO with shared_expert).
@@ -1140,54 +1269,68 @@ impl HeterogeneousEngine {
     }
 
     /// pair_post_moe_batched — both tokens' ffn_combine on de.compute.
-    /// Each waits on its own moe_arrived event, then vec_add + hc_post.
+    /// Wait for moe_arrived (cross-device event, can't capture), then
+    /// vec_add + hc_post per token. The vec_add+hc_post for BOTH tokens
+    /// is captured into one graph (same buffer layout layer-after-layer).
     fn pair_post_moe_batched(
         &self,
         t0: &mut TokenScratch,
         t1: &mut TokenScratch,
         _dlw: &DgpuLayerWeights,
+        layer: u32,
         evt_t0: &LayerSyncEvents,
         evt_t1: &LayerSyncEvents,
     ) -> eyre::Result<()> {
         let de = &self.dgpu;
         let compute = &de.compute;
-        // t0
+        // Cross-device waits — can't go inside captured graph; stay direct.
         {
             let _t = de.events.stage("dgpu.ffn_combine.wait_t0", compute)?;
             compute.wait_event(&evt_t0.moe_arrived)?;
         }
         {
-            let _t = de.events.stage("dgpu.ffn_combine_t0", compute)?;
-            de.vec_add.launch(compute, &mut t0.ffn_moe_recv, &t0.ffn_shared, N_EMBD)?;
-            de.hc_post.launch_from_split(
-                compute,
-                &mut t0.residual_next,
-                &t0.ffn_moe_recv,
-                &t0.after_attn_hc,
-                &t0.split,
-                N_HC,
-                N_EMBD,
-                N_HC,
-            )?;
-        }
-        // t1
-        {
             let _t = de.events.stage("dgpu.ffn_combine.wait_t1", compute)?;
             compute.wait_event(&evt_t1.moe_arrived)?;
         }
+        // Both ffn_combines CAPTURED into one graph per layer (4 kernels:
+        // 2 vec_add + 2 hc_post).
         {
-            let _t = de.events.stage("dgpu.ffn_combine_t1", compute)?;
-            de.vec_add.launch(compute, &mut t1.ffn_moe_recv, &t1.ffn_shared, N_EMBD)?;
-            de.hc_post.launch_from_split(
-                compute,
-                &mut t1.residual_next,
-                &t1.ffn_moe_recv,
-                &t1.after_attn_hc,
-                &t1.split,
-                N_HC,
-                N_EMBD,
-                N_HC,
-            )?;
+            let _t = de.events.stage("dgpu.ffn_combine_pair", compute)?;
+            let graph_slot = &self.dgpu_pair_ffn_combine_graphs[layer as usize];
+            let mut guard = graph_slot.lock().unwrap();
+            if guard.is_none() {
+                compute.begin_capture(
+                    v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                de.vec_add.launch(compute, &mut t0.ffn_moe_recv, &t0.ffn_shared, N_EMBD)?;
+                de.hc_post.launch_from_split(
+                    compute,
+                    &mut t0.residual_next,
+                    &t0.ffn_moe_recv,
+                    &t0.after_attn_hc,
+                    &t0.split,
+                    N_HC,
+                    N_EMBD,
+                    N_HC,
+                )?;
+                de.vec_add.launch(compute, &mut t1.ffn_moe_recv, &t1.ffn_shared, N_EMBD)?;
+                de.hc_post.launch_from_split(
+                    compute,
+                    &mut t1.residual_next,
+                    &t1.ffn_moe_recv,
+                    &t1.after_attn_hc,
+                    &t1.split,
+                    N_HC,
+                    N_EMBD,
+                    N_HC,
+                )?;
+                let graph = compute.end_capture()?;
+                let exec = graph.instantiate()?;
+                exec.launch(compute)?;
+                *guard = Some(exec);
+            } else {
+                guard.as_ref().unwrap().launch(compute)?;
+            }
         }
         Ok(())
     }

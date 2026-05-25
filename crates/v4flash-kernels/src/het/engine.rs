@@ -322,6 +322,21 @@ pub struct HeterogeneousEngine {
     /// throughout. HIP graph capture orders the kernels sequentially on
     /// the stream, so the read-after-write dependency is preserved.
     pub dgpu_combined_ffn_pre_attn_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+
+    /// M40-P4.8: per-layer captured graphs for the pair_pre_moe_batched
+    /// blocks. Each block is single-stream (de.compute) and references
+    /// stable TokenScratch pointers — safe to capture. Per-token rope,
+    /// kv_append, and attn launches stay OUTSIDE the captured graphs
+    /// because they take per-token `pos`/`n_raw` runtime params.
+    pub dgpu_pair_mhc_pre_attn_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    pub dgpu_pair_q_chain_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    pub dgpu_pair_kv_chain_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    pub dgpu_pair_output_proj_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    pub dgpu_pair_mhc_post_attn_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    pub dgpu_pair_mhc_pre_ffn_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    pub dgpu_pair_router_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    pub dgpu_pair_shared_expert_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    pub dgpu_pair_ffn_combine_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
     /// M20: cache which HIP device is currently bound on this thread,
     /// so set_current_cached() can skip the driver call when the
     /// device hasn't actually changed. AtomicI32 (not Cell) so
@@ -759,6 +774,28 @@ impl HeterogeneousEngine {
             dgpu_combined_ffn_pre_attn_graphs.push(std::sync::Mutex::new(None));
         }
 
+        // M40-P4.8: pair-mode captured-graph slots, one per layer per block.
+        let mut dgpu_pair_mhc_pre_attn_graphs = Vec::with_capacity(N_LAYER as usize);
+        let mut dgpu_pair_q_chain_graphs = Vec::with_capacity(N_LAYER as usize);
+        let mut dgpu_pair_kv_chain_graphs = Vec::with_capacity(N_LAYER as usize);
+        let mut dgpu_pair_output_proj_graphs = Vec::with_capacity(N_LAYER as usize);
+        let mut dgpu_pair_mhc_post_attn_graphs = Vec::with_capacity(N_LAYER as usize);
+        let mut dgpu_pair_mhc_pre_ffn_graphs = Vec::with_capacity(N_LAYER as usize);
+        let mut dgpu_pair_router_graphs = Vec::with_capacity(N_LAYER as usize);
+        let mut dgpu_pair_shared_expert_graphs = Vec::with_capacity(N_LAYER as usize);
+        let mut dgpu_pair_ffn_combine_graphs = Vec::with_capacity(N_LAYER as usize);
+        for _ in 0..N_LAYER {
+            dgpu_pair_mhc_pre_attn_graphs.push(std::sync::Mutex::new(None));
+            dgpu_pair_q_chain_graphs.push(std::sync::Mutex::new(None));
+            dgpu_pair_kv_chain_graphs.push(std::sync::Mutex::new(None));
+            dgpu_pair_output_proj_graphs.push(std::sync::Mutex::new(None));
+            dgpu_pair_mhc_post_attn_graphs.push(std::sync::Mutex::new(None));
+            dgpu_pair_mhc_pre_ffn_graphs.push(std::sync::Mutex::new(None));
+            dgpu_pair_router_graphs.push(std::sync::Mutex::new(None));
+            dgpu_pair_shared_expert_graphs.push(std::sync::Mutex::new(None));
+            dgpu_pair_ffn_combine_graphs.push(std::sync::Mutex::new(None));
+        }
+
         Ok(Self {
             dgpu,
             igpu,
@@ -775,6 +812,15 @@ impl HeterogeneousEngine {
             dgpu_output_proj_post_rope_graphs,
             dgpu_ffn_combine_graphs,
             dgpu_combined_ffn_pre_attn_graphs,
+            dgpu_pair_mhc_pre_attn_graphs,
+            dgpu_pair_q_chain_graphs,
+            dgpu_pair_kv_chain_graphs,
+            dgpu_pair_output_proj_graphs,
+            dgpu_pair_mhc_post_attn_graphs,
+            dgpu_pair_mhc_pre_ffn_graphs,
+            dgpu_pair_router_graphs,
+            dgpu_pair_shared_expert_graphs,
+            dgpu_pair_ffn_combine_graphs,
             current_device: std::sync::atomic::AtomicI32::new(-1),
             last_host_us: std::sync::atomic::AtomicU64::new(0),
             last_sync_us: std::sync::atomic::AtomicU64::new(0),
