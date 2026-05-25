@@ -57,12 +57,20 @@ pub enum ExecMode {
 /// not weights). Memory split happens in [`super::weights`].
 pub struct DeviceEngine {
     pub device: Device,
-    /// Compute stream — all kernel launches go here.
+    /// Compute stream — all kernel launches go here for single-token paths.
     pub compute: Stream,
     /// Transfer stream — peer copies originating on this device go here.
     /// Per the load-bearing peer-copy rule, `hipMemcpyPeerAsync` MUST be
     /// queued on the **source** device's stream.
     pub xfer: Stream,
+    /// M40-P4: per-token dGPU streams for `forward_pair_interleaved`.
+    /// On the iGPU these stay None — iGPU MoE is FIFO-serialized through
+    /// the single `compute` stream because MoE is the bottleneck and the
+    /// dGPU side does the parallelism.
+    pub compute_t0: Option<Stream>,
+    pub compute_t1: Option<Stream>,
+    pub xfer_t0: Option<Stream>,
+    pub xfer_t1: Option<Stream>,
 
     pub rms_w: RmsNorm,
     pub rms_nw: RmsNormNoWeight,
@@ -110,16 +118,27 @@ impl DeviceEngine {
         device.set_current()?;
         let compute = Stream::new(device.id)?;
         let xfer = Stream::new(device.id)?;
-        let label: &'static str = if device.properties()?.integrated {
-            "igpu"
+        let is_igpu = device.properties()?.integrated;
+        let (compute_t0, compute_t1, xfer_t0, xfer_t1) = if !is_igpu {
+            (
+                Some(Stream::new(device.id)?),
+                Some(Stream::new(device.id)?),
+                Some(Stream::new(device.id)?),
+                Some(Stream::new(device.id)?),
+            )
         } else {
-            "dgpu"
+            (None, None, None, None)
         };
+        let label: &'static str = if is_igpu { "igpu" } else { "dgpu" };
         let events = EventPool::new(label, EVENT_POOL_CAPACITY)?;
         Ok(Self {
             device,
             compute,
             xfer,
+            compute_t0,
+            compute_t1,
+            xfer_t0,
+            xfer_t1,
             rms_w: RmsNorm::for_arch(arch)?,
             rms_nw: RmsNormNoWeight::for_arch(arch)?,
             q8: Q8_0Matvec::for_arch(arch)?,
@@ -236,6 +255,12 @@ pub struct HeterogeneousEngine {
     /// interleaved pair forward. `sync_events` is t0, this is t1. Allocated
     /// identically to sync_events.
     pub sync_events_t1: HetSyncEvents,
+    /// M40-P4: per-layer cross-token sync event for the pair forward.
+    /// Recorded on de.compute_t0 after t0's pre-attn state writes (KV
+    /// append + optional compressor state). de.compute_t1 waits on it
+    /// before t1's attention so t1's attn_mixed/attn_swa kernel sees a
+    /// kv_cache that includes row `pos` written by t0.
+    pub pair_t0_state_ready: Vec<Event>,
     /// Optional per-token device-time perfetto exporter. Drains the
     /// EventPools at the end of each `forward_token` into per-stream
     /// perfetto tracks. Enable by calling
@@ -705,6 +730,12 @@ impl HeterogeneousEngine {
 
         let sync_events = HetSyncEvents::alloc(dgpu_device, igpu_device)?;
         let sync_events_t1 = HetSyncEvents::alloc(dgpu_device, igpu_device)?;
+        // M40-P4: per-layer cross-token kv-state event (on dGPU).
+        dgpu_device.set_current()?;
+        let mut pair_t0_state_ready = Vec::with_capacity(N_LAYER as usize);
+        for _ in 0..N_LAYER {
+            pair_t0_state_ready.push(Event::new_no_timing()?);
+        }
 
         let mut igpu_moe_graphs = Vec::with_capacity(N_LAYER as usize);
         let mut dgpu_mhc_pre_attn_graphs = Vec::with_capacity(N_LAYER as usize);
@@ -734,6 +765,7 @@ impl HeterogeneousEngine {
             mode,
             sync_events,
             sync_events_t1,
+            pair_t0_state_ready,
             perfetto: None,
             igpu_moe_graphs,
             dgpu_mhc_pre_attn_graphs,
@@ -796,7 +828,7 @@ impl HeterogeneousEngine {
         &mut self,
         path: impl AsRef<std::path::Path>,
     ) -> eyre::Result<()> {
-        let exporter = DeviceTimingExporter::open(
+        let mut exporter = DeviceTimingExporter::open(
             path,
             self.dgpu.device,
             &self.dgpu.compute,
@@ -805,16 +837,18 @@ impl HeterogeneousEngine {
             &self.igpu.compute,
             &self.igpu.xfer,
         )?;
+        // M40-P4: add 4 dGPU per-token tracks if those streams exist.
+        if let (Some(ct0), Some(ct1), Some(xt0), Some(xt1)) = (
+            self.dgpu.compute_t0.as_ref(),
+            self.dgpu.compute_t1.as_ref(),
+            self.dgpu.xfer_t0.as_ref(),
+            self.dgpu.xfer_t1.as_ref(),
+        ) {
+            exporter.add_pair_tracks(self.dgpu.device, ct0, ct1, xt0, xt1)?;
+        }
         self.perfetto = Some(std::sync::Mutex::new(exporter));
-        // M20: per-stage events are skipped by default (bench mode);
-        // perfetto export needs them on. Flip both pools on now.
         self.dgpu.events.set_enabled(true);
         self.igpu.events.set_enabled(true);
-        // DeviceTimingExporter::open ran Anchor::new() for each track,
-        // which calls device.set_current() and leaves whichever device
-        // was set last as current — bypassing our set_current cache.
-        // Invalidate so the first set_current_cached call after
-        // attach_perfetto is forced through.
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }

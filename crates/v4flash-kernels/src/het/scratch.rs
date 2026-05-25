@@ -22,6 +22,126 @@ use crate::forward::{
 };
 use crate::q8_k::BLOCK_Q8_K_BYTES;
 
+/// M40-P4: per-token in-flight scratch for `forward_pair_interleaved`.
+/// Holds every buffer that pre_moe + post_moe write/read inside a single
+/// layer pass for ONE token. With per-token streams, t0's and t1's
+/// pre_moes run truly in parallel on the dGPU — they cannot share these
+/// buffers. Memory cost: ~1 MB per instance × 2 instances = ~2 MB total.
+pub struct TokenScratch {
+    // Residual flow (input residual + this layer's output ffn_combine result).
+    pub residual: DeviceBuffer<f32>,      // HC_DIM
+    pub residual_next: DeviceBuffer<f32>, // HC_DIM
+
+    // mhc_pre_attn intermediates + output.
+    pub flat: DeviceBuffer<f32>,            // HC_DIM
+    pub mix: DeviceBuffer<f32>,             // HC_MIX_DIM
+    pub split: DeviceBuffer<f32>,           // HC_MIX_DIM (matches DgpuScratch.split)
+    pub attn_cur: DeviceBuffer<f32>,        // N_EMBD
+    pub attn_input_norm: DeviceBuffer<f32>, // N_EMBD
+
+    // Q chain.
+    pub xq_n_embd: DeviceBuffer<i8>,       // N_EMBD
+    pub xscale_n_embd: DeviceBuffer<f32>,  // BLOCKS_N_EMBD
+    pub qr: DeviceBuffer<f32>,             // N_LORA_Q
+    pub qr_normed: DeviceBuffer<f32>,      // N_LORA_Q
+    pub qr_xq: DeviceBuffer<i8>,           // N_LORA_Q
+    pub qr_xscale: DeviceBuffer<f32>,      // BLOCKS_N_LORA_Q
+    pub q: DeviceBuffer<f32>,              // Q_FLAT
+    pub q_normed: DeviceBuffer<f32>,       // Q_FLAT
+
+    // KV chain.
+    pub kv_raw: DeviceBuffer<f32>,    // N_HEAD_DIM
+    pub kv_normed: DeviceBuffer<f32>, // N_HEAD_DIM
+
+    // Compressor scratch.
+    pub kv_cur: DeviceBuffer<f32>,   // 2 * N_HEAD_DIM
+    pub sc_cur: DeviceBuffer<f32>,   // 2 * N_HEAD_DIM
+    pub pooled: DeviceBuffer<f32>,   // N_HEAD_DIM
+    pub comp_row: DeviceBuffer<f32>, // N_HEAD_DIM
+
+    // Attention output + output_proj intermediates.
+    pub heads: DeviceBuffer<f32>,         // Q_FLAT
+    pub heads_xq: DeviceBuffer<i8>,       // Q_FLAT
+    pub heads_xscale: DeviceBuffer<f32>,  // BLOCKS_GROUPED_OUT
+    pub low: DeviceBuffer<f32>,           // OUT_LOW
+    pub low_xq: DeviceBuffer<i8>,         // OUT_LOW
+    pub low_xscale: DeviceBuffer<f32>,    // BLOCKS_OUT_LOW
+    pub attn_out: DeviceBuffer<f32>,      // N_EMBD
+
+    // mHC post-attn + pre-ffn.
+    pub after_attn_hc: DeviceBuffer<f32>,   // HC_DIM
+    pub ffn_cur: DeviceBuffer<f32>,         // N_EMBD
+    pub ffn_input_norm: DeviceBuffer<f32>,  // N_EMBD
+
+    // Router.
+    pub router_logits: DeviceBuffer<f32>,   // N_EXPERT
+    pub router_logits_host: Vec<f32>,
+    pub d_selected: DeviceBuffer<i32>,      // N_EXPERT_USED
+    pub d_ew: DeviceBuffer<f32>,            // N_EXPERT_USED
+
+    // Shared expert intermediates + output.
+    pub gate_sh: DeviceBuffer<f32>,        // N_FF_SHARED
+    pub up_sh: DeviceBuffer<f32>,          // N_FF_SHARED
+    pub mid_sh: DeviceBuffer<f32>,         // N_FF_SHARED
+    pub mid_sh_xq: DeviceBuffer<i8>,       // N_FF_SHARED
+    pub mid_sh_xscale: DeviceBuffer<f32>,  // BLOCKS_N_FF_SHARED
+    pub ffn_shared: DeviceBuffer<f32>,     // N_EMBD
+
+    // Mailbox: iGPU MoE peer-pushed back to here.
+    pub ffn_moe_recv: DeviceBuffer<f32>,   // N_EMBD
+}
+
+impl TokenScratch {
+    pub fn alloc(dgpu_device: Device) -> eyre::Result<Self> {
+        dgpu_device.set_current()?;
+        let device_id = dgpu_device.id;
+        Ok(Self {
+            residual: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            residual_next: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            flat: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            mix: DeviceBuffer::new(device_id, HC_MIX_DIM as usize)?,
+            split: DeviceBuffer::new(device_id, HC_MIX_DIM as usize)?,
+            attn_cur: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            attn_input_norm: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            xq_n_embd: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            xscale_n_embd: DeviceBuffer::new(device_id, BLOCKS_N_EMBD as usize)?,
+            qr: DeviceBuffer::new(device_id, N_LORA_Q as usize)?,
+            qr_normed: DeviceBuffer::new(device_id, N_LORA_Q as usize)?,
+            qr_xq: DeviceBuffer::new(device_id, N_LORA_Q as usize)?,
+            qr_xscale: DeviceBuffer::new(device_id, BLOCKS_N_LORA_Q as usize)?,
+            q: DeviceBuffer::new(device_id, Q_FLAT as usize)?,
+            q_normed: DeviceBuffer::new(device_id, Q_FLAT as usize)?,
+            kv_raw: DeviceBuffer::new(device_id, N_HEAD_DIM as usize)?,
+            kv_normed: DeviceBuffer::new(device_id, N_HEAD_DIM as usize)?,
+            kv_cur: DeviceBuffer::new(device_id, (2 * N_HEAD_DIM) as usize)?,
+            sc_cur: DeviceBuffer::new(device_id, (2 * N_HEAD_DIM) as usize)?,
+            pooled: DeviceBuffer::new(device_id, N_HEAD_DIM as usize)?,
+            comp_row: DeviceBuffer::new(device_id, N_HEAD_DIM as usize)?,
+            heads: DeviceBuffer::new(device_id, Q_FLAT as usize)?,
+            heads_xq: DeviceBuffer::new(device_id, Q_FLAT as usize)?,
+            heads_xscale: DeviceBuffer::new(device_id, BLOCKS_GROUPED_OUT as usize)?,
+            low: DeviceBuffer::new(device_id, OUT_LOW as usize)?,
+            low_xq: DeviceBuffer::new(device_id, OUT_LOW as usize)?,
+            low_xscale: DeviceBuffer::new(device_id, BLOCKS_OUT_LOW as usize)?,
+            attn_out: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            after_attn_hc: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            ffn_cur: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            ffn_input_norm: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            router_logits: DeviceBuffer::new(device_id, N_EXPERT as usize)?,
+            router_logits_host: vec![0f32; N_EXPERT as usize],
+            d_selected: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
+            d_ew: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
+            gate_sh: DeviceBuffer::new(device_id, N_FF_SHARED as usize)?,
+            up_sh: DeviceBuffer::new(device_id, N_FF_SHARED as usize)?,
+            mid_sh: DeviceBuffer::new(device_id, N_FF_SHARED as usize)?,
+            mid_sh_xq: DeviceBuffer::new(device_id, N_FF_SHARED as usize)?,
+            mid_sh_xscale: DeviceBuffer::new(device_id, BLOCKS_N_FF_SHARED as usize)?,
+            ffn_shared: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            ffn_moe_recv: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+        })
+    }
+}
+
 pub struct DgpuScratch {
     // Cross-layer residual
     pub residual: DeviceBuffer<f32>,
@@ -140,6 +260,13 @@ pub struct DgpuScratch {
     pub d_ew_stash_t0: DeviceBuffer<f32>,
     pub d_ew_stash_t1: DeviceBuffer<f32>,
 
+    /// M40-P4: per-token scratch for forward_pair_interleaved with per-token
+    /// streams. Each token's pre_moe + post_moe writes into its own scratch
+    /// instance — no aliasing, no stash/restore needed inside a single
+    /// layer.
+    pub t0: TokenScratch,
+    pub t1: TokenScratch,
+
     // ----- M40-P2: MTP draft scratch (dGPU side) -----
     /// Embedded last token (N_EMBD floats).
     pub mtp_embed: DeviceBuffer<f32>,
@@ -251,6 +378,9 @@ impl DgpuScratch {
             d_selected_stash_t1: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
             d_ew_stash_t0: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
             d_ew_stash_t1: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
+
+            t0: TokenScratch::alloc(dgpu_device)?,
+            t1: TokenScratch::alloc(dgpu_device)?,
 
             mtp_embed: DeviceBuffer::new(device_id, N_EMBD as usize)?,
             mtp_enorm: DeviceBuffer::new(device_id, N_EMBD as usize)?,
