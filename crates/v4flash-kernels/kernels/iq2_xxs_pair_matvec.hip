@@ -53,12 +53,13 @@ __device__ __forceinline__ int32_t sudot4(int32_t a, int32_t b, int32_t c) {
     return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
 }
 
-__device__ __forceinline__ int32_t load_i32_unaligned(const int8_t* p) {
-    const uint8_t* u = (const uint8_t*)p;
-    return (int32_t)((uint32_t)u[0] |
-                     ((uint32_t)u[1] << 8) |
-                     ((uint32_t)u[2] << 16) |
-                     ((uint32_t)u[3] << 24));
+// Q8_K q8 buffer (the only call site) starts at block offset 4 (after
+// fp32 yd), so q8+0 and q8+4 are both 4-aligned. memcpy folds to a
+// single dword load.
+__device__ __forceinline__ int32_t load_dword(const int8_t* p) {
+    int32_t v;
+    __builtin_memcpy(&v, p, 4);
+    return v;
 }
 
 // Expand a ksigns byte (already odd-parity-corrected by table lookup) into
@@ -98,8 +99,8 @@ __device__ __forceinline__ int32_t iq2_dp4a_8(
     const uint32_t sm1 = expand_signs(signs, 0x80402010u);
     const int32_t g0 = cond_neg_bytes((int32_t)(uint32_t)grid_val, sm0);
     const int32_t g1 = cond_neg_bytes((int32_t)(uint32_t)(grid_val >> 32), sm1);
-    acc = sudot4(g0, load_i32_unaligned(q8 + 0), acc);
-    acc = sudot4(g1, load_i32_unaligned(q8 + 4), acc);
+    acc = sudot4(g0, load_dword(q8 + 0), acc);
+    acc = sudot4(g1, load_dword(q8 + 4), acc);
     return acc;
 }
 

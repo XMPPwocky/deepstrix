@@ -18,20 +18,6 @@
 // AMD HIP requires a 64-bit mask for __shfl_down_sync (supports wave32 + wave64).
 #define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFull
 
-__device__ __forceinline__ int32_t load_i8x4_aligned(const int8_t* p) {
-    return *(const int32_t*)p;
-}
-
-__device__ __forceinline__ int32_t load_i8x4_unaligned(const int8_t* p) {
-    // M18: let the compiler emit the right instruction for the target.
-    // RDNA3/4 hardware supports misaligned dword loads; the prior
-    // byte-by-byte assembly defeated load coalescing and locked us to
-    // ~60% of dGPU memory peak on output_proj.
-    int32_t v;
-    __builtin_memcpy(&v, p, 4);
-    return v;
-}
-
 // AMD-specific 4-byte int8 SIMD dot-product. RDNA 3.5 + RDNA 4 both
 // expose this via `sudot4` (the `sdot4` form is older AMDs only).
 // Mirrors ggml's ggml_cuda_dp4a path for RDNA3/4.

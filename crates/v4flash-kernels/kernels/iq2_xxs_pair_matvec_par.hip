@@ -43,12 +43,12 @@ __device__ __forceinline__ int32_t sudot4_par(int32_t a, int32_t b, int32_t c) {
     return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
 }
 
-__device__ __forceinline__ int32_t load_i32_unaligned_par(const int8_t* p) {
-    const uint8_t* u = (const uint8_t*)p;
-    return (int32_t)((uint32_t)u[0] |
-                     ((uint32_t)u[1] << 8) |
-                     ((uint32_t)u[2] << 16) |
-                     ((uint32_t)u[3] << 24));
+// q8 + 0 and q8 + 4 are both 4-aligned (Q8_K blocks start at 0 mod 4,
+// q8 lives at block offset 4). memcpy folds to a single dword load.
+__device__ __forceinline__ int32_t load_dword_par(const int8_t* p) {
+    int32_t v;
+    __builtin_memcpy(&v, p, 4);
+    return v;
 }
 
 __device__ __forceinline__ uint32_t expand_signs_par(uint32_t s, uint32_t mask) {
@@ -79,8 +79,8 @@ __device__ __forceinline__ int32_t iq2_dp4a_8_par(
     const uint32_t sm1 = expand_signs_par(signs, 0x80402010u);
     const int32_t g0 = cond_neg_bytes_par((int32_t)(uint32_t)grid_val, sm0);
     const int32_t g1 = cond_neg_bytes_par((int32_t)(uint32_t)(grid_val >> 32), sm1);
-    acc = sudot4_par(g0, load_i32_unaligned_par(q8 + 0), acc);
-    acc = sudot4_par(g1, load_i32_unaligned_par(q8 + 4), acc);
+    acc = sudot4_par(g0, load_dword_par(q8 + 0), acc);
+    acc = sudot4_par(g1, load_dword_par(q8 + 4), acc);
     return acc;
 }
 
@@ -262,8 +262,8 @@ __device__ __forceinline__ int32_t iq2_dp4a_8_lds(
     const uint32_t sm1 = expand_signs_par(signs, 0x80402010u);
     const int32_t g0 = cond_neg_bytes_par((int32_t)(uint32_t)grid_val, sm0);
     const int32_t g1 = cond_neg_bytes_par((int32_t)(uint32_t)(grid_val >> 32), sm1);
-    acc = sudot4_par(g0, load_i32_unaligned_par(q8 + 0), acc);
-    acc = sudot4_par(g1, load_i32_unaligned_par(q8 + 4), acc);
+    acc = sudot4_par(g0, load_dword_par(q8 + 0), acc);
+    acc = sudot4_par(g1, load_dword_par(q8 + 4), acc);
     return acc;
 }
 

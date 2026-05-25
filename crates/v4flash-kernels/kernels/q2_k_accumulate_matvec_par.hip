@@ -49,15 +49,18 @@ __device__ __forceinline__ int32_t sudot4_par(int32_t a, int32_t b, int32_t c) {
     return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
 }
 
-__device__ __forceinline__ int32_t load_i32_unaligned_par(const uint8_t* p) {
-    return (int32_t)((uint32_t)p[0] |
-                     ((uint32_t)p[1] << 8) |
-                     ((uint32_t)p[2] << 16) |
-                     ((uint32_t)p[3] << 24));
+// All call sites here read from 4-byte-aligned addresses: Q2_K blocks
+// are 84 bytes (4-aligned) with q2 quants at block offset 16; Q8_K
+// blocks are 292 bytes (4-aligned) with q8 quants at block offset 4.
+// memcpy folds to a single aligned dword load — no scalar byte fallback.
+__device__ __forceinline__ int32_t load_dword_par(const uint8_t* p) {
+    int32_t v;
+    __builtin_memcpy(&v, p, 4);
+    return v;
 }
 
-__device__ __forceinline__ int32_t load_i32_unaligned_i8_par(const int8_t* p) {
-    return load_i32_unaligned_par((const uint8_t*)p);
+__device__ __forceinline__ int32_t load_dword_i8_par(const int8_t* p) {
+    return load_dword_par((const uint8_t*)p);
 }
 
 __device__ __forceinline__ int32_t dot_q2_16_par(
@@ -65,8 +68,8 @@ __device__ __forceinline__ int32_t dot_q2_16_par(
     int32_t sum = 0;
     #pragma unroll
     for (uint32_t i = 0; i < 16; i += 4) {
-        const int32_t v = (load_i32_unaligned_par(q2 + i) >> shift) & 0x03030303;
-        sum = sudot4_par(v, load_i32_unaligned_i8_par(q8 + i), sum);
+        const int32_t v = (load_dword_par(q2 + i) >> shift) & 0x03030303;
+        sum = sudot4_par(v, load_dword_i8_par(q8 + i), sum);
     }
     return sum;
 }

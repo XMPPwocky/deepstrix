@@ -19,19 +19,6 @@
 #define WARP_LANES 32u
 #define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFull
 
-__device__ __forceinline__ int32_t gload_i8x4_aligned(const int8_t* p) {
-    return *(const int32_t*)p;
-}
-
-__device__ __forceinline__ int32_t gload_i8x4_unaligned(const int8_t* p) {
-    // M18: memcpy lets the compiler pick the right load instruction
-    // for the target. With the M18 repacked layout the source is
-    // 4-aligned, so this folds to a single dword load.
-    int32_t v;
-    __builtin_memcpy(&v, p, 4);
-    return v;
-}
-
 __device__ __forceinline__ int32_t gdp4a_sudot(int32_t a, int32_t b, int32_t c) {
     return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
 }

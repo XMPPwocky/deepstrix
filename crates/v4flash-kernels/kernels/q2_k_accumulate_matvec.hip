@@ -47,15 +47,16 @@ __device__ __forceinline__ int32_t sudot4(int32_t a, int32_t b, int32_t c) {
     return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
 }
 
-__device__ __forceinline__ int32_t load_i32_unaligned(const uint8_t* p) {
-    return (int32_t)((uint32_t)p[0] |
-                     ((uint32_t)p[1] << 8) |
-                     ((uint32_t)p[2] << 16) |
-                     ((uint32_t)p[3] << 24));
+// q2 + i and q8 + i are both 4-aligned. memcpy folds to a single
+// dword load.
+__device__ __forceinline__ int32_t load_dword(const uint8_t* p) {
+    int32_t v;
+    __builtin_memcpy(&v, p, 4);
+    return v;
 }
 
-__device__ __forceinline__ int32_t load_i32_unaligned_i8(const int8_t* p) {
-    return load_i32_unaligned((const uint8_t*)p);
+__device__ __forceinline__ int32_t load_dword_i8(const int8_t* p) {
+    return load_dword((const uint8_t*)p);
 }
 
 __device__ __forceinline__ int32_t dot_q2_16(
@@ -63,8 +64,8 @@ __device__ __forceinline__ int32_t dot_q2_16(
     int32_t sum = 0;
     #pragma unroll
     for (uint32_t i = 0; i < 16; i += 4) {
-        const int32_t v = (load_i32_unaligned(q2 + i) >> shift) & 0x03030303;
-        sum = sudot4(v, load_i32_unaligned_i8(q8 + i), sum);
+        const int32_t v = (load_dword(q2 + i) >> shift) & 0x03030303;
+        sum = sudot4(v, load_dword_i8(q8 + i), sum);
     }
     return sum;
 }
