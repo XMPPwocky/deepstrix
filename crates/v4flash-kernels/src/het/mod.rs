@@ -21,6 +21,7 @@ pub mod forward_head;
 pub mod forward_layer;
 pub mod forward_mtp;
 pub mod forward_pair_interleaved;
+pub mod spec_decode;
 pub mod mtp_weights;
 pub mod perfetto;
 pub mod scratch;
