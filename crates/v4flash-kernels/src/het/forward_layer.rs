@@ -309,28 +309,32 @@ impl HeterogeneousEngine {
             let comp_width = cw.width;
             let pos_mod = pos % ratio;
             let row = if ratio == 4 { 4 + pos_mod } else { pos_mod };
-            // M32: fused matvec_pair + state_write into one launch (ape
-            // prefetched ahead of matvec loop so its global-load latency
-            // hides behind FMA work, not on the warp-retirement critical
-            // path). Eliminates one launch per layer + the kv_cur/sc_cur
-            // scratch read/write round-trip.
+            {
+                let _t = de.events.stage("k.compressor_d.f16_pair", &de.compute)?;
+                de.f16.matvec_pair(
+                    &de.compute,
+                    &mut dgpu_scratch.kv_cur,
+                    &mut dgpu_scratch.sc_cur,
+                    &cw.wkv.buffer,
+                    &cw.wgate.buffer,
+                    &dgpu_scratch.attn_input_norm,
+                    comp_width,
+                    N_EMBD,
+                )?;
+            }
             let cs = ls
                 .compressor
                 .as_mut()
                 .ok_or_else(|| eyre!("L{layer}: missing compressor state"))?;
             {
-                let _t = de
-                    .events
-                    .stage("k.compressor_d.f16_pair_state_write", &de.compute)?;
-                de.f16.matvec_pair_state_write(
+                let _t = de.events.stage("k.compressor_d.state_write", &de.compute)?;
+                de.compressor_state_write.launch(
                     &de.compute,
                     &mut cs.state_kv,
                     &mut cs.state_score,
-                    &cw.wkv.buffer,
-                    &cw.wgate.buffer,
+                    &dgpu_scratch.kv_cur,
+                    &dgpu_scratch.sc_cur,
                     &cw.ape.buffer,
-                    &dgpu_scratch.attn_input_norm,
-                    N_EMBD,
                     comp_width,
                     row,
                     pos_mod,

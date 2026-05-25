@@ -18,10 +18,6 @@ const F16_MATVEC_PAIR_GFX1201: &[u8] =
     include_bytes!(env!("KERNEL_F16_MATVEC_PAIR_GFX1201"));
 const F16_MATVEC_PAIR_GFX1151: &[u8] =
     include_bytes!(env!("KERNEL_F16_MATVEC_PAIR_GFX1151"));
-const F16_MATVEC_PAIR_STATE_WRITE_GFX1201: &[u8] =
-    include_bytes!(env!("KERNEL_F16_MATVEC_PAIR_STATE_WRITE_GFX1201"));
-const F16_MATVEC_PAIR_STATE_WRITE_GFX1151: &[u8] =
-    include_bytes!(env!("KERNEL_F16_MATVEC_PAIR_STATE_WRITE_GFX1151"));
 
 const GEMV_ROWS_PER_BLOCK: u32 = 8;
 const GEMV_WARP_LANES: u32 = 32;
@@ -39,39 +35,29 @@ pub struct F16Matvec {
     wide: Module,
     narrow: Module,
     pair: Module,
-    pair_state_write: Module,
 }
 
 impl F16Matvec {
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
-        let (wide_img, narrow_img, pair_img, psw_img): (&[u8], &[u8], &[u8], &[u8]) =
-            if arch.starts_with("gfx1201") {
-                (
-                    F16_MATVEC_GFX1201,
-                    F16_MATVEC_NARROW_GFX1201,
-                    F16_MATVEC_PAIR_GFX1201,
-                    F16_MATVEC_PAIR_STATE_WRITE_GFX1201,
-                )
-            } else if arch.starts_with("gfx1151") {
-                (
-                    F16_MATVEC_GFX1151,
-                    F16_MATVEC_NARROW_GFX1151,
-                    F16_MATVEC_PAIR_GFX1151,
-                    F16_MATVEC_PAIR_STATE_WRITE_GFX1151,
-                )
-            } else {
-                return Err(eyre!("unsupported arch for f16_matvec: {arch}"));
-            };
+        let (wide_img, narrow_img, pair_img): (&[u8], &[u8], &[u8]) = if arch.starts_with("gfx1201") {
+            (
+                F16_MATVEC_GFX1201,
+                F16_MATVEC_NARROW_GFX1201,
+                F16_MATVEC_PAIR_GFX1201,
+            )
+        } else if arch.starts_with("gfx1151") {
+            (
+                F16_MATVEC_GFX1151,
+                F16_MATVEC_NARROW_GFX1151,
+                F16_MATVEC_PAIR_GFX1151,
+            )
+        } else {
+            return Err(eyre!("unsupported arch for f16_matvec: {arch}"));
+        };
         let wide = Module::load_data(wide_img)?;
         let narrow = Module::load_data(narrow_img)?;
         let pair = Module::load_data(pair_img)?;
-        let pair_state_write = Module::load_data(psw_img)?;
-        Ok(Self {
-            wide,
-            narrow,
-            pair,
-            pair_state_write,
-        })
+        Ok(Self { wide, narrow, pair })
     }
 
     /// Paired matvec: `kv[r] = W_kv[r] · x`, `gate[r] = W_gate[r] · x` for
@@ -131,82 +117,6 @@ impl F16Matvec {
             &mut nr_v as *mut _ as *mut c_void,
         ];
         let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
-        let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
-        let cfg = LaunchConfig {
-            grid: (grid_x, 1, 1),
-            block: (block_x, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
-    }
-
-    /// Fused paired matvec + compressor state write. Equivalent to
-    /// `matvec_pair(kv_cur, sc_cur, ...)` followed by
-    /// `compressor_state_write(state_kv, state_score, kv_cur, sc_cur,
-    /// ape, width, row, pos_mod)`, but as one kernel launch. No
-    /// intermediate kv_cur / sc_cur scratch buffers needed.
-    #[allow(clippy::too_many_arguments)]
-    pub fn matvec_pair_state_write(
-        &self,
-        stream: &Stream,
-        state_kv: &mut DeviceBuffer<f32>,
-        state_score: &mut DeviceBuffer<f32>,
-        kv_w: &DeviceBuffer<u8>,
-        gate_w: &DeviceBuffer<u8>,
-        ape: &DeviceBuffer<u8>,
-        x: &DeviceBuffer<f32>,
-        k: u32,
-        width: u32,
-        row: u32,
-        pos_mod: u32,
-    ) -> eyre::Result<()> {
-        let expected_w = (width as usize) * (k as usize) * 2;
-        if kv_w.byte_len() != expected_w || gate_w.byte_len() != expected_w {
-            return Err(eyre!(
-                "f16 matvec_pair_state_write: weight bytes mismatch (kv={}, gate={}, expected={})",
-                kv_w.byte_len(),
-                gate_w.byte_len(),
-                expected_w
-            ));
-        }
-        if x.len() < k as usize {
-            return Err(eyre!(
-                "f16 matvec_pair_state_write: x len {} < k {k}",
-                x.len()
-            ));
-        }
-        if k % 4 != 0 {
-            return Err(eyre!(
-                "f16 matvec_pair_state_write: k={k} must be divisible by 4 for float4 loads"
-            ));
-        }
-
-        let function = self
-            .pair_state_write
-            .get_function("f16_matvec_pair_state_write")?;
-        let mut sk_ptr = state_kv.raw();
-        let mut ss_ptr = state_score.raw();
-        let mut kvw_ptr = kv_w.raw();
-        let mut gw_ptr = gate_w.raw();
-        let mut ape_ptr = ape.raw();
-        let mut x_ptr = x.raw();
-        let mut k_v = k;
-        let mut w_v = width;
-        let mut row_v = row;
-        let mut pm_v = pos_mod;
-        let mut args: [*mut c_void; 10] = [
-            &mut sk_ptr as *mut _ as *mut c_void,
-            &mut ss_ptr as *mut _ as *mut c_void,
-            &mut kvw_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut ape_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut k_v as *mut _ as *mut c_void,
-            &mut w_v as *mut _ as *mut c_void,
-            &mut row_v as *mut _ as *mut c_void,
-            &mut pm_v as *mut _ as *mut c_void,
-        ];
-        let grid_x = width.div_ceil(GEMV_ROWS_PER_BLOCK);
         let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
         let cfg = LaunchConfig {
             grid: (grid_x, 1, 1),
