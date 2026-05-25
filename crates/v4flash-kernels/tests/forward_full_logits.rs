@@ -537,3 +537,310 @@ fn run_het_oracle(mode: ExecMode, label: &str) -> eyre::Result<()> {
     );
     Ok(())
 }
+
+/// M40-P1.6: validate that `forward_pair(t0, t1, pos)` produces the
+/// same per-token logits as two sequential `forward_token` calls. The
+/// two paths use the same kernels in the same order; only the
+/// scheduling and snapshot/restore plumbing differ. Allow f32-ULP
+/// drift (the device-to-device snapshot copy should be bit-exact, so
+/// in practice we expect KL=0 or very near it).
+#[test]
+#[ignore]
+fn forward_pair_matches_sequential() -> eyre::Result<()> {
+    install_panic_handler()?;
+    eprintln!("=== forward_pair vs sequential forward_token oracle ===");
+
+    let dump = ActivationDump::open(dump_dir())?;
+    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let token_seq = build_token_sequence(&dump)?;
+
+    let dgpu = pick_dgpu_device()?;
+    let igpu = pick_igpu_device()?;
+    let dgpu_arch = dgpu.properties()?.gcn_arch_name;
+    let igpu_arch = igpu.properties()?.gcn_arch_name;
+
+    let rope_for_layer = |layer: i32| -> eyre::Result<RopeParams> {
+        let entry = dump
+            .weight("rope_params", layer)
+            .ok_or_else(|| eyre!("missing weight:rope_params for L{layer}"))?;
+        let floats = dump.read_f32(entry)?;
+        let n_ctx_orig = if floats[2] != 0.0 { ROPE_ORIG_CTX } else { 0 };
+        RopeParams::from_dump_blob(&floats, n_ctx_orig)
+    };
+
+    eprintln!("loading weights...");
+    let weights = HetModelWeights::load_all(&gguf, dgpu, igpu, &rope_for_layer)?;
+    let engine =
+        HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
+    let mut dgpu_scratch = DgpuScratch::alloc(dgpu)?;
+    let mut igpu_scratch = IgpuScratch::alloc(igpu)?;
+    let n_positions = dump.n_logit_rows as i32 + PROMPT_LEN - 1;
+
+    // Test at a few consecutive position pairs. Pick positions that
+    // exercise: layer-0 compressor (none), layer-2 compressor (ratio=4
+    // boundary), and a deeper ratio=128 layer.
+    let pair_positions: Vec<i32> = vec![0, 2, 5, 8, 15]
+        .into_iter()
+        .filter(|&p| p < n_positions - 1)
+        .collect();
+
+    let mut total_kl_0: f64 = 0.0;
+    let mut total_kl_1: f64 = 0.0;
+    let mut max_kl_0: f64 = 0.0;
+    let mut max_kl_1: f64 = 0.0;
+    let mut all_match = true;
+
+    for &pos in pair_positions.iter() {
+        eprintln!("--- pair at pos={pos} (token_id={} → token_id={}) ---",
+                  token_seq[pos as usize], token_seq[(pos + 1) as usize]);
+
+        let t0 = token_seq[pos as usize];
+        let t1 = token_seq[(pos + 1) as usize];
+
+        let inp0 = dump
+            .tensor("layer_input_residual", 0, pos)
+            .ok_or_else(|| eyre!("missing L0 input at pos {pos}"))?;
+        let inp1 = dump
+            .tensor("layer_input_residual", 0, pos + 1)
+            .ok_or_else(|| eyre!("missing L0 input at pos {}", pos + 1))?;
+        let input_hc_0 = dump.read_f32(inp0)?;
+        let input_hc_1 = dump.read_f32(inp1)?;
+        assert_eq!(input_hc_0.len(), HC_DIM as usize);
+        assert_eq!(input_hc_1.len(), HC_DIM as usize);
+
+        // === Sequential baseline ===
+        // Fresh state each pair to avoid cross-pair state pollution.
+        let mut state = HetModelState::alloc(dgpu, igpu, n_positions as u32)?;
+        // Warm up prefix [0..pos) so KV cache + compressor state are valid at `pos`.
+        for warm_pos in 0..pos {
+            let warm_t = token_seq[warm_pos as usize];
+            let warm_inp = dump
+                .tensor("layer_input_residual", 0, warm_pos)
+                .ok_or_else(|| eyre!("missing L0 input at pos {warm_pos}"))?;
+            let warm_hc = dump.read_f32(warm_inp)?;
+            engine.forward_token(
+                &mut dgpu_scratch,
+                &mut igpu_scratch,
+                &mut state,
+                &weights,
+                &warm_hc,
+                warm_pos as u32,
+                warm_t,
+            )?;
+        }
+        // Host-side snapshot of (n_raw, n_comp, n_index_comp) and the
+        // kv_cache / compressor state / comp_kv arrays. Test-local, so it
+        // doesn't conflict with forward_pair's INTERNAL per-layer
+        // snapshot (which lives in layer.snapshot_state and gets
+        // clobbered every pair call).
+        let mut test_kv_hosts: Vec<Vec<f32>> = Vec::with_capacity(state.layers.len());
+        let mut test_state_kv_hosts: Vec<Option<Vec<f32>>> = Vec::new();
+        let mut test_state_score_hosts: Vec<Option<Vec<f32>>> = Vec::new();
+        let mut test_comp_kv_hosts: Vec<Option<Vec<f32>>> = Vec::new();
+        let mut test_idx_kv_hosts: Vec<Option<Vec<f32>>> = Vec::new();
+        let mut test_idx_score_hosts: Vec<Option<Vec<f32>>> = Vec::new();
+        let mut test_idx_comp_kv_hosts: Vec<Option<Vec<f32>>> = Vec::new();
+        let mut test_n_raws: Vec<u32> = Vec::new();
+        let mut test_n_comps: Vec<u32> = Vec::new();
+        let mut test_n_idx_comps: Vec<u32> = Vec::new();
+        for layer in state.layers.iter() {
+            let mut kv_h = vec![0f32; layer.kv_cache.len()];
+            layer.kv_cache.copy_to_host(&mut kv_h)?;
+            test_kv_hosts.push(kv_h);
+            test_n_raws.push(layer.n_raw);
+            if let Some(comp) = layer.compressor.as_ref() {
+                let mut a = vec![0f32; comp.state_kv.len()];
+                comp.state_kv.copy_to_host(&mut a)?;
+                let mut b = vec![0f32; comp.state_score.len()];
+                comp.state_score.copy_to_host(&mut b)?;
+                let mut c = vec![0f32; comp.comp_kv.len()];
+                comp.comp_kv.copy_to_host(&mut c)?;
+                test_state_kv_hosts.push(Some(a));
+                test_state_score_hosts.push(Some(b));
+                test_comp_kv_hosts.push(Some(c));
+                test_n_comps.push(comp.n_comp);
+            } else {
+                test_state_kv_hosts.push(None);
+                test_state_score_hosts.push(None);
+                test_comp_kv_hosts.push(None);
+                test_n_comps.push(0);
+            }
+            if let Some(idx) = layer.indexer_compressor.as_ref() {
+                let mut a = vec![0f32; idx.state_kv.len()];
+                idx.state_kv.copy_to_host(&mut a)?;
+                let mut b = vec![0f32; idx.state_score.len()];
+                idx.state_score.copy_to_host(&mut b)?;
+                let mut c = vec![0f32; idx.comp_kv.len()];
+                idx.comp_kv.copy_to_host(&mut c)?;
+                test_idx_kv_hosts.push(Some(a));
+                test_idx_score_hosts.push(Some(b));
+                test_idx_comp_kv_hosts.push(Some(c));
+                test_n_idx_comps.push(idx.n_comp);
+            } else {
+                test_idx_kv_hosts.push(None);
+                test_idx_score_hosts.push(None);
+                test_idx_comp_kv_hosts.push(None);
+                test_n_idx_comps.push(0);
+            }
+        }
+        let test_restore = |state: &mut HetModelState,
+                            engine: &HeterogeneousEngine|
+         -> eyre::Result<()> {
+            for (i, layer) in state.layers.iter_mut().enumerate() {
+                layer.n_raw = test_n_raws[i];
+                layer.kv_cache.copy_from_host(&test_kv_hosts[i])?;
+                if let Some(comp) = layer.compressor.as_mut() {
+                    comp.n_comp = test_n_comps[i];
+                    comp.state_kv
+                        .copy_from_host(test_state_kv_hosts[i].as_ref().unwrap())?;
+                    comp.state_score
+                        .copy_from_host(test_state_score_hosts[i].as_ref().unwrap())?;
+                    comp.comp_kv
+                        .copy_from_host(test_comp_kv_hosts[i].as_ref().unwrap())?;
+                }
+                if let Some(idx) = layer.indexer_compressor.as_mut() {
+                    idx.n_comp = test_n_idx_comps[i];
+                    idx.state_kv
+                        .copy_from_host(test_idx_kv_hosts[i].as_ref().unwrap())?;
+                    idx.state_score
+                        .copy_from_host(test_idx_score_hosts[i].as_ref().unwrap())?;
+                    idx.comp_kv
+                        .copy_from_host(test_idx_comp_kv_hosts[i].as_ref().unwrap())?;
+                }
+            }
+            engine.invalidate_device_cache();
+            Ok(())
+        };
+        engine.invalidate_device_cache();
+        engine.forward_token(
+            &mut dgpu_scratch,
+            &mut igpu_scratch,
+            &mut state,
+            &weights,
+            &input_hc_0,
+            pos as u32,
+            t0,
+        )?;
+        let mut logits_seq_0 = vec![0f32; N_VOCAB as usize];
+        dgpu_scratch.logits.copy_to_host(&mut logits_seq_0)?;
+        engine.forward_token(
+            &mut dgpu_scratch,
+            &mut igpu_scratch,
+            &mut state,
+            &weights,
+            &input_hc_1,
+            (pos + 1) as u32,
+            t1,
+        )?;
+        let mut logits_seq_1 = vec![0f32; N_VOCAB as usize];
+        dgpu_scratch.logits.copy_to_host(&mut logits_seq_1)?;
+
+        // === Pair path (restore state to pre-pair snapshot first) ===
+        test_restore(&mut state, &engine)?;
+        engine.forward_pair(
+            &mut dgpu_scratch,
+            &mut igpu_scratch,
+            &mut state,
+            &weights,
+            &input_hc_0,
+            &input_hc_1,
+            pos as u32,
+            t0,
+            t1,
+        )?;
+        let mut logits_pair_0 = vec![0f32; N_VOCAB as usize];
+        let mut logits_pair_1 = vec![0f32; N_VOCAB as usize];
+        dgpu_scratch
+            .logits_token0
+            .copy_to_host(&mut logits_pair_0)?;
+        dgpu_scratch.logits.copy_to_host(&mut logits_pair_1)?;
+
+        // === Determinism check: re-run pair and compare to itself ===
+        test_restore(&mut state, &engine)?;
+        engine.forward_pair(
+            &mut dgpu_scratch,
+            &mut igpu_scratch,
+            &mut state,
+            &weights,
+            &input_hc_0,
+            &input_hc_1,
+            pos as u32,
+            t0,
+            t1,
+        )?;
+        let mut logits_pair_0b = vec![0f32; N_VOCAB as usize];
+        let mut logits_pair_1b = vec![0f32; N_VOCAB as usize];
+        dgpu_scratch
+            .logits_token0
+            .copy_to_host(&mut logits_pair_0b)?;
+        dgpu_scratch.logits.copy_to_host(&mut logits_pair_1b)?;
+        let kl_pair_self_0 = kl_divergence(&logits_pair_0, &logits_pair_0b);
+        let kl_pair_self_1 = kl_divergence(&logits_pair_1, &logits_pair_1b);
+        eprintln!(
+            "  pair-vs-pair determinism: KL_token0={:.6} KL_token1={:.6}",
+            kl_pair_self_0, kl_pair_self_1
+        );
+
+        // Compare
+        let kl_0 = kl_divergence(&logits_seq_0, &logits_pair_0);
+        let kl_1 = kl_divergence(&logits_seq_1, &logits_pair_1);
+        let argmax_seq_0 = argmax(&logits_seq_0);
+        let argmax_pair_0 = argmax(&logits_pair_0);
+        let argmax_seq_1 = argmax(&logits_seq_1);
+        let argmax_pair_1 = argmax(&logits_pair_1);
+        let argmax_match_0 = argmax_seq_0 == argmax_pair_0;
+        let argmax_match_1 = argmax_seq_1 == argmax_pair_1;
+
+        eprintln!(
+            "  token0: KL(seq||pair)={:.6} argmax seq={} pair={} {}",
+            kl_0,
+            argmax_seq_0,
+            argmax_pair_0,
+            if argmax_match_0 { "OK" } else { "MISMATCH" }
+        );
+        eprintln!(
+            "  token1: KL(seq||pair)={:.6} argmax seq={} pair={} {}",
+            kl_1,
+            argmax_seq_1,
+            argmax_pair_1,
+            if argmax_match_1 { "OK" } else { "MISMATCH" }
+        );
+
+        if !argmax_match_0 || !argmax_match_1 {
+            all_match = false;
+        }
+        total_kl_0 += kl_0;
+        total_kl_1 += kl_1;
+        if kl_0 > max_kl_0 {
+            max_kl_0 = kl_0;
+        }
+        if kl_1 > max_kl_1 {
+            max_kl_1 = kl_1;
+        }
+    }
+
+    let n = pair_positions.len() as f64;
+    eprintln!(
+        "FORWARD_PAIR ORACLE: mean_KL token0={:.6} token1={:.6}  max_KL token0={:.6} token1={:.6}",
+        total_kl_0 / n,
+        total_kl_1 / n,
+        max_kl_0,
+        max_kl_1
+    );
+
+    // Acceptance: argmax must match for both tokens in every pair, and
+    // KL should be small (effectively zero since the kernel work is
+    // identical). 0.01 nats is a generous bound for f32-ULP drift.
+    assert!(all_match, "forward_pair argmax differs from sequential");
+    assert!(
+        max_kl_0 < 0.01,
+        "token0 max KL {:.6} > 0.01 — forward_pair diverges",
+        max_kl_0
+    );
+    assert!(
+        max_kl_1 < 0.01,
+        "token1 max KL {:.6} > 0.01 — forward_pair diverges",
+        max_kl_1
+    );
+    Ok(())
+}

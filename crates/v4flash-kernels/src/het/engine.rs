@@ -487,6 +487,173 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
+    /// M40-P1: layer-major pair forward for K=1 spec decode. Processes
+    /// two tokens (token0 at pos, token1 at pos+1) through the model in
+    /// interleaved layer order:
+    ///
+    ///   for each layer L:
+    ///     run forward_layer_pair_mode for token0 at L
+    ///     snapshot per-layer state
+    ///     run forward_layer_pair_mode for token1 at L
+    ///
+    /// Then runs the head twice (once per token's final HC). Writes
+    /// token0's logits to `dgpu_scratch.logits_token0` and token1's
+    /// logits to `dgpu_scratch.logits`.
+    ///
+    /// On caller-detected partial reject, call `state.restore_all()` to
+    /// roll back token1's effects on per-layer state.
+    ///
+    /// `input_hc_0` / `input_hc_1` must both be HC_DIM. The caller is
+    /// responsible for computing them (via token embedding outside
+    /// the engine, e.g. as bench_decode does for forward_token).
+    ///
+    /// Pair-mode bypasses M30 combined graphs (see
+    /// `forward_layer_pair_mode`). It uses per-layer standalone
+    /// mhc_pre_attn + ffn_combine graphs which exist for every layer.
+    /// First-call captures may be triggered for layers that weren't
+    /// captured during prior forward_token runs; this is a one-time
+    /// cost.
+    pub fn forward_pair(
+        &self,
+        dgpu_scratch: &mut super::DgpuScratch,
+        igpu_scratch: &mut super::IgpuScratch,
+        state: &mut super::HetModelState,
+        weights: &super::HetModelWeights,
+        input_hc_0: &[f32],
+        input_hc_1: &[f32],
+        pos: u32,
+        token_id_0: i32,
+        token_id_1: i32,
+    ) -> color_eyre::eyre::Result<()> {
+        use crate::forward::{HC_DIM, N_LAYER};
+        use tracing::debug_span;
+
+        if input_hc_0.len() != HC_DIM as usize || input_hc_1.len() != HC_DIM as usize {
+            return Err(color_eyre::eyre::eyre!(
+                "forward_pair: input_hc lengths must equal HC_DIM={} (got {} / {})",
+                HC_DIM,
+                input_hc_0.len(),
+                input_hc_1.len()
+            ));
+        }
+        let _span = debug_span!("het.pair", pos, token_id_0, token_id_1).entered();
+
+        self.dgpu.events.reset();
+        self.igpu.events.reset();
+
+        self.set_current_cached(self.dgpu.device)?;
+
+        // Initialize both stashes from the inputs. The loop body always
+        // copies stash → residual BEFORE each forward_layer call, so we
+        // don't need to seed residual itself.
+        dgpu_scratch
+            .residual_stash_token0
+            .copy_from_host(input_hc_0)?;
+        dgpu_scratch
+            .residual_stash_token1
+            .copy_from_host(input_hc_1)?;
+
+        let pair_start = std::time::Instant::now();
+        for layer in 0..N_LAYER as usize {
+            // M15.1 parity: forward_token does `swap(residual, residual_next)` after
+            // each layer's forward_layer call. We mirror that BETWEEN outer-loop
+            // iterations so the (residual, residual_next) pointer assignment at the
+            // start of each layer L matches what layer L's captured graphs expect.
+            if layer > 0 {
+                std::mem::swap(
+                    &mut dgpu_scratch.residual,
+                    &mut dgpu_scratch.residual_next,
+                );
+            }
+
+            // === Token0's layer L ===
+            // Load token0's HC input (= its output from layer L-1, in stash_token0)
+            // into whatever physical buffer `residual` currently points to.
+            dgpu_scratch
+                .residual
+                .copy_from_buffer(&dgpu_scratch.residual_stash_token0)?;
+            self.forward_layer_pair_mode(
+                dgpu_scratch,
+                igpu_scratch,
+                &mut state.layers[layer],
+                &weights.dgpu_layers[layer],
+                &weights.igpu_layers[layer],
+                pos,
+                token_id_0,
+            )?;
+            // residual_next now has token0's output of layer L → save for next iter.
+            dgpu_scratch
+                .residual_stash_token0
+                .copy_from_buffer(&dgpu_scratch.residual_next)?;
+
+            // === Per-layer snapshot (post-token0, pre-token1) ===
+            // Async on dGPU compute + iGPU compute streams: queued
+            // after token0's writes complete (same stream as those
+            // writes) and BEFORE token1's reads, since the captured
+            // graph for token1 launches on the same streams in order.
+            state.layers[layer].snapshot_async(&self.dgpu.compute, &self.igpu.compute)?;
+
+            // === Token1's layer L ===
+            dgpu_scratch
+                .residual
+                .copy_from_buffer(&dgpu_scratch.residual_stash_token1)?;
+            self.forward_layer_pair_mode(
+                dgpu_scratch,
+                igpu_scratch,
+                &mut state.layers[layer],
+                &weights.dgpu_layers[layer],
+                &weights.igpu_layers[layer],
+                pos + 1,
+                token_id_1,
+            )?;
+            dgpu_scratch
+                .residual_stash_token1
+                .copy_from_buffer(&dgpu_scratch.residual_next)?;
+            // Pointer assignment unchanged within the iter (no swaps inside).
+            // At end of iter: (residual, residual_next) at the layer-L-capture
+            // pointer assignment, contents arbitrary (overwritten next iter).
+        }
+
+        // M15.1: forward_token does (N_LAYER) in-loop swaps + 1 epilogue swap =
+        // N_LAYER + 1 = 44 (even) → residual/residual_next back at initial parity.
+        // forward_pair does (N_LAYER - 1 = 42, even) inter-iter swaps already. We do
+        // ZERO epilogue swaps so the total stays even (42) and parity returns to
+        // initial — matching what subsequent forward_token / forward_pair calls
+        // expect via the captured-graph buffer-pointer invariant. (Adding a wrong
+        // epilogue swap here makes the SECOND forward_pair call read stale residual
+        // buffers and produce garbage; the first call works by accident because it
+        // starts at the correct parity from forward_token's end state.)
+
+        // === Head for token0 ===
+        // Load token0's final HC into residual (whatever pointer it is now).
+        dgpu_scratch
+            .residual
+            .copy_from_buffer(&dgpu_scratch.residual_stash_token0)?;
+        self.forward_head(dgpu_scratch, &weights.global)?;
+        // Save token0's logits before token1's head overwrites dgpu_scratch.logits.
+        dgpu_scratch
+            .logits_token0
+            .copy_from_buffer(&dgpu_scratch.logits)?;
+
+        // === Head for token1 ===
+        dgpu_scratch
+            .residual
+            .copy_from_buffer(&dgpu_scratch.residual_stash_token1)?;
+        self.forward_head(dgpu_scratch, &weights.global)?;
+        // dgpu_scratch.logits now has token1's logits.
+
+        self.set_current_cached(self.dgpu.device)?;
+        let host_us = pair_start.elapsed().as_micros() as u64;
+        self.dgpu.compute.synchronize()?;
+        let pair_elapsed_us = pair_start.elapsed().as_micros() as u64;
+        let sync_us = pair_elapsed_us.saturating_sub(host_us);
+        use std::sync::atomic::Ordering;
+        self.last_host_us.store(host_us, Ordering::Relaxed);
+        self.last_sync_us.store(sync_us, Ordering::Relaxed);
+
+        Ok(())
+    }
+
     /// Build a het engine over (dgpu, igpu). Enables peer access both
     /// directions — if the runtime refuses, that's surfaced as an error
     /// here rather than at the first `hipMemcpyPeerAsync` call.
@@ -580,6 +747,16 @@ impl HeterogeneousEngine {
         self.dgpu_keepalive = Some(ka);
         self.dgpu_keepalive_stream = Some(stream);
         Ok(())
+    }
+
+    /// M40-P1: invalidate the set_current_cached cache. Call this any
+    /// time external code (e.g. snapshot/restore that does direct
+    /// `Device::set_current`) may have changed the actual current HIP
+    /// device behind the cache's back. Next set_current_cached call
+    /// will then forcibly re-set.
+    pub fn invalidate_device_cache(&self) {
+        self.current_device
+            .store(-1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// M20: set the HIP device only if the cached value differs from

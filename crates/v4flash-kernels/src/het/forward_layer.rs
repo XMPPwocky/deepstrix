@@ -48,6 +48,14 @@ impl HeterogeneousEngine {
     /// graph). Correspondingly, mhc_pre_attn is launched standalone ONLY
     /// for layer 0 — every other layer's mhc_pre_attn rides the previous
     /// layer's combined graph.
+    ///
+    /// M40-P1: in pair-mode (`pair_mode=true`), the M30 cross-layer
+    /// combined graph is bypassed — each layer uses standalone
+    /// mhc_pre_attn + standalone ffn_combine. This is required because
+    /// pair-mode interleaves two tokens at each layer boundary
+    /// (token0's layer N → snapshot → token1's layer N → ...) and the
+    /// combined graph would speculatively launch the NEXT layer's
+    /// mhc_pre_attn before the snapshot point.
     pub fn forward_layer(
         &self,
         dgpu_scratch: &mut DgpuScratch,
@@ -59,6 +67,57 @@ impl HeterogeneousEngine {
         pos: u32,
         token_id: i32,
     ) -> eyre::Result<()> {
+        self.forward_layer_impl(
+            dgpu_scratch,
+            igpu_scratch,
+            ls,
+            dlw,
+            next_dlw,
+            ilw,
+            pos,
+            token_id,
+            false,
+        )
+    }
+
+    /// M40-P1: pair-mode entry point. See `forward_layer` docs.
+    pub fn forward_layer_pair_mode(
+        &self,
+        dgpu_scratch: &mut DgpuScratch,
+        igpu_scratch: &mut IgpuScratch,
+        ls: &mut HetLayerState,
+        dlw: &DgpuLayerWeights,
+        ilw: &IgpuLayerWeights,
+        pos: u32,
+        token_id: i32,
+    ) -> eyre::Result<()> {
+        // pair-mode forces standalone graphs on every layer, so
+        // next_dlw is unused. Pass None.
+        self.forward_layer_impl(
+            dgpu_scratch,
+            igpu_scratch,
+            ls,
+            dlw,
+            None,
+            ilw,
+            pos,
+            token_id,
+            true,
+        )
+    }
+
+    fn forward_layer_impl(
+        &self,
+        dgpu_scratch: &mut DgpuScratch,
+        igpu_scratch: &mut IgpuScratch,
+        ls: &mut HetLayerState,
+        dlw: &DgpuLayerWeights,
+        next_dlw: Option<&DgpuLayerWeights>,
+        ilw: &IgpuLayerWeights,
+        pos: u32,
+        token_id: i32,
+        pair_mode: bool,
+    ) -> eyre::Result<()> {
         let layer = dlw.layer_idx;
         if ilw.layer_idx != layer {
             return Err(eyre!(
@@ -68,8 +127,12 @@ impl HeterogeneousEngine {
             ));
         }
         let ratio = dlw.ratio;
-        let is_first_layer = layer == 0;
-        let is_last_layer = next_dlw.is_none();
+        // M40-P1: pair-mode forces standalone graphs (no cross-layer
+        // M30 combined graph). Set is_first_layer=true ALWAYS to fire
+        // standalone mhc_pre_attn each layer, and is_last_layer=true
+        // ALWAYS to fire standalone ffn_combine each layer.
+        let is_first_layer = pair_mode || layer == 0;
+        let is_last_layer = pair_mode || next_dlw.is_none();
 
         let serial = matches!(self.mode, ExecMode::HetSingleStream);
 

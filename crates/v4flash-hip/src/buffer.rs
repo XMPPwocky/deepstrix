@@ -121,6 +121,76 @@ impl<T> DeviceBuffer<T> {
         )
     }
 
+    /// Async device-to-device copy on the SAME device, queued on
+    /// `stream`. Returns immediately; the copy completes when prior
+    /// work on `stream` completes. Used by the spec-decode snapshot
+    /// path (one snapshot per layer per pair = 100s of copies; sync
+    /// version would stall the pipeline).
+    pub fn copy_from_buffer_async(
+        &mut self,
+        src: &DeviceBuffer<T>,
+        stream: &Stream,
+    ) -> eyre::Result<()> {
+        if src.len != self.len {
+            return Err(eyre!(
+                "copy_from_buffer_async length mismatch: src={} dst={}",
+                src.len,
+                self.len
+            ));
+        }
+        if src.device_id != self.device_id {
+            return Err(eyre!(
+                "copy_from_buffer_async cross-device not supported (src dev {}, dst dev {})",
+                src.device_id,
+                self.device_id
+            ));
+        }
+        check_eyre(
+            unsafe {
+                sys::hipMemcpyAsync(
+                    self.raw,
+                    src.raw,
+                    self.byte_len(),
+                    sys::HIP_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.raw(),
+                )
+            },
+            "hipMemcpyAsync(DtoD)",
+        )
+    }
+
+    /// Synchronous device-to-device copy on the SAME device. Returns
+    /// when the copy is complete (host-blocking). Used by the spec-
+    /// decode snapshot/restore path where we want a strict happens-
+    /// before relationship without managing stream events.
+    pub fn copy_from_buffer(&mut self, src: &DeviceBuffer<T>) -> eyre::Result<()> {
+        if src.len != self.len {
+            return Err(eyre!(
+                "copy_from_buffer length mismatch: src={} dst={}",
+                src.len,
+                self.len
+            ));
+        }
+        if src.device_id != self.device_id {
+            return Err(eyre!(
+                "copy_from_buffer cross-device not supported (src dev {}, dst dev {}); use copy_to_peer_async",
+                src.device_id,
+                self.device_id
+            ));
+        }
+        check_eyre(
+            unsafe {
+                sys::hipMemcpy(
+                    self.raw,
+                    src.raw,
+                    self.byte_len(),
+                    sys::HIP_MEMCPY_DEVICE_TO_DEVICE,
+                )
+            },
+            "hipMemcpy(DtoD)",
+        )
+    }
+
     /// Direct peer-to-peer async copy. `dst` and `self` must live on
     /// different devices; the copy is queued on `stream` (which itself
     /// belongs to *some* device; per HIP docs, peer copy uses the stream's

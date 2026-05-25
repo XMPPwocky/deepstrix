@@ -103,6 +103,20 @@ pub struct DgpuScratch {
     pub head_xq: DeviceBuffer<i8>,
     pub head_xscale: DeviceBuffer<f32>,
     pub logits: DeviceBuffer<f32>,
+
+    /// M40-P1: stash buffers for the layer-major pair-mode forward.
+    /// Per layer iteration we run forward_layer for token0 (which
+    /// reads `residual` / writes `residual_next`), then we save
+    /// `residual_next` into `residual_stash_token0` and load
+    /// `residual_stash_token1` (= token1's residual after the previous
+    /// layer) into `residual` for token1's forward_layer call. Reuses
+    /// the captured graphs since the kernel pointers (`residual` /
+    /// `residual_next`) don't change — only their contents do.
+    pub residual_stash_token0: DeviceBuffer<f32>,
+    pub residual_stash_token1: DeviceBuffer<f32>,
+    /// M40-P1: held copy of token0's logits in a pair-forward so they
+    /// survive token1's head pass overwriting `logits`.
+    pub logits_token0: DeviceBuffer<f32>,
 }
 
 impl DgpuScratch {
@@ -174,6 +188,10 @@ impl DgpuScratch {
             head_xq: DeviceBuffer::new(device_id, N_EMBD as usize)?,
             head_xscale: DeviceBuffer::new(device_id, BLOCKS_N_EMBD as usize)?,
             logits: DeviceBuffer::new(device_id, N_VOCAB as usize)?,
+
+            residual_stash_token0: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            residual_stash_token1: DeviceBuffer::new(device_id, HC_DIM as usize)?,
+            logits_token0: DeviceBuffer::new(device_id, N_VOCAB as usize)?,
         })
     }
 }
