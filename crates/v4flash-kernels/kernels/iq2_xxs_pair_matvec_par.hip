@@ -608,3 +608,197 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_by_expert(
         __syncthreads(); // before next member's xq overwrite
     }
 }
+
+// M50 by-expert iq2 — chunked variant (Phase 7.2). Solves the popular-
+// expert tail latency that killed Phase 7 v0 at B≥192.
+//
+// Each WG handles ONE work item (= one chunk of up to CHUNK_SIZE members
+// of one expert) for ONE row_block. Popular experts split into multiple
+// chunks/WGs that run in parallel → bounded WG runtime regardless of
+// group_count[e]. Combined with chunk-size matched to WMMA fragment
+// (16×16×16), this is also the natural launch geometry for a future
+// dequant-to-LDS + WMMA GEMM rewrite.
+//
+// Grid: (n_rows/8, n_work_items, 1). n_work_items determined at runtime
+// by moe_work_items_builder (host syncs and reads it before launch).
+// Block: 256 threads (8 warps × 32 lanes).
+//
+// work_items[i] packing: (expert_id << 16) | member_start.
+// member_count = min(chunk_size, group_count[expert] - member_start),
+// computed inside the kernel.
+extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked(
+        float        * __restrict__ mid,           // [B, n_used, n_rows]
+        const uint8_t * __restrict__ gate_w_base,
+        const uint8_t * __restrict__ up_w_base,
+        const uint8_t * __restrict__ xq,           // [B, n_blocks*292]
+        const float  * __restrict__ expert_w,      // [B, n_used]
+        const int    * __restrict__ group_count,   // [n_expert]
+        const int    * __restrict__ expert_members,// [n_expert * max_per_expert]
+        const int    * __restrict__ work_items,    // [n_work_items]
+        unsigned int    gate_bpe,
+        unsigned int    up_bpe,
+        unsigned int    n_used,
+        unsigned int    max_per_expert,
+        unsigned int    chunk_size,
+        float           clamp,
+        unsigned int    n_rows,
+        unsigned int    n_blocks) {
+    const unsigned int w_idx = blockIdx.y;
+    const int packed_item = work_items[w_idx];
+    const unsigned int e            = (unsigned int)(packed_item >> 16) & 0xffffu;
+    const unsigned int member_start = (unsigned int)(packed_item       ) & 0xffffu;
+    const int group_n = group_count[e];
+    const unsigned int member_end = min((unsigned int)group_n, member_start + chunk_size);
+    if (member_end <= member_start) return; // shouldn't happen but safe
+
+    __shared__ uint64_t s_sign_pair[128];
+    __shared__ uint64_t s_grid[256];
+    __shared__ uint8_t  s_xq[16 * 292];
+
+    const unsigned int tid = threadIdx.x;
+    if (tid < 128) {
+        const uint32_t s = ksigns_iq2xs[tid];
+        const uint32_t signs = s * 0x01010101u;
+        const uint32_t sm0 = expand_signs_par(signs, 0x08040201u);
+        const uint32_t sm1 = expand_signs_par(signs, 0x80402010u);
+        s_sign_pair[tid] = ((uint64_t)sm1 << 32) | (uint64_t)sm0;
+    }
+    if (tid < 256) s_grid[tid] = iq2xxs_grid[tid];
+    __syncthreads();
+
+    const unsigned int row_in_block = tid / 32u;
+    const unsigned int lane         = tid & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    if (row >= n_rows) return;
+
+    const unsigned int block_lane = lane >> 1u;
+    const unsigned int ib32_lo    = (lane & 1u) * 4u;
+
+    const uint8_t* gate_row_base = gate_w_base
+                                 + (uint64_t)e * (uint64_t)gate_bpe
+                                 + (uint64_t)row * (uint64_t)n_blocks * BLOCK_IQ2_XXS_BYTES;
+    const uint8_t* up_row_base   = up_w_base
+                                 + (uint64_t)e * (uint64_t)up_bpe
+                                 + (uint64_t)row * (uint64_t)n_blocks * BLOCK_IQ2_XXS_BYTES;
+
+    const unsigned int xq_bytes = n_blocks * 292u;
+    for (unsigned int m = member_start; m < member_end; m++) {
+        // Decode this member's (b, slot).
+        const int packed = expert_members[(size_t)e * (size_t)max_per_expert + (size_t)m];
+        const unsigned int b    = (unsigned int)(packed >> 16);
+        const unsigned int slot = (unsigned int)(packed & 0xFFFFu);
+
+        // Stage this batch's xq in LDS.
+        const uint8_t* xq_b = xq + (size_t)b * (size_t)xq_bytes;
+        for (unsigned int i = tid; i < xq_bytes; i += blockDim.x) {
+            s_xq[i] = xq_b[i];
+        }
+        __syncthreads();
+
+        float g_sum = 0.0f;
+        float u_sum = 0.0f;
+        for (unsigned int bl = block_lane; bl < n_blocks; bl += 16u) {
+            const uint8_t* w_g = gate_row_base + (uint64_t)bl * BLOCK_IQ2_XXS_BYTES;
+            const uint8_t* w_u = up_row_base   + (uint64_t)bl * BLOCK_IQ2_XXS_BYTES;
+            const uint8_t* y   = s_xq          + (size_t)bl   * BLOCK_Q8_K_BYTES;
+            g_sum += dot_block_half_lds(w_g, y, ib32_lo, s_sign_pair, s_grid);
+            u_sum += dot_block_half_lds(w_u, y, ib32_lo, s_sign_pair, s_grid);
+        }
+
+        g_sum = warp_sum_f32_par(g_sum);
+        u_sum = warp_sum_f32_par(u_sum);
+
+        if (lane == 0) {
+            const float ew = expert_w[(size_t)b * (size_t)n_used + (size_t)slot];
+            if (clamp > 1.0e-6f) {
+                if (g_sum > clamp)  g_sum = clamp;
+                if (u_sum > clamp)  u_sum = clamp;
+                if (u_sum < -clamp) u_sum = -clamp;
+            }
+            const float sig = 1.0f / (1.0f + expf(-g_sum));
+            const size_t out_off = ((size_t)b * (size_t)n_used + (size_t)slot)
+                                 * (size_t)n_rows + (size_t)row;
+            mid[out_off] = g_sum * sig * u_sum * ew;
+        }
+        __syncthreads(); // before next member's xq overwrite
+    }
+}
+
+// Phase 7.2 diagnostic: same as iq2_xxs_pair_matvec_fused_swiglu_chunked
+// but with the dot-product inner loop SKIPPED (writes 0.0 to mid).
+// All other costs are still paid: LDS init, xq cooperative load, member
+// loop, reduce shuffles, output write. Letting us isolate dot vs the rest.
+extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_NODOT(
+        float        * __restrict__ mid,
+        const uint8_t * __restrict__ /*gate_w_base*/,
+        const uint8_t * __restrict__ /*up_w_base*/,
+        const uint8_t * __restrict__ xq,
+        const float  * __restrict__ /*expert_w*/,
+        const int    * __restrict__ group_count,
+        const int    * __restrict__ expert_members,
+        const int    * __restrict__ work_items,
+        unsigned int    /*gate_bpe*/,
+        unsigned int    /*up_bpe*/,
+        unsigned int    n_used,
+        unsigned int    max_per_expert,
+        unsigned int    chunk_size,
+        float           /*clamp*/,
+        unsigned int    n_rows,
+        unsigned int    n_blocks) {
+    const unsigned int w_idx = blockIdx.y;
+    const int packed_item = work_items[w_idx];
+    const unsigned int e            = (unsigned int)(packed_item >> 16) & 0xffffu;
+    const unsigned int member_start = (unsigned int)(packed_item       ) & 0xffffu;
+    const int group_n = group_count[e];
+    const unsigned int member_end = min((unsigned int)group_n, member_start + chunk_size);
+    if (member_end <= member_start) return;
+
+    __shared__ uint64_t s_sign_pair[128];
+    __shared__ uint64_t s_grid[256];
+    __shared__ uint8_t  s_xq[16 * 292];
+
+    const unsigned int tid = threadIdx.x;
+    if (tid < 128) {
+        const uint32_t s = ksigns_iq2xs[tid];
+        const uint32_t signs = s * 0x01010101u;
+        const uint32_t sm0 = expand_signs_par(signs, 0x08040201u);
+        const uint32_t sm1 = expand_signs_par(signs, 0x80402010u);
+        s_sign_pair[tid] = ((uint64_t)sm1 << 32) | (uint64_t)sm0;
+    }
+    if (tid < 256) s_grid[tid] = iq2xxs_grid[tid];
+    __syncthreads();
+
+    const unsigned int row_in_block = tid / 32u;
+    const unsigned int lane         = tid & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    if (row >= n_rows) return;
+
+    const unsigned int xq_bytes = n_blocks * 292u;
+    for (unsigned int m = member_start; m < member_end; m++) {
+        const int packed = expert_members[(size_t)e * (size_t)max_per_expert + (size_t)m];
+        const unsigned int b    = (unsigned int)(packed >> 16);
+        const unsigned int slot = (unsigned int)(packed & 0xFFFFu);
+
+        // Stage xq exactly like the real kernel.
+        const uint8_t* xq_b = xq + (size_t)b * (size_t)xq_bytes;
+        for (unsigned int i = tid; i < xq_bytes; i += blockDim.x) {
+            s_xq[i] = xq_b[i];
+        }
+        __syncthreads();
+
+        // SKIP the dot loop. Touch s_xq[0] so it doesn't get DCE'd.
+        float g_sum = s_xq[tid & 1023] * 0.001f;
+        float u_sum = 0.0f;
+
+        // Standard warp reduce (still pays this cost).
+        g_sum = warp_sum_f32_par(g_sum);
+        u_sum = warp_sum_f32_par(u_sum);
+
+        if (lane == 0) {
+            const size_t out_off = ((size_t)b * (size_t)n_used + (size_t)slot)
+                                 * (size_t)n_rows + (size_t)row;
+            mid[out_off] = g_sum + u_sum;
+        }
+        __syncthreads();
+    }
+}

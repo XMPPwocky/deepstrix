@@ -206,6 +206,15 @@ pub struct BatchIgpuScratch {
     /// `max_per_expert = B_MAX` (worst case: every token picks the same expert
     /// in some slot — still fits since each token contributes ≤ n_used picks).
     pub expert_members: DeviceBuffer<i32>,
+    /// Phase 7.2 chunked by-expert: flat list of (expert_id<<16 | member_start)
+    /// work items built by moe_work_items_builder. Sized for worst case
+    /// = `B_MAX * n_used / CHUNK_SIZE + n_expert` (each active expert may
+    /// have one extra ceiling chunk).
+    pub work_items: DeviceBuffer<i32>,
+    /// Phase 7.2 chunked by-expert: `[1]` i32. Count of valid entries in
+    /// `work_items[]`. MUST be zeroed before each layer's pre-pass.
+    /// Read back to host (sync) to set grid.y for the main kernel.
+    pub n_work_items: DeviceBuffer<i32>,
 }
 
 impl BatchIgpuScratch {
@@ -230,6 +239,14 @@ impl BatchIgpuScratch {
             d_ew: DeviceBuffer::new(id, b * N_EXPERT_USED as usize)?,
             group_count: DeviceBuffer::new(id, N_EXPERT as usize)?,
             expert_members: DeviceBuffer::new(id, (N_EXPERT as usize) * b)?,
+            // Worst case work items: every member could be its own chunk
+            // (CHUNK_SIZE=1 degenerate), so size for B*n_used. In practice
+            // at CHUNK_SIZE=16 we use far less.
+            work_items: DeviceBuffer::new(
+                id,
+                (N_EXPERT as usize) + b * (N_EXPERT_USED as usize),
+            )?,
+            n_work_items: DeviceBuffer::new(id, 1)?,
         })
     }
 

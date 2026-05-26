@@ -1047,27 +1047,88 @@ impl HeterogeneousEngine {
             &bi.ffn_input_norm_recv,
             crate::forward::BLOCKS_Q8K_GATE_IN * b,
         )?;
-        // Phase 7 by-expert path lives at `iq2.launch_fused_swiglu_by_expert`
-        // and `moe_group_builder` (committed but unused — see commit
-        // message: ~50% predicted perf win didn't materialize because of
-        // dead-WG launch overhead and the fact that L2 already amortizes
-        // weight reuse in the by-token kernel). Production uses by-token.
-        ie.iq2.launch_fused_swiglu_batch_bxn(
-            &ie.compute,
-            &mut bi.d_mid_cat,
-            &ilw.routed.gate.buffer,
-            &ilw.routed.up.buffer,
-            &bi.d_xq_q8k,
-            &bi.d_ew,
-            &bi.d_selected,
-            gbpe,
-            ubpe,
-            cs_n_used as u32,
-            crate::forward::SWIGLU_CLAMP_EXP,
-            crate::forward::N_FF_EXP,
-            crate::forward::BLOCKS_Q8K_GATE_IN,
-            b,
-        )?;
+        // Phase 7.2 chunked by-expert iq2. Three pre-passes then main kernel:
+        //   1. moe_group_builder: invert d_selected → group_count + expert_members.
+        //   2. moe_work_items_builder: chunk popular groups → work_items + n_work_items.
+        //   3. host sync + readback n_work_items to set main kernel grid.y.
+        //   4. iq2 chunked main kernel.
+        // CHUNK_SIZE=16 — WMMA-compatible, bounds popular-expert WG iters.
+        const CHUNK_SIZE: u32 = 32;
+        let max_per_expert = bi.max_per_expert();
+        bi.group_count.fill_zero()?;
+        bi.n_work_items.fill_zero()?;
+        {
+            let BatchIgpuScratch {
+                group_count,
+                expert_members,
+                d_selected,
+                ..
+            } = bi;
+            ie.moe_group_builder.launch(
+                &ie.compute,
+                group_count,
+                expert_members,
+                d_selected,
+                b,
+                cs_n_used as u32,
+                N_EXPERT,
+                max_per_expert,
+            )?;
+        }
+        {
+            let BatchIgpuScratch {
+                work_items,
+                n_work_items,
+                group_count,
+                ..
+            } = bi;
+            ie.moe_group_builder.launch_work_items(
+                &ie.compute,
+                work_items,
+                n_work_items,
+                group_count,
+                N_EXPERT,
+                CHUNK_SIZE,
+                work_items.len() as u32,
+            )?;
+        }
+        // Host sync + readback. ~5us. Necessary because grid.y for the
+        // main kernel depends on the runtime work-item count.
+        ie.compute.synchronize()?;
+        let mut n_wi_host = [0i32; 1];
+        bi.n_work_items.copy_to_host(&mut n_wi_host)?;
+        let n_work_items = n_wi_host[0] as u32;
+        {
+            let BatchIgpuScratch {
+                d_mid_cat,
+                d_xq_q8k,
+                d_ew,
+                group_count,
+                expert_members,
+                work_items,
+                ..
+            } = bi;
+            ie.iq2.launch_fused_swiglu_chunked(
+                &ie.compute,
+                d_mid_cat,
+                &ilw.routed.gate.buffer,
+                &ilw.routed.up.buffer,
+                d_xq_q8k,
+                d_ew,
+                group_count,
+                expert_members,
+                work_items,
+                gbpe,
+                ubpe,
+                cs_n_used as u32,
+                max_per_expert,
+                CHUNK_SIZE,
+                crate::forward::SWIGLU_CLAMP_EXP,
+                crate::forward::N_FF_EXP,
+                crate::forward::BLOCKS_Q8K_GATE_IN,
+                n_work_items,
+            )?;
+        }
         ie.q8k.launch(
             &ie.compute,
             &mut bi.d_midq_cat,

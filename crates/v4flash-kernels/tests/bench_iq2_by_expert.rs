@@ -191,7 +191,7 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
         by_token_ms.push(Event::elapsed_ms(&start, &end)?);
     }
 
-    // ---- Time the by-expert kernel N iters ----
+    // ---- Time the by-expert v0 kernel N iters ----
     let mut by_expert_ms: Vec<f32> = Vec::with_capacity(iters);
     for _ in 0..iters {
         let start = Event::new()?;
@@ -228,6 +228,121 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
         by_expert_ms.push(Event::elapsed_ms(&start, &end)?);
     }
 
+    // ---- Phase 7.2: Time the chunked by-expert kernel N iters ----
+    // Need to (re)build the work_items pre-pass each call too, since the
+    // chunked kernel reads it. Build once outside the timing loop —
+    // group_count + work_items don't change across iters.
+    let chunk_size: u32 = std::env::var("BENCH_CHUNK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+    let CHUNK_SIZE = chunk_size; // for naming consistency below
+    bi.n_work_items.fill_zero()?;
+    {
+        let BatchIgpuScratch {
+            work_items,
+            n_work_items,
+            group_count,
+            ..
+        } = &mut bi;
+        let max_items = work_items.len() as u32;
+        ie.moe_group_builder.launch_work_items(
+            &ie.compute,
+            work_items,
+            n_work_items,
+            group_count,
+            N_EXPERT,
+            CHUNK_SIZE,
+            max_items,
+        )?;
+    }
+    ie.compute.synchronize()?;
+    let mut n_wi_host = [0i32; 1];
+    bi.n_work_items.copy_to_host(&mut n_wi_host)?;
+    let n_work_items = n_wi_host[0] as u32;
+
+    let mut chunked_ms: Vec<f32> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let start = Event::new()?;
+        let end = Event::new()?;
+        start.record(&ie.compute)?;
+        let BatchIgpuScratch {
+            d_mid_cat,
+            d_xq_q8k,
+            d_ew,
+            group_count,
+            expert_members,
+            work_items,
+            ..
+        } = &mut bi;
+        ie.iq2.launch_fused_swiglu_chunked(
+            &ie.compute,
+            d_mid_cat,
+            &ilw.routed.gate.buffer,
+            &ilw.routed.up.buffer,
+            d_xq_q8k,
+            d_ew,
+            group_count,
+            expert_members,
+            work_items,
+            gbpe,
+            ubpe,
+            cs_n_used,
+            max_per_expert,
+            CHUNK_SIZE,
+            SWIGLU_CLAMP_EXP,
+            N_FF_EXP,
+            BLOCKS_Q8K_GATE_IN,
+            n_work_items,
+        )?;
+        end.record(&ie.compute)?;
+        ie.compute.synchronize()?;
+        chunked_ms.push(Event::elapsed_ms(&start, &end)?);
+    }
+
+    // ---- DIAGNOSTIC: chunked kernel with dot-product stubbed.
+    // Same launch, same WG geometry, same LDS init + xq cooperative loads,
+    // but no dot work. If wall ≈ same → dot is amortized into other costs
+    // (BW, LDS, sync); if wall ≈ 0 → dot is the bottleneck.
+    let mut nodot_ms: Vec<f32> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let start = Event::new()?;
+        let end = Event::new()?;
+        start.record(&ie.compute)?;
+        let BatchIgpuScratch {
+            d_mid_cat,
+            d_xq_q8k,
+            d_ew,
+            group_count,
+            expert_members,
+            work_items,
+            ..
+        } = &mut bi;
+        ie.iq2.launch_fused_swiglu_chunked_nodot(
+            &ie.compute,
+            d_mid_cat,
+            &ilw.routed.gate.buffer,
+            &ilw.routed.up.buffer,
+            d_xq_q8k,
+            d_ew,
+            group_count,
+            expert_members,
+            work_items,
+            gbpe,
+            ubpe,
+            cs_n_used,
+            max_per_expert,
+            CHUNK_SIZE,
+            SWIGLU_CLAMP_EXP,
+            N_FF_EXP,
+            BLOCKS_Q8K_GATE_IN,
+            n_work_items,
+        )?;
+        end.record(&ie.compute)?;
+        ie.compute.synchronize()?;
+        nodot_ms.push(Event::elapsed_ms(&start, &end)?);
+    }
+
     fn median(v: &mut [f32]) -> f32 {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[v.len() / 2]
@@ -237,13 +352,23 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
     }
     let bt_min = pmin(&by_token_ms);
     let be_min = pmin(&by_expert_ms);
+    let ch_min = pmin(&chunked_ms);
     let bt_med = median(&mut by_token_ms.clone());
     let be_med = median(&mut by_expert_ms.clone());
+    let ch_med = median(&mut chunked_ms.clone());
 
     eprintln!("\n=== iq2 kernel wall (B={b}, {iters} iters, hipEvent-timed) ===");
     eprintln!("by-token   min={:.3} ms  median={:.3} ms", bt_min, bt_med);
-    eprintln!("by-expert  min={:.3} ms  median={:.3} ms", be_min, be_med);
-    eprintln!("ratio (be/bt): min={:.3}x  median={:.3}x", be_min / bt_min, be_med / bt_med);
+    eprintln!("by-expert  min={:.3} ms  median={:.3} ms  (ratio min={:.3}x  med={:.3}x)",
+              be_min, be_med, be_min / bt_min, be_med / bt_med);
+    eprintln!("chunked-{chunk_size} min={:.3} ms  median={:.3} ms  (ratio min={:.3}x  med={:.3}x)  n_work_items={n_work_items}",
+              ch_min, ch_med, ch_min / bt_min, ch_med / bt_med);
+    let nd_min = pmin(&nodot_ms);
+    let nd_med = median(&mut nodot_ms.clone());
+    eprintln!("nodot-{chunk_size}   min={:.3} ms  median={:.3} ms  (= chunked - dot cost)",
+              nd_min, nd_med);
+    eprintln!("  dot-only cost:  min={:.3} ms  med={:.3} ms  ({:.0}% of chunked wall)",
+              ch_min - nd_min, ch_med - nd_med, 100.0 * (ch_med - nd_med) / ch_med);
 
     // Print the active-expert count to give context for the ratio.
     let mut gc_host = vec![0i32; N_EXPERT as usize];

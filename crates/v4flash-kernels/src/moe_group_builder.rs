@@ -19,22 +19,78 @@ use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
 
 const MOE_GROUP_BUILDER_GFX1201: &[u8] = include_bytes!(env!("KERNEL_MOE_GROUP_BUILDER_GFX1201"));
 const MOE_GROUP_BUILDER_GFX1151: &[u8] = include_bytes!(env!("KERNEL_MOE_GROUP_BUILDER_GFX1151"));
+const MOE_WORK_ITEMS_BUILDER_GFX1201: &[u8] =
+    include_bytes!(env!("KERNEL_MOE_WORK_ITEMS_BUILDER_GFX1201"));
+const MOE_WORK_ITEMS_BUILDER_GFX1151: &[u8] =
+    include_bytes!(env!("KERNEL_MOE_WORK_ITEMS_BUILDER_GFX1151"));
 
 pub struct MoeGroupBuilder {
     module: Module,
+    work_items_module: Module,
 }
 
 impl MoeGroupBuilder {
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
-        let image: &[u8] = if arch.starts_with("gfx1201") {
-            MOE_GROUP_BUILDER_GFX1201
+        let (image, wi_image): (&[u8], &[u8]) = if arch.starts_with("gfx1201") {
+            (MOE_GROUP_BUILDER_GFX1201, MOE_WORK_ITEMS_BUILDER_GFX1201)
         } else if arch.starts_with("gfx1151") {
-            MOE_GROUP_BUILDER_GFX1151
+            (MOE_GROUP_BUILDER_GFX1151, MOE_WORK_ITEMS_BUILDER_GFX1151)
         } else {
             return Err(eyre!("unsupported arch for moe_group_builder: {arch}"));
         };
         let module = Module::load_data(image)?;
-        Ok(Self { module })
+        let work_items_module = Module::load_data(wi_image)?;
+        Ok(Self {
+            module,
+            work_items_module,
+        })
+    }
+
+    /// Phase 7.2: build work_items list from group_count for chunked
+    /// by-expert dispatch. Each work item is `(expert_id << 16) | member_start`.
+    /// Returns the kernel; the caller is responsible for copying
+    /// `n_work_items[0]` to host (sync) to read the actual count for
+    /// the main kernel's grid_y.
+    ///
+    /// Caller MUST zero `n_work_items` before this call. `work_items` is
+    /// sized for the worst case; only the first `n_work_items[0]` entries
+    /// are valid after the call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_work_items(
+        &self,
+        stream: &Stream,
+        work_items: &mut DeviceBuffer<i32>,
+        n_work_items: &mut DeviceBuffer<i32>,
+        group_count: &DeviceBuffer<i32>,
+        n_expert: u32,
+        chunk_size: u32,
+        max_items: u32,
+    ) -> eyre::Result<()> {
+        let function = self
+            .work_items_module
+            .get_function("moe_work_items_builder")?;
+        let mut wi_ptr = work_items.raw();
+        let mut nwi_ptr = n_work_items.raw();
+        let mut gc_ptr = group_count.raw();
+        let mut ne = n_expert;
+        let mut cs = chunk_size;
+        let mut mi = max_items;
+        let mut args: [*mut c_void; 6] = [
+            &mut wi_ptr as *mut _ as *mut c_void,
+            &mut nwi_ptr as *mut _ as *mut c_void,
+            &mut gc_ptr as *mut _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut cs as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+        ];
+        let block_x = 256u32;
+        let grid_x = n_expert.div_ceil(block_x);
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
 
     /// Build per-expert (token, slot) groups from `d_selected[B, n_used]`.
