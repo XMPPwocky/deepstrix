@@ -105,6 +105,18 @@ crates/v4flash-kernels/
 
 - Master single-token decode (M31): **27.95 tok/s** sustained (35.78 ms/tok p50)
 - Phase 1 prefill at B=7: 12.94 tok/s (77 ms/tok — pair_mode overhead, no batching)
-- Phase 2 target at B=64: 70-100 tok/s (dGPU batched, iGPU serial)
+- **Phase 2 v2 measured** (`bench_prefill_v2`):
+
+  | B  | best tok/s | median tok/s | ms/tok (best) |
+  |----|-----------:|-------------:|--------------:|
+  |  4 |      37.48 |        36.86 |          26.7 |
+  |  7 |      41.22 |        37.25 |          24.3 |
+  | 16 |      44.09 |        43.06 |          22.7 |
+  | 32 |      44.97 |        43.06 |          22.2 |
+  | 64 |      42.97 |        41.69 |          23.3 |
+
+  Plateaus at ~43-45 tok/s. ~1.5× single-token decode. Bottleneck: iGPU MoE
+  + attention still in serial per-batch loops (Phases 3+4 unblock).
+
 - Phase 3 target at B=64: 150-250 tok/s (full batched)
 - Phase 6 target on 200-token prompt: ≥ 150 tok/s with `last_only=true`

@@ -19,7 +19,7 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::het::{
-    BatchScratch, ExecMode, HetModelState, HetModelWeights, HeterogeneousEngine,
+    BatchDgpuScratch, BatchScratch, ExecMode, HetModelState, HetModelWeights, HeterogeneousEngine,
 };
 use v4flash_kernels::{ActivationDump, RopeParams};
 
@@ -159,5 +159,129 @@ fn bench_prefill() -> eyre::Result<()> {
         (b as f64 * 1000.0) / median_ms
     );
     eprintln!("reference: single-token decode = 35.78 ms/tok = 27.95 tok/s (master p50)");
+    Ok(())
+}
+
+/// M50 Phase 2 v2 bench: measure `forward_prompt_batch_v2` (real batched
+/// kernels) at various B.
+#[test]
+#[ignore]
+fn bench_prefill_v2() -> eyre::Result<()> {
+    install_panic_handler()?;
+    use v4flash_kernels::forward::HC_DIM;
+
+    let b: usize = std::env::var("BENCH_B")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(PROMPT_TOKENS.len())
+        .min(64);
+    let n_warmup: usize = std::env::var("BENCH_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let n_iters: usize = std::env::var("BENCH_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    eprintln!("bench_prefill_v2: B={b}, warmup={n_warmup}, iters={n_iters}");
+
+    let dump = ActivationDump::open(dump_dir())?;
+    let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
+    let dgpu = pick_dgpu()?;
+    let igpu = pick_igpu()?;
+    let dgpu_arch = dgpu.properties()?.gcn_arch_name;
+    let igpu_arch = igpu.properties()?.gcn_arch_name;
+
+    let rope_for_layer = |layer: i32| -> eyre::Result<RopeParams> {
+        let entry = dump
+            .weight("rope_params", layer)
+            .ok_or_else(|| eyre!("missing rope_params L{layer}"))?;
+        let floats = dump.read_f32(entry)?;
+        let n_ctx_orig = if floats[2] != 0.0 { ROPE_ORIG_CTX } else { 0 };
+        RopeParams::from_dump_blob(&floats, n_ctx_orig)
+    };
+
+    eprintln!("loading main weights...");
+    let main_weights = HetModelWeights::load_all(&main_gguf, dgpu, igpu, &rope_for_layer)?;
+    let engine =
+        HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
+    let mut bs = BatchScratch::alloc(dgpu, igpu)?; // for shared_igpu
+    let mut bd = BatchDgpuScratch::alloc(dgpu)?;
+
+    // Load real dump inputs for the first 7 positions; repeat thereafter
+    // to support synthetic B>7 timing tests. (Repeated inputs make KV
+    // cache contents bogus but kernel timings unchanged.)
+    let n_real = PROMPT_TOKENS.len();
+    let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(b);
+    let mut tokens: Vec<i32> = Vec::with_capacity(b);
+    for i in 0..b {
+        let src_i = i % n_real;
+        let entry = dump
+            .tensor("layer_input_residual", 0, src_i as i32)
+            .ok_or_else(|| eyre!("missing layer_input_residual L0 T{src_i}"))?;
+        let hc = dump.read_f32(entry)?;
+        assert_eq!(hc.len(), HC_DIM as usize);
+        input_hcs.push(hc);
+        tokens.push(PROMPT_TOKENS[src_i]);
+    }
+    if b > n_real {
+        eprintln!("(B>{n_real}: repeating real inputs cyclically — timing only, not correctness)");
+    }
+
+    eprintln!("warmup × {n_warmup}");
+    for _ in 0..n_warmup {
+        let mut state = HetModelState::alloc(dgpu, igpu, b as u32 + 4)?;
+        engine.forward_prompt_batch_v2(
+            &mut bd,
+            &mut bs.shared_igpu,
+            &mut state,
+            &main_weights,
+            &input_hcs,
+            &tokens,
+            0,
+        )?;
+    }
+
+    let mut walls_ms: Vec<f64> = Vec::with_capacity(n_iters);
+    for it in 0..n_iters {
+        let mut state = HetModelState::alloc(dgpu, igpu, b as u32 + 4)?;
+        let t0 = Instant::now();
+        engine.forward_prompt_batch_v2(
+            &mut bd,
+            &mut bs.shared_igpu,
+            &mut state,
+            &main_weights,
+            &input_hcs,
+            &tokens,
+            0,
+        )?;
+        let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        walls_ms.push(wall_ms);
+        eprintln!(
+            "  iter {it}: wall={:.2} ms  ({:.2} ms/tok = {:.2} tok/s)",
+            wall_ms,
+            wall_ms / b as f64,
+            (b as f64 * 1000.0) / wall_ms
+        );
+    }
+
+    walls_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median_ms = walls_ms[walls_ms.len() / 2];
+    let min_ms = walls_ms[0];
+    eprintln!("\n=== BENCH PREFILL V2 B={b} ===");
+    eprintln!(
+        "best wall:   {:.2} ms ({:.2} ms/tok = {:.2} tok/s)",
+        min_ms,
+        min_ms / b as f64,
+        (b as f64 * 1000.0) / min_ms
+    );
+    eprintln!(
+        "median wall: {:.2} ms ({:.2} ms/tok = {:.2} tok/s)",
+        median_ms,
+        median_ms / b as f64,
+        (b as f64 * 1000.0) / median_ms
+    );
+    eprintln!("reference: single-token decode = 35.78 ms/tok = 27.95 tok/s (master p50)");
+    eprintln!("reference: Phase 1 (looped) = 77 ms/tok @ B=7 (forfeits M30 graphs)");
     Ok(())
 }
