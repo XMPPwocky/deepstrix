@@ -16,26 +16,33 @@ Plan: `~/.claude/plans/read-design-doc-agile-hollerith.md`.
 - `tests/forward_prompt_batch_matches_sequential.rs` — passes bit-identical (max diff 0.0) at B=1, 4, 7
 - `tests/bench_prefill.rs` — measures 77 ms/tok at B=7 (slower than 36 ms/tok single because pair_mode disables M30 combined graphs)
 
-### ⏳ Phase 2: dGPU batched kernels DONE, full v2 integration FAILING ORACLE
+### ✅ Phase 2: dGPU batched kernels + v2 integration — PASSING ORACLE
 
-`forward_prompt_batch_v2` + `forward_layer_batch_v2` in `src/het/forward_prefill.rs` — committed but currently fails its oracle by ~8.9e3 (outputs ~10× smaller than expected). See `memory/project_m50_v2_failing_oracle.md` for bisect strategy + suspect list. 8 of 10 batched kernels are unverified; bug is in at least one of them or in v2's orchestration.
+`forward_prompt_batch_v2` + `forward_layer_batch_v2` in `src/het/forward_prefill.rs` — **bit-identical to sequential reference at B=4 and B=7** (max diff 0.0). Three bugs fixed during the integration:
+
+1. **Stream race**: Stage 11's peer-pushes on `de.xfer` raced with Stage 9's `router_topk` writes on `de.compute` because there was no sync. Added `de.compute.synchronize()` before the per-batch peer-push loop.
+2. **`hc_weighted_sum_batched` weights stride**: kernel assumed `weights[B, n_hc]` packed (stride 4) but callers pass `split[B, HC_MIX_DIM]` (stride 24). Added `w_stride` kernel parameter.
+3. **Causal attention violation**: Stage 5 used the final post-loop `ls.n_raw` for every batch element's attention, letting token i attend to future tokens. Captured per-batch `n_raw_after[i]` / `n_comp_after[i]` snapshots during Stage 4 and use them in Stage 5.
+
+Also: the wide single-token `f16.matvec` is used per-batch for the router (Stage 9) instead of the batched narrow kernel, to keep router-logit float-reduction order matching the single-token path. Saves us from float-drift causing topk to pick different experts. A future batched WIDE f16 matvec would replace this loop.
+
+Bisect harness lives in `tests/forward_prompt_batch_matches_sequential.rs::forward_prompt_batch_v2_bisect_layer` (run-by-run B-by-B per-layer comparison; supports per-stage debug compare via `V2_DBG_LAYER=N`).
 
 **Building blocks** (all committed):
 
-**All batched kernels written and building cleanly:**
-
-| kernel | hip file | rust wrapper | tested? |
+| kernel | hip file | rust wrapper | validated by |
 |---|---|---|---|
-| `q8_0_gemv_batched_warp8` | `kernels/q8_0_matvec.hip` | `Q8_0Matvec::matvec_batched` | ✓ B=4 bit-identical |
-| `q8_0_grouped_gemv_batched` | `kernels/q8_0_grouped_matvec.hip` | `Q8_0GroupedMatvec::matvec_grouped_batched` | no |
-| `f16_matvec_narrow_batched` | `kernels/f16_matvec_narrow.hip` | `F16Matvec::matvec_narrow_batched` | no |
-| `q8_k_quantize` (trivial) | existing `kernels/q8_k_quantize.hip` | use `launch(n_blocks = B × per_token)` | trivially works |
-| `rms_norm_weighted_batched` | `kernels/rms_norm.hip` | `RmsNorm::launch_weighted_batched` | no |
-| `rms_norm_no_weight_batched` | `kernels/rms_norm_no_weight.hip` | `RmsNormNoWeight::launch_batched` | no |
-| `hc_weighted_sum_batched` | `kernels/hc_weighted_sum.hip` | `HcWeightedSum::launch_batched` | no |
-| `hc_sinkhorn_par_batched` | `kernels/hc_sinkhorn_par.hip` | `HcSinkhorn::launch_batched` | no |
-| `hc_post_batched` | `kernels/hc_post.hip` | `HcPost::launch_batched` | no |
-| `hc_sigmoid_bias_batched` | `kernels/hc_sigmoid_bias.hip` | `HcSigmoidBias::launch_batched` | no |
+| `q8_0_gemv_batched_warp8` | `kernels/q8_0_matvec.hip` | `Q8_0Matvec::matvec_batched` | unit test + v2 oracle |
+| `q8_0_grouped_gemv_batched` | `kernels/q8_0_grouped_matvec.hip` | `Q8_0GroupedMatvec::matvec_grouped_batched` | v2 oracle |
+| `f16_matvec_narrow_batched` | `kernels/f16_matvec_narrow.hip` | `F16Matvec::matvec_narrow_batched` | v2 oracle (HC stages) |
+| `q8_k_quantize` (trivial) | existing `kernels/q8_k_quantize.hip` | use `launch(n_blocks = B × per_token)` | v2 oracle |
+| `rms_norm_weighted_batched` | `kernels/rms_norm.hip` | `RmsNorm::launch_weighted_batched` | v2 oracle |
+| `rms_norm_no_weight_batched` | `kernels/rms_norm_no_weight.hip` | `RmsNormNoWeight::launch_batched` | v2 oracle |
+| `hc_weighted_sum_batched` | `kernels/hc_weighted_sum.hip` | `HcWeightedSum::launch_batched(.., w_stride, batch)` | v2 oracle (after stride fix) |
+| `hc_sinkhorn_par_batched` | `kernels/hc_sinkhorn_par.hip` | `HcSinkhorn::launch_batched` | v2 oracle |
+| `hc_post_batched` | `kernels/hc_post.hip` | `HcPost::launch_batched` | not used by v2 yet |
+| `hc_post_from_split_batched` | `kernels/hc_post.hip` | `HcPost::launch_from_split_batched` | v2 oracle |
+| `hc_sigmoid_bias_batched` | `kernels/hc_sigmoid_bias.hip` | `HcSigmoidBias::launch_batched` | not used by v2 |
 
 All v0 designs: `grid.z = B` parallel WGs, no W-amortization across batch (each WG re-reads weights independently). A v1 pass per kernel can pack multiple batch elements per WG to amortize W reads — that's the next-level perf optimization, but v0 already enables dGPU-side WG concurrency which should give 1.5-3× wall improvement.
 

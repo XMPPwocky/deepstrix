@@ -167,6 +167,14 @@ impl HcWeightedSum {
 
     /// M50 Phase 2: batched. x[B, n_hc, n_embd], weights[B, n_hc],
     /// out[B, n_embd]. Grid (n_embd/256, 1, B).
+    /// M50 Phase 2: batched hc_weighted_sum.
+    ///
+    /// `w_stride` is the per-batch stride of `weights`. When `weights`
+    /// is the packed `split[B, HC_MIX_DIM]` from sinkhorn, pass
+    /// `w_stride = HC_MIX_DIM` (= 2*n_hc + n_hc*n_hc); the kernel reads
+    /// the first `n_hc` elements (= pre-sigmoid "w" portion) per batch.
+    /// For a tightly-packed `weights[B, n_hc]`, pass `w_stride = n_hc`.
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_batched(
         &self,
         stream: &Stream,
@@ -175,6 +183,7 @@ impl HcWeightedSum {
         weights: &DeviceBuffer<f32>,
         n_embd: u32,
         n_hc: u32,
+        w_stride: u32,
         batch: u32,
     ) -> eyre::Result<()> {
         if batch == 0 {
@@ -186,12 +195,14 @@ impl HcWeightedSum {
         let mut w_ptr = weights.raw();
         let mut ne = n_embd;
         let mut nh = n_hc;
-        let mut args: [*mut c_void; 5] = [
+        let mut ws = w_stride;
+        let mut args: [*mut c_void; 6] = [
             &mut out_ptr as *mut _ as *mut c_void,
             &mut x_ptr as *mut _ as *mut c_void,
             &mut w_ptr as *mut _ as *mut c_void,
             &mut ne as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void,
+            &mut ws as *mut _ as *mut c_void,
         ];
         let block_x = 256u32;
         let grid_x = n_embd.div_ceil(block_x);

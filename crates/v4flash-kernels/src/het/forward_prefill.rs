@@ -324,6 +324,7 @@ impl HeterogeneousEngine {
             &bd.split,
             N_EMBD,
             N_HC,
+            HC_MIX_DIM, // w_stride: split is [B, HC_MIX_DIM]; pre-sigmoid w is first n_hc
             b,
         )?;
         de.rms_w.launch_weighted_batched(
@@ -449,7 +450,14 @@ impl HeterogeneousEngine {
 
         // ========================================================
         // Stage 4: KV cache append + compressor (SERIAL per batch)
+        //
+        // We capture per-batch n_raw_after / n_comp_after snapshots so
+        // Stage 5 attention can use causal prefix lengths instead of the
+        // final post-loop values (which would let token i attend to
+        // future tokens i+1..B-1).
         // ========================================================
+        let mut n_raw_after: Vec<u32> = Vec::with_capacity(b as usize);
+        let mut n_comp_after: Vec<u32> = Vec::with_capacity(b as usize);
         for i in 0..b as usize {
             let pos = pos0 + i as u32;
             let kv_view = bd.kv_normed.slice_view(i * cs_kvhd, cs_kvhd);
@@ -464,6 +472,7 @@ impl HeterogeneousEngine {
             if ls.n_raw < SWA_WINDOW {
                 ls.n_raw += 1;
             }
+            n_raw_after.push(ls.n_raw);
             if ratio > 0 {
                 let cw = dlw
                     .compressor
@@ -554,14 +563,23 @@ impl HeterogeneousEngine {
                     cs.n_comp += 1;
                 }
             }
+            // Record per-batch n_comp snapshot for Stage 5 causality.
+            let n_comp_snap = ls.compressor.as_ref().map(|c| c.n_comp).unwrap_or(0);
+            n_comp_after.push(n_comp_snap);
         }
 
         // ========================================================
         // Stage 5: Attention (SERIAL per batch — Phase 4 batches this)
+        //
+        // Causal: each token i attends to KV prefix [0..n_raw_after[i]]
+        // and comp_kv prefix [0..n_comp_after[i]]. Using ls.n_raw or
+        // ls.n_comp (the FINAL values after Stage 4's loop) would let
+        // token i see future tokens i+1..B-1.
         // ========================================================
         for i in 0..b as usize {
             let q_view = bd.q_normed.slice_view(i * cs_qflat, cs_qflat);
             let mut heads_view = bd.heads.slice_view_mut(i * cs_qflat, cs_qflat);
+            let n_raw_i = n_raw_after[i];
             if ratio == 0 {
                 de.attn_swa.launch(
                     &de.compute,
@@ -571,12 +589,12 @@ impl HeterogeneousEngine {
                     &dlw.attn_sinks,
                     N_HEAD,
                     N_HEAD_DIM,
-                    ls.n_raw,
+                    n_raw_i,
                 )?;
             } else {
                 let cs = ls.compressor.as_ref();
-                let n_comp = cs.map(|c| c.n_comp).unwrap_or(0);
-                let comp_kv_buf = if n_comp > 0 { cs.map(|c| &c.comp_kv) } else { None };
+                let n_comp_i = n_comp_after[i];
+                let comp_kv_buf = if n_comp_i > 0 { cs.map(|c| &c.comp_kv) } else { None };
                 de.attn_mixed.launch(
                     &de.compute,
                     &mut heads_view,
@@ -587,8 +605,8 @@ impl HeterogeneousEngine {
                     &dlw.attn_sinks,
                     N_HEAD,
                     N_HEAD_DIM,
-                    ls.n_raw,
-                    n_comp,
+                    n_raw_i,
+                    n_comp_i,
                 )?;
             }
         }
@@ -700,6 +718,7 @@ impl HeterogeneousEngine {
             &bd.split,
             N_EMBD,
             N_HC,
+            HC_MIX_DIM,
             b,
         )?;
         de.rms_w.launch_weighted_batched(
@@ -713,17 +732,29 @@ impl HeterogeneousEngine {
         )?;
 
         // ========================================================
-        // Stage 9: Router (BATCHED matvec; per-batch topk OR hash select)
+        // Stage 9: Router (per-batch wide matvec to match single-token
+        // float reduction order; batched matvec_narrow has different
+        // accumulation order which makes topk pick different experts
+        // when logits are near the threshold. f16.matvec dispatches to
+        // wide when n_rows >= 64 (N_EXPERT=256 ≥ 64). Phase 2-bis will
+        // add a wide batched variant.)
         // ========================================================
-        de.f16.matvec_narrow_batched(
-            &de.compute,
-            &mut bd.router_logits,
-            &dlw.ffn_gate_inp.buffer,
-            &bd.ffn_input_norm,
-            N_EXPERT,
-            N_EMBD,
-            b,
-        )?;
+        for i in 0..b as usize {
+            let ffn_in_v = bd
+                .ffn_input_norm
+                .slice_view(i * cs_n_embd, cs_n_embd);
+            let mut logits_v = bd
+                .router_logits
+                .slice_view_mut(i * (N_EXPERT as usize), N_EXPERT as usize);
+            de.f16.matvec(
+                &de.compute,
+                &mut logits_v,
+                &dlw.ffn_gate_inp.buffer,
+                &ffn_in_v,
+                N_EXPERT,
+                N_EMBD,
+            )?;
+        }
         if !dlw.is_hash_router {
             for i in 0..b as usize {
                 let logits_v = bd
@@ -843,6 +874,14 @@ impl HeterogeneousEngine {
         let dbpe = ilw.routed.down_bytes_per_expert as u32;
         let mid_blocks_bytes = (crate::forward::BLOCKS_Q8K_DOWN_IN as usize)
             * crate::q8_k::BLOCK_Q8_K_BYTES;
+        // Stage 9 router_topk + Stage 10 shared expert wrote bd.d_selected,
+        // bd.d_ew, bd.ffn_input_norm on de.compute. We're about to read
+        // them from de.xfer. Without this fence, the peer-pushes race with
+        // the still-pending compute writes and push stale data. Single-
+        // token forward_layer uses events (sev.ain_ready/selected_ready)
+        // for the same reason; v2 takes the simpler bulk-sync route.
+        self.set_current_cached(self.dgpu.device)?;
+        de.compute.synchronize()?;
         for i in 0..b as usize {
             let ain_v = bd.ffn_input_norm.slice_view(i * cs_n_embd, cs_n_embd);
             let dsel_v = bd.d_selected.slice_view(i * cs_n_used, cs_n_used);

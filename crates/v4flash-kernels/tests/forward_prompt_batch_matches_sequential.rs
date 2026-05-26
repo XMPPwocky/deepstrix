@@ -336,3 +336,223 @@ fn forward_prompt_batch_v2_matches_sequential() -> eyre::Result<()> {
     eprintln!("\nv2 ORACLE PASS within 5e-2");
     Ok(())
 }
+
+/// M50 v2 bisect: run forward_layer_batch_v2 ONE layer at a time
+/// and compare per-batch residual_next against Phase 1 (B sequential
+/// forward_layer_pair_mode calls) at the same layer. Print first-
+/// divergence layer + batch position.
+/// Set `BENCH_B` to choose batch size (default 1, max 7).
+#[test]
+#[ignore]
+fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
+    install_panic_handler()?;
+    use v4flash_kernels::forward::{HC_DIM, N_LAYER};
+
+    let dump = ActivationDump::open(dump_dir())?;
+    let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
+    let dgpu = pick_dgpu()?;
+    let igpu = pick_igpu()?;
+    let dgpu_arch = dgpu.properties()?.gcn_arch_name;
+    let igpu_arch = igpu.properties()?.gcn_arch_name;
+
+    let rope_for_layer = |layer: i32| -> eyre::Result<RopeParams> {
+        let entry = dump
+            .weight("rope_params", layer)
+            .ok_or_else(|| eyre!("missing rope_params L{layer}"))?;
+        let floats = dump.read_f32(entry)?;
+        let n_ctx_orig = if floats[2] != 0.0 { ROPE_ORIG_CTX } else { 0 };
+        RopeParams::from_dump_blob(&floats, n_ctx_orig)
+    };
+
+    eprintln!("loading main weights...");
+    let main_weights = HetModelWeights::load_all(&main_gguf, dgpu, igpu, &rope_for_layer)?;
+    let engine =
+        HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
+
+    let b_n: usize = std::env::var("BENCH_B")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .min(PROMPT_TOKENS.len());
+    eprintln!("bisect: B={b_n}");
+
+    let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(b_n);
+    for i in 0..b_n {
+        let entry = dump
+            .tensor("layer_input_residual", 0, i as i32)
+            .ok_or_else(|| eyre!("missing layer_input_residual L0 T{i}"))?;
+        input_hcs.push(dump.read_f32(entry)?);
+    }
+    let tokens: Vec<i32> = PROMPT_TOKENS[..b_n].to_vec();
+
+    // Two parallel paths.
+    let mut bs = BatchScratch::alloc(dgpu, igpu)?; // Phase 1 reference
+    let mut bd = BatchDgpuScratch::alloc(dgpu)?;   // Phase 2 v2
+
+    let mut ref_state = HetModelState::alloc(dgpu, igpu, b_n as u32 + 4)?;
+    let mut v2_state = HetModelState::alloc(dgpu, igpu, b_n as u32 + 4)?;
+
+    // Seed both with per-position input HCs.
+    for i in 0..b_n {
+        bs.per_token_residual[i].copy_from_host(&input_hcs[i])?;
+        let mut v2_slot = bd
+            .residual
+            .slice_view_mut(i * HC_DIM as usize, HC_DIM as usize);
+        v2_slot.copy_from_host(&input_hcs[i])?;
+    }
+
+    let mut first_bad: Option<(usize, usize)> = None; // (layer, batch_idx)
+    let mut max_seen_layer_diff: f32 = 0.0;
+
+    for layer in 0..N_LAYER as usize {
+        // ---- Phase 1: B sequential forward_layer_pair_mode calls ----
+        for i in 0..b_n {
+            dgpu.set_current()?;
+            bs.shared_dgpu
+                .residual
+                .copy_from_buffer(&bs.per_token_residual[i])?;
+            engine.forward_layer_pair_mode(
+                &mut bs.shared_dgpu,
+                &mut bs.shared_igpu,
+                &mut ref_state.layers[layer],
+                &main_weights.dgpu_layers[layer],
+                &main_weights.igpu_layers[layer],
+                i as u32,
+                tokens[i],
+            )?;
+            bs.per_token_residual_next[i]
+                .copy_from_buffer(&bs.shared_dgpu.residual_next)?;
+        }
+
+        // ---- Phase 2 v2: one forward_layer_batch_v2 call (B-wide) ----
+        engine.forward_layer_batch_v2(
+            &mut bd,
+            &mut bs.shared_igpu,
+            &mut v2_state.layers[layer],
+            &main_weights.dgpu_layers[layer],
+            &main_weights.igpu_layers[layer],
+            0,
+            &tokens,
+        )?;
+
+        // ---- Compare each batch element's residual_next ----
+        let mut layer_max_per_b: Vec<(f32, usize)> = Vec::with_capacity(b_n);
+        for i in 0..b_n {
+            let mut ref_hc = vec![0.0f32; HC_DIM as usize];
+            bs.per_token_residual_next[i].copy_to_host(&mut ref_hc)?;
+            let v2_slot = bd
+                .residual_next
+                .slice_view(i * HC_DIM as usize, HC_DIM as usize);
+            let mut v2_hc = vec![0.0f32; HC_DIM as usize];
+            v2_slot.copy_to_host(&mut v2_hc)?;
+            let (md, ix) = max_abs_diff(&ref_hc, &v2_hc);
+            layer_max_per_b.push((md, ix));
+            if md > max_seen_layer_diff {
+                max_seen_layer_diff = md;
+            }
+            if first_bad.is_none() && md > 1.0e-2 {
+                first_bad = Some((layer, i));
+            }
+        }
+        let summary: String = layer_max_per_b
+            .iter()
+            .enumerate()
+            .map(|(i, (m, _))| format!("b{i}={m:.2e}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        eprintln!("L{layer:>2}  {summary}");
+
+        // ---- DEBUG: at the layer specified by V2_DBG_LAYER, compare a
+        //     handful of intermediate buffers to localize the bug. ----
+        // (Compares b=0 only.)
+        if std::env::var("V2_DBG_LAYER")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            == Some(layer)
+        {
+            use v4flash_kernels::forward::{HC_DIM as HD, N_EMBD as NE, Q_FLAT as QF};
+            let compare = |name: &str, ref_buf: &v4flash_hip::DeviceBuffer<f32>,
+                            v2_buf_view: v4flash_hip::DeviceBuffer<f32>|
+             -> eyre::Result<()> {
+                let n = ref_buf.len();
+                let mut rh = vec![0.0f32; n];
+                let mut vh = vec![0.0f32; n];
+                ref_buf.copy_to_host(&mut rh)?;
+                v2_buf_view.copy_to_host(&mut vh)?;
+                let (maxd, idx) = max_abs_diff(&rh, &vh);
+                eprintln!(
+                    "    DBG L{layer} {name:18}  maxd={maxd:.4e}@i={idx}  ref={r:.4}  v2={v:.4}",
+                    r = rh[idx], v = vh[idx]
+                );
+                Ok(())
+            };
+            // mhc_pre_attn outputs (stages 1-end).
+            compare("attn_input_norm", &bs.shared_dgpu.attn_input_norm,
+                bd.attn_input_norm.slice_view(0, NE as usize))?;
+            // Q chain.
+            compare("q_normed", &bs.shared_dgpu.q_normed,
+                bd.q_normed.slice_view(0, QF as usize))?;
+            // KV chain.
+            compare("kv_normed", &bs.shared_dgpu.kv_normed,
+                bd.kv_normed.slice_view(0, v4flash_kernels::forward::N_HEAD_DIM as usize))?;
+            // Attention output (heads).
+            compare("heads_post_attn", &bs.shared_dgpu.heads,
+                bd.heads.slice_view(0, QF as usize))?;
+            // Output projection.
+            compare("attn_out", &bs.shared_dgpu.attn_out,
+                bd.attn_out.slice_view(0, NE as usize))?;
+            // mHC post-attn.
+            compare("after_attn_hc", &bs.shared_dgpu.after_attn_hc,
+                bd.after_attn_hc.slice_view(0, HD as usize))?;
+            // mHC pre-ffn.
+            compare("ffn_input_norm", &bs.shared_dgpu.ffn_input_norm,
+                bd.ffn_input_norm.slice_view(0, NE as usize))?;
+            // Shared expert output.
+            compare("ffn_shared", &bs.shared_dgpu.ffn_shared,
+                bd.ffn_shared.slice_view(0, NE as usize))?;
+            // Router selections (d_selected = i32, custom print).
+            {
+                let mut sel_ref = vec![0i32; 6];
+                let mut sel_v2 = vec![0i32; 6];
+                bs.shared_dgpu.d_selected.copy_to_host(&mut sel_ref)?;
+                bd.d_selected.slice_view(0, 6).copy_to_host(&mut sel_v2)?;
+                eprintln!("    DBG L{layer} d_selected         ref={:?}", sel_ref);
+                eprintln!("    DBG L{layer} d_selected          v2={:?}", sel_v2);
+                let mut ew_ref = vec![0f32; 6];
+                let mut ew_v2 = vec![0f32; 6];
+                bs.shared_dgpu.d_ew.copy_to_host(&mut ew_ref)?;
+                bd.d_ew.slice_view(0, 6).copy_to_host(&mut ew_v2)?;
+                eprintln!("    DBG L{layer} d_ew               ref={:?}", ew_ref);
+                eprintln!("    DBG L{layer} d_ew                v2={:?}", ew_v2);
+            }
+            // iGPU MoE arrival.
+            compare("ffn_moe_recv", &bs.shared_dgpu.ffn_moe_recv,
+                bd.ffn_moe_recv.slice_view(0, NE as usize))?;
+        }
+
+        // ---- Swap residuals for next layer on BOTH paths ----
+        for i in 0..b_n {
+            std::mem::swap(
+                &mut bs.per_token_residual[i],
+                &mut bs.per_token_residual_next[i],
+            );
+        }
+        std::mem::swap(&mut bd.residual, &mut bd.residual_next);
+
+        // Limit bisect output — stop after divergence is well-established.
+        if let Some((bad_layer, _)) = first_bad {
+            if layer >= bad_layer + 2 {
+                eprintln!("\n>>> First-bad layer = {bad_layer}; stopping bisect at L{layer}");
+                break;
+            }
+        }
+    }
+
+    eprintln!("\nmax abs diff seen across layers: {max_seen_layer_diff:.4e}");
+    if let Some((bad_layer, bad_b)) = first_bad {
+        eprintln!(">>> first divergent (layer, batch_idx) = (L{bad_layer}, b{bad_b})");
+    } else {
+        eprintln!(">>> all layers within 1e-2");
+    }
+    Ok(())
+}
