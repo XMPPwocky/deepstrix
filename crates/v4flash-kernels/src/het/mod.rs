@@ -16,10 +16,12 @@
 //! forward_full_logits oracle. M13.4 turns on real concurrency via
 //! `ExecMode::HetParallel`. M13.5 migrates the compressor to iGPU.
 
+pub mod batch_scratch;
 pub mod engine;
 pub mod forward_head;
 pub mod forward_layer;
 pub mod forward_mtp;
+pub mod forward_prefill;
 pub mod forward_pair_interleaved;
 pub mod spec_decode;
 pub mod mtp_weights;
@@ -30,6 +32,7 @@ pub mod sync;
 pub mod trace;
 pub mod weights;
 
+pub use batch_scratch::{BatchScratch, B_MAX};
 pub use engine::{DeviceEngine, ExecMode, HeterogeneousEngine};
 pub use mtp_weights::{MtpRoutedExperts, MtpWeights};
 pub use scratch::{DgpuScratch, IgpuScratch, TokenScratch};
