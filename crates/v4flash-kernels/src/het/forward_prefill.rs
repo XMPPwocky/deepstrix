@@ -569,47 +569,62 @@ impl HeterogeneousEngine {
         }
 
         // ========================================================
-        // Stage 5: Attention (SERIAL per batch — Phase 4 batches this)
+        // Stage 5: Attention (BATCHED — grid (n_head, B, 1))
         //
         // Causal: each token i attends to KV prefix [0..n_raw_after[i]]
-        // and comp_kv prefix [0..n_comp_after[i]]. Using ls.n_raw or
-        // ls.n_comp (the FINAL values after Stage 4's loop) would let
-        // token i see future tokens i+1..B-1.
+        // and comp_kv prefix [0..n_comp_after[i]]. Per-token prefix
+        // lengths live in bd.n_raw_per / bd.n_comp_per device buffers
+        // (uploaded fresh per layer from the host snapshots captured in
+        // Stage 4).
         // ========================================================
-        for i in 0..b as usize {
-            let q_view = bd.q_normed.slice_view(i * cs_qflat, cs_qflat);
-            let mut heads_view = bd.heads.slice_view_mut(i * cs_qflat, cs_qflat);
-            let n_raw_i = n_raw_after[i];
-            if ratio == 0 {
-                de.attn_swa.launch(
-                    &de.compute,
-                    &mut heads_view,
-                    &q_view,
-                    &ls.kv_cache,
-                    &dlw.attn_sinks,
-                    N_HEAD,
-                    N_HEAD_DIM,
-                    n_raw_i,
-                )?;
-            } else {
-                let cs = ls.compressor.as_ref();
-                let n_comp_i = n_comp_after[i];
-                let comp_kv_buf = if n_comp_i > 0 { cs.map(|c| &c.comp_kv) } else { None };
-                de.attn_mixed.launch(
-                    &de.compute,
-                    &mut heads_view,
-                    &q_view,
-                    &ls.kv_cache,
-                    comp_kv_buf,
-                    None,
-                    &dlw.attn_sinks,
-                    N_HEAD,
-                    N_HEAD_DIM,
-                    n_raw_i,
-                    n_comp_i,
-                )?;
-            }
+        let n_raw_per_host: Vec<i32> = n_raw_after.iter().map(|&v| v as i32).collect();
+        let n_comp_per_host: Vec<i32> =
+            n_comp_after.iter().map(|&v| v as i32).collect();
+        // Async copies on de.compute so they FIFO with the subsequent
+        // attention launch. Avoids the bulk-sync that copy_from_host
+        // would impose (~5us each blocks the host AND fences the device).
+        {
+            let mut nrp_v = bd.n_raw_per.slice_view_mut(0, b as usize);
+            nrp_v.copy_from_host_async(&n_raw_per_host, &de.compute)?;
         }
+        {
+            let mut ncp_v = bd.n_comp_per.slice_view_mut(0, b as usize);
+            ncp_v.copy_from_host_async(&n_comp_per_host, &de.compute)?;
+        }
+        let nrp_view = bd.n_raw_per.slice_view(0, b as usize);
+        let ncp_view = bd.n_comp_per.slice_view(0, b as usize);
+        if ratio == 0 {
+            de.attn_swa.launch_batched(
+                &de.compute,
+                &mut bd.heads,
+                &bd.q_normed,
+                &ls.kv_cache,
+                &dlw.attn_sinks,
+                &nrp_view,
+                N_HEAD,
+                N_HEAD_DIM,
+                b,
+            )?;
+        } else {
+            let cs = ls.compressor.as_ref();
+            let any_comp = n_comp_after.iter().any(|&v| v > 0);
+            let comp_kv_buf = if any_comp { cs.map(|c| &c.comp_kv) } else { None };
+            de.attn_mixed.launch_batched(
+                &de.compute,
+                &mut bd.heads,
+                &bd.q_normed,
+                &ls.kv_cache,
+                comp_kv_buf,
+                &dlw.attn_sinks,
+                &nrp_view,
+                &ncp_view,
+                N_HEAD,
+                N_HEAD_DIM,
+                b,
+            )?;
+        }
+        drop(nrp_view);
+        drop(ncp_view);
 
         // ========================================================
         // Stage 6: Output projection (rope_inv per b, then BATCHED q8)

@@ -132,6 +132,13 @@ pub struct BatchDgpuScratch {
     pub pooled: DeviceBuffer<f32>,
     pub comp_row: DeviceBuffer<f32>,
 
+    // ---- Per-token attention causality (Phase 4) ----
+    /// `[B]` — per-token causal prefix length over raw KV cache.
+    pub n_raw_per: DeviceBuffer<i32>,
+    /// `[B]` — per-token causal prefix length over comp_kv (0 for ratio=0
+    /// layers and for tokens before the first comp boundary).
+    pub n_comp_per: DeviceBuffer<i32>,
+
     // ---- Attention output + output projection ----
     pub heads: DeviceBuffer<f32>,
     pub low: DeviceBuffer<f32>,
@@ -250,6 +257,9 @@ impl BatchDgpuScratch {
             sc_cur: mk_f32((2 * N_HEAD_DIM) as usize)?,
             pooled: mk_f32(N_HEAD_DIM as usize)?,
             comp_row: mk_f32(N_HEAD_DIM as usize)?,
+
+            n_raw_per: mk_i32(1)?,
+            n_comp_per: mk_i32(1)?,
 
             heads: mk_f32(Q_FLAT as usize)?,
             low: mk_f32(OUT_LOW as usize)?,

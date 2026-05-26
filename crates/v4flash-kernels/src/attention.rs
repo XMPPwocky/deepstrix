@@ -129,6 +129,53 @@ impl AttentionSwa {
         };
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
+
+    /// M50 Phase 4: per-token causal SWA attention. Grid (n_head, B, 1).
+    /// `n_raw_per[B]` gives each token's causal prefix length over the
+    /// SHARED `kv` cache. Per-token q[B, n_head, head_dim], out[B, ...].
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        kv: &DeviceBuffer<f32>,
+        sinks: &DeviceBuffer<f32>,
+        n_raw_per: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
+        let function = self.module.get_function("attention_swa_batched")?;
+        let mut out_ptr = out.raw();
+        let mut q_ptr = q.raw();
+        let mut kv_ptr = kv.raw();
+        let mut sinks_ptr = sinks.raw();
+        let mut nrp_ptr = n_raw_per.raw();
+        let mut nh = n_head;
+        let mut hd = head_dim;
+        let mut sc = kq_scale;
+        let mut args: [*mut c_void; 8] = [
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut kv_ptr as *mut _ as *mut c_void,
+            &mut sinks_ptr as *mut _ as *mut c_void,
+            &mut nrp_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (n_head, batch, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
 }
 
 /// Mixed-attention compute — mirrors ds4's `layer_attention_mixed_one_decode_scratch`
@@ -259,6 +306,62 @@ impl AttentionMixed {
 
         let cfg = LaunchConfig {
             grid: (n_head, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
+    /// M50 Phase 4: per-token causal mixed attention. Grid (n_head, B, 1).
+    /// `n_raw_per[B]` and `n_comp_per[B]` give each token's per-cache
+    /// causal prefixes over the SHARED raw_kv and comp_kv buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<f32>,
+        comp_kv: Option<&DeviceBuffer<f32>>,
+        sinks: &DeviceBuffer<f32>,
+        n_raw_per: &DeviceBuffer<i32>,
+        n_comp_per: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
+        let function = self.module.get_function("attention_mixed_batched")?;
+        let mut out_ptr = out.raw();
+        let mut q_ptr = q.raw();
+        let mut raw_ptr = raw_kv.raw();
+        let mut comp_ptr: v4flash_hip::sys::hipDeviceptr_t = match comp_kv {
+            Some(c) => c.raw(),
+            None => std::ptr::null_mut(),
+        };
+        let mut sinks_ptr = sinks.raw();
+        let mut nrp_ptr = n_raw_per.raw();
+        let mut ncp_ptr = n_comp_per.raw();
+        let mut nh = n_head;
+        let mut hd = head_dim;
+        let mut sc = kq_scale;
+        let mut args: [*mut c_void; 10] = [
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut raw_ptr as *mut _ as *mut c_void,
+            &mut comp_ptr as *mut _ as *mut c_void,
+            &mut sinks_ptr as *mut _ as *mut c_void,
+            &mut nrp_ptr as *mut _ as *mut c_void,
+            &mut ncp_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (n_head, batch, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };

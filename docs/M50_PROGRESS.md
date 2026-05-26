@@ -58,8 +58,11 @@ All v0 designs: `grid.z = B` parallel WGs, no W-amortization across batch (each 
 
 Added `iq2_xxs_pair_matvec_fused_swiglu_batch_BxN` and `q2_k_matvec_par_batched_BxN` (grid.z = B). Added `BatchIgpuScratch` with B-extended buffers. Stage 11 in `forward_layer_batch_v2` now does a single batched peer-push + 4 batched iGPU kernel launches + single batched peer-push back — replaces the per-batch serial loop. Bit-identical oracle at B=7. Batching is **by token** (each WG handles one (row_block, slot, token) triple) — no SGLang-style expert-major grouping, because at B=64 / 256 experts / top-6 the expected unique-experts-touched is ~78% (avg reuse ≈ 1.9×), so per-expert amortization is small.
 
-### 🔲 Phase 4: per-token causal attention
-`attn_swa_batched` and `attn_mixed_batched` with per-batch `n_kv[b]` array. Each token attends to a different KV prefix (causal). KV cache is shared.
+### ✅ Phase 4: per-token causal attention
+
+`attention_swa_batched` + `attention_mixed_batched` (grid `(n_head, B, 1)`) consume per-token `n_raw_per[B]` / `n_comp_per[B]` device buffers. Stage 5 in v2 now uploads those snapshots via `copy_from_host_async` (FIFO with the subsequent attention launch — sync `copy_from_host` would fence the device and erase the win). Bit-identical oracle at B=7. Bench: B=64 = 67.7 tok/s (+9% over Phase 3).
+
+NB: gain is modest because the per-WG work is uneven (token b=0 attends to 1 KV row, token b=B-1 to B). Wave-quantization tail latency means ~B× WGs don't fully parallelize. A future variant could decompose the kv-axis sum across multiple WGs and reduce; deferred until profiler tells us it's worth it.
 
 ### ✅ Phase 5: HcSinkhorn batched kernel
 Done as part of Phase 2's kernel batch.
@@ -128,8 +131,21 @@ crates/v4flash-kernels/
   | 32 |      63.93 |        62.90 |          15.6 |       1.42× |
   | 64 |      62.15 |        61.55 |          16.1 |       1.44× |
 
-  ~62-64 tok/s = **2.3× single-token decode**. Plateau likely from attention
-  still per-batch + per-batch wide router matvec.
+  ~62-64 tok/s = **2.3× single-token**. Plateau from attention still per-batch
+  + per-batch wide router matvec.
 
-- Phase 4 target at B=64: 100+ tok/s (attention batched)
+- **Phase 4 v2 measured** — all stages batched (attention via grid `(n_head, B, 1)`,
+  per-token causal `n_raw_per[B]` device buffer):
+
+  | B  | best tok/s | median tok/s | ms/tok (best) | vs Phase 3 |
+  |----|-----------:|-------------:|--------------:|-----------:|
+  |  7 |      55.77 |        55.75 |          17.9 |       1.06× |
+  | 16 |      62.94 |        62.93 |          15.9 |       1.03× |
+  | 32 |      66.96 |        66.84 |          14.9 |       1.05× |
+  | 64 |      67.68 |        67.65 |          14.8 |       1.09× |
+
+  ~68 tok/s = **2.4× single-token**. Modest gain because per-WG attention
+  work is uneven (b=0: 1 KV row; b=63: 64 rows) → wave-quantization tail
+  latency dampens the launch-overhead savings.
+
 - Phase 6 target on 200-token prompt: ≥ 150 tok/s with `last_only=true`
