@@ -28,13 +28,13 @@ use color_eyre::eyre::{self, eyre};
 use crate::forward::{
     hash_router_select, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
     EXPERT_WEIGHT_SCALE, GROUP_DIM, HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED,
-    N_FF_SHARED, N_GROUPS, N_HC, N_HEAD, N_HEAD_DIM, N_LAYER, N_LORA_Q, N_ROT, OUT_LOW, Q_FLAT,
-    RANK, RMS_EPS, SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW,
+    N_FF_SHARED, N_GROUPS, N_HC, N_HEAD, N_HEAD_DIM, N_LAYER, N_LORA_Q, N_ROT, N_VOCAB, OUT_LOW,
+    Q_FLAT, RANK, RMS_EPS, SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW,
 };
 
-use super::batch_scratch::{BatchDgpuScratch, BatchIgpuScratch, BatchScratch};
+use super::batch_scratch::{BatchDgpuScratch, BatchIgpuScratch, BatchScratch, B_MAX};
 use super::engine::HeterogeneousEngine;
-use super::scratch::IgpuScratch;
+use super::scratch::{DgpuScratch, IgpuScratch};
 use super::state::{HetLayerState, HetModelState};
 use super::sync::{peer_push_f32, peer_push_i32};
 use super::weights::{DgpuLayerWeights, HetModelWeights, IgpuLayerWeights};
@@ -251,6 +251,104 @@ impl HeterogeneousEngine {
         // Drain any pending async work.
         self.dgpu.compute.synchronize()?;
         Ok(())
+    }
+
+    /// M50 Phase 6: chunked prefill driver. Processes `tokens` (length T)
+    /// through the v2 batched pipeline in chunks of CHUNK_SIZE=B_MAX. State
+    /// carries across chunks via `state.layers[*].{kv_cache,n_raw,compressor}`
+    /// (the per-layer fields just keep growing — no special handling).
+    ///
+    /// Returns logits:
+    /// * `last_only=true`: `[N_VOCAB]` for the last token only — typical
+    ///   generation start path. Each per-token head is ~16 ms; skipping
+    ///   all but the last saves ~T × head_cost wall on the prefill.
+    /// * `last_only=false`: `[T × N_VOCAB]` — full per-token logits, for
+    ///   prompt-eval / log-prob scoring.
+    ///
+    /// `head_scratch` is a single-token `DgpuScratch` used for the head
+    /// matvec — the head buffers (`head_flat`, `head_pre`, …, `logits`)
+    /// aren't B-extended in `BatchDgpuScratch` yet. Per-token head is fast
+    /// enough that this isn't on the critical path for `last_only=true`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill(
+        &self,
+        bd: &mut BatchDgpuScratch,
+        bi: &mut BatchIgpuScratch,
+        head_scratch: &mut DgpuScratch,
+        state: &mut HetModelState,
+        weights: &HetModelWeights,
+        input_hcs: &[Vec<f32>],
+        tokens: &[i32],
+        pos0: u32,
+        last_only: bool,
+    ) -> eyre::Result<Vec<f32>> {
+        let t = tokens.len();
+        if t == 0 {
+            return Ok(Vec::new());
+        }
+        if input_hcs.len() != t {
+            return Err(eyre!(
+                "forward_prefill: input_hcs len {} != tokens len {t}",
+                input_hcs.len()
+            ));
+        }
+        let chunk_size = B_MAX;
+        let cs_hc = HC_DIM as usize;
+        let cs_vocab = N_VOCAB as usize;
+
+        let mut out_logits: Vec<f32> = if last_only {
+            Vec::with_capacity(cs_vocab)
+        } else {
+            Vec::with_capacity(t * cs_vocab)
+        };
+
+        let mut chunk_start = 0usize;
+        while chunk_start < t {
+            let chunk_end = (chunk_start + chunk_size).min(t);
+            let chunk_b = chunk_end - chunk_start;
+            let is_last_chunk = chunk_end == t;
+            let chunk_input = &input_hcs[chunk_start..chunk_end];
+            let chunk_tokens = &tokens[chunk_start..chunk_end];
+            let chunk_pos0 = pos0 + chunk_start as u32;
+
+            self.forward_prompt_batch_v2(
+                bd,
+                bi,
+                state,
+                weights,
+                chunk_input,
+                chunk_tokens,
+                chunk_pos0,
+            )?;
+
+            // residual post-loop holds layer-N output in bd.residual (43
+            // layers + 43 swaps = even number of mutations to residual).
+            if last_only {
+                if is_last_chunk {
+                    let last_b = chunk_b - 1;
+                    head_scratch.residual.copy_from_buffer(
+                        &bd.residual.slice_view(last_b * cs_hc, cs_hc),
+                    )?;
+                    self.forward_head(head_scratch, &weights.global)?;
+                    let mut logits = vec![0f32; cs_vocab];
+                    head_scratch.logits.copy_to_host(&mut logits)?;
+                    out_logits = logits;
+                }
+            } else {
+                for i in 0..chunk_b {
+                    head_scratch
+                        .residual
+                        .copy_from_buffer(&bd.residual.slice_view(i * cs_hc, cs_hc))?;
+                    self.forward_head(head_scratch, &weights.global)?;
+                    let mut logits = vec![0f32; cs_vocab];
+                    head_scratch.logits.copy_to_host(&mut logits)?;
+                    out_logits.extend_from_slice(&logits);
+                }
+            }
+
+            chunk_start = chunk_end;
+        }
+        Ok(out_logits)
     }
 }
 

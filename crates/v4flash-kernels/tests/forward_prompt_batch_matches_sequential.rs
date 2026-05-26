@@ -24,9 +24,10 @@ use std::path::PathBuf;
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
+use v4flash_kernels::forward::N_VOCAB;
 use v4flash_kernels::het::{
-    BatchDgpuScratch, BatchIgpuScratch, BatchScratch, ExecMode, HetModelState, HetModelWeights,
-    HeterogeneousEngine,
+    BatchDgpuScratch, BatchIgpuScratch, BatchScratch, DgpuScratch, ExecMode, HetModelState,
+    HetModelWeights, HeterogeneousEngine,
 };
 use v4flash_kernels::{ActivationDump, RopeParams};
 
@@ -557,5 +558,104 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
     } else {
         eprintln!(">>> all layers within 1e-2");
     }
+    Ok(())
+}
+
+/// M50 Phase 6 oracle: forward_prefill with last_only=true returns logits
+/// matching what you'd get from B sequential forward_token + forward_head
+/// calls on the same prompt. T<=7 (single chunk for the dump-real test).
+#[test]
+#[ignore]
+fn forward_prefill_last_only_matches_sequential() -> eyre::Result<()> {
+    install_panic_handler()?;
+    use v4flash_kernels::forward::HC_DIM;
+
+    let t: usize = std::env::var("BENCH_B")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7)
+        .min(PROMPT_TOKENS.len());
+    eprintln!("Phase 6 oracle: T={t} (single chunk)");
+
+    let dump = ActivationDump::open(dump_dir())?;
+    let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
+    let dgpu = pick_dgpu()?;
+    let igpu = pick_igpu()?;
+    let dgpu_arch = dgpu.properties()?.gcn_arch_name;
+    let igpu_arch = igpu.properties()?.gcn_arch_name;
+
+    let rope_for_layer = |layer: i32| -> eyre::Result<RopeParams> {
+        let entry = dump
+            .weight("rope_params", layer)
+            .ok_or_else(|| eyre!("missing rope_params L{layer}"))?;
+        let floats = dump.read_f32(entry)?;
+        let n_ctx_orig = if floats[2] != 0.0 { ROPE_ORIG_CTX } else { 0 };
+        RopeParams::from_dump_blob(&floats, n_ctx_orig)
+    };
+    let main_weights = HetModelWeights::load_all(&main_gguf, dgpu, igpu, &rope_for_layer)?;
+    let engine =
+        HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
+
+    let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(t);
+    for i in 0..t {
+        let entry = dump
+            .tensor("layer_input_residual", 0, i as i32)
+            .ok_or_else(|| eyre!("missing layer_input_residual L0 T{i}"))?;
+        input_hcs.push(dump.read_f32(entry)?);
+    }
+    let tokens: Vec<i32> = PROMPT_TOKENS[..t].to_vec();
+
+    // Reference: T sequential forward_token + final forward_head on the last.
+    eprintln!("Run A: sequential forward_token × {t} + forward_head");
+    let mut bs = BatchScratch::alloc(dgpu, igpu)?;
+    let mut seq_state = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
+    for i in 0..t {
+        engine.forward_token(
+            &mut bs.shared_dgpu,
+            &mut bs.shared_igpu,
+            &mut seq_state,
+            &main_weights,
+            &input_hcs[i],
+            i as u32,
+            tokens[i],
+        )?;
+    }
+    // Last token's residual is in shared_dgpu.residual_next after forward_token.
+    bs.shared_dgpu
+        .residual
+        .copy_from_buffer(&bs.shared_dgpu.residual_next)?;
+    engine.forward_head(&mut bs.shared_dgpu, &main_weights.global)?;
+    let mut seq_logits = vec![0f32; N_VOCAB as usize];
+    bs.shared_dgpu.logits.copy_to_host(&mut seq_logits)?;
+
+    // Phase 6: forward_prefill in one shot, last_only=true.
+    eprintln!("Run B: forward_prefill (last_only=true)");
+    let mut bd = BatchDgpuScratch::alloc(dgpu)?;
+    let mut bi = BatchIgpuScratch::alloc(igpu)?;
+    let mut head_scratch = DgpuScratch::alloc(dgpu)?;
+    let mut p6_state = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
+    let prefill_logits = engine.forward_prefill(
+        &mut bd,
+        &mut bi,
+        &mut head_scratch,
+        &mut p6_state,
+        &main_weights,
+        &input_hcs,
+        &tokens,
+        0,
+        true,
+    )?;
+    assert_eq!(prefill_logits.len(), N_VOCAB as usize);
+
+    let (maxd, idx) = max_abs_diff(&seq_logits, &prefill_logits);
+    eprintln!(
+        "max abs diff = {maxd:.4e} @i={idx}  ref={:.4}  prefill={:.4}",
+        seq_logits[idx], prefill_logits[idx]
+    );
+    assert!(
+        maxd < 5e-2,
+        "forward_prefill last_only diverges from sequential by {maxd:.4e} (> 5e-2)"
+    );
+    eprintln!("Phase 6 ORACLE PASS within 5e-2");
     Ok(())
 }

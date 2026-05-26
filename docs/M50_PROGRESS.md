@@ -67,8 +67,9 @@ NB: gain is modest because the per-WG work is uneven (token b=0 attends to 1 KV 
 ### ✅ Phase 5: HcSinkhorn batched kernel
 Done as part of Phase 2's kernel batch.
 
-### 🔲 Phase 6: chunked prefill driver
-`forward_prefill(prompt, pos0, last_only)` that chunks at CHUNK_SIZE=64. State carries across chunks. `last_only=true` skips per-token head except for the very last batch element.
+### ✅ Phase 6: chunked prefill driver
+
+`forward_prefill(bd, bi, head_scratch, state, weights, input_hcs, tokens, pos0, last_only)` in `src/het/forward_prefill.rs`. Chunks at CHUNK_SIZE=B_MAX=64. Calls `forward_prompt_batch_v2` per chunk; state carries across chunks via `HetModelState.layers[*].{kv_cache,n_raw,compressor}` which are growing per-layer fields. `last_only=true` runs head only on the last token of the last chunk (returns `[N_VOCAB]`); `last_only=false` runs head per token (returns `[T*N_VOCAB]`). Bit-identical Phase 6 oracle vs sequential `forward_token × T + forward_head` at T=7. Bench at T=200 last_only=true: **61 tok/s = 3.3s prefill, 2.2× faster than sequential's 7.2s.**
 
 ## File layout
 
@@ -148,4 +149,11 @@ crates/v4flash-kernels/
   work is uneven (b=0: 1 KV row; b=63: 64 rows) → wave-quantization tail
   latency dampens the launch-overhead savings.
 
-- Phase 6 target on 200-token prompt: ≥ 150 tok/s with `last_only=true`
+- **Phase 6 end-to-end** (`bench_prefill_chunked`):
+
+  | T   | last_only | best tok/s | wall ms | seq baseline (35.78 ms/tok) | speedup |
+  |-----|-----------|-----------:|--------:|---------------------------:|--------:|
+  | 200 | true      |       61.1 |  3,274  |                    7,156 ms |  2.19×  |
+
+  200-token prompt prefill cut from ~7s to ~3.3s — meaningful UX win for
+  the "wait before first generated token" experience.

@@ -19,8 +19,8 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::het::{
-    BatchDgpuScratch, BatchIgpuScratch, BatchScratch, ExecMode, HetModelState, HetModelWeights,
-    HeterogeneousEngine,
+    BatchDgpuScratch, BatchIgpuScratch, BatchScratch, DgpuScratch, ExecMode, HetModelState,
+    HetModelWeights, HeterogeneousEngine,
 };
 use v4flash_kernels::{ActivationDump, RopeParams};
 
@@ -285,5 +285,132 @@ fn bench_prefill_v2() -> eyre::Result<()> {
     );
     eprintln!("reference: single-token decode = 35.78 ms/tok = 27.95 tok/s (master p50)");
     eprintln!("reference: Phase 1 (looped) = 77 ms/tok @ B=7 (forfeits M30 graphs)");
+    Ok(())
+}
+
+/// M50 Phase 6 bench: end-to-end chunked prefill on arbitrary-length T
+/// via repeated dump inputs. Reports total wall + effective tok/s for the
+/// full prefill (not per-chunk). T defaults to 200, last_only=true.
+#[test]
+#[ignore]
+fn bench_prefill_chunked() -> eyre::Result<()> {
+    install_panic_handler()?;
+    use v4flash_kernels::forward::HC_DIM;
+
+    let t: usize = std::env::var("BENCH_T")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+    let last_only: bool = std::env::var("BENCH_LAST_ONLY")
+        .ok()
+        .and_then(|s| s.parse::<u8>().ok())
+        .map(|v| v != 0)
+        .unwrap_or(true);
+    let n_warmup: usize = std::env::var("BENCH_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let n_iters: usize = std::env::var("BENCH_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    eprintln!(
+        "bench_prefill_chunked: T={t}, last_only={last_only}, warmup={n_warmup}, iters={n_iters}"
+    );
+
+    let dump = ActivationDump::open(dump_dir())?;
+    let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
+    let dgpu = pick_dgpu()?;
+    let igpu = pick_igpu()?;
+    let dgpu_arch = dgpu.properties()?.gcn_arch_name;
+    let igpu_arch = igpu.properties()?.gcn_arch_name;
+    let rope_for_layer = |layer: i32| -> eyre::Result<RopeParams> {
+        let entry = dump
+            .weight("rope_params", layer)
+            .ok_or_else(|| eyre!("missing rope_params L{layer}"))?;
+        let floats = dump.read_f32(entry)?;
+        let n_ctx_orig = if floats[2] != 0.0 { ROPE_ORIG_CTX } else { 0 };
+        RopeParams::from_dump_blob(&floats, n_ctx_orig)
+    };
+    eprintln!("loading main weights...");
+    let main_weights = HetModelWeights::load_all(&main_gguf, dgpu, igpu, &rope_for_layer)?;
+    let engine =
+        HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
+    let mut bd = BatchDgpuScratch::alloc(dgpu)?;
+    let mut bi = BatchIgpuScratch::alloc(igpu)?;
+    let mut head_scratch = DgpuScratch::alloc(dgpu)?;
+
+    let n_real = PROMPT_TOKENS.len();
+    let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(t);
+    let mut tokens: Vec<i32> = Vec::with_capacity(t);
+    for i in 0..t {
+        let src_i = i % n_real;
+        let entry = dump
+            .tensor("layer_input_residual", 0, src_i as i32)
+            .ok_or_else(|| eyre!("missing layer_input_residual L0 T{src_i}"))?;
+        let hc = dump.read_f32(entry)?;
+        assert_eq!(hc.len(), HC_DIM as usize);
+        input_hcs.push(hc);
+        tokens.push(PROMPT_TOKENS[src_i]);
+    }
+    if t > n_real {
+        eprintln!("(T>{n_real}: repeating real inputs cyclically — timing only)");
+    }
+
+    eprintln!("warmup × {n_warmup}");
+    for _ in 0..n_warmup {
+        let mut state = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
+        let _ = engine.forward_prefill(
+            &mut bd,
+            &mut bi,
+            &mut head_scratch,
+            &mut state,
+            &main_weights,
+            &input_hcs,
+            &tokens,
+            0,
+            last_only,
+        )?;
+    }
+    let mut walls_ms: Vec<f64> = Vec::with_capacity(n_iters);
+    for it in 0..n_iters {
+        let mut state = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
+        let t0 = Instant::now();
+        let _ = engine.forward_prefill(
+            &mut bd,
+            &mut bi,
+            &mut head_scratch,
+            &mut state,
+            &main_weights,
+            &input_hcs,
+            &tokens,
+            0,
+            last_only,
+        )?;
+        let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        walls_ms.push(wall_ms);
+        eprintln!(
+            "  iter {it}: wall={:.2} ms  ({:.2} ms/tok = {:.2} tok/s)",
+            wall_ms,
+            wall_ms / t as f64,
+            (t as f64 * 1000.0) / wall_ms
+        );
+    }
+    walls_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median_ms = walls_ms[walls_ms.len() / 2];
+    let min_ms = walls_ms[0];
+    eprintln!("\n=== BENCH PREFILL CHUNKED T={t} last_only={last_only} ===");
+    eprintln!(
+        "best wall:   {:.2} ms ({:.2} ms/tok = {:.2} tok/s)",
+        min_ms,
+        min_ms / t as f64,
+        (t as f64 * 1000.0) / min_ms
+    );
+    eprintln!(
+        "median wall: {:.2} ms ({:.2} ms/tok = {:.2} tok/s)",
+        median_ms,
+        median_ms / t as f64,
+        (t as f64 * 1000.0) / median_ms
+    );
     Ok(())
 }
