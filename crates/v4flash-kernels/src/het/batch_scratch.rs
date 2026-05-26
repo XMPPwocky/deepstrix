@@ -193,6 +193,15 @@ pub struct BatchIgpuScratch {
     pub ffn_moe: DeviceBuffer<f32>,
     pub d_selected: DeviceBuffer<i32>,
     pub d_ew: DeviceBuffer<f32>,
+    /// Phase 7 by-expert: per-expert pick count built by the group_builder
+    /// pre-pass. `[n_expert]` i32. MUST be zeroed before each layer's pre-pass.
+    pub group_count: DeviceBuffer<i32>,
+    /// Phase 7 by-expert: per-expert (b, slot) member lists, packed as
+    /// `(b << 16) | slot`. `[n_expert × max_per_expert]` i32. Only the first
+    /// `group_count[e]` entries per expert are valid after the pre-pass.
+    /// `max_per_expert = B_MAX` (worst case: every token picks the same expert
+    /// in some slot — still fits since each token contributes ≤ n_used picks).
+    pub expert_members: DeviceBuffer<i32>,
 }
 
 impl BatchIgpuScratch {
@@ -215,7 +224,14 @@ impl BatchIgpuScratch {
             ffn_moe: DeviceBuffer::new(id, b * N_EMBD as usize)?,
             d_selected: DeviceBuffer::new(id, b * N_EXPERT_USED as usize)?,
             d_ew: DeviceBuffer::new(id, b * N_EXPERT_USED as usize)?,
+            group_count: DeviceBuffer::new(id, N_EXPERT as usize)?,
+            expert_members: DeviceBuffer::new(id, (N_EXPERT as usize) * b)?,
         })
+    }
+
+    /// Max per-expert group capacity (= B_MAX). Used by Stage 11's by-expert path.
+    pub fn max_per_expert(&self) -> u32 {
+        B_MAX as u32
     }
 }
 

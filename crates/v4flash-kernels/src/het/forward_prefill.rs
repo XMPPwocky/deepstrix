@@ -1035,35 +1035,68 @@ impl HeterogeneousEngine {
         drop(bi_sel);
         drop(bi_ew);
 
-        // Single batched iGPU MoE call chain. No captured graph (the
-        // single-token graph baked in N_USED-sized buffer pointers; v2
-        // uses B*N_USED-sized buffers in bi). Phase 3 v0: direct launches.
+        // Single batched iGPU MoE call chain. Phase 7: by-expert dispatch
+        // for iq2. q2_k stays by-token for now (could also be by-expert
+        // but smaller perf lever).
         self.set_current_cached(self.igpu.device)?;
         let ie = &self.igpu;
-        // q8k quantize ain[B*N_EMBD] → d_xq_q8k[B*blocks]. The kernel is
-        // layout-agnostic; just stretch n_blocks by B.
+        // q8k quantize ain[B*N_EMBD] → d_xq_q8k[B*blocks].
         ie.q8k.launch(
             &ie.compute,
             &mut bi.d_xq_q8k,
             &bi.ffn_input_norm_recv,
             crate::forward::BLOCKS_Q8K_GATE_IN * b,
         )?;
-        ie.iq2.launch_fused_swiglu_batch_bxn(
-            &ie.compute,
-            &mut bi.d_mid_cat,
-            &ilw.routed.gate.buffer,
-            &ilw.routed.up.buffer,
-            &bi.d_xq_q8k,
-            &bi.d_ew,
-            &bi.d_selected,
-            gbpe,
-            ubpe,
-            cs_n_used as u32,
-            crate::forward::SWIGLU_CLAMP_EXP,
-            crate::forward::N_FF_EXP,
-            crate::forward::BLOCKS_Q8K_GATE_IN,
-            b,
-        )?;
+        // Phase 7 pre-pass: invert d_selected into per-expert groups.
+        // Zero group_count first.
+        let max_per_expert = bi.max_per_expert();
+        bi.group_count.fill_zero()?;
+        {
+            let BatchIgpuScratch {
+                group_count,
+                expert_members,
+                d_selected,
+                ..
+            } = bi;
+            ie.moe_group_builder.launch(
+                &ie.compute,
+                group_count,
+                expert_members,
+                d_selected,
+                b,
+                cs_n_used as u32,
+                N_EXPERT,
+                max_per_expert,
+            )?;
+        }
+        {
+            let BatchIgpuScratch {
+                d_mid_cat,
+                d_xq_q8k,
+                d_ew,
+                group_count,
+                expert_members,
+                ..
+            } = bi;
+            ie.iq2.launch_fused_swiglu_by_expert(
+                &ie.compute,
+                d_mid_cat,
+                &ilw.routed.gate.buffer,
+                &ilw.routed.up.buffer,
+                d_xq_q8k,
+                d_ew,
+                group_count,
+                expert_members,
+                gbpe,
+                ubpe,
+                cs_n_used as u32,
+                N_EXPERT,
+                max_per_expert,
+                crate::forward::SWIGLU_CLAMP_EXP,
+                crate::forward::N_FF_EXP,
+                crate::forward::BLOCKS_Q8K_GATE_IN,
+            )?;
+        }
         ie.q8k.launch(
             &ie.compute,
             &mut bi.d_midq_cat,

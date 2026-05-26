@@ -481,4 +481,76 @@ impl Iq2XxsPairMatvec {
         };
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
+
+    /// M50 Phase 7 by-expert iq2 fused-swiglu. Grid (n_rows/8, n_expert, 1).
+    /// Each WG handles one (row_block, expert) pair; iterates over all
+    /// (token, slot) members that picked this expert (built by the
+    /// `moe_group_builder` pre-pass kernel). Expected ~6× weight-BW
+    /// amortization at B=64 vs the by-token batched variant, based on
+    /// measured per-expert reuse stats.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_by_expert(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,         // [B, n_used, n_rows]
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,               // [B, n_blocks*292]
+        expert_w: &DeviceBuffer<f32>,        // [B, n_used]
+        group_count: &DeviceBuffer<i32>,     // [n_expert]
+        expert_members: &DeviceBuffer<i32>,  // [n_expert * max_per_expert]
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        n_expert: u32,
+        max_per_expert: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+    ) -> eyre::Result<()> {
+        if n_rows % 8 != 0 {
+            return Err(eyre!(
+                "iq2_xxs by_expert: n_rows={n_rows} must be multiple of 8"
+            ));
+        }
+        let function = self
+            .module
+            .get_function("iq2_xxs_pair_matvec_fused_swiglu_by_expert")?;
+        let mut mid_ptr = mid.raw();
+        let mut gw_ptr = gate_w_base.raw();
+        let mut uw_ptr = up_w_base.raw();
+        let mut xq_ptr = xq.raw();
+        let mut ew_ptr = expert_w.raw();
+        let mut gc_ptr = group_count.raw();
+        let mut em_ptr = expert_members.raw();
+        let mut gbpe = gate_bpe;
+        let mut ubpe = up_bpe;
+        let mut nu = n_used;
+        let mut mpe = max_per_expert;
+        let mut clamp_v = clamp;
+        let mut nr = n_rows;
+        let mut nb = n_blocks;
+        let mut args: [*mut c_void; 14] = [
+            &mut mid_ptr as *mut _ as *mut c_void,
+            &mut gw_ptr as *mut _ as *mut c_void,
+            &mut uw_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut ew_ptr as *mut _ as *mut c_void,
+            &mut gc_ptr as *mut _ as *mut c_void,
+            &mut em_ptr as *mut _ as *mut c_void,
+            &mut gbpe as *mut _ as *mut c_void,
+            &mut ubpe as *mut _ as *mut c_void,
+            &mut nu as *mut _ as *mut c_void,
+            &mut mpe as *mut _ as *mut c_void,
+            &mut clamp_v as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, n_expert, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
 }

@@ -105,6 +105,9 @@ pub struct DeviceEngine {
     pub kv_append: KvCacheAppend,
     pub comp_kv_append: CompKvAppend,
     pub router_topk: RouterTopk,
+    /// M50 Phase 7: by-expert MoE pre-pass — inverts d_selected into per-
+    /// expert (token, slot) lists. Only loaded on iGPU (where iq2 runs).
+    pub moe_group_builder: crate::moe_group_builder::MoeGroupBuilder,
 
     /// Per-device event pool for kernel-scope timing (M13.2). Use
     /// `events.stage(name, &compute)` to wrap a kernel-group.
@@ -167,6 +170,7 @@ impl DeviceEngine {
             kv_append: KvCacheAppend::for_arch(arch)?,
             comp_kv_append: CompKvAppend::for_arch(arch)?,
             router_topk: RouterTopk::for_arch(arch)?,
+            moe_group_builder: crate::moe_group_builder::MoeGroupBuilder::for_arch(arch)?,
             events,
         })
     }
