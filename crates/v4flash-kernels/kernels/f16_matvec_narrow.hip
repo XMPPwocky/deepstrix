@@ -118,3 +118,42 @@ extern "C" __global__ void f16_matvec_narrow_two_inputs(
         }
     }
 }
+
+// M50 Phase 2: batched narrow f16 matvec. Grid (n_rows, 1, B), block (256).
+// Per-batch x[B, k], out[B, n_rows]. Weight shared.
+extern "C" __global__ void f16_matvec_narrow_batched(
+        float          * __restrict__ out,        // [B, n_rows]
+        const __half   * __restrict__ weight,     // [n_rows, k]
+        const float    * __restrict__ x,          // [B, k]
+        unsigned int     k,
+        unsigned int     n_rows) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t b = blockIdx.z;
+    if (row >= n_rows) return;
+
+    const __half *wr = weight + (size_t)row * (size_t)k;
+    const float  *xb = x + (size_t)b * (size_t)k;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & (F16N_WARP - 1u);
+    const uint32_t warp = tid >> 5u;
+
+    float acc = 0.0f;
+    for (uint32_t i = tid; i < k; i += F16N_BLOCK_THREADS) {
+        acc += __half2float(wr[i]) * xb[i];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down(acc, offset, F16N_WARP);
+    }
+    __shared__ float per_warp[F16N_MAX_WARPS];
+    if (lane == 0) per_warp[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < F16N_MAX_WARPS) ? per_warp[lane] : 0.0f;
+        for (int offset = F16N_MAX_WARPS / 2; offset > 0; offset >>= 1) {
+            v += __shfl_down(v, offset, F16N_WARP);
+        }
+        if (lane == 0) {
+            out[(size_t)b * (size_t)n_rows + row] = v;
+        }
+    }
+}

@@ -193,6 +193,60 @@ impl F16Matvec {
         }
     }
 
+    /// M50 Phase 2: batched narrow f16 matvec with grid.z = B. For each
+    /// batch element, computes `out[b, r] = sum_i f32(W[r,i]) * x[b,i]`.
+    /// Uses the narrow kernel (1 block per row, 256 threads cooperating)
+    /// suitable for small n_rows. Wide variant for B not implemented yet —
+    /// fall back to per-batch loop if n_rows >= NARROW_ROWS_THRESHOLD.
+    pub fn matvec_narrow_batched(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        x: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let expected_w = (n_rows as usize) * (k as usize) * 2;
+        if weight.byte_len() != expected_w {
+            return Err(eyre!(
+                "f16 matvec_narrow_batched weight bytes: {} != {}",
+                weight.byte_len(),
+                expected_w
+            ));
+        }
+        if x.len() < (batch as usize) * (k as usize) {
+            return Err(eyre!("f16 matvec_narrow_batched x: too small"));
+        }
+        if out.len() < (batch as usize) * (n_rows as usize) {
+            return Err(eyre!("f16 matvec_narrow_batched out: too small"));
+        }
+
+        let mut out_ptr = out.raw();
+        let mut w_ptr = weight.raw();
+        let mut x_ptr = x.raw();
+        let mut k_v = k;
+        let mut n_rows_v = n_rows;
+        let mut args: [*mut c_void; 5] = [
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut w_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut k_v as *mut _ as *mut c_void,
+            &mut n_rows_v as *mut _ as *mut c_void,
+        ];
+        let function = self.narrow.get_function("f16_matvec_narrow_batched")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows, 1, batch),
+            block: (NARROW_BLOCK_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
     /// M40-P4.5: 2-wide pair variant — ONE weight, TWO input vectors → TWO
     /// outputs. Halves W bandwidth vs running `matvec` twice. NB: this is
     /// the OPPOSITE pattern from `matvec_pair` (which shares ONE input

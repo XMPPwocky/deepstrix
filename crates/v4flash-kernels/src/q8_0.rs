@@ -446,6 +446,82 @@ impl Q8_0GroupedMatvec {
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
 
+    /// M50 Phase 2: batched grouped GEMV with `grid.z = B`. Per-batch
+    /// xq[B, n_groups*group_dim], xscale[B, n_groups*blocks_per_group],
+    /// out[B, n_groups*rank]. Weight shared across batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_grouped_batched(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        group_dim: u32,
+        rank: u32,
+        n_groups: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        if group_dim % Q8_0_BLOCK_ELEMS != 0 {
+            return Err(eyre!(
+                "q8_0 grouped matvec_batched: group_dim={group_dim} not %32"
+            ));
+        }
+        let blocks_per_group = group_dim / Q8_0_BLOCK_ELEMS;
+        let out_dim = n_groups * rank;
+        let expected_weight_bytes =
+            (out_dim as usize) * (blocks_per_group as usize) * (Q8_0_BLOCK_BYTES as usize);
+        if weight.byte_len() != expected_weight_bytes {
+            return Err(eyre!(
+                "q8_0 grouped matvec_batched weight bytes: {}!={expected_weight_bytes}",
+                weight.byte_len()
+            ));
+        }
+        let per_batch_in = (n_groups as usize) * (group_dim as usize);
+        let per_batch_scales = (n_groups as usize) * (blocks_per_group as usize);
+        if xq.len() < (batch as usize) * per_batch_in
+            || xscale.len() < (batch as usize) * per_batch_scales
+            || out.len() < (batch as usize) * (out_dim as usize)
+        {
+            return Err(eyre!(
+                "q8_0 grouped matvec_batched: buffer too small for batch={batch} (xq {} xs {} out {})",
+                xq.len(), xscale.len(), out.len()
+            ));
+        }
+
+        let function = self.module.get_function("q8_0_grouped_gemv_batched")?;
+        let mut out_ptr = out.raw();
+        let mut w_ptr = weight.raw();
+        let mut xq_ptr = xq.raw();
+        let mut xs_ptr = xscale.raw();
+        let mut group_dim_v = group_dim;
+        let mut rank_v = rank;
+        let mut bpg_v = blocks_per_group;
+        let mut n_groups_v = n_groups;
+        let mut args: [*mut c_void; 8] = [
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut w_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut xs_ptr as *mut _ as *mut c_void,
+            &mut group_dim_v as *mut _ as *mut c_void,
+            &mut rank_v as *mut _ as *mut c_void,
+            &mut bpg_v as *mut _ as *mut c_void,
+            &mut n_groups_v as *mut _ as *mut c_void,
+        ];
+
+        let grid_x = out_dim.div_ceil(GEMV_ROWS_PER_BLOCK);
+        let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, batch),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
     /// M40-P4.5: 2-wide pair variant of grouped GEMV. Same weight, two
     /// input vectors → two outputs in one launch. Halves W BW vs running
     /// twice.

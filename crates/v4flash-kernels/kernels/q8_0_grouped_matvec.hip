@@ -136,3 +136,46 @@ extern "C" __global__ void q8_0_grouped_gemv_pair(
         out_b[row] = acc_b;
     }
 }
+
+// M50 Phase 2: batched grouped GEMV with grid.z = B. Each WG handles
+// one (output_row, batch) pair. Per-batch inputs/outputs at offset
+// `batch * (n_groups * group_dim)` for xq, `batch * (n_groups *
+// blocks_per_group)` for xscale, and `batch * out_dim` for out.
+// Weight is shared across batch.
+extern "C" __global__ void q8_0_grouped_gemv_batched(
+        float        * __restrict__ out,         // [B, n_groups * rank]
+        const unsigned char * __restrict__ w,    // [n_groups * rank, blocks_per_group * 34]
+        const int8_t * __restrict__ xq,          // [B, n_groups * group_dim]
+        const float  * __restrict__ xscale,      // [B, n_groups * blocks_per_group]
+        unsigned int   group_dim,
+        unsigned int   rank,
+        unsigned int   blocks_per_group,
+        unsigned int   n_groups)
+{
+    uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    uint32_t b = blockIdx.z;
+    uint32_t out_dim = n_groups * rank;
+    if (row >= out_dim) return;
+
+    uint32_t g = row / rank;
+    const unsigned char* wr = w + (size_t)row * (size_t)blocks_per_group * 34u;
+    const int8_t* xq_g = xq + (size_t)b * (size_t)(n_groups * group_dim)
+                            + (size_t)g * (size_t)group_dim;
+    const float*  xs_g = xscale + (size_t)b * (size_t)(n_groups * blocks_per_group)
+                                + (size_t)g * (size_t)blocks_per_group;
+
+    const __half* scales = (const __half*)wr;
+    const int8_t* quants = (const int8_t*)(wr + (size_t)blocks_per_group * 2u);
+    float acc = 0.0f;
+    for (uint32_t bl = lane; bl < blocks_per_group; bl += WARP_LANES) {
+        const int8_t* qs = quants + (size_t)bl * 32u;
+        const int8_t* xqb = xq_g + (size_t)bl * 32u;
+        int32_t dot = gdot_i8x32(qs, xqb);
+        acc += __half2float(scales[bl]) * xs_g[bl] * (float)dot;
+    }
+    acc = gwarp_sum_f32(acc);
+    if (lane == 0) {
+        out[(size_t)b * (size_t)out_dim + row] = acc;
+    }
+}
