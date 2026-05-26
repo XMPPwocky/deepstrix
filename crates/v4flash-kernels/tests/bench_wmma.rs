@@ -148,5 +148,37 @@ fn bench_wmma_throughput_igpu() -> eyre::Result<()> {
     eprintln!("\nRDNA3.5 theoretical peak f16 (FMA): {peak_f16_fma_tops:.2} TFLOPs");
     eprintln!("  ({} CUs × {} lanes × 2 fma × {:.2} GHz)", cus_actual, lanes_per_cu, max_clock_ghz);
     eprintln!("Parallel realized vs peak: {:.1}%", par_tops / peak_f16_fma_tops * 100.0);
+
+    // ---- IU8 WMMA bench ----
+    let a_iu8: Vec<i8> = vec![1i8; 16];
+    let b_iu8: Vec<i8> = vec![1i8; 16];
+    let mut a_iu8_in: DeviceBuffer<i8> = DeviceBuffer::new(igpu.id, 16)?;
+    let mut b_iu8_in: DeviceBuffer<i8> = DeviceBuffer::new(igpu.id, 16)?;
+    a_iu8_in.copy_from_host(&a_iu8)?;
+    b_iu8_in.copy_from_host(&b_iu8)?;
+    let mut out_iu8: DeviceBuffer<i32> = DeviceBuffer::new(igpu.id, (n_warps_total as usize) * 8)?;
+
+    probe.launch_iu8_parallel(&stream, &mut out_iu8, &a_iu8_in, &b_iu8_in, 100, n_blocks, block_threads)?;
+    stream.synchronize()?;
+
+    let mut iu8_ms: Vec<f32> = Vec::with_capacity(n_runs);
+    for _ in 0..n_runs {
+        let start = Event::new()?;
+        let end = Event::new()?;
+        start.record(&stream)?;
+        probe.launch_iu8_parallel(&stream, &mut out_iu8, &a_iu8_in, &b_iu8_in, n_iters, n_blocks, block_threads)?;
+        end.record(&stream)?;
+        stream.synchronize()?;
+        iu8_ms.push(Event::elapsed_ms(&start, &end)?);
+    }
+    iu8_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let iu8_min = iu8_ms[0];
+    let iu8_total_ops: u64 = (n_warps_total as u64) * (n_iters as u64) * OPS_PER_WMMA * 8;
+    let iu8_tops = (iu8_total_ops as f64 / 1.0e12) / (iu8_min as f64 / 1000.0);
+    eprintln!("\n=== WMMA IU8 throughput on {arch} ===");
+    eprintln!("Parallel (8 acc/warp):     min {iu8_min:.3} ms  realized {iu8_tops:.2} TOps");
+    eprintln!("Per article (RDNA3 IU8 = 512 ops/clock/CU), theoretical = {:.2} TOps",
+              (cus_actual as f64) * 512.0 * clock_hz / 1.0e12);
+
     Ok(())
 }

@@ -115,3 +115,57 @@ extern "C" __global__ void wmma_f16_throughput_probe_parallel(
         out[base+4]=c[4]; out[base+5]=c[5]; out[base+6]=c[6]; out[base+7]=c[7];
     }
 }
+
+// IU8 (int8 -> int32) WMMA throughput. Same parallel-accumulator
+// pattern as wmma_f16_throughput_probe_parallel. Per-op count:
+// 16*16*16 = 4096 muls + 4096 adds = 8192 int-ops.
+typedef int8_t  i8x16  __attribute__((ext_vector_type(16)));
+typedef int     i32x8 __attribute__((ext_vector_type(8)));
+
+extern "C" __global__ void wmma_iu8_throughput_probe_parallel(
+        int          * __restrict__ out,
+        const int8_t * __restrict__ a_in,
+        const int8_t * __restrict__ b_in,
+        unsigned int   n_iters) {
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp_id_in_block = threadIdx.x >> 5u;
+    const unsigned int n_warps_per_block = blockDim.x >> 5u;
+    const unsigned int global_warp_id =
+        blockIdx.x * n_warps_per_block + warp_id_in_block;
+
+    i8x16 a;
+    i8x16 b;
+    for (int i = 0; i < 16; i++) { a[i] = a_in[i]; b[i] = b_in[i]; }
+    i32x8 c0 = {0}, c1 = {0}, c2 = {0}, c3 = {0};
+    i32x8 c4 = {0}, c5 = {0}, c6 = {0}, c7 = {0};
+
+    for (unsigned int i = 0; i < n_iters; i++) {
+#if defined(__gfx1151__) || defined(__gfx1150__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
+        // IU8: 4 args (A signed, B signed, C, clamp). The clang
+        // builtin is __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32.
+        // A and B both treated as unsigned (false flag means signed
+        // interpretation depending on builtin spec). Use false=signed
+        // for both for the test.
+        c0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, a, false, b, c0, false);
+        c1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, a, false, b, c1, false);
+        c2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, a, false, b, c2, false);
+        c3 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, a, false, b, c3, false);
+        c4 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, a, false, b, c4, false);
+        c5 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, a, false, b, c5, false);
+        c6 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, a, false, b, c6, false);
+        c7 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, a, false, b, c7, false);
+#else
+        c0[0] += (int)a[0] * (int)b[0];
+#endif
+    }
+
+    i32x8 c = {0};
+    for (int i = 0; i < 8; i++) {
+        c[i] = c0[i]+c1[i]+c2[i]+c3[i]+c4[i]+c5[i]+c6[i]+c7[i];
+    }
+    if (lane == 0) {
+        const size_t base = (size_t)global_warp_id * 8;
+        out[base+0]=c[0]; out[base+1]=c[1]; out[base+2]=c[2]; out[base+3]=c[3];
+        out[base+4]=c[4]; out[base+5]=c[5]; out[base+6]=c[6]; out[base+7]=c[7];
+    }
+}

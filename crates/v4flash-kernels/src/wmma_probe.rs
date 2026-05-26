@@ -59,6 +59,37 @@ impl WmmaProbe {
         self.launch_named(stream, "wmma_f16_throughput_probe_parallel", out, a_in, b_in, n_iters, n_blocks, block_threads)
     }
 
+    /// IU8 (int8 → int32) WMMA, parallel accumulators. Same shape as
+    /// f16 variant. Each WMMA emits 8192 int-ops (4096 mul + 4096 add).
+    pub fn launch_iu8_parallel(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<i32>,
+        a_in: &DeviceBuffer<i8>,
+        b_in: &DeviceBuffer<i8>,
+        n_iters: u32,
+        n_blocks: u32,
+        block_threads: u32,
+    ) -> eyre::Result<()> {
+        let function = self.module.get_function("wmma_iu8_throughput_probe_parallel")?;
+        let mut o_ptr = out.raw();
+        let mut a_ptr = a_in.raw();
+        let mut b_ptr = b_in.raw();
+        let mut ni = n_iters;
+        let mut args: [*mut c_void; 4] = [
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut b_ptr as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (n_blocks, 1, 1),
+            block: (block_threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_named(
         &self,
