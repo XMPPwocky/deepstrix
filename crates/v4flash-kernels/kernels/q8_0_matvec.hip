@@ -174,3 +174,55 @@ extern "C" __global__ void q8_0_quantize_f32(
         xqb[i] = (int8_t)q;
     }
 }
+// Q8_0 batched GEMV — Phase 2 v0: grid.z = B parallel single-token kernels.
+//
+// Initial version: same per-row math as q8_0_gemv_warp8, but launched
+// with grid.z = batch_size so multiple batch elements run concurrently.
+// Per-batch inputs (xq, xscale) and outputs (y) live at their own
+// offsets:
+//
+//   xq    + batch * in_dim          // [B, K] int8
+//   xscale + batch * (K / 32)       // [B, K/32] f32
+//   out   + batch * out_dim         // [B, M] f32
+//   W     // [M * blocks * 34] — SHARED across batch
+//
+// This does NOT amortize W reads across batch (each WG still re-reads W
+// once per row group). A v1 kernel will pack B inputs through one
+// W-load — register pressure permitting.
+
+// Grid: (out_dim / 8, 1, batch_size). Block: (256, 1, 1) — 8 warps,
+// each warp computes one output row of one batch element. Reuses the
+// dp4a_sudot / dot_i8x32 / warp_sum_f32 helpers defined above.
+extern "C" __global__ void q8_0_gemv_batched_warp8(
+    float* __restrict__ out,             // [B, M]
+    const unsigned char* __restrict__ w, // [M * blocks * 34] — shared across B
+    const int8_t* __restrict__ xq,       // [B, K]
+    const float* __restrict__ xscale,    // [B, K/32]
+    uint32_t in_dim,                     // K
+    uint32_t out_dim,                    // M
+    uint32_t blocks)                     // K / 32
+{
+    uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    uint32_t b = blockIdx.z;
+    if (row >= out_dim) return;
+
+    const unsigned char* wr = w + (size_t)row * blocks * 34u;
+    const __half*  scales = (const __half*)wr;
+    const int8_t*  quants = (const int8_t*)(wr + (size_t)blocks * 2u);
+    const int8_t* xq_b = xq + (size_t)b * in_dim;
+    const float*  xscale_b = xscale + (size_t)b * blocks;
+
+    float acc = 0.0f;
+    for (uint32_t bl = lane; bl < blocks; bl += WARP_LANES) {
+        const int8_t* qs = quants + (size_t)bl * 32u;
+        const int8_t* xqb = xq_b + (size_t)bl * 32u;
+        int32_t dot = dot_i8x32(qs, xqb);
+        acc += __half2float(scales[bl]) * xscale_b[bl] * (float)dot;
+    }
+
+    acc = warp_sum_f32(acc);
+    if (lane == 0) {
+        out[(size_t)b * out_dim + row] = acc;
+    }
+}

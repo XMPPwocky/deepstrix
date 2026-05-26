@@ -167,6 +167,88 @@ impl Q8_0Matvec {
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
 
+    /// M50 Phase 2: batched GEMV with `grid.z = B`. Same per-row math
+    /// as `matvec`; B parallel WGs run concurrently, one per batch
+    /// element. `xq[B, K]`, `xscale[B, K/32]`, `out[B, n_rows]` —
+    /// row-major. Weight `[n_rows, K]` Q8_0 is shared across batch.
+    ///
+    /// v0 of batching: no W amortization across batch (each WG re-reads
+    /// W independently). A v1 kernel will pack multiple batch elements
+    /// per WG to amortize W reads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_batched(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        if k % Q8_0_BLOCK_ELEMS != 0 {
+            return Err(eyre!("q8_0 matvec_batched: k={k} not a multiple of 32"));
+        }
+        let blocks = k / Q8_0_BLOCK_ELEMS;
+        let expected_weight_bytes =
+            (n_rows as usize) * (blocks as usize) * (Q8_0_BLOCK_BYTES as usize);
+        if weight.byte_len() != expected_weight_bytes {
+            return Err(eyre!(
+                "q8_0 matvec_batched weight bytes: have {}, expected {}",
+                weight.byte_len(),
+                expected_weight_bytes
+            ));
+        }
+        let expected_out = (batch as usize) * (n_rows as usize);
+        if out.len() < expected_out {
+            return Err(eyre!(
+                "q8_0 matvec_batched out len: have {}, expected {}",
+                out.len(),
+                expected_out
+            ));
+        }
+        let expected_xq = (batch as usize) * (k as usize);
+        let expected_xscale = (batch as usize) * (blocks as usize);
+        if xq.len() < expected_xq || xscale.len() < expected_xscale {
+            return Err(eyre!(
+                "q8_0 matvec_batched xq/xscale len: xq={} (need {expected_xq}), xscale={} (need {expected_xscale})",
+                xq.len(),
+                xscale.len()
+            ));
+        }
+
+        let function = self.module.get_function("q8_0_gemv_batched_warp8")?;
+        let mut out_ptr = out.raw();
+        let mut w_ptr = weight.raw();
+        let mut xq_ptr = xq.raw();
+        let mut xs_ptr = xscale.raw();
+        let mut in_dim = k;
+        let mut out_dim = n_rows;
+        let mut n_blocks = blocks;
+        let mut args: [*mut c_void; 7] = [
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut w_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut xs_ptr as *mut _ as *mut c_void,
+            &mut in_dim as *mut _ as *mut c_void,
+            &mut out_dim as *mut _ as *mut c_void,
+            &mut n_blocks as *mut _ as *mut c_void,
+        ];
+
+        let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
+        let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES; // 8 × 32 = 256
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, batch),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
     /// M40-P4.5: 2-wide pair GEMV. Same as `matvec` but processes TWO input
     /// columns against ONE weight matrix per call. Reads W once and computes
     /// both outputs in the same kernel pass — halves W bandwidth vs two
