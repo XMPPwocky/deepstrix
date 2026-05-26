@@ -370,6 +370,50 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
     eprintln!("  dot-only cost:  min={:.3} ms  med={:.3} ms  ({:.0}% of chunked wall)",
               ch_min - nd_min, ch_med - nd_med, 100.0 * (ch_med - nd_med) / ch_med);
 
+    // ---- Phase 7.3: LDS-staged weights variant ----
+    let mut lds_ms: Vec<f32> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let start = Event::new()?;
+        let end = Event::new()?;
+        start.record(&ie.compute)?;
+        let BatchIgpuScratch {
+            d_mid_cat,
+            d_xq_q8k,
+            d_ew,
+            group_count,
+            expert_members,
+            work_items,
+            ..
+        } = &mut bi;
+        ie.iq2.launch_fused_swiglu_chunked_lds(
+            &ie.compute,
+            d_mid_cat,
+            &ilw.routed.gate.buffer,
+            &ilw.routed.up.buffer,
+            d_xq_q8k,
+            d_ew,
+            group_count,
+            expert_members,
+            work_items,
+            gbpe,
+            ubpe,
+            cs_n_used,
+            max_per_expert,
+            CHUNK_SIZE,
+            SWIGLU_CLAMP_EXP,
+            N_FF_EXP,
+            BLOCKS_Q8K_GATE_IN,
+            n_work_items,
+        )?;
+        end.record(&ie.compute)?;
+        ie.compute.synchronize()?;
+        lds_ms.push(Event::elapsed_ms(&start, &end)?);
+    }
+    let lds_min = pmin(&lds_ms);
+    let lds_med = median(&mut lds_ms.clone());
+    eprintln!("lds-{chunk_size}     min={:.3} ms  median={:.3} ms  (ratio min={:.3}x  med={:.3}x)",
+              lds_min, lds_med, lds_min / bt_min, lds_med / bt_med);
+
     // Print the active-expert count to give context for the ratio.
     let mut gc_host = vec![0i32; N_EXPERT as usize];
     bi.group_count.copy_to_host(&mut gc_host)?;

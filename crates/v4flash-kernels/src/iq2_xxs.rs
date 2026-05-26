@@ -640,6 +640,80 @@ impl Iq2XxsPairMatvec {
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
 
+    /// Phase 7.3: chunked + per-WG LDS-staged weights. Identical signature
+    /// to `launch_fused_swiglu_chunked`. The per-WG cooperative LDS-stage
+    /// of iq2 weights cuts global weight reads by a factor of ~B (one
+    /// expert's weights read once per chunk instead of once per member).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_chunked_lds(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,
+        expert_w: &DeviceBuffer<f32>,
+        group_count: &DeviceBuffer<i32>,
+        expert_members: &DeviceBuffer<i32>,
+        work_items: &DeviceBuffer<i32>,
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+        n_work_items: u32,
+    ) -> eyre::Result<()> {
+        if n_work_items == 0 {
+            return Ok(());
+        }
+        let function = self
+            .module
+            .get_function("iq2_xxs_pair_matvec_fused_swiglu_chunked_lds")?;
+        let mut mid_ptr = mid.raw();
+        let mut gw_ptr = gate_w_base.raw();
+        let mut uw_ptr = up_w_base.raw();
+        let mut xq_ptr = xq.raw();
+        let mut ew_ptr = expert_w.raw();
+        let mut gc_ptr = group_count.raw();
+        let mut em_ptr = expert_members.raw();
+        let mut wi_ptr = work_items.raw();
+        let mut gbpe = gate_bpe;
+        let mut ubpe = up_bpe;
+        let mut nu = n_used;
+        let mut mpe = max_per_expert;
+        let mut cs = chunk_size;
+        let mut clamp_v = clamp;
+        let mut nr = n_rows;
+        let mut nb = n_blocks;
+        let mut args: [*mut c_void; 16] = [
+            &mut mid_ptr as *mut _ as *mut c_void,
+            &mut gw_ptr as *mut _ as *mut c_void,
+            &mut uw_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut ew_ptr as *mut _ as *mut c_void,
+            &mut gc_ptr as *mut _ as *mut c_void,
+            &mut em_ptr as *mut _ as *mut c_void,
+            &mut wi_ptr as *mut _ as *mut c_void,
+            &mut gbpe as *mut _ as *mut c_void,
+            &mut ubpe as *mut _ as *mut c_void,
+            &mut nu as *mut _ as *mut c_void,
+            &mut mpe as *mut _ as *mut c_void,
+            &mut cs as *mut _ as *mut c_void,
+            &mut clamp_v as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, n_work_items, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
     /// Phase 7.2 diagnostic: chunked kernel with dot-product loop stubbed.
     /// Same signature & args as `launch_fused_swiglu_chunked`. Use to
     /// isolate dot-product wall vs LDS-init + xq-load + reduce overhead.
