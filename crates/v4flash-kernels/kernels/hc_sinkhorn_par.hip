@@ -124,3 +124,104 @@ extern "C" __global__ void hc_sinkhorn_par(
 
     out[2u * HC_PAR_N + idx] = c[idx];
 }
+
+// M50 Phase 2 / Phase 5: batched hc_sinkhorn_par. Grid (B, 1, 1), block (16).
+// Each WG handles one batch element's sinkhorn iteration independently.
+// mix[B, 2*n_hc + n_hc*n_hc], out[B, 2*n_hc + n_hc*n_hc]. scale, base shared.
+extern "C" __global__ void hc_sinkhorn_par_batched(
+        float        * __restrict__ out,
+        const float  * __restrict__ mix,
+        const float  * __restrict__ scale,
+        const float  * __restrict__ base,
+        unsigned int   n_hc,
+        unsigned int   iters,
+        float          eps) {
+    const unsigned int tid = threadIdx.x;
+    const unsigned int b = blockIdx.x;
+    if (n_hc != HC_PAR_N) return;
+    if (tid >= 16) return;
+
+    const unsigned int stride = 2u * HC_PAR_N + HC_PAR_N * HC_PAR_N;
+    const float *mix_b = mix + (size_t)b * (size_t)stride;
+    float       *out_b = out + (size_t)b * (size_t)stride;
+
+    const float pre_scale  = scale[0];
+    const float post_scale = scale[1];
+    const float comb_scale = scale[2];
+
+    if (tid < HC_PAR_N) {
+        const float z = mix_b[tid] * pre_scale + base[tid];
+        float sig;
+        if (z >= 0.0f) sig = 1.0f / (1.0f + expf(-z));
+        else           sig = expf(z) / (1.0f + expf(z));
+        out_b[tid] = sig + eps;
+    } else if (tid < 2 * HC_PAR_N) {
+        const unsigned int off = tid;
+        const float z = mix_b[off] * post_scale + base[off];
+        float sig;
+        if (z >= 0.0f) sig = 1.0f / (1.0f + expf(-z));
+        else           sig = expf(z) / (1.0f + expf(z));
+        out_b[off] = 2.0f * sig;
+    }
+
+    __shared__ float c[16];
+    __shared__ float row_sum[HC_PAR_N];
+    __shared__ float col_sum[HC_PAR_N];
+
+    const unsigned int src = tid % HC_PAR_N;
+    const unsigned int dst = tid / HC_PAR_N;
+    const unsigned int idx = src + dst * HC_PAR_N;
+
+    {
+        const unsigned int off = 2u * HC_PAR_N + idx;
+        c[idx] = mix_b[off] * comb_scale + base[off];
+    }
+    __syncthreads();
+
+    if (tid < HC_PAR_N) {
+        float m = -INFINITY;
+        for (unsigned int s = 0; s < HC_PAR_N; s++) {
+            const float v = c[s + tid * HC_PAR_N];
+            if (v > m) m = v;
+        }
+        row_sum[tid] = m;
+    }
+    __syncthreads();
+    c[idx] = expf(c[idx] - row_sum[dst]);
+    __syncthreads();
+    if (tid < HC_PAR_N) {
+        float s = 0.0f;
+        for (unsigned int x = 0; x < HC_PAR_N; x++) s += c[x + tid * HC_PAR_N];
+        row_sum[tid] = s;
+    }
+    __syncthreads();
+    c[idx] = c[idx] / row_sum[dst] + eps;
+    __syncthreads();
+    if (tid < HC_PAR_N) {
+        float s = 0.0f;
+        for (unsigned int y = 0; y < HC_PAR_N; y++) s += c[tid + y * HC_PAR_N];
+        col_sum[tid] = s;
+    }
+    __syncthreads();
+    c[idx] = c[idx] / (col_sum[src] + eps);
+    __syncthreads();
+    for (unsigned int iter = 1; iter < iters; iter++) {
+        if (tid < HC_PAR_N) {
+            float s = 0.0f;
+            for (unsigned int x = 0; x < HC_PAR_N; x++) s += c[x + tid * HC_PAR_N];
+            row_sum[tid] = s;
+        }
+        __syncthreads();
+        c[idx] = c[idx] / (row_sum[dst] + eps);
+        __syncthreads();
+        if (tid < HC_PAR_N) {
+            float s = 0.0f;
+            for (unsigned int y = 0; y < HC_PAR_N; y++) s += c[tid + y * HC_PAR_N];
+            col_sum[tid] = s;
+        }
+        __syncthreads();
+        c[idx] = c[idx] / (col_sum[src] + eps);
+        __syncthreads();
+    }
+    out_b[2u * HC_PAR_N + idx] = c[idx];
+}

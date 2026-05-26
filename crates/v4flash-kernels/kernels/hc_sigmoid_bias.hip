@@ -27,3 +27,27 @@ extern "C" __global__ void hc_sigmoid_bias(
     }
     out[i] = sig + DS4_HC_EPS;
 }
+
+// M50 Phase 2: batched. pre[B, n], scale[1], base[n], out[B, n].
+// Grid (n/256, 1, B). scale[0] is broadcast; base[n] is broadcast.
+extern "C" __global__ void hc_sigmoid_bias_batched(
+        float        * __restrict__ out,
+        const float  * __restrict__ pre,
+        const float  * __restrict__ scale,
+        const float  * __restrict__ base,
+        unsigned int   n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int b = blockIdx.z;
+    if (i >= n) return;
+    const float s = scale[0];
+    const float x = pre[(size_t)b * (size_t)n + i] * s + base[i];
+    float sig;
+    if (x >= 0.0f) {
+        const float e = expf(-x);
+        sig = 1.0f / (1.0f + e);
+    } else {
+        const float e = expf(x);
+        sig = e / (1.0f + e);
+    }
+    out[(size_t)b * (size_t)n + i] = sig + DS4_HC_EPS;
+}

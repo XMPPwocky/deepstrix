@@ -75,6 +75,43 @@ impl HcSigmoidBias {
         };
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
+
+    /// M50 Phase 2: batched. pre[B, n], out[B, n]. scale, base shared.
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        pre: &DeviceBuffer<f32>,
+        scale: &DeviceBuffer<f32>,
+        base: &DeviceBuffer<f32>,
+        n: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let function = self.module.get_function("hc_sigmoid_bias_batched")?;
+        let mut out_ptr = out.raw();
+        let mut pre_ptr = pre.raw();
+        let mut scale_ptr = scale.raw();
+        let mut base_ptr = base.raw();
+        let mut n_v = n;
+        let mut args: [*mut c_void; 5] = [
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pre_ptr as *mut _ as *mut c_void,
+            &mut scale_ptr as *mut _ as *mut c_void,
+            &mut base_ptr as *mut _ as *mut c_void,
+            &mut n_v as *mut _ as *mut c_void,
+        ];
+        let block_x = 32u32;
+        let grid_x = n.div_ceil(block_x);
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, batch),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
 }
 
 /// `out[d] = sum_h x[h*n_embd + d] * weights[h]`. Used by the head's HC collapse
@@ -122,6 +159,44 @@ impl HcWeightedSum {
         let grid_x = n_embd.div_ceil(block_x);
         let cfg = LaunchConfig {
             grid: (grid_x, 1, 1),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
+    /// M50 Phase 2: batched. x[B, n_hc, n_embd], weights[B, n_hc],
+    /// out[B, n_embd]. Grid (n_embd/256, 1, B).
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        weights: &DeviceBuffer<f32>,
+        n_embd: u32,
+        n_hc: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let function = self.module.get_function("hc_weighted_sum_batched")?;
+        let mut out_ptr = out.raw();
+        let mut x_ptr = x.raw();
+        let mut w_ptr = weights.raw();
+        let mut ne = n_embd;
+        let mut nh = n_hc;
+        let mut args: [*mut c_void; 5] = [
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut w_ptr as *mut _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+        ];
+        let block_x = 256u32;
+        let grid_x = n_embd.div_ceil(block_x);
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, batch),
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -207,6 +282,53 @@ impl HcSinkhorn {
         ];
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
+
+    /// M50 Phase 2: batched sinkhorn (n_hc=4 only). Grid (B, 1, 1),
+    /// block (16). Each WG independently runs the 20-iteration
+    /// Sinkhorn-Knopp on its batch element's mix.
+    /// mix[B, 2*n_hc + n_hc*n_hc], out same shape. scale, base shared.
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        mix: &DeviceBuffer<f32>,
+        scale: &DeviceBuffer<f32>,
+        base: &DeviceBuffer<f32>,
+        n_hc: u32,
+        iters: u32,
+        eps: f32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        if n_hc != 4 {
+            return Err(eyre!("sinkhorn batched only supports n_hc=4"));
+        }
+        let function = self.par.get_function("hc_sinkhorn_par_batched")?;
+        let mut out_ptr = out.raw();
+        let mut mix_ptr = mix.raw();
+        let mut sc_ptr = scale.raw();
+        let mut b_ptr = base.raw();
+        let mut nh = n_hc;
+        let mut it = iters;
+        let mut ep = eps;
+        let mut args: [*mut c_void; 7] = [
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut mix_ptr as *mut _ as *mut c_void,
+            &mut sc_ptr as *mut _ as *mut c_void,
+            &mut b_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut it as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (batch, 1, 1),
+            block: (16, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
 }
 
 /// HC post: blend sublayer output with HC residual. Mirrors `hc_post_one`
@@ -264,6 +386,97 @@ impl HcPost {
             shared_mem_bytes: 0,
         };
         unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
+    /// M50 Phase 2: batched. out_hc[B, n_hc, n_embd], block_out[B, n_embd],
+    /// residual_hc[B, n_hc, n_embd], post[B, n_hc], comb[B, n_hc, n_hc].
+    /// Grid (n_embd/256, n_hc, B).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        out_hc: &mut DeviceBuffer<f32>,
+        block_out: &DeviceBuffer<f32>,
+        residual_hc: &DeviceBuffer<f32>,
+        post: &DeviceBuffer<f32>,
+        comb: &DeviceBuffer<f32>,
+        n_embd: u32,
+        n_hc: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let function = self.module.get_function("hc_post_batched")?;
+        let mut o_ptr = out_hc.raw();
+        let mut bo_ptr = block_out.raw();
+        let mut r_ptr = residual_hc.raw();
+        let mut p_ptr = post.raw();
+        let mut c_ptr = comb.raw();
+        let mut ne = n_embd;
+        let mut nh = n_hc;
+        let mut args: [*mut c_void; 7] = [
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut bo_ptr as *mut _ as *mut c_void,
+            &mut r_ptr as *mut _ as *mut c_void,
+            &mut p_ptr as *mut _ as *mut c_void,
+            &mut c_ptr as *mut _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+        ];
+        let block_x = 256u32;
+        let grid_x = n_embd.div_ceil(block_x);
+        let cfg = LaunchConfig {
+            grid: (grid_x, n_hc, batch),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
+    /// M50 Phase 2: batched from_split. Per-batch split layout:
+    /// `[B][n_w + n_hc + n_hc*n_hc]`. Extracts post/comb pointers with
+    /// stride.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_from_split_batched(
+        &self,
+        stream: &Stream,
+        out_hc: &mut DeviceBuffer<f32>,
+        block_out: &DeviceBuffer<f32>,
+        residual_hc: &DeviceBuffer<f32>,
+        split: &DeviceBuffer<f32>,
+        n_w: u32,
+        n_embd: u32,
+        n_hc: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        // The batched hc_post kernel expects post[B, n_hc] and
+        // comb[B, n_hc, n_hc] as separately-pointed contiguous regions.
+        // split is laid out as [B][n_w + n_hc + n_hc*n_hc] — post and
+        // comb for each batch are NOT contiguous across batch elements,
+        // so we can't just take offset pointers.
+        //
+        // For correctness we'd need to gather post[B] and comb[B] into
+        // separate buffers. For Phase 2 v0, we fall back to a per-batch
+        // loop using launch_from_split.
+        for b in 0..batch as usize {
+            let stride = (n_w + n_hc + n_hc * n_hc) as usize;
+            let split_base = split.raw() as *mut u8;
+            // For each batch element, treat it like a single-token call
+            // with offset pointers. We can't easily do this in pure Rust
+            // because copy_from_split needs DeviceBuffer args, not raw
+            // ptrs. TODO: write a true batched from_split that takes
+            // a stride arg in the kernel.
+            let _ = (split_base, stride, b, block_out, residual_hc, out_hc);
+            return Err(eyre!(
+                "launch_from_split_batched not yet implemented; \
+                 use launch_batched(post, comb) with pre-extracted batched buffers"
+            ));
+        }
+        Ok(())
     }
 
     /// Launch reading `post` and `comb` directly from a packed `split`
