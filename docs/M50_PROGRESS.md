@@ -16,7 +16,12 @@ Plan: `~/.claude/plans/read-design-doc-agile-hollerith.md`.
 - `tests/forward_prompt_batch_matches_sequential.rs` — passes bit-identical (max diff 0.0) at B=1, 4, 7
 - `tests/bench_prefill.rs` — measures 77 ms/tok at B=7 (slower than 36 ms/tok single because pair_mode disables M30 combined graphs)
 
-### ⏳ Phase 2: dGPU batched kernels — building blocks DONE, integration pending
+### ⏳ Phase 2: dGPU batched kernels DONE, full v2 integration FAILING ORACLE
+
+`forward_prompt_batch_v2` + `forward_layer_batch_v2` in `src/het/forward_prefill.rs` — committed but currently fails its oracle by ~8.9e3 (outputs ~10× smaller than expected). See `memory/project_m50_v2_failing_oracle.md` for bisect strategy + suspect list. 8 of 10 batched kernels are unverified; bug is in at least one of them or in v2's orchestration.
+
+**Building blocks** (all committed):
+
 **All batched kernels written and building cleanly:**
 
 | kernel | hip file | rust wrapper | tested? |
