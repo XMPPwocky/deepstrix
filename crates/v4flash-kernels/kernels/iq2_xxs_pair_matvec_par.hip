@@ -1271,3 +1271,182 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_zeroidx(
         __syncthreads();
     }
 }
+
+// Phase 7.5 — padded LDS tables for bank-conflict mitigation.
+//
+// Pads s_grid and s_sign_pair from 8-byte stride → 12-byte stride
+// (8 useful bytes + 4 padding). Math (32-bank LDS):
+//   8-byte stride:  gcd(2, 32) = 2 → 16 distinct bank classes
+//                   → 32 balls in 16 bins → E[max load] ≈ 5.3
+//   12-byte stride: gcd(3, 32) = 1 → 32 distinct bank classes
+//                   → 32 balls in 32 bins → E[max load] ≈ 3.6
+// Expected speedup on LDS-read step: ~5.3/3.6 = 1.47×.
+//
+// LDS overhead per WG:
+//   s_grid:      2 KB → 3 KB   (+1 KB)
+//   s_sign_pair: 1 KB → 1.5 KB (+0.5 KB)
+// Total: ~9.5 KB per WG (was ~8 KB). Should not change occupancy tier.
+
+__device__ __forceinline__ uint64_t lds_read_u64_padded12(const uint8_t* base, uint32_t idx) {
+    return *(const uint64_t*)(base + idx * 12u);
+}
+
+__device__ __forceinline__ int32_t iq2_dp4a_8_padded(
+        uint64_t grid_val, uint32_t sign_idx,
+        const uint8_t* __restrict__ s_sign_pair_pad,
+        const int8_t* q8, int32_t acc) {
+    const uint64_t pair = lds_read_u64_padded12(s_sign_pair_pad, sign_idx);
+    const uint32_t sm0 = (uint32_t)pair;
+    const uint32_t sm1 = (uint32_t)(pair >> 32);
+    const int32_t g0 = cond_neg_bytes_fast((int32_t)(uint32_t)grid_val, sm0);
+    const int32_t g1 = cond_neg_bytes_fast((int32_t)(uint32_t)(grid_val >> 32), sm1);
+    acc = sudot4_par(g0, load_dword_par(q8 + 0), acc);
+    acc = sudot4_par(g1, load_dword_par(q8 + 4), acc);
+    return acc;
+}
+
+__device__ __forceinline__ int32_t dot_iq2_pair_16_padded(
+        uint8_t g0_idx, uint32_t s0_idx,
+        uint8_t g1_idx, uint32_t s1_idx,
+        const uint8_t* __restrict__ s_sign_pair_pad,
+        const uint8_t* __restrict__ s_grid_pad,
+        const int8_t* q8) {
+    int32_t sum = 0;
+    const uint64_t g0_val = lds_read_u64_padded12(s_grid_pad, g0_idx);
+    const uint64_t g1_val = lds_read_u64_padded12(s_grid_pad, g1_idx);
+    sum = iq2_dp4a_8_padded(g0_val, s0_idx, s_sign_pair_pad, q8 + 0, sum);
+    sum = iq2_dp4a_8_padded(g1_val, s1_idx, s_sign_pair_pad, q8 + 8, sum);
+    return sum;
+}
+
+__device__ __forceinline__ float dot_block_half_padded(
+        const uint8_t* w_blk, const uint8_t* y_blk, unsigned int ib32_lo,
+        const uint8_t* __restrict__ s_sign_pair_pad,
+        const uint8_t* __restrict__ s_grid_pad) {
+    const uint16_t wd = *(const uint16_t*)(w_blk + 0);
+    const uint16_t* q2 = (const uint16_t*)(w_blk + 2) + (size_t)ib32_lo * 4u;
+    const float yd = *(const float*)(y_blk + 0);
+    const int8_t* q8 = (const int8_t*)(y_blk + 4) + (size_t)ib32_lo * 32u;
+    const float d = f16_to_f32_par(wd) * yd;
+
+    int32_t bsum = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        q2 += 4;
+        const uint32_t ls = 2u * (aux1 >> 28) + 1u;
+        int32_t sumi = 0;
+        sumi += dot_iq2_pair_16_padded(
+            (uint8_t)(aux0 & 0xffu),         (aux1 >>  0) & 127u,
+            (uint8_t)((aux0 >>  8) & 0xffu), (aux1 >>  7) & 127u,
+            s_sign_pair_pad, s_grid_pad, q8 + 0);
+        sumi += dot_iq2_pair_16_padded(
+            (uint8_t)((aux0 >> 16) & 0xffu), (aux1 >> 14) & 127u,
+            (uint8_t)((aux0 >> 24) & 0xffu), (aux1 >> 21) & 127u,
+            s_sign_pair_pad, s_grid_pad, q8 + 16);
+        bsum += sumi * (int32_t)ls;
+        q8 += 32;
+    }
+    return 0.125f * d * (float)bsum;
+}
+
+extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_padded(
+        float        * __restrict__ mid,
+        const uint8_t * __restrict__ gate_w_base,
+        const uint8_t * __restrict__ up_w_base,
+        const uint8_t * __restrict__ xq,
+        const float  * __restrict__ expert_w,
+        const int    * __restrict__ group_count,
+        const int    * __restrict__ expert_members,
+        const int    * __restrict__ work_items,
+        unsigned int    gate_bpe,
+        unsigned int    up_bpe,
+        unsigned int    n_used,
+        unsigned int    max_per_expert,
+        unsigned int    chunk_size,
+        float           clamp,
+        unsigned int    n_rows,
+        unsigned int    n_blocks) {
+    const unsigned int w_idx = blockIdx.y;
+    const int packed_item = work_items[w_idx];
+    const unsigned int e            = (unsigned int)(packed_item >> 16) & 0xffffu;
+    const unsigned int member_start = (unsigned int)(packed_item       ) & 0xffffu;
+    const int group_n = group_count[e];
+    const unsigned int member_end = min((unsigned int)group_n, member_start + chunk_size);
+    if (member_end <= member_start) return;
+
+    // Padded: 12-byte stride per entry. 256 × 12 = 3072 B, 128 × 12 = 1536 B.
+    __shared__ uint8_t s_sign_pair_pad[128 * 12];
+    __shared__ uint8_t s_grid_pad[256 * 12];
+    __shared__ uint8_t s_xq[16 * 292];
+
+    const unsigned int tid = threadIdx.x;
+    if (tid < 128) {
+        const uint32_t s = ksigns_iq2xs[tid];
+        const uint32_t signs = s * 0x01010101u;
+        const uint32_t sm0 = expand_signs_par(signs, 0x08040201u);
+        const uint32_t sm1 = expand_signs_par(signs, 0x80402010u);
+        *(uint64_t*)(s_sign_pair_pad + tid * 12) =
+            ((uint64_t)sm1 << 32) | (uint64_t)sm0;
+    }
+    if (tid < 256) {
+        *(uint64_t*)(s_grid_pad + tid * 12) = iq2xxs_grid[tid];
+    }
+    __syncthreads();
+
+    const unsigned int row_in_block = tid / 32u;
+    const unsigned int lane         = tid & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    if (row >= n_rows) return;
+
+    const unsigned int block_lane = lane >> 1u;
+    const unsigned int ib32_lo    = (lane & 1u) * 4u;
+
+    const uint8_t* gate_row_base = gate_w_base
+                                 + (uint64_t)e * (uint64_t)gate_bpe
+                                 + (uint64_t)row * (uint64_t)n_blocks * BLOCK_IQ2_XXS_BYTES;
+    const uint8_t* up_row_base   = up_w_base
+                                 + (uint64_t)e * (uint64_t)up_bpe
+                                 + (uint64_t)row * (uint64_t)n_blocks * BLOCK_IQ2_XXS_BYTES;
+
+    const unsigned int xq_bytes = n_blocks * 292u;
+    for (unsigned int m = member_start; m < member_end; m++) {
+        const int packed = expert_members[(size_t)e * (size_t)max_per_expert + (size_t)m];
+        const unsigned int b    = (unsigned int)(packed >> 16);
+        const unsigned int slot = (unsigned int)(packed & 0xFFFFu);
+
+        const uint8_t* xq_b = xq + (size_t)b * (size_t)xq_bytes;
+        for (unsigned int i = tid; i < xq_bytes; i += blockDim.x) {
+            s_xq[i] = xq_b[i];
+        }
+        __syncthreads();
+
+        float g_sum = 0.0f;
+        float u_sum = 0.0f;
+        for (unsigned int bl = block_lane; bl < n_blocks; bl += 16u) {
+            const uint8_t* w_g = gate_row_base + (uint64_t)bl * BLOCK_IQ2_XXS_BYTES;
+            const uint8_t* w_u = up_row_base   + (uint64_t)bl * BLOCK_IQ2_XXS_BYTES;
+            const uint8_t* y   = s_xq          + (size_t)bl   * BLOCK_Q8_K_BYTES;
+            g_sum += dot_block_half_padded(w_g, y, ib32_lo, s_sign_pair_pad, s_grid_pad);
+            u_sum += dot_block_half_padded(w_u, y, ib32_lo, s_sign_pair_pad, s_grid_pad);
+        }
+
+        g_sum = warp_sum_f32_par(g_sum);
+        u_sum = warp_sum_f32_par(u_sum);
+
+        if (lane == 0) {
+            const float ew = expert_w[(size_t)b * (size_t)n_used + (size_t)slot];
+            if (clamp > 1.0e-6f) {
+                if (g_sum > clamp)  g_sum = clamp;
+                if (u_sum > clamp)  u_sum = clamp;
+                if (u_sum < -clamp) u_sum = -clamp;
+            }
+            const float sig = 1.0f / (1.0f + expf(-g_sum));
+            const size_t out_off = ((size_t)b * (size_t)n_used + (size_t)slot)
+                                 * (size_t)n_rows + (size_t)row;
+            mid[out_off] = g_sum * sig * u_sum * ew;
+        }
+        __syncthreads();
+    }
+}
