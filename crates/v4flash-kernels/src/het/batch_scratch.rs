@@ -25,8 +25,12 @@ use crate::q8_k::BLOCK_Q8_K_BYTES;
 
 use super::scratch::{DgpuScratch, IgpuScratch};
 
-/// Max prefill batch size. Sized for ds4-parity (chunk=64 tokens).
-pub const B_MAX: usize = 64;
+/// Max prefill batch size. Bumped to 256 for the by-expert MoE
+/// experiment — at B=256 expected per-expert reuse is ~6× (vs ~2× at
+/// B=64), which is where by-expert grouping should start winning over
+/// the L2-amortized by-token kernel. Memory cost at B=256: ~104 MB dGPU
+/// scratch + ~24 MB iGPU scratch — trivial vs the 60+ GiB model weights.
+pub const B_MAX: usize = 256;
 
 /// Per-batch dGPU + iGPU scratch for prefill.
 ///

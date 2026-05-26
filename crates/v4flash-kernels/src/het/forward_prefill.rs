@@ -1047,56 +1047,27 @@ impl HeterogeneousEngine {
             &bi.ffn_input_norm_recv,
             crate::forward::BLOCKS_Q8K_GATE_IN * b,
         )?;
-        // Phase 7 pre-pass: invert d_selected into per-expert groups.
-        // Zero group_count first.
-        let max_per_expert = bi.max_per_expert();
-        bi.group_count.fill_zero()?;
-        {
-            let BatchIgpuScratch {
-                group_count,
-                expert_members,
-                d_selected,
-                ..
-            } = bi;
-            ie.moe_group_builder.launch(
-                &ie.compute,
-                group_count,
-                expert_members,
-                d_selected,
-                b,
-                cs_n_used as u32,
-                N_EXPERT,
-                max_per_expert,
-            )?;
-        }
-        {
-            let BatchIgpuScratch {
-                d_mid_cat,
-                d_xq_q8k,
-                d_ew,
-                group_count,
-                expert_members,
-                ..
-            } = bi;
-            ie.iq2.launch_fused_swiglu_by_expert(
-                &ie.compute,
-                d_mid_cat,
-                &ilw.routed.gate.buffer,
-                &ilw.routed.up.buffer,
-                d_xq_q8k,
-                d_ew,
-                group_count,
-                expert_members,
-                gbpe,
-                ubpe,
-                cs_n_used as u32,
-                N_EXPERT,
-                max_per_expert,
-                crate::forward::SWIGLU_CLAMP_EXP,
-                crate::forward::N_FF_EXP,
-                crate::forward::BLOCKS_Q8K_GATE_IN,
-            )?;
-        }
+        // Phase 7 by-expert path lives at `iq2.launch_fused_swiglu_by_expert`
+        // and `moe_group_builder` (committed but unused — see commit
+        // message: ~50% predicted perf win didn't materialize because of
+        // dead-WG launch overhead and the fact that L2 already amortizes
+        // weight reuse in the by-token kernel). Production uses by-token.
+        ie.iq2.launch_fused_swiglu_batch_bxn(
+            &ie.compute,
+            &mut bi.d_mid_cat,
+            &ilw.routed.gate.buffer,
+            &ilw.routed.up.buffer,
+            &bi.d_xq_q8k,
+            &bi.d_ew,
+            &bi.d_selected,
+            gbpe,
+            ubpe,
+            cs_n_used as u32,
+            crate::forward::SWIGLU_CLAMP_EXP,
+            crate::forward::N_FF_EXP,
+            crate::forward::BLOCKS_Q8K_GATE_IN,
+            b,
+        )?;
         ie.q8k.launch(
             &ie.compute,
             &mut bi.d_midq_cat,
