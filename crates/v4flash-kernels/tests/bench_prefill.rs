@@ -18,9 +18,10 @@ use std::time::Instant;
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
+use v4flash_kernels::forward::{N_EXPERT, N_EXPERT_USED, N_LAYER};
 use v4flash_kernels::het::{
     BatchDgpuScratch, BatchIgpuScratch, BatchScratch, DgpuScratch, ExecMode, HetModelState,
-    HetModelWeights, HeterogeneousEngine,
+    HetModelWeights, HeterogeneousEngine, PrefillStats,
 };
 use v4flash_kernels::{ActivationDump, RopeParams};
 
@@ -241,6 +242,7 @@ fn bench_prefill_v2() -> eyre::Result<()> {
             &input_hcs,
             &tokens,
             0,
+            None,
         )?;
     }
 
@@ -256,6 +258,7 @@ fn bench_prefill_v2() -> eyre::Result<()> {
             &input_hcs,
             &tokens,
             0,
+            None,
         )?;
         let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
         walls_ms.push(wall_ms);
@@ -370,6 +373,7 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
             &tokens,
             0,
             last_only,
+            None,
         )?;
     }
     let mut walls_ms: Vec<f64> = Vec::with_capacity(n_iters);
@@ -386,6 +390,7 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
             &tokens,
             0,
             last_only,
+            None,
         )?;
         let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
         walls_ms.push(wall_ms);
@@ -412,5 +417,75 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
         median_ms / t as f64,
         (t as f64 * 1000.0) / median_ms
     );
+    Ok(())
+}
+
+/// M50 Phase 3 expert-stats run. Runs forward_prefill at T=BENCH_T (default
+/// 128) with stats collection enabled and dumps the per-chunk reuse and
+/// per-layer skew tables. Doesn't validate correctness — purely an
+/// observation tool to inform whether by-expert MoE grouping would help.
+#[test]
+#[ignore]
+fn bench_prefill_expert_stats() -> eyre::Result<()> {
+    install_panic_handler()?;
+    use v4flash_kernels::forward::HC_DIM;
+
+    let t: usize = std::env::var("BENCH_T")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128);
+    eprintln!("expert-stats run: T={t}");
+
+    let dump = ActivationDump::open(dump_dir())?;
+    let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
+    let dgpu = pick_dgpu()?;
+    let igpu = pick_igpu()?;
+    let dgpu_arch = dgpu.properties()?.gcn_arch_name;
+    let igpu_arch = igpu.properties()?.gcn_arch_name;
+    let rope_for_layer = |layer: i32| -> eyre::Result<RopeParams> {
+        let entry = dump
+            .weight("rope_params", layer)
+            .ok_or_else(|| eyre!("missing rope_params L{layer}"))?;
+        let floats = dump.read_f32(entry)?;
+        let n_ctx_orig = if floats[2] != 0.0 { ROPE_ORIG_CTX } else { 0 };
+        RopeParams::from_dump_blob(&floats, n_ctx_orig)
+    };
+    let main_weights = HetModelWeights::load_all(&main_gguf, dgpu, igpu, &rope_for_layer)?;
+    let engine =
+        HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
+    let mut bd = BatchDgpuScratch::alloc(dgpu)?;
+    let mut bi = BatchIgpuScratch::alloc(igpu)?;
+    let mut head_scratch = DgpuScratch::alloc(dgpu)?;
+
+    let n_real = PROMPT_TOKENS.len();
+    let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(t);
+    let mut tokens: Vec<i32> = Vec::with_capacity(t);
+    for i in 0..t {
+        let src_i = i % n_real;
+        let entry = dump
+            .tensor("layer_input_residual", 0, src_i as i32)
+            .ok_or_else(|| eyre!("missing layer_input_residual L0 T{src_i}"))?;
+        let hc = dump.read_f32(entry)?;
+        assert_eq!(hc.len(), HC_DIM as usize);
+        input_hcs.push(hc);
+        tokens.push(PROMPT_TOKENS[src_i]);
+    }
+
+    let mut state = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
+    let mut stats = PrefillStats::new(N_LAYER as u32, N_EXPERT_USED as u32, N_EXPERT);
+
+    let _ = engine.forward_prefill(
+        &mut bd,
+        &mut bi,
+        &mut head_scratch,
+        &mut state,
+        &main_weights,
+        &input_hcs,
+        &tokens,
+        0,
+        true,
+        Some(&mut stats),
+    )?;
+    stats.print_summary();
     Ok(())
 }

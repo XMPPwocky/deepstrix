@@ -26,6 +26,7 @@ pub mod forward_pair_interleaved;
 pub mod spec_decode;
 pub mod mtp_weights;
 pub mod perfetto;
+pub mod prefill_stats;
 pub mod scratch;
 pub mod state;
 pub mod sync;
@@ -33,6 +34,7 @@ pub mod trace;
 pub mod weights;
 
 pub use batch_scratch::{BatchDgpuScratch, BatchIgpuScratch, BatchScratch, B_MAX};
+pub use prefill_stats::{LayerStats, PerChunkReuse, PrefillStats};
 pub use engine::{DeviceEngine, ExecMode, HeterogeneousEngine};
 pub use mtp_weights::{MtpRoutedExperts, MtpWeights};
 pub use scratch::{DgpuScratch, IgpuScratch, TokenScratch};

@@ -293,6 +293,7 @@ fn forward_prompt_batch_v2_matches_sequential() -> eyre::Result<()> {
         &input_hcs,
         &tokens,
         0,
+        None,
     )?;
     let mut v2_hcs: Vec<Vec<f32>> = Vec::with_capacity(b);
     for i in 0..b {
@@ -437,6 +438,7 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
             &main_weights.igpu_layers[layer],
             0,
             &tokens,
+            None,
         )?;
 
         // ---- Compare each batch element's residual_next ----
@@ -644,6 +646,7 @@ fn forward_prefill_last_only_matches_sequential() -> eyre::Result<()> {
         &tokens,
         0,
         true,
+        None,
     )?;
     assert_eq!(prefill_logits.len(), N_VOCAB as usize);
 

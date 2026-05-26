@@ -34,6 +34,7 @@ use crate::forward::{
 
 use super::batch_scratch::{BatchDgpuScratch, BatchIgpuScratch, BatchScratch, B_MAX};
 use super::engine::HeterogeneousEngine;
+use super::prefill_stats::PrefillStats;
 use super::scratch::{DgpuScratch, IgpuScratch};
 use super::state::{HetLayerState, HetModelState};
 use super::sync::{peer_push_f32, peer_push_i32};
@@ -185,6 +186,7 @@ impl HeterogeneousEngine {
     /// After return, `batch_dgpu.residual` (or `residual_next` if the
     /// model layer count is odd — V4-Flash has 43, so `residual` after
     /// post-loop swap holds it) contains per-token post-last-layer HC.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_prompt_batch_v2(
         &self,
         batch_dgpu: &mut BatchDgpuScratch,
@@ -194,6 +196,7 @@ impl HeterogeneousEngine {
         input_hcs: &[Vec<f32>],
         tokens: &[i32],
         pos0: u32,
+        mut stats: Option<&mut PrefillStats>,
     ) -> eyre::Result<()> {
         let b = tokens.len();
         if b == 0 {
@@ -242,6 +245,7 @@ impl HeterogeneousEngine {
                 &weights.igpu_layers[layer],
                 pos0,
                 tokens,
+                stats.as_deref_mut(),
             )?;
             // Swap residual / residual_next for the next layer: the
             // layer wrote residual_next; next layer reads residual.
@@ -281,6 +285,7 @@ impl HeterogeneousEngine {
         tokens: &[i32],
         pos0: u32,
         last_only: bool,
+        mut stats: Option<&mut PrefillStats>,
     ) -> eyre::Result<Vec<f32>> {
         let t = tokens.len();
         if t == 0 {
@@ -319,6 +324,7 @@ impl HeterogeneousEngine {
                 chunk_input,
                 chunk_tokens,
                 chunk_pos0,
+                stats.as_deref_mut(),
             )?;
 
             // residual post-loop holds layer-N output in bd.residual (43
@@ -358,6 +364,7 @@ impl HeterogeneousEngine {
     /// `batch_dgpu.residual_next` (per-token output HC). All other
     /// `batch_dgpu` fields are scratch.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_layer_batch_v2(
         &self,
         bd: &mut BatchDgpuScratch,
@@ -367,6 +374,7 @@ impl HeterogeneousEngine {
         ilw: &IgpuLayerWeights,
         pos0: u32,
         tokens: &[i32],
+        stats: Option<&mut PrefillStats>,
     ) -> eyre::Result<()> {
         let layer = dlw.layer_idx;
         if ilw.layer_idx != layer {
@@ -913,6 +921,17 @@ impl HeterogeneousEngine {
             sel_v.copy_from_host(&all_sel)?;
             let mut ew_v = bd.d_ew.slice_view_mut(0, b as usize * cs_n_used);
             ew_v.copy_from_host(&all_ew)?;
+        }
+
+        // Stats collection (optional). Copies d_selected to host — sync,
+        // fences the device. Don't enable in production prefill.
+        if let Some(s) = stats {
+            de.compute.synchronize()?;
+            let mut sel_host = vec![0i32; (b as usize) * cs_n_used];
+            bd.d_selected
+                .slice_view(0, (b as usize) * cs_n_used)
+                .copy_to_host(&mut sel_host)?;
+            s.record_batch(layer as usize, &sel_host, b);
         }
 
         // ========================================================
