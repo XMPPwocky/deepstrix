@@ -46,3 +46,37 @@ extern "C" __global__ void rms_norm_weighted(
         out[i] = x[i] * scale * weight[i];
     }
 }
+
+// M50 Phase 2: batched rms_norm_weighted. Grid (B, 1, 1), block (256).
+// Each WG processes one batch element's n-element row.
+extern "C" __global__ void rms_norm_weighted_batched(
+        float *out,                     // [B, n]
+        const float *x,                 // [B, n]
+        const float *weight,            // [n] — SHARED across batch
+        unsigned int n,
+        float eps) {
+    __shared__ float sdata[256];
+    const unsigned int b = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int block = blockDim.x;
+
+    const float *xb = x + (size_t)b * (size_t)n;
+    float       *ob = out + (size_t)b * (size_t)n;
+
+    double partial = 0.0;
+    for (unsigned int i = tid; i < n; i += block) {
+        float v = xb[i];
+        partial += (double)v * (double)v;
+    }
+    sdata[tid] = (float)partial;
+    __syncthreads();
+    for (unsigned int stride = block / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] += sdata[tid + stride];
+        __syncthreads();
+    }
+    const float mean_sq = sdata[0] / (float)n;
+    const float scale = rsqrtf(mean_sq + eps);
+    for (unsigned int i = tid; i < n; i += block) {
+        ob[i] = xb[i] * scale * weight[i];
+    }
+}

@@ -97,6 +97,56 @@ impl RmsNorm {
         };
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
+
+    /// M50 Phase 2: batched rms_norm_weighted. `x[B, n]`, `out[B, n]`,
+    /// `weight[n]` shared across batch. Grid (B, 1, 1), block (256).
+    pub fn launch_weighted_batched(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<f32>,
+        n: u32,
+        eps: f32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let needed = (batch as usize) * (n as usize);
+        if out.len() < needed || x.len() < needed {
+            return Err(eyre!(
+                "rms_norm_weighted_batched: buffer too small (need {needed})"
+            ));
+        }
+        if weight.len() != n as usize {
+            return Err(eyre!("rms_norm_weighted_batched: weight len != n"));
+        }
+        if n > 4096 {
+            return Err(eyre!("rms_norm_weighted_batched: n={n} > 4096"));
+        }
+        let function = self
+            .module
+            .get_function("rms_norm_weighted_batched")?;
+        let mut out_ptr = out.raw();
+        let mut x_ptr = x.raw();
+        let mut w_ptr = weight.raw();
+        let mut n_val = n;
+        let mut eps_val = eps;
+        let mut args: [*mut c_void; 5] = [
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut w_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut eps_val as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (batch, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
 }
 
 /// No-weight RMSNorm — mirrors ds4.c `rms_norm_no_weight`. Operates on
@@ -158,6 +208,49 @@ impl RmsNormNoWeight {
 
         let cfg = LaunchConfig {
             grid: (n_rows, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
+    /// M50 Phase 2: batched rms_norm_no_weight. `x[B, n_rows, n]`,
+    /// `out[B, n_rows, n]`. Grid (B, n_rows, 1), block (256). Each WG
+    /// processes one (batch, row) pair.
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        n_rows: u32,
+        n: u32,
+        eps: f32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let needed = (batch as usize) * (n_rows as usize) * (n as usize);
+        if out.len() < needed || x.len() < needed {
+            return Err(eyre!(
+                "rms_norm_no_weight_batched: buffer too small (need {needed})"
+            ));
+        }
+        let function = self.module.get_function("rms_norm_no_weight_batched")?;
+        let mut out_ptr = out.raw();
+        let mut x_ptr = x.raw();
+        let mut nr_val = n_rows;
+        let mut n_val = n;
+        let mut eps_val = eps;
+        let mut args: [*mut c_void; 5] = [
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut nr_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut eps_val as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (batch, n_rows, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
