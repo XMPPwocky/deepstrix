@@ -60,3 +60,36 @@ extern "C" __global__ void hc_post_batched(
     }
     out[(size_t)dst * (size_t)n_embd + d] = acc;
 }
+
+// M50 Phase 2: batched hc_post that reads `post` and `comb` directly from
+// the packed split buffer (same layout as the single-token launch_from_split).
+// split[B, n_w + n_hc + n_hc*n_hc] with stride = n_w + n_hc + n_hc*n_hc.
+// Grid (n_embd/256, n_hc, B).
+extern "C" __global__ void hc_post_from_split_batched(
+        float        * __restrict__ out_hc,
+        const float  * __restrict__ block_out,
+        const float  * __restrict__ residual_hc,
+        const float  * __restrict__ split,
+        unsigned int   n_w,
+        unsigned int   n_embd,
+        unsigned int   n_hc) {
+    const unsigned int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= n_embd) return;
+    const unsigned int dst = blockIdx.y;
+    const unsigned int b = blockIdx.z;
+
+    const size_t split_stride = (size_t)n_w + (size_t)n_hc + (size_t)n_hc * (size_t)n_hc;
+    const float *sp = split + (size_t)b * split_stride;
+    const float *pb = sp + (size_t)n_w;             // post[n_hc]
+    const float *cb = pb + (size_t)n_hc;            // comb[n_hc, n_hc]
+
+    const float *bo = block_out + (size_t)b * (size_t)n_embd;
+    const float *rh = residual_hc + (size_t)b * (size_t)n_hc * (size_t)n_embd;
+    float       *out = out_hc + (size_t)b * (size_t)n_hc * (size_t)n_embd;
+
+    float acc = bo[d] * pb[dst];
+    for (unsigned int src = 0; src < n_hc; src++) {
+        acc += cb[dst + src * n_hc] * rh[(size_t)src * (size_t)n_embd + d];
+    }
+    out[(size_t)dst * (size_t)n_embd + d] = acc;
+}

@@ -98,6 +98,52 @@ impl Q8_0Matvec {
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
 
+    /// M50 Phase 2: batched quantize. Equivalent to `quantize_input` over
+    /// `B × n` contiguous elements. The kernel has no batch concept — it
+    /// just processes `B × blocks` blocks. Buffers must be at least
+    /// `B × n` (xq), `B × n/32` (xscale), `B × n` (x).
+    pub fn quantize_input_batched(
+        &self,
+        stream: &Stream,
+        xq: &mut DeviceBuffer<i8>,
+        xscale: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        n: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        if n % Q8_0_BLOCK_ELEMS != 0 {
+            return Err(eyre!("q8_0 quantize_batched: n={n} not %32"));
+        }
+        let total_blocks = (n / Q8_0_BLOCK_ELEMS) * batch;
+        let total_n = (n as usize) * (batch as usize);
+        if x.len() < total_n || xq.len() < total_n || xscale.len() < total_blocks as usize {
+            return Err(eyre!(
+                "q8_0 quantize_batched: buffer too small (n*B={total_n}, blocks*B={total_blocks}, x={}, xq={}, xscale={})",
+                x.len(), xq.len(), xscale.len()
+            ));
+        }
+        let function = self.module.get_function("q8_0_quantize_f32")?;
+        let mut xq_ptr = xq.raw();
+        let mut xscale_ptr = xscale.raw();
+        let mut x_ptr = x.raw();
+        let mut blocks_val = total_blocks;
+        let mut args: [*mut c_void; 4] = [
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut xscale_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut blocks_val as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (total_blocks, 1, 1),
+            block: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
     /// `out[i] = sum_b f16_scale_w[i, b] * xscale[b] * dot_i8x32(qs_w[i, b], xq[b])`
     /// for i in 0..n_rows. The Q8_0 weight buffer holds `n_rows` rows of
     /// `(k/32) * 34` bytes each, row-major.

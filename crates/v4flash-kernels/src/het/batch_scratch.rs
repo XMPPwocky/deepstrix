@@ -1,20 +1,26 @@
 //! M50: per-batch scratch for prefill.
 //!
-//! Phase 1 implementation: a `Vec<DgpuScratch>` + `Vec<IgpuScratch>` of
-//! length `B_MAX`, each element being a complete single-token scratch.
-//! `forward_prompt_batch` calls the existing single-token `forward_layer`
-//! in a loop over batch elements, using `scratches[b]` per element.
+//! Phase 1 implementation: a shared `DgpuScratch`/`IgpuScratch` used by
+//! the existing single-token `forward_layer` in an inner loop over B,
+//! with `per_token_residual` ping-ponged in/out. See `forward_prompt_batch`.
+//!
+//! Phase 2 (this file): adds [`BatchDgpuScratch`] — every per-token field
+//! is B-extended to a single contiguous `[B × per_token_size]` buffer.
+//! Batched kernels (`*_batched`) read/write with per-batch strides
+//! directly, no per-token copies. Used by `forward_prompt_batch_v2`.
 //!
 //! Memory cost at `B_MAX = 64`:
-//! * dGPU: ~64 × 2 MB = ~128 MB (each `DgpuScratch` ~2 MB)
-//! * iGPU: ~64 × 250 KB = ~16 MB
-//!
-//! Phase 2 will replace `Vec<DgpuScratch>` with a single contiguous
-//! `BatchDgpuScratch` whose buffers are sized `[B_MAX × per_token_size]`,
-//! and Phase 2 batched kernels read/write with per-batch offsets.
+//! * Phase 1 `BatchScratch`: ~2 MB shared + 64×16 KB residual = ~3 MB.
+//! * Phase 2 `BatchDgpuScratch`: ~26 MB of B-extended per-token state.
 
 use color_eyre::eyre;
-use v4flash_hip::Device;
+use v4flash_hip::{Device, DeviceBuffer};
+
+use crate::forward::{
+    BLOCKS_GROUPED_OUT, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
+    HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED, N_FF_SHARED, N_HEAD_DIM, N_LORA_Q,
+    OUT_LOW, Q_FLAT,
+};
 
 use super::scratch::{DgpuScratch, IgpuScratch};
 
@@ -73,5 +79,148 @@ impl BatchScratch {
 
     pub fn b_max(&self) -> usize {
         B_MAX
+    }
+}
+
+/// M50 Phase 2: per-batch dGPU scratch with B-extended buffers.
+///
+/// Every field is a single contiguous `DeviceBuffer` sized for the
+/// maximum batch (`B_MAX × per_token_size`). Batched kernels read/write
+/// with per-batch strides; per-token (stateful) kernels use offset slices.
+///
+/// Memory at B_MAX=64: ~26 MB total. Trivial vs the 9 GiB model weights.
+///
+/// Does NOT include head/MTP/stash buffers — `forward_layer_batch_v2`
+/// only needs the active per-token state. Head can run in a serial loop
+/// over `per_token_residual_next` from the parent `BatchScratch`.
+pub struct BatchDgpuScratch {
+    // ---- mHC stage ----
+    /// `[B, HC_DIM]` — per-token residual (cross-layer flow).
+    pub residual: DeviceBuffer<f32>,
+    pub residual_next: DeviceBuffer<f32>,
+    /// `[B, HC_DIM]` — rms_nw output going into hc_attn_fn.
+    pub flat: DeviceBuffer<f32>,
+    /// `[B, HC_MIX_DIM]` — f16 narrow matvec output (sinkhorn input).
+    pub mix: DeviceBuffer<f32>,
+    /// `[B, HC_MIX_DIM]` — sinkhorn output (post + comb embedded).
+    pub split: DeviceBuffer<f32>,
+    /// `[B, N_EMBD]` — hc_weighted output for attention input.
+    pub attn_cur: DeviceBuffer<f32>,
+    pub attn_input_norm: DeviceBuffer<f32>,
+    pub after_attn_hc: DeviceBuffer<f32>,
+    pub ffn_cur: DeviceBuffer<f32>,
+    pub ffn_input_norm: DeviceBuffer<f32>,
+
+    // ---- Q chain ----
+    pub xq_n_embd: DeviceBuffer<i8>,
+    pub xscale_n_embd: DeviceBuffer<f32>,
+    pub qr: DeviceBuffer<f32>,
+    pub qr_normed: DeviceBuffer<f32>,
+    pub qr_xq: DeviceBuffer<i8>,
+    pub qr_xscale: DeviceBuffer<f32>,
+    pub q: DeviceBuffer<f32>,
+    pub q_normed: DeviceBuffer<f32>,
+
+    // ---- KV chain ----
+    pub kv_raw: DeviceBuffer<f32>,
+    pub kv_normed: DeviceBuffer<f32>,
+
+    // ---- Compressor (used in per-batch serial inner loop) ----
+    pub kv_cur: DeviceBuffer<f32>,
+    pub sc_cur: DeviceBuffer<f32>,
+    pub pooled: DeviceBuffer<f32>,
+    pub comp_row: DeviceBuffer<f32>,
+
+    // ---- Attention output + output projection ----
+    pub heads: DeviceBuffer<f32>,
+    pub low: DeviceBuffer<f32>,
+    pub heads_xq: DeviceBuffer<i8>,
+    pub heads_xscale: DeviceBuffer<f32>,
+    pub low_xq: DeviceBuffer<i8>,
+    pub low_xscale: DeviceBuffer<f32>,
+    pub attn_out: DeviceBuffer<f32>,
+
+    // ---- Router ----
+    pub router_logits: DeviceBuffer<f32>,
+    pub d_selected: DeviceBuffer<i32>,
+    pub d_ew: DeviceBuffer<f32>,
+    /// Host readback area for hash router path. `[B, N_EXPERT]`.
+    pub router_logits_host: Vec<f32>,
+
+    // ---- Shared expert ----
+    pub gate_sh: DeviceBuffer<f32>,
+    pub up_sh: DeviceBuffer<f32>,
+    pub mid_sh: DeviceBuffer<f32>,
+    pub mid_sh_xq: DeviceBuffer<i8>,
+    pub mid_sh_xscale: DeviceBuffer<f32>,
+    pub ffn_shared: DeviceBuffer<f32>,
+
+    /// `[B, N_EMBD]` — peer-arrival mailbox for iGPU MoE output. iGPU
+    /// pushes per-batch in the serial inner loop; we add ffn_shared via
+    /// a B-stretched vec_add then run hc_post.
+    pub ffn_moe_recv: DeviceBuffer<f32>,
+}
+
+impl BatchDgpuScratch {
+    pub fn alloc(dgpu_device: Device) -> eyre::Result<Self> {
+        dgpu_device.set_current()?;
+        let id = dgpu_device.id;
+        let b = B_MAX;
+        let mk_f32 =
+            |n: usize| -> eyre::Result<DeviceBuffer<f32>> { DeviceBuffer::new(id, b * n) };
+        let mk_i8 = |n: usize| -> eyre::Result<DeviceBuffer<i8>> { DeviceBuffer::new(id, b * n) };
+        let mk_i32 =
+            |n: usize| -> eyre::Result<DeviceBuffer<i32>> { DeviceBuffer::new(id, b * n) };
+        Ok(Self {
+            residual: mk_f32(HC_DIM as usize)?,
+            residual_next: mk_f32(HC_DIM as usize)?,
+            flat: mk_f32(HC_DIM as usize)?,
+            mix: mk_f32(HC_MIX_DIM as usize)?,
+            split: mk_f32(HC_MIX_DIM as usize)?,
+            attn_cur: mk_f32(N_EMBD as usize)?,
+            attn_input_norm: mk_f32(N_EMBD as usize)?,
+            after_attn_hc: mk_f32(HC_DIM as usize)?,
+            ffn_cur: mk_f32(N_EMBD as usize)?,
+            ffn_input_norm: mk_f32(N_EMBD as usize)?,
+
+            xq_n_embd: mk_i8(N_EMBD as usize)?,
+            xscale_n_embd: mk_f32(BLOCKS_N_EMBD as usize)?,
+            qr: mk_f32(N_LORA_Q as usize)?,
+            qr_normed: mk_f32(N_LORA_Q as usize)?,
+            qr_xq: mk_i8(N_LORA_Q as usize)?,
+            qr_xscale: mk_f32(BLOCKS_N_LORA_Q as usize)?,
+            q: mk_f32(Q_FLAT as usize)?,
+            q_normed: mk_f32(Q_FLAT as usize)?,
+
+            kv_raw: mk_f32(N_HEAD_DIM as usize)?,
+            kv_normed: mk_f32(N_HEAD_DIM as usize)?,
+
+            kv_cur: mk_f32((2 * N_HEAD_DIM) as usize)?,
+            sc_cur: mk_f32((2 * N_HEAD_DIM) as usize)?,
+            pooled: mk_f32(N_HEAD_DIM as usize)?,
+            comp_row: mk_f32(N_HEAD_DIM as usize)?,
+
+            heads: mk_f32(Q_FLAT as usize)?,
+            low: mk_f32(OUT_LOW as usize)?,
+            heads_xq: mk_i8(Q_FLAT as usize)?,
+            heads_xscale: mk_f32(BLOCKS_GROUPED_OUT as usize)?,
+            low_xq: mk_i8(OUT_LOW as usize)?,
+            low_xscale: mk_f32(BLOCKS_OUT_LOW as usize)?,
+            attn_out: mk_f32(N_EMBD as usize)?,
+
+            router_logits: mk_f32(N_EXPERT as usize)?,
+            d_selected: mk_i32(N_EXPERT_USED)?,
+            d_ew: mk_f32(N_EXPERT_USED)?,
+            router_logits_host: vec![0.0f32; b * (N_EXPERT as usize)],
+
+            gate_sh: mk_f32(N_FF_SHARED as usize)?,
+            up_sh: mk_f32(N_FF_SHARED as usize)?,
+            mid_sh: mk_f32(N_FF_SHARED as usize)?,
+            mid_sh_xq: mk_i8(N_FF_SHARED as usize)?,
+            mid_sh_xscale: mk_f32(BLOCKS_N_FF_SHARED as usize)?,
+            ffn_shared: mk_f32(N_EMBD as usize)?,
+
+            ffn_moe_recv: mk_f32(N_EMBD as usize)?,
+        })
     }
 }

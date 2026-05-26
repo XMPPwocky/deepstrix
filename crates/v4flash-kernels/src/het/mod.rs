@@ -32,7 +32,7 @@ pub mod sync;
 pub mod trace;
 pub mod weights;
 
-pub use batch_scratch::{BatchScratch, B_MAX};
+pub use batch_scratch::{BatchDgpuScratch, BatchScratch, B_MAX};
 pub use engine::{DeviceEngine, ExecMode, HeterogeneousEngine};
 pub use mtp_weights::{MtpRoutedExperts, MtpWeights};
 pub use scratch::{DgpuScratch, IgpuScratch, TokenScratch};

@@ -435,8 +435,9 @@ impl HcPost {
     }
 
     /// M50 Phase 2: batched from_split. Per-batch split layout:
-    /// `[B][n_w + n_hc + n_hc*n_hc]`. Extracts post/comb pointers with
-    /// stride.
+    /// `[B][n_w + n_hc + n_hc*n_hc]`. The kernel reads `post` at
+    /// offset `n_w` and `comb` at offset `n_w + n_hc` within each
+    /// per-batch row.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_from_split_batched(
         &self,
@@ -453,30 +454,31 @@ impl HcPost {
         if batch == 0 {
             return Ok(());
         }
-        // The batched hc_post kernel expects post[B, n_hc] and
-        // comb[B, n_hc, n_hc] as separately-pointed contiguous regions.
-        // split is laid out as [B][n_w + n_hc + n_hc*n_hc] — post and
-        // comb for each batch are NOT contiguous across batch elements,
-        // so we can't just take offset pointers.
-        //
-        // For correctness we'd need to gather post[B] and comb[B] into
-        // separate buffers. For Phase 2 v0, we fall back to a per-batch
-        // loop using launch_from_split.
-        for b in 0..batch as usize {
-            let stride = (n_w + n_hc + n_hc * n_hc) as usize;
-            let split_base = split.raw() as *mut u8;
-            // For each batch element, treat it like a single-token call
-            // with offset pointers. We can't easily do this in pure Rust
-            // because copy_from_split needs DeviceBuffer args, not raw
-            // ptrs. TODO: write a true batched from_split that takes
-            // a stride arg in the kernel.
-            let _ = (split_base, stride, b, block_out, residual_hc, out_hc);
-            return Err(eyre!(
-                "launch_from_split_batched not yet implemented; \
-                 use launch_batched(post, comb) with pre-extracted batched buffers"
-            ));
-        }
-        Ok(())
+        let function = self.module.get_function("hc_post_from_split_batched")?;
+        let mut o_ptr = out_hc.raw();
+        let mut bo_ptr = block_out.raw();
+        let mut r_ptr = residual_hc.raw();
+        let mut s_ptr = split.raw();
+        let mut nw = n_w;
+        let mut ne = n_embd;
+        let mut nh = n_hc;
+        let mut args: [*mut c_void; 7] = [
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut bo_ptr as *mut _ as *mut c_void,
+            &mut r_ptr as *mut _ as *mut c_void,
+            &mut s_ptr as *mut _ as *mut c_void,
+            &mut nw as *mut _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+        ];
+        let block_x = 256u32;
+        let grid_x = n_embd.div_ceil(block_x);
+        let cfg = LaunchConfig {
+            grid: (grid_x, n_hc, batch),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
 
     /// Launch reading `post` and `comb` directly from a packed `split`

@@ -12,10 +12,15 @@ use crate::sys;
 /// is informational — HIP doesn't tag allocations with a device, so we
 /// track it ourselves so peer-copy calls can pass the right source/dst
 /// device IDs.
+///
+/// `is_view = true` means this struct refers to a sub-range of another
+/// allocation (created via [`DeviceBuffer::slice_view`] /
+/// [`DeviceBuffer::slice_view_mut`]); Drop skips `hipFree` for views.
 pub struct DeviceBuffer<T> {
     raw: sys::hipDeviceptr_t,
     len: usize,
     device_id: i32,
+    is_view: bool,
     _marker: PhantomData<T>,
 }
 
@@ -33,8 +38,40 @@ impl<T> DeviceBuffer<T> {
             raw,
             len,
             device_id,
+            is_view: false,
             _marker: PhantomData,
         })
+    }
+
+    /// Return a non-owning sub-range view starting at `offset` elements
+    /// in, with `len` elements. The returned `DeviceBuffer` is a view —
+    /// its `Drop` does NOT free the underlying allocation. Caller is
+    /// responsible for ensuring the parent allocation outlives the view.
+    ///
+    /// Used for per-batch operations in M50 batched prefill: kernel
+    /// wrappers take `&DeviceBuffer<T>`, so a view lets us point at
+    /// `parent[offset..offset+len]` without restructuring every wrapper.
+    pub fn slice_view(&self, offset: usize, len: usize) -> Self {
+        assert!(
+            offset.checked_add(len).map(|e| e <= self.len).unwrap_or(false),
+            "slice_view out of range: offset={offset} len={len} parent_len={}",
+            self.len
+        );
+        let byte_off = offset.checked_mul(std::mem::size_of::<T>()).expect("byte offset overflow");
+        let raw = unsafe { (self.raw as *mut u8).add(byte_off) as sys::hipDeviceptr_t };
+        DeviceBuffer {
+            raw,
+            len,
+            device_id: self.device_id,
+            is_view: true,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Mutable variant of [`Self::slice_view`]. Same semantics —
+    /// returned view does not own its memory.
+    pub fn slice_view_mut(&mut self, offset: usize, len: usize) -> Self {
+        self.slice_view(offset, len)
     }
 
     pub fn raw(&self) -> sys::hipDeviceptr_t {
@@ -232,7 +269,7 @@ impl<T> DeviceBuffer<T> {
 
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
-        if !self.raw.is_null() {
+        if !self.raw.is_null() && !self.is_view {
             let code = unsafe { sys::hipFree(self.raw) };
             if code != sys::HIP_SUCCESS {
                 tracing::warn!(code, "hipFree failed during drop");
