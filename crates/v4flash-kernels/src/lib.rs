@@ -35,6 +35,7 @@ pub mod q8_k;
 pub mod rms_norm;
 pub mod rope;
 pub mod weights;
+pub mod wmma_probe;
 
 pub use attention::{AttentionMixed, AttentionSwa, ATTN_MIXED_MAX_KEYS, ATTN_SWA_MAX_KV};
 pub use broadcast::BroadcastToHc;
