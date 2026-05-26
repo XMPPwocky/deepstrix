@@ -19,7 +19,8 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::het::{
-    BatchDgpuScratch, BatchScratch, ExecMode, HetModelState, HetModelWeights, HeterogeneousEngine,
+    BatchDgpuScratch, BatchIgpuScratch, BatchScratch, ExecMode, HetModelState, HetModelWeights,
+    HeterogeneousEngine,
 };
 use v4flash_kernels::{ActivationDump, RopeParams};
 
@@ -205,8 +206,9 @@ fn bench_prefill_v2() -> eyre::Result<()> {
     let main_weights = HetModelWeights::load_all(&main_gguf, dgpu, igpu, &rope_for_layer)?;
     let engine =
         HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
-    let mut bs = BatchScratch::alloc(dgpu, igpu)?; // for shared_igpu
+    let mut _bs = BatchScratch::alloc(dgpu, igpu)?;
     let mut bd = BatchDgpuScratch::alloc(dgpu)?;
+    let mut bi = BatchIgpuScratch::alloc(igpu)?;
 
     // Load real dump inputs for the first 7 positions; repeat thereafter
     // to support synthetic B>7 timing tests. (Repeated inputs make KV
@@ -233,7 +235,7 @@ fn bench_prefill_v2() -> eyre::Result<()> {
         let mut state = HetModelState::alloc(dgpu, igpu, b as u32 + 4)?;
         engine.forward_prompt_batch_v2(
             &mut bd,
-            &mut bs.shared_igpu,
+            &mut bi,
             &mut state,
             &main_weights,
             &input_hcs,
@@ -248,7 +250,7 @@ fn bench_prefill_v2() -> eyre::Result<()> {
         let t0 = Instant::now();
         engine.forward_prompt_batch_v2(
             &mut bd,
-            &mut bs.shared_igpu,
+            &mut bi,
             &mut state,
             &main_weights,
             &input_hcs,

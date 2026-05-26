@@ -25,7 +25,8 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::het::{
-    BatchDgpuScratch, BatchScratch, ExecMode, HetModelState, HetModelWeights, HeterogeneousEngine,
+    BatchDgpuScratch, BatchIgpuScratch, BatchScratch, ExecMode, HetModelState, HetModelWeights,
+    HeterogeneousEngine,
 };
 use v4flash_kernels::{ActivationDump, RopeParams};
 
@@ -256,6 +257,7 @@ fn forward_prompt_batch_v2_matches_sequential() -> eyre::Result<()> {
     // loops per-batch for iGPU MoE through the same shared IgpuScratch).
     let mut batch_scratch = BatchScratch::alloc(dgpu, igpu)?;
     let mut batch_dgpu = BatchDgpuScratch::alloc(dgpu)?;
+    let mut batch_igpu = BatchIgpuScratch::alloc(igpu)?;
 
     // Run A: sequential single-token (reference).
     eprintln!("Run A: sequential forward_token × {b}");
@@ -284,7 +286,7 @@ fn forward_prompt_batch_v2_matches_sequential() -> eyre::Result<()> {
     let mut v2_state = HetModelState::alloc(dgpu, igpu, b as u32 + 4)?;
     engine.forward_prompt_batch_v2(
         &mut batch_dgpu,
-        &mut batch_scratch.shared_igpu,
+        &mut batch_igpu,
         &mut v2_state,
         &main_weights,
         &input_hcs,
@@ -387,7 +389,8 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
 
     // Two parallel paths.
     let mut bs = BatchScratch::alloc(dgpu, igpu)?; // Phase 1 reference
-    let mut bd = BatchDgpuScratch::alloc(dgpu)?;   // Phase 2 v2
+    let mut bd = BatchDgpuScratch::alloc(dgpu)?;   // Phase 2 v2 dGPU side
+    let mut bi = BatchIgpuScratch::alloc(igpu)?;   // Phase 3 v2 iGPU side
 
     let mut ref_state = HetModelState::alloc(dgpu, igpu, b_n as u32 + 4)?;
     let mut v2_state = HetModelState::alloc(dgpu, igpu, b_n as u32 + 4)?;
@@ -427,7 +430,7 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
         // ---- Phase 2 v2: one forward_layer_batch_v2 call (B-wide) ----
         engine.forward_layer_batch_v2(
             &mut bd,
-            &mut bs.shared_igpu,
+            &mut bi,
             &mut v2_state.layers[layer],
             &main_weights.dgpu_layers[layer],
             &main_weights.igpu_layers[layer],

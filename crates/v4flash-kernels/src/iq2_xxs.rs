@@ -409,4 +409,76 @@ impl Iq2XxsPairMatvec {
         };
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
+
+    /// M50 Phase 3 v0: batched variant — grid.z = B. Per-batch xq, selected,
+    /// expert_w, mid. Weight shared across batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_batch_bxn(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,        // [B, n_used, n_rows]
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,              // [B, n_blocks * 292]
+        expert_w: &DeviceBuffer<f32>,       // [B, n_used]
+        selected: &DeviceBuffer<i32>,       // [B, n_used]
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        if n_rows % 8 != 0 {
+            return Err(eyre!(
+                "iq2_xxs_pair_fused_batch_bxn: n_rows={n_rows} must be multiple of 8"
+            ));
+        }
+        let needed = (batch as usize) * (n_used as usize) * (n_rows as usize);
+        if mid.len() < needed {
+            return Err(eyre!(
+                "mid out len {} < B*n_used*n_rows = {needed}",
+                mid.len()
+            ));
+        }
+        let function = self
+            .module
+            .get_function("iq2_xxs_pair_matvec_fused_swiglu_batch_BxN")?;
+        let mut mid_ptr = mid.raw();
+        let mut gw_ptr = gate_w_base.raw();
+        let mut uw_ptr = up_w_base.raw();
+        let mut xq_ptr = xq.raw();
+        let mut ew_ptr = expert_w.raw();
+        let mut sel_ptr = selected.raw();
+        let mut gbpe = gate_bpe;
+        let mut ubpe = up_bpe;
+        let mut nu = n_used;
+        let mut clamp_v = clamp;
+        let mut nr = n_rows;
+        let mut nb = n_blocks;
+        let mut args: [*mut c_void; 12] = [
+            &mut mid_ptr as *mut _ as *mut c_void,
+            &mut gw_ptr as *mut _ as *mut c_void,
+            &mut uw_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut ew_ptr as *mut _ as *mut c_void,
+            &mut sel_ptr as *mut _ as *mut c_void,
+            &mut gbpe as *mut _ as *mut c_void,
+            &mut ubpe as *mut _ as *mut c_void,
+            &mut nu as *mut _ as *mut c_void,
+            &mut clamp_v as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, n_used, batch),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
 }

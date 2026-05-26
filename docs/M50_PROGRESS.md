@@ -54,8 +54,9 @@ All v0 designs: `grid.z = B` parallel WGs, no W-amortization across batch (each 
 5. **Validate** via `forward_prompt_batch_matches_sequential` oracle at B=4, 8 (tolerance ~1e-3 — float reduction order will differ from single-token).
 6. **Bench**: expect 70-100 tok/s at B=64 with dGPU batched + iGPU still serial.
 
-### 🔲 Phase 3: iGPU MoE batching
-Extend `iq2_xxs_pair_matvec_fused_swiglu_batch` and `q2_k_matvec_par_batched` to grid.z = B, with per-batch routing buffers. Same v0 pattern as Phase 2. Expect: routed MoE wall scales 4-8× at B=64.
+### ✅ Phase 3: iGPU MoE batching
+
+Added `iq2_xxs_pair_matvec_fused_swiglu_batch_BxN` and `q2_k_matvec_par_batched_BxN` (grid.z = B). Added `BatchIgpuScratch` with B-extended buffers. Stage 11 in `forward_layer_batch_v2` now does a single batched peer-push + 4 batched iGPU kernel launches + single batched peer-push back — replaces the per-batch serial loop. Bit-identical oracle at B=7. Batching is **by token** (each WG handles one (row_block, slot, token) triple) — no SGLang-style expert-major grouping, because at B=64 / 256 experts / top-6 the expected unique-experts-touched is ~78% (avg reuse ≈ 1.9×), so per-expert amortization is small.
 
 ### 🔲 Phase 4: per-token causal attention
 `attn_swa_batched` and `attn_mixed_batched` with per-batch `n_kv[b]` array. Each token attends to a different KV prefix (causal). KV cache is shared.
@@ -105,7 +106,7 @@ crates/v4flash-kernels/
 
 - Master single-token decode (M31): **27.95 tok/s** sustained (35.78 ms/tok p50)
 - Phase 1 prefill at B=7: 12.94 tok/s (77 ms/tok — pair_mode overhead, no batching)
-- **Phase 2 v2 measured** (`bench_prefill_v2`):
+- **Phase 2 v2 measured** (`bench_prefill_v2`) — pre-Phase-3:
 
   | B  | best tok/s | median tok/s | ms/tok (best) |
   |----|-----------:|-------------:|--------------:|
@@ -115,8 +116,20 @@ crates/v4flash-kernels/
   | 32 |      44.97 |        43.06 |          22.2 |
   | 64 |      42.97 |        41.69 |          23.3 |
 
-  Plateaus at ~43-45 tok/s. ~1.5× single-token decode. Bottleneck: iGPU MoE
-  + attention still in serial per-batch loops (Phases 3+4 unblock).
+  Plateaued at ~43-45 tok/s (~1.5× single-token). Bottleneck: iGPU MoE
+  + attention still in serial per-batch loops.
 
-- Phase 3 target at B=64: 150-250 tok/s (full batched)
+- **Phase 3 v2 measured** (`bench_prefill_v2`) — iGPU MoE batched, attention still serial:
+
+  | B  | best tok/s | median tok/s | ms/tok (best) | vs Phase 2 |
+  |----|-----------:|-------------:|--------------:|-----------:|
+  |  7 |      52.41 |        51.90 |          19.1 |       1.27× |
+  | 16 |      61.30 |        60.84 |          16.3 |       1.39× |
+  | 32 |      63.93 |        62.90 |          15.6 |       1.42× |
+  | 64 |      62.15 |        61.55 |          16.1 |       1.44× |
+
+  ~62-64 tok/s = **2.3× single-token decode**. Plateau likely from attention
+  still per-batch + per-batch wide router matvec.
+
+- Phase 4 target at B=64: 100+ tok/s (attention batched)
 - Phase 6 target on 200-token prompt: ≥ 150 tok/s with `last_only=true`

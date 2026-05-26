@@ -18,9 +18,10 @@ use v4flash_hip::{Device, DeviceBuffer};
 
 use crate::forward::{
     BLOCKS_GROUPED_OUT, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
-    HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED, N_FF_SHARED, N_HEAD_DIM, N_LORA_Q,
-    OUT_LOW, Q_FLAT,
+    BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED,
+    N_FF_EXP, N_FF_SHARED, N_HEAD_DIM, N_LORA_Q, OUT_LOW, Q_FLAT,
 };
+use crate::q8_k::BLOCK_Q8_K_BYTES;
 
 use super::scratch::{DgpuScratch, IgpuScratch};
 
@@ -155,10 +156,60 @@ pub struct BatchDgpuScratch {
     pub mid_sh_xscale: DeviceBuffer<f32>,
     pub ffn_shared: DeviceBuffer<f32>,
 
-    /// `[B, N_EMBD]` — peer-arrival mailbox for iGPU MoE output. iGPU
-    /// pushes per-batch in the serial inner loop; we add ffn_shared via
-    /// a B-stretched vec_add then run hc_post.
+    /// `[B, N_EMBD]` — peer-arrival mailbox for iGPU MoE output. Single
+    /// batched peer-push from iGPU (Phase 3); then vec_add ffn_shared and
+    /// run hc_post.
     pub ffn_moe_recv: DeviceBuffer<f32>,
+}
+
+/// M50 Phase 3: per-batch iGPU scratch with B-extended buffers.
+///
+/// Mirrors [`IgpuScratch`]'s MoE-relevant fields but each sized for
+/// `B_MAX × per_token_size`. Used by the batched iGPU MoE in
+/// `forward_layer_batch_v2`: one peer-push of `[B, N_EMBD]` ain, one
+/// batched iq2 + q2k call chain, one peer-push of `[B, N_EMBD]` ffn_moe
+/// back — replaces the per-batch serial loop.
+///
+/// Memory at B_MAX=64 (rough):
+/// * `ffn_input_norm_recv` 64×16KB = 1 MB
+/// * `d_xq_q8k` 64×~4.7KB = 300 KB
+/// * `d_mid_cat` 64×6×8KB = 3 MB
+/// * `d_midq_cat` 64×6×~2.3KB = 880 KB
+/// * `ffn_moe` 64×16KB = 1 MB
+/// * `d_selected`/`d_ew` 64×6 = 1.5 KB each
+/// Total: ~6 MB. Negligible vs the 52 GiB resident expert weights.
+pub struct BatchIgpuScratch {
+    pub ffn_input_norm_recv: DeviceBuffer<f32>,
+    pub d_xq_q8k: DeviceBuffer<u8>,
+    pub d_mid_cat: DeviceBuffer<f32>,
+    pub d_midq_cat: DeviceBuffer<u8>,
+    pub ffn_moe: DeviceBuffer<f32>,
+    pub d_selected: DeviceBuffer<i32>,
+    pub d_ew: DeviceBuffer<f32>,
+}
+
+impl BatchIgpuScratch {
+    pub fn alloc(igpu_device: Device) -> eyre::Result<Self> {
+        igpu_device.set_current()?;
+        let id = igpu_device.id;
+        let b = B_MAX;
+        let xq_bytes_per_batch =
+            (BLOCKS_Q8K_GATE_IN as usize) * BLOCK_Q8_K_BYTES;
+        let midq_bytes_per_batch =
+            (N_EXPERT_USED as usize) * (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
+        Ok(Self {
+            ffn_input_norm_recv: DeviceBuffer::new(id, b * N_EMBD as usize)?,
+            d_xq_q8k: DeviceBuffer::new(id, b * xq_bytes_per_batch)?,
+            d_mid_cat: DeviceBuffer::new(
+                id,
+                b * (N_EXPERT_USED as usize) * (N_FF_EXP as usize),
+            )?,
+            d_midq_cat: DeviceBuffer::new(id, b * midq_bytes_per_batch)?,
+            ffn_moe: DeviceBuffer::new(id, b * N_EMBD as usize)?,
+            d_selected: DeviceBuffer::new(id, b * N_EXPERT_USED as usize)?,
+            d_ew: DeviceBuffer::new(id, b * N_EXPERT_USED as usize)?,
+        })
+    }
 }
 
 impl BatchDgpuScratch {

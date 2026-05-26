@@ -32,7 +32,7 @@ use crate::forward::{
     RANK, RMS_EPS, SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW,
 };
 
-use super::batch_scratch::{BatchDgpuScratch, BatchScratch};
+use super::batch_scratch::{BatchDgpuScratch, BatchIgpuScratch, BatchScratch};
 use super::engine::HeterogeneousEngine;
 use super::scratch::IgpuScratch;
 use super::state::{HetLayerState, HetModelState};
@@ -188,7 +188,7 @@ impl HeterogeneousEngine {
     pub fn forward_prompt_batch_v2(
         &self,
         batch_dgpu: &mut BatchDgpuScratch,
-        igpu_scratch: &mut IgpuScratch,
+        batch_igpu: &mut BatchIgpuScratch,
         state: &mut HetModelState,
         weights: &HetModelWeights,
         input_hcs: &[Vec<f32>],
@@ -236,7 +236,7 @@ impl HeterogeneousEngine {
         for layer in 0..N_LAYER as usize {
             self.forward_layer_batch_v2(
                 batch_dgpu,
-                igpu_scratch,
+                batch_igpu,
                 &mut state.layers[layer],
                 &weights.dgpu_layers[layer],
                 &weights.igpu_layers[layer],
@@ -263,7 +263,7 @@ impl HeterogeneousEngine {
     pub fn forward_layer_batch_v2(
         &self,
         bd: &mut BatchDgpuScratch,
-        ig: &mut IgpuScratch,
+        bi: &mut BatchIgpuScratch,
         ls: &mut HetLayerState,
         dlw: &DgpuLayerWeights,
         ilw: &IgpuLayerWeights,
@@ -877,89 +877,91 @@ impl HeterogeneousEngine {
         // Stage 9 router_topk + Stage 10 shared expert wrote bd.d_selected,
         // bd.d_ew, bd.ffn_input_norm on de.compute. We're about to read
         // them from de.xfer. Without this fence, the peer-pushes race with
-        // the still-pending compute writes and push stale data. Single-
-        // token forward_layer uses events (sev.ain_ready/selected_ready)
-        // for the same reason; v2 takes the simpler bulk-sync route.
+        // the still-pending compute writes. Single-token forward_layer uses
+        // events (sev.ain_ready/selected_ready) for the same reason; v2
+        // takes the simpler bulk-sync route.
         self.set_current_cached(self.dgpu.device)?;
         de.compute.synchronize()?;
-        for i in 0..b as usize {
-            let ain_v = bd.ffn_input_norm.slice_view(i * cs_n_embd, cs_n_embd);
-            let dsel_v = bd.d_selected.slice_view(i * cs_n_used, cs_n_used);
-            let dew_v = bd.d_ew.slice_view(i * cs_n_used, cs_n_used);
+        // Single batched peer-push of all B activations + routing.
+        let ain_v = bd
+            .ffn_input_norm
+            .slice_view(0, (b as usize) * cs_n_embd);
+        let dsel_v = bd.d_selected.slice_view(0, (b as usize) * cs_n_used);
+        let dew_v = bd.d_ew.slice_view(0, (b as usize) * cs_n_used);
+        let mut bi_ain = bi
+            .ffn_input_norm_recv
+            .slice_view_mut(0, (b as usize) * cs_n_embd);
+        let mut bi_sel = bi
+            .d_selected
+            .slice_view_mut(0, (b as usize) * cs_n_used);
+        let mut bi_ew = bi.d_ew.slice_view_mut(0, (b as usize) * cs_n_used);
+        peer_push_f32(&ain_v, &mut bi_ain, &de.xfer)?;
+        peer_push_i32(&dsel_v, &mut bi_sel, &de.xfer)?;
+        peer_push_f32(&dew_v, &mut bi_ew, &de.xfer)?;
+        de.xfer.synchronize()?;
+        drop(bi_ain);
+        drop(bi_sel);
+        drop(bi_ew);
 
-            self.set_current_cached(self.dgpu.device)?;
-            peer_push_f32(&ain_v, &mut ig.ffn_input_norm_recv, &de.xfer)?;
-            peer_push_i32(&dsel_v, &mut ig.d_selected, &de.xfer)?;
-            peer_push_f32(&dew_v, &mut ig.d_ew, &de.xfer)?;
-            de.xfer.synchronize()?;
+        // Single batched iGPU MoE call chain. No captured graph (the
+        // single-token graph baked in N_USED-sized buffer pointers; v2
+        // uses B*N_USED-sized buffers in bi). Phase 3 v0: direct launches.
+        self.set_current_cached(self.igpu.device)?;
+        let ie = &self.igpu;
+        // q8k quantize ain[B*N_EMBD] → d_xq_q8k[B*blocks]. The kernel is
+        // layout-agnostic; just stretch n_blocks by B.
+        ie.q8k.launch(
+            &ie.compute,
+            &mut bi.d_xq_q8k,
+            &bi.ffn_input_norm_recv,
+            crate::forward::BLOCKS_Q8K_GATE_IN * b,
+        )?;
+        ie.iq2.launch_fused_swiglu_batch_bxn(
+            &ie.compute,
+            &mut bi.d_mid_cat,
+            &ilw.routed.gate.buffer,
+            &ilw.routed.up.buffer,
+            &bi.d_xq_q8k,
+            &bi.d_ew,
+            &bi.d_selected,
+            gbpe,
+            ubpe,
+            cs_n_used as u32,
+            crate::forward::SWIGLU_CLAMP_EXP,
+            crate::forward::N_FF_EXP,
+            crate::forward::BLOCKS_Q8K_GATE_IN,
+            b,
+        )?;
+        ie.q8k.launch(
+            &ie.compute,
+            &mut bi.d_midq_cat,
+            &bi.d_mid_cat,
+            crate::forward::BLOCKS_Q8K_DOWN_IN * (cs_n_used as u32) * b,
+        )?;
+        ie.q2k.launch_batched_bxn(
+            &ie.compute,
+            &mut bi.ffn_moe,
+            &ilw.routed.down.buffer,
+            &bi.d_midq_cat,
+            &bi.d_selected,
+            dbpe,
+            mid_blocks_bytes as u32,
+            cs_n_used as u32,
+            N_EMBD,
+            crate::forward::BLOCKS_Q8K_DOWN_IN,
+            b,
+        )?;
+        ie.compute.synchronize()?;
 
-            self.set_current_cached(self.igpu.device)?;
-            let ie = &self.igpu;
-            // Replay the captured iGPU MoE graph if already captured
-            // (single-token path captures it on first call); otherwise
-            // capture here. We use the same shared scratch every call
-            // so pointers in the capture remain valid.
-            {
-                let graph_slot = &self.igpu_moe_graphs[layer as usize];
-                let mut guard = graph_slot.lock().unwrap();
-                if guard.is_none() {
-                    ie.compute.begin_capture(
-                        v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                    )?;
-                    ie.q8k.launch(
-                        &ie.compute,
-                        &mut ig.d_xq_q8k,
-                        &ig.ffn_input_norm_recv,
-                        crate::forward::BLOCKS_Q8K_GATE_IN,
-                    )?;
-                    ie.iq2.launch_fused_swiglu_batch(
-                        &ie.compute,
-                        &mut ig.d_mid_cat,
-                        &ilw.routed.gate.buffer,
-                        &ilw.routed.up.buffer,
-                        &ig.d_xq_q8k,
-                        &ig.d_ew,
-                        &ig.d_selected,
-                        gbpe,
-                        ubpe,
-                        cs_n_used as u32,
-                        crate::forward::SWIGLU_CLAMP_EXP,
-                        crate::forward::N_FF_EXP,
-                        crate::forward::BLOCKS_Q8K_GATE_IN,
-                    )?;
-                    ie.q8k.launch(
-                        &ie.compute,
-                        &mut ig.d_midq_cat,
-                        &ig.d_mid_cat,
-                        crate::forward::BLOCKS_Q8K_DOWN_IN * (cs_n_used as u32),
-                    )?;
-                    ie.q2k.launch_batched(
-                        &ie.compute,
-                        &mut ig.ffn_moe,
-                        &ilw.routed.down.buffer,
-                        &ig.d_midq_cat,
-                        &ig.d_selected,
-                        dbpe,
-                        mid_blocks_bytes as u32,
-                        cs_n_used as u32,
-                        N_EMBD,
-                        crate::forward::BLOCKS_Q8K_DOWN_IN,
-                    )?;
-                    let graph = ie.compute.end_capture()?;
-                    let exec = graph.instantiate()?;
-                    exec.launch(&ie.compute)?;
-                    *guard = Some(exec);
-                } else {
-                    guard.as_ref().unwrap().launch(&ie.compute)?;
-                }
-            }
-            ie.compute.synchronize()?;
-
-            // Push ffn_moe back to dGPU's per-batch slot.
-            let mut moe_dst = bd.ffn_moe_recv.slice_view_mut(i * cs_n_embd, cs_n_embd);
-            peer_push_f32(&ig.ffn_moe, &mut moe_dst, &ie.xfer)?;
-            ie.xfer.synchronize()?;
-        }
+        // Single batched peer-push back of bi.ffn_moe[B*N_EMBD].
+        let bi_ffn_view = bi.ffn_moe.slice_view(0, (b as usize) * cs_n_embd);
+        let mut bd_moe_dst = bd
+            .ffn_moe_recv
+            .slice_view_mut(0, (b as usize) * cs_n_embd);
+        peer_push_f32(&bi_ffn_view, &mut bd_moe_dst, &ie.xfer)?;
+        ie.xfer.synchronize()?;
+        drop(bi_ffn_view);
+        drop(bd_moe_dst);
         self.set_current_cached(self.dgpu.device)?;
 
         // ========================================================

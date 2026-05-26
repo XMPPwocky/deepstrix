@@ -213,3 +213,49 @@ extern "C" __global__ void q2_k_matvec_par_batched(
         out[row] = acc;
     }
 }
+
+// M50 Phase 3 v0: B-batched variant. grid.z = B; each WG processes ONE
+// (row, batch) and loops over n_used slots internally. Per-batch xq
+// midq[B, n_used, n_blocks * BLOCK_Q8_K_BYTES], selected[B, n_used],
+// out[B, n_rows]. Weight tensor SHARED across batch.
+extern "C" __global__ void q2_k_matvec_par_batched_BxN(
+        float          * __restrict__ out,           // [B, n_rows]
+        const uint8_t  * __restrict__ w_base,
+        const uint8_t  * __restrict__ xq_base,       // [B, n_used*xq_slot_stride]
+        const int      * __restrict__ selected,      // [B, n_used]
+        unsigned int     dbpe,
+        unsigned int     xq_slot_stride,
+        unsigned int     n_used,
+        unsigned int     n_rows,
+        unsigned int     n_blocks_in) {
+    const unsigned int row_in_block = threadIdx.x / 32u;
+    const unsigned int lane         = threadIdx.x & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    const unsigned int b            = blockIdx.z;
+    if (row >= n_rows) return;
+
+    const unsigned int block_lane = lane >> 2u;
+    const unsigned int sub        = lane & 3u;
+
+    const uint8_t* xq_b = xq_base
+                        + (size_t)b * (size_t)n_used * (size_t)xq_slot_stride;
+    const int*     sel_b = selected + (size_t)b * (size_t)n_used;
+
+    float acc = 0.0f;
+    for (unsigned int s = 0; s < n_used; s++) {
+        const int e = sel_b[s];
+        const uint8_t* w_expert = w_base + (uint64_t)e * (uint64_t)dbpe;
+        const uint8_t* xq_slot  = xq_b + (uint64_t)s * (uint64_t)xq_slot_stride;
+        const uint8_t* row_base = w_expert + (uint64_t)row * n_blocks_in * BLOCK_Q2_K_BYTES;
+        for (unsigned int bl = block_lane; bl < n_blocks_in; bl += 8u) {
+            const uint8_t* w_blk = row_base + (uint64_t)bl * BLOCK_Q2_K_BYTES;
+            const uint8_t* y_blk = xq_slot  + (uint64_t)bl * BLOCK_Q8_K_BYTES;
+            acc += dot_block_quarter(w_blk, y_blk, sub);
+        }
+    }
+    acc = warp_sum_f32_par(acc);
+
+    if (lane == 0) {
+        out[(size_t)b * (size_t)n_rows + (size_t)row] = acc;
+    }
+}
