@@ -56,6 +56,14 @@ fn bench_iq2_isolated() -> eyre::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(60); // typical for B=64
     let chunk_size: u32 = 16;
+    // BENCH_VARIANT: 0=chunked, 1=inline, 2=zeroidx
+    let variant: u32 = std::env::var("BENCH_VARIANT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let use_inline = variant == 1;
+    let use_zeroidx = variant == 2;
+    eprintln!("variant={variant} (0=chunked, 1=inline, 2=zeroidx)");
     eprintln!("isolated iq2 probe: B={b}, iters={iters}, n_work_items={n_work_items_target}");
 
     let igpu = pick_igpu()?;
@@ -156,26 +164,31 @@ fn bench_iq2_isolated() -> eyre::Result<()> {
         let start = Event::new()?;
         let end = Event::new()?;
         start.record(&stream)?;
-        iq2.launch_fused_swiglu_chunked(
-            &stream,
-            &mut mid,
-            &gate_w,
-            &up_w,
-            &xq,
-            &expert_w,
-            &group_count,
-            &expert_members,
-            &work_items,
-            gate_bpe as u32,
-            up_bpe as u32,
-            cs_n_used,
-            max_per_expert,
-            chunk_size,
-            SWIGLU_CLAMP_EXP,
-            N_FF_EXP,
-            BLOCKS_Q8K_GATE_IN,
-            n_work_items_target,
-        )?;
+        if use_zeroidx {
+            iq2.launch_fused_swiglu_chunked_zeroidx(
+                &stream, &mut mid, &gate_w, &up_w, &xq, &expert_w,
+                &group_count, &expert_members, &work_items,
+                gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+                chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+                n_work_items_target,
+            )?;
+        } else if use_inline {
+            iq2.launch_fused_swiglu_chunked_inline(
+                &stream, &mut mid, &gate_w, &up_w, &xq, &expert_w,
+                &group_count, &expert_members, &work_items,
+                gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+                chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+                n_work_items_target,
+            )?;
+        } else {
+            iq2.launch_fused_swiglu_chunked(
+                &stream, &mut mid, &gate_w, &up_w, &xq, &expert_w,
+                &group_count, &expert_members, &work_items,
+                gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+                chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+                n_work_items_target,
+            )?;
+        }
         end.record(&stream)?;
         stream.synchronize()?;
         walls_ms.push(Event::elapsed_ms(&start, &end)?);

@@ -414,6 +414,31 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
     eprintln!("lds-{chunk_size}     min={:.3} ms  median={:.3} ms  (ratio min={:.3}x  med={:.3}x)",
               lds_min, lds_med, lds_min / bt_min, lds_med / bt_med);
 
+    // ---- Phase 7.4: inline-sign-math variant ----
+    let mut inline_ms: Vec<f32> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let start = Event::new()?;
+        let end = Event::new()?;
+        start.record(&ie.compute)?;
+        let BatchIgpuScratch {
+            d_mid_cat, d_xq_q8k, d_ew, group_count, expert_members, work_items, ..
+        } = &mut bi;
+        ie.iq2.launch_fused_swiglu_chunked_inline(
+            &ie.compute, d_mid_cat,
+            &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+            d_xq_q8k, d_ew, group_count, expert_members, work_items,
+            gbpe, ubpe, cs_n_used, max_per_expert, CHUNK_SIZE,
+            SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN, n_work_items,
+        )?;
+        end.record(&ie.compute)?;
+        ie.compute.synchronize()?;
+        inline_ms.push(Event::elapsed_ms(&start, &end)?);
+    }
+    let in_min = pmin(&inline_ms);
+    let in_med = median(&mut inline_ms.clone());
+    eprintln!("inline-{chunk_size}  min={:.3} ms  median={:.3} ms  (ratio min={:.3}x  med={:.3}x)",
+              in_min, in_med, in_min / bt_min, in_med / bt_med);
+
     // ====================================================
     // DRAM-bound diff-test: same WG count, different expert
     // selection patterns. If kernel is DRAM-bound on weight

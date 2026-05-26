@@ -640,6 +640,80 @@ impl Iq2XxsPairMatvec {
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
 
+    /// Phase 7.4: chunked + inline-sign-math (replaces s_sign_pair LDS lookup
+    /// with VALU bit ops: `i ^ ((popcount(i) & 1) << 7) → expand_signs`).
+    /// Same signature as `launch_fused_swiglu_chunked`. Goal: cut ~half of
+    /// the data-dependent LDS reads to reduce LDSBankConflict + MemUnitBusy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_chunked_inline(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,
+        expert_w: &DeviceBuffer<f32>,
+        group_count: &DeviceBuffer<i32>,
+        expert_members: &DeviceBuffer<i32>,
+        work_items: &DeviceBuffer<i32>,
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+        n_work_items: u32,
+    ) -> eyre::Result<()> {
+        if n_work_items == 0 {
+            return Ok(());
+        }
+        let function = self
+            .module
+            .get_function("iq2_xxs_pair_matvec_fused_swiglu_chunked_inline")?;
+        let mut mid_ptr = mid.raw();
+        let mut gw_ptr = gate_w_base.raw();
+        let mut uw_ptr = up_w_base.raw();
+        let mut xq_ptr = xq.raw();
+        let mut ew_ptr = expert_w.raw();
+        let mut gc_ptr = group_count.raw();
+        let mut em_ptr = expert_members.raw();
+        let mut wi_ptr = work_items.raw();
+        let mut gbpe = gate_bpe;
+        let mut ubpe = up_bpe;
+        let mut nu = n_used;
+        let mut mpe = max_per_expert;
+        let mut cs = chunk_size;
+        let mut clamp_v = clamp;
+        let mut nr = n_rows;
+        let mut nb = n_blocks;
+        let mut args: [*mut c_void; 16] = [
+            &mut mid_ptr as *mut _ as *mut c_void,
+            &mut gw_ptr as *mut _ as *mut c_void,
+            &mut uw_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut ew_ptr as *mut _ as *mut c_void,
+            &mut gc_ptr as *mut _ as *mut c_void,
+            &mut em_ptr as *mut _ as *mut c_void,
+            &mut wi_ptr as *mut _ as *mut c_void,
+            &mut gbpe as *mut _ as *mut c_void,
+            &mut ubpe as *mut _ as *mut c_void,
+            &mut nu as *mut _ as *mut c_void,
+            &mut mpe as *mut _ as *mut c_void,
+            &mut cs as *mut _ as *mut c_void,
+            &mut clamp_v as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, n_work_items, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
     /// Phase 7.3: chunked + per-WG LDS-staged weights. Identical signature
     /// to `launch_fused_swiglu_chunked`. The per-WG cooperative LDS-stage
     /// of iq2 weights cuts global weight reads by a factor of ~B (one
@@ -672,6 +746,79 @@ impl Iq2XxsPairMatvec {
         let function = self
             .module
             .get_function("iq2_xxs_pair_matvec_fused_swiglu_chunked_lds")?;
+        let mut mid_ptr = mid.raw();
+        let mut gw_ptr = gate_w_base.raw();
+        let mut uw_ptr = up_w_base.raw();
+        let mut xq_ptr = xq.raw();
+        let mut ew_ptr = expert_w.raw();
+        let mut gc_ptr = group_count.raw();
+        let mut em_ptr = expert_members.raw();
+        let mut wi_ptr = work_items.raw();
+        let mut gbpe = gate_bpe;
+        let mut ubpe = up_bpe;
+        let mut nu = n_used;
+        let mut mpe = max_per_expert;
+        let mut cs = chunk_size;
+        let mut clamp_v = clamp;
+        let mut nr = n_rows;
+        let mut nb = n_blocks;
+        let mut args: [*mut c_void; 16] = [
+            &mut mid_ptr as *mut _ as *mut c_void,
+            &mut gw_ptr as *mut _ as *mut c_void,
+            &mut uw_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut ew_ptr as *mut _ as *mut c_void,
+            &mut gc_ptr as *mut _ as *mut c_void,
+            &mut em_ptr as *mut _ as *mut c_void,
+            &mut wi_ptr as *mut _ as *mut c_void,
+            &mut gbpe as *mut _ as *mut c_void,
+            &mut ubpe as *mut _ as *mut c_void,
+            &mut nu as *mut _ as *mut c_void,
+            &mut mpe as *mut _ as *mut c_void,
+            &mut cs as *mut _ as *mut c_void,
+            &mut clamp_v as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, n_work_items, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
+    /// Phase 7.5 DIAGNOSTIC: same as chunked but all LDS lookup indices
+    /// forced to 0. Same LDS read count, but broadcast-access → no bank
+    /// conflicts. Result is numerically wrong; ONLY for timing diagnostic.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_chunked_zeroidx(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,
+        expert_w: &DeviceBuffer<f32>,
+        group_count: &DeviceBuffer<i32>,
+        expert_members: &DeviceBuffer<i32>,
+        work_items: &DeviceBuffer<i32>,
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+        n_work_items: u32,
+    ) -> eyre::Result<()> {
+        if n_work_items == 0 {
+            return Ok(());
+        }
+        let function = self
+            .module
+            .get_function("iq2_xxs_pair_matvec_fused_swiglu_chunked_zeroidx")?;
         let mut mid_ptr = mid.raw();
         let mut gw_ptr = gate_w_base.raw();
         let mut uw_ptr = up_w_base.raw();
