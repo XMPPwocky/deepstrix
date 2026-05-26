@@ -157,3 +157,27 @@ crates/v4flash-kernels/
 
   200-token prompt prefill cut from ~7s to ~3.3s — meaningful UX win for
   the "wait before first generated token" experience.
+
+- **Phase 7 v0 by-expert iq2** — NOT a perf win, kept for infrastructure
+  (`iq2_xxs_pair_matvec_fused_swiglu_by_expert` + `moe_group_builder`).
+  Dead-WG cost dominates at small B (1.3× slower @ B=4), popular-expert
+  tail at large B (1.03× slower @ B=256). Reverted; replaced by chunked.
+
+- **Phase 7.2 chunked-static by-expert iq2** — modest production win.
+  Adds `moe_work_items_builder` pre-pass + `iq2_xxs_pair_matvec_fused_swiglu_chunked`.
+  Chunk=16 (WMMA-future-proof). Each WG handles ≤16 members of one expert.
+
+  | B | by-token | chunked-16 | delta |
+  |---|---:|---:|---:|
+  | 16 | 1.92 ms | 1.85 | −4% |
+  | 64 | 7.59 | 7.25 | −5% |
+  | 256 | 29.80 | 28.94 | −3% |
+
+  End-to-end at B=64: 67.68 → **69.15 tok/s (+2.2%)** = **2.47× single-token**.
+
+  **NODOT diagnostic** (strips dot loop, keeps LDS init + xq load + reduces):
+  at B=256 chunk=16, dot-product = 23.7 ms / 28.9 ms total = **82% of wall**.
+  iq2 is COMPUTE-bound on dp4a, not BW-bound. 6× BW savings from by-expert
+  grouping IS real but capped at the 18% non-dot portion → hard ceiling on
+  dispatch-based wins. **WMMA on dequanted weights is the only lever big
+  enough to attack the 82%.** WMMA fragment throughput is ~32× dp4a.
