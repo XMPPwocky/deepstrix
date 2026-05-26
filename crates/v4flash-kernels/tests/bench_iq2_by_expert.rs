@@ -414,6 +414,143 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
     eprintln!("lds-{chunk_size}     min={:.3} ms  median={:.3} ms  (ratio min={:.3}x  med={:.3}x)",
               lds_min, lds_med, lds_min / bt_min, lds_med / bt_med);
 
+    // ====================================================
+    // DRAM-bound diff-test: same WG count, different expert
+    // selection patterns. If kernel is DRAM-bound on weight
+    // reads then "all-same-expert" should be MUCH faster than
+    // "all-disjoint-experts" (L2 reuse vs eviction).
+    // ====================================================
+    // Save the production work_items + group_count + expert_members.
+    let mut prod_work_items_host = vec![0i32; n_work_items as usize];
+    bi.work_items.slice_view(0, n_work_items as usize).copy_to_host(&mut prod_work_items_host)?;
+    let mut prod_gc_host = vec![0i32; N_EXPERT as usize];
+    bi.group_count.copy_to_host(&mut prod_gc_host)?;
+    let mut prod_em_host = vec![0i32; bi.expert_members.len()];
+    bi.expert_members.copy_to_host(&mut prod_em_host)?;
+
+    // Test A: all WGs hit the SAME expert (expert 0). Build wi where
+    // every entry is (0 << 16) | 0. Set group_count[0] = chunk_size and
+    // pre-fill expert_members[0..chunk_size] with valid (b, slot)
+    // packed values so the kernel processes real work.
+    let n_wi_synthetic = n_work_items as usize;
+    let same_wi: Vec<i32> = vec![(0i32 << 16) | 0; n_wi_synthetic];
+    let mut same_gc = vec![0i32; N_EXPERT as usize];
+    same_gc[0] = CHUNK_SIZE as i32;
+    let mut same_em = vec![0i32; bi.expert_members.len()];
+    for i in 0..(CHUNK_SIZE as usize) {
+        let b_idx = i % (b as usize);
+        let slot = i % (cs_n_used as usize);
+        same_em[0 * (max_per_expert as usize) + i] = ((b_idx as i32) << 16) | (slot as i32);
+    }
+    bi.work_items.slice_view_mut(0, n_wi_synthetic).copy_from_host(&same_wi)?;
+    bi.group_count.copy_from_host(&same_gc)?;
+    bi.expert_members.copy_from_host(&same_em)?;
+
+    let mut same_ms: Vec<f32> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let start = Event::new()?;
+        let end = Event::new()?;
+        start.record(&ie.compute)?;
+        let BatchIgpuScratch {
+            d_mid_cat, d_xq_q8k, d_ew, group_count, expert_members, work_items, ..
+        } = &mut bi;
+        ie.iq2.launch_fused_swiglu_chunked(
+            &ie.compute, d_mid_cat,
+            &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+            d_xq_q8k, d_ew, group_count, expert_members, work_items,
+            gbpe, ubpe, cs_n_used, max_per_expert, CHUNK_SIZE,
+            SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN, n_work_items,
+        )?;
+        end.record(&ie.compute)?;
+        ie.compute.synchronize()?;
+        same_ms.push(Event::elapsed_ms(&start, &end)?);
+    }
+
+    // Test B: all WGs hit DISTINCT experts. work_items[i] = (i << 16) | 0
+    // for i in [0..min(n_wi, N_EXPERT)). For each used expert e, set
+    // group_count[e] = chunk_size and fill expert_members.
+    let n_distinct = std::cmp::min(n_wi_synthetic, N_EXPERT as usize);
+    let mut disjoint_wi = Vec::with_capacity(n_wi_synthetic);
+    for i in 0..n_wi_synthetic {
+        let e = i % n_distinct;
+        disjoint_wi.push(((e as i32) << 16) | 0);
+    }
+    let mut disjoint_gc = vec![0i32; N_EXPERT as usize];
+    let mut disjoint_em = vec![0i32; bi.expert_members.len()];
+    for e in 0..n_distinct {
+        disjoint_gc[e] = CHUNK_SIZE as i32;
+        for i in 0..(CHUNK_SIZE as usize) {
+            let b_idx = i % (b as usize);
+            let slot = i % (cs_n_used as usize);
+            disjoint_em[e * (max_per_expert as usize) + i] = ((b_idx as i32) << 16) | (slot as i32);
+        }
+    }
+    bi.work_items.slice_view_mut(0, n_wi_synthetic).copy_from_host(&disjoint_wi)?;
+    bi.group_count.copy_from_host(&disjoint_gc)?;
+    bi.expert_members.copy_from_host(&disjoint_em)?;
+
+    let mut disjoint_ms: Vec<f32> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let start = Event::new()?;
+        let end = Event::new()?;
+        start.record(&ie.compute)?;
+        let BatchIgpuScratch {
+            d_mid_cat, d_xq_q8k, d_ew, group_count, expert_members, work_items, ..
+        } = &mut bi;
+        ie.iq2.launch_fused_swiglu_chunked(
+            &ie.compute, d_mid_cat,
+            &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+            d_xq_q8k, d_ew, group_count, expert_members, work_items,
+            gbpe, ubpe, cs_n_used, max_per_expert, CHUNK_SIZE,
+            SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN, n_work_items,
+        )?;
+        end.record(&ie.compute)?;
+        ie.compute.synchronize()?;
+        disjoint_ms.push(Event::elapsed_ms(&start, &end)?);
+    }
+
+    // Test C: SORTED — same production expert distribution but work_items
+    // sorted by expert_id so consecutive WGs (which the HW scheduler tends
+    // to co-dispatch) hit the same expert → max L2 reuse.
+    bi.work_items.slice_view_mut(0, n_work_items as usize).copy_from_host(&prod_work_items_host)?;
+    bi.group_count.copy_from_host(&prod_gc_host)?;
+    bi.expert_members.copy_from_host(&prod_em_host)?;
+    let mut sorted_wi = prod_work_items_host.clone();
+    // Sort by expert_id (upper 16 bits).
+    sorted_wi.sort_by_key(|&wi| (wi >> 16) & 0xffff);
+    bi.work_items.slice_view_mut(0, n_work_items as usize).copy_from_host(&sorted_wi)?;
+
+    let mut sorted_ms: Vec<f32> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let start = Event::new()?;
+        let end = Event::new()?;
+        start.record(&ie.compute)?;
+        let BatchIgpuScratch {
+            d_mid_cat, d_xq_q8k, d_ew, group_count, expert_members, work_items, ..
+        } = &mut bi;
+        ie.iq2.launch_fused_swiglu_chunked(
+            &ie.compute, d_mid_cat,
+            &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+            d_xq_q8k, d_ew, group_count, expert_members, work_items,
+            gbpe, ubpe, cs_n_used, max_per_expert, CHUNK_SIZE,
+            SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN, n_work_items,
+        )?;
+        end.record(&ie.compute)?;
+        ie.compute.synchronize()?;
+        sorted_ms.push(Event::elapsed_ms(&start, &end)?);
+    }
+
+    let same_min = pmin(&same_ms);
+    let disjoint_min = pmin(&disjoint_ms);
+    let sorted_min = pmin(&sorted_ms);
+    eprintln!("\n--- DRAM-bound diff-test (same n_work_items={n_work_items}, same kernel) ---");
+    eprintln!("  same-expert    (all WGs hit expert 0): min={same_min:.3} ms");
+    eprintln!("  disjoint-expert (all WGs distinct e):  min={disjoint_min:.3} ms");
+    eprintln!("  prod-unsorted  (chunked baseline):     min={ch_min:.3} ms");
+    eprintln!("  prod-sorted    (sorted by expert):     min={sorted_min:.3} ms");
+    eprintln!("  Sorted speedup vs unsorted:  {:.3}x", ch_min / sorted_min);
+    eprintln!("  Disjoint slowdown vs same:   {:.3}x", disjoint_min / same_min);
+
     // Print the active-expert count to give context for the ratio.
     let mut gc_host = vec![0i32; N_EXPERT as usize];
     bi.group_count.copy_to_host(&mut gc_host)?;
