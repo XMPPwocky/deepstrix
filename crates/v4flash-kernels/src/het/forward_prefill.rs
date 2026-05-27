@@ -232,6 +232,15 @@ impl HeterogeneousEngine {
             slot.copy_from_host(&input_hcs[i])?;
         }
 
+        // 1b. Upload pos_per_b = [pos0, pos0+1, ..., pos0+B-1] once per chunk.
+        //     Used by batched rope kernels in Stages 2/3/6. Constant across
+        //     layers, so uploaded outside the layer loop.
+        {
+            let pos_host: Vec<i32> = (0..b).map(|i| (pos0 + i as u32) as i32).collect();
+            let mut pos_v = batch_dgpu.pos_per_b.slice_view_mut(0, b);
+            pos_v.copy_from_host_async(&pos_host, &self.dgpu.compute)?;
+        }
+
         // 2. Layer loop: invoke forward_layer_batch_v2 once per layer.
         //    Each call swaps residual / residual_next internally (we do
         //    the swap here for clarity, mirroring forward_token's per-
@@ -540,16 +549,17 @@ impl HeterogeneousEngine {
             RMS_EPS,
             b,
         )?;
-        // Per-token rope on q_normed (serial — pos differs per token).
-        for i in 0..b as usize {
-            let mut q_view = bd.q_normed.slice_view_mut(i * cs_qflat, cs_qflat);
-            de.rope.launch_forward(
+        // M50: batched rope across all B q_normed rows.
+        {
+            let pos_v = bd.pos_per_b.slice_view(0, b as usize);
+            de.rope.launch_forward_batched(
                 &de.compute,
-                &mut q_view,
+                &mut bd.q_normed,
+                &pos_v,
                 N_HEAD,
                 N_HEAD_DIM,
                 N_ROT,
-                pos0 + i as u32,
+                b,
                 &dlw.rope_params,
             )?;
         }
@@ -579,21 +589,29 @@ impl HeterogeneousEngine {
             RMS_EPS,
             b,
         )?;
-        for i in 0..b as usize {
-            let mut kv_view = bd.kv_normed.slice_view_mut(i * cs_kvhd, cs_kvhd);
-            de.rope.launch_forward(
+        // M50: batched rope + fp8 + f16rt across all B kv_normed rows.
+        {
+            let pos_v = bd.pos_per_b.slice_view(0, b as usize);
+            de.rope.launch_forward_batched(
                 &de.compute,
-                &mut kv_view,
+                &mut bd.kv_normed,
+                &pos_v,
                 1,
                 N_HEAD_DIM,
                 N_ROT,
-                pos0 + i as u32,
+                b,
                 &dlw.rope_params,
             )?;
-            de.fp8
-                .launch(&de.compute, &mut kv_view, N_HEAD_DIM - N_ROT)?;
-            de.f16rt.launch(&de.compute, &mut kv_view, N_HEAD_DIM)?;
         }
+        de.fp8.launch_batched(
+            &de.compute,
+            &mut bd.kv_normed,
+            N_HEAD_DIM - N_ROT,
+            N_HEAD_DIM,
+            b,
+        )?;
+        // f16rt is pure elementwise — stretch n by B for a single launch.
+        de.f16rt.launch(&de.compute, &mut bd.kv_normed, b * N_HEAD_DIM)?;
 
         // ========================================================
         // Stage 4: KV cache append + compressor (SERIAL per batch)
@@ -872,15 +890,17 @@ impl HeterogeneousEngine {
         // Stage 6: Output projection (rope_inv per b, then BATCHED q8)
         // ========================================================
         let _t_out = de.events.stage("dgpu.output_proj", &de.compute)?;
-        for i in 0..b as usize {
-            let mut h_view = bd.heads.slice_view_mut(i * cs_qflat, cs_qflat);
-            de.rope.launch_inverse(
+        // M50: batched rope inverse across all B heads rows.
+        {
+            let pos_v = bd.pos_per_b.slice_view(0, b as usize);
+            de.rope.launch_inverse_batched(
                 &de.compute,
-                &mut h_view,
+                &mut bd.heads,
+                &pos_v,
                 N_HEAD,
                 N_HEAD_DIM,
                 N_ROT,
-                pos0 + i as u32,
+                b,
                 &dlw.rope_params,
             )?;
         }
