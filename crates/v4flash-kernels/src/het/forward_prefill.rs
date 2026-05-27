@@ -352,38 +352,86 @@ impl HeterogeneousEngine {
         // they should use the single-lane forward_prompt_batch_v2.
         let mut stats_a = stats;
 
-        for layer in 0..N_LAYER as usize {
-            let sev_a = &self.sync_events.layers[layer];
-            let sev_b = &self.sync_events_t1.layers[layer];
+        // Deep pipeline: queue lane A's L+1 pre-MoE immediately after lane A's
+        // L post-MoE (NOT after lane B's L post-MoE). On the dgpu.compute FIFO
+        // this means lane A's next layer can start as soon as lane A's MoE is
+        // back, regardless of how long lane B's MoE still has to run.
+        //
+        // Stream order in steady state:
+        //   ... [wait moe_A(L)] post_A(L) pre_A(L+1) [wait moe_B(L)] post_B(L) pre_B(L+1) ...
+        //
+        // vs. the shallow version (which we replaced):
+        //   ... [wait moe_A(L)] post_A(L) [wait moe_B(L)] post_B(L) pre_A(L+1) pre_B(L+1) ...
+        // — the shallow version stalled pre_A(L+1) behind moe_arrived_B(L).
 
+        // Warmup: queue layer 0 pre-MoE for both lanes.
+        let layer0 = 0usize;
+        self.forward_layer_pre_moe_v2(
+            bd_a,
+            bi_a,
+            &mut state.layers[layer0],
+            &weights.dgpu_layers[layer0],
+            &weights.igpu_layers[layer0],
+            pos0_a,
+            tokens_a,
+            stats_a.as_deref_mut(),
+            &self.sync_events.layers[layer0],
+        )?;
+        self.forward_layer_pre_moe_v2(
+            bd_b,
+            bi_b,
+            &mut state.layers[layer0],
+            &weights.dgpu_layers[layer0],
+            &weights.igpu_layers[layer0],
+            pos0_b,
+            tokens_b,
+            None,
+            &self.sync_events_t1.layers[layer0],
+        )?;
+
+        // Steady state: for each layer L in 0..N_LAYER-1, queue post_X(L)
+        // followed by pre_X(L+1) for the SAME lane, before moving to lane B.
+        for layer in 0..(N_LAYER as usize - 1) {
+            let sev_a_cur = &self.sync_events.layers[layer];
+            let sev_b_cur = &self.sync_events_t1.layers[layer];
+
+            // Lane A: finish layer L, then start layer L+1.
+            self.forward_layer_post_moe_v2(bd_a, b_a as u32, sev_a_cur)?;
+            std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
             self.forward_layer_pre_moe_v2(
                 bd_a,
                 bi_a,
-                &mut state.layers[layer],
-                &weights.dgpu_layers[layer],
-                &weights.igpu_layers[layer],
+                &mut state.layers[layer + 1],
+                &weights.dgpu_layers[layer + 1],
+                &weights.igpu_layers[layer + 1],
                 pos0_a,
                 tokens_a,
                 stats_a.as_deref_mut(),
-                sev_a,
+                &self.sync_events.layers[layer + 1],
             )?;
+
+            // Lane B: same.
+            self.forward_layer_post_moe_v2(bd_b, b_b as u32, sev_b_cur)?;
+            std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
             self.forward_layer_pre_moe_v2(
                 bd_b,
                 bi_b,
-                &mut state.layers[layer],
-                &weights.dgpu_layers[layer],
-                &weights.igpu_layers[layer],
+                &mut state.layers[layer + 1],
+                &weights.dgpu_layers[layer + 1],
+                &weights.igpu_layers[layer + 1],
                 pos0_b,
                 tokens_b,
                 None,
-                sev_b,
+                &self.sync_events_t1.layers[layer + 1],
             )?;
-            self.forward_layer_post_moe_v2(bd_a, b_a as u32, sev_a)?;
-            self.forward_layer_post_moe_v2(bd_b, b_b as u32, sev_b)?;
-
-            std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
-            std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
         }
+
+        // Cooldown: post-MoE for the final layer on both lanes.
+        let last = N_LAYER as usize - 1;
+        self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[last])?;
+        std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
+        self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[last])?;
+        std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
 
         self.dgpu.compute.synchronize()?;
         Ok(())
