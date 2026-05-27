@@ -343,8 +343,24 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
         eprintln!("perfetto: enabling, output → {perfetto_out}");
         engine.attach_perfetto(&perfetto_out)?;
     }
+    // PIPELINE_LANES=2 turns on the two-lane pipelined prefill driver
+    // (two BatchScratch sets, lane A + lane B interleaved per layer).
+    // Default 1 keeps the original single-lane path.
+    let pipeline_lanes: u32 = std::env::var("PIPELINE_LANES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     let mut bd = BatchDgpuScratch::alloc(dgpu)?;
     let mut bi = BatchIgpuScratch::alloc(igpu)?;
+    let (mut bd_b, mut bi_b) = if pipeline_lanes >= 2 {
+        eprintln!("PIPELINE_LANES=2: allocating second BatchScratch set");
+        (
+            Some(BatchDgpuScratch::alloc(dgpu)?),
+            Some(BatchIgpuScratch::alloc(igpu)?),
+        )
+    } else {
+        (None, None)
+    };
     let mut head_scratch = DgpuScratch::alloc(dgpu)?;
 
     let n_real = PROMPT_TOKENS.len();
@@ -364,37 +380,65 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
         eprintln!("(T>{n_real}: repeating real inputs cyclically — timing only)");
     }
 
+    let mut run_once = |bd: &mut BatchDgpuScratch,
+                        bi: &mut BatchIgpuScratch,
+                        bd_b: Option<&mut BatchDgpuScratch>,
+                        bi_b: Option<&mut BatchIgpuScratch>,
+                        state: &mut HetModelState|
+     -> eyre::Result<()> {
+        if let (Some(bdb), Some(bib)) = (bd_b, bi_b) {
+            let _ = engine.forward_prefill_pipelined(
+                bd,
+                bi,
+                bdb,
+                bib,
+                &mut head_scratch,
+                state,
+                &main_weights,
+                &input_hcs,
+                &tokens,
+                0,
+                last_only,
+                None,
+            )?;
+        } else {
+            let _ = engine.forward_prefill(
+                bd,
+                bi,
+                &mut head_scratch,
+                state,
+                &main_weights,
+                &input_hcs,
+                &tokens,
+                0,
+                last_only,
+                None,
+            )?;
+        }
+        Ok(())
+    };
+
     eprintln!("warmup × {n_warmup}");
     for _ in 0..n_warmup {
         let mut state = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
-        let _ = engine.forward_prefill(
+        run_once(
             &mut bd,
             &mut bi,
-            &mut head_scratch,
+            bd_b.as_mut(),
+            bi_b.as_mut(),
             &mut state,
-            &main_weights,
-            &input_hcs,
-            &tokens,
-            0,
-            last_only,
-            None,
         )?;
     }
     let mut walls_ms: Vec<f64> = Vec::with_capacity(n_iters);
     for it in 0..n_iters {
         let mut state = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
         let t0 = Instant::now();
-        let _ = engine.forward_prefill(
+        run_once(
             &mut bd,
             &mut bi,
-            &mut head_scratch,
+            bd_b.as_mut(),
+            bi_b.as_mut(),
             &mut state,
-            &main_weights,
-            &input_hcs,
-            &tokens,
-            0,
-            last_only,
-            None,
         )?;
         let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
         walls_ms.push(wall_ms);

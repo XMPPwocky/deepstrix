@@ -266,6 +266,129 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
+    /// Two-lane pipelined version of `forward_prompt_batch_v2`. Splits the
+    /// chunk into lane A (first ceil(B/2) tokens) and lane B (the rest)
+    /// and interleaves them on the layer loop so:
+    ///   per-layer order on de.compute = pre_A stages, pre_B stages,
+    ///                                   ffn_combine_A, ffn_combine_B
+    ///   per-layer order on ie.compute = q8k+group+wis+iq2+q2k_A,
+    ///                                   q8k+group+wis+iq2+q2k_B
+    /// The cross-lane dependency that matters is KV writes: lane B's
+    /// attention at layer L reads KV slots lane A wrote at the same
+    /// layer L. Both lanes share de.compute (FIFO), and pre_A is queued
+    /// before pre_B, so lane A's kv_chain/kv_append always sequences
+    /// before lane B's attn — no event needed.
+    ///
+    /// Lane A uses `self.sync_events`, lane B uses `self.sync_events_t1`
+    /// (both pre-allocated at engine construction for the decode pair
+    /// path; we reuse them here).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prompt_batch_v2_pipelined(
+        &self,
+        bd_a: &mut BatchDgpuScratch,
+        bi_a: &mut BatchIgpuScratch,
+        bd_b: &mut BatchDgpuScratch,
+        bi_b: &mut BatchIgpuScratch,
+        state: &mut HetModelState,
+        weights: &HetModelWeights,
+        input_hcs: &[Vec<f32>],
+        tokens: &[i32],
+        pos0: u32,
+        stats: Option<&mut PrefillStats>,
+    ) -> eyre::Result<()> {
+        let b = tokens.len();
+        if b == 0 {
+            return Ok(());
+        }
+        if input_hcs.len() != b {
+            return Err(eyre!(
+                "forward_prompt_batch_v2_pipelined: input_hcs len {} != tokens len {b}",
+                input_hcs.len()
+            ));
+        }
+        // For chunks too small to bother pipelining, fall back to single-lane.
+        if b < 2 {
+            return self.forward_prompt_batch_v2(
+                bd_a, bi_a, state, weights, input_hcs, tokens, pos0, stats,
+            );
+        }
+        let b_a = b.div_ceil(2);
+        let b_b = b - b_a;
+        let tokens_a = &tokens[..b_a];
+        let tokens_b = &tokens[b_a..];
+        let input_a = &input_hcs[..b_a];
+        let input_b = &input_hcs[b_a..];
+        let pos0_a = pos0;
+        let pos0_b = pos0 + b_a as u32;
+
+        self.current_device
+            .store(-1, std::sync::atomic::Ordering::Relaxed);
+        self.set_current_cached(self.dgpu.device)?;
+
+        for i in 0..b_a {
+            let mut slot = bd_a
+                .residual
+                .slice_view_mut(i * HC_DIM as usize, HC_DIM as usize);
+            slot.copy_from_host(&input_a[i])?;
+        }
+        for i in 0..b_b {
+            let mut slot = bd_b
+                .residual
+                .slice_view_mut(i * HC_DIM as usize, HC_DIM as usize);
+            slot.copy_from_host(&input_b[i])?;
+        }
+        {
+            let pos_a: Vec<i32> = (0..b_a).map(|i| (pos0_a + i as u32) as i32).collect();
+            let mut va = bd_a.pos_per_b.slice_view_mut(0, b_a);
+            va.copy_from_host_async(&pos_a, &self.dgpu.compute)?;
+            let pos_b: Vec<i32> = (0..b_b).map(|i| (pos0_b + i as u32) as i32).collect();
+            let mut vb = bd_b.pos_per_b.slice_view_mut(0, b_b);
+            vb.copy_from_host_async(&pos_b, &self.dgpu.compute)?;
+        }
+
+        // Stats: only lane A collects, to avoid a double mutable borrow of
+        // PrefillStats inside the loop. Pipelined mode is for perf benches,
+        // not for stats collection — if a caller wants per-batch picks,
+        // they should use the single-lane forward_prompt_batch_v2.
+        let mut stats_a = stats;
+
+        for layer in 0..N_LAYER as usize {
+            let sev_a = &self.sync_events.layers[layer];
+            let sev_b = &self.sync_events_t1.layers[layer];
+
+            self.forward_layer_pre_moe_v2(
+                bd_a,
+                bi_a,
+                &mut state.layers[layer],
+                &weights.dgpu_layers[layer],
+                &weights.igpu_layers[layer],
+                pos0_a,
+                tokens_a,
+                stats_a.as_deref_mut(),
+                sev_a,
+            )?;
+            self.forward_layer_pre_moe_v2(
+                bd_b,
+                bi_b,
+                &mut state.layers[layer],
+                &weights.dgpu_layers[layer],
+                &weights.igpu_layers[layer],
+                pos0_b,
+                tokens_b,
+                None,
+                sev_b,
+            )?;
+            self.forward_layer_post_moe_v2(bd_a, b_a as u32, sev_a)?;
+            self.forward_layer_post_moe_v2(bd_b, b_b as u32, sev_b)?;
+
+            std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
+            std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
+        }
+
+        self.dgpu.compute.synchronize()?;
+        Ok(())
+    }
+
     /// M50 Phase 6: chunked prefill driver. Processes `tokens` (length T)
     /// through the v2 batched pipeline in chunks of CHUNK_SIZE=B_MAX. State
     /// carries across chunks via `state.layers[*].{kv_cache,n_raw,compressor}`
@@ -388,6 +511,148 @@ impl HeterogeneousEngine {
                     head_scratch
                         .residual
                         .copy_from_buffer(&bd.residual.slice_view(i * cs_hc, cs_hc))?;
+                    self.forward_head(head_scratch, &weights.global)?;
+                    let mut logits = vec![0f32; cs_vocab];
+                    head_scratch.logits.copy_to_host(&mut logits)?;
+                    out_logits.extend_from_slice(&logits);
+                }
+            }
+
+            chunk_start = chunk_end;
+        }
+        Ok(out_logits)
+    }
+
+    /// Two-lane pipelined chunked prefill. Same contract as
+    /// `forward_prefill` but takes two BatchDgpu/BatchIgpu scratch sets
+    /// (one per lane) and calls `forward_prompt_batch_v2_pipelined`.
+    /// For `last_only`, the last token of each chunk lives in lane B if
+    /// `chunk_b > 1`, otherwise in lane A.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_pipelined(
+        &self,
+        bd_a: &mut BatchDgpuScratch,
+        bi_a: &mut BatchIgpuScratch,
+        bd_b: &mut BatchDgpuScratch,
+        bi_b: &mut BatchIgpuScratch,
+        head_scratch: &mut DgpuScratch,
+        state: &mut HetModelState,
+        weights: &HetModelWeights,
+        input_hcs: &[Vec<f32>],
+        tokens: &[i32],
+        pos0: u32,
+        last_only: bool,
+        mut stats: Option<&mut PrefillStats>,
+    ) -> eyre::Result<Vec<f32>> {
+        let t = tokens.len();
+        if t == 0 {
+            return Ok(Vec::new());
+        }
+        if input_hcs.len() != t {
+            return Err(eyre!(
+                "forward_prefill_pipelined: input_hcs len {} != tokens len {t}",
+                input_hcs.len()
+            ));
+        }
+        let chunk_size = B_MAX;
+        let cs_hc = HC_DIM as usize;
+        let cs_vocab = N_VOCAB as usize;
+
+        let mut out_logits: Vec<f32> = if last_only {
+            Vec::with_capacity(cs_vocab)
+        } else {
+            Vec::with_capacity(t * cs_vocab)
+        };
+
+        let mut chunk_start = 0usize;
+        while chunk_start < t {
+            let chunk_end = (chunk_start + chunk_size).min(t);
+            let chunk_b = chunk_end - chunk_start;
+            let is_last_chunk = chunk_end == t;
+            let chunk_input = &input_hcs[chunk_start..chunk_end];
+            let chunk_tokens = &tokens[chunk_start..chunk_end];
+            let chunk_pos0 = pos0 + chunk_start as u32;
+
+            self.dgpu.events.reset();
+            self.igpu.events.reset();
+
+            self.forward_prompt_batch_v2_pipelined(
+                bd_a,
+                bi_a,
+                bd_b,
+                bi_b,
+                state,
+                weights,
+                chunk_input,
+                chunk_tokens,
+                chunk_pos0,
+                stats.as_deref_mut(),
+            )?;
+
+            if let Some(exp_lock) = &self.perfetto {
+                let mut exp = exp_lock.lock().unwrap();
+                self.dgpu.events.for_each_pair(|name, s, e| {
+                    let track = if name.contains(".xfer") || name.contains(".peer_push") {
+                        &exp.dgpu_xfer
+                    } else {
+                        &exp.dgpu_compute
+                    };
+                    exp.emit_slice(track, name, s, e)
+                })?;
+                self.igpu.events.for_each_pair(|name, s, e| {
+                    let track = if name.contains(".xfer") || name.contains(".peer_push") {
+                        &exp.igpu_xfer
+                    } else {
+                        &exp.igpu_compute
+                    };
+                    exp.emit_slice(track, name, s, e)
+                })?;
+                exp.re_anchor(
+                    self.dgpu.device,
+                    &self.dgpu.compute,
+                    &self.dgpu.xfer,
+                    self.igpu.device,
+                    &self.igpu.compute,
+                    &self.igpu.xfer,
+                )?;
+                self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            // Split point mirrors forward_prompt_batch_v2_pipelined:
+            // first ceil(b/2) tokens → lane A, rest → lane B.
+            let b_a = chunk_b.div_ceil(2);
+            let b_b = chunk_b - b_a;
+
+            if last_only {
+                if is_last_chunk {
+                    // Last token: lives in lane B if b_b > 0, else lane A.
+                    let (src_bd, last_idx) = if b_b > 0 {
+                        (&*bd_b, b_b - 1)
+                    } else {
+                        (&*bd_a, b_a - 1)
+                    };
+                    head_scratch
+                        .residual
+                        .copy_from_buffer(&src_bd.residual.slice_view(last_idx * cs_hc, cs_hc))?;
+                    self.forward_head(head_scratch, &weights.global)?;
+                    let mut logits = vec![0f32; cs_vocab];
+                    head_scratch.logits.copy_to_host(&mut logits)?;
+                    out_logits = logits;
+                }
+            } else {
+                for i in 0..b_a {
+                    head_scratch
+                        .residual
+                        .copy_from_buffer(&bd_a.residual.slice_view(i * cs_hc, cs_hc))?;
+                    self.forward_head(head_scratch, &weights.global)?;
+                    let mut logits = vec![0f32; cs_vocab];
+                    head_scratch.logits.copy_to_host(&mut logits)?;
+                    out_logits.extend_from_slice(&logits);
+                }
+                for i in 0..b_b {
+                    head_scratch
+                        .residual
+                        .copy_from_buffer(&bd_b.residual.slice_view(i * cs_hc, cs_hc))?;
                     self.forward_head(head_scratch, &weights.global)?;
                     let mut logits = vec![0f32; cs_vocab];
                     head_scratch.logits.copy_to_host(&mut logits)?;

@@ -669,3 +669,108 @@ fn forward_prefill_last_only_matches_sequential() -> eyre::Result<()> {
     eprintln!("Phase 6 ORACLE PASS within 5e-2");
     Ok(())
 }
+
+/// Two-lane pipelined prefill oracle: forward_prefill_pipelined should
+/// produce the same last-token logits as a single-lane forward_prefill
+/// on the same prompt. The split point is ceil(B/2), so this also
+/// exercises both lane A and lane B writing KV at the same layer.
+///
+/// Use IQ2_VARIANT=chunked for bit-exact; default staged exhibits the
+/// usual ~1e-5 per-element drift (router argmax flips at deep layers).
+#[test]
+#[ignore]
+fn forward_prefill_pipelined_matches_single_lane() -> eyre::Result<()> {
+    install_panic_handler()?;
+    use v4flash_kernels::forward::HC_DIM;
+    std::env::set_var("IQ2_VARIANT", "chunked");
+
+    let t: usize = std::env::var("BENCH_B")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7)
+        .min(PROMPT_TOKENS.len());
+    eprintln!("pipelined oracle: T={t} (split = ceil(T/2)={})", t.div_ceil(2));
+
+    let dump = ActivationDump::open(dump_dir())?;
+    let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
+    let dgpu = pick_dgpu()?;
+    let igpu = pick_igpu()?;
+    let dgpu_arch = dgpu.properties()?.gcn_arch_name;
+    let igpu_arch = igpu.properties()?.gcn_arch_name;
+
+    let rope_for_layer = |layer: i32| -> eyre::Result<RopeParams> {
+        let entry = dump
+            .weight("rope_params", layer)
+            .ok_or_else(|| eyre!("missing rope_params L{layer}"))?;
+        let floats = dump.read_f32(entry)?;
+        let n_ctx_orig = if floats[2] != 0.0 { ROPE_ORIG_CTX } else { 0 };
+        RopeParams::from_dump_blob(&floats, n_ctx_orig)
+    };
+    let main_weights = HetModelWeights::load_all(&main_gguf, dgpu, igpu, &rope_for_layer)?;
+    let engine =
+        HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
+
+    let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(t);
+    for i in 0..t {
+        let entry = dump
+            .tensor("layer_input_residual", 0, i as i32)
+            .ok_or_else(|| eyre!("missing layer_input_residual L0 T{i}"))?;
+        input_hcs.push(dump.read_f32(entry)?);
+    }
+    let tokens: Vec<i32> = PROMPT_TOKENS[..t].to_vec();
+
+    // Reference: single-lane forward_prefill.
+    eprintln!("Run A: single-lane forward_prefill");
+    let mut bd_a = BatchDgpuScratch::alloc(dgpu)?;
+    let mut bi_a = BatchIgpuScratch::alloc(igpu)?;
+    let mut head_scratch = DgpuScratch::alloc(dgpu)?;
+    let mut state_a = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
+    let logits_single = engine.forward_prefill(
+        &mut bd_a,
+        &mut bi_a,
+        &mut head_scratch,
+        &mut state_a,
+        &main_weights,
+        &input_hcs,
+        &tokens,
+        0,
+        true,
+        None,
+    )?;
+
+    // Test: two-lane pipelined forward_prefill.
+    eprintln!("Run B: forward_prefill_pipelined (lanes=2)");
+    let mut bd_p_a = BatchDgpuScratch::alloc(dgpu)?;
+    let mut bi_p_a = BatchIgpuScratch::alloc(igpu)?;
+    let mut bd_p_b = BatchDgpuScratch::alloc(dgpu)?;
+    let mut bi_p_b = BatchIgpuScratch::alloc(igpu)?;
+    let mut state_b = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
+    let logits_pipelined = engine.forward_prefill_pipelined(
+        &mut bd_p_a,
+        &mut bi_p_a,
+        &mut bd_p_b,
+        &mut bi_p_b,
+        &mut head_scratch,
+        &mut state_b,
+        &main_weights,
+        &input_hcs,
+        &tokens,
+        0,
+        true,
+        None,
+    )?;
+
+    let (maxd, idx) = max_abs_diff(&logits_single, &logits_pipelined);
+    eprintln!(
+        "max abs diff = {maxd:.4e} @i={idx}  single={:.4}  pipelined={:.4}",
+        logits_single[idx], logits_pipelined[idx]
+    );
+    assert!(
+        maxd < 1e-3,
+        "forward_prefill_pipelined diverges from single-lane by {maxd:.4e} (> 1e-3)"
+    );
+    eprintln!("Pipelined ORACLE PASS within 1e-3");
+    // Silence unused warning when HC_DIM only used in some build configs.
+    let _ = HC_DIM;
+    Ok(())
+}
