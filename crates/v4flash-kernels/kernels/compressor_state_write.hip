@@ -28,3 +28,28 @@ extern "C" __global__ void compressor_state_write(
     const float ape_val = __half2float(ape[(unsigned long long)pos_mod * width + j]);
     state_score[stride + j] = sc_cur[j] + ape_val;
 }
+
+// M50 batched: per-batch row + pos_mod arrays. State is shared (single
+// state_kv/state_score per layer); each b writes to its own (row, pos_mod)
+// slot. Caller must guarantee no two batches collide on the same row.
+// kv_cur / sc_cur are [B, width].
+extern "C" __global__ void compressor_state_write_batched(
+        float        * __restrict__ state_kv,
+        float        * __restrict__ state_score,
+        const float  * __restrict__ kv_cur,        // [B, width]
+        const float  * __restrict__ sc_cur,        // [B, width]
+        const __half * __restrict__ ape,
+        const int    * __restrict__ row_per_b,     // [B]
+        const int    * __restrict__ pos_mod_per_b, // [B]
+        unsigned int   width) {
+    const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int b = blockIdx.y;
+    if (j >= width) return;
+    const int row     = row_per_b[b];
+    const int pos_mod = pos_mod_per_b[b];
+    const unsigned long long stride       = (unsigned long long)row * width;
+    const unsigned long long batch_stride = (unsigned long long)b   * width;
+    state_kv[stride + j] = kv_cur[batch_stride + j];
+    const float ape_val = __half2float(ape[(unsigned long long)pos_mod * width + j]);
+    state_score[stride + j] = sc_cur[batch_stride + j] + ape_val;
+}

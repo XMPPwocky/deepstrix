@@ -169,6 +169,39 @@ impl Fp8E4m3fnQuantize {
         };
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
+
+    /// M50 batched: B rows, each `row_stride` elements, quantize the first
+    /// `n_nope` of each row. One launch instead of B.
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        x: &mut DeviceBuffer<f32>,
+        n_nope: u32,
+        row_stride: u32,
+        b: u32,
+    ) -> eyre::Result<()> {
+        if b == 0 {
+            return Ok(());
+        }
+        if n_nope % 64 != 0 {
+            return Err(eyre!("fp8_e4m3fn batched: n_nope={n_nope} not a multiple of 64"));
+        }
+        let function = self.module.get_function("fp8_e4m3fn_quantize_batched")?;
+        let mut x_ptr = x.raw();
+        let mut n_nope_v = n_nope;
+        let mut row_stride_v = row_stride;
+        let mut args: [*mut c_void; 3] = [
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut n_nope_v as *mut _ as *mut c_void,
+            &mut row_stride_v as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (n_nope / 64, b, 1),
+            block: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
 }
 
 /// Combined APE-add + state-row-write. Mirrors ds4.c:6625-6630.
@@ -229,6 +262,57 @@ impl CompressorStateWrite {
         let grid_x = width.div_ceil(block_x);
         let cfg = LaunchConfig {
             grid: (grid_x, 1, 1),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
+    /// M50 batched: per-batch (row, pos_mod) arrays; B separate state writes
+    /// in one launch. Caller must guarantee no two batches collide on the
+    /// same row (V4-Flash compressor: each batch advances pos%ratio + row
+    /// monotonically — collisions only happen across compressor BOUNDARIES,
+    /// not within a single batch on stable rows).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        state_kv: &mut DeviceBuffer<f32>,
+        state_score: &mut DeviceBuffer<f32>,
+        kv_cur: &DeviceBuffer<f32>,
+        sc_cur: &DeviceBuffer<f32>,
+        ape: &DeviceBuffer<u8>,
+        row_per_b: &DeviceBuffer<i32>,
+        pos_mod_per_b: &DeviceBuffer<i32>,
+        width: u32,
+        b: u32,
+    ) -> eyre::Result<()> {
+        if b == 0 {
+            return Ok(());
+        }
+        let function = self.module.get_function("compressor_state_write_batched")?;
+        let mut state_kv_ptr = state_kv.raw();
+        let mut state_sc_ptr = state_score.raw();
+        let mut kv_ptr = kv_cur.raw();
+        let mut sc_ptr = sc_cur.raw();
+        let mut ape_ptr = ape.raw();
+        let mut row_ptr = row_per_b.raw();
+        let mut pos_mod_ptr = pos_mod_per_b.raw();
+        let mut width_v = width;
+        let mut args: [*mut c_void; 8] = [
+            &mut state_kv_ptr as *mut _ as *mut c_void,
+            &mut state_sc_ptr as *mut _ as *mut c_void,
+            &mut kv_ptr as *mut _ as *mut c_void,
+            &mut sc_ptr as *mut _ as *mut c_void,
+            &mut ape_ptr as *mut _ as *mut c_void,
+            &mut row_ptr as *mut _ as *mut c_void,
+            &mut pos_mod_ptr as *mut _ as *mut c_void,
+            &mut width_v as *mut _ as *mut c_void,
+        ];
+        let block_x = 256u32;
+        let grid_x = width.div_ceil(block_x);
+        let cfg = LaunchConfig {
+            grid: (grid_x, b, 1),
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };

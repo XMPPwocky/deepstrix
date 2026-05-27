@@ -43,3 +43,20 @@ extern "C" __global__ void kv_cache_append(
     }
     cache[(unsigned long long)(swa_window - 1) * head_dim + d] = kv_new[d];
 }
+
+// M50 batched: append B contiguous rows to slots
+// [n_raw_before .. n_raw_before + B). Requires n_raw_before + B <= swa_window
+// (no eviction handling on the batched path — caller falls back to serial).
+// Grid (B, 1, 1), block (head_dim, 1, 1).
+extern "C" __global__ void kv_cache_append_batched(
+        float        * __restrict__ cache,         // [swa_window * head_dim]
+        const float  * __restrict__ kv_new,        // [B, head_dim]
+        unsigned int   n_raw_before,
+        unsigned int   head_dim) {
+    const unsigned int d = threadIdx.x;
+    const unsigned int b = blockIdx.x;
+    if (d >= head_dim) return;
+    const unsigned int slot = n_raw_before + b;
+    cache[(unsigned long long)slot * head_dim + d] =
+        kv_new[(unsigned long long)b * head_dim + d];
+}

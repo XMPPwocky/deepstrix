@@ -126,6 +126,55 @@ impl F16Matvec {
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
 
+    /// M50 batched: B independent matvec_pair, sharing the two weight
+    /// matrices across all B. `kv`/`gate` outputs are [B, n_rows]; `x` is
+    /// [B, k]. One launch instead of B.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_pair_batched(
+        &self,
+        stream: &Stream,
+        kv: &mut DeviceBuffer<f32>,
+        gate: &mut DeviceBuffer<f32>,
+        kv_w: &DeviceBuffer<u8>,
+        gate_w: &DeviceBuffer<u8>,
+        x: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+        b: u32,
+    ) -> eyre::Result<()> {
+        if b == 0 {
+            return Ok(());
+        }
+        if k % 2 != 0 {
+            return Err(eyre!("f16 matvec_pair_batched: k={k} must be even"));
+        }
+        let function = self.pair.get_function("f16_matvec_pair_batched")?;
+        let mut kv_ptr = kv.raw();
+        let mut g_ptr = gate.raw();
+        let mut kvw_ptr = kv_w.raw();
+        let mut gw_ptr = gate_w.raw();
+        let mut x_ptr = x.raw();
+        let mut k_v = k;
+        let mut nr_v = n_rows;
+        let mut args: [*mut c_void; 7] = [
+            &mut kv_ptr as *mut _ as *mut c_void,
+            &mut g_ptr as *mut _ as *mut c_void,
+            &mut kvw_ptr as *mut _ as *mut c_void,
+            &mut gw_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut k_v as *mut _ as *mut c_void,
+            &mut nr_v as *mut _ as *mut c_void,
+        ];
+        let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
+        let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, b),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
     /// `out[r] = sum_i f32(weight[r, i]) * x[i]` for `r in 0..n_rows`.
     /// Weight is F16 row-major `[n_rows, k]`, passed as a `DeviceBuffer<u8>`
     /// holding raw F16 bytes (mirrors how Q8_0 weights are passed).

@@ -101,6 +101,107 @@ impl RopeTail {
         self.launch(stream, x, n_head, head_dim, n_rot, pos, params, true)
     }
 
+    /// Batched variant: process B independent (n_head × head_dim) rows in
+    /// one launch. `pos_per_b` is a device buffer of B i32 positions.
+    /// Forward = `inverse=false`, mirror to `launch_inverse_batched`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_forward_batched(
+        &self,
+        stream: &Stream,
+        x: &mut DeviceBuffer<f32>,
+        pos_per_b: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        n_rot: u32,
+        b: u32,
+        params: &RopeParams,
+    ) -> eyre::Result<()> {
+        self.launch_batched(stream, x, pos_per_b, n_head, head_dim, n_rot, b, params, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_inverse_batched(
+        &self,
+        stream: &Stream,
+        x: &mut DeviceBuffer<f32>,
+        pos_per_b: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        n_rot: u32,
+        b: u32,
+        params: &RopeParams,
+    ) -> eyre::Result<()> {
+        self.launch_batched(stream, x, pos_per_b, n_head, head_dim, n_rot, b, params, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_batched(
+        &self,
+        stream: &Stream,
+        x: &mut DeviceBuffer<f32>,
+        pos_per_b: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        n_rot: u32,
+        b: u32,
+        params: &RopeParams,
+        inverse: bool,
+    ) -> eyre::Result<()> {
+        if n_rot % 2 != 0 {
+            return Err(eyre!("rope_tail batched: n_rot={n_rot} must be even"));
+        }
+        if n_rot > head_dim {
+            return Err(eyre!("rope_tail batched: n_rot={n_rot} > head_dim={head_dim}"));
+        }
+        if b == 0 {
+            return Ok(());
+        }
+        let theta_scale = params.freq_base.powf(-2.0 / n_rot as f32);
+        let mscale_eff = if params.ext_factor != 0.0 && params.freq_scale > 0.0 {
+            params.attn_factor * (1.0 + 0.1 * (1.0 / params.freq_scale).ln())
+        } else {
+            params.attn_factor
+        };
+        let (corr_low, corr_high) = if params.ext_factor != 0.0 {
+            corr_dims(n_rot, params.n_ctx_orig, params.freq_base, params.beta_fast, params.beta_slow)
+        } else {
+            (0.0, 0.0)
+        };
+        let function = self.module.get_function("rope_tail_batched")?;
+        let mut x_ptr = x.raw();
+        let mut pos_ptr = pos_per_b.raw();
+        let mut n_head_v = n_head;
+        let mut head_dim_v = head_dim;
+        let mut n_rot_v = n_rot;
+        let mut theta_scale_v = theta_scale;
+        let mut freq_scale_v = params.freq_scale;
+        let mut ext_factor_v = params.ext_factor;
+        let mut mscale_eff_v = mscale_eff;
+        let mut corr_low_v = corr_low;
+        let mut corr_high_v = corr_high;
+        let mut inverse_v: i32 = if inverse { 1 } else { 0 };
+        let mut args: [*mut c_void; 12] = [
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut n_head_v as *mut _ as *mut c_void,
+            &mut head_dim_v as *mut _ as *mut c_void,
+            &mut n_rot_v as *mut _ as *mut c_void,
+            &mut theta_scale_v as *mut _ as *mut c_void,
+            &mut freq_scale_v as *mut _ as *mut c_void,
+            &mut ext_factor_v as *mut _ as *mut c_void,
+            &mut mscale_eff_v as *mut _ as *mut c_void,
+            &mut corr_low_v as *mut _ as *mut c_void,
+            &mut corr_high_v as *mut _ as *mut c_void,
+            &mut inverse_v as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (n_head, 1, b),
+            block: (n_rot / 2, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
     fn launch(
         &self,
         stream: &Stream,

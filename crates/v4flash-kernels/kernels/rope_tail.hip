@@ -62,3 +62,54 @@ extern "C" __global__ void rope_tail(
     tail[i + 0] = x0 * c - x1 * s;
     tail[i + 1] = x0 * s + x1 * c;
 }
+
+// M50: batched variant. Grid (n_head, 1, B), each block handles one
+// (head, batch) pair at pos = pos_per_b[batch]. Eliminates the B× host
+// launch overhead in the per-token serial loops of prefill.
+extern "C" __global__ void rope_tail_batched(
+        float        * x,                  // [B, n_head, head_dim]
+        const int    * __restrict__ pos_per_b,  // [B]
+        unsigned int   n_head,
+        unsigned int   head_dim,
+        unsigned int   n_rot,
+        float          theta_scale,
+        float          freq_scale,
+        float          ext_factor,
+        float          mscale_eff,
+        float          corr_low,
+        float          corr_high,
+        int            inverse) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int b    = blockIdx.z;
+    const unsigned int lane = threadIdx.x;
+    if (head >= n_head) return;
+    if (2u * lane >= n_rot) return;
+
+    const unsigned int n_nope = head_dim - n_rot;
+    const unsigned int i = 2u * lane;
+    const int pos = pos_per_b[b];
+
+    const float theta_extrap = (float)pos * powf(theta_scale, (float)lane);
+    const float theta_interp = freq_scale * theta_extrap;
+
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        const float y = ((float)lane - corr_low) / fmaxf(0.001f, corr_high - corr_low);
+        const float ramp = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+        const float ramp_mix = ramp * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+    }
+
+    const float sin_sign = (inverse != 0) ? -1.0f : 1.0f;
+    const float c = cosf(theta) * mscale_eff;
+    const float s = sin_sign * sinf(theta) * mscale_eff;
+
+    const unsigned long long batch_stride = (unsigned long long)n_head * (unsigned long long)head_dim;
+    float *tail = x + (unsigned long long)b * batch_stride
+                    + (unsigned long long)head * (unsigned long long)head_dim
+                    + n_nope;
+    const float x0 = tail[i + 0];
+    const float x1 = tail[i + 1];
+    tail[i + 0] = x0 * c - x1 * s;
+    tail[i + 1] = x0 * s + x1 * c;
+}

@@ -135,3 +135,50 @@ extern "C" __global__ void fp8_e4m3fn_quantize(
     if (vs < -448.0f) vs = -448.0f;
     x[off + tid] = dsv4_e4m3fn_dequant(vs) * scale;
 }
+
+// M50 batched: B independent rows of `row_stride` length each, quantize
+// the first `n_nope` elements of each (the nope part). Each block handles
+// one (b, block_idx) chunk of 64 elements. Same compute, B-fold launch.
+// Grid (n_nope/64, B), block (64).
+extern "C" __global__ void fp8_e4m3fn_quantize_batched(
+        float        * __restrict__ x,
+        unsigned int   n_nope,
+        unsigned int   row_stride) {
+    const unsigned int block_idx = blockIdx.x;
+    const unsigned int b         = blockIdx.y;
+    const unsigned int tid       = threadIdx.x;
+    const unsigned int off       = block_idx * 64u;
+    if (off >= n_nope) return;
+    float * row = x + (unsigned long long)b * row_stride;
+
+    __shared__ float partial[64];
+    __shared__ float scale_s;
+
+    const float v = row[off + tid];
+    const float av = fabsf(v);
+    partial[tid] = av;
+    __syncthreads();
+
+    for (unsigned int stride = 32; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            const float other = partial[tid + stride];
+            if (other > partial[tid]) partial[tid] = other;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float amax = partial[0];
+        if (amax < 1.0e-4f) amax = 1.0e-4f;
+        const float l = log2f(amax / 448.0f);
+        const int e = (int)ceilf(l);
+        scale_s = ldexpf(1.0f, e);
+    }
+    __syncthreads();
+    const float scale = scale_s;
+
+    float vs = v / scale;
+    if (vs > 448.0f) vs = 448.0f;
+    if (vs < -448.0f) vs = -448.0f;
+    row[off + tid] = dsv4_e4m3fn_dequant(vs) * scale;
+}

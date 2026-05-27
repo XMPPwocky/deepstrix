@@ -97,3 +97,66 @@ extern "C" __global__ void f16_matvec_pair(
         gate[row] = g_acc;
     }
 }
+
+// M50 batched: B independent matvec_pair calls in one launch. Per-batch
+// x[B, k] → kv[B, n_rows], gate[B, n_rows]. Weights shared (same
+// kv_w / gate_w across all B). Grid (n_rows/ROWS, 1, B).
+extern "C" __global__ void f16_matvec_pair_batched(
+        float          * __restrict__ kv,         // [B, n_rows]
+        float          * __restrict__ gate,       // [B, n_rows]
+        const __half   * __restrict__ kv_w,       // [n_rows, k]
+        const __half   * __restrict__ gate_w,     // [n_rows, k]
+        const float    * __restrict__ x,          // [B, k]
+        unsigned int     k,
+        unsigned int     n_rows) {
+    const uint32_t row  = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t b    = blockIdx.z;
+    if (row >= n_rows) return;
+
+    const __half *kv_row   = kv_w   + (size_t)row * (size_t)k;
+    const __half *gate_row = gate_w + (size_t)row * (size_t)k;
+    const float  *x_b      = x      + (size_t)b   * (size_t)k;
+
+    const uint64_t *kv_u64   = reinterpret_cast<const uint64_t*>(kv_row);
+    const uint64_t *gate_u64 = reinterpret_cast<const uint64_t*>(gate_row);
+    const float4   *x_f4     = reinterpret_cast<const float4  *>(x_b);
+    const uint32_t  k4       = k >> 2u;
+
+    float kv_a0 = 0.0f, kv_a1 = 0.0f, kv_a2 = 0.0f, kv_a3 = 0.0f;
+    float g_a0  = 0.0f, g_a1  = 0.0f, g_a2  = 0.0f, g_a3  = 0.0f;
+
+    for (uint32_t i = lane; i < k4; i += WARP) {
+        const uint64_t kv_pack = kv_u64[i];
+        const uint64_t g_pack  = gate_u64[i];
+        const float4   xv      = x_f4[i];
+
+        const __half2 kv_lo = *reinterpret_cast<const __half2*>(&kv_pack);
+        const __half2 kv_hi = *(reinterpret_cast<const __half2*>(&kv_pack) + 1);
+        const __half2 g_lo  = *reinterpret_cast<const __half2*>(&g_pack);
+        const __half2 g_hi  = *(reinterpret_cast<const __half2*>(&g_pack) + 1);
+
+        const float2 fkv_lo = __half22float2(kv_lo);
+        const float2 fkv_hi = __half22float2(kv_hi);
+        const float2 fg_lo  = __half22float2(g_lo);
+        const float2 fg_hi  = __half22float2(g_hi);
+
+        kv_a0 += fkv_lo.x * xv.x;
+        kv_a1 += fkv_lo.y * xv.y;
+        kv_a2 += fkv_hi.x * xv.z;
+        kv_a3 += fkv_hi.y * xv.w;
+        g_a0  += fg_lo.x  * xv.x;
+        g_a1  += fg_lo.y  * xv.y;
+        g_a2  += fg_hi.x  * xv.z;
+        g_a3  += fg_hi.y  * xv.w;
+    }
+
+    float kv_acc = (kv_a0 + kv_a1) + (kv_a2 + kv_a3);
+    float g_acc  = (g_a0  + g_a1)  + (g_a2  + g_a3);
+    kv_acc = warp_sum_f32(kv_acc);
+    g_acc  = warp_sum_f32(g_acc);
+    if (lane == 0) {
+        kv  [(size_t)b * (size_t)n_rows + row] = kv_acc;
+        gate[(size_t)b * (size_t)n_rows + row] = g_acc;
+    }
+}
