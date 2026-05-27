@@ -402,11 +402,11 @@ impl HeterogeneousEngine {
 }
 
 impl HeterogeneousEngine {
-    /// M50 Phase 2: one layer of batched prefill. Reads
+    /// M50 Phase 2: one layer of batched prefill, all phases. Reads
     /// `batch_dgpu.residual` (per-token input HC), writes
     /// `batch_dgpu.residual_next` (per-token output HC). All other
-    /// `batch_dgpu` fields are scratch.
-    #[allow(clippy::too_many_arguments)]
+    /// `batch_dgpu` fields are scratch. Thin wrapper over the split
+    /// pre-MoE + post-MoE methods; single-lane callers use this.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_layer_batch_v2(
         &self,
@@ -419,10 +419,42 @@ impl HeterogeneousEngine {
         tokens: &[i32],
         stats: Option<&mut PrefillStats>,
     ) -> eyre::Result<()> {
+        let layer = dlw.layer_idx as usize;
+        let b = tokens.len() as u32;
+        if b == 0 {
+            return Ok(());
+        }
+        let sev = &self.sync_events.layers[layer];
+        self.forward_layer_pre_moe_v2(bd, bi, ls, dlw, ilw, pos0, tokens, stats, sev)?;
+        self.forward_layer_post_moe_v2(bd, b, sev)?;
+        Ok(())
+    }
+
+    /// Pre-MoE phase of one prefill layer. Submits dGPU stages 1-10
+    /// (attn + router + shared expert), the dGPU→iGPU peer push, the
+    /// iGPU MoE chain (iq2 + q2k_down), and the iGPU→dGPU peer push of
+    /// the MoE output. Records `sev.moe_arrived` once the MoE result has
+    /// landed on dGPU. Does NOT queue `ffn_combine` — the caller drives
+    /// that via `forward_layer_post_moe_v2`, which lets two lanes share
+    /// the de.compute stream without ffn_combine serializing the second
+    /// lane's pre-MoE work behind the first lane's ffn_combine.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_layer_pre_moe_v2(
+        &self,
+        bd: &mut BatchDgpuScratch,
+        bi: &mut BatchIgpuScratch,
+        ls: &mut HetLayerState,
+        dlw: &DgpuLayerWeights,
+        ilw: &IgpuLayerWeights,
+        pos0: u32,
+        tokens: &[i32],
+        stats: Option<&mut PrefillStats>,
+        sev: &super::engine::LayerSyncEvents,
+    ) -> eyre::Result<()> {
         let layer = dlw.layer_idx;
         if ilw.layer_idx != layer {
             return Err(eyre!(
-                "forward_layer_batch_v2: dgpu L{} != igpu L{}",
+                "forward_layer_pre_moe_v2: dgpu L{} != igpu L{}",
                 layer,
                 ilw.layer_idx
             ));
@@ -439,11 +471,6 @@ impl HeterogeneousEngine {
         let cs_qflat = Q_FLAT as usize;
         let cs_kvhd = N_HEAD_DIM as usize;
         let cs_n_used = N_EXPERT_USED;
-        // Per-layer cross-device sync events. Same set the decode path uses
-        // (LayerSyncEvents in engine.rs). We use selected_ready/_pushed for
-        // the pre-MoE handoff and moe_done/_arrived for the MoE→ffn_combine
-        // handoff — replacing the v1 host syncs.
-        let sev = &self.sync_events.layers[layer as usize];
 
         // ========================================================
         // Stage 1: mhc_pre_attn (BATCHED)
@@ -1444,11 +1471,26 @@ impl HeterogeneousEngine {
         drop(bi_ffn_view);
         drop(bd_moe_dst);
         self.set_current_cached(self.dgpu.device)?;
-        de.compute.wait_event(&sev.moe_arrived)?;
+        // moe_arrived is the post-MoE handoff event; forward_layer_post_moe_v2
+        // queues the wait + ffn_combine. Pre-MoE returns here without
+        // touching de.compute again, so the caller can interleave another
+        // lane's pre-MoE before queueing this lane's ffn_combine.
+        Ok(())
+    }
 
-        // ========================================================
-        // Stage 12: ffn_combine (vec_add stretched + BATCHED hc_post_from_split)
-        // ========================================================
+    /// Stage 12: dGPU ffn_combine. Separated from the pre-MoE body so the
+    /// pipelined caller can queue both lanes' pre-MoE work on de.compute
+    /// before any ffn_combine reads its post-MoE inputs. `sev.moe_arrived`
+    /// must be the same LayerSyncEvents passed to the matching pre-MoE call.
+    fn forward_layer_post_moe_v2(
+        &self,
+        bd: &mut BatchDgpuScratch,
+        b: u32,
+        sev: &super::engine::LayerSyncEvents,
+    ) -> eyre::Result<()> {
+        self.set_current_cached(self.dgpu.device)?;
+        let de = &self.dgpu;
+        de.compute.wait_event(&sev.moe_arrived)?;
         let _t_combine = de.events.stage("dgpu.ffn_combine", &de.compute)?;
         de.vec_add.launch(
             &de.compute,
