@@ -93,6 +93,67 @@ impl MoeGroupBuilder {
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
 
+    /// M50 hybrid dispatch: split-builder variant. Emits work items into two
+    /// disjoint arrays based on actual chunk size, AND sorts each by expert.
+    /// Chunks with size ≥ threshold go to `staged_work_items`; smaller ones
+    /// go to `chunked_work_items`. Within each, expert e's chunks precede
+    /// expert e+1's (consecutive WGs in the launch hit the same expert →
+    /// L2 reuse). `n_staged` and `n_chunked` are written directly (no
+    /// pre-zero required). Caller syncs + reads both before launching
+    /// the respective iq2 kernels.
+    ///
+    /// Launch geometry: one block of `n_expert` threads (in-block prefix sum).
+    /// Requires `n_expert ≤ 1024`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_work_items_split(
+        &self,
+        stream: &Stream,
+        staged_work_items: &mut DeviceBuffer<i32>,
+        chunked_work_items: &mut DeviceBuffer<i32>,
+        n_staged: &mut DeviceBuffer<i32>,
+        n_chunked: &mut DeviceBuffer<i32>,
+        group_count: &DeviceBuffer<i32>,
+        n_expert: u32,
+        chunk_size: u32,
+        threshold: u32,
+        max_items: u32,
+    ) -> eyre::Result<()> {
+        let function = self
+            .work_items_module
+            .get_function("moe_work_items_builder_split")?;
+        let mut swi_ptr = staged_work_items.raw();
+        let mut cwi_ptr = chunked_work_items.raw();
+        let mut ns_ptr = n_staged.raw();
+        let mut nc_ptr = n_chunked.raw();
+        let mut gc_ptr = group_count.raw();
+        let mut ne = n_expert;
+        let mut cs = chunk_size;
+        let mut th = threshold;
+        let mut mi = max_items;
+        let mut args: [*mut c_void; 9] = [
+            &mut swi_ptr as *mut _ as *mut c_void,
+            &mut cwi_ptr as *mut _ as *mut c_void,
+            &mut ns_ptr as *mut _ as *mut c_void,
+            &mut nc_ptr as *mut _ as *mut c_void,
+            &mut gc_ptr as *mut _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut cs as *mut _ as *mut c_void,
+            &mut th as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+        ];
+        if n_expert > 1024 {
+            return Err(eyre!(
+                "moe_work_items_builder_split: n_expert={n_expert} exceeds 1024 (in-block prefix sum limit)"
+            ));
+        }
+        let cfg = LaunchConfig {
+            grid: (1, 1, 1),
+            block: (n_expert, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
+
     /// Build per-expert (token, slot) groups from `d_selected[B, n_used]`.
     /// Caller MUST zero `group_count` before this call.
     #[allow(clippy::too_many_arguments)]

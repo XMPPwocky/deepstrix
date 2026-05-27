@@ -138,6 +138,12 @@ pub struct BatchDgpuScratch {
 
     // ---- Per-token attention causality (Phase 4) ----
     /// `[B]` — per-token causal prefix length over raw KV cache.
+    /// M50 batched per-position kernels: [B] arrays uploaded per chunk/layer.
+    /// `pos_per_b[b] = pos0 + b` (constant per chunk).
+    /// `row_per_b[b]`, `pos_mod_per_b[b]` depend on ratio (computed per layer).
+    pub pos_per_b: DeviceBuffer<i32>,
+    pub row_per_b: DeviceBuffer<i32>,
+    pub pos_mod_per_b: DeviceBuffer<i32>,
     pub n_raw_per: DeviceBuffer<i32>,
     /// `[B]` — per-token causal prefix length over comp_kv (0 for ratio=0
     /// layers and for tokens before the first comp boundary).
@@ -215,6 +221,15 @@ pub struct BatchIgpuScratch {
     /// `work_items[]`. MUST be zeroed before each layer's pre-pass.
     /// Read back to host (sync) to set grid.y for the main kernel.
     pub n_work_items: DeviceBuffer<i32>,
+    /// M50 hybrid dispatch: work items for the staged kernel (chunks ≥ threshold).
+    /// Same shape as `work_items`. MUST be paired with `n_staged_work_items`.
+    pub staged_work_items: DeviceBuffer<i32>,
+    /// M50 hybrid dispatch: work items for the chunked kernel (chunks < threshold).
+    /// Same shape as `work_items`. MUST be paired with `n_chunked_work_items`.
+    pub chunked_work_items: DeviceBuffer<i32>,
+    /// M50 hybrid dispatch: `[1]` i32 atomic counters, pre-zeroed per layer.
+    pub n_staged_work_items: DeviceBuffer<i32>,
+    pub n_chunked_work_items: DeviceBuffer<i32>,
 }
 
 impl BatchIgpuScratch {
@@ -247,6 +262,18 @@ impl BatchIgpuScratch {
                 (N_EXPERT as usize) + b * (N_EXPERT_USED as usize),
             )?,
             n_work_items: DeviceBuffer::new(id, 1)?,
+            // Hybrid dispatch: two extra work_items arrays, each sized for the
+            // worst case (all items land in one bucket).
+            staged_work_items: DeviceBuffer::new(
+                id,
+                (N_EXPERT as usize) + b * (N_EXPERT_USED as usize),
+            )?,
+            chunked_work_items: DeviceBuffer::new(
+                id,
+                (N_EXPERT as usize) + b * (N_EXPERT_USED as usize),
+            )?,
+            n_staged_work_items: DeviceBuffer::new(id, 1)?,
+            n_chunked_work_items: DeviceBuffer::new(id, 1)?,
         })
     }
 
@@ -295,6 +322,9 @@ impl BatchDgpuScratch {
             pooled: mk_f32(N_HEAD_DIM as usize)?,
             comp_row: mk_f32(N_HEAD_DIM as usize)?,
 
+            pos_per_b: mk_i32(1)?,
+            row_per_b: mk_i32(1)?,
+            pos_mod_per_b: mk_i32(1)?,
             n_raw_per: mk_i32(1)?,
             n_comp_per: mk_i32(1)?,
 

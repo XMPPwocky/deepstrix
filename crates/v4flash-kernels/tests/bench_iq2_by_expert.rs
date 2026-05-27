@@ -439,6 +439,73 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
     eprintln!("inline-{chunk_size}  min={:.3} ms  median={:.3} ms  (ratio min={:.3}x  med={:.3}x)",
               in_min, in_med, in_min / bt_min, in_med / bt_med);
 
+    // ---- M50 staged: dequant-amortization variant ----
+    // First: snapshot the chunked baseline output for correctness comparison.
+    let mid_len = bi.d_mid_cat.len();
+    let mut chunked_out = vec![0f32; mid_len];
+    {
+        // Re-run chunked once to ensure d_mid_cat holds the canonical output.
+        let BatchIgpuScratch { d_mid_cat, d_xq_q8k, d_ew, group_count, expert_members, work_items, .. } = &mut bi;
+        ie.iq2.launch_fused_swiglu_chunked(
+            &ie.compute, d_mid_cat,
+            &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+            d_xq_q8k, d_ew, group_count, expert_members, work_items,
+            gbpe, ubpe, cs_n_used, max_per_expert, CHUNK_SIZE,
+            SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN, n_work_items,
+        )?;
+        ie.compute.synchronize()?;
+        d_mid_cat.copy_to_host(&mut chunked_out)?;
+    }
+    let mut staged_ms: Vec<f32> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let start = Event::new()?;
+        let end = Event::new()?;
+        start.record(&ie.compute)?;
+        let BatchIgpuScratch {
+            d_mid_cat, d_xq_q8k, d_ew, group_count, expert_members, work_items, ..
+        } = &mut bi;
+        ie.iq2.launch_fused_swiglu_chunked_staged(
+            &ie.compute, d_mid_cat,
+            &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+            d_xq_q8k, d_ew, group_count, expert_members, work_items,
+            gbpe, ubpe, cs_n_used, max_per_expert, CHUNK_SIZE,
+            SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN, n_work_items,
+        )?;
+        end.record(&ie.compute)?;
+        ie.compute.synchronize()?;
+        staged_ms.push(Event::elapsed_ms(&start, &end)?);
+    }
+    let st_min = pmin(&staged_ms);
+    let st_med = median(&mut staged_ms.clone());
+    eprintln!("staged-{chunk_size}  min={:.3} ms  median={:.3} ms  (ratio min={:.3}x  med={:.3}x)",
+              st_min, st_med, st_min / bt_min, st_med / bt_med);
+    eprintln!("  staged vs chunked: min ratio {:.3}x  med ratio {:.3}x  ({}%)",
+              st_min / ch_min, st_med / ch_med,
+              ((1.0 - st_med / ch_med) * 100.0).round() as i32);
+
+    // Correctness check: staged output should match chunked within ~1e-2 (different
+    // float reduction order across batched vs per-(sb,m) warp reduces).
+    let mut staged_out = vec![0f32; mid_len];
+    bi.d_mid_cat.copy_to_host(&mut staged_out)?;
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    let mut n_nonzero = 0usize;
+    for (c, s) in chunked_out.iter().zip(staged_out.iter()) {
+        let d = (s - c).abs();
+        if d > max_abs { max_abs = d; }
+        if c.abs() > 1e-4 {
+            let r = d / c.abs();
+            if r > max_rel { max_rel = r; }
+            n_nonzero += 1;
+        }
+    }
+    eprintln!("staged correctness: max_abs={max_abs:.3e}  max_rel={max_rel:.3e}  n_nonzero={n_nonzero}/{mid_len}");
+    if max_abs > 1e-1 || (n_nonzero > 0 && max_rel > 1e-1) {
+        return Err(eyre!(
+            "staged output diverges from chunked: max_abs={max_abs:.3e}, max_rel={max_rel:.3e}"
+        ));
+    }
+
     // ====================================================
     // DRAM-bound diff-test: same WG count, different expert
     // selection patterns. If kernel is DRAM-bound on weight

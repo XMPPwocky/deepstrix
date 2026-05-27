@@ -283,7 +283,14 @@ fn forward_prompt_batch_v2_matches_sequential() -> eyre::Result<()> {
     // so iGPU MoE captured graphs replay correctly. After the call,
     // batch_dgpu.residual holds the post-last-layer HC for each batch
     // element (N_LAYER=43 is odd, so post-swap state is in .residual).
-    eprintln!("Run B: forward_prompt_batch_v2 B={b}");
+    //
+    // Force IQ2_VARIANT=chunked for bit-exact comparison with single-token
+    // path. The default staged variant has a different float reduction
+    // order (8 rows × 32 lanes per super-block vs single-token's 2 lanes ×
+    // 16 super-blocks); per-layer diffs of ~1e-2 compound across all
+    // layers to give visible (but functionally correct) deltas.
+    std::env::set_var("IQ2_VARIANT", "chunked");
+    eprintln!("Run B: forward_prompt_batch_v2 B={b} (IQ2_VARIANT=chunked for bit-exact oracle)");
     let mut v2_state = HetModelState::alloc(dgpu, igpu, b as u32 + 4)?;
     engine.forward_prompt_batch_v2(
         &mut batch_dgpu,

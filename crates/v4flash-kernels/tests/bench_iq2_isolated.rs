@@ -55,8 +55,11 @@ fn bench_iq2_isolated() -> eyre::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(60); // typical for B=64
-    let chunk_size: u32 = 16;
-    // BENCH_VARIANT: 0=chunked, 1=inline, 2=zeroidx, 3=padded
+    let chunk_size: u32 = std::env::var("BENCH_CHUNK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+    // BENCH_VARIANT: 0=chunked, 1=inline, 2=zeroidx, 3=padded, 4=staged
     let variant: u32 = std::env::var("BENCH_VARIANT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -64,7 +67,8 @@ fn bench_iq2_isolated() -> eyre::Result<()> {
     let use_inline = variant == 1;
     let use_zeroidx = variant == 2;
     let use_padded = variant == 3;
-    eprintln!("variant={variant} (0=chunked, 1=inline, 2=zeroidx, 3=padded)");
+    let use_staged = variant == 4;
+    eprintln!("variant={variant} (0=chunked, 1=inline, 2=zeroidx, 3=padded, 4=staged)");
     eprintln!("isolated iq2 probe: B={b}, iters={iters}, n_work_items={n_work_items_target}");
 
     let igpu = pick_igpu()?;
@@ -136,27 +140,25 @@ fn bench_iq2_isolated() -> eyre::Result<()> {
         (b as usize) * (cs_n_used as usize) * (N_FF_EXP as usize),
     )?;
 
-    // Warm up the kernel + caches.
-    iq2.launch_fused_swiglu_chunked(
-        &stream,
-        &mut mid,
-        &gate_w,
-        &up_w,
-        &xq,
-        &expert_w,
-        &group_count,
-        &expert_members,
-        &work_items,
-        gate_bpe as u32,
-        up_bpe as u32,
-        cs_n_used,
-        max_per_expert,
-        chunk_size,
-        SWIGLU_CLAMP_EXP,
-        N_FF_EXP,
-        BLOCKS_Q8K_GATE_IN,
-        n_work_items_target,
-    )?;
+    // Warm up the kernel + caches with the variant being measured, so
+    // first-launch overhead is excluded from the timed loop.
+    if use_staged {
+        iq2.launch_fused_swiglu_chunked_staged(
+            &stream, &mut mid, &gate_w, &up_w, &xq, &expert_w,
+            &group_count, &expert_members, &work_items,
+            gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+            chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+            n_work_items_target,
+        )?;
+    } else {
+        iq2.launch_fused_swiglu_chunked(
+            &stream, &mut mid, &gate_w, &up_w, &xq, &expert_w,
+            &group_count, &expert_members, &work_items,
+            gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+            chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+            n_work_items_target,
+        )?;
+    }
     stream.synchronize()?;
 
     eprintln!("running {iters} iters under timing...");
@@ -165,7 +167,15 @@ fn bench_iq2_isolated() -> eyre::Result<()> {
         let start = Event::new()?;
         let end = Event::new()?;
         start.record(&stream)?;
-        if use_padded {
+        if use_staged {
+            iq2.launch_fused_swiglu_chunked_staged(
+                &stream, &mut mid, &gate_w, &up_w, &xq, &expert_w,
+                &group_count, &expert_members, &work_items,
+                gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+                chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+                n_work_items_target,
+            )?;
+        } else if use_padded {
             iq2.launch_fused_swiglu_chunked_padded(
                 &stream, &mut mid, &gate_w, &up_w, &xq, &expert_w,
                 &group_count, &expert_members, &work_items,

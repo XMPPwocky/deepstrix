@@ -1008,4 +1008,93 @@ impl Iq2XxsPairMatvec {
         };
         unsafe { function.launch_raw(cfg, stream, &mut args) }
     }
+
+    /// M50 staged: dequant-amortization variant of chunked. Per super-block,
+    /// dequant 8 rows of gate+up into a conflict-free int8 LDS tile ONCE,
+    /// then dp4a against the staged tile for every member in the chunk.
+    /// Bank-conflict cost (the diagnosed bottleneck) is paid 1/chunk_size as
+    /// often per produced output vs the chunked baseline.
+    ///
+    /// Same dispatch geometry, same arg list — true drop-in replacement.
+    /// See the kernel-side comment at `iq2_xxs_pair_matvec_fused_swiglu_chunked_staged`
+    /// for LDS layout math and tile padding rationale.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_chunked_staged(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,           // [B, n_used, n_rows]
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,                 // [B, n_blocks*292]
+        expert_w: &DeviceBuffer<f32>,          // [B, n_used]
+        group_count: &DeviceBuffer<i32>,       // [n_expert]
+        expert_members: &DeviceBuffer<i32>,    // [n_expert * max_per_expert]
+        work_items: &DeviceBuffer<i32>,        // [n_work_items]
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+        n_work_items: u32,
+    ) -> eyre::Result<()> {
+        if n_rows % 8 != 0 {
+            return Err(eyre!(
+                "iq2_xxs staged: n_rows={n_rows} must be multiple of 8"
+            ));
+        }
+        if chunk_size > 32 {
+            return Err(eyre!(
+                "iq2_xxs staged: chunk_size={chunk_size} exceeds IQ2_STAGED_MAX_CHUNK=32"
+            ));
+        }
+        if n_work_items == 0 {
+            return Ok(());
+        }
+        let function = self
+            .module
+            .get_function("iq2_xxs_pair_matvec_fused_swiglu_chunked_staged")?;
+        let mut mid_ptr = mid.raw();
+        let mut gw_ptr = gate_w_base.raw();
+        let mut uw_ptr = up_w_base.raw();
+        let mut xq_ptr = xq.raw();
+        let mut ew_ptr = expert_w.raw();
+        let mut gc_ptr = group_count.raw();
+        let mut em_ptr = expert_members.raw();
+        let mut wi_ptr = work_items.raw();
+        let mut gbpe = gate_bpe;
+        let mut ubpe = up_bpe;
+        let mut nu = n_used;
+        let mut mpe = max_per_expert;
+        let mut cs = chunk_size;
+        let mut clamp_v = clamp;
+        let mut nr = n_rows;
+        let mut nb = n_blocks;
+        let mut args: [*mut c_void; 16] = [
+            &mut mid_ptr as *mut _ as *mut c_void,
+            &mut gw_ptr as *mut _ as *mut c_void,
+            &mut uw_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut ew_ptr as *mut _ as *mut c_void,
+            &mut gc_ptr as *mut _ as *mut c_void,
+            &mut em_ptr as *mut _ as *mut c_void,
+            &mut wi_ptr as *mut _ as *mut c_void,
+            &mut gbpe as *mut _ as *mut c_void,
+            &mut ubpe as *mut _ as *mut c_void,
+            &mut nu as *mut _ as *mut c_void,
+            &mut mpe as *mut _ as *mut c_void,
+            &mut cs as *mut _ as *mut c_void,
+            &mut clamp_v as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+        ];
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, n_work_items, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { function.launch_raw(cfg, stream, &mut args) }
+    }
 }

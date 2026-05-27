@@ -1450,3 +1450,305 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_padded(
         __syncthreads();
     }
 }
+
+// M50 staged: dequant-amortization variant of chunked.
+//
+// Architectural change vs `iq2_xxs_pair_matvec_fused_swiglu_chunked`:
+//   - OLD loop nesting: for member { for super_block { dequant + dot } }
+//   - NEW loop nesting: for super_block { dequant ONCE, for member { dot } }
+//
+// The dequant phase reads s_grid / s_sign_pair (data-dependent indices, the
+// source of the ~14% LDS bank conflicts diagnosed under rocprofv3). By
+// pulling dequant outside the member loop and writing the dequantized int8
+// weights into a conflict-free LDS tile, the bank-conflict cost is paid
+// 1 / chunk_size as often per produced output. The dot loop becomes plain
+// dp4a against staged int8 — no codebook indirection.
+//
+// LDS tile layout: s_gate_tile[8 rows][260 byte stride].
+//   - 256 int8 weights per row + 4 byte pad → row stride = 65 dwords.
+//   - Cross-row reads (8 lanes hitting 8 different rows, same dword offset)
+//     get bank index (R*65 + K) mod 32 = (R + K) mod 32 → conflict-free.
+//   - Within-row reads (32 lanes hitting 32 consecutive dwords of one row)
+//     get bank index L mod 32 → conflict-free naturally.
+//
+// LDS budget per WG (~9.6 KiB total) leaves plenty of headroom. VGPR is
+// expected to be the occupancy limiter (matches chunked baseline).
+//
+// Numerics: reduction order differs from chunked because per-member f32
+// partial sums are accumulated across super-blocks BEFORE the warp reduce,
+// rather than warp-reducing per (super-block, member). Expect ≤1e-3
+// diff vs chunked (consistent with batched-vs-sequential float roundoff).
+
+// Row stride must be 8-byte aligned so int2 (ds_read/write_b64) doesn't fall
+// back to unaligned scalar loads. 256 int8 + 8 pad → 264 bytes = 66 dwords.
+// Bank math: (66*row + dword_idx) mod 32 = (2*row + dword_idx) mod 32, which
+// for the within-row stride-2 access still leaves a 2-way conflict (inherent
+// to lane*8 stride), but 64-bit reads halve the LDS-issue instruction count
+// to compensate.
+#define IQ2_STAGED_TILE_STRIDE 264u
+#define IQ2_STAGED_MAX_CHUNK   32u
+#define IQ2_STAGED_MAX_ROWS    8u
+
+extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_staged(
+        float        * __restrict__ mid,           // [B, n_used, n_rows]
+        const uint8_t * __restrict__ gate_w_base,
+        const uint8_t * __restrict__ up_w_base,
+        const uint8_t * __restrict__ xq,           // [B, n_blocks*292]
+        const float  * __restrict__ expert_w,      // [B, n_used]
+        const int    * __restrict__ group_count,   // [n_expert]
+        const int    * __restrict__ expert_members,// [n_expert * max_per_expert]
+        const int    * __restrict__ work_items,    // [n_work_items]
+        unsigned int    gate_bpe,
+        unsigned int    up_bpe,
+        unsigned int    n_used,
+        unsigned int    max_per_expert,
+        unsigned int    chunk_size,
+        float           clamp,
+        unsigned int    n_rows,
+        unsigned int    n_blocks) {
+    const unsigned int w_idx = blockIdx.y;
+    const int packed_item = work_items[w_idx];
+    const unsigned int e            = (unsigned int)(packed_item >> 16) & 0xffffu;
+    const unsigned int member_start = (unsigned int)(packed_item       ) & 0xffffu;
+    const int group_n = group_count[e];
+    const unsigned int member_end = min((unsigned int)group_n, member_start + chunk_size);
+    if (member_end <= member_start) return;
+    const unsigned int n_members = member_end - member_start;
+
+    // === LDS layout ===
+    __shared__ uint64_t s_sign_pair[128];
+    __shared__ uint64_t s_grid[256];
+    __shared__ int8_t   s_gate_tile[IQ2_STAGED_MAX_ROWS * IQ2_STAGED_TILE_STRIDE];
+    __shared__ int8_t   s_up_tile  [IQ2_STAGED_MAX_ROWS * IQ2_STAGED_TILE_STRIDE];
+    __shared__ int8_t   s_gate_ls  [IQ2_STAGED_MAX_ROWS * 8];
+    __shared__ int8_t   s_up_ls    [IQ2_STAGED_MAX_ROWS * 8];
+    // (wd_g / wd_u are kept in per-lane registers, not LDS — every lane in
+    //  a row_valid warp already loaded them from the gate_block / up_block
+    //  header. Avoids one LDS write + read + implicit sync per super-block.)
+    // s_xq_blk_all holds ALL members' activations for the CURRENT super-block.
+    // Staged in one cooperative pass per super-block → 1 sync/super-block instead of
+    // 1 sync/(super-block, member). Costs 9344 B at chunk_size=32; trivial.
+    __shared__ uint8_t  s_xq_blk_all[IQ2_STAGED_MAX_CHUNK * BLOCK_Q8_K_BYTES];
+    // Per-member (b, slot) cache. Decoded once at WG init, reused everywhere.
+    __shared__ int      s_member_packed[IQ2_STAGED_MAX_CHUNK];
+    __shared__ float    s_partial_g[IQ2_STAGED_MAX_CHUNK * IQ2_STAGED_MAX_ROWS];
+    __shared__ float    s_partial_u[IQ2_STAGED_MAX_CHUNK * IQ2_STAGED_MAX_ROWS];
+
+    const unsigned int tid = threadIdx.x;
+    if (tid < 128) {
+        const uint32_t s = ksigns_iq2xs[tid];
+        const uint32_t signs = s * 0x01010101u;
+        const uint32_t sm0 = expand_signs_par(signs, 0x08040201u);
+        const uint32_t sm1 = expand_signs_par(signs, 0x80402010u);
+        s_sign_pair[tid] = ((uint64_t)sm1 << 32) | (uint64_t)sm0;
+    }
+    if (tid < 256) s_grid[tid] = iq2xxs_grid[tid];
+
+    // (s_partial_g/u are not zero-initialized — the warp-reduce phase
+    //  overwrites with `=` after accumulating into per-lane registers.)
+    // Decode each member's (b, slot) once.
+    for (unsigned int i = tid; i < n_members; i += blockDim.x) {
+        s_member_packed[i] = expert_members[(size_t)e * (size_t)max_per_expert
+                                          + (size_t)(member_start + i)];
+    }
+    __syncthreads();
+
+    const unsigned int row_in_block = tid >> 5;            // 0..7 (warp index)
+    const unsigned int lane         = tid & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    const bool row_valid = (row < n_rows);
+
+    // Lane assignment for dequant phase: lane L handles weight chunk
+    // [L*8 .. L*8+7] in the warp's row. That maps to sub_idx = L/4,
+    // chunk_in_sub = L%4 within the iq2_xxs sub-block layout.
+    const unsigned int sub_idx      = lane >> 2;           // 0..7
+    const unsigned int chunk_in_sub = lane & 3u;           // 0..3
+    const unsigned int g_shift      = chunk_in_sub * 8u;   // codebook index bit offset in aux0
+    const unsigned int s_shift      = chunk_in_sub * 7u;   // sign index bit offset in aux1
+
+    const uint8_t* gate_e_base = gate_w_base + (uint64_t)e * (uint64_t)gate_bpe;
+    const uint8_t* up_e_base   = up_w_base   + (uint64_t)e * (uint64_t)up_bpe;
+
+    // Per-lane f32 accumulators, one per member. Accumulated across all
+    // super-blocks; warp-reduced ONCE per member at the end (vs the prior
+    // version which warp-reduced per (super-block, member) — that's 16×
+    // more shfls and was the actual bottleneck).
+    float lane_pacc_g[IQ2_STAGED_MAX_CHUNK];
+    float lane_pacc_u[IQ2_STAGED_MAX_CHUNK];
+    #pragma unroll
+    for (unsigned int mi = 0; mi < IQ2_STAGED_MAX_CHUNK; mi++) {
+        lane_pacc_g[mi] = 0.0f;
+        lane_pacc_u[mi] = 0.0f;
+    }
+
+    // === Super-block loop ===
+    for (unsigned int sb = 0; sb < n_blocks; sb++) {
+        // Per-warp wd registers (lifted out of row_valid block so we can use
+        // them after the sync to compute gd/ud directly — avoids one LDS
+        // write+read+sync per super-block).
+        uint16_t wd_g = 0, wd_u = 0;
+        // --- Dequant phase: cooperative, once per (sb, WG) ---
+        if (row_valid) {
+            const uint8_t* gate_block = gate_e_base
+                                      + (uint64_t)row * (uint64_t)n_blocks * BLOCK_IQ2_XXS_BYTES
+                                      + (uint64_t)sb  * BLOCK_IQ2_XXS_BYTES;
+            const uint8_t* up_block   = up_e_base
+                                      + (uint64_t)row * (uint64_t)n_blocks * BLOCK_IQ2_XXS_BYTES
+                                      + (uint64_t)sb  * BLOCK_IQ2_XXS_BYTES;
+            wd_g = *(const uint16_t*)(gate_block + 0);
+            wd_u = *(const uint16_t*)(up_block   + 0);
+
+            const uint8_t* sb_g = gate_block + 2 + sub_idx * 8;
+            const uint8_t* sb_u = up_block   + 2 + sub_idx * 8;
+            const uint32_t aux0_g = *(const uint32_t*)(sb_g + 0);
+            const uint32_t aux1_g = *(const uint32_t*)(sb_g + 4);
+            const uint32_t aux0_u = *(const uint32_t*)(sb_u + 0);
+            const uint32_t aux1_u = *(const uint32_t*)(sb_u + 4);
+
+            const uint8_t g_idx_g = (uint8_t)((aux0_g >> g_shift) & 0xffu);
+            const uint32_t s_idx_g = (aux1_g >> s_shift) & 0x7fu;
+            const uint8_t g_idx_u = (uint8_t)((aux0_u >> g_shift) & 0xffu);
+            const uint32_t s_idx_u = (aux1_u >> s_shift) & 0x7fu;
+
+            // Codebook lookup + sign apply — bank-conflict source, now paid once per (sb, WG).
+            const uint64_t grid_g       = s_grid[g_idx_g];
+            const uint64_t sign_pair_g  = s_sign_pair[s_idx_g];
+            const uint32_t sm0_g        = (uint32_t)sign_pair_g;
+            const uint32_t sm1_g        = (uint32_t)(sign_pair_g >> 32);
+            const int32_t  g0           = cond_neg_bytes_fast((int32_t)(uint32_t)grid_g,         sm0_g);
+            const int32_t  g1           = cond_neg_bytes_fast((int32_t)(uint32_t)(grid_g >> 32), sm1_g);
+
+            const uint64_t grid_u       = s_grid[g_idx_u];
+            const uint64_t sign_pair_u  = s_sign_pair[s_idx_u];
+            const uint32_t sm0_u        = (uint32_t)sign_pair_u;
+            const uint32_t sm1_u        = (uint32_t)(sign_pair_u >> 32);
+            const int32_t  u0           = cond_neg_bytes_fast((int32_t)(uint32_t)grid_u,         sm0_u);
+            const int32_t  u1           = cond_neg_bytes_fast((int32_t)(uint32_t)(grid_u >> 32), sm1_u);
+
+            // Write 8 int8 weights as int2 → one ds_write_b64 per matrix.
+            // Address: row_in_block * 264 (8-byte aligned) + lane * 8 (8-byte aligned).
+            int8_t* tg = &s_gate_tile[row_in_block * IQ2_STAGED_TILE_STRIDE + lane * 8u];
+            int8_t* tu = &s_up_tile  [row_in_block * IQ2_STAGED_TILE_STRIDE + lane * 8u];
+            *(int2*)tg = int2{g0, g1};
+            *(int2*)tu = int2{u0, u1};
+
+            if (chunk_in_sub == 0u) {
+                const uint32_t ls_g = 2u * (aux1_g >> 28) + 1u;
+                const uint32_t ls_u = 2u * (aux1_u >> 28) + 1u;
+                s_gate_ls[row_in_block * 8u + sub_idx] = (int8_t)ls_g;
+                s_up_ls  [row_in_block * 8u + sub_idx] = (int8_t)ls_u;
+            }
+            // wd_g / wd_u are now per-lane registers (kept across the row_valid
+            // scope via the outer declaration above). No LDS round-trip needed.
+        }
+
+        // Cooperative xq stage: ALL 256 threads pull n_members × 292 bytes for THIS
+        // super-block into s_xq_blk_all. Per-member outer (no integer division),
+        // dword-granular inner. Runs in parallel with the per-warp dequant above.
+        {
+            // 292 bytes = 73 dwords (292 / 4 == 73 exactly).
+            const unsigned int n_dw = (unsigned int)BLOCK_Q8_K_BYTES / 4u;
+            for (unsigned int mi = 0; mi < n_members; mi++) {
+                const int packed     = s_member_packed[mi];
+                const unsigned int b = (unsigned int)(packed >> 16);
+                const uint32_t* xq_src_dw = (const uint32_t*)(
+                    xq + (size_t)b * (size_t)n_blocks * (size_t)BLOCK_Q8_K_BYTES
+                       + (size_t)sb * (size_t)BLOCK_Q8_K_BYTES);
+                uint32_t* xq_dst_dw = (uint32_t*)&s_xq_blk_all[mi * BLOCK_Q8_K_BYTES];
+                for (unsigned int i = tid; i < n_dw; i += blockDim.x) {
+                    xq_dst_dw[i] = xq_src_dw[i];
+                }
+            }
+        }
+        __syncthreads();
+
+        const float gd = row_valid ? (0.125f * f16_to_f32_par(wd_g)) : 0.0f;
+        const float ud = row_valid ? (0.125f * f16_to_f32_par(wd_u)) : 0.0f;
+
+        const int32_t ls_g_lane = row_valid ? (int32_t)s_gate_ls[row_in_block * 8u + sub_idx] : 0;
+        const int32_t ls_u_lane = row_valid ? (int32_t)s_up_ls  [row_in_block * 8u + sub_idx] : 0;
+
+        // Precompute weight dwords (constant across members). int2 = one
+        // ds_read_b64 per matrix. Address is 8-byte aligned (264 byte stride).
+        int32_t w_g0 = 0, w_g1 = 0, w_u0 = 0, w_u1 = 0;
+        if (row_valid) {
+            const int8_t* tg = &s_gate_tile[row_in_block * IQ2_STAGED_TILE_STRIDE + lane * 8u];
+            const int8_t* tu = &s_up_tile  [row_in_block * IQ2_STAGED_TILE_STRIDE + lane * 8u];
+            const int2 wg_pair = *(const int2*)tg;
+            const int2 wu_pair = *(const int2*)tu;
+            w_g0 = wg_pair.x; w_g1 = wg_pair.y;
+            w_u0 = wu_pair.x; w_u1 = wu_pair.y;
+        }
+
+        // --- Dot phase: M members against the staged tile ---
+        // (No sync inside — all members' xq is in s_xq_blk_all, dequanted weights
+        // in s_*_tile. Each warp reads its own row's tile + per-member q8 slices.)
+        if (row_valid) {
+            for (unsigned int mi = 0; mi < n_members; mi++) {
+                const uint8_t* xq_m = &s_xq_blk_all[mi * BLOCK_Q8_K_BYTES];
+                const float yd = *(const float*)&xq_m[0];
+                const int8_t* q8_base = (const int8_t*)&xq_m[4];
+                // q8_base is at xq_m + 4 (4-byte aligned, not 8-byte) — but
+                // (q8_base + lane*8) = xq_m + 4 + lane*8. xq_m is 292-byte
+                // aligned (well, BLOCK_Q8_K_BYTES * mi from a 8-aligned LDS
+                // base; 292 = 4 mod 8). To be safe, use int2 read of the
+                // 8-byte chunk starting at lane*8 from a sub-region we know
+                // is 8-aligned: shift to read xq_m + 8 + (lane*8 - 4).
+                // Simpler: keep two int32 reads here — q8 is only 2 reads
+                // per (sb,m), not the dominant LDS cost.
+                const int32_t q8_0 = *(const int32_t*)(q8_base + lane * 8u + 0);
+                const int32_t q8_1 = *(const int32_t*)(q8_base + lane * 8u + 4);
+
+                int32_t sumi_g = 0;
+                sumi_g = sudot4_par(w_g0, q8_0, sumi_g);
+                sumi_g = sudot4_par(w_g1, q8_1, sumi_g);
+                int32_t sumi_u = 0;
+                sumi_u = sudot4_par(w_u0, q8_0, sumi_u);
+                sumi_u = sudot4_par(w_u1, q8_1, sumi_u);
+
+                // Fold per-sub-block ls (sumi ≤ 127×127×8 ≈ 1M, ls ≤ 31 → fits int32).
+                // Accumulate per-lane; warp-reduce only once per member at the very end.
+                lane_pacc_g[mi] += (float)(sumi_g * ls_g_lane) * yd * gd;
+                lane_pacc_u[mi] += (float)(sumi_u * ls_u_lane) * yd * ud;
+            }
+        }
+        __syncthreads();  // protect tile + s_xq_blk_all from next super-block's overwrite
+    }
+
+    // Warp-reduce each member's accumulator ONCE here (instead of n_blocks times
+    // per member as in the prior version). Lane 0 stages into s_partial_g/u so
+    // the final swiglu loop has uniform LDS-based access.
+    if (row_valid) {
+        for (unsigned int mi = 0; mi < n_members; mi++) {
+            const float wg = warp_sum_f32_par(lane_pacc_g[mi]);
+            const float wu = warp_sum_f32_par(lane_pacc_u[mi]);
+            if (lane == 0u) {
+                s_partial_g[mi * IQ2_STAGED_MAX_ROWS + row_in_block] = wg;
+                s_partial_u[mi * IQ2_STAGED_MAX_ROWS + row_in_block] = wu;
+            }
+        }
+    }
+
+    // === Final swiglu + output, one per (member, row) ===
+    if (row_valid && lane == 0u) {
+        for (unsigned int mi = 0; mi < n_members; mi++) {
+            const int packed          = s_member_packed[mi];
+            const unsigned int b      = (unsigned int)(packed >> 16);
+            const unsigned int slot   = (unsigned int)(packed & 0xFFFFu);
+
+            float g_sum = s_partial_g[mi * IQ2_STAGED_MAX_ROWS + row_in_block];
+            float u_sum = s_partial_u[mi * IQ2_STAGED_MAX_ROWS + row_in_block];
+
+            if (clamp > 1.0e-6f) {
+                if (g_sum > clamp)  g_sum = clamp;
+                if (u_sum > clamp)  u_sum = clamp;
+                if (u_sum < -clamp) u_sum = -clamp;
+            }
+            const float ew  = expert_w[(size_t)b * (size_t)n_used + (size_t)slot];
+            const float sig = 1.0f / (1.0f + expf(-g_sum));
+            const size_t out_off = ((size_t)b * (size_t)n_used + (size_t)slot)
+                                 * (size_t)n_rows + (size_t)row;
+            mid[out_off] = g_sum * sig * u_sum * ew;
+        }
+    }
+}

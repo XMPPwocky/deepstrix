@@ -316,6 +316,10 @@ impl HeterogeneousEngine {
             let chunk_tokens = &tokens[chunk_start..chunk_end];
             let chunk_pos0 = pos0 + chunk_start as u32;
 
+            // Reset event pools at chunk start (mirrors decode's per-token cycle).
+            self.dgpu.events.reset();
+            self.igpu.events.reset();
+
             self.forward_prompt_batch_v2(
                 bd,
                 bi,
@@ -326,6 +330,36 @@ impl HeterogeneousEngine {
                 chunk_pos0,
                 stats.as_deref_mut(),
             )?;
+
+            // After this chunk: if perfetto is attached, emit slices + re-anchor.
+            if let Some(exp_lock) = &self.perfetto {
+                let mut exp = exp_lock.lock().unwrap();
+                self.dgpu.events.for_each_pair(|name, s, e| {
+                    let track = if name.contains(".xfer") || name.contains(".peer_push") {
+                        &exp.dgpu_xfer
+                    } else {
+                        &exp.dgpu_compute
+                    };
+                    exp.emit_slice(track, name, s, e)
+                })?;
+                self.igpu.events.for_each_pair(|name, s, e| {
+                    let track = if name.contains(".xfer") || name.contains(".peer_push") {
+                        &exp.igpu_xfer
+                    } else {
+                        &exp.igpu_compute
+                    };
+                    exp.emit_slice(track, name, s, e)
+                })?;
+                exp.re_anchor(
+                    self.dgpu.device,
+                    &self.dgpu.compute,
+                    &self.dgpu.xfer,
+                    self.igpu.device,
+                    &self.igpu.compute,
+                    &self.igpu.xfer,
+                )?;
+                self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
+            }
 
             // residual post-loop holds layer-N output in bd.residual (43
             // layers + 43 swaps = even number of mutations to residual).
@@ -401,6 +435,7 @@ impl HeterogeneousEngine {
         // Stage 1: mhc_pre_attn (BATCHED)
         // rms_nw → f16_narrow → sinkhorn → hc_weighted → rms_w
         // ========================================================
+        let _t_mhc_pre = de.events.stage("dgpu.mhc_pre_attn", &de.compute)?;
         de.rms_nw
             .launch_batched(&de.compute, &mut bd.flat, &bd.residual, 1, HC_DIM, RMS_EPS, b)?;
         de.f16.matvec_narrow_batched(
@@ -443,9 +478,12 @@ impl HeterogeneousEngine {
             b,
         )?;
 
+        drop(_t_mhc_pre);
+
         // ========================================================
         // Stage 2: Q chain (BATCHED quantize + matvec + rms + ...)
         // ========================================================
+        let _t_q = de.events.stage("dgpu.q_chain", &de.compute)?;
         de.q8.quantize_input_batched(
             &de.compute,
             &mut bd.xq_n_embd,
@@ -516,9 +554,12 @@ impl HeterogeneousEngine {
             )?;
         }
 
+        drop(_t_q);
+
         // ========================================================
         // Stage 3: KV chain (BATCHED matvec + rms; per-token rope/fp8/f16rt)
         // ========================================================
+        let _t_kv = de.events.stage("dgpu.kv_chain", &de.compute)?;
         de.q8.matvec_batched(
             &de.compute,
             &mut bd.kv_raw,
@@ -562,6 +603,8 @@ impl HeterogeneousEngine {
         // final post-loop values (which would let token i attend to
         // future tokens i+1..B-1).
         // ========================================================
+        drop(_t_kv);
+        let _t_kv_append_comp = de.events.stage("dgpu.kv_append_compressor_serial", &de.compute)?;
         let mut n_raw_after: Vec<u32> = Vec::with_capacity(b as usize);
         let mut n_comp_after: Vec<u32> = Vec::with_capacity(b as usize);
         for i in 0..b as usize {
@@ -673,6 +716,7 @@ impl HeterogeneousEngine {
             let n_comp_snap = ls.compressor.as_ref().map(|c| c.n_comp).unwrap_or(0);
             n_comp_after.push(n_comp_snap);
         }
+        drop(_t_kv_append_comp);
 
         // ========================================================
         // Stage 5: Attention (BATCHED — grid (n_head, B, 1))
@@ -686,6 +730,7 @@ impl HeterogeneousEngine {
         let n_raw_per_host: Vec<i32> = n_raw_after.iter().map(|&v| v as i32).collect();
         let n_comp_per_host: Vec<i32> =
             n_comp_after.iter().map(|&v| v as i32).collect();
+        let _t_attn = de.events.stage("dgpu.attn_compute", &de.compute)?;
         // Async copies on de.compute so they FIFO with the subsequent
         // attention launch. Avoids the bulk-sync that copy_from_host
         // would impose (~5us each blocks the host AND fences the device).
@@ -731,10 +776,12 @@ impl HeterogeneousEngine {
         }
         drop(nrp_view);
         drop(ncp_view);
+        drop(_t_attn);
 
         // ========================================================
         // Stage 6: Output projection (rope_inv per b, then BATCHED q8)
         // ========================================================
+        let _t_out = de.events.stage("dgpu.output_proj", &de.compute)?;
         for i in 0..b as usize {
             let mut h_view = bd.heads.slice_view_mut(i * cs_qflat, cs_qflat);
             de.rope.launch_inverse(
@@ -784,10 +831,12 @@ impl HeterogeneousEngine {
             OUT_LOW,
             b,
         )?;
+        drop(_t_out);
 
         // ========================================================
         // Stage 7: mhc_post_attn (BATCHED hc_post_from_split)
         // ========================================================
+        let _t_mhc_post = de.events.stage("dgpu.mhc_post_attn", &de.compute)?;
         de.hc_post.launch_from_split_batched(
             &de.compute,
             &mut bd.after_attn_hc,
@@ -799,10 +848,12 @@ impl HeterogeneousEngine {
             N_HC,
             b,
         )?;
+        drop(_t_mhc_post);
 
         // ========================================================
         // Stage 8: mhc_pre_ffn (BATCHED, same shape as Stage 1)
         // ========================================================
+        let _t_mhc_pre_ffn = de.events.stage("dgpu.mhc_pre_ffn", &de.compute)?;
         de.rms_nw.launch_batched(
             &de.compute,
             &mut bd.flat,
@@ -851,6 +902,7 @@ impl HeterogeneousEngine {
             RMS_EPS,
             b,
         )?;
+        drop(_t_mhc_pre_ffn);
 
         // ========================================================
         // Stage 9: Router (per-batch wide matvec to match single-token
@@ -860,6 +912,7 @@ impl HeterogeneousEngine {
         // wide when n_rows >= 64 (N_EXPERT=256 ≥ 64). Phase 2-bis will
         // add a wide batched variant.)
         // ========================================================
+        let _t_router = de.events.stage("dgpu.router", &de.compute)?;
         for i in 0..b as usize {
             let ffn_in_v = bd
                 .ffn_input_norm
@@ -922,6 +975,7 @@ impl HeterogeneousEngine {
             let mut ew_v = bd.d_ew.slice_view_mut(0, b as usize * cs_n_used);
             ew_v.copy_from_host(&all_ew)?;
         }
+        drop(_t_router);
 
         // Stats collection (optional). Copies d_selected to host — sync,
         // fences the device. Don't enable in production prefill.
@@ -938,6 +992,7 @@ impl HeterogeneousEngine {
         // Stage 10: Shared expert (BATCHED Q8_0 chains)
         // swiglu + vec_add are pure elementwise → stretch n by B
         // ========================================================
+        let _t_shared = de.events.stage("dgpu.shared_expert", &de.compute)?;
         de.q8.quantize_input_batched(
             &de.compute,
             &mut bd.xq_n_embd,
@@ -992,6 +1047,7 @@ impl HeterogeneousEngine {
             N_FF_SHARED,
             b,
         )?;
+        drop(_t_shared);
 
         // ========================================================
         // Stage 11: iGPU routed MoE (SERIAL per batch — Phase 3 batches this)
@@ -1027,9 +1083,12 @@ impl HeterogeneousEngine {
             .d_selected
             .slice_view_mut(0, (b as usize) * cs_n_used);
         let mut bi_ew = bi.d_ew.slice_view_mut(0, (b as usize) * cs_n_used);
-        peer_push_f32(&ain_v, &mut bi_ain, &de.xfer)?;
-        peer_push_i32(&dsel_v, &mut bi_sel, &de.xfer)?;
-        peer_push_f32(&dew_v, &mut bi_ew, &de.xfer)?;
+        {
+            let _t_peer_ain = de.events.stage("dgpu.peer_push_ffn_input_norm", &de.xfer)?;
+            peer_push_f32(&ain_v, &mut bi_ain, &de.xfer)?;
+            peer_push_i32(&dsel_v, &mut bi_sel, &de.xfer)?;
+            peer_push_f32(&dew_v, &mut bi_ew, &de.xfer)?;
+        }
         de.xfer.synchronize()?;
         drop(bi_ain);
         drop(bi_sel);
@@ -1041,12 +1100,15 @@ impl HeterogeneousEngine {
         self.set_current_cached(self.igpu.device)?;
         let ie = &self.igpu;
         // q8k quantize ain[B*N_EMBD] → d_xq_q8k[B*blocks].
-        ie.q8k.launch(
-            &ie.compute,
-            &mut bi.d_xq_q8k,
-            &bi.ffn_input_norm_recv,
-            crate::forward::BLOCKS_Q8K_GATE_IN * b,
-        )?;
+        {
+            let _t_q8k_pre = ie.events.stage("igpu.q8k_quantize_pre_iq2", &ie.compute)?;
+            ie.q8k.launch(
+                &ie.compute,
+                &mut bi.d_xq_q8k,
+                &bi.ffn_input_norm_recv,
+                crate::forward::BLOCKS_Q8K_GATE_IN * b,
+            )?;
+        }
         // Phase 7.2 chunked by-expert iq2. Three pre-passes then main kernel:
         //   1. moe_group_builder: invert d_selected → group_count + expert_members.
         //   2. moe_work_items_builder: chunk popular groups → work_items + n_work_items.
@@ -1056,8 +1118,8 @@ impl HeterogeneousEngine {
         const CHUNK_SIZE: u32 = 32;
         let max_per_expert = bi.max_per_expert();
         bi.group_count.fill_zero()?;
-        bi.n_work_items.fill_zero()?;
         {
+            let _t_grp = ie.events.stage("igpu.moe_group_builder", &ie.compute)?;
             let BatchIgpuScratch {
                 group_count,
                 expert_members,
@@ -1075,79 +1137,175 @@ impl HeterogeneousEngine {
                 max_per_expert,
             )?;
         }
+        // IQ2_VARIANT env: "staged" (default), "chunked", or "hybrid".
+        // Hybrid splits work items by actual chunk size, sorts each bucket
+        // by expert, runs staged kernel for large chunks + chunked for small.
+        // IQ2_HYBRID_THRESHOLD env: chunk-size cutoff (default 8).
+        let variant = std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "staged".into());
+        let threshold: u32 = std::env::var("IQ2_HYBRID_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        if variant == "hybrid" {
+            {
+                let BatchIgpuScratch {
+                    staged_work_items,
+                    chunked_work_items,
+                    n_staged_work_items,
+                    n_chunked_work_items,
+                    group_count,
+                    ..
+                } = bi;
+                let _t_wis = ie.events.stage("igpu.moe_work_items_split", &ie.compute)?;
+                let max_items = staged_work_items.len() as u32;
+                ie.moe_group_builder.launch_work_items_split(
+                    &ie.compute,
+                    staged_work_items,
+                    chunked_work_items,
+                    n_staged_work_items,
+                    n_chunked_work_items,
+                    group_count,
+                    N_EXPERT,
+                    CHUNK_SIZE,
+                    threshold,
+                    max_items,
+                )?;
+            }
+            ie.compute.synchronize()?;
+            let mut counts = [0i32; 1];
+            bi.n_staged_work_items.copy_to_host(&mut counts)?;
+            let n_staged = counts[0] as u32;
+            bi.n_chunked_work_items.copy_to_host(&mut counts)?;
+            let n_chunked = counts[0] as u32;
+            {
+                let BatchIgpuScratch {
+                    d_mid_cat,
+                    d_xq_q8k,
+                    d_ew,
+                    group_count,
+                    expert_members,
+                    staged_work_items,
+                    chunked_work_items,
+                    ..
+                } = bi;
+                if n_staged > 0 {
+                    let _t_st = ie.events.stage("igpu.iq2_staged", &ie.compute)?;
+                    ie.iq2.launch_fused_swiglu_chunked_staged(
+                        &ie.compute, d_mid_cat,
+                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        d_xq_q8k, d_ew,
+                        group_count, expert_members, staged_work_items,
+                        gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
+                        crate::forward::SWIGLU_CLAMP_EXP,
+                        crate::forward::N_FF_EXP,
+                        crate::forward::BLOCKS_Q8K_GATE_IN,
+                        n_staged,
+                    )?;
+                }
+                if n_chunked > 0 {
+                    let _t_ch = ie.events.stage("igpu.iq2_chunked", &ie.compute)?;
+                    ie.iq2.launch_fused_swiglu_chunked(
+                        &ie.compute, d_mid_cat,
+                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        d_xq_q8k, d_ew,
+                        group_count, expert_members, chunked_work_items,
+                        gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
+                        crate::forward::SWIGLU_CLAMP_EXP,
+                        crate::forward::N_FF_EXP,
+                        crate::forward::BLOCKS_Q8K_GATE_IN,
+                        n_chunked,
+                    )?;
+                }
+            }
+        } else {
+            bi.n_work_items.fill_zero()?;
+            {
+                let BatchIgpuScratch {
+                    work_items,
+                    n_work_items,
+                    group_count,
+                    ..
+                } = bi;
+                let _t_wi = ie.events.stage("igpu.moe_work_items", &ie.compute)?;
+                ie.moe_group_builder.launch_work_items(
+                    &ie.compute,
+                    work_items,
+                    n_work_items,
+                    group_count,
+                    N_EXPERT,
+                    CHUNK_SIZE,
+                    work_items.len() as u32,
+                )?;
+            }
+            ie.compute.synchronize()?;
+            let mut n_wi_host = [0i32; 1];
+            bi.n_work_items.copy_to_host(&mut n_wi_host)?;
+            let n_work_items = n_wi_host[0] as u32;
+            {
+                let BatchIgpuScratch {
+                    d_mid_cat,
+                    d_xq_q8k,
+                    d_ew,
+                    group_count,
+                    expert_members,
+                    work_items,
+                    ..
+                } = bi;
+                let use_staged = variant != "chunked";
+                if use_staged {
+                    let _t_st = ie.events.stage("igpu.iq2_staged", &ie.compute)?;
+                    ie.iq2.launch_fused_swiglu_chunked_staged(
+                        &ie.compute, d_mid_cat,
+                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        d_xq_q8k, d_ew,
+                        group_count, expert_members, work_items,
+                        gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
+                        crate::forward::SWIGLU_CLAMP_EXP,
+                        crate::forward::N_FF_EXP,
+                        crate::forward::BLOCKS_Q8K_GATE_IN,
+                        n_work_items,
+                    )?;
+                } else {
+                    let _t_ch = ie.events.stage("igpu.iq2_chunked", &ie.compute)?;
+                    ie.iq2.launch_fused_swiglu_chunked(
+                        &ie.compute, d_mid_cat,
+                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        d_xq_q8k, d_ew,
+                        group_count, expert_members, work_items,
+                        gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
+                        crate::forward::SWIGLU_CLAMP_EXP,
+                        crate::forward::N_FF_EXP,
+                        crate::forward::BLOCKS_Q8K_GATE_IN,
+                        n_work_items,
+                    )?;
+                }
+            }
+        }
         {
-            let BatchIgpuScratch {
-                work_items,
-                n_work_items,
-                group_count,
-                ..
-            } = bi;
-            ie.moe_group_builder.launch_work_items(
+            let _t_q8k_post = ie.events.stage("igpu.q8k_quantize_post_iq2", &ie.compute)?;
+            ie.q8k.launch(
                 &ie.compute,
-                work_items,
-                n_work_items,
-                group_count,
-                N_EXPERT,
-                CHUNK_SIZE,
-                work_items.len() as u32,
+                &mut bi.d_midq_cat,
+                &bi.d_mid_cat,
+                crate::forward::BLOCKS_Q8K_DOWN_IN * (cs_n_used as u32) * b,
             )?;
         }
-        // Host sync + readback. ~5us. Necessary because grid.y for the
-        // main kernel depends on the runtime work-item count.
-        ie.compute.synchronize()?;
-        let mut n_wi_host = [0i32; 1];
-        bi.n_work_items.copy_to_host(&mut n_wi_host)?;
-        let n_work_items = n_wi_host[0] as u32;
         {
-            let BatchIgpuScratch {
-                d_mid_cat,
-                d_xq_q8k,
-                d_ew,
-                group_count,
-                expert_members,
-                work_items,
-                ..
-            } = bi;
-            ie.iq2.launch_fused_swiglu_chunked(
+            let _t_q2k = ie.events.stage("igpu.q2k_down", &ie.compute)?;
+            ie.q2k.launch_batched_bxn(
                 &ie.compute,
-                d_mid_cat,
-                &ilw.routed.gate.buffer,
-                &ilw.routed.up.buffer,
-                d_xq_q8k,
-                d_ew,
-                group_count,
-                expert_members,
-                work_items,
-                gbpe,
-                ubpe,
+                &mut bi.ffn_moe,
+                &ilw.routed.down.buffer,
+                &bi.d_midq_cat,
+                &bi.d_selected,
+                dbpe,
+                mid_blocks_bytes as u32,
                 cs_n_used as u32,
-                max_per_expert,
-                CHUNK_SIZE,
-                crate::forward::SWIGLU_CLAMP_EXP,
-                crate::forward::N_FF_EXP,
-                crate::forward::BLOCKS_Q8K_GATE_IN,
-                n_work_items,
+                N_EMBD,
+                crate::forward::BLOCKS_Q8K_DOWN_IN,
+                b,
             )?;
         }
-        ie.q8k.launch(
-            &ie.compute,
-            &mut bi.d_midq_cat,
-            &bi.d_mid_cat,
-            crate::forward::BLOCKS_Q8K_DOWN_IN * (cs_n_used as u32) * b,
-        )?;
-        ie.q2k.launch_batched_bxn(
-            &ie.compute,
-            &mut bi.ffn_moe,
-            &ilw.routed.down.buffer,
-            &bi.d_midq_cat,
-            &bi.d_selected,
-            dbpe,
-            mid_blocks_bytes as u32,
-            cs_n_used as u32,
-            N_EMBD,
-            crate::forward::BLOCKS_Q8K_DOWN_IN,
-            b,
-        )?;
         ie.compute.synchronize()?;
 
         // Single batched peer-push back of bi.ffn_moe[B*N_EMBD].
@@ -1155,7 +1313,10 @@ impl HeterogeneousEngine {
         let mut bd_moe_dst = bd
             .ffn_moe_recv
             .slice_view_mut(0, (b as usize) * cs_n_embd);
-        peer_push_f32(&bi_ffn_view, &mut bd_moe_dst, &ie.xfer)?;
+        {
+            let _t_peer_moe = ie.events.stage("igpu.peer_push_ffn_moe", &ie.xfer)?;
+            peer_push_f32(&bi_ffn_view, &mut bd_moe_dst, &ie.xfer)?;
+        }
         ie.xfer.synchronize()?;
         drop(bi_ffn_view);
         drop(bd_moe_dst);
@@ -1164,6 +1325,7 @@ impl HeterogeneousEngine {
         // ========================================================
         // Stage 12: ffn_combine (vec_add stretched + BATCHED hc_post_from_split)
         // ========================================================
+        let _t_combine = de.events.stage("dgpu.ffn_combine", &de.compute)?;
         de.vec_add.launch(
             &de.compute,
             &mut bd.ffn_moe_recv,
