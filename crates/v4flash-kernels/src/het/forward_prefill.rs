@@ -607,63 +607,135 @@ impl HeterogeneousEngine {
         let _t_kv_append_comp = de.events.stage("dgpu.kv_append_compressor_serial", &de.compute)?;
         let mut n_raw_after: Vec<u32> = Vec::with_capacity(b as usize);
         let mut n_comp_after: Vec<u32> = Vec::with_capacity(b as usize);
-        for i in 0..b as usize {
-            let pos = pos0 + i as u32;
-            let kv_view = bd.kv_normed.slice_view(i * cs_kvhd, cs_kvhd);
-            de.kv_append.launch(
+
+        // M50: batched kv_cache_append (single launch if no eviction). Replaces
+        // the B× per-position launches that dominated dispatch overhead.
+        let n_raw_before = ls.n_raw;
+        if n_raw_before + b <= SWA_WINDOW {
+            de.kv_append.launch_batched(
                 &de.compute,
                 &mut ls.kv_cache,
-                &kv_view,
-                ls.n_raw,
-                SWA_WINDOW,
+                &bd.kv_normed,
+                n_raw_before,
                 N_HEAD_DIM,
+                b,
             )?;
-            if ls.n_raw < SWA_WINDOW {
-                ls.n_raw += 1;
+            for i in 0..b as usize {
+                let n_after = (n_raw_before + i as u32 + 1).min(SWA_WINDOW);
+                n_raw_after.push(n_after);
             }
-            n_raw_after.push(ls.n_raw);
-            if ratio > 0 {
-                let cw = dlw
-                    .compressor
-                    .as_ref()
-                    .ok_or_else(|| eyre!("L{layer}: missing compressor weights"))?;
-                let comp_width = cw.width;
-                let pos_mod = pos % ratio;
-                let row = if ratio == 4 { 4 + pos_mod } else { pos_mod };
-                let mut kv_cur_v = bd.kv_cur.slice_view_mut(i * 2 * cs_kvhd, 2 * cs_kvhd);
-                let mut sc_cur_v = bd.sc_cur.slice_view_mut(i * 2 * cs_kvhd, 2 * cs_kvhd);
-                let attn_norm_v = bd
-                    .attn_input_norm
-                    .slice_view(i * cs_n_embd, cs_n_embd);
-                de.f16.matvec_pair(
+            ls.n_raw = (n_raw_before + b).min(SWA_WINDOW);
+        } else {
+            // Eviction path — fall back to per-token.
+            for i in 0..b as usize {
+                let kv_view = bd.kv_normed.slice_view(i * cs_kvhd, cs_kvhd);
+                de.kv_append.launch(
                     &de.compute,
-                    &mut kv_cur_v,
-                    &mut sc_cur_v,
-                    &cw.wkv.buffer,
-                    &cw.wgate.buffer,
-                    &attn_norm_v,
-                    comp_width,
-                    N_EMBD,
+                    &mut ls.kv_cache,
+                    &kv_view,
+                    ls.n_raw,
+                    SWA_WINDOW,
+                    N_HEAD_DIM,
                 )?;
-                let cs = ls
-                    .compressor
-                    .as_mut()
-                    .ok_or_else(|| eyre!("L{layer}: missing compressor state"))?;
-                de.compressor_state_write.launch(
+                if ls.n_raw < SWA_WINDOW {
+                    ls.n_raw += 1;
+                }
+                n_raw_after.push(ls.n_raw);
+            }
+        }
+
+        // M50: batched matvec_pair across all B for ratio>0 layers. Produces
+        // bd.kv_cur[B, comp_width] + bd.sc_cur[B, comp_width] in one launch.
+        // The per-token loop below just READS from those buffers.
+        if ratio > 0 {
+            let cw = dlw
+                .compressor
+                .as_ref()
+                .ok_or_else(|| eyre!("L{layer}: missing compressor weights"))?;
+            let comp_width = cw.width;
+            de.f16.matvec_pair_batched(
+                &de.compute,
+                &mut bd.kv_cur,
+                &mut bd.sc_cur,
+                &cw.wkv.buffer,
+                &cw.wgate.buffer,
+                &bd.attn_input_norm,
+                comp_width,
+                N_EMBD,
+                b,
+            )?;
+        }
+
+        // M50: per-segment batched state_write. Each segment is ≤ `ratio`
+        // positions long; within a segment, state_writes go to distinct
+        // rows (rows {pos_mod_start..pos_mod_start+seg_len}) so they're
+        // safely batched. Segments are bounded by compressor boundaries
+        // (where pool+shuffle fire serially) or the chunk end.
+        if ratio > 0 {
+            let cw = dlw
+                .compressor
+                .as_ref()
+                .ok_or_else(|| eyre!("L{layer}: missing compressor weights"))?;
+            let comp_width = cw.width;
+
+            // Precompute per-b (row, pos_mod) and upload once.
+            let row_host: Vec<i32> = (0..b)
+                .map(|i| {
+                    let pos = pos0 + i;
+                    let pm = pos % ratio;
+                    let row = if ratio == 4 { 4 + pm } else { pm };
+                    row as i32
+                })
+                .collect();
+            let pos_mod_host: Vec<i32> =
+                (0..b).map(|i| ((pos0 + i) % ratio) as i32).collect();
+            {
+                let mut row_v = bd.row_per_b.slice_view_mut(0, b as usize);
+                row_v.copy_from_host_async(&row_host, &de.compute)?;
+                let mut pm_v = bd.pos_mod_per_b.slice_view_mut(0, b as usize);
+                pm_v.copy_from_host_async(&pos_mod_host, &de.compute)?;
+            }
+
+            let cs = ls
+                .compressor
+                .as_mut()
+                .ok_or_else(|| eyre!("L{layer}: missing compressor state"))?;
+            let mut i: u32 = 0;
+            while i < b {
+                let pos_mod_now = (pos0 + i) % ratio;
+                let seg_len = std::cmp::min(ratio - pos_mod_now, b - i);
+                let seg_end = i + seg_len;
+
+                // Batched state_write for this segment.
+                let kv_seg = bd.kv_cur.slice_view(
+                    (i as usize) * 2 * cs_kvhd,
+                    (seg_len as usize) * 2 * cs_kvhd,
+                );
+                let sc_seg = bd.sc_cur.slice_view(
+                    (i as usize) * 2 * cs_kvhd,
+                    (seg_len as usize) * 2 * cs_kvhd,
+                );
+                let row_seg = bd.row_per_b.slice_view(i as usize, seg_len as usize);
+                let pm_seg = bd.pos_mod_per_b.slice_view(i as usize, seg_len as usize);
+                de.compressor_state_write.launch_batched(
                     &de.compute,
                     &mut cs.state_kv,
                     &mut cs.state_score,
-                    &kv_cur_v,
-                    &sc_cur_v,
+                    &kv_seg,
+                    &sc_seg,
                     &cw.ape.buffer,
+                    &row_seg,
+                    &pm_seg,
                     comp_width,
-                    row,
-                    pos_mod,
+                    seg_len,
                 )?;
-                let comp_fires = (pos + 1) % ratio == 0;
+
+                // Boundary fire? (Sequential dep on state via pool+shuffle.)
+                let comp_fires = (pos0 + seg_end) % ratio == 0;
                 if comp_fires {
-                    let mut pooled_v = bd.pooled.slice_view_mut(i * cs_kvhd, cs_kvhd);
-                    let mut comp_row_v = bd.comp_row.slice_view_mut(i * cs_kvhd, cs_kvhd);
+                    // Use slot 0 of pooled/comp_row as scratch (boundaries serial).
+                    let mut pooled_v = bd.pooled.slice_view_mut(0, cs_kvhd);
+                    let mut comp_row_v = bd.comp_row.slice_view_mut(0, cs_kvhd);
                     de.compressor_pool.launch(
                         &de.compute,
                         &mut pooled_v,
@@ -680,7 +752,7 @@ impl HeterogeneousEngine {
                         N_HEAD_DIM,
                         RMS_EPS,
                     )?;
-                    let comp_pos = pos + 1 - ratio;
+                    let comp_pos = pos0 + seg_end - ratio;
                     de.rope.launch_forward(
                         &de.compute,
                         &mut comp_row_v,
@@ -711,10 +783,28 @@ impl HeterogeneousEngine {
                     )?;
                     cs.n_comp += 1;
                 }
+
+                // n_comp_after semantics: for token at pos = pos0+k, value
+                // reflects cs.n_comp AFTER processing that position. If the
+                // boundary fires at the end of this segment (i.e., at the
+                // last position in the segment), only that LAST position
+                // sees the post-fire n_comp; earlier positions see pre-fire.
+                let post_fire = cs.n_comp;
+                let pre_fire = if comp_fires { post_fire - 1 } else { post_fire };
+                for k in i..seg_end {
+                    let snap = if comp_fires && k == seg_end - 1 {
+                        post_fire
+                    } else {
+                        pre_fire
+                    };
+                    n_comp_after.push(snap);
+                }
+                i = seg_end;
             }
-            // Record per-batch n_comp snapshot for Stage 5 causality.
-            let n_comp_snap = ls.compressor.as_ref().map(|c| c.n_comp).unwrap_or(0);
-            n_comp_after.push(n_comp_snap);
+        } else {
+            for _ in 0..b {
+                n_comp_after.push(0);
+            }
         }
         drop(_t_kv_append_comp);
 
