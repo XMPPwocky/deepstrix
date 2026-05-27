@@ -129,6 +129,23 @@ impl PrefillStats {
         (self.n_expert as f32) * (1.0 - p_not_picked_b)
     }
 
+    /// Write per-expert pick_counts (one line per expert) for a chosen layer to a file.
+    /// Format: JSON {"layer": L, "n_used": ..., "n_expert": ..., "total_tokens": T,
+    ///                "picks": [count_for_expert_0, count_for_expert_1, ...]}.
+    pub fn dump_layer_picks(&self, layer: usize, path: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let ls = &self.layers[layer];
+        let mut f = std::fs::File::create(path)?;
+        write!(f, "{{\"layer\": {}, \"n_used\": {}, \"n_expert\": {}, \"total_tokens\": {}, \"picks\": [",
+               layer, self.n_used, self.n_expert, ls.total_tokens)?;
+        for (i, &c) in ls.pick_counts.iter().enumerate() {
+            if i > 0 { write!(f, ", ")?; }
+            write!(f, "{}", c)?;
+        }
+        write!(f, "]}}")?;
+        Ok(())
+    }
+
     /// Print a human-readable summary.
     pub fn print_summary(&self) {
         eprintln!("\n=== PrefillStats (n_layer={}, n_used={}, n_expert={}) ===",

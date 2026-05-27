@@ -337,8 +337,12 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
     };
     eprintln!("loading main weights...");
     let main_weights = HetModelWeights::load_all(&main_gguf, dgpu, igpu, &rope_for_layer)?;
-    let engine =
+    let mut engine =
         HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
+    if let Ok(perfetto_out) = std::env::var("PERFETTO_OUT") {
+        eprintln!("perfetto: enabling, output → {perfetto_out}");
+        engine.attach_perfetto(&perfetto_out)?;
+    }
     let mut bd = BatchDgpuScratch::alloc(dgpu)?;
     let mut bi = BatchIgpuScratch::alloc(igpu)?;
     let mut head_scratch = DgpuScratch::alloc(dgpu)?;
@@ -487,5 +491,14 @@ fn bench_prefill_expert_stats() -> eyre::Result<()> {
         Some(&mut stats),
     )?;
     stats.print_summary();
+    // Dump representative layer's pick counts for offline plotting.
+    let dump_layer: usize = std::env::var("DUMP_LAYER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let dump_path = std::env::var("DUMP_PATH")
+        .unwrap_or_else(|_| format!("/tmp/expert_picks_T{t}_L{dump_layer}.json"));
+    stats.dump_layer_picks(dump_layer, &dump_path)?;
+    eprintln!("\nDumped layer {dump_layer} pick_counts to {dump_path}");
     Ok(())
 }
