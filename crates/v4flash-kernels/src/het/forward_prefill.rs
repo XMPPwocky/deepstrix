@@ -439,6 +439,11 @@ impl HeterogeneousEngine {
         let cs_qflat = Q_FLAT as usize;
         let cs_kvhd = N_HEAD_DIM as usize;
         let cs_n_used = N_EXPERT_USED;
+        // Per-layer cross-device sync events. Same set the decode path uses
+        // (LayerSyncEvents in engine.rs). We use selected_ready/_pushed for
+        // the pre-MoE handoff and moe_done/_arrived for the MoE→ffn_combine
+        // handoff — replacing the v1 host syncs.
+        let sev = &self.sync_events.layers[layer as usize];
 
         // ========================================================
         // Stage 1: mhc_pre_attn (BATCHED)
@@ -1174,12 +1179,13 @@ impl HeterogeneousEngine {
             * crate::q8_k::BLOCK_Q8_K_BYTES;
         // Stage 9 router_topk + Stage 10 shared expert wrote bd.d_selected,
         // bd.d_ew, bd.ffn_input_norm on de.compute. We're about to read
-        // them from de.xfer. Without this fence, the peer-pushes race with
-        // the still-pending compute writes. Single-token forward_layer uses
-        // events (sev.ain_ready/selected_ready) for the same reason; v2
-        // takes the simpler bulk-sync route.
+        // them from de.xfer. Use the LayerSyncEvents event chain
+        // (selected_ready → wait → push → selected_pushed → igpu waits)
+        // instead of a host sync, so de.compute is free to keep queuing
+        // the next lane's pre-MoE work while xfer/igpu drain this lane.
         self.set_current_cached(self.dgpu.device)?;
-        de.compute.synchronize()?;
+        sev.selected_ready.record(&de.compute)?;
+        de.xfer.wait_event(&sev.selected_ready)?;
         // Single batched peer-push of all B activations + routing.
         let ain_v = bd
             .ffn_input_norm
@@ -1199,7 +1205,7 @@ impl HeterogeneousEngine {
             peer_push_i32(&dsel_v, &mut bi_sel, &de.xfer)?;
             peer_push_f32(&dew_v, &mut bi_ew, &de.xfer)?;
         }
-        de.xfer.synchronize()?;
+        sev.selected_pushed.record(&de.xfer)?;
         drop(bi_ain);
         drop(bi_sel);
         drop(bi_ew);
@@ -1209,6 +1215,9 @@ impl HeterogeneousEngine {
         // but smaller perf lever).
         self.set_current_cached(self.igpu.device)?;
         let ie = &self.igpu;
+        // Wait for the dGPU→iGPU peer-push to land before any iGPU compute
+        // reads the recv buffers. Replaces the old de.xfer.synchronize().
+        ie.compute.wait_event(&sev.selected_pushed)?;
         // q8k quantize ain[B*N_EMBD] → d_xq_q8k[B*blocks].
         {
             let _t_q8k_pre = ie.events.stage("igpu.q8k_quantize_pre_iq2", &ie.compute)?;
@@ -1416,7 +1425,9 @@ impl HeterogeneousEngine {
                 b,
             )?;
         }
-        ie.compute.synchronize()?;
+        // Record MoE-done so the iGPU xfer can wait without a host sync.
+        sev.moe_done.record(&ie.compute)?;
+        ie.xfer.wait_event(&sev.moe_done)?;
 
         // Single batched peer-push back of bi.ffn_moe[B*N_EMBD].
         let bi_ffn_view = bi.ffn_moe.slice_view(0, (b as usize) * cs_n_embd);
@@ -1427,10 +1438,13 @@ impl HeterogeneousEngine {
             let _t_peer_moe = ie.events.stage("igpu.peer_push_ffn_moe", &ie.xfer)?;
             peer_push_f32(&bi_ffn_view, &mut bd_moe_dst, &ie.xfer)?;
         }
-        ie.xfer.synchronize()?;
+        // moe_arrived fires once ffn_moe has landed on dGPU; ffn_combine
+        // below waits on it instead of the old ie.xfer.synchronize().
+        sev.moe_arrived.record(&ie.xfer)?;
         drop(bi_ffn_view);
         drop(bd_moe_dst);
         self.set_current_cached(self.dgpu.device)?;
+        de.compute.wait_event(&sev.moe_arrived)?;
 
         // ========================================================
         // Stage 12: ffn_combine (vec_add stretched + BATCHED hc_post_from_split)
