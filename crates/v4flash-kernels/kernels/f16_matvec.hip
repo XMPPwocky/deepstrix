@@ -44,6 +44,35 @@ extern "C" __global__ void f16_matvec(
     if (lane == 0) out[row] = acc;
 }
 
+// Batched wide variant: grid.z = B. For each batch element b, computes
+// out[b, r] = sum_i f32(W[r,i]) * x[b, i]. Weight is shared across the
+// batch; x and out are indexed by blockIdx.z. The per-row reduction is the
+// identical single-warp shuffle tree as f16_matvec, so each (b, row) output
+// is bit-identical to calling f16_matvec once per batch element — only the
+// launch count changes (1 launch vs B).
+extern "C" __global__ void f16_matvec_batched(
+        float          * __restrict__ out,        // [B, n_rows]
+        const __half   * __restrict__ weight,     // [n_rows, k]
+        const float    * __restrict__ x,          // [B, k]
+        unsigned int     k,
+        unsigned int     n_rows) {
+    uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= n_rows) return;
+    const uint32_t bz = blockIdx.z;
+
+    const __half *wr = weight + (size_t)row * (size_t)k;
+    const float  *xb = x + (size_t)bz * (size_t)k;
+
+    float acc = 0.0f;
+    for (uint32_t i = lane; i < k; i += F16_WARP_LANES) {
+        acc += __half2float(wr[i]) * xb[i];
+    }
+
+    acc = f16_warp_sum_f32(acc);
+    if (lane == 0) out[(size_t)bz * (size_t)n_rows + row] = acc;
+}
+
 // M40-P4.5: 2-wide pair variant. One weight matrix, two input vectors,
 // two output vectors. Per-lane: load W[i] once, multiply by x_a[i] and
 // x_b[i], accumulate into two scalars. Halves W bandwidth.

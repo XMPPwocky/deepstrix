@@ -78,6 +78,48 @@ impl WmmaProbe {
         launch_kernel!(function, cfg, stream, [out.raw(), a_in.raw(), b_in.raw(), n_iters])
     }
 
+    /// Non-WMMA f32 vector-FMA throughput (the path attention runs today).
+    /// Effective flops/iter per warp = FMA_ACC(32) × 32 lanes × 2 (mul+add).
+    pub fn launch_fma_f32(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        a_in: &DeviceBuffer<f32>,
+        b_in: &DeviceBuffer<f32>,
+        n_iters: u32,
+        n_blocks: u32,
+        block_threads: u32,
+    ) -> eyre::Result<()> {
+        let function = self.module.get_function("fma_f32_throughput_probe")?;
+        let cfg = LaunchConfig {
+            grid: (n_blocks, 1, 1),
+            block: (block_threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [out.raw(), a_in.raw(), b_in.raw(), n_iters])
+    }
+
+    /// Non-WMMA packed f16x2 vector-FMA throughput (2 elems/op).
+    /// Effective flops/iter per warp = FMA_ACC(32) × 32 lanes × 2 elems × 2.
+    pub fn launch_fma_f16x2(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        a_in: &DeviceBuffer<u16>,
+        b_in: &DeviceBuffer<u16>,
+        n_iters: u32,
+        n_blocks: u32,
+        block_threads: u32,
+    ) -> eyre::Result<()> {
+        let function = self.module.get_function("fma_f16x2_throughput_probe")?;
+        let cfg = LaunchConfig {
+            grid: (n_blocks, 1, 1),
+            block: (block_threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [out.raw(), a_in.raw(), b_in.raw(), n_iters])
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_named(
         &self,

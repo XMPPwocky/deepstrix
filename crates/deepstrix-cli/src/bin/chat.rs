@@ -381,5 +381,9 @@ fn main() -> eyre::Result<()> {
             if hit_eos { ", EOS" } else { ", max_new" }
         );
     }
+    // Drain both devices to idle before the buffers/streams drop. Without
+    // this, a per-buffer hipFree's implicit SyncAllStreams can orphan an
+    // in-flight cross-device wait and busy-spin forever at teardown.
+    engine.shutdown()?;
     Ok(())
 }

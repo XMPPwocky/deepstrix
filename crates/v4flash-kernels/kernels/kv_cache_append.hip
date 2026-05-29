@@ -60,3 +60,36 @@ extern "C" __global__ void kv_cache_append_batched(
     cache[(unsigned long long)slot * head_dim + d] =
         kv_new[(unsigned long long)b * head_dim + d];
 }
+
+// M51 general eviction gather. Whenever the combined sequence
+// [old_cache(R0 rows), kv_new(B rows)] overflows the window
+// (R0 + B > swa_window), the serial slide loop leaves the cache holding
+// exactly the LAST `swa_window` rows of that combined sequence, in order.
+// Reproduce that final state directly: slot s ← combined[R0 + B - W + s],
+// where combined[m] = old_cache[m] if m < R0 else kv_new[m - R0].
+//
+// In the eviction regime R0 + B > W, the source index m = R0+B-W+s ≥ 1 for
+// all s ≥ 0, so there is no underflow even when B < W (partial eviction with
+// surviving prior rows). Output is written to a SEPARATE scratch buffer, so
+// the survivor reads from `cache` never race the writes — caller copies the
+// scratch ring back into the cache afterwards.
+//
+// Grid (swa_window, 1, 1), block (head_dim, 1, 1). Caller ensures R0+B > W.
+extern "C" __global__ void kv_cache_append_evict_gather(
+        const float  * __restrict__ cache,         // [swa_window * head_dim] (old)
+        const float  * __restrict__ kv_new,        // [B, head_dim]
+        float        * __restrict__ out,           // [swa_window * head_dim] (new ring)
+        unsigned int   r0,                         // prior fill count (old rows in cache)
+        unsigned int   b,
+        unsigned int   swa_window,
+        unsigned int   head_dim) {
+    const unsigned int d = threadIdx.x;
+    const unsigned int s = blockIdx.x;
+    if (d >= head_dim || s >= swa_window) return;
+    // m ≥ 1 because r0 + b > swa_window in the eviction regime.
+    const unsigned long long m = (unsigned long long)r0 + b - swa_window + s;
+    const float val = (m < (unsigned long long)r0)
+        ? cache[m * head_dim + d]
+        : kv_new[(m - r0) * head_dim + d];
+    out[(unsigned long long)s * head_dim + d] = val;
+}

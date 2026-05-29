@@ -35,6 +35,19 @@ impl Device {
         check_eyre(unsafe { sys::hipSetDevice(self.id) }, "hipSetDevice")
     }
 
+    /// Block until ALL streams on this device have completed all queued
+    /// work. `hipDeviceSynchronize` acts on the *current* device, so we
+    /// `set_current` first. Used at teardown to drain every stream
+    /// (including the pipeline lane/xfer streams and cross-device event
+    /// signal packets) to a quiescent state before any stream or buffer
+    /// is destroyed — otherwise a buffer's `hipFree` runs an implicit
+    /// per-buffer `SyncAllStreams` that can orphan a not-yet-executed
+    /// cross-device wait and busy-spin forever.
+    pub fn synchronize(&self) -> eyre::Result<()> {
+        self.set_current()?;
+        check_eyre(unsafe { sys::hipDeviceSynchronize() }, "hipDeviceSynchronize")
+    }
+
     /// Read full device properties.
     ///
     /// We sanity-check the struct layout immediately by comparing the

@@ -16,7 +16,20 @@
 #include <hip/hip_fp16.h>
 
 typedef _Float16 half16 __attribute__((ext_vector_type(16)));
+typedef _Float16 half8  __attribute__((ext_vector_type(8)));
 typedef float    float8 __attribute__((ext_vector_type(8)));
+
+// RDNA3/3.5 (gfx11xx) and RDNA4 (gfx12xx) use different WMMA intrinsics.
+// RDNA3 packs the K=16 operand as 16 halfs/lane (replicated across the two
+// halves of the w32 wave); RDNA4 dropped that replication, so its A/B
+// fragments are 8 halfs/lane (verified by compiling against ROCm 7.2.3
+// clang — the gfx12 builtin rejects a 16-wide vector). Op count is the
+// same 16×16×16 = 8192 flops either way.
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
+#define WMMA_RDNA3 1
+#elif defined(__gfx1200__) || defined(__gfx1201__)
+#define WMMA_RDNA4 1
+#endif
 
 extern "C" __global__ void wmma_f16_throughput_probe(
         float        * __restrict__ out,     // [n_warps × 8] sink for c_frag
@@ -29,27 +42,28 @@ extern "C" __global__ void wmma_f16_throughput_probe(
     const unsigned int global_warp_id =
         blockIdx.x * n_warps_per_block + warp_id_in_block;
 
-    // Load fragments — every lane loads the same 16 elements. In a real
+    // Load fragments — every lane loads the same elements. In a real
     // WMMA op the load is interpreted per-fragment-mapping; here we
     // just need values in registers so the compiler emits the WMMA insn.
-    half16 a;
-    half16 b;
-    for (int i = 0; i < 16; i++) {
-        a[i] = a_in[i];
-        b[i] = b_in[i];
-    }
+    // RDNA4 A/B fragments are 8 halfs/lane; RDNA3 are 16 (replicated).
+#if defined(WMMA_RDNA4)
+    half8 a, b;
+    for (int i = 0; i < 8; i++) { a[i] = a_in[i]; b[i] = b_in[i]; }
+#else
+    half16 a, b;
+    for (int i = 0; i < 16; i++) { a[i] = a_in[i]; b[i] = b_in[i]; }
+#endif
     float8 c = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
     // The dependency chain: each iter feeds c back into itself. This
     // measures issue rate per warp, not parallel throughput. To measure
     // parallel throughput, increase n_warps_per_block + total WGs.
     for (unsigned int i = 0; i < n_iters; i++) {
-#if defined(__gfx1151__) || defined(__gfx1150__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
+#if defined(WMMA_RDNA4)
+        c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+#elif defined(WMMA_RDNA3)
         c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 #else
-        // gfx1201 (RDNA4) uses a different intrinsic naming; not
-        // exercised here since iq2 lives on iGPU only. Stub out so
-        // the kernel still compiles but the probe shouldn't be run.
         c[0] += (float)a[0] * (float)b[0];
 #endif
     }
@@ -83,14 +97,27 @@ extern "C" __global__ void wmma_f16_throughput_probe_parallel(
     const unsigned int global_warp_id =
         blockIdx.x * n_warps_per_block + warp_id_in_block;
 
-    half16 a;
-    half16 b;
+#if defined(WMMA_RDNA4)
+    half8 a, b;
+    for (int i = 0; i < 8; i++) { a[i] = a_in[i]; b[i] = b_in[i]; }
+#else
+    half16 a, b;
     for (int i = 0; i < 16; i++) { a[i] = a_in[i]; b[i] = b_in[i]; }
+#endif
     float8 c0 = {0.0f}, c1 = {0.0f}, c2 = {0.0f}, c3 = {0.0f};
     float8 c4 = {0.0f}, c5 = {0.0f}, c6 = {0.0f}, c7 = {0.0f};
 
     for (unsigned int i = 0; i < n_iters; i++) {
-#if defined(__gfx1151__) || defined(__gfx1150__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
+#if defined(WMMA_RDNA4)
+        c0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c0);
+        c1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c1);
+        c2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c2);
+        c3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c3);
+        c4 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c4);
+        c5 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c5);
+        c6 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c6);
+        c7 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c7);
+#elif defined(WMMA_RDNA3)
         c0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c0);
         c1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c1);
         c2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c2);
@@ -120,6 +147,7 @@ extern "C" __global__ void wmma_f16_throughput_probe_parallel(
 // pattern as wmma_f16_throughput_probe_parallel. Per-op count:
 // 16*16*16 = 4096 muls + 4096 adds = 8192 int-ops.
 typedef int8_t  i8x16  __attribute__((ext_vector_type(16)));
+typedef int8_t  i8x8   __attribute__((ext_vector_type(8)));
 typedef int     i32x8 __attribute__((ext_vector_type(8)));
 
 extern "C" __global__ void wmma_iu8_throughput_probe_parallel(
@@ -133,19 +161,31 @@ extern "C" __global__ void wmma_iu8_throughput_probe_parallel(
     const unsigned int global_warp_id =
         blockIdx.x * n_warps_per_block + warp_id_in_block;
 
-    i8x16 a;
-    i8x16 b;
+    // RDNA4 int8 A/B fragments are 8 int8/lane (packed as 2×int32);
+    // RDNA3 are 16/lane. Op count is the same 16×16×16.
+#if defined(WMMA_RDNA4)
+    i8x8 a, b;
+    for (int i = 0; i < 8; i++) { a[i] = a_in[i]; b[i] = b_in[i]; }
+#else
+    i8x16 a, b;
     for (int i = 0; i < 16; i++) { a[i] = a_in[i]; b[i] = b_in[i]; }
+#endif
     i32x8 c0 = {0}, c1 = {0}, c2 = {0}, c3 = {0};
     i32x8 c4 = {0}, c5 = {0}, c6 = {0}, c7 = {0};
 
+    // IU8: 6 args (A-signedness, A, B-signedness, B, C, clamp). false =
+    // signed interpretation for both operands.
     for (unsigned int i = 0; i < n_iters; i++) {
-#if defined(__gfx1151__) || defined(__gfx1150__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
-        // IU8: 4 args (A signed, B signed, C, clamp). The clang
-        // builtin is __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32.
-        // A and B both treated as unsigned (false flag means signed
-        // interpretation depending on builtin spec). Use false=signed
-        // for both for the test.
+#if defined(WMMA_RDNA4)
+        c0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, false, b, c0, false);
+        c1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, false, b, c1, false);
+        c2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, false, b, c2, false);
+        c3 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, false, b, c3, false);
+        c4 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, false, b, c4, false);
+        c5 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, false, b, c5, false);
+        c6 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, false, b, c6, false);
+        c7 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, false, b, c7, false);
+#elif defined(WMMA_RDNA3)
         c0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, a, false, b, c0, false);
         c1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, a, false, b, c1, false);
         c2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, a, false, b, c2, false);
@@ -168,4 +208,70 @@ extern "C" __global__ void wmma_iu8_throughput_probe_parallel(
         out[base+0]=c[0]; out[base+1]=c[1]; out[base+2]=c[2]; out[base+3]=c[3];
         out[base+4]=c[4]; out[base+5]=c[5]; out[base+6]=c[6]; out[base+7]=c[7];
     }
+}
+
+// ============================================================================
+// Non-WMMA baseline: plain vector-ALU FMA throughput. This is the path the
+// attention/dense kernels use today (scalar f32). Measuring it gives the
+// honest "what does WMMA buy over what we run now" denominator.
+//
+// Each lane keeps FMA_ACC independent accumulator chains so the SIMD pipeline
+// stays full (hides FMA latency) and the compiler is free to dual-issue
+// (VOPD) where it can. flops = n_warps × 32 lanes × n_iters × FMA_ACC × (mul+add).
+// ============================================================================
+#define FMA_ACC 32
+
+extern "C" __global__ void fma_f32_throughput_probe(
+        float       * __restrict__ out,
+        const float * __restrict__ a_in,
+        const float * __restrict__ b_in,
+        unsigned int  n_iters) {
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int gwarp = blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
+
+    const float b = b_in[0];
+    float acc[FMA_ACC];
+    #pragma unroll
+    for (int k = 0; k < FMA_ACC; k++) acc[k] = a_in[0] + (float)k;
+
+    // Plain mul+add (NOT fmaf): hipcc -O3 contracts this to one hardware
+    // v_fma_f32. Calling fmaf() can route through OCML's correctly-rounded
+    // software fma (a libcall) and tanks throughput ~10×.
+    for (unsigned int i = 0; i < n_iters; i++) {
+        #pragma unroll
+        for (int k = 0; k < FMA_ACC; k++) acc[k] = acc[k] * b + b;
+    }
+
+    float s = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < FMA_ACC; k++) s += acc[k];
+    if (lane == 0) out[gwarp] = s;
+}
+
+// Packed f16x2 FMA (v_pk_fma_f16): 2 elements per op → 2× the f32 flop rate
+// when the data is half. flops = ... × FMA_ACC × 2 elems × (mul+add).
+typedef _Float16 half2v __attribute__((ext_vector_type(2)));
+
+extern "C" __global__ void fma_f16x2_throughput_probe(
+        float          * __restrict__ out,
+        const _Float16 * __restrict__ a_in,
+        const _Float16 * __restrict__ b_in,
+        unsigned int     n_iters) {
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int gwarp = blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
+
+    const half2v b = {b_in[0], b_in[0]};
+    half2v acc[FMA_ACC];
+    #pragma unroll
+    for (int k = 0; k < FMA_ACC; k++) acc[k] = half2v{a_in[0], a_in[0]} + (_Float16)k;
+
+    for (unsigned int i = 0; i < n_iters; i++) {
+        #pragma unroll
+        for (int k = 0; k < FMA_ACC; k++) acc[k] = acc[k] * b + b;
+    }
+
+    _Float16 s = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < FMA_ACC; k++) s += acc[k][0] + acc[k][1];
+    if (lane == 0) out[gwarp] = (float)s;
 }

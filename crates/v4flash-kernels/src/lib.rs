@@ -36,6 +36,7 @@ pub mod rms_norm;
 pub mod rope;
 pub mod weights;
 pub mod wmma_probe;
+pub mod wmma_wsum;
 
 pub use attention::{AttentionMixed, AttentionSwa, ATTN_MIXED_MAX_KEYS, ATTN_SWA_MAX_KV};
 pub use broadcast::BroadcastToHc;
@@ -55,7 +56,7 @@ pub use oracle::{ActivationDump, Dtype, TensorEntry};
 pub use router_topk::{RouterTopk, ROUTER_MAX_EXPERTS, ROUTER_MAX_USED};
 pub use q2_k::{Q2KAccumulateMatvec, BLOCK_Q2_K_BYTES};
 pub use q4_k::{Q4KMatvec, BLOCK_Q4_K_BYTES};
-pub use q8_0::{Q8_0GroupedMatvec, Q8_0Matvec};
+pub use q8_0::{Q8_0GroupedMatvec, Q8_0Matvec, Q8_0MatvecWmma};
 pub use q8_k::{Q8KQuantize, BLOCK_Q8_K_BYTES, QK_K};
 pub use rms_norm::{RmsNorm, RmsNormNoWeight};
 pub use rope::{RopeParams, RopeTail};

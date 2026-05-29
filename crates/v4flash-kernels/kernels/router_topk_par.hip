@@ -39,6 +39,14 @@ extern "C" __global__ void router_topk_par(
 
     const unsigned int tid = threadIdx.x;
 
+    // Batched over blockIdx.x: each block handles one token. logits/selected/
+    // weights are indexed by the block; bias is shared. For the single-token
+    // launch (grid.x == 1) blockIdx.x == 0, so these offsets are no-ops and
+    // the result is identical to the unbatched kernel.
+    logits   += (size_t)blockIdx.x * (size_t)n_expert;
+    selected += (size_t)blockIdx.x * (size_t)n_used;
+    weights  += (size_t)blockIdx.x * (size_t)n_used;
+
     // Phase 1: probs + selection scores.
     if (tid < n_expert) {
         const float p = sqrtf(softplus_stable(logits[tid]));

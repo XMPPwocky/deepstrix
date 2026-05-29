@@ -465,4 +465,88 @@ impl AttentionMixed {
             n_head, head_dim, ATTN_MIXED_MAX_KEYS
         ])
     }
+
+    /// WMMA variant of [`Self::launch_score_batched_htiled`]. Computes the
+    /// score GEMM O[heads,keys]=Q·Kᵀ as a RDNA4 16x16x16 f16 WMMA (f32->f16 at
+    /// fragment-load, no f16 KV cache). Requires head_dim==512 and n_head a
+    /// multiple of 16. Grid (ceil(n_total_max/256), 1, batch), block 512.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_score_batched_htiled_wmma(
+        &self,
+        stream: &Stream,
+        scores_g: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<f32>,
+        comp_kv: Option<&DeviceBuffer<f32>>,
+        n_raw_per: &DeviceBuffer<i32>,
+        n_comp_per: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        n_total_max: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_total_max == 0 {
+            return Ok(());
+        }
+        if n_total_max > ATTN_MIXED_MAX_KEYS {
+            return Err(eyre!(
+                "attention_mixed_score_batched_htiled_wmma: n_total_max={n_total_max} exceeds cap {ATTN_MIXED_MAX_KEYS}"
+            ));
+        }
+        let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
+        let function = self
+            .module
+            .get_function("attention_mixed_score_batched_htiled_wmma")?;
+        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
+        let key_blocks = n_total_max.div_ceil(256);
+        let cfg = LaunchConfig {
+            grid: (key_blocks, 1, batch),
+            block: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            scores_g.raw(), q.raw(), raw_kv.raw(), comp_kv_ptr,
+            n_raw_per.raw(), n_comp_per.raw(),
+            n_head, head_dim, ATTN_MIXED_MAX_KEYS, kq_scale
+        ])
+    }
+
+    /// WMMA Phase-B variant of [`Self::launch_softmax_wsum_batched_htiled`].
+    /// Phase A (softmax) is identical; Phase B is a RDNA4 16x16x16 f16 WMMA
+    /// GEMM (f32->f16 converted at fragment-load, no f16 KV cache). Requires
+    /// head_dim==512 and SMWSUM_HEAD_TILE==16. Same grid/block/output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_softmax_wsum_batched_htiled_wmma(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        scores_g: &mut DeviceBuffer<f32>,
+        sinks: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<f32>,
+        comp_kv: Option<&DeviceBuffer<f32>>,
+        n_raw_per: &DeviceBuffer<i32>,
+        n_comp_per: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let function = self
+            .module
+            .get_function("attention_mixed_softmax_wsum_batched_htiled_wmma")?;
+        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
+        let n_head_groups = n_head.div_ceil(SMWSUM_HEAD_TILE);
+        let cfg = LaunchConfig {
+            grid: (n_head_groups, batch, 1),
+            block: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
+            n_raw_per.raw(), n_comp_per.raw(),
+            n_head, head_dim, ATTN_MIXED_MAX_KEYS
+        ])
+    }
 }

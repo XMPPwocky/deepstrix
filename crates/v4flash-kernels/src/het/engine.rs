@@ -24,7 +24,7 @@ use crate::keep_alive::KeepAlive;
 use crate::iq2_xxs::Iq2XxsPairMatvec;
 use crate::kv_cache_append::KvCacheAppend;
 use crate::q2_k::Q2KAccumulateMatvec;
-use crate::q8_0::{Q8_0GroupedMatvec, Q8_0Matvec};
+use crate::q8_0::{Q8_0GroupedMatvec, Q8_0Matvec, Q8_0MatvecWmma};
 use crate::q8_k::Q8KQuantize;
 use crate::rms_norm::{RmsNorm, RmsNormNoWeight};
 use crate::rope::RopeTail;
@@ -75,6 +75,9 @@ pub struct DeviceEngine {
     pub rms_w: RmsNorm,
     pub rms_nw: RmsNormNoWeight,
     pub q8: Q8_0Matvec,
+    /// int8-WMMA Q8_0 GEMM (gfx12 dGPU only). Same math as `q8.matvec_batched`,
+    /// via the matrix cores. Used for the prefill qb up-projection.
+    pub q8_wmma: Q8_0MatvecWmma,
     pub q8_grouped: Q8_0GroupedMatvec,
     pub f16: F16Matvec,
     pub rope: RopeTail,
@@ -145,6 +148,7 @@ impl DeviceEngine {
             rms_w: RmsNorm::for_arch(arch)?,
             rms_nw: RmsNormNoWeight::for_arch(arch)?,
             q8: Q8_0Matvec::for_arch(arch)?,
+            q8_wmma: Q8_0MatvecWmma::for_arch(arch)?,
             q8_grouped: Q8_0GroupedMatvec::for_arch(arch)?,
             f16: F16Matvec::for_arch(arch)?,
             rope: RopeTail::for_arch(arch)?,
@@ -843,6 +847,22 @@ impl HeterogeneousEngine {
         let stream = Stream::new(self.dgpu.device.id)?;
         self.dgpu_keepalive = Some(ka);
         self.dgpu_keepalive_stream = Some(stream);
+        Ok(())
+    }
+
+    /// Drain both devices to idle before teardown. Call this once after
+    /// all forward work is done and before `HeterogeneousEngine`,
+    /// `HetModelState`, and the scratch buffers go out of scope. It
+    /// guarantees every stream (compute, xfer, the pipeline lane streams,
+    /// and any in-flight cross-device event signal packets) has fully
+    /// completed, so the implicit `SyncAllStreams` that each buffer's
+    /// `hipFree` performs during Drop finds quiescent queues. Without
+    /// this drain, a stream destroyed before its signal packet executes
+    /// can orphan a peer's `hipStreamWaitEvent`, making teardown
+    /// busy-spin forever (the intermittent ROCm teardown hang).
+    pub fn shutdown(&self) -> eyre::Result<()> {
+        self.dgpu.device.synchronize()?;
+        self.igpu.device.synchronize()?;
         Ok(())
     }
 

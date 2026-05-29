@@ -339,10 +339,10 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
     let main_weights = HetModelWeights::load_all(&main_gguf, dgpu, igpu, &rope_for_layer)?;
     let mut engine =
         HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
-    if let Ok(perfetto_out) = std::env::var("PERFETTO_OUT") {
-        eprintln!("perfetto: enabling, output → {perfetto_out}");
-        engine.attach_perfetto(&perfetto_out)?;
-    }
+    // Defer perfetto attach until AFTER warmup so the trace contains only
+    // the timed chunk(s), not the shallow graph-capture warmups (whose tiny
+    // attention spans otherwise pollute the per-span aggregates).
+    let perfetto_out = std::env::var("PERFETTO_OUT").ok();
     // PIPELINE_LANES=2 turns on the two-lane pipelined prefill driver
     // (two BatchScratch sets, lane A + lane B interleaved per layer).
     // Default 1 keeps the original single-lane path.
@@ -475,73 +475,121 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
             }
         };
 
-        // Sweep each requested depth in-process (model stays resident).
-        let mut summary: Vec<(u32, f64, f64)> = Vec::with_capacity(fake_depths.len());
-        for &fake_pos in &fake_depths {
-            let mut walls_ms: Vec<f64> = Vec::with_capacity(n_iters);
-            for it in 0..n_iters {
-                // Reset depth before each timed chunk (forward_prefill advances
-                // the counters), so every iter measures the same depth.
-                set_fake(&mut state, fake_pos);
-                let t0 = Instant::now();
-                if let (Some(bdb), Some(bib)) = (bd_b.as_mut(), bi_b.as_mut()) {
-                    let _ = engine.forward_prefill_pipelined(
-                        &mut bd,
-                        &mut bi,
-                        bdb,
-                        bib,
-                        &mut head_scratch,
-                        &mut state,
-                        &main_weights,
-                        &chunk_hcs,
-                        &chunk_tokens,
-                        fake_pos,
-                        true,
-                        None,
-                    )?;
-                } else {
-                    let _ = engine.forward_prefill(
-                        &mut bd,
-                        &mut bi,
-                        &mut head_scratch,
-                        &mut state,
-                        &main_weights,
-                        &chunk_hcs,
-                        &chunk_tokens,
-                        fake_pos,
-                        true,
-                        None,
-                    )?;
-                }
-                let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                walls_ms.push(wall_ms);
-                eprintln!(
-                    "  depth {fake_pos} iter {it}: chunk wall={:.2} ms  ({:.3} ms/tok = {:.1} tok/s)",
-                    wall_ms,
-                    wall_ms / chunk_b as f64,
-                    (chunk_b as f64 * 1000.0) / wall_ms
-                );
+        // Attach perfetto now — after graph-capture warmup, before timing —
+        // so the trace holds only the timed chunk(s) at the requested depth.
+        if let Some(p) = &perfetto_out {
+            eprintln!("perfetto: attaching after warmup, output → {p}");
+            engine.attach_perfetto(p)?;
+        }
+
+        // QB_WMMA_AB=1: run the WHOLE sweep twice in-process (one model load)
+        // — once with QB_WMMA off (dp4a qb), once on (int8-WMMA qb) — so the
+        // A/B shares a thermal envelope (back-to-back methodology). The qb
+        // kernel reads QB_WMMA fresh on every call, so flipping the env var
+        // here switches the path with no rebuild.
+        let ab = std::env::var_os("QB_WMMA_AB").is_some();
+        let variants: Vec<(&str, Option<bool>)> = if ab {
+            vec![("qb=dp4a", Some(false)), ("qb=wmma", Some(true))]
+        } else {
+            vec![("qb=current", None)]
+        };
+
+        // summary[variant] = Vec<(depth, min_ms, median_ms)>
+        let mut summaries: Vec<(&str, Vec<(u32, f64, f64)>)> = Vec::new();
+        for (vname, vflag) in &variants {
+            match vflag {
+                Some(true) => std::env::set_var("QB_WMMA", "1"),
+                Some(false) => std::env::remove_var("QB_WMMA"),
+                None => {}
             }
-            walls_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let min_ms = walls_ms[0];
-            let median_ms = walls_ms[walls_ms.len() / 2];
-            summary.push((fake_pos, min_ms, median_ms));
+            eprintln!("\n--- variant {vname} ---");
+            let mut summary: Vec<(u32, f64, f64)> = Vec::with_capacity(fake_depths.len());
+            for &fake_pos in &fake_depths {
+                let mut walls_ms: Vec<f64> = Vec::with_capacity(n_iters);
+                for it in 0..n_iters {
+                    // Reset depth before each timed chunk (forward_prefill advances
+                    // the counters), so every iter measures the same depth.
+                    set_fake(&mut state, fake_pos);
+                    let t0 = Instant::now();
+                    if let (Some(bdb), Some(bib)) = (bd_b.as_mut(), bi_b.as_mut()) {
+                        let _ = engine.forward_prefill_pipelined(
+                            &mut bd,
+                            &mut bi,
+                            bdb,
+                            bib,
+                            &mut head_scratch,
+                            &mut state,
+                            &main_weights,
+                            &chunk_hcs,
+                            &chunk_tokens,
+                            fake_pos,
+                            true,
+                            None,
+                        )?;
+                    } else {
+                        let _ = engine.forward_prefill(
+                            &mut bd,
+                            &mut bi,
+                            &mut head_scratch,
+                            &mut state,
+                            &main_weights,
+                            &chunk_hcs,
+                            &chunk_tokens,
+                            fake_pos,
+                            true,
+                            None,
+                        )?;
+                    }
+                    let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    walls_ms.push(wall_ms);
+                    eprintln!(
+                        "  [{vname}] depth {fake_pos} iter {it}: chunk wall={:.2} ms  ({:.3} ms/tok = {:.1} tok/s)",
+                        wall_ms,
+                        wall_ms / chunk_b as f64,
+                        (chunk_b as f64 * 1000.0) / wall_ms
+                    );
+                }
+                walls_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let min_ms = walls_ms[0];
+                let median_ms = walls_ms[walls_ms.len() / 2];
+                summary.push((fake_pos, min_ms, median_ms));
+            }
+            summaries.push((vname, summary));
         }
 
         eprintln!("\n=== BENCH FAKE PREFILL ({chunk_b} tokens/iter, B_MAX={B_MAX} chunks) ===");
-        eprintln!("depth   best ms/iter    ms/tok   tok/s   |  median ms/iter    ms/tok   tok/s");
-        for (fake_pos, min_ms, median_ms) in &summary {
-            eprintln!(
-                "{:>6}  {:>11.2}  {:>7.3}  {:>6.1}  |  {:>13.2}  {:>7.3}  {:>6.1}",
-                fake_pos,
-                min_ms,
-                min_ms / chunk_b as f64,
-                (chunk_b as f64 * 1000.0) / min_ms,
-                median_ms,
-                median_ms / chunk_b as f64,
-                (chunk_b as f64 * 1000.0) / median_ms,
-            );
+        for (vname, summary) in &summaries {
+            eprintln!("[{vname}]");
+            eprintln!("depth   best ms/iter    ms/tok   tok/s   |  median ms/iter    ms/tok   tok/s");
+            for (fake_pos, min_ms, median_ms) in summary {
+                eprintln!(
+                    "{:>6}  {:>11.2}  {:>7.3}  {:>6.1}  |  {:>13.2}  {:>7.3}  {:>6.1}",
+                    fake_pos,
+                    min_ms,
+                    min_ms / chunk_b as f64,
+                    (chunk_b as f64 * 1000.0) / min_ms,
+                    median_ms,
+                    median_ms / chunk_b as f64,
+                    (chunk_b as f64 * 1000.0) / median_ms,
+                );
+            }
         }
+        if summaries.len() == 2 {
+            eprintln!("\n=== qb A/B (best ms/iter, dp4a -> wmma) ===");
+            let (_, a) = &summaries[0];
+            let (_, b) = &summaries[1];
+            for ((d, a_min, _), (_, b_min, _)) in a.iter().zip(b.iter()) {
+                eprintln!(
+                    "  depth {d}: {:.2} ms -> {:.2} ms  ({:+.1}%, {:.1} -> {:.1} tok/s)",
+                    a_min,
+                    b_min,
+                    (a_min - b_min) / a_min * 100.0,
+                    (chunk_b as f64 * 1000.0) / a_min,
+                    (chunk_b as f64 * 1000.0) / b_min,
+                );
+            }
+        }
+        engine.shutdown()?;
         return Ok(());
     }
 
@@ -561,11 +609,12 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
         eprintln!("(T>{n_real}: repeating real inputs cyclically — timing only)");
     }
 
-    let mut run_once = |bd: &mut BatchDgpuScratch,
-                        bi: &mut BatchIgpuScratch,
-                        bd_b: Option<&mut BatchDgpuScratch>,
-                        bi_b: Option<&mut BatchIgpuScratch>,
-                        state: &mut HetModelState|
+    let mut run_once = |engine: &mut HeterogeneousEngine,
+                    bd: &mut BatchDgpuScratch,
+                    bi: &mut BatchIgpuScratch,
+                    bd_b: Option<&mut BatchDgpuScratch>,
+                    bi_b: Option<&mut BatchIgpuScratch>,
+                    state: &mut HetModelState|
      -> eyre::Result<()> {
         if let (Some(bdb), Some(bib)) = (bd_b, bi_b) {
             let _ = engine.forward_prefill_pipelined(
@@ -603,6 +652,7 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
     for _ in 0..n_warmup {
         let mut state = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
         run_once(
+            &mut engine,
             &mut bd,
             &mut bi,
             bd_b.as_mut(),
@@ -610,11 +660,17 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
             &mut state,
         )?;
     }
+    // Attach perfetto after warmup so only the timed iters are traced.
+    if let Some(p) = &perfetto_out {
+        eprintln!("perfetto: attaching after warmup, output → {p}");
+        engine.attach_perfetto(p)?;
+    }
     let mut walls_ms: Vec<f64> = Vec::with_capacity(n_iters);
     for it in 0..n_iters {
         let mut state = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
         let t0 = Instant::now();
         run_once(
+            &mut engine,
             &mut bd,
             &mut bi,
             bd_b.as_mut(),
@@ -646,6 +702,7 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
         median_ms / t as f64,
         (t as f64 * 1000.0) / median_ms
     );
+    engine.shutdown()?;
     Ok(())
 }
 

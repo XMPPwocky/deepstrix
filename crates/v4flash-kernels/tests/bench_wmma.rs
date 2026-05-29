@@ -19,6 +19,208 @@ fn pick_igpu() -> eyre::Result<Device> {
     Err(eyre!("no gfx1151 iGPU"))
 }
 
+fn pick_dgpu() -> eyre::Result<Device> {
+    for d in Device::all()? {
+        if d.properties()?.gcn_arch_name.starts_with("gfx1201") {
+            return Ok(d);
+        }
+    }
+    Err(eyre!("no gfx1201 dGPU"))
+}
+
+/// Run the f16 + iu8 WMMA throughput probe on `dev`, with `peak` doc values
+/// supplied by the caller (they differ per arch). Returns the realized
+/// parallel f16 TFLOPs so callers can sanity-check against expectations.
+fn run_probe(
+    dev: Device,
+    f16_peak_dense: f64,
+    int8_peak_dense: f64,
+) -> eyre::Result<()> {
+    let arch = dev.properties()?.gcn_arch_name;
+    eprintln!("WMMA probe on {arch}");
+    dev.set_current()?;
+
+    let probe = WmmaProbe::for_arch(&arch)?;
+    let stream = Stream::new(dev.id)?;
+
+    let props = dev.properties()?;
+    let n_cus = props.multi_processor_count as u32;
+    let max_clock_ghz = props.clock_rate_khz as f64 / 1.0e6;
+    eprintln!("props: {n_cus} CUs (HIP WGP count), max clock {max_clock_ghz:.2} GHz");
+
+    let n_iters: u32 = std::env::var("WMMA_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10000);
+    let warps_per_block: u32 = std::env::var("WMMA_WARPS_PER_BLOCK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    let n_blocks: u32 = std::env::var("WMMA_BLOCKS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(n_cus * 2);
+    let block_threads = warps_per_block * 32;
+    let n_warps_total = n_blocks * warps_per_block;
+    eprintln!(
+        "config: n_iters={n_iters}, warps_per_block={warps_per_block}, n_blocks={n_blocks}, total warps={n_warps_total}"
+    );
+
+    const OPS_PER_WMMA: u64 = 8192; // 16×16×16 = 4096 mul + 4096 add
+
+    // --- f16 ---
+    let a_host: Vec<u16> = vec![0x3c00u16; 16];
+    let b_host: Vec<u16> = vec![0x3c00u16; 16];
+    let mut a_in: DeviceBuffer<u16> = DeviceBuffer::new(dev.id, 16)?;
+    let mut b_in: DeviceBuffer<u16> = DeviceBuffer::new(dev.id, 16)?;
+    a_in.copy_from_host(&a_host)?;
+    b_in.copy_from_host(&b_host)?;
+    let mut out: DeviceBuffer<f32> = DeviceBuffer::new(dev.id, (n_warps_total as usize) * 8)?;
+
+    probe.launch(&stream, &mut out, &a_in, &b_in, 100, n_blocks, block_threads)?;
+    probe.launch_parallel(&stream, &mut out, &a_in, &b_in, 100, n_blocks, block_threads)?;
+    stream.synchronize()?;
+
+    let n_runs = 5;
+
+    let seq_min = {
+        let mut ms: Vec<f32> = Vec::with_capacity(n_runs);
+        for _ in 0..n_runs {
+            let start = Event::new()?;
+            let end = Event::new()?;
+            start.record(&stream)?;
+            probe.launch(&stream, &mut out, &a_in, &b_in, n_iters, n_blocks, block_threads)?;
+            end.record(&stream)?;
+            stream.synchronize()?;
+            ms.push(Event::elapsed_ms(&start, &end)?);
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ms[0]
+    };
+    let seq_total_ops = (n_warps_total as u64) * (n_iters as u64) * OPS_PER_WMMA;
+    let seq_tops = (seq_total_ops as f64 / 1.0e12) / (seq_min as f64 / 1000.0);
+
+    let par_min = {
+        let mut ms: Vec<f32> = Vec::with_capacity(n_runs);
+        for _ in 0..n_runs {
+            let start = Event::new()?;
+            let end = Event::new()?;
+            start.record(&stream)?;
+            probe.launch_parallel(&stream, &mut out, &a_in, &b_in, n_iters, n_blocks, block_threads)?;
+            end.record(&stream)?;
+            stream.synchronize()?;
+            ms.push(Event::elapsed_ms(&start, &end)?);
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ms[0]
+    };
+    let par_total_ops = (n_warps_total as u64) * (n_iters as u64) * OPS_PER_WMMA * 8;
+    let par_tops = (par_total_ops as f64 / 1.0e12) / (par_min as f64 / 1000.0);
+
+    eprintln!("\n=== WMMA f16 throughput on {arch} ===");
+    eprintln!("Sequential (1 dep chain):  min {seq_min:.3} ms  realized {seq_tops:.2} TFLOPs");
+    eprintln!("Parallel (8 acc/warp):     min {par_min:.3} ms  realized {par_tops:.2} TFLOPs");
+    eprintln!("doc dense f16 WMMA peak:   {f16_peak_dense:.1} TFLOPs  → realized {:.1}% of peak", par_tops / f16_peak_dense * 100.0);
+
+    // --- iu8 ---
+    let a_iu8: Vec<i8> = vec![1i8; 16];
+    let b_iu8: Vec<i8> = vec![1i8; 16];
+    let mut a_iu8_in: DeviceBuffer<i8> = DeviceBuffer::new(dev.id, 16)?;
+    let mut b_iu8_in: DeviceBuffer<i8> = DeviceBuffer::new(dev.id, 16)?;
+    a_iu8_in.copy_from_host(&a_iu8)?;
+    b_iu8_in.copy_from_host(&b_iu8)?;
+    let mut out_iu8: DeviceBuffer<i32> = DeviceBuffer::new(dev.id, (n_warps_total as usize) * 8)?;
+    probe.launch_iu8_parallel(&stream, &mut out_iu8, &a_iu8_in, &b_iu8_in, 100, n_blocks, block_threads)?;
+    stream.synchronize()?;
+
+    let iu8_min = {
+        let mut ms: Vec<f32> = Vec::with_capacity(n_runs);
+        for _ in 0..n_runs {
+            let start = Event::new()?;
+            let end = Event::new()?;
+            start.record(&stream)?;
+            probe.launch_iu8_parallel(&stream, &mut out_iu8, &a_iu8_in, &b_iu8_in, n_iters, n_blocks, block_threads)?;
+            end.record(&stream)?;
+            stream.synchronize()?;
+            ms.push(Event::elapsed_ms(&start, &end)?);
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ms[0]
+    };
+    let iu8_total_ops = (n_warps_total as u64) * (n_iters as u64) * OPS_PER_WMMA * 8;
+    let iu8_tops = (iu8_total_ops as f64 / 1.0e12) / (iu8_min as f64 / 1000.0);
+    eprintln!("\n=== WMMA IU8 throughput on {arch} ===");
+    eprintln!("Parallel (8 acc/warp):     min {iu8_min:.3} ms  realized {iu8_tops:.2} TOps");
+    eprintln!("doc dense int8 WMMA peak:  {int8_peak_dense:.1} TOps  → realized {:.1}% of peak", iu8_tops / int8_peak_dense * 100.0);
+
+    // --- non-WMMA vector FMA baseline (the path attention runs today) ---
+    const FMA_ACC: u64 = 32; // must match #define FMA_ACC in wmma_probe.hip
+    let mut a_f32: DeviceBuffer<f32> = DeviceBuffer::new(dev.id, 1)?;
+    let mut b_f32: DeviceBuffer<f32> = DeviceBuffer::new(dev.id, 1)?;
+    a_f32.copy_from_host(&[1.0001f32])?;
+    b_f32.copy_from_host(&[0.9999f32])?;
+    let mut out_fma: DeviceBuffer<f32> = DeviceBuffer::new(dev.id, n_warps_total as usize)?;
+
+    probe.launch_fma_f32(&stream, &mut out_fma, &a_f32, &b_f32, 100, n_blocks, block_threads)?;
+    probe.launch_fma_f16x2(&stream, &mut out_fma, &a_in, &b_in, 100, n_blocks, block_threads)?;
+    stream.synchronize()?;
+
+    let f32_min = {
+        let mut ms: Vec<f32> = Vec::with_capacity(n_runs);
+        for _ in 0..n_runs {
+            let start = Event::new()?;
+            let end = Event::new()?;
+            start.record(&stream)?;
+            probe.launch_fma_f32(&stream, &mut out_fma, &a_f32, &b_f32, n_iters, n_blocks, block_threads)?;
+            end.record(&stream)?;
+            stream.synchronize()?;
+            ms.push(Event::elapsed_ms(&start, &end)?);
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ms[0]
+    };
+    // flops = warps × 32 lanes × n_iters × FMA_ACC × 2 (mul+add)
+    let f32_ops = (n_warps_total as u64) * 32 * (n_iters as u64) * FMA_ACC * 2;
+    let f32_tops = (f32_ops as f64 / 1.0e12) / (f32_min as f64 / 1000.0);
+
+    let f16_min = {
+        let mut ms: Vec<f32> = Vec::with_capacity(n_runs);
+        for _ in 0..n_runs {
+            let start = Event::new()?;
+            let end = Event::new()?;
+            start.record(&stream)?;
+            probe.launch_fma_f16x2(&stream, &mut out_fma, &a_in, &b_in, n_iters, n_blocks, block_threads)?;
+            end.record(&stream)?;
+            stream.synchronize()?;
+            ms.push(Event::elapsed_ms(&start, &end)?);
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ms[0]
+    };
+    // f16x2: × 2 elements per packed op
+    let f16_ops = (n_warps_total as u64) * 32 * (n_iters as u64) * FMA_ACC * 2 * 2;
+    let f16_tops = (f16_ops as f64 / 1.0e12) / (f16_min as f64 / 1000.0);
+
+    eprintln!("\n=== non-WMMA vector FMA throughput on {arch} (today's attention path) ===");
+    eprintln!("f32   FMA:                 min {f32_min:.3} ms  realized {f32_tops:.2} TFLOPs");
+    eprintln!("f16x2 FMA (packed):        min {f16_min:.3} ms  realized {f16_tops:.2} TFLOPs");
+    eprintln!("\n=== WMMA speedup over vector FMA ===");
+    eprintln!("f16 WMMA / f32 vector FMA:   {:.1}×   (the realistic ceiling for moving attention f32→WMMA)", par_tops / f32_tops);
+    eprintln!("f16 WMMA / f16x2 vector FMA: {:.1}×", par_tops / f16_tops);
+
+    Ok(())
+}
+
+#[test]
+#[ignore]
+fn bench_wmma_throughput_dgpu() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let dgpu = pick_dgpu()?;
+    // RDNA4 (gfx1201, 9070 XT) documented dense WMMA peaks (docs/DESIGN.md §2.1):
+    // f16/bf16 194.6 TFLOPS, int8 389 TOPS.
+    run_probe(dgpu, 194.6, 389.0)
+}
+
 #[test]
 #[ignore]
 fn bench_wmma_throughput_igpu() -> eyre::Result<()> {

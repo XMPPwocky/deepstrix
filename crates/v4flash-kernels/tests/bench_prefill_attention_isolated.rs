@@ -81,8 +81,10 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
     let phase: String = std::env::var("BENCH_PHASE").unwrap_or_else(|_| "both".to_string());
     let do_score = phase == "both" || phase == "score";
     let do_score_ht = phase == "score_ht";
+    let do_score_wmma = phase == "score_wmma";
     let do_smwsum = phase == "both" || phase == "smwsum";
     let do_smwsum_ht = phase == "smwsum_ht";
+    let do_smwsum_wmma = phase == "smwsum_wmma";
     let do_mono = phase == "mono";
 
     let n_total = n_raw + n_comp;
@@ -211,6 +213,21 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
                 batch,
             )?;
         }
+        if do_score_wmma {
+            attn.launch_score_batched_htiled_wmma(
+                stream,
+                scores,
+                &q,
+                &raw_kv,
+                comp_kv.as_ref(),
+                &n_raw_per,
+                &n_comp_per,
+                n_head,
+                head_dim,
+                n_total,
+                batch,
+            )?;
+        }
         if do_smwsum {
             attn.launch_softmax_wsum_batched(
                 stream,
@@ -228,6 +245,21 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
         }
         if do_smwsum_ht {
             attn.launch_softmax_wsum_batched_htiled(
+                stream,
+                out,
+                scores,
+                &sinks,
+                &raw_kv,
+                comp_kv.as_ref(),
+                &n_raw_per,
+                &n_comp_per,
+                n_head,
+                head_dim,
+                batch,
+            )?;
+        }
+        if do_smwsum_wmma {
+            attn.launch_softmax_wsum_batched_htiled_wmma(
                 stream,
                 out,
                 scores,
@@ -357,6 +389,14 @@ fn prefill_attention_split_matches_mono() -> eyre::Result<()> {
     let mut scores_htfull =
         DeviceBuffer::new(dgpu.id, b * n_head as usize * ATTN_MIXED_MAX_KEYS as usize)?;
     scores_htfull.fill_zero()?;
+    let mut scores_wmma =
+        DeviceBuffer::new(dgpu.id, b * n_head as usize * ATTN_MIXED_MAX_KEYS as usize)?;
+    scores_wmma.fill_zero()?;
+    // Fresh f32 score reference — NOT consumed by softmax (the wsum kernels
+    // overwrite scores_g in place with weights), so it stays as raw scores.
+    let mut scores_f32ref =
+        DeviceBuffer::new(dgpu.id, b * n_head as usize * ATTN_MIXED_MAX_KEYS as usize)?;
+    scores_f32ref.fill_zero()?;
 
     let n_total_max = nrawh
         .iter()
@@ -460,7 +500,62 @@ fn prefill_attention_split_matches_mono() -> eyre::Result<()> {
         head_dim,
         batch,
     )?;
+    // Fresh raw f32 score reference (not softmaxed).
+    attn.launch_score_batched_htiled(
+        &stream,
+        &mut scores_f32ref,
+        &q,
+        &raw_kv,
+        Some(&comp_kv),
+        &n_raw_per,
+        &n_comp_per,
+        n_head,
+        head_dim,
+        n_total_max,
+        batch,
+    )?;
+    // WMMA score (f16 GEMM) — validated against the f32 score directly.
+    attn.launch_score_batched_htiled_wmma(
+        &stream,
+        &mut scores_wmma,
+        &q,
+        &raw_kv,
+        Some(&comp_kv),
+        &n_raw_per,
+        &n_comp_per,
+        n_head,
+        head_dim,
+        n_total_max,
+        batch,
+    )?;
     stream.synchronize()?;
+
+    {
+        let nelem = b * n_head as usize * ATTN_MIXED_MAX_KEYS as usize;
+        let mut sf = vec![0f32; nelem];
+        let mut sw = vec![0f32; nelem];
+        scores_f32ref.copy_to_host(&mut sf)?;
+        scores_wmma.copy_to_host(&mut sw)?;
+        let mut err_sq = 0f64;
+        let mut ref_sq = 0f64;
+        let mut max_abs = 0f32;
+        for (a, c) in sf.iter().zip(sw.iter()) {
+            let d = (a - c).abs();
+            max_abs = max_abs.max(d);
+            err_sq += (d as f64) * (d as f64);
+            ref_sq += (*a as f64) * (*a as f64);
+        }
+        let rel_l2 = (err_sq / ref_sq).sqrt();
+        eprintln!(
+            "WMMA-score vs f32-score: rel_L2={rel_l2:.3e} max_abs={max_abs:.2e} \
+             (B={batch}, n_total_max={n_total_max})"
+        );
+        if rel_l2 > 1e-2 {
+            return Err(eyre!(
+                "WMMA score diverges from f32 score: rel_L2={rel_l2:.3e} (layout likely wrong)"
+            ));
+        }
+    }
 
     let mut m = vec![0f32; out_len];
     let mut s = vec![0f32; out_len];

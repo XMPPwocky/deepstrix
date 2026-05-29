@@ -123,4 +123,82 @@ impl RouterTopk {
             n_expert, n_used, expert_weight_scale, weight_eps
         ])
     }
+
+    /// Batched top-k: one block per token (grid.x = B). `logits` is
+    /// `[B, n_expert]`, `selected`/`weights` are `[B, n_used]`; bias is shared
+    /// across tokens. Each block's result is identical to a single `launch`
+    /// for that token. Requires the parallel kernel (`router_topk_par`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        selected: &mut DeviceBuffer<i32>,
+        weights: &mut DeviceBuffer<f32>,
+        logits: &DeviceBuffer<f32>,
+        bias: Option<&DeviceBuffer<f32>>,
+        n_expert: u32,
+        n_used: u32,
+        expert_weight_scale: f32,
+        weight_eps: f32,
+        b: u32,
+    ) -> eyre::Result<()> {
+        if b == 0 {
+            return Ok(());
+        }
+        if n_expert == 0 || n_expert > ROUTER_MAX_EXPERTS {
+            return Err(eyre!(
+                "router_topk: n_expert {n_expert} must be in [1, {ROUTER_MAX_EXPERTS}]"
+            ));
+        }
+        if n_used == 0 || n_used > ROUTER_MAX_USED {
+            return Err(eyre!(
+                "router_topk: n_used {n_used} must be in [1, {ROUTER_MAX_USED}]"
+            ));
+        }
+        let bn = b as usize;
+        if selected.len() < bn * n_used as usize {
+            return Err(eyre!(
+                "router_topk batched: selected len {} < b*n_used {}",
+                selected.len(),
+                bn * n_used as usize
+            ));
+        }
+        if weights.len() < bn * n_used as usize {
+            return Err(eyre!(
+                "router_topk batched: weights len {} < b*n_used {}",
+                weights.len(),
+                bn * n_used as usize
+            ));
+        }
+        if logits.len() < bn * n_expert as usize {
+            return Err(eyre!(
+                "router_topk batched: logits len {} < b*n_expert {}",
+                logits.len(),
+                bn * n_expert as usize
+            ));
+        }
+        if let Some(bs) = bias {
+            if bs.len() < n_expert as usize {
+                return Err(eyre!(
+                    "router_topk batched: bias len {} < n_expert {n_expert}",
+                    bs.len()
+                ));
+            }
+        }
+        // Batched path needs the par kernel's blockIdx.x offsetting.
+        let function = self.module.get_function("router_topk_par")?;
+        let b_ptr: sys::hipDeviceptr_t = match bias {
+            Some(bs) => bs.raw(),
+            None => std::ptr::null_mut(),
+        };
+        let cfg = LaunchConfig {
+            grid: (b, 1, 1),
+            block: (n_expert, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            selected.raw(), weights.raw(), logits.raw(), b_ptr,
+            n_expert, n_used, expert_weight_scale, weight_eps
+        ])
+    }
 }

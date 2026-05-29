@@ -23,6 +23,11 @@ const Q8_0_GROUPED_MATVEC_GFX1201: &[u8] =
 const Q8_0_GROUPED_MATVEC_GFX1151: &[u8] =
     include_bytes!(env!("KERNEL_Q8_0_GROUPED_MATVEC_GFX1151"));
 
+const Q8_0_MATVEC_WMMA_GFX1201: &[u8] =
+    include_bytes!(env!("KERNEL_Q8_0_MATVEC_WMMA_GFX1201"));
+const Q8_0_MATVEC_WMMA_GFX1151: &[u8] =
+    include_bytes!(env!("KERNEL_Q8_0_MATVEC_WMMA_GFX1151"));
+
 /// Q8_0 packs 32 int8 quants per 2-byte f16 scale → 34 bytes per block,
 /// identical layout to ds4 / llama.cpp.
 pub const Q8_0_BLOCK_ELEMS: u32 = 32;
@@ -303,6 +308,94 @@ impl Q8_0Matvec {
         launch_kernel!(function, cfg, stream, [
             out_a.raw(), out_b.raw(), weight.raw(), xq_a.raw(), xq_b.raw(),
             xscale_a.raw(), xscale_b.raw(), k, n_rows, blocks
+        ])
+    }
+}
+
+/// Q8_0 int8-WMMA GEMM (gfx12 only): `out[B,M] = W[M,K] · Xq[B,K]^T`, with
+/// both Q8_0 dequant scales folded into the f16 WMMA operands at load time.
+/// One wave per 16-row M-tile; batch N-tiles loop inside each K-tile so the
+/// weight A-fragment is read once per K-tile and reused across all batch
+/// columns. Same numeric result as `Q8_0Matvec::matvec_batched`, just via the
+/// matrix cores instead of the grid.z=B dp4a path. On non-gfx12 the kernel
+/// has a scalar fallback (so the gfx1151 build succeeds); it should only ever
+/// be launched on the dGPU.
+#[allow(non_camel_case_types)]
+pub struct Q8_0MatvecWmma {
+    module: Module,
+}
+
+impl Q8_0MatvecWmma {
+    pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            Q8_0_MATVEC_WMMA_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            Q8_0_MATVEC_WMMA_GFX1151
+        } else {
+            return Err(eyre!("unsupported arch for q8_0 wmma matvec: {arch}"));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    /// `out[b,m] = sum_k (qW[m,k]·wscale[m,k/32]) · (qX[b,k]·xscale[b,k/32])`.
+    /// `weight` is `[n_rows=M, K]` Q8_0 (row pitch `blocks*34`), `xq` is
+    /// `[B, K]` int8, `xscale` is `[B, blocks]` f32, `out` is `[B, M]` f32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        n_rows: u32, // M
+        k: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        if k % Q8_0_BLOCK_ELEMS != 0 {
+            return Err(eyre!("q8_0 wmma gemm: k={k} not a multiple of 32"));
+        }
+        let blocks = k / Q8_0_BLOCK_ELEMS;
+        let expected_weight_bytes =
+            (n_rows as usize) * (blocks as usize) * (Q8_0_BLOCK_BYTES as usize);
+        if weight.byte_len() != expected_weight_bytes {
+            return Err(eyre!(
+                "q8_0 wmma gemm weight bytes: have {}, expected {} (n_rows={n_rows}, k={k})",
+                weight.byte_len(),
+                expected_weight_bytes
+            ));
+        }
+        let expected_out = (batch as usize) * (n_rows as usize);
+        if out.len() < expected_out {
+            return Err(eyre!(
+                "q8_0 wmma gemm out len: have {}, expected {}",
+                out.len(),
+                expected_out
+            ));
+        }
+        let expected_xq = (batch as usize) * (k as usize);
+        let expected_xscale = (batch as usize) * (blocks as usize);
+        if xq.len() < expected_xq || xscale.len() < expected_xscale {
+            return Err(eyre!(
+                "q8_0 wmma gemm xq/xscale len: xq={} (need {expected_xq}), xscale={} (need {expected_xscale})",
+                xq.len(),
+                xscale.len()
+            ));
+        }
+
+        let function = self.module.get_function("q8_0_gemm_wmma_i8")?;
+        let grid_x = n_rows.div_ceil(16);
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), weight.raw(), xq.raw(), xscale.raw(), k, n_rows, batch, blocks
         ])
     }
 }

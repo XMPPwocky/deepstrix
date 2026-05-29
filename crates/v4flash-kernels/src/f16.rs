@@ -199,6 +199,49 @@ impl F16Matvec {
         }
     }
 
+    /// Batched WIDE f16 matvec with grid.z = B: `out[b, r] = sum_i
+    /// f32(W[r,i]) * x[b,i]`. Per-row reduction is the identical single-warp
+    /// shuffle as `matvec`'s wide path, so each output is bit-identical to a
+    /// per-batch loop of `matvec` — only the launch count drops to 1. Use for
+    /// `n_rows >= NARROW_ROWS_THRESHOLD` (e.g. the router gate, n_rows=256).
+    pub fn matvec_batched(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        x: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let expected_weight_bytes = (n_rows as usize) * (k as usize) * 2;
+        if weight.byte_len() != expected_weight_bytes {
+            return Err(eyre!(
+                "f16 matvec_batched weight bytes: have {}, expected {} (n_rows={n_rows}, k={k})",
+                weight.byte_len(),
+                expected_weight_bytes
+            ));
+        }
+        if x.len() < (batch as usize) * (k as usize) {
+            return Err(eyre!("f16 matvec_batched x too small: {}", x.len()));
+        }
+        if out.len() < (batch as usize) * (n_rows as usize) {
+            return Err(eyre!("f16 matvec_batched out too small: {}", out.len()));
+        }
+        let function = self.wide.get_function("f16_matvec_batched")?;
+        let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
+        let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, batch),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [out.raw(), weight.raw(), x.raw(), k, n_rows])
+    }
+
     /// M50 Phase 2: batched narrow f16 matvec with grid.z = B. For each
     /// batch element, computes `out[b, r] = sum_i f32(W[r,i]) * x[b,i]`.
     /// Uses the narrow kernel (1 block per row, 256 threads cooperating)
