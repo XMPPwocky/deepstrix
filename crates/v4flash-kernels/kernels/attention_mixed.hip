@@ -334,54 +334,10 @@ extern "C" __global__ void attention_mixed_softmax_wsum(
 // pathologies the decode split fixed.
 // ---------------------------------------------------------------------------
 
-// Phase 1 (score). Grid (n_total_max, n_head, B), block 32. One wave per
-// (row, head, token); rows past this token's causal prefix early-return.
-extern "C" __global__ void attention_mixed_score_batched(
-        float          * scores_g,       // [B, n_head, max_keys]
-        const float    * q,              // [B, n_head, head_dim]
-        const float    * raw_kv,         // [n_raw, head_dim]   (shared)
-        const float    * comp_kv,        // [n_comp, head_dim]  (shared, may be null)
-        const int      * n_raw_per,      // [B]
-        const int      * n_comp_per,     // [B]
-        unsigned int     n_head,
-        unsigned int     head_dim,
-        unsigned int     max_keys,
-        float            kq_scale) {
-    const unsigned int r   = blockIdx.x;   // key row
-    const unsigned int h   = blockIdx.y;   // head
-    const unsigned int b   = blockIdx.z;   // batch token
-    const unsigned int tid = threadIdx.x;  // lane 0..31
-    if (h >= n_head) return;
-
-    const unsigned int n_raw  = (unsigned int)n_raw_per[b];
-    const unsigned int n_comp = (unsigned int)n_comp_per[b];
-    if (r >= n_raw + n_comp) return;
-
-    const float *qh = q + ((size_t)b * n_head + h) * head_dim;
-    const float *kv_row = (r < n_raw)
-        ? raw_kv + (size_t)r * head_dim
-        : comp_kv + (size_t)(r - n_raw) * head_dim;
-
-    // head_dim=512 / 32 lanes = 16 muls/lane, hardcoded so the compiler
-    // pipelines all 16 loads then waits once (see decode score notes).
-    float p = 0.0f;
-    #pragma unroll
-    for (unsigned int u = 0; u < 16; u++) {
-        const unsigned int i = tid + u * 32;
-        p += qh[i] * kv_row[i];
-    }
-    p += __shfl_down(p, 16);
-    p += __shfl_down(p,  8);
-    p += __shfl_down(p,  4);
-    p += __shfl_down(p,  2);
-    p += __shfl_down(p,  1);
-    if (tid == 0) scores_g[((size_t)b * n_head + h) * max_keys + r] = p * kq_scale;
-}
-
-// Phase 1, head-tiled. Same math as attention_mixed_score_batched, but each
-// WG fixes (row r, token b) and a group of SCORE_HEAD_TILE heads. The KV row
-// is loaded into registers ONCE and reused across every head in the group —
-// KV is shared across heads in this MLA layout, so the un-tiled kernel
+// Phase 1, head-tiled. Each WG fixes (row r, token b) and a group of
+// SCORE_HEAD_TILE heads. The KV row is loaded into registers ONCE and reused
+// across every head in the group — KV is shared across heads in this MLA
+// layout, so the un-tiled per-head kernel
 // re-fetched the same 2KB row n_head times. Cuts KV global traffic by
 // SCORE_HEAD_TILE×, lifting the score phase's ~0.5 MAC/float arithmetic
 // intensity toward the q-bound. Grid (n_total_max, ceil(n_head/TILE), B).
@@ -439,106 +395,8 @@ extern "C" __global__ void attention_mixed_score_batched_htiled(
     }
 }
 
-// Phase 2 (merged softmax + weighted sum). Grid (n_head, B), block 512.
-// Wave 0 does softmax in place; all 512 threads do the 16-way-ILP wsum.
-extern "C" __global__ void attention_mixed_softmax_wsum_batched(
-        float          * out,            // [B, n_head, head_dim]
-        float          * scores_g,       // [B, n_head, max_keys] in/out
-        const float    * sinks,          // [n_head]
-        const float    * raw_kv,
-        const float    * comp_kv,
-        const int      * n_raw_per,      // [B]
-        const int      * n_comp_per,     // [B]
-        unsigned int     n_head,
-        unsigned int     head_dim,
-        unsigned int     max_keys) {
-    const unsigned int h   = blockIdx.x;
-    const unsigned int b   = blockIdx.y;
-    const unsigned int tid = threadIdx.x;
-    const unsigned int block = blockDim.x;
-    if (h >= n_head) return;
-
-    __shared__ float s_inv;
-
-    const unsigned int n_raw  = (unsigned int)n_raw_per[b];
-    const unsigned int n_comp = (unsigned int)n_comp_per[b];
-    const unsigned int n_total = n_raw + n_comp;
-
-    float *sw = scores_g + ((size_t)b * n_head + h) * max_keys;
-    float *oh = out + ((size_t)b * n_head + h) * head_dim;
-    const float sink_h = sinks[h];
-
-    // Phase A: softmax — wave 0 only, in place on global sw[].
-    if (tid < 32) {
-        float local_max = sink_h;
-        for (unsigned int r = tid; r < n_total; r += 32) {
-            float v = sw[r];
-            if (v > local_max) local_max = v;
-        }
-        {
-            float o;
-            o = __shfl_xor(local_max, 16); if (o > local_max) local_max = o;
-            o = __shfl_xor(local_max,  8); if (o > local_max) local_max = o;
-            o = __shfl_xor(local_max,  4); if (o > local_max) local_max = o;
-            o = __shfl_xor(local_max,  2); if (o > local_max) local_max = o;
-            o = __shfl_xor(local_max,  1); if (o > local_max) local_max = o;
-        }
-        const float max_score = local_max;
-
-        float local_sum = (tid == 0) ? expf(sink_h - max_score) : 0.0f;
-        for (unsigned int r = tid; r < n_total; r += 32) {
-            float w = expf(sw[r] - max_score);
-            sw[r] = w;
-            local_sum += w;
-        }
-        local_sum += __shfl_xor(local_sum, 16);
-        local_sum += __shfl_xor(local_sum,  8);
-        local_sum += __shfl_xor(local_sum,  4);
-        local_sum += __shfl_xor(local_sum,  2);
-        local_sum += __shfl_xor(local_sum,  1);
-        if (tid == 0) s_inv = 1.0f / local_sum;
-    }
-    __syncthreads();
-
-    // Phase B: weighted sum (all 512 threads), 16-way ILP over rows.
-    const float inv = s_inv;
-    for (unsigned int d = tid; d < head_dim; d += block) {
-        constexpr int U = 16;
-        float s[U] = {0};
-
-        unsigned int r = 0;
-        for (; r + U <= n_raw; r += U) {
-            #pragma unroll
-            for (int k = 0; k < U; k++) {
-                s[k] += sw[r + k] * raw_kv[(size_t)(r + k) * head_dim + d];
-            }
-        }
-        for (; r < n_raw; r++) {
-            s[0] += sw[r] * raw_kv[(size_t)r * head_dim + d];
-        }
-
-        float *cw = sw + n_raw;
-        unsigned int c = 0;
-        for (; c + U <= n_comp; c += U) {
-            #pragma unroll
-            for (int k = 0; k < U; k++) {
-                s[k] += cw[c + k] * comp_kv[(size_t)(c + k) * head_dim + d];
-            }
-        }
-        for (; c < n_comp; c++) {
-            s[0] += cw[c] * comp_kv[(size_t)c * head_dim + d];
-        }
-
-        float acc = 0.0f;
-        #pragma unroll
-        for (int k = 0; k < U; k++) acc += s[k];
-        oh[d] = acc * inv;
-    }
-}
-
-// Head-tiled merged softmax + weighted sum. Same output as
-// attention_mixed_softmax_wsum_batched, but each WG covers SMWSUM_HEAD_TILE
-// heads. Two wins over the per-head kernel:
+// Head-tiled merged softmax + weighted sum. Each WG covers SMWSUM_HEAD_TILE
+// heads. Two wins over a hypothetical per-head kernel:
 //   Phase A: wave w computes head (h0+w)'s softmax, so up to 16 heads run in
 //            parallel instead of 1 (the per-head kernel left 15/16 waves idle).
 //   Phase B: each thread loads each shared V-latent element kv[r][d] ONCE and

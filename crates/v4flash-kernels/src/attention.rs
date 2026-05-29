@@ -303,54 +303,15 @@ impl AttentionMixed {
         ])
     }
 
-    /// Batched split-kernel PREFILL — phase 1 (scores). Each token `b` uses
-    /// its own causal prefix `n_raw_per[b]`/`n_comp_per[b]` over the shared
-    /// raw_kv/comp_kv. `scores_g` is `[batch, n_head, max_keys]` global.
-    /// `n_total_max` = max over the chunk of `n_raw+n_comp` (grid.x extent).
-    #[allow(clippy::too_many_arguments)]
-    pub fn launch_score_batched(
-        &self,
-        stream: &Stream,
-        scores_g: &mut DeviceBuffer<f32>,
-        q: &DeviceBuffer<f32>,
-        raw_kv: &DeviceBuffer<f32>,
-        comp_kv: Option<&DeviceBuffer<f32>>,
-        n_raw_per: &DeviceBuffer<i32>,
-        n_comp_per: &DeviceBuffer<i32>,
-        n_head: u32,
-        head_dim: u32,
-        n_total_max: u32,
-        batch: u32,
-    ) -> eyre::Result<()> {
-        if batch == 0 || n_total_max == 0 {
-            return Ok(());
-        }
-        if n_total_max > ATTN_MIXED_MAX_KEYS {
-            return Err(eyre!(
-                "attention_mixed_score_batched: n_total_max={n_total_max} exceeds cap {ATTN_MIXED_MAX_KEYS}"
-            ));
-        }
-        let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
-        let function = self.module.get_function("attention_mixed_score_batched")?;
-        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
-        // One wave32 per (row, head, token). Rows past a token's causal
-        // prefix early-return; grid.x is sized to the chunk-max prefix.
-        let cfg = LaunchConfig {
-            grid: (n_total_max, n_head, batch),
-            block: (32, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        launch_kernel!(function, cfg, stream, [
-            scores_g.raw(), q.raw(), raw_kv.raw(), comp_kv_ptr,
-            n_raw_per.raw(), n_comp_per.raw(),
-            n_head, head_dim, ATTN_MIXED_MAX_KEYS, kq_scale
-        ])
-    }
-
-    /// Head-tiled variant of [`Self::launch_score_batched`]. Identical
-    /// output; each WG covers `SCORE_HEAD_TILE` heads, loading the shared KV
-    /// row once and reusing it across them. Grid (n_total_max,
-    /// ceil(n_head/SCORE_HEAD_TILE), batch), block 32.
+    /// Batched split-kernel PREFILL — phase 1 (scores), head-tiled. Each
+    /// token `b` uses its own causal prefix `n_raw_per[b]`/`n_comp_per[b]`
+    /// over the shared raw_kv/comp_kv with per-token starting slot
+    /// `n_raw_offset_per[b]` into the (oversized) raw cache. `scores_g` is
+    /// `[batch, n_head, max_keys]` global. `n_total_max` = max over the
+    /// chunk of `n_raw+n_comp` (grid.x extent). Each WG covers
+    /// `SCORE_HEAD_TILE` heads, loading the shared KV row once and reusing
+    /// it across them. Grid (n_total_max, ceil(n_head/SCORE_HEAD_TILE),
+    /// batch), block 32.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_score_batched_htiled(
         &self,
@@ -394,47 +355,11 @@ impl AttentionMixed {
     }
 
     /// Batched split-kernel PREFILL — phase 2 (merged softmax + weighted
-    /// sum). Grid (n_head, batch), block 512. Reads/overwrites `scores_g`
-    /// from phase 1, writes `out` `[batch, n_head, head_dim]`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn launch_softmax_wsum_batched(
-        &self,
-        stream: &Stream,
-        out: &mut DeviceBuffer<f32>,
-        scores_g: &mut DeviceBuffer<f32>,
-        sinks: &DeviceBuffer<f32>,
-        raw_kv: &DeviceBuffer<f32>,
-        comp_kv: Option<&DeviceBuffer<f32>>,
-        n_raw_per: &DeviceBuffer<i32>,
-        n_comp_per: &DeviceBuffer<i32>,
-        n_head: u32,
-        head_dim: u32,
-        batch: u32,
-    ) -> eyre::Result<()> {
-        if batch == 0 {
-            return Ok(());
-        }
-        let function = self
-            .module
-            .get_function("attention_mixed_softmax_wsum_batched")?;
-        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
-        let cfg = LaunchConfig {
-            grid: (n_head, batch, 1),
-            block: (512, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        launch_kernel!(function, cfg, stream, [
-            out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
-            n_raw_per.raw(), n_comp_per.raw(),
-            n_head, head_dim, ATTN_MIXED_MAX_KEYS
-        ])
-    }
-
-    /// Head-tiled variant of [`Self::launch_softmax_wsum_batched`]. Identical
-    /// output; each WG covers `SMWSUM_HEAD_TILE` heads — softmax runs one
-    /// wave per head, and the wsum loads each shared V-latent element once
-    /// and reuses it across the head group. Grid
-    /// (ceil(n_head/SMWSUM_HEAD_TILE), batch), block 512.
+    /// sum), head-tiled. Each WG covers `SMWSUM_HEAD_TILE` heads — softmax
+    /// runs one wave per head, and the wsum loads each shared V-latent
+    /// element once and reuses it across the head group. Reads/overwrites
+    /// `scores_g` from phase 1, writes `out` `[batch, n_head, head_dim]`.
+    /// Grid (ceil(n_head/SMWSUM_HEAD_TILE), batch), block 512.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_softmax_wsum_batched_htiled(
         &self,

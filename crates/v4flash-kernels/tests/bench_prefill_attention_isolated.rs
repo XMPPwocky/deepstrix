@@ -1,6 +1,6 @@
 //! Standalone PREFILL attention probe — no GGUF, no model load, no mmap.
 //! Runs the batched split attention chain
-//! (`attention_mixed_score_batched` + `attention_mixed_softmax_wsum_batched`)
+//! (`attention_mixed_score_batched_htiled` + `attention_mixed_softmax_wsum_batched_htiled`)
 //! on a single layer with synthetic buffers, over a batch of B tokens.
 //! Mirrors `bench_attention_isolated.rs` (the decode probe) for prefill.
 //!
@@ -17,7 +17,9 @@
 //!   BENCH_BATCH    tokens per chunk (≤ B_MAX=256). Default 256.
 //!   BENCH_ITERS    timed iterations. Default 50.
 //!   BENCH_WARMUP   warmup iterations (discarded). Default 3.
-//!   BENCH_PHASE    "both" | "score" | "smwsum" | "mono" — which to time.
+//!   BENCH_PHASE    "both" | "score_ht" | "smwsum_ht" | "score_wmma" |
+//!                  "smwsum_wmma" | "mono" — which to time. "both" runs the
+//!                  production htiled score + htiled smwsum chain.
 //!                  "mono" runs the old monolithic attention_mixed_batched
 //!                  (requires n_raw+n_comp ≤ ATTN_PREFILL_LDS_MAX=2304).
 //!                  Default "both".
@@ -79,11 +81,9 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
     let phase: String = std::env::var("BENCH_PHASE").unwrap_or_else(|_| "both".to_string());
-    let do_score = phase == "both" || phase == "score";
-    let do_score_ht = phase == "score_ht";
+    let do_score_ht = phase == "both" || phase == "score_ht";
     let do_score_wmma = phase == "score_wmma";
-    let do_smwsum = phase == "both" || phase == "smwsum";
-    let do_smwsum_ht = phase == "smwsum_ht";
+    let do_smwsum_ht = phase == "both" || phase == "smwsum_ht";
     let do_smwsum_wmma = phase == "smwsum_wmma";
     let do_mono = phase == "mono";
 
@@ -185,21 +185,6 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
             )?;
             return Ok(());
         }
-        if do_score {
-            attn.launch_score_batched(
-                stream,
-                scores,
-                &q,
-                &raw_kv,
-                comp_kv.as_ref(),
-                &n_raw_per,
-                &n_comp_per,
-                n_head,
-                head_dim,
-                n_total,
-                batch,
-            )?;
-        }
         if do_score_ht {
             attn.launch_score_batched_htiled(
                 stream,
@@ -228,21 +213,6 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
                 n_head,
                 head_dim,
                 n_total,
-                batch,
-            )?;
-        }
-        if do_smwsum {
-            attn.launch_softmax_wsum_batched(
-                stream,
-                out,
-                scores,
-                &sinks,
-                &raw_kv,
-                comp_kv.as_ref(),
-                &n_raw_per,
-                &n_comp_per,
-                n_head,
-                head_dim,
                 batch,
             )?;
         }
@@ -380,18 +350,8 @@ fn prefill_attention_split_matches_mono() -> eyre::Result<()> {
     let out_len = b * n_head as usize * head_dim as usize;
     let mut out_mono = DeviceBuffer::new(dgpu.id, out_len)?;
     out_mono.fill_zero()?;
-    let mut out_split = DeviceBuffer::new(dgpu.id, out_len)?;
-    out_split.fill_zero()?;
-    let mut out_ht = DeviceBuffer::new(dgpu.id, out_len)?;
-    out_ht.fill_zero()?;
     let mut out_htfull = DeviceBuffer::new(dgpu.id, out_len)?;
     out_htfull.fill_zero()?;
-    let mut scores =
-        DeviceBuffer::new(dgpu.id, b * n_head as usize * ATTN_MIXED_MAX_KEYS as usize)?;
-    scores.fill_zero()?;
-    let mut scores_ht =
-        DeviceBuffer::new(dgpu.id, b * n_head as usize * ATTN_MIXED_MAX_KEYS as usize)?;
-    scores_ht.fill_zero()?;
     let mut scores_htfull =
         DeviceBuffer::new(dgpu.id, b * n_head as usize * ATTN_MIXED_MAX_KEYS as usize)?;
     scores_htfull.fill_zero()?;
@@ -425,62 +385,8 @@ fn prefill_attention_split_matches_mono() -> eyre::Result<()> {
         head_dim,
         batch,
     )?;
-    // Batched split.
-    attn.launch_score_batched(
-        &stream,
-        &mut scores,
-        &q,
-        &raw_kv,
-        Some(&comp_kv),
-        &n_raw_per,
-        &n_comp_per,
-        n_head,
-        head_dim,
-        n_total_max,
-        batch,
-    )?;
-    attn.launch_softmax_wsum_batched(
-        &stream,
-        &mut out_split,
-        &mut scores,
-        &sinks,
-        &raw_kv,
-        Some(&comp_kv),
-        &n_raw_per,
-        &n_comp_per,
-        n_head,
-        head_dim,
-        batch,
-    )?;
-    // Head-tiled split (same smwsum phase 2, head-tiled phase 1).
-    attn.launch_score_batched_htiled(
-        &stream,
-        &mut scores_ht,
-        &q,
-        &raw_kv,
-        Some(&comp_kv),
-        &n_raw_per,
-        &n_raw_offset_per,
-        &n_comp_per,
-        n_head,
-        head_dim,
-        n_total_max,
-        batch,
-    )?;
-    attn.launch_softmax_wsum_batched(
-        &stream,
-        &mut out_ht,
-        &mut scores_ht,
-        &sinks,
-        &raw_kv,
-        Some(&comp_kv),
-        &n_raw_per,
-        &n_comp_per,
-        n_head,
-        head_dim,
-        batch,
-    )?;
-    // Full head-tiled chain (htiled score + htiled smwsum).
+    // Full head-tiled chain (htiled score + htiled smwsum) — the production
+    // batched attention path.
     attn.launch_score_batched_htiled(
         &stream,
         &mut scores_htfull,
@@ -568,12 +474,8 @@ fn prefill_attention_split_matches_mono() -> eyre::Result<()> {
     }
 
     let mut m = vec![0f32; out_len];
-    let mut s = vec![0f32; out_len];
-    let mut sht = vec![0f32; out_len];
     let mut shtf = vec![0f32; out_len];
     out_mono.copy_to_host(&mut m)?;
-    out_split.copy_to_host(&mut s)?;
-    out_ht.copy_to_host(&mut sht)?;
     out_htfull.copy_to_host(&mut shtf)?;
 
     let cmp = |label: &str, ref_v: &[f32], got: &[f32]| -> eyre::Result<()> {
@@ -600,10 +502,8 @@ fn prefill_attention_split_matches_mono() -> eyre::Result<()> {
         }
         Ok(())
     };
-    cmp("split", &m, &s)?;
-    cmp("htiled-score", &m, &sht)?;
     cmp("htiled-full", &m, &shtf)?;
-    eprintln!("PASS: split + head-tiled (score & full) match monolithic within 1e-3");
+    eprintln!("PASS: head-tiled split chain matches monolithic within 1e-3");
     Ok(())
 }
 
