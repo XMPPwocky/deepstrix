@@ -25,7 +25,6 @@
 
 use color_eyre::eyre::{self, eyre};
 
-use crate::attention::ATTN_PREFILL_LDS_MAX;
 use crate::forward::{
     hash_router_select, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
     EXPERT_WEIGHT_SCALE, GROUP_DIM, HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED,
@@ -874,16 +873,32 @@ impl HeterogeneousEngine {
             N_LORA_Q,
             b,
         )?;
-        de.q8.matvec_batched(
-            &de.compute,
-            &mut bd.q,
-            &dlw.attn_q_b.buffer,
-            &bd.qr_xq,
-            &bd.qr_xscale,
-            Q_FLAT,
-            N_LORA_Q,
-            b,
-        )?;
+        // qb up-projection (M=Q_FLAT, K=N_LORA_Q). QB_WMMA swaps the grid.z=B
+        // dp4a matvec for the int8-WMMA GEMM (matrix cores, weight read once
+        // per K-tile across the batch).
+        if std::env::var_os("QB_WMMA").is_some() {
+            de.q8_wmma.gemm(
+                &de.compute,
+                &mut bd.q,
+                &dlw.attn_q_b.buffer,
+                &bd.qr_xq,
+                &bd.qr_xscale,
+                Q_FLAT,
+                N_LORA_Q,
+                b,
+            )?;
+        } else {
+            de.q8.matvec_batched(
+                &de.compute,
+                &mut bd.q,
+                &dlw.attn_q_b.buffer,
+                &bd.qr_xq,
+                &bd.qr_xscale,
+                Q_FLAT,
+                N_LORA_Q,
+                b,
+            )?;
+        }
         // rms_nw over batch: each batch has [N_HEAD, N_HEAD_DIM] rows.
         // batched API: grid (B, N_HEAD, 1), inner row of N_HEAD_DIM.
         de.rms_nw.launch_batched(
@@ -972,10 +987,32 @@ impl HeterogeneousEngine {
         let mut n_raw_after: Vec<u32> = Vec::with_capacity(b as usize);
         let mut n_comp_after: Vec<u32> = Vec::with_capacity(b as usize);
 
-        // M50: batched kv_cache_append (single launch if no eviction). Replaces
-        // the B× per-position launches that dominated dispatch overhead.
+        // M50/M51: batched kv_cache_append. n_raw_after is the per-token
+        // causal-valid prefix length INTO THE POST-APPEND CACHE.
+        //
+        // The post-append cache holds the LAST `n_raw_post_append` positions
+        // of the combined sequence so far. With cache slot s holding position
+        // (last_pos - n_raw_post_append + 1 + s), token i in this batch
+        // (which lives at the position-last_pos - (b-1-i)) can only causally
+        // attend to slots [0..n_raw_post_append - (b - 1 - i)].
+        //
+        // The old formula `(n_raw_before + i + 1).min(W)` was a serial-cache
+        // assumption: it assumed cache slot s holds position s, which is only
+        // true before any eviction. Once eviction fires (because n_raw_before
+        // + b > W), the slot↔position map slides, and the old formula lets
+        // intermediate tokens read FUTURE tokens' KV from within their own
+        // batch, corrupting their residual. The corruption then poisons the
+        // next layer's KV writes and cascades, breaking long-context recall
+        // whenever a chunk boundary is crossed (T > B_MAX).
         let n_raw_before = ls.n_raw;
+        let n_raw_post_append = (n_raw_before + b).min(SWA_WINDOW);
+        for i in 0..b as usize {
+            let future_in_cache = (b as usize) - 1 - i; // tokens after i still in cache
+            let valid = (n_raw_post_append as usize).saturating_sub(future_in_cache) as u32;
+            n_raw_after.push(valid);
+        }
         if n_raw_before + b <= SWA_WINDOW {
+            // No eviction: place B contiguous rows at [n_raw_before..+B).
             de.kv_append.launch_batched(
                 &de.compute,
                 &mut ls.kv_cache,
@@ -984,29 +1021,27 @@ impl HeterogeneousEngine {
                 N_HEAD_DIM,
                 b,
             )?;
-            for i in 0..b as usize {
-                let n_after = (n_raw_before + i as u32 + 1).min(SWA_WINDOW);
-                n_raw_after.push(n_after);
-            }
-            ls.n_raw = (n_raw_before + b).min(SWA_WINDOW);
         } else {
-            // Eviction path — fall back to per-token.
-            for i in 0..b as usize {
-                let kv_view = bd.kv_normed.slice_view(i * cs_kvhd, cs_kvhd);
-                de.kv_append.launch(
-                    &de.compute,
-                    &mut ls.kv_cache,
-                    &kv_view,
-                    ls.n_raw,
-                    SWA_WINDOW,
-                    N_HEAD_DIM,
-                )?;
-                if ls.n_raw < SWA_WINDOW {
-                    ls.n_raw += 1;
-                }
-                n_raw_after.push(ls.n_raw);
-            }
+            // Eviction (n_raw_before + B > window). One general gather builds
+            // the final SWA_WINDOW ring — survivors from the old cache, new
+            // rows from kv_normed — into a scratch buffer (so survivor reads
+            // can't race), then copy it back. Subsumes both the B≥window hot
+            // path and the B<window partial-eviction case; no underflow.
+            de.kv_append.launch_evict_gather(
+                &de.compute,
+                &ls.kv_cache,
+                &bd.kv_normed,
+                &mut bd.kv_ring_scratch,
+                n_raw_before,
+                b,
+                SWA_WINDOW,
+                N_HEAD_DIM,
+            )?;
+            let ring_len = SWA_WINDOW as usize * N_HEAD_DIM as usize;
+            ls.kv_cache
+                .copy_from_buffer_async(&bd.kv_ring_scratch.slice_view(0, ring_len), &de.compute)?;
         }
+        ls.n_raw = (n_raw_before + b).min(SWA_WINDOW);
 
         // M50: batched matvec_pair across all B for ratio>0 layers. Produces
         // bd.kv_cur[B, comp_width] + bd.sc_cur[B, comp_width] in one launch.
@@ -1220,15 +1255,32 @@ impl HeterogeneousEngine {
                 .map(|(&r, &c)| r + c)
                 .max()
                 .unwrap_or(0);
-            if n_total_max > ATTN_PREFILL_LDS_MAX {
-                // Long context: the monolithic kernel's LDS `scores[2304]`
-                // would overflow (n_comp = pos/ratio). Use the batched split
-                // (scores in global, per-row grid, wave-parallel softmax,
-                // 16-way ILP wsum) — same kernels that fixed 64K decode.
-                // Head-tiled score: one WG per (row, head-group, token) loads
-                // the shared MLA latent row once and reuses it across the
-                // head group, amortizing per-WG overhead + KV traffic. ~5×
-                // over the per-head grid at 64K (270M → 34M WGs).
+            // Always use the batched split (scores in global, per-row grid,
+            // wave-parallel softmax, 16-way ILP wsum). The old monolithic
+            // `launch_batched` (LDS scores[2304], used below n_total≤2304) was
+            // 12.5× SLOWER at the same B=256 shape — one WG per (head,token)
+            // with everything serialized in LDS tanks occupancy — so there is
+            // no depth where it wins for batched prefill. It survives only as
+            // the correctness oracle in prefill_attention_split_matches_mono.
+            // Head-tiled score: one WG per (row, head-group, token) loads the
+            // shared MLA latent row once and reuses it across the head group.
+            // ATTN_SCORE_WMMA=1 swaps the score Q·Kᵀ GEMM for the RDNA4 f16
+            // WMMA variant (7.2× the f32 head-tiled score at 64K).
+            if std::env::var_os("ATTN_SCORE_WMMA").is_some() {
+                de.attn_mixed.launch_score_batched_htiled_wmma(
+                    &de.compute,
+                    &mut bd.attn_scores,
+                    &bd.q_normed,
+                    &ls.kv_cache,
+                    comp_kv_buf,
+                    &nrp_view,
+                    &ncp_view,
+                    N_HEAD,
+                    N_HEAD_DIM,
+                    n_total_max,
+                    b,
+                )?;
+            } else {
                 de.attn_mixed.launch_score_batched_htiled(
                     &de.compute,
                     &mut bd.attn_scores,
@@ -1242,10 +1294,12 @@ impl HeterogeneousEngine {
                     n_total_max,
                     b,
                 )?;
-                // Head-tiled phase 2: softmax one wave per head + wsum that
-                // loads each shared V-latent element once per head group.
-                // 1.76× over the per-head kernel at 64K (HEAD_TILE=16).
-                de.attn_mixed.launch_softmax_wsum_batched_htiled(
+            }
+            // Head-tiled phase 2: softmax one wave per head + wsum that loads
+            // each shared V-latent element once per head group (HEAD_TILE=16).
+            // ATTN_WSUM_WMMA=1 swaps Phase B for the RDNA4 f16 WMMA GEMM.
+            if std::env::var_os("ATTN_WSUM_WMMA").is_some() {
+                de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma(
                     &de.compute,
                     &mut bd.heads,
                     &mut bd.attn_scores,
@@ -1259,13 +1313,13 @@ impl HeterogeneousEngine {
                     b,
                 )?;
             } else {
-                de.attn_mixed.launch_batched(
+                de.attn_mixed.launch_softmax_wsum_batched_htiled(
                     &de.compute,
                     &mut bd.heads,
-                    &bd.q_normed,
+                    &mut bd.attn_scores,
+                    &dlw.attn_sinks,
                     &ls.kv_cache,
                     comp_kv_buf,
-                    &dlw.attn_sinks,
                     &nrp_view,
                     &ncp_view,
                     N_HEAD,
@@ -1415,41 +1469,32 @@ impl HeterogeneousEngine {
         // add a wide batched variant.)
         // ========================================================
         let _t_router = de.events.stage("dgpu.router", &de.compute)?;
-        for i in 0..b as usize {
-            let ffn_in_v = bd
-                .ffn_input_norm
-                .slice_view(i * cs_n_embd, cs_n_embd);
-            let mut logits_v = bd
-                .router_logits
-                .slice_view_mut(i * (N_EXPERT as usize), N_EXPERT as usize);
-            de.f16.matvec(
-                &de.compute,
-                &mut logits_v,
-                &dlw.ffn_gate_inp.buffer,
-                &ffn_in_v,
-                N_EXPERT,
-                N_EMBD,
-            )?;
-        }
+        // Gate projection: one wide batched matvec over all B tokens. The
+        // per-row warp reduction is identical to the old per-token loop, so
+        // logits are bit-identical — only the launch count drops from B to 1.
+        de.f16.matvec_batched(
+            &de.compute,
+            &mut bd.router_logits,
+            &dlw.ffn_gate_inp.buffer,
+            &bd.ffn_input_norm,
+            N_EXPERT,
+            N_EMBD,
+            b,
+        )?;
         if !dlw.is_hash_router {
-            for i in 0..b as usize {
-                let logits_v = bd
-                    .router_logits
-                    .slice_view(i * (N_EXPERT as usize), N_EXPERT as usize);
-                let mut sel_v = bd.d_selected.slice_view_mut(i * cs_n_used, cs_n_used);
-                let mut ew_v = bd.d_ew.slice_view_mut(i * cs_n_used, cs_n_used);
-                de.router_topk.launch(
-                    &de.compute,
-                    &mut sel_v,
-                    &mut ew_v,
-                    &logits_v,
-                    dlw.router_bias_dev.as_ref(),
-                    N_EXPERT,
-                    cs_n_used as u32,
-                    EXPERT_WEIGHT_SCALE,
-                    ROUTER_WEIGHT_EPS,
-                )?;
-            }
+            // Top-k: one block per token in a single launch (B→1 launches).
+            de.router_topk.launch_batched(
+                &de.compute,
+                &mut bd.d_selected,
+                &mut bd.d_ew,
+                &bd.router_logits,
+                dlw.router_bias_dev.as_ref(),
+                N_EXPERT,
+                cs_n_used as u32,
+                EXPERT_WEIGHT_SCALE,
+                ROUTER_WEIGHT_EPS,
+                b,
+            )?;
         } else {
             // Hash router: readback all B × N_EXPERT logits, run host
             // select per batch element, upload d_selected + d_ew.
