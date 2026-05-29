@@ -60,7 +60,7 @@ pub struct DgpuScratch {
     // Size [N_HEAD, ATTN_MIXED_MAX_KEYS].
     pub attn_scores: DeviceBuffer<f32>,
 
-    // Compressor scratch (M14L: lives on dGPU alongside attn_input_norm).
+    // Compressor scratch (lives on dGPU alongside attn_input_norm).
     pub kv_cur: DeviceBuffer<f32>,
     pub sc_cur: DeviceBuffer<f32>,
     pub pooled: DeviceBuffer<f32>,
@@ -77,8 +77,8 @@ pub struct DgpuScratch {
     // Mailbox for ffn_moe arriving from iGPU.
     pub ffn_moe_recv: DeviceBuffer<f32>,
 
-    // Router (M16: migrated to dGPU). Matvec writes router_logits; topk
-    // (or hash router host path) writes d_selected/d_ew. Both are then
+    // Router (lives on dGPU). Matvec writes router_logits; topk (or
+    // hash router host path) writes d_selected/d_ew. Both are then
     // peer-pushed to iGPU MoE.
     pub router_logits: DeviceBuffer<f32>,
     pub router_logits_host: Vec<f32>,
@@ -150,7 +150,7 @@ impl DgpuScratch {
 
             ffn_moe_recv: DeviceBuffer::new(device_id, N_EMBD as usize)?,
 
-            // Router (lives on dGPU per M16).
+            // Router (dGPU-resident).
             router_logits: DeviceBuffer::new(device_id, N_EXPERT as usize)?,
             router_logits_host: vec![0f32; N_EXPERT as usize],
             d_selected: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
@@ -173,8 +173,8 @@ pub struct IgpuScratch {
     /// mhc_pre_ffn. The routed-MoE pipeline reads from this.
     pub ffn_input_norm_recv: DeviceBuffer<f32>,
 
-    // Routed-MoE pipeline (M13.4 device-side fused: q8k_xq → iq2_fused
-    // → q8k_mid → q2k_down). `d_mid_cat` is the per-slot concatenated
+    // Routed-MoE pipeline (device-side fused: q8k_xq → iq2_fused →
+    // q8k_mid → q2k_down). `d_mid_cat` is the per-slot concatenated
     // mid-quant intermediate; `d_midq_cat` is its q8k-quantized form.
     pub d_xq_q8k: DeviceBuffer<u8>,
     pub d_mid_cat: DeviceBuffer<f32>,

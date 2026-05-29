@@ -1,17 +1,15 @@
-//! M50: per-batch scratch for prefill.
+//! Per-batch scratch for prefill.
 //!
-//! Phase 1 implementation: a shared `DgpuScratch`/`IgpuScratch` used by
-//! the existing single-token `forward_layer` in an inner loop over B,
-//! with `per_token_residual` ping-ponged in/out. See `forward_prompt_batch`.
+//! * [`BatchDgpuScratch`] / [`BatchIgpuScratch`] — every per-token field
+//!   is B-extended to a single contiguous `[B × per_token_size]` buffer.
+//!   Batched kernels (`*_batched`) read/write with per-batch strides
+//!   directly, no per-token copies. Used by `forward_prompt_batch_v2` and
+//!   the pipelined wrapper.
+//! * [`BatchScratch`] — bundle of (shared `DgpuScratch`, shared
+//!   `IgpuScratch`, B per-token residual buffers). Test-only convenience
+//!   container retained for diagnostic tests; no production caller.
 //!
-//! Phase 2 (this file): adds [`BatchDgpuScratch`] — every per-token field
-//! is B-extended to a single contiguous `[B × per_token_size]` buffer.
-//! Batched kernels (`*_batched`) read/write with per-batch strides
-//! directly, no per-token copies. Used by `forward_prompt_batch_v2`.
-//!
-//! Memory cost at `B_MAX = 64`:
-//! * Phase 1 `BatchScratch`: ~2 MB shared + 64×16 KB residual = ~3 MB.
-//! * Phase 2 `BatchDgpuScratch`: ~26 MB of B-extended per-token state.
+//! Memory cost at `B_MAX = 512`: `BatchDgpuScratch` ~208 MB on dGPU.
 
 use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer};
@@ -35,20 +33,18 @@ use super::scratch::{DgpuScratch, IgpuScratch};
 /// scratch growth is ~24→48 MB. Total dGPU scratch ~208 MB at B=512.
 pub const B_MAX: usize = 512;
 
-/// Per-batch dGPU + iGPU scratch for prefill.
+/// Test-only convenience bundle of (shared `DgpuScratch`,
+/// shared `IgpuScratch`, B per-token residual buffers).
 ///
-/// Phase 1: Holds ONE shared `DgpuScratch`/`IgpuScratch` used by the
-/// engine's existing `forward_layer` (so captured HIP graphs replay
-/// consistently — captures bake in scratch buffer pointers, so we
-/// can't naively spread them across B independent scratches), plus B
-/// small per-token residual buffers swapped in/out around each
-/// per-layer call. KV cache + compressor state live in `HetModelState`
-/// (per-layer, shared across batch).
+/// The shared single-token scratches are reused so captured HIP graphs
+/// replay consistently — captures bake in scratch buffer pointers, so
+/// a fresh scratch per batch element would break replay. KV cache +
+/// compressor state live in `HetModelState` (per-layer, shared across
+/// the batch).
 ///
-/// In Phase 2 the shared scratch goes away and per-batch fields are
-/// batch-extended (`[B × original_size]`) within a single struct, so
-/// batched kernels can index directly without copies. For now this
-/// keeps Phase 1 small and lets us validate the layer-major schedule.
+/// Production prefill (`forward_prompt_batch_v2` /
+/// `forward_prefill_pipelined`) uses [`BatchDgpuScratch`] instead — no
+/// per-token residual ping-pong, no shared single-token scratch.
 pub struct BatchScratch {
     pub shared_dgpu: DgpuScratch,
     pub shared_igpu: IgpuScratch,
@@ -90,7 +86,7 @@ impl BatchScratch {
     }
 }
 
-/// M50 Phase 2: per-batch dGPU scratch with B-extended buffers.
+/// Per-batch dGPU scratch with B-extended buffers.
 ///
 /// Every field is a single contiguous `DeviceBuffer` sized for the
 /// maximum batch (`B_MAX × per_token_size`). Batched kernels read/write
@@ -132,7 +128,7 @@ pub struct BatchDgpuScratch {
     // ---- KV chain ----
     pub kv_raw: DeviceBuffer<f32>,
     pub kv_normed: DeviceBuffer<f32>,
-    /// Scratch ring (≥ `SWA_WINDOW * N_HEAD_DIM`) used by the M52 post-chunk
+    /// Scratch ring (≥ `SWA_WINDOW * N_HEAD_DIM`) used by the post-chunk
     /// SWA-eviction pass. After a prefill chunk leaves the cache holding
     /// `n_raw_during_chunk > SWA_WINDOW` rows in the oversized region, we copy
     /// the LAST `SWA_WINDOW` rows here, then copy them back to slots `[0..W)`
@@ -147,9 +143,9 @@ pub struct BatchDgpuScratch {
     pub pooled: DeviceBuffer<f32>,
     pub comp_row: DeviceBuffer<f32>,
 
-    // ---- Per-token attention causality (Phase 4) ----
-    /// `[B]` — per-token causal prefix length over raw KV cache.
-    /// M50 batched per-position kernels: [B] arrays uploaded per chunk/layer.
+    // ---- Per-token attention causality ----
+    /// `[B]` — per-token causal prefix length over raw KV cache. Batched
+    /// per-position kernels read these arrays (uploaded per chunk/layer).
     /// `pos_per_b[b] = pos0 + b` (constant per chunk).
     /// `row_per_b[b]`, `pos_mod_per_b[b]` depend on ratio (computed per layer).
     pub pos_per_b: DeviceBuffer<i32>,
@@ -196,28 +192,20 @@ pub struct BatchDgpuScratch {
     pub mid_sh_xscale: DeviceBuffer<f32>,
     pub ffn_shared: DeviceBuffer<f32>,
 
-    /// `[B, N_EMBD]` — peer-arrival mailbox for iGPU MoE output. Single
-    /// batched peer-push from iGPU (Phase 3); then vec_add ffn_shared and
-    /// run hc_post.
+    /// `[B, N_EMBD]` — peer-arrival mailbox for iGPU MoE output. Filled
+    /// by a single batched peer-push from iGPU; then vec_add ffn_shared
+    /// and run hc_post.
     pub ffn_moe_recv: DeviceBuffer<f32>,
 }
 
-/// M50 Phase 3: per-batch iGPU scratch with B-extended buffers.
+/// Per-batch iGPU scratch with B-extended buffers.
 ///
-/// Mirrors [`IgpuScratch`]'s MoE-relevant fields but each sized for
+/// Mirrors [`IgpuScratch`]'s MoE-relevant fields, each sized for
 /// `B_MAX × per_token_size`. Used by the batched iGPU MoE in
 /// `forward_layer_batch_v2`: one peer-push of `[B, N_EMBD]` ain, one
 /// batched iq2 + q2k call chain, one peer-push of `[B, N_EMBD]` ffn_moe
-/// back — replaces the per-batch serial loop.
-///
-/// Memory at B_MAX=64 (rough):
-/// * `ffn_input_norm_recv` 64×16KB = 1 MB
-/// * `d_xq_q8k` 64×~4.7KB = 300 KB
-/// * `d_mid_cat` 64×6×8KB = 3 MB
-/// * `d_midq_cat` 64×6×~2.3KB = 880 KB
-/// * `ffn_moe` 64×16KB = 1 MB
-/// * `d_selected`/`d_ew` 64×6 = 1.5 KB each
-/// Total: ~6 MB. Negligible vs the 52 GiB resident expert weights.
+/// back. Total ~6 MB at B_MAX=64 — negligible vs the 52 GiB resident
+/// expert weights.
 pub struct BatchIgpuScratch {
     pub ffn_input_norm_recv: DeviceBuffer<f32>,
     pub d_xq_q8k: DeviceBuffer<u8>,
@@ -226,31 +214,31 @@ pub struct BatchIgpuScratch {
     pub ffn_moe: DeviceBuffer<f32>,
     pub d_selected: DeviceBuffer<i32>,
     pub d_ew: DeviceBuffer<f32>,
-    /// Phase 7 by-expert: per-expert pick count built by the group_builder
+    /// By-expert MoE: per-expert pick count built by the group_builder
     /// pre-pass. `[n_expert]` i32. MUST be zeroed before each layer's pre-pass.
     pub group_count: DeviceBuffer<i32>,
-    /// Phase 7 by-expert: per-expert (b, slot) member lists, packed as
+    /// By-expert MoE: per-expert (b, slot) member lists, packed as
     /// `(b << 16) | slot`. `[n_expert × max_per_expert]` i32. Only the first
     /// `group_count[e]` entries per expert are valid after the pre-pass.
     /// `max_per_expert = B_MAX` (worst case: every token picks the same expert
     /// in some slot — still fits since each token contributes ≤ n_used picks).
     pub expert_members: DeviceBuffer<i32>,
-    /// Phase 7.2 chunked by-expert: flat list of (expert_id<<16 | member_start)
+    /// Chunked by-expert: flat list of (expert_id<<16 | member_start)
     /// work items built by moe_work_items_builder. Sized for worst case
     /// = `B_MAX * n_used / CHUNK_SIZE + n_expert` (each active expert may
     /// have one extra ceiling chunk).
     pub work_items: DeviceBuffer<i32>,
-    /// Phase 7.2 chunked by-expert: `[1]` i32. Count of valid entries in
+    /// Chunked by-expert: `[1]` i32. Count of valid entries in
     /// `work_items[]`. MUST be zeroed before each layer's pre-pass.
     /// Read back to host (sync) to set grid.y for the main kernel.
     pub n_work_items: DeviceBuffer<i32>,
-    /// M50 hybrid dispatch: work items for the staged kernel (chunks ≥ threshold).
+    /// Hybrid dispatch: work items for the staged kernel (chunks ≥ threshold).
     /// Same shape as `work_items`. MUST be paired with `n_staged_work_items`.
     pub staged_work_items: DeviceBuffer<i32>,
-    /// M50 hybrid dispatch: work items for the chunked kernel (chunks < threshold).
+    /// Hybrid dispatch: work items for the chunked kernel (chunks < threshold).
     /// Same shape as `work_items`. MUST be paired with `n_chunked_work_items`.
     pub chunked_work_items: DeviceBuffer<i32>,
-    /// M50 hybrid dispatch: `[1]` i32 atomic counters, pre-zeroed per layer.
+    /// Hybrid dispatch: `[1]` i32 atomic counters, pre-zeroed per layer.
     pub n_staged_work_items: DeviceBuffer<i32>,
     pub n_chunked_work_items: DeviceBuffer<i32>,
 }

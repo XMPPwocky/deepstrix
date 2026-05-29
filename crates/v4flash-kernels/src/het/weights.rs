@@ -1,11 +1,9 @@
 //! Per-device weight splits for V4-Flash.
 //!
-//! * [`DgpuLayerWeights`] — attention LoRAs, mHC, compressor (M13.1; moves
-//!   to iGPU in M13.5), shared expert, attention norms. ~200 MiB/layer ×
-//!   43 layers = ~9 GiB.
-//! * [`IgpuLayerWeights`] — routed MoE (gate/up/down for 256 experts) +
-//!   router (ffn_gate_inp + tid2eid/router_bias). ~1.2 GiB/layer ×
-//!   43 layers = ~52 GiB.
+//! * [`DgpuLayerWeights`] — attention LoRAs, mHC, compressor, shared
+//!   expert, attention norms, router. ~200 MiB/layer × 43 layers = ~9 GiB.
+//! * [`IgpuLayerWeights`] — routed MoE (gate/up/down for 256 experts).
+//!   ~1.2 GiB/layer × 43 layers = ~52 GiB.
 //! * [`HetGlobalWeights`] — output head + embedding, dGPU-resident.
 
 use color_eyre::eyre::{self, eyre};
@@ -52,19 +50,16 @@ pub struct DgpuLayerWeights {
     pub ffn_norm: DeviceBuffer<f32>,
     pub shared: SharedExpertWeights,
 
-    // M14L: compressor migrated to dGPU. Loaded here instead of on iGPU
-    // because (a) 9070 XT has 2.6× the BW of Strix iGPU → f16 matvec is
-    // faster locally, and (b) attn_input_norm is computed on dGPU, so
-    // running compressor on dGPU eliminates a 16-byte peer push and
-    // the iGPU.compressor.wait it gates.
+    // Compressor lives on dGPU because (a) 9070 XT has 2.6× the BW of
+    // Strix iGPU → f16 matvec is faster locally, and (b) attn_input_norm
+    // is computed on dGPU, so the compressor's input is local and no
+    // peer push is needed.
     pub compressor: Option<CompressorWeights>,
 
-    // M16: router migrated to dGPU. The dGPU has 2.6× iGPU BW so the
-    // router matvec is ~1.5 ms faster; more importantly running it on
-    // dGPU lifts it off the iGPU's critical path (iGPU.router.wait was
-    // gating MoE start). After the router runs on dGPU, the resulting
-    // selected/d_ew are peer-pushed to iGPU and the MoE pipeline starts
-    // there immediately upon their arrival.
+    // Router lives on dGPU because (a) the f16 matvec is ~1.5 ms faster
+    // on dGPU's BW, and (b) keeping it off iGPU lifts it from the iGPU
+    // MoE critical path. After the router runs on dGPU, selected/d_ew
+    // are peer-pushed to iGPU and the MoE pipeline starts immediately.
     pub is_hash_router: bool,
     pub ffn_gate_inp: DeviceWeight,
     pub tid2eid: Option<Vec<i32>>,
@@ -76,12 +71,12 @@ pub struct IgpuLayerWeights {
     pub ratio: u32,
     pub is_hash_router: bool,
 
-    // Router — M16: moved to dGPU. iGPU keeps these as None to avoid
-    // duplicate ~86 MB of router weights (was OOM'ing the system).
+    // Router weights — dGPU-resident; these stay `None` on iGPU to
+    // avoid duplicating ~86 MB of weights that caused early OOMs.
     pub ffn_gate_inp: Option<DeviceWeight>,
     pub tid2eid: Option<Vec<i32>>,
     pub router_bias: Option<Vec<f32>>,
-    /// Device-resident copy of `router_bias` for the M13.3 `router_topk`
+    /// Device-resident copy of `router_bias` for the `router_topk`
     /// kernel. Only present for learned routers (L≥3).
     pub router_bias_dev: Option<DeviceBuffer<f32>>,
 
@@ -220,7 +215,7 @@ impl DgpuLayerWeights {
             )?,
         };
 
-        // M14L: compressor weights now on dGPU.
+        // Compressor weights live on dGPU.
         let compressor = if ratio > 0 {
             let comp_width = if ratio == 4 { 1024 } else { 512 };
             Some(CompressorWeights {
@@ -252,7 +247,7 @@ impl DgpuLayerWeights {
             None
         };
 
-        // M16: router weights on dGPU.
+        // Router weights live on dGPU.
         let is_hash_router = layer < N_HASH_LAYERS;
         let ffn_gate_inp =
             load_to_device(gguf, &format!("blk.{layer}.ffn_gate_inp.weight"), device_id)?;
@@ -327,12 +322,12 @@ impl IgpuLayerWeights {
         let ratio = COMPRESS_RATIOS[layer as usize];
         let is_hash_router = layer < N_HASH_LAYERS;
 
-        // M40-P5.1: router moved BACK to iGPU for pair-forward, where
-        // starting iGPU MoE doesn't have to wait for dGPU shared_expert.
-        // ffn_gate_inp is small (~2 MB/layer F16) — the 86 MB OOM from M16
-        // came from putting all the LoRA stuff on iGPU too. Just the router
-        // matvec weight is cheap. router_bias for learned routers also lives
-        // here (small, ~1 KB).
+        // iGPU-side copy of the router weights. Loaded for a retired
+        // pair-forward path that started iGPU MoE without waiting on
+        // dGPU shared_expert. No live caller now — `forward_layer` and
+        // `forward_layer_batch_v2` both use the dGPU copy in
+        // `dlw.ffn_gate_inp`. Candidate for removal alongside the iGPU
+        // router_bias fields below; left in place pending a sweep.
         let ffn_gate_inp: Option<DeviceWeight> = Some(load_to_device(
             gguf,
             &format!("blk.{layer}.ffn_gate_inp.weight"),
@@ -392,7 +387,8 @@ impl IgpuLayerWeights {
             down_bytes_per_expert,
         };
 
-        // M40-P5.1: router_bias_dev mirrors router_bias on iGPU.
+        // router_bias_dev mirrors router_bias on iGPU. Dead-allocated
+        // alongside the iGPU router_bias above; same cleanup candidate.
         let router_bias_dev: Option<DeviceBuffer<f32>> = if let Some(b) = router_bias.as_ref() {
             let mut buf = DeviceBuffer::<f32>::new(device_id, b.len())?;
             buf.copy_from_host(b)?;

@@ -1,20 +1,23 @@
 //! Per-layer dispatch for the het orchestrator.
 //!
-//! Pipeline (M13.1 — serial; events come in M13.4):
+//! Pipeline (event-driven overlap mode — `ExecMode::HetParallel`):
 //!
-//! 1. **dGPU**: mHC pre-attn → attn_cur → attn_input_norm
-//! 2. **dGPU**: Q chain + KV chain
-//! 3. **dGPU**: KV cache push (FP8 + F16-roundtrip + SWA slide)
-//! 4. **dGPU** (ratio>0): compressor step + boundary fire → comp_kv
-//! 5. **dGPU**: attention (swa or mixed) → heads → attn_out
-//! 6. **dGPU**: mHC post-attn → after_attn_hc
-//! 7. **dGPU**: mHC pre-ffn → ffn_cur → ffn_input_norm
-//! 8. **dGPU→iGPU**: peer push ffn_input_norm
-//! 9. **iGPU**: router (matvec + host topk) + routed MoE → ffn_moe
-//! 10. **iGPU→dGPU**: peer push ffn_moe → ffn_moe_recv
-//! 11. **dGPU**: shared expert → ffn_shared
-//! 12. **dGPU**: ffn_moe_recv += ffn_shared (vec_add)
-//! 13. **dGPU**: mHC post-ffn → residual_next
+//!  1. **dGPU**: mHC pre-attn → attn_cur → attn_input_norm
+//!  2. **dGPU**: Q chain + KV chain
+//!  3. **dGPU**: KV cache push (FP8 + F16-roundtrip + SWA slide)
+//!  4. **dGPU** (ratio>0): compressor step + boundary fire → comp_kv
+//!  5. **dGPU**: attention (swa or mixed) → heads → attn_out
+//!  6. **dGPU**: mHC post-attn → after_attn_hc
+//!  7. **dGPU**: mHC pre-ffn → ffn_cur → ffn_input_norm
+//!  8. **dGPU**: router → d_selected / d_ew
+//!  9. **dGPU→iGPU**: peer push ffn_input_norm + d_selected/d_ew (on dGPU.xfer)
+//! 10. **iGPU**: routed MoE → ffn_moe
+//! 11. **iGPU→dGPU**: peer push ffn_moe → ffn_moe_recv
+//! 12. **dGPU**: shared expert → ffn_shared (overlaps with 9-11)
+//! 13. **dGPU**: ffn_moe_recv += ffn_shared then mHC post-ffn → residual_next
+//!
+//! `ExecMode::HetSingleStream` is a correctness oracle that runs the same
+//! pipeline with `.synchronize()` between every kernel.
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{Device, DeviceBuffer};
@@ -144,10 +147,10 @@ impl HeterogeneousEngine {
         self.set_current_cached(self.dgpu.device)?;
         let de = &self.dgpu;
 
-        // M30: mhc_pre_attn for layer N is launched by the PREVIOUS
-        // layer's combined ffn_combine→mhc_pre_attn graph, except for
-        // layer 0 which has no preceding ffn_combine. The standalone
-        // mhc_pre_attn graph below only fires once per token (layer 0).
+        // mhc_pre_attn for layer N is launched by the PREVIOUS layer's
+        // combined ffn_combine→mhc_pre_attn graph, except for layer 0
+        // which has no preceding ffn_combine. The standalone mhc_pre_attn
+        // graph below only fires once per token (layer 0).
         if is_first_layer {
             let _t_mhc_pre = de.events.stage("dgpu.mhc_pre_attn", &de.compute)?;
             let _s_mhc_pre = debug_span!("mhc_pre_attn").entered();
@@ -166,10 +169,10 @@ impl HeterogeneousEngine {
         // ============================================================
         // dGPU: Q LoRA chain → q_post_rope
         // ============================================================
-        // M15: q_chain prefix (6 kernels) captured into a graph — all
-        // params are layer-constant and all I/O buffers are non-swapped
-        // scratch. The trailing rope_forward takes per-token `pos` so
-        // stays a direct launch.
+        // q_chain prefix (6 kernels) captured into a graph — all params
+        // are layer-constant and all I/O buffers are non-swapped scratch.
+        // The trailing rope_forward takes per-token `pos` so stays a
+        // direct launch.
         let _t_q = de.events.stage("dgpu.q_chain", &de.compute)?;
         let _s_q = debug_span!("q_chain").entered();
         self.dgpu_graphs.run("q_chain_pre_rope", layer as u32, &de.compute, |s| {
@@ -262,23 +265,14 @@ impl HeterogeneousEngine {
         _t_kv.end()?;
 
         // ============================================================
-        // M13.5: Compressor migrated to iGPU.
-        //
-        // The dGPU already has `attn_input_norm` computed (above). We
-        // peer-push it to the iGPU, run the compressor matvecs +
-        // state-write there in parallel with the dGPU's Q/KV chain
-        // work that follows, and on boundary tokens stream `comp_row`
-        // back to the dGPU's `comp_kv` cache via a tiny peer-push +
-        // `comp_kv_append` kernel.
+        // dGPU: Compressor (ratio>0 layers) — produces comp_kv rows on
+        // boundary tokens. Reads attn_input_norm (computed above);
+        // weights + state + scratch all live on dGPU so no peer push.
         // ============================================================
         let comp_fires_boundary = ratio > 0 && (pos + 1) % ratio == 0;
         let _parallel_pre = matches!(self.mode, ExecMode::HetParallel);
         let _sev_pre = &self.sync_events.layers[layer as usize];
 
-        // M14L: compressor runs entirely on dGPU. attn_input_norm is
-        // already local; weights + state + scratch all on dGPU; no peer
-        // pushes (was: dGPU→iGPU attn_input_norm push, iGPU→dGPU
-        // comp_row push).
         if ratio > 0 {
             let _t_comp = de.events.stage("dgpu.compressor", &de.compute)?;
             let _s_comp = debug_span!("compressor_dgpu", ratio).entered();
@@ -459,8 +453,8 @@ impl HeterogeneousEngine {
         // ============================================================
         // dGPU: Output projection
         // ============================================================
-        // M15: output_proj suffix (4 kernels after rope_inv) captured.
-        // rope_inv takes per-token `pos` and stays a direct launch.
+        // output_proj suffix (4 kernels after rope_inv) is captured into
+        // a graph. rope_inv takes per-token `pos` and stays a direct launch.
         let _t_out = de.events.stage("dgpu.output_proj", &de.compute)?;
         let _s_out = debug_span!("output_proj").entered();
         de.rope.launch_inverse(
@@ -483,9 +477,8 @@ impl HeterogeneousEngine {
         _t_out.end()?;
 
         // ============================================================
-        // dGPU: mHC post attn → after_attn_hc (M13.3: hc_post reads
-        // post + comb directly from the packed `split` buffer; no host
-        // roundtrip)
+        // dGPU: mHC post attn → after_attn_hc. hc_post reads post + comb
+        // directly from the packed `split` buffer (no host roundtrip).
         // ============================================================
         let _t_mhc_post_attn = de.events.stage("dgpu.mhc_post_attn", &de.compute)?;
         let _s_mhc_post_attn = debug_span!("mhc_post_attn").entered();
@@ -505,8 +498,8 @@ impl HeterogeneousEngine {
         // ============================================================
         // dGPU: mHC pre ffn → ffn_input_norm
         // ============================================================
-        // M15: capture mhc_pre_ffn block (5 kernels, layer-constant params)
-        // into a HIP graph on first call; replay thereafter.
+        // mhc_pre_ffn block (5 kernels, layer-constant params) is captured
+        // into a HIP graph on first call and replayed thereafter.
         let _t_mhc_pre_ffn = de.events.stage("dgpu.mhc_pre_ffn", &de.compute)?;
         let _s_mhc_pre_ffn = debug_span!("mhc_pre_ffn").entered();
         self.dgpu_graphs.run("mhc_pre_ffn", layer as u32, &de.compute, |s| {
@@ -521,9 +514,9 @@ impl HeterogeneousEngine {
         _t_mhc_pre_ffn.end()?;
 
         // ============================================================
-        // M16: router → dGPU. dGPU has 2.6× iGPU BW so the matvec is
-        // ~1.5 ms faster across the model, and running router on the
-        // dGPU side lifts it off the iGPU's critical path.
+        // dGPU: router. Runs on dGPU because (a) the f16 matvec is ~1.5 ms
+        // faster on dGPU's 2.6× iGPU BW, and (b) keeping router off iGPU
+        // lifts it from the iGPU MoE critical path.
         //
         // Order on dGPU (all on de.compute, FIFO):
         //   1. router_logits = matvec(ffn_gate_inp, ffn_input_norm)
@@ -571,7 +564,7 @@ impl HeterogeneousEngine {
         drop(_s_peer_ain);
         _t_peer_ain.end()?;
 
-        // M16: router on dGPU.compute.
+        // Router runs on dGPU.compute.
         let _t_router = de.events.stage("dgpu.router", &de.compute)?;
         let _s_router = debug_span!("router_dgpu").entered();
         {
@@ -621,8 +614,8 @@ impl HeterogeneousEngine {
         drop(_s_router);
         _t_router.end()?;
 
-        // M16: push d_selected and d_ew to iGPU on dGPU.xfer (FIFO
-        // after ffn_input_norm push).
+        // Push d_selected and d_ew to iGPU on dGPU.xfer (FIFO after the
+        // ffn_input_norm push above).
         if parallel {
             sev.selected_ready.record(&de.compute)?;
             let _t_wait = de
@@ -693,18 +686,16 @@ impl HeterogeneousEngine {
         // Fully device-side MoE pipeline (no per-slot host syncs). Each
         // iq2 writes directly into the cat positions, swiglu_cw fires
         // once, q8k_quantize + q2k accumulate then drain the cat via the
-        // d_midq_cat staging buffer. Eliminates ~600μs/layer of host
-        // round-trips (M13.4 inner-loop refactor).
+        // d_midq_cat staging buffer.
         //
-        // M15: the 4-kernel core (q8k_xq → iq2_fused → q8k_mid → q2k_down)
-        // is captured into a per-layer HIP graph on the first call and
-        // replayed thereafter. All kernel params are device pointers +
-        // layer-constant scalars, so the captured graph stays valid for
-        // every subsequent token.
+        // The 4-kernel core (q8k_xq → iq2_fused → q8k_mid → q2k_down) is
+        // captured into a per-layer HIP graph on first call and replayed
+        // thereafter — all params are device pointers + layer-constant
+        // scalars, so the graph stays valid for every subsequent token.
         //
-        // M16: d_selected and d_ew are now peer-pushed from dGPU (router
-        // ran there) and arrive via the selected_pushed event already
-        // waited on above — no more host copy_from_host here.
+        // d_selected and d_ew are device-side here: peer-pushed from
+        // dGPU (router runs there) and arriving via the selected_pushed
+        // event already waited on above.
         let mid_blocks_bytes = (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
         let _t_moe = ie.events.stage("igpu.routed_moe", &ie.compute)?;
         let _s_moe = debug_span!("routed_moe").entered();
@@ -721,8 +712,8 @@ impl HeterogeneousEngine {
             ie.q2k.launch_batched(s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
             Ok(())
         })?;
-        // (M16: `selected` no longer materialized on host — d_selected
-        // is fully device-side and peer-pushed from dGPU above.)
+        // `selected` is not materialized on host — d_selected stays
+        // device-side, peer-pushed from dGPU above.
         drop(_s_moe);
         _t_moe.end()?;
 
@@ -774,9 +765,10 @@ impl HeterogeneousEngine {
             de.compute.wait_event(&sev.moe_arrived)?;
             _t_wait.end()?;
         }
-        // Non-last layers launch the M30 fused graph (this layer's
-        // ffn_combine + next layer's mhc_pre_attn), so the span covers
-        // both — name it accordingly. The last layer is a pure combine.
+        // Non-last layers launch the fused cross-layer graph (this
+        // layer's ffn_combine + next layer's mhc_pre_attn) for a single
+        // graph submit, eliminating the host-scheduling gap between
+        // them. The last layer fires a pure combine.
         let combine_label = if is_last_layer {
             "dgpu.ffn_combine"
         } else {
@@ -785,21 +777,21 @@ impl HeterogeneousEngine {
         let _t_combine = de.events.stage(combine_label, &de.compute)?;
         let _s_combine = debug_span!("ffn_combine").entered();
         if is_last_layer {
-            // M15.1 (vec_add → hc_post writing residual_next). Stable
-            // per-layer pointers thanks to the end-of-token extra swap.
-            // Used ONLY for the last layer under M30.
+            // (vec_add → hc_post writing residual_next). Stable per-layer
+            // pointers thanks to the end-of-token extra swap. Used ONLY
+            // for the last layer; non-last layers ride the combined graph.
             self.dgpu_graphs.run("ffn_combine", layer as u32, &de.compute, |s| {
                 de.vec_add.launch(s, &mut dgpu_scratch.ffn_moe_recv, &dgpu_scratch.ffn_shared, N_EMBD)?;
                 de.hc_post.launch_from_split(s, &mut dgpu_scratch.residual_next, &dgpu_scratch.ffn_moe_recv, &dgpu_scratch.after_attn_hc, &dgpu_scratch.split, N_HC, N_EMBD, N_HC)?;
                 Ok(())
             })?;
         } else {
-            // M30: combined ffn_combine_N + mhc_pre_attn_{N+1} graph.
-            // The mhc_pre_attn block reads from layer N+1's `residual`
-            // which is THIS layer's `residual_next` after the post-layer
-            // swap — same physical buffer. We pass `residual_next.raw()`
+            // Combined ffn_combine_N + mhc_pre_attn_{N+1} graph. The
+            // mhc_pre_attn block reads from layer N+1's `residual` which
+            // is THIS layer's `residual_next` after the post-layer swap
+            // — same physical buffer. We pass `residual_next.raw()`
             // throughout so the captured graph references one ptr.
-            let next = next_dlw.expect("M30: next_dlw required for non-last layer");
+            let next = next_dlw.expect("combined_ffn_pre_attn: next_dlw required for non-last layer");
             self.dgpu_graphs.run("combined_ffn_pre_attn", layer as u32, &de.compute, |s| {
                 // ffn_combine half — writes residual_next (= layer N+1's residual).
                 de.vec_add.launch(s, &mut dgpu_scratch.ffn_moe_recv, &dgpu_scratch.ffn_shared, N_EMBD)?;

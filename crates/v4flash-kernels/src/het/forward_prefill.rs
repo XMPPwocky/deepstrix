@@ -307,7 +307,7 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
-    /// M50 Phase 6: chunked prefill driver. Processes `tokens` (length T)
+    /// Chunked prefill driver. Processes `tokens` (length T)
     /// through the v2 batched pipeline in chunks of CHUNK_SIZE=B_MAX. State
     /// carries across chunks via `state.layers[*].{kv_cache,n_raw,compressor}`
     /// (the per-layer fields just keep growing — no special handling).
@@ -585,7 +585,7 @@ impl HeterogeneousEngine {
 }
 
 impl HeterogeneousEngine {
-    /// M50 Phase 2: one layer of batched prefill, all phases. Reads
+    /// One layer of batched prefill, all phases. Reads
     /// `batch_dgpu.residual` (per-token input HC), writes
     /// `batch_dgpu.residual_next` (per-token output HC). All other
     /// `batch_dgpu` fields are scratch. Thin wrapper over the split
@@ -901,7 +901,7 @@ impl HeterogeneousEngine {
         let mut n_raw_after: Vec<u32> = Vec::with_capacity(b as usize);
         let mut n_comp_after: Vec<u32> = Vec::with_capacity(b as usize);
 
-        // M52: oversized cache + per-token offset. The cache (ls.kv_cache) is
+        // Oversized cache + per-token offset. The cache (ls.kv_cache) is
         // sized SWA_WINDOW + B_MAX rows so a prefill chunk can write its full
         // batch into slots [n_raw_before .. n_raw_before + b) WITHOUT evicting
         // any prior content. Attention's `n_raw_offset_per[i]` tells the
@@ -928,7 +928,7 @@ impl HeterogeneousEngine {
             n_raw_after.push(n_per);
             n_raw_offset_after.push(offset);
         }
-        // M52: cache is oversized to SWA_WINDOW + B_MAX rows, so we always
+        // The cache is oversized to SWA_WINDOW + B_MAX rows, so we always
         // use the no-eviction batched append. The post-chunk eviction pass at
         // the end of this layer (after attention) copies the last SWA_WINDOW
         // rows down to slots [0..W) and updates ls.n_raw, restoring the
@@ -955,7 +955,7 @@ impl HeterogeneousEngine {
         // at the END of this layer (see the eviction-down pass).
         let n_raw_during_chunk = n_raw_before + b;
 
-        // M50: batched matvec_pair across all B for ratio>0 layers. Produces
+        // Batched matvec_pair across all B for ratio>0 layers. Produces
         // bd.kv_cur[B, comp_width] + bd.sc_cur[B, comp_width] in one launch.
         // The per-token loop below just READS from those buffers.
         if ratio > 0 {
@@ -977,7 +977,7 @@ impl HeterogeneousEngine {
             )?;
         }
 
-        // M50: per-segment batched state_write. Each segment is ≤ `ratio`
+        // Per-segment batched state_write. Each segment is ≤ `ratio`
         // positions long; within a segment, state_writes go to distinct
         // rows (rows {pos_mod_start..pos_mod_start+seg_len}) so they're
         // safely batched. Segments are bounded by compressor boundaries
@@ -1248,7 +1248,7 @@ impl HeterogeneousEngine {
         drop(ncp_view);
         drop(_t_attn);
 
-        // M52: post-attention eviction. Cache holds n_raw_during_chunk rows
+        // Post-attention eviction. Cache holds n_raw_during_chunk rows
         // (= n_raw_before + b). Compress back to the SWA invariant:
         //   - if n_raw_during_chunk <= SWA_WINDOW: nothing to do, slots
         //     [0..n_raw_during_chunk) are already the steady state. Update
@@ -1441,8 +1441,8 @@ impl HeterogeneousEngine {
         // float reduction order; batched matvec_narrow has different
         // accumulation order which makes topk pick different experts
         // when logits are near the threshold. f16.matvec dispatches to
-        // wide when n_rows >= 64 (N_EXPERT=256 ≥ 64). Phase 2-bis will
-        // add a wide batched variant.)
+        // wide when n_rows >= 64 (N_EXPERT=256 ≥ 64); a future wide-
+        // batched variant could remove the per-token launch overhead.)
         // ========================================================
         let _t_router = de.events.stage("dgpu.router", &de.compute)?;
         {
@@ -1595,12 +1595,12 @@ impl HeterogeneousEngine {
         drop(_t_shared);
 
         // ========================================================
-        // Stage 11: iGPU routed MoE (SERIAL per batch — Phase 3 batches this)
+        // Stage 11: iGPU routed MoE (batched).
         //
-        // For each batch element: peer-push the per-batch slice of
-        // ffn_input_norm + d_selected + d_ew, run the existing single-
-        // token iGPU MoE 4-kernel pipeline (uses captured graph),
-        // peer-push ffn_moe back into the per-batch slot.
+        // One peer-push of [B × N_EMBD] ffn_input_norm + [B × N_USED]
+        // d_selected/d_ew, one batched iGPU MoE call chain (q8k_xq →
+        // iq2_fused_swiglu → q8k_mid → q2k_down with by-expert dispatch),
+        // one peer-push of [B × N_EMBD] ffn_moe back.
         // ========================================================
         let gbpe = ilw.routed.gate_bytes_per_expert as u32;
         let ubpe = ilw.routed.up_bytes_per_expert as u32;
@@ -1650,9 +1650,9 @@ impl HeterogeneousEngine {
         drop(bi_sel);
         drop(bi_ew);
 
-        // Single batched iGPU MoE call chain. Phase 7: by-expert dispatch
-        // for iq2. q2_k stays by-token for now (could also be by-expert
-        // but smaller perf lever).
+        // Single batched iGPU MoE call chain. iq2 uses by-expert
+        // dispatch (group_builder + work_items pre-pass), q2_k stays
+        // by-token (could also be by-expert but smaller perf lever).
         self.set_current_cached(self.igpu.device)?;
         let ie = &self.igpu;
         // Wait for the dGPU→iGPU peer-push to land before any iGPU compute
@@ -1668,7 +1668,7 @@ impl HeterogeneousEngine {
                 crate::config::BLOCKS_Q8K_GATE_IN * b,
             )?;
         }
-        // Phase 7.2 chunked by-expert iq2. Three pre-passes then main kernel:
+        // Chunked by-expert iq2. Three pre-passes then main kernel:
         //   1. moe_group_builder: invert d_selected → group_count + expert_members.
         //   2. moe_work_items_builder: chunk popular groups → work_items + n_work_items.
         //   3. host sync + readback n_work_items to set main kernel grid.y.

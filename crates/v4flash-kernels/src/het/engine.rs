@@ -1,11 +1,12 @@
 //! [`DeviceEngine`] — per-device bundle of HIP kernel modules + streams.
 //! [`HeterogeneousEngine`] — pair of engines plus [`ExecMode`] policy.
 //!
-//! M13.1 implements `ExecMode::HetSingleStream` only — every kernel is
-//! followed by `compute.synchronize()` and peer copies are serial. The
-//! engine layout is already structured for M13.4's parallel mode (separate
-//! `compute` + `xfer` streams per device), but the wait-events haven't
-//! been wired yet.
+//! Two execution modes:
+//! * `HetSingleStream` — every kernel followed by `compute.synchronize()`,
+//!   peer copies serial. Correctness oracle, slower than even single-
+//!   device because of cross-device sync overhead.
+//! * `HetParallel` — separate `compute` + `xfer` streams per device,
+//!   cross-device handoffs gated by HIP events. The production mode.
 
 use color_eyre::eyre;
 use v4flash_hip::{Device, Event, Stream};
@@ -50,14 +51,14 @@ pub enum ExecMode {
     /// Expected to be *slower* than single-device because of cross-device
     /// sync overhead.
     HetSingleStream,
-    /// Event-driven overlap (M13.4+). Compressor / shared / routed-MoE run
+    /// Event-driven overlap. Compressor / shared / routed-MoE run
     /// concurrently across the two devices, gated by HIP events.
     HetParallel,
 }
 
-/// All kernel modules + streams for one HIP device. We carry the full
-/// kernel set on both devices in M13.1 (cheap — kernels are HSACO blobs,
-/// not weights). Memory split happens in [`super::weights`].
+/// All kernel modules + streams for one HIP device. Both devices carry
+/// the full kernel set (cheap — kernels are HSACO blobs, not weights).
+/// Memory split happens in [`super::weights`].
 pub struct DeviceEngine {
     pub device: Device,
     /// Compute stream — all kernel launches go here for single-token paths.
@@ -84,12 +85,15 @@ pub struct DeviceEngine {
     pub q8k: Q8KQuantize,
     pub iq2: Iq2XxsPairMatvec,
     pub q2k: Q2KAccumulateMatvec,
-    /// M40-P2: Q4_K matvec kernels (par-batched + pair-swiglu-batched).
-    /// Used by the MTP draft layer — antirez's MTP GGUF stores routed
-    /// experts as Q4_K, distinct from the main model's iq2_xxs + q2_k.
+    /// Q4_K matvec kernels (par-batched + pair-swiglu-batched). Loaded
+    /// for the retired MTP draft layer (whose GGUF stored routed experts
+    /// as Q4_K). No live caller in the current forward path — retained
+    /// because `kernels/q4_k_matvec_par.hip` exists and is exercised by
+    /// `tests/q4_k_matvec.rs`. Candidate for removal from DeviceEngine.
     pub q4k: crate::q4_k::Q4KMatvec,
-    /// M40-P2: broadcast/tile kernel for the MTP HC-combine stage
-    /// (expand N_EMBD vector to N_HC × N_EMBD).
+    /// Broadcast/tile kernel (expand N_EMBD vector to N_HC × N_EMBD).
+    /// Loaded for retired MTP HC-combine; same dead-engine-field status
+    /// as `q4k` above.
     pub broadcast: crate::broadcast::BroadcastToHc,
     pub hc_sigmoid: HcSigmoidBias,
     pub hc_weighted: HcWeightedSum,
@@ -103,11 +107,11 @@ pub struct DeviceEngine {
     pub kv_append: KvCacheAppend,
     pub comp_kv_append: CompKvAppend,
     pub router_topk: RouterTopk,
-    /// M50 Phase 7: by-expert MoE pre-pass — inverts d_selected into per-
-    /// expert (token, slot) lists. Only loaded on iGPU (where iq2 runs).
+    /// By-expert MoE pre-pass — inverts d_selected into per-expert
+    /// (token, slot) lists. Used by the prefill iGPU MoE path.
     pub moe_group_builder: crate::moe_group_builder::MoeGroupBuilder,
 
-    /// Per-device event pool for kernel-scope timing (M13.2). Use
+    /// Per-device event pool for kernel-scope timing. Use
     /// `events.stage(name, &compute)` to wrap a kernel-group.
     pub events: EventPool,
 }
@@ -164,17 +168,21 @@ impl DeviceEngine {
 /// Per-layer cross-device sync events for the [`ExecMode::HetParallel`]
 /// pipeline. Pre-allocated up front, reused per token.
 ///
-/// FFN handoff (M13.4):
+/// FFN handoff:
 /// * `ain_ready` (dgpu.compute) — `ffn_input_norm` finished computing.
 /// * `ain_pushed` (dgpu.xfer)   — `ffn_input_norm` finished copying to iGPU.
 /// * `moe_done`  (igpu.compute) — routed MoE finished writing `ffn_moe`.
 /// * `moe_arrived` (igpu.xfer)  — `ffn_moe` finished copying to dGPU.
 ///
-/// Compressor handoff (M13.5):
-/// * `attn_in_ready`   (dgpu.compute) — `attn_input_norm` finished computing.
-/// * `attn_in_pushed`  (dgpu.xfer)    — `attn_input_norm` finished copying to iGPU.
-/// * `comp_row_ready`  (igpu.compute) — boundary `comp_row` finished computing.
-/// * `comp_row_arrived`(igpu.xfer)    — `comp_row` finished copying to dGPU.
+/// Router handoff:
+/// * `selected_ready` (dgpu.compute) — selected/d_ew written and ready for
+///   peer-push to iGPU.
+/// * `selected_pushed` (dgpu.xfer) — selected/d_ew pushed to iGPU;
+///   iGPU MoE waits on this.
+///
+/// The `attn_in_*` and `comp_row_*` fields are pre-allocated for a
+/// retired compressor-handoff path (the compressor now runs entirely on
+/// dGPU). They are unread in the current code; candidates for removal.
 pub struct LayerSyncEvents {
     pub ain_ready: Event,
     pub ain_pushed: Event,
@@ -184,11 +192,7 @@ pub struct LayerSyncEvents {
     pub attn_in_pushed: Event,
     pub comp_row_ready: Event,
     pub comp_row_arrived: Event,
-    /// M16: router runs on dGPU; this fires (dGPU compute) once
-    /// selected/d_ew are written and ready for peer-push to iGPU.
     pub selected_ready: Event,
-    /// M16: fires (dGPU xfer) once selected/d_ew have been pushed to
-    /// the iGPU's d_selected/d_ew. iGPU MoE waits on this.
     pub selected_pushed: Event,
 }
 
@@ -254,25 +258,25 @@ pub struct HeterogeneousEngine {
     /// per-layer forward stage that is purely device-resident with
     /// layer-constant scalar params is captured once and replayed per
     /// token. Stages currently captured on the dGPU side: `mhc_pre_attn`,
-    /// `mhc_pre_ffn`, `shared_expert`, `q_chain`, `output_proj`,
-    /// `ffn_combine`, `combined_ffn_pre_attn` (the M30 cross-layer
-    /// merge). The combined graph occupies slot `(stage, layer)` for
-    /// the transition out of `layer` to `layer + 1`.
+    /// `mhc_pre_ffn`, `shared_expert`, `q_chain_pre_rope`,
+    /// `output_proj_post_rope`, `ffn_combine`, `combined_ffn_pre_attn`
+    /// (the cross-layer fusion of ffn_combine_N + mhc_pre_attn_{N+1};
+    /// occupies slot `(name, layer)` for the transition out of `layer`).
     pub dgpu_graphs: GraphCache,
     /// Same as `dgpu_graphs` for the iGPU routed-MoE sub-pipeline
-    /// (`igpu_moe`).
+    /// (`routed_moe`).
     pub igpu_graphs: GraphCache,
 
-    /// M20: cache which HIP device is currently bound on this thread,
-    /// so set_current_cached() can skip the driver call when the
-    /// device hasn't actually changed. AtomicI32 (not Cell) so
-    /// HeterogeneousEngine stays Sync. `-1` = unknown.
+    /// Thread-local cache of the currently-bound HIP device, so
+    /// `set_current_cached()` can skip the driver call when the device
+    /// hasn't actually changed. AtomicI32 (not Cell) keeps the engine
+    /// `Sync`. `-1` = unknown.
     pub current_device: std::sync::atomic::AtomicI32,
-    /// M27 diagnostic: last forward_token's host-enqueue time (µs),
-    /// before the final dgpu.compute.synchronize(). Bench reads this
-    /// to split per-token wall into host vs device-wait.
+    /// Diagnostic: last `forward_token`'s host-enqueue time (µs), before
+    /// the final `dgpu.compute.synchronize()`. Bench reads this to split
+    /// per-token wall into host vs device-wait.
     pub last_host_us: std::sync::atomic::AtomicU64,
-    /// M27 diagnostic: time spent in the final synchronize() call.
+    /// Diagnostic: time the host spent inside the final `synchronize()`.
     pub last_sync_us: std::sync::atomic::AtomicU64,
 }
 
@@ -336,21 +340,22 @@ impl HeterogeneousEngine {
             std::mem::swap(&mut dgpu_scratch.residual, &mut dgpu_scratch.residual_next);
         }
         self.forward_head(dgpu_scratch, &weights.global)?;
-        // M15.1: N_LAYER (43) is odd, so 43 in-loop swaps leave
-        // residual/residual_next inverted from token start. Without an
-        // extra swap, every token's layer 0 would read from a different
+        // N_LAYER (43) is odd, so 43 in-loop swaps leave residual /
+        // residual_next inverted from token start. Without an extra swap
+        // here, every token's layer 0 would read from a different
         // physical DeviceBuffer than the previous token's layer 0,
         // making it impossible to capture mhc_pre_attn / mhc_post_ffn
         // into HIP graphs (the captured pointer would be wrong on
-        // alternating tokens). One extra swap here restores the
-        // initial state so layer N always operates on the same
-        // physical buffers across every token.
+        // alternating tokens). The extra swap restores the initial state
+        // so layer N always operates on the same physical buffers across
+        // every token.
         std::mem::swap(&mut dgpu_scratch.residual, &mut dgpu_scratch.residual_next);
         self.set_current_cached(self.dgpu.device)?;
-        // M27 diagnostic: split token wall into (host-enqueue / device-sync).
-        // host_us = time spent in this loop before the final sync. If big,
-        // OS preempted us between launches. sync_us = time the host waited
-        // for the device. If big, the device was slow (clock/thermal).
+        // Diagnostic split of per-token wall:
+        //   host_us = time in this loop before the final sync. If big,
+        //             OS preempted between launches.
+        //   sync_us = time the host waited for the device. If big, the
+        //             device was slow (clock/thermal).
         let host_us = token_start.elapsed().as_micros() as u64;
         self.dgpu.compute.synchronize()?;
         let token_elapsed_us = token_start.elapsed().as_micros() as u64;
@@ -393,11 +398,11 @@ impl HeterogeneousEngine {
                 &self.igpu.compute,
                 &self.igpu.xfer,
             )?;
-            // M20: re_anchor calls device.set_current() internally for
-            // each of the 4 tracks (last is igpu.xfer → igpu). That
-            // bypasses our set_current_cached, leaving the cache stale.
-            // Invalidate so the next forward_token's first
-            // set_current_cached is forced through.
+            // re_anchor calls device.set_current() internally for each
+            // of the 4 tracks (last is igpu.xfer → igpu), bypassing
+            // set_current_cached and leaving the cache stale. Invalidate
+            // so the next forward_token's first set_current_cached is
+            // forced through.
             self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         }
 
@@ -522,20 +527,20 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
-    /// M40-P1: invalidate the set_current_cached cache. Call this any
-    /// time external code (e.g. snapshot/restore that does direct
-    /// `Device::set_current`) may have changed the actual current HIP
-    /// device behind the cache's back. Next set_current_cached call
-    /// will then forcibly re-set.
+    /// Invalidate the set_current_cached cache. Call this any time
+    /// external code may have changed the actual current HIP device
+    /// behind the cache's back — the next set_current_cached call will
+    /// then forcibly re-set.
     pub fn invalidate_device_cache(&self) {
         self.current_device
             .store(-1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// M20: set the HIP device only if the cached value differs from
-    /// the request. Skips redundant `hipSetDevice` driver calls in the
-    /// forward_layer loop (we toggle dGPU ↔ iGPU multiple times per
-    /// layer; each unconditional set_current was a few µs of host time).
+    /// Set the HIP device only if the cached value differs from the
+    /// request. Skips redundant `hipSetDevice` driver calls in the
+    /// forward_layer loop (which toggles dGPU ↔ iGPU multiple times
+    /// per layer; each unconditional `set_current` was a few µs of
+    /// host time).
     pub fn set_current_cached(&self, dev: Device) -> eyre::Result<()> {
         use std::sync::atomic::Ordering;
         if self.current_device.load(Ordering::Relaxed) != dev.id {

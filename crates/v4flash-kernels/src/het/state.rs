@@ -1,9 +1,8 @@
 //! Per-layer state for the het orchestrator (KV cache + compressor state).
 //!
-//! In M13.1 everything lives on the dGPU (the device that runs attention
-//! and reads the KV cache). M13.5 will migrate compressor state to the
-//! iGPU and stream `comp_row` back to the dGPU on boundary tokens via a
-//! tiny peer push.
+//! All state lives on the dGPU (the device that runs attention and reads
+//! the KV cache). The compressor's iGPU-resident era was rolled back —
+//! see [`HetCompressorState`].
 
 use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer};
@@ -18,11 +17,11 @@ use crate::het::batch_scratch::B_MAX;
 /// Outside of prefill chunks only the first SWA_WINDOW rows are used.
 pub const KV_CACHE_ROWS: usize = SWA_WINDOW as usize + B_MAX;
 
-/// Per-layer compressor state. After M13.5, `state_kv` and `state_score`
-/// live on the **iGPU** (where the compressor kernels run), while
-/// `comp_kv` stays on the **dGPU** (where `attn_mixed` reads it). On
-/// each boundary the iGPU compressor emits a `comp_row` that's
-/// peer-pushed to the dGPU's `comp_kv`.
+/// Per-layer compressor state. All buffers live on the dGPU: the
+/// compressor kernels run alongside attn_input_norm on dGPU, so
+/// `state_kv` / `state_score` (sliding compressor state) and `comp_kv`
+/// (the cumulative pooled cache `attn_mixed` reads) are all local —
+/// no peer push needed when the compressor fires at a boundary.
 pub struct HetCompressorState {
     /// iGPU-resident: compressor sliding state.
     pub state_kv: DeviceBuffer<f32>,
