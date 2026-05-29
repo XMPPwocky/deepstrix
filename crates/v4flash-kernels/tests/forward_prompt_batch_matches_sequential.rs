@@ -1,16 +1,8 @@
-//! M50 Phase 1 oracle: `forward_prompt_batch` produces the same
-//! post-last-layer residual as B sequential `forward_token` calls.
-//!
-//! Setup:
-//! 1. Allocate fresh state.
-//! 2. Run B sequential `forward_token(prompt[0..B])` calls. Capture
-//!    each token's residual_next (= final HC) immediately after its
-//!    forward_token returns.
-//! 3. Reset state (allocate a NEW HetModelState).
-//! 4. Run `forward_prompt_batch(prompt[0..B], pos0=0)`. Capture each
-//!    batch element's residual_next after return.
-//! 5. Compare: per-token residual_next bit-identical (same kernels,
-//!    same inputs, just reorganized layer-major).
+//! Prefill oracles: the batched (`forward_prompt_batch_v2`) and
+//! pipelined (`forward_prefill_pipelined`) paths produce the same
+//! post-last-layer residual as B sequential `forward_token` calls, plus
+//! a layer-bisect diagnostic that finds the first diverging layer/batch
+//! element.
 //!
 //! Run:
 //!   HIP_VISIBLE_DEVICES=0,1 nix develop -c cargo test --release \
@@ -73,140 +65,8 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
     (maxd, idx)
 }
 
-#[test]
-#[ignore]
-fn forward_prompt_batch_matches_sequential() -> eyre::Result<()> {
-    install_panic_handler()?;
-    use v4flash_kernels::config::HC_DIM;
-
-    // Phase 1 keeps B small to keep memory + run time bounded.
-    let b: usize = std::env::var("BENCH_B")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8)
-        .min(PROMPT_TOKENS.len());
-    eprintln!("oracle: B={b} (prompt slice [0..{b}])");
-
-    let dump = ActivationDump::open(dump_dir())?;
-    let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
-    let dgpu = pick_dgpu()?;
-    let igpu = pick_igpu()?;
-    let dgpu_arch = dgpu.properties()?.gcn_arch_name;
-    let igpu_arch = igpu.properties()?.gcn_arch_name;
-
-    let rope_for_layer = |layer: i32| -> eyre::Result<RopeParams> {
-        let entry = dump
-            .weight("rope_params", layer)
-            .ok_or_else(|| eyre!("missing rope_params L{layer}"))?;
-        let floats = dump.read_f32(entry)?;
-        let n_ctx_orig = if floats[2] != 0.0 { ROPE_ORIG_CTX } else { 0 };
-        RopeParams::from_dump_blob(&floats, n_ctx_orig)
-    };
-
-    eprintln!("loading main weights...");
-    let main_weights = HetModelWeights::load_all(&main_gguf, dgpu, igpu, &rope_for_layer)?;
-    let engine =
-        HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
-
-    // Build per-token input_hc from the dump's `layer_input_residual`
-    // tensor (the canonical layer-0 input for each prompt position).
-    let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(b);
-    for i in 0..b {
-        let entry = dump
-            .tensor("layer_input_residual", 0, i as i32)
-            .ok_or_else(|| eyre!("missing layer_input_residual L0 T{i}"))?;
-        let hc = dump.read_f32(entry)?;
-        assert_eq!(hc.len(), HC_DIM as usize);
-        input_hcs.push(hc);
-    }
-    let tokens: Vec<i32> = PROMPT_TOKENS[..b].to_vec();
-
-    // Allocate batch_scratch ONCE and use its shared_dgpu/shared_igpu
-    // for BOTH runs. forward_token captures sub-block graphs on first
-    // call using its scratch's buffer pointers; subsequent calls (and
-    // Run B) need the SAME scratch's pointers for the captured graphs
-    // to replay correctly. Allocating two separate scratches breaks
-    // captures because the second run's replays use the first run's
-    // (now freed/different) memory addresses.
-    let mut batch_scratch = BatchScratch::alloc(dgpu, igpu)?;
-
-    // ---- Run A: sequential forward_token. Capture residual_next per token. ----
-    eprintln!("Run A: sequential forward_token × {b} (reuses shared_dgpu)");
-    let mut seq_state = HetModelState::alloc(dgpu, igpu, b as u32 + 4)?;
-    let mut seq_hcs: Vec<Vec<f32>> = Vec::with_capacity(b);
-    for i in 0..b {
-        engine.forward_token(
-            &mut batch_scratch.shared_dgpu,
-            &mut batch_scratch.shared_igpu,
-            &mut seq_state,
-            &main_weights,
-            &input_hcs[i],
-            i as u32,
-            tokens[i],
-        )?;
-        let mut hc = vec![0f32; HC_DIM as usize];
-        batch_scratch.shared_dgpu.residual_next.copy_to_host(&mut hc)?;
-        seq_hcs.push(hc);
-    }
-
-    // ---- Run B: forward_prompt_batch. Capture residual_next per batch element. ----
-    // Fresh state (so KV cache + compressor start empty again), reuse
-    // the SAME shared scratch so capture pointers stay valid.
-    eprintln!("Run B: forward_prompt_batch B={b}");
-    let mut batch_state = HetModelState::alloc(dgpu, igpu, b as u32 + 4)?;
-    engine.forward_prompt_batch(
-        &mut batch_scratch,
-        &mut batch_state,
-        &main_weights,
-        &input_hcs,
-        &tokens,
-        0,
-    )?;
-    let mut batch_hcs: Vec<Vec<f32>> = Vec::with_capacity(b);
-    for i in 0..b {
-        let mut hc = vec![0f32; HC_DIM as usize];
-        batch_scratch.per_token_residual_next[i].copy_to_host(&mut hc)?;
-        batch_hcs.push(hc);
-    }
-
-    // ---- Compare ----
-    eprintln!("\n=== per-token residual_next: batch vs sequential ===");
-    let mut overall_max = 0.0f32;
-    let mut overall_max_pos = 0usize;
-    for i in 0..b {
-        let (maxd, idx) = max_abs_diff(&batch_hcs[i], &seq_hcs[i]);
-        let verdict = if maxd < 1e-4 { "✓" }
-                     else if maxd < 1e-2 { "~" }
-                     else { "✗" };
-        eprintln!(
-            "  {} pos={} tok={:>5}  max={:.4e} @i={:>5}  batch={:.4}  seq={:.4}",
-            verdict, i, tokens[i], maxd, idx, batch_hcs[i][idx], seq_hcs[i][idx]
-        );
-        if maxd > overall_max {
-            overall_max = maxd;
-            overall_max_pos = i;
-        }
-    }
-    eprintln!(
-        "\noverall max abs diff = {:.4e} at pos {overall_max_pos}",
-        overall_max
-    );
-
-    // Phase 1 expectation: bit-identical (same kernels, same inputs, just
-    // reorganized layer-major). Tolerance accounts for HIP nondeterminism
-    // in certain reduction kernels but anything > 1e-3 is a real bug.
-    assert!(
-        overall_max < 1e-3,
-        "forward_prompt_batch diverges from sequential by {:.4e} (> 1e-3)",
-        overall_max
-    );
-
-    eprintln!("\nORACLE PASS: forward_prompt_batch matches sequential within 1e-3");
-    Ok(())
-}
-
-/// M50 Phase 2 oracle: `forward_prompt_batch_v2` (real batched kernels)
-/// matches the sequential single-token path within float-reduction-order
+/// Oracle: `forward_prompt_batch_v2` (real batched kernels) matches the
+/// sequential single-token path within float-reduction-order
 /// tolerance (~1e-3 — batched kernels have different summation order).
 #[test]
 #[ignore]
