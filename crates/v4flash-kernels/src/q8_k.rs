@@ -2,10 +2,8 @@
 //! Q8_K blocks (292 bytes each) consumed by routed-expert IQ2_XXS/Q2_K
 //! matvecs. Mirrors `ds4_quantize_row_q8_K` (ds4.c:1655).
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const Q8_K_QUANTIZE_GFX1201: &[u8] = include_bytes!(env!("KERNEL_Q8_K_QUANTIZE_GFX1201"));
 const Q8_K_QUANTIZE_GFX1151: &[u8] = include_bytes!(env!("KERNEL_Q8_K_QUANTIZE_GFX1151"));
@@ -90,21 +88,15 @@ impl Q8KQuantize {
 
         let function = self.module.get_function("q8_k_quantize")?;
         // SAFETY: bounds-checked above.
-        let mut out_ptr = unsafe { (out.raw() as *mut u8).add(out_offset_bytes) }
+        let out_ptr = unsafe { (out.raw() as *mut u8).add(out_offset_bytes) }
             as v4flash_hip::sys::hipDeviceptr_t;
-        let mut x_ptr = unsafe { (x.raw() as *mut f32).add(x_offset_elems) }
+        let x_ptr = unsafe { (x.raw() as *mut f32).add(x_offset_elems) }
             as v4flash_hip::sys::hipDeviceptr_t;
-        let mut n = n_blocks;
-        let mut args: [*mut c_void; 3] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut n as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_blocks, 1, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [out_ptr, x_ptr, n_blocks])
     }
 }

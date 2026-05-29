@@ -19,6 +19,8 @@ mod device;
 mod error;
 mod event;
 mod graph;
+#[macro_use]
+mod launch;
 mod module;
 mod stream;
 

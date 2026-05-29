@@ -1,3 +1,7 @@
+#![cfg(any())]
+// Commented out 2026-05-27 — depends on retired forward_pair_interleaved / spec_decode.
+// Re-enable along with `pub mod forward_pair_interleaved;` and `pub mod spec_decode;` in het/mod.rs.
+
 //! Capture a perfetto trace of `forward_pair_interleaved` (M40 Phase 3).
 //! After warming up the state with a few single-token forwards to fill
 //! KV cache, runs several pair-forward iterations so you can see the

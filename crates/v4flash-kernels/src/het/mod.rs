@@ -22,8 +22,11 @@ pub mod forward_head;
 pub mod forward_layer;
 pub mod forward_mtp;
 pub mod forward_prefill;
-pub mod forward_pair_interleaved;
-pub mod spec_decode;
+// Commented out 2026-05-27 — speculative-decode path retired pending
+// review. Source preserved in git history. Re-enable along with
+// `spec_decode` when needed.
+// pub mod forward_pair_interleaved;
+// pub mod spec_decode;
 pub mod mtp_weights;
 pub mod perfetto;
 pub mod prefill_stats;

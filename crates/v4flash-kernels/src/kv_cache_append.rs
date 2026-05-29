@@ -7,10 +7,8 @@
 //! Single-block kernel; caller must launch with `block.x = head_dim`.
 //! Works for any `head_dim ≤ 1024` (HIP max block size on RDNA).
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const KV_CACHE_APPEND_GFX1201: &[u8] = include_bytes!(env!("KERNEL_KV_CACHE_APPEND_GFX1201"));
 const KV_CACHE_APPEND_GFX1151: &[u8] = include_bytes!(env!("KERNEL_KV_CACHE_APPEND_GFX1151"));
@@ -70,24 +68,14 @@ impl KvCacheAppend {
         }
 
         let function = self.module.get_function("kv_cache_append")?;
-        let mut cache_ptr = cache.raw();
-        let mut new_ptr = kv_new.raw();
-        let mut n = n_raw_before;
-        let mut sw = swa_window;
-        let mut hd = head_dim;
-        let mut args: [*mut c_void; 5] = [
-            &mut cache_ptr as *mut _ as *mut c_void,
-            &mut new_ptr as *mut _ as *mut c_void,
-            &mut n as *mut _ as *mut c_void,
-            &mut sw as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (1, 1, 1),
             block: (head_dim, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            cache.raw(), kv_new.raw(), n_raw_before, swa_window, head_dim
+        ])
     }
 
     /// M50 batched: append B contiguous rows to slots
@@ -107,21 +95,11 @@ impl KvCacheAppend {
             return Ok(());
         }
         let function = self.module.get_function("kv_cache_append_batched")?;
-        let mut cache_ptr = cache.raw();
-        let mut new_ptr = kv_new.raw();
-        let mut n = n_raw_before;
-        let mut hd = head_dim;
-        let mut args: [*mut c_void; 4] = [
-            &mut cache_ptr as *mut _ as *mut c_void,
-            &mut new_ptr as *mut _ as *mut c_void,
-            &mut n as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (b, 1, 1),
             block: (head_dim, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [cache.raw(), kv_new.raw(), n_raw_before, head_dim])
     }
 }

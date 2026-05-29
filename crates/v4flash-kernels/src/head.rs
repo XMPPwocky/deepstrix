@@ -10,10 +10,8 @@
 //! `RmsNormNoWeight` (M3) and `F16Matvec` (M7) cover the first two steps;
 //! this module adds the last two as `HcSigmoidBias` and `HcWeightedSum`.
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const HC_SIGMOID_BIAS_GFX1201: &[u8] = include_bytes!(env!("KERNEL_HC_SIGMOID_BIAS_GFX1201"));
 const HC_SIGMOID_BIAS_GFX1151: &[u8] = include_bytes!(env!("KERNEL_HC_SIGMOID_BIAS_GFX1151"));
@@ -54,18 +52,6 @@ impl HcSigmoidBias {
         n: u32,
     ) -> eyre::Result<()> {
         let function = self.module.get_function("hc_sigmoid_bias")?;
-        let mut out_ptr = out.raw();
-        let mut pre_ptr = pre.raw();
-        let mut scale_ptr = scale.raw();
-        let mut base_ptr = base.raw();
-        let mut n_v = n;
-        let mut args: [*mut c_void; 5] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut pre_ptr as *mut _ as *mut c_void,
-            &mut scale_ptr as *mut _ as *mut c_void,
-            &mut base_ptr as *mut _ as *mut c_void,
-            &mut n_v as *mut _ as *mut c_void,
-        ];
         let block_x = 32u32;
         let grid_x = n.div_ceil(block_x);
         let cfg = LaunchConfig {
@@ -73,7 +59,7 @@ impl HcSigmoidBias {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [out.raw(), pre.raw(), scale.raw(), base.raw(), n])
     }
 
     /// M50 Phase 2: batched. pre[B, n], out[B, n]. scale, base shared.
@@ -91,18 +77,6 @@ impl HcSigmoidBias {
             return Ok(());
         }
         let function = self.module.get_function("hc_sigmoid_bias_batched")?;
-        let mut out_ptr = out.raw();
-        let mut pre_ptr = pre.raw();
-        let mut scale_ptr = scale.raw();
-        let mut base_ptr = base.raw();
-        let mut n_v = n;
-        let mut args: [*mut c_void; 5] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut pre_ptr as *mut _ as *mut c_void,
-            &mut scale_ptr as *mut _ as *mut c_void,
-            &mut base_ptr as *mut _ as *mut c_void,
-            &mut n_v as *mut _ as *mut c_void,
-        ];
         let block_x = 32u32;
         let grid_x = n.div_ceil(block_x);
         let cfg = LaunchConfig {
@@ -110,7 +84,7 @@ impl HcSigmoidBias {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [out.raw(), pre.raw(), scale.raw(), base.raw(), n])
     }
 }
 
@@ -143,18 +117,6 @@ impl HcWeightedSum {
         n_hc: u32,
     ) -> eyre::Result<()> {
         let function = self.module.get_function("hc_weighted_sum")?;
-        let mut out_ptr = out.raw();
-        let mut x_ptr = x.raw();
-        let mut w_ptr = weights.raw();
-        let mut ne = n_embd;
-        let mut nh = n_hc;
-        let mut args: [*mut c_void; 5] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut ne as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-        ];
         let block_x = 256u32;
         let grid_x = n_embd.div_ceil(block_x);
         let cfg = LaunchConfig {
@@ -162,7 +124,7 @@ impl HcWeightedSum {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [out.raw(), x.raw(), weights.raw(), n_embd, n_hc])
     }
 
     /// M50 Phase 2: batched. x[B, n_hc, n_embd], weights[B, n_hc],
@@ -190,20 +152,6 @@ impl HcWeightedSum {
             return Ok(());
         }
         let function = self.module.get_function("hc_weighted_sum_batched")?;
-        let mut out_ptr = out.raw();
-        let mut x_ptr = x.raw();
-        let mut w_ptr = weights.raw();
-        let mut ne = n_embd;
-        let mut nh = n_hc;
-        let mut ws = w_stride;
-        let mut args: [*mut c_void; 6] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut ne as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut ws as *mut _ as *mut c_void,
-        ];
         let block_x = 256u32;
         let grid_x = n_embd.div_ceil(block_x);
         let cfg = LaunchConfig {
@@ -211,7 +159,9 @@ impl HcWeightedSum {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), x.raw(), weights.raw(), n_embd, n_hc, w_stride
+        ])
     }
 }
 
@@ -275,23 +225,9 @@ impl HcSinkhorn {
                 },
             )
         };
-        let mut out_ptr = out.raw();
-        let mut mix_ptr = mix.raw();
-        let mut sc_ptr = scale.raw();
-        let mut b_ptr = base.raw();
-        let mut nh = n_hc;
-        let mut it = iters;
-        let mut ep = eps;
-        let mut args: [*mut c_void; 7] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut mix_ptr as *mut _ as *mut c_void,
-            &mut sc_ptr as *mut _ as *mut c_void,
-            &mut b_ptr as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut it as *mut _ as *mut c_void,
-            &mut ep as *mut _ as *mut c_void,
-        ];
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), mix.raw(), scale.raw(), base.raw(), n_hc, iters, eps
+        ])
     }
 
     /// M50 Phase 2: batched sinkhorn (n_hc=4 only). Grid (B, 1, 1),
@@ -317,28 +253,14 @@ impl HcSinkhorn {
             return Err(eyre!("sinkhorn batched only supports n_hc=4"));
         }
         let function = self.par.get_function("hc_sinkhorn_par_batched")?;
-        let mut out_ptr = out.raw();
-        let mut mix_ptr = mix.raw();
-        let mut sc_ptr = scale.raw();
-        let mut b_ptr = base.raw();
-        let mut nh = n_hc;
-        let mut it = iters;
-        let mut ep = eps;
-        let mut args: [*mut c_void; 7] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut mix_ptr as *mut _ as *mut c_void,
-            &mut sc_ptr as *mut _ as *mut c_void,
-            &mut b_ptr as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut it as *mut _ as *mut c_void,
-            &mut ep as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (batch, 1, 1),
             block: (16, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), mix.raw(), scale.raw(), base.raw(), n_hc, iters, eps
+        ])
     }
 }
 
@@ -373,22 +295,6 @@ impl HcPost {
         n_hc: u32,
     ) -> eyre::Result<()> {
         let function = self.module.get_function("hc_post")?;
-        let mut o_ptr = out_hc.raw();
-        let mut bo_ptr = block_out.raw();
-        let mut r_ptr = residual_hc.raw();
-        let mut p_ptr = post.raw();
-        let mut c_ptr = comb.raw();
-        let mut ne = n_embd;
-        let mut nh = n_hc;
-        let mut args: [*mut c_void; 7] = [
-            &mut o_ptr as *mut _ as *mut c_void,
-            &mut bo_ptr as *mut _ as *mut c_void,
-            &mut r_ptr as *mut _ as *mut c_void,
-            &mut p_ptr as *mut _ as *mut c_void,
-            &mut c_ptr as *mut _ as *mut c_void,
-            &mut ne as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-        ];
         let block_x = 256u32;
         let grid_x = n_embd.div_ceil(block_x);
         let cfg = LaunchConfig {
@@ -396,7 +302,9 @@ impl HcPost {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out_hc.raw(), block_out.raw(), residual_hc.raw(), post.raw(), comb.raw(), n_embd, n_hc
+        ])
     }
 
     /// M50 Phase 2: batched. out_hc[B, n_hc, n_embd], block_out[B, n_embd],
@@ -419,22 +327,6 @@ impl HcPost {
             return Ok(());
         }
         let function = self.module.get_function("hc_post_batched")?;
-        let mut o_ptr = out_hc.raw();
-        let mut bo_ptr = block_out.raw();
-        let mut r_ptr = residual_hc.raw();
-        let mut p_ptr = post.raw();
-        let mut c_ptr = comb.raw();
-        let mut ne = n_embd;
-        let mut nh = n_hc;
-        let mut args: [*mut c_void; 7] = [
-            &mut o_ptr as *mut _ as *mut c_void,
-            &mut bo_ptr as *mut _ as *mut c_void,
-            &mut r_ptr as *mut _ as *mut c_void,
-            &mut p_ptr as *mut _ as *mut c_void,
-            &mut c_ptr as *mut _ as *mut c_void,
-            &mut ne as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-        ];
         let block_x = 256u32;
         let grid_x = n_embd.div_ceil(block_x);
         let cfg = LaunchConfig {
@@ -442,7 +334,9 @@ impl HcPost {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out_hc.raw(), block_out.raw(), residual_hc.raw(), post.raw(), comb.raw(), n_embd, n_hc
+        ])
     }
 
     /// M50 Phase 2: batched from_split. Per-batch split layout:
@@ -466,22 +360,6 @@ impl HcPost {
             return Ok(());
         }
         let function = self.module.get_function("hc_post_from_split_batched")?;
-        let mut o_ptr = out_hc.raw();
-        let mut bo_ptr = block_out.raw();
-        let mut r_ptr = residual_hc.raw();
-        let mut s_ptr = split.raw();
-        let mut nw = n_w;
-        let mut ne = n_embd;
-        let mut nh = n_hc;
-        let mut args: [*mut c_void; 7] = [
-            &mut o_ptr as *mut _ as *mut c_void,
-            &mut bo_ptr as *mut _ as *mut c_void,
-            &mut r_ptr as *mut _ as *mut c_void,
-            &mut s_ptr as *mut _ as *mut c_void,
-            &mut nw as *mut _ as *mut c_void,
-            &mut ne as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-        ];
         let block_x = 256u32;
         let grid_x = n_embd.div_ceil(block_x);
         let cfg = LaunchConfig {
@@ -489,7 +367,9 @@ impl HcPost {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out_hc.raw(), block_out.raw(), residual_hc.raw(), split.raw(), n_w, n_embd, n_hc
+        ])
     }
 
     /// Launch reading `post` and `comb` directly from a packed `split`
@@ -509,28 +389,14 @@ impl HcPost {
         n_hc: u32,
     ) -> eyre::Result<()> {
         let function = self.module.get_function("hc_post")?;
-        let mut o_ptr = out_hc.raw();
-        let mut bo_ptr = block_out.raw();
-        let mut r_ptr = residual_hc.raw();
         // SAFETY: caller must ensure split has length >= n_w + n_hc + n_hc*n_hc.
         let split_base = split.raw() as *mut u8;
         let post_offset_bytes = (n_w as usize) * 4;
         let comb_offset_bytes = ((n_w + n_hc) as usize) * 4;
-        let mut p_ptr =
+        let p_ptr =
             unsafe { split_base.add(post_offset_bytes) } as v4flash_hip::sys::hipDeviceptr_t;
-        let mut c_ptr =
+        let c_ptr =
             unsafe { split_base.add(comb_offset_bytes) } as v4flash_hip::sys::hipDeviceptr_t;
-        let mut ne = n_embd;
-        let mut nh = n_hc;
-        let mut args: [*mut c_void; 7] = [
-            &mut o_ptr as *mut _ as *mut c_void,
-            &mut bo_ptr as *mut _ as *mut c_void,
-            &mut r_ptr as *mut _ as *mut c_void,
-            &mut p_ptr as *mut _ as *mut c_void,
-            &mut c_ptr as *mut _ as *mut c_void,
-            &mut ne as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-        ];
         let block_x = 256u32;
         let grid_x = n_embd.div_ceil(block_x);
         let cfg = LaunchConfig {
@@ -538,6 +404,8 @@ impl HcPost {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out_hc.raw(), block_out.raw(), residual_hc.raw(), p_ptr, c_ptr, n_embd, n_hc
+        ])
     }
 }

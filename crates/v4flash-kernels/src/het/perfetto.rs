@@ -297,13 +297,23 @@ impl DeviceTimingExporter {
         end_event: &Event,
     ) -> eyre::Result<()> {
         let start_ns = track.anchor.ns_for(start_event)?;
-        let end_ns = track.anchor.ns_for(end_event)?;
-        if end_ns < start_ns {
-            return Err(eyre!(
-                "perfetto emit_slice: end_ns {} < start_ns {} for {}",
-                end_ns, start_ns, name
-            ));
-        }
+        let raw_end_ns = track.anchor.ns_for(end_event)?;
+        // Cross-stream / cross-device event timing can drift by tens to
+        // low hundreds of ns. Clamp small inversions to a 1-ns slice so a
+        // long trace doesn't abort on noise; >1µs inversion still errors
+        // because that signals real corruption (event reuse, etc).
+        let end_ns = if raw_end_ns < start_ns {
+            let delta = start_ns - raw_end_ns;
+            if delta > 1_000 {
+                return Err(eyre!(
+                    "perfetto emit_slice: end_ns {} < start_ns {} (Δ={}ns) for {}",
+                    raw_end_ns, start_ns, delta, name
+                ));
+            }
+            start_ns + 1
+        } else {
+            raw_end_ns
+        };
         let begin = encode_track_event(TYPE_SLICE_BEGIN, Some(name), track.uuid);
         let end = encode_track_event(TYPE_SLICE_END, None, track.uuid);
         let begin_pkt = encode_packet_event(start_ns, &begin, self.seq_id);

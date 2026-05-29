@@ -6,10 +6,8 @@
 //! still uses host code because it indexes into `tid2eid` with the
 //! per-token id, which is host-side anyway.
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{sys, DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, sys, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const ROUTER_TOPK_GFX1201: &[u8] = include_bytes!(env!("KERNEL_ROUTER_TOPK_GFX1201"));
 const ROUTER_TOPK_GFX1151: &[u8] = include_bytes!(env!("KERNEL_ROUTER_TOPK_GFX1151"));
@@ -111,32 +109,18 @@ impl RouterTopk {
             .module
             .get_function("router_topk_par")
             .or_else(|_| self.module.get_function("router_topk"))?;
-        let mut sel_ptr = selected.raw();
-        let mut w_ptr = weights.raw();
-        let mut l_ptr = logits.raw();
-        let mut b_ptr: sys::hipDeviceptr_t = match bias {
+        let b_ptr: sys::hipDeviceptr_t = match bias {
             Some(b) => b.raw(),
             None => std::ptr::null_mut(),
         };
-        let mut ne = n_expert;
-        let mut nu = n_used;
-        let mut scale = expert_weight_scale;
-        let mut eps = weight_eps;
-        let mut args: [*mut c_void; 8] = [
-            &mut sel_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut l_ptr as *mut _ as *mut c_void,
-            &mut b_ptr as *mut _ as *mut c_void,
-            &mut ne as *mut _ as *mut c_void,
-            &mut nu as *mut _ as *mut c_void,
-            &mut scale as *mut _ as *mut c_void,
-            &mut eps as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (1, 1, 1),
             block: (n_expert, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            selected.raw(), weights.raw(), logits.raw(), b_ptr,
+            n_expert, n_used, expert_weight_scale, weight_eps
+        ])
     }
 }

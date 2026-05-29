@@ -12,10 +12,8 @@
 //!    pathological case but `B` is sufficient for V4-Flash where each
 //!    of n_used slots picks a distinct expert).
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const MOE_GROUP_BUILDER_GFX1201: &[u8] = include_bytes!(env!("KERNEL_MOE_GROUP_BUILDER_GFX1201"));
 const MOE_GROUP_BUILDER_GFX1151: &[u8] = include_bytes!(env!("KERNEL_MOE_GROUP_BUILDER_GFX1151"));
@@ -69,20 +67,6 @@ impl MoeGroupBuilder {
         let function = self
             .work_items_module
             .get_function("moe_work_items_builder")?;
-        let mut wi_ptr = work_items.raw();
-        let mut nwi_ptr = n_work_items.raw();
-        let mut gc_ptr = group_count.raw();
-        let mut ne = n_expert;
-        let mut cs = chunk_size;
-        let mut mi = max_items;
-        let mut args: [*mut c_void; 6] = [
-            &mut wi_ptr as *mut _ as *mut c_void,
-            &mut nwi_ptr as *mut _ as *mut c_void,
-            &mut gc_ptr as *mut _ as *mut c_void,
-            &mut ne as *mut _ as *mut c_void,
-            &mut cs as *mut _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-        ];
         let block_x = 256u32;
         let grid_x = n_expert.div_ceil(block_x);
         let cfg = LaunchConfig {
@@ -90,7 +74,9 @@ impl MoeGroupBuilder {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            work_items.raw(), n_work_items.raw(), group_count.raw(), n_expert, chunk_size, max_items
+        ])
     }
 
     /// M50 hybrid dispatch: split-builder variant. Emits work items into two
@@ -121,26 +107,6 @@ impl MoeGroupBuilder {
         let function = self
             .work_items_module
             .get_function("moe_work_items_builder_split")?;
-        let mut swi_ptr = staged_work_items.raw();
-        let mut cwi_ptr = chunked_work_items.raw();
-        let mut ns_ptr = n_staged.raw();
-        let mut nc_ptr = n_chunked.raw();
-        let mut gc_ptr = group_count.raw();
-        let mut ne = n_expert;
-        let mut cs = chunk_size;
-        let mut th = threshold;
-        let mut mi = max_items;
-        let mut args: [*mut c_void; 9] = [
-            &mut swi_ptr as *mut _ as *mut c_void,
-            &mut cwi_ptr as *mut _ as *mut c_void,
-            &mut ns_ptr as *mut _ as *mut c_void,
-            &mut nc_ptr as *mut _ as *mut c_void,
-            &mut gc_ptr as *mut _ as *mut c_void,
-            &mut ne as *mut _ as *mut c_void,
-            &mut cs as *mut _ as *mut c_void,
-            &mut th as *mut _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-        ];
         if n_expert > 1024 {
             return Err(eyre!(
                 "moe_work_items_builder_split: n_expert={n_expert} exceeds 1024 (in-block prefix sum limit)"
@@ -151,7 +117,10 @@ impl MoeGroupBuilder {
             block: (n_expert, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            staged_work_items.raw(), chunked_work_items.raw(), n_staged.raw(), n_chunked.raw(),
+            group_count.raw(), n_expert, chunk_size, threshold, max_items
+        ])
     }
 
     /// Build per-expert (token, slot) groups from `d_selected[B, n_used]`.
@@ -182,22 +151,6 @@ impl MoeGroupBuilder {
             return Err(eyre!("d_selected too small"));
         }
         let function = self.module.get_function("moe_group_builder")?;
-        let mut gc_ptr = group_count.raw();
-        let mut em_ptr = expert_members.raw();
-        let mut ds_ptr = d_selected.raw();
-        let mut b = batch;
-        let mut nu = n_used;
-        let mut ne = n_expert;
-        let mut mpe = max_per_expert;
-        let mut args: [*mut c_void; 7] = [
-            &mut gc_ptr as *mut _ as *mut c_void,
-            &mut em_ptr as *mut _ as *mut c_void,
-            &mut ds_ptr as *mut _ as *mut c_void,
-            &mut b as *mut _ as *mut c_void,
-            &mut nu as *mut _ as *mut c_void,
-            &mut ne as *mut _ as *mut c_void,
-            &mut mpe as *mut _ as *mut c_void,
-        ];
         // 384 threads = B=64 * n_used=6; round up to 512 to give some headroom.
         let block_x = 512u32;
         let grid_x = total.div_ceil(block_x);
@@ -206,6 +159,9 @@ impl MoeGroupBuilder {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            group_count.raw(), expert_members.raw(), d_selected.raw(),
+            batch, n_used, n_expert, max_per_expert
+        ])
     }
 }

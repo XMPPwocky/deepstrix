@@ -1,3 +1,7 @@
+#![cfg(any())]
+// Commented out 2026-05-27 — depends on retired forward_pair_interleaved / spec_decode.
+// Re-enable along with `pub mod forward_pair_interleaved;` and `pub mod spec_decode;` in het/mod.rs.
+
 //! M40-P6.3: bench `spec_decode_step` end-to-end. Loops N rounds of
 //! (forward_token, mtp_draft, forward_pair_interleaved) and reports
 //! median wall + effective tok/s at the actual acceptance rate.

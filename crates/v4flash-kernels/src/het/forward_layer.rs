@@ -469,9 +469,9 @@ impl HeterogeneousEngine {
         // ============================================================
         // dGPU: Attention compute
         // ============================================================
-        let _t_attn = de.events.stage("dgpu.attn_compute", &de.compute)?;
-        let _s_attn = debug_span!("attn_compute").entered();
         if ratio == 0 {
+            let _t_attn = de.events.stage("dgpu.attn_compute", &de.compute)?;
+            let _s_attn = debug_span!("attn_compute").entered();
             de.attn_swa.launch(
                 &de.compute,
                 &mut dgpu_scratch.heads,
@@ -482,26 +482,44 @@ impl HeterogeneousEngine {
                 N_HEAD_DIM,
                 ls.n_raw,
             )?;
+            drop(_s_attn);
+            _t_attn.end()?;
         } else {
             let cs = ls.compressor.as_ref();
             let n_comp = cs.map(|c| c.n_comp).unwrap_or(0);
             let comp_kv_buf = if n_comp > 0 { cs.map(|c| &c.comp_kv) } else { None };
-            de.attn_mixed.launch(
-                &de.compute,
-                &mut dgpu_scratch.heads,
-                &dgpu_scratch.q_normed,
-                &ls.kv_cache,
-                comp_kv_buf,
-                None,
-                &dlw.attn_sinks,
-                N_HEAD,
-                N_HEAD_DIM,
-                ls.n_raw,
-                n_comp,
-            )?;
+            {
+                let _t = de.events.stage("dgpu.attn_score", &de.compute)?;
+                let _s = debug_span!("attn_score").entered();
+                de.attn_mixed.launch_score(
+                    &de.compute,
+                    &mut dgpu_scratch.attn_scores,
+                    &dgpu_scratch.q_normed,
+                    &ls.kv_cache,
+                    comp_kv_buf,
+                    N_HEAD,
+                    N_HEAD_DIM,
+                    ls.n_raw,
+                    n_comp,
+                )?;
+            }
+            {
+                let _t = de.events.stage("dgpu.attn_smwsum", &de.compute)?;
+                let _s = debug_span!("attn_smwsum").entered();
+                de.attn_mixed.launch_softmax_wsum(
+                    &de.compute,
+                    &mut dgpu_scratch.heads,
+                    &mut dgpu_scratch.attn_scores,
+                    &dlw.attn_sinks,
+                    &ls.kv_cache,
+                    comp_kv_buf,
+                    N_HEAD,
+                    N_HEAD_DIM,
+                    ls.n_raw,
+                    n_comp,
+                )?;
+            }
         }
-        drop(_s_attn);
-        _t_attn.end()?;
 
         // ============================================================
         // dGPU: Output projection
@@ -957,7 +975,15 @@ impl HeterogeneousEngine {
             de.compute.wait_event(&sev.moe_arrived)?;
             _t_wait.end()?;
         }
-        let _t_combine = de.events.stage("dgpu.ffn_combine", &de.compute)?;
+        // Non-last layers launch the M30 fused graph (this layer's
+        // ffn_combine + next layer's mhc_pre_attn), so the span covers
+        // both — name it accordingly. The last layer is a pure combine.
+        let combine_label = if is_last_layer {
+            "dgpu.ffn_combine"
+        } else {
+            "dgpu.ffn_combine+next_pre_attn"
+        };
+        let _t_combine = de.events.stage(combine_label, &de.compute)?;
         let _s_combine = debug_span!("ffn_combine").entered();
         if is_last_layer {
             // M15.1: capture (vec_add → hc_post writing residual_next).

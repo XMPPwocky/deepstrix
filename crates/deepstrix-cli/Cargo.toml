@@ -1,0 +1,17 @@
+[package]
+name = "deepstrix-cli"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+v4flash-core = { path = "../v4flash-core" }
+v4flash-hip = { path = "../v4flash-hip" }
+v4flash-kernels = { path = "../v4flash-kernels" }
+color-eyre = { workspace = true }
+
+[[bin]]
+name = "deepstrix-chat"
+path = "src/bin/chat.rs"

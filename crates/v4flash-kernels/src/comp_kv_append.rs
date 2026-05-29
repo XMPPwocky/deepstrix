@@ -1,10 +1,8 @@
 //! Append one compressor row into the per-layer `comp_kv` cache
 //! (M13.5). Sibling of `kv_cache_append` but without SWA eviction.
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const COMP_KV_APPEND_GFX1201: &[u8] = include_bytes!(env!("KERNEL_COMP_KV_APPEND_GFX1201"));
 const COMP_KV_APPEND_GFX1151: &[u8] = include_bytes!(env!("KERNEL_COMP_KV_APPEND_GFX1151"));
@@ -56,21 +54,11 @@ impl CompKvAppend {
         }
 
         let function = self.module.get_function("comp_kv_append")?;
-        let mut ck_ptr = comp_kv.raw();
-        let mut row_ptr = row.raw();
-        let mut nc = n_comp;
-        let mut hd = head_dim;
-        let mut args: [*mut c_void; 4] = [
-            &mut ck_ptr as *mut _ as *mut c_void,
-            &mut row_ptr as *mut _ as *mut c_void,
-            &mut nc as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (1, 1, 1),
             block: (head_dim, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [comp_kv.raw(), row.raw(), n_comp, head_dim])
     }
 }

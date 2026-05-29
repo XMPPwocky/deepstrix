@@ -12,10 +12,8 @@
 //! Early return: if `n_comp <= top_k`, ds4 returns all-permit without
 //! computing q/weights/scores. Our pipeline mirrors that.
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const INDEXER_SCORE_GFX1201: &[u8] = include_bytes!(env!("KERNEL_INDEXER_SCORE_GFX1201"));
 const INDEXER_SCORE_GFX1151: &[u8] = include_bytes!(env!("KERNEL_INDEXER_SCORE_GFX1151"));
@@ -59,29 +57,14 @@ impl IndexerScore {
             return Err(eyre!("indexer_score: n_comp must be > 0"));
         }
         let function = self.module.get_function("indexer_score")?;
-
-        let mut scores_ptr = scores.raw();
-        let mut q_ptr = q.raw();
-        let mut hw_ptr = head_weights.raw();
-        let mut kv_ptr = index_comp_kv.raw();
-        let mut n_comp_v = n_comp;
-        let mut n_head_v = n_head;
-        let mut head_dim_v = head_dim;
-        let mut args: [*mut c_void; 7] = [
-            &mut scores_ptr as *mut _ as *mut c_void,
-            &mut q_ptr as *mut _ as *mut c_void,
-            &mut hw_ptr as *mut _ as *mut c_void,
-            &mut kv_ptr as *mut _ as *mut c_void,
-            &mut n_comp_v as *mut _ as *mut c_void,
-            &mut n_head_v as *mut _ as *mut c_void,
-            &mut head_dim_v as *mut _ as *mut c_void,
-        ];
-
         let cfg = LaunchConfig {
             grid: (n_comp, 1, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            scores.raw(), q.raw(), head_weights.raw(), index_comp_kv.raw(),
+            n_comp, n_head, head_dim
+        ])
     }
 }

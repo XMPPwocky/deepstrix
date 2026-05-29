@@ -6,10 +6,8 @@
 //! the softmax with compressed-KV rows + indexer masking — that's M6/M7.
 //! The M5 SWA kernel is the building block both variants share.
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const ATTENTION_SWA_GFX1201: &[u8] = include_bytes!(env!("KERNEL_ATTENTION_SWA_GFX1201"));
 const ATTENTION_SWA_GFX1151: &[u8] = include_bytes!(env!("KERNEL_ATTENTION_SWA_GFX1151"));
@@ -27,9 +25,34 @@ pub const ATTN_SWA_MAX_KV: u32 = 128;
 /// must cover `n_raw + n_comp`. Raw is permanently capped at SWA_WINDOW
 /// (128) by the forward orchestrator's sliding eviction; comp grows
 /// unbounded until cap_comp (set per allocation in `ModelState::alloc`).
-/// 256 covers up to 128 raw + 128 comp = 512 tokens at ratio=4, which is
-/// our practical near-term demo bound.
-pub const ATTN_MIXED_MAX_KEYS: u32 = 256;
+/// 2304 covers up to 128 raw + 2176 comp ≈ 8832 tokens at ratio=4, sized
+/// for chat sessions up to CHAT_KV_MAX=8192. Costs ~16 KiB extra LDS/WG
+/// vs the original 256-cap; one WG per head so occupancy is fine.
+/// Hard cap on `n_raw + n_comp` for the split decode kernels
+/// (`attention_mixed_score`, `attention_mixed_softmax_wsum`). Scratch
+/// lives in `DgpuScratch.attn_scores` (global memory), so this isn't
+/// LDS-bound. 17664 covers 128 raw + 17536 comp ≈ 70K context at ratio=4
+/// (headroom above 64K so a full chunk prefilled on top of a 64K prefix
+/// still fits). Must match `#define ATTN_MIXED_MAX_KEYS` in `kernels/attention_mixed.hip`.
+pub const ATTN_MIXED_MAX_KEYS: u32 = 17664;
+
+/// LDS capacity of the monolithic `attention_mixed_batched` prefill kernel's
+/// `scores`/`weights` arrays. Must match `#define ATTN_PREFILL_LDS_MAX` in
+/// `kernels/attention_mixed.hip`. When a chunk's max `n_raw + n_comp` exceeds
+/// this, prefill dispatches to the batched split kernels (global scratch,
+/// no LDS cap) instead — both for correctness (the LDS arrays overflow past
+/// ~9K tokens) and perf (the monolithic kernel's single-thread softmax +
+/// sequential per-row reduction is the long-context bottleneck).
+pub const ATTN_PREFILL_LDS_MAX: u32 = 2304;
+
+/// Head-group size for `attention_mixed_score_batched_htiled`. Must match
+/// `#define SCORE_HEAD_TILE` in `kernels/attention_mixed.hip`. One WG covers
+/// this many heads, loading the shared KV row once and reusing it across them.
+pub const SCORE_HEAD_TILE: u32 = 8;
+
+/// Head-group size for `attention_mixed_softmax_wsum_batched_htiled`. Must
+/// match `#define SMWSUM_HEAD_TILE` in `kernels/attention_mixed.hip`.
+pub const SMWSUM_HEAD_TILE: u32 = 16;
 
 pub struct AttentionSwa {
     module: Module,
@@ -101,33 +124,14 @@ impl AttentionSwa {
 
         let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
         let function = self.module.get_function("attention_swa")?;
-
-        let mut out_ptr = out.raw();
-        let mut q_ptr = q.raw();
-        let mut kv_ptr = kv.raw();
-        let mut sinks_ptr = sinks.raw();
-        let mut n_head_v = n_head;
-        let mut head_dim_v = head_dim;
-        let mut n_kv_v = n_kv;
-        let mut kq_scale_v = kq_scale;
-
-        let mut args: [*mut c_void; 8] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut q_ptr as *mut _ as *mut c_void,
-            &mut kv_ptr as *mut _ as *mut c_void,
-            &mut sinks_ptr as *mut _ as *mut c_void,
-            &mut n_head_v as *mut _ as *mut c_void,
-            &mut head_dim_v as *mut _ as *mut c_void,
-            &mut n_kv_v as *mut _ as *mut c_void,
-            &mut kq_scale_v as *mut _ as *mut c_void,
-        ];
-
         let cfg = LaunchConfig {
             grid: (n_head, 1, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), q.raw(), kv.raw(), sinks.raw(), n_head, head_dim, n_kv, kq_scale
+        ])
     }
 
     /// M50 Phase 4: per-token causal SWA attention. Grid (n_head, B, 1).
@@ -151,30 +155,14 @@ impl AttentionSwa {
         }
         let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
         let function = self.module.get_function("attention_swa_batched")?;
-        let mut out_ptr = out.raw();
-        let mut q_ptr = q.raw();
-        let mut kv_ptr = kv.raw();
-        let mut sinks_ptr = sinks.raw();
-        let mut nrp_ptr = n_raw_per.raw();
-        let mut nh = n_head;
-        let mut hd = head_dim;
-        let mut sc = kq_scale;
-        let mut args: [*mut c_void; 8] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut q_ptr as *mut _ as *mut c_void,
-            &mut kv_ptr as *mut _ as *mut c_void,
-            &mut sinks_ptr as *mut _ as *mut c_void,
-            &mut nrp_ptr as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut sc as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_head, batch, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), q.raw(), kv.raw(), sinks.raw(), n_raw_per.raw(), n_head, head_dim, kq_scale
+        ])
     }
 }
 
@@ -201,117 +189,6 @@ impl AttentionMixed {
         Ok(Self { module })
     }
 
-    /// Launch the mixed-attention kernel.
-    ///
-    /// - `out`:     `[n_head * head_dim]`
-    /// - `q`:       `[n_head * head_dim]` (post-RoPE)
-    /// - `raw_kv`:  `[n_raw * head_dim]`  (f16-precision values in f32 cells)
-    /// - `comp_kv`: `[n_comp * head_dim]` or `None` when `n_comp == 0`
-    /// - `mask`:    `[n_comp]` i32 (0 = blocked, 1 = permitted) or `None` = all-permit
-    /// - `sinks`:   `[n_head]`
-    /// - `n_raw + n_comp ≤ ATTN_MIXED_MAX_KEYS`
-    pub fn launch(
-        &self,
-        stream: &Stream,
-        out: &mut DeviceBuffer<f32>,
-        q: &DeviceBuffer<f32>,
-        raw_kv: &DeviceBuffer<f32>,
-        comp_kv: Option<&DeviceBuffer<f32>>,
-        mask: Option<&DeviceBuffer<i32>>,
-        sinks: &DeviceBuffer<f32>,
-        n_head: u32,
-        head_dim: u32,
-        n_raw: u32,
-        n_comp: u32,
-    ) -> eyre::Result<()> {
-        if n_raw + n_comp > ATTN_MIXED_MAX_KEYS {
-            return Err(eyre!(
-                "attention_mixed: n_raw+n_comp={} exceeds kernel cap {ATTN_MIXED_MAX_KEYS}",
-                n_raw + n_comp
-            ));
-        }
-        if n_raw == 0 {
-            return Err(eyre!("attention_mixed: n_raw must be > 0"));
-        }
-        if n_comp > 0 && comp_kv.is_none() {
-            return Err(eyre!(
-                "attention_mixed: n_comp={n_comp} but comp_kv is None"
-            ));
-        }
-
-        let needed_out = (n_head as usize) * (head_dim as usize);
-        if out.len() < needed_out || q.len() < needed_out {
-            return Err(eyre!(
-                "attention_mixed: out/q have {}/{} elems, need {}",
-                out.len(),
-                q.len(),
-                needed_out
-            ));
-        }
-        if raw_kv.len() < (n_raw as usize) * (head_dim as usize) {
-            return Err(eyre!(
-                "attention_mixed: raw_kv has {} elems, need n_raw*head_dim={}",
-                raw_kv.len(),
-                (n_raw as usize) * (head_dim as usize)
-            ));
-        }
-        if let Some(ck) = comp_kv {
-            if ck.len() < (n_comp as usize) * (head_dim as usize) {
-                return Err(eyre!(
-                    "attention_mixed: comp_kv has {} elems, need n_comp*head_dim={}",
-                    ck.len(),
-                    (n_comp as usize) * (head_dim as usize)
-                ));
-            }
-        }
-        if let Some(m) = mask {
-            if m.len() < n_comp as usize {
-                return Err(eyre!(
-                    "attention_mixed: mask has {} elems, need n_comp={n_comp}",
-                    m.len()
-                ));
-            }
-        }
-
-        let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
-        let function = self.module.get_function("attention_mixed")?;
-
-        let null_ptr: *mut c_void = std::ptr::null_mut();
-
-        let mut out_ptr = out.raw();
-        let mut q_ptr = q.raw();
-        let mut raw_kv_ptr = raw_kv.raw();
-        let mut comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(null_ptr);
-        let mut mask_ptr = mask.map(|b| b.raw()).unwrap_or(null_ptr);
-        let mut sinks_ptr = sinks.raw();
-        let mut n_head_v = n_head;
-        let mut head_dim_v = head_dim;
-        let mut n_raw_v = n_raw;
-        let mut n_comp_v = n_comp;
-        let mut kq_scale_v = kq_scale;
-
-        let mut args: [*mut c_void; 11] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut q_ptr as *mut _ as *mut c_void,
-            &mut raw_kv_ptr as *mut _ as *mut c_void,
-            &mut comp_kv_ptr as *mut _ as *mut c_void,
-            &mut mask_ptr as *mut _ as *mut c_void,
-            &mut sinks_ptr as *mut _ as *mut c_void,
-            &mut n_head_v as *mut _ as *mut c_void,
-            &mut head_dim_v as *mut _ as *mut c_void,
-            &mut n_raw_v as *mut _ as *mut c_void,
-            &mut n_comp_v as *mut _ as *mut c_void,
-            &mut kq_scale_v as *mut _ as *mut c_void,
-        ];
-
-        let cfg = LaunchConfig {
-            grid: (n_head, 1, 1),
-            block: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
-    }
-
     /// M50 Phase 4: per-token causal mixed attention. Grid (n_head, B, 1).
     /// `n_raw_per[B]` and `n_comp_per[B]` give each token's per-cache
     /// causal prefixes over the SHARED raw_kv and comp_kv buffers.
@@ -335,36 +212,257 @@ impl AttentionMixed {
         }
         let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
         let function = self.module.get_function("attention_mixed_batched")?;
-        let mut out_ptr = out.raw();
-        let mut q_ptr = q.raw();
-        let mut raw_ptr = raw_kv.raw();
-        let mut comp_ptr: v4flash_hip::sys::hipDeviceptr_t = match comp_kv {
+        let comp_ptr: v4flash_hip::sys::hipDeviceptr_t = match comp_kv {
             Some(c) => c.raw(),
             None => std::ptr::null_mut(),
         };
-        let mut sinks_ptr = sinks.raw();
-        let mut nrp_ptr = n_raw_per.raw();
-        let mut ncp_ptr = n_comp_per.raw();
-        let mut nh = n_head;
-        let mut hd = head_dim;
-        let mut sc = kq_scale;
-        let mut args: [*mut c_void; 10] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut q_ptr as *mut _ as *mut c_void,
-            &mut raw_ptr as *mut _ as *mut c_void,
-            &mut comp_ptr as *mut _ as *mut c_void,
-            &mut sinks_ptr as *mut _ as *mut c_void,
-            &mut nrp_ptr as *mut _ as *mut c_void,
-            &mut ncp_ptr as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut sc as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_head, batch, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), q.raw(), raw_kv.raw(), comp_ptr, sinks.raw(),
+            n_raw_per.raw(), n_comp_per.raw(), n_head, head_dim, kq_scale
+        ])
+    }
+
+    /// Split-kernel decode (perf diagnosis): phase 1 (dot-product scores).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_score(
+        &self,
+        stream: &Stream,
+        scores: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<f32>,
+        comp_kv: Option<&DeviceBuffer<f32>>,
+        n_head: u32,
+        head_dim: u32,
+        n_raw: u32,
+        n_comp: u32,
+    ) -> eyre::Result<()> {
+        if n_raw + n_comp > ATTN_MIXED_MAX_KEYS {
+            return Err(eyre!(
+                "attention_mixed_score: n_raw+n_comp={} exceeds cap {ATTN_MIXED_MAX_KEYS}",
+                n_raw + n_comp
+            ));
+        }
+        let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
+        let function = self.module.get_function("attention_mixed_score")?;
+        let comp_kv_ptr = comp_kv
+            .map(|b| b.raw())
+            .unwrap_or(std::ptr::null_mut());
+        // WG handles ROWS_PER_WG rows: grid (n_head, ceil(n_total/ROWS)).
+        // ROWS_PER_WG must match the #define in kernels/attention_mixed.hip.
+        const ROWS_PER_WG: u32 = 1;
+        let n_total = n_raw + n_comp;
+        let grid_y = (n_total + ROWS_PER_WG - 1) / ROWS_PER_WG;
+        let cfg = LaunchConfig {
+            grid: (n_head, grid_y, 1),
+            block: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            scores.raw(), q.raw(), raw_kv.raw(), comp_kv_ptr,
+            n_head, head_dim, n_raw, n_comp, ATTN_MIXED_MAX_KEYS, kq_scale
+        ])
+    }
+
+    /// Merged softmax + weighted sum (phases 2-4). Reads scores from
+    /// global, does softmax in place via wave 0 + warp-shuffle reductions,
+    /// then all 256 threads do the weighted sum reading weights from the
+    /// same global buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_softmax_wsum(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        scores: &mut DeviceBuffer<f32>,
+        sinks: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<f32>,
+        comp_kv: Option<&DeviceBuffer<f32>>,
+        n_head: u32,
+        head_dim: u32,
+        n_raw: u32,
+        n_comp: u32,
+    ) -> eyre::Result<()> {
+        let function = self.module.get_function("attention_mixed_softmax_wsum")?;
+        let comp_kv_ptr = comp_kv
+            .map(|b| b.raw())
+            .unwrap_or(std::ptr::null_mut());
+        // block=512 = 16 waves/WG → 4 waves/SIMD on a 64-CU dGPU. More
+        // waves give more concurrent in-flight loads to hide L2 latency.
+        // Softmax uses only wave 0; other waves idle during phase B.
+        let cfg = LaunchConfig { grid: (n_head, 1, 1), block: (512, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), scores.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
+            n_head, head_dim, n_raw, n_comp, ATTN_MIXED_MAX_KEYS
+        ])
+    }
+
+    /// Batched split-kernel PREFILL — phase 1 (scores). Each token `b` uses
+    /// its own causal prefix `n_raw_per[b]`/`n_comp_per[b]` over the shared
+    /// raw_kv/comp_kv. `scores_g` is `[batch, n_head, max_keys]` global.
+    /// `n_total_max` = max over the chunk of `n_raw+n_comp` (grid.x extent).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_score_batched(
+        &self,
+        stream: &Stream,
+        scores_g: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<f32>,
+        comp_kv: Option<&DeviceBuffer<f32>>,
+        n_raw_per: &DeviceBuffer<i32>,
+        n_comp_per: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        n_total_max: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_total_max == 0 {
+            return Ok(());
+        }
+        if n_total_max > ATTN_MIXED_MAX_KEYS {
+            return Err(eyre!(
+                "attention_mixed_score_batched: n_total_max={n_total_max} exceeds cap {ATTN_MIXED_MAX_KEYS}"
+            ));
+        }
+        let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
+        let function = self.module.get_function("attention_mixed_score_batched")?;
+        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
+        // One wave32 per (row, head, token). Rows past a token's causal
+        // prefix early-return; grid.x is sized to the chunk-max prefix.
+        let cfg = LaunchConfig {
+            grid: (n_total_max, n_head, batch),
+            block: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            scores_g.raw(), q.raw(), raw_kv.raw(), comp_kv_ptr,
+            n_raw_per.raw(), n_comp_per.raw(),
+            n_head, head_dim, ATTN_MIXED_MAX_KEYS, kq_scale
+        ])
+    }
+
+    /// Head-tiled variant of [`Self::launch_score_batched`]. Identical
+    /// output; each WG covers `SCORE_HEAD_TILE` heads, loading the shared KV
+    /// row once and reusing it across them. Grid (n_total_max,
+    /// ceil(n_head/SCORE_HEAD_TILE), batch), block 32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_score_batched_htiled(
+        &self,
+        stream: &Stream,
+        scores_g: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<f32>,
+        comp_kv: Option<&DeviceBuffer<f32>>,
+        n_raw_per: &DeviceBuffer<i32>,
+        n_comp_per: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        n_total_max: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_total_max == 0 {
+            return Ok(());
+        }
+        if n_total_max > ATTN_MIXED_MAX_KEYS {
+            return Err(eyre!(
+                "attention_mixed_score_batched_htiled: n_total_max={n_total_max} exceeds cap {ATTN_MIXED_MAX_KEYS}"
+            ));
+        }
+        let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
+        let function = self
+            .module
+            .get_function("attention_mixed_score_batched_htiled")?;
+        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
+        let n_head_groups = n_head.div_ceil(SCORE_HEAD_TILE);
+        let cfg = LaunchConfig {
+            grid: (n_total_max, n_head_groups, batch),
+            block: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            scores_g.raw(), q.raw(), raw_kv.raw(), comp_kv_ptr,
+            n_raw_per.raw(), n_comp_per.raw(),
+            n_head, head_dim, ATTN_MIXED_MAX_KEYS, kq_scale
+        ])
+    }
+
+    /// Batched split-kernel PREFILL — phase 2 (merged softmax + weighted
+    /// sum). Grid (n_head, batch), block 512. Reads/overwrites `scores_g`
+    /// from phase 1, writes `out` `[batch, n_head, head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_softmax_wsum_batched(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        scores_g: &mut DeviceBuffer<f32>,
+        sinks: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<f32>,
+        comp_kv: Option<&DeviceBuffer<f32>>,
+        n_raw_per: &DeviceBuffer<i32>,
+        n_comp_per: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let function = self
+            .module
+            .get_function("attention_mixed_softmax_wsum_batched")?;
+        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
+        let cfg = LaunchConfig {
+            grid: (n_head, batch, 1),
+            block: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
+            n_raw_per.raw(), n_comp_per.raw(),
+            n_head, head_dim, ATTN_MIXED_MAX_KEYS
+        ])
+    }
+
+    /// Head-tiled variant of [`Self::launch_softmax_wsum_batched`]. Identical
+    /// output; each WG covers `SMWSUM_HEAD_TILE` heads — softmax runs one
+    /// wave per head, and the wsum loads each shared V-latent element once
+    /// and reuses it across the head group. Grid
+    /// (ceil(n_head/SMWSUM_HEAD_TILE), batch), block 512.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_softmax_wsum_batched_htiled(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        scores_g: &mut DeviceBuffer<f32>,
+        sinks: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<f32>,
+        comp_kv: Option<&DeviceBuffer<f32>>,
+        n_raw_per: &DeviceBuffer<i32>,
+        n_comp_per: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let function = self
+            .module
+            .get_function("attention_mixed_softmax_wsum_batched_htiled")?;
+        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
+        let n_head_groups = n_head.div_ceil(SMWSUM_HEAD_TILE);
+        let cfg = LaunchConfig {
+            grid: (n_head_groups, batch, 1),
+            block: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
+            n_raw_per.raw(), n_comp_per.raw(),
+            n_head, head_dim, ATTN_MIXED_MAX_KEYS
+        ])
     }
 }

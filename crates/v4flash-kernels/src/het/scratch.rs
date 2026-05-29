@@ -17,9 +17,10 @@ use v4flash_hip::{Device, DeviceBuffer};
 use crate::forward::{
     BLOCKS_GROUPED_OUT, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
     BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED,
-    N_FF_EXP, N_FF_SHARED, N_HC, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LORA_Q, N_VOCAB, OUT_LOW,
-    Q_FLAT,
+    N_FF_EXP, N_FF_SHARED, N_HC, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LORA_Q, N_VOCAB,
+    OUT_LOW, Q_FLAT,
 };
+use crate::attention::ATTN_MIXED_MAX_KEYS;
 use crate::q8_k::BLOCK_Q8_K_BYTES;
 
 /// M40-P4: per-token in-flight scratch for `forward_pair_interleaved`.
@@ -182,6 +183,11 @@ pub struct DgpuScratch {
     pub low_xscale: DeviceBuffer<f32>,
     pub attn_out: DeviceBuffer<f32>,
 
+    // Split-kernel attention scratch: holds scores out of `attn_score`,
+    // then overwritten in place with weights by `attn_softmax_wsum`.
+    // Size [N_HEAD, ATTN_MIXED_MAX_KEYS].
+    pub attn_scores: DeviceBuffer<f32>,
+
     /// (Legacy after M14L.) Was the mailbox for `comp_row` peer-pushed
     /// from the iGPU compressor; now compressor runs locally on dGPU so
     /// this buffer is unused. Kept allocated to avoid touching downstream
@@ -328,6 +334,11 @@ impl DgpuScratch {
             low_xq: DeviceBuffer::new(device_id, OUT_LOW as usize)?,
             low_xscale: DeviceBuffer::new(device_id, BLOCKS_OUT_LOW as usize)?,
             attn_out: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+
+            attn_scores: DeviceBuffer::new(
+                device_id,
+                (N_HEAD as usize) * (ATTN_MIXED_MAX_KEYS as usize),
+            )?,
 
             comp_row_recv: DeviceBuffer::new(device_id, N_HEAD_DIM as usize)?,
             kv_cur: DeviceBuffer::new(device_id, (2 * N_HEAD_DIM) as usize)?,

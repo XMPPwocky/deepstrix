@@ -12,10 +12,8 @@
 //! Q8_0 `[n_embd=4096, n_vocab=129280]`), and (in future milestones) every
 //! Q8_0-format attention projection and shared-expert MLP.
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const Q8_0_MATVEC_GFX1201: &[u8] = include_bytes!(env!("KERNEL_Q8_0_MATVEC_GFX1201"));
 const Q8_0_MATVEC_GFX1151: &[u8] = include_bytes!(env!("KERNEL_Q8_0_MATVEC_GFX1151"));
@@ -79,23 +77,12 @@ impl Q8_0Matvec {
             ));
         }
         let function = self.module.get_function("q8_0_quantize_f32")?;
-
-        let mut xq_ptr = xq.raw();
-        let mut xscale_ptr = xscale.raw();
-        let mut x_ptr = x.raw();
-        let mut blocks_val = blocks;
-        let mut args: [*mut c_void; 4] = [
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut xscale_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut blocks_val as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (blocks, 1, 1),
             block: (32, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [xq.raw(), xscale.raw(), x.raw(), blocks])
     }
 
     /// M50 Phase 2: batched quantize. Equivalent to `quantize_input` over
@@ -126,22 +113,12 @@ impl Q8_0Matvec {
             ));
         }
         let function = self.module.get_function("q8_0_quantize_f32")?;
-        let mut xq_ptr = xq.raw();
-        let mut xscale_ptr = xscale.raw();
-        let mut x_ptr = x.raw();
-        let mut blocks_val = total_blocks;
-        let mut args: [*mut c_void; 4] = [
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut xscale_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut blocks_val as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (total_blocks, 1, 1),
             block: (32, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [xq.raw(), xscale.raw(), x.raw(), total_blocks])
     }
 
     /// `out[i] = sum_b f16_scale_w[i, b] * xscale[b] * dot_i8x32(qs_w[i, b], xq[b])`
@@ -186,23 +163,6 @@ impl Q8_0Matvec {
 
         let function = self.module.get_function("q8_0_gemv_warp8")?;
 
-        let mut out_ptr = out.raw();
-        let mut w_ptr = weight.raw();
-        let mut xq_ptr = xq.raw();
-        let mut xs_ptr = xscale.raw();
-        let mut in_dim = k;
-        let mut out_dim = n_rows;
-        let mut n_blocks = blocks;
-        let mut args: [*mut c_void; 7] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut xs_ptr as *mut _ as *mut c_void,
-            &mut in_dim as *mut _ as *mut c_void,
-            &mut out_dim as *mut _ as *mut c_void,
-            &mut n_blocks as *mut _ as *mut c_void,
-        ];
-
         let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
         let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES; // 8 × 32 = 256
         let cfg = LaunchConfig {
@@ -210,7 +170,7 @@ impl Q8_0Matvec {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [out.raw(), weight.raw(), xq.raw(), xscale.raw(), k, n_rows, blocks])
     }
 
     /// M50 Phase 2: batched GEMV with `grid.z = B`. Same per-row math
@@ -268,23 +228,6 @@ impl Q8_0Matvec {
         }
 
         let function = self.module.get_function("q8_0_gemv_batched_warp8")?;
-        let mut out_ptr = out.raw();
-        let mut w_ptr = weight.raw();
-        let mut xq_ptr = xq.raw();
-        let mut xs_ptr = xscale.raw();
-        let mut in_dim = k;
-        let mut out_dim = n_rows;
-        let mut n_blocks = blocks;
-        let mut args: [*mut c_void; 7] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut xs_ptr as *mut _ as *mut c_void,
-            &mut in_dim as *mut _ as *mut c_void,
-            &mut out_dim as *mut _ as *mut c_void,
-            &mut n_blocks as *mut _ as *mut c_void,
-        ];
-
         let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
         let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES; // 8 × 32 = 256
         let cfg = LaunchConfig {
@@ -292,7 +235,7 @@ impl Q8_0Matvec {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [out.raw(), weight.raw(), xq.raw(), xscale.raw(), k, n_rows, blocks])
     }
 
     /// M40-P4.5: 2-wide pair GEMV. Same as `matvec` but processes TWO input
@@ -350,29 +293,6 @@ impl Q8_0Matvec {
 
         let function = self.module.get_function("q8_0_gemv_pair_warp8")?;
 
-        let mut out_a_ptr = out_a.raw();
-        let mut out_b_ptr = out_b.raw();
-        let mut w_ptr = weight.raw();
-        let mut xq_a_ptr = xq_a.raw();
-        let mut xq_b_ptr = xq_b.raw();
-        let mut xs_a_ptr = xscale_a.raw();
-        let mut xs_b_ptr = xscale_b.raw();
-        let mut in_dim = k;
-        let mut out_dim = n_rows;
-        let mut n_blocks = blocks;
-        let mut args: [*mut c_void; 10] = [
-            &mut out_a_ptr as *mut _ as *mut c_void,
-            &mut out_b_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut xq_a_ptr as *mut _ as *mut c_void,
-            &mut xq_b_ptr as *mut _ as *mut c_void,
-            &mut xs_a_ptr as *mut _ as *mut c_void,
-            &mut xs_b_ptr as *mut _ as *mut c_void,
-            &mut in_dim as *mut _ as *mut c_void,
-            &mut out_dim as *mut _ as *mut c_void,
-            &mut n_blocks as *mut _ as *mut c_void,
-        ];
-
         let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
         let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
         let cfg = LaunchConfig {
@@ -380,7 +300,10 @@ impl Q8_0Matvec {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out_a.raw(), out_b.raw(), weight.raw(), xq_a.raw(), xq_b.raw(),
+            xscale_a.raw(), xscale_b.raw(), k, n_rows, blocks
+        ])
     }
 }
 
@@ -463,25 +386,6 @@ impl Q8_0GroupedMatvec {
 
         let function = self.module.get_function("q8_0_grouped_gemv")?;
 
-        let mut out_ptr = out.raw();
-        let mut w_ptr = weight.raw();
-        let mut xq_ptr = xq.raw();
-        let mut xs_ptr = xscale.raw();
-        let mut group_dim_v = group_dim;
-        let mut rank_v = rank;
-        let mut blocks_per_group_v = blocks_per_group;
-        let mut n_groups_v = n_groups;
-        let mut args: [*mut c_void; 8] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut xs_ptr as *mut _ as *mut c_void,
-            &mut group_dim_v as *mut _ as *mut c_void,
-            &mut rank_v as *mut _ as *mut c_void,
-            &mut blocks_per_group_v as *mut _ as *mut c_void,
-            &mut n_groups_v as *mut _ as *mut c_void,
-        ];
-
         let grid_x = out_dim.div_ceil(GEMV_ROWS_PER_BLOCK);
         let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
         let cfg = LaunchConfig {
@@ -489,7 +393,10 @@ impl Q8_0GroupedMatvec {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), weight.raw(), xq.raw(), xscale.raw(),
+            group_dim, rank, blocks_per_group, n_groups
+        ])
     }
 
     /// M50 Phase 2: batched grouped GEMV with `grid.z = B`. Per-batch
@@ -539,25 +446,6 @@ impl Q8_0GroupedMatvec {
         }
 
         let function = self.module.get_function("q8_0_grouped_gemv_batched")?;
-        let mut out_ptr = out.raw();
-        let mut w_ptr = weight.raw();
-        let mut xq_ptr = xq.raw();
-        let mut xs_ptr = xscale.raw();
-        let mut group_dim_v = group_dim;
-        let mut rank_v = rank;
-        let mut bpg_v = blocks_per_group;
-        let mut n_groups_v = n_groups;
-        let mut args: [*mut c_void; 8] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut xs_ptr as *mut _ as *mut c_void,
-            &mut group_dim_v as *mut _ as *mut c_void,
-            &mut rank_v as *mut _ as *mut c_void,
-            &mut bpg_v as *mut _ as *mut c_void,
-            &mut n_groups_v as *mut _ as *mut c_void,
-        ];
-
         let grid_x = out_dim.div_ceil(GEMV_ROWS_PER_BLOCK);
         let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
         let cfg = LaunchConfig {
@@ -565,7 +453,10 @@ impl Q8_0GroupedMatvec {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), weight.raw(), xq.raw(), xscale.raw(),
+            group_dim, rank, blocks_per_group, n_groups
+        ])
     }
 
     /// M40-P4.5: 2-wide pair variant of grouped GEMV. Same weight, two
@@ -626,31 +517,6 @@ impl Q8_0GroupedMatvec {
 
         let function = self.module.get_function("q8_0_grouped_gemv_pair")?;
 
-        let mut out_a_ptr = out_a.raw();
-        let mut out_b_ptr = out_b.raw();
-        let mut w_ptr = weight.raw();
-        let mut xq_a_ptr = xq_a.raw();
-        let mut xq_b_ptr = xq_b.raw();
-        let mut xs_a_ptr = xscale_a.raw();
-        let mut xs_b_ptr = xscale_b.raw();
-        let mut group_dim_v = group_dim;
-        let mut rank_v = rank;
-        let mut blocks_per_group_v = blocks_per_group;
-        let mut n_groups_v = n_groups;
-        let mut args: [*mut c_void; 11] = [
-            &mut out_a_ptr as *mut _ as *mut c_void,
-            &mut out_b_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut xq_a_ptr as *mut _ as *mut c_void,
-            &mut xq_b_ptr as *mut _ as *mut c_void,
-            &mut xs_a_ptr as *mut _ as *mut c_void,
-            &mut xs_b_ptr as *mut _ as *mut c_void,
-            &mut group_dim_v as *mut _ as *mut c_void,
-            &mut rank_v as *mut _ as *mut c_void,
-            &mut blocks_per_group_v as *mut _ as *mut c_void,
-            &mut n_groups_v as *mut _ as *mut c_void,
-        ];
-
         let grid_x = out_dim.div_ceil(GEMV_ROWS_PER_BLOCK);
         let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
         let cfg = LaunchConfig {
@@ -658,6 +524,10 @@ impl Q8_0GroupedMatvec {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out_a.raw(), out_b.raw(), weight.raw(),
+            xq_a.raw(), xq_b.raw(), xscale_a.raw(), xscale_b.raw(),
+            group_dim, rank, blocks_per_group, n_groups
+        ])
     }
 }

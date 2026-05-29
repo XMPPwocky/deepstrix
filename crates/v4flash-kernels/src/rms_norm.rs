@@ -10,10 +10,8 @@
 //! Threshold from `docs/PHASE2_KERNEL_VALIDATION.md`: tests assert
 //! `max_abs_diff < 1e-4` against the canonical ds4 CPU output.
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const RMS_NORM_GFX1201: &[u8] = include_bytes!(env!("KERNEL_RMS_NORM_GFX1201"));
 const RMS_NORM_GFX1151: &[u8] = include_bytes!(env!("KERNEL_RMS_NORM_GFX1151"));
@@ -76,26 +74,12 @@ impl RmsNorm {
 
         // Kernel signature: (float *out, const float *x, const float *weight,
         //                   unsigned int n, float eps)
-        // HIP kernelParams ABI: array of pointers to each argument's storage.
-        let mut out_ptr = out.raw();
-        let mut x_ptr = x.raw();
-        let mut w_ptr = weight.raw();
-        let mut n_val = n;
-        let mut eps_val = eps;
-        let mut args: [*mut c_void; 5] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-            &mut eps_val as *mut _ as *mut c_void,
-        ];
-
         let cfg = LaunchConfig {
             grid: (1, 1, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [out.raw(), x.raw(), weight.raw(), n, eps])
     }
 
     /// M50 Phase 2: batched rms_norm_weighted. `x[B, n]`, `out[B, n]`,
@@ -128,24 +112,12 @@ impl RmsNorm {
         let function = self
             .module
             .get_function("rms_norm_weighted_batched")?;
-        let mut out_ptr = out.raw();
-        let mut x_ptr = x.raw();
-        let mut w_ptr = weight.raw();
-        let mut n_val = n;
-        let mut eps_val = eps;
-        let mut args: [*mut c_void; 5] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-            &mut eps_val as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (batch, 1, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [out.raw(), x.raw(), weight.raw(), n, eps])
     }
 }
 
@@ -195,23 +167,12 @@ impl RmsNormNoWeight {
 
         let function = self.module.get_function("rms_norm_no_weight")?;
 
-        let mut out_ptr = out.raw();
-        let mut x_ptr = x.raw();
-        let mut n_val = n;
-        let mut eps_val = eps;
-        let mut args: [*mut c_void; 4] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-            &mut eps_val as *mut _ as *mut c_void,
-        ];
-
         let cfg = LaunchConfig {
             grid: (n_rows, 1, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [out.raw(), x.raw(), n, eps])
     }
 
     /// M50 Phase 2: batched rms_norm_no_weight. `x[B, n_rows, n]`,
@@ -237,23 +198,11 @@ impl RmsNormNoWeight {
             ));
         }
         let function = self.module.get_function("rms_norm_no_weight_batched")?;
-        let mut out_ptr = out.raw();
-        let mut x_ptr = x.raw();
-        let mut nr_val = n_rows;
-        let mut n_val = n;
-        let mut eps_val = eps;
-        let mut args: [*mut c_void; 5] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut nr_val as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
-            &mut eps_val as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (batch, n_rows, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [out.raw(), x.raw(), n_rows, n, eps])
     }
 }

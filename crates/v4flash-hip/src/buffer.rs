@@ -294,6 +294,12 @@ impl<T> PinnedBuffer<T> {
             unsafe { sys::hipHostMalloc(&mut raw, bytes, 0) },
             "hipHostMalloc",
         )?;
+        // hipHostMalloc does not zero, so the bytes are uninitialized.
+        // Zero them once here (allocations are rare, off the hot path) so
+        // `as_slice`/`as_mut_slice` can hand out `&[T]` over initialized
+        // memory. PinnedBuffer is only used with plain-data numeric types,
+        // for which the all-zero bit pattern is valid.
+        unsafe { ptr::write_bytes(raw as *mut u8, 0, bytes) };
         Ok(PinnedBuffer {
             raw: raw as *mut T,
             len,
@@ -301,13 +307,16 @@ impl<T> PinnedBuffer<T> {
     }
 
     pub fn as_slice(&self) -> &[T] {
-        // SAFETY: hipHostMalloc returns aligned, initialized-by-zero memory
-        // of `len * size_of::<T>()` bytes (we may be reading uninit memory
-        // for non-zeroable T, so callers must write before reading).
+        // SAFETY: `raw` points at `len * size_of::<T>()` bytes from
+        // hipHostMalloc, zero-initialized in `new`, properly aligned, and
+        // owned for `&self`'s lifetime. Sound for the plain-data types
+        // PinnedBuffer is used with (all-zero is a valid bit pattern).
         unsafe { std::slice::from_raw_parts(self.raw, self.len) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [T] {
+        // SAFETY: same invariants as `as_slice`; `&mut self` guarantees
+        // exclusive access for the returned slice's lifetime.
         unsafe { std::slice::from_raw_parts_mut(self.raw, self.len) }
     }
 

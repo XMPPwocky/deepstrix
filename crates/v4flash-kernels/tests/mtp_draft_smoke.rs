@@ -1,3 +1,7 @@
+#![cfg(any())]
+// Commented out 2026-05-27 — depends on retired forward_pair_interleaved / spec_decode.
+// Re-enable along with `pub mod forward_pair_interleaved;` and `pub mod spec_decode;` in het/mod.rs.
+
 //! M40-P2.3 smoke + P2.5 mini-bench: run `forward_mtp_draft` end-to-end.
 //! Confirms the 6-stage MTP pipeline executes without crashing and
 //! produces logits. Measures wall time per draft to inform whether to

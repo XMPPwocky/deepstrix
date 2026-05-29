@@ -11,11 +11,10 @@
 //! (`DS4_ROPE_ORIG_CTX = 65536` when compressed, 0 otherwise) and is set by
 //! the caller; in practice it's only consulted when `ext_factor != 0`.
 
-use std::ffi::c_void;
 use std::f32::consts::PI;
 
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const ROPE_TAIL_GFX1201: &[u8] = include_bytes!(env!("KERNEL_ROPE_TAIL_GFX1201"));
 const ROPE_TAIL_GFX1151: &[u8] = include_bytes!(env!("KERNEL_ROPE_TAIL_GFX1151"));
@@ -168,38 +167,17 @@ impl RopeTail {
             (0.0, 0.0)
         };
         let function = self.module.get_function("rope_tail_batched")?;
-        let mut x_ptr = x.raw();
-        let mut pos_ptr = pos_per_b.raw();
-        let mut n_head_v = n_head;
-        let mut head_dim_v = head_dim;
-        let mut n_rot_v = n_rot;
-        let mut theta_scale_v = theta_scale;
-        let mut freq_scale_v = params.freq_scale;
-        let mut ext_factor_v = params.ext_factor;
-        let mut mscale_eff_v = mscale_eff;
-        let mut corr_low_v = corr_low;
-        let mut corr_high_v = corr_high;
-        let mut inverse_v: i32 = if inverse { 1 } else { 0 };
-        let mut args: [*mut c_void; 12] = [
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut pos_ptr as *mut _ as *mut c_void,
-            &mut n_head_v as *mut _ as *mut c_void,
-            &mut head_dim_v as *mut _ as *mut c_void,
-            &mut n_rot_v as *mut _ as *mut c_void,
-            &mut theta_scale_v as *mut _ as *mut c_void,
-            &mut freq_scale_v as *mut _ as *mut c_void,
-            &mut ext_factor_v as *mut _ as *mut c_void,
-            &mut mscale_eff_v as *mut _ as *mut c_void,
-            &mut corr_low_v as *mut _ as *mut c_void,
-            &mut corr_high_v as *mut _ as *mut c_void,
-            &mut inverse_v as *mut _ as *mut c_void,
-        ];
+        let inverse_i: i32 = if inverse { 1 } else { 0 };
         let cfg = LaunchConfig {
             grid: (n_head, 1, b),
             block: (n_rot / 2, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            x.raw(), pos_per_b.raw(), n_head, head_dim, n_rot,
+            theta_scale, params.freq_scale, params.ext_factor,
+            mscale_eff, corr_low, corr_high, inverse_i
+        ])
     }
 
     fn launch(
@@ -259,40 +237,17 @@ impl RopeTail {
 
         let function = self.module.get_function("rope_tail")?;
 
-        let mut x_ptr = x.raw();
-        let mut n_head_v = n_head;
-        let mut head_dim_v = head_dim;
-        let mut n_rot_v = n_rot;
-        let mut pos_v = pos;
-        let mut theta_scale_v = theta_scale;
-        let mut freq_scale_v = params.freq_scale;
-        let mut ext_factor_v = params.ext_factor;
-        let mut mscale_eff_v = mscale_eff;
-        let mut corr_low_v = corr_low;
-        let mut corr_high_v = corr_high;
-        let mut inverse_v: i32 = if inverse { 1 } else { 0 };
-
-        let mut args: [*mut c_void; 12] = [
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut n_head_v as *mut _ as *mut c_void,
-            &mut head_dim_v as *mut _ as *mut c_void,
-            &mut n_rot_v as *mut _ as *mut c_void,
-            &mut pos_v as *mut _ as *mut c_void,
-            &mut theta_scale_v as *mut _ as *mut c_void,
-            &mut freq_scale_v as *mut _ as *mut c_void,
-            &mut ext_factor_v as *mut _ as *mut c_void,
-            &mut mscale_eff_v as *mut _ as *mut c_void,
-            &mut corr_low_v as *mut _ as *mut c_void,
-            &mut corr_high_v as *mut _ as *mut c_void,
-            &mut inverse_v as *mut _ as *mut c_void,
-        ];
-
+        let inverse_i: i32 = if inverse { 1 } else { 0 };
         let cfg = LaunchConfig {
             grid: (n_head, 1, 1),
             block: (n_rot / 2, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            x.raw(), n_head, head_dim, n_rot, pos,
+            theta_scale, params.freq_scale, params.ext_factor,
+            mscale_eff, corr_low, corr_high, inverse_i
+        ])
     }
 }
 

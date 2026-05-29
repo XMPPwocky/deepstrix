@@ -1,9 +1,7 @@
 //! WMMA throughput probe — see kernels/wmma_probe.hip.
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const WMMA_PROBE_GFX1201: &[u8] = include_bytes!(env!("KERNEL_WMMA_PROBE_GFX1201"));
 const WMMA_PROBE_GFX1151: &[u8] = include_bytes!(env!("KERNEL_WMMA_PROBE_GFX1151"));
@@ -72,22 +70,12 @@ impl WmmaProbe {
         block_threads: u32,
     ) -> eyre::Result<()> {
         let function = self.module.get_function("wmma_iu8_throughput_probe_parallel")?;
-        let mut o_ptr = out.raw();
-        let mut a_ptr = a_in.raw();
-        let mut b_ptr = b_in.raw();
-        let mut ni = n_iters;
-        let mut args: [*mut c_void; 4] = [
-            &mut o_ptr as *mut _ as *mut c_void,
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut b_ptr as *mut _ as *mut c_void,
-            &mut ni as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_blocks, 1, 1),
             block: (block_threads, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [out.raw(), a_in.raw(), b_in.raw(), n_iters])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -103,21 +91,11 @@ impl WmmaProbe {
         block_threads: u32,
     ) -> eyre::Result<()> {
         let function = self.module.get_function(kernel_name)?;
-        let mut o_ptr = out.raw();
-        let mut a_ptr = a_in.raw();
-        let mut b_ptr = b_in.raw();
-        let mut ni = n_iters;
-        let mut args: [*mut c_void; 4] = [
-            &mut o_ptr as *mut _ as *mut c_void,
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut b_ptr as *mut _ as *mut c_void,
-            &mut ni as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_blocks, 1, 1),
             block: (block_threads, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [out.raw(), a_in.raw(), b_in.raw(), n_iters])
     }
 }

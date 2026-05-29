@@ -3,10 +3,8 @@
 //! down matvec). One launch per selected expert; first launch zero-initialises,
 //! subsequent launches add into `out`.
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const Q2_K_ACC_GFX1201: &[u8] = include_bytes!(env!("KERNEL_Q2_K_ACCUMULATE_MATVEC_GFX1201"));
 const Q2_K_ACC_GFX1151: &[u8] = include_bytes!(env!("KERNEL_Q2_K_ACCUMULATE_MATVEC_GFX1151"));
@@ -137,29 +135,19 @@ impl Q2KAccumulateMatvec {
             .module
             .get_function("q2_k_accumulate_matvec_par")
             .or_else(|_| self.module.get_function("q2_k_accumulate_matvec"))?;
-        let mut out_ptr = out.raw();
         // SAFETY: bounds-checked above.
-        let mut w_ptr = unsafe { (w_expert.raw() as *mut u8).add(w_expert_offset) }
+        let w_ptr = unsafe { (w_expert.raw() as *mut u8).add(w_expert_offset) }
             as v4flash_hip::sys::hipDeviceptr_t;
-        let mut x_ptr = unsafe { (xq.raw() as *mut u8).add(xq_offset_bytes) }
+        let x_ptr = unsafe { (xq.raw() as *mut u8).add(xq_offset_bytes) }
             as v4flash_hip::sys::hipDeviceptr_t;
-        let mut nr = n_rows;
-        let mut nb = n_blocks_in;
-        let mut zi: u32 = if zero_init { 1 } else { 0 };
-        let mut args: [*mut c_void; 6] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-            &mut zi as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, 1, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), w_ptr, x_ptr, n_rows, n_blocks_in, if zero_init { 1u32 } else { 0u32 }
+        ])
     }
 }
 
@@ -196,32 +184,15 @@ impl Q2KAccumulateMatvec {
         }
 
         let function = self.module.get_function("q2_k_matvec_par_batched")?;
-        let mut out_ptr = out.raw();
-        let mut w_ptr = w_base.raw();
-        let mut xq_ptr = xq_base.raw();
-        let mut sel_ptr = selected.raw();
-        let mut dbpe_v = dbpe;
-        let mut xq_stride_v = xq_slot_stride;
-        let mut nu = n_used;
-        let mut nr = n_rows;
-        let mut nb = n_blocks_in;
-        let mut args: [*mut c_void; 9] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut sel_ptr as *mut _ as *mut c_void,
-            &mut dbpe_v as *mut _ as *mut c_void,
-            &mut xq_stride_v as *mut _ as *mut c_void,
-            &mut nu as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, 1, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), w_base.raw(), xq_base.raw(), selected.raw(),
+            dbpe, xq_slot_stride, n_used, n_rows, n_blocks_in
+        ])
     }
 
     /// M50 Phase 3 v0: B-batched variant — grid.z = B. Per-batch xq, selected,
@@ -259,32 +230,15 @@ impl Q2KAccumulateMatvec {
         let function = self
             .module
             .get_function("q2_k_matvec_par_batched_BxN")?;
-        let mut out_ptr = out.raw();
-        let mut w_ptr = w_base.raw();
-        let mut xq_ptr = xq_base.raw();
-        let mut sel_ptr = selected.raw();
-        let mut dbpe_v = dbpe;
-        let mut xq_stride_v = xq_slot_stride;
-        let mut nu = n_used;
-        let mut nr = n_rows;
-        let mut nb = n_blocks_in;
-        let mut args: [*mut c_void; 9] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut sel_ptr as *mut _ as *mut c_void,
-            &mut dbpe_v as *mut _ as *mut c_void,
-            &mut xq_stride_v as *mut _ as *mut c_void,
-            &mut nu as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, 1, batch),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), w_base.raw(), xq_base.raw(), selected.raw(),
+            dbpe, xq_slot_stride, n_used, n_rows, n_blocks_in
+        ])
     }
 }
 

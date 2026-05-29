@@ -4,6 +4,7 @@ members = [
     "crates/v4flash-core",
     "crates/v4flash-hip",
     "crates/v4flash-kernels",
+    "crates/deepstrix-cli",
     "crates/phase0",
     "crates/phase1",
 ]

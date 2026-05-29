@@ -2,10 +2,8 @@
 //! sharing one Q8_K-quantized activation. Mirrors ds4
 //! `matvec_iq2_xxs_experts_mid_prequant` inner kernel (ds4.c:3879).
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const IQ2_XXS_PAIR_GFX1201: &[u8] = include_bytes!(env!("KERNEL_IQ2_XXS_PAIR_MATVEC_GFX1201"));
 const IQ2_XXS_PAIR_GFX1151: &[u8] = include_bytes!(env!("KERNEL_IQ2_XXS_PAIR_MATVEC_GFX1151"));
@@ -114,31 +112,22 @@ impl Iq2XxsPairMatvec {
             .module
             .get_function("iq2_xxs_pair_matvec_par")
             .or_else(|_| self.module.get_function("iq2_xxs_pair_matvec"))?;
-        let mut g_ptr = gate.raw();
-        let mut u_ptr = up.raw();
-        // SAFETY: bounds-checked above; pointer math within the allocation.
-        let mut gw_ptr = unsafe { (gate_w.raw() as *mut u8).add(gate_w_offset) }
+        // SAFETY: offsets bounds-checked above; pointer math within the allocation.
+        let gw_ptr = unsafe { (gate_w.raw() as *mut u8).add(gate_w_offset) }
             as v4flash_hip::sys::hipDeviceptr_t;
-        let mut uw_ptr = unsafe { (up_w.raw() as *mut u8).add(up_w_offset) }
+        let uw_ptr = unsafe { (up_w.raw() as *mut u8).add(up_w_offset) }
             as v4flash_hip::sys::hipDeviceptr_t;
-        let mut xq_ptr = xq.raw();
-        let mut nr = n_rows;
-        let mut nb = n_blocks;
-        let mut args: [*mut c_void; 7] = [
-            &mut g_ptr as *mut _ as *mut c_void,
-            &mut u_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut uw_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, 1, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(
+            function,
+            cfg,
+            stream,
+            [gate.raw(), up.raw(), gw_ptr, uw_ptr, xq.raw(), n_rows, n_blocks]
+        )
     }
 
     /// Full-offset variant: also offsets the gate/up output buffers.
@@ -206,32 +195,20 @@ impl Iq2XxsPairMatvec {
             .module
             .get_function("iq2_xxs_pair_matvec_par")
             .or_else(|_| self.module.get_function("iq2_xxs_pair_matvec"))?;
-        let mut g_ptr = unsafe { (gate.raw() as *mut f32).add(gate_offset_elems) }
+        let g_ptr = unsafe { (gate.raw() as *mut f32).add(gate_offset_elems) }
             as v4flash_hip::sys::hipDeviceptr_t;
-        let mut u_ptr = unsafe { (up.raw() as *mut f32).add(up_offset_elems) }
+        let u_ptr = unsafe { (up.raw() as *mut f32).add(up_offset_elems) }
             as v4flash_hip::sys::hipDeviceptr_t;
-        let mut gw_ptr = unsafe { (gate_w.raw() as *mut u8).add(gate_w_offset) }
+        let gw_ptr = unsafe { (gate_w.raw() as *mut u8).add(gate_w_offset) }
             as v4flash_hip::sys::hipDeviceptr_t;
-        let mut uw_ptr = unsafe { (up_w.raw() as *mut u8).add(up_w_offset) }
+        let uw_ptr = unsafe { (up_w.raw() as *mut u8).add(up_w_offset) }
             as v4flash_hip::sys::hipDeviceptr_t;
-        let mut xq_ptr = xq.raw();
-        let mut nr = n_rows;
-        let mut nb = n_blocks;
-        let mut args: [*mut c_void; 7] = [
-            &mut g_ptr as *mut _ as *mut c_void,
-            &mut u_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut uw_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, 1, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [g_ptr, u_ptr, gw_ptr, uw_ptr, xq.raw(), n_rows, n_blocks])
     }
 
     /// Fused variant: iq2_pair matvec → silu_clamp(g) * clamp(u) * expert_w[slot]
@@ -296,34 +273,19 @@ impl Iq2XxsPairMatvec {
         let function = self
             .module
             .get_function("iq2_xxs_pair_matvec_fused_swiglu")?;
-        let mut mid_ptr = mid.raw();
-        let mut gw_ptr = unsafe { (gate_w.raw() as *mut u8).add(gate_w_offset) }
+        let gw_ptr = unsafe { (gate_w.raw() as *mut u8).add(gate_w_offset) }
             as v4flash_hip::sys::hipDeviceptr_t;
-        let mut uw_ptr = unsafe { (up_w.raw() as *mut u8).add(up_w_offset) }
+        let uw_ptr = unsafe { (up_w.raw() as *mut u8).add(up_w_offset) }
             as v4flash_hip::sys::hipDeviceptr_t;
-        let mut xq_ptr = xq.raw();
-        let mut ew_ptr = expert_w.raw();
-        let mut slot_v = slot;
-        let mut clamp_v = clamp;
-        let mut nr = n_rows;
-        let mut nb = n_blocks;
-        let mut args: [*mut c_void; 9] = [
-            &mut mid_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut uw_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut ew_ptr as *mut _ as *mut c_void,
-            &mut slot_v as *mut _ as *mut c_void,
-            &mut clamp_v as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, 1, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gw_ptr, uw_ptr, xq.raw(), expert_w.raw(),
+            slot, clamp, n_rows, n_blocks
+        ])
     }
 
     /// Batched fused variant: single launch handles all `n_used` slots
@@ -378,36 +340,55 @@ impl Iq2XxsPairMatvec {
         let function = self
             .module
             .get_function("iq2_xxs_pair_matvec_fused_swiglu_batch")?;
-        let mut mid_ptr = mid.raw();
-        let mut gw_ptr = gate_w_base.raw();
-        let mut uw_ptr = up_w_base.raw();
-        let mut xq_ptr = xq.raw();
-        let mut ew_ptr = expert_w.raw();
-        let mut sel_ptr = selected.raw();
-        let mut gbpe = gate_bpe;
-        let mut ubpe = up_bpe;
-        let mut clamp_v = clamp;
-        let mut nr = n_rows;
-        let mut nb = n_blocks;
-        let mut args: [*mut c_void; 11] = [
-            &mut mid_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut uw_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut ew_ptr as *mut _ as *mut c_void,
-            &mut sel_ptr as *mut _ as *mut c_void,
-            &mut gbpe as *mut _ as *mut c_void,
-            &mut ubpe as *mut _ as *mut c_void,
-            &mut clamp_v as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, n_used, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(),
+            expert_w.raw(), selected.raw(), gate_bpe, up_bpe, clamp, n_rows, n_blocks
+        ])
+    }
+
+    /// Decode-path variant: block=512 (16 waves/WG) processing 16 rows/WG
+    /// instead of block=256 / 8 rows. Same algorithm, double the waves
+    /// per CU. See attention smwsum case for the precedent — more waves
+    /// per SIMD hides memory + LDS latency better.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_batch_b512(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,
+        expert_w: &DeviceBuffer<f32>,
+        selected: &DeviceBuffer<i32>,
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+    ) -> eyre::Result<()> {
+        if n_rows % 16 != 0 {
+            return Err(eyre!(
+                "iq2_xxs_pair_fused_batch_b512: n_rows={n_rows} must be multiple of 16"
+            ));
+        }
+        let function = self
+            .module
+            .get_function("iq2_xxs_pair_matvec_fused_swiglu_batch_b512")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows / 16, n_used, 1),
+            block: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(),
+            expert_w.raw(), selected.raw(), gate_bpe, up_bpe, clamp, n_rows, n_blocks
+        ])
     }
 
     /// M50 Phase 3 v0: batched variant — grid.z = B. Per-batch xq, selected,
@@ -448,38 +429,16 @@ impl Iq2XxsPairMatvec {
         let function = self
             .module
             .get_function("iq2_xxs_pair_matvec_fused_swiglu_batch_BxN")?;
-        let mut mid_ptr = mid.raw();
-        let mut gw_ptr = gate_w_base.raw();
-        let mut uw_ptr = up_w_base.raw();
-        let mut xq_ptr = xq.raw();
-        let mut ew_ptr = expert_w.raw();
-        let mut sel_ptr = selected.raw();
-        let mut gbpe = gate_bpe;
-        let mut ubpe = up_bpe;
-        let mut nu = n_used;
-        let mut clamp_v = clamp;
-        let mut nr = n_rows;
-        let mut nb = n_blocks;
-        let mut args: [*mut c_void; 12] = [
-            &mut mid_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut uw_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut ew_ptr as *mut _ as *mut c_void,
-            &mut sel_ptr as *mut _ as *mut c_void,
-            &mut gbpe as *mut _ as *mut c_void,
-            &mut ubpe as *mut _ as *mut c_void,
-            &mut nu as *mut _ as *mut c_void,
-            &mut clamp_v as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, n_used, batch),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(),
+            expert_w.raw(), selected.raw(), gate_bpe, up_bpe,
+            n_used, clamp, n_rows, n_blocks
+        ])
     }
 
     /// M50 Phase 7 by-expert iq2 fused-swiglu. Grid (n_rows/8, n_expert, 1).
@@ -516,42 +475,16 @@ impl Iq2XxsPairMatvec {
         let function = self
             .module
             .get_function("iq2_xxs_pair_matvec_fused_swiglu_by_expert")?;
-        let mut mid_ptr = mid.raw();
-        let mut gw_ptr = gate_w_base.raw();
-        let mut uw_ptr = up_w_base.raw();
-        let mut xq_ptr = xq.raw();
-        let mut ew_ptr = expert_w.raw();
-        let mut gc_ptr = group_count.raw();
-        let mut em_ptr = expert_members.raw();
-        let mut gbpe = gate_bpe;
-        let mut ubpe = up_bpe;
-        let mut nu = n_used;
-        let mut mpe = max_per_expert;
-        let mut clamp_v = clamp;
-        let mut nr = n_rows;
-        let mut nb = n_blocks;
-        let mut args: [*mut c_void; 14] = [
-            &mut mid_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut uw_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut ew_ptr as *mut _ as *mut c_void,
-            &mut gc_ptr as *mut _ as *mut c_void,
-            &mut em_ptr as *mut _ as *mut c_void,
-            &mut gbpe as *mut _ as *mut c_void,
-            &mut ubpe as *mut _ as *mut c_void,
-            &mut nu as *mut _ as *mut c_void,
-            &mut mpe as *mut _ as *mut c_void,
-            &mut clamp_v as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, n_expert, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(),
+            expert_w.raw(), group_count.raw(), expert_members.raw(),
+            gate_bpe, up_bpe, n_used, max_per_expert, clamp, n_rows, n_blocks
+        ])
     }
 
     /// M50 Phase 7.2 chunked-static by-expert iq2 dispatch. Solves the
@@ -598,46 +531,16 @@ impl Iq2XxsPairMatvec {
         let function = self
             .module
             .get_function("iq2_xxs_pair_matvec_fused_swiglu_chunked")?;
-        let mut mid_ptr = mid.raw();
-        let mut gw_ptr = gate_w_base.raw();
-        let mut uw_ptr = up_w_base.raw();
-        let mut xq_ptr = xq.raw();
-        let mut ew_ptr = expert_w.raw();
-        let mut gc_ptr = group_count.raw();
-        let mut em_ptr = expert_members.raw();
-        let mut wi_ptr = work_items.raw();
-        let mut gbpe = gate_bpe;
-        let mut ubpe = up_bpe;
-        let mut nu = n_used;
-        let mut mpe = max_per_expert;
-        let mut cs = chunk_size;
-        let mut clamp_v = clamp;
-        let mut nr = n_rows;
-        let mut nb = n_blocks;
-        let mut args: [*mut c_void; 16] = [
-            &mut mid_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut uw_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut ew_ptr as *mut _ as *mut c_void,
-            &mut gc_ptr as *mut _ as *mut c_void,
-            &mut em_ptr as *mut _ as *mut c_void,
-            &mut wi_ptr as *mut _ as *mut c_void,
-            &mut gbpe as *mut _ as *mut c_void,
-            &mut ubpe as *mut _ as *mut c_void,
-            &mut nu as *mut _ as *mut c_void,
-            &mut mpe as *mut _ as *mut c_void,
-            &mut cs as *mut _ as *mut c_void,
-            &mut clamp_v as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, n_work_items, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(),
+            expert_w.raw(), group_count.raw(), expert_members.raw(), work_items.raw(),
+            gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp, n_rows, n_blocks
+        ])
     }
 
     /// Phase 7.4: chunked + inline-sign-math (replaces s_sign_pair LDS lookup
@@ -672,46 +575,16 @@ impl Iq2XxsPairMatvec {
         let function = self
             .module
             .get_function("iq2_xxs_pair_matvec_fused_swiglu_chunked_inline")?;
-        let mut mid_ptr = mid.raw();
-        let mut gw_ptr = gate_w_base.raw();
-        let mut uw_ptr = up_w_base.raw();
-        let mut xq_ptr = xq.raw();
-        let mut ew_ptr = expert_w.raw();
-        let mut gc_ptr = group_count.raw();
-        let mut em_ptr = expert_members.raw();
-        let mut wi_ptr = work_items.raw();
-        let mut gbpe = gate_bpe;
-        let mut ubpe = up_bpe;
-        let mut nu = n_used;
-        let mut mpe = max_per_expert;
-        let mut cs = chunk_size;
-        let mut clamp_v = clamp;
-        let mut nr = n_rows;
-        let mut nb = n_blocks;
-        let mut args: [*mut c_void; 16] = [
-            &mut mid_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut uw_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut ew_ptr as *mut _ as *mut c_void,
-            &mut gc_ptr as *mut _ as *mut c_void,
-            &mut em_ptr as *mut _ as *mut c_void,
-            &mut wi_ptr as *mut _ as *mut c_void,
-            &mut gbpe as *mut _ as *mut c_void,
-            &mut ubpe as *mut _ as *mut c_void,
-            &mut nu as *mut _ as *mut c_void,
-            &mut mpe as *mut _ as *mut c_void,
-            &mut cs as *mut _ as *mut c_void,
-            &mut clamp_v as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, n_work_items, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(),
+            expert_w.raw(), group_count.raw(), expert_members.raw(), work_items.raw(),
+            gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp, n_rows, n_blocks
+        ])
     }
 
     /// Phase 7.3: chunked + per-WG LDS-staged weights. Identical signature
@@ -746,46 +619,16 @@ impl Iq2XxsPairMatvec {
         let function = self
             .module
             .get_function("iq2_xxs_pair_matvec_fused_swiglu_chunked_lds")?;
-        let mut mid_ptr = mid.raw();
-        let mut gw_ptr = gate_w_base.raw();
-        let mut uw_ptr = up_w_base.raw();
-        let mut xq_ptr = xq.raw();
-        let mut ew_ptr = expert_w.raw();
-        let mut gc_ptr = group_count.raw();
-        let mut em_ptr = expert_members.raw();
-        let mut wi_ptr = work_items.raw();
-        let mut gbpe = gate_bpe;
-        let mut ubpe = up_bpe;
-        let mut nu = n_used;
-        let mut mpe = max_per_expert;
-        let mut cs = chunk_size;
-        let mut clamp_v = clamp;
-        let mut nr = n_rows;
-        let mut nb = n_blocks;
-        let mut args: [*mut c_void; 16] = [
-            &mut mid_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut uw_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut ew_ptr as *mut _ as *mut c_void,
-            &mut gc_ptr as *mut _ as *mut c_void,
-            &mut em_ptr as *mut _ as *mut c_void,
-            &mut wi_ptr as *mut _ as *mut c_void,
-            &mut gbpe as *mut _ as *mut c_void,
-            &mut ubpe as *mut _ as *mut c_void,
-            &mut nu as *mut _ as *mut c_void,
-            &mut mpe as *mut _ as *mut c_void,
-            &mut cs as *mut _ as *mut c_void,
-            &mut clamp_v as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, n_work_items, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(),
+            expert_w.raw(), group_count.raw(), expert_members.raw(), work_items.raw(),
+            gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp, n_rows, n_blocks
+        ])
     }
 
     /// Phase 7.5: padded-LDS variant. Pads s_grid and s_sign_pair from
@@ -821,46 +664,16 @@ impl Iq2XxsPairMatvec {
         let function = self
             .module
             .get_function("iq2_xxs_pair_matvec_fused_swiglu_chunked_padded")?;
-        let mut mid_ptr = mid.raw();
-        let mut gw_ptr = gate_w_base.raw();
-        let mut uw_ptr = up_w_base.raw();
-        let mut xq_ptr = xq.raw();
-        let mut ew_ptr = expert_w.raw();
-        let mut gc_ptr = group_count.raw();
-        let mut em_ptr = expert_members.raw();
-        let mut wi_ptr = work_items.raw();
-        let mut gbpe = gate_bpe;
-        let mut ubpe = up_bpe;
-        let mut nu = n_used;
-        let mut mpe = max_per_expert;
-        let mut cs = chunk_size;
-        let mut clamp_v = clamp;
-        let mut nr = n_rows;
-        let mut nb = n_blocks;
-        let mut args: [*mut c_void; 16] = [
-            &mut mid_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut uw_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut ew_ptr as *mut _ as *mut c_void,
-            &mut gc_ptr as *mut _ as *mut c_void,
-            &mut em_ptr as *mut _ as *mut c_void,
-            &mut wi_ptr as *mut _ as *mut c_void,
-            &mut gbpe as *mut _ as *mut c_void,
-            &mut ubpe as *mut _ as *mut c_void,
-            &mut nu as *mut _ as *mut c_void,
-            &mut mpe as *mut _ as *mut c_void,
-            &mut cs as *mut _ as *mut c_void,
-            &mut clamp_v as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, n_work_items, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(),
+            expert_w.raw(), group_count.raw(), expert_members.raw(), work_items.raw(),
+            gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp, n_rows, n_blocks
+        ])
     }
 
     /// Phase 7.5 DIAGNOSTIC: same as chunked but all LDS lookup indices
@@ -894,46 +707,16 @@ impl Iq2XxsPairMatvec {
         let function = self
             .module
             .get_function("iq2_xxs_pair_matvec_fused_swiglu_chunked_zeroidx")?;
-        let mut mid_ptr = mid.raw();
-        let mut gw_ptr = gate_w_base.raw();
-        let mut uw_ptr = up_w_base.raw();
-        let mut xq_ptr = xq.raw();
-        let mut ew_ptr = expert_w.raw();
-        let mut gc_ptr = group_count.raw();
-        let mut em_ptr = expert_members.raw();
-        let mut wi_ptr = work_items.raw();
-        let mut gbpe = gate_bpe;
-        let mut ubpe = up_bpe;
-        let mut nu = n_used;
-        let mut mpe = max_per_expert;
-        let mut cs = chunk_size;
-        let mut clamp_v = clamp;
-        let mut nr = n_rows;
-        let mut nb = n_blocks;
-        let mut args: [*mut c_void; 16] = [
-            &mut mid_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut uw_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut ew_ptr as *mut _ as *mut c_void,
-            &mut gc_ptr as *mut _ as *mut c_void,
-            &mut em_ptr as *mut _ as *mut c_void,
-            &mut wi_ptr as *mut _ as *mut c_void,
-            &mut gbpe as *mut _ as *mut c_void,
-            &mut ubpe as *mut _ as *mut c_void,
-            &mut nu as *mut _ as *mut c_void,
-            &mut mpe as *mut _ as *mut c_void,
-            &mut cs as *mut _ as *mut c_void,
-            &mut clamp_v as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, n_work_items, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(),
+            expert_w.raw(), group_count.raw(), expert_members.raw(), work_items.raw(),
+            gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp, n_rows, n_blocks
+        ])
     }
 
     /// Phase 7.2 diagnostic: chunked kernel with dot-product loop stubbed.
@@ -967,46 +750,16 @@ impl Iq2XxsPairMatvec {
         let function = self
             .module
             .get_function("iq2_xxs_pair_matvec_fused_swiglu_chunked_NODOT")?;
-        let mut mid_ptr = mid.raw();
-        let mut gw_ptr = gate_w_base.raw();
-        let mut uw_ptr = up_w_base.raw();
-        let mut xq_ptr = xq.raw();
-        let mut ew_ptr = expert_w.raw();
-        let mut gc_ptr = group_count.raw();
-        let mut em_ptr = expert_members.raw();
-        let mut wi_ptr = work_items.raw();
-        let mut gbpe = gate_bpe;
-        let mut ubpe = up_bpe;
-        let mut nu = n_used;
-        let mut mpe = max_per_expert;
-        let mut cs = chunk_size;
-        let mut clamp_v = clamp;
-        let mut nr = n_rows;
-        let mut nb = n_blocks;
-        let mut args: [*mut c_void; 16] = [
-            &mut mid_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut uw_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut ew_ptr as *mut _ as *mut c_void,
-            &mut gc_ptr as *mut _ as *mut c_void,
-            &mut em_ptr as *mut _ as *mut c_void,
-            &mut wi_ptr as *mut _ as *mut c_void,
-            &mut gbpe as *mut _ as *mut c_void,
-            &mut ubpe as *mut _ as *mut c_void,
-            &mut nu as *mut _ as *mut c_void,
-            &mut mpe as *mut _ as *mut c_void,
-            &mut cs as *mut _ as *mut c_void,
-            &mut clamp_v as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, n_work_items, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(),
+            expert_w.raw(), group_count.raw(), expert_members.raw(), work_items.raw(),
+            gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp, n_rows, n_blocks
+        ])
     }
 
     /// M50 staged: dequant-amortization variant of chunked. Per super-block,
@@ -1056,45 +809,15 @@ impl Iq2XxsPairMatvec {
         let function = self
             .module
             .get_function("iq2_xxs_pair_matvec_fused_swiglu_chunked_staged")?;
-        let mut mid_ptr = mid.raw();
-        let mut gw_ptr = gate_w_base.raw();
-        let mut uw_ptr = up_w_base.raw();
-        let mut xq_ptr = xq.raw();
-        let mut ew_ptr = expert_w.raw();
-        let mut gc_ptr = group_count.raw();
-        let mut em_ptr = expert_members.raw();
-        let mut wi_ptr = work_items.raw();
-        let mut gbpe = gate_bpe;
-        let mut ubpe = up_bpe;
-        let mut nu = n_used;
-        let mut mpe = max_per_expert;
-        let mut cs = chunk_size;
-        let mut clamp_v = clamp;
-        let mut nr = n_rows;
-        let mut nb = n_blocks;
-        let mut args: [*mut c_void; 16] = [
-            &mut mid_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut uw_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut ew_ptr as *mut _ as *mut c_void,
-            &mut gc_ptr as *mut _ as *mut c_void,
-            &mut em_ptr as *mut _ as *mut c_void,
-            &mut wi_ptr as *mut _ as *mut c_void,
-            &mut gbpe as *mut _ as *mut c_void,
-            &mut ubpe as *mut _ as *mut c_void,
-            &mut nu as *mut _ as *mut c_void,
-            &mut mpe as *mut _ as *mut c_void,
-            &mut cs as *mut _ as *mut c_void,
-            &mut clamp_v as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, n_work_items, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(),
+            expert_w.raw(), group_count.raw(), expert_members.raw(), work_items.raw(),
+            gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp, n_rows, n_blocks
+        ])
     }
 }

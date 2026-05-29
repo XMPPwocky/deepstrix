@@ -10,10 +10,8 @@
 //! Per element: w = d_super * d_sub * q4 - dmin_super * m_sub
 //! (8 sub-blocks of 32 elements each, 6-bit packed (d_sub, m_sub) pairs).
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const Q4_K_MATVEC_PAR_GFX1201: &[u8] =
     include_bytes!(env!("KERNEL_Q4_K_MATVEC_PAR_GFX1201"));
@@ -84,36 +82,15 @@ impl Q4KMatvec {
         let function = self
             .module
             .get_function("q4_k_pair_matvec_fused_swiglu_batch")?;
-        let mut mid_ptr = mid.raw();
-        let mut gw_ptr = gate_w_base.raw();
-        let mut uw_ptr = up_w_base.raw();
-        let mut xq_ptr = xq.raw();
-        let mut ew_ptr = expert_w.raw();
-        let mut sel_ptr = selected.raw();
-        let mut gbpe = gate_bpe;
-        let mut ubpe = up_bpe;
-        let mut clamp_v = clamp;
-        let mut nr = n_rows;
-        let mut nb = n_blocks_in;
-        let mut args: [*mut std::ffi::c_void; 11] = [
-            &mut mid_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut uw_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut ew_ptr as *mut _ as *mut c_void,
-            &mut sel_ptr as *mut _ as *mut c_void,
-            &mut gbpe as *mut _ as *mut c_void,
-            &mut ubpe as *mut _ as *mut c_void,
-            &mut clamp_v as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, n_used, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(), expert_w.raw(),
+            selected.raw(), gate_bpe, up_bpe, clamp, n_rows, n_blocks_in
+        ])
     }
 
     /// Batched MoE matvec. Single launch loops over `n_used` selected
@@ -152,32 +129,15 @@ impl Q4KMatvec {
         }
 
         let function = self.module.get_function("q4_k_matvec_par_batched")?;
-        let mut out_ptr = out.raw();
-        let mut w_ptr = w_base.raw();
-        let mut xq_ptr = xq_base.raw();
-        let mut sel_ptr = selected.raw();
-        let mut dbpe_v = dbpe;
-        let mut xq_stride_v = xq_slot_stride;
-        let mut nu = n_used;
-        let mut nr = n_rows;
-        let mut nb = n_blocks_in;
-        let mut args: [*mut c_void; 9] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            &mut sel_ptr as *mut _ as *mut c_void,
-            &mut dbpe_v as *mut _ as *mut c_void,
-            &mut xq_stride_v as *mut _ as *mut c_void,
-            &mut nu as *mut _ as *mut c_void,
-            &mut nr as *mut _ as *mut c_void,
-            &mut nb as *mut _ as *mut c_void,
-        ];
         let cfg = LaunchConfig {
             grid: (n_rows / 8, 1, 1),
             block: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), w_base.raw(), xq_base.raw(), selected.raw(),
+            dbpe, xq_slot_stride, n_used, n_rows, n_blocks_in
+        ])
     }
 }
 

@@ -142,7 +142,6 @@ impl HetCompressorState {
 
 pub struct HetLayerState {
     pub kv_cache: DeviceBuffer<f32>,
-    pub kv_cache_host: Vec<f32>,
     pub n_raw: u32,
     pub compressor: Option<HetCompressorState>,
     pub indexer_compressor: Option<HetCompressorState>,
@@ -284,16 +283,19 @@ impl HetModelState {
             } else {
                 None
             };
-            // SWA caps the raw KV cache at SWA_WINDOW rows regardless
-            // of total context length.
+            // SWA caps the raw KV cache at SWA_WINDOW rows regardless of
+            // total context length: `n_raw` never exceeds SWA_WINDOW in any
+            // write path (kv_append slides the window in place), so rows
+            // beyond it are never written or read. All 43 layers are
+            // window-local on the raw cache; compressor layers hold long
+            // range in their separate comp_kv. Independent of n_kv_max.
             dgpu_device.set_current()?;
-            let raw_rows = SWA_WINDOW.max(n_kv_max);
+            let raw_rows = SWA_WINDOW;
             layers.push(HetLayerState {
                 kv_cache: DeviceBuffer::new(
                     dgpu_device.id,
                     (raw_rows as usize) * (N_HEAD_DIM as usize),
                 )?,
-                kv_cache_host: vec![0f32; (raw_rows as usize) * (N_HEAD_DIM as usize)],
                 n_raw: 0,
                 compressor,
                 indexer_compressor,
@@ -316,7 +318,9 @@ impl HetModelState {
             return Ok(());
         }
         dgpu_device.set_current()?;
-        let raw_rows = SWA_WINDOW.max(self.n_kv_max);
+        // Raw KV is a SWA_WINDOW-row slide buffer (kv_cache_append only ever
+        // touches slots < swa_window); independent of n_kv_max.
+        let raw_rows = SWA_WINDOW;
         let kv_cache = DeviceBuffer::new(
             dgpu_device.id,
             (raw_rows as usize) * (N_HEAD_DIM as usize),

@@ -16,10 +16,11 @@
 use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer};
 
+use crate::attention::ATTN_MIXED_MAX_KEYS;
 use crate::forward::{
     BLOCKS_GROUPED_OUT, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
     BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED,
-    N_FF_EXP, N_FF_SHARED, N_HEAD_DIM, N_LORA_Q, OUT_LOW, Q_FLAT,
+    N_FF_EXP, N_FF_SHARED, N_HEAD, N_HEAD_DIM, N_LORA_Q, OUT_LOW, Q_FLAT,
 };
 use crate::q8_k::BLOCK_Q8_K_BYTES;
 
@@ -151,6 +152,11 @@ pub struct BatchDgpuScratch {
 
     // ---- Attention output + output projection ----
     pub heads: DeviceBuffer<f32>,
+    /// `[B, n_head, ATTN_MIXED_MAX_KEYS]` — global scores/weights scratch for
+    /// the batched split attention kernels (long-context prefill). Replaces
+    /// the monolithic kernel's LDS `scores[2304]` (which overflows past ~9K
+    /// tokens). ~1.1 GiB at B_MAX=256.
+    pub attn_scores: DeviceBuffer<f32>,
     pub low: DeviceBuffer<f32>,
     pub heads_xq: DeviceBuffer<i8>,
     pub heads_xscale: DeviceBuffer<f32>,
@@ -329,6 +335,7 @@ impl BatchDgpuScratch {
             n_comp_per: mk_i32(1)?,
 
             heads: mk_f32(Q_FLAT as usize)?,
+            attn_scores: mk_f32((N_HEAD * ATTN_MIXED_MAX_KEYS) as usize)?,
             low: mk_f32(OUT_LOW as usize)?,
             heads_xq: mk_i8(Q_FLAT as usize)?,
             heads_xscale: mk_f32(BLOCKS_GROUPED_OUT as usize)?,

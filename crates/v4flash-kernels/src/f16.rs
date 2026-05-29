@@ -3,10 +3,8 @@
 //! in our model). Same launch geometry as `Q8_0Matvec` (8 rows/workgroup,
 //! warp-per-row) without the per-block dequant.
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const F16_MATVEC_GFX1201: &[u8] = include_bytes!(env!("KERNEL_F16_MATVEC_GFX1201"));
 const F16_MATVEC_GFX1151: &[u8] = include_bytes!(env!("KERNEL_F16_MATVEC_GFX1151"));
@@ -100,22 +98,6 @@ impl F16Matvec {
         }
 
         let function = self.pair.get_function("f16_matvec_pair")?;
-        let mut kv_ptr = kv.raw();
-        let mut g_ptr = gate.raw();
-        let mut kvw_ptr = kv_w.raw();
-        let mut gw_ptr = gate_w.raw();
-        let mut x_ptr = x.raw();
-        let mut k_v = k;
-        let mut nr_v = n_rows;
-        let mut args: [*mut c_void; 7] = [
-            &mut kv_ptr as *mut _ as *mut c_void,
-            &mut g_ptr as *mut _ as *mut c_void,
-            &mut kvw_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut k_v as *mut _ as *mut c_void,
-            &mut nr_v as *mut _ as *mut c_void,
-        ];
         let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
         let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
         let cfg = LaunchConfig {
@@ -123,7 +105,9 @@ impl F16Matvec {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            kv.raw(), gate.raw(), kv_w.raw(), gate_w.raw(), x.raw(), k, n_rows
+        ])
     }
 
     /// M50 batched: B independent matvec_pair, sharing the two weight
@@ -149,22 +133,6 @@ impl F16Matvec {
             return Err(eyre!("f16 matvec_pair_batched: k={k} must be even"));
         }
         let function = self.pair.get_function("f16_matvec_pair_batched")?;
-        let mut kv_ptr = kv.raw();
-        let mut g_ptr = gate.raw();
-        let mut kvw_ptr = kv_w.raw();
-        let mut gw_ptr = gate_w.raw();
-        let mut x_ptr = x.raw();
-        let mut k_v = k;
-        let mut nr_v = n_rows;
-        let mut args: [*mut c_void; 7] = [
-            &mut kv_ptr as *mut _ as *mut c_void,
-            &mut g_ptr as *mut _ as *mut c_void,
-            &mut kvw_ptr as *mut _ as *mut c_void,
-            &mut gw_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut k_v as *mut _ as *mut c_void,
-            &mut nr_v as *mut _ as *mut c_void,
-        ];
         let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
         let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
         let cfg = LaunchConfig {
@@ -172,7 +140,9 @@ impl F16Matvec {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            kv.raw(), gate.raw(), kv_w.raw(), gate_w.raw(), x.raw(), k, n_rows
+        ])
     }
 
     /// `out[r] = sum_i f32(weight[r, i]) * x[i]` for `r in 0..n_rows`.
@@ -208,19 +178,6 @@ impl F16Matvec {
             ));
         }
 
-        let mut out_ptr = out.raw();
-        let mut w_ptr = weight.raw();
-        let mut x_ptr = x.raw();
-        let mut k_v = k;
-        let mut n_rows_v = n_rows;
-        let mut args: [*mut c_void; 5] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut k_v as *mut _ as *mut c_void,
-            &mut n_rows_v as *mut _ as *mut c_void,
-        ];
-
         if n_rows < NARROW_ROWS_THRESHOLD {
             let function = self.narrow.get_function("f16_matvec_narrow")?;
             let cfg = LaunchConfig {
@@ -228,7 +185,7 @@ impl F16Matvec {
                 block: (NARROW_BLOCK_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             };
-            unsafe { function.launch_raw(cfg, stream, &mut args) }
+            launch_kernel!(function, cfg, stream, [out.raw(), weight.raw(), x.raw(), k, n_rows])
         } else {
             let function = self.wide.get_function("f16_matvec")?;
             let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
@@ -238,7 +195,7 @@ impl F16Matvec {
                 block: (block_x, 1, 1),
                 shared_mem_bytes: 0,
             };
-            unsafe { function.launch_raw(cfg, stream, &mut args) }
+            launch_kernel!(function, cfg, stream, [out.raw(), weight.raw(), x.raw(), k, n_rows])
         }
     }
 
@@ -275,25 +232,13 @@ impl F16Matvec {
             return Err(eyre!("f16 matvec_narrow_batched out: too small"));
         }
 
-        let mut out_ptr = out.raw();
-        let mut w_ptr = weight.raw();
-        let mut x_ptr = x.raw();
-        let mut k_v = k;
-        let mut n_rows_v = n_rows;
-        let mut args: [*mut c_void; 5] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut k_v as *mut _ as *mut c_void,
-            &mut n_rows_v as *mut _ as *mut c_void,
-        ];
         let function = self.narrow.get_function("f16_matvec_narrow_batched")?;
         let cfg = LaunchConfig {
             grid: (n_rows, 1, batch),
             block: (NARROW_BLOCK_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [out.raw(), weight.raw(), x.raw(), k, n_rows])
     }
 
     /// M40-P4.5: 2-wide pair variant — ONE weight, TWO input vectors → TWO
@@ -337,22 +282,6 @@ impl F16Matvec {
             ));
         }
 
-        let mut out_a_ptr = out_a.raw();
-        let mut out_b_ptr = out_b.raw();
-        let mut w_ptr = weight.raw();
-        let mut x_a_ptr = x_a.raw();
-        let mut x_b_ptr = x_b.raw();
-        let mut k_v = k;
-        let mut n_rows_v = n_rows;
-        let mut args: [*mut c_void; 7] = [
-            &mut out_a_ptr as *mut _ as *mut c_void,
-            &mut out_b_ptr as *mut _ as *mut c_void,
-            &mut w_ptr as *mut _ as *mut c_void,
-            &mut x_a_ptr as *mut _ as *mut c_void,
-            &mut x_b_ptr as *mut _ as *mut c_void,
-            &mut k_v as *mut _ as *mut c_void,
-            &mut n_rows_v as *mut _ as *mut c_void,
-        ];
         // M40-P7: dispatch narrow variant for tiny n_rows (e.g. HC_MIX_DIM=24)
         // — the wide variant launches only 3 WGs and runs at ~1.5% peak BW.
         // Narrow uses 1 WG per row with 256 threads cooperating per row →
@@ -364,7 +293,9 @@ impl F16Matvec {
                 block: (NARROW_BLOCK_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             };
-            unsafe { function.launch_raw(cfg, stream, &mut args) }
+            launch_kernel!(function, cfg, stream, [
+                out_a.raw(), out_b.raw(), weight.raw(), x_a.raw(), x_b.raw(), k, n_rows
+            ])
         } else {
             let function = self.wide.get_function("f16_matvec_two_inputs")?;
             let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
@@ -374,7 +305,9 @@ impl F16Matvec {
                 block: (block_x, 1, 1),
                 shared_mem_bytes: 0,
             };
-            unsafe { function.launch_raw(cfg, stream, &mut args) }
+            launch_kernel!(function, cfg, stream, [
+                out_a.raw(), out_b.raw(), weight.raw(), x_a.raw(), x_b.raw(), k, n_rows
+            ])
         }
     }
 }

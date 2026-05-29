@@ -18,10 +18,10 @@ use std::time::Instant;
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
-use v4flash_kernels::forward::{N_EXPERT, N_EXPERT_USED, N_LAYER};
+use v4flash_kernels::forward::{COMPRESS_RATIOS, N_EXPERT, N_EXPERT_USED, N_LAYER, SWA_WINDOW};
 use v4flash_kernels::het::{
     BatchDgpuScratch, BatchIgpuScratch, BatchScratch, DgpuScratch, ExecMode, HetModelState,
-    HetModelWeights, HeterogeneousEngine, PrefillStats,
+    HetModelWeights, HeterogeneousEngine, PrefillStats, B_MAX,
 };
 use v4flash_kernels::{ActivationDump, RopeParams};
 
@@ -364,6 +364,187 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
     let mut head_scratch = DgpuScratch::alloc(dgpu)?;
 
     let n_real = PROMPT_TOKENS.len();
+
+    // FAKE_PREFILL_POS=N: measure the MARGINAL cost of prefilling one
+    // B_MAX-token chunk at simulated context depth N, WITHOUT paying the
+    // O(N²) real fill to reach depth N. Mirrors the decode FAKE_WARMUP
+    // trick: stamp per-layer n_raw / n_comp counters so attention runs
+    // over correctly-SIZED (but zero-valued) KV state. Values are garbage,
+    // timing is representative — kernel cost depends on shapes/counts, not
+    // values. Unlike the default path's `T / total_wall` (a blended
+    // average over depths 0..T dominated by the quadratic tail), this
+    // reports `B_MAX / chunk_wall` = the actual prefill throughput AT
+    // depth N. Sweep N for a fast, clean scaling curve.
+    let fake_depths: Vec<u32> = std::env::var("FAKE_PREFILL_POS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|p| p.trim().parse::<u32>().ok())
+                .filter(|&v| v > 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !fake_depths.is_empty() {
+        // FAKE_PREFILL_TOKENS: tokens pushed per timed iter. forward_prefill
+        // chunks these into B_MAX-sized chunks internally and runs them
+        // back-to-back, so >B_MAX gives a steady-state throughput number
+        // (amortizing the per-chunk pipeline warmup/cooldown bubble) rather
+        // than single-chunk latency. Default = B_MAX (one chunk).
+        let chunk_b = std::env::var("FAKE_PREFILL_TOKENS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(B_MAX);
+        let max_depth = *fake_depths.iter().max().unwrap();
+        eprintln!(
+            "FAKE_PREFILL_POS sweep {fake_depths:?}: timing {chunk_b} tokens/iter per depth"
+        );
+
+        // One chunk of inputs (cycle the real dump residuals).
+        let mut chunk_hcs: Vec<Vec<f32>> = Vec::with_capacity(chunk_b);
+        let mut chunk_tokens: Vec<i32> = Vec::with_capacity(chunk_b);
+        for i in 0..chunk_b {
+            let src_i = i % n_real;
+            let entry = dump
+                .tensor("layer_input_residual", 0, src_i as i32)
+                .ok_or_else(|| eyre!("missing layer_input_residual L0 T{src_i}"))?;
+            let hc = dump.read_f32(entry)?;
+            assert_eq!(hc.len(), HC_DIM as usize);
+            chunk_hcs.push(hc);
+            chunk_tokens.push(PROMPT_TOKENS[src_i]);
+        }
+
+        // State must hold the deepest position we touch: the real graph-
+        // capture warmup spans `warm_span`, the timed chunk reaches
+        // `fake_pos + chunk_b`. Size comp_kv/KV for the max of both.
+        let graph_warm_chunks = 2u32;
+        let warm_span = graph_warm_chunks * chunk_b as u32;
+        let n_kv_max = max_depth.max(warm_span) + chunk_b as u32 + 8;
+        let mut state = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
+
+        // Real warmup chunks (pos 0, B_MAX, …) so the per-layer HIP graphs
+        // get captured before timing — else the first timed chunk spikes.
+        eprintln!("  real-warming {graph_warm_chunks} chunks for graph capture...");
+        for w in 0..graph_warm_chunks {
+            if let (Some(bdb), Some(bib)) = (bd_b.as_mut(), bi_b.as_mut()) {
+                let _ = engine.forward_prefill_pipelined(
+                    &mut bd,
+                    &mut bi,
+                    bdb,
+                    bib,
+                    &mut head_scratch,
+                    &mut state,
+                    &main_weights,
+                    &chunk_hcs,
+                    &chunk_tokens,
+                    w * chunk_b as u32,
+                    true,
+                    None,
+                )?;
+            } else {
+                let _ = engine.forward_prefill(
+                    &mut bd,
+                    &mut bi,
+                    &mut head_scratch,
+                    &mut state,
+                    &main_weights,
+                    &chunk_hcs,
+                    &chunk_tokens,
+                    w * chunk_b as u32,
+                    true,
+                    None,
+                )?;
+            }
+        }
+
+        // Stamp per-layer counters to simulate `pos` prior tokens. Same
+        // logic as the decode FAKE_WARMUP path in perfetto_trace_long.
+        let set_fake = |state: &mut HetModelState, pos: u32| {
+            for layer in 0..N_LAYER as usize {
+                let ls = &mut state.layers[layer];
+                ls.n_raw = SWA_WINDOW.min(pos);
+                let ratio = COMPRESS_RATIOS[layer];
+                if ratio > 0 {
+                    if let Some(cs) = ls.compressor.as_mut() {
+                        cs.n_comp = pos / ratio;
+                    }
+                    if let Some(ics) = ls.indexer_compressor.as_mut() {
+                        ics.n_comp = pos / ratio;
+                    }
+                }
+            }
+        };
+
+        // Sweep each requested depth in-process (model stays resident).
+        let mut summary: Vec<(u32, f64, f64)> = Vec::with_capacity(fake_depths.len());
+        for &fake_pos in &fake_depths {
+            let mut walls_ms: Vec<f64> = Vec::with_capacity(n_iters);
+            for it in 0..n_iters {
+                // Reset depth before each timed chunk (forward_prefill advances
+                // the counters), so every iter measures the same depth.
+                set_fake(&mut state, fake_pos);
+                let t0 = Instant::now();
+                if let (Some(bdb), Some(bib)) = (bd_b.as_mut(), bi_b.as_mut()) {
+                    let _ = engine.forward_prefill_pipelined(
+                        &mut bd,
+                        &mut bi,
+                        bdb,
+                        bib,
+                        &mut head_scratch,
+                        &mut state,
+                        &main_weights,
+                        &chunk_hcs,
+                        &chunk_tokens,
+                        fake_pos,
+                        true,
+                        None,
+                    )?;
+                } else {
+                    let _ = engine.forward_prefill(
+                        &mut bd,
+                        &mut bi,
+                        &mut head_scratch,
+                        &mut state,
+                        &main_weights,
+                        &chunk_hcs,
+                        &chunk_tokens,
+                        fake_pos,
+                        true,
+                        None,
+                    )?;
+                }
+                let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                walls_ms.push(wall_ms);
+                eprintln!(
+                    "  depth {fake_pos} iter {it}: chunk wall={:.2} ms  ({:.3} ms/tok = {:.1} tok/s)",
+                    wall_ms,
+                    wall_ms / chunk_b as f64,
+                    (chunk_b as f64 * 1000.0) / wall_ms
+                );
+            }
+            walls_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let min_ms = walls_ms[0];
+            let median_ms = walls_ms[walls_ms.len() / 2];
+            summary.push((fake_pos, min_ms, median_ms));
+        }
+
+        eprintln!("\n=== BENCH FAKE PREFILL ({chunk_b} tokens/iter, B_MAX={B_MAX} chunks) ===");
+        eprintln!("depth   best ms/iter    ms/tok   tok/s   |  median ms/iter    ms/tok   tok/s");
+        for (fake_pos, min_ms, median_ms) in &summary {
+            eprintln!(
+                "{:>6}  {:>11.2}  {:>7.3}  {:>6.1}  |  {:>13.2}  {:>7.3}  {:>6.1}",
+                fake_pos,
+                min_ms,
+                min_ms / chunk_b as f64,
+                (chunk_b as f64 * 1000.0) / min_ms,
+                median_ms,
+                median_ms / chunk_b as f64,
+                (chunk_b as f64 * 1000.0) / median_ms,
+            );
+        }
+        return Ok(());
+    }
+
     let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(t);
     let mut tokens: Vec<i32> = Vec::with_capacity(t);
     for i in 0..t {

@@ -25,6 +25,7 @@
 
 use color_eyre::eyre::{self, eyre};
 
+use crate::attention::ATTN_PREFILL_LDS_MAX;
 use crate::forward::{
     hash_router_select, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
     EXPERT_WEIGHT_SCALE, GROUP_DIM, HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED,
@@ -1213,19 +1214,65 @@ impl HeterogeneousEngine {
             let cs = ls.compressor.as_ref();
             let any_comp = n_comp_after.iter().any(|&v| v > 0);
             let comp_kv_buf = if any_comp { cs.map(|c| &c.comp_kv) } else { None };
-            de.attn_mixed.launch_batched(
-                &de.compute,
-                &mut bd.heads,
-                &bd.q_normed,
-                &ls.kv_cache,
-                comp_kv_buf,
-                &dlw.attn_sinks,
-                &nrp_view,
-                &ncp_view,
-                N_HEAD,
-                N_HEAD_DIM,
-                b,
-            )?;
+            let n_total_max = n_raw_after
+                .iter()
+                .zip(n_comp_after.iter())
+                .map(|(&r, &c)| r + c)
+                .max()
+                .unwrap_or(0);
+            if n_total_max > ATTN_PREFILL_LDS_MAX {
+                // Long context: the monolithic kernel's LDS `scores[2304]`
+                // would overflow (n_comp = pos/ratio). Use the batched split
+                // (scores in global, per-row grid, wave-parallel softmax,
+                // 16-way ILP wsum) — same kernels that fixed 64K decode.
+                // Head-tiled score: one WG per (row, head-group, token) loads
+                // the shared MLA latent row once and reuses it across the
+                // head group, amortizing per-WG overhead + KV traffic. ~5×
+                // over the per-head grid at 64K (270M → 34M WGs).
+                de.attn_mixed.launch_score_batched_htiled(
+                    &de.compute,
+                    &mut bd.attn_scores,
+                    &bd.q_normed,
+                    &ls.kv_cache,
+                    comp_kv_buf,
+                    &nrp_view,
+                    &ncp_view,
+                    N_HEAD,
+                    N_HEAD_DIM,
+                    n_total_max,
+                    b,
+                )?;
+                // Head-tiled phase 2: softmax one wave per head + wsum that
+                // loads each shared V-latent element once per head group.
+                // 1.76× over the per-head kernel at 64K (HEAD_TILE=16).
+                de.attn_mixed.launch_softmax_wsum_batched_htiled(
+                    &de.compute,
+                    &mut bd.heads,
+                    &mut bd.attn_scores,
+                    &dlw.attn_sinks,
+                    &ls.kv_cache,
+                    comp_kv_buf,
+                    &nrp_view,
+                    &ncp_view,
+                    N_HEAD,
+                    N_HEAD_DIM,
+                    b,
+                )?;
+            } else {
+                de.attn_mixed.launch_batched(
+                    &de.compute,
+                    &mut bd.heads,
+                    &bd.q_normed,
+                    &ls.kv_cache,
+                    comp_kv_buf,
+                    &dlw.attn_sinks,
+                    &nrp_view,
+                    &ncp_view,
+                    N_HEAD,
+                    N_HEAD_DIM,
+                    b,
+                )?;
+            }
         }
         drop(nrp_view);
         drop(ncp_view);

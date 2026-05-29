@@ -1,9 +1,7 @@
 //! V4 Flash FFN building blocks: SwiGLU (and future expert MLP kernels).
 
-use std::ffi::c_void;
-
 use color_eyre::eyre::{self, eyre};
-use v4flash_hip::{DeviceBuffer, LaunchConfig, Module, Stream};
+use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const SWIGLU_GFX1201: &[u8] = include_bytes!(env!("KERNEL_SWIGLU_GFX1201"));
 const SWIGLU_GFX1151: &[u8] = include_bytes!(env!("KERNEL_SWIGLU_GFX1151"));
@@ -40,16 +38,6 @@ impl Swiglu {
         n: u32,
     ) -> eyre::Result<()> {
         let function = self.module.get_function("swiglu")?;
-        let mut out_ptr = out.raw();
-        let mut g_ptr = gate.raw();
-        let mut u_ptr = up.raw();
-        let mut n_v = n;
-        let mut args: [*mut c_void; 4] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut g_ptr as *mut _ as *mut c_void,
-            &mut u_ptr as *mut _ as *mut c_void,
-            &mut n_v as *mut _ as *mut c_void,
-        ];
         let block_x = 256u32;
         let grid_x = n.div_ceil(block_x);
         let cfg = LaunchConfig {
@@ -57,7 +45,7 @@ impl Swiglu {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [out.raw(), gate.raw(), up.raw(), n])
     }
 }
 
@@ -93,20 +81,6 @@ impl SwigluClampWeighted {
         n_experts: u32,
     ) -> eyre::Result<()> {
         let function = self.module.get_function("swiglu_clamp_weighted")?;
-        let mut mid_ptr = mid.raw();
-        let mut g_ptr = gate.raw();
-        let mut u_ptr = up.raw();
-        let mut ew_ptr = expert_w.raw();
-        let mut clamp_v = clamp;
-        let mut ff = ff_exp;
-        let mut args: [*mut c_void; 6] = [
-            &mut mid_ptr as *mut _ as *mut c_void,
-            &mut g_ptr as *mut _ as *mut c_void,
-            &mut u_ptr as *mut _ as *mut c_void,
-            &mut ew_ptr as *mut _ as *mut c_void,
-            &mut clamp_v as *mut _ as *mut c_void,
-            &mut ff as *mut _ as *mut c_void,
-        ];
         let block_x = 256u32;
         let grid_x = ff_exp.div_ceil(block_x);
         let cfg = LaunchConfig {
@@ -114,7 +88,9 @@ impl SwigluClampWeighted {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate.raw(), up.raw(), expert_w.raw(), clamp, ff_exp
+        ])
     }
 }
 
@@ -145,14 +121,6 @@ impl VecAddInplace {
         n: u32,
     ) -> eyre::Result<()> {
         let function = self.module.get_function("vec_add_inplace")?;
-        let mut out_ptr = out.raw();
-        let mut rhs_ptr = rhs.raw();
-        let mut n_v = n;
-        let mut args: [*mut c_void; 3] = [
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut rhs_ptr as *mut _ as *mut c_void,
-            &mut n_v as *mut _ as *mut c_void,
-        ];
         let block_x = 256u32;
         let grid_x = n.div_ceil(block_x);
         let cfg = LaunchConfig {
@@ -160,6 +128,6 @@ impl VecAddInplace {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { function.launch_raw(cfg, stream, &mut args) }
+        launch_kernel!(function, cfg, stream, [out.raw(), rhs.raw(), n])
     }
 }
