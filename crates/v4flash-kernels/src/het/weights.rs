@@ -71,15 +71,6 @@ pub struct IgpuLayerWeights {
     pub ratio: u32,
     pub is_hash_router: bool,
 
-    // Router weights — dGPU-resident; these stay `None` on iGPU to
-    // avoid duplicating ~86 MB of weights that caused early OOMs.
-    pub ffn_gate_inp: Option<DeviceWeight>,
-    pub tid2eid: Option<Vec<i32>>,
-    pub router_bias: Option<Vec<f32>>,
-    /// Device-resident copy of `router_bias` for the `router_topk`
-    /// kernel. Only present for learned routers (L≥3).
-    pub router_bias_dev: Option<DeviceBuffer<f32>>,
-
     // Routed experts (all 256, iGPU-resident)
     pub routed: RoutedExpertWeights,
 
@@ -322,45 +313,6 @@ impl IgpuLayerWeights {
         let ratio = COMPRESS_RATIOS[layer as usize];
         let is_hash_router = layer < N_HASH_LAYERS;
 
-        // iGPU-side copy of the router weights. Loaded for a retired
-        // pair-forward path that started iGPU MoE without waiting on
-        // dGPU shared_expert. No live caller now — `forward_layer` and
-        // `forward_layer_batch_v2` both use the dGPU copy in
-        // `dlw.ffn_gate_inp`. Candidate for removal alongside the iGPU
-        // router_bias fields below; left in place pending a sweep.
-        let ffn_gate_inp: Option<DeviceWeight> = Some(load_to_device(
-            gguf,
-            &format!("blk.{layer}.ffn_gate_inp.weight"),
-            device_id,
-        )?);
-        let tid2eid: Option<Vec<i32>> = if is_hash_router {
-            Some(load_i32_tensor(
-                gguf,
-                &format!("blk.{layer}.ffn_gate_tid2eid.weight"),
-            )?)
-        } else {
-            None
-        };
-        let router_bias: Option<Vec<f32>> = if !is_hash_router {
-            let bias_name = format!("blk.{layer}.exp_probs_b.bias");
-            if let Some(t) = gguf.gguf().tensor(&bias_name) {
-                if t.dtype != GgufType::F32 {
-                    return Err(eyre!("{bias_name} dtype {:?} != F32", t.dtype));
-                }
-                let bytes = gguf.read_tensor(t)?;
-                Some(
-                    bytes
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                        .collect(),
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
         // Routed expert weights — fully iGPU-resident (~1.2 GiB/layer).
         let gate = load_to_device(
             gguf,
@@ -387,26 +339,12 @@ impl IgpuLayerWeights {
             down_bytes_per_expert,
         };
 
-        // router_bias_dev mirrors router_bias on iGPU. Dead-allocated
-        // alongside the iGPU router_bias above; same cleanup candidate.
-        let router_bias_dev: Option<DeviceBuffer<f32>> = if let Some(b) = router_bias.as_ref() {
-            let mut buf = DeviceBuffer::<f32>::new(device_id, b.len())?;
-            buf.copy_from_host(b)?;
-            Some(buf)
-        } else {
-            None
-        };
-
         let rope_params = rope_params_for_layer(layer)?;
 
         Ok(IgpuLayerWeights {
             layer_idx: layer,
             ratio,
             is_hash_router,
-            ffn_gate_inp,
-            tid2eid,
-            router_bias,
-            router_bias_dev,
             routed,
             rope_params,
         })

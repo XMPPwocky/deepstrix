@@ -85,16 +85,6 @@ pub struct DeviceEngine {
     pub q8k: Q8KQuantize,
     pub iq2: Iq2XxsPairMatvec,
     pub q2k: Q2KAccumulateMatvec,
-    /// Q4_K matvec kernels (par-batched + pair-swiglu-batched). Loaded
-    /// for the retired MTP draft layer (whose GGUF stored routed experts
-    /// as Q4_K). No live caller in the current forward path — retained
-    /// because `kernels/q4_k_matvec_par.hip` exists and is exercised by
-    /// `tests/q4_k_matvec.rs`. Candidate for removal from DeviceEngine.
-    pub q4k: crate::q4_k::Q4KMatvec,
-    /// Broadcast/tile kernel (expand N_EMBD vector to N_HC × N_EMBD).
-    /// Loaded for retired MTP HC-combine; same dead-engine-field status
-    /// as `q4k` above.
-    pub broadcast: crate::broadcast::BroadcastToHc,
     pub hc_sigmoid: HcSigmoidBias,
     pub hc_weighted: HcWeightedSum,
     pub hc_sinkhorn: HcSinkhorn,
@@ -145,8 +135,6 @@ impl DeviceEngine {
             q8k: Q8KQuantize::for_arch(arch)?,
             iq2: Iq2XxsPairMatvec::for_arch(arch)?,
             q2k: Q2KAccumulateMatvec::for_arch(arch)?,
-            q4k: crate::q4_k::Q4KMatvec::for_arch(arch)?,
-            broadcast: crate::broadcast::BroadcastToHc::for_arch(arch)?,
             hc_sigmoid: HcSigmoidBias::for_arch(arch)?,
             hc_weighted: HcWeightedSum::for_arch(arch)?,
             hc_sinkhorn: HcSinkhorn::for_arch(arch)?,
@@ -179,19 +167,11 @@ impl DeviceEngine {
 ///   peer-push to iGPU.
 /// * `selected_pushed` (dgpu.xfer) — selected/d_ew pushed to iGPU;
 ///   iGPU MoE waits on this.
-///
-/// The `attn_in_*` and `comp_row_*` fields are pre-allocated for a
-/// retired compressor-handoff path (the compressor now runs entirely on
-/// dGPU). They are unread in the current code; candidates for removal.
 pub struct LayerSyncEvents {
     pub ain_ready: Event,
     pub ain_pushed: Event,
     pub moe_done: Event,
     pub moe_arrived: Event,
-    pub attn_in_ready: Event,
-    pub attn_in_pushed: Event,
-    pub comp_row_ready: Event,
-    pub comp_row_arrived: Event,
     pub selected_ready: Event,
     pub selected_pushed: Event,
 }
@@ -210,24 +190,16 @@ impl HetSyncEvents {
             dgpu.set_current()?;
             let ain_ready = Event::new_no_timing()?;
             let ain_pushed = Event::new_no_timing()?;
-            let attn_in_ready = Event::new_no_timing()?;
-            let attn_in_pushed = Event::new_no_timing()?;
             let selected_ready = Event::new_no_timing()?;
             let selected_pushed = Event::new_no_timing()?;
             igpu.set_current()?;
             let moe_done = Event::new_no_timing()?;
             let moe_arrived = Event::new_no_timing()?;
-            let comp_row_ready = Event::new_no_timing()?;
-            let comp_row_arrived = Event::new_no_timing()?;
             layers.push(LayerSyncEvents {
                 ain_ready,
                 ain_pushed,
                 moe_done,
                 moe_arrived,
-                attn_in_ready,
-                attn_in_pushed,
-                comp_row_ready,
-                comp_row_arrived,
                 selected_ready,
                 selected_pushed,
             });
