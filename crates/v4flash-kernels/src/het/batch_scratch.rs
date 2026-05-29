@@ -26,12 +26,14 @@ use crate::q8_k::BLOCK_Q8_K_BYTES;
 
 use super::scratch::{DgpuScratch, IgpuScratch};
 
-/// Max prefill batch size. Bumped to 256 for the by-expert MoE
-/// experiment — at B=256 expected per-expert reuse is ~6× (vs ~2× at
-/// B=64), which is where by-expert grouping should start winning over
-/// the L2-amortized by-token kernel. Memory cost at B=256: ~104 MB dGPU
-/// scratch + ~24 MB iGPU scratch — trivial vs the 60+ GiB model weights.
-pub const B_MAX: usize = 256;
+/// Max prefill batch size. At 512 (vs 256): larger batches grow the hot
+/// expert chunks under the skewed (Zipf-y) routing, so the staged iq2
+/// path amortizes better over longer member lists — measured +9.4% e2e
+/// prefill at depth 1024 (186.6 → 204.2 tok/s, back-to-back). The big
+/// scratch growth is `attn_scores` (~+1.1 GiB) which is dGPU-resident
+/// (16 GiB 9070 XT, ample), NOT on the tight iGPU expert budget; iGPU
+/// scratch growth is ~24→48 MB. Total dGPU scratch ~208 MB at B=512.
+pub const B_MAX: usize = 512;
 
 /// Per-batch dGPU + iGPU scratch for prefill.
 ///
@@ -130,6 +132,10 @@ pub struct BatchDgpuScratch {
     // ---- KV chain ----
     pub kv_raw: DeviceBuffer<f32>,
     pub kv_normed: DeviceBuffer<f32>,
+    /// Scratch ring (≥ `SWA_WINDOW * N_HEAD_DIM`) for the eviction-gather
+    /// append path: gather writes here so survivor reads from the live cache
+    /// cannot race, then it's copied back into `ls.kv_cache`.
+    pub kv_ring_scratch: DeviceBuffer<f32>,
 
     // ---- Compressor (used in per-batch serial inner loop) ----
     pub kv_cur: DeviceBuffer<f32>,
@@ -322,6 +328,8 @@ impl BatchDgpuScratch {
 
             kv_raw: mk_f32(N_HEAD_DIM as usize)?,
             kv_normed: mk_f32(N_HEAD_DIM as usize)?,
+            // b*N_HEAD_DIM = B_MAX*N_HEAD_DIM ≥ SWA_WINDOW*N_HEAD_DIM.
+            kv_ring_scratch: mk_f32(N_HEAD_DIM as usize)?,
 
             kv_cur: mk_f32((2 * N_HEAD_DIM) as usize)?,
             sc_cur: mk_f32((2 * N_HEAD_DIM) as usize)?,
