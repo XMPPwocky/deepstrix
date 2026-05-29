@@ -1187,43 +1187,100 @@ impl HeterogeneousEngine {
             // shared MLA latent row once and reuses it across the head group.
             // Score Q·Kᵀ runs as the RDNA4 f16 WMMA GEMM — measured 7.3× over
             // the f32 head-tiled variant on the depth-32k ratio=4 layer.
+            // ATTN_SCORES_F16=1 switches both kernels to store/read scores
+            // as f16 in DRAM (Phase A softmax keeps f32 math).
+            let scores_f16 = std::env::var_os("ATTN_SCORES_F16").is_some();
             {
                 let _t = de.events.stage("k.attn.score", &de.compute)?;
-                de.attn_mixed.launch_score_batched_htiled_wmma(
-                    &de.compute,
-                    &mut bd.attn_scores,
-                    &bd.q_normed,
-                    &ls.kv_cache,
-                    comp_kv_buf,
-                    &nrp_view,
-                    &nrop_view,
-                    &ncp_view,
-                    N_HEAD,
-                    N_HEAD_DIM,
-                    n_total_max,
-                    b,
-                )?;
+                if scores_f16 {
+                    de.attn_mixed.launch_score_batched_htiled_wmma_f16s(
+                        &de.compute,
+                        &mut bd.attn_scores,
+                        &bd.q_normed,
+                        &ls.kv_cache,
+                        comp_kv_buf,
+                        &nrp_view,
+                        &nrop_view,
+                        &ncp_view,
+                        N_HEAD,
+                        N_HEAD_DIM,
+                        n_total_max,
+                        b,
+                    )?;
+                } else {
+                    de.attn_mixed.launch_score_batched_htiled_wmma(
+                        &de.compute,
+                        &mut bd.attn_scores,
+                        &bd.q_normed,
+                        &ls.kv_cache,
+                        comp_kv_buf,
+                        &nrp_view,
+                        &nrop_view,
+                        &ncp_view,
+                        N_HEAD,
+                        N_HEAD_DIM,
+                        n_total_max,
+                        b,
+                    )?;
+                }
             }
-            // Head-tiled phase 2: softmax one wave per head + wsum that loads
-            // each shared V-latent element once per head group (HEAD_TILE=16).
-            // Phase B W·V runs as RDNA4 f16 WMMA — 2.2× over the f32 path on
-            // the depth-32k ratio=4 layer (Phase A softmax is identical f32).
+            // Head-tiled phase 2: softmax one wave per head + WMMA Phase B
+            // W·V. Default reads V from LDS (`_ldsv`): each K-tile's 16 V
+            // rows are cooperatively staged to a 16 KB LDS tile once, then
+            // the per-warp B-fragment loads come from LDS instead of DRAM —
+            // saves ~10 ms per call at depth 32k, B=512 (smwsum 24.8 →
+            // ~15 ms). ATT trace showed the DRAM-V variant burned 82.8% of
+            // stall cycles on s_wait_loadcnt waiting for V rows.
+            // ATTN_SCORES_F16=1 / ATTN_SMWSUM_DRAM_V=1 keep prior variants
+            // reachable for kernel-level A/B.
             {
                 let _t = de.events.stage("k.attn.smwsum", &de.compute)?;
-                de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma(
-                    &de.compute,
-                    &mut bd.heads,
-                    &mut bd.attn_scores,
-                    &dlw.attn_sinks,
-                    &ls.kv_cache,
-                    comp_kv_buf,
-                    &nrp_view,
-                    &nrop_view,
-                    &ncp_view,
-                    N_HEAD,
-                    N_HEAD_DIM,
-                    b,
-                )?;
+                if scores_f16 {
+                    de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma_f16s(
+                        &de.compute,
+                        &mut bd.heads,
+                        &mut bd.attn_scores,
+                        &dlw.attn_sinks,
+                        &ls.kv_cache,
+                        comp_kv_buf,
+                        &nrp_view,
+                        &nrop_view,
+                        &ncp_view,
+                        N_HEAD,
+                        N_HEAD_DIM,
+                        b,
+                    )?;
+                } else if std::env::var_os("ATTN_SMWSUM_DRAM_V").is_some() {
+                    de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma(
+                        &de.compute,
+                        &mut bd.heads,
+                        &mut bd.attn_scores,
+                        &dlw.attn_sinks,
+                        &ls.kv_cache,
+                        comp_kv_buf,
+                        &nrp_view,
+                        &nrop_view,
+                        &ncp_view,
+                        N_HEAD,
+                        N_HEAD_DIM,
+                        b,
+                    )?;
+                } else {
+                    de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma_ldsv(
+                        &de.compute,
+                        &mut bd.heads,
+                        &mut bd.attn_scores,
+                        &dlw.attn_sinks,
+                        &ls.kv_cache,
+                        comp_kv_buf,
+                        &nrp_view,
+                        &nrop_view,
+                        &ncp_view,
+                        N_HEAD,
+                        N_HEAD_DIM,
+                        b,
+                    )?;
+                }
             }
         }
         drop(nrp_view);

@@ -801,3 +801,437 @@ extern "C" __global__ void attention_mixed_score_batched_htiled_wmma(
 #endif
 }
 
+// === f16-scores experimental variants ====================================
+// Same WMMA math as the f32-scores variants above, but the scores buffer
+// itself is _Float16. Halves the largest single piece of DRAM traffic in
+// the attention pair at long context (e.g. 1.04 GB → 520 MB at
+// depth=32k, B=512). Phase A softmax math stays f32 (running max/sum are
+// reductions and need it); only the storage type changes.
+extern "C" __global__ void attention_mixed_score_batched_htiled_wmma_f16s(
+        _Float16       * scores_g,       // [B, n_head, max_keys]  (f16)
+        const float    * q,
+        const float    * raw_kv,
+        const float    * comp_kv,
+        const int      * n_raw_per,
+        const int      * n_raw_offset_per,
+        const int      * n_comp_per,
+        unsigned int     n_head,
+        unsigned int     head_dim,
+        unsigned int     max_keys,
+        float            kq_scale) {
+    const unsigned int b    = blockIdx.z;
+    const unsigned int tid  = threadIdx.x;
+    const unsigned int warp = tid >> 5;
+    const unsigned int lane = tid & 31u;
+    const unsigned int n_raw  = (unsigned int)n_raw_per[b];
+    const unsigned int raw_off= (unsigned int)n_raw_offset_per[b];
+    const unsigned int n_comp = (unsigned int)n_comp_per[b];
+    const unsigned int n_total = n_raw + n_comp;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    const unsigned int n0   = blockIdx.x * SCORE_WMMA_KEYS_PER_BLK + warp * 16u;
+    const unsigned int col  = lane & 15u;
+    const unsigned int kh   = (lane >> 4) * 8u;
+    const unsigned int bkey = n0 + col;
+    const unsigned int n_kc = head_dim / 16u;
+    const float *brow = nullptr;
+    if (bkey < n_total) {
+        brow = (bkey < n_raw)
+            ? raw_kv + (size_t)(bkey + raw_off) * head_dim
+            : comp_kv + (size_t)(bkey - n_raw) * head_dim;
+    }
+    const unsigned int n_ht = n_head / 16u;
+    float8 c[8];
+    #pragma unroll
+    for (unsigned int t = 0; t < 8; t++) c[t] = (float8){0,0,0,0,0,0,0,0};
+    const float *qbase = q + ((size_t)b * n_head) * head_dim;
+    for (unsigned int kc = 0; kc < n_kc; kc++) {
+        const unsigned int dim0 = kc * 16u + kh;
+        half8 bf = {0,0,0,0,0,0,0,0};
+        if (brow) {
+            #pragma unroll
+            for (int e = 0; e < 8; e++) bf[e] = (_Float16)brow[dim0 + (unsigned int)e];
+        }
+        #pragma unroll
+        for (unsigned int mt = 0; mt < 8; mt++) {
+            if (mt >= n_ht) break;
+            const float *qh = qbase + (size_t)(mt * 16u + col) * head_dim;
+            half8 af;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) af[e] = (_Float16)qh[dim0 + (unsigned int)e];
+            c[mt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(af, bf, c[mt]);
+        }
+    }
+    #pragma unroll
+    for (unsigned int mt = 0; mt < 8; mt++) {
+        if (mt >= n_ht) break;
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const unsigned int h = mt * 16u + (lane >> 4) * 8u + (unsigned int)e;
+            if (h < n_head && bkey < n_total) {
+                scores_g[((size_t)b * n_head + h) * max_keys + bkey] =
+                    (_Float16)(c[mt][e] * kq_scale);
+            }
+        }
+    }
+#else
+    (void)scores_g; (void)q; (void)raw_kv; (void)comp_kv; (void)n_head;
+    (void)head_dim; (void)max_keys; (void)kq_scale; (void)warp; (void)lane;
+    (void)n_total;
+#endif
+}
+
+// === LDS-V experimental variant ==========================================
+// Same WMMA math as the f32-scores baseline, but each K-tile of 16 keys
+// has its V latent rows cooperatively staged through LDS once per tile,
+// then the per-warp WMMA B-fragment loads read from LDS instead of DRAM.
+// Motivation: rocprofv3 ATT shows 82.8% of smwsum stall cycles on
+// `s_wait_loadcnt` (waiting on V-row loads from DRAM); the WGs have low
+// effective occupancy on DRAM-latency hiding. Per-tile cooperative load
+// converts 16×head_dim DRAM reads into LDS-latency reads thereafter.
+//
+// LDS budget: 16 keys × head_dim (=512) × 2 bytes f16 = 16384 B = 16 KB
+// per WG. RDNA4 CU has 64 KB LDS → still fits 2 WGs/CU + 32 KB headroom.
+//
+// Layout: v_lds[16 keys × head_dim] f16, no padding (head_dim==512 is
+// already aligned). 2-way LDS bank conflict on per-fragment reads (16
+// lanes packing into 8 banks at f16) is intrinsic to f16 packing —
+// accepted as 2 cycles/read vs ~500 cycles DRAM latency.
+extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled_wmma_ldsv(
+        float          * out,
+        float          * scores_g,
+        const float    * sinks,
+        const float    * raw_kv,
+        const float    * comp_kv,
+        const int      * n_raw_per,
+        const int      * n_raw_offset_per,
+        const int      * n_comp_per,
+        unsigned int     n_head,
+        unsigned int     head_dim,
+        unsigned int     max_keys) {
+    const unsigned int hg    = blockIdx.x;
+    const unsigned int b     = blockIdx.y;
+    const unsigned int tid   = threadIdx.x;
+    const unsigned int h0    = hg * SMWSUM_HEAD_TILE;
+    if (h0 >= n_head) return;
+    unsigned int ht = SMWSUM_HEAD_TILE;
+    if (h0 + ht > n_head) ht = n_head - h0;
+    const unsigned int n_raw  = (unsigned int)n_raw_per[b];
+    const unsigned int raw_off= (unsigned int)n_raw_offset_per[b];
+    const unsigned int n_comp = (unsigned int)n_comp_per[b];
+    const unsigned int n_total = n_raw + n_comp;
+
+    __shared__ float    s_inv[SMWSUM_HEAD_TILE];
+    __shared__ _Float16 v_lds[16 * 512];  // 16 keys × head_dim f16 = 16 KB
+
+    // Phase A: softmax — identical to f32-scores baseline.
+    const unsigned int wave = tid >> 5;
+    const unsigned int lane = tid & 31u;
+    if (wave < ht) {
+        const unsigned int h = h0 + wave;
+        float *sw = scores_g + ((size_t)b * n_head + h) * max_keys;
+        const float sink_h = sinks[h];
+        float local_max = sink_h;
+        for (unsigned int rr = lane; rr < n_total; rr += 32) {
+            float v = sw[rr];
+            if (v > local_max) local_max = v;
+        }
+        {
+            float o;
+            o = __shfl_xor(local_max, 16); if (o > local_max) local_max = o;
+            o = __shfl_xor(local_max,  8); if (o > local_max) local_max = o;
+            o = __shfl_xor(local_max,  4); if (o > local_max) local_max = o;
+            o = __shfl_xor(local_max,  2); if (o > local_max) local_max = o;
+            o = __shfl_xor(local_max,  1); if (o > local_max) local_max = o;
+        }
+        const float max_score = local_max;
+        float local_sum = (lane == 0) ? expf(sink_h - max_score) : 0.0f;
+        for (unsigned int rr = lane; rr < n_total; rr += 32) {
+            float w = expf(sw[rr] - max_score);
+            sw[rr] = w;
+            local_sum += w;
+        }
+        local_sum += __shfl_xor(local_sum, 16);
+        local_sum += __shfl_xor(local_sum,  8);
+        local_sum += __shfl_xor(local_sum,  4);
+        local_sum += __shfl_xor(local_sum,  2);
+        local_sum += __shfl_xor(local_sum,  1);
+        if (lane == 0) s_inv[wave] = 1.0f / local_sum;
+    }
+    __syncthreads();
+
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    const unsigned int warp = wave;
+    const unsigned int arow = lane & 15u;
+    const unsigned int kh   = (lane >> 4) * 8u;
+    const unsigned int nt_a = warp;
+    const unsigned int nt_b = warp + 16u;
+    const unsigned int d_a  = nt_a * 16u + arow;
+    const unsigned int d_b  = nt_b * 16u + arow;
+    const float *swrow = scores_g + ((size_t)b * n_head + h0 + arow) * max_keys;
+    constexpr unsigned int LDS_STRIDE = 512u;  // head_dim, no padding
+
+    float8 c_a = {0,0,0,0,0,0,0,0};
+    float8 c_b = {0,0,0,0,0,0,0,0};
+
+    // Cooperative-load helper: stage V[base..base+16) (raw or comp) into v_lds.
+    // 16 keys × 512 dim = 8192 f32 → 512 threads × 16 elems/thread, vectorized
+    // as 4 × float4 b128 loads/thread. f32→f16 cast at the LDS store.
+    auto stage_v = [&](const float *kv_base, unsigned int base, unsigned int n_avail) {
+        // Each thread covers 4 (k, d_chunk) pairs across the tile.
+        // Mapping: thread tid → flat slot s = tid + 512*iter, where
+        // s/(head_dim/4) = k_idx, s%(head_dim/4) = d_chunk (b128 offset).
+        constexpr unsigned int N_VEC = 16u * (512u / 4u);   // 16 × 128 = 2048
+        constexpr unsigned int VEC_PER_KEY = 512u / 4u;     // 128
+        #pragma unroll
+        for (unsigned int it = 0; it < N_VEC / 512u; it++) {
+            const unsigned int s = tid + it * 512u;
+            const unsigned int k_idx = s / VEC_PER_KEY;
+            const unsigned int d_chunk = s % VEC_PER_KEY;
+            float4 v = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (k_idx < n_avail) {
+                const float4 *src = (const float4 *)(kv_base + (size_t)(base + k_idx) * 512u + d_chunk * 4u);
+                v = *src;
+            }
+            _Float16 *dst = v_lds + k_idx * LDS_STRIDE + d_chunk * 4u;
+            dst[0] = (_Float16)v.x;
+            dst[1] = (_Float16)v.y;
+            dst[2] = (_Float16)v.z;
+            dst[3] = (_Float16)v.w;
+        }
+    };
+
+    // --- raw section ---
+    unsigned int r = 0;
+    for (; r + 16u <= n_raw; r += 16u) {
+        __syncthreads();
+        stage_v(raw_kv, r + raw_off, 16u);
+        __syncthreads();
+        half8 a, ba, bb;
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const unsigned int k_idx = kh + (unsigned int)e;
+            a[e]  = (_Float16)swrow[r + k_idx];
+            ba[e] = v_lds[k_idx * LDS_STRIDE + d_a];
+            bb[e] = v_lds[k_idx * LDS_STRIDE + d_b];
+        }
+        c_a = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, ba, c_a);
+        c_b = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bb, c_b);
+    }
+    if (r < n_raw) {
+        __syncthreads();
+        stage_v(raw_kv, r + raw_off, n_raw - r);
+        __syncthreads();
+        half8 a = {0,0,0,0,0,0,0,0}, ba = {0,0,0,0,0,0,0,0}, bb = {0,0,0,0,0,0,0,0};
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const unsigned int k_idx = kh + (unsigned int)e;
+            const unsigned int k = r + k_idx;
+            if (k < n_raw) {
+                a[e]  = (_Float16)swrow[k];
+                ba[e] = v_lds[k_idx * LDS_STRIDE + d_a];
+                bb[e] = v_lds[k_idx * LDS_STRIDE + d_b];
+            }
+        }
+        c_a = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, ba, c_a);
+        c_b = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bb, c_b);
+    }
+
+    // --- comp section ---
+    if (comp_kv) {
+        unsigned int c = 0;
+        for (; c + 16u <= n_comp; c += 16u) {
+            __syncthreads();
+            stage_v(comp_kv, c, 16u);
+            __syncthreads();
+            half8 a, ba, bb;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const unsigned int k_idx = kh + (unsigned int)e;
+                a[e]  = (_Float16)swrow[n_raw + c + k_idx];
+                ba[e] = v_lds[k_idx * LDS_STRIDE + d_a];
+                bb[e] = v_lds[k_idx * LDS_STRIDE + d_b];
+            }
+            c_a = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, ba, c_a);
+            c_b = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bb, c_b);
+        }
+        if (c < n_comp) {
+            __syncthreads();
+            stage_v(comp_kv, c, n_comp - c);
+            __syncthreads();
+            half8 a = {0,0,0,0,0,0,0,0}, ba = {0,0,0,0,0,0,0,0}, bb = {0,0,0,0,0,0,0,0};
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const unsigned int k_idx = kh + (unsigned int)e;
+                const unsigned int cc = c + k_idx;
+                if (cc < n_comp) {
+                    a[e]  = (_Float16)swrow[n_raw + cc];
+                    ba[e] = v_lds[k_idx * LDS_STRIDE + d_a];
+                    bb[e] = v_lds[k_idx * LDS_STRIDE + d_b];
+                }
+            }
+            c_a = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, ba, c_a);
+            c_b = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bb, c_b);
+        }
+    }
+
+    #pragma unroll
+    for (int e = 0; e < 8; e++) {
+        const unsigned int mh = (lane >> 4) * 8u + (unsigned int)e;
+        if (mh < ht) {
+            const float scale = s_inv[mh];
+            const size_t obase = ((size_t)b * n_head + h0 + mh) * head_dim;
+            out[obase + d_a] = c_a[e] * scale;
+            out[obase + d_b] = c_b[e] * scale;
+        }
+    }
+#else
+    (void)out; (void)raw_kv; (void)comp_kv; (void)head_dim; (void)lane;
+#endif
+}
+
+extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled_wmma_f16s(
+        float          * out,
+        _Float16       * scores_g,       // [B, n_head, max_keys]  (f16, in/out)
+        const float    * sinks,
+        const float    * raw_kv,
+        const float    * comp_kv,
+        const int      * n_raw_per,
+        const int      * n_raw_offset_per,
+        const int      * n_comp_per,
+        unsigned int     n_head,
+        unsigned int     head_dim,
+        unsigned int     max_keys) {
+    const unsigned int hg    = blockIdx.x;
+    const unsigned int b     = blockIdx.y;
+    const unsigned int tid   = threadIdx.x;
+    const unsigned int h0    = hg * SMWSUM_HEAD_TILE;
+    if (h0 >= n_head) return;
+    unsigned int ht = SMWSUM_HEAD_TILE;
+    if (h0 + ht > n_head) ht = n_head - h0;
+    const unsigned int n_raw  = (unsigned int)n_raw_per[b];
+    const unsigned int raw_off= (unsigned int)n_raw_offset_per[b];
+    const unsigned int n_comp = (unsigned int)n_comp_per[b];
+    const unsigned int n_total = n_raw + n_comp;
+    __shared__ float s_inv[SMWSUM_HEAD_TILE];
+
+    // Phase A: softmax — reads f16, computes in f32, writes back f16.
+    const unsigned int wave = tid >> 5;
+    const unsigned int lane = tid & 31u;
+    if (wave < ht) {
+        const unsigned int h = h0 + wave;
+        _Float16 *sw = scores_g + ((size_t)b * n_head + h) * max_keys;
+        const float sink_h = sinks[h];
+        float local_max = sink_h;
+        for (unsigned int rr = lane; rr < n_total; rr += 32) {
+            float v = (float)sw[rr];
+            if (v > local_max) local_max = v;
+        }
+        {
+            float o;
+            o = __shfl_xor(local_max, 16); if (o > local_max) local_max = o;
+            o = __shfl_xor(local_max,  8); if (o > local_max) local_max = o;
+            o = __shfl_xor(local_max,  4); if (o > local_max) local_max = o;
+            o = __shfl_xor(local_max,  2); if (o > local_max) local_max = o;
+            o = __shfl_xor(local_max,  1); if (o > local_max) local_max = o;
+        }
+        const float max_score = local_max;
+        float local_sum = (lane == 0) ? expf(sink_h - max_score) : 0.0f;
+        for (unsigned int rr = lane; rr < n_total; rr += 32) {
+            float w = expf((float)sw[rr] - max_score);
+            sw[rr] = (_Float16)w;
+            local_sum += w;
+        }
+        local_sum += __shfl_xor(local_sum, 16);
+        local_sum += __shfl_xor(local_sum,  8);
+        local_sum += __shfl_xor(local_sum,  4);
+        local_sum += __shfl_xor(local_sum,  2);
+        local_sum += __shfl_xor(local_sum,  1);
+        if (lane == 0) s_inv[wave] = 1.0f / local_sum;
+    }
+    __syncthreads();
+
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    // Phase B: WMMA GEMM using f16 scores directly as A-fragment (no cast).
+    const unsigned int warp = wave;
+    const unsigned int arow = lane & 15u;
+    const unsigned int kh   = (lane >> 4) * 8u;
+    const unsigned int nt_a = warp;
+    const unsigned int nt_b = warp + 16u;
+    const unsigned int d_a  = nt_a * 16u + arow;
+    const unsigned int d_b  = nt_b * 16u + arow;
+    const _Float16 *swrow = scores_g + ((size_t)b * n_head + h0 + arow) * max_keys;
+
+    float8 c_a = {0,0,0,0,0,0,0,0};
+    float8 c_b = {0,0,0,0,0,0,0,0};
+
+    unsigned int r = 0;
+    for (; r + 16u <= n_raw; r += 16u) {
+        half8 a, ba, bb;
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const unsigned int k = r + kh + (unsigned int)e;
+            a[e]  = swrow[k];
+            ba[e] = (_Float16)raw_kv[(size_t)(k + raw_off) * head_dim + d_a];
+            bb[e] = (_Float16)raw_kv[(size_t)(k + raw_off) * head_dim + d_b];
+        }
+        c_a = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, ba, c_a);
+        c_b = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bb, c_b);
+    }
+    if (r < n_raw) {
+        half8 a = {0,0,0,0,0,0,0,0}, ba = {0,0,0,0,0,0,0,0}, bb = {0,0,0,0,0,0,0,0};
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const unsigned int k = r + kh + (unsigned int)e;
+            if (k < n_raw) {
+                a[e]  = swrow[k];
+                ba[e] = (_Float16)raw_kv[(size_t)(k + raw_off) * head_dim + d_a];
+                bb[e] = (_Float16)raw_kv[(size_t)(k + raw_off) * head_dim + d_b];
+            }
+        }
+        c_a = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, ba, c_a);
+        c_b = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bb, c_b);
+    }
+    if (comp_kv) {
+        unsigned int c = 0;
+        for (; c + 16u <= n_comp; c += 16u) {
+            half8 a, ba, bb;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const unsigned int cc = c + kh + (unsigned int)e;
+                a[e]  = swrow[n_raw + cc];
+                ba[e] = (_Float16)comp_kv[(size_t)cc * head_dim + d_a];
+                bb[e] = (_Float16)comp_kv[(size_t)cc * head_dim + d_b];
+            }
+            c_a = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, ba, c_a);
+            c_b = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bb, c_b);
+        }
+        if (c < n_comp) {
+            half8 a = {0,0,0,0,0,0,0,0}, ba = {0,0,0,0,0,0,0,0}, bb = {0,0,0,0,0,0,0,0};
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const unsigned int cc = c + kh + (unsigned int)e;
+                if (cc < n_comp) {
+                    a[e]  = swrow[n_raw + cc];
+                    ba[e] = (_Float16)comp_kv[(size_t)cc * head_dim + d_a];
+                    bb[e] = (_Float16)comp_kv[(size_t)cc * head_dim + d_b];
+                }
+            }
+            c_a = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, ba, c_a);
+            c_b = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bb, c_b);
+        }
+    }
+    #pragma unroll
+    for (int e = 0; e < 8; e++) {
+        const unsigned int mh = (lane >> 4) * 8u + (unsigned int)e;
+        if (mh < ht) {
+            const float scale = s_inv[mh];
+            const size_t obase = ((size_t)b * n_head + h0 + mh) * head_dim;
+            out[obase + d_a] = c_a[e] * scale;
+            out[obase + d_b] = c_b[e] * scale;
+        }
+    }
+#else
+    (void)out; (void)raw_kv; (void)comp_kv; (void)head_dim; (void)lane;
+#endif
+}
+
