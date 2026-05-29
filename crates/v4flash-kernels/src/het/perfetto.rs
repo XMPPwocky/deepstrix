@@ -131,12 +131,6 @@ pub struct DeviceTimingExporter {
     pub dgpu_xfer: Track,
     pub igpu_compute: Track,
     pub igpu_xfer: Track,
-    /// M40-P4: per-token dGPU tracks for the pair-forward path. None until
-    /// `open_with_pair_tracks` is called.
-    pub dgpu_compute_t0: Option<Track>,
-    pub dgpu_compute_t1: Option<Track>,
-    pub dgpu_xfer_t0: Option<Track>,
-    pub dgpu_xfer_t1: Option<Track>,
 }
 
 impl DeviceTimingExporter {
@@ -182,78 +176,12 @@ impl DeviceTimingExporter {
             dgpu_xfer,
             igpu_compute,
             igpu_xfer,
-            dgpu_compute_t0: None,
-            dgpu_compute_t1: None,
-            dgpu_xfer_t0: None,
-            dgpu_xfer_t1: None,
         };
         this.declare_track(this.dgpu_compute.uuid, "dgpu.compute (device)")?;
         this.declare_track(this.dgpu_xfer.uuid, "dgpu.xfer (device)")?;
         this.declare_track(this.igpu_compute.uuid, "igpu.compute (device)")?;
         this.declare_track(this.igpu_xfer.uuid, "igpu.xfer (device)")?;
         Ok(this)
-    }
-
-    /// M40-P4: declare 4 additional dGPU tracks for per-token visualization
-    /// of `forward_pair_interleaved`. Call once after `open` if pair tracing
-    /// is desired.
-    pub fn add_pair_tracks(
-        &mut self,
-        dgpu: Device,
-        dgpu_compute_t0_stream: &Stream,
-        dgpu_compute_t1_stream: &Stream,
-        dgpu_xfer_t0_stream: &Stream,
-        dgpu_xfer_t1_stream: &Stream,
-    ) -> eyre::Result<()> {
-        let dgpu_compute_t0 = Track {
-            uuid: 0x44504755_0000_1001,
-            anchor: Anchor::new(dgpu_compute_t0_stream, dgpu)?,
-        };
-        let dgpu_compute_t1 = Track {
-            uuid: 0x44504755_0000_1002,
-            anchor: Anchor::new(dgpu_compute_t1_stream, dgpu)?,
-        };
-        let dgpu_xfer_t0 = Track {
-            uuid: 0x44504755_0000_2001,
-            anchor: Anchor::new(dgpu_xfer_t0_stream, dgpu)?,
-        };
-        let dgpu_xfer_t1 = Track {
-            uuid: 0x44504755_0000_2002,
-            anchor: Anchor::new(dgpu_xfer_t1_stream, dgpu)?,
-        };
-        self.declare_track(dgpu_compute_t0.uuid, "dgpu.compute_t0 (device)")?;
-        self.declare_track(dgpu_compute_t1.uuid, "dgpu.compute_t1 (device)")?;
-        self.declare_track(dgpu_xfer_t0.uuid, "dgpu.xfer_t0 (device)")?;
-        self.declare_track(dgpu_xfer_t1.uuid, "dgpu.xfer_t1 (device)")?;
-        self.dgpu_compute_t0 = Some(dgpu_compute_t0);
-        self.dgpu_compute_t1 = Some(dgpu_compute_t1);
-        self.dgpu_xfer_t0 = Some(dgpu_xfer_t0);
-        self.dgpu_xfer_t1 = Some(dgpu_xfer_t1);
-        Ok(())
-    }
-
-    /// Re-anchor the pair tracks (call once per pair forward to bound drift).
-    pub fn re_anchor_pair_tracks(
-        &mut self,
-        dgpu: Device,
-        dgpu_compute_t0_stream: &Stream,
-        dgpu_compute_t1_stream: &Stream,
-        dgpu_xfer_t0_stream: &Stream,
-        dgpu_xfer_t1_stream: &Stream,
-    ) -> eyre::Result<()> {
-        if let Some(t) = self.dgpu_compute_t0.as_mut() {
-            t.anchor = Anchor::new(dgpu_compute_t0_stream, dgpu)?;
-        }
-        if let Some(t) = self.dgpu_compute_t1.as_mut() {
-            t.anchor = Anchor::new(dgpu_compute_t1_stream, dgpu)?;
-        }
-        if let Some(t) = self.dgpu_xfer_t0.as_mut() {
-            t.anchor = Anchor::new(dgpu_xfer_t0_stream, dgpu)?;
-        }
-        if let Some(t) = self.dgpu_xfer_t1.as_mut() {
-            t.anchor = Anchor::new(dgpu_xfer_t1_stream, dgpu)?;
-        }
-        Ok(())
     }
 
     /// Re-record the per-stream anchors and capture fresh host wall-times.

@@ -89,12 +89,8 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
     let weights = HetModelWeights::load_all(&gguf, dgpu, igpu, &rope_for_layer)?;
     eprintln!("loaded.");
 
-    let mut engine =
+    let engine =
         HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
-    if std::env::var("BENCH_KEEPALIVE").is_ok() {
-        engine.attach_keepalive(&dgpu_arch)?;
-        eprintln!("M28: dGPU keep-alive ATTACHED");
-    }
     let mut dgpu_scratch = DgpuScratch::alloc(dgpu)?;
     let mut igpu_scratch = IgpuScratch::alloc(igpu)?;
     let n_positions = n_tokens + PROMPT_TOKENS.len() as i32 - 1;

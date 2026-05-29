@@ -20,7 +20,6 @@ use crate::f16::F16Matvec;
 use crate::ffn::{Swiglu, SwigluClampWeighted, VecAddInplace};
 use crate::head::{HcPost, HcSigmoidBias, HcSinkhorn, HcWeightedSum};
 use crate::comp_kv_append::CompKvAppend;
-use crate::keep_alive::KeepAlive;
 use crate::iq2_xxs::Iq2XxsPairMatvec;
 use crate::kv_cache_append::KvCacheAppend;
 use crate::q2_k::Q2KAccumulateMatvec;
@@ -63,14 +62,6 @@ pub struct DeviceEngine {
     /// Per the load-bearing peer-copy rule, `hipMemcpyPeerAsync` MUST be
     /// queued on the **source** device's stream.
     pub xfer: Stream,
-    /// M40-P4: per-token dGPU streams for `forward_pair_interleaved`.
-    /// On the iGPU these stay None — iGPU MoE is FIFO-serialized through
-    /// the single `compute` stream because MoE is the bottleneck and the
-    /// dGPU side does the parallelism.
-    pub compute_t0: Option<Stream>,
-    pub compute_t1: Option<Stream>,
-    pub xfer_t0: Option<Stream>,
-    pub xfer_t1: Option<Stream>,
 
     pub rms_w: RmsNorm,
     pub rms_nw: RmsNormNoWeight,
@@ -125,26 +116,12 @@ impl DeviceEngine {
         let compute = Stream::new(device.id)?;
         let xfer = Stream::new(device.id)?;
         let is_igpu = device.properties()?.integrated;
-        let (compute_t0, compute_t1, xfer_t0, xfer_t1) = if !is_igpu {
-            (
-                Some(Stream::new(device.id)?),
-                Some(Stream::new(device.id)?),
-                Some(Stream::new(device.id)?),
-                Some(Stream::new(device.id)?),
-            )
-        } else {
-            (None, None, None, None)
-        };
         let label: &'static str = if is_igpu { "igpu" } else { "dgpu" };
         let events = EventPool::new(label, EVENT_POOL_CAPACITY)?;
         Ok(Self {
             device,
             compute,
             xfer,
-            compute_t0,
-            compute_t1,
-            xfer_t0,
-            xfer_t1,
             rms_w: RmsNorm::for_arch(arch)?,
             rms_nw: RmsNormNoWeight::for_arch(arch)?,
             q8: Q8_0Matvec::for_arch(arch)?,
@@ -259,16 +236,10 @@ pub struct HeterogeneousEngine {
     /// Pre-allocated per-layer sync events for `HetParallel`. Unused in
     /// `HetSingleStream` but cheap to keep allocated.
     pub sync_events: HetSyncEvents,
-    /// M40-P3.5: second per-layer event set for token1 in the substage-
-    /// interleaved pair forward. `sync_events` is t0, this is t1. Allocated
-    /// identically to sync_events.
+    /// Second per-layer event set, used by the two-lane pipelined prefill
+    /// in `forward_prefill_pipelined` — lane A uses `sync_events`, lane B
+    /// uses this. Allocated identically.
     pub sync_events_t1: HetSyncEvents,
-    /// M40-P4: per-layer cross-token sync event for the pair forward.
-    /// Recorded on de.compute_t0 after t0's pre-attn state writes (KV
-    /// append + optional compressor state). de.compute_t1 waits on it
-    /// before t1's attention so t1's attn_mixed/attn_swa kernel sees a
-    /// kv_cache that includes row `pos` written by t0.
-    pub pair_t0_state_ready: Vec<Event>,
     /// Optional per-token device-time perfetto exporter. Drains the
     /// EventPools at the end of each `forward_token` into per-stream
     /// perfetto tracks. Enable by calling
@@ -331,20 +302,6 @@ pub struct HeterogeneousEngine {
     /// the stream, so the read-after-write dependency is preserved.
     pub dgpu_combined_ffn_pre_attn_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
 
-    /// M40-P4.8: per-layer captured graphs for the pair_pre_moe_batched
-    /// blocks. Each block is single-stream (de.compute) and references
-    /// stable TokenScratch pointers — safe to capture. Per-token rope,
-    /// kv_append, and attn launches stay OUTSIDE the captured graphs
-    /// because they take per-token `pos`/`n_raw` runtime params.
-    pub dgpu_pair_mhc_pre_attn_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
-    pub dgpu_pair_q_chain_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
-    pub dgpu_pair_kv_chain_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
-    pub dgpu_pair_output_proj_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
-    pub dgpu_pair_mhc_post_attn_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
-    pub dgpu_pair_mhc_pre_ffn_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
-    pub dgpu_pair_router_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
-    pub dgpu_pair_shared_expert_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
-    pub dgpu_pair_ffn_combine_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
     /// M20: cache which HIP device is currently bound on this thread,
     /// so set_current_cached() can skip the driver call when the
     /// device hasn't actually changed. AtomicI32 (not Cell) so
@@ -356,12 +313,6 @@ pub struct HeterogeneousEngine {
     pub last_host_us: std::sync::atomic::AtomicU64,
     /// M27 diagnostic: time spent in the final synchronize() call.
     pub last_sync_us: std::sync::atomic::AtomicU64,
-    /// M28: dGPU clock keep-alive. Tiny no-op kernel launched on a
-    /// secondary stream to keep the dGPU "busy" between idle windows
-    /// so its clock doesn't dip. Enabled by attach_keepalive(); off
-    /// by default (no overhead in the standard config).
-    pub dgpu_keepalive: Option<KeepAlive>,
-    pub dgpu_keepalive_stream: Option<Stream>,
 }
 
 impl HeterogeneousEngine {
@@ -403,15 +354,6 @@ impl HeterogeneousEngine {
 
         self.set_current_cached(self.dgpu.device)?;
         dgpu_scratch.residual.copy_from_host(input_hc_host)?;
-
-        // M28 tried: spawn keep-alive kernels on secondary stream to
-        // prevent dGPU clock dips. REGRESSED 24 → 14 tok/s — host
-        // time exploded (4 → 37 ms) from HIP runtime blocking on the
-        // keep-alive stream's queue. Mechanism kept around (the
-        // KeepAlive module + secondary stream alloc) but not invoked.
-        // Real clock-dip fix is sysfs setperflevel/setperfdeterminism,
-        // done outside the test process.
-        let _ = (&self.dgpu_keepalive, &self.dgpu_keepalive_stream);
 
         let token_start = std::time::Instant::now();
         for layer in 0..N_LAYER as usize {
@@ -548,173 +490,6 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
-    /// M40-P1: layer-major pair forward for K=1 spec decode. Processes
-    /// two tokens (token0 at pos, token1 at pos+1) through the model in
-    /// interleaved layer order:
-    ///
-    ///   for each layer L:
-    ///     run forward_layer_pair_mode for token0 at L
-    ///     snapshot per-layer state
-    ///     run forward_layer_pair_mode for token1 at L
-    ///
-    /// Then runs the head twice (once per token's final HC). Writes
-    /// token0's logits to `dgpu_scratch.logits_token0` and token1's
-    /// logits to `dgpu_scratch.logits`.
-    ///
-    /// On caller-detected partial reject, call `state.restore_all()` to
-    /// roll back token1's effects on per-layer state.
-    ///
-    /// `input_hc_0` / `input_hc_1` must both be HC_DIM. The caller is
-    /// responsible for computing them (via token embedding outside
-    /// the engine, e.g. as bench_decode does for forward_token).
-    ///
-    /// Pair-mode bypasses M30 combined graphs (see
-    /// `forward_layer_pair_mode`). It uses per-layer standalone
-    /// mhc_pre_attn + ffn_combine graphs which exist for every layer.
-    /// First-call captures may be triggered for layers that weren't
-    /// captured during prior forward_token runs; this is a one-time
-    /// cost.
-    pub fn forward_pair(
-        &self,
-        dgpu_scratch: &mut super::DgpuScratch,
-        igpu_scratch: &mut super::IgpuScratch,
-        state: &mut super::HetModelState,
-        weights: &super::HetModelWeights,
-        input_hc_0: &[f32],
-        input_hc_1: &[f32],
-        pos: u32,
-        token_id_0: i32,
-        token_id_1: i32,
-    ) -> color_eyre::eyre::Result<()> {
-        use crate::forward::{HC_DIM, N_LAYER};
-        use tracing::debug_span;
-
-        if input_hc_0.len() != HC_DIM as usize || input_hc_1.len() != HC_DIM as usize {
-            return Err(color_eyre::eyre::eyre!(
-                "forward_pair: input_hc lengths must equal HC_DIM={} (got {} / {})",
-                HC_DIM,
-                input_hc_0.len(),
-                input_hc_1.len()
-            ));
-        }
-        let _span = debug_span!("het.pair", pos, token_id_0, token_id_1).entered();
-
-        self.dgpu.events.reset();
-        self.igpu.events.reset();
-
-        self.set_current_cached(self.dgpu.device)?;
-
-        // Initialize both stashes from the inputs. The loop body always
-        // copies stash → residual BEFORE each forward_layer call, so we
-        // don't need to seed residual itself.
-        dgpu_scratch
-            .residual_stash_token0
-            .copy_from_host(input_hc_0)?;
-        dgpu_scratch
-            .residual_stash_token1
-            .copy_from_host(input_hc_1)?;
-
-        let pair_start = std::time::Instant::now();
-        for layer in 0..N_LAYER as usize {
-            // M15.1 parity: forward_token does `swap(residual, residual_next)` after
-            // each layer's forward_layer call. We mirror that BETWEEN outer-loop
-            // iterations so the (residual, residual_next) pointer assignment at the
-            // start of each layer L matches what layer L's captured graphs expect.
-            if layer > 0 {
-                std::mem::swap(
-                    &mut dgpu_scratch.residual,
-                    &mut dgpu_scratch.residual_next,
-                );
-            }
-
-            // === Token0's layer L ===
-            // Load token0's HC input (= its output from layer L-1, in stash_token0)
-            // into whatever physical buffer `residual` currently points to.
-            dgpu_scratch
-                .residual
-                .copy_from_buffer(&dgpu_scratch.residual_stash_token0)?;
-            self.forward_layer_pair_mode(
-                dgpu_scratch,
-                igpu_scratch,
-                &mut state.layers[layer],
-                &weights.dgpu_layers[layer],
-                &weights.igpu_layers[layer],
-                pos,
-                token_id_0,
-            )?;
-            // residual_next now has token0's output of layer L → save for next iter.
-            dgpu_scratch
-                .residual_stash_token0
-                .copy_from_buffer(&dgpu_scratch.residual_next)?;
-
-            // === Per-layer snapshot (post-token0, pre-token1) ===
-            // Async on dGPU compute + iGPU compute streams: queued
-            // after token0's writes complete (same stream as those
-            // writes) and BEFORE token1's reads, since the captured
-            // graph for token1 launches on the same streams in order.
-            state.layers[layer].snapshot_async(&self.dgpu.compute, &self.igpu.compute)?;
-
-            // === Token1's layer L ===
-            dgpu_scratch
-                .residual
-                .copy_from_buffer(&dgpu_scratch.residual_stash_token1)?;
-            self.forward_layer_pair_mode(
-                dgpu_scratch,
-                igpu_scratch,
-                &mut state.layers[layer],
-                &weights.dgpu_layers[layer],
-                &weights.igpu_layers[layer],
-                pos + 1,
-                token_id_1,
-            )?;
-            dgpu_scratch
-                .residual_stash_token1
-                .copy_from_buffer(&dgpu_scratch.residual_next)?;
-            // Pointer assignment unchanged within the iter (no swaps inside).
-            // At end of iter: (residual, residual_next) at the layer-L-capture
-            // pointer assignment, contents arbitrary (overwritten next iter).
-        }
-
-        // M15.1: forward_token does (N_LAYER) in-loop swaps + 1 epilogue swap =
-        // N_LAYER + 1 = 44 (even) → residual/residual_next back at initial parity.
-        // forward_pair does (N_LAYER - 1 = 42, even) inter-iter swaps already. We do
-        // ZERO epilogue swaps so the total stays even (42) and parity returns to
-        // initial — matching what subsequent forward_token / forward_pair calls
-        // expect via the captured-graph buffer-pointer invariant. (Adding a wrong
-        // epilogue swap here makes the SECOND forward_pair call read stale residual
-        // buffers and produce garbage; the first call works by accident because it
-        // starts at the correct parity from forward_token's end state.)
-
-        // === Head for token0 ===
-        // Load token0's final HC into residual (whatever pointer it is now).
-        dgpu_scratch
-            .residual
-            .copy_from_buffer(&dgpu_scratch.residual_stash_token0)?;
-        self.forward_head(dgpu_scratch, &weights.global)?;
-        // Save token0's logits before token1's head overwrites dgpu_scratch.logits.
-        dgpu_scratch
-            .logits_token0
-            .copy_from_buffer(&dgpu_scratch.logits)?;
-
-        // === Head for token1 ===
-        dgpu_scratch
-            .residual
-            .copy_from_buffer(&dgpu_scratch.residual_stash_token1)?;
-        self.forward_head(dgpu_scratch, &weights.global)?;
-        // dgpu_scratch.logits now has token1's logits.
-
-        self.set_current_cached(self.dgpu.device)?;
-        let host_us = pair_start.elapsed().as_micros() as u64;
-        self.dgpu.compute.synchronize()?;
-        let pair_elapsed_us = pair_start.elapsed().as_micros() as u64;
-        let sync_us = pair_elapsed_us.saturating_sub(host_us);
-        use std::sync::atomic::Ordering;
-        self.last_host_us.store(host_us, Ordering::Relaxed);
-        self.last_sync_us.store(sync_us, Ordering::Relaxed);
-
-        Ok(())
-    }
-
     /// Build a het engine over (dgpu, igpu). Enables peer access both
     /// directions — if the runtime refuses, that's surfaced as an error
     /// here rather than at the first `hipMemcpyPeerAsync` call.
@@ -753,12 +528,7 @@ impl HeterogeneousEngine {
 
         let sync_events = HetSyncEvents::alloc(dgpu_device, igpu_device)?;
         let sync_events_t1 = HetSyncEvents::alloc(dgpu_device, igpu_device)?;
-        // M40-P4: per-layer cross-token kv-state event (on dGPU).
         dgpu_device.set_current()?;
-        let mut pair_t0_state_ready = Vec::with_capacity(N_LAYER as usize);
-        for _ in 0..N_LAYER {
-            pair_t0_state_ready.push(Event::new_no_timing()?);
-        }
 
         let mut igpu_moe_graphs = Vec::with_capacity(N_LAYER as usize);
         let mut dgpu_mhc_pre_attn_graphs = Vec::with_capacity(N_LAYER as usize);
@@ -782,35 +552,12 @@ impl HeterogeneousEngine {
             dgpu_combined_ffn_pre_attn_graphs.push(std::sync::Mutex::new(None));
         }
 
-        // M40-P4.8: pair-mode captured-graph slots, one per layer per block.
-        let mut dgpu_pair_mhc_pre_attn_graphs = Vec::with_capacity(N_LAYER as usize);
-        let mut dgpu_pair_q_chain_graphs = Vec::with_capacity(N_LAYER as usize);
-        let mut dgpu_pair_kv_chain_graphs = Vec::with_capacity(N_LAYER as usize);
-        let mut dgpu_pair_output_proj_graphs = Vec::with_capacity(N_LAYER as usize);
-        let mut dgpu_pair_mhc_post_attn_graphs = Vec::with_capacity(N_LAYER as usize);
-        let mut dgpu_pair_mhc_pre_ffn_graphs = Vec::with_capacity(N_LAYER as usize);
-        let mut dgpu_pair_router_graphs = Vec::with_capacity(N_LAYER as usize);
-        let mut dgpu_pair_shared_expert_graphs = Vec::with_capacity(N_LAYER as usize);
-        let mut dgpu_pair_ffn_combine_graphs = Vec::with_capacity(N_LAYER as usize);
-        for _ in 0..N_LAYER {
-            dgpu_pair_mhc_pre_attn_graphs.push(std::sync::Mutex::new(None));
-            dgpu_pair_q_chain_graphs.push(std::sync::Mutex::new(None));
-            dgpu_pair_kv_chain_graphs.push(std::sync::Mutex::new(None));
-            dgpu_pair_output_proj_graphs.push(std::sync::Mutex::new(None));
-            dgpu_pair_mhc_post_attn_graphs.push(std::sync::Mutex::new(None));
-            dgpu_pair_mhc_pre_ffn_graphs.push(std::sync::Mutex::new(None));
-            dgpu_pair_router_graphs.push(std::sync::Mutex::new(None));
-            dgpu_pair_shared_expert_graphs.push(std::sync::Mutex::new(None));
-            dgpu_pair_ffn_combine_graphs.push(std::sync::Mutex::new(None));
-        }
-
         Ok(Self {
             dgpu,
             igpu,
             mode,
             sync_events,
             sync_events_t1,
-            pair_t0_state_ready,
             perfetto: None,
             igpu_moe_graphs,
             dgpu_mhc_pre_attn_graphs,
@@ -820,34 +567,10 @@ impl HeterogeneousEngine {
             dgpu_output_proj_post_rope_graphs,
             dgpu_ffn_combine_graphs,
             dgpu_combined_ffn_pre_attn_graphs,
-            dgpu_pair_mhc_pre_attn_graphs,
-            dgpu_pair_q_chain_graphs,
-            dgpu_pair_kv_chain_graphs,
-            dgpu_pair_output_proj_graphs,
-            dgpu_pair_mhc_post_attn_graphs,
-            dgpu_pair_mhc_pre_ffn_graphs,
-            dgpu_pair_router_graphs,
-            dgpu_pair_shared_expert_graphs,
-            dgpu_pair_ffn_combine_graphs,
             current_device: std::sync::atomic::AtomicI32::new(-1),
             last_host_us: std::sync::atomic::AtomicU64::new(0),
             last_sync_us: std::sync::atomic::AtomicU64::new(0),
-            dgpu_keepalive: None,
-            dgpu_keepalive_stream: None,
         })
-    }
-
-    /// M28: attach a clock-keep-alive kernel on a secondary dGPU stream.
-    /// When attached, forward_token will spawn tiny no-op kernels on
-    /// this stream throughout each token to keep the dGPU clock from
-    /// dropping into a low-power state.
-    pub fn attach_keepalive(&mut self, arch: &str) -> eyre::Result<()> {
-        self.dgpu.device.set_current()?;
-        let ka = KeepAlive::for_arch(arch)?;
-        let stream = Stream::new(self.dgpu.device.id)?;
-        self.dgpu_keepalive = Some(ka);
-        self.dgpu_keepalive_stream = Some(stream);
-        Ok(())
     }
 
     /// Drain both devices to idle before teardown. Call this once after
@@ -898,7 +621,7 @@ impl HeterogeneousEngine {
         &mut self,
         path: impl AsRef<std::path::Path>,
     ) -> eyre::Result<()> {
-        let mut exporter = DeviceTimingExporter::open(
+        let exporter = DeviceTimingExporter::open(
             path,
             self.dgpu.device,
             &self.dgpu.compute,
@@ -907,15 +630,6 @@ impl HeterogeneousEngine {
             &self.igpu.compute,
             &self.igpu.xfer,
         )?;
-        // M40-P4: add 4 dGPU per-token tracks if those streams exist.
-        if let (Some(ct0), Some(ct1), Some(xt0), Some(xt1)) = (
-            self.dgpu.compute_t0.as_ref(),
-            self.dgpu.compute_t1.as_ref(),
-            self.dgpu.xfer_t0.as_ref(),
-            self.dgpu.xfer_t1.as_ref(),
-        ) {
-            exporter.add_pair_tracks(self.dgpu.device, ct0, ct1, xt0, xt1)?;
-        }
         self.perfetto = Some(std::sync::Mutex::new(exporter));
         self.dgpu.events.set_enabled(true);
         self.igpu.events.set_enabled(true);

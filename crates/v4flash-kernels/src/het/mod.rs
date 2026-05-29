@@ -20,14 +20,7 @@ pub mod batch_scratch;
 pub mod engine;
 pub mod forward_head;
 pub mod forward_layer;
-pub mod forward_mtp;
 pub mod forward_prefill;
-// Commented out 2026-05-27 — speculative-decode path retired pending
-// review. Source preserved in git history. Re-enable along with
-// `spec_decode` when needed.
-// pub mod forward_pair_interleaved;
-// pub mod spec_decode;
-pub mod mtp_weights;
 pub mod perfetto;
 pub mod prefill_stats;
 pub mod scratch;
@@ -39,9 +32,8 @@ pub mod weights;
 pub use batch_scratch::{BatchDgpuScratch, BatchIgpuScratch, BatchScratch, B_MAX};
 pub use prefill_stats::{LayerStats, PerChunkReuse, PrefillStats};
 pub use engine::{DeviceEngine, ExecMode, HeterogeneousEngine};
-pub use mtp_weights::{MtpRoutedExperts, MtpWeights};
-pub use scratch::{DgpuScratch, IgpuScratch, TokenScratch};
-pub use state::{HetCompressorState, HetLayerState, HetModelState, MtpLayerState};
+pub use scratch::{DgpuScratch, IgpuScratch};
+pub use state::{HetCompressorState, HetLayerState, HetModelState};
 pub use weights::{
     DgpuLayerWeights, HetGlobalWeights, HetModelWeights, IgpuLayerWeights,
 };
