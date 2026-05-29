@@ -25,14 +25,6 @@ pub struct CompressorWeights {
     pub head_dim: u32,
 }
 
-/// IndexerWeights (only on ratio==4 layers). Indexer scoring path is
-/// skipped for our short-prompt validation; we load `q_b` / `proj` only
-/// when the indexer is actually wired.
-pub struct IndexerWeights {
-    pub q_b: DeviceWeight,
-    pub proj: DeviceWeight,
-}
-
 pub struct SharedExpertWeights {
     pub gate: DeviceWeight,
     pub up: DeviceWeight,

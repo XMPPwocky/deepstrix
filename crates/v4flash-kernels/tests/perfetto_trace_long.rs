@@ -157,9 +157,6 @@ fn perfetto_trace_long() -> eyre::Result<()> {
                 if let Some(cs) = ls.compressor.as_mut() {
                     cs.n_comp = (warmup_pos as u32) / ratio;
                 }
-                if let Some(ics) = ls.indexer_compressor.as_mut() {
-                    ics.n_comp = (warmup_pos as u32) / ratio;
-                }
             }
         }
         eprintln!(

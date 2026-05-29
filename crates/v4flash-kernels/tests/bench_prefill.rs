@@ -356,9 +356,6 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                     if let Some(cs) = ls.compressor.as_mut() {
                         cs.n_comp = pos / ratio;
                     }
-                    if let Some(ics) = ls.indexer_compressor.as_mut() {
-                        ics.n_comp = pos / ratio;
-                    }
                 }
             }
         };

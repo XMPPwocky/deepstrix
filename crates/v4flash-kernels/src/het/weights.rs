@@ -14,11 +14,10 @@ use v4flash_hip::{Device, DeviceBuffer};
 
 use crate::config::{
     BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, COMPRESS_RATIOS, HC_MIX_DIM, N_EMBD, N_HASH_LAYERS,
-    N_HC, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, N_LORA_Q,
+    N_HC, N_HEAD, N_HEAD_DIM, N_LAYER, N_LORA_Q,
 };
 use crate::model_weights::{
-    load_f32_weight, load_i32_tensor, CompressorWeights, IndexerWeights, RoutedExpertWeights,
-    SharedExpertWeights,
+    load_f32_weight, load_i32_tensor, CompressorWeights, RoutedExpertWeights, SharedExpertWeights,
 };
 use crate::iq2_xxs::BLOCK_IQ2_XXS_BYTES;
 use crate::q2_k::BLOCK_Q2_K_BYTES;
@@ -89,14 +88,8 @@ pub struct IgpuLayerWeights {
     // Routed experts (all 256, iGPU-resident)
     pub routed: RoutedExpertWeights,
 
-    // CSA producers (M13.5: now iGPU-resident; iGPU runs the
-    // compressor and peer-pushes `comp_row` to the dGPU's `comp_kv` on
-    // boundaries).
-    pub compressor: Option<CompressorWeights>,
-    pub indexer_compressor: Option<CompressorWeights>,
-    pub indexer: Option<IndexerWeights>,
-    /// Per-layer RoPE params (compressor needs them for the boundary
-    /// comp_row RoPE pass; copy mirrors dGPU's).
+    /// Per-layer RoPE params. Mirrors the dGPU side for any future
+    /// iGPU-resident RoPE call (currently unused — all RoPE runs on dGPU).
     pub rope_params: RopeParams,
 }
 
@@ -408,55 +401,6 @@ impl IgpuLayerWeights {
             None
         };
 
-        // M14L: attn compressor moved to dGPU. Field kept (None) so the
-        // IgpuLayerWeights shape is unchanged for non-compressor consumers
-        // (indexer_compressor below remains iGPU-resident).
-        let compressor: Option<CompressorWeights> = None;
-        let indexer_compressor = if ratio == 4 {
-            Some(CompressorWeights {
-                wkv: load_to_device(
-                    gguf,
-                    &format!("blk.{layer}.indexer_compressor_kv.weight"),
-                    device_id,
-                )?,
-                wgate: load_to_device(
-                    gguf,
-                    &format!("blk.{layer}.indexer_compressor_gate.weight"),
-                    device_id,
-                )?,
-                ape: load_to_device(
-                    gguf,
-                    &format!("blk.{layer}.indexer_compressor_ape.weight"),
-                    device_id,
-                )?,
-                norm: load_f32_weight(
-                    gguf,
-                    &format!("blk.{layer}.indexer_compressor_norm.weight"),
-                    device_id,
-                    N_INDEXER_HEAD_DIM as usize,
-                )?,
-                width: 256,
-                head_dim: N_INDEXER_HEAD_DIM,
-            })
-        } else {
-            None
-        };
-        let indexer = if ratio == 4 {
-            Some(IndexerWeights {
-                q_b: load_to_device(
-                    gguf,
-                    &format!("blk.{layer}.indexer.attn_q_b.weight"),
-                    device_id,
-                )?,
-                proj: load_to_device(
-                    gguf,
-                    &format!("blk.{layer}.indexer.proj.weight"),
-                    device_id,
-                )?,
-            })
-        } else {
-            None
-        };
         let rope_params = rope_params_for_layer(layer)?;
 
         Ok(IgpuLayerWeights {
@@ -468,9 +412,6 @@ impl IgpuLayerWeights {
             router_bias,
             router_bias_dev,
             routed,
-            compressor,
-            indexer_compressor,
-            indexer,
             rope_params,
         })
     }

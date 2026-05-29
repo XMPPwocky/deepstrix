@@ -8,7 +8,7 @@
 use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer};
 
-use crate::config::{COMPRESS_RATIOS, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, NEG_INF, SWA_WINDOW};
+use crate::config::{COMPRESS_RATIOS, N_HEAD_DIM, N_LAYER, NEG_INF, SWA_WINDOW};
 use crate::het::batch_scratch::B_MAX;
 
 /// During batched prefill we need to hold the prior SWA-window AND the
@@ -77,7 +77,6 @@ pub struct HetLayerState {
     pub kv_cache: DeviceBuffer<f32>,
     pub n_raw: u32,
     pub compressor: Option<HetCompressorState>,
-    pub indexer_compressor: Option<HetCompressorState>,
 }
 
 pub struct HetModelState {
@@ -86,29 +85,18 @@ pub struct HetModelState {
 }
 
 impl HetModelState {
-    pub fn alloc(dgpu_device: Device, igpu_device: Device, n_kv_max: u32) -> eyre::Result<Self> {
+    pub fn alloc(dgpu_device: Device, _igpu_device: Device, n_kv_max: u32) -> eyre::Result<Self> {
         let mut layers = Vec::with_capacity(N_LAYER as usize);
         for layer in 0..N_LAYER {
             let ratio = COMPRESS_RATIOS[layer as usize];
             let compressor = if ratio > 0 {
-                // M14L: attn compressor state moved to dGPU so the compressor
-                // can run there alongside attn_input_norm with no peer push.
+                // Attn compressor state lives on dGPU alongside attn_input_norm
+                // (no peer push needed for the boundary `comp_row` write).
                 Some(HetCompressorState::alloc(
                     dgpu_device,
                     dgpu_device,
                     ratio,
                     N_HEAD_DIM,
-                    n_kv_max,
-                )?)
-            } else {
-                None
-            };
-            let indexer_compressor = if ratio == 4 {
-                Some(HetCompressorState::alloc(
-                    igpu_device,
-                    dgpu_device,
-                    ratio,
-                    N_INDEXER_HEAD_DIM,
                     n_kv_max,
                 )?)
             } else {
@@ -132,7 +120,6 @@ impl HetModelState {
                 )?,
                 n_raw: 0,
                 compressor,
-                indexer_compressor,
             });
         }
         Ok(Self {
