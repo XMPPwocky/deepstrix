@@ -8,7 +8,9 @@
 //! been wired yet.
 
 use color_eyre::eyre;
-use v4flash_hip::{Device, Event, GraphExec, Stream};
+use v4flash_hip::{Device, Event, Stream};
+
+use super::graph_cache::GraphCache;
 
 use crate::forward::N_LAYER;
 
@@ -246,61 +248,18 @@ pub struct HeterogeneousEngine {
     /// [`HeterogeneousEngine::attach_perfetto`].
     pub perfetto: Option<std::sync::Mutex<DeviceTimingExporter>>,
 
-    /// M15: per-layer captured HIP graphs for the iGPU routed-MoE
-    /// sub-pipeline (q8k_xq → iq2_fused_swiglu_batch → q8k_mid_batch →
-    /// q2k_down_batch). All 4 launches have device-resident inputs and
-    /// layer-constant scalar params, so the graph captures once on the
-    /// first call to each layer and replays for every subsequent token.
-    /// Each layer slot is `None` until the first forward_layer call
-    /// initializes it.
-    pub igpu_moe_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
-    /// M15: per-layer captured graphs for the dGPU mHC pre-attn block
-    /// (5 kernels: rms_nw → f16_matvec → hc_sinkhorn → hc_weighted →
-    /// rms_w_weighted). All inputs are device-resident; scalar params
-    /// are layer-constant.
-    pub dgpu_mhc_pre_attn_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
-    /// M15: per-layer captured graphs for the dGPU mHC pre-ffn block
-    /// (5 kernels, same shape as pre-attn but using the ffn-side
-    /// projection / scale / base / norm weights).
-    pub dgpu_mhc_pre_ffn_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
-    /// M15: per-layer captured graphs for the dGPU shared-expert chain
-    /// (6 kernels: q8_quantize → q8 gate matvec → q8 up matvec → swiglu
-    /// → q8_quantize_mid → q8 down matvec). All inputs are
-    /// device-resident; scalar params are layer-constant.
-    pub dgpu_shared_expert_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
-    /// M15: per-layer captured graphs for the dGPU Q-chain prefix
-    /// (6 kernels: q8_quantize → q8_matvec_qa → rms_w_qa → q8_quantize_qr
-    /// → q8_matvec_qb → rms_nw_heads). Stops before rope_forward, which
-    /// takes per-token `pos` and is launched directly.
-    pub dgpu_q_chain_pre_rope_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
-    /// M15: per-layer captured graphs for the dGPU output-projection
-    /// suffix (4 kernels: q8_quantize_heads → q8_grouped_matvec_a →
-    /// q8_quantize_low → q8_matvec_b). Skips the leading rope_inverse,
-    /// which takes per-token `pos`.
-    pub dgpu_output_proj_post_rope_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
-    /// M15.1: per-layer captured graphs for the dGPU ffn_combine block
-    /// (2 kernels: vec_add (ffn_moe_recv += ffn_shared) followed by
-    /// hc_post writing residual_next). Safe to capture because the
-    /// end-of-token extra swap keeps each layer's residual/residual_next
-    /// pointing to stable physical buffers. Under M30 this is populated
-    /// ONLY for the last layer (N_LAYER-1); transitions between layers
-    /// use the combined graphs below.
-    pub dgpu_ffn_combine_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
-    /// M30: per-layer-transition captured graphs combining ffn_combine_N
-    /// with mhc_pre_attn_{N+1} (7 kernels: vec_add → hc_post writing
-    /// residual_next of N → rms_nw of N+1 → f16_matvec → hc_sinkhorn →
-    /// hc_weighted → rms_w_weighted). One graph per transition →
-    /// `N_LAYER - 1` slots. Eliminates ~115µs/layer of host-scheduling
-    /// gap-idle between the two stages.
-    ///
-    /// Correctness: ffn_combine_N writes `residual_next` (physical buf X).
-    /// After the end-of-layer swap, layer N+1's `residual` IS buf X. So
-    /// mhc_pre_attn_{N+1} reading `residual` reads from the same physical
-    /// buffer ffn_combine_N just wrote. In the captured graph we pass
-    /// `residual_next.raw()` to BOTH stages — the device sees one buffer
-    /// throughout. HIP graph capture orders the kernels sequentially on
-    /// the stream, so the read-after-write dependency is preserved.
-    pub dgpu_combined_ffn_pre_attn_graphs: Vec<std::sync::Mutex<Option<GraphExec>>>,
+    /// Captured HIP-graph cache, keyed by `(stage_name, layer)`. Each
+    /// per-layer forward stage that is purely device-resident with
+    /// layer-constant scalar params is captured once and replayed per
+    /// token. Stages currently captured on the dGPU side: `mhc_pre_attn`,
+    /// `mhc_pre_ffn`, `shared_expert`, `q_chain`, `output_proj`,
+    /// `ffn_combine`, `combined_ffn_pre_attn` (the M30 cross-layer
+    /// merge). The combined graph occupies slot `(stage, layer)` for
+    /// the transition out of `layer` to `layer + 1`.
+    pub dgpu_graphs: GraphCache,
+    /// Same as `dgpu_graphs` for the iGPU routed-MoE sub-pipeline
+    /// (`igpu_moe`).
+    pub igpu_graphs: GraphCache,
 
     /// M20: cache which HIP device is currently bound on this thread,
     /// so set_current_cached() can skip the driver call when the
@@ -530,28 +489,6 @@ impl HeterogeneousEngine {
         let sync_events_t1 = HetSyncEvents::alloc(dgpu_device, igpu_device)?;
         dgpu_device.set_current()?;
 
-        let mut igpu_moe_graphs = Vec::with_capacity(N_LAYER as usize);
-        let mut dgpu_mhc_pre_attn_graphs = Vec::with_capacity(N_LAYER as usize);
-        let mut dgpu_mhc_pre_ffn_graphs = Vec::with_capacity(N_LAYER as usize);
-        let mut dgpu_shared_expert_graphs = Vec::with_capacity(N_LAYER as usize);
-        let mut dgpu_q_chain_pre_rope_graphs = Vec::with_capacity(N_LAYER as usize);
-        let mut dgpu_output_proj_post_rope_graphs = Vec::with_capacity(N_LAYER as usize);
-        let mut dgpu_ffn_combine_graphs = Vec::with_capacity(N_LAYER as usize);
-        let mut dgpu_combined_ffn_pre_attn_graphs =
-            Vec::with_capacity(N_LAYER as usize - 1);
-        for _ in 0..N_LAYER {
-            igpu_moe_graphs.push(std::sync::Mutex::new(None));
-            dgpu_mhc_pre_attn_graphs.push(std::sync::Mutex::new(None));
-            dgpu_mhc_pre_ffn_graphs.push(std::sync::Mutex::new(None));
-            dgpu_shared_expert_graphs.push(std::sync::Mutex::new(None));
-            dgpu_q_chain_pre_rope_graphs.push(std::sync::Mutex::new(None));
-            dgpu_output_proj_post_rope_graphs.push(std::sync::Mutex::new(None));
-            dgpu_ffn_combine_graphs.push(std::sync::Mutex::new(None));
-        }
-        for _ in 0..N_LAYER - 1 {
-            dgpu_combined_ffn_pre_attn_graphs.push(std::sync::Mutex::new(None));
-        }
-
         Ok(Self {
             dgpu,
             igpu,
@@ -559,14 +496,8 @@ impl HeterogeneousEngine {
             sync_events,
             sync_events_t1,
             perfetto: None,
-            igpu_moe_graphs,
-            dgpu_mhc_pre_attn_graphs,
-            dgpu_mhc_pre_ffn_graphs,
-            dgpu_shared_expert_graphs,
-            dgpu_q_chain_pre_rope_graphs,
-            dgpu_output_proj_post_rope_graphs,
-            dgpu_ffn_combine_graphs,
-            dgpu_combined_ffn_pre_attn_graphs,
+            dgpu_graphs: GraphCache::new(),
+            igpu_graphs: GraphCache::new(),
             current_device: std::sync::atomic::AtomicI32::new(-1),
             last_host_us: std::sync::atomic::AtomicU64::new(0),
             last_sync_us: std::sync::atomic::AtomicU64::new(0),

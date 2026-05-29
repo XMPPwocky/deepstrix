@@ -151,60 +151,14 @@ impl HeterogeneousEngine {
         if is_first_layer {
             let _t_mhc_pre = de.events.stage("dgpu.mhc_pre_attn", &de.compute)?;
             let _s_mhc_pre = debug_span!("mhc_pre_attn").entered();
-            let graph_slot = &self.dgpu_mhc_pre_attn_graphs[layer as usize];
-            let mut guard = graph_slot.lock().unwrap();
-            if guard.is_none() {
-                de.compute
-                    .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                de.rms_nw.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.flat,
-                    &dgpu_scratch.residual,
-                    1,
-                    HC_DIM,
-                    RMS_EPS,
-                )?;
-                de.f16.matvec(
-                    &de.compute,
-                    &mut dgpu_scratch.mix,
-                    &dlw.hc_attn_fn.buffer,
-                    &dgpu_scratch.flat,
-                    HC_MIX_DIM,
-                    HC_DIM,
-                )?;
-                de.hc_sinkhorn.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.split,
-                    &dgpu_scratch.mix,
-                    &dlw.hc_attn_scale,
-                    &dlw.hc_attn_base,
-                    N_HC,
-                    SINKHORN_ITERS,
-                    SINKHORN_EPS,
-                )?;
-                de.hc_weighted.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.attn_cur,
-                    &dgpu_scratch.residual,
-                    &dgpu_scratch.split,
-                    N_EMBD,
-                    N_HC,
-                )?;
-                de.rms_w.launch_weighted(
-                    &de.compute,
-                    &mut dgpu_scratch.attn_input_norm,
-                    &dgpu_scratch.attn_cur,
-                    &dlw.attn_norm,
-                    N_EMBD,
-                    RMS_EPS,
-                )?;
-                let graph = de.compute.end_capture()?;
-                let exec = graph.instantiate()?;
-                exec.launch(&de.compute)?;
-                *guard = Some(exec);
-            } else {
-                guard.as_ref().unwrap().launch(&de.compute)?;
-            }
+            self.dgpu_graphs.run("mhc_pre_attn", layer as u32, &de.compute, |s| {
+                de.rms_nw.launch(s, &mut dgpu_scratch.flat, &dgpu_scratch.residual, 1, HC_DIM, RMS_EPS)?;
+                de.f16.matvec(s, &mut dgpu_scratch.mix, &dlw.hc_attn_fn.buffer, &dgpu_scratch.flat, HC_MIX_DIM, HC_DIM)?;
+                de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &dlw.hc_attn_scale, &dlw.hc_attn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
+                de.hc_weighted.launch(s, &mut dgpu_scratch.attn_cur, &dgpu_scratch.residual, &dgpu_scratch.split, N_EMBD, N_HC)?;
+                de.rms_w.launch_weighted(s, &mut dgpu_scratch.attn_input_norm, &dgpu_scratch.attn_cur, &dlw.attn_norm, N_EMBD, RMS_EPS)?;
+                Ok(())
+            })?;
             drop(_s_mhc_pre);
             _t_mhc_pre.end()?;
         }
@@ -218,68 +172,15 @@ impl HeterogeneousEngine {
         // stays a direct launch.
         let _t_q = de.events.stage("dgpu.q_chain", &de.compute)?;
         let _s_q = debug_span!("q_chain").entered();
-        {
-            let graph_slot = &self.dgpu_q_chain_pre_rope_graphs[layer as usize];
-            let mut guard = graph_slot.lock().unwrap();
-            if guard.is_none() {
-                de.compute
-                    .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                de.q8.quantize_input(
-                    &de.compute,
-                    &mut dgpu_scratch.xq_n_embd,
-                    &mut dgpu_scratch.xscale_n_embd,
-                    &dgpu_scratch.attn_input_norm,
-                    N_EMBD,
-                )?;
-                de.q8.matvec(
-                    &de.compute,
-                    &mut dgpu_scratch.qr,
-                    &dlw.attn_q_a.buffer,
-                    &dgpu_scratch.xq_n_embd,
-                    &dgpu_scratch.xscale_n_embd,
-                    N_LORA_Q,
-                    N_EMBD,
-                )?;
-                de.rms_w.launch_weighted(
-                    &de.compute,
-                    &mut dgpu_scratch.qr_normed,
-                    &dgpu_scratch.qr,
-                    &dlw.q_a_norm,
-                    N_LORA_Q,
-                    RMS_EPS,
-                )?;
-                de.q8.quantize_input(
-                    &de.compute,
-                    &mut dgpu_scratch.qr_xq,
-                    &mut dgpu_scratch.qr_xscale,
-                    &dgpu_scratch.qr_normed,
-                    N_LORA_Q,
-                )?;
-                de.q8.matvec(
-                    &de.compute,
-                    &mut dgpu_scratch.q,
-                    &dlw.attn_q_b.buffer,
-                    &dgpu_scratch.qr_xq,
-                    &dgpu_scratch.qr_xscale,
-                    Q_FLAT,
-                    N_LORA_Q,
-                )?;
-                de.rms_nw.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.q_normed,
-                    &dgpu_scratch.q,
-                    N_HEAD,
-                    N_HEAD_DIM,
-                    RMS_EPS,
-                )?;
-                let graph = de.compute.end_capture()?;
-                let exec = graph.instantiate()?;
-                exec.launch(&de.compute)?;
-                *guard = Some(exec);
-            } else {
-                guard.as_ref().unwrap().launch(&de.compute)?;
-            }
-        }
+        self.dgpu_graphs.run("q_chain_pre_rope", layer as u32, &de.compute, |s| {
+            de.q8.quantize_input(s, &mut dgpu_scratch.xq_n_embd, &mut dgpu_scratch.xscale_n_embd, &dgpu_scratch.attn_input_norm, N_EMBD)?;
+            de.q8.matvec(s, &mut dgpu_scratch.qr, &dlw.attn_q_a.buffer, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_LORA_Q, N_EMBD)?;
+            de.rms_w.launch_weighted(s, &mut dgpu_scratch.qr_normed, &dgpu_scratch.qr, &dlw.q_a_norm, N_LORA_Q, RMS_EPS)?;
+            de.q8.quantize_input(s, &mut dgpu_scratch.qr_xq, &mut dgpu_scratch.qr_xscale, &dgpu_scratch.qr_normed, N_LORA_Q)?;
+            de.q8.matvec(s, &mut dgpu_scratch.q, &dlw.attn_q_b.buffer, &dgpu_scratch.qr_xq, &dgpu_scratch.qr_xscale, Q_FLAT, N_LORA_Q)?;
+            de.rms_nw.launch(s, &mut dgpu_scratch.q_normed, &dgpu_scratch.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
+            Ok(())
+        })?;
         de.rope.launch_forward(
             &de.compute,
             &mut dgpu_scratch.q_normed,
@@ -537,53 +438,13 @@ impl HeterogeneousEngine {
             pos,
             &dlw.rope_params,
         )?;
-        {
-            let graph_slot = &self.dgpu_output_proj_post_rope_graphs[layer as usize];
-            let mut guard = graph_slot.lock().unwrap();
-            if guard.is_none() {
-                de.compute
-                    .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                de.q8.quantize_input(
-                    &de.compute,
-                    &mut dgpu_scratch.heads_xq,
-                    &mut dgpu_scratch.heads_xscale,
-                    &dgpu_scratch.heads,
-                    Q_FLAT,
-                )?;
-                de.q8_grouped.matvec_grouped(
-                    &de.compute,
-                    &mut dgpu_scratch.low,
-                    &dlw.attn_output_a.buffer,
-                    &dgpu_scratch.heads_xq,
-                    &dgpu_scratch.heads_xscale,
-                    GROUP_DIM,
-                    RANK,
-                    N_GROUPS,
-                )?;
-                de.q8.quantize_input(
-                    &de.compute,
-                    &mut dgpu_scratch.low_xq,
-                    &mut dgpu_scratch.low_xscale,
-                    &dgpu_scratch.low,
-                    OUT_LOW,
-                )?;
-                de.q8.matvec(
-                    &de.compute,
-                    &mut dgpu_scratch.attn_out,
-                    &dlw.attn_output_b.buffer,
-                    &dgpu_scratch.low_xq,
-                    &dgpu_scratch.low_xscale,
-                    N_EMBD,
-                    OUT_LOW,
-                )?;
-                let graph = de.compute.end_capture()?;
-                let exec = graph.instantiate()?;
-                exec.launch(&de.compute)?;
-                *guard = Some(exec);
-            } else {
-                guard.as_ref().unwrap().launch(&de.compute)?;
-            }
-        }
+        self.dgpu_graphs.run("output_proj_post_rope", layer as u32, &de.compute, |s| {
+            de.q8.quantize_input(s, &mut dgpu_scratch.heads_xq, &mut dgpu_scratch.heads_xscale, &dgpu_scratch.heads, Q_FLAT)?;
+            de.q8_grouped.matvec_grouped(s, &mut dgpu_scratch.low, &dlw.attn_output_a.buffer, &dgpu_scratch.heads_xq, &dgpu_scratch.heads_xscale, GROUP_DIM, RANK, N_GROUPS)?;
+            de.q8.quantize_input(s, &mut dgpu_scratch.low_xq, &mut dgpu_scratch.low_xscale, &dgpu_scratch.low, OUT_LOW)?;
+            de.q8.matvec(s, &mut dgpu_scratch.attn_out, &dlw.attn_output_b.buffer, &dgpu_scratch.low_xq, &dgpu_scratch.low_xscale, N_EMBD, OUT_LOW)?;
+            Ok(())
+        })?;
         drop(_s_out);
         _t_out.end()?;
 
@@ -614,62 +475,14 @@ impl HeterogeneousEngine {
         // into a HIP graph on first call; replay thereafter.
         let _t_mhc_pre_ffn = de.events.stage("dgpu.mhc_pre_ffn", &de.compute)?;
         let _s_mhc_pre_ffn = debug_span!("mhc_pre_ffn").entered();
-        {
-            let graph_slot = &self.dgpu_mhc_pre_ffn_graphs[layer as usize];
-            let mut guard = graph_slot.lock().unwrap();
-            if guard.is_none() {
-                de.compute
-                    .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                de.rms_nw.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.flat,
-                    &dgpu_scratch.after_attn_hc,
-                    1,
-                    HC_DIM,
-                    RMS_EPS,
-                )?;
-                de.f16.matvec(
-                    &de.compute,
-                    &mut dgpu_scratch.mix,
-                    &dlw.hc_ffn_fn.buffer,
-                    &dgpu_scratch.flat,
-                    HC_MIX_DIM,
-                    HC_DIM,
-                )?;
-                de.hc_sinkhorn.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.split,
-                    &dgpu_scratch.mix,
-                    &dlw.hc_ffn_scale,
-                    &dlw.hc_ffn_base,
-                    N_HC,
-                    SINKHORN_ITERS,
-                    SINKHORN_EPS,
-                )?;
-                de.hc_weighted.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.ffn_cur,
-                    &dgpu_scratch.after_attn_hc,
-                    &dgpu_scratch.split,
-                    N_EMBD,
-                    N_HC,
-                )?;
-                de.rms_w.launch_weighted(
-                    &de.compute,
-                    &mut dgpu_scratch.ffn_input_norm,
-                    &dgpu_scratch.ffn_cur,
-                    &dlw.ffn_norm,
-                    N_EMBD,
-                    RMS_EPS,
-                )?;
-                let graph = de.compute.end_capture()?;
-                let exec = graph.instantiate()?;
-                exec.launch(&de.compute)?;
-                *guard = Some(exec);
-            } else {
-                guard.as_ref().unwrap().launch(&de.compute)?;
-            }
-        }
+        self.dgpu_graphs.run("mhc_pre_ffn", layer as u32, &de.compute, |s| {
+            de.rms_nw.launch(s, &mut dgpu_scratch.flat, &dgpu_scratch.after_attn_hc, 1, HC_DIM, RMS_EPS)?;
+            de.f16.matvec(s, &mut dgpu_scratch.mix, &dlw.hc_ffn_fn.buffer, &dgpu_scratch.flat, HC_MIX_DIM, HC_DIM)?;
+            de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &dlw.hc_ffn_scale, &dlw.hc_ffn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
+            de.hc_weighted.launch(s, &mut dgpu_scratch.ffn_cur, &dgpu_scratch.after_attn_hc, &dgpu_scratch.split, N_EMBD, N_HC)?;
+            de.rms_w.launch_weighted(s, &mut dgpu_scratch.ffn_input_norm, &dgpu_scratch.ffn_cur, &dlw.ffn_norm, N_EMBD, RMS_EPS)?;
+            Ok(())
+        })?;
         drop(_s_mhc_pre_ffn);
         _t_mhc_pre_ffn.end()?;
 
@@ -855,73 +668,19 @@ impl HeterogeneousEngine {
         let mid_blocks_bytes = (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
         let _t_moe = ie.events.stage("igpu.routed_moe", &ie.compute)?;
         let _s_moe = debug_span!("routed_moe").entered();
-        {
-            let graph_slot = &self.igpu_moe_graphs[layer as usize];
-            let mut guard = graph_slot.lock().unwrap();
-            if guard.is_none() {
-                // First call for this layer: capture the 4-kernel
-                // sub-pipeline. begin_capture / end_capture bracket only
-                // the launches we want in the graph; per-kernel event
-                // staging is OUTSIDE the capture so the event-record
-                // nodes don't become part of the replayed graph (they
-                // would re-record the same pool events on every replay,
-                // corrupting the per-token harvest).
-                ie.compute
-                    .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                ie.q8k.launch(
-                    &ie.compute,
-                    &mut igpu_scratch.d_xq_q8k,
-                    &igpu_scratch.ffn_input_norm_recv,
-                    BLOCKS_Q8K_GATE_IN,
-                )?;
-                ie.iq2.launch_fused_swiglu_batch(
-                    &ie.compute,
-                    &mut igpu_scratch.d_mid_cat,
-                    &ilw.routed.gate.buffer,
-                    &ilw.routed.up.buffer,
-                    &igpu_scratch.d_xq_q8k,
-                    &igpu_scratch.d_ew,
-                    &igpu_scratch.d_selected,
-                    gbpe as u32,
-                    ubpe as u32,
-                    N_EXPERT_USED as u32,
-                    SWIGLU_CLAMP_EXP,
-                    N_FF_EXP,
-                    BLOCKS_Q8K_GATE_IN,
-                )?;
-                ie.q8k.launch(
-                    &ie.compute,
-                    &mut igpu_scratch.d_midq_cat,
-                    &igpu_scratch.d_mid_cat,
-                    BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32),
-                )?;
-                ie.q2k.launch_batched(
-                    &ie.compute,
-                    &mut igpu_scratch.ffn_moe,
-                    &ilw.routed.down.buffer,
-                    &igpu_scratch.d_midq_cat,
-                    &igpu_scratch.d_selected,
-                    dbpe as u32,
-                    mid_blocks_bytes as u32,
-                    N_EXPERT_USED as u32,
-                    N_EMBD,
-                    BLOCKS_Q8K_DOWN_IN,
-                )?;
-                let graph = ie.compute.end_capture()?;
-                let exec = graph.instantiate()?;
-                // Stream-capture only RECORDS — it does not execute.
-                // Launch the freshly instantiated graph now so the
-                // first-token forward pass actually runs this layer's
-                // MoE pipeline.
-                exec.launch(&ie.compute)?;
-                *guard = Some(exec);
-            } else {
-                guard
-                    .as_ref()
-                    .unwrap()
-                    .launch(&ie.compute)?;
-            }
-        }
+        // 4-kernel core (q8k_xq → iq2_fused → q8k_mid → q2k_down) captured
+        // into a per-layer HIP graph on first call and replayed thereafter.
+        // All kernel params are device pointers + layer-constant scalars.
+        // Per-kernel event staging stays OUTSIDE the capture; the
+        // event-record nodes would otherwise become part of the replayed
+        // graph and corrupt the per-token harvest.
+        self.igpu_graphs.run("routed_moe", layer as u32, &ie.compute, |s| {
+            ie.q8k.launch(s, &mut igpu_scratch.d_xq_q8k, &igpu_scratch.ffn_input_norm_recv, BLOCKS_Q8K_GATE_IN)?;
+            ie.iq2.launch_fused_swiglu_batch(s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
+            ie.q8k.launch(s, &mut igpu_scratch.d_midq_cat, &igpu_scratch.d_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
+            ie.q2k.launch_batched(s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
+            Ok(())
+        })?;
         // (M16: `selected` no longer materialized on host — d_selected
         // is fully device-side and peer-pushed from dGPU above.)
         drop(_s_moe);
@@ -986,37 +745,14 @@ impl HeterogeneousEngine {
         let _t_combine = de.events.stage(combine_label, &de.compute)?;
         let _s_combine = debug_span!("ffn_combine").entered();
         if is_last_layer {
-            // M15.1: capture (vec_add → hc_post writing residual_next).
-            // Stable per-layer pointers thanks to the end-of-token
-            // extra swap. Used ONLY for the last layer under M30.
-            let graph_slot = &self.dgpu_ffn_combine_graphs[layer as usize];
-            let mut guard = graph_slot.lock().unwrap();
-            if guard.is_none() {
-                de.compute
-                    .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                de.vec_add.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.ffn_moe_recv,
-                    &dgpu_scratch.ffn_shared,
-                    N_EMBD,
-                )?;
-                de.hc_post.launch_from_split(
-                    &de.compute,
-                    &mut dgpu_scratch.residual_next,
-                    &dgpu_scratch.ffn_moe_recv,
-                    &dgpu_scratch.after_attn_hc,
-                    &dgpu_scratch.split,
-                    N_HC,
-                    N_EMBD,
-                    N_HC,
-                )?;
-                let graph = de.compute.end_capture()?;
-                let exec = graph.instantiate()?;
-                exec.launch(&de.compute)?;
-                *guard = Some(exec);
-            } else {
-                guard.as_ref().unwrap().launch(&de.compute)?;
-            }
+            // M15.1 (vec_add → hc_post writing residual_next). Stable
+            // per-layer pointers thanks to the end-of-token extra swap.
+            // Used ONLY for the last layer under M30.
+            self.dgpu_graphs.run("ffn_combine", layer as u32, &de.compute, |s| {
+                de.vec_add.launch(s, &mut dgpu_scratch.ffn_moe_recv, &dgpu_scratch.ffn_shared, N_EMBD)?;
+                de.hc_post.launch_from_split(s, &mut dgpu_scratch.residual_next, &dgpu_scratch.ffn_moe_recv, &dgpu_scratch.after_attn_hc, &dgpu_scratch.split, N_HC, N_EMBD, N_HC)?;
+                Ok(())
+            })?;
         } else {
             // M30: combined ffn_combine_N + mhc_pre_attn_{N+1} graph.
             // The mhc_pre_attn block reads from layer N+1's `residual`
@@ -1024,79 +760,19 @@ impl HeterogeneousEngine {
             // swap — same physical buffer. We pass `residual_next.raw()`
             // throughout so the captured graph references one ptr.
             let next = next_dlw.expect("M30: next_dlw required for non-last layer");
-            let graph_slot = &self.dgpu_combined_ffn_pre_attn_graphs[layer as usize];
-            let mut guard = graph_slot.lock().unwrap();
-            if guard.is_none() {
-                de.compute
-                    .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+            self.dgpu_graphs.run("combined_ffn_pre_attn", layer as u32, &de.compute, |s| {
                 // ffn_combine half — writes residual_next (= layer N+1's residual).
-                de.vec_add.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.ffn_moe_recv,
-                    &dgpu_scratch.ffn_shared,
-                    N_EMBD,
-                )?;
-                de.hc_post.launch_from_split(
-                    &de.compute,
-                    &mut dgpu_scratch.residual_next,
-                    &dgpu_scratch.ffn_moe_recv,
-                    &dgpu_scratch.after_attn_hc,
-                    &dgpu_scratch.split,
-                    N_HC,
-                    N_EMBD,
-                    N_HC,
-                )?;
+                de.vec_add.launch(s, &mut dgpu_scratch.ffn_moe_recv, &dgpu_scratch.ffn_shared, N_EMBD)?;
+                de.hc_post.launch_from_split(s, &mut dgpu_scratch.residual_next, &dgpu_scratch.ffn_moe_recv, &dgpu_scratch.after_attn_hc, &dgpu_scratch.split, N_HC, N_EMBD, N_HC)?;
                 // mhc_pre_attn half — reads residual_next (= layer N+1's residual
                 // after swap), uses layer N+1's hc/norm weights.
-                de.rms_nw.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.flat,
-                    &dgpu_scratch.residual_next,
-                    1,
-                    HC_DIM,
-                    RMS_EPS,
-                )?;
-                de.f16.matvec(
-                    &de.compute,
-                    &mut dgpu_scratch.mix,
-                    &next.hc_attn_fn.buffer,
-                    &dgpu_scratch.flat,
-                    HC_MIX_DIM,
-                    HC_DIM,
-                )?;
-                de.hc_sinkhorn.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.split,
-                    &dgpu_scratch.mix,
-                    &next.hc_attn_scale,
-                    &next.hc_attn_base,
-                    N_HC,
-                    SINKHORN_ITERS,
-                    SINKHORN_EPS,
-                )?;
-                de.hc_weighted.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.attn_cur,
-                    &dgpu_scratch.residual_next,
-                    &dgpu_scratch.split,
-                    N_EMBD,
-                    N_HC,
-                )?;
-                de.rms_w.launch_weighted(
-                    &de.compute,
-                    &mut dgpu_scratch.attn_input_norm,
-                    &dgpu_scratch.attn_cur,
-                    &next.attn_norm,
-                    N_EMBD,
-                    RMS_EPS,
-                )?;
-                let graph = de.compute.end_capture()?;
-                let exec = graph.instantiate()?;
-                exec.launch(&de.compute)?;
-                *guard = Some(exec);
-            } else {
-                guard.as_ref().unwrap().launch(&de.compute)?;
-            }
+                de.rms_nw.launch(s, &mut dgpu_scratch.flat, &dgpu_scratch.residual_next, 1, HC_DIM, RMS_EPS)?;
+                de.f16.matvec(s, &mut dgpu_scratch.mix, &next.hc_attn_fn.buffer, &dgpu_scratch.flat, HC_MIX_DIM, HC_DIM)?;
+                de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &next.hc_attn_scale, &next.hc_attn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
+                de.hc_weighted.launch(s, &mut dgpu_scratch.attn_cur, &dgpu_scratch.residual_next, &dgpu_scratch.split, N_EMBD, N_HC)?;
+                de.rms_w.launch_weighted(s, &mut dgpu_scratch.attn_input_norm, &dgpu_scratch.attn_cur, &next.attn_norm, N_EMBD, RMS_EPS)?;
+                Ok(())
+            })?;
         }
         drop(_s_combine);
         _t_combine.end()?;
@@ -1108,10 +784,9 @@ impl HeterogeneousEngine {
 }
 
 impl HeterogeneousEngine {
-    /// M15: capture the dGPU shared-expert chain (6 kernels, all
-    /// layer-constant params) into a HIP graph on first call; replay
-    /// thereafter. Caller is responsible for the surrounding events
-    /// stage and span.
+    /// Capture the dGPU shared-expert chain (6 kernels, all layer-constant
+    /// params) into a HIP graph on first call; replay thereafter. Caller is
+    /// responsible for the surrounding events stage and span.
     fn issue_shared_expert_graph(
         &self,
         de: &DeviceEngine,
@@ -1119,79 +794,27 @@ impl HeterogeneousEngine {
         dlw: &DgpuLayerWeights,
         layer: i32,
     ) -> eyre::Result<()> {
-        let graph_slot = &self.dgpu_shared_expert_graphs[layer as usize];
-        let mut guard = graph_slot.lock().unwrap();
-        if guard.is_none() {
-            de.compute
-                .begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-            issue_shared_expert(de, dgpu_scratch, dlw)?;
-            let graph = de.compute.end_capture()?;
-            let exec = graph.instantiate()?;
-            exec.launch(&de.compute)?;
-            *guard = Some(exec);
-        } else {
-            guard.as_ref().unwrap().launch(&de.compute)?;
-        }
-        Ok(())
+        self.dgpu_graphs.run("shared_expert", layer as u32, &de.compute, |s| {
+            issue_shared_expert(de, dgpu_scratch, dlw, s)
+        })
     }
 }
 
-/// Issue all dGPU shared-expert kernels on `de.compute`. Reads
-/// `ffn_input_norm`, writes `ffn_shared`. Used by both modes; in
-/// `HetParallel` it's invoked earlier to overlap with iGPU MoE.
+/// Issue all dGPU shared-expert kernels on `stream` (= `de.compute` in
+/// practice). Reads `ffn_input_norm`, writes `ffn_shared`. Used by both
+/// modes; in `HetParallel` it's invoked earlier to overlap with iGPU MoE.
 fn issue_shared_expert(
     de: &DeviceEngine,
     dgpu_scratch: &mut DgpuScratch,
     dlw: &DgpuLayerWeights,
+    stream: &v4flash_hip::Stream,
 ) -> eyre::Result<()> {
-    de.q8.quantize_input(
-        &de.compute,
-        &mut dgpu_scratch.xq_n_embd,
-        &mut dgpu_scratch.xscale_n_embd,
-        &dgpu_scratch.ffn_input_norm,
-        N_EMBD,
-    )?;
-    de.q8.matvec(
-        &de.compute,
-        &mut dgpu_scratch.gate_sh,
-        &dlw.shared.gate.buffer,
-        &dgpu_scratch.xq_n_embd,
-        &dgpu_scratch.xscale_n_embd,
-        N_FF_SHARED,
-        N_EMBD,
-    )?;
-    de.q8.matvec(
-        &de.compute,
-        &mut dgpu_scratch.up_sh,
-        &dlw.shared.up.buffer,
-        &dgpu_scratch.xq_n_embd,
-        &dgpu_scratch.xscale_n_embd,
-        N_FF_SHARED,
-        N_EMBD,
-    )?;
-    de.swiglu.launch(
-        &de.compute,
-        &mut dgpu_scratch.mid_sh,
-        &dgpu_scratch.gate_sh,
-        &dgpu_scratch.up_sh,
-        N_FF_SHARED,
-    )?;
-    de.q8.quantize_input(
-        &de.compute,
-        &mut dgpu_scratch.mid_sh_xq,
-        &mut dgpu_scratch.mid_sh_xscale,
-        &dgpu_scratch.mid_sh,
-        N_FF_SHARED,
-    )?;
-    de.q8.matvec(
-        &de.compute,
-        &mut dgpu_scratch.ffn_shared,
-        &dlw.shared.down.buffer,
-        &dgpu_scratch.mid_sh_xq,
-        &dgpu_scratch.mid_sh_xscale,
-        N_EMBD,
-        N_FF_SHARED,
-    )?;
+    de.q8.quantize_input(stream, &mut dgpu_scratch.xq_n_embd, &mut dgpu_scratch.xscale_n_embd, &dgpu_scratch.ffn_input_norm, N_EMBD)?;
+    de.q8.matvec(stream, &mut dgpu_scratch.gate_sh, &dlw.shared.gate.buffer, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_FF_SHARED, N_EMBD)?;
+    de.q8.matvec(stream, &mut dgpu_scratch.up_sh, &dlw.shared.up.buffer, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_FF_SHARED, N_EMBD)?;
+    de.swiglu.launch(stream, &mut dgpu_scratch.mid_sh, &dgpu_scratch.gate_sh, &dgpu_scratch.up_sh, N_FF_SHARED)?;
+    de.q8.quantize_input(stream, &mut dgpu_scratch.mid_sh_xq, &mut dgpu_scratch.mid_sh_xscale, &dgpu_scratch.mid_sh, N_FF_SHARED)?;
+    de.q8.matvec(stream, &mut dgpu_scratch.ffn_shared, &dlw.shared.down.buffer, &dgpu_scratch.mid_sh_xq, &dgpu_scratch.mid_sh_xscale, N_EMBD, N_FF_SHARED)?;
     Ok(())
 }
 

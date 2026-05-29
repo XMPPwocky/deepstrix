@@ -21,6 +21,7 @@ pub mod engine;
 pub mod forward_head;
 pub mod forward_layer;
 pub mod forward_prefill;
+pub mod graph_cache;
 pub mod perfetto;
 pub mod prefill_stats;
 pub mod scratch;
