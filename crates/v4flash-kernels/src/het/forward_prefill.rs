@@ -25,12 +25,13 @@
 
 use color_eyre::eyre::{self, eyre};
 
-use crate::forward::{
-    hash_router_select, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
-    EXPERT_WEIGHT_SCALE, GROUP_DIM, HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED,
-    N_FF_SHARED, N_GROUPS, N_HC, N_HEAD, N_HEAD_DIM, N_LAYER, N_LORA_Q, N_ROT, N_VOCAB, OUT_LOW,
-    Q_FLAT, RANK, RMS_EPS, SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW,
+use crate::config::{
+    BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW, EXPERT_WEIGHT_SCALE,
+    GROUP_DIM, HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED, N_FF_SHARED, N_GROUPS, N_HC,
+    N_HEAD, N_HEAD_DIM, N_LAYER, N_LORA_Q, N_ROT, N_VOCAB, OUT_LOW, Q_FLAT, RANK, RMS_EPS,
+    SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW,
 };
+use crate::routing::hash_router_select;
 
 use super::batch_scratch::{BatchDgpuScratch, BatchIgpuScratch, BatchScratch, B_MAX};
 use super::engine::HeterogeneousEngine;
@@ -1639,7 +1640,7 @@ impl HeterogeneousEngine {
         let gbpe = ilw.routed.gate_bytes_per_expert as u32;
         let ubpe = ilw.routed.up_bytes_per_expert as u32;
         let dbpe = ilw.routed.down_bytes_per_expert as u32;
-        let mid_blocks_bytes = (crate::forward::BLOCKS_Q8K_DOWN_IN as usize)
+        let mid_blocks_bytes = (crate::config::BLOCKS_Q8K_DOWN_IN as usize)
             * crate::q8_k::BLOCK_Q8_K_BYTES;
         // Stage 9 router_topk + Stage 10 shared expert wrote bd.d_selected,
         // bd.d_ew, bd.ffn_input_norm on de.compute. We're about to read
@@ -1689,7 +1690,7 @@ impl HeterogeneousEngine {
                 &ie.compute,
                 &mut bi.d_xq_q8k,
                 &bi.ffn_input_norm_recv,
-                crate::forward::BLOCKS_Q8K_GATE_IN * b,
+                crate::config::BLOCKS_Q8K_GATE_IN * b,
             )?;
         }
         // Phase 7.2 chunked by-expert iq2. Three pre-passes then main kernel:
@@ -1779,9 +1780,9 @@ impl HeterogeneousEngine {
                         d_xq_q8k, d_ew,
                         group_count, expert_members, staged_work_items,
                         gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
-                        crate::forward::SWIGLU_CLAMP_EXP,
-                        crate::forward::N_FF_EXP,
-                        crate::forward::BLOCKS_Q8K_GATE_IN,
+                        crate::config::SWIGLU_CLAMP_EXP,
+                        crate::config::N_FF_EXP,
+                        crate::config::BLOCKS_Q8K_GATE_IN,
                         n_staged,
                     )?;
                 }
@@ -1793,9 +1794,9 @@ impl HeterogeneousEngine {
                         d_xq_q8k, d_ew,
                         group_count, expert_members, chunked_work_items,
                         gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
-                        crate::forward::SWIGLU_CLAMP_EXP,
-                        crate::forward::N_FF_EXP,
-                        crate::forward::BLOCKS_Q8K_GATE_IN,
+                        crate::config::SWIGLU_CLAMP_EXP,
+                        crate::config::N_FF_EXP,
+                        crate::config::BLOCKS_Q8K_GATE_IN,
                         n_chunked,
                     )?;
                 }
@@ -1843,9 +1844,9 @@ impl HeterogeneousEngine {
                         d_xq_q8k, d_ew,
                         group_count, expert_members, work_items,
                         gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
-                        crate::forward::SWIGLU_CLAMP_EXP,
-                        crate::forward::N_FF_EXP,
-                        crate::forward::BLOCKS_Q8K_GATE_IN,
+                        crate::config::SWIGLU_CLAMP_EXP,
+                        crate::config::N_FF_EXP,
+                        crate::config::BLOCKS_Q8K_GATE_IN,
                         n_work_items,
                     )?;
                 } else {
@@ -1856,9 +1857,9 @@ impl HeterogeneousEngine {
                         d_xq_q8k, d_ew,
                         group_count, expert_members, work_items,
                         gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
-                        crate::forward::SWIGLU_CLAMP_EXP,
-                        crate::forward::N_FF_EXP,
-                        crate::forward::BLOCKS_Q8K_GATE_IN,
+                        crate::config::SWIGLU_CLAMP_EXP,
+                        crate::config::N_FF_EXP,
+                        crate::config::BLOCKS_Q8K_GATE_IN,
                         n_work_items,
                     )?;
                 }
@@ -1870,7 +1871,7 @@ impl HeterogeneousEngine {
                 &ie.compute,
                 &mut bi.d_midq_cat,
                 &bi.d_mid_cat,
-                crate::forward::BLOCKS_Q8K_DOWN_IN * (cs_n_used as u32) * b,
+                crate::config::BLOCKS_Q8K_DOWN_IN * (cs_n_used as u32) * b,
             )?;
         }
         {
@@ -1885,7 +1886,7 @@ impl HeterogeneousEngine {
                 mid_blocks_bytes as u32,
                 cs_n_used as u32,
                 N_EMBD,
-                crate::forward::BLOCKS_Q8K_DOWN_IN,
+                crate::config::BLOCKS_Q8K_DOWN_IN,
                 b,
             )?;
         }

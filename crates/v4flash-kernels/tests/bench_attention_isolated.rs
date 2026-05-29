@@ -34,7 +34,7 @@
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Event, Stream};
 use v4flash_kernels::attention::{AttentionMixed, ATTN_MIXED_MAX_KEYS};
-use v4flash_kernels::forward::{N_HEAD, N_HEAD_DIM};
+use v4flash_kernels::config::{N_HEAD, N_HEAD_DIM};
 
 fn pick_dgpu() -> eyre::Result<Device> {
     for d in Device::all()? {

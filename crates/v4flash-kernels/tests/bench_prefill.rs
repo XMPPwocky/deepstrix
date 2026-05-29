@@ -18,7 +18,7 @@ use std::time::Instant;
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
-use v4flash_kernels::forward::{COMPRESS_RATIOS, N_EXPERT, N_EXPERT_USED, N_LAYER, SWA_WINDOW};
+use v4flash_kernels::config::{COMPRESS_RATIOS, N_EXPERT, N_EXPERT_USED, N_LAYER, SWA_WINDOW};
 use v4flash_kernels::het::{
     BatchDgpuScratch, BatchIgpuScratch, BatchScratch, DgpuScratch, ExecMode, HetModelState,
     HetModelWeights, HeterogeneousEngine, PrefillStats, B_MAX,
@@ -57,7 +57,7 @@ fn pick_igpu() -> eyre::Result<Device> {
 #[ignore]
 fn bench_prefill() -> eyre::Result<()> {
     install_panic_handler()?;
-    use v4flash_kernels::forward::HC_DIM;
+    use v4flash_kernels::config::HC_DIM;
 
     let b: usize = std::env::var("BENCH_B")
         .ok()
@@ -170,7 +170,7 @@ fn bench_prefill() -> eyre::Result<()> {
 #[ignore]
 fn bench_prefill_v2() -> eyre::Result<()> {
     install_panic_handler()?;
-    use v4flash_kernels::forward::HC_DIM;
+    use v4flash_kernels::config::HC_DIM;
 
     let b: usize = std::env::var("BENCH_B")
         .ok()
@@ -298,7 +298,7 @@ fn bench_prefill_v2() -> eyre::Result<()> {
 #[ignore]
 fn bench_prefill_chunked() -> eyre::Result<()> {
     install_panic_handler()?;
-    use v4flash_kernels::forward::HC_DIM;
+    use v4flash_kernels::config::HC_DIM;
 
     let t: usize = std::env::var("BENCH_T")
         .ok()
@@ -714,7 +714,7 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
 #[ignore]
 fn bench_prefill_expert_stats() -> eyre::Result<()> {
     install_panic_handler()?;
-    use v4flash_kernels::forward::HC_DIM;
+    use v4flash_kernels::config::HC_DIM;
 
     let t: usize = std::env::var("BENCH_T")
         .ok()

@@ -8,7 +8,7 @@
 use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer};
 
-use crate::forward::{COMPRESS_RATIOS, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, NEG_INF, SWA_WINDOW};
+use crate::config::{COMPRESS_RATIOS, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, NEG_INF, SWA_WINDOW};
 use crate::het::batch_scratch::B_MAX;
 
 /// During batched prefill we need to hold the prior SWA-window AND the

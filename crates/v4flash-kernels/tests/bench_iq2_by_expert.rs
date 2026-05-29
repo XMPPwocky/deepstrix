@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device, Event};
-use v4flash_kernels::forward::{
+use v4flash_kernels::config::{
     BLOCKS_Q8K_GATE_IN, N_EMBD, N_EXPERT, N_EXPERT_USED, N_FF_EXP, SWIGLU_CLAMP_EXP,
 };
 use v4flash_kernels::het::{
@@ -55,7 +55,7 @@ fn pick_igpu() -> eyre::Result<Device> {
 #[ignore]
 fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
     install_panic_handler()?;
-    use v4flash_kernels::forward::HC_DIM;
+    use v4flash_kernels::config::HC_DIM;
 
     let b: u32 = std::env::var("BENCH_B")
         .ok()

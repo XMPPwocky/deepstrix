@@ -19,12 +19,13 @@
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{Device, DeviceBuffer};
 
-use crate::forward::{
-    hash_router_select, BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, EXPERT_WEIGHT_SCALE, GROUP_DIM,
-    HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED, N_FF_EXP, N_FF_SHARED, N_GROUPS, N_HC,
-    N_HEAD, N_HEAD_DIM, N_LORA_Q, N_ROT, OUT_LOW, Q_FLAT, RANK, RMS_EPS, SINKHORN_EPS,
-    SINKHORN_ITERS, SWA_WINDOW, SWIGLU_CLAMP_EXP,
+use crate::config::{
+    BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, EXPERT_WEIGHT_SCALE, GROUP_DIM, HC_DIM, HC_MIX_DIM,
+    N_EMBD, N_EXPERT, N_EXPERT_USED, N_FF_EXP, N_FF_SHARED, N_GROUPS, N_HC, N_HEAD, N_HEAD_DIM,
+    N_LORA_Q, N_ROT, OUT_LOW, Q_FLAT, RANK, RMS_EPS, SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW,
+    SWIGLU_CLAMP_EXP,
 };
+use crate::routing::hash_router_select;
 use crate::q8_k::BLOCK_Q8_K_BYTES;
 
 /// Floor for the router-weight sum, mirroring the host topk path (f16

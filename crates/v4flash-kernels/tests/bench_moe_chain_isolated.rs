@@ -12,7 +12,7 @@
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Event, Stream};
-use v4flash_kernels::forward::{
+use v4flash_kernels::config::{
     BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, N_EMBD, N_EXPERT, N_EXPERT_USED, N_FF_EXP,
     SWIGLU_CLAMP_EXP,
 };

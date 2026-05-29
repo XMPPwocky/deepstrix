@@ -31,7 +31,7 @@ use color_eyre::eyre::{self, eyre};
 
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
-use v4flash_kernels::forward::{COMPRESS_RATIOS, HC_DIM, N_LAYER, SWA_WINDOW};
+use v4flash_kernels::config::{COMPRESS_RATIOS, HC_DIM, N_LAYER, SWA_WINDOW};
 use v4flash_kernels::het::{
     DgpuScratch, ExecMode, HetModelState, HetModelWeights, HeterogeneousEngine, IgpuScratch,
 };

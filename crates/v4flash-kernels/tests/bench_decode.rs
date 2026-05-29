@@ -17,7 +17,7 @@ use color_eyre::eyre::{self, eyre};
 
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
-use v4flash_kernels::forward::HC_DIM;
+use v4flash_kernels::config::HC_DIM;
 use v4flash_kernels::het::{
     DgpuScratch, ExecMode, HetModelState, HetModelWeights, HeterogeneousEngine, IgpuScratch,
 };
@@ -175,7 +175,7 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
 
     eprintln!(
         "BENCH context: dGPU={} (gfx1201) + iGPU={} (gfx1151), V4-Flash {} layers, HetParallel mode",
-        dgpu.id, igpu.id, v4flash_kernels::forward::N_LAYER
+        dgpu.id, igpu.id, v4flash_kernels::config::N_LAYER
     );
 
     // Per-token timing dump — correlate token speed against position

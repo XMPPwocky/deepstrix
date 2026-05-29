@@ -12,7 +12,7 @@ use v4flash_hip::{Device, Event, Stream};
 
 use super::graph_cache::GraphCache;
 
-use crate::forward::N_LAYER;
+use crate::config::N_LAYER;
 
 use crate::attention::{AttentionMixed, AttentionSwa};
 use crate::compressor::{
@@ -295,7 +295,7 @@ impl HeterogeneousEngine {
         pos: u32,
         token_id: i32,
     ) -> color_eyre::eyre::Result<()> {
-        use crate::forward::{HC_DIM, N_LAYER};
+        use crate::config::{HC_DIM, N_LAYER};
         use tracing::debug_span;
 
         if input_hc_host.len() != HC_DIM as usize {
@@ -410,7 +410,7 @@ impl HeterogeneousEngine {
         let igpu_idle_us = token_elapsed_us.saturating_sub(igpu_busy_us);
 
         // peer copies: ffn_input_norm (N_EMBD f32) + ffn_moe (N_EMBD f32) per layer.
-        let peer_bytes = (N_LAYER as u64) * 2 * (crate::forward::N_EMBD as u64) * 4;
+        let peer_bytes = (N_LAYER as u64) * 2 * (crate::config::N_EMBD as u64) * 4;
 
         let summary = super::trace::TokenTiming {
             token_pos: pos,

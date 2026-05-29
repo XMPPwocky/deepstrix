@@ -12,10 +12,13 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{Device, DeviceBuffer};
 
-use crate::forward::{
+use crate::config::{
+    BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, COMPRESS_RATIOS, HC_MIX_DIM, N_EMBD, N_HASH_LAYERS,
+    N_HC, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, N_LORA_Q,
+};
+use crate::model_weights::{
     load_f32_weight, load_i32_tensor, CompressorWeights, IndexerWeights, RoutedExpertWeights,
-    SharedExpertWeights, BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, COMPRESS_RATIOS, HC_MIX_DIM,
-    N_EMBD, N_HASH_LAYERS, N_HC, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, N_LORA_Q,
+    SharedExpertWeights,
 };
 use crate::iq2_xxs::BLOCK_IQ2_XXS_BYTES;
 use crate::q2_k::BLOCK_Q2_K_BYTES;
@@ -383,7 +386,7 @@ impl IgpuLayerWeights {
             device_id,
         )?;
         let gate_bytes_per_expert =
-            (crate::forward::N_FF_EXP as usize) * (BLOCKS_Q8K_GATE_IN as usize) * BLOCK_IQ2_XXS_BYTES;
+            (crate::config::N_FF_EXP as usize) * (BLOCKS_Q8K_GATE_IN as usize) * BLOCK_IQ2_XXS_BYTES;
         let up_bytes_per_expert = gate_bytes_per_expert;
         let down_bytes_per_expert =
             (N_EMBD as usize) * (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q2_K_BYTES;

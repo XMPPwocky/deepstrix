@@ -32,7 +32,7 @@ use std::io::{BufRead, Write};
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::{gguf::GgufType, tokenizer::BpeVocab, MappedGguf};
 use v4flash_hip::{install_panic_handler, Device};
-use v4flash_kernels::forward::{COMPRESS_RATIOS, HC_DIM, N_EMBD, N_HC, N_VOCAB};
+use v4flash_kernels::config::{COMPRESS_RATIOS, HC_DIM, N_EMBD, N_HC, N_VOCAB};
 use v4flash_kernels::het::{
     BatchDgpuScratch, BatchIgpuScratch, DgpuScratch, ExecMode, HetModelState, HetModelWeights,
     HeterogeneousEngine, IgpuScratch,

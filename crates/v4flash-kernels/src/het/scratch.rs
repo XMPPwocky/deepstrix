@@ -14,7 +14,7 @@
 use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer};
 
-use crate::forward::{
+use crate::config::{
     BLOCKS_GROUPED_OUT, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
     BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED,
     N_FF_EXP, N_FF_SHARED, N_HC, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LORA_Q, N_VOCAB,

@@ -2,7 +2,7 @@
 
 use color_eyre::eyre;
 
-use crate::forward::{HC_DIM, N_EMBD, N_HC, N_VOCAB, RMS_EPS};
+use crate::config::{HC_DIM, N_EMBD, N_HC, N_VOCAB, RMS_EPS};
 
 use super::engine::HeterogeneousEngine;
 use super::scratch::DgpuScratch;

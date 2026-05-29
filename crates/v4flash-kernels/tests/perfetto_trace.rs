@@ -22,7 +22,7 @@ use tracing_subscriber::EnvFilter;
 
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
-use v4flash_kernels::forward::{HC_DIM, N_LAYER};
+use v4flash_kernels::config::{HC_DIM, N_LAYER};
 use v4flash_kernels::het::{
     DgpuScratch, ExecMode, HetModelState, HetModelWeights, HeterogeneousEngine, IgpuScratch,
 };

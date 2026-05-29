@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
-use v4flash_kernels::forward::{
+use v4flash_kernels::config::{
     HC_DIM, N_EMBD, N_HEAD_DIM, OUT_LOW, Q_FLAT,
 };
 use v4flash_kernels::het::{
@@ -151,7 +151,7 @@ fn forward_l0_t0_stages() -> eyre::Result<()> {
 
     // Block 2: Q chain. q_normed = q_post_rope (after rope on q_b output rms-normed).
     // qr_normed = q_a_normed. q = q_b_out (pre rms).
-    let mut hq_low = vec![0f32; v4flash_kernels::forward::N_LORA_Q as usize];
+    let mut hq_low = vec![0f32; v4flash_kernels::config::N_LORA_Q as usize];
     bs.shared_dgpu.qr.copy_to_host(&mut hq_low)?;
     compare("q_a_out", &hq_low)?;
     bs.shared_dgpu.qr_normed.copy_to_host(&mut hq_low)?;

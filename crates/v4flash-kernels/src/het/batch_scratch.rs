@@ -17,7 +17,7 @@ use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer};
 
 use crate::attention::ATTN_MIXED_MAX_KEYS;
-use crate::forward::{
+use crate::config::{
     BLOCKS_GROUPED_OUT, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
     BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED,
     N_FF_EXP, N_FF_SHARED, N_HEAD, N_HEAD_DIM, N_LORA_Q, OUT_LOW, Q_FLAT,
@@ -61,7 +61,7 @@ pub struct BatchScratch {
 
 impl BatchScratch {
     pub fn alloc(dgpu_device: Device, igpu_device: Device) -> eyre::Result<Self> {
-        use crate::forward::HC_DIM;
+        use crate::config::HC_DIM;
         let shared_dgpu = DgpuScratch::alloc(dgpu_device)?;
         let shared_igpu = IgpuScratch::alloc(igpu_device)?;
         dgpu_device.set_current()?;

@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
-use v4flash_kernels::forward::N_VOCAB;
+use v4flash_kernels::config::N_VOCAB;
 use v4flash_kernels::het::{
     BatchDgpuScratch, BatchIgpuScratch, BatchScratch, DgpuScratch, ExecMode, HetModelState,
     HetModelWeights, HeterogeneousEngine,
@@ -77,7 +77,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
 #[ignore]
 fn forward_prompt_batch_matches_sequential() -> eyre::Result<()> {
     install_panic_handler()?;
-    use v4flash_kernels::forward::HC_DIM;
+    use v4flash_kernels::config::HC_DIM;
 
     // Phase 1 keeps B small to keep memory + run time bounded.
     let b: usize = std::env::var("BENCH_B")
@@ -212,7 +212,7 @@ fn forward_prompt_batch_matches_sequential() -> eyre::Result<()> {
 #[ignore]
 fn forward_prompt_batch_v2_matches_sequential() -> eyre::Result<()> {
     install_panic_handler()?;
-    use v4flash_kernels::forward::HC_DIM;
+    use v4flash_kernels::config::HC_DIM;
 
     let b: usize = std::env::var("BENCH_B")
         .ok()
@@ -357,7 +357,7 @@ fn forward_prompt_batch_v2_matches_sequential() -> eyre::Result<()> {
 #[ignore]
 fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
     install_panic_handler()?;
-    use v4flash_kernels::forward::{HC_DIM, N_LAYER};
+    use v4flash_kernels::config::{HC_DIM, N_LAYER};
 
     let dump = ActivationDump::open(dump_dir())?;
     let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
@@ -483,7 +483,7 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
             .and_then(|s| s.parse::<usize>().ok())
             == Some(layer)
         {
-            use v4flash_kernels::forward::{HC_DIM as HD, N_EMBD as NE, Q_FLAT as QF};
+            use v4flash_kernels::config::{HC_DIM as HD, N_EMBD as NE, Q_FLAT as QF};
             let compare = |name: &str, ref_buf: &v4flash_hip::DeviceBuffer<f32>,
                             v2_buf_view: v4flash_hip::DeviceBuffer<f32>|
              -> eyre::Result<()> {
@@ -507,7 +507,7 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
                 bd.q_normed.slice_view(0, QF as usize))?;
             // KV chain.
             compare("kv_normed", &bs.shared_dgpu.kv_normed,
-                bd.kv_normed.slice_view(0, v4flash_kernels::forward::N_HEAD_DIM as usize))?;
+                bd.kv_normed.slice_view(0, v4flash_kernels::config::N_HEAD_DIM as usize))?;
             // Attention output (heads).
             compare("heads_post_attn", &bs.shared_dgpu.heads,
                 bd.heads.slice_view(0, QF as usize))?;
@@ -577,7 +577,7 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
 #[ignore]
 fn forward_prefill_last_only_matches_sequential() -> eyre::Result<()> {
     install_panic_handler()?;
-    use v4flash_kernels::forward::HC_DIM;
+    use v4flash_kernels::config::HC_DIM;
 
     let t: usize = std::env::var("BENCH_B")
         .ok()
@@ -681,7 +681,7 @@ fn forward_prefill_last_only_matches_sequential() -> eyre::Result<()> {
 #[ignore]
 fn forward_prefill_pipelined_matches_single_lane() -> eyre::Result<()> {
     install_panic_handler()?;
-    use v4flash_kernels::forward::HC_DIM;
+    use v4flash_kernels::config::HC_DIM;
     std::env::set_var("IQ2_VARIANT", "chunked");
 
     let t: usize = std::env::var("BENCH_B")
