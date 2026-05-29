@@ -387,12 +387,13 @@ extern "C" __global__ void attention_mixed_score_batched(
 // intensity toward the q-bound. Grid (n_total_max, ceil(n_head/TILE), B).
 #define SCORE_HEAD_TILE 8
 extern "C" __global__ void attention_mixed_score_batched_htiled(
-        float          * scores_g,       // [B, n_head, max_keys]
-        const float    * q,              // [B, n_head, head_dim]
-        const float    * raw_kv,         // [n_raw, head_dim]   (shared)
-        const float    * comp_kv,        // [n_comp, head_dim]  (shared, may be null)
-        const int      * n_raw_per,      // [B]
-        const int      * n_comp_per,     // [B]
+        float          * scores_g,           // [B, n_head, max_keys]
+        const float    * q,                  // [B, n_head, head_dim]
+        const float    * raw_kv,             // [..., head_dim]   (shared, oversized)
+        const float    * comp_kv,            // [n_comp, head_dim]  (shared, may be null)
+        const int      * n_raw_per,          // [B] causal count into raw cache
+        const int      * n_raw_offset_per,   // [B] starting raw-cache slot for this token
+        const int      * n_comp_per,         // [B]
         unsigned int     n_head,
         unsigned int     head_dim,
         unsigned int     max_keys,
@@ -407,9 +408,10 @@ extern "C" __global__ void attention_mixed_score_batched_htiled(
     const unsigned int n_raw  = (unsigned int)n_raw_per[b];
     const unsigned int n_comp = (unsigned int)n_comp_per[b];
     if (r >= n_raw + n_comp) return;
+    const unsigned int raw_off = (unsigned int)n_raw_offset_per[b];
 
     const float *kv_row = (r < n_raw)
-        ? raw_kv + (size_t)r * head_dim
+        ? raw_kv + (size_t)(r + raw_off) * head_dim
         : comp_kv + (size_t)(r - n_raw) * head_dim;
 
     // head_dim=512 / 32 lanes = 16 elems/lane. Load the KV row ONCE.
@@ -546,13 +548,14 @@ extern "C" __global__ void attention_mixed_softmax_wsum_batched(
 #define SMWSUM_HEAD_TILE 16
 #define SMWSUM_ROW_ILP   2
 extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled(
-        float          * out,            // [B, n_head, head_dim]
-        float          * scores_g,       // [B, n_head, max_keys] in/out
-        const float    * sinks,          // [n_head]
-        const float    * raw_kv,
+        float          * out,                // [B, n_head, head_dim]
+        float          * scores_g,           // [B, n_head, max_keys] in/out
+        const float    * sinks,              // [n_head]
+        const float    * raw_kv,             // oversized: cache holds [n_raw_before+b] rows during prefill
         const float    * comp_kv,
-        const int      * n_raw_per,      // [B]
-        const int      * n_comp_per,     // [B]
+        const int      * n_raw_per,          // [B] causal count into raw cache
+        const int      * n_raw_offset_per,   // [B] starting slot for this token's raw window
+        const int      * n_comp_per,         // [B]
         unsigned int     n_head,
         unsigned int     head_dim,
         unsigned int     max_keys) {
@@ -622,6 +625,7 @@ extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled(
 
     // Phase B: each thread owns dim d; load each kv[r][d] once, reuse across
     // the head group. SMWSUM_ROW_ILP independent kv loads hide latency.
+    const unsigned int raw_off = (unsigned int)n_raw_offset_per[b];
     for (unsigned int d = tid; d < head_dim; d += block) {
         constexpr unsigned int U = SMWSUM_ROW_ILP;
         float acc[SMWSUM_HEAD_TILE];
@@ -633,7 +637,7 @@ extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled(
             float kvv[U];
             #pragma unroll
             for (unsigned int k = 0; k < U; k++)
-                kvv[k] = raw_kv[(size_t)(r + k) * head_dim + d];
+                kvv[k] = raw_kv[(size_t)(r + k + raw_off) * head_dim + d];
             #pragma unroll
             for (unsigned int hh = 0; hh < SMWSUM_HEAD_TILE; hh++) {
                 const float *swh = swbase + (size_t)hh * hstride;
@@ -643,7 +647,7 @@ extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled(
             }
         }
         for (; r < n_raw; r++) {
-            float kv = raw_kv[(size_t)r * head_dim + d];
+            float kv = raw_kv[(size_t)(r + raw_off) * head_dim + d];
             #pragma unroll
             for (unsigned int hh = 0; hh < SMWSUM_HEAD_TILE; hh++)
                 acc[hh] += swbase[(size_t)hh * hstride + r] * kv;

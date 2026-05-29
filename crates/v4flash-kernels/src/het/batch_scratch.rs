@@ -152,6 +152,13 @@ pub struct BatchDgpuScratch {
     pub row_per_b: DeviceBuffer<i32>,
     pub pos_mod_per_b: DeviceBuffer<i32>,
     pub n_raw_per: DeviceBuffer<i32>,
+    /// `[B]` — per-token starting slot offset into the (oversized) raw KV
+    /// cache. Cache holds `n_raw_before + b` rows during a prefill chunk;
+    /// token i's causally-valid window is rows
+    /// `[n_raw_offset_per[i] .. n_raw_offset_per[i] + n_raw_per[i])`.
+    /// Outside prefill chunks (decode), offsets are 0 and the cache is
+    /// the steady-state SWA_WINDOW prefix only.
+    pub n_raw_offset_per: DeviceBuffer<i32>,
     /// `[B]` — per-token causal prefix length over comp_kv (0 for ratio=0
     /// layers and for tokens before the first comp boundary).
     pub n_comp_per: DeviceBuffer<i32>,
@@ -340,6 +347,7 @@ impl BatchDgpuScratch {
             row_per_b: mk_i32(1)?,
             pos_mod_per_b: mk_i32(1)?,
             n_raw_per: mk_i32(1)?,
+            n_raw_offset_per: mk_i32(1)?,
             n_comp_per: mk_i32(1)?,
 
             heads: mk_f32(Q_FLAT as usize)?,

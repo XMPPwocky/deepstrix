@@ -146,6 +146,7 @@ impl AttentionSwa {
         kv: &DeviceBuffer<f32>,
         sinks: &DeviceBuffer<f32>,
         n_raw_per: &DeviceBuffer<i32>,
+        n_raw_offset_per: &DeviceBuffer<i32>,
         n_head: u32,
         head_dim: u32,
         batch: u32,
@@ -161,7 +162,9 @@ impl AttentionSwa {
             shared_mem_bytes: 0,
         };
         launch_kernel!(function, cfg, stream, [
-            out.raw(), q.raw(), kv.raw(), sinks.raw(), n_raw_per.raw(), n_head, head_dim, kq_scale
+            out.raw(), q.raw(), kv.raw(), sinks.raw(),
+            n_raw_per.raw(), n_raw_offset_per.raw(),
+            n_head, head_dim, kq_scale
         ])
     }
 }
@@ -357,6 +360,7 @@ impl AttentionMixed {
         raw_kv: &DeviceBuffer<f32>,
         comp_kv: Option<&DeviceBuffer<f32>>,
         n_raw_per: &DeviceBuffer<i32>,
+        n_raw_offset_per: &DeviceBuffer<i32>,
         n_comp_per: &DeviceBuffer<i32>,
         n_head: u32,
         head_dim: u32,
@@ -384,7 +388,7 @@ impl AttentionMixed {
         };
         launch_kernel!(function, cfg, stream, [
             scores_g.raw(), q.raw(), raw_kv.raw(), comp_kv_ptr,
-            n_raw_per.raw(), n_comp_per.raw(),
+            n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
             n_head, head_dim, ATTN_MIXED_MAX_KEYS, kq_scale
         ])
     }
@@ -441,6 +445,7 @@ impl AttentionMixed {
         raw_kv: &DeviceBuffer<f32>,
         comp_kv: Option<&DeviceBuffer<f32>>,
         n_raw_per: &DeviceBuffer<i32>,
+        n_raw_offset_per: &DeviceBuffer<i32>,
         n_comp_per: &DeviceBuffer<i32>,
         n_head: u32,
         head_dim: u32,
@@ -461,7 +466,7 @@ impl AttentionMixed {
         };
         launch_kernel!(function, cfg, stream, [
             out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
-            n_raw_per.raw(), n_comp_per.raw(),
+            n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
             n_head, head_dim, ATTN_MIXED_MAX_KEYS
         ])
     }

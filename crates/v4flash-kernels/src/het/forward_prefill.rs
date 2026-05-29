@@ -987,61 +987,50 @@ impl HeterogeneousEngine {
         let mut n_raw_after: Vec<u32> = Vec::with_capacity(b as usize);
         let mut n_comp_after: Vec<u32> = Vec::with_capacity(b as usize);
 
-        // M50/M51: batched kv_cache_append. n_raw_after is the per-token
-        // causal-valid prefix length INTO THE POST-APPEND CACHE.
+        // M52: oversized cache + per-token offset. The cache (ls.kv_cache) is
+        // sized SWA_WINDOW + B_MAX rows so a prefill chunk can write its full
+        // batch into slots [n_raw_before .. n_raw_before + b) WITHOUT evicting
+        // any prior content. Attention's `n_raw_offset_per[i]` tells the
+        // kernel where each token's causally-valid window begins in the cache:
         //
-        // The post-append cache holds the LAST `n_raw_post_append` positions
-        // of the combined sequence so far. With cache slot s holding position
-        // (last_pos - n_raw_post_append + 1 + s), token i in this batch
-        // (which lives at the position-last_pos - (b-1-i)) can only causally
-        // attend to slots [0..n_raw_post_append - (b - 1 - i)].
+        //   absolute_position p_i  = chunk_pos0 + i  (lives at cache slot
+        //                            n_raw_before + i)
+        //   causal window         = [max(0, p_i - W + 1) .. p_i]
+        //   in cache slots         = [max(0, n_raw_before+i+1-W) .. n_raw_before+i+1)
         //
-        // The old formula `(n_raw_before + i + 1).min(W)` was a serial-cache
-        // assumption: it assumed cache slot s holds position s, which is only
-        // true before any eviction. Once eviction fires (because n_raw_before
-        // + b > W), the slot↔position map slides, and the old formula lets
-        // intermediate tokens read FUTURE tokens' KV from within their own
-        // batch, corrupting their residual. The corruption then poisons the
-        // next layer's KV writes and cascades, breaking long-context recall
-        // whenever a chunk boundary is crossed (T > B_MAX).
+        // So n_raw_per[i] = min(n_raw_before+i+1, W) and
+        //    n_raw_offset_per[i] = max(0, n_raw_before+i+1 - W).
+        //
+        // After the chunk's attention runs, an explicit eviction pass copies
+        // the last SWA_WINDOW rows back to slots [0..W) and resets ls.n_raw
+        // to W (or less, for short prompts) so the steady-state SWA invariant
+        // holds for decode and for the next chunk.
         let n_raw_before = ls.n_raw;
-        let n_raw_post_append = (n_raw_before + b).min(SWA_WINDOW);
+        let mut n_raw_offset_after: Vec<u32> = Vec::with_capacity(b as usize);
         for i in 0..b as usize {
-            let future_in_cache = (b as usize) - 1 - i; // tokens after i still in cache
-            let valid = (n_raw_post_append as usize).saturating_sub(future_in_cache) as u32;
-            n_raw_after.push(valid);
+            let causal_end = n_raw_before + i as u32 + 1; // exclusive upper slot
+            let n_per = causal_end.min(SWA_WINDOW);
+            let offset = causal_end.saturating_sub(SWA_WINDOW);
+            n_raw_after.push(n_per);
+            n_raw_offset_after.push(offset);
         }
-        if n_raw_before + b <= SWA_WINDOW {
-            // No eviction: place B contiguous rows at [n_raw_before..+B).
-            de.kv_append.launch_batched(
-                &de.compute,
-                &mut ls.kv_cache,
-                &bd.kv_normed,
-                n_raw_before,
-                N_HEAD_DIM,
-                b,
-            )?;
-        } else {
-            // Eviction (n_raw_before + B > window). One general gather builds
-            // the final SWA_WINDOW ring — survivors from the old cache, new
-            // rows from kv_normed — into a scratch buffer (so survivor reads
-            // can't race), then copy it back. Subsumes both the B≥window hot
-            // path and the B<window partial-eviction case; no underflow.
-            de.kv_append.launch_evict_gather(
-                &de.compute,
-                &ls.kv_cache,
-                &bd.kv_normed,
-                &mut bd.kv_ring_scratch,
-                n_raw_before,
-                b,
-                SWA_WINDOW,
-                N_HEAD_DIM,
-            )?;
-            let ring_len = SWA_WINDOW as usize * N_HEAD_DIM as usize;
-            ls.kv_cache
-                .copy_from_buffer_async(&bd.kv_ring_scratch.slice_view(0, ring_len), &de.compute)?;
-        }
-        ls.n_raw = (n_raw_before + b).min(SWA_WINDOW);
+        // M52: cache is oversized to SWA_WINDOW + B_MAX rows, so we always
+        // use the no-eviction batched append. The post-chunk eviction pass at
+        // the end of this layer (after attention) copies the last SWA_WINDOW
+        // rows down to slots [0..W) and updates ls.n_raw, restoring the
+        // steady-state SWA invariant before the next chunk or decode.
+        de.kv_append.launch_batched(
+            &de.compute,
+            &mut ls.kv_cache,
+            &bd.kv_normed,
+            n_raw_before,
+            N_HEAD_DIM,
+            b,
+        )?;
+        // Cache now holds n_raw_before + b rows; attention will index with
+        // n_raw_offset_per. ls.n_raw is updated to its post-eviction value
+        // at the END of this layer (see the eviction-down pass).
+        let n_raw_during_chunk = n_raw_before + b;
 
         // M50: batched matvec_pair across all B for ratio>0 layers. Produces
         // bd.kv_cur[B, comp_width] + bd.sc_cur[B, comp_width] in one launch.
@@ -1217,6 +1206,8 @@ impl HeterogeneousEngine {
         // Stage 4).
         // ========================================================
         let n_raw_per_host: Vec<i32> = n_raw_after.iter().map(|&v| v as i32).collect();
+        let n_raw_offset_per_host: Vec<i32> =
+            n_raw_offset_after.iter().map(|&v| v as i32).collect();
         let n_comp_per_host: Vec<i32> =
             n_comp_after.iter().map(|&v| v as i32).collect();
         let _t_attn = de.events.stage("dgpu.attn_compute", &de.compute)?;
@@ -1228,10 +1219,15 @@ impl HeterogeneousEngine {
             nrp_v.copy_from_host_async(&n_raw_per_host, &de.compute)?;
         }
         {
+            let mut nrop_v = bd.n_raw_offset_per.slice_view_mut(0, b as usize);
+            nrop_v.copy_from_host_async(&n_raw_offset_per_host, &de.compute)?;
+        }
+        {
             let mut ncp_v = bd.n_comp_per.slice_view_mut(0, b as usize);
             ncp_v.copy_from_host_async(&n_comp_per_host, &de.compute)?;
         }
         let nrp_view = bd.n_raw_per.slice_view(0, b as usize);
+        let nrop_view = bd.n_raw_offset_per.slice_view(0, b as usize);
         let ncp_view = bd.n_comp_per.slice_view(0, b as usize);
         if ratio == 0 {
             de.attn_swa.launch_batched(
@@ -1241,6 +1237,7 @@ impl HeterogeneousEngine {
                 &ls.kv_cache,
                 &dlw.attn_sinks,
                 &nrp_view,
+                &nrop_view,
                 N_HEAD,
                 N_HEAD_DIM,
                 b,
@@ -1267,19 +1264,9 @@ impl HeterogeneousEngine {
             // ATTN_SCORE_WMMA=1 swaps the score Q·Kᵀ GEMM for the RDNA4 f16
             // WMMA variant (7.2× the f32 head-tiled score at 64K).
             if std::env::var_os("ATTN_SCORE_WMMA").is_some() {
-                de.attn_mixed.launch_score_batched_htiled_wmma(
-                    &de.compute,
-                    &mut bd.attn_scores,
-                    &bd.q_normed,
-                    &ls.kv_cache,
-                    comp_kv_buf,
-                    &nrp_view,
-                    &ncp_view,
-                    N_HEAD,
-                    N_HEAD_DIM,
-                    n_total_max,
-                    b,
-                )?;
+                return Err(eyre!(
+                    "ATTN_SCORE_WMMA path not yet updated for M52 oversized cache + n_raw_offset_per"
+                ));
             } else {
                 de.attn_mixed.launch_score_batched_htiled(
                     &de.compute,
@@ -1288,6 +1275,7 @@ impl HeterogeneousEngine {
                     &ls.kv_cache,
                     comp_kv_buf,
                     &nrp_view,
+                    &nrop_view,
                     &ncp_view,
                     N_HEAD,
                     N_HEAD_DIM,
@@ -1299,19 +1287,9 @@ impl HeterogeneousEngine {
             // each shared V-latent element once per head group (HEAD_TILE=16).
             // ATTN_WSUM_WMMA=1 swaps Phase B for the RDNA4 f16 WMMA GEMM.
             if std::env::var_os("ATTN_WSUM_WMMA").is_some() {
-                de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma(
-                    &de.compute,
-                    &mut bd.heads,
-                    &mut bd.attn_scores,
-                    &dlw.attn_sinks,
-                    &ls.kv_cache,
-                    comp_kv_buf,
-                    &nrp_view,
-                    &ncp_view,
-                    N_HEAD,
-                    N_HEAD_DIM,
-                    b,
-                )?;
+                return Err(eyre!(
+                    "ATTN_WSUM_WMMA path not yet updated for M52 oversized cache + n_raw_offset_per"
+                ));
             } else {
                 de.attn_mixed.launch_softmax_wsum_batched_htiled(
                     &de.compute,
@@ -1321,6 +1299,7 @@ impl HeterogeneousEngine {
                     &ls.kv_cache,
                     comp_kv_buf,
                     &nrp_view,
+                    &nrop_view,
                     &ncp_view,
                     N_HEAD,
                     N_HEAD_DIM,
@@ -1329,8 +1308,42 @@ impl HeterogeneousEngine {
             }
         }
         drop(nrp_view);
+        drop(nrop_view);
         drop(ncp_view);
         drop(_t_attn);
+
+        // M52: post-attention eviction. Cache holds n_raw_during_chunk rows
+        // (= n_raw_before + b). Compress back to the SWA invariant:
+        //   - if n_raw_during_chunk <= SWA_WINDOW: nothing to do, slots
+        //     [0..n_raw_during_chunk) are already the steady state. Update
+        //     ls.n_raw = n_raw_during_chunk.
+        //   - if n_raw_during_chunk > SWA_WINDOW: copy the LAST SWA_WINDOW
+        //     rows down to slots [0..SWA_WINDOW). Set ls.n_raw = SWA_WINDOW.
+        //
+        // The shift may have source/dest overlap when n_raw_during_chunk is
+        // between (SWA_WINDOW, 2*SWA_WINDOW), so route through the kv_ring
+        // scratch buffer.
+        if n_raw_during_chunk > SWA_WINDOW {
+            let src_first_slot = n_raw_during_chunk - SWA_WINDOW;
+            let head_dim = N_HEAD_DIM as usize;
+            let ring_len = (SWA_WINDOW as usize) * head_dim;
+            let src_offset = (src_first_slot as usize) * head_dim;
+            // scratch = cache[src_first_slot..src_first_slot+SWA_WINDOW)
+            {
+                let mut ring_v = bd.kv_ring_scratch.slice_view_mut(0, ring_len);
+                let src_v = ls.kv_cache.slice_view(src_offset, ring_len);
+                ring_v.copy_from_buffer_async(&src_v, &de.compute)?;
+            }
+            // cache[0..SWA_WINDOW) = scratch
+            {
+                let ring_src = bd.kv_ring_scratch.slice_view(0, ring_len);
+                let mut dst_v = ls.kv_cache.slice_view_mut(0, ring_len);
+                dst_v.copy_from_buffer_async(&ring_src, &de.compute)?;
+            }
+            ls.n_raw = SWA_WINDOW;
+        } else {
+            ls.n_raw = n_raw_during_chunk;
+        }
 
         // ========================================================
         // Stage 6: Output projection (rope_inv per b, then BATCHED q8)

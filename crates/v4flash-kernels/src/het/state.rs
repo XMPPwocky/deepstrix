@@ -9,6 +9,14 @@ use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer, Stream};
 
 use crate::forward::{COMPRESS_RATIOS, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, NEG_INF, SWA_WINDOW};
+use crate::het::batch_scratch::B_MAX;
+
+/// During batched prefill we need to hold the prior SWA-window AND the
+/// current chunk's freshly-computed KVs together in cache so each token in
+/// the batch can attend to its causally-valid window (which spans both)
+/// — see the n_raw_offset_per attention parameter in forward_prefill.rs.
+/// Outside of prefill chunks only the first SWA_WINDOW rows are used.
+pub const KV_CACHE_ROWS: usize = SWA_WINDOW as usize + B_MAX;
 
 /// Per-layer compressor state. After M13.5, `state_kv` and `state_score`
 /// live on the **iGPU** (where the compressor kernels run), while
@@ -283,14 +291,17 @@ impl HetModelState {
             } else {
                 None
             };
-            // SWA caps the raw KV cache at SWA_WINDOW rows regardless of
-            // total context length: `n_raw` never exceeds SWA_WINDOW in any
-            // write path (kv_append slides the window in place), so rows
-            // beyond it are never written or read. All 43 layers are
-            // window-local on the raw cache; compressor layers hold long
-            // range in their separate comp_kv. Independent of n_kv_max.
+            // Raw KV cache is sized SWA_WINDOW + B_MAX rows. The first
+            // SWA_WINDOW slots hold the steady-state SWA-window contents
+            // (which is all that decode/single-token attention sees).
+            // During batched prefill we additionally use slots
+            // [SWA_WINDOW .. SWA_WINDOW + chunk_b) for the chunk's
+            // freshly-computed KVs so that each token's per-token
+            // n_raw_offset_per can see its causally-valid window across
+            // the prior+current boundary. After each chunk the last
+            // SWA_WINDOW rows are evicted back down to slot [0..W).
             dgpu_device.set_current()?;
-            let raw_rows = SWA_WINDOW;
+            let raw_rows = KV_CACHE_ROWS as u32;
             layers.push(HetLayerState {
                 kv_cache: DeviceBuffer::new(
                     dgpu_device.id,

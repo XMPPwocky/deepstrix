@@ -148,8 +148,10 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
 
     // Per-token causal prefixes [B] — uniform for the bench.
     let mut n_raw_per: DeviceBuffer<i32> = DeviceBuffer::new(dgpu.id, b)?;
+    let mut n_raw_offset_per: DeviceBuffer<i32> = DeviceBuffer::new(dgpu.id, b)?;
     let mut n_comp_per: DeviceBuffer<i32> = DeviceBuffer::new(dgpu.id, b)?;
     n_raw_per.copy_from_host_async(&vec![n_raw as i32; b], &stream)?;
+    n_raw_offset_per.copy_from_host_async(&vec![0i32; b], &stream)?;
     n_comp_per.copy_from_host_async(&vec![n_comp as i32; b], &stream)?;
     stream.synchronize()?;
 
@@ -206,6 +208,7 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
                 &raw_kv,
                 comp_kv.as_ref(),
                 &n_raw_per,
+                &n_raw_offset_per,
                 &n_comp_per,
                 n_head,
                 head_dim,
@@ -252,6 +255,7 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
                 &raw_kv,
                 comp_kv.as_ref(),
                 &n_raw_per,
+                &n_raw_offset_per,
                 &n_comp_per,
                 n_head,
                 head_dim,
@@ -368,6 +372,8 @@ fn prefill_attention_split_matches_mono() -> eyre::Result<()> {
     sinks.copy_from_host(&sinkh)?;
     let mut n_raw_per = DeviceBuffer::new(dgpu.id, b)?;
     n_raw_per.copy_from_host(&nrawh)?;
+    let mut n_raw_offset_per: DeviceBuffer<i32> = DeviceBuffer::new(dgpu.id, b)?;
+    n_raw_offset_per.copy_from_host(&vec![0i32; b])?;
     let mut n_comp_per = DeviceBuffer::new(dgpu.id, b)?;
     n_comp_per.copy_from_host(&ncomph)?;
 
@@ -454,6 +460,7 @@ fn prefill_attention_split_matches_mono() -> eyre::Result<()> {
         &raw_kv,
         Some(&comp_kv),
         &n_raw_per,
+        &n_raw_offset_per,
         &n_comp_per,
         n_head,
         head_dim,
@@ -481,6 +488,7 @@ fn prefill_attention_split_matches_mono() -> eyre::Result<()> {
         &raw_kv,
         Some(&comp_kv),
         &n_raw_per,
+        &n_raw_offset_per,
         &n_comp_per,
         n_head,
         head_dim,
@@ -495,6 +503,7 @@ fn prefill_attention_split_matches_mono() -> eyre::Result<()> {
         &raw_kv,
         Some(&comp_kv),
         &n_raw_per,
+        &n_raw_offset_per,
         &n_comp_per,
         n_head,
         head_dim,
@@ -508,6 +517,7 @@ fn prefill_attention_split_matches_mono() -> eyre::Result<()> {
         &raw_kv,
         Some(&comp_kv),
         &n_raw_per,
+        &n_raw_offset_per,
         &n_comp_per,
         n_head,
         head_dim,

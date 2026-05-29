@@ -104,11 +104,12 @@ extern "C" __global__ void attention_swa(
 // Per-token q[B, n_head, head_dim], out[B, n_head, head_dim], n_raw_per[B].
 // kv_cache is SHARED across tokens (causal: token b sees rows [0..n_raw_per[b]]).
 extern "C" __global__ void attention_swa_batched(
-        float        * out,             // [B, n_head, head_dim]
-        const float  * q,               // [B, n_head, head_dim]
-        const float  * kv,              // [n_kv, head_dim] shared
-        const float  * sinks,           // [n_head]
-        const int    * n_raw_per,       // [B]
+        float        * out,                 // [B, n_head, head_dim]
+        const float  * q,                   // [B, n_head, head_dim]
+        const float  * kv,                  // oversized: [..., head_dim] shared
+        const float  * sinks,               // [n_head]
+        const int    * n_raw_per,           // [B] causal count for this token
+        const int    * n_raw_offset_per,    // [B] starting slot into oversized cache
         unsigned int   n_head,
         unsigned int   head_dim,
         float          kq_scale) {
@@ -124,13 +125,14 @@ extern "C" __global__ void attention_swa_batched(
     __shared__ float inv_denom_s;
 
     const unsigned int n_kv = (unsigned int)n_raw_per[b];
+    const unsigned int raw_off = (unsigned int)n_raw_offset_per[b];
 
     const float *qh = q + ((size_t)b * (size_t)n_head + (size_t)h) * (size_t)head_dim;
     float       *oh = out + ((size_t)b * (size_t)n_head + (size_t)h) * (size_t)head_dim;
     const float sink_h = sinks[h];
 
     for (unsigned int r = 0; r < n_kv; r++) {
-        const float *kv_row = kv + (size_t)r * (size_t)head_dim;
+        const float *kv_row = kv + (size_t)(r + raw_off) * (size_t)head_dim;
         float p = 0.0f;
         for (unsigned int i = tid; i < head_dim; i += block) {
             p += qh[i] * kv_row[i];
@@ -164,7 +166,7 @@ extern "C" __global__ void attention_swa_batched(
     for (unsigned int d = tid; d < head_dim; d += block) {
         float sum = 0.0f;
         for (unsigned int r = 0; r < n_kv; r++) {
-            sum += weights[r] * kv[(size_t)r * (size_t)head_dim + d];
+            sum += weights[r] * kv[(size_t)(r + raw_off) * (size_t)head_dim + d];
         }
         oh[d] = sum * inv;
     }
