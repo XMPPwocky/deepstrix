@@ -210,7 +210,7 @@ fn forward_prompt_batch_v2_matches_sequential() -> eyre::Result<()> {
 
 /// M50 v2 bisect: run forward_layer_batch_v2 ONE layer at a time
 /// and compare per-batch residual_next against Phase 1 (B sequential
-/// forward_layer_pair_mode calls) at the same layer. Print first-
+/// forward_layer_standalone_graphs calls) at the same layer. Print first-
 /// divergence layer + batch position.
 /// Set `BENCH_B` to choose batch size (default 1, max 7).
 #[test]
@@ -277,13 +277,13 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
     let mut max_seen_layer_diff: f32 = 0.0;
 
     for layer in 0..N_LAYER as usize {
-        // ---- Phase 1: B sequential forward_layer_pair_mode calls ----
+        // ---- Phase 1: B sequential forward_layer_standalone_graphs calls ----
         for i in 0..b_n {
             dgpu.set_current()?;
             bs.shared_dgpu
                 .residual
                 .copy_from_buffer(&bs.per_token_residual[i])?;
-            engine.forward_layer_pair_mode(
+            engine.forward_layer_standalone_graphs(
                 &mut bs.shared_dgpu,
                 &mut bs.shared_igpu,
                 &mut ref_state.layers[layer],

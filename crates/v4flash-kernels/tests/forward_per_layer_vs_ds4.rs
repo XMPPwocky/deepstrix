@@ -6,7 +6,7 @@
 //!   For each token T in 0..B (in order so KV cache builds up correctly):
 //!     Seed `shared_dgpu.residual` with `dump.layer_input_residual[L=0, T]`.
 //!     For each layer L in 0..N_LAYER:
-//!       Call `forward_layer_pair_mode(L, T)`. This writes layer-L KV for T
+//!       Call `forward_layer_standalone_graphs(L, T)`. This writes layer-L KV for T
 //!         and produces residual_next (= input to layer L+1).
 //!       Compare `residual_next` to `dump.layer_output_residual[L, T]`.
 //!       Then copy residual_next → residual for the next layer iteration.
@@ -122,7 +122,7 @@ fn forward_per_layer_vs_ds4() -> eyre::Result<()> {
         bs.shared_dgpu.residual.copy_from_host(&inp)?;
 
         for layer in 0..N_LAYER as usize {
-            engine.forward_layer_pair_mode(
+            engine.forward_layer_standalone_graphs(
                 &mut bs.shared_dgpu,
                 &mut bs.shared_igpu,
                 &mut state.layers[layer],

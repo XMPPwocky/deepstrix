@@ -43,20 +43,12 @@ impl HeterogeneousEngine {
     /// Run one layer in the het pipeline. Reads from
     /// `dgpu_scratch.residual` and writes to `dgpu_scratch.residual_next`.
     ///
-    /// M30: `next_dlw` is `Some` for all layers except the last. When
-    /// present, layer N's ffn_combine is fused with layer N+1's
-    /// mhc_pre_attn into one captured graph (the combined-transition
-    /// graph). Correspondingly, mhc_pre_attn is launched standalone ONLY
-    /// for layer 0 — every other layer's mhc_pre_attn rides the previous
-    /// layer's combined graph.
-    ///
-    /// M40-P1: in pair-mode (`pair_mode=true`), the M30 cross-layer
-    /// combined graph is bypassed — each layer uses standalone
-    /// mhc_pre_attn + standalone ffn_combine. This is required because
-    /// pair-mode interleaves two tokens at each layer boundary
-    /// (token0's layer N → snapshot → token1's layer N → ...) and the
-    /// combined graph would speculatively launch the NEXT layer's
-    /// mhc_pre_attn before the snapshot point.
+    /// `next_dlw` is `Some` for all layers except the last. When present,
+    /// layer N's ffn_combine is fused with layer N+1's mhc_pre_attn into
+    /// one captured graph (the combined-transition graph that closes the
+    /// ~115 µs/layer host-scheduling gap). Correspondingly, mhc_pre_attn
+    /// is launched standalone ONLY for layer 0 — every other layer's
+    /// mhc_pre_attn rides the previous layer's combined graph.
     pub fn forward_layer(
         &self,
         dgpu_scratch: &mut DgpuScratch,
@@ -81,8 +73,15 @@ impl HeterogeneousEngine {
         )
     }
 
-    /// M40-P1: pair-mode entry point. See `forward_layer` docs.
-    pub fn forward_layer_pair_mode(
+    /// Run one layer with the cross-layer combined ffn_combine →
+    /// next-mhc_pre_attn graph disabled. Each layer fires its own
+    /// standalone mhc_pre_attn + standalone ffn_combine instead.
+    ///
+    /// Used by diagnostic tests that need per-layer control (e.g. running
+    /// only layer N against the activation dump) — the combined graph
+    /// would speculatively launch the NEXT layer's mhc_pre_attn before
+    /// the test can read the layer-N output.
+    pub fn forward_layer_standalone_graphs(
         &self,
         dgpu_scratch: &mut DgpuScratch,
         igpu_scratch: &mut IgpuScratch,
@@ -92,8 +91,8 @@ impl HeterogeneousEngine {
         pos: u32,
         token_id: i32,
     ) -> eyre::Result<()> {
-        // pair-mode forces standalone graphs on every layer, so
-        // next_dlw is unused. Pass None.
+        // next_dlw unused; the standalone flag forces is_first_layer +
+        // is_last_layer to true regardless.
         self.forward_layer_impl(
             dgpu_scratch,
             igpu_scratch,
@@ -117,7 +116,7 @@ impl HeterogeneousEngine {
         ilw: &IgpuLayerWeights,
         pos: u32,
         token_id: i32,
-        pair_mode: bool,
+        standalone_graphs: bool,
     ) -> eyre::Result<()> {
         let layer = dlw.layer_idx;
         if ilw.layer_idx != layer {
@@ -128,12 +127,12 @@ impl HeterogeneousEngine {
             ));
         }
         let ratio = dlw.ratio;
-        // M40-P1: pair-mode forces standalone graphs (no cross-layer
-        // M30 combined graph). Set is_first_layer=true ALWAYS to fire
-        // standalone mhc_pre_attn each layer, and is_last_layer=true
-        // ALWAYS to fire standalone ffn_combine each layer.
-        let is_first_layer = pair_mode || layer == 0;
-        let is_last_layer = pair_mode || next_dlw.is_none();
+        // `standalone_graphs` forces standalone mhc_pre_attn + standalone
+        // ffn_combine each layer (i.e. bypasses the cross-layer combined
+        // graph). Required when the caller needs to observe layer-N
+        // output before layer N+1 starts.
+        let is_first_layer = standalone_graphs || layer == 0;
+        let is_last_layer = standalone_graphs || next_dlw.is_none();
 
         let serial = matches!(self.mode, ExecMode::HetSingleStream);
 

@@ -1,4 +1,4 @@
-//! Layer-0 token-0 per-stage diff vs ds4 dump. Runs forward_layer_pair_mode
+//! Layer-0 token-0 per-stage diff vs ds4 dump. Runs forward_layer_standalone_graphs
 //! for (L=0, T=0) and compares each named scratch buffer to the corresponding
 //! ds4 dump tag, so we can see which stage contributes the bulk of the ~1e-2
 //! layer-0 divergence.
@@ -105,7 +105,7 @@ fn forward_l0_t0_stages() -> eyre::Result<()> {
     bs.shared_dgpu.residual.copy_from_host(&inp)?;
 
     // Run layer 0 for token 0.
-    engine.forward_layer_pair_mode(
+    engine.forward_layer_standalone_graphs(
         &mut bs.shared_dgpu,
         &mut bs.shared_igpu,
         &mut state.layers[0],
