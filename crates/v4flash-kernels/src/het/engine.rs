@@ -522,6 +522,44 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
+    /// Drain the current device event pools into perfetto slices and
+    /// re-anchor. forward_prefill / forward_token do this implicitly per
+    /// chunk / token; tests that drive forward_layer_batch_v2 directly in
+    /// a loop must call this between iterations to keep slice timestamps
+    /// from drifting against the anchor reference.
+    pub fn flush_perfetto(&self) -> eyre::Result<()> {
+        if let Some(exp_lock) = &self.perfetto {
+            let mut exp = exp_lock.lock().unwrap();
+            self.dgpu.events.for_each_pair(|name, s, e| {
+                let track = if name.contains(".xfer") || name.contains(".peer_push") {
+                    &exp.dgpu_xfer
+                } else {
+                    &exp.dgpu_compute
+                };
+                exp.emit_slice(track, name, s, e)
+            })?;
+            self.igpu.events.for_each_pair(|name, s, e| {
+                let track = if name.contains(".xfer") || name.contains(".peer_push") {
+                    &exp.igpu_xfer
+                } else {
+                    &exp.igpu_compute
+                };
+                exp.emit_slice(track, name, s, e)
+            })?;
+            exp.re_anchor(
+                self.dgpu.device,
+                &self.dgpu.compute,
+                &self.dgpu.xfer,
+                self.igpu.device,
+                &self.igpu.compute,
+                &self.igpu.xfer,
+            )?;
+            self.current_device
+                .store(-1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     /// Open a perfetto device-time trace file. Subsequent
     /// `forward_token` calls will append per-stream slices for every
     /// kernel-stage event-pair. Call after `new()` and before forward

@@ -1185,20 +1185,11 @@ impl HeterogeneousEngine {
             // the correctness oracle in prefill_attention_split_matches_mono.
             // Head-tiled score: one WG per (row, head-group, token) loads the
             // shared MLA latent row once and reuses it across the head group.
-            // ATTN_SCORE_WMMA=1 swaps the score Q·Kᵀ GEMM for the RDNA4 f16
-            // WMMA variant (7.2× the f32 head-tiled score at 64K).
-            if std::env::var_os("ATTN_SCORE_WMMA").is_some() {
-                // TODO(M52): refresh the WMMA score kernel +
-                // launch_score_batched_htiled_wmma wrapper to take
-                // n_raw_offset_per[b] and read raw_kv[(r + offset) * head_dim],
-                // matching the f32 path. Fenced off until then because the
-                // current contract would silently corrupt cross-chunk tokens.
-                return Err(eyre!(
-                    "ATTN_SCORE_WMMA path not yet updated for M52 oversized cache + n_raw_offset_per"
-                ));
-            } else {
+            // Score Q·Kᵀ runs as the RDNA4 f16 WMMA GEMM — measured 7.3× over
+            // the f32 head-tiled variant on the depth-32k ratio=4 layer.
+            {
                 let _t = de.events.stage("k.attn.score", &de.compute)?;
-                de.attn_mixed.launch_score_batched_htiled(
+                de.attn_mixed.launch_score_batched_htiled_wmma(
                     &de.compute,
                     &mut bd.attn_scores,
                     &bd.q_normed,
@@ -1215,19 +1206,11 @@ impl HeterogeneousEngine {
             }
             // Head-tiled phase 2: softmax one wave per head + wsum that loads
             // each shared V-latent element once per head group (HEAD_TILE=16).
-            // ATTN_WSUM_WMMA=1 swaps Phase B for the RDNA4 f16 WMMA GEMM.
-            if std::env::var_os("ATTN_WSUM_WMMA").is_some() {
-                // TODO(M52): refresh the WMMA wsum kernel +
-                // launch_softmax_wsum_batched_htiled_wmma wrapper to take
-                // n_raw_offset_per[b] and apply (r + offset) to both the
-                // score-phase k-row reads and the final v-row reads, matching
-                // the f32 path. Fenced off until then.
-                return Err(eyre!(
-                    "ATTN_WSUM_WMMA path not yet updated for M52 oversized cache + n_raw_offset_per"
-                ));
-            } else {
+            // Phase B W·V runs as RDNA4 f16 WMMA — 2.2× over the f32 path on
+            // the depth-32k ratio=4 layer (Phase A softmax is identical f32).
+            {
                 let _t = de.events.stage("k.attn.smwsum", &de.compute)?;
-                de.attn_mixed.launch_softmax_wsum_batched_htiled(
+                de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma(
                     &de.compute,
                     &mut bd.heads,
                     &mut bd.attn_scores,

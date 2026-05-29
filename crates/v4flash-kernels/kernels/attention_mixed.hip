@@ -565,6 +565,7 @@ extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled_wmma(
         const float    * raw_kv,
         const float    * comp_kv,
         const int      * n_raw_per,      // [B]
+        const int      * n_raw_offset_per,// [B] starting raw-cache slot for this token
         const int      * n_comp_per,     // [B]
         unsigned int     n_head,
         unsigned int     head_dim,
@@ -579,6 +580,7 @@ extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled_wmma(
     if (h0 + ht > n_head) ht = n_head - h0;
 
     const unsigned int n_raw  = (unsigned int)n_raw_per[b];
+    const unsigned int raw_off= (unsigned int)n_raw_offset_per[b];
     const unsigned int n_comp = (unsigned int)n_comp_per[b];
     const unsigned int n_total = n_raw + n_comp;
 
@@ -643,8 +645,8 @@ extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled_wmma(
         for (int e = 0; e < 8; e++) {
             const unsigned int k = r + kh + (unsigned int)e;
             a[e]  = (_Float16)swrow[k];
-            ba[e] = (_Float16)raw_kv[(size_t)k * head_dim + d_a];
-            bb[e] = (_Float16)raw_kv[(size_t)k * head_dim + d_b];
+            ba[e] = (_Float16)raw_kv[(size_t)(k + raw_off) * head_dim + d_a];
+            bb[e] = (_Float16)raw_kv[(size_t)(k + raw_off) * head_dim + d_b];
         }
         c_a = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, ba, c_a);
         c_b = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bb, c_b);
@@ -656,8 +658,8 @@ extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled_wmma(
             const unsigned int k = r + kh + (unsigned int)e;
             if (k < n_raw) {
                 a[e]  = (_Float16)swrow[k];
-                ba[e] = (_Float16)raw_kv[(size_t)k * head_dim + d_a];
-                bb[e] = (_Float16)raw_kv[(size_t)k * head_dim + d_b];
+                ba[e] = (_Float16)raw_kv[(size_t)(k + raw_off) * head_dim + d_a];
+                bb[e] = (_Float16)raw_kv[(size_t)(k + raw_off) * head_dim + d_b];
             }
         }
         c_a = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, ba, c_a);
@@ -721,9 +723,10 @@ extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled_wmma(
 extern "C" __global__ void attention_mixed_score_batched_htiled_wmma(
         float          * scores_g,       // [B, n_head, max_keys]
         const float    * q,              // [B, n_head, head_dim]
-        const float    * raw_kv,         // [n_raw, head_dim]
+        const float    * raw_kv,         // [..., head_dim]   (oversized; per-token raw_off)
         const float    * comp_kv,        // [n_comp, head_dim]  (may be null)
         const int      * n_raw_per,      // [B]
+        const int      * n_raw_offset_per,// [B] starting raw-cache slot for this token
         const int      * n_comp_per,     // [B]
         unsigned int     n_head,
         unsigned int     head_dim,
@@ -735,6 +738,7 @@ extern "C" __global__ void attention_mixed_score_batched_htiled_wmma(
     const unsigned int lane = tid & 31u;
 
     const unsigned int n_raw  = (unsigned int)n_raw_per[b];
+    const unsigned int raw_off= (unsigned int)n_raw_offset_per[b];
     const unsigned int n_comp = (unsigned int)n_comp_per[b];
     const unsigned int n_total = n_raw + n_comp;
 
@@ -749,7 +753,7 @@ extern "C" __global__ void attention_mixed_score_batched_htiled_wmma(
     const float *brow = nullptr;
     if (bkey < n_total) {
         brow = (bkey < n_raw)
-            ? raw_kv + (size_t)bkey * head_dim
+            ? raw_kv + (size_t)(bkey + raw_off) * head_dim
             : comp_kv + (size_t)(bkey - n_raw) * head_dim;
     }
 
