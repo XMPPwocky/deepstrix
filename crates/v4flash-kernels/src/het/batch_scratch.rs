@@ -132,9 +132,13 @@ pub struct BatchDgpuScratch {
     // ---- KV chain ----
     pub kv_raw: DeviceBuffer<f32>,
     pub kv_normed: DeviceBuffer<f32>,
-    /// Scratch ring (≥ `SWA_WINDOW * N_HEAD_DIM`) for the eviction-gather
-    /// append path: gather writes here so survivor reads from the live cache
-    /// cannot race, then it's copied back into `ls.kv_cache`.
+    /// Scratch ring (≥ `SWA_WINDOW * N_HEAD_DIM`) used by the M52 post-chunk
+    /// SWA-eviction pass. After a prefill chunk leaves the cache holding
+    /// `n_raw_during_chunk > SWA_WINDOW` rows in the oversized region, we copy
+    /// the LAST `SWA_WINDOW` rows here, then copy them back to slots `[0..W)`
+    /// of `ls.kv_cache` — two non-overlapping device-to-device copies on the
+    /// compute stream. The intermediate buffer makes the shift race-free
+    /// even when the source/destination regions in the cache overlap.
     pub kv_ring_scratch: DeviceBuffer<f32>,
 
     // ---- Compressor (used in per-batch serial inner loop) ----

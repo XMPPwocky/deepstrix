@@ -36,7 +36,7 @@ use super::batch_scratch::{BatchDgpuScratch, BatchIgpuScratch, BatchScratch, B_M
 use super::engine::HeterogeneousEngine;
 use super::prefill_stats::PrefillStats;
 use super::scratch::{DgpuScratch, IgpuScratch};
-use super::state::{HetLayerState, HetModelState};
+use super::state::{HetLayerState, HetModelState, KV_CACHE_ROWS};
 use super::sync::{peer_push_f32, peer_push_i32};
 use super::weights::{DgpuLayerWeights, HetModelWeights, IgpuLayerWeights};
 
@@ -1019,6 +1019,15 @@ impl HeterogeneousEngine {
         // the end of this layer (after attention) copies the last SWA_WINDOW
         // rows down to slots [0..W) and updates ls.n_raw, restoring the
         // steady-state SWA invariant before the next chunk or decode.
+        //
+        // The cache bound is tight (no margin): n_raw_before ≤ SWA_WINDOW and
+        // b ≤ B_MAX must hold, otherwise launch_batched will OOB-write into
+        // the next layer's KV allocation. Guard in debug builds.
+        debug_assert!(
+            (n_raw_before + b) as usize <= KV_CACHE_ROWS,
+            "kv_append OOB: n_raw_before={n_raw_before} + b={b} > KV_CACHE_ROWS={}",
+            KV_CACHE_ROWS,
+        );
         de.kv_append.launch_batched(
             &de.compute,
             &mut ls.kv_cache,
@@ -1264,6 +1273,11 @@ impl HeterogeneousEngine {
             // ATTN_SCORE_WMMA=1 swaps the score Q·Kᵀ GEMM for the RDNA4 f16
             // WMMA variant (7.2× the f32 head-tiled score at 64K).
             if std::env::var_os("ATTN_SCORE_WMMA").is_some() {
+                // TODO(M52): refresh the WMMA score kernel +
+                // launch_score_batched_htiled_wmma wrapper to take
+                // n_raw_offset_per[b] and read raw_kv[(r + offset) * head_dim],
+                // matching the f32 path. Fenced off until then because the
+                // current contract would silently corrupt cross-chunk tokens.
                 return Err(eyre!(
                     "ATTN_SCORE_WMMA path not yet updated for M52 oversized cache + n_raw_offset_per"
                 ));
@@ -1287,6 +1301,11 @@ impl HeterogeneousEngine {
             // each shared V-latent element once per head group (HEAD_TILE=16).
             // ATTN_WSUM_WMMA=1 swaps Phase B for the RDNA4 f16 WMMA GEMM.
             if std::env::var_os("ATTN_WSUM_WMMA").is_some() {
+                // TODO(M52): refresh the WMMA wsum kernel +
+                // launch_softmax_wsum_batched_htiled_wmma wrapper to take
+                // n_raw_offset_per[b] and apply (r + offset) to both the
+                // score-phase k-row reads and the final v-row reads, matching
+                // the f32 path. Fenced off until then.
                 return Err(eyre!(
                     "ATTN_WSUM_WMMA path not yet updated for M52 oversized cache + n_raw_offset_per"
                 ));

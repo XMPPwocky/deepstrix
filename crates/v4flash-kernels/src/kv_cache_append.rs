@@ -78,10 +78,13 @@ impl KvCacheAppend {
         ])
     }
 
-    /// M50 batched: append B contiguous rows to slots
-    /// [n_raw_before .. n_raw_before + B). Requires no eviction
-    /// (n_raw_before + B <= swa_window). Caller must fall back to a
-    /// per-token serial loop when this precondition would fail.
+    /// M50/M52 batched: append B contiguous rows to slots
+    /// [n_raw_before .. n_raw_before + B). Caller is responsible for
+    /// ensuring `n_raw_before + B <= cache_rows` (the cache is allocated
+    /// at `het::state::KV_CACHE_ROWS = SWA_WINDOW + B_MAX` rows so a full
+    /// prefill chunk can be appended without touching the prior SWA window).
+    /// Post-chunk SWA-window restoration is the caller's job — see the
+    /// eviction-down pass in `forward_prefill::forward_layer_batch_v2`.
     pub fn launch_batched(
         &self,
         stream: &Stream,
@@ -103,52 +106,4 @@ impl KvCacheAppend {
         launch_kernel!(function, cfg, stream, [cache.raw(), kv_new.raw(), n_raw_before, head_dim])
     }
 
-    /// M51 general eviction gather: when the combined sequence
-    /// `[cache(r0 rows), kv_new(b rows)]` overflows the window
-    /// (`r0 + b > swa_window`), the serial slide loop leaves the cache holding
-    /// exactly the last `swa_window` rows of that sequence. Reproduce that
-    /// final state in one launch: slot `s ← combined[r0 + b - swa_window + s]`
-    /// (old cache for indices `< r0`, else `kv_new`). Handles partial eviction
-    /// (`b < swa_window`, surviving prior rows) without underflow.
-    ///
-    /// Output goes to `out` (a separate scratch ring of `swa_window*head_dim`),
-    /// so survivor reads from `cache` cannot race the writes; the caller copies
-    /// `out` back into `cache`. Caller must ensure `r0 + b > swa_window`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn launch_evict_gather(
-        &self,
-        stream: &Stream,
-        cache: &DeviceBuffer<f32>,
-        kv_new: &DeviceBuffer<f32>,
-        out: &mut DeviceBuffer<f32>,
-        r0: u32,
-        b: u32,
-        swa_window: u32,
-        head_dim: u32,
-    ) -> eyre::Result<()> {
-        if swa_window == 0 {
-            return Ok(());
-        }
-        if r0 + b <= swa_window {
-            return Err(eyre!(
-                "kv_cache_append_evict_gather: r0 {r0} + b {b} <= swa_window {swa_window} (no eviction; use launch_batched)"
-            ));
-        }
-        let need = (swa_window as usize) * (head_dim as usize);
-        if out.len() < need {
-            return Err(eyre!(
-                "kv_cache_append_evict_gather: out len {} < swa_window*head_dim {need}",
-                out.len()
-            ));
-        }
-        let function = self.module.get_function("kv_cache_append_evict_gather")?;
-        let cfg = LaunchConfig {
-            grid: (swa_window, 1, 1),
-            block: (head_dim, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        launch_kernel!(function, cfg, stream, [
-            cache.raw(), kv_new.raw(), out.raw(), r0, b, swa_window, head_dim
-        ])
-    }
 }

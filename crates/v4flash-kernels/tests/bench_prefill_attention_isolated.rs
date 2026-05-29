@@ -606,3 +606,202 @@ fn prefill_attention_split_matches_mono() -> eyre::Result<()> {
     eprintln!("PASS: split + head-tiled (score & full) match monolithic within 1e-3");
     Ok(())
 }
+
+/// M52 cross-chunk SWA regression test: the htiled chain must correctly honor
+/// `n_raw_offset_per[b] != 0` (per-token starting slot into the oversized raw
+/// KV cache). Validated against a CPU reference that re-implements the
+/// per-token attention math with the same per-token offset semantics.
+///
+/// The monolithic kernel (used as the oracle in `prefill_attention_split_matches_mono`)
+/// reads `raw_kv[r * head_dim]` and cannot express per-token offsets, so it's
+/// useless for this case — hence the CPU oracle. This is the test the T=540
+/// regression would have caught at `cargo test` time instead of via manual
+/// wine-tasting essays.
+#[test]
+#[ignore]
+fn prefill_attention_htiled_offset_oracle() -> eyre::Result<()> {
+    install_panic_handler()?;
+
+    let dgpu = pick_dgpu()?;
+    dgpu.set_current()?;
+    let arch = dgpu.properties()?.gcn_arch_name;
+    let stream = Stream::new(dgpu.id)?;
+    let attn = AttentionMixed::for_arch(&arch)?;
+
+    let head_dim = N_HEAD_DIM;
+    let n_head = N_HEAD;
+    let batch: u32 = 4;
+    let b = batch as usize;
+
+    // Mimics the post-eviction cross-chunk geometry: n_raw_before = W = 128,
+    // token i lives at chunk slot W + i, causal window starts at slot i + 1.
+    // So n_raw_per[i] = W (saturated) and n_raw_offset_per[i] = i + 1.
+    let n_raw_per_h: Vec<i32> = vec![128, 128, 128, 128];
+    let n_raw_offset_per_h: Vec<i32> = vec![1, 2, 3, 4];
+    // Mix in some comp coverage so both raw + comp paths are exercised.
+    let n_comp_per_h: Vec<i32> = vec![500, 510, 520, 530];
+
+    let max_raw_slot: usize = (0..b)
+        .map(|i| (n_raw_offset_per_h[i] + n_raw_per_h[i]) as usize)
+        .max()
+        .unwrap();
+    let max_comp_slot = *n_comp_per_h.iter().max().unwrap() as usize;
+
+    // Deterministic pseudo-random fill (no rand dep), matching the
+    // companion test's RNG so failures are reproducible.
+    let mut rng: u64 = 0x9E3779B97F4A7C15;
+    let mut next = || -> f32 {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        ((rng >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+    };
+    let qh: Vec<f32> = (0..b * n_head as usize * head_dim as usize)
+        .map(|_| next())
+        .collect();
+    let rawh: Vec<f32> = (0..max_raw_slot * head_dim as usize)
+        .map(|_| next())
+        .collect();
+    let comph: Vec<f32> = (0..max_comp_slot * head_dim as usize)
+        .map(|_| next())
+        .collect();
+    let sinkh: Vec<f32> = (0..n_head as usize).map(|_| next()).collect();
+
+    // CPU oracle: per (b, h) attention with per-token offset.
+    let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
+    let hd = head_dim as usize;
+    let nh = n_head as usize;
+    let mut out_cpu = vec![0f32; b * nh * hd];
+    for bi in 0..b {
+        let n_r = n_raw_per_h[bi] as usize;
+        let off = n_raw_offset_per_h[bi] as usize;
+        let n_c = n_comp_per_h[bi] as usize;
+        for h in 0..nh {
+            let q_base = (bi * nh + h) * hd;
+            let mut scores = Vec::with_capacity(n_r + n_c);
+            for r in 0..n_r {
+                let kv_base = (r + off) * hd;
+                let mut s = 0f32;
+                for d in 0..hd {
+                    s += qh[q_base + d] * rawh[kv_base + d];
+                }
+                scores.push(s * kq_scale);
+            }
+            for c in 0..n_c {
+                let kv_base = c * hd;
+                let mut s = 0f32;
+                for d in 0..hd {
+                    s += qh[q_base + d] * comph[kv_base + d];
+                }
+                scores.push(s * kq_scale);
+            }
+            let sink_h = sinkh[h];
+            let max_s = scores.iter().copied().fold(sink_h, f32::max);
+            let mut denom = (sink_h - max_s).exp();
+            let mut weights = Vec::with_capacity(scores.len());
+            for &s in &scores {
+                let w = (s - max_s).exp();
+                weights.push(w);
+                denom += w;
+            }
+            let inv = 1.0f32 / denom;
+            let o_base = (bi * nh + h) * hd;
+            for d in 0..hd {
+                let mut sum = 0f32;
+                for r in 0..n_r {
+                    sum += weights[r] * rawh[(r + off) * hd + d];
+                }
+                for c in 0..n_c {
+                    sum += weights[n_r + c] * comph[c * hd + d];
+                }
+                out_cpu[o_base + d] = sum * inv;
+            }
+        }
+    }
+
+    // GPU run through the htiled chain.
+    let mut q = DeviceBuffer::new(dgpu.id, qh.len())?;
+    q.copy_from_host(&qh)?;
+    let mut raw_kv = DeviceBuffer::new(dgpu.id, rawh.len())?;
+    raw_kv.copy_from_host(&rawh)?;
+    let mut comp_kv = DeviceBuffer::new(dgpu.id, comph.len())?;
+    comp_kv.copy_from_host(&comph)?;
+    let mut sinks = DeviceBuffer::new(dgpu.id, sinkh.len())?;
+    sinks.copy_from_host(&sinkh)?;
+    let mut n_raw_per = DeviceBuffer::new(dgpu.id, b)?;
+    n_raw_per.copy_from_host(&n_raw_per_h)?;
+    let mut n_raw_offset_per = DeviceBuffer::new(dgpu.id, b)?;
+    n_raw_offset_per.copy_from_host(&n_raw_offset_per_h)?;
+    let mut n_comp_per = DeviceBuffer::new(dgpu.id, b)?;
+    n_comp_per.copy_from_host(&n_comp_per_h)?;
+
+    let out_len = b * nh * hd;
+    let mut out_gpu = DeviceBuffer::new(dgpu.id, out_len)?;
+    out_gpu.fill_zero()?;
+    let mut scores_g =
+        DeviceBuffer::new(dgpu.id, b * nh * ATTN_MIXED_MAX_KEYS as usize)?;
+    scores_g.fill_zero()?;
+    let n_total_max = n_raw_per_h
+        .iter()
+        .zip(n_comp_per_h.iter())
+        .map(|(&r, &c)| (r + c) as u32)
+        .max()
+        .unwrap();
+
+    attn.launch_score_batched_htiled(
+        &stream,
+        &mut scores_g,
+        &q,
+        &raw_kv,
+        Some(&comp_kv),
+        &n_raw_per,
+        &n_raw_offset_per,
+        &n_comp_per,
+        n_head,
+        head_dim,
+        n_total_max,
+        batch,
+    )?;
+    attn.launch_softmax_wsum_batched_htiled(
+        &stream,
+        &mut out_gpu,
+        &mut scores_g,
+        &sinks,
+        &raw_kv,
+        Some(&comp_kv),
+        &n_raw_per,
+        &n_raw_offset_per,
+        &n_comp_per,
+        n_head,
+        head_dim,
+        batch,
+    )?;
+    stream.synchronize()?;
+
+    let mut got = vec![0f32; out_len];
+    out_gpu.copy_to_host(&mut got)?;
+
+    let mut max_abs = 0f32;
+    let mut max_rel = 0f32;
+    for (a, c) in out_cpu.iter().zip(got.iter()) {
+        let abs = (a - c).abs();
+        max_abs = max_abs.max(abs);
+        let rel = abs / a.abs().max(1e-4);
+        max_rel = max_rel.max(rel);
+    }
+    eprintln!(
+        "htiled-with-offset vs CPU: max_abs={max_abs:.2e} max_rel={max_rel:.2e} \
+         (B={batch}, n_raw_offset_per={n_raw_offset_per_h:?})"
+    );
+    // f32 reductions on GPU (32-lane shuffle tree) vs CPU (sequential) differ
+    // by ULPs through softmax; 1e-3 is the same tolerance the companion test
+    // uses against the monolithic GPU reference.
+    if max_abs > 1e-3 {
+        return Err(eyre!(
+            "htiled with n_raw_offset_per != 0 diverges from CPU oracle: \
+             max_abs={max_abs:.2e} (the cross-chunk SWA path is broken)"
+        ));
+    }
+    eprintln!("PASS: htiled honors n_raw_offset_per (M52 cross-chunk SWA path is correct)");
+    Ok(())
+}
