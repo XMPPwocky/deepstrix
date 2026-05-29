@@ -34,11 +34,13 @@ use crate::router_topk::RouterTopk;
 use super::perfetto::DeviceTimingExporter;
 use super::trace::EventPool;
 
-/// Per-device EventPool capacity. With wait-vs-work split bracketing
-/// plus per-kernel timing inside the heavy stages (mhc_pre_attn,
-/// mhc_pre_ffn, output_proj, q_chain, routed_moe — see forward_layer.rs)
-/// we approach ~70 pairs/layer × 43 layers ≈ 6000 events per device.
-pub const EVENT_POOL_CAPACITY: usize = 8192;
+/// Per-device EventPool capacity. The forward path emits per-kernel
+/// sub-spans (one event-pair per kernel launch) inside every multi-kernel
+/// stage; this can hit ~100 pairs/layer × 43 layers ≈ 8600 events in
+/// decode and ~120 pairs/layer × 43 ≈ 10000 events in prefill. Sized
+/// generously so the pool never trips when perfetto is attached. The
+/// pool is reset per token/chunk; allocation is per-session.
+pub const EVENT_POOL_CAPACITY: usize = 16384;
 
 /// Execution policy for [`HeterogeneousEngine::forward_token`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

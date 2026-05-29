@@ -198,46 +198,63 @@ impl HeterogeneousEngine {
         // ============================================================
         let _t_kv = de.events.stage("dgpu.kv_chain", &de.compute)?;
         let _s_kv = debug_span!("kv_chain").entered();
-        de.q8.matvec(
-            &de.compute,
-            &mut dgpu_scratch.kv_raw,
-            &dlw.attn_kv.buffer,
-            &dgpu_scratch.xq_n_embd,
-            &dgpu_scratch.xscale_n_embd,
-            N_HEAD_DIM,
-            N_EMBD,
-        )?;
-        de.rms_w.launch_weighted(
-            &de.compute,
-            &mut dgpu_scratch.kv_normed,
-            &dgpu_scratch.kv_raw,
-            &dlw.kv_a_norm,
-            N_HEAD_DIM,
-            RMS_EPS,
-        )?;
-        de.rope.launch_forward(
-            &de.compute,
-            &mut dgpu_scratch.kv_normed,
-            1,
-            N_HEAD_DIM,
-            N_ROT,
-            pos,
-            &dlw.rope_params,
-        )?;
-        de.fp8
-            .launch(&de.compute, &mut dgpu_scratch.kv_normed, N_HEAD_DIM - N_ROT)?;
-        de.f16rt
-            .launch(&de.compute, &mut dgpu_scratch.kv_normed, N_HEAD_DIM)?;
-
-        // M13.3: device-side append + SWA slide. No sync, no host copies.
-        de.kv_append.launch(
-            &de.compute,
-            &mut ls.kv_cache,
-            &dgpu_scratch.kv_normed,
-            ls.n_raw,
-            SWA_WINDOW,
-            N_HEAD_DIM,
-        )?;
+        {
+            let _t = de.events.stage("k.kv_chain.matvec", &de.compute)?;
+            de.q8.matvec(
+                &de.compute,
+                &mut dgpu_scratch.kv_raw,
+                &dlw.attn_kv.buffer,
+                &dgpu_scratch.xq_n_embd,
+                &dgpu_scratch.xscale_n_embd,
+                N_HEAD_DIM,
+                N_EMBD,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.kv_chain.rms_w", &de.compute)?;
+            de.rms_w.launch_weighted(
+                &de.compute,
+                &mut dgpu_scratch.kv_normed,
+                &dgpu_scratch.kv_raw,
+                &dlw.kv_a_norm,
+                N_HEAD_DIM,
+                RMS_EPS,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.kv_chain.rope", &de.compute)?;
+            de.rope.launch_forward(
+                &de.compute,
+                &mut dgpu_scratch.kv_normed,
+                1,
+                N_HEAD_DIM,
+                N_ROT,
+                pos,
+                &dlw.rope_params,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.kv_chain.fp8", &de.compute)?;
+            de.fp8
+                .launch(&de.compute, &mut dgpu_scratch.kv_normed, N_HEAD_DIM - N_ROT)?;
+        }
+        {
+            let _t = de.events.stage("k.kv_chain.f16rt", &de.compute)?;
+            de.f16rt
+                .launch(&de.compute, &mut dgpu_scratch.kv_normed, N_HEAD_DIM)?;
+        }
+        {
+            // Device-side append + SWA slide. No sync, no host copies.
+            let _t = de.events.stage("k.kv_chain.kv_append", &de.compute)?;
+            de.kv_append.launch(
+                &de.compute,
+                &mut ls.kv_cache,
+                &dgpu_scratch.kv_normed,
+                ls.n_raw,
+                SWA_WINDOW,
+                N_HEAD_DIM,
+            )?;
+        }
         if ls.n_raw < SWA_WINDOW {
             ls.n_raw += 1;
         }
@@ -306,43 +323,59 @@ impl HeterogeneousEngine {
             }
 
             if comp_fires_boundary {
-                de.compressor_pool.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.pooled,
-                    &cs.state_kv,
-                    &cs.state_score,
-                    N_HEAD_DIM,
-                    ratio,
-                )?;
-                de.rms_w.launch_weighted(
-                    &de.compute,
-                    &mut dgpu_scratch.comp_row,
-                    &dgpu_scratch.pooled,
-                    &cw.norm,
-                    N_HEAD_DIM,
-                    RMS_EPS,
-                )?;
+                {
+                    let _t = de.events.stage("k.compressor_d.pool", &de.compute)?;
+                    de.compressor_pool.launch(
+                        &de.compute,
+                        &mut dgpu_scratch.pooled,
+                        &cs.state_kv,
+                        &cs.state_score,
+                        N_HEAD_DIM,
+                        ratio,
+                    )?;
+                }
+                {
+                    let _t = de.events.stage("k.compressor_d.rms_w", &de.compute)?;
+                    de.rms_w.launch_weighted(
+                        &de.compute,
+                        &mut dgpu_scratch.comp_row,
+                        &dgpu_scratch.pooled,
+                        &cw.norm,
+                        N_HEAD_DIM,
+                        RMS_EPS,
+                    )?;
+                }
                 let comp_pos = pos + 1 - ratio;
-                de.rope.launch_forward(
-                    &de.compute,
-                    &mut dgpu_scratch.comp_row,
-                    1,
-                    N_HEAD_DIM,
-                    N_ROT,
-                    comp_pos,
-                    &dlw.rope_params,
-                )?;
-                de.fp8.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.comp_row,
-                    N_HEAD_DIM - N_ROT,
-                )?;
-                de.f16rt.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.comp_row,
-                    N_HEAD_DIM,
-                )?;
+                {
+                    let _t = de.events.stage("k.compressor_d.rope", &de.compute)?;
+                    de.rope.launch_forward(
+                        &de.compute,
+                        &mut dgpu_scratch.comp_row,
+                        1,
+                        N_HEAD_DIM,
+                        N_ROT,
+                        comp_pos,
+                        &dlw.rope_params,
+                    )?;
+                }
+                {
+                    let _t = de.events.stage("k.compressor_d.fp8", &de.compute)?;
+                    de.fp8.launch(
+                        &de.compute,
+                        &mut dgpu_scratch.comp_row,
+                        N_HEAD_DIM - N_ROT,
+                    )?;
+                }
+                {
+                    let _t = de.events.stage("k.compressor_d.f16rt", &de.compute)?;
+                    de.f16rt.launch(
+                        &de.compute,
+                        &mut dgpu_scratch.comp_row,
+                        N_HEAD_DIM,
+                    )?;
+                }
                 if ratio == 4 {
+                    let _t = de.events.stage("k.compressor_d.shuffle", &de.compute)?;
                     de.compressor_shuffle.launch(
                         &de.compute,
                         &mut cs.state_kv,
@@ -352,16 +385,17 @@ impl HeterogeneousEngine {
                 }
 
                 // No peer push needed — append directly into local comp_kv.
-                let _t_append = de.events.stage("dgpu.comp_kv_append", &de.compute)?;
-                de.comp_kv_append.launch(
-                    &de.compute,
-                    &mut cs.comp_kv,
-                    &dgpu_scratch.comp_row,
-                    cs.n_comp,
-                    N_HEAD_DIM,
-                )?;
+                {
+                    let _t = de.events.stage("k.compressor_d.comp_kv_append", &de.compute)?;
+                    de.comp_kv_append.launch(
+                        &de.compute,
+                        &mut cs.comp_kv,
+                        &dgpu_scratch.comp_row,
+                        cs.n_comp,
+                        N_HEAD_DIM,
+                    )?;
+                }
                 cs.n_comp += 1;
-                _t_append.end()?;
             }
             drop(_s_comp);
             _t_comp.end()?;
@@ -601,16 +635,22 @@ impl HeterogeneousEngine {
         }
         let _t_peer_sel = de.events.stage("dgpu.peer_push_selected", &de.xfer)?;
         let _s_peer_sel = debug_span!("peer_push_selected").entered();
-        peer_push_i32(
-            &dgpu_scratch.d_selected,
-            &mut igpu_scratch.d_selected,
-            &de.xfer,
-        )?;
-        peer_push_f32(
-            &dgpu_scratch.d_ew,
-            &mut igpu_scratch.d_ew,
-            &de.xfer,
-        )?;
+        {
+            let _t = de.events.stage("k.peer_push_selected.d_selected", &de.xfer)?;
+            peer_push_i32(
+                &dgpu_scratch.d_selected,
+                &mut igpu_scratch.d_selected,
+                &de.xfer,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.peer_push_selected.d_ew", &de.xfer)?;
+            peer_push_f32(
+                &dgpu_scratch.d_ew,
+                &mut igpu_scratch.d_ew,
+                &de.xfer,
+            )?;
+        }
         if parallel {
             sev.selected_pushed.record(&de.xfer)?;
         } else {

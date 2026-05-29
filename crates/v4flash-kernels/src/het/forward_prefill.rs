@@ -660,47 +660,62 @@ impl HeterogeneousEngine {
         // rms_nw → f16_narrow → sinkhorn → hc_weighted → rms_w
         // ========================================================
         let _t_mhc_pre = de.events.stage("dgpu.mhc_pre_attn", &de.compute)?;
-        de.rms_nw
-            .launch_batched(&de.compute, &mut bd.flat, &bd.residual, 1, HC_DIM, RMS_EPS, b)?;
-        de.f16.matvec_narrow_batched(
-            &de.compute,
-            &mut bd.mix,
-            &dlw.hc_attn_fn.buffer,
-            &bd.flat,
-            HC_MIX_DIM,
-            HC_DIM,
-            b,
-        )?;
-        de.hc_sinkhorn.launch_batched(
-            &de.compute,
-            &mut bd.split,
-            &bd.mix,
-            &dlw.hc_attn_scale,
-            &dlw.hc_attn_base,
-            N_HC,
-            SINKHORN_ITERS,
-            SINKHORN_EPS,
-            b,
-        )?;
-        de.hc_weighted.launch_batched(
-            &de.compute,
-            &mut bd.attn_cur,
-            &bd.residual,
-            &bd.split,
-            N_EMBD,
-            N_HC,
-            HC_MIX_DIM, // w_stride: split is [B, HC_MIX_DIM]; pre-sigmoid w is first n_hc
-            b,
-        )?;
-        de.rms_w.launch_weighted_batched(
-            &de.compute,
-            &mut bd.attn_input_norm,
-            &bd.attn_cur,
-            &dlw.attn_norm,
-            N_EMBD,
-            RMS_EPS,
-            b,
-        )?;
+        {
+            let _t = de.events.stage("k.mhc_pre_attn.rms_nw", &de.compute)?;
+            de.rms_nw
+                .launch_batched(&de.compute, &mut bd.flat, &bd.residual, 1, HC_DIM, RMS_EPS, b)?;
+        }
+        {
+            let _t = de.events.stage("k.mhc_pre_attn.f16_matvec", &de.compute)?;
+            de.f16.matvec_narrow_batched(
+                &de.compute,
+                &mut bd.mix,
+                &dlw.hc_attn_fn.buffer,
+                &bd.flat,
+                HC_MIX_DIM,
+                HC_DIM,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.mhc_pre_attn.sinkhorn", &de.compute)?;
+            de.hc_sinkhorn.launch_batched(
+                &de.compute,
+                &mut bd.split,
+                &bd.mix,
+                &dlw.hc_attn_scale,
+                &dlw.hc_attn_base,
+                N_HC,
+                SINKHORN_ITERS,
+                SINKHORN_EPS,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.mhc_pre_attn.hc_weighted", &de.compute)?;
+            de.hc_weighted.launch_batched(
+                &de.compute,
+                &mut bd.attn_cur,
+                &bd.residual,
+                &bd.split,
+                N_EMBD,
+                N_HC,
+                HC_MIX_DIM, // w_stride: split is [B, HC_MIX_DIM]; pre-sigmoid w is first n_hc
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.mhc_pre_attn.rms_w", &de.compute)?;
+            de.rms_w.launch_weighted_batched(
+                &de.compute,
+                &mut bd.attn_input_norm,
+                &bd.attn_cur,
+                &dlw.attn_norm,
+                N_EMBD,
+                RMS_EPS,
+                b,
+            )?;
+        }
 
         drop(_t_mhc_pre);
 
@@ -708,45 +723,58 @@ impl HeterogeneousEngine {
         // Stage 2: Q chain (BATCHED quantize + matvec + rms + ...)
         // ========================================================
         let _t_q = de.events.stage("dgpu.q_chain", &de.compute)?;
-        de.q8.quantize_input_batched(
-            &de.compute,
-            &mut bd.xq_n_embd,
-            &mut bd.xscale_n_embd,
-            &bd.attn_input_norm,
-            N_EMBD,
-            b,
-        )?;
-        de.q8.matvec_batched(
-            &de.compute,
-            &mut bd.qr,
-            &dlw.attn_q_a.buffer,
-            &bd.xq_n_embd,
-            &bd.xscale_n_embd,
-            N_LORA_Q,
-            N_EMBD,
-            b,
-        )?;
-        de.rms_w.launch_weighted_batched(
-            &de.compute,
-            &mut bd.qr_normed,
-            &bd.qr,
-            &dlw.q_a_norm,
-            N_LORA_Q,
-            RMS_EPS,
-            b,
-        )?;
-        de.q8.quantize_input_batched(
-            &de.compute,
-            &mut bd.qr_xq,
-            &mut bd.qr_xscale,
-            &bd.qr_normed,
-            N_LORA_Q,
-            b,
-        )?;
+        {
+            let _t = de.events.stage("k.q_chain.quantize_input", &de.compute)?;
+            de.q8.quantize_input_batched(
+                &de.compute,
+                &mut bd.xq_n_embd,
+                &mut bd.xscale_n_embd,
+                &bd.attn_input_norm,
+                N_EMBD,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.q_chain.qa_matvec", &de.compute)?;
+            de.q8.matvec_batched(
+                &de.compute,
+                &mut bd.qr,
+                &dlw.attn_q_a.buffer,
+                &bd.xq_n_embd,
+                &bd.xscale_n_embd,
+                N_LORA_Q,
+                N_EMBD,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.q_chain.rms_w", &de.compute)?;
+            de.rms_w.launch_weighted_batched(
+                &de.compute,
+                &mut bd.qr_normed,
+                &bd.qr,
+                &dlw.q_a_norm,
+                N_LORA_Q,
+                RMS_EPS,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.q_chain.quantize_qr", &de.compute)?;
+            de.q8.quantize_input_batched(
+                &de.compute,
+                &mut bd.qr_xq,
+                &mut bd.qr_xscale,
+                &bd.qr_normed,
+                N_LORA_Q,
+                b,
+            )?;
+        }
         // qb up-projection (M=Q_FLAT, K=N_LORA_Q). QB_WMMA swaps the grid.z=B
         // dp4a matvec for the int8-WMMA GEMM (matrix cores, weight read once
         // per K-tile across the batch).
         if std::env::var_os("QB_WMMA").is_some() {
+            let _t = de.events.stage("k.q_chain.qb_wmma", &de.compute)?;
             de.q8_wmma.gemm(
                 &de.compute,
                 &mut bd.q,
@@ -758,6 +786,7 @@ impl HeterogeneousEngine {
                 b,
             )?;
         } else {
+            let _t = de.events.stage("k.q_chain.qb_matvec", &de.compute)?;
             de.q8.matvec_batched(
                 &de.compute,
                 &mut bd.q,
@@ -769,19 +798,22 @@ impl HeterogeneousEngine {
                 b,
             )?;
         }
-        // rms_nw over batch: each batch has [N_HEAD, N_HEAD_DIM] rows.
-        // batched API: grid (B, N_HEAD, 1), inner row of N_HEAD_DIM.
-        de.rms_nw.launch_batched(
-            &de.compute,
-            &mut bd.q_normed,
-            &bd.q,
-            N_HEAD,
-            N_HEAD_DIM,
-            RMS_EPS,
-            b,
-        )?;
-        // M50: batched rope across all B q_normed rows.
         {
+            let _t = de.events.stage("k.q_chain.rms_nw_heads", &de.compute)?;
+            // rms_nw over batch: each batch has [N_HEAD, N_HEAD_DIM] rows.
+            // batched API: grid (B, N_HEAD, 1), inner row of N_HEAD_DIM.
+            de.rms_nw.launch_batched(
+                &de.compute,
+                &mut bd.q_normed,
+                &bd.q,
+                N_HEAD,
+                N_HEAD_DIM,
+                RMS_EPS,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.q_chain.rope", &de.compute)?;
             let pos_v = bd.pos_per_b.slice_view(0, b as usize);
             de.rope.launch_forward_batched(
                 &de.compute,
@@ -801,27 +833,33 @@ impl HeterogeneousEngine {
         // Stage 3: KV chain (BATCHED matvec + rms; per-token rope/fp8/f16rt)
         // ========================================================
         let _t_kv = de.events.stage("dgpu.kv_chain", &de.compute)?;
-        de.q8.matvec_batched(
-            &de.compute,
-            &mut bd.kv_raw,
-            &dlw.attn_kv.buffer,
-            &bd.xq_n_embd,
-            &bd.xscale_n_embd,
-            N_HEAD_DIM,
-            N_EMBD,
-            b,
-        )?;
-        de.rms_w.launch_weighted_batched(
-            &de.compute,
-            &mut bd.kv_normed,
-            &bd.kv_raw,
-            &dlw.kv_a_norm,
-            N_HEAD_DIM,
-            RMS_EPS,
-            b,
-        )?;
-        // M50: batched rope + fp8 + f16rt across all B kv_normed rows.
         {
+            let _t = de.events.stage("k.kv_chain.matvec", &de.compute)?;
+            de.q8.matvec_batched(
+                &de.compute,
+                &mut bd.kv_raw,
+                &dlw.attn_kv.buffer,
+                &bd.xq_n_embd,
+                &bd.xscale_n_embd,
+                N_HEAD_DIM,
+                N_EMBD,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.kv_chain.rms_w", &de.compute)?;
+            de.rms_w.launch_weighted_batched(
+                &de.compute,
+                &mut bd.kv_normed,
+                &bd.kv_raw,
+                &dlw.kv_a_norm,
+                N_HEAD_DIM,
+                RMS_EPS,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.kv_chain.rope", &de.compute)?;
             let pos_v = bd.pos_per_b.slice_view(0, b as usize);
             de.rope.launch_forward_batched(
                 &de.compute,
@@ -834,15 +872,21 @@ impl HeterogeneousEngine {
                 &dlw.rope_params,
             )?;
         }
-        de.fp8.launch_batched(
-            &de.compute,
-            &mut bd.kv_normed,
-            N_HEAD_DIM - N_ROT,
-            N_HEAD_DIM,
-            b,
-        )?;
-        // f16rt is pure elementwise — stretch n by B for a single launch.
-        de.f16rt.launch(&de.compute, &mut bd.kv_normed, b * N_HEAD_DIM)?;
+        {
+            let _t = de.events.stage("k.kv_chain.fp8", &de.compute)?;
+            de.fp8.launch_batched(
+                &de.compute,
+                &mut bd.kv_normed,
+                N_HEAD_DIM - N_ROT,
+                N_HEAD_DIM,
+                b,
+            )?;
+        }
+        {
+            // f16rt is pure elementwise — stretch n by B for a single launch.
+            let _t = de.events.stage("k.kv_chain.f16rt", &de.compute)?;
+            de.f16rt.launch(&de.compute, &mut bd.kv_normed, b * N_HEAD_DIM)?;
+        }
 
         // ========================================================
         // Stage 4: KV cache append + compressor (SERIAL per batch)
@@ -1109,6 +1153,7 @@ impl HeterogeneousEngine {
         let nrop_view = bd.n_raw_offset_per.slice_view(0, b as usize);
         let ncp_view = bd.n_comp_per.slice_view(0, b as usize);
         if ratio == 0 {
+            let _t = de.events.stage("k.attn.swa", &de.compute)?;
             de.attn_swa.launch_batched(
                 &de.compute,
                 &mut bd.heads,
@@ -1152,6 +1197,7 @@ impl HeterogeneousEngine {
                     "ATTN_SCORE_WMMA path not yet updated for M52 oversized cache + n_raw_offset_per"
                 ));
             } else {
+                let _t = de.events.stage("k.attn.score", &de.compute)?;
                 de.attn_mixed.launch_score_batched_htiled(
                     &de.compute,
                     &mut bd.attn_scores,
@@ -1180,6 +1226,7 @@ impl HeterogeneousEngine {
                     "ATTN_WSUM_WMMA path not yet updated for M52 oversized cache + n_raw_offset_per"
                 ));
             } else {
+                let _t = de.events.stage("k.attn.smwsum", &de.compute)?;
                 de.attn_mixed.launch_softmax_wsum_batched_htiled(
                     &de.compute,
                     &mut bd.heads,
@@ -1238,8 +1285,8 @@ impl HeterogeneousEngine {
         // Stage 6: Output projection (rope_inv per b, then BATCHED q8)
         // ========================================================
         let _t_out = de.events.stage("dgpu.output_proj", &de.compute)?;
-        // M50: batched rope inverse across all B heads rows.
         {
+            let _t = de.events.stage("k.output_proj.rope_inverse", &de.compute)?;
             let pos_v = bd.pos_per_b.slice_view(0, b as usize);
             de.rope.launch_inverse_batched(
                 &de.compute,
@@ -1252,43 +1299,55 @@ impl HeterogeneousEngine {
                 &dlw.rope_params,
             )?;
         }
-        de.q8.quantize_input_batched(
-            &de.compute,
-            &mut bd.heads_xq,
-            &mut bd.heads_xscale,
-            &bd.heads,
-            Q_FLAT,
-            b,
-        )?;
-        de.q8_grouped.matvec_grouped_batched(
-            &de.compute,
-            &mut bd.low,
-            &dlw.attn_output_a.buffer,
-            &bd.heads_xq,
-            &bd.heads_xscale,
-            GROUP_DIM,
-            RANK,
-            N_GROUPS,
-            b,
-        )?;
-        de.q8.quantize_input_batched(
-            &de.compute,
-            &mut bd.low_xq,
-            &mut bd.low_xscale,
-            &bd.low,
-            OUT_LOW,
-            b,
-        )?;
-        de.q8.matvec_batched(
-            &de.compute,
-            &mut bd.attn_out,
-            &dlw.attn_output_b.buffer,
-            &bd.low_xq,
-            &bd.low_xscale,
-            N_EMBD,
-            OUT_LOW,
-            b,
-        )?;
+        {
+            let _t = de.events.stage("k.output_proj.quantize_heads", &de.compute)?;
+            de.q8.quantize_input_batched(
+                &de.compute,
+                &mut bd.heads_xq,
+                &mut bd.heads_xscale,
+                &bd.heads,
+                Q_FLAT,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.output_proj.grouped_matvec", &de.compute)?;
+            de.q8_grouped.matvec_grouped_batched(
+                &de.compute,
+                &mut bd.low,
+                &dlw.attn_output_a.buffer,
+                &bd.heads_xq,
+                &bd.heads_xscale,
+                GROUP_DIM,
+                RANK,
+                N_GROUPS,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.output_proj.quantize_low", &de.compute)?;
+            de.q8.quantize_input_batched(
+                &de.compute,
+                &mut bd.low_xq,
+                &mut bd.low_xscale,
+                &bd.low,
+                OUT_LOW,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.output_proj.matvec_out", &de.compute)?;
+            de.q8.matvec_batched(
+                &de.compute,
+                &mut bd.attn_out,
+                &dlw.attn_output_b.buffer,
+                &bd.low_xq,
+                &bd.low_xscale,
+                N_EMBD,
+                OUT_LOW,
+                b,
+            )?;
+        }
         drop(_t_out);
 
         // ========================================================
@@ -1312,54 +1371,69 @@ impl HeterogeneousEngine {
         // Stage 8: mhc_pre_ffn (BATCHED, same shape as Stage 1)
         // ========================================================
         let _t_mhc_pre_ffn = de.events.stage("dgpu.mhc_pre_ffn", &de.compute)?;
-        de.rms_nw.launch_batched(
-            &de.compute,
-            &mut bd.flat,
-            &bd.after_attn_hc,
-            1,
-            HC_DIM,
-            RMS_EPS,
-            b,
-        )?;
-        de.f16.matvec_narrow_batched(
-            &de.compute,
-            &mut bd.mix,
-            &dlw.hc_ffn_fn.buffer,
-            &bd.flat,
-            HC_MIX_DIM,
-            HC_DIM,
-            b,
-        )?;
-        de.hc_sinkhorn.launch_batched(
-            &de.compute,
-            &mut bd.split,
-            &bd.mix,
-            &dlw.hc_ffn_scale,
-            &dlw.hc_ffn_base,
-            N_HC,
-            SINKHORN_ITERS,
-            SINKHORN_EPS,
-            b,
-        )?;
-        de.hc_weighted.launch_batched(
-            &de.compute,
-            &mut bd.ffn_cur,
-            &bd.after_attn_hc,
-            &bd.split,
-            N_EMBD,
-            N_HC,
-            HC_MIX_DIM,
-            b,
-        )?;
-        de.rms_w.launch_weighted_batched(
-            &de.compute,
-            &mut bd.ffn_input_norm,
-            &bd.ffn_cur,
-            &dlw.ffn_norm,
-            N_EMBD,
-            RMS_EPS,
-            b,
-        )?;
+        {
+            let _t = de.events.stage("k.mhc_pre_ffn.rms_nw", &de.compute)?;
+            de.rms_nw.launch_batched(
+                &de.compute,
+                &mut bd.flat,
+                &bd.after_attn_hc,
+                1,
+                HC_DIM,
+                RMS_EPS,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.mhc_pre_ffn.f16_matvec", &de.compute)?;
+            de.f16.matvec_narrow_batched(
+                &de.compute,
+                &mut bd.mix,
+                &dlw.hc_ffn_fn.buffer,
+                &bd.flat,
+                HC_MIX_DIM,
+                HC_DIM,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.mhc_pre_ffn.sinkhorn", &de.compute)?;
+            de.hc_sinkhorn.launch_batched(
+                &de.compute,
+                &mut bd.split,
+                &bd.mix,
+                &dlw.hc_ffn_scale,
+                &dlw.hc_ffn_base,
+                N_HC,
+                SINKHORN_ITERS,
+                SINKHORN_EPS,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.mhc_pre_ffn.hc_weighted", &de.compute)?;
+            de.hc_weighted.launch_batched(
+                &de.compute,
+                &mut bd.ffn_cur,
+                &bd.after_attn_hc,
+                &bd.split,
+                N_EMBD,
+                N_HC,
+                HC_MIX_DIM,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.mhc_pre_ffn.rms_w", &de.compute)?;
+            de.rms_w.launch_weighted_batched(
+                &de.compute,
+                &mut bd.ffn_input_norm,
+                &bd.ffn_cur,
+                &dlw.ffn_norm,
+                N_EMBD,
+                RMS_EPS,
+                b,
+            )?;
+        }
         drop(_t_mhc_pre_ffn);
 
         // ========================================================
@@ -1371,20 +1445,24 @@ impl HeterogeneousEngine {
         // add a wide batched variant.)
         // ========================================================
         let _t_router = de.events.stage("dgpu.router", &de.compute)?;
-        // Gate projection: one wide batched matvec over all B tokens. The
-        // per-row warp reduction is identical to the old per-token loop, so
-        // logits are bit-identical — only the launch count drops from B to 1.
-        de.f16.matvec_batched(
-            &de.compute,
-            &mut bd.router_logits,
-            &dlw.ffn_gate_inp.buffer,
-            &bd.ffn_input_norm,
-            N_EXPERT,
-            N_EMBD,
-            b,
-        )?;
+        {
+            // Gate projection: one wide batched matvec over all B tokens. The
+            // per-row warp reduction is identical to the old per-token loop, so
+            // logits are bit-identical — only the launch count drops from B to 1.
+            let _t = de.events.stage("k.router.f16_matvec", &de.compute)?;
+            de.f16.matvec_batched(
+                &de.compute,
+                &mut bd.router_logits,
+                &dlw.ffn_gate_inp.buffer,
+                &bd.ffn_input_norm,
+                N_EXPERT,
+                N_EMBD,
+                b,
+            )?;
+        }
         if !dlw.is_hash_router {
             // Top-k: one block per token in a single launch (B→1 launches).
+            let _t = de.events.stage("k.router.topk", &de.compute)?;
             de.router_topk.launch_batched(
                 &de.compute,
                 &mut bd.d_selected,
@@ -1442,60 +1520,78 @@ impl HeterogeneousEngine {
         // swiglu + vec_add are pure elementwise → stretch n by B
         // ========================================================
         let _t_shared = de.events.stage("dgpu.shared_expert", &de.compute)?;
-        de.q8.quantize_input_batched(
-            &de.compute,
-            &mut bd.xq_n_embd,
-            &mut bd.xscale_n_embd,
-            &bd.ffn_input_norm,
-            N_EMBD,
-            b,
-        )?;
-        de.q8.matvec_batched(
-            &de.compute,
-            &mut bd.gate_sh,
-            &dlw.shared.gate.buffer,
-            &bd.xq_n_embd,
-            &bd.xscale_n_embd,
-            N_FF_SHARED,
-            N_EMBD,
-            b,
-        )?;
-        de.q8.matvec_batched(
-            &de.compute,
-            &mut bd.up_sh,
-            &dlw.shared.up.buffer,
-            &bd.xq_n_embd,
-            &bd.xscale_n_embd,
-            N_FF_SHARED,
-            N_EMBD,
-            b,
-        )?;
-        // swiglu — elementwise; stretch n to B * N_FF_SHARED.
-        de.swiglu.launch(
-            &de.compute,
-            &mut bd.mid_sh,
-            &bd.gate_sh,
-            &bd.up_sh,
-            b * N_FF_SHARED,
-        )?;
-        de.q8.quantize_input_batched(
-            &de.compute,
-            &mut bd.mid_sh_xq,
-            &mut bd.mid_sh_xscale,
-            &bd.mid_sh,
-            N_FF_SHARED,
-            b,
-        )?;
-        de.q8.matvec_batched(
-            &de.compute,
-            &mut bd.ffn_shared,
-            &dlw.shared.down.buffer,
-            &bd.mid_sh_xq,
-            &bd.mid_sh_xscale,
-            N_EMBD,
-            N_FF_SHARED,
-            b,
-        )?;
+        {
+            let _t = de.events.stage("k.shared_expert.quantize_input", &de.compute)?;
+            de.q8.quantize_input_batched(
+                &de.compute,
+                &mut bd.xq_n_embd,
+                &mut bd.xscale_n_embd,
+                &bd.ffn_input_norm,
+                N_EMBD,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.shared_expert.gate_matvec", &de.compute)?;
+            de.q8.matvec_batched(
+                &de.compute,
+                &mut bd.gate_sh,
+                &dlw.shared.gate.buffer,
+                &bd.xq_n_embd,
+                &bd.xscale_n_embd,
+                N_FF_SHARED,
+                N_EMBD,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.shared_expert.up_matvec", &de.compute)?;
+            de.q8.matvec_batched(
+                &de.compute,
+                &mut bd.up_sh,
+                &dlw.shared.up.buffer,
+                &bd.xq_n_embd,
+                &bd.xscale_n_embd,
+                N_FF_SHARED,
+                N_EMBD,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.shared_expert.swiglu", &de.compute)?;
+            // swiglu — elementwise; stretch n to B * N_FF_SHARED.
+            de.swiglu.launch(
+                &de.compute,
+                &mut bd.mid_sh,
+                &bd.gate_sh,
+                &bd.up_sh,
+                b * N_FF_SHARED,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.shared_expert.quantize_mid", &de.compute)?;
+            de.q8.quantize_input_batched(
+                &de.compute,
+                &mut bd.mid_sh_xq,
+                &mut bd.mid_sh_xscale,
+                &bd.mid_sh,
+                N_FF_SHARED,
+                b,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.shared_expert.down_matvec", &de.compute)?;
+            de.q8.matvec_batched(
+                &de.compute,
+                &mut bd.ffn_shared,
+                &dlw.shared.down.buffer,
+                &bd.mid_sh_xq,
+                &bd.mid_sh_xscale,
+                N_EMBD,
+                N_FF_SHARED,
+                b,
+            )?;
+        }
         drop(_t_shared);
 
         // ========================================================
@@ -1535,9 +1631,19 @@ impl HeterogeneousEngine {
         let mut bi_ew = bi.d_ew.slice_view_mut(0, (b as usize) * cs_n_used);
         {
             let _t_peer_ain = de.events.stage("dgpu.peer_push_ffn_input_norm", &de.xfer)?;
-            peer_push_f32(&ain_v, &mut bi_ain, &de.xfer)?;
-            peer_push_i32(&dsel_v, &mut bi_sel, &de.xfer)?;
-            peer_push_f32(&dew_v, &mut bi_ew, &de.xfer)?;
+            {
+                let _t = de.events.stage("k.peer_push.ain", &de.xfer)?;
+                peer_push_f32(&ain_v, &mut bi_ain, &de.xfer)?;
+            }
+            {
+                let _t = de.events.stage("k.peer_push.d_selected", &de.xfer)?;
+                peer_push_i32(&dsel_v, &mut bi_sel, &de.xfer)?;
+            }
+            {
+                let _t = de.events.stage("k.peer_push.d_ew", &de.xfer)?;
+                peer_push_f32(&dew_v, &mut bi_ew, &de.xfer)?;
+            }
+            drop(_t_peer_ain);
         }
         sev.selected_pushed.record(&de.xfer)?;
         drop(bi_ain);
@@ -1799,23 +1905,29 @@ impl HeterogeneousEngine {
         let de = &self.dgpu;
         de.compute.wait_event(&sev.moe_arrived)?;
         let _t_combine = de.events.stage("dgpu.ffn_combine", &de.compute)?;
-        de.vec_add.launch(
-            &de.compute,
-            &mut bd.ffn_moe_recv,
-            &bd.ffn_shared,
-            b * N_EMBD,
-        )?;
-        de.hc_post.launch_from_split_batched(
-            &de.compute,
-            &mut bd.residual_next,
-            &bd.ffn_moe_recv,
-            &bd.after_attn_hc,
-            &bd.split,
-            N_HC,
-            N_EMBD,
-            N_HC,
-            b,
-        )?;
+        {
+            let _t = de.events.stage("k.ffn_combine.vec_add", &de.compute)?;
+            de.vec_add.launch(
+                &de.compute,
+                &mut bd.ffn_moe_recv,
+                &bd.ffn_shared,
+                b * N_EMBD,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.ffn_combine.hc_post", &de.compute)?;
+            de.hc_post.launch_from_split_batched(
+                &de.compute,
+                &mut bd.residual_next,
+                &bd.ffn_moe_recv,
+                &bd.after_attn_hc,
+                &bd.split,
+                N_HC,
+                N_EMBD,
+                N_HC,
+                b,
+            )?;
+        }
         Ok(())
     }
 }
