@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
-use v4flash_kernels::{ActivationDump, CompressorPool};
+use v4flash_kernels::{oracle::ActivationDump, CompressorPool};
 
 const HEAD_DIM_MAIN: u32 = 512;
 const COMP_WIDTH_R4: usize = 2 * HEAD_DIM_MAIN as usize; // 1024

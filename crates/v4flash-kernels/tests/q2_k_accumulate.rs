@@ -17,7 +17,7 @@ use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::q2_k::cpu_dot_q2_k_q8_k;
 use v4flash_kernels::{
-    ActivationDump, Q2KAccumulateMatvec, Q8KQuantize, BLOCK_Q2_K_BYTES, BLOCK_Q8_K_BYTES,
+    oracle::ActivationDump, Q2KAccumulateMatvec, Q8KQuantize, BLOCK_Q2_K_BYTES, BLOCK_Q8_K_BYTES,
 };
 
 const MODEL_PATH: &str =

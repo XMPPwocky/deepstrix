@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use color_eyre::eyre;
-use v4flash_kernels::ActivationDump;
+use v4flash_kernels::oracle::ActivationDump;
 
 #[test]
 #[ignore]

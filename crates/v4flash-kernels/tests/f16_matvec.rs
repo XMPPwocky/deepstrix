@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
-use v4flash_kernels::{weights, ActivationDump, F16Matvec};
+use v4flash_kernels::{weights, oracle::ActivationDump, F16Matvec};
 
 const MODEL_PATH: &str =
     "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf";

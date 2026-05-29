@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use color_eyre::eyre;
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
-use v4flash_kernels::{ActivationDump, RmsNorm};
+use v4flash_kernels::{oracle::ActivationDump, RmsNorm};
 
 /// Per-element RMSNorm matches ds4's CPU implementation to better than
 /// this absolute tolerance. ds4's CPU rms_norm_weight accumulates in

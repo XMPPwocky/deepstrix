@@ -14,7 +14,7 @@ use v4flash_kernels::config::{
 use v4flash_kernels::het::{
     BatchScratch, ExecMode, HetModelState, HetModelWeights, HeterogeneousEngine,
 };
-use v4flash_kernels::{ActivationDump, RopeParams};
+use v4flash_kernels::{oracle::ActivationDump, RopeParams};
 
 const MAIN_MODEL_PATH: &str =
     "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf";

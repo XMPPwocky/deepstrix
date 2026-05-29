@@ -14,7 +14,7 @@ use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::q4_k::cpu_dot_q4_k_q8_k;
 use v4flash_kernels::{
-    ActivationDump, Q4KMatvec, Q8KQuantize, BLOCK_Q4_K_BYTES, BLOCK_Q8_K_BYTES,
+    oracle::ActivationDump, Q4KMatvec, Q8KQuantize, BLOCK_Q4_K_BYTES, BLOCK_Q8_K_BYTES,
 };
 
 const MTP_MODEL_PATH: &str =

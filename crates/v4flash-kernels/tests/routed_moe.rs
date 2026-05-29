@@ -19,7 +19,7 @@ use color_eyre::eyre::WrapErr;
 use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::{
-    ActivationDump, Iq2XxsPairMatvec, Q2KAccumulateMatvec, Q8KQuantize, SwigluClampWeighted,
+    oracle::ActivationDump, Iq2XxsPairMatvec, Q2KAccumulateMatvec, Q8KQuantize, SwigluClampWeighted,
     BLOCK_IQ2_XXS_BYTES, BLOCK_Q2_K_BYTES, BLOCK_Q8_K_BYTES,
 };
 

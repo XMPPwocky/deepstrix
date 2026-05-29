@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
-use v4flash_kernels::{ActivationDump, Q8KQuantize, BLOCK_Q8_K_BYTES, QK_K};
+use v4flash_kernels::{oracle::ActivationDump, Q8KQuantize, BLOCK_Q8_K_BYTES, QK_K};
 
 const N_EMBD: usize = 4096;
 const N_BLOCKS: usize = N_EMBD / 256; // 16

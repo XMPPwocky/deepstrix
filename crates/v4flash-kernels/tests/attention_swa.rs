@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
-use v4flash_kernels::{ActivationDump, AttentionSwa, ATTN_SWA_MAX_KV};
+use v4flash_kernels::{oracle::ActivationDump, AttentionSwa, ATTN_SWA_MAX_KV};
 
 const N_HEAD: u32 = 64;
 const N_HEAD_DIM: u32 = 512;

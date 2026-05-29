@@ -24,7 +24,7 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::{
-    weights, ActivationDump, AttentionSwa, Q8_0GroupedMatvec, Q8_0Matvec, RopeParams, RopeTail,
+    weights, oracle::ActivationDump, AttentionSwa, Q8_0GroupedMatvec, Q8_0Matvec, RopeParams, RopeTail,
     ATTN_SWA_MAX_KV,
 };
 

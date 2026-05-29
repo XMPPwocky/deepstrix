@@ -25,7 +25,7 @@ use color_eyre::eyre::WrapErr;
 use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::{
-    weights, ActivationDump, F16Matvec, HcPost, HcSinkhorn, HcWeightedSum, RmsNormNoWeight,
+    weights, oracle::ActivationDump, F16Matvec, HcPost, HcSinkhorn, HcWeightedSum, RmsNormNoWeight,
 };
 
 const MODEL_PATH: &str =

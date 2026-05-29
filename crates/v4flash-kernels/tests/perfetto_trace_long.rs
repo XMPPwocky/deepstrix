@@ -35,7 +35,7 @@ use v4flash_kernels::config::{COMPRESS_RATIOS, HC_DIM, N_LAYER, SWA_WINDOW};
 use v4flash_kernels::het::{
     DgpuScratch, ExecMode, HetModelState, HetModelWeights, HeterogeneousEngine, IgpuScratch,
 };
-use v4flash_kernels::{ActivationDump, RopeParams};
+use v4flash_kernels::{oracle::ActivationDump, RopeParams};
 
 const MODEL_PATH: &str =
     "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf";

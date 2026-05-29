@@ -33,7 +33,7 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::{
-    weights, ActivationDump, Q8_0Matvec, RmsNorm, RmsNormNoWeight, RopeParams, RopeTail,
+    weights, oracle::ActivationDump, Q8_0Matvec, RmsNorm, RmsNormNoWeight, RopeParams, RopeTail,
 };
 
 const MODEL_PATH: &str =

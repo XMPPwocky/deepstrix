@@ -19,7 +19,7 @@ use color_eyre::eyre::WrapErr;
 use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::{
-    weights, ActivationDump, CompressorPool, CompressorStateShuffleR4, CompressorStateWrite,
+    weights, oracle::ActivationDump, CompressorPool, CompressorStateShuffleR4, CompressorStateWrite,
     F16Matvec, Fp8E4m3fnQuantize, RmsNorm, RopeParams, RopeTail,
 };
 

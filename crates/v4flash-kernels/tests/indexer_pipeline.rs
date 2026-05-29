@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device};
-use v4flash_kernels::{ActivationDump, Dtype, INDEXER_TOP_K};
+use v4flash_kernels::{oracle::ActivationDump, oracle::Dtype, INDEXER_TOP_K};
 
 fn dump_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

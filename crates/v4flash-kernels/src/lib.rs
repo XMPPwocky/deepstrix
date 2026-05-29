@@ -53,7 +53,10 @@ pub use indexer::{IndexerScore, INDEXER_HEAD_DIM, INDEXER_N_HEAD, INDEXER_TOP_K}
 pub use iq2_xxs::{Iq2XxsPairMatvec, BLOCK_IQ2_XXS_BYTES};
 pub use kv_cache_append::KvCacheAppend;
 pub use moe_group_builder::MoeGroupBuilder;
-pub use oracle::{ActivationDump, Dtype, TensorEntry};
+// `oracle::{ActivationDump, Dtype, TensorEntry}` is intentionally NOT
+// re-exported at the crate root — it's a test-fixture loader for the
+// M2-era activation dumps, not part of the production API. Tests import
+// it as `v4flash_kernels::oracle::ActivationDump`.
 pub use router_topk::{RouterTopk, ROUTER_MAX_EXPERTS, ROUTER_MAX_USED};
 pub use q2_k::{Q2KAccumulateMatvec, BLOCK_Q2_K_BYTES};
 pub use q4_k::{Q4KMatvec, BLOCK_Q4_K_BYTES};

@@ -18,7 +18,7 @@ use color_eyre::eyre::WrapErr;
 use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::{
-    weights, ActivationDump, F16Matvec, HcSigmoidBias, HcWeightedSum, Q8_0Matvec, RmsNorm,
+    weights, oracle::ActivationDump, F16Matvec, HcSigmoidBias, HcWeightedSum, Q8_0Matvec, RmsNorm,
     RmsNormNoWeight,
 };
 

@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
-use v4flash_kernels::{ActivationDump, RopeParams, RopeTail};
+use v4flash_kernels::{oracle::ActivationDump, RopeParams, RopeTail};
 
 const N_LAYER: i32 = 43;
 const N_HEAD: u32 = 64;

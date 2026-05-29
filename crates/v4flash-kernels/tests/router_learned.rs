@@ -12,7 +12,7 @@ use color_eyre::eyre::{self, eyre};
 use color_eyre::eyre::WrapErr;
 use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
-use v4flash_kernels::{weights, ActivationDump, Dtype, F16Matvec};
+use v4flash_kernels::{weights, oracle::ActivationDump, oracle::Dtype, F16Matvec};
 
 const MODEL_PATH: &str =
     "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf";
