@@ -70,6 +70,15 @@ pub struct DgpuScratch {
     pub attn_n_raw_offset_per_b1: DeviceBuffer<i32>,
     pub attn_n_comp_per_b1: DeviceBuffer<i32>,
 
+    // Decode K-split smwsum pipeline scratch (per [[decode-long-ctx-analysis]]).
+    // partials: [k_split, n_head, head_dim] f32 — written by wsum kernel
+    //   pass 2, summed by reduce kernel pass 3. At k_split=16 and the
+    //   V4-Flash shape (n_head=64, head_dim=512) this is 2 MiB.
+    // inv_per_head: [n_head] f32 — written by softmax_only pass 1,
+    //   consumed by reduce pass 3.
+    pub attn_partials: DeviceBuffer<f32>,
+    pub attn_inv_per_head: DeviceBuffer<f32>,
+
     // Compressor scratch (lives on dGPU alongside attn_input_norm).
     pub kv_cur: DeviceBuffer<f32>,
     pub sc_cur: DeviceBuffer<f32>,
@@ -152,6 +161,13 @@ impl DgpuScratch {
                 b
             },
             attn_n_comp_per_b1: DeviceBuffer::new(device_id, 1)?,
+            // k_split=16 matches the kernel default; if it ever changes,
+            // this allocation needs to grow with it.
+            attn_partials: DeviceBuffer::new(
+                device_id,
+                16 * (N_HEAD as usize) * (N_HEAD_DIM as usize),
+            )?,
+            attn_inv_per_head: DeviceBuffer::new(device_id, N_HEAD as usize)?,
 
             kv_cur: DeviceBuffer::new(device_id, (2 * N_HEAD_DIM) as usize)?,
             sc_cur: DeviceBuffer::new(device_id, (2 * N_HEAD_DIM) as usize)?,

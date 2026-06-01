@@ -339,6 +339,93 @@ impl AttentionMixed {
         ])
     }
 
+    /// Decode-attention K-split smwsum pipeline, pass 1: softmax_only.
+    /// Per-head softmax across all keys, writes weights in place to scores
+    /// buffer, writes per-head inv = 1/sum to `inv_per_head` for pass 3.
+    /// Grid (n_head, 1, 1), block 32 (wave 0 only).
+    pub fn launch_softmax_only(
+        &self,
+        stream: &Stream,
+        scores: &mut DeviceBuffer<f32>,
+        sinks: &DeviceBuffer<f32>,
+        inv_per_head: &mut DeviceBuffer<f32>,
+        n_head: u32,
+        n_raw: u32,
+        n_comp: u32,
+    ) -> eyre::Result<()> {
+        let function = self.module.get_function("attention_mixed_softmax_only")?;
+        let cfg = LaunchConfig { grid: (n_head, 1, 1), block: (32, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(function, cfg, stream, [
+            scores.raw(), sinks.raw(), inv_per_head.raw(),
+            n_head, n_raw, n_comp, ATTN_MIXED_MAX_KEYS
+        ])
+    }
+
+    /// Decode K-split smwsum pass 2: head-tiled (16 heads/WG) WMMA wsum,
+    /// K-split across WGs. Writes per-chunk partials [k_split, n_head,
+    /// head_dim] to `partials`. Requires head_dim == 512, n_head % 16 == 0.
+    /// Caller must run `launch_softmax_only` first to populate weights in
+    /// `scores` and inv values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_wsum_b1_htiled_ksplit_ldsv(
+        &self,
+        stream: &Stream,
+        partials: &mut DeviceBuffer<f32>,
+        scores: &DeviceBuffer<f32>,         // post-softmax weights, unscaled
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
+        n_head: u32,
+        head_dim: u32,
+        n_raw: u32,
+        n_comp: u32,
+        k_split: u32,
+    ) -> eyre::Result<()> {
+        if head_dim != 512 || n_head % 16 != 0 {
+            return Err(eyre!(
+                "launch_wsum_b1_htiled_ksplit_ldsv: requires head_dim=512 and n_head%16==0 (got {head_dim}, {n_head})"
+            ));
+        }
+        let function = self
+            .module
+            .get_function("attention_mixed_wsum_b1_htiled_ksplit_ldsv")?;
+        let h_tiles = n_head / 16;
+        let cfg = LaunchConfig {
+            grid: (h_tiles, k_split, 1),
+            block: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
+        launch_kernel!(function, cfg, stream, [
+            partials.raw(), scores.raw(), raw_kv.raw(), comp_kv_ptr,
+            n_raw, n_comp, n_head, head_dim, ATTN_MIXED_MAX_KEYS, k_split
+        ])
+    }
+
+    /// Decode K-split smwsum pass 3: reduce k_split partials per (h, d)
+    /// and apply inv[h]. Writes final out [n_head, head_dim].
+    pub fn launch_reduce_partials_apply_inv(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        partials: &DeviceBuffer<f32>,
+        inv_per_head: &DeviceBuffer<f32>,
+        n_head: u32,
+        head_dim: u32,
+        k_split: u32,
+    ) -> eyre::Result<()> {
+        let function = self
+            .module
+            .get_function("attention_mixed_reduce_partials_apply_inv")?;
+        let total = (n_head as usize) * (head_dim as usize);
+        let block: u32 = 256;
+        let grid: u32 = ((total + (block as usize) - 1) / (block as usize)) as u32;
+        let cfg = LaunchConfig { grid: (grid, 1, 1), block: (block, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), partials.raw(), inv_per_head.raw(),
+            n_head, head_dim, k_split
+        ])
+    }
+
     /// LDS-V variant of `launch_softmax_wsum` — same semantics, V tile is
     /// cooperatively staged to LDS once per K-tile then per-d reads come
     /// from LDS. Targets long-ctx decode where the per-K-tile DRAM reads

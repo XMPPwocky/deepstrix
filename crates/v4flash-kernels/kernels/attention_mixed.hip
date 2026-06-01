@@ -348,6 +348,241 @@ extern "C" __global__ void attention_mixed_softmax_wsum_ldsv(
     oh[d] = s * inv;
 }
 
+// === Decode head-tiled + K-split smwsum (3 kernels) ====================
+// Architectural restructure of the single-token smwsum to unlock MLA
+// V-share at B=1. The baseline single-token kernel runs 1 WG per head,
+// each reading the full V independently — V data is reused across heads
+// only via L2 cache (small, partial reuse). The batched WMMA kernel
+// shares V via LDS within a 16-head WG, but at B=1 it under-occupies the
+// 64-CU dGPU (only 4 head-tile WGs).
+//
+// This pipeline restores V-share at B=1 by adding K-split:
+//   Pass 1  attention_mixed_softmax_only
+//     1 WG × 32 threads per head. Computes max/sum, writes weights in
+//     place to scores buffer, writes inv[h] to a separate per-head buffer.
+//   Pass 2  attention_mixed_wsum_b1_htiled_ksplit_ldsv
+//     Grid (n_head/16=4, k_split, 1). Per WG: 16 heads × K_chunk keys ×
+//     full head_dim=512. LDS-stages V (16 KB) once per K-tile of 16 keys,
+//     each warp does WMMA against its 2 N-tile region. Writes partials
+//     [k_split, h, d] to a global scratch buffer (no inv applied yet).
+//   Pass 3  attention_mixed_reduce_partials
+//     Per (h, d): sums k_split partials, multiplies by inv[h], writes out.
+//
+// With k_split=16, total grid = 4 × 16 = 64 WGs = 1 WG/CU on 64 CUs —
+// matches baseline occupancy. Within each WG, V data is reused 16× across
+// heads (the win the batched kernel can't deliver at B=1).
+#define DEC_KS_HEAD_TILE 16
+#define DEC_KS_N_TILE    16    // WMMA N-tile width
+#define DEC_KS_K_TILE    16    // WMMA K-tile width
+
+extern "C" __global__ void attention_mixed_softmax_only(
+        float       * scores_g,       // [n_head, max_keys] — in-place
+        const float * sinks,          // [n_head]
+        float       * inv_per_head,   // [n_head] — output
+        unsigned int  n_head,
+        unsigned int  n_raw,
+        unsigned int  n_comp,
+        unsigned int  max_keys) {
+    const unsigned int h = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    if (h >= n_head) return;
+    if (tid >= 32) return;
+    float *sw = scores_g + (size_t)h * max_keys;
+    const float sink_h = sinks[h];
+    const unsigned int n_total = n_raw + n_comp;
+
+    // Max reduction.
+    float local_max = sink_h;
+    for (unsigned int r = tid; r < n_total; r += 32) {
+        float v = sw[r];
+        if (v > local_max) local_max = v;
+    }
+    {
+        float o;
+        o = __shfl_xor(local_max, 16); if (o > local_max) local_max = o;
+        o = __shfl_xor(local_max,  8); if (o > local_max) local_max = o;
+        o = __shfl_xor(local_max,  4); if (o > local_max) local_max = o;
+        o = __shfl_xor(local_max,  2); if (o > local_max) local_max = o;
+        o = __shfl_xor(local_max,  1); if (o > local_max) local_max = o;
+    }
+    const float max_score = local_max;
+
+    // Sum (with sink in denom only) + write weights in place.
+    float local_sum = (tid == 0) ? expf(sink_h - max_score) : 0.0f;
+    for (unsigned int r = tid; r < n_total; r += 32) {
+        float w = expf(sw[r] - max_score);
+        sw[r] = w;
+        local_sum += w;
+    }
+    local_sum += __shfl_xor(local_sum, 16);
+    local_sum += __shfl_xor(local_sum,  8);
+    local_sum += __shfl_xor(local_sum,  4);
+    local_sum += __shfl_xor(local_sum,  2);
+    local_sum += __shfl_xor(local_sum,  1);
+    if (tid == 0) inv_per_head[h] = 1.0f / local_sum;
+}
+
+extern "C" __global__ void attention_mixed_wsum_b1_htiled_ksplit_ldsv(
+        float          * partials,    // [k_split, n_head, head_dim] f32
+        const float    * scores_g,    // [n_head, max_keys] — post-softmax weights (unscaled)
+        const _Float16 * raw_kv,      // [n_raw, head_dim]
+        const _Float16 * comp_kv,     // [n_comp, head_dim]
+        unsigned int     n_raw,
+        unsigned int     n_comp,
+        unsigned int     n_head,
+        unsigned int     head_dim,    // == 512
+        unsigned int     max_keys,
+        unsigned int     k_split) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    constexpr unsigned int HT = DEC_KS_HEAD_TILE;  // 16
+    constexpr unsigned int KT = DEC_KS_K_TILE;     // 16
+    constexpr unsigned int NT = DEC_KS_N_TILE;     // 16
+    constexpr unsigned int HEAD_DIM = 512u;
+    constexpr unsigned int N_TILES_TOTAL = HEAD_DIM / NT;   // 32
+    constexpr unsigned int N_WARPS_PER_WG = 16u;            // 512 threads / 32 lanes
+    constexpr unsigned int N_TILES_PER_WARP = N_TILES_TOTAL / N_WARPS_PER_WG;  // 2
+
+    __shared__ _Float16 V_tile[KT * HEAD_DIM];               // 16 KB
+    __shared__ float    W_tile[HT * KT];                     // 1 KB (16×16 f32)
+
+    const unsigned int tid     = threadIdx.x;
+    const unsigned int lane    = tid & 31u;
+    const unsigned int warp    = tid >> 5;       // 0..15
+    const unsigned int h_tile  = blockIdx.x;     // 0..n_head/HT - 1
+    const unsigned int k_chunk = blockIdx.y;     // 0..k_split-1
+    const unsigned int h_base  = h_tile * HT;
+
+    // K-chunk range (rounded to multiples of KT inside each segment).
+    const unsigned int n_total = n_raw + n_comp;
+    const unsigned int chunk_size = (n_total + k_split - 1u) / k_split;
+    const unsigned int k_lo = k_chunk * chunk_size;
+    const unsigned int k_hi = min(k_lo + chunk_size, n_total);
+
+    // Per-warp WMMA accumulators (N_TILES_PER_WARP per warp).
+    float8 acc[N_TILES_PER_WARP];
+    #pragma unroll
+    for (unsigned int t = 0; t < N_TILES_PER_WARP; t++)
+        acc[t] = (float8){0,0,0,0,0,0,0,0};
+
+    // K-tile loop, stepping by KT=16. Edge tile handled by zero-padding
+    // in cooperative loads.
+    for (unsigned int k0 = k_lo; k0 < k_hi; k0 += KT) {
+        // --- Cooperative load V tile (16 keys × 512 d) ---
+        // 512 threads, 8192 f16 elements = 16 per thread. Use vec b128 =
+        // 8 f16 per load, 2 loads per thread.
+        // Thread tid handles V_tile[k_row][d_off] where k_row = tid/64,
+        // d_off = (tid % 64) * 8.
+        {
+            const unsigned int k_row = tid >> 6;          // 0..7  (only half cover, see below)
+            const unsigned int d_off = (tid & 63u) * 8u;  // 0,8,...,504
+            // Each thread loads 2 rows (k_row and k_row+8) to cover all 16.
+            #pragma unroll
+            for (unsigned int kk = 0; kk < 2; kk++) {
+                const unsigned int kk_row = k_row + kk * 8u;
+                const unsigned int g_k = k0 + kk_row;
+                _Float16 vals[8];
+                bool valid = g_k < k_hi;
+                if (valid) {
+                    const _Float16 *src = (g_k < n_raw)
+                        ? raw_kv + (size_t)g_k * head_dim
+                        : comp_kv + (size_t)(g_k - n_raw) * head_dim;
+                    *(int4*)vals = *(const int4*)(src + d_off);
+                } else {
+                    #pragma unroll
+                    for (int e = 0; e < 8; e++) vals[e] = (_Float16)0;
+                }
+                *(int4*)(&V_tile[kk_row * HEAD_DIM + d_off]) =
+                    *(int4*)vals;
+            }
+        }
+        // --- Cooperative load W tile (16 heads × 16 keys) ---
+        // 256 f32 elements over 512 threads → half cover. Thread t in [0, 256)
+        // handles W_tile[t / 16][t % 16].
+        if (tid < HT * KT) {
+            const unsigned int h_local = tid / KT;
+            const unsigned int k_local = tid % KT;
+            const unsigned int g_k = k0 + k_local;
+            const float w = (g_k < k_hi)
+                ? scores_g[(size_t)(h_base + h_local) * max_keys + g_k]
+                : 0.0f;
+            W_tile[h_local * KT + k_local] = w;
+        }
+        __syncthreads();
+
+        // --- Single WMMA M=16, K=16, N=16 per N-tile-per-warp ---
+        // A frag = W_tile in f16 (cast on load): lane l holds
+        //   a[e] = W[(l&15)][(l>>4)*8 + e]
+        half8 a_frag;
+        {
+            const unsigned int m_in = lane & 15u;
+            const unsigned int k_in_base = (lane >> 4) * 8u;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {
+                a_frag[e] = (_Float16)W_tile[m_in * KT + k_in_base + (unsigned int)e];
+            }
+        }
+        // B frag(s) = V_tile in f16: lane l holds
+        //   b[e] = V[(l>>4)*8 + e][n_tile_base + (l&15)]
+        // Per warp: N_TILES_PER_WARP n-tiles to cover.
+        #pragma unroll
+        for (unsigned int nt = 0; nt < N_TILES_PER_WARP; nt++) {
+            const unsigned int n_tile_idx = warp * N_TILES_PER_WARP + nt;
+            const unsigned int n_base = n_tile_idx * NT;
+            half8 b_frag;
+            const unsigned int k_in_base = (lane >> 4) * 8u;
+            const unsigned int n_in      = lane & 15u;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {
+                b_frag[e] = V_tile[(k_in_base + (unsigned int)e) * HEAD_DIM + n_base + n_in];
+            }
+            acc[nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                a_frag, b_frag, acc[nt]);
+        }
+        __syncthreads();
+    }
+
+    // --- Write partials to global ---
+    // C frag layout: lane l holds c[e] = C[(l>>4)*8 + e][l & 15]
+    //   → row h = h_base + (l>>4)*8 + e ; col d = n_base + (l & 15)
+    float * out_chunk = partials + ((size_t)k_chunk * n_head + h_base) * head_dim;
+    #pragma unroll
+    for (unsigned int nt = 0; nt < N_TILES_PER_WARP; nt++) {
+        const unsigned int n_tile_idx = warp * N_TILES_PER_WARP + nt;
+        const unsigned int n_base = n_tile_idx * NT;
+        const unsigned int n_idx = n_base + (lane & 15u);
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const unsigned int h_off = (lane >> 4) * 8u + (unsigned int)e;
+            out_chunk[(size_t)h_off * head_dim + n_idx] = acc[nt][e];
+        }
+    }
+#else
+    (void)partials; (void)scores_g; (void)raw_kv; (void)comp_kv;
+    (void)n_raw; (void)n_comp; (void)n_head; (void)head_dim;
+    (void)max_keys; (void)k_split;
+#endif
+}
+
+extern "C" __global__ void attention_mixed_reduce_partials_apply_inv(
+        float       * out,           // [n_head, head_dim]
+        const float * partials,      // [k_split, n_head, head_dim]
+        const float * inv_per_head,  // [n_head]
+        unsigned int  n_head,
+        unsigned int  head_dim,
+        unsigned int  k_split) {
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = n_head * head_dim;
+    if (gid >= total) return;
+    const unsigned int h = gid / head_dim;
+    const unsigned int d = gid % head_dim;
+    const size_t hd_per_chunk = (size_t)n_head * head_dim;
+    float acc = 0.0f;
+    for (unsigned int kc = 0; kc < k_split; kc++) {
+        acc += partials[(size_t)kc * hd_per_chunk + (size_t)h * head_dim + d];
+    }
+    out[(size_t)h * head_dim + d] = acc * inv_per_head[h];
+}
+
 #define SMWSUM_HEAD_TILE 16
 
 // Head-tiled WMMA Phase-B smwsum. Each WG covers SMWSUM_HEAD_TILE(16)

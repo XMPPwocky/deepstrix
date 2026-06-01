@@ -73,6 +73,7 @@ fn bench_attention_isolated() -> eyre::Result<()> {
     let do_score        = phase == "both" || phase == "score";
     let do_smwsum       = phase == "both" || phase == "smwsum";
     let do_smwsum_ldsv  = phase == "smwsum_ldsv";
+    let do_smwsum_ksplit = phase == "smwsum_ksplit";
     let do_b_score      = phase == "batched_both" || phase == "batched_score";
     let do_b_smwsum     = phase == "batched_both" || phase == "batched_smwsum";
     let do_b1_score     = phase == "b1_score";
@@ -141,6 +142,15 @@ fn bench_attention_isolated() -> eyre::Result<()> {
         dgpu.id, (n_head as usize) * (head_dim as usize))?;
     if !skip_fill { out.fill_zero()?; }
 
+    // Buffers for the K-split decode smwsum pipeline.
+    let k_split: u32 = std::env::var("BENCH_KSPLIT")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+    let mut partials: DeviceBuffer<f32> = DeviceBuffer::new(
+        dgpu.id, (k_split as usize) * (n_head as usize) * (head_dim as usize))?;
+    if !skip_fill { partials.fill_zero()?; }
+    let mut inv_per_head: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, n_head as usize)?;
+    if !skip_fill { inv_per_head.fill_zero()?; }
+
     // Per-batch counters for the batched kernels (B=1).
     let mut n_raw_per: DeviceBuffer<i32> = DeviceBuffer::new(dgpu.id, 1)?;
     n_raw_per.copy_from_host(&[n_raw as i32])?;
@@ -170,6 +180,21 @@ fn bench_attention_isolated() -> eyre::Result<()> {
             attn.launch_softmax_wsum_ldsv(
                 stream, out, scores, &sinks, &raw_kv, comp_kv.as_ref(),
                 n_head, head_dim, n_raw, n_comp,
+            )?;
+        }
+        if do_smwsum_ksplit {
+            // 3-pass: softmax_only → wsum_b1_htiled_ksplit_ldsv → reduce.
+            attn.launch_softmax_only(
+                stream, scores, &sinks, &mut inv_per_head,
+                n_head, n_raw, n_comp,
+            )?;
+            attn.launch_wsum_b1_htiled_ksplit_ldsv(
+                stream, &mut partials, scores, &raw_kv, comp_kv.as_ref(),
+                n_head, head_dim, n_raw, n_comp, k_split,
+            )?;
+            attn.launch_reduce_partials_apply_inv(
+                stream, out, &partials, &inv_per_head,
+                n_head, head_dim, k_split,
             )?;
         }
         if do_b_score {

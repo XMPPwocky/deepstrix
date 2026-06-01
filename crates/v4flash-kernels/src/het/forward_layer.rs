@@ -453,18 +453,53 @@ impl HeterogeneousEngine {
             {
                 let _t = de.events.stage("dgpu.attn_smwsum", &de.compute)?;
                 let _s = debug_span!("attn_smwsum").entered();
-                de.attn_mixed.launch_softmax_wsum(
-                    &de.compute,
-                    &mut dgpu_scratch.heads,
-                    &mut dgpu_scratch.attn_scores,
-                    &dlw.attn_sinks,
-                    &ls.kv_cache,
-                    comp_kv_buf,
-                    N_HEAD,
-                    N_HEAD_DIM,
-                    ls.n_raw,
-                    n_comp,
-                )?;
+                // Default: 3-pass K-split smwsum (head-tile=16 + k-split=16
+                // + reduce). Recovers MLA V-share at B=1 by tiling 16 heads
+                // per WG sharing V via LDS — the win the batched WMMA
+                // kernel can't deliver at B=1 due to under-occupation.
+                // Isolated bench at ratio=4 n_comp=16384:
+                //   baseline      609 µs p50
+                //   k-split=16    260 µs p50  (2.34× faster)
+                // DECODE_SMWSUM=single rolls back to the existing kernel.
+                let use_ksplit = std::env::var("DECODE_SMWSUM")
+                    .map(|v| v != "single").unwrap_or(true);
+                if use_ksplit {
+                    const K_SPLIT: u32 = 16;
+                    de.attn_mixed.launch_softmax_only(
+                        &de.compute,
+                        &mut dgpu_scratch.attn_scores,
+                        &dlw.attn_sinks,
+                        &mut dgpu_scratch.attn_inv_per_head,
+                        N_HEAD, ls.n_raw, n_comp,
+                    )?;
+                    de.attn_mixed.launch_wsum_b1_htiled_ksplit_ldsv(
+                        &de.compute,
+                        &mut dgpu_scratch.attn_partials,
+                        &dgpu_scratch.attn_scores,
+                        &ls.kv_cache,
+                        comp_kv_buf,
+                        N_HEAD, N_HEAD_DIM,
+                        ls.n_raw, n_comp,
+                        K_SPLIT,
+                    )?;
+                    de.attn_mixed.launch_reduce_partials_apply_inv(
+                        &de.compute,
+                        &mut dgpu_scratch.heads,
+                        &dgpu_scratch.attn_partials,
+                        &dgpu_scratch.attn_inv_per_head,
+                        N_HEAD, N_HEAD_DIM, K_SPLIT,
+                    )?;
+                } else {
+                    de.attn_mixed.launch_softmax_wsum(
+                        &de.compute,
+                        &mut dgpu_scratch.heads,
+                        &mut dgpu_scratch.attn_scores,
+                        &dlw.attn_sinks,
+                        &ls.kv_cache,
+                        comp_kv_buf,
+                        N_HEAD, N_HEAD_DIM, ls.n_raw, n_comp,
+                    )?;
+                }
             }
         }
 
