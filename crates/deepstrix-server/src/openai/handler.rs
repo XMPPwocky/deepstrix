@@ -128,15 +128,27 @@ pub async fn chat_completions(
 }
 
 /// GET /v1/models — minimal listing for letta's provider auth flow.
+/// We surface `max_context_length` and `loaded_context_length` to
+/// match LM Studio's API shape — letta's pi-ai stream adapter reads
+/// these to know how much prompt the model can take. Both values are
+/// our `--ctx` (= `n_kv_max`) since deepstrix-server doesn't
+/// distinguish "supported" from "currently-loaded" ctx.
 pub async fn list_models(State(engine): State<EngineHandle>) -> Json<serde_json::Value> {
     let id = engine.model_name.as_str().to_string();
+    let ctx = engine.n_kv_max as u64;
     Json(serde_json::json!({
         "object": "list",
         "data": [{
             "id": id,
             "object": "model",
+            "type": "llm",
             "created": 0,
-            "owned_by": "deepstrix"
+            "owned_by": "deepstrix",
+            "max_context_length": ctx,
+            "loaded_context_length": ctx,
+            "context_window": ctx,
+            "context_length": ctx,
+            "state": "loaded"
         }]
     }))
 }

@@ -94,6 +94,10 @@ pub struct EngineHandle {
     tx: mpsc::UnboundedSender<EngineRequest>,
     pub vocab: Arc<BpeVocab>,
     pub model_name: Arc<String>,
+    /// Total KV-cache capacity in tokens — surfaced on `/v1/models` so
+    /// clients (notably letta) can size requests to fit. Matches
+    /// `WorkerConfig.n_kv_max`.
+    pub n_kv_max: u32,
 }
 
 impl EngineHandle {
@@ -147,6 +151,7 @@ pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
     let (tx, rx) = mpsc::unbounded_channel::<EngineRequest>();
     let (ready_tx, ready_rx) =
         std::sync::mpsc::sync_channel::<eyre::Result<(Arc<BpeVocab>, Arc<String>)>>(1);
+    let n_kv_max = cfg.n_kv_max;
 
     std::thread::Builder::new()
         .name("deepstrix-engine".into())
@@ -160,6 +165,7 @@ pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
         tx,
         vocab,
         model_name,
+        n_kv_max,
     })
 }
 
@@ -632,6 +638,8 @@ fn save_live_if_dirty(state: &mut WorkerState) {
         state.igpu,
         &state.model_fingerprint,
         state.snapshot_index.root(),
+        state.vocab.as_ref(),
+        &state.byte_decoder,
     ) {
         Ok(entry) => {
             let hash = entry.hash;
@@ -719,7 +727,12 @@ fn handle_generate_stream(
         let disk_hit_session = session_id
             .as_deref()
             .and_then(|sid| state.snapshot_index.lookup_session(sid, &req.tokens));
-        let disk_hit_walk = state.snapshot_index.find_longest_prefix(&req.tokens, TOK_EOS);
+        let disk_hit_walk = state.snapshot_index.find_longest_prefix(
+            &req.tokens,
+            TOK_EOS,
+            state.vocab.as_ref(),
+            &state.byte_decoder,
+        );
         let disk_hit = match (disk_hit_session, disk_hit_walk) {
             (Some(a), Some(b)) => Some(if a.0 >= b.0 { a } else { b }),
             (Some(a), None) => Some(a),
@@ -727,10 +740,13 @@ fn handle_generate_stream(
             (None, None) => None,
         };
 
-        // Disk snapshot lookup uses req-token-count comparison; lcp_req
-        // is the req-side coverage of the in-VRAM hit.
-        if let Some((snap_tokens, snap_hash, snap_dir)) = disk_hit {
-            if snap_tokens > lcp_req {
+        // Disk snapshot lookup. The snapshot's IndexEntry.token_count
+        // is in the SAVED token-id space (originally-sampled IDs); the
+        // walk's match position is the byte boundary in req-token space.
+        // We treat the snapshot as "potentially useful" if it offers more
+        // req-side coverage than the in-VRAM live cache.
+        if let Some((snap_req_tokens, snap_hash, snap_dir)) = disk_hit {
+            if snap_req_tokens > lcp_req {
                 save_live_if_dirty(state);
                 state.state.reset_in_place(state.dgpu, state.igpu)?;
                 let loaded = snapshot::restore(
@@ -740,45 +756,60 @@ fn handle_generate_stream(
                     state.igpu,
                     &state.model_fingerprint,
                 )?;
-                if loaded.len() > req.tokens.len()
-                    || loaded != req.tokens[..loaded.len()]
-                {
+                let loaded_len = loaded.len() as u32;
+                // Verify the snapshot's BYTE stream is actually a prefix
+                // of req. With byte-hashed keys (format v2) this should
+                // always be true when find_longest_prefix returned this
+                // entry; the session-hint path bypasses that check so
+                // we re-verify here.
+                let verify = byte_aligned_lcp(
+                    &loaded,
+                    &req.tokens,
+                    state.vocab.as_ref(),
+                    &state.byte_decoder,
+                );
+                if verify.live_tokens != loaded.len() {
                     tracing::warn!(
                         loaded_len = loaded.len(),
-                        "snapshot tokens are not a prefix of the request; falling back to full prefill"
+                        verify_live = verify.live_tokens,
+                        verify_req = verify.req_tokens,
+                        "restored snapshot bytes are NOT a prefix of the request; falling back"
                     );
                     state.state.reset_in_place(state.dgpu, state.igpu)?;
                     state.live = None;
                 } else {
-                    let loaded_len = loaded.len() as u32;
-                    state.live = Some(LiveSession {
-                        tokens: loaded,
-                        pos: loaded_len,
-                        dirty: false,
-                        session_id: session_id.clone(),
-                    });
                     let _ = state.snapshot_index.touch(&snap_hash);
+                    let suffix_len = req.tokens.len() - verify.req_tokens;
                     tracing::info!(
                         req_len = req.tokens.len(),
-                        restored = loaded_len,
-                        suffix_len = req.tokens.len() - loaded_len as usize,
+                        restored_live = loaded_len,
+                        restored_req = verify.req_tokens,
+                        suffix_len,
                         mode = "restore",
                         "prefill"
                     );
-                    if (loaded_len as usize) < req.tokens.len() {
-                        prefill_suffix(state, &req.tokens[loaded_len as usize..], loaded_len)?;
+                    if suffix_len > 0 {
+                        prefill_suffix(state, &req.tokens[verify.req_tokens..], loaded_len)?;
                     }
-                    if let Some(l) = &mut state.live {
-                        l.tokens = req.tokens.clone();
-                        l.pos = prompt_tokens;
-                        l.session_id = session_id.clone();
-                    }
+                    let new_pos = loaded_len + suffix_len as u32;
+                    // live.tokens after restore + suffix prefill: loaded
+                    // (in saved token-id space) + req.tokens[lcp_req..].
+                    let mut new_tokens: Vec<i32> =
+                        Vec::with_capacity(loaded.len() + suffix_len);
+                    new_tokens.extend_from_slice(&loaded);
+                    new_tokens.extend_from_slice(&req.tokens[verify.req_tokens..]);
+                    state.live = Some(LiveSession {
+                        tokens: new_tokens,
+                        pos: new_pos,
+                        dirty: false,
+                        session_id: session_id.clone(),
+                    });
                     return finish_decode(
                         state,
                         req,
                         tx,
                         prompt_tokens,
-                        prompt_tokens, // pos == prompt_tokens for restore/full-prefill path
+                        new_pos,
                         session_id,
                         cancel,
                     );

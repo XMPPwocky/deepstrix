@@ -23,11 +23,34 @@ use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{self, eyre};
 use serde::{Deserialize, Serialize};
+use v4flash_core::tokenizer::BpeVocab;
 use v4flash_hip::Device;
 use v4flash_kernels::config::{COMPRESS_RATIOS, N_HEAD_DIM, N_LAYER, NEG_INF, SWA_WINDOW};
 use v4flash_kernels::het::HetModelState;
 
-const FORMAT_VERSION: u32 = 1;
+use crate::embed::gpt2_decode_token;
+
+/// Bumped to 2 when snapshot keys switched from `blake3(token_id_LE_bytes)`
+/// to `blake3(decoded_byte_stream)` — bytes are the source of truth and
+/// survive tokenizer-roundtrip splits.
+const FORMAT_VERSION: u32 = 2;
+
+/// Decode a token-id sequence to the raw byte stream the model would
+/// see at the surface level. Used for snapshot keys + byte-level
+/// prefix matching across tokenization differences.
+pub fn decode_tokens_to_bytes(
+    tokens: &[i32],
+    vocab: &BpeVocab,
+    byte_decoder: &std::collections::HashMap<char, u8>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(tokens.len() * 2);
+    for &id in tokens {
+        if let Some(bytes) = vocab.token_text(id) {
+            out.extend(gpt2_decode_token(bytes, byte_decoder));
+        }
+    }
+    out
+}
 
 /// Identifies which model produced a snapshot — guards against
 /// silently restoring weights from a different GGUF. We don't blake
@@ -266,29 +289,44 @@ impl SnapshotIndex {
     }
 
     /// Walk `tokens` looking for the longest prefix `tokens[..i]` whose
-    /// blake3 matches an on-disk snapshot. Probes only at turn-boundary
-    /// indices: positions `i` where `tokens[i-1] == TOK_EOS` (and `i ==
-    /// tokens.len()` if the full sequence ends at EOS). Returns
-    /// `(prefix_len, hash, dir)` of the largest match, or `None`.
+    /// byte-decoded form (`blake3(decode(tokens[..i]))`) matches an
+    /// on-disk snapshot. Probes only at turn-boundary indices:
+    /// positions `i` where `tokens[i-1] == TOK_EOS`. Returns
+    /// `(req_prefix_len, hash, dir)` of the largest match — where
+    /// `req_prefix_len` is the req-side token count for the byte
+    /// boundary that hashed (the snapshot's stored token count may
+    /// differ, since the same bytes can split differently).
     pub fn find_longest_prefix(
         &self,
         tokens: &[i32],
         tok_eos: i32,
+        vocab: &BpeVocab,
+        byte_decoder: &std::collections::HashMap<char, u8>,
     ) -> Option<(usize, [u8; 32], PathBuf)> {
         let mut best: Option<(usize, [u8; 32], PathBuf)> = None;
-        let mut i = 1;
-        while i <= tokens.len() {
-            // EOS-boundary: tokens[i-1] == EOS.
-            if tokens[i - 1] == tok_eos {
-                let bytes = token_ids_as_bytes(&tokens[..i]);
-                let h = *blake3::hash(&bytes).as_bytes();
+        // Build the decoded byte prefix incrementally; recompute the
+        // blake3 hash at each EOS boundary. blake3 doesn't have a
+        // cheap incremental hash for arbitrary prefixes, but the
+        // hashing itself is fast (~GB/s) — for a 16K-token prompt
+        // this is sub-millisecond.
+        let mut byte_prefix: Vec<u8> = Vec::with_capacity(tokens.len() * 2);
+        let decode = |id: i32| -> Vec<u8> {
+            vocab
+                .token_text(id)
+                .map(|b| gpt2_decode_token(b, byte_decoder))
+                .unwrap_or_default()
+        };
+        for (i, &tok) in tokens.iter().enumerate() {
+            byte_prefix.extend(decode(tok));
+            if tok == tok_eos {
+                let h = *blake3::hash(&byte_prefix).as_bytes();
                 if let Some(entry) = self.by_hash.get(&h) {
-                    if best.as_ref().map(|(b, _, _)| *b).unwrap_or(0) < i {
-                        best = Some((i, h, entry.dir.clone()));
+                    let req_prefix_len = i + 1;
+                    if best.as_ref().map(|(b, _, _)| *b).unwrap_or(0) < req_prefix_len {
+                        best = Some((req_prefix_len, h, entry.dir.clone()));
                     }
                 }
             }
-            i += 1;
         }
         best
     }
@@ -322,6 +360,15 @@ fn token_ids_as_bytes(tokens: &[i32]) -> Vec<u8> {
     out
 }
 
+fn blake3_decoded(
+    tokens: &[i32],
+    vocab: &BpeVocab,
+    byte_decoder: &std::collections::HashMap<char, u8>,
+) -> [u8; 32] {
+    let bytes = decode_tokens_to_bytes(tokens, vocab, byte_decoder);
+    *blake3::hash(&bytes).as_bytes()
+}
+
 fn hex_to_blake3(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
@@ -351,6 +398,8 @@ pub fn save(
     igpu: Device,
     fingerprint: &ModelFingerprint,
     root: &Path,
+    vocab: &BpeVocab,
+    byte_decoder: &std::collections::HashMap<char, u8>,
 ) -> eyre::Result<IndexEntry> {
     if state.layers.len() != N_LAYER as usize {
         return Err(eyre!(
@@ -359,13 +408,19 @@ pub fn save(
             N_LAYER
         ));
     }
-    let hash_bytes = token_ids_as_bytes(tokens);
-    let hash = *blake3::hash(&hash_bytes).as_bytes();
+    // Key is hash of DECODED bytes, not token IDs — survives tokenizer
+    // round-trips (sampled tokens vs. re-encoded history may split
+    // differently but produce identical byte streams).
+    let hash = blake3_decoded(tokens, vocab, byte_decoder);
     let dir = root.join(hex::encode(hash));
     fs::create_dir_all(&dir)?;
 
-    // tokens.bin — i32-LE token ids.
-    fs::write(dir.join("tokens.bin"), &hash_bytes)?;
+    // tokens.bin is still i32-LE token IDs — we DO want to restore the
+    // actual sampled tokens into the KV cache (the K/V vectors were
+    // built from those exact IDs). The hash key just makes lookup
+    // byte-stable across re-encodings.
+    let tokens_bytes = token_ids_as_bytes(tokens);
+    fs::write(dir.join("tokens.bin"), &tokens_bytes)?;
 
     // Pull device data per layer.
     let mut layers = Vec::with_capacity(N_LAYER as usize);
@@ -470,7 +525,7 @@ pub fn save(
         layers,
         disk_bytes: 0,
     };
-    let mut total_bytes: u64 = hash_bytes.len() as u64 + kv_blob.len() as u64;
+    let mut total_bytes: u64 = tokens_bytes.len() as u64 + kv_blob.len() as u64;
     total_bytes += comp_kv_blob.len() as u64;
     total_bytes += comp_state_blob.len() as u64;
     let meta_initial = serde_json::to_vec_pretty(&meta).map_err(|e| eyre!("meta encode: {e}"))?;
