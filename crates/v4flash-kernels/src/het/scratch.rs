@@ -87,6 +87,9 @@ pub struct DgpuScratch {
     // ::launch_inv_only → F16Matvec::matvec_pre_scaled.
     pub rms_nw_inv_scalar: DeviceBuffer<f32>,
 
+    // Partials for f16_matvec_narrow_ksplit at HC_MIX_DIM=24, n_k_split≤64.
+    pub mhc_matvec_partials: DeviceBuffer<f32>,
+
     // Compressor scratch (lives on dGPU alongside attn_input_norm).
     pub kv_cur: DeviceBuffer<f32>,
     pub sc_cur: DeviceBuffer<f32>,
@@ -178,6 +181,8 @@ impl DgpuScratch {
             attn_inv_per_head: DeviceBuffer::new(device_id, N_HEAD as usize)?,
             rms_nw_partials: DeviceBuffer::new(device_id, 64)?,
             rms_nw_inv_scalar: DeviceBuffer::new(device_id, 1)?,
+            // 64 × HC_MIX_DIM=24 = 1536 f32 = 6 KB. n_k_split=32 uses half.
+            mhc_matvec_partials: DeviceBuffer::new(device_id, 64 * (HC_MIX_DIM as usize))?,
 
             kv_cur: DeviceBuffer::new(device_id, (2 * N_HEAD_DIM) as usize)?,
             sc_cur: DeviceBuffer::new(device_id, (2 * N_HEAD_DIM) as usize)?,

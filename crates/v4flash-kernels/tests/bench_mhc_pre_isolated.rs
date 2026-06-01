@@ -159,6 +159,40 @@ fn bench_mhc_pre_isolated() -> eyre::Result<()> {
             walls.push(Event::elapsed_ms(&s, &e)?);
         }
         stats(&mut walls, "2. f16.matvec (24×16384)           ");
+
+        // K-split variant. Sweep n_k_split = {8, 16, 32, 64}.
+        let n_k_splits: Vec<u32> = std::env::var("BENCH_KSPLITS")
+            .ok()
+            .map(|s| s.split(',').filter_map(|p| p.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![8, 16, 32, 64]);
+        let mut partials: DeviceBuffer<f32> = DeviceBuffer::new(
+            dgpu.id, 64 * (HC_MIX_DIM as usize))?;
+        let mut pre_scale_buf: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, 1)?;
+        let pre_scale_host = vec![1.0f32];
+        pre_scale_buf.copy_from_host(&pre_scale_host)?;
+        for &nks in &n_k_splits {
+            if HC_DIM % nks != 0 || HC_DIM / nks > 1024 { continue; }
+            // Warmup
+            for _ in 0..warmup {
+                f16.matvec_narrow_ksplit_pre_scaled(
+                    &stream, &mut mix, &hc_fn_w, &flat, &pre_scale_buf,
+                    &mut partials, HC_MIX_DIM, HC_DIM, nks,
+                )?;
+            }
+            stream.synchronize()?;
+            let mut walls: Vec<f32> = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let s = Event::new()?; let e = Event::new()?;
+                s.record(&stream)?;
+                f16.matvec_narrow_ksplit_pre_scaled(
+                    &stream, &mut mix, &hc_fn_w, &flat, &pre_scale_buf,
+                    &mut partials, HC_MIX_DIM, HC_DIM, nks,
+                )?;
+                e.record(&stream)?; stream.synchronize()?;
+                walls.push(Event::elapsed_ms(&s, &e)?);
+            }
+            stats(&mut walls, format!("2b. f16.matvec_ksplit n_k_split={nks:<3}    ").as_str());
+        }
     }
     if do_sink {
         let mut walls: Vec<f32> = Vec::with_capacity(iters);

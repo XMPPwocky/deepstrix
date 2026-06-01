@@ -148,6 +148,71 @@ impl F16Matvec {
     /// `out[r] = sum_i f32(weight[r, i]) * x[i]` for `r in 0..n_rows`.
     /// Weight is F16 row-major `[n_rows, k]`, passed as a `DeviceBuffer<u8>`
     /// holding raw F16 bytes (mirrors how Q8_0 weights are passed).
+    /// K-split f16 matvec for narrow M (e.g., HC_MIX_DIM=24, HC_DIM=16384).
+    /// Two kernels:
+    ///   pass 1 partial: grid (n_k_split, 1, 1). Each WG stages its
+    ///     K-slice of x in LDS once, computes ALL n_rows outputs against
+    ///     that x. Eliminates the 24× redundant x reads of the legacy
+    ///     narrow path (which had Grid(n_rows,1,1) and each WG re-read
+    ///     all of x).
+    ///   pass 2 reduce + pre_scale apply: sums partials per row,
+    ///     multiplies by pre_scale[0].
+    /// Requires k % n_k_split == 0, k_chunk = k/n_k_split ≤ 1024 (LDS).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_narrow_ksplit_pre_scaled(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        x: &DeviceBuffer<f32>,
+        pre_scale: &DeviceBuffer<f32>,
+        partials: &mut DeviceBuffer<f32>,    // [n_k_split, n_rows] f32
+        n_rows: u32,
+        k: u32,
+        n_k_split: u32,
+    ) -> eyre::Result<()> {
+        if k % n_k_split != 0 {
+            return Err(eyre!(
+                "matvec_narrow_ksplit_pre_scaled: k={k} not divisible by n_k_split={n_k_split}"
+            ));
+        }
+        let k_chunk = k / n_k_split;
+        if k_chunk > 1024 {
+            return Err(eyre!(
+                "matvec_narrow_ksplit_pre_scaled: k_chunk={k_chunk} exceeds LDS budget 1024"
+            ));
+        }
+        let needed = (n_k_split as usize) * (n_rows as usize);
+        if partials.len() < needed {
+            return Err(eyre!(
+                "matvec_narrow_ksplit_pre_scaled: partials len={} < {needed}",
+                partials.len()
+            ));
+        }
+        let f_part = self
+            .narrow
+            .get_function("f16_matvec_narrow_ksplit_partial")?;
+        let f_red = self
+            .narrow
+            .get_function("f16_matvec_narrow_ksplit_reduce_pre_scaled")?;
+        let cfg_p = LaunchConfig {
+            grid: (n_k_split, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let cfg_r = LaunchConfig {
+            grid: (1, 1, 1),
+            block: (32.max(n_rows.next_power_of_two()), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(f_part, cfg_p, stream, [
+            partials.raw(), weight.raw(), x.raw(), k, k_chunk, n_rows
+        ])?;
+        launch_kernel!(f_red, cfg_r, stream, [
+            out.raw(), partials.raw(), pre_scale.raw(), n_k_split, n_rows
+        ])
+    }
+
     /// Pre-scaled matvec: same as `matvec` but each output is multiplied
     /// by the scalar in `pre_scale[0]`. Pairs with a multi-WG RMS variant
     /// that just computes inv_rms (no apply pass) — eliminates one full

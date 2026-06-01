@@ -207,7 +207,20 @@ impl HeterogeneousEngine {
                     }
                     _ => {
                         de.rms_nw_mw.launch_inv_only(s, &mut dgpu_scratch.rms_nw_inv_scalar, &dgpu_scratch.residual, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
-                        de.f16.matvec_pre_scaled(s, &mut dgpu_scratch.mix, &dlw.hc_attn_fn.buffer, &dgpu_scratch.residual, &dgpu_scratch.rms_nw_inv_scalar, HC_MIX_DIM, HC_DIM)?;
+                        // F16_KSPLIT=N (default 0 = legacy narrow). N>0 uses
+                        // the K-split path with that n_k_split.
+                        let ksplit: u32 = std::env::var("F16_KSPLIT")
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                        if ksplit > 0 {
+                            de.f16.matvec_narrow_ksplit_pre_scaled(
+                                s, &mut dgpu_scratch.mix, &dlw.hc_attn_fn.buffer,
+                                &dgpu_scratch.residual, &dgpu_scratch.rms_nw_inv_scalar,
+                                &mut dgpu_scratch.mhc_matvec_partials,
+                                HC_MIX_DIM, HC_DIM, ksplit,
+                            )?;
+                        } else {
+                            de.f16.matvec_pre_scaled(s, &mut dgpu_scratch.mix, &dlw.hc_attn_fn.buffer, &dgpu_scratch.residual, &dgpu_scratch.rms_nw_inv_scalar, HC_MIX_DIM, HC_DIM)?;
+                        }
                     }
                 }
                 de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &dlw.hc_attn_scale, &dlw.hc_attn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
@@ -649,7 +662,18 @@ impl HeterogeneousEngine {
                 }
                 _ => {
                     de.rms_nw_mw.launch_inv_only(s, &mut dgpu_scratch.rms_nw_inv_scalar, &dgpu_scratch.after_attn_hc, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
-                    de.f16.matvec_pre_scaled(s, &mut dgpu_scratch.mix, &dlw.hc_ffn_fn.buffer, &dgpu_scratch.after_attn_hc, &dgpu_scratch.rms_nw_inv_scalar, HC_MIX_DIM, HC_DIM)?;
+                    let ksplit: u32 = std::env::var("F16_KSPLIT")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    if ksplit > 0 {
+                        de.f16.matvec_narrow_ksplit_pre_scaled(
+                            s, &mut dgpu_scratch.mix, &dlw.hc_ffn_fn.buffer,
+                            &dgpu_scratch.after_attn_hc, &dgpu_scratch.rms_nw_inv_scalar,
+                            &mut dgpu_scratch.mhc_matvec_partials,
+                            HC_MIX_DIM, HC_DIM, ksplit,
+                        )?;
+                    } else {
+                        de.f16.matvec_pre_scaled(s, &mut dgpu_scratch.mix, &dlw.hc_ffn_fn.buffer, &dgpu_scratch.after_attn_hc, &dgpu_scratch.rms_nw_inv_scalar, HC_MIX_DIM, HC_DIM)?;
+                    }
                 }
             }
             de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &dlw.hc_ffn_scale, &dlw.hc_ffn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
@@ -962,7 +986,18 @@ impl HeterogeneousEngine {
                     }
                     _ => {
                         de.rms_nw_mw.launch_inv_only(s, &mut dgpu_scratch.rms_nw_inv_scalar, &dgpu_scratch.residual_next, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
-                        de.f16.matvec_pre_scaled(s, &mut dgpu_scratch.mix, &next.hc_attn_fn.buffer, &dgpu_scratch.residual_next, &dgpu_scratch.rms_nw_inv_scalar, HC_MIX_DIM, HC_DIM)?;
+                        let ksplit: u32 = std::env::var("F16_KSPLIT")
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                        if ksplit > 0 {
+                            de.f16.matvec_narrow_ksplit_pre_scaled(
+                                s, &mut dgpu_scratch.mix, &next.hc_attn_fn.buffer,
+                                &dgpu_scratch.residual_next, &dgpu_scratch.rms_nw_inv_scalar,
+                                &mut dgpu_scratch.mhc_matvec_partials,
+                                HC_MIX_DIM, HC_DIM, ksplit,
+                            )?;
+                        } else {
+                            de.f16.matvec_pre_scaled(s, &mut dgpu_scratch.mix, &next.hc_attn_fn.buffer, &dgpu_scratch.residual_next, &dgpu_scratch.rms_nw_inv_scalar, HC_MIX_DIM, HC_DIM)?;
+                        }
                     }
                 }
                 de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &next.hc_attn_scale, &next.hc_attn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;

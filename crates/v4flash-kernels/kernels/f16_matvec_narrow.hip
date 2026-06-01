@@ -161,6 +161,98 @@ extern "C" __global__ void f16_matvec_narrow_two_inputs(
     }
 }
 
+// === K-split narrow matvec ==============================================
+// For narrow M (e.g., HC_MIX_DIM=24, HC_DIM=16384). Each WG processes
+// ALL n_rows outputs for a K-slice. Eliminates the 24× redundant x reads
+// of f16_matvec_narrow (which had Grid(n_rows,1,1) each WG re-reading
+// the full x). x is read ONCE total (each WG reads a unique K-chunk).
+// ATT on the legacy narrow showed 89% wave time waiting on global loads;
+// k-split converts those to one cooperative LDS stage per K-chunk.
+//
+//   pass 1 partial: grid (n_k_split, 1, 1). Each WG stages K_chunk
+//     elements of x in LDS, then computes ALL n_rows outputs against
+//     that x. Writes partials[(k_chunk_idx, row)].
+//   pass 2 reduce + pre_scale: sums n_k_split partials per row,
+//     multiplies by pre_scale[0] scalar.
+//
+// Constraints: k % n_k_split == 0, k_chunk ≤ 1024 (LDS 4 KB), n_rows ≤ 32.
+
+#define KMV_BLOCK 256u
+#define KMV_LANES 32u
+#define KMV_WAVES 8u
+
+__device__ __forceinline__ float kmv_warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) {
+        v += __shfl_down(v, o, KMV_LANES);
+    }
+    return v;
+}
+
+extern "C" __global__ void f16_matvec_narrow_ksplit_partial(
+        float          * __restrict__ partials,  // [n_k_split, n_rows]
+        const __half   * __restrict__ weight,    // [n_rows, k_total]
+        const float    * __restrict__ x,         // [k_total]
+        unsigned int     k_total,
+        unsigned int     k_chunk,
+        unsigned int     n_rows) {
+    __shared__ float s_x[1024];
+
+    const uint32_t tid          = threadIdx.x;
+    const uint32_t lane         = tid & (KMV_LANES - 1u);
+    const uint32_t wave         = tid >> 5u;
+    const uint32_t k_chunk_idx  = blockIdx.x;
+    const uint32_t k_start      = k_chunk_idx * k_chunk;
+
+    for (uint32_t i = tid; i < k_chunk; i += KMV_BLOCK) {
+        s_x[i] = x[k_start + i];
+    }
+    __syncthreads();
+
+    const uint32_t out_per_wave = (n_rows + KMV_WAVES - 1u) / KMV_WAVES;
+    for (uint32_t oi = 0; oi < out_per_wave; oi++) {
+        const uint32_t row = wave * out_per_wave + oi;
+        if (row >= n_rows) break;
+        const __half *wr = weight + (size_t)row * (size_t)k_total + (size_t)k_start;
+        float acc = 0.0f;
+        for (uint32_t k = lane; k < k_chunk; k += KMV_LANES) {
+            acc += __half2float(wr[k]) * s_x[k];
+        }
+        acc = kmv_warp_sum(acc);
+        if (lane == 0) {
+            partials[(size_t)k_chunk_idx * (size_t)n_rows + (size_t)row] = acc;
+        }
+    }
+}
+
+extern "C" __global__ void f16_matvec_narrow_ksplit_reduce_pre_scaled(
+        float          * __restrict__ out,
+        const float    * __restrict__ partials,
+        const float    * __restrict__ pre_scale,
+        unsigned int     n_k_split,
+        unsigned int     n_rows) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    float acc = 0.0f;
+    for (uint32_t kc = 0; kc < n_k_split; kc++) {
+        acc += partials[(size_t)kc * (size_t)n_rows + (size_t)row];
+    }
+    out[row] = acc * pre_scale[0];
+}
+
+extern "C" __global__ void f16_matvec_narrow_ksplit_reduce(
+        float          * __restrict__ out,
+        const float    * __restrict__ partials,
+        unsigned int     n_k_split,
+        unsigned int     n_rows) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    float acc = 0.0f;
+    for (uint32_t kc = 0; kc < n_k_split; kc++) {
+        acc += partials[(size_t)kc * (size_t)n_rows + (size_t)row];
+    }
+    out[row] = acc;
+}
+
 // M50 Phase 2: batched narrow f16 matvec. Grid (n_rows, 1, B), block (256).
 // Per-batch x[B, k], out[B, n_rows]. Weight shared.
 extern "C" __global__ void f16_matvec_narrow_batched(
