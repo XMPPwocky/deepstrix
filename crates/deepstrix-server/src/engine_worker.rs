@@ -23,7 +23,7 @@ use v4flash_kernels::RopeParams;
 
 use crate::embed::{build_gpt2_byte_decoder, embed_lookup, gpt2_decode_token};
 use crate::rope_for_layer;
-use crate::tokens::{is_think_marker, is_turn_end};
+use crate::tokens::{is_think_marker, is_turn_end, TOK_EOS};
 
 /// Per-request input.
 pub struct GenerateReq {
@@ -161,6 +161,20 @@ pub struct WorkerState {
     pub bi_b: BatchIgpuScratch,
 
     pub n_kv_max: u32,
+
+    /// The conversation currently resident in the KV cache.
+    ///
+    /// Invariant: `live.pos == live.tokens.len() as u32`. When set, the
+    /// engine's `HetModelState` reflects exactly these tokens having
+    /// been prefilled / forwarded in order, including any per-turn
+    /// trailing EOS we force into the cache at turn end.
+    pub live: Option<LiveSession>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveSession {
+    pub tokens: Vec<i32>,
+    pub pos: u32,
 }
 
 fn pick_dgpu() -> eyre::Result<Device> {
@@ -242,7 +256,13 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         bd_b,
         bi_b,
         n_kv_max: cfg.n_kv_max,
+        live: None,
     })
+}
+
+/// Longest common prefix length of two token-id sequences.
+fn common_prefix_len(a: &[i32], b: &[i32]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
 fn worker_loop(mut state: WorkerState, rx: &mut mpsc::UnboundedReceiver<EngineRequest>) {
@@ -276,31 +296,77 @@ fn handle_generate_stream(
         ));
     }
 
-    // Phase 1+2: re-allocate per request. Phase 3 introduces reset_in_place.
-    state.state = HetModelState::alloc(state.dgpu, state.igpu, state.n_kv_max)?;
+    let prompt_tokens = req.tokens.len() as u32;
 
-    let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(req.tokens.len());
-    for &tok in &req.tokens {
-        let mut v = vec![0f32; HC_DIM as usize];
-        embed_lookup(&state.token_embd_bytes, tok, &mut v);
-        input_hcs.push(v);
+    // KV-cache reuse decision. There are three cases:
+    //   1. No live session, or new request diverges from live mid-prefix:
+    //        reset in place, full prefill from pos=0.
+    //   2. New request strictly extends live (lcp == live.tokens.len()):
+    //        prefill only the suffix at pos0 = live.pos.
+    //   3. New request equals live exactly (lcp == req.len()):
+    //        no prefill — sample from existing logits in dgpu_scratch.
+    let (lcp, live_len) = match &state.live {
+        Some(live) => (
+            common_prefix_len(&live.tokens, &req.tokens),
+            live.tokens.len(),
+        ),
+        None => (0, 0),
+    };
+
+    if state.live.is_none() || lcp < live_len {
+        // Divergence (or first request) — reset and prefill from 0.
+        state.state.reset_in_place(state.dgpu, state.igpu)?;
+        let was_live = state.live.is_some();
+        if was_live {
+            let l = state.live.as_ref().unwrap();
+            // Log the few tokens around the divergence point to aid
+            // debugging tokenizer round-trip issues.
+            let start = lcp.saturating_sub(2);
+            let end_live = (lcp + 3).min(l.tokens.len());
+            let end_req = (lcp + 3).min(req.tokens.len());
+            tracing::warn!(
+                lcp,
+                live_len,
+                req_len = req.tokens.len(),
+                live_window = ?&l.tokens[start..end_live],
+                req_window = ?&req.tokens[start..end_req],
+                "live cache divergence; resetting"
+            );
+        }
+        state.live = None;
+        let suffix = &req.tokens[..];
+        tracing::info!(
+            req_len = req.tokens.len(),
+            lcp,
+            live_len,
+            mode = "full",
+            "prefill"
+        );
+        prefill_suffix(state, suffix, 0)?;
+    } else if lcp < req.tokens.len() {
+        // Pure extension — prefill only the new tail.
+        let suffix = &req.tokens[lcp..];
+        let pos0 = lcp as u32;
+        tracing::info!(
+            req_len = req.tokens.len(),
+            lcp,
+            live_len,
+            suffix_len = suffix.len(),
+            mode = "extend",
+            "prefill"
+        );
+        prefill_suffix(state, suffix, pos0)?;
+    } else {
+        // Exact match — no prefill needed; logits in dgpu_scratch are
+        // already correct for position lcp (== live.pos).
+        tracing::info!(req_len = req.tokens.len(), mode = "exact", "prefill");
     }
 
-    let prompt_tokens = req.tokens.len() as u32;
-    let _ = state.engine.forward_prefill_pipelined(
-        &mut state.bd_a,
-        &mut state.bi_a,
-        &mut state.bd_b,
-        &mut state.bi_b,
-        &mut state.dgpu_scratch,
-        &mut state.state,
-        &state.weights,
-        &input_hcs,
-        &req.tokens,
-        0u32,
-        true,
-        None,
-    )?;
+    // Live now reflects exactly the request's prompt tokens at pos == prompt_tokens.
+    state.live = Some(LiveSession {
+        tokens: req.tokens.clone(),
+        pos: prompt_tokens,
+    });
     let mut pos = prompt_tokens;
 
     let sample_mode = if req.temperature <= 0.0 {
@@ -330,6 +396,10 @@ fn handle_generate_stream(
                     let s = String::from_utf8_lossy(&raw).into_owned();
                     if tx.blocking_send(WorkerEvent::Chunk(s)).is_err() {
                         // Receiver dropped (client disconnected, e.g.).
+                        // The KV cache mid-decode is now inconsistent
+                        // with live.tokens; mark it as such by clearing
+                        // live so the next request reset-prefills.
+                        state.live = None;
                         return Ok(());
                     }
                 }
@@ -352,6 +422,11 @@ fn handle_generate_stream(
             next,
         )?;
         pos += 1;
+        // Successfully ingested `next` into KV at `pos-1`. Record it.
+        if let Some(ref mut live) = state.live {
+            live.tokens.push(next);
+            live.pos = pos;
+        }
         if pos >= state.n_kv_max {
             break FinishReason::Length;
         }
@@ -361,11 +436,62 @@ fn handle_generate_stream(
         completion_tokens += 1;
     };
 
+    // Force EOS into the KV cache at end-of-turn so the next request's
+    // history (which always renders EOS after a closed assistant turn,
+    // per `prompt.rs`) prefix-matches the live cache. Mirrors
+    // `chat.rs:582-600`'s end_of_turn handling.
+    if matches!(finish, FinishReason::Stop) && pos < state.n_kv_max {
+        embed_lookup(&state.token_embd_bytes, TOK_EOS, &mut residual);
+        state.engine.forward_token(
+            &mut state.dgpu_scratch,
+            &mut state.igpu_scratch,
+            &mut state.state,
+            &state.weights,
+            &residual,
+            pos,
+            TOK_EOS,
+        )?;
+        pos += 1;
+        if let Some(ref mut live) = state.live {
+            live.tokens.push(TOK_EOS);
+            live.pos = pos;
+        }
+    }
+
     let _ = tx.blocking_send(WorkerEvent::Done {
         prompt_tokens,
         completion_tokens,
         finish,
     });
+    Ok(())
+}
+
+/// Run the batched-prefill pipeline for `tokens` starting at `pos0`.
+/// Used both for full prefill (pos0=0) and for the extension fast-path.
+fn prefill_suffix(state: &mut WorkerState, tokens: &[i32], pos0: u32) -> eyre::Result<()> {
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
+    for &tok in tokens {
+        let mut v = vec![0f32; HC_DIM as usize];
+        embed_lookup(&state.token_embd_bytes, tok, &mut v);
+        input_hcs.push(v);
+    }
+    let _ = state.engine.forward_prefill_pipelined(
+        &mut state.bd_a,
+        &mut state.bi_a,
+        &mut state.bd_b,
+        &mut state.bi_b,
+        &mut state.dgpu_scratch,
+        &mut state.state,
+        &state.weights,
+        &input_hcs,
+        tokens,
+        pos0,
+        true,
+        None,
+    )?;
     Ok(())
 }
 

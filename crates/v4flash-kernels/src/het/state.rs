@@ -87,6 +87,37 @@ pub struct HetModelState {
 }
 
 impl HetModelState {
+    /// Reset the state in place so it's equivalent to a freshly-`alloc`ed
+    /// state of the same dimensions — without re-creating the underlying
+    /// device buffers. Used by the server's KV-cache management to wipe
+    /// a live conversation before reloading from disk or starting fresh.
+    ///
+    /// Re-initialises compressor scratch to match `HetCompressorState::alloc`
+    /// (state_kv→0, state_score→NEG_INF). The raw `kv_cache` and the
+    /// cumulative `comp_kv` buffers don't need clearing — the per-layer
+    /// kernels never read past `n_raw` / `n_comp` slots, so zeroing the
+    /// counters is sufficient.
+    pub fn reset_in_place(&mut self, dgpu_device: Device, igpu_device: Device) -> eyre::Result<()> {
+        for layer in &mut self.layers {
+            layer.n_raw = 0;
+            if let Some(comp) = &mut layer.compressor {
+                comp.n_comp = 0;
+                let n_state = comp.state_kv.len();
+                let zeros = vec![0f32; n_state];
+                let neg_inf = vec![NEG_INF; n_state];
+                igpu_device.set_current()?;
+                comp.state_kv.copy_from_host(&zeros)?;
+                comp.state_score.copy_from_host(&neg_inf)?;
+            }
+        }
+        // The kv_cache buffers and comp_kv buffer don't need wiping —
+        // their valid extent is gated by n_raw/n_comp respectively, both
+        // now 0. Set the current device back to dGPU to leave the engine
+        // in the expected state for the next forward pass.
+        dgpu_device.set_current()?;
+        Ok(())
+    }
+
     pub fn alloc(dgpu_device: Device, _igpu_device: Device, n_kv_max: u32) -> eyre::Result<Self> {
         let mut layers = Vec::with_capacity(N_LAYER as usize);
         for layer in 0..N_LAYER {
