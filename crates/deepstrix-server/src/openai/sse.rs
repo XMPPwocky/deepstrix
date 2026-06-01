@@ -15,6 +15,13 @@ pub struct ChunkDelta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// DeepSeek convention: thinking-mode tokens are streamed as
+    /// `reasoning_content` so clients (incl. letta-code via pi-ai)
+    /// can render them on a separate channel from the user-facing
+    /// `content` after `</think>`. Mirrors what the DeepSeek API
+    /// emits for V3/R1/V4 models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallDelta>,
 }
@@ -119,6 +126,15 @@ pub fn tool_call_args_delta(tc: &ToolCall, index: u32) -> ChunkDelta {
 pub fn text_delta(s: String) -> ChunkDelta {
     ChunkDelta {
         content: Some(s),
+        ..Default::default()
+    }
+}
+
+/// Build a "reasoning content" delta (DeepSeek-style — thinking tokens
+/// streamed via the `reasoning_content` field).
+pub fn reasoning_delta(s: String) -> ChunkDelta {
+    ChunkDelta {
+        reasoning_content: Some(s),
         ..Default::default()
     }
 }

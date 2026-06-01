@@ -25,7 +25,7 @@ use v4flash_kernels::RopeParams;
 use crate::embed::{build_gpt2_byte_decoder, embed_lookup, gpt2_decode_token};
 use crate::rope_for_layer;
 use crate::snapshot::{self, ModelFingerprint, SnapshotIndex};
-use crate::tokens::{is_think_marker, is_turn_end, TOK_EOS};
+use crate::tokens::{is_turn_end, TOK_EOS, TOK_THINK_BEGIN, TOK_THINK_END};
 
 /// Per-request input.
 pub struct GenerateReq {
@@ -55,10 +55,10 @@ impl FinishReason {
 /// Events emitted by the worker during a generation.
 #[derive(Debug)]
 pub enum WorkerEvent {
-    /// One token's decoded bytes (or empty if the token was a structural
-    /// marker we suppressed). The caller (handler) feeds these into a
-    /// DSML scanner to recover tool-call structure.
-    Chunk(String),
+    /// One token's decoded bytes, with a flag for whether we're inside
+    /// a `<think>…</think>` block. The caller routes reasoning vs.
+    /// content to different SSE fields based on this flag.
+    Chunk { text: String, reasoning: bool },
     /// Generation finished.
     Done {
         prompt_tokens: u32,
@@ -778,6 +778,16 @@ fn finish_decode(
 
     let mut residual = vec![0f32; HC_DIM as usize];
     let max_new = req.max_new as u32;
+    // Track whether we're inside a `<think>…</think>` block so the
+    // handler can route reasoning vs. content to different SSE fields.
+    // We start in "thinking" iff the request's last token (the assistant
+    // open marker) was `<think>` — letta's default render uses `</think>`
+    // for no-think, so the typical start is `in_think = false`.
+    let mut in_think = req
+        .tokens
+        .last()
+        .map(|&t| t == TOK_THINK_BEGIN)
+        .unwrap_or(false);
     let finish: FinishReason = loop {
         if cancel.load(Ordering::Relaxed) {
             tracing::info!("generation cancelled by client");
@@ -786,19 +796,29 @@ fn finish_decode(
         if is_turn_end(next) {
             break FinishReason::Stop;
         }
-        if !is_think_marker(next) {
-            if let Some(bytes) = state.vocab.token_text(next) {
-                let raw = gpt2_decode_token(bytes, &state.byte_decoder);
-                if !raw.is_empty() {
-                    let s = String::from_utf8_lossy(&raw).into_owned();
-                    if tx.blocking_send(WorkerEvent::Chunk(s)).is_err() {
-                        // Receiver dropped (client disconnected, e.g.).
-                        // The KV cache mid-decode is now inconsistent
-                        // with live.tokens; mark it as such by clearing
-                        // live so the next request reset-prefills.
-                        state.live = None;
-                        return Ok(());
-                    }
+        if next == TOK_THINK_BEGIN {
+            in_think = true;
+            // Token itself is suppressed.
+        } else if next == TOK_THINK_END {
+            in_think = false;
+            // Token itself is suppressed.
+        } else if let Some(bytes) = state.vocab.token_text(next) {
+            let raw = gpt2_decode_token(bytes, &state.byte_decoder);
+            if !raw.is_empty() {
+                let s = String::from_utf8_lossy(&raw).into_owned();
+                if tx
+                    .blocking_send(WorkerEvent::Chunk {
+                        text: s,
+                        reasoning: in_think,
+                    })
+                    .is_err()
+                {
+                    // Receiver dropped (client disconnected, e.g.).
+                    // The KV cache mid-decode is now inconsistent
+                    // with live.tokens; mark it as such by clearing
+                    // live so the next request reset-prefills.
+                    state.live = None;
+                    return Ok(());
                 }
             }
         }
@@ -905,7 +925,12 @@ pub struct GenerateResult {
     pub finish_reason: FinishReason,
 }
 
-/// Drain a `submit` stream into a single accumulated result.
+/// Drain a `submit` stream into a single accumulated result. The
+/// `text` field collects only NON-reasoning content (post-`</think>`),
+/// which is what OpenAI clients expect for `choices[].message.content`.
+/// Reasoning tokens are dropped (clients see them via `reasoning_content`
+/// in the streaming path; the non-streaming path doesn't have a
+/// `reasoning_content` field today).
 pub async fn accumulate(
     mut rx: mpsc::Receiver<WorkerEvent>,
 ) -> eyre::Result<GenerateResult> {
@@ -913,7 +938,11 @@ pub async fn accumulate(
     let mut last: Option<(u32, u32, FinishReason)> = None;
     while let Some(ev) = rx.recv().await {
         match ev {
-            WorkerEvent::Chunk(s) => text.push_str(&s),
+            WorkerEvent::Chunk { text: s, reasoning } => {
+                if !reasoning {
+                    text.push_str(&s);
+                }
+            }
             WorkerEvent::Done {
                 prompt_tokens,
                 completion_tokens,

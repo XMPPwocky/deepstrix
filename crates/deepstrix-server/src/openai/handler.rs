@@ -34,8 +34,8 @@ use crate::dsml::{DsmlEvent, DsmlScanner};
 use crate::engine_worker::{accumulate, EngineHandle, FinishReason, GenerateReq, WorkerEvent};
 use crate::openai::error::ApiError;
 use crate::openai::sse::{
-    encode_chunk, role_delta, text_delta, tool_call_args_delta, tool_call_start_delta,
-    ChunkDelta,
+    encode_chunk, reasoning_delta, role_delta, text_delta, tool_call_args_delta,
+    tool_call_start_delta, ChunkDelta,
 };
 use crate::openai::types::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, Role, ToolCall,
@@ -53,10 +53,12 @@ pub async fn chat_completions(
 ) -> Result<Response, ApiError> {
     let stream = req.stream.unwrap_or(false);
 
+    let think_mode = is_reasoning_enabled(&req.reasoning, &req.reasoning_effort);
     let tokens = render_prompt(
         &engine.vocab,
         &req.messages,
         req.tools.as_deref(),
+        think_mode,
     )
     .map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
     let prompt_tokens_count = tokens.len() as u32;
@@ -249,7 +251,19 @@ async fn drive_sse_stream(
 
     while let Some(ev) = rx.recv().await {
         match ev {
-            WorkerEvent::Chunk(s) => {
+            WorkerEvent::Chunk { text: s, reasoning } => {
+                if reasoning {
+                    // Reasoning tokens don't go through the DSML
+                    // scanner — they live outside the tool-call grammar
+                    // (the model only emits DSML AFTER </think>). Emit
+                    // them directly on the reasoning_content channel.
+                    if !s.is_empty()
+                        && out.send(send(reasoning_delta(s), None)).await.is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
                 let events = scanner.push_text(&s);
                 for de in events {
                     match de {
@@ -357,6 +371,17 @@ async fn drive_sse_stream(
     let _ = out
         .send(Ok(Event::default().data("[DONE]".to_string())))
         .await;
+}
+
+/// True if either `reasoning` or `reasoning_effort` is set to anything
+/// other than "none" / "off" / empty. Letta sends `reasoning` as a
+/// string level ("low"/"medium"/"high"); OpenAI uses `reasoning_effort`.
+fn is_reasoning_enabled(reasoning: &Option<String>, effort: &Option<String>) -> bool {
+    let on = |s: &str| {
+        let l = s.to_ascii_lowercase();
+        !matches!(l.as_str(), "" | "none" | "off" | "disabled" | "false")
+    };
+    reasoning.as_deref().map(on).unwrap_or(false) || effort.as_deref().map(on).unwrap_or(false)
 }
 
 fn unix_now() -> u64 {

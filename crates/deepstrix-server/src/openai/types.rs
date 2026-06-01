@@ -6,7 +6,7 @@
 //! so we can deserialize requests that include them without erroring —
 //! Phase 2 wires the rendering / emission.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -17,13 +17,15 @@ pub enum Role {
     Tool,
 }
 
-/// A single message in the conversation. `content` is text-only in v1
-/// (we don't yet decode the array-of-parts variant that OpenAI also
-/// permits). Tool-related fields are tolerated but not yet rendered.
+/// A single message in the conversation. OpenAI permits `content` to be
+/// either a plain string OR an array of typed parts (text / image_url /
+/// input_audio …). We accept both; non-text parts are dropped at deserialize
+/// time and a single concatenated string is exposed to the rest of the
+/// pipeline.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: Role,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_content_flexible")]
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
@@ -31,6 +33,61 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+/// Custom deserializer that collapses OpenAI's flexible `content` field
+/// into a plain `Option<String>`. Accepts:
+///   * null → None
+///   * "..." → Some("...")
+///   * [{"type":"text","text":"..."}, ...] → joined text parts; non-text
+///     parts (images, audio, etc.) are dropped with a debug log
+fn deserialize_content_flexible<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = serde_json::Value::deserialize(d)?;
+    match v {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => Ok(Some(s)),
+        serde_json::Value::Array(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match &p {
+                    serde_json::Value::String(s) => out.push_str(s),
+                    serde_json::Value::Object(obj) => {
+                        let kind = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        match kind {
+                            "text" | "input_text" => {
+                                if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
+                                    out.push_str(t);
+                                }
+                            }
+                            other => {
+                                tracing::debug!(
+                                    part_type = other,
+                                    "dropping non-text content part"
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(D::Error::custom(format!(
+                            "content array element is not a string or object: {p}"
+                        )))
+                    }
+                }
+            }
+            if out.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(out))
+            }
+        }
+        other => Err(D::Error::custom(format!(
+            "content must be null, a string, or an array; got {other}"
+        ))),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -92,6 +149,15 @@ pub struct ChatCompletionRequest {
     /// `include_usage` (emit a final usage chunk in SSE responses).
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    /// OpenAI o1/o3-style reasoning toggle: "low" | "medium" | "high".
+    /// Any non-"none" value enables think mode (the assistant turn
+    /// opens with `<think>` instead of `</think>`). Letta sends this
+    /// as `reasoning` in pi-ai's stream adapter; OpenAI clients send
+    /// it as `reasoning_effort`. We accept either.
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
