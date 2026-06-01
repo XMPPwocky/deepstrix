@@ -260,7 +260,11 @@ fn main() -> eyre::Result<()> {
         if user_msg.trim().is_empty() {
             continue;
         }
-        match user_msg.trim() {
+        // Slash-command dispatch. /load is a multi-line escape: substitutes
+        // the file's full contents (newlines preserved) as the user turn.
+        let trimmed = user_msg.trim();
+        let mut owned_msg = String::new();
+        let effective_msg: &str = match trimmed {
             "/quit" => break,
             "/think" => {
                 think_mode = true;
@@ -272,8 +276,23 @@ fn main() -> eyre::Result<()> {
                 eprintln!("[think mode OFF]");
                 continue;
             }
-            _ => {}
-        }
+            cmd if cmd.starts_with("/load ") => {
+                let path = cmd[6..].trim();
+                match std::fs::read_to_string(path) {
+                    Ok(s) => {
+                        eprintln!("[loaded {} bytes from {path}]", s.len());
+                        owned_msg = s;
+                        owned_msg.as_str()
+                    }
+                    Err(e) => {
+                        eprintln!("[/load {path}: {e}]");
+                        continue;
+                    }
+                }
+            }
+            _ => user_msg,
+        };
+        let user_msg = effective_msg;
 
         // Build this turn's prefix.
         //   first turn:  [BOS, USER, ...encode(user), ASSISTANT, THINK_END]
