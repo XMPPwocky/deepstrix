@@ -88,6 +88,16 @@ pub struct ChatCompletionRequest {
     /// per-request value derived from request arrival time.
     #[serde(default)]
     pub seed: Option<u64>,
+    /// OpenAI stream options. Currently we honor only
+    /// `include_usage` (emit a final usage chunk in SSE responses).
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -9,6 +9,8 @@
 //!     `delta.tool_calls` events for each DSML invoke block.
 
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
@@ -16,6 +18,17 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_util::stream::poll_fn;
+
+/// Drop guard: flips the engine's cancel bool when the HTTP response
+/// future is dropped (i.e. when the client disconnects mid-decode).
+/// The worker's decode loop polls the bool and breaks out of the
+/// generation as soon as it sees true.
+struct CancelOnDrop(Arc<AtomicBool>);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
 
 use crate::dsml::{DsmlEvent, DsmlScanner};
 use crate::engine_worker::{accumulate, EngineHandle, FinishReason, GenerateReq, WorkerEvent};
@@ -66,24 +79,40 @@ pub async fn chat_completions(
     let id = format!("chatcmpl-{}", uuid::Uuid::now_v7().simple());
     let model = engine.model_name.as_str().to_string();
 
-    let rx = engine
+    let include_usage = req
+        .stream_options
+        .as_ref()
+        .and_then(|s| s.include_usage)
+        .unwrap_or(false);
+
+    let (rx, cancel) = engine
         .submit(gen_req, req.session_id.clone())
         .map_err(ApiError::from)?;
 
     if stream {
-        // Spawn a task that drives the worker stream and pushes SSE
-        // events into a channel. The HTTP response wraps the channel
-        // as a Stream via futures_util::poll_fn.
+        // The cancel guard moves into the SSE driver. When the
+        // SSE response (and its task) is dropped — e.g. client
+        // disconnect — the guard fires and flips the cancel bool.
+        let guard = CancelOnDrop(cancel);
         let (tx, mut sse_rx) =
             tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
-        tokio::spawn(drive_sse_stream(id.clone(), model.clone(), rx, tx));
+        tokio::spawn(drive_sse_stream(
+            id.clone(),
+            model.clone(),
+            rx,
+            tx,
+            guard,
+            include_usage,
+            prompt_tokens_count,
+        ));
         let stream = poll_fn::<Result<Event, Infallible>, _>(move |cx| sse_rx.poll_recv(cx));
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
             .into_response())
     } else {
+        let guard = CancelOnDrop(cancel);
         let result = accumulate(rx).await.map_err(ApiError::from)?;
-        let _ = prompt_tokens_count; // re-counted below from result
+        drop(guard); // explicit no-op: generation done, no need to cancel
         let blocking = build_blocking_response(
             id,
             model,
@@ -94,6 +123,26 @@ pub async fn chat_completions(
         );
         Ok(Json(blocking).into_response())
     }
+}
+
+/// GET /v1/models — minimal listing for letta's provider auth flow.
+pub async fn list_models(State(engine): State<EngineHandle>) -> Json<serde_json::Value> {
+    let id = engine.model_name.as_str().to_string();
+    Json(serde_json::json!({
+        "object": "list",
+        "data": [{
+            "id": id,
+            "object": "model",
+            "created": 0,
+            "owned_by": "deepstrix"
+        }]
+    }))
+}
+
+/// GET /healthz — 200 once the worker is ready (true by construction:
+/// the server only starts accepting connections after weights load).
+pub async fn healthz() -> &'static str {
+    "ok\n"
 }
 
 fn build_blocking_response(
@@ -171,6 +220,9 @@ async fn drive_sse_stream(
     model: String,
     mut rx: tokio::sync::mpsc::Receiver<WorkerEvent>,
     out: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    _cancel_guard: CancelOnDrop,
+    include_usage: bool,
+    prompt_tokens: u32,
 ) {
     let created = unix_now();
     let send = |delta: ChunkDelta,
@@ -193,6 +245,7 @@ async fn drive_sse_stream(
     let mut sent_tool_index: u32 = 0;
     let mut saw_tool = false;
     let mut finish_reason: &'static str = "stop";
+    let mut completion_tokens: u32 = 0;
 
     while let Some(ev) = rx.recv().await {
         match ev {
@@ -247,7 +300,12 @@ async fn drive_sse_stream(
                     }
                 }
             }
-            WorkerEvent::Done { finish, .. } => {
+            WorkerEvent::Done {
+                finish,
+                completion_tokens: ct,
+                ..
+            } => {
+                completion_tokens = ct;
                 let tail = scanner.finish();
                 for de in tail {
                     if let DsmlEvent::Text(t) = de {
@@ -275,6 +333,26 @@ async fn drive_sse_stream(
     let _ = out
         .send(send(ChunkDelta::default(), Some(finish_reason)))
         .await;
+    // Optional usage chunk (OpenAI sends this after the finish chunk
+    // when stream_options.include_usage=true).
+    if include_usage {
+        let total = prompt_tokens + completion_tokens;
+        let payload = serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": unix_now(),
+            "model": model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total,
+            }
+        });
+        let _ = out
+            .send(Ok(Event::default().data(payload.to_string())))
+            .await;
+    }
     // [DONE] sentinel.
     let _ = out
         .send(Ok(Event::default().data("[DONE]".to_string())))

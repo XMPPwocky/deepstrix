@@ -6,6 +6,7 @@
 //! event stream — the non-streaming handler just accumulates events
 //! into a single response before returning.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use color_eyre::eyre::{self, eyre};
@@ -77,6 +78,10 @@ pub enum EngineRequest {
         /// Optional sessionId hint from the client. Used as a fast-path
         /// for the on-disk snapshot lookup.
         session_id: Option<String>,
+        /// Flipped by the HTTP handler when the client disconnects.
+        /// The worker polls it between forward_token calls and breaks
+        /// out as soon as it sees true.
+        cancel: Arc<AtomicBool>,
     },
     /// Save any dirty live state to disk and shut down cleanly.
     Shutdown {
@@ -92,21 +97,25 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    /// Submit a generation request. Returns a stream of `WorkerEvent`s.
+    /// Submit a generation request. Returns the worker-event stream
+    /// and a cancellation handle the caller can flip to ask the worker
+    /// to stop mid-decode.
     pub fn submit(
         &self,
         req: GenerateReq,
         session_id: Option<String>,
-    ) -> eyre::Result<mpsc::Receiver<WorkerEvent>> {
+    ) -> eyre::Result<(mpsc::Receiver<WorkerEvent>, Arc<AtomicBool>)> {
         let (tx, rx) = mpsc::channel(64);
+        let cancel = Arc::new(AtomicBool::new(false));
         self.tx
             .send(EngineRequest::Generate {
                 req,
                 tx,
                 session_id,
+                cancel: cancel.clone(),
             })
             .map_err(|_| eyre!("engine worker channel closed"))?;
-        Ok(rx)
+        Ok((rx, cancel))
     }
 
     /// Block until the worker has saved its dirty live state and exited.
@@ -491,8 +500,9 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::UnboundedReceiver<EngineRe
                 req,
                 tx,
                 session_id,
+                cancel,
             } => {
-                if let Err(e) = handle_generate_stream(&mut state, req, session_id, &tx) {
+                if let Err(e) = handle_generate_stream(&mut state, req, session_id, cancel, &tx) {
                     let _ = tx.blocking_send(WorkerEvent::Error(format!("{e:#}")));
                 }
                 // tx is dropped here, signaling end of stream.
@@ -553,6 +563,7 @@ fn handle_generate_stream(
     state: &mut WorkerState,
     req: GenerateReq,
     session_id: Option<String>,
+    cancel: Arc<AtomicBool>,
     tx: &mpsc::Sender<WorkerEvent>,
 ) -> eyre::Result<()> {
     if req.tokens.is_empty() {
@@ -678,6 +689,7 @@ fn handle_generate_stream(
                         tx,
                         prompt_tokens,
                         session_id,
+                        cancel,
                     );
                 }
             }
@@ -737,7 +749,7 @@ fn handle_generate_stream(
         session_id: session_id.clone(),
     });
 
-    finish_decode(state, req, tx, prompt_tokens, session_id)
+    finish_decode(state, req, tx, prompt_tokens, session_id, cancel)
 }
 
 fn finish_decode(
@@ -746,6 +758,7 @@ fn finish_decode(
     tx: &mpsc::Sender<WorkerEvent>,
     prompt_tokens: u32,
     _session_id: Option<String>,
+    cancel: Arc<AtomicBool>,
 ) -> eyre::Result<()> {
     let mut pos = prompt_tokens;
 
@@ -766,6 +779,10 @@ fn finish_decode(
     let mut residual = vec![0f32; HC_DIM as usize];
     let max_new = req.max_new as u32;
     let finish: FinishReason = loop {
+        if cancel.load(Ordering::Relaxed) {
+            tracing::info!("generation cancelled by client");
+            break FinishReason::Stop;
+        }
         if is_turn_end(next) {
             break FinishReason::Stop;
         }

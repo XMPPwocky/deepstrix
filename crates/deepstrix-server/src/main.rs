@@ -12,14 +12,14 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 use clap::Parser;
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::install_panic_handler;
 
 use deepstrix_server::engine_worker::{spawn, WorkerConfig};
-use deepstrix_server::openai::handler::chat_completions;
+use deepstrix_server::openai::handler::{chat_completions, healthz, list_models};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "OpenAI-compatible HTTP server for deepstrix V4-Flash")]
@@ -90,6 +90,8 @@ async fn main() -> eyre::Result<()> {
 
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/models", get(list_models))
+        .route("/healthz", get(healthz))
         .with_state(engine.clone());
 
     let listener = tokio::net::TcpListener::bind(args.addr).await?;
