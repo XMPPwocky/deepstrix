@@ -66,7 +66,9 @@ pub async fn chat_completions(
     let id = format!("chatcmpl-{}", uuid::Uuid::now_v7().simple());
     let model = engine.model_name.as_str().to_string();
 
-    let rx = engine.submit(gen_req).map_err(ApiError::from)?;
+    let rx = engine
+        .submit(gen_req, req.session_id.clone())
+        .map_err(ApiError::from)?;
 
     if stream {
         // Spawn a task that drives the worker stream and pushes SSE

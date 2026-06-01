@@ -23,6 +23,7 @@ use v4flash_kernels::RopeParams;
 
 use crate::embed::{build_gpt2_byte_decoder, embed_lookup, gpt2_decode_token};
 use crate::rope_for_layer;
+use crate::snapshot::{self, ModelFingerprint, SnapshotIndex};
 use crate::tokens::{is_think_marker, is_turn_end, TOK_EOS};
 
 /// Per-request input.
@@ -73,6 +74,13 @@ pub enum EngineRequest {
     Generate {
         req: GenerateReq,
         tx: mpsc::Sender<WorkerEvent>,
+        /// Optional sessionId hint from the client. Used as a fast-path
+        /// for the on-disk snapshot lookup.
+        session_id: Option<String>,
+    },
+    /// Save any dirty live state to disk and shut down cleanly.
+    Shutdown {
+        ack: oneshot::Sender<()>,
     },
 }
 
@@ -88,12 +96,30 @@ impl EngineHandle {
     pub fn submit(
         &self,
         req: GenerateReq,
+        session_id: Option<String>,
     ) -> eyre::Result<mpsc::Receiver<WorkerEvent>> {
         let (tx, rx) = mpsc::channel(64);
         self.tx
-            .send(EngineRequest::Generate { req, tx })
+            .send(EngineRequest::Generate {
+                req,
+                tx,
+                session_id,
+            })
             .map_err(|_| eyre!("engine worker channel closed"))?;
         Ok(rx)
+    }
+
+    /// Block until the worker has saved its dirty live state and exited.
+    /// Used during graceful shutdown.
+    pub async fn shutdown(&self) -> eyre::Result<()> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.tx
+            .send(EngineRequest::Shutdown { ack: ack_tx })
+            .map_err(|_| eyre!("engine worker channel closed"))?;
+        ack_rx
+            .await
+            .map_err(|_| eyre!("engine worker dropped shutdown ack"))?;
+        Ok(())
     }
 }
 
@@ -102,6 +128,10 @@ pub struct WorkerConfig {
     pub gguf_path: String,
     pub n_kv_max: u32,
     pub model_name: String,
+    /// Directory where on-disk KV snapshots live. Created if missing.
+    pub snapshot_root: std::path::PathBuf,
+    /// Soft cap for the snapshot cache. LRU eviction kicks in above this.
+    pub snapshot_cap_bytes: u64,
 }
 
 pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
@@ -169,12 +199,23 @@ pub struct WorkerState {
     /// been prefilled / forwarded in order, including any per-turn
     /// trailing EOS we force into the cache at turn end.
     pub live: Option<LiveSession>,
+
+    /// On-disk snapshot index. Loaded at startup, mutated as sessions
+    /// switch.
+    pub snapshot_index: SnapshotIndex,
+    pub model_fingerprint: ModelFingerprint,
 }
 
 #[derive(Debug, Clone)]
 pub struct LiveSession {
     pub tokens: Vec<i32>,
     pub pos: u32,
+    /// Set when `live.tokens` advanced past the last save point on disk.
+    /// Triggers a save when the session is about to be evicted.
+    pub dirty: bool,
+    /// sessionId hint provided by the client (if any). Carried through
+    /// so that when we save we can update the index's sessionId hint.
+    pub session_id: Option<String>,
 }
 
 fn pick_dgpu() -> eyre::Result<Device> {
@@ -240,6 +281,18 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
 
     let byte_decoder = build_gpt2_byte_decoder();
 
+    // Compute model fingerprint and load (or create) the snapshot index.
+    let fingerprint = ModelFingerprint::compute(vocab.vocab_size() as u32, &token_embd_bytes);
+    if !cfg.snapshot_root.exists() {
+        std::fs::create_dir_all(&cfg.snapshot_root)
+            .map_err(|e| eyre!("create snapshot root {:?}: {e}", cfg.snapshot_root))?;
+    }
+    let snapshot_index = SnapshotIndex::load(
+        cfg.snapshot_root.clone(),
+        fingerprint.clone(),
+        cfg.snapshot_cap_bytes,
+    )?;
+
     Ok(WorkerState {
         dgpu,
         igpu,
@@ -257,6 +310,8 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         bi_b,
         n_kv_max: cfg.n_kv_max,
         live: None,
+        snapshot_index,
+        model_fingerprint: fingerprint,
     })
 }
 
@@ -432,11 +487,21 @@ mod tests {
 fn worker_loop(mut state: WorkerState, rx: &mut mpsc::UnboundedReceiver<EngineRequest>) {
     while let Some(msg) = rx.blocking_recv() {
         match msg {
-            EngineRequest::Generate { req, tx } => {
-                if let Err(e) = handle_generate_stream(&mut state, req, &tx) {
+            EngineRequest::Generate {
+                req,
+                tx,
+                session_id,
+            } => {
+                if let Err(e) = handle_generate_stream(&mut state, req, session_id, &tx) {
                     let _ = tx.blocking_send(WorkerEvent::Error(format!("{e:#}")));
                 }
                 // tx is dropped here, signaling end of stream.
+            }
+            EngineRequest::Shutdown { ack } => {
+                tracing::info!("worker received shutdown");
+                save_live_if_dirty(&mut state);
+                let _ = ack.send(());
+                break;
             }
         }
     }
@@ -444,9 +509,50 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::UnboundedReceiver<EngineRe
     let _ = state.engine.shutdown();
 }
 
+/// If the live session has uncommitted state, persist it to disk and
+/// clear its dirty flag. Called before any operation that would evict
+/// the live state (conversation switch, shutdown).
+fn save_live_if_dirty(state: &mut WorkerState) {
+    let Some(live) = &state.live else { return };
+    if !live.dirty {
+        return;
+    }
+    let tokens = live.tokens.clone();
+    let session_id = live.session_id.clone();
+    match snapshot::save(
+        &state.state,
+        &tokens,
+        state.dgpu,
+        state.igpu,
+        &state.model_fingerprint,
+        state.snapshot_index.root(),
+    ) {
+        Ok(entry) => {
+            let hash = entry.hash;
+            let n = entry.token_count;
+            state.snapshot_index.insert(entry);
+            if let Some(sid) = session_id {
+                state.snapshot_index.session_to_hash.insert(sid, hash);
+            }
+            if let Some(l) = &mut state.live {
+                l.dirty = false;
+            }
+            tracing::info!(
+                tokens = n,
+                total_disk = state.snapshot_index.total_bytes(),
+                "saved live to disk"
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "snapshot.save failed; live not persisted");
+        }
+    }
+}
+
 fn handle_generate_stream(
     state: &mut WorkerState,
     req: GenerateReq,
+    session_id: Option<String>,
     tx: &mpsc::Sender<WorkerEvent>,
 ) -> eyre::Result<()> {
     if req.tokens.is_empty() {
@@ -497,14 +603,91 @@ fn handle_generate_stream(
         None => (0, 0),
     };
 
+    // If live doesn't extend the request, see if an on-disk snapshot
+    // covers more of the new request's prefix. The disk lookup probes
+    // turn-boundary positions (just after each EOS).
     if state.live.is_none() || lcp < live_len {
-        // Divergence (or first request) — reset and prefill from 0.
+        // Try the sessionId hot-cache first.
+        let disk_hit_session = session_id
+            .as_deref()
+            .and_then(|sid| state.snapshot_index.lookup_session(sid, &req.tokens));
+        // Otherwise walk EOS boundaries for the longest matching prefix.
+        let disk_hit_walk = state.snapshot_index.find_longest_prefix(&req.tokens, TOK_EOS);
+        // Take whichever offers more tokens.
+        let disk_hit = match (disk_hit_session, disk_hit_walk) {
+            (Some(a), Some(b)) => Some(if a.0 >= b.0 { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+
+        // If the disk match is BETTER than the in-VRAM partial match,
+        // evict live to disk first, then restore from the snapshot.
+        if let Some((snap_tokens, snap_hash, snap_dir)) = disk_hit {
+            if snap_tokens > lcp {
+                save_live_if_dirty(state);
+                state.state.reset_in_place(state.dgpu, state.igpu)?;
+                let loaded = snapshot::restore(
+                    &mut state.state,
+                    &snap_dir,
+                    state.dgpu,
+                    state.igpu,
+                    &state.model_fingerprint,
+                )?;
+                // Verify the snapshot's tokens are a prefix of req.
+                if loaded.len() > req.tokens.len()
+                    || loaded != req.tokens[..loaded.len()]
+                {
+                    tracing::warn!(
+                        loaded_len = loaded.len(),
+                        "snapshot tokens are not a prefix of the request; falling back to full prefill"
+                    );
+                    // Reset again and fall through to full prefill below.
+                    state.state.reset_in_place(state.dgpu, state.igpu)?;
+                    state.live = None;
+                } else {
+                    let loaded_len = loaded.len() as u32;
+                    state.live = Some(LiveSession {
+                        tokens: loaded,
+                        pos: loaded_len,
+                        dirty: false,
+                        session_id: session_id.clone(),
+                    });
+                    // Touch the snapshot's LRU timestamp.
+                    let _ = state.snapshot_index.touch(&snap_hash);
+                    tracing::info!(
+                        req_len = req.tokens.len(),
+                        restored = loaded_len,
+                        suffix_len = req.tokens.len() - loaded_len as usize,
+                        mode = "restore",
+                        "prefill"
+                    );
+                    // Prefill any remaining suffix.
+                    if (loaded_len as usize) < req.tokens.len() {
+                        prefill_suffix(state, &req.tokens[loaded_len as usize..], loaded_len)?;
+                    }
+                    // Now live matches req fully.
+                    if let Some(l) = &mut state.live {
+                        l.tokens = req.tokens.clone();
+                        l.pos = prompt_tokens;
+                        l.session_id = session_id.clone();
+                    }
+                    return finish_decode(
+                        state,
+                        req,
+                        tx,
+                        prompt_tokens,
+                        session_id,
+                    );
+                }
+            }
+        }
+
+        // No useful disk hit. Save dirty live (if any) before resetting.
+        save_live_if_dirty(state);
         state.state.reset_in_place(state.dgpu, state.igpu)?;
-        let was_live = state.live.is_some();
-        if was_live {
+        if state.live.is_some() {
             let l = state.live.as_ref().unwrap();
-            // Log the few tokens around the divergence point to aid
-            // debugging tokenizer round-trip issues.
             let start = lcp.saturating_sub(2);
             let end_live = (lcp + 3).min(l.tokens.len());
             let end_req = (lcp + 3).min(req.tokens.len());
@@ -550,7 +733,20 @@ fn handle_generate_stream(
     state.live = Some(LiveSession {
         tokens: req.tokens.clone(),
         pos: prompt_tokens,
+        dirty: false,
+        session_id: session_id.clone(),
     });
+
+    finish_decode(state, req, tx, prompt_tokens, session_id)
+}
+
+fn finish_decode(
+    state: &mut WorkerState,
+    req: GenerateReq,
+    tx: &mpsc::Sender<WorkerEvent>,
+    prompt_tokens: u32,
+    _session_id: Option<String>,
+) -> eyre::Result<()> {
     let mut pos = prompt_tokens;
 
     let sample_mode = if req.temperature <= 0.0 {
@@ -610,6 +806,7 @@ fn handle_generate_stream(
         if let Some(ref mut live) = state.live {
             live.tokens.push(next);
             live.pos = pos;
+            live.dirty = true;
         }
         if pos >= state.n_kv_max {
             break FinishReason::Length;
@@ -639,6 +836,7 @@ fn handle_generate_stream(
         if let Some(ref mut live) = state.live {
             live.tokens.push(TOK_EOS);
             live.pos = pos;
+            live.dirty = true;
         }
     }
 

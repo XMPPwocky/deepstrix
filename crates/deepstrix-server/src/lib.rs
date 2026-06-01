@@ -7,6 +7,7 @@ pub mod embed;
 pub mod engine_worker;
 pub mod openai;
 pub mod prompt;
+pub mod snapshot;
 pub mod tokens;
 
 use color_eyre::eyre;
