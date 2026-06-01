@@ -282,12 +282,32 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
 /// vs ["hello!"]). Those still terminate the LCP and trigger reset.
 /// In practice the per-position case covers most observed mismatches
 /// (punctuation, single-character tokens).
+/// Outcome of an [`aligned_lcp`] computation.
+#[derive(Debug, Clone, Copy)]
+struct AlignedLcp {
+    /// Number of positions that matched (by id-equality or by text-bridge).
+    len: usize,
+    /// Number of positions matched via text-bridge (different IDs but
+    /// equal decoded bytes). 0 in the common case. Non-zero means the
+    /// vocab has text-aliased tokens AND the model chose a non-canonical
+    /// encoding — worth surfacing so we know prefix-cache hits depend
+    /// on the safety net.
+    bridged: usize,
+    /// First (live_id, req_id) pair the bridge accepted, for telemetry.
+    first_bridge: Option<(i32, i32)>,
+}
+
 fn aligned_lcp(
     live: &[i32],
     req: &[i32],
     vocab: &BpeVocab,
     byte_decoder: &std::collections::HashMap<char, u8>,
-) -> usize {
+) -> AlignedLcp {
+    let mut out = AlignedLcp {
+        len: 0,
+        bridged: 0,
+        first_bridge: None,
+    };
     let mut m = 0;
     while m < live.len() && m < req.len() {
         if live[m] == req[m] {
@@ -302,12 +322,17 @@ fn aligned_lcp(
             .map(|b| gpt2_decode_token(b, byte_decoder));
         match (live_bytes, req_bytes) {
             (Some(a), Some(b)) if a == b => {
+                out.bridged += 1;
+                if out.first_bridge.is_none() {
+                    out.first_bridge = Some((live[m], req[m]));
+                }
                 m += 1;
             }
             _ => break,
         }
     }
-    m
+    out.len = m;
+    out
 }
 
 #[cfg(test)]
@@ -382,8 +407,10 @@ mod tests {
         // Identical prefix, then the alias at position 3, then more matching.
         let live = vec![100, 200, 300, a, 1];
         let req = vec![100, 200, 300, b, 1, 128803];
-        let lcp = aligned_lcp(&live, &req, &vocab, &dec);
-        assert_eq!(lcp, 5, "aligned LCP should bridge the alias and the trailing match");
+        let res = aligned_lcp(&live, &req, &vocab, &dec);
+        assert_eq!(res.len, 5, "aligned LCP should bridge the alias and the trailing match");
+        assert_eq!(res.bridged, 1, "exactly one position should have been bridged");
+        assert_eq!(res.first_bridge, Some((a, b)));
     }
 
     #[test]
@@ -396,8 +423,9 @@ mod tests {
         // LCP should stop at the divergent position, not bridge.
         let live = vec![100, 200, 300, 16, 1];
         let req = vec![100, 200, 300, 603, 1];
-        let lcp = aligned_lcp(&live, &req, &vocab, &dec);
-        assert_eq!(lcp, 3, "LCP must stop where decoded bytes diverge");
+        let res = aligned_lcp(&live, &req, &vocab, &dec);
+        assert_eq!(res.len, 3, "LCP must stop where decoded bytes diverge");
+        assert_eq!(res.bridged, 0, "no bridge should have fired");
     }
 }
 
@@ -442,15 +470,30 @@ fn handle_generate_stream(
     //   3. New request equals live exactly (lcp == req.len()):
     //        no prefill — sample from existing logits in dgpu_scratch.
     let (lcp, live_len) = match &state.live {
-        Some(live) => (
-            aligned_lcp(
+        Some(live) => {
+            let res = aligned_lcp(
                 &live.tokens,
                 &req.tokens,
                 state.vocab.as_ref(),
                 &state.byte_decoder,
-            ),
-            live.tokens.len(),
-        ),
+            );
+            if res.bridged > 0 {
+                // Surface non-canonical-tokenization events. On the
+                // V4-Flash vocab this is expected to never fire (the
+                // BPE is bijective on decoded bytes). When it does
+                // fire, the cache hit still works, but it means the
+                // vocab has text-aliased token pairs and the model
+                // sampled a non-canonical encoding for some text.
+                tracing::warn!(
+                    bridged = res.bridged,
+                    first_bridge = ?res.first_bridge,
+                    lcp = res.len,
+                    "prefix cache match used text-bridge safety net \
+                     (aligned_lcp bridged across token-id divergence)"
+                );
+            }
+            (res.len, live.tokens.len())
+        }
         None => (0, 0),
     };
 
