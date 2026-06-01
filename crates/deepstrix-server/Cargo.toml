@@ -1,0 +1,29 @@
+[package]
+name = "deepstrix-server"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+v4flash-core = { path = "../v4flash-core" }
+v4flash-hip = { path = "../v4flash-hip" }
+v4flash-kernels = { path = "../v4flash-kernels" }
+
+# Workspace-approved already.
+color-eyre = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Approved deps (workspace Cargo.toml). blake3/uuid wired in by their
+# respective phases (4 / 2).
+tokio = { workspace = true }
+axum = { workspace = true }
+
+[[bin]]
+name = "deepstrix-server"
+path = "src/main.rs"

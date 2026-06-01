@@ -5,6 +5,7 @@ members = [
     "crates/v4flash-hip",
     "crates/v4flash-kernels",
     "crates/deepstrix-cli",
+    "crates/deepstrix-server",
     "crates/phase0",
     "crates/phase1",
 ]
@@ -30,3 +31,14 @@ thiserror = "2.0.18"
 memmap2 = "0.9.10"
 # eyre is re-exported by color-eyre; library code uses eyre::Result and binaries
 # install the color-eyre handler in main().
+
+# Approved for deepstrix-server (user sign-off 2026-06-01).
+#   tokio:  async runtime backing axum; tokio-rs official.
+#   axum:   HTTP framework on hyper+tower; OpenAI /v1/chat/completions + SSE.
+#   blake3: snapshot-key hashing over token-id byte sequences.
+#   uuid:   v7 ids for OpenAI tool-call ids.
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "signal", "io-util", "time"] }
+axum = "0.8.9"
+blake3 = "1.8.5"
+uuid = { version = "1.23.2", features = ["v7"] }
+
