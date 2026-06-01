@@ -207,10 +207,10 @@ impl HeterogeneousEngine {
                     }
                     _ => {
                         de.rms_nw_mw.launch_inv_only(s, &mut dgpu_scratch.rms_nw_inv_scalar, &dgpu_scratch.residual, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
-                        // F16_KSPLIT=N (default 0 = legacy narrow). N>0 uses
-                        // the K-split path with that n_k_split.
+                        // F16_KSPLIT=N (default 16 = K-split + u128 vector
+                        // loads). N=0 rolls back to legacy narrow.
                         let ksplit: u32 = std::env::var("F16_KSPLIT")
-                            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
                         if ksplit > 0 {
                             de.f16.matvec_narrow_ksplit_pre_scaled(
                                 s, &mut dgpu_scratch.mix, &dlw.hc_attn_fn.buffer,
@@ -663,7 +663,7 @@ impl HeterogeneousEngine {
                 _ => {
                     de.rms_nw_mw.launch_inv_only(s, &mut dgpu_scratch.rms_nw_inv_scalar, &dgpu_scratch.after_attn_hc, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
                     let ksplit: u32 = std::env::var("F16_KSPLIT")
-                        .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
                     if ksplit > 0 {
                         de.f16.matvec_narrow_ksplit_pre_scaled(
                             s, &mut dgpu_scratch.mix, &dlw.hc_ffn_fn.buffer,
@@ -987,7 +987,7 @@ impl HeterogeneousEngine {
                     _ => {
                         de.rms_nw_mw.launch_inv_only(s, &mut dgpu_scratch.rms_nw_inv_scalar, &dgpu_scratch.residual_next, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
                         let ksplit: u32 = std::env::var("F16_KSPLIT")
-                            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
                         if ksplit > 0 {
                             de.f16.matvec_narrow_ksplit_pre_scaled(
                                 s, &mut dgpu_scratch.mix, &next.hc_attn_fn.buffer,

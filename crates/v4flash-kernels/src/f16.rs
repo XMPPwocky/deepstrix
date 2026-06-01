@@ -189,9 +189,16 @@ impl F16Matvec {
                 partials.len()
             ));
         }
-        let f_part = self
-            .narrow
-            .get_function("f16_matvec_narrow_ksplit_partial")?;
+        // F16_KSPLIT_V8=1 uses the u128 vector-load variant (8 f16 per
+        // load instruction instead of 1). Requires k_chunk = k/n_k_split
+        // to be a multiple of 256 (32 lanes × 8 elems).
+        let use_v8 = (k_chunk % 256 == 0)
+            && std::env::var("F16_KSPLIT_V8").map(|v| v != "0").unwrap_or(true);
+        let f_part = if use_v8 {
+            self.narrow.get_function("f16_matvec_narrow_ksplit_partial_v8")?
+        } else {
+            self.narrow.get_function("f16_matvec_narrow_ksplit_partial")?
+        };
         let f_red = self
             .narrow
             .get_function("f16_matvec_narrow_ksplit_reduce_pre_scaled")?;

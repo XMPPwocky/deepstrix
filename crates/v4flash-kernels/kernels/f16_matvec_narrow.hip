@@ -224,6 +224,57 @@ extern "C" __global__ void f16_matvec_narrow_ksplit_partial(
     }
 }
 
+// Vector-load variant: each lane reads 8 f16 (u128 = 16 B) per
+// instruction instead of 1 (u16 = 2 B). 8× fewer load instructions =
+// 8× fewer `s_wait_loadcnt` stall points in the inner loop.
+// ATT on the u16 variant showed 24692 cycles on s_wait_loadcnt_dscnt
+// (68.5% of stall) at 24 hits/wave × 128 cycles latency each.
+// With u128 we issue 1/8 the loads, so ~3 hits/wave × 128 = ~384 cycles.
+// Requires k_chunk % 256 == 0 (= 32 lanes × 8 elements/load).
+// k_chunk also still ≤ 1024 for LDS budget.
+extern "C" __global__ void f16_matvec_narrow_ksplit_partial_v8(
+        float          * __restrict__ partials,  // [n_k_split, n_rows]
+        const __half   * __restrict__ weight,    // [n_rows, k_total]
+        const float    * __restrict__ x,         // [k_total]
+        unsigned int     k_total,
+        unsigned int     k_chunk,
+        unsigned int     n_rows) {
+    __shared__ float s_x[1024];
+
+    const uint32_t tid          = threadIdx.x;
+    const uint32_t lane         = tid & (KMV_LANES - 1u);
+    const uint32_t wave         = tid >> 5u;
+    const uint32_t k_chunk_idx  = blockIdx.x;
+    const uint32_t k_start      = k_chunk_idx * k_chunk;
+
+    for (uint32_t i = tid; i < k_chunk; i += KMV_BLOCK) {
+        s_x[i] = x[k_start + i];
+    }
+    __syncthreads();
+
+    const uint32_t out_per_wave = (n_rows + KMV_WAVES - 1u) / KMV_WAVES;
+    for (uint32_t oi = 0; oi < out_per_wave; oi++) {
+        const uint32_t row = wave * out_per_wave + oi;
+        if (row >= n_rows) break;
+        const __half *wr = weight + (size_t)row * (size_t)k_total + (size_t)k_start;
+        float acc = 0.0f;
+        // Each lane reads 8 contiguous f16 per iter; lanes step by 256 between iters.
+        const uint32_t k_lane = lane * 8u;
+        for (uint32_t k_base = k_lane; k_base < k_chunk; k_base += KMV_LANES * 8u) {
+            __half h[8];
+            *(int4*)h = *(const int4*)(wr + k_base);
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {
+                acc += __half2float(h[e]) * s_x[k_base + (uint32_t)e];
+            }
+        }
+        acc = kmv_warp_sum(acc);
+        if (lane == 0) {
+            partials[(size_t)k_chunk_idx * (size_t)n_rows + (size_t)row] = acc;
+        }
+    }
+}
+
 extern "C" __global__ void f16_matvec_narrow_ksplit_reduce_pre_scaled(
         float          * __restrict__ out,
         const float    * __restrict__ partials,

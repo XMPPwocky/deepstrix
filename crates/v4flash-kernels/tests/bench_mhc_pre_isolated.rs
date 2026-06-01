@@ -108,6 +108,7 @@ fn bench_mhc_pre_isolated() -> eyre::Result<()> {
     let do_chain  = phase == "all" || phase == "chain";
     let do_rms_nw = phase == "all" || phase == "rms_nw";
     let do_f16mv  = phase == "all" || phase == "f16_matvec";
+    let do_f16mv_ksplit_only = phase == "f16_matvec_ksplit";
     let do_sink   = phase == "all" || phase == "sinkhorn";
     let do_wsum   = phase == "all" || phase == "hc_weighted";
     let do_rms_w  = phase == "all" || phase == "rms_w";
@@ -148,6 +149,36 @@ fn bench_mhc_pre_isolated() -> eyre::Result<()> {
             walls.push(Event::elapsed_ms(&s, &e)?);
         }
         stats(&mut walls, format!("1b. rms_nw multi-WG (n_wgs={rms_n_wgs})    ").as_str());
+    }
+    if do_f16mv_ksplit_only {
+        // Bench ONLY the k-split partial+reduce pair (the legacy narrow is
+        // skipped so ATT can target the ksplit_partial kernel as the first
+        // dispatched compute kernel with --att-consecutive-kernels 1).
+        let nks: u32 = std::env::var("BENCH_KSPLIT")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+        let mut partials: DeviceBuffer<f32> = DeviceBuffer::new(
+            dgpu.id, 64 * (HC_MIX_DIM as usize))?;
+        let mut pre_scale_buf: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, 1)?;
+        pre_scale_buf.copy_from_host(&[1.0f32])?;
+        for _ in 0..warmup {
+            f16.matvec_narrow_ksplit_pre_scaled(
+                &stream, &mut mix, &hc_fn_w, &flat, &pre_scale_buf,
+                &mut partials, HC_MIX_DIM, HC_DIM, nks,
+            )?;
+        }
+        stream.synchronize()?;
+        let mut walls: Vec<f32> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let s = Event::new()?; let e = Event::new()?;
+            s.record(&stream)?;
+            f16.matvec_narrow_ksplit_pre_scaled(
+                &stream, &mut mix, &hc_fn_w, &flat, &pre_scale_buf,
+                &mut partials, HC_MIX_DIM, HC_DIM, nks,
+            )?;
+            e.record(&stream)?; stream.synchronize()?;
+            walls.push(Event::elapsed_ms(&s, &e)?);
+        }
+        stats(&mut walls, format!("f16.matvec_ksplit-only (n_k_split={nks})  ").as_str());
     }
     if do_f16mv {
         let mut walls: Vec<f32> = Vec::with_capacity(iters);
