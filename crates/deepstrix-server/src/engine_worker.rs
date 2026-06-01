@@ -260,9 +260,145 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     })
 }
 
-/// Longest common prefix length of two token-id sequences.
-fn common_prefix_len(a: &[i32], b: &[i32]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+/// Text-aware longest common prefix of two token-id sequences. When
+/// token IDs differ at a position, decode both via the BPE vocab + GPT-2
+/// byte decoder and compare raw bytes — same-text-different-id pairs
+/// (e.g. two encodings of "." that differ in BPE rank) count as a
+/// match.
+///
+/// This is the smallest fix to the canonical BPE-roundtrip problem:
+/// when the model samples a non-canonical encoding for some text, the
+/// re-encoded form of that same text on the next request will produce
+/// different IDs at the same position, but the decoded bytes match. We
+/// can safely treat that as a cache hit because:
+///   * Token COUNT is identical — ROPE position numbering lines up.
+///   * The KV state at that position was derived from the actual
+///     sampled token; subsequent attention from later positions reads
+///     the same byte-content's K,V — semantically equivalent context
+///     even if the exact token-id differs.
+///
+/// What this does NOT handle: divergences where the BPE produces a
+/// different NUMBER of tokens for the same text (e.g. ["hello", "!"]
+/// vs ["hello!"]). Those still terminate the LCP and trigger reset.
+/// In practice the per-position case covers most observed mismatches
+/// (punctuation, single-character tokens).
+fn aligned_lcp(
+    live: &[i32],
+    req: &[i32],
+    vocab: &BpeVocab,
+    byte_decoder: &std::collections::HashMap<char, u8>,
+) -> usize {
+    let mut m = 0;
+    while m < live.len() && m < req.len() {
+        if live[m] == req[m] {
+            m += 1;
+            continue;
+        }
+        let live_bytes = vocab
+            .token_text(live[m])
+            .map(|b| gpt2_decode_token(b, byte_decoder));
+        let req_bytes = vocab
+            .token_text(req[m])
+            .map(|b| gpt2_decode_token(b, byte_decoder));
+        match (live_bytes, req_bytes) {
+            (Some(a), Some(b)) if a == b => {
+                m += 1;
+            }
+            _ => break,
+        }
+    }
+    m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Loads the real BPE vocab. Gated since the GGUF is large.
+    fn load_vocab() -> Option<BpeVocab> {
+        let path = "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf";
+        if !std::path::Path::new(path).exists() {
+            return None;
+        }
+        let gguf = MappedGguf::open(path).ok()?;
+        BpeVocab::from_gguf(gguf.gguf()).ok()
+    }
+
+    /// Find an aliased pair: two distinct token ids whose
+    /// `gpt2_decode_token(token_text(id))` bytes are equal. The DeepSeek
+    /// vocab has these because BPE can have multiple paths to the same
+    /// surface text. We scan a small range; on the V4-Flash vocab a
+    /// pair shows up easily within the first few thousand ids.
+    fn find_alias_pair(
+        vocab: &BpeVocab,
+        dec: &std::collections::HashMap<char, u8>,
+    ) -> Option<(i32, i32)> {
+        let mut by_text: std::collections::HashMap<Vec<u8>, i32> =
+            std::collections::HashMap::new();
+        for id in 0..vocab.vocab_size() as i32 {
+            // Skip special tokens — those don't alias to plain text.
+            if id == 0 || (id >= 128800 && id <= 128900) {
+                continue;
+            }
+            if let Some(bytes) = vocab.token_text(id) {
+                let decoded = gpt2_decode_token(bytes, dec);
+                if decoded.is_empty() {
+                    continue;
+                }
+                if let Some(&other) = by_text.get(&decoded) {
+                    return Some((other, id));
+                }
+                by_text.insert(decoded, id);
+            }
+        }
+        None
+    }
+
+    #[test]
+    #[ignore]
+    fn aligned_lcp_bridges_text_aliased_token() {
+        let Some(vocab) = load_vocab() else { return };
+        let dec = build_gpt2_byte_decoder();
+        let Some((a, b)) = find_alias_pair(&vocab, &dec) else {
+            // No alias found in scanned range — vocab is unusually
+            // canonical; aligned_lcp would behave the same as plain
+            // prefix match. Nothing to test, skip.
+            eprintln!("no alias pair found; skipping aligned LCP bridge test");
+            return;
+        };
+        let aa = vocab
+            .token_text(a)
+            .map(|b| gpt2_decode_token(b, &dec))
+            .unwrap_or_default();
+        let bb = vocab
+            .token_text(b)
+            .map(|b| gpt2_decode_token(b, &dec))
+            .unwrap_or_default();
+        assert_eq!(aa, bb, "alias pair must decode to the same bytes");
+        eprintln!(
+            "alias: id {a} ↔ id {b}, both decode to {:?}",
+            String::from_utf8_lossy(&aa)
+        );
+        // Identical prefix, then the alias at position 3, then more matching.
+        let live = vec![100, 200, 300, a, 1];
+        let req = vec![100, 200, 300, b, 1, 128803];
+        let lcp = aligned_lcp(&live, &req, &vocab, &dec);
+        assert_eq!(lcp, 5, "aligned LCP should bridge the alias and the trailing match");
+    }
+
+    #[test]
+    #[ignore]
+    fn aligned_lcp_does_not_match_different_text() {
+        let Some(vocab) = load_vocab() else { return };
+        let dec = build_gpt2_byte_decoder();
+        // id 16 = "." (1 byte), id 603 = ".\n" (2 bytes) in V4-Flash —
+        // these are NOT aliases, the text differs by a newline. The
+        // LCP should stop at the divergent position, not bridge.
+        let live = vec![100, 200, 300, 16, 1];
+        let req = vec![100, 200, 300, 603, 1];
+        let lcp = aligned_lcp(&live, &req, &vocab, &dec);
+        assert_eq!(lcp, 3, "LCP must stop where decoded bytes diverge");
+    }
 }
 
 fn worker_loop(mut state: WorkerState, rx: &mut mpsc::UnboundedReceiver<EngineRequest>) {
@@ -307,7 +443,12 @@ fn handle_generate_stream(
     //        no prefill — sample from existing logits in dgpu_scratch.
     let (lcp, live_len) = match &state.live {
         Some(live) => (
-            common_prefix_len(&live.tokens, &req.tokens),
+            aligned_lcp(
+                &live.tokens,
+                &req.tokens,
+                state.vocab.as_ref(),
+                &state.byte_decoder,
+            ),
             live.tokens.len(),
         ),
         None => (0, 0),
