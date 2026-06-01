@@ -30,12 +30,13 @@ impl KvCacheAppend {
         Ok(Self { module })
     }
 
-    /// `cache` must be `[swa_window * head_dim]` f32. `kv_new` is
-    /// `[head_dim]`. `n_raw_before` is the current fill count (0..=swa_window).
+    /// `cache` must be `[swa_window * head_dim]` f16 (held as `u16`).
+    /// `kv_new` is `[head_dim]` f32 (cast to f16 at store).
+    /// `n_raw_before` is the current fill count (0..=swa_window).
     pub fn launch(
         &self,
         stream: &Stream,
-        cache: &mut DeviceBuffer<f32>,
+        cache: &mut DeviceBuffer<u16>,
         kv_new: &DeviceBuffer<f32>,
         n_raw_before: u32,
         swa_window: u32,
@@ -88,7 +89,7 @@ impl KvCacheAppend {
     pub fn launch_batched(
         &self,
         stream: &Stream,
-        cache: &mut DeviceBuffer<f32>,
+        cache: &mut DeviceBuffer<u16>,
         kv_new: &DeviceBuffer<f32>,
         n_raw_before: u32,
         head_dim: u32,

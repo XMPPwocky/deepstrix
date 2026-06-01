@@ -28,9 +28,10 @@ use super::scratch::{DgpuScratch, IgpuScratch};
 /// expert chunks under the skewed (Zipf-y) routing, so the staged iq2
 /// path amortizes better over longer member lists — measured +9.4% e2e
 /// prefill at depth 1024 (186.6 → 204.2 tok/s, back-to-back). The big
-/// scratch growth is `attn_scores` (~+1.1 GiB) which is dGPU-resident
-/// (16 GiB 9070 XT, ample), NOT on the tight iGPU expert budget; iGPU
-/// scratch growth is ~24→48 MB. Total dGPU scratch ~208 MB at B=512.
+/// scratch growth is `attn_scores` (~+580 MB at f16 / ~290 MB after
+/// halving for f16 scores) which is dGPU-resident (16 GiB 9070 XT,
+/// ample), NOT on the tight iGPU expert budget; iGPU scratch growth is
+/// ~24→48 MB.
 pub const B_MAX: usize = 512;
 
 /// Test-only convenience bundle of (shared `DgpuScratch`,
@@ -135,7 +136,8 @@ pub struct BatchDgpuScratch {
     /// of `ls.kv_cache` — two non-overlapping device-to-device copies on the
     /// compute stream. The intermediate buffer makes the shift race-free
     /// even when the source/destination regions in the cache overlap.
-    pub kv_ring_scratch: DeviceBuffer<f32>,
+    /// `u16` because `ls.kv_cache` is f16-stored.
+    pub kv_ring_scratch: DeviceBuffer<u16>,
 
     // ---- Compressor (used in per-batch serial inner loop) ----
     pub kv_cur: DeviceBuffer<f32>,
@@ -241,6 +243,11 @@ pub struct BatchIgpuScratch {
     /// Hybrid dispatch: `[1]` i32 atomic counters, pre-zeroed per layer.
     pub n_staged_work_items: DeviceBuffer<i32>,
     pub n_chunked_work_items: DeviceBuffer<i32>,
+    /// Q2K_VARIANT=by_expert: per-(b, slot, row) partial sums written by
+    /// `q2_k_matvec_par_by_expert`, then summed across `n_used` by
+    /// `q2_k_reduce_partials`. `[B*n_used, N_EMBD]` f32 = 48 MiB at B=512.
+    /// Avoids the atomicAdd nondeterminism of an in-place accumulation.
+    pub q2k_partials: DeviceBuffer<f32>,
 }
 
 impl BatchIgpuScratch {
@@ -273,6 +280,10 @@ impl BatchIgpuScratch {
                 (N_EXPERT as usize) + b * (N_EXPERT_USED as usize),
             )?,
             n_work_items: DeviceBuffer::new(id, 1)?,
+            q2k_partials: DeviceBuffer::new(
+                id,
+                b * (N_EXPERT_USED as usize) * (N_EMBD as usize),
+            )?,
             // Hybrid dispatch: two extra work_items arrays, each sized for the
             // worst case (all items land in one bucket).
             staged_work_items: DeviceBuffer::new(
@@ -301,6 +312,8 @@ impl BatchDgpuScratch {
         let b = B_MAX;
         let mk_f32 =
             |n: usize| -> eyre::Result<DeviceBuffer<f32>> { DeviceBuffer::new(id, b * n) };
+        let mk_u16 =
+            |n: usize| -> eyre::Result<DeviceBuffer<u16>> { DeviceBuffer::new(id, b * n) };
         let mk_i8 = |n: usize| -> eyre::Result<DeviceBuffer<i8>> { DeviceBuffer::new(id, b * n) };
         let mk_i32 =
             |n: usize| -> eyre::Result<DeviceBuffer<i32>> { DeviceBuffer::new(id, b * n) };
@@ -328,7 +341,7 @@ impl BatchDgpuScratch {
             kv_raw: mk_f32(N_HEAD_DIM as usize)?,
             kv_normed: mk_f32(N_HEAD_DIM as usize)?,
             // b*N_HEAD_DIM = B_MAX*N_HEAD_DIM ≥ SWA_WINDOW*N_HEAD_DIM.
-            kv_ring_scratch: mk_f32(N_HEAD_DIM as usize)?,
+            kv_ring_scratch: mk_u16(N_HEAD_DIM as usize)?,
 
             kv_cur: mk_f32((2 * N_HEAD_DIM) as usize)?,
             sc_cur: mk_f32((2 * N_HEAD_DIM) as usize)?,
@@ -343,7 +356,12 @@ impl BatchDgpuScratch {
             n_comp_per: mk_i32(1)?,
 
             heads: mk_f32(Q_FLAT as usize)?,
-            attn_scores: mk_f32((N_HEAD * ATTN_MIXED_MAX_KEYS) as usize)?,
+            // Half-sized: the score kernel writes f16 into this buffer
+            // (see launch_score_batched_htiled_wmma_f16s in attention.rs).
+            // N_HEAD * ATTN_MIXED_MAX_KEYS / 2 f32 elements ≡ N_HEAD *
+            // ATTN_MIXED_MAX_KEYS f16 elements ≡ same byte budget as the
+            // f32-scores layout would have used.
+            attn_scores: mk_f32(((N_HEAD * ATTN_MIXED_MAX_KEYS) / 2) as usize)?,
             low: mk_f32(OUT_LOW as usize)?,
             heads_xq: mk_i8(Q_FLAT as usize)?,
             heads_xscale: mk_f32(BLOCKS_GROUPED_OUT as usize)?,

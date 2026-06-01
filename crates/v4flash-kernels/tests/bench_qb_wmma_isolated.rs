@@ -51,9 +51,13 @@ fn bench_qb_wmma_isolated() -> eyre::Result<()> {
     let batch: u32 = std::env::var("BENCH_B")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(64);
 
-    // qb shape.
-    let n_rows: u32 = 32768; // Q_FLAT
-    let k: u32 = 1024; // N_LORA_Q
+    // Default qb shape; override via BENCH_M / BENCH_K to probe other GEMM
+    // shapes (e.g. matvec_out: BENCH_M=4096 BENCH_K=8192 for the output_proj
+    // tail; grouped sub-call: BENCH_M=1024 BENCH_K=4096 ×8 groups).
+    let n_rows: u32 = std::env::var("BENCH_M")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(32768); // qb default = Q_FLAT
+    let k: u32 = std::env::var("BENCH_K")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1024); // qb default = N_LORA_Q
     let blocks = k / Q8_0_BLOCK_ELEMS;
 
     let dgpu = pick_dgpu()?;

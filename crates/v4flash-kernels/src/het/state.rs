@@ -27,8 +27,10 @@ pub struct HetCompressorState {
     pub state_kv: DeviceBuffer<f32>,
     pub state_score: DeviceBuffer<f32>,
     /// dGPU-resident: cumulative pooled comp-KV cache consumed by
-    /// `attn_mixed`.
-    pub comp_kv: DeviceBuffer<f32>,
+    /// `attn_mixed`. Stored as f16 (held as u16) — V values come out of
+    /// the compressor as f32, get cast at the comp_kv_append store,
+    /// halving DRAM bw for the dominant V-read cost in long-context attention.
+    pub comp_kv: DeviceBuffer<u16>,
     pub n_comp: u32,
     pub width: u32,
     pub head_dim: u32,
@@ -60,7 +62,7 @@ impl HetCompressorState {
         dgpu_device.set_current()?;
         let max_n_comp = (n_kv_max + ratio - 1) / ratio;
         let comp_kv_capacity = (max_n_comp as usize) * (head_dim as usize);
-        let comp_kv: DeviceBuffer<f32> = DeviceBuffer::new(dgpu_device.id, comp_kv_capacity)?;
+        let comp_kv: DeviceBuffer<u16> = DeviceBuffer::new(dgpu_device.id, comp_kv_capacity)?;
         Ok(Self {
             state_kv,
             state_score,
@@ -73,7 +75,8 @@ impl HetCompressorState {
 }
 
 pub struct HetLayerState {
-    pub kv_cache: DeviceBuffer<f32>,
+    /// SWA raw KV cache. f16-stored (see `HetCompressorState::comp_kv` rationale).
+    pub kv_cache: DeviceBuffer<u16>,
     pub n_raw: u32,
     pub compressor: Option<HetCompressorState>,
 }
@@ -113,7 +116,7 @@ impl HetModelState {
             dgpu_device.set_current()?;
             let raw_rows = KV_CACHE_ROWS as u32;
             layers.push(HetLayerState {
-                kv_cache: DeviceBuffer::new(
+                kv_cache: DeviceBuffer::<u16>::new(
                     dgpu_device.id,
                     (raw_rows as usize) * (N_HEAD_DIM as usize),
                 )?,

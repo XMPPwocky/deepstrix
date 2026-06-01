@@ -24,10 +24,12 @@ impl CompKvAppend {
         Ok(Self { module })
     }
 
+    /// `comp_kv` is `[n_comp_max * head_dim]` f16 (held as `u16`).
+    /// `row` is `[head_dim]` f32 (cast to f16 at store).
     pub fn launch(
         &self,
         stream: &Stream,
-        comp_kv: &mut DeviceBuffer<f32>,
+        comp_kv: &mut DeviceBuffer<u16>,
         row: &DeviceBuffer<f32>,
         n_comp: u32,
         head_dim: u32,

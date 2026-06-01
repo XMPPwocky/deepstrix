@@ -240,6 +240,89 @@ impl Q2KAccumulateMatvec {
             dbpe, xq_slot_stride, n_used, n_rows, n_blocks_in
         ])
     }
+
+    /// By-expert dispatch — reuses iq2's `group_count` + `expert_members` +
+    /// `work_items` arrays. Grid `(n_rows/8, n_work_items)`; each WG handles
+    /// one (row-tile, expert-chunk) and writes per-(b, used_slot) partial
+    /// sums to `partials` (one writer per slot, no atomic, deterministic).
+    ///
+    /// Attacks the 94% DRAM-BW wall of `launch_batched_bxn` by reading each
+    /// expert's row-tile once instead of once per selecting batch slot.
+    /// Combine with `launch_reduce_partials` to materialize the final
+    /// out buffer.
+    ///
+    /// Caller MUST zero `partials` before launching — the kernel only writes
+    /// (b, slot) pairs that appear in `expert_members`; any (b, slot) NOT
+    /// touched must already be zero so the reduce step doesn't pick up
+    /// stale data.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_by_expert(
+        &self,
+        stream: &Stream,
+        partials: &mut DeviceBuffer<f32>,    // [B*n_used, n_rows] — zero on entry
+        w_base: &DeviceBuffer<u8>,
+        xq_base: &DeviceBuffer<u8>,          // [B, n_used * xq_slot_stride]
+        group_count: &DeviceBuffer<i32>,     // [N_EXPERT]
+        expert_members: &DeviceBuffer<i32>,  // [N_EXPERT * max_per_expert]
+        work_items: &DeviceBuffer<i32>,      // [n_work_items]
+        dbpe: u32,
+        xq_slot_stride: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        n_rows: u32,
+        n_blocks_in: u32,
+        n_work_items: u32,
+    ) -> eyre::Result<()> {
+        if n_work_items == 0 {
+            return Ok(());
+        }
+        if n_rows % 8 != 0 {
+            return Err(eyre!(
+                "q2_k_matvec_par_by_expert: n_rows={n_rows} not %8"
+            ));
+        }
+        let function = self.module.get_function("q2_k_matvec_par_by_expert")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, n_work_items, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            partials.raw(), w_base.raw(), xq_base.raw(),
+            group_count.raw(), expert_members.raw(), work_items.raw(),
+            dbpe, xq_slot_stride, n_used, max_per_expert, chunk_size,
+            n_rows, n_blocks_in
+        ])
+    }
+
+    /// Reduce per-(b, slot) partials into final out. Tiny kernel — each
+    /// thread sums n_used (typically 6) values. Pairs with `launch_by_expert`.
+    pub fn launch_reduce_partials(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,         // [B, n_rows]
+        partials: &DeviceBuffer<f32>,        // [B*n_used, n_rows]
+        n_used: u32,
+        n_rows: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let function = self.module.get_function("q2_k_reduce_partials")?;
+        let total_threads = (batch as usize) * (n_rows as usize);
+        let block: u32 = 256;
+        let grid: u32 = ((total_threads + (block as usize) - 1) / (block as usize)) as u32;
+        let cfg = LaunchConfig {
+            grid: (grid, 1, 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), partials.raw(), n_used, n_rows
+        ])
+    }
 }
 
 /// CPU port of `dev_dot_q2_K_q8_K_block` (ds4_cuda.cu:7296). Used by oracle.

@@ -33,6 +33,31 @@ fn dump_dir() -> PathBuf {
         .join("reference/v4flash-cpu-activations")
 }
 
+/// f32 → f16 bits (RTNE). Matches GPU `(_Float16)` cast.
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let mut exp = ((bits >> 23) & 0xff) as i32;
+    let mant = (bits & 0x7fffff) as u32;
+    if exp == 0xff {
+        let m = if mant != 0 { 0x200 } else { 0 };
+        return sign | 0x7c00 | m as u16;
+    }
+    exp = exp - 127 + 15;
+    if exp >= 0x1f { return sign | 0x7c00; }
+    if exp <= 0 {
+        if exp < -10 { return sign; }
+        let m = (mant | 0x800000) >> (1 - exp);
+        let rounded = (m + 0x1000 + ((m >> 13) & 1)) >> 13;
+        return sign | rounded as u16;
+    }
+    let rounded_mant = (mant + 0x1000 + ((mant >> 13) & 1)) >> 13;
+    if rounded_mant & 0x400 != 0 {
+        return sign | ((exp as u16 + 1) << 10);
+    }
+    sign | ((exp as u16) << 10) | rounded_mant as u16
+}
+
 fn pick_device() -> eyre::Result<Device> {
     let devices = Device::all()?;
     for d in &devices {
@@ -99,8 +124,9 @@ fn attention_swa_oracle() -> eyre::Result<()> {
     let mut d_q: DeviceBuffer<f32> = DeviceBuffer::new(device.id, Q_FLAT as usize)?;
     let mut d_out: DeviceBuffer<f32> = DeviceBuffer::new(device.id, Q_FLAT as usize)?;
     let mut d_sinks: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N_HEAD as usize)?;
-    // One contiguous device buffer for the KV cache; grows by N_HEAD_DIM per T.
-    let mut d_kv: DeviceBuffer<f32> =
+    // One contiguous device buffer for the KV cache (f16-stored); grows by
+    // N_HEAD_DIM per T. Host-side staging stays f32 then converts at copy.
+    let mut d_kv: DeviceBuffer<u16> =
         DeviceBuffer::new(device.id, (ATTN_SWA_MAX_KV as usize) * (N_HEAD_DIM as usize))?;
     let mut got = vec![0f32; Q_FLAT as usize];
 
@@ -129,7 +155,10 @@ fn attention_swa_oracle() -> eyre::Result<()> {
 
             let row_offset = (token as usize) * (N_HEAD_DIM as usize);
             host_cache[row_offset..row_offset + (N_HEAD_DIM as usize)].copy_from_slice(&kv_row);
-            d_kv.copy_from_host(&host_cache)?;
+            // Host f32 cache → f16 bits to match the f16 V cache layout.
+            let host_cache_f16: Vec<u16> =
+                host_cache.iter().map(|&x| f32_to_f16_bits(x)).collect();
+            d_kv.copy_from_host(&host_cache_f16)?;
 
             let q_entry = dump
                 .tensor("q_post_rope", layer, token)

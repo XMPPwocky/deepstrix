@@ -770,10 +770,14 @@ impl HeterogeneousEngine {
                 b,
             )?;
         }
-        // qb up-projection (M=Q_FLAT, K=N_LORA_Q). QB_WMMA swaps the grid.z=B
-        // dp4a matvec for the int8-WMMA GEMM (matrix cores, weight read once
-        // per K-tile across the batch).
-        if std::env::var_os("QB_WMMA").is_some() {
+        // qb up-projection (M=Q_FLAT=32768, K=N_LORA_Q=1024). Default WMMA:
+        // int8-WMMA GEMM (weights read ONCE per K-tile across the batch
+        // instead of B times). Isolated A/B at B={64,256,512}: WMMA wins
+        // 2.0-2.5× vs dp4a `_warp8` at this M=32768 shape. QB_WMMA=0 rolls
+        // back to the dp4a path.
+        let use_qb_wmma = std::env::var("QB_WMMA")
+            .map(|v| v != "0").unwrap_or(true);
+        if use_qb_wmma {
             let _t = de.events.stage("k.q_chain.qb_wmma", &de.compute)?;
             de.q8_wmma.gemm(
                 &de.compute,
@@ -1187,59 +1191,48 @@ impl HeterogeneousEngine {
             // shared MLA latent row once and reuses it across the head group.
             // Score Q·Kᵀ runs as the RDNA4 f16 WMMA GEMM — measured 7.3× over
             // the f32 head-tiled variant on the depth-32k ratio=4 layer.
-            // ATTN_SCORES_F16=1 switches both kernels to store/read scores
-            // as f16 in DRAM (Phase A softmax keeps f32 math).
-            let scores_f16 = std::env::var_os("ATTN_SCORES_F16").is_some();
-            {
+            // Scores live in DRAM as f16 (the score kernel writes f16,
+            // smwsum reads f16). Halves the scores-buffer DRAM round-trip
+            // for free; Phase A softmax keeps f32 math. The bd.attn_scores
+            // scratch is half-sized accordingly — there is no production
+            // f32-scores path. ATTN_FUSED=1 takes the fused-FlashAttention
+            // single-kernel path (online softmax, no scores buffer); skips
+            // both score and smwsum below.
+            let fused = std::env::var_os("ATTN_FUSED").is_some();
+            if !fused {
                 let _t = de.events.stage("k.attn.score", &de.compute)?;
-                if scores_f16 {
-                    de.attn_mixed.launch_score_batched_htiled_wmma_f16s(
-                        &de.compute,
-                        &mut bd.attn_scores,
-                        &bd.q_normed,
-                        &ls.kv_cache,
-                        comp_kv_buf,
-                        &nrp_view,
-                        &nrop_view,
-                        &ncp_view,
-                        N_HEAD,
-                        N_HEAD_DIM,
-                        n_total_max,
-                        b,
-                    )?;
-                } else {
-                    de.attn_mixed.launch_score_batched_htiled_wmma(
-                        &de.compute,
-                        &mut bd.attn_scores,
-                        &bd.q_normed,
-                        &ls.kv_cache,
-                        comp_kv_buf,
-                        &nrp_view,
-                        &nrop_view,
-                        &ncp_view,
-                        N_HEAD,
-                        N_HEAD_DIM,
-                        n_total_max,
-                        b,
-                    )?;
-                }
+                de.attn_mixed.launch_score_batched_htiled_wmma_f16s(
+                    &de.compute,
+                    &mut bd.attn_scores,
+                    &bd.q_normed,
+                    &ls.kv_cache,
+                    comp_kv_buf,
+                    &nrp_view,
+                    &nrop_view,
+                    &ncp_view,
+                    N_HEAD,
+                    N_HEAD_DIM,
+                    n_total_max,
+                    b,
+                )?;
             }
             // Head-tiled phase 2: softmax one wave per head + WMMA Phase B
-            // W·V. Default reads V from LDS (`_ldsv`): each K-tile's 16 V
-            // rows are cooperatively staged to a 16 KB LDS tile once, then
-            // the per-warp B-fragment loads come from LDS instead of DRAM —
-            // saves ~10 ms per call at depth 32k, B=512 (smwsum 24.8 →
-            // ~15 ms). ATT trace showed the DRAM-V variant burned 82.8% of
-            // stall cycles on s_wait_loadcnt waiting for V rows.
-            // ATTN_SCORES_F16=1 / ATTN_SMWSUM_DRAM_V=1 keep prior variants
-            // reachable for kernel-level A/B.
+            // W·V via `_ldsv_f16s`. LDS-V staging cooperatively loads each
+            // K-tile's 16 V rows once (saves 82.8% of the s_wait_loadcnt
+            // stalls the DRAM-V variant ate), and f16 scores halve the
+            // Phase A score-DRAM round-trip — together −23% over `_ldsv`
+            // at depth 32k, B=256 (13.05 → 10.09 ms p50). The score writer
+            // upstream must match the chain (both are f16-only here).
             {
-                let _t = de.events.stage("k.attn.smwsum", &de.compute)?;
-                if scores_f16 {
-                    de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma_f16s(
+                let _t = de.events.stage(
+                    if fused { "k.attn.fused" } else { "k.attn.smwsum" },
+                    &de.compute,
+                )?;
+                if fused {
+                    de.attn_mixed.launch_fused_wmma(
                         &de.compute,
                         &mut bd.heads,
-                        &mut bd.attn_scores,
+                        &bd.q_normed,
                         &dlw.attn_sinks,
                         &ls.kv_cache,
                         comp_kv_buf,
@@ -1248,25 +1241,11 @@ impl HeterogeneousEngine {
                         &ncp_view,
                         N_HEAD,
                         N_HEAD_DIM,
-                        b,
-                    )?;
-                } else if std::env::var_os("ATTN_SMWSUM_DRAM_V").is_some() {
-                    de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma(
-                        &de.compute,
-                        &mut bd.heads,
-                        &mut bd.attn_scores,
-                        &dlw.attn_sinks,
-                        &ls.kv_cache,
-                        comp_kv_buf,
-                        &nrp_view,
-                        &nrop_view,
-                        &ncp_view,
-                        N_HEAD,
-                        N_HEAD_DIM,
+                        n_total_max,
                         b,
                     )?;
                 } else {
-                    de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma_ldsv(
+                    de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(
                         &de.compute,
                         &mut bd.heads,
                         &mut bd.attn_scores,
@@ -1741,6 +1720,10 @@ impl HeterogeneousEngine {
         // by expert, runs staged kernel for large chunks + chunked for small.
         // IQ2_HYBRID_THRESHOLD env: chunk-size cutoff (default 8).
         let variant = std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "staged".into());
+        // Carried out to the q2k_down dispatch below; staged/chunked path
+        // assigns it inside its else-branch, hybrid path leaves it 0 (which
+        // is fine — Q2K_VARIANT=by_expert is forbidden with hybrid below).
+        let mut n_work_items: u32 = 0;
         let threshold: u32 = std::env::var("IQ2_HYBRID_THRESHOLD")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1839,7 +1822,7 @@ impl HeterogeneousEngine {
             ie.compute.synchronize()?;
             let mut n_wi_host = [0i32; 1];
             bi.n_work_items.copy_to_host(&mut n_wi_host)?;
-            let n_work_items = n_wi_host[0] as u32;
+            n_work_items = n_wi_host[0] as u32;
             {
                 let BatchIgpuScratch {
                     d_mid_cat,
@@ -1891,19 +1874,75 @@ impl HeterogeneousEngine {
         }
         {
             let _t_q2k = ie.events.stage("igpu.q2k_down", &ie.compute)?;
-            ie.q2k.launch_batched_bxn(
-                &ie.compute,
-                &mut bi.ffn_moe,
-                &ilw.routed.down.buffer,
-                &bi.d_midq_cat,
-                &bi.d_selected,
-                dbpe,
-                mid_blocks_bytes as u32,
-                cs_n_used as u32,
-                N_EMBD,
-                crate::config::BLOCKS_Q8K_DOWN_IN,
-                b,
-            )?;
+            // Default `by_expert`: invert (B, expert) iteration so each
+            // expert's row-tile is read once instead of B*n_used times.
+            // Was: 94% DRAM-BW-bound on redundant weight reads (PMC L2 hit
+            // 4%, MemUnitBusy 99.98%). Reuses the iq2 group arrays
+            // (group_count / expert_members / work_items) built once per
+            // layer by moe_group_builder — no extra pre-pass. Writes per-
+            // (b, slot) partials, then a tiny reduce kernel sums across
+            // slots to produce out — fully deterministic (no atomicAdd).
+            // E2E: +14-23% prefill throughput at B_MAX=512 across all
+            // depths (4K..64K); ~flat at B≤64; small-batch regression for
+            // pathological B<32 prefills.
+            // Q2K_VARIANT=bxn rolls back to the original kernel.
+            // Hybrid IQ2 is incompatible (splits work_items into two
+            // buckets); error out if both are requested simultaneously.
+            let q2k_variant = std::env::var("Q2K_VARIANT")
+                .unwrap_or_else(|_| "by_expert".into());
+            let use_by_expert = q2k_variant == "by_expert";
+            if use_by_expert && variant == "hybrid" {
+                return Err(eyre!(
+                    "Q2K_VARIANT=by_expert not supported with IQ2_VARIANT=hybrid \
+                     (would need to combine staged_+chunked_work_items). \
+                     Set Q2K_VARIANT=bxn to opt out."
+                ));
+            }
+            if use_by_expert {
+                // Zero partials: unwritten (b, slot) pairs must stay 0 so
+                // the reduce-sum is correct. The by_expert kernel only writes
+                // the slots in expert_members.
+                bi.q2k_partials.fill_zero()?;
+                ie.q2k.launch_by_expert(
+                    &ie.compute,
+                    &mut bi.q2k_partials,
+                    &ilw.routed.down.buffer,
+                    &bi.d_midq_cat,
+                    &bi.group_count,
+                    &bi.expert_members,
+                    &bi.work_items,
+                    dbpe,
+                    mid_blocks_bytes as u32,
+                    cs_n_used as u32,
+                    max_per_expert,
+                    CHUNK_SIZE,
+                    N_EMBD,
+                    crate::config::BLOCKS_Q8K_DOWN_IN,
+                    n_work_items,
+                )?;
+                ie.q2k.launch_reduce_partials(
+                    &ie.compute,
+                    &mut bi.ffn_moe,
+                    &bi.q2k_partials,
+                    cs_n_used as u32,
+                    N_EMBD,
+                    b,
+                )?;
+            } else {
+                ie.q2k.launch_batched_bxn(
+                    &ie.compute,
+                    &mut bi.ffn_moe,
+                    &ilw.routed.down.buffer,
+                    &bi.d_midq_cat,
+                    &bi.d_selected,
+                    dbpe,
+                    mid_blocks_bytes as u32,
+                    cs_n_used as u32,
+                    N_EMBD,
+                    crate::config::BLOCKS_Q8K_DOWN_IN,
+                    b,
+                )?;
+            }
         }
         // Record MoE-done so the iGPU xfer can wait without a host sync.
         sev.moe_done.record(&ie.compute)?;

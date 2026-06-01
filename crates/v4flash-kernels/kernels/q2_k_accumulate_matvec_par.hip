@@ -259,3 +259,112 @@ extern "C" __global__ void q2_k_matvec_par_batched_BxN(
         out[(size_t)b * (size_t)n_rows + (size_t)row] = acc;
     }
 }
+
+// by_expert: invert the (B, expert) iteration of _batched_BxN.
+//
+// _batched_BxN has grid (n_rows/8, 1, B) and each WG loops over n_used
+// experts for ITS batch slot, re-reading each expert's row-tile bytes
+// every time. With B=512, n_used=6, ~128 distinct experts: each expert's
+// row-tile is read ~24× redundantly across the dispatch. PMC confirms:
+// L2CacheHit 4%, MemUnitBusy 99.98%, 94% of iGPU DRAM BW peak → the
+// kernel is hard BW-bound on the redundant weight reads.
+//
+// This variant uses grid (n_rows/8, n_work_items) — one WG per (8-row
+// tile, expert-chunk) — and loops over the chunk's (b, used_slot)
+// members. Each expert's row-tile is read ONCE per WG (instead of K_avg
+// times), so total weight bytes drop from B*n_used*tile to
+// distinct(E)*tile.
+//
+// Writes per-(b, used_slot) PARTIAL sums to `partials[b*n_used + s][row]`
+// — exactly one writer per slot, no atomic, deterministic. A separate
+// reduce kernel (`q2_k_reduce_partials`) sums the n_used partials per
+// (b, row) to produce `out[b][row]` matching the BXN kernel's semantics.
+//
+// `group_count` + `expert_members` + `work_items` are the same arrays
+// the iq2 by-expert / staged kernels consume, built by the upstream
+// moe_group_builder pre-pass (one builder run feeds both iq2 and q2k).
+extern "C" __global__ void q2_k_matvec_par_by_expert(
+        float          * __restrict__ partials,      // [B*n_used, n_rows]
+        const uint8_t  * __restrict__ w_base,
+        const uint8_t  * __restrict__ xq_base,       // [B, n_used*xq_slot_stride]
+        const int      * __restrict__ group_count,   // [N_EXPERT]
+        const int      * __restrict__ expert_members,// [N_EXPERT * max_per_expert]: (b<<16) | slot
+        const int      * __restrict__ work_items,    // [n_work_items]:    (e<<16) | member_start
+        unsigned int     dbpe,
+        unsigned int     xq_slot_stride,
+        unsigned int     n_used,
+        unsigned int     max_per_expert,
+        unsigned int     chunk_size,
+        unsigned int     n_rows,
+        unsigned int     n_blocks_in) {
+    const unsigned int row_in_block = threadIdx.x / 32u;
+    const unsigned int lane         = threadIdx.x & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    const unsigned int w_idx        = blockIdx.y;
+    if (row >= n_rows) return;
+
+    const int packed_item = work_items[w_idx];
+    const unsigned int e            = (unsigned int)(packed_item >> 16) & 0xffffu;
+    const unsigned int member_start = (unsigned int)(packed_item       ) & 0xffffu;
+    const int group_n = group_count[e];
+    const unsigned int member_end = min((unsigned int)group_n, member_start + chunk_size);
+    if (member_end <= member_start) return;
+
+    const unsigned int block_lane = lane >> 2u;
+    const unsigned int sub        = lane & 3u;
+
+    // Expert's row-tile bytes: read once per WG; the per-member loop below
+    // hits these same n_blocks_in × 84 bytes repeatedly so they live in L1.
+    const uint8_t* w_expert  = w_base + (uint64_t)e * (uint64_t)dbpe;
+    const uint8_t* row_base  = w_expert + (uint64_t)row * (uint64_t)n_blocks_in * BLOCK_Q2_K_BYTES;
+
+    for (unsigned int mi = member_start; mi < member_end; mi++) {
+        const int packed = expert_members[(size_t)e * (size_t)max_per_expert + (size_t)mi];
+        const unsigned int b    = (unsigned int)(packed >> 16) & 0xffffu;
+        const unsigned int slot = (unsigned int)(packed       ) & 0xffffu;
+        const uint8_t* xq_slot = xq_base
+                               + (size_t)b * (size_t)n_used * (size_t)xq_slot_stride
+                               + (size_t)slot * (size_t)xq_slot_stride;
+
+        float acc = 0.0f;
+        for (unsigned int bl = block_lane; bl < n_blocks_in; bl += 8u) {
+            const uint8_t* w_blk = row_base + (uint64_t)bl * BLOCK_Q2_K_BYTES;
+            const uint8_t* y_blk = xq_slot  + (uint64_t)bl * BLOCK_Q8_K_BYTES;
+            acc += dot_block_quarter(w_blk, y_blk, sub);
+        }
+        acc = warp_sum_f32_par(acc);
+
+        if (lane == 0) {
+            // One writer per (b, slot, row) — no atomic, no race.
+            partials[((size_t)b * (size_t)n_used + (size_t)slot) * (size_t)n_rows
+                     + (size_t)row] = acc;
+        }
+    }
+}
+
+// Sum partials across the n_used dimension, matching the BXN kernel's
+// `acc = Σ_s dot(...)` semantics exactly. Each thread = one (b, row)
+// output slot; reduces a tiny n_used (typically 6) values.
+//
+// Caller MUST pre-fill `partials` with zeros for any (b, slot) that the
+// by_expert kernel didn't touch — i.e. before launching by_expert,
+// memset partials to 0. (The by_expert kernel only writes the (b, slot)
+// pairs that actually appear in expert_members; unwritten slots must be
+// zero to leave `out` unchanged for that contribution.)
+extern "C" __global__ void q2_k_reduce_partials(
+        float       * __restrict__ out,        // [B, n_rows]
+        const float * __restrict__ partials,   // [B*n_used, n_rows]
+        unsigned int  n_used,
+        unsigned int  n_rows) {
+    const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = gridDim.x * blockDim.x;
+    const unsigned int b   = tid / n_rows;
+    const unsigned int row = tid % n_rows;
+    if (b >= (total / n_rows)) return;
+    float acc = 0.0f;
+    for (unsigned int s = 0; s < n_used; s++) {
+        acc += partials[((size_t)b * (size_t)n_used + (size_t)s) * (size_t)n_rows
+                        + (size_t)row];
+    }
+    out[(size_t)b * (size_t)n_rows + (size_t)row] = acc;
+}

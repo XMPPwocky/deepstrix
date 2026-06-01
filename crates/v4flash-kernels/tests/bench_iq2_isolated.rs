@@ -89,22 +89,31 @@ fn bench_iq2_isolated() -> eyre::Result<()> {
         total_gate_bytes / 1_000_000,
         total_up_bytes / 1_000_000
     );
+    // ATT_SKIP_FILL=1: skip the data fill_zero kernels (gate_w/up_w/xq/
+    // expert_w). The copy_from_host calls for group_count/expert_members/
+    // work_items below are HSA memcpys (not kernel dispatches), so when this
+    // flag is set the warmup iq2 call is the FIRST kernel dispatched — lets
+    // ATT capture it with `--att-consecutive-kernels 1` and no name filter
+    // (the regex filter hangs ATT on gfx1151/gfx1201 in 7.2.3).
+    let skip_fill = std::env::var_os("ATT_SKIP_FILL").is_some();
     let mut gate_w: DeviceBuffer<u8> = DeviceBuffer::new(igpu.id, total_gate_bytes)?;
     let mut up_w: DeviceBuffer<u8> = DeviceBuffer::new(igpu.id, total_up_bytes)?;
-    gate_w.fill_zero()?;
-    up_w.fill_zero()?;
+    if !skip_fill {
+        gate_w.fill_zero()?;
+        up_w.fill_zero()?;
+    }
 
     // xq: B tokens × q8_k blocks. Zero-filled.
     let xq_bytes_per_token = (BLOCKS_Q8K_GATE_IN as usize) * BLOCK_Q8_K_BYTES;
     let total_xq_bytes = xq_bytes_per_token * (b as usize);
     let mut xq: DeviceBuffer<u8> = DeviceBuffer::new(igpu.id, total_xq_bytes)?;
-    xq.fill_zero()?;
+    if !skip_fill { xq.fill_zero()?; }
 
     // expert_w, group_count, expert_members, work_items, mid.
     let cs_n_used = N_EXPERT_USED as u32;
     let mut expert_w: DeviceBuffer<f32> =
         DeviceBuffer::new(igpu.id, (b as usize) * (cs_n_used as usize))?;
-    expert_w.fill_zero()?;
+    if !skip_fill { expert_w.fill_zero()?; }
 
     let max_per_expert = b; // B_MAX in production. Synthetic just needs >= chunk_size.
     let mut group_count: DeviceBuffer<i32> = DeviceBuffer::new(igpu.id, N_EXPERT as usize)?;

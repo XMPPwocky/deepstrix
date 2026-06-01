@@ -100,15 +100,15 @@ fn bench_attention_isolated() -> eyre::Result<()> {
         dgpu.id, (n_head as usize) * (head_dim as usize))?;
     q.fill_zero()?;
 
-    // raw_kv: [n_raw_max=SWA_WINDOW=128, head_dim]
+    // raw_kv: [n_raw_max=SWA_WINDOW=128, head_dim] f16
     let n_raw_capacity: usize = 128;
-    let mut raw_kv: DeviceBuffer<f32> = DeviceBuffer::new(
+    let mut raw_kv: DeviceBuffer<u16> = DeviceBuffer::new(
         dgpu.id, n_raw_capacity * (head_dim as usize))?;
     raw_kv.fill_zero()?;
 
-    // comp_kv: [n_comp, head_dim]
-    let mut comp_kv: Option<DeviceBuffer<f32>> = if n_comp > 0 {
-        let mut b: DeviceBuffer<f32> = DeviceBuffer::new(
+    // comp_kv: [n_comp, head_dim] f16
+    let mut comp_kv: Option<DeviceBuffer<u16>> = if n_comp > 0 {
+        let mut b: DeviceBuffer<u16> = DeviceBuffer::new(
             dgpu.id, (n_comp as usize) * (head_dim as usize))?;
         b.fill_zero()?;
         Some(b)

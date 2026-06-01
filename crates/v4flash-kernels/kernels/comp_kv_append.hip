@@ -7,13 +7,14 @@
 // Single-block kernel; launch with `block.x = head_dim`.
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 extern "C" __global__ void comp_kv_append(
-        float        * __restrict__ comp_kv,    // [n_comp_max * head_dim]
-        const float  * __restrict__ row,        // [head_dim]
+        _Float16     * __restrict__ comp_kv,    // [n_comp_max * head_dim] (f16)
+        const float  * __restrict__ row,        // [head_dim]              (f32 input, cast at store)
         unsigned int   n_comp,                  // current row count
         unsigned int   head_dim) {
     const unsigned int d = threadIdx.x;
     if (d >= head_dim) return;
-    comp_kv[(unsigned long long)n_comp * head_dim + d] = row[d];
+    comp_kv[(unsigned long long)n_comp * head_dim + d] = (_Float16)row[d];
 }

@@ -3,9 +3,10 @@
 // host-side sync+copy_to_host+memmove+copy_from_host round-trip
 // (M13.3).
 //
-// Cache layout: [swa_window × head_dim] f32, row-major (one cache slot
-// per row). `n_raw_before` is the current fill count (0..swa_window
-// inclusive); on every call we either:
+// Cache layout: [swa_window × head_dim] f16, row-major (one cache slot
+// per row). `kv_new` arrives as f32 from the per-token compute path —
+// cast to f16 at store. `n_raw_before` is the current fill count
+// (0..swa_window inclusive); on every call we either:
 //   * not-full (n_raw_before < swa_window): write `kv_new` into slot
 //     `n_raw_before`. All earlier slots stay put.
 //   * full (n_raw_before == swa_window): shift slots [1, swa_window)
@@ -16,10 +17,11 @@
 // within the block. Caller must launch with block = (head_dim, 1, 1).
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 extern "C" __global__ void kv_cache_append(
-        float        * __restrict__ cache,         // [swa_window * head_dim]
-        const float  * __restrict__ kv_new,        // [head_dim]
+        _Float16     * __restrict__ cache,         // [swa_window * head_dim] (f16)
+        const float  * __restrict__ kv_new,        // [head_dim]              (f32 input, cast at store)
         unsigned int   n_raw_before,
         unsigned int   swa_window,
         unsigned int   head_dim) {
@@ -28,7 +30,7 @@ extern "C" __global__ void kv_cache_append(
 
     if (n_raw_before < swa_window) {
         // Append at slot n_raw_before. No reads, just a write.
-        cache[(unsigned long long)n_raw_before * head_dim + d] = kv_new[d];
+        cache[(unsigned long long)n_raw_before * head_dim + d] = (_Float16)kv_new[d];
         return;
     }
 
@@ -36,12 +38,12 @@ extern "C" __global__ void kv_cache_append(
     // Read s+1 into a register, syncthreads, write to s. Race-free within
     // the single block.
     for (unsigned int s = 0; s < swa_window - 1; ++s) {
-        float val = cache[(unsigned long long)(s + 1) * head_dim + d];
+        _Float16 val = cache[(unsigned long long)(s + 1) * head_dim + d];
         __syncthreads();
         cache[(unsigned long long)s * head_dim + d] = val;
         __syncthreads();
     }
-    cache[(unsigned long long)(swa_window - 1) * head_dim + d] = kv_new[d];
+    cache[(unsigned long long)(swa_window - 1) * head_dim + d] = (_Float16)kv_new[d];
 }
 
 // M50 batched: append B contiguous rows to slots
@@ -49,8 +51,8 @@ extern "C" __global__ void kv_cache_append(
 // (no eviction handling on the batched path — caller falls back to serial).
 // Grid (B, 1, 1), block (head_dim, 1, 1).
 extern "C" __global__ void kv_cache_append_batched(
-        float        * __restrict__ cache,         // [swa_window * head_dim]
-        const float  * __restrict__ kv_new,        // [B, head_dim]
+        _Float16     * __restrict__ cache,         // [swa_window * head_dim] (f16)
+        const float  * __restrict__ kv_new,        // [B, head_dim]           (f32 input)
         unsigned int   n_raw_before,
         unsigned int   head_dim) {
     const unsigned int d = threadIdx.x;
@@ -58,6 +60,6 @@ extern "C" __global__ void kv_cache_append_batched(
     if (d >= head_dim) return;
     const unsigned int slot = n_raw_before + b;
     cache[(unsigned long long)slot * head_dim + d] =
-        kv_new[(unsigned long long)b * head_dim + d];
+        (_Float16)kv_new[(unsigned long long)b * head_dim + d];
 }
 

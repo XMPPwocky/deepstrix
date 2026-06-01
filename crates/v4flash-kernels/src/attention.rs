@@ -36,22 +36,8 @@ pub const ATTN_SWA_MAX_KV: u32 = 128;
 /// still fits). Must match `#define ATTN_MIXED_MAX_KEYS` in `kernels/attention_mixed.hip`.
 pub const ATTN_MIXED_MAX_KEYS: u32 = 17664;
 
-/// LDS capacity of the monolithic `attention_mixed_batched` prefill kernel's
-/// `scores`/`weights` arrays. Must match `#define ATTN_PREFILL_LDS_MAX` in
-/// `kernels/attention_mixed.hip`. When a chunk's max `n_raw + n_comp` exceeds
-/// this, prefill dispatches to the batched split kernels (global scratch,
-/// no LDS cap) instead — both for correctness (the LDS arrays overflow past
-/// ~9K tokens) and perf (the monolithic kernel's single-thread softmax +
-/// sequential per-row reduction is the long-context bottleneck).
-pub const ATTN_PREFILL_LDS_MAX: u32 = 2304;
-
-/// Head-group size for `attention_mixed_score_batched_htiled`. Must match
-/// `#define SCORE_HEAD_TILE` in `kernels/attention_mixed.hip`. One WG covers
-/// this many heads, loading the shared KV row once and reusing it across them.
-pub const SCORE_HEAD_TILE: u32 = 8;
-
-/// Head-group size for `attention_mixed_softmax_wsum_batched_htiled`. Must
-/// match `#define SMWSUM_HEAD_TILE` in `kernels/attention_mixed.hip`.
+/// Head-group size for the head-tiled WMMA smwsum kernels. Must match
+/// `#define SMWSUM_HEAD_TILE` in `kernels/attention_mixed.hip`.
 pub const SMWSUM_HEAD_TILE: u32 = 16;
 
 pub struct AttentionSwa {
@@ -84,7 +70,7 @@ impl AttentionSwa {
         stream: &Stream,
         out: &mut DeviceBuffer<f32>,
         q: &DeviceBuffer<f32>,
-        kv: &DeviceBuffer<f32>,
+        kv: &DeviceBuffer<u16>,
         sinks: &DeviceBuffer<f32>,
         n_head: u32,
         head_dim: u32,
@@ -143,7 +129,7 @@ impl AttentionSwa {
         stream: &Stream,
         out: &mut DeviceBuffer<f32>,
         q: &DeviceBuffer<f32>,
-        kv: &DeviceBuffer<f32>,
+        kv: &DeviceBuffer<u16>,
         sinks: &DeviceBuffer<f32>,
         n_raw_per: &DeviceBuffer<i32>,
         n_raw_offset_per: &DeviceBuffer<i32>,
@@ -192,43 +178,6 @@ impl AttentionMixed {
         Ok(Self { module })
     }
 
-    /// M50 Phase 4: per-token causal mixed attention. Grid (n_head, B, 1).
-    /// `n_raw_per[B]` and `n_comp_per[B]` give each token's per-cache
-    /// causal prefixes over the SHARED raw_kv and comp_kv buffers.
-    #[allow(clippy::too_many_arguments)]
-    pub fn launch_batched(
-        &self,
-        stream: &Stream,
-        out: &mut DeviceBuffer<f32>,
-        q: &DeviceBuffer<f32>,
-        raw_kv: &DeviceBuffer<f32>,
-        comp_kv: Option<&DeviceBuffer<f32>>,
-        sinks: &DeviceBuffer<f32>,
-        n_raw_per: &DeviceBuffer<i32>,
-        n_comp_per: &DeviceBuffer<i32>,
-        n_head: u32,
-        head_dim: u32,
-        batch: u32,
-    ) -> eyre::Result<()> {
-        if batch == 0 {
-            return Ok(());
-        }
-        let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
-        let function = self.module.get_function("attention_mixed_batched")?;
-        let comp_ptr: v4flash_hip::sys::hipDeviceptr_t = match comp_kv {
-            Some(c) => c.raw(),
-            None => std::ptr::null_mut(),
-        };
-        let cfg = LaunchConfig {
-            grid: (n_head, batch, 1),
-            block: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        launch_kernel!(function, cfg, stream, [
-            out.raw(), q.raw(), raw_kv.raw(), comp_ptr, sinks.raw(),
-            n_raw_per.raw(), n_comp_per.raw(), n_head, head_dim, kq_scale
-        ])
-    }
 
     /// Split-kernel decode (perf diagnosis): phase 1 (dot-product scores).
     #[allow(clippy::too_many_arguments)]
@@ -237,8 +186,8 @@ impl AttentionMixed {
         stream: &Stream,
         scores: &mut DeviceBuffer<f32>,
         q: &DeviceBuffer<f32>,
-        raw_kv: &DeviceBuffer<f32>,
-        comp_kv: Option<&DeviceBuffer<f32>>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
         n_head: u32,
         head_dim: u32,
         n_raw: u32,
@@ -282,8 +231,8 @@ impl AttentionMixed {
         out: &mut DeviceBuffer<f32>,
         scores: &mut DeviceBuffer<f32>,
         sinks: &DeviceBuffer<f32>,
-        raw_kv: &DeviceBuffer<f32>,
-        comp_kv: Option<&DeviceBuffer<f32>>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
         n_head: u32,
         head_dim: u32,
         n_raw: u32,
@@ -303,98 +252,7 @@ impl AttentionMixed {
         ])
     }
 
-    /// Batched split-kernel PREFILL — phase 1 (scores), head-tiled. Each
-    /// token `b` uses its own causal prefix `n_raw_per[b]`/`n_comp_per[b]`
-    /// over the shared raw_kv/comp_kv with per-token starting slot
-    /// `n_raw_offset_per[b]` into the (oversized) raw cache. `scores_g` is
-    /// `[batch, n_head, max_keys]` global. `n_total_max` = max over the
-    /// chunk of `n_raw+n_comp` (grid.x extent). Each WG covers
-    /// `SCORE_HEAD_TILE` heads, loading the shared KV row once and reusing
-    /// it across them. Grid (n_total_max, ceil(n_head/SCORE_HEAD_TILE),
-    /// batch), block 32.
-    #[allow(clippy::too_many_arguments)]
-    pub fn launch_score_batched_htiled(
-        &self,
-        stream: &Stream,
-        scores_g: &mut DeviceBuffer<f32>,
-        q: &DeviceBuffer<f32>,
-        raw_kv: &DeviceBuffer<f32>,
-        comp_kv: Option<&DeviceBuffer<f32>>,
-        n_raw_per: &DeviceBuffer<i32>,
-        n_raw_offset_per: &DeviceBuffer<i32>,
-        n_comp_per: &DeviceBuffer<i32>,
-        n_head: u32,
-        head_dim: u32,
-        n_total_max: u32,
-        batch: u32,
-    ) -> eyre::Result<()> {
-        if batch == 0 || n_total_max == 0 {
-            return Ok(());
-        }
-        if n_total_max > ATTN_MIXED_MAX_KEYS {
-            return Err(eyre!(
-                "attention_mixed_score_batched_htiled: n_total_max={n_total_max} exceeds cap {ATTN_MIXED_MAX_KEYS}"
-            ));
-        }
-        let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
-        let function = self
-            .module
-            .get_function("attention_mixed_score_batched_htiled")?;
-        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
-        let n_head_groups = n_head.div_ceil(SCORE_HEAD_TILE);
-        let cfg = LaunchConfig {
-            grid: (n_total_max, n_head_groups, batch),
-            block: (32, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        launch_kernel!(function, cfg, stream, [
-            scores_g.raw(), q.raw(), raw_kv.raw(), comp_kv_ptr,
-            n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
-            n_head, head_dim, ATTN_MIXED_MAX_KEYS, kq_scale
-        ])
-    }
 
-    /// Batched split-kernel PREFILL — phase 2 (merged softmax + weighted
-    /// sum), head-tiled. Each WG covers `SMWSUM_HEAD_TILE` heads — softmax
-    /// runs one wave per head, and the wsum loads each shared V-latent
-    /// element once and reuses it across the head group. Reads/overwrites
-    /// `scores_g` from phase 1, writes `out` `[batch, n_head, head_dim]`.
-    /// Grid (ceil(n_head/SMWSUM_HEAD_TILE), batch), block 512.
-    #[allow(clippy::too_many_arguments)]
-    pub fn launch_softmax_wsum_batched_htiled(
-        &self,
-        stream: &Stream,
-        out: &mut DeviceBuffer<f32>,
-        scores_g: &mut DeviceBuffer<f32>,
-        sinks: &DeviceBuffer<f32>,
-        raw_kv: &DeviceBuffer<f32>,
-        comp_kv: Option<&DeviceBuffer<f32>>,
-        n_raw_per: &DeviceBuffer<i32>,
-        n_raw_offset_per: &DeviceBuffer<i32>,
-        n_comp_per: &DeviceBuffer<i32>,
-        n_head: u32,
-        head_dim: u32,
-        batch: u32,
-    ) -> eyre::Result<()> {
-        if batch == 0 {
-            return Ok(());
-        }
-        let function = self
-            .module
-            .get_function("attention_mixed_softmax_wsum_batched_htiled")?;
-        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
-        let n_head_groups = n_head.div_ceil(SMWSUM_HEAD_TILE);
-        let cfg = LaunchConfig {
-            grid: (n_head_groups, batch, 1),
-            block: (512, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        launch_kernel!(function, cfg, stream, [
-            out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
-            n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
-            n_head, head_dim, ATTN_MIXED_MAX_KEYS
-        ])
-    }
 
     /// WMMA variant of [`Self::launch_score_batched_htiled`]. Computes the
     /// score GEMM O[heads,keys]=Q·Kᵀ as a RDNA4 16x16x16 f16 WMMA (f32->f16 at
@@ -406,8 +264,8 @@ impl AttentionMixed {
         stream: &Stream,
         scores_g: &mut DeviceBuffer<f32>,
         q: &DeviceBuffer<f32>,
-        raw_kv: &DeviceBuffer<f32>,
-        comp_kv: Option<&DeviceBuffer<f32>>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
         n_raw_per: &DeviceBuffer<i32>,
         n_raw_offset_per: &DeviceBuffer<i32>,
         n_comp_per: &DeviceBuffer<i32>,
@@ -453,8 +311,8 @@ impl AttentionMixed {
         out: &mut DeviceBuffer<f32>,
         scores_g: &mut DeviceBuffer<f32>,
         sinks: &DeviceBuffer<f32>,
-        raw_kv: &DeviceBuffer<f32>,
-        comp_kv: Option<&DeviceBuffer<f32>>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
         n_raw_per: &DeviceBuffer<i32>,
         n_raw_offset_per: &DeviceBuffer<i32>,
         n_comp_per: &DeviceBuffer<i32>,
@@ -495,8 +353,8 @@ impl AttentionMixed {
         stream: &Stream,
         scores_g: &mut DeviceBuffer<f32>,
         q: &DeviceBuffer<f32>,
-        raw_kv: &DeviceBuffer<f32>,
-        comp_kv: Option<&DeviceBuffer<f32>>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
         n_raw_per: &DeviceBuffer<i32>,
         n_raw_offset_per: &DeviceBuffer<i32>,
         n_comp_per: &DeviceBuffer<i32>,
@@ -538,8 +396,8 @@ impl AttentionMixed {
         out: &mut DeviceBuffer<f32>,
         scores_g: &mut DeviceBuffer<f32>,
         sinks: &DeviceBuffer<f32>,
-        raw_kv: &DeviceBuffer<f32>,
-        comp_kv: Option<&DeviceBuffer<f32>>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
         n_raw_per: &DeviceBuffer<i32>,
         n_raw_offset_per: &DeviceBuffer<i32>,
         n_comp_per: &DeviceBuffer<i32>,
@@ -580,8 +438,8 @@ impl AttentionMixed {
         out: &mut DeviceBuffer<f32>,
         scores_g: &mut DeviceBuffer<f32>,
         sinks: &DeviceBuffer<f32>,
-        raw_kv: &DeviceBuffer<f32>,
-        comp_kv: Option<&DeviceBuffer<f32>>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
         n_raw_per: &DeviceBuffer<i32>,
         n_raw_offset_per: &DeviceBuffer<i32>,
         n_comp_per: &DeviceBuffer<i32>,
@@ -606,6 +464,169 @@ impl AttentionMixed {
             out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
             n_head, head_dim, ATTN_MIXED_MAX_KEYS
+        ])
+    }
+
+    /// Combined LDS-V + f16-scores smwsum. Pairs with
+    /// `launch_score_batched_htiled_wmma_f16s` (writes f16 scores). Cuts
+    /// the Phase A score-DRAM stall (~28% of stall pre-fix) by halving
+    /// scores buffer bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        // f32 buffer reinterpreted as f16 by the kernel (kernel only writes
+        // n_head × max_keys × 2 bytes; the f32 buffer is 2× oversized).
+        scores_g: &mut DeviceBuffer<f32>,
+        sinks: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
+        n_raw_per: &DeviceBuffer<i32>,
+        n_raw_offset_per: &DeviceBuffer<i32>,
+        n_comp_per: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let function = self
+            .module
+            .get_function("attention_mixed_softmax_wsum_batched_htiled_wmma_ldsv_f16s")?;
+        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
+        let n_head_groups = n_head.div_ceil(SMWSUM_HEAD_TILE);
+        let cfg = LaunchConfig {
+            grid: (n_head_groups, batch, 1),
+            block: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
+            n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
+            n_head, head_dim, ATTN_MIXED_MAX_KEYS
+        ])
+    }
+
+    /// Double-buffered LDS-V variant of the WMMA smwsum. Two ping-pong
+    /// 16 KB LDS V tiles let stage_v(tile N+1) issue DRAM loads while
+    /// WMMA(tile N) runs, halving the per-iter barrier count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_softmax_wsum_batched_htiled_wmma_ldsv_db(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        scores_g: &mut DeviceBuffer<f32>,
+        sinks: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
+        n_raw_per: &DeviceBuffer<i32>,
+        n_raw_offset_per: &DeviceBuffer<i32>,
+        n_comp_per: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let function = self
+            .module
+            .get_function("attention_mixed_softmax_wsum_batched_htiled_wmma_ldsv_db")?;
+        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
+        let n_head_groups = n_head.div_ceil(SMWSUM_HEAD_TILE);
+        let cfg = LaunchConfig {
+            grid: (n_head_groups, batch, 1),
+            block: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
+            n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
+            n_head, head_dim, ATTN_MIXED_MAX_KEYS
+        ])
+    }
+
+    /// Register-V double-buffered LDS-V smwsum variant. V lives entirely
+    /// in VGPRs (per-warp B-fragment slice loaded directly from DRAM);
+    /// only s_inv (64 B) stays in LDS. Wave-occupancy-limited at 100% vs
+    /// 75% for the LDS-V variants, and zero per-tile barriers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_softmax_wsum_batched_htiled_wmma_regv_db(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        scores_g: &mut DeviceBuffer<f32>,
+        sinks: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
+        n_raw_per: &DeviceBuffer<i32>,
+        n_raw_offset_per: &DeviceBuffer<i32>,
+        n_comp_per: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let function = self
+            .module
+            .get_function("attention_mixed_softmax_wsum_batched_htiled_wmma_regv_db")?;
+        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
+        let n_head_groups = n_head.div_ceil(SMWSUM_HEAD_TILE);
+        let cfg = LaunchConfig {
+            grid: (n_head_groups, batch, 1),
+            block: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
+            n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
+            n_head, head_dim, ATTN_MIXED_MAX_KEYS
+        ])
+    }
+
+    /// Fused FlashAttention-style WMMA kernel. Replaces (score → smwsum)
+    /// with one streaming kernel that keeps Q in LDS, stages V to LDS per
+    /// K-tile, and runs an online softmax in f32 registers — never writes
+    /// scores to DRAM. Designed to take ~6-8 ms at depth 32k vs the
+    /// current ~22 ms split chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_wmma(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        sinks: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
+        n_raw_per: &DeviceBuffer<i32>,
+        n_raw_offset_per: &DeviceBuffer<i32>,
+        n_comp_per: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        n_total_max: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
+        let function = self.module.get_function("attention_mixed_fused_wmma")?;
+        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
+        let n_head_groups = n_head.div_ceil(SMWSUM_HEAD_TILE);
+        let cfg = LaunchConfig {
+            grid: (n_head_groups, batch, 1),
+            block: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), q.raw(),
+            raw_kv.raw(), comp_kv_ptr, sinks.raw(),
+            n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
+            n_head, head_dim, n_total_max, kq_scale
         ])
     }
 }

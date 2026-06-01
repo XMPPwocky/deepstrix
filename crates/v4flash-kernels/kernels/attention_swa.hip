@@ -19,13 +19,14 @@
 //   ≈ 2 KB total
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 #define ATTN_SWA_MAX_KV 128
 
 extern "C" __global__ void attention_swa(
         float        * out,            // [n_head, head_dim]
         const float  * q,              // [n_head, head_dim] post-RoPE
-        const float  * kv,             // [n_kv, head_dim]   cached rows
+        const _Float16 * kv,           // [n_kv, head_dim]   cached rows (f16)
         const float  * sinks,          // [n_head]
         unsigned int   n_head,
         unsigned int   head_dim,
@@ -47,10 +48,10 @@ extern "C" __global__ void attention_swa(
 
     // Phase 1: per-row dot product → scores[r] = dot(qh, kv[r]) * kq_scale.
     for (unsigned int r = 0; r < n_kv; r++) {
-        const float *kv_row = kv + (unsigned long long)r * head_dim;
+        const _Float16 *kv_row = kv + (unsigned long long)r * head_dim;
         float p = 0.0f;
         for (unsigned int i = tid; i < head_dim; i += block) {
-            p += qh[i] * kv_row[i];
+            p += qh[i] * (float)kv_row[i];
         }
         partial[tid] = p;
         __syncthreads();
@@ -93,7 +94,7 @@ extern "C" __global__ void attention_swa(
     for (unsigned int d = tid; d < head_dim; d += block) {
         float sum = 0.0f;
         for (unsigned int r = 0; r < n_kv; r++) {
-            sum += weights[r] * kv[(unsigned long long)r * head_dim + d];
+            sum += weights[r] * (float)kv[(unsigned long long)r * head_dim + d];
         }
         oh[d] = sum * inv;
     }
@@ -106,7 +107,7 @@ extern "C" __global__ void attention_swa(
 extern "C" __global__ void attention_swa_batched(
         float        * out,                 // [B, n_head, head_dim]
         const float  * q,                   // [B, n_head, head_dim]
-        const float  * kv,                  // oversized: [..., head_dim] shared
+        const _Float16 * kv,                // oversized: [..., head_dim] shared (f16)
         const float  * sinks,               // [n_head]
         const int    * n_raw_per,           // [B] causal count for this token
         const int    * n_raw_offset_per,    // [B] starting slot into oversized cache
@@ -132,10 +133,10 @@ extern "C" __global__ void attention_swa_batched(
     const float sink_h = sinks[h];
 
     for (unsigned int r = 0; r < n_kv; r++) {
-        const float *kv_row = kv + (size_t)(r + raw_off) * (size_t)head_dim;
+        const _Float16 *kv_row = kv + (size_t)(r + raw_off) * (size_t)head_dim;
         float p = 0.0f;
         for (unsigned int i = tid; i < head_dim; i += block) {
-            p += qh[i] * kv_row[i];
+            p += qh[i] * (float)kv_row[i];
         }
         partial[tid] = p;
         __syncthreads();
@@ -166,7 +167,7 @@ extern "C" __global__ void attention_swa_batched(
     for (unsigned int d = tid; d < head_dim; d += block) {
         float sum = 0.0f;
         for (unsigned int r = 0; r < n_kv; r++) {
-            sum += weights[r] * kv[(size_t)(r + raw_off) * (size_t)head_dim + d];
+            sum += weights[r] * (float)kv[(size_t)(r + raw_off) * (size_t)head_dim + d];
         }
         oh[d] = sum * inv;
     }
