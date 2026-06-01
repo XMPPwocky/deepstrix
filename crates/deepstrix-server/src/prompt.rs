@@ -1,141 +1,149 @@
 //! Render OpenAI `messages[]` → V4-Flash token-id sequence.
 //!
-//! Mirrors `ChatTurnBuilder::build` (`crates/deepstrix-cli/src/bin/chat.rs:96-122`)
-//! but extends it to handle a full multi-turn history with system /
-//! user / assistant roles in any order. The tool / tool-call cases will
-//! be wired up in Phase 2; Phase 1 supports text-only conversations.
+//! Mirrors `external/ds4/ds4_server.c:render_chat_prompt_text` (1901-1978)
+//! — the canonical V4-Flash chat template used in production. Supports:
+//!   * system / user / assistant / tool roles
+//!   * tool definitions (rendered into the system prompt via DSML schema block)
+//!   * assistant history turns that contained tool calls (re-rendered as DSML)
+//!   * tool-result messages wrapped as `<tool_result>…</tool_result>` text
 //!
-//! Template (matches the on-wire chat template the model was trained on):
-//!   `<BOS>`
-//!   [system_prompt_text]      // concatenation of all role:"system" messages
-//!   For each (user, assistant) turn pair:
-//!     `<User>` user_text
-//!     `<Assistant>` `</think>` assistant_text   // </think> means no-think mode
-//!     `<EOS>`
-//!   Trailing prompt (open assistant turn for generation):
-//!     `<User>` <last_user_text>
-//!     `<Assistant>` `</think>`
+//! Template structure (after rendering):
+//!   <BOS>
+//!   [merged system prompt text]
+//!   [tool schemas block if tools provided]
+//!   For each turn in history:
+//!     For each user/tool-result message in a contiguous run:
+//!       <User> [content or <tool_result>...</tool_result>]
+//!     <Assistant> </think> [content][optional DSML tool_calls] <EOS>
+//!   Trailing open turn (after last user-like message):
+//!     <Assistant> </think>      (no-think mode default)
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::tokenizer::BpeVocab;
 
-use crate::openai::types::{ChatMessage, Role};
+use crate::dsml::{render_tool_calls_in_history, render_tools_prompt};
+use crate::openai::types::{ChatMessage, Role, ToolDef};
 use crate::tokens::{TOK_ASSISTANT, TOK_BOS, TOK_EOS, TOK_THINK_END, TOK_USER};
 
-/// Render a list of OpenAI chat messages into a token-id sequence ready
-/// for `forward_prefill_pipelined`. The result includes a trailing
-/// `<Assistant> </think>` so the model is positioned to start emitting
-/// the next assistant turn.
-///
-/// `system_prompt` is the optional content of any role:"system" message
-/// — pre-merged by the caller. We don't search for system messages
-/// in-line; OpenAI's convention is to either have one at the front, or
-/// to merge multiple as the harness sees fit.
 pub fn render_prompt(
     vocab: &BpeVocab,
     messages: &[ChatMessage],
-    system_prompt: Option<&str>,
+    tools: Option<&[ToolDef]>,
 ) -> eyre::Result<Vec<i32>> {
     if messages.is_empty() {
         return Err(eyre!("render_prompt: messages array is empty"));
     }
-    let mut out: Vec<i32> = Vec::new();
-    out.push(TOK_BOS);
-    if let Some(sys) = system_prompt {
-        if !sys.is_empty() {
-            out.extend(vocab.encode(sys));
+
+    // System block: concatenate all role:"system" messages (anywhere in
+    // the array — ds4 collects them by walking the entire list, not just
+    // the prefix). Then append the tools schema if any.
+    let mut system_text = String::new();
+    for m in messages {
+        if matches!(m.role, Role::System) {
+            if let Some(c) = m.content.as_ref() {
+                if !c.is_empty() {
+                    if !system_text.is_empty() {
+                        system_text.push_str("\n\n");
+                    }
+                    system_text.push_str(c);
+                }
+            }
+        }
+    }
+    if let Some(t) = tools {
+        if !t.is_empty() {
+            let block = render_tools_prompt(t);
+            if !block.is_empty() {
+                if !system_text.is_empty() {
+                    system_text.push_str("\n\n");
+                }
+                system_text.push_str(&block);
+            }
         }
     }
 
-    // Walk turns. We collapse adjacent same-role messages by concatenating
-    // their content with "\n" — matches typical OpenAI client behavior.
-    // Roles other than user/assistant in v1 are an error (tool roles land
-    // in Phase 2).
-    let mut i = 0;
-    while i < messages.len() {
-        let m = &messages[i];
+    let mut out: Vec<i32> = Vec::new();
+    out.push(TOK_BOS);
+    if !system_text.is_empty() {
+        out.extend(vocab.encode(&system_text));
+    }
+
+    // Walk turns, tracking lazily-opened <User> and pending <Assistant>.
+    let mut pending_assistant = false;
+    let mut user_tool_block_open = false; // we've already emitted <User> for a
+                                          // contiguous run of tool-result messages
+
+    for m in messages {
         match m.role {
-            Role::System => {
-                // System messages should have been merged into
-                // `system_prompt` by the caller. Tolerate an inline one
-                // by treating it as additional system context.
-                if !out.contains(&TOK_USER) {
-                    if let Some(c) = m.content.as_ref() {
-                        out.extend(vocab.encode(c));
-                    }
-                } else {
-                    return Err(eyre!(
-                        "render_prompt: role:\"system\" message after a user turn is not supported"
-                    ));
-                }
-                i += 1;
-            }
+            Role::System => continue,
             Role::User => {
                 out.push(TOK_USER);
                 if let Some(c) = m.content.as_ref() {
-                    out.extend(vocab.encode(c));
-                }
-                i += 1;
-
-                // If there's a following assistant message, it's a
-                // closed turn — include the assistant text with an EOS
-                // so the model treats it as history. The final user
-                // message (no following assistant) is the open prompt.
-                if i < messages.len() && messages[i].role == Role::Assistant {
-                    out.push(TOK_ASSISTANT);
-                    // </think> = no-think mode for history (we don't
-                    // know whether the historical turn was emitted in
-                    // think mode; </think> is the safer default since
-                    // it positions the model to read the content as
-                    // already-post-think).
-                    out.push(TOK_THINK_END);
-                    if let Some(c) = messages[i].content.as_ref() {
+                    if !c.is_empty() {
                         out.extend(vocab.encode(c));
                     }
-                    out.push(TOK_EOS);
-                    i += 1;
                 }
-            }
-            Role::Assistant => {
-                return Err(eyre!(
-                    "render_prompt: role:\"assistant\" message at position {i} has no preceding user message"
-                ));
+                pending_assistant = true;
+                user_tool_block_open = false;
             }
             Role::Tool => {
-                return Err(eyre!(
-                    "render_prompt: role:\"tool\" messages are not supported in Phase 1"
-                ));
+                if !user_tool_block_open {
+                    out.push(TOK_USER);
+                    user_tool_block_open = true;
+                }
+                let body = build_tool_result_text(m);
+                out.extend(vocab.encode(&body));
+                pending_assistant = true;
+            }
+            Role::Assistant => {
+                if !pending_assistant {
+                    return Err(eyre!(
+                        "render_prompt: assistant message with no prior user/tool turn"
+                    ));
+                }
+                out.push(TOK_ASSISTANT);
+                out.push(TOK_THINK_END);
+                if let Some(c) = m.content.as_ref() {
+                    if !c.is_empty() {
+                        out.extend(vocab.encode(c));
+                    }
+                }
+                if !m.tool_calls.is_empty() {
+                    let dsml = render_tool_calls_in_history(&m.tool_calls);
+                    out.extend(vocab.encode(&dsml));
+                }
+                out.push(TOK_EOS);
+                pending_assistant = false;
+                user_tool_block_open = false;
             }
         }
     }
 
-    // Open the generating assistant turn. </think> = no-think mode by
-    // default; Phase 2 may add a request-level toggle.
-    out.push(TOK_ASSISTANT);
-    out.push(TOK_THINK_END);
+    // Final open assistant turn.
+    if pending_assistant {
+        out.push(TOK_ASSISTANT);
+        out.push(TOK_THINK_END);
+    }
     Ok(out)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn vocab() -> Option<BpeVocab> {
-        // Tests that need a real vocab are #[ignore]-gated and require
-        // the GGUF file. Pure structural tests (token-id sequencing) can
-        // use a mock; for now we only test against a real vocab in the
-        // gated path.
-        None
+fn build_tool_result_text(m: &ChatMessage) -> String {
+    // ds4_server.c:1942-1945 — `<tool_result>` + DSML-text-escaped content
+    // + `</tool_result>`. No special token for `tool_result`; the model
+    // sees it as regular text.
+    let mut s = String::new();
+    s.push_str("<tool_result>");
+    if let Some(content) = m.content.as_ref() {
+        // DSML text escape (`<`, `>`, `&` → entities).
+        for ch in content.chars() {
+            match ch {
+                '&' => s.push_str("&amp;"),
+                '<' => s.push_str("&lt;"),
+                '>' => s.push_str("&gt;"),
+                other => s.push(other),
+            }
+        }
     }
-
-    #[test]
-    fn empty_messages_errors() {
-        // Doesn't need a real vocab — fails before encode.
-        let dummy = match vocab() {
-            Some(v) => v,
-            None => return, // skip without a vocab
-        };
-        let r = render_prompt(&dummy, &[], None);
-        assert!(r.is_err());
-    }
+    s.push_str("</tool_result>");
+    s
 }

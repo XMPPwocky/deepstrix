@@ -34,6 +34,10 @@ pub struct BpeVocab {
     pub eos_id: Option<i32>,
     pub unknown_id: Option<i32>,
     pub padding_id: Option<i32>,
+    /// V4-Flash DSML control token (`｜DSML｜`). Resolved at load time
+    /// via `lookup_token_id`, mirroring ds4.c:14952. None if the GGUF
+    /// is not a V4-Flash vocab.
+    pub dsml_id: Option<i32>,
 }
 
 impl BpeVocab {
@@ -81,6 +85,7 @@ impl BpeVocab {
         let eos_id = g.metadata("tokenizer.ggml.eos_token_id").and_then(|v| v.as_u32()).map(|v| v as i32);
         let unknown_id = g.metadata("tokenizer.ggml.unknown_token_id").and_then(|v| v.as_u32()).map(|v| v as i32);
         let padding_id = g.metadata("tokenizer.ggml.padding_token_id").and_then(|v| v.as_u32()).map(|v| v as i32);
+        let dsml_id = token_to_id.get("｜DSML｜".as_bytes()).copied();
 
         Ok(BpeVocab {
             tokens,
@@ -90,7 +95,15 @@ impl BpeVocab {
             eos_id,
             unknown_id,
             padding_id,
+            dsml_id,
         })
+    }
+
+    /// Look up a token id by its raw byte text. Used to resolve
+    /// special-control tokens by name at load time (mirrors ds4's
+    /// `vocab_lookup`). Returns None if the token is not in the vocab.
+    pub fn lookup_token_id(&self, name: &str) -> Option<i32> {
+        self.token_to_id.get(name.as_bytes()).copied()
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -501,6 +514,7 @@ mod tests {
         let vocab = BpeVocab {
             tokens, token_to_id, merge_rank,
             bos_id: None, eos_id: None, unknown_id: None, padding_id: None,
+            dsml_id: None,
         };
         let mut out = Vec::new();
         vocab.bpe_emit_piece(b"abc", &mut out);

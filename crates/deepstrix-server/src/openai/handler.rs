@@ -1,48 +1,58 @@
-//! `/v1/chat/completions` handler — non-streaming Phase 1 path.
+//! `/v1/chat/completions` handler.
+//!
+//! Two response paths:
+//!   * `stream:false` (default) → JSON `chat.completion` after the model
+//!     finishes. Accumulates worker events; runs them through the DSML
+//!     scanner; assembles tool_calls + text into the `Choice::message`.
+//!   * `stream:true` → SSE stream of `chat.completion.chunk` events,
+//!     emitting text deltas as they arrive and synthesizing
+//!     `delta.tool_calls` events for each DSML invoke block.
+
+use std::convert::Infallible;
+use std::time::Duration;
 
 use axum::extract::State;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures_util::stream::poll_fn;
 
-use crate::engine_worker::{EngineHandle, GenerateReq};
+use crate::dsml::{DsmlEvent, DsmlScanner};
+use crate::engine_worker::{accumulate, EngineHandle, FinishReason, GenerateReq, WorkerEvent};
 use crate::openai::error::ApiError;
+use crate::openai::sse::{
+    encode_chunk, role_delta, text_delta, tool_call_args_delta, tool_call_start_delta,
+    ChunkDelta,
+};
 use crate::openai::types::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, Role, Usage,
+    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, Role, ToolCall,
+    ToolCallFunction, Usage,
 };
 use crate::prompt::render_prompt;
 
-/// Default sampler parameters when the request omits them. Matches the
-/// DeepSeek V4-Flash recommended recipe (`temperature=1.0`, `top_p=1.0`).
 const DEFAULT_TEMPERATURE: f32 = 1.0;
 const DEFAULT_MIN_P_REL: f32 = 0.0;
-/// Default max tokens per request. Letta typically overrides this. Cap
-/// chosen to avoid runaway generation if the client forgets to set it.
 const DEFAULT_MAX_NEW: usize = 2048;
 
 pub async fn chat_completions(
     State(engine): State<EngineHandle>,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<Json<ChatCompletionResponse>, ApiError> {
-    if req.stream.unwrap_or(false) {
-        return Err(ApiError::BadRequest(
-            "streaming responses are not supported in Phase 1; omit stream:true".into(),
-        ));
-    }
-    if req.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false) {
-        return Err(ApiError::BadRequest(
-            "tool definitions are not supported in Phase 1; omit tools".into(),
-        ));
-    }
+) -> Result<Response, ApiError> {
+    let stream = req.stream.unwrap_or(false);
 
-    // Extract a merged system prompt from any leading role:"system"
-    // messages, and the remaining (user/assistant) tail.
-    let (system_prompt, body) = split_system(req.messages);
-
-    let tokens = render_prompt(&engine.vocab, &body, system_prompt.as_deref())
-        .map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
+    let tokens = render_prompt(
+        &engine.vocab,
+        &req.messages,
+        req.tools.as_deref(),
+    )
+    .map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
     let prompt_tokens_count = tokens.len() as u32;
 
     let temperature = req.temperature.unwrap_or(DEFAULT_TEMPERATURE);
-    let max_new = req.max_tokens.map(|m| m as usize).unwrap_or(DEFAULT_MAX_NEW);
+    let max_new = req
+        .max_tokens
+        .map(|m| m as usize)
+        .unwrap_or(DEFAULT_MAX_NEW);
     let seed = req.seed.unwrap_or_else(default_seed);
 
     let gen_req = GenerateReq {
@@ -53,56 +63,220 @@ pub async fn chat_completions(
         seed,
     };
 
-    let result = engine.generate(gen_req).await.map_err(ApiError::from)?;
+    let id = format!("chatcmpl-{}", uuid::Uuid::now_v7().simple());
+    let model = engine.model_name.as_str().to_string();
 
-    let id = format!("chatcmpl-{}", uuid_like(seed));
-    let resp = ChatCompletionResponse {
+    let rx = engine.submit(gen_req).map_err(ApiError::from)?;
+
+    if stream {
+        // Spawn a task that drives the worker stream and pushes SSE
+        // events into a channel. The HTTP response wraps the channel
+        // as a Stream via futures_util::poll_fn.
+        let (tx, mut sse_rx) =
+            tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+        tokio::spawn(drive_sse_stream(id.clone(), model.clone(), rx, tx));
+        let stream = poll_fn::<Result<Event, Infallible>, _>(move |cx| sse_rx.poll_recv(cx));
+        Ok(Sse::new(stream)
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+            .into_response())
+    } else {
+        let result = accumulate(rx).await.map_err(ApiError::from)?;
+        let _ = prompt_tokens_count; // re-counted below from result
+        let blocking = build_blocking_response(
+            id,
+            model,
+            result.text,
+            prompt_tokens_count,
+            result.completion_tokens,
+            result.finish_reason,
+        );
+        Ok(Json(blocking).into_response())
+    }
+}
+
+fn build_blocking_response(
+    id: String,
+    model: String,
+    raw_text: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    finish: FinishReason,
+) -> ChatCompletionResponse {
+    // Pass the full text through the scanner to separate tool calls
+    // from plain text.
+    let mut scanner = DsmlScanner::new();
+    let mut events = scanner.push_text(&raw_text);
+    events.extend(scanner.finish());
+
+    let mut content_text = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut saw_tool = false;
+    for ev in events {
+        match ev {
+            DsmlEvent::Text(s) => content_text.push_str(&s),
+            DsmlEvent::ToolCall {
+                id, name, arguments, ..
+            } => {
+                tool_calls.push(ToolCall {
+                    id,
+                    kind: "function".into(),
+                    function: ToolCallFunction { name, arguments },
+                });
+                saw_tool = true;
+            }
+            DsmlEvent::ToolCallsEnd => saw_tool = true,
+        }
+    }
+
+    let finish_reason = if saw_tool {
+        "tool_calls"
+    } else {
+        finish.as_openai()
+    };
+
+    ChatCompletionResponse {
         id,
         object: "chat.completion",
         created: unix_now(),
-        model: engine.model_name.as_str().to_string(),
+        model,
         choices: vec![Choice {
             index: 0,
             message: ChatMessage {
                 role: Role::Assistant,
-                content: Some(result.text),
-                tool_calls: Vec::new(),
+                content: if content_text.is_empty() {
+                    None
+                } else {
+                    Some(content_text)
+                },
+                tool_calls,
                 tool_call_id: None,
                 name: None,
             },
-            finish_reason: result.finish_reason.as_openai(),
+            finish_reason,
         }],
         usage: Usage {
-            prompt_tokens: prompt_tokens_count,
-            completion_tokens: result.completion_tokens,
-            total_tokens: prompt_tokens_count + result.completion_tokens,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
         },
-    };
-    Ok(Json(resp))
+    }
 }
 
-fn split_system(messages: Vec<ChatMessage>) -> (Option<String>, Vec<ChatMessage>) {
-    let mut system_chunks: Vec<String> = Vec::new();
-    let mut body: Vec<ChatMessage> = Vec::with_capacity(messages.len());
-    let mut seen_non_system = false;
-    for m in messages {
-        if matches!(m.role, Role::System) && !seen_non_system {
-            if let Some(c) = m.content {
-                if !c.is_empty() {
-                    system_chunks.push(c);
+/// Drives the SSE stream forward: pulls `WorkerEvent`s, runs them
+/// through the DSML scanner, and pushes encoded `Event`s into `out`.
+async fn drive_sse_stream(
+    id: String,
+    model: String,
+    mut rx: tokio::sync::mpsc::Receiver<WorkerEvent>,
+    out: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+) {
+    let created = unix_now();
+    let send = |delta: ChunkDelta,
+                finish_reason: Option<&'static str>|
+     -> Result<Event, Infallible> {
+        let s = encode_chunk(&id, &model, created, delta, finish_reason);
+        // axum's Event::data adds back the "data: " + "\n\n" framing.
+        let payload = s
+            .trim_start_matches("data: ")
+            .trim_end_matches("\n\n")
+            .to_string();
+        Ok(Event::default().data(payload))
+    };
+
+    if out.send(send(role_delta(), None)).await.is_err() {
+        return;
+    }
+
+    let mut scanner = DsmlScanner::new();
+    let mut sent_tool_index: u32 = 0;
+    let mut saw_tool = false;
+    let mut finish_reason: &'static str = "stop";
+
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            WorkerEvent::Chunk(s) => {
+                let events = scanner.push_text(&s);
+                for de in events {
+                    match de {
+                        DsmlEvent::Text(t) => {
+                            if !t.is_empty()
+                                && out.send(send(text_delta(t), None)).await.is_err()
+                            {
+                                return;
+                            }
+                        }
+                        DsmlEvent::ToolCall {
+                            id: tid,
+                            name,
+                            arguments,
+                            ..
+                        } => {
+                            saw_tool = true;
+                            let tc = ToolCall {
+                                id: tid,
+                                kind: "function".into(),
+                                function: ToolCallFunction { name, arguments },
+                            };
+                            if out
+                                .send(send(
+                                    tool_call_start_delta(&tc, sent_tool_index),
+                                    None,
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if out
+                                .send(send(
+                                    tool_call_args_delta(&tc, sent_tool_index),
+                                    None,
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            sent_tool_index += 1;
+                        }
+                        DsmlEvent::ToolCallsEnd => {
+                            saw_tool = true;
+                        }
+                    }
                 }
             }
-        } else {
-            seen_non_system = true;
-            body.push(m);
+            WorkerEvent::Done { finish, .. } => {
+                let tail = scanner.finish();
+                for de in tail {
+                    if let DsmlEvent::Text(t) = de {
+                        if !t.is_empty()
+                            && out.send(send(text_delta(t), None)).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                finish_reason = if saw_tool {
+                    "tool_calls"
+                } else {
+                    finish.as_openai()
+                };
+            }
+            WorkerEvent::Error(e) => {
+                tracing::error!(error=%e, "engine error during stream");
+                finish_reason = "error";
+            }
         }
     }
-    let merged = if system_chunks.is_empty() {
-        None
-    } else {
-        Some(system_chunks.join("\n\n"))
-    };
-    (merged, body)
+
+    // Final terminating chunk with finish_reason.
+    let _ = out
+        .send(send(ChunkDelta::default(), Some(finish_reason)))
+        .await;
+    // [DONE] sentinel.
+    let _ = out
+        .send(Ok(Event::default().data("[DONE]".to_string())))
+        .await;
 }
 
 fn unix_now() -> u64 {
@@ -113,17 +287,9 @@ fn unix_now() -> u64 {
 }
 
 fn default_seed() -> u64 {
-    // Per-request derived from wall clock — deterministic per request,
-    // not deterministic across requests. Clients that want repro pass
-    // the `seed` field explicitly.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0xD5C0DE);
     nanos ^ 0xD5C0DE
-}
-
-fn uuid_like(seed: u64) -> String {
-    // Cheap pseudo-uuid from the seed; Phase 2 swaps to uuid::Uuid::now_v7.
-    format!("{:016x}", seed)
 }

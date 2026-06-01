@@ -19,11 +19,16 @@ clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-# Approved deps (workspace Cargo.toml). blake3/uuid wired in by their
-# respective phases (4 / 2).
+# Approved deps (workspace Cargo.toml). blake3 lands in Phase 4.
 tokio = { workspace = true }
 axum = { workspace = true }
+uuid = { workspace = true }
+futures-util = { workspace = true }
 
 [[bin]]
 name = "deepstrix-server"
 path = "src/main.rs"
+
+[[bin]]
+name = "deepstrix-tok-dump"
+path = "src/bin/tok-dump.rs"

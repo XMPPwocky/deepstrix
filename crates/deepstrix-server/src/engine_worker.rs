@@ -1,16 +1,10 @@
 //! Single OS-thread worker that owns the V4-Flash inference engine and
-//! per-session state. HTTP handlers communicate with it through a
-//! tokio mpsc channel; the worker uses `blocking_recv` to drain it.
+//! per-session state.
 //!
-//! Why an OS thread (not `tokio::task::spawn_blocking`): HIP keeps a
-//! per-thread current-device context. The engine's `set_current_cached`
-//! caches that. A dedicated worker thread keeps the binding stable
-//! across the whole process lifetime — there's no thread-pool churn
-//! that would invalidate the cache.
-//!
-//! Phase 1 scope: handle `GenerateBlocking` only. Each request
-//! re-allocates `HetModelState` from scratch — no cross-request KV
-//! reuse. Phases 3+4 add reset-in-place + on-disk snapshots.
+//! Phase 2 model: the worker emits a `WorkerEvent` stream per request.
+//! Both streaming and non-streaming HTTP handlers consume the same
+//! event stream — the non-streaming handler just accumulates events
+//! into a single response before returning.
 
 use std::sync::Arc;
 
@@ -40,15 +34,7 @@ pub struct GenerateReq {
     pub seed: u64,
 }
 
-/// Per-request output.
-#[derive(Debug, Clone)]
-pub struct GenerateResult {
-    pub text: String,
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub finish_reason: FinishReason,
-}
-
+/// Generation outcome — sent as the final `WorkerEvent::Done`.
 #[derive(Debug, Clone, Copy)]
 pub enum FinishReason {
     Stop,
@@ -64,15 +50,32 @@ impl FinishReason {
     }
 }
 
-/// Messages sent from HTTP handlers to the worker.
+/// Events emitted by the worker during a generation.
+#[derive(Debug)]
+pub enum WorkerEvent {
+    /// One token's decoded bytes (or empty if the token was a structural
+    /// marker we suppressed). The caller (handler) feeds these into a
+    /// DSML scanner to recover tool-call structure.
+    Chunk(String),
+    /// Generation finished.
+    Done {
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        finish: FinishReason,
+    },
+    /// Fatal error mid-generation.
+    Error(String),
+}
+
 pub enum EngineRequest {
+    /// Stream of generation events. `tx` is closed by the worker on
+    /// completion (Done) or error (Error).
     Generate {
         req: GenerateReq,
-        resp: oneshot::Sender<eyre::Result<GenerateResult>>,
+        tx: mpsc::Sender<WorkerEvent>,
     },
 }
 
-/// Cheaply-cloneable handle held by axum state.
 #[derive(Clone)]
 pub struct EngineHandle {
     tx: mpsc::UnboundedSender<EngineRequest>,
@@ -81,14 +84,16 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    pub async fn generate(&self, req: GenerateReq) -> eyre::Result<GenerateResult> {
-        let (resp_tx, resp_rx) = oneshot::channel();
+    /// Submit a generation request. Returns a stream of `WorkerEvent`s.
+    pub fn submit(
+        &self,
+        req: GenerateReq,
+    ) -> eyre::Result<mpsc::Receiver<WorkerEvent>> {
+        let (tx, rx) = mpsc::channel(64);
         self.tx
-            .send(EngineRequest::Generate { req, resp: resp_tx })
+            .send(EngineRequest::Generate { req, tx })
             .map_err(|_| eyre!("engine worker channel closed"))?;
-        resp_rx
-            .await
-            .map_err(|_| eyre!("engine worker dropped response sender"))?
+        Ok(rx)
     }
 }
 
@@ -99,12 +104,10 @@ pub struct WorkerConfig {
     pub model_name: String,
 }
 
-/// Spawn the engine worker thread. Blocks the caller until the model
-/// is loaded so the server doesn't start accepting requests before it
-/// can answer them.
 pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
     let (tx, rx) = mpsc::unbounded_channel::<EngineRequest>();
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<eyre::Result<(Arc<BpeVocab>, Arc<String>)>>(1);
+    let (ready_tx, ready_rx) =
+        std::sync::mpsc::sync_channel::<eyre::Result<(Arc<BpeVocab>, Arc<String>)>>(1);
 
     std::thread::Builder::new()
         .name("deepstrix-engine".into())
@@ -140,8 +143,6 @@ fn worker_main(
     worker_loop(state, &mut rx);
 }
 
-/// All resources the worker holds across requests. `state` is wiped
-/// before each request in Phase 1 (re-allocated). Phases 3+4 reuse.
 pub struct WorkerState {
     pub dgpu: Device,
     pub igpu: Device,
@@ -184,6 +185,11 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     tracing::info!(gguf = %cfg.gguf_path, "loading GGUF");
     let gguf = MappedGguf::open(&cfg.gguf_path)?;
     let vocab = BpeVocab::from_gguf(gguf.gguf())?;
+    tracing::info!(
+        vocab_size = vocab.vocab_size(),
+        dsml_id = ?vocab.dsml_id,
+        "vocab loaded"
+    );
 
     let dgpu = pick_dgpu()?;
     let igpu = pick_igpu()?;
@@ -242,18 +248,23 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
 fn worker_loop(mut state: WorkerState, rx: &mut mpsc::UnboundedReceiver<EngineRequest>) {
     while let Some(msg) = rx.blocking_recv() {
         match msg {
-            EngineRequest::Generate { req, resp } => {
-                let result = handle_generate(&mut state, req);
-                let _ = resp.send(result);
+            EngineRequest::Generate { req, tx } => {
+                if let Err(e) = handle_generate_stream(&mut state, req, &tx) {
+                    let _ = tx.blocking_send(WorkerEvent::Error(format!("{e:#}")));
+                }
+                // tx is dropped here, signaling end of stream.
             }
         }
     }
     tracing::info!("engine worker channel closed; shutting down");
-    // Drain device queues so HIP teardown doesn't busy-spin.
     let _ = state.engine.shutdown();
 }
 
-fn handle_generate(state: &mut WorkerState, req: GenerateReq) -> eyre::Result<GenerateResult> {
+fn handle_generate_stream(
+    state: &mut WorkerState,
+    req: GenerateReq,
+    tx: &mpsc::Sender<WorkerEvent>,
+) -> eyre::Result<()> {
     if req.tokens.is_empty() {
         return Err(eyre!("generate: empty tokens"));
     }
@@ -265,11 +276,9 @@ fn handle_generate(state: &mut WorkerState, req: GenerateReq) -> eyre::Result<Ge
         ));
     }
 
-    // Phase 1: re-allocate HetModelState to wipe per-request. ~50KB of
-    // pinned compressor-init writes; cheap relative to the prefill.
+    // Phase 1+2: re-allocate per request. Phase 3 introduces reset_in_place.
     state.state = HetModelState::alloc(state.dgpu, state.igpu, state.n_kv_max)?;
 
-    // Build per-token input HCs for prefill.
     let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(req.tokens.len());
     for &tok in &req.tokens {
         let mut v = vec![0f32; HC_DIM as usize];
@@ -278,7 +287,7 @@ fn handle_generate(state: &mut WorkerState, req: GenerateReq) -> eyre::Result<Ge
     }
 
     let prompt_tokens = req.tokens.len() as u32;
-    let _last_logits = state.engine.forward_prefill_pipelined(
+    let _ = state.engine.forward_prefill_pipelined(
         &mut state.bd_a,
         &mut state.bi_a,
         &mut state.bd_b,
@@ -289,12 +298,11 @@ fn handle_generate(state: &mut WorkerState, req: GenerateReq) -> eyre::Result<Ge
         &input_hcs,
         &req.tokens,
         0u32,
-        true, // last_only
-        None, // stats
+        true,
+        None,
     )?;
     let mut pos = prompt_tokens;
 
-    // Sample first output token from the logits the prefill left on dGPU.
     let sample_mode = if req.temperature <= 0.0 {
         SampleMode::Argmax
     } else {
@@ -309,28 +317,27 @@ fn handle_generate(state: &mut WorkerState, req: GenerateReq) -> eyre::Result<Ge
         .sample_next(&mut state.dgpu_scratch, sample_mode, rng.next_f32())?;
     let mut completion_tokens: u32 = 1;
 
-    let mut decoded_bytes: Vec<u8> = Vec::new();
     let mut residual = vec![0f32; HC_DIM as usize];
     let max_new = req.max_new as u32;
     let finish: FinishReason = loop {
-        // Stop: any role-boundary token ends the turn (incl. hallucinated USER/ASSISTANT).
         if is_turn_end(next) {
             break FinishReason::Stop;
         }
-
-        // Render this token (skip structural <think>/</think>).
         if !is_think_marker(next) {
             if let Some(bytes) = state.vocab.token_text(next) {
                 let raw = gpt2_decode_token(bytes, &state.byte_decoder);
-                decoded_bytes.extend(raw);
+                if !raw.is_empty() {
+                    let s = String::from_utf8_lossy(&raw).into_owned();
+                    if tx.blocking_send(WorkerEvent::Chunk(s)).is_err() {
+                        // Receiver dropped (client disconnected, e.g.).
+                        return Ok(());
+                    }
+                }
             }
         }
-
         if completion_tokens >= max_new {
             break FinishReason::Length;
         }
-
-        // Forward this token into KV cache, then sample the next one.
         if (next as u32) >= N_VOCAB {
             return Err(eyre!("generate: sampled token id {next} out of vocab"));
         }
@@ -354,16 +361,55 @@ fn handle_generate(state: &mut WorkerState, req: GenerateReq) -> eyre::Result<Ge
         completion_tokens += 1;
     };
 
-    let text = String::from_utf8_lossy(&decoded_bytes).into_owned();
-    Ok(GenerateResult {
-        text,
+    let _ = tx.blocking_send(WorkerEvent::Done {
         prompt_tokens,
         completion_tokens,
-        finish_reason: finish,
+        finish,
+    });
+    Ok(())
+}
+
+/// Convenience helper used by oneshot helpers (kept for backwards
+/// compat with the Phase 1 handler; will be removed once everything
+/// goes through the stream interface).
+#[derive(Debug, Clone)]
+pub struct GenerateResult {
+    pub text: String,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub finish_reason: FinishReason,
+}
+
+/// Drain a `submit` stream into a single accumulated result.
+pub async fn accumulate(
+    mut rx: mpsc::Receiver<WorkerEvent>,
+) -> eyre::Result<GenerateResult> {
+    let mut text = String::new();
+    let mut last: Option<(u32, u32, FinishReason)> = None;
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            WorkerEvent::Chunk(s) => text.push_str(&s),
+            WorkerEvent::Done {
+                prompt_tokens,
+                completion_tokens,
+                finish,
+            } => {
+                last = Some((prompt_tokens, completion_tokens, finish));
+            }
+            WorkerEvent::Error(e) => return Err(eyre!("engine error: {e}")),
+        }
+    }
+    let (p, c, f) = last.ok_or_else(|| eyre!("worker closed without Done"))?;
+    Ok(GenerateResult {
+        text,
+        prompt_tokens: p,
+        completion_tokens: c,
+        finish_reason: f,
     })
 }
 
-// Layer-ratio guard: ensure COMPRESS_RATIOS is exposed at compile time.
+// Compile-time sanity check.
 const _: () = {
     let _ = COMPRESS_RATIOS;
+    let _: oneshot::Sender<()>;
 };

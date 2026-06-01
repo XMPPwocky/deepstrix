@@ -2,6 +2,7 @@
 //! heterogeneous inference engine. See `/home/claude-code/.claude/plans/
 //! shimmering-wandering-blanket.md` for the full phased design.
 
+pub mod dsml;
 pub mod embed;
 pub mod engine_worker;
 pub mod openai;
