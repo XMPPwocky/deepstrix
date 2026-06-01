@@ -13,19 +13,28 @@
 //! Env overrides:
 //!   CHAT_KV_MAX   total KV slots to allocate up front (default 8192)
 //!   CHAT_MAX_NEW  cap on tokens per assistant turn  (default 1024)
+//!   CHAT_SYSTEM   system prompt prepended after BOS on the first turn
+//!   CHAT_NOCOLOR  set to disable grey-on-think ANSI coloring
 //!
 //! REPL commands:
 //!   /think    enable chain-of-thought for subsequent turns
 //!   /nothink  disable (default)
+//!   /thinkmax enable "absolute max" reasoning preamble (≥384K ctx only;
+//!             matches ds4_server.c DS4_THINK_MAX behavior)
+//!   /load <path>  substitute file contents as one user turn
 //!   /quit     exit
 //!   (EOF)     exit
 //!
-//! Template applied per user turn (matches V4-Flash GGUF chat_template):
-//!   (first turn only) <BOS>
+//! Template applied per user turn (matches ds4_server.c render_chat_prompt_text
+//! at the token-ID level — encoder doesn't recognize special-token text):
+//!   (first turn only) <BOS> [think-max preamble if /thinkmax] [CHAT_SYSTEM content]
 //!   <｜User｜>{user_msg}<｜Assistant｜>{<think> if thinking else </think>}
 //!   …model output… <EOS>
-//! Picking `</think>` skips reasoning; `<think>` opens a reasoning block
-//! that the model itself closes with `</think>` before answering.
+//! The model emits `</think>` itself at end-of-reasoning, then its answer.
+//! Some V4-Flash training distributions also emit a trailing `</think>`
+//! near end-of-turn; the token printer below suppresses display of all
+//! `<think>` / `</think>` tokens regardless of position (matches ds4_cli.c
+//! token_printer_process behavior) and only renders content tokens.
 
 use std::io::{BufRead, Write};
 
@@ -46,6 +55,154 @@ const TOK_USER: i32 = 128803;        // <｜User｜>
 const TOK_ASSISTANT: i32 = 128804;   // <｜Assistant｜>
 const TOK_THINK_BEGIN: i32 = 128821; // <think>
 const TOK_THINK_END: i32 = 128822;   // </think>
+
+/// DS4 "absolute maximum reasoning" preamble. Per ds4.c (DS4_REASONING_EFFORT_MAX_PREFIX).
+/// Used at /thinkmax. Only safe at ≥384K ctx — preamble is large.
+const REASONING_MAX_PREFIX: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n\
+You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n\
+Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThinkMode { Off, On, Max }
+
+impl ThinkMode {
+    fn is_on(self) -> bool { !matches!(self, ThinkMode::Off) }
+    fn prefill_tok(self) -> i32 {
+        // ds4_server.c:1972: open the generating assistant turn with
+        // <think> if think-on (any flavor), else </think>.
+        if self.is_on() { TOK_THINK_BEGIN } else { TOK_THINK_END }
+    }
+}
+
+/// Per-turn token-list builder. Matches the incremental path of
+/// `render_chat_prompt_text` in ds4_server.c — emits BOS + system on the
+/// first turn, then just [User|content|Assistant|think-open] each turn.
+/// Assumes the assistant's previous EOS is already in KV from the last
+/// decode loop (we forward EOS into KV on hit_eos — see decode loop).
+struct ChatTurnBuilder {
+    is_first_turn: bool,
+    system_prompt: Option<String>,
+}
+
+impl ChatTurnBuilder {
+    fn build(&mut self, vocab: &BpeVocab, user_msg: &str, think: ThinkMode) -> Vec<i32> {
+        let mut out = Vec::new();
+        if self.is_first_turn {
+            out.push(TOK_BOS);
+            if think == ThinkMode::Max {
+                out.extend(vocab.encode(REASONING_MAX_PREFIX));
+            }
+            if let Some(sys) = &self.system_prompt {
+                if !sys.is_empty() {
+                    out.extend(vocab.encode(sys));
+                }
+            }
+            self.is_first_turn = false;
+        }
+        out.push(TOK_USER);
+        out.extend(vocab.encode(user_msg));
+        out.push(TOK_ASSISTANT);
+        out.push(think.prefill_tok());
+        out
+    }
+}
+
+/// Streaming token printer with V4-Flash special-token handling. Suppresses
+/// `<think>` / `</think>` from display (they're structural markers, not
+/// content), greys content emitted between an unmatched `<think>` and its
+/// `</think>` if `format_thinking` is on, and signals turn-end when the
+/// model emits any of the role-boundary tokens. Token-ID level — no need
+/// for ds4_cli.c's byte-state-machine because each special token is one
+/// token in our vocab.
+struct ChatTokenPrinter {
+    format_thinking: bool,
+    use_color: bool,
+    in_think: bool,
+    color_open: bool,
+    last_was_newline: bool,
+}
+
+impl ChatTokenPrinter {
+    fn new(format_thinking: bool, use_color: bool, start_in_think: bool) -> Self {
+        Self {
+            format_thinking, use_color,
+            in_think: start_in_think,
+            color_open: false,
+            last_was_newline: false,
+        }
+    }
+
+    /// Returns `true` when caller should treat this token as end-of-turn
+    /// (EOS, or a hallucinated role marker mid-decode).
+    fn push_token<W: Write>(
+        &mut self, w: &mut W, token: i32, text: Option<&[u8]>,
+    ) -> std::io::Result<bool> {
+        // Hard turn-end markers.
+        if token == TOK_EOS {
+            self.reset_color(w)?;
+            return Ok(true);
+        }
+        // Hallucinated next-turn markers — treat as turn-end (model is
+        // pretending to start a new turn). Don't display.
+        if token == TOK_USER || token == TOK_ASSISTANT || token == TOK_BOS {
+            self.reset_color(w)?;
+            return Ok(true);
+        }
+        // Structural — suppress display, toggle think-mode rendering state.
+        if token == TOK_THINK_BEGIN {
+            self.in_think = true;
+            self.set_grey(w)?;
+            return Ok(false);
+        }
+        if token == TOK_THINK_END {
+            self.in_think = false;
+            self.reset_color(w)?;
+            // Insert a separating newline once thinking ends.
+            if !self.last_was_newline {
+                w.write_all(b"\n")?;
+                self.last_was_newline = true;
+                w.flush()?;
+            }
+            return Ok(false);
+        }
+        // Content token: render it.
+        if let Some(bytes) = text {
+            if !bytes.is_empty() {
+                if self.in_think { self.set_grey(w)?; }
+                w.write_all(bytes)?;
+                self.last_was_newline = bytes.last() == Some(&b'\n');
+                w.flush()?;
+            }
+        }
+        Ok(false)
+    }
+
+    fn set_grey<W: Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        if self.use_color && self.format_thinking && !self.color_open {
+            w.write_all(b"\x1b[90m")?;
+            self.color_open = true;
+        }
+        Ok(())
+    }
+
+    fn reset_color<W: Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        if self.color_open {
+            w.write_all(b"\x1b[0m")?;
+            self.color_open = false;
+        }
+        Ok(())
+    }
+
+    fn finish<W: Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.reset_color(w)?;
+        if !self.last_was_newline {
+            w.write_all(b"\n")?;
+            self.last_was_newline = true;
+        }
+        w.flush()?;
+        Ok(())
+    }
+}
 
 // V4-Flash RoPE constants (from GGUF metadata + ds4.c).
 const ROPE_FREQ_BASE_DENSE: f32 = 10000.0;
@@ -243,10 +400,15 @@ fn main() -> eyre::Result<()> {
     let mut stdin = stdin.lock();
     let mut line = String::new();
     let mut pos: u32 = 0;
-    let mut is_first_turn = true;
-    let mut think_mode = false;
+    let mut think_mode = ThinkMode::Off;
 
-    eprintln!("ready. type a message and hit enter. /think, /nothink, /quit.");
+    let use_color = std::env::var_os("CHAT_NOCOLOR").is_none();
+    let mut builder = ChatTurnBuilder {
+        is_first_turn: true,
+        system_prompt: std::env::var("CHAT_SYSTEM").ok(),
+    };
+
+    eprintln!("ready. /think, /nothink, /thinkmax, /load <file>, /quit.");
     loop {
         print!("\n\x1b[1mUser:\x1b[0m ");
         std::io::stdout().flush().ok();
@@ -267,13 +429,26 @@ fn main() -> eyre::Result<()> {
         let effective_msg: &str = match trimmed {
             "/quit" => break,
             "/think" => {
-                think_mode = true;
-                eprintln!("[think mode ON]");
+                think_mode = ThinkMode::On;
+                eprintln!("[think mode: on]");
                 continue;
             }
             "/nothink" => {
-                think_mode = false;
-                eprintln!("[think mode OFF]");
+                think_mode = ThinkMode::Off;
+                eprintln!("[think mode: off]");
+                continue;
+            }
+            "/thinkmax" => {
+                if builder.is_first_turn {
+                    think_mode = ThinkMode::Max;
+                    eprintln!("[think mode: MAX (reasoning preamble will be injected on first turn — \
+                               needs ≥384K ctx per ds4 convention; CHAT_KV_MAX={n_kv_max})]");
+                } else {
+                    // Per ds4: max-prefix is part of the system block which we
+                    // already passed. Downgrading to on prevents silent no-op.
+                    think_mode = ThinkMode::On;
+                    eprintln!("[think mode: on (MAX prefix only takes effect on first turn)]");
+                }
                 continue;
             }
             cmd if cmd.starts_with("/load ") => {
@@ -294,18 +469,10 @@ fn main() -> eyre::Result<()> {
         };
         let user_msg = effective_msg;
 
-        // Build this turn's prefix.
-        //   first turn:  [BOS, USER, ...encode(user), ASSISTANT, THINK_END]
-        //   later turns: [USER, ...encode(user), ASSISTANT, THINK_END]
-        let mut turn_tokens: Vec<i32> = Vec::new();
-        if is_first_turn {
-            turn_tokens.push(TOK_BOS);
-            is_first_turn = false;
-        }
-        turn_tokens.push(TOK_USER);
-        turn_tokens.extend(vocab.encode(user_msg));
-        turn_tokens.push(TOK_ASSISTANT);
-        turn_tokens.push(if think_mode { TOK_THINK_BEGIN } else { TOK_THINK_END });
+        // Build this turn's prefix via the shared template builder. First
+        // turn includes BOS + (optional) MAX-reasoning preamble + system;
+        // every turn adds [User|content|Assistant|(<think>|</think>)].
+        let turn_tokens = builder.build(&vocab, user_msg, think_mode);
 
         if pos as usize + turn_tokens.len() + 1 > n_kv_max as usize {
             eprintln!(
@@ -354,28 +521,42 @@ fn main() -> eyre::Result<()> {
         print!("\x1b[1mAssistant:\x1b[0m ");
         std::io::stdout().flush().ok();
 
+        // The injected last prefill token was THINK_BEGIN/END (per builder),
+        // so the printer starts in the right rendering state.
+        let mut printer = ChatTokenPrinter::new(
+            /*format_thinking=*/ true,
+            /*use_color=*/ use_color,
+            /*start_in_think=*/ think_mode.is_on(),
+        );
+        let mut stdout = std::io::stdout().lock();
+
         let t0 = std::time::Instant::now();
         let mut n_decoded = 0usize;
         let mut hit_eos = false;
         for _ in 0..max_new {
-            if next == TOK_EOS {
-                // Forward EOS into KV so the next turn sees a clean boundary.
-                embed_lookup(token_embd_bytes, next, &mut residual);
+            // Render this token (returns true if turn-end marker).
+            let text_owned: Option<Vec<u8>> = vocab
+                .token_text(next)
+                .map(|b| gpt2_decode_token(b, &byte_decoder));
+            let end_of_turn = printer
+                .push_token(&mut stdout, next, text_owned.as_deref())
+                .ok()
+                .unwrap_or(false);
+
+            if end_of_turn {
+                // Forward EOS into KV so next turn picks up after a clean
+                // boundary. (Also true for hallucinated role markers — we
+                // treat them as if the model meant to end the turn.)
+                embed_lookup(token_embd_bytes, TOK_EOS, &mut residual);
                 engine.forward_token(
                     &mut dgpu_scratch, &mut igpu_scratch, &mut state, &weights,
-                    &residual, pos, next,
+                    &residual, pos, TOK_EOS,
                 )?;
                 pos += 1;
                 hit_eos = true;
                 break;
             }
-            if let Some(bytes) = vocab.token_text(next) {
-                let raw = gpt2_decode_token(bytes, &byte_decoder);
-                std::io::stdout().write_all(&raw).ok();
-                std::io::stdout().flush().ok();
-            } else {
-                print!("<?{next}>");
-            }
+
             embed_lookup(token_embd_bytes, next, &mut residual);
             engine.forward_token(
                 &mut dgpu_scratch, &mut igpu_scratch, &mut state, &weights,
@@ -391,7 +572,8 @@ fn main() -> eyre::Result<()> {
             next = argmax(&logits_host) as i32;
         }
         let decode_secs = t0.elapsed().as_secs_f64();
-        println!();
+        printer.finish(&mut stdout).ok();
+        drop(stdout);
         eprintln!(
             "[decode: {} tok in {:.2}s = {:.1} tok/s{}]",
             n_decoded,
