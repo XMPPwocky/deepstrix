@@ -16,6 +16,19 @@
 //!   CHAT_SYSTEM   system prompt prepended after BOS on the first turn
 //!   CHAT_NOCOLOR  set to disable grey-on-think ANSI coloring
 //!
+//!   CHAT_SAMPLER  "argmax" | "multinomial" (default "multinomial" —
+//!                 matches V4-Flash's recommended sampler).
+//!   CHAT_TEMP     temperature for multinomial mode (default 1.0,
+//!                 matches DeepSeek's published recipe). Set to 0.0 to
+//!                 force argmax.
+//!   CHAT_MIN_P    min-p threshold relative to most-likely token
+//!                 (default 0.0 = off, matches the recipe). Try 0.05
+//!                 for a long-tail prune.
+//!   CHAT_SEED     u64 seed for the host PRNG that feeds the device
+//!                 sampler. 0 = deterministic baseline. Defaults to
+//!                 a fixed value (0xD5C0DE) so chat sessions are
+//!                 reproducible across runs unless explicitly changed.
+//!
 //! REPL commands:
 //!   /think    enable chain-of-thought for subsequent turns
 //!   /nothink  disable (default)
@@ -44,8 +57,9 @@ use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::config::{COMPRESS_RATIOS, HC_DIM, N_EMBD, N_HC, N_VOCAB};
 use v4flash_kernels::het::{
     BatchDgpuScratch, BatchIgpuScratch, DgpuScratch, ExecMode, HetModelState, HetModelWeights,
-    HeterogeneousEngine, IgpuScratch,
+    HeterogeneousEngine, IgpuScratch, SampleMode,
 };
+use v4flash_kernels::sampler::SamplerRng;
 use v4flash_kernels::RopeParams;
 
 // V4-Flash chat-template special token IDs (from GGUF tokenizer.ggml.tokens).
@@ -324,18 +338,6 @@ fn gpt2_decode_token(token_bytes: &[u8], dec: &std::collections::HashMap<char, u
     out
 }
 
-fn argmax(v: &[f32]) -> usize {
-    let mut best = 0usize;
-    let mut bv = f32::NEG_INFINITY;
-    for (i, &x) in v.iter().enumerate() {
-        if x > bv {
-            bv = x;
-            best = i;
-        }
-    }
-    best
-}
-
 fn main() -> eyre::Result<()> {
     install_panic_handler()?;
     let mut args = std::env::args().skip(1);
@@ -351,6 +353,37 @@ fn main() -> eyre::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024);
+
+    let sampler_kind = std::env::var("CHAT_SAMPLER").unwrap_or_else(|_| "multinomial".to_string());
+    let temperature: f32 = std::env::var("CHAT_TEMP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
+    let min_p_rel: f32 = std::env::var("CHAT_MIN_P")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let seed: u64 = std::env::var("CHAT_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0x00D5C0DE_u64);
+
+    let sample_mode = match sampler_kind.as_str() {
+        "argmax" => SampleMode::Argmax,
+        "multinomial" => {
+            if temperature <= 0.0 {
+                SampleMode::Argmax
+            } else {
+                SampleMode::Multinomial { temperature, min_p_rel }
+            }
+        }
+        other => return Err(eyre!("CHAT_SAMPLER={other} (want \"argmax\" or \"multinomial\")")),
+    };
+    let mut rng = SamplerRng::new(seed);
+    eprintln!(
+        "sampler: {} (T={}, min_p_rel={}, seed=0x{:x})",
+        sampler_kind, temperature, min_p_rel, seed
+    );
 
     eprintln!("loading model from {gguf_path}…");
     let gguf = MappedGguf::open(&gguf_path)?;
@@ -394,7 +427,6 @@ fn main() -> eyre::Result<()> {
 
     let byte_decoder = build_gpt2_byte_decoder();
     let mut residual = vec![0f32; HC_DIM as usize];
-    let mut logits_host = vec![0f32; N_VOCAB as usize];
 
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
@@ -515,8 +547,12 @@ fn main() -> eyre::Result<()> {
                 last_logits.len(), N_VOCAB
             ));
         }
-        logits_host.copy_from_slice(&last_logits);
-        let mut next = argmax(&logits_host) as i32;
+        // dgpu_scratch.logits still holds the last-token logits from the
+        // prefill head — sample on-device. (last_logits is the host copy
+        // produced by forward_prefill_pipelined for symmetry; we ignore
+        // it here so prefill and decode share one sampling path.)
+        let _ = last_logits;
+        let mut next = engine.sample_next(&mut dgpu_scratch, sample_mode, rng.next_f32())?;
 
         print!("\x1b[1mAssistant:\x1b[0m ");
         std::io::stdout().flush().ok();
@@ -568,8 +604,7 @@ fn main() -> eyre::Result<()> {
                 eprintln!("\n[KV cache full at pos={pos}, stopping turn]");
                 break;
             }
-            dgpu_scratch.logits.copy_to_host(&mut logits_host)?;
-            next = argmax(&logits_host) as i32;
+            next = engine.sample_next(&mut dgpu_scratch, sample_mode, rng.next_f32())?;
         }
         let decode_secs = t0.elapsed().as_secs_f64();
         printer.finish(&mut stdout).ok();

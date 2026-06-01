@@ -56,6 +56,24 @@ pub enum ExecMode {
     HetParallel,
 }
 
+/// Per-step sampling policy for `HeterogeneousEngine::sample_next`.
+#[derive(Debug, Clone, Copy)]
+pub enum SampleMode {
+    /// Deterministic — picks argmax. Lowest-index tie-break.
+    Argmax,
+    /// Multinomial sample from softmax(logits / temperature).
+    /// V4-Flash's recommended setting is `temperature = 1.0,
+    /// min_p_rel = 0.0` (no pruning).
+    Multinomial {
+        temperature: f32,
+        /// Min-p threshold relative to the most-likely token (e.g. 0.05).
+        /// Set to 0.0 to disable pruning. Tokens whose unnormalised
+        /// probability `exp((x*inv_T) - gmax)` falls below this threshold
+        /// are skipped during the cumulative walk.
+        min_p_rel: f32,
+    },
+}
+
 /// All kernel modules + streams for one HIP device. Both devices carry
 /// the full kernel set (cheap — kernels are HSACO blobs, not weights).
 /// Memory split happens in [`super::weights`].
@@ -90,6 +108,9 @@ pub struct DeviceEngine {
     pub hc_sinkhorn: HcSinkhorn,
     pub mhc_pre_fused: crate::MhcPreFused,
     pub rms_nw_mw: crate::RmsNormNoWeightMultiWG,
+    /// On-device sampler. Used only on dGPU (logits live there) but
+    /// instantiated on both arches so the engine struct stays symmetric.
+    pub sampler: crate::Sampler,
     pub hc_post: HcPost,
     pub compressor_pool: CompressorPool,
     pub compressor_state_write: CompressorStateWrite,
@@ -142,6 +163,7 @@ impl DeviceEngine {
             hc_sinkhorn: HcSinkhorn::for_arch(arch)?,
             mhc_pre_fused: crate::MhcPreFused::for_arch(arch)?,
             rms_nw_mw: crate::RmsNormNoWeightMultiWG::for_arch(arch)?,
+            sampler: crate::Sampler::for_arch(arch)?,
             hc_post: HcPost::for_arch(arch)?,
             compressor_pool: CompressorPool::for_arch(arch)?,
             compressor_state_write: CompressorStateWrite::for_arch(arch)?,
@@ -501,6 +523,67 @@ impl HeterogeneousEngine {
         self.dgpu.device.synchronize()?;
         self.igpu.device.synchronize()?;
         Ok(())
+    }
+
+    /// Sample the next token from `dgpu_scratch.logits` on-device.
+    ///
+    /// Three modes:
+    ///   - argmax: deterministic, ignores temperature / u01.
+    ///   - multinomial: full softmax sample with optional min-p pruning.
+    ///   - argmax (T == 0.0): falls through to argmax mode automatically.
+    ///
+    /// `u01` is the host-supplied uniform sample in [0, 1) for this token.
+    /// Pass `0.0` in argmax mode (ignored). The returned token id is read
+    /// back via a 4-byte D→H copy after a stream sync — total overhead
+    /// per token is well under 100 µs.
+    ///
+    /// Caller must hold the dGPU as current device (or this method will
+    /// re-set it via `set_current_cached`).
+    pub fn sample_next(
+        &self,
+        dgpu_scratch: &mut super::DgpuScratch,
+        mode: SampleMode,
+        u01: f32,
+    ) -> eyre::Result<i32> {
+        self.set_current_cached(self.dgpu.device)?;
+        let n = crate::config::N_VOCAB;
+        match mode {
+            SampleMode::Argmax => {
+                self.dgpu.sampler.launch_argmax(
+                    &self.dgpu.compute,
+                    &mut dgpu_scratch.sampler_next_token_id,
+                    &dgpu_scratch.logits,
+                    n,
+                )?;
+            }
+            SampleMode::Multinomial { temperature, min_p_rel } => {
+                if temperature <= 0.0 {
+                    self.dgpu.sampler.launch_argmax(
+                        &self.dgpu.compute,
+                        &mut dgpu_scratch.sampler_next_token_id,
+                        &dgpu_scratch.logits,
+                        n,
+                    )?;
+                } else {
+                    dgpu_scratch.sampler_u01.copy_from_host(&[u01])?;
+                    self.dgpu.sampler.launch_multinomial(
+                        &self.dgpu.compute,
+                        &mut dgpu_scratch.sampler_next_token_id,
+                        &dgpu_scratch.logits,
+                        &mut dgpu_scratch.sampler_partials_max,
+                        &mut dgpu_scratch.sampler_partials_z,
+                        &dgpu_scratch.sampler_u01,
+                        n,
+                        temperature,
+                        min_p_rel,
+                    )?;
+                }
+            }
+        }
+        self.dgpu.compute.synchronize()?;
+        let mut id = [0i32; 1];
+        dgpu_scratch.sampler_next_token_id.copy_to_host(&mut id)?;
+        Ok(id[0])
     }
 
     /// Invalidate the set_current_cached cache. Call this any time

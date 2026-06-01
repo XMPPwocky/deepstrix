@@ -124,6 +124,16 @@ pub struct DgpuScratch {
     pub head_xq: DeviceBuffer<i8>,
     pub head_xscale: DeviceBuffer<f32>,
     pub logits: DeviceBuffer<f32>,
+
+    // Sampler scratch (see crate::sampler). partials_max / partials_z
+    // hold per-WG reductions consumed by softmax_sample_one. u01 is a
+    // 1-element f32 the host writes per decode step. next_token_id is
+    // the kernel's only output — a 1-element i32 the host reads back
+    // after sampling.
+    pub sampler_partials_max: DeviceBuffer<f32>,
+    pub sampler_partials_z: DeviceBuffer<f32>,
+    pub sampler_u01: DeviceBuffer<f32>,
+    pub sampler_next_token_id: DeviceBuffer<i32>,
 }
 
 impl DgpuScratch {
@@ -212,6 +222,11 @@ impl DgpuScratch {
             head_xq: DeviceBuffer::new(device_id, N_EMBD as usize)?,
             head_xscale: DeviceBuffer::new(device_id, BLOCKS_N_EMBD as usize)?,
             logits: DeviceBuffer::new(device_id, N_VOCAB as usize)?,
+
+            sampler_partials_max: DeviceBuffer::new(device_id, crate::sampler::SAMPLER_N_WG as usize)?,
+            sampler_partials_z: DeviceBuffer::new(device_id, crate::sampler::SAMPLER_N_WG as usize)?,
+            sampler_u01: DeviceBuffer::new(device_id, 1)?,
+            sampler_next_token_id: DeviceBuffer::new(device_id, 1)?,
         })
     }
 }
