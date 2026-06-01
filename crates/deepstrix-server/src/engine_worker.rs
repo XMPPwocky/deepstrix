@@ -817,17 +817,42 @@ fn handle_generate_stream(
             }
         }
 
-        save_live_if_dirty(state);
-        state.state.reset_in_place(state.dgpu, state.igpu)?;
-        if state.live.is_some() {
+        if let Some(live_ref) = state.live.as_ref() {
+            // Dump a window of bytes + token-ids around the divergence
+            // boundary on both sides so we can diagnose what differs.
+            // 30 tokens of context before the divergence point, 50
+            // tokens after.
+            let live_start = lcp_live.saturating_sub(30);
+            let live_end = (lcp_live + 50).min(live_ref.tokens.len());
+            let req_start = lcp_req.saturating_sub(30);
+            let req_end = (lcp_req + 50).min(req.tokens.len());
+            let live_slice = &live_ref.tokens[live_start..live_end];
+            let req_slice = &req.tokens[req_start..req_end];
+            let decode_to_string = |slice: &[i32]| -> String {
+                let mut bytes = Vec::new();
+                for &t in slice {
+                    if let Some(b) = state.vocab.token_text(t) {
+                        bytes.extend(gpt2_decode_token(b, &state.byte_decoder));
+                    }
+                }
+                String::from_utf8_lossy(&bytes).into_owned()
+            };
             tracing::warn!(
                 lcp_live,
                 lcp_req,
                 live_len,
                 req_len = req.tokens.len(),
+                live_window_offset = live_start,
+                req_window_offset = req_start,
+                live_window_tokens = ?live_slice,
+                req_window_tokens = ?req_slice,
+                live_window_text = ?decode_to_string(live_slice),
+                req_window_text = ?decode_to_string(req_slice),
                 "live cache divergence (byte-aligned); resetting"
             );
         }
+        save_live_if_dirty(state);
+        state.state.reset_in_place(state.dgpu, state.igpu)?;
         state.live = None;
         prefill_suffix(state, &req.tokens, 0)?;
         tracing::info!(

@@ -158,10 +158,22 @@ pub fn render_prompt(
                 out.push(TOK_THINK_END);
                 if let Some(c) = m.content.as_ref() {
                     if !c.is_empty() {
-                        // History assistant text content also gets plain
-                        // BPE — only the DSML tool_calls block below is
-                        // explicitly DSML-aware.
-                        out.extend(vocab.encode(c));
+                        // If a DSML tool_calls block follows, strip the
+                        // content's trailing whitespace. The model's
+                        // natural output is `<content text>\n\n<｜DSML｜...>`
+                        // (often as a single token like ".\n\n"), and
+                        // `render_tool_calls_in_history` ALSO prefixes
+                        // "\n\n" before the DSML block — so without the
+                        // strip we'd emit four newlines vs. the live
+                        // cache's two and break byte-aligned LCP.
+                        let text = if !m.tool_calls.is_empty() {
+                            c.trim_end_matches(['\n', '\r', '\t', ' '])
+                        } else {
+                            c.as_str()
+                        };
+                        if !text.is_empty() {
+                            out.extend(vocab.encode(text));
+                        }
                     }
                 }
                 if !m.tool_calls.is_empty() {
