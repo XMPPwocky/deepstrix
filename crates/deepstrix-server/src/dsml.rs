@@ -1,31 +1,36 @@
-//! DSML scanner + tool-prompt renderer.
+//! Token-driven DSML scanner.
 //!
-//! V4-Flash emits tool calls as text-encoded DSML markup whose only
-//! special token is `｜DSML｜` (id 128825). The rest is regular BPE'd
-//! text. We don't need to special-case the token in the scanner — we
-//! just look at decoded bytes.
+//! V4-Flash encodes tool calls as **DSML text** anchored on a single
+//! special token, `｜DSML｜` (id loaded from GGUF at vocab init —
+//! `vocab.dsml_id`, typically 128825). The surrounding characters
+//! (`<`, `>`, `tool_calls`, `invoke`, `parameter`, attribute names,
+//! parameter values) are regular BPE-encoded text.
 //!
-//! Reference (canonical engine): `external/ds4/ds4_server.c`:
-//!   * tool-prompt schema block: lines 1646-1671
-//!   * DSML tool-calls renderer:  lines 1857-1877
-//!   * DSML streaming scanner:    lines 3233-4010
+//! The scanner is driven by **TOK_DSML transitions**, not by byte
+//! patterns. That has two important properties:
 //!
-//! Phase 2 scope: a **block-buffering** scanner — we accumulate the
-//! entire tool block before emitting OpenAI events, rather than
-//! streaming arg deltas. Letta consumes tool calls atomically anyway;
-//! the streaming-arg path is an optimization that can land in a future
-//! phase if needed.
+//! 1. **No false positives on user content.** A user message that
+//!    literally contains the characters `｜DSML｜` produces regular
+//!    BPE tokens (`28217, 10525, 7398, 28217`) — not TOK_DSML — and
+//!    the scanner ignores them.
+//!
+//! 2. **TOK_DSML bytes are never emitted as content.** When the
+//!    worker decodes TOK_DSML it produces 10 UTF-8 bytes that look
+//!    like `｜DSML｜`. If those bytes went out as `delta.content`,
+//!    letta would store them, the next request would re-encode them
+//!    as regular BPE tokens, and the model would see literal
+//!    `｜DSML｜` in its input and learn to mimic it back. We close
+//!    that cycle by suppressing TOK_DSML's bytes unconditionally —
+//!    inside markup (structural) or outside (stray — warn + drop).
 
-use crate::openai::types::{ToolCall, ToolCallFunction, ToolDef};
+use crate::openai::types::{ToolCall, ToolDef};
 
 // ---------------------------------------------------------------------------
-// Renderer — used to construct the system-prompt schema block and to
-// re-render assistant turns that contained tool calls in history.
+// Renderer — unchanged from the byte-scanner version. Used to build
+// the system-prompt schema block and to re-render assistant turns
+// that had tool_calls in history.
 // ---------------------------------------------------------------------------
 
-/// Append the standard tool-prompt header + the JSON schemas for each
-/// declared tool. Returns the rendered string; caller concatenates it
-/// into the system prompt at first-turn. Mirrors `ds4_server.c:1646`.
 pub fn render_tools_prompt(tools: &[ToolDef]) -> String {
     if tools.is_empty() {
         return String::new();
@@ -61,10 +66,6 @@ pub fn render_tools_prompt(tools: &[ToolDef]) -> String {
     out
 }
 
-/// Render an assistant turn's `tool_calls` back into DSML text for
-/// history replay. Mirrors `ds4_server.c:1857`. The output is meant to
-/// be tokenized (via BpeVocab.encode) and prefixed to the assistant's
-/// reply content.
 pub fn render_tool_calls_in_history(calls: &[ToolCall]) -> String {
     if calls.is_empty() {
         return String::new();
@@ -75,9 +76,6 @@ pub fn render_tool_calls_in_history(calls: &[ToolCall]) -> String {
         out.push_str("<\u{ff5c}DSML\u{ff5c}invoke name=\"");
         push_dsml_attr(&mut out, &tc.function.name);
         out.push_str("\">\n");
-        // Try to parse arguments as a JSON object and emit one parameter
-        // per key. Fall back to a single string-typed arguments param if
-        // the JSON is malformed.
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
             if let serde_json::Value::Object(map) = v {
                 for (key, val) in &map {
@@ -97,8 +95,6 @@ pub fn render_tool_calls_in_history(calls: &[ToolCall]) -> String {
                     out.push_str("</\u{ff5c}DSML\u{ff5c}parameter>\n");
                 }
             } else {
-                // Non-object JSON: emit as a single string-typed
-                // arguments param.
                 out.push_str("<\u{ff5c}DSML\u{ff5c}parameter name=\"arguments\" string=\"true\">");
                 push_dsml_parameter_text(&mut out, &tc.function.arguments);
                 out.push_str("</\u{ff5c}DSML\u{ff5c}parameter>\n");
@@ -127,9 +123,6 @@ fn push_dsml_attr(out: &mut String, s: &str) {
 }
 
 fn push_dsml_parameter_text(out: &mut String, s: &str) {
-    // Mirrors ds4_server.c:1777-1788. Only escape an in-text occurrence
-    // of `</｜DSML｜parameter>` (the closing tag), by replacing its leading
-    // `<` with `&lt;`. Other special chars pass through.
     let end = "</\u{ff5c}DSML\u{ff5c}parameter>";
     let mut i = 0;
     let bytes = s.as_bytes();
@@ -137,9 +130,8 @@ fn push_dsml_parameter_text(out: &mut String, s: &str) {
     while i < bytes.len() {
         if bytes[i..].starts_with(end_bytes) {
             out.push_str("&lt;");
-            i += 1; // advance past '<' only; rest re-scanned
+            i += 1;
         } else {
-            // Push the next char (UTF-8 boundary aware).
             let ch_len = utf8_char_len(bytes[i]);
             if let Ok(s) = std::str::from_utf8(&bytes[i..i + ch_len]) {
                 out.push_str(s);
@@ -172,7 +164,7 @@ fn utf8_char_len(first: u8) -> usize {
     if first < 0x80 {
         1
     } else if first < 0xC0 {
-        1 // continuation byte (shouldn't happen at boundary; defensive)
+        1
     } else if first < 0xE0 {
         2
     } else if first < 0xF0 {
@@ -183,286 +175,382 @@ fn utf8_char_len(first: u8) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Scanner — accumulates decoded token bytes; emits events.
+// Scanner — token-driven.
 // ---------------------------------------------------------------------------
-
-const TAG_TC_OPEN: &str = "<\u{ff5c}DSML\u{ff5c}tool_calls>";
-const TAG_TC_CLOSE: &str = "</\u{ff5c}DSML\u{ff5c}tool_calls>";
-const TAG_INVOKE_OPEN_PREFIX: &str = "<\u{ff5c}DSML\u{ff5c}invoke";
-const TAG_INVOKE_CLOSE: &str = "</\u{ff5c}DSML\u{ff5c}invoke>";
-const TAG_PARAM_OPEN_PREFIX: &str = "<\u{ff5c}DSML\u{ff5c}parameter";
-const TAG_PARAM_CLOSE: &str = "</\u{ff5c}DSML\u{ff5c}parameter>";
 
 #[derive(Debug, Clone)]
 pub enum DsmlEvent {
-    /// Plain assistant text outside any tool block.
-    Text(String),
-    /// A complete tool call. Emitted when `</｜DSML｜invoke>` is reached.
-    /// `index` numbers calls within the current `<tool_calls>` block.
+    /// Plain assistant text outside any DSML markup. Bytes are NOT
+    /// UTF-8-validated — caller maintains its own cross-chunk buffer.
+    Text(Vec<u8>),
+    /// One completed `<invoke>` block.
     ToolCall {
         index: u32,
         id: String,
         name: String,
-        /// JSON object string (the value for OpenAI's `function.arguments`).
         arguments: String,
     },
-    /// End of the enclosing `</｜DSML｜tool_calls>` block. Caller may use
-    /// this to set `finish_reason="tool_calls"`.
+    /// `</tool_calls>` — outer block closed.
     ToolCallsEnd,
 }
 
+/// Sentinel value: "no token, just process the leftover bytes." Used
+/// when a header-completion (`>` found) leaves bytes that the new
+/// mode should also see.
+const NO_TOKEN: i32 = -1;
+
 #[derive(Debug)]
-enum ScanMode {
-    /// Outside any DSML markup. Stream bytes as text.
-    Text,
-    /// We're between `<｜DSML｜tool_calls>` and `</｜DSML｜tool_calls>`.
-    InToolCalls { next_index: u32 },
-    /// Inside an `<｜DSML｜invoke>` block.
-    InInvoke {
+enum Frame {
+    /// Inside `<｜DSML｜tool_calls>…</｜DSML｜tool_calls>`.
+    ToolCalls { next_invoke_index: u32 },
+    /// Inside `<｜DSML｜invoke …>…</｜DSML｜invoke>`.
+    Invoke {
         index: u32,
         name: String,
-        params: Vec<(String, bool, String)>, // (name, is_string, body)
+        params: Vec<(String, bool, String)>,
     },
-    /// Done — any further input is ignored. Caller may break out of the
-    /// decode loop.
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Mode {
+    /// Streaming text. Outside frames → emit as `Text(bytes)`. Inside
+    /// frames → drop (between tags).
+    Text,
+    /// Accumulating bytes between `<｜DSML｜` and the next `>`.
+    OpenHeader,
+    /// Accumulating bytes between `</｜DSML｜` and the next `>`.
+    CloseHeader,
+    /// Inside a `<｜DSML｜parameter …>…</｜DSML｜parameter>` body.
+    ParameterBody,
+    /// After the outer `</tool_calls>` — anything else is ignored.
     Done,
 }
 
 pub struct DsmlScanner {
+    tok_dsml: i32,
+    frames: Vec<Frame>,
+    mode: Mode,
+    /// Trailing 0–2 bytes that might be `<` or `</` — used to
+    /// disambiguate tag direction when the next token is TOK_DSML.
+    /// Reset to empty by every TOK_DSML transition and on byte flush.
+    tail: Vec<u8>,
+    /// Mode-specific accumulator (header bytes for OpenHeader /
+    /// CloseHeader; parameter value bytes for ParameterBody).
     buf: Vec<u8>,
-    mode: ScanMode,
+    /// Set when mode == ParameterBody or we just transitioned into
+    /// CloseHeader from ParameterBody. `(name, is_string, body)` —
+    /// the body slot is filled when we leave ParameterBody so
+    /// dispatch_close("parameter") can finalize it.
+    current_param: Option<(String, bool, Vec<u8>)>,
 }
 
 impl DsmlScanner {
-    pub fn new() -> Self {
+    pub fn new(tok_dsml: i32) -> Self {
         Self {
+            tok_dsml,
+            frames: Vec::new(),
+            mode: Mode::Text,
+            tail: Vec::new(),
             buf: Vec::new(),
-            mode: ScanMode::Text,
+            current_param: None,
         }
     }
 
-    /// Feed a chunk of decoded text into the scanner. Returns any
-    /// events produced.
-    pub fn push_text(&mut self, s: &str) -> Vec<DsmlEvent> {
-        self.buf.extend_from_slice(s.as_bytes());
+    pub fn push_token(&mut self, tok: i32, bytes: &[u8]) -> Vec<DsmlEvent> {
         let mut events = Vec::new();
-        self.drain(&mut events, false);
+        let mut leftover = self.step(tok, bytes, &mut events);
+        while !leftover.is_empty() {
+            let next = self.step(NO_TOKEN, &leftover, &mut events);
+            if next.len() == leftover.len() && next == leftover {
+                // No progress — bail out (defensive, shouldn't happen).
+                break;
+            }
+            leftover = next;
+        }
         events
     }
 
-    /// Mark end-of-stream. Emits any remaining text (drops unmatched
-    /// partial tags). Returns any final events.
     pub fn finish(&mut self) -> Vec<DsmlEvent> {
         let mut events = Vec::new();
-        self.drain(&mut events, true);
+        // Flush any pending tail bytes if we're still in Text mode
+        // outside all frames.
+        if self.mode == Mode::Text && self.frames.is_empty() && !self.tail.is_empty() {
+            let drained = std::mem::take(&mut self.tail);
+            events.push(DsmlEvent::Text(drained));
+        }
+        self.mode = Mode::Done;
         events
     }
 
-    fn drain(&mut self, events: &mut Vec<DsmlEvent>, eof: bool) {
-        loop {
-            match &mut self.mode {
-                ScanMode::Done => {
+    fn step(&mut self, tok: i32, bytes: &[u8], events: &mut Vec<DsmlEvent>) -> Vec<u8> {
+        if self.mode == Mode::Done {
+            return Vec::new();
+        }
+
+        // TOK_DSML is always a structural marker. Its bytes never
+        // reach the output. The transition depends on `tail`.
+        if tok == self.tok_dsml {
+            return self.on_tok_dsml(bytes, events);
+        }
+
+        // Regular bytes — behaviour per mode.
+        match self.mode {
+            Mode::Text => self.consume_text_bytes(bytes, events),
+            Mode::OpenHeader => self.consume_header_bytes(bytes, false, events),
+            Mode::CloseHeader => self.consume_header_bytes(bytes, true, events),
+            Mode::ParameterBody => self.consume_param_body_bytes(bytes),
+            Mode::Done => Vec::new(),
+        }
+    }
+
+    /// Handle a TOK_DSML token. The token's byte content is dropped
+    /// regardless of context (it's purely structural — `bytes` is
+    /// accepted as a parameter only to match the step() signature
+    /// and is otherwise ignored).
+    fn on_tok_dsml(&mut self, _bytes_ignored: &[u8], events: &mut Vec<DsmlEvent>) -> Vec<u8> {
+        match self.mode {
+            Mode::Text | Mode::ParameterBody => {
+                // The tail tells us whether this is `<` (open) or
+                // `</` (close). Trim that suffix from tail, treat any
+                // remaining tail bytes appropriately, transition.
+                let is_close = self.tail.ends_with(b"</");
+                let is_open = !is_close && self.tail.ends_with(b"<");
+                if is_close {
+                    self.tail.truncate(self.tail.len() - 2);
+                    self.flush_tail_to_current_mode(events);
+                    // If we were accumulating a parameter body in buf,
+                    // hand it off to current_param so the upcoming
+                    // CloseHeader's "parameter>" tag can find it.
+                    if self.mode == Mode::ParameterBody {
+                        let body = std::mem::take(&mut self.buf);
+                        if let Some((_, _, slot)) = self.current_param.as_mut() {
+                            *slot = body;
+                        }
+                    }
+                    self.mode = Mode::CloseHeader;
                     self.buf.clear();
-                    return;
-                }
-                ScanMode::Text => {
-                    // Scan for TAG_TC_OPEN. Emit everything before it as Text.
-                    let buf_str = std::str::from_utf8(&self.buf).unwrap_or("");
-                    if let Some(pos) = buf_str.find(TAG_TC_OPEN) {
-                        if pos > 0 {
-                            let prefix: String = buf_str[..pos].into();
-                            events.push(DsmlEvent::Text(prefix));
-                        }
-                        let consumed_bytes = pos + TAG_TC_OPEN.len();
-                        self.buf.drain(..consumed_bytes);
-                        self.mode = ScanMode::InToolCalls { next_index: 0 };
-                        continue;
-                    }
-                    // No full open-tag found. If the buf ends with a
-                    // prefix of TAG_TC_OPEN, hold it back.
-                    let hold = trailing_prefix_len(buf_str, TAG_TC_OPEN);
-                    if buf_str.len() > hold {
-                        let emit_end = buf_str.len() - hold;
-                        let emit: String = buf_str[..emit_end].into();
-                        events.push(DsmlEvent::Text(emit));
-                        self.buf.drain(..emit_end);
-                    }
-                    if eof && !self.buf.is_empty() {
-                        // Flush any leftover bytes as text.
-                        let buf_str = std::str::from_utf8(&self.buf)
-                            .unwrap_or("")
-                            .to_string();
-                        events.push(DsmlEvent::Text(buf_str));
-                        self.buf.clear();
-                    }
-                    return;
-                }
-                ScanMode::InToolCalls { next_index } => {
-                    // We expect either `<｜DSML｜invoke ...>` (start a call)
-                    // or `</｜DSML｜tool_calls>` (end the block). Whitespace
-                    // is permitted between them.
-                    let buf_str = std::str::from_utf8(&self.buf).unwrap_or("");
-                    // Skip leading whitespace cheaply.
-                    let trimmed_start = buf_str
-                        .find(|c: char| !c.is_whitespace())
-                        .unwrap_or(buf_str.len());
-                    if buf_str[trimmed_start..].starts_with(TAG_TC_CLOSE) {
-                        let consumed = trimmed_start + TAG_TC_CLOSE.len();
-                        self.buf.drain(..consumed);
-                        events.push(DsmlEvent::ToolCallsEnd);
-                        self.mode = ScanMode::Done;
-                        continue;
-                    }
-                    if buf_str[trimmed_start..].starts_with(TAG_INVOKE_OPEN_PREFIX) {
-                        // We need the whole `<｜DSML｜invoke name="..."` …`>`
-                        // header before we can start the call. Find the
-                        // closing `>` of the header (the FIRST `>` after
-                        // TAG_INVOKE_OPEN_PREFIX, but watch out for `>`
-                        // inside a quoted attribute — we only have name=,
-                        // so safe to use bare `>` search).
-                        let header_start = trimmed_start;
-                        let scan_from = header_start + TAG_INVOKE_OPEN_PREFIX.len();
-                        if let Some(rel_close) = buf_str[scan_from..].find('>') {
-                            let header_end = scan_from + rel_close + 1;
-                            let header_slice = &buf_str[header_start..header_end];
-                            let name =
-                                parse_attr(header_slice, "name").unwrap_or_default();
-                            self.buf.drain(..header_end);
-                            let idx = *next_index;
-                            *next_index += 1;
-                            self.mode = ScanMode::InInvoke {
-                                index: idx,
-                                name,
-                                params: Vec::new(),
-                            };
-                            continue;
-                        }
-                        // Incomplete header; wait for more bytes.
-                        return;
-                    }
-                    // Neither tag matched yet. If the leading non-ws
-                    // is a strict prefix of either tag, wait. Otherwise
-                    // tolerate stray text by emitting it as Text and
-                    // moving on (matches ds4's behavior).
-                    let after_ws = &buf_str[trimmed_start..];
-                    let hold_close = trailing_prefix_len(after_ws, TAG_TC_CLOSE);
-                    let hold_open = trailing_prefix_len(after_ws, TAG_INVOKE_OPEN_PREFIX);
-                    let hold = hold_close.max(hold_open);
-                    if after_ws.len() > hold {
-                        // Emit the leading whitespace + stray text as Text,
-                        // hold the trailing partial.
-                        let emit_end = trimmed_start + (after_ws.len() - hold);
-                        let emit: String = buf_str[..emit_end].into();
-                        events.push(DsmlEvent::Text(emit));
-                        self.buf.drain(..emit_end);
-                    }
-                    return;
-                }
-                ScanMode::InInvoke {
-                    index,
-                    name,
-                    params,
-                } => {
-                    let buf_str = std::str::from_utf8(&self.buf).unwrap_or("");
-                    let trimmed_start = buf_str
-                        .find(|c: char| !c.is_whitespace())
-                        .unwrap_or(buf_str.len());
-                    if buf_str[trimmed_start..].starts_with(TAG_INVOKE_CLOSE) {
-                        // Complete the call.
-                        let consumed = trimmed_start + TAG_INVOKE_CLOSE.len();
-                        self.buf.drain(..consumed);
-                        let arguments = params_to_json(params);
-                        let id = format!("call_{}", uuid::Uuid::now_v7().simple());
-                        events.push(DsmlEvent::ToolCall {
-                            index: *index,
-                            id,
-                            name: std::mem::take(name),
-                            arguments,
-                        });
-                        // After </｜DSML｜invoke>, we're back in the
-                        // surrounding <tool_calls> block.
-                        let next_idx = *index + 1;
-                        self.mode = ScanMode::InToolCalls {
-                            next_index: next_idx,
-                        };
-                        continue;
-                    }
-                    if buf_str[trimmed_start..].starts_with(TAG_PARAM_OPEN_PREFIX) {
-                        // Parse `<｜DSML｜parameter name="..." string="...">`.
-                        let header_start = trimmed_start;
-                        let scan_from = header_start + TAG_PARAM_OPEN_PREFIX.len();
-                        let Some(rel_close) = buf_str[scan_from..].find('>') else {
-                            // header incomplete; wait
-                            return;
-                        };
-                        let header_end = scan_from + rel_close + 1;
-                        let header_slice = &buf_str[header_start..header_end];
-                        let param_name =
-                            parse_attr(header_slice, "name").unwrap_or_default();
-                        let is_string = parse_attr(header_slice, "string")
-                            .map(|s| s == "true")
-                            .unwrap_or(true);
-                        // We now need the body up to `</｜DSML｜parameter>`.
-                        // The body is everything from `header_end` to the
-                        // first occurrence of TAG_PARAM_CLOSE.
-                        let after_header = &buf_str[header_end..];
-                        if let Some(rel_body_end) = after_header.find(TAG_PARAM_CLOSE) {
-                            let body: String = after_header[..rel_body_end].into();
-                            let total =
-                                header_end + rel_body_end + TAG_PARAM_CLOSE.len();
-                            self.buf.drain(..total);
-                            params.push((param_name, is_string, body));
-                            continue;
-                        }
-                        // Incomplete body — wait.
-                        return;
-                    }
-                    // Not a recognized tag yet. Hold partial prefix.
-                    let after_ws = &buf_str[trimmed_start..];
-                    let hold_close = trailing_prefix_len(after_ws, TAG_INVOKE_CLOSE);
-                    let hold_open = trailing_prefix_len(after_ws, TAG_PARAM_OPEN_PREFIX);
-                    let hold = hold_close.max(hold_open);
-                    if after_ws.len() > hold {
-                        // Stray text between params — discard (matches ds4 lenient parse).
-                        let advance = trimmed_start + (after_ws.len() - hold);
-                        self.buf.drain(..advance);
-                    }
-                    return;
+                } else if is_open {
+                    self.tail.truncate(self.tail.len() - 1);
+                    self.flush_tail_to_current_mode(events);
+                    self.mode = Mode::OpenHeader;
+                    self.buf.clear();
+                } else {
+                    // Stray TOK_DSML — neither `<` nor `</` preceded
+                    // it. Flush tail as content (text or body), warn,
+                    // and silently drop the DSML marker.
+                    self.flush_tail_to_current_mode(events);
+                    tracing::warn!(
+                        mode = ?self.mode,
+                        frames = self.frames.len(),
+                        "stray TOK_DSML in stream (no preceding `<` or `</`); dropping the marker bytes"
+                    );
                 }
             }
+            Mode::OpenHeader | Mode::CloseHeader => {
+                // TOK_DSML inside a tag header is malformed. The only
+                // valid headers are `tool_calls>`, `invoke ...>`,
+                // `parameter ...>` — none contain DSML markers
+                // internally. Log and drop.
+                tracing::warn!(
+                    mode = ?self.mode,
+                    "TOK_DSML inside tag header; dropping"
+                );
+            }
+            Mode::Done => {}
         }
+        // TOK_DSML's bytes are NEVER content; always return empty so
+        // the outer leftover-loop doesn't reprocess them as text.
+        Vec::new()
+    }
+
+    /// Flush the `tail` buffer as content appropriate to the current
+    /// mode (text emit, body append, or drop).
+    fn flush_tail_to_current_mode(&mut self, events: &mut Vec<DsmlEvent>) {
+        if self.tail.is_empty() {
+            return;
+        }
+        let drained = std::mem::take(&mut self.tail);
+        match self.mode {
+            Mode::Text => {
+                if self.frames.is_empty() {
+                    events.push(DsmlEvent::Text(drained));
+                }
+                // else: inside a frame (ToolCalls/Invoke), between
+                // tags. Drop.
+            }
+            Mode::ParameterBody => {
+                self.buf.extend(drained);
+            }
+            _ => {}
+        }
+    }
+
+    fn consume_text_bytes(&mut self, bytes: &[u8], events: &mut Vec<DsmlEvent>) -> Vec<u8> {
+        self.tail.extend_from_slice(bytes);
+        let hold = tag_lookahead(&self.tail);
+        if self.tail.len() > hold {
+            let emit: Vec<u8> = self.tail.drain(..self.tail.len() - hold).collect();
+            if self.frames.is_empty() {
+                events.push(DsmlEvent::Text(emit));
+            }
+            // else: drop — we're between tags inside a frame.
+        }
+        Vec::new()
+    }
+
+    fn consume_header_bytes(
+        &mut self,
+        bytes: &[u8],
+        is_close: bool,
+        events: &mut Vec<DsmlEvent>,
+    ) -> Vec<u8> {
+        self.buf.extend_from_slice(bytes);
+        if let Some(gt_pos) = self.buf.iter().position(|&b| b == b'>') {
+            let head_str = String::from_utf8_lossy(&self.buf[..gt_pos]).into_owned();
+            let leftover = self.buf[gt_pos + 1..].to_vec();
+            self.buf.clear();
+            if is_close {
+                self.dispatch_close(&head_str, events);
+            } else {
+                self.dispatch_open(&head_str);
+            }
+            return leftover;
+        }
+        Vec::new()
+    }
+
+    fn consume_param_body_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        // In ParameterBody, bytes accumulate into the param value.
+        // Only the trailing `</` is held back (for the next TOK_DSML
+        // check). Everything else goes to `buf` (the body).
+        self.tail.extend_from_slice(bytes);
+        let hold = tag_lookahead(&self.tail);
+        if self.tail.len() > hold {
+            let absorbed: Vec<u8> = self.tail.drain(..self.tail.len() - hold).collect();
+            self.buf.extend(absorbed);
+        }
+        Vec::new()
+    }
+
+    /// Parse an opening-tag header (already with the leading
+    /// `<｜DSML｜` stripped and the trailing `>` consumed). The
+    /// header is one of: `tool_calls`, `invoke …`, `parameter …`.
+    fn dispatch_open(&mut self, head: &str) {
+        let trimmed = head.trim_start();
+        if trimmed.starts_with("tool_calls") {
+            self.frames.push(Frame::ToolCalls {
+                next_invoke_index: 0,
+            });
+            self.mode = Mode::Text;
+            return;
+        }
+        if trimmed.starts_with("invoke") {
+            let name = parse_attr(trimmed, "name").unwrap_or_default();
+            let next_invoke_index = match self.frames.last_mut() {
+                Some(Frame::ToolCalls { next_invoke_index }) => {
+                    let i = *next_invoke_index;
+                    *next_invoke_index += 1;
+                    i
+                }
+                _ => 0,
+            };
+            self.frames.push(Frame::Invoke {
+                index: next_invoke_index,
+                name,
+                params: Vec::new(),
+            });
+            self.mode = Mode::Text;
+            return;
+        }
+        if trimmed.starts_with("parameter") {
+            let name = parse_attr(trimmed, "name").unwrap_or_default();
+            let is_string = parse_attr(trimmed, "string")
+                .map(|s| s == "true")
+                .unwrap_or(true);
+            self.current_param = Some((name, is_string, Vec::new()));
+            self.buf.clear();
+            self.mode = Mode::ParameterBody;
+            return;
+        }
+        // Unknown tag — treat as text fallback.
+        tracing::warn!(head, "unknown DSML open tag; falling back to Text");
+        self.mode = Mode::Text;
+    }
+
+    fn dispatch_close(&mut self, head: &str, events: &mut Vec<DsmlEvent>) {
+        let trimmed = head.trim_start();
+        if trimmed.starts_with("tool_calls") {
+            // Pop the ToolCalls frame; emit ToolCallsEnd.
+            self.frames.clear();
+            events.push(DsmlEvent::ToolCallsEnd);
+            self.mode = Mode::Done;
+            return;
+        }
+        if trimmed.starts_with("invoke") {
+            // Pop the Invoke frame; emit ToolCall.
+            if let Some(Frame::Invoke {
+                index,
+                name,
+                params,
+            }) = self.pop_frame()
+            {
+                let arguments = params_to_json(&params);
+                events.push(DsmlEvent::ToolCall {
+                    index,
+                    id: format!("call_{}", uuid::Uuid::now_v7().simple()),
+                    name,
+                    arguments,
+                });
+            }
+            self.mode = Mode::Text;
+            return;
+        }
+        if trimmed.starts_with("parameter") {
+            // Finalise the current parameter (body was stashed when
+            // we left ParameterBody → CloseHeader).
+            if let Some((name, is_string, body_bytes)) = self.current_param.take() {
+                let body_str = if is_string {
+                    dsml_param_decode_string(&String::from_utf8_lossy(&body_bytes))
+                } else {
+                    dsml_param_decode_json_literal(&String::from_utf8_lossy(&body_bytes))
+                };
+                if let Some(Frame::Invoke { params, .. }) = self.frames.last_mut() {
+                    params.push((name, is_string, body_str));
+                }
+            }
+            self.mode = Mode::Text;
+            return;
+        }
+        tracing::warn!(head, "unknown DSML close tag; falling back to Text");
+        self.mode = Mode::Text;
+    }
+
+    fn pop_frame(&mut self) -> Option<Frame> {
+        self.frames.pop()
     }
 }
 
 impl Default for DsmlScanner {
     fn default() -> Self {
-        Self::new()
+        // For tests that don't have a vocab: 128825 is the V4-Flash
+        // value. Callers in production pass it explicitly via `new()`.
+        Self::new(128825)
     }
 }
 
-/// Length of the longest prefix of `lit` that is a suffix of `s`.
-/// Used to decide how many trailing bytes to hold back so a partial
-/// tag crossing a token boundary isn't emitted as text.
-fn trailing_prefix_len(s: &str, lit: &str) -> usize {
-    let lit_bytes = lit.as_bytes();
-    let s_bytes = s.as_bytes();
-    // Largest k > 0 such that s ends with lit[..k] AND k <= lit_bytes.len()-1
-    // (i.e. proper prefix).
-    let max_k = lit_bytes.len().saturating_sub(1).min(s_bytes.len());
-    for k in (1..=max_k).rev() {
-        if s_bytes.ends_with(&lit_bytes[..k]) {
-            // Must also be a valid char-boundary in s.
-            let split = s_bytes.len() - k;
-            if s.is_char_boundary(split) {
-                return k;
-            }
-        }
+/// Largest number of trailing bytes in `b` that are a strict prefix
+/// of `</` — i.e. could be the start of a closing tag waiting for
+/// TOK_DSML. Returns 0, 1 (just `<`), or 2 (`</`).
+fn tag_lookahead(b: &[u8]) -> usize {
+    if b.ends_with(b"</") {
+        2
+    } else if b.ends_with(b"<") {
+        1
+    } else {
+        0
     }
-    0
 }
 
-/// Find an `attr="value"` pair in a tag header slice and return the
-/// (DSML-decoded) value.
 fn parse_attr(header: &str, attr: &str) -> Option<String> {
     let needle = format!("{attr}=\"");
     let start = header.find(&needle)? + needle.len();
@@ -476,7 +564,6 @@ fn dsml_attr_decode(s: &str) -> String {
     let mut it = s.chars().peekable();
     while let Some(c) = it.next() {
         if c == '&' {
-            // peek for &amp; &lt; &gt; &quot;
             let mut peek = String::new();
             for _ in 0..5 {
                 match it.peek() {
@@ -507,37 +594,26 @@ fn dsml_attr_decode(s: &str) -> String {
     out
 }
 
-/// Decode `&amp;`, `&lt;`, `&gt;`, `&quot;` in a parameter body.
 fn dsml_param_decode_string(s: &str) -> String {
     dsml_attr_decode(s)
 }
 
-/// Decode `<` back to `<` (the only DSML→JSON escape used by ds4's
-/// renderer for JSON literals, per ds4_server.c:1790).
 fn dsml_param_decode_json_literal(s: &str) -> String {
     s.replace("\\u003c", "<")
 }
 
-/// Assemble a JSON object string from the parsed parameter list.
-/// Parameters with `string="true"` become JSON strings; `string="false"`
-/// values are passed through as already-valid JSON literals.
 fn params_to_json(params: &[(String, bool, String)]) -> String {
     let mut map = serde_json::Map::new();
     for (k, is_string, body) in params {
         if *is_string {
-            map.insert(
-                k.clone(),
-                serde_json::Value::String(dsml_param_decode_string(body)),
-            );
+            map.insert(k.clone(), serde_json::Value::String(body.clone()));
         } else {
-            let decoded = dsml_param_decode_json_literal(body);
-            match serde_json::from_str::<serde_json::Value>(decoded.trim()) {
+            match serde_json::from_str::<serde_json::Value>(body.trim()) {
                 Ok(v) => {
                     map.insert(k.clone(), v);
                 }
                 Err(_) => {
-                    // Fall back to raw string if the literal is malformed.
-                    map.insert(k.clone(), serde_json::Value::String(decoded));
+                    map.insert(k.clone(), serde_json::Value::String(body.clone()));
                 }
             }
         }
@@ -545,125 +621,151 @@ fn params_to_json(params: &[(String, bool, String)]) -> String {
     serde_json::Value::Object(map).to_string()
 }
 
-/// Convert a list of parsed `ToolCall`s (one per `<invoke>`) into the
-/// OpenAI `tool_calls` array used in `Choice::message::tool_calls`.
-/// Phase 1 helper for the non-streaming response path.
+/// Convenience for the non-streaming path: take a token-id stream and
+/// fully-decoded byte payload-per-token, run the scanner to
+/// completion, and return the final event vector.
 pub fn tool_calls_from_events(events: Vec<DsmlEvent>) -> Vec<ToolCall> {
-    let mut out = Vec::new();
-    for ev in events {
-        if let DsmlEvent::ToolCall {
-            id,
-            name,
-            arguments,
-            ..
-        } = ev
-        {
-            out.push(ToolCall {
+    use crate::openai::types::ToolCallFunction;
+    events
+        .into_iter()
+        .filter_map(|ev| {
+            if let DsmlEvent::ToolCall {
                 id,
-                kind: "function".into(),
-                function: ToolCallFunction { name, arguments },
-            });
-        }
-    }
-    out
+                name,
+                arguments,
+                ..
+            } = ev
+            {
+                Some(ToolCall {
+                    id,
+                    kind: "function".into(),
+                    function: ToolCallFunction { name, arguments },
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn one_chunk(s: &str) -> Vec<DsmlEvent> {
-        let mut sc = DsmlScanner::new();
-        let mut ev = sc.push_text(s);
-        ev.extend(sc.finish());
-        ev
+    // Synthetic vocab: token IDs map to ASCII bytes by convention.
+    // Token 0 = TOK_DSML (with bytes `｜DSML｜`).
+    // Token N (N>0) = bytes derived from the lower 7 bits as ASCII.
+    // Tests construct sequences directly with bytes.
+
+    const TOK_DSML_TEST: i32 = 999;
+
+    /// Feed a sequence of (tok, bytes) pairs to the scanner and
+    /// collect all events.
+    fn drive(seq: &[(i32, &[u8])]) -> Vec<DsmlEvent> {
+        let mut sc = DsmlScanner::new(TOK_DSML_TEST);
+        let mut out = Vec::new();
+        for &(t, b) in seq {
+            out.extend(sc.push_token(t, b));
+        }
+        out.extend(sc.finish());
+        out
     }
 
     #[test]
-    fn plain_text_passes_through() {
-        let ev = one_chunk("hello world");
+    fn plain_text_pass_through() {
+        let ev = drive(&[(1, b"hello world")]);
         assert_eq!(ev.len(), 1);
         match &ev[0] {
-            DsmlEvent::Text(t) => assert_eq!(t, "hello world"),
-            other => panic!("unexpected: {:?}", other),
+            DsmlEvent::Text(b) => assert_eq!(b.as_slice(), b"hello world"),
+            other => panic!("unexpected {:?}", other),
         }
+    }
+
+    #[test]
+    fn stray_tok_dsml_dropped() {
+        let ev = drive(&[(1, b"hello "), (TOK_DSML_TEST, b"\xef\xbd\x9cDSML\xef\xbd\x9c"), (1, b" world")]);
+        // The stray TOK_DSML's bytes must NOT appear in the output.
+        let combined: Vec<u8> = ev
+            .iter()
+            .filter_map(|e| if let DsmlEvent::Text(b) = e { Some(b.clone()) } else { None })
+            .flatten()
+            .collect();
+        assert_eq!(combined, b"hello  world".to_vec());
+        // No tool_call event.
+        assert!(!ev.iter().any(|e| matches!(e, DsmlEvent::ToolCall { .. })));
     }
 
     #[test]
     fn single_tool_call() {
-        let s = "Sure! \n\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n\
-                 <\u{ff5c}DSML\u{ff5c}invoke name=\"bash\">\n\
-                 <\u{ff5c}DSML\u{ff5c}parameter name=\"command\" string=\"true\">ls -la</\u{ff5c}DSML\u{ff5c}parameter>\n\
-                 </\u{ff5c}DSML\u{ff5c}invoke>\n\
-                 </\u{ff5c}DSML\u{ff5c}tool_calls>";
-        let ev = one_chunk(s);
-        // Expect: Text("Sure! \n\n"), ToolCall {bash}, ToolCallsEnd
-        assert!(matches!(&ev[0], DsmlEvent::Text(t) if t == "Sure! \n\n"));
-        match &ev[1] {
-            DsmlEvent::ToolCall { name, arguments, index, .. } => {
-                assert_eq!(name, "bash");
-                assert_eq!(*index, 0);
-                let v: serde_json::Value = serde_json::from_str(arguments).unwrap();
-                assert_eq!(v["command"], "ls -la");
+        // "<｜DSML｜tool_calls>" then "<｜DSML｜invoke name=\"bash\">" then
+        // "<｜DSML｜parameter name=\"cmd\" string=\"true\">ls</｜DSML｜parameter>"
+        // then "</｜DSML｜invoke>" then "</｜DSML｜tool_calls>"
+        //
+        // We model TOK_DSML's bytes as the actual `｜DSML｜` UTF-8
+        // (10 bytes) — the scanner must drop them regardless.
+        let dsml_bytes: &[u8] = b"\xef\xbd\x9cDSML\xef\xbd\x9c";
+        let ev = drive(&[
+            (1, b"Sure! "),
+            (1, b"<"),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, b"tool_calls>\n<"),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, b"invoke name=\"bash\">\n<"),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, b"parameter name=\"cmd\" string=\"true\">ls -la</"),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, b"parameter>\n</"),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, b"invoke>\n</"),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, b"tool_calls>"),
+        ]);
+        // No literal `｜DSML｜` bytes anywhere in Text events.
+        for e in &ev {
+            if let DsmlEvent::Text(b) = e {
+                assert!(
+                    !contains_subseq(b, b"\xef\xbd\x9cDSML\xef\xbd\x9c"),
+                    "Text event leaked literal ｜DSML｜ bytes: {:?}",
+                    String::from_utf8_lossy(b)
+                );
             }
-            other => panic!("unexpected: {:?}", other),
         }
-        assert!(matches!(&ev[2], DsmlEvent::ToolCallsEnd));
+        // First event is "Sure! " text.
+        assert!(matches!(&ev[0], DsmlEvent::Text(t) if t.as_slice() == b"Sure! "));
+        // Has a ToolCall with name="bash" and args containing "ls -la".
+        let tc = ev.iter().find_map(|e| {
+            if let DsmlEvent::ToolCall { name, arguments, .. } = e {
+                Some((name.clone(), arguments.clone()))
+            } else {
+                None
+            }
+        });
+        let (name, args) = tc.expect("expected a ToolCall event");
+        assert_eq!(name, "bash");
+        let v: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(v["cmd"], "ls -la");
+        // ToolCallsEnd at the end.
+        assert!(ev.iter().any(|e| matches!(e, DsmlEvent::ToolCallsEnd)));
     }
 
     #[test]
-    fn partial_tag_split_across_chunks() {
-        let mut sc = DsmlScanner::new();
-        let ev1 = sc.push_text("hello <\u{ff5c}DSML");
-        // We've now sent a prefix of the open tag mid-buffer. Should
-        // emit "hello " text and hold the partial.
-        assert_eq!(ev1.len(), 1);
-        match &ev1[0] {
-            DsmlEvent::Text(t) => assert_eq!(t, "hello "),
-            other => panic!("unexpected: {:?}", other),
-        }
-        let ev2 = sc.push_text(
-            "\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"x\">\n\
-             </\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>",
-        );
-        // Now we expect ToolCall and ToolCallsEnd.
-        assert!(ev2.iter().any(|e| matches!(e, DsmlEvent::ToolCall { name, .. } if name == "x")));
-        assert!(ev2.iter().any(|e| matches!(e, DsmlEvent::ToolCallsEnd)));
-    }
-
-    #[test]
-    fn json_typed_parameter() {
-        let s = "<\u{ff5c}DSML\u{ff5c}tool_calls>\n\
-                 <\u{ff5c}DSML\u{ff5c}invoke name=\"f\">\n\
-                 <\u{ff5c}DSML\u{ff5c}parameter name=\"n\" string=\"false\">42</\u{ff5c}DSML\u{ff5c}parameter>\n\
-                 <\u{ff5c}DSML\u{ff5c}parameter name=\"flag\" string=\"false\">true</\u{ff5c}DSML\u{ff5c}parameter>\n\
-                 </\u{ff5c}DSML\u{ff5c}invoke>\n\
-                 </\u{ff5c}DSML\u{ff5c}tool_calls>";
-        let ev = one_chunk(s);
-        let tc = ev
-            .iter()
-            .find_map(|e| {
-                if let DsmlEvent::ToolCall { arguments, .. } = e {
-                    Some(arguments.clone())
-                } else {
-                    None
-                }
-            })
-            .expect("tool call present");
-        let v: serde_json::Value = serde_json::from_str(&tc).unwrap();
-        assert_eq!(v["n"], 42);
-        assert_eq!(v["flag"], true);
-    }
-
-    #[test]
-    fn parallel_tool_calls() {
-        let s = "<\u{ff5c}DSML\u{ff5c}tool_calls>\n\
-                 <\u{ff5c}DSML\u{ff5c}invoke name=\"a\">\n\
-                 </\u{ff5c}DSML\u{ff5c}invoke>\n\
-                 <\u{ff5c}DSML\u{ff5c}invoke name=\"b\">\n\
-                 </\u{ff5c}DSML\u{ff5c}invoke>\n\
-                 </\u{ff5c}DSML\u{ff5c}tool_calls>";
-        let ev = one_chunk(s);
+    fn parallel_tool_calls_indices() {
+        let dsml_bytes: &[u8] = b"\xef\xbd\x9cDSML\xef\xbd\x9c";
+        let ev = drive(&[
+            (1, b"<"),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, b"tool_calls>\n<"),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, b"invoke name=\"a\">\n</"),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, b"invoke>\n<"),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, b"invoke name=\"b\">\n</"),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, b"invoke>\n</"),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, b"tool_calls>"),
+        ]);
         let calls: Vec<_> = ev
             .iter()
             .filter_map(|e| {
@@ -677,27 +779,12 @@ mod tests {
         assert_eq!(calls, vec![(0, "a".into()), (1, "b".into())]);
     }
 
-    #[test]
-    fn escaped_param_close_in_body() {
-        // The model is instructed to emit "&lt;/｜DSML｜parameter>" when
-        // a string body contains the closing tag verbatim.
-        let s = "<\u{ff5c}DSML\u{ff5c}tool_calls>\n\
-                 <\u{ff5c}DSML\u{ff5c}invoke name=\"t\">\n\
-                 <\u{ff5c}DSML\u{ff5c}parameter name=\"x\" string=\"true\">a &amp; b &lt; c</\u{ff5c}DSML\u{ff5c}parameter>\n\
-                 </\u{ff5c}DSML\u{ff5c}invoke>\n\
-                 </\u{ff5c}DSML\u{ff5c}tool_calls>";
-        let ev = one_chunk(s);
-        let tc = ev
-            .iter()
-            .find_map(|e| {
-                if let DsmlEvent::ToolCall { arguments, .. } = e {
-                    Some(arguments.clone())
-                } else {
-                    None
-                }
-            })
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_str(&tc).unwrap();
-        assert_eq!(v["x"], "a & b < c");
+    fn contains_subseq(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        haystack
+            .windows(needle.len())
+            .any(|w| w == needle)
     }
 }

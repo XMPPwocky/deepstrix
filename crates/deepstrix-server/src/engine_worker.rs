@@ -55,10 +55,18 @@ impl FinishReason {
 /// Events emitted by the worker during a generation.
 #[derive(Debug)]
 pub enum WorkerEvent {
-    /// One token's decoded bytes, with a flag for whether we're inside
-    /// a `<think>…</think>` block. The caller routes reasoning vs.
-    /// content to different SSE fields based on this flag.
-    Chunk { text: String, reasoning: bool },
+    /// One token's raw decoded bytes, with the token's id (so the
+    /// handler's DSML scanner can react to TOK_DSML structurally) and
+    /// a flag for whether we're inside a `<think>…</think>` block.
+    /// Bytes are NOT UTF-8-validated — BPE can split a multi-byte
+    /// UTF-8 character (e.g. `─` = E2 94 80) across tokens, so
+    /// per-token bytes are often a fragment. The handler maintains
+    /// the cross-chunk UTF-8 buffer for JSON-safe output.
+    Chunk {
+        token_id: i32,
+        bytes: Vec<u8>,
+        reasoning: bool,
+    },
     /// Generation finished.
     Done {
         prompt_tokens: u32,
@@ -980,22 +988,25 @@ fn finish_decode(
             // Token itself is suppressed.
         } else if let Some(bytes) = state.vocab.token_text(next) {
             let raw = gpt2_decode_token(bytes, &state.byte_decoder);
-            if !raw.is_empty() {
-                let s = String::from_utf8_lossy(&raw).into_owned();
-                if tx
-                    .blocking_send(WorkerEvent::Chunk {
-                        text: s,
-                        reasoning: in_think,
-                    })
-                    .is_err()
-                {
-                    // Receiver dropped (client disconnected, e.g.).
-                    // The KV cache mid-decode is now inconsistent
-                    // with live.tokens; mark it as such by clearing
-                    // live so the next request reset-prefills.
-                    state.live = None;
-                    return Ok(());
-                }
+            // Always emit, even for empty raw — TOK_DSML's bytes are
+            // routinely the model's primary signal and must be visible
+            // to the scanner even though their bytes get suppressed
+            // downstream. (For non-DSML empty-decoding tokens this
+            // is a no-op for the scanner anyway.)
+            if tx
+                .blocking_send(WorkerEvent::Chunk {
+                    token_id: next,
+                    bytes: raw,
+                    reasoning: in_think,
+                })
+                .is_err()
+            {
+                // Receiver dropped (client disconnected, e.g.).
+                // The KV cache mid-decode is now inconsistent
+                // with live.tokens; mark it as such by clearing
+                // live so the next request reset-prefills.
+                state.live = None;
+                return Ok(());
             }
         }
         if completion_tokens >= max_new {
@@ -1058,6 +1069,22 @@ fn finish_decode(
         completion_tokens,
         finish,
     });
+
+    // Snapshot the just-completed turn to disk so:
+    //   * cross-restart resumption works (server crash → next request
+    //     can restore from the most recent turn-boundary snapshot)
+    //   * conversation switches restore from the last turn boundary
+    //   * mid-turn divergences (user interruption / tool-call
+    //     rejection) fall back to the previous turn's snapshot —
+    //     close enough that the new prefill is ~hundreds of tokens
+    //     instead of full restart from 0
+    //
+    // This runs AFTER `Done` so the response is already on the wire
+    // when the snapshot write starts; the worker still blocks for ~1-2s
+    // before accepting the next request, but the user has their
+    // response in hand.
+    save_live_if_dirty(state);
+
     Ok(())
 }
 
@@ -1090,33 +1117,90 @@ fn prefill_suffix(state: &mut WorkerState, tokens: &[i32], pos0: u32) -> eyre::R
     Ok(())
 }
 
-/// Convenience helper used by oneshot helpers (kept for backwards
-/// compat with the Phase 1 handler; will be removed once everything
-/// goes through the stream interface).
 #[derive(Debug, Clone)]
 pub struct GenerateResult {
+    /// Plain text content (post-DSML-scanner, UTF-8-clean).
     pub text: String,
+    /// Tool calls parsed out of the DSML markup.
+    pub tool_calls: Vec<crate::openai::types::ToolCall>,
+    /// True if the scanner saw any tool call or the tool_calls block
+    /// closed (used to set finish_reason="tool_calls").
+    pub saw_tool: bool,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub finish_reason: FinishReason,
 }
 
-/// Drain a `submit` stream into a single accumulated result. The
-/// `text` field collects only NON-reasoning content (post-`</think>`),
-/// which is what OpenAI clients expect for `choices[].message.content`.
-/// Reasoning tokens are dropped (clients see them via `reasoning_content`
-/// in the streaming path; the non-streaming path doesn't have a
-/// `reasoning_content` field today).
+/// Drain a `submit` stream into a single accumulated result, driving
+/// the DSML scanner so TOK_DSML bytes never leak into the text field
+/// and tool calls are separated out structurally. Used by the
+/// non-streaming chat-completions path.
+///
+/// `tok_dsml` is the vocab's `｜DSML｜` token id — pass `None` to
+/// disable DSML scanning (treat all content as plain text).
+///
+/// The text field gets only NON-reasoning, post-DSML-scanner content.
+/// Reasoning tokens are dropped (OpenAI's non-streaming response
+/// doesn't have a reasoning_content field). A UTF-8 buffer holds
+/// trailing 0–3 bytes of any incomplete multi-byte character across
+/// scanner Text events.
 pub async fn accumulate(
     mut rx: mpsc::Receiver<WorkerEvent>,
+    tok_dsml: Option<i32>,
 ) -> eyre::Result<GenerateResult> {
+    use crate::dsml::{DsmlEvent, DsmlScanner};
+    use crate::openai::types::{ToolCall, ToolCallFunction};
+
     let mut text = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut saw_tool = false;
+    let mut pending: Vec<u8> = Vec::new();
     let mut last: Option<(u32, u32, FinishReason)> = None;
+    let mut scanner = DsmlScanner::new(tok_dsml.unwrap_or(-1));
+
+    fn drain_valid_utf8(pending: &mut Vec<u8>, chunk: &[u8]) -> String {
+        pending.extend_from_slice(chunk);
+        let valid_to = match std::str::from_utf8(pending) {
+            Ok(_) => pending.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_to == 0 {
+            return String::new();
+        }
+        let drained: Vec<u8> = pending.drain(..valid_to).collect();
+        String::from_utf8(drained).unwrap()
+    }
+
     while let Some(ev) = rx.recv().await {
         match ev {
-            WorkerEvent::Chunk { text: s, reasoning } => {
-                if !reasoning {
-                    text.push_str(&s);
+            WorkerEvent::Chunk {
+                token_id,
+                bytes,
+                reasoning,
+            } => {
+                if reasoning {
+                    continue;
+                }
+                for de in scanner.push_token(token_id, &bytes) {
+                    match de {
+                        DsmlEvent::Text(b) => {
+                            let s = drain_valid_utf8(&mut pending, &b);
+                            if !s.is_empty() {
+                                text.push_str(&s);
+                            }
+                        }
+                        DsmlEvent::ToolCall {
+                            id, name, arguments, ..
+                        } => {
+                            saw_tool = true;
+                            tool_calls.push(ToolCall {
+                                id,
+                                kind: "function".into(),
+                                function: ToolCallFunction { name, arguments },
+                            });
+                        }
+                        DsmlEvent::ToolCallsEnd => saw_tool = true,
+                    }
                 }
             }
             WorkerEvent::Done {
@@ -1129,9 +1213,23 @@ pub async fn accumulate(
             WorkerEvent::Error(e) => return Err(eyre!("engine error: {e}")),
         }
     }
+    // Drain scanner state.
+    for de in scanner.finish() {
+        if let DsmlEvent::Text(b) = de {
+            let s = drain_valid_utf8(&mut pending, &b);
+            if !s.is_empty() {
+                text.push_str(&s);
+            }
+        }
+    }
+    if !pending.is_empty() {
+        text.push_str(&String::from_utf8_lossy(&pending));
+    }
     let (p, c, f) = last.ok_or_else(|| eyre!("worker closed without Done"))?;
     Ok(GenerateResult {
         text,
+        tool_calls,
+        saw_tool,
         prompt_tokens: p,
         completion_tokens: c,
         finish_reason: f,

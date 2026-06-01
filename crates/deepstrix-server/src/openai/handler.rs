@@ -91,6 +91,7 @@ pub async fn chat_completions(
         .submit(gen_req, req.session_id.clone())
         .map_err(ApiError::from)?;
 
+    let tok_dsml = engine.vocab.dsml_id;
     if stream {
         // The cancel guard moves into the SSE driver. When the
         // SSE response (and its task) is dropped — e.g. client
@@ -106,6 +107,7 @@ pub async fn chat_completions(
             guard,
             include_usage,
             prompt_tokens_count,
+            tok_dsml,
         ));
         let stream = poll_fn::<Result<Event, Infallible>, _>(move |cx| sse_rx.poll_recv(cx));
         Ok(Sse::new(stream)
@@ -113,17 +115,40 @@ pub async fn chat_completions(
             .into_response())
     } else {
         let guard = CancelOnDrop(cancel);
-        let result = accumulate(rx).await.map_err(ApiError::from)?;
-        drop(guard); // explicit no-op: generation done, no need to cancel
-        let blocking = build_blocking_response(
+        let result = accumulate(rx, tok_dsml).await.map_err(ApiError::from)?;
+        drop(guard);
+        let finish_reason = if result.saw_tool {
+            "tool_calls"
+        } else {
+            result.finish_reason.as_openai()
+        };
+        let resp = ChatCompletionResponse {
             id,
+            object: "chat.completion",
+            created: unix_now(),
             model,
-            result.text,
-            prompt_tokens_count,
-            result.completion_tokens,
-            result.finish_reason,
-        );
-        Ok(Json(blocking).into_response())
+            choices: vec![Choice {
+                index: 0,
+                message: ChatMessage {
+                    role: Role::Assistant,
+                    content: if result.text.is_empty() {
+                        None
+                    } else {
+                        Some(result.text)
+                    },
+                    tool_calls: result.tool_calls,
+                    tool_call_id: None,
+                    name: None,
+                },
+                finish_reason,
+            }],
+            usage: Usage {
+                prompt_tokens: prompt_tokens_count,
+                completion_tokens: result.completion_tokens,
+                total_tokens: prompt_tokens_count + result.completion_tokens,
+            },
+        };
+        Ok(Json(resp).into_response())
     }
 }
 
@@ -159,73 +184,6 @@ pub async fn healthz() -> &'static str {
     "ok\n"
 }
 
-fn build_blocking_response(
-    id: String,
-    model: String,
-    raw_text: String,
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    finish: FinishReason,
-) -> ChatCompletionResponse {
-    // Pass the full text through the scanner to separate tool calls
-    // from plain text.
-    let mut scanner = DsmlScanner::new();
-    let mut events = scanner.push_text(&raw_text);
-    events.extend(scanner.finish());
-
-    let mut content_text = String::new();
-    let mut tool_calls: Vec<ToolCall> = Vec::new();
-    let mut saw_tool = false;
-    for ev in events {
-        match ev {
-            DsmlEvent::Text(s) => content_text.push_str(&s),
-            DsmlEvent::ToolCall {
-                id, name, arguments, ..
-            } => {
-                tool_calls.push(ToolCall {
-                    id,
-                    kind: "function".into(),
-                    function: ToolCallFunction { name, arguments },
-                });
-                saw_tool = true;
-            }
-            DsmlEvent::ToolCallsEnd => saw_tool = true,
-        }
-    }
-
-    let finish_reason = if saw_tool {
-        "tool_calls"
-    } else {
-        finish.as_openai()
-    };
-
-    ChatCompletionResponse {
-        id,
-        object: "chat.completion",
-        created: unix_now(),
-        model,
-        choices: vec![Choice {
-            index: 0,
-            message: ChatMessage {
-                role: Role::Assistant,
-                content: if content_text.is_empty() {
-                    None
-                } else {
-                    Some(content_text)
-                },
-                tool_calls,
-                tool_call_id: None,
-                name: None,
-            },
-            finish_reason,
-        }],
-        usage: Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-        },
-    }
-}
 
 /// Drives the SSE stream forward: pulls `WorkerEvent`s, runs them
 /// through the DSML scanner, and pushes encoded `Event`s into `out`.
@@ -237,6 +195,7 @@ async fn drive_sse_stream(
     _cancel_guard: CancelOnDrop,
     include_usage: bool,
     prompt_tokens: u32,
+    tok_dsml: Option<i32>,
 ) {
     let created = unix_now();
     let send = |delta: ChunkDelta,
@@ -255,20 +214,44 @@ async fn drive_sse_stream(
         return;
     }
 
-    let mut scanner = DsmlScanner::new();
+    // The scanner is driven by TOK_DSML (vocab-dependent). If the
+    // vocab didn't expose a dsml_id (non-V4-Flash model), fall back
+    // to a sentinel that never matches — effectively disabling DSML
+    // detection.
+    let scanner_tok_dsml = tok_dsml.unwrap_or(-1);
+    let mut scanner = DsmlScanner::new(scanner_tok_dsml);
     let mut sent_tool_index: u32 = 0;
     let mut saw_tool = false;
     let mut finish_reason: &'static str = "stop";
     let mut completion_tokens: u32 = 0;
+    // UTF-8 buffers per channel. Applied to *bytes the scanner emits
+    // as Text*, not to raw worker bytes — so the scanner sees the
+    // raw byte stream including TOK_DSML's bytes, which it discards.
+    let mut content_pending: Vec<u8> = Vec::new();
+    let mut reasoning_pending: Vec<u8> = Vec::new();
+
+    fn drain_valid_utf8(pending: &mut Vec<u8>, chunk: &[u8]) -> String {
+        pending.extend_from_slice(chunk);
+        let valid_to = match std::str::from_utf8(pending) {
+            Ok(_) => pending.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_to == 0 {
+            return String::new();
+        }
+        let drained: Vec<u8> = pending.drain(..valid_to).collect();
+        String::from_utf8(drained).unwrap()
+    }
 
     while let Some(ev) = rx.recv().await {
         match ev {
-            WorkerEvent::Chunk { text: s, reasoning } => {
+            WorkerEvent::Chunk {
+                token_id,
+                bytes,
+                reasoning,
+            } => {
                 if reasoning {
-                    // Reasoning tokens don't go through the DSML
-                    // scanner — they live outside the tool-call grammar
-                    // (the model only emits DSML AFTER </think>). Emit
-                    // them directly on the reasoning_content channel.
+                    let s = drain_valid_utf8(&mut reasoning_pending, &bytes);
                     if !s.is_empty()
                         && out.send(send(reasoning_delta(s), None)).await.is_err()
                     {
@@ -276,12 +259,15 @@ async fn drive_sse_stream(
                     }
                     continue;
                 }
-                let events = scanner.push_text(&s);
-                for de in events {
+                // Drive the scanner with the actual token-id + bytes;
+                // it suppresses TOK_DSML bytes regardless and emits
+                // clean Text/ToolCall events.
+                for de in scanner.push_token(token_id, &bytes) {
                     match de {
                         DsmlEvent::Text(t) => {
-                            if !t.is_empty()
-                                && out.send(send(text_delta(t), None)).await.is_err()
+                            let s = drain_valid_utf8(&mut content_pending, &t);
+                            if !s.is_empty()
+                                && out.send(send(text_delta(s), None)).await.is_err()
                             {
                                 return;
                             }
@@ -332,14 +318,34 @@ async fn drive_sse_stream(
                 ..
             } => {
                 completion_tokens = ct;
-                let tail = scanner.finish();
-                for de in tail {
+                // Drain anything still buffered in the scanner.
+                for de in scanner.finish() {
                     if let DsmlEvent::Text(t) = de {
-                        if !t.is_empty()
-                            && out.send(send(text_delta(t), None)).await.is_err()
+                        let s = drain_valid_utf8(&mut content_pending, &t);
+                        if !s.is_empty()
+                            && out.send(send(text_delta(s), None)).await.is_err()
                         {
                             return;
                         }
+                    }
+                }
+                // Lossy-flush any trailing partial bytes.
+                if !content_pending.is_empty() {
+                    let s = String::from_utf8_lossy(&content_pending).into_owned();
+                    content_pending.clear();
+                    if !s.is_empty()
+                        && out.send(send(text_delta(s), None)).await.is_err()
+                    {
+                        return;
+                    }
+                }
+                if !reasoning_pending.is_empty() {
+                    let s = String::from_utf8_lossy(&reasoning_pending).into_owned();
+                    reasoning_pending.clear();
+                    if !s.is_empty()
+                        && out.send(send(reasoning_delta(s), None)).await.is_err()
+                    {
+                        return;
                     }
                 }
                 finish_reason = if saw_tool {
