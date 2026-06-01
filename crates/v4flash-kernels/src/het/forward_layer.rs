@@ -154,6 +154,39 @@ impl HeterogeneousEngine {
         if is_first_layer {
             let _t_mhc_pre = de.events.stage("dgpu.mhc_pre_attn", &de.compute)?;
             let _s_mhc_pre = debug_span!("mhc_pre_attn").entered();
+            // Single fused kernel replaces the 5-kernel chain. Wrapped in
+            // the same graph-replay path so launch is amortized identically
+            // to the original chain — the win (if any) comes from the
+            // single in-WG pipeline instead of 5 short kernels.
+            // ENV MHC_FUSED=0 rolls back to the 5-kernel chain.
+            // MHC_FUSED=1 enables the fused mhc_pre_fused kernel. Default
+            // OFF: the 5-kernel chain in a captured graph is FASTER than
+            // the fused single-WG version because the standalone f16.matvec
+            // uses 24 WGs (~24 CUs) for the HC_MIX_DIM=24 outputs while the
+            // single-WG fused kernel is limited to 1 CU. Graph capture
+            // already amortizes launch overhead to ~1 µs/kernel. The
+            // chain's bottleneck was matvec WORK, not launch overhead —
+            // our "12 ms/tok launch-overhead-bound" estimate was wrong.
+            // The kernel is kept in tree for the rollback and as documented
+            // negative result.
+            let mhc_fused = std::env::var("MHC_FUSED")
+                .map(|v| v != "0").unwrap_or(false);
+            if mhc_fused {
+                self.dgpu_graphs.run("mhc_pre_attn_fused", layer as u32, &de.compute, |s| {
+                    de.mhc_pre_fused.launch(
+                        s,
+                        &mut dgpu_scratch.attn_input_norm,
+                        &dgpu_scratch.residual,
+                        &dlw.hc_attn_fn.buffer,
+                        &dlw.hc_attn_scale,
+                        &dlw.hc_attn_base,
+                        &dlw.attn_norm,
+                        RMS_EPS,
+                        SINKHORN_ITERS,
+                    )?;
+                    Ok(())
+                })?;
+            } else {
             self.dgpu_graphs.run("mhc_pre_attn", layer as u32, &de.compute, |s| {
                 de.rms_nw.launch(s, &mut dgpu_scratch.flat, &dgpu_scratch.residual, 1, HC_DIM, RMS_EPS)?;
                 de.f16.matvec(s, &mut dgpu_scratch.mix, &dlw.hc_attn_fn.buffer, &dgpu_scratch.flat, HC_MIX_DIM, HC_DIM)?;
@@ -162,6 +195,7 @@ impl HeterogeneousEngine {
                 de.rms_w.launch_weighted(s, &mut dgpu_scratch.attn_input_norm, &dgpu_scratch.attn_cur, &dlw.attn_norm, N_EMBD, RMS_EPS)?;
                 Ok(())
             })?;
+            }
             drop(_s_mhc_pre);
             _t_mhc_pre.end()?;
         }
@@ -555,6 +589,24 @@ impl HeterogeneousEngine {
         // into a HIP graph on first call and replayed thereafter.
         let _t_mhc_pre_ffn = de.events.stage("dgpu.mhc_pre_ffn", &de.compute)?;
         let _s_mhc_pre_ffn = debug_span!("mhc_pre_ffn").entered();
+        let mhc_fused = std::env::var("MHC_FUSED")
+            .map(|v| v != "0").unwrap_or(false);
+        if mhc_fused {
+            self.dgpu_graphs.run("mhc_pre_ffn_fused", layer as u32, &de.compute, |s| {
+                de.mhc_pre_fused.launch(
+                    s,
+                    &mut dgpu_scratch.ffn_input_norm,
+                    &dgpu_scratch.after_attn_hc,
+                    &dlw.hc_ffn_fn.buffer,
+                    &dlw.hc_ffn_scale,
+                    &dlw.hc_ffn_base,
+                    &dlw.ffn_norm,
+                    RMS_EPS,
+                    SINKHORN_ITERS,
+                )?;
+                Ok(())
+            })?;
+        } else {
         self.dgpu_graphs.run("mhc_pre_ffn", layer as u32, &de.compute, |s| {
             de.rms_nw.launch(s, &mut dgpu_scratch.flat, &dgpu_scratch.after_attn_hc, 1, HC_DIM, RMS_EPS)?;
             de.f16.matvec(s, &mut dgpu_scratch.mix, &dlw.hc_ffn_fn.buffer, &dgpu_scratch.flat, HC_MIX_DIM, HC_DIM)?;
@@ -563,6 +615,7 @@ impl HeterogeneousEngine {
             de.rms_w.launch_weighted(s, &mut dgpu_scratch.ffn_input_norm, &dgpu_scratch.ffn_cur, &dlw.ffn_norm, N_EMBD, RMS_EPS)?;
             Ok(())
         })?;
+        }
         drop(_s_mhc_pre_ffn);
         _t_mhc_pre_ffn.end()?;
 
