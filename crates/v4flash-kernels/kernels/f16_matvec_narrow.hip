@@ -60,6 +60,48 @@ extern "C" __global__ void f16_matvec_narrow(
     }
 }
 
+// Pre-scaled narrow variant — out[r] = pre_scale[0] * sum_i W[r,i] * x[i].
+// Folds the rms_norm apply step into the matvec: the input vector is
+// implicitly multiplied by a scalar (read once at the end) instead of
+// reading a pre-multiplied flat[] buffer. Eliminates one full N=k DRAM
+// round-trip and one kernel launch from the mhc_pre chain.
+extern "C" __global__ void f16_matvec_narrow_pre_scaled(
+        float          * __restrict__ out,        // [n_rows]
+        const __half   * __restrict__ weight,     // [n_rows, k]
+        const float    * __restrict__ x,          // [k]
+        const float    * __restrict__ pre_scale,  // [1]
+        unsigned int     k,
+        unsigned int     n_rows) {
+    const uint32_t row = blockIdx.x;
+    if (row >= n_rows) return;
+
+    const __half *wr = weight + (size_t)row * (size_t)k;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & (F16N_WARP - 1u);
+    const uint32_t warp = tid >> 5u;
+
+    float acc = 0.0f;
+    for (uint32_t i = tid; i < k; i += F16N_BLOCK_THREADS) {
+        acc += __half2float(wr[i]) * x[i];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down(acc, offset, F16N_WARP);
+    }
+
+    __shared__ float per_warp[F16N_MAX_WARPS];
+    if (lane == 0) per_warp[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < F16N_MAX_WARPS) ? per_warp[lane] : 0.0f;
+        for (int offset = F16N_MAX_WARPS / 2; offset > 0; offset >>= 1) {
+            v += __shfl_down(v, offset, F16N_WARP);
+        }
+        if (lane == 0) {
+            out[row] = v * pre_scale[0];
+        }
+    }
+}
+
 // M40-P7: narrow variant for the 2-input matvec pattern. Used by
 // `mhc_pre_attn`/`mhc_pre_ffn` in pair-forward where the n_rows=24
 // `f16_matvec_two_inputs` wide variant launched only 3 WGs and ran at

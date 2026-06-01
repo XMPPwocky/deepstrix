@@ -125,6 +125,103 @@ impl RmsNorm {
 /// `n_rows` independent rows of length `n` (stride n); one workgroup per
 /// row. Used by V4 Flash for `head_rms_norm_inplace` (n_rows=64, n=512)
 /// and by the head's `output_flat` normalisation (M10; n_rows=1, n=16384).
+// Multi-WG variant of rms_norm_no_weight. Single-WG version is 150× off
+// BW roofline because 63/64 CUs sit idle for a 128 KB memcpy-style op.
+pub struct RmsNormNoWeightMultiWG {
+    module: Module,
+}
+
+const RMS_NORM_NW_MULTIWG_GFX1201: &[u8] =
+    include_bytes!(env!("KERNEL_RMS_NORM_NO_WEIGHT_MULTIWG_GFX1201"));
+const RMS_NORM_NW_MULTIWG_GFX1151: &[u8] =
+    include_bytes!(env!("KERNEL_RMS_NORM_NO_WEIGHT_MULTIWG_GFX1151"));
+
+impl RmsNormNoWeightMultiWG {
+    pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            RMS_NORM_NW_MULTIWG_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            RMS_NORM_NW_MULTIWG_GFX1151
+        } else {
+            return Err(eyre!("unsupported arch for rms_norm_no_weight_multiwg: {arch}"));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    /// Two-kernel multi-WG RMS norm without weight. `partial_buf` is sized
+    /// `n_wgs` f32 elements — each WG writes one slot, no zeroing required.
+    /// Grid uses `n_wgs` WGs of 256 threads each; `n` must be a multiple
+    /// of `n_wgs`.
+    pub fn launch(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        partial_buf: &mut DeviceBuffer<f32>,    // [n_wgs] — per-WG partials (no zero needed)
+        n: u32,
+        n_wgs: u32,
+        eps: f32,
+    ) -> eyre::Result<()> {
+        if n % n_wgs != 0 {
+            return Err(eyre!(
+                "rms_norm_no_weight_multiwg: n={n} not divisible by n_wgs={n_wgs}"
+            ));
+        }
+        if (partial_buf.len() as u32) < n_wgs {
+            return Err(eyre!(
+                "rms_norm_no_weight_multiwg: partial_buf len={} < n_wgs={n_wgs}",
+                partial_buf.len()
+            ));
+        }
+        let f_part = self
+            .module
+            .get_function("rms_norm_partial_sum_sq")?;
+        let f_apply = self.module.get_function("rms_norm_apply_scale")?;
+        let cfg = LaunchConfig {
+            grid: (n_wgs, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(f_part, cfg, stream, [partial_buf.raw(), x.raw(), n])?;
+        launch_kernel!(f_apply, cfg, stream, [out.raw(), x.raw(), partial_buf.raw(), n, n_wgs, eps])
+    }
+
+    /// Compute inv_rms scalar only (no apply pass). Pairs with
+    /// `F16Matvec::matvec_pre_scaled` to fold the per-element scale into
+    /// the next kernel — saves one N-sized DRAM round-trip + one launch.
+    /// Two-kernel: multi-WG partial sum, then a 1-thread finalize that
+    /// reduces the partials and computes `1/sqrt(mean_sq + eps)`.
+    pub fn launch_inv_only(
+        &self,
+        stream: &Stream,
+        inv_out: &mut DeviceBuffer<f32>,        // [1]
+        x: &DeviceBuffer<f32>,
+        partial_buf: &mut DeviceBuffer<f32>,    // [n_wgs]
+        n: u32,
+        n_wgs: u32,
+        eps: f32,
+    ) -> eyre::Result<()> {
+        if n % n_wgs != 0 {
+            return Err(eyre!("inv_only: n={n} not divisible by n_wgs={n_wgs}"));
+        }
+        let f_part = self.module.get_function("rms_norm_partial_sum_sq")?;
+        let f_fin  = self.module.get_function("rms_norm_finalize_inv")?;
+        let cfg_part = LaunchConfig {
+            grid: (n_wgs, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let cfg_fin = LaunchConfig {
+            grid: (1, 1, 1),
+            block: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(f_part, cfg_part, stream, [partial_buf.raw(), x.raw(), n])?;
+        launch_kernel!(f_fin, cfg_fin, stream, [inv_out.raw(), partial_buf.raw(), n, n_wgs, eps])
+    }
+}
+
 pub struct RmsNormNoWeight {
     module: Module,
 }

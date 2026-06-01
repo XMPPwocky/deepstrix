@@ -148,6 +148,46 @@ impl F16Matvec {
     /// `out[r] = sum_i f32(weight[r, i]) * x[i]` for `r in 0..n_rows`.
     /// Weight is F16 row-major `[n_rows, k]`, passed as a `DeviceBuffer<u8>`
     /// holding raw F16 bytes (mirrors how Q8_0 weights are passed).
+    /// Pre-scaled matvec: same as `matvec` but each output is multiplied
+    /// by the scalar in `pre_scale[0]`. Pairs with a multi-WG RMS variant
+    /// that just computes inv_rms (no apply pass) — eliminates one full
+    /// N=k DRAM round-trip and one kernel launch from the mhc_pre chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_pre_scaled(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        x: &DeviceBuffer<f32>,
+        pre_scale: &DeviceBuffer<f32>,  // [1]
+        n_rows: u32,
+        k: u32,
+    ) -> eyre::Result<()> {
+        if n_rows < NARROW_ROWS_THRESHOLD {
+            let function = self.narrow.get_function("f16_matvec_narrow_pre_scaled")?;
+            let cfg = LaunchConfig {
+                grid: (n_rows, 1, 1),
+                block: (NARROW_BLOCK_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            launch_kernel!(function, cfg, stream, [
+                out.raw(), weight.raw(), x.raw(), pre_scale.raw(), k, n_rows
+            ])
+        } else {
+            let function = self.wide.get_function("f16_matvec_pre_scaled")?;
+            let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
+            let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
+            let cfg = LaunchConfig {
+                grid: (grid_x, 1, 1),
+                block: (block_x, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            launch_kernel!(function, cfg, stream, [
+                out.raw(), weight.raw(), x.raw(), pre_scale.raw(), k, n_rows
+            ])
+        }
+    }
+
     pub fn matvec(
         &self,
         stream: &Stream,

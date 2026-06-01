@@ -79,6 +79,14 @@ pub struct DgpuScratch {
     pub attn_partials: DeviceBuffer<f32>,
     pub attn_inv_per_head: DeviceBuffer<f32>,
 
+    // Per-WG sum-sq partials for the multi-WG rms_norm_no_weight kernel.
+    // Sized for max n_wgs=64; production uses n_wgs=16.
+    pub rms_nw_partials: DeviceBuffer<f32>,
+    // 1-element scalar holding inv_rms = 1/sqrt(mean(x²)+eps) for the
+    // fused rms_nw + pre-scaled matvec pair. Pair: RmsNormNoWeightMultiWG
+    // ::launch_inv_only → F16Matvec::matvec_pre_scaled.
+    pub rms_nw_inv_scalar: DeviceBuffer<f32>,
+
     // Compressor scratch (lives on dGPU alongside attn_input_norm).
     pub kv_cur: DeviceBuffer<f32>,
     pub sc_cur: DeviceBuffer<f32>,
@@ -168,6 +176,8 @@ impl DgpuScratch {
                 16 * (N_HEAD as usize) * (N_HEAD_DIM as usize),
             )?,
             attn_inv_per_head: DeviceBuffer::new(device_id, N_HEAD as usize)?,
+            rms_nw_partials: DeviceBuffer::new(device_id, 64)?,
+            rms_nw_inv_scalar: DeviceBuffer::new(device_id, 1)?,
 
             kv_cur: DeviceBuffer::new(device_id, (2 * N_HEAD_DIM) as usize)?,
             sc_cur: DeviceBuffer::new(device_id, (2 * N_HEAD_DIM) as usize)?,

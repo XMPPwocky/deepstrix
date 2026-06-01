@@ -64,6 +64,6 @@ pub use q4_k::{Q4KMatvec, BLOCK_Q4_K_BYTES};
 pub use q8_0::{Q8_0GroupedMatvec, Q8_0Matvec, Q8_0MatvecWmma};
 pub use q8_k::{Q8KQuantize, BLOCK_Q8_K_BYTES, QK_K};
 pub use mhc_pre_fused::MhcPreFused;
-pub use rms_norm::{RmsNorm, RmsNormNoWeight};
+pub use rms_norm::{RmsNorm, RmsNormNoWeight, RmsNormNoWeightMultiWG};
 pub use rope::{RopeParams, RopeTail};
 pub use weights::{load_to_device, DeviceWeight};

@@ -44,6 +44,39 @@ extern "C" __global__ void f16_matvec(
     if (lane == 0) out[row] = acc;
 }
 
+// Fused pre-scaled variant: identical to f16_matvec but each x[i] is
+// implicitly multiplied by a *scalar* `pre_scale` read once from a 1-element
+// device buffer. Pairs with a multi-WG RMS that just computes inv_rms
+// without writing the applied-vector — the apply pass and its DRAM
+// round-trip get eliminated (each output reads residual + scalar instead
+// of a separate flat[] buffer).
+//   out[r] = pre_scale * sum_i f32(weight[r, i]) * x[i]
+// Algebraically identical to f16_matvec(weight, x * pre_scale, ...) but
+// without materializing the x * pre_scale buffer.
+extern "C" __global__ void f16_matvec_pre_scaled(
+        float          * __restrict__ out,        // [n_rows]
+        const __half   * __restrict__ weight,     // [n_rows, k]
+        const float    * __restrict__ x,          // [k]
+        const float    * __restrict__ pre_scale,  // [1]
+        unsigned int     k,
+        unsigned int     n_rows) {
+    uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= n_rows) return;
+
+    const __half *wr = weight + (size_t)row * (size_t)k;
+    // Read the scalar once per WG (broadcast-cached by L1).
+    const float s = pre_scale[0];
+
+    float acc = 0.0f;
+    for (uint32_t i = lane; i < k; i += F16_WARP_LANES) {
+        acc += __half2float(wr[i]) * x[i];
+    }
+
+    acc = f16_warp_sum_f32(acc);
+    if (lane == 0) out[row] = acc * s;
+}
+
 // Batched wide variant: grid.z = B. For each batch element b, computes
 // out[b, r] = sum_i f32(W[r,i]) * x[b, i]. Weight is shared across the
 // batch; x and out are indexed by blockIdx.z. The per-row reduction is the

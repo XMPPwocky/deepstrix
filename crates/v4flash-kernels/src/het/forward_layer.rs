@@ -188,8 +188,28 @@ impl HeterogeneousEngine {
                 })?;
             } else {
             self.dgpu_graphs.run("mhc_pre_attn", layer as u32, &de.compute, |s| {
-                de.rms_nw.launch(s, &mut dgpu_scratch.flat, &dgpu_scratch.residual, 1, HC_DIM, RMS_EPS)?;
-                de.f16.matvec(s, &mut dgpu_scratch.mix, &dlw.hc_attn_fn.buffer, &dgpu_scratch.flat, HC_MIX_DIM, HC_DIM)?;
+                // RMS_NW_MW values:
+                //   "fused" (default): compute inv_rms only, fold scale into
+                //      next f16 matvec (no apply pass, no flat[] DRAM
+                //      round-trip, one fewer launch).
+                //   "split": multi-WG rms_nw + standalone matvec (the
+                //      previous approach).
+                //   "0"/"single": original Grid(1,1,1) single-WG kernel.
+                let mode = std::env::var("RMS_NW_MW").unwrap_or_else(|_| "fused".into());
+                match mode.as_str() {
+                    "0" | "single" => {
+                        de.rms_nw.launch(s, &mut dgpu_scratch.flat, &dgpu_scratch.residual, 1, HC_DIM, RMS_EPS)?;
+                        de.f16.matvec(s, &mut dgpu_scratch.mix, &dlw.hc_attn_fn.buffer, &dgpu_scratch.flat, HC_MIX_DIM, HC_DIM)?;
+                    }
+                    "split" => {
+                        de.rms_nw_mw.launch(s, &mut dgpu_scratch.flat, &dgpu_scratch.residual, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
+                        de.f16.matvec(s, &mut dgpu_scratch.mix, &dlw.hc_attn_fn.buffer, &dgpu_scratch.flat, HC_MIX_DIM, HC_DIM)?;
+                    }
+                    _ => {
+                        de.rms_nw_mw.launch_inv_only(s, &mut dgpu_scratch.rms_nw_inv_scalar, &dgpu_scratch.residual, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
+                        de.f16.matvec_pre_scaled(s, &mut dgpu_scratch.mix, &dlw.hc_attn_fn.buffer, &dgpu_scratch.residual, &dgpu_scratch.rms_nw_inv_scalar, HC_MIX_DIM, HC_DIM)?;
+                    }
+                }
                 de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &dlw.hc_attn_scale, &dlw.hc_attn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
                 de.hc_weighted.launch(s, &mut dgpu_scratch.attn_cur, &dgpu_scratch.residual, &dgpu_scratch.split, N_EMBD, N_HC)?;
                 de.rms_w.launch_weighted(s, &mut dgpu_scratch.attn_input_norm, &dgpu_scratch.attn_cur, &dlw.attn_norm, N_EMBD, RMS_EPS)?;
@@ -608,8 +628,21 @@ impl HeterogeneousEngine {
             })?;
         } else {
         self.dgpu_graphs.run("mhc_pre_ffn", layer as u32, &de.compute, |s| {
-            de.rms_nw.launch(s, &mut dgpu_scratch.flat, &dgpu_scratch.after_attn_hc, 1, HC_DIM, RMS_EPS)?;
-            de.f16.matvec(s, &mut dgpu_scratch.mix, &dlw.hc_ffn_fn.buffer, &dgpu_scratch.flat, HC_MIX_DIM, HC_DIM)?;
+            let mode = std::env::var("RMS_NW_MW").unwrap_or_else(|_| "fused".into());
+            match mode.as_str() {
+                "0" | "single" => {
+                    de.rms_nw.launch(s, &mut dgpu_scratch.flat, &dgpu_scratch.after_attn_hc, 1, HC_DIM, RMS_EPS)?;
+                    de.f16.matvec(s, &mut dgpu_scratch.mix, &dlw.hc_ffn_fn.buffer, &dgpu_scratch.flat, HC_MIX_DIM, HC_DIM)?;
+                }
+                "split" => {
+                    de.rms_nw_mw.launch(s, &mut dgpu_scratch.flat, &dgpu_scratch.after_attn_hc, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
+                    de.f16.matvec(s, &mut dgpu_scratch.mix, &dlw.hc_ffn_fn.buffer, &dgpu_scratch.flat, HC_MIX_DIM, HC_DIM)?;
+                }
+                _ => {
+                    de.rms_nw_mw.launch_inv_only(s, &mut dgpu_scratch.rms_nw_inv_scalar, &dgpu_scratch.after_attn_hc, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
+                    de.f16.matvec_pre_scaled(s, &mut dgpu_scratch.mix, &dlw.hc_ffn_fn.buffer, &dgpu_scratch.after_attn_hc, &dgpu_scratch.rms_nw_inv_scalar, HC_MIX_DIM, HC_DIM)?;
+                }
+            }
             de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &dlw.hc_ffn_scale, &dlw.hc_ffn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
             de.hc_weighted.launch(s, &mut dgpu_scratch.ffn_cur, &dgpu_scratch.after_attn_hc, &dgpu_scratch.split, N_EMBD, N_HC)?;
             de.rms_w.launch_weighted(s, &mut dgpu_scratch.ffn_input_norm, &dgpu_scratch.ffn_cur, &dlw.ffn_norm, N_EMBD, RMS_EPS)?;
@@ -904,8 +937,21 @@ impl HeterogeneousEngine {
                 de.hc_post.launch_from_split(s, &mut dgpu_scratch.residual_next, &dgpu_scratch.ffn_moe_recv, &dgpu_scratch.after_attn_hc, &dgpu_scratch.split, N_HC, N_EMBD, N_HC)?;
                 // mhc_pre_attn half — reads residual_next (= layer N+1's residual
                 // after swap), uses layer N+1's hc/norm weights.
-                de.rms_nw.launch(s, &mut dgpu_scratch.flat, &dgpu_scratch.residual_next, 1, HC_DIM, RMS_EPS)?;
-                de.f16.matvec(s, &mut dgpu_scratch.mix, &next.hc_attn_fn.buffer, &dgpu_scratch.flat, HC_MIX_DIM, HC_DIM)?;
+                let mode = std::env::var("RMS_NW_MW").unwrap_or_else(|_| "fused".into());
+                match mode.as_str() {
+                    "0" | "single" => {
+                        de.rms_nw.launch(s, &mut dgpu_scratch.flat, &dgpu_scratch.residual_next, 1, HC_DIM, RMS_EPS)?;
+                        de.f16.matvec(s, &mut dgpu_scratch.mix, &next.hc_attn_fn.buffer, &dgpu_scratch.flat, HC_MIX_DIM, HC_DIM)?;
+                    }
+                    "split" => {
+                        de.rms_nw_mw.launch(s, &mut dgpu_scratch.flat, &dgpu_scratch.residual_next, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
+                        de.f16.matvec(s, &mut dgpu_scratch.mix, &next.hc_attn_fn.buffer, &dgpu_scratch.flat, HC_MIX_DIM, HC_DIM)?;
+                    }
+                    _ => {
+                        de.rms_nw_mw.launch_inv_only(s, &mut dgpu_scratch.rms_nw_inv_scalar, &dgpu_scratch.residual_next, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
+                        de.f16.matvec_pre_scaled(s, &mut dgpu_scratch.mix, &next.hc_attn_fn.buffer, &dgpu_scratch.residual_next, &dgpu_scratch.rms_nw_inv_scalar, HC_MIX_DIM, HC_DIM)?;
+                    }
+                }
                 de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &next.hc_attn_scale, &next.hc_attn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
                 de.hc_weighted.launch(s, &mut dgpu_scratch.attn_cur, &dgpu_scratch.residual_next, &dgpu_scratch.split, N_EMBD, N_HC)?;
                 de.rms_w.launch_weighted(s, &mut dgpu_scratch.attn_input_norm, &dgpu_scratch.attn_cur, &next.attn_norm, N_EMBD, RMS_EPS)?;
