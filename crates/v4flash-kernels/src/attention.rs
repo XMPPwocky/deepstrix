@@ -252,6 +252,125 @@ impl AttentionMixed {
         ])
     }
 
+    /// B=1 scalar-arg variant of `launch_score_batched_htiled_wmma` —
+    /// f32 scores, drop-in compatible with the existing f32-reading
+    /// `launch_softmax_wsum`. Decode-path scoring.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_score_b1_htiled_wmma(
+        &self,
+        stream: &Stream,
+        scores_g: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
+        n_raw: u32,
+        raw_off: u32,
+        n_comp: u32,
+        n_head: u32,
+        head_dim: u32,
+        n_total_max: u32,
+    ) -> eyre::Result<()> {
+        if n_total_max == 0 {
+            return Ok(());
+        }
+        if n_total_max > ATTN_MIXED_MAX_KEYS {
+            return Err(eyre!(
+                "launch_score_b1_htiled_wmma: n_total_max={n_total_max} exceeds cap {ATTN_MIXED_MAX_KEYS}"
+            ));
+        }
+        let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
+        let function = self
+            .module
+            .get_function("attention_mixed_score_b1_htiled_wmma")?;
+        let cfg = LaunchConfig {
+            grid: ((n_total_max + 255) / 256, 1, 1),
+            block: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
+        launch_kernel!(function, cfg, stream, [
+            scores_g.raw(), q.raw(), raw_kv.raw(), comp_kv_ptr,
+            n_raw, raw_off, n_comp, n_head, head_dim, ATTN_MIXED_MAX_KEYS, kq_scale
+        ])
+    }
+
+    /// B=1 scalar-arg variant of `launch_score_batched_htiled_wmma_f16s`.
+    /// Writes f16 scores; takes scalar n_raw/raw_off/n_comp instead of
+    /// per-batch device buffers — used in the decode path so we don't pay
+    /// 86 copy_from_host calls per token to stamp the buffer-indexed
+    /// variant's counters. Grid (ceil(n_total_max/256), 1, 1), block 512.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_score_b1_htiled_wmma_f16s(
+        &self,
+        stream: &Stream,
+        scores_g: &mut DeviceBuffer<f32>,    // type-aliased to f16 — buffer sized for f32 holds 2× f16
+        q: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
+        n_raw: u32,
+        raw_off: u32,
+        n_comp: u32,
+        n_head: u32,
+        head_dim: u32,
+        n_total_max: u32,
+    ) -> eyre::Result<()> {
+        if n_total_max == 0 {
+            return Ok(());
+        }
+        if n_total_max > ATTN_MIXED_MAX_KEYS {
+            return Err(eyre!(
+                "launch_score_b1_htiled_wmma_f16s: n_total_max={n_total_max} exceeds cap {ATTN_MIXED_MAX_KEYS}"
+            ));
+        }
+        let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
+        let function = self
+            .module
+            .get_function("attention_mixed_score_b1_htiled_wmma_f16s")?;
+        // SCORE_WMMA_KEYS_PER_BLK = 256 (16 warps × 16 keys/warp).
+        let cfg = LaunchConfig {
+            grid: ((n_total_max + 255) / 256, 1, 1),
+            block: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
+        launch_kernel!(function, cfg, stream, [
+            scores_g.raw(), q.raw(), raw_kv.raw(), comp_kv_ptr,
+            n_raw, raw_off, n_comp, n_head, head_dim, ATTN_MIXED_MAX_KEYS, kq_scale
+        ])
+    }
+
+    /// LDS-V variant of `launch_softmax_wsum` — same semantics, V tile is
+    /// cooperatively staged to LDS once per K-tile then per-d reads come
+    /// from LDS. Targets long-ctx decode where the per-K-tile DRAM reads
+    /// of V dominate (~540 µs per dispatch at ratio=4 n_comp=16384).
+    /// Requires head_dim == 512 (the MLA latent width).
+    pub fn launch_softmax_wsum_ldsv(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        scores: &mut DeviceBuffer<f32>,
+        sinks: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
+        n_head: u32,
+        head_dim: u32,
+        n_raw: u32,
+        n_comp: u32,
+    ) -> eyre::Result<()> {
+        if head_dim != 512 {
+            return Err(eyre!(
+                "launch_softmax_wsum_ldsv requires head_dim==512, got {head_dim}"
+            ));
+        }
+        let function = self.module.get_function("attention_mixed_softmax_wsum_ldsv")?;
+        let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
+        let cfg = LaunchConfig { grid: (n_head, 1, 1), block: (512, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), scores.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
+            n_head, head_dim, n_raw, n_comp, ATTN_MIXED_MAX_KEYS
+        ])
+    }
+
 
 
     /// WMMA variant of [`Self::launch_score_batched_htiled`]. Computes the

@@ -212,6 +212,142 @@ extern "C" __global__ void attention_mixed_softmax_wsum(
     }
 }
 
+// Single-token (decode) variant with LDS-staged V. Same signature and
+// semantics as attention_mixed_softmax_wsum — drops in without changing
+// the call site. Each WG still handles one head, but Phase B
+// cooperatively loads one K-tile of 16 V rows into LDS once per outer
+// iter, then per-thread reads come from LDS instead of DRAM. Targets
+// the long-ctx decode bottleneck (attn.smwsum p50=540 µs at ratio=4
+// n_comp=16384 = ~10.8 ms/tok at 20 ratio=4 layers). The batched
+// _ldsv_f16s wins (-23% over non-LDSV) came from V-staging + f16
+// scores; the f16-scores half needs Phase A restructure (in-place
+// f16/f32 mix), so we ship LDS-V on its own first.
+//
+// LDS budget: 16 rows × 512 d × 2 B = 16 KB per WG. At 64 KB/CU we
+// could fit 4 WGs/CU but the grid is just 64 heads = 64 WGs over 64
+// CUs = 1 WG/CU regardless. No occupancy hit.
+extern "C" __global__ void attention_mixed_softmax_wsum_ldsv(
+        float          * out,            // [n_head, head_dim]
+        float          * scores_g,       // [n_head, max_keys] — in/out
+        const float    * sinks,          // [n_head]
+        const _Float16 * raw_kv,         // [n_raw,  head_dim]
+        const _Float16 * comp_kv,        // [n_comp, head_dim]
+        unsigned int     n_head,
+        unsigned int     head_dim,
+        unsigned int     n_raw,
+        unsigned int     n_comp,
+        unsigned int     max_keys) {
+    const unsigned int h = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int block = blockDim.x;
+    if (h >= n_head) return;
+
+    constexpr unsigned int LDSV_K = 16;          // K-tile size = ILP unroll
+    constexpr unsigned int LDSV_HEAD_DIM = 512;  // hard-coded (matches MLA latent)
+    __shared__ _Float16 V_tile[LDSV_K * LDSV_HEAD_DIM];   // 16 KB
+    __shared__ float s_inv;
+
+    float *sw = scores_g + (size_t)h * max_keys;
+    float *oh = out + (size_t)h * head_dim;
+    const float sink_h = sinks[h];
+    const unsigned int n_total = n_raw + n_comp;
+
+    // Phase A: softmax — unchanged from the non-LDSV variant. Wave 0
+    // only, writes weights back into sw[] in place.
+    if (tid < 32) {
+        float local_max = sink_h;
+        for (unsigned int r = tid; r < n_total; r += 32) {
+            float v = sw[r];
+            if (v > local_max) local_max = v;
+        }
+        {
+            float o;
+            o = __shfl_xor(local_max, 16); if (o > local_max) local_max = o;
+            o = __shfl_xor(local_max,  8); if (o > local_max) local_max = o;
+            o = __shfl_xor(local_max,  4); if (o > local_max) local_max = o;
+            o = __shfl_xor(local_max,  2); if (o > local_max) local_max = o;
+            o = __shfl_xor(local_max,  1); if (o > local_max) local_max = o;
+        }
+        const float max_score = local_max;
+
+        float local_sum = (tid == 0) ? expf(sink_h - max_score) : 0.0f;
+        for (unsigned int r = tid; r < n_total; r += 32) {
+            float w = expf(sw[r] - max_score);
+            sw[r] = w;
+            local_sum += w;
+        }
+        local_sum += __shfl_xor(local_sum, 16);
+        local_sum += __shfl_xor(local_sum,  8);
+        local_sum += __shfl_xor(local_sum,  4);
+        local_sum += __shfl_xor(local_sum,  2);
+        local_sum += __shfl_xor(local_sum,  1);
+        if (tid == 0) s_inv = 1.0f / local_sum;
+    }
+    __syncthreads();
+
+    // Phase B: per-d weighted sum, with V cooperatively staged to LDS
+    // once per K-tile. Each thread handles one d (block=512=head_dim).
+    const float inv = s_inv;
+    const unsigned int d = tid;
+    if (d >= head_dim) return;
+
+    // Cooperative load layout: 16 rows × 32 lane-slots × 16 f16 = 512
+    // threads × 16 f16 per thread. tid maps to (row=tid/32, slot=tid%32);
+    // each thread loads 16 contiguous f16 starting at row * head_dim +
+    // slot * 16. Use *(int4*) for a 16-byte vec b128 load (head_dim=512,
+    // row pitch 1024 B, slot offset 16 f16 = 32 B → 16-byte aligned).
+    const unsigned int load_row  = tid >> 5;      // 0..15
+    const unsigned int load_slot = tid & 31u;     // 0..31
+    const unsigned int load_off  = load_slot * 16u;
+
+    float s = 0.0f;
+
+    // ---- raw_kv segment ----
+    unsigned int r = 0;
+    while (r + LDSV_K <= n_raw) {
+        // Cooperative load 16 V rows starting at raw_kv[r..r+16].
+        if (load_off < head_dim) {
+            const _Float16 *src = raw_kv + (size_t)(r + load_row) * head_dim + load_off;
+            int4 v = *(const int4*)src;
+            *(int4*)(&V_tile[load_row * LDSV_HEAD_DIM + load_off]) = v;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int k = 0; k < LDSV_K; k++) {
+            s += sw[r + k] * (float)V_tile[k * LDSV_HEAD_DIM + d];
+        }
+        __syncthreads();
+        r += LDSV_K;
+    }
+    // Tail of raw_kv (n_raw % 16).
+    for (; r < n_raw; r++) {
+        s += sw[r] * (float)raw_kv[(size_t)r * head_dim + d];
+    }
+
+    // ---- comp_kv segment ----
+    float *cw = sw + n_raw;
+    unsigned int c = 0;
+    while (c + LDSV_K <= n_comp) {
+        if (load_off < head_dim) {
+            const _Float16 *src = comp_kv + (size_t)(c + load_row) * head_dim + load_off;
+            int4 v = *(const int4*)src;
+            *(int4*)(&V_tile[load_row * LDSV_HEAD_DIM + load_off]) = v;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int k = 0; k < LDSV_K; k++) {
+            s += cw[c + k] * (float)V_tile[k * LDSV_HEAD_DIM + d];
+        }
+        __syncthreads();
+        c += LDSV_K;
+    }
+    for (; c < n_comp; c++) {
+        s += cw[c] * (float)comp_kv[(size_t)c * head_dim + d];
+    }
+
+    oh[d] = s * inv;
+}
+
 #define SMWSUM_HEAD_TILE 16
 
 // Head-tiled WMMA Phase-B smwsum. Each WG covers SMWSUM_HEAD_TILE(16)
@@ -550,6 +686,157 @@ extern "C" __global__ void attention_mixed_score_batched_htiled_wmma_f16s(
     (void)scores_g; (void)q; (void)raw_kv; (void)comp_kv; (void)n_head;
     (void)head_dim; (void)max_keys; (void)kq_scale; (void)warp; (void)lane;
     (void)n_total;
+#endif
+}
+
+// B=1 scalar-arg variant of attention_mixed_score_batched_htiled_wmma
+// (f32 scores). Same as the f16s sibling below but writes f32 — slots
+// into the existing f32-reading attention_mixed_softmax_wsum without
+// needing a paired f16-scores smwsum.
+extern "C" __global__ void attention_mixed_score_b1_htiled_wmma(
+        float          * scores_g,       // [n_head, max_keys]  (f32)
+        const float    * q,              // [n_head, head_dim]
+        const _Float16 * raw_kv,
+        const _Float16 * comp_kv,
+        unsigned int     n_raw,
+        unsigned int     raw_off,
+        unsigned int     n_comp,
+        unsigned int     n_head,
+        unsigned int     head_dim,
+        unsigned int     max_keys,
+        float            kq_scale) {
+    const unsigned int tid  = threadIdx.x;
+    const unsigned int warp = tid >> 5;
+    const unsigned int lane = tid & 31u;
+    const unsigned int n_total = n_raw + n_comp;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    const unsigned int n0   = blockIdx.x * SCORE_WMMA_KEYS_PER_BLK + warp * 16u;
+    const unsigned int col  = lane & 15u;
+    const unsigned int kh   = (lane >> 4) * 8u;
+    const unsigned int bkey = n0 + col;
+    const unsigned int n_kc = head_dim / 16u;
+    const _Float16 *brow = nullptr;
+    if (bkey < n_total) {
+        brow = (bkey < n_raw)
+            ? raw_kv + (size_t)(bkey + raw_off) * head_dim
+            : comp_kv + (size_t)(bkey - n_raw) * head_dim;
+    }
+    const unsigned int n_ht = n_head / 16u;
+    float8 c[8];
+    #pragma unroll
+    for (unsigned int t = 0; t < 8; t++) c[t] = (float8){0,0,0,0,0,0,0,0};
+    const float *qbase = q;  // b=0
+    for (unsigned int kc = 0; kc < n_kc; kc++) {
+        const unsigned int dim0 = kc * 16u + kh;
+        half8 bf = {0,0,0,0,0,0,0,0};
+        if (brow) {
+            #pragma unroll
+            for (int e = 0; e < 8; e++) bf[e] = brow[dim0 + (unsigned int)e];
+        }
+        #pragma unroll
+        for (unsigned int mt = 0; mt < 8; mt++) {
+            if (mt >= n_ht) break;
+            const float *qh = qbase + (size_t)(mt * 16u + col) * head_dim;
+            half8 af;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) af[e] = (_Float16)qh[dim0 + (unsigned int)e];
+            c[mt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(af, bf, c[mt]);
+        }
+    }
+    #pragma unroll
+    for (unsigned int mt = 0; mt < 8; mt++) {
+        if (mt >= n_ht) break;
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const unsigned int h = mt * 16u + (lane >> 4) * 8u + (unsigned int)e;
+            if (h < n_head && bkey < n_total) {
+                scores_g[(size_t)h * max_keys + bkey] = c[mt][e] * kq_scale;
+            }
+        }
+    }
+#else
+    (void)scores_g; (void)q; (void)raw_kv; (void)comp_kv; (void)n_head;
+    (void)head_dim; (void)max_keys; (void)kq_scale; (void)warp; (void)lane;
+    (void)n_total; (void)raw_off;
+#endif
+}
+
+// B=1 scalar-arg variant of attention_mixed_score_batched_htiled_wmma_f16s.
+// Identical math; takes n_raw / n_raw_offset / n_comp as scalars instead of
+// per-batch device buffers. Wired in the decode path where the buffer-
+// indexed variant's per-layer copy_from_host (43 × 2 = 86 ints/token)
+// erased the kernel's 6× speedup over launch_score with ~43 ms/token of
+// host→device sync overhead. Score writes f16 into scores_g (caller must
+// size the buffer accordingly; identical layout to the batched f16s kernel
+// at batch=1). Grid: (ceil(n_total/256), 1, 1).
+extern "C" __global__ void attention_mixed_score_b1_htiled_wmma_f16s(
+        _Float16       * scores_g,       // [n_head, max_keys]  (f16)
+        const float    * q,              // [n_head, head_dim]
+        const _Float16 * raw_kv,
+        const _Float16 * comp_kv,
+        unsigned int     n_raw,
+        unsigned int     raw_off,
+        unsigned int     n_comp,
+        unsigned int     n_head,
+        unsigned int     head_dim,
+        unsigned int     max_keys,
+        float            kq_scale) {
+    const unsigned int tid  = threadIdx.x;
+    const unsigned int warp = tid >> 5;
+    const unsigned int lane = tid & 31u;
+    const unsigned int n_total = n_raw + n_comp;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    const unsigned int n0   = blockIdx.x * SCORE_WMMA_KEYS_PER_BLK + warp * 16u;
+    const unsigned int col  = lane & 15u;
+    const unsigned int kh   = (lane >> 4) * 8u;
+    const unsigned int bkey = n0 + col;
+    const unsigned int n_kc = head_dim / 16u;
+    const _Float16 *brow = nullptr;
+    if (bkey < n_total) {
+        brow = (bkey < n_raw)
+            ? raw_kv + (size_t)(bkey + raw_off) * head_dim
+            : comp_kv + (size_t)(bkey - n_raw) * head_dim;
+    }
+    const unsigned int n_ht = n_head / 16u;
+    float8 c[8];
+    #pragma unroll
+    for (unsigned int t = 0; t < 8; t++) c[t] = (float8){0,0,0,0,0,0,0,0};
+    // b=0 so qbase = q.
+    const float *qbase = q;
+    for (unsigned int kc = 0; kc < n_kc; kc++) {
+        const unsigned int dim0 = kc * 16u + kh;
+        half8 bf = {0,0,0,0,0,0,0,0};
+        if (brow) {
+            #pragma unroll
+            for (int e = 0; e < 8; e++) bf[e] = brow[dim0 + (unsigned int)e];
+        }
+        #pragma unroll
+        for (unsigned int mt = 0; mt < 8; mt++) {
+            if (mt >= n_ht) break;
+            const float *qh = qbase + (size_t)(mt * 16u + col) * head_dim;
+            half8 af;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) af[e] = (_Float16)qh[dim0 + (unsigned int)e];
+            c[mt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(af, bf, c[mt]);
+        }
+    }
+    #pragma unroll
+    for (unsigned int mt = 0; mt < 8; mt++) {
+        if (mt >= n_ht) break;
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const unsigned int h = mt * 16u + (lane >> 4) * 8u + (unsigned int)e;
+            if (h < n_head && bkey < n_total) {
+                // b=0: row stride is just n_head.
+                scores_g[(size_t)h * max_keys + bkey] =
+                    (_Float16)(c[mt][e] * kq_scale);
+            }
+        }
+    }
+#else
+    (void)scores_g; (void)q; (void)raw_kv; (void)comp_kv; (void)n_head;
+    (void)head_dim; (void)max_keys; (void)kq_scale; (void)warp; (void)lane;
+    (void)n_total; (void)raw_off;
 #endif
 }
 

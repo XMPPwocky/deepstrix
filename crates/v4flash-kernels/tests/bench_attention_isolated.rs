@@ -66,8 +66,16 @@ fn bench_attention_isolated() -> eyre::Result<()> {
         .ok().and_then(|s| s.parse().ok()).unwrap_or(5);
     let phase: String = std::env::var("BENCH_PHASE")
         .unwrap_or_else(|_| "both".to_string());
-    let do_score = phase == "both" || phase == "score";
-    let do_smwsum = phase == "both" || phase == "smwsum";
+    // "score" / "smwsum" / "both" — single-token decode kernels.
+    // "batched_score" / "batched_smwsum" / "batched_both" — batched WMMA
+    //   kernels run at B=1 (decode shape, but with the LDS-V+f16-scores
+    //   structure we shipped for prefill). The data layout is compatible.
+    let do_score        = phase == "both" || phase == "score";
+    let do_smwsum       = phase == "both" || phase == "smwsum";
+    let do_smwsum_ldsv  = phase == "smwsum_ldsv";
+    let do_b_score      = phase == "batched_both" || phase == "batched_score";
+    let do_b_smwsum     = phase == "batched_both" || phase == "batched_smwsum";
+    let do_b1_score     = phase == "b1_score";
 
     if n_raw + n_comp > ATTN_MIXED_MAX_KEYS {
         return Err(eyre!(
@@ -98,35 +106,48 @@ fn bench_attention_isolated() -> eyre::Result<()> {
     // q: [n_head, head_dim] post-RoPE
     let mut q: DeviceBuffer<f32> = DeviceBuffer::new(
         dgpu.id, (n_head as usize) * (head_dim as usize))?;
-    q.fill_zero()?;
+    // ATT_SKIP_FILL=1: skip the data fill_zero kernels so the warmup
+    // smwsum is the FIRST dispatched kernel. Lets `rocprofv3 --att
+    // --att-consecutive-kernels 1` capture smwsum without a regex
+    // filter (which hangs ATT per [[rocprofv3-rdna4]]).
+    let skip_fill = std::env::var_os("ATT_SKIP_FILL").is_some();
+    if !skip_fill { q.fill_zero()?; } else { drop(()); }
 
     // raw_kv: [n_raw_max=SWA_WINDOW=128, head_dim] f16
     let n_raw_capacity: usize = 128;
     let mut raw_kv: DeviceBuffer<u16> = DeviceBuffer::new(
         dgpu.id, n_raw_capacity * (head_dim as usize))?;
-    raw_kv.fill_zero()?;
+    if !skip_fill { raw_kv.fill_zero()?; }
 
     // comp_kv: [n_comp, head_dim] f16
     let mut comp_kv: Option<DeviceBuffer<u16>> = if n_comp > 0 {
         let mut b: DeviceBuffer<u16> = DeviceBuffer::new(
             dgpu.id, (n_comp as usize) * (head_dim as usize))?;
-        b.fill_zero()?;
+        if !skip_fill { b.fill_zero()?; }
         Some(b)
     } else { None };
 
     // sinks: [n_head]
     let mut sinks: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, n_head as usize)?;
-    sinks.fill_zero()?;
+    if !skip_fill { sinks.fill_zero()?; }
 
     // attn_scores scratch: [n_head, ATTN_MIXED_MAX_KEYS]
     let mut scores: DeviceBuffer<f32> = DeviceBuffer::new(
         dgpu.id, (n_head as usize) * (ATTN_MIXED_MAX_KEYS as usize))?;
-    scores.fill_zero()?;
+    if !skip_fill { scores.fill_zero()?; }
 
     // out: [n_head, head_dim]
     let mut out: DeviceBuffer<f32> = DeviceBuffer::new(
         dgpu.id, (n_head as usize) * (head_dim as usize))?;
-    out.fill_zero()?;
+    if !skip_fill { out.fill_zero()?; }
+
+    // Per-batch counters for the batched kernels (B=1).
+    let mut n_raw_per: DeviceBuffer<i32> = DeviceBuffer::new(dgpu.id, 1)?;
+    n_raw_per.copy_from_host(&[n_raw as i32])?;
+    let mut n_raw_offset_per: DeviceBuffer<i32> = DeviceBuffer::new(dgpu.id, 1)?;
+    n_raw_offset_per.copy_from_host(&[0i32])?;
+    let mut n_comp_per: DeviceBuffer<i32> = DeviceBuffer::new(dgpu.id, 1)?;
+    n_comp_per.copy_from_host(&[n_comp as i32])?;
 
     // === Run loop ===
     let mut launch_iter = |stream: &Stream,
@@ -145,6 +166,32 @@ fn bench_attention_isolated() -> eyre::Result<()> {
                 n_head, head_dim, n_raw, n_comp,
             )?;
         }
+        if do_smwsum_ldsv {
+            attn.launch_softmax_wsum_ldsv(
+                stream, out, scores, &sinks, &raw_kv, comp_kv.as_ref(),
+                n_head, head_dim, n_raw, n_comp,
+            )?;
+        }
+        if do_b_score {
+            attn.launch_score_batched_htiled_wmma_f16s(
+                stream, scores, &q, &raw_kv, comp_kv.as_ref(),
+                &n_raw_per, &n_raw_offset_per, &n_comp_per,
+                n_head, head_dim, n_total, /*batch=*/1,
+            )?;
+        }
+        if do_b1_score {
+            attn.launch_score_b1_htiled_wmma_f16s(
+                stream, scores, &q, &raw_kv, comp_kv.as_ref(),
+                n_raw, /*raw_off=*/0, n_comp, n_head, head_dim, n_total,
+            )?;
+        }
+        if do_b_smwsum {
+            attn.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(
+                stream, out, scores, &sinks, &raw_kv, comp_kv.as_ref(),
+                &n_raw_per, &n_raw_offset_per, &n_comp_per,
+                n_head, head_dim, /*batch=*/1,
+            )?;
+        }
         Ok(())
     };
 
@@ -153,6 +200,51 @@ fn bench_attention_isolated() -> eyre::Result<()> {
         launch_iter(&stream, &mut scores, &mut out)?;
     }
     stream.synchronize()?;
+
+    // Correctness: when comparing score vs batched_score (or smwsum vs
+    // batched_smwsum), run one round of each on the same inputs and diff
+    // the output buffers. Non-zero synth input would give a stronger
+    // signal, but even all-zero we'd catch a structural bug (both should
+    // produce identical zero output).
+    if std::env::var_os("BENCH_DIFF_BATCHED").is_some() {
+        let mut s_ref  = vec![0.0f32; (n_head as usize) * (ATTN_MIXED_MAX_KEYS as usize)];
+        let mut s_test = vec![0.0f32; (n_head as usize) * (ATTN_MIXED_MAX_KEYS as usize)];
+        let mut o_ref  = vec![0.0f32; (n_head as usize) * (head_dim as usize)];
+        let mut o_test = vec![0.0f32; (n_head as usize) * (head_dim as usize)];
+        // single-token reference: score then smwsum
+        attn.launch_score(&stream, &mut scores, &q, &raw_kv, comp_kv.as_ref(),
+            n_head, head_dim, n_raw, n_comp)?;
+        stream.synchronize()?;
+        scores.copy_to_host(&mut s_ref)?;
+        attn.launch_softmax_wsum(&stream, &mut out, &mut scores, &sinks,
+            &raw_kv, comp_kv.as_ref(), n_head, head_dim, n_raw, n_comp)?;
+        stream.synchronize()?;
+        out.copy_to_host(&mut o_ref)?;
+
+        // batched WMMA at B=1
+        attn.launch_score_batched_htiled_wmma_f16s(&stream, &mut scores, &q,
+            &raw_kv, comp_kv.as_ref(),
+            &n_raw_per, &n_raw_offset_per, &n_comp_per,
+            n_head, head_dim, n_total, 1)?;
+        stream.synchronize()?;
+        scores.copy_to_host(&mut s_test)?;
+        attn.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(&stream, &mut out,
+            &mut scores, &sinks, &raw_kv, comp_kv.as_ref(),
+            &n_raw_per, &n_raw_offset_per, &n_comp_per,
+            n_head, head_dim, 1)?;
+        stream.synchronize()?;
+        out.copy_to_host(&mut o_test)?;
+
+        let mut s_max = 0.0f32;
+        for (a, b) in s_ref.iter().zip(s_test.iter()) {
+            let d = (a - b).abs(); if d > s_max { s_max = d; }
+        }
+        let mut o_max = 0.0f32;
+        for (a, b) in o_ref.iter().zip(o_test.iter()) {
+            let d = (a - b).abs(); if d > o_max { o_max = d; }
+        }
+        eprintln!("DIFF batched-vs-single: scores max_abs={s_max:.3e}, out max_abs={o_max:.3e}");
+    }
 
     eprintln!("running {iters} timed iters...");
     let mut walls_ms: Vec<f32> = Vec::with_capacity(iters);

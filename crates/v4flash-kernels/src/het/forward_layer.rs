@@ -420,17 +420,35 @@ impl HeterogeneousEngine {
             {
                 let _t = de.events.stage("dgpu.attn_score", &de.compute)?;
                 let _s = debug_span!("attn_score").entered();
-                de.attn_mixed.launch_score(
-                    &de.compute,
-                    &mut dgpu_scratch.attn_scores,
-                    &dgpu_scratch.q_normed,
-                    &ls.kv_cache,
-                    comp_kv_buf,
-                    N_HEAD,
-                    N_HEAD_DIM,
-                    ls.n_raw,
-                    n_comp,
-                )?;
+                // Default: B=1 head-tiled WMMA score (scalar-arg variant of
+                // the prefill batched WMMA score). Isolated at ratio=4
+                // n_comp=16384: 312 µs single-token → 58 µs = 5.4× faster.
+                // Scalar args avoid the per-batch buffer reads that would
+                // force ~86 copy_from_host calls/token via the batched API.
+                // DECODE_SCORE=single rolls back to attention_mixed_score.
+                let use_b1_wmma_score = std::env::var("DECODE_SCORE")
+                    .map(|v| v != "single").unwrap_or(true);
+                if use_b1_wmma_score {
+                    let n_total_max = ls.n_raw + n_comp;
+                    de.attn_mixed.launch_score_b1_htiled_wmma(
+                        &de.compute,
+                        &mut dgpu_scratch.attn_scores,
+                        &dgpu_scratch.q_normed,
+                        &ls.kv_cache,
+                        comp_kv_buf,
+                        ls.n_raw, /*raw_off=*/0, n_comp,
+                        N_HEAD, N_HEAD_DIM, n_total_max,
+                    )?;
+                } else {
+                    de.attn_mixed.launch_score(
+                        &de.compute,
+                        &mut dgpu_scratch.attn_scores,
+                        &dgpu_scratch.q_normed,
+                        &ls.kv_cache,
+                        comp_kv_buf,
+                        N_HEAD, N_HEAD_DIM, ls.n_raw, n_comp,
+                    )?;
+                }
             }
             {
                 let _t = de.events.stage("dgpu.attn_smwsum", &de.compute)?;

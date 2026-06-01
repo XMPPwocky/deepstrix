@@ -60,6 +60,16 @@ pub struct DgpuScratch {
     // Size [N_HEAD, ATTN_MIXED_MAX_KEYS].
     pub attn_scores: DeviceBuffer<f32>,
 
+    // Per-batch counters for the batched-WMMA attention kernels called at
+    // B=1 from the decode path. Allocated as 1-element buffers each;
+    // overwritten per-layer with [n_raw], [0], [n_comp] before launch.
+    // The batched score (f16s, head-tiled WMMA) runs 6× faster than the
+    // single-token launch_score at ratio=4 depth-16K — wired only for
+    // score for now; the batched smwsum loses at B=1 due to under-fill.
+    pub attn_n_raw_per_b1: DeviceBuffer<i32>,
+    pub attn_n_raw_offset_per_b1: DeviceBuffer<i32>,
+    pub attn_n_comp_per_b1: DeviceBuffer<i32>,
+
     // Compressor scratch (lives on dGPU alongside attn_input_norm).
     pub kv_cur: DeviceBuffer<f32>,
     pub sc_cur: DeviceBuffer<f32>,
@@ -135,6 +145,13 @@ impl DgpuScratch {
                 device_id,
                 (N_HEAD as usize) * (ATTN_MIXED_MAX_KEYS as usize),
             )?,
+            attn_n_raw_per_b1: DeviceBuffer::new(device_id, 1)?,
+            attn_n_raw_offset_per_b1: {
+                let mut b: DeviceBuffer<i32> = DeviceBuffer::new(device_id, 1)?;
+                b.copy_from_host(&[0i32])?;
+                b
+            },
+            attn_n_comp_per_b1: DeviceBuffer::new(device_id, 1)?,
 
             kv_cur: DeviceBuffer::new(device_id, (2 * N_HEAD_DIM) as usize)?,
             sc_cur: DeviceBuffer::new(device_id, (2 * N_HEAD_DIM) as usize)?,
