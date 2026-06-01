@@ -770,37 +770,36 @@ impl HeterogeneousEngine {
                 b,
             )?;
         }
-        // qb up-projection (M=Q_FLAT=32768, K=N_LORA_Q=1024). Default WMMA:
-        // int8-WMMA GEMM (weights read ONCE per K-tile across the batch
-        // instead of B times). Isolated A/B at B={64,256,512}: WMMA wins
-        // 2.0-2.5× vs dp4a `_warp8` at this M=32768 shape. QB_WMMA=0 rolls
-        // back to the dp4a path.
-        let use_qb_wmma = std::env::var("QB_WMMA")
-            .map(|v| v != "0").unwrap_or(true);
-        if use_qb_wmma {
-            let _t = de.events.stage("k.q_chain.qb_wmma", &de.compute)?;
-            de.q8_wmma.gemm(
-                &de.compute,
-                &mut bd.q,
-                &dlw.attn_q_b.buffer,
-                &bd.qr_xq,
-                &bd.qr_xscale,
-                Q_FLAT,
-                N_LORA_Q,
-                b,
-            )?;
-        } else {
-            let _t = de.events.stage("k.q_chain.qb_matvec", &de.compute)?;
-            de.q8.matvec_batched(
-                &de.compute,
-                &mut bd.q,
-                &dlw.attn_q_b.buffer,
-                &bd.qr_xq,
-                &bd.qr_xscale,
-                Q_FLAT,
-                N_LORA_Q,
-                b,
-            )?;
+        // qb up-projection (M=Q_FLAT=32768, K=N_LORA_Q=1024). Default
+        // LDS-tiled WMMA: cooperative-load A+B into LDS per K-outer iter,
+        // then WMMA from LDS — kills the s_wait_loadcnt latency throttle
+        // that capped both dp4a and the older non-tiled WMMA. Isolated A/B
+        // at B=512: dp4a 8.82ms / wmma_old 4.24ms / wmma_lds_tiled 1.38ms
+        // → 6.4× over dp4a, 3.1× over the older WMMA. Q_FLAT % 64 == 0 ✓.
+        // QB_WMMA=wmma forces the older non-tiled WMMA; QB_WMMA=0 forces dp4a.
+        let qb_variant = std::env::var("QB_WMMA").unwrap_or_else(|_| "lds_tiled".into());
+        match qb_variant.as_str() {
+            "0" | "dp4a" => {
+                let _t = de.events.stage("k.q_chain.qb_matvec", &de.compute)?;
+                de.q8.matvec_batched(
+                    &de.compute, &mut bd.q, &dlw.attn_q_b.buffer,
+                    &bd.qr_xq, &bd.qr_xscale, Q_FLAT, N_LORA_Q, b,
+                )?;
+            }
+            "wmma" => {
+                let _t = de.events.stage("k.q_chain.qb_wmma", &de.compute)?;
+                de.q8_wmma.gemm(
+                    &de.compute, &mut bd.q, &dlw.attn_q_b.buffer,
+                    &bd.qr_xq, &bd.qr_xscale, Q_FLAT, N_LORA_Q, b,
+                )?;
+            }
+            _ => {
+                let _t = de.events.stage("k.q_chain.qb_lds", &de.compute)?;
+                de.q8_wmma.gemm_lds_tiled(
+                    &de.compute, &mut bd.q, &dlw.attn_q_b.buffer,
+                    &bd.qr_xq, &bd.qr_xscale, Q_FLAT, N_LORA_Q, b,
+                )?;
+            }
         }
         {
             let _t = de.events.stage("k.q_chain.rms_nw_heads", &de.compute)?;
@@ -1331,17 +1330,28 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.output_proj.grouped_matvec", &de.compute)?;
-            de.q8_grouped.matvec_grouped_batched(
-                &de.compute,
-                &mut bd.low,
-                &dlw.attn_output_a.buffer,
-                &bd.heads_xq,
-                &bd.heads_xscale,
-                GROUP_DIM,
-                RANK,
-                N_GROUPS,
-                b,
-            )?;
+            // LDS-tiled WMMA grouped variant. Per-group shape M=RANK=1024,
+            // K=GROUP_DIM=4096 is too small for the legacy per-row GEMV to
+            // saturate (1 wave/CU occupancy); the LDS-tiled kernel uses
+            // 4 warps × 4 WMMA accs per WG = good occupancy even at small
+            // M. Isolated A/B per sub-group at B=512: dp4a 0.42ms vs
+            // lds_tiled 0.20ms = 2.1× on each, ~2× on the whole grouped
+            // call. Q8_GROUPED_VARIANT=dp4a rolls back.
+            let grp_variant = std::env::var("Q8_GROUPED_VARIANT")
+                .unwrap_or_else(|_| "lds_tiled".into());
+            if grp_variant == "dp4a" {
+                de.q8_grouped.matvec_grouped_batched(
+                    &de.compute, &mut bd.low, &dlw.attn_output_a.buffer,
+                    &bd.heads_xq, &bd.heads_xscale,
+                    GROUP_DIM, RANK, N_GROUPS, b,
+                )?;
+            } else {
+                de.q8_wmma.gemm_lds_tiled_grouped(
+                    &de.compute, &mut bd.low, &dlw.attn_output_a.buffer,
+                    &bd.heads_xq, &bd.heads_xscale,
+                    GROUP_DIM, RANK, N_GROUPS, b,
+                )?;
+            }
         }
         {
             let _t = de.events.stage("k.output_proj.quantize_low", &de.compute)?;
@@ -1356,16 +1366,22 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.output_proj.matvec_out", &de.compute)?;
-            de.q8.matvec_batched(
-                &de.compute,
-                &mut bd.attn_out,
-                &dlw.attn_output_b.buffer,
-                &bd.low_xq,
-                &bd.low_xscale,
-                N_EMBD,
-                OUT_LOW,
-                b,
-            )?;
+            // Same LDS-tiled WMMA the qb path uses. matvec_out shape
+            // (M=N_EMBD=4096, K=OUT_LOW=8192) hits the same s_wait_loadcnt
+            // throttle on dp4a; LDS-tiled WMMA wins 6.2× at B=512 isolated
+            // (8.82 → 1.42 ms). Q8_OUT_VARIANT=dp4a rolls back.
+            let out_variant = std::env::var("Q8_OUT_VARIANT").unwrap_or_else(|_| "lds_tiled".into());
+            if out_variant == "dp4a" {
+                de.q8.matvec_batched(
+                    &de.compute, &mut bd.attn_out, &dlw.attn_output_b.buffer,
+                    &bd.low_xq, &bd.low_xscale, N_EMBD, OUT_LOW, b,
+                )?;
+            } else {
+                de.q8_wmma.gemm_lds_tiled(
+                    &de.compute, &mut bd.attn_out, &dlw.attn_output_b.buffer,
+                    &bd.low_xq, &bd.low_xscale, N_EMBD, OUT_LOW, b,
+                )?;
+            }
         }
         drop(_t_out);
 

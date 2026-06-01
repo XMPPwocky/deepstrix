@@ -85,6 +85,11 @@ fn bench_qb_wmma_isolated() -> eyre::Result<()> {
     let out_len = (batch as usize) * (n_rows as usize);
     let mut out_dp4a: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, out_len)?;
     let mut out_wmma: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, out_len)?;
+    let mut out_lds:  DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, out_len)?;
+    let do_lds = n_rows % 64 == 0; // gemm_lds_tiled requires M % 64 == 0
+    if !do_lds {
+        eprintln!("note: LDS-tiled skipped (n_rows={n_rows} not %64)");
+    }
 
     let time = |stream: &Stream,
                 f: &mut dyn FnMut(&Stream) -> eyre::Result<()>|
@@ -98,16 +103,39 @@ fn bench_qb_wmma_isolated() -> eyre::Result<()> {
         Ok(Event::elapsed_ms(&start, &end)?)
     };
 
-    // Warmup both.
+    // Warmup all.
     for _ in 0..warmup {
         q8.matvec_batched(&stream, &mut out_dp4a, &w_dev, &xq_dev, &xs_dev, n_rows, k, batch)?;
         wmma.gemm(&stream, &mut out_wmma, &w_dev, &xq_dev, &xs_dev, n_rows, k, batch)?;
+        if do_lds {
+            wmma.gemm_lds_tiled(&stream, &mut out_lds, &w_dev, &xq_dev, &xs_dev, n_rows, k, batch)?;
+        }
     }
     stream.synchronize()?;
+
+    // Correctness: with all-ones inputs, all three should produce the same
+    // (within f32 reduction-order drift) output.
+    if do_lds {
+        let mut h_dp4a = vec![0.0f32; out_len];
+        let mut h_lds  = vec![0.0f32; out_len];
+        out_dp4a.copy_to_host(&mut h_dp4a)?;
+        out_lds.copy_to_host(&mut h_lds)?;
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (a, b) in h_dp4a.iter().zip(h_lds.iter()) {
+            let d = (a - b).abs();
+            if d > max_abs { max_abs = d; }
+            let denom = a.abs().max(b.abs()).max(1e-30);
+            let r = d / denom;
+            if r > max_rel { max_rel = r; }
+        }
+        eprintln!("LDS-tiled vs dp4a: max_abs={max_abs:.3e} max_rel={max_rel:.3e}");
+    }
 
     // Interleave the A/B per iteration so both see the same thermal envelope.
     let mut dp4a_ms = Vec::with_capacity(iters);
     let mut wmma_ms = Vec::with_capacity(iters);
+    let mut lds_ms  = Vec::with_capacity(iters);
     for _ in 0..iters {
         dp4a_ms.push(time(&stream, &mut |s| {
             q8.matvec_batched(s, &mut out_dp4a, &w_dev, &xq_dev, &xs_dev, n_rows, k, batch)
@@ -115,14 +143,21 @@ fn bench_qb_wmma_isolated() -> eyre::Result<()> {
         wmma_ms.push(time(&stream, &mut |s| {
             wmma.gemm(s, &mut out_wmma, &w_dev, &xq_dev, &xs_dev, n_rows, k, batch)
         })?);
+        if do_lds {
+            lds_ms.push(time(&stream, &mut |s| {
+                wmma.gemm_lds_tiled(s, &mut out_lds, &w_dev, &xq_dev, &xs_dev, n_rows, k, batch)
+            })?);
+        }
     }
 
     eprintln!();
     let dp4a_p50 = stats(&mut dp4a_ms, "dp4a matvec_batched");
-    let wmma_p50 = stats(&mut wmma_ms, "wmma gemm         ");
+    let wmma_p50 = stats(&mut wmma_ms, "wmma gemm          ");
+    let lds_p50  = if do_lds { stats(&mut lds_ms, "wmma gemm_lds_tiled") } else { f32::NAN };
     eprintln!(
-        "\nqb p50 speedup (dp4a / wmma) = {:.2}x  ({dp4a_p50:.4} ms -> {wmma_p50:.4} ms)",
-        dp4a_p50 / wmma_p50
+        "\nspeedup vs dp4a: wmma={:.2}x, lds_tiled={:.2}x  (dp4a {dp4a_p50:.4} ms)",
+        dp4a_p50 / wmma_p50,
+        dp4a_p50 / lds_p50,
     );
     Ok(())
 }

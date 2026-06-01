@@ -398,6 +398,101 @@ impl Q8_0MatvecWmma {
             out.raw(), weight.raw(), xq.raw(), xscale.raw(), k, n_rows, batch, blocks
         ])
     }
+
+    /// Grouped LDS-tiled GEMM (RDNA4 only). 8-group block-diagonal matmul
+    /// where the per-group inputs/outputs are interleaved per-batch
+    /// (xq/xscale/out all strided by n_groups within the batch dim).
+    /// Used for output_proj.grouped_matvec.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_lds_tiled_grouped(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,         // [B, n_groups*rank]
+        weight: &DeviceBuffer<u8>,           // [n_groups*rank, group_dim Q8_0]
+        xq: &DeviceBuffer<i8>,               // [B, n_groups*group_dim]
+        xscale: &DeviceBuffer<f32>,          // [B, n_groups*blocks]
+        group_dim: u32,
+        rank: u32,
+        n_groups: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_groups == 0 {
+            return Ok(());
+        }
+        if group_dim % Q8_0_BLOCK_ELEMS != 0 {
+            return Err(eyre!(
+                "gemm_lds_tiled_grouped: group_dim={group_dim} not %32"
+            ));
+        }
+        if rank % 64 != 0 {
+            return Err(eyre!(
+                "gemm_lds_tiled_grouped: rank={rank} not %64 (BM)"
+            ));
+        }
+        let blocks = group_dim / Q8_0_BLOCK_ELEMS;
+        let function = self
+            .module
+            .get_function("q8_0_gemm_wmma_lds_tiled_grouped")?;
+        let cfg = LaunchConfig {
+            grid: (rank.div_ceil(64), batch.div_ceil(64), n_groups),
+            block: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), weight.raw(), xq.raw(), xscale.raw(),
+            group_dim, rank, n_groups, batch, blocks
+        ])
+    }
+
+    /// LDS-tiled Q8_0 GEMM (RDNA4 only). Same semantics as `gemm()` but
+    /// cooperatively stages BM×BK A + BK×BN B into LDS once per K-outer
+    /// iter, then runs the inner WMMA loop entirely from LDS — amortizes
+    /// global weight loads across many compute ops to kill the
+    /// `s_wait_loadcnt` latency stall that bottlenecks both `gemm()` and
+    /// the dp4a `matvec_batched()` at long-K shapes (matvec_out, etc).
+    /// Requires `M % 64 == 0` and `K % 32 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_lds_tiled(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        n_rows: u32, // M
+        k: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        if k % Q8_0_BLOCK_ELEMS != 0 {
+            return Err(eyre!("q8_0 gemm_lds_tiled: k={k} not a multiple of 32"));
+        }
+        if n_rows % 64 != 0 {
+            return Err(eyre!("q8_0 gemm_lds_tiled: n_rows={n_rows} not a multiple of 64 (BM)"));
+        }
+        let blocks = k / Q8_0_BLOCK_ELEMS;
+        let expected_weight_bytes =
+            (n_rows as usize) * (blocks as usize) * (Q8_0_BLOCK_BYTES as usize);
+        if weight.byte_len() != expected_weight_bytes {
+            return Err(eyre!(
+                "q8_0 gemm_lds_tiled weight bytes: have {}, expected {} (n_rows={n_rows}, k={k})",
+                weight.byte_len(), expected_weight_bytes
+            ));
+        }
+        let function = self.module.get_function("q8_0_gemm_wmma_lds_tiled")?;
+        let grid_x = n_rows.div_ceil(64);          // BM=64
+        let grid_y = batch.div_ceil(64);           // BN=64
+        let cfg = LaunchConfig {
+            grid: (grid_x, grid_y, 1),
+            block: (128, 1, 1),                    // 4 warps × wave32
+            shared_mem_bytes: 0,                   // declared static in kernel
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), weight.raw(), xq.raw(), xscale.raw(), k, n_rows, batch, blocks
+        ])
+    }
 }
 
 /// Grouped Q8_0 GEMV — each output row `idx` in `[0, n_groups*rank)` reads
