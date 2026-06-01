@@ -212,7 +212,16 @@ impl HeterogeneousEngine {
                 }
                 de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &dlw.hc_attn_scale, &dlw.hc_attn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
                 de.hc_weighted.launch(s, &mut dgpu_scratch.attn_cur, &dgpu_scratch.residual, &dgpu_scratch.split, N_EMBD, N_HC)?;
-                de.rms_w.launch_weighted(s, &mut dgpu_scratch.attn_input_norm, &dgpu_scratch.attn_cur, &dlw.attn_norm, N_EMBD, RMS_EPS)?;
+                // RMS_W_MW=1 enables multi-WG weighted RMS. Default OFF: at
+                // N_EMBD=4096 the single-WG version is small enough that
+                // multi-WG's extra kernel launch erases any parallelism
+                // win — averaged across 256-token decode runs the variants
+                // are statistical ties (~±2% within thermal noise).
+                if std::env::var("RMS_W_MW").map(|v| v != "0").unwrap_or(false) {
+                    de.rms_nw_mw.launch_weighted(s, &mut dgpu_scratch.attn_input_norm, &dgpu_scratch.attn_cur, &dlw.attn_norm, &mut dgpu_scratch.rms_nw_partials, N_EMBD, 16, RMS_EPS)?;
+                } else {
+                    de.rms_w.launch_weighted(s, &mut dgpu_scratch.attn_input_norm, &dgpu_scratch.attn_cur, &dlw.attn_norm, N_EMBD, RMS_EPS)?;
+                }
                 Ok(())
             })?;
             }
@@ -645,7 +654,11 @@ impl HeterogeneousEngine {
             }
             de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &dlw.hc_ffn_scale, &dlw.hc_ffn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
             de.hc_weighted.launch(s, &mut dgpu_scratch.ffn_cur, &dgpu_scratch.after_attn_hc, &dgpu_scratch.split, N_EMBD, N_HC)?;
-            de.rms_w.launch_weighted(s, &mut dgpu_scratch.ffn_input_norm, &dgpu_scratch.ffn_cur, &dlw.ffn_norm, N_EMBD, RMS_EPS)?;
+            if std::env::var("RMS_W_MW").map(|v| v != "0").unwrap_or(false) {
+                de.rms_nw_mw.launch_weighted(s, &mut dgpu_scratch.ffn_input_norm, &dgpu_scratch.ffn_cur, &dlw.ffn_norm, &mut dgpu_scratch.rms_nw_partials, N_EMBD, 16, RMS_EPS)?;
+            } else {
+                de.rms_w.launch_weighted(s, &mut dgpu_scratch.ffn_input_norm, &dgpu_scratch.ffn_cur, &dlw.ffn_norm, N_EMBD, RMS_EPS)?;
+            }
             Ok(())
         })?;
         }
@@ -954,7 +967,16 @@ impl HeterogeneousEngine {
                 }
                 de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &next.hc_attn_scale, &next.hc_attn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
                 de.hc_weighted.launch(s, &mut dgpu_scratch.attn_cur, &dgpu_scratch.residual_next, &dgpu_scratch.split, N_EMBD, N_HC)?;
-                de.rms_w.launch_weighted(s, &mut dgpu_scratch.attn_input_norm, &dgpu_scratch.attn_cur, &next.attn_norm, N_EMBD, RMS_EPS)?;
+                // RMS_W_MW=1 enables multi-WG weighted RMS. Default OFF: at
+                // N_EMBD=4096 the single-WG version is small enough that
+                // multi-WG's extra kernel launch erases any parallelism
+                // win — averaged across 256-token decode runs the variants
+                // are statistical ties (~±2% within thermal noise).
+                if std::env::var("RMS_W_MW").map(|v| v != "0").unwrap_or(false) {
+                    de.rms_nw_mw.launch_weighted(s, &mut dgpu_scratch.attn_input_norm, &dgpu_scratch.attn_cur, &next.attn_norm, &mut dgpu_scratch.rms_nw_partials, N_EMBD, 16, RMS_EPS)?;
+                } else {
+                    de.rms_w.launch_weighted(s, &mut dgpu_scratch.attn_input_norm, &dgpu_scratch.attn_cur, &next.attn_norm, N_EMBD, RMS_EPS)?;
+                }
                 Ok(())
             })?;
         }

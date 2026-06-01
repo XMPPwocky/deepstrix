@@ -65,6 +65,33 @@ extern "C" __global__ void rms_norm_finalize_inv(
     inv_out[0] = rsqrtf(mean_sq + eps);
 }
 
+// Weighted apply: out[i] = x[i] * inv_rms * weight[i].
+// Same multi-WG split as the unweighted apply; reads the global partials
+// and computes inv_rms inline. Pair with `rms_norm_partial_sum_sq`.
+extern "C" __global__ void rms_norm_weighted_apply(
+        float *out,                  // [n]
+        const float *x,              // [n]
+        const float *weight,         // [n] — per-element norm weight
+        const float *partials,       // [n_wgs]
+        unsigned int n,
+        unsigned int n_wgs,
+        float eps) {
+    const unsigned int tid     = threadIdx.x;
+    const unsigned int wg      = blockIdx.x;
+    const unsigned int wg_size = n / n_wgs;
+    const unsigned int base    = wg * wg_size;
+
+    float sum_sq = 0.0f;
+    for (unsigned int i = 0; i < n_wgs; i++) sum_sq += partials[i];
+    const float mean_sq = sum_sq / (float)n;
+    const float scale = rsqrtf(mean_sq + eps);
+
+    for (unsigned int i = tid; i < wg_size; i += RMSNW_BLOCK) {
+        const unsigned int idx = base + i;
+        out[idx] = x[idx] * scale * weight[idx];
+    }
+}
+
 // Each WG reads ALL partials, sums them, computes inv_rms, applies to its slice.
 // Caller MUST launch with the same n_wgs grid as the partial kernel.
 extern "C" __global__ void rms_norm_apply_scale(

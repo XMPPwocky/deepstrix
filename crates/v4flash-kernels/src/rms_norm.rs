@@ -187,6 +187,41 @@ impl RmsNormNoWeightMultiWG {
         launch_kernel!(f_apply, cfg, stream, [out.raw(), x.raw(), partial_buf.raw(), n, n_wgs, eps])
     }
 
+    /// Multi-WG weighted RMS: same partial-sum pass as the unweighted
+    /// variant, then a multi-WG apply that does `out[i] = x[i] * inv_rms
+    /// * weight[i]`. Pairs with `rms_norm_partial_sum_sq` so the partial
+    /// kernel is shared between weighted and unweighted use. `n` must be
+    /// divisible by `n_wgs`; `partial_buf` sized for `n_wgs` f32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_weighted(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<f32>,
+        partial_buf: &mut DeviceBuffer<f32>,
+        n: u32,
+        n_wgs: u32,
+        eps: f32,
+    ) -> eyre::Result<()> {
+        if n % n_wgs != 0 {
+            return Err(eyre!(
+                "rms_norm_weighted_multiwg: n={n} not divisible by n_wgs={n_wgs}"
+            ));
+        }
+        let f_part  = self.module.get_function("rms_norm_partial_sum_sq")?;
+        let f_apply = self.module.get_function("rms_norm_weighted_apply")?;
+        let cfg = LaunchConfig {
+            grid: (n_wgs, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(f_part, cfg, stream, [partial_buf.raw(), x.raw(), n])?;
+        launch_kernel!(f_apply, cfg, stream, [
+            out.raw(), x.raw(), weight.raw(), partial_buf.raw(), n, n_wgs, eps
+        ])
+    }
+
     /// Compute inv_rms scalar only (no apply pass). Pairs with
     /// `F16Matvec::matvec_pre_scaled` to fold the per-element scale into
     /// the next kernel — saves one N-sized DRAM round-trip + one launch.
