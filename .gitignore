@@ -25,3 +25,6 @@ external/ds4-dump/ds4-dump-activations
 /scratch/svm_probe_hostmem
 /scratch/plain_probe_many
 .rocprofv3/
+
+# Per-session Claude Code local config (not source)
+.claude/
