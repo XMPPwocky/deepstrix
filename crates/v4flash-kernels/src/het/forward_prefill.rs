@@ -1021,13 +1021,36 @@ impl HeterogeneousEngine {
                 let seg_end = i + seg_len;
 
                 // Batched state_write for this segment.
+                //
+                // CRITICAL: per-batch stride MUST be `comp_width`, NOT
+                // the constant `2 * cs_kvhd`. comp_width = coff *
+                // head_dim, where coff=2 for ratio==4 layers and
+                // coff=1 for ratio==128 layers. The old `2 * cs_kvhd
+                // = 1024` formula coincidentally matched coff=2
+                // (ratio==4 → comp_width=1024) but DOUBLED the offset
+                // on ratio==128 layers (comp_width=512). The second
+                // segment iter per lane then read kv_cur/sc_cur from
+                // uninitialised scratch past the matvec_pair_batched
+                // write region, producing near-zero-magnitude garbage
+                // for every other committed comp_kv row at ratio==128
+                // layers. Surfaced as catastrophic attn_heads
+                // divergence (cosine ≈ 0.35 vs ds4-CPU on the same
+                // quant) at layer 3, the first ratio==128 layer, on
+                // long-prompt cases; the model still produced
+                // plausible text but picked visibly-wrong tokens at
+                // long ctx (e.g. "Based" instead of "Component" on
+                // long_memory_archive at 3.3K-token prefill). Per-
+                // sub-tensor diff against ds4-CPU + per-row comp_kv
+                // pattern (cos≈1 on even rows, cos≈0 on odd rows)
+                // confirmed.
+                let comp_stride = comp_width as usize;
                 let kv_seg = bd.kv_cur.slice_view(
-                    (i as usize) * 2 * cs_kvhd,
-                    (seg_len as usize) * 2 * cs_kvhd,
+                    (i as usize) * comp_stride,
+                    (seg_len as usize) * comp_stride,
                 );
                 let sc_seg = bd.sc_cur.slice_view(
-                    (i as usize) * 2 * cs_kvhd,
-                    (seg_len as usize) * 2 * cs_kvhd,
+                    (i as usize) * comp_stride,
+                    (seg_len as usize) * comp_stride,
                 );
                 let row_seg = bd.row_per_b.slice_view(i as usize, seg_len as usize);
                 let pm_seg = bd.pos_mod_per_b.slice_view(i as usize, seg_len as usize);
