@@ -80,6 +80,7 @@ pub fn render_prompt(
     if messages.is_empty() {
         return Err(eyre!("render_prompt: messages array is empty"));
     }
+    diagnose_dsml_text_in_messages(messages);
 
     // System block. We encode the user-provided portion (role:"system"
     // messages) and our generated tools-schema portion separately —
@@ -200,6 +201,58 @@ pub fn render_prompt(
         });
     }
     Ok(out)
+}
+
+/// Warn when any incoming message content contains the literal
+/// `｜DSML｜` marker as text. The model SHOULD only ever see TOK_DSML
+/// as a special token; text-form occurrences leak into the model's
+/// context as regular BPE tokens (`28217 10525 7398 28217`) and prime
+/// the model to mimic that pattern in its output — at which point our
+/// scanner emits the bytes as content, letta stores it, and the loop
+/// self-perpetuates.
+///
+/// Sources we render through `encode_text` (tools schema block,
+/// re-rendered prior tool_calls) substitute the marker correctly. Any
+/// occurrence found by this function comes from letta's payload: a
+/// system message, a user message, a tool result body, or assistant
+/// content text. Logs role, index, count, and a short context window
+/// around the first hit so the source can be tracked back.
+fn diagnose_dsml_text_in_messages(messages: &[ChatMessage]) {
+    const MARKER: &str = "\u{ff5c}DSML\u{ff5c}";
+    for (i, m) in messages.iter().enumerate() {
+        let Some(content) = m.content.as_ref() else {
+            continue;
+        };
+        if !content.contains(MARKER) {
+            continue;
+        }
+        let count = content.matches(MARKER).count();
+        let first = content.find(MARKER).unwrap();
+        // Show ~40 bytes either side of the first hit, char-boundary safe.
+        let pre_start = content[..first]
+            .char_indices()
+            .rev()
+            .nth(40)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let post_end = content[first + MARKER.len()..]
+            .char_indices()
+            .nth(40)
+            .map(|(idx, _)| first + MARKER.len() + idx)
+            .unwrap_or(content.len());
+        tracing::warn!(
+            message_index = i,
+            role = ?m.role,
+            occurrences = count,
+            len_bytes = content.len(),
+            first_byte_offset = first,
+            context = %&content[pre_start..post_end],
+            "incoming message content contains literal ｜DSML｜ text — \
+             this primes the model to emit BPE-form DSML instead of \
+             TOK_DSML; trace back to find the source (tool result? \
+             prior assistant turn leak?)"
+        );
+    }
 }
 
 fn build_tool_result_text(m: &ChatMessage) -> String {

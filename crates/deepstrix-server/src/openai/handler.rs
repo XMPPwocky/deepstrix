@@ -31,7 +31,7 @@ impl Drop for CancelOnDrop {
 }
 
 use crate::dsml::{DsmlEvent, DsmlScanner};
-use crate::engine_worker::{accumulate, EngineHandle, FinishReason, GenerateReq, WorkerEvent};
+use crate::engine_worker::{accumulate, EngineHandle, GenerateReq, WorkerEvent};
 use crate::openai::error::ApiError;
 use crate::openai::sse::{
     encode_chunk, reasoning_delta, role_delta, text_delta, tool_call_args_delta,
@@ -62,6 +62,23 @@ pub async fn chat_completions(
     )
     .map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
     let prompt_tokens_count = tokens.len() as u32;
+
+    // Up-front ctx check. Without this, an over-long prompt
+    // surfaces as `ERROR engine error during stream` mid-SSE —
+    // letta treats that as an opaque model failure. A proper
+    // HTTP 400 with a clear message lets letta drop/summarize
+    // history and retry cleanly.
+    if prompt_tokens_count >= engine.n_kv_max {
+        // Include the literal marker `context_length_exceeded` so
+        // letta's `isContextWindowOverflowError` matcher recognises
+        // it and triggers conversation compaction instead of bailing
+        // the agent loop. See letta-code
+        // `src/backend/dev/context-window-overflow.ts:44`.
+        return Err(ApiError::ContextExhausted(format!(
+            "context_length_exceeded: prompt length {} >= maximum context length {}",
+            prompt_tokens_count, engine.n_kv_max
+        )));
+    }
 
     let temperature = req.temperature.unwrap_or(DEFAULT_TEMPERATURE);
     let max_new = req
@@ -117,10 +134,35 @@ pub async fn chat_completions(
         let guard = CancelOnDrop(cancel);
         let result = accumulate(rx, tok_dsml).await.map_err(ApiError::from)?;
         drop(guard);
-        let finish_reason = if result.saw_tool {
-            "tool_calls"
+        // Malformed DSML wins over everything else — the turn is
+        // corrupted, don't pretend it succeeded as text/tool_calls.
+        // Drop both content and tool_calls so letta records an empty
+        // assistant turn with finish_reason="internal_error" rather
+        // than storing partial garbage that taints subsequent turns.
+        //
+        // Why "internal_error" and not "error": pi-ai forwards unknown
+        // finish_reasons verbatim as "Provider finish_reason: <reason>"
+        // and letta's retryable-error detector substring-matches that
+        // string against a fixed pattern list. "internal_error" is in
+        // the list (local-provider-errors.ts); bare "error" is not, so
+        // letta would surface a non-retryable hard error.
+        let (finish_reason, content, tool_calls) = if result.saw_malformed {
+            tracing::warn!(
+                "non-streaming: scanner saw malformed DSML; reporting finish_reason=internal_error"
+            );
+            ("internal_error", None, Vec::new())
+        } else if result.saw_tool {
+            ("tool_calls", if result.text.is_empty() {
+                None
+            } else {
+                Some(result.text)
+            }, result.tool_calls)
         } else {
-            result.finish_reason.as_openai()
+            (result.finish_reason.as_openai(), if result.text.is_empty() {
+                None
+            } else {
+                Some(result.text)
+            }, result.tool_calls)
         };
         let resp = ChatCompletionResponse {
             id,
@@ -131,12 +173,8 @@ pub async fn chat_completions(
                 index: 0,
                 message: ChatMessage {
                     role: Role::Assistant,
-                    content: if result.text.is_empty() {
-                        None
-                    } else {
-                        Some(result.text)
-                    },
-                    tool_calls: result.tool_calls,
+                    content,
+                    tool_calls,
                     tool_call_id: None,
                     name: None,
                 },
@@ -356,9 +394,31 @@ async fn drive_sse_stream(
             }
             WorkerEvent::Error(e) => {
                 tracing::error!(error=%e, "engine error during stream");
-                finish_reason = "error";
+                // "internal_error" — see retryable-naming note on the
+                // malformed-DSML branch below.
+                finish_reason = "internal_error";
             }
         }
+    }
+
+    // Malformed DSML overrides whatever finish we picked above. We
+    // can't unsend already-emitted text chunks (streaming), but at
+    // least the terminating finish_reason tells letta the turn is
+    // broken. "internal_error" rather than "error" so letta's
+    // substring-based retryable-error classifier matches — see the
+    // longer note on the non-streaming branch above.
+    //
+    // Caveat: letta also gates retry on whether ANY model output
+    // (text_delta / thinking_delta / toolcall_end) was emitted before
+    // the error (pi-stream-adapter.ts: `emittedModelOutput`). For
+    // bad-DSML *before* any text/tool deltas the retry will fire; for
+    // bad-DSML *after* we've already streamed text, letta will surface
+    // the error without retrying even though we mark it retryable.
+    if scanner.saw_malformed() {
+        tracing::warn!(
+            "stream: scanner saw malformed DSML; reporting finish_reason=internal_error"
+        );
+        finish_reason = "internal_error";
     }
 
     // Final terminating chunk with finish_reason.
@@ -391,15 +451,24 @@ async fn drive_sse_stream(
         .await;
 }
 
-/// True if either `reasoning` or `reasoning_effort` is set to anything
-/// other than "none" / "off" / empty. Letta sends `reasoning` as a
-/// string level ("low"/"medium"/"high"); OpenAI uses `reasoning_effort`.
+/// True if neither `reasoning` nor `reasoning_effort` is set to an
+/// explicit OFF value. Letta sends `reasoning` as a string level
+/// ("low"/"medium"/"high"); OpenAI uses `reasoning_effort`.
+///
+/// Default = **ON**: V4-Flash benefits substantially from a `<think>`
+/// planning phase before emitting tool-call DSML, and most letta
+/// requests omit the field entirely (relying on the server default).
+/// Letta or other clients can disable by sending e.g.
+/// `reasoning: "none"`.
 fn is_reasoning_enabled(reasoning: &Option<String>, effort: &Option<String>) -> bool {
-    let on = |s: &str| {
+    let off = |s: &str| {
         let l = s.to_ascii_lowercase();
-        !matches!(l.as_str(), "" | "none" | "off" | "disabled" | "false")
+        matches!(l.as_str(), "" | "none" | "off" | "disabled" | "false")
     };
-    reasoning.as_deref().map(on).unwrap_or(false) || effort.as_deref().map(on).unwrap_or(false)
+    // If EITHER field explicitly says "off", honour it. Otherwise on.
+    let r_off = reasoning.as_deref().map(off).unwrap_or(false);
+    let e_off = effort.as_deref().map(off).unwrap_or(false);
+    !(r_off || e_off)
 }
 
 fn unix_now() -> u64 {

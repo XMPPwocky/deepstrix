@@ -107,6 +107,18 @@ pub struct SnapshotMeta {
 }
 
 /// In-memory record of one on-disk snapshot.
+/// Output of [`SnapshotIndex::diag_largest_divergence`].
+#[derive(Debug, Clone)]
+pub struct DiagDivergence {
+    pub snap_token_count: u32,
+    pub snap_byte_len: usize,
+    pub req_byte_len: usize,
+    pub common_byte_len: usize,
+    pub before: String,
+    pub snap_after: String,
+    pub req_after: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct IndexEntry {
     pub hash: [u8; 32],
@@ -288,27 +300,84 @@ impl SnapshotIndex {
         self.evict_to_fit();
     }
 
+    /// Diagnostic: pick the snapshot in the index whose stored
+    /// token_count is largest, load its tokens.bin, decode to bytes,
+    /// and compute the byte-position at which the snapshot's byte
+    /// stream first diverges from `req_tokens`' byte stream. Returns
+    /// the snapshot's token count, the divergence byte offset, and
+    /// short hex slices of the bytes before/at/after divergence on
+    /// each side. Used to investigate why save-every-turn snapshots
+    /// don't byte-match what letta replays. Returns None when there
+    /// is no candidate larger than `min_token_count`.
+    pub fn diag_largest_divergence(
+        &self,
+        req_tokens: &[i32],
+        min_token_count: u32,
+        vocab: &BpeVocab,
+        byte_decoder: &std::collections::HashMap<char, u8>,
+    ) -> Option<DiagDivergence> {
+        let entry = self
+            .by_hash
+            .values()
+            .filter(|e| e.token_count > min_token_count)
+            .max_by_key(|e| e.token_count)?;
+        let tokens_path = entry.dir.join("tokens.bin");
+        let raw = std::fs::read(&tokens_path).ok()?;
+        if raw.len() % 4 != 0 {
+            return None;
+        }
+        let mut snap_tokens: Vec<i32> = Vec::with_capacity(raw.len() / 4);
+        for c in raw.chunks_exact(4) {
+            snap_tokens.push(i32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        }
+        let snap_bytes = decode_tokens_to_bytes(&snap_tokens, vocab, byte_decoder);
+        let req_bytes = decode_tokens_to_bytes(req_tokens, vocab, byte_decoder);
+        let common_len = snap_bytes
+            .iter()
+            .zip(req_bytes.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let ctx_before = 64usize.min(common_len);
+        let snap_after_end = (common_len + 64).min(snap_bytes.len());
+        let req_after_end = (common_len + 64).min(req_bytes.len());
+        Some(DiagDivergence {
+            snap_token_count: entry.token_count,
+            snap_byte_len: snap_bytes.len(),
+            req_byte_len: req_bytes.len(),
+            common_byte_len: common_len,
+            before: String::from_utf8_lossy(
+                &snap_bytes[common_len.saturating_sub(ctx_before)..common_len],
+            )
+            .into_owned(),
+            snap_after: String::from_utf8_lossy(&snap_bytes[common_len..snap_after_end])
+                .into_owned(),
+            req_after: String::from_utf8_lossy(&req_bytes[common_len..req_after_end])
+                .into_owned(),
+        })
+    }
+
     /// Walk `tokens` looking for the longest prefix `tokens[..i]` whose
     /// byte-decoded form (`blake3(decode(tokens[..i]))`) matches an
-    /// on-disk snapshot. Probes only at turn-boundary indices:
-    /// positions `i` where `tokens[i-1] == TOK_EOS`. Returns
-    /// `(req_prefix_len, hash, dir)` of the largest match — where
-    /// `req_prefix_len` is the req-side token count for the byte
-    /// boundary that hashed (the snapshot's stored token count may
-    /// differ, since the same bytes can split differently).
+    /// on-disk snapshot. Probes at turn-boundary indices: positions
+    /// `i` where `tokens[i-1]` is either `TOK_EOS` (end-of-message)
+    /// or `TOK_ASSISTANT` (start of an assistant turn — the
+    /// canonical save point for the start-of-think snapshot). The
+    /// latter is essential: post-`<think>`-design snapshots end at
+    /// `<Assistant>` (not EOS), and probing only at EOS would never
+    /// find them. Returns `(req_prefix_len, hash, dir)` of the
+    /// largest match — where `req_prefix_len` is the req-side token
+    /// count for the byte boundary that hashed (the snapshot's
+    /// stored token count may differ, since the same bytes can
+    /// split differently).
     pub fn find_longest_prefix(
         &self,
         tokens: &[i32],
         tok_eos: i32,
+        tok_assistant: i32,
         vocab: &BpeVocab,
         byte_decoder: &std::collections::HashMap<char, u8>,
     ) -> Option<(usize, [u8; 32], PathBuf)> {
         let mut best: Option<(usize, [u8; 32], PathBuf)> = None;
-        // Build the decoded byte prefix incrementally; recompute the
-        // blake3 hash at each EOS boundary. blake3 doesn't have a
-        // cheap incremental hash for arbitrary prefixes, but the
-        // hashing itself is fast (~GB/s) — for a 16K-token prompt
-        // this is sub-millisecond.
         let mut byte_prefix: Vec<u8> = Vec::with_capacity(tokens.len() * 2);
         let decode = |id: i32| -> Vec<u8> {
             vocab
@@ -318,7 +387,7 @@ impl SnapshotIndex {
         };
         for (i, &tok) in tokens.iter().enumerate() {
             byte_prefix.extend(decode(tok));
-            if tok == tok_eos {
+            if tok == tok_eos || tok == tok_assistant {
                 let h = *blake3::hash(&byte_prefix).as_bytes();
                 if let Some(entry) = self.by_hash.get(&h) {
                     let req_prefix_len = i + 1;
@@ -579,9 +648,14 @@ pub fn restore(
     if state.layers.len() != N_LAYER as usize {
         return Err(eyre!("snapshot.restore: state has wrong layer count"));
     }
-    if meta.n_kv_max != state.n_kv_max {
+    // Snapshots from a smaller n_kv_max fit inside a larger state's
+    // buffers — restore copies row data and zero-pads the rest. Only
+    // reject when the snapshot is LARGER than the live state (would
+    // overflow). This lets `--ctx` be bumped without invalidating the
+    // disk cache.
+    if meta.n_kv_max > state.n_kv_max {
         return Err(eyre!(
-            "snapshot.restore: n_kv_max mismatch (snapshot {}, state {})",
+            "snapshot.restore: snapshot n_kv_max {} exceeds state n_kv_max {}",
             meta.n_kv_max,
             state.n_kv_max
         ));

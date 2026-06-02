@@ -25,7 +25,7 @@ use v4flash_kernels::RopeParams;
 use crate::embed::{build_gpt2_byte_decoder, embed_lookup, gpt2_decode_token};
 use crate::rope_for_layer;
 use crate::snapshot::{self, ModelFingerprint, SnapshotIndex};
-use crate::tokens::{is_turn_end, TOK_EOS, TOK_THINK_BEGIN, TOK_THINK_END};
+use crate::tokens::{is_turn_end, TOK_ASSISTANT, TOK_EOS, TOK_THINK_BEGIN, TOK_THINK_END};
 
 /// Per-request input.
 pub struct GenerateReq {
@@ -673,7 +673,7 @@ fn save_live_if_dirty(state: &mut WorkerState) {
 
 fn handle_generate_stream(
     state: &mut WorkerState,
-    req: GenerateReq,
+    mut req: GenerateReq,
     session_id: Option<String>,
     cancel: Arc<AtomicBool>,
     tx: &mpsc::Sender<WorkerEvent>,
@@ -689,7 +689,26 @@ fn handle_generate_stream(
         ));
     }
 
+    // Strip the trailing `<think>`/`</think>` marker from the rendered
+    // prompt. The marker is "transient" — letta's history-replay of
+    // this turn always starts with `</think>` (never `<think>`), so
+    // saving a snapshot whose bytes include the trailing `<think>`
+    // would byte-diverge against every subsequent turn's request.
+    //
+    // Strategy: prefill everything UP TO the marker, save the
+    // snapshot here (canonical bytes match letta's future replay),
+    // then forward the marker manually as the first sampling input.
+    // The model still thinks/responds; we just don't bake the marker
+    // into the snapshot's saved tokens. See [[think-cache-design]].
     let prompt_tokens = req.tokens.len() as u32;
+    let trailing_marker: Option<i32> = req
+        .tokens
+        .last()
+        .copied()
+        .filter(|&t| t == TOK_THINK_BEGIN || t == TOK_THINK_END);
+    if trailing_marker.is_some() {
+        req.tokens.truncate(req.tokens.len() - 1);
+    }
 
     // KV-cache reuse decision. There are three cases:
     //   1. No live session, or new request diverges from live mid-prefix:
@@ -738,6 +757,7 @@ fn handle_generate_stream(
         let disk_hit_walk = state.snapshot_index.find_longest_prefix(
             &req.tokens,
             TOK_EOS,
+            TOK_ASSISTANT,
             state.vocab.as_ref(),
             &state.byte_decoder,
         );
@@ -748,13 +768,16 @@ fn handle_generate_stream(
             (None, None) => None,
         };
 
-        // Disk snapshot lookup. The snapshot's IndexEntry.token_count
-        // is in the SAVED token-id space (originally-sampled IDs); the
-        // walk's match position is the byte boundary in req-token space.
-        // We treat the snapshot as "potentially useful" if it offers more
-        // req-side coverage than the in-VRAM live cache.
+        // Disk snapshot lookup. We can't actually USE the in-VRAM
+        // partial match (lcp_req bytes) here — without truncation
+        // support we're about to throw all of it away and full-reset.
+        // So restoring from disk is worthwhile whenever the snapshot
+        // covers MORE THAN ZERO req tokens (with a small threshold to
+        // avoid the ~1-2 s restore overhead for tiny snapshots that
+        // wouldn't pay for themselves).
+        const DISK_RESTORE_MIN_TOKENS: usize = 64;
         if let Some((snap_req_tokens, snap_hash, snap_dir)) = disk_hit {
-            if snap_req_tokens > lcp_req {
+            if snap_req_tokens >= DISK_RESTORE_MIN_TOKENS {
                 save_live_if_dirty(state);
                 state.state.reset_in_place(state.dgpu, state.igpu)?;
                 let loaded = snapshot::restore(
@@ -788,6 +811,37 @@ fn handle_generate_stream(
                 } else {
                     let _ = state.snapshot_index.touch(&snap_hash);
                     let suffix_len = req.tokens.len() - verify.req_tokens;
+                    // Diagnostic: when there's a LARGER snapshot than
+                    // the one we just restored AND that snapshot shares
+                    // a meaningful byte prefix with the current
+                    // request, log where its bytes first diverge —
+                    // tells us which turn-boundary re-render is broken.
+                    // Suppress when the larger snapshot is clearly
+                    // from a different conversation (tiny common
+                    // prefix) — that's just LRU index noise.
+                    if let Some(diag) = state.snapshot_index.diag_largest_divergence(
+                        &req.tokens,
+                        loaded_len,
+                        state.vocab.as_ref(),
+                        &state.byte_decoder,
+                    ) {
+                        // Threshold: larger snapshot must share at
+                        // least half the request's bytes to be
+                        // considered "same conversation".
+                        if diag.common_byte_len * 2 >= diag.req_byte_len {
+                            tracing::warn!(
+                                picked_token_count = loaded_len,
+                                largest_token_count = diag.snap_token_count,
+                                largest_byte_len = diag.snap_byte_len,
+                                req_byte_len = diag.req_byte_len,
+                                common_byte_len = diag.common_byte_len,
+                                before = %diag.before,
+                                snap_after = %diag.snap_after,
+                                req_after = %diag.req_after,
+                                "byte divergence vs largest snapshot"
+                            );
+                        }
+                    }
                     tracing::info!(
                         req_len = req.tokens.len(),
                         restored_live = loaded_len,
@@ -809,17 +863,20 @@ fn handle_generate_stream(
                     state.live = Some(LiveSession {
                         tokens: new_tokens,
                         pos: new_pos,
-                        dirty: false,
+                        dirty: true,
                         session_id: session_id.clone(),
                     });
+                    let (pos_after_marker, initial_in_think) =
+                        save_and_forward_marker(state, trailing_marker, new_pos)?;
                     return finish_decode(
                         state,
                         req,
                         tx,
                         prompt_tokens,
-                        new_pos,
+                        pos_after_marker,
                         session_id,
                         cancel,
+                        initial_in_think,
                     );
                 }
             }
@@ -921,11 +978,79 @@ fn handle_generate_stream(
     state.live = Some(LiveSession {
         tokens: new_live_tokens,
         pos: new_pos,
-        dirty: false,
+        // Force dirty=true so save_and_forward_marker below actually
+        // writes. State is canonical (no `<think>` baked in) AND new
+        // (we just appended the request's suffix), so it deserves a
+        // save.
+        dirty: true,
         session_id: session_id.clone(),
     });
 
-    finish_decode(state, req, tx, prompt_tokens, new_pos, session_id, cancel)
+    let (pos_after_marker, initial_in_think) =
+        save_and_forward_marker(state, trailing_marker, new_pos)?;
+
+    finish_decode(
+        state,
+        req,
+        tx,
+        prompt_tokens,
+        pos_after_marker,
+        session_id,
+        cancel,
+        initial_in_think,
+    )
+}
+
+/// Save the start-of-think snapshot, then forward the trailing
+/// `<think>`/`</think>` marker (if any) into the KV cache.
+///
+/// The snapshot's saved tokens (== live.tokens at this point) match
+/// what letta will replay for this turn's history on subsequent
+/// requests: canonical bytes through `<Assistant>`, with no
+/// `<think>` baked in. The marker we forward AFTER the save is
+/// transient w.r.t. snapshot identity but still required so the
+/// model starts sampling in the right "thinking vs responding"
+/// mode.
+///
+/// Returns `(pos_after_marker, initial_in_think)` — the KV
+/// position the next sampled token will be written at, and whether
+/// we should treat the first sampled token as part of the model's
+/// reasoning trace.
+fn save_and_forward_marker(
+    state: &mut WorkerState,
+    trailing_marker: Option<i32>,
+    pos_at_save: u32,
+) -> eyre::Result<(u32, bool)> {
+    save_live_if_dirty(state);
+
+    let mut pos_after_marker = pos_at_save;
+    let initial_in_think = if let Some(marker) = trailing_marker {
+        let mut residual = vec![0f32; HC_DIM as usize];
+        embed_lookup(&state.token_embd_bytes, marker, &mut residual);
+        state.engine.forward_token(
+            &mut state.dgpu_scratch,
+            &mut state.igpu_scratch,
+            &mut state.state,
+            &state.weights,
+            &residual,
+            pos_after_marker,
+            marker,
+        )?;
+        pos_after_marker += 1;
+        if let Some(live) = state.live.as_mut() {
+            live.pos = pos_after_marker;
+            // TOK_THINK_END is canonical (letta renders it at the
+            // start of every historical assistant turn). TOK_THINK_BEGIN
+            // is transient — never in letta's replay.
+            if marker == TOK_THINK_END {
+                live.tokens.push(marker);
+            }
+        }
+        marker == TOK_THINK_BEGIN
+    } else {
+        false
+    };
+    Ok((pos_after_marker, initial_in_think))
 }
 
 // `prompt_tokens` is reported back via OpenAI's usage block (== request
@@ -941,6 +1066,7 @@ fn finish_decode(
     start_pos: u32,
     _session_id: Option<String>,
     cancel: Arc<AtomicBool>,
+    initial_in_think: bool,
 ) -> eyre::Result<()> {
     let mut pos = start_pos;
 
@@ -960,22 +1086,44 @@ fn finish_decode(
 
     let mut residual = vec![0f32; HC_DIM as usize];
     let max_new = req.max_new as u32;
-    // Track whether we're inside a `<think>…</think>` block so the
-    // handler can route reasoning vs. content to different SSE fields.
-    // We start in "thinking" iff the last token forwarded into the KV
-    // cache was `<think>`. After a byte-aligned-extend, that's
-    // `req.tokens.last()` (which we just appended). For the no-extend
-    // case it's also `req.tokens.last()`.
-    let mut in_think = req
-        .tokens
-        .last()
-        .map(|&t| t == TOK_THINK_BEGIN)
-        .unwrap_or(false);
+    // The caller already forwarded the trailing think marker (if any)
+    // — see handle_generate_stream — and passes the resulting
+    // in_think state here directly. (req.tokens no longer includes
+    // the trailing marker now that we strip it for the snapshot.)
+    let mut in_think = initial_in_think;
     let _ = start_pos;
+    let tok_dsml = state.vocab.dsml_id.unwrap_or(-1);
+    let trace_tokens =
+        std::env::var("DEEPSTRIX_TRACE_TOKENS").is_ok_and(|v| !v.is_empty() && v != "0");
+    // When we sample TOK_DSML, dump the next N tokens too so we can
+    // see what bytes are flowing into the scanner's header parse.
+    let mut dump_window: usize = 0;
     let finish: FinishReason = loop {
         if cancel.load(Ordering::Relaxed) {
             tracing::info!("generation cancelled by client");
             break FinishReason::Stop;
+        }
+        // Per-token diagnostic. Logs (token_id, decoded text) for
+        // every TOK_DSML sample and the next ~12 tokens after it,
+        // plus everything when DEEPSTRIX_TRACE_TOKENS is set.
+        let is_dsml = next == tok_dsml;
+        if trace_tokens || is_dsml || dump_window > 0 {
+            let decoded = state
+                .vocab
+                .token_text(next)
+                .map(|b| gpt2_decode_token(b, &state.byte_decoder))
+                .unwrap_or_default();
+            tracing::info!(
+                token_id = next,
+                is_dsml,
+                text = ?String::from_utf8_lossy(&decoded),
+                "sample"
+            );
+            if is_dsml {
+                dump_window = 12;
+            } else {
+                dump_window = dump_window.saturating_sub(1);
+            }
         }
         if is_turn_end(next) {
             break FinishReason::Stop;
@@ -1026,11 +1174,22 @@ fn finish_decode(
             next,
         )?;
         pos += 1;
-        // Successfully ingested `next` into KV at `pos-1`. Record it.
+        // Successfully ingested `next` into KV at `pos-1`. live.pos
+        // always tracks the KV cache position. live.tokens only
+        // tracks CANONICAL tokens — what letta will replay as
+        // history. Transient tokens (TOK_THINK_BEGIN itself; any
+        // token sampled while in_think) go into KV but NOT into
+        // live.tokens. TOK_THINK_END IS canonical (letta always
+        // renders it at the start of each historical assistant
+        // turn). See [[think-cache-design]].
+        let canonical =
+            next != TOK_THINK_BEGIN && (next == TOK_THINK_END || !in_think);
         if let Some(ref mut live) = state.live {
-            live.tokens.push(next);
             live.pos = pos;
-            live.dirty = true;
+            if canonical {
+                live.tokens.push(next);
+                live.dirty = true;
+            }
         }
         if pos >= state.n_kv_max {
             break FinishReason::Length;
@@ -1070,20 +1229,29 @@ fn finish_decode(
         finish,
     });
 
-    // Snapshot the just-completed turn to disk so:
-    //   * cross-restart resumption works (server crash → next request
-    //     can restore from the most recent turn-boundary snapshot)
-    //   * conversation switches restore from the last turn boundary
-    //   * mid-turn divergences (user interruption / tool-call
-    //     rejection) fall back to the previous turn's snapshot —
-    //     close enough that the new prefill is ~hundreds of tokens
-    //     instead of full restart from 0
+    // End-of-turn cleanup. We no longer save the snapshot here —
+    // the meaningful save happened in handle_generate_stream BEFORE
+    // we forwarded the trailing `<think>` marker (so the snapshot
+    // bytes match what letta will replay as history).
     //
-    // This runs AFTER `Done` so the response is already on the wire
-    // when the snapshot write starts; the worker still blocks for ~1-2s
-    // before accepting the next request, but the user has their
-    // response in hand.
-    save_live_if_dirty(state);
+    // If the KV cache holds transient tokens past the canonical
+    // position (i.e. we forwarded `<think>` + thinking content +
+    // `</think>` but only pushed `</think>` + content to
+    // live.tokens), the in-VRAM state can't be safely extended on
+    // the next request — RoPE positions would be off. Drop it; the
+    // next request will pick up the start-of-think snapshot from
+    // disk and re-forward the now-canonical suffix.
+    if let Some(live) = &state.live {
+        if (live.pos as usize) > live.tokens.len() {
+            tracing::debug!(
+                pos = live.pos,
+                tokens_len = live.tokens.len(),
+                "clearing live cache: transient tokens past canonical \
+                 position (cross-turn extension would mis-position the KV)"
+            );
+            state.live = None;
+        }
+    }
 
     Ok(())
 }
@@ -1126,6 +1294,13 @@ pub struct GenerateResult {
     /// True if the scanner saw any tool call or the tool_calls block
     /// closed (used to set finish_reason="tool_calls").
     pub saw_tool: bool,
+    /// True if the scanner hit an unknown DSML tag and fell back to
+    /// Text mode — the model emitted broken markup (e.g.
+    /// `<｜DSML｜command …>` instead of `<｜DSML｜parameter
+    /// name="command">`). Callers report `finish_reason: "error"` so
+    /// letta treats the turn as failed rather than recording the
+    /// corrupted markup as content.
+    pub saw_malformed: bool,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub finish_reason: FinishReason,
@@ -1226,10 +1401,12 @@ pub async fn accumulate(
         text.push_str(&String::from_utf8_lossy(&pending));
     }
     let (p, c, f) = last.ok_or_else(|| eyre!("worker closed without Done"))?;
+    let saw_malformed = scanner.saw_malformed();
     Ok(GenerateResult {
         text,
         tool_calls,
         saw_tool,
+        saw_malformed,
         prompt_tokens: p,
         completion_tokens: c,
         finish_reason: f,

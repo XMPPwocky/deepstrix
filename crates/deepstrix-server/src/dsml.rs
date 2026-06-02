@@ -242,6 +242,22 @@ pub struct DsmlScanner {
     /// the body slot is filled when we leave ParameterBody so
     /// dispatch_close("parameter") can finalize it.
     current_param: Option<(String, bool, Vec<u8>)>,
+    /// Sticky flag: true once any unknown-tag fallback occurred
+    /// (e.g. the model emitted `<｜DSML｜command name="ls"…>` instead
+    /// of `<｜DSML｜parameter name="command"…>ls`). The handler
+    /// checks this at end-of-turn and reports
+    /// `finish_reason: "error"` so letta knows the turn is broken
+    /// rather than treating the corrupted markup as content.
+    malformed: bool,
+}
+
+impl DsmlScanner {
+    /// True if the scanner ever encountered an unknown DSML tag and
+    /// fell back to Text mode. Sticky for the lifetime of the
+    /// scanner — caller queries at end-of-turn.
+    pub fn saw_malformed(&self) -> bool {
+        self.malformed
+    }
 }
 
 impl DsmlScanner {
@@ -253,6 +269,7 @@ impl DsmlScanner {
             tail: Vec::new(),
             buf: Vec::new(),
             current_param: None,
+            malformed: false,
         }
     }
 
@@ -472,8 +489,8 @@ impl DsmlScanner {
             self.mode = Mode::ParameterBody;
             return;
         }
-        // Unknown tag — treat as text fallback.
         tracing::warn!(head, "unknown DSML open tag; falling back to Text");
+        self.malformed = true;
         self.mode = Mode::Text;
     }
 
@@ -522,6 +539,7 @@ impl DsmlScanner {
             return;
         }
         tracing::warn!(head, "unknown DSML close tag; falling back to Text");
+        self.malformed = true;
         self.mode = Mode::Text;
     }
 
