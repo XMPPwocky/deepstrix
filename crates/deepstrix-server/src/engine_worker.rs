@@ -1098,10 +1098,39 @@ fn finish_decode(
     // When we sample TOK_DSML, dump the next N tokens too so we can
     // see what bytes are flowing into the scanner's header parse.
     let mut dump_window: usize = 0;
+    // Decode-loop heartbeat. The DSML-window trace above goes silent
+    // for long stretches of plain-text decode, which makes a
+    // genuinely-progressing decode look identical to a hang. Emit a
+    // one-line heartbeat every HEARTBEAT_INTERVAL completion tokens
+    // with rolling tok/s since the last beat, so the log keeps
+    // breathing.
+    const HEARTBEAT_INTERVAL: u32 = 64;
+    let mut hb_last_count: u32 = 0;
+    let mut hb_last_at = std::time::Instant::now();
     let finish: FinishReason = loop {
         if cancel.load(Ordering::Relaxed) {
             tracing::info!("generation cancelled by client");
             break FinishReason::Stop;
+        }
+        if completion_tokens > 0
+            && completion_tokens - hb_last_count >= HEARTBEAT_INTERVAL
+        {
+            let elapsed = hb_last_at.elapsed().as_secs_f32();
+            let delta = completion_tokens - hb_last_count;
+            let tok_per_s = if elapsed > 0.0 {
+                delta as f32 / elapsed
+            } else {
+                0.0
+            };
+            tracing::info!(
+                completion_tokens,
+                pos,
+                in_think,
+                tok_per_s = format!("{:.1}", tok_per_s),
+                "decode heartbeat"
+            );
+            hb_last_count = completion_tokens;
+            hb_last_at = std::time::Instant::now();
         }
         // Per-token diagnostic. Logs (token_id, decoded text) for
         // every TOK_DSML sample and the next ~12 tokens after it,

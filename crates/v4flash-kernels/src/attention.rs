@@ -31,10 +31,13 @@ pub const ATTN_SWA_MAX_KV: u32 = 128;
 /// Hard cap on `n_raw + n_comp` for the split decode kernels
 /// (`attention_mixed_score`, `attention_mixed_softmax_wsum`). Scratch
 /// lives in `DgpuScratch.attn_scores` (global memory), so this isn't
-/// LDS-bound. 17664 covers 128 raw + 17536 comp ≈ 70K context at ratio=4
-/// (headroom above 64K so a full chunk prefilled on top of a 64K prefix
-/// still fits). Must match `#define ATTN_MIXED_MAX_KEYS` in `kernels/attention_mixed.hip`.
-pub const ATTN_MIXED_MAX_KEYS: u32 = 17664;
+/// LDS-bound. 24576 covers 128 raw + 24448 comp ≈ 97K context at ratio=4
+/// (worst-case layer ratio across [[compress-ratios]] is 4; min layers
+/// have 128, but they barely grow). Headroom above 96K so a full chunk
+/// (B_MAX=512 tokens, +128 comp rows) prefilled on top of a 96K prefix
+/// still fits. Must match `#define ATTN_MIXED_MAX_KEYS` in
+/// `kernels/attention_mixed.hip`.
+pub const ATTN_MIXED_MAX_KEYS: u32 = 24576;
 
 /// Head-group size for the head-tiled WMMA smwsum kernels. Must match
 /// `#define SMWSUM_HEAD_TILE` in `kernels/attention_mixed.hip`.

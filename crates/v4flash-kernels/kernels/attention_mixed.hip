@@ -14,7 +14,7 @@
 // weighted-sum axpy without any special-casing.
 //
 // ATTN_MIXED_MAX_KEYS — global-mem-bound, used by all attention kernels.
-// 17664 covers 128 raw + 17536 comp ≈ 70K ctx at ratio=4. Scratch lives
+// 24576 covers 128 raw + 24448 comp ≈ 97K ctx at ratio=4. Scratch lives
 // in DgpuScratch.attn_scores (caller-supplied global buffer).
 
 #include <hip/hip_runtime.h>
@@ -24,7 +24,7 @@
 typedef _Float16 half8  __attribute__((ext_vector_type(8)));
 typedef float    float8 __attribute__((ext_vector_type(8)));
 
-#define ATTN_MIXED_MAX_KEYS  17664
+#define ATTN_MIXED_MAX_KEYS  24576
 
 // ---------------------------------------------------------------------------
 // Split-kernel decode (perf diagnosis): same math as `attention_mixed`, but

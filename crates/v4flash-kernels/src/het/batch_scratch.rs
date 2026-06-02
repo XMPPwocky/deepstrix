@@ -34,6 +34,31 @@ use super::scratch::{DgpuScratch, IgpuScratch};
 /// ~24→48 MB.
 pub const B_MAX: usize = 512;
 
+/// Diagnostic toggle (env `DEEPSTRIX_F32_SCORES=1`): route the batched-
+/// prefill attention through the **f32-scores** kernel pair instead of
+/// the production f16-scores one. Used to test whether long-ctx
+/// accuracy degradation is caused by f16 quantization of pre-softmax
+/// logits (`_f16s` writes scores as f16, losing ~3 mantissa digits per
+/// logit — bad near softmax ties). When on:
+///   * `BatchDgpuScratch::attn_scores` is allocated at *full* f32 size
+///     (B_MAX × N_HEAD × ATTN_MIXED_MAX_KEYS f32 elements = ~3.2 GiB at
+///     B_MAX=512), instead of the half-sized f16-byte-equivalent layout.
+///   * `forward_prefill` dispatches `launch_score_batched_htiled_wmma`
+///     + `launch_softmax_wsum_batched_htiled_wmma_ldsv` (both read/write
+///     f32) instead of the `_f16s` siblings.
+/// Read once at process start; flipping the env var mid-run does
+/// nothing.
+pub fn use_f32_scores() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("DEEPSTRIX_F32_SCORES")
+            .ok()
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
 /// Test-only convenience bundle of (shared `DgpuScratch`,
 /// shared `IgpuScratch`, B per-token residual buffers).
 ///
@@ -356,12 +381,22 @@ impl BatchDgpuScratch {
             n_comp_per: mk_i32(1)?,
 
             heads: mk_f32(Q_FLAT as usize)?,
-            // Half-sized: the score kernel writes f16 into this buffer
-            // (see launch_score_batched_htiled_wmma_f16s in attention.rs).
-            // N_HEAD * ATTN_MIXED_MAX_KEYS / 2 f32 elements ≡ N_HEAD *
-            // ATTN_MIXED_MAX_KEYS f16 elements ≡ same byte budget as the
-            // f32-scores layout would have used.
-            attn_scores: mk_f32(((N_HEAD * ATTN_MIXED_MAX_KEYS) / 2) as usize)?,
+            // Half-sized by default: the f16-scores kernel writes f16
+            // into this buffer (see launch_score_batched_htiled_wmma_f16s
+            // in attention.rs). N_HEAD * ATTN_MIXED_MAX_KEYS / 2 f32
+            // elements ≡ N_HEAD * ATTN_MIXED_MAX_KEYS f16 elements ≡
+            // same byte budget as the f32-scores layout would have used.
+            //
+            // Doubled when DEEPSTRIX_F32_SCORES=1 so the f32-scores
+            // kernel pair has the headroom it needs.
+            attn_scores: {
+                let per_b = if use_f32_scores() {
+                    (N_HEAD * ATTN_MIXED_MAX_KEYS) as usize
+                } else {
+                    ((N_HEAD * ATTN_MIXED_MAX_KEYS) / 2) as usize
+                };
+                mk_f32(per_b)?
+            },
             low: mk_f32(OUT_LOW as usize)?,
             heads_xq: mk_i8(Q_FLAT as usize)?,
             heads_xscale: mk_f32(BLOCKS_GROUPED_OUT as usize)?,

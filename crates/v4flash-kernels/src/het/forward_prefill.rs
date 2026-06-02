@@ -482,6 +482,13 @@ impl HeterogeneousEngine {
             Vec::with_capacity(t * cs_vocab)
         };
 
+        // Progress log: long cold prefills can take many minutes;
+        // emit a heartbeat every ~16 chunks so the operator can see
+        // forward progress instead of guessing whether the engine is
+        // stuck. Wall-clock + chunk index lets you extrapolate ETA.
+        let prefill_start = std::time::Instant::now();
+        let total_chunks = t.div_ceil(chunk_size);
+        let mut chunk_idx = 0usize;
         let mut chunk_start = 0usize;
         while chunk_start < t {
             let chunk_end = (chunk_start + chunk_size).min(t);
@@ -490,6 +497,31 @@ impl HeterogeneousEngine {
             let chunk_input = &input_hcs[chunk_start..chunk_end];
             let chunk_tokens = &tokens[chunk_start..chunk_end];
             let chunk_pos0 = pos0 + chunk_start as u32;
+
+            if chunk_idx == 0 || chunk_idx % 16 == 0 || is_last_chunk {
+                let elapsed_s = prefill_start.elapsed().as_secs_f32();
+                let toks_per_s = if elapsed_s > 0.001 {
+                    chunk_start as f32 / elapsed_s
+                } else {
+                    0.0
+                };
+                let eta_s = if toks_per_s > 1.0 {
+                    (t - chunk_start) as f32 / toks_per_s
+                } else {
+                    -1.0
+                };
+                tracing::warn!(
+                    chunk = chunk_idx,
+                    total_chunks,
+                    chunk_pos0,
+                    tokens_done = chunk_start,
+                    tokens_total = t,
+                    elapsed_s = format!("{elapsed_s:.1}"),
+                    tok_per_s = format!("{toks_per_s:.1}"),
+                    eta_s = format!("{eta_s:.1}"),
+                    "prefill_progress"
+                );
+            }
 
             self.dgpu.events.reset();
             self.igpu.events.reset();
@@ -579,6 +611,7 @@ impl HeterogeneousEngine {
             }
 
             chunk_start = chunk_end;
+            chunk_idx += 1;
         }
         Ok(out_logits)
     }
@@ -1022,27 +1055,20 @@ impl HeterogeneousEngine {
 
                 // Batched state_write for this segment.
                 //
-                // CRITICAL: per-batch stride MUST be `comp_width`, NOT
+                // CRITICAL: per-batch stride MUST be `comp_width`, not
                 // the constant `2 * cs_kvhd`. comp_width = coff *
                 // head_dim, where coff=2 for ratio==4 layers and
-                // coff=1 for ratio==128 layers. The old `2 * cs_kvhd
-                // = 1024` formula coincidentally matched coff=2
-                // (ratio==4 → comp_width=1024) but DOUBLED the offset
-                // on ratio==128 layers (comp_width=512). The second
-                // segment iter per lane then read kv_cur/sc_cur from
+                // coff=1 for ratio==128 layers. The old `2*cs_kvhd =
+                // 1024` formula happened to match coff=2 (ratio=4)
+                // but DOUBLED the offset for ratio=128 layers — the
+                // second segment iter per lane then read from
                 // uninitialised scratch past the matvec_pair_batched
-                // write region, producing near-zero-magnitude garbage
-                // for every other committed comp_kv row at ratio==128
-                // layers. Surfaced as catastrophic attn_heads
-                // divergence (cosine ≈ 0.35 vs ds4-CPU on the same
-                // quant) at layer 3, the first ratio==128 layer, on
-                // long-prompt cases; the model still produced
-                // plausible text but picked visibly-wrong tokens at
-                // long ctx (e.g. "Based" instead of "Component" on
-                // long_memory_archive at 3.3K-token prefill). Per-
-                // sub-tensor diff against ds4-CPU + per-row comp_kv
-                // pattern (cos≈1 on even rows, cos≈0 on odd rows)
-                // confirmed.
+                // write region, producing zero-near-magnitude garbage
+                // for every other compressed K/V row at ratio=128
+                // layers. Observed end-to-end as catastrophic
+                // attn_heads divergence at layer 3 (the first
+                // ratio=128 layer) on long-prompt cases. See the
+                // sub-tensor bisection in [TODO: commit msg].
                 let comp_stride = comp_width as usize;
                 let kv_seg = bd.kv_cur.slice_view(
                     (i as usize) * comp_stride,
@@ -1221,22 +1247,40 @@ impl HeterogeneousEngine {
             // single-kernel path (online softmax, no scores buffer); skips
             // both score and smwsum below.
             let fused = std::env::var_os("ATTN_FUSED").is_some();
+            let f32_scores = super::batch_scratch::use_f32_scores();
             if !fused {
                 let _t = de.events.stage("k.attn.score", &de.compute)?;
-                de.attn_mixed.launch_score_batched_htiled_wmma_f16s(
-                    &de.compute,
-                    &mut bd.attn_scores,
-                    &bd.q_normed,
-                    &ls.kv_cache,
-                    comp_kv_buf,
-                    &nrp_view,
-                    &nrop_view,
-                    &ncp_view,
-                    N_HEAD,
-                    N_HEAD_DIM,
-                    n_total_max,
-                    b,
-                )?;
+                if f32_scores {
+                    de.attn_mixed.launch_score_batched_htiled_wmma(
+                        &de.compute,
+                        &mut bd.attn_scores,
+                        &bd.q_normed,
+                        &ls.kv_cache,
+                        comp_kv_buf,
+                        &nrp_view,
+                        &nrop_view,
+                        &ncp_view,
+                        N_HEAD,
+                        N_HEAD_DIM,
+                        n_total_max,
+                        b,
+                    )?;
+                } else {
+                    de.attn_mixed.launch_score_batched_htiled_wmma_f16s(
+                        &de.compute,
+                        &mut bd.attn_scores,
+                        &bd.q_normed,
+                        &ls.kv_cache,
+                        comp_kv_buf,
+                        &nrp_view,
+                        &nrop_view,
+                        &ncp_view,
+                        N_HEAD,
+                        N_HEAD_DIM,
+                        n_total_max,
+                        b,
+                    )?;
+                }
             }
             // Head-tiled phase 2: softmax one wave per head + WMMA Phase B
             // W·V via `_ldsv_f16s`. LDS-V staging cooperatively loads each
@@ -1264,6 +1308,21 @@ impl HeterogeneousEngine {
                         N_HEAD,
                         N_HEAD_DIM,
                         n_total_max,
+                        b,
+                    )?;
+                } else if f32_scores {
+                    de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma_ldsv(
+                        &de.compute,
+                        &mut bd.heads,
+                        &mut bd.attn_scores,
+                        &dlw.attn_sinks,
+                        &ls.kv_cache,
+                        comp_kv_buf,
+                        &nrp_view,
+                        &nrop_view,
+                        &ncp_view,
+                        N_HEAD,
+                        N_HEAD_DIM,
                         b,
                     )?;
                 } else {

@@ -317,25 +317,132 @@ impl HeterogeneousEngine {
 
         self.set_current_cached(self.dgpu.device)?;
         dgpu_scratch.residual.copy_from_host(input_hc_host)?;
+        // Dump the layer-0 input (== embedded token vector) if
+        // DEEPSTRIX_DUMP_RESIDUAL_DIR is set. Index 00 in the file
+        // naming. Per-layer post-output dumps land at indices 01..43.
+        maybe_dump_residual(0, &dgpu_scratch.residual)?;
 
         let token_start = std::time::Instant::now();
+        let dump_subtensor_layers: Vec<usize> = subtensor_dump_spec()
+            .as_ref()
+            .map(|(ls, _)| ls.clone())
+            .unwrap_or_default();
         for layer in 0..N_LAYER as usize {
             let next_dlw = if layer + 1 < N_LAYER as usize {
                 Some(&weights.dgpu_layers[layer + 1])
             } else {
                 None
             };
-            self.forward_layer(
-                dgpu_scratch,
-                igpu_scratch,
-                &mut state.layers[layer],
-                &weights.dgpu_layers[layer],
-                next_dlw,
-                &weights.igpu_layers[layer],
-                pos,
-                token_id,
-            )?;
+            // When sub-tensor dumping is active at this layer, fall
+            // back to the standalone-graphs path. The combined
+            // cross-layer graph (ffn_combine fused with next layer's
+            // mhc_pre_attn) writes the NEXT layer's attn_cur /
+            // attn_input_norm into the same scratch fields, clobbering
+            // the current layer's values before we can read them.
+            // Standalone runs each layer's mhc_pre_attn separately so
+            // the post-layer-N buffers are stable.
+            let force_standalone = dump_subtensor_layers.contains(&layer);
+            if force_standalone {
+                self.forward_layer_standalone_graphs(
+                    dgpu_scratch,
+                    igpu_scratch,
+                    &mut state.layers[layer],
+                    &weights.dgpu_layers[layer],
+                    &weights.igpu_layers[layer],
+                    pos,
+                    token_id,
+                )?;
+                self.dgpu.compute.synchronize()?;
+                // Dump every scratch field that ds4 also emits. Names
+                // match ds4's dump tags so per-tag diff is mechanical.
+                maybe_dump_subtensor_f32(layer, "attn_cur", &dgpu_scratch.attn_cur)?;
+                maybe_dump_subtensor_f32(layer, "attn_input_norm", &dgpu_scratch.attn_input_norm)?;
+                maybe_dump_subtensor_f32(layer, "q_a_out", &dgpu_scratch.qr)?;
+                maybe_dump_subtensor_f32(layer, "q_a_normed", &dgpu_scratch.qr_normed)?;
+                maybe_dump_subtensor_f32(layer, "q_post_rope", &dgpu_scratch.q_normed)?;
+                maybe_dump_subtensor_f32(layer, "kv_post_rope", &dgpu_scratch.kv_normed)?;
+                maybe_dump_subtensor_f32(layer, "attn_heads", &dgpu_scratch.heads)?;
+                maybe_dump_subtensor_f32(layer, "attn_out", &dgpu_scratch.attn_out)?;
+                maybe_dump_subtensor_f32(layer, "after_attn_hc", &dgpu_scratch.after_attn_hc)?;
+                maybe_dump_subtensor_f32(layer, "ffn_cur", &dgpu_scratch.ffn_cur)?;
+                maybe_dump_subtensor_f32(layer, "ffn_input_norm", &dgpu_scratch.ffn_input_norm)?;
+                maybe_dump_subtensor_f32(layer, "ffn_shared", &dgpu_scratch.ffn_shared)?;
+                maybe_dump_subtensor_f32(layer, "ffn_moe", &dgpu_scratch.ffn_moe_recv)?;
+                // Dump the cached K/V state that attention reads —
+                // both the committed compressed rows (`comp_kv`,
+                // ratio>0 layers) and the raw SWA window (`kv_cache`).
+                // f16 stored on device, dumped as f32 to match ds4's
+                // f32 dump format.
+                let head_dim = crate::config::N_HEAD_DIM as usize;
+                if let Some(comp) = &state.layers[layer].compressor {
+                    let n_comp_elems = (comp.n_comp as usize) * head_dim;
+                    maybe_dump_subtensor_f16_as_f32(
+                        layer, "attn_comp_kv", &comp.comp_kv, n_comp_elems
+                    )?;
+                }
+                let n_raw_elems = (state.layers[layer].n_raw as usize) * head_dim;
+                maybe_dump_subtensor_f16_as_f32(
+                    layer, "raw_kv", &state.layers[layer].kv_cache, n_raw_elems
+                )?;
+                // Router + expert-selection diagnostic: lets us
+                // compare against ds4's `expert_selected` /
+                // `expert_weight_out` / router_logits to see whether
+                // the top-K experts we pick match ds4's. If they
+                // don't, the MoE divergence is a router-precision
+                // issue, not a per-expert kernel issue.
+                maybe_dump_subtensor_f32(
+                    layer, "router_logits", &dgpu_scratch.router_logits
+                )?;
+                maybe_dump_subtensor_i32(
+                    layer, "d_selected", &dgpu_scratch.d_selected,
+                    crate::config::N_EXPERT_USED,
+                )?;
+                maybe_dump_subtensor_f32(
+                    layer, "d_ew", &dgpu_scratch.d_ew
+                )?;
+            } else {
+                self.forward_layer(
+                    dgpu_scratch,
+                    igpu_scratch,
+                    &mut state.layers[layer],
+                    &weights.dgpu_layers[layer],
+                    next_dlw,
+                    &weights.igpu_layers[layer],
+                    pos,
+                    token_id,
+                )?;
+            }
             std::mem::swap(&mut dgpu_scratch.residual, &mut dgpu_scratch.residual_next);
+            // Diagnostic-only: substitute the per-layer output residual
+            // with a host-supplied vector (typically ds4's
+            // `layer_input_residual` for layer+1, loaded from a file).
+            // Used to bisect cross-impl divergence by layer — when set,
+            // the next layer reads the substituted residual instead of
+            // ours, isolating whether our layer-`layer` compute is
+            // upstream of the diverging logit.
+            //
+            // Format of env var:
+            //   DEEPSTRIX_SUBSTITUTE_RESIDUAL=<after_layer>:<path>
+            // where <after_layer> is the layer index whose OUTPUT to
+            // overwrite (i.e. the substitution happens AFTER that
+            // layer's forward + swap, so layer <after_layer+1> reads
+            // the injected value). <path> is a binary file containing
+            // exactly HC_DIM little-endian f32 values.
+            //
+            // No-op when the env var is unset or doesn't match this
+            // layer. Read once per token via OnceLock; flipping the
+            // env mid-run does nothing.
+            maybe_substitute_residual(layer, &mut dgpu_scratch.residual)?;
+            // Companion DUMP hook. Env: DEEPSTRIX_DUMP_RESIDUAL_DIR=/path
+            // — when set, copy `dgpu_scratch.residual` (= layer's
+            // output = layer+1's input) to host and write to
+            // <dir>/layer_<NN+1>_residual.bin. Naming matches ds4's
+            // convention: file index = INPUT-LAYER-NUMBER, i.e. our
+            // layer-K-output is dumped as the file for layer K+1's
+            // input. We also dump layer 0's INPUT separately at the
+            // top of forward_token. Together this gives us a
+            // ds4-comparable set of 43 files (indices 00..42).
+            maybe_dump_residual(layer + 1, &dgpu_scratch.residual)?;
         }
         self.forward_head(dgpu_scratch, &weights.global)?;
         // N_LAYER (43) is odd, so 43 in-loop swaps leave residual /
@@ -671,4 +778,254 @@ impl HeterogeneousEngine {
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
+}
+
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = (bits >> 15) & 0x1;
+    let exp = (bits >> 10) & 0x1f;
+    let mant = bits & 0x3ff;
+    let s: u32 = (sign as u32) << 31;
+    let f32_bits: u32 = match exp {
+        0 if mant == 0 => s,
+        0 => {
+            let m = (mant as f32) / 1024.0;
+            let v = m * (1.0 / (1u64 << 14) as f32);
+            return if sign == 1 { -v } else { v };
+        }
+        0x1f => s | 0x7f800000 | ((mant as u32) << 13),
+        _ => s | ((exp as u32 + 112) << 23) | ((mant as u32) << 13),
+    };
+    f32::from_bits(f32_bits)
+}
+
+/// Parsed `DEEPSTRIX_SUBSTITUTE_RESIDUAL` setting. See the call site
+/// in `forward_token` for the full rationale.
+struct SubstituteResidualSpec {
+    after_layer: usize,
+    bytes: Vec<u8>,
+}
+
+fn substitute_residual_spec() -> &'static Option<SubstituteResidualSpec> {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Option<SubstituteResidualSpec>> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        let raw = std::env::var("DEEPSTRIX_SUBSTITUTE_RESIDUAL").ok()?;
+        let mut parts = raw.splitn(2, ':');
+        let layer_str = parts.next()?;
+        let path = parts.next()?;
+        let after_layer: usize = layer_str.parse().ok()?;
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "DEEPSTRIX_SUBSTITUTE_RESIDUAL: failed to read {path}: {e}"
+                );
+                return None;
+            }
+        };
+        let expected = (crate::config::HC_DIM as usize) * std::mem::size_of::<f32>();
+        if bytes.len() != expected {
+            eprintln!(
+                "DEEPSTRIX_SUBSTITUTE_RESIDUAL: {path} is {} bytes, expected {expected} (HC_DIM={} f32)",
+                bytes.len(),
+                crate::config::HC_DIM
+            );
+            return None;
+        }
+        eprintln!(
+            "DEEPSTRIX_SUBSTITUTE_RESIDUAL: armed — after layer {after_layer}, overwrite residual from {path}"
+        );
+        Some(SubstituteResidualSpec { after_layer, bytes })
+    })
+}
+
+fn maybe_substitute_residual(
+    layer: usize,
+    residual: &mut v4flash_hip::DeviceBuffer<f32>,
+) -> eyre::Result<()> {
+    let Some(spec) = substitute_residual_spec().as_ref() else {
+        return Ok(());
+    };
+    if spec.after_layer != layer {
+        return Ok(());
+    }
+    // Reinterpret the cached bytes as &[f32] for copy_from_host.
+    // Safe: spec.bytes.len() was checked == HC_DIM * sizeof(f32) at
+    // env-var parse time, and we trust the on-disk byte order matches
+    // the device's f32 layout (LE on both Linux x86_64 and the GPUs
+    // we target).
+    let n = crate::config::HC_DIM as usize;
+    let floats: &[f32] = unsafe {
+        std::slice::from_raw_parts(spec.bytes.as_ptr() as *const f32, n)
+    };
+    residual.copy_from_host(floats)?;
+    eprintln!("substituted residual after layer {layer} from ds4 dump");
+    Ok(())
+}
+
+fn dump_residual_dir() -> &'static Option<String> {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Option<String>> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        let dir = std::env::var("DEEPSTRIX_DUMP_RESIDUAL_DIR").ok()?;
+        if dir.is_empty() { return None; }
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("DEEPSTRIX_DUMP_RESIDUAL_DIR: mkdir {dir} failed: {e}");
+            return None;
+        }
+        eprintln!("DEEPSTRIX_DUMP_RESIDUAL_DIR: dumping per-layer residuals to {dir}");
+        Some(dir)
+    })
+}
+
+fn maybe_dump_residual(
+    layer_index_for_name: usize,
+    residual: &v4flash_hip::DeviceBuffer<f32>,
+) -> eyre::Result<()> {
+    let Some(dir) = dump_residual_dir().as_ref() else {
+        return Ok(());
+    };
+    let n = crate::config::HC_DIM as usize;
+    let mut host = vec![0.0f32; n];
+    residual.copy_to_host(&mut host)?;
+    let path = format!("{dir}/layer_{:02}_residual.bin", layer_index_for_name);
+    // Reinterpret as bytes for fs::write. f32→u8 LE is the host
+    // representation; matches ds4's on-disk f32 layout.
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(host.as_ptr() as *const u8, n * std::mem::size_of::<f32>())
+    };
+    std::fs::write(&path, bytes)
+        .map_err(|e| eyre::eyre!("write {path}: {e}"))?;
+    eprintln!("  dumped layer_{:02}_residual.bin", layer_index_for_name);
+    Ok(())
+}
+
+/// Diagnostic: when env `DEEPSTRIX_DUMP_SUBTENSOR_LAYER=N` and
+/// `DEEPSTRIX_DUMP_SUBTENSOR_DIR=/path` are set, forward_layer can
+/// call this after each major stage to capture per-sub-tensor f32
+/// values for the layer `N`. Output filename:
+/// `<dir>/layer_<NN>_<tag>.bin`. Used to bisect WITHIN a layer to find
+/// which specific kernel first diverges from ds4-CPU's reference,
+/// matching ds4's `ds4_dump_emit_1d` tagging.
+fn subtensor_dump_spec() -> &'static Option<(Vec<usize>, String)> {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Option<(Vec<usize>, String)>> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        // Accept either DEEPSTRIX_DUMP_SUBTENSOR_LAYERS (comma list)
+        // or the legacy DEEPSTRIX_DUMP_SUBTENSOR_LAYER (single int).
+        let layers_s = std::env::var("DEEPSTRIX_DUMP_SUBTENSOR_LAYERS")
+            .ok()
+            .or_else(|| std::env::var("DEEPSTRIX_DUMP_SUBTENSOR_LAYER").ok())?;
+        let dir = std::env::var("DEEPSTRIX_DUMP_SUBTENSOR_DIR").ok()?;
+        let layers: Vec<usize> = layers_s
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        if layers.is_empty() {
+            return None;
+        }
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("DEEPSTRIX_DUMP_SUBTENSOR_DIR: mkdir {dir} failed: {e}");
+            return None;
+        }
+        eprintln!(
+            "DEEPSTRIX_DUMP_SUBTENSOR_LAYERS={layers:?} dir={dir}: sub-tensor dump armed"
+        );
+        Some((layers, dir))
+    })
+}
+
+pub(super) fn maybe_dump_subtensor_f32(
+    layer: usize,
+    tag: &str,
+    buf: &v4flash_hip::DeviceBuffer<f32>,
+) -> eyre::Result<()> {
+    let Some((target_layers, dir)) = subtensor_dump_spec().as_ref() else {
+        return Ok(());
+    };
+    if !target_layers.contains(&layer) {
+        return Ok(());
+    }
+    let n = buf.len();
+    let mut host = vec![0.0f32; n];
+    buf.copy_to_host(&mut host)?;
+    let path = format!("{dir}/layer_{:02}_{tag}.bin", layer);
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(host.as_ptr() as *const u8, n * std::mem::size_of::<f32>())
+    };
+    std::fs::write(&path, bytes)
+        .map_err(|e| eyre::eyre!("write {path}: {e}"))?;
+    eprintln!("  dumped layer_{:02}_{tag}.bin ({} f32)", layer, n);
+    Ok(())
+}
+
+pub(super) fn maybe_dump_subtensor_i32(
+    layer: usize,
+    tag: &str,
+    buf: &v4flash_hip::DeviceBuffer<i32>,
+    n_elem: usize,
+) -> eyre::Result<()> {
+    let Some((target_layers, dir)) = subtensor_dump_spec().as_ref() else {
+        return Ok(());
+    };
+    if !target_layers.contains(&layer) || n_elem == 0 {
+        return Ok(());
+    }
+    let take = n_elem.min(buf.len());
+    let mut full = vec![0i32; buf.len()];
+    buf.copy_to_host(&mut full)?;
+    let host: Vec<i32> = full[..take].to_vec();
+    let path = format!("{dir}/layer_{:02}_{tag}.bin", layer);
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * std::mem::size_of::<i32>())
+    };
+    std::fs::write(&path, bytes)
+        .map_err(|e| eyre::eyre!("write {path}: {e}"))?;
+    eprintln!("  dumped layer_{:02}_{tag}.bin ({} i32)", layer, host.len());
+    Ok(())
+}
+
+/// Dump f16-stored values (u16 buffer) as f32 to match ds4's f32-only
+/// dump callback. Only the first `n_elem` u16 values are read +
+/// converted; subsequent buffer bytes are unused (some buffers like
+/// kv_cache and comp_kv are over-allocated to a max capacity but only
+/// the first n_used rows are valid).
+pub(super) fn maybe_dump_subtensor_f16_as_f32(
+    layer: usize,
+    tag: &str,
+    buf: &v4flash_hip::DeviceBuffer<u16>,
+    n_elem: usize,
+) -> eyre::Result<()> {
+    let Some((target_layers, dir)) = subtensor_dump_spec().as_ref() else {
+        return Ok(());
+    };
+    if !target_layers.contains(&layer) {
+        return Ok(());
+    }
+    if n_elem == 0 {
+        return Ok(());
+    }
+    // Read the full buffer into u16s, slice to n_elem, convert each
+    // u16 → f16 → f32, then dump as little-endian f32 bytes.
+    let mut raw = vec![0u16; buf.len()];
+    buf.copy_to_host(&mut raw)?;
+    let take = n_elem.min(raw.len());
+    let f32s: Vec<f32> = raw[..take]
+        .iter()
+        .map(|&u| f16_bits_to_f32(u))
+        .collect();
+    let path = format!("{dir}/layer_{:02}_{tag}.bin", layer);
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            f32s.as_ptr() as *const u8,
+            f32s.len() * std::mem::size_of::<f32>(),
+        )
+    };
+    std::fs::write(&path, bytes)
+        .map_err(|e| eyre::eyre!("write {path}: {e}"))?;
+    eprintln!(
+        "  dumped layer_{:02}_{tag}.bin ({} f32 from f16 source)",
+        layer, take
+    );
+    Ok(())
 }

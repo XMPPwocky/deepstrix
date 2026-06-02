@@ -45,7 +45,20 @@ use crate::prompt::render_prompt;
 
 const DEFAULT_TEMPERATURE: f32 = 1.0;
 const DEFAULT_MIN_P_REL: f32 = 0.0;
-const DEFAULT_MAX_NEW: usize = 2048;
+// Per-turn completion cap applied when the request omits `max_tokens`.
+// Letta-code's pi-ai only sends max_tokens when the registered model
+// has it set explicitly (pi-stream-adapter.ts:486-487); when it
+// doesn't, we apply this default. 2048 (the OpenAI-historical default)
+// is far too low for think-mode + a non-trivial Write/Edit tool call:
+// `<think>` typically eats 500–2000 tokens at long ctx, leaving
+// almost nothing for the actual response, and the model truncates
+// mid-DSML — surfaces to letta as "Empty LLM response, retrying"
+// (now caught by `DsmlScanner::finish()`'s mid-markup flush) or as
+// malformed tool args even when caught. 16K accommodates think + a
+// multi-kB file Write comfortably while still bounding runaway
+// generation. Clients can override either direction by sending
+// max_tokens explicitly in the request.
+const DEFAULT_MAX_NEW: usize = 16384;
 
 pub async fn chat_completions(
     State(engine): State<EngineHandle>,

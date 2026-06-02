@@ -80,7 +80,7 @@ pub fn render_prompt(
     if messages.is_empty() {
         return Err(eyre!("render_prompt: messages array is empty"));
     }
-    diagnose_dsml_text_in_messages(messages);
+    diagnose_dsml_text_in_messages(messages, tools);
 
     // System block. We encode the user-provided portion (role:"system"
     // messages) and our generated tools-schema portion separately —
@@ -217,8 +217,21 @@ pub fn render_prompt(
 /// system message, a user message, a tool result body, or assistant
 /// content text. Logs role, index, count, and a short context window
 /// around the first hit so the source can be tracked back.
-fn diagnose_dsml_text_in_messages(messages: &[ChatMessage]) {
+fn diagnose_dsml_text_in_messages(messages: &[ChatMessage], tools: Option<&[ToolDef]>) {
     const MARKER: &str = "\u{ff5c}DSML\u{ff5c}";
+    // One-shot dump cap. On the first few REQUESTS per process whose
+    // payload has any ｜DSML｜-text leak, dump the FULL transcript
+    // (messages + tools) as JSON so the system prompt, the tool
+    // schemas, and the surrounding turns are all readable raw — not
+    // just the offending message in isolation. After
+    // DUMP_CAP_PER_PROCESS the diagnostic stays log-only.
+    const DUMP_CAP_PER_PROCESS: usize = 3;
+    static DUMP_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    // Collect all offenders for this request first; if any, do one
+    // transcript dump and reference it from each warn line.
+    let mut offenders: Vec<(usize, usize, usize)> = Vec::new(); // (msg_idx, occurrences, first_byte_offset)
     for (i, m) in messages.iter().enumerate() {
         let Some(content) = m.content.as_ref() else {
             continue;
@@ -228,25 +241,65 @@ fn diagnose_dsml_text_in_messages(messages: &[ChatMessage]) {
         }
         let count = content.matches(MARKER).count();
         let first = content.find(MARKER).unwrap();
-        // Show ~40 bytes either side of the first hit, char-boundary safe.
-        let pre_start = content[..first]
+        offenders.push((i, count, first));
+    }
+    if offenders.is_empty() {
+        return;
+    }
+
+    let dump_path: Option<String> = {
+        let dump_idx = DUMP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if dump_idx < DUMP_CAP_PER_PROCESS {
+            let pid = std::process::id();
+            let path = format!(
+                "/tmp/deepstrix-dsml-leak-pid{}-req{}.json",
+                pid, dump_idx
+            );
+            let body = serde_json::json!({
+                "offender_message_indices": offenders
+                    .iter()
+                    .map(|(i, _, _)| *i)
+                    .collect::<Vec<_>>(),
+                "messages": messages,
+                "tools": tools.unwrap_or(&[]),
+            });
+            let serialized = serde_json::to_string_pretty(&body)
+                .unwrap_or_else(|e| format!("<failed to serialize: {e}>"));
+            match std::fs::write(&path, serialized) {
+                Ok(_) => Some(path),
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %path, "failed to dump transcript");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    for (i, count, first) in &offenders {
+        let content = messages[*i].content.as_ref().unwrap();
+        // 80-char context window either side of the first marker hit,
+        // char-boundary safe.
+        let pre_start = content[..*first]
             .char_indices()
             .rev()
-            .nth(40)
+            .nth(80)
             .map(|(idx, _)| idx)
             .unwrap_or(0);
-        let post_end = content[first + MARKER.len()..]
+        let post_end = content[*first + MARKER.len()..]
             .char_indices()
-            .nth(40)
-            .map(|(idx, _)| first + MARKER.len() + idx)
+            .nth(80)
+            .map(|(idx, _)| *first + MARKER.len() + idx)
             .unwrap_or(content.len());
         tracing::warn!(
             message_index = i,
-            role = ?m.role,
+            role = ?messages[*i].role,
             occurrences = count,
             len_bytes = content.len(),
             first_byte_offset = first,
             context = %&content[pre_start..post_end],
+            transcript_dump = ?dump_path,
             "incoming message content contains literal ｜DSML｜ text — \
              this primes the model to emit BPE-form DSML instead of \
              TOK_DSML; trace back to find the source (tool result? \

@@ -38,5 +38,47 @@ fn main() -> eyre::Result<()> {
         let id = vocab.lookup_token_id(name);
         println!("  {:?} → id {:?}", name, id);
     }
+
+    // Verify encode_with_special_marker actually inlines TOK_DSML.
+    // Run a small DSML-shaped fragment through it, then through plain
+    // BPE, and print both token sequences alongside their decoded text.
+    println!();
+    println!("encode_with_special_marker spot-check:");
+    let sample =
+        "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"bash\">";
+    let dsml_id = vocab.dsml_id.unwrap_or(-1);
+    let marker = "\u{ff5c}DSML\u{ff5c}";
+    let mut out: Vec<i32> = Vec::new();
+    let mut remaining = sample;
+    while let Some(pos) = remaining.find(marker) {
+        if pos > 0 {
+            out.extend(vocab.encode(&remaining[..pos]));
+        }
+        out.push(dsml_id);
+        remaining = &remaining[pos + marker.len()..];
+    }
+    if !remaining.is_empty() {
+        out.extend(vocab.encode(remaining));
+    }
+    let plain: Vec<i32> = vocab.encode(sample);
+    println!("  input:                {:?}", sample);
+    println!("  with-marker tokens:   {:?}", out);
+    println!("  plain encode tokens:  {:?}", plain);
+    println!("  with-marker per-tok:");
+    for &id in &out {
+        let text = vocab
+            .token_text(id)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        println!("    {:>6} {:?}{}", id, text, if id == dsml_id { "  ← TOK_DSML" } else { "" });
+    }
+    println!("  plain per-tok:");
+    for &id in &plain {
+        let text = vocab
+            .token_text(id)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        println!("    {:>6} {:?}{}", id, text, if id == dsml_id { "  ← TOK_DSML" } else { "" });
+    }
     Ok(())
 }

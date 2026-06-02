@@ -289,11 +289,75 @@ impl DsmlScanner {
 
     pub fn finish(&mut self) -> Vec<DsmlEvent> {
         let mut events = Vec::new();
-        // Flush any pending tail bytes if we're still in Text mode
-        // outside all frames.
-        if self.mode == Mode::Text && self.frames.is_empty() && !self.tail.is_empty() {
-            let drained = std::mem::take(&mut self.tail);
-            events.push(DsmlEvent::Text(drained));
+        // End-of-stream cleanup. There are four cases:
+        //
+        // 1. Clean end (Mode::Text + no open frames): flush pending tail
+        //    bytes as text. The normal-path case.
+        //
+        // 2. Mid-stream EOS inside an open DSML frame (Mode::Text +
+        //    frames non-empty, or Mode in {OpenHeader, CloseHeader,
+        //    ParameterBody}): the model hit length-cap or sampled EOS
+        //    before closing `<｜DSML｜tool_calls>` / `<｜DSML｜invoke>` /
+        //    `<｜DSML｜parameter>`. Previously we silently dropped ALL
+        //    accumulated state — producing an EMPTY assistant turn
+        //    (no text, no tool_calls). Letta sees that as
+        //    `Empty LLM response` and triggers retry, which usually
+        //    repeats the same failure (deterministic at low temp +
+        //    same prompt). Now we flush whatever bytes we have as
+        //    plain text and mark the turn malformed so the handler
+        //    reports finish_reason=internal_error AND letta has
+        //    *some* content to attribute to the assistant turn.
+        //
+        // The flushed bytes are guaranteed not to contain literal
+        // `｜DSML｜` chars (the markers themselves were consumed by
+        // TOK_DSML transitions and stripped from tail). Per-mode
+        // contents:
+        //   OpenHeader/CloseHeader: header text (e.g. "parameter
+        //     name=\"command\"") — half-parsed, no DSML markers.
+        //   ParameterBody:          parameter body text plus any
+        //     tail lookahead bytes — pure content.
+        //   Text + inside frame:    only tail (text content between
+        //     frame tags is dropped on the fly already).
+        let in_open_frame = !self.frames.is_empty();
+        let mid_tag = matches!(
+            self.mode,
+            Mode::OpenHeader | Mode::CloseHeader | Mode::ParameterBody
+        );
+        if self.mode == Mode::Text && !in_open_frame {
+            // Case 1: clean end.
+            if !self.tail.is_empty() {
+                let drained = std::mem::take(&mut self.tail);
+                events.push(DsmlEvent::Text(drained));
+            }
+        } else if in_open_frame || mid_tag {
+            // Case 2: truncated mid-DSML. Recover bytes so letta gets
+            // a non-empty turn, then flag malformed so the handler
+            // reports an error (retryable for letta's retry path).
+            self.malformed = true;
+            let mut recovered: Vec<u8> = Vec::new();
+            if !self.buf.is_empty() {
+                recovered.extend(std::mem::take(&mut self.buf));
+            }
+            if !self.tail.is_empty() {
+                recovered.extend(std::mem::take(&mut self.tail));
+            }
+            if !recovered.is_empty() {
+                tracing::warn!(
+                    bytes = recovered.len(),
+                    mode = ?self.mode,
+                    open_frames = self.frames.len(),
+                    "DSML stream ended mid-markup; flushing partial bytes \
+                     as text to avoid empty response"
+                );
+                events.push(DsmlEvent::Text(recovered));
+            } else {
+                tracing::warn!(
+                    mode = ?self.mode,
+                    open_frames = self.frames.len(),
+                    "DSML stream ended mid-markup with no buffered bytes; \
+                     reporting malformed so handler returns retryable error"
+                );
+            }
         }
         self.mode = Mode::Done;
         events
@@ -795,6 +859,66 @@ mod tests {
             })
             .collect();
         assert_eq!(calls, vec![(0, "a".into()), (1, "b".into())]);
+    }
+
+    #[test]
+    fn truncated_mid_parameter_flushes_partial_text_and_marks_malformed() {
+        // Reproduces the "Empty LLM response" bug: the model opens
+        // <tool_calls><invoke><parameter ...> and writes body bytes,
+        // then hits EOS / length-cap before emitting the closing
+        // tags. Pre-fix: finish() silently dropped every byte and
+        // letta saw zero text + zero tool_calls. Now: partial body
+        // text is recovered and `saw_malformed()` flips so the
+        // handler reports a retryable error.
+        let dsml_bytes: &[u8] = b"\xef\xbd\x9cDSML\xef\xbd\x9c";
+        let mut sc = DsmlScanner::new(TOK_DSML_TEST);
+        let mut events: Vec<DsmlEvent> = Vec::new();
+        for &(t, b) in &[
+            (1i32, &b"<"[..]),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, &b"tool_calls>\n<"[..]),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, &b"invoke name=\"bash\">\n<"[..]),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, &b"parameter name=\"cmd\" string=\"true\">curl --max-time 30"[..]),
+            // EOS arrives here — no closing </parameter></invoke></tool_calls>.
+        ] {
+            events.extend(sc.push_token(t, b));
+        }
+        events.extend(sc.finish());
+        // Recovered partial body must arrive as Text.
+        let text: Vec<u8> = events
+            .iter()
+            .filter_map(|e| if let DsmlEvent::Text(b) = e { Some(b.clone()) } else { None })
+            .flatten()
+            .collect();
+        assert!(
+            contains_subseq(&text, b"curl --max-time 30"),
+            "expected partial parameter body in flushed text, got {:?}",
+            String::from_utf8_lossy(&text)
+        );
+        // Malformed flag must be set so the handler returns an error.
+        assert!(sc.saw_malformed(), "truncated DSML must flip saw_malformed");
+        // No ToolCall emitted (the invoke never closed).
+        assert!(!events.iter().any(|e| matches!(e, DsmlEvent::ToolCall { .. })));
+    }
+
+    #[test]
+    fn truncated_at_open_tag_marks_malformed_no_panic() {
+        // Even worse case: model opens <｜DSML｜tool_calls> then EOS
+        // immediately. No body bytes at all. Scanner must mark
+        // malformed without panicking. Pre-fix: silent empty turn.
+        let dsml_bytes: &[u8] = b"\xef\xbd\x9cDSML\xef\xbd\x9c";
+        let mut sc = DsmlScanner::new(TOK_DSML_TEST);
+        for &(t, b) in &[
+            (1i32, &b"<"[..]),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, &b"tool_calls>"[..]),
+        ] {
+            let _ = sc.push_token(t, b);
+        }
+        let _ = sc.finish();
+        assert!(sc.saw_malformed());
     }
 
     fn contains_subseq(haystack: &[u8], needle: &[u8]) -> bool {
