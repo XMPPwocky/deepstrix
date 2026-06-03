@@ -123,6 +123,10 @@ pub fn render_prompt(
     let mut pending_assistant = false;
     let mut user_tool_block_open = false; // we've already emitted <User> for a
                                           // contiguous run of tool-result messages
+    // One dump per render_prompt call on the assistant-without-prior-
+    // user codepath, so multiple consecutive such turns in one request
+    // produce a single warn line + one dump file.
+    let mut dumped_no_user_assistant = false;
 
     for m in messages {
         match m.role {
@@ -150,13 +154,31 @@ pub fn render_prompt(
                 pending_assistant = true;
             }
             Role::Assistant => {
-                if !pending_assistant {
-                    return Err(eyre!(
-                        "render_prompt: assistant message with no prior user/tool turn"
-                    ));
+                // Mirror ds4_server.c:1948-1968: gate <Assistant>+</think>
+                // on pending_assistant. When an assistant message has no
+                // preceding user/tool turn, ds4 skips both opening tokens
+                // and pastes [content][tool_calls]<EOS> directly into the
+                // buffer (i.e. concatenated to the system block / a prior
+                // assistant's EOS, with no role marker for the orphan
+                // content). It's unclear whether this is a designed feature
+                // of the V4-Flash template or just "doesn't crash" behavior;
+                // matching ds4 is the safe canonical default, and the dump
+                // below captures the request shape so we can design a real
+                // fix once we have evidence of what clients actually send.
+                if !pending_assistant && !dumped_no_user_assistant {
+                    let dump_path = dump_no_user_assistant_transcript(messages, tools);
+                    tracing::warn!(
+                        transcript_dump = ?dump_path,
+                        "assistant message with no prior user/tool turn — \
+                         matching ds4 (skip <Assistant>+</think>, paste content+tool_calls+<EOS> raw). \
+                         Dumping transcript so we can see what the client sends."
+                    );
+                    dumped_no_user_assistant = true;
                 }
-                out.push(TOK_ASSISTANT);
-                out.push(TOK_THINK_END);
+                if pending_assistant {
+                    out.push(TOK_ASSISTANT);
+                    out.push(TOK_THINK_END);
+                }
                 if let Some(c) = m.content.as_ref() {
                     if !c.is_empty() {
                         // If a DSML tool_calls block follows, strip the
@@ -305,6 +327,41 @@ fn diagnose_dsml_text_in_messages(messages: &[ChatMessage], tools: Option<&[Tool
              TOK_DSML; trace back to find the source (tool result? \
              prior assistant turn leak?)"
         );
+    }
+}
+
+/// Dump the full messages+tools payload to /tmp on the assistant-
+/// without-prior-user codepath. One-shot capped per process (cap = 3)
+/// so a misbehaving client can't fill /tmp. Returns the dump path on
+/// success; None when the cap is hit or the write fails.
+fn dump_no_user_assistant_transcript(
+    messages: &[ChatMessage],
+    tools: Option<&[ToolDef]>,
+) -> Option<String> {
+    const DUMP_CAP_PER_PROCESS: usize = 3;
+    static DUMP_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    let dump_idx = DUMP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if dump_idx >= DUMP_CAP_PER_PROCESS {
+        return None;
+    }
+    let pid = std::process::id();
+    let path = format!(
+        "/tmp/deepstrix-assistant-no-user-pid{}-req{}.json",
+        pid, dump_idx
+    );
+    let body = serde_json::json!({
+        "messages": messages,
+        "tools": tools.unwrap_or(&[]),
+    });
+    let serialized = serde_json::to_string_pretty(&body)
+        .unwrap_or_else(|e| format!("<failed to serialize: {e}>"));
+    match std::fs::write(&path, serialized) {
+        Ok(_) => Some(path),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path, "failed to dump transcript");
+            None
+        }
     }
 }
 
