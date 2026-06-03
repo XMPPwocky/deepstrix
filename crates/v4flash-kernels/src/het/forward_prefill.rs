@@ -461,6 +461,14 @@ impl HeterogeneousEngine {
         pos0: u32,
         last_only: bool,
         mut stats: Option<&mut PrefillStats>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        // Called after each prefill chunk completes (after the head
+        // pass for last_only=true, after the per-token logits copy for
+        // last_only=false). Used by the server to pet its forward-
+        // progress watchdog — the chunk-grain matters because long-ctx
+        // chunks can take many seconds and per-call petting would
+        // false-fire the watchdog mid-chunk.
+        on_chunk_done: Option<&dyn Fn()>,
     ) -> eyre::Result<Vec<f32>> {
         let t = tokens.len();
         if t == 0 {
@@ -491,6 +499,23 @@ impl HeterogeneousEngine {
         let mut chunk_idx = 0usize;
         let mut chunk_start = 0usize;
         while chunk_start < t {
+            // Caller-driven cancel (typically: HTTP client disconnect).
+            // Checked at chunk boundary so latency is bounded by one
+            // chunk's wall-clock — ~hundreds of ms at long ctx, cheap
+            // at short. Returning an empty Vec is fine for the
+            // server's `last_only=true` path; the caller knows to
+            // discard the result when the cancel bool is set.
+            if let Some(c) = cancel {
+                if c.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        chunk_idx,
+                        tokens_done = chunk_start,
+                        tokens_total = t,
+                        "prefill cancelled by caller"
+                    );
+                    return Ok(Vec::new());
+                }
+            }
             let chunk_end = (chunk_start + chunk_size).min(t);
             let chunk_b = chunk_end - chunk_start;
             let is_last_chunk = chunk_end == t;
@@ -612,6 +637,9 @@ impl HeterogeneousEngine {
 
             chunk_start = chunk_end;
             chunk_idx += 1;
+            if let Some(f) = on_chunk_done {
+                f();
+            }
         }
         Ok(out_logits)
     }
@@ -1827,6 +1855,14 @@ impl HeterogeneousEngine {
             .and_then(|s| s.parse().ok())
             .unwrap_or(8);
         if variant == "hybrid" {
+            // launch_work_items_split atomicAdds into these counters.
+            // Their doc-comment promises "pre-zeroed per layer" — honour
+            // that here. Without this, the readback at copy_to_host below
+            // returns prev_counter+actual_count, the downstream iq2 grid
+            // is overstated, and the staged/chunked kernels read past the
+            // real work_items[] tail into uninit slots.
+            bi.n_staged_work_items.fill_zero()?;
+            bi.n_chunked_work_items.fill_zero()?;
             {
                 let BatchIgpuScratch {
                     staged_work_items,

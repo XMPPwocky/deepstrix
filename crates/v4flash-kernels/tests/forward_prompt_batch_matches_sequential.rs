@@ -618,6 +618,8 @@ fn forward_prefill_pipelined_matches_single_lane() -> eyre::Result<()> {
         0,
         true,
         None,
+        None,
+        None,
     )?;
 
     let (maxd, idx) = max_abs_diff(&logits_single, &logits_pipelined);

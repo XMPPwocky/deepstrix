@@ -328,6 +328,8 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                     w * chunk_b as u32,
                     true,
                     None,
+                    None,
+                    None,
                 )?;
             } else {
                 let _ = engine.forward_prefill(
@@ -409,6 +411,8 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                             &chunk_tokens,
                             fake_pos,
                             true,
+                            None,
+                            None,
                             None,
                         )?;
                     } else {
@@ -514,6 +518,8 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                 &tokens,
                 0,
                 last_only,
+                None,
+                None,
                 None,
             )?;
         } else {

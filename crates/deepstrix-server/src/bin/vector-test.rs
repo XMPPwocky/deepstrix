@@ -442,6 +442,8 @@ fn main() -> eyre::Result<()> {
             &input_hcs, prefill_tokens, /*pos0=*/ 0,
             /*last_only=*/ true,
             /*stats=*/ None,
+            /*cancel=*/ None,
+            /*on_chunk_done=*/ None,
         )?;
         let mut pos = prefill_tokens.len() as u32;
         // In substitute_eval mode, now run forward_token for the

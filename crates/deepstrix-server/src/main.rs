@@ -18,8 +18,8 @@ use clap::Parser;
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::install_panic_handler;
 
-use deepstrix_server::engine_worker::{spawn, WorkerConfig};
-use deepstrix_server::openai::handler::{chat_completions, healthz, list_models};
+use deepstrix_server::engine_worker::{run_watchdog, spawn, WorkerConfig};
+use deepstrix_server::openai::handler::{chat_completions, healthz, list_models, readyz};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "OpenAI-compatible HTTP server for deepstrix V4-Flash")]
@@ -45,6 +45,14 @@ struct Args {
     /// in above this.
     #[arg(long, default_value_t = 100)]
     disk_cap_gb: u64,
+    /// Forward-progress deadline (ms). If a request is in-flight and
+    /// no token sample / prefill chunk completes within this window,
+    /// the watchdog aborts the process for supervisor restart. Default
+    /// 60s — comfortably above the worst-case chunk wall-clock (~20s
+    /// at depth 64K) but short enough to detect a wedged GPU quickly.
+    /// Override with env `DEEPSTRIX_HANG_DEADLINE_MS` (env wins).
+    #[arg(long, default_value_t = 60_000)]
+    hang_deadline_ms: i64,
 }
 
 fn default_snapshot_dir() -> eyre::Result<PathBuf> {
@@ -88,10 +96,26 @@ async fn main() -> eyre::Result<()> {
         snapshot_cap_bytes: disk_cap_bytes,
     })?;
 
+    // Forward-progress watchdog. Env override > CLI flag > default.
+    let hang_deadline_ms = std::env::var("DEEPSTRIX_HANG_DEADLINE_MS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(args.hang_deadline_ms);
+    let watchdog_progress = engine.progress.clone();
+    std::thread::Builder::new()
+        .name("deepstrix-watchdog".into())
+        .spawn(move || run_watchdog(watchdog_progress, hang_deadline_ms, 2000))
+        .map_err(|e| eyre!("failed to spawn watchdog thread: {e}"))?;
+    tracing::info!(
+        hang_deadline_ms,
+        "watchdog armed; on stall the process will abort() for supervisor restart"
+    );
+
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .with_state(engine.clone());
 
     let listener = tokio::net::TcpListener::bind(args.addr).await?;

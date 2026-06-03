@@ -31,7 +31,7 @@ impl Drop for CancelOnDrop {
 }
 
 use crate::dsml::{DsmlEvent, DsmlScanner};
-use crate::engine_worker::{accumulate, EngineHandle, GenerateReq, WorkerEvent};
+use crate::engine_worker::{accumulate, EngineHandle, GenerateReq, SubmitError, WorkerEvent};
 use crate::openai::error::ApiError;
 use crate::openai::sse::{
     encode_chunk, reasoning_delta, role_delta, text_delta, tool_call_args_delta,
@@ -117,9 +117,12 @@ pub async fn chat_completions(
         .and_then(|s| s.include_usage)
         .unwrap_or(false);
 
-    let (rx, cancel) = engine
-        .submit(gen_req, req.session_id.clone())
-        .map_err(ApiError::from)?;
+    let (rx, cancel) = engine.submit(gen_req, req.session_id.clone()).map_err(|e| match e {
+        SubmitError::Busy => ApiError::Busy(format!("{e}")),
+        SubmitError::WorkerDead => {
+            ApiError::EngineFailed(color_eyre::eyre::eyre!("{e}"))
+        }
+    })?;
 
     let tok_dsml = engine.vocab.dsml_id;
     if stream {
@@ -229,10 +232,45 @@ pub async fn list_models(State(engine): State<EngineHandle>) -> Json<serde_json:
     }))
 }
 
-/// GET /healthz — 200 once the worker is ready (true by construction:
-/// the server only starts accepting connections after weights load).
+/// GET /healthz — process-level liveness. Always 200 once the HTTP
+/// stack is up. Does NOT detect a wedged engine; use /readyz for that.
 pub async fn healthz() -> &'static str {
     "ok\n"
+}
+
+/// GET /readyz — engine-level readiness. 200 if the worker is either
+/// idle or making forward progress; 503 if a request has been in-
+/// flight for longer than the watchdog deadline (engine likely wedged,
+/// abort imminent).
+///
+/// Body is a one-line summary so an operator curling the endpoint can
+/// see why a 503 fired.
+pub async fn readyz(
+    State(engine): State<crate::engine_worker::EngineHandle>,
+) -> Response {
+    use axum::http::StatusCode;
+    let p = &engine.progress;
+    let inflight = p.inflight.load(std::sync::atomic::Ordering::Relaxed);
+    let stale_ms = p.stale_ms();
+    let deadline_ms = std::env::var("DEEPSTRIX_HANG_DEADLINE_MS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(60_000);
+    if inflight && stale_ms > deadline_ms {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "engine stalled: inflight=true stale_ms={stale_ms} deadline_ms={deadline_ms}\n"
+            ),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::OK,
+            format!("ok inflight={inflight} stale_ms={stale_ms}\n"),
+        )
+            .into_response()
+    }
 }
 
 
@@ -294,7 +332,25 @@ async fn drive_sse_stream(
         String::from_utf8(drained).unwrap()
     }
 
-    while let Some(ev) = rx.recv().await {
+    // Race rx.recv() against out.closed(). Without this we'd park
+    // on rx.recv() during long prefills — the worker emits zero
+    // events while batching — and never observe the client
+    // disconnect. CancelOnDrop only fires when this task exits, so
+    // a parked task means cancel stays false even though the SSE
+    // consumer (sse_rx) was dropped seconds ago. Exiting on
+    // out.closed() drops _cancel_guard, flips the bool, and the
+    // worker's per-chunk cancel check picks it up at the next
+    // prefill chunk boundary.
+    loop {
+        let ev = tokio::select! {
+            biased;
+            _ = out.closed() => {
+                tracing::debug!("sse: downstream closed during generation; cancelling");
+                return;
+            }
+            ev = rx.recv() => ev,
+        };
+        let Some(ev) = ev else { break };
         match ev {
             WorkerEvent::Chunk {
                 token_id,

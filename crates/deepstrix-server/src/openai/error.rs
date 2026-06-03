@@ -12,6 +12,8 @@ pub enum ApiError {
     BadRequest(String),
     EngineFailed(color_eyre::eyre::Report),
     ContextExhausted(String),
+    /// Engine queue is full. Maps to HTTP 503 with a Retry-After hint.
+    Busy(String),
 }
 
 impl ApiError {
@@ -20,6 +22,7 @@ impl ApiError {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::ContextExhausted(_) => StatusCode::BAD_REQUEST,
             ApiError::EngineFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -46,6 +49,13 @@ impl ApiError {
                     code: "engine_error",
                 },
             },
+            ApiError::Busy(msg) => ApiErrorBody {
+                error: ApiErrorDetail {
+                    message: msg.clone(),
+                    kind: "server_error",
+                    code: "engine_busy",
+                },
+            },
         }
     }
 }
@@ -67,7 +77,16 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status();
         let body = self.body();
-        (status, Json(body)).into_response()
+        let mut resp = (status, Json(body)).into_response();
+        // Retry-After tells well-behaved clients (incl. letta's
+        // pi-ai retryable-error path) to back off rather than
+        // hot-retry into the same full queue. 2s is roughly one
+        // long decode's worth.
+        if matches!(self, ApiError::Busy(_)) {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, "2".parse().unwrap());
+        }
+        resp
     }
 }
 

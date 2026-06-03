@@ -6,8 +6,9 @@
 //! event stream — the non-streaming handler just accumulates events
 //! into a single response before returning.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use color_eyre::eyre::{self, eyre};
 use tokio::sync::{mpsc, oneshot};
@@ -97,45 +98,168 @@ pub enum EngineRequest {
     },
 }
 
+/// Maximum number of generation requests queued behind the one
+/// currently executing. Each request takes seconds-to-minutes; a deep
+/// queue would just be requests timing out client-side anyway. When
+/// full, `submit()` returns `SubmitError::Busy` which the handler maps
+/// to HTTP 503 + Retry-After.
+pub const ENGINE_QUEUE_CAP: usize = 8;
+
+#[derive(Debug)]
+pub enum SubmitError {
+    /// Engine queue is full (more than ENGINE_QUEUE_CAP requests
+    /// already waiting). Client should back off and retry.
+    Busy,
+    /// Engine worker thread has terminated. Fatal — server is gone.
+    WorkerDead,
+}
+
+impl std::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubmitError::Busy => write!(
+                f,
+                "engine busy: queue depth {} reached, retry in a moment",
+                ENGINE_QUEUE_CAP
+            ),
+            SubmitError::WorkerDead => write!(f, "engine worker channel closed"),
+        }
+    }
+}
+
+impl std::error::Error for SubmitError {}
+
+/// Forward-progress signal for the hang watchdog and /readyz.
+///
+/// The worker thread `pet()`s after each meaningful progress unit:
+/// one decoded token emitted, or one prefill chunk completed. The
+/// watchdog thread observes `last_pet_ms` and aborts the process if
+/// it goes stale while `inflight` is set.
+///
+/// All fields are Arc-wrapped so the watchdog and /readyz handler
+/// can share them with the worker by cloning the WorkerProgress
+/// (which only clones two Arcs).
+#[derive(Clone, Default)]
+pub struct WorkerProgress {
+    /// Unix ms of last forward progress. 0 until first pet.
+    pub last_pet_ms: Arc<AtomicI64>,
+    /// True between request-begin and request-end. The watchdog only
+    /// fires when this is set — if no request is in-flight, the worker
+    /// is legitimately idle.
+    pub inflight: Arc<AtomicBool>,
+}
+
+impl WorkerProgress {
+    pub fn pet(&self) {
+        self.last_pet_ms.store(unix_now_ms(), Ordering::Relaxed);
+    }
+    pub fn begin(&self) {
+        self.pet();
+        self.inflight.store(true, Ordering::Relaxed);
+    }
+    pub fn end(&self) {
+        self.inflight.store(false, Ordering::Relaxed);
+    }
+    /// ms since last pet. Saturates at 0 if the clock moved backwards
+    /// or no pet has happened yet.
+    pub fn stale_ms(&self) -> i64 {
+        let last = self.last_pet_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return 0;
+        }
+        unix_now_ms().saturating_sub(last).max(0)
+    }
+}
+
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Watchdog: if a request is in-flight and no forward progress has
+/// happened in `deadline_ms`, abort the process so the supervisor
+/// restarts us. Polls every `poll_ms`.
+///
+/// abort() is intentional: by the time we're here the engine is
+/// usually stuck on a GPU stream sync that no Rust-level cancellation
+/// can unstick. A clean shutdown would just hang too. The on-disk KV
+/// snapshot is persisted at every turn-end (`save_live_if_dirty`),
+/// so the next start replays from there cheaply.
+pub fn run_watchdog(progress: WorkerProgress, deadline_ms: i64, poll_ms: u64) {
+    loop {
+        std::thread::sleep(Duration::from_millis(poll_ms));
+        if !progress.inflight.load(Ordering::Relaxed) {
+            continue;
+        }
+        let stale = progress.stale_ms();
+        if stale > deadline_ms {
+            tracing::error!(
+                stale_ms = stale,
+                deadline_ms,
+                "engine wedged — no forward progress in deadline; aborting for supervisor restart"
+            );
+            // Flush logs before abort.
+            std::thread::sleep(Duration::from_millis(50));
+            std::process::abort();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EngineHandle {
-    tx: mpsc::UnboundedSender<EngineRequest>,
+    tx: mpsc::Sender<EngineRequest>,
     pub vocab: Arc<BpeVocab>,
     pub model_name: Arc<String>,
     /// Total KV-cache capacity in tokens — surfaced on `/v1/models` so
     /// clients (notably letta) can size requests to fit. Matches
     /// `WorkerConfig.n_kv_max`.
     pub n_kv_max: u32,
+    /// Forward-progress signal. Shared with the watchdog thread and
+    /// the /readyz HTTP handler.
+    pub progress: WorkerProgress,
 }
 
 impl EngineHandle {
     /// Submit a generation request. Returns the worker-event stream
     /// and a cancellation handle the caller can flip to ask the worker
     /// to stop mid-decode.
+    ///
+    /// Returns `SubmitError::Busy` when the engine queue is full so
+    /// the caller can return HTTP 503 instead of blocking the HTTP
+    /// task on a long backlog.
     pub fn submit(
         &self,
         req: GenerateReq,
         session_id: Option<String>,
-    ) -> eyre::Result<(mpsc::Receiver<WorkerEvent>, Arc<AtomicBool>)> {
+    ) -> Result<(mpsc::Receiver<WorkerEvent>, Arc<AtomicBool>), SubmitError> {
         let (tx, rx) = mpsc::channel(64);
         let cancel = Arc::new(AtomicBool::new(false));
-        self.tx
-            .send(EngineRequest::Generate {
-                req,
-                tx,
-                session_id,
-                cancel: cancel.clone(),
-            })
-            .map_err(|_| eyre!("engine worker channel closed"))?;
-        Ok((rx, cancel))
+        match self.tx.try_send(EngineRequest::Generate {
+            req,
+            tx,
+            session_id,
+            cancel: cancel.clone(),
+        }) {
+            Ok(()) => Ok((rx, cancel)),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(SubmitError::Busy),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(SubmitError::WorkerDead),
+        }
     }
 
     /// Block until the worker has saved its dirty live state and exited.
     /// Used during graceful shutdown.
+    ///
+    /// Uses `send().await` rather than `try_send`: shutdown must
+    /// actually reach the worker, and waiting briefly for queue
+    /// slack is fine here (no other request will be admitted —
+    /// shutdown is initiated only on process termination).
     pub async fn shutdown(&self) -> eyre::Result<()> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
             .send(EngineRequest::Shutdown { ack: ack_tx })
+            .await
             .map_err(|_| eyre!("engine worker channel closed"))?;
         ack_rx
             .await
@@ -156,14 +280,16 @@ pub struct WorkerConfig {
 }
 
 pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
-    let (tx, rx) = mpsc::unbounded_channel::<EngineRequest>();
+    let (tx, rx) = mpsc::channel::<EngineRequest>(ENGINE_QUEUE_CAP);
     let (ready_tx, ready_rx) =
         std::sync::mpsc::sync_channel::<eyre::Result<(Arc<BpeVocab>, Arc<String>)>>(1);
     let n_kv_max = cfg.n_kv_max;
+    let progress = WorkerProgress::default();
+    let progress_worker = progress.clone();
 
     std::thread::Builder::new()
         .name("deepstrix-engine".into())
-        .spawn(move || worker_main(cfg, rx, ready_tx))
+        .spawn(move || worker_main(cfg, rx, ready_tx, progress_worker))
         .map_err(|e| eyre!("failed to spawn engine thread: {e}"))?;
 
     let (vocab, model_name) = ready_rx
@@ -174,21 +300,24 @@ pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
         vocab,
         model_name,
         n_kv_max,
+        progress,
     })
 }
 
 fn worker_main(
     cfg: WorkerConfig,
-    mut rx: mpsc::UnboundedReceiver<EngineRequest>,
+    mut rx: mpsc::Receiver<EngineRequest>,
     ready_tx: std::sync::mpsc::SyncSender<eyre::Result<(Arc<BpeVocab>, Arc<String>)>>,
+    progress: WorkerProgress,
 ) {
-    let state = match initialize_state(&cfg) {
+    let mut state = match initialize_state(&cfg) {
         Ok(s) => s,
         Err(e) => {
             let _ = ready_tx.send(Err(e));
             return;
         }
     };
+    state.progress = progress;
     let vocab = state.vocab.clone();
     let model_name = Arc::new(cfg.model_name.clone());
     let _ = ready_tx.send(Ok((vocab, model_name)));
@@ -227,6 +356,11 @@ pub struct WorkerState {
     /// switch.
     pub snapshot_index: SnapshotIndex,
     pub model_fingerprint: ModelFingerprint,
+
+    /// Forward-progress signal. The worker pet()s this after every
+    /// emitted decode token and after every completed prefill chunk;
+    /// the watchdog thread aborts the process if it goes stale.
+    pub progress: WorkerProgress,
 }
 
 #[derive(Debug, Clone)]
@@ -335,6 +469,10 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         live: None,
         snapshot_index,
         model_fingerprint: fingerprint,
+        // worker_main overwrites this with the real progress handle
+        // that's shared with EngineHandle + watchdog. Default here so
+        // initialize_state stays a self-contained fn.
+        progress: WorkerProgress::default(),
     })
 }
 
@@ -603,7 +741,7 @@ mod tests {
     }
 }
 
-fn worker_loop(mut state: WorkerState, rx: &mut mpsc::UnboundedReceiver<EngineRequest>) {
+fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
     while let Some(msg) = rx.blocking_recv() {
         match msg {
             EngineRequest::Generate {
@@ -612,6 +750,20 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::UnboundedReceiver<EngineRe
                 session_id,
                 cancel,
             } => {
+                // Bracket the whole request with begin/end so the
+                // watchdog only fires when we're actually supposed to
+                // be making progress. RAII: end runs even on panic-unwind
+                // or early return inside handle_generate_stream. The
+                // guard owns its own clone (two Arcs) so it doesn't
+                // co-borrow `state` with handle_generate_stream below.
+                struct InflightGuard(WorkerProgress);
+                impl Drop for InflightGuard {
+                    fn drop(&mut self) {
+                        self.0.end();
+                    }
+                }
+                state.progress.begin();
+                let _guard = InflightGuard(state.progress.clone());
                 if let Err(e) = handle_generate_stream(&mut state, req, session_id, cancel, &tx) {
                     let _ = tx.blocking_send(WorkerEvent::Error(format!("{e:#}")));
                 }
@@ -687,6 +839,15 @@ fn handle_generate_stream(
             req.tokens.len(),
             state.n_kv_max
         ));
+    }
+
+    // Pre-flight cancel check. The request may have sat in the
+    // engine queue while a long generation occupied the worker; the
+    // HTTP client could have disconnected in the meantime. Bail
+    // before doing any GPU work.
+    if cancel.load(Ordering::Relaxed) {
+        tracing::info!("generate: cancelled before prefill (client gone)");
+        return Ok(());
     }
 
     // Strip the trailing `<think>`/`</think>` marker from the rendered
@@ -851,7 +1012,21 @@ fn handle_generate_stream(
                         "prefill"
                     );
                     if suffix_len > 0 {
-                        prefill_suffix(state, &req.tokens[verify.req_tokens..], loaded_len)?;
+                        prefill_suffix(
+                            state,
+                            &req.tokens[verify.req_tokens..],
+                            loaded_len,
+                            Some(&cancel),
+                        )?;
+                        if cancel.load(Ordering::Relaxed) {
+                            tracing::info!("generate: cancelled mid-prefill (restore path)");
+                            // Restored snapshot is still on-GPU but
+                            // we may have partially appended suffix
+                            // KV beyond it. Drop live so next request
+                            // reset-prefills from a known state.
+                            state.live = None;
+                            return Ok(());
+                        }
                     }
                     let new_pos = loaded_len + suffix_len as u32;
                     // live.tokens after restore + suffix prefill: loaded
@@ -919,7 +1094,13 @@ fn handle_generate_stream(
         save_live_if_dirty(state);
         state.state.reset_in_place(state.dgpu, state.igpu)?;
         state.live = None;
-        prefill_suffix(state, &req.tokens, 0)?;
+        prefill_suffix(state, &req.tokens, 0, Some(&cancel))?;
+        if cancel.load(Ordering::Relaxed) {
+            tracing::info!("generate: cancelled mid-prefill (full path)");
+            // live is already None; KV cache has partial garbage but
+            // the next request's reset_in_place will clear it.
+            return Ok(());
+        }
         tracing::info!(
             req_len = req.tokens.len(),
             lcp_live,
@@ -943,7 +1124,15 @@ fn handle_generate_stream(
             mode = "extend",
             "prefill"
         );
-        prefill_suffix(state, suffix, pos0)?;
+        prefill_suffix(state, suffix, pos0, Some(&cancel))?;
+        if cancel.load(Ordering::Relaxed) {
+            tracing::info!("generate: cancelled mid-prefill (extend path)");
+            // live state's pos no longer reflects the KV cache (we
+            // wrote some suffix tokens beyond live.pos). Drop it; the
+            // next request will reset_in_place.
+            state.live = None;
+            return Ok(());
+        }
     } else {
         // Exact byte match — no prefill needed; existing logits in
         // dgpu_scratch are for position `lcp_live`.
@@ -1170,18 +1359,58 @@ fn finish_decode(
             // to the scanner even though their bytes get suppressed
             // downstream. (For non-DSML empty-decoding tokens this
             // is a no-op for the scanner anyway.)
-            if tx
-                .blocking_send(WorkerEvent::Chunk {
-                    token_id: next,
-                    bytes: raw,
-                    reasoning: in_think,
-                })
-                .is_err()
-            {
-                // Receiver dropped (client disconnected, e.g.).
-                // The KV cache mid-decode is now inconsistent
-                // with live.tokens; mark it as such by clearing
-                // live so the next request reset-prefills.
+            //
+            // Bounded try_send (not blocking_send) so one slow HTTP
+            // client can't stall the single engine thread — which
+            // would block every other concurrent request. We retry
+            // briefly to absorb transient backpressure (network
+            // hiccup, scheduler), then declare the client dead and
+            // bail. CHUNK_SEND_RETRY_MS * CHUNK_SEND_RETRIES = ~3s
+            // total grace; well past any sane jitter, below any
+            // sane HTTP client timeout.
+            let chunk = WorkerEvent::Chunk {
+                token_id: next,
+                bytes: raw,
+                reasoning: in_think,
+            };
+            const CHUNK_SEND_RETRIES: u32 = 30;
+            const CHUNK_SEND_RETRY_MS: u64 = 100;
+            let mut pending = Some(chunk);
+            let mut send_failed = false;
+            for attempt in 0..=CHUNK_SEND_RETRIES {
+                match tx.try_send(pending.take().unwrap()) {
+                    Ok(()) => {
+                        // Forward progress: one decoded token shipped.
+                        state.progress.pet();
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Full(ev)) => {
+                        pending = Some(ev);
+                        if attempt == CHUNK_SEND_RETRIES {
+                            tracing::warn!(
+                                completion_tokens,
+                                pos,
+                                "stream consumer slow ({}ms backpressure); dropping client",
+                                CHUNK_SEND_RETRIES as u64 * CHUNK_SEND_RETRY_MS
+                            );
+                            send_failed = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            CHUNK_SEND_RETRY_MS,
+                        ));
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        send_failed = true;
+                        break;
+                    }
+                }
+            }
+            if send_failed {
+                // Receiver dropped (client disconnected, e.g.) or
+                // remained full past our grace window. The KV cache
+                // mid-decode is now inconsistent with live.tokens;
+                // clear live so the next request reset-prefills.
                 state.live = None;
                 return Ok(());
             }
@@ -1287,7 +1516,16 @@ fn finish_decode(
 
 /// Run the batched-prefill pipeline for `tokens` starting at `pos0`.
 /// Used both for full prefill (pos0=0) and for the extension fast-path.
-fn prefill_suffix(state: &mut WorkerState, tokens: &[i32], pos0: u32) -> eyre::Result<()> {
+///
+/// `cancel` is checked at chunk boundary inside the engine; on trip,
+/// the call returns Ok early and the caller is responsible for
+/// observing the bool and unwinding (clearing `live`, no events).
+fn prefill_suffix(
+    state: &mut WorkerState,
+    tokens: &[i32],
+    pos0: u32,
+    cancel: Option<&AtomicBool>,
+) -> eyre::Result<()> {
     if tokens.is_empty() {
         return Ok(());
     }
@@ -1297,6 +1535,11 @@ fn prefill_suffix(state: &mut WorkerState, tokens: &[i32], pos0: u32) -> eyre::R
         embed_lookup(&state.token_embd_bytes, tok, &mut v);
         input_hcs.push(v);
     }
+    // Clone the progress handle into a local so the per-chunk pet
+    // closure doesn't co-borrow `state` with state.engine below.
+    // WorkerProgress is two Arc clones — effectively free.
+    let progress = state.progress.clone();
+    let pet_each_chunk = || progress.pet();
     let _ = state.engine.forward_prefill_pipelined(
         &mut state.bd_a,
         &mut state.bi_a,
@@ -1310,6 +1553,8 @@ fn prefill_suffix(state: &mut WorkerState, tokens: &[i32], pos0: u32) -> eyre::R
         pos0,
         true,
         None,
+        cancel,
+        Some(&pet_each_chunk),
     )?;
     Ok(())
 }

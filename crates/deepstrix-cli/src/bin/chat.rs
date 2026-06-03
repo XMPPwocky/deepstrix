@@ -531,6 +531,8 @@ fn main() -> eyre::Result<()> {
             &input_hcs, &turn_tokens, pos,
             true, // last_only
             None, // stats
+            None, // cancel
+            None, // on_chunk_done
         )?;
         pos += turn_tokens.len() as u32;
         let prefill_secs = t0.elapsed().as_secs_f64();
