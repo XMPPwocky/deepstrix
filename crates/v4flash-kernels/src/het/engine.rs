@@ -123,6 +123,10 @@ pub struct DeviceEngine {
     /// CSA indexer kernels (used only on the dGPU's ratio==4 layers, but
     /// instantiated unconditionally so the engine struct stays symmetric).
     pub indexer_score: crate::IndexerScore,
+    /// WMMA-fused IndexerScore variant. Available on gfx12 dGPU only;
+    /// `None` on iGPU. Callers should prefer it when present (28× faster
+    /// at production decode shape).
+    pub indexer_score_wmma: Option<crate::IndexerScoreWmma>,
     pub indexer_topk: crate::IndexerTopk,
     pub indexer_gather: crate::IndexerGather,
     pub indexer_bitpack: crate::IndexerBitpack,
@@ -181,6 +185,11 @@ impl DeviceEngine {
             comp_kv_append: CompKvAppend::for_arch(arch)?,
             router_topk: RouterTopk::for_arch(arch)?,
             indexer_score: crate::IndexerScore::for_arch(arch)?,
+            indexer_score_wmma: if arch.starts_with("gfx1200") || arch.starts_with("gfx1201") {
+                Some(crate::IndexerScoreWmma::for_arch(arch)?)
+            } else {
+                None
+            },
             indexer_topk: crate::IndexerTopk::for_arch(arch)?,
             indexer_gather: crate::IndexerGather::for_arch(arch)?,
             indexer_bitpack: crate::IndexerBitpack::for_arch(arch)?,

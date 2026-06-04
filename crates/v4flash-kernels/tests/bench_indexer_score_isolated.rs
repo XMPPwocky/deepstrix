@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
-use v4flash_kernels::{IndexerScore, INDEXER_HEAD_DIM, INDEXER_N_HEAD};
+use v4flash_kernels::{IndexerScore, IndexerScoreWmma, INDEXER_HEAD_DIM, INDEXER_N_HEAD};
 
 fn pick_dgpu() -> eyre::Result<Device> {
     for d in Device::all()? {
@@ -114,9 +114,29 @@ fn bench_indexer_score_isolated() -> eyre::Result<()> {
     let per_call_us = elapsed.as_micros() as f64 / iters as f64;
 
     eprintln!(
-        "BENCH IndexerScore n_comp={n_comp}: {iters} iters in {:.2}ms = {:.2}us/call",
+        "BENCH IndexerScore (naive) n_comp={n_comp}: {iters} iters in {:.2}ms = {:.2}us/call",
         elapsed.as_secs_f64() * 1000.0,
         per_call_us
+    );
+
+    // --- WMMA variant ---
+    let kernel_wmma = IndexerScoreWmma::for_arch(&arch)?;
+    for _ in 0..warmup {
+        kernel_wmma.launch(&stream, &mut d_scores, &d_q, &d_hw, &d_kv, n_comp)?;
+    }
+    stream.synchronize()?;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        kernel_wmma.launch(&stream, &mut d_scores, &d_q, &d_hw, &d_kv, n_comp)?;
+    }
+    stream.synchronize()?;
+    let elapsed_w = t0.elapsed();
+    let per_call_us_w = elapsed_w.as_micros() as f64 / iters as f64;
+    eprintln!(
+        "BENCH IndexerScore (wmma)  n_comp={n_comp}: {iters} iters in {:.2}ms = {:.2}us/call  ({:.1}× speedup)",
+        elapsed_w.as_secs_f64() * 1000.0,
+        per_call_us_w,
+        per_call_us / per_call_us_w,
     );
 
     Ok(())

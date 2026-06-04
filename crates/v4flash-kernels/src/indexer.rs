@@ -18,6 +18,11 @@ use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 const INDEXER_SCORE_GFX1201: &[u8] = include_bytes!(env!("KERNEL_INDEXER_SCORE_GFX1201"));
 const INDEXER_SCORE_GFX1151: &[u8] = include_bytes!(env!("KERNEL_INDEXER_SCORE_GFX1151"));
 
+const INDEXER_SCORE_WMMA_GFX1201: &[u8] =
+    include_bytes!(env!("KERNEL_INDEXER_SCORE_WMMA_GFX1201"));
+const INDEXER_SCORE_WMMA_GFX1151: &[u8] =
+    include_bytes!(env!("KERNEL_INDEXER_SCORE_WMMA_GFX1151"));
+
 const INDEXER_TOPK_GFX1201: &[u8] = include_bytes!(env!("KERNEL_INDEXER_TOPK_GFX1201"));
 const INDEXER_TOPK_GFX1151: &[u8] = include_bytes!(env!("KERNEL_INDEXER_TOPK_GFX1151"));
 
@@ -79,6 +84,55 @@ impl IndexerScore {
         launch_kernel!(function, cfg, stream, [
             scores.raw(), q.raw(), head_weights.raw(), index_comp_kv.raw(),
             n_comp, n_head, head_dim
+        ])
+    }
+}
+
+/// WMMA-based variant of [`IndexerScore`]. Same math, identical I/O
+/// contract; rewrites the per-row scalar scoring as a Q × K^T GEMM fused
+/// with the per-row ReLU + head_weights + sum-across-heads tail so the
+/// 64-head intermediate never materialises in DRAM. Hardcoded to
+/// N_INDEXER_HEAD=64 and N_INDEXER_HEAD_DIM=128 (the V4-Flash shape).
+/// Requires gfx12 (RDNA4 WMMA); falls back to a no-op on other arches.
+pub struct IndexerScoreWmma {
+    module: Module,
+}
+
+impl IndexerScoreWmma {
+    pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            INDEXER_SCORE_WMMA_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            INDEXER_SCORE_WMMA_GFX1151
+        } else {
+            return Err(eyre!("unsupported arch for indexer_score_wmma: {arch}"));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    pub fn launch(
+        &self,
+        stream: &Stream,
+        scores: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        head_weights: &DeviceBuffer<f32>,
+        index_comp_kv: &DeviceBuffer<u16>,
+        n_comp: u32,
+    ) -> eyre::Result<()> {
+        if n_comp == 0 {
+            return Err(eyre!("indexer_score_wmma: n_comp must be > 0"));
+        }
+        let function = self.module.get_function("indexer_score_wmma")?;
+        // One WG per 16-comp-row n-tile.
+        let n_tiles = (n_comp + 15) / 16;
+        let cfg = LaunchConfig {
+            grid: (n_tiles, 1, 1),
+            block: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            scores.raw(), q.raw(), head_weights.raw(), index_comp_kv.raw(), n_comp
         ])
     }
 }

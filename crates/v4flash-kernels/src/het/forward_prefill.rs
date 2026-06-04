@@ -1529,16 +1529,27 @@ impl HeterogeneousEngine {
                         bi * (N_INDEXER_HEAD as usize),
                         N_INDEXER_HEAD as usize,
                     );
-                    de.indexer_score.launch(
-                        &de.compute,
-                        &mut bd.indexer_scores,
-                        &q_in,
-                        &hw_in,
-                        &kv_view,
-                        n_idx,
-                        N_INDEXER_HEAD,
-                        N_INDEXER_HEAD_DIM,
-                    )?;
+                    if let Some(wmma) = de.indexer_score_wmma.as_ref() {
+                        wmma.launch(
+                            &de.compute,
+                            &mut bd.indexer_scores,
+                            &q_in,
+                            &hw_in,
+                            &kv_view,
+                            n_idx,
+                        )?;
+                    } else {
+                        de.indexer_score.launch(
+                            &de.compute,
+                            &mut bd.indexer_scores,
+                            &q_in,
+                            &hw_in,
+                            &kv_view,
+                            n_idx,
+                            N_INDEXER_HEAD,
+                            N_INDEXER_HEAD_DIM,
+                        )?;
+                    }
                     // Sized for the FULL ATTN_MIXED_MAX_KEYS-words
                     // bitmap; topk writes its own bitmap into a separate
                     // single-token buffer that we discard — we rely on

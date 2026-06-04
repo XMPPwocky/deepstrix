@@ -689,19 +689,33 @@ impl HeterogeneousEngine {
                     N_INDEXER_HEAD,
                 )?;
                 // 5. IndexerScore over the contiguous prefix of index_comp_kv.
+                // Prefer the WMMA variant when available (28× faster at
+                // production decode shape); fall back to the naive kernel
+                // on iGPU or any arch without WMMA support.
                 let kv_slice = ics_ref
                     .comp_kv
                     .slice_view(0, (n_index_comp * N_INDEXER_HEAD_DIM) as usize);
-                de.indexer_score.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.indexer_scores,
-                    &dgpu_scratch.indexer_q,
-                    &dgpu_scratch.indexer_head_weights,
-                    &kv_slice,
-                    n_index_comp,
-                    N_INDEXER_HEAD,
-                    N_INDEXER_HEAD_DIM,
-                )?;
+                if let Some(wmma) = de.indexer_score_wmma.as_ref() {
+                    wmma.launch(
+                        &de.compute,
+                        &mut dgpu_scratch.indexer_scores,
+                        &dgpu_scratch.indexer_q,
+                        &dgpu_scratch.indexer_head_weights,
+                        &kv_slice,
+                        n_index_comp,
+                    )?;
+                } else {
+                    de.indexer_score.launch(
+                        &de.compute,
+                        &mut dgpu_scratch.indexer_scores,
+                        &dgpu_scratch.indexer_q,
+                        &dgpu_scratch.indexer_head_weights,
+                        &kv_slice,
+                        n_index_comp,
+                        N_INDEXER_HEAD,
+                        N_INDEXER_HEAD_DIM,
+                    )?;
+                }
                 // 6. IndexerTopk → sorted indices + bitmap.
                 de.indexer_topk.launch(
                     &de.compute,

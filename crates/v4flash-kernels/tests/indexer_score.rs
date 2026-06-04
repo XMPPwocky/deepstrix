@@ -11,7 +11,7 @@
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
-use v4flash_kernels::{IndexerScore, INDEXER_HEAD_DIM, INDEXER_N_HEAD};
+use v4flash_kernels::{IndexerScore, IndexerScoreWmma, INDEXER_HEAD_DIM, INDEXER_N_HEAD};
 
 const THRESHOLD: f32 = 1.0e-3;
 
@@ -200,6 +200,96 @@ fn indexer_score_synthetic() -> eyre::Result<()> {
         assert!(
             max_abs < THRESHOLD,
             "n_comp={n_comp}: max_abs_diff {max_abs:.3e} exceeds threshold {THRESHOLD:.3e}"
+        );
+    }
+
+    // --- WMMA variant: same shapes, same threshold (relaxed slightly for
+    //     f16 fragment intermediate vs the naïve kernel's f32 throughout).
+    //
+    // WMMA only compiles under __gfx1200__ / __gfx1201__ — the kernel's
+    // RDNA4 builtin gates on that. The dGPU (gfx1201) is the production
+    // dispatch target; the iGPU (gfx1151) silently no-ops the WMMA path.
+    // Switch to the dGPU explicitly for this arm, regardless of which
+    // device pick_device() returned for the naïve test above.
+    let dgpu = Device::all()?
+        .into_iter()
+        .find(|d| d.properties().map(|p| p.gcn_arch_name.starts_with("gfx12")).unwrap_or(false));
+    let Some(dgpu) = dgpu else {
+        eprintln!("[wmma] skipping — no gfx12 dGPU present (iGPU-only system)");
+        return Ok(());
+    };
+    dgpu.set_current()?;
+    let dgpu_arch = dgpu.properties()?.gcn_arch_name;
+    let stream = Stream::new(dgpu.id)?;
+    let kernel_wmma = IndexerScoreWmma::for_arch(&dgpu_arch)?;
+    eprintln!("[wmma] using dGPU {} ({dgpu_arch})", dgpu.id);
+    const WMMA_THRESHOLD: f32 = 5.0e-3;
+    for &n_comp in &[14usize, 128, 514, 16384] {
+        let mut seed: u32 = 0xdeadbeef_u32.wrapping_add(n_comp as u32);
+        let q_flat = n_head * head_dim;
+        let mut q = vec![0f32; q_flat];
+        let mut head_weights = vec![0f32; n_head];
+        let mut comp_kv = vec![0f32; n_comp * head_dim];
+        for v in &mut q {
+            *v = lcg_step(&mut seed) * 0.5;
+        }
+        for v in &mut head_weights {
+            *v = lcg_step(&mut seed) * 0.1;
+        }
+        for v in &mut comp_kv {
+            *v = lcg_step(&mut seed) * 0.7;
+        }
+        let comp_kv_f16: Vec<u16> = comp_kv.iter().map(|&v| f32_to_f16_bits(v)).collect();
+        let comp_kv_quantized: Vec<f32> =
+            comp_kv_f16.iter().map(|&u| f16_bits_to_f32(u)).collect();
+        let expected = cpu_indexer_score(
+            &q,
+            &head_weights,
+            &comp_kv_quantized,
+            n_comp,
+            n_head,
+            head_dim,
+        );
+
+        let mut d_q: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, q_flat)?;
+        let mut d_hw: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, n_head)?;
+        let mut d_kv: DeviceBuffer<u16> = DeviceBuffer::new(dgpu.id, n_comp * head_dim)?;
+        let mut d_scores: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, n_comp)?;
+        d_q.copy_from_host(&q)?;
+        d_hw.copy_from_host(&head_weights)?;
+        d_kv.copy_from_host(&comp_kv_f16)?;
+
+        kernel_wmma.launch(&stream, &mut d_scores, &d_q, &d_hw, &d_kv, n_comp as u32)?;
+        stream.synchronize()?;
+        let mut got = vec![0f32; n_comp];
+        d_scores.copy_to_host(&mut got)?;
+
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (a, e) in got.iter().zip(expected.iter()) {
+            let d = (a - e).abs();
+            if d > max_abs {
+                max_abs = d;
+            }
+            let r = d / e.abs().max(1e-6);
+            if r > max_rel {
+                max_rel = r;
+            }
+        }
+        eprintln!(
+            "[wmma] n_comp={n_comp}: max_abs_diff={max_abs:.3e} max_rel={max_rel:.3e} (expected magnitude ~{:.3})",
+            expected.iter().map(|v| v.abs()).fold(0f32, f32::max)
+        );
+        if max_abs >= WMMA_THRESHOLD {
+            // Show the first 16 entries to localise the bad slot.
+            for c in 0..n_comp.min(16) {
+                let d = (got[c] - expected[c]).abs();
+                eprintln!("  c={c:3} expected={:11.4e} got={:11.4e} diff={d:.3e}", expected[c], got[c]);
+            }
+        }
+        assert!(
+            max_abs < WMMA_THRESHOLD,
+            "[wmma] n_comp={n_comp}: max_abs_diff {max_abs:.3e} exceeds threshold {WMMA_THRESHOLD:.3e}"
         );
     }
 
