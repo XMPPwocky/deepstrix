@@ -163,9 +163,12 @@ impl IndexerScoreWmma {
             return Ok(());
         }
         let function = self.module.get_function("indexer_score_wmma_batched")?;
+        // Must match ISW_NT_PER_WG in kernels/indexer_score_wmma.hip.
+        const NT_PER_WG: u32 = 8;
         let n_tiles_max = (n_idx_max + 15) / 16;
+        let n_chunks_x = (n_tiles_max + NT_PER_WG - 1) / NT_PER_WG;
         let cfg = LaunchConfig {
-            grid: (n_tiles_max, batch, 1),
+            grid: (n_chunks_x, batch, 1),
             block: (32, 1, 1),
             shared_mem_bytes: 0,
         };

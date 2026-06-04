@@ -1462,17 +1462,20 @@ impl HeterogeneousEngine {
                     v.copy_from_host_async(&n_comp_after, &de.compute)?;
                 }
                 // q[B, N_INDEXER_HEAD * N_INDEXER_HEAD_DIM] = attn_q_b @ qr[B]
-                de.f16.matvec_batched(
-                    &de.compute,
-                    &mut bd.indexer_q,
-                    &iw.attn_q_b.buffer,
-                    &bd.qr_normed,
-                    N_INDEXER_HEAD * N_INDEXER_HEAD_DIM,
-                    N_LORA_Q,
-                    b,
-                )?;
-                // RoPE in-place per-token pos from pos_per_b.
                 {
+                    let _t = de.events.stage("k.indexer.matvec_q", &de.compute)?;
+                    de.f16.matvec_batched(
+                        &de.compute,
+                        &mut bd.indexer_q,
+                        &iw.attn_q_b.buffer,
+                        &bd.qr_normed,
+                        N_INDEXER_HEAD * N_INDEXER_HEAD_DIM,
+                        N_LORA_Q,
+                        b,
+                    )?;
+                }
+                {
+                    let _t = de.events.stage("k.indexer.rope", &de.compute)?;
                     let pos_v = bd.pos_per_b.slice_view(0, b as usize);
                     de.rope.launch_forward_batched(
                         &de.compute,
@@ -1485,51 +1488,57 @@ impl HeterogeneousEngine {
                         &dlw.rope_params,
                     )?;
                 }
-                // head_weights[B, N_INDEXER_HEAD] = proj @ attn_input_norm[B]
-                de.f16.matvec_batched(
-                    &de.compute,
-                    &mut bd.indexer_head_weights,
-                    &iw.proj.buffer,
-                    &bd.attn_input_norm,
-                    N_INDEXER_HEAD,
-                    N_EMBD,
-                    b,
-                )?;
-                de.vec_scale.launch(
-                    &de.compute,
-                    &mut bd.indexer_head_weights,
-                    scale,
-                    b * N_INDEXER_HEAD,
-                )?;
-                // Score: stride = ATTN_MIXED_MAX_KEYS (== scores buffer
-                // width). Stamps -INF past n_idx_per[bi] so downstream
-                // topk only picks valid entries.
-                wmma.launch_batched(
-                    &de.compute,
-                    &mut bd.indexer_scores,
-                    &bd.indexer_q,
-                    &bd.indexer_head_weights,
-                    &ics.comp_kv,
-                    &bd.n_index_comp_per_b,
-                    n_idx_max,
-                    ATTN_MIXED_MAX_KEYS,
-                    b,
-                )?;
-                // TopK + bitmap (self-zeros each token's slice + atomic-OR
-                // selected bits).
-                de.indexer_topk_bitonic.launch_batched(
-                    &de.compute,
-                    &mut bd.indexer_selected,
-                    &mut bd.attn_comp_allowed_bits,
-                    &mut bd.indexer_topk_scratch,
-                    &bd.indexer_scores,
-                    &bd.n_index_comp_per_b,
-                    n_idx_max,
-                    ATTN_MIXED_MAX_KEYS,
-                    n_words_per_b as u32,
-                    INDEXER_TOP_K,
-                    b,
-                )?;
+                {
+                    let _t = de.events.stage("k.indexer.matvec_proj", &de.compute)?;
+                    de.f16.matvec_batched(
+                        &de.compute,
+                        &mut bd.indexer_head_weights,
+                        &iw.proj.buffer,
+                        &bd.attn_input_norm,
+                        N_INDEXER_HEAD,
+                        N_EMBD,
+                        b,
+                    )?;
+                }
+                {
+                    let _t = de.events.stage("k.indexer.scale", &de.compute)?;
+                    de.vec_scale.launch(
+                        &de.compute,
+                        &mut bd.indexer_head_weights,
+                        scale,
+                        b * N_INDEXER_HEAD,
+                    )?;
+                }
+                {
+                    let _t = de.events.stage("k.indexer.score_wmma", &de.compute)?;
+                    wmma.launch_batched(
+                        &de.compute,
+                        &mut bd.indexer_scores,
+                        &bd.indexer_q,
+                        &bd.indexer_head_weights,
+                        &ics.comp_kv,
+                        &bd.n_index_comp_per_b,
+                        n_idx_max,
+                        ATTN_MIXED_MAX_KEYS,
+                        b,
+                    )?;
+                }
+                {
+                    let _t = de.events.stage("k.indexer.topk_bitonic", &de.compute)?;
+                    de.indexer_topk_bitonic.launch_batched(
+                        &de.compute,
+                        &mut bd.indexer_selected,
+                        &mut bd.attn_comp_allowed_bits,
+                        &mut bd.indexer_topk_scratch,
+                        &bd.indexer_scores,
+                        &bd.n_index_comp_per_b,
+                        n_idx_max,
+                        ATTN_MIXED_MAX_KEYS,
+                        n_words_per_b as u32,
+                        INDEXER_TOP_K,
+                        b,
+                    )?;
+                }
                 let _ = pos0; // pos consumed via pos_per_b
                 _t_ix.end()?;
                 Some(&bd.attn_comp_allowed_bits)
