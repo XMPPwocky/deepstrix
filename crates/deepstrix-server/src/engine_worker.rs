@@ -781,6 +781,58 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
     let _ = state.engine.shutdown();
 }
 
+fn short_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Compact forensic fingerprint of the worker's KV-related state.
+/// Host-side only — no GPU work. Used at restore / cancel / decode-end
+/// transitions to pin down wrong-KV-attended bugs by correlating
+/// snapshot hashes with the in-VRAM counters that should match them.
+fn state_fingerprint(state: &WorkerState) -> String {
+    let (live_h, live_pos, live_toks) = match &state.live {
+        Some(l) => {
+            let bytes: Vec<u8> = l.tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+            let h = blake3::hash(&bytes);
+            (
+                short_hex(&h.as_bytes()[..4]),
+                Some(l.pos),
+                Some(l.tokens.len()),
+            )
+        }
+        None => ("none".to_string(), None, None),
+    };
+    let layers = &state.state.layers;
+    let l0_n_raw = layers.first().map(|l| l.n_raw).unwrap_or(0);
+    let (l2_n_raw, l2_n_comp) = layers
+        .get(2)
+        .map(|l| {
+            (
+                l.n_raw,
+                l.compressor.as_ref().map(|c| c.n_comp).unwrap_or(0),
+            )
+        })
+        .unwrap_or((0, 0));
+    let (sum_raw, sum_comp) = layers.iter().fold((0u64, 0u64), |(r, c), layer| {
+        (
+            r + layer.n_raw as u64,
+            c + layer
+                .compressor
+                .as_ref()
+                .map(|c| c.n_comp as u64)
+                .unwrap_or(0),
+        )
+    });
+    format!(
+        "liveH={} live={:?}/{:?} L0.n_raw={} L2={}/{} sum={}/{}",
+        live_h, live_toks, live_pos, l0_n_raw, l2_n_raw, l2_n_comp, sum_raw, sum_comp
+    )
+}
+
 /// If the live session has uncommitted state, persist it to disk and
 /// clear its dirty flag. Called before any operation that would evict
 /// the live state (conversation switch, shutdown).
@@ -811,9 +863,12 @@ fn save_live_if_dirty(state: &mut WorkerState) {
             if let Some(l) = &mut state.live {
                 l.dirty = false;
             }
+            let fp = state_fingerprint(state);
             tracing::info!(
                 tokens = n,
+                snap_hash = %short_hex(&hash[..4]),
                 total_disk = state.snapshot_index.total_bytes(),
+                fp = %fp,
                 "saved live to disk"
             );
         }
@@ -849,6 +904,19 @@ fn handle_generate_stream(
         tracing::info!("generate: cancelled before prefill (client gone)");
         return Ok(());
     }
+
+    // Forensic: per-request entry fingerprint. Correlates inbound
+    // req.tokens.len() with the in-VRAM state inherited from the
+    // previous turn. Wrong-KV-attended bugs show up here as a live
+    // hash + counter set that doesn't match the previous turn's exit
+    // fingerprint, or a non-None live whose hash doesn't byte-prefix
+    // req.
+    tracing::debug!(
+        req_len = req.tokens.len(),
+        sid = ?session_id,
+        fp = %state_fingerprint(state),
+        "generate: entry"
+    );
 
     // Strip the trailing `<think>`/`</think>` marker from the rendered
     // prompt. The marker is "transient" — letta's history-replay of
@@ -965,6 +1033,7 @@ fn handle_generate_stream(
                         loaded_len = loaded.len(),
                         verify_live = verify.live_tokens,
                         verify_req = verify.req_tokens,
+                        snap_hash = %short_hex(&snap_hash[..4]),
                         "restored snapshot bytes are NOT a prefix of the request; falling back"
                     );
                     state.state.reset_in_place(state.dgpu, state.igpu)?;
@@ -1008,7 +1077,9 @@ fn handle_generate_stream(
                         restored_live = loaded_len,
                         restored_req = verify.req_tokens,
                         suffix_len,
+                        snap_hash = %short_hex(&snap_hash[..4]),
                         mode = "restore",
+                        fp = %state_fingerprint(state),
                         "prefill"
                     );
                     if suffix_len > 0 {
@@ -1019,7 +1090,10 @@ fn handle_generate_stream(
                             Some(&cancel),
                         )?;
                         if cancel.load(Ordering::Relaxed) {
-                            tracing::info!("generate: cancelled mid-prefill (restore path)");
+                            tracing::info!(
+                                fp = %state_fingerprint(state),
+                                "generate: cancelled mid-prefill (restore path)"
+                            );
                             // Restored snapshot is still on-GPU but
                             // we may have partially appended suffix
                             // KV beyond it. Drop live so next request
@@ -1096,7 +1170,10 @@ fn handle_generate_stream(
         state.live = None;
         prefill_suffix(state, &req.tokens, 0, Some(&cancel))?;
         if cancel.load(Ordering::Relaxed) {
-            tracing::info!("generate: cancelled mid-prefill (full path)");
+            tracing::info!(
+                fp = %state_fingerprint(state),
+                "generate: cancelled mid-prefill (full path)"
+            );
             // live is already None; KV cache has partial garbage but
             // the next request's reset_in_place will clear it.
             return Ok(());
@@ -1126,7 +1203,10 @@ fn handle_generate_stream(
         );
         prefill_suffix(state, suffix, pos0, Some(&cancel))?;
         if cancel.load(Ordering::Relaxed) {
-            tracing::info!("generate: cancelled mid-prefill (extend path)");
+            tracing::info!(
+                fp = %state_fingerprint(state),
+                "generate: cancelled mid-prefill (extend path)"
+            );
             // live state's pos no longer reflects the KV cache (we
             // wrote some suffix tokens beyond live.pos). Drop it; the
             // next request will reset_in_place.
@@ -1296,9 +1376,19 @@ fn finish_decode(
     const HEARTBEAT_INTERVAL: u32 = 64;
     let mut hb_last_count: u32 = 0;
     let mut hb_last_at = std::time::Instant::now();
+    // Tracks whether the decode loop exited because the client cancelled.
+    // FinishReason::Stop covers both natural turn-end AND cancel, so we
+    // need a separate signal to disambiguate. On cancel we DROP live
+    // unconditionally below — leaving live populated with canonical
+    // garbage tokens (samples that streamed before cancel) lets a
+    // letta-style retry extend into a KV state that includes the
+    // model's own half-finished output, producing "grammatically
+    // correct but semantically scrambled" garbage on the retry.
+    let mut was_cancelled = false;
     let finish: FinishReason = loop {
         if cancel.load(Ordering::Relaxed) {
             tracing::info!("generation cancelled by client");
+            was_cancelled = true;
             break FinishReason::Stop;
         }
         if completion_tokens > 0
@@ -1411,6 +1501,12 @@ fn finish_decode(
                 // remained full past our grace window. The KV cache
                 // mid-decode is now inconsistent with live.tokens;
                 // clear live so the next request reset-prefills.
+                tracing::info!(
+                    completion_tokens,
+                    pos,
+                    fp = %state_fingerprint(state),
+                    "decode: bailed on send_failed; clearing live"
+                );
                 state.live = None;
                 return Ok(());
             }
@@ -1462,7 +1558,13 @@ fn finish_decode(
     // history (which always renders EOS after a closed assistant turn,
     // per `prompt.rs`) prefix-matches the live cache. Mirrors
     // `chat.rs:582-600`'s end_of_turn handling.
-    if matches!(finish, FinishReason::Stop) && pos < state.n_kv_max {
+    //
+    // Skipped on cancel: the EOS-forward is for snapshot-prefix
+    // continuity, but on cancel we drop live entirely below, so
+    // forwarding EOS would just contaminate the in-VRAM KV state for
+    // the brief window between here and the next request's
+    // reset_in_place.
+    if matches!(finish, FinishReason::Stop) && !was_cancelled && pos < state.n_kv_max {
         embed_lookup(&state.token_embd_bytes, TOK_EOS, &mut residual);
         state.engine.forward_token(
             &mut state.dgpu_scratch,
@@ -1487,6 +1589,27 @@ fn finish_decode(
         finish,
     });
 
+    // Cancel cleanup. live.tokens accumulated canonical samples while
+    // the decode loop was running; on cancel those samples are GARBAGE
+    // from the user's perspective (they pressed stop because they
+    // didn't want it). Letta's retry typically resubmits with the
+    // streamed-before-cancel content as a prior assistant turn —
+    // byte_aligned_lcp would then match into live, the extend path
+    // would prefill the new suffix on top of the contaminated KV
+    // cache, and the model would attend back to its own half-finished
+    // output. Drop live so the next request reset-prefills cleanly.
+    //
+    // Symmetric with the send_failed cleanup above (line ~1485).
+    if was_cancelled {
+        tracing::info!(
+            completion_tokens,
+            pos,
+            fp = %state_fingerprint(state),
+            "decode: dropping live on cancel"
+        );
+        state.live = None;
+    }
+
     // End-of-turn cleanup. We no longer save the snapshot here —
     // the meaningful save happened in handle_generate_stream BEFORE
     // we forwarded the trailing `<think>` marker (so the snapshot
@@ -1510,6 +1633,18 @@ fn finish_decode(
             state.live = None;
         }
     }
+
+    // Forensic: end-of-turn fingerprint. The next request's entry
+    // fingerprint should match this — divergence between adjacent
+    // turns is a smoking gun for state corruption (cancel cleanup
+    // missed something, scratch leaked, etc.). `finish` tells us
+    // whether we're exiting via natural stop, length cap, or cancel.
+    tracing::debug!(
+        finish = ?finish,
+        completion_tokens,
+        fp = %state_fingerprint(state),
+        "decode: end"
+    );
 
     Ok(())
 }
