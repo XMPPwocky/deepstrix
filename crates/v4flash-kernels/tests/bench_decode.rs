@@ -17,7 +17,7 @@ use color_eyre::eyre::{self, eyre};
 
 use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
-use v4flash_kernels::config::HC_DIM;
+use v4flash_kernels::config::{COMPRESS_RATIOS, HC_DIM, N_LAYER, SWA_WINDOW};
 use v4flash_kernels::het::{
     DgpuScratch, ExecMode, HetModelState, HetModelWeights, HeterogeneousEngine, IgpuScratch,
 };
@@ -65,7 +65,20 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
-    eprintln!("bench config: n_tokens={n_tokens}, warmup={warmup}");
+    // FAKE_POS=N stamps per-layer KV counters to simulate having decoded
+    // N prior tokens (n_raw=min(N,W); cs.n_comp=N/ratio; ics.n_comp=N/ratio
+    // for ratio==4 layers). Buffers stay zero-initialised — timing is
+    // representative (FMA/BW don't depend on values) but output is
+    // garbage. Use this for long-context decode benchmarks without
+    // paying the hour-long cost of real prefill at depth.
+    //
+    // A short real warmup runs first to capture per-layer HIP graphs;
+    // without it the first faked token spikes on graph capture.
+    let fake_pos: u32 = std::env::var("FAKE_POS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    eprintln!("bench config: n_tokens={n_tokens}, warmup={warmup}, fake_pos={fake_pos}");
 
     let dump = ActivationDump::open(dump_dir())?;
     let gguf = MappedGguf::open(MODEL_PATH)?;
@@ -94,7 +107,11 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
     let mut dgpu_scratch = DgpuScratch::alloc(dgpu)?;
     let mut igpu_scratch = IgpuScratch::alloc(igpu)?;
     let n_positions = n_tokens + PROMPT_TOKENS.len() as i32 - 1;
-    let mut state = HetModelState::alloc(dgpu, igpu, n_positions as u32)?;
+    // Size n_kv_max to fit the faked depth too. comp_kv buffers are sized
+    // from n_kv_max so they need to be large enough to hold the simulated
+    // state's n_comp slots, even though we don't fill them.
+    let n_kv_max = (n_positions as u32).max(fake_pos + n_tokens as u32 + 64);
+    let mut state = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
 
     // Use the dump's first-position embedding as input; we're not
     // sampling, just exercising the forward path. Each position reads
@@ -119,17 +136,73 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
     }
     eprintln!("preloaded.");
 
+    // If FAKE_POS is set: short real warmup to capture HIP graphs, then
+    // stamp per-layer counters to simulate having decoded `fake_pos`
+    // tokens. After this, the bench loop measures decode at the faked
+    // depth.
+    let start_pos: i32 = if fake_pos > 0 {
+        let graph_warm = 20i32.min(n_positions);
+        eprintln!(
+            "FAKE_POS={fake_pos}: real-forwarding {graph_warm} tokens to capture HIP graphs..."
+        );
+        for pos in 0..graph_warm {
+            let token_id = if (pos as usize) < PROMPT_TOKENS.len() {
+                PROMPT_TOKENS[pos as usize]
+            } else {
+                0
+            };
+            engine.forward_token(
+                &mut dgpu_scratch,
+                &mut igpu_scratch,
+                &mut state,
+                &weights,
+                &inputs[pos as usize],
+                pos as u32,
+                token_id,
+            )?;
+        }
+        eprintln!("stamping per-layer counters for fake depth {fake_pos}");
+        for layer in 0..N_LAYER as usize {
+            let ls = &mut state.layers[layer];
+            ls.n_raw = SWA_WINDOW.min(fake_pos);
+            let ratio = COMPRESS_RATIOS[layer];
+            if ratio > 0 {
+                if let Some(cs) = ls.compressor.as_mut() {
+                    cs.n_comp = fake_pos / ratio;
+                }
+                if let Some(ics) = ls.indexer_compressor.as_mut() {
+                    ics.n_comp = fake_pos / ratio;
+                }
+            }
+        }
+        eprintln!(
+            "fake counters set: ratio=4 n_comp={}, ratio=128 n_comp={}",
+            fake_pos / 4,
+            fake_pos / 128
+        );
+        // Continue at the faked position. The bench loop's positions go
+        // [fake_pos, fake_pos+n_positions).
+        fake_pos as i32
+    } else {
+        0
+    };
+
     let mut token_us: Vec<u64> = Vec::with_capacity(n_positions as usize);
     let mut token_host_us: Vec<u64> = Vec::with_capacity(n_positions as usize);
     let mut token_sync_us: Vec<u64> = Vec::with_capacity(n_positions as usize);
     let bench_start = Instant::now();
-    for pos in 0..n_positions {
-        let token_id = if (pos as usize) < PROMPT_TOKENS.len() {
-            PROMPT_TOKENS[pos as usize]
+    for i in 0..n_positions {
+        let pos = start_pos + i;
+        // For fake-pos runs, all bench tokens are post-prompt — use
+        // input residual #0 cycled (it's just exercising kernels, output
+        // is meaningless at faked depth anyway).
+        let input_idx = (i as usize) % inputs.len();
+        let token_id = if (i as usize) < PROMPT_TOKENS.len() && fake_pos == 0 {
+            PROMPT_TOKENS[i as usize]
         } else {
             0
         };
-        let input_hc = &inputs[pos as usize];
+        let input_hc = &inputs[input_idx];
 
         let t = Instant::now();
         engine.forward_token(

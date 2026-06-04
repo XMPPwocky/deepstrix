@@ -157,6 +157,12 @@ fn perfetto_trace_long() -> eyre::Result<()> {
                 if let Some(cs) = ls.compressor.as_mut() {
                     cs.n_comp = (warmup_pos as u32) / ratio;
                 }
+                // CSA indexer compressor fires at same boundaries as main
+                // compressor for ratio==4 layers. Stamp its counter too so
+                // the prefill/decode mask path exercises realistic depths.
+                if let Some(ics) = ls.indexer_compressor.as_mut() {
+                    ics.n_comp = (warmup_pos as u32) / ratio;
+                }
             }
         }
         eprintln!(
