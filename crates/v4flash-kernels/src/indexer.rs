@@ -140,6 +140,40 @@ impl IndexerScoreWmma {
             scores.raw(), q.raw(), head_weights.raw(), index_comp_kv.raw(), n_comp
         ])
     }
+
+    /// Batched variant: one launch handles `batch` tokens. Per-token n_comp
+    /// comes from `n_idx_per[bi]`. `scores`/`q`/`head_weights` are strided
+    /// by `bi` (scores stride = `n_idx_stride`). Scores past valid range
+    /// are stamped with -INF (so the bitonic topk that follows picks only
+    /// valid entries).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        scores: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        head_weights: &DeviceBuffer<f32>,
+        index_comp_kv: &DeviceBuffer<u16>,
+        n_idx_per: &DeviceBuffer<u32>,
+        n_idx_max: u32,
+        n_idx_stride: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_idx_max == 0 {
+            return Ok(());
+        }
+        let function = self.module.get_function("indexer_score_wmma_batched")?;
+        let n_tiles_max = (n_idx_max + 15) / 16;
+        let cfg = LaunchConfig {
+            grid: (n_tiles_max, batch, 1),
+            block: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            scores.raw(), q.raw(), head_weights.raw(), index_comp_kv.raw(),
+            n_idx_per.raw(), n_idx_stride
+        ])
+    }
 }
 
 /// Greedy top-K selection over indexer scores. Mirrors ds4's iterative
@@ -353,6 +387,89 @@ impl IndexerTopkBitonic {
         launch_kernel!(merge_fn, merge_cfg, stream, [
             selected.raw(), allowed_bits.raw(), scratch.raw(), scores.raw(),
             n_comp, top_k, n_candidates
+        ])
+    }
+
+    /// Batched variant: one launch covers `batch` tokens. Each token's
+    /// `n_comp = n_idx_per[bi]` (may vary within batch). Strides:
+    ///   - `selected`     stride `top_k`
+    ///   - `allowed_bits` stride `n_words_per_b`
+    ///   - `scores`       stride `n_idx_stride`
+    ///   - `scratch`      stride `n_chunks_max * top_k` (chunked path only)
+    /// Self-zeros the per-token `allowed_bits` slice before atomic-OR'ing
+    /// in selected bits. Pre-condition: scores past `n_idx_per[bi]` must
+    /// be `-INF` (the batched IndexerScoreWmma stamps this).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        selected: &mut DeviceBuffer<i32>,
+        allowed_bits: &mut DeviceBuffer<u32>,
+        scratch: &mut DeviceBuffer<u32>,
+        scores: &DeviceBuffer<f32>,
+        n_idx_per: &DeviceBuffer<u32>,
+        n_idx_max: u32,
+        n_idx_stride: u32,
+        n_words_per_b: u32,
+        top_k: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || top_k == 0 {
+            return Ok(());
+        }
+        const SORT_N: u32 = 4096;
+        const BLOCK: u32 = 1024;
+
+        if n_idx_max <= SORT_N {
+            let function = self.module.get_function("indexer_topk_bitonic_4096_batched")?;
+            let cfg = LaunchConfig {
+                grid: (1, batch, 1),
+                block: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            return launch_kernel!(function, cfg, stream, [
+                selected.raw(), allowed_bits.raw(), scores.raw(), n_idx_per.raw(),
+                n_idx_stride, n_words_per_b, top_k
+            ]);
+        }
+
+        let n_chunks = (n_idx_max + SORT_N - 1) / SORT_N;
+        let n_candidates = n_chunks * top_k;
+        if n_candidates > SORT_N {
+            return Err(eyre!(
+                "indexer_topk_bitonic_batched: n_candidates={n_candidates} exceeds merge cap {SORT_N}"
+            ));
+        }
+        let candidates_stride = n_candidates;
+        let scratch_need = (batch as usize) * (candidates_stride as usize);
+        if scratch.len() < scratch_need {
+            return Err(eyre!(
+                "indexer_topk_bitonic_batched: scratch has {} u32, need {} (B={batch}, stride={candidates_stride})",
+                scratch.len(),
+                scratch_need,
+            ));
+        }
+
+        let chunk_fn = self.module.get_function("indexer_topk_chunk_4096_batched")?;
+        let chunk_cfg = LaunchConfig {
+            grid: (n_chunks, batch, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(chunk_fn, chunk_cfg, stream, [
+            scratch.raw(), scores.raw(), n_idx_per.raw(),
+            n_idx_stride, candidates_stride, top_k
+        ])?;
+
+        let merge_fn = self.module.get_function("indexer_topk_merge_4096_batched")?;
+        let merge_cfg = LaunchConfig {
+            grid: (1, batch, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(merge_fn, merge_cfg, stream, [
+            selected.raw(), allowed_bits.raw(), scratch.raw(), scores.raw(), n_idx_per.raw(),
+            n_idx_stride, candidates_stride, n_words_per_b, top_k, n_candidates
         ])
     }
 }

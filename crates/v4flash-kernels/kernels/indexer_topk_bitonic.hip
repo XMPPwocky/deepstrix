@@ -220,3 +220,184 @@ void indexer_topk_bitonic_4096(
         }
     }
 }
+
+// ---- Batched variants (one launch over B tokens) -----------------------
+//
+// Each batched kernel adds grid.y = B and strides scores/selected/bitmap/
+// scratch by `bi`. Per-token `n_comp` comes from `n_idx_per[bi]`. Scores
+// past valid range MUST already be -INF (the IndexerScoreWmma_batched
+// kernel does this), so each WG can sort over a uniform TOPK_SORT_N range
+// and the bitonic better-predicate naturally pushes invalid slots to the
+// end.
+
+extern "C" __global__ __launch_bounds__(TOPK_BLOCK)
+void indexer_topk_bitonic_4096_batched(
+        int          * __restrict__ selected_b,     // [B, top_k]
+        unsigned int * __restrict__ allowed_bits_b, // [B, n_words_per_b]
+        const float  * __restrict__ scores_b,       // [B, n_idx_stride]
+        const unsigned int * __restrict__ n_idx_per,// [B]
+        unsigned int                n_idx_stride,
+        unsigned int                n_words_per_b,
+        unsigned int                top_k) {
+    const unsigned int bi = blockIdx.y;
+    const unsigned int n_comp = n_idx_per[bi];
+
+    int          * __restrict__ selected     = selected_b     + (size_t)bi * top_k;
+    unsigned int * __restrict__ allowed_bits = allowed_bits_b + (size_t)bi * n_words_per_b;
+    const float  * __restrict__ scores       = scores_b       + (size_t)bi * n_idx_stride;
+
+    __shared__ float        vals[TOPK_SORT_N];
+    __shared__ unsigned int idxs[TOPK_SORT_N];
+
+    const unsigned int tid = threadIdx.x;
+    for (unsigned int i = tid; i < n_words_per_b; i += TOPK_BLOCK) {
+        allowed_bits[i] = 0u;
+    }
+    if (n_comp == 0) {
+        for (unsigned int i = tid; i < top_k; i += TOPK_BLOCK) {
+            selected[i] = -1;
+        }
+        return;
+    }
+    for (unsigned int i = tid; i < TOPK_SORT_N; i += TOPK_BLOCK) {
+        if (i < n_comp) {
+            vals[i] = scores[i];
+            idxs[i] = i;
+        } else {
+            vals[i] = TOPK_NEG_INF;
+            idxs[i] = 0xFFFFFFFFu;
+        }
+    }
+    __syncthreads();
+
+    bitonic_sort_lds(vals, idxs);
+
+    for (unsigned int i = tid; i < top_k; i += TOPK_BLOCK) {
+        const unsigned int idx = idxs[i];
+        if (idx < n_comp) {
+            selected[i] = (int)idx;
+            atomicOr(&allowed_bits[idx >> 5], 1u << (idx & 31u));
+        } else {
+            selected[i] = -1;
+        }
+    }
+}
+
+// Per-chunk batched. Grid: (n_chunks, B, 1).
+extern "C" __global__ __launch_bounds__(TOPK_BLOCK)
+void indexer_topk_chunk_4096_batched(
+        unsigned int * __restrict__ candidates_b,   // [B, candidates_stride]
+        const float  * __restrict__ scores_b,       // [B, n_idx_stride]
+        const unsigned int * __restrict__ n_idx_per,// [B]
+        unsigned int                n_idx_stride,
+        unsigned int                candidates_stride, // = n_chunks * top_k
+        unsigned int                top_k) {
+    const unsigned int chunk = blockIdx.x;
+    const unsigned int bi    = blockIdx.y;
+    const unsigned int n_comp = n_idx_per[bi];
+    const unsigned int chunk_lo = chunk * TOPK_SORT_N;
+    unsigned int * __restrict__ candidates = candidates_b + (size_t)bi * candidates_stride;
+    const float  * __restrict__ scores     = scores_b     + (size_t)bi * n_idx_stride;
+    const unsigned int out_base = chunk * top_k;
+    const unsigned int tid = threadIdx.x;
+    if (chunk_lo >= n_comp) {
+        for (unsigned int i = tid; i < top_k; i += TOPK_BLOCK) {
+            candidates[out_base + i] = 0xFFFFFFFFu;
+        }
+        return;
+    }
+    const unsigned int chunk_hi = (chunk_lo + TOPK_SORT_N < n_comp)
+        ? chunk_lo + TOPK_SORT_N
+        : n_comp;
+    const unsigned int chunk_n  = chunk_hi - chunk_lo;
+
+    __shared__ float        vals[TOPK_SORT_N];
+    __shared__ unsigned int idxs[TOPK_SORT_N];
+
+    for (unsigned int i = tid; i < TOPK_SORT_N; i += TOPK_BLOCK) {
+        if (i < chunk_n) {
+            vals[i] = scores[chunk_lo + i];
+            idxs[i] = chunk_lo + i;
+        } else {
+            vals[i] = TOPK_NEG_INF;
+            idxs[i] = 0xFFFFFFFFu;
+        }
+    }
+    __syncthreads();
+
+    bitonic_sort_lds(vals, idxs);
+
+    for (unsigned int i = tid; i < top_k; i += TOPK_BLOCK) {
+        candidates[out_base + i] = idxs[i];
+    }
+}
+
+// Final merge batched. Grid: (1, B, 1).
+extern "C" __global__ __launch_bounds__(TOPK_BLOCK)
+void indexer_topk_merge_4096_batched(
+        int          * __restrict__ selected_b,     // [B, top_k]
+        unsigned int * __restrict__ allowed_bits_b, // [B, n_words_per_b]
+        const unsigned int * __restrict__ candidates_b, // [B, candidates_stride]
+        const float        * __restrict__ scores_b,     // [B, n_idx_stride]
+        const unsigned int * __restrict__ n_idx_per,    // [B]
+        unsigned int                n_idx_stride,
+        unsigned int                candidates_stride,
+        unsigned int                n_words_per_b,
+        unsigned int                top_k,
+        unsigned int                n_candidates) {
+    const unsigned int bi = blockIdx.y;
+    const unsigned int n_comp = n_idx_per[bi];
+
+    int          * __restrict__ selected     = selected_b     + (size_t)bi * top_k;
+    unsigned int * __restrict__ allowed_bits = allowed_bits_b + (size_t)bi * n_words_per_b;
+    const unsigned int * __restrict__ candidates = candidates_b + (size_t)bi * candidates_stride;
+    const float        * __restrict__ scores     = scores_b     + (size_t)bi * n_idx_stride;
+
+    __shared__ float        vals[TOPK_SORT_N];
+    __shared__ unsigned int idxs[TOPK_SORT_N];
+
+    const unsigned int tid = threadIdx.x;
+    for (unsigned int i = tid; i < n_words_per_b; i += TOPK_BLOCK) {
+        allowed_bits[i] = 0u;
+    }
+    if (n_comp == 0) {
+        for (unsigned int i = tid; i < top_k; i += TOPK_BLOCK) {
+            selected[i] = -1;
+        }
+        return;
+    }
+    for (unsigned int i = tid; i < TOPK_SORT_N; i += TOPK_BLOCK) {
+        if (i < n_candidates) {
+            const unsigned int idx = candidates[i];
+            if (idx < n_comp) {
+                vals[i] = scores[idx];
+                idxs[i] = idx;
+            } else {
+                vals[i] = TOPK_NEG_INF;
+                idxs[i] = 0xFFFFFFFFu;
+            }
+        } else {
+            vals[i] = TOPK_NEG_INF;
+            idxs[i] = 0xFFFFFFFFu;
+        }
+    }
+    __syncthreads();
+
+    bitonic_sort_lds(vals, idxs);
+
+    for (unsigned int i = tid; i < top_k; i += TOPK_BLOCK) {
+        const unsigned int idx = idxs[i];
+        if (idx < n_comp) {
+            selected[i] = (int)idx;
+            atomicOr(&allowed_bits[idx >> 5], 1u << (idx & 31u));
+        } else {
+            selected[i] = -1;
+        }
+    }
+}
+
+// Final merge batched, multi-level tree. Same as merge_4096_batched but
+// reads from a per-batch sorted-candidates buffer of arbitrary stride.
+// Used when n_chunks > TOPK_SORT_N / top_k requires a 2-level reduction.
+// (Currently unused — single-level merge covers up to n_comp = 32768 with
+// top_k = 512.)

@@ -1445,126 +1445,92 @@ impl HeterogeneousEngine {
                 let n_words_per_b = ((ATTN_MIXED_MAX_KEYS + 31) / 32) as usize;
                 let scale = 1.0f32
                     / ((N_INDEXER_HEAD_DIM as f32) * (N_INDEXER_HEAD as f32)).sqrt();
+                let wmma = de.indexer_score_wmma.as_ref().ok_or_else(|| {
+                    eyre!("L{layer}: batched prefill indexer requires gfx12 IndexerScoreWmma")
+                })?;
 
-                // Per-token loop. Each iteration:
-                //  - zero this token's bitmap slice
-                //  - if n_index_comp_per[b] ≤ 512: fill all-1s
-                //  - else: matvec(attn_q_b, qr[b]) → RoPE → matvec(proj,
-                //    attn_input_norm[b]) → scale → IndexerScore →
-                //    IndexerTopk → bitpack_set
-                for bi in 0..(b as usize) {
-                    let mut slice = bd.attn_comp_allowed_bits.slice_view_mut(
-                        bi * n_words_per_b,
-                        n_words_per_b,
-                    );
-                    let n_idx = n_comp_after[bi];
-                    de.indexer_bitpack.launch_zero(
+                // Batched indexer pipeline. One launch per stage replaces
+                // the per-token serial loop (was 8 launches × B × 21L =
+                // 86K launches per chunk — the regression root cause).
+                // Tokens with n_idx ≤ INDEXER_TOP_K are handled correctly
+                // by the batched topk degenerating to all-valid selection.
+                let n_idx_max: u32 = n_comp_after.iter().copied().max().unwrap_or(0);
+                {
+                    let mut v = bd
+                        .n_index_comp_per_b
+                        .slice_view_mut(0, b as usize);
+                    v.copy_from_host_async(&n_comp_after, &de.compute)?;
+                }
+                // q[B, N_INDEXER_HEAD * N_INDEXER_HEAD_DIM] = attn_q_b @ qr[B]
+                de.f16.matvec_batched(
+                    &de.compute,
+                    &mut bd.indexer_q,
+                    &iw.attn_q_b.buffer,
+                    &bd.qr_normed,
+                    N_INDEXER_HEAD * N_INDEXER_HEAD_DIM,
+                    N_LORA_Q,
+                    b,
+                )?;
+                // RoPE in-place per-token pos from pos_per_b.
+                {
+                    let pos_v = bd.pos_per_b.slice_view(0, b as usize);
+                    de.rope.launch_forward_batched(
                         &de.compute,
-                        &mut slice,
-                        n_words_per_b as u32,
-                    )?;
-                    if n_idx == 0 {
-                        continue;
-                    }
-                    if n_idx <= INDEXER_TOP_K {
-                        de.indexer_bitpack
-                            .launch_all_ones(&de.compute, &mut slice, n_idx)?;
-                        continue;
-                    }
-                    // Full indexer pipeline for this token.
-                    let mut q_slot = bd.indexer_q.slice_view_mut(
-                        bi * (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize,
-                        (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize,
-                    );
-                    let qr_in = bd
-                        .qr_normed
-                        .slice_view(bi * (N_LORA_Q as usize), N_LORA_Q as usize);
-                    de.f16.matvec(
-                        &de.compute,
-                        &mut q_slot,
-                        &iw.attn_q_b.buffer,
-                        &qr_in,
-                        N_INDEXER_HEAD * N_INDEXER_HEAD_DIM,
-                        N_LORA_Q,
-                    )?;
-                    let token_pos = pos0 + bi as u32;
-                    de.rope.launch_forward(
-                        &de.compute,
-                        &mut q_slot,
+                        &mut bd.indexer_q,
+                        &pos_v,
                         N_INDEXER_HEAD,
                         N_INDEXER_HEAD_DIM,
                         N_ROT,
-                        token_pos,
+                        b,
                         &dlw.rope_params,
                     )?;
-                    let mut hw_slot = bd.indexer_head_weights.slice_view_mut(
-                        bi * (N_INDEXER_HEAD as usize),
-                        N_INDEXER_HEAD as usize,
-                    );
-                    let ain_in = bd
-                        .attn_input_norm
-                        .slice_view(bi * (N_EMBD as usize), N_EMBD as usize);
-                    de.f16.matvec(
-                        &de.compute,
-                        &mut hw_slot,
-                        &iw.proj.buffer,
-                        &ain_in,
-                        N_INDEXER_HEAD,
-                        N_EMBD,
-                    )?;
-                    de.vec_scale.launch(
-                        &de.compute,
-                        &mut hw_slot,
-                        scale,
-                        N_INDEXER_HEAD,
-                    )?;
-                    let kv_view = ics
-                        .comp_kv
-                        .slice_view(0, (n_idx * N_INDEXER_HEAD_DIM) as usize);
-                    let q_in = bd.indexer_q.slice_view(
-                        bi * (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize,
-                        (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize,
-                    );
-                    let hw_in = bd.indexer_head_weights.slice_view(
-                        bi * (N_INDEXER_HEAD as usize),
-                        N_INDEXER_HEAD as usize,
-                    );
-                    if let Some(wmma) = de.indexer_score_wmma.as_ref() {
-                        wmma.launch(
-                            &de.compute,
-                            &mut bd.indexer_scores,
-                            &q_in,
-                            &hw_in,
-                            &kv_view,
-                            n_idx,
-                        )?;
-                    } else {
-                        de.indexer_score.launch(
-                            &de.compute,
-                            &mut bd.indexer_scores,
-                            &q_in,
-                            &hw_in,
-                            &kv_view,
-                            n_idx,
-                            N_INDEXER_HEAD,
-                            N_INDEXER_HEAD_DIM,
-                        )?;
-                    }
-                    // Bitonic TopK (ports ds4's chunked sort + merge);
-                    // 72× faster than the greedy fallback at n=16384.
-                    // Writes selected[] and self-zeros + sets bits in
-                    // the per-token slice of attn_comp_allowed_bits.
-                    de.indexer_topk_bitonic.launch(
-                        &de.compute,
-                        &mut bd.indexer_selected,
-                        &mut slice,
-                        &mut bd.indexer_topk_scratch,
-                        &bd.indexer_scores,
-                        n_idx,
-                        INDEXER_TOP_K,
-                    )?;
-                    let _ = slice; // re-borrow guard
                 }
+                // head_weights[B, N_INDEXER_HEAD] = proj @ attn_input_norm[B]
+                de.f16.matvec_batched(
+                    &de.compute,
+                    &mut bd.indexer_head_weights,
+                    &iw.proj.buffer,
+                    &bd.attn_input_norm,
+                    N_INDEXER_HEAD,
+                    N_EMBD,
+                    b,
+                )?;
+                de.vec_scale.launch(
+                    &de.compute,
+                    &mut bd.indexer_head_weights,
+                    scale,
+                    b * N_INDEXER_HEAD,
+                )?;
+                // Score: stride = ATTN_MIXED_MAX_KEYS (== scores buffer
+                // width). Stamps -INF past n_idx_per[bi] so downstream
+                // topk only picks valid entries.
+                wmma.launch_batched(
+                    &de.compute,
+                    &mut bd.indexer_scores,
+                    &bd.indexer_q,
+                    &bd.indexer_head_weights,
+                    &ics.comp_kv,
+                    &bd.n_index_comp_per_b,
+                    n_idx_max,
+                    ATTN_MIXED_MAX_KEYS,
+                    b,
+                )?;
+                // TopK + bitmap (self-zeros each token's slice + atomic-OR
+                // selected bits).
+                de.indexer_topk_bitonic.launch_batched(
+                    &de.compute,
+                    &mut bd.indexer_selected,
+                    &mut bd.attn_comp_allowed_bits,
+                    &mut bd.indexer_topk_scratch,
+                    &bd.indexer_scores,
+                    &bd.n_index_comp_per_b,
+                    n_idx_max,
+                    ATTN_MIXED_MAX_KEYS,
+                    n_words_per_b as u32,
+                    INDEXER_TOP_K,
+                    b,
+                )?;
+                let _ = pos0; // pos consumed via pos_per_b
                 _t_ix.end()?;
                 Some(&bd.attn_comp_allowed_bits)
             } else {

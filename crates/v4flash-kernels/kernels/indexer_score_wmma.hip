@@ -170,3 +170,121 @@ void indexer_score_wmma(
     (void)lane; (void)c_base;
 #endif
 }
+
+// Batched variant: one launch handles B tokens. Sharing pattern:
+//   - K (index_comp_kv) is shared across all B tokens at this layer
+//   - Q, head_weights, scores are per-token (strided by bi)
+//   - n_idx_per[bi] gives per-token comp count (varies within batch).
+//
+// Grid: (n_tiles_max, B, 1). Each WG handles (n_tile, bi). Scores past
+// n_idx_per[bi] are stamped with -INF so the downstream bitonic topk
+// picks only valid entries.
+extern "C" __global__ __launch_bounds__(ISW_BLOCK)
+void indexer_score_wmma_batched(
+        float          * __restrict__ scores,          // [B, n_idx_stride]
+        const float    * __restrict__ q,               // [B, N_INDEXER_HEAD * N_INDEXER_HEAD_DIM]
+        const float    * __restrict__ head_weights,    // [B, N_INDEXER_HEAD]
+        const _Float16 * __restrict__ index_comp_kv,   // [n_idx_max, N_INDEXER_HEAD_DIM]
+        const unsigned int * __restrict__ n_idx_per,   // [B]
+        unsigned int     n_idx_stride) {
+    const unsigned int lane   = threadIdx.x & 31u;
+    const unsigned int n_tile = blockIdx.x;
+    const unsigned int bi     = blockIdx.y;
+    const unsigned int c_base = n_tile * ISW_N_TILE;
+    const unsigned int n_comp = n_idx_per[bi];
+
+    float       * __restrict__ scores_b = scores + (size_t)bi * n_idx_stride;
+    const float * __restrict__ q_b      = q      + (size_t)bi * (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM);
+    const float * __restrict__ hw_b     = head_weights + (size_t)bi * N_INDEXER_HEAD;
+
+    // Whole-WG early-out: all 16 cols of this n-tile are past valid range.
+    if (c_base >= n_comp) {
+        if (lane < ISW_N_TILE) {
+            const unsigned int c = c_base + lane;
+            if (c < n_idx_stride) {
+                scores_b[c] = -3.4028235e38f;
+            }
+        }
+        return;
+    }
+
+    __shared__ _Float16 lds_q[N_INDEXER_HEAD * N_INDEXER_HEAD_DIM];
+    __shared__ _Float16 lds_k[ISW_N_TILE * N_INDEXER_HEAD_DIM];
+    __shared__ float    lds_hw[N_INDEXER_HEAD];
+
+    #pragma unroll 8
+    for (unsigned int i = lane; i < N_INDEXER_HEAD * N_INDEXER_HEAD_DIM; i += ISW_BLOCK) {
+        lds_q[i] = (_Float16)q_b[i];
+    }
+    const unsigned int k_elems = ISW_N_TILE * N_INDEXER_HEAD_DIM;
+    #pragma unroll 4
+    for (unsigned int i = lane; i < k_elems; i += ISW_BLOCK) {
+        const unsigned int local_row = i / N_INDEXER_HEAD_DIM;
+        const unsigned int d         = i % N_INDEXER_HEAD_DIM;
+        const unsigned int c         = c_base + local_row;
+        lds_k[i] = (c < n_comp)
+            ? index_comp_kv[(size_t)c * N_INDEXER_HEAD_DIM + d]
+            : (_Float16)0.0f;
+    }
+    if (lane < N_INDEXER_HEAD) {
+        lds_hw[lane] = hw_b[lane];
+    }
+    if (N_INDEXER_HEAD > ISW_BLOCK && lane < (N_INDEXER_HEAD - ISW_BLOCK)) {
+        lds_hw[ISW_BLOCK + lane] = hw_b[ISW_BLOCK + lane];
+    }
+    __syncthreads();
+
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    float8 c_acc[ISW_M_TILES];
+    #pragma unroll
+    for (unsigned int mt = 0; mt < ISW_M_TILES; mt++) {
+        c_acc[mt] = (float8){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    }
+    const unsigned int col_in_tile = lane & 15u;
+    const unsigned int half        = lane >> 4;
+    const unsigned int k_off       = half * 8u;
+
+    #pragma unroll
+    for (unsigned int kt = 0; kt < ISW_K_TILES; kt++) {
+        const unsigned int kbase = kt * 16u;
+        half8 b_frag;
+        const _Float16 *b_row = lds_k + (size_t)col_in_tile * N_INDEXER_HEAD_DIM
+            + kbase + k_off;
+        #pragma unroll
+        for (int e = 0; e < 8; e++) b_frag[e] = b_row[e];
+
+        #pragma unroll
+        for (unsigned int mt = 0; mt < ISW_M_TILES; mt++) {
+            const unsigned int h0 = mt * 16u;
+            half8 a_frag;
+            const _Float16 *a_row = lds_q + (size_t)(h0 + col_in_tile) * N_INDEXER_HEAD_DIM
+                + kbase + k_off;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) a_frag[e] = a_row[e];
+            c_acc[mt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                a_frag, b_frag, c_acc[mt]);
+        }
+    }
+
+    float partial = 0.0f;
+    #pragma unroll
+    for (unsigned int mt = 0; mt < ISW_M_TILES; mt++) {
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const unsigned int h = mt * 16u + k_off + (unsigned int)e;
+            float v = c_acc[mt][e];
+            if (v < 0.0f) v = 0.0f;
+            partial += v * lds_hw[h];
+        }
+    }
+    partial += __shfl_xor(partial, 16);
+    if (lane < ISW_N_TILE) {
+        const unsigned int c = c_base + lane;
+        if (c < n_idx_stride) {
+            scores_b[c] = (c < n_comp) ? partial : -3.4028235e38f;
+        }
+    }
+#else
+    (void)c_base; (void)scores_b; (void)q_b; (void)hw_b;
+#endif
+}
