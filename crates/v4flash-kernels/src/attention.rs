@@ -563,6 +563,14 @@ impl AttentionMixed {
     /// pre-mask version). When `Some(_)`, masked comp rows are stamped as
     /// f16 -INFINITY in the score buffer — softmax converts to zero
     /// weight downstream.
+    ///
+    /// `comp_kv_batch_stride` (rows): `0` = legacy shared comp_kv (all batches
+    /// read the same row 0..n_comp). `>0` = per-batch comp_kv (batch b reads
+    /// rows starting at `b * comp_kv_batch_stride`). Pairs with the CSA
+    /// gather path where `comp_kv` is `active_comp_kv[B, top_k, head_dim]`
+    /// and `comp_kv_batch_stride = top_k` — score kernel then reads only the
+    /// gathered top-K dense rows per batch instead of doing per-row mask
+    /// tests on the full sparse set.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_score_batched_htiled_wmma_f16s(
         &self,
@@ -579,6 +587,7 @@ impl AttentionMixed {
         head_dim: u32,
         n_total_max: u32,
         batch: u32,
+        comp_kv_batch_stride: u32,
     ) -> eyre::Result<()> {
         if batch == 0 || n_total_max == 0 {
             return Ok(());
@@ -607,7 +616,8 @@ impl AttentionMixed {
             scores_g.raw(), q.raw(), raw_kv.raw(), comp_kv_ptr,
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
             mask_ptr, max_keys_words,
-            n_head, head_dim, ATTN_MIXED_MAX_KEYS, kq_scale
+            n_head, head_dim, ATTN_MIXED_MAX_KEYS, kq_scale,
+            comp_kv_batch_stride
         ])
     }
 
@@ -693,6 +703,10 @@ impl AttentionMixed {
     /// `launch_score_batched_htiled_wmma_f16s` (writes f16 scores). Cuts
     /// the Phase A score-DRAM stall (~28% of stall pre-fix) by halving
     /// scores buffer bytes.
+    ///
+    /// `comp_kv_batch_stride` (rows): same semantics as the score launcher.
+    /// `0` = legacy shared comp_kv; `>0` = per-batch comp_kv at offset
+    /// `b * comp_kv_batch_stride * head_dim`. Pairs with CSA gather.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(
         &self,
@@ -710,6 +724,7 @@ impl AttentionMixed {
         n_head: u32,
         head_dim: u32,
         batch: u32,
+        comp_kv_batch_stride: u32,
     ) -> eyre::Result<()> {
         if batch == 0 {
             return Ok(());
@@ -727,7 +742,7 @@ impl AttentionMixed {
         launch_kernel!(function, cfg, stream, [
             out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
-            n_head, head_dim, ATTN_MIXED_MAX_KEYS
+            n_head, head_dim, ATTN_MIXED_MAX_KEYS, comp_kv_batch_stride
         ])
     }
 

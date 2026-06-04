@@ -878,7 +878,12 @@ extern "C" __global__ void attention_mixed_score_batched_htiled_wmma_f16s(
         unsigned int     n_head,
         unsigned int     head_dim,
         unsigned int     max_keys,
-        float            kq_scale) {
+        float            kq_scale,
+        // 0 = legacy shared comp_kv (n_comp rows total). >0 = per-batch
+        // active_comp_kv, where batch b's rows live at offset
+        // b * comp_kv_batch_stride * head_dim. Pairs with the CSA
+        // gather → sparse-attention path.
+        unsigned int     comp_kv_batch_stride) {
     const unsigned int b    = blockIdx.z;
     const unsigned int tid  = threadIdx.x;
     const unsigned int warp = tid >> 5;
@@ -893,11 +898,12 @@ extern "C" __global__ void attention_mixed_score_batched_htiled_wmma_f16s(
     const unsigned int kh   = (lane >> 4) * 8u;
     const unsigned int bkey = n0 + col;
     const unsigned int n_kc = head_dim / 16u;
+    const size_t comp_kv_b_off = (size_t)b * comp_kv_batch_stride;
     const _Float16 *brow = nullptr;
     if (bkey < n_total) {
         brow = (bkey < n_raw)
             ? raw_kv + (size_t)(bkey + raw_off) * head_dim
-            : comp_kv + (size_t)(bkey - n_raw) * head_dim;
+            : comp_kv + (comp_kv_b_off + (bkey - n_raw)) * head_dim;
     }
     // CSA mask: per-(b, comp_row) bit test, hoisted out of the m-tile
     // loop since it depends only on (b, bkey) not on the head tile.
@@ -2275,7 +2281,10 @@ extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled_wmma_ldsv
         const int      * n_comp_per,
         unsigned int     n_head,
         unsigned int     head_dim,
-        unsigned int     max_keys) {
+        unsigned int     max_keys,
+        // 0 = legacy shared comp_kv. >0 = per-batch active_comp_kv, where
+        // batch b's rows live at offset b * comp_kv_batch_stride * head_dim.
+        unsigned int     comp_kv_batch_stride) {
     const unsigned int hg    = blockIdx.x;
     const unsigned int b     = blockIdx.y;
     const unsigned int tid   = threadIdx.x;
@@ -2287,6 +2296,9 @@ extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled_wmma_ldsv
     const unsigned int raw_off= (unsigned int)n_raw_offset_per[b];
     const unsigned int n_comp = (unsigned int)n_comp_per[b];
     const unsigned int n_total = n_raw + n_comp;
+    const _Float16 * comp_kv_b = (comp_kv && comp_kv_batch_stride != 0u)
+        ? comp_kv + (size_t)b * comp_kv_batch_stride * head_dim
+        : comp_kv;
 
     __shared__ float    s_inv[SMWSUM_HEAD_TILE];
     __shared__ _Float16 v_lds[16 * 512];  // 16 KB
@@ -2400,11 +2412,11 @@ extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled_wmma_ldsv
     }
 
     // --- comp section ---
-    if (comp_kv) {
+    if (comp_kv_b) {
         unsigned int c = 0;
         for (; c + 16u <= n_comp; c += 16u) {
             __syncthreads();
-            stage_v(comp_kv, c, 16u);
+            stage_v(comp_kv_b, c, 16u);
             __syncthreads();
             half8 a, ba, bb;
             #pragma unroll
@@ -2419,7 +2431,7 @@ extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled_wmma_ldsv
         }
         if (c < n_comp) {
             __syncthreads();
-            stage_v(comp_kv, c, n_comp - c);
+            stage_v(comp_kv_b, c, n_comp - c);
             __syncthreads();
             half8 a = {0,0,0,0,0,0,0,0}, ba = {0,0,0,0,0,0,0,0}, bb = {0,0,0,0,0,0,0,0};
             #pragma unroll

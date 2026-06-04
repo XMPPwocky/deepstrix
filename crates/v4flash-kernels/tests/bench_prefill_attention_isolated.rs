@@ -252,6 +252,7 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
                 n_head,
                 head_dim,
                 batch,
+                0,
             )?;
         }
         if do_smwsum_ldsv_db {
@@ -482,6 +483,7 @@ fn prefill_attention_htiled_offset_oracle() -> eyre::Result<()> {
             head_dim,
             n_total_max,
             batch,
+            0,
         )?;
         attn.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(
             &stream,
@@ -496,6 +498,7 @@ fn prefill_attention_htiled_offset_oracle() -> eyre::Result<()> {
             n_head,
             head_dim,
             batch,
+            0,
         )?;
     } else {
         attn.launch_score_batched_htiled_wmma(

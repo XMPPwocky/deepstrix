@@ -540,6 +540,52 @@ impl IndexerGather {
             active_comp_kv.raw(), comp_kv.raw(), selected.raw(), top_k, head_dim
         ])
     }
+
+    /// Batched variant: one launch covers `batch` tokens. Per-batch
+    /// selected indices at stride `top_k`; per-batch destination strides
+    /// `top_k * head_dim`. `comp_kv` is shared across the batch (the layer's
+    /// single main compressor). Sentinel slots (selected[bi, i] == -1) are
+    /// skipped; downstream attention must respect per-token n_comp_per ≤ top_k.
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        active_comp_kv_b: &mut DeviceBuffer<u16>,
+        comp_kv: &DeviceBuffer<u16>,
+        selected_b: &DeviceBuffer<i32>,
+        top_k: u32,
+        head_dim: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || top_k == 0 || head_dim == 0 {
+            return Ok(());
+        }
+        let need = (batch as usize) * (top_k as usize) * (head_dim as usize);
+        if active_comp_kv_b.len() < need {
+            return Err(eyre!(
+                "indexer_gather_batched: active_comp_kv_b has {} f16, need {} (B={batch})",
+                active_comp_kv_b.len(),
+                need
+            ));
+        }
+        if selected_b.len() < (batch as usize) * (top_k as usize) {
+            return Err(eyre!(
+                "indexer_gather_batched: selected_b too small (have {}, need {})",
+                selected_b.len(),
+                (batch as usize) * (top_k as usize)
+            ));
+        }
+        let function = self.module.get_function("indexer_gather_batched")?;
+        const BLOCK: u32 = 256;
+        let dim_blocks = (head_dim + BLOCK - 1) / BLOCK;
+        let cfg = LaunchConfig {
+            grid: (top_k, batch, dim_blocks),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            active_comp_kv_b.raw(), comp_kv.raw(), selected_b.raw(), top_k, head_dim
+        ])
+    }
 }
 
 /// In-place scalar multiply on an f32 device buffer.

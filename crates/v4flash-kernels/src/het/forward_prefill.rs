@@ -1436,7 +1436,7 @@ impl HeterogeneousEngine {
             let need_mask = ratio == 4
                 && ls.indexer_compressor.is_some()
                 && n_comp_after.iter().any(|&v| v > INDEXER_TOP_K);
-            let comp_allowed_bits: Option<&DeviceBuffer<u32>> = if need_mask {
+            let indexer_fired = if need_mask {
                 let _t_ix = de.events.stage("dgpu.prefill_indexer", &de.compute)?;
                 let iw = dlw.indexer.as_ref().ok_or_else(|| {
                     eyre!("L{layer}: ratio==4 mask needed but no indexer weights")
@@ -1542,11 +1542,57 @@ impl HeterogeneousEngine {
                         b,
                     )?;
                 }
+                // Gather selected rows from the MAIN compressor's comp_kv
+                // (head_dim=512) into a dense per-batch buffer. Attention
+                // then reads only top-K rows per token instead of doing
+                // dense reads with a -INF mask — 15× DRAM/WMMA savings on
+                // both score and smwsum at depth 32K.
+                {
+                    let _t = de.events.stage("k.indexer.gather", &de.compute)?;
+                    let cs_ref = ls
+                        .compressor
+                        .as_ref()
+                        .ok_or_else(|| eyre!("L{layer}: missing compressor state for gather"))?;
+                    de.indexer_gather.launch_batched(
+                        &de.compute,
+                        &mut bd.attn_active_comp_kv,
+                        &cs_ref.comp_kv,
+                        &bd.indexer_selected,
+                        INDEXER_TOP_K,
+                        N_HEAD_DIM,
+                        b,
+                    )?;
+                }
+                // Re-upload sparse n_comp_per (= min(actual, INDEXER_TOP_K))
+                // so score+smwsum iterate only over the gathered top-K rows.
+                {
+                    let sparse_n_comp_host: Vec<i32> = n_comp_after
+                        .iter()
+                        .map(|&v| v.min(INDEXER_TOP_K) as i32)
+                        .collect();
+                    let mut ncp_v = bd.n_comp_per.slice_view_mut(0, b as usize);
+                    ncp_v.copy_from_host_async(&sparse_n_comp_host, &de.compute)?;
+                }
                 let _ = pos0; // pos consumed via pos_per_b
                 _t_ix.end()?;
-                Some(&bd.attn_comp_allowed_bits)
+                true
             } else {
-                None
+                false
+            };
+
+            // Sparse-attn switch: when indexer fired, attention reads
+            // active_comp_kv (per-batch dense top-K) instead of the
+            // 8K+-row dense comp_kv. Score+smwsum get a per-batch stride;
+            // the bitmask path becomes unused. n_total_max collapses to
+            // raw_window + INDEXER_TOP_K.
+            let (eff_comp_kv_buf, eff_n_total_max, eff_comp_kv_batch_stride):
+                (Option<&DeviceBuffer<u16>>, u32, u32) = if indexer_fired {
+                let sparse_max = n_raw_after.iter().zip(n_comp_after.iter())
+                    .map(|(&r, &c)| r + c.min(INDEXER_TOP_K))
+                    .max().unwrap_or(0);
+                (Some(&bd.attn_active_comp_kv), sparse_max, INDEXER_TOP_K)
+            } else {
+                (comp_kv_buf, n_total_max, 0u32)
             };
 
             let fused = std::env::var_os("ATTN_FUSED").is_some();
@@ -1559,13 +1605,13 @@ impl HeterogeneousEngine {
                         &mut bd.attn_scores,
                         &bd.q_normed,
                         &ls.kv_cache,
-                        comp_kv_buf,
+                        eff_comp_kv_buf,
                         &nrp_view,
                         &nrop_view,
                         &ncp_view,
                         N_HEAD,
                         N_HEAD_DIM,
-                        n_total_max,
+                        eff_n_total_max,
                         b,
                     )?;
                 } else {
@@ -1574,15 +1620,16 @@ impl HeterogeneousEngine {
                         &mut bd.attn_scores,
                         &bd.q_normed,
                         &ls.kv_cache,
-                        comp_kv_buf,
+                        eff_comp_kv_buf,
                         &nrp_view,
                         &nrop_view,
                         &ncp_view,
-                        comp_allowed_bits,
+                        None, // gather handles sparsity; no -INF mask needed
                         N_HEAD,
                         N_HEAD_DIM,
-                        n_total_max,
+                        eff_n_total_max,
                         b,
+                        eff_comp_kv_batch_stride,
                     )?;
                 }
             }
@@ -1605,13 +1652,13 @@ impl HeterogeneousEngine {
                         &bd.q_normed,
                         &dlw.attn_sinks,
                         &ls.kv_cache,
-                        comp_kv_buf,
+                        eff_comp_kv_buf,
                         &nrp_view,
                         &nrop_view,
                         &ncp_view,
                         N_HEAD,
                         N_HEAD_DIM,
-                        n_total_max,
+                        eff_n_total_max,
                         b,
                     )?;
                 } else if f32_scores {
@@ -1621,7 +1668,7 @@ impl HeterogeneousEngine {
                         &mut bd.attn_scores,
                         &dlw.attn_sinks,
                         &ls.kv_cache,
-                        comp_kv_buf,
+                        eff_comp_kv_buf,
                         &nrp_view,
                         &nrop_view,
                         &ncp_view,
@@ -1636,13 +1683,14 @@ impl HeterogeneousEngine {
                         &mut bd.attn_scores,
                         &dlw.attn_sinks,
                         &ls.kv_cache,
-                        comp_kv_buf,
+                        eff_comp_kv_buf,
                         &nrp_view,
                         &nrop_view,
                         &ncp_view,
                         N_HEAD,
                         N_HEAD_DIM,
                         b,
+                        eff_comp_kv_batch_stride,
                     )?;
                 }
             }

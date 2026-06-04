@@ -224,6 +224,13 @@ pub struct BatchDgpuScratch {
     pub indexer_topk_scratch: DeviceBuffer<u32>,
     /// `[B]` — per-token n_index_comp uploaded once per ratio==4 layer.
     pub n_index_comp_per_b: DeviceBuffer<u32>,
+    /// `[B, INDEXER_TOP_K, N_HEAD_DIM]` f16 — per-batch gathered comp_kv
+    /// rows for the CSA sparse-attention path. Populated by
+    /// `IndexerGather::launch_batched` when the indexer fires. Passed to
+    /// score+smwsum with `comp_kv_batch_stride = INDEXER_TOP_K` so the
+    /// kernels read only the dense top-K rows per batch instead of doing
+    /// per-row mask tests on the full sparse n_comp. ~256 MB at B_MAX=512.
+    pub attn_active_comp_kv: DeviceBuffer<u16>,
     pub low: DeviceBuffer<f32>,
     pub heads_xq: DeviceBuffer<i8>,
     pub heads_xscale: DeviceBuffer<f32>,
@@ -451,6 +458,9 @@ impl BatchDgpuScratch {
                 )?
             },
             n_index_comp_per_b: DeviceBuffer::new(id, b)?,
+            attn_active_comp_kv: mk_u16(
+                (crate::config::INDEXER_TOP_K * crate::config::N_HEAD_DIM) as usize,
+            )?,
             low: mk_f32(OUT_LOW as usize)?,
             heads_xq: mk_i8(Q_FLAT as usize)?,
             heads_xscale: mk_f32(BLOCKS_GROUPED_OUT as usize)?,
