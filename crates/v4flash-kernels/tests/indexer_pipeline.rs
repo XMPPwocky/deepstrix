@@ -422,11 +422,12 @@ fn indexer_pipeline_oracle() -> eyre::Result<()> {
     // written when the dump finishes. For partial / mid-prefill dumps fall
     // back to scanning the entries for the max token id, optionally capped
     // via the MAX_TOKEN env var.
-    let mut n_tokens = dump.n_logit_rows as i32;
-    if n_tokens == 0 {
-        n_tokens = dump.entries().map(|e| e.token).max().unwrap_or(-1) + 1;
-        eprintln!("(partial dump) inferred n_tokens = {n_tokens}");
-    }
+    // n_logit_rows only counts decode tokens (1 in our long-prompt
+    // dump where N_TOKENS=1 was passed); the per-layer activation
+    // entries cover all prefill tokens too. Scan entries for the true
+    // coverage.
+    let entries_max = dump.entries().map(|e| e.token).max().unwrap_or(-1) + 1;
+    let mut n_tokens = entries_max.max(dump.n_logit_rows as i32);
     if let Ok(cap) = std::env::var("MAX_TOKEN") {
         if let Ok(c) = cap.parse::<i32>() {
             n_tokens = n_tokens.min(c);

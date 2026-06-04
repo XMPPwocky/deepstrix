@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
-use v4flash_kernels::{IndexerTopk, INDEXER_TOP_K};
+use v4flash_kernels::{IndexerTopk, IndexerTopkBitonic, INDEXER_TOP_K};
 
 fn pick_dgpu() -> eyre::Result<Device> {
     for d in Device::all()? {
@@ -80,9 +80,39 @@ fn bench_indexer_topk_isolated() -> eyre::Result<()> {
     let per_call_us = elapsed.as_micros() as f64 / iters as f64;
 
     eprintln!(
-        "BENCH IndexerTopk n_comp={n_comp} K={top_k}: {iters} iters in {:.2}ms = {:.2}us/call",
+        "BENCH IndexerTopk (greedy)  n_comp={n_comp} K={top_k}: {iters} iters in {:.2}ms = {:.2}us/call",
         elapsed.as_secs_f64() * 1000.0,
         per_call_us
+    );
+
+    // --- Bitonic variant ---
+    let kernel_b = IndexerTopkBitonic::for_arch(&arch)?;
+    let max_chunks = (n_comp + 4095) / 4096;
+    let mut d_scratch: DeviceBuffer<u32> =
+        DeviceBuffer::new(dgpu.id, (max_chunks * top_k).max(1) as usize)?;
+    let launch_b = |stream: &Stream,
+                    d_selected: &mut DeviceBuffer<i32>,
+                    d_bits: &mut DeviceBuffer<u32>,
+                    d_scratch: &mut DeviceBuffer<u32>|
+     -> eyre::Result<()> {
+        kernel_b.launch(stream, d_selected, d_bits, d_scratch, &d_scores, n_comp, top_k)
+    };
+    for _ in 0..warmup {
+        launch_b(&stream, &mut d_selected, &mut d_bits, &mut d_scratch)?;
+    }
+    stream.synchronize()?;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        launch_b(&stream, &mut d_selected, &mut d_bits, &mut d_scratch)?;
+    }
+    stream.synchronize()?;
+    let elapsed_b = t0.elapsed();
+    let per_call_us_b = elapsed_b.as_micros() as f64 / iters as f64;
+    eprintln!(
+        "BENCH IndexerTopk (bitonic) n_comp={n_comp} K={top_k}: {iters} iters in {:.2}ms = {:.2}us/call  ({:.1}× speedup)",
+        elapsed_b.as_secs_f64() * 1000.0,
+        per_call_us_b,
+        per_call_us / per_call_us_b,
     );
 
     Ok(())

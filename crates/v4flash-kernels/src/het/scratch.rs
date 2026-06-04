@@ -105,6 +105,11 @@ pub struct DgpuScratch {
     pub indexer_scores: DeviceBuffer<f32>,       // [ATTN_MIXED_MAX_KEYS]
     pub indexer_selected: DeviceBuffer<i32>,     // [INDEXER_TOP_K]
     pub indexer_allowed_bits: DeviceBuffer<u32>, // [ceil(ATTN_MIXED_MAX_KEYS/32)]
+    /// Scratch for the bitonic IndexerTopk's per-chunk candidates.
+    /// Sized for the worst case: ceil(ATTN_MIXED_MAX_KEYS/4096) chunks
+    /// × INDEXER_TOP_K candidates per chunk = up to 6 × 512 = 3072 u32
+    /// at ATTN_MIXED_MAX_KEYS=24576.
+    pub indexer_topk_scratch: DeviceBuffer<u32>,
     pub active_comp_kv: DeviceBuffer<u16>,       // [INDEXER_TOP_K * N_HEAD_DIM]
 
     // Shared expert
@@ -221,6 +226,10 @@ impl DgpuScratch {
                 device_id,
                 ((ATTN_MIXED_MAX_KEYS + 31) / 32) as usize,
             )?,
+            indexer_topk_scratch: {
+                let max_chunks = (ATTN_MIXED_MAX_KEYS + 4095) / 4096;
+                DeviceBuffer::new(device_id, (max_chunks * INDEXER_TOP_K) as usize)?
+            },
             active_comp_kv: DeviceBuffer::new(
                 device_id,
                 (INDEXER_TOP_K * N_HEAD_DIM) as usize,

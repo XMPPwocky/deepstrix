@@ -24,7 +24,7 @@
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
-use v4flash_kernels::{IndexerTopk, INDEXER_TOP_K};
+use v4flash_kernels::{IndexerTopk, IndexerTopkBitonic, INDEXER_TOP_K};
 
 fn pick_device() -> eyre::Result<Device> {
     let devices = Device::all()?;
@@ -130,6 +130,78 @@ fn run_case(
     Ok(())
 }
 
+fn run_case_bitonic(
+    kernel: &IndexerTopkBitonic,
+    stream: &Stream,
+    device: Device,
+    label: &str,
+    scores: Vec<f32>,
+    top_k: u32,
+) -> eyre::Result<()> {
+    let n_comp = scores.len() as u32;
+    let (cpu_selected, cpu_allowed) = cpu_topk(&scores, top_k);
+
+    let mut d_scores: DeviceBuffer<f32> = DeviceBuffer::new(device.id, n_comp as usize)?;
+    d_scores.copy_from_host(&scores)?;
+
+    let mut d_selected: DeviceBuffer<i32> = DeviceBuffer::new(device.id, top_k as usize)?;
+    let n_words = ((n_comp + 31) / 32) as usize;
+    let mut d_bits: DeviceBuffer<u32> = DeviceBuffer::new(device.id, n_words)?;
+    // Scratch sized for the worst case (n_comp/4096 chunks × top_k).
+    let max_chunks = (n_comp + 4095) / 4096;
+    let mut d_scratch: DeviceBuffer<u32> =
+        DeviceBuffer::new(device.id, (max_chunks * top_k).max(1) as usize)?;
+
+    kernel.launch(
+        stream,
+        &mut d_selected,
+        &mut d_bits,
+        &mut d_scratch,
+        &d_scores,
+        n_comp,
+        top_k,
+    )?;
+    stream.synchronize()?;
+
+    let mut got_selected = vec![0i32; top_k as usize];
+    let mut got_bits = vec![0u32; n_words];
+    d_selected.copy_to_host(&mut got_selected)?;
+    d_bits.copy_to_host(&mut got_bits)?;
+
+    let mut sel_mismatches = 0usize;
+    for k in 0..(top_k as usize) {
+        if got_selected[k] != cpu_selected[k] {
+            if sel_mismatches < 5 {
+                eprintln!(
+                    "  [{label}] selected[{k}]: gpu={} cpu={} (gpu score={}, cpu score={})",
+                    got_selected[k],
+                    cpu_selected[k],
+                    if got_selected[k] >= 0 { scores[got_selected[k] as usize] } else { 0.0 },
+                    if cpu_selected[k] >= 0 { scores[cpu_selected[k] as usize] } else { 0.0 },
+                );
+            }
+            sel_mismatches += 1;
+        }
+    }
+    let mut bit_mismatches = 0usize;
+    for c in 0..(n_comp as usize) {
+        let gpu_bit = (got_bits[c >> 5] >> (c & 31)) & 1u32 != 0;
+        if gpu_bit != cpu_allowed[c] {
+            bit_mismatches += 1;
+        }
+    }
+
+    eprintln!(
+        "[{label}] n_comp={n_comp} top_k={top_k}: selected mismatches={sel_mismatches}/{top_k}, bit mismatches={bit_mismatches}/{n_comp}"
+    );
+    if sel_mismatches != 0 || bit_mismatches != 0 {
+        return Err(eyre!(
+            "[{label}] mismatch: selected={sel_mismatches} bits={bit_mismatches}"
+        ));
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore]
 fn indexer_topk_synthetic() -> eyre::Result<()> {
@@ -191,6 +263,43 @@ fn indexer_topk_synthetic() -> eyre::Result<()> {
         let n_comp = 256 * 128u32;
         let scores: Vec<f32> = (0..n_comp).map(|i| (i / 128) as f32 * 0.01).collect();
         run_case(&kernel, &stream, device, "clustered-ties", scores, top_k)?;
+    }
+
+    // --- Bitonic variant: same cases, must match CPU exactly. ---
+    let kernel_b = IndexerTopkBitonic::for_arch(&arch)?;
+    {
+        let n_comp = 32 * 1024u32;
+        let mut seed = 0xdeadbeefu32;
+        let scores: Vec<f32> = (0..n_comp).map(|_| lcg_step(&mut seed)).collect();
+        run_case_bitonic(&kernel_b, &stream, device, "bit:random-32K", scores, top_k)?;
+    }
+    {
+        let n_comp = top_k + 1;
+        let mut seed = 0xcafef00du32;
+        let scores: Vec<f32> = (0..n_comp).map(|_| lcg_step(&mut seed)).collect();
+        run_case_bitonic(&kernel_b, &stream, device, "bit:boundary+1", scores, top_k)?;
+    }
+    {
+        let n_comp = top_k;
+        let mut seed = 0x1234abcdu32;
+        let scores: Vec<f32> = (0..n_comp).map(|_| lcg_step(&mut seed)).collect();
+        run_case_bitonic(&kernel_b, &stream, device, "bit:equal", scores, top_k)?;
+    }
+    {
+        let n_comp = 100u32;
+        let mut seed = 0xfeedfaceu32;
+        let scores: Vec<f32> = (0..n_comp).map(|_| lcg_step(&mut seed)).collect();
+        run_case_bitonic(&kernel_b, &stream, device, "bit:small", scores, top_k)?;
+    }
+    {
+        let n_comp = 2048u32;
+        let scores: Vec<f32> = vec![0.5f32; n_comp as usize];
+        run_case_bitonic(&kernel_b, &stream, device, "bit:all-tied", scores, top_k)?;
+    }
+    {
+        let n_comp = 256 * 128u32;
+        let scores: Vec<f32> = (0..n_comp).map(|i| (i / 128) as f32 * 0.01).collect();
+        run_case_bitonic(&kernel_b, &stream, device, "bit:clustered-ties", scores, top_k)?;
     }
 
     Ok(())

@@ -29,6 +29,11 @@ const INDEXER_TOPK_GFX1151: &[u8] = include_bytes!(env!("KERNEL_INDEXER_TOPK_GFX
 const INDEXER_GATHER_GFX1201: &[u8] = include_bytes!(env!("KERNEL_INDEXER_GATHER_GFX1201"));
 const INDEXER_GATHER_GFX1151: &[u8] = include_bytes!(env!("KERNEL_INDEXER_GATHER_GFX1151"));
 
+const INDEXER_TOPK_BITONIC_GFX1201: &[u8] =
+    include_bytes!(env!("KERNEL_INDEXER_TOPK_BITONIC_GFX1201"));
+const INDEXER_TOPK_BITONIC_GFX1151: &[u8] =
+    include_bytes!(env!("KERNEL_INDEXER_TOPK_BITONIC_GFX1151"));
+
 const VEC_SCALE_INPLACE_GFX1201: &[u8] = include_bytes!(env!("KERNEL_VEC_SCALE_INPLACE_GFX1201"));
 const VEC_SCALE_INPLACE_GFX1151: &[u8] = include_bytes!(env!("KERNEL_VEC_SCALE_INPLACE_GFX1151"));
 
@@ -220,6 +225,134 @@ impl IndexerTopk {
         };
         launch_kernel!(function, cfg, stream, [
             selected.raw(), allowed_bits.raw(), scores.raw(), n_comp, top_k
+        ])
+    }
+}
+
+/// Bitonic-sort variant of [`IndexerTopk`]. Ported from ds4's
+/// `indexer_topk_chunk_pow2_kernel` + `indexer_topk_merge_pow2_kernel`
+/// design. Same bit-exact tie-break:
+///
+///   better(a, b) := a.score > b.score
+///                || (a.score == b.score && a.idx < b.idx)
+///
+/// Dispatch:
+///   - `n_comp ≤ 4096`         → single `indexer_topk_bitonic_4096` WG
+///                               (no scratch).
+///   - `4096 < n_comp ≤ 24576` → `indexer_topk_chunk_4096` (one WG per
+///                               4096-element chunk, up to 6 chunks for
+///                               ATTN_MIXED_MAX_KEYS=24576) followed by
+///                               one `indexer_topk_merge_4096` WG that
+///                               bitonic-sorts the (n_chunks × top_k)
+///                               candidates and writes the final
+///                               selected[] + bitmap.
+///
+/// Self-zeroes `allowed_bits` so the API matches [`IndexerTopk`].
+pub struct IndexerTopkBitonic {
+    module: Module,
+}
+
+impl IndexerTopkBitonic {
+    pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            INDEXER_TOPK_BITONIC_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            INDEXER_TOPK_BITONIC_GFX1151
+        } else {
+            return Err(eyre!("unsupported arch for indexer_topk_bitonic: {arch}"));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    /// `selected[top_k]` i32 (sorted descending by score, sentinel -1
+    /// past the valid range). `allowed_bits[ceil(n_comp/32)]` u32
+    /// (self-zeroed by the kernel before bits are atomically OR'd in).
+    /// `scratch` must be sized for at least `n_chunks × top_k` u32
+    /// candidates; for ATTN_MIXED_MAX_KEYS=24576 and top_k=512, that's
+    /// 6 × 512 = 3072 u32 = 12 KB.
+    pub fn launch(
+        &self,
+        stream: &Stream,
+        selected: &mut DeviceBuffer<i32>,
+        allowed_bits: &mut DeviceBuffer<u32>,
+        scratch: &mut DeviceBuffer<u32>,
+        scores: &DeviceBuffer<f32>,
+        n_comp: u32,
+        top_k: u32,
+    ) -> eyre::Result<()> {
+        if n_comp == 0 {
+            return Err(eyre!("indexer_topk_bitonic: n_comp must be > 0"));
+        }
+        if top_k == 0 {
+            return Err(eyre!("indexer_topk_bitonic: top_k must be > 0"));
+        }
+        const SORT_N: u32 = 4096;
+        const BLOCK: u32 = 1024;
+        let needed_bits_words = ((n_comp + 31) / 32) as usize;
+        if allowed_bits.len() < needed_bits_words {
+            return Err(eyre!(
+                "indexer_topk_bitonic: allowed_bits has {} words, need {}",
+                allowed_bits.len(),
+                needed_bits_words
+            ));
+        }
+        if selected.len() < top_k as usize {
+            return Err(eyre!(
+                "indexer_topk_bitonic: selected has {} slots, need {}",
+                selected.len(),
+                top_k
+            ));
+        }
+
+        if n_comp <= SORT_N {
+            let function = self.module.get_function("indexer_topk_bitonic_4096")?;
+            let cfg = LaunchConfig {
+                grid: (1, 1, 1),
+                block: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            return launch_kernel!(function, cfg, stream, [
+                selected.raw(), allowed_bits.raw(), scores.raw(), n_comp, top_k
+            ]);
+        }
+
+        // Chunked path.
+        let n_chunks = (n_comp + SORT_N - 1) / SORT_N;
+        let n_candidates = n_chunks * top_k;
+        if n_candidates > SORT_N {
+            return Err(eyre!(
+                "indexer_topk_bitonic: n_candidates={n_candidates} exceeds merge cap {SORT_N} \
+                 (n_chunks={n_chunks}, top_k={top_k}). Multi-level tree merge not yet implemented."
+            ));
+        }
+        if scratch.len() < n_candidates as usize {
+            return Err(eyre!(
+                "indexer_topk_bitonic: scratch has {} u32, need {}",
+                scratch.len(),
+                n_candidates
+            ));
+        }
+
+        let chunk_fn = self.module.get_function("indexer_topk_chunk_4096")?;
+        let chunk_cfg = LaunchConfig {
+            grid: (n_chunks, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(chunk_fn, chunk_cfg, stream, [
+            scratch.raw(), scores.raw(), n_comp, top_k
+        ])?;
+
+        let merge_fn = self.module.get_function("indexer_topk_merge_4096")?;
+        let merge_cfg = LaunchConfig {
+            grid: (1, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(merge_fn, merge_cfg, stream, [
+            selected.raw(), allowed_bits.raw(), scratch.raw(), scores.raw(),
+            n_comp, top_k, n_candidates
         ])
     }
 }

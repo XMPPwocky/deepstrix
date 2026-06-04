@@ -220,6 +220,9 @@ pub struct BatchDgpuScratch {
     /// `[INDEXER_TOP_K]` — per-token IndexerTopk output (selected
     /// indices, sentinel -1 in unused slots). Reused per token.
     pub indexer_selected: DeviceBuffer<i32>,
+    /// Scratch for the bitonic IndexerTopk's per-chunk candidates.
+    /// Single-token sized; reused sequentially.
+    pub indexer_topk_scratch: DeviceBuffer<u32>,
     pub low: DeviceBuffer<f32>,
     pub heads_xq: DeviceBuffer<i8>,
     pub heads_xscale: DeviceBuffer<f32>,
@@ -436,6 +439,10 @@ impl BatchDgpuScratch {
             // tokens' IndexerScore + IndexerTopk launches. 96 KB + 2 KB.
             indexer_scores: DeviceBuffer::new(id, ATTN_MIXED_MAX_KEYS as usize)?,
             indexer_selected: DeviceBuffer::new(id, crate::config::INDEXER_TOP_K as usize)?,
+            indexer_topk_scratch: {
+                let max_chunks = (ATTN_MIXED_MAX_KEYS + 4095) / 4096;
+                DeviceBuffer::new(id, (max_chunks * crate::config::INDEXER_TOP_K) as usize)?
+            },
             low: mk_f32(OUT_LOW as usize)?,
             heads_xq: mk_i8(Q_FLAT as usize)?,
             heads_xscale: mk_f32(BLOCKS_GROUPED_OUT as usize)?,

@@ -716,11 +716,14 @@ impl HeterogeneousEngine {
                         N_INDEXER_HEAD_DIM,
                     )?;
                 }
-                // 6. IndexerTopk → sorted indices + bitmap.
-                de.indexer_topk.launch(
+                // 6. IndexerTopk → sorted indices + bitmap. The bitonic
+                // variant (ported from ds4) is 72× faster than the
+                // greedy fallback at n_comp=16384.
+                de.indexer_topk_bitonic.launch(
                     &de.compute,
                     &mut dgpu_scratch.indexer_selected,
                     &mut dgpu_scratch.indexer_allowed_bits,
+                    &mut dgpu_scratch.indexer_topk_scratch,
                     &dgpu_scratch.indexer_scores,
                     n_index_comp,
                     INDEXER_TOP_K,

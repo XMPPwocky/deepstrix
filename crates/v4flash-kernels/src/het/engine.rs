@@ -128,6 +128,9 @@ pub struct DeviceEngine {
     /// at production decode shape).
     pub indexer_score_wmma: Option<crate::IndexerScoreWmma>,
     pub indexer_topk: crate::IndexerTopk,
+    /// Bitonic-sort IndexerTopk variant (ported from ds4). 72× faster
+    /// at n_comp=16384 than the greedy fallback. Always available.
+    pub indexer_topk_bitonic: crate::IndexerTopkBitonic,
     pub indexer_gather: crate::IndexerGather,
     pub indexer_bitpack: crate::IndexerBitpack,
     pub vec_scale: crate::VecScaleInplace,
@@ -191,6 +194,7 @@ impl DeviceEngine {
                 None
             },
             indexer_topk: crate::IndexerTopk::for_arch(arch)?,
+            indexer_topk_bitonic: crate::IndexerTopkBitonic::for_arch(arch)?,
             indexer_gather: crate::IndexerGather::for_arch(arch)?,
             indexer_bitpack: crate::IndexerBitpack::for_arch(arch)?,
             vec_scale: crate::VecScaleInplace::for_arch(arch)?,
