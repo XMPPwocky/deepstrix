@@ -13,8 +13,9 @@ use v4flash_hip::{Device, DeviceBuffer};
 
 use crate::config::{
     BLOCKS_GROUPED_OUT, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
-    BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED,
-    N_FF_EXP, N_FF_SHARED, N_HC, N_HEAD, N_HEAD_DIM, N_LORA_Q, N_VOCAB, OUT_LOW, Q_FLAT,
+    BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, HC_DIM, HC_MIX_DIM, INDEXER_TOP_K, N_EMBD, N_EXPERT,
+    N_EXPERT_USED, N_FF_EXP, N_FF_SHARED, N_HC, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD,
+    N_INDEXER_HEAD_DIM, N_LORA_Q, N_VOCAB, OUT_LOW, Q_FLAT,
 };
 use crate::attention::ATTN_MIXED_MAX_KEYS;
 use crate::q8_k::BLOCK_Q8_K_BYTES;
@@ -95,6 +96,16 @@ pub struct DgpuScratch {
     pub sc_cur: DeviceBuffer<f32>,
     pub pooled: DeviceBuffer<f32>,
     pub comp_row: DeviceBuffer<f32>,
+
+    // CSA indexer scratch (used only on ratio==4 layers with
+    // n_index_comp > INDEXER_TOP_K; otherwise the entire indexer pipeline
+    // short-circuits via ds4's early-permit and these buffers are untouched).
+    pub indexer_q: DeviceBuffer<f32>,            // [64 * 128]
+    pub indexer_head_weights: DeviceBuffer<f32>, // [64]
+    pub indexer_scores: DeviceBuffer<f32>,       // [ATTN_MIXED_MAX_KEYS]
+    pub indexer_selected: DeviceBuffer<i32>,     // [INDEXER_TOP_K]
+    pub indexer_allowed_bits: DeviceBuffer<u32>, // [ceil(ATTN_MIXED_MAX_KEYS/32)]
+    pub active_comp_kv: DeviceBuffer<u16>,       // [INDEXER_TOP_K * N_HEAD_DIM]
 
     // Shared expert
     pub gate_sh: DeviceBuffer<f32>,
@@ -198,6 +209,22 @@ impl DgpuScratch {
             sc_cur: DeviceBuffer::new(device_id, (2 * N_HEAD_DIM) as usize)?,
             pooled: DeviceBuffer::new(device_id, N_HEAD_DIM as usize)?,
             comp_row: DeviceBuffer::new(device_id, N_HEAD_DIM as usize)?,
+
+            indexer_q: DeviceBuffer::new(
+                device_id,
+                (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize,
+            )?,
+            indexer_head_weights: DeviceBuffer::new(device_id, N_INDEXER_HEAD as usize)?,
+            indexer_scores: DeviceBuffer::new(device_id, ATTN_MIXED_MAX_KEYS as usize)?,
+            indexer_selected: DeviceBuffer::new(device_id, INDEXER_TOP_K as usize)?,
+            indexer_allowed_bits: DeviceBuffer::new(
+                device_id,
+                ((ATTN_MIXED_MAX_KEYS + 31) / 32) as usize,
+            )?,
+            active_comp_kv: DeviceBuffer::new(
+                device_id,
+                (INDEXER_TOP_K * N_HEAD_DIM) as usize,
+            )?,
 
             gate_sh: DeviceBuffer::new(device_id, N_FF_SHARED as usize)?,
             up_sh: DeviceBuffer::new(device_id, N_FF_SHARED as usize)?,

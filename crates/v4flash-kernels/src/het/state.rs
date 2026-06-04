@@ -7,7 +7,7 @@
 use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer};
 
-use crate::config::{COMPRESS_RATIOS, N_HEAD_DIM, N_LAYER, NEG_INF, SWA_WINDOW};
+use crate::config::{COMPRESS_RATIOS, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, NEG_INF, SWA_WINDOW};
 use crate::het::batch_scratch::B_MAX;
 
 /// During batched prefill we need to hold the prior SWA-window AND the
@@ -79,6 +79,11 @@ pub struct HetLayerState {
     pub kv_cache: DeviceBuffer<u16>,
     pub n_raw: u32,
     pub compressor: Option<HetCompressorState>,
+    /// CSA indexer's parallel compressor (head_dim=128 vs main's 512).
+    /// Only present at ratio==4 layers. Layout / lifecycle mirror the
+    /// main compressor exactly; `n_comp` here is what ds4 calls
+    /// `cache->n_index_comp`.
+    pub indexer_compressor: Option<HetCompressorState>,
 }
 
 pub struct HetModelState {
@@ -101,6 +106,16 @@ impl HetModelState {
         for layer in &mut self.layers {
             layer.n_raw = 0;
             if let Some(comp) = &mut layer.compressor {
+                comp.n_comp = 0;
+                let n_state = comp.state_kv.len();
+                let zeros = vec![0f32; n_state];
+                let neg_inf = vec![NEG_INF; n_state];
+                igpu_device.set_current()?;
+                comp.state_kv.copy_from_host(&zeros)?;
+                comp.state_score.copy_from_host(&neg_inf)?;
+            }
+            // Indexer compressor (ratio==4 only) uses the same reset shape.
+            if let Some(comp) = &mut layer.indexer_compressor {
                 comp.n_comp = 0;
                 let n_state = comp.state_kv.len();
                 let zeros = vec![0f32; n_state];
@@ -135,6 +150,20 @@ impl HetModelState {
             } else {
                 None
             };
+            // CSA indexer compressor — second compressor with head_dim=128,
+            // only on ratio==4 layers. State layout / lifecycle identical to
+            // the main compressor; allocator reused via head_dim parameter.
+            let indexer_compressor = if ratio == 4 {
+                Some(HetCompressorState::alloc(
+                    dgpu_device,
+                    dgpu_device,
+                    ratio,
+                    N_INDEXER_HEAD_DIM,
+                    n_kv_max,
+                )?)
+            } else {
+                None
+            };
             // Raw KV cache is sized SWA_WINDOW + B_MAX rows. The first
             // SWA_WINDOW slots hold the steady-state SWA-window contents
             // (which is all that decode/single-token attention sees).
@@ -153,6 +182,7 @@ impl HetModelState {
                 )?,
                 n_raw: 0,
                 compressor,
+                indexer_compressor,
             });
         }
         Ok(Self {

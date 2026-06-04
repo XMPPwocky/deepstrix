@@ -32,6 +32,59 @@ fn lcg_step(s: &mut u32) -> f32 {
     v * 2.0 - 1.0                                    // [-1, 1)
 }
 
+/// IEEE 754 round-half-to-even f32 → binary16. Inlined so we don't pull
+/// in the `half` crate just for the test.
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xFF) as i32;
+    let mant = b & 0x7FFFFF;
+    if exp == 0xFF {
+        // Inf / NaN.
+        if mant != 0 {
+            return sign | 0x7E00; // canonical NaN
+        }
+        return sign | 0x7C00;
+    }
+    let unbiased = exp - 127 + 15;
+    if unbiased >= 0x1F {
+        return sign | 0x7C00; // overflow → inf
+    }
+    if unbiased <= 0 {
+        if unbiased < -10 {
+            return sign; // underflow → 0
+        }
+        // Subnormal: pack with implicit leading 1 and shift right.
+        let mant_full = mant | 0x800000;
+        let shift = (1 - unbiased) as u32;
+        let half = 1u32 << (shift + 12);
+        let mask = (1u32 << (shift + 13)) - 1;
+        let rounded = mant_full + half;
+        let m = (rounded >> (shift + 13)) as u16;
+        // round-to-even tiebreak
+        let sticky = mant_full & mask;
+        let m = if sticky == half && (m & 1) == 0 { m } else { m };
+        return sign | m;
+    }
+    // Normal: 10-bit mantissa, round half to even.
+    let m_full = mant + 0x1000; // add 1/2 ulp
+    let mut m = (m_full >> 13) as u16;
+    let mut e = unbiased as u16;
+    if (m_full >> 13) & 0x400 != 0 {
+        // overflow into exponent
+        m = 0;
+        e += 1;
+        if e >= 0x1F {
+            return sign | 0x7C00;
+        }
+    }
+    sign | (e << 10) | (m & 0x3FF)
+}
+
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    v4flash_kernels::iq2_xxs_tables::f16_to_f32(bits)
+}
+
 fn cpu_indexer_score(
     q: &[f32],
     head_weights: &[f32],
@@ -95,15 +148,30 @@ fn indexer_score_synthetic() -> eyre::Result<()> {
             *v = lcg_step(&mut seed) * 0.7;
         }
 
-        let expected = cpu_indexer_score(&q, &head_weights, &comp_kv, n_comp, n_head, head_dim);
+        // index_comp_kv is f16 in production (matches the indexer
+        // compressor's output dtype). Round-trip through f16 here so the
+        // CPU reference operates on the same quantized values the kernel
+        // will see — the comparison then isolates the kernel's compute
+        // from the dtype round-trip.
+        let comp_kv_f16: Vec<u16> = comp_kv.iter().map(|&v| f32_to_f16_bits(v)).collect();
+        let comp_kv_quantized: Vec<f32> =
+            comp_kv_f16.iter().map(|&u| f16_bits_to_f32(u)).collect();
+        let expected = cpu_indexer_score(
+            &q,
+            &head_weights,
+            &comp_kv_quantized,
+            n_comp,
+            n_head,
+            head_dim,
+        );
 
         let mut d_q: DeviceBuffer<f32> = DeviceBuffer::new(device.id, q_flat)?;
         let mut d_hw: DeviceBuffer<f32> = DeviceBuffer::new(device.id, n_head)?;
-        let mut d_kv: DeviceBuffer<f32> = DeviceBuffer::new(device.id, n_comp * head_dim)?;
+        let mut d_kv: DeviceBuffer<u16> = DeviceBuffer::new(device.id, n_comp * head_dim)?;
         let mut d_scores: DeviceBuffer<f32> = DeviceBuffer::new(device.id, n_comp)?;
         d_q.copy_from_host(&q)?;
         d_hw.copy_from_host(&head_weights)?;
-        d_kv.copy_from_host(&comp_kv)?;
+        d_kv.copy_from_host(&comp_kv_f16)?;
 
         kernel.launch(
             &stream,

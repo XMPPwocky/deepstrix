@@ -15,33 +15,38 @@
 // are reduced in shared mem, ReLU'd, then weighted-summed.
 //
 // For V4 Flash: n_head=DS4_N_INDEXER_HEAD=64, head_dim=DS4_N_INDEXER_HEAD_DIM=128.
+//
+// `index_comp_kv` is f16-stored (the indexer compressor emits f16
+// post-roundtrip; ds4's CPU path matches this in its `index_comp_post_fp8`
+// dump tag). Q and head_weights are f32 (live, no quantization).
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 #define INDEXER_BLOCK 256
 
 extern "C" __global__ void indexer_score(
-        float        * __restrict__ scores,        // [n_comp]
-        const float  * __restrict__ q,             // [n_head, head_dim]
-        const float  * __restrict__ head_weights,  // [n_head]
-        const float  * __restrict__ index_comp_kv, // [n_comp, head_dim]
-        unsigned int   n_comp,
-        unsigned int   n_head,
-        unsigned int   head_dim) {
+        float          * __restrict__ scores,        // [n_comp]
+        const float    * __restrict__ q,             // [n_head, head_dim]
+        const float    * __restrict__ head_weights,  // [n_head]
+        const _Float16 * __restrict__ index_comp_kv, // [n_comp, head_dim] f16
+        unsigned int     n_comp,
+        unsigned int     n_head,
+        unsigned int     head_dim) {
     const unsigned int c = blockIdx.x;
     const unsigned int tid = threadIdx.x;
     if (c >= n_comp) return;
 
     __shared__ float partial[INDEXER_BLOCK];
 
-    const float *kv = index_comp_kv + (unsigned long long)c * head_dim;
+    const _Float16 *kv = index_comp_kv + (unsigned long long)c * head_dim;
     float total = 0.0f;
 
     for (unsigned int h = 0; h < n_head; h++) {
         const float *qh = q + (unsigned long long)h * head_dim;
         float p = 0.0f;
         for (unsigned int i = tid; i < head_dim; i += INDEXER_BLOCK) {
-            p += kv[i] * qh[i];
+            p += (float)kv[i] * qh[i];
         }
         partial[tid] = p;
         __syncthreads();

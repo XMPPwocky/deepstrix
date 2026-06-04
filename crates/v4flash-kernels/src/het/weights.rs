@@ -11,8 +11,8 @@ use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{Device, DeviceBuffer};
 
 use crate::config::{
-    BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, COMPRESS_RATIOS, HC_MIX_DIM, N_EMBD, N_HASH_LAYERS,
-    N_HC, N_HEAD, N_HEAD_DIM, N_LAYER, N_LORA_Q,
+    BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, COMPRESS_RATIOS, HC_MIX_DIM, INDEXER_COMP_WIDTH,
+    N_EMBD, N_HASH_LAYERS, N_HC, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, N_LORA_Q,
 };
 use crate::model_weights::{
     load_f32_weight, load_i32_tensor, CompressorWeights, RoutedExpertWeights, SharedExpertWeights,
@@ -56,6 +56,16 @@ pub struct DgpuLayerWeights {
     // peer push is needed.
     pub compressor: Option<CompressorWeights>,
 
+    // CSA indexer — only present at ratio==4 layers. `indexer` holds the
+    // two projection weights (attn_q_b, proj) that build the per-token
+    // indexer query + head weights; `indexer_compressor` is a second
+    // compressor instance at head_dim=128 (vs main's 512) that maintains
+    // the index_comp_kv cache the scoring kernel reads. See ds4.c:6977-7106
+    // (`indexer_allowed_decode_one`) and ds4.c:7791-7811 (the indexer
+    // compressor call site).
+    pub indexer: Option<IndexerWeights>,
+    pub indexer_compressor: Option<CompressorWeights>,
+
     // Router lives on dGPU because (a) the f16 matvec is ~1.5 ms faster
     // on dGPU's BW, and (b) keeping it off iGPU lifts it from the iGPU
     // MoE critical path. After the router runs on dGPU, selected/d_ew
@@ -64,6 +74,16 @@ pub struct DgpuLayerWeights {
     pub ffn_gate_inp: DeviceWeight,
     pub tid2eid: Option<Vec<i32>>,
     pub router_bias_dev: Option<DeviceBuffer<f32>>,
+}
+
+/// CSA indexer projection weights (per ratio==4 layer).
+/// - `attn_q_b`: F16 [N_LORA_Q × (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM)]
+///   matvec input qr_normed → indexer_q[N_INDEXER_HEAD, N_INDEXER_HEAD_DIM]
+/// - `proj`: F16 [N_EMBD × N_INDEXER_HEAD]
+///   matvec input attn_input_norm → head_weights[N_INDEXER_HEAD]
+pub struct IndexerWeights {
+    pub attn_q_b: DeviceWeight,
+    pub proj: DeviceWeight,
 }
 
 pub struct IgpuLayerWeights {
@@ -238,6 +258,50 @@ impl DgpuLayerWeights {
             None
         };
 
+        // CSA indexer (ratio==4 only). Tensor names per ds4.c:2610-2615.
+        let (indexer, indexer_compressor) = if ratio == 4 {
+            let iw = IndexerWeights {
+                attn_q_b: load_to_device(
+                    gguf,
+                    &format!("blk.{layer}.indexer.attn_q_b.weight"),
+                    device_id,
+                )?,
+                proj: load_to_device(
+                    gguf,
+                    &format!("blk.{layer}.indexer.proj.weight"),
+                    device_id,
+                )?,
+            };
+            let ic = CompressorWeights {
+                wkv: load_to_device(
+                    gguf,
+                    &format!("blk.{layer}.indexer_compressor_kv.weight"),
+                    device_id,
+                )?,
+                wgate: load_to_device(
+                    gguf,
+                    &format!("blk.{layer}.indexer_compressor_gate.weight"),
+                    device_id,
+                )?,
+                ape: load_to_device(
+                    gguf,
+                    &format!("blk.{layer}.indexer_compressor_ape.weight"),
+                    device_id,
+                )?,
+                norm: load_f32_weight(
+                    gguf,
+                    &format!("blk.{layer}.indexer_compressor_norm.weight"),
+                    device_id,
+                    N_INDEXER_HEAD_DIM as usize,
+                )?,
+                width: INDEXER_COMP_WIDTH,
+                head_dim: N_INDEXER_HEAD_DIM,
+            };
+            (Some(iw), Some(ic))
+        } else {
+            (None, None)
+        };
+
         // Router weights live on dGPU.
         let is_hash_router = layer < N_HASH_LAYERS;
         let ffn_gate_inp =
@@ -293,6 +357,8 @@ impl DgpuLayerWeights {
             ffn_norm,
             shared,
             compressor,
+            indexer,
+            indexer_compressor,
             is_hash_router,
             ffn_gate_inp,
             tid2eid,

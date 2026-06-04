@@ -60,6 +60,10 @@ pub const NEG_INF: f32 = -3.4028235e38;
 pub const N_INDEXER_HEAD: u32 = 64;
 pub const N_INDEXER_HEAD_DIM: u32 = 128;
 pub const INDEXER_TOP_K: u32 = 512;
+/// Indexer compressor width — coff * N_INDEXER_HEAD_DIM where coff = 2 at
+/// ratio=4 (the only ratio the indexer fires on). Mirrors the main
+/// compressor's `comp_width` formula, just at the indexer's head_dim.
+pub const INDEXER_COMP_WIDTH: u32 = 2 * N_INDEXER_HEAD_DIM;
 
 // === Attention / routing topology ===
 

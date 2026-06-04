@@ -33,7 +33,12 @@ use crate::embed::gpt2_decode_token;
 /// Bumped to 2 when snapshot keys switched from `blake3(token_id_LE_bytes)`
 /// to `blake3(decoded_byte_stream)` — bytes are the source of truth and
 /// survive tokenizer-roundtrip splits.
-const FORMAT_VERSION: u32 = 2;
+// v2 → v3: added per-layer indexer compressor state (`has_indexer_compressor`,
+// `n_index_comp`, `index_*` shape fields) + index_comp_kv.bin +
+// index_comp_state.bin blobs. v2 snapshots get evicted at startup since
+// they lack the indexer state needed for correct ratio==4 attention at
+// long context.
+const FORMAT_VERSION: u32 = 3;
 
 /// Decode a token-id sequence to the raw byte stream the model would
 /// see at the surface level. Used for snapshot keys + byte-level
@@ -91,6 +96,21 @@ pub struct PerLayerMeta {
     pub width: u32,
     pub head_dim: u32,
     pub state_rows: u32,
+    /// CSA indexer compressor state (only on ratio==4 layers). When
+    /// `has_indexer_compressor` is false the `index_*` fields are 0 /
+    /// undefined and no indexer bytes are written for this layer.
+    #[serde(default)]
+    pub has_indexer_compressor: bool,
+    #[serde(default)]
+    pub n_index_comp: u32,
+    #[serde(default)]
+    pub index_coff: u32,
+    #[serde(default)]
+    pub index_width: u32,
+    #[serde(default)]
+    pub index_head_dim: u32,
+    #[serde(default)]
+    pub index_state_rows: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -496,6 +516,8 @@ pub fn save(
     let mut kv_blob: Vec<u8> = Vec::new();
     let mut comp_kv_blob: Vec<u8> = Vec::new();
     let mut comp_state_blob: Vec<u8> = Vec::new();
+    let mut index_comp_kv_blob: Vec<u8> = Vec::new();
+    let mut index_comp_state_blob: Vec<u8> = Vec::new();
     for (li, layer) in state.layers.iter().enumerate() {
         let ratio = COMPRESS_RATIOS[li];
         let kv_rows = layer.n_raw.min(SWA_WINDOW);
@@ -557,6 +579,55 @@ pub fn save(
             (false, 0, 0, 0, 0, 0)
         };
 
+        // CSA indexer compressor (only on ratio==4 layers). State lives
+        // on dGPU (per HetCompressorState::alloc(dgpu, dgpu, …)) so all
+        // reads happen with dgpu current.
+        let (
+            has_indexer_compressor,
+            n_index_comp,
+            index_width,
+            index_head_dim,
+            index_state_rows,
+            index_coff,
+        ) = if let Some(icomp) = &layer.indexer_compressor {
+            let coff_local = 2u32; // ratio==4 only
+            let state_rows = ratio * coff_local;
+            let ck_full_n = icomp.comp_kv.len();
+            let mut icomp_kv_host = vec![0u16; ck_full_n];
+            if ck_full_n > 0 {
+                dgpu.set_current()?;
+                icomp.comp_kv.copy_to_host(&mut icomp_kv_host)?;
+            }
+            let ck_used_n = (icomp.n_comp as usize) * (icomp.head_dim as usize);
+            for v in &icomp_kv_host[..ck_used_n] {
+                index_comp_kv_blob.extend_from_slice(&v.to_le_bytes());
+            }
+            let n_state = icomp.state_kv.len();
+            let mut state_kv_host = vec![0f32; n_state];
+            let mut state_score_host = vec![0f32; n_state];
+            if n_state > 0 {
+                dgpu.set_current()?;
+                icomp.state_kv.copy_to_host(&mut state_kv_host)?;
+                icomp.state_score.copy_to_host(&mut state_score_host)?;
+            }
+            for v in &state_kv_host {
+                index_comp_state_blob.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in &state_score_host {
+                index_comp_state_blob.extend_from_slice(&v.to_le_bytes());
+            }
+            (
+                true,
+                icomp.n_comp,
+                icomp.width,
+                icomp.head_dim,
+                state_rows,
+                coff_local,
+            )
+        } else {
+            (false, 0, 0, 0, 0, 0)
+        };
+
         layers.push(PerLayerMeta {
             n_raw: layer.n_raw,
             kv_rows,
@@ -567,6 +638,12 @@ pub fn save(
             width,
             head_dim,
             state_rows,
+            has_indexer_compressor,
+            n_index_comp,
+            index_coff,
+            index_width,
+            index_head_dim,
+            index_state_rows,
         });
     }
     // Restore dgpu as current (callers expect that).
@@ -579,6 +656,12 @@ pub fn save(
     }
     if !comp_state_blob.is_empty() {
         fs::write(dir.join("comp_state.bin"), &comp_state_blob)?;
+    }
+    if !index_comp_kv_blob.is_empty() {
+        fs::write(dir.join("index_comp_kv.bin"), &index_comp_kv_blob)?;
+    }
+    if !index_comp_state_blob.is_empty() {
+        fs::write(dir.join("index_comp_state.bin"), &index_comp_state_blob)?;
     }
 
     // Total disk bytes (including meta.json's eventual size — we
@@ -676,10 +759,15 @@ pub fn restore(
         .map_err(|e| eyre!("snapshot.restore: kv.bin: {e}"))?;
     let comp_kv_bytes = fs::read(src.join("comp_kv.bin")).unwrap_or_default();
     let comp_state_bytes = fs::read(src.join("comp_state.bin")).unwrap_or_default();
+    let index_comp_kv_bytes = fs::read(src.join("index_comp_kv.bin")).unwrap_or_default();
+    let index_comp_state_bytes =
+        fs::read(src.join("index_comp_state.bin")).unwrap_or_default();
 
     let mut kv_off = 0usize;
     let mut comp_kv_off = 0usize;
     let mut comp_state_off = 0usize;
+    let mut index_comp_kv_off = 0usize;
+    let mut index_comp_state_off = 0usize;
 
     for (li, layer) in state.layers.iter_mut().enumerate() {
         let m = &meta.layers[li];
@@ -785,6 +873,83 @@ pub fn restore(
             igpu.set_current()?;
             comp.state_kv.copy_from_host(&vec![0f32; n_state])?;
             comp.state_score.copy_from_host(&vec![NEG_INF; n_state])?;
+        }
+
+        // CSA indexer compressor restore. Mirrors the main-compressor
+        // block above with the indexer's smaller dims. State lives on
+        // dGPU (per HetCompressorState::alloc(dgpu, dgpu, …)).
+        if m.has_indexer_compressor {
+            let Some(icomp) = &mut layer.indexer_compressor else {
+                return Err(eyre!(
+                    "snapshot.restore: layer {li} has indexer_compressor in snapshot but not in state"
+                ));
+            };
+            icomp.n_comp = m.n_index_comp;
+
+            let ick_count = (m.n_index_comp as usize) * (m.index_head_dim as usize);
+            let ick_bytes_len = ick_count * 2;
+            if index_comp_kv_off + ick_bytes_len > index_comp_kv_bytes.len() {
+                return Err(eyre!(
+                    "snapshot.restore: index_comp_kv.bin truncated at layer {li}"
+                ));
+            }
+            let ick_full_n = icomp.comp_kv.len();
+            if ick_count > ick_full_n {
+                return Err(eyre!(
+                    "snapshot.restore: index ck_count {ick_count} > buffer {ick_full_n}"
+                ));
+            }
+            if ick_full_n > 0 {
+                let mut ick_host = vec![0u16; ick_full_n];
+                for (i, c) in index_comp_kv_bytes
+                    [index_comp_kv_off..index_comp_kv_off + ick_bytes_len]
+                    .chunks_exact(2)
+                    .enumerate()
+                {
+                    ick_host[i] = u16::from_le_bytes([c[0], c[1]]);
+                }
+                dgpu.set_current()?;
+                icomp.comp_kv.copy_from_host(&ick_host)?;
+            }
+            index_comp_kv_off += ick_bytes_len;
+
+            let in_state = (m.index_state_rows as usize) * (m.index_width as usize);
+            let in_block_bytes = in_state * 4;
+            let in_block_total = 2 * in_block_bytes;
+            if index_comp_state_off + in_block_total > index_comp_state_bytes.len() {
+                dgpu.set_current()?;
+                icomp.state_kv.copy_from_host(&vec![0f32; in_state])?;
+                icomp.state_score.copy_from_host(&vec![NEG_INF; in_state])?;
+            } else {
+                let mut kv = vec![0f32; in_state];
+                let mut score = vec![0f32; in_state];
+                for (i, c) in index_comp_state_bytes
+                    [index_comp_state_off..index_comp_state_off + in_block_bytes]
+                    .chunks_exact(4)
+                    .enumerate()
+                {
+                    kv[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                }
+                for (i, c) in index_comp_state_bytes[index_comp_state_off + in_block_bytes
+                    ..index_comp_state_off + in_block_total]
+                    .chunks_exact(4)
+                    .enumerate()
+                {
+                    score[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                }
+                dgpu.set_current()?;
+                icomp.state_kv.copy_from_host(&kv)?;
+                icomp.state_score.copy_from_host(&score)?;
+                index_comp_state_off += in_block_total;
+            }
+        } else if let Some(icomp) = layer.indexer_compressor.as_mut() {
+            // State expects an indexer_compressor but snapshot doesn't —
+            // re-init defaults.
+            icomp.n_comp = 0;
+            let n_state = icomp.state_kv.len();
+            dgpu.set_current()?;
+            icomp.state_kv.copy_from_host(&vec![0f32; n_state])?;
+            icomp.state_score.copy_from_host(&vec![NEG_INF; n_state])?;
         }
     }
 

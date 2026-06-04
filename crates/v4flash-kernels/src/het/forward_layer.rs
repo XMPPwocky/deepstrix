@@ -24,9 +24,9 @@ use v4flash_hip::{Device, DeviceBuffer};
 
 use crate::config::{
     BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, EXPERT_WEIGHT_SCALE, GROUP_DIM, HC_DIM, HC_MIX_DIM,
-    N_EMBD, N_EXPERT, N_EXPERT_USED, N_FF_EXP, N_FF_SHARED, N_GROUPS, N_HC, N_HEAD, N_HEAD_DIM,
-    N_LORA_Q, N_ROT, OUT_LOW, Q_FLAT, RANK, RMS_EPS, SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW,
-    SWIGLU_CLAMP_EXP,
+    INDEXER_COMP_WIDTH, INDEXER_TOP_K, N_EMBD, N_EXPERT, N_EXPERT_USED, N_FF_EXP, N_FF_SHARED,
+    N_GROUPS, N_HC, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD, N_INDEXER_HEAD_DIM, N_LORA_Q, N_ROT,
+    OUT_LOW, Q_FLAT, RANK, RMS_EPS, SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW, SWIGLU_CLAMP_EXP,
 };
 use crate::routing::hash_router_select;
 use crate::q8_k::BLOCK_Q8_K_BYTES;
@@ -472,6 +472,140 @@ impl HeterogeneousEngine {
         }
 
         // ============================================================
+        // dGPU: CSA indexer compressor — second, parallel compressor at
+        // head_dim=128, only on ratio==4 layers. Same kernel set as the
+        // main compressor (matvec_pair → state_write → on boundary:
+        // pool → rms_w → rope → f16rt → shuffle → comp_kv_append).
+        // FP8 quantize is SKIPPED — only valid for head_dim=512.
+        //
+        // Scratch reuse: this block runs strictly after the main
+        // compressor block on the same de.compute stream, so we can
+        // reuse `kv_cur` / `sc_cur` / `pooled` / `comp_row` buffers via
+        // slice views sized to the indexer's smaller dims.
+        // ============================================================
+        if ratio == 4 {
+            let _t_icomp = de.events.stage("dgpu.indexer_compressor", &de.compute)?;
+            let _s_icomp = debug_span!("indexer_compressor_dgpu").entered();
+
+            let iw = dlw
+                .indexer_compressor
+                .as_ref()
+                .ok_or_else(|| eyre!("L{layer}: missing indexer_compressor weights"))?;
+            let ics = ls
+                .indexer_compressor
+                .as_mut()
+                .ok_or_else(|| eyre!("L{layer}: missing indexer_compressor state"))?;
+            let icw = INDEXER_COMP_WIDTH; // 256
+            let ihd = N_INDEXER_HEAD_DIM; // 128
+            let pos_mod = pos % ratio;
+            let row = 4 + pos_mod; // ratio==4 always
+
+            // matvec_pair writes [icw] into the head of kv_cur / sc_cur.
+            {
+                let _t = de.events.stage("k.indexer_compressor.f16_pair", &de.compute)?;
+                let mut kv_view = dgpu_scratch.kv_cur.slice_view_mut(0, icw as usize);
+                let mut sc_view = dgpu_scratch.sc_cur.slice_view_mut(0, icw as usize);
+                de.f16.matvec_pair(
+                    &de.compute,
+                    &mut kv_view,
+                    &mut sc_view,
+                    &iw.wkv.buffer,
+                    &iw.wgate.buffer,
+                    &dgpu_scratch.attn_input_norm,
+                    icw,
+                    N_EMBD,
+                )?;
+            }
+            {
+                let _t = de.events.stage("k.indexer_compressor.state_write", &de.compute)?;
+                let kv_view = dgpu_scratch.kv_cur.slice_view(0, icw as usize);
+                let sc_view = dgpu_scratch.sc_cur.slice_view(0, icw as usize);
+                de.compressor_state_write.launch(
+                    &de.compute,
+                    &mut ics.state_kv,
+                    &mut ics.state_score,
+                    &kv_view,
+                    &sc_view,
+                    &iw.ape.buffer,
+                    icw,
+                    row,
+                    pos_mod,
+                )?;
+            }
+
+            if comp_fires_boundary {
+                {
+                    let _t = de.events.stage("k.indexer_compressor.pool", &de.compute)?;
+                    let mut pooled_view = dgpu_scratch.pooled.slice_view_mut(0, ihd as usize);
+                    de.compressor_pool.launch(
+                        &de.compute,
+                        &mut pooled_view,
+                        &ics.state_kv,
+                        &ics.state_score,
+                        ihd,
+                        ratio,
+                    )?;
+                }
+                {
+                    let _t = de.events.stage("k.indexer_compressor.rms_w", &de.compute)?;
+                    let mut row_view = dgpu_scratch.comp_row.slice_view_mut(0, ihd as usize);
+                    let pooled_view = dgpu_scratch.pooled.slice_view(0, ihd as usize);
+                    de.rms_w.launch_weighted(
+                        &de.compute,
+                        &mut row_view,
+                        &pooled_view,
+                        &iw.norm,
+                        ihd,
+                        RMS_EPS,
+                    )?;
+                }
+                let comp_pos = pos + 1 - ratio;
+                {
+                    let _t = de.events.stage("k.indexer_compressor.rope", &de.compute)?;
+                    let mut row_view = dgpu_scratch.comp_row.slice_view_mut(0, ihd as usize);
+                    de.rope.launch_forward(
+                        &de.compute,
+                        &mut row_view,
+                        1,
+                        ihd,
+                        N_ROT,
+                        comp_pos,
+                        &dlw.rope_params,
+                    )?;
+                }
+                // No FP8 step — head_dim=128 ≠ 512 (ds4.c:6702 gates fp8 on head_dim==N_HEAD_DIM).
+                {
+                    let _t = de.events.stage("k.indexer_compressor.f16rt", &de.compute)?;
+                    let mut row_view = dgpu_scratch.comp_row.slice_view_mut(0, ihd as usize);
+                    de.f16rt.launch(&de.compute, &mut row_view, ihd)?;
+                }
+                {
+                    let _t = de.events.stage("k.indexer_compressor.shuffle", &de.compute)?;
+                    de.compressor_shuffle.launch(
+                        &de.compute,
+                        &mut ics.state_kv,
+                        &mut ics.state_score,
+                        icw,
+                    )?;
+                }
+                {
+                    let _t = de.events.stage("k.indexer_compressor.comp_kv_append", &de.compute)?;
+                    let row_view = dgpu_scratch.comp_row.slice_view(0, ihd as usize);
+                    de.comp_kv_append.launch(
+                        &de.compute,
+                        &mut ics.comp_kv,
+                        &row_view,
+                        ics.n_comp,
+                        ihd,
+                    )?;
+                }
+                ics.n_comp += 1;
+            }
+            drop(_s_icomp);
+            _t_icomp.end()?;
+        }
+
+        // ============================================================
         // dGPU: Attention compute
         // ============================================================
         if ratio == 0 {
@@ -490,9 +624,116 @@ impl HeterogeneousEngine {
             drop(_s_attn);
             _t_attn.end()?;
         } else {
+            // CSA indexer: at ratio==4 layers with n_index_comp > 512, run
+            // matvec(attn_q_b) → RoPE → matvec(proj) → scale →
+            // IndexerScore → IndexerTopk → IndexerGather. Result is a
+            // dense `active_comp_kv` of ≤512 rows for the attention kernels
+            // to consume instead of the full `cs.comp_kv`.
+            //
+            // Below the early-permit boundary (n_index_comp ≤ 512), or for
+            // ratio==128 layers (no indexer), the existing dense path runs
+            // unchanged.
             let cs = ls.compressor.as_ref();
-            let n_comp = cs.map(|c| c.n_comp).unwrap_or(0);
-            let comp_kv_buf = if n_comp > 0 { cs.map(|c| &c.comp_kv) } else { None };
+            let n_comp_full = cs.map(|c| c.n_comp).unwrap_or(0);
+            let ics = ls.indexer_compressor.as_ref();
+            let n_index_comp = ics.map(|c| c.n_comp).unwrap_or(0);
+            let use_sparse = ratio == 4 && n_index_comp > INDEXER_TOP_K;
+            let env_disable_sparse = std::env::var("DECODE_INDEXER")
+                .map(|v| v == "off" || v == "0").unwrap_or(false);
+            let use_sparse = use_sparse && !env_disable_sparse;
+
+            if use_sparse {
+                let _t_ix = de.events.stage("dgpu.indexer", &de.compute)?;
+                let _s_ix = debug_span!("indexer_dgpu").entered();
+                let iw = dlw
+                    .indexer
+                    .as_ref()
+                    .ok_or_else(|| eyre!("L{layer}: ratio==4 but no indexer weights"))?;
+                let ics_ref = ics.expect("ratio==4 must have indexer_compressor state");
+
+                // 1. matvec(attn_q_b × qr_normed) → indexer_q [N_INDEXER_HEAD * N_INDEXER_HEAD_DIM]
+                de.f16.matvec(
+                    &de.compute,
+                    &mut dgpu_scratch.indexer_q,
+                    &iw.attn_q_b.buffer,
+                    &dgpu_scratch.qr_normed,
+                    N_INDEXER_HEAD * N_INDEXER_HEAD_DIM,
+                    N_LORA_Q,
+                )?;
+                // 2. RoPE on indexer_q at this token's global position.
+                de.rope.launch_forward(
+                    &de.compute,
+                    &mut dgpu_scratch.indexer_q,
+                    N_INDEXER_HEAD,
+                    N_INDEXER_HEAD_DIM,
+                    N_ROT,
+                    pos,
+                    &dlw.rope_params,
+                )?;
+                // 3. matvec(indexer.proj × attn_input_norm) → head_weights [N_INDEXER_HEAD]
+                de.f16.matvec(
+                    &de.compute,
+                    &mut dgpu_scratch.indexer_head_weights,
+                    &iw.proj.buffer,
+                    &dgpu_scratch.attn_input_norm,
+                    N_INDEXER_HEAD,
+                    N_EMBD,
+                )?;
+                // 4. Scale head_weights *= 1/sqrt(head_dim * n_head)
+                let scale =
+                    1.0f32 / ((N_INDEXER_HEAD_DIM as f32) * (N_INDEXER_HEAD as f32)).sqrt();
+                de.vec_scale.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.indexer_head_weights,
+                    scale,
+                    N_INDEXER_HEAD,
+                )?;
+                // 5. IndexerScore over the contiguous prefix of index_comp_kv.
+                let kv_slice = ics_ref
+                    .comp_kv
+                    .slice_view(0, (n_index_comp * N_INDEXER_HEAD_DIM) as usize);
+                de.indexer_score.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.indexer_scores,
+                    &dgpu_scratch.indexer_q,
+                    &dgpu_scratch.indexer_head_weights,
+                    &kv_slice,
+                    n_index_comp,
+                    N_INDEXER_HEAD,
+                    N_INDEXER_HEAD_DIM,
+                )?;
+                // 6. IndexerTopk → sorted indices + bitmap.
+                de.indexer_topk.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.indexer_selected,
+                    &mut dgpu_scratch.indexer_allowed_bits,
+                    &dgpu_scratch.indexer_scores,
+                    n_index_comp,
+                    INDEXER_TOP_K,
+                )?;
+                // 7. Gather selected rows of cs.comp_kv into active_comp_kv.
+                let cs_ref = cs.expect("ratio==4 must have main compressor state");
+                de.indexer_gather.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.active_comp_kv,
+                    &cs_ref.comp_kv,
+                    &dgpu_scratch.indexer_selected,
+                    INDEXER_TOP_K,
+                    N_HEAD_DIM,
+                )?;
+                drop(_s_ix);
+                _t_ix.end()?;
+            }
+
+            // For sparse-attn paths we read from active_comp_kv (≤512
+            // rows). Otherwise we read from cs.comp_kv directly.
+            let (attn_comp_kv, attn_n_comp) = if use_sparse {
+                (Some(&dgpu_scratch.active_comp_kv), INDEXER_TOP_K)
+            } else if n_comp_full > 0 {
+                (cs.map(|c| &c.comp_kv), n_comp_full)
+            } else {
+                (None, 0)
+            };
             {
                 let _t = de.events.stage("dgpu.attn_score", &de.compute)?;
                 let _s = debug_span!("attn_score").entered();
@@ -505,14 +746,14 @@ impl HeterogeneousEngine {
                 let use_b1_wmma_score = std::env::var("DECODE_SCORE")
                     .map(|v| v != "single").unwrap_or(true);
                 if use_b1_wmma_score {
-                    let n_total_max = ls.n_raw + n_comp;
+                    let n_total_max = ls.n_raw + attn_n_comp;
                     de.attn_mixed.launch_score_b1_htiled_wmma(
                         &de.compute,
                         &mut dgpu_scratch.attn_scores,
                         &dgpu_scratch.q_normed,
                         &ls.kv_cache,
-                        comp_kv_buf,
-                        ls.n_raw, /*raw_off=*/0, n_comp,
+                        attn_comp_kv,
+                        ls.n_raw, /*raw_off=*/0, attn_n_comp,
                         N_HEAD, N_HEAD_DIM, n_total_max,
                     )?;
                 } else {
@@ -521,8 +762,8 @@ impl HeterogeneousEngine {
                         &mut dgpu_scratch.attn_scores,
                         &dgpu_scratch.q_normed,
                         &ls.kv_cache,
-                        comp_kv_buf,
-                        N_HEAD, N_HEAD_DIM, ls.n_raw, n_comp,
+                        attn_comp_kv,
+                        N_HEAD, N_HEAD_DIM, ls.n_raw, attn_n_comp,
                     )?;
                 }
             }
@@ -546,16 +787,16 @@ impl HeterogeneousEngine {
                         &mut dgpu_scratch.attn_scores,
                         &dlw.attn_sinks,
                         &mut dgpu_scratch.attn_inv_per_head,
-                        N_HEAD, ls.n_raw, n_comp,
+                        N_HEAD, ls.n_raw, attn_n_comp,
                     )?;
                     de.attn_mixed.launch_wsum_b1_htiled_ksplit_ldsv(
                         &de.compute,
                         &mut dgpu_scratch.attn_partials,
                         &dgpu_scratch.attn_scores,
                         &ls.kv_cache,
-                        comp_kv_buf,
+                        attn_comp_kv,
                         N_HEAD, N_HEAD_DIM,
-                        ls.n_raw, n_comp,
+                        ls.n_raw, attn_n_comp,
                         K_SPLIT,
                     )?;
                     de.attn_mixed.launch_reduce_partials_apply_inv(
@@ -572,8 +813,8 @@ impl HeterogeneousEngine {
                         &mut dgpu_scratch.attn_scores,
                         &dlw.attn_sinks,
                         &ls.kv_cache,
-                        comp_kv_buf,
-                        N_HEAD, N_HEAD_DIM, ls.n_raw, n_comp,
+                        attn_comp_kv,
+                        N_HEAD, N_HEAD_DIM, ls.n_raw, attn_n_comp,
                     )?;
                 }
             }

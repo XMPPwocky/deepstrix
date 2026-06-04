@@ -120,6 +120,12 @@ pub struct DeviceEngine {
     pub kv_append: KvCacheAppend,
     pub comp_kv_append: CompKvAppend,
     pub router_topk: RouterTopk,
+    /// CSA indexer kernels (used only on the dGPU's ratio==4 layers, but
+    /// instantiated unconditionally so the engine struct stays symmetric).
+    pub indexer_score: crate::IndexerScore,
+    pub indexer_topk: crate::IndexerTopk,
+    pub indexer_gather: crate::IndexerGather,
+    pub vec_scale: crate::VecScaleInplace,
     /// By-expert MoE pre-pass — inverts d_selected into per-expert
     /// (token, slot) lists. Used by the prefill iGPU MoE path.
     pub moe_group_builder: crate::moe_group_builder::MoeGroupBuilder,
@@ -173,6 +179,10 @@ impl DeviceEngine {
             kv_append: KvCacheAppend::for_arch(arch)?,
             comp_kv_append: CompKvAppend::for_arch(arch)?,
             router_topk: RouterTopk::for_arch(arch)?,
+            indexer_score: crate::IndexerScore::for_arch(arch)?,
+            indexer_topk: crate::IndexerTopk::for_arch(arch)?,
+            indexer_gather: crate::IndexerGather::for_arch(arch)?,
+            vec_scale: crate::VecScaleInplace::for_arch(arch)?,
             moe_group_builder: crate::moe_group_builder::MoeGroupBuilder::for_arch(arch)?,
             events,
         })

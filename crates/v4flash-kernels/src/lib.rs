@@ -51,7 +51,10 @@ pub use compressor::{
 pub use f16::F16Matvec;
 pub use ffn::{Swiglu, SwigluClampWeighted, VecAddInplace};
 pub use head::{HcPost, HcSigmoidBias, HcSinkhorn, HcWeightedSum};
-pub use indexer::{IndexerScore, INDEXER_HEAD_DIM, INDEXER_N_HEAD, INDEXER_TOP_K};
+pub use indexer::{
+    IndexerGather, IndexerScore, IndexerTopk, VecScaleInplace, INDEXER_HEAD_DIM, INDEXER_N_HEAD,
+    INDEXER_TOP_K,
+};
 pub use iq2_xxs::{Iq2XxsPairMatvec, BLOCK_IQ2_XXS_BYTES};
 pub use kv_cache_append::KvCacheAppend;
 pub use moe_group_builder::MoeGroupBuilder;

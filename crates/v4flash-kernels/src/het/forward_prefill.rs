@@ -23,9 +23,9 @@ use color_eyre::eyre::{self, eyre};
 
 use crate::config::{
     BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW, EXPERT_WEIGHT_SCALE,
-    GROUP_DIM, HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED, N_FF_SHARED, N_GROUPS, N_HC,
-    N_HEAD, N_HEAD_DIM, N_LAYER, N_LORA_Q, N_ROT, N_VOCAB, OUT_LOW, Q_FLAT, RANK, RMS_EPS,
-    SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW,
+    GROUP_DIM, HC_DIM, HC_MIX_DIM, INDEXER_COMP_WIDTH, N_EMBD, N_EXPERT, N_EXPERT_USED,
+    N_FF_SHARED, N_GROUPS, N_HC, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, N_LORA_Q, N_ROT,
+    N_VOCAB, OUT_LOW, Q_FLAT, RANK, RMS_EPS, SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW,
 };
 use crate::routing::hash_router_select;
 
@@ -1195,6 +1195,136 @@ impl HeterogeneousEngine {
         } else {
             for _ in 0..b {
                 n_comp_after.push(0);
+            }
+        }
+
+        // ========================================================
+        // CSA indexer compressor — second compressor at head_dim=128,
+        // only on ratio==4 layers. Same shape as the main compressor's
+        // batched-matvec_pair + per-segment-state_write + on-fire-serial-ops
+        // pattern, with:
+        //   - head_dim = N_INDEXER_HEAD_DIM (128) vs N_HEAD_DIM (512)
+        //   - width    = INDEXER_COMP_WIDTH  (256) vs main's (1024)
+        //   - NO FP8 step (only valid at head_dim=512 per ds4.c:6702)
+        // Scratch (bd.kv_cur, bd.sc_cur, bd.pooled, bd.comp_row) is
+        // reused via slice views — main compressor block has already
+        // consumed its writes by this point on the same compute stream.
+        // row_per_b / pos_mod_per_b reuse — ratio=4 row formula is the
+        // same as main's at ratio=4 (`4 + pm`).
+        // ics.n_comp tracks identically to cs.n_comp at ratio==4 layers
+        // (both fire on the same boundaries) — we don't need a separate
+        // n_index_comp_after vector; downstream (Phase 5 mask) can reuse
+        // n_comp_after.
+        if ratio == 4 {
+            let iw = dlw
+                .indexer_compressor
+                .as_ref()
+                .ok_or_else(|| eyre!("L{layer}: missing indexer_compressor weights"))?;
+            let ics = ls
+                .indexer_compressor
+                .as_mut()
+                .ok_or_else(|| eyre!("L{layer}: missing indexer_compressor state"))?;
+            let icw = INDEXER_COMP_WIDTH; // 256
+            let ihd = N_INDEXER_HEAD_DIM; // 128
+
+            // Batched matvec_pair across all B → bd.kv_cur[B,icw] +
+            // bd.sc_cur[B,icw] (head of buffers, slice view).
+            {
+                let mut kv_view =
+                    bd.kv_cur.slice_view_mut(0, (b as usize) * (icw as usize));
+                let mut sc_view =
+                    bd.sc_cur.slice_view_mut(0, (b as usize) * (icw as usize));
+                de.f16.matvec_pair_batched(
+                    &de.compute,
+                    &mut kv_view,
+                    &mut sc_view,
+                    &iw.wkv.buffer,
+                    &iw.wgate.buffer,
+                    &bd.attn_input_norm,
+                    icw,
+                    N_EMBD,
+                    b,
+                )?;
+            }
+
+            let mut i: u32 = 0;
+            while i < b {
+                let pos_mod_now = (pos0 + i) % ratio;
+                let seg_len = std::cmp::min(ratio - pos_mod_now, b - i);
+                let seg_end = i + seg_len;
+
+                let comp_stride = icw as usize;
+                let kv_seg = bd.kv_cur.slice_view(
+                    (i as usize) * comp_stride,
+                    (seg_len as usize) * comp_stride,
+                );
+                let sc_seg = bd.sc_cur.slice_view(
+                    (i as usize) * comp_stride,
+                    (seg_len as usize) * comp_stride,
+                );
+                let row_seg = bd.row_per_b.slice_view(i as usize, seg_len as usize);
+                let pm_seg = bd.pos_mod_per_b.slice_view(i as usize, seg_len as usize);
+                de.compressor_state_write.launch_batched(
+                    &de.compute,
+                    &mut ics.state_kv,
+                    &mut ics.state_score,
+                    &kv_seg,
+                    &sc_seg,
+                    &iw.ape.buffer,
+                    &row_seg,
+                    &pm_seg,
+                    icw,
+                    seg_len,
+                )?;
+
+                let comp_fires = (pos0 + seg_end) % ratio == 0;
+                if comp_fires {
+                    let mut pooled_v = bd.pooled.slice_view_mut(0, ihd as usize);
+                    let mut comp_row_v = bd.comp_row.slice_view_mut(0, ihd as usize);
+                    de.compressor_pool.launch(
+                        &de.compute,
+                        &mut pooled_v,
+                        &ics.state_kv,
+                        &ics.state_score,
+                        ihd,
+                        ratio,
+                    )?;
+                    de.rms_w.launch_weighted(
+                        &de.compute,
+                        &mut comp_row_v,
+                        &pooled_v,
+                        &iw.norm,
+                        ihd,
+                        RMS_EPS,
+                    )?;
+                    let comp_pos = pos0 + seg_end - ratio;
+                    de.rope.launch_forward(
+                        &de.compute,
+                        &mut comp_row_v,
+                        1,
+                        ihd,
+                        N_ROT,
+                        comp_pos,
+                        &dlw.rope_params,
+                    )?;
+                    // No FP8 (head_dim != 512).
+                    de.f16rt.launch(&de.compute, &mut comp_row_v, ihd)?;
+                    de.compressor_shuffle.launch(
+                        &de.compute,
+                        &mut ics.state_kv,
+                        &mut ics.state_score,
+                        icw,
+                    )?;
+                    de.comp_kv_append.launch(
+                        &de.compute,
+                        &mut ics.comp_kv,
+                        &comp_row_v,
+                        ics.n_comp,
+                        ihd,
+                    )?;
+                    ics.n_comp += 1;
+                }
+                i = seg_end;
             }
         }
         drop(_t_kv_append_comp);
