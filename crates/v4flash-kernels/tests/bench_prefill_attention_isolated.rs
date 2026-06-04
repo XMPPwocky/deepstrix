@@ -477,6 +477,7 @@ fn prefill_attention_htiled_offset_oracle() -> eyre::Result<()> {
             &n_raw_per,
             &n_raw_offset_per,
             &n_comp_per,
+            None, // no CSA mask in this isolated bench — dense path
             n_head,
             head_dim,
             n_total_max,

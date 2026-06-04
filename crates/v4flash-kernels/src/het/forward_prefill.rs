@@ -20,13 +20,16 @@
 //! weight reads across the batch.
 
 use color_eyre::eyre::{self, eyre};
+use v4flash_hip::DeviceBuffer;
 
 use crate::config::{
     BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW, EXPERT_WEIGHT_SCALE,
-    GROUP_DIM, HC_DIM, HC_MIX_DIM, INDEXER_COMP_WIDTH, N_EMBD, N_EXPERT, N_EXPERT_USED,
-    N_FF_SHARED, N_GROUPS, N_HC, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, N_LORA_Q, N_ROT,
-    N_VOCAB, OUT_LOW, Q_FLAT, RANK, RMS_EPS, SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW,
+    GROUP_DIM, HC_DIM, HC_MIX_DIM, INDEXER_COMP_WIDTH, INDEXER_TOP_K, N_EMBD, N_EXPERT,
+    N_EXPERT_USED, N_FF_SHARED, N_GROUPS, N_HC, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD,
+    N_INDEXER_HEAD_DIM, N_LAYER, N_LORA_Q, N_ROT, N_VOCAB, OUT_LOW, Q_FLAT, RANK, RMS_EPS,
+    SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW,
 };
+use crate::attention::ATTN_MIXED_MAX_KEYS;
 use crate::routing::hash_router_select;
 
 use super::batch_scratch::{BatchDgpuScratch, BatchIgpuScratch, B_MAX};
@@ -1404,6 +1407,171 @@ impl HeterogeneousEngine {
             // f32-scores path. ATTN_FUSED=1 takes the fused-FlashAttention
             // single-kernel path (online softmax, no scores buffer); skips
             // both score and smwsum below.
+            // ============================================================
+            // CSA indexer mask (per-token, ratio==4 only).
+            //
+            // For each batch token b at ratio==4 with n_index_comp_per[b] >
+            // INDEXER_TOP_K, run matvec(attn_q_b) → RoPE → matvec(proj) →
+            // scale → IndexerScore → IndexerTopk → bitpack into a per-
+            // token slice of bd.attn_comp_allowed_bits. The score kernel
+            // below then sees the mask via its nullable comp_allowed_bits
+            // param and stamps -INF for masked comp rows; softmax
+            // converts to zero weight.
+            //
+            // For tokens with n_index_comp_per[b] ≤ INDEXER_TOP_K (early-
+            // permit) we set an all-1s mask — leaving the score kernel
+            // bit-exact with the pre-mask dense path for that token.
+            //
+            // For ratio==128 layers and tokens with n_index_comp==0 we
+            // pass `None` for the whole-batch mask — the kernel skips
+            // the bit test entirely. ratio==128 layers will hit this
+            // path because indexer_compressor is None there, so
+            // n_index_comp stays 0.
+            //
+            // The whole pipeline runs serial-per-token on the same
+            // compute stream. Cost dominates IndexerScore at long ctx
+            // (~70 µs/token at n_index_comp=16K), times B tokens per
+            // chunk → maybe ~36 ms added per chunk at B=512, depth 32K.
+            // Acceptable per the phase 5 perf budget.
+            let need_mask = ratio == 4
+                && ls.indexer_compressor.is_some()
+                && n_comp_after.iter().any(|&v| v > INDEXER_TOP_K);
+            let comp_allowed_bits: Option<&DeviceBuffer<u32>> = if need_mask {
+                let _t_ix = de.events.stage("dgpu.prefill_indexer", &de.compute)?;
+                let iw = dlw.indexer.as_ref().ok_or_else(|| {
+                    eyre!("L{layer}: ratio==4 mask needed but no indexer weights")
+                })?;
+                let ics = ls.indexer_compressor.as_ref().expect("checked above");
+                let n_words_per_b = ((ATTN_MIXED_MAX_KEYS + 31) / 32) as usize;
+                let scale = 1.0f32
+                    / ((N_INDEXER_HEAD_DIM as f32) * (N_INDEXER_HEAD as f32)).sqrt();
+
+                // Per-token loop. Each iteration:
+                //  - zero this token's bitmap slice
+                //  - if n_index_comp_per[b] ≤ 512: fill all-1s
+                //  - else: matvec(attn_q_b, qr[b]) → RoPE → matvec(proj,
+                //    attn_input_norm[b]) → scale → IndexerScore →
+                //    IndexerTopk → bitpack_set
+                for bi in 0..(b as usize) {
+                    let mut slice = bd.attn_comp_allowed_bits.slice_view_mut(
+                        bi * n_words_per_b,
+                        n_words_per_b,
+                    );
+                    let n_idx = n_comp_after[bi];
+                    de.indexer_bitpack.launch_zero(
+                        &de.compute,
+                        &mut slice,
+                        n_words_per_b as u32,
+                    )?;
+                    if n_idx == 0 {
+                        continue;
+                    }
+                    if n_idx <= INDEXER_TOP_K {
+                        de.indexer_bitpack
+                            .launch_all_ones(&de.compute, &mut slice, n_idx)?;
+                        continue;
+                    }
+                    // Full indexer pipeline for this token.
+                    let mut q_slot = bd.indexer_q.slice_view_mut(
+                        bi * (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize,
+                        (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize,
+                    );
+                    let qr_in = bd
+                        .qr_normed
+                        .slice_view(bi * (N_LORA_Q as usize), N_LORA_Q as usize);
+                    de.f16.matvec(
+                        &de.compute,
+                        &mut q_slot,
+                        &iw.attn_q_b.buffer,
+                        &qr_in,
+                        N_INDEXER_HEAD * N_INDEXER_HEAD_DIM,
+                        N_LORA_Q,
+                    )?;
+                    let token_pos = pos0 + bi as u32;
+                    de.rope.launch_forward(
+                        &de.compute,
+                        &mut q_slot,
+                        N_INDEXER_HEAD,
+                        N_INDEXER_HEAD_DIM,
+                        N_ROT,
+                        token_pos,
+                        &dlw.rope_params,
+                    )?;
+                    let mut hw_slot = bd.indexer_head_weights.slice_view_mut(
+                        bi * (N_INDEXER_HEAD as usize),
+                        N_INDEXER_HEAD as usize,
+                    );
+                    let ain_in = bd
+                        .attn_input_norm
+                        .slice_view(bi * (N_EMBD as usize), N_EMBD as usize);
+                    de.f16.matvec(
+                        &de.compute,
+                        &mut hw_slot,
+                        &iw.proj.buffer,
+                        &ain_in,
+                        N_INDEXER_HEAD,
+                        N_EMBD,
+                    )?;
+                    de.vec_scale.launch(
+                        &de.compute,
+                        &mut hw_slot,
+                        scale,
+                        N_INDEXER_HEAD,
+                    )?;
+                    let kv_view = ics
+                        .comp_kv
+                        .slice_view(0, (n_idx * N_INDEXER_HEAD_DIM) as usize);
+                    let q_in = bd.indexer_q.slice_view(
+                        bi * (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize,
+                        (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize,
+                    );
+                    let hw_in = bd.indexer_head_weights.slice_view(
+                        bi * (N_INDEXER_HEAD as usize),
+                        N_INDEXER_HEAD as usize,
+                    );
+                    de.indexer_score.launch(
+                        &de.compute,
+                        &mut bd.indexer_scores,
+                        &q_in,
+                        &hw_in,
+                        &kv_view,
+                        n_idx,
+                        N_INDEXER_HEAD,
+                        N_INDEXER_HEAD_DIM,
+                    )?;
+                    // Sized for the FULL ATTN_MIXED_MAX_KEYS-words
+                    // bitmap; topk writes its own bitmap into a separate
+                    // single-token buffer that we discard — we rely on
+                    // `selected[]` + the bitpack_set kernel to write our
+                    // per-batch slice.
+                    de.indexer_topk.launch(
+                        &de.compute,
+                        &mut bd.indexer_selected,
+                        // Topk wants an output bitmap too; the spec
+                        // requires only `selected[]` for our use, but
+                        // the kernel currently always writes both.
+                        // Repurpose the single-token slice of
+                        // attn_comp_allowed_bits as scratch BEFORE we
+                        // bitpack the real per-batch slice below… no:
+                        // simpler — pass `slice` directly. The topk's
+                        // bitmap write covers n_idx bits, exactly what
+                        // we want.
+                        &mut slice,
+                        &bd.indexer_scores,
+                        n_idx,
+                        INDEXER_TOP_K,
+                    )?;
+                    // NOTE: IndexerTopk already wrote the per-token
+                    // bitmap into `slice`. No separate bitpack_set call
+                    // needed for the n_idx > INDEXER_TOP_K case.
+                    let _ = slice; // re-borrow guard
+                }
+                _t_ix.end()?;
+                Some(&bd.attn_comp_allowed_bits)
+            } else {
+                None
+            };
+
             let fused = std::env::var_os("ATTN_FUSED").is_some();
             let f32_scores = super::batch_scratch::use_f32_scores();
             if !fused {
@@ -1433,6 +1601,7 @@ impl HeterogeneousEngine {
                         &nrp_view,
                         &nrop_view,
                         &ncp_view,
+                        comp_allowed_bits,
                         N_HEAD,
                         N_HEAD_DIM,
                         n_total_max,

@@ -197,6 +197,29 @@ pub struct BatchDgpuScratch {
     /// the monolithic kernel's LDS `scores[2304]` (which overflows past ~9K
     /// tokens). ~1.1 GiB at B_MAX=256.
     pub attn_scores: DeviceBuffer<f32>,
+    /// `[B, ceil(ATTN_MIXED_MAX_KEYS/32)]` — bitpacked CSA mask passed
+    /// to the score kernel. Bit `(c & 31)` of word
+    /// `b * max_keys_words + (c >> 5)` is 1 iff comp row c is allowed
+    /// for batch token b. Only populated at ratio==4 layers where some
+    /// token in the chunk has `n_index_comp > INDEXER_TOP_K`; otherwise
+    /// the kernel sees `None` and runs dense.
+    pub attn_comp_allowed_bits: DeviceBuffer<u32>,
+    // ---- CSA indexer per-token scratch ----
+    /// `[B, N_INDEXER_HEAD * N_INDEXER_HEAD_DIM]` — per-token indexer Q
+    /// (matvec(attn_q_b) output before RoPE). Allocated full B-batch so
+    /// we can write all tokens with one batched matvec; the per-token
+    /// IndexerScore + IndexerTopk passes read slices.
+    pub indexer_q: DeviceBuffer<f32>,
+    /// `[B, N_INDEXER_HEAD]` — per-token head_weights (matvec(proj)
+    /// output, post-scale).
+    pub indexer_head_weights: DeviceBuffer<f32>,
+    /// `[ATTN_MIXED_MAX_KEYS]` — per-token scratch for IndexerScore output.
+    /// Reused across tokens within a chunk (sequential per-token topk
+    /// loop on the compute stream).
+    pub indexer_scores: DeviceBuffer<f32>,
+    /// `[INDEXER_TOP_K]` — per-token IndexerTopk output (selected
+    /// indices, sentinel -1 in unused slots). Reused per token.
+    pub indexer_selected: DeviceBuffer<i32>,
     pub low: DeviceBuffer<f32>,
     pub heads_xq: DeviceBuffer<i8>,
     pub heads_xscale: DeviceBuffer<f32>,
@@ -397,6 +420,22 @@ impl BatchDgpuScratch {
                 };
                 mk_f32(per_b)?
             },
+            // CSA mask scratch. Per-batch bitmap [B, ceil(MAX/32)] u32.
+            // For B_MAX=512 and ATTN_MIXED_MAX_KEYS=24576: 512 × 768 = 1.5 MB.
+            attn_comp_allowed_bits: {
+                let words_per_b = (ATTN_MIXED_MAX_KEYS as usize + 31) / 32;
+                DeviceBuffer::new(id, b * words_per_b)?
+            },
+            // Per-token Indexer Q [N_INDEXER_HEAD * N_INDEXER_HEAD_DIM].
+            // At B_MAX=512, 64×128 = 8192 f32 × 512 = 16 MB.
+            indexer_q: mk_f32((crate::config::N_INDEXER_HEAD
+                * crate::config::N_INDEXER_HEAD_DIM) as usize)?,
+            // Per-token head_weights [N_INDEXER_HEAD]. 64 f32 × 512 = 128 KB.
+            indexer_head_weights: mk_f32(crate::config::N_INDEXER_HEAD as usize)?,
+            // Single-token scratch reused sequentially across the B
+            // tokens' IndexerScore + IndexerTopk launches. 96 KB + 2 KB.
+            indexer_scores: DeviceBuffer::new(id, ATTN_MIXED_MAX_KEYS as usize)?,
+            indexer_selected: DeviceBuffer::new(id, crate::config::INDEXER_TOP_K as usize)?,
             low: mk_f32(OUT_LOW as usize)?,
             heads_xq: mk_i8(Q_FLAT as usize)?,
             heads_xscale: mk_f32(BLOCKS_GROUPED_OUT as usize)?,

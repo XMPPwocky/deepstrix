@@ -27,6 +27,9 @@ const INDEXER_GATHER_GFX1151: &[u8] = include_bytes!(env!("KERNEL_INDEXER_GATHER
 const VEC_SCALE_INPLACE_GFX1201: &[u8] = include_bytes!(env!("KERNEL_VEC_SCALE_INPLACE_GFX1201"));
 const VEC_SCALE_INPLACE_GFX1151: &[u8] = include_bytes!(env!("KERNEL_VEC_SCALE_INPLACE_GFX1151"));
 
+const INDEXER_BITPACK_GFX1201: &[u8] = include_bytes!(env!("KERNEL_INDEXER_BITPACK_GFX1201"));
+const INDEXER_BITPACK_GFX1151: &[u8] = include_bytes!(env!("KERNEL_INDEXER_BITPACK_GFX1151"));
+
 pub const INDEXER_TOP_K: u32 = 512;
 pub const INDEXER_N_HEAD: u32 = 64;
 pub const INDEXER_HEAD_DIM: u32 = 128;
@@ -279,5 +282,91 @@ impl VecScaleInplace {
             shared_mem_bytes: 0,
         };
         launch_kernel!(function, cfg, stream, [x.raw(), scalar, n])
+    }
+}
+
+/// Bitpack helpers for the prefill CSA mask. Three kernels:
+///  - `bitpack_zero`     — clear the first `n_words` words of a slice.
+///  - `bitpack_set`      — OR in the bits named by IndexerTopk's
+///                          `selected[k]` list (sentinel `-1` skipped).
+///  - `bitpack_all_ones` — set bits [0..n_comp) (early-permit branch
+///                          where every comp row is allowed).
+pub struct IndexerBitpack {
+    module: Module,
+}
+
+impl IndexerBitpack {
+    pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            INDEXER_BITPACK_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            INDEXER_BITPACK_GFX1151
+        } else {
+            return Err(eyre!("unsupported arch for indexer_bitpack: {arch}"));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    pub fn launch_zero(
+        &self,
+        stream: &Stream,
+        bits: &mut DeviceBuffer<u32>,
+        n_words: u32,
+    ) -> eyre::Result<()> {
+        if n_words == 0 {
+            return Ok(());
+        }
+        let function = self.module.get_function("indexer_bitpack_zero")?;
+        const BLOCK: u32 = 256;
+        let grid = (n_words + BLOCK - 1) / BLOCK;
+        let cfg = LaunchConfig {
+            grid: (grid, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [bits.raw(), n_words])
+    }
+
+    pub fn launch_set(
+        &self,
+        stream: &Stream,
+        bits: &mut DeviceBuffer<u32>,
+        selected: &DeviceBuffer<i32>,
+        k: u32,
+    ) -> eyre::Result<()> {
+        if k == 0 {
+            return Ok(());
+        }
+        let function = self.module.get_function("indexer_bitpack_set")?;
+        const BLOCK: u32 = 256;
+        let grid = (k + BLOCK - 1) / BLOCK;
+        let cfg = LaunchConfig {
+            grid: (grid, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [bits.raw(), selected.raw(), k])
+    }
+
+    pub fn launch_all_ones(
+        &self,
+        stream: &Stream,
+        bits: &mut DeviceBuffer<u32>,
+        n_comp: u32,
+    ) -> eyre::Result<()> {
+        if n_comp == 0 {
+            return Ok(());
+        }
+        let function = self.module.get_function("indexer_bitpack_all_ones")?;
+        const BLOCK: u32 = 256;
+        let n_words = (n_comp + 31) / 32;
+        let grid = (n_words + BLOCK - 1) / BLOCK;
+        let cfg = LaunchConfig {
+            grid: (grid, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [bits.raw(), n_comp])
     }
 }

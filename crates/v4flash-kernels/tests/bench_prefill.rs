@@ -349,6 +349,12 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
 
         // Stamp per-layer counters to simulate `pos` prior tokens. Same
         // logic as the decode FAKE_WARMUP path in perfetto_trace_long.
+        // The indexer compressor counter must be stamped too so the
+        // mask-aware prefill path (CSA, ratio==4 layers, ratio fires at
+        // the same boundaries as the main compressor) sees a realistic
+        // n_index_comp. The underlying comp_kv buffers stay zeroed —
+        // perf-shape is unaffected since the indexer's compute cost
+        // depends on `n_index_comp` not the buffer contents.
         let set_fake = |state: &mut HetModelState, pos: u32| {
             for layer in 0..N_LAYER as usize {
                 let ls = &mut state.layers[layer];
@@ -357,6 +363,9 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                 if ratio > 0 {
                     if let Some(cs) = ls.compressor.as_mut() {
                         cs.n_comp = pos / ratio;
+                    }
+                    if let Some(ics) = ls.indexer_compressor.as_mut() {
+                        ics.n_comp = pos / ratio;
                     }
                 }
             }

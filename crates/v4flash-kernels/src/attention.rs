@@ -556,6 +556,13 @@ impl AttentionMixed {
     /// computes in f32, stores back as f16). The Rust-side buffer stays
     /// `DeviceBuffer<f32>` (oversized — only half is used) so no scratch
     /// re-allocation is needed.
+    /// Mask-aware variant of [`Self::launch_score_batched_htiled_wmma_f16s`].
+    /// `comp_allowed_bits` is bitpacked `[B, max_keys_words]` u32 where
+    /// `max_keys_words = ceil(ATTN_MIXED_MAX_KEYS / 32)`. When `None`, the
+    /// kernel skips the bit test (bit-exact identical output to the
+    /// pre-mask version). When `Some(_)`, masked comp rows are stamped as
+    /// f16 -INFINITY in the score buffer — softmax converts to zero
+    /// weight downstream.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_score_batched_htiled_wmma_f16s(
         &self,
@@ -567,6 +574,7 @@ impl AttentionMixed {
         n_raw_per: &DeviceBuffer<i32>,
         n_raw_offset_per: &DeviceBuffer<i32>,
         n_comp_per: &DeviceBuffer<i32>,
+        comp_allowed_bits: Option<&DeviceBuffer<u32>>,
         n_head: u32,
         head_dim: u32,
         n_total_max: u32,
@@ -585,6 +593,10 @@ impl AttentionMixed {
             .module
             .get_function("attention_mixed_score_batched_htiled_wmma_f16s")?;
         let comp_kv_ptr = comp_kv.map(|b| b.raw()).unwrap_or(std::ptr::null_mut());
+        let mask_ptr = comp_allowed_bits
+            .map(|b| b.raw())
+            .unwrap_or(std::ptr::null_mut());
+        let max_keys_words: u32 = (ATTN_MIXED_MAX_KEYS + 31) / 32;
         let key_blocks = n_total_max.div_ceil(256);
         let cfg = LaunchConfig {
             grid: (key_blocks, 1, batch),
@@ -594,6 +606,7 @@ impl AttentionMixed {
         launch_kernel!(function, cfg, stream, [
             scores_g.raw(), q.raw(), raw_kv.raw(), comp_kv_ptr,
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
+            mask_ptr, max_keys_words,
             n_head, head_dim, ATTN_MIXED_MAX_KEYS, kq_scale
         ])
     }

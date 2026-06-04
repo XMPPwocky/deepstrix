@@ -851,6 +851,20 @@ extern "C" __global__ void attention_mixed_score_batched_htiled_wmma(
 // the attention pair at long context (e.g. 1.04 GB → 520 MB at
 // depth=32k, B=512). Phase A softmax math stays f32 (running max/sum are
 // reductions and need it); only the storage type changes.
+// `comp_allowed_bits` (nullable) carries the CSA indexer mask: when set,
+// it's a bitpacked [B, max_keys_words] buffer where bit `c & 31` of word
+// `b * max_keys_words + (c >> 5)` is 1 iff comp row c is allowed for
+// batch token b. Raw-KV rows are never masked (the SWA window is always
+// fully attended). Masked comp scores are stamped as f16 -INFINITY,
+// which softmax converts to 0 weight downstream.
+//
+// `max_keys_words = ceil(max_keys / 32)` — uniform across batches so the
+// indexing is just (b * max_keys_words + word). The caller is
+// responsible for sizing the buffer.
+//
+// `comp_allowed_bits == nullptr` short-circuits to dense (no bit test
+// emitted in the hot path). Bit-exact identical to the pre-mask kernel
+// in this case.
 extern "C" __global__ void attention_mixed_score_batched_htiled_wmma_f16s(
         _Float16       * scores_g,       // [B, n_head, max_keys]  (f16)
         const float    * q,
@@ -859,6 +873,8 @@ extern "C" __global__ void attention_mixed_score_batched_htiled_wmma_f16s(
         const int      * n_raw_per,
         const int      * n_raw_offset_per,
         const int      * n_comp_per,
+        const unsigned int * comp_allowed_bits, // nullable; [B, max_keys_words]
+        unsigned int     max_keys_words,        // = ceil(max_keys/32)
         unsigned int     n_head,
         unsigned int     head_dim,
         unsigned int     max_keys,
@@ -883,6 +899,14 @@ extern "C" __global__ void attention_mixed_score_batched_htiled_wmma_f16s(
             ? raw_kv + (size_t)(bkey + raw_off) * head_dim
             : comp_kv + (size_t)(bkey - n_raw) * head_dim;
     }
+    // CSA mask: per-(b, comp_row) bit test, hoisted out of the m-tile
+    // loop since it depends only on (b, bkey) not on the head tile.
+    bool key_masked = false;
+    if (comp_allowed_bits != nullptr && bkey >= n_raw && bkey < n_total) {
+        const unsigned int c = bkey - n_raw;
+        const unsigned int word_idx = (size_t)b * max_keys_words + (c >> 5);
+        key_masked = ((comp_allowed_bits[word_idx] >> (c & 31)) & 1u) == 0u;
+    }
     const unsigned int n_ht = n_head / 16u;
     float8 c[8];
     #pragma unroll
@@ -905,6 +929,7 @@ extern "C" __global__ void attention_mixed_score_batched_htiled_wmma_f16s(
             c[mt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(af, bf, c[mt]);
         }
     }
+    const _Float16 NEG_INF_F16 = (_Float16)(-INFINITY);
     #pragma unroll
     for (unsigned int mt = 0; mt < 8; mt++) {
         if (mt >= n_ht) break;
@@ -913,14 +938,14 @@ extern "C" __global__ void attention_mixed_score_batched_htiled_wmma_f16s(
             const unsigned int h = mt * 16u + (lane >> 4) * 8u + (unsigned int)e;
             if (h < n_head && bkey < n_total) {
                 scores_g[((size_t)b * n_head + h) * max_keys + bkey] =
-                    (_Float16)(c[mt][e] * kq_scale);
+                    key_masked ? NEG_INF_F16 : (_Float16)(c[mt][e] * kq_scale);
             }
         }
     }
 #else
     (void)scores_g; (void)q; (void)raw_kv; (void)comp_kv; (void)n_head;
     (void)head_dim; (void)max_keys; (void)kq_scale; (void)warp; (void)lane;
-    (void)n_total;
+    (void)n_total; (void)comp_allowed_bits; (void)max_keys_words;
 #endif
 }
 

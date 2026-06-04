@@ -125,6 +125,7 @@ pub struct DeviceEngine {
     pub indexer_score: crate::IndexerScore,
     pub indexer_topk: crate::IndexerTopk,
     pub indexer_gather: crate::IndexerGather,
+    pub indexer_bitpack: crate::IndexerBitpack,
     pub vec_scale: crate::VecScaleInplace,
     /// By-expert MoE pre-pass — inverts d_selected into per-expert
     /// (token, slot) lists. Used by the prefill iGPU MoE path.
@@ -182,6 +183,7 @@ impl DeviceEngine {
             indexer_score: crate::IndexerScore::for_arch(arch)?,
             indexer_topk: crate::IndexerTopk::for_arch(arch)?,
             indexer_gather: crate::IndexerGather::for_arch(arch)?,
+            indexer_bitpack: crate::IndexerBitpack::for_arch(arch)?,
             vec_scale: crate::VecScaleInplace::for_arch(arch)?,
             moe_group_builder: crate::moe_group_builder::MoeGroupBuilder::for_arch(arch)?,
             events,

@@ -201,6 +201,7 @@ fn bench_attention_isolated() -> eyre::Result<()> {
             attn.launch_score_batched_htiled_wmma_f16s(
                 stream, scores, &q, &raw_kv, comp_kv.as_ref(),
                 &n_raw_per, &n_raw_offset_per, &n_comp_per,
+                None, // no CSA mask in isolated bench — dense path
                 n_head, head_dim, n_total, /*batch=*/1,
             )?;
         }
@@ -250,6 +251,7 @@ fn bench_attention_isolated() -> eyre::Result<()> {
         attn.launch_score_batched_htiled_wmma_f16s(&stream, &mut scores, &q,
             &raw_kv, comp_kv.as_ref(),
             &n_raw_per, &n_raw_offset_per, &n_comp_per,
+            None,
             n_head, head_dim, n_total, 1)?;
         stream.synchronize()?;
         scores.copy_to_host(&mut s_test)?;
