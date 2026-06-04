@@ -16,6 +16,10 @@ const F16_MATVEC_PAIR_GFX1201: &[u8] =
     include_bytes!(env!("KERNEL_F16_MATVEC_PAIR_GFX1201"));
 const F16_MATVEC_PAIR_GFX1151: &[u8] =
     include_bytes!(env!("KERNEL_F16_MATVEC_PAIR_GFX1151"));
+const F16_GEMM_WMMA_GFX1201: &[u8] =
+    include_bytes!(env!("KERNEL_F16_GEMM_WMMA_GFX1201"));
+const F16_GEMM_WMMA_GFX1151: &[u8] =
+    include_bytes!(env!("KERNEL_F16_GEMM_WMMA_GFX1151"));
 
 const GEMV_ROWS_PER_BLOCK: u32 = 8;
 const GEMV_WARP_LANES: u32 = 32;
@@ -33,21 +37,28 @@ pub struct F16Matvec {
     wide: Module,
     narrow: Module,
     pair: Module,
+    gemm_wmma: Option<Module>,
 }
 
 impl F16Matvec {
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
-        let (wide_img, narrow_img, pair_img): (&[u8], &[u8], &[u8]) = if arch.starts_with("gfx1201") {
+        let (wide_img, narrow_img, pair_img, gemm_img): (
+            &[u8], &[u8], &[u8], Option<&[u8]>,
+        ) = if arch.starts_with("gfx1201") {
             (
                 F16_MATVEC_GFX1201,
                 F16_MATVEC_NARROW_GFX1201,
                 F16_MATVEC_PAIR_GFX1201,
+                Some(F16_GEMM_WMMA_GFX1201),
             )
         } else if arch.starts_with("gfx1151") {
             (
                 F16_MATVEC_GFX1151,
                 F16_MATVEC_NARROW_GFX1151,
                 F16_MATVEC_PAIR_GFX1151,
+                // gfx1151 has no WMMA; the kernel compiles but body is a
+                // no-op. We just never dispatch it on iGPU.
+                Some(F16_GEMM_WMMA_GFX1151),
             )
         } else {
             return Err(eyre!("unsupported arch for f16_matvec: {arch}"));
@@ -55,7 +66,60 @@ impl F16Matvec {
         let wide = Module::load_data(wide_img)?;
         let narrow = Module::load_data(narrow_img)?;
         let pair = Module::load_data(pair_img)?;
-        Ok(Self { wide, narrow, pair })
+        let gemm_wmma = gemm_img.map(Module::load_data).transpose()?;
+        Ok(Self { wide, narrow, pair, gemm_wmma })
+    }
+
+    /// LDS-tiled WMMA GEMM for f16 weights × f32 activations (gfx12 only).
+    /// Replaces `matvec_batched` for shapes where B is large enough to
+    /// benefit from cooperative tile loading (the matvec-per-batch path
+    /// re-fetches weights per row and is weight-BW-bound at large B).
+    /// Tile shape BM=BN=64, BK=32; out and batch dims align upward to 64.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_batched_wmma(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        x: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_rows == 0 {
+            return Ok(());
+        }
+        let module = self
+            .gemm_wmma
+            .as_ref()
+            .ok_or_else(|| eyre!("f16 gemm_batched_wmma: no module for this arch"))?;
+        let expected_weight_bytes = (n_rows as usize) * (k as usize) * 2;
+        if weight.byte_len() != expected_weight_bytes {
+            return Err(eyre!(
+                "f16 gemm_batched_wmma weight bytes: have {}, expected {} (n_rows={n_rows}, k={k})",
+                weight.byte_len(),
+                expected_weight_bytes
+            ));
+        }
+        if x.len() < (batch as usize) * (k as usize) {
+            return Err(eyre!("f16 gemm_batched_wmma x too small: {}", x.len()));
+        }
+        if out.len() < (batch as usize) * (n_rows as usize) {
+            return Err(eyre!("f16 gemm_batched_wmma out too small: {}", out.len()));
+        }
+        // Must match BM/BN in kernels/f16_gemm_wmma.hip.
+        const BM: u32 = 64;
+        const BN: u32 = 64;
+        const BLOCK: u32 = 128;
+        let function = module.get_function("f16_gemm_wmma_lds_tiled")?;
+        let cfg = LaunchConfig {
+            grid: ((n_rows + BM - 1) / BM, (batch + BN - 1) / BN, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), weight.raw(), x.raw(), k, n_rows, batch
+        ])
     }
 
     /// Paired matvec: `kv[r] = W_kv[r] · x`, `gate[r] = W_gate[r] · x` for

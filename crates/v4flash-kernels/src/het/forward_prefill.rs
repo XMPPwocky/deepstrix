@@ -1461,10 +1461,13 @@ impl HeterogeneousEngine {
                         .slice_view_mut(0, b as usize);
                     v.copy_from_host_async(&n_comp_after, &de.compute)?;
                 }
-                // q[B, N_INDEXER_HEAD * N_INDEXER_HEAD_DIM] = attn_q_b @ qr[B]
+                // q[B, N_INDEXER_HEAD * N_INDEXER_HEAD_DIM] = attn_q_b @ qr[B].
+                // LDS-tiled WMMA GEMM: weight loaded once per (m0,n0) tile
+                // and reused across BN=64 output cols. matvec_batched was
+                // weight-BW-bound on per-batch rereads at 156 ms/chunk.
                 {
                     let _t = de.events.stage("k.indexer.matvec_q", &de.compute)?;
-                    de.f16.matvec_batched(
+                    de.f16.gemm_batched_wmma(
                         &de.compute,
                         &mut bd.indexer_q,
                         &iw.attn_q_b.buffer,
