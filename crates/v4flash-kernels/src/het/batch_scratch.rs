@@ -14,7 +14,7 @@
 use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer};
 
-use crate::attention::ATTN_MIXED_MAX_KEYS;
+use crate::attention::{ATTN_MIXED_MAX_KEYS, ATTN_SCORES_STRIDE};
 use crate::config::{
     BLOCKS_GROUPED_OUT, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
     BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, HC_DIM, HC_MIX_DIM, N_EMBD, N_EXPERT, N_EXPERT_USED,
@@ -32,7 +32,7 @@ use super::scratch::{DgpuScratch, IgpuScratch};
 /// halving for f16 scores) which is dGPU-resident (16 GiB 9070 XT,
 /// ample), NOT on the tight iGPU expert budget; iGPU scratch growth is
 /// ~24→48 MB.
-pub const B_MAX: usize = 512;
+pub const B_MAX: usize = 1024;
 
 /// Diagnostic toggle (env `DEEPSTRIX_F32_SCORES=1`): route the batched-
 /// prefill attention through the **f32-scores** kernel pair instead of
@@ -441,10 +441,14 @@ impl BatchDgpuScratch {
             // Doubled when DEEPSTRIX_F32_SCORES=1 so the f32-scores
             // kernel pair has the headroom it needs.
             attn_scores: {
+                // Sized at ATTN_SCORES_STRIDE (not ATTN_MIXED_MAX_KEYS): the
+                // production batched attention runs on the CSA-gathered dense
+                // top-K buffer so n_total ≤ ~640 keys. 2048 stride leaves
+                // headroom and unblocks B_MAX > 512.
                 let per_b = if use_f32_scores() {
-                    (N_HEAD * ATTN_MIXED_MAX_KEYS) as usize
+                    (N_HEAD * ATTN_SCORES_STRIDE) as usize
                 } else {
-                    ((N_HEAD * ATTN_MIXED_MAX_KEYS) / 2) as usize
+                    ((N_HEAD * ATTN_SCORES_STRIDE) / 2) as usize
                 };
                 mk_f32(per_b)?
             },

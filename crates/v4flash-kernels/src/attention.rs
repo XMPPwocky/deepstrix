@@ -39,6 +39,21 @@ pub const ATTN_SWA_MAX_KV: u32 = 128;
 /// `kernels/attention_mixed.hip`.
 pub const ATTN_MIXED_MAX_KEYS: u32 = 24576;
 
+/// Stride (in keys) of the `attn_scores` scratch buffer per (batch, head).
+/// Smaller than ATTN_MIXED_MAX_KEYS because the production attention path
+/// runs after the CSA indexer has gathered the top-K=512 most-relevant
+/// comp_kv rows into a dense buffer. So n_total = n_raw (≤128) + n_keys
+/// (≤512) ≈ 640 at any depth. Set to 2048 to cover:
+///   - ratio==4 with CSA: ≤ 640 keys (post-gather)
+///   - ratio==4 without CSA (n_index_comp ≤ INDEXER_TOP_K): n_total ≤ 640
+///   - ratio==128 at 256K ctx: n_raw + n_kv/128 = 128 + 2048 = 2176 — close
+///     but headroom ok at our actual max ctx of 96K (1024). Bump if max
+///     ctx is ever raised past ~256K.
+///
+/// At B=512: 64 * 2048 * 2 (f16) = 256 KB/B = 128 MB scratch (was 1.5 GiB).
+/// At B=1024: 256 MB. Plenty of room for bigger batches.
+pub const ATTN_SCORES_STRIDE: u32 = 2048;
+
 /// Head-group size for the head-tiled WMMA smwsum kernels. Must match
 /// `#define SMWSUM_HEAD_TILE` in `kernels/attention_mixed.hip`.
 pub const SMWSUM_HEAD_TILE: u32 = 16;
@@ -592,9 +607,12 @@ impl AttentionMixed {
         if batch == 0 || n_total_max == 0 {
             return Ok(());
         }
-        if n_total_max > ATTN_MIXED_MAX_KEYS {
+        // BUFFER bound: scratch is sized at ATTN_SCORES_STRIDE per (b,head).
+        // The user-facing cap stays ATTN_MIXED_MAX_KEYS but the production
+        // CSA gather path never approaches it (post-gather n_total ≤ ~640).
+        if n_total_max > ATTN_SCORES_STRIDE {
             return Err(eyre!(
-                "attention_mixed_score_batched_htiled_wmma_f16s: n_total_max={n_total_max} exceeds cap {ATTN_MIXED_MAX_KEYS}"
+                "attention_mixed_score_batched_htiled_wmma_f16s: n_total_max={n_total_max} exceeds scratch stride {ATTN_SCORES_STRIDE}"
             ));
         }
         let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -605,6 +623,8 @@ impl AttentionMixed {
         let mask_ptr = comp_allowed_bits
             .map(|b| b.raw())
             .unwrap_or(std::ptr::null_mut());
+        // Mask is still bitpacked over ATTN_MIXED_MAX_KEYS bits — its
+        // allocation in `attn_comp_allowed_bits` hasn't shrunk.
         let max_keys_words: u32 = (ATTN_MIXED_MAX_KEYS + 31) / 32;
         let key_blocks = n_total_max.div_ceil(256);
         let cfg = LaunchConfig {
@@ -616,7 +636,7 @@ impl AttentionMixed {
             scores_g.raw(), q.raw(), raw_kv.raw(), comp_kv_ptr,
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
             mask_ptr, max_keys_words,
-            n_head, head_dim, ATTN_MIXED_MAX_KEYS, kq_scale,
+            n_head, head_dim, ATTN_SCORES_STRIDE, kq_scale,
             comp_kv_batch_stride
         ])
     }
@@ -742,7 +762,7 @@ impl AttentionMixed {
         launch_kernel!(function, cfg, stream, [
             out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
-            n_head, head_dim, ATTN_MIXED_MAX_KEYS, comp_kv_batch_stride
+            n_head, head_dim, ATTN_SCORES_STRIDE, comp_kv_batch_stride
         ])
     }
 

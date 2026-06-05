@@ -41,7 +41,7 @@ pub mod weights;
 pub mod wmma_probe;
 pub mod wmma_wsum;
 
-pub use attention::{AttentionMixed, AttentionSwa, ATTN_MIXED_MAX_KEYS, ATTN_SWA_MAX_KV};
+pub use attention::{AttentionMixed, AttentionSwa, ATTN_MIXED_MAX_KEYS, ATTN_SCORES_STRIDE, ATTN_SWA_MAX_KV};
 pub use broadcast::BroadcastToHc;
 pub use comp_kv_append::CompKvAppend;
 pub use compressor::{
