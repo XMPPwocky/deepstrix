@@ -141,3 +141,81 @@ fn bench_indexer_score_isolated() -> eyre::Result<()> {
 
     Ok(())
 }
+
+/// Batched IndexerScoreWmma at the production PREFILL shape (B=512,
+/// n_idx_max=8192 = depth-32K). Single dispatch per iter; ATT-trace one
+/// iter for the per-WG stall profile.
+#[test]
+#[ignore]
+fn bench_indexer_score_wmma_batched() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let n_idx_max: u32 = std::env::var("BENCH_N_IDX_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8192);
+    let batch: u32 = std::env::var("BENCH_BATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
+    let iters: u32 = std::env::var("BENCH_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let warmup: u32 = std::env::var("BENCH_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+
+    let dgpu = pick_dgpu()?;
+    dgpu.set_current()?;
+    let arch = dgpu.properties()?.gcn_arch_name;
+    let stream = Stream::new(dgpu.id)?;
+    let kernel = IndexerScoreWmma::for_arch(&arch)?;
+
+    let n_head = INDEXER_N_HEAD as usize;
+    let head_dim = INDEXER_HEAD_DIM as usize;
+    let n_idx_stride = n_idx_max;
+
+    eprintln!(
+        "isolated batched IndexerScoreWmma: B={batch} n_idx_max={n_idx_max} n_head={n_head} head_dim={head_dim} iters={iters}"
+    );
+
+    let mut d_q: DeviceBuffer<f32> =
+        DeviceBuffer::new(dgpu.id, (batch as usize) * n_head * head_dim)?;
+    d_q.copy_from_host(&vec![0.1f32; (batch as usize) * n_head * head_dim])?;
+    let mut d_hw: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, (batch as usize) * n_head)?;
+    d_hw.copy_from_host(&vec![0.05f32; (batch as usize) * n_head])?;
+    let mut seed: u32 = 0xdeadbeef;
+    let kv_host: Vec<u16> = (0..(n_idx_max as usize) * head_dim).map(|_| lcg(&mut seed)).collect();
+    let mut d_kv: DeviceBuffer<u16> = DeviceBuffer::new(dgpu.id, kv_host.len())?;
+    d_kv.copy_from_host(&kv_host)?;
+    let mut d_n_idx: DeviceBuffer<u32> = DeviceBuffer::new(dgpu.id, batch as usize)?;
+    d_n_idx.copy_from_host(&vec![n_idx_max; batch as usize])?;
+    let mut d_scores: DeviceBuffer<f32> =
+        DeviceBuffer::new(dgpu.id, (batch as usize) * (n_idx_stride as usize))?;
+    d_scores.copy_from_host(&vec![0f32; (batch as usize) * (n_idx_stride as usize)])?;
+
+    for _ in 0..warmup {
+        kernel.launch_batched(
+            &stream, &mut d_scores, &d_q, &d_hw, &d_kv, &d_n_idx,
+            n_idx_max, n_idx_stride, batch,
+        )?;
+    }
+    stream.synchronize()?;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        kernel.launch_batched(
+            &stream, &mut d_scores, &d_q, &d_hw, &d_kv, &d_n_idx,
+            n_idx_max, n_idx_stride, batch,
+        )?;
+    }
+    stream.synchronize()?;
+    let elapsed = t0.elapsed();
+    let per_call_us = elapsed.as_micros() as f64 / iters as f64;
+    eprintln!(
+        "BENCH IndexerScoreWmma_batched B={batch} n_idx={n_idx_max}: {iters} iters in {:.2}ms = {:.2}us/call",
+        elapsed.as_secs_f64() * 1000.0,
+        per_call_us
+    );
+    Ok(())
+}
