@@ -227,6 +227,8 @@ pub async fn list_models(State(engine): State<EngineHandle>) -> Json<serde_json:
             "loaded_context_length": ctx,
             "context_window": ctx,
             "context_length": ctx,
+            "max_completion_tokens": DEFAULT_MAX_NEW as u64,
+            "max_output_tokens": DEFAULT_MAX_NEW as u64,
             "state": "loaded"
         }]
     }))
