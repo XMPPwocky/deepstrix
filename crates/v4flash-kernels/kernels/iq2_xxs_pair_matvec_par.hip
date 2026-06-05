@@ -1832,3 +1832,236 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_staged(
         }
     }
 }
+
+// =============================================================================
+// tile8_row32 — port of ejpir/ds4-hip's moe_gate_up_mid_expert_tile8_row32
+// =============================================================================
+//
+// Different WG geometry vs `_chunked_staged`:
+//   - chunked_staged: 8 rows × 32 lanes; lane L decodes ONE octet/sb to LDS,
+//     32 lanes split one super-block 32 ways; warp_sum (32-wide) per row.
+//   - tile8_row32:    32 rows × 8 lanes; lane L processes super-blocks
+//     {L, L+8, L+16, ...} ENTIRELY in registers (full block8 dequant);
+//     quarter_warp_sum (8-wide) per row.
+//
+// Trade: tile8 amortizes the 8-octet dequant work into ~xq_blocks/8 super-
+// blocks per (row, lane) — no LDS round-trip for weights. LDS pressure
+// drops from ~9.6 KiB to ~2.1 KiB (just the iq2 LUTs), which opens
+// occupancy room. Per-row reduce drops to 3 shfls (8→1) instead of 5.
+//
+// Constraints:
+//   - chunk_size MUST be ≤ 8  (caller asserts; see Iq2XxsPairMatvec::launch_fused_swiglu_tile8)
+//   - n_rows MUST be a multiple of 32 (asserted in wrapper; 2048 is fine for V4-Flash N_FF_EXP)
+//
+// Numerics: bsum integer order matches dev_dot_iq2_xxs_q8_K_block_lut; f32
+// reduction order differs vs chunked_staged (per-member acc across
+// stride-8 super-blocks + 8-wide tree, vs warp-tree across 32 lanes). Same
+// shape of accumulation order ejpir's reference uses, so behaviour matches
+// the upstream fork.
+
+#define IQ2_TILE8_MAX_MEMBERS 8u
+
+// Quarter-warp 8-lane reduction. Mirrors ejpir's quarter_warp_sum_f32
+// (rocm/ds4_rocm_moe.cuh:474). RDNA __shfl_down_sync wraps lanes within
+// the warp; since each "row" (8 consecutive lanes within the wave) is
+// already aligned to multiples of 8, the 4 shfl steps stay within the row.
+__device__ __forceinline__ float quarter_warp_sum_f32(float v) {
+    v += __shfl_down_sync(FULL_WARP_MASK, v, 4);
+    v += __shfl_down_sync(FULL_WARP_MASK, v, 2);
+    v += __shfl_down_sync(FULL_WARP_MASK, v, 1);
+    return v;
+}
+
+// Block8 deq-LUT helper — direct port of ejpir's
+// dev_dot_iq2_xxs_q8_K_block8_deq_lut. Reads one iq2_xxs super-block,
+// unpacks 8 octets to register weights w[0..7] (4 grid lookups × 2 i32
+// each), then dp4a's into n_members q8_K xq slices.
+//
+// `n_members` MUST be ≤ 8. `q8_ptrs[m]` may be NULL for unused slots
+// (we still call dp4a; harmless because acc[m] is unused later).
+__device__ __forceinline__ void block8_dot_lut(
+        const uint8_t* iq2_block,                  // 66 bytes
+        const int8_t* const q8_ptrs[8],            // [n_members] each pointing to 256 int8
+        unsigned int n_members,
+        float xd,                                  // f16_to_f32(iq2_block->d)
+        const float yd[8],                         // per-member y->d
+        const uint64_t* __restrict__ s_grid,
+        const uint64_t* __restrict__ s_sign_pair,
+        float acc[8]) {
+    int32_t bsum[8] = {0,0,0,0,0,0,0,0};
+    const uint16_t* q2 = (const uint16_t*)(iq2_block + 2);
+    #pragma unroll
+    for (int ib32 = 0; ib32 < 8; ib32++) {  // QK_K / 32 = 8 sub-blocks
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        q2 += 4;
+        const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
+
+        int32_t w[8];
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const uint8_t  g_idx = (uint8_t)((aux0 >> (k * 8))  & 0xffu);
+            const uint32_t s_idx = (aux1 >> (k * 7)) & 0x7fu;
+            const uint64_t g     = s_grid[g_idx];
+            const uint64_t sp    = s_sign_pair[s_idx];
+            const uint32_t sm0   = (uint32_t)sp;
+            const uint32_t sm1   = (uint32_t)(sp >> 32);
+            w[k * 2 + 0] = cond_neg_bytes_fast((int32_t)(uint32_t)g,         sm0);
+            w[k * 2 + 1] = cond_neg_bytes_fast((int32_t)(uint32_t)(g >> 32), sm1);
+        }
+
+        #pragma unroll
+        for (unsigned int p = 0; p < IQ2_TILE8_MAX_MEMBERS; p++) {
+            if (p >= n_members) break;
+            const int8_t* q = q8_ptrs[p] + ib32 * 32;
+            int32_t sumi = 0;
+            sumi = sudot4_par(w[0], *(const int32_t*)(q + 0),  sumi);
+            sumi = sudot4_par(w[1], *(const int32_t*)(q + 4),  sumi);
+            sumi = sudot4_par(w[2], *(const int32_t*)(q + 8),  sumi);
+            sumi = sudot4_par(w[3], *(const int32_t*)(q + 12), sumi);
+            sumi = sudot4_par(w[4], *(const int32_t*)(q + 16), sumi);
+            sumi = sudot4_par(w[5], *(const int32_t*)(q + 20), sumi);
+            sumi = sudot4_par(w[6], *(const int32_t*)(q + 24), sumi);
+            sumi = sudot4_par(w[7], *(const int32_t*)(q + 28), sumi);
+            bsum[p] += sumi * ls;
+        }
+    }
+    #pragma unroll
+    for (unsigned int p = 0; p < IQ2_TILE8_MAX_MEMBERS; p++) {
+        if (p >= n_members) break;
+        acc[p] += 0.125f * xd * yd[p] * (float)bsum[p];
+    }
+}
+
+extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_tile8_row32(
+        float        * __restrict__ mid,           // [B, n_used, n_rows]
+        const uint8_t * __restrict__ gate_w_base,
+        const uint8_t * __restrict__ up_w_base,
+        const uint8_t * __restrict__ xq,           // [B, n_blocks*292]
+        const float  * __restrict__ expert_w,      // [B, n_used]
+        const int    * __restrict__ group_count,   // [n_expert]
+        const int    * __restrict__ expert_members,// [n_expert * max_per_expert]
+        const int    * __restrict__ work_items,    // [n_work_items]
+        unsigned int    gate_bpe,
+        unsigned int    up_bpe,
+        unsigned int    n_used,
+        unsigned int    max_per_expert,
+        unsigned int    chunk_size,                // ≤ 8
+        float           clamp,
+        unsigned int    n_rows,
+        unsigned int    n_blocks) {
+    const unsigned int w_idx = blockIdx.y;
+    const int packed_item   = work_items[w_idx];
+    const unsigned int e            = (unsigned int)(packed_item >> 16) & 0xffffu;
+    const unsigned int member_start = (unsigned int)(packed_item       ) & 0xffffu;
+    const int group_n = group_count[e];
+    const unsigned int member_end = min((unsigned int)group_n, member_start + chunk_size);
+    if (member_end <= member_start) return;
+    const unsigned int n_members = member_end - member_start;  // ≤ 8
+
+    __shared__ uint64_t s_grid[256];
+    __shared__ uint64_t s_sign_pair[128];
+
+    const unsigned int tid = threadIdx.x;
+
+    // Per-member (b, slot) decoded once. Kept in regs by replicating across all threads.
+    int pkt[IQ2_TILE8_MAX_MEMBERS] = {0,0,0,0,0,0,0,0};
+    #pragma unroll
+    for (unsigned int p = 0; p < IQ2_TILE8_MAX_MEMBERS; p++) {
+        if (p < n_members) {
+            pkt[p] = expert_members[(size_t)e * (size_t)max_per_expert
+                                  + (size_t)(member_start + p)];
+        }
+    }
+
+    // Load LUTs.
+    if (tid < 128) {
+        const uint32_t s     = ksigns_iq2xs[tid];
+        const uint32_t signs = s * 0x01010101u;
+        const uint32_t sm0   = expand_signs_par(signs, 0x08040201u);
+        const uint32_t sm1   = expand_signs_par(signs, 0x80402010u);
+        s_sign_pair[tid] = ((uint64_t)sm1 << 32) | (uint64_t)sm0;
+    }
+    if (tid < 256) s_grid[tid] = iq2xxs_grid[tid];
+    __syncthreads();
+
+    const unsigned int lane         = tid & 7u;             // 0..7  (block-stride lane)
+    const unsigned int row_in_block = tid >> 3;             // 0..31 (row within WG)
+    const unsigned int row          = blockIdx.x * 32u + row_in_block;
+    const bool row_valid = (row < n_rows);
+
+    if (!row_valid) return;
+
+    const uint8_t* gate_row_base = gate_w_base
+                                 + (uint64_t)e * (uint64_t)gate_bpe
+                                 + (uint64_t)row * (uint64_t)n_blocks * BLOCK_IQ2_XXS_BYTES;
+    const uint8_t* up_row_base   = up_w_base
+                                 + (uint64_t)e * (uint64_t)up_bpe
+                                 + (uint64_t)row * (uint64_t)n_blocks * BLOCK_IQ2_XXS_BYTES;
+
+    // Per-member xq base pointers + y->d cache.
+    const int8_t*  q8_base[IQ2_TILE8_MAX_MEMBERS];
+    float          yd_cache[IQ2_TILE8_MAX_MEMBERS] = {0,0,0,0,0,0,0,0};
+    #pragma unroll
+    for (unsigned int p = 0; p < IQ2_TILE8_MAX_MEMBERS; p++) {
+        q8_base[p] = nullptr;
+        if (p < n_members) {
+            const unsigned int b = (unsigned int)(pkt[p] >> 16);
+            const uint8_t* xq_b = xq + (size_t)b * (size_t)n_blocks * (size_t)BLOCK_Q8_K_BYTES;
+            q8_base[p] = (const int8_t*)(xq_b + 4);  // skip y->d header (4 bytes)
+            yd_cache[p] = *(const float*)xq_b;
+        }
+    }
+
+    float gate_acc[IQ2_TILE8_MAX_MEMBERS] = {0,0,0,0,0,0,0,0};
+    float up_acc  [IQ2_TILE8_MAX_MEMBERS] = {0,0,0,0,0,0,0,0};
+
+    // Each lane (0..7) processes super-blocks {lane, lane+8, ...}.
+    for (unsigned int b = lane; b < n_blocks; b += 8u) {
+        const uint8_t* gate_blk = gate_row_base + (uint64_t)b * BLOCK_IQ2_XXS_BYTES;
+        const uint8_t* up_blk   = up_row_base   + (uint64_t)b * BLOCK_IQ2_XXS_BYTES;
+        const float gd = f16_to_f32_par(*(const uint16_t*)gate_blk);
+        const float ud = f16_to_f32_par(*(const uint16_t*)up_blk);
+
+        // Build q8 ptr table for this super-block (constant across rows of same WG —
+        // but each lane owns its own super-block, so this stays in regs).
+        const int8_t* q8_sb[IQ2_TILE8_MAX_MEMBERS];
+        #pragma unroll
+        for (unsigned int p = 0; p < IQ2_TILE8_MAX_MEMBERS; p++) {
+            q8_sb[p] = (p < n_members) ? (q8_base[p] + (size_t)b * (size_t)BLOCK_Q8_K_BYTES)
+                                       : nullptr;
+        }
+
+        block8_dot_lut(gate_blk, q8_sb, n_members, gd, yd_cache, s_grid, s_sign_pair, gate_acc);
+        block8_dot_lut(up_blk,   q8_sb, n_members, ud, yd_cache, s_grid, s_sign_pair, up_acc);
+    }
+
+    // Quarter-warp reduce across the 8 lanes of each row.
+    #pragma unroll
+    for (unsigned int p = 0; p < IQ2_TILE8_MAX_MEMBERS; p++) {
+        if (p >= n_members) break;
+        gate_acc[p] = quarter_warp_sum_f32(gate_acc[p]);
+        up_acc  [p] = quarter_warp_sum_f32(up_acc  [p]);
+    }
+
+    if (lane == 0u) {
+        #pragma unroll
+        for (unsigned int p = 0; p < IQ2_TILE8_MAX_MEMBERS; p++) {
+            if (p >= n_members) break;
+            const unsigned int b    = (unsigned int)(pkt[p] >> 16);
+            const unsigned int slot = (unsigned int)(pkt[p] & 0xFFFFu);
+            float g_sum = gate_acc[p];
+            float u_sum = up_acc[p];
+            if (clamp > 1.0e-6f) {
+                if (g_sum > clamp)  g_sum = clamp;
+                if (u_sum > clamp)  u_sum = clamp;
+                if (u_sum < -clamp) u_sum = -clamp;
+            }
+            const float ew  = expert_w[(size_t)b * (size_t)n_used + (size_t)slot];
+            const float sig = 1.0f / (1.0f + expf(-g_sum));
+            const size_t out_off = ((size_t)b * (size_t)n_used + (size_t)slot)
+                                 * (size_t)n_rows + (size_t)row;
+            mid[out_off] = g_sum * sig * u_sum * ew;
+        }
+    }
+}

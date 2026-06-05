@@ -2231,8 +2231,11 @@ impl HeterogeneousEngine {
         //   2. moe_work_items_builder: chunk popular groups → work_items + n_work_items.
         //   3. host sync + readback n_work_items to set main kernel grid.y.
         //   4. iq2 chunked main kernel.
-        // CHUNK_SIZE=16 — WMMA-compatible, bounds popular-expert WG iters.
-        const CHUNK_SIZE: u32 = 32;
+        // Chunk size = how many members per WG the iq2/q2k kernels handle.
+        // tile8_row32 caps at 8 (ejpir-style block8 unpack); others use 32.
+        let variant_peek = std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "staged".into());
+        #[allow(non_snake_case)]
+        let CHUNK_SIZE: u32 = if variant_peek == "tile8" { 8 } else { 32 };
         let max_per_expert = bi.max_per_expert();
         bi.group_count.fill_zero()?;
         {
@@ -2254,11 +2257,11 @@ impl HeterogeneousEngine {
                 max_per_expert,
             )?;
         }
-        // IQ2_VARIANT env: "staged" (default), "chunked", or "hybrid".
-        // Hybrid splits work items by actual chunk size, sorts each bucket
-        // by expert, runs staged kernel for large chunks + chunked for small.
+        // IQ2_VARIANT env: "staged" (default), "chunked", "hybrid", or "tile8".
+        // - hybrid: split work items by chunk size; staged for large, chunked for small.
+        // - tile8:  ejpir-port block8 + tile8_row32 (chunk_size auto-set to 8 above).
         // IQ2_HYBRID_THRESHOLD env: chunk-size cutoff (default 8).
-        let variant = std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "staged".into());
+        let variant = variant_peek.clone();
         // Carried out to the q2k_down dispatch below; staged/chunked path
         // assigns it inside its else-branch, hybrid path leaves it 0 (which
         // is fine — Q2K_VARIANT=by_expert is forbidden with hybrid below).
@@ -2380,8 +2383,20 @@ impl HeterogeneousEngine {
                     work_items,
                     ..
                 } = bi;
-                let use_staged = variant != "chunked";
-                if use_staged {
+                if variant == "tile8" {
+                    let _t_t8 = ie.events.stage("igpu.iq2_tile8", &ie.compute)?;
+                    ie.iq2.launch_fused_swiglu_tile8_row32(
+                        &ie.compute, d_mid_cat,
+                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        d_xq_q8k, d_ew,
+                        group_count, expert_members, work_items,
+                        gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
+                        crate::config::SWIGLU_CLAMP_EXP,
+                        crate::config::N_FF_EXP,
+                        crate::config::BLOCKS_Q8K_GATE_IN,
+                        n_work_items,
+                    )?;
+                } else if variant != "chunked" {
                     let _t_st = ie.events.stage("igpu.iq2_staged", &ie.compute)?;
                     ie.iq2.launch_fused_swiglu_chunked_staged(
                         &ie.compute, d_mid_cat,
