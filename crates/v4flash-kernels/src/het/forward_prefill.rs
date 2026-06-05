@@ -2002,7 +2002,10 @@ impl HeterogeneousEngine {
             // per-row warp reduction is identical to the old per-token loop, so
             // logits are bit-identical — only the launch count drops from B to 1.
             let _t = de.events.stage("k.router.f16_matvec", &de.compute)?;
-            de.f16.matvec_batched(
+            // GEMM-tile via LDS-WMMA: M=N_EXPERT=256, K=N_EMBD=4096, N=B.
+            // matvec_batched re-reads weight per batch — at B=512 that's
+            // weight-BW-bound; tile-shares across BN=64.
+            de.f16.gemm_batched_wmma(
                 &de.compute,
                 &mut bd.router_logits,
                 &dlw.ffn_gate_inp.buffer,
