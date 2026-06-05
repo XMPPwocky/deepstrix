@@ -800,7 +800,10 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.q_chain.qa_matvec", &de.compute)?;
-            de.q8.matvec_batched(
+            // LDS-tiled WMMA GEMM: matvec_batched re-reads weight per
+            // batch (weight-BW-bound at B=512). GEMM shares weight across
+            // BN=64 batch cols.
+            de.q8_wmma.gemm_lds_tiled(
                 &de.compute,
                 &mut bd.qr,
                 &dlw.attn_q_a.buffer,
@@ -902,7 +905,7 @@ impl HeterogeneousEngine {
         let _t_kv = de.events.stage("dgpu.kv_chain", &de.compute)?;
         {
             let _t = de.events.stage("k.kv_chain.matvec", &de.compute)?;
-            de.q8.matvec_batched(
+            de.q8_wmma.gemm_lds_tiled(
                 &de.compute,
                 &mut bd.kv_raw,
                 &dlw.attn_kv.buffer,
@@ -2081,8 +2084,11 @@ impl HeterogeneousEngine {
             )?;
         }
         {
+            // LDS-tiled WMMA GEMM: weight tile loaded ONCE per (m0,n0)
+            // tile and reused across BN=64 batch cols (matvec_batched
+            // re-reads weight per batch — weight-BW-bound at B=512).
             let _t = de.events.stage("k.shared_expert.gate_matvec", &de.compute)?;
-            de.q8.matvec_batched(
+            de.q8_wmma.gemm_lds_tiled(
                 &de.compute,
                 &mut bd.gate_sh,
                 &dlw.shared.gate.buffer,
@@ -2095,7 +2101,7 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.shared_expert.up_matvec", &de.compute)?;
-            de.q8.matvec_batched(
+            de.q8_wmma.gemm_lds_tiled(
                 &de.compute,
                 &mut bd.up_sh,
                 &dlw.shared.up.buffer,
@@ -2130,7 +2136,7 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.shared_expert.down_matvec", &de.compute)?;
-            de.q8.matvec_batched(
+            de.q8_wmma.gemm_lds_tiled(
                 &de.compute,
                 &mut bd.ffn_shared,
                 &dlw.shared.down.buffer,
