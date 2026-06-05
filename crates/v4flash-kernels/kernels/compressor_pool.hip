@@ -72,3 +72,65 @@ extern "C" __global__ void compressor_pool(
 
     out[j] = (denom > 0.0f) ? (sum / denom) : 0.0f;
 }
+
+// Batched variant: grid (1, n_boundaries, 1), block head_dim. Each WG
+// pools one boundary's state into out_b[k * head_dim]. State buffers are
+// strided per boundary by (coff * compress_ratio) * width elements.
+extern "C" __global__ void compressor_pool_batched(
+        float       * __restrict__ out_b,         // [n_boundaries, head_dim]
+        const float * __restrict__ state_kv_b,    // [n_boundaries, coff*ratio, width]
+        const float * __restrict__ state_score_b, // same shape
+        unsigned int  head_dim,
+        unsigned int  compress_ratio) {
+    const unsigned int j = threadIdx.x;
+    const unsigned int k = blockIdx.y;
+    if (j >= head_dim) return;
+
+    const unsigned int coff = (compress_ratio == 4u) ? 2u : 1u;
+    const unsigned int width = coff * head_dim;
+    const unsigned int state_per_boundary = (coff * compress_ratio) * width;
+
+    const float *state_kv    = state_kv_b    + (size_t)k * state_per_boundary;
+    const float *state_score = state_score_b + (size_t)k * state_per_boundary;
+    float       *out         = out_b         + (size_t)k * head_dim;
+
+    float max_score = POOL_NEG_INF;
+    if (compress_ratio == 4u) {
+        for (unsigned int r = 0; r < compress_ratio; r++) {
+            const float sp = state_score[(unsigned long long)r * width + j];
+            const float sc = state_score[(unsigned long long)(compress_ratio + r) * width + head_dim + j];
+            if (sp > max_score) max_score = sp;
+            if (sc > max_score) max_score = sc;
+        }
+    } else {
+        for (unsigned int r = 0; r < compress_ratio; r++) {
+            const float s = state_score[(unsigned long long)r * width + j];
+            if (s > max_score) max_score = s;
+        }
+    }
+
+    if (max_score <= POOL_NEG_INF * 0.5f) {
+        out[j] = 0.0f;
+        return;
+    }
+
+    float denom = 0.0f;
+    float sum = 0.0f;
+    if (compress_ratio == 4u) {
+        for (unsigned int r = 0; r < compress_ratio; r++) {
+            const float wp = expf(state_score[(unsigned long long)r * width + j] - max_score);
+            const float wc = expf(state_score[(unsigned long long)(compress_ratio + r) * width + head_dim + j] - max_score);
+            denom += wp + wc;
+            sum += wp * state_kv[(unsigned long long)r * width + j];
+            sum += wc * state_kv[(unsigned long long)(compress_ratio + r) * width + head_dim + j];
+        }
+    } else {
+        for (unsigned int r = 0; r < compress_ratio; r++) {
+            const float w = expf(state_score[(unsigned long long)r * width + j] - max_score);
+            denom += w;
+            sum += w * state_kv[(unsigned long long)r * width + j];
+        }
+    }
+
+    out[j] = (denom > 0.0f) ? (sum / denom) : 0.0f;
+}

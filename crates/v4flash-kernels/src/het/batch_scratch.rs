@@ -231,6 +231,23 @@ pub struct BatchDgpuScratch {
     /// kernels read only the dense top-K rows per batch instead of doing
     /// per-row mask tests on the full sparse n_comp. ~256 MB at B_MAX=512.
     pub attn_active_comp_kv: DeviceBuffer<u16>,
+    /// `[n_boundaries_max × coff × ratio × width]` f32 — per-boundary
+    /// state_kv snapshots taken at each boundary firing in the prefill
+    /// compressor loop. Reused across main + indexer compressors (only
+    /// one is active at a time). Sized for the largest case (ratio==4
+    /// main: 128 boundaries × 8 × 1024 = 4 MB).
+    pub comp_state_kv_snapshots: DeviceBuffer<f32>,
+    pub comp_state_score_snapshots: DeviceBuffer<f32>,
+    /// `[n_boundaries_max, head_dim]` f32 — pool output per boundary.
+    /// Feeds rms_w_batched which writes its result into `comp_rows_batched`.
+    pub comp_pooled_batched: DeviceBuffer<f32>,
+    /// `[n_boundaries_max, head_dim]` f32 — post-rms_w, then rope/fp8/
+    /// f16rt-ed in place. Final values appended to comp_kv via
+    /// comp_kv_append_batched. Max 128 × 512 = 256 KB.
+    pub comp_rows_batched: DeviceBuffer<f32>,
+    /// `[n_boundaries_max]` i32 — per-boundary RoPE positions, uploaded
+    /// once per layer×compressor for the batched rope launch.
+    pub comp_pos_per_boundary: DeviceBuffer<i32>,
     pub low: DeviceBuffer<f32>,
     pub heads_xq: DeviceBuffer<i8>,
     pub heads_xscale: DeviceBuffer<f32>,
@@ -461,6 +478,31 @@ impl BatchDgpuScratch {
             attn_active_comp_kv: mk_u16(
                 (crate::config::INDEXER_TOP_K * crate::config::N_HEAD_DIM) as usize,
             )?,
+            // Per-boundary state snapshots scratch. Sized for the largest
+            // compressor (main ratio==4: 8 × 1024 f32 = 32 KB) × max boundaries
+            // (B_MAX/4 = 128) = 4 MB per buffer. Reused across compressors.
+            comp_state_kv_snapshots: {
+                let max_state_per_b = 8 * (2 * crate::config::N_HEAD_DIM) as usize; // ratio*coff * width
+                let max_boundaries = B_MAX / 4;
+                DeviceBuffer::new(id, max_boundaries * max_state_per_b)?
+            },
+            comp_state_score_snapshots: {
+                let max_state_per_b = 8 * (2 * crate::config::N_HEAD_DIM) as usize;
+                let max_boundaries = B_MAX / 4;
+                DeviceBuffer::new(id, max_boundaries * max_state_per_b)?
+            },
+            comp_pooled_batched: {
+                let max_boundaries = B_MAX / 4;
+                DeviceBuffer::new(id, max_boundaries * crate::config::N_HEAD_DIM as usize)?
+            },
+            comp_rows_batched: {
+                let max_boundaries = B_MAX / 4;
+                DeviceBuffer::new(id, max_boundaries * crate::config::N_HEAD_DIM as usize)?
+            },
+            comp_pos_per_boundary: {
+                let max_boundaries = B_MAX / 4;
+                DeviceBuffer::new(id, max_boundaries)?
+            },
             low: mk_f32(OUT_LOW as usize)?,
             heads_xq: mk_i8(Q_FLAT as usize)?,
             heads_xscale: mk_f32(BLOCKS_GROUPED_OUT as usize)?,

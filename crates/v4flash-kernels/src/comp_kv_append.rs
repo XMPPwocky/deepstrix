@@ -63,4 +63,49 @@ impl CompKvAppend {
         };
         launch_kernel!(function, cfg, stream, [comp_kv.raw(), row.raw(), n_comp, head_dim])
     }
+
+    /// Batched: append `n_boundaries` rows from `rows_b[k*head_dim]` to
+    /// `comp_kv[(n_comp_start+k)*head_dim]` for k in 0..n_boundaries.
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        comp_kv: &mut DeviceBuffer<u16>,
+        rows_b: &DeviceBuffer<f32>,
+        n_comp_start: u32,
+        head_dim: u32,
+        n_boundaries: u32,
+    ) -> eyre::Result<()> {
+        if n_boundaries == 0 {
+            return Ok(());
+        }
+        if head_dim == 0 || head_dim > 1024 {
+            return Err(eyre!(
+                "comp_kv_append_batched: head_dim must be in [1, 1024], got {head_dim}"
+            ));
+        }
+        let need = ((n_comp_start + n_boundaries) as usize) * (head_dim as usize);
+        if comp_kv.len() < need {
+            return Err(eyre!(
+                "comp_kv_append_batched: comp_kv len {} < {}",
+                comp_kv.len(),
+                need
+            ));
+        }
+        if rows_b.len() < (n_boundaries as usize) * (head_dim as usize) {
+            return Err(eyre!(
+                "comp_kv_append_batched: rows_b len {} < {}",
+                rows_b.len(),
+                (n_boundaries as usize) * (head_dim as usize)
+            ));
+        }
+        let function = self.module.get_function("comp_kv_append_batched")?;
+        let cfg = LaunchConfig {
+            grid: (1, n_boundaries, 1),
+            block: (head_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            comp_kv.raw(), rows_b.raw(), n_comp_start, head_dim
+        ])
+    }
 }

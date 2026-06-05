@@ -1078,6 +1078,12 @@ impl HeterogeneousEngine {
                 .compressor
                 .as_mut()
                 .ok_or_else(|| eyre!("L{layer}: missing compressor state"))?;
+            // Per-boundary snapshot scratch slot size for THIS compressor.
+            let coff_main: u32 = if ratio == 4 { 2 } else { 1 };
+            let snap_elems = (coff_main * ratio * comp_width) as usize;
+            let n_comp_start = cs.n_comp;
+            let mut pos_per_boundary_host: Vec<i32> = Vec::new();
+
             let mut i: u32 = 0;
             while i < b {
                 let pos_mod_now = (pos0 + i) % ratio;
@@ -1085,21 +1091,6 @@ impl HeterogeneousEngine {
                 let seg_end = i + seg_len;
 
                 // Batched state_write for this segment.
-                //
-                // CRITICAL: per-batch stride MUST be `comp_width`, not
-                // the constant `2 * cs_kvhd`. comp_width = coff *
-                // head_dim, where coff=2 for ratio==4 layers and
-                // coff=1 for ratio==128 layers. The old `2*cs_kvhd =
-                // 1024` formula happened to match coff=2 (ratio=4)
-                // but DOUBLED the offset for ratio=128 layers — the
-                // second segment iter per lane then read from
-                // uninitialised scratch past the matvec_pair_batched
-                // write region, producing zero-near-magnitude garbage
-                // for every other compressed K/V row at ratio=128
-                // layers. Observed end-to-end as catastrophic
-                // attn_heads divergence at layer 3 (the first
-                // ratio=128 layer) on long-prompt cases. See the
-                // sub-tensor bisection in [TODO: commit msg].
                 let comp_stride = comp_width as usize;
                 let kv_seg = bd.kv_cur.slice_view(
                     (i as usize) * comp_stride,
@@ -1124,42 +1115,27 @@ impl HeterogeneousEngine {
                     seg_len,
                 )?;
 
-                // Boundary fire? (Sequential dep on state via pool+shuffle.)
+                // Boundary fire? Snapshot state for batched post-pass at
+                // end-of-chunk. Shuffle still runs immediately so the
+                // NEXT segment's state_write sees correct "old" rows.
                 let comp_fires = (pos0 + seg_end) % ratio == 0;
                 if comp_fires {
-                    // Use slot 0 of pooled/comp_row as scratch (boundaries serial).
-                    let mut pooled_v = bd.pooled.slice_view_mut(0, cs_kvhd);
-                    let mut comp_row_v = bd.comp_row.slice_view_mut(0, cs_kvhd);
-                    de.compressor_pool.launch(
+                    let k = pos_per_boundary_host.len();
+                    let snap_off = k * snap_elems;
+                    let mut snap_kv = bd
+                        .comp_state_kv_snapshots
+                        .slice_view_mut(snap_off, snap_elems);
+                    let mut snap_sc = bd
+                        .comp_state_score_snapshots
+                        .slice_view_mut(snap_off, snap_elems);
+                    de.compressor_state_snapshot.launch(
                         &de.compute,
-                        &mut pooled_v,
+                        &mut snap_kv,
+                        &mut snap_sc,
                         &cs.state_kv,
                         &cs.state_score,
-                        N_HEAD_DIM,
-                        ratio,
+                        snap_elems as u32,
                     )?;
-                    de.rms_w.launch_weighted(
-                        &de.compute,
-                        &mut comp_row_v,
-                        &pooled_v,
-                        &cw.norm,
-                        N_HEAD_DIM,
-                        RMS_EPS,
-                    )?;
-                    let comp_pos = pos0 + seg_end - ratio;
-                    de.rope.launch_forward(
-                        &de.compute,
-                        &mut comp_row_v,
-                        1,
-                        N_HEAD_DIM,
-                        N_ROT,
-                        comp_pos,
-                        &dlw.rope_params,
-                    )?;
-                    de.fp8
-                        .launch(&de.compute, &mut comp_row_v, N_HEAD_DIM - N_ROT)?;
-                    de.f16rt
-                        .launch(&de.compute, &mut comp_row_v, N_HEAD_DIM)?;
                     if ratio == 4 {
                         de.compressor_shuffle.launch(
                             &de.compute,
@@ -1168,21 +1144,14 @@ impl HeterogeneousEngine {
                             comp_width,
                         )?;
                     }
-                    de.comp_kv_append.launch(
-                        &de.compute,
-                        &mut cs.comp_kv,
-                        &comp_row_v,
-                        cs.n_comp,
-                        N_HEAD_DIM,
-                    )?;
+                    pos_per_boundary_host.push((pos0 + seg_end - ratio) as i32);
                     cs.n_comp += 1;
                 }
 
                 // n_comp_after semantics: for token at pos = pos0+k, value
                 // reflects cs.n_comp AFTER processing that position. If the
-                // boundary fires at the end of this segment (i.e., at the
-                // last position in the segment), only that LAST position
-                // sees the post-fire n_comp; earlier positions see pre-fire.
+                // boundary fires at the end of this segment, only the LAST
+                // position sees the post-fire n_comp; earlier positions see pre-fire.
                 let post_fire = cs.n_comp;
                 let pre_fire = if comp_fires { post_fire - 1 } else { post_fire };
                 for k in i..seg_end {
@@ -1194,6 +1163,73 @@ impl HeterogeneousEngine {
                     n_comp_after.push(snap);
                 }
                 i = seg_end;
+            }
+
+            // Batched per-boundary stages: pool → rms_w → rope → fp8 →
+            // f16rt → comp_kv_append. Replaces what used to be 6 launches
+            // per boundary × ~128 boundaries × 21+ layers in the per-token
+            // serial loop (~200ms of launch overhead per chunk).
+            let n_boundaries = pos_per_boundary_host.len() as u32;
+            if n_boundaries > 0 {
+                de.compressor_pool.launch_batched(
+                    &de.compute,
+                    &mut bd.comp_pooled_batched,
+                    &bd.comp_state_kv_snapshots,
+                    &bd.comp_state_score_snapshots,
+                    N_HEAD_DIM,
+                    ratio,
+                    n_boundaries,
+                )?;
+                de.rms_w.launch_weighted_batched(
+                    &de.compute,
+                    &mut bd.comp_rows_batched,
+                    &bd.comp_pooled_batched,
+                    &cw.norm,
+                    N_HEAD_DIM,
+                    RMS_EPS,
+                    n_boundaries,
+                )?;
+                {
+                    let mut pv = bd
+                        .comp_pos_per_boundary
+                        .slice_view_mut(0, n_boundaries as usize);
+                    pv.copy_from_host_async(&pos_per_boundary_host, &de.compute)?;
+                }
+                {
+                    let pos_v = bd
+                        .comp_pos_per_boundary
+                        .slice_view(0, n_boundaries as usize);
+                    de.rope.launch_forward_batched(
+                        &de.compute,
+                        &mut bd.comp_rows_batched,
+                        &pos_v,
+                        1,
+                        N_HEAD_DIM,
+                        N_ROT,
+                        n_boundaries,
+                        &dlw.rope_params,
+                    )?;
+                }
+                de.fp8.launch_batched(
+                    &de.compute,
+                    &mut bd.comp_rows_batched,
+                    N_HEAD_DIM - N_ROT,
+                    N_HEAD_DIM,
+                    n_boundaries,
+                )?;
+                de.f16rt.launch(
+                    &de.compute,
+                    &mut bd.comp_rows_batched,
+                    n_boundaries * N_HEAD_DIM,
+                )?;
+                de.comp_kv_append.launch_batched(
+                    &de.compute,
+                    &mut cs.comp_kv,
+                    &bd.comp_rows_batched,
+                    n_comp_start,
+                    N_HEAD_DIM,
+                    n_boundaries,
+                )?;
             }
         } else {
             for _ in 0..b {
@@ -1250,6 +1286,13 @@ impl HeterogeneousEngine {
                 )?;
             }
 
+            // Same snapshot+batched pattern as main compressor above.
+            // ratio==4, no fp8 (head_dim=128 != 512).
+            let coff_idx: u32 = 2; // ratio==4 ⇒ coff = 2
+            let snap_elems_idx = (coff_idx * ratio * icw) as usize;
+            let n_idx_comp_start = ics.n_comp;
+            let mut pos_per_boundary_idx: Vec<i32> = Vec::new();
+
             let mut i: u32 = 0;
             while i < b {
                 let pos_mod_now = (pos0 + i) % ratio;
@@ -1282,52 +1325,89 @@ impl HeterogeneousEngine {
 
                 let comp_fires = (pos0 + seg_end) % ratio == 0;
                 if comp_fires {
-                    let mut pooled_v = bd.pooled.slice_view_mut(0, ihd as usize);
-                    let mut comp_row_v = bd.comp_row.slice_view_mut(0, ihd as usize);
-                    de.compressor_pool.launch(
+                    let k = pos_per_boundary_idx.len();
+                    let snap_off = k * snap_elems_idx;
+                    let mut snap_kv = bd
+                        .comp_state_kv_snapshots
+                        .slice_view_mut(snap_off, snap_elems_idx);
+                    let mut snap_sc = bd
+                        .comp_state_score_snapshots
+                        .slice_view_mut(snap_off, snap_elems_idx);
+                    de.compressor_state_snapshot.launch(
                         &de.compute,
-                        &mut pooled_v,
+                        &mut snap_kv,
+                        &mut snap_sc,
                         &ics.state_kv,
                         &ics.state_score,
-                        ihd,
-                        ratio,
+                        snap_elems_idx as u32,
                     )?;
-                    de.rms_w.launch_weighted(
-                        &de.compute,
-                        &mut comp_row_v,
-                        &pooled_v,
-                        &iw.norm,
-                        ihd,
-                        RMS_EPS,
-                    )?;
-                    let comp_pos = pos0 + seg_end - ratio;
-                    de.rope.launch_forward(
-                        &de.compute,
-                        &mut comp_row_v,
-                        1,
-                        ihd,
-                        N_ROT,
-                        comp_pos,
-                        &dlw.rope_params,
-                    )?;
-                    // No FP8 (head_dim != 512).
-                    de.f16rt.launch(&de.compute, &mut comp_row_v, ihd)?;
                     de.compressor_shuffle.launch(
                         &de.compute,
                         &mut ics.state_kv,
                         &mut ics.state_score,
                         icw,
                     )?;
-                    de.comp_kv_append.launch(
-                        &de.compute,
-                        &mut ics.comp_kv,
-                        &comp_row_v,
-                        ics.n_comp,
-                        ihd,
-                    )?;
+                    pos_per_boundary_idx.push((pos0 + seg_end - ratio) as i32);
                     ics.n_comp += 1;
                 }
                 i = seg_end;
+            }
+
+            // Batched post-stages for the indexer compressor (no fp8).
+            let n_idx_boundaries = pos_per_boundary_idx.len() as u32;
+            if n_idx_boundaries > 0 {
+                de.compressor_pool.launch_batched(
+                    &de.compute,
+                    &mut bd.comp_pooled_batched,
+                    &bd.comp_state_kv_snapshots,
+                    &bd.comp_state_score_snapshots,
+                    ihd,
+                    ratio,
+                    n_idx_boundaries,
+                )?;
+                de.rms_w.launch_weighted_batched(
+                    &de.compute,
+                    &mut bd.comp_rows_batched,
+                    &bd.comp_pooled_batched,
+                    &iw.norm,
+                    ihd,
+                    RMS_EPS,
+                    n_idx_boundaries,
+                )?;
+                {
+                    let mut pv = bd
+                        .comp_pos_per_boundary
+                        .slice_view_mut(0, n_idx_boundaries as usize);
+                    pv.copy_from_host_async(&pos_per_boundary_idx, &de.compute)?;
+                }
+                {
+                    let pos_v = bd
+                        .comp_pos_per_boundary
+                        .slice_view(0, n_idx_boundaries as usize);
+                    de.rope.launch_forward_batched(
+                        &de.compute,
+                        &mut bd.comp_rows_batched,
+                        &pos_v,
+                        1,
+                        ihd,
+                        N_ROT,
+                        n_idx_boundaries,
+                        &dlw.rope_params,
+                    )?;
+                }
+                de.f16rt.launch(
+                    &de.compute,
+                    &mut bd.comp_rows_batched,
+                    n_idx_boundaries * ihd,
+                )?;
+                de.comp_kv_append.launch_batched(
+                    &de.compute,
+                    &mut ics.comp_kv,
+                    &bd.comp_rows_batched,
+                    n_idx_comp_start,
+                    ihd,
+                    n_idx_boundaries,
+                )?;
             }
         }
         drop(_t_kv_append_comp);

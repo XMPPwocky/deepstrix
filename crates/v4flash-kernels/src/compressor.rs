@@ -26,6 +26,11 @@ const COMPRESSOR_STATE_SHUFFLE_GFX1201: &[u8] =
 const COMPRESSOR_STATE_SHUFFLE_GFX1151: &[u8] =
     include_bytes!(env!("KERNEL_COMPRESSOR_STATE_SHUFFLE_GFX1151"));
 
+const COMPRESSOR_STATE_SNAPSHOT_GFX1201: &[u8] =
+    include_bytes!(env!("KERNEL_COMPRESSOR_STATE_SNAPSHOT_GFX1201"));
+const COMPRESSOR_STATE_SNAPSHOT_GFX1151: &[u8] =
+    include_bytes!(env!("KERNEL_COMPRESSOR_STATE_SNAPSHOT_GFX1151"));
+
 const F16_ROUNDTRIP_GFX1201: &[u8] = include_bytes!(env!("KERNEL_F16_ROUNDTRIP_GFX1201"));
 const F16_ROUNDTRIP_GFX1151: &[u8] = include_bytes!(env!("KERNEL_F16_ROUNDTRIP_GFX1151"));
 
@@ -96,6 +101,57 @@ impl CompressorPool {
         };
         launch_kernel!(function, cfg, stream, [
             out.raw(), state_kv.raw(), state_score.raw(), head_dim, compress_ratio
+        ])
+    }
+
+    /// Batched variant: pool `n_boundaries` per-boundary state snapshots
+    /// into `out_b[k * head_dim]`. Snapshots are strided by
+    /// `(coff * compress_ratio) * width` floats per boundary.
+    pub fn launch_batched(
+        &self,
+        stream: &Stream,
+        out_b: &mut DeviceBuffer<f32>,
+        state_kv_b: &DeviceBuffer<f32>,
+        state_score_b: &DeviceBuffer<f32>,
+        head_dim: u32,
+        compress_ratio: u32,
+        n_boundaries: u32,
+    ) -> eyre::Result<()> {
+        if n_boundaries == 0 {
+            return Ok(());
+        }
+        if compress_ratio != 4 && compress_ratio != 128 {
+            return Err(eyre!(
+                "compressor_pool_batched: compress_ratio={compress_ratio} must be 4 or 128"
+            ));
+        }
+        let coff: u32 = if compress_ratio == 4 { 2 } else { 1 };
+        let width = coff * head_dim;
+        let state_per_b = ((coff * compress_ratio) * width) as usize;
+        let need_state = (n_boundaries as usize) * state_per_b;
+        if state_kv_b.len() < need_state || state_score_b.len() < need_state {
+            return Err(eyre!(
+                "compressor_pool_batched: state buffers have {}/{} elems, need {} (n_boundaries={n_boundaries}, per_b={state_per_b})",
+                state_kv_b.len(),
+                state_score_b.len(),
+                need_state
+            ));
+        }
+        if out_b.len() < (n_boundaries as usize) * (head_dim as usize) {
+            return Err(eyre!(
+                "compressor_pool_batched: out_b has {} elems, need {}",
+                out_b.len(),
+                (n_boundaries as usize) * (head_dim as usize)
+            ));
+        }
+        let function = self.module.get_function("compressor_pool_batched")?;
+        let cfg = LaunchConfig {
+            grid: (1, n_boundaries, 1),
+            block: (head_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out_b.raw(), state_kv_b.raw(), state_score_b.raw(), head_dim, compress_ratio
         ])
     }
 }
@@ -171,6 +227,68 @@ impl Fp8E4m3fnQuantize {
             shared_mem_bytes: 0,
         };
         launch_kernel!(function, cfg, stream, [x.raw(), n_nope, row_stride])
+    }
+}
+
+/// Copy `state_kv` + `state_score` to a per-boundary scratch slot, used
+/// by the batched prefill compressor path to capture state at each
+/// boundary firing so that pool/rms_w/rope/fp8/f16rt/append can run in
+/// a single batched pass at end-of-chunk instead of one launch chain
+/// per boundary.
+pub struct CompressorStateSnapshot {
+    module: Module,
+}
+
+impl CompressorStateSnapshot {
+    pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            COMPRESSOR_STATE_SNAPSHOT_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            COMPRESSOR_STATE_SNAPSHOT_GFX1151
+        } else {
+            return Err(eyre!(
+                "unsupported arch for compressor_state_snapshot: {arch}"
+            ));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    /// Copy `snap_elems` floats from shared state to per-boundary
+    /// `snap_kv` / `snap_score` slots. Caller computes `snap_elems =
+    /// coff * ratio * width` for the relevant compressor.
+    pub fn launch(
+        &self,
+        stream: &Stream,
+        snap_kv: &mut DeviceBuffer<f32>,
+        snap_score: &mut DeviceBuffer<f32>,
+        state_kv: &DeviceBuffer<f32>,
+        state_score: &DeviceBuffer<f32>,
+        snap_elems: u32,
+    ) -> eyre::Result<()> {
+        if snap_elems == 0 {
+            return Ok(());
+        }
+        if snap_kv.len() < snap_elems as usize
+            || snap_score.len() < snap_elems as usize
+            || state_kv.len() < snap_elems as usize
+            || state_score.len() < snap_elems as usize
+        {
+            return Err(eyre!(
+                "compressor_state_snapshot: buffer too small for snap_elems={snap_elems}"
+            ));
+        }
+        let function = self.module.get_function("compressor_state_snapshot")?;
+        const BLOCK: u32 = 256;
+        let grid_x = snap_elems.div_ceil(BLOCK);
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            snap_kv.raw(), snap_score.raw(), state_kv.raw(), state_score.raw(), snap_elems
+        ])
     }
 }
 

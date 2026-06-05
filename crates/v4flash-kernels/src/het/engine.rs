@@ -17,7 +17,8 @@ use crate::config::N_LAYER;
 
 use crate::attention::{AttentionMixed, AttentionSwa};
 use crate::compressor::{
-    CompressorPool, CompressorStateShuffleR4, CompressorStateWrite, F16Roundtrip, Fp8E4m3fnQuantize,
+    CompressorPool, CompressorStateShuffleR4, CompressorStateSnapshot, CompressorStateWrite,
+    F16Roundtrip, Fp8E4m3fnQuantize,
 };
 use crate::f16::F16Matvec;
 use crate::ffn::{Swiglu, SwigluClampWeighted, VecAddInplace};
@@ -115,6 +116,7 @@ pub struct DeviceEngine {
     pub compressor_pool: CompressorPool,
     pub compressor_state_write: CompressorStateWrite,
     pub compressor_shuffle: CompressorStateShuffleR4,
+    pub compressor_state_snapshot: CompressorStateSnapshot,
     pub fp8: Fp8E4m3fnQuantize,
     pub f16rt: F16Roundtrip,
     pub kv_append: KvCacheAppend,
@@ -182,6 +184,7 @@ impl DeviceEngine {
             compressor_pool: CompressorPool::for_arch(arch)?,
             compressor_state_write: CompressorStateWrite::for_arch(arch)?,
             compressor_shuffle: CompressorStateShuffleR4::for_arch(arch)?,
+            compressor_state_snapshot: CompressorStateSnapshot::for_arch(arch)?,
             fp8: Fp8E4m3fnQuantize::for_arch(arch)?,
             f16rt: F16Roundtrip::for_arch(arch)?,
             kv_append: KvCacheAppend::for_arch(arch)?,

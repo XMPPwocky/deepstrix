@@ -45,8 +45,8 @@ pub use attention::{AttentionMixed, AttentionSwa, ATTN_MIXED_MAX_KEYS, ATTN_SWA_
 pub use broadcast::BroadcastToHc;
 pub use comp_kv_append::CompKvAppend;
 pub use compressor::{
-    CompressorPool, CompressorStateShuffleR4, CompressorStateWrite, F16Roundtrip,
-    Fp8E4m3fnQuantize,
+    CompressorPool, CompressorStateShuffleR4, CompressorStateSnapshot, CompressorStateWrite,
+    F16Roundtrip, Fp8E4m3fnQuantize,
 };
 pub use f16::F16Matvec;
 pub use ffn::{Swiglu, SwigluClampWeighted, VecAddInplace};
