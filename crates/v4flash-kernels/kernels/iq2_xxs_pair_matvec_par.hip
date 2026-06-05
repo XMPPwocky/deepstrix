@@ -1999,41 +1999,46 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_tile8_row32(
                                  + (uint64_t)e * (uint64_t)up_bpe
                                  + (uint64_t)row * (uint64_t)n_blocks * BLOCK_IQ2_XXS_BYTES;
 
-    // Per-member xq base pointers + y->d cache.
-    const int8_t*  q8_base[IQ2_TILE8_MAX_MEMBERS];
-    float          yd_cache[IQ2_TILE8_MAX_MEMBERS] = {0,0,0,0,0,0,0,0};
+    // Per-member xq base pointers (start of super-block 0 — INCLUDES d header).
+    const uint8_t* xq_base[IQ2_TILE8_MAX_MEMBERS];
     #pragma unroll
     for (unsigned int p = 0; p < IQ2_TILE8_MAX_MEMBERS; p++) {
-        q8_base[p] = nullptr;
+        xq_base[p] = nullptr;
         if (p < n_members) {
             const unsigned int b = (unsigned int)(pkt[p] >> 16);
-            const uint8_t* xq_b = xq + (size_t)b * (size_t)n_blocks * (size_t)BLOCK_Q8_K_BYTES;
-            q8_base[p] = (const int8_t*)(xq_b + 4);  // skip y->d header (4 bytes)
-            yd_cache[p] = *(const float*)xq_b;
+            xq_base[p] = xq + (size_t)b * (size_t)n_blocks * (size_t)BLOCK_Q8_K_BYTES;
         }
     }
 
     float gate_acc[IQ2_TILE8_MAX_MEMBERS] = {0,0,0,0,0,0,0,0};
     float up_acc  [IQ2_TILE8_MAX_MEMBERS] = {0,0,0,0,0,0,0,0};
 
-    // Each lane (0..7) processes super-blocks {lane, lane+8, ...}.
+    // Each lane (0..7) processes super-blocks {lane, lane+8, ...}. Per super-block,
+    // each q8_K block has its OWN d scale at byte 0 — read it fresh per iteration
+    // (caching once outside the loop was a bug: real xq has varying d per super-block).
     for (unsigned int b = lane; b < n_blocks; b += 8u) {
         const uint8_t* gate_blk = gate_row_base + (uint64_t)b * BLOCK_IQ2_XXS_BYTES;
         const uint8_t* up_blk   = up_row_base   + (uint64_t)b * BLOCK_IQ2_XXS_BYTES;
         const float gd = f16_to_f32_par(*(const uint16_t*)gate_blk);
         const float ud = f16_to_f32_par(*(const uint16_t*)up_blk);
 
-        // Build q8 ptr table for this super-block (constant across rows of same WG —
-        // but each lane owns its own super-block, so this stays in regs).
+        // Per-member q8 super-block start + its d. Same super-block index b
+        // across members (we're matvec'ing the row against all member activations).
         const int8_t* q8_sb[IQ2_TILE8_MAX_MEMBERS];
+        float         yd_sb[IQ2_TILE8_MAX_MEMBERS] = {0,0,0,0,0,0,0,0};
         #pragma unroll
         for (unsigned int p = 0; p < IQ2_TILE8_MAX_MEMBERS; p++) {
-            q8_sb[p] = (p < n_members) ? (q8_base[p] + (size_t)b * (size_t)BLOCK_Q8_K_BYTES)
-                                       : nullptr;
+            if (p < n_members) {
+                const uint8_t* xq_sb = xq_base[p] + (size_t)b * (size_t)BLOCK_Q8_K_BYTES;
+                yd_sb[p] = *(const float*)xq_sb;
+                q8_sb[p] = (const int8_t*)(xq_sb + 4);
+            } else {
+                q8_sb[p] = nullptr;
+            }
         }
 
-        block8_dot_lut(gate_blk, q8_sb, n_members, gd, yd_cache, s_grid, s_sign_pair, gate_acc);
-        block8_dot_lut(up_blk,   q8_sb, n_members, ud, yd_cache, s_grid, s_sign_pair, up_acc);
+        block8_dot_lut(gate_blk, q8_sb, n_members, gd, yd_sb, s_grid, s_sign_pair, gate_acc);
+        block8_dot_lut(up_blk,   q8_sb, n_members, ud, yd_sb, s_grid, s_sign_pair, up_acc);
     }
 
     // Quarter-warp reduce across the 8 lanes of each row.

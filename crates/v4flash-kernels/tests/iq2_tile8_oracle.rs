@@ -103,9 +103,10 @@ fn iq2_tile8_matches_staged() -> eyre::Result<()> {
     for t in 0..(b as usize) {
         for bi in 0..(BLOCKS_Q8K_GATE_IN as usize) {
             let o = t * xq_per_tok + bi * BLOCK_Q8_K_BYTES;
-            // d = 0.0625 (f32 little-endian)
-            let d_bytes = 0.0625f32.to_le_bytes();
-            xq_host[o..o+4].copy_from_slice(&d_bytes);
+            // d varies PER (token, super-block) — catches the kind of "cached d
+            // from super-block 0" bug a uniform-d test would silently pass.
+            let d_val = 0.03f32 + ((rng.next() & 0xff) as f32) * (0.001f32);
+            xq_host[o..o+4].copy_from_slice(&d_val.to_le_bytes());
             for k in 0..256 {
                 let v = rng.next_byte() as i8;
                 xq_host[o + 4 + k] = v as u8;
