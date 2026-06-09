@@ -177,6 +177,42 @@ impl IndexerScoreWmma {
             n_idx_per.raw(), n_idx_stride
         ])
     }
+
+    /// **Multi-wave batched variant (M52)** — 8 waves/WG share one Q staging
+    /// (the 1-wave kernel re-staged Q per 128 cols: ~6.3 GB redundant reads
+    /// and a 4× staging-to-WMMA instruction ratio at 96K ctx); B-fragments
+    /// load straight from global (K is small + MALL-resident), giving the WG
+    /// a single barrier. Same args/semantics as `launch_batched`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched_mw(
+        &self,
+        stream: &Stream,
+        scores: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        head_weights: &DeviceBuffer<f32>,
+        index_comp_kv: &DeviceBuffer<u16>,
+        n_idx_per: &DeviceBuffer<u32>,
+        n_idx_max: u32,
+        n_idx_stride: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_idx_max == 0 {
+            return Ok(());
+        }
+        let function = self.module.get_function("indexer_score_wmma_batched_mw")?;
+        // Must match ISWMW_WAVES × ISW_NT_PER_WG × ISW_N_TILE in the kernel.
+        const COLS_PER_WG: u32 = 8 * 8 * 16; // 1024
+        let n_chunks_x = (n_idx_max + COLS_PER_WG - 1) / COLS_PER_WG;
+        let cfg = LaunchConfig {
+            grid: (n_chunks_x, batch, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            scores.raw(), q.raw(), head_weights.raw(), index_comp_kv.raw(),
+            n_idx_per.raw(), n_idx_stride
+        ])
+    }
 }
 
 /// Greedy top-K selection over indexer scores. Mirrors ds4's iterative

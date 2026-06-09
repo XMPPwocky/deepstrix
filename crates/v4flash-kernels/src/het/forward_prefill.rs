@@ -1597,17 +1597,40 @@ impl HeterogeneousEngine {
                 }
                 {
                     let _t = de.events.stage("k.indexer.score_wmma", &de.compute)?;
-                    wmma.launch_batched(
-                        &de.compute,
-                        &mut bd.indexer_scores,
-                        &bd.indexer_q,
-                        &bd.indexer_head_weights,
-                        &ics.comp_kv,
-                        &bd.n_index_comp_per_b,
-                        n_idx_max,
-                        ATTN_MIXED_MAX_KEYS,
-                        b,
-                    )?;
+                    // INDEXER_SCORE_VARIANT=mw selects the M52 multi-wave
+                    // kernel (1-wave kernel re-stages Q per 128 cols;
+                    // 28.7 ms/launch at 96K vs ~3.4 roofline — M52 journal).
+                    // Default stays the 1-wave kernel until gates pass.
+                    static SCORE_MW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                        std::env::var("INDEXER_SCORE_VARIANT")
+                            .map(|v| v == "mw")
+                            .unwrap_or(false)
+                    });
+                    if *SCORE_MW {
+                        wmma.launch_batched_mw(
+                            &de.compute,
+                            &mut bd.indexer_scores,
+                            &bd.indexer_q,
+                            &bd.indexer_head_weights,
+                            &ics.comp_kv,
+                            &bd.n_index_comp_per_b,
+                            n_idx_max,
+                            ATTN_MIXED_MAX_KEYS,
+                            b,
+                        )?;
+                    } else {
+                        wmma.launch_batched(
+                            &de.compute,
+                            &mut bd.indexer_scores,
+                            &bd.indexer_q,
+                            &bd.indexer_head_weights,
+                            &ics.comp_kv,
+                            &bd.n_index_comp_per_b,
+                            n_idx_max,
+                            ATTN_MIXED_MAX_KEYS,
+                            b,
+                        )?;
+                    }
                 }
                 {
                     let _t = de.events.stage("k.indexer.topk_bitonic", &de.compute)?;
