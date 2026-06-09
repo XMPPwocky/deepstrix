@@ -58,3 +58,14 @@ INDEXER_SCORE_VARIANT=sw.
   B-fragments) if indexer ever re-surfaces in a trace.
 - q8_0_gemm_wmma_lds_tiled (415 ms/chunk dGPU, depth-independent) is the next
   dGPU item if packing ever exposes it; WMMA-i8 idea from [[q8-lds-tiled-wmma]].
+
+# M53 — iGPU round 2 (no hot-expert cache)
+
+## 2026-06-09 — kwide staging ISA audit
+
+The xq staging loop compiles terribly: per dword — 64-bit addr chain, exec-mask
+branching for the ii==0 yd case, and `s_waitcnt vmcnt(0)` before EVERY
+ds_store (zero MLP); members copied sequentially with only 130/256 threads.
+Plan: branch-free run-per-thread staging (all members concurrent, 16
+pipelined loads/thread), then q2k row-pair reuse, then chunk=64 sequential
+halves.
