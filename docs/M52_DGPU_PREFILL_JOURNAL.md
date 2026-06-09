@@ -69,3 +69,15 @@ ds_store (zero MLP); members copied sequentially with only 130/256 threads.
 Plan: branch-free run-per-thread staging (all members concurrent, 16
 pipelined loads/thread), then q2k row-pair reuse, then chunk=64 sequential
 halves.
+
+## 2026-06-09 — M53.1 staging rewrite SHIPPED: iq2 50.6 → 30.0 ms (−41%)
+
+Branch-free run-per-thread staging (all members concurrent, 16 pipelined
+loads/thread, yd by separate thread subset). Oracle unchanged (1.1e-4).
+The serialized staging stalled all 8 waves at the barrier — its true cost was
+~2× its PMC instruction share.
+
+E2e: **4K 419.9 / 32K 409.8 / 96K 384.0 tok/s** (was 318/312/318).
+iq2 now ≈ at the (conservative-estimate) dp4a compute roofline.
+96K dips again as the iGPU shrinks → dGPU partially re-exposed (expected).
+Next: q2k row-pair (q2k now ~36% of iGPU busy).
