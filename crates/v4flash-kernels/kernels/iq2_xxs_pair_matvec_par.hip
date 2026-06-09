@@ -1834,6 +1834,234 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_staged(
 }
 
 // =============================================================================
+// staged_v2 — M51 S0: same geometry/semantics as _chunked_staged, minus the
+// per-member issue overhead found in the 2026-06-09 ISA audit:
+//
+//   S0a  scale chain hoisted: gds = gd * (float)ls is member-invariant, so the
+//        member tail is (float)sumi * (yd * gds) — no v_mul_lo_u32, no
+//        separate per-matrix imul+cvt+mul+mul chain.
+//   S0b  no LDS weight tile: the staged kernel's dot phase already hoists the
+//        dequanted octets to registers; the s_*_tile/s_*_ls arrays only cost
+//        8.5 KiB LDS (occupancy 12 waves/SIMD was LDS-bound). Each lane keeps
+//        its octets + ls in registers across the barrier instead.
+//   S0c  xq restaged as s_yd[32] + 8-aligned s_q8[32][256]: dot-phase q8 load
+//        is one ds_load_b64 (was 2× b32 off the +4-misaligned 292-B layout),
+//        and we stop copying the 32-byte Q2_K-only bsums tail.
+//   S0d  full-chunk specialization: n_members == 32 takes a #pragma-unrolled
+//        member loop with STATIC lane_pacc indices. The generic loop's dynamic
+//        indices compile to v_movrels/movreld + m0 updates — 4 indexed register
+//        moves per member, as expensive as the 4 dot4s themselves.
+//
+// LDS: 3072 LUT + 8192 q8 + 128 yd + 128 member + 2048 partials ≈ 13.6 KiB
+// (was 18.9 KiB).
+// =============================================================================
+
+extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_staged_v2(
+        float        * __restrict__ mid,           // [B, n_used, n_rows]
+        const uint8_t * __restrict__ gate_w_base,
+        const uint8_t * __restrict__ up_w_base,
+        const uint8_t * __restrict__ xq,           // [B, n_blocks*292]
+        const float  * __restrict__ expert_w,      // [B, n_used]
+        const int    * __restrict__ group_count,   // [n_expert]
+        const int    * __restrict__ expert_members,// [n_expert * max_per_expert]
+        const int    * __restrict__ work_items,    // [n_work_items]
+        unsigned int    gate_bpe,
+        unsigned int    up_bpe,
+        unsigned int    n_used,
+        unsigned int    max_per_expert,
+        unsigned int    chunk_size,
+        float           clamp,
+        unsigned int    n_rows,
+        unsigned int    n_blocks) {
+    const unsigned int w_idx = blockIdx.y;
+    const int packed_item = work_items[w_idx];
+    const unsigned int e            = (unsigned int)(packed_item >> 16) & 0xffffu;
+    const unsigned int member_start = (unsigned int)(packed_item       ) & 0xffffu;
+    const int group_n = group_count[e];
+    const unsigned int member_end = min((unsigned int)group_n, member_start + chunk_size);
+    if (member_end <= member_start) return;
+    const unsigned int n_members = member_end - member_start;
+
+    __shared__ uint64_t s_sign_pair[128];
+    __shared__ uint64_t s_grid[256];
+    // 8-byte aligned q8 (uint64_t base), 32 slices of 256 B. yd separate.
+    __shared__ uint64_t s_q8_u64[IQ2_STAGED_MAX_CHUNK * 32];   // 32 × 256 B
+    __shared__ float    s_yd[IQ2_STAGED_MAX_CHUNK];
+    __shared__ int      s_member_packed[IQ2_STAGED_MAX_CHUNK];
+    __shared__ float    s_partial_g[IQ2_STAGED_MAX_CHUNK * IQ2_STAGED_MAX_ROWS];
+    __shared__ float    s_partial_u[IQ2_STAGED_MAX_CHUNK * IQ2_STAGED_MAX_ROWS];
+
+    const unsigned int tid = threadIdx.x;
+    if (tid < 128) {
+        const uint32_t s = ksigns_iq2xs[tid];
+        const uint32_t signs = s * 0x01010101u;
+        const uint32_t sm0 = expand_signs_par(signs, 0x08040201u);
+        const uint32_t sm1 = expand_signs_par(signs, 0x80402010u);
+        s_sign_pair[tid] = ((uint64_t)sm1 << 32) | (uint64_t)sm0;
+    }
+    if (tid < 256) s_grid[tid] = iq2xxs_grid[tid];
+
+    for (unsigned int i = tid; i < n_members; i += blockDim.x) {
+        s_member_packed[i] = expert_members[(size_t)e * (size_t)max_per_expert
+                                          + (size_t)(member_start + i)];
+    }
+    __syncthreads();
+
+    const unsigned int row_in_block = tid >> 5;            // 0..7 (warp index)
+    const unsigned int lane         = tid & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    const bool row_valid = (row < n_rows);
+
+    const unsigned int sub_idx      = lane >> 2;           // 0..7
+    const unsigned int chunk_in_sub = lane & 3u;           // 0..3
+    const unsigned int g_shift      = chunk_in_sub * 8u;
+    const unsigned int s_shift      = chunk_in_sub * 7u;
+
+    const uint8_t* gate_e_base = gate_w_base + (uint64_t)e * (uint64_t)gate_bpe;
+    const uint8_t* up_e_base   = up_w_base   + (uint64_t)e * (uint64_t)up_bpe;
+
+    float lane_pacc_g[IQ2_STAGED_MAX_CHUNK];
+    float lane_pacc_u[IQ2_STAGED_MAX_CHUNK];
+    #pragma unroll
+    for (unsigned int mi = 0; mi < IQ2_STAGED_MAX_CHUNK; mi++) {
+        lane_pacc_g[mi] = 0.0f;
+        lane_pacc_u[mi] = 0.0f;
+    }
+
+    for (unsigned int sb = 0; sb < n_blocks; sb++) {
+        // --- Dequant phase: octets + hoisted scales stay in REGISTERS ---
+        int32_t w_g0 = 0, w_g1 = 0, w_u0 = 0, w_u1 = 0;
+        float gds = 0.0f, uds = 0.0f;
+        if (row_valid) {
+            const uint8_t* gate_block = gate_e_base
+                                      + (uint64_t)row * (uint64_t)n_blocks * BLOCK_IQ2_XXS_BYTES
+                                      + (uint64_t)sb  * BLOCK_IQ2_XXS_BYTES;
+            const uint8_t* up_block   = up_e_base
+                                      + (uint64_t)row * (uint64_t)n_blocks * BLOCK_IQ2_XXS_BYTES
+                                      + (uint64_t)sb  * BLOCK_IQ2_XXS_BYTES;
+            const uint16_t wd_g = *(const uint16_t*)(gate_block + 0);
+            const uint16_t wd_u = *(const uint16_t*)(up_block   + 0);
+
+            const uint8_t* sb_g = gate_block + 2 + sub_idx * 8;
+            const uint8_t* sb_u = up_block   + 2 + sub_idx * 8;
+            const uint32_t aux0_g = *(const uint32_t*)(sb_g + 0);
+            const uint32_t aux1_g = *(const uint32_t*)(sb_g + 4);
+            const uint32_t aux0_u = *(const uint32_t*)(sb_u + 0);
+            const uint32_t aux1_u = *(const uint32_t*)(sb_u + 4);
+
+            const uint8_t g_idx_g = (uint8_t)((aux0_g >> g_shift) & 0xffu);
+            const uint32_t s_idx_g = (aux1_g >> s_shift) & 0x7fu;
+            const uint8_t g_idx_u = (uint8_t)((aux0_u >> g_shift) & 0xffu);
+            const uint32_t s_idx_u = (aux1_u >> s_shift) & 0x7fu;
+
+            const uint64_t grid_g       = s_grid[g_idx_g];
+            const uint64_t sign_pair_g  = s_sign_pair[s_idx_g];
+            w_g0 = cond_neg_bytes_fast((int32_t)(uint32_t)grid_g,         (uint32_t)sign_pair_g);
+            w_g1 = cond_neg_bytes_fast((int32_t)(uint32_t)(grid_g >> 32), (uint32_t)(sign_pair_g >> 32));
+
+            const uint64_t grid_u       = s_grid[g_idx_u];
+            const uint64_t sign_pair_u  = s_sign_pair[s_idx_u];
+            w_u0 = cond_neg_bytes_fast((int32_t)(uint32_t)grid_u,         (uint32_t)sign_pair_u);
+            w_u1 = cond_neg_bytes_fast((int32_t)(uint32_t)(grid_u >> 32), (uint32_t)(sign_pair_u >> 32));
+
+            // S0a: every lane already holds aux1 — compute its own ls and fold
+            // it into the member-invariant f32 scale here. (float)ls ≤ 31 is
+            // exact; sumi ≤ 8·127·31 ≪ 2^24 so (float)sumi is exact too.
+            const int32_t ls_g = (int32_t)(2u * (aux1_g >> 28) + 1u);
+            const int32_t ls_u = (int32_t)(2u * (aux1_u >> 28) + 1u);
+            gds = (0.125f * f16_to_f32_par(wd_g)) * (float)ls_g;
+            uds = (0.125f * f16_to_f32_par(wd_u)) * (float)ls_u;
+        }
+
+        // --- Cooperative xq stage: 65 dwords per member (yd + 64 q8 dwords),
+        //     q8 landing 8-byte aligned in s_q8_u64 ---
+        {
+            uint32_t* s_q8_dw = (uint32_t*)s_q8_u64;
+            for (unsigned int mi = 0; mi < n_members; mi++) {
+                const int packed     = s_member_packed[mi];
+                const unsigned int b = (unsigned int)(packed >> 16);
+                const uint32_t* xq_src_dw = (const uint32_t*)(
+                    xq + (size_t)b * (size_t)n_blocks * (size_t)BLOCK_Q8_K_BYTES
+                       + (size_t)sb * (size_t)BLOCK_Q8_K_BYTES);
+                if (tid == 0u) s_yd[mi] = *(const float*)xq_src_dw;
+                for (unsigned int i = tid; i < 64u; i += blockDim.x) {
+                    s_q8_dw[mi * 64u + i] = xq_src_dw[1u + i];
+                }
+            }
+        }
+        __syncthreads();
+
+        // --- Dot phase ---
+        if (row_valid) {
+            const uint64_t* q8_lane = &s_q8_u64[lane];   // member mi at +mi*32
+
+            // S0d: full chunks take the unrolled loop (static lane_pacc
+            // indices — no v_movrel); tail chunks take the generic loop.
+            #define IQ2_V2_DOT_BODY(mi)                                          \
+                {                                                                \
+                    const uint64_t q8pair = q8_lane[(mi) * 32u];                 \
+                    const int32_t q8_0 = (int32_t)(uint32_t)q8pair;              \
+                    const int32_t q8_1 = (int32_t)(uint32_t)(q8pair >> 32);      \
+                    int32_t sumi_g = 0;                                          \
+                    sumi_g = sudot4_par(w_g0, q8_0, sumi_g);                     \
+                    sumi_g = sudot4_par(w_g1, q8_1, sumi_g);                     \
+                    int32_t sumi_u = 0;                                          \
+                    sumi_u = sudot4_par(w_u0, q8_0, sumi_u);                     \
+                    sumi_u = sudot4_par(w_u1, q8_1, sumi_u);                     \
+                    const float yd = s_yd[(mi)];                                 \
+                    lane_pacc_g[(mi)] += (float)sumi_g * (yd * gds);             \
+                    lane_pacc_u[(mi)] += (float)sumi_u * (yd * uds);             \
+                }
+            if (n_members == IQ2_STAGED_MAX_CHUNK) {
+                #pragma unroll
+                for (unsigned int mi = 0; mi < IQ2_STAGED_MAX_CHUNK; mi++) {
+                    IQ2_V2_DOT_BODY(mi);
+                }
+            } else {
+                for (unsigned int mi = 0; mi < n_members; mi++) {
+                    IQ2_V2_DOT_BODY(mi);
+                }
+            }
+            #undef IQ2_V2_DOT_BODY
+        }
+        __syncthreads();  // protect s_q8/s_yd from next super-block's overwrite
+    }
+
+    if (row_valid) {
+        for (unsigned int mi = 0; mi < n_members; mi++) {
+            const float wg = warp_sum_f32_par(lane_pacc_g[mi]);
+            const float wu = warp_sum_f32_par(lane_pacc_u[mi]);
+            if (lane == 0u) {
+                s_partial_g[mi * IQ2_STAGED_MAX_ROWS + row_in_block] = wg;
+                s_partial_u[mi * IQ2_STAGED_MAX_ROWS + row_in_block] = wu;
+            }
+        }
+    }
+
+    if (row_valid && lane == 0u) {
+        for (unsigned int mi = 0; mi < n_members; mi++) {
+            const int packed          = s_member_packed[mi];
+            const unsigned int b      = (unsigned int)(packed >> 16);
+            const unsigned int slot   = (unsigned int)(packed & 0xFFFFu);
+
+            float g_sum = s_partial_g[mi * IQ2_STAGED_MAX_ROWS + row_in_block];
+            float u_sum = s_partial_u[mi * IQ2_STAGED_MAX_ROWS + row_in_block];
+
+            if (clamp > 1.0e-6f) {
+                if (g_sum > clamp)  g_sum = clamp;
+                if (u_sum > clamp)  u_sum = clamp;
+                if (u_sum < -clamp) u_sum = -clamp;
+            }
+            const float ew  = expert_w[(size_t)b * (size_t)n_used + (size_t)slot];
+            const float sig = 1.0f / (1.0f + expf(-g_sum));
+            const size_t out_off = ((size_t)b * (size_t)n_used + (size_t)slot)
+                                 * (size_t)n_rows + (size_t)row;
+            mid[out_off] = g_sum * sig * u_sum * ew;
+        }
+    }
+}
+
+// =============================================================================
 // tile8_row32 — port of ejpir/ds4-hip's moe_gate_up_mid_expert_tile8_row32
 // =============================================================================
 //
