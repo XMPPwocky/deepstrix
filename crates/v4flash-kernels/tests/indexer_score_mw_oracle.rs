@@ -16,8 +16,7 @@
 use color_eyre::eyre::{self, eyre};
 use std::time::Instant;
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
-use v4flash_kernels::config::{INDEXER_HEAD_DIM, INDEXER_N_HEAD};
-use v4flash_kernels::indexer::IndexerScoreWmma;
+use v4flash_kernels::{IndexerScoreWmma, INDEXER_HEAD_DIM, INDEXER_N_HEAD};
 
 fn pick_dgpu() -> eyre::Result<Device> {
     for d in Device::all()? {
@@ -125,19 +124,31 @@ fn indexer_score_mw_matches_batched() -> eyre::Result<()> {
     d_scores_ref.copy_to_host(&mut ref_host)?;
     d_scores_mw.copy_to_host(&mut mw_host)?;
 
+    // Contract: bit-exact on [0, n_comp) (the only range topk reads); on
+    // [n_comp, n_idx_stride) mw must stamp -INF (the 1-wave kernel's grid is
+    // sized by n_idx_max and may leave cols past its coverage unwritten).
     let mut n_diff = 0usize;
-    let mut max_abs = 0f32;
+    let mut n_tail_bad = 0usize;
     let mut first: Option<(usize, f32, f32)> = None;
-    for (i, (&a, &b)) in ref_host.iter().zip(mw_host.iter()).enumerate() {
-        if a.to_bits() != b.to_bits() {
-            n_diff += 1;
-            let d = (a - b).abs();
-            if d > max_abs { max_abs = d; }
-            if first.is_none() { first = Some((i, a, b)); }
+    for bi in 0..(batch as usize) {
+        let n_comp = n_idx_host[bi] as usize;
+        for c in 0..(n_idx_stride as usize) {
+            let i = bi * (n_idx_stride as usize) + c;
+            let (a, b) = (ref_host[i], mw_host[i]);
+            if c < n_comp {
+                if a.to_bits() != b.to_bits() {
+                    n_diff += 1;
+                    if first.is_none() { first = Some((i, a, b)); }
+                }
+            } else if b != f32::MIN.min(-3.4028235e38f32) && b != -3.4028235e38f32 {
+                n_tail_bad += 1;
+                if first.is_none() { first = Some((i, a, b)); }
+            }
         }
     }
-    eprintln!("mw vs batched: n={score_elems} n_bit_diff={n_diff} max_abs={max_abs:.3e} first={first:?}");
-    assert_eq!(n_diff, 0, "mw diverges from batched (expected bit-exact)");
+    eprintln!("mw vs batched: n={score_elems} n_bit_diff(valid)={n_diff} n_tail_not_neginf={n_tail_bad} first={first:?}");
+    assert_eq!(n_diff, 0, "mw diverges from batched on valid cols");
+    assert_eq!(n_tail_bad, 0, "mw left non--INF in [n_comp, stride)");
 
     // --- Isolated timing A/B at the 96K production shape ---
     let b96: u32 = 512;
