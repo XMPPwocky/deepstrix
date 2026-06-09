@@ -55,6 +55,44 @@ impl Stream {
         )
     }
 
+    /// Enqueue a wait until the 32-bit value at `ptr` is >= `value`
+    /// (unsigned). The comparison happens at stream-EXECUTION time, so the
+    /// wait may be enqueued before the producer's write call — unlike
+    /// `wait_event`, which snapshots the event's last record at call time
+    /// and degenerates to a no-op when enqueued ahead of the record.
+    ///
+    /// # Safety
+    /// `ptr` must remain valid (pinned host memory or device memory
+    /// accessible to this stream's device) until the wait completes.
+    pub unsafe fn wait_value32_gte(&self, ptr: *mut u32, value: u32) -> eyre::Result<()> {
+        check_eyre(
+            unsafe {
+                sys::hipStreamWaitValue32(
+                    self.raw,
+                    ptr as *mut std::ffi::c_void,
+                    value,
+                    0, // hipStreamWaitValueGte
+                    0xFFFF_FFFF,
+                )
+            },
+            "hipStreamWaitValue32",
+        )
+    }
+
+    /// Enqueue a 32-bit write of `value` to `ptr`, ordered after all prior
+    /// work on this stream. Companion to [`wait_value32_gte`].
+    ///
+    /// # Safety
+    /// `ptr` must remain valid until the write completes.
+    pub unsafe fn write_value32(&self, ptr: *mut u32, value: u32) -> eyre::Result<()> {
+        check_eyre(
+            unsafe {
+                sys::hipStreamWriteValue32(self.raw, ptr as *mut std::ffi::c_void, value, 0)
+            },
+            "hipStreamWriteValue32",
+        )
+    }
+
     /// Begin recording all subsequent async operations on this stream
     /// into a HIP graph. Call [`Stream::end_capture`] to finalize.
     ///

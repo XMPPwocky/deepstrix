@@ -164,8 +164,18 @@ impl HeterogeneousEngine {
         let ie = &self.igpu;
 
         {
+            // Value-wait, NOT event-wait: this lane is enqueued at token
+            // start, before the dGPU's record/write calls for the token.
+            // hipStreamWaitEvent snapshots at call time (would no-op);
+            // hipStreamWaitValue32 compares at execution time.
             let _t_wait = ie.events.stage("igpu.moe.wait", &ie.compute)?;
-            ie.compute.wait_event(&sev.selected_pushed)?;
+            let seq = self
+                .token_seq
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let sig = unsafe {
+                (self.moe_signal.as_slice().as_ptr() as *mut u32).add(layer as usize)
+            };
+            unsafe { ie.compute.wait_value32_gte(sig, seq)? };
             _t_wait.end()?;
         }
 
@@ -1198,6 +1208,21 @@ impl HeterogeneousEngine {
         }
         if parallel {
             sev.selected_pushed.record(&de.xfer)?;
+            // M54: value-signal companion to selected_pushed, consumed by
+            // the PRE-ISSUED iGPU lane (issue_igpu_moe). An event wait
+            // enqueued before its record call is a no-op (snapshot
+            // semantics); the 32-bit value wait compares at execution
+            // time, which makes token-start pre-issue sound. One SDMA
+            // dword write per layer — negligible when pre-issue is off.
+            let seq = self
+                .token_seq
+                .load(std::sync::atomic::Ordering::Relaxed);
+            // Const-cast: the engine only ever writes this slot from
+            // device streams; the host slice is allocation-stable.
+            let sig = unsafe {
+                (self.moe_signal.as_slice().as_ptr() as *mut u32).add(layer as usize)
+            };
+            unsafe { de.xfer.write_value32(sig, seq)? };
         } else {
             de.xfer.synchronize()?;
         }

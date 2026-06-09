@@ -274,6 +274,15 @@ pub struct HeterogeneousEngine {
     /// in `forward_prefill_pipelined` — lane A uses `sync_events`, lane B
     /// uses this. Allocated identically.
     pub sync_events_t1: HetSyncEvents,
+    /// M54: per-layer MoE-ready signal words (pinned host memory). The
+    /// dGPU xfer stream writes `signal[layer] = token_seq` right after the
+    /// selected push; the pre-issued iGPU lane waits GTE on it. Value
+    /// waits compare at execution time, so the whole iGPU lane can be
+    /// enqueued at token start (event waits would snapshot-no-op).
+    pub moe_signal: v4flash_hip::PinnedBuffer<u32>,
+    /// Monotonic per-token sequence for `moe_signal` (starts at 1 on the
+    /// first token; u32 wrap is ~4B tokens, ignored).
+    pub token_seq: std::sync::atomic::AtomicU32,
     /// Optional per-token device-time perfetto exporter. Drains the
     /// EventPools at the end of each `forward_token` into per-stream
     /// perfetto tracks. Enable by calling
@@ -368,6 +377,12 @@ impl HeterogeneousEngine {
         let preissue = *PREISSUE
             && matches!(self.mode, ExecMode::HetParallel)
             && dump_subtensor_layers.is_empty();
+        // Advance the token sequence for the moe_signal protocol (the
+        // write side in forward_layer reads this with `load`). Done
+        // unconditionally so the signal words stay in lockstep with
+        // tokens whether or not pre-issue is active.
+        self.token_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if preissue {
             let _span = debug_span!("igpu.preissue_lane").entered();
             for layer in 0..N_LAYER as usize {
@@ -671,6 +686,8 @@ impl HeterogeneousEngine {
             mode,
             sync_events,
             sync_events_t1,
+            moe_signal: v4flash_hip::PinnedBuffer::new(N_LAYER as usize)?,
+            token_seq: std::sync::atomic::AtomicU32::new(0),
             perfetto: None,
             dgpu_graphs: GraphCache::new(),
             igpu_graphs: GraphCache::new(),

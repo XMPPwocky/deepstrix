@@ -270,6 +270,24 @@ unsafe extern "C" {
         event: hipEvent_t,
         flags: c_uint,
     ) -> hipError_t;
+    /// Enqueue a wait until `*ptr` (32-bit) satisfies the condition in
+    /// `flags` (0 = GTE, 1 = EQ, 2 = AND, 3 = NOR) against `value`.
+    /// Unlike hipStreamWaitEvent (which snapshots the event state at CALL
+    /// time), the comparison happens at EXECUTION time — the primitive
+    /// that makes pre-issued cross-device pipelines sound.
+    pub fn hipStreamWaitValue32(
+        stream: hipStream_t,
+        ptr: *mut c_void,
+        value: u32,
+        flags: c_uint,
+        mask: u32,
+    ) -> hipError_t;
+    pub fn hipStreamWriteValue32(
+        stream: hipStream_t,
+        ptr: *mut c_void,
+        value: u32,
+        flags: c_uint,
+    ) -> hipError_t;
     pub fn hipDeviceGetStreamPriorityRange(
         leastPriority: *mut c_int,
         greatestPriority: *mut c_int,
