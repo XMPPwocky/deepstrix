@@ -83,3 +83,26 @@ sequential path bit-restored.
 
 Sum ≈ 3.5-4.5 ms → ~28.5-29 tok/s (+13%). Roofline remains ~50 (the rest
 is the serial weight-BW chain itself).
+
+## 2026-06-09 — Divergence investigation CLOSED: benign drift, miscalibrated oracle
+
+Full 43-layer bisect of batch-vs-sequential: drift grows smoothly 7.9e-3 →
+5.4e1 ABSOLUTE, but hc magnitudes grow 0.01 → ~2700 over the same span —
+vector-scaled drift is a flat ~0.5-1.3% everywhere. The L33/L34 "explosions"
+were magnitude growth, not error growth. At every layer: identical expert
+selection, router weights matching to 3-4 decimals, kv diffs exactly one
+fp8/f16 quantization step. Per-element relative ALSO misleads (cancellation:
+hc elements sum O(1000) terms — a 0.6-valued element legitimately carries
+O(1) noise from 0.5% drift on the terms).
+
+Sources: the deliberately-shipped precision trade-offs (f16 WMMA scores,
+fp8 KV, q8/q8k stages), each oracle-gated at the kernel level. The e2e test
+used an ABSOLUTE 5e-2 tolerance from a pre-WMMA era; failure predates today
+(worktree-verified at 0959f65).
+
+Fix: oracles now compare max-diff / vector-scale (bound 5e-2, measured
+3.5-4.3e-2 — intentionally thin, it's a drift BUDGET: new precision
+trade-offs that add drift will trip it and force a conscious decision) and
+the logits oracle additionally asserts argmax agreement (it matched:
+token 260 both paths). **All 4 batch-vs-sequential oracles GREEN** — the
+e2e gate that caught the pre-issue race is now usable for future work.
