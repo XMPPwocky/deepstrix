@@ -1568,6 +1568,12 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_padded(
 #define IQ2_STAGED_TILE_STRIDE 264u
 #define IQ2_STAGED_MAX_CHUNK   32u
 #define IQ2_STAGED_MAX_ROWS    8u
+// staged_v2 S0d full-chunk unroll. 1 = specialize n_members==32 with static
+// accumulator indices (157 VGPR / 9 waves); 0 = generic loop (movrel, but
+// lower register pressure). A/B'd 2026-06-09.
+#ifndef IQ2_V2_UNROLL
+#define IQ2_V2_UNROLL 1
+#endif
 
 extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_staged(
         float        * __restrict__ mid,           // [B, n_used, n_rows]
@@ -2012,6 +2018,7 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_staged_v2(
                     lane_pacc_g[(mi)] += (float)sumi_g * (yd * gds);             \
                     lane_pacc_u[(mi)] += (float)sumi_u * (yd * uds);             \
                 }
+#if IQ2_V2_UNROLL
             if (n_members == IQ2_STAGED_MAX_CHUNK) {
                 #pragma unroll
                 for (unsigned int mi = 0; mi < IQ2_STAGED_MAX_CHUNK; mi++) {
@@ -2022,6 +2029,11 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_staged_v2(
                     IQ2_V2_DOT_BODY(mi);
                 }
             }
+#else
+            for (unsigned int mi = 0; mi < n_members; mi++) {
+                IQ2_V2_DOT_BODY(mi);
+            }
+#endif
             #undef IQ2_V2_DOT_BODY
         }
         __syncthreads();  // protect s_q8/s_yd from next super-block's overwrite
