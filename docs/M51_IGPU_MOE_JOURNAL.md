@@ -189,4 +189,55 @@ Wall composition @4K (3234 ms): iq2 kwide ~2176 ms (67%), q2k kwide ~851 ms
 unroll sweep, SBG=4 (more k per lane, 32 KiB LDS occupancy risk), q8-direct
 from L2 (drop staging+barriers).
 
-## Next: iq2 kwide tuning round (unroll sweep, then SBG=4 or q8-L2)
+## 2026-06-09 — kwide tuning round: all knobs flat or negative; 50.5 ms stands
+
+- Member-loop unroll {2,4,8}: 50.5/50.6/50.5 ms — no longer pipelining-limited.
+- Full-chunk static unroll (movrel removal): 168 VGPR → 9 waves → 71.5 ms.
+  With `__launch_bounds__(256,12)` cap: 64 VGPR + 272 B scratch SPILL → 90.6 ms.
+  The ~10% movrel tax is structurally locked (dynamic member index needs
+  movrel or VGPR explosion). Knob `IQ2_KW_FULLUNROLL` stays 0.
+- q8-direct-from-L2: rejected on paper — LDS staging dedups 8× within the WG;
+  direct reads would 8× the L2/MALL traffic (~68 GB/launch).
+- SBG=4: needs 32+ KiB LDS → ≤8-10 waves (proven-bad zone); SBG=4+chunk16
+  pencils to ~+3% net. Not pursued.
+
+PMC says kwide is VALU-issue-bound at IPC 1.78 (issue 10,040/wave ≈ busy
+5,635 cyc × dual-issue). Composition/wave ≈ 3,584 dot+tail, ~1k staging,
+~1k movrel, ~400 dequant, rest addressing/loop. ~1.56× over dot4-only roofline.
+
+## 2026-06-09 — GATES + PROMOTION
+
+1. Oracles: iq2 kwide rel=1.1e-4, staged_v2 rel=7.9e-5, q2k kwide BIT-EXACT ✓
+2. Cold e2e sweep (PIPELINE_LANES=2, B=1024/iter), kwide+kwide vs 0959f65
+   baseline, back-to-back:
+
+| depth | baseline | kwide | Δ |
+|---|---|---|---|
+| 4096  | 229.7 | **320.4** | +39.5% |
+| 8192  | 228.6 | **319.5** | +39.8% |
+| 16384 | 223.4 | **311.7** | +39.5% |
+| 32768 | 224.4 | **312.5** | +39.3% |
+
+3. Occupancy gate: iq2 kwide 110 VGPR/12 waves, q2k kwide 92 VGPR/16 waves,
+   no spills ✓
+4. Real-server gate: deepstrix-server with kwide variants, 3371-token cold
+   prefill → **297 tok/s** in production logs (`tok_per_s="297.0"`);
+   completions coherent AND content-accurate on both short and long prompts
+   (correctly summarized the ejpir doc). The tile8 `content: null` scare
+   reproduced once but was max_tokens exhaustion (160 < reasoning length),
+   not a kernel bug — fine at max_tokens=1200. ✓
+5. **Defaults flipped**: IQ2_VARIANT=kwide, Q2K_VARIANT=kwide
+   (forward_prefill.rs). Verified default-config bench: 319.4 @4K, 311.3 @32K.
+
+## Remaining headroom (for a future session)
+
+Wall @4K ≈ 3200 ms: iq2 kwide ~2176 (68%), q2k ~851 (27%), other ~200.
+- iq2 at perfect dot4 roofline → wall ~2560 → ~400 tok/s. The 1.56× residual
+  is tail ops (cvt/mul/fma per member-pair) + staging + movrel + dequant; each
+  individually 5-12%, all measured sticky.
+- Past ~400 needs the ejpir FAST_FULL structural route (per-chunk f16 hot-
+  expert cache + WMMA): eliminates per-member tail AND dequant from inner
+  loop, pays 4× weight BW + cache build. Plausible but a multi-day rewrite.
+- q2k is cache-BW-bound on cross-WG q8 re-reads; geometry changes are the
+  tile8 trap. Near floor for this shape.
+- dGPU becomes the wall only below ~1250 ms iGPU — far away.

@@ -2233,7 +2233,10 @@ impl HeterogeneousEngine {
         //   4. iq2 chunked main kernel.
         // Chunk size = how many members per WG the iq2/q2k kernels handle.
         // tile8_row32 caps at 8 (ejpir-style block8 unpack); others use 32.
-        let variant_peek = std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "staged".into());
+        // Default kwide since M51 (2026-06-09): k-widened lanes, −35% kernel
+        // vs staged, +30% e2e prefill. staged/staged_v2/chunked/tile8/hybrid
+        // remain opt-in.
+        let variant_peek = std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "kwide".into());
         #[allow(non_snake_case)]
         let CHUNK_SIZE: u32 = if variant_peek == "tile8" { 8 } else { 32 };
         let max_per_expert = bi.max_per_expert();
@@ -2476,8 +2479,10 @@ impl HeterogeneousEngine {
             // Q2K_VARIANT=bxn rolls back to the original kernel.
             // Hybrid IQ2 is incompatible (splits work_items into two
             // buckets); error out if both are requested simultaneously.
+            // Default kwide since M51 (2026-06-09): unpack-once member loop,
+            // bit-exact vs by_expert, −12% kernel. by_expert/bxn stay opt-in.
             let q2k_variant = std::env::var("Q2K_VARIANT")
-                .unwrap_or_else(|_| "by_expert".into());
+                .unwrap_or_else(|_| "kwide".into());
             let use_kwide = q2k_variant == "kwide";
             let use_by_expert = use_kwide || q2k_variant == "by_expert";
             if use_by_expert && variant == "hybrid" {
