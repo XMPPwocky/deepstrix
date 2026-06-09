@@ -65,6 +65,31 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
     (maxd, idx)
 }
 
+/// Max RELATIVE diff with an absolute floor: |a-b| / max(|a|, |b|, floor).
+///
+/// V4-Flash's hc residual magnitudes grow from ~0.01 (L0) to ~2700 (L42);
+/// the deliberate precision trade-offs in the batched path (f16 WMMA
+/// scores, fp8 KV, q8/q8k quantization) each contribute ~5e-3 relative
+/// reduction-order drift per layer-stage. An ABSOLUTE tolerance therefore
+/// can't hold across depth (measured: maxd 3.6e1 at L42 = 1.3e-2 rel) —
+/// these oracles compare relative-with-floor instead. M54 audit
+/// (docs/M54_DECODE_ANALYSIS.md): drift verified benign layer-by-layer —
+/// same experts selected, no step change, rel ≈ 0.5-1.3% at every depth.
+fn max_rel_diff(a: &[f32], b: &[f32], floor: f32) -> (f32, usize) {
+    assert_eq!(a.len(), b.len());
+    let mut maxr = 0.0f32;
+    let mut idx = 0usize;
+    for i in 0..a.len() {
+        let denom = a[i].abs().max(b[i].abs()).max(floor);
+        let r = (a[i] - b[i]).abs() / denom;
+        if r > maxr {
+            maxr = r;
+            idx = i;
+        }
+    }
+    (maxr, idx)
+}
+
 /// Oracle: `forward_prompt_batch_v2` (real batched kernels) matches the
 /// sequential single-token path within float-reduction-order
 /// tolerance (~1e-3 — batched kernels have different summation order).
@@ -176,35 +201,37 @@ fn forward_prompt_batch_v2_matches_sequential() -> eyre::Result<()> {
     let mut overall_max = 0.0f32;
     let mut overall_max_pos = 0usize;
     for i in 0..b {
-        let (maxd, idx) = max_abs_diff(&v2_hcs[i], &seq_hcs[i]);
-        let verdict = if maxd < 1e-3 {
+        let (maxr, idx) = max_rel_diff(&v2_hcs[i], &seq_hcs[i], 1.0);
+        let verdict = if maxr < 1e-3 {
             "✓"
-        } else if maxd < 1e-1 {
+        } else if maxr < 5e-2 {
             "~"
         } else {
             "✗"
         };
         eprintln!(
-            "  {} pos={} tok={:>5}  max={:.4e} @i={:>5}  v2={:.4}  seq={:.4}",
-            verdict, i, tokens[i], maxd, idx, v2_hcs[i][idx], seq_hcs[i][idx]
+            "  {} pos={} tok={:>5}  max_rel={:.4e} @i={:>5}  v2={:.4}  seq={:.4}",
+            verdict, i, tokens[i], maxr, idx, v2_hcs[i][idx], seq_hcs[i][idx]
         );
-        if maxd > overall_max {
-            overall_max = maxd;
+        if maxr > overall_max {
+            overall_max = maxr;
             overall_max_pos = i;
         }
     }
     eprintln!(
-        "\nv2 overall max abs diff = {:.4e} at pos {overall_max_pos}",
+        "\nv2 overall max REL diff = {:.4e} at pos {overall_max_pos}",
         overall_max
     );
-    // Phase 2 batched kernels accumulate in a different order than the
-    // single-token path; expect ~1e-3 tolerance per HC element.
+    // Relative-with-floor (see max_rel_diff doc): batched kernels
+    // accumulate in a different order through f16/fp8/q8 stages; measured
+    // benign drift is ≤1.3e-2 rel. 5e-2 keeps margin while still catching
+    // real bugs (routing flips / stale buffers show as O(1) rel).
     assert!(
         overall_max < 5e-2,
-        "forward_prompt_batch_v2 diverges from sequential by {:.4e} (> 5e-2)",
+        "forward_prompt_batch_v2 diverges from sequential by rel {:.4e} (> 5e-2)",
         overall_max
     );
-    eprintln!("\nv2 ORACLE PASS within 5e-2");
+    eprintln!("\nv2 ORACLE PASS within rel 5e-2");
     Ok(())
 }
 
@@ -520,16 +547,17 @@ fn forward_prefill_last_only_matches_sequential() -> eyre::Result<()> {
     )?;
     assert_eq!(prefill_logits.len(), N_VOCAB as usize);
 
-    let (maxd, idx) = max_abs_diff(&seq_logits, &prefill_logits);
+    let (maxr, idx) = max_rel_diff(&seq_logits, &prefill_logits, 1.0);
     eprintln!(
-        "max abs diff = {maxd:.4e} @i={idx}  ref={:.4}  prefill={:.4}",
+        "max rel diff = {maxr:.4e} @i={idx}  ref={:.4}  prefill={:.4}",
         seq_logits[idx], prefill_logits[idx]
     );
+    // Relative-with-floor; see max_rel_diff doc.
     assert!(
-        maxd < 5e-2,
-        "forward_prefill last_only diverges from sequential by {maxd:.4e} (> 5e-2)"
+        maxr < 5e-2,
+        "forward_prefill last_only diverges from sequential by rel {maxr:.4e} (> 5e-2)"
     );
-    eprintln!("Phase 6 ORACLE PASS within 5e-2");
+    eprintln!("Phase 6 ORACLE PASS within rel 5e-2");
     Ok(())
 }
 
