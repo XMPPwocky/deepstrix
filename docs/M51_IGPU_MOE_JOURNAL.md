@@ -165,5 +165,28 @@ roofline (was 2.4×).
 Remaining iq2 ideas (post-S2, diminishing): SBG=4 (32 KiB LDS → 8-10 waves,
 risky), q8-direct-from-L2 (no staging/barriers), staging-loop tuning.
 
-## Next: S2 — same treatment for q2_k down (est. ~24 ms × 43 ≈ 1030 ms of the
-## 3414 ms wall at B=1024; unpack-once + scale-fold + per-lane member accs)
+## 2026-06-09 — S2 q2k kwide: bit-exact, e2e +5% → 316 tok/s combined
+
+`q2_k_matvec_par_by_expert_kwide` (Q2K_VARIANT=kwide): loops inverted —
+weight quarter unpacked ONCE per (block, lane) with 4-bit group scale folded
+at unpack (byte-safe: 3·15 < 256), f16 d/dmin converted once, per-lane member
+accumulators pacc[32], one warp-reduce per member at the end. 92 VGPR / 0 LDS /
+16 waves / no spills.
+
+- Oracle vs by_expert (random sc/q2/d/dmin/bsums, full+partial chunks):
+  **bit-exact** (max_abs_diff = 0.0) — folded integer scale is associative.
+- Isolated (B=1024, chunk=32): 22.2-23.3 → **19.8 ms (−12%)**. Less than the
+  VALU math promised → q2k is substantially cache-BW-bound on cross-WG q8
+  re-reads (each row-WG re-pulls members' midq from L2/MALL). LDS staging
+  can't fix cross-WG redundancy; geometry change (more rows/WG) is the tile8
+  trap. Accepting ~19.8 ms as near-floor for this shape.
+- E2e (IQ2=kwide fixed, q2k by_expert → kwide): 301.8 → **316.6 tok/s** @4K.
+
+**Combined state: baseline 230 → 316.6 tok/s @4K (+37.6%); ≥309 at 16K/32K.**
+
+Wall composition @4K (3234 ms): iq2 kwide ~2176 ms (67%), q2k kwide ~851 ms
+(26%), other ~200 ms. iGPU still the pipeline wall. Next iq2 levers: member
+unroll sweep, SBG=4 (more k per lane, 32 KiB LDS occupancy risk), q8-direct
+from L2 (drop staging+barriers).
+
+## Next: iq2 kwide tuning round (unroll sweep, then SBG=4 or q8-L2)
