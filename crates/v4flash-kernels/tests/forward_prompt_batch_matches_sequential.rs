@@ -413,10 +413,13 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
         std::mem::swap(&mut bd.residual, &mut bd.residual_next);
 
         // Limit bisect output — stop after divergence is well-established.
-        if let Some((bad_layer, _)) = first_bad {
-            if layer >= bad_layer + 2 {
-                eprintln!("\n>>> First-bad layer = {bad_layer}; stopping bisect at L{layer}");
-                break;
+        // V2_BISECT_FULL=1 disables the early stop (full 43-layer drift curve).
+        if std::env::var_os("V2_BISECT_FULL").is_none() {
+            if let Some((bad_layer, _)) = first_bad {
+                if layer >= bad_layer + 2 {
+                    eprintln!("\n>>> First-bad layer = {bad_layer}; stopping bisect at L{layer}");
+                    break;
+                }
             }
         }
     }
