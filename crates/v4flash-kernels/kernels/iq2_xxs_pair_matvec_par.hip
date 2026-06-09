@@ -2260,29 +2260,46 @@ void iq2_xxs_pair_matvec_fused_swiglu_kwide(
             uds = (0.125f * f16_to_f32_par(wd_u)) * (float)ls_u;
         }
 
-        // --- Cooperative xq stage: per member, the PAIR of blocks: 2 × (1 yd
-        //     + 64 q8 dwords) = 130 dwords; q8 lands 16-B aligned, member-major ---
+        // --- Cooperative xq stage (M53 rewrite): branch-free, all members
+        //     concurrent. The old per-member loop compiled to a vmcnt(0)-
+        //     serialized branchy copy (one exposed global-load latency per
+        //     dword, members sequential, 130/256 threads active). Here
+        //     thread t owns member t>>3, dword lanes (t&7)+8j of the
+        //     member's 2×64 q8 dwords — 16 independent loads issue before
+        //     any store waits, every thread busy. yd via the first
+        //     2·n_members threads. 292-B source block = 73 dwords; dword 0
+        //     is yd, 1..64 are q8. ---
         {
             uint32_t* s_q8_dw = (uint32_t*)s_q8v;
             const unsigned int src_blk0 = 2u * sbp;
-            for (unsigned int mi = 0; mi < n_members; mi++) {
+            const unsigned int mi = tid >> 3;
+            const unsigned int r  = tid & 7u;
+            if (mi < n_members) {
                 const int packed     = s_member_packed[mi];
                 const unsigned int b = (unsigned int)(packed >> 16);
                 const uint32_t* xq_src_dw = (const uint32_t*)(
                     xq + (size_t)b * (size_t)n_blocks * (size_t)BLOCK_Q8_K_BYTES
                        + (size_t)src_blk0 * (size_t)BLOCK_Q8_K_BYTES);
-                // i ∈ [0,130): h = i/65 picks the block, ii = i%65 the dword;
-                // ii==0 is yd, 1..64 are the q8 dwords. 292 B block = 73 dwords.
-                for (unsigned int i = tid; i < 130u; i += blockDim.x) {
-                    const unsigned int h  = (i >= 65u) ? 1u : 0u;
-                    const unsigned int ii = i - 65u * h;
-                    const uint32_t v = xq_src_dw[h * 73u + ii];
-                    if (ii == 0u) {
-                        s_yd[mi * 2u + h] = __uint_as_float(v);
-                    } else {
-                        s_q8_dw[(mi * 2u + h) * 64u + (ii - 1u)] = v;
-                    }
+                #pragma unroll
+                for (unsigned int j = 0; j < 8u; j++) {
+                    const unsigned int ii = r + 8u * j;          // 0..63
+                    s_q8_dw[(mi * 2u + 0u) * 64u + ii] = xq_src_dw[1u + ii];
                 }
+                #pragma unroll
+                for (unsigned int j = 0; j < 8u; j++) {
+                    const unsigned int ii = r + 8u * j;
+                    s_q8_dw[(mi * 2u + 1u) * 64u + ii] = xq_src_dw[74u + ii];
+                }
+            }
+            if (tid < 2u * n_members) {
+                const unsigned int myd = tid >> 1;
+                const unsigned int h   = tid & 1u;
+                const int packed     = s_member_packed[myd];
+                const unsigned int b = (unsigned int)(packed >> 16);
+                const uint32_t* xq_src_dw = (const uint32_t*)(
+                    xq + (size_t)b * (size_t)n_blocks * (size_t)BLOCK_Q8_K_BYTES
+                       + (size_t)src_blk0 * (size_t)BLOCK_Q8_K_BYTES);
+                s_yd[myd * 2u + h] = __uint_as_float(xq_src_dw[h * 73u]);
             }
         }
         __syncthreads();
