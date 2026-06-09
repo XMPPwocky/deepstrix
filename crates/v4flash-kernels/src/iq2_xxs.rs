@@ -337,9 +337,17 @@ impl Iq2XxsPairMatvec {
             ));
         }
 
-        let function = self
-            .module
-            .get_function("iq2_xxs_pair_matvec_fused_swiglu_batch")?;
+        // DECODE_IQ2=wstage selects the M55 weight-staged kernel (LDS-staged
+        // b128 weight loads vs the base kernel's 2-byte u16s; see kernel
+        // comment). Opt-in until gated.
+        static WSTAGE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("DECODE_IQ2").map(|v| v == "wstage").unwrap_or(false)
+        });
+        let function = self.module.get_function(if *WSTAGE {
+            "iq2_xxs_pair_matvec_fused_swiglu_batch_wstage"
+        } else {
+            "iq2_xxs_pair_matvec_fused_swiglu_batch"
+        })?;
         let cfg = LaunchConfig {
             grid: (n_rows / 8, n_used, 1),
             block: (256, 1, 1),

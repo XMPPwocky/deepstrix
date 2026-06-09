@@ -499,6 +499,112 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_batch_b512(
     }
 }
 
+// =============================================================================
+// M55 decode: weight-STAGED variant of _fused_swiglu_batch.
+//
+// The B=1 decode kernel is weight-BW-bound, but its global weight loads are
+// 2-byte u16s off the odd-offset iq2 layout (qs at block+2) — measured
+// ~73% of achievable BW (139 µs/launch ≈ 187 GB/s). Here each WG coop-stages
+// its 8 rows of one matrix (8 × 1056 B, row stride is 16-aligned) into LDS
+// with b128 loads, then runs the existing dequant from LDS. Two passes
+// (gate, then up) keep LDS at 1 KB sign + 2 KB grid + 4.7 KB xq + 8.4 KB
+// weights ≈ 16.1 KB → full occupancy.
+// =============================================================================
+extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_batch_wstage(
+        float        * __restrict__ mid,           // [n_used, n_rows]
+        const uint8_t * __restrict__ gate_w_base,
+        const uint8_t * __restrict__ up_w_base,
+        const uint8_t * __restrict__ xq,
+        const float  * __restrict__ expert_w,
+        const int    * __restrict__ selected,      // [n_used]
+        unsigned int    gate_bpe,
+        unsigned int    up_bpe,
+        float           clamp,
+        unsigned int    n_rows,
+        unsigned int    n_blocks) {
+    __shared__ uint64_t s_sign_pair[128];
+    __shared__ uint64_t s_grid[256];
+    __shared__ uint8_t  s_xq[16 * 292];
+    __shared__ uint8_t  s_w[8 * 16 * BLOCK_IQ2_XXS_BYTES];  // 8 rows × 16 blocks × 66 B
+
+    const unsigned int tid = threadIdx.x;
+    if (tid < 128) {
+        const uint32_t s = ksigns_iq2xs[tid];
+        const uint32_t signs = s * 0x01010101u;
+        const uint32_t sm0 = expand_signs_par(signs, 0x08040201u);
+        const uint32_t sm1 = expand_signs_par(signs, 0x80402010u);
+        s_sign_pair[tid] = ((uint64_t)sm1 << 32) | (uint64_t)sm0;
+    }
+    if (tid < 256) s_grid[tid] = iq2xxs_grid[tid];
+    const unsigned int xq_bytes = n_blocks * 292u;
+    for (unsigned int i = tid; i < xq_bytes; i += blockDim.x) {
+        s_xq[i] = xq[i];
+    }
+
+    const unsigned int slot = blockIdx.y;
+    const unsigned int row_in_block = tid / 32u;
+    const unsigned int lane         = tid & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    const bool row_valid = (row < n_rows);
+
+    const int e = selected[slot];
+    const unsigned int block_lane = lane >> 1u;
+    const unsigned int ib32_lo    = (lane & 1u) * 4u;
+
+    const unsigned int row_bytes = n_blocks * BLOCK_IQ2_XXS_BYTES;   // 1056
+    // Coop-stage source: the WG's 8 rows are contiguous (rows row0..row0+8
+    // of one expert) — 8448 B. Row stride 1056 ≡ 0 (mod 16) and bpe is a
+    // multiple of 16, so the base is b128-aligned.
+    const unsigned int wg_bytes = 8u * row_bytes;
+    const unsigned int wg_vec4  = wg_bytes / 16u;
+
+    float g_sum = 0.0f;
+    float u_sum = 0.0f;
+    #pragma unroll
+    for (unsigned int pass = 0; pass < 2u; pass++) {
+        const uint8_t* base = (pass ? up_w_base : gate_w_base)
+                            + (uint64_t)e * (uint64_t)(pass ? up_bpe : gate_bpe)
+                            + (uint64_t)blockIdx.x * 8u * (uint64_t)row_bytes;
+        __syncthreads();   // pass 0: after LUT/xq stage; pass 1: protect s_w
+        {
+            const uint4* src = (const uint4*)base;
+            uint4* dst = (uint4*)s_w;
+            for (unsigned int i = tid; i < wg_vec4; i += blockDim.x) {
+                dst[i] = src[i];
+            }
+        }
+        __syncthreads();
+
+        if (row_valid) {
+            float acc = 0.0f;
+            const uint8_t* w_row = s_w + (size_t)row_in_block * row_bytes;
+            for (unsigned int b = block_lane; b < n_blocks; b += 16u) {
+                acc += dot_block_half_lds(
+                    w_row + (size_t)b * BLOCK_IQ2_XXS_BYTES,
+                    s_xq + (size_t)b * BLOCK_Q8_K_BYTES,
+                    ib32_lo, s_sign_pair, s_grid);
+            }
+            if (pass) { u_sum = acc; } else { g_sum = acc; }
+        }
+    }
+
+    if (!row_valid) return;
+    g_sum = warp_sum_f32_par(g_sum);
+    u_sum = warp_sum_f32_par(u_sum);
+
+    if (lane == 0) {
+        const float ew = expert_w[slot];
+        if (clamp > 1.0e-6f) {
+            if (g_sum > clamp)  g_sum = clamp;
+            if (u_sum > clamp)  u_sum = clamp;
+            if (u_sum < -clamp) u_sum = -clamp;
+        }
+        const float sig = 1.0f / (1.0f + expf(-g_sum));
+        mid[(uint64_t)slot * (uint64_t)n_rows + (uint64_t)row] =
+            g_sum * sig * u_sum * ew;
+    }
+}
+
 // M50 Phase 3 v0: batched variant of iq2_xxs_pair_matvec_fused_swiglu_batch.
 // grid.z = B so each WG handles ONE (row_block, slot, batch) triple. Per-
 // batch xq[B, n_blocks*292], selected[B, n_used], expert_w[B, n_used] and
