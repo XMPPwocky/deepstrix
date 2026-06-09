@@ -1572,7 +1572,7 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_padded(
 // accumulator indices (157 VGPR / 9 waves); 0 = generic loop (movrel, but
 // lower register pressure). A/B'd 2026-06-09.
 #ifndef IQ2_V2_UNROLL
-#define IQ2_V2_UNROLL 8
+#define IQ2_V2_UNROLL 4
 #endif
 
 extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_staged(
