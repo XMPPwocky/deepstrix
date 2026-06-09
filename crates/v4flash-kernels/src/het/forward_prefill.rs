@@ -2502,11 +2502,11 @@ impl HeterogeneousEngine {
             // Q2K_VARIANT=bxn rolls back to the original kernel.
             // Hybrid IQ2 is incompatible (splits work_items into two
             // buckets); error out if both are requested simultaneously.
-            // Default kwide since M51 (2026-06-09): unpack-once member loop,
-            // bit-exact vs by_expert, −12% kernel. by_expert/bxn stay opt-in.
-            // kwide2 (M53): row-pair activation reuse, opt-in until gated.
+            // Default kwide2 since M53 (2026-06-09): row-pair activation
+            // reuse on top of kwide's unpack-once loop; bit-exact vs
+            // by_expert. kwide/by_expert/bxn stay opt-in.
             let q2k_variant = std::env::var("Q2K_VARIANT")
-                .unwrap_or_else(|_| "kwide".into());
+                .unwrap_or_else(|_| "kwide2".into());
             let use_kwide2 = q2k_variant == "kwide2";
             let use_kwide = q2k_variant == "kwide";
             let use_by_expert = use_kwide || use_kwide2 || q2k_variant == "by_expert";
@@ -2518,10 +2518,12 @@ impl HeterogeneousEngine {
                 ));
             }
             if use_by_expert {
-                // Zero partials: unwritten (b, slot) pairs must stay 0 so
-                // the reduce-sum is correct. The by_expert kernel only writes
-                // the slots in expert_members.
-                bi.q2k_partials.fill_zero()?;
+                // No partials zero-fill (M53): router topk yields 8 DISTINCT
+                // experts per token, so group_count[e] ≤ B = max_per_expert —
+                // the builder's overflow guard can't fire and every (b, slot)
+                // pair is written by exactly one work item. (The 128 MB/layer
+                // fill was ~44 ms/chunk of pure overhead.) If routing ever
+                // allows duplicate experts per token, restore the fill.
                 if use_kwide2 {
                     ie.q2k.launch_by_expert_kwide2(
                         &ie.compute,
