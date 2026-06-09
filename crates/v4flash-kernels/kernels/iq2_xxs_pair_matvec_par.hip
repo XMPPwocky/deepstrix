@@ -1578,6 +1578,10 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_padded(
 #ifndef IQ2_KW_UNROLL
 #define IQ2_KW_UNROLL 4
 #endif
+// kwide full-chunk (n_members==32) static-unroll specialization.
+#ifndef IQ2_KW_FULLUNROLL
+#define IQ2_KW_FULLUNROLL 0
+#endif
 
 extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_staged(
         float        * __restrict__ mid,           // [B, n_used, n_rows]
@@ -2282,23 +2286,45 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_kwide(
             const uint4* q8_lane = &s_q8v[sbh * 16u + l15];   // member mi at +mi*32
             const float* yd_lane = &s_yd[sbh];                // member mi at +mi*2
 
+            #define IQ2_KW_DOT_BODY(mi)                                          \
+                {                                                                \
+                    const uint4 q = q8_lane[(mi) * 32u];                         \
+                    int32_t sumi_g = 0;                                          \
+                    sumi_g = sudot4_par(wg0, (int32_t)q.x, sumi_g);              \
+                    sumi_g = sudot4_par(wg1, (int32_t)q.y, sumi_g);              \
+                    sumi_g = sudot4_par(wg2, (int32_t)q.z, sumi_g);              \
+                    sumi_g = sudot4_par(wg3, (int32_t)q.w, sumi_g);              \
+                    int32_t sumi_u = 0;                                          \
+                    sumi_u = sudot4_par(wu0, (int32_t)q.x, sumi_u);              \
+                    sumi_u = sudot4_par(wu1, (int32_t)q.y, sumi_u);              \
+                    sumi_u = sudot4_par(wu2, (int32_t)q.z, sumi_u);              \
+                    sumi_u = sudot4_par(wu3, (int32_t)q.w, sumi_u);              \
+                    const float yd = yd_lane[(mi) * 2u];                         \
+                    lane_pacc_g[(mi)] += (float)sumi_g * (yd * gds);             \
+                    lane_pacc_u[(mi)] += (float)sumi_u * (yd * uds);             \
+                }
+#if IQ2_KW_FULLUNROLL
+            // Full-chunk specialization: static pacc indices (no movrel, no
+            // per-iter address math). kwide is VALU-issue-bound, so the
+            // occupancy this costs may matter less than it did for staged.
+            if (n_members == IQ2_STAGED_MAX_CHUNK) {
+                #pragma unroll
+                for (unsigned int mi = 0; mi < IQ2_STAGED_MAX_CHUNK; mi++) {
+                    IQ2_KW_DOT_BODY(mi);
+                }
+            } else {
+                #pragma unroll IQ2_KW_UNROLL
+                for (unsigned int mi = 0; mi < n_members; mi++) {
+                    IQ2_KW_DOT_BODY(mi);
+                }
+            }
+#else
             #pragma unroll IQ2_KW_UNROLL
             for (unsigned int mi = 0; mi < n_members; mi++) {
-                const uint4 q = q8_lane[mi * 32u];
-                int32_t sumi_g = 0;
-                sumi_g = sudot4_par(wg0, (int32_t)q.x, sumi_g);
-                sumi_g = sudot4_par(wg1, (int32_t)q.y, sumi_g);
-                sumi_g = sudot4_par(wg2, (int32_t)q.z, sumi_g);
-                sumi_g = sudot4_par(wg3, (int32_t)q.w, sumi_g);
-                int32_t sumi_u = 0;
-                sumi_u = sudot4_par(wu0, (int32_t)q.x, sumi_u);
-                sumi_u = sudot4_par(wu1, (int32_t)q.y, sumi_u);
-                sumi_u = sudot4_par(wu2, (int32_t)q.z, sumi_u);
-                sumi_u = sudot4_par(wu3, (int32_t)q.w, sumi_u);
-                const float yd = yd_lane[mi * 2u];
-                lane_pacc_g[mi] += (float)sumi_g * (yd * gds);
-                lane_pacc_u[mi] += (float)sumi_u * (yd * uds);
+                IQ2_KW_DOT_BODY(mi);
             }
+#endif
+            #undef IQ2_KW_DOT_BODY
         }
         __syncthreads();  // protect s_q8v/s_yd from next pair's overwrite
     }
