@@ -134,4 +134,36 @@ Design adjustments from the S0 data:
 - No s_partial: fold swiglu+output into the post-reduce lane-0 loop (−2 KiB).
 - Member loop #pragma unroll 4 (empirically the pipelining sweet spot).
 
-## Next: S1 kwide implementation
+## 2026-06-09 — S1 kwide: +30% e2e. Floor target hit.
+
+Kernel `iq2_xxs_pair_matvec_fused_swiglu_kwide` (IQ2_VARIANT=kwide): warp=row
+unchanged; lanes split a PAIR of super-blocks — lane owns 16 weights (half
+sub-block), one ds_load_b128 feeds 8 dot4s. 110 VGPR / 19840 B LDS / 12
+waves/SIMD / no spills. Member-major s_q8 [mi][sbh][16×uint4] (the [sbh][mi]
+layout would 2-way bank-conflict the half-waves). Swiglu fused into reduce
+loop (no s_partial). Member loop #pragma unroll 4.
+
+Isolated (B=1024, WI=256, chunk=32, min-of-20, interleaved):
+  staged 78.3 ms → kwide **50.6 ms (−35.4%)**
+
+Oracle (varying xq-d AND weight-d, full 32-member + partial 19-member chunks):
+  kwide rel=1.1e-4, staged_v2 rel=7.9e-5 (tol 5e-3) ✓
+
+PMC vs staged: VALU 2.69e10→2.11e10 (−22%), LDS insts 3.17e9→2.49e9 (−22%),
+SQ_BUSY 1.83e10→1.18e10 (−35%). IPC 1.47→1.78. Now ~1.56× over dot4-only
+roofline (was 2.4×).
+
+**E2e cold A/B (PIPELINE_LANES=2, B=1024/iter, back-to-back):**
+
+| depth | staged | kwide | Δ |
+|---|---|---|---|
+| 4096  | 230.3 | **299.9** | +30.2% |
+| 8192  | 228.9 | **298.0** | +30.2% |
+| 16384 | 223.9 | **292.4** | +30.6% |
+| 32768 | 224.7 | **293.6** | +30.7% |
+
+Remaining iq2 ideas (post-S2, diminishing): SBG=4 (32 KiB LDS → 8-10 waves,
+risky), q8-direct-from-L2 (no staging/barriers), staging-loop tuning.
+
+## Next: S2 — same treatment for q2_k down (est. ~24 ms × 43 ≈ 1030 ms of the
+## 3414 ms wall at B=1024; unpack-once + scale-fold + per-lane member accs)
