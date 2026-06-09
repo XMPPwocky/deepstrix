@@ -355,6 +355,31 @@ impl HeterogeneousEngine {
             .as_ref()
             .map(|(ls, _)| ls.clone())
             .unwrap_or_default();
+
+        // M54: pre-issue the token's ENTIRE iGPU MoE lane (43 × wait →
+        // graph → push, all event-gated) before the dGPU layer loop. The
+        // decode pftrace showed ~125 µs/layer of host-submission lag on the
+        // iGPU stream when its commands were interleaved with the ~25 dGPU
+        // submissions per layer — lag that lands on the dGPU's MoE wait.
+        // DECODE_PREISSUE=1 opts in (default off until gated).
+        static PREISSUE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("DECODE_PREISSUE").map(|v| v == "1").unwrap_or(false)
+        });
+        let preissue = *PREISSUE
+            && matches!(self.mode, ExecMode::HetParallel)
+            && dump_subtensor_layers.is_empty();
+        if preissue {
+            let _span = debug_span!("igpu.preissue_lane").entered();
+            for layer in 0..N_LAYER as usize {
+                self.issue_igpu_moe(
+                    dgpu_scratch,
+                    igpu_scratch,
+                    &weights.igpu_layers[layer],
+                )?;
+            }
+            self.set_current_cached(self.dgpu.device)?;
+        }
+
         for layer in 0..N_LAYER as usize {
             let next_dlw = if layer + 1 < N_LAYER as usize {
                 Some(&weights.dgpu_layers[layer + 1])
@@ -427,6 +452,17 @@ impl HeterogeneousEngine {
                 )?;
                 maybe_dump_subtensor_f32(
                     layer, "d_ew", &dgpu_scratch.d_ew
+                )?;
+            } else if preissue {
+                self.forward_layer_preissued_moe(
+                    dgpu_scratch,
+                    igpu_scratch,
+                    &mut state.layers[layer],
+                    &weights.dgpu_layers[layer],
+                    next_dlw,
+                    &weights.igpu_layers[layer],
+                    pos,
+                    token_id,
                 )?;
             } else {
                 self.forward_layer(

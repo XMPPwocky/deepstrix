@@ -109,6 +109,96 @@ impl HeterogeneousEngine {
         )
     }
 
+    /// Same as [`forward_layer`] but assumes the layer's iGPU MoE command
+    /// sequence was already enqueued by [`issue_igpu_moe`] (M54 pre-issue
+    /// mode) — the impl skips its inline iGPU section. Parallel mode only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_layer_preissued_moe(
+        &self,
+        dgpu_scratch: &mut DgpuScratch,
+        igpu_scratch: &mut IgpuScratch,
+        ls: &mut HetLayerState,
+        dlw: &DgpuLayerWeights,
+        next_dlw: Option<&DgpuLayerWeights>,
+        ilw: &IgpuLayerWeights,
+        pos: u32,
+        token_id: i32,
+    ) -> eyre::Result<()> {
+        self.forward_layer_impl_inner(
+            dgpu_scratch,
+            igpu_scratch,
+            ls,
+            dlw,
+            next_dlw,
+            ilw,
+            pos,
+            token_id,
+            false,
+            true,
+        )
+    }
+
+    /// M54: enqueue one layer's complete iGPU MoE sequence (wait on
+    /// `selected_pushed` → routed_moe graph → record `moe_done` → peer-push
+    /// ffn_moe → record `moe_arrived`). Every command is event-gated, so
+    /// the whole lane for all 43 layers can be pre-issued at token start —
+    /// the decode pftrace showed ~125 µs/layer of host-submission lag
+    /// (`routed_moe → moe.wait` gaps) when the iGPU commands were
+    /// interleaved with the ~25 dGPU submissions per layer, and that lag
+    /// lands directly on the dGPU's MoE wait (the critical path).
+    ///
+    /// Safety relies on stream ordering: ffn_combine(L) precedes
+    /// router(L+1) on the dGPU compute stream, so `selected_pushed(L+1)`
+    /// implies ffn_moe_recv(L) was consumed; the activations push precedes
+    /// the selected push on the dGPU xfer stream.
+    pub fn issue_igpu_moe(
+        &self,
+        dgpu_scratch: &mut DgpuScratch,
+        igpu_scratch: &mut IgpuScratch,
+        ilw: &IgpuLayerWeights,
+    ) -> eyre::Result<()> {
+        use tracing::debug_span;
+        let layer = ilw.layer_idx;
+        let sev = &self.sync_events.layers[layer as usize];
+        self.set_current_cached(self.igpu.device)?;
+        let ie = &self.igpu;
+
+        {
+            let _t_wait = ie.events.stage("igpu.moe.wait", &ie.compute)?;
+            ie.compute.wait_event(&sev.selected_pushed)?;
+            _t_wait.end()?;
+        }
+
+        let gbpe = ilw.routed.gate_bytes_per_expert;
+        let ubpe = ilw.routed.up_bytes_per_expert;
+        let dbpe = ilw.routed.down_bytes_per_expert;
+        let mid_blocks_bytes = (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
+
+        let _t_moe = ie.events.stage("igpu.routed_moe", &ie.compute)?;
+        let _s_moe = debug_span!("routed_moe").entered();
+        self.igpu_graphs.run("routed_moe", layer as u32, &ie.compute, |s| {
+            ie.q8k.launch(s, &mut igpu_scratch.d_xq_q8k, &igpu_scratch.ffn_input_norm_recv, BLOCKS_Q8K_GATE_IN)?;
+            ie.iq2.launch_fused_swiglu_batch(s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
+            ie.q8k.launch(s, &mut igpu_scratch.d_midq_cat, &igpu_scratch.d_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
+            ie.q2k.launch_batched(s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
+            Ok(())
+        })?;
+        drop(_s_moe);
+        _t_moe.end()?;
+
+        sev.moe_done.record(&ie.compute)?;
+        ie.xfer.wait_event(&sev.moe_done)?;
+        let _t_peer_moe = ie.events.stage("igpu.peer_push_ffn_moe", &ie.xfer)?;
+        peer_push_f32(
+            &igpu_scratch.ffn_moe,
+            &mut dgpu_scratch.ffn_moe_recv,
+            &ie.xfer,
+        )?;
+        sev.moe_arrived.record(&ie.xfer)?;
+        _t_peer_moe.end()?;
+        Ok(())
+    }
+
     fn forward_layer_impl(
         &self,
         dgpu_scratch: &mut DgpuScratch,
@@ -120,6 +210,34 @@ impl HeterogeneousEngine {
         pos: u32,
         token_id: i32,
         standalone_graphs: bool,
+    ) -> eyre::Result<()> {
+        self.forward_layer_impl_inner(
+            dgpu_scratch,
+            igpu_scratch,
+            ls,
+            dlw,
+            next_dlw,
+            ilw,
+            pos,
+            token_id,
+            standalone_graphs,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_impl_inner(
+        &self,
+        dgpu_scratch: &mut DgpuScratch,
+        igpu_scratch: &mut IgpuScratch,
+        ls: &mut HetLayerState,
+        dlw: &DgpuLayerWeights,
+        next_dlw: Option<&DgpuLayerWeights>,
+        ilw: &IgpuLayerWeights,
+        pos: u32,
+        token_id: i32,
+        standalone_graphs: bool,
+        igpu_moe_preissued: bool,
     ) -> eyre::Result<()> {
         let layer = dlw.layer_idx;
         if ilw.layer_idx != layer {
@@ -1097,6 +1215,11 @@ impl HeterogeneousEngine {
             _t_shared.end()?;
         }
 
+        // M54 pre-issue mode: the whole iGPU MoE lane (wait → graph →
+        // push) was enqueued at token start by issue_igpu_moe; skip the
+        // inline iGPU section entirely (the dGPU's moe_arrived wait below
+        // synchronizes against the pre-issued lane).
+        if !igpu_moe_preissued {
         // Switch to iGPU for the MoE.
         self.set_current_cached(self.igpu.device)?;
         let ie = &self.igpu;
@@ -1178,6 +1301,7 @@ impl HeterogeneousEngine {
         }
         drop(_s_peer_moe);
         _t_peer_moe.end()?;
+        } // !igpu_moe_preissued
 
         // ============================================================
         // dGPU: in serial mode, issue shared expert NOW. In parallel
