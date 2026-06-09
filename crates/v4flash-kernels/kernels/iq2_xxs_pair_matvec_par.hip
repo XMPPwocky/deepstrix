@@ -2122,7 +2122,13 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_staged_v2(
 // the lane-partition of k — within the usual 5e-3 rel oracle tolerance.
 // =============================================================================
 
-extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_kwide(
+extern "C" __global__
+#if IQ2_KW_FULLUNROLL
+// Cap VGPRs so the full-unroll's load pipelining can't blow occupancy
+// (uncapped: 168 VGPR → 9 waves → +41%). 12 waves/SIMD needs ≤128 VGPR.
+__launch_bounds__(256, 12)
+#endif
+void iq2_xxs_pair_matvec_fused_swiglu_kwide(
         float        * __restrict__ mid,           // [B, n_used, n_rows]
         const uint8_t * __restrict__ gate_w_base,
         const uint8_t * __restrict__ up_w_base,
