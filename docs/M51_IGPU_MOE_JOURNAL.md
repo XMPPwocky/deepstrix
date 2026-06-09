@@ -30,4 +30,43 @@ Findings:
 
 Gate for all new variants: waves/SIMD ≥ 12 (iq2) / 16 (q2k), zero spills.
 
-## Next: Phase 0c ISA audit of staged member loop (v_mul_lo? VOPD? dead LDS round-trip?)
+## 2026-06-09 — Phase 0c: ISA audit of staged member loop
+
+Recipe (CCOB bundles need unbundling first):
+```
+nix develop -c hipcc -O3 --genco --offload-arch=gfx1151 -o /tmp/iq2_dev.hsaco crates/v4flash-kernels/kernels/iq2_xxs_pair_matvec_par.hip
+nix develop -c clang-offload-bundler --unbundle --type=o --input=/tmp/iq2_dev.hsaco --output=/tmp/iq2_elf.hsaco --targets=hipv4-amdgcn-amd-amdhsa--gfx1151
+nix develop -c llvm-objdump -d --mcpu=gfx1151 /tmp/iq2_elf.hsaco
+```
+
+Member loop is unrolled ×4. Per member iteration (the hot ~25 instructions):
+
+| group | insts | notes |
+|---|---|---|
+| useful | 4× `v_dot4_i32_iu8` | the only roofline work |
+| scale chain | 2× `v_mul_lo_u32` + 2× `v_cvt_f32_i32` + ~4× `v_mul/fmac_f32` | F3 — hoistable |
+| **accumulator movrel** | **2× `v_movrels_b32` + 2× `v_movreld_b32` + `s_add m0`** | `lane_pacc_g/u[mi]` dynamic index → M0-indexed register moves. NOT in any source-level analysis. |
+| LDS | `ds_load_2addr_b32` (q8) + `ds_load_b32` (yd) + 2× `s_waitcnt lgkmcnt` | misaligned q8 → 2×b32 (F2) |
+
+≈16 VALU + 2 SALU issued per member vs 4 useful → static ~4×, recovered to the
+measured 2.4× by partial VOPD (`v_dual_*` present but sparse).
+
+**Key surprises vs plan:**
+1. Weights v74-77 are ALREADY hoisted to registers across the member loop — the
+   F1 LDS round-trip costs ~nothing in the dot phase. Its only real cost is the
+   8.5 KiB LDS (occupancy: 12 waves/SIMD is LDS-bound). S0b still worth it for
+   occupancy, not for issue count.
+2. **NEW lever S0d**: specialize the member loop for full chunks
+   (`n_members == 32`) with `#pragma unroll` → static accumulator indices →
+   kills all movrel + M0 traffic. Dynamic-n fallback loop kept for tail chunks.
+   At B=1024 most work items are full 32-member chunks.
+
+Attribution settled statically: per-member overhead (movrel + scale chain +
+LDS waits), NOT dequant. Subwarp/chunk-64 plan stays rejected; ablation-kernel
+trio downgraded to optional (ISA already gives the answer). Proceeding to S0.
+
+Post-S0 predicted member iteration: 1× `ds_load_b64` (aligned q8) + 1 yd load
++ 4 dot4 + 2 cvt + 2 mul + 2 fma ≈ 10 VALU + 2 LDS, no movrel → ~1.6× issue
+reduction in the 82%-of-wall dot phase.
+
+## Next: baseline e2e bench at HEAD (for later A/B), then S0 implementation
