@@ -2396,6 +2396,19 @@ impl HeterogeneousEngine {
                         crate::config::BLOCKS_Q8K_GATE_IN,
                         n_work_items,
                     )?;
+                } else if variant == "kwide" {
+                    let _t_kw = ie.events.stage("igpu.iq2_kwide", &ie.compute)?;
+                    ie.iq2.launch_fused_swiglu_kwide(
+                        &ie.compute, d_mid_cat,
+                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        d_xq_q8k, d_ew,
+                        group_count, expert_members, work_items,
+                        gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
+                        crate::config::SWIGLU_CLAMP_EXP,
+                        crate::config::N_FF_EXP,
+                        crate::config::BLOCKS_Q8K_GATE_IN,
+                        n_work_items,
+                    )?;
                 } else if variant == "staged_v2" {
                     let _t_s2 = ie.events.stage("igpu.iq2_staged_v2", &ie.compute)?;
                     ie.iq2.launch_fused_swiglu_chunked_staged_v2(

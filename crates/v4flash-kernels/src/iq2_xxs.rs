@@ -875,6 +875,62 @@ impl Iq2XxsPairMatvec {
         ])
     }
 
+    /// **kwide (M51 S1)** — k-widened lanes: warp still owns one row, but
+    /// lanes split a PAIR of super-blocks (16 weights each), so one
+    /// ds_load_b128 feeds 8 dot4s. Targets the LDS-round-trip-latency bound
+    /// found in the S0 experiments. Same arg list as `_chunked_staged`;
+    /// additionally requires `n_blocks % 2 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_kwide(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,           // [B, n_used, n_rows]
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,                 // [B, n_blocks*292]
+        expert_w: &DeviceBuffer<f32>,          // [B, n_used]
+        group_count: &DeviceBuffer<i32>,       // [n_expert]
+        expert_members: &DeviceBuffer<i32>,    // [n_expert * max_per_expert]
+        work_items: &DeviceBuffer<i32>,        // [n_work_items]
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+        n_work_items: u32,
+    ) -> eyre::Result<()> {
+        if n_rows % 8 != 0 {
+            return Err(eyre!("iq2_xxs kwide: n_rows={n_rows} must be multiple of 8"));
+        }
+        if n_blocks % 2 != 0 {
+            return Err(eyre!("iq2_xxs kwide: n_blocks={n_blocks} must be even"));
+        }
+        if chunk_size > 32 {
+            return Err(eyre!(
+                "iq2_xxs kwide: chunk_size={chunk_size} exceeds IQ2_STAGED_MAX_CHUNK=32"
+            ));
+        }
+        if n_work_items == 0 {
+            return Ok(());
+        }
+        let function = self
+            .module
+            .get_function("iq2_xxs_pair_matvec_fused_swiglu_kwide")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, n_work_items, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(),
+            expert_w.raw(), group_count.raw(), expert_members.raw(), work_items.raw(),
+            gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp, n_rows, n_blocks
+        ])
+    }
+
     /// **tile8_row32 variant** — port of ejpir/ds4-hip's
     /// `moe_gate_up_mid_expert_tile8_row32_kernel`.
     ///

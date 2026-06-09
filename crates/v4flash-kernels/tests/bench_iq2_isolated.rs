@@ -69,7 +69,8 @@ fn bench_iq2_isolated() -> eyre::Result<()> {
     let use_padded = variant == 3;
     let use_staged = variant == 4;
     let use_staged_v2 = variant == 5;
-    eprintln!("variant={variant} (0=chunked, 1=inline, 2=zeroidx, 3=padded, 4=staged, 5=staged_v2)");
+    let use_kwide = variant == 6;
+    eprintln!("variant={variant} (0=chunked, 1=inline, 2=zeroidx, 3=padded, 4=staged, 5=staged_v2, 6=kwide)");
     eprintln!("isolated iq2 probe: B={b}, iters={iters}, n_work_items={n_work_items_target}");
 
     let igpu = pick_igpu()?;
@@ -152,7 +153,15 @@ fn bench_iq2_isolated() -> eyre::Result<()> {
 
     // Warm up the kernel + caches with the variant being measured, so
     // first-launch overhead is excluded from the timed loop.
-    if use_staged_v2 {
+    if use_kwide {
+        iq2.launch_fused_swiglu_kwide(
+            &stream, &mut mid, &gate_w, &up_w, &xq, &expert_w,
+            &group_count, &expert_members, &work_items,
+            gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+            chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+            n_work_items_target,
+        )?;
+    } else if use_staged_v2 {
         iq2.launch_fused_swiglu_chunked_staged_v2(
             &stream, &mut mid, &gate_w, &up_w, &xq, &expert_w,
             &group_count, &expert_members, &work_items,
@@ -185,7 +194,15 @@ fn bench_iq2_isolated() -> eyre::Result<()> {
         let start = Event::new()?;
         let end = Event::new()?;
         start.record(&stream)?;
-        if use_staged_v2 {
+        if use_kwide {
+            iq2.launch_fused_swiglu_kwide(
+                &stream, &mut mid, &gate_w, &up_w, &xq, &expert_w,
+                &group_count, &expert_members, &work_items,
+                gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+                chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+                n_work_items_target,
+            )?;
+        } else if use_staged_v2 {
             iq2.launch_fused_swiglu_chunked_staged_v2(
                 &stream, &mut mid, &gate_w, &up_w, &xq, &expert_w,
                 &group_count, &expert_members, &work_items,
