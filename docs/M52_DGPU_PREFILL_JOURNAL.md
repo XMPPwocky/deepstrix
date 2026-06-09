@@ -81,3 +81,40 @@ E2e: **4K 419.9 / 32K 409.8 / 96K 384.0 tok/s** (was 318/312/318).
 iq2 now ≈ at the (conservative-estimate) dp4a compute roofline.
 96K dips again as the iGPU shrinks → dGPU partially re-exposed (expected).
 Next: q2k row-pair (q2k now ~36% of iGPU busy).
+
+## 2026-06-09 — M53.2 q2k kwide2 + dead-fill removal SHIPPED as defaults
+
+- `q2_k_matvec_par_by_expert_kwide2` (Q2K_VARIANT=kwide2, now default): each
+  warp dots one loaded q8/bsums set against TWO rows' weights (16 rows/WG) —
+  halves the cross-WG activation traffic the kernel is bound on. Members in
+  halves of 16 (register budget; 125 VGPR / 10 waves — below the usual 12-wave
+  gate, but the kernel is BW-bound and the cold e2e decides). **Bit-exact** vs
+  by_expert. Isolated 19.7 → 16.65 ms (−15.5%).
+- q2k partials zero-fill REMOVED: router topk gives 8 distinct experts/token →
+  group_count[e] ≤ B = max_per_expert → builder overflow guard can't fire →
+  every (b, slot) written. Was 128 MB/layer ≈ 44 ms/chunk of fillBuffer.
+
+E2e (defaults, cold, B=1024/iter):
+
+| depth | M52 end | M53 end |
+|---|---|---|
+| 4096  | 318.6 | **459.7** |
+| 32768 | 311.6 | **443.4** |
+| 98304 | 318.0 | **402.7** |
+
+(M53.1 staging rewrite contributed 318→420; kwide2 420→450; fill removal
+450→460 at 4K.)
+
+Server gate: real cold prefill **420.6 tok/s** (4606-tok prompt); completion
+coherent + content-accurate (correctly summarized our own M51 journal).
+
+Day total: **230 → 460 tok/s @4K (2.0×), 224 → 443 @32K, 223 → 403 @96K.**
+
+## Future (logged, not started)
+- chunk=64 for q2k only (dual work-item lists): iq2 can't use it (accumulator
+  VGPR cap), q2k weight-DRAM halves → ~+2%. Plumbing: second work_items build.
+- 96K gap vs 4K (403 vs 460) = dGPU re-exposure round 2: next dGPU item is
+  q8_0_gemm_wmma_lds_tiled (~415 ms/chunk) + attention smwsum growth.
+- iq2 now ~30 ms/launch ≈ 1.6× over theoretical dp4a peak; remaining levers
+  are tail-amortization geometry changes (SBG=4 needs chunk=16 → dequant 2×,
+  pencils ~neutral) — likely format-bound without the f16 cache route.
