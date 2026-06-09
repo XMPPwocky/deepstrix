@@ -482,6 +482,164 @@ extern "C" __global__ void q2_k_matvec_par_by_expert_kwide(
     }
 }
 
+// =============================================================================
+// by_expert_kwide2 — M53: row-pair activation reuse on top of kwide.
+//
+// kwide is cache-BW-bound on cross-WG activation re-reads: every 8-row WG
+// pulls its members' full midq (≈74 KB at chunk=32) from L2/MALL. Here each
+// warp owns TWO adjacent rows and dots one loaded q8/bsums set against both
+// rows' (separately unpacked, scale-folded) weights — 16 rows per WG, so
+// per-token activation traffic HALVES. Weight traffic is unchanged (each
+// row's tile still read once per work item).
+//
+// Register budget forces members to be processed in HALVES of 16
+// (pacc[2 rows][16 members] = 32 VGPR + 2×16 weight dwords + q8 in flight).
+// The second half re-reads q8 (the traffic win is 2× from rows, not 4×).
+//
+// Grid: (n_rows/16, n_work_items). Block 256 (8 warps × 2 rows = 16 rows).
+// n_rows must be a multiple of 16. Same partials semantics as by_expert.
+// =============================================================================
+
+extern "C" __global__ void q2_k_matvec_par_by_expert_kwide2(
+        float          * __restrict__ partials,      // [B*n_used, n_rows]
+        const uint8_t  * __restrict__ w_base,
+        const uint8_t  * __restrict__ xq_base,       // [B, n_used*xq_slot_stride]
+        const int      * __restrict__ group_count,   // [N_EXPERT]
+        const int      * __restrict__ expert_members,// [N_EXPERT * max_per_expert]
+        const int      * __restrict__ work_items,    // [n_work_items]
+        unsigned int     dbpe,
+        unsigned int     xq_slot_stride,
+        unsigned int     n_used,
+        unsigned int     max_per_expert,
+        unsigned int     chunk_size,
+        unsigned int     n_rows,
+        unsigned int     n_blocks_in) {
+    const unsigned int warp_in_block = threadIdx.x / 32u;
+    const unsigned int lane          = threadIdx.x & 31u;
+    const unsigned int row0          = blockIdx.x * 16u + warp_in_block * 2u;
+    const unsigned int w_idx         = blockIdx.y;
+    if (row0 >= n_rows) return;
+
+    const int packed_item = work_items[w_idx];
+    const unsigned int e            = (unsigned int)(packed_item >> 16) & 0xffffu;
+    const unsigned int member_start = (unsigned int)(packed_item       ) & 0xffffu;
+    const int group_n = group_count[e];
+    const unsigned int member_end = min((unsigned int)group_n, member_start + chunk_size);
+    if (member_end <= member_start) return;
+    const unsigned int n_members = member_end - member_start;
+
+    const unsigned int block_lane = lane >> 2u;        // 0..7
+    const unsigned int sub        = lane & 3u;         // 0..3
+    const unsigned int k_outer    = sub >> 1u;
+    const unsigned int j_lo       = (sub & 1u) * 2u;
+    const unsigned int is_base    = 2u * (4u * k_outer + j_lo);
+    const unsigned int q8_off     = k_outer * 128u + j_lo * 32u;
+
+    const uint8_t* w_expert = w_base + (uint64_t)e * (uint64_t)dbpe;
+
+    // Process members in halves of 16 to keep pacc at 2×16.
+    for (unsigned int half_lo = 0; half_lo < n_members; half_lo += 16u) {
+        const unsigned int half_n = min(16u, n_members - half_lo);
+
+        float pacc0[16];
+        float pacc1[16];
+        #pragma unroll
+        for (unsigned int m = 0; m < 16u; m++) { pacc0[m] = 0.0f; pacc1[m] = 0.0f; }
+
+        for (unsigned int bl = block_lane; bl < n_blocks_in; bl += 8u) {
+            // Unpack BOTH rows' quarters once, scales folded (see kwide).
+            int32_t w0[16], w1[16];
+            float d0, dmin0, d1, dmin1;
+            int32_t smin0[4], smin1[4];
+            #pragma unroll
+            for (unsigned int rr = 0; rr < 2u; rr++) {
+                const uint8_t* w_blk = w_expert
+                    + (uint64_t)(row0 + rr) * (uint64_t)n_blocks_in * BLOCK_Q2_K_BYTES
+                    + (uint64_t)bl * BLOCK_Q2_K_BYTES;
+                const uint8_t* sc      = w_blk;
+                const uint8_t* q2_base = w_blk + 16 + (uint64_t)k_outer * 32u;
+                const float dd  = f16_to_f32_par(*(const uint16_t*)(w_blk + 80));
+                const float dm  = f16_to_f32_par(*(const uint16_t*)(w_blk + 82));
+                int32_t* w = rr ? w1 : w0;
+                unsigned int wi = 0;
+                int shift = (int)(2u * j_lo);
+                #pragma unroll
+                for (int jj = 0; jj < 2; jj++) {
+                    const int32_t d_a = (int32_t)(sc[is_base + 2u * jj] & 0x0f);
+                    const int32_t d_b = (int32_t)(sc[is_base + 2u * jj + 1u] & 0x0f);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < 16; i += 4) {
+                        w[wi++] = (((load_dword_par(q2_base + i) >> shift) & 0x03030303) * d_a);
+                    }
+                    #pragma unroll
+                    for (uint32_t i = 0; i < 16; i += 4) {
+                        w[wi++] = (((load_dword_par(q2_base + 16 + i) >> shift) & 0x03030303) * d_b);
+                    }
+                    shift += 2;
+                }
+                if (rr) { d1 = dd; dmin1 = dm; } else { d0 = dd; dmin0 = dm; }
+                int32_t* sm = rr ? smin1 : smin0;
+                #pragma unroll
+                for (unsigned int t = 0; t < 4u; t++) {
+                    sm[t] = (int32_t)(sc[sub * 4u + t] >> 4);
+                }
+            }
+
+            #pragma unroll 2
+            for (unsigned int m = 0; m < half_n; m++) {
+                const int packed = expert_members[(size_t)e * (size_t)max_per_expert
+                                                + (size_t)(member_start + half_lo + m)];
+                const unsigned int b    = (unsigned int)(packed >> 16) & 0xffffu;
+                const unsigned int slot = (unsigned int)(packed       ) & 0xffffu;
+                const uint8_t* y_blk = xq_base
+                                     + (size_t)b * (size_t)n_used * (size_t)xq_slot_stride
+                                     + (size_t)slot * (size_t)xq_slot_stride
+                                     + (size_t)bl * (size_t)BLOCK_Q8_K_BYTES;
+                const float yd = *(const float*)(y_blk + 0);
+                const int8_t* q8 = (const int8_t*)(y_blk + 4) + q8_off;
+
+                // q8 loaded once, dotted against both rows.
+                int32_t q[16];
+                #pragma unroll
+                for (unsigned int i = 0; i < 16u; i++) {
+                    q[i] = load_dword_i8_par(q8 + 4u * i);
+                }
+                int32_t isum0 = 0, isum1 = 0;
+                #pragma unroll
+                for (unsigned int i = 0; i < 16u; i++) {
+                    isum0 = sudot4_par(w0[i], q[i], isum0);
+                    isum1 = sudot4_par(w1[i], q[i], isum1);
+                }
+                const int16_t* bsums = (const int16_t*)(y_blk + 260);
+                int32_t summs0 = 0, summs1 = 0;
+                #pragma unroll
+                for (unsigned int t = 0; t < 4u; t++) {
+                    const int32_t bs = (int32_t)bsums[sub * 4u + t];
+                    summs0 += bs * smin0[t];
+                    summs1 += bs * smin1[t];
+                }
+                pacc0[m] += (yd * d0) * (float)isum0 - (yd * dmin0) * (float)summs0;
+                pacc1[m] += (yd * d1) * (float)isum1 - (yd * dmin1) * (float)summs1;
+            }
+        }
+
+        for (unsigned int m = 0; m < half_n; m++) {
+            const float a0 = warp_sum_f32_par(pacc0[m]);
+            const float a1 = warp_sum_f32_par(pacc1[m]);
+            if (lane == 0) {
+                const int packed = expert_members[(size_t)e * (size_t)max_per_expert
+                                                + (size_t)(member_start + half_lo + m)];
+                const unsigned int b    = (unsigned int)(packed >> 16) & 0xffffu;
+                const unsigned int slot = (unsigned int)(packed       ) & 0xffffu;
+                const size_t out_base = ((size_t)b * (size_t)n_used + (size_t)slot)
+                                      * (size_t)n_rows;
+                partials[out_base + (size_t)row0]      = a0;
+                partials[out_base + (size_t)row0 + 1u] = a1;
+            }
+        }
+    }
+}
+
 // Sum partials across the n_used dimension, matching the BXN kernel's
 // `acc = Σ_s dot(...)` semantics exactly. Each thread = one (b, row)
 // output slot; reduces a tiny n_used (typically 6) values.

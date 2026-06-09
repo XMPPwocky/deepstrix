@@ -153,38 +153,50 @@ fn q2k_kwide_matches_by_expert() -> eyre::Result<()> {
         dbpe as u32, xq_slot_stride, n_used, max_per_expert, chunk_size,
         n_rows, n_blocks_in, n_work_items,
     )?;
+    let mut part_kw2: DeviceBuffer<f32> = DeviceBuffer::new(igpu.id, part_elems)?;
+    part_kw2.fill_zero()?;
+    q2k.launch_by_expert_kwide2(
+        &stream, &mut part_kw2, &down_w, &xq,
+        &group_count_d, &expert_members_d, &work_items_d,
+        dbpe as u32, xq_slot_stride, n_used, max_per_expert, chunk_size,
+        n_rows, n_blocks_in, n_work_items,
+    )?;
     stream.synchronize()?;
 
     let mut ref_host = vec![0f32; part_elems];
     let mut kw_host = vec![0f32; part_elems];
+    let mut kw2_host = vec![0f32; part_elems];
     part_ref.copy_to_host(&mut ref_host)?;
     part_kw.copy_to_host(&mut kw_host)?;
+    part_kw2.copy_to_host(&mut kw2_host)?;
 
-    let mut max_abs_diff = 0f32;
-    let mut max_abs_ref = 0f32;
-    let mut sum_sq = 0f64;
-    let mut n = 0usize;
-    for &(b_idx, slot) in &touched {
-        for row in 0..(n_rows as usize) {
-            let off = (b_idx * (n_used as usize) + slot) * (n_rows as usize) + row;
-            let r = ref_host[off];
-            let t = kw_host[off];
-            let d = (r - t).abs();
-            if d > max_abs_diff { max_abs_diff = d; }
-            if r.abs() > max_abs_ref { max_abs_ref = r.abs(); }
-            sum_sq += (d as f64) * (d as f64);
-            n += 1;
+    for (name, test_host) in [("kwide", &kw_host), ("kwide2", &kw2_host)] {
+        let mut max_abs_diff = 0f32;
+        let mut max_abs_ref = 0f32;
+        let mut sum_sq = 0f64;
+        let mut n = 0usize;
+        for &(b_idx, slot) in &touched {
+            for row in 0..(n_rows as usize) {
+                let off = (b_idx * (n_used as usize) + slot) * (n_rows as usize) + row;
+                let r = ref_host[off];
+                let t = test_host[off];
+                let d = (r - t).abs();
+                if d > max_abs_diff { max_abs_diff = d; }
+                if r.abs() > max_abs_ref { max_abs_ref = r.abs(); }
+                sum_sq += (d as f64) * (d as f64);
+                n += 1;
+            }
         }
+        let rmse = (sum_sq / n as f64).sqrt();
+        if max_abs_ref < 1e-6 {
+            return Err(eyre!("{name}: reference output near-zero — degenerate test"));
+        }
+        let rel = max_abs_diff / max_abs_ref;
+        eprintln!(
+            "q2k {name} vs by_expert: n={n} max|ref|={max_abs_ref:.4} \
+             max_abs_diff={max_abs_diff:.6} rmse={rmse:.6} rel={rel:.6}"
+        );
+        assert!(rel < 5e-3, "q2k {name} diverges: rel={rel}");
     }
-    let rmse = (sum_sq / n as f64).sqrt();
-    if max_abs_ref < 1e-6 {
-        return Err(eyre!("reference output near-zero — degenerate test"));
-    }
-    let rel = max_abs_diff / max_abs_ref;
-    eprintln!(
-        "q2k kwide vs by_expert: n={n} max|ref|={max_abs_ref:.4} \
-         max_abs_diff={max_abs_diff:.6} rmse={rmse:.6} rel={rel:.6}"
-    );
-    assert!(rel < 5e-3, "q2k kwide diverges: rel={rel}");
     Ok(())
 }

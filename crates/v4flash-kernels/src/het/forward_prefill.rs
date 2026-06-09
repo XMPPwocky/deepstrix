@@ -2504,10 +2504,12 @@ impl HeterogeneousEngine {
             // buckets); error out if both are requested simultaneously.
             // Default kwide since M51 (2026-06-09): unpack-once member loop,
             // bit-exact vs by_expert, −12% kernel. by_expert/bxn stay opt-in.
+            // kwide2 (M53): row-pair activation reuse, opt-in until gated.
             let q2k_variant = std::env::var("Q2K_VARIANT")
                 .unwrap_or_else(|_| "kwide".into());
+            let use_kwide2 = q2k_variant == "kwide2";
             let use_kwide = q2k_variant == "kwide";
-            let use_by_expert = use_kwide || q2k_variant == "by_expert";
+            let use_by_expert = use_kwide || use_kwide2 || q2k_variant == "by_expert";
             if use_by_expert && variant == "hybrid" {
                 return Err(eyre!(
                     "Q2K_VARIANT=by_expert/kwide not supported with IQ2_VARIANT=hybrid \
@@ -2520,7 +2522,25 @@ impl HeterogeneousEngine {
                 // the reduce-sum is correct. The by_expert kernel only writes
                 // the slots in expert_members.
                 bi.q2k_partials.fill_zero()?;
-                if use_kwide {
+                if use_kwide2 {
+                    ie.q2k.launch_by_expert_kwide2(
+                        &ie.compute,
+                        &mut bi.q2k_partials,
+                        &ilw.routed.down.buffer,
+                        &bi.d_midq_cat,
+                        &bi.group_count,
+                        &bi.expert_members,
+                        &bi.work_items,
+                        dbpe,
+                        mid_blocks_bytes as u32,
+                        cs_n_used as u32,
+                        max_per_expert,
+                        CHUNK_SIZE,
+                        N_EMBD,
+                        crate::config::BLOCKS_Q8K_DOWN_IN,
+                        n_work_items,
+                    )?;
+                } else if use_kwide {
                     ie.q2k.launch_by_expert_kwide(
                         &ie.compute,
                         &mut bi.q2k_partials,

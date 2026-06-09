@@ -162,6 +162,7 @@ fn bench_q2k_isolated() -> eyre::Result<()> {
     let do_bxn = variant.is_none() || variant == Some(0);
     let do_by_expert = variant.is_none() || variant == Some(1);
     let do_kwide = variant == Some(2);
+    let do_kwide2 = variant == Some(3);
 
     // by_expert needs a partials buffer (B*n_used, n_rows).
     let mut partials: DeviceBuffer<f32> = DeviceBuffer::new(
@@ -287,6 +288,33 @@ fn bench_q2k_isolated() -> eyre::Result<()> {
             walls_ms.push(Event::elapsed_ms(&start, &end)?);
         }
         summarize("q2k_kwide      ", &mut walls_ms);
+    }
+    if do_kwide2 {
+        for _ in 0..warmup {
+            partials.fill_zero()?;
+            q2k.launch_by_expert_kwide2(&stream, &mut partials, &down_w, &xq,
+                &group_count_d, &expert_members_d, &work_items_d,
+                dbpe as u32, xq_slot_stride, n_used, max_per_expert, chunk_size,
+                n_rows, n_blocks_in, n_work_items)?;
+            q2k.launch_reduce_partials(&stream, &mut out, &partials, n_used, n_rows, b)?;
+        }
+        stream.synchronize()?;
+        let mut walls_ms: Vec<f32> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let start = Event::new()?;
+            let end = Event::new()?;
+            start.record(&stream)?;
+            partials.fill_zero()?;
+            q2k.launch_by_expert_kwide2(&stream, &mut partials, &down_w, &xq,
+                &group_count_d, &expert_members_d, &work_items_d,
+                dbpe as u32, xq_slot_stride, n_used, max_per_expert, chunk_size,
+                n_rows, n_blocks_in, n_work_items)?;
+            q2k.launch_reduce_partials(&stream, &mut out, &partials, n_used, n_rows, b)?;
+            end.record(&stream)?;
+            stream.synchronize()?;
+            walls_ms.push(Event::elapsed_ms(&start, &end)?);
+        }
+        summarize("q2k_kwide2     ", &mut walls_ms);
     }
     Ok(())
 }
