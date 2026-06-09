@@ -1572,7 +1572,7 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_padded(
 // accumulator indices (157 VGPR / 9 waves); 0 = generic loop (movrel, but
 // lower register pressure). A/B'd 2026-06-09.
 #ifndef IQ2_V2_UNROLL
-#define IQ2_V2_UNROLL 1
+#define IQ2_V2_UNROLL 4
 #endif
 
 extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_staged(
@@ -2018,7 +2018,8 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_staged_v2(
                     lane_pacc_g[(mi)] += (float)sumi_g * (yd * gds);             \
                     lane_pacc_u[(mi)] += (float)sumi_u * (yd * uds);             \
                 }
-#if IQ2_V2_UNROLL
+#if IQ2_V2_UNROLL == 1
+            // Full static unroll: no movrel, but 157 VGPR → 9 waves/SIMD.
             if (n_members == IQ2_STAGED_MAX_CHUNK) {
                 #pragma unroll
                 for (unsigned int mi = 0; mi < IQ2_STAGED_MAX_CHUNK; mi++) {
@@ -2029,7 +2030,17 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_staged_v2(
                     IQ2_V2_DOT_BODY(mi);
                 }
             }
+#elif IQ2_V2_UNROLL > 1
+            // Partial unroll: movrel stays, but the compiler software-
+            // pipelines the q8/yd LDS loads across body copies (the original
+            // staged kernel compiled to unroll-4 + lgkmcnt(1) — that
+            // pipelining, not the instruction count, dominated).
+            #pragma unroll IQ2_V2_UNROLL
+            for (unsigned int mi = 0; mi < n_members; mi++) {
+                IQ2_V2_DOT_BODY(mi);
+            }
 #else
+            // No unroll: every iteration stalls on lgkmcnt(0) twice. SLOW.
             for (unsigned int mi = 0; mi < n_members; mi++) {
                 IQ2_V2_DOT_BODY(mi);
             }
