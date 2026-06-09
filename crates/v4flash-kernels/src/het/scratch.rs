@@ -15,7 +15,7 @@ use crate::config::{
     BLOCKS_GROUPED_OUT, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
     BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, HC_DIM, HC_MIX_DIM, INDEXER_TOP_K, N_EMBD, N_EXPERT,
     N_EXPERT_USED, N_FF_EXP, N_FF_SHARED, N_HC, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD,
-    N_INDEXER_HEAD_DIM, N_LORA_Q, N_VOCAB, OUT_LOW, Q_FLAT,
+    N_INDEXER_HEAD_DIM, N_LORA_Q, N_VOCAB, OUT_LOW, Q_FLAT, SWA_WINDOW,
 };
 use crate::attention::ATTN_MIXED_MAX_KEYS;
 use crate::q8_k::BLOCK_Q8_K_BYTES;
@@ -79,6 +79,11 @@ pub struct DgpuScratch {
     //   consumed by reduce pass 3.
     pub attn_partials: DeviceBuffer<f32>,
     pub attn_inv_per_head: DeviceBuffer<f32>,
+
+    // M55: staging for the decode kv window eviction-down copy (the
+    // monotonic-append wrap, ~once per 1024 tokens per layer). Same
+    // two-hop overlap-safe pattern as prefill's kv_ring_scratch.
+    pub kv_wrap_scratch: DeviceBuffer<u16>,
 
     // Per-WG sum-sq partials for the multi-WG rms_norm_no_weight kernel.
     // Sized for max n_wgs=64; production uses n_wgs=16.
@@ -205,6 +210,10 @@ impl DgpuScratch {
                 16 * (N_HEAD as usize) * (N_HEAD_DIM as usize),
             )?,
             attn_inv_per_head: DeviceBuffer::new(device_id, N_HEAD as usize)?,
+            kv_wrap_scratch: DeviceBuffer::new(
+                device_id,
+                (SWA_WINDOW as usize) * (N_HEAD_DIM as usize),
+            )?,
             rms_nw_partials: DeviceBuffer::new(device_id, 64)?,
             rms_nw_inv_scalar: DeviceBuffer::new(device_id, 1)?,
             // 64 × HC_MIX_DIM=24 = 1536 f32 = 6 KB. n_k_split=32 uses half.

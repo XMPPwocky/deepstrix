@@ -449,9 +449,12 @@ impl HeterogeneousEngine {
                     )?;
                 }
                 let n_raw_elems = (state.layers[layer].n_raw as usize) * head_dim;
-                maybe_dump_subtensor_f16_as_f32(
-                    layer, "raw_kv", &state.layers[layer].kv_cache, n_raw_elems
-                )?;
+                // M55: live window starts at raw_off (monotonic append).
+                let raw_win = state.layers[layer].kv_cache.slice_view(
+                    (state.layers[layer].raw_off as usize) * head_dim,
+                    n_raw_elems,
+                );
+                maybe_dump_subtensor_f16_as_f32(layer, "raw_kv", &raw_win, n_raw_elems)?;
                 // Router + expert-selection diagnostic: lets us
                 // compare against ds4's `expert_selected` /
                 // `expert_weight_out` / router_logits to see whether

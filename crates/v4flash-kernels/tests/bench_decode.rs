@@ -165,6 +165,7 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
         for layer in 0..N_LAYER as usize {
             let ls = &mut state.layers[layer];
             ls.n_raw = SWA_WINDOW.min(fake_pos);
+            ls.raw_off = 0; // graph_warm=20 < W, window starts at slot 0
             let ratio = COMPRESS_RATIOS[layer];
             if ratio > 0 {
                 if let Some(cs) = ls.compressor.as_mut() {

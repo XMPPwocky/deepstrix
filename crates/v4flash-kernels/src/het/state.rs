@@ -78,6 +78,16 @@ pub struct HetLayerState {
     /// SWA raw KV cache. f16-stored (see `HetCompressorState::comp_kv` rationale).
     pub kv_cache: DeviceBuffer<u16>,
     pub n_raw: u32,
+    /// M55: first valid row of the SWA window inside `kv_cache`. The decode
+    /// path appends MONOTONICALLY at slot `raw_off + n_raw` and advances
+    /// `raw_off` instead of sliding 127 rows per token (the old
+    /// kv_cache_append evict path: 254 barriers/layer/token). When the
+    /// window reaches the end of the oversized cache, an eviction-down
+    /// copy (same two-hop pattern as prefill's) resets it to 0. Readers
+    /// take a `slice_view` starting at `raw_off * head_dim`. Also the
+    /// prerequisite for MTP rollback: rejected appends just decrement,
+    /// the "evicted" row is still in place.
+    pub raw_off: u32,
     pub compressor: Option<HetCompressorState>,
     /// CSA indexer's parallel compressor (head_dim=128 vs main's 512).
     /// Only present at ratio==4 layers. Layout / lifecycle mirror the
@@ -105,6 +115,7 @@ impl HetModelState {
     pub fn reset_in_place(&mut self, dgpu_device: Device, igpu_device: Device) -> eyre::Result<()> {
         for layer in &mut self.layers {
             layer.n_raw = 0;
+            layer.raw_off = 0;
             if let Some(comp) = &mut layer.compressor {
                 comp.n_comp = 0;
                 let n_state = comp.state_kv.len();
@@ -181,6 +192,7 @@ impl HetModelState {
                     (raw_rows as usize) * (N_HEAD_DIM as usize),
                 )?,
                 n_raw: 0,
+                raw_off: 0,
                 compressor,
                 indexer_compressor,
             });

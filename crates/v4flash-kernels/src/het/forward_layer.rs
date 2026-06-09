@@ -451,19 +451,52 @@ impl HeterogeneousEngine {
                 .launch(&de.compute, &mut dgpu_scratch.kv_normed, N_HEAD_DIM)?;
         }
         {
-            // Device-side append + SWA slide. No sync, no host copies.
+            // M55: MONOTONIC append at slot raw_off + n_raw — never the
+            // kernel's evict-slide path (which moved 127 rows through 254
+            // block-wide barriers per layer per token, ~25 µs each).
+            // Passing the cache CAPACITY as the kernel's `swa_window`
+            // guarantees the not-full branch. The window advances via
+            // raw_off; readers below take a slice_view at raw_off.
             let _t = de.events.stage("k.kv_chain.kv_append", &de.compute)?;
+            let slot = ls.raw_off + ls.n_raw;
+            debug_assert!(
+                (slot as usize) < super::state::KV_CACHE_ROWS,
+                "kv monotonic append OOB: raw_off={} n_raw={}",
+                ls.raw_off,
+                ls.n_raw
+            );
             de.kv_append.launch(
                 &de.compute,
                 &mut ls.kv_cache,
                 &dgpu_scratch.kv_normed,
-                ls.n_raw,
-                SWA_WINDOW,
+                slot,
+                super::state::KV_CACHE_ROWS as u32,
                 N_HEAD_DIM,
             )?;
         }
         if ls.n_raw < SWA_WINDOW {
             ls.n_raw += 1;
+        } else {
+            ls.raw_off += 1;
+        }
+        // Wrap (~once per B_MAX tokens per layer): eviction-down copy of
+        // the live window to slots [0..W) via scratch (overlap-safe two-hop,
+        // same pattern as prefill's post-chunk eviction), then reset.
+        if (ls.raw_off + SWA_WINDOW) as usize >= super::state::KV_CACHE_ROWS {
+            let head_dim = N_HEAD_DIM as usize;
+            let win_len = (ls.n_raw as usize) * head_dim;
+            let src_off = (ls.raw_off as usize) * head_dim;
+            {
+                let mut s = dgpu_scratch.kv_wrap_scratch.slice_view_mut(0, win_len);
+                let src = ls.kv_cache.slice_view(src_off, win_len);
+                s.copy_from_buffer_async(&src, &de.compute)?;
+            }
+            {
+                let s = dgpu_scratch.kv_wrap_scratch.slice_view(0, win_len);
+                let mut dst = ls.kv_cache.slice_view_mut(0, win_len);
+                dst.copy_from_buffer_async(&s, &de.compute)?;
+            }
+            ls.raw_off = 0;
         }
         drop(_s_kv);
         _t_kv.end()?;
@@ -736,6 +769,13 @@ impl HeterogeneousEngine {
         // ============================================================
         // dGPU: Attention compute
         // ============================================================
+        // M55: the live SWA window is rows [raw_off, raw_off + n_raw) of the
+        // monotonic cache; every raw-KV reader gets this view (kernels are
+        // unchanged — they read rows [0, n_raw) of their base pointer).
+        let kv_win = ls.kv_cache.slice_view(
+            (ls.raw_off as usize) * (N_HEAD_DIM as usize),
+            (ls.n_raw as usize) * (N_HEAD_DIM as usize),
+        );
         if ratio == 0 {
             let _t_attn = de.events.stage("dgpu.attn_compute", &de.compute)?;
             let _s_attn = debug_span!("attn_compute").entered();
@@ -743,7 +783,7 @@ impl HeterogeneousEngine {
                 &de.compute,
                 &mut dgpu_scratch.heads,
                 &dgpu_scratch.q_normed,
-                &ls.kv_cache,
+                &kv_win,
                 &dlw.attn_sinks,
                 N_HEAD,
                 N_HEAD_DIM,
@@ -896,7 +936,7 @@ impl HeterogeneousEngine {
                         &de.compute,
                         &mut dgpu_scratch.attn_scores,
                         &dgpu_scratch.q_normed,
-                        &ls.kv_cache,
+                        &kv_win,
                         attn_comp_kv,
                         ls.n_raw, /*raw_off=*/0, attn_n_comp,
                         N_HEAD, N_HEAD_DIM, n_total_max,
@@ -906,7 +946,7 @@ impl HeterogeneousEngine {
                         &de.compute,
                         &mut dgpu_scratch.attn_scores,
                         &dgpu_scratch.q_normed,
-                        &ls.kv_cache,
+                        &kv_win,
                         attn_comp_kv,
                         N_HEAD, N_HEAD_DIM, ls.n_raw, attn_n_comp,
                     )?;
@@ -938,7 +978,7 @@ impl HeterogeneousEngine {
                         &de.compute,
                         &mut dgpu_scratch.attn_partials,
                         &dgpu_scratch.attn_scores,
-                        &ls.kv_cache,
+                        &kv_win,
                         attn_comp_kv,
                         N_HEAD, N_HEAD_DIM,
                         ls.n_raw, attn_n_comp,
@@ -957,7 +997,7 @@ impl HeterogeneousEngine {
                         &mut dgpu_scratch.heads,
                         &mut dgpu_scratch.attn_scores,
                         &dlw.attn_sinks,
-                        &ls.kv_cache,
+                        &kv_win,
                         attn_comp_kv,
                         N_HEAD, N_HEAD_DIM, ls.n_raw, attn_n_comp,
                     )?;

@@ -1838,6 +1838,9 @@ impl HeterogeneousEngine {
         } else {
             ls.n_raw = n_raw_during_chunk;
         }
+        // M55: prefill always leaves the live window at slots [0..n_raw);
+        // reset the decode-side monotonic offset to match.
+        ls.raw_off = 0;
 
         // ========================================================
         // Stage 6: Output projection (rope_inv per b, then BATCHED q8)
