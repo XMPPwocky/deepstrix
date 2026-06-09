@@ -106,3 +106,33 @@ trade-offs that add drift will trip it and force a conscious decision) and
 the logits oracle additionally asserts argmax agreement (it matched:
 token 260 both paths). **All 4 batch-vs-sequential oracles GREEN** — the
 e2e gate that caught the pre-issue race is now usable for future work.
+
+# M55 — decode round 2 (2026-06-09, late): measured lever results
+
+Target ≥30 @4K; reached **26.9** (from 25.4). All oracles green throughout.
+
+| change | predicted | MEASURED | status |
+|---|---|---|---|
+| monotonic KV append + raw_off (no 127-row slide) | −1.0 ms | **−2.1 ms** (39.3→37.2) | SHIPPED (default; also MTP-rollback prereq) |
+| iq2 decode weight-staging (b128 via LDS) | −1.1 ms | **+3.3 ms REGRESSION** | opt-in only (DECODE_IQ2=wstage). Narrow u16 loads were already latency-hidden by the 1536-WG grid; staging serialized fetch→compute. ~187 GB/s is the pattern ceiling. |
+| rms_w+quantize fusion (q_chain) | −0.3-0.4 | **−0.2 (≈noise)** | shipped (harmless); graph-internal nodes are already cheap |
+
+96K decode: 23.6 → 24.9 tok/s.
+
+**Honest correction to the M54 lever table**: the "small-kernel zoo ~7.5 ms"
+estimate was trace-inflated. Kernels inside HIP graphs sequence cheaply;
+only genuinely latency-SERIALIZED items pay big (the KV slide was one).
+Remaining sized-by-measurement levers: token boundary (~1.6 ms, partly
+host), q/kv-chain device-pos graph (~1.0), per-kernel grinding (~1-1.5
+total at terrible ROI).
+
+**Path to 30+ is MTP self-speculative decode** (probe + validation exist;
+not wired): draft 1 token with the MTP head, verify with a 2-position
+forward. Prerequisites now in place: monotonic KV makes raw rollback a
+counter decrement. Design dodge for compressor-state rollback: SKIP
+speculation at positions where accepting would cross a ratio-4/128
+compressor boundary (~75% of positions still speculate). Expected
+1 + 0.7·0.75 ≈ 1.5 tokens/step → **~38-40 tok/s** — the only mechanism
+that clears 30 with headroom, and it stacks on any future kernel wins.
+Verify-forward should reuse the q8 GEMM/BxN-MoE batched kernels (NOT the
+full batch-prefill path — its fixed per-chunk overhead swamps B=2).
