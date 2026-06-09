@@ -1597,14 +1597,14 @@ impl HeterogeneousEngine {
                 }
                 {
                     let _t = de.events.stage("k.indexer.score_wmma", &de.compute)?;
-                    // INDEXER_SCORE_VARIANT=mw selects the M52 multi-wave
-                    // kernel (1-wave kernel re-stages Q per 128 cols;
-                    // 28.7 ms/launch at 96K vs ~3.4 roofline — M52 journal).
-                    // Default stays the 1-wave kernel until gates pass.
+                    // Default mw since M52 (2026-06-09): multi-wave Q-staging
+                    // kernel, bit-exact vs 1-wave, isolated 32.6→7.45 ms at
+                    // the 96K shape, e2e 96K 262→318 tok/s. The 1-wave
+                    // kernel stays behind INDEXER_SCORE_VARIANT=sw.
                     static SCORE_MW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
                         std::env::var("INDEXER_SCORE_VARIANT")
-                            .map(|v| v == "mw")
-                            .unwrap_or(false)
+                            .map(|v| v != "sw")
+                            .unwrap_or(true)
                     });
                     if *SCORE_MW {
                         wmma.launch_batched_mw(
