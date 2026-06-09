@@ -194,6 +194,7 @@ void indexer_score_wmma(
 // LDS: 16 KB Q + 256 B hw.
 // =============================================================================
 #define ISWMW_WAVES 8u
+#define ISW_NT_PER_WG 8u   // n-tiles per wave (mw) / per WG (1-wave batched)
 
 extern "C" __global__ __launch_bounds__(ISWMW_WAVES * ISW_BLOCK)
 void indexer_score_wmma_batched_mw(
@@ -338,7 +339,7 @@ void indexer_score_wmma_batched_mw(
 // design was BW-bound on Q reads at ~14 ms/layer).
 //
 // Grid: (ceil(n_tiles_max / ISW_NT_PER_WG), B, 1). Block: 32 (1 wave).
-#define ISW_NT_PER_WG 8u   // n-tiles per WG (= 128 score cols / WG)
+// (ISW_NT_PER_WG defined above, shared with the mw variant.)
 
 extern "C" __global__ __launch_bounds__(ISW_BLOCK)
 void indexer_score_wmma_batched(
