@@ -1574,6 +1574,10 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_padded(
 #ifndef IQ2_V2_UNROLL
 #define IQ2_V2_UNROLL 4
 #endif
+// kwide member-loop unroll depth (pipelines the b128 q8 loads).
+#ifndef IQ2_KW_UNROLL
+#define IQ2_KW_UNROLL 4
+#endif
 
 extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_chunked_staged(
         float        * __restrict__ mid,           // [B, n_used, n_rows]
@@ -2278,7 +2282,7 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_kwide(
             const uint4* q8_lane = &s_q8v[sbh * 16u + l15];   // member mi at +mi*32
             const float* yd_lane = &s_yd[sbh];                // member mi at +mi*2
 
-            #pragma unroll 4
+            #pragma unroll IQ2_KW_UNROLL
             for (unsigned int mi = 0; mi < n_members; mi++) {
                 const uint4 q = q8_lane[mi * 32u];
                 int32_t sumi_g = 0;
