@@ -2478,10 +2478,11 @@ impl HeterogeneousEngine {
             // buckets); error out if both are requested simultaneously.
             let q2k_variant = std::env::var("Q2K_VARIANT")
                 .unwrap_or_else(|_| "by_expert".into());
-            let use_by_expert = q2k_variant == "by_expert";
+            let use_kwide = q2k_variant == "kwide";
+            let use_by_expert = use_kwide || q2k_variant == "by_expert";
             if use_by_expert && variant == "hybrid" {
                 return Err(eyre!(
-                    "Q2K_VARIANT=by_expert not supported with IQ2_VARIANT=hybrid \
+                    "Q2K_VARIANT=by_expert/kwide not supported with IQ2_VARIANT=hybrid \
                      (would need to combine staged_+chunked_work_items). \
                      Set Q2K_VARIANT=bxn to opt out."
                 ));
@@ -2491,23 +2492,43 @@ impl HeterogeneousEngine {
                 // the reduce-sum is correct. The by_expert kernel only writes
                 // the slots in expert_members.
                 bi.q2k_partials.fill_zero()?;
-                ie.q2k.launch_by_expert(
-                    &ie.compute,
-                    &mut bi.q2k_partials,
-                    &ilw.routed.down.buffer,
-                    &bi.d_midq_cat,
-                    &bi.group_count,
-                    &bi.expert_members,
-                    &bi.work_items,
-                    dbpe,
-                    mid_blocks_bytes as u32,
-                    cs_n_used as u32,
-                    max_per_expert,
-                    CHUNK_SIZE,
-                    N_EMBD,
-                    crate::config::BLOCKS_Q8K_DOWN_IN,
-                    n_work_items,
-                )?;
+                if use_kwide {
+                    ie.q2k.launch_by_expert_kwide(
+                        &ie.compute,
+                        &mut bi.q2k_partials,
+                        &ilw.routed.down.buffer,
+                        &bi.d_midq_cat,
+                        &bi.group_count,
+                        &bi.expert_members,
+                        &bi.work_items,
+                        dbpe,
+                        mid_blocks_bytes as u32,
+                        cs_n_used as u32,
+                        max_per_expert,
+                        CHUNK_SIZE,
+                        N_EMBD,
+                        crate::config::BLOCKS_Q8K_DOWN_IN,
+                        n_work_items,
+                    )?;
+                } else {
+                    ie.q2k.launch_by_expert(
+                        &ie.compute,
+                        &mut bi.q2k_partials,
+                        &ilw.routed.down.buffer,
+                        &bi.d_midq_cat,
+                        &bi.group_count,
+                        &bi.expert_members,
+                        &bi.work_items,
+                        dbpe,
+                        mid_blocks_bytes as u32,
+                        cs_n_used as u32,
+                        max_per_expert,
+                        CHUNK_SIZE,
+                        N_EMBD,
+                        crate::config::BLOCKS_Q8K_DOWN_IN,
+                        n_work_items,
+                    )?;
+                }
                 ie.q2k.launch_reduce_partials(
                     &ie.compute,
                     &mut bi.ffn_moe,

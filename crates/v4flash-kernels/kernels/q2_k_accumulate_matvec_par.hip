@@ -342,6 +342,146 @@ extern "C" __global__ void q2_k_matvec_par_by_expert(
     }
 }
 
+// =============================================================================
+// by_expert_kwide — M51 S2: unpack-once member loop for the down matvec.
+//
+// `by_expert` re-unpacks the lane's quarter-block weights for EVERY member:
+// per (member, lane): 16 shift+and dwords + 4 scale imuls + 2 f16 converts
+// + a warp_sum — ~48 VALU where the roofline counts 16 sudot4.
+//
+// This variant inverts the loops: per (block, lane) the 16 weight dwords are
+// unpacked ONCE into registers with the 4-bit group scale FOLDED at unpack
+// time (((q2>>shift)&0x03030303) * (sc&0xF) is byte-safe: 3·15 = 45 < 256,
+// no cross-byte carries — the integer block sum is bit-identical), and the
+// f16 d/dmin are converted once. Per (member, lane) only: 16 sudot4 +
+// 4-entry bsums min-term + 2 cvt + 2 mul + 2 fma remain. Member partials
+// accumulate in per-lane registers (pacc[32]) and warp-reduce ONCE per
+// member at the very end instead of per (member, block).
+//
+// Geometry, arg list, partials semantics: identical to by_expert (drop-in;
+// pair with q2_k_reduce_partials). chunk_size must be ≤ 32.
+// =============================================================================
+
+#define Q2K_KW_MAX_CHUNK 32u
+
+extern "C" __global__ void q2_k_matvec_par_by_expert_kwide(
+        float          * __restrict__ partials,      // [B*n_used, n_rows]
+        const uint8_t  * __restrict__ w_base,
+        const uint8_t  * __restrict__ xq_base,       // [B, n_used*xq_slot_stride]
+        const int      * __restrict__ group_count,   // [N_EXPERT]
+        const int      * __restrict__ expert_members,// [N_EXPERT * max_per_expert]
+        const int      * __restrict__ work_items,    // [n_work_items]
+        unsigned int     dbpe,
+        unsigned int     xq_slot_stride,
+        unsigned int     n_used,
+        unsigned int     max_per_expert,
+        unsigned int     chunk_size,
+        unsigned int     n_rows,
+        unsigned int     n_blocks_in) {
+    const unsigned int row_in_block = threadIdx.x / 32u;
+    const unsigned int lane         = threadIdx.x & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    const unsigned int w_idx        = blockIdx.y;
+    if (row >= n_rows) return;
+
+    const int packed_item = work_items[w_idx];
+    const unsigned int e            = (unsigned int)(packed_item >> 16) & 0xffffu;
+    const unsigned int member_start = (unsigned int)(packed_item       ) & 0xffffu;
+    const int group_n = group_count[e];
+    const unsigned int member_end = min((unsigned int)group_n, member_start + chunk_size);
+    if (member_end <= member_start) return;
+    const unsigned int n_members = member_end - member_start;
+
+    const unsigned int block_lane = lane >> 2u;        // 0..7
+    const unsigned int sub        = lane & 3u;         // 0..3
+    const unsigned int k_outer    = sub >> 1u;         // 0..1
+    const unsigned int j_lo       = (sub & 1u) * 2u;   // 0 or 2
+    const unsigned int is_base    = 2u * (4u * k_outer + j_lo);
+    // q8 byte offset of this lane's 64-weight quarter within the member block.
+    const unsigned int q8_off     = k_outer * 128u + j_lo * 32u;
+
+    const uint8_t* w_expert  = w_base + (uint64_t)e * (uint64_t)dbpe;
+    const uint8_t* row_base  = w_expert + (uint64_t)row * (uint64_t)n_blocks_in * BLOCK_Q2_K_BYTES;
+
+    float pacc[Q2K_KW_MAX_CHUNK];
+    #pragma unroll
+    for (unsigned int m = 0; m < Q2K_KW_MAX_CHUNK; m++) pacc[m] = 0.0f;
+
+    for (unsigned int bl = block_lane; bl < n_blocks_in; bl += 8u) {
+        const uint8_t* w_blk = row_base + (uint64_t)bl * BLOCK_Q2_K_BYTES;
+        const uint8_t* sc      = w_blk;
+        const uint8_t* q2_base = w_blk + 16 + (uint64_t)k_outer * 32u;
+        const float d_lane    = f16_to_f32_par(*(const uint16_t*)(w_blk + 80));
+        const float dmin_lane = f16_to_f32_par(*(const uint16_t*)(w_blk + 82));
+
+        // Unpack 64 weights once, group scale folded (byte-safe, see header).
+        int32_t w[16];
+        {
+            unsigned int wi = 0;
+            int shift = (int)(2u * j_lo);
+            #pragma unroll
+            for (int jj = 0; jj < 2; jj++) {
+                const int32_t d_a = (int32_t)(sc[is_base + 2u * jj] & 0x0f);
+                const int32_t d_b = (int32_t)(sc[is_base + 2u * jj + 1u] & 0x0f);
+                #pragma unroll
+                for (uint32_t i = 0; i < 16; i += 4) {
+                    w[wi++] = (((load_dword_par(q2_base + i) >> shift) & 0x03030303) * d_a);
+                }
+                #pragma unroll
+                for (uint32_t i = 0; i < 16; i += 4) {
+                    w[wi++] = (((load_dword_par(q2_base + 16 + i) >> shift) & 0x03030303) * d_b);
+                }
+                shift += 2;
+            }
+        }
+        // 4-bit mins for this lane's 4 bsums entries.
+        int32_t smin[4];
+        #pragma unroll
+        for (unsigned int t = 0; t < 4u; t++) {
+            smin[t] = (int32_t)(sc[sub * 4u + t] >> 4);
+        }
+
+        #pragma unroll 2
+        for (unsigned int m = 0; m < n_members; m++) {
+            const int packed = expert_members[(size_t)e * (size_t)max_per_expert
+                                            + (size_t)(member_start + m)];
+            const unsigned int b    = (unsigned int)(packed >> 16) & 0xffffu;
+            const unsigned int slot = (unsigned int)(packed       ) & 0xffffu;
+            const uint8_t* y_blk = xq_base
+                                 + (size_t)b * (size_t)n_used * (size_t)xq_slot_stride
+                                 + (size_t)slot * (size_t)xq_slot_stride
+                                 + (size_t)bl * (size_t)BLOCK_Q8_K_BYTES;
+            const float yd = *(const float*)(y_blk + 0);
+            const int8_t* q8 = (const int8_t*)(y_blk + 4) + q8_off;
+
+            int32_t isum = 0;
+            #pragma unroll
+            for (unsigned int i = 0; i < 16u; i++) {
+                isum = sudot4_par(w[i], load_dword_i8_par(q8 + 4u * i), isum);
+            }
+            const int16_t* bsums = (const int16_t*)(y_blk + 260);
+            int32_t summs = 0;
+            #pragma unroll
+            for (unsigned int t = 0; t < 4u; t++) {
+                summs += (int32_t)bsums[sub * 4u + t] * smin[t];
+            }
+            pacc[m] += (yd * d_lane) * (float)isum - (yd * dmin_lane) * (float)summs;
+        }
+    }
+
+    for (unsigned int m = 0; m < n_members; m++) {
+        const float acc = warp_sum_f32_par(pacc[m]);
+        if (lane == 0) {
+            const int packed = expert_members[(size_t)e * (size_t)max_per_expert
+                                            + (size_t)(member_start + m)];
+            const unsigned int b    = (unsigned int)(packed >> 16) & 0xffffu;
+            const unsigned int slot = (unsigned int)(packed       ) & 0xffffu;
+            partials[((size_t)b * (size_t)n_used + (size_t)slot) * (size_t)n_rows
+                     + (size_t)row] = acc;
+        }
+    }
+}
+
 // Sum partials across the n_used dimension, matching the BXN kernel's
 // `acc = Σ_s dot(...)` semantics exactly. Each thread = one (b, row)
 // output slot; reduces a tiny n_used (typically 6) values.

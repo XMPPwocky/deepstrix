@@ -296,6 +296,57 @@ impl Q2KAccumulateMatvec {
         ])
     }
 
+    /// **by_expert_kwide (M51 S2)** — unpack-once member loop: weight quarter
+    /// unpacked to registers once per (block, lane) with the group scale
+    /// folded; members then cost only 16 sudot4 + bsums term + 2 fma. Same
+    /// partials semantics as `launch_by_expert` (pair with
+    /// `launch_reduce_partials`); additionally requires `chunk_size <= 32`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_by_expert_kwide(
+        &self,
+        stream: &Stream,
+        partials: &mut DeviceBuffer<f32>,    // [B*n_used, n_rows] — zero on entry
+        w_base: &DeviceBuffer<u8>,
+        xq_base: &DeviceBuffer<u8>,          // [B, n_used * xq_slot_stride]
+        group_count: &DeviceBuffer<i32>,     // [N_EXPERT]
+        expert_members: &DeviceBuffer<i32>,  // [N_EXPERT * max_per_expert]
+        work_items: &DeviceBuffer<i32>,      // [n_work_items]
+        dbpe: u32,
+        xq_slot_stride: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        n_rows: u32,
+        n_blocks_in: u32,
+        n_work_items: u32,
+    ) -> eyre::Result<()> {
+        if n_work_items == 0 {
+            return Ok(());
+        }
+        if n_rows % 8 != 0 {
+            return Err(eyre!(
+                "q2_k_matvec_par_by_expert_kwide: n_rows={n_rows} not %8"
+            ));
+        }
+        if chunk_size > 32 {
+            return Err(eyre!(
+                "q2_k_matvec_par_by_expert_kwide: chunk_size={chunk_size} > 32"
+            ));
+        }
+        let function = self.module.get_function("q2_k_matvec_par_by_expert_kwide")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, n_work_items, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            partials.raw(), w_base.raw(), xq_base.raw(),
+            group_count.raw(), expert_members.raw(), work_items.raw(),
+            dbpe, xq_slot_stride, n_used, max_per_expert, chunk_size,
+            n_rows, n_blocks_in
+        ])
+    }
+
     /// Reduce per-(b, slot) partials into final out. Tiny kernel — each
     /// thread sums n_used (typically 6) values. Pairs with `launch_by_expert`.
     pub fn launch_reduce_partials(
