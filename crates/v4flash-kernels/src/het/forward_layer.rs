@@ -382,8 +382,9 @@ impl HeterogeneousEngine {
         self.dgpu_graphs.run("q_chain_pre_rope", layer as u32, &de.compute, |s| {
             de.q8.quantize_input(s, &mut dgpu_scratch.xq_n_embd, &mut dgpu_scratch.xscale_n_embd, &dgpu_scratch.attn_input_norm, N_EMBD)?;
             de.q8.matvec(s, &mut dgpu_scratch.qr, &dlw.attn_q_a.buffer, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_LORA_Q, N_EMBD)?;
-            de.rms_w.launch_weighted(s, &mut dgpu_scratch.qr_normed, &dgpu_scratch.qr, &dlw.q_a_norm, N_LORA_Q, RMS_EPS)?;
-            de.q8.quantize_input(s, &mut dgpu_scratch.qr_xq, &mut dgpu_scratch.qr_xscale, &dgpu_scratch.qr_normed, N_LORA_Q)?;
+            // M55: fused rms_w + q8 quantize (was two single-WG kernels);
+            // qr_normed is still written for the CSA indexer.
+            de.rms_w.launch_weighted_quantize_q8(s, &mut dgpu_scratch.qr_normed, &mut dgpu_scratch.qr_xq, &mut dgpu_scratch.qr_xscale, &dgpu_scratch.qr, &dlw.q_a_norm, N_LORA_Q, RMS_EPS)?;
             de.q8.matvec(s, &mut dgpu_scratch.q, &dlw.attn_q_b.buffer, &dgpu_scratch.qr_xq, &dgpu_scratch.qr_xscale, Q_FLAT, N_LORA_Q)?;
             de.rms_nw.launch(s, &mut dgpu_scratch.q_normed, &dgpu_scratch.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
             Ok(())

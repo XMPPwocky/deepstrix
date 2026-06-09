@@ -82,6 +82,55 @@ impl RmsNorm {
         launch_kernel!(function, cfg, stream, [out.raw(), x.raw(), weight.raw(), n, eps])
     }
 
+    /// M55: fused rms_norm_weighted + q8_0 input quantization — replaces a
+    /// (rms_w, q8_0_quantize_f32) kernel pair in the decode q_chain.
+    /// Writes the normed vector AND its q8 blocks in one pass; numerics
+    /// identical to the separate kernels. `n` must be a multiple of 32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_weighted_quantize_q8(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        xq: &mut DeviceBuffer<i8>,
+        xscale: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<f32>,
+        n: u32,
+        eps: f32,
+    ) -> eyre::Result<()> {
+        if out.len() != n as usize || x.len() != n as usize || weight.len() != n as usize {
+            return Err(eyre!(
+                "rms_norm_weighted_quantize_q8 len mismatch: n={}, out={}, x={}, w={}",
+                n,
+                out.len(),
+                x.len(),
+                weight.len()
+            ));
+        }
+        if n > 4096 || n % 32 != 0 {
+            return Err(eyre!(
+                "rms_norm_weighted_quantize_q8: n={n} must be ≤4096 and %32"
+            ));
+        }
+        if xq.len() < n as usize || xscale.len() < (n / 32) as usize {
+            return Err(eyre!(
+                "rms_norm_weighted_quantize_q8: xq={} xscale={} too small for n={n}",
+                xq.len(),
+                xscale.len()
+            ));
+        }
+
+        let function = self.module.get_function("rms_norm_weighted_quantize_q8")?;
+        let cfg = LaunchConfig {
+            grid: (1, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), xq.raw(), xscale.raw(), x.raw(), weight.raw(), n, eps
+        ])
+    }
+
     /// M50 Phase 2: batched rms_norm_weighted. `x[B, n]`, `out[B, n]`,
     /// `weight[n]` shared across batch. Grid (B, 1, 1), block (256).
     pub fn launch_weighted_batched(
