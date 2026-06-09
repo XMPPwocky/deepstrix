@@ -241,3 +241,17 @@ Wall @4K ≈ 3200 ms: iq2 kwide ~2176 (68%), q2k ~851 (27%), other ~200.
 - q2k is cache-BW-bound on cross-WG q8 re-reads; geometry changes are the
   tile8 trap. Near floor for this shape.
 - dGPU becomes the wall only below ~1250 ms iGPU — far away.
+
+## 2026-06-09 — Post-promotion: 64K/96K depth A/B (gate extension)
+
+| depth | staged+by_expert | kwide+kwide | Δ |
+|---|---|---|---|
+| 65536 | 225.8 | **290.8** | +28.8% |
+| 98304 | 223.4 | **261.1** | +16.9% |
+
+No regression at long context (tile8 check extended to 96K). The shrinking
+delta is the predicted pipeline crossover: staged is FLAT 64K→96K (iGPU so
+slow it hides all depth-dependent dGPU work), kwide drops 291→261 — at ~96K
+the dGPU attention/indexer side stops being fully hidden. **Long-context
+prefill optimization now shifts to the dGPU attention side; the iGPU MoE
+levers only pay below ~64K.**
