@@ -102,7 +102,7 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
     let weights = HetModelWeights::load_all(&gguf, dgpu, igpu, &rope_for_layer)?;
     eprintln!("loaded.");
 
-    let engine =
+    let mut engine =
         HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
     let mut dgpu_scratch = DgpuScratch::alloc(dgpu)?;
     let mut igpu_scratch = IgpuScratch::alloc(igpu)?;
@@ -191,6 +191,12 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
     let mut token_us: Vec<u64> = Vec::with_capacity(n_positions as usize);
     let mut token_host_us: Vec<u64> = Vec::with_capacity(n_positions as usize);
     let mut token_sync_us: Vec<u64> = Vec::with_capacity(n_positions as usize);
+    // PERFETTO_DEVICE_OUT=<path>: attach the device-time exporter for the
+    // timed tokens (adds event overhead — don't trust tok/s from traced runs).
+    if let Ok(out_path) = std::env::var("PERFETTO_DEVICE_OUT") {
+        eprintln!("attaching perfetto: {out_path}");
+        engine.attach_perfetto(&out_path)?;
+    }
     let bench_start = Instant::now();
     for i in 0..n_positions {
         let pos = start_pos + i;
