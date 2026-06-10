@@ -161,3 +161,39 @@ selections, projected iGPU MoE wall shrinks ~s; at s≈0.2 → ~460→
 **Gates.** forward_prompt_batch_matches_sequential (hot on), then cold
 back-to-back A/B DGPU_HOT_PREFILL=0/1 at 4K/32K/96K, PIPELINE_LANES=2,
 DGPU_HOT_EXPERTS=8 + decode_hot_experts.txt placement.
+
+## M61 results (2026-06-10, HEAD 801a5bb)
+
+Oracles: all 4 green. pipelined-vs-single-lane **BIT-EXACT** (0.0 diff —
+confirms per-member math is batch-split-independent). last_only 4.99e-2
+scaled (bound 5e-2, argmax match) — thin margin; the M61 marginal drift was
+fixed by defaulting the prefill cap to decode's DGPU_HOT_CAP=4 so the
+slot→device partition (and f32 sum association) matches the sequential
+reference exactly. Watch this one for flapping.
+
+Two implementation incidents:
+1. Uncapped prefill (cap=∞ vs decode 4) pushed last_only to 5.44e-2 — over
+   the bound. Matched caps fixed it; offload cost ~nil (P(>4 resident
+   slots) ≈ 0 at K≈8/256).
+2. +280 MB/lane hot scratch OOM'd the 3-scratch pipelined oracle. Fixed by
+   carving the five big buffers as views into attn_active_comp_kv (537 MB,
+   idle during the MoE phase; single de.compute stream ⇒ serial-safe).
+   Marginal VRAM now ~5 MB/lane.
+
+Cold A/B, PIPELINE_LANES=2, K=8 (decode placement file), median of 3:
+
+| depth | hot=0 | hot=1 | Δ |
+|---|---|---|---|
+| 4096  | 459.7 | **500.5** | +8.9% |
+| 32768 | 444.8 | **470.6** | +5.8% |
+| 98176 | 402.4 | **417.0** | +3.6% |
+
+Ships default-on (DGPU_HOT_PREFILL=1 when DGPU_HOT_EXPERTS set).
+
+Saved iGPU wall at 4K ≈ 190 ms/chunk ≈ 9% of the MoE leg — consistent with
+a ~10-12% hot member share under prefill's flatter routing (placement file
+is from DECODE token stats). Future levers:
+- prefill-specific placement (collect prefill expert stats per layer;
+  re-rank); could also bump per-layer K if the 128K-KV margin allows.
+- raise DGPU_HOT_CAP_PREFILL above 4 only if last_only oracle margin is
+  re-examined (association then diverges from decode again).
