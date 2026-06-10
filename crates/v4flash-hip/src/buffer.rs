@@ -28,11 +28,42 @@ impl<T> DeviceBuffer<T> {
     /// Allocate `len` elements of T on the current device. Caller must
     /// `Device::set_current` first, and pass that device's id so the
     /// buffer knows where it lives.
+    #[track_caller]
     pub fn new(device_id: i32, len: usize) -> eyre::Result<Self> {
         let mut raw: sys::hipDeviceptr_t = ptr::null_mut();
         let bytes = len.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
             eyre!("DeviceBuffer size overflow: {} * {}", len, std::mem::size_of::<T>())
         })?;
+        // DEEPSTRIX_ALLOC_TRACE=1: print every allocation ≥ 8 MB with a
+        // running per-device tally (audit tool; map sizes back to fields
+        // by reading the alloc order in scratch/state/weights).
+        static TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("DEEPSTRIX_ALLOC_TRACE").is_some()
+        });
+        if *TRACE && bytes >= 8 << 20 {
+            static TALLY: [std::sync::atomic::AtomicU64; 8] = [
+                const { std::sync::atomic::AtomicU64::new(0) },
+                const { std::sync::atomic::AtomicU64::new(0) },
+                const { std::sync::atomic::AtomicU64::new(0) },
+                const { std::sync::atomic::AtomicU64::new(0) },
+                const { std::sync::atomic::AtomicU64::new(0) },
+                const { std::sync::atomic::AtomicU64::new(0) },
+                const { std::sync::atomic::AtomicU64::new(0) },
+                const { std::sync::atomic::AtomicU64::new(0) },
+            ];
+            let d = (device_id as usize).min(7);
+            let tot = TALLY[d].fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed)
+                + bytes as u64;
+            let loc = std::panic::Location::caller();
+            eprintln!(
+                "ALLOC_TRACE dev{} {:>8.1} MB  (≥8MB tally {:>8.1} MB)  {}:{}",
+                device_id,
+                bytes as f64 / 1e6,
+                tot as f64 / 1e6,
+                loc.file(),
+                loc.line()
+            );
+        }
         check_eyre(unsafe { sys::hipMalloc(&mut raw, bytes) }, "hipMalloc")?;
         Ok(DeviceBuffer {
             raw,

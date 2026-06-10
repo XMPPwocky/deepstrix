@@ -109,7 +109,9 @@ pub struct IgpuLayerWeights {
 
 pub struct HetGlobalWeights {
     /// Embedding lookup on dGPU (output head also lives here).
-    pub token_embd: DeviceWeight,
+    // M57: token_embd is NOT device-resident — the server embeds host-side
+    // from the gguf mmap (deepstrix-server/src/embed.rs); the old 1.06 GB
+    // dGPU copy had zero kernel consumers. Dtype is still validated below.
     pub output: DeviceWeight,
     pub output_norm: DeviceBuffer<f32>,
     pub output_hc_fn: DeviceWeight,
@@ -127,9 +129,15 @@ impl HetGlobalWeights {
     pub fn load(gguf: &MappedGguf, dgpu_device: Device) -> eyre::Result<Self> {
         dgpu_device.set_current()?;
         let dgpu_id = dgpu_device.id;
-        let token_embd = load_to_device(gguf, "token_embd.weight", dgpu_id)?;
-        if token_embd.dtype != GgufType::F16 {
-            return Err(eyre!("token_embd dtype {:?} != F16", token_embd.dtype));
+        // Validate token_embd dtype without uploading (host-side embed path).
+        {
+            let te = gguf
+                .gguf()
+                .tensor("token_embd.weight")
+                .ok_or_else(|| eyre!("token_embd.weight not found"))?;
+            if te.dtype != GgufType::F16 {
+                return Err(eyre!("token_embd dtype {:?} != F16", te.dtype));
+            }
         }
         let output = load_to_device(gguf, "output.weight", dgpu_id)?;
         if output.dtype != GgufType::Q8_0 {
@@ -141,7 +149,6 @@ impl HetGlobalWeights {
         let output_hc_base =
             load_f32_weight(gguf, "output_hc_base.weight", dgpu_id, N_HC as usize)?;
         Ok(Self {
-            token_embd,
             output,
             output_norm,
             output_hc_fn,
