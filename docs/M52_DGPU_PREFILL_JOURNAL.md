@@ -222,3 +222,21 @@ raise the hot member share (~10-12% today) and with it the M61 win.
 **Gates.** (1) device histogram == PrefillStats pick_counts exactly;
 (2) prefill A/B stats on/off ≤0.5%; (3) server flush e2e + restart with JSON
 placement: 4 oracles green + placement A/B bench (old txt vs JSON).
+
+## M62 results (2026-06-10, HEAD 84994ac)
+
+All three gates green:
+1. **Counts oracle**: device histogram == PrefillStats pick_counts, 0 diffs
+   over 43×256; token counter exact; banks zeroed after harvest
+   (tests/expert_sel_stats_oracle.rs).
+2. **Cost**: 4K prefill A/B stats off/on = 504.8 vs 505.6 tok/s median —
+   pure noise (the 6144-atomic kernel hides in dGPU slack).
+3. **Server e2e**: two requests across sessions → expert_stats.json banks
+   exact (prefill 16 tok ⇒ 4128 picks; decode 40 ⇒ 10320) + 43-line
+   hot_experts.txt placement; second request's stats flush at next save
+   point as designed (kill -9 loses only last-turn stats).
+
+Restarts now self-improve: loader picks up <cache>/hot_experts.txt unless
+DGPU_HOT_EXPERTS_FILE is pinned. Placement A/B (accumulated vs legacy
+decode txt) deferred until real workload volume accrues — meaningful only
+after letta runs feed the prefill bank.
