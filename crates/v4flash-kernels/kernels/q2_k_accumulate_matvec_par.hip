@@ -719,3 +719,39 @@ extern "C" __global__ void q2_k_reduce_partials(
     }
     out[(size_t)b * (size_t)n_rows + (size_t)row] = acc;
 }
+
+// M61 prefill het-split reduce: sum ONLY the slots this device computed,
+// so neither side needs a partials zero-fill (the M53 invariant survives
+// the split). Slot ownership recomputes the resident-rank exactly like
+// moe_group_builder_hetsplit: resident slots ranked in slot order, rank <
+// cap → dGPU (mode 1), everything else → iGPU (mode 0).
+extern "C" __global__ void q2_k_reduce_partials_hetsplit(
+        float       * __restrict__ out,        // [B, n_rows]
+        const float * __restrict__ partials,   // [B*n_used, n_rows]
+        const int   * __restrict__ d_selected, // [B, n_used]
+        const int   * __restrict__ remap,      // [N_EXPERT total] id → dense or -1
+        unsigned int  mode,                    // 0 = iGPU misses, 1 = dGPU hits
+        unsigned int  cap,
+        unsigned int  n_used,
+        unsigned int  n_rows) {
+    const unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = gridDim.x * blockDim.x;
+    const unsigned int b   = tid / n_rows;
+    const unsigned int row = tid % n_rows;
+    if (b >= (total / n_rows)) return;
+    const int* sel_b = d_selected + (size_t)b * (size_t)n_used;
+    float acc = 0.0f;
+    unsigned int rank = 0;
+    for (unsigned int s = 0; s < n_used; s++) {
+        const int e = sel_b[s];
+        const bool resident   = (e >= 0) && (remap[e] >= 0);
+        const bool dgpu_takes = resident && (rank < cap);
+        if (resident) rank++;
+        const bool take = (mode == 1) ? dgpu_takes : !dgpu_takes;
+        if (take) {
+            acc += partials[((size_t)b * (size_t)n_used + (size_t)s)
+                            * (size_t)n_rows + (size_t)row];
+        }
+    }
+    out[(size_t)b * (size_t)n_rows + (size_t)row] = acc;
+}

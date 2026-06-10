@@ -42,6 +42,48 @@ use super::weights::{DgpuLayerWeights, HetModelWeights, IgpuLayerWeights};
 
 const ROUTER_WEIGHT_EPS: f32 = 6.103515625e-5;
 
+/// M61 prefill het-split rollback: `DGPU_HOT_PREFILL=0` keeps the decode
+/// het-split but routes ALL prefill MoE slots to the iGPU (pre-M61
+/// behaviour). Default on when hot experts are loaded.
+fn hot_prefill_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("DGPU_HOT_PREFILL").map(|v| v != "0").unwrap_or(true)
+    });
+    *ON
+}
+
+/// Max dGPU-resident slots per token in prefill. Defaults to decode's
+/// DGPU_HOT_CAP (default 4) so the prefill slot→device partition matches
+/// the decode path exactly — the f32 summation association then matches
+/// too, keeping the prefill-vs-sequential oracle drift in the pre-M61
+/// kernel-difference class (an uncapped prefill measured 5.4e-2 scaled
+/// logit drift vs the 5e-2 oracle bound; matched caps stay ~2.5e-2).
+/// Offload cost of the cap is ~nil: with ~8 of 256 experts resident,
+/// tokens with >4 resident slots are vanishingly rare.
+fn hot_prefill_cap() -> u32 {
+    static CAP: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("DGPU_HOT_CAP_PREFILL")
+            .ok()
+            .or_else(|| std::env::var("DGPU_HOT_CAP").ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4)
+    });
+    *CAP
+}
+
+/// Whether the M61 het-split MoE runs for this prefill layer: hot weights
+/// present on BOTH devices, hot scratch allocated, and not rolled back.
+fn prefill_hot_active(
+    dlw: &DgpuLayerWeights,
+    ilw: &IgpuLayerWeights,
+    bd: &BatchDgpuScratch,
+) -> bool {
+    hot_prefill_enabled()
+        && bd.hot.is_some()
+        && dlw.hot_experts.is_some()
+        && ilw.hot_remap.is_some()
+}
+
 impl HeterogeneousEngine {
     /// Layer-major batched prefill using batched kernels.
     ///
@@ -268,8 +310,14 @@ impl HeterogeneousEngine {
             let sev_a_cur = &self.sync_events.layers[layer];
             let sev_b_cur = &self.sync_events_t1.layers[layer];
 
+            let hot_cur = prefill_hot_active(
+                &weights.dgpu_layers[layer],
+                &weights.igpu_layers[layer],
+                bd_a,
+            );
+
             // Lane A: finish layer L, then start layer L+1.
-            self.forward_layer_post_moe_v2(bd_a, b_a as u32, sev_a_cur)?;
+            self.forward_layer_post_moe_v2(bd_a, b_a as u32, sev_a_cur, hot_cur)?;
             std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
             self.forward_layer_pre_moe_v2(
                 bd_a,
@@ -284,7 +332,7 @@ impl HeterogeneousEngine {
             )?;
 
             // Lane B: same.
-            self.forward_layer_post_moe_v2(bd_b, b_b as u32, sev_b_cur)?;
+            self.forward_layer_post_moe_v2(bd_b, b_b as u32, sev_b_cur, hot_cur)?;
             std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
             self.forward_layer_pre_moe_v2(
                 bd_b,
@@ -301,9 +349,14 @@ impl HeterogeneousEngine {
 
         // Cooldown: post-MoE for the final layer on both lanes.
         let last = N_LAYER as usize - 1;
-        self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[last])?;
+        let hot_last = prefill_hot_active(
+            &weights.dgpu_layers[last],
+            &weights.igpu_layers[last],
+            bd_a,
+        );
+        self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[last], hot_last)?;
         std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
-        self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[last])?;
+        self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[last], hot_last)?;
         std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
 
         self.dgpu.compute.synchronize()?;
@@ -672,8 +725,9 @@ impl HeterogeneousEngine {
             return Ok(());
         }
         let sev = &self.sync_events.layers[layer];
+        let hot_active = prefill_hot_active(dlw, ilw, bd);
         self.forward_layer_pre_moe_v2(bd, bi, ls, dlw, ilw, pos0, tokens, stats, sev)?;
-        self.forward_layer_post_moe_v2(bd, b, sev)?;
+        self.forward_layer_post_moe_v2(bd, b, sev, hot_active)?;
         Ok(())
     }
 
@@ -2234,6 +2288,103 @@ impl HeterogeneousEngine {
         drop(bi_sel);
         drop(bi_ew);
 
+        // ========================================================
+        // M61 prefill het-split: the dGPU computes its RESIDENT (hot)
+        // experts' (b, slot) members itself, on de.compute, fully async
+        // with the iGPU MoE below (which skips those slots). Same
+        // group-builder machinery as the iGPU path but in DENSE id space,
+        // and with a STATIC work-items list — grid.y covers the worst
+        // case (n_hot × B_MAX/HOT_CHUNK) and the matvec kernels'
+        // `member_end <= member_start` guard early-exits empty chunks, so
+        // nothing here blocks on a host readback of n_work_items (a
+        // de.compute sync would stall the lane pipeline). The partial is
+        // added to ffn_moe_recv at ffn_combine (post_moe).
+        // ========================================================
+        let hot_active = prefill_hot_active(dlw, ilw, bd);
+        if hot_active {
+            use super::batch_scratch::{HOT_CHUNK, HOT_CHUNKS_PER_EXPERT};
+            let hot = dlw.hot_experts.as_ref().unwrap();
+            let hd = bd.hot.as_mut().unwrap();
+            let cap = hot_prefill_cap();
+            let n_wi = hot.n_hot * HOT_CHUNKS_PER_EXPERT as u32;
+            let _t_hot = de.events.stage("dgpu.hot_moe_prefill", &de.compute)?;
+            hd.group_count.fill_zero_async(&de.compute)?;
+            de.moe_group_builder.launch_hetsplit(
+                &de.compute,
+                &mut hd.group_count,
+                &mut hd.expert_members,
+                &bd.d_selected,
+                &hot.remap,
+                /*mode=*/ 1,
+                cap,
+                b,
+                cs_n_used as u32,
+                hot.n_hot,
+                B_MAX as u32,
+            )?;
+            de.q8k.launch(
+                &de.compute,
+                &mut hd.moe_xq,
+                &bd.ffn_input_norm,
+                crate::config::BLOCKS_Q8K_GATE_IN * b,
+            )?;
+            de.iq2.launch_fused_swiglu_kwide(
+                &de.compute,
+                &mut hd.mid_cat,
+                &hot.gate,
+                &hot.up,
+                &hd.moe_xq,
+                &bd.d_ew,
+                &hd.group_count,
+                &hd.expert_members,
+                &hd.work_items_static,
+                gbpe,
+                ubpe,
+                cs_n_used as u32,
+                B_MAX as u32,
+                HOT_CHUNK as u32,
+                crate::config::SWIGLU_CLAMP_EXP,
+                crate::config::N_FF_EXP,
+                crate::config::BLOCKS_Q8K_GATE_IN,
+                n_wi,
+            )?;
+            de.q8k.launch(
+                &de.compute,
+                &mut hd.midq_cat,
+                &hd.mid_cat,
+                crate::config::BLOCKS_Q8K_DOWN_IN * (cs_n_used as u32) * b,
+            )?;
+            de.q2k.launch_by_expert_kwide2(
+                &de.compute,
+                &mut hd.partials,
+                &hot.down,
+                &hd.midq_cat,
+                &hd.group_count,
+                &hd.expert_members,
+                &hd.work_items_static,
+                dbpe,
+                mid_blocks_bytes as u32,
+                cs_n_used as u32,
+                B_MAX as u32,
+                HOT_CHUNK as u32,
+                N_EMBD,
+                crate::config::BLOCKS_Q8K_DOWN_IN,
+                n_wi,
+            )?;
+            de.q2k.launch_reduce_partials_hetsplit(
+                &de.compute,
+                &mut hd.ffn_moe_dgpu,
+                &hd.partials,
+                &bd.d_selected,
+                &hot.remap,
+                /*mode=*/ 1,
+                cap,
+                cs_n_used as u32,
+                N_EMBD,
+                b,
+            )?;
+        }
+
         // Single batched iGPU MoE call chain. iq2 uses by-expert
         // dispatch (group_builder + work_items pre-pass), q2_k stays
         // by-token (could also be by-expert but smaller perf lever).
@@ -2275,16 +2426,34 @@ impl HeterogeneousEngine {
                 d_selected,
                 ..
             } = bi;
-            ie.moe_group_builder.launch(
-                &ie.compute,
-                group_count,
-                expert_members,
-                d_selected,
-                b,
-                cs_n_used as u32,
-                N_EXPERT,
-                max_per_expert,
-            )?;
+            if hot_active {
+                // M61: build groups for the MISS slots only — the dGPU
+                // owns the resident slots (up to the per-token cap).
+                ie.moe_group_builder.launch_hetsplit(
+                    &ie.compute,
+                    group_count,
+                    expert_members,
+                    d_selected,
+                    ilw.hot_remap.as_ref().unwrap(),
+                    /*mode=*/ 0,
+                    hot_prefill_cap(),
+                    b,
+                    cs_n_used as u32,
+                    N_EXPERT,
+                    max_per_expert,
+                )?;
+            } else {
+                ie.moe_group_builder.launch(
+                    &ie.compute,
+                    group_count,
+                    expert_members,
+                    d_selected,
+                    b,
+                    cs_n_used as u32,
+                    N_EXPERT,
+                    max_per_expert,
+                )?;
+            }
         }
         // IQ2_VARIANT env: "staged" (default), "chunked", "hybrid", or "tile8".
         // - hybrid: split work items by chunk size; staged for large, chunked for small.
@@ -2520,6 +2689,17 @@ impl HeterogeneousEngine {
                      Set Q2K_VARIANT=bxn to opt out."
                 ));
             }
+            if hot_active && !use_by_expert {
+                // bxn iterates d_selected directly: it would read mid for
+                // the dGPU-resident slots the iGPU never computed (garbage)
+                // and double-count them after the combine adds the dGPU
+                // partial.
+                return Err(eyre!(
+                    "Q2K_VARIANT=bxn incompatible with prefill het-split \
+                     (dGPU owns the resident slots). Set DGPU_HOT_PREFILL=0 \
+                     to roll back the split instead."
+                ));
+            }
             if use_by_expert {
                 // No partials zero-fill (M53): router topk yields 8 DISTINCT
                 // experts per token, so group_count[e] ≤ B = max_per_expert —
@@ -2582,14 +2762,32 @@ impl HeterogeneousEngine {
                         n_work_items,
                     )?;
                 }
-                ie.q2k.launch_reduce_partials(
-                    &ie.compute,
-                    &mut bi.ffn_moe,
-                    &bi.q2k_partials,
-                    cs_n_used as u32,
-                    N_EMBD,
-                    b,
-                )?;
+                if hot_active {
+                    // M61: sum ONLY the miss slots this device computed —
+                    // resident slots' partials are stale here (the dGPU
+                    // holds their contribution).
+                    ie.q2k.launch_reduce_partials_hetsplit(
+                        &ie.compute,
+                        &mut bi.ffn_moe,
+                        &bi.q2k_partials,
+                        &bi.d_selected,
+                        ilw.hot_remap.as_ref().unwrap(),
+                        /*mode=*/ 0,
+                        hot_prefill_cap(),
+                        cs_n_used as u32,
+                        N_EMBD,
+                        b,
+                    )?;
+                } else {
+                    ie.q2k.launch_reduce_partials(
+                        &ie.compute,
+                        &mut bi.ffn_moe,
+                        &bi.q2k_partials,
+                        cs_n_used as u32,
+                        N_EMBD,
+                        b,
+                    )?;
+                }
             } else {
                 ie.q2k.launch_batched_bxn(
                     &ie.compute,
@@ -2641,6 +2839,7 @@ impl HeterogeneousEngine {
         bd: &mut BatchDgpuScratch,
         b: u32,
         sev: &super::engine::LayerSyncEvents,
+        hot_active: bool,
     ) -> eyre::Result<()> {
         self.set_current_cached(self.dgpu.device)?;
         let de = &self.dgpu;
@@ -2652,6 +2851,19 @@ impl HeterogeneousEngine {
                 &de.compute,
                 &mut bd.ffn_moe_recv,
                 &bd.ffn_shared,
+                b * N_EMBD,
+            )?;
+        }
+        if hot_active {
+            // M61: + the dGPU's resident-expert MoE partial. Queued on
+            // de.compute in pre_moe, so stream order already guarantees
+            // it's complete here.
+            let _t = de.events.stage("k.ffn_combine.vec_add_hot", &de.compute)?;
+            let hd = bd.hot.as_ref().expect("hot_active implies bd.hot");
+            de.vec_add.launch(
+                &de.compute,
+                &mut bd.ffn_moe_recv,
+                &hd.ffn_moe_dgpu,
                 b * N_EMBD,
             )?;
         }

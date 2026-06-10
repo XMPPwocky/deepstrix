@@ -49,3 +49,55 @@ extern "C" __global__ void moe_group_builder(
     const int packed = (int)((b << 16) | slot);
     expert_members[(unsigned int)e * max_per_expert + (unsigned int)pos] = packed;
 }
+
+// M61 prefill het-split: residency-aware group builder.
+//
+// remap[e] >= 0 marks a dGPU-resident ("hot") expert and gives its dense
+// slot in the packed hot weight buffers. A token's resident slots are
+// ranked in slot order; ranks < cap belong to the dGPU, the rest (and all
+// non-resident slots) to the iGPU. Must agree bit-for-bit with the rank
+// logic in q2_k_reduce_partials_hetsplit — both scan d_selected in slot
+// order counting resident slots.
+//
+//   mode 0 (iGPU): keep the complement; group ids in ORIGINAL expert space
+//                  (group arrays sized n_expert like the plain builder).
+//   mode 1 (dGPU): keep the hits; group ids in DENSE remap space (group
+//                  arrays sized n_hot).
+extern "C" __global__ void moe_group_builder_hetsplit(
+        int       * __restrict__ group_count,      // [n_expert] — must be pre-zeroed
+        int       * __restrict__ expert_members,   // [n_expert * max_per_expert]
+        const int * __restrict__ d_selected,       // [B, n_used] — flat
+        const int * __restrict__ remap,            // [N_EXPERT total] id → dense or -1
+        unsigned int mode,                         // 0 = iGPU misses, 1 = dGPU hits
+        unsigned int cap,                          // max resident slots/token on dGPU
+        unsigned int batch,                        // B
+        unsigned int n_used,
+        unsigned int n_expert,                     // bound of the GROUP id space
+        unsigned int max_per_expert) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = batch * n_used;
+    if (idx >= total) return;
+    const unsigned int b = idx / n_used;
+    const unsigned int slot = idx - b * n_used;
+    const int e = d_selected[idx];
+    if (e < 0) return;
+    const int dense = remap[e];
+    // Resident rank = #resident slots before this one in the same token.
+    unsigned int rank = 0;
+    if (dense >= 0) {
+        const int* sel_b = d_selected + (size_t)b * (size_t)n_used;
+        for (unsigned int s = 0; s < slot; s++) {
+            const int es = sel_b[s];
+            if (es >= 0 && remap[es] >= 0) rank++;
+        }
+    }
+    const bool dgpu_takes = (dense >= 0) && (rank < cap);
+    int g;
+    if (mode == 1) { if (!dgpu_takes) return; g = dense; }
+    else           { if (dgpu_takes)  return; g = e;     }
+    if ((unsigned int)g >= n_expert) return;
+    const int pos = atomicAdd(&group_count[g], 1);
+    if ((unsigned int)pos >= max_per_expert) return; // overflow guard
+    expert_members[(unsigned int)g * max_per_expert + (unsigned int)pos]
+        = (int)((b << 16) | slot);
+}

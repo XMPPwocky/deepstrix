@@ -464,6 +464,42 @@ impl Q2KAccumulateMatvec {
             out.raw(), partials.raw(), n_used, n_rows
         ])
     }
+
+    /// M61 prefill het-split reduce: sums ONLY the slots this device owns
+    /// (mode 0 = iGPU misses, mode 1 = dGPU hits), recomputing the same
+    /// resident-rank as `moe_group_builder_hetsplit`. Keeps the M53
+    /// no-zero-fill invariant when each side writes only its own slots.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_reduce_partials_hetsplit(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,         // [B, n_rows]
+        partials: &DeviceBuffer<f32>,        // [B*n_used, n_rows]
+        d_selected: &DeviceBuffer<i32>,      // [B, n_used]
+        remap: &DeviceBuffer<i32>,           // [N_EXPERT] id → dense or -1
+        mode: u32,
+        cap: u32,
+        n_used: u32,
+        n_rows: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let function = self.module.get_function("q2_k_reduce_partials_hetsplit")?;
+        let total_threads = (batch as usize) * (n_rows as usize);
+        let block: u32 = 256;
+        let grid: u32 = ((total_threads + (block as usize) - 1) / (block as usize)) as u32;
+        let cfg = LaunchConfig {
+            grid: (grid, 1, 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), partials.raw(), d_selected.raw(), remap.raw(),
+            mode, cap, n_used, n_rows
+        ])
+    }
 }
 
 /// CPU port of `dev_dot_q2_K_q8_K_block` (ds4_cuda.cu:7296). Used by oracle.

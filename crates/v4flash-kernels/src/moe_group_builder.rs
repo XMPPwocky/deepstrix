@@ -164,4 +164,52 @@ impl MoeGroupBuilder {
             batch, n_used, n_expert, max_per_expert
         ])
     }
+
+    /// M61 prefill het-split: residency-aware group builder. `remap[e] >= 0`
+    /// marks a dGPU-resident expert; a token's resident slots are ranked in
+    /// slot order, ranks < `cap` go to the dGPU. `mode=0` keeps the
+    /// complement in ORIGINAL id space (iGPU); `mode=1` keeps the hits in
+    /// DENSE remap space (dGPU — pass `n_expert = n_hot`). Caller MUST zero
+    /// `group_count` (stream-ordered) before this call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_hetsplit(
+        &self,
+        stream: &Stream,
+        group_count: &mut DeviceBuffer<i32>,
+        expert_members: &mut DeviceBuffer<i32>,
+        d_selected: &DeviceBuffer<i32>,
+        remap: &DeviceBuffer<i32>,
+        mode: u32,
+        cap: u32,
+        batch: u32,
+        n_used: u32,
+        n_expert: u32,
+        max_per_expert: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let total = batch * n_used;
+        if group_count.len() < n_expert as usize {
+            return Err(eyre!("group_count too small"));
+        }
+        if expert_members.len() < (n_expert as usize) * (max_per_expert as usize) {
+            return Err(eyre!("expert_members too small"));
+        }
+        if d_selected.len() < total as usize {
+            return Err(eyre!("d_selected too small"));
+        }
+        let function = self.module.get_function("moe_group_builder_hetsplit")?;
+        let block_x = 512u32;
+        let grid_x = total.div_ceil(block_x);
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            group_count.raw(), expert_members.raw(), d_selected.raw(), remap.raw(),
+            mode, cap, batch, n_used, n_expert, max_per_expert
+        ])
+    }
 }

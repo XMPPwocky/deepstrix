@@ -322,6 +322,16 @@ impl<T> DeviceBuffer<T> {
             "hipMemset",
         )
     }
+
+    /// Stream-ordered zero fill. Unlike [`fill_zero`](Self::fill_zero)
+    /// (synchronous `hipMemset`), this queues on `stream` and returns
+    /// immediately — safe to interleave with kernels on the same stream.
+    pub fn fill_zero_async(&mut self, stream: &Stream) -> eyre::Result<()> {
+        check_eyre(
+            unsafe { sys::hipMemsetAsync(self.raw, 0, self.byte_len(), stream.raw()) },
+            "hipMemsetAsync",
+        )
+    }
 }
 
 impl<T> Drop for DeviceBuffer<T> {

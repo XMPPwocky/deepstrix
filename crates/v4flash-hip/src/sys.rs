@@ -256,6 +256,12 @@ unsafe extern "C" {
         stream: hipStream_t,
     ) -> hipError_t;
     pub fn hipMemset(dst: hipDeviceptr_t, value: c_int, size: usize) -> hipError_t;
+    pub fn hipMemsetAsync(
+        dst: hipDeviceptr_t,
+        value: c_int,
+        size: usize,
+        stream: hipStream_t,
+    ) -> hipError_t;
 
     pub fn hipStreamCreate(stream: *mut hipStream_t) -> hipError_t;
     pub fn hipStreamCreateWithPriority(

@@ -274,6 +274,115 @@ pub struct BatchDgpuScratch {
     /// by a single batched peer-push from iGPU; then vec_add ffn_shared
     /// and run hc_post.
     pub ffn_moe_recv: DeviceBuffer<f32>,
+
+    /// M61 prefill het-split: dGPU-side MoE scratch for the hot-expert leg.
+    /// `Some` only when `DGPU_HOT_EXPERTS > 0` (~280 MB at B_MAX=1024).
+    pub hot: Option<BatchDgpuHotScratch>,
+}
+
+/// Static work-item geometry for the dGPU hot-expert prefill leg.
+/// Members per hot expert are capped at B_MAX, so each expert needs at
+/// most `B_MAX / HOT_CHUNK` chunks. The work-items list is e-major and
+/// uploaded ONCE; per-layer launches set grid.y = n_hot × chunks and the
+/// matvec kernels' `member_end <= member_start` guard early-exits empty
+/// chunks — no per-layer host readback of n_work_items on de.compute.
+pub const HOT_MAX_EXPERTS: usize = 256;
+pub const HOT_CHUNK: usize = 32;
+pub const HOT_CHUNKS_PER_EXPERT: usize = B_MAX / HOT_CHUNK;
+
+/// M61 prefill het-split: dGPU scratch mirroring the iGPU batched MoE
+/// pipeline, sized for the hot-expert (resident) slots only. The matvec
+/// kernels are the SAME kwide/kwide2 kernels the iGPU runs — only the
+/// group builder (dense ids, hits only) and the reduce (own-slots only)
+/// differ.
+///
+/// VRAM: the five big buffers (~280 MB at B_MAX=1024) are non-owning
+/// VIEWS into `attn_active_comp_kv` (537 MB), which is idle for the
+/// entire MoE phase. ALIASING CONTRACT: comp_kv is written (IndexerGather)
+/// and read (attention) strictly BEFORE the router/MoE stages of the same
+/// layer, and the hot leg's last read of these views (the ffn_combine
+/// vec_add of `ffn_moe_dgpu`) is enqueued before the next layer's
+/// attention — all on the single de.compute stream, so reuse is
+/// serial-safe. Per-layer comp_kv dirtying can leave NaN bit patterns in
+/// the miss slots of `mid_cat`; the post-iq2 q8k quantize reads them but
+/// the resulting q8 blocks are never dotted (work items cover hot members
+/// only), so that is harmless.
+pub struct BatchDgpuHotScratch {
+    /// `[B, BLOCKS_Q8K_GATE_IN × 292]` — q8_K-quantized ffn_input_norm.
+    /// Bit-identical to the iGPU's d_xq_q8k (same f32 input, same kernel).
+    /// View into attn_active_comp_kv.
+    pub moe_xq: DeviceBuffer<u8>,
+    /// `[B, n_used, N_FF_EXP]` f32 — fused-swiglu mid, hit slots only.
+    /// View into attn_active_comp_kv.
+    pub mid_cat: DeviceBuffer<f32>,
+    /// `[B, n_used, BLOCKS_Q8K_DOWN_IN × 292]` — quantized mid.
+    /// View into attn_active_comp_kv.
+    pub midq_cat: DeviceBuffer<u8>,
+    /// `[B*n_used, N_EMBD]` f32 — q2k by-expert partials, hit slots only.
+    /// View into attn_active_comp_kv.
+    pub partials: DeviceBuffer<f32>,
+    /// `[B, N_EMBD]` f32 — hetsplit-reduced dGPU MoE partial; added to
+    /// ffn_moe_recv at ffn_combine. View into attn_active_comp_kv.
+    pub ffn_moe_dgpu: DeviceBuffer<f32>,
+    /// `[HOT_MAX_EXPERTS]` i32 — DENSE-id group counts. Zeroed per layer
+    /// via fill_zero_async on de.compute. Owned.
+    pub group_count: DeviceBuffer<i32>,
+    /// `[HOT_MAX_EXPERTS × B_MAX]` i32 — dense-id member lists,
+    /// `(b<<16)|slot` packed like the iGPU arrays. Owned.
+    pub expert_members: DeviceBuffer<i32>,
+    /// `[HOT_MAX_EXPERTS × HOT_CHUNKS_PER_EXPERT]` i32 — STATIC e-major
+    /// work items `(e<<16)|(c×HOT_CHUNK)`, uploaded once at alloc. Owned.
+    pub work_items_static: DeviceBuffer<i32>,
+}
+
+impl BatchDgpuHotScratch {
+    /// Carve the big buffers out of `comp_kv` (see ALIASING CONTRACT on
+    /// the struct). `comp_kv`'s device memory is owned by the parent
+    /// `BatchDgpuScratch` and never reallocated, so the views stay valid
+    /// for the parent's lifetime.
+    fn alloc(id: i32, comp_kv: &DeviceBuffer<u16>) -> eyre::Result<Self> {
+        let b = B_MAX;
+        let xq_len = b * (BLOCKS_Q8K_GATE_IN as usize) * BLOCK_Q8_K_BYTES;
+        let midq_len =
+            b * (N_EXPERT_USED as usize) * (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
+        let mid_len = b * (N_EXPERT_USED as usize) * (N_FF_EXP as usize);
+        let partials_len = b * (N_EXPERT_USED as usize) * (N_EMBD as usize);
+        let out_len = b * N_EMBD as usize;
+
+        // f32 views first (offset stays 4-aligned), byte views after.
+        let mut off = 0usize;
+        let mut take = |bytes: usize| {
+            let o = off;
+            off += (bytes + 255) & !255; // 256-B align each region
+            o
+        };
+        let partials = unsafe { comp_kv.view_as::<f32>(take(partials_len * 4), partials_len) };
+        let ffn_moe_dgpu = unsafe { comp_kv.view_as::<f32>(take(out_len * 4), out_len) };
+        let mid_cat = unsafe { comp_kv.view_as::<f32>(take(mid_len * 4), mid_len) };
+        let moe_xq = unsafe { comp_kv.view_as::<u8>(take(xq_len), xq_len) };
+        let midq_cat = unsafe { comp_kv.view_as::<u8>(take(midq_len), midq_len) };
+
+        let mut work_items_static: DeviceBuffer<i32> =
+            DeviceBuffer::new(id, HOT_MAX_EXPERTS * HOT_CHUNKS_PER_EXPERT)?;
+        let mut wi_host = vec![0i32; HOT_MAX_EXPERTS * HOT_CHUNKS_PER_EXPERT];
+        for e in 0..HOT_MAX_EXPERTS {
+            for c in 0..HOT_CHUNKS_PER_EXPERT {
+                wi_host[e * HOT_CHUNKS_PER_EXPERT + c] =
+                    ((e as i32) << 16) | ((c * HOT_CHUNK) as i32);
+            }
+        }
+        work_items_static.copy_from_host(&wi_host)?;
+        Ok(Self {
+            moe_xq,
+            mid_cat,
+            midq_cat,
+            partials,
+            ffn_moe_dgpu,
+            group_count: DeviceBuffer::new(id, HOT_MAX_EXPERTS)?,
+            expert_members: DeviceBuffer::new(id, HOT_MAX_EXPERTS * b)?,
+            work_items_static,
+        })
+    }
 }
 
 /// Per-batch iGPU scratch with B-extended buffers.
@@ -393,6 +502,22 @@ impl BatchDgpuScratch {
         let mk_i8 = |n: usize| -> eyre::Result<DeviceBuffer<i8>> { DeviceBuffer::new(id, b * n) };
         let mk_i32 =
             |n: usize| -> eyre::Result<DeviceBuffer<i32>> { DeviceBuffer::new(id, b * n) };
+        // Built before the literal so the M61 hot-expert scratch can carve
+        // its views out of it (see BatchDgpuHotScratch ALIASING CONTRACT).
+        let attn_active_comp_kv = mk_u16(
+            (crate::config::INDEXER_TOP_K * crate::config::N_HEAD_DIM) as usize,
+        )?;
+        let hot = {
+            let hot_k: usize = std::env::var("DGPU_HOT_EXPERTS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if hot_k > 0 {
+                Some(BatchDgpuHotScratch::alloc(id, &attn_active_comp_kv)?)
+            } else {
+                None
+            }
+        };
         Ok(Self {
             residual: mk_f32(HC_DIM as usize)?,
             residual_next: mk_f32(HC_DIM as usize)?,
@@ -479,9 +604,7 @@ impl BatchDgpuScratch {
                 )?
             },
             n_index_comp_per_b: DeviceBuffer::new(id, b)?,
-            attn_active_comp_kv: mk_u16(
-                (crate::config::INDEXER_TOP_K * crate::config::N_HEAD_DIM) as usize,
-            )?,
+            attn_active_comp_kv,
             // Per-boundary state snapshots scratch. Sized for the largest
             // compressor (main ratio==4: 8 × 1024 f32 = 32 KB) × max boundaries
             // (B_MAX/4 = 128) = 4 MB per buffer. Reused across compressors.
@@ -527,6 +650,10 @@ impl BatchDgpuScratch {
             ffn_shared: mk_f32(N_EMBD as usize)?,
 
             ffn_moe_recv: mk_f32(N_EMBD as usize)?,
+
+            // M61: hot-expert prefill scratch, only when the het-split
+            // weights will be loaded (same env gate as weights.rs).
+            hot,
         })
     }
 }
