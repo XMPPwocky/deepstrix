@@ -5,6 +5,7 @@
 pub mod dsml;
 pub mod embed;
 pub mod engine_worker;
+pub mod expert_stats;
 pub mod openai;
 pub mod prompt;
 pub mod snapshot;

@@ -9,7 +9,7 @@
 //!   cross-device handoffs gated by HIP events. The production mode.
 
 use color_eyre::eyre;
-use v4flash_hip::{Device, Event, Stream};
+use v4flash_hip::{Device, DeviceBuffer, Event, Stream};
 
 use super::graph_cache::GraphCache;
 
@@ -139,6 +139,10 @@ pub struct DeviceEngine {
     /// By-expert MoE pre-pass — inverts d_selected into per-expert
     /// (token, slot) lists. Used by the prefill iGPU MoE path.
     pub moe_group_builder: crate::moe_group_builder::MoeGroupBuilder,
+    /// M62: expert-selection histogram accumulator. Launched on the dGPU
+    /// only (router lives there) but instantiated on both arches so the
+    /// engine struct stays symmetric.
+    pub expert_sel_count: crate::ExpertSelCount,
 
     /// Per-device event pool for kernel-scope timing. Use
     /// `events.stage(name, &compute)` to wrap a kernel-group.
@@ -202,6 +206,7 @@ impl DeviceEngine {
             indexer_bitpack: crate::IndexerBitpack::for_arch(arch)?,
             vec_scale: crate::VecScaleInplace::for_arch(arch)?,
             moe_group_builder: crate::moe_group_builder::MoeGroupBuilder::for_arch(arch)?,
+            expert_sel_count: crate::ExpertSelCount::for_arch(arch)?,
             events,
         })
     }
@@ -313,6 +318,18 @@ pub struct HeterogeneousEngine {
     pub last_host_us: std::sync::atomic::AtomicU64,
     /// Diagnostic: time the host spent inside the final `synchronize()`.
     pub last_sync_us: std::sync::atomic::AtomicU64,
+
+    /// M62: persistent expert-selection histogram banks on the dGPU,
+    /// `u32[N_LAYER × N_EXPERT]` each (88 KB). Accumulated by
+    /// `record_sel_stats` on de.compute after router top-k (no hot-path
+    /// readbacks); harvested + zeroed by `harvest_sel_stats` at the
+    /// server's snapshot-save points. Mutex keeps the engine `Sync`
+    /// (uncontended in practice — one engine worker thread).
+    pub sel_stats_prefill: std::sync::Mutex<DeviceBuffer<u32>>,
+    pub sel_stats_decode: std::sync::Mutex<DeviceBuffer<u32>>,
+    /// Tokens accumulated into each bank since the last harvest.
+    pub sel_tokens_prefill: std::sync::atomic::AtomicU64,
+    pub sel_tokens_decode: std::sync::atomic::AtomicU64,
 }
 
 impl HeterogeneousEngine {
@@ -851,7 +868,87 @@ impl HeterogeneousEngine {
             current_device: std::sync::atomic::AtomicI32::new(-1),
             last_host_us: std::sync::atomic::AtomicU64::new(0),
             last_sync_us: std::sync::atomic::AtomicU64::new(0),
+            sel_stats_prefill: std::sync::Mutex::new({
+                let mut b: DeviceBuffer<u32> = DeviceBuffer::new(
+                    dgpu_device.id,
+                    (N_LAYER as usize) * (crate::config::N_EXPERT as usize),
+                )?;
+                b.fill_zero()?;
+                b
+            }),
+            sel_stats_decode: std::sync::Mutex::new({
+                let mut b: DeviceBuffer<u32> = DeviceBuffer::new(
+                    dgpu_device.id,
+                    (N_LAYER as usize) * (crate::config::N_EXPERT as usize),
+                )?;
+                b.fill_zero()?;
+                b
+            }),
+            sel_tokens_prefill: std::sync::atomic::AtomicU64::new(0),
+            sel_tokens_decode: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// M62: stats collection default-on; `DEEPSTRIX_SEL_STATS=0` opts out.
+    pub fn sel_stats_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("DEEPSTRIX_SEL_STATS").map(|v| v != "0").unwrap_or(true)
+        });
+        *ON
+    }
+
+    /// M62: accumulate this layer's router picks (`tokens × N_EXPERT_USED`
+    /// flat in `d_selected`) into the prefill or decode bank. Queued on
+    /// de.compute — caller must already be in a context where d_selected
+    /// has been written on that stream (right after router top-k).
+    pub fn record_sel_stats(
+        &self,
+        is_prefill: bool,
+        d_selected: &DeviceBuffer<i32>,
+        layer: u32,
+        tokens: u32,
+    ) -> eyre::Result<()> {
+        if !Self::sel_stats_enabled() || tokens == 0 {
+            return Ok(());
+        }
+        let bank = if is_prefill { &self.sel_stats_prefill } else { &self.sel_stats_decode };
+        let mut bank = bank.lock().expect("sel_stats lock");
+        self.dgpu.expert_sel_count.launch(
+            &self.dgpu.compute,
+            &mut bank,
+            d_selected,
+            layer,
+            crate::config::N_EXPERT,
+            tokens * (crate::config::N_EXPERT_USED as u32),
+        )?;
+        if layer == 0 {
+            let ctr = if is_prefill { &self.sel_tokens_prefill } else { &self.sel_tokens_decode };
+            ctr.fetch_add(tokens as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// M62: read back and zero both banks. Returns
+    /// `((prefill_counts, prefill_tokens), (decode_counts, decode_tokens))`
+    /// with counts laid out `[N_LAYER × N_EXPERT]`. Synchronizes de.compute
+    /// — call only at harvest points (turn end / shutdown), never per token.
+    #[allow(clippy::type_complexity)]
+    pub fn harvest_sel_stats(&self) -> eyre::Result<((Vec<u32>, u64), (Vec<u32>, u64))> {
+        self.set_current_cached(self.dgpu.device)?;
+        self.dgpu.compute.synchronize()?;
+        let take = |m: &std::sync::Mutex<DeviceBuffer<u32>>,
+                    t: &std::sync::atomic::AtomicU64|
+         -> eyre::Result<(Vec<u32>, u64)> {
+            let mut b = m.lock().expect("sel_stats lock");
+            let mut host = vec![0u32; b.len()];
+            b.copy_to_host(&mut host)?;
+            b.fill_zero()?;
+            Ok((host, t.swap(0, std::sync::atomic::Ordering::Relaxed)))
+        };
+        Ok((
+            take(&self.sel_stats_prefill, &self.sel_tokens_prefill)?,
+            take(&self.sel_stats_decode, &self.sel_tokens_decode)?,
+        ))
     }
 
     /// Drain both devices to idle before teardown. Call this once after

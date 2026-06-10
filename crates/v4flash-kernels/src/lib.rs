@@ -22,6 +22,7 @@ pub mod head;
 pub mod model_weights;
 pub mod routing;
 pub mod het;
+pub mod expert_sel_count;
 pub mod indexer;
 pub mod iq2_xxs;
 pub mod iq2_xxs_tables;
@@ -48,6 +49,7 @@ pub use compressor::{
     CompressorPool, CompressorStateShuffleR4, CompressorStateSnapshot, CompressorStateWrite,
     F16Roundtrip, Fp8E4m3fnQuantize,
 };
+pub use expert_sel_count::ExpertSelCount;
 pub use f16::F16Matvec;
 pub use ffn::{Swiglu, SwigluClampWeighted, VecAddInplace};
 pub use head::{HcPost, HcSigmoidBias, HcSinkhorn, HcWeightedSum};

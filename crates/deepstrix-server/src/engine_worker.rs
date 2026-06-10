@@ -357,6 +357,12 @@ pub struct WorkerState {
     pub snapshot_index: SnapshotIndex,
     pub model_fingerprint: ModelFingerprint,
 
+    /// M62: on-disk expert-selection aggregate + its sidecar path.
+    /// Harvested from the engine's device banks and flushed at the same
+    /// points snapshots save (turn end / session switch / shutdown).
+    pub expert_stats: crate::expert_stats::ExpertStatsAgg,
+    pub expert_stats_path: std::path::PathBuf,
+
     /// Forward-progress signal. The worker pet()s this after every
     /// emitted decode token and after every completed prefill chunk;
     /// the watchdog thread aborts the process if it goes stale.
@@ -420,6 +426,17 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
 
     let rope = |layer: i32| -> eyre::Result<RopeParams> { Ok(rope_for_layer(layer)) };
 
+    // M62: if a derived placement file from a previous run exists and the
+    // user hasn't pinned one, point the hot-expert loader at it BEFORE the
+    // weights load — restarts then self-improve from accumulated stats.
+    if std::env::var("DGPU_HOT_EXPERTS_FILE").is_err() {
+        let placement = deepstrix_server_placement_path(&cfg.snapshot_root);
+        if placement.exists() {
+            tracing::info!(path = %placement.display(), "using accumulated expert-stats placement");
+            std::env::set_var("DGPU_HOT_EXPERTS_FILE", &placement);
+        }
+    }
+
     tracing::info!("loading het weights (dGPU ~9 GiB + iGPU ~52 GiB)");
     let t0 = std::time::Instant::now();
     let weights = HetModelWeights::load_all(&gguf, dgpu, igpu, &rope)?;
@@ -449,6 +466,9 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         fingerprint.clone(),
         cfg.snapshot_cap_bytes,
     )?;
+    let expert_stats_path = crate::expert_stats::ExpertStatsAgg::path_for(&cfg.snapshot_root);
+    let expert_stats =
+        crate::expert_stats::ExpertStatsAgg::load_or_fresh(&expert_stats_path, &fingerprint);
 
     Ok(WorkerState {
         dgpu,
@@ -469,6 +489,8 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         live: None,
         snapshot_index,
         model_fingerprint: fingerprint,
+        expert_stats,
+        expert_stats_path,
         // worker_main overwrites this with the real progress handle
         // that's shared with EngineHandle + watchdog. Default here so
         // initialize_state stays a self-contained fn.
@@ -833,10 +855,53 @@ fn state_fingerprint(state: &WorkerState) -> String {
     )
 }
 
+/// M62: derived placement path from the snapshot root (sidecar dir).
+fn deepstrix_server_placement_path(snapshot_root: &std::path::Path) -> std::path::PathBuf {
+    crate::expert_stats::ExpertStatsAgg::placement_path(
+        &crate::expert_stats::ExpertStatsAgg::path_for(snapshot_root),
+    )
+}
+
+/// M62: harvest the engine's device-side expert-selection banks into the
+/// on-disk aggregate. Cheap (2 × 88 KB readback) and skipped when nothing
+/// accumulated. Called from the same points that save snapshots.
+fn flush_expert_stats(state: &mut WorkerState) {
+    let ((pc, pt), (dc, dt)) = match state.engine.harvest_sel_stats() {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("expert_stats harvest failed: {e}");
+            return;
+        }
+    };
+    if pt == 0 && dt == 0 {
+        return;
+    }
+    state.expert_stats.merge_harvest(&pc, pt, &dc, dt);
+    if let Err(e) = state.expert_stats.save(&state.expert_stats_path) {
+        tracing::warn!("expert_stats save failed: {e}");
+        return;
+    }
+    // Derived placement for the NEXT server start (loader-format txt).
+    let alpha: f64 = std::env::var("DGPU_HOT_ALPHA")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.5);
+    let placement = crate::expert_stats::ExpertStatsAgg::placement_path(&state.expert_stats_path);
+    if let Err(e) = state.expert_stats.write_placement(&placement, alpha) {
+        tracing::warn!("expert_stats placement write failed: {e}");
+    }
+    tracing::debug!(
+        prefill_tokens = state.expert_stats.prefill.tokens,
+        decode_tokens = state.expert_stats.decode.tokens,
+        "expert_stats flushed"
+    );
+}
+
 /// If the live session has uncommitted state, persist it to disk and
 /// clear its dirty flag. Called before any operation that would evict
 /// the live state (conversation switch, shutdown).
 fn save_live_if_dirty(state: &mut WorkerState) {
+    flush_expert_stats(state);
     let Some(live) = &state.live else { return };
     if !live.dirty {
         return;

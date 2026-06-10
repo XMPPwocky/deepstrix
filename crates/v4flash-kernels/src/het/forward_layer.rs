@@ -1276,6 +1276,10 @@ impl HeterogeneousEngine {
         drop(_s_router);
         _t_router.end()?;
 
+        // M62: accumulate this layer's picks into the decode stats bank
+        // (one tiny atomicAdd kernel on de.compute, no readback).
+        self.record_sel_stats(false, &dgpu_scratch.d_selected, layer as u32, 1)?;
+
         // Push d_selected and d_ew to iGPU on dGPU.xfer (FIFO after the
         // ffn_input_norm push above).
         if parallel {

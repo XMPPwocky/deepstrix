@@ -2139,6 +2139,10 @@ impl HeterogeneousEngine {
         }
         drop(_t_router);
 
+        // M62: accumulate the chunk's picks into the prefill stats bank
+        // (one tiny atomicAdd kernel on de.compute, no readback).
+        self.record_sel_stats(true, &bd.d_selected, layer as u32, b)?;
+
         // Stats collection (optional). Copies d_selected to host — sync,
         // fences the device. Don't enable in production prefill.
         if let Some(s) = stats {
