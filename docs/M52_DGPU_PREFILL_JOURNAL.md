@@ -118,3 +118,46 @@ Day total: **230 → 460 tok/s @4K (2.0×), 224 → 443 @32K, 223 → 403 @96K.*
 - iq2 now ~30 ms/launch ≈ 1.6× over theoretical dp4a peak; remaining levers
   are tail-amortization geometry changes (SBG=4 needs chunk=16 → dequant 2×,
   pencils ~neutral) — likely format-bound without the f16 cache route.
+
+# M61 — prefill het-split MoE (dGPU computes hot experts during its slack)
+
+**Hypothesis.** At PIPELINE_LANES=2 the iGPU MoE chain is the prefill wall
+(~2200 ms/chunk iGPU vs ~625 ms dGPU at 4K). The decode het-split (M56)
+already keeps the K hottest experts/layer packed dense in dGPU VRAM. If the
+dGPU also computes those experts' (b, slot) members during prefill — in its
+~1575 ms/chunk of slack, fully async with the iGPU misses — every hit member
+comes off the iGPU wall. With K=8 hot experts covering share `s` of
+selections, projected iGPU MoE wall shrinks ~s; at s≈0.2 → ~460→
+~530-560 tok/s @4K.
+
+**Design** (no changes to the matvec kernels):
+- `moe_group_builder_hetsplit` (new): same inversion as `moe_group_builder`
+  but residency-aware. Resident slots of a token are ranked in slot order;
+  rank < cap (`DGPU_HOT_CAP_PREFILL`, default 255 = all) goes to the dGPU.
+  mode=0 (iGPU) keeps the complement in ORIGINAL id space; mode=1 (dGPU)
+  keeps hits in DENSE (remap) id space.
+- dGPU side avoids the per-layer host readback of n_work_items entirely:
+  a STATIC e-major work-items list (e<<16 | c*32, c<B_MAX/32) is uploaded
+  once; grid.y = n_hot × B_MAX/32 and the existing kwide/kwide2 guard
+  (`member_end <= member_start → return`) early-exits empty chunks. The
+  whole hot chain (group build → q8k → iq2 kwide → q8k → q2k kwide2 →
+  reduce) queues on de.compute with zero host syncs.
+- `q2_k_reduce_partials_hetsplit` (new): each side's reduce sums ONLY the
+  slots it computed (recomputes the same resident-rank), preserving the
+  M53 no-zero-fill invariant on both devices.
+- Combine: extra batched vec_add of `ffn_moe_dgpu` at ffn_combine
+  (mirrors decode M56).
+- Numerics: dGPU q8k input is the same f32 ffn_input_norm both devices
+  hold → bit-identical quantization; per-member sums bit-identical (same
+  kernels); only the final slot-sum association changes (hot partial added
+  after own-slot sum) → tiny f32 drift, same class as decode M56.
+- Rollback: DGPU_HOT_PREFILL=0 (default 1 when hot experts loaded).
+  Forbidden combos: Q2K_VARIANT=bxn and IQ2_VARIANT=hybrid error out when
+  hot prefill is active.
+- VRAM: +~280 MB dGPU batch scratch at B_MAX=1024 (xq 8.4 + mid 50 +
+  midq 15 + partials 176 + out 29 + group arrays ~1), gated on
+  DGPU_HOT_EXPERTS>0.
+
+**Gates.** forward_prompt_batch_matches_sequential (hot on), then cold
+back-to-back A/B DGPU_HOT_PREFILL=0/1 at 4K/32K/96K, PIPELINE_LANES=2,
+DGPU_HOT_EXPERTS=8 + decode_hot_experts.txt placement.
