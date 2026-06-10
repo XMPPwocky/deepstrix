@@ -250,3 +250,17 @@ How SHOULD hot experts be chosen — analysis + measurement:
   calibration corpus, not cycled dump residuals.
 - dGPU hot-MoE is fully ASYNC with iGPU MoE (own stream, event-gated;
   verified: e2e win == iGPU saved time, dGPU share hidden in its wait).
+
+## M58.3 — dGPU hot-slot cap (2026-06-10)
+
+User correction ACCEPTED: expected-hits maximization is NOT optimal in
+general — the true objective is E[max(miss×32.5 µs, hit×12.3 µs + shared
+~46 µs)] per layer-token; beyond h* ≈ 3.3-4 resident picks the dGPU leg
+becomes the wall while the iGPU idles. This (not just frequency
+flattening) explains the K=16→24 plateau.
+
+Fix: deterministic slot-order cap — dGPU takes resident slots in slot
+order up to DGPU_HOT_CAP (default 4), overflow returns to the iGPU; both
+hetsplit kernels compute the identical rank independently. Measured at
+K=16: cap6 29.46 / cap4 **29.68** / cap3 29.28 tok/s — optimum at the
+predicted balance point.
