@@ -181,3 +181,31 @@ hit rates will sit lower until placement is recalibrated (or adaptive).
 prefill scratch currently leaves only ~1.5-2 GB free; trimming it (or
 phase-alternating lane-B scratch with the hot set) raises K to 8-16 →
 ~29-30.5 server-side. MTP remains shelved per analysis above.
+
+# M57 — dGPU VRAM audit (2026-06-10)
+
+Tool: DEEPSTRIX_ALLOC_TRACE=1 (buffer.rs, ≥8MB allocs + #[track_caller]
+source line). Findings (server config = 2 prefill lanes):
+
+| allocation | size | verdict |
+|---|---|---|
+| token_embd dGPU copy | **1.06 GB** | **DEAD — removed** (server embeds host-side from mmap; zero kernel consumers; dtype still validated) |
+| active_comp_kv | 537 MB/lane | real (CSA gathered top-512 × 512 f16 × B=1024); next structural trim target |
+| attn_scores (f16 mode) | 268 MB/lane | real |
+| q / q_normed / heads | 3×134 MB/lane | trimmable to f16 (−0.5 GB/2 lanes) if needed |
+| indexer_scores | 101 MB/lane | grows with ctx (B × MAX_KEYS f32) |
+| lm_head q8 | 563 MB | real (only head copy now) |
+
+**Result: hot-expert K=8 fits the FULL server stack** (was K=4):
+- worst-case oracle (3 scratch instances): K=8 PASS, K=12 OOM
+- real server @ ctx 98304 + K=8: 15.62/17.1 GB used → **1.47 GB free**
+- **128K ctx KV budget: +0.24 GB vs 96K (comp 705 MB + indexer 176 + raw 50
+  + r128 21 ≈ 0.95 GB total) → fits with ~1.2 GB margin at K=8** ✓
+- K=12 at 128K would be borderline; take K=8.
+
+Decode (mean, 96 tokens): K=8 = **29.19 tok/s** (production-compatible).
+Server e2e incl. sampling/overhead: ~27.2 tok/s on a real generation,
+output coherent. Day-2 decode totals: 25.4 → 29.2 bench / 27 server.
+
+Remaining to clear 30 bench-side: q→f16 trim → K=12 (+~0.3), token-boundary
+(~1.6 ms), q/kv-chain device-pos graph (~1).
