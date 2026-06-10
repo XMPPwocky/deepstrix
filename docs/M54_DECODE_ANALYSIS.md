@@ -264,3 +264,20 @@ order up to DGPU_HOT_CAP (default 4), overflow returns to the iGPU; both
 hetsplit kernels compute the identical rank independently. Measured at
 K=16: cap6 29.46 / cap4 **29.68** / cap3 29.28 tok/s — optimum at the
 predicted balance point.
+
+# M59 — silly-list execution (2026-06-10)
+
+| change | est. | MEASURED | status |
+|---|---|---|---|
+| merged qkv_chain graph (rope_tail_pdev + kv_append_slotdev; pos/slot published per token via hipStreamWriteValue32) | −1..1.5 | **−0.3** | shipped (DECODE_QKV_GRAPH=0 rollback). Lesson refined: the glue bucket is mostly per-kernel DEVICE-time floor, not launch gaps — graphs can't shrink it, fusion can. |
+| kv_post_fused: rms+rope+fp8+f16rt+append 5→1 kernel, one 512-thread WG | −0.7..0.9 | **−0.55** | shipped (inside qkv_chain graph) |
+| packed per-layer peer pushes (4→1-2 copies/layer, ~0.4-0.6) | | not built | next session; mechanical |
+| token boundary device-feedback | ~1.6? | not built | the 1.6 figure was from a TRACED run (exporter drain inflates the boundary); needs untraced host-timeline measurement before building. Note: device-side embed would need the 1.06 GB token_embd back on dGPU — weigh against 128K KV margin. |
+
+**Decode @4K, production config (K=8, cap 4): 34.1 ms = 29.3-29.4 tok/s.**
+All 4 e2e oracles PASS (batch_v2 scaled drift improved 4.3e-2 → 3.0e-2).
+
+Two-day decode arc: 25.3 → 29.4 @4K, 23.6 → ~28.5 @96K (with M58 indexer).
+Remaining honest map: dGPU weight bytes 13.9 (physics), iGPU misses 7.4
+(hit-rate), glue ~3.3 (fusion candidates left: q-side rms_nw+rope, MoE
+4→1 chain), copies ~1.0 (packing), gaps/boundary ~4-5.
