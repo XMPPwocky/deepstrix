@@ -572,21 +572,17 @@ impl HetModelWeights {
                                 dgpu_layers[layer].hot_experts = Some(hot);
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    layer,
-                                    "hot-expert load failed (disabled for layer): {e}"
+                                eprintln!(
+                                    "WARN hot-expert load failed at L{layer} (disabled): {e}"
                                 );
                             }
                         }
                     }
                     dgpu_device.set_current()?;
-                    tracing::info!(
-                        hot_k,
-                        "M56 het-split: hot experts resident on dGPU"
-                    );
+                    eprintln!("M56 het-split: {hot_k} hot experts/layer resident on dGPU");
                 }
                 Err(e) => {
-                    tracing::warn!("DGPU_HOT_EXPERTS set but placement file unusable: {e}");
+                    eprintln!("WARN DGPU_HOT_EXPERTS set but placement file unusable: {e}");
                 }
             }
         }

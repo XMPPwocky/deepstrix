@@ -509,6 +509,35 @@ impl HeterogeneousEngine {
                         std::sync::Mutex::new((vec![[0u64; 256]; N_LAYER as usize], 0u64))
                     })
                 });
+                // Optional hot-set hit-rate histogram: resident sets from the
+                // same placement file + K the het-split loader uses.
+                static HOTSETS: std::sync::LazyLock<Option<Vec<[bool; 256]>>> =
+                    std::sync::LazyLock::new(|| {
+                        let k: usize = std::env::var("DGPU_HOT_EXPERTS")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                        if k == 0 {
+                            return None;
+                        }
+                        let path = std::env::var("DGPU_HOT_EXPERTS_FILE")
+                            .unwrap_or_else(|_| "reference/decode_hot_experts.txt".into());
+                        super::weights::parse_hot_expert_file(&path, k).ok().map(|lists| {
+                            lists
+                                .iter()
+                                .map(|ids| {
+                                    let mut m = [false; 256];
+                                    for &e in ids {
+                                        m[e as usize] = true;
+                                    }
+                                    m
+                                })
+                                .collect()
+                        })
+                    });
+                // (per-token hit counter, 21-bin hit-rate histogram in 5% steps)
+                static HITHIST: std::sync::LazyLock<std::sync::Mutex<(u32, [u32; 21])>> =
+                    std::sync::LazyLock::new(|| std::sync::Mutex::new((0, [0; 21])));
                 if let Some(m) = &*STATS {
                     self.dgpu.compute.synchronize()?;
                     let mut sel = vec![0i32; crate::config::N_EXPERT_USED];
@@ -520,6 +549,36 @@ impl HeterogeneousEngine {
                     for &e in &sel {
                         if (0..256).contains(&e) {
                             g.0[layer][e as usize] += 1;
+                        }
+                    }
+                    if let Some(hs) = &*HOTSETS {
+                        let mut h = HITHIST.lock().unwrap();
+                        for &e in &sel {
+                            if (0..256).contains(&e) && hs[layer][e as usize] {
+                                h.0 += 1;
+                            }
+                        }
+                        if layer == (N_LAYER as usize) - 1 {
+                            let total = (N_LAYER as usize)
+                                * crate::config::N_EXPERT_USED;
+                            let rate = h.0 as f64 / total as f64;
+                            let bin = ((rate * 20.0).round() as usize).min(20);
+                            h.1[bin] += 1;
+                            h.0 = 0;
+                            let tokens: u32 = h.1.iter().sum();
+                            if tokens % 32 == 0 {
+                                let hist: Vec<String> = h
+                                    .1
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, c)| **c > 0)
+                                    .map(|(b, c)| format!("{}%:{}", b * 5, c))
+                                    .collect();
+                                eprintln!(
+                                    "HOT_HIT_HIST after {tokens} tokens (per-token hit-rate bins): {}",
+                                    hist.join(" ")
+                                );
+                            }
                         }
                     }
                     if layer == (N_LAYER as usize) - 1 {
