@@ -502,27 +502,70 @@ impl HotExpertWeights {
     }
 }
 
-/// Parse the hot-expert placement file (one line per layer, descending-
-/// frequency comma-separated expert ids — written by the
-/// DEEPSTRIX_EXPERT_STATS probe). Returns per-layer top-k id lists.
-pub fn parse_hot_expert_file(path: &str, k: usize) -> eyre::Result<Vec<Vec<u32>>> {
+/// Parse the hot-expert placement file and allocate the slot budget.
+///
+/// File format (DEEPSTRIX_EXPERT_STATS probe): one line per layer,
+/// descending-frequency `id` or `id:count` entries. With counts present,
+/// the TOTAL budget of `k_avg × N_LAYER` slots is allocated by GLOBAL
+/// GREEDY — all (layer, expert) pairs ranked by count, top budget taken —
+/// so skewed layers get more slots than flat ones (optimal for expected
+/// hits under a stationary distribution: every expert costs the same
+/// 7.08 MB and a miss in any layer is equally serial). Legacy count-less
+/// files fall back to uniform per-layer top-k.
+pub fn parse_hot_expert_file(path: &str, k_avg: usize) -> eyre::Result<Vec<Vec<u32>>> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| eyre!("read hot-expert file {path}: {e}"))?;
-    let mut out = Vec::with_capacity(N_LAYER as usize);
+    let mut per_layer: Vec<Vec<(u32, u64)>> = Vec::with_capacity(N_LAYER as usize);
+    let mut have_counts = true;
     for line in text.lines().take(N_LAYER as usize) {
-        let ids: Vec<u32> = line
-            .split(',')
-            .filter_map(|s| s.trim().parse().ok())
-            .take(k)
-            .collect();
-        out.push(ids);
+        let mut row = Vec::new();
+        for tok in line.split(',') {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            if let Some((id, cnt)) = tok.split_once(':') {
+                if let (Ok(id), Ok(cnt)) = (id.parse::<u32>(), cnt.parse::<u64>()) {
+                    row.push((id, cnt));
+                }
+            } else if let Ok(id) = tok.parse::<u32>() {
+                have_counts = false;
+                row.push((id, 0));
+            }
+        }
+        per_layer.push(row);
     }
-    if out.len() != N_LAYER as usize {
+    if per_layer.len() != N_LAYER as usize {
         return Err(eyre!(
             "hot-expert file {path}: {} lines, need {}",
-            out.len(),
+            per_layer.len(),
             N_LAYER
         ));
+    }
+    let budget = k_avg * N_LAYER as usize;
+    let mut out: Vec<Vec<u32>> = vec![Vec::new(); N_LAYER as usize];
+    if have_counts {
+        let mut all: Vec<(u64, usize, u32)> = Vec::new();
+        for (l, row) in per_layer.iter().enumerate() {
+            for &(id, cnt) in row {
+                all.push((cnt, l, id));
+            }
+        }
+        all.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        for &(_, l, id) in all.iter().take(budget) {
+            out[l].push(id);
+        }
+        let (min_k, max_k) = (
+            out.iter().map(|v| v.len()).min().unwrap_or(0),
+            out.iter().map(|v| v.len()).max().unwrap_or(0),
+        );
+        eprintln!(
+            "hot-expert global-greedy: budget {budget} slots, per-layer K range {min_k}..{max_k}"
+        );
+    } else {
+        for (l, row) in per_layer.iter().enumerate() {
+            out[l] = row.iter().take(k_avg).map(|&(id, _)| id).collect();
+        }
     }
     Ok(out)
 }
@@ -564,6 +607,11 @@ impl HetModelWeights {
             match parse_hot_expert_file(&path, hot_k) {
                 Ok(lists) => {
                     for layer in 0..N_LAYER as usize {
+                        if lists[layer].is_empty() {
+                            // Global greedy gave this (flat-routing) layer
+                            // zero slots — leave it fully iGPU-resident.
+                            continue;
+                        }
                         match HotExpertWeights::load(
                             gguf,
                             dgpu_device,

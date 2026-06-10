@@ -608,6 +608,9 @@ impl HeterogeneousEngine {
                             // (placement input). One line per layer.
                             if let Ok(path) = std::env::var("DEEPSTRIX_EXPERT_STATS") {
                                 if path != "1" {
+                                    // id:count pairs, descending frequency —
+                                    // counts let the loader do GLOBAL greedy
+                                    // slot allocation across layers.
                                     let mut out = String::new();
                                     for l in 0..N_LAYER as usize {
                                         let mut idx: Vec<usize> = (0..256).collect();
@@ -616,8 +619,8 @@ impl HeterogeneousEngine {
                                         });
                                         let row: Vec<String> = idx
                                             .iter()
-                                            .take(32)
-                                            .map(|e| e.to_string())
+                                            .take(64)
+                                            .map(|&e| format!("{}:{}", e, g.0[l][e]))
                                             .collect();
                                         out.push_str(&row.join(","));
                                         out.push('\n');

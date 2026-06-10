@@ -227,3 +227,26 @@ sub-ms for score.
 Remaining long-ctx-specific: topk over n_comp scores (~0.6 ms/tok at 96K,
 ~0.8 at 128K) — block-local top-512 pre-reduction before the merge would
 cut it ~2-3×; everything else is depth-flat.
+
+## M58.2 — placement policy (2026-06-10)
+
+How SHOULD hot experts be chosen — analysis + measurement:
+- Objective: mean decode time ∝ mean iGPU MISS bytes (uniform 7.08 MB per
+  expert, any layer's miss equally serial, dGPU has ~5× slack) → maximizing
+  EXPECTED HITS is exactly right; frequency is the correct statistic. No
+  co-occurrence/tail modeling needed.
+- **Global-greedy slot allocation implemented** (stats file now id:count;
+  budget = K×43 slots ranked across ALL (layer, expert) pairs; flat layers
+  get fewer slots — at K=4 the range was 0..7, at K=8 5..11). Theoretically
+  ≥ uniform; **measured: WASH at K=4 and K=8** on the current calibration
+  set (marginal frequencies beyond the per-layer head are similar across
+  layers). Kept (free, principled, should matter with diverse traffic).
+- Notable: layer 0 picks the SAME 6 experts for ~95% of calibration tokens
+  (hash-router layers route by token hash → token-unigram-Zipf, extremely
+  placement-friendly).
+- Production design (not yet built): EWMA of per-(layer, expert) selection
+  counts during serving; periodic global-greedy re-rank; background PCIe
+  swaps (~0.3 ms/expert) with hysteresis. Cold-start from a DIVERSE
+  calibration corpus, not cycled dump residuals.
+- dGPU hot-MoE is fully ASYNC with iGPU MoE (own stream, event-gated;
+  verified: e2e win == iGPU saved time, dGPU share hidden in its wait).
