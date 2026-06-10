@@ -500,6 +500,109 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_batch_b512(
 }
 
 // =============================================================================
+// M56 decode het-split: _fused_swiglu_batch with a resident-expert remap.
+//
+// Static hot-expert placement: the K hottest experts per layer also live in
+// dGPU VRAM (packed dense). Per token each device computes ONLY its share
+// of the 6 selected experts — the dGPU during its former MoE wait — and the
+// partial FFN sums add at combine. `remap[e] >= 0` ⇔ expert e is
+// dGPU-resident (value = dense slot in the packed dGPU weights).
+//
+//   mode 0 (iGPU): process slot iff remap[e] < 0; weights at expert id e.
+//   mode 1 (dGPU): process slot iff remap[e] >= 0; weights at remap[e].
+//
+// Skipped slots write 0.0 to mid so the downstream q8k/q2k stages stay
+// oblivious (their own hetsplit gating makes the values irrelevant, but
+// zeros keep the quantizer NaN-free).
+// =============================================================================
+extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_batch_hetsplit(
+        float        * __restrict__ mid,           // [n_used, n_rows]
+        const uint8_t * __restrict__ gate_w_base,
+        const uint8_t * __restrict__ up_w_base,
+        const uint8_t * __restrict__ xq,
+        const float  * __restrict__ expert_w,
+        const int    * __restrict__ selected,      // [n_used]
+        const int    * __restrict__ remap,         // [256]; -1 = not dGPU-resident
+        unsigned int    mode,                      // 0 = iGPU share, 1 = dGPU share
+        unsigned int    gate_bpe,
+        unsigned int    up_bpe,
+        float           clamp,
+        unsigned int    n_rows,
+        unsigned int    n_blocks) {
+    __shared__ uint64_t s_sign_pair[128];
+    __shared__ uint64_t s_grid[256];
+    __shared__ uint8_t  s_xq[16 * 292];
+
+    const unsigned int slot = blockIdx.y;
+    const int sel = selected[slot];
+    const int dense = remap[sel];
+    const unsigned int tid = threadIdx.x;
+    const unsigned int row_in_block = tid / 32u;
+    const unsigned int lane         = tid & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+
+    const bool ours = (mode == 0u) ? (dense < 0) : (dense >= 0);
+    if (!ours) {
+        // Zero our slice of mid and bail before any weight traffic.
+        if (row < n_rows && lane == 0) {
+            mid[(uint64_t)slot * (uint64_t)n_rows + (uint64_t)row] = 0.0f;
+        }
+        return;
+    }
+    const int e = (mode == 0u) ? sel : dense;
+
+    if (tid < 128) {
+        const uint32_t s = ksigns_iq2xs[tid];
+        const uint32_t signs = s * 0x01010101u;
+        const uint32_t sm0 = expand_signs_par(signs, 0x08040201u);
+        const uint32_t sm1 = expand_signs_par(signs, 0x80402010u);
+        s_sign_pair[tid] = ((uint64_t)sm1 << 32) | (uint64_t)sm0;
+    }
+    if (tid < 256) s_grid[tid] = iq2xxs_grid[tid];
+    const unsigned int xq_bytes = n_blocks * 292u;
+    for (unsigned int i = tid; i < xq_bytes; i += blockDim.x) {
+        s_xq[i] = xq[i];
+    }
+    __syncthreads();
+    if (row >= n_rows) return;
+
+    const unsigned int block_lane = lane >> 1u;
+    const unsigned int ib32_lo    = (lane & 1u) * 4u;
+
+    const uint8_t* gate_row_base = gate_w_base
+                                 + (uint64_t)e * (uint64_t)gate_bpe
+                                 + (uint64_t)row * (uint64_t)n_blocks * BLOCK_IQ2_XXS_BYTES;
+    const uint8_t* up_row_base   = up_w_base
+                                 + (uint64_t)e * (uint64_t)up_bpe
+                                 + (uint64_t)row * (uint64_t)n_blocks * BLOCK_IQ2_XXS_BYTES;
+
+    float g_sum = 0.0f;
+    float u_sum = 0.0f;
+    for (unsigned int b = block_lane; b < n_blocks; b += 16u) {
+        const uint8_t* w_g = gate_row_base + (uint64_t)b * BLOCK_IQ2_XXS_BYTES;
+        const uint8_t* w_u = up_row_base   + (uint64_t)b * BLOCK_IQ2_XXS_BYTES;
+        const uint8_t* y   = s_xq          + (size_t)b   * BLOCK_Q8_K_BYTES;
+        g_sum += dot_block_half_lds(w_g, y, ib32_lo, s_sign_pair, s_grid);
+        u_sum += dot_block_half_lds(w_u, y, ib32_lo, s_sign_pair, s_grid);
+    }
+
+    g_sum = warp_sum_f32_par(g_sum);
+    u_sum = warp_sum_f32_par(u_sum);
+
+    if (lane == 0) {
+        const float ew = expert_w[slot];
+        if (clamp > 1.0e-6f) {
+            if (g_sum > clamp)  g_sum = clamp;
+            if (u_sum > clamp)  u_sum = clamp;
+            if (u_sum < -clamp) u_sum = -clamp;
+        }
+        const float sig = 1.0f / (1.0f + expf(-g_sum));
+        mid[(uint64_t)slot * (uint64_t)n_rows + (uint64_t)row] =
+            g_sum * sig * u_sum * ew;
+    }
+}
+
+// =============================================================================
 // M55 decode: weight-STAGED variant of _fused_swiglu_batch.
 //
 // The B=1 decode kernel is weight-BW-bound, but its global weight loads are

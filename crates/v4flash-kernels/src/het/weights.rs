@@ -26,6 +26,9 @@ pub struct DgpuLayerWeights {
     pub layer_idx: i32,
     pub ratio: u32,
 
+    /// M56 het-split: dGPU-resident hot routed experts (None = feature off).
+    pub hot_experts: Option<HotExpertWeights>,
+
     // mHC
     pub hc_attn_fn: DeviceWeight,
     pub hc_attn_scale: DeviceBuffer<f32>,
@@ -93,6 +96,11 @@ pub struct IgpuLayerWeights {
 
     // Routed experts (all 256, iGPU-resident)
     pub routed: RoutedExpertWeights,
+
+    /// M56 het-split: iGPU-resident copy of the resident-expert remap
+    /// (remap[e] >= 0 ⇔ expert e is ALSO dGPU-resident; the iGPU MoE
+    /// kernels then skip those slots). None = feature off.
+    pub hot_remap: Option<DeviceBuffer<i32>>,
 
     /// Per-layer RoPE params. Mirrors the dGPU side for any future
     /// iGPU-resident RoPE call (currently unused — all RoPE runs on dGPU).
@@ -338,6 +346,7 @@ impl DgpuLayerWeights {
         Ok(DgpuLayerWeights {
             layer_idx: layer,
             ratio,
+            hot_experts: None,
             hc_attn_fn,
             hc_attn_scale,
             hc_attn_base,
@@ -412,9 +421,103 @@ impl IgpuLayerWeights {
             ratio,
             is_hash_router,
             routed,
+            hot_remap: None,
             rope_params,
         })
     }
+}
+
+/// M56: dGPU-resident copies of the K hottest routed experts of one layer
+/// (packed dense), plus the id→dense remap. The dGPU computes these picks
+/// during its former MoE wait; the iGPU skips them.
+pub struct HotExpertWeights {
+    pub gate: DeviceBuffer<u8>,
+    pub up: DeviceBuffer<u8>,
+    pub down: DeviceBuffer<u8>,
+    /// remap[e] = dense slot in the packed buffers, or -1.
+    pub remap: DeviceBuffer<i32>,
+    pub n_hot: u32,
+}
+
+impl HotExpertWeights {
+    pub fn load(
+        gguf: &MappedGguf,
+        dgpu_device: Device,
+        layer: i32,
+        expert_ids: &[u32],
+    ) -> eyre::Result<(Self, Vec<i32>)> {
+        dgpu_device.set_current()?;
+        let device_id = dgpu_device.id;
+        let gate_bpe = (crate::config::N_FF_EXP as usize)
+            * (BLOCKS_Q8K_GATE_IN as usize)
+            * BLOCK_IQ2_XXS_BYTES;
+        let down_bpe =
+            (N_EMBD as usize) * (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q2_K_BYTES;
+        let k = expert_ids.len();
+
+        let mut remap_host = vec![-1i32; 256];
+        for (dense, &e) in expert_ids.iter().enumerate() {
+            remap_host[e as usize] = dense as i32;
+        }
+
+        let pack = |name: &str, bpe: usize| -> eyre::Result<DeviceBuffer<u8>> {
+            let tensor = gguf
+                .gguf()
+                .tensor(name)
+                .ok_or_else(|| eyre!("tensor `{name}` not found"))?;
+            let host = gguf.read_tensor(tensor)?;
+            let mut packed = vec![0u8; k * bpe];
+            for (dense, &e) in expert_ids.iter().enumerate() {
+                let src = &host[(e as usize) * bpe..(e as usize + 1) * bpe];
+                packed[dense * bpe..(dense + 1) * bpe].copy_from_slice(src);
+            }
+            let mut buf = DeviceBuffer::<u8>::new(device_id, packed.len())?;
+            buf.copy_from_host(&packed)?;
+            Ok(buf)
+        };
+
+        let gate = pack(&format!("blk.{layer}.ffn_gate_exps.weight"), gate_bpe)?;
+        let up = pack(&format!("blk.{layer}.ffn_up_exps.weight"), gate_bpe)?;
+        let down = pack(&format!("blk.{layer}.ffn_down_exps.weight"), down_bpe)?;
+        let mut remap = DeviceBuffer::<i32>::new(device_id, 256)?;
+        remap.copy_from_host(&remap_host)?;
+
+        Ok((
+            HotExpertWeights {
+                gate,
+                up,
+                down,
+                remap,
+                n_hot: k as u32,
+            },
+            remap_host,
+        ))
+    }
+}
+
+/// Parse the hot-expert placement file (one line per layer, descending-
+/// frequency comma-separated expert ids — written by the
+/// DEEPSTRIX_EXPERT_STATS probe). Returns per-layer top-k id lists.
+pub fn parse_hot_expert_file(path: &str, k: usize) -> eyre::Result<Vec<Vec<u32>>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| eyre!("read hot-expert file {path}: {e}"))?;
+    let mut out = Vec::with_capacity(N_LAYER as usize);
+    for line in text.lines().take(N_LAYER as usize) {
+        let ids: Vec<u32> = line
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .take(k)
+            .collect();
+        out.push(ids);
+    }
+    if out.len() != N_LAYER as usize {
+        return Err(eyre!(
+            "hot-expert file {path}: {} lines, need {}",
+            out.len(),
+            N_LAYER
+        ));
+    }
+    Ok(out)
 }
 
 impl HetModelWeights {
@@ -440,6 +543,52 @@ impl HetModelWeights {
                 layer,
                 rope_params_for_layer,
             )?);
+        }
+        // M56 het-split: DGPU_HOT_EXPERTS=K (+ optional
+        // DGPU_HOT_EXPERTS_FILE, default reference/decode_hot_experts.txt)
+        // places the K hottest experts per layer on the dGPU too.
+        let hot_k: usize = std::env::var("DGPU_HOT_EXPERTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if hot_k > 0 {
+            let path = std::env::var("DGPU_HOT_EXPERTS_FILE")
+                .unwrap_or_else(|_| "reference/decode_hot_experts.txt".into());
+            match parse_hot_expert_file(&path, hot_k) {
+                Ok(lists) => {
+                    for layer in 0..N_LAYER as usize {
+                        match HotExpertWeights::load(
+                            gguf,
+                            dgpu_device,
+                            layer as i32,
+                            &lists[layer],
+                        ) {
+                            Ok((hot, remap_host)) => {
+                                igpu_device.set_current()?;
+                                let mut r =
+                                    DeviceBuffer::<i32>::new(igpu_device.id, 256)?;
+                                r.copy_from_host(&remap_host)?;
+                                igpu_layers[layer].hot_remap = Some(r);
+                                dgpu_layers[layer].hot_experts = Some(hot);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    layer,
+                                    "hot-expert load failed (disabled for layer): {e}"
+                                );
+                            }
+                        }
+                    }
+                    dgpu_device.set_current()?;
+                    tracing::info!(
+                        hot_k,
+                        "M56 het-split: hot experts resident on dGPU"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("DGPU_HOT_EXPERTS set but placement file unusable: {e}");
+                }
+            }
         }
         Ok(Self {
             global,

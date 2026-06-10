@@ -195,6 +195,46 @@ impl Q2KAccumulateMatvec {
         ])
     }
 
+    /// **hetsplit (M56)** — `launch_batched` with a resident-expert remap;
+    /// see the iq2 hetsplit doc. `out` gets this device's partial sum
+    /// (zeros when none of the slots belong to it).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched_hetsplit(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        w_base: &DeviceBuffer<u8>,
+        xq_base: &DeviceBuffer<u8>,
+        selected: &DeviceBuffer<i32>,
+        remap: &DeviceBuffer<i32>,
+        mode: u32,
+        dbpe: u32,
+        xq_slot_stride: u32,
+        n_used: u32,
+        n_rows: u32,
+        n_blocks_in: u32,
+    ) -> eyre::Result<()> {
+        if n_rows % 8 != 0 {
+            return Err(eyre!("q2_k hetsplit: n_rows={n_rows} not %8"));
+        }
+        if out.len() < n_rows as usize {
+            return Err(eyre!("q2_k hetsplit out: len {} < n_rows {n_rows}", out.len()));
+        }
+        if remap.len() < 256 {
+            return Err(eyre!("q2_k hetsplit: remap len {} < 256", remap.len()));
+        }
+        let function = self.module.get_function("q2_k_matvec_par_batched_hetsplit")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), w_base.raw(), xq_base.raw(), selected.raw(), remap.raw(), mode,
+            dbpe, xq_slot_stride, n_used, n_rows, n_blocks_in
+        ])
+    }
+
     /// M50 Phase 3 v0: B-batched variant — grid.z = B. Per-batch xq, selected,
     /// out. Weight shared across batch.
     #[allow(clippy::too_many_arguments)]

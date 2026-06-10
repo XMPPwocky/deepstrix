@@ -376,7 +376,10 @@ impl HeterogeneousEngine {
         });
         let preissue = *PREISSUE
             && matches!(self.mode, ExecMode::HetParallel)
-            && dump_subtensor_layers.is_empty();
+            && dump_subtensor_layers.is_empty()
+            // M56: pre-issue's iGPU lane doesn't carry the het-split
+            // branch; the two are not composed yet.
+            && weights.dgpu_layers[0].hot_experts.is_none();
         // Advance the token sequence for the moe_signal protocol (the
         // write side in forward_layer reads this with `load`). Done
         // unconditionally so the signal words stay in lockstep with

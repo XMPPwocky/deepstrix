@@ -1281,6 +1281,41 @@ impl HeterogeneousEngine {
             _t_shared.end()?;
         }
 
+        // M56 het-split: the dGPU computes its RESIDENT hot experts during
+        // its former MoE wait, in parallel with shared expert + iGPU MoE.
+        // Mirrors the iGPU routed_moe pipeline on dGPU scratch; the partial
+        // is added at ffn_combine. Input is the same f32 ffn_input_norm both
+        // devices hold, so the q8k quantization is bit-identical.
+        if parallel {
+            if let Some(hot) = dlw.hot_experts.as_ref() {
+                let mid_blocks_bytes_d = (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
+                let hot_gbpe = ilw.routed.gate_bytes_per_expert;
+                let hot_dbpe = ilw.routed.down_bytes_per_expert;
+                let _t_hot = de.events.stage("dgpu.hot_moe", &de.compute)?;
+                self.dgpu_graphs.run("dgpu_hot_moe", layer as u32, &de.compute, |s| {
+                    de.q8k.launch(s, &mut dgpu_scratch.moe_xq, &dgpu_scratch.ffn_input_norm, BLOCKS_Q8K_GATE_IN)?;
+                    de.iq2.launch_fused_swiglu_batch_hetsplit(
+                        s, &mut dgpu_scratch.moe_mid_cat,
+                        &hot.gate, &hot.up,
+                        &dgpu_scratch.moe_xq, &dgpu_scratch.d_ew, &dgpu_scratch.d_selected,
+                        &hot.remap, /*mode=*/1,
+                        hot_gbpe as u32, hot_gbpe as u32,
+                        N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+                    )?;
+                    de.q8k.launch(s, &mut dgpu_scratch.moe_midq_cat, &dgpu_scratch.moe_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
+                    de.q2k.launch_batched_hetsplit(
+                        s, &mut dgpu_scratch.ffn_moe_dgpu,
+                        &hot.down, &dgpu_scratch.moe_midq_cat, &dgpu_scratch.d_selected,
+                        &hot.remap, /*mode=*/1,
+                        hot_dbpe as u32, mid_blocks_bytes_d as u32,
+                        N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN,
+                    )?;
+                    Ok(())
+                })?;
+                _t_hot.end()?;
+            }
+        }
+
         // M54 pre-issue mode: the whole iGPU MoE lane (wait → graph →
         // push) was enqueued at token start by issue_igpu_moe; skip the
         // inline iGPU section entirely (the dGPU's moe_arrived wait below
@@ -1330,9 +1365,16 @@ impl HeterogeneousEngine {
         // graph and corrupt the per-token harvest.
         self.igpu_graphs.run("routed_moe", layer as u32, &ie.compute, |s| {
             ie.q8k.launch(s, &mut igpu_scratch.d_xq_q8k, &igpu_scratch.ffn_input_norm_recv, BLOCKS_Q8K_GATE_IN)?;
-            ie.iq2.launch_fused_swiglu_batch(s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
-            ie.q8k.launch(s, &mut igpu_scratch.d_midq_cat, &igpu_scratch.d_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
-            ie.q2k.launch_batched(s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
+            if let Some(remap) = ilw.hot_remap.as_ref() {
+                // M56: skip dGPU-resident slots (the dGPU computes those).
+                ie.iq2.launch_fused_swiglu_batch_hetsplit(s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, remap, /*mode=*/0, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
+                ie.q8k.launch(s, &mut igpu_scratch.d_midq_cat, &igpu_scratch.d_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
+                ie.q2k.launch_batched_hetsplit(s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, remap, /*mode=*/0, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
+            } else {
+                ie.iq2.launch_fused_swiglu_batch(s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
+                ie.q8k.launch(s, &mut igpu_scratch.d_midq_cat, &igpu_scratch.d_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
+                ie.q2k.launch_batched(s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
+            }
             Ok(())
         })?;
         // `selected` is not materialized on host — d_selected stays
@@ -1406,6 +1448,10 @@ impl HeterogeneousEngine {
             // for the last layer; non-last layers ride the combined graph.
             self.dgpu_graphs.run("ffn_combine", layer as u32, &de.compute, |s| {
                 de.vec_add.launch(s, &mut dgpu_scratch.ffn_moe_recv, &dgpu_scratch.ffn_shared, N_EMBD)?;
+                if dlw.hot_experts.is_some() {
+                    // M56: + the dGPU's resident-expert MoE partial.
+                    de.vec_add.launch(s, &mut dgpu_scratch.ffn_moe_recv, &dgpu_scratch.ffn_moe_dgpu, N_EMBD)?;
+                }
                 de.hc_post.launch_from_split(s, &mut dgpu_scratch.residual_next, &dgpu_scratch.ffn_moe_recv, &dgpu_scratch.after_attn_hc, &dgpu_scratch.split, N_HC, N_EMBD, N_HC)?;
                 Ok(())
             })?;
@@ -1419,6 +1465,10 @@ impl HeterogeneousEngine {
             self.dgpu_graphs.run("combined_ffn_pre_attn", layer as u32, &de.compute, |s| {
                 // ffn_combine half — writes residual_next (= layer N+1's residual).
                 de.vec_add.launch(s, &mut dgpu_scratch.ffn_moe_recv, &dgpu_scratch.ffn_shared, N_EMBD)?;
+                if dlw.hot_experts.is_some() {
+                    // M56: + the dGPU's resident-expert MoE partial.
+                    de.vec_add.launch(s, &mut dgpu_scratch.ffn_moe_recv, &dgpu_scratch.ffn_moe_dgpu, N_EMBD)?;
+                }
                 de.hc_post.launch_from_split(s, &mut dgpu_scratch.residual_next, &dgpu_scratch.ffn_moe_recv, &dgpu_scratch.after_attn_hc, &dgpu_scratch.split, N_HC, N_EMBD, N_HC)?;
                 // mhc_pre_attn half — reads residual_next (= layer N+1's residual
                 // after swap), uses layer N+1's hc/norm weights.

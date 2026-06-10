@@ -260,6 +260,54 @@ extern "C" __global__ void q2_k_matvec_par_batched_BxN(
     }
 }
 
+// M56 decode het-split: q2_k_matvec_par_batched with a resident-expert
+// remap (see iq2 _hetsplit comment). mode 0 = iGPU (process remap[e] < 0,
+// weights at e); mode 1 = dGPU (process remap[e] >= 0, weights at the dense
+// remap[e] slot). `out` accumulates only this device's slots — the two
+// devices' partials add at ffn_combine.
+extern "C" __global__ void q2_k_matvec_par_batched_hetsplit(
+        float          * __restrict__ out,           // [n_rows] (this device's partial)
+        const uint8_t  * __restrict__ w_base,
+        const uint8_t  * __restrict__ xq_base,       // slot-major midq_cat
+        const int      * __restrict__ selected,      // [n_used]
+        const int      * __restrict__ remap,         // [256]
+        unsigned int     mode,
+        unsigned int     dbpe,
+        unsigned int     xq_slot_stride,
+        unsigned int     n_used,
+        unsigned int     n_rows,
+        unsigned int     n_blocks_in) {
+    const unsigned int row_in_block = threadIdx.x / 32u;
+    const unsigned int lane         = threadIdx.x & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    if (row >= n_rows) return;
+
+    const unsigned int block_lane = lane >> 2u;
+    const unsigned int sub        = lane & 3u;
+
+    float acc = 0.0f;
+    for (unsigned int s = 0; s < n_used; s++) {
+        const int sel = selected[s];
+        const int dense = remap[sel];
+        const bool ours = (mode == 0u) ? (dense < 0) : (dense >= 0);
+        if (!ours) continue;
+        const int e = (mode == 0u) ? sel : dense;
+        const uint8_t* w_expert = w_base + (uint64_t)e * (uint64_t)dbpe;
+        const uint8_t* xq_slot  = xq_base + (uint64_t)s * (uint64_t)xq_slot_stride;
+        const uint8_t* row_base = w_expert + (uint64_t)row * n_blocks_in * BLOCK_Q2_K_BYTES;
+        for (unsigned int b = block_lane; b < n_blocks_in; b += 8u) {
+            const uint8_t* w_blk = row_base + (uint64_t)b * BLOCK_Q2_K_BYTES;
+            const uint8_t* y_blk = xq_slot  + (uint64_t)b * BLOCK_Q8_K_BYTES;
+            acc += dot_block_quarter(w_blk, y_blk, sub);
+        }
+    }
+    acc = warp_sum_f32_par(acc);
+
+    if (lane == 0) {
+        out[row] = acc;   // all-skipped slots → 0.0 (still written)
+    }
+}
+
 // by_expert: invert the (B, expert) iteration of _batched_BxN.
 //
 // _batched_BxN has grid (n_rows/8, 1, B) and each WG loops over n_used

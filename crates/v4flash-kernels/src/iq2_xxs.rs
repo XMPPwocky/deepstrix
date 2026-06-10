@@ -829,6 +829,53 @@ impl Iq2XxsPairMatvec {
         ])
     }
 
+    /// **hetsplit (M56)** — decode batch kernel with a resident-expert remap:
+    /// mode 0 (iGPU) computes slots whose expert is NOT dGPU-resident
+    /// (weights indexed by expert id); mode 1 (dGPU) computes resident slots
+    /// (weights indexed by the dense remap slot in the packed hot buffers).
+    /// Skipped slots write zeros to `mid`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_batch_hetsplit(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,
+        expert_w: &DeviceBuffer<f32>,
+        selected: &DeviceBuffer<i32>,
+        remap: &DeviceBuffer<i32>,
+        mode: u32,
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+    ) -> eyre::Result<()> {
+        if n_rows % 8 != 0 {
+            return Err(eyre!(
+                "iq2_xxs hetsplit: n_rows={n_rows} must be multiple of 8"
+            ));
+        }
+        if remap.len() < 256 {
+            return Err(eyre!("iq2_xxs hetsplit: remap len {} < 256", remap.len()));
+        }
+        let function = self
+            .module
+            .get_function("iq2_xxs_pair_matvec_fused_swiglu_batch_hetsplit")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, n_used, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(),
+            expert_w.raw(), selected.raw(), remap.raw(), mode,
+            gate_bpe, up_bpe, clamp, n_rows, n_blocks
+        ])
+    }
+
     /// **staged_v2 (M51 S0)** — same geometry/semantics/arg-list as
     /// `_chunked_staged`; removes the per-member issue overhead found in the
     /// 2026-06-09 ISA audit (movrel accumulator indexing, unhoisted scale

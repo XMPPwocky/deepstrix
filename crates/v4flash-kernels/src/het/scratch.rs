@@ -128,6 +128,13 @@ pub struct DgpuScratch {
     // Mailbox for ffn_moe arriving from iGPU.
     pub ffn_moe_recv: DeviceBuffer<f32>,
 
+    // M56 het-split: dGPU-side MoE scratch for the resident hot experts.
+    // Mirrors the iGPU's d_xq_q8k / d_mid_cat / d_midq_cat / ffn_moe.
+    pub moe_xq: DeviceBuffer<u8>,
+    pub moe_mid_cat: DeviceBuffer<f32>,
+    pub moe_midq_cat: DeviceBuffer<u8>,
+    pub ffn_moe_dgpu: DeviceBuffer<f32>,
+
     // Router (lives on dGPU). Matvec writes router_logits; topk (or
     // hash router host path) writes d_selected/d_ew. Both are then
     // peer-pushed to iGPU MoE.
@@ -252,6 +259,19 @@ impl DgpuScratch {
             ffn_shared: DeviceBuffer::new(device_id, N_EMBD as usize)?,
 
             ffn_moe_recv: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            moe_xq: DeviceBuffer::new(
+                device_id,
+                (BLOCKS_Q8K_GATE_IN as usize) * BLOCK_Q8_K_BYTES,
+            )?,
+            moe_mid_cat: DeviceBuffer::new(
+                device_id,
+                (N_EXPERT_USED) * (N_FF_EXP as usize),
+            )?,
+            moe_midq_cat: DeviceBuffer::new(
+                device_id,
+                (N_EXPERT_USED) * (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES,
+            )?,
+            ffn_moe_dgpu: DeviceBuffer::new(device_id, N_EMBD as usize)?,
 
             // Router (dGPU-resident).
             router_logits: DeviceBuffer::new(device_id, N_EXPERT as usize)?,
