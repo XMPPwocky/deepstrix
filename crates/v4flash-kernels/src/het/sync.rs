@@ -60,3 +60,25 @@ pub fn peer_push_i32(
     }
     src.copy_to_peer_async(dst, src_stream)
 }
+
+pub fn peer_push_u8(
+    src: &DeviceBuffer<u8>,
+    dst: &mut DeviceBuffer<u8>,
+    src_stream: &Stream,
+) -> eyre::Result<()> {
+    if src.device_id() == dst.device_id() {
+        return Err(eyre!(
+            "peer_push: same-device copy (src={}, dst={})",
+            src.device_id(),
+            dst.device_id()
+        ));
+    }
+    if src_stream.device_id() != src.device_id() {
+        return Err(eyre!(
+            "peer_push: src_stream device {} != src buffer device {}",
+            src_stream.device_id(),
+            src.device_id()
+        ));
+    }
+    src.copy_to_peer_async(dst, src_stream)
+}

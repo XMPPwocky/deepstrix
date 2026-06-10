@@ -148,6 +148,8 @@ pub struct DgpuScratch {
     // peer-pushed to iGPU MoE.
     pub router_logits: DeviceBuffer<f32>,
     pub router_logits_host: Vec<f32>,
+    /// M60: backing allocation for d_selected + d_ew (single peer push).
+    pub sel_ew_pack: DeviceBuffer<u8>,
     pub d_selected: DeviceBuffer<i32>,
     pub d_ew: DeviceBuffer<f32>,
 
@@ -176,6 +178,13 @@ impl DgpuScratch {
     pub fn alloc(dgpu_device: Device) -> eyre::Result<Self> {
         dgpu_device.set_current()?;
         let device_id = dgpu_device.id;
+        // M60: selected+ew in ONE allocation → single 48-B peer push on the
+        // router→iGPU handoff. Layout: [0..24) i32 selected | [24..48) f32 ew.
+        let sel_ew_pack = DeviceBuffer::<u8>::new(device_id, 64)?;
+        // SAFETY: offsets 0/24 are 4-aligned; producers (router_topk) and
+        // consumers agree on the layout; pack lives in the same struct.
+        let d_selected = unsafe { sel_ew_pack.view_as::<i32>(0, N_EXPERT_USED) };
+        let d_ew = unsafe { sel_ew_pack.view_as::<f32>(24, N_EXPERT_USED) };
         Ok(Self {
             residual: DeviceBuffer::new(device_id, HC_DIM as usize)?,
             residual_next: DeviceBuffer::new(device_id, HC_DIM as usize)?,
@@ -286,8 +295,9 @@ impl DgpuScratch {
             // Router (dGPU-resident).
             router_logits: DeviceBuffer::new(device_id, N_EXPERT as usize)?,
             router_logits_host: vec![0f32; N_EXPERT as usize],
-            d_selected: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
-            d_ew: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
+            sel_ew_pack,
+            d_selected,
+            d_ew,
 
             head_flat: DeviceBuffer::new(device_id, HC_DIM as usize)?,
             head_pre: DeviceBuffer::new(device_id, N_HC as usize)?,
@@ -317,6 +327,8 @@ pub struct IgpuScratch {
     pub d_xq_q8k: DeviceBuffer<u8>,
     pub d_mid_cat: DeviceBuffer<f32>,
     pub d_midq_cat: DeviceBuffer<u8>,
+    /// M60: backing allocation for d_selected + d_ew (single peer push).
+    pub sel_ew_pack: DeviceBuffer<u8>,
     pub d_ew: DeviceBuffer<f32>,
     pub d_selected: DeviceBuffer<i32>,
     pub ffn_moe: DeviceBuffer<f32>,
@@ -326,6 +338,11 @@ impl IgpuScratch {
     pub fn alloc(igpu_device: Device) -> eyre::Result<Self> {
         igpu_device.set_current()?;
         let device_id = igpu_device.id;
+        // M60: mirror of DgpuScratch::sel_ew_pack (single 48-B peer push).
+        let sel_ew_pack = DeviceBuffer::<u8>::new(device_id, 64)?;
+        // SAFETY: see DgpuScratch counterpart.
+        let d_selected = unsafe { sel_ew_pack.view_as::<i32>(0, N_EXPERT_USED) };
+        let d_ew = unsafe { sel_ew_pack.view_as::<f32>(24, N_EXPERT_USED) };
         Ok(Self {
             ffn_input_norm_recv: DeviceBuffer::new(device_id, N_EMBD as usize)?,
 
@@ -338,8 +355,9 @@ impl IgpuScratch {
                 device_id,
                 N_EXPERT_USED * (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES,
             )?,
-            d_ew: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
-            d_selected: DeviceBuffer::new(device_id, N_EXPERT_USED)?,
+            sel_ew_pack,
+            d_ew,
+            d_selected,
             ffn_moe: DeviceBuffer::new(device_id, N_EMBD as usize)?,
         })
     }

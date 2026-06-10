@@ -105,6 +105,32 @@ impl<T> DeviceBuffer<T> {
         self.slice_view(offset, len)
     }
 
+    /// Reinterpret a byte sub-range of this buffer as a typed non-owning
+    /// view (`DeviceBuffer<U>` with `is_view = true`). Used to pack
+    /// heterogeneously-typed per-layer transfer payloads into one
+    /// allocation so a single peer copy moves them together.
+    ///
+    /// # Safety
+    /// Caller must ensure `byte_offset` is aligned for `U` and that the
+    /// producers/consumers agree on the layout. The parent allocation must
+    /// outlive the view.
+    pub unsafe fn view_as<U>(&self, byte_offset: usize, len: usize) -> DeviceBuffer<U> {
+        let need = byte_offset + len * std::mem::size_of::<U>();
+        assert!(
+            need <= self.byte_len(),
+            "view_as out of range: need {need} bytes, have {}",
+            self.byte_len()
+        );
+        let raw = unsafe { (self.raw as *mut u8).add(byte_offset) as sys::hipDeviceptr_t };
+        DeviceBuffer {
+            raw,
+            len,
+            device_id: self.device_id,
+            is_view: true,
+            _marker: PhantomData,
+        }
+    }
+
     pub fn raw(&self) -> sys::hipDeviceptr_t {
         self.raw
     }

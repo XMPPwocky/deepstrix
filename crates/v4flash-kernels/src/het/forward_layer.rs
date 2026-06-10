@@ -1291,18 +1291,13 @@ impl HeterogeneousEngine {
         let _t_peer_sel = de.events.stage("dgpu.peer_push_selected", &de.xfer)?;
         let _s_peer_sel = debug_span!("peer_push_selected").entered();
         {
-            let _t = de.events.stage("k.peer_push_selected.d_selected", &de.xfer)?;
-            peer_push_i32(
-                &dgpu_scratch.d_selected,
-                &mut igpu_scratch.d_selected,
-                &de.xfer,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.peer_push_selected.d_ew", &de.xfer)?;
-            peer_push_f32(
-                &dgpu_scratch.d_ew,
-                &mut igpu_scratch.d_ew,
+            // M60: selected + ew share one backing allocation (see
+            // DgpuScratch::sel_ew_pack) — ONE 48-byte peer push instead of
+            // two copies on the router→iGPU handoff path.
+            let _t = de.events.stage("k.peer_push_selected.pack", &de.xfer)?;
+            super::sync::peer_push_u8(
+                &dgpu_scratch.sel_ew_pack,
+                &mut igpu_scratch.sel_ew_pack,
                 &de.xfer,
             )?;
         }
