@@ -848,7 +848,14 @@ impl HeterogeneousEngine {
             let cs = ls.compressor.as_ref();
             let n_comp_full = cs.map(|c| c.n_comp).unwrap_or(0);
             let ics = ls.indexer_compressor.as_ref();
-            let n_index_comp = ics.map(|c| c.n_comp).unwrap_or(0);
+            // Clamp to the scratch stride (indexer_scores [MAX_KEYS],
+            // indexer_allowed_bits [ceil(MAX_KEYS/32)]). Unreachable in
+            // production (ctx ≤ 4 × MAX_KEYS); FAKE_POS benches decoding
+            // past the cap used to overrun the bitmap by one word.
+            let n_index_comp = ics
+                .map(|c| c.n_comp)
+                .unwrap_or(0)
+                .min(crate::attention::ATTN_MIXED_MAX_KEYS);
             let use_sparse = ratio == 4 && n_index_comp > INDEXER_TOP_K;
             let env_disable_sparse = std::env::var("DECODE_INDEXER")
                 .map(|v| v == "off" || v == "0").unwrap_or(false);

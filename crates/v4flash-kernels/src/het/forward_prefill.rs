@@ -1293,6 +1293,14 @@ impl HeterogeneousEngine {
                 n_comp_after.push(0);
             }
         }
+        // Clamp to the per-token stride of every comp-indexed scratch
+        // buffer (indexer_scores, attn_comp_allowed_bits, ...). Production
+        // can't exceed it (ctx ≤ 4 × ATTN_MIXED_MAX_KEYS by config), but
+        // FAKE_PREFILL_POS benches stamping pos at the cap and decoding
+        // past it used to overrun the bitmap by one word (the 98304 trap).
+        for v in n_comp_after.iter_mut() {
+            *v = (*v).min(ATTN_MIXED_MAX_KEYS);
+        }
 
         // ========================================================
         // CSA indexer compressor — second compressor at head_dim=128,
