@@ -63,3 +63,19 @@ extern "C" __global__ void kv_cache_append_batched(
         (_Float16)kv_new[(unsigned long long)b * head_dim + d];
 }
 
+
+// M59: device-slot variant of the monotonic append — `slot` comes from a
+// device u32 (one hipStreamWriteValue32 per token serves all layers, since
+// every layer appends exactly once per token and the counters evolve in
+// lockstep). No evict path: the M55 monotonic scheme guarantees
+// slot < capacity; the host still owns raw_off/window bookkeeping.
+extern "C" __global__ void kv_cache_append_slotdev(
+        _Float16     * __restrict__ cache,         // [capacity * head_dim] (f16)
+        const float  * __restrict__ kv_new,        // [head_dim]
+        const unsigned int * __restrict__ slot_dev,
+        unsigned int   head_dim) {
+    const unsigned int d = threadIdx.x;
+    if (d >= head_dim) return;
+    const unsigned int slot = *slot_dev;
+    cache[(unsigned long long)slot * head_dim + d] = (_Float16)kv_new[d];
+}

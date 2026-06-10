@@ -86,6 +86,28 @@ impl KvCacheAppend {
     /// prefill chunk can be appended without touching the prior SWA window).
     /// Post-chunk SWA-window restoration is the caller's job — see the
     /// eviction-down pass in `forward_prefill::forward_layer_batch_v2`.
+    /// M59: monotonic append with the slot read from a device u32 —
+    /// graph-capturable (the engine writes slot once per token; all layers
+    /// share it since their counters evolve in lockstep).
+    pub fn launch_slotdev(
+        &self,
+        stream: &Stream,
+        cache: &mut DeviceBuffer<u16>,
+        kv_new: &DeviceBuffer<f32>,
+        slot_dev: &DeviceBuffer<u32>,
+        head_dim: u32,
+    ) -> eyre::Result<()> {
+        let function = self.module.get_function("kv_cache_append_slotdev")?;
+        let cfg = LaunchConfig {
+            grid: (1, 1, 1),
+            block: (head_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            cache.raw(), kv_new.raw(), slot_dev.raw(), head_dim
+        ])
+    }
+
     pub fn launch_batched(
         &self,
         stream: &Stream,

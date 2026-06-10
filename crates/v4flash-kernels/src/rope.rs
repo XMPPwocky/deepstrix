@@ -87,6 +87,93 @@ impl RopeTail {
         self.launch(stream, x, n_head, head_dim, n_rot, pos, params, false)
     }
 
+    /// M59: forward rope with `pos` read from a device u32 (graph-capturable;
+    /// the engine writes the value once per token via hipStreamWriteValue32).
+    /// Math identical to `launch_forward`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_forward_pdev(
+        &self,
+        stream: &Stream,
+        x: &mut DeviceBuffer<f32>,
+        pos_dev: &DeviceBuffer<u32>,
+        n_head: u32,
+        head_dim: u32,
+        n_rot: u32,
+        params: &RopeParams,
+    ) -> eyre::Result<()> {
+        self.launch_pdev(stream, x, pos_dev, n_head, head_dim, n_rot, params, false)
+    }
+
+    /// M59: inverse rope, device-pos. See `launch_forward_pdev`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_inverse_pdev(
+        &self,
+        stream: &Stream,
+        x: &mut DeviceBuffer<f32>,
+        pos_dev: &DeviceBuffer<u32>,
+        n_head: u32,
+        head_dim: u32,
+        n_rot: u32,
+        params: &RopeParams,
+    ) -> eyre::Result<()> {
+        self.launch_pdev(stream, x, pos_dev, n_head, head_dim, n_rot, params, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_pdev(
+        &self,
+        stream: &Stream,
+        x: &mut DeviceBuffer<f32>,
+        pos_dev: &DeviceBuffer<u32>,
+        n_head: u32,
+        head_dim: u32,
+        n_rot: u32,
+        params: &RopeParams,
+        inverse: bool,
+    ) -> eyre::Result<()> {
+        if n_rot % 2 != 0 {
+            return Err(eyre!("rope_tail_pdev: n_rot={n_rot} must be even"));
+        }
+        let needed = (n_head as usize) * (head_dim as usize);
+        if x.len() < needed {
+            return Err(eyre!(
+                "rope_tail_pdev: x has {} elements, need {}",
+                x.len(),
+                needed
+            ));
+        }
+        let theta_scale = params.freq_base.powf(-2.0 / n_rot as f32);
+        let mscale_eff =
+            if params.ext_factor != 0.0 && params.freq_scale > 0.0 {
+                params.attn_factor * (1.0 + 0.1 * (1.0 / params.freq_scale).ln())
+            } else {
+                params.attn_factor
+            };
+        let (corr_low, corr_high) = if params.ext_factor != 0.0 {
+            corr_dims(
+                n_rot,
+                params.n_ctx_orig,
+                params.freq_base,
+                params.beta_fast,
+                params.beta_slow,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let function = self.module.get_function("rope_tail_pdev")?;
+        let inverse_i: i32 = if inverse { 1 } else { 0 };
+        let cfg = LaunchConfig {
+            grid: (n_head, 1, 1),
+            block: (n_rot / 2, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            x.raw(), pos_dev.raw(), n_head, head_dim, n_rot,
+            theta_scale, params.freq_scale, params.ext_factor,
+            mscale_eff, corr_low, corr_high, inverse_i
+        ])
+    }
+
     pub fn launch_inverse(
         &self,
         stream: &Stream,

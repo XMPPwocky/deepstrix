@@ -359,6 +359,22 @@ impl HeterogeneousEngine {
         // naming. Per-layer post-output dumps land at indices 01..43.
         maybe_dump_residual(0, &dgpu_scratch.residual)?;
 
+        // M59: publish the per-token device scalars consumed by the merged
+        // qkv_chain graphs (rope pos + monotonic KV append slot; the slot is
+        // identical across layers — counters evolve in lockstep). One pair
+        // of 4-byte stream writes per token, ordered before layer 0 on the
+        // dGPU compute stream.
+        {
+            let slot = state.layers[0].raw_off + state.layers[0].n_raw;
+            let pos_ptr = dgpu_scratch.pos_dev.raw() as *mut u32;
+            let slot_ptr = dgpu_scratch.kv_slot_dev.raw() as *mut u32;
+            // SAFETY: scratch buffers outlive the token; writes are stream-
+            // ordered on de.compute ahead of all consumers.
+            unsafe {
+                self.dgpu.compute.write_value32(pos_ptr, pos)?;
+                self.dgpu.compute.write_value32(slot_ptr, slot)?;
+            }
+        }
         let token_start = std::time::Instant::now();
         let dump_subtensor_layers: Vec<usize> = subtensor_dump_spec()
             .as_ref()

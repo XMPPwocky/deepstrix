@@ -379,102 +379,136 @@ impl HeterogeneousEngine {
         // direct launch.
         let _t_q = de.events.stage("dgpu.q_chain", &de.compute)?;
         let _s_q = debug_span!("q_chain").entered();
+        // M59: one merged per-layer graph for the whole q+kv chain (13
+        // kernels incl. device-pos ropes + device-slot append) — the
+        // ungraphed segments paid ~4-6 µs of launch serialization each.
+        // DECODE_QKV_GRAPH=0 rolls back to the split version.
+        static QKV_GRAPH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("DECODE_QKV_GRAPH").map(|v| v != "0").unwrap_or(true)
+        });
+        if *QKV_GRAPH && !standalone_graphs {
+            self.dgpu_graphs.run("qkv_chain", layer as u32, &de.compute, |s| {
+                de.q8.quantize_input(s, &mut dgpu_scratch.xq_n_embd, &mut dgpu_scratch.xscale_n_embd, &dgpu_scratch.attn_input_norm, N_EMBD)?;
+                de.q8.matvec(s, &mut dgpu_scratch.qr, &dlw.attn_q_a.buffer, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_LORA_Q, N_EMBD)?;
+                de.rms_w.launch_weighted_quantize_q8(s, &mut dgpu_scratch.qr_normed, &mut dgpu_scratch.qr_xq, &mut dgpu_scratch.qr_xscale, &dgpu_scratch.qr, &dlw.q_a_norm, N_LORA_Q, RMS_EPS)?;
+                de.q8.matvec(s, &mut dgpu_scratch.q, &dlw.attn_q_b.buffer, &dgpu_scratch.qr_xq, &dgpu_scratch.qr_xscale, Q_FLAT, N_LORA_Q)?;
+                de.rms_nw.launch(s, &mut dgpu_scratch.q_normed, &dgpu_scratch.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
+                de.rope.launch_forward_pdev(s, &mut dgpu_scratch.q_normed, &dgpu_scratch.pos_dev, N_HEAD, N_HEAD_DIM, N_ROT, &dlw.rope_params)?;
+                de.q8.matvec(s, &mut dgpu_scratch.kv_raw, &dlw.attn_kv.buffer, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_HEAD_DIM, N_EMBD)?;
+                de.rms_w.launch_weighted(s, &mut dgpu_scratch.kv_normed, &dgpu_scratch.kv_raw, &dlw.kv_a_norm, N_HEAD_DIM, RMS_EPS)?;
+                de.rope.launch_forward_pdev(s, &mut dgpu_scratch.kv_normed, &dgpu_scratch.pos_dev, 1, N_HEAD_DIM, N_ROT, &dlw.rope_params)?;
+                de.fp8.launch(s, &mut dgpu_scratch.kv_normed, N_HEAD_DIM - N_ROT)?;
+                de.f16rt.launch(s, &mut dgpu_scratch.kv_normed, N_HEAD_DIM)?;
+                de.kv_append.launch_slotdev(s, &mut ls.kv_cache, &dgpu_scratch.kv_normed, &dgpu_scratch.kv_slot_dev, N_HEAD_DIM)?;
+                Ok(())
+            })?;
+            debug_assert!(
+                ((ls.raw_off + ls.n_raw) as usize) < super::state::KV_CACHE_ROWS,
+                "kv monotonic append OOB (qkv_chain): raw_off={} n_raw={}",
+                ls.raw_off,
+                ls.n_raw
+            );
+            drop(_s_q);
+            _t_q.end()?;
+        } else {
         self.dgpu_graphs.run("q_chain_pre_rope", layer as u32, &de.compute, |s| {
-            de.q8.quantize_input(s, &mut dgpu_scratch.xq_n_embd, &mut dgpu_scratch.xscale_n_embd, &dgpu_scratch.attn_input_norm, N_EMBD)?;
-            de.q8.matvec(s, &mut dgpu_scratch.qr, &dlw.attn_q_a.buffer, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_LORA_Q, N_EMBD)?;
-            // M55: fused rms_w + q8 quantize (was two single-WG kernels);
-            // qr_normed is still written for the CSA indexer.
-            de.rms_w.launch_weighted_quantize_q8(s, &mut dgpu_scratch.qr_normed, &mut dgpu_scratch.qr_xq, &mut dgpu_scratch.qr_xscale, &dgpu_scratch.qr, &dlw.q_a_norm, N_LORA_Q, RMS_EPS)?;
-            de.q8.matvec(s, &mut dgpu_scratch.q, &dlw.attn_q_b.buffer, &dgpu_scratch.qr_xq, &dgpu_scratch.qr_xscale, Q_FLAT, N_LORA_Q)?;
-            de.rms_nw.launch(s, &mut dgpu_scratch.q_normed, &dgpu_scratch.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
-            Ok(())
-        })?;
-        de.rope.launch_forward(
-            &de.compute,
-            &mut dgpu_scratch.q_normed,
-            N_HEAD,
-            N_HEAD_DIM,
-            N_ROT,
-            pos,
-            &dlw.rope_params,
-        )?;
-        drop(_s_q);
-        _t_q.end()?;
-
-        // ============================================================
-        // dGPU: KV chain → kv_post_rope → KV cache push
-        // ============================================================
-        let _t_kv = de.events.stage("dgpu.kv_chain", &de.compute)?;
-        let _s_kv = debug_span!("kv_chain").entered();
-        {
-            let _t = de.events.stage("k.kv_chain.matvec", &de.compute)?;
-            de.q8.matvec(
-                &de.compute,
-                &mut dgpu_scratch.kv_raw,
-                &dlw.attn_kv.buffer,
-                &dgpu_scratch.xq_n_embd,
-                &dgpu_scratch.xscale_n_embd,
-                N_HEAD_DIM,
-                N_EMBD,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.kv_chain.rms_w", &de.compute)?;
-            de.rms_w.launch_weighted(
-                &de.compute,
-                &mut dgpu_scratch.kv_normed,
-                &dgpu_scratch.kv_raw,
-                &dlw.kv_a_norm,
-                N_HEAD_DIM,
-                RMS_EPS,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.kv_chain.rope", &de.compute)?;
+                de.q8.quantize_input(s, &mut dgpu_scratch.xq_n_embd, &mut dgpu_scratch.xscale_n_embd, &dgpu_scratch.attn_input_norm, N_EMBD)?;
+                de.q8.matvec(s, &mut dgpu_scratch.qr, &dlw.attn_q_a.buffer, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_LORA_Q, N_EMBD)?;
+                // M55: fused rms_w + q8 quantize (was two single-WG kernels);
+                // qr_normed is still written for the CSA indexer.
+                de.rms_w.launch_weighted_quantize_q8(s, &mut dgpu_scratch.qr_normed, &mut dgpu_scratch.qr_xq, &mut dgpu_scratch.qr_xscale, &dgpu_scratch.qr, &dlw.q_a_norm, N_LORA_Q, RMS_EPS)?;
+                de.q8.matvec(s, &mut dgpu_scratch.q, &dlw.attn_q_b.buffer, &dgpu_scratch.qr_xq, &dgpu_scratch.qr_xscale, Q_FLAT, N_LORA_Q)?;
+                de.rms_nw.launch(s, &mut dgpu_scratch.q_normed, &dgpu_scratch.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
+                Ok(())
+            })?;
             de.rope.launch_forward(
                 &de.compute,
-                &mut dgpu_scratch.kv_normed,
-                1,
+                &mut dgpu_scratch.q_normed,
+                N_HEAD,
                 N_HEAD_DIM,
                 N_ROT,
                 pos,
                 &dlw.rope_params,
             )?;
-        }
-        {
-            let _t = de.events.stage("k.kv_chain.fp8", &de.compute)?;
-            de.fp8
-                .launch(&de.compute, &mut dgpu_scratch.kv_normed, N_HEAD_DIM - N_ROT)?;
-        }
-        {
-            let _t = de.events.stage("k.kv_chain.f16rt", &de.compute)?;
-            de.f16rt
-                .launch(&de.compute, &mut dgpu_scratch.kv_normed, N_HEAD_DIM)?;
-        }
-        {
-            // M55: MONOTONIC append at slot raw_off + n_raw — never the
-            // kernel's evict-slide path (which moved 127 rows through 254
-            // block-wide barriers per layer per token, ~25 µs each).
-            // Passing the cache CAPACITY as the kernel's `swa_window`
-            // guarantees the not-full branch. The window advances via
-            // raw_off; readers below take a slice_view at raw_off.
-            let _t = de.events.stage("k.kv_chain.kv_append", &de.compute)?;
-            let slot = ls.raw_off + ls.n_raw;
-            debug_assert!(
-                (slot as usize) < super::state::KV_CACHE_ROWS,
-                "kv monotonic append OOB: raw_off={} n_raw={}",
-                ls.raw_off,
-                ls.n_raw
-            );
-            de.kv_append.launch(
-                &de.compute,
-                &mut ls.kv_cache,
-                &dgpu_scratch.kv_normed,
-                slot,
-                super::state::KV_CACHE_ROWS as u32,
-                N_HEAD_DIM,
-            )?;
-        }
+            drop(_s_q);
+            _t_q.end()?;
+
+            // ============================================================
+            // dGPU: KV chain → kv_post_rope → KV cache push
+            // ============================================================
+            let _t_kv = de.events.stage("dgpu.kv_chain", &de.compute)?;
+            let _s_kv = debug_span!("kv_chain").entered();
+            {
+                let _t = de.events.stage("k.kv_chain.matvec", &de.compute)?;
+                de.q8.matvec(
+                    &de.compute,
+                    &mut dgpu_scratch.kv_raw,
+                    &dlw.attn_kv.buffer,
+                    &dgpu_scratch.xq_n_embd,
+                    &dgpu_scratch.xscale_n_embd,
+                    N_HEAD_DIM,
+                    N_EMBD,
+                )?;
+            }
+            {
+                let _t = de.events.stage("k.kv_chain.rms_w", &de.compute)?;
+                de.rms_w.launch_weighted(
+                    &de.compute,
+                    &mut dgpu_scratch.kv_normed,
+                    &dgpu_scratch.kv_raw,
+                    &dlw.kv_a_norm,
+                    N_HEAD_DIM,
+                    RMS_EPS,
+                )?;
+            }
+            {
+                let _t = de.events.stage("k.kv_chain.rope", &de.compute)?;
+                de.rope.launch_forward(
+                    &de.compute,
+                    &mut dgpu_scratch.kv_normed,
+                    1,
+                    N_HEAD_DIM,
+                    N_ROT,
+                    pos,
+                    &dlw.rope_params,
+                )?;
+            }
+            {
+                let _t = de.events.stage("k.kv_chain.fp8", &de.compute)?;
+                de.fp8
+                    .launch(&de.compute, &mut dgpu_scratch.kv_normed, N_HEAD_DIM - N_ROT)?;
+            }
+            {
+                let _t = de.events.stage("k.kv_chain.f16rt", &de.compute)?;
+                de.f16rt
+                    .launch(&de.compute, &mut dgpu_scratch.kv_normed, N_HEAD_DIM)?;
+            }
+            {
+                // M55: MONOTONIC append at slot raw_off + n_raw — never the
+                // kernel's evict-slide path (which moved 127 rows through 254
+                // block-wide barriers per layer per token, ~25 µs each).
+                // Passing the cache CAPACITY as the kernel's `swa_window`
+                // guarantees the not-full branch. The window advances via
+                // raw_off; readers below take a slice_view at raw_off.
+                let _t = de.events.stage("k.kv_chain.kv_append", &de.compute)?;
+                let slot = ls.raw_off + ls.n_raw;
+                debug_assert!(
+                    (slot as usize) < super::state::KV_CACHE_ROWS,
+                    "kv monotonic append OOB: raw_off={} n_raw={}",
+                    ls.raw_off,
+                    ls.n_raw
+                );
+                de.kv_append.launch(
+                    &de.compute,
+                    &mut ls.kv_cache,
+                    &dgpu_scratch.kv_normed,
+                    slot,
+                    super::state::KV_CACHE_ROWS as u32,
+                    N_HEAD_DIM,
+                )?;
+            }
+        } // !QKV_GRAPH
+
         if ls.n_raw < SWA_WINDOW {
             ls.n_raw += 1;
         } else {
@@ -499,8 +533,8 @@ impl HeterogeneousEngine {
             }
             ls.raw_off = 0;
         }
-        drop(_s_kv);
-        _t_kv.end()?;
+        // (_t_kv/_s_kv guards, when the split path created them, end at
+        // their own scope close inside the else-branch above.)
 
         // ============================================================
         // dGPU: Compressor (ratio>0 layers) — produces comp_kv rows on

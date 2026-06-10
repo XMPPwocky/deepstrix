@@ -135,6 +135,14 @@ pub struct DgpuScratch {
     pub moe_midq_cat: DeviceBuffer<u8>,
     pub ffn_moe_dgpu: DeviceBuffer<f32>,
 
+    // M59: device-resident per-token scalars (written once per token via
+    // hipStreamWriteValue32) so rope/append can live inside per-layer
+    // graphs: current position, and the monotonic KV append slot
+    // (= raw_off + n_raw, identical across layers — counters evolve in
+    // lockstep).
+    pub pos_dev: DeviceBuffer<u32>,
+    pub kv_slot_dev: DeviceBuffer<u32>,
+
     // Router (lives on dGPU). Matvec writes router_logits; topk (or
     // hash router host path) writes d_selected/d_ew. Both are then
     // peer-pushed to iGPU MoE.
@@ -272,6 +280,8 @@ impl DgpuScratch {
                 (N_EXPERT_USED) * (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES,
             )?,
             ffn_moe_dgpu: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            pos_dev: DeviceBuffer::new(device_id, 1)?,
+            kv_slot_dev: DeviceBuffer::new(device_id, 1)?,
 
             // Router (dGPU-resident).
             router_logits: DeviceBuffer::new(device_id, N_EXPERT as usize)?,

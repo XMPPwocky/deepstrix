@@ -113,3 +113,51 @@ extern "C" __global__ void rope_tail_batched(
     tail[i + 0] = x0 * c - x1 * s;
     tail[i + 1] = x0 * s + x1 * c;
 }
+
+// M59: device-pos variant — identical math, but `pos` is read from a device
+// u32 (written once per token via hipStreamWriteValue32). Removes the only
+// host-side argument that kept the decode q/kv rope launches out of the
+// per-layer HIP graphs.
+extern "C" __global__ void rope_tail_pdev(
+        float        * x,
+        const unsigned int * __restrict__ pos_dev,
+        unsigned int   n_head,
+        unsigned int   head_dim,
+        unsigned int   n_rot,
+        float          theta_scale,
+        float          freq_scale,
+        float          ext_factor,
+        float          mscale_eff,
+        float          corr_low,
+        float          corr_high,
+        int            inverse) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int lane = threadIdx.x;
+    if (head >= n_head) return;
+    if (2u * lane >= n_rot) return;
+    const unsigned int pos = *pos_dev;
+
+    const unsigned int n_nope = head_dim - n_rot;
+    const unsigned int i = 2u * lane;
+
+    // EXACT copy of rope_tail's math (bit-identical rotation).
+    const float theta_extrap = (float)pos * powf(theta_scale, (float)lane);
+    const float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        const float y = ((float)lane - corr_low) / fmaxf(0.001f, corr_high - corr_low);
+        const float ramp = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+        const float ramp_mix = ramp * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+    }
+
+    const float sin_sign = (inverse != 0) ? -1.0f : 1.0f;
+    const float c = cosf(theta) * mscale_eff;
+    const float s = sin_sign * sinf(theta) * mscale_eff;
+
+    float *tail = x + (unsigned long long)head * (unsigned long long)head_dim + n_nope;
+    const float x0 = tail[i + 0];
+    const float x1 = tail[i + 1];
+    tail[i + 0] = x0 * c - x1 * s;
+    tail[i + 1] = x0 * s + x1 * c;
+}
