@@ -197,3 +197,28 @@ is from DECODE token stats). Future levers:
   re-rank); could also bump per-layer K if the 128K-KV margin allows.
 - raise DGPU_HOT_CAP_PREFILL above 4 only if last_only oracle margin is
   re-examined (association then diverges from decode again).
+
+# M62 — expert-selection stats: device collection → sidecar aggregate → load-time placement
+
+**Hypothesis.** M61's hot set is ranked by decode-token stats
+(reference/decode_hot_experts.txt, collected with sync-heavy diagnostics).
+Prefill routes flatter; placement ranked on real prefill+decode volume should
+raise the hot member share (~10-12% today) and with it the M61 win.
+
+**Design** (user-approved plan, 2026-06-10):
+- `expert_sel_count` kernel: counts[layer*256+sel] atomicAdd, launched on
+  de.compute after router top-k in BOTH paths (dGPU holds d_selected
+  natively). Two persistent u32[N_LAYER×256] banks (prefill/decode) on dGPU,
+  88 KB each; no hot-path readbacks. DEEPSTRIX_SEL_STATS=0 opts out.
+- Persistence: NOT in KV snapshots (global workload aggregate vs per-prefix
+  LRU-evicted state). Sidecar expert_stats.json in the deepstrix cache root;
+  flushed at the existing snapshot-save points (turn end / shutdown);
+  halving decay past ~10M tokens/bank; model-fingerprint guarded.
+- Placement: DGPU_HOT_EXPERTS_FILE may be the JSON; score =
+  (1-α)·prefill_freq + α·decode_freq (DGPU_HOT_ALPHA, default 0.5) into the
+  EXISTING global-greedy budget. Raw counts stored, placement computed at
+  load → adaptive refresh stays open.
+
+**Gates.** (1) device histogram == PrefillStats pick_counts exactly;
+(2) prefill A/B stats on/off ≤0.5%; (3) server flush e2e + restart with JSON
+placement: 4 oracles green + placement A/B bench (old txt vs JSON).
