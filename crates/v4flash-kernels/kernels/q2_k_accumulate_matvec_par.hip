@@ -272,6 +272,7 @@ extern "C" __global__ void q2_k_matvec_par_batched_hetsplit(
         const int      * __restrict__ selected,      // [n_used]
         const int      * __restrict__ remap,         // [256]
         unsigned int     mode,
+        unsigned int     dgpu_cap,
         unsigned int     dbpe,
         unsigned int     xq_slot_stride,
         unsigned int     n_used,
@@ -286,10 +287,14 @@ extern "C" __global__ void q2_k_matvec_par_batched_hetsplit(
     const unsigned int sub        = lane & 3u;
 
     float acc = 0.0f;
+    unsigned int res_rank = 0;
     for (unsigned int s = 0; s < n_used; s++) {
         const int sel = selected[s];
         const int dense = remap[sel];
-        const bool ours = (mode == 0u) ? (dense < 0) : (dense >= 0);
+        const bool resident = dense >= 0;
+        const bool dgpu_takes = resident && (res_rank < dgpu_cap);
+        if (resident) res_rank++;
+        const bool ours = (mode == 0u) ? !dgpu_takes : dgpu_takes;
         if (!ours) continue;
         const int e = (mode == 0u) ? sel : dense;
         const uint8_t* w_expert = w_base + (uint64_t)e * (uint64_t)dbpe;

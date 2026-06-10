@@ -208,6 +208,7 @@ impl Q2KAccumulateMatvec {
         selected: &DeviceBuffer<i32>,
         remap: &DeviceBuffer<i32>,
         mode: u32,
+        dgpu_cap: u32,
         dbpe: u32,
         xq_slot_stride: u32,
         n_used: u32,
@@ -230,7 +231,7 @@ impl Q2KAccumulateMatvec {
             shared_mem_bytes: 0,
         };
         launch_kernel!(function, cfg, stream, [
-            out.raw(), w_base.raw(), xq_base.raw(), selected.raw(), remap.raw(), mode,
+            out.raw(), w_base.raw(), xq_base.raw(), selected.raw(), remap.raw(), mode, dgpu_cap,
             dbpe, xq_slot_stride, n_used, n_rows, n_blocks_in
         ])
     }

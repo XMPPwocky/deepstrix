@@ -524,6 +524,7 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_batch_hetsplit(
         const int    * __restrict__ selected,      // [n_used]
         const int    * __restrict__ remap,         // [256]; -1 = not dGPU-resident
         unsigned int    mode,                      // 0 = iGPU share, 1 = dGPU share
+        unsigned int    dgpu_cap,                  // max resident slots dGPU takes (overflow → iGPU)
         unsigned int    gate_bpe,
         unsigned int    up_bpe,
         float           clamp,
@@ -541,7 +542,15 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_batch_hetsplit(
     const unsigned int lane         = tid & 31u;
     const unsigned int row          = blockIdx.x * 8u + row_in_block;
 
-    const bool ours = (mode == 0u) ? (dense < 0) : (dense >= 0);
+    // M58.3 load balance: the dGPU takes resident slots in SLOT ORDER up to
+    // dgpu_cap; overflow goes back to the (otherwise idle) iGPU. Both
+    // devices compute the same deterministic rank, so the split is exact.
+    unsigned int res_rank = 0;
+    for (unsigned int t2 = 0; t2 < slot; t2++) {
+        res_rank += (remap[selected[t2]] >= 0) ? 1u : 0u;
+    }
+    const bool dgpu_takes = (dense >= 0) && (res_rank < dgpu_cap);
+    const bool ours = (mode == 0u) ? !dgpu_takes : dgpu_takes;
     if (!ours) {
         // Zero our slice of mid and bail before any weight traffic.
         if (row < n_rows && lane == 0) {

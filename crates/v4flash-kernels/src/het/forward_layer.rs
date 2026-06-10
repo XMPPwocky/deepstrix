@@ -1304,6 +1304,13 @@ impl HeterogeneousEngine {
         // devices hold, so the q8k quantization is bit-identical.
         if parallel {
             if let Some(hot) = dlw.hot_experts.as_ref() {
+        // M58.3: the dGPU takes at most DGPU_HOT_CAP resident slots per
+        // token (default 4 ≈ the leg-balance point: misses×32.5 µs vs
+        // hits×12.3 µs + shared ~46 µs cross near h*≈3.3-4); overflow goes
+        // back to the otherwise-idle iGPU.
+        static HOT_CAP: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+            std::env::var("DGPU_HOT_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(4)
+        });
                 let mid_blocks_bytes_d = (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
                 let hot_gbpe = ilw.routed.gate_bytes_per_expert;
                 let hot_dbpe = ilw.routed.down_bytes_per_expert;
@@ -1314,7 +1321,7 @@ impl HeterogeneousEngine {
                         s, &mut dgpu_scratch.moe_mid_cat,
                         &hot.gate, &hot.up,
                         &dgpu_scratch.moe_xq, &dgpu_scratch.d_ew, &dgpu_scratch.d_selected,
-                        &hot.remap, /*mode=*/1,
+                        &hot.remap, /*mode=*/1, *HOT_CAP,
                         hot_gbpe as u32, hot_gbpe as u32,
                         N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
                     )?;
@@ -1322,7 +1329,7 @@ impl HeterogeneousEngine {
                     de.q2k.launch_batched_hetsplit(
                         s, &mut dgpu_scratch.ffn_moe_dgpu,
                         &hot.down, &dgpu_scratch.moe_midq_cat, &dgpu_scratch.d_selected,
-                        &hot.remap, /*mode=*/1,
+                        &hot.remap, /*mode=*/1, *HOT_CAP,
                         hot_dbpe as u32, mid_blocks_bytes_d as u32,
                         N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN,
                     )?;
@@ -1382,10 +1389,14 @@ impl HeterogeneousEngine {
         self.igpu_graphs.run("routed_moe", layer as u32, &ie.compute, |s| {
             ie.q8k.launch(s, &mut igpu_scratch.d_xq_q8k, &igpu_scratch.ffn_input_norm_recv, BLOCKS_Q8K_GATE_IN)?;
             if let Some(remap) = ilw.hot_remap.as_ref() {
-                // M56: skip dGPU-resident slots (the dGPU computes those).
-                ie.iq2.launch_fused_swiglu_batch_hetsplit(s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, remap, /*mode=*/0, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
+                // M56: skip dGPU-resident slots (the dGPU computes those,
+                // up to DGPU_HOT_CAP — overflow comes back here).
+                static HOT_CAP_I: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+                    std::env::var("DGPU_HOT_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(4)
+                });
+                ie.iq2.launch_fused_swiglu_batch_hetsplit(s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, remap, /*mode=*/0, *HOT_CAP_I, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
                 ie.q8k.launch(s, &mut igpu_scratch.d_midq_cat, &igpu_scratch.d_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
-                ie.q2k.launch_batched_hetsplit(s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, remap, /*mode=*/0, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
+                ie.q2k.launch_batched_hetsplit(s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, remap, /*mode=*/0, *HOT_CAP_I, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
             } else {
                 ie.iq2.launch_fused_swiglu_batch(s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
                 ie.q8k.launch(s, &mut igpu_scratch.d_midq_cat, &igpu_scratch.d_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;

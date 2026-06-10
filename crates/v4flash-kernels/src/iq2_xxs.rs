@@ -846,6 +846,7 @@ impl Iq2XxsPairMatvec {
         selected: &DeviceBuffer<i32>,
         remap: &DeviceBuffer<i32>,
         mode: u32,
+        dgpu_cap: u32,
         gate_bpe: u32,
         up_bpe: u32,
         n_used: u32,
@@ -871,7 +872,7 @@ impl Iq2XxsPairMatvec {
         };
         launch_kernel!(function, cfg, stream, [
             mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(),
-            expert_w.raw(), selected.raw(), remap.raw(), mode,
+            expert_w.raw(), selected.raw(), remap.raw(), mode, dgpu_cap,
             gate_bpe, up_bpe, clamp, n_rows, n_blocks
         ])
     }
