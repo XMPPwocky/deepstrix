@@ -166,6 +166,60 @@ pub struct Fp8E4m3fnQuantize {
 }
 
 impl Fp8E4m3fnQuantize {
+    /// M59: fused decode KV tail — rms_w + rope(last n_rot) + fp8(first
+    /// n_nope) + f16 roundtrip + cache append in ONE workgroup. pos/slot
+    /// from device u32s (graph-capturable). See kv_post_fused kernel doc.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_kv_post_fused(
+        &self,
+        stream: &Stream,
+        kv_normed: &mut DeviceBuffer<f32>,
+        cache: &mut DeviceBuffer<u16>,
+        kv_raw: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<f32>,
+        pos_dev: &DeviceBuffer<u32>,
+        slot_dev: &DeviceBuffer<u32>,
+        head_dim: u32,
+        n_rot: u32,
+        rms_eps: f32,
+        params: &crate::RopeParams,
+    ) -> eyre::Result<()> {
+        if head_dim != 512 || n_rot % 2 != 0 {
+            return Err(eyre!(
+                "kv_post_fused: head_dim={head_dim} (need 512), n_rot={n_rot}"
+            ));
+        }
+        let theta_scale = params.freq_base.powf(-2.0 / n_rot as f32);
+        let mscale_eff = if params.ext_factor != 0.0 && params.freq_scale > 0.0 {
+            params.attn_factor * (1.0 + 0.1 * (1.0 / params.freq_scale).ln())
+        } else {
+            params.attn_factor
+        };
+        let (corr_low, corr_high) = if params.ext_factor != 0.0 {
+            crate::rope::corr_dims(
+                n_rot,
+                params.n_ctx_orig,
+                params.freq_base,
+                params.beta_fast,
+                params.beta_slow,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let function = self.module.get_function("kv_post_fused")?;
+        let cfg = LaunchConfig {
+            grid: (1, 1, 1),
+            block: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            kv_normed.raw(), cache.raw(), kv_raw.raw(), weight.raw(),
+            pos_dev.raw(), slot_dev.raw(), head_dim, n_rot, rms_eps,
+            theta_scale, params.freq_scale, params.ext_factor,
+            mscale_eff, corr_low, corr_high
+        ])
+    }
+
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
         let image: &[u8] = if arch.starts_with("gfx1201") {
             FP8_E4M3FN_GFX1201

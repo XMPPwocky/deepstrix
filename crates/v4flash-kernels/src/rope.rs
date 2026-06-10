@@ -342,7 +342,7 @@ impl RopeTail {
 /// per the CPU function:
 ///   low  = max(0, floor(corr_dim(beta_fast)))
 ///   high = min(n_rot - 1, ceil(corr_dim(beta_slow)))
-fn corr_dims(n_rot: u32, n_ctx_orig: u64, freq_base: f32, beta_fast: f32, beta_slow: f32) -> (f32, f32) {
+pub(crate) fn corr_dims(n_rot: u32, n_ctx_orig: u64, freq_base: f32, beta_fast: f32, beta_slow: f32) -> (f32, f32) {
     let start = corr_dim(n_rot as f32, n_ctx_orig, beta_fast, freq_base).floor();
     let end = corr_dim(n_rot as f32, n_ctx_orig, beta_slow, freq_base).ceil();
     let low = start.max(0.0);

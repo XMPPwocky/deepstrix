@@ -395,11 +395,20 @@ impl HeterogeneousEngine {
                 de.rms_nw.launch(s, &mut dgpu_scratch.q_normed, &dgpu_scratch.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
                 de.rope.launch_forward_pdev(s, &mut dgpu_scratch.q_normed, &dgpu_scratch.pos_dev, N_HEAD, N_HEAD_DIM, N_ROT, &dlw.rope_params)?;
                 de.q8.matvec(s, &mut dgpu_scratch.kv_raw, &dlw.attn_kv.buffer, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_HEAD_DIM, N_EMBD)?;
-                de.rms_w.launch_weighted(s, &mut dgpu_scratch.kv_normed, &dgpu_scratch.kv_raw, &dlw.kv_a_norm, N_HEAD_DIM, RMS_EPS)?;
-                de.rope.launch_forward_pdev(s, &mut dgpu_scratch.kv_normed, &dgpu_scratch.pos_dev, 1, N_HEAD_DIM, N_ROT, &dlw.rope_params)?;
-                de.fp8.launch(s, &mut dgpu_scratch.kv_normed, N_HEAD_DIM - N_ROT)?;
-                de.f16rt.launch(s, &mut dgpu_scratch.kv_normed, N_HEAD_DIM)?;
-                de.kv_append.launch_slotdev(s, &mut ls.kv_cache, &dgpu_scratch.kv_normed, &dgpu_scratch.kv_slot_dev, N_HEAD_DIM)?;
+                // M59: fused rms+rope+fp8+f16rt+append (was 5 kernels).
+                de.fp8.launch_kv_post_fused(
+                    s,
+                    &mut dgpu_scratch.kv_normed,
+                    &mut ls.kv_cache,
+                    &dgpu_scratch.kv_raw,
+                    &dlw.kv_a_norm,
+                    &dgpu_scratch.pos_dev,
+                    &dgpu_scratch.kv_slot_dev,
+                    N_HEAD_DIM,
+                    N_ROT,
+                    RMS_EPS,
+                    &dlw.rope_params,
+                )?;
                 Ok(())
             })?;
             debug_assert!(
