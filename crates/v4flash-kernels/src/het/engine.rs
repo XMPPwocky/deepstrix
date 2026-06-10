@@ -542,6 +542,27 @@ impl HeterogeneousEngine {
                                 100.0 * hit16 / tot,
                                 100.0 * hit32 / tot
                             );
+                            // Dump per-layer descending-frequency expert ids
+                            // (placement input). One line per layer.
+                            if let Ok(path) = std::env::var("DEEPSTRIX_EXPERT_STATS") {
+                                if path != "1" {
+                                    let mut out = String::new();
+                                    for l in 0..N_LAYER as usize {
+                                        let mut idx: Vec<usize> = (0..256).collect();
+                                        idx.sort_unstable_by_key(|&e| {
+                                            std::cmp::Reverse(g.0[l][e])
+                                        });
+                                        let row: Vec<String> = idx
+                                            .iter()
+                                            .take(32)
+                                            .map(|e| e.to_string())
+                                            .collect();
+                                        out.push_str(&row.join(","));
+                                        out.push('\n');
+                                    }
+                                    let _ = std::fs::write(&path, out);
+                                }
+                            }
                         }
                     }
                 }
