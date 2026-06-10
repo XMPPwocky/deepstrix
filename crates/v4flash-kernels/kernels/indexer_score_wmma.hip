@@ -326,6 +326,114 @@ void indexer_score_wmma_batched_mw(
 #endif
 }
 
+// =============================================================================
+// M58: multi-wave NON-batched variant (decode path). Same fix as the M52
+// batched `_mw` kernel: the 1-wave `indexer_score_wmma` re-stages the full
+// 16 KB Q in every 16-col WG — at decode depth 96K (n_comp ≈ 24.5K,
+// ~1534 WGs) that's ~25 MB of Q re-reads per layer per token, measured
+// ~55 µs/launch ≈ 1.2 ms/token across the 21 CSA layers. 8 waves share one
+// cooperative Q stage; B-fragments load straight from global.
+// Grid: (ceil(n_comp / 1024), 1, 1). Block: 256. Writes scores[0, n_comp).
+// =============================================================================
+extern "C" __global__ __launch_bounds__(ISWMW_WAVES * ISW_BLOCK)
+void indexer_score_wmma_mw(
+        float          * __restrict__ scores,        // [n_comp]
+        const float    * __restrict__ q,             // [N_INDEXER_HEAD, N_INDEXER_HEAD_DIM]
+        const float    * __restrict__ head_weights,  // [N_INDEXER_HEAD]
+        const _Float16 * __restrict__ index_comp_kv, // [n_comp, N_INDEXER_HEAD_DIM]
+        unsigned int     n_comp) {
+    const unsigned int tid  = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int wave = tid >> 5;
+
+    const unsigned int cols_per_wave = ISW_NT_PER_WG * ISW_N_TILE;      // 128
+    const unsigned int cols_per_wg   = ISWMW_WAVES * cols_per_wave;     // 1024
+    const unsigned int c_wg0         = blockIdx.x * cols_per_wg;
+    if (c_wg0 >= n_comp) return;
+
+    __shared__ _Float16 lds_q[N_INDEXER_HEAD * N_INDEXER_HEAD_DIM];
+    __shared__ float    lds_hw[N_INDEXER_HEAD];
+
+    #pragma unroll 8
+    for (unsigned int i = tid; i < N_INDEXER_HEAD * N_INDEXER_HEAD_DIM;
+         i += ISWMW_WAVES * ISW_BLOCK) {
+        lds_q[i] = (_Float16)q[i];
+    }
+    if (tid < N_INDEXER_HEAD) {
+        lds_hw[tid] = head_weights[tid];
+    }
+    __syncthreads();   // the ONLY barrier — waves diverge freely below
+
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    const unsigned int col_in_tile = lane & 15u;
+    const unsigned int half        = lane >> 4;
+    const unsigned int k_off       = half * 8u;
+    const unsigned int c_wave0     = c_wg0 + wave * cols_per_wave;
+
+    #pragma unroll 1
+    for (unsigned int nt_local = 0; nt_local < ISW_NT_PER_WG; nt_local++) {
+        const unsigned int c_base = c_wave0 + nt_local * ISW_N_TILE;
+        if (c_base >= n_comp) break;
+
+        float8 c_acc[ISW_M_TILES];
+        #pragma unroll
+        for (unsigned int mt = 0; mt < ISW_M_TILES; mt++) {
+            c_acc[mt] = (float8){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        }
+
+        const unsigned int c_row = c_base + col_in_tile;
+        const bool c_row_valid = (c_row < n_comp);
+        const _Float16 *k_row = index_comp_kv + (size_t)c_row * N_INDEXER_HEAD_DIM;
+
+        #pragma unroll
+        for (unsigned int kt = 0; kt < ISW_K_TILES; kt++) {
+            const unsigned int kbase = kt * 16u;
+            half8 b_frag;
+            if (c_row_valid) {
+                const _Float16 *b_src = k_row + kbase + k_off;
+                #pragma unroll
+                for (int e = 0; e < 8; e++) b_frag[e] = b_src[e];
+            } else {
+                #pragma unroll
+                for (int e = 0; e < 8; e++) b_frag[e] = (_Float16)0.0f;
+            }
+            #pragma unroll
+            for (unsigned int mt = 0; mt < ISW_M_TILES; mt++) {
+                const unsigned int h0 = mt * 16u;
+                half8 a_frag;
+                const _Float16 *a_row = lds_q + (size_t)(h0 + col_in_tile) * N_INDEXER_HEAD_DIM
+                    + kbase + k_off;
+                #pragma unroll
+                for (int e = 0; e < 8; e++) a_frag[e] = a_row[e];
+                c_acc[mt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                    a_frag, b_frag, c_acc[mt]);
+            }
+        }
+
+        float partial = 0.0f;
+        #pragma unroll
+        for (unsigned int mt = 0; mt < ISW_M_TILES; mt++) {
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const unsigned int h = mt * 16u + k_off + (unsigned int)e;
+                float v = c_acc[mt][e];
+                if (v < 0.0f) v = 0.0f;
+                partial += v * lds_hw[h];
+            }
+        }
+        partial += __shfl_xor(partial, 16);
+        if (lane < ISW_N_TILE) {
+            const unsigned int c = c_base + lane;
+            if (c < n_comp) {
+                scores[c] = partial;
+            }
+        }
+    }
+#else
+    (void)scores; (void)wave;
+#endif
+}
+
 // Batched variant: one launch handles B tokens. Sharing pattern:
 //   - K (index_comp_kv) is shared across all B tokens at this layer
 //   - Q, head_weights, scores are per-token (strided by bi)

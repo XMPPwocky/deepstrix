@@ -178,6 +178,33 @@ impl IndexerScoreWmma {
         ])
     }
 
+    /// **Multi-wave NON-batched variant (M58, decode path)** — same fix as
+    /// `launch_batched_mw`: the 1-wave kernel re-stages 16 KB of Q per
+    /// 16-col WG (~25 MB/layer of Q re-reads at decode depth 96K).
+    pub fn launch_mw(
+        &self,
+        stream: &Stream,
+        scores: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        head_weights: &DeviceBuffer<f32>,
+        index_comp_kv: &DeviceBuffer<u16>,
+        n_comp: u32,
+    ) -> eyre::Result<()> {
+        if n_comp == 0 {
+            return Err(eyre!("indexer_score_wmma_mw: n_comp must be > 0"));
+        }
+        let function = self.module.get_function("indexer_score_wmma_mw")?;
+        const COLS_PER_WG: u32 = 8 * 8 * 16; // 1024
+        let cfg = LaunchConfig {
+            grid: ((n_comp + COLS_PER_WG - 1) / COLS_PER_WG, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            scores.raw(), q.raw(), head_weights.raw(), index_comp_kv.raw(), n_comp
+        ])
+    }
+
     /// **Multi-wave batched variant (M52)** — 8 waves/WG share one Q staging
     /// (the 1-wave kernel re-staged Q per 128 cols: ~6.3 GB redundant reads
     /// and a 4× staging-to-WMMA instruction ratio at 96K ctx); B-fragments

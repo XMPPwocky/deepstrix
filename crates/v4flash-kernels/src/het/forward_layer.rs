@@ -865,14 +865,30 @@ impl HeterogeneousEngine {
                     .comp_kv
                     .slice_view(0, (n_index_comp * N_INDEXER_HEAD_DIM) as usize);
                 if let Some(wmma) = de.indexer_score_wmma.as_ref() {
-                    wmma.launch(
-                        &de.compute,
-                        &mut dgpu_scratch.indexer_scores,
-                        &dgpu_scratch.indexer_q,
-                        &dgpu_scratch.indexer_head_weights,
-                        &kv_slice,
-                        n_index_comp,
-                    )?;
+                    // M58: multi-wave by default (INDEXER_DECODE=sw rolls
+                    // back to the 1-wave kernel).
+                    static MW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                        std::env::var("INDEXER_DECODE").map(|v| v != "sw").unwrap_or(true)
+                    });
+                    if *MW {
+                        wmma.launch_mw(
+                            &de.compute,
+                            &mut dgpu_scratch.indexer_scores,
+                            &dgpu_scratch.indexer_q,
+                            &dgpu_scratch.indexer_head_weights,
+                            &kv_slice,
+                            n_index_comp,
+                        )?;
+                    } else {
+                        wmma.launch(
+                            &de.compute,
+                            &mut dgpu_scratch.indexer_scores,
+                            &dgpu_scratch.indexer_q,
+                            &dgpu_scratch.indexer_head_weights,
+                            &kv_slice,
+                            n_index_comp,
+                        )?;
+                    }
                 } else {
                     de.indexer_score.launch(
                         &de.compute,

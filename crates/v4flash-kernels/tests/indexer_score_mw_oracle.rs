@@ -150,6 +150,28 @@ fn indexer_score_mw_matches_batched() -> eyre::Result<()> {
     assert_eq!(n_diff, 0, "mw diverges from batched on valid cols");
     assert_eq!(n_tail_bad, 0, "mw left non--INF in [n_comp, stride)");
 
+    // --- M58: non-batched (decode) mw vs 1-wave — bit-exact expected ---
+    {
+        let n_comp: u32 = 4096 + 17;
+        let kv1 = d_kv.slice_view(0, (n_comp as usize) * head_dim);
+        let mut s_ref: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, n_comp as usize)?;
+        let mut s_mw: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, n_comp as usize)?;
+        s_ref.fill_zero()?;
+        s_mw.fill_zero()?;
+        let q1 = d_q.slice_view(0, n_head * head_dim);
+        let hw1 = d_hw.slice_view(0, n_head);
+        kernel.launch(&stream, &mut s_ref, &q1, &hw1, &kv1, n_comp)?;
+        kernel.launch_mw(&stream, &mut s_mw, &q1, &hw1, &kv1, n_comp)?;
+        stream.synchronize()?;
+        let mut a = vec![0f32; n_comp as usize];
+        let mut b = vec![0f32; n_comp as usize];
+        s_ref.copy_to_host(&mut a)?;
+        s_mw.copy_to_host(&mut b)?;
+        let bad = a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        eprintln!("decode mw vs 1-wave: n={} n_bit_diff={}", n_comp, bad);
+        assert_eq!(bad, 0, "decode mw diverges");
+    }
+
     // --- Isolated timing A/B at the 96K production shape ---
     let b96: u32 = 512;
     let n96: u32 = 24576;
