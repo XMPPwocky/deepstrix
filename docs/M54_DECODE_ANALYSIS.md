@@ -136,3 +136,48 @@ compressor boundary (~75% of positions still speculate). Expected
 that clears 30 with headroom, and it stacks on any future kernel wins.
 Verify-forward should reuse the q8 GEMM/BxN-MoE batched kernels (NOT the
 full batch-prefill path — its fixed per-chunk overhead swamps B=2).
+
+# M56 — heterogeneous MoE split (2026-06-10)
+
+User challenged MTP (correctly: verify-2 nearly doubles iGPU expert reads
+since adjacent tokens pick mostly-disjoint experts; IQ2 acceptance unknown).
+Re-examination found the better lever: each device idles ~half of every
+token — the serial chain is a device-ASSIGNMENT choice for weight-parallel
+work.
+
+**Per-token expert streaming BOTEC (user question): rejected.** PCIe ~25
+GB/s → 283 µs to move one 7.08 MB expert vs 32 µs of iGPU read saved (9×
+loss); selections for L+1 unknowable at L (no prefetch). Streaming pays only
+for many-times-reused bytes = static placement. v2 extension: background
+adaptive refresh (swap ~1 expert/few-hundred tokens over PCIe ≈ free).
+
+**Static hot-expert placement (DGPU_HOT_EXPERTS=K + _FILE):** per-layer
+top-K experts by measured decode selection frequency (DEEPSTRIX_EXPERT_STATS
+probe, 128 tokens @4K, 70 cycled real residuals →
+reference/decode_hot_experts.txt) packed dense into dGPU VRAM; hetsplit
+kernel variants (shared remap[256], mode 0=iGPU misses / 1=dGPU hits); dGPU
+computes its picks in its former MoE wait via a "dgpu_hot_moe" graph;
+partials add at ffn_combine. Oracles: batch_v2 + last_only + pipelined all
+PASS (within drift budget).
+
+Measured (mean over 96+ tokens — per-token hit rate VARIES, see histogram):
+
+| config | mean ms/tok | tok/s | note |
+|---|---|---|---|
+| off | 37.52 | 26.65 | |
+| K=4 (1.2 GB) | 35.06 | 28.52 | **max K that coexists with 2-lane prefill scratch (server config)** |
+| K=6+ | — | — | OOM next to prefill scratch |
+| K=16 (4.9 GB) | 33.75 | 29.63 | decode-only process |
+| K=24 (7.3 GB) | 33.58 | 29.78 | decode-only; diminishing |
+
+Aggregate top-16 hit ~62%; per-token hit-rate HISTOGRAM (256 tokens, 5%
+bins): bell around 55-60%, bulk 40-85%, outlier 15% — hence mean-not-median
+reporting (time p99 only ~+4% over mean).
+
+Caveat: calibration and bench share the input distribution; real-traffic
+hit rates will sit lower until placement is recalibrated (or adaptive).
+
+**Next lever to reach 30+ in SERVER config: dGPU VRAM audit** — 2-lane batch
+prefill scratch currently leaves only ~1.5-2 GB free; trimming it (or
+phase-alternating lane-B scratch with the hot set) raises K to 8-16 →
+~29-30.5 server-side. MTP remains shelved per analysis above.
