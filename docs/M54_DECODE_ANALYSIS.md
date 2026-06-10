@@ -209,3 +209,21 @@ output coherent. Day-2 decode totals: 25.4 → 29.2 bench / 27 server.
 
 Remaining to clear 30 bench-side: q→f16 trim → K=12 (+~0.3), token-boundary
 (~1.6 ms), q/kv-chain device-pos graph (~1).
+
+# M58 — long-context decode (2026-06-10)
+
+96K decode trace (K=8): the 4K→96K gap was NOT attention (CSA bounds it:
+score_b1 reads 128 raw + top-512 gathered, depth-independent ✓) but the
+INDEXER re-ranking the full history every token:
+- indexer_score_wmma (1-wave B=1): 1.2 ms/tok — same per-WG 16 KB Q-restage
+  disease M52 fixed for prefill (~1534 WGs/layer at n_comp=24.5K)
+- indexer_topk merge/bitonic: ~0.6 ms/tok
+
+**Shipped: indexer_score_wmma_mw** (M52 port, bit-exact, INDEXER_DECODE=sw
+rollback): 96K decode 37.5 → 35.8 ms = **27.9 tok/s** (was 23.6 at M54).
+4K unaffected. At 128K, indexer cost scales ~×1.33 (n_comp 32768) → still
+sub-ms for score.
+
+Remaining long-ctx-specific: topk over n_comp scores (~0.6 ms/tok at 96K,
+~0.8 at 128K) — block-local top-512 pre-reduction before the merge would
+cut it ~2-3×; everything else is depth-flat.
