@@ -494,6 +494,58 @@ impl HeterogeneousEngine {
                     token_id,
                 )?;
             }
+            // DEEPSTRIX_EXPERT_STATS=1: per-layer expert-selection histogram
+            // (diagnostic; syncs every layer — slow). Prints cumulative
+            // top-16 hit-rates every 32 tokens. Used to size M55 static
+            // hot-expert placement.
+            {
+                static STATS: std::sync::LazyLock<
+                    Option<std::sync::Mutex<(Vec<[u64; 256]>, u64)>>,
+                > = std::sync::LazyLock::new(|| {
+                    std::env::var_os("DEEPSTRIX_EXPERT_STATS").map(|_| {
+                        std::sync::Mutex::new((vec![[0u64; 256]; N_LAYER as usize], 0u64))
+                    })
+                });
+                if let Some(m) = &*STATS {
+                    self.dgpu.compute.synchronize()?;
+                    let mut sel = vec![0i32; crate::config::N_EXPERT_USED];
+                    dgpu_scratch
+                        .d_selected
+                        .slice_view(0, crate::config::N_EXPERT_USED)
+                        .copy_to_host(&mut sel)?;
+                    let mut g = m.lock().unwrap();
+                    for &e in &sel {
+                        if (0..256).contains(&e) {
+                            g.0[layer][e as usize] += 1;
+                        }
+                    }
+                    if layer == (N_LAYER as usize) - 1 {
+                        g.1 += 1;
+                        if g.1 % 32 == 0 {
+                            // Per-layer top-K hit rates, summarized.
+                            let mut hit16 = 0f64;
+                            let mut hit32 = 0f64;
+                            let mut tot = 0f64;
+                            for l in 0..N_LAYER as usize {
+                                let mut c: Vec<u64> = g.0[l].to_vec();
+                                let sum: u64 = c.iter().sum();
+                                c.sort_unstable_by(|a, b| b.cmp(a));
+                                let t16: u64 = c.iter().take(16).sum();
+                                let t32: u64 = c.iter().take(32).sum();
+                                hit16 += t16 as f64;
+                                hit32 += t32 as f64;
+                                tot += sum as f64;
+                            }
+                            eprintln!(
+                                "EXPERT_STATS after {} tokens: top16 hit {:.1}%  top32 hit {:.1}%",
+                                g.1,
+                                100.0 * hit16 / tot,
+                                100.0 * hit32 / tot
+                            );
+                        }
+                    }
+                }
+            }
             std::mem::swap(&mut dgpu_scratch.residual, &mut dgpu_scratch.residual_next);
             // Diagnostic-only: substitute the per-layer output residual
             // with a host-supplied vector (typically ds4's
