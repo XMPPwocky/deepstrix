@@ -31,13 +31,14 @@ pub const ATTN_SWA_MAX_KV: u32 = 128;
 /// Hard cap on `n_raw + n_comp` for the split decode kernels
 /// (`attention_mixed_score`, `attention_mixed_softmax_wsum`). Scratch
 /// lives in `DgpuScratch.attn_scores` (global memory), so this isn't
-/// LDS-bound. 24576 covers 128 raw + 24448 comp ≈ 97K context at ratio=4
-/// (worst-case layer ratio across [[compress-ratios]] is 4; min layers
-/// have 128, but they barely grow). Headroom above 96K so a full chunk
-/// (B_MAX=512 tokens, +128 comp rows) prefilled on top of a 96K prefix
-/// still fits. Must match `#define ATTN_MIXED_MAX_KEYS` in
-/// `kernels/attention_mixed.hip`.
-pub const ATTN_MIXED_MAX_KEYS: u32 = 24576;
+/// LDS-bound. 49408 covers 128 raw + 49152 comp + 128 chunk-headroom ≈ 192K
+/// context at ratio=4 (worst-case layer ratio across [[compress-ratios]] is 4;
+/// min layers have 128, but they barely grow). Headroom above 192K so a full
+/// chunk (B_MAX tokens, +128 comp rows) prefilled on top of a 192K prefix
+/// still fits. Requires DGPU_HOT_EXPERTS≤6 at 192K to leave ~1 GiB dGPU KV
+/// margin (K=8 overflows the ~17.1 GiB budget past ~128K). Must match
+/// `#define ATTN_MIXED_MAX_KEYS` in `kernels/attention_mixed.hip`.
+pub const ATTN_MIXED_MAX_KEYS: u32 = 49408;
 
 /// Stride (in keys) of the `attn_scores` scratch buffer per (batch, head).
 /// Smaller than ATTN_MIXED_MAX_KEYS because the production attention path
