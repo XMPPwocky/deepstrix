@@ -147,10 +147,13 @@ fn run_case_bitonic(
     let mut d_selected: DeviceBuffer<i32> = DeviceBuffer::new(device.id, top_k as usize)?;
     let n_words = ((n_comp + 31) / 32) as usize;
     let mut d_bits: DeviceBuffer<u32> = DeviceBuffer::new(device.id, n_words)?;
-    // Scratch sized for the worst case (n_comp/4096 chunks × top_k).
+    // Scratch sized for the worst case: L0 (n_comp/4096 chunks × top_k)
+    // plus L1 (n_groups × top_k) for the two-level tree merge.
     let max_chunks = (n_comp + 4095) / 4096;
+    let group_chunks = 4096 / top_k;
+    let n_groups = (max_chunks + group_chunks - 1) / group_chunks;
     let mut d_scratch: DeviceBuffer<u32> =
-        DeviceBuffer::new(device.id, (max_chunks * top_k).max(1) as usize)?;
+        DeviceBuffer::new(device.id, ((max_chunks + n_groups) * top_k).max(1) as usize)?;
 
     kernel.launch(
         stream,
@@ -300,6 +303,37 @@ fn indexer_topk_synthetic() -> eyre::Result<()> {
         let n_comp = 256 * 128u32;
         let scores: Vec<f32> = (0..n_comp).map(|i| (i / 128) as f32 * 0.01).collect();
         run_case_bitonic(&kernel_b, &stream, device, "bit:clustered-ties", scores, top_k)?;
+    }
+
+    // --- Two-level tree merge cases (n_comp > 32768 → 9+ chunks). These
+    // exercise the regroup level added for ATTN_MIXED_MAX_KEYS=49408 (192K
+    // ctx); pre-fix these returned "exceeds merge cap 4096". ---
+    {
+        // 9 chunks → 4608 candidates > 4096: just past the single-merge wall.
+        let n_comp = 36864u32;
+        let mut seed = 0xa5a5a5a5u32;
+        let scores: Vec<f32> = (0..n_comp).map(|_| lcg_step(&mut seed)).collect();
+        run_case_bitonic(&kernel_b, &stream, device, "bit:tree-36K", scores, top_k)?;
+    }
+    {
+        // 13 chunks = the ATTN_MIXED_MAX_KEYS cap → 2 regroup groups.
+        let n_comp = 49408u32;
+        let mut seed = 0x0badf00du32;
+        let scores: Vec<f32> = (0..n_comp).map(|_| lcg_step(&mut seed)).collect();
+        run_case_bitonic(&kernel_b, &stream, device, "bit:tree-49408", scores, top_k)?;
+    }
+    {
+        // All-tied through two levels: first-index tie-break must survive
+        // chunk → regroup → merge. Selection MUST be exactly 0..top_k.
+        let n_comp = 40000u32;
+        let scores: Vec<f32> = vec![0.5f32; n_comp as usize];
+        run_case_bitonic(&kernel_b, &stream, device, "bit:tree-all-tied", scores, top_k)?;
+    }
+    {
+        // Clustered ties spanning chunk boundaries above the wall.
+        let n_comp = 45056u32;
+        let scores: Vec<f32> = (0..n_comp).map(|i| (i / 128) as f32 * 0.001).collect();
+        run_case_bitonic(&kernel_b, &stream, device, "bit:tree-clustered", scores, top_k)?;
     }
 
     Ok(())

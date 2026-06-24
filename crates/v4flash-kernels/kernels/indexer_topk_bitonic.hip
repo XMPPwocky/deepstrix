@@ -396,8 +396,116 @@ void indexer_topk_merge_4096_batched(
     }
 }
 
-// Final merge batched, multi-level tree. Same as merge_4096_batched but
-// reads from a per-batch sorted-candidates buffer of arbitrary stride.
-// Used when n_chunks > TOPK_SORT_N / top_k requires a 2-level reduction.
-// (Currently unused — single-level merge covers up to n_comp = 32768 with
-// top_k = 512.)
+// ---- Multi-level tree merge: intermediate "regroup" level ---------------
+//
+// When n_chunks * top_k > TOPK_SORT_N the final merge can't see every
+// candidate in one bitonic sort. The regroup kernel reduces the candidate
+// set by one level: it partitions the n_chunks*top_k candidates into
+// contiguous GROUPS of `group_span` (= floor(TOPK_SORT_N/top_k)*top_k)
+// candidates and emits each group's top_k. n_chunks*top_k candidates →
+// n_groups*top_k, which the existing merge_4096 then sorts to the final
+// top_k. Re-reads scores from `scores` like the merge (indices only flow
+// through the candidate buffers). Two levels cover n_comp up to
+// (TOPK_SORT_N/top_k)^2 * TOPK_SORT_N — far beyond any real ctx.
+//
+// Grid: (n_groups, 1, 1). One WG per group.
+extern "C" __global__ __launch_bounds__(TOPK_BLOCK)
+void indexer_topk_regroup_4096(
+        unsigned int       * __restrict__ candidates_out,  // [n_groups * top_k]
+        const unsigned int * __restrict__ candidates_in,   // [n_candidates_in]
+        const float        * __restrict__ scores,          // [n_comp]
+        unsigned int                      n_comp,
+        unsigned int                      n_candidates_in,
+        unsigned int                      top_k,
+        unsigned int                      group_span) {
+    const unsigned int group = blockIdx.x;
+    const unsigned int lo = group * group_span;
+    unsigned int hi = lo + group_span;
+    if (hi > n_candidates_in) hi = n_candidates_in;
+    const unsigned int cnt = (hi > lo) ? (hi - lo) : 0u;
+
+    __shared__ float        vals[TOPK_SORT_N];
+    __shared__ unsigned int idxs[TOPK_SORT_N];
+
+    const unsigned int tid = threadIdx.x;
+    for (unsigned int i = tid; i < TOPK_SORT_N; i += TOPK_BLOCK) {
+        if (i < cnt) {
+            const unsigned int idx = candidates_in[lo + i];
+            if (idx < n_comp) {
+                vals[i] = scores[idx];
+                idxs[i] = idx;
+            } else {
+                vals[i] = TOPK_NEG_INF;
+                idxs[i] = 0xFFFFFFFFu;
+            }
+        } else {
+            vals[i] = TOPK_NEG_INF;
+            idxs[i] = 0xFFFFFFFFu;
+        }
+    }
+    __syncthreads();
+
+    bitonic_sort_lds(vals, idxs);
+
+    const unsigned int out_base = group * top_k;
+    for (unsigned int i = tid; i < top_k; i += TOPK_BLOCK) {
+        candidates_out[out_base + i] = idxs[i];
+    }
+}
+
+// Batched regroup. Grid: (n_groups, B, 1). Per-token candidate count is
+// uniform (= in_stride = n_chunks*top_k; chunks past a token's n_comp
+// already hold sentinels), so the group partition is the same for every
+// token; n_comp per token only gates the score re-read.
+extern "C" __global__ __launch_bounds__(TOPK_BLOCK)
+void indexer_topk_regroup_4096_batched(
+        unsigned int       * __restrict__ candidates_out_b, // [B, out_stride]
+        const unsigned int * __restrict__ candidates_in_b,  // [B, in_stride]
+        const float        * __restrict__ scores_b,         // [B, n_idx_stride]
+        const unsigned int * __restrict__ n_idx_per,        // [B]
+        unsigned int                      n_idx_stride,
+        unsigned int                      in_stride,        // = n_chunks * top_k
+        unsigned int                      out_stride,       // = n_groups * top_k
+        unsigned int                      top_k,
+        unsigned int                      group_span) {
+    const unsigned int group = blockIdx.x;
+    const unsigned int bi    = blockIdx.y;
+    const unsigned int n_comp = n_idx_per[bi];
+
+    unsigned int       * __restrict__ candidates_out = candidates_out_b + (size_t)bi * out_stride;
+    const unsigned int * __restrict__ candidates_in  = candidates_in_b  + (size_t)bi * in_stride;
+    const float        * __restrict__ scores         = scores_b         + (size_t)bi * n_idx_stride;
+
+    const unsigned int lo = group * group_span;
+    unsigned int hi = lo + group_span;
+    if (hi > in_stride) hi = in_stride;
+    const unsigned int cnt = (hi > lo) ? (hi - lo) : 0u;
+
+    __shared__ float        vals[TOPK_SORT_N];
+    __shared__ unsigned int idxs[TOPK_SORT_N];
+
+    const unsigned int tid = threadIdx.x;
+    for (unsigned int i = tid; i < TOPK_SORT_N; i += TOPK_BLOCK) {
+        if (i < cnt) {
+            const unsigned int idx = candidates_in[lo + i];
+            if (idx < n_comp) {
+                vals[i] = scores[idx];
+                idxs[i] = idx;
+            } else {
+                vals[i] = TOPK_NEG_INF;
+                idxs[i] = 0xFFFFFFFFu;
+            }
+        } else {
+            vals[i] = TOPK_NEG_INF;
+            idxs[i] = 0xFFFFFFFFu;
+        }
+    }
+    __syncthreads();
+
+    bitonic_sort_lds(vals, idxs);
+
+    const unsigned int out_base = group * top_k;
+    for (unsigned int i = tid; i < top_k; i += TOPK_BLOCK) {
+        candidates_out[out_base + i] = idxs[i];
+    }
+}

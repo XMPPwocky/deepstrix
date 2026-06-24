@@ -597,10 +597,14 @@ impl BatchDgpuScratch {
                 b * crate::config::INDEXER_TOP_K as usize,
             )?,
             indexer_topk_scratch: {
+                // Two-level bitonic tree merge (see scratch.rs): per token
+                // L0 = max_chunks*top_k + L1 = n_groups*top_k.
                 let max_chunks = (ATTN_MIXED_MAX_KEYS + 4095) / 4096;
+                let group_chunks = 4096 / crate::config::INDEXER_TOP_K;
+                let n_groups = (max_chunks + group_chunks - 1) / group_chunks;
                 DeviceBuffer::new(
                     id,
-                    b * (max_chunks * crate::config::INDEXER_TOP_K) as usize,
+                    b * ((max_chunks + n_groups) * crate::config::INDEXER_TOP_K) as usize,
                 )?
             },
             n_index_comp_per_b: DeviceBuffer::new(id, b)?,

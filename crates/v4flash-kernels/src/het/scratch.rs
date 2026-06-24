@@ -260,8 +260,14 @@ impl DgpuScratch {
                 ((ATTN_MIXED_MAX_KEYS + 31) / 32) as usize,
             )?,
             indexer_topk_scratch: {
+                // Two-level bitonic tree merge: L0 = max_chunks*top_k
+                // candidates, plus L1 = n_groups*top_k regrouped candidates
+                // (group = 4096/top_k chunks). Covers n_comp up to
+                // ATTN_MIXED_MAX_KEYS without the old 32768 merge-cap wall.
                 let max_chunks = (ATTN_MIXED_MAX_KEYS + 4095) / 4096;
-                DeviceBuffer::new(device_id, (max_chunks * INDEXER_TOP_K) as usize)?
+                let group_chunks = 4096 / INDEXER_TOP_K;
+                let n_groups = (max_chunks + group_chunks - 1) / group_chunks;
+                DeviceBuffer::new(device_id, ((max_chunks + n_groups) * INDEXER_TOP_K) as usize)?
             },
             active_comp_kv: DeviceBuffer::new(
                 device_id,

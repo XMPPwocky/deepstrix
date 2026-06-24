@@ -337,15 +337,17 @@ impl IndexerTopk {
 ///                || (a.score == b.score && a.idx < b.idx)
 ///
 /// Dispatch:
-///   - `n_comp ≤ 4096`         → single `indexer_topk_bitonic_4096` WG
-///                               (no scratch).
-///   - `4096 < n_comp ≤ 24576` → `indexer_topk_chunk_4096` (one WG per
-///                               4096-element chunk, up to 6 chunks for
-///                               ATTN_MIXED_MAX_KEYS=24576) followed by
-///                               one `indexer_topk_merge_4096` WG that
-///                               bitonic-sorts the (n_chunks × top_k)
-///                               candidates and writes the final
-///                               selected[] + bitmap.
+///   - `n_comp ≤ 4096`            → single `indexer_topk_bitonic_4096` WG
+///                                  (no scratch).
+///   - `4096 < n_comp ≤ 32768`    → `indexer_topk_chunk_4096` (one WG per
+///                                  4096-element chunk, ≤ 8 chunks) then one
+///                                  `indexer_topk_merge_4096` WG that
+///                                  bitonic-sorts the (n_chunks × top_k)
+///                                  candidates → selected[] + bitmap.
+///   - `32768 < n_comp ≤ 262144`  → two-level tree: chunk →
+///                                  `indexer_topk_regroup_4096` (folds groups
+///                                  of 8 chunks' top_k down to top_k each) →
+///                                  merge. Covers ATTN_MIXED_MAX_KEYS=49408.
 ///
 /// Self-zeroes `allowed_bits` so the API matches [`IndexerTopk`].
 pub struct IndexerTopkBitonic {
@@ -420,19 +422,6 @@ impl IndexerTopkBitonic {
         // Chunked path.
         let n_chunks = (n_comp + SORT_N - 1) / SORT_N;
         let n_candidates = n_chunks * top_k;
-        if n_candidates > SORT_N {
-            return Err(eyre!(
-                "indexer_topk_bitonic: n_candidates={n_candidates} exceeds merge cap {SORT_N} \
-                 (n_chunks={n_chunks}, top_k={top_k}). Multi-level tree merge not yet implemented."
-            ));
-        }
-        if scratch.len() < n_candidates as usize {
-            return Err(eyre!(
-                "indexer_topk_bitonic: scratch has {} u32, need {}",
-                scratch.len(),
-                n_candidates
-            ));
-        }
 
         let chunk_fn = self.module.get_function("indexer_topk_chunk_4096")?;
         let chunk_cfg = LaunchConfig {
@@ -440,19 +429,78 @@ impl IndexerTopkBitonic {
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
-        launch_kernel!(chunk_fn, chunk_cfg, stream, [
-            scratch.raw(), scores.raw(), n_comp, top_k
-        ])?;
-
         let merge_fn = self.module.get_function("indexer_topk_merge_4096")?;
         let merge_cfg = LaunchConfig {
             grid: (1, 1, 1),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
+
+        if n_candidates <= SORT_N {
+            // Single-level merge: chunk -> merge.
+            if scratch.len() < n_candidates as usize {
+                return Err(eyre!(
+                    "indexer_topk_bitonic: scratch has {} u32, need {}",
+                    scratch.len(),
+                    n_candidates
+                ));
+            }
+            launch_kernel!(chunk_fn, chunk_cfg, stream, [
+                scratch.raw(), scores.raw(), n_comp, top_k
+            ])?;
+            return launch_kernel!(merge_fn, merge_cfg, stream, [
+                selected.raw(), allowed_bits.raw(), scratch.raw(), scores.raw(),
+                n_comp, top_k, n_candidates
+            ]);
+        }
+
+        // Two-level tree merge: chunk -> regroup -> merge.
+        // Each regroup group folds `group_chunks` chunks' top_k candidates
+        // (≤ SORT_N) down to top_k. n_groups*top_k must then fit one merge.
+        let group_chunks = SORT_N / top_k; // 8 for SORT_N=4096, top_k=512
+        let group_span = group_chunks * top_k;
+        let n_groups = (n_chunks + group_chunks - 1) / group_chunks;
+        let n_grouped = n_groups * top_k;
+        if n_grouped > SORT_N {
+            return Err(eyre!(
+                "indexer_topk_bitonic: n_grouped={n_grouped} exceeds merge cap {SORT_N} \
+                 (n_chunks={n_chunks}, n_groups={n_groups}, top_k={top_k}); a 3rd merge \
+                 level would be needed for n_comp={n_comp}."
+            ));
+        }
+        let scratch_need = (n_candidates + n_grouped) as usize;
+        if scratch.len() < scratch_need {
+            return Err(eyre!(
+                "indexer_topk_bitonic: scratch has {} u32, need {} (tree merge: \
+                 {n_candidates} L0 + {n_grouped} L1)",
+                scratch.len(),
+                scratch_need
+            ));
+        }
+
+        // L0 candidates in scratch[0..n_candidates], L1 grouped candidates
+        // in scratch[n_candidates..n_candidates+n_grouped]. Non-owning views.
+        let level0 = scratch.slice_view_mut(0, n_candidates as usize);
+        let level1 = scratch.slice_view_mut(n_candidates as usize, n_grouped as usize);
+
+        launch_kernel!(chunk_fn, chunk_cfg, stream, [
+            level0.raw(), scores.raw(), n_comp, top_k
+        ])?;
+
+        let regroup_fn = self.module.get_function("indexer_topk_regroup_4096")?;
+        let regroup_cfg = LaunchConfig {
+            grid: (n_groups, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(regroup_fn, regroup_cfg, stream, [
+            level1.raw(), level0.raw(), scores.raw(),
+            n_comp, n_candidates, top_k, group_span
+        ])?;
+
         launch_kernel!(merge_fn, merge_cfg, stream, [
-            selected.raw(), allowed_bits.raw(), scratch.raw(), scores.raw(),
-            n_comp, top_k, n_candidates
+            selected.raw(), allowed_bits.raw(), level1.raw(), scores.raw(),
+            n_comp, top_k, n_grouped
         ])
     }
 
@@ -501,20 +549,7 @@ impl IndexerTopkBitonic {
 
         let n_chunks = (n_idx_max + SORT_N - 1) / SORT_N;
         let n_candidates = n_chunks * top_k;
-        if n_candidates > SORT_N {
-            return Err(eyre!(
-                "indexer_topk_bitonic_batched: n_candidates={n_candidates} exceeds merge cap {SORT_N}"
-            ));
-        }
         let candidates_stride = n_candidates;
-        let scratch_need = (batch as usize) * (candidates_stride as usize);
-        if scratch.len() < scratch_need {
-            return Err(eyre!(
-                "indexer_topk_bitonic_batched: scratch has {} u32, need {} (B={batch}, stride={candidates_stride})",
-                scratch.len(),
-                scratch_need,
-            ));
-        }
 
         let chunk_fn = self.module.get_function("indexer_topk_chunk_4096_batched")?;
         let chunk_cfg = LaunchConfig {
@@ -522,20 +557,77 @@ impl IndexerTopkBitonic {
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
-        launch_kernel!(chunk_fn, chunk_cfg, stream, [
-            scratch.raw(), scores.raw(), n_idx_per.raw(),
-            n_idx_stride, candidates_stride, top_k
-        ])?;
-
         let merge_fn = self.module.get_function("indexer_topk_merge_4096_batched")?;
         let merge_cfg = LaunchConfig {
             grid: (1, batch, 1),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
+
+        if n_candidates <= SORT_N {
+            // Single-level merge: chunk -> merge.
+            let scratch_need = (batch as usize) * (candidates_stride as usize);
+            if scratch.len() < scratch_need {
+                return Err(eyre!(
+                    "indexer_topk_bitonic_batched: scratch has {} u32, need {} (B={batch}, stride={candidates_stride})",
+                    scratch.len(),
+                    scratch_need,
+                ));
+            }
+            launch_kernel!(chunk_fn, chunk_cfg, stream, [
+                scratch.raw(), scores.raw(), n_idx_per.raw(),
+                n_idx_stride, candidates_stride, top_k
+            ])?;
+            return launch_kernel!(merge_fn, merge_cfg, stream, [
+                selected.raw(), allowed_bits.raw(), scratch.raw(), scores.raw(), n_idx_per.raw(),
+                n_idx_stride, candidates_stride, n_words_per_b, top_k, n_candidates
+            ]);
+        }
+
+        // Two-level tree merge: chunk -> regroup -> merge.
+        let group_chunks = SORT_N / top_k;
+        let group_span = group_chunks * top_k;
+        let n_groups = (n_chunks + group_chunks - 1) / group_chunks;
+        let n_grouped = n_groups * top_k;
+        if n_grouped > SORT_N {
+            return Err(eyre!(
+                "indexer_topk_bitonic_batched: n_grouped={n_grouped} exceeds merge cap {SORT_N} \
+                 (n_chunks={n_chunks}, n_groups={n_groups}, top_k={top_k}); 3rd merge level needed."
+            ));
+        }
+        // Scratch layout: [B * n_candidates] L0 then [B * n_grouped] L1.
+        let l0_len = (batch * n_candidates) as usize;
+        let l1_len = (batch * n_grouped) as usize;
+        if scratch.len() < l0_len + l1_len {
+            return Err(eyre!(
+                "indexer_topk_bitonic_batched: scratch has {} u32, need {} (B={batch}: \
+                 {n_candidates} L0 + {n_grouped} L1 per token)",
+                scratch.len(),
+                l0_len + l1_len
+            ));
+        }
+        let level0 = scratch.slice_view_mut(0, l0_len);
+        let level1 = scratch.slice_view_mut(l0_len, l1_len);
+
+        launch_kernel!(chunk_fn, chunk_cfg, stream, [
+            level0.raw(), scores.raw(), n_idx_per.raw(),
+            n_idx_stride, candidates_stride, top_k
+        ])?;
+
+        let regroup_fn = self.module.get_function("indexer_topk_regroup_4096_batched")?;
+        let regroup_cfg = LaunchConfig {
+            grid: (n_groups, batch, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(regroup_fn, regroup_cfg, stream, [
+            level1.raw(), level0.raw(), scores.raw(), n_idx_per.raw(),
+            n_idx_stride, candidates_stride, n_grouped, top_k, group_span
+        ])?;
+
         launch_kernel!(merge_fn, merge_cfg, stream, [
-            selected.raw(), allowed_bits.raw(), scratch.raw(), scores.raw(), n_idx_per.raw(),
-            n_idx_stride, candidates_stride, n_words_per_b, top_k, n_candidates
+            selected.raw(), allowed_bits.raw(), level1.raw(), scores.raw(), n_idx_per.raw(),
+            n_idx_stride, n_grouped, n_words_per_b, top_k, n_grouped
         ])
     }
 }
