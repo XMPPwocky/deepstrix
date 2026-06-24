@@ -124,6 +124,11 @@ pub struct SnapshotMeta {
     pub layers: Vec<PerLayerMeta>,
     /// Total bytes on disk for this snapshot (sum of files).
     pub disk_bytes: u64,
+    /// Conversation lineage this snapshot belongs to (letta `session_id`).
+    /// Used for per-lineage retention (keep the N most-recent per session).
+    /// Absent on pre-retention snapshots → treated as a singleton lineage.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// In-memory record of one on-disk snapshot.
@@ -146,6 +151,8 @@ pub struct IndexEntry {
     pub last_used_unix: u64,
     pub disk_bytes: u64,
     pub dir: PathBuf,
+    /// Lineage key (letta `session_id`); `None` = singleton lineage.
+    pub session_id: Option<String>,
 }
 
 pub struct SnapshotIndex {
@@ -158,6 +165,13 @@ pub struct SnapshotIndex {
     by_hash: HashMap<[u8; 32], IndexEntry>,
     /// (last_used_unix, hash) sorted by time for LRU eviction.
     by_last_used: BTreeMap<(u64, [u8; 32]), ()>,
+    /// session_id → hashes of that lineage's snapshots (unordered;
+    /// recency comes from `by_hash[h].last_used_unix`). Drives the
+    /// per-lineage retention cap (R1).
+    by_session: HashMap<String, Vec<[u8; 32]>>,
+    /// Max snapshots retained per lineage (R1). Env-tunable via
+    /// `DEEPSTRIX_SNAPSHOT_KEEP_PER_SESSION`, default 3.
+    max_per_lineage: usize,
     total_bytes: u64,
     /// Soft cap; eviction targets get to ≤ this.
     pub cap_bytes: u64,
@@ -169,11 +183,18 @@ pub struct SnapshotIndex {
 
 impl SnapshotIndex {
     pub fn new(root: PathBuf, fingerprint: ModelFingerprint, cap_bytes: u64) -> Self {
+        let max_per_lineage = std::env::var("DEEPSTRIX_SNAPSHOT_KEEP_PER_SESSION")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(3);
         Self {
             root,
             fingerprint,
             by_hash: HashMap::new(),
             by_last_used: BTreeMap::new(),
+            by_session: HashMap::new(),
+            max_per_lineage,
             total_bytes: 0,
             cap_bytes,
             session_to_hash: HashMap::new(),
@@ -249,9 +270,13 @@ impl SnapshotIndex {
                 last_used_unix: meta.last_used_unix,
                 disk_bytes: meta.disk_bytes,
                 dir: path,
+                session_id: meta.session_id.clone(),
             };
             idx.total_bytes += e.disk_bytes;
             idx.by_last_used.insert((e.last_used_unix, e.hash), ());
+            if let Some(sid) = &e.session_id {
+                idx.by_session.entry(sid.clone()).or_default().push(e.hash);
+            }
             idx.by_hash.insert(e.hash, e);
         }
         tracing::info!(
@@ -287,36 +312,107 @@ impl SnapshotIndex {
         Ok(())
     }
 
-    /// Pop LRU entries until total_bytes <= self.cap_bytes.
+    /// Fully remove one snapshot: drop it from every index, subtract its
+    /// bytes, and delete its on-disk dir. Central path for both eviction
+    /// rules so the maps never drift.
+    fn remove_entry(&mut self, hash: &[u8; 32], reason: &str) {
+        let Some(entry) = self.by_hash.remove(hash) else {
+            return;
+        };
+        self.by_last_used.remove(&(entry.last_used_unix, *hash));
+        if let Some(sid) = &entry.session_id {
+            if let Some(v) = self.by_session.get_mut(sid) {
+                v.retain(|h| h != hash);
+                if v.is_empty() {
+                    self.by_session.remove(sid);
+                }
+            }
+            // Drop the hot-cache hint if it pointed at this snapshot.
+            if self.session_to_hash.get(sid) == Some(hash) {
+                self.session_to_hash.remove(sid);
+            }
+        }
+        self.total_bytes = self.total_bytes.saturating_sub(entry.disk_bytes);
+        if let Err(e) = fs::remove_dir_all(&entry.dir) {
+            tracing::warn!(dir = ?entry.dir, error = %e, "failed to remove evicted snapshot dir");
+        } else {
+            tracing::info!(
+                hash = %hex::encode(entry.hash),
+                bytes = entry.disk_bytes,
+                reason,
+                "evicted snapshot"
+            );
+        }
+    }
+
+    /// R1: cap a lineage at `max_per_lineage`, evicting its oldest
+    /// (lowest `last_used_unix`) snapshots beyond the cap. The newest
+    /// (continuation tip) is always retained.
+    fn evict_lineage_overflow(&mut self, session_id: &str) {
+        loop {
+            let to_evict = {
+                let Some(members) = self.by_session.get(session_id) else {
+                    return;
+                };
+                if members.len() <= self.max_per_lineage {
+                    return;
+                }
+                members
+                    .iter()
+                    .copied()
+                    .min_by_key(|h| self.by_hash.get(h).map(|e| e.last_used_unix).unwrap_or(0))
+            };
+            match to_evict {
+                Some(h) => self.remove_entry(&h, "lineage cap"),
+                None => return,
+            }
+        }
+    }
+
+    /// R4: global backstop. Pop globally-LRU entries until
+    /// total_bytes <= cap_bytes (evicts whole least-recently-used
+    /// lineages first, since their snapshots carry the oldest timestamps).
     pub fn evict_to_fit(&mut self) {
         while self.total_bytes > self.cap_bytes {
-            let Some(((ts, hash), ())) = self.by_last_used.iter().next().map(|(k, v)| (*k, *v))
-            else {
+            let Some((ts, hash)) = self.by_last_used.iter().next().map(|(k, _)| *k) else {
                 break;
             };
-            let Some(entry) = self.by_hash.remove(&hash) else {
-                self.by_last_used.remove(&(ts, hash));
-                continue;
-            };
-            self.by_last_used.remove(&(ts, hash));
-            self.total_bytes = self.total_bytes.saturating_sub(entry.disk_bytes);
-            if let Err(e) = fs::remove_dir_all(&entry.dir) {
-                tracing::warn!(dir = ?entry.dir, error = %e, "failed to remove evicted snapshot dir");
+            if self.by_hash.contains_key(&hash) {
+                self.remove_entry(&hash, "global cap");
             } else {
-                tracing::info!(
-                    hash = %hex::encode(entry.hash),
-                    bytes = entry.disk_bytes,
-                    "evicted snapshot"
-                );
+                // Stale key with no entry — drop it and continue.
+                self.by_last_used.remove(&(ts, hash));
             }
         }
     }
 
     pub fn insert(&mut self, entry: IndexEntry) {
+        // De-dup: re-saving the same hash replaces the prior record so we
+        // never double-count bytes or duplicate lineage membership.
+        if let Some(old) = self.by_hash.remove(&entry.hash) {
+            self.by_last_used.remove(&(old.last_used_unix, old.hash));
+            if let Some(sid) = &old.session_id {
+                if let Some(v) = self.by_session.get_mut(sid) {
+                    v.retain(|h| *h != old.hash);
+                }
+            }
+            self.total_bytes = self.total_bytes.saturating_sub(old.disk_bytes);
+        }
+        let session_id = entry.session_id.clone();
         self.total_bytes += entry.disk_bytes;
         self.by_last_used
             .insert((entry.last_used_unix, entry.hash), ());
+        if let Some(sid) = &session_id {
+            self.by_session
+                .entry(sid.clone())
+                .or_default()
+                .push(entry.hash);
+        }
         self.by_hash.insert(entry.hash, entry);
+        // R1: per-lineage cap, then R4: global cap backstop.
+        if let Some(sid) = &session_id {
+            self.evict_lineage_overflow(sid);
+        }
         self.evict_to_fit();
     }
 
@@ -489,6 +585,7 @@ pub fn save(
     root: &Path,
     vocab: &BpeVocab,
     byte_decoder: &std::collections::HashMap<char, u8>,
+    session_id: Option<&str>,
 ) -> eyre::Result<IndexEntry> {
     if state.layers.len() != N_LAYER as usize {
         return Err(eyre!(
@@ -676,6 +773,7 @@ pub fn save(
         last_used_unix: now,
         layers,
         disk_bytes: 0,
+        session_id: session_id.map(|s| s.to_string()),
     };
     let mut total_bytes: u64 = tokens_bytes.len() as u64 + kv_blob.len() as u64;
     total_bytes += comp_kv_blob.len() as u64;
@@ -692,6 +790,7 @@ pub fn save(
         last_used_unix: now,
         disk_bytes: total_bytes,
         dir,
+        session_id: session_id.map(|s| s.to_string()),
     })
 }
 
@@ -967,5 +1066,107 @@ mod hex {
             s.push_str(&format!("{b:02x}"));
         }
         s
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    //! Per-lineage retention (R1) + global-cap backstop (R4). Pure index
+    //! logic — no GPU. Uses real temp dirs so `remove_dir_all` exercises.
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn unique_root() -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("deepstrix-rt-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+    fn fp() -> ModelFingerprint {
+        ModelFingerprint {
+            n_layer: 1,
+            n_head_dim: 1,
+            vocab_size: 1,
+            token_embd_prefix_blake3: "x".into(),
+        }
+    }
+    fn h(tag: u8) -> [u8; 32] {
+        let mut x = [0u8; 32];
+        x[0] = tag;
+        x
+    }
+    fn mk(root: &Path, tag: u8, last_used: u64, bytes: u64, session: Option<&str>) -> IndexEntry {
+        let hash = h(tag);
+        let dir = root.join(hex::encode(hash));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("tokens.bin"), b"x").unwrap();
+        IndexEntry {
+            hash,
+            token_count: bytes as u32,
+            last_used_unix: last_used,
+            disk_bytes: bytes,
+            dir,
+            session_id: session.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn r1_keeps_last_n_per_lineage_and_protects_tip() {
+        let root = unique_root();
+        let mut idx = SnapshotIndex::new(root.clone(), fp(), 1 << 40); // huge cap → isolate R1
+        idx.max_per_lineage = 3;
+        for i in 0..5u8 {
+            idx.insert(mk(&root, i, i as u64 + 1, 100, Some("A")));
+        }
+        assert_eq!(idx.len(), 3, "lineage capped at 3");
+        assert_eq!(idx.by_session.get("A").unwrap().len(), 3);
+        // Oldest two (tags 0,1) evicted incl. their dirs; newest tip (4) kept.
+        assert!(idx.by_hash.get(&h(0)).is_none());
+        assert!(idx.by_hash.get(&h(1)).is_none());
+        assert!(!root.join(hex::encode(h(0))).exists());
+        assert!(idx.by_hash.contains_key(&h(4)), "tip retained");
+    }
+
+    #[test]
+    fn lineages_are_independent() {
+        let root = unique_root();
+        let mut idx = SnapshotIndex::new(root.clone(), fp(), 1 << 40);
+        idx.max_per_lineage = 3;
+        for i in 0..5u8 {
+            idx.insert(mk(&root, i, i as u64 + 1, 100, Some("A")));
+        }
+        for i in 5..10u8 {
+            idx.insert(mk(&root, i, i as u64 + 1, 100, Some("B")));
+        }
+        assert_eq!(idx.len(), 6, "3 per lineage × 2 lineages");
+        assert_eq!(idx.by_session.get("A").unwrap().len(), 3);
+        assert_eq!(idx.by_session.get("B").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn r4_global_cap_evicts_lru_across_lineages() {
+        let root = unique_root();
+        let mut idx = SnapshotIndex::new(root.clone(), fp(), 250); // 250-byte cap
+        idx.max_per_lineage = 10; // disable R1 so R4 is the actor
+        idx.insert(mk(&root, 0, 1, 100, Some("A")));
+        idx.insert(mk(&root, 1, 2, 100, Some("B")));
+        idx.insert(mk(&root, 2, 3, 100, Some("A"))); // 300>250 → drop globally-oldest (tag0)
+        assert!(idx.total_bytes() <= 250);
+        assert!(idx.by_hash.get(&h(0)).is_none(), "oldest across lineages evicted");
+        assert!(idx.by_hash.contains_key(&h(2)), "newest kept");
+    }
+
+    #[test]
+    fn resave_same_hash_does_not_double_count() {
+        let root = unique_root();
+        let mut idx = SnapshotIndex::new(root.clone(), fp(), 1 << 40);
+        idx.max_per_lineage = 3;
+        idx.insert(mk(&root, 0, 1, 100, Some("A")));
+        idx.insert(mk(&root, 0, 2, 100, Some("A"))); // same hash, re-saved
+        assert_eq!(idx.len(), 1);
+        assert_eq!(idx.total_bytes(), 100, "bytes not double-counted");
+        assert_eq!(idx.by_session.get("A").unwrap().len(), 1, "membership not duplicated");
     }
 }

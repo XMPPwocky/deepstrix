@@ -917,6 +917,7 @@ fn save_live_if_dirty(state: &mut WorkerState) {
         state.snapshot_index.root(),
         state.vocab.as_ref(),
         &state.byte_decoder,
+        session_id.as_deref(),
     ) {
         Ok(entry) => {
             let hash = entry.hash;
