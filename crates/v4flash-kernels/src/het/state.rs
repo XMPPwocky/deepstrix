@@ -101,7 +101,152 @@ pub struct HetModelState {
     pub n_kv_max: u32,
 }
 
+/// M40 MTP drafter layer state (restored). One SWA-windowed raw KV cache
+/// on the dGPU, independent of the main model's per-layer KV (the MTP
+/// head processes speculative future tokens on its own position track).
+/// f16-stored (u16) to match the current `kv_cache_append` / `attention_swa`
+/// kernels. `n_raw` counts valid rows in the window.
+pub struct MtpLayerState {
+    pub kv_cache: DeviceBuffer<u16>,
+    pub n_raw: u32,
+}
+
+impl MtpLayerState {
+    /// Allocate the MTP layer's KV cache on the dGPU. The raw KV window is
+    /// `SWA_WINDOW` rows (the append kernel only touches slots < window).
+    pub fn alloc(dgpu_device: Device) -> eyre::Result<Self> {
+        dgpu_device.set_current()?;
+        let kv_cache = DeviceBuffer::<u16>::new(
+            dgpu_device.id,
+            (SWA_WINDOW as usize) * (N_HEAD_DIM as usize),
+        )?;
+        Ok(Self { kv_cache, n_raw: 0 })
+    }
+}
+
+/// Snapshot of one compressor's sliding state (`state_kv` / `state_score`)
+/// plus its `n_comp` row counter. Buffers are dGPU-resident device copies,
+/// pre-allocated to match the live compressor's shapes.
+pub struct CompStateSnap {
+    state_kv: DeviceBuffer<f32>,
+    state_score: DeviceBuffer<f32>,
+    n_comp: u32,
+}
+
+/// Per-layer "frontier" — everything a speculative verify mutates that
+/// counter-only rollback cannot restore. Mirrors ds4's `ds4_spec_frontier`
+/// (`ds4.c:16236`): the raw-KV *body* is NOT snapshotted (append-only,
+/// invisible garbage past `n_raw`), only the counters (`n_raw`/`raw_off`)
+/// and the compressor sliding state (`state_kv`/`state_score` + `n_comp`).
+/// The `compressor_state_shuffle` slide-down (ratio==4) corrupts the
+/// "previous generation" rows irreversibly on a rejected append, so
+/// counter-only rollback is NOT greedy-exact — the state copy is required.
+pub struct LayerFrontier {
+    n_raw: u32,
+    raw_off: u32,
+    comp: Option<CompStateSnap>,
+    index: Option<CompStateSnap>,
+}
+
+/// A reusable full-model frontier snapshot. Allocate once with
+/// [`HetModelState::alloc_frontier`], then [`HetModelState::capture_frontier`]
+/// before a speculative verify and [`HetModelState::restore_frontier`] on
+/// reject.
+pub struct FrontierSnapshot {
+    layers: Vec<LayerFrontier>,
+}
+
 impl HetModelState {
+    /// Pre-allocate a [`FrontierSnapshot`] whose per-compressor buffers match
+    /// this state's live compressor shapes. All buffers land on `dgpu_device`
+    /// (where the compressor state lives).
+    pub fn alloc_frontier(&self, dgpu_device: Device) -> eyre::Result<FrontierSnapshot> {
+        dgpu_device.set_current()?;
+        let id = dgpu_device.id;
+        let mk = |cs: &HetCompressorState| -> eyre::Result<CompStateSnap> {
+            Ok(CompStateSnap {
+                state_kv: DeviceBuffer::<f32>::new(id, cs.state_kv.len())?,
+                state_score: DeviceBuffer::<f32>::new(id, cs.state_score.len())?,
+                n_comp: 0,
+            })
+        };
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for ls in &self.layers {
+            let comp = match &ls.compressor {
+                Some(cs) => Some(mk(cs)?),
+                None => None,
+            };
+            let index = match &ls.indexer_compressor {
+                Some(cs) => Some(mk(cs)?),
+                None => None,
+            };
+            layers.push(LayerFrontier {
+                n_raw: 0,
+                raw_off: 0,
+                comp,
+                index,
+            });
+        }
+        Ok(FrontierSnapshot { layers })
+    }
+
+    /// Capture the current frontier (counters + compressor sliding state)
+    /// into `snap`. Device-to-device copies on the dGPU.
+    pub fn capture_frontier(
+        &self,
+        dgpu_device: Device,
+        snap: &mut FrontierSnapshot,
+    ) -> eyre::Result<()> {
+        dgpu_device.set_current()?;
+        for (ls, lf) in self.layers.iter().zip(snap.layers.iter_mut()) {
+            lf.n_raw = ls.n_raw;
+            lf.raw_off = ls.raw_off;
+            if let (Some(cs), Some(snapc)) = (&ls.compressor, &mut lf.comp) {
+                snapc.state_kv.copy_from_buffer(&cs.state_kv)?;
+                snapc.state_score.copy_from_buffer(&cs.state_score)?;
+                snapc.n_comp = cs.n_comp;
+            }
+            if let (Some(ics), Some(snapi)) = (&ls.indexer_compressor, &mut lf.index) {
+                snapi.state_kv.copy_from_buffer(&ics.state_kv)?;
+                snapi.state_score.copy_from_buffer(&ics.state_score)?;
+                snapi.n_comp = ics.n_comp;
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore the frontier from `snap` (reject rollback). Rewinds counters
+    /// and copies the compressor sliding state back. The raw-KV / comp-KV
+    /// bodies past the restored counters stay as invisible garbage — the next
+    /// append overwrites them (exactly ds4's discipline).
+    ///
+    /// NOTE: assumes no physical raw-cache eviction happened between capture
+    /// and restore (true while `raw_off + n_raw + b <= KV_CACHE_ROWS`, i.e.
+    /// context depth below the eviction boundary). The caller must not
+    /// speculate across an eviction.
+    pub fn restore_frontier(
+        &mut self,
+        dgpu_device: Device,
+        snap: &FrontierSnapshot,
+    ) -> eyre::Result<()> {
+        dgpu_device.set_current()?;
+        for (ls, lf) in self.layers.iter_mut().zip(snap.layers.iter()) {
+            ls.n_raw = lf.n_raw;
+            ls.raw_off = lf.raw_off;
+            if let (Some(cs), Some(snapc)) = (&mut ls.compressor, &lf.comp) {
+                cs.state_kv.copy_from_buffer(&snapc.state_kv)?;
+                cs.state_score.copy_from_buffer(&snapc.state_score)?;
+                cs.n_comp = snapc.n_comp;
+            }
+            if let (Some(ics), Some(snapi)) = (&mut ls.indexer_compressor, &lf.index) {
+                ics.state_kv.copy_from_buffer(&snapi.state_kv)?;
+                ics.state_score.copy_from_buffer(&snapi.state_score)?;
+                ics.n_comp = snapi.n_comp;
+            }
+        }
+        Ok(())
+    }
+
     /// Reset the state in place so it's equivalent to a freshly-`alloc`ed
     /// state of the same dimensions — without re-creating the underlying
     /// device buffers. Used by the server's KV-cache management to wipe

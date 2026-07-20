@@ -49,6 +49,17 @@ impl GraphCache {
     /// instantiate on the first call, but released before the launch.
     /// On steady-state calls the mutex is held only long enough to
     /// `Arc::clone` the `GraphExec` out.
+    /// Drop all captured graphs. Needed when the buffers a graph baked in
+    /// (e.g. a per-`HetModelState` `kv_cache` pointer, captured inside the
+    /// decode `qkv_chain` graph) are replaced by a different allocation —
+    /// otherwise a replay writes to the *previous* state's buffers. In
+    /// production there is one long-lived state so this is never hit; the
+    /// verify correctness harness drives several independent states and must
+    /// clear between them.
+    pub fn clear(&self) {
+        self.entries.lock().unwrap().clear();
+    }
+
     pub fn run<F>(
         &self,
         stage: &'static str,

@@ -20,11 +20,15 @@ pub mod batch_scratch;
 pub mod engine;
 pub mod forward_head;
 pub mod forward_layer;
+pub mod forward_mtp;
 pub mod forward_prefill;
+pub mod forward_verify;
 pub mod graph_cache;
+pub mod mtp_weights;
 pub mod perfetto;
 pub mod prefill_stats;
 pub mod scratch;
+pub mod spec_decode;
 pub mod state;
 pub mod sync;
 pub mod trace;
@@ -33,8 +37,17 @@ pub mod weights;
 pub use batch_scratch::{BatchDgpuScratch, BatchIgpuScratch, BatchScratch, B_MAX};
 pub use prefill_stats::{LayerStats, PerChunkReuse, PrefillStats};
 pub use engine::{DeviceEngine, ExecMode, HeterogeneousEngine, SampleMode};
+pub use forward_mtp::MtpScratch;
+pub use forward_verify::VerifyOut;
+pub use mtp_weights::{MtpRoutedExperts, MtpWeights};
 pub use scratch::{DgpuScratch, IgpuScratch};
-pub use state::{HetCompressorState, HetLayerState, HetModelState};
+pub use spec_decode::{
+    softmax_dist, SpecDecodeConfig, SpecDecodeOut, SpecDecodeStats, SpecSampleConfig,
+    SpecSampleOut, SpecSampleStats,
+};
+pub use state::{
+    FrontierSnapshot, HetCompressorState, HetLayerState, HetModelState, MtpLayerState,
+};
 pub use weights::{
     DgpuLayerWeights, HetGlobalWeights, HetModelWeights, IgpuLayerWeights,
 };

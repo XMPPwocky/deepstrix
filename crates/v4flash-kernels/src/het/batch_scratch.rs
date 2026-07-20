@@ -419,6 +419,14 @@ pub struct BatchIgpuScratch {
     /// `work_items[]`. MUST be zeroed before each layer's pre-pass.
     /// Read back to host (sync) to set grid.y for the main kernel.
     pub n_work_items: DeviceBuffer<i32>,
+    /// MTP-verify overlap (M63): a constant sentinel source, pre-filled at
+    /// alloc with the packed early-exit value `(0<<16)|0xFFFF` (member_start
+    /// 65535 > any group_count → the matvec kernels' `member_end<=member_start`
+    /// guard bails). The verify path d2d-copies this into `work_items[0..
+    /// b*n_used]` before the compact device builder overwrites the prefix, so
+    /// the tail entries early-exit and grid.y can be the tight host bound
+    /// `b*n_used` WITHOUT a host readback of `n_work_items`. `[B_MAX*n_used]`.
+    pub wi_sentinel: DeviceBuffer<i32>,
     /// Hybrid dispatch: work items for the staged kernel (chunks ≥ threshold).
     /// Same shape as `work_items`. MUST be paired with `n_staged_work_items`.
     pub staged_work_items: DeviceBuffer<i32>,
@@ -444,7 +452,13 @@ impl BatchIgpuScratch {
             (BLOCKS_Q8K_GATE_IN as usize) * BLOCK_Q8_K_BYTES;
         let midq_bytes_per_batch =
             (N_EXPERT_USED as usize) * (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
+        // M63 verify-overlap sentinel: constant early-exit work-items
+        // (member_start=0xFFFF > any group_count). Filled once here.
+        let wi_sentinel_len = b * (N_EXPERT_USED as usize);
+        let mut wi_sentinel: DeviceBuffer<i32> = DeviceBuffer::new(id, wi_sentinel_len)?;
+        wi_sentinel.copy_from_host(&vec![0x0000_FFFFi32; wi_sentinel_len])?;
         Ok(Self {
+            wi_sentinel,
             ffn_input_norm_recv: DeviceBuffer::new(id, b * N_EMBD as usize)?,
             d_xq_q8k: DeviceBuffer::new(id, b * xq_bytes_per_batch)?,
             d_mid_cat: DeviceBuffer::new(

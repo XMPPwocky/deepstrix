@@ -27,6 +27,7 @@ use crate::comp_kv_append::CompKvAppend;
 use crate::iq2_xxs::Iq2XxsPairMatvec;
 use crate::kv_cache_append::KvCacheAppend;
 use crate::q2_k::Q2KAccumulateMatvec;
+use crate::q4_k::Q4KMatvec;
 use crate::q8_0::{Q8_0GroupedMatvec, Q8_0Matvec, Q8_0MatvecWmma};
 use crate::q8_k::Q8KQuantize;
 use crate::rms_norm::{RmsNorm, RmsNormNoWeight};
@@ -104,6 +105,11 @@ pub struct DeviceEngine {
     pub q8k: Q8KQuantize,
     pub iq2: Iq2XxsPairMatvec,
     pub q2k: Q2KAccumulateMatvec,
+    /// Q4_K × Q8_K matvec — used only by the MTP drafter's routed MoE
+    /// (the MTP GGUF stores routed experts as Q4_K). Instantiated on both
+    /// arches so the engine struct stays symmetric; the main-model decode
+    /// path never touches it.
+    pub q4k: Q4KMatvec,
     pub hc_sigmoid: HcSigmoidBias,
     pub hc_weighted: HcWeightedSum,
     pub hc_sinkhorn: HcSinkhorn,
@@ -178,6 +184,7 @@ impl DeviceEngine {
             q8k: Q8KQuantize::for_arch(arch)?,
             iq2: Iq2XxsPairMatvec::for_arch(arch)?,
             q2k: Q2KAccumulateMatvec::for_arch(arch)?,
+            q4k: Q4KMatvec::for_arch(arch)?,
             hc_sigmoid: HcSigmoidBias::for_arch(arch)?,
             hc_weighted: HcWeightedSum::for_arch(arch)?,
             hc_sinkhorn: HcSinkhorn::for_arch(arch)?,
@@ -965,6 +972,17 @@ impl HeterogeneousEngine {
         self.dgpu.device.synchronize()?;
         self.igpu.device.synchronize()?;
         Ok(())
+    }
+
+    /// Drop all captured HIP graphs (dGPU + iGPU). Captured decode graphs
+    /// bake in the live `HetModelState`'s `kv_cache` / compressor buffer
+    /// pointers; when a test or harness switches to a *different* state
+    /// allocation, the stale graphs must be cleared or a replay writes to
+    /// the previous state's buffers. Production runs a single long-lived
+    /// state and never needs this.
+    pub fn clear_graphs(&self) {
+        self.dgpu_graphs.clear();
+        self.igpu_graphs.clear();
     }
 
     /// Sample the next token from `dgpu_scratch.logits` on-device.

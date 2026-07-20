@@ -111,7 +111,48 @@ impl HeterogeneousEngine {
         input_hcs: &[Vec<f32>],
         tokens: &[i32],
         pos0: u32,
+        stats: Option<&mut PrefillStats>,
+    ) -> eyre::Result<()> {
+        self.forward_prompt_batch_v2_impl(
+            batch_dgpu, batch_igpu, state, weights, input_hcs, tokens, pos0, stats, false,
+        )
+    }
+
+    /// Batched forward on the DECODE monotonic KV discipline — the MTP
+    /// verify path. Appends the k rows at `raw_off + n_raw` (contiguous,
+    /// no eviction) and reads each token's attention window from `raw_off`,
+    /// so it correctly CONTINUES a state left by decode's `forward_token`.
+    /// `forward_prompt_batch_v2` uses the prefill discipline instead
+    /// (append at `n_raw`, evict the SWA window back to slot 0 post-chunk),
+    /// which corrupts a decode-maintained state. See `forward_verify`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_verify_batch(
+        &self,
+        batch_dgpu: &mut BatchDgpuScratch,
+        batch_igpu: &mut BatchIgpuScratch,
+        state: &mut HetModelState,
+        weights: &HetModelWeights,
+        input_hcs: &[Vec<f32>],
+        tokens: &[i32],
+        pos0: u32,
+    ) -> eyre::Result<()> {
+        self.forward_prompt_batch_v2_impl(
+            batch_dgpu, batch_igpu, state, weights, input_hcs, tokens, pos0, None, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_prompt_batch_v2_impl(
+        &self,
+        batch_dgpu: &mut BatchDgpuScratch,
+        batch_igpu: &mut BatchIgpuScratch,
+        state: &mut HetModelState,
+        weights: &HetModelWeights,
+        input_hcs: &[Vec<f32>],
+        tokens: &[i32],
+        pos0: u32,
         mut stats: Option<&mut PrefillStats>,
+        verify_monotonic: bool,
     ) -> eyre::Result<()> {
         let b = tokens.len();
         if b == 0 {
@@ -156,12 +197,13 @@ impl HeterogeneousEngine {
             pos_v.copy_from_host_async(&pos_host, &self.dgpu.compute)?;
         }
 
+
         // 2. Layer loop: invoke forward_layer_batch_v2 once per layer.
         //    Each call swaps residual / residual_next internally (we do
         //    the swap here for clarity, mirroring forward_token's per-
         //    layer swap).
         for layer in 0..N_LAYER as usize {
-            self.forward_layer_batch_v2(
+            self.forward_layer_batch_v2_impl(
                 batch_dgpu,
                 batch_igpu,
                 &mut state.layers[layer],
@@ -170,6 +212,7 @@ impl HeterogeneousEngine {
                 pos0,
                 tokens,
                 stats.as_deref_mut(),
+                verify_monotonic,
             )?;
             // Swap residual / residual_next for the next layer: the
             // layer wrote residual_next; next layer reads residual.
@@ -719,6 +762,22 @@ impl HeterogeneousEngine {
         tokens: &[i32],
         stats: Option<&mut PrefillStats>,
     ) -> eyre::Result<()> {
+        self.forward_layer_batch_v2_impl(bd, bi, ls, dlw, ilw, pos0, tokens, stats, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_layer_batch_v2_impl(
+        &self,
+        bd: &mut BatchDgpuScratch,
+        bi: &mut BatchIgpuScratch,
+        ls: &mut HetLayerState,
+        dlw: &DgpuLayerWeights,
+        ilw: &IgpuLayerWeights,
+        pos0: u32,
+        tokens: &[i32],
+        stats: Option<&mut PrefillStats>,
+        verify_monotonic: bool,
+    ) -> eyre::Result<()> {
         let layer = dlw.layer_idx as usize;
         let b = tokens.len() as u32;
         if b == 0 {
@@ -726,7 +785,7 @@ impl HeterogeneousEngine {
         }
         let sev = &self.sync_events.layers[layer];
         let hot_active = prefill_hot_active(dlw, ilw, bd);
-        self.forward_layer_pre_moe_v2(bd, bi, ls, dlw, ilw, pos0, tokens, stats, sev)?;
+        self.forward_layer_pre_moe_v2_impl(bd, bi, ls, dlw, ilw, pos0, tokens, stats, sev, verify_monotonic)?;
         self.forward_layer_post_moe_v2(bd, b, sev, hot_active)?;
         Ok(())
     }
@@ -751,6 +810,77 @@ impl HeterogeneousEngine {
         tokens: &[i32],
         stats: Option<&mut PrefillStats>,
         sev: &super::engine::LayerSyncEvents,
+    ) -> eyre::Result<()> {
+        self.forward_layer_pre_moe_v2_impl(bd, bi, ls, dlw, ilw, pos0, tokens, stats, sev, false)
+    }
+
+    /// M63 verify-overlap: peer-push the routed `ffn_input_norm` + selected/
+    /// ew to the iGPU on `de.xfer`, gated by the `selected_ready` →
+    /// `selected_pushed` event chain (no host sync). Extracted so the verify
+    /// path can issue it BEFORE the dGPU shared-expert (letting the iGPU cold
+    /// MoE overlap the shared-expert compute), while prefill keeps issuing it
+    /// after (unchanged ordering).
+    fn push_selected_to_igpu(
+        &self,
+        bd: &BatchDgpuScratch,
+        bi: &mut BatchIgpuScratch,
+        sev: &super::engine::LayerSyncEvents,
+        b: u32,
+    ) -> eyre::Result<()> {
+        let de = &self.dgpu;
+        let cs_n_embd = N_EMBD as usize;
+        let cs_n_used = N_EXPERT_USED;
+        self.set_current_cached(self.dgpu.device)?;
+        sev.selected_ready.record(&de.compute)?;
+        de.xfer.wait_event(&sev.selected_ready)?;
+        let ain_v = bd.ffn_input_norm.slice_view(0, (b as usize) * cs_n_embd);
+        let dsel_v = bd.d_selected.slice_view(0, (b as usize) * cs_n_used);
+        let dew_v = bd.d_ew.slice_view(0, (b as usize) * cs_n_used);
+        let mut bi_ain = bi
+            .ffn_input_norm_recv
+            .slice_view_mut(0, (b as usize) * cs_n_embd);
+        let mut bi_sel = bi.d_selected.slice_view_mut(0, (b as usize) * cs_n_used);
+        let mut bi_ew = bi.d_ew.slice_view_mut(0, (b as usize) * cs_n_used);
+        {
+            let _t_peer_ain = de.events.stage("dgpu.peer_push_ffn_input_norm", &de.xfer)?;
+            {
+                let _t = de.events.stage("k.peer_push.ain", &de.xfer)?;
+                peer_push_f32(&ain_v, &mut bi_ain, &de.xfer)?;
+            }
+            {
+                let _t = de.events.stage("k.peer_push.d_selected", &de.xfer)?;
+                peer_push_i32(&dsel_v, &mut bi_sel, &de.xfer)?;
+            }
+            {
+                let _t = de.events.stage("k.peer_push.d_ew", &de.xfer)?;
+                peer_push_f32(&dew_v, &mut bi_ew, &de.xfer)?;
+            }
+            drop(_t_peer_ain);
+        }
+        sev.selected_pushed.record(&de.xfer)?;
+        Ok(())
+    }
+
+    /// See `forward_layer_pre_moe_v2`. When `verify_monotonic` is set, the
+    /// raw KV cache follows the DECODE discipline (append at `raw_off+n_raw`,
+    /// per-token window read from `raw_off`, advance `raw_off`/`n_raw` like
+    /// decode with a wrap-down when the oversized cache fills) instead of
+    /// prefill's append-at-`n_raw` + evict-to-slot-0. The compressor,
+    /// attention kernels, MoE, and all HC stages are identical between the
+    /// two disciplines (comp_kv is cumulative; everything else is per-token).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_layer_pre_moe_v2_impl(
+        &self,
+        bd: &mut BatchDgpuScratch,
+        bi: &mut BatchIgpuScratch,
+        ls: &mut HetLayerState,
+        dlw: &DgpuLayerWeights,
+        ilw: &IgpuLayerWeights,
+        pos0: u32,
+        tokens: &[i32],
+        stats: Option<&mut PrefillStats>,
+        sev: &super::engine::LayerSyncEvents,
+        verify_monotonic: bool,
     ) -> eyre::Result<()> {
         let layer = dlw.layer_idx;
         if ilw.layer_idx != layer {
@@ -856,17 +986,31 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.q_chain.qa_matvec", &de.compute)?;
             // LDS-tiled WMMA GEMM: matvec_batched re-reads weight per
             // batch (weight-BW-bound at B=512). GEMM shares weight across
-            // BN=64 batch cols.
-            de.q8_wmma.gemm_lds_tiled(
-                &de.compute,
-                &mut bd.qr,
-                &dlw.attn_q_a.buffer,
-                &bd.xq_n_embd,
-                &bd.xscale_n_embd,
-                N_LORA_Q,
-                N_EMBD,
-                b,
-            )?;
+            // BN=64 batch cols. MTP verify (B≤4): weight-reuse is ~0, so the
+            // per-row dp4a matvec is cheaper — force it on verify.
+            if verify_monotonic {
+                de.q8.matvec_batched(
+                    &de.compute,
+                    &mut bd.qr,
+                    &dlw.attn_q_a.buffer,
+                    &bd.xq_n_embd,
+                    &bd.xscale_n_embd,
+                    N_LORA_Q,
+                    N_EMBD,
+                    b,
+                )?;
+            } else {
+                de.q8_wmma.gemm_lds_tiled(
+                    &de.compute,
+                    &mut bd.qr,
+                    &dlw.attn_q_a.buffer,
+                    &bd.xq_n_embd,
+                    &bd.xscale_n_embd,
+                    N_LORA_Q,
+                    N_EMBD,
+                    b,
+                )?;
+            }
         }
         {
             let _t = de.events.stage("k.q_chain.rms_w", &de.compute)?;
@@ -898,7 +1042,14 @@ impl HeterogeneousEngine {
         // at B=512: dp4a 8.82ms / wmma_old 4.24ms / wmma_lds_tiled 1.38ms
         // → 6.4× over dp4a, 3.1× over the older WMMA. Q_FLAT % 64 == 0 ✓.
         // QB_WMMA=wmma forces the older non-tiled WMMA; QB_WMMA=0 forces dp4a.
-        let qb_variant = std::env::var("QB_WMMA").unwrap_or_else(|_| "lds_tiled".into());
+        // MTP verify (B≤4): force dp4a (per-row matvec_batched). At B≤4 the
+        // B≈512-tuned LDS-tiled WMMA is fixed-cost-dominated; dp4a is the
+        // batched twin of decode's warp8 gemv. Prefill keeps its env choice.
+        let qb_variant = if verify_monotonic {
+            "dp4a".to_string()
+        } else {
+            std::env::var("QB_WMMA").unwrap_or_else(|_| "lds_tiled".into())
+        };
         match qb_variant.as_str() {
             "0" | "dp4a" => {
                 let _t = de.events.stage("k.q_chain.qb_matvec", &de.compute)?;
@@ -959,16 +1110,24 @@ impl HeterogeneousEngine {
         let _t_kv = de.events.stage("dgpu.kv_chain", &de.compute)?;
         {
             let _t = de.events.stage("k.kv_chain.matvec", &de.compute)?;
-            de.q8_wmma.gemm_lds_tiled(
-                &de.compute,
-                &mut bd.kv_raw,
-                &dlw.attn_kv.buffer,
-                &bd.xq_n_embd,
-                &bd.xscale_n_embd,
-                N_HEAD_DIM,
-                N_EMBD,
-                b,
-            )?;
+            // MTP verify (B≤4): dp4a per-row matvec beats B≈512-tuned WMMA.
+            if verify_monotonic {
+                de.q8.matvec_batched(
+                    &de.compute, &mut bd.kv_raw, &dlw.attn_kv.buffer,
+                    &bd.xq_n_embd, &bd.xscale_n_embd, N_HEAD_DIM, N_EMBD, b,
+                )?;
+            } else {
+                de.q8_wmma.gemm_lds_tiled(
+                    &de.compute,
+                    &mut bd.kv_raw,
+                    &dlw.attn_kv.buffer,
+                    &bd.xq_n_embd,
+                    &bd.xscale_n_embd,
+                    N_HEAD_DIM,
+                    N_EMBD,
+                    b,
+                )?;
+            }
         }
         {
             let _t = de.events.stage("k.kv_chain.rms_w", &de.compute)?;
@@ -1043,12 +1202,45 @@ impl HeterogeneousEngine {
         // the last SWA_WINDOW rows back to slots [0..W) and resets ls.n_raw
         // to W (or less, for short prompts) so the steady-state SWA invariant
         // holds for decode and for the next chunk.
+        // DECODE (verify) discipline: the live SWA window sits at
+        // [raw_off, raw_off+n_raw); append the k rows MONOTONICALLY at
+        // `raw_off + n_raw` (contiguous, no eviction) so a decode-maintained
+        // state continues bit-consistently. If the oversized cache would
+        // overflow, wrap the window down to slot 0 first (the same two-hop
+        // copy decode uses). PREFILL discipline: append at `n_raw`, evict later.
+        if verify_monotonic && (ls.raw_off + ls.n_raw + b) as usize > KV_CACHE_ROWS {
+            let head_dim = N_HEAD_DIM as usize;
+            let win_len = (ls.n_raw as usize) * head_dim;
+            let src_off = (ls.raw_off as usize) * head_dim;
+            {
+                let mut ring = bd.kv_ring_scratch.slice_view_mut(0, win_len);
+                let src = ls.kv_cache.slice_view(src_off, win_len);
+                ring.copy_from_buffer_async(&src, &de.compute)?;
+            }
+            {
+                let ring = bd.kv_ring_scratch.slice_view(0, win_len);
+                let mut dst = ls.kv_cache.slice_view_mut(0, win_len);
+                dst.copy_from_buffer_async(&ring, &de.compute)?;
+            }
+            ls.raw_off = 0;
+        }
         let n_raw_before = ls.n_raw;
+        // Monotonic append base slot = raw_off+n_raw (verify) vs n_raw (prefill).
+        let append_base = if verify_monotonic {
+            ls.raw_off + ls.n_raw
+        } else {
+            n_raw_before
+        };
         let mut n_raw_offset_after: Vec<u32> = Vec::with_capacity(b as usize);
         for i in 0..b as usize {
             let causal_end = n_raw_before + i as u32 + 1; // exclusive upper slot
             let n_per = causal_end.min(SWA_WINDOW);
-            let offset = causal_end.saturating_sub(SWA_WINDOW);
+            let offset = if verify_monotonic {
+                // Window ends at slot append_base+i; length n_per rows.
+                (append_base + i as u32 + 1) - n_per
+            } else {
+                causal_end.saturating_sub(SWA_WINDOW)
+            };
             n_raw_after.push(n_per);
             n_raw_offset_after.push(offset);
         }
@@ -1062,15 +1254,15 @@ impl HeterogeneousEngine {
         // b ≤ B_MAX must hold, otherwise launch_batched will OOB-write into
         // the next layer's KV allocation. Guard in debug builds.
         debug_assert!(
-            (n_raw_before + b) as usize <= KV_CACHE_ROWS,
-            "kv_append OOB: n_raw_before={n_raw_before} + b={b} > KV_CACHE_ROWS={}",
+            (append_base + b) as usize <= KV_CACHE_ROWS,
+            "kv_append OOB: append_base={append_base} + b={b} > KV_CACHE_ROWS={}",
             KV_CACHE_ROWS,
         );
         de.kv_append.launch_batched(
             &de.compute,
             &mut ls.kv_cache,
             &bd.kv_normed,
-            n_raw_before,
+            append_base,
             N_HEAD_DIM,
             b,
         )?;
@@ -1879,7 +2071,19 @@ impl HeterogeneousEngine {
         // The shift may have source/dest overlap when n_raw_during_chunk is
         // between (SWA_WINDOW, 2*SWA_WINDOW), so route through the kv_ring
         // scratch buffer.
-        if n_raw_during_chunk > SWA_WINDOW {
+        if verify_monotonic {
+            // DECODE discipline: advance the window exactly as k sequential
+            // decode steps would — no eviction (the rows stay in place,
+            // ready for MTP rollback). Wrap-down is handled at the START of
+            // the next append when the oversized cache would overflow.
+            for _ in 0..b {
+                if ls.n_raw < SWA_WINDOW {
+                    ls.n_raw += 1;
+                } else {
+                    ls.raw_off += 1;
+                }
+            }
+        } else if n_raw_during_chunk > SWA_WINDOW {
             let src_first_slot = n_raw_during_chunk - SWA_WINDOW;
             let head_dim = N_HEAD_DIM as usize;
             let ring_len = (SWA_WINDOW as usize) * head_dim;
@@ -1897,12 +2101,13 @@ impl HeterogeneousEngine {
                 dst_v.copy_from_buffer_async(&ring_src, &de.compute)?;
             }
             ls.n_raw = SWA_WINDOW;
+            // M55: prefill always leaves the live window at slots [0..n_raw);
+            // reset the decode-side monotonic offset to match.
+            ls.raw_off = 0;
         } else {
             ls.n_raw = n_raw_during_chunk;
+            ls.raw_off = 0;
         }
-        // M55: prefill always leaves the live window at slots [0..n_raw);
-        // reset the decode-side monotonic offset to match.
-        ls.raw_off = 0;
 
         // ========================================================
         // Stage 6: Output projection (rope_inv per b, then BATCHED q8)
@@ -1942,9 +2147,14 @@ impl HeterogeneousEngine {
             // M. Isolated A/B per sub-group at B=512: dp4a 0.42ms vs
             // lds_tiled 0.20ms = 2.1× on each, ~2× on the whole grouped
             // call. Q8_GROUPED_VARIANT=dp4a rolls back.
+            // MTP verify (B≤4): the LDS-tiled WMMA grouped GEMM is tuned for
+            // B≈512; at B≤4 it is fixed-cost-dominated and ~2× the per-row
+            // dp4a batched matvec (the batched twin of decode's warp8 gemv,
+            // identical inner loop). Force dp4a on the verify path — prefill
+            // keeps WMMA. Argmax-exact (validated 78→62 ms floor drop).
             let grp_variant = std::env::var("Q8_GROUPED_VARIANT")
                 .unwrap_or_else(|_| "lds_tiled".into());
-            if grp_variant == "dp4a" {
+            if grp_variant == "dp4a" || verify_monotonic {
                 de.q8_grouped.matvec_grouped_batched(
                     &de.compute, &mut bd.low, &dlw.attn_output_a.buffer,
                     &bd.heads_xq, &bd.heads_xscale,
@@ -1975,8 +2185,10 @@ impl HeterogeneousEngine {
             // (M=N_EMBD=4096, K=OUT_LOW=8192) hits the same s_wait_loadcnt
             // throttle on dp4a; LDS-tiled WMMA wins 6.2× at B=512 isolated
             // (8.82 → 1.42 ms). Q8_OUT_VARIANT=dp4a rolls back.
+            // MTP verify (B≤4): dp4a per-row matvec beats the B≈512-tuned
+            // LDS-tiled WMMA at tiny B (weight-reuse is ~0). Force on verify.
             let out_variant = std::env::var("Q8_OUT_VARIANT").unwrap_or_else(|_| "lds_tiled".into());
-            if out_variant == "dp4a" {
+            if out_variant == "dp4a" || verify_monotonic {
                 de.q8.matvec_batched(
                     &de.compute, &mut bd.attn_out, &dlw.attn_output_b.buffer,
                     &bd.low_xq, &bd.low_xscale, N_EMBD, OUT_LOW, b,
@@ -2162,6 +2374,17 @@ impl HeterogeneousEngine {
             s.record_batch(layer as usize, &sel_host, b);
         }
 
+        // M63 verify-overlap: hand the routed activations + selection to the
+        // iGPU NOW (before the dGPU shared-expert), so the iGPU cold-expert
+        // MoE runs CONCURRENTLY with the dGPU shared-expert + hot MoE instead
+        // of serially after them. The router already wrote d_selected/d_ew and
+        // ffn_input_norm on de.compute; the event chain (selected_ready) fences
+        // the xfer read. Prefill keeps the original post-shared-expert ordering
+        // (below), untouched.
+        if verify_monotonic {
+            self.push_selected_to_igpu(bd, bi, sev, b as u32)?;
+        }
+
         // ========================================================
         // Stage 10: Shared expert (BATCHED Q8_0 chains)
         // swiglu + vec_add are pure elementwise → stretch n by B
@@ -2183,29 +2406,45 @@ impl HeterogeneousEngine {
             // tile and reused across BN=64 batch cols (matvec_batched
             // re-reads weight per batch — weight-BW-bound at B=512).
             let _t = de.events.stage("k.shared_expert.gate_matvec", &de.compute)?;
-            de.q8_wmma.gemm_lds_tiled(
-                &de.compute,
-                &mut bd.gate_sh,
-                &dlw.shared.gate.buffer,
-                &bd.xq_n_embd,
-                &bd.xscale_n_embd,
-                N_FF_SHARED,
-                N_EMBD,
-                b,
-            )?;
+            // MTP verify (B≤4): dp4a per-row matvec beats the B≈512-tuned
+            // LDS-tiled WMMA (weight-reuse ~0). Force on verify.
+            if verify_monotonic {
+                de.q8.matvec_batched(
+                    &de.compute, &mut bd.gate_sh, &dlw.shared.gate.buffer,
+                    &bd.xq_n_embd, &bd.xscale_n_embd, N_FF_SHARED, N_EMBD, b,
+                )?;
+            } else {
+                de.q8_wmma.gemm_lds_tiled(
+                    &de.compute,
+                    &mut bd.gate_sh,
+                    &dlw.shared.gate.buffer,
+                    &bd.xq_n_embd,
+                    &bd.xscale_n_embd,
+                    N_FF_SHARED,
+                    N_EMBD,
+                    b,
+                )?;
+            }
         }
         {
             let _t = de.events.stage("k.shared_expert.up_matvec", &de.compute)?;
-            de.q8_wmma.gemm_lds_tiled(
-                &de.compute,
-                &mut bd.up_sh,
-                &dlw.shared.up.buffer,
-                &bd.xq_n_embd,
-                &bd.xscale_n_embd,
-                N_FF_SHARED,
-                N_EMBD,
-                b,
-            )?;
+            if verify_monotonic {
+                de.q8.matvec_batched(
+                    &de.compute, &mut bd.up_sh, &dlw.shared.up.buffer,
+                    &bd.xq_n_embd, &bd.xscale_n_embd, N_FF_SHARED, N_EMBD, b,
+                )?;
+            } else {
+                de.q8_wmma.gemm_lds_tiled(
+                    &de.compute,
+                    &mut bd.up_sh,
+                    &dlw.shared.up.buffer,
+                    &bd.xq_n_embd,
+                    &bd.xscale_n_embd,
+                    N_FF_SHARED,
+                    N_EMBD,
+                    b,
+                )?;
+            }
         }
         {
             let _t = de.events.stage("k.shared_expert.swiglu", &de.compute)?;
@@ -2231,16 +2470,23 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.shared_expert.down_matvec", &de.compute)?;
-            de.q8_wmma.gemm_lds_tiled(
-                &de.compute,
-                &mut bd.ffn_shared,
-                &dlw.shared.down.buffer,
-                &bd.mid_sh_xq,
-                &bd.mid_sh_xscale,
-                N_EMBD,
-                N_FF_SHARED,
-                b,
-            )?;
+            if verify_monotonic {
+                de.q8.matvec_batched(
+                    &de.compute, &mut bd.ffn_shared, &dlw.shared.down.buffer,
+                    &bd.mid_sh_xq, &bd.mid_sh_xscale, N_EMBD, N_FF_SHARED, b,
+                )?;
+            } else {
+                de.q8_wmma.gemm_lds_tiled(
+                    &de.compute,
+                    &mut bd.ffn_shared,
+                    &dlw.shared.down.buffer,
+                    &bd.mid_sh_xq,
+                    &bd.mid_sh_xscale,
+                    N_EMBD,
+                    N_FF_SHARED,
+                    b,
+                )?;
+            }
         }
         drop(_t_shared);
 
@@ -2257,48 +2503,13 @@ impl HeterogeneousEngine {
         let dbpe = ilw.routed.down_bytes_per_expert as u32;
         let mid_blocks_bytes = (crate::config::BLOCKS_Q8K_DOWN_IN as usize)
             * crate::q8_k::BLOCK_Q8_K_BYTES;
-        // Stage 9 router_topk + Stage 10 shared expert wrote bd.d_selected,
-        // bd.d_ew, bd.ffn_input_norm on de.compute. We're about to read
-        // them from de.xfer. Use the LayerSyncEvents event chain
-        // (selected_ready → wait → push → selected_pushed → igpu waits)
-        // instead of a host sync, so de.compute is free to keep queuing
-        // the next lane's pre-MoE work while xfer/igpu drain this lane.
-        self.set_current_cached(self.dgpu.device)?;
-        sev.selected_ready.record(&de.compute)?;
-        de.xfer.wait_event(&sev.selected_ready)?;
-        // Single batched peer-push of all B activations + routing.
-        let ain_v = bd
-            .ffn_input_norm
-            .slice_view(0, (b as usize) * cs_n_embd);
-        let dsel_v = bd.d_selected.slice_view(0, (b as usize) * cs_n_used);
-        let dew_v = bd.d_ew.slice_view(0, (b as usize) * cs_n_used);
-        let mut bi_ain = bi
-            .ffn_input_norm_recv
-            .slice_view_mut(0, (b as usize) * cs_n_embd);
-        let mut bi_sel = bi
-            .d_selected
-            .slice_view_mut(0, (b as usize) * cs_n_used);
-        let mut bi_ew = bi.d_ew.slice_view_mut(0, (b as usize) * cs_n_used);
-        {
-            let _t_peer_ain = de.events.stage("dgpu.peer_push_ffn_input_norm", &de.xfer)?;
-            {
-                let _t = de.events.stage("k.peer_push.ain", &de.xfer)?;
-                peer_push_f32(&ain_v, &mut bi_ain, &de.xfer)?;
-            }
-            {
-                let _t = de.events.stage("k.peer_push.d_selected", &de.xfer)?;
-                peer_push_i32(&dsel_v, &mut bi_sel, &de.xfer)?;
-            }
-            {
-                let _t = de.events.stage("k.peer_push.d_ew", &de.xfer)?;
-                peer_push_f32(&dew_v, &mut bi_ew, &de.xfer)?;
-            }
-            drop(_t_peer_ain);
+        // Prefill: hand off AFTER the shared expert (original ordering; the
+        // verify path already issued this before Stage 10 for overlap).
+        // Uses the LayerSyncEvents chain (selected_ready → wait → push →
+        // selected_pushed) — no host sync, so de.compute keeps queuing.
+        if !verify_monotonic {
+            self.push_selected_to_igpu(bd, bi, sev, b as u32)?;
         }
-        sev.selected_pushed.record(&de.xfer)?;
-        drop(bi_ain);
-        drop(bi_sel);
-        drop(bi_ew);
 
         // ========================================================
         // M61 prefill het-split: the dGPU computes its RESIDENT (hot)
@@ -2560,29 +2771,77 @@ impl HeterogeneousEngine {
                 }
             }
         } else {
-            bi.n_work_items.fill_zero()?;
-            {
-                let BatchIgpuScratch {
-                    work_items,
-                    n_work_items,
-                    group_count,
-                    ..
-                } = bi;
-                let _t_wi = ie.events.stage("igpu.moe_work_items", &ie.compute)?;
-                ie.moe_group_builder.launch_work_items(
-                    &ie.compute,
-                    work_items,
-                    n_work_items,
-                    group_count,
-                    N_EXPERT,
-                    CHUNK_SIZE,
-                    work_items.len() as u32,
-                )?;
+            if verify_monotonic {
+                // M63 overlap: the per-layer `ie.compute.synchronize()` +
+                // readback of `n_work_items` (below, non-verify branch) is the
+                // ONLY host-blocking sync in an otherwise fully event-chained
+                // batched MoE pipeline. It stops the iGPU cold-expert compute
+                // (~19 ms at B=2) from overlapping the dGPU shared-expert/
+                // attention (~49 ms) — decode overlaps this, verify didn't
+                // (Step-0 VERIFY_BUSY).
+                //
+                // Kill the readback WITHOUT the over-launch a full static list
+                // caused (256 empty WGs ≈ 2× iGPU busy): keep the COMPACT
+                // device builder (fills work_items[0..n_actual] + a device
+                // count we ignore), but first sentinel-fill the grid range
+                // [0..b*n_used] with an early-exit packed value
+                // (member_start=0xFFFF > any group_count → in-kernel guard
+                // `member_end<=member_start` bails). `b*n_used` is the exact
+                // host upper bound on work items (≤1 chunk/expert at b≤CHUNK),
+                // so the grid is TIGHT and the output is bit-identical to the
+                // dynamic path. All on ie.compute (FIFO) → no host sync.
+                let n_grid = b as u32 * cs_n_used as u32;
+                // Builder uses n_work_items as an atomic write cursor → reset.
+                bi.n_work_items.fill_zero_async(&ie.compute)?;
+                {
+                    let mut wi_v = bi.work_items.slice_view_mut(0, n_grid as usize);
+                    let sent_v = bi.wi_sentinel.slice_view(0, n_grid as usize);
+                    wi_v.copy_from_buffer_async(&sent_v, &ie.compute)?;
+                }
+                {
+                    let BatchIgpuScratch {
+                        work_items,
+                        n_work_items,
+                        group_count,
+                        ..
+                    } = bi;
+                    let _t_wi = ie.events.stage("igpu.moe_work_items", &ie.compute)?;
+                    ie.moe_group_builder.launch_work_items(
+                        &ie.compute,
+                        work_items,
+                        n_work_items,
+                        group_count,
+                        N_EXPERT,
+                        CHUNK_SIZE,
+                        n_grid,
+                    )?;
+                }
+                n_work_items = n_grid;
+            } else {
+                bi.n_work_items.fill_zero()?;
+                {
+                    let BatchIgpuScratch {
+                        work_items,
+                        n_work_items,
+                        group_count,
+                        ..
+                    } = bi;
+                    let _t_wi = ie.events.stage("igpu.moe_work_items", &ie.compute)?;
+                    ie.moe_group_builder.launch_work_items(
+                        &ie.compute,
+                        work_items,
+                        n_work_items,
+                        group_count,
+                        N_EXPERT,
+                        CHUNK_SIZE,
+                        work_items.len() as u32,
+                    )?;
+                }
+                ie.compute.synchronize()?;
+                let mut n_wi_host = [0i32; 1];
+                bi.n_work_items.copy_to_host(&mut n_wi_host)?;
+                n_work_items = n_wi_host[0] as u32;
             }
-            ie.compute.synchronize()?;
-            let mut n_wi_host = [0i32; 1];
-            bi.n_work_items.copy_to_host(&mut n_wi_host)?;
-            n_work_items = n_wi_host[0] as u32;
             {
                 let BatchIgpuScratch {
                     d_mid_cat,

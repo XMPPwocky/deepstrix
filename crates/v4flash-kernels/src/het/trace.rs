@@ -167,6 +167,26 @@ impl EventPool {
         self.label
     }
 
+    /// Harvest per-pair intervals as (name, start_ms, end_ms) relative to
+    /// the FIRST recorded start event. Real GPU HW timestamps (not host
+    /// stage spans) — usable for computing device-busy via interval union.
+    pub fn harvest_intervals(&self) -> eyre::Result<Vec<(&'static str, f32, f32)>> {
+        let inner = self.inner.borrow();
+        if inner.pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let last_end_idx = inner.pairs.last().unwrap().end_idx;
+        inner.events[last_end_idx].synchronize()?;
+        let ref_idx = inner.pairs[0].start_idx;
+        let mut out = Vec::with_capacity(inner.pairs.len());
+        for p in &inner.pairs {
+            let s = Event::elapsed_ms(&inner.events[ref_idx], &inner.events[p.start_idx])?;
+            let e = Event::elapsed_ms(&inner.events[ref_idx], &inner.events[p.end_idx])?;
+            out.push((p.name, s, e));
+        }
+        Ok(out)
+    }
+
     /// Synchronize on the last event in the ring, then invoke `f` once
     /// per recorded pair with `(name, &start_event, &end_event)`. Used
     /// by the perfetto device-time exporter to emit per-stream tracks

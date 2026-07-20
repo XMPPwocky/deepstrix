@@ -60,11 +60,20 @@ fn bench_prefill_v2() -> eyre::Result<()> {
     install_panic_handler()?;
     use v4flash_kernels::config::HC_DIM;
 
-    let b: usize = std::env::var("BENCH_B")
+    // BENCH_B accepts a comma-separated list (e.g. "1,2,3,4") so the C(B)
+    // cost-scaling curve is measured in ONE process / one 86 GB weight load.
+    // Baseline for C(B) is the FIRST entry in the list.
+    let bs_list: Vec<usize> = std::env::var("BENCH_B")
         .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(PROMPT_TOKENS.len())
-        .min(64);
+        .map(|s| {
+            s.split(',')
+                .filter_map(|x| x.trim().parse::<usize>().ok())
+                .map(|b| b.clamp(1, 64))
+                .collect::<Vec<_>>()
+        })
+        .filter(|v: &Vec<usize>| !v.is_empty())
+        .unwrap_or_else(|| vec![PROMPT_TOKENS.len()]);
+    let b_max = *bs_list.iter().max().unwrap();
     let n_warmup: usize = std::env::var("BENCH_WARMUP")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -73,7 +82,7 @@ fn bench_prefill_v2() -> eyre::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
-    eprintln!("bench_prefill_v2: B={b}, warmup={n_warmup}, iters={n_iters}");
+    eprintln!("bench_prefill_v2: B list={bs_list:?}, warmup={n_warmup}, iters={n_iters}");
 
     let dump = ActivationDump::open(dump_dir())?;
     let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
@@ -103,9 +112,9 @@ fn bench_prefill_v2() -> eyre::Result<()> {
     // to support synthetic B>7 timing tests. (Repeated inputs make KV
     // cache contents bogus but kernel timings unchanged.)
     let n_real = PROMPT_TOKENS.len();
-    let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(b);
-    let mut tokens: Vec<i32> = Vec::with_capacity(b);
-    for i in 0..b {
+    let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(b_max);
+    let mut tokens: Vec<i32> = Vec::with_capacity(b_max);
+    for i in 0..b_max {
         let src_i = i % n_real;
         let entry = dump
             .tensor("layer_input_residual", 0, src_i as i32)
@@ -115,67 +124,63 @@ fn bench_prefill_v2() -> eyre::Result<()> {
         input_hcs.push(hc);
         tokens.push(PROMPT_TOKENS[src_i]);
     }
-    if b > n_real {
+    if b_max > n_real {
         eprintln!("(B>{n_real}: repeating real inputs cyclically — timing only, not correctness)");
     }
 
-    eprintln!("warmup × {n_warmup}");
-    for _ in 0..n_warmup {
-        let mut state = HetModelState::alloc(dgpu, igpu, b as u32 + 4)?;
-        engine.forward_prompt_batch_v2(
-            &mut bd,
-            &mut bi,
-            &mut state,
-            &main_weights,
-            &input_hcs,
-            &tokens,
-            0,
-            None,
-        )?;
+    // (B, best_ms, median_ms) per batch size, measured back-to-back in one
+    // thermal envelope so C(B) = t(B)/t(B0) is drift-free.
+    let mut rows: Vec<(usize, f64, f64)> = Vec::with_capacity(bs_list.len());
+    for &b in &bs_list {
+        let inp = &input_hcs[0..b];
+        let toks = &tokens[0..b];
+        eprintln!("--- B={b}: warmup × {n_warmup} ---");
+        for _ in 0..n_warmup {
+            let mut state = HetModelState::alloc(dgpu, igpu, b as u32 + 4)?;
+            engine.forward_prompt_batch_v2(
+                &mut bd, &mut bi, &mut state, &main_weights, inp, toks, 0, None,
+            )?;
+        }
+        let mut walls_ms: Vec<f64> = Vec::with_capacity(n_iters);
+        for it in 0..n_iters {
+            let mut state = HetModelState::alloc(dgpu, igpu, b as u32 + 4)?;
+            let t0 = Instant::now();
+            engine.forward_prompt_batch_v2(
+                &mut bd, &mut bi, &mut state, &main_weights, inp, toks, 0, None,
+            )?;
+            let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            walls_ms.push(wall_ms);
+            eprintln!(
+                "  B={b} iter {it}: wall={:.2} ms  ({:.2} ms/tok)",
+                wall_ms,
+                wall_ms / b as f64
+            );
+        }
+        walls_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        rows.push((b, walls_ms[0], walls_ms[walls_ms.len() / 2]));
     }
 
-    let mut walls_ms: Vec<f64> = Vec::with_capacity(n_iters);
-    for it in 0..n_iters {
-        let mut state = HetModelState::alloc(dgpu, igpu, b as u32 + 4)?;
-        let t0 = Instant::now();
-        engine.forward_prompt_batch_v2(
-            &mut bd,
-            &mut bi,
-            &mut state,
-            &main_weights,
-            &input_hcs,
-            &tokens,
-            0,
-            None,
-        )?;
-        let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        walls_ms.push(wall_ms);
+    // C(B) table: cost multiplier vs the FIRST batch size, and the implied
+    // fixed-overhead fraction F from C(B) = F + (1-F)*B  =>  F = (B - C)/(B - 1).
+    let (b0, best0, med0) = rows[0];
+    eprintln!("\n=== C(B) COST-SCALING (baseline B={b0}) ===");
+    eprintln!("   B | best ms  median ms | C(B)=med/med0 | ms/tok | implied F");
+    for &(b, best, med) in &rows {
+        let c = med / med0;
+        let f = if b > b0 {
+            (b as f64 - c) / (b as f64 - 1.0)
+        } else {
+            f64::NAN
+        };
         eprintln!(
-            "  iter {it}: wall={:.2} ms  ({:.2} ms/tok = {:.2} tok/s)",
-            wall_ms,
-            wall_ms / b as f64,
-            (b as f64 * 1000.0) / wall_ms
+            "  {b:>2} | {best:>7.2}  {med:>8.2} | {c:>12.3} | {:>6.2} | {f:>8.3}",
+            med / b as f64
         );
     }
-
-    walls_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let median_ms = walls_ms[walls_ms.len() / 2];
-    let min_ms = walls_ms[0];
-    eprintln!("\n=== BENCH PREFILL V2 B={b} ===");
-    eprintln!(
-        "best wall:   {:.2} ms ({:.2} ms/tok = {:.2} tok/s)",
-        min_ms,
-        min_ms / b as f64,
-        (b as f64 * 1000.0) / min_ms
-    );
-    eprintln!(
-        "median wall: {:.2} ms ({:.2} ms/tok = {:.2} tok/s)",
-        median_ms,
-        median_ms / b as f64,
-        (b as f64 * 1000.0) / median_ms
-    );
     eprintln!("reference: single-token decode = 35.78 ms/tok = 27.95 tok/s (master p50)");
-    eprintln!("reference: Phase 1 (looped) = 77 ms/tok @ B=7 (forfeits M30 graphs)");
+    eprintln!(
+        "MTP break-even @ yield 2.6, k=2 (B=3): need C(3) < 2.6 (i.e. F > 0.20)"
+    );
     Ok(())
 }
 
