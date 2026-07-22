@@ -34,6 +34,13 @@ pub struct BpeVocab {
     pub eos_id: Option<i32>,
     pub unknown_id: Option<i32>,
     pub padding_id: Option<i32>,
+    /// End-of-turn token (`tokenizer.ggml.eot_token_id`). For Laguna this
+    /// is id 24 (`</assistant>`) and is the primary generation stop.
+    pub eot_id: Option<i32>,
+    /// Whether to prepend BOS on encode (`tokenizer.ggml.add_bos_token`).
+    pub add_bos: bool,
+    /// Pre-tokenizer name (`tokenizer.ggml.pre`), e.g. "laguna".
+    pub pre: Option<String>,
     /// V4-Flash DSML control token (`｜DSML｜`). Resolved at load time
     /// via `lookup_token_id`, mirroring ds4.c:14952. None if the GGUF
     /// is not a V4-Flash vocab.
@@ -86,6 +93,17 @@ impl BpeVocab {
         let unknown_id = g.metadata("tokenizer.ggml.unknown_token_id").and_then(|v| v.as_u32()).map(|v| v as i32);
         let padding_id = g.metadata("tokenizer.ggml.padding_token_id").and_then(|v| v.as_u32()).map(|v| v as i32);
         let dsml_id = token_to_id.get("｜DSML｜".as_bytes()).copied();
+        let eot_id = g.metadata("tokenizer.ggml.eot_token_id").and_then(|v| v.as_u32()).map(|v| v as i32);
+        // add_bos_token defaults to true when absent (matches llama.cpp for
+        // Laguna, whose GGUF sets add_bos_token=true explicitly).
+        let add_bos = g
+            .metadata("tokenizer.ggml.add_bos_token")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let pre = g
+            .metadata("tokenizer.ggml.pre")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         Ok(BpeVocab {
             tokens,
@@ -95,6 +113,9 @@ impl BpeVocab {
             eos_id,
             unknown_id,
             padding_id,
+            eot_id,
+            add_bos,
+            pre,
             dsml_id,
         })
     }
@@ -118,6 +139,40 @@ impl BpeVocab {
             self.bpe_emit_piece(piece, &mut out);
         }
         out
+    }
+
+    /// Encode using the Laguna pre-tokenizer (llama.cpp `LAGUNA` pre-type =
+    /// newline pre-split + Qwen2-style GPT-2 regex, single-digit numbers),
+    /// GPT-2 byte encoding + BPE merge. Prepends BOS (id 2) when `add_bos`.
+    ///
+    /// This is additive and does not touch the ds4/joyai `encode` path.
+    pub fn encode_laguna(&self, text: &str) -> Vec<i32> {
+        self.encode_laguna_opts(text, self.add_bos)
+    }
+
+    /// Laguna encode with explicit BOS control (server/CLI may already have
+    /// prefixed BOS via the chat template).
+    pub fn encode_laguna_opts(&self, text: &str, add_bos: bool) -> Vec<i32> {
+        let mut out = Vec::new();
+        if add_bos {
+            if let Some(bos) = self.bos_id {
+                out.push(bos);
+            }
+        }
+        for (a, b) in laguna_pre_tokenize(text) {
+            self.bpe_emit_piece(&text.as_bytes()[a..b], &mut out);
+        }
+        out
+    }
+
+    /// Dispatch on the GGUF `tokenizer.ggml.pre` value: "laguna" uses the
+    /// Laguna path (with its `add_bos`), anything else keeps the legacy
+    /// ds4/joyai `encode` (no implicit BOS, unchanged behavior).
+    pub fn encode_auto(&self, text: &str) -> Vec<i32> {
+        match self.pre.as_deref() {
+            Some("laguna") => self.encode_laguna(text),
+            _ => self.encode(text),
+        }
     }
 
     fn bpe_emit_piece(&self, raw_piece: &[u8], out: &mut Vec<i32>) {
@@ -408,6 +463,172 @@ pub fn joyai_pre_tokenize(text: &[u8]) -> Vec<&[u8]> {
     out
 }
 
+// ---- Laguna pre-tokenizer ----
+//
+// Port of llama.cpp `LLAMA_VOCAB_PRE_TYPE_LAGUNA` (poolside fork). The
+// pre-type applies two regex expressions in sequence:
+//
+//   1. "[^\n]+|[\n]+"   -> newline pre-split (unicode_regex_split_custom_newlines)
+//   2. "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
+//       |[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*
+//       |\s*[\r\n]+|\s+(?!\S)|\s+"
+//      -> the Qwen2 GPT-2-style splitter (unicode_regex_split_custom_qwen2)
+//
+// Both patterns route to hand-coded custom splitters in llama.cpp's
+// unicode.cpp, so we port those splitters directly (no regex engine).
+// Difference vs the llama3 pre-type: numbers are single codepoints (`\p{N}`,
+// not `\p{N}{1,3}`); difference vs ds4/joyai: entirely — see the module docs.
+//
+// Unicode classes: `\p{L}` ~= char::is_alphabetic() minus numeric, `\p{N}`
+// ~= char::is_numeric() (Nd|Nl|No), `\s` ~= char::is_whitespace(). The
+// `flags.as_uint()` "has a category" guard maps to "codepoint in range".
+
+/// Laguna pre-tokenize `text` into byte sub-ranges `[start, end)` of
+/// `text.as_bytes()`. Operates on Unicode codepoints internally.
+pub fn laguna_pre_tokenize(text: &str) -> Vec<(usize, usize)> {
+    let cps: Vec<char> = text.chars().collect();
+    // byte offset of each char index; boff[cps.len()] == text.len()
+    let mut boff: Vec<usize> = Vec::with_capacity(cps.len() + 1);
+    let mut b = 0usize;
+    for c in &cps {
+        boff.push(b);
+        b += c.len_utf8();
+    }
+    boff.push(text.len());
+
+    let n = cps.len();
+    let mut bounds: Vec<usize> = Vec::new(); // absolute char-index token ends
+
+    // Stage 1: split on newline runs vs non-newline runs.
+    let mut seg_start = 0usize;
+    while seg_start < n {
+        let is_nl = cps[seg_start] == '\n';
+        let mut seg_end = seg_start;
+        while seg_end < n && (cps[seg_end] == '\n') == is_nl {
+            seg_end += 1;
+        }
+        // Stage 2: Qwen2 split within [seg_start, seg_end).
+        laguna_qwen2_split(&cps, seg_start, seg_end, &mut bounds);
+        seg_start = seg_end;
+    }
+
+    let mut out = Vec::with_capacity(bounds.len());
+    let mut prev = 0usize;
+    for &e in &bounds {
+        if e > prev {
+            out.push((boff[prev], boff[e]));
+        }
+        prev = e;
+    }
+    out
+}
+
+/// Port of `unicode_regex_split_custom_qwen2` for a single segment
+/// `[ini, end)` of `cps`. Pushes absolute char-index token ends onto
+/// `bounds` (contiguous, covering the whole segment).
+fn laguna_qwen2_split(cps: &[char], ini: usize, end: usize, bounds: &mut Vec<usize>) {
+    let cpt = |p: usize| -> Option<char> {
+        if ini <= p && p < end { Some(cps[p]) } else { None }
+    };
+    // \p{N}: Nd|Nl|No
+    let is_number = |p: usize| cpt(p).map_or(false, |c| c.is_numeric());
+    // \p{L}: guarded elsewhere by !is_number, so exclude Nl overlap here.
+    let is_letter = |p: usize| cpt(p).map_or(false, |c| c.is_alphabetic() && !c.is_numeric());
+    let is_ws = |p: usize| cpt(p).map_or(false, |c| c.is_whitespace());
+    // flags.as_uint() != 0  <=>  codepoint present (in range).
+    let has_flags = |p: usize| cpt(p).is_some();
+
+    let mut pos = ini;
+    while pos < end {
+        let c = cps[pos];
+
+        // (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
+        if c == '\'' && pos + 1 < end {
+            let n1 = cps[pos + 1].to_ascii_lowercase();
+            if n1 == 's' || n1 == 't' || n1 == 'm' || n1 == 'd' {
+                pos += 2;
+                bounds.push(pos);
+                continue;
+            }
+            if pos + 2 < end {
+                let n2 = cps[pos + 2].to_ascii_lowercase();
+                if (n1 == 'r' && n2 == 'e') || (n1 == 'v' && n2 == 'e') || (n1 == 'l' && n2 == 'l') {
+                    pos += 3;
+                    bounds.push(pos);
+                    continue;
+                }
+            }
+        }
+
+        // [^\r\n\p{L}\p{N}]?\p{L}+
+        if !(c == '\r' || c == '\n' || is_number(pos)) && (is_letter(pos) || is_letter(pos + 1)) {
+            pos += 1;
+            while is_letter(pos) {
+                pos += 1;
+            }
+            bounds.push(pos);
+            continue;
+        }
+
+        // \p{N}   (single codepoint)
+        if is_number(pos) {
+            pos += 1;
+            bounds.push(pos);
+            continue;
+        }
+
+        // <space>?[^\s\p{L}\p{N}]+[\r\n]*
+        let flags2 = if c == ' ' { pos + 1 } else { pos };
+        let flags2_wln = is_ws(flags2) || is_letter(flags2) || is_number(flags2);
+        if !flags2_wln && has_flags(pos) {
+            if c == ' ' {
+                pos += 1;
+            }
+            while has_flags(pos) && !(is_ws(pos) || is_letter(pos) || is_number(pos)) {
+                pos += 1;
+            }
+            while matches!(cpt(pos), Some('\r') | Some('\n')) {
+                pos += 1;
+            }
+            bounds.push(pos);
+            continue;
+        }
+
+        // Whitespace runs: \s*[\r\n]+ | \s+(?!\S) | \s+
+        let mut num_ws = 0usize;
+        let mut last_end_rn = 0usize; // char index just past last \r or \n
+        while is_ws(pos + num_ws) {
+            let c2 = cps[pos + num_ws];
+            if c2 == '\r' || c2 == '\n' {
+                last_end_rn = pos + num_ws + 1;
+            }
+            num_ws += 1;
+        }
+        if last_end_rn > 0 {
+            // \s*[\r\n]+
+            pos = last_end_rn;
+            bounds.push(pos);
+            continue;
+        }
+        if num_ws > 1 && cpt(pos + num_ws).is_some() {
+            // \s+(?!\S): leave one space for the following token
+            pos += num_ws - 1;
+            bounds.push(pos);
+            continue;
+        }
+        if num_ws > 0 {
+            // \s+
+            pos += num_ws;
+            bounds.push(pos);
+            continue;
+        }
+
+        // no matches: emit single codepoint
+        pos += 1;
+        bounds.push(pos);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +735,7 @@ mod tests {
         let vocab = BpeVocab {
             tokens, token_to_id, merge_rank,
             bos_id: None, eos_id: None, unknown_id: None, padding_id: None,
+            eot_id: None, add_bos: false, pre: None,
             dsml_id: None,
         };
         let mut out = Vec::new();
