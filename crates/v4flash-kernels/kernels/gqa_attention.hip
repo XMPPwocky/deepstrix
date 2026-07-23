@@ -766,6 +766,312 @@ void gqa_attn_prefill_flash_wmma(
 }
 
 // =============================================================================
+// gqa_attn_prefill_flash_wmma_fa2 — FlashAttention-2 REGISTER-RESIDENT-O WMMA
+// prefill. Identical signature, output contract, online-softmax math, causal +
+// sliding-window mask, and kt_start tile-skip as gqa_attn_prefill_flash_wmma —
+// the ONLY difference is where the running O accumulator lives.
+//
+// The predecessor kept O in LDS (`Os[WFBR*WFD] = 16 KB`), which pushed total LDS
+// to ~46 KB → only 1 WG/CU. At 1 WG/CU there is no occupancy to hide the 3
+// __syncthreads per key tile, so as the key-tile count grows with context the
+// barrier latency compounds → super-linear prefill falloff on the O(L²) global
+// layers.
+//
+// FA2 fix: each wave owns a FIXED (row-tile rt, d-group dgrp) region of the
+// 32×128 output for the WHOLE key loop, so the WMMA C-fragment can stay in
+// REGISTERS across every key tile. Per wave that is 4 d-tiles × 8 f32/lane = 32
+// f32/lane persistent (gqa_float8 oacc[4]). Each key tile:
+//   1. rescale the register O by corr_s[row] (per-row, from LDS)
+//   2. WMMA-accumulate P·V into it   →  O = O·corr + P·V   (same recurrence)
+// O never touches LDS; it is written to global only in the final normalize.
+//
+// Dropping Os removes 16 KB → total LDS ≈ 30 KB → ≥2 WG/CU, restoring the
+// latency hiding that flattens the L² curve.
+//
+// LDS: Qs/Ks/Vs (3×8K f16) + Ps (2K f16) + Sp (4K f32) + m/l/corr ≈ 30.4 KB.
+//   grid: (n_head, ceil(B/WFBR), 1)   block: (128, 1, 1)
+// =============================================================================
+extern "C" __global__ __launch_bounds__(WBLOCK)
+void gqa_attn_prefill_flash_wmma_fa2(
+        float          * __restrict__ out,         // [B, n_head, head_dim]
+        const _Float16 * __restrict__ q,           // [B, n_head, head_dim]
+        const _Float16 * __restrict__ k_cache,     // [n_kv_total, n_kv_head, head_dim]
+        const _Float16 * __restrict__ v_cache,     // [n_kv_total, n_kv_head, head_dim]
+        unsigned int     n_head,
+        unsigned int     n_kv_head,
+        unsigned int     head_dim,
+        unsigned int     q_offset,
+        unsigned int     batch,
+        unsigned int     n_kv_total,
+        float            scale,
+        unsigned int     swa_window) {   // 0 = full causal; else sliding window
+    const unsigned int h   = blockIdx.x;
+    const unsigned int qt  = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    if (h >= n_head) return;
+
+    const unsigned int q_row_base = qt * WFBR;
+    if (q_row_base >= batch) return;
+    const unsigned int n_rows = (batch - q_row_base < WFBR) ? (batch - q_row_base) : WFBR;
+    const unsigned int hd = head_dim;              // == WFD for Laguna
+
+    const unsigned int kv_group = n_head / n_kv_head;
+    const unsigned int kv_head  = h / kv_group;
+    const unsigned long long kvh_off    = (unsigned long long)kv_head * hd;
+    const unsigned long long row_stride = (unsigned long long)n_kv_head * hd;
+
+    __shared__ _Float16 Qs[WFBR * WFD];
+    __shared__ _Float16 Ks[WFBC * WFD];
+    __shared__ _Float16 Vs[WFBC * WFD];
+    __shared__ _Float16 Ps[WFBR * WFBC];   // f16 probabilities (WMMA A-fragment)
+    __shared__ float     Sp[WFBR * WFBC];  // f32 scores
+    __shared__ float     m_s[WFBR];
+    __shared__ float     l_s[WFBR];
+    __shared__ float     corr_s[WFBR];
+#if !(defined(__gfx1200__) || defined(__gfx1201__))
+    // Portable (non-gfx120x) fallback keeps the running O in LDS — this kernel is
+    // never launched on the iGPU, but the #else path must still compile/run.
+    __shared__ float     Os[WFBR * WFD];
+#endif
+
+    // --- Stage Q (zero-padded), zero Ps ---
+    for (unsigned int p = tid; p < WFBR * WFD; p += WBLOCK) {
+        const unsigned int i = p / WFD;
+        const unsigned int d = p % WFD;
+#if !(defined(__gfx1200__) || defined(__gfx1201__))
+        Os[p] = 0.0f;
+#endif
+        if (i < n_rows && d < hd) {
+            Qs[p] = q[((unsigned long long)(q_row_base + i) * n_head + h) * hd + d];
+        } else {
+            Qs[p] = (_Float16)0.0f;
+        }
+    }
+    for (unsigned int p = tid; p < WFBR * WFBC; p += WBLOCK) Ps[p] = (_Float16)0.0f;
+    if (tid < WFBR) {
+        m_s[tid]    = -INFINITY;
+        l_s[tid]    = 0.0f;
+        corr_s[tid] = 0.0f;
+    }
+
+    const unsigned int lane = tid & 31u;
+    const unsigned int wave = tid >> 5;            // 0..3
+
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    // FA2 register-resident O accumulator. Wave owns (rt = wave>>1, dgrp = wave&1);
+    // dgrp selects the 4 d-tiles it accumulates. Persistent across the key loop.
+    gqa_float8 oacc[4] = {{0,0,0,0,0,0,0,0}, {0,0,0,0,0,0,0,0},
+                          {0,0,0,0,0,0,0,0}, {0,0,0,0,0,0,0,0}};
+#endif
+    __syncthreads();
+
+    const unsigned int max_q_abs   = q_offset + q_row_base + n_rows - 1u;
+    const unsigned int n_key_tiles = max_q_abs / WFBC + 1u;
+    const unsigned int min_q_abs = q_offset + q_row_base;
+    const unsigned int win_lo    = (swa_window != 0u && min_q_abs + 1u > swa_window)
+                                     ? (min_q_abs + 1u - swa_window) : 0u;
+    const unsigned int kt_start  = win_lo / WFBC;
+
+    for (unsigned int kt = kt_start; kt < n_key_tiles; kt++) {
+        const unsigned int key_base = kt * WFBC;
+
+        // --- Stage K/V tile (zero-padded) ---
+        for (unsigned int p = tid; p < WFBC * WFD; p += WBLOCK) {
+            const unsigned int j = p / WFD;
+            const unsigned int d = p % WFD;
+            const unsigned int key_g = key_base + j;
+            if (key_g < n_kv_total && d < hd) {
+                const unsigned long long off = (unsigned long long)key_g * row_stride + kvh_off + d;
+                Ks[p] = k_cache[off];
+                Vs[p] = v_cache[off];
+            } else {
+                Ks[p] = (_Float16)0.0f;
+                Vs[p] = (_Float16)0.0f;
+            }
+        }
+        __syncthreads();
+
+        // --- SCORE: Sp[i][j] = scale·dot(Q_i,K_j), causal-masked ---
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        {
+            const unsigned int rt = wave >> 1;     // row-tile 0..1
+            const unsigned int ct = wave & 1u;     // col-tile 0..1
+            gqa_float8 sacc = {0,0,0,0,0,0,0,0};
+            #pragma unroll
+            for (unsigned int ks = 0; ks < WFD; ks += 16u) {   // 8 k-steps
+                gqa_half8 qf, kf;
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned int row = rt * 16u + (lane & 15u);
+                    const unsigned int d   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                    qf[e] = Qs[row * WFD + d];
+                }
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned int krow = ct * 16u + (lane & 15u);
+                    const unsigned int d    = ks + (lane >> 4) * 8u + (unsigned int)e;
+                    kf[e] = Ks[krow * WFD + d];
+                }
+                sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(qf, kf, sacc);
+            }
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const unsigned int i = rt * 16u + (lane >> 4) * 8u + (unsigned int)e;
+                const unsigned int j = ct * 16u + (lane & 15u);
+                float s = -INFINITY;
+                if (i < n_rows) {
+                    const unsigned int q_abs   = q_offset + q_row_base + i;
+                    const unsigned int key_abs = key_base + j;
+                    const bool in_win = (swa_window == 0u) || (key_abs + swa_window > q_abs);
+                    if (key_abs <= q_abs && key_abs < n_kv_total && in_win) s = sacc[e] * scale;
+                }
+                Sp[i * WFBC + j] = s;
+            }
+        }
+#else
+        for (unsigned int pp = tid; pp < WFBR * WFBC; pp += WBLOCK) {
+            const unsigned int i = pp / WFBC;
+            const unsigned int j = pp % WFBC;
+            float s = -INFINITY;
+            if (i < n_rows) {
+                const unsigned int q_abs   = q_offset + q_row_base + i;
+                const unsigned int key_abs = key_base + j;
+                const bool in_win = (swa_window == 0u) || (key_abs + swa_window > q_abs);
+                if (key_abs <= q_abs && key_abs < n_kv_total && in_win) {
+                    const _Float16 *qr = Qs + (unsigned long long)i * WFD;
+                    const _Float16 *kr = Ks + (unsigned long long)j * WFD;
+                    float acc = 0.0f;
+                    for (unsigned int d = 0; d < hd; d++) acc += (float)qr[d] * (float)kr[d];
+                    s = acc * scale;
+                }
+            }
+            Sp[i * WFBC + j] = s;
+        }
+#endif
+        __syncthreads();
+
+        // --- Online-softmax stats (one thread per query row) -> P into Ps (f16) ---
+        if (tid < WFBR && tid < n_rows) {
+            const unsigned int i = tid;
+            float tmax = -INFINITY;
+            #pragma unroll
+            for (unsigned int j = 0; j < WFBC; j++) {
+                const float v = Sp[i * WFBC + j];
+                if (v > tmax) tmax = v;
+            }
+            const float m_old = m_s[i];
+            const float m_new = fmaxf(m_old, tmax);
+            float corr;
+            float rsum = 0.0f;
+            if (m_new == -INFINITY) {
+                corr = 1.0f;
+                #pragma unroll
+                for (unsigned int j = 0; j < WFBC; j++) Ps[i * WFBC + j] = (_Float16)0.0f;
+            } else {
+                corr = expf(m_old - m_new);
+                #pragma unroll
+                for (unsigned int j = 0; j < WFBC; j++) {
+                    const float sij = Sp[i * WFBC + j];
+                    const float p = (sij == -INFINITY) ? 0.0f : expf(sij - m_new);
+                    Ps[i * WFBC + j] = (_Float16)p;
+                    rsum += p;
+                }
+            }
+            l_s[i]    = l_s[i] * corr + rsum;
+            m_s[i]    = m_new;
+            corr_s[i] = corr;
+        }
+        __syncthreads();
+
+        // --- AV: O = O·corr + P·V, with O in REGISTERS (the FA2 lever) ---
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        {
+            const unsigned int rt   = wave >> 1;   // row-tile 0..1
+            const unsigned int dgrp = wave & 1u;   // d-tile group 0..1 (cols 0..63 / 64..127)
+            // Per-lane rescale factors for the 8 rows this lane's C-fragment owns
+            // (row = rt*16 + (lane>>4)*8 + e). corr is the same for all 4 d-tiles.
+            float cr[8];
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const unsigned int i = rt * 16u + (lane >> 4) * 8u + (unsigned int)e;
+                cr[e] = corr_s[i];
+            }
+            #pragma unroll
+            for (unsigned int dti = 0; dti < 4u; ++dti) {
+                const unsigned int dt = dgrp * 4u + dti;   // d-tile 0..7
+                // 1) rescale the persistent register accumulator by corr (FA2)
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) oacc[dti][e] *= cr[e];
+                // 2) WMMA-accumulate P·V into it (2 k-steps of 16, FBC=32)
+                #pragma unroll
+                for (unsigned int ks = 0; ks < WFBC; ks += 16u) {
+                    gqa_half8 pf, vf;
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const unsigned int prow = rt * 16u + (lane & 15u);
+                        const unsigned int jj   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                        pf[e] = Ps[prow * WFBC + jj];
+                    }
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const unsigned int jj   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                        const unsigned int dcol = dt * 16u + (lane & 15u);
+                        vf[e] = Vs[jj * WFD + dcol];
+                    }
+                    oacc[dti] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pf, vf, oacc[dti]);
+                }
+            }
+        }
+#else
+        for (unsigned int p = tid; p < WFBR * WFD; p += WBLOCK) {
+            const unsigned int i = p / WFD;
+            const unsigned int d = p % WFD;
+            if (i < n_rows && d < hd) {
+                const _Float16 *pr = Ps + (unsigned long long)i * WFBC;
+                float o = 0.0f;
+                #pragma unroll
+                for (unsigned int j = 0; j < WFBC; j++) o += (float)pr[j] * (float)Vs[j * WFD + d];
+                Os[p] = Os[p] * corr_s[i] + o;
+            }
+        }
+#endif
+        __syncthreads();
+    }
+
+    // --- Normalise + write out[q_row_base+i, h, :] ---
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    {
+        const unsigned int rt   = wave >> 1;
+        const unsigned int dgrp = wave & 1u;
+        #pragma unroll
+        for (unsigned int dti = 0; dti < 4u; ++dti) {
+            const unsigned int dt = dgrp * 4u + dti;
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const unsigned int i = rt * 16u + (lane >> 4) * 8u + (unsigned int)e;
+                const unsigned int d = dt * 16u + (lane & 15u);
+                if (i < n_rows) {
+                    const float l = l_s[i];
+                    const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+                    out[((unsigned long long)(q_row_base + i) * n_head + h) * hd + d] = oacc[dti][e] * inv;
+                }
+            }
+        }
+    }
+#else
+    for (unsigned int p = tid; p < WFBR * WFD; p += WBLOCK) {
+        const unsigned int i = p / WFD;
+        const unsigned int d = p % WFD;
+        if (i < n_rows && d < hd) {
+            const float l = l_s[i];
+            const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+            out[((unsigned long long)(q_row_base + i) * n_head + h) * hd + d] = Os[p] * inv;
+        }
+    }
+#endif
+}
+
+// =============================================================================
 // SPLIT-KV DECODE ("flash decoding") — the fix for single-query decode at long
 // context. The existing gqa_attn_prefill_flash at batch=1 launches only
 // (n_head) workgroups, each of which marches SERIALLY through n_kv/32 key

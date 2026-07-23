@@ -1401,10 +1401,20 @@ impl LagunaHetModel {
                         bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa,
                     )?;
                 } else if force_wmma || (!force_flash && n_kv_total >= PREFILL_ATTN_WMMA_MIN_KV) {
-                    dk.gqa.prefill_flash_wmma(
-                        st, &mut od_v, &qf_v, &k_v, &v_v,
-                        bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa,
-                    )?;
+                    // Default WMMA path is the FA2 register-resident-O kernel (≥2 WG/CU,
+                    // flattens the O(L²) global-attn falloff). LAGUNA_ATTN_WMMA_LEGACY=1
+                    // restores the LDS-Os kernel for A/B.
+                    if std::env::var("LAGUNA_ATTN_WMMA_LEGACY").is_ok() {
+                        dk.gqa.prefill_flash_wmma(
+                            st, &mut od_v, &qf_v, &k_v, &v_v,
+                            bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa,
+                        )?;
+                    } else {
+                        dk.gqa.prefill_flash_wmma_fa2(
+                            st, &mut od_v, &qf_v, &k_v, &v_v,
+                            bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa,
+                        )?;
+                    }
                 } else {
                     dk.gqa.prefill_flash(
                         st, &mut od_v, &qf_v, &k_v, &v_v,

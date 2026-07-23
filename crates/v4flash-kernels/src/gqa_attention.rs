@@ -706,4 +706,72 @@ impl GqaAttention {
             n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window
         ])
     }
+
+    /// FA2 REGISTER-RESIDENT-O WMMA prefill — identical contract, output, and
+    /// online-softmax math as [`prefill_flash_wmma`], but the running O
+    /// accumulator lives in REGISTERS (a persistent WMMA C-fragment per wave)
+    /// instead of the 16 KB `Os` LDS array. That drops LDS ~46 KB → ~30 KB →
+    /// ≥2 WG/CU, restoring the occupancy that hides the per-key-tile barriers and
+    /// flattens the O(L²) global-attention prefill falloff. Same buffer shapes
+    /// and `head_dim <= FLASH_HEAD_DIM` (128) as [`prefill_flash_wmma`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_flash_wmma_fa2(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<u16>,
+        k_cache: &DeviceBuffer<u16>,
+        v_cache: &DeviceBuffer<u16>,
+        batch: u32,
+        n_head: u32,
+        n_kv_head: u32,
+        head_dim: u32,
+        q_offset: u32,
+        scale: f32,
+        swa_window: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_head == 0 || n_kv_head == 0 || head_dim == 0 {
+            return Err(eyre!(
+                "gqa flash wmma fa2: batch={batch}, n_head={n_head}, n_kv_head={n_kv_head}, head_dim={head_dim} must be > 0"
+            ));
+        }
+        if head_dim > FLASH_HEAD_DIM {
+            return Err(eyre!(
+                "gqa flash wmma fa2: head_dim={head_dim} exceeds FLASH_HEAD_DIM={FLASH_HEAD_DIM}"
+            ));
+        }
+        if n_head % n_kv_head != 0 {
+            return Err(eyre!(
+                "gqa flash wmma fa2: n_head={n_head} not divisible by n_kv_head={n_kv_head}"
+            ));
+        }
+        let want_q = (batch * n_head * head_dim) as usize;
+        if q.len() != want_q {
+            return Err(eyre!("gqa flash wmma fa2 q len: have {}, expected {want_q}", q.len()));
+        }
+        if out.len() != want_q {
+            return Err(eyre!("gqa flash wmma fa2 out len: have {}, expected {want_q}", out.len()));
+        }
+        let n_kv_total = q_offset + batch;
+        let min_kv = n_kv_total as usize * (n_kv_head * head_dim) as usize;
+        if k_cache.len() < min_kv || v_cache.len() < min_kv {
+            return Err(eyre!(
+                "gqa flash wmma fa2 kv cache too small: k={} v={} need >= {min_kv}",
+                k_cache.len(), v_cache.len()
+            ));
+        }
+
+        let function = self.module.get_function("gqa_attn_prefill_flash_wmma_fa2")?;
+        let grid_y = batch.div_ceil(FLASH_BR);
+        const WMMA_BLOCK: u32 = 128;
+        let cfg = LaunchConfig {
+            grid: (n_head, grid_y, 1),
+            block: (WMMA_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), q.raw(), k_cache.raw(), v_cache.raw(),
+            n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window
+        ])
+    }
 }
