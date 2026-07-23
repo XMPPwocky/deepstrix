@@ -1485,10 +1485,30 @@ impl LagunaHetModel {
                             st, &mut od_v, &qf_v, &k_v, &v_v,
                             bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa, cap as u32,
                         )?;
+                    } else if is_full
+                        && std::env::var("LAGUNA_ATTN_HG").as_deref() != Some("0")
+                    {
+                        // Head-grouped WMMA prefill is the DEFAULT on the O(L²) global
+                        // layers (kv_group=6 divisible by HG_G=3): block=256 (8 waves)
+                        // stages each K/V key-tile into LDS once and runs all 3 grouped
+                        // query heads against it, amortising barriers with no wave-
+                        // occupancy loss — +13.6% e2e @100K, parity-exact. SWA layers
+                        // read only 512 keys so grouping there buys nothing — fa2.
+                        // LAGUNA_ATTN_HG=0 restores fa2 on global layers for A/B.
+                        dk.gqa.prefill_flash_wmma_fa2_hg(
+                            st, &mut od_v, &qf_v, &k_v, &v_v,
+                            bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa, cap as u32,
+                        )?;
                     } else {
+                        // KV-first grid remap (Infinity-Cache locality) for the O(L²)
+                        // global layers; A/B via LAGUNA_ATTN_KVFIRST=1. SWA layers read
+                        // only 512 keys so their K/V is already tiny — skip the remap.
+                        let kv_first = is_full
+                            && std::env::var("LAGUNA_ATTN_KVFIRST").as_deref() == Ok("1");
                         dk.gqa.prefill_flash_wmma_fa2(
                             st, &mut od_v, &qf_v, &k_v, &v_v,
                             bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa, cap as u32,
+                            kv_first,
                         )?;
                     }
                 } else {

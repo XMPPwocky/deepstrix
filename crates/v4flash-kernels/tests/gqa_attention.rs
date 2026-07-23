@@ -514,6 +514,7 @@ fn run_prefill_wmma_case(
     kernel.prefill_flash_wmma_fa2(
         stream, &mut d_fa2, &d_q, &d_k, &d_v,
         batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32,
+        false,
     )?;
     stream.synchronize()?;
 
@@ -630,7 +631,7 @@ fn gqa_attn_prefill_wmma_bench() -> eyre::Result<()> {
             kernel.prefill_flash_wmma(&stream, &mut d_wmma, &d_q, &d_k, &d_v,
                 batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
             kernel.prefill_flash_wmma_fa2(&stream, &mut d_fa2, &d_q, &d_k, &d_v,
-                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32, false)?;
         }
         stream.synchronize()?;
 
@@ -667,7 +668,7 @@ fn gqa_attn_prefill_wmma_bench() -> eyre::Result<()> {
         let t2 = std::time::Instant::now();
         for _ in 0..ITERS {
             kernel.prefill_flash_wmma_fa2(&stream, &mut d_fa2, &d_q, &d_k, &d_v,
-                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32, false)?;
         }
         stream.synchronize()?;
         let fa2_us = t2.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
@@ -1152,16 +1153,28 @@ fn gqa_attn_prefill_swa_window_correctness() -> eyre::Result<()> {
         kernel.prefill_flash_wmma(&stream, &mut d_wmma, &d_q, &d_k, &d_v,
             batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, window, (q_offset + batch) as u32)?;
         kernel.prefill_flash_wmma_fa2(&stream, &mut d_fa2, &d_q, &d_k, &d_v,
+            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, window, (q_offset + batch) as u32, false)?;
+        // KV-first grid remap (Infinity-Cache locality): identical math, must match.
+        let mut d_fa2kv: DeviceBuffer<f32> = DeviceBuffer::new(device.id, ol)?;
+        kernel.prefill_flash_wmma_fa2(&stream, &mut d_fa2kv, &d_q, &d_k, &d_v,
+            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, window, (q_offset + batch) as u32, true)?;
+        // Head-grouped WMMA prefill (kv_group % HG_G == 0 for these cases).
+        let mut d_fa2hg: DeviceBuffer<f32> = DeviceBuffer::new(device.id, ol)?;
+        kernel.prefill_flash_wmma_fa2_hg(&stream, &mut d_fa2hg, &d_q, &d_k, &d_v,
             batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, window, (q_offset + batch) as u32)?;
         stream.synchronize()?;
+        let mut got_fa2hg = vec![0f32; ol];
+        d_fa2hg.copy_to_host(&mut got_fa2hg)?;
         let mut got_naive = vec![0f32; ol];
         let mut got_flash = vec![0f32; ol];
         let mut got_wmma = vec![0f32; ol];
         let mut got_fa2 = vec![0f32; ol];
+        let mut got_fa2kv = vec![0f32; ol];
         d_naive.copy_to_host(&mut got_naive)?;
         d_flash.copy_to_host(&mut got_flash)?;
         d_wmma.copy_to_host(&mut got_wmma)?;
         d_fa2.copy_to_host(&mut got_fa2)?;
+        d_fa2kv.copy_to_host(&mut got_fa2kv)?;
 
         // CPU windowed causal reference.
         let mut expect = vec![0f32; ol];
@@ -1192,17 +1205,26 @@ fn gqa_attn_prefill_swa_window_correctness() -> eyre::Result<()> {
             }
         }
         let (mut en, mut ef, mut ew, mut e2) = (0f32, 0f32, 0f32, 0f32);
+        let (mut e2kv, mut e2kv_vs_fa2) = (0f32, 0f32);
+        let mut e2hg = 0f32;
         for i in 0..ol {
             en = en.max((got_naive[i] - expect[i]).abs());
             ef = ef.max((got_flash[i] - expect[i]).abs());
             ew = ew.max((got_wmma[i] - expect[i]).abs());
             e2 = e2.max((got_fa2[i] - expect[i]).abs());
+            e2kv = e2kv.max((got_fa2kv[i] - expect[i]).abs());
+            e2kv_vs_fa2 = e2kv_vs_fa2.max((got_fa2kv[i] - got_fa2[i]).abs());
+            e2hg = e2hg.max((got_fa2hg[i] - expect[i]).abs());
         }
-        eprintln!("q_off={q_offset} B={batch} n_head={n_head} win={window}  cpu_ref: naive={en:.3e} flash={ef:.3e} wmma={ew:.3e} fa2={e2:.3e}");
+        eprintln!("q_off={q_offset} B={batch} n_head={n_head} win={window}  cpu_ref: naive={en:.3e} flash={ef:.3e} wmma={ew:.3e} fa2={e2:.3e} fa2kv={e2kv:.3e} (kv-vs-fa2 {e2kv_vs_fa2:.3e}) fa2hg={e2hg:.3e}");
         assert!(en < TOL_SCALAR, "naive windowed vs cpu {en:.3e}");
         assert!(ef < TOL_SCALAR, "flash windowed vs cpu {ef:.3e}");
         assert!(ew < TOL_WMMA, "wmma windowed vs cpu {ew:.3e}");
         assert!(e2 < TOL_WMMA, "wmma-fa2 windowed vs cpu {e2:.3e}");
+        assert!(e2kv < TOL_WMMA, "wmma-fa2 KV-first windowed vs cpu {e2kv:.3e}");
+        // KV-first is a pure remap → bit-identical to fa2 (same accumulation order).
+        assert!(e2kv_vs_fa2 == 0.0, "wmma-fa2 KV-first must equal fa2 exactly, got {e2kv_vs_fa2:.3e}");
+        assert!(e2hg < TOL_WMMA, "wmma-fa2 head-grouped windowed vs cpu {e2hg:.3e}");
     }
     Ok(())
 }
