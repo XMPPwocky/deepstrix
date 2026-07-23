@@ -776,15 +776,20 @@ impl LagunaModel {
             let k_v = self.kc[il].slice_view(0, n_kv * N_KV_HEAD * HEAD_DIM);
             let v_v = self.vc[il].slice_view(0, n_kv * N_KV_HEAD * HEAD_DIM);
             let mut od_v = s.od.slice_view_mut(0, n_embd_q);
+            // Non-het base Laguna: full causal history in a contiguous [0, n_kv)
+            // buffer (no SWA ring). k_base=0 and kv_capacity=n_kv make the kernel's
+            // physical-slot modulo a no-op (j % n_kv == j for j < n_kv).
             if crate::gqa_attention::decode_attn_use_naive() {
                 gqa.single_query(
                     stream, &mut od_v, &qf_v, &k_v, &v_v,
                     n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, n_kv as u32, scale,
+                    0, n_kv as u32,
                 )?;
             } else {
                 gqa.single_query_flash(
                     stream, &mut od_v, &qf_v, &k_v, &v_v,
                     n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, n_kv as u32, scale,
+                    0, n_kv as u32,
                 )?;
             }
         }

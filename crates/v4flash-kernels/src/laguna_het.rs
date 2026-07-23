@@ -46,6 +46,21 @@ use crate::{
     Q6_KDenseMatvec, RmsNorm, RopeParams, RopeTail, Swiglu, Q8KQuantize, VecAddInplace,
 };
 
+/// Sliding-window attention window size (spec `sliding_window`=512,
+/// LLAMA_SWA_TYPE_STANDARD). SWA layers (il%4 != 0) attend only the previous
+/// `SWA_WINDOW` keys inclusive of self.
+pub const SWA_WINDOW: usize = 512;
+
+/// Physical KV ring-buffer capacity for SWA layers. Must be >= the largest
+/// prefill chunk `B_MAX` (512) + `SWA_WINDOW` so that, within any left-to-right
+/// chunk, every in-window key for the whole chunk span
+/// `[chunk_start-511, chunk_end]` is still physically resident (not yet
+/// overwritten by a later position). 2048 gives headroom over the 1024 minimum
+/// and is a multiple of the 32-key attention tile. SWA layers only ever read the
+/// last SWA_WINDOW keys, so allocating full context for them is pure waste — the
+/// ring drops 36 of 48 layers from `max_kv` rows to `SWA_RING_CAP` rows.
+pub const SWA_RING_CAP: usize = 2048;
+
 /// Full Laguna kernel set for one device. Kernels are HSACO blobs (tiny), so
 /// carrying the whole set on both devices is cheap; only the weights split.
 struct HetKernels {
@@ -259,6 +274,10 @@ pub struct LagunaHetModel {
     tok_embd_row_bytes: usize,
 
     max_kv: usize,
+    /// Per-layer physical KV capacity (ring size). Global layers (il%4==0) get
+    /// `max_kv`; SWA layers get `min(SWA_RING_CAP, max_kv)`. K/V is indexed by
+    /// absolute position `p` at physical slot `p % kv_cap[il]`.
+    kv_cap: Vec<usize>,
     kc: Vec<DeviceBuffer<u16>>,
     vc: Vec<DeviceBuffer<u16>>,
     kv_len: usize,
@@ -561,11 +580,19 @@ impl LagunaHetModel {
         let tok_embd_off = tok_embd_t.abs_offset;
         let tok_embd_row_bytes = (HIDDEN / 256) * 144;
 
+        // SWA-aware KV allocation: global layers (il%4==0) hold the full context
+        // (max_kv rows); SWA layers only ever read the last SWA_WINDOW keys, so a
+        // small ring buffer (SWA_RING_CAP rows, capped at max_kv for short ctx)
+        // suffices. At 100K ctx this drops KV from ~19 GB to ~5 GB.
+        let swa_cap = SWA_RING_CAP.min(max_kv);
+        let mut kv_cap = Vec::with_capacity(N_LAYER);
         let mut kc = Vec::with_capacity(N_LAYER);
         let mut vc = Vec::with_capacity(N_LAYER);
-        for _ in 0..N_LAYER {
-            kc.push(DeviceBuffer::<u16>::new(dgpu.id, max_kv * N_KV_HEAD * HEAD_DIM)?);
-            vc.push(DeviceBuffer::<u16>::new(dgpu.id, max_kv * N_KV_HEAD * HEAD_DIM)?);
+        for il in 0..N_LAYER {
+            let cap = if il % 4 == 0 { max_kv } else { swa_cap };
+            kv_cap.push(cap);
+            kc.push(DeviceBuffer::<u16>::new(dgpu.id, cap * N_KV_HEAD * HEAD_DIM)?);
+            vc.push(DeviceBuffer::<u16>::new(dgpu.id, cap * N_KV_HEAD * HEAD_DIM)?);
         }
 
         // --- dGPU scratch ---
@@ -685,6 +712,7 @@ impl LagunaHetModel {
             tok_embd_off,
             tok_embd_row_bytes,
             max_kv,
+            kv_cap,
             kc,
             vc,
             kv_len: 0,
@@ -805,6 +833,7 @@ impl LagunaHetModel {
             let ds = &mut self.ds;
             let st = &self.dstream;
             let rope = if is_full { &self.rope_full } else { &self.rope_swa };
+            let cap = self.kv_cap[il]; // KV ring capacity for this layer
 
             dk.rms.launch_weighted(st, &mut ds.ain, &ds.h, &dlw.attn_norm, HIDDEN as u32, EPS)?;
             dk.f16.matvec(st, &mut ds.q, &dlw.wq, &ds.ain, n_embd_q as u32, HIDDEN as u32)?;
@@ -815,9 +844,11 @@ impl LagunaHetModel {
             dk.rope.launch_forward(st, &mut ds.qn, n_head as u32, HEAD_DIM as u32, n_rot, pos as u32, rope)?;
             dk.rope.launch_forward(st, &mut ds.kn, N_KV_HEAD as u32, HEAD_DIM as u32, n_rot, pos as u32, rope)?;
             {
-                let mut kslot = self.kc[il].slice_view_mut(pos * N_KV_HEAD * HEAD_DIM, N_KV_HEAD * HEAD_DIM);
+                // Ring write: physical slot = pos % cap (single row, never wraps).
+                let pslot = (pos % cap) * N_KV_HEAD * HEAD_DIM;
+                let mut kslot = self.kc[il].slice_view_mut(pslot, N_KV_HEAD * HEAD_DIM);
                 dk.ops.cast_f16(st, &mut kslot, &ds.kn, (N_KV_HEAD * HEAD_DIM) as u32)?;
-                let mut vslot = self.vc[il].slice_view_mut(pos * N_KV_HEAD * HEAD_DIM, N_KV_HEAD * HEAD_DIM);
+                let mut vslot = self.vc[il].slice_view_mut(pslot, N_KV_HEAD * HEAD_DIM);
                 dk.ops.cast_f16(st, &mut vslot, &ds.v, (N_KV_HEAD * HEAD_DIM) as u32)?;
             }
             dk.ops.cast_f16(st, &mut ds.qf, &ds.qn, n_embd_q as u32)?;
@@ -826,23 +857,24 @@ impl LagunaHetModel {
                 // 4 layers) attend only the previous `SWA_WINDOW=512` keys inclusive
                 // of self — [pos-511, pos] — per the Laguna spec (sliding_window=512,
                 // LLAMA_SWA_TYPE_STANDARD). Full layers attend the whole causal
-                // history. K/V are RoPE'd at absolute positions in the cache, so the
-                // window is a pure key-range restriction: slice the cache to
-                // [k0, n_kv) and pass the reduced count. This is transparent to every
-                // decode kernel (they attend all keys in the passed slice), and it is
-                // a NO-OP at pos < 512 (k0 == 0), so the short-context oracle-parity
-                // path is unchanged. WITHOUT this, SWA layers over-attended the full
-                // history and diverged from the oracle at ctx > 512.
-                const SWA_WINDOW: usize = 512;
-                // LAGUNA_SWA_OFF=1 disables windowing (A/B: restores the old
-                // full-attention-on-SWA-layers behavior for before/after tests).
+                // history. K/V are RoPE'd at absolute positions in the ring cache;
+                // the window is a key-range restriction [k0, n_kv). We pass the WHOLE
+                // physical ring buffer plus `k_base=k0` + `kv_capacity=cap`, and the
+                // decode kernels map relative key j -> physical (k0+j) % cap. For
+                // global layers cap==max_kv and k0==0, so the modulo is a no-op and
+                // the path is byte-identical. Slicing the ring directly would break
+                // when the window wraps the ring boundary, so the modulo lives in the
+                // kernel. NO-OP at pos < 512 (k0 == 0). WITHOUT SWA, SWA layers
+                // over-attended the full history and diverged from the oracle > 512.
+                // LAGUNA_SWA_OFF=1 disables windowing (A/B). Note: with the SWA ring
+                // (cap < max_kv), SWA_OFF is only meaningful when cap >= n_kv.
                 let swa_off = std::env::var("LAGUNA_SWA_OFF").as_deref() == Ok("1");
                 let k0 = if is_full || swa_off { 0 } else { n_kv.saturating_sub(SWA_WINDOW) };
                 let attn_nkv = n_kv - k0;
-                let kv_off = k0 * N_KV_HEAD * HEAD_DIM;
+                let swa_win = if is_full || swa_off { 0u32 } else { SWA_WINDOW as u32 };
                 let qf_v = ds.qf.slice_view(0, n_embd_q);
-                let k_v = self.kc[il].slice_view(kv_off, attn_nkv * N_KV_HEAD * HEAD_DIM);
-                let v_v = self.vc[il].slice_view(kv_off, attn_nkv * N_KV_HEAD * HEAD_DIM);
+                let k_v = self.kc[il].slice_view(0, cap * N_KV_HEAD * HEAD_DIM);
+                let v_v = self.vc[il].slice_view(0, cap * N_KV_HEAD * HEAD_DIM);
                 let mut od_v = ds.od.slice_view_mut(0, n_embd_q);
                 // Decode attention kernel selection. Default SPLIT-KV ("flash
                 // decoding"): partitions the causal history across n_head*n_splits
@@ -855,15 +887,25 @@ impl LagunaHetModel {
                 use crate::gqa_attention::DecodeAttn;
                 let decode_flash_min_kv = crate::gqa_attention::decode_flash_min_kv();
                 let variant = crate::gqa_attention::decode_attn_variant();
+                // k_base = k0 (absolute start of the windowed key range); the split
+                // math stays over the relative count attn_nkv, mapped to physical
+                // (k0 + rel) % cap in the kernel.
+                let k_base = k0 as u32;
+                let capu = cap as u32;
                 if variant == DecodeAttn::Naive || attn_nkv < decode_flash_min_kv {
                     dk.gqa.single_query(
                         st, &mut od_v, &qf_v, &k_v, &v_v,
                         n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, attn_nkv as u32, scale,
+                        k_base, capu,
                     )?;
                 } else if variant == DecodeAttn::Flash {
+                    // Flash reuses the prefill kernel's ABSOLUTE causal indexing +
+                    // internal sliding-window mask, so it takes the full causal count
+                    // n_kv and windows itself (no host-side k_base slice).
                     dk.gqa.single_query_flash(
                         st, &mut od_v, &qf_v, &k_v, &v_v,
-                        n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, attn_nkv as u32, scale,
+                        n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, n_kv as u32, scale,
+                        swa_win, capu,
                     )?;
                 } else if variant == DecodeAttn::SplitKv {
                     let n_splits = crate::gqa_attention::decode_kv_splits(attn_nkv as u32);
@@ -871,6 +913,7 @@ impl LagunaHetModel {
                         st, &mut od_v, &mut ds.attn_op, &mut ds.attn_mp, &mut ds.attn_lp,
                         &qf_v, &k_v, &v_v,
                         n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, attn_nkv as u32, n_splits, scale,
+                        k_base, capu,
                     )?;
                 } else {
                     // Default: head-grouped split-KV (K/V staged once per KV head,
@@ -880,6 +923,7 @@ impl LagunaHetModel {
                         st, &mut od_v, &mut ds.attn_op, &mut ds.attn_mp, &mut ds.attn_lp,
                         &qf_v, &k_v, &v_v,
                         n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, attn_nkv as u32, n_splits, scale,
+                        k_base, capu,
                     )?;
                 }
             }
@@ -1341,6 +1385,18 @@ impl LagunaHetModel {
             let dlw = &self.dlayers[il];
             let st = &self.dstream;
             let rope = if is_full { &self.rope_full } else { &self.rope_swa };
+            let cap = self.kv_cap[il]; // KV ring capacity for this layer
+            // Ring-wrap correctness: within a left-to-right chunk, an SWA query reads
+            // keys [q-511, q]; the whole chunk's read span is [q_offset-511,
+            // q_offset+b-1] ≤ b + SWA_WINDOW positions. Every one must still be
+            // physically resident (not overwritten by a later position), which holds
+            // iff that span ≤ cap. When cap == max_kv the ring never wraps (whole
+            // context resident), so the check only bites when the ring is active.
+            debug_assert!(
+                cap == self.max_kv || b + SWA_WINDOW <= cap,
+                "SWA ring too small: b={b} + SWA_WINDOW={SWA_WINDOW} > cap={cap} (il={il}); \
+                 raise SWA_RING_CAP or lower LAGUNA_PREFILL_BMAX"
+            );
 
             dk.rms.launch_weighted_batched(st, &mut ps.ain, &ps.h, &dlw.attn_norm, HIDDEN as u32, EPS, bu)?;
             // WMMA GEMM (each f16 weight read once) replaces matvec_batched
@@ -1354,14 +1410,30 @@ impl LagunaHetModel {
             dk.ops.qk_rmsnorm(st, &mut ps.kn, &ps.k, &dlw.k_norm, (b * N_KV_HEAD) as u32, HEAD_DIM as u32, EPS)?;
             dk.rope.launch_forward_batched(st, &mut ps.qn, &ps.pos, n_head as u32, HEAD_DIM as u32, n_rot, bu, rope)?;
             dk.rope.launch_forward_batched(st, &mut ps.kn, &ps.pos, N_KV_HEAD as u32, HEAD_DIM as u32, n_rot, bu, rope)?;
-            // append the whole batch's K/V into contiguous cache slots [q_offset .. q_offset+b].
+            // Append the whole batch's K/V into ring slots for absolute positions
+            // [q_offset .. q_offset+b). Physical start row = q_offset % cap. When the
+            // batch straddles the ring boundary (phys0 + b > cap) the write splits
+            // into two contiguous cast_f16 calls (tail then wrap). For global layers
+            // cap==max_kv and q_offset+b<=max_kv, so `first==b` — a single write,
+            // byte-identical to the pre-ring path.
             {
-                let mut kslot = self.kc[il].slice_view_mut(q_offset * kv_stride, b * kv_stride);
-                let kn_v = ps.kn.slice_view(0, b * kv_stride);
-                dk.ops.cast_f16(st, &mut kslot, &kn_v, (b * kv_stride) as u32)?;
-                let mut vslot = self.vc[il].slice_view_mut(q_offset * kv_stride, b * kv_stride);
-                let v_v = ps.v.slice_view(0, b * kv_stride);
-                dk.ops.cast_f16(st, &mut vslot, &v_v, (b * kv_stride) as u32)?;
+                let phys0 = q_offset % cap;
+                let first = (cap - phys0).min(b); // rows written before the wrap
+                let mut kslot = self.kc[il].slice_view_mut(phys0 * kv_stride, first * kv_stride);
+                let kn_v = ps.kn.slice_view(0, first * kv_stride);
+                dk.ops.cast_f16(st, &mut kslot, &kn_v, (first * kv_stride) as u32)?;
+                let mut vslot = self.vc[il].slice_view_mut(phys0 * kv_stride, first * kv_stride);
+                let v_v = ps.v.slice_view(0, first * kv_stride);
+                dk.ops.cast_f16(st, &mut vslot, &v_v, (first * kv_stride) as u32)?;
+                if first < b {
+                    let rem = b - first; // wrapped rows at physical row 0
+                    let mut kslot2 = self.kc[il].slice_view_mut(0, rem * kv_stride);
+                    let kn_v2 = ps.kn.slice_view(first * kv_stride, rem * kv_stride);
+                    dk.ops.cast_f16(st, &mut kslot2, &kn_v2, (rem * kv_stride) as u32)?;
+                    let mut vslot2 = self.vc[il].slice_view_mut(0, rem * kv_stride);
+                    let v_v2 = ps.v.slice_view(first * kv_stride, rem * kv_stride);
+                    dk.ops.cast_f16(st, &mut vslot2, &v_v2, (rem * kv_stride) as u32)?;
+                }
             }
             {
                 let qn_v = ps.qn.slice_view(0, b * n_embd_q);
@@ -1371,8 +1443,12 @@ impl LagunaHetModel {
             {
                 let qf_v = ps.qf.slice_view(0, b * n_embd_q);
                 let n_kv_total = q_offset + b;
-                let k_v = self.kc[il].slice_view(0, n_kv_total * kv_stride);
-                let v_v = self.vc[il].slice_view(0, n_kv_total * kv_stride);
+                // Pass the WHOLE physical ring buffer (cap rows). The kernel bounds
+                // keys by the logical n_kv_total and maps absolute key -> physical
+                // key % cap. For global layers cap==max_kv >= n_kv_total, so this is
+                // the same memory the pre-ring path read (byte-identical).
+                let k_v = self.kc[il].slice_view(0, cap * kv_stride);
+                let v_v = self.vc[il].slice_view(0, cap * kv_stride);
                 let mut od_v = ps.od.slice_view_mut(0, b * n_embd_q);
                 // Flash-tiled prefill attention (K/V-reuse, one barrier per key
                 // tile) by default; LAGUNA_ATTN_NAIVE=1 restores the naive
@@ -1398,7 +1474,7 @@ impl LagunaHetModel {
                 if std::env::var("LAGUNA_ATTN_NAIVE").is_ok() {
                     dk.gqa.prefill(
                         st, &mut od_v, &qf_v, &k_v, &v_v,
-                        bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa,
+                        bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa, cap as u32,
                     )?;
                 } else if force_wmma || (!force_flash && n_kv_total >= PREFILL_ATTN_WMMA_MIN_KV) {
                     // Default WMMA path is the FA2 register-resident-O kernel (≥2 WG/CU,
@@ -1407,18 +1483,18 @@ impl LagunaHetModel {
                     if std::env::var("LAGUNA_ATTN_WMMA_LEGACY").is_ok() {
                         dk.gqa.prefill_flash_wmma(
                             st, &mut od_v, &qf_v, &k_v, &v_v,
-                            bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa,
+                            bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa, cap as u32,
                         )?;
                     } else {
                         dk.gqa.prefill_flash_wmma_fa2(
                             st, &mut od_v, &qf_v, &k_v, &v_v,
-                            bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa,
+                            bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa, cap as u32,
                         )?;
                     }
                 } else {
                     dk.gqa.prefill_flash(
                         st, &mut od_v, &qf_v, &k_v, &v_v,
-                        bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa,
+                        bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa, cap as u32,
                     )?;
                 }
             }

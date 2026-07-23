@@ -645,6 +645,8 @@ fn laguna_forward_batched_moe() -> eyre::Result<()> {
                 HEAD_DIM as u32,
                 n_kv as u32,
                 scale,
+                0,
+                n_kv as u32,
             )?;
             eng.stream.synchronize()?;
             attn_out.push(eng.download(&od, n_head * HEAD_DIM)?);

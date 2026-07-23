@@ -49,7 +49,9 @@ extern "C" __global__ void gqa_attn_single_query(
         unsigned int     n_kv_head,
         unsigned int     head_dim,
         unsigned int     n_kv,
-        float            scale) {   // 1/sqrt(head_dim), host-precomputed
+        float            scale,     // 1/sqrt(head_dim), host-precomputed
+        unsigned int     k_base,    // absolute position of relative key 0 (SWA window start)
+        unsigned int     kv_capacity) { // ring size: physical row = (k_base+j) % kv_capacity
     const unsigned int h     = blockIdx.x;
     const unsigned int tid   = threadIdx.x;
     const unsigned int block = blockDim.x;
@@ -85,7 +87,10 @@ extern "C" __global__ void gqa_attn_single_query(
     const unsigned long long row_stride = (unsigned long long)n_kv_head * head_dim;
 
     for (unsigned int j = 0; j < n_kv; j++) {
-        const _Float16 *kj = k_cache + (unsigned long long)j * row_stride + kvh_off;
+        // Ring-buffer physical row for SWA layers; identity for global (k_base=0,
+        // kv_capacity=max_kv, (0+j)%max_kv == j).
+        const unsigned long long jp = (unsigned long long)((k_base + j) % kv_capacity);
+        const _Float16 *kj = k_cache + jp * row_stride + kvh_off;
 
         // Per-key dot product: each lane sums its strided dims, tree-reduce.
         float p = 0.0f;
@@ -110,7 +115,7 @@ extern "C" __global__ void gqa_attn_single_query(
         const float corr  = expf(m_old - m_new);
         const float p_j   = expf(score - m_new);
 
-        const _Float16 *vj = v_cache + (unsigned long long)j * row_stride + kvh_off;
+        const _Float16 *vj = v_cache + jp * row_stride + kvh_off;
         for (unsigned int d = tid; d < head_dim; d += block) {
             acc[d] = acc[d] * corr + p_j * (float)vj[d];
         }
@@ -159,7 +164,8 @@ extern "C" __global__ void gqa_attn_prefill(
         unsigned int     head_dim,
         unsigned int     q_offset,  // absolute position of query row 0
         float            scale,
-        unsigned int     swa_window) { // 0 = full causal; else attend last `swa_window` keys
+        unsigned int     swa_window, // 0 = full causal; else attend last `swa_window` keys
+        unsigned int     kv_capacity) { // ring size: physical row = key_abs % kv_capacity
     const unsigned int h     = blockIdx.x;
     const unsigned int qi    = blockIdx.y;         // query row within the chunk
     const unsigned int tid   = threadIdx.x;
@@ -200,7 +206,9 @@ extern "C" __global__ void gqa_attn_prefill(
     const unsigned long long row_stride = (unsigned long long)n_kv_head * head_dim;
 
     for (unsigned int j = j_start; j < n_kv; j++) {
-        const _Float16 *kj = k_cache + (unsigned long long)j * row_stride + kvh_off;
+        // Ring-buffer physical row (identity for global: kv_capacity=max_kv, j<max_kv).
+        const unsigned long long jp = (unsigned long long)(j % kv_capacity);
+        const _Float16 *kj = k_cache + jp * row_stride + kvh_off;
 
         float p = 0.0f;
         for (unsigned int d = tid; d < head_dim; d += block) {
@@ -221,7 +229,7 @@ extern "C" __global__ void gqa_attn_prefill(
         const float corr  = expf(m_old - m_new);
         const float p_j   = expf(score - m_new);
 
-        const _Float16 *vj = v_cache + (unsigned long long)j * row_stride + kvh_off;
+        const _Float16 *vj = v_cache + jp * row_stride + kvh_off;
         for (unsigned int d = tid; d < head_dim; d += block) {
             acc[d] = acc[d] * corr + p_j * (float)vj[d];
         }
@@ -306,7 +314,8 @@ void gqa_attn_prefill_flash(
         unsigned int     batch,                    // B (number of query rows)
         unsigned int     n_kv_total,               // rows present in the cache
         float            scale,
-        unsigned int     swa_window) {             // 0 = full causal; else sliding window
+        unsigned int     swa_window,               // 0 = full causal; else sliding window
+        unsigned int     kv_capacity) {            // ring size: physical row = key_g % kv_capacity
     const unsigned int h   = blockIdx.x;
     const unsigned int qt  = blockIdx.y;
     const unsigned int tid = threadIdx.x;
@@ -368,7 +377,9 @@ void gqa_attn_prefill_flash(
             const unsigned int d = p % FD;
             const unsigned int key_g = key_base + j;
             if (key_g < n_kv_total && d < hd) {
-                const unsigned long long off = (unsigned long long)key_g * row_stride + kvh_off + d;
+                // Ring-buffer physical row (identity for global: kv_capacity=max_kv,
+                // key_g<n_kv_total<=max_kv). Only the row index wraps; kvh_off+d unchanged.
+                const unsigned long long off = (unsigned long long)(key_g % kv_capacity) * row_stride + kvh_off + d;
                 Ks[p] = k_cache[off];
                 Vs[p] = v_cache[off];
             } else {
@@ -536,7 +547,8 @@ void gqa_attn_prefill_flash_wmma(
         unsigned int     batch,
         unsigned int     n_kv_total,
         float            scale,
-        unsigned int     swa_window) {   // 0 = full causal; else sliding window
+        unsigned int     swa_window,     // 0 = full causal; else sliding window
+        unsigned int     kv_capacity) {  // ring size: physical row = key_g % kv_capacity
     const unsigned int h   = blockIdx.x;
     const unsigned int qt  = blockIdx.y;
     const unsigned int tid = threadIdx.x;
@@ -601,7 +613,9 @@ void gqa_attn_prefill_flash_wmma(
             const unsigned int d = p % WFD;
             const unsigned int key_g = key_base + j;
             if (key_g < n_kv_total && d < hd) {
-                const unsigned long long off = (unsigned long long)key_g * row_stride + kvh_off + d;
+                // Ring-buffer physical row (identity for global: kv_capacity=max_kv,
+                // key_g<n_kv_total<=max_kv). Only the row index wraps; kvh_off+d unchanged.
+                const unsigned long long off = (unsigned long long)(key_g % kv_capacity) * row_stride + kvh_off + d;
                 Ks[p] = k_cache[off];
                 Vs[p] = v_cache[off];
             } else {
@@ -804,7 +818,8 @@ void gqa_attn_prefill_flash_wmma_fa2(
         unsigned int     batch,
         unsigned int     n_kv_total,
         float            scale,
-        unsigned int     swa_window) {   // 0 = full causal; else sliding window
+        unsigned int     swa_window,     // 0 = full causal; else sliding window
+        unsigned int     kv_capacity) {  // ring size: physical row = key_g % kv_capacity
     const unsigned int h   = blockIdx.x;
     const unsigned int qt  = blockIdx.y;
     const unsigned int tid = threadIdx.x;
@@ -881,7 +896,9 @@ void gqa_attn_prefill_flash_wmma_fa2(
             const unsigned int d = p % WFD;
             const unsigned int key_g = key_base + j;
             if (key_g < n_kv_total && d < hd) {
-                const unsigned long long off = (unsigned long long)key_g * row_stride + kvh_off + d;
+                // Ring-buffer physical row (identity for global: kv_capacity=max_kv,
+                // key_g<n_kv_total<=max_kv). Only the row index wraps; kvh_off+d unchanged.
+                const unsigned long long off = (unsigned long long)(key_g % kv_capacity) * row_stride + kvh_off + d;
                 Ks[p] = k_cache[off];
                 Vs[p] = v_cache[off];
             } else {
@@ -1112,7 +1129,9 @@ void gqa_attn_decode_partial(
         unsigned int     head_dim,
         unsigned int     n_kv,
         unsigned int     n_splits,
-        float            scale) {
+        float            scale,
+        unsigned int     k_base,        // absolute position of relative key 0 (SWA window start)
+        unsigned int     kv_capacity) { // ring size: physical row = (k_base+key_g) % kv_capacity
     const unsigned int h   = blockIdx.x;
     const unsigned int s   = blockIdx.y;
     const unsigned int tid = threadIdx.x;
@@ -1151,7 +1170,10 @@ void gqa_attn_decode_partial(
                 const unsigned int d = p % hd;
                 const unsigned int key_g = kb + j;
                 if (key_g < k1) {
-                    const unsigned long long off = (unsigned long long)key_g * row_stride + kvh_off + d;
+                    // Ring-buffer physical row: absolute pos = k_base + key_g (key_g is
+                    // relative to the window start). Identity for global (k_base=0,
+                    // kv_capacity=max_kv). key_g/k0/k1 stay relative for the split math.
+                    const unsigned long long off = (unsigned long long)((k_base + key_g) % kv_capacity) * row_stride + kvh_off + d;
                     Ks[p] = k_cache[off];
                     Vs[p] = v_cache[off];
                 } else {
@@ -1274,7 +1296,9 @@ void gqa_attn_decode_partial_hg(
         unsigned int     head_dim,
         unsigned int     n_kv,
         unsigned int     n_splits,
-        float            scale) {
+        float            scale,
+        unsigned int     k_base,        // absolute position of relative key 0 (SWA window start)
+        unsigned int     kv_capacity) { // ring size: physical row = (k_base+key_g) % kv_capacity
     const unsigned int kh  = blockIdx.x;   // KV head
     const unsigned int s   = blockIdx.y;   // split
     const unsigned int tid = threadIdx.x;
@@ -1322,7 +1346,10 @@ void gqa_attn_decode_partial_hg(
                 const unsigned int d = p % hd;
                 const unsigned int key_g = kb + j;
                 if (key_g < k1) {
-                    const unsigned long long off = (unsigned long long)key_g * row_stride + kvh_off + d;
+                    // Ring-buffer physical row: absolute pos = k_base + key_g (key_g is
+                    // relative to the window start). Identity for global (k_base=0,
+                    // kv_capacity=max_kv). key_g/k0/k1 stay relative for the split math.
+                    const unsigned long long off = (unsigned long long)((k_base + key_g) % kv_capacity) * row_stride + kvh_off + d;
                     Ks[p] = k_cache[off];
                     Vs[p] = v_cache[off];
                 } else {

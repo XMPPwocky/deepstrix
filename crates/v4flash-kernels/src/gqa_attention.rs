@@ -187,6 +187,8 @@ impl GqaAttention {
         head_dim: u32,
         n_kv: u32,
         scale: f32,
+        k_base: u32,
+        kv_capacity: u32,
     ) -> eyre::Result<()> {
         if n_head == 0 || n_kv_head == 0 || head_dim == 0 {
             return Err(eyre!(
@@ -223,16 +225,19 @@ impl GqaAttention {
                 out.len()
             ));
         }
-        let expected_kv = nkv * nkvh * hd;
-        if k_cache.len() != expected_kv {
+        // The caller passes the WHOLE physical ring buffer (kv_capacity rows); the
+        // kernel maps relative key j -> physical (k_base+j) % kv_capacity.
+        let _ = nkv;
+        let expected_kv = kv_capacity as usize * nkvh * hd;
+        if k_cache.len() < expected_kv {
             return Err(eyre!(
-                "gqa attn k_cache len: have {}, expected {expected_kv} (n_kv={n_kv}, n_kv_head={n_kv_head}, head_dim={head_dim})",
+                "gqa attn k_cache len: have {}, need >= {expected_kv} (kv_capacity={kv_capacity}, n_kv_head={n_kv_head}, head_dim={head_dim})",
                 k_cache.len()
             ));
         }
-        if v_cache.len() != expected_kv {
+        if v_cache.len() < expected_kv {
             return Err(eyre!(
-                "gqa attn v_cache len: have {}, expected {expected_kv} (n_kv={n_kv}, n_kv_head={n_kv_head}, head_dim={head_dim})",
+                "gqa attn v_cache len: have {}, need >= {expected_kv} (kv_capacity={kv_capacity}, n_kv_head={n_kv_head}, head_dim={head_dim})",
                 v_cache.len()
             ));
         }
@@ -245,7 +250,7 @@ impl GqaAttention {
         };
         launch_kernel!(function, cfg, stream, [
             out.raw(), q.raw(), k_cache.raw(), v_cache.raw(),
-            n_head, n_kv_head, head_dim, n_kv, scale
+            n_head, n_kv_head, head_dim, n_kv, scale, k_base, kv_capacity
         ])
     }
 
@@ -275,6 +280,8 @@ impl GqaAttention {
         head_dim: u32,
         n_kv: u32,
         scale: f32,
+        swa_window: u32,
+        kv_capacity: u32,
     ) -> eyre::Result<()> {
         if n_head == 0 || n_kv_head == 0 || head_dim == 0 || n_kv == 0 {
             return Err(eyre!(
@@ -299,10 +306,13 @@ impl GqaAttention {
         if out.len() != expected_q {
             return Err(eyre!("gqa flash decode out len: have {}, expected {expected_q}", out.len()));
         }
-        let expected_kv = n_kv as usize * n_kv_head as usize * hd;
-        if k_cache.len() != expected_kv || v_cache.len() != expected_kv {
+        // Caller passes the WHOLE physical ring buffer (kv_capacity rows). n_kv is
+        // the ABSOLUTE causal length; the kernel windows via swa_window and maps
+        // absolute key -> physical key%kv_capacity.
+        let expected_kv = kv_capacity as usize * n_kv_head as usize * hd;
+        if k_cache.len() < expected_kv || v_cache.len() < expected_kv {
             return Err(eyre!(
-                "gqa flash decode kv len: k={} v={}, expected {expected_kv}",
+                "gqa flash decode kv len: k={} v={}, need >= {expected_kv}",
                 k_cache.len(), v_cache.len()
             ));
         }
@@ -317,7 +327,7 @@ impl GqaAttention {
         };
         launch_kernel!(function, cfg, stream, [
             out.raw(), q.raw(), k_cache.raw(), v_cache.raw(),
-            n_head, n_kv_head, head_dim, q_offset, 1u32, n_kv, scale
+            n_head, n_kv_head, head_dim, q_offset, 1u32, n_kv, scale, swa_window, kv_capacity
         ])
     }
 
@@ -351,6 +361,8 @@ impl GqaAttention {
         n_kv: u32,
         n_splits: u32,
         scale: f32,
+        k_base: u32,
+        kv_capacity: u32,
     ) -> eyre::Result<()> {
         if n_head == 0 || n_kv_head == 0 || head_dim == 0 || n_kv == 0 || n_splits == 0 {
             return Err(eyre!(
@@ -368,9 +380,11 @@ impl GqaAttention {
         if q.len() != expected_q || out.len() != expected_q {
             return Err(eyre!("gqa splitkv q/out len: q={} out={}, expected {expected_q}", q.len(), out.len()));
         }
-        let expected_kv = n_kv as usize * n_kv_head as usize * hd;
-        if k_cache.len() != expected_kv || v_cache.len() != expected_kv {
-            return Err(eyre!("gqa splitkv kv len: k={} v={}, expected {expected_kv}", k_cache.len(), v_cache.len()));
+        // Whole physical ring buffer (kv_capacity rows); kernel maps relative key
+        // -> physical (k_base+key)%kv_capacity. n_kv stays the windowed count.
+        let expected_kv = kv_capacity as usize * n_kv_head as usize * hd;
+        if k_cache.len() < expected_kv || v_cache.len() < expected_kv {
+            return Err(eyre!("gqa splitkv kv len: k={} v={}, need >= {expected_kv}", k_cache.len(), v_cache.len()));
         }
         let need_part = n_head as usize * n_splits as usize * hd;
         let need_ml = n_head as usize * n_splits as usize;
@@ -391,7 +405,7 @@ impl GqaAttention {
         launch_kernel!(fp, cfg_p, stream, [
             out_partial.raw(), m_partial.raw(), l_partial.raw(),
             q.raw(), k_cache.raw(), v_cache.raw(),
-            n_head, n_kv_head, head_dim, n_kv, n_splits, scale
+            n_head, n_kv_head, head_dim, n_kv, n_splits, scale, k_base, kv_capacity
         ])?;
         let fc = self.module.get_function("gqa_attn_decode_combine")?;
         let cfg_c = LaunchConfig {
@@ -433,6 +447,8 @@ impl GqaAttention {
         n_kv: u32,
         n_splits: u32,
         scale: f32,
+        k_base: u32,
+        kv_capacity: u32,
     ) -> eyre::Result<()> {
         if n_head == 0 || n_kv_head == 0 || head_dim == 0 || n_kv == 0 || n_splits == 0 {
             return Err(eyre!(
@@ -454,9 +470,11 @@ impl GqaAttention {
         if q.len() != expected_q || out.len() != expected_q {
             return Err(eyre!("gqa splitkv_hg q/out len: q={} out={}, expected {expected_q}", q.len(), out.len()));
         }
-        let expected_kv = n_kv as usize * n_kv_head as usize * hd;
-        if k_cache.len() != expected_kv || v_cache.len() != expected_kv {
-            return Err(eyre!("gqa splitkv_hg kv len: k={} v={}, expected {expected_kv}", k_cache.len(), v_cache.len()));
+        // Whole physical ring buffer (kv_capacity rows); kernel maps relative key
+        // -> physical (k_base+key)%kv_capacity. n_kv stays the windowed count.
+        let expected_kv = kv_capacity as usize * n_kv_head as usize * hd;
+        if k_cache.len() < expected_kv || v_cache.len() < expected_kv {
+            return Err(eyre!("gqa splitkv_hg kv len: k={} v={}, need >= {expected_kv}", k_cache.len(), v_cache.len()));
         }
         let need_part = n_head as usize * n_splits as usize * hd;
         let need_ml = n_head as usize * n_splits as usize;
@@ -477,7 +495,7 @@ impl GqaAttention {
         launch_kernel!(fp, cfg_p, stream, [
             out_partial.raw(), m_partial.raw(), l_partial.raw(),
             q.raw(), k_cache.raw(), v_cache.raw(),
-            n_head, n_kv_head, head_dim, n_kv, n_splits, scale
+            n_head, n_kv_head, head_dim, n_kv, n_splits, scale, k_base, kv_capacity
         ])?;
         let fc = self.module.get_function("gqa_attn_decode_combine")?;
         let cfg_c = LaunchConfig {
@@ -522,6 +540,7 @@ impl GqaAttention {
         q_offset: u32,
         scale: f32,
         swa_window: u32,
+        kv_capacity: u32,
     ) -> eyre::Result<()> {
         if batch == 0 || n_head == 0 || n_kv_head == 0 || head_dim == 0 {
             return Err(eyre!(
@@ -545,8 +564,10 @@ impl GqaAttention {
         if out.len() != want_q {
             return Err(eyre!("gqa prefill out len: have {}, expected {want_q}", out.len()));
         }
-        // Need at least q_offset+batch key rows to cover the last query.
-        let min_kv = (q_offset + batch) as usize * (n_kv_head * head_dim) as usize;
+        // Caller passes the whole physical ring buffer (kv_capacity rows); for
+        // global layers kv_capacity==max_kv >= q_offset+batch. The kernel maps
+        // absolute key -> physical key%kv_capacity.
+        let min_kv = kv_capacity as usize * (n_kv_head * head_dim) as usize;
         if k_cache.len() < min_kv || v_cache.len() < min_kv {
             return Err(eyre!(
                 "gqa prefill kv cache too small: k={} v={} need >= {min_kv}",
@@ -562,7 +583,7 @@ impl GqaAttention {
         };
         launch_kernel!(function, cfg, stream, [
             out.raw(), q.raw(), k_cache.raw(), v_cache.raw(),
-            n_head, n_kv_head, head_dim, q_offset, scale, swa_window
+            n_head, n_kv_head, head_dim, q_offset, scale, swa_window, kv_capacity
         ])
     }
 
@@ -591,6 +612,7 @@ impl GqaAttention {
         q_offset: u32,
         scale: f32,
         swa_window: u32,
+        kv_capacity: u32,
     ) -> eyre::Result<()> {
         if batch == 0 || n_head == 0 || n_kv_head == 0 || head_dim == 0 {
             return Err(eyre!(
@@ -615,7 +637,9 @@ impl GqaAttention {
             return Err(eyre!("gqa flash out len: have {}, expected {want_q}", out.len()));
         }
         let n_kv_total = q_offset + batch;
-        let min_kv = n_kv_total as usize * (n_kv_head * head_dim) as usize;
+        // Caller passes the whole physical ring buffer (kv_capacity rows); global
+        // layers have kv_capacity==max_kv >= n_kv_total. Kernel wraps key%kv_capacity.
+        let min_kv = kv_capacity as usize * (n_kv_head * head_dim) as usize;
         if k_cache.len() < min_kv || v_cache.len() < min_kv {
             return Err(eyre!(
                 "gqa flash kv cache too small: k={} v={} need >= {min_kv}",
@@ -632,7 +656,7 @@ impl GqaAttention {
         };
         launch_kernel!(function, cfg, stream, [
             out.raw(), q.raw(), k_cache.raw(), v_cache.raw(),
-            n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window
+            n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window, kv_capacity
         ])
     }
 
@@ -661,6 +685,7 @@ impl GqaAttention {
         q_offset: u32,
         scale: f32,
         swa_window: u32,
+        kv_capacity: u32,
     ) -> eyre::Result<()> {
         if batch == 0 || n_head == 0 || n_kv_head == 0 || head_dim == 0 {
             return Err(eyre!(
@@ -685,7 +710,9 @@ impl GqaAttention {
             return Err(eyre!("gqa flash wmma out len: have {}, expected {want_q}", out.len()));
         }
         let n_kv_total = q_offset + batch;
-        let min_kv = n_kv_total as usize * (n_kv_head * head_dim) as usize;
+        // Caller passes the whole physical ring buffer (kv_capacity rows); global
+        // layers have kv_capacity==max_kv >= n_kv_total. Kernel wraps key%kv_capacity.
+        let min_kv = kv_capacity as usize * (n_kv_head * head_dim) as usize;
         if k_cache.len() < min_kv || v_cache.len() < min_kv {
             return Err(eyre!(
                 "gqa flash wmma kv cache too small: k={} v={} need >= {min_kv}",
@@ -703,7 +730,7 @@ impl GqaAttention {
         };
         launch_kernel!(function, cfg, stream, [
             out.raw(), q.raw(), k_cache.raw(), v_cache.raw(),
-            n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window
+            n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window, kv_capacity
         ])
     }
 
@@ -729,6 +756,7 @@ impl GqaAttention {
         q_offset: u32,
         scale: f32,
         swa_window: u32,
+        kv_capacity: u32,
     ) -> eyre::Result<()> {
         if batch == 0 || n_head == 0 || n_kv_head == 0 || head_dim == 0 {
             return Err(eyre!(
@@ -753,7 +781,9 @@ impl GqaAttention {
             return Err(eyre!("gqa flash wmma fa2 out len: have {}, expected {want_q}", out.len()));
         }
         let n_kv_total = q_offset + batch;
-        let min_kv = n_kv_total as usize * (n_kv_head * head_dim) as usize;
+        // Caller passes the whole physical ring buffer (kv_capacity rows); global
+        // layers have kv_capacity==max_kv >= n_kv_total. Kernel wraps key%kv_capacity.
+        let min_kv = kv_capacity as usize * (n_kv_head * head_dim) as usize;
         if k_cache.len() < min_kv || v_cache.len() < min_kv {
             return Err(eyre!(
                 "gqa flash wmma fa2 kv cache too small: k={} v={} need >= {min_kv}",
@@ -771,7 +801,7 @@ impl GqaAttention {
         };
         launch_kernel!(function, cfg, stream, [
             out.raw(), q.raw(), k_cache.raw(), v_cache.raw(),
-            n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window
+            n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window, kv_capacity
         ])
     }
 }

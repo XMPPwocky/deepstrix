@@ -195,6 +195,8 @@ fn run_case(
         head_dim as u32,
         n_kv as u32,
         scale,
+        0,
+        n_kv as u32,
     )?;
     stream.synchronize()?;
 
@@ -299,7 +301,7 @@ fn run_prefill_case(
 
     kernel.prefill(
         stream, &mut d_out, &d_q, &d_k, &d_v,
-        batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, 0, scale, 0,
+        batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, 0, scale, 0, batch as u32,
     )?;
     stream.synchronize()?;
 
@@ -404,7 +406,7 @@ fn run_prefill_flash_case(
 
     kernel.prefill_flash(
         stream, &mut d_out, &d_q, &d_k, &d_v,
-        batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0,
+        batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32,
     )?;
     stream.synchronize()?;
 
@@ -506,12 +508,12 @@ fn run_prefill_wmma_case(
 
     kernel.prefill_flash_wmma(
         stream, &mut d_out, &d_q, &d_k, &d_v,
-        batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0,
+        batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32,
     )?;
     let mut d_fa2: DeviceBuffer<f32> = DeviceBuffer::new(device.id, batch * n_head * head_dim)?;
     kernel.prefill_flash_wmma_fa2(
         stream, &mut d_fa2, &d_q, &d_k, &d_v,
-        batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0,
+        batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32,
     )?;
     stream.synchronize()?;
 
@@ -624,11 +626,11 @@ fn gqa_attn_prefill_wmma_bench() -> eyre::Result<()> {
 
         for _ in 0..WARMUP {
             kernel.prefill_flash(&stream, &mut d_flash, &d_q, &d_k, &d_v,
-                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0)?;
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
             kernel.prefill_flash_wmma(&stream, &mut d_wmma, &d_q, &d_k, &d_v,
-                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0)?;
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
             kernel.prefill_flash_wmma_fa2(&stream, &mut d_fa2, &d_q, &d_k, &d_v,
-                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0)?;
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
         }
         stream.synchronize()?;
 
@@ -649,7 +651,7 @@ fn gqa_attn_prefill_wmma_bench() -> eyre::Result<()> {
         let t0 = std::time::Instant::now();
         for _ in 0..ITERS {
             kernel.prefill_flash(&stream, &mut d_flash, &d_q, &d_k, &d_v,
-                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0)?;
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
         }
         stream.synchronize()?;
         let flash_us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
@@ -657,7 +659,7 @@ fn gqa_attn_prefill_wmma_bench() -> eyre::Result<()> {
         let t1 = std::time::Instant::now();
         for _ in 0..ITERS {
             kernel.prefill_flash_wmma(&stream, &mut d_wmma, &d_q, &d_k, &d_v,
-                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0)?;
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
         }
         stream.synchronize()?;
         let wmma_us = t1.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
@@ -665,7 +667,7 @@ fn gqa_attn_prefill_wmma_bench() -> eyre::Result<()> {
         let t2 = std::time::Instant::now();
         for _ in 0..ITERS {
             kernel.prefill_flash_wmma_fa2(&stream, &mut d_fa2, &d_q, &d_k, &d_v,
-                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0)?;
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
         }
         stream.synchronize()?;
         let fa2_us = t2.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
@@ -821,15 +823,15 @@ fn gqa_attn_decode_bench() -> eyre::Result<()> {
         // --- warmup + parity ---
         for _ in 0..WARMUP {
             kernel.single_query(&stream, &mut d_naive, &d_q, &d_k, &d_v,
-                n_head as u32, n_kv_head as u32, head_dim as u32, n_kv as u32, scale)?;
+                n_head as u32, n_kv_head as u32, head_dim as u32, n_kv as u32, scale, 0, n_kv as u32)?;
             kernel.single_query_flash(&stream, &mut d_flash, &d_q, &d_k, &d_v,
-                n_head as u32, n_kv_head as u32, head_dim as u32, n_kv as u32, scale)?;
+                n_head as u32, n_kv_head as u32, head_dim as u32, n_kv as u32, scale, 0, n_kv as u32)?;
             kernel.single_query_splitkv(&stream, &mut d_split, &mut d_op, &mut d_mp, &mut d_lp,
                 &d_q, &d_k, &d_v, n_head as u32, n_kv_head as u32, head_dim as u32,
-                n_kv as u32, n_splits, scale)?;
+                n_kv as u32, n_splits, scale, 0, n_kv as u32)?;
             kernel.single_query_splitkv_hg(&stream, &mut d_hg, &mut d_hop, &mut d_hmp, &mut d_hlp,
                 &d_q, &d_k, &d_v, n_head as u32, n_kv_head as u32, head_dim as u32,
-                n_kv as u32, n_splits_hg, scale)?;
+                n_kv as u32, n_splits_hg, scale, 0, n_kv as u32)?;
         }
         stream.synchronize()?;
 
@@ -898,7 +900,7 @@ fn gqa_attn_decode_bench() -> eyre::Result<()> {
         let t0 = std::time::Instant::now();
         for _ in 0..ITERS {
             kernel.single_query(&stream, &mut d_naive, &d_q, &d_k, &d_v,
-                n_head as u32, n_kv_head as u32, head_dim as u32, n_kv as u32, scale)?;
+                n_head as u32, n_kv_head as u32, head_dim as u32, n_kv as u32, scale, 0, n_kv as u32)?;
         }
         stream.synchronize()?;
         let naive_us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
@@ -907,7 +909,7 @@ fn gqa_attn_decode_bench() -> eyre::Result<()> {
         let t1 = std::time::Instant::now();
         for _ in 0..ITERS {
             kernel.single_query_flash(&stream, &mut d_flash, &d_q, &d_k, &d_v,
-                n_head as u32, n_kv_head as u32, head_dim as u32, n_kv as u32, scale)?;
+                n_head as u32, n_kv_head as u32, head_dim as u32, n_kv as u32, scale, 0, n_kv as u32)?;
         }
         stream.synchronize()?;
         let flash_us = t1.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
@@ -917,7 +919,7 @@ fn gqa_attn_decode_bench() -> eyre::Result<()> {
         for _ in 0..ITERS {
             kernel.single_query_splitkv(&stream, &mut d_split, &mut d_op, &mut d_mp, &mut d_lp,
                 &d_q, &d_k, &d_v, n_head as u32, n_kv_head as u32, head_dim as u32,
-                n_kv as u32, n_splits, scale)?;
+                n_kv as u32, n_splits, scale, 0, n_kv as u32)?;
         }
         stream.synchronize()?;
         let split_us = t2.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
@@ -927,7 +929,7 @@ fn gqa_attn_decode_bench() -> eyre::Result<()> {
         for _ in 0..ITERS {
             kernel.single_query_splitkv_hg(&stream, &mut d_hg, &mut d_hop, &mut d_hmp, &mut d_hlp,
                 &d_q, &d_k, &d_v, n_head as u32, n_kv_head as u32, head_dim as u32,
-                n_kv as u32, n_splits_hg, scale)?;
+                n_kv as u32, n_splits_hg, scale, 0, n_kv as u32)?;
         }
         stream.synchronize()?;
         let hg_us = t3.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
@@ -1033,13 +1035,13 @@ fn gqa_attn_decode_small_ctx_correctness() -> eyre::Result<()> {
             let mut d_lp: DeviceBuffer<f32> = DeviceBuffer::new(device.id, n_head * smax)?;
 
             kernel.single_query(&stream, &mut d_naive, &d_q, &d_k, &d_v,
-                n_head as u32, n_kv_head as u32, head_dim as u32, n_kv as u32, scale)?;
+                n_head as u32, n_kv_head as u32, head_dim as u32, n_kv as u32, scale, 0, n_kv as u32)?;
             kernel.single_query_splitkv(&stream, &mut d_split, &mut d_op, &mut d_mp, &mut d_lp,
                 &d_q, &d_k, &d_v, n_head as u32, n_kv_head as u32, head_dim as u32,
-                n_kv as u32, n_splits, scale)?;
+                n_kv as u32, n_splits, scale, 0, n_kv as u32)?;
             kernel.single_query_splitkv_hg(&stream, &mut d_hg, &mut d_op, &mut d_mp, &mut d_lp,
                 &d_q, &d_k, &d_v, n_head as u32, n_kv_head as u32, head_dim as u32,
-                n_kv as u32, n_splits_hg, scale)?;
+                n_kv as u32, n_splits_hg, scale, 0, n_kv as u32)?;
             stream.synchronize()?;
 
             let mut got_naive = vec![0f32; n_head * head_dim];
@@ -1144,13 +1146,13 @@ fn gqa_attn_prefill_swa_window_correctness() -> eyre::Result<()> {
         let mut d_wmma: DeviceBuffer<f32> = DeviceBuffer::new(device.id, ol)?;
         let mut d_fa2: DeviceBuffer<f32> = DeviceBuffer::new(device.id, ol)?;
         kernel.prefill(&stream, &mut d_naive, &d_q, &d_k, &d_v,
-            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, window)?;
+            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, window, (q_offset + batch) as u32)?;
         kernel.prefill_flash(&stream, &mut d_flash, &d_q, &d_k, &d_v,
-            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, window)?;
+            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, window, (q_offset + batch) as u32)?;
         kernel.prefill_flash_wmma(&stream, &mut d_wmma, &d_q, &d_k, &d_v,
-            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, window)?;
+            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, window, (q_offset + batch) as u32)?;
         kernel.prefill_flash_wmma_fa2(&stream, &mut d_fa2, &d_q, &d_k, &d_v,
-            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, window)?;
+            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, window, (q_offset + batch) as u32)?;
         stream.synchronize()?;
         let mut got_naive = vec![0f32; ol];
         let mut got_flash = vec![0f32; ol];
