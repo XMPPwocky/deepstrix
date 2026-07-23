@@ -822,9 +822,27 @@ impl LagunaHetModel {
             }
             dk.ops.cast_f16(st, &mut ds.qf, &ds.qn, n_embd_q as u32)?;
             {
+                // SLIDING-WINDOW ATTENTION (SWA). SWA layers (`!is_full`, 3 of every
+                // 4 layers) attend only the previous `SWA_WINDOW=512` keys inclusive
+                // of self — [pos-511, pos] — per the Laguna spec (sliding_window=512,
+                // LLAMA_SWA_TYPE_STANDARD). Full layers attend the whole causal
+                // history. K/V are RoPE'd at absolute positions in the cache, so the
+                // window is a pure key-range restriction: slice the cache to
+                // [k0, n_kv) and pass the reduced count. This is transparent to every
+                // decode kernel (they attend all keys in the passed slice), and it is
+                // a NO-OP at pos < 512 (k0 == 0), so the short-context oracle-parity
+                // path is unchanged. WITHOUT this, SWA layers over-attended the full
+                // history and diverged from the oracle at ctx > 512.
+                const SWA_WINDOW: usize = 512;
+                // LAGUNA_SWA_OFF=1 disables windowing (A/B: restores the old
+                // full-attention-on-SWA-layers behavior for before/after tests).
+                let swa_off = std::env::var("LAGUNA_SWA_OFF").as_deref() == Ok("1");
+                let k0 = if is_full || swa_off { 0 } else { n_kv.saturating_sub(SWA_WINDOW) };
+                let attn_nkv = n_kv - k0;
+                let kv_off = k0 * N_KV_HEAD * HEAD_DIM;
                 let qf_v = ds.qf.slice_view(0, n_embd_q);
-                let k_v = self.kc[il].slice_view(0, n_kv * N_KV_HEAD * HEAD_DIM);
-                let v_v = self.vc[il].slice_view(0, n_kv * N_KV_HEAD * HEAD_DIM);
+                let k_v = self.kc[il].slice_view(kv_off, attn_nkv * N_KV_HEAD * HEAD_DIM);
+                let v_v = self.vc[il].slice_view(kv_off, attn_nkv * N_KV_HEAD * HEAD_DIM);
                 let mut od_v = ds.od.slice_view_mut(0, n_embd_q);
                 // Decode attention kernel selection. Default SPLIT-KV ("flash
                 // decoding"): partitions the causal history across n_head*n_splits
@@ -837,31 +855,31 @@ impl LagunaHetModel {
                 use crate::gqa_attention::DecodeAttn;
                 let decode_flash_min_kv = crate::gqa_attention::decode_flash_min_kv();
                 let variant = crate::gqa_attention::decode_attn_variant();
-                if variant == DecodeAttn::Naive || n_kv < decode_flash_min_kv {
+                if variant == DecodeAttn::Naive || attn_nkv < decode_flash_min_kv {
                     dk.gqa.single_query(
                         st, &mut od_v, &qf_v, &k_v, &v_v,
-                        n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, n_kv as u32, scale,
+                        n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, attn_nkv as u32, scale,
                     )?;
                 } else if variant == DecodeAttn::Flash {
                     dk.gqa.single_query_flash(
                         st, &mut od_v, &qf_v, &k_v, &v_v,
-                        n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, n_kv as u32, scale,
+                        n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, attn_nkv as u32, scale,
                     )?;
                 } else if variant == DecodeAttn::SplitKv {
-                    let n_splits = crate::gqa_attention::decode_kv_splits(n_kv as u32);
+                    let n_splits = crate::gqa_attention::decode_kv_splits(attn_nkv as u32);
                     dk.gqa.single_query_splitkv(
                         st, &mut od_v, &mut ds.attn_op, &mut ds.attn_mp, &mut ds.attn_lp,
                         &qf_v, &k_v, &v_v,
-                        n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, n_kv as u32, n_splits, scale,
+                        n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, attn_nkv as u32, n_splits, scale,
                     )?;
                 } else {
                     // Default: head-grouped split-KV (K/V staged once per KV head,
                     // reused across all kv_group query heads).
-                    let n_splits = crate::gqa_attention::decode_kv_splits_hg(n_kv as u32);
+                    let n_splits = crate::gqa_attention::decode_kv_splits_hg(attn_nkv as u32);
                     dk.gqa.single_query_splitkv_hg(
                         st, &mut od_v, &mut ds.attn_op, &mut ds.attn_mp, &mut ds.attn_lp,
                         &qf_v, &k_v, &v_v,
-                        n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, n_kv as u32, n_splits, scale,
+                        n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, attn_nkv as u32, n_splits, scale,
                     )?;
                 }
             }
@@ -1186,7 +1204,11 @@ impl LagunaHetModel {
         Ok(())
     }
 
-    pub fn forward_logits(&mut self, tok_id: usize, pos: usize) -> eyre::Result<(usize, f32)> {
+    /// Forward one token and return the full host logit vector (`VOCAB` long).
+    /// The device path is identical to [`Self::forward_logits`]; this variant
+    /// hands back all logits so the caller can sample (temperature / top-p)
+    /// host-side instead of taking the argmax.
+    pub fn forward_logits_full(&mut self, tok_id: usize, pos: usize) -> eyre::Result<Vec<f32>> {
         self.embed(tok_id)?;
         for il in 0..N_LAYER {
             self.layer(il, pos)?;
@@ -1204,6 +1226,11 @@ impl LagunaHetModel {
 
         let mut logits = vec![0f32; VOCAB];
         self.ds.logits.copy_to_host(&mut logits)?;
+        Ok(logits)
+    }
+
+    pub fn forward_logits(&mut self, tok_id: usize, pos: usize) -> eyre::Result<(usize, f32)> {
+        let logits = self.forward_logits_full(tok_id, pos)?;
         let (argmax, maxv) = logits
             .iter()
             .enumerate()
@@ -1359,22 +1386,29 @@ impl LagunaHetModel {
                 // LAGUNA_ATTN_FLASH=1 force scalar-ILP flash. Threshold is a conservative
                 // guess between the measured 512/4096 crossover — TODO tune at 1K/2K/3K.
                 const PREFILL_ATTN_WMMA_MIN_KV: usize = 2048;
+                // SLIDING-WINDOW ATTENTION: SWA layers (!is_full) attend only the
+                // previous SWA_WINDOW=512 keys per query row (spec sliding_window=512,
+                // LLAMA_SWA_TYPE_STANDARD). 0 = full causal (global layers). Passing
+                // 0 keeps global layers byte-identical to the pre-window behavior.
+                const SWA_WINDOW: u32 = 512;
+                let swa_off = std::env::var("LAGUNA_SWA_OFF").as_deref() == Ok("1");
+                let swa = if is_full || swa_off { 0u32 } else { SWA_WINDOW };
                 let force_wmma = std::env::var("LAGUNA_ATTN_WMMA").is_ok();
                 let force_flash = std::env::var("LAGUNA_ATTN_FLASH").is_ok();
                 if std::env::var("LAGUNA_ATTN_NAIVE").is_ok() {
                     dk.gqa.prefill(
                         st, &mut od_v, &qf_v, &k_v, &v_v,
-                        bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale,
+                        bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa,
                     )?;
                 } else if force_wmma || (!force_flash && n_kv_total >= PREFILL_ATTN_WMMA_MIN_KV) {
                     dk.gqa.prefill_flash_wmma(
                         st, &mut od_v, &qf_v, &k_v, &v_v,
-                        bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale,
+                        bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa,
                     )?;
                 } else {
                     dk.gqa.prefill_flash(
                         st, &mut od_v, &qf_v, &k_v, &v_v,
-                        bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale,
+                        bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa,
                     )?;
                 }
             }

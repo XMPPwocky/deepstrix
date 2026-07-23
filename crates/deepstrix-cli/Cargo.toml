@@ -15,3 +15,11 @@ color-eyre = { workspace = true }
 [[bin]]
 name = "deepstrix-chat"
 path = "src/bin/chat.rs"
+
+[[bin]]
+name = "laguna-chat"
+path = "src/bin/laguna_chat.rs"
+
+[[bin]]
+name = "laguna-oracle-gen"
+path = "src/bin/laguna_oracle_gen.rs"

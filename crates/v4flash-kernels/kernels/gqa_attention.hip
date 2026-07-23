@@ -158,7 +158,8 @@ extern "C" __global__ void gqa_attn_prefill(
         unsigned int     n_kv_head,
         unsigned int     head_dim,
         unsigned int     q_offset,  // absolute position of query row 0
-        float            scale) {
+        float            scale,
+        unsigned int     swa_window) { // 0 = full causal; else attend last `swa_window` keys
     const unsigned int h     = blockIdx.x;
     const unsigned int qi    = blockIdx.y;         // query row within the chunk
     const unsigned int tid   = threadIdx.x;
@@ -167,6 +168,9 @@ extern "C" __global__ void gqa_attn_prefill(
 
     // Causal key count for this query row (>= 1).
     const unsigned int n_kv = q_offset + qi + 1u;
+    // Sliding-window lower bound: attend keys [j_start, n_kv). j_start=0 for full
+    // layers (swa_window==0) — a NO-OP, so full-attention output is unchanged.
+    const unsigned int j_start = (swa_window != 0u && n_kv > swa_window) ? (n_kv - swa_window) : 0u;
 
     __shared__ float qs[GQA_HEAD_DIM_MAX];
     __shared__ float acc[GQA_HEAD_DIM_MAX];
@@ -195,7 +199,7 @@ extern "C" __global__ void gqa_attn_prefill(
     const unsigned long long kvh_off    = (unsigned long long)kv_head * head_dim;
     const unsigned long long row_stride = (unsigned long long)n_kv_head * head_dim;
 
-    for (unsigned int j = 0; j < n_kv; j++) {
+    for (unsigned int j = j_start; j < n_kv; j++) {
         const _Float16 *kj = k_cache + (unsigned long long)j * row_stride + kvh_off;
 
         float p = 0.0f;
@@ -301,7 +305,8 @@ void gqa_attn_prefill_flash(
         unsigned int     q_offset,                 // abs pos of query row 0
         unsigned int     batch,                    // B (number of query rows)
         unsigned int     n_kv_total,               // rows present in the cache
-        float            scale) {
+        float            scale,
+        unsigned int     swa_window) {             // 0 = full causal; else sliding window
     const unsigned int h   = blockIdx.x;
     const unsigned int qt  = blockIdx.y;
     const unsigned int tid = threadIdx.x;
@@ -347,8 +352,14 @@ void gqa_attn_prefill_flash(
     // Absolute position of the LAST valid query row -> last key it attends.
     const unsigned int max_q_abs   = q_offset + q_row_base + n_rows - 1u;
     const unsigned int n_key_tiles = max_q_abs / FBC + 1u;
+    // Sliding window: the block's SMALLEST query abs pos is row 0 (q_offset+q_row_base);
+    // keys below its window lower bound are masked for EVERY row, so skip those tiles.
+    const unsigned int min_q_abs = q_offset + q_row_base;
+    const unsigned int win_lo    = (swa_window != 0u && min_q_abs + 1u > swa_window)
+                                     ? (min_q_abs + 1u - swa_window) : 0u;
+    const unsigned int kt_start  = win_lo / FBC;
 
-    for (unsigned int kt = 0; kt < n_key_tiles; kt++) {
+    for (unsigned int kt = kt_start; kt < n_key_tiles; kt++) {
         const unsigned int key_base = kt * FBC;
 
         // --- Stage K/V tile into LDS once (reused across all FBR queries) ---
@@ -375,7 +386,8 @@ void gqa_attn_prefill_flash(
             if (i < n_rows) {
                 const unsigned int q_abs   = q_offset + q_row_base + i;
                 const unsigned int key_abs = key_base + j;
-                if (key_abs <= q_abs && key_abs < n_kv_total) {
+                const bool in_win = (swa_window == 0u) || (key_abs + swa_window > q_abs);
+                if (key_abs <= q_abs && key_abs < n_kv_total && in_win) {
                     const _Float16 *qr = Qs + (unsigned long long)i * FD;
                     const _Float16 *kr = Ks + (unsigned long long)j * FD;
                     // 8-way ILP: break the D-deep dependent fma chain so the
@@ -523,7 +535,8 @@ void gqa_attn_prefill_flash_wmma(
         unsigned int     q_offset,
         unsigned int     batch,
         unsigned int     n_kv_total,
-        float            scale) {
+        float            scale,
+        unsigned int     swa_window) {   // 0 = full causal; else sliding window
     const unsigned int h   = blockIdx.x;
     const unsigned int qt  = blockIdx.y;
     const unsigned int tid = threadIdx.x;
@@ -570,11 +583,16 @@ void gqa_attn_prefill_flash_wmma(
 
     const unsigned int max_q_abs   = q_offset + q_row_base + n_rows - 1u;
     const unsigned int n_key_tiles = max_q_abs / WFBC + 1u;
+    // Sliding window: skip key tiles entirely below the block's window lower bound.
+    const unsigned int min_q_abs = q_offset + q_row_base;
+    const unsigned int win_lo    = (swa_window != 0u && min_q_abs + 1u > swa_window)
+                                     ? (min_q_abs + 1u - swa_window) : 0u;
+    const unsigned int kt_start  = win_lo / WFBC;
 
     const unsigned int lane = tid & 31u;
     const unsigned int wave = tid >> 5;            // 0..3
 
-    for (unsigned int kt = 0; kt < n_key_tiles; kt++) {
+    for (unsigned int kt = kt_start; kt < n_key_tiles; kt++) {
         const unsigned int key_base = kt * WFBC;
 
         // --- Stage K/V tile (zero-padded) ---
@@ -624,7 +642,8 @@ void gqa_attn_prefill_flash_wmma(
                 if (i < n_rows) {
                     const unsigned int q_abs   = q_offset + q_row_base + i;
                     const unsigned int key_abs = key_base + j;
-                    if (key_abs <= q_abs && key_abs < n_kv_total) s = sacc[e] * scale;
+                    const bool in_win = (swa_window == 0u) || (key_abs + swa_window > q_abs);
+                    if (key_abs <= q_abs && key_abs < n_kv_total && in_win) s = sacc[e] * scale;
                 }
                 Sp[i * WFBC + j] = s;
             }
@@ -637,7 +656,8 @@ void gqa_attn_prefill_flash_wmma(
             if (i < n_rows) {
                 const unsigned int q_abs   = q_offset + q_row_base + i;
                 const unsigned int key_abs = key_base + j;
-                if (key_abs <= q_abs && key_abs < n_kv_total) {
+                const bool in_win = (swa_window == 0u) || (key_abs + swa_window > q_abs);
+                if (key_abs <= q_abs && key_abs < n_kv_total && in_win) {
                     const _Float16 *qr = Qs + (unsigned long long)i * WFD;
                     const _Float16 *kr = Ks + (unsigned long long)j * WFD;
                     float acc = 0.0f;

@@ -299,7 +299,7 @@ fn run_prefill_case(
 
     kernel.prefill(
         stream, &mut d_out, &d_q, &d_k, &d_v,
-        batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, 0, scale,
+        batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, 0, scale, 0,
     )?;
     stream.synchronize()?;
 
@@ -404,7 +404,7 @@ fn run_prefill_flash_case(
 
     kernel.prefill_flash(
         stream, &mut d_out, &d_q, &d_k, &d_v,
-        batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale,
+        batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0,
     )?;
     stream.synchronize()?;
 
@@ -506,7 +506,7 @@ fn run_prefill_wmma_case(
 
     kernel.prefill_flash_wmma(
         stream, &mut d_out, &d_q, &d_k, &d_v,
-        batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale,
+        batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0,
     )?;
     stream.synchronize()?;
 
@@ -613,9 +613,9 @@ fn gqa_attn_prefill_wmma_bench() -> eyre::Result<()> {
 
         for _ in 0..WARMUP {
             kernel.prefill_flash(&stream, &mut d_flash, &d_q, &d_k, &d_v,
-                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale)?;
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0)?;
             kernel.prefill_flash_wmma(&stream, &mut d_wmma, &d_q, &d_k, &d_v,
-                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale)?;
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0)?;
         }
         stream.synchronize()?;
 
@@ -632,7 +632,7 @@ fn gqa_attn_prefill_wmma_bench() -> eyre::Result<()> {
         let t0 = std::time::Instant::now();
         for _ in 0..ITERS {
             kernel.prefill_flash(&stream, &mut d_flash, &d_q, &d_k, &d_v,
-                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale)?;
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0)?;
         }
         stream.synchronize()?;
         let flash_us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
@@ -640,7 +640,7 @@ fn gqa_attn_prefill_wmma_bench() -> eyre::Result<()> {
         let t1 = std::time::Instant::now();
         for _ in 0..ITERS {
             kernel.prefill_flash_wmma(&stream, &mut d_wmma, &d_q, &d_k, &d_v,
-                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale)?;
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0)?;
         }
         stream.synchronize()?;
         let wmma_us = t1.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
@@ -941,5 +941,233 @@ fn gqa_attn_single_query_correctness() -> eyre::Result<()> {
     let e2 = run_case(&kernel, &device, &stream, 0x0fed_cba9_8765_4321, 72, 8, 128, 33)?;
     assert!(e2 < TOL, "case2 max_abs {e2:.3e} >= tol {TOL:.3e}");
 
+    Ok(())
+}
+
+/// SMALL-n_kv decode correctness: the shipped decode-parity bench only covers
+/// n_kv >= 4096 (n_splits >> 1). Real decode starts at n_kv ~ prompt_len (tens),
+/// where decode_kv_splits_hg == 1 and per-head/per-split edge cases live. This
+/// drives naive + splitkv + hg with the MODEL's own split counts and compares
+/// each against an independent CPU f32 softmax reference, for both Laguna layer
+/// shapes (n_head 48/72). Signed [-1,1) inputs (real q/k are signed post-RoPE).
+#[test]
+#[ignore]
+fn gqa_attn_decode_small_ctx_correctness() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let device = pick_dgpu()?;
+    device.set_current()?;
+    let arch = device.properties()?.gcn_arch_name;
+    let kernel = GqaAttention::for_arch(&arch)?;
+    let stream = Stream::new(device.id)?;
+
+    let n_kv_head = 8usize;
+    let head_dim = 128usize;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let mut worst_hg = 0f32;
+    let mut worst_sp = 0f32;
+
+    for &n_head in &[48usize, 72usize] {
+        let kv_group = n_head / n_kv_head;
+        for &n_kv in &[17usize, 20, 29, 40, 63, 100, 200, 257, 511, 600] {
+            let mut rng = Lcg(0xbeef00 ^ ((n_head as u64) << 20) ^ n_kv as u64);
+            let mut q_bits = vec![0u16; n_head * head_dim];
+            let mut q_f = vec![0f32; n_head * head_dim];
+            for i in 0..q_bits.len() {
+                let (b, v) = round_f16(rng.next_f32());
+                q_bits[i] = b;
+                q_f[i] = v;
+            }
+            let kv_len = n_kv * n_kv_head * head_dim;
+            let mut k_bits = vec![0u16; kv_len];
+            let mut v_bits = vec![0u16; kv_len];
+            let mut k_f = vec![0f32; kv_len];
+            let mut v_f = vec![0f32; kv_len];
+            for i in 0..kv_len {
+                let (kb, kv) = round_f16(rng.next_f32());
+                k_bits[i] = kb; k_f[i] = kv;
+                let (vb, vv) = round_f16(rng.next_f32());
+                v_bits[i] = vb; v_f[i] = vv;
+            }
+
+            let mut d_q: DeviceBuffer<u16> = DeviceBuffer::new(device.id, q_bits.len())?;
+            d_q.copy_from_host(&q_bits)?;
+            let mut d_k: DeviceBuffer<u16> = DeviceBuffer::new(device.id, k_bits.len())?;
+            d_k.copy_from_host(&k_bits)?;
+            let mut d_v: DeviceBuffer<u16> = DeviceBuffer::new(device.id, v_bits.len())?;
+            d_v.copy_from_host(&v_bits)?;
+            let mut d_naive: DeviceBuffer<f32> = DeviceBuffer::new(device.id, n_head * head_dim)?;
+            let mut d_split: DeviceBuffer<f32> = DeviceBuffer::new(device.id, n_head * head_dim)?;
+            let mut d_hg: DeviceBuffer<f32> = DeviceBuffer::new(device.id, n_head * head_dim)?;
+
+            let n_splits = v4flash_kernels::gqa_attention::decode_kv_splits(n_kv as u32);
+            let n_splits_hg = v4flash_kernels::gqa_attention::decode_kv_splits_hg(n_kv as u32);
+            let smax = n_splits.max(n_splits_hg) as usize;
+            let mut d_op: DeviceBuffer<f32> = DeviceBuffer::new(device.id, n_head * smax * head_dim)?;
+            let mut d_mp: DeviceBuffer<f32> = DeviceBuffer::new(device.id, n_head * smax)?;
+            let mut d_lp: DeviceBuffer<f32> = DeviceBuffer::new(device.id, n_head * smax)?;
+
+            kernel.single_query(&stream, &mut d_naive, &d_q, &d_k, &d_v,
+                n_head as u32, n_kv_head as u32, head_dim as u32, n_kv as u32, scale)?;
+            kernel.single_query_splitkv(&stream, &mut d_split, &mut d_op, &mut d_mp, &mut d_lp,
+                &d_q, &d_k, &d_v, n_head as u32, n_kv_head as u32, head_dim as u32,
+                n_kv as u32, n_splits, scale)?;
+            kernel.single_query_splitkv_hg(&stream, &mut d_hg, &mut d_op, &mut d_mp, &mut d_lp,
+                &d_q, &d_k, &d_v, n_head as u32, n_kv_head as u32, head_dim as u32,
+                n_kv as u32, n_splits_hg, scale)?;
+            stream.synchronize()?;
+
+            let mut got_naive = vec![0f32; n_head * head_dim];
+            let mut got_split = vec![0f32; n_head * head_dim];
+            let mut got_hg = vec![0f32; n_head * head_dim];
+            d_naive.copy_to_host(&mut got_naive)?;
+            d_split.copy_to_host(&mut got_split)?;
+            d_hg.copy_to_host(&mut got_hg)?;
+
+            // CPU f32 softmax reference.
+            let mut expect = vec![0f32; n_head * head_dim];
+            for h in 0..n_head {
+                let kv_head = h / kv_group;
+                let qh = &q_f[h * head_dim..h * head_dim + head_dim];
+                let mut scores = vec![0f32; n_kv];
+                for (j, s) in scores.iter_mut().enumerate() {
+                    let base = (j * n_kv_head + kv_head) * head_dim;
+                    let mut dot = 0f32;
+                    for d in 0..head_dim { dot += qh[d] * k_f[base + d]; }
+                    *s = dot * scale;
+                }
+                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut denom = 0f32;
+                for s in &mut scores { *s = (*s - m).exp(); denom += *s; }
+                let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+                let oh = &mut expect[h * head_dim..h * head_dim + head_dim];
+                for (j, &w) in scores.iter().enumerate() {
+                    let base = (j * n_kv_head + kv_head) * head_dim;
+                    let ww = w * inv;
+                    for d in 0..head_dim { oh[d] += ww * v_f[base + d]; }
+                }
+            }
+            let (mut cn, mut cs, mut ch) = (0f32, 0f32, 0f32);
+            for i in 0..expect.len() {
+                cn = cn.max((got_naive[i] - expect[i]).abs());
+                cs = cs.max((got_split[i] - expect[i]).abs());
+                ch = ch.max((got_hg[i] - expect[i]).abs());
+            }
+            worst_hg = worst_hg.max(ch);
+            worst_sp = worst_sp.max(cs);
+            eprintln!("n_head={n_head} n_kv={n_kv:>4} splits(sp/hg)={n_splits}/{n_splits_hg}  cpu_ref: naive={cn:.3e} splitkv={cs:.3e} hg={ch:.3e}");
+        }
+    }
+    const TOL: f32 = 2.0e-3;
+    assert!(worst_sp < TOL, "splitkv vs cpu worst {worst_sp:.3e} >= {TOL:.3e}");
+    assert!(worst_hg < TOL, "hg vs cpu worst {worst_hg:.3e} >= {TOL:.3e}");
+    Ok(())
+}
+
+/// SWA-WINDOWED prefill correctness: drives prefill / prefill_flash /
+/// prefill_flash_wmma with a non-zero `swa_window` and compares each against a
+/// CPU reference that applies the SAME sliding window — query row i (abs pos
+/// q_offset+i) attends keys [max(0, abs-window+1) .. abs]. Validates the new
+/// per-key window mask + the key-tile-start clamp. Uses a small window to force
+/// the windowed regime at modest B, and a q_offset>window case.
+#[test]
+#[ignore]
+fn gqa_attn_prefill_swa_window_correctness() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let device = pick_dgpu()?;
+    device.set_current()?;
+    let arch = device.properties()?.gcn_arch_name;
+    let kernel = GqaAttention::for_arch(&arch)?;
+    let stream = Stream::new(device.id)?;
+    let n_kv_head = 8usize;
+    let head_dim = 128usize;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    const TOL_SCALAR: f32 = 2.0e-3;
+    const TOL_WMMA: f32 = 3.0e-3;
+
+    // (q_offset, batch, n_head, window)
+    for &(q_offset, batch, n_head, window) in &[
+        (0usize, 40usize, 48usize, 8u32),
+        (0, 200, 72, 64),
+        (600, 64, 48, 512),
+        (500, 77, 72, 512),
+    ] {
+        let kv_group = n_head / n_kv_head;
+        let n_kv_total = q_offset + batch;
+        let mut rng = Lcg(0x5a5a00 ^ ((n_head as u64) << 24) ^ ((window as u64) << 8) ^ batch as u64);
+        let mut q_bits = vec![0u16; batch * n_head * head_dim];
+        let mut q_f = vec![0f32; batch * n_head * head_dim];
+        for i in 0..q_bits.len() { let (b, v) = round_f16(rng.next_f32()); q_bits[i] = b; q_f[i] = v; }
+        let kv_len = n_kv_total * n_kv_head * head_dim;
+        let mut k_bits = vec![0u16; kv_len];
+        let mut v_bits = vec![0u16; kv_len];
+        let mut k_f = vec![0f32; kv_len];
+        let mut v_f = vec![0f32; kv_len];
+        for i in 0..kv_len {
+            let (kb, kv) = round_f16(rng.next_f32()); k_bits[i] = kb; k_f[i] = kv;
+            let (vb, vv) = round_f16(rng.next_f32()); v_bits[i] = vb; v_f[i] = vv;
+        }
+        let mut d_q: DeviceBuffer<u16> = DeviceBuffer::new(device.id, q_bits.len())?;
+        d_q.copy_from_host(&q_bits)?;
+        let mut d_k: DeviceBuffer<u16> = DeviceBuffer::new(device.id, k_bits.len())?;
+        d_k.copy_from_host(&k_bits)?;
+        let mut d_v: DeviceBuffer<u16> = DeviceBuffer::new(device.id, v_bits.len())?;
+        d_v.copy_from_host(&v_bits)?;
+        let ol = batch * n_head * head_dim;
+        let mut d_naive: DeviceBuffer<f32> = DeviceBuffer::new(device.id, ol)?;
+        let mut d_flash: DeviceBuffer<f32> = DeviceBuffer::new(device.id, ol)?;
+        let mut d_wmma: DeviceBuffer<f32> = DeviceBuffer::new(device.id, ol)?;
+        kernel.prefill(&stream, &mut d_naive, &d_q, &d_k, &d_v,
+            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, window)?;
+        kernel.prefill_flash(&stream, &mut d_flash, &d_q, &d_k, &d_v,
+            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, window)?;
+        kernel.prefill_flash_wmma(&stream, &mut d_wmma, &d_q, &d_k, &d_v,
+            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, window)?;
+        stream.synchronize()?;
+        let mut got_naive = vec![0f32; ol];
+        let mut got_flash = vec![0f32; ol];
+        let mut got_wmma = vec![0f32; ol];
+        d_naive.copy_to_host(&mut got_naive)?;
+        d_flash.copy_to_host(&mut got_flash)?;
+        d_wmma.copy_to_host(&mut got_wmma)?;
+
+        // CPU windowed causal reference.
+        let mut expect = vec![0f32; ol];
+        for i in 0..batch {
+            let abs = q_offset + i;
+            let lo = abs.saturating_sub(window as usize - 1);
+            for h in 0..n_head {
+                let kv_head = h / kv_group;
+                let qh = &q_f[(i * n_head + h) * head_dim..(i * n_head + h) * head_dim + head_dim];
+                let mut scores = vec![f32::NEG_INFINITY; abs + 1];
+                for j in lo..=abs {
+                    let base = (j * n_kv_head + kv_head) * head_dim;
+                    let mut dot = 0f32;
+                    for d in 0..head_dim { dot += qh[d] * k_f[base + d]; }
+                    scores[j] = dot * scale;
+                }
+                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut denom = 0f32;
+                let mut sw = vec![0f32; abs + 1];
+                for j in lo..=abs { sw[j] = (scores[j] - m).exp(); denom += sw[j]; }
+                let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+                let oh = &mut expect[(i * n_head + h) * head_dim..(i * n_head + h) * head_dim + head_dim];
+                for j in lo..=abs {
+                    let base = (j * n_kv_head + kv_head) * head_dim;
+                    let ww = sw[j] * inv;
+                    for d in 0..head_dim { oh[d] += ww * v_f[base + d]; }
+                }
+            }
+        }
+        let (mut en, mut ef, mut ew) = (0f32, 0f32, 0f32);
+        for i in 0..ol {
+            en = en.max((got_naive[i] - expect[i]).abs());
+            ef = ef.max((got_flash[i] - expect[i]).abs());
+            ew = ew.max((got_wmma[i] - expect[i]).abs());
+        }
+        eprintln!("q_off={q_offset} B={batch} n_head={n_head} win={window}  cpu_ref: naive={en:.3e} flash={ef:.3e} wmma={ew:.3e}");
+        assert!(en < TOL_SCALAR, "naive windowed vs cpu {en:.3e}");
+        assert!(ef < TOL_SCALAR, "flash windowed vs cpu {ef:.3e}");
+        assert!(ew < TOL_WMMA, "wmma windowed vs cpu {ew:.3e}");
+    }
     Ok(())
 }

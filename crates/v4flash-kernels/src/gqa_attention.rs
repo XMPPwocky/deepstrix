@@ -521,6 +521,7 @@ impl GqaAttention {
         head_dim: u32,
         q_offset: u32,
         scale: f32,
+        swa_window: u32,
     ) -> eyre::Result<()> {
         if batch == 0 || n_head == 0 || n_kv_head == 0 || head_dim == 0 {
             return Err(eyre!(
@@ -561,7 +562,7 @@ impl GqaAttention {
         };
         launch_kernel!(function, cfg, stream, [
             out.raw(), q.raw(), k_cache.raw(), v_cache.raw(),
-            n_head, n_kv_head, head_dim, q_offset, scale
+            n_head, n_kv_head, head_dim, q_offset, scale, swa_window
         ])
     }
 
@@ -589,6 +590,7 @@ impl GqaAttention {
         head_dim: u32,
         q_offset: u32,
         scale: f32,
+        swa_window: u32,
     ) -> eyre::Result<()> {
         if batch == 0 || n_head == 0 || n_kv_head == 0 || head_dim == 0 {
             return Err(eyre!(
@@ -630,7 +632,7 @@ impl GqaAttention {
         };
         launch_kernel!(function, cfg, stream, [
             out.raw(), q.raw(), k_cache.raw(), v_cache.raw(),
-            n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale
+            n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window
         ])
     }
 
@@ -658,6 +660,7 @@ impl GqaAttention {
         head_dim: u32,
         q_offset: u32,
         scale: f32,
+        swa_window: u32,
     ) -> eyre::Result<()> {
         if batch == 0 || n_head == 0 || n_kv_head == 0 || head_dim == 0 {
             return Err(eyre!(
@@ -700,7 +703,7 @@ impl GqaAttention {
         };
         launch_kernel!(function, cfg, stream, [
             out.raw(), q.raw(), k_cache.raw(), v_cache.raw(),
-            n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale
+            n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window
         ])
     }
 }
