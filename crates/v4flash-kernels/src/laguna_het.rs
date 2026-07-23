@@ -1486,7 +1486,7 @@ impl LagunaHetModel {
                             bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa, cap as u32,
                         )?;
                     } else if is_full
-                        && std::env::var("LAGUNA_ATTN_HG").as_deref() != Some("0")
+                        && std::env::var("LAGUNA_ATTN_HG").as_deref() != Ok("0")
                     {
                         // Head-grouped WMMA prefill is the DEFAULT on the O(L²) global
                         // layers (kv_group=6 divisible by HG_G=3): block=256 (8 waves)

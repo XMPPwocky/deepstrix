@@ -1178,17 +1178,26 @@ void gqa_attn_prefill_flash_wmma_fa2_hg(
     __shared__ _Float16 Vs[HG_BC * WFD];
     __shared__ _Float16 Ps[HG_G * HG_BR * HG_BC];
     __shared__ float    Sp[HG_G * HG_BR * HG_BC];
-    __shared__ float    Os[HG_G * HG_BR * WFD];
     __shared__ float    m_s[HG_G * HG_BR];
     __shared__ float    l_s[HG_G * HG_BR];
     __shared__ float    corr_s[HG_G * HG_BR];
 
-    // --- Stage all HG_G heads' Q (zero-padded), zero Os ---
+    // REGISTER-RESIDENT O accumulator. Wave `w` owns d-tile w (cols w*16..w*16+15)
+    // for all HG_G heads; O_reg[g][e] holds row i=(lane>>4)*8+e of that d-tile.
+    // Keeping O in VGPRs (24/thread) instead of the old 24 KB LDS `Os` frees that
+    // LDS AND — the real win — kills the ~48 KB/tile LDS load+rescale+store round
+    // trip the AV phase used to pay on `Os` every single key tile.
+    gqa_float8 O_reg[HG_G];
+    #pragma unroll
+    for (unsigned int g = 0; g < HG_G; ++g)
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) O_reg[g][e] = 0.0f;
+
+    // --- Stage all HG_G heads' Q (zero-padded) ---
     for (unsigned int p = tid; p < HG_G * HG_BR * WFD; p += HG_BLOCK) {
         const unsigned int g = p / (HG_BR * WFD);
         const unsigned int r = (p / WFD) % HG_BR;
         const unsigned int d = p % WFD;
-        Os[p] = 0.0f;
         if (r < n_rows && d < hd) {
             Qs[p] = q[((unsigned long long)(q_row_base + r) * n_head + (h0 + g)) * hd + d];
         } else {
@@ -1268,56 +1277,80 @@ void gqa_attn_prefill_flash_wmma_fa2_hg(
         }
         __syncthreads();
 
-        // --- Online-softmax stats: one thread per (head, query row) ---
-        if (tid < HG_G * HG_BR) {
-            const unsigned int g = tid / HG_BR;
-            const unsigned int i = tid % HG_BR;
+        // --- Online-softmax stats: WARP-PARALLEL, 4 lanes per (head,row).
+        //     Each (head,row) softmax task is split across 4 consecutive lanes,
+        //     each owning HG_BC/4 (=8) columns. The scalar version ran one thread
+        //     per row (HG_G*HG_BR=48 threads, each serially scanning 32 keys with
+        //     expf) while the matrix core idled; spreading each row over 4 lanes
+        //     quarters the serial expf chain (8 vs 32) and uses 192 threads. The
+        //     per-row max/sum are combined across the 4 lanes with a 2-step
+        //     __shfl_xor butterfly (mask 1,2 — the 4 lanes are contiguous within
+        //     a wave since 4 | 32). Reassociates the sum across 4 partials; the
+        //     WMMA-f16 tolerance already absorbs the reorder. ---
+        if (tid < HG_G * HG_BR * 4u) {
+            const unsigned int task    = tid >> 2;        // 0..HG_G*HG_BR-1
+            const unsigned int quarter = tid & 3u;        // 0..3
+            const unsigned int g = task / HG_BR;
+            const unsigned int i = task % HG_BR;
             if (i < n_rows) {
                 float *Spg = Sp + (unsigned long long)g * HG_BR * HG_BC;
                 _Float16 *Psg = Ps + (unsigned long long)g * HG_BR * HG_BC;
-                float tmax = -INFINITY;
+                const unsigned int c0 = quarter * (HG_BC / 4u);   // 8 cols/lane
+                // local max over this lane's 8 columns
+                float lmax = -INFINITY;
                 #pragma unroll
-                for (unsigned int j = 0; j < HG_BC; j++) { const float v = Spg[i*HG_BC+j]; if (v > tmax) tmax = v; }
+                for (unsigned int j = 0; j < HG_BC / 4u; j++) {
+                    const float v = Spg[i*HG_BC + c0 + j];
+                    if (v > lmax) lmax = v;
+                }
+                // butterfly-reduce max across the 4 lanes
+                lmax = fmaxf(lmax, __shfl_xor(lmax, 1));
+                lmax = fmaxf(lmax, __shfl_xor(lmax, 2));
+                const float tmax  = lmax;
                 const float m_old = m_s[g*HG_BR+i];
                 const float m_new = fmaxf(m_old, tmax);
-                float corr, rsum = 0.0f;
+                float corr, lsum = 0.0f;
                 if (m_new == -INFINITY) {
                     corr = 1.0f;
                     #pragma unroll
-                    for (unsigned int j = 0; j < HG_BC; j++) Psg[i*HG_BC+j] = (_Float16)0.0f;
+                    for (unsigned int j = 0; j < HG_BC / 4u; j++) Psg[i*HG_BC + c0 + j] = (_Float16)0.0f;
                 } else {
                     corr = expf(m_old - m_new);
                     #pragma unroll
-                    for (unsigned int j = 0; j < HG_BC; j++) {
-                        const float sij = Spg[i*HG_BC+j];
+                    for (unsigned int j = 0; j < HG_BC / 4u; j++) {
+                        const float sij = Spg[i*HG_BC + c0 + j];
                         const float p = (sij == -INFINITY) ? 0.0f : expf(sij - m_new);
-                        Psg[i*HG_BC+j] = (_Float16)p;
-                        rsum += p;
+                        Psg[i*HG_BC + c0 + j] = (_Float16)p;
+                        lsum += p;
                     }
                 }
-                l_s[g*HG_BR+i]    = l_s[g*HG_BR+i] * corr + rsum;
-                m_s[g*HG_BR+i]    = m_new;
-                corr_s[g*HG_BR+i] = corr;
+                // butterfly-reduce sum across the 4 lanes
+                lsum += __shfl_xor(lsum, 1);
+                lsum += __shfl_xor(lsum, 2);
+                if (quarter == 0u) {
+                    l_s[g*HG_BR+i]    = l_s[g*HG_BR+i] * corr + lsum;
+                    m_s[g*HG_BR+i]    = m_new;
+                    corr_s[g*HG_BR+i] = corr;
+                }
             }
         }
         __syncthreads();
 
-        // --- AV: Os[g] = Os[g]·corr + P[g]·V. Wave = d-tile (0..7), loops heads.
-        //     Os C-fragment loaded from LDS, rescaled, WMMA-accumulated, stored. ---
+        // --- AV: O_reg[g] = O_reg[g]·corr + P[g]·V. Wave = d-tile (0..7), loops
+        //     heads. O stays in registers — rescale in place, WMMA-accumulate,
+        //     NO LDS load/store (the old `Os` round trip is gone). ---
         {
             const unsigned int dt = wave;          // d-tile 0..7 (cols dt*16..dt*16+15)
             #pragma unroll
             for (unsigned int g = 0; g < HG_G; ++g) {
-                float    *Osg = Os + (unsigned long long)g * HG_BR * WFD;
                 _Float16 *Psg = Ps + (unsigned long long)g * HG_BR * HG_BC;
                 const float *crg = corr_s + (unsigned long long)g * HG_BR;
-                // load current O fragment + rescale by corr (per row)
                 gqa_float8 oacc;
+                // rescale the running O fragment by corr (per row)
                 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
                     const unsigned int i = (lane >> 4) * 8u + (unsigned int)e;   // row 0..15
-                    const unsigned int d = dt * 16u + (lane & 15u);
-                    oacc[e] = Osg[i * WFD + d] * crg[i];
+                    oacc[e] = O_reg[g][e] * crg[i];
                 }
                 #pragma unroll
                 for (unsigned int ks = 0; ks < HG_BC; ks += 16u) {   // 2 k-steps
@@ -1337,25 +1370,28 @@ void gqa_attn_prefill_flash_wmma_fa2_hg(
                     oacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pf, vf, oacc);
                 }
                 #pragma unroll
-                for (int e = 0; e < 8; ++e) {
-                    const unsigned int i = (lane >> 4) * 8u + (unsigned int)e;
-                    const unsigned int d = dt * 16u + (lane & 15u);
-                    Osg[i * WFD + d] = oacc[e];
-                }
+                for (int e = 0; e < 8; ++e) O_reg[g][e] = oacc[e];
             }
         }
         __syncthreads();
     }
 
-    // --- Normalise + write out for all HG_G heads ---
-    for (unsigned int p = tid; p < HG_G * HG_BR * WFD; p += HG_BLOCK) {
-        const unsigned int g = p / (HG_BR * WFD);
-        const unsigned int i = (p / WFD) % HG_BR;
-        const unsigned int d = p % WFD;
-        if (i < n_rows && d < hd) {
-            const float l = l_s[g*HG_BR+i];
-            const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
-            out[((unsigned long long)(q_row_base + i) * n_head + (h0 + g)) * hd + d] = Os[p] * inv;
+    // --- Normalise + write out from register-O. Wave = d-tile (dt); it owns cols
+    //     dt*16..dt*16+15 (all < hd since dt<8, hd=128) for rows (lane>>4)*8+e. ---
+    {
+        const unsigned int dt = wave;
+        #pragma unroll
+        for (unsigned int g = 0; g < HG_G; ++g) {
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const unsigned int i = (lane >> 4) * 8u + (unsigned int)e;
+                const unsigned int d = dt * 16u + (lane & 15u);
+                if (i < n_rows) {
+                    const float l = l_s[g*HG_BR+i];
+                    const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+                    out[((unsigned long long)(q_row_base + i) * n_head + (h0 + g)) * hd + d] = O_reg[g][e] * inv;
+                }
+            }
         }
     }
 #endif

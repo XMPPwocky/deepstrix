@@ -42,7 +42,12 @@ const GQA_BLOCK: u32 = 256;
 const FLASH_BR: u32 = 32;
 /// Head-grouped WMMA prefill geometry — MUST mirror `HG_G`/`HG_BR`/`HG_BLOCK`
 /// in `gqa_attention.hip` (override both sides together via `-DHG_G=`/`-DHG_BR=`).
-const FLASH_HG_G: u32 = 3;
+// Query heads grouped per WG. Env-overridable for A/B (MUST match the kernel's
+// compile-time -DHG_G). Default 3 = max K/V reuse at 1 WG/CU; 2 lowers LDS to
+// ~31 KB → 2 WG/CU (hides barriers behind a second WG).
+fn flash_hg_g() -> u32 {
+    std::env::var("LAGUNA_HG_G").ok().and_then(|v| v.parse().ok()).unwrap_or(3)
+}
 const FLASH_HG_BR: u32 = 16;
 const FLASH_HG_BLOCK: u32 = 256;
 /// Max `head_dim` the flash kernel's static LDS supports (mirrors `FD`).
@@ -855,8 +860,9 @@ impl GqaAttention {
             return Err(eyre!("gqa flash wmma fa2 hg: n_head={n_head} not div by n_kv_head={n_kv_head}"));
         }
         let kv_group = n_head / n_kv_head;
-        if kv_group % FLASH_HG_G != 0 {
-            return Err(eyre!("gqa flash wmma fa2 hg: kv_group={kv_group} not div by HG_G={FLASH_HG_G}"));
+        let flash_hg_g = flash_hg_g();
+        if kv_group % flash_hg_g != 0 {
+            return Err(eyre!("gqa flash wmma fa2 hg: kv_group={kv_group} not div by HG_G={flash_hg_g}"));
         }
         let n_kv_total = q_offset + batch;
         let want_q = (batch * n_head * head_dim) as usize;
@@ -868,7 +874,7 @@ impl GqaAttention {
             return Err(eyre!("gqa flash wmma fa2 hg: kv cache too small"));
         }
         let function = self.module.get_function("gqa_attn_prefill_flash_wmma_fa2_hg")?;
-        let n_subgroup = kv_group / FLASH_HG_G;
+        let n_subgroup = kv_group / flash_hg_g;
         let grid_x = n_kv_head * n_subgroup;
         let grid_y = batch.div_ceil(FLASH_HG_BR);
         let cfg = LaunchConfig {
