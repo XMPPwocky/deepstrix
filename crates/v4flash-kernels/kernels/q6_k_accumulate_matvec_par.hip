@@ -172,6 +172,7 @@ extern "C" __global__ void q6_k_matvec_par_batched(
     float acc = 0.0f;
     for (unsigned int s = 0; s < n_used; s++) {
         const int e = selected[s];
+        if (e < 0) continue; // het-split sentinel (slot owned by the other device)
         const uint8_t* w_expert = w_base + (uint64_t)e * (uint64_t)dbpe;
         const uint8_t* xq_slot  = xq_base + (uint64_t)s * (uint64_t)xq_slot_stride;
         const uint8_t* row_base = w_expert + (uint64_t)row * n_blocks_in * BLOCK_Q6_K_BYTES;

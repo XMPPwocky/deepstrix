@@ -178,6 +178,9 @@ extern "C" __global__ void q4_k_pair_matvec_fused_swiglu_batch(
     const unsigned int sub        = lane & 3u;
 
     const int e = selected[slot];
+    // het-split sentinel: a slot routed to the OTHER device is marked -1; skip
+    // it before touching any weights (inert for callers that pass ids >= 0).
+    if (e < 0) return;
     const uint8_t* gate_row_base = gate_w_base
                                  + (uint64_t)e * (uint64_t)gate_bpe
                                  + (uint64_t)row * n_blocks_in * BLOCK_Q4_K_BYTES;
@@ -243,6 +246,7 @@ extern "C" __global__ void q4_k_matvec_par_batched(
     float acc = 0.0f;
     for (unsigned int s = 0; s < n_used; s++) {
         const int e = selected[s];
+        if (e < 0) continue; // het-split sentinel (slot owned by the other device)
         const uint8_t* w_expert = w_base + (uint64_t)e * (uint64_t)dbpe;
         const uint8_t* xq_slot  = xq_base + (uint64_t)s * (uint64_t)xq_slot_stride;
         const uint8_t* row_base = w_expert + (uint64_t)row * n_blocks_in * BLOCK_Q4_K_BYTES;

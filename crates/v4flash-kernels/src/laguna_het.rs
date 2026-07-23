@@ -35,7 +35,7 @@ use v4flash_core::gguf::{GgufType};
 use v4flash_core::MappedGguf;
 use v4flash_hip::{Device, DeviceBuffer, Event, Stream};
 
-use crate::het::sync::peer_push_f32;
+use crate::het::sync::{peer_push_f32, peer_push_i32};
 use crate::laguna::{
     block_bytes, dequant_q4k_superblock, qmatvec, qmatvec_batched, LagunaHparams, LagunaOps,
     QWeight, EPS, FF_DENSE, FF_EXP, FF_SHEXP, HEAD_DIM, HIDDEN, N_EXPERT, N_KV_HEAD, N_LAYER, TOPK,
@@ -96,11 +96,44 @@ struct DgpuLayer {
     wo: DeviceBuffer<u8>,
     wg: DeviceBuffer<u8>,
     dense: Option<(QWeight, QWeight, QWeight)>, // gate, up, down (layer 0 only)
+    // dGPU-resident copy of the shared expert (gate, up, down) for MoE layers.
+    // Populated so the shared expert can run on the dGPU CONCURRENTLY with the
+    // iGPU routed experts (the dGPU is otherwise idle during the MoE window).
+    // ~6 MB/layer (~288 MB total). See `LAGUNA_SHEXP_DGPU`.
+    shexp: Option<(QWeight, QWeight, QWeight)>,
+    // dGPU-resident router (matvec weight + score-correction bias) for the
+    // het-split path: the router runs on the dGPU so `fn_in` never has to make a
+    // round trip to the iGPU before the hot experts can start. MoE layers only.
+    router: Option<DeviceBuffer<f32>>,
+    router_bias: Option<DeviceBuffer<f32>>,
+    // dGPU-resident HOT routed experts (the K globally-most-frequent experts for
+    // this layer) + the global->local slot map. Populated when the het-MoE split
+    // is enabled (`LAGUNA_HOT_EXPERTS_DGPU=<file>`).
+    hot: Option<DgpuHot>,
+}
+
+/// dGPU-resident hot routed experts: the K most-frequent experts for a layer,
+/// packed exactly like the iGPU's all-expert buffers but only K entries wide.
+struct DgpuHot {
+    hot_map: DeviceBuffer<i32>, // [N_EXPERT] global id -> local slot 0..K, else -1
+    gate_all: DeviceBuffer<u8>, // [K * gate_stride]
+    up_all: DeviceBuffer<u8>,   // [K * up_stride]
+    down_all: DeviceBuffer<u8>, // [K * down_stride]
+    gate_stride: usize,
+    up_stride: usize,
+    down_stride: usize,
+    down_dt: GgufType,
+    n_hot: usize, // K — the number of dGPU-resident hot experts for this layer
 }
 
 /// iGPU-resident per-layer MoE weights (None for the dense layer 0).
 struct IgpuLayer {
     moe: Option<HetMoe>,
+    // iGPU-resident copy of the per-layer hot-map (global expert id -> local
+    // dGPU slot, or -1). Needed by the COLD by-expert group builder
+    // (`launch_hetsplit` mode=0) so the iGPU knows which selections the dGPU
+    // took. Populated with the dGPU hot residency (prefill het-split).
+    hot_map: Option<DeviceBuffer<i32>>,
 }
 
 struct HetMoe {
@@ -143,11 +176,33 @@ struct DgpuScratch {
     moe_recv: DeviceBuffer<f32>, // ffn_out received from iGPU
     rn: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
+    // dGPU shared-expert scratch (overlaps iGPU routed experts).
+    sh_gate: DeviceBuffer<f32>, // [FF_SHEXP]
+    sh_up: DeviceBuffer<f32>,   // [FF_SHEXP]
+    sh_sw: DeviceBuffer<f32>,   // [FF_SHEXP]
+    sh_down: DeviceBuffer<f32>, // [HIDDEN] shared-expert output
+    // het-MoE-split (router-on-dGPU + hot routed experts on dGPU) scratch.
+    sel: DeviceBuffer<i32>,          // [TOPK] router selection (global ids)
+    ew: DeviceBuffer<f32>,           // [TOPK] routing weights
+    router_probs: DeviceBuffer<f32>, // [N_EXPERT]
+    router_scores: DeviceBuffer<f32>,// [N_EXPERT]
+    hot_sel: DeviceBuffer<i32>,      // [TOPK] local slot (hot) else -1
+    hot_ew: DeviceBuffer<f32>,       // [TOPK]
+    cold_sel: DeviceBuffer<i32>,     // [TOPK] global id (cold) else -1
+    cold_ew: DeviceBuffer<f32>,      // [TOPK]
+    xq_hidden: DeviceBuffer<u8>,     // [(HIDDEN/256)*292] q8k(fn_in)
+    mid_hot: DeviceBuffer<f32>,      // [TOPK*FF_EXP]
+    xq_mid: DeviceBuffer<u8>,        // [TOPK*(FF_EXP/256)*292]
+    acc_hot: DeviceBuffer<f32>,      // [HIDDEN] hot routed partial sum
 }
 
 /// iGPU scratch — router + routed MoE + shared expert.
 struct IgpuScratch {
     fn_in_recv: DeviceBuffer<f32>, // received from dGPU
+    // het-split: cold selection computed on the dGPU and pushed here (the iGPU
+    // runs no router in split mode). `[TOPK]`, sentinel -1 in hot slots.
+    cold_sel_recv: DeviceBuffer<i32>,
+    cold_ew_recv: DeviceBuffer<f32>,
     sel: DeviceBuffer<i32>,
     ew: DeviceBuffer<f32>,
     router_probs: DeviceBuffer<f32>,
@@ -217,6 +272,52 @@ pub struct LagunaHetModel {
     diag: bool,
     diag_dgpu_us: u64,
     diag_igpu_us: u64,
+
+    // Run the shared expert on the dGPU concurrently with the iGPU routed
+    // experts (default on). `LAGUNA_SHEXP_DGPU=0` restores the all-iGPU MoE.
+    shexp_dgpu: bool,
+
+    // LAGUNA_EXPERT_HIST=1: accumulate a per-layer routed-expert selection
+    // histogram over decode steps. Used to size the hot-expert set (which
+    // globally-frequent experts to make dGPU-resident) and to measure the
+    // per-token top-K capture fraction that bounds the het-MoE overlap win.
+    hist_enabled: bool,
+    expert_hist: Vec<Vec<u32>>, // [N_LAYER][N_EXPERT] selection counts
+    hist_sel_host: Vec<i32>,    // reusable [TOPK] host scratch
+
+    // het-MoE split: hot routed experts on the dGPU overlap the cold experts on
+    // the iGPU. Enabled by `LAGUNA_HOT_EXPERTS_DGPU=<file>` (per-layer hot-expert
+    // id list). `hot_split` is true only when the hot residency actually loaded.
+    hetmoe: crate::laguna_het_moe::LagunaHetMoeSplit, // partition kernel (dGPU)
+    hot_split: bool,
+
+    // Prefill het-MoE split: when true, `attn_batched` leaves `fn_in` on the
+    // dGPU (the router runs on the dGPU in the split path) instead of pushing it
+    // to the iGPU. Set for the duration of `prefill_batched_het` only.
+    prefill_split: bool,
+    // Per-token dGPU-resident-slot cap for the prefill split (hetsplit `cap`).
+    // TOPK == no cap (every resident selection goes to the dGPU). Lower values
+    // shift work back to the iGPU to balance the two device legs.
+    prefill_hot_cap: u32,
+}
+
+/// Parse a hot-experts file: `N_LAYER` lines, line `il` holds the space-
+/// separated global expert ids to make dGPU-resident for layer `il` (blank for
+/// the dense layer 0). Missing trailing lines => empty (all-cold) layers.
+fn parse_hot_experts(path: &str) -> eyre::Result<Vec<Vec<usize>>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| eyre!("LAGUNA_HOT_EXPERTS_DGPU={path}: {e}"))?;
+    let mut per_layer: Vec<Vec<usize>> = text
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .filter_map(|t| t.parse::<usize>().ok())
+                .collect()
+        })
+        .collect();
+    per_layer.resize(N_LAYER, Vec::new());
+    per_layer.truncate(N_LAYER);
+    Ok(per_layer)
 }
 
 impl LagunaHetModel {
@@ -282,6 +383,36 @@ impl LagunaHetModel {
             Ok(b)
         };
 
+        // het-MoE split: optional per-layer hot-expert residency on the dGPU.
+        // `LAGUNA_HOT_EXPERTS_DGPU=<file>` — N_LAYER lines, line `il` = the
+        // space-separated global expert ids to make dGPU-resident for layer il
+        // (empty for the dense layer 0). Absent/empty => pure-iGPU MoE fallback.
+        let hot_experts: Option<Vec<Vec<usize>>> = match std::env::var("LAGUNA_HOT_EXPERTS_DGPU") {
+            Ok(path) if !path.is_empty() => Some(parse_hot_experts(&path)?),
+            _ => None,
+        };
+        // Pack the K hot experts' rows out of the full [N_EXPERT*stride] tensor
+        // into a K-wide dGPU-resident buffer (local slot j == hot_ids[j]).
+        let mk_hot = |dev: i32, name: &str, stride: usize, hot_ids: &[usize]| -> eyre::Result<DeviceBuffer<u8>> {
+            let t = gguf.gguf().tensor(name).ok_or_else(|| eyre!("missing {name}"))?;
+            let bytes = gguf.read_tensor(t)?;
+            let want = N_EXPERT * stride;
+            if bytes.len() != want {
+                return Err(eyre!("{name}: expected {want} bytes, got {}", bytes.len()));
+            }
+            let mut packed = vec![0u8; hot_ids.len() * stride];
+            for (j, &g) in hot_ids.iter().enumerate() {
+                if g >= N_EXPERT {
+                    return Err(eyre!("hot expert id {g} >= N_EXPERT for {name}"));
+                }
+                packed[j * stride..(j + 1) * stride]
+                    .copy_from_slice(&bytes[g * stride..(g + 1) * stride]);
+            }
+            let mut b = DeviceBuffer::<u8>::new(dev, packed.len())?;
+            b.copy_from_host(&packed)?;
+            Ok(b)
+        };
+
         let mut dlayers = Vec::with_capacity(N_LAYER);
         let mut ilayers = Vec::with_capacity(N_LAYER);
         for il in 0..N_LAYER {
@@ -300,6 +431,16 @@ impl LagunaHetModel {
             } else {
                 None
             };
+            // dGPU-resident shared expert (MoE layers only) for the overlap path.
+            let shexp = if il == 0 {
+                None
+            } else {
+                Some((
+                    mk_qweight(dgpu.id, &p("ffn_gate_shexp.weight"))?,
+                    mk_qweight(dgpu.id, &p("ffn_up_shexp.weight"))?,
+                    mk_qweight(dgpu.id, &p("ffn_down_shexp.weight"))?,
+                ))
+            };
             dlayers.push(DgpuLayer {
                 is_full,
                 n_head,
@@ -313,6 +454,10 @@ impl LagunaHetModel {
                 wo: mk_u8(dgpu.id, &p("attn_output.weight"))?,
                 wg: mk_u8(dgpu.id, &p("attn_gate.weight"))?,
                 dense,
+                shexp,
+                router: None,
+                router_bias: None,
+                hot: None,
             });
 
             // --- iGPU: routed + shared experts + router ---
@@ -357,8 +502,56 @@ impl LagunaHetModel {
                     down_dt,
                 })
             };
-            ilayers.push(IgpuLayer { moe });
+            ilayers.push(IgpuLayer { moe, hot_map: None });
+
+            // --- dGPU: router + HOT routed experts (het-split), MoE layers ---
+            if il > 0 {
+                if let Some(hot_ids) = hot_experts.as_ref().map(|h| h.get(il)).flatten() {
+                    if !hot_ids.is_empty() {
+                        dgpu.set_current()?;
+                        let g = gguf.gguf();
+                        let gate_t = g.tensor(&p("ffn_gate_exps.weight")).unwrap();
+                        let up_t = g.tensor(&p("ffn_up_exps.weight")).unwrap();
+                        let down_t = g.tensor(&p("ffn_down_exps.weight")).unwrap();
+                        let gate_stride = FF_EXP * (HIDDEN / 256) * block_bytes(gate_t.dtype);
+                        let up_stride = FF_EXP * (HIDDEN / 256) * block_bytes(up_t.dtype);
+                        let down_stride = HIDDEN * (FF_EXP / 256) * block_bytes(down_t.dtype);
+                        let down_dt = down_t.dtype;
+                        // hot_map[global] = local slot, else -1.
+                        let mut map = vec![-1i32; N_EXPERT];
+                        for (j, &e) in hot_ids.iter().enumerate() {
+                            map[e] = j as i32;
+                        }
+                        let mut hot_map = DeviceBuffer::<i32>::new(dgpu.id, N_EXPERT)?;
+                        hot_map.copy_from_host(&map)?;
+                        let hot = DgpuHot {
+                            hot_map,
+                            gate_all: mk_hot(dgpu.id, &p("ffn_gate_exps.weight"), gate_stride, hot_ids)?,
+                            up_all: mk_hot(dgpu.id, &p("ffn_up_exps.weight"), up_stride, hot_ids)?,
+                            down_all: mk_hot(dgpu.id, &p("ffn_down_exps.weight"), down_stride, hot_ids)?,
+                            gate_stride,
+                            up_stride,
+                            down_stride,
+                            down_dt,
+                            n_hot: hot_ids.len(),
+                        };
+                        let dl = dlayers.last_mut().unwrap();
+                        dl.router = Some(mk_f32(dgpu.id, &p("ffn_gate_inp.weight"))?);
+                        dl.router_bias = Some(mk_f32(dgpu.id, &p("exp_probs_b.bias"))?);
+                        dl.hot = Some(hot);
+                        // iGPU-resident hot-map for the COLD by-expert group
+                        // builder (mode=0 needs the same remap to exclude the
+                        // dGPU-taken selections).
+                        igpu.set_current()?;
+                        let mut hot_map_i = DeviceBuffer::<i32>::new(igpu.id, N_EXPERT)?;
+                        hot_map_i.copy_from_host(&map)?;
+                        ilayers.last_mut().unwrap().hot_map = Some(hot_map_i);
+                        dgpu.set_current()?;
+                    }
+                }
+            }
         }
+        let hot_split = hot_experts.is_some();
 
         // --- output head + KV cache on dGPU ---
         dgpu.set_current()?;
@@ -401,6 +594,22 @@ impl LagunaHetModel {
             moe_recv: mkd(HIDDEN)?,
             rn: mkd(HIDDEN)?,
             logits: mkd(VOCAB)?,
+            sh_gate: mkd(FF_SHEXP)?,
+            sh_up: mkd(FF_SHEXP)?,
+            sh_sw: mkd(FF_SHEXP)?,
+            sh_down: mkd(HIDDEN)?,
+            sel: DeviceBuffer::<i32>::new(dgpu.id, TOPK)?,
+            ew: mkd(TOPK)?,
+            router_probs: mkd(N_EXPERT)?,
+            router_scores: mkd(N_EXPERT)?,
+            hot_sel: DeviceBuffer::<i32>::new(dgpu.id, TOPK)?,
+            hot_ew: mkd(TOPK)?,
+            cold_sel: DeviceBuffer::<i32>::new(dgpu.id, TOPK)?,
+            cold_ew: mkd(TOPK)?,
+            xq_hidden: DeviceBuffer::<u8>::new(dgpu.id, (HIDDEN / 256) * 292)?,
+            mid_hot: mkd(TOPK * FF_EXP)?,
+            xq_mid: DeviceBuffer::<u8>::new(dgpu.id, TOPK * (FF_EXP / 256) * 292)?,
+            acc_hot: mkd(HIDDEN)?,
         };
 
         // --- iGPU scratch ---
@@ -408,6 +617,8 @@ impl LagunaHetModel {
         let mki = |n: usize| DeviceBuffer::<f32>::new(igpu.id, n);
         let is = IgpuScratch {
             fn_in_recv: mki(HIDDEN)?,
+            cold_sel_recv: DeviceBuffer::<i32>::new(igpu.id, TOPK)?,
+            cold_ew_recv: mki(TOPK)?,
             sel: DeviceBuffer::<i32>::new(igpu.id, TOPK)?,
             ew: mki(TOPK)?,
             router_probs: mki(N_EXPERT)?,
@@ -452,6 +663,11 @@ impl LagunaHetModel {
             hp,
             rope_full,
             rope_swa,
+            hetmoe: {
+                dgpu.set_current()?;
+                crate::laguna_het_moe::LagunaHetMoeSplit::for_arch(dgpu_arch)?
+            },
+            hot_split,
             dk: {
                 dgpu.set_current()?;
                 HetKernels::for_arch(dgpu_arch)?
@@ -477,6 +693,15 @@ impl LagunaHetModel {
             diag: std::env::var("LAGUNA_HET_DIAG").map(|v| v == "1").unwrap_or(false),
             diag_dgpu_us: 0,
             diag_igpu_us: 0,
+            shexp_dgpu: std::env::var("LAGUNA_SHEXP_DGPU").map(|v| v != "0").unwrap_or(true),
+            hist_enabled: std::env::var("LAGUNA_EXPERT_HIST").map(|v| v == "1").unwrap_or(false),
+            expert_hist: vec![vec![0u32; N_EXPERT]; N_LAYER],
+            hist_sel_host: vec![0i32; TOPK],
+            prefill_split: false,
+            prefill_hot_cap: std::env::var("LAGUNA_PREFILL_HOT_CAP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(TOPK as u32),
         })
     }
 
@@ -496,6 +721,54 @@ impl LagunaHetModel {
     pub fn reset_diag(&mut self) {
         self.diag_dgpu_us = 0;
         self.diag_igpu_us = 0;
+    }
+
+    /// Per-layer routed-expert selection histogram (`[N_LAYER][N_EXPERT]`).
+    /// Only populated when `LAGUNA_EXPERT_HIST=1`.
+    pub fn expert_hist(&self) -> &[Vec<u32>] {
+        &self.expert_hist
+    }
+
+    /// For each layer, pick the `k` globally-most-frequent experts (descending
+    /// count) and return their ids. This is the static hot set the dGPU would
+    /// hold resident.
+    pub fn hot_experts_per_layer(&self, k: usize) -> Vec<Vec<usize>> {
+        self.expert_hist
+            .iter()
+            .map(|counts| {
+                let mut idx: Vec<usize> = (0..counts.len()).collect();
+                idx.sort_by(|&a, &b| counts[b].cmp(&counts[a]).then(a.cmp(&b)));
+                idx.truncate(k);
+                idx
+            })
+            .collect()
+    }
+
+    /// Fraction of all per-token top-K routing SLOTS that land on the `k`
+    /// dGPU-resident hot experts (per-layer hot set = the k most frequent in
+    /// that layer). This upper-bounds the iGPU work that can be moved to the
+    /// dGPU. Returns (overall_fraction, per_layer_fraction).
+    pub fn hot_capture_fraction(&self, k: usize) -> (f64, Vec<f64>) {
+        let hot = self.hot_experts_per_layer(k);
+        let mut tot_all = 0u64;
+        let mut tot_hot = 0u64;
+        let per_layer: Vec<f64> = self
+            .expert_hist
+            .iter()
+            .enumerate()
+            .map(|(il, counts)| {
+                let layer_all: u64 = counts.iter().map(|&c| c as u64).sum();
+                if layer_all == 0 {
+                    return 0.0;
+                }
+                let layer_hot: u64 = hot[il].iter().map(|&e| counts[e] as u64).sum();
+                tot_all += layer_all;
+                tot_hot += layer_hot;
+                layer_hot as f64 / layer_all as f64
+            })
+            .collect();
+        let overall = if tot_all == 0 { 0.0 } else { tot_hot as f64 / tot_all as f64 };
+        (overall, per_layer)
     }
 
     /// Host Q4_K dequant of one token-embedding row -> dGPU hidden.
@@ -562,9 +835,9 @@ impl LagunaHetModel {
                 // naive per-key kernel (a single split has no parallelism to gain).
                 // `LAGUNA_DECODE_ATTN=naive|flash|splitkv` overrides for A/B.
                 use crate::gqa_attention::DecodeAttn;
-                const DECODE_FLASH_MIN_KV: usize = 512;
+                let decode_flash_min_kv = crate::gqa_attention::decode_flash_min_kv();
                 let variant = crate::gqa_attention::decode_attn_variant();
-                if variant == DecodeAttn::Naive || n_kv < DECODE_FLASH_MIN_KV {
+                if variant == DecodeAttn::Naive || n_kv < decode_flash_min_kv {
                     dk.gqa.single_query(
                         st, &mut od_v, &qf_v, &k_v, &v_v,
                         n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, n_kv as u32, scale,
@@ -616,6 +889,18 @@ impl LagunaHetModel {
             return Ok(());
         }
 
+        // ================= het-MoE SPLIT (hot experts on dGPU) =================
+        // Router + the K globally-hottest routed experts run on the dGPU (which
+        // is otherwise idle during the MoE window), CONCURRENTLY with the cold
+        // experts on the iGPU. The two partial routed sums + the dGPU shared
+        // expert are recombined by addition after the handoff. Enabled by
+        // `LAGUNA_HOT_EXPERTS_DGPU=<file>`; falls through to the pure-iGPU MoE
+        // below when a layer has no hot residency.
+        if self.hot_split && self.dlayers[il].hot.is_some() {
+            self.layer_moe_split(il, diag_t0)?;
+            return Ok(());
+        }
+
         // MoE layer: hand fn_in to the iGPU, run experts, take ffn_out back.
         // Handoffs are device-side event waits (no host block): the iGPU stream
         // waits on the dGPU's fn_in push, and the dGPU stream later waits on the
@@ -623,6 +908,23 @@ impl LagunaHetModel {
         // (1) peer-push fn_in dGPU->iGPU on the dGPU (source) stream, record evt.
         peer_push_f32(&self.ds.fn_in, &mut self.is.fn_in_recv, &self.dstream)?;
         self.fn_in_evt.record(&self.dstream)?;
+
+        // (1b) SHARED EXPERT on the dGPU, overlapped with the iGPU routed experts.
+        // The dGPU is idle for the whole MoE window; the shared expert only needs
+        // `fn_in` (already dGPU-resident), so enqueue it on `dstream` right after
+        // the fn_in push. It runs CONCURRENTLY with the iGPU's router+routed path
+        // (which waits on `fn_in_evt`). Result lands in `ds.sh_down` and is folded
+        // into the residual after the iGPU handoff. `LAGUNA_SHEXP_DGPU=0` disables.
+        if self.shexp_dgpu {
+            let dk = &self.dk;
+            let ds = &mut self.ds;
+            let st = &self.dstream;
+            let (gw, uw, dw) = self.dlayers[il].shexp.as_ref().unwrap();
+            qmatvec(&dk.q4d, &dk.q6d, st, &mut ds.sh_gate, gw, &ds.fn_in, FF_SHEXP as u32, HIDDEN as u32)?;
+            qmatvec(&dk.q4d, &dk.q6d, st, &mut ds.sh_up, uw, &ds.fn_in, FF_SHEXP as u32, HIDDEN as u32)?;
+            dk.swiglu.launch(st, &mut ds.sh_sw, &ds.sh_gate, &ds.sh_up, FF_SHEXP as u32)?;
+            qmatvec(&dk.q4d, &dk.q6d, st, &mut ds.sh_down, dw, &ds.sh_sw, HIDDEN as u32, FF_SHEXP as u32)?;
+        }
         let diag_t1 = if self.diag {
             self.dstream.synchronize()?;
             let now = std::time::Instant::now();
@@ -636,6 +938,7 @@ impl LagunaHetModel {
         self.igpu.set_current()?;
         self.istream.wait_event(&self.fn_in_evt)?;
         let moe_scale = self.hp.moe_scale;
+        let shexp_dgpu = self.shexp_dgpu;
         {
             let ik = &self.ik;
             let is = &mut self.is;
@@ -667,13 +970,32 @@ impl LagunaHetModel {
                 )?,
                 other => return Err(eyre!("moe down dtype {other:?}")),
             }
-            // shared expert (dense SwiGLU) added to the routed sum
-            qmatvec(&ik.q4d, &ik.q6d, ist, &mut is.gate_s, &moe.sh_gate, &is.fn_in_recv, FF_SHEXP as u32, HIDDEN as u32)?;
-            qmatvec(&ik.q4d, &ik.q6d, ist, &mut is.up_s, &moe.sh_up, &is.fn_in_recv, FF_SHEXP as u32, HIDDEN as u32)?;
-            ik.swiglu.launch(ist, &mut is.sw_s, &is.gate_s, &is.up_s, FF_SHEXP as u32)?;
-            qmatvec(&ik.q4d, &ik.q6d, ist, &mut is.down_s, &moe.sh_down, &is.sw_s, HIDDEN as u32, FF_SHEXP as u32)?;
-            is.ffn_out.copy_from_buffer_async(&is.acc, ist)?;
-            ik.vadd.launch(ist, &mut is.ffn_out, &is.down_s, HIDDEN as u32)?;
+            if shexp_dgpu {
+                // Shared expert runs on the dGPU (overlapped); iGPU emits routed
+                // sum only. The dGPU folds in `ds.sh_down` during the residual.
+                is.ffn_out.copy_from_buffer_async(&is.acc, ist)?;
+            } else {
+                // shared expert (dense SwiGLU) added to the routed sum on the iGPU
+                qmatvec(&ik.q4d, &ik.q6d, ist, &mut is.gate_s, &moe.sh_gate, &is.fn_in_recv, FF_SHEXP as u32, HIDDEN as u32)?;
+                qmatvec(&ik.q4d, &ik.q6d, ist, &mut is.up_s, &moe.sh_up, &is.fn_in_recv, FF_SHEXP as u32, HIDDEN as u32)?;
+                ik.swiglu.launch(ist, &mut is.sw_s, &is.gate_s, &is.up_s, FF_SHEXP as u32)?;
+                qmatvec(&ik.q4d, &ik.q6d, ist, &mut is.down_s, &moe.sh_down, &is.sw_s, HIDDEN as u32, FF_SHEXP as u32)?;
+                is.ffn_out.copy_from_buffer_async(&is.acc, ist)?;
+                ik.vadd.launch(ist, &mut is.ffn_out, &is.down_s, HIDDEN as u32)?;
+            }
+        }
+
+        // Expert-selection histogram (LAGUNA_EXPERT_HIST=1). Blocking DtoH of the
+        // TOPK selection after the routed MoE; perturbs timing, so gate off by
+        // default. Only meaningful with real (non-garbage-KV) decode content.
+        if self.hist_enabled {
+            self.istream.synchronize()?;
+            self.is.sel.copy_to_host(&mut self.hist_sel_host)?;
+            for &e in &self.hist_sel_host {
+                if (0..N_EXPERT as i32).contains(&e) {
+                    self.expert_hist[il][e as usize] += 1;
+                }
+            }
         }
 
         // (3) peer-push ffn_out iGPU->dGPU on the iGPU (source) stream, record evt.
@@ -698,6 +1020,154 @@ impl LagunaHetModel {
             // variant so it stays ordered on dstream after the event wait.
             ds.h.copy_from_buffer_async(&ds.moe_recv, st)?;
             self.dk.vadd.launch(st, &mut ds.h, &ds.op, HIDDEN as u32)?;
+            if self.shexp_dgpu {
+                // fold the concurrently-computed dGPU shared expert into h.
+                self.dk.vadd.launch(st, &mut ds.h, &ds.sh_down, HIDDEN as u32)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// het-MoE split FFN for one MoE layer. Assumes `layer()` has already run
+    /// the dGPU attention front (so `ds.fn_in` / `ds.op` hold ffn_norm / the
+    /// ffn residual) and that `self.dlayers[il].hot` is populated. Router + hot
+    /// routed experts + shared expert run on `dstream`; cold routed experts run
+    /// on `istream`; the partial sums are recombined on the dGPU.
+    fn layer_moe_split(&mut self, il: usize, diag_t0: Option<std::time::Instant>) -> eyre::Result<()> {
+        let moe_scale = self.hp.moe_scale;
+        let n_blk_hidden = (HIDDEN / 256) as u32;
+        let n_blk_mid = (FF_EXP / 256) as u32;
+        let xq_slot_stride = n_blk_mid * 292;
+
+        // (A) dGPU: router(fn_in) -> sel/ew, then partition into hot/cold slots.
+        self.dgpu.set_current()?;
+        {
+            let dk = &self.dk;
+            let ds = &mut self.ds;
+            let st = &self.dstream;
+            let dlw = &self.dlayers[il];
+            let rw = dlw.router.as_ref().unwrap();
+            let rb = dlw.router_bias.as_ref().unwrap();
+            dk.ops.router_split(
+                st, &mut ds.sel, &mut ds.ew, &mut ds.router_probs, &mut ds.router_scores,
+                rw, &ds.fn_in, rb, N_EXPERT as u32, HIDDEN as u32, TOPK as u32, moe_scale, 1e-20,
+            )?;
+            let hot = dlw.hot.as_ref().unwrap();
+            self.hetmoe.partition(
+                st, &ds.sel, &ds.ew, &hot.hot_map,
+                &mut ds.hot_sel, &mut ds.hot_ew, &mut ds.cold_sel, &mut ds.cold_ew, TOPK as u32,
+            )?;
+        }
+
+        // (B) push fn_in + the COLD selection to the iGPU; record fn_in_evt. The
+        //     iGPU runs no router in split mode — it consumes cold_sel/cold_ew.
+        peer_push_f32(&self.ds.fn_in, &mut self.is.fn_in_recv, &self.dstream)?;
+        peer_push_i32(&self.ds.cold_sel, &mut self.is.cold_sel_recv, &self.dstream)?;
+        peer_push_f32(&self.ds.cold_ew, &mut self.is.cold_ew_recv, &self.dstream)?;
+        self.fn_in_evt.record(&self.dstream)?;
+
+        // (C) dGPU HOT routed experts + shared expert, on dstream (overlaps the
+        //     iGPU cold path which is gated on fn_in_evt).
+        {
+            let dk = &self.dk;
+            let ds = &mut self.ds;
+            let st = &self.dstream;
+            let dlw = &self.dlayers[il];
+            let hot = dlw.hot.as_ref().unwrap();
+            dk.q8k.launch(st, &mut ds.xq_hidden, &ds.fn_in, n_blk_hidden)?;
+            dk.q4b.launch_pair_swiglu_batched(
+                st, &mut ds.mid_hot, &hot.gate_all, &hot.up_all, &ds.xq_hidden, &ds.hot_ew, &ds.hot_sel,
+                hot.gate_stride as u32, hot.up_stride as u32, TOPK as u32, 0.0, FF_EXP as u32, n_blk_hidden,
+            )?;
+            dk.q8k.launch(st, &mut ds.xq_mid, &ds.mid_hot, (TOPK as u32) * n_blk_mid)?;
+            match hot.down_dt {
+                GgufType::Q6_K => dk.q6b.launch_batched(
+                    st, &mut ds.acc_hot, &hot.down_all, &ds.xq_mid, &ds.hot_sel,
+                    hot.down_stride as u32, xq_slot_stride, TOPK as u32, HIDDEN as u32, n_blk_mid,
+                )?,
+                GgufType::Q4_K => dk.q4b.launch_batched(
+                    st, &mut ds.acc_hot, &hot.down_all, &ds.xq_mid, &ds.hot_sel,
+                    hot.down_stride as u32, xq_slot_stride, TOPK as u32, HIDDEN as u32, n_blk_mid,
+                )?,
+                other => return Err(eyre!("hot moe down dtype {other:?}")),
+            }
+            // Shared expert (always dGPU in split mode).
+            let (gw, uw, dw) = dlw.shexp.as_ref().unwrap();
+            qmatvec(&dk.q4d, &dk.q6d, st, &mut ds.sh_gate, gw, &ds.fn_in, FF_SHEXP as u32, HIDDEN as u32)?;
+            qmatvec(&dk.q4d, &dk.q6d, st, &mut ds.sh_up, uw, &ds.fn_in, FF_SHEXP as u32, HIDDEN as u32)?;
+            dk.swiglu.launch(st, &mut ds.sh_sw, &ds.sh_gate, &ds.sh_up, FF_SHEXP as u32)?;
+            qmatvec(&dk.q4d, &dk.q6d, st, &mut ds.sh_down, dw, &ds.sh_sw, HIDDEN as u32, FF_SHEXP as u32)?;
+        }
+        let diag_t1 = if self.diag {
+            self.dstream.synchronize()?;
+            let now = std::time::Instant::now();
+            self.diag_dgpu_us += now.duration_since(diag_t0.unwrap()).as_micros() as u64;
+            Some(now)
+        } else {
+            None
+        };
+
+        // (D) iGPU COLD routed experts (no router; cold sel/ew received).
+        self.igpu.set_current()?;
+        self.istream.wait_event(&self.fn_in_evt)?;
+        {
+            let ik = &self.ik;
+            let is = &mut self.is;
+            let ist = &self.istream;
+            let moe = self.ilayers[il].moe.as_ref().unwrap();
+            ik.q8k.launch(ist, &mut is.xq_hidden, &is.fn_in_recv, n_blk_hidden)?;
+            ik.q4b.launch_pair_swiglu_batched(
+                ist, &mut is.mid, &moe.gate_all, &moe.up_all, &is.xq_hidden,
+                &is.cold_ew_recv, &is.cold_sel_recv,
+                moe.gate_stride as u32, moe.up_stride as u32, TOPK as u32, 0.0, FF_EXP as u32, n_blk_hidden,
+            )?;
+            ik.q8k.launch(ist, &mut is.xq_mid, &is.mid, (TOPK as u32) * n_blk_mid)?;
+            match moe.down_dt {
+                GgufType::Q6_K => ik.q6b.launch_batched(
+                    ist, &mut is.acc, &moe.down_all, &is.xq_mid, &is.cold_sel_recv,
+                    moe.down_stride as u32, xq_slot_stride, TOPK as u32, HIDDEN as u32, n_blk_mid,
+                )?,
+                GgufType::Q4_K => ik.q4b.launch_batched(
+                    ist, &mut is.acc, &moe.down_all, &is.xq_mid, &is.cold_sel_recv,
+                    moe.down_stride as u32, xq_slot_stride, TOPK as u32, HIDDEN as u32, n_blk_mid,
+                )?,
+                other => return Err(eyre!("cold moe down dtype {other:?}")),
+            }
+            is.ffn_out.copy_from_buffer_async(&is.acc, ist)?;
+        }
+
+        // Histogram (uses the full dGPU-side selection). Perturbs timing.
+        if self.hist_enabled {
+            self.dgpu.set_current()?;
+            self.dstream.synchronize()?;
+            self.ds.sel.copy_to_host(&mut self.hist_sel_host)?;
+            for &e in &self.hist_sel_host {
+                if (0..N_EXPERT as i32).contains(&e) {
+                    self.expert_hist[il][e as usize] += 1;
+                }
+            }
+            self.igpu.set_current()?;
+        }
+
+        // (E) push cold sum back; combine on dGPU: h = op + cold + hot + shexp.
+        peer_push_f32(&self.is.ffn_out, &mut self.ds.moe_recv, &self.istream)?;
+        self.moe_evt.record(&self.istream)?;
+        if self.diag {
+            self.istream.synchronize()?;
+            self.diag_igpu_us += std::time::Instant::now()
+                .duration_since(diag_t1.unwrap())
+                .as_micros() as u64;
+        }
+
+        self.dgpu.set_current()?;
+        self.dstream.wait_event(&self.moe_evt)?;
+        {
+            let ds = &mut self.ds;
+            let st = &self.dstream;
+            ds.h.copy_from_buffer_async(&ds.moe_recv, st)?;
+            self.dk.vadd.launch(st, &mut ds.h, &ds.op, HIDDEN as u32)?;
+            self.dk.vadd.launch(st, &mut ds.h, &ds.acc_hot, HIDDEN as u32)?;
+            self.dk.vadd.launch(st, &mut ds.h, &ds.sh_down, HIDDEN as u32)?;
         }
         Ok(())
     }
@@ -1152,6 +1622,189 @@ impl LagunaHetModel {
         Ok(())
     }
 
+    // ======================================================================
+    // BATCHED PREFILL HET-MoE SPLIT — the K globally-hottest routed experts
+    // run on the dGPU (which is otherwise idle during the iGPU MoE window),
+    // CONCURRENTLY with the COLD experts on the iGPU. Router runs on the dGPU
+    // (fn_in is already dGPU-resident); the two partial routed sums + the iGPU
+    // shared expert are recombined by addition on the dGPU. This spans the MoE
+    // itself across both devices (on top of the attention∥MoE pipeline).
+    //
+    // Reuses the DECODE het residency (`DgpuLayer.hot`, `LAGUNA_HOT_EXPERTS_DGPU`)
+    // and the generic residency-aware group builder
+    // (`MoeGroupBuilder::launch_hetsplit`): mode=1 yields dense-local hot groups
+    // (grid.y = K, K-wide packed weights), mode=0 yields the original-id cold
+    // groups (grid.y = N_EXPERT). No dedicated batched partition kernel needed.
+    // ======================================================================
+
+    /// het-split MoE for one batch lane. Router + hot experts (+ q8k) run on the
+    /// dGPU (`dstream`); cold experts + shared expert run on the iGPU (`istream`).
+    /// `attn_batched` already pushed `fn_in` to the iGPU and recorded
+    /// `pipe_fn_in_evt[lane]`; here we push the freshly-routed `sel`/`ew` and
+    /// re-record that event so the iGPU cold path also waits on them. The dGPU
+    /// hot partial lands in `hs.acc`; the iGPU cold+shexp sum lands in
+    /// `ps.moe_recv` after `pipe_moe_evt[lane]`.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_batched_split(
+        &mut self,
+        il: usize,
+        b: usize,
+        ps: &mut PrefillScratch,
+        hs: &mut HotScratch,
+        tiled_d: &LagunaMoeTiled,
+        gb_d: &MoeGroupBuilder,
+        tiled_i: &LagunaMoeTiled,
+        gb_i: &MoeGroupBuilder,
+        lane: usize,
+    ) -> eyre::Result<()> {
+        let bu = b as u32;
+        let moe_scale = self.hp.moe_scale;
+        let n_blk_hidden = (HIDDEN / 256) as u32;
+        let n_blk_mid = (FF_EXP / 256) as u32;
+        let xq_slot_stride = n_blk_mid * 292;
+        let cap = self.prefill_hot_cap;
+        let max_per_expert = bu; // each expert picked ≤ once per token
+
+        // (A) dGPU: router(fn_in) -> sel/ew on dstream (fn_in already resident).
+        self.dgpu.set_current()?;
+        {
+            let dk = &self.dk;
+            let dlw = &self.dlayers[il];
+            let st = &self.dstream;
+            let rw = dlw.router.as_ref().unwrap();
+            let rb = dlw.router_bias.as_ref().unwrap();
+            dk.ops.router_split_batched(
+                st, &mut hs.sel, &mut hs.ew, &mut hs.router_probs, &mut hs.router_scores,
+                rw, &ps.fn_in, rb, N_EXPERT as u32, HIDDEN as u32, TOPK as u32, moe_scale, 1e-20, bu,
+            )?;
+        }
+
+        // (B) push the routed sel/ew to the iGPU (fn_in was already pushed by
+        //     attn_batched); re-record fn_in_evt so the cold path waits on these.
+        {
+            let sel_v = hs.sel.slice_view(0, b * TOPK);
+            let mut sel_recv = ps.sel.slice_view_mut(0, b * TOPK);
+            peer_push_i32(&sel_v, &mut sel_recv, &self.dstream)?;
+            let ew_v = hs.ew.slice_view(0, b * TOPK);
+            let mut ew_recv = ps.ew.slice_view_mut(0, b * TOPK);
+            peer_push_f32(&ew_v, &mut ew_recv, &self.dstream)?;
+        }
+        self.pipe_fn_in_evt[lane].record(&self.dstream)?;
+
+        // (C) dGPU HOT path on dstream (overlaps the iGPU cold path).
+        {
+            let dk = &self.dk;
+            let dlw = &self.dlayers[il];
+            let hot = dlw.hot.as_ref().unwrap();
+            let st = &self.dstream;
+            let n_hot = hot.n_hot as u32;
+            dk.q8k.launch(st, &mut hs.xq_hidden, &ps.fn_in, bu * n_blk_hidden)?;
+            hs.group_count.fill_zero_async(st)?; // K_MAX ints — tiny
+            gb_d.launch_hetsplit(
+                st, &mut hs.group_count, &mut hs.members, &hs.sel, &hot.hot_map,
+                1, cap, bu, TOPK as u32, n_hot, max_per_expert,
+            )?;
+            tiled_d.gate_up_swiglu_reg_col_r32(
+                st, &mut hs.mid, &hot.gate_all, &hot.up_all, &hs.xq_hidden, &hs.ew,
+                &hs.group_count, &hs.members, hot.gate_stride as u32, hot.up_stride as u32,
+                TOPK as u32, max_per_expert, 0.0, FF_EXP as u32, n_blk_hidden, n_hot,
+            )?;
+            dk.q8k.launch(st, &mut hs.xq_mid, &hs.mid, bu * TOPK as u32 * n_blk_mid)?;
+            // In the split, only this token's HOT slots get a down_part member;
+            // the cold slots stay unwritten. down_reduce_slots sums ALL TOPK
+            // slots, so zero the unwritten ones first (the non-split path writes
+            // every slot, hence needs no zeroing).
+            {
+                let mut dp = hs.down_part.slice_view_mut(0, b * TOPK * HIDDEN);
+                dp.fill_zero_async(st)?;
+            }
+            tiled_d.down_part(
+                st, hot.down_dt, &mut hs.down_part, &hot.down_all, &hs.xq_mid,
+                &hs.group_count, &hs.members, hot.down_stride as u32, xq_slot_stride,
+                TOPK as u32, max_per_expert, HIDDEN as u32, n_blk_mid, n_hot,
+            )?;
+            tiled_d.down_reduce_slots(
+                st, &mut hs.acc, &hs.down_part, HIDDEN as u32, TOPK as u32, bu * HIDDEN as u32,
+            )?;
+        }
+
+        // (D) iGPU COLD path on istream (waits fn_in_evt). Router NOT re-run.
+        self.igpu.set_current()?;
+        self.istream.wait_event(&self.pipe_fn_in_evt[lane])?;
+        {
+            let ik = &self.ik;
+            let ist = &self.istream;
+            let moe = self.ilayers[il].moe.as_ref().unwrap();
+            let hot_map_i = self.ilayers[il].hot_map.as_ref().unwrap();
+            ik.q8k.launch(ist, &mut ps.xq_hidden, &ps.fn_in_recv, bu * n_blk_hidden)?;
+            ps.group_count.fill_zero_async(ist)?;
+            gb_i.launch_hetsplit(
+                ist, &mut ps.group_count, &mut ps.members, &ps.sel, hot_map_i,
+                0, cap, bu, TOPK as u32, N_EXPERT as u32, max_per_expert,
+            )?;
+            tiled_i.gate_up_swiglu_reg_col_r32(
+                ist, &mut ps.mid, &moe.gate_all, &moe.up_all, &ps.xq_hidden, &ps.ew,
+                &ps.group_count, &ps.members, moe.gate_stride as u32, moe.up_stride as u32,
+                TOPK as u32, max_per_expert, 0.0, FF_EXP as u32, n_blk_hidden, N_EXPERT as u32,
+            )?;
+            ik.q8k.launch(ist, &mut ps.xq_mid, &ps.mid, bu * TOPK as u32 * n_blk_mid)?;
+            // Split: only COLD slots get written here — zero the rest so the
+            // TOPK-slot reduce doesn't fold in garbage (see the hot path).
+            {
+                let mut dp = ps.down_part.slice_view_mut(0, b * TOPK * HIDDEN);
+                dp.fill_zero_async(ist)?;
+            }
+            tiled_i.down_part(
+                ist, moe.down_dt, &mut ps.down_part, &moe.down_all, &ps.xq_mid,
+                &ps.group_count, &ps.members, moe.down_stride as u32, xq_slot_stride,
+                TOPK as u32, max_per_expert, HIDDEN as u32, n_blk_mid, N_EXPERT as u32,
+            )?;
+            tiled_i.down_reduce_slots(
+                ist, &mut ps.acc, &ps.down_part, HIDDEN as u32, TOPK as u32, bu * HIDDEN as u32,
+            )?;
+            // shared expert (iGPU, read-once dp4a) folded into the cold sum.
+            tiled_i.dense_gemm_dp4a(ist, moe.sh_gate.dtype, &mut ps.gate_s, &moe.sh_gate.bytes, &ps.xq_hidden, bu, FF_SHEXP as u32, n_blk_hidden)?;
+            tiled_i.dense_gemm_dp4a(ist, moe.sh_up.dtype, &mut ps.up_s, &moe.sh_up.bytes, &ps.xq_hidden, bu, FF_SHEXP as u32, n_blk_hidden)?;
+            ik.swiglu.launch(ist, &mut ps.sw_s, &ps.gate_s, &ps.up_s, (b * FF_SHEXP) as u32)?;
+            ik.q8k.launch(ist, &mut ps.xq_sw, &ps.sw_s, bu * n_blk_mid)?;
+            tiled_i.dense_gemm_dp4a(ist, moe.sh_down.dtype, &mut ps.down_s, &moe.sh_down.bytes, &ps.xq_sw, bu, HIDDEN as u32, n_blk_mid)?;
+            ps.ffn_out_i.copy_from_buffer_async(&ps.acc, ist)?;
+            ik.vadd.launch(ist, &mut ps.ffn_out_i, &ps.down_s, (b * HIDDEN) as u32)?;
+        }
+
+        // Push the cold+shexp sum iGPU -> dGPU; record the per-lane event.
+        {
+            let out_v = ps.ffn_out_i.slice_view(0, b * HIDDEN);
+            let mut recv_v = ps.moe_recv.slice_view_mut(0, b * HIDDEN);
+            peer_push_f32(&out_v, &mut recv_v, &self.istream)?;
+        }
+        self.pipe_moe_evt[lane].record(&self.istream)?;
+        Ok(())
+    }
+
+    /// het-split residual: `h = op + (cold+shexp) + hot`. Waits `pipe_moe_evt`
+    /// (cold sum landed on the dGPU); the hot partial `hs.acc` is already on
+    /// `dstream` (FIFO-ordered after step C).
+    fn combine_batched_split(
+        &mut self,
+        _il: usize,
+        b: usize,
+        ps: &mut PrefillScratch,
+        hs: &mut HotScratch,
+        lane: usize,
+    ) -> eyre::Result<()> {
+        self.dgpu.set_current()?;
+        self.dstream.wait_event(&self.pipe_moe_evt[lane])?;
+        {
+            let dk = &self.dk;
+            let st = &self.dstream;
+            ps.h.copy_from_buffer_async(&ps.moe_recv, st)?;        // cold + shexp
+            dk.vadd.launch(st, &mut ps.h, &ps.op, (b * HIDDEN) as u32)?;   // + residual
+            dk.vadd.launch(st, &mut ps.h, &hs.acc, (b * HIDDEN) as u32)?;  // + hot partial
+        }
+        Ok(())
+    }
+
     /// BATCHED prefill: process `tokens` in B_MAX-sized tiles, building the KV
     /// cache across the whole prompt, then return the greedy next token after
     /// the last prompt token. Logits/greedy token match the sequential
@@ -1163,6 +1816,14 @@ impl LagunaHetModel {
     pub fn prefill_batched(&mut self, tokens: &[usize]) -> eyre::Result<(usize, f32)> {
         if tokens.is_empty() {
             return Err(eyre!("prefill_batched: empty prompt"));
+        }
+        // Prefill het-MoE split (hot experts on the dGPU) when the decode hot
+        // residency is loaded (`LAGUNA_HOT_EXPERTS_DGPU=<file>`) AND
+        // `LAGUNA_PREFILL_HET=1`. Single-lane, env-gated; falls through to the
+        // pure-iGPU pipeline otherwise. Keeps a pure-iGPU fallback intact.
+        let prefill_het = std::env::var("LAGUNA_PREFILL_HET").map(|v| v == "1").unwrap_or(false);
+        if prefill_het && self.hot_split {
+            return self.prefill_batched_het(tokens);
         }
         // Two-lane cross-device PIPELINE is the default: it hides the (now
         // small) dGPU attention under the iGPU MoE by keeping two per-lane
@@ -1397,6 +2058,214 @@ impl LagunaHetModel {
             |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) },
         ))
     }
+
+    /// SINGLE-LANE batched prefill with the het-MoE split (hot experts on the
+    /// dGPU ∥ cold experts on the iGPU). Attention and the LM head are identical
+    /// to `prefill_batched`; only the MoE layers span both devices. Router runs
+    /// on the dGPU. Sequential per layer (attn → split-MoE → combine); the split
+    /// overlaps the dGPU hot experts with the iGPU cold experts. Parity: the
+    /// routed sum is reordered (hot+cold vs all-iGPU), greedy-exact + in-tol.
+    pub fn prefill_batched_het(&mut self, tokens: &[usize]) -> eyre::Result<(usize, f32)> {
+        if tokens.is_empty() {
+            return Err(eyre!("prefill_batched_het: empty prompt"));
+        }
+        // Two-lane cross-device pipeline is the default (hides the dGPU
+        // attention + hot-MoE leg under the iGPU cold-MoE leg across lanes).
+        // `LAGUNA_PIPELINE=0` runs the sequential single-lane split.
+        let pipeline = std::env::var("LAGUNA_PIPELINE").map(|v| v != "0").unwrap_or(true);
+        if pipeline {
+            return self.prefill_batched_het_pipelined(tokens);
+        }
+        self.reset();
+        let b_max: usize = std::env::var("LAGUNA_PREFILL_BMAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256)
+            .min(self.max_kv)
+            .max(1);
+
+        // Tiled MoE + group builder for BOTH devices (hot on dGPU, cold on iGPU).
+        self.igpu.set_current()?;
+        let igpu_arch = self.igpu.properties()?.gcn_arch_name;
+        let tiled_i = LagunaMoeTiled::for_arch(&igpu_arch)?;
+        let gb_i = MoeGroupBuilder::for_arch(&igpu_arch)?;
+        self.dgpu.set_current()?;
+        let dgpu_arch = self.dgpu.properties()?.gcn_arch_name;
+        let tiled_d = LagunaMoeTiled::for_arch(&dgpu_arch)?;
+        let gb_d = MoeGroupBuilder::for_arch(&dgpu_arch)?;
+
+        let mut ps = PrefillScratch::new(&self.dgpu, &self.igpu, b_max)?;
+        let mut hs = HotScratch::new(&self.dgpu, b_max)?;
+        self.dgpu.set_current()?;
+        self.prefill_split = true;
+
+        let n = tokens.len();
+        let mut tile_start = 0usize;
+        let mut last_result: Option<(usize, f32)> = None;
+        while tile_start < n {
+            let b = (n - tile_start).min(b_max);
+            let toks = &tokens[tile_start..tile_start + b];
+            let is_last_tile = tile_start + b == n;
+
+            self.embed_batch(toks, &mut ps.h)?;
+            let pos_h: Vec<i32> = (0..b).map(|i| (tile_start + i) as i32).collect();
+            self.dgpu.set_current()?;
+            ps.pos.slice_view_mut(0, b).copy_from_host(&pos_h)?;
+
+            for il in 0..N_LAYER {
+                // dGPU attention front-half (pushes fn_in + records fn_in_evt).
+                if self.attn_batched(il, tile_start, b, &mut ps, 0)? {
+                    continue; // dense layer-0 fully handled on the dGPU
+                }
+                if self.dlayers[il].hot.is_some() {
+                    self.moe_batched_split(il, b, &mut ps, &mut hs, &tiled_d, &gb_d, &tiled_i, &gb_i, 0)?;
+                    self.combine_batched_split(il, b, &mut ps, &mut hs, 0)?;
+                } else {
+                    // No hot residency for this layer: pure-iGPU MoE fallback
+                    // (attn_batched already pushed fn_in + recorded fn_in_evt).
+                    self.moe_batched(il, b, &mut ps, &tiled_i, &gb_i, 0)?;
+                    self.combine_batched(il, b, &mut ps, 0)?;
+                }
+            }
+
+            if is_last_tile {
+                last_result = Some(self.prefill_head(&ps, b - 1)?);
+            } else {
+                self.dgpu.set_current()?;
+                self.dstream.synchronize()?;
+            }
+            tile_start += b;
+            self.kv_len = tile_start;
+        }
+        self.prefill_split = false;
+        last_result.ok_or_else(|| eyre!("prefill_batched_het: no tiles processed"))
+    }
+
+    /// TWO-LANE PIPELINED het-split prefill (default when het is enabled). Same
+    /// lane schedule as [`Self::prefill_batched_pipelined`] but each MoE layer
+    /// runs the hot experts on the dGPU (`dstream`) ∥ cold experts on the iGPU
+    /// (`istream`). The dGPU leg is now attention + hot MoE; the iGPU leg is the
+    /// cold MoE + shared expert. Two lanes keep both legs busy: lane A's iGPU
+    /// cold MoE overlaps lane B's dGPU attention + hot MoE.
+    pub fn prefill_batched_het_pipelined(&mut self, tokens: &[usize]) -> eyre::Result<(usize, f32)> {
+        if tokens.is_empty() {
+            return Err(eyre!("prefill_batched_het_pipelined: empty prompt"));
+        }
+        self.reset();
+        let b_max: usize = std::env::var("LAGUNA_PREFILL_BMAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256)
+            .min(self.max_kv)
+            .max(1);
+
+        self.igpu.set_current()?;
+        let igpu_arch = self.igpu.properties()?.gcn_arch_name;
+        let tiled_i = LagunaMoeTiled::for_arch(&igpu_arch)?;
+        let gb_i = MoeGroupBuilder::for_arch(&igpu_arch)?;
+        self.dgpu.set_current()?;
+        let dgpu_arch = self.dgpu.properties()?.gcn_arch_name;
+        let tiled_d = LagunaMoeTiled::for_arch(&dgpu_arch)?;
+        let gb_d = MoeGroupBuilder::for_arch(&dgpu_arch)?;
+
+        let lane_max = b_max.div_ceil(2).max(1);
+        let mut ps_a = PrefillScratch::new(&self.dgpu, &self.igpu, lane_max)?;
+        let mut ps_b = PrefillScratch::new(&self.dgpu, &self.igpu, lane_max)?;
+        let mut hs_a = HotScratch::new(&self.dgpu, lane_max)?;
+        let mut hs_b = HotScratch::new(&self.dgpu, lane_max)?;
+        self.dgpu.set_current()?;
+        self.prefill_split = true;
+
+        let n = tokens.len();
+        let mut tile_start = 0usize;
+        let mut last_result: Option<(usize, f32)> = None;
+        while tile_start < n {
+            let b = (n - tile_start).min(b_max);
+            let toks = &tokens[tile_start..tile_start + b];
+            let is_last_tile = tile_start + b == n;
+
+            if b < 2 {
+                // Tiny tail: single lane, no overlap to be had.
+                self.embed_batch(toks, &mut ps_a.h)?;
+                let pos_h: Vec<i32> = (0..b).map(|i| (tile_start + i) as i32).collect();
+                self.dgpu.set_current()?;
+                ps_a.pos.slice_view_mut(0, b).copy_from_host(&pos_h)?;
+                for il in 0..N_LAYER {
+                    if self.attn_batched(il, tile_start, b, &mut ps_a, 0)? {
+                        continue;
+                    }
+                    if self.dlayers[il].hot.is_some() {
+                        self.moe_batched_split(il, b, &mut ps_a, &mut hs_a, &tiled_d, &gb_d, &tiled_i, &gb_i, 0)?;
+                        self.combine_batched_split(il, b, &mut ps_a, &mut hs_a, 0)?;
+                    } else {
+                        self.moe_batched(il, b, &mut ps_a, &tiled_i, &gb_i, 0)?;
+                        self.combine_batched(il, b, &mut ps_a, 0)?;
+                    }
+                }
+                if is_last_tile {
+                    last_result = Some(self.prefill_head(&ps_a, b - 1)?);
+                } else {
+                    self.dgpu.set_current()?;
+                    self.dstream.synchronize()?;
+                }
+                tile_start += b;
+                self.kv_len = tile_start;
+                continue;
+            }
+
+            let b_a = b.div_ceil(2);
+            let b_b = b - b_a;
+            let off_a = tile_start;
+            let off_b = tile_start + b_a;
+            let toks_a = &toks[..b_a];
+            let toks_b = &toks[b_a..];
+
+            self.embed_batch(toks_a, &mut ps_a.h)?;
+            self.embed_batch(toks_b, &mut ps_b.h)?;
+            let pos_a: Vec<i32> = (0..b_a).map(|i| (off_a + i) as i32).collect();
+            let pos_b: Vec<i32> = (0..b_b).map(|i| (off_b + i) as i32).collect();
+            self.dgpu.set_current()?;
+            ps_a.pos.slice_view_mut(0, b_a).copy_from_host(&pos_a)?;
+            ps_b.pos.slice_view_mut(0, b_b).copy_from_host(&pos_b)?;
+
+            // Helper closures aren't ergonomic with &mut self; inline the split
+            // MoE call chain. Layer 0 is dense (both lanes on the dGPU).
+            self.attn_batched(0, off_a, b_a, &mut ps_a, 0)?;
+            self.attn_batched(0, off_b, b_b, &mut ps_b, 1)?;
+
+            // Warmup: attn+MoE-submit for the first MoE layer, both lanes.
+            self.attn_batched(1, off_a, b_a, &mut ps_a, 0)?;
+            self.moe_batched_split(1, b_a, &mut ps_a, &mut hs_a, &tiled_d, &gb_d, &tiled_i, &gb_i, 0)?;
+            self.attn_batched(1, off_b, b_b, &mut ps_b, 1)?;
+            self.moe_batched_split(1, b_b, &mut ps_b, &mut hs_b, &tiled_d, &gb_d, &tiled_i, &gb_i, 1)?;
+
+            // Steady state: finish layer L then start L+1, per lane.
+            for il in 1..(N_LAYER - 1) {
+                self.combine_batched_split(il, b_a, &mut ps_a, &mut hs_a, 0)?;
+                self.attn_batched(il + 1, off_a, b_a, &mut ps_a, 0)?;
+                self.moe_batched_split(il + 1, b_a, &mut ps_a, &mut hs_a, &tiled_d, &gb_d, &tiled_i, &gb_i, 0)?;
+
+                self.combine_batched_split(il, b_b, &mut ps_b, &mut hs_b, 1)?;
+                self.attn_batched(il + 1, off_b, b_b, &mut ps_b, 1)?;
+                self.moe_batched_split(il + 1, b_b, &mut ps_b, &mut hs_b, &tiled_d, &gb_d, &tiled_i, &gb_i, 1)?;
+            }
+
+            // Cooldown: combine the last MoE layer, both lanes.
+            self.combine_batched_split(N_LAYER - 1, b_a, &mut ps_a, &mut hs_a, 0)?;
+            self.combine_batched_split(N_LAYER - 1, b_b, &mut ps_b, &mut hs_b, 1)?;
+
+            if is_last_tile {
+                last_result = Some(self.prefill_head(&ps_b, b_b - 1)?);
+            } else {
+                self.dgpu.set_current()?;
+                self.dstream.synchronize()?;
+            }
+            tile_start += b;
+            self.kv_len = tile_start;
+        }
+        self.prefill_split = false;
+        last_result.ok_or_else(|| eyre!("prefill_batched_het_pipelined: no tiles processed"))
+    }
 }
 
 /// Reusable device scratch for batched prefill, sized to `b_max`. dGPU carries
@@ -1497,6 +2366,49 @@ impl PrefillScratch {
             gate_big, up_big, sw_big, moe_recv, pos,
             fn_in_recv, sel, ew, router_probs, router_scores, xq_hidden, mid, xq_mid,
             acc, down_part, gate_s, up_s, sw_s, xq_sw, down_s, ffn_out_i, group_count, members,
+        })
+    }
+}
+
+/// dGPU-resident scratch for the prefill het-split HOT path (router + hot
+/// experts). Sized to `b_max`. The K-wide hot WEIGHTS live in `DgpuLayer.hot`;
+/// this holds only the per-batch activations + the K-space by-expert groups.
+/// `K_MAX = 32` bounds the hot-expert count (matches the largest hot-set file).
+struct HotScratch {
+    xq_hidden: DeviceBuffer<u8>,      // Q8_K(fn_in) [b, n_blk_hidden, 292]
+    sel: DeviceBuffer<i32>,           // router selection [b, TOPK] (global ids)
+    ew: DeviceBuffer<f32>,            // routing weights [b, TOPK]
+    router_probs: DeviceBuffer<f32>,  // [b, N_EXPERT]
+    router_scores: DeviceBuffer<f32>, // [b, N_EXPERT]
+    group_count: DeviceBuffer<i32>,   // [K_MAX] dense-local hot groups
+    members: DeviceBuffer<i32>,       // [K_MAX * b]
+    mid: DeviceBuffer<f32>,           // [b, TOPK, FF_EXP]
+    xq_mid: DeviceBuffer<u8>,         // Q8_K(mid) [b, TOPK, n_blk_mid, 292]
+    down_part: DeviceBuffer<f32>,     // [b, TOPK, HIDDEN] atomic-free down partials
+    acc: DeviceBuffer<f32>,           // [b, HIDDEN] hot routed partial sum
+}
+
+impl HotScratch {
+    const K_MAX: usize = 32;
+
+    fn new(dgpu_dev: &Device, b: usize) -> eyre::Result<Self> {
+        let n_blk_hidden = HIDDEN / 256;
+        let n_blk_mid = FF_EXP / 256;
+        let dgpu = dgpu_dev.id;
+        dgpu_dev.set_current()?;
+        let mkd = |n: usize| DeviceBuffer::<f32>::new(dgpu, n);
+        Ok(Self {
+            xq_hidden: DeviceBuffer::<u8>::new(dgpu, b * n_blk_hidden * 292)?,
+            sel: DeviceBuffer::<i32>::new(dgpu, b * TOPK)?,
+            ew: mkd(b * TOPK)?,
+            router_probs: mkd(b * N_EXPERT)?,
+            router_scores: mkd(b * N_EXPERT)?,
+            group_count: DeviceBuffer::<i32>::new(dgpu, Self::K_MAX)?,
+            members: DeviceBuffer::<i32>::new(dgpu, Self::K_MAX * b)?,
+            mid: mkd(b * TOPK * FF_EXP)?,
+            xq_mid: DeviceBuffer::<u8>::new(dgpu, b * TOPK * n_blk_mid * 292)?,
+            down_part: mkd(b * TOPK * HIDDEN)?,
+            acc: mkd(b * HIDDEN)?,
         })
     }
 }

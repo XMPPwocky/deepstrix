@@ -87,6 +87,23 @@ pub fn decode_attn_variant() -> DecodeAttn {
     })
 }
 
+/// Crossover (in causal length `n_kv`) below which decode attention uses the
+/// naive per-key kernel and at/above which it uses the split-KV family. MEASURED
+/// (Laguna decode, back-to-back A/B): split-KV-HG beats naive at EVERY context
+/// tested including ctx=64 (26.1 vs 23.9 tok/s), ctx=256 (26.0 vs 19.5 — the old
+/// gate=512 dip), ctx=512 (25.4 vs 15.5). The naive per-key barrier storm costs
+/// wall out of all proportion to the tiny attn kernel itself. So the crossover is
+/// below 64; keep a minimal floor of 16 only for trivially short history where a
+/// single split has no parallelism to exploit. Env `LAGUNA_DECODE_FLASH_MIN_KV`
+/// overrides for A/B sweeps. Cached.
+pub fn decode_flash_min_kv() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("LAGUNA_DECODE_FLASH_MIN_KV").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
+    })
+}
+
 /// Max `n_splits` the caller must size split-KV scratch for.
 pub const DECODE_KV_SPLITS_MAX: u32 = 128;
 

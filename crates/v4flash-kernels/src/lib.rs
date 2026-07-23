@@ -30,6 +30,7 @@ pub mod iq2_xxs_tables;
 pub mod kv_cache_append;
 pub mod laguna;
 pub mod laguna_het;
+pub mod laguna_het_moe;
 pub mod laguna_moe_tiled;
 pub mod moe_group_builder;
 pub mod oracle;
