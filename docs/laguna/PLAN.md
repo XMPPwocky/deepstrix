@@ -3,6 +3,53 @@
 Status: **APPROVED v3** (architect review 3 rounds; all blockers/majors/must-fixes resolved). Ready for Phase 0.
 Branch: `laguna-model-support`
 
+---
+## 0. OUTCOME (2026-07-23) — SHIPPED on `laguna-spike`, merged to `master`
+
+Laguna-S-2.1 runs end-to-end (prefill + decode, het dGPU/iGPU split), oracle-parity
+clean. **The Phase-1 spike stayed disciplined (purely additive: 44 new files, 0
+edits to ds4 shared code — config.rs/attention.rs/het/* untouched), so it became the
+product rather than being thrown away.** The plan's "delete the spike, reimplement in
+Phase 2" is therefore superseded — merging the additive spike cannot regress ds4, so
+it was merged as-is. The **Model-trait/ModelConfig refactor (Phase 2) is deferred as
+optional cleanliness** (dedup the het pipeline across ds4+Laguna); it enables nothing
+new and is not a correctness/merge gate.
+
+**Performance (measured, this HW; SWA-on, B_MAX=512, pipelined dGPU∥iGPU):**
+- Prefill: 490 @4K · 467 @16K · 443 @32K · 362 @64K · **298 @100K** tok/s.
+- Decode: ~26.7 @4K, ~19.7 @32K tok/s.
+- Prefill met the ≥400 target at ≤~24K context. **400 @100K NOT reached** — the 12
+  dense global O(L²) attention layers are the wall; the WMMA kernel is at its
+  structural floor (~5% of matrix peak, memory/LDS-bound, matrix core ~95% idle;
+  occupancy lever measured dead). MoE floor ≥490 (from 490@4K), so 400@100K is
+  physically reachable ONLY via an *algorithmic* change (sparse/strided global
+  attention) that diverges from the dense reference — **user chose to bank the
+  parity-exact 298 rather than trade quality.** Note: ds4's 400@100K uses MLA
+  (compressed KV), a cheaper long-ctx attention — the target was apples-to-oranges.
+
+**Key perf levers (all parity-exact, oracle token 22718):** SWA windowing (1.9×@16K +
+correctness) · FA2 register-O (occupancy 1→2 WG/CU) · SWA ring-KV (KV 20→5.3 GB @100K,
+killed the OOM, unlocks native 262K) · head-grouped global attn · register-O +
+warp-parallel softmax. Session arc @100K: broken/OOM → 214 → 244 → **298**.
+
+**Correctness:** batched==sequential==oracle greedy 22718; per-kernel GPU-parity tests
+green (gqa 8/8, MoE, tokenizer exact). **SWA >512 validated 4 ways** (isolation vs
+CPU-windowed ref; llama.cpp boundary formula q_pos−k_pos<512; smooth-across-512 e2e no
+NaN/discontinuity; coherent varied-content continuation at ctx 523). Open (low-risk,
+documented): full external teacher-forced argmax match at >512 — blocked by oracle
+greedy-degeneration + llama.cpp not exposing per-position argmax.
+
+**Deliverables:** `laguna-chat` (interactive REPL, chat template, sampling) +
+`laguna-oracle-gen` (correctness harness) bins; kernels + forward + tokenizer under
+`crates/v4flash-{core,kernels}`, all additive. Env A/B toggles documented in
+`laguna_het.rs` (LAGUNA_ATTN_HG, _WMMA_LEGACY, _KVFIRST, _NAIVE, _FLASH, _SWA_OFF,
+LAGUNA_PIPELINE, LAGUNA_PREFILL_HET, LAGUNA_HG_G).
+
+The original phased plan (spike → extract seam → completeness/perf) follows below for
+historical reference; §0 above is what actually shipped.
+
+---
+
 ## 1. Goal & framing
 
 deepstrix today runs exactly one model — DeepSeek V4-Flash ("ds4") with antirez's iq2
