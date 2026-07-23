@@ -1226,10 +1226,23 @@ void gqa_attn_prefill_flash_wmma_fa2_hg(
     // Occupancy is LDS-bound (1 block/CU) so the extra ~16 VGPRs are free.
     // No extra LDS buffer (avoids the "attn double-buffer trap").
     // ===================================================================
+    // Prefetch DEPTH: how many key tiles are kept in-flight (register-resident)
+    // at once. Depth 1 = the original single-tile-ahead prefetch. Depth 2+ keeps
+    // more outstanding K/V global loads → higher memory-level parallelism → less
+    // s_wait_loadcnt (ATT showed 56% of stall on load-wait). Extra cost is
+    // DEPTH*KVPT*2 half regs (occupancy is LDS-bound so VGPRs are free until 256).
+    // A STATIC shift-register (buf[s] <- buf[s+1]) rotates the tiles so every
+    // buffer index is a compile-time constant — no dynamic-indexed register array
+    // (that would spill to scratch). Bit-exact vs depth 1: only load SCHEDULING
+    // changes; the bytes stored into Ks/Vs are identical.
+#ifndef ATTN_PREFETCH_DEPTH
+#define ATTN_PREFETCH_DEPTH 2
+#endif
     constexpr unsigned int KVPT = (HG_BC * WFD) / HG_BLOCK;   // regs/thread per K,V
-    _Float16 kbuf[KVPT];
-    _Float16 vbuf[KVPT];
-    #define ATTN_LOAD_TILE_REG(KT) do {                                              \
+    constexpr unsigned int PFD  = ATTN_PREFETCH_DEPTH;
+    _Float16 kbuf[PFD][KVPT];
+    _Float16 vbuf[PFD][KVPT];
+    #define ATTN_LOAD_TILE_REG(SLOT, KT) do {                                        \
         const unsigned int _kbase = (KT) * HG_BC;                                    \
         _Pragma("unroll")                                                            \
         for (unsigned int _i = 0; _i < KVPT; ++_i) {                                 \
@@ -1240,29 +1253,40 @@ void gqa_attn_prefill_flash_wmma_fa2_hg(
             if (_kg < n_kv_total && _d < hd) {                                       \
                 const unsigned long long _off =                                      \
                     (unsigned long long)(_kg % kv_capacity) * row_stride + kvh_off + _d; \
-                kbuf[_i] = k_cache[_off];                                            \
-                vbuf[_i] = v_cache[_off];                                            \
-            } else { kbuf[_i] = (_Float16)0.0f; vbuf[_i] = (_Float16)0.0f; }         \
+                kbuf[SLOT][_i] = k_cache[_off];                                      \
+                vbuf[SLOT][_i] = v_cache[_off];                                      \
+            } else { kbuf[SLOT][_i] = (_Float16)0.0f; vbuf[SLOT][_i] = (_Float16)0.0f; } \
         }                                                                            \
     } while (0)
 
-    // Prefetch the first tile before the loop.
-    ATTN_LOAD_TILE_REG(kt_start);
+    // Prime the pipeline: issue the first PFD tiles' loads up front.
+    #pragma unroll
+    for (unsigned int _pf = 0; _pf < PFD; ++_pf) {
+        if (kt_start + _pf < n_key_tiles) ATTN_LOAD_TILE_REG(_pf, kt_start + _pf);
+    }
 
     for (unsigned int kt = kt_start; kt < n_key_tiles; kt++) {
-        // --- Copy the (already-loaded) K/V tile regs → LDS. ---
+        // --- Copy the (already-loaded) K/V tile regs → LDS (always buf[0]). ---
         #pragma unroll
         for (unsigned int _i = 0; _i < KVPT; ++_i) {
             const unsigned int _p = tid + _i * HG_BLOCK;
-            Ks[_p] = kbuf[_i];
-            Vs[_p] = vbuf[_i];
+            Ks[_p] = kbuf[0][_i];
+            Vs[_p] = vbuf[0][_i];
         }
         __syncthreads();
 
-        // Issue the NEXT tile's global loads NOW so they overlap this tile's
-        // score/softmax/AV compute. Safe to overwrite kbuf/vbuf: the ds_store
-        // above consumed the registers at issue time.
-        if (kt + 1u < n_key_tiles) ATTN_LOAD_TILE_REG(kt + 1u);
+        // Shift the register ring down: buf[s] <- buf[s+1] (static indices).
+        #pragma unroll
+        for (unsigned int _s = 0; _s + 1u < PFD; ++_s) {
+            #pragma unroll
+            for (unsigned int _i = 0; _i < KVPT; ++_i) {
+                kbuf[_s][_i] = kbuf[_s + 1u][_i];
+                vbuf[_s][_i] = vbuf[_s + 1u][_i];
+            }
+        }
+        // Issue the load for tile kt+PFD into the freed top slot NOW so its
+        // global loads overlap the whole PFD-tile compute window before consume.
+        if (kt + PFD < n_key_tiles) ATTN_LOAD_TILE_REG(PFD - 1u, kt + PFD);
 
         const unsigned int key_base = kt * HG_BC;
 #else

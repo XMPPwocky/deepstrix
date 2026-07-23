@@ -574,6 +574,49 @@ fn gqa_attn_prefill_flash_wmma_correctness() -> eyre::Result<()> {
 ///       --test gqa_attention -- --ignored --nocapture prefill_wmma_bench
 #[test]
 #[ignore]
+fn gqa_attn_fa2hg_att() -> eyre::Result<()> {
+    // Minimal single-dispatch fa2_hg driver for rocprofv3 --att (ATT gate).
+    // ONE 32K, n_head=72, B=512 fa2_hg dispatch (+1 warmup). Regex-target
+    // gqa_attn_prefill_flash_wmma_fa2_hg. WMMA_BENCH_DEPTH/HEAD override.
+    install_panic_handler()?;
+    let device = pick_dgpu()?;
+    device.set_current()?;
+    let arch = device.properties()?.gcn_arch_name;
+    let kernel = GqaAttention::for_arch(&arch)?;
+    let stream = Stream::new(device.id)?;
+    let n_kv_head = 8usize;
+    let head_dim = 128usize;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let batch = std::env::var("WMMA_BENCH_B").ok().and_then(|v| v.parse().ok()).unwrap_or(512usize);
+    let depth = std::env::var("WMMA_BENCH_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(32768usize);
+    let n_head = std::env::var("WMMA_BENCH_HEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(72usize);
+    let q_offset = depth - batch;
+    let n_kv_total = depth;
+    let mut rng = Lcg(0xabu64 ^ ((n_head as u64) << 20) ^ depth as u64);
+    let mut q_bits = vec![0u16; batch * n_head * head_dim];
+    for v in q_bits.iter_mut() { let (b, _) = round_f16(rng.next_f32()); *v = b; }
+    let kv_len = n_kv_total * n_kv_head * head_dim;
+    let mut k_bits = vec![0u16; kv_len];
+    let mut v_bits = vec![0u16; kv_len];
+    for i in 0..kv_len {
+        let (kb, _) = round_f16(rng.next_f32()); k_bits[i] = kb;
+        let (vb, _) = round_f16(rng.next_f32()); v_bits[i] = vb;
+    }
+    let mut d_q: DeviceBuffer<u16> = DeviceBuffer::new(device.id, q_bits.len())?; d_q.copy_from_host(&q_bits)?;
+    let mut d_k: DeviceBuffer<u16> = DeviceBuffer::new(device.id, k_bits.len())?; d_k.copy_from_host(&k_bits)?;
+    let mut d_v: DeviceBuffer<u16> = DeviceBuffer::new(device.id, v_bits.len())?; d_v.copy_from_host(&v_bits)?;
+    let mut d_out: DeviceBuffer<f32> = DeviceBuffer::new(device.id, batch * n_head * head_dim)?;
+    for _ in 0..2 {
+        kernel.prefill_flash_wmma_fa2_hg(&stream, &mut d_out, &d_q, &d_k, &d_v,
+            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
+    }
+    stream.synchronize()?;
+    eprintln!("fa2hg ATT dispatch done: n_head={n_head} depth={depth} B={batch}");
+    Ok(())
+}
+
+#[test]
+#[ignore]
 fn gqa_attn_prefill_wmma_bench() -> eyre::Result<()> {
     install_panic_handler()?;
     let device = pick_dgpu()?;
@@ -624,6 +667,7 @@ fn gqa_attn_prefill_wmma_bench() -> eyre::Result<()> {
         let mut d_flash: DeviceBuffer<f32> = DeviceBuffer::new(device.id, batch * n_head * head_dim)?;
         let mut d_wmma: DeviceBuffer<f32> = DeviceBuffer::new(device.id, batch * n_head * head_dim)?;
         let mut d_fa2: DeviceBuffer<f32> = DeviceBuffer::new(device.id, batch * n_head * head_dim)?;
+        let mut d_fa2hg: DeviceBuffer<f32> = DeviceBuffer::new(device.id, batch * n_head * head_dim)?;
 
         for _ in 0..WARMUP {
             kernel.prefill_flash(&stream, &mut d_flash, &d_q, &d_k, &d_v,
@@ -632,6 +676,8 @@ fn gqa_attn_prefill_wmma_bench() -> eyre::Result<()> {
                 batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
             kernel.prefill_flash_wmma_fa2(&stream, &mut d_fa2, &d_q, &d_k, &d_v,
                 batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32, false)?;
+            kernel.prefill_flash_wmma_fa2_hg(&stream, &mut d_fa2hg, &d_q, &d_k, &d_v,
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
         }
         stream.synchronize()?;
 
@@ -673,9 +719,17 @@ fn gqa_attn_prefill_wmma_bench() -> eyre::Result<()> {
         stream.synchronize()?;
         let fa2_us = t2.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
 
+        let t3 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            kernel.prefill_flash_wmma_fa2_hg(&stream, &mut d_fa2hg, &d_q, &d_k, &d_v,
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
+        }
+        stream.synchronize()?;
+        let fa2hg_us = t3.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
+
         eprintln!(
-            "n_head={n_head:>3} depth={depth:>6} B={batch}  flash={flash_us:9.1}  wmma={wmma_us:9.1}  fa2={fa2_us:9.1} us  wmma-sp={:.2}x  fa2-sp={:.2}x  wmma-vs-flash={wf_max:.3e}  fa2-vs-flash={f2_max:.3e}",
-            flash_us / wmma_us, flash_us / fa2_us
+            "n_head={n_head:>3} depth={depth:>6} B={batch}  flash={flash_us:9.1}  wmma={wmma_us:9.1}  fa2={fa2_us:9.1}  fa2hg={fa2hg_us:9.1} us  wmma-sp={:.2}x  fa2-sp={:.2}x  fa2hg-sp={:.2}x  wmma-vs-flash={wf_max:.3e}  fa2-vs-flash={f2_max:.3e}",
+            flash_us / wmma_us, flash_us / fa2_us, flash_us / fa2hg_us
         );
         assert!(wf_max < 2.0e-3, "wmma vs flash diverged at n_head={n_head} depth={depth}: {wf_max:.3e}");
         assert!(f2_max < 2.0e-3, "wmma-fa2 vs flash diverged at n_head={n_head} depth={depth}: {f2_max:.3e}");
