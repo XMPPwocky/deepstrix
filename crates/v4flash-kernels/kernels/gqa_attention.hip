@@ -1215,6 +1215,57 @@ void gqa_attn_prefill_flash_wmma_fa2_hg(
                                        ? (min_q_abs + 1u - swa_window) : 0u;
     const unsigned int kt_start    = win_lo / HG_BC;
 
+#ifndef ATTN_KV_PREFETCH_OFF  // prefetch is DEFAULT; -DATTN_KV_PREFETCH_OFF restores serial staging (A/B)
+    // ===================================================================
+    // Software-pipelined K/V prefetch (raise memory-level parallelism).
+    // ATT showed 74% of stall cycles on `s_wait_loadcnt` — waves parked on
+    // K/V global loads with too few in flight. Instead of load→store→wait
+    // per element, we PREFETCH the whole next key tile into registers
+    // (all loads issued up front, in flight during this tile's WMMA
+    // compute), then just copy regs→LDS at the top of the next iteration.
+    // Occupancy is LDS-bound (1 block/CU) so the extra ~16 VGPRs are free.
+    // No extra LDS buffer (avoids the "attn double-buffer trap").
+    // ===================================================================
+    constexpr unsigned int KVPT = (HG_BC * WFD) / HG_BLOCK;   // regs/thread per K,V
+    _Float16 kbuf[KVPT];
+    _Float16 vbuf[KVPT];
+    #define ATTN_LOAD_TILE_REG(KT) do {                                              \
+        const unsigned int _kbase = (KT) * HG_BC;                                    \
+        _Pragma("unroll")                                                            \
+        for (unsigned int _i = 0; _i < KVPT; ++_i) {                                 \
+            const unsigned int _p  = tid + _i * HG_BLOCK;                            \
+            const unsigned int _j  = _p / WFD;                                       \
+            const unsigned int _d  = _p % WFD;                                       \
+            const unsigned int _kg = _kbase + _j;                                    \
+            if (_kg < n_kv_total && _d < hd) {                                       \
+                const unsigned long long _off =                                      \
+                    (unsigned long long)(_kg % kv_capacity) * row_stride + kvh_off + _d; \
+                kbuf[_i] = k_cache[_off];                                            \
+                vbuf[_i] = v_cache[_off];                                            \
+            } else { kbuf[_i] = (_Float16)0.0f; vbuf[_i] = (_Float16)0.0f; }         \
+        }                                                                            \
+    } while (0)
+
+    // Prefetch the first tile before the loop.
+    ATTN_LOAD_TILE_REG(kt_start);
+
+    for (unsigned int kt = kt_start; kt < n_key_tiles; kt++) {
+        // --- Copy the (already-loaded) K/V tile regs → LDS. ---
+        #pragma unroll
+        for (unsigned int _i = 0; _i < KVPT; ++_i) {
+            const unsigned int _p = tid + _i * HG_BLOCK;
+            Ks[_p] = kbuf[_i];
+            Vs[_p] = vbuf[_i];
+        }
+        __syncthreads();
+
+        // Issue the NEXT tile's global loads NOW so they overlap this tile's
+        // score/softmax/AV compute. Safe to overwrite kbuf/vbuf: the ds_store
+        // above consumed the registers at issue time.
+        if (kt + 1u < n_key_tiles) ATTN_LOAD_TILE_REG(kt + 1u);
+
+        const unsigned int key_base = kt * HG_BC;
+#else
     for (unsigned int kt = kt_start; kt < n_key_tiles; kt++) {
         const unsigned int key_base = kt * HG_BC;
 
@@ -1233,6 +1284,7 @@ void gqa_attn_prefill_flash_wmma_fa2_hg(
             }
         }
         __syncthreads();
+#endif
 
         // --- SCORE for every head: Sp[g][i][j] = scale·dot(Qg_i,K_j). One wave per
         //     (head, col-tile); HG_BR=16 is a single 16-row WMMA tile. ---
@@ -1648,6 +1700,43 @@ void gqa_attn_decode_partial_hg(
         const unsigned int key = tid >> 2;   // 0..31
         const unsigned int sub = tid & 3u;   // 0..3 (dim quarter)
 
+#ifndef ATTN_KV_PREFETCH_OFF  // prefetch is DEFAULT; -DATTN_KV_PREFETCH_OFF restores serial staging (A/B)
+        // Software-pipelined K/V prefetch: issue the next key tile's global
+        // loads into registers while this tile's score/softmax/V-accumulate
+        // runs, hiding the load latency that ATT showed as the dominant
+        // `s_wait_loadcnt` stall. Occupancy is LDS-bound so the extra VGPRs
+        // are free; no second LDS tile (avoids the double-buffer trap).
+        constexpr unsigned int KVPT_D = (DEC_FBC * DEC_FD) / DEC_BLOCK;   // regs/thread
+        _Float16 kbuf[KVPT_D];
+        _Float16 vbuf[KVPT_D];
+        #define DEC_LOAD_TILE_REG(KB) do {                                               \
+            _Pragma("unroll")                                                            \
+            for (unsigned int _i = 0; _i < KVPT_D; ++_i) {                               \
+                const unsigned int _p  = tid + _i * DEC_BLOCK;                           \
+                const unsigned int _j  = _p / hd;                                        \
+                const unsigned int _d  = _p % hd;                                        \
+                const unsigned int _kg = (KB) + _j;                                      \
+                if (_kg < k1) {                                                          \
+                    const unsigned long long _off =                                      \
+                        (unsigned long long)((k_base + _kg) % kv_capacity) * row_stride + kvh_off + _d; \
+                    kbuf[_i] = k_cache[_off]; vbuf[_i] = v_cache[_off];                  \
+                } else { kbuf[_i] = (_Float16)0.0f; vbuf[_i] = (_Float16)0.0f; }         \
+            }                                                                            \
+        } while (0)
+
+        DEC_LOAD_TILE_REG(k0);
+        for (unsigned int kb = k0; kb < k1; kb += DEC_FBC) {
+            // copy prefetched regs -> LDS
+            #pragma unroll
+            for (unsigned int _i = 0; _i < KVPT_D; ++_i) {
+                const unsigned int _p = tid + _i * DEC_BLOCK;
+                Ks[_p] = kbuf[_i]; Vs[_p] = vbuf[_i];
+            }
+            __syncthreads();
+            // prefetch next tile (loads in flight during compute below)
+            if (kb + DEC_FBC < k1) DEC_LOAD_TILE_REG(kb + DEC_FBC);
+            const unsigned int n_keys = (kb + DEC_FBC < k1) ? DEC_FBC : (k1 - kb);
+#else
         for (unsigned int kb = k0; kb < k1; kb += DEC_FBC) {
             // --- stage K/V tile into LDS ONCE (reused across the whole group) ---
             for (unsigned int p = tid; p < DEC_FBC * hd; p += DEC_BLOCK) {
@@ -1668,6 +1757,7 @@ void gqa_attn_decode_partial_hg(
             }
             __syncthreads();
             const unsigned int n_keys = (kb + DEC_FBC < k1) ? DEC_FBC : (k1 - kb);
+#endif
 
             // --- (1) scores for ALL group heads into Sp[g][key] (no barriers:
             //         every lane writes a distinct Sp slot). 4 lanes/key sum a
