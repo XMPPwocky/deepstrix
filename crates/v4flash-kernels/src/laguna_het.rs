@@ -68,7 +68,7 @@ pub const SWA_RING_CAP: usize = 2048;
 fn proj_vec_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("LAGUNA_PROJ_LDS_TILED").as_deref() != Some("0"))
+    *ENABLED.get_or_init(|| std::env::var("LAGUNA_PROJ_LDS_TILED").ok().as_deref() != Some("0"))
 }
 
 /// Full Laguna kernel set for one device. Kernels are HSACO blobs (tiny), so
