@@ -516,23 +516,40 @@ fn run_prefill_wmma_case(
         batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32,
         false,
     )?;
+    // Full-GQA-group packed variant (HGP_G=6) only when kv_group % 6 == 0.
+    let do_packed = kv_group % 6 == 0;
+    let mut d_pk: DeviceBuffer<f32> = DeviceBuffer::new(device.id, batch * n_head * head_dim)?;
+    if do_packed {
+        kernel.prefill_flash_wmma_fa2_hg_packed(
+            stream, &mut d_pk, &d_q, &d_k, &d_v,
+            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32,
+        )?;
+    }
     stream.synchronize()?;
 
     let mut got = vec![0f32; batch * n_head * head_dim];
     d_out.copy_to_host(&mut got)?;
     let mut got_fa2 = vec![0f32; batch * n_head * head_dim];
     d_fa2.copy_to_host(&mut got_fa2)?;
+    let mut got_pk = vec![0f32; batch * n_head * head_dim];
+    if do_packed {
+        d_pk.copy_to_host(&mut got_pk)?;
+    }
     let mut max_abs = 0f32;
     let mut fa2_abs = 0f32;
+    let mut pk_abs = 0f32;
     for i in 0..got.len() {
         max_abs = max_abs.max((got[i] - expect[i]).abs());
         fa2_abs = fa2_abs.max((got_fa2[i] - expect[i]).abs());
+        if do_packed {
+            pk_abs = pk_abs.max((got_pk[i] - expect[i]).abs());
+        }
     }
     eprintln!(
-        "gqa wmma case: q_offset={q_offset}, B={batch}, n_head={n_head}, n_kv_head={n_kv_head}, head_dim={head_dim} -> max_abs={max_abs:.3e} fa2={fa2_abs:.3e}"
+        "gqa wmma case: q_offset={q_offset}, B={batch}, n_head={n_head}, n_kv_head={n_kv_head}, head_dim={head_dim} -> max_abs={max_abs:.3e} fa2={fa2_abs:.3e} packed={pk_abs:.3e}"
     );
     // FA2 (register-O) must match the CPU reference just as tightly as the LDS-O WMMA.
-    Ok(max_abs.max(fa2_abs))
+    Ok(max_abs.max(fa2_abs).max(pk_abs))
 }
 
 #[test]
@@ -606,12 +623,18 @@ fn gqa_attn_fa2hg_att() -> eyre::Result<()> {
     let mut d_k: DeviceBuffer<u16> = DeviceBuffer::new(device.id, k_bits.len())?; d_k.copy_from_host(&k_bits)?;
     let mut d_v: DeviceBuffer<u16> = DeviceBuffer::new(device.id, v_bits.len())?; d_v.copy_from_host(&v_bits)?;
     let mut d_out: DeviceBuffer<f32> = DeviceBuffer::new(device.id, batch * n_head * head_dim)?;
+    let use_packed = std::env::var("WMMA_BENCH_PACKED").as_deref() == Ok("1");
     for _ in 0..2 {
-        kernel.prefill_flash_wmma_fa2_hg(&stream, &mut d_out, &d_q, &d_k, &d_v,
-            batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
+        if use_packed {
+            kernel.prefill_flash_wmma_fa2_hg_packed(&stream, &mut d_out, &d_q, &d_k, &d_v,
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
+        } else {
+            kernel.prefill_flash_wmma_fa2_hg(&stream, &mut d_out, &d_q, &d_k, &d_v,
+                batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
+        }
     }
     stream.synchronize()?;
-    eprintln!("fa2hg ATT dispatch done: n_head={n_head} depth={depth} B={batch}");
+    eprintln!("fa2hg ATT dispatch done: n_head={n_head} depth={depth} B={batch} packed={use_packed}");
     Ok(())
 }
 
@@ -727,8 +750,41 @@ fn gqa_attn_prefill_wmma_bench() -> eyre::Result<()> {
         stream.synchronize()?;
         let fa2hg_us = t3.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
 
+        // Full-GQA-group packed (HGP_G=6): full-attn layers only (kv_group % 6 == 0).
+        let mut pk_us = 0f64;
+        let mut pk_max = 0f32;
+        if (n_head / n_kv_head) % 6 == 0 {
+            let mut d_pk: DeviceBuffer<f32> = DeviceBuffer::new(device.id, batch * n_head * head_dim)?;
+            for _ in 0..WARMUP {
+                kernel.prefill_flash_wmma_fa2_hg_packed(&stream, &mut d_pk, &d_q, &d_k, &d_v,
+                    batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
+            }
+            stream.synchronize()?;
+            let mut got_pk = vec![0f32; batch * n_head * head_dim];
+            d_pk.copy_to_host(&mut got_pk)?;
+            for i in 0..got_flash.len() { pk_max = pk_max.max((got_flash[i] - got_pk[i]).abs()); }
+            let tp = std::time::Instant::now();
+            for _ in 0..ITERS {
+                kernel.prefill_flash_wmma_fa2_hg_packed(&stream, &mut d_pk, &d_q, &d_k, &d_v,
+                    batch as u32, n_head as u32, n_kv_head as u32, head_dim as u32, q_offset as u32, scale, 0, (q_offset + batch) as u32)?;
+            }
+            stream.synchronize()?;
+            pk_us = tp.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
+            // FLOPs ~= 2*B*L*n_head*head_dim (score, causal ~ half) + 2*B*L*n_head*head_dim (AV).
+            // Use causal-average key count L_eff = q_offset + batch/2 for score+AV both.
+            let l_eff = q_offset as f64 + batch as f64 / 2.0;
+            let flops = 4.0 * batch as f64 * l_eff * n_head as f64 * head_dim as f64;
+            let pk_tflops = flops / (pk_us * 1e6);      // us -> s: /1e6; flops/s -> T: /1e12
+            let hg_tflops = flops / (fa2hg_us * 1e6);
+            eprintln!(
+                "  PACKED n_head={n_head} depth={depth}: fa2hg={fa2hg_us:.1}us ({:.1}% peak)  packed={pk_us:.1}us ({:.1}% peak)  packed-vs-flash={pk_max:.3e}",
+                hg_tflops / 194.0 * 100.0, pk_tflops / 194.0 * 100.0
+            );
+            assert!(pk_max < 2.0e-3, "packed vs flash diverged at n_head={n_head} depth={depth}: {pk_max:.3e}");
+        }
+
         eprintln!(
-            "n_head={n_head:>3} depth={depth:>6} B={batch}  flash={flash_us:9.1}  wmma={wmma_us:9.1}  fa2={fa2_us:9.1}  fa2hg={fa2hg_us:9.1} us  wmma-sp={:.2}x  fa2-sp={:.2}x  fa2hg-sp={:.2}x  wmma-vs-flash={wf_max:.3e}  fa2-vs-flash={f2_max:.3e}",
+            "n_head={n_head:>3} depth={depth:>6} B={batch}  flash={flash_us:9.1}  wmma={wmma_us:9.1}  fa2={fa2_us:9.1}  fa2hg={fa2hg_us:9.1}  packed={pk_us:9.1} us  wmma-sp={:.2}x  fa2-sp={:.2}x  fa2hg-sp={:.2}x  wmma-vs-flash={wf_max:.3e}  fa2-vs-flash={f2_max:.3e}",
             flash_us / wmma_us, flash_us / fa2_us, flash_us / fa2hg_us
         );
         assert!(wf_max < 2.0e-3, "wmma vs flash diverged at n_head={n_head} depth={depth}: {wf_max:.3e}");

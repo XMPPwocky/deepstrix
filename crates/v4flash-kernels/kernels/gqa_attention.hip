@@ -1474,6 +1474,302 @@ void gqa_attn_prefill_flash_wmma_fa2_hg(
 }
 
 // =============================================================================
+// gqa_attn_prefill_flash_wmma_fa2_hg_packed — FULL-GQA-GROUP packed WMMA FA prefill.
+//
+// fa2_hg packs only HG_G(=3) of the kv_group(=6) query heads per WG, so each KV
+// head is split across n_subgroup=2 workgroups and the per-key-tile softmax stats,
+// barriers, and (crucially) the K/V LDS→WMMA-fragment loads are only amortized
+// over 3 heads — the MHA-like (~7% of WMMA peak) regime. llama.cpp's RDNA config
+// packs the FULL GQA group into one tile column (ncols2 = whole group) so one
+// K/V-load + one softmax pass serves all group heads → 22-25% of peak.
+//
+// This variant hardwires HGP_G = 6 (== full-attn kv_group): ONE WG owns ALL 6
+// query heads of a KV head. n_subgroup=1. The score+softmax phases are generalized
+// to wave-/thread-strided loops (fa2_hg hard-assumed HG_G<=4: score needs 2 waves
+// /head <=8 waves, softmax needs 4 lanes*HG_G*HG_BR<=256 threads). At G=6 that is
+// 12 score wave-tasks (loop stride 8) and 384 softmax slots (loop stride 256).
+//
+// O stays REGISTER-resident (O_reg[6] = 48 VGPRs). LDS budget @ G=6:
+//   Qs 24576 + Ks 8192 + Vs 8192 + Ps 6144 + Sp 12288 + (m/l/corr) 1152 = 60544 B
+//   (59.1 KB < 64 KB → 1 block/CU). Moving O to LDS (+49 KB) would NOT fit, so
+//   register-O is mandatory here; if it spills to scratch, G=6 is off the table.
+//   grid: (n_kv_head * (kv_group/6), ceil(B/HG_BR), 1)   block: (256,1,1)
+// Requires kv_group % 6 == 0 (global Laguna: 6). SWA layers (kv_group 9) stay on
+// fa2_hg. Env-gated OFF by default (LAGUNA_ATTN_HG_PACKED=1).
+// =============================================================================
+#ifndef HGP_G
+#define HGP_G 6u
+#endif
+extern "C" __global__ __launch_bounds__(HG_BLOCK)
+void gqa_attn_prefill_flash_wmma_fa2_hg_packed(
+        float          * __restrict__ out,         // [B, n_head, head_dim]
+        const _Float16 * __restrict__ q,           // [B, n_head, head_dim]
+        const _Float16 * __restrict__ k_cache,     // [n_kv_total, n_kv_head, head_dim]
+        const _Float16 * __restrict__ v_cache,     // [n_kv_total, n_kv_head, head_dim]
+        unsigned int     n_head,
+        unsigned int     n_kv_head,
+        unsigned int     head_dim,
+        unsigned int     q_offset,
+        unsigned int     batch,
+        unsigned int     n_kv_total,
+        float            scale,
+        unsigned int     swa_window,     // 0 = full causal; else sliding window
+        unsigned int     kv_capacity) {  // ring size: physical row = key_g % kv_capacity
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int wave = tid >> 5;            // 0..7
+
+    const unsigned int kv_group   = n_head / n_kv_head;
+    const unsigned int n_subgroup = kv_group / HGP_G;
+    const unsigned int kv_head    = blockIdx.x / n_subgroup;
+    const unsigned int subgroup   = blockIdx.x % n_subgroup;
+    const unsigned int qt         = blockIdx.y;
+    if (kv_head >= n_kv_head) return;
+
+    const unsigned int q_row_base = qt * HG_BR;
+    if (q_row_base >= batch) return;
+    const unsigned int n_rows = (batch - q_row_base < HG_BR) ? (batch - q_row_base) : HG_BR;
+    const unsigned int hd = head_dim;              // == WFD
+    const unsigned int h0 = kv_head * kv_group + subgroup * HGP_G;
+
+    const unsigned long long kvh_off    = (unsigned long long)kv_head * hd;
+    const unsigned long long row_stride = (unsigned long long)n_kv_head * hd;
+
+    __shared__ _Float16 Qs[HGP_G * HG_BR * WFD];
+    __shared__ _Float16 Ks[HG_BC * WFD];
+    __shared__ _Float16 Vs[HG_BC * WFD];
+    __shared__ _Float16 Ps[HGP_G * HG_BR * HG_BC];
+    __shared__ float    Sp[HGP_G * HG_BR * HG_BC];
+    __shared__ float    m_s[HGP_G * HG_BR];
+    __shared__ float    l_s[HGP_G * HG_BR];
+    __shared__ float    corr_s[HGP_G * HG_BR];
+
+    gqa_float8 O_reg[HGP_G];
+    #pragma unroll
+    for (unsigned int g = 0; g < HGP_G; ++g)
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) O_reg[g][e] = 0.0f;
+
+    for (unsigned int p = tid; p < HGP_G * HG_BR * WFD; p += HG_BLOCK) {
+        const unsigned int g = p / (HG_BR * WFD);
+        const unsigned int r = (p / WFD) % HG_BR;
+        const unsigned int d = p % WFD;
+        if (r < n_rows && d < hd) {
+            Qs[p] = q[((unsigned long long)(q_row_base + r) * n_head + (h0 + g)) * hd + d];
+        } else {
+            Qs[p] = (_Float16)0.0f;
+        }
+    }
+    for (unsigned int p = tid; p < HGP_G * HG_BR * HG_BC; p += HG_BLOCK) Ps[p] = (_Float16)0.0f;
+    for (unsigned int p = tid; p < HGP_G * HG_BR; p += HG_BLOCK) { m_s[p] = -INFINITY; l_s[p] = 0.0f; corr_s[p] = 0.0f; }
+    __syncthreads();
+
+    const unsigned int max_q_abs   = q_offset + q_row_base + n_rows - 1u;
+    const unsigned int n_key_tiles = max_q_abs / HG_BC + 1u;
+    const unsigned int min_q_abs   = q_offset + q_row_base;
+    const unsigned int win_lo      = (swa_window != 0u && min_q_abs + 1u > swa_window)
+                                       ? (min_q_abs + 1u - swa_window) : 0u;
+    const unsigned int kt_start    = win_lo / HG_BC;
+
+    constexpr unsigned int KVPT = (HG_BC * WFD) / HG_BLOCK;   // regs/thread per K,V
+#ifndef ATTN_PREFETCH_DEPTH
+#define ATTN_PREFETCH_DEPTH 2
+#endif
+    constexpr unsigned int PFD  = ATTN_PREFETCH_DEPTH;
+    _Float16 kbuf[PFD][KVPT];
+    _Float16 vbuf[PFD][KVPT];
+    #define ATTN_LOAD_TILE_REG_P(SLOT, KT) do {                                      \
+        const unsigned int _kbase = (KT) * HG_BC;                                    \
+        _Pragma("unroll")                                                            \
+        for (unsigned int _i = 0; _i < KVPT; ++_i) {                                 \
+            const unsigned int _p  = tid + _i * HG_BLOCK;                            \
+            const unsigned int _j  = _p / WFD;                                       \
+            const unsigned int _d  = _p % WFD;                                       \
+            const unsigned int _kg = _kbase + _j;                                    \
+            if (_kg < n_kv_total && _d < hd) {                                       \
+                const unsigned long long _off =                                      \
+                    (unsigned long long)(_kg % kv_capacity) * row_stride + kvh_off + _d; \
+                kbuf[SLOT][_i] = k_cache[_off];                                      \
+                vbuf[SLOT][_i] = v_cache[_off];                                      \
+            } else { kbuf[SLOT][_i] = (_Float16)0.0f; vbuf[SLOT][_i] = (_Float16)0.0f; } \
+        }                                                                            \
+    } while (0)
+
+    #pragma unroll
+    for (unsigned int _pf = 0; _pf < PFD; ++_pf) {
+        if (kt_start + _pf < n_key_tiles) ATTN_LOAD_TILE_REG_P(_pf, kt_start + _pf);
+    }
+
+    for (unsigned int kt = kt_start; kt < n_key_tiles; kt++) {
+        #pragma unroll
+        for (unsigned int _i = 0; _i < KVPT; ++_i) {
+            const unsigned int _p = tid + _i * HG_BLOCK;
+            Ks[_p] = kbuf[0][_i];
+            Vs[_p] = vbuf[0][_i];
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (unsigned int _s = 0; _s + 1u < PFD; ++_s) {
+            #pragma unroll
+            for (unsigned int _i = 0; _i < KVPT; ++_i) {
+                kbuf[_s][_i] = kbuf[_s + 1u][_i];
+                vbuf[_s][_i] = vbuf[_s + 1u][_i];
+            }
+        }
+        if (kt + PFD < n_key_tiles) ATTN_LOAD_TILE_REG_P(PFD - 1u, kt + PFD);
+
+        const unsigned int key_base = kt * HG_BC;
+
+        // --- SCORE for every head. 12 (head,col-tile) wave-tasks over 8 waves
+        //     (waves 0-3 run 2 tasks, 4-7 run 1). ---
+        for (unsigned int task = wave; task < HGP_G * 2u; task += 8u) {
+            const unsigned int g  = task >> 1;     // 0..HGP_G-1
+            const unsigned int ct = task & 1u;     // col-tile 0..1
+            const _Float16 *Qg = Qs + (unsigned long long)g * HG_BR * WFD;
+            gqa_float8 sacc = {0,0,0,0,0,0,0,0};
+            #pragma unroll
+            for (unsigned int ks = 0; ks < WFD; ks += 16u) {   // 8 k-steps
+                gqa_half8 qf, kf;
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned int row = (lane & 15u);
+                    const unsigned int d   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                    qf[e] = Qg[row * WFD + d];
+                }
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned int krow = ct * 16u + (lane & 15u);
+                    const unsigned int d    = ks + (lane >> 4) * 8u + (unsigned int)e;
+                    kf[e] = Ks[krow * WFD + d];
+                }
+                sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(qf, kf, sacc);
+            }
+            float *Spg = Sp + (unsigned long long)g * HG_BR * HG_BC;
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const unsigned int i = (lane >> 4) * 8u + (unsigned int)e;   // row 0..15
+                const unsigned int j = ct * 16u + (lane & 15u);
+                float s = -INFINITY;
+                if (i < n_rows) {
+                    const unsigned int q_abs   = q_offset + q_row_base + i;
+                    const unsigned int key_abs = key_base + j;
+                    const bool in_win = (swa_window == 0u) || (key_abs + swa_window > q_abs);
+                    if (key_abs <= q_abs && key_abs < n_kv_total && in_win) s = sacc[e] * scale;
+                }
+                Spg[i * HG_BC + j] = s;
+            }
+        }
+        __syncthreads();
+
+        // --- Online-softmax stats: 4 lanes per (head,row); 384 slots over 256
+        //     threads (thread tid also runs slot tid+256 for tasks 64-95). ---
+        for (unsigned int slot = tid; slot < HGP_G * HG_BR * 4u; slot += HG_BLOCK) {
+            const unsigned int task    = slot >> 2;        // 0..HGP_G*HG_BR-1
+            const unsigned int quarter = slot & 3u;        // 0..3
+            const unsigned int g = task / HG_BR;
+            const unsigned int i = task % HG_BR;
+            if (i < n_rows) {
+                float *Spg = Sp + (unsigned long long)g * HG_BR * HG_BC;
+                _Float16 *Psg = Ps + (unsigned long long)g * HG_BR * HG_BC;
+                const unsigned int c0 = quarter * (HG_BC / 4u);   // 8 cols/lane
+                float lmax = -INFINITY;
+                #pragma unroll
+                for (unsigned int j = 0; j < HG_BC / 4u; j++) {
+                    const float v = Spg[i*HG_BC + c0 + j];
+                    if (v > lmax) lmax = v;
+                }
+                lmax = fmaxf(lmax, __shfl_xor(lmax, 1));
+                lmax = fmaxf(lmax, __shfl_xor(lmax, 2));
+                const float tmax  = lmax;
+                const float m_old = m_s[g*HG_BR+i];
+                const float m_new = fmaxf(m_old, tmax);
+                float corr, lsum = 0.0f;
+                if (m_new == -INFINITY) {
+                    corr = 1.0f;
+                    #pragma unroll
+                    for (unsigned int j = 0; j < HG_BC / 4u; j++) Psg[i*HG_BC + c0 + j] = (_Float16)0.0f;
+                } else {
+                    corr = expf(m_old - m_new);
+                    #pragma unroll
+                    for (unsigned int j = 0; j < HG_BC / 4u; j++) {
+                        const float sij = Spg[i*HG_BC + c0 + j];
+                        const float p = (sij == -INFINITY) ? 0.0f : expf(sij - m_new);
+                        Psg[i*HG_BC + c0 + j] = (_Float16)p;
+                        lsum += p;
+                    }
+                }
+                lsum += __shfl_xor(lsum, 1);
+                lsum += __shfl_xor(lsum, 2);
+                if (quarter == 0u) {
+                    l_s[g*HG_BR+i]    = l_s[g*HG_BR+i] * corr + lsum;
+                    m_s[g*HG_BR+i]    = m_new;
+                    corr_s[g*HG_BR+i] = corr;
+                }
+            }
+        }
+        __syncthreads();
+
+        // --- AV: O_reg[g] = O_reg[g]·corr + P[g]·V. Wave = d-tile (0..7), loops
+        //     all HGP_G heads. O stays in registers. ---
+        {
+            const unsigned int dt = wave;          // d-tile 0..7
+            #pragma unroll
+            for (unsigned int g = 0; g < HGP_G; ++g) {
+                _Float16 *Psg = Ps + (unsigned long long)g * HG_BR * HG_BC;
+                const float *crg = corr_s + (unsigned long long)g * HG_BR;
+                gqa_float8 oacc;
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned int i = (lane >> 4) * 8u + (unsigned int)e;
+                    oacc[e] = O_reg[g][e] * crg[i];
+                }
+                #pragma unroll
+                for (unsigned int ks = 0; ks < HG_BC; ks += 16u) {   // 2 k-steps
+                    gqa_half8 pf, vf;
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const unsigned int prow = (lane & 15u);
+                        const unsigned int jj   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                        pf[e] = Psg[prow * HG_BC + jj];
+                    }
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const unsigned int jj   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                        const unsigned int dcol = dt * 16u + (lane & 15u);
+                        vf[e] = Vs[jj * WFD + dcol];
+                    }
+                    oacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pf, vf, oacc);
+                }
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) O_reg[g][e] = oacc[e];
+            }
+        }
+        __syncthreads();
+    }
+
+    // --- Normalise + write out from register-O. ---
+    {
+        const unsigned int dt = wave;
+        #pragma unroll
+        for (unsigned int g = 0; g < HGP_G; ++g) {
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const unsigned int i = (lane >> 4) * 8u + (unsigned int)e;
+                const unsigned int d = dt * 16u + (lane & 15u);
+                if (i < n_rows) {
+                    const float l = l_s[g*HG_BR+i];
+                    const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+                    out[((unsigned long long)(q_row_base + i) * n_head + (h0 + g)) * hd + d] = O_reg[g][e] * inv;
+                }
+            }
+        }
+    }
+#endif
+}
+
+// =============================================================================
 // SPLIT-KV DECODE ("flash decoding") — the fix for single-query decode at long
 // context. The existing gqa_attn_prefill_flash at batch=1 launches only
 // (n_head) workgroups, each of which marches SERIALLY through n_kv/32 key

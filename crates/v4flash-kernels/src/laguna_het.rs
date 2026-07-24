@@ -1511,6 +1511,20 @@ impl LagunaHetModel {
                             bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa, cap as u32,
                         )?;
                     } else if is_full
+                        && std::env::var("LAGUNA_ATTN_HG_PACKED").as_deref() != Ok("0")
+                    {
+                        // FULL-GQA-group packed WMMA (HGP_G=6) is the DEFAULT on global
+                        // layers: one WG owns all 6 global query heads of a KV head,
+                        // loading K/V once (vs 2 subgroups) + amortizing softmax/barriers
+                        // over all 6 (fa2_hg packs only 3 of 6, splits into 2 subgroups).
+                        // Register-O (48 VGPRs, 0 spill). +13.7% e2e @64K prefill
+                        // (365→415 tok/s), parity-clean (token 22718, rel 1e-4).
+                        // LAGUNA_ATTN_HG_PACKED=0 restores the HG-3 kernel for A/B.
+                        dk.gqa.prefill_flash_wmma_fa2_hg_packed(
+                            st, &mut od_v, &qf_v, &k_v, &v_v,
+                            bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa, cap as u32,
+                        )?;
+                    } else if is_full
                         && std::env::var("LAGUNA_ATTN_HG").as_deref() != Ok("0")
                     {
                         // Head-grouped WMMA prefill is the DEFAULT on the O(L²) global

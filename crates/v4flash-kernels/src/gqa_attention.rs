@@ -50,6 +50,9 @@ fn flash_hg_g() -> u32 {
 }
 const FLASH_HG_BR: u32 = 16;
 const FLASH_HG_BLOCK: u32 = 256;
+/// Full-GQA-group packing factor for `..._fa2_hg_packed` (mirrors `HGP_G` in the
+/// `.hip`). Fixed at 6 = full-attn kv_group; one WG owns the whole group.
+const FLASH_HGP_G: u32 = 6;
 /// Max `head_dim` the flash kernel's static LDS supports (mirrors `FD`).
 pub const FLASH_HEAD_DIM: u32 = 128;
 /// Flash kernel workgroup size (mirrors `FBLOCK`).
@@ -875,6 +878,65 @@ impl GqaAttention {
         }
         let function = self.module.get_function("gqa_attn_prefill_flash_wmma_fa2_hg")?;
         let n_subgroup = kv_group / flash_hg_g;
+        let grid_x = n_kv_head * n_subgroup;
+        let grid_y = batch.div_ceil(FLASH_HG_BR);
+        let cfg = LaunchConfig {
+            grid: (grid_x, grid_y, 1),
+            block: (FLASH_HG_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), q.raw(), k_cache.raw(), v_cache.raw(),
+            n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window, kv_capacity
+        ])
+    }
+
+    /// FULL-GQA-group packed WMMA FA prefill (`..._fa2_hg_packed`, HGP_G=6). One
+    /// WG owns ALL `kv_group` query heads of a KV head, amortizing the K/V load +
+    /// softmax pass + barriers over the whole group (fa2_hg only packs 3 of 6).
+    /// Requires `kv_group % FLASH_HGP_G == 0` (global Laguna: 6). Same contract as
+    /// `fa2_hg`. Env-gated OFF (`LAGUNA_ATTN_HG_PACKED=1`) via the het path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_flash_wmma_fa2_hg_packed(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<u16>,
+        k_cache: &DeviceBuffer<u16>,
+        v_cache: &DeviceBuffer<u16>,
+        batch: u32,
+        n_head: u32,
+        n_kv_head: u32,
+        head_dim: u32,
+        q_offset: u32,
+        scale: f32,
+        swa_window: u32,
+        kv_capacity: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_head == 0 || n_kv_head == 0 || head_dim == 0 {
+            return Err(eyre!("gqa flash wmma fa2 hg packed: zero dim"));
+        }
+        if head_dim > FLASH_HEAD_DIM {
+            return Err(eyre!("gqa flash wmma fa2 hg packed: head_dim={head_dim} > {FLASH_HEAD_DIM}"));
+        }
+        if n_head % n_kv_head != 0 {
+            return Err(eyre!("gqa flash wmma fa2 hg packed: n_head={n_head} not div by n_kv_head={n_kv_head}"));
+        }
+        let kv_group = n_head / n_kv_head;
+        if kv_group % FLASH_HGP_G != 0 {
+            return Err(eyre!("gqa flash wmma fa2 hg packed: kv_group={kv_group} not div by HGP_G={FLASH_HGP_G}"));
+        }
+        let n_kv_total = q_offset + batch;
+        let want_q = (batch * n_head * head_dim) as usize;
+        if q.len() != want_q || out.len() != want_q {
+            return Err(eyre!("gqa flash wmma fa2 hg packed: q/out len mismatch"));
+        }
+        let min_kv = kv_capacity as usize * (n_kv_head * head_dim) as usize;
+        if k_cache.len() < min_kv || v_cache.len() < min_kv {
+            return Err(eyre!("gqa flash wmma fa2 hg packed: kv cache too small"));
+        }
+        let function = self.module.get_function("gqa_attn_prefill_flash_wmma_fa2_hg_packed")?;
+        let n_subgroup = kv_group / FLASH_HGP_G;
         let grid_x = n_kv_head * n_subgroup;
         let grid_y = batch.div_ceil(FLASH_HG_BR);
         let cfg = LaunchConfig {
