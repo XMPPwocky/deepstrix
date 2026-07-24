@@ -1828,12 +1828,38 @@ void gqa_attn_decode_partial_hg(
             // --- (1) scores for ALL group heads into Sp[g][key] (no barriers:
             //         every lane writes a distinct Sp slot). 4 lanes/key sum a
             //         32-dim quarter, then a 4-lane xor-shuffle gives the dot. ---
+            const unsigned int d0 = sub * 32u;
+#ifndef ATTN_DEC_REGCACHE_OFF
+            // REGISTER-CACHE the 32-dim K quarter ONCE per tile. Its value is
+            // IDENTICAL across the kv_group query heads (only Q differs), so the
+            // old code re-read the SAME Ks LDS slot kv_group(=9)× per tile — that
+            // redundant non-broadcast LDS read stream is the s_wait_dscnt pole.
+            // Staging Ks in LDS is still required (it transposes the coalesced
+            // DRAM-load layout into the score layout); we just read it back ONCE.
+            // Bit-exact: same _Float16 values, identical (float)-cast FMA order.
+            _Float16 kreg[32];
+            if (key < n_keys) {
+                const _Float16 *kr = Ks + (unsigned long long)key * hd + d0;
+                #pragma unroll
+                for (unsigned int dd = 0; dd < 32u; dd++) kreg[dd] = kr[dd];
+            }
+            for (unsigned int g = 0; g < kv_group; g++) {
+                float part = 0.0f;
+                if (key < n_keys) {
+                    const float *qg = Qs + (unsigned long long)g * hd + d0;
+                    #pragma unroll
+                    for (unsigned int dd = 0; dd < 32u; dd++) part += qg[dd] * (float)kreg[dd];
+                }
+                part += __shfl_xor(part, 1);
+                part += __shfl_xor(part, 2);
+                if (sub == 0) Sp[g * DEC_FBC + key] = (key < n_keys) ? part * scale : -INFINITY;
+            }
+#else
             for (unsigned int g = 0; g < kv_group; g++) {
                 float part = 0.0f;
                 if (key < n_keys) {
                     const _Float16 *kr = Ks + (unsigned long long)key * hd;
                     const float    *qg = Qs + (unsigned long long)g * hd;
-                    const unsigned int d0 = sub * 32u;
                     #pragma unroll
                     for (unsigned int dd = 0; dd < 32u; dd++) {
                         const unsigned int d = d0 + dd;
@@ -1844,6 +1870,7 @@ void gqa_attn_decode_partial_hg(
                 part += __shfl_xor(part, 2);
                 if (sub == 0) Sp[g * DEC_FBC + key] = (key < n_keys) ? part * scale : -INFINITY;
             }
+#endif
             __syncthreads();
 
             // --- (2) online-softmax merge, ONE THREAD PER HEAD (parallel) ---
@@ -1871,6 +1898,27 @@ void gqa_attn_decode_partial_hg(
             // --- (3) V-accumulate: thread `tid` owns output dim `tid`, loops
             //         the group heads (all 128 lanes busy, no inter-head sync) ---
             if (tid < hd) {
+#ifndef ATTN_DEC_REGCACHE_OFF
+                // Same lever as the score: thread `tid`'s V column Vs[j*hd+tid]
+                // is IDENTICAL across the kv_group heads (only Sp/corr differ), so
+                // register-cache the 32 V elements ONCE per tile instead of the
+                // old kv_group(=9)× non-broadcast LDS re-read (the other dscnt
+                // pole). The Sp[g][j] reads that remain are LDS BROADCAST (all 128
+                // lanes hit the same address) → conflict-free/cheap. Bit-exact.
+                _Float16 vreg[32];
+                #pragma unroll
+                for (unsigned int j = 0; j < DEC_FBC; j++) vreg[j] = Vs[(unsigned long long)j * hd + tid];
+                for (unsigned int g = 0; g < kv_group; g++) {
+                    const float *sp = Sp + g * DEC_FBC;
+                    const float corr = corr_s[g];
+                    float o = 0.0f;
+                    #pragma unroll
+                    for (unsigned int j = 0; j < DEC_FBC; j++) {
+                        o += sp[j] * (float)vreg[j];
+                    }
+                    Os[g * hd + tid] = Os[g * hd + tid] * corr + o;
+                }
+#else
                 for (unsigned int g = 0; g < kv_group; g++) {
                     const float *sp = Sp + g * DEC_FBC;
                     const float corr = corr_s[g];
@@ -1881,6 +1929,7 @@ void gqa_attn_decode_partial_hg(
                     }
                     Os[g * hd + tid] = Os[g * hd + tid] * corr + o;
                 }
+#endif
             }
             __syncthreads();
         }
