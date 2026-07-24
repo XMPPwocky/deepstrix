@@ -61,6 +61,16 @@ pub const SWA_WINDOW: usize = 512;
 /// ring drops 36 of 48 layers from `max_kv` rows to `SWA_RING_CAP` rows.
 pub const SWA_RING_CAP: usize = 2048;
 
+/// LAGUNA_PROJ_LDS_TILED=1 routes the 5 decode attention projections
+/// (wq/wk/wv/wo/wg) through the bandwidth-driven vector-load matvec
+/// (`f16.matvec_wide_vec`) instead of the scalar `f16.matvec`. Default OFF;
+/// the coordinator flips it for the e2e A/B. Cached once (decode hot path).
+fn proj_vec_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("LAGUNA_PROJ_LDS_TILED").as_deref() == Ok("1"))
+}
+
 /// Full Laguna kernel set for one device. Kernels are HSACO blobs (tiny), so
 /// carrying the whole set on both devices is cheap; only the weights split.
 struct HetKernels {
@@ -835,10 +845,17 @@ impl LagunaHetModel {
             let rope = if is_full { &self.rope_full } else { &self.rope_swa };
             let cap = self.kv_cap[il]; // KV ring capacity for this layer
 
+            let pv = proj_vec_enabled();
             dk.rms.launch_weighted(st, &mut ds.ain, &ds.h, &dlw.attn_norm, HIDDEN as u32, EPS)?;
-            dk.f16.matvec(st, &mut ds.q, &dlw.wq, &ds.ain, n_embd_q as u32, HIDDEN as u32)?;
-            dk.f16.matvec(st, &mut ds.k, &dlw.wk, &ds.ain, (N_KV_HEAD * HEAD_DIM) as u32, HIDDEN as u32)?;
-            dk.f16.matvec(st, &mut ds.v, &dlw.wv, &ds.ain, (N_KV_HEAD * HEAD_DIM) as u32, HIDDEN as u32)?;
+            if pv {
+                dk.f16.matvec_wide_vec(st, &mut ds.q, &dlw.wq, &ds.ain, n_embd_q as u32, HIDDEN as u32)?;
+                dk.f16.matvec_wide_vec(st, &mut ds.k, &dlw.wk, &ds.ain, (N_KV_HEAD * HEAD_DIM) as u32, HIDDEN as u32)?;
+                dk.f16.matvec_wide_vec(st, &mut ds.v, &dlw.wv, &ds.ain, (N_KV_HEAD * HEAD_DIM) as u32, HIDDEN as u32)?;
+            } else {
+                dk.f16.matvec(st, &mut ds.q, &dlw.wq, &ds.ain, n_embd_q as u32, HIDDEN as u32)?;
+                dk.f16.matvec(st, &mut ds.k, &dlw.wk, &ds.ain, (N_KV_HEAD * HEAD_DIM) as u32, HIDDEN as u32)?;
+                dk.f16.matvec(st, &mut ds.v, &dlw.wv, &ds.ain, (N_KV_HEAD * HEAD_DIM) as u32, HIDDEN as u32)?;
+            }
             dk.ops.qk_rmsnorm(st, &mut ds.qn, &ds.q, &dlw.q_norm, n_head as u32, HEAD_DIM as u32, EPS)?;
             dk.ops.qk_rmsnorm(st, &mut ds.kn, &ds.k, &dlw.k_norm, N_KV_HEAD as u32, HEAD_DIM as u32, EPS)?;
             dk.rope.launch_forward(st, &mut ds.qn, n_head as u32, HEAD_DIM as u32, n_rot, pos as u32, rope)?;
@@ -927,9 +944,17 @@ impl LagunaHetModel {
                     )?;
                 }
             }
-            dk.f16.matvec(st, &mut ds.gate_logits, &dlw.wg, &ds.ain, n_head as u32, HIDDEN as u32)?;
+            if pv {
+                dk.f16.matvec_wide_vec(st, &mut ds.gate_logits, &dlw.wg, &ds.ain, n_head as u32, HIDDEN as u32)?;
+            } else {
+                dk.f16.matvec(st, &mut ds.gate_logits, &dlw.wg, &ds.ain, n_head as u32, HIDDEN as u32)?;
+            }
             dk.ops.softplus_gate(st, &mut ds.od, &ds.gate_logits, n_head as u32, HEAD_DIM as u32)?;
-            dk.f16.matvec(st, &mut ds.op, &dlw.wo, &ds.od, HIDDEN as u32, n_embd_q as u32)?;
+            if pv {
+                dk.f16.matvec_wide_vec(st, &mut ds.op, &dlw.wo, &ds.od, HIDDEN as u32, n_embd_q as u32)?;
+            } else {
+                dk.f16.matvec(st, &mut ds.op, &dlw.wo, &ds.od, HIDDEN as u32, n_embd_q as u32)?;
+            }
             dk.vadd.launch(st, &mut ds.op, &ds.h, HIDDEN as u32)?;
             dk.rms.launch_weighted(st, &mut ds.fn_in, &ds.op, &dlw.ffn_norm, HIDDEN as u32, EPS)?;
         }

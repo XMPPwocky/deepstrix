@@ -44,6 +44,77 @@ extern "C" __global__ void f16_matvec(
     if (lane == 0) out[row] = acc;
 }
 
+// ============================================================================
+// f16_matvec_wide_vec — bandwidth-driven B=1 projection matvec (Laguna decode).
+//
+// Same math as f16_matvec (warp-per-row, f32 accumulate), but the weight row
+// is streamed with 128-bit vector loads (uint4 == 8× __half) instead of scalar
+// __half loads. Two effects that raise achieved DRAM bandwidth on the
+// (read-once, no-reuse) weight stream:
+//   1. Coalesced transaction width: 32 lanes × 16 B = 512 B per warp load
+//      (vs 32 × 2 B = 64 B for the scalar path) → fewer, fatter DRAM bursts.
+//   2. Memory-level parallelism: the inner loop is 4-way unrolled over
+//      independent 128-bit loads, so 4 loads per lane are in flight before any
+//      is consumed — hides DRAM latency without adding occupancy pressure.
+// No LDS: the weights are used exactly once, so staging them through LDS would
+// only add a round-trip. The activation x[] is tiny (k·4 B) and stays L1/L2
+// resident, reused across the 8 rows of the block and all blocks.
+//
+// Requires k % 8 == 0 (every Laguna projection K is a multiple of 128) and the
+// weight row base 16-B aligned (row*k*2 is a multiple of 16 when k%8==0 and the
+// buffer base is device-aligned). Accumulation is grouped in 8s, so the result
+// is NOT bit-identical to the scalar path (reduction order differs) but matches
+// within f16-dequant tolerance — argmax-preserving.
+typedef _Float16 f16x8_t __attribute__((ext_vector_type(8)));
+
+extern "C" __global__ void f16_matvec_wide_vec(
+        float          * __restrict__ out,        // [n_rows]
+        const __half   * __restrict__ weight,     // [n_rows, k]
+        const float    * __restrict__ x,          // [k]
+        unsigned int     k,
+        unsigned int     n_rows) {
+    uint32_t row  = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= n_rows) return;
+
+    const f16x8_t *wr8 = reinterpret_cast<const f16x8_t *>(
+        weight + (size_t)row * (size_t)k);
+    const uint32_t n8 = k >> 3u;   // number of 8-wide chunks in the row
+
+    float acc = 0.0f;
+    uint32_t j = lane;
+    // 4-way unrolled main body: 4 independent 128-bit loads in flight per lane.
+    for (; j + 96u < n8; j += 128u) {
+        f16x8_t w0 = wr8[j];
+        f16x8_t w1 = wr8[j + 32u];
+        f16x8_t w2 = wr8[j + 64u];
+        f16x8_t w3 = wr8[j + 96u];
+        const float *x0 = x + ((size_t)j        << 3u);
+        const float *x1 = x + ((size_t)(j + 32u) << 3u);
+        const float *x2 = x + ((size_t)(j + 64u) << 3u);
+        const float *x3 = x + ((size_t)(j + 96u) << 3u);
+        #pragma unroll
+        for (int t = 0; t < 8; t++) {
+            acc += (float)w0[t] * x0[t];
+            acc += (float)w1[t] * x1[t];
+            acc += (float)w2[t] * x2[t];
+            acc += (float)w3[t] * x3[t];
+        }
+    }
+    // Tail: remaining chunks, one 128-bit load per iter.
+    for (; j < n8; j += 32u) {
+        f16x8_t w = wr8[j];
+        const float *xb = x + ((size_t)j << 3u);
+        #pragma unroll
+        for (int t = 0; t < 8; t++) {
+            acc += (float)w[t] * xb[t];
+        }
+    }
+
+    acc = f16_warp_sum_f32(acc);
+    if (lane == 0) out[row] = acc;
+}
+
 // Fused pre-scaled variant: identical to f16_matvec but each x[i] is
 // implicitly multiplied by a *scalar* `pre_scale` read once from a 1-element
 // device buffer. Pairs with a multi-WG RMS that just computes inv_rms
