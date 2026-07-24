@@ -61,14 +61,14 @@ pub const SWA_WINDOW: usize = 512;
 /// ring drops 36 of 48 layers from `max_kv` rows to `SWA_RING_CAP` rows.
 pub const SWA_RING_CAP: usize = 2048;
 
-/// LAGUNA_PROJ_LDS_TILED=1 routes the 5 decode attention projections
-/// (wq/wk/wv/wo/wg) through the bandwidth-driven vector-load matvec
-/// (`f16.matvec_wide_vec`) instead of the scalar `f16.matvec`. Default OFF;
-/// the coordinator flips it for the e2e A/B. Cached once (decode hot path).
+/// The 5 decode attention projections (wq/wk/wv/wo/wg) route through the
+/// bandwidth-driven b128 vector-load matvec (`f16.matvec_wide_vec`, 96% DRAM BW)
+/// by DEFAULT; LAGUNA_PROJ_LDS_TILED=0 restores the scalar `f16.matvec` (75% BW)
+/// for A/B. e2e decode: +7.8% @4K, +6.1% @32K, token-exact. Cached once (hot path).
 fn proj_vec_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("LAGUNA_PROJ_LDS_TILED").as_deref() == Ok("1"))
+    *ENABLED.get_or_init(|| std::env::var("LAGUNA_PROJ_LDS_TILED").as_deref() != Some("0"))
 }
 
 /// Full Laguna kernel set for one device. Kernels are HSACO blobs (tiny), so
