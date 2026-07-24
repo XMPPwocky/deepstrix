@@ -1500,6 +1500,30 @@ void gqa_attn_prefill_flash_wmma_fa2_hg(
 #ifndef HGP_G
 #define HGP_G 6u
 #endif
+// -----------------------------------------------------------------------------
+// Conflict-free LDS operand layout (HG_LDS_SKEW). The WMMA A/B fragment loads
+// feed from Qs/Ks/Vs/Ps with row stride == the logical tile width (WFD=128 or
+// HG_BC=32). Both are multiples of 64 elements, so consecutive fragment rows
+// alias to the SAME 32-bit LDS bank set (bank = (elem/2) mod 32; row*128/2 ≡ 0):
+//   Q/K score load = 16-way conflict, V load = 4-way, P load = 8-way.
+// The matrix core then starves 99.9% idle on `ds_load`s (ATT: LDS 82% stall).
+// Padding each LDS row stride by +2 halfs makes the row term step by 1 bank
+// (130/2 = 65 ≡ 1 mod 32) so the 16 fragment rows spread across all banks; the
+// high-lane-bit k-half offset (+4 banks, structural) leaves at most a 2-way
+// conflict — an 8× cut on the Q/K operand load, 2× on V, 4× on P. Padding cols
+// are never read (loads index d<WFD, j<HG_BC), so no value changes; parity is
+// exact modulo the WMMA-f16 tolerance the kernel already carries.
+#ifndef HG_LDS_SKEW_OFF  // conflict-free padded LDS stride is DEFAULT; -DHG_LDS_SKEW_OFF for A/B
+#define HGP_QSTRIDE (WFD + 2u)
+#define HGP_KSTRIDE (WFD + 2u)
+#define HGP_VSTRIDE (WFD + 2u)
+#define HGP_PSTRIDE (HG_BC + 2u)
+#else
+#define HGP_QSTRIDE WFD
+#define HGP_KSTRIDE WFD
+#define HGP_VSTRIDE WFD
+#define HGP_PSTRIDE HG_BC
+#endif
 extern "C" __global__ __launch_bounds__(HG_BLOCK)
 void gqa_attn_prefill_flash_wmma_fa2_hg_packed(
         float          * __restrict__ out,         // [B, n_head, head_dim]
@@ -1536,10 +1560,10 @@ void gqa_attn_prefill_flash_wmma_fa2_hg_packed(
     const unsigned long long kvh_off    = (unsigned long long)kv_head * hd;
     const unsigned long long row_stride = (unsigned long long)n_kv_head * hd;
 
-    __shared__ _Float16 Qs[HGP_G * HG_BR * WFD];
-    __shared__ _Float16 Ks[HG_BC * WFD];
-    __shared__ _Float16 Vs[HG_BC * WFD];
-    __shared__ _Float16 Ps[HGP_G * HG_BR * HG_BC];
+    __shared__ _Float16 Qs[HGP_G * HG_BR * HGP_QSTRIDE];
+    __shared__ _Float16 Ks[HG_BC * HGP_KSTRIDE];
+    __shared__ _Float16 Vs[HG_BC * HGP_VSTRIDE];
+    __shared__ _Float16 Ps[HGP_G * HG_BR * HGP_PSTRIDE];
     __shared__ float    Sp[HGP_G * HG_BR * HG_BC];
     __shared__ float    m_s[HGP_G * HG_BR];
     __shared__ float    l_s[HGP_G * HG_BR];
@@ -1555,13 +1579,14 @@ void gqa_attn_prefill_flash_wmma_fa2_hg_packed(
         const unsigned int g = p / (HG_BR * WFD);
         const unsigned int r = (p / WFD) % HG_BR;
         const unsigned int d = p % WFD;
+        const unsigned int qsp = g * HG_BR * HGP_QSTRIDE + r * HGP_QSTRIDE + d;
         if (r < n_rows && d < hd) {
-            Qs[p] = q[((unsigned long long)(q_row_base + r) * n_head + (h0 + g)) * hd + d];
+            Qs[qsp] = q[((unsigned long long)(q_row_base + r) * n_head + (h0 + g)) * hd + d];
         } else {
-            Qs[p] = (_Float16)0.0f;
+            Qs[qsp] = (_Float16)0.0f;
         }
     }
-    for (unsigned int p = tid; p < HGP_G * HG_BR * HG_BC; p += HG_BLOCK) Ps[p] = (_Float16)0.0f;
+    for (unsigned int p = tid; p < HGP_G * HG_BR * HGP_PSTRIDE; p += HG_BLOCK) Ps[p] = (_Float16)0.0f;
     for (unsigned int p = tid; p < HGP_G * HG_BR; p += HG_BLOCK) { m_s[p] = -INFINITY; l_s[p] = 0.0f; corr_s[p] = 0.0f; }
     __syncthreads();
 
@@ -1605,8 +1630,10 @@ void gqa_attn_prefill_flash_wmma_fa2_hg_packed(
         #pragma unroll
         for (unsigned int _i = 0; _i < KVPT; ++_i) {
             const unsigned int _p = tid + _i * HG_BLOCK;
-            Ks[_p] = kbuf[0][_i];
-            Vs[_p] = vbuf[0][_i];
+            const unsigned int _j = _p / WFD;
+            const unsigned int _d = _p % WFD;
+            Ks[_j * HGP_KSTRIDE + _d] = kbuf[0][_i];
+            Vs[_j * HGP_VSTRIDE + _d] = vbuf[0][_i];
         }
         __syncthreads();
 
@@ -1627,7 +1654,7 @@ void gqa_attn_prefill_flash_wmma_fa2_hg_packed(
         for (unsigned int task = wave; task < HGP_G * 2u; task += 8u) {
             const unsigned int g  = task >> 1;     // 0..HGP_G-1
             const unsigned int ct = task & 1u;     // col-tile 0..1
-            const _Float16 *Qg = Qs + (unsigned long long)g * HG_BR * WFD;
+            const _Float16 *Qg = Qs + (unsigned long long)g * HG_BR * HGP_QSTRIDE;
             gqa_float8 sacc = {0,0,0,0,0,0,0,0};
             #pragma unroll
             for (unsigned int ks = 0; ks < WFD; ks += 16u) {   // 8 k-steps
@@ -1636,13 +1663,13 @@ void gqa_attn_prefill_flash_wmma_fa2_hg_packed(
                 for (int e = 0; e < 8; ++e) {
                     const unsigned int row = (lane & 15u);
                     const unsigned int d   = ks + (lane >> 4) * 8u + (unsigned int)e;
-                    qf[e] = Qg[row * WFD + d];
+                    qf[e] = Qg[row * HGP_QSTRIDE + d];
                 }
                 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
                     const unsigned int krow = ct * 16u + (lane & 15u);
                     const unsigned int d    = ks + (lane >> 4) * 8u + (unsigned int)e;
-                    kf[e] = Ks[krow * WFD + d];
+                    kf[e] = Ks[krow * HGP_KSTRIDE + d];
                 }
                 sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(qf, kf, sacc);
             }
@@ -1672,7 +1699,7 @@ void gqa_attn_prefill_flash_wmma_fa2_hg_packed(
             const unsigned int i = task % HG_BR;
             if (i < n_rows) {
                 float *Spg = Sp + (unsigned long long)g * HG_BR * HG_BC;
-                _Float16 *Psg = Ps + (unsigned long long)g * HG_BR * HG_BC;
+                _Float16 *Psg = Ps + (unsigned long long)g * HG_BR * HGP_PSTRIDE;
                 const unsigned int c0 = quarter * (HG_BC / 4u);   // 8 cols/lane
                 float lmax = -INFINITY;
                 #pragma unroll
@@ -1689,14 +1716,14 @@ void gqa_attn_prefill_flash_wmma_fa2_hg_packed(
                 if (m_new == -INFINITY) {
                     corr = 1.0f;
                     #pragma unroll
-                    for (unsigned int j = 0; j < HG_BC / 4u; j++) Psg[i*HG_BC + c0 + j] = (_Float16)0.0f;
+                    for (unsigned int j = 0; j < HG_BC / 4u; j++) Psg[i*HGP_PSTRIDE + c0 + j] = (_Float16)0.0f;
                 } else {
                     corr = expf(m_old - m_new);
                     #pragma unroll
                     for (unsigned int j = 0; j < HG_BC / 4u; j++) {
                         const float sij = Spg[i*HG_BC + c0 + j];
                         const float p = (sij == -INFINITY) ? 0.0f : expf(sij - m_new);
-                        Psg[i*HG_BC + c0 + j] = (_Float16)p;
+                        Psg[i*HGP_PSTRIDE + c0 + j] = (_Float16)p;
                         lsum += p;
                     }
                 }
@@ -1717,7 +1744,7 @@ void gqa_attn_prefill_flash_wmma_fa2_hg_packed(
             const unsigned int dt = wave;          // d-tile 0..7
             #pragma unroll
             for (unsigned int g = 0; g < HGP_G; ++g) {
-                _Float16 *Psg = Ps + (unsigned long long)g * HG_BR * HG_BC;
+                _Float16 *Psg = Ps + (unsigned long long)g * HG_BR * HGP_PSTRIDE;
                 const float *crg = corr_s + (unsigned long long)g * HG_BR;
                 gqa_float8 oacc;
                 #pragma unroll
@@ -1732,13 +1759,13 @@ void gqa_attn_prefill_flash_wmma_fa2_hg_packed(
                     for (int e = 0; e < 8; ++e) {
                         const unsigned int prow = (lane & 15u);
                         const unsigned int jj   = ks + (lane >> 4) * 8u + (unsigned int)e;
-                        pf[e] = Psg[prow * HG_BC + jj];
+                        pf[e] = Psg[prow * HGP_PSTRIDE + jj];
                     }
                     #pragma unroll
                     for (int e = 0; e < 8; ++e) {
                         const unsigned int jj   = ks + (lane >> 4) * 8u + (unsigned int)e;
                         const unsigned int dcol = dt * 16u + (lane & 15u);
-                        vf[e] = Vs[jj * WFD + dcol];
+                        vf[e] = Vs[jj * HGP_VSTRIDE + dcol];
                     }
                     oacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pf, vf, oacc);
                 }
