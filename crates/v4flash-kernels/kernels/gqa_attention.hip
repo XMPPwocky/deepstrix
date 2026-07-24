@@ -1745,12 +1745,14 @@ void gqa_attn_decode_partial_hg(
         // with Scratch=0. Consecutive _i map to consecutive keys at the same dim
         // (tid), so pack pairs (2m, 2m+1) into lane 0/1 of entry m.
         constexpr unsigned int KVPT_D = (DEC_FBC * DEC_FD) / DEC_BLOCK;   // 32 elems/thread per K,V
-        constexpr unsigned int KVPT2  = KVPT_D / 2u;                       // 16 packed half2/thread
-        typedef _Float16 dec_h2 __attribute__((ext_vector_type(2)));
 #ifndef DEC_PREFETCH_DEPTH
 #define DEC_PREFETCH_DEPTH 2
 #endif
         constexpr unsigned int PFD_D = DEC_PREFETCH_DEPTH;
+#ifdef DEC_KV_LOAD_NARROW
+        // --- FALLBACK: half2 (32-bit) scalar-underlying global loads (A/B) ---
+        constexpr unsigned int KVPT2  = KVPT_D / 2u;                       // 16 packed half2/thread
+        typedef _Float16 dec_h2 __attribute__((ext_vector_type(2)));
         dec_h2 kbuf[PFD_D][KVPT2];
         dec_h2 vbuf[PFD_D][KVPT2];
         #define DEC_LOAD_ELEM(SLOT, KB, _i) do {                                         \
@@ -1803,6 +1805,80 @@ void gqa_attn_decode_partial_hg(
             }
             const unsigned int n_keys = (kb + DEC_FBC < k1) ? DEC_FBC : (k1 - kb);
 #else
+        // --- DEFAULT: b128 (half8, 128-bit) wide coalesced global loads ---
+        // head_dim (128 halfs) is contiguous in DRAM, so a lane loads 8 contiguous
+        // dims per global_load_b128 (16 B / 128-bit). KVPT_D=32 elems/lane = 4 b128
+        // per lane per tile for K and 4 for V. With PFD_D=2 depth-2 prefetch, ~8+
+        // K b128 (+8 V) loads are in flight per lane → high memory-level parallelism
+        // (the projection fix's lever). The half2 scalar path (DEC_KV_LOAD_NARROW)
+        // issued 16-bit-per-lane loads → too few outstanding → DRAM-latency-bound.
+        // Register footprint is IDENTICAL: kbuf[2][4] half8 = 8 vecs × 4 VGPR = 32
+        // VGPR (same as [2][16] half2). LDS staging kept (transposes for compute).
+        // Bit-exact vs half2: same halfs, same store layout Ks[key*hd+dim]; only the
+        // load WIDTH/scheduling changes. b128 needs 16-B alignment: _off is a
+        // multiple of 8 halfs (row_stride=n_kv_head*128, kvh_off=kh*128, _d%8==0).
+        constexpr unsigned int CPK    = DEC_FD / 8u;   // 16 b128-chunks per key
+        constexpr unsigned int KVPT8  = KVPT_D / 8u;   // 4 b128/thread per K,V
+        typedef _Float16 dec_h8 __attribute__((ext_vector_type(8)));
+        dec_h8 kbuf[PFD_D][KVPT8];
+        dec_h8 vbuf[PFD_D][KVPT8];
+        // Lane t, chunk _c owns b128-chunk (t + _c*128): key = chunk/CPK, dim = 8*(chunk%CPK).
+        // Adjacent lanes → adjacent chunks → adjacent 16-B addresses within a key
+        // (16 lanes cover one 256-B key row → one coalesced transaction).
+        #define DEC_LOAD_ELEM(SLOT, KB, _c) do {                                         \
+            const unsigned int _chunk = tid + (_c) * DEC_BLOCK;                          \
+            const unsigned int _j  = _chunk / CPK;                                       \
+            const unsigned int _d  = (_chunk % CPK) * 8u;                                \
+            const unsigned int _kg = (KB) + _j;                                          \
+            dec_h8 _kv = {}, _vv = {};                                                   \
+            if (_kg < k1) {                                                              \
+                const unsigned long long _off =                                          \
+                    (unsigned long long)((k_base + _kg) % kv_capacity) * row_stride + kvh_off + _d; \
+                _kv = *(const dec_h8 *)(k_cache + _off);                                 \
+                _vv = *(const dec_h8 *)(v_cache + _off);                                 \
+            }                                                                            \
+            kbuf[SLOT][_c] = _kv;                                                        \
+            vbuf[SLOT][_c] = _vv;                                                        \
+        } while (0)
+        #define DEC_LOAD_TILE_REG(SLOT, KB) do {                                         \
+            _Pragma("unroll")                                                            \
+            for (unsigned int _c = 0; _c < KVPT8; ++_c) DEC_LOAD_ELEM(SLOT, KB, _c);     \
+        } while (0)
+
+        // Prime the pipeline: issue the first PFD tiles' loads up front.
+        #pragma unroll
+        for (unsigned int _pf = 0; _pf < PFD_D; ++_pf) {
+            const unsigned int _kb = k0 + _pf * DEC_FBC;
+            if (_kb < k1) DEC_LOAD_TILE_REG(_pf, _kb);
+        }
+        for (unsigned int kb = k0; kb < k1; kb += DEC_FBC) {
+            // copy the (already-loaded) K/V tile regs -> LDS (always buf[0]) as b128.
+            // chunk*8 == key*hd + dim, so the store lands at Ks[key*hd+dim] (16-B aligned).
+            #pragma unroll
+            for (unsigned int _c = 0; _c < KVPT8; ++_c) {
+                const unsigned int _chunk = tid + _c * DEC_BLOCK;
+                *(dec_h8 *)(Ks + _chunk * 8u) = kbuf[0][_c];
+                *(dec_h8 *)(Vs + _chunk * 8u) = vbuf[0][_c];
+            }
+            __syncthreads();
+            // shift the register ring down: buf[s] <- buf[s+1] (static indices)
+            #pragma unroll
+            for (unsigned int _s = 0; _s + 1u < PFD_D; ++_s) {
+                #pragma unroll
+                for (unsigned int _c = 0; _c < KVPT8; ++_c) {
+                    kbuf[_s][_c] = kbuf[_s + 1u][_c];
+                    vbuf[_s][_c] = vbuf[_s + 1u][_c];
+                }
+            }
+            // issue the load for tile kb+PFD*FBC into the freed top slot NOW so
+            // its b128 global loads overlap the whole PFD-tile compute window.
+            {
+                const unsigned int _next = kb + PFD_D * DEC_FBC;
+                if (_next < k1) DEC_LOAD_TILE_REG(PFD_D - 1u, _next);
+            }
+            const unsigned int n_keys = (kb + DEC_FBC < k1) ? DEC_FBC : (k1 - kb);
+#endif  // DEC_KV_LOAD_NARROW
+#else   // ATTN_KV_PREFETCH_OFF
         for (unsigned int kb = k0; kb < k1; kb += DEC_FBC) {
             // --- stage K/V tile into LDS ONCE (reused across the whole group) ---
             for (unsigned int p = tid; p < DEC_FBC * hd; p += DEC_BLOCK) {
