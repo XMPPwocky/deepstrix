@@ -1725,40 +1725,82 @@ void gqa_attn_decode_partial_hg(
         const unsigned int sub = tid & 3u;   // 0..3 (dim quarter)
 
 #ifndef ATTN_KV_PREFETCH_OFF  // prefetch is DEFAULT; -DATTN_KV_PREFETCH_OFF restores serial staging (A/B)
-        // Software-pipelined K/V prefetch: issue the next key tile's global
-        // loads into registers while this tile's score/softmax/V-accumulate
-        // runs, hiding the load latency that ATT showed as the dominant
-        // `s_wait_loadcnt` stall. Occupancy is LDS-bound so the extra VGPRs
-        // are free; no second LDS tile (avoids the double-buffer trap).
-        constexpr unsigned int KVPT_D = (DEC_FBC * DEC_FD) / DEC_BLOCK;   // regs/thread
-        _Float16 kbuf[KVPT_D];
-        _Float16 vbuf[KVPT_D];
-        #define DEC_LOAD_TILE_REG(KB) do {                                               \
-            _Pragma("unroll")                                                            \
-            for (unsigned int _i = 0; _i < KVPT_D; ++_i) {                               \
-                const unsigned int _p  = tid + _i * DEC_BLOCK;                           \
-                const unsigned int _j  = _p / hd;                                        \
-                const unsigned int _d  = _p % hd;                                        \
-                const unsigned int _kg = (KB) + _j;                                      \
-                if (_kg < k1) {                                                          \
-                    const unsigned long long _off =                                      \
-                        (unsigned long long)((k_base + _kg) % kv_capacity) * row_stride + kvh_off + _d; \
-                    kbuf[_i] = k_cache[_off]; vbuf[_i] = v_cache[_off];                  \
-                } else { kbuf[_i] = (_Float16)0.0f; vbuf[_i] = (_Float16)0.0f; }         \
+        // Software-pipelined DEPTH-2 K/V prefetch: keep PFD key tiles in flight
+        // (register-resident) so multiple K/V global loads overlap this tile's
+        // score/softmax/V-accumulate compute. ATT showed decode_partial_hg
+        // stall = 47% s_wait_loadcnt (K/V load-wait); depth-1 issues only one
+        // tile ahead so a single tile's compute window (~small at B=1) can't
+        // hide the full load latency. A STATIC shift-register ring (buf[s] <-
+        // buf[s+1], compile-time indices) rotates the tiles so no dynamic-
+        // indexed register array (that spills to scratch). Bit-exact vs depth-1:
+        // only load SCHEDULING changes; bytes stored into Ks/Vs are identical.
+        // Occupancy is LDS-bound (2 WG/CU) so the extra PFD*KVPT*2 half regs are
+        // free until 256 VGPR; no second LDS tile (avoids the double-buffer trap).
+        // PACKED half2 ring buffers: each thread's KVPT_D per-tile elements are
+        // 2× the prefill's (128-thread block vs 256 → 32 halfs/tile for K AND V).
+        // A scalar `_Float16 buf[]` array is register-allocated one half per VGPR
+        // (no packing), so depth-2 (4 tiles' worth of K+V) blew past 256 VGPR and
+        // spilled 29 to scratch. Declaring the ring as a native 2-wide half vector
+        // forces 2 halfs/VGPR → HALVES the buffer VGPR footprint so depth-2 fits
+        // with Scratch=0. Consecutive _i map to consecutive keys at the same dim
+        // (tid), so pack pairs (2m, 2m+1) into lane 0/1 of entry m.
+        constexpr unsigned int KVPT_D = (DEC_FBC * DEC_FD) / DEC_BLOCK;   // 32 elems/thread per K,V
+        constexpr unsigned int KVPT2  = KVPT_D / 2u;                       // 16 packed half2/thread
+        typedef _Float16 dec_h2 __attribute__((ext_vector_type(2)));
+#ifndef DEC_PREFETCH_DEPTH
+#define DEC_PREFETCH_DEPTH 2
+#endif
+        constexpr unsigned int PFD_D = DEC_PREFETCH_DEPTH;
+        dec_h2 kbuf[PFD_D][KVPT2];
+        dec_h2 vbuf[PFD_D][KVPT2];
+        #define DEC_LOAD_ELEM(SLOT, KB, _i) do {                                         \
+            const unsigned int _p  = tid + (_i) * DEC_BLOCK;                             \
+            const unsigned int _j  = _p / hd;                                            \
+            const unsigned int _d  = _p % hd;                                            \
+            const unsigned int _kg = (KB) + _j;                                          \
+            _Float16 _kv = (_Float16)0.0f, _vv = (_Float16)0.0f;                         \
+            if (_kg < k1) {                                                              \
+                const unsigned long long _off =                                          \
+                    (unsigned long long)((k_base + _kg) % kv_capacity) * row_stride + kvh_off + _d; \
+                _kv = k_cache[_off]; _vv = v_cache[_off];                                \
             }                                                                            \
+            kbuf[SLOT][(_i) >> 1][(_i) & 1u] = _kv;                                      \
+            vbuf[SLOT][(_i) >> 1][(_i) & 1u] = _vv;                                      \
+        } while (0)
+        #define DEC_LOAD_TILE_REG(SLOT, KB) do {                                         \
+            _Pragma("unroll")                                                            \
+            for (unsigned int _i = 0; _i < KVPT_D; ++_i) DEC_LOAD_ELEM(SLOT, KB, _i);    \
         } while (0)
 
-        DEC_LOAD_TILE_REG(k0);
+        // Prime the pipeline: issue the first PFD tiles' loads up front.
+        #pragma unroll
+        for (unsigned int _pf = 0; _pf < PFD_D; ++_pf) {
+            const unsigned int _kb = k0 + _pf * DEC_FBC;
+            if (_kb < k1) DEC_LOAD_TILE_REG(_pf, _kb);
+        }
         for (unsigned int kb = k0; kb < k1; kb += DEC_FBC) {
-            // copy prefetched regs -> LDS
+            // copy the (already-loaded) K/V tile regs -> LDS (always buf[0])
             #pragma unroll
             for (unsigned int _i = 0; _i < KVPT_D; ++_i) {
                 const unsigned int _p = tid + _i * DEC_BLOCK;
-                Ks[_p] = kbuf[_i]; Vs[_p] = vbuf[_i];
+                Ks[_p] = kbuf[0][_i >> 1][_i & 1u]; Vs[_p] = vbuf[0][_i >> 1][_i & 1u];
             }
             __syncthreads();
-            // prefetch next tile (loads in flight during compute below)
-            if (kb + DEC_FBC < k1) DEC_LOAD_TILE_REG(kb + DEC_FBC);
+            // shift the register ring down: buf[s] <- buf[s+1] (static indices)
+            #pragma unroll
+            for (unsigned int _s = 0; _s + 1u < PFD_D; ++_s) {
+                #pragma unroll
+                for (unsigned int _i = 0; _i < KVPT2; ++_i) {
+                    kbuf[_s][_i] = kbuf[_s + 1u][_i];
+                    vbuf[_s][_i] = vbuf[_s + 1u][_i];
+                }
+            }
+            // issue the load for tile kb+PFD*FBC into the freed top slot NOW so
+            // its global loads overlap the whole PFD-tile compute window.
+            {
+                const unsigned int _next = kb + PFD_D * DEC_FBC;
+                if (_next < k1) DEC_LOAD_TILE_REG(PFD_D - 1u, _next);
+            }
             const unsigned int n_keys = (kb + DEC_FBC < k1) ? DEC_FBC : (k1 - kb);
 #else
         for (unsigned int kb = k0; kb < k1; kb += DEC_FBC) {
