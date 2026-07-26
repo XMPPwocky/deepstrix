@@ -79,6 +79,20 @@ __device__ __forceinline__ float dot_block_quarter_q6k(
     const int8_t*  q8  = q8_base + (size_t)half * 128u + (size_t)upper * 64u;
     const int8_t*  sch = sc + (size_t)half * 8u + (size_t)upper * 4u; // 4 scales
 
+    // Vectorized Q6_K unpack (bit-identical to the scalar per-element form
+    // above, which this replaces). Instead of 4 byte-loads + per-element
+    // shift/mask/pack, decode 4 consecutive elements per dword with SWAR:
+    //   - `ql` 4-bit nibbles extract exactly like Q4_K (mask 0x0F0F0F0F, or
+    //     >>4 for the high-nibble quarter);
+    //   - `qh` 2-bit high bits: one shift+mask 0x03030303, then <<4 into
+    //     bits 4-5 of each byte;
+    //   - the Q6_K -32 offset per byte via the borrow-free SWAR identity
+    //     ((c|0x80808080)-0x20202020)^0x80808080  (each combined byte is in
+    //     [0,63], so bit7 is clear and no byte borrows into the next).
+    // r0 is a multiple of 4, so all 4 elements share the same `r>=32` (hence
+    // the same qh shift) and the same qh dword at (r0 & 31). This cuts the
+    // load-instruction count 4x (dword vs ubyte) and the VALU per element ~5x,
+    // letting the kernel reach the DRAM-BW roofline like the Q4_K sibling.
     int32_t isum = 0;
     #pragma unroll
     for (int g = 0; g < 4; g++) {            // 4 sub-blocks of 16 elements
@@ -86,17 +100,17 @@ __device__ __forceinline__ float dot_block_quarter_q6k(
         #pragma unroll
         for (int q = 0; q < 16; q += 4) {    // 4 signed dp4a per sub-block
             const int r0 = g * 16 + q;
-            uint32_t apack = 0u;
-            #pragma unroll
-            for (int t = 0; t < 4; t++) {
-                const int r = r0 + t;
-                const unsigned int shift = upper * 4u + ((r >= 32) ? 2u : 0u);
-                const uint8_t nib = upper ? (uint8_t)(qlh[r] >> 4)
-                                          : (uint8_t)(qlh[r] & 0x0Fu);
-                const uint8_t hi2 = (uint8_t)((qhh[r & 31] >> shift) & 3u);
-                const int8_t  av  = (int8_t)((int)(nib | (hi2 << 4)) - 32);
-                apack |= ((uint32_t)(uint8_t)av) << (t * 8);
-            }
+            const unsigned int shift = upper * 4u + ((r0 >= 32) ? 2u : 0u);
+            const uint32_t qld =
+                (uint32_t)load_dword_i8_q6k((const int8_t*)(qlh + r0));
+            const uint32_t nib = upper ? ((qld >> 4) & 0x0F0F0F0Fu)
+                                       : (qld & 0x0F0F0F0Fu);
+            const uint32_t qhd =
+                (uint32_t)load_dword_i8_q6k((const int8_t*)(qhh + (r0 & 31)));
+            const uint32_t hi2  = ((qhd >> shift) & 0x03030303u) << 4;
+            const uint32_t comb = nib | hi2;           // each byte in [0,63]
+            const uint32_t apack =
+                ((comb | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
             dot = sudot4_q6k((int32_t)apack, load_dword_i8_q6k(q8 + r0), dot);
         }
         isum += (int32_t)sch[g] * dot;

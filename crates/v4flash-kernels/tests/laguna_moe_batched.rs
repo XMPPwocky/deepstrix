@@ -1053,14 +1053,15 @@ fn dequant_q6k_row(row: &[u8], n_super: usize) -> Vec<f32> {
 }
 
 fn make_engine() -> eyre::Result<Engine> {
+    let want = std::env::var("Q6K_ARCH").unwrap_or_else(|_| "gfx1201".to_string());
     let dev = Device::all()?
         .into_iter()
         .find(|d| {
             d.properties()
-                .map(|p| p.gcn_arch_name.starts_with("gfx1201"))
+                .map(|p| p.gcn_arch_name.starts_with(&want))
                 .unwrap_or(false)
         })
-        .ok_or_else(|| eyre!("no gfx1201 device"))?;
+        .ok_or_else(|| eyre!("no {want} device"))?;
     dev.set_current()?;
     let arch = dev.properties()?.gcn_arch_name;
     let stream = Stream::new(dev.id)?;
@@ -1243,6 +1244,142 @@ fn moe_batched_timing() -> eyre::Result<()> {
     eng.stream.synchronize()?;
     let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
     println!("moe_batched B=1 L1 dims (top-10, hid=3072, ff=1024): {us:.1} us/token (3 kernels, kernel-only)");
+    Ok(())
+}
+
+/// ISOLATED q6_k_matvec_par_batched down-projection timing at real Laguna L1
+/// dims (n_rows=3072, k=1024 → n_blocks_in=4, top-10). Reports achieved GB/s
+/// (weight-bytes moved / kernel time) and % of the ~230 GB/s iGPU roofline.
+/// This isolates the single FIXABLE decode kernel from the scorecard.
+#[test]
+#[ignore = "drives the GPU; run explicitly"]
+fn q6_k_down_isolated_bench() -> eyre::Result<()> {
+    v4flash_hip::install_panic_handler();
+    // Target the iGPU (gfx1151, ~230 GB/s LPDDR5X) — this is where the cold
+    // routed-MoE down projection actually runs. make_engine() picks gfx1201
+    // (the dGPU), which has ~600 GB/s and would mask the roofline entirely.
+    let eng = {
+        let want = std::env::var("Q6K_ARCH").unwrap_or_else(|_| "gfx1151".to_string());
+        let dev = Device::all()?
+            .into_iter()
+            .find(|d| {
+                d.properties()
+                    .map(|p| p.gcn_arch_name.starts_with(&want))
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| eyre!("no {want} device"))?;
+        dev.set_current()?;
+        let arch = dev.properties()?.gcn_arch_name;
+        println!("== isolated bench device id={} arch={arch} ==", dev.id);
+        let stream = Stream::new(dev.id)?;
+        Engine {
+            dev: dev.id,
+            stream,
+            f16: F16Matvec::for_arch(&arch)?,
+            q4: Q4_KDenseMatvec::for_arch(&arch)?,
+            q6: Q6_KDenseMatvec::for_arch(&arch)?,
+            gqa: GqaAttention::for_arch(&arch)?,
+            q8k: Q8KQuantize::for_arch(&arch)?,
+            q4b: Q4KMatvec::for_arch(&arch)?,
+            q6b: Q6KMatvec::for_arch(&arch)?,
+        }
+    };
+
+    const HID: usize = 3072; // n_rows (down output)
+    const FF: usize = 1024; // k (down input)
+    const NUSED: usize = 10;
+    // Large expert pool so the swept working set (NPOOL*2.58MB) far exceeds the
+    // iGPU MALL cache: each timed iter reads a DIFFERENT group of 10 experts,
+    // forcing COLD DRAM reads (matches the real decode, where each token routes
+    // to distinct cold experts). A single-group warm loop reads from cache and
+    // massively overstates BW (>600 GB/s), so it is NOT representative.
+    const NGROUP: usize = 80; // 80 disjoint groups → 800 experts, ~2.0 GiB
+    const NPOOL: usize = NGROUP * NUSED;
+    let fblk = FF / 256; // 4
+    let down_bpe = HID * fblk * 210; // bytes per expert
+
+    // Cheap fill (byte VALUES are irrelevant to BW; any bytes are legal Q6_K).
+    // ~2 GiB working set → far beyond any cache, guarantees cold DRAM reads.
+    let mut down_cat = vec![0u8; NPOOL * down_bpe];
+    for (i, b) in down_cat.iter_mut().enumerate() {
+        *b = (i as u8) ^ ((i >> 8) as u8);
+    }
+    let down_base = eng.upload_u8(&down_cat)?;
+
+    // xq activations: NUSED slots × fblk blocks × 292 B (valid Q8_K from random mid)
+    let mut rng = Lcg(0xf00d_0006_600d_0006);
+    let mid: Vec<f32> = (0..NUSED * FF).map(|_| rng.f32()).collect();
+    let mid_d = eng.upload_f32(&mid)?;
+    let mut xq_mid = DeviceBuffer::<u8>::new(eng.dev, NUSED * fblk * 292)?;
+    eng.q8k.launch(&eng.stream, &mut xq_mid, &mid_d, (NUSED * fblk) as u32)?;
+
+    // Pre-build one device `selected` buffer per group (10 distinct experts
+    // each) so rotation adds no host copy inside the timed loop.
+    let mut sel_bufs: Vec<DeviceBuffer<i32>> = Vec::with_capacity(NGROUP);
+    for gi in 0..NGROUP {
+        let sel: Vec<i32> = (0..NUSED as i32).map(|s| (gi * NUSED) as i32 + s).collect();
+        let mut sd = DeviceBuffer::<i32>::new(eng.dev, NUSED)?;
+        sd.copy_from_host(&sel)?;
+        sel_bufs.push(sd);
+    }
+    let mut acc = DeviceBuffer::<f32>::new(eng.dev, HID)?;
+    let xq_slot_stride = (fblk * 292) as u32;
+
+    let launch = |eng: &Engine, acc: &mut DeviceBuffer<f32>, sd: &DeviceBuffer<i32>| -> eyre::Result<()> {
+        eng.q6b.launch_batched(
+            &eng.stream, acc, &down_base, &xq_mid, sd, down_bpe as u32,
+            xq_slot_stride, NUSED as u32, HID as u32, fblk as u32,
+        )
+    };
+
+    for i in 0..NGROUP {
+        launch(&eng, &mut acc, &sel_bufs[i % NGROUP])?;
+    }
+    eng.stream.synchronize()?;
+
+    let iters = 2000;
+    let t0 = std::time::Instant::now();
+    for i in 0..iters {
+        launch(&eng, &mut acc, &sel_bufs[i % NGROUP])?;
+    }
+    eng.stream.synchronize()?;
+    let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+    let wbytes = (NUSED * down_bpe) as f64;
+    let gbps = wbytes / (us * 1e3); // bytes / (us*1e3 ns) = GB/s
+    println!("q6_k_down_isolated_bench COLD (n_rows={HID}, k={FF}, top-{NUSED}, pool={NPOOL}):");
+    println!("  weight bytes/call = {:.3} MiB", wbytes / 1024.0 / 1024.0);
+    println!("  time/call         = {us:.2} us");
+    println!("  Q6_K achieved BW  = {gbps:.1} GB/s  ({:.1}% of 230)", gbps / 230.0 * 100.0);
+
+    // ---- CONTROL: q4_k down sibling, identical harness ----
+    let down_bpe4 = HID * fblk * 144;
+    let mut down_cat4 = vec![0u8; NPOOL * down_bpe4];
+    for (i, b) in down_cat4.iter_mut().enumerate() {
+        *b = (i as u8) ^ ((i >> 8) as u8);
+    }
+    let down_base4 = eng.upload_u8(&down_cat4)?;
+    let launch4 = |eng: &Engine, acc: &mut DeviceBuffer<f32>, sd: &DeviceBuffer<i32>| -> eyre::Result<()> {
+        eng.q4b.launch_batched(
+            &eng.stream, acc, &down_base4, &xq_mid, sd, down_bpe4 as u32,
+            xq_slot_stride, NUSED as u32, HID as u32, fblk as u32,
+        )
+    };
+    for i in 0..NGROUP {
+        launch4(&eng, &mut acc, &sel_bufs[i % NGROUP])?;
+    }
+    eng.stream.synchronize()?;
+    let t1 = std::time::Instant::now();
+    for i in 0..iters {
+        launch4(&eng, &mut acc, &sel_bufs[i % NGROUP])?;
+    }
+    eng.stream.synchronize()?;
+    let us4 = t1.elapsed().as_secs_f64() * 1e6 / iters as f64;
+    let wbytes4 = (NUSED * down_bpe4) as f64;
+    let gbps4 = wbytes4 / (us4 * 1e3);
+    println!("q4_k_down CONTROL (same harness):");
+    println!("  time/call         = {us4:.2} us");
+    println!("  Q4_K achieved BW  = {gbps4:.1} GB/s  ({:.1}% of 230)", gbps4 / 230.0 * 100.0);
     Ok(())
 }
 
