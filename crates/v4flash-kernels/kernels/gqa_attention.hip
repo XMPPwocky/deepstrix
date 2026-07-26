@@ -1823,6 +1823,14 @@ void gqa_attn_prefill_flash_wmma_fa2_hg_packed(
 #define DEC_FBC   32u    // keys staged per tile
 #define DEC_FD    128u   // head_dim (Laguna) — also the block size
 #define DEC_BLOCK 128u
+// Keys staged per tile for the HEAD-GROUPED decode kernel. Overridable via
+// -DDEC_FBC_HG=64u (build.rs DEEPSTRIX_KERNEL_CFLAGS) to HALVE the barrier
+// count per key (bigger tile → more score/AV compute between each
+// __syncthreads). MUST be a multiple of 32 (the score phase sub-tiles the
+// tile into 32-key chunks mapped 4 lanes/key over the 128-thread block).
+#ifndef DEC_FBC_HG
+#define DEC_FBC_HG 32u
+#endif
 
 extern "C" __global__ __launch_bounds__(DEC_BLOCK)
 void gqa_attn_decode_partial(
@@ -2022,21 +2030,34 @@ void gqa_attn_decode_partial_hg(
     const unsigned int k0  = s * per;
     const unsigned int k1  = (k0 + per < n_kv) ? (k0 + per) : n_kv;
 
-    __shared__ float    Qs[DEC_KVG_MAX * DEC_FD];
-    __shared__ float    Os[DEC_KVG_MAX * DEC_FD];
-    __shared__ _Float16 Ks[DEC_FBC * DEC_FD];
-    __shared__ _Float16 Vs[DEC_FBC * DEC_FD];
-    __shared__ float    Sp[DEC_KVG_MAX * DEC_FBC];   // per-head score tile
+    // Qs stored f16 (the query IS f16 in DRAM; (float)-widening at read is
+    // exact → bit-identical) to shave DEC_KVG_MAX*DEC_FD*2 = 3 KB more LDS and,
+    // with Os in registers, drop the tile under the 3-WG/CU LDS threshold.
+    __shared__ _Float16 Qs[DEC_KVG_MAX * DEC_FD];
+    __shared__ _Float16 Ks[DEC_FBC_HG * DEC_FD];
+    __shared__ _Float16 Vs[DEC_FBC_HG * DEC_FD];
+    __shared__ float    Sp[DEC_KVG_MAX * DEC_FBC_HG];   // per-head score tile
     __shared__ float    m_s[DEC_KVG_MAX];
     __shared__ float    l_s[DEC_KVG_MAX];
     __shared__ float    corr_s[DEC_KVG_MAX];
 
-    // Stage all group heads' queries + zero the per-head output accumulators.
+    // Per-head output accumulator lives in REGISTERS, not LDS: Os[g][d] is
+    // touched ONLY by the thread that owns dim d (tid==d) — init, the per-tile
+    // rescale-accumulate, and the final write are all thread-private. Keeping it
+    // in LDS forced a read-modify-write LDS round-trip PER TILE PER HEAD on the
+    // AV critical path (a s_wait_dscnt pole) AND cost DEC_KVG_MAX*DEC_FD*4 =
+    // 6 KB of LDS that capped occupancy at 2 WG/CU. Registers remove both.
+    // Indexed by COMPILE-TIME g (DEC_KVG_MAX-unrolled, kv_group-guarded) so it
+    // stays in VGPRs (a runtime index would spill to scratch).
+    float Oreg[DEC_KVG_MAX];
+    #pragma unroll
+    for (unsigned int g = 0; g < DEC_KVG_MAX; g++) Oreg[g] = 0.0f;
+
+    // Stage all group heads' queries.
     if (tid < hd) {
         for (unsigned int g = 0; g < kv_group; g++) {
             const unsigned int qh_idx = kh * kv_group + g;
-            Qs[g * hd + tid] = (float)q[(unsigned long long)qh_idx * hd + tid];
-            Os[g * hd + tid] = 0.0f;
+            Qs[g * hd + tid] = q[(unsigned long long)qh_idx * hd + tid];
         }
     }
     if (tid < kv_group) { m_s[tid] = -INFINITY; l_s[tid] = 0.0f; }
@@ -2067,7 +2088,7 @@ void gqa_attn_decode_partial_hg(
         // forces 2 halfs/VGPR → HALVES the buffer VGPR footprint so depth-2 fits
         // with Scratch=0. Consecutive _i map to consecutive keys at the same dim
         // (tid), so pack pairs (2m, 2m+1) into lane 0/1 of entry m.
-        constexpr unsigned int KVPT_D = (DEC_FBC * DEC_FD) / DEC_BLOCK;   // 32 elems/thread per K,V
+        constexpr unsigned int KVPT_D = (DEC_FBC_HG * DEC_FD) / DEC_BLOCK;   // 32 elems/thread per K,V
 #ifndef DEC_PREFETCH_DEPTH
 #define DEC_PREFETCH_DEPTH 2
 #endif
@@ -2100,10 +2121,10 @@ void gqa_attn_decode_partial_hg(
         // Prime the pipeline: issue the first PFD tiles' loads up front.
         #pragma unroll
         for (unsigned int _pf = 0; _pf < PFD_D; ++_pf) {
-            const unsigned int _kb = k0 + _pf * DEC_FBC;
+            const unsigned int _kb = k0 + _pf * DEC_FBC_HG;
             if (_kb < k1) DEC_LOAD_TILE_REG(_pf, _kb);
         }
-        for (unsigned int kb = k0; kb < k1; kb += DEC_FBC) {
+        for (unsigned int kb = k0; kb < k1; kb += DEC_FBC_HG) {
             // copy the (already-loaded) K/V tile regs -> LDS (always buf[0])
             #pragma unroll
             for (unsigned int _i = 0; _i < KVPT_D; ++_i) {
@@ -2123,10 +2144,10 @@ void gqa_attn_decode_partial_hg(
             // issue the load for tile kb+PFD*FBC into the freed top slot NOW so
             // its global loads overlap the whole PFD-tile compute window.
             {
-                const unsigned int _next = kb + PFD_D * DEC_FBC;
+                const unsigned int _next = kb + PFD_D * DEC_FBC_HG;
                 if (_next < k1) DEC_LOAD_TILE_REG(PFD_D - 1u, _next);
             }
-            const unsigned int n_keys = (kb + DEC_FBC < k1) ? DEC_FBC : (k1 - kb);
+            const unsigned int n_keys = (kb + DEC_FBC_HG < k1) ? DEC_FBC_HG : (k1 - kb);
 #else
         // --- DEFAULT: b128 (half8, 128-bit) wide coalesced global loads ---
         // head_dim (128 halfs) is contiguous in DRAM, so a lane loads 8 contiguous
@@ -2171,10 +2192,10 @@ void gqa_attn_decode_partial_hg(
         // Prime the pipeline: issue the first PFD tiles' loads up front.
         #pragma unroll
         for (unsigned int _pf = 0; _pf < PFD_D; ++_pf) {
-            const unsigned int _kb = k0 + _pf * DEC_FBC;
+            const unsigned int _kb = k0 + _pf * DEC_FBC_HG;
             if (_kb < k1) DEC_LOAD_TILE_REG(_pf, _kb);
         }
-        for (unsigned int kb = k0; kb < k1; kb += DEC_FBC) {
+        for (unsigned int kb = k0; kb < k1; kb += DEC_FBC_HG) {
             // copy the (already-loaded) K/V tile regs -> LDS (always buf[0]) as b128.
             // chunk*8 == key*hd + dim, so the store lands at Ks[key*hd+dim] (16-B aligned).
             #pragma unroll
@@ -2196,15 +2217,15 @@ void gqa_attn_decode_partial_hg(
             // issue the load for tile kb+PFD*FBC into the freed top slot NOW so
             // its b128 global loads overlap the whole PFD-tile compute window.
             {
-                const unsigned int _next = kb + PFD_D * DEC_FBC;
+                const unsigned int _next = kb + PFD_D * DEC_FBC_HG;
                 if (_next < k1) DEC_LOAD_TILE_REG(PFD_D - 1u, _next);
             }
-            const unsigned int n_keys = (kb + DEC_FBC < k1) ? DEC_FBC : (k1 - kb);
+            const unsigned int n_keys = (kb + DEC_FBC_HG < k1) ? DEC_FBC_HG : (k1 - kb);
 #endif  // DEC_KV_LOAD_NARROW
 #else   // ATTN_KV_PREFETCH_OFF
-        for (unsigned int kb = k0; kb < k1; kb += DEC_FBC) {
+        for (unsigned int kb = k0; kb < k1; kb += DEC_FBC_HG) {
             // --- stage K/V tile into LDS ONCE (reused across the whole group) ---
-            for (unsigned int p = tid; p < DEC_FBC * hd; p += DEC_BLOCK) {
+            for (unsigned int p = tid; p < DEC_FBC_HG * hd; p += DEC_BLOCK) {
                 const unsigned int j = p / hd;
                 const unsigned int d = p % hd;
                 const unsigned int key_g = kb + j;
@@ -2221,53 +2242,61 @@ void gqa_attn_decode_partial_hg(
                 }
             }
             __syncthreads();
-            const unsigned int n_keys = (kb + DEC_FBC < k1) ? DEC_FBC : (k1 - kb);
+            const unsigned int n_keys = (kb + DEC_FBC_HG < k1) ? DEC_FBC_HG : (k1 - kb);
 #endif
 
             // --- (1) scores for ALL group heads into Sp[g][key] (no barriers:
             //         every lane writes a distinct Sp slot). 4 lanes/key sum a
             //         32-dim quarter, then a 4-lane xor-shuffle gives the dot. ---
             const unsigned int d0 = sub * 32u;
+            // Sub-tile the DEC_FBC_HG-key tile into 32-key chunks (the score
+            // thread map is 4 lanes/key × 32 keys = the 128-thread block). For
+            // DEC_FBC_HG==32 this loop runs ONCE (kk==key) → bit-identical to the
+            // pre-bigtile kernel. For DEC_FBC_HG==64 it runs twice (kk = key,
+            // key+32), so ONE tile's barriers now amortise over 2× the keys.
 #ifndef ATTN_DEC_REGCACHE_OFF
-            // REGISTER-CACHE the 32-dim K quarter ONCE per tile. Its value is
-            // IDENTICAL across the kv_group query heads (only Q differs), so the
-            // old code re-read the SAME Ks LDS slot kv_group(=9)× per tile — that
-            // redundant non-broadcast LDS read stream is the s_wait_dscnt pole.
-            // Staging Ks in LDS is still required (it transposes the coalesced
-            // DRAM-load layout into the score layout); we just read it back ONCE.
-            // Bit-exact: same _Float16 values, identical (float)-cast FMA order.
-            _Float16 kreg[32];
-            if (key < n_keys) {
-                const _Float16 *kr = Ks + (unsigned long long)key * hd + d0;
-                #pragma unroll
-                for (unsigned int dd = 0; dd < 32u; dd++) kreg[dd] = kr[dd];
-            }
-            for (unsigned int g = 0; g < kv_group; g++) {
-                float part = 0.0f;
-                if (key < n_keys) {
-                    const float *qg = Qs + (unsigned long long)g * hd + d0;
+            for (unsigned int kt = 0; kt < DEC_FBC_HG; kt += 32u) {
+                const unsigned int kk = kt + key;   // 0 .. DEC_FBC_HG-1
+                // REGISTER-CACHE the 32-dim K quarter ONCE per sub-tile. Its value
+                // is IDENTICAL across the kv_group query heads (only Q differs), so
+                // the old code re-read the SAME Ks LDS slot kv_group(=6)× — that
+                // redundant non-broadcast LDS read stream is the s_wait_dscnt pole.
+                _Float16 kreg[32];
+                if (kk < n_keys) {
+                    const _Float16 *kr = Ks + (unsigned long long)kk * hd + d0;
                     #pragma unroll
-                    for (unsigned int dd = 0; dd < 32u; dd++) part += qg[dd] * (float)kreg[dd];
+                    for (unsigned int dd = 0; dd < 32u; dd++) kreg[dd] = kr[dd];
                 }
-                part += __shfl_xor(part, 1);
-                part += __shfl_xor(part, 2);
-                if (sub == 0) Sp[g * DEC_FBC + key] = (key < n_keys) ? part * scale : -INFINITY;
+                for (unsigned int g = 0; g < kv_group; g++) {
+                    float part = 0.0f;
+                    if (kk < n_keys) {
+                        const _Float16 *qg = Qs + (unsigned long long)g * hd + d0;
+                        #pragma unroll
+                        for (unsigned int dd = 0; dd < 32u; dd++) part += (float)qg[dd] * (float)kreg[dd];
+                    }
+                    part += __shfl_xor(part, 1);
+                    part += __shfl_xor(part, 2);
+                    if (sub == 0) Sp[g * DEC_FBC_HG + kk] = (kk < n_keys) ? part * scale : -INFINITY;
+                }
             }
 #else
-            for (unsigned int g = 0; g < kv_group; g++) {
-                float part = 0.0f;
-                if (key < n_keys) {
-                    const _Float16 *kr = Ks + (unsigned long long)key * hd;
-                    const float    *qg = Qs + (unsigned long long)g * hd;
-                    #pragma unroll
-                    for (unsigned int dd = 0; dd < 32u; dd++) {
-                        const unsigned int d = d0 + dd;
-                        part += qg[d] * (float)kr[d];
+            for (unsigned int kt = 0; kt < DEC_FBC_HG; kt += 32u) {
+                const unsigned int kk = kt + key;
+                for (unsigned int g = 0; g < kv_group; g++) {
+                    float part = 0.0f;
+                    if (kk < n_keys) {
+                        const _Float16 *kr = Ks + (unsigned long long)kk * hd;
+                        const _Float16 *qg = Qs + (unsigned long long)g * hd;
+                        #pragma unroll
+                        for (unsigned int dd = 0; dd < 32u; dd++) {
+                            const unsigned int d = d0 + dd;
+                            part += (float)qg[d] * (float)kr[d];
+                        }
                     }
+                    part += __shfl_xor(part, 1);
+                    part += __shfl_xor(part, 2);
+                    if (sub == 0) Sp[g * DEC_FBC_HG + kk] = (kk < n_keys) ? part * scale : -INFINITY;
                 }
-                part += __shfl_xor(part, 1);
-                part += __shfl_xor(part, 2);
-                if (sub == 0) Sp[g * DEC_FBC + key] = (key < n_keys) ? part * scale : -INFINITY;
             }
 #endif
             __syncthreads();
@@ -2275,14 +2304,14 @@ void gqa_attn_decode_partial_hg(
             // --- (2) online-softmax merge, ONE THREAD PER HEAD (parallel) ---
             if (tid < kv_group) {
                 const unsigned int g = tid;
-                float *sp = Sp + g * DEC_FBC;
+                float *sp = Sp + g * DEC_FBC_HG;
                 float tmax = -INFINITY;
                 for (unsigned int j = 0; j < n_keys; j++) if (sp[j] > tmax) tmax = sp[j];
                 const float m_old = m_s[g];
                 const float m_new = fmaxf(m_old, tmax);
                 const float corr  = (m_old == -INFINITY) ? 1.0f : expf(m_old - m_new);
                 float rsum = 0.0f;
-                for (unsigned int j = 0; j < DEC_FBC; j++) {
+                for (unsigned int j = 0; j < DEC_FBC_HG; j++) {
                     const float sij = sp[j];
                     const float p = (sij == -INFINITY) ? 0.0f : expf(sij - m_new);
                     sp[j] = p;
@@ -2297,36 +2326,43 @@ void gqa_attn_decode_partial_hg(
             // --- (3) V-accumulate: thread `tid` owns output dim `tid`, loops
             //         the group heads (all 128 lanes busy, no inter-head sync) ---
             if (tid < hd) {
-#ifndef ATTN_DEC_REGCACHE_OFF
+#if !defined(ATTN_DEC_REGCACHE_OFF) && (DEC_FBC_HG <= 32u)
                 // Same lever as the score: thread `tid`'s V column Vs[j*hd+tid]
                 // is IDENTICAL across the kv_group heads (only Sp/corr differ), so
                 // register-cache the 32 V elements ONCE per tile instead of the
-                // old kv_group(=9)× non-broadcast LDS re-read (the other dscnt
+                // old kv_group(=6)× non-broadcast LDS re-read (the other dscnt
                 // pole). The Sp[g][j] reads that remain are LDS BROADCAST (all 128
                 // lanes hit the same address) → conflict-free/cheap. Bit-exact.
-                _Float16 vreg[32];
+                // Disabled for big tiles (DEC_FBC_HG>32): vreg[64] + the depth-2
+                // half8 prefetch ring would blow past 256 VGPR → scratch spill;
+                // read V from LDS instead (still ONE staged copy per KV head).
+                _Float16 vreg[DEC_FBC_HG];
                 #pragma unroll
-                for (unsigned int j = 0; j < DEC_FBC; j++) vreg[j] = Vs[(unsigned long long)j * hd + tid];
-                for (unsigned int g = 0; g < kv_group; g++) {
-                    const float *sp = Sp + g * DEC_FBC;
+                for (unsigned int j = 0; j < DEC_FBC_HG; j++) vreg[j] = Vs[(unsigned long long)j * hd + tid];
+                #pragma unroll
+                for (unsigned int g = 0; g < DEC_KVG_MAX; g++) {
+                    if (g >= kv_group) break;
+                    const float *sp = Sp + g * DEC_FBC_HG;
                     const float corr = corr_s[g];
                     float o = 0.0f;
                     #pragma unroll
-                    for (unsigned int j = 0; j < DEC_FBC; j++) {
+                    for (unsigned int j = 0; j < DEC_FBC_HG; j++) {
                         o += sp[j] * (float)vreg[j];
                     }
-                    Os[g * hd + tid] = Os[g * hd + tid] * corr + o;
+                    Oreg[g] = Oreg[g] * corr + o;
                 }
 #else
-                for (unsigned int g = 0; g < kv_group; g++) {
-                    const float *sp = Sp + g * DEC_FBC;
+                #pragma unroll
+                for (unsigned int g = 0; g < DEC_KVG_MAX; g++) {
+                    if (g >= kv_group) break;
+                    const float *sp = Sp + g * DEC_FBC_HG;
                     const float corr = corr_s[g];
                     float o = 0.0f;
                     #pragma unroll
-                    for (unsigned int j = 0; j < DEC_FBC; j++) {
+                    for (unsigned int j = 0; j < DEC_FBC_HG; j++) {
                         o += sp[j] * (float)Vs[(unsigned long long)j * hd + tid];
                     }
-                    Os[g * hd + tid] = Os[g * hd + tid] * corr + o;
+                    Oreg[g] = Oreg[g] * corr + o;
                 }
 #endif
             }
@@ -2335,10 +2371,14 @@ void gqa_attn_decode_partial_hg(
     }
 
     // --- write each group head's UNNORMALISED partial + (m, l) ---
-    for (unsigned int g = 0; g < kv_group; g++) {
+    // Oreg[g] is compile-time indexed (register-resident), so unroll over
+    // DEC_KVG_MAX and guard on the runtime kv_group.
+    #pragma unroll
+    for (unsigned int g = 0; g < DEC_KVG_MAX; g++) {
+        if (g >= kv_group) break;
         const unsigned int qh_idx = kh * kv_group + g;
         const unsigned long long po = ((unsigned long long)qh_idx * n_splits + s) * hd;
-        if (tid < hd) out_partial[po + tid] = Os[g * hd + tid];
+        if (tid < hd) out_partial[po + tid] = Oreg[g];
         if (tid == 0) {
             m_partial[(unsigned long long)qh_idx * n_splits + s] = m_s[g];
             l_partial[(unsigned long long)qh_idx * n_splits + s] = l_s[g];
