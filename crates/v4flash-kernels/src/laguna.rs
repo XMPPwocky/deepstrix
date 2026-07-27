@@ -255,6 +255,31 @@ impl LagunaOps {
         let cfg = LaunchConfig { grid: (n.div_ceil(block), 1, 1), block: (block, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(f, cfg, stream, [out.raw(), input.raw(), n])
     }
+
+    /// FP8 (e4m3fn) KV-cache quantize (LAGUNA_FP8_KV). Quantizes `n_rows`
+    /// contiguous f32 rows of `head_dim` (<=128) into 1-byte e4m3fn (`out`) plus
+    /// one f32 per-row symmetric scale (`scale`, `amax/448`). One WG per row.
+    pub fn quantize_fp8_kv(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<u8>,
+        scale: &mut DeviceBuffer<f32>,
+        input: &DeviceBuffer<f32>,
+        n_rows: u32,
+        head_dim: u32,
+    ) -> eyre::Result<()> {
+        debug_assert!(head_dim <= 128, "quantize_fp8_kv head_dim={head_dim} > 128");
+        let n = (n_rows * head_dim) as usize;
+        if out.len() < n || scale.len() < n_rows as usize || input.len() < n {
+            return Err(eyre!(
+                "quantize_fp8_kv len mismatch: n_rows={n_rows} head_dim={head_dim}, out={} scale={} in={}",
+                out.len(), scale.len(), input.len()
+            ));
+        }
+        let f = self.module.get_function("laguna_quantize_fp8_kv")?;
+        let cfg = LaunchConfig { grid: (n_rows, 1, 1), block: (128, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(f, cfg, stream, [out.raw(), scale.raw(), input.raw(), n_rows, head_dim])
+    }
 }
 
 // --------------------------------------------------------------------------

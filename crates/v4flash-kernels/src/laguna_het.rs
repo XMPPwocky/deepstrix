@@ -290,6 +290,16 @@ pub struct LagunaHetModel {
     kv_cap: Vec<usize>,
     kc: Vec<DeviceBuffer<u16>>,
     vc: Vec<DeviceBuffer<u16>>,
+    /// FP8 (e4m3fn) KV cache (LAGUNA_FP8_KV). When `fp8_kv`, K/V live here as
+    /// 1-byte e4m3fn + per-(token,kv_head) f32 scale sidecars, and `kc`/`vc`
+    /// above are 1-element dummies. Halves KV bytes (storage + the load traffic
+    /// ATT flagged as `s_wait_loadcnt`-bound). f16 default; fp8 flips both the
+    /// KV write (quantize) and the attention read (dequant) paths.
+    fp8_kv: bool,
+    kc8: Vec<DeviceBuffer<u8>>,
+    vc8: Vec<DeviceBuffer<u8>>,
+    kc8_scale: Vec<DeviceBuffer<f32>>,
+    vc8_scale: Vec<DeviceBuffer<f32>>,
     kv_len: usize,
 
     ds: DgpuScratch,
@@ -595,14 +605,41 @@ impl LagunaHetModel {
         // small ring buffer (SWA_RING_CAP rows, capped at max_kv for short ctx)
         // suffices. At 100K ctx this drops KV from ~19 GB to ~5 GB.
         let swa_cap = SWA_RING_CAP.min(max_kv);
+        // FP8 e4m3fn KV cache (LAGUNA_FP8_KV): store K/V as 1 byte + per-(token,
+        // kv_head) f32 scale instead of f16. Halves KV storage AND the
+        // load-bound byte traffic. f16 remains the default until proven.
+        let fp8_kv = std::env::var("LAGUNA_FP8_KV").as_deref() == Ok("1");
         let mut kv_cap = Vec::with_capacity(N_LAYER);
         let mut kc = Vec::with_capacity(N_LAYER);
         let mut vc = Vec::with_capacity(N_LAYER);
+        let mut kc8 = Vec::with_capacity(N_LAYER);
+        let mut vc8 = Vec::with_capacity(N_LAYER);
+        let mut kc8_scale = Vec::with_capacity(N_LAYER);
+        let mut vc8_scale = Vec::with_capacity(N_LAYER);
         for il in 0..N_LAYER {
             let cap = if il % 4 == 0 { max_kv } else { swa_cap };
             kv_cap.push(cap);
-            kc.push(DeviceBuffer::<u16>::new(dgpu.id, cap * N_KV_HEAD * HEAD_DIM)?);
-            vc.push(DeviceBuffer::<u16>::new(dgpu.id, cap * N_KV_HEAD * HEAD_DIM)?);
+            let elems = cap * N_KV_HEAD * HEAD_DIM;
+            let rows = cap * N_KV_HEAD;
+            if fp8_kv {
+                // e4m3fn bytes + f32 scale sidecar; f16 buffers are dummies.
+                kc8.push(DeviceBuffer::<u8>::new(dgpu.id, elems)?);
+                vc8.push(DeviceBuffer::<u8>::new(dgpu.id, elems)?);
+                kc8_scale.push(DeviceBuffer::<f32>::new(dgpu.id, rows)?);
+                vc8_scale.push(DeviceBuffer::<f32>::new(dgpu.id, rows)?);
+                kc.push(DeviceBuffer::<u16>::new(dgpu.id, 1)?);
+                vc.push(DeviceBuffer::<u16>::new(dgpu.id, 1)?);
+            } else {
+                kc.push(DeviceBuffer::<u16>::new(dgpu.id, elems)?);
+                vc.push(DeviceBuffer::<u16>::new(dgpu.id, elems)?);
+                kc8.push(DeviceBuffer::<u8>::new(dgpu.id, 1)?);
+                vc8.push(DeviceBuffer::<u8>::new(dgpu.id, 1)?);
+                kc8_scale.push(DeviceBuffer::<f32>::new(dgpu.id, 1)?);
+                vc8_scale.push(DeviceBuffer::<f32>::new(dgpu.id, 1)?);
+            }
+        }
+        if fp8_kv {
+            eprintln!("[laguna] LAGUNA_FP8_KV=1: KV cache is e4m3fn (1 byte/elem + per-row f32 scale)");
         }
 
         // --- dGPU scratch ---
@@ -725,6 +762,11 @@ impl LagunaHetModel {
             kv_cap,
             kc,
             vc,
+            fp8_kv,
+            kc8,
+            vc8,
+            kc8_scale,
+            vc8_scale,
             kv_len: 0,
             ds,
             is,
@@ -863,10 +905,22 @@ impl LagunaHetModel {
             {
                 // Ring write: physical slot = pos % cap (single row, never wraps).
                 let pslot = (pos % cap) * N_KV_HEAD * HEAD_DIM;
-                let mut kslot = self.kc[il].slice_view_mut(pslot, N_KV_HEAD * HEAD_DIM);
-                dk.ops.cast_f16(st, &mut kslot, &ds.kn, (N_KV_HEAD * HEAD_DIM) as u32)?;
-                let mut vslot = self.vc[il].slice_view_mut(pslot, N_KV_HEAD * HEAD_DIM);
-                dk.ops.cast_f16(st, &mut vslot, &ds.v, (N_KV_HEAD * HEAD_DIM) as u32)?;
+                if self.fp8_kv {
+                    // Quantize the 8 KV-head rows (128 dims each) to e4m3fn + per-row
+                    // scale. Scale sidecar row = (pos%cap)*N_KV_HEAD + kv_head.
+                    let pscale = (pos % cap) * N_KV_HEAD;
+                    let mut kb = self.kc8[il].slice_view_mut(pslot, N_KV_HEAD * HEAD_DIM);
+                    let mut ksc = self.kc8_scale[il].slice_view_mut(pscale, N_KV_HEAD);
+                    dk.ops.quantize_fp8_kv(st, &mut kb, &mut ksc, &ds.kn, N_KV_HEAD as u32, HEAD_DIM as u32)?;
+                    let mut vb = self.vc8[il].slice_view_mut(pslot, N_KV_HEAD * HEAD_DIM);
+                    let mut vsc = self.vc8_scale[il].slice_view_mut(pscale, N_KV_HEAD);
+                    dk.ops.quantize_fp8_kv(st, &mut vb, &mut vsc, &ds.v, N_KV_HEAD as u32, HEAD_DIM as u32)?;
+                } else {
+                    let mut kslot = self.kc[il].slice_view_mut(pslot, N_KV_HEAD * HEAD_DIM);
+                    dk.ops.cast_f16(st, &mut kslot, &ds.kn, (N_KV_HEAD * HEAD_DIM) as u32)?;
+                    let mut vslot = self.vc[il].slice_view_mut(pslot, N_KV_HEAD * HEAD_DIM);
+                    dk.ops.cast_f16(st, &mut vslot, &ds.v, (N_KV_HEAD * HEAD_DIM) as u32)?;
+                }
             }
             dk.ops.cast_f16(st, &mut ds.qf, &ds.qn, n_embd_q as u32)?;
             {
@@ -890,9 +944,27 @@ impl LagunaHetModel {
                 let attn_nkv = n_kv - k0;
                 let swa_win = if is_full || swa_off { 0u32 } else { SWA_WINDOW as u32 };
                 let qf_v = ds.qf.slice_view(0, n_embd_q);
+                let mut od_v = ds.od.slice_view_mut(0, n_embd_q);
+                let k_base = k0 as u32;
+                let capu = cap as u32;
+                if self.fp8_kv {
+                    // FP8 decode: dequant e4m3fn K/V (halved DRAM bytes) inside the
+                    // head-grouped split-KV kernel. All decode ctx uses splitkv_hg
+                    // (decode_flash_min_kv=16), so this single path covers it.
+                    let k8 = self.kc8[il].slice_view(0, cap * N_KV_HEAD * HEAD_DIM);
+                    let v8 = self.vc8[il].slice_view(0, cap * N_KV_HEAD * HEAD_DIM);
+                    let ks = self.kc8_scale[il].slice_view(0, cap * N_KV_HEAD);
+                    let vs = self.vc8_scale[il].slice_view(0, cap * N_KV_HEAD);
+                    let n_splits = crate::gqa_attention::decode_kv_splits_hg(attn_nkv as u32);
+                    dk.gqa.single_query_splitkv_hg_fp8(
+                        st, &mut od_v, &mut ds.attn_op, &mut ds.attn_mp, &mut ds.attn_lp,
+                        &qf_v, &k8, &v8, &ks, &vs,
+                        n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, attn_nkv as u32, n_splits, scale,
+                        k_base, capu,
+                    )?;
+                } else {
                 let k_v = self.kc[il].slice_view(0, cap * N_KV_HEAD * HEAD_DIM);
                 let v_v = self.vc[il].slice_view(0, cap * N_KV_HEAD * HEAD_DIM);
-                let mut od_v = ds.od.slice_view_mut(0, n_embd_q);
                 // Decode attention kernel selection. Default SPLIT-KV ("flash
                 // decoding"): partitions the causal history across n_head*n_splits
                 // workgroups so the dGPU is filled and each WG's serial key-tile
@@ -904,11 +976,6 @@ impl LagunaHetModel {
                 use crate::gqa_attention::DecodeAttn;
                 let decode_flash_min_kv = crate::gqa_attention::decode_flash_min_kv();
                 let variant = crate::gqa_attention::decode_attn_variant();
-                // k_base = k0 (absolute start of the windowed key range); the split
-                // math stays over the relative count attn_nkv, mapped to physical
-                // (k0 + rel) % cap in the kernel.
-                let k_base = k0 as u32;
-                let capu = cap as u32;
                 if variant == DecodeAttn::Naive || attn_nkv < decode_flash_min_kv {
                     dk.gqa.single_query(
                         st, &mut od_v, &qf_v, &k_v, &v_v,
@@ -942,6 +1009,7 @@ impl LagunaHetModel {
                         n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, attn_nkv as u32, n_splits, scale,
                         k_base, capu,
                     )?;
+                }
                 }
             }
             if pv {
@@ -1444,20 +1512,46 @@ impl LagunaHetModel {
             {
                 let phys0 = q_offset % cap;
                 let first = (cap - phys0).min(b); // rows written before the wrap
-                let mut kslot = self.kc[il].slice_view_mut(phys0 * kv_stride, first * kv_stride);
-                let kn_v = ps.kn.slice_view(0, first * kv_stride);
-                dk.ops.cast_f16(st, &mut kslot, &kn_v, (first * kv_stride) as u32)?;
-                let mut vslot = self.vc[il].slice_view_mut(phys0 * kv_stride, first * kv_stride);
-                let v_v = ps.v.slice_view(0, first * kv_stride);
-                dk.ops.cast_f16(st, &mut vslot, &v_v, (first * kv_stride) as u32)?;
-                if first < b {
-                    let rem = b - first; // wrapped rows at physical row 0
-                    let mut kslot2 = self.kc[il].slice_view_mut(0, rem * kv_stride);
-                    let kn_v2 = ps.kn.slice_view(first * kv_stride, rem * kv_stride);
-                    dk.ops.cast_f16(st, &mut kslot2, &kn_v2, (rem * kv_stride) as u32)?;
-                    let mut vslot2 = self.vc[il].slice_view_mut(0, rem * kv_stride);
-                    let v_v2 = ps.v.slice_view(first * kv_stride, rem * kv_stride);
-                    dk.ops.cast_f16(st, &mut vslot2, &v_v2, (rem * kv_stride) as u32)?;
+                if self.fp8_kv {
+                    // Quantize the whole batch's K/V to e4m3fn + per-(token,kv_head)
+                    // scale. Each of `first`*N_KV_HEAD rows (128 dims) gets its own
+                    // scale; the wrap tail (if any) restarts at physical row 0.
+                    // First segment [0, first) -> physical rows [phys0, phys0+first).
+                    let mut kb = self.kc8[il].slice_view_mut(phys0 * kv_stride, first * kv_stride);
+                    let mut ks = self.kc8_scale[il].slice_view_mut(phys0 * N_KV_HEAD, first * N_KV_HEAD);
+                    let kn_v = ps.kn.slice_view(0, first * kv_stride);
+                    dk.ops.quantize_fp8_kv(st, &mut kb, &mut ks, &kn_v, (first * N_KV_HEAD) as u32, HEAD_DIM as u32)?;
+                    let mut vb = self.vc8[il].slice_view_mut(phys0 * kv_stride, first * kv_stride);
+                    let mut vs = self.vc8_scale[il].slice_view_mut(phys0 * N_KV_HEAD, first * N_KV_HEAD);
+                    let v_v = ps.v.slice_view(0, first * kv_stride);
+                    dk.ops.quantize_fp8_kv(st, &mut vb, &mut vs, &v_v, (first * N_KV_HEAD) as u32, HEAD_DIM as u32)?;
+                    if first < b {
+                        let rem = b - first;
+                        let mut kb2 = self.kc8[il].slice_view_mut(0, rem * kv_stride);
+                        let mut ks2 = self.kc8_scale[il].slice_view_mut(0, rem * N_KV_HEAD);
+                        let kn_v2 = ps.kn.slice_view(first * kv_stride, rem * kv_stride);
+                        dk.ops.quantize_fp8_kv(st, &mut kb2, &mut ks2, &kn_v2, (rem * N_KV_HEAD) as u32, HEAD_DIM as u32)?;
+                        let mut vb2 = self.vc8[il].slice_view_mut(0, rem * kv_stride);
+                        let mut vs2 = self.vc8_scale[il].slice_view_mut(0, rem * N_KV_HEAD);
+                        let v_v2 = ps.v.slice_view(first * kv_stride, rem * kv_stride);
+                        dk.ops.quantize_fp8_kv(st, &mut vb2, &mut vs2, &v_v2, (rem * N_KV_HEAD) as u32, HEAD_DIM as u32)?;
+                    }
+                } else {
+                    let mut kslot = self.kc[il].slice_view_mut(phys0 * kv_stride, first * kv_stride);
+                    let kn_v = ps.kn.slice_view(0, first * kv_stride);
+                    dk.ops.cast_f16(st, &mut kslot, &kn_v, (first * kv_stride) as u32)?;
+                    let mut vslot = self.vc[il].slice_view_mut(phys0 * kv_stride, first * kv_stride);
+                    let v_v = ps.v.slice_view(0, first * kv_stride);
+                    dk.ops.cast_f16(st, &mut vslot, &v_v, (first * kv_stride) as u32)?;
+                    if first < b {
+                        let rem = b - first; // wrapped rows at physical row 0
+                        let mut kslot2 = self.kc[il].slice_view_mut(0, rem * kv_stride);
+                        let kn_v2 = ps.kn.slice_view(first * kv_stride, rem * kv_stride);
+                        dk.ops.cast_f16(st, &mut kslot2, &kn_v2, (rem * kv_stride) as u32)?;
+                        let mut vslot2 = self.vc[il].slice_view_mut(0, rem * kv_stride);
+                        let v_v2 = ps.v.slice_view(first * kv_stride, rem * kv_stride);
+                        dk.ops.cast_f16(st, &mut vslot2, &v_v2, (rem * kv_stride) as u32)?;
+                    }
                 }
             }
             {
@@ -1472,9 +1566,33 @@ impl LagunaHetModel {
                 // keys by the logical n_kv_total and maps absolute key -> physical
                 // key % cap. For global layers cap==max_kv >= n_kv_total, so this is
                 // the same memory the pre-ring path read (byte-identical).
+                let mut od_v = ps.od.slice_view_mut(0, b * n_embd_q);
+                if self.fp8_kv {
+                    // FP8 prefill: dequant e4m3fn K/V inside the WMMA kernels. Always
+                    // route through WMMA (hg for global O(L²) layers, fa2 for SWA) —
+                    // the scalar/naive small-ctx kernels have no fp8 variant, and WMMA
+                    // is bounds-guarded for any batch/ctx. swa mirrors the f16 path.
+                    const SWA_WINDOW_P: u32 = 512;
+                    let swa_off_p = std::env::var("LAGUNA_SWA_OFF").as_deref() == Ok("1");
+                    let swa_p = if is_full || swa_off_p { 0u32 } else { SWA_WINDOW_P };
+                    let k8 = self.kc8[il].slice_view(0, cap * kv_stride);
+                    let v8 = self.vc8[il].slice_view(0, cap * kv_stride);
+                    let ks = self.kc8_scale[il].slice_view(0, cap * N_KV_HEAD);
+                    let vs = self.vc8_scale[il].slice_view(0, cap * N_KV_HEAD);
+                    if is_full && std::env::var("LAGUNA_ATTN_HG").as_deref() != Ok("0") {
+                        dk.gqa.prefill_flash_wmma_fa2_hg_fp8(
+                            st, &mut od_v, &qf_v, &k8, &v8, &ks, &vs,
+                            bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa_p, cap as u32,
+                        )?;
+                    } else {
+                        dk.gqa.prefill_flash_wmma_fa2_fp8(
+                            st, &mut od_v, &qf_v, &k8, &v8, &ks, &vs,
+                            bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa_p, cap as u32,
+                        )?;
+                    }
+                } else {
                 let k_v = self.kc[il].slice_view(0, cap * kv_stride);
                 let v_v = self.vc[il].slice_view(0, cap * kv_stride);
-                let mut od_v = ps.od.slice_view_mut(0, b * n_embd_q);
                 // Flash-tiled prefill attention (K/V-reuse, one barrier per key
                 // tile) by default; LAGUNA_ATTN_NAIVE=1 restores the naive
                 // per-query kernel for A/B benchmarking.
@@ -1555,6 +1673,7 @@ impl LagunaHetModel {
                         st, &mut od_v, &qf_v, &k_v, &v_v,
                         bu, n_head as u32, N_KV_HEAD as u32, HEAD_DIM as u32, q_offset as u32, scale, swa, cap as u32,
                     )?;
+                }
                 }
             }
             // softplus gate over [B*n_head] logits, applied to od[B*n_head, head_dim].

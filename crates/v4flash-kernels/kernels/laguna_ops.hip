@@ -485,6 +485,92 @@ extern "C" __global__ void laguna_cast_f32_f16(
 }
 
 // --------------------------------------------------------------------------
+// FP8 (e4m3fn) KV-cache quantize (LAGUNA_FP8_KV write path). Quantizes `n_rows`
+// contiguous f32 rows of `head_dim` (<=128) into real 1-byte e4m3fn + one f32
+// per-row scale = amax/448 (symmetric, per-(token,kv_head) granularity — robust
+// to per-vector outliers, self-contained, no calibration). Encoding matches
+// fp8_e4m3fn.hip / compressed-tensors. On gfx1200/1201 uses the NATIVE packed
+// VOP3 convert `__builtin_amdgcn_cvt_pk_fp8_f32` (round-to-nearest-even, verified
+// vs the LUT); avoids the VOP1 erratum. Portable LUT fallback for other arches.
+//   grid: (n_rows,1,1)  block: (128,1,1); one WG per (token,kv_head) row.
+// --------------------------------------------------------------------------
+#if !(defined(__gfx1200__) || defined(__gfx1201__))
+__constant__ float c_lg_e4m3fn_values[128] = {
+    0.0f, 0.001953125f, 0.00390625f, 0.005859375f, 0.0078125f, 0.009765625f, 0.01171875f, 0.013671875f,
+    0.015625f, 0.017578125f, 0.01953125f, 0.021484375f, 0.0234375f, 0.025390625f, 0.02734375f, 0.029296875f,
+    0.03125f, 0.03515625f, 0.0390625f, 0.04296875f, 0.046875f, 0.05078125f, 0.0546875f, 0.05859375f,
+    0.0625f, 0.0703125f, 0.078125f, 0.0859375f, 0.09375f, 0.1015625f, 0.109375f, 0.1171875f,
+    0.125f, 0.140625f, 0.15625f, 0.171875f, 0.1875f, 0.203125f, 0.21875f, 0.234375f,
+    0.25f, 0.28125f, 0.3125f, 0.34375f, 0.375f, 0.40625f, 0.4375f, 0.46875f,
+    0.5f, 0.5625f, 0.625f, 0.6875f, 0.75f, 0.8125f, 0.875f, 0.9375f,
+    1.0f, 1.125f, 1.25f, 1.375f, 1.5f, 1.625f, 1.75f, 1.875f,
+    2.0f, 2.25f, 2.5f, 2.75f, 3.0f, 3.25f, 3.5f, 3.75f,
+    4.0f, 4.5f, 5.0f, 5.5f, 6.0f, 6.5f, 7.0f, 7.5f,
+    8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,
+    16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 28.0f, 30.0f,
+    32.0f, 36.0f, 40.0f, 44.0f, 48.0f, 52.0f, 56.0f, 60.0f,
+    64.0f, 72.0f, 80.0f, 88.0f, 96.0f, 104.0f, 112.0f, 120.0f,
+    128.0f, 144.0f, 160.0f, 176.0f, 192.0f, 208.0f, 224.0f, 240.0f,
+    256.0f, 288.0f, 320.0f, 352.0f, 384.0f, 416.0f, 448.0f, 0.0f,
+};
+#endif
+
+static __device__ __forceinline__ unsigned char laguna_f32_to_fp8(float x) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    int packed = __builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, 0, false);
+    return (unsigned char)(packed & 0xff);
+#else
+    // Nearest-value binary search over the magnitude table; returns index|sign.
+    const unsigned int sgn = (x < 0.0f) ? 0x80u : 0x00u;
+    float ax = fabsf(x);
+    if (ax > 448.0f) ax = 448.0f;
+    int lo = 0, hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (c_lg_e4m3fn_values[mid] <= ax) lo = mid; else hi = mid - 1;
+    }
+    int best = lo;
+    if (best < 126) {
+        const float bd = fabsf(ax - c_lg_e4m3fn_values[best]);
+        const float nd = fabsf(ax - c_lg_e4m3fn_values[best + 1]);
+        if (nd < bd) best++;
+    }
+    return (unsigned char)((unsigned int)best | sgn);
+#endif
+}
+
+extern "C" __global__ void laguna_quantize_fp8_kv(
+        unsigned char * __restrict__ out,   // [n_rows, head_dim] e4m3fn bytes
+        float         * __restrict__ scale, // [n_rows] per-row f32 scale
+        const float   * __restrict__ in,    // [n_rows, head_dim] f32
+        unsigned int    n_rows,
+        unsigned int    head_dim) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int t   = threadIdx.x;
+    if (row >= n_rows) return;
+    const float * r = in + (unsigned long long)row * head_dim;
+
+    __shared__ float red[128];
+    const float v = (t < head_dim) ? r[t] : 0.0f;
+    red[t] = (t < head_dim) ? fabsf(v) : 0.0f;
+    __syncthreads();
+    for (unsigned int s = 64u; s > 0u; s >>= 1) {
+        if (t < s) { const float o = red[t + s]; if (o > red[t]) red[t] = o; }
+        __syncthreads();
+    }
+    // Per-row symmetric scale = amax/448 (floored to avoid div-by-zero rows).
+    float sc = red[0] * (1.0f / 448.0f);
+    if (sc < 1.0e-12f) sc = 1.0e-12f;
+    if (t == 0) scale[row] = sc;
+    if (t < head_dim) {
+        float q = v / sc;
+        if (q > 448.0f) q = 448.0f;
+        if (q < -448.0f) q = -448.0f;
+        out[(unsigned long long)row * head_dim + t] = laguna_f32_to_fp8(q);
+    }
+}
+
+// --------------------------------------------------------------------------
 // 4. Fused per-head QK RMSNorm. Normalizes each head's `head_dim` slice by its
 //    OWN RMS and scales by a shared `weight[head_dim]` — replacing the 72 (Q) +
 //    8 (K) per-slice `rms_norm_weighted` launches with a single grid launch.

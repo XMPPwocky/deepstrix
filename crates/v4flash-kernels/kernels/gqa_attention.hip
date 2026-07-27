@@ -529,6 +529,76 @@ void gqa_attn_prefill_flash(
 typedef _Float16 gqa_half8  __attribute__((ext_vector_type(8)));
 typedef float     gqa_float8 __attribute__((ext_vector_type(8)));
 
+// =============================================================================
+// FP8 (e4m3fn) KV-cache dequant helper (LAGUNA_FP8_KV). K/V are stored as real
+// 1-byte e4m3fn + a per-(token,kv_head) f32 scale sidecar; the attention read
+// dequants back to f16 during LDS/register staging, halving the KV DRAM bytes
+// (the `s_wait_loadcnt`-bound load traffic) that ATT flagged.
+//
+// On gfx1200/1201 we use the NATIVE packed VOP3 convert
+// `__builtin_amdgcn_cvt_pk_f32_fp8` — verified bit-exact vs the ds4/
+// compressed-tensors e4m3fn table over all 254 finite bytes. We deliberately
+// avoid the VOP1 single-operand `cvt_f32_fp8` (erratum `cvt-fp8-vop1-bug`) and
+// the scale-fused form (intrinsic name absent in this toolchain; scale is
+// folded in software instead). The LUT is the portable fallback / reference for
+// other arches (these kernels never launch on the iGPU but must still compile).
+// =============================================================================
+typedef float gqa_v2f __attribute__((ext_vector_type(2)));
+
+#if !(defined(__gfx1200__) || defined(__gfx1201__))
+__constant__ float c_gqa_e4m3fn_values[128] = {
+    0.0f, 0.001953125f, 0.00390625f, 0.005859375f,
+    0.0078125f, 0.009765625f, 0.01171875f, 0.013671875f,
+    0.015625f, 0.017578125f, 0.01953125f, 0.021484375f,
+    0.0234375f, 0.025390625f, 0.02734375f, 0.029296875f,
+    0.03125f, 0.03515625f, 0.0390625f, 0.04296875f,
+    0.046875f, 0.05078125f, 0.0546875f, 0.05859375f,
+    0.0625f, 0.0703125f, 0.078125f, 0.0859375f,
+    0.09375f, 0.1015625f, 0.109375f, 0.1171875f,
+    0.125f, 0.140625f, 0.15625f, 0.171875f,
+    0.1875f, 0.203125f, 0.21875f, 0.234375f,
+    0.25f, 0.28125f, 0.3125f, 0.34375f,
+    0.375f, 0.40625f, 0.4375f, 0.46875f,
+    0.5f, 0.5625f, 0.625f, 0.6875f,
+    0.75f, 0.8125f, 0.875f, 0.9375f,
+    1.0f, 1.125f, 1.25f, 1.375f,
+    1.5f, 1.625f, 1.75f, 1.875f,
+    2.0f, 2.25f, 2.5f, 2.75f,
+    3.0f, 3.25f, 3.5f, 3.75f,
+    4.0f, 4.5f, 5.0f, 5.5f,
+    6.0f, 6.5f, 7.0f, 7.5f,
+    8.0f, 9.0f, 10.0f, 11.0f,
+    12.0f, 13.0f, 14.0f, 15.0f,
+    16.0f, 18.0f, 20.0f, 22.0f,
+    24.0f, 26.0f, 28.0f, 30.0f,
+    32.0f, 36.0f, 40.0f, 44.0f,
+    48.0f, 52.0f, 56.0f, 60.0f,
+    64.0f, 72.0f, 80.0f, 88.0f,
+    96.0f, 104.0f, 112.0f, 120.0f,
+    128.0f, 144.0f, 160.0f, 176.0f,
+    192.0f, 208.0f, 224.0f, 240.0f,
+    256.0f, 288.0f, 320.0f, 352.0f,
+    384.0f, 416.0f, 448.0f, 0.0f,
+};
+#endif
+
+static __device__ __forceinline__ float gqa_fp8_to_f32(unsigned char b) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    gqa_v2f r = __builtin_amdgcn_cvt_pk_f32_fp8((int)(unsigned int)b, false);
+    return r[0];
+#else
+    const float sign = (b & 0x80u) ? -1.0f : 1.0f;
+    return sign * c_gqa_e4m3fn_values[b & 0x7fu];
+#endif
+}
+
+// Dequant one e4m3fn byte at `off` and apply the row scale at `srow`.
+static __device__ __forceinline__ _Float16 gqa_deq_fp8(
+        const unsigned char * __restrict__ c, unsigned long long off,
+        const float * __restrict__ scale, unsigned long long srow) {
+    return (_Float16)(gqa_fp8_to_f32(c[off]) * scale[srow]);
+}
+
 #define WFBR   32u
 #define WFBC   32u
 #define WFD    128u   // max head_dim this WMMA flash kernel's static LDS supports
@@ -822,12 +892,17 @@ void gqa_attn_prefill_flash_wmma(
 // LDS: Qs/Ks/Vs (3×8K f16) + Ps (2K f16) + Sp (4K f32) + m/l/corr ≈ 30.4 KB.
 //   grid: (n_head, ceil(B/WFBR), 1)   block: (128, 1, 1)
 // =============================================================================
-extern "C" __global__ __launch_bounds__(WBLOCK)
-void gqa_attn_prefill_flash_wmma_fa2(
+// Shared core. FP8=false: k/v_cache_v are const _Float16*, k/v_scale unused.
+// FP8=true: k/v_cache_v are const uint8_t* e4m3fn, dequant with per-(row,kvhead)
+// scale from k/v_scale during LDS staging (all downstream math is f16, identical).
+template<bool FP8> static __device__ __forceinline__
+void gqa_attn_prefill_flash_wmma_fa2_core(
         float          * __restrict__ out,         // [B, n_head, head_dim]
         const _Float16 * __restrict__ q,           // [B, n_head, head_dim]
-        const _Float16 * __restrict__ k_cache,     // [n_kv_total, n_kv_head, head_dim]
-        const _Float16 * __restrict__ v_cache,     // [n_kv_total, n_kv_head, head_dim]
+        const void     * __restrict__ k_cache_v,   // f16 or e4m3fn [n_kv_total, n_kv_head, head_dim]
+        const void     * __restrict__ v_cache_v,
+        const float    * __restrict__ k_scale,     // [n_kv_total, n_kv_head] (FP8 only)
+        const float    * __restrict__ v_scale,
         unsigned int     n_head,
         unsigned int     n_kv_head,
         unsigned int     head_dim,
@@ -838,6 +913,10 @@ void gqa_attn_prefill_flash_wmma_fa2(
         unsigned int     swa_window,     // 0 = full causal; else sliding window
         unsigned int     kv_capacity,    // ring size: physical row = key_g % kv_capacity
         unsigned int     grid_mode) {    // 0=(head,qtile); 1=KV-first (Infinity-Cache locality)
+    const _Float16      * __restrict__ k_cache = (const _Float16*)k_cache_v;
+    const _Float16      * __restrict__ v_cache = (const _Float16*)v_cache_v;
+    const unsigned char * __restrict__ k_cache8 = (const unsigned char*)k_cache_v;
+    const unsigned char * __restrict__ v_cache8 = (const unsigned char*)v_cache_v;
     // grid_mode 1 remaps the block index so ALL query heads + query-tiles that
     // share one KV head are enumerated by CONSECUTIVE linear block ids (KV head =
     // blockIdx.y, the slow dimension). The HW dispatches blocks roughly in linear
@@ -930,9 +1009,16 @@ void gqa_attn_prefill_flash_wmma_fa2(
             if (key_g < n_kv_total && d < hd) {
                 // Ring-buffer physical row (identity for global: kv_capacity=max_kv,
                 // key_g<n_kv_total<=max_kv). Only the row index wraps; kvh_off+d unchanged.
-                const unsigned long long off = (unsigned long long)(key_g % kv_capacity) * row_stride + kvh_off + d;
-                Ks[p] = k_cache[off];
-                Vs[p] = v_cache[off];
+                const unsigned long long phys = (unsigned long long)(key_g % kv_capacity);
+                const unsigned long long off = phys * row_stride + kvh_off + d;
+                if constexpr (FP8) {
+                    const unsigned long long srow = phys * n_kv_head + kv_head;
+                    Ks[p] = gqa_deq_fp8(k_cache8, off, k_scale, srow);
+                    Vs[p] = gqa_deq_fp8(v_cache8, off, v_scale, srow);
+                } else {
+                    Ks[p] = k_cache[off];
+                    Vs[p] = v_cache[off];
+                }
             } else {
                 Ks[p] = (_Float16)0.0f;
                 Vs[p] = (_Float16)0.0f;
@@ -1120,6 +1206,29 @@ void gqa_attn_prefill_flash_wmma_fa2(
 #endif
 }
 
+// f16 (default) + fp8 e4m3fn KV wrappers around the shared fa2 core.
+extern "C" __global__ __launch_bounds__(WBLOCK)
+void gqa_attn_prefill_flash_wmma_fa2(
+        float * __restrict__ out, const _Float16 * __restrict__ q,
+        const _Float16 * __restrict__ k_cache, const _Float16 * __restrict__ v_cache,
+        unsigned int n_head, unsigned int n_kv_head, unsigned int head_dim,
+        unsigned int q_offset, unsigned int batch, unsigned int n_kv_total,
+        float scale, unsigned int swa_window, unsigned int kv_capacity, unsigned int grid_mode) {
+    gqa_attn_prefill_flash_wmma_fa2_core<false>(out, q, k_cache, v_cache, nullptr, nullptr,
+        n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window, kv_capacity, grid_mode);
+}
+extern "C" __global__ __launch_bounds__(WBLOCK)
+void gqa_attn_prefill_flash_wmma_fa2_fp8(
+        float * __restrict__ out, const _Float16 * __restrict__ q,
+        const unsigned char * __restrict__ k_cache, const unsigned char * __restrict__ v_cache,
+        const float * __restrict__ k_scale, const float * __restrict__ v_scale,
+        unsigned int n_head, unsigned int n_kv_head, unsigned int head_dim,
+        unsigned int q_offset, unsigned int batch, unsigned int n_kv_total,
+        float scale, unsigned int swa_window, unsigned int kv_capacity, unsigned int grid_mode) {
+    gqa_attn_prefill_flash_wmma_fa2_core<true>(out, q, k_cache, v_cache, k_scale, v_scale,
+        n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window, kv_capacity, grid_mode);
+}
+
 // =============================================================================
 // gqa_attn_prefill_flash_wmma_fa2_hg — HEAD-GROUPED WMMA FA prefill.
 //
@@ -1136,12 +1245,14 @@ void gqa_attn_prefill_flash_wmma_fa2(
 // wave occupancy. head_dim == WFD(128). Requires kv_group % HG_G == 0.
 //   grid: (n_kv_head * (kv_group/HG_G), ceil(B/HG_BR), 1)   block: (256,1,1)
 // =============================================================================
-extern "C" __global__ __launch_bounds__(HG_BLOCK)
-void gqa_attn_prefill_flash_wmma_fa2_hg(
+template<bool FP8> static __device__ __forceinline__
+void gqa_attn_prefill_flash_wmma_fa2_hg_core(
         float          * __restrict__ out,         // [B, n_head, head_dim]
         const _Float16 * __restrict__ q,           // [B, n_head, head_dim]
-        const _Float16 * __restrict__ k_cache,     // [n_kv_total, n_kv_head, head_dim]
-        const _Float16 * __restrict__ v_cache,     // [n_kv_total, n_kv_head, head_dim]
+        const void     * __restrict__ k_cache_v,   // f16 or e4m3fn [n_kv_total, n_kv_head, head_dim]
+        const void     * __restrict__ v_cache_v,
+        const float    * __restrict__ k_scale,     // [n_kv_total, n_kv_head] (FP8 only)
+        const float    * __restrict__ v_scale,
         unsigned int     n_head,
         unsigned int     n_kv_head,
         unsigned int     head_dim,
@@ -1151,6 +1262,10 @@ void gqa_attn_prefill_flash_wmma_fa2_hg(
         float            scale,
         unsigned int     swa_window,     // 0 = full causal; else sliding window
         unsigned int     kv_capacity) {  // ring size: physical row = key_g % kv_capacity
+    const _Float16      * __restrict__ k_cache = (const _Float16*)k_cache_v;
+    const _Float16      * __restrict__ v_cache = (const _Float16*)v_cache_v;
+    const unsigned char * __restrict__ k_cache8 = (const unsigned char*)k_cache_v;
+    const unsigned char * __restrict__ v_cache8 = (const unsigned char*)v_cache_v;
 #if defined(__gfx1200__) || defined(__gfx1201__)
     const unsigned int tid = threadIdx.x;
     const unsigned int lane = tid & 31u;
@@ -1251,10 +1366,16 @@ void gqa_attn_prefill_flash_wmma_fa2_hg(
             const unsigned int _d  = _p % WFD;                                       \
             const unsigned int _kg = _kbase + _j;                                    \
             if (_kg < n_kv_total && _d < hd) {                                       \
-                const unsigned long long _off =                                      \
-                    (unsigned long long)(_kg % kv_capacity) * row_stride + kvh_off + _d; \
-                kbuf[SLOT][_i] = k_cache[_off];                                      \
-                vbuf[SLOT][_i] = v_cache[_off];                                      \
+                const unsigned long long _phys = (unsigned long long)(_kg % kv_capacity); \
+                const unsigned long long _off = _phys * row_stride + kvh_off + _d;   \
+                if constexpr (FP8) {                                                 \
+                    const unsigned long long _sr = _phys * n_kv_head + kv_head;      \
+                    kbuf[SLOT][_i] = gqa_deq_fp8(k_cache8, _off, k_scale, _sr);      \
+                    vbuf[SLOT][_i] = gqa_deq_fp8(v_cache8, _off, v_scale, _sr);      \
+                } else {                                                            \
+                    kbuf[SLOT][_i] = k_cache[_off];                                  \
+                    vbuf[SLOT][_i] = v_cache[_off];                                  \
+                }                                                                    \
             } else { kbuf[SLOT][_i] = (_Float16)0.0f; vbuf[SLOT][_i] = (_Float16)0.0f; } \
         }                                                                            \
     } while (0)
@@ -1299,9 +1420,16 @@ void gqa_attn_prefill_flash_wmma_fa2_hg(
             const unsigned int d = p % WFD;
             const unsigned int key_g = key_base + j;
             if (key_g < n_kv_total && d < hd) {
-                const unsigned long long off = (unsigned long long)(key_g % kv_capacity) * row_stride + kvh_off + d;
-                Ks[p] = k_cache[off];
-                Vs[p] = v_cache[off];
+                const unsigned long long phys = (unsigned long long)(key_g % kv_capacity);
+                const unsigned long long off = phys * row_stride + kvh_off + d;
+                if constexpr (FP8) {
+                    const unsigned long long srow = phys * n_kv_head + kv_head;
+                    Ks[p] = gqa_deq_fp8(k_cache8, off, k_scale, srow);
+                    Vs[p] = gqa_deq_fp8(v_cache8, off, v_scale, srow);
+                } else {
+                    Ks[p] = k_cache[off];
+                    Vs[p] = v_cache[off];
+                }
             } else {
                 Ks[p] = (_Float16)0.0f;
                 Vs[p] = (_Float16)0.0f;
@@ -1471,6 +1599,29 @@ void gqa_attn_prefill_flash_wmma_fa2_hg(
         }
     }
 #endif
+}
+
+// f16 (default) + fp8 e4m3fn KV wrappers around the shared fa2_hg core.
+extern "C" __global__ __launch_bounds__(HG_BLOCK)
+void gqa_attn_prefill_flash_wmma_fa2_hg(
+        float * __restrict__ out, const _Float16 * __restrict__ q,
+        const _Float16 * __restrict__ k_cache, const _Float16 * __restrict__ v_cache,
+        unsigned int n_head, unsigned int n_kv_head, unsigned int head_dim,
+        unsigned int q_offset, unsigned int batch, unsigned int n_kv_total,
+        float scale, unsigned int swa_window, unsigned int kv_capacity) {
+    gqa_attn_prefill_flash_wmma_fa2_hg_core<false>(out, q, k_cache, v_cache, nullptr, nullptr,
+        n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window, kv_capacity);
+}
+extern "C" __global__ __launch_bounds__(HG_BLOCK)
+void gqa_attn_prefill_flash_wmma_fa2_hg_fp8(
+        float * __restrict__ out, const _Float16 * __restrict__ q,
+        const unsigned char * __restrict__ k_cache, const unsigned char * __restrict__ v_cache,
+        const float * __restrict__ k_scale, const float * __restrict__ v_scale,
+        unsigned int n_head, unsigned int n_kv_head, unsigned int head_dim,
+        unsigned int q_offset, unsigned int batch, unsigned int n_kv_total,
+        float scale, unsigned int swa_window, unsigned int kv_capacity) {
+    gqa_attn_prefill_flash_wmma_fa2_hg_core<true>(out, q, k_cache, v_cache, k_scale, v_scale,
+        n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window, kv_capacity);
 }
 
 // =============================================================================
@@ -1999,14 +2150,16 @@ void gqa_attn_decode_partial(
 // =============================================================================
 #define DEC_KVG_MAX 12u   // max kv_group (Laguna SWA = 72/8 = 9)
 
-extern "C" __global__ __launch_bounds__(DEC_BLOCK)
-void gqa_attn_decode_partial_hg(
+template<bool FP8> static __device__ __forceinline__
+void gqa_attn_decode_partial_hg_core(
         float          * __restrict__ out_partial,  // [n_head, n_splits, head_dim]
         float          * __restrict__ m_partial,    // [n_head, n_splits]
         float          * __restrict__ l_partial,    // [n_head, n_splits]
         const _Float16 * __restrict__ q,            // [n_head, head_dim]
-        const _Float16 * __restrict__ k_cache,      // [n_kv, n_kv_head, head_dim]
-        const _Float16 * __restrict__ v_cache,      // [n_kv, n_kv_head, head_dim]
+        const void     * __restrict__ k_cache_v,    // f16 or e4m3fn [n_kv, n_kv_head, head_dim]
+        const void     * __restrict__ v_cache_v,
+        const float    * __restrict__ k_scale,      // [n_kv, n_kv_head] (FP8 only)
+        const float    * __restrict__ v_scale,
         unsigned int     n_head,
         unsigned int     n_kv_head,
         unsigned int     head_dim,
@@ -2015,6 +2168,10 @@ void gqa_attn_decode_partial_hg(
         float            scale,
         unsigned int     k_base,        // absolute position of relative key 0 (SWA window start)
         unsigned int     kv_capacity) { // ring size: physical row = (k_base+key_g) % kv_capacity
+    const _Float16      * __restrict__ k_cache = (const _Float16*)k_cache_v;
+    const _Float16      * __restrict__ v_cache = (const _Float16*)v_cache_v;
+    const unsigned char * __restrict__ k_cache8 = (const unsigned char*)k_cache_v;
+    const unsigned char * __restrict__ v_cache8 = (const unsigned char*)v_cache_v;
     const unsigned int kh  = blockIdx.x;   // KV head
     const unsigned int s   = blockIdx.y;   // split
     const unsigned int tid = threadIdx.x;
@@ -2106,9 +2263,13 @@ void gqa_attn_decode_partial_hg(
             const unsigned int _kg = (KB) + _j;                                          \
             _Float16 _kv = (_Float16)0.0f, _vv = (_Float16)0.0f;                         \
             if (_kg < k1) {                                                              \
-                const unsigned long long _off =                                          \
-                    (unsigned long long)((k_base + _kg) % kv_capacity) * row_stride + kvh_off + _d; \
-                _kv = k_cache[_off]; _vv = v_cache[_off];                                \
+                const unsigned long long _phys = (unsigned long long)((k_base + _kg) % kv_capacity); \
+                const unsigned long long _off = _phys * row_stride + kvh_off + _d;       \
+                if constexpr (FP8) {                                                     \
+                    const unsigned long long _sr = _phys * n_kv_head + kh;               \
+                    _kv = gqa_deq_fp8(k_cache8, _off, k_scale, _sr);                     \
+                    _vv = gqa_deq_fp8(v_cache8, _off, v_scale, _sr);                     \
+                } else { _kv = k_cache[_off]; _vv = v_cache[_off]; }                     \
             }                                                                            \
             kbuf[SLOT][(_i) >> 1][(_i) & 1u] = _kv;                                      \
             vbuf[SLOT][(_i) >> 1][(_i) & 1u] = _vv;                                      \
@@ -2176,10 +2337,30 @@ void gqa_attn_decode_partial_hg(
             const unsigned int _kg = (KB) + _j;                                          \
             dec_h8 _kv = {}, _vv = {};                                                   \
             if (_kg < k1) {                                                              \
-                const unsigned long long _off =                                          \
-                    (unsigned long long)((k_base + _kg) % kv_capacity) * row_stride + kvh_off + _d; \
-                _kv = *(const dec_h8 *)(k_cache + _off);                                 \
-                _vv = *(const dec_h8 *)(v_cache + _off);                                 \
+                const unsigned long long _phys = (unsigned long long)((k_base + _kg) % kv_capacity); \
+                const unsigned long long _off = _phys * row_stride + kvh_off + _d;       \
+                if constexpr (FP8) {                                                     \
+                    /* fp8: the 8-dim b128 chunk is within ONE key (_j), so all 8      */\
+                    /* bytes share the (_phys, kh) scale. _off is a multiple of 8      */\
+                    /* (row_stride,kvh_off,_d all %8==0) so the 8 e4m3fn bytes are one */\
+                    /* 64-bit COALESCED load; native packed convert does 2 f32/call    */\
+                    /* (avoids the 8×1-byte load-count trap that made fp8 slower).      */\
+                    const unsigned long long _sr = _phys * n_kv_head + kh;               \
+                    const float _ksc = k_scale[_sr];                                     \
+                    const float _vsc = v_scale[_sr];                                     \
+                    const uint2 _kw = *(const uint2 *)(k_cache8 + _off);                 \
+                    const uint2 _vw = *(const uint2 *)(v_cache8 + _off);                 \
+                    const unsigned char *_kb = (const unsigned char *)&_kw;              \
+                    const unsigned char *_vb = (const unsigned char *)&_vw;              \
+                    _Pragma("unroll")                                                    \
+                    for (unsigned int _e = 0; _e < 8u; ++_e) {                           \
+                        _kv[_e] = (_Float16)(gqa_fp8_to_f32(_kb[_e]) * _ksc);            \
+                        _vv[_e] = (_Float16)(gqa_fp8_to_f32(_vb[_e]) * _vsc);            \
+                    }                                                                    \
+                } else {                                                                \
+                    _kv = *(const dec_h8 *)(k_cache + _off);                             \
+                    _vv = *(const dec_h8 *)(v_cache + _off);                             \
+                }                                                                        \
             }                                                                            \
             kbuf[SLOT][_c] = _kv;                                                        \
             vbuf[SLOT][_c] = _vv;                                                        \
@@ -2233,9 +2414,16 @@ void gqa_attn_decode_partial_hg(
                     // Ring-buffer physical row: absolute pos = k_base + key_g (key_g is
                     // relative to the window start). Identity for global (k_base=0,
                     // kv_capacity=max_kv). key_g/k0/k1 stay relative for the split math.
-                    const unsigned long long off = (unsigned long long)((k_base + key_g) % kv_capacity) * row_stride + kvh_off + d;
-                    Ks[p] = k_cache[off];
-                    Vs[p] = v_cache[off];
+                    const unsigned long long phys = (unsigned long long)((k_base + key_g) % kv_capacity);
+                    const unsigned long long off = phys * row_stride + kvh_off + d;
+                    if constexpr (FP8) {
+                        const unsigned long long srow = phys * n_kv_head + kh;
+                        Ks[p] = gqa_deq_fp8(k_cache8, off, k_scale, srow);
+                        Vs[p] = gqa_deq_fp8(v_cache8, off, v_scale, srow);
+                    } else {
+                        Ks[p] = k_cache[off];
+                        Vs[p] = v_cache[off];
+                    }
                 } else {
                     Ks[p] = (_Float16)0.0f;
                     Vs[p] = (_Float16)0.0f;
@@ -2384,6 +2572,33 @@ void gqa_attn_decode_partial_hg(
             l_partial[(unsigned long long)qh_idx * n_splits + s] = l_s[g];
         }
     }
+}
+
+// f16 (default) + fp8 e4m3fn KV wrappers around the shared decode_partial_hg core.
+extern "C" __global__ __launch_bounds__(DEC_BLOCK)
+void gqa_attn_decode_partial_hg(
+        float * __restrict__ out_partial, float * __restrict__ m_partial, float * __restrict__ l_partial,
+        const _Float16 * __restrict__ q,
+        const _Float16 * __restrict__ k_cache, const _Float16 * __restrict__ v_cache,
+        unsigned int n_head, unsigned int n_kv_head, unsigned int head_dim,
+        unsigned int n_kv, unsigned int n_splits, float scale,
+        unsigned int k_base, unsigned int kv_capacity) {
+    gqa_attn_decode_partial_hg_core<false>(out_partial, m_partial, l_partial, q,
+        k_cache, v_cache, nullptr, nullptr,
+        n_head, n_kv_head, head_dim, n_kv, n_splits, scale, k_base, kv_capacity);
+}
+extern "C" __global__ __launch_bounds__(DEC_BLOCK)
+void gqa_attn_decode_partial_hg_fp8(
+        float * __restrict__ out_partial, float * __restrict__ m_partial, float * __restrict__ l_partial,
+        const _Float16 * __restrict__ q,
+        const unsigned char * __restrict__ k_cache, const unsigned char * __restrict__ v_cache,
+        const float * __restrict__ k_scale, const float * __restrict__ v_scale,
+        unsigned int n_head, unsigned int n_kv_head, unsigned int head_dim,
+        unsigned int n_kv, unsigned int n_splits, float scale,
+        unsigned int k_base, unsigned int kv_capacity) {
+    gqa_attn_decode_partial_hg_core<true>(out_partial, m_partial, l_partial, q,
+        k_cache, v_cache, k_scale, v_scale,
+        n_head, n_kv_head, head_dim, n_kv, n_splits, scale, k_base, kv_capacity);
 }
 
 // gqa_attn_decode_combine — merge the n_splits partials for each head into the
