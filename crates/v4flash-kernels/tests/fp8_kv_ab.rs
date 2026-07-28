@@ -148,7 +148,14 @@ fn fp8_kv_decode_timing() -> Result<()> {
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     const ITERS: usize = 60;
     const WARM: usize = 8;
-    for &n_kv in &[32768usize, 65536, 100000] {
+    // Contexts to time; override with e.g. FP8_AB_NKV=32768,196608
+    let nkv_list: Vec<usize> = std::env::var("FP8_AB_NKV")
+        .unwrap_or_else(|_| "32768,65536,100000,196608".to_string())
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().parse().expect("bad FP8_AB_NKV"))
+        .collect();
+    for n_kv in nkv_list {
         let mut rng = Lcg(0xabc ^ n_kv as u64);
         let mut q_bits = vec![0u16; n_head * head_dim];
         for b in q_bits.iter_mut() { *b = round_f16(rng.f()).0; }
@@ -196,7 +203,16 @@ fn fp8_kv_decode_timing() -> Result<()> {
             &d_q, &d_k8, &d_v8, &d_ks, &d_vs, n_head as u32, n_kv_head as u32, head_dim as u32, n_kv as u32, n_splits, scale, 0, n_kv as u32)?; }
         st.synchronize()?;
         let fp8us = t.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
+        // Achieved read BW: each kernel streams the whole K+V cache once.
+        // f16 = 2 B/elem; fp8 = 1 B/elem + the f32 per-(token,kv_head) scale sidecar.
+        let kv_elems = (n_kv * n_kv_head * head_dim) as f64;
+        let f16_bytes = kv_elems * 2.0 * 2.0;
+        let fp8_bytes = kv_elems * 1.0 * 2.0 + (n_kv * n_kv_head) as f64 * 4.0 * 2.0;
+        let gbs = |bytes: f64, us: f64| bytes / (us * 1e-6) / 1e9;
+        let (f16gbs, fp8gbs) = (gbs(f16_bytes, f16us), gbs(fp8_bytes, fp8us));
         eprintln!("  f16: {f16us:.1} us   fp8: {fp8us:.1} us   => fp8 {:.2}x ({:+.1}%)", f16us/fp8us, 100.0*(f16us-fp8us)/f16us);
+        eprintln!("  BW: f16 {f16gbs:.0} GB/s ({:.0}% of 600)   fp8 {fp8gbs:.0} GB/s ({:.0}% of 600)",
+            100.0*f16gbs/600.0, 100.0*fp8gbs/600.0);
     }
     Ok(())
 }
