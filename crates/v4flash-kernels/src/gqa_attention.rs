@@ -949,4 +949,200 @@ impl GqaAttention {
             n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window, kv_capacity
         ])
     }
+
+    // ==================== FP8 (e4m3fn) KV-cache variants ====================
+    // K/V cache is stored as 1-byte e4m3fn + per-(token,kv_head) f32 scale sidecar
+    // (LAGUNA_FP8_KV). Same math/launch geometry as the f16 wrappers; the kernels
+    // dequant during LDS/register staging via the native gfx1201 packed convert.
+
+    /// FP8 head-grouped WMMA FA prefill (global layers). Mirrors
+    /// [`prefill_flash_wmma_fa2_hg`] with e4m3fn K/V + scale sidecars.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_flash_wmma_fa2_hg_fp8(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<u16>,
+        k_cache: &DeviceBuffer<u8>,
+        v_cache: &DeviceBuffer<u8>,
+        k_scale: &DeviceBuffer<f32>,
+        v_scale: &DeviceBuffer<f32>,
+        batch: u32,
+        n_head: u32,
+        n_kv_head: u32,
+        head_dim: u32,
+        q_offset: u32,
+        scale: f32,
+        swa_window: u32,
+        kv_capacity: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_head == 0 || n_kv_head == 0 || head_dim == 0 {
+            return Err(eyre!("gqa flash wmma fa2 hg fp8: zero dim"));
+        }
+        if head_dim > FLASH_HEAD_DIM {
+            return Err(eyre!("gqa flash wmma fa2 hg fp8: head_dim={head_dim} > {FLASH_HEAD_DIM}"));
+        }
+        if n_head % n_kv_head != 0 {
+            return Err(eyre!("gqa flash wmma fa2 hg fp8: n_head={n_head} not div by n_kv_head={n_kv_head}"));
+        }
+        let kv_group = n_head / n_kv_head;
+        let flash_hg_g = flash_hg_g();
+        if kv_group % flash_hg_g != 0 {
+            return Err(eyre!("gqa flash wmma fa2 hg fp8: kv_group={kv_group} not div by HG_G={flash_hg_g}"));
+        }
+        let n_kv_total = q_offset + batch;
+        let want_q = (batch * n_head * head_dim) as usize;
+        if q.len() != want_q || out.len() != want_q {
+            return Err(eyre!("gqa flash wmma fa2 hg fp8: q/out len mismatch"));
+        }
+        let min_kv = kv_capacity as usize * (n_kv_head * head_dim) as usize;
+        if k_cache.len() < min_kv || v_cache.len() < min_kv {
+            return Err(eyre!("gqa flash wmma fa2 hg fp8: kv cache too small"));
+        }
+        let min_sc = kv_capacity as usize * n_kv_head as usize;
+        if k_scale.len() < min_sc || v_scale.len() < min_sc {
+            return Err(eyre!("gqa flash wmma fa2 hg fp8: scale sidecar too small"));
+        }
+        let function = self.module.get_function("gqa_attn_prefill_flash_wmma_fa2_hg_fp8")?;
+        let n_subgroup = kv_group / flash_hg_g;
+        let cfg = LaunchConfig {
+            grid: (n_kv_head * n_subgroup, batch.div_ceil(FLASH_HG_BR), 1),
+            block: (FLASH_HG_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), q.raw(), k_cache.raw(), v_cache.raw(), k_scale.raw(), v_scale.raw(),
+            n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window, kv_capacity
+        ])
+    }
+
+    /// FP8 FA2 register-resident-O prefill (SWA layers). Mirrors
+    /// [`prefill_flash_wmma_fa2`] (grid_mode 0) with e4m3fn K/V + scale sidecars.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_flash_wmma_fa2_fp8(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<u16>,
+        k_cache: &DeviceBuffer<u8>,
+        v_cache: &DeviceBuffer<u8>,
+        k_scale: &DeviceBuffer<f32>,
+        v_scale: &DeviceBuffer<f32>,
+        batch: u32,
+        n_head: u32,
+        n_kv_head: u32,
+        head_dim: u32,
+        q_offset: u32,
+        scale: f32,
+        swa_window: u32,
+        kv_capacity: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_head == 0 || n_kv_head == 0 || head_dim == 0 {
+            return Err(eyre!("gqa flash wmma fa2 fp8: zero dim"));
+        }
+        if head_dim > FLASH_HEAD_DIM || n_head % n_kv_head != 0 {
+            return Err(eyre!("gqa flash wmma fa2 fp8: bad dims"));
+        }
+        let n_kv_total = q_offset + batch;
+        let want_q = (batch * n_head * head_dim) as usize;
+        if q.len() != want_q || out.len() != want_q {
+            return Err(eyre!("gqa flash wmma fa2 fp8: q/out len mismatch"));
+        }
+        let min_kv = kv_capacity as usize * (n_kv_head * head_dim) as usize;
+        if k_cache.len() < min_kv || v_cache.len() < min_kv {
+            return Err(eyre!("gqa flash wmma fa2 fp8: kv cache too small"));
+        }
+        let min_sc = kv_capacity as usize * n_kv_head as usize;
+        if k_scale.len() < min_sc || v_scale.len() < min_sc {
+            return Err(eyre!("gqa flash wmma fa2 fp8: scale sidecar too small"));
+        }
+        let function = self.module.get_function("gqa_attn_prefill_flash_wmma_fa2_fp8")?;
+        const WMMA_BLOCK: u32 = 128;
+        let grid_mode: u32 = 0;
+        let cfg = LaunchConfig {
+            grid: (n_head, batch.div_ceil(FLASH_BR), 1),
+            block: (WMMA_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), q.raw(), k_cache.raw(), v_cache.raw(), k_scale.raw(), v_scale.raw(),
+            n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window, kv_capacity, grid_mode
+        ])
+    }
+
+    /// FP8 head-grouped split-KV decode. Mirrors [`single_query_splitkv_hg`]
+    /// with e4m3fn K/V + scale sidecars.
+    #[allow(clippy::too_many_arguments)]
+    pub fn single_query_splitkv_hg_fp8(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        out_partial: &mut DeviceBuffer<f32>,
+        m_partial: &mut DeviceBuffer<f32>,
+        l_partial: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<u16>,
+        k_cache: &DeviceBuffer<u8>,
+        v_cache: &DeviceBuffer<u8>,
+        k_scale: &DeviceBuffer<f32>,
+        v_scale: &DeviceBuffer<f32>,
+        n_head: u32,
+        n_kv_head: u32,
+        head_dim: u32,
+        n_kv: u32,
+        n_splits: u32,
+        scale: f32,
+        k_base: u32,
+        kv_capacity: u32,
+    ) -> eyre::Result<()> {
+        if n_head == 0 || n_kv_head == 0 || head_dim == 0 || n_kv == 0 || n_splits == 0 {
+            return Err(eyre!("gqa splitkv_hg fp8: zero dim"));
+        }
+        if head_dim > FLASH_HEAD_DIM || n_head % n_kv_head != 0 {
+            return Err(eyre!("gqa splitkv_hg fp8: bad dims"));
+        }
+        let kv_group = n_head / n_kv_head;
+        if kv_group > 12 {
+            return Err(eyre!("gqa splitkv_hg fp8: kv_group={kv_group} exceeds DEC_KVG_MAX=12"));
+        }
+        let hd = head_dim as usize;
+        let expected_q = n_head as usize * hd;
+        if q.len() != expected_q || out.len() != expected_q {
+            return Err(eyre!("gqa splitkv_hg fp8 q/out len"));
+        }
+        let expected_kv = kv_capacity as usize * n_kv_head as usize * hd;
+        if k_cache.len() < expected_kv || v_cache.len() < expected_kv {
+            return Err(eyre!("gqa splitkv_hg fp8 kv len"));
+        }
+        let expected_sc = kv_capacity as usize * n_kv_head as usize;
+        if k_scale.len() < expected_sc || v_scale.len() < expected_sc {
+            return Err(eyre!("gqa splitkv_hg fp8 scale sidecar too small"));
+        }
+        let need_part = n_head as usize * n_splits as usize * hd;
+        let need_ml = n_head as usize * n_splits as usize;
+        if out_partial.len() < need_part || m_partial.len() < need_ml || l_partial.len() < need_ml {
+            return Err(eyre!("gqa splitkv_hg fp8 scratch too small"));
+        }
+        const DEC_BLOCK: u32 = 128;
+        let fp = self.module.get_function("gqa_attn_decode_partial_hg_fp8")?;
+        let cfg_p = LaunchConfig {
+            grid: (n_kv_head, n_splits, 1),
+            block: (DEC_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(fp, cfg_p, stream, [
+            out_partial.raw(), m_partial.raw(), l_partial.raw(),
+            q.raw(), k_cache.raw(), v_cache.raw(), k_scale.raw(), v_scale.raw(),
+            n_head, n_kv_head, head_dim, n_kv, n_splits, scale, k_base, kv_capacity
+        ])?;
+        let fc = self.module.get_function("gqa_attn_decode_combine")?;
+        let cfg_c = LaunchConfig {
+            grid: (n_head, 1, 1),
+            block: (DEC_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(fc, cfg_c, stream, [
+            out.raw(), out_partial.raw(), m_partial.raw(), l_partial.raw(),
+            n_head, head_dim, n_splits
+        ])
+    }
 }

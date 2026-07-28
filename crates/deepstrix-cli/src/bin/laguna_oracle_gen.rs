@@ -210,9 +210,28 @@ fn main() -> eyre::Result<()> {
         let last = ids.len() - 1;
         let mut sum = 0f64;
         let mut logits = Vec::new();
+        // LAGUNA_GEN_DUMP_ARGMAX=1: print per-position next-token argmax so an
+        // fp8-vs-f16 A/B can measure per-position agreement WITHOUT greedy cascade
+        // (each position is fed the identical teacher-forced context).
+        let dump_argmax = std::env::var("LAGUNA_GEN_DUMP_ARGMAX").as_deref() == Ok("1");
         for (i, &tok) in ids.iter().enumerate() {
-            if i == last {
+            if i == last || dump_argmax {
                 logits = model.forward_logits_full(tok as usize, i)?;
+                if dump_argmax {
+                    // Per-position dump for the fp8-vs-f16 quality A/B: argmax,
+                    // top1-top2 logit gap (near-tie detector), and top-5 ids +
+                    // logits (top-5 overlap + a coarse distribution snapshot).
+                    let t5 = top5(&logits);
+                    let gap = if t5.len() >= 2 { t5[0].1 - t5[1].1 } else { f32::INFINITY };
+                    let ids5: String =
+                        t5.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(",");
+                    let lg5: String =
+                        t5.iter().map(|(_, v)| format!("{v:.4}")).collect::<Vec<_>>().join(",");
+                    println!(
+                        "POS {i} ARGMAX {} GAP {gap:.5} TOP5 {ids5} L5 {lg5}",
+                        argmax(&logits)
+                    );
+                }
             } else {
                 model.forward_no_logits(tok as usize, i)?;
             }
