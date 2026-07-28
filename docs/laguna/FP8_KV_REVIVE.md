@@ -219,3 +219,89 @@ keep f16 default ≤192K.
 - Kernel resources via `hipcc -Rpass-analysis=kernel-resource-usage` @gfx1201.
 - Untouched (user WIP): `sampler.rs`, `softmax_sample.hip`, `sampler` test,
   `external/ds4`.
+
+---
+
+# ADDENDUM 2026-07-28 — quality re-measured properly. Verdict unchanged, reasons corrected.
+
+The quality numbers above were taken before the b128 load-width fix, and the
+greedy first token (which used to flip off 22718) now holds. That made them
+suspect, so they were re-measured on the fixed build. **They reproduce — the old
+number was genuine quantization drift, not the bug.** But the old
+*interpretation* was wrong in a way that matters.
+
+## Method (better than the original)
+Teacher-forced on **real natural-language text** (~900K tokens of public-domain
+novels), not the pangram loop. Deep context built via the batched prefill path,
+then a 384-512-position window measured with per-position full-logit dumps.
+Two controls the original lacked:
+- **f16-vs-f16 is bit-exact** (KL=0, 100% top-1) → the pipeline is deterministic,
+  so every fp8 number is signal, not run-to-run noise.
+- **Fake-quant mode** (`LAGUNA_FP8_FAKE`): quantize→dequantize into the *f16*
+  cache, read by the *f16* kernels. Isolates pure numerics from the read kernel.
+
+## Results by depth
+| depth | top-1 | top-5 overlap | KL(f16‖fp8) | median gap@disagree | near-ties (<0.5) |
+|---|---|---|---|---|---|
+| shallow (~0-320) | 83.1% | 74.4% | 0.316 | 0.51 | 50% |
+| 4K   | 62.5% | 68.2% | 0.491 | 0.50 | 50% |
+| 32K  | 72.5% | 76.9% | 0.251 | 0.43 | 56% |
+| 128K | 71.1% | **79.8%** | **0.192** | 0.27 | **68%** |
+
+**fp8 error does NOT accumulate with depth — it shrinks.** KL falls and top-5
+overlap rises from 4K to 128K (more keys attended → more averaging → less
+error; corroborated by the isolated test, where attention-output error drops
+0.0125 → 0.0010 as n_kv grows 34 → 4096). The 4K row is the worst point and is
+content-confounded (different chapters at different depths; content cannot be
+held fixed across depth with a linear corpus), which is why KL is the robust
+signal rather than top-1.
+
+**This corrects the original claim above.** It reported "disagreements are
+mostly NOT near-ties, therefore real distribution shift" — but that was measured
+in a shallow, low-entropy, in-distribution window. At the long context fp8
+actually exists to serve, divergence is smaller (KL 0.19) and **68% of flips are
+near-ties**.
+
+## No read-kernel bug remains
+fake-both@32K (72.5%, KL 0.245) is identical to real fp8@32K (72.5%, KL 0.251).
+The two post-merge fixes (b128 NaN path, load width) fixed crashes/NaN at long
+ctx and the first-token flip — not this drift.
+
+## Attribution: no asymmetry to exploit
+- **K vs V roughly symmetric.** 4K: K-only 58.0%, V-only 63.1%. 32K: K-only
+  75.4%, V-only 74.4%. Neither dominates → no "quantize only the tolerant one" win.
+- **Global vs SWA layers (4K):** global-only 56.5% / KL 0.53; SWA-only 60.9% /
+  KL 0.47. Global layers hurt more per-layer, but the 36 SWA layers (which only
+  ever attend 512 keys) contribute nearly as much in aggregate → this is broad
+  per-layer KV sensitivity, NOT a deep-attention phenomenon.
+
+## Every fix hypothesis tested and FAILED (4K, fake-both)
+| variant | top-1 | KL |
+|---|---|---|
+| per-row (blk=128) e4m3 | 58.4% | 0.515 |
+| per-32 e4m3 | 56.5% | 0.568 |
+| per-16 e4m3 | 58.4% | 0.535 |
+| per-128, V=e5m2 | 59.0% | 0.582 |
+| per-16, V=e5m2 | 60.6% | 0.546 |
+| per-16, K&V=e5m2 | 55.7% | 0.617 |
+
+Finer scale granularity gives **no** improvement (slightly worse KL — fewer
+elements per amax estimate). That **rules out the outlier/clipping hypothesis**:
+the error is uniform across elements, the signature of correct-but-
+resolution-bound quantization. e5m2-for-V doesn't help (extra range is not the
+constraint; lower mantissa slightly hurts). No clipping is possible by
+construction — the per-row scale is amax/448, so the max element maps to exactly
+448. Write/read scale application verified consistent.
+
+**There is no quality fix to ship.** The cause is the intrinsic ~3-bit mantissa
+of 8-bit KV, amplified by 256-expert top-10 MoE routing sensitivity, on a
+checkpoint that is ALREADY 4-bit-weight quantized and that we quantize post-hoc
+— unlike poolside's natively-supported fp8 recipe on their higher-precision base.
+
+## Recommendation (unchanged, better justified)
+Keep fp8 KV as the **explicit opt-in >192K capability path**, not a general
+long-context default.
+- Below 192K, f16 fits AND is faster → no reason to pay any quality cost.
+- At 256K, f16 physically OOMs, so "slightly lossy but runs at 16.44 tok/s"
+  beats "cannot run". The drift there is the mild end of the range measured
+  (KL ~0.19, 80% top-5 overlap, majority near-tie flips).
