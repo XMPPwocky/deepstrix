@@ -571,6 +571,88 @@ extern "C" __global__ void laguna_quantize_fp8_kv(
 }
 
 // --------------------------------------------------------------------------
+// FP8 (e4m3fn) FAKE-QUANT round-trip for KV attribution experiments
+// (LAGUNA_FP8_FAKE). Quantizes each row to e4m3fn + per-row amax/448 scale and
+// immediately DEQUANTIZES back to f16 into the normal f16 KV cache, so the
+// downstream attention reads use the *identical* f16 read kernels. This
+// isolates the pure NUMERICAL error of fp8 (no read-kernel path change) and lets
+// K and V be round-tripped independently to attribute drift. NOT a production
+// path — diagnostic only.
+typedef float v2f_lg __attribute__((ext_vector_type(2)));
+static __device__ __forceinline__ float laguna_fp8_to_f32(unsigned char b) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    v2f_lg r = __builtin_amdgcn_cvt_pk_f32_fp8((int)(unsigned int)b, false);
+    return r[0];
+#else
+    const float sign = (b & 0x80u) ? -1.0f : 1.0f;
+    return sign * c_lg_e4m3fn_values[b & 0x7fu];
+#endif
+}
+
+// e5m2 (bf8) round-trip via native converts (gfx1200/1201). Max normal 57344.
+static __device__ __forceinline__ unsigned char laguna_f32_to_bf8(float x) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    int packed = __builtin_amdgcn_cvt_pk_bf8_f32(x, 0.0f, 0, false);
+    return (unsigned char)(packed & 0xff);
+#else
+    return 0;
+#endif
+}
+static __device__ __forceinline__ float laguna_bf8_to_f32(unsigned char b) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    v2f_lg r = __builtin_amdgcn_cvt_pk_f32_bf8((int)(unsigned int)b, false);
+    return r[0];
+#else
+    return 0.0f;
+#endif
+}
+
+// Generalized fp8/bf8 fake-quant round-trip with configurable scale block size.
+// fmt: 0=e4m3 (amax scale = 448), 1=e5m2 (amax scale = 57344).
+// blk: elements sharing one amax scale (<=head_dim; head_dim => per-row). The
+// per-block amax reduction runs within each contiguous blk-chunk of the row.
+extern "C" __global__ void laguna_fp8_roundtrip_kv(
+        _Float16     * __restrict__ out,   // [n_rows, head_dim] f16
+        const float  * __restrict__ in,    // [n_rows, head_dim] f32
+        unsigned int    n_rows,
+        unsigned int    head_dim,
+        unsigned int    blk,
+        unsigned int    fmt) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int t   = threadIdx.x;
+    if (row >= n_rows) return;
+    const float * r = in + (unsigned long long)row * head_dim;
+
+    const float fmax = (fmt == 1u) ? 57344.0f : 448.0f;
+    __shared__ float red[128];
+    const float v = (t < head_dim) ? r[t] : 0.0f;
+    red[t] = (t < head_dim) ? fabsf(v) : 0.0f;
+    __syncthreads();
+    // Per-block amax: reduce within each contiguous [g*blk, g*blk+blk) chunk.
+    const unsigned int g = t / blk;      // block index of this lane
+    const unsigned int base = g * blk;
+    for (unsigned int s = blk >> 1; s > 0u; s >>= 1) {
+        const unsigned int l = t - base;
+        if (t < head_dim && l < s) {
+            const float o = red[t + s];
+            if (o > red[t]) red[t] = o;
+        }
+        __syncthreads();
+    }
+    float sc = red[base] / fmax;
+    if (sc < 1.0e-12f) sc = 1.0e-12f;
+    if (t < head_dim) {
+        float q = v / sc;
+        if (q > fmax) q = fmax;
+        if (q < -fmax) q = -fmax;
+        float deq;
+        if (fmt == 1u) deq = laguna_bf8_to_f32(laguna_f32_to_bf8(q));
+        else           deq = laguna_fp8_to_f32(laguna_f32_to_fp8(q));
+        out[(unsigned long long)row * head_dim + t] = (_Float16)(deq * sc);
+    }
+}
+
+// --------------------------------------------------------------------------
 // 4. Fused per-head QK RMSNorm. Normalizes each head's `head_dim` slice by its
 //    OWN RMS and scales by a shared `weight[head_dim]` — replacing the 72 (Q) +
 //    8 (K) per-slice `rms_norm_weighted` launches with a single grid launch.

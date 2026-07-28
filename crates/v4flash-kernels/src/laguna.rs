@@ -280,6 +280,33 @@ impl LagunaOps {
         let cfg = LaunchConfig { grid: (n_rows, 1, 1), block: (128, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(f, cfg, stream, [out.raw(), scale.raw(), input.raw(), n_rows, head_dim])
     }
+
+    /// FP8 (e4m3fn) FAKE-QUANT round-trip (LAGUNA_FP8_FAKE, diagnostic). Quantizes
+    /// each `head_dim` row to e4m3fn + per-row amax/448 scale and dequantizes back
+    /// to f16 in `out`, so downstream attention uses the normal f16 read kernels.
+    /// Isolates the pure numerical error of fp8 (K/V independently). One WG/row.
+    pub fn roundtrip_fp8_kv(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<u16>,
+        input: &DeviceBuffer<f32>,
+        n_rows: u32,
+        head_dim: u32,
+        blk: u32,
+        fmt: u32,
+    ) -> eyre::Result<()> {
+        debug_assert!(head_dim <= 128, "roundtrip_fp8_kv head_dim={head_dim} > 128");
+        let n = (n_rows * head_dim) as usize;
+        if out.len() < n || input.len() < n {
+            return Err(eyre!(
+                "roundtrip_fp8_kv len mismatch: n_rows={n_rows} head_dim={head_dim}, out={} in={}",
+                out.len(), input.len()
+            ));
+        }
+        let f = self.module.get_function("laguna_fp8_roundtrip_kv")?;
+        let cfg = LaunchConfig { grid: (n_rows, 1, 1), block: (128, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(f, cfg, stream, [out.raw(), input.raw(), n_rows, head_dim, blk, fmt])
+    }
 }
 
 // --------------------------------------------------------------------------
