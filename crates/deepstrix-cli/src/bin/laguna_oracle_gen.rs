@@ -189,8 +189,9 @@ fn main() -> eyre::Result<()> {
     let dgpu_arch = dgpu.properties()?.gcn_arch_name;
     let igpu_arch = igpu.properties()?.gcn_arch_name;
 
+    let max_kv: usize = std::env::var("LAGUNA_MAX_KV").ok().and_then(|s| s.parse().ok()).unwrap_or(8192);
     let t0 = std::time::Instant::now();
-    let mut model = LagunaHetModel::load(&gguf_path, dgpu, &dgpu_arch, igpu, &igpu_arch, 8192)?;
+    let mut model = LagunaHetModel::load(&gguf_path, dgpu, &dgpu_arch, igpu, &igpu_arch, max_kv)?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     model.reset();
@@ -201,12 +202,29 @@ fn main() -> eyre::Result<()> {
     // top-5). No generation — a clean forward-pass checksum vs the oracle
     // (llama-eval-callback result_output) that is immune to greedy divergence and
     // chat-template mismatch. Used to validate SWA windowing at ctx > 512.
-    if let Ok(idfile) = std::env::var("LAGUNA_GEN_IDS_FILE") {
-        let ids: Vec<i32> = std::fs::read_to_string(&idfile)?
-            .lines()
-            .filter_map(|l| l.trim().parse::<i32>().ok())
-            .collect();
-        eprintln!("teacher-forced: {} ids from {idfile}", ids.len());
+    // LAGUNA_GEN_IDS_FROM_TEXT=<file>: tokenize a real-text file with our BPE and
+    // use it as the teacher-forced id stream (natural-language content). Takes
+    // precedence over LAGUNA_GEN_IDS_FILE. +BOS.
+    let ids_from_text = std::env::var("LAGUNA_GEN_IDS_FROM_TEXT").ok().map(|f| {
+        let text = std::fs::read_to_string(&f).expect("read text file");
+        let ids = vocab.encode_laguna_opts(&text, true);
+        eprintln!("tokenized {} -> {} ids", f, ids.len());
+        ids
+    });
+    if std::env::var("LAGUNA_GEN_IDS_FILE").is_ok() || ids_from_text.is_some() {
+        let ids: Vec<i32> = if let Some(ids) = ids_from_text {
+            match std::env::var("LAGUNA_GEN_IDS_MAX").ok().and_then(|s| s.parse::<usize>().ok()) {
+                Some(n) => ids.into_iter().take(n).collect(),
+                None => ids,
+            }
+        } else {
+            let idfile = std::env::var("LAGUNA_GEN_IDS_FILE").unwrap();
+            std::fs::read_to_string(&idfile)?
+                .lines()
+                .filter_map(|l| l.trim().parse::<i32>().ok())
+                .collect()
+        };
+        eprintln!("teacher-forced: {} ids", ids.len());
         let last = ids.len() - 1;
         let mut sum = 0f64;
         let mut logits = Vec::new();
@@ -214,9 +232,35 @@ fn main() -> eyre::Result<()> {
         // fp8-vs-f16 A/B can measure per-position agreement WITHOUT greedy cascade
         // (each position is fed the identical teacher-forced context).
         let dump_argmax = std::env::var("LAGUNA_GEN_DUMP_ARGMAX").as_deref() == Ok("1");
+        // LAGUNA_GEN_PREFILL_N=<M>: ingest ids[0..M] via the batched prefill path
+        // (fast, O(N) not O(N^2)), then teacher-force-measure positions M.. only.
+        // Builds deep context to test depth-dependent fp8 drift.
+        let prefill_n: usize = std::env::var("LAGUNA_GEN_PREFILL_N").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        // LAGUNA_GEN_DUMP_LOGITS_FILE: binary dump per measured position:
+        // i32 pos, then VOCAB f32 logits. Paired f16/fp8 runs -> offline KL.
+        let mut logdump = std::env::var("LAGUNA_GEN_DUMP_LOGITS_FILE").ok()
+            .map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("create logits dump")));
+        let start = if prefill_n > 0 {
+            let pre: Vec<usize> = ids[0..prefill_n].iter().map(|&x| x as usize).collect();
+            let t = std::time::Instant::now();
+            let (am, lg) = model.prefill_batched(&pre)?;
+            eprintln!("prefilled {} ids in {:.1}s (last argmax {am} logit {lg:.3})", prefill_n, t.elapsed().as_secs_f32());
+            prefill_n
+        } else { 0 };
         for (i, &tok) in ids.iter().enumerate() {
+            if i < start {
+                continue; // already ingested by prefill_batched
+            }
             if i == last || dump_argmax {
                 logits = model.forward_logits_full(tok as usize, i)?;
+                if let Some(w) = logdump.as_mut() {
+                    use std::io::Write as _;
+                    w.write_all(&(i as i32).to_le_bytes()).ok();
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(logits.as_ptr() as *const u8, logits.len() * 4)
+                    };
+                    w.write_all(bytes).ok();
+                }
                 if dump_argmax {
                     // Per-position dump for the fp8-vs-f16 quality A/B: argmax,
                     // top1-top2 logit gap (near-tie detector), and top-5 ids +

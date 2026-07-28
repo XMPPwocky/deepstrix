@@ -296,6 +296,20 @@ pub struct LagunaHetModel {
     /// ATT flagged as `s_wait_loadcnt`-bound). f16 default; fp8 flips both the
     /// KV write (quantize) and the attention read (dequant) paths.
     fp8_kv: bool,
+    /// FP8 FAKE-QUANT diagnostic (LAGUNA_FP8_FAKE=k|v|both). K/V are fp8
+    /// round-tripped (quantize→dequantize) into the normal f16 cache and read by
+    /// the f16 kernels — isolates the pure numerical error of fp8 (no read-kernel
+    /// path change) and attributes drift to K vs V. Orthogonal to `fp8_kv`.
+    fake_fp8_k: bool,
+    fake_fp8_v: bool,
+    /// Fake-quant scale block size (LAGUNA_FP8_FAKE_BLK, default 128 = per-row)
+    /// and K/V formats (LAGUNA_FP8_FAKE_FMT_K/V: 0=e4m3, 1=e5m2).
+    fake_blk: u32,
+    fake_fmt_k: u32,
+    fake_fmt_v: u32,
+    /// Restrict fake-quant to a layer group (LAGUNA_FP8_FAKE_LAYERS): 0=all,
+    /// 1=global (full-attn, il%4==0), 2=swa. Attributes depth-drift to a group.
+    fake_layers: u8,
     kc8: Vec<DeviceBuffer<u8>>,
     vc8: Vec<DeviceBuffer<u8>>,
     kc8_scale: Vec<DeviceBuffer<f32>>,
@@ -609,6 +623,26 @@ impl LagunaHetModel {
         // kv_head) f32 scale instead of f16. Halves KV storage AND the
         // load-bound byte traffic. f16 remains the default until proven.
         let fp8_kv = std::env::var("LAGUNA_FP8_KV").as_deref() == Ok("1");
+        // FP8 FAKE-QUANT diagnostic: round-trip K/V through fp8 into the f16 cache.
+        let fake = std::env::var("LAGUNA_FP8_FAKE").unwrap_or_default();
+        let (fake_fp8_k, fake_fp8_v) = match fake.as_str() {
+            "k" => (true, false),
+            "v" => (false, true),
+            "both" | "1" => (true, true),
+            _ => (false, false),
+        };
+        let fake_blk: u32 = std::env::var("LAGUNA_FP8_FAKE_BLK").ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+        let fmt_of = |v: &str| -> u32 { if v == "e5m2" || v == "1" { 1 } else { 0 } };
+        let fake_fmt_k = std::env::var("LAGUNA_FP8_FAKE_FMT_K").map(|v| fmt_of(&v)).unwrap_or(0);
+        let fake_fmt_v = std::env::var("LAGUNA_FP8_FAKE_FMT_V").map(|v| fmt_of(&v)).unwrap_or(0);
+        let fake_layers: u8 = match std::env::var("LAGUNA_FP8_FAKE_LAYERS").as_deref() {
+            Ok("global") => 1,
+            Ok("swa") => 2,
+            _ => 0,
+        };
+        if (fake_fp8_k || fake_fp8_v) && !fp8_kv {
+            eprintln!("[laguna] LAGUNA_FP8_FAKE={fake}: fp8 round-trip into f16 cache (K={fake_fp8_k} V={fake_fp8_v}) blk={fake_blk} fmt_k={fake_fmt_k} fmt_v={fake_fmt_v} — diagnostic");
+        }
         let mut kv_cap = Vec::with_capacity(N_LAYER);
         let mut kc = Vec::with_capacity(N_LAYER);
         let mut vc = Vec::with_capacity(N_LAYER);
@@ -763,6 +797,12 @@ impl LagunaHetModel {
             kc,
             vc,
             fp8_kv,
+            fake_fp8_k,
+            fake_fp8_v,
+            fake_blk,
+            fake_fmt_k,
+            fake_fmt_v,
+            fake_layers,
             kc8,
             vc8,
             kc8_scale,
@@ -873,6 +913,10 @@ impl LagunaHetModel {
         let is_dense = self.dlayers[il].dense.is_some();
         let n_embd_q = n_head * HEAD_DIM;
         let n_rot = if is_full { self.hp.n_rot_full as u32 } else { self.hp.n_rot_swa as u32 };
+        // Layer-group-gated fake-quant flags (LAGUNA_FP8_FAKE_LAYERS attribution).
+        let fake_grp = self.fake_layers == 0 || (self.fake_layers == 1) == is_full;
+        let fake_k = self.fake_fp8_k && fake_grp;
+        let fake_v = self.fake_fp8_v && fake_grp;
         let n_kv = pos + 1;
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
         let diag_t0 = if self.diag { Some(std::time::Instant::now()) } else { None };
@@ -917,9 +961,17 @@ impl LagunaHetModel {
                     dk.ops.quantize_fp8_kv(st, &mut vb, &mut vsc, &ds.v, N_KV_HEAD as u32, HEAD_DIM as u32)?;
                 } else {
                     let mut kslot = self.kc[il].slice_view_mut(pslot, N_KV_HEAD * HEAD_DIM);
-                    dk.ops.cast_f16(st, &mut kslot, &ds.kn, (N_KV_HEAD * HEAD_DIM) as u32)?;
+                    if fake_k {
+                        dk.ops.roundtrip_fp8_kv(st, &mut kslot, &ds.kn, N_KV_HEAD as u32, HEAD_DIM as u32, self.fake_blk, self.fake_fmt_k)?;
+                    } else {
+                        dk.ops.cast_f16(st, &mut kslot, &ds.kn, (N_KV_HEAD * HEAD_DIM) as u32)?;
+                    }
                     let mut vslot = self.vc[il].slice_view_mut(pslot, N_KV_HEAD * HEAD_DIM);
-                    dk.ops.cast_f16(st, &mut vslot, &ds.v, (N_KV_HEAD * HEAD_DIM) as u32)?;
+                    if fake_v {
+                        dk.ops.roundtrip_fp8_kv(st, &mut vslot, &ds.v, N_KV_HEAD as u32, HEAD_DIM as u32, self.fake_blk, self.fake_fmt_v)?;
+                    } else {
+                        dk.ops.cast_f16(st, &mut vslot, &ds.v, (N_KV_HEAD * HEAD_DIM) as u32)?;
+                    }
                 }
             }
             dk.ops.cast_f16(st, &mut ds.qf, &ds.qn, n_embd_q as u32)?;
@@ -1467,6 +1519,10 @@ impl LagunaHetModel {
         let is_dense = self.dlayers[il].dense.is_some();
         let n_embd_q = n_head * HEAD_DIM;
         let kv_stride = N_KV_HEAD * HEAD_DIM;
+        // Layer-group-gated fake-quant flags (LAGUNA_FP8_FAKE_LAYERS attribution).
+        let fake_grp = self.fake_layers == 0 || (self.fake_layers == 1) == is_full;
+        let fake_k = self.fake_fp8_k && fake_grp;
+        let fake_v = self.fake_fp8_v && fake_grp;
         let n_rot = if is_full { self.hp.n_rot_full as u32 } else { self.hp.n_rot_swa as u32 };
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
         let bu = b as u32;
@@ -1537,20 +1593,37 @@ impl LagunaHetModel {
                         dk.ops.quantize_fp8_kv(st, &mut vb2, &mut vs2, &v_v2, (rem * N_KV_HEAD) as u32, HEAD_DIM as u32)?;
                     }
                 } else {
+                    let hkr = HEAD_DIM as u32;
                     let mut kslot = self.kc[il].slice_view_mut(phys0 * kv_stride, first * kv_stride);
                     let kn_v = ps.kn.slice_view(0, first * kv_stride);
-                    dk.ops.cast_f16(st, &mut kslot, &kn_v, (first * kv_stride) as u32)?;
+                    if fake_k {
+                        dk.ops.roundtrip_fp8_kv(st, &mut kslot, &kn_v, (first * N_KV_HEAD) as u32, hkr, self.fake_blk, self.fake_fmt_k)?;
+                    } else {
+                        dk.ops.cast_f16(st, &mut kslot, &kn_v, (first * kv_stride) as u32)?;
+                    }
                     let mut vslot = self.vc[il].slice_view_mut(phys0 * kv_stride, first * kv_stride);
                     let v_v = ps.v.slice_view(0, first * kv_stride);
-                    dk.ops.cast_f16(st, &mut vslot, &v_v, (first * kv_stride) as u32)?;
+                    if fake_v {
+                        dk.ops.roundtrip_fp8_kv(st, &mut vslot, &v_v, (first * N_KV_HEAD) as u32, hkr, self.fake_blk, self.fake_fmt_v)?;
+                    } else {
+                        dk.ops.cast_f16(st, &mut vslot, &v_v, (first * kv_stride) as u32)?;
+                    }
                     if first < b {
                         let rem = b - first; // wrapped rows at physical row 0
                         let mut kslot2 = self.kc[il].slice_view_mut(0, rem * kv_stride);
                         let kn_v2 = ps.kn.slice_view(first * kv_stride, rem * kv_stride);
-                        dk.ops.cast_f16(st, &mut kslot2, &kn_v2, (rem * kv_stride) as u32)?;
+                        if fake_k {
+                            dk.ops.roundtrip_fp8_kv(st, &mut kslot2, &kn_v2, (rem * N_KV_HEAD) as u32, hkr, self.fake_blk, self.fake_fmt_k)?;
+                        } else {
+                            dk.ops.cast_f16(st, &mut kslot2, &kn_v2, (rem * kv_stride) as u32)?;
+                        }
                         let mut vslot2 = self.vc[il].slice_view_mut(0, rem * kv_stride);
                         let v_v2 = ps.v.slice_view(first * kv_stride, rem * kv_stride);
-                        dk.ops.cast_f16(st, &mut vslot2, &v_v2, (rem * kv_stride) as u32)?;
+                        if fake_v {
+                            dk.ops.roundtrip_fp8_kv(st, &mut vslot2, &v_v2, (rem * N_KV_HEAD) as u32, hkr, self.fake_blk, self.fake_fmt_v)?;
+                        } else {
+                            dk.ops.cast_f16(st, &mut vslot2, &v_v2, (rem * kv_stride) as u32)?;
+                        }
                     }
                 }
             }
