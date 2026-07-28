@@ -2214,12 +2214,23 @@ void gqa_attn_decode_partial_hg_core(
     // function of its high bits so the 8 colliding lanes fan out across all 8 bank
     // quads → 4-way = f16 parity. Bijective + block-granular → b128 stays 16-B
     // aligned and numerics are bit-identical (pure LDS relocation). Same skew is
-    // applied to EVERY Ks/Vs store AND read (below). Default 0 → identity.
-#ifndef DEC_LDS_SWZ
+    // applied to EVERY Ks/Vs store AND read (below).
+    //
+    // DEFAULT ON: bit-identical, zero extra LDS, measured neutral where the
+    // kernel is not conflict-limited (f16 e2e decode at 4K/32K/128K all within
+    // +0.2%) and +3.0% at 192K.
+    //
+    // It patches only the DEFAULT b128+prefetch staging store, while the reads
+    // are swizzled unconditionally — so it MUST auto-disable on the opt-in
+    // OFF/NARROW store paths (whose stores are unpatched) or store and read
+    // would disagree. Auto-disable rather than #error: those flags are A/B
+    // fallbacks and have to keep building now that the swizzle is the default.
+#if defined(ATTN_KV_PREFETCH_OFF) || defined(DEC_KV_LOAD_NARROW)
+#undef  DEC_LDS_SWZ
 #define DEC_LDS_SWZ 0
 #endif
-#if DEC_LDS_SWZ && (defined(ATTN_KV_PREFETCH_OFF) || defined(DEC_KV_LOAD_NARROW))
-#error "DEC_LDS_SWZ patches the default b128+prefetch staging store only; the reads are swizzled unconditionally, so the OFF/NARROW store paths would mismatch."
+#ifndef DEC_LDS_SWZ
+#define DEC_LDS_SWZ 1
 #endif
 #if DEC_LDS_SWZ
 #define DEC_BLK(b) ((b) ^ (((b) >> 3) & 7u))   // logical 16-B block -> physical
