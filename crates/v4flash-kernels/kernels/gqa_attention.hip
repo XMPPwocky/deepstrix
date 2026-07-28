@@ -592,6 +592,23 @@ static __device__ __forceinline__ float gqa_fp8_to_f32(unsigned char b) {
 #endif
 }
 
+// Packed convert: two adjacent e4m3fn bytes (a 16-bit word, low byte first) →
+// two f32. Uses the native VOP3 packed convert on gfx1200/1201 (2 f32/call,
+// halving the convert count vs the per-byte helper); portable LUT fallback on
+// other arches (these kernels never launch on the iGPU but must still compile).
+static __device__ __forceinline__ gqa_v2f gqa_fp8x2_to_f32(unsigned short w) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_cvt_pk_f32_fp8((int)(unsigned int)w, false);
+#else
+    gqa_v2f r;
+    const unsigned char b0 = (unsigned char)(w & 0xffu);
+    const unsigned char b1 = (unsigned char)((w >> 8) & 0xffu);
+    r[0] = ((b0 & 0x80u) ? -1.0f : 1.0f) * c_gqa_e4m3fn_values[b0 & 0x7fu];
+    r[1] = ((b1 & 0x80u) ? -1.0f : 1.0f) * c_gqa_e4m3fn_values[b1 & 0x7fu];
+    return r;
+#endif
+}
+
 // Dequant one e4m3fn byte at `off` and apply the row scale at `srow`.
 static __device__ __forceinline__ _Float16 gqa_deq_fp8(
         const unsigned char * __restrict__ c, unsigned long long off,
@@ -2190,6 +2207,25 @@ void gqa_attn_decode_partial_hg_core(
     // Qs stored f16 (the query IS f16 in DRAM; (float)-widening at read is
     // exact → bit-identical) to shave DEC_KVG_MAX*DEC_FD*2 = 3 KB more LDS and,
     // with Os in registers, drop the tile under the 3-WG/CU LDS threshold.
+    // DEC_LDS_SWZ: zero-extra-LDS conflict swizzle. fp8's staging store owns 32 B
+    // per lane (half16) → per-lane byte stride 32 → the b128 sub-store's bank quad
+    // (block%8) repeats every 4 lanes → 8-way LDS bank conflict (f16 owns 16 B →
+    // 4-way, the 32-lane b128 floor). We XOR each 16-B LDS block index by a
+    // function of its high bits so the 8 colliding lanes fan out across all 8 bank
+    // quads → 4-way = f16 parity. Bijective + block-granular → b128 stays 16-B
+    // aligned and numerics are bit-identical (pure LDS relocation). Same skew is
+    // applied to EVERY Ks/Vs store AND read (below). Default 0 → identity.
+#ifndef DEC_LDS_SWZ
+#define DEC_LDS_SWZ 0
+#endif
+#if DEC_LDS_SWZ && (defined(ATTN_KV_PREFETCH_OFF) || defined(DEC_KV_LOAD_NARROW))
+#error "DEC_LDS_SWZ patches the default b128+prefetch staging store only; the reads are swizzled unconditionally, so the OFF/NARROW store paths would mismatch."
+#endif
+#if DEC_LDS_SWZ
+#define DEC_BLK(b) ((b) ^ (((b) >> 3) & 7u))   // logical 16-B block -> physical
+#else
+#define DEC_BLK(b) (b)
+#endif
     __shared__ _Float16 Qs[DEC_KVG_MAX * DEC_FD];
     __shared__ _Float16 Ks[DEC_FBC_HG * DEC_FD];
     __shared__ _Float16 Vs[DEC_FBC_HG * DEC_FD];
@@ -2249,7 +2285,30 @@ void gqa_attn_decode_partial_hg_core(
 #ifndef DEC_PREFETCH_DEPTH
 #define DEC_PREFETCH_DEPTH 2
 #endif
-        constexpr unsigned int PFD_D = DEC_PREFETCH_DEPTH;
+        // Prefetch depth is PER-FORMAT so the fp8 knob can never regress f16 (with
+        // both at 2 this folds to a constant; f16 ISA is byte-identical either way).
+        //
+        // MEASURED depth sweep (gfx1201, isolated decode kernel, back-to-back A/B,
+        // fp8 GB/s is of its own halved byte count; f16 holds 86-87% of 600 GB/s):
+        //   depth | VGPR | scratch | occ | fp8 @192K        | fp8 eff
+        //     2   | 164  |    0    |  6  | 1656 us (-7%)    | 42%   <- BEST
+        //     3   | 196  |    0    |  6  | 1630 us (-5%)    | 42%   (noise; +32 VGPR)
+        //     4   | 248  |    0    |  5  | 2011 us (-30%)   | 34%   (occupancy cliff)
+        //     5   | 256  |   92    |  5  | 2054 us (-32%)   | 33%   (SPILLS; invalid)
+        //
+        // So deeper prefetch is NOT the lever: depth 3 doubles the primed loads
+        // (8->12 b128 in the preamble) and adds a full tile of ring registers, yet
+        // achieved BW does not move off 42%. fp8 is therefore NOT MLP-starved. It is
+        // also not VALU/dequant-bound (stripping convert+scale entirely: 843->841 us
+        // @100K). What it IS: the per-tile pipeline (LDS staging + barriers + the
+        // score/AV math) is identical for both formats and does not scale with KV
+        // bytes, so halving the bytes cannot buy time — and depth 4 shows the kernel
+        // is acutely occupancy-sensitive, i.e. latency is hidden by WAVE parallelism,
+        // not per-wave MLP. Keep depth 2; raise only with a re-measure.
+#ifndef DEC_PREFETCH_DEPTH_FP8
+#define DEC_PREFETCH_DEPTH_FP8 2
+#endif
+        constexpr unsigned int PFD_D = FP8 ? DEC_PREFETCH_DEPTH_FP8 : DEC_PREFETCH_DEPTH;
 #ifdef DEC_KV_LOAD_NARROW
         // --- FALLBACK: half2 (32-bit) scalar-underlying global loads (A/B) ---
         constexpr unsigned int KVPT2  = KVPT_D / 2u;                       // 16 packed half2/thread
@@ -2310,56 +2369,67 @@ void gqa_attn_decode_partial_hg_core(
             }
             const unsigned int n_keys = (kb + DEC_FBC_HG < k1) ? DEC_FBC_HG : (k1 - kb);
 #else
-        // --- DEFAULT: b128 (half8, 128-bit) wide coalesced global loads ---
-        // head_dim (128 halfs) is contiguous in DRAM, so a lane loads 8 contiguous
-        // dims per global_load_b128 (16 B / 128-bit). KVPT_D=32 elems/lane = 4 b128
-        // per lane per tile for K and 4 for V. With PFD_D=2 depth-2 prefetch, ~8+
-        // K b128 (+8 V) loads are in flight per lane → high memory-level parallelism
-        // (the projection fix's lever). The half2 scalar path (DEC_KV_LOAD_NARROW)
-        // issued 16-bit-per-lane loads → too few outstanding → DRAM-latency-bound.
-        // Register footprint is IDENTICAL: kbuf[2][4] half8 = 8 vecs × 4 VGPR = 32
-        // VGPR (same as [2][16] half2). LDS staging kept (transposes for compute).
-        // Bit-exact vs half2: same halfs, same store layout Ks[key*hd+dim]; only the
-        // load WIDTH/scheduling changes. b128 needs 16-B alignment: _off is a
-        // multiple of 8 halfs (row_stride=n_kv_head*128, kvh_off=kh*128, _d%8==0).
-        constexpr unsigned int CPK    = DEC_FD / 8u;   // 16 b128-chunks per key
-        constexpr unsigned int KVPT8  = KVPT_D / 8u;   // 4 b128/thread per K,V
-        typedef _Float16 dec_h8 __attribute__((ext_vector_type(8)));
-        dec_h8 kbuf[PFD_D][KVPT8];
-        dec_h8 vbuf[PFD_D][KVPT8];
-        // Lane t, chunk _c owns b128-chunk (t + _c*128): key = chunk/CPK, dim = 8*(chunk%CPK).
+        // --- DEFAULT: b128 (128-bit) wide coalesced global loads ---
+        // A lane loads WELEM contiguous dims per global_load_b128 (16 B / 128-bit).
+        //   f16: WELEM=8  (8 halfs  = 16 B) → 4 b128/lane/tile for K, 4 for V.
+        //   fp8: WELEM=16 (16 e4m3  = 16 B) → 2 b128/lane/tile for K, 2 for V.
+        // FP8 keeps the load WIDTH at b128 (16 B) but doubles ELEMENTS/instruction,
+        // so it issues HALF the load instructions of the old 8-B (b64) fp8 path —
+        // that path had the SAME load-instruction COUNT as f16 while moving half the
+        // bytes, so it never hid load latency (bytes halved, no speedup, net slower
+        // after dequant). At WELEM=16 the load count halves (the real MLP lever) and
+        // the dequant uses the PACKED v_cvt_pk_f32_fp8 (2 f32/call) → half the converts.
+        // With PFD_D=2 depth-2 prefetch, loads stay in flight across the compute window.
+        // Register footprint is IDENTICAL: f16 kbuf[2][4] half8 = 32 VGPR; fp8
+        // kbuf[2][2] half16 = 32 VGPR. LDS staging kept (transposes for compute).
+        // Bit-exact vs the scalar path: same halfs, same store layout Ks[key*hd+dim];
+        // only the load WIDTH / lane→data partition changes (a __syncthreads separates
+        // load from compute, so which lane wrote which LDS slot is irrelevant).
+        // b128 needs 16-B alignment: _off is a multiple of WELEM
+        // (row_stride=n_kv_head*128, kvh_off=kh*128, _d%WELEM==0; fp8 bytes → 16-B).
+        constexpr unsigned int WELEM  = FP8 ? 16u : 8u;    // KV elems per b128 load
+        constexpr unsigned int CPK    = DEC_FD / WELEM;    // wide-chunks per key (8 fp8 / 16 f16)
+        constexpr unsigned int KVPT8  = KVPT_D / WELEM;    // b128/thread per K,V (2 fp8 / 4 f16)
+        typedef _Float16 dec_hw __attribute__((ext_vector_type(FP8 ? 16 : 8)));
+        dec_hw kbuf[PFD_D][KVPT8];
+        dec_hw vbuf[PFD_D][KVPT8];
+        // Lane t, chunk _c owns wide-chunk (t + _c*128): key = chunk/CPK, dim = WELEM*(chunk%CPK).
         // Adjacent lanes → adjacent chunks → adjacent 16-B addresses within a key
-        // (16 lanes cover one 256-B key row → one coalesced transaction).
+        // (one coalesced transaction: 16 f16-lanes / 8 fp8-lanes cover one key row).
         #define DEC_LOAD_ELEM(SLOT, KB, _c) do {                                         \
             const unsigned int _chunk = tid + (_c) * DEC_BLOCK;                          \
             const unsigned int _j  = _chunk / CPK;                                       \
-            const unsigned int _d  = (_chunk % CPK) * 8u;                                \
+            const unsigned int _d  = (_chunk % CPK) * WELEM;                             \
             const unsigned int _kg = (KB) + _j;                                          \
-            dec_h8 _kv = {}, _vv = {};                                                   \
+            dec_hw _kv = {}, _vv = {};                                                   \
             if (_kg < k1) {                                                              \
                 const unsigned long long _phys = (unsigned long long)((k_base + _kg) % kv_capacity); \
                 const unsigned long long _off = _phys * row_stride + kvh_off + _d;       \
                 if constexpr (FP8) {                                                     \
-                    /* fp8: the 8-dim b128 chunk is within ONE key (_j), so all 8      */\
-                    /* bytes share the (_phys, kh) scale. _off is a multiple of 8      */\
-                    /* (row_stride,kvh_off,_d all %8==0) so the 8 e4m3fn bytes are one */\
-                    /* 64-bit COALESCED load; native packed convert does 2 f32/call    */\
-                    /* (avoids the 8×1-byte load-count trap that made fp8 slower).      */\
+                    /* fp8: all WELEM=16 dims are within ONE key (_j), so they share    */\
+                    /* the (_phys, kh) scale. _off is a multiple of 16 (row_stride,     */\
+                    /* kvh_off, _d all %16==0) → the 16 e4m3fn bytes are ONE b128       */\
+                    /* COALESCED load; native packed convert does 2 f32/call.           */\
                     const unsigned long long _sr = _phys * n_kv_head + kh;               \
                     const float _ksc = k_scale[_sr];                                     \
                     const float _vsc = v_scale[_sr];                                     \
-                    const uint2 _kw = *(const uint2 *)(k_cache8 + _off);                 \
-                    const uint2 _vw = *(const uint2 *)(v_cache8 + _off);                 \
-                    const unsigned char *_kb = (const unsigned char *)&_kw;              \
-                    const unsigned char *_vb = (const unsigned char *)&_vw;              \
+                    typedef unsigned char fp8x16 __attribute__((ext_vector_type(16)));   \
+                    const fp8x16 _kw = *(const fp8x16 *)(k_cache8 + _off);               \
+                    const fp8x16 _vw = *(const fp8x16 *)(v_cache8 + _off);               \
+                    const unsigned short *_kp = (const unsigned short *)&_kw;            \
+                    const unsigned short *_vp = (const unsigned short *)&_vw;            \
                     _Pragma("unroll")                                                    \
                     for (unsigned int _e = 0; _e < 8u; ++_e) {                           \
-                        _kv[_e] = (_Float16)(gqa_fp8_to_f32(_kb[_e]) * _ksc);            \
-                        _vv[_e] = (_Float16)(gqa_fp8_to_f32(_vb[_e]) * _vsc);            \
+                        const gqa_v2f _rk = gqa_fp8x2_to_f32(_kp[_e]);                   \
+                        const gqa_v2f _rv = gqa_fp8x2_to_f32(_vp[_e]);                   \
+                        _kv[2u*_e]      = (_Float16)(_rk[0] * _ksc);                     \
+                        _kv[2u*_e + 1u] = (_Float16)(_rk[1] * _ksc);                     \
+                        _vv[2u*_e]      = (_Float16)(_rv[0] * _vsc);                     \
+                        _vv[2u*_e + 1u] = (_Float16)(_rv[1] * _vsc);                     \
                     }                                                                    \
                 } else {                                                                \
-                    _kv = *(const dec_h8 *)(k_cache + _off);                             \
-                    _vv = *(const dec_h8 *)(v_cache + _off);                             \
+                    _kv = *(const dec_hw *)(k_cache + _off);                             \
+                    _vv = *(const dec_hw *)(v_cache + _off);                             \
                 }                                                                        \
             }                                                                            \
             kbuf[SLOT][_c] = _kv;                                                        \
@@ -2378,12 +2448,22 @@ void gqa_attn_decode_partial_hg_core(
         }
         for (unsigned int kb = k0; kb < k1; kb += DEC_FBC_HG) {
             // copy the (already-loaded) K/V tile regs -> LDS (always buf[0]) as b128.
-            // chunk*8 == key*hd + dim, so the store lands at Ks[key*hd+dim] (16-B aligned).
+            // chunk*WELEM == key*hd + dim, so the store lands at Ks[key*hd+dim] (16-B aligned).
+            // Store each chunk as BLKPC 16-B blocks (1 for f16, 2 for fp8), each
+            // relocated by DEC_BLK. logical block = key*(hd/8) + dim/8 + _b, which
+            // equals _chunk*WELEM/8 + _b → at DEC_LDS_SWZ==0 this is the identical
+            // contiguous b128 store. gqa_half8 == one 16-B block.
+            constexpr unsigned int BLKPC = WELEM / 8u;   // 1 (f16) or 2 (fp8)
             #pragma unroll
             for (unsigned int _c = 0; _c < KVPT8; ++_c) {
-                const unsigned int _chunk = tid + _c * DEC_BLOCK;
-                *(dec_h8 *)(Ks + _chunk * 8u) = kbuf[0][_c];
-                *(dec_h8 *)(Vs + _chunk * 8u) = vbuf[0][_c];
+                const unsigned int _blk0 = (tid + _c * DEC_BLOCK) * (WELEM / 8u);
+                const gqa_half8 *_kp = (const gqa_half8 *)&kbuf[0][_c];
+                const gqa_half8 *_vp = (const gqa_half8 *)&vbuf[0][_c];
+                #pragma unroll
+                for (unsigned int _b = 0; _b < BLKPC; ++_b) {
+                    *(gqa_half8 *)(Ks + DEC_BLK(_blk0 + _b) * 8u) = _kp[_b];
+                    *(gqa_half8 *)(Vs + DEC_BLK(_blk0 + _b) * 8u) = _vp[_b];
+                }
             }
             __syncthreads();
             // shift the register ring down: buf[s] <- buf[s+1] (static indices)
@@ -2451,9 +2531,15 @@ void gqa_attn_decode_partial_hg_core(
                 // redundant non-broadcast LDS read stream is the s_wait_dscnt pole.
                 _Float16 kreg[32];
                 if (kk < n_keys) {
-                    const _Float16 *kr = Ks + (unsigned long long)kk * hd + d0;
+                    // 32 contiguous dims = 4 16-B blocks; base block = kk*(hd/8)+d0/8.
+                    // DEC_BLK relocates each; at SWZ==0 this is the contiguous read.
+                    const unsigned int _kb0 = kk * (DEC_FD / 8u) + (d0 >> 3);
                     #pragma unroll
-                    for (unsigned int dd = 0; dd < 32u; dd++) kreg[dd] = kr[dd];
+                    for (unsigned int _b = 0; _b < 4u; _b++) {
+                        const gqa_half8 _v = *(const gqa_half8 *)(Ks + DEC_BLK(_kb0 + _b) * 8u);
+                        #pragma unroll
+                        for (unsigned int e = 0; e < 8u; e++) kreg[_b * 8u + e] = _v[e];
+                    }
                 }
                 for (unsigned int g = 0; g < kv_group; g++) {
                     float part = 0.0f;
@@ -2473,7 +2559,7 @@ void gqa_attn_decode_partial_hg_core(
                 for (unsigned int g = 0; g < kv_group; g++) {
                     float part = 0.0f;
                     if (kk < n_keys) {
-                        const _Float16 *kr = Ks + (unsigned long long)kk * hd;
+                        const _Float16 *kr = Ks + (unsigned long long)kk * hd;  // SWZ n/a (opt-in path)
                         const _Float16 *qg = Qs + (unsigned long long)g * hd;
                         #pragma unroll
                         for (unsigned int dd = 0; dd < 32u; dd++) {
@@ -2526,7 +2612,10 @@ void gqa_attn_decode_partial_hg_core(
                 // read V from LDS instead (still ONE staged copy per KV head).
                 _Float16 vreg[DEC_FBC_HG];
                 #pragma unroll
-                for (unsigned int j = 0; j < DEC_FBC_HG; j++) vreg[j] = Vs[(unsigned long long)j * hd + tid];
+                for (unsigned int j = 0; j < DEC_FBC_HG; j++) {
+                    const unsigned int _h = j * DEC_FD + tid;   // logical half index
+                    vreg[j] = Vs[DEC_BLK(_h >> 3) * 8u + (_h & 7u)];
+                }
                 #pragma unroll
                 for (unsigned int g = 0; g < DEC_KVG_MAX; g++) {
                     if (g >= kv_group) break;
@@ -2548,7 +2637,8 @@ void gqa_attn_decode_partial_hg_core(
                     float o = 0.0f;
                     #pragma unroll
                     for (unsigned int j = 0; j < DEC_FBC_HG; j++) {
-                        o += sp[j] * (float)Vs[(unsigned long long)j * hd + tid];
+                        { const unsigned int _h = j * DEC_FD + tid;
+                          o += sp[j] * (float)Vs[DEC_BLK(_h >> 3) * 8u + (_h & 7u)]; }
                     }
                     Oreg[g] = Oreg[g] * corr + o;
                 }
