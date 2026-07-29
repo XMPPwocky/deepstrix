@@ -619,9 +619,10 @@ impl LagunaHetModel {
         // small ring buffer (SWA_RING_CAP rows, capped at max_kv for short ctx)
         // suffices. At 100K ctx this drops KV from ~19 GB to ~5 GB.
         let swa_cap = SWA_RING_CAP.min(max_kv);
-        // FP8 e4m3fn KV cache (LAGUNA_FP8_KV): store K/V as 1 byte + per-(token,
-        // kv_head) f32 scale instead of f16. Halves KV storage AND the
-        // load-bound byte traffic. f16 remains the default until proven.
+        // INT8 symmetric KV cache (LAGUNA_FP8_KV — gate name kept): store K/V as
+        // 1 signed-int8 byte + per-(token, kv_head) f32 scale (amax/127) instead
+        // of f16. Halves KV storage AND the load-bound byte traffic, and beats
+        // e4m3 on KL/top-5 at matched bytes. f16 remains the default until proven.
         let fp8_kv = std::env::var("LAGUNA_FP8_KV").as_deref() == Ok("1");
         // FP8 FAKE-QUANT diagnostic: round-trip K/V through fp8 into the f16 cache.
         let fake = std::env::var("LAGUNA_FP8_FAKE").unwrap_or_default();
@@ -632,7 +633,15 @@ impl LagunaHetModel {
             _ => (false, false),
         };
         let fake_blk: u32 = std::env::var("LAGUNA_FP8_FAKE_BLK").ok().and_then(|s| s.parse().ok()).unwrap_or(128);
-        let fmt_of = |v: &str| -> u32 { if v == "e5m2" || v == "1" { 1 } else { 0 } };
+        // 0=e4m3, 1=e5m2, 2=int8 (amax/127), 3=int8 (amax/127.5, full range).
+        let fmt_of = |v: &str| -> u32 {
+            match v {
+                "e5m2" | "1" => 1,
+                "int8" | "2" => 2,
+                "int8f" | "3" => 3,
+                _ => 0,
+            }
+        };
         let fake_fmt_k = std::env::var("LAGUNA_FP8_FAKE_FMT_K").map(|v| fmt_of(&v)).unwrap_or(0);
         let fake_fmt_v = std::env::var("LAGUNA_FP8_FAKE_FMT_V").map(|v| fmt_of(&v)).unwrap_or(0);
         let fake_layers: u8 = match std::env::var("LAGUNA_FP8_FAKE_LAYERS").as_deref() {
@@ -656,7 +665,7 @@ impl LagunaHetModel {
             let elems = cap * N_KV_HEAD * HEAD_DIM;
             let rows = cap * N_KV_HEAD;
             if fp8_kv {
-                // e4m3fn bytes + f32 scale sidecar; f16 buffers are dummies.
+                // int8 bytes + f32 scale sidecar; f16 buffers are dummies.
                 kc8.push(DeviceBuffer::<u8>::new(dgpu.id, elems)?);
                 vc8.push(DeviceBuffer::<u8>::new(dgpu.id, elems)?);
                 kc8_scale.push(DeviceBuffer::<f32>::new(dgpu.id, rows)?);
@@ -673,7 +682,7 @@ impl LagunaHetModel {
             }
         }
         if fp8_kv {
-            eprintln!("[laguna] LAGUNA_FP8_KV=1: KV cache is e4m3fn (1 byte/elem + per-row f32 scale)");
+            eprintln!("[laguna] LAGUNA_FP8_KV=1: KV cache is int8 symmetric (1 byte/elem + per-row f32 scale, amax/127)");
         }
 
         // --- dGPU scratch ---
@@ -1416,6 +1425,39 @@ impl LagunaHetModel {
         let mut logits = vec![0f32; VOCAB];
         self.ds.logits.copy_to_host(&mut logits)?;
         Ok(logits)
+    }
+
+    /// DIAGNOSTIC: dump raw f16 K/V cache rows for the first `n_tok` tokens of
+    /// every 4th layer to `path` so the actual per-row value DISTRIBUTION can be
+    /// analysed offline (amax/sigma, kurtosis) — the mechanism that decides
+    /// whether int8-per-block or e4m3 quantizes KV better. Only valid when the
+    /// f16 cache is live (i.e. NOT `LAGUNA_FP8_KV=1`). Layout per record:
+    /// i32 layer, i32 is_v, i32 n_rows, i32 head_dim, then n_rows*head_dim f16.
+    pub fn dump_kv_rows(&self, path: &str, n_tok: usize) -> eyre::Result<()> {
+        use std::io::Write as _;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+        for il in (0..N_LAYER).step_by(4) {
+            let cap = self.kv_cap[il];
+            let ntok = n_tok.min(cap);
+            let rows = ntok * N_KV_HEAD;
+            let n = rows * HEAD_DIM;
+            for (is_v, buf) in [(0i32, &self.kc[il]), (1i32, &self.vc[il])] {
+                if buf.len() < n {
+                    continue;
+                }
+                let mut host = vec![0u16; buf.len()];
+                buf.copy_to_host(&mut host)?;
+                w.write_all(&(il as i32).to_le_bytes())?;
+                w.write_all(&is_v.to_le_bytes())?;
+                w.write_all(&(rows as i32).to_le_bytes())?;
+                w.write_all(&(HEAD_DIM as i32).to_le_bytes())?;
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(host.as_ptr() as *const u8, n * 2)
+                };
+                w.write_all(bytes)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn forward_logits(&mut self, tok_id: usize, pos: usize) -> eyre::Result<(usize, f32)> {

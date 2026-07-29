@@ -950,13 +950,15 @@ impl GqaAttention {
         ])
     }
 
-    // ==================== FP8 (e4m3fn) KV-cache variants ====================
-    // K/V cache is stored as 1-byte e4m3fn + per-(token,kv_head) f32 scale sidecar
-    // (LAGUNA_FP8_KV). Same math/launch geometry as the f16 wrappers; the kernels
-    // dequant during LDS/register staging via the native gfx1201 packed convert.
+    // ============== Quantized (int8 symmetric) KV-cache variants ==============
+    // K/V cache is stored as 1-byte int8 + per-(token,kv_head) f32 scale sidecar
+    // (LAGUNA_FP8_KV — gate name kept; format is now int8, amax/127). Same math/
+    // launch geometry as the f16 wrappers; the kernels dequant (int8->f32 widen +
+    // scale) during LDS/register staging. The `_fp8` wrapper suffix is retained
+    // to keep call sites stable; it denotes "the quantized-KV variant".
 
-    /// FP8 head-grouped WMMA FA prefill (global layers). Mirrors
-    /// [`prefill_flash_wmma_fa2_hg`] with e4m3fn K/V + scale sidecars.
+    /// Quantized-KV head-grouped WMMA FA prefill (global layers). Mirrors
+    /// [`prefill_flash_wmma_fa2_hg`] with int8 K/V + scale sidecars.
     #[allow(clippy::too_many_arguments)]
     pub fn prefill_flash_wmma_fa2_hg_fp8(
         &self,

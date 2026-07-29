@@ -530,86 +530,40 @@ typedef _Float16 gqa_half8  __attribute__((ext_vector_type(8)));
 typedef float     gqa_float8 __attribute__((ext_vector_type(8)));
 
 // =============================================================================
-// FP8 (e4m3fn) KV-cache dequant helper (LAGUNA_FP8_KV). K/V are stored as real
-// 1-byte e4m3fn + a per-(token,kv_head) f32 scale sidecar; the attention read
-// dequants back to f16 during LDS/register staging, halving the KV DRAM bytes
-// (the `s_wait_loadcnt`-bound load traffic) that ATT flagged.
+// INT8 symmetric KV-cache dequant helper (LAGUNA_FP8_KV — gate name kept; the
+// backing format is now int8, which strictly dominates e4m3 on KV quality at
+// matched bytes, see docs/laguna/FP8_KV_REVIVE.md 2026-07-28). K/V are stored as
+// signed int8 (two's complement in the u8 buffer) + a per-(token,kv_head) f32
+// scale sidecar = amax/127; the attention read dequants back to f16 during
+// LDS/register staging, halving the KV DRAM bytes (the `s_wait_loadcnt`-bound
+// load traffic) that ATT flagged.
 //
-// On gfx1200/1201 we use the NATIVE packed VOP3 convert
-// `__builtin_amdgcn_cvt_pk_f32_fp8` — verified bit-exact vs the ds4/
-// compressed-tensors e4m3fn table over all 254 finite bytes. We deliberately
-// avoid the VOP1 single-operand `cvt_f32_fp8` (erratum `cvt-fp8-vop1-bug`) and
-// the scale-fused form (intrinsic name absent in this toolchain; scale is
-// folded in software instead). The LUT is the portable fallback / reference for
-// other arches (these kernels never launch on the iGPU but must still compile).
+// Dequant is a plain int8->f32 widen (`(float)(signed char)`) then the per-row
+// scale multiply — replacing e4m3's `cvt_pk_f32_fp8`. Layout, load widths, and
+// the f16 LDS staging are byte-identical to the old e4m3 path (still 1 byte/elem
+// + f32 scale), so the LDS swizzle / occupancy / register footprint are
+// unchanged. Fully portable — no arch intrinsics needed (these kernels never
+// launch on the iGPU but must still compile there).
 // =============================================================================
 typedef float gqa_v2f __attribute__((ext_vector_type(2)));
 
-#if !(defined(__gfx1200__) || defined(__gfx1201__))
-__constant__ float c_gqa_e4m3fn_values[128] = {
-    0.0f, 0.001953125f, 0.00390625f, 0.005859375f,
-    0.0078125f, 0.009765625f, 0.01171875f, 0.013671875f,
-    0.015625f, 0.017578125f, 0.01953125f, 0.021484375f,
-    0.0234375f, 0.025390625f, 0.02734375f, 0.029296875f,
-    0.03125f, 0.03515625f, 0.0390625f, 0.04296875f,
-    0.046875f, 0.05078125f, 0.0546875f, 0.05859375f,
-    0.0625f, 0.0703125f, 0.078125f, 0.0859375f,
-    0.09375f, 0.1015625f, 0.109375f, 0.1171875f,
-    0.125f, 0.140625f, 0.15625f, 0.171875f,
-    0.1875f, 0.203125f, 0.21875f, 0.234375f,
-    0.25f, 0.28125f, 0.3125f, 0.34375f,
-    0.375f, 0.40625f, 0.4375f, 0.46875f,
-    0.5f, 0.5625f, 0.625f, 0.6875f,
-    0.75f, 0.8125f, 0.875f, 0.9375f,
-    1.0f, 1.125f, 1.25f, 1.375f,
-    1.5f, 1.625f, 1.75f, 1.875f,
-    2.0f, 2.25f, 2.5f, 2.75f,
-    3.0f, 3.25f, 3.5f, 3.75f,
-    4.0f, 4.5f, 5.0f, 5.5f,
-    6.0f, 6.5f, 7.0f, 7.5f,
-    8.0f, 9.0f, 10.0f, 11.0f,
-    12.0f, 13.0f, 14.0f, 15.0f,
-    16.0f, 18.0f, 20.0f, 22.0f,
-    24.0f, 26.0f, 28.0f, 30.0f,
-    32.0f, 36.0f, 40.0f, 44.0f,
-    48.0f, 52.0f, 56.0f, 60.0f,
-    64.0f, 72.0f, 80.0f, 88.0f,
-    96.0f, 104.0f, 112.0f, 120.0f,
-    128.0f, 144.0f, 160.0f, 176.0f,
-    192.0f, 208.0f, 224.0f, 240.0f,
-    256.0f, 288.0f, 320.0f, 352.0f,
-    384.0f, 416.0f, 448.0f, 0.0f,
-};
-#endif
-
 static __device__ __forceinline__ float gqa_fp8_to_f32(unsigned char b) {
-#if defined(__gfx1200__) || defined(__gfx1201__)
-    gqa_v2f r = __builtin_amdgcn_cvt_pk_f32_fp8((int)(unsigned int)b, false);
-    return r[0];
-#else
-    const float sign = (b & 0x80u) ? -1.0f : 1.0f;
-    return sign * c_gqa_e4m3fn_values[b & 0x7fu];
-#endif
+    // Reinterpret the stored byte as two's-complement int8 and widen.
+    return (float)(signed char)b;
 }
 
-// Packed convert: two adjacent e4m3fn bytes (a 16-bit word, low byte first) →
-// two f32. Uses the native VOP3 packed convert on gfx1200/1201 (2 f32/call,
-// halving the convert count vs the per-byte helper); portable LUT fallback on
-// other arches (these kernels never launch on the iGPU but must still compile).
+// Packed convert: two adjacent int8 bytes (a 16-bit word, low byte first) →
+// two f32. Mirrors the old packed e4m3 helper's interface so every call site is
+// unchanged; the byte layout is identical (1 byte/elem), only the interpretation
+// differs.
 static __device__ __forceinline__ gqa_v2f gqa_fp8x2_to_f32(unsigned short w) {
-#if defined(__gfx1200__) || defined(__gfx1201__)
-    return __builtin_amdgcn_cvt_pk_f32_fp8((int)(unsigned int)w, false);
-#else
     gqa_v2f r;
-    const unsigned char b0 = (unsigned char)(w & 0xffu);
-    const unsigned char b1 = (unsigned char)((w >> 8) & 0xffu);
-    r[0] = ((b0 & 0x80u) ? -1.0f : 1.0f) * c_gqa_e4m3fn_values[b0 & 0x7fu];
-    r[1] = ((b1 & 0x80u) ? -1.0f : 1.0f) * c_gqa_e4m3fn_values[b1 & 0x7fu];
+    r[0] = (float)(signed char)(unsigned char)(w & 0xffu);
+    r[1] = (float)(signed char)(unsigned char)((w >> 8) & 0xffu);
     return r;
-#endif
 }
 
-// Dequant one e4m3fn byte at `off` and apply the row scale at `srow`.
+// Dequant one int8 byte at `off` and apply the row scale at `srow`.
 static __device__ __forceinline__ _Float16 gqa_deq_fp8(
         const unsigned char * __restrict__ c, unsigned long long off,
         const float * __restrict__ scale, unsigned long long srow) {
@@ -2207,8 +2161,11 @@ void gqa_attn_decode_partial_hg_core(
     // Qs stored f16 (the query IS f16 in DRAM; (float)-widening at read is
     // exact → bit-identical) to shave DEC_KVG_MAX*DEC_FD*2 = 3 KB more LDS and,
     // with Os in registers, drop the tile under the 3-WG/CU LDS threshold.
-    // DEC_LDS_SWZ: zero-extra-LDS conflict swizzle. fp8's staging store owns 32 B
-    // per lane (half16) → per-lane byte stride 32 → the b128 sub-store's bank quad
+    // DEC_LDS_SWZ: zero-extra-LDS conflict swizzle. The quantized path's staging
+    // store owns 32 B per lane (half16) — the ring holds DEQUANTIZED f16, not the
+    // raw 1-B codes, so the per-lane LDS byte stride is 32 whether the DRAM format
+    // is int8 or e4m3; this analysis is format-invariant and the e4m3->int8 swap
+    // did not perturb it → per-lane byte stride 32 → the b128 sub-store's bank quad
     // (block%8) repeats every 4 lanes → 8-way LDS bank conflict (f16 owns 16 B →
     // 4-way, the 32-lane b128 floor). We XOR each 16-B LDS block index by a
     // function of its high bits so the 8 colliding lanes fan out across all 8 bank
@@ -2383,13 +2340,13 @@ void gqa_attn_decode_partial_hg_core(
         // --- DEFAULT: b128 (128-bit) wide coalesced global loads ---
         // A lane loads WELEM contiguous dims per global_load_b128 (16 B / 128-bit).
         //   f16: WELEM=8  (8 halfs  = 16 B) → 4 b128/lane/tile for K, 4 for V.
-        //   fp8: WELEM=16 (16 e4m3  = 16 B) → 2 b128/lane/tile for K, 2 for V.
-        // FP8 keeps the load WIDTH at b128 (16 B) but doubles ELEMENTS/instruction,
-        // so it issues HALF the load instructions of the old 8-B (b64) fp8 path —
-        // that path had the SAME load-instruction COUNT as f16 while moving half the
-        // bytes, so it never hid load latency (bytes halved, no speedup, net slower
-        // after dequant). At WELEM=16 the load count halves (the real MLP lever) and
-        // the dequant uses the PACKED v_cvt_pk_f32_fp8 (2 f32/call) → half the converts.
+        //   int8: WELEM=16 (16 int8 = 16 B) → 2 b128/lane/tile for K, 2 for V.
+        // The quantized path keeps the load WIDTH at b128 (16 B) but doubles
+        // ELEMENTS/instruction, so it issues HALF the load instructions of the old
+        // 8-B (b64) path — that path had the SAME load-instruction COUNT as f16
+        // while moving half the bytes, so it never hid load latency (bytes halved,
+        // no speedup, net slower after dequant). At WELEM=16 the load count halves
+        // (the real MLP lever); the dequant is a plain int8->f32 widen + scale.
         // With PFD_D=2 depth-2 prefetch, loads stay in flight across the compute window.
         // Register footprint is IDENTICAL: f16 kbuf[2][4] half8 = 32 VGPR; fp8
         // kbuf[2][2] half16 = 32 VGPR. LDS staging kept (transposes for compute).
@@ -2417,10 +2374,10 @@ void gqa_attn_decode_partial_hg_core(
                 const unsigned long long _phys = (unsigned long long)((k_base + _kg) % kv_capacity); \
                 const unsigned long long _off = _phys * row_stride + kvh_off + _d;       \
                 if constexpr (FP8) {                                                     \
-                    /* fp8: all WELEM=16 dims are within ONE key (_j), so they share    */\
+                    /* int8: all WELEM=16 dims are within ONE key (_j), so they share   */\
                     /* the (_phys, kh) scale. _off is a multiple of 16 (row_stride,     */\
-                    /* kvh_off, _d all %16==0) → the 16 e4m3fn bytes are ONE b128       */\
-                    /* COALESCED load; native packed convert does 2 f32/call.           */\
+                    /* kvh_off, _d all %16==0) → the 16 int8 bytes are ONE b128         */\
+                    /* COALESCED load; packed helper widens 2 int8/call.                */\
                     const unsigned long long _sr = _phys * n_kv_head + kh;               \
                     const float _ksc = k_scale[_sr];                                     \
                     const float _vsc = v_scale[_sr];                                     \
