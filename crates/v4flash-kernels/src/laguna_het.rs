@@ -619,9 +619,10 @@ impl LagunaHetModel {
         // small ring buffer (SWA_RING_CAP rows, capped at max_kv for short ctx)
         // suffices. At 100K ctx this drops KV from ~19 GB to ~5 GB.
         let swa_cap = SWA_RING_CAP.min(max_kv);
-        // FP8 e4m3fn KV cache (LAGUNA_FP8_KV): store K/V as 1 byte + per-(token,
-        // kv_head) f32 scale instead of f16. Halves KV storage AND the
-        // load-bound byte traffic. f16 remains the default until proven.
+        // INT8 symmetric KV cache (LAGUNA_FP8_KV — gate name kept): store K/V as
+        // 1 signed-int8 byte + per-(token, kv_head) f32 scale (amax/127) instead
+        // of f16. Halves KV storage AND the load-bound byte traffic, and beats
+        // e4m3 on KL/top-5 at matched bytes. f16 remains the default until proven.
         let fp8_kv = std::env::var("LAGUNA_FP8_KV").as_deref() == Ok("1");
         // FP8 FAKE-QUANT diagnostic: round-trip K/V through fp8 into the f16 cache.
         let fake = std::env::var("LAGUNA_FP8_FAKE").unwrap_or_default();
@@ -664,7 +665,7 @@ impl LagunaHetModel {
             let elems = cap * N_KV_HEAD * HEAD_DIM;
             let rows = cap * N_KV_HEAD;
             if fp8_kv {
-                // e4m3fn bytes + f32 scale sidecar; f16 buffers are dummies.
+                // int8 bytes + f32 scale sidecar; f16 buffers are dummies.
                 kc8.push(DeviceBuffer::<u8>::new(dgpu.id, elems)?);
                 vc8.push(DeviceBuffer::<u8>::new(dgpu.id, elems)?);
                 kc8_scale.push(DeviceBuffer::<f32>::new(dgpu.id, rows)?);
@@ -681,7 +682,7 @@ impl LagunaHetModel {
             }
         }
         if fp8_kv {
-            eprintln!("[laguna] LAGUNA_FP8_KV=1: KV cache is e4m3fn (1 byte/elem + per-row f32 scale)");
+            eprintln!("[laguna] LAGUNA_FP8_KV=1: KV cache is int8 symmetric (1 byte/elem + per-row f32 scale, amax/127)");
         }
 
         // --- dGPU scratch ---

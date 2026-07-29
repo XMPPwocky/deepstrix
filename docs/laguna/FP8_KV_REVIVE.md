@@ -305,3 +305,108 @@ long-context default.
 - At 256K, f16 physically OOMs, so "slightly lossy but runs at 16.44 tok/s"
   beats "cannot run". The drift there is the mild end of the range measured
   (KL ~0.19, 80% top-5 overlap, majority near-tie flips).
+
+---
+
+# ADDENDUM 2026-07-29 — quantized KV format swapped e4m3fn → INT8 symmetric (production)
+
+The `LAGUNA_FP8_KV=1` path is now backed by **int8 symmetric**, not e4m3fn. The
+env-var name is unchanged (it means "quantized KV"), and the wire layout is
+**byte-identical**: 1 byte/elem + the same per-`(token, kv_head)` f32 scale.
+Only the scale denominator and the encode/decode change:
+
+- write (`laguna_quantize_fp8_kv`): scale = **amax/127**; `q = roundf(v/scale)`
+  clamped to `[-127,127]`, stored two's-complement in the existing u8 buffer.
+- read (`gqa_fp8_to_f32` / `gqa_fp8x2_to_f32`): `(float)(signed char)` widen ×
+  the same row scale — replaces `v_cvt_pk_f32_fp8`. No arch intrinsic needed, so
+  the e4m3 LUT fallback (128 f32 of `__constant__`) is deleted from
+  `gqa_attention.hip`. `amax/127.5` was measured slightly worse; 127 is used.
+
+**e4m3 is REPLACED, not added as a second option.** Two lossy KV formats where
+one strictly dominates is pure maintenance cost. e4m3/e5m2 survive only in the
+`LAGUNA_FP8_FAKE` diagnostic round-trip (fmt 0/1), alongside int8 (fmt 2/3).
+
+## Why: int8 strictly dominates e4m3 at matched bytes
+
+Fake-quant grid (teacher-forced, 320 positions, per-row blk=128, vs f16):
+
+| depth | e4m3 KL | int8 KL | int8 better by |
+|---|---:|---:|---:|
+| 4K   | 0.5014 | 0.4388 | 12.5% |
+| 32K  | 0.2897 | 0.2589 | 10.6% |
+| 128K | 0.2485 | 0.2238 | 9.9% |
+
+**Confirmed on the REAL production path** (128K, K=4, same f16 reference — this
+is the decisive matched real-vs-real A/B, not real-vs-fake):
+
+| config | top-1 | top-5 | KL |
+|---|---:|---:|---:|
+| real e4m3 | 68.4% | 73.9% | 0.2763 |
+| **real int8** | **69.4%** | **75.3%** | **0.2421** |
+
+int8 is **12.4% lower KL** with better top-1 AND top-5 — agreeing with the
+fake-quant grid's ~10% prediction. Both real numbers sit ~8-11% above their
+fake-quant counterparts (the quantized prefill routes HG-3 while f16 default
+routes HGP-6 packed, so accumulation order differs), but the *ranking and margin
+are preserved*, which is the point of the check.
+
+Elementwise, the isolated decode A/B max_abs vs f16 improves 5-9×:
+int8 0.0014/0.0004/0.0002/0.0004 vs e4m3 0.0125/0.0023/0.0010/0.0024.
+
+Per-32 / per-16 blocking is slightly better on KL still (128K int8_16 = 0.1918)
+but grows bytes/token and would put the K=16 hot-expert tier at risk — NOT used.
+
+## Perf: no regression; a real win at shallow ctx
+
+Isolated decode-attention kernel, one n_kv per process (cross-context thermal
+accumulation otherwise penalises whichever format is timed second — that
+artifact produced a spurious "-24.6%" in an early sweep):
+
+| n_kv | f16 | int8 | |
+|---|---:|---:|---|
+| 32768  | 307.7 us | 278.6 us | **int8 1.10×** |
+| 65536  | 540.7 us | 518.1 us | int8 1.04× |
+| 100000 | 786.9 us | 783.8 us | 1.00× |
+| 196608 | 1515.6 us | 1538.6 us | 0.99× (−1.5%) |
+
+int8 is genuinely **faster than f16 below ~64K** and at parity by 100K. It does
+NOT stay faster at depth: f16 climbs from 73% → 89% of the 600 GB/s roofline as
+n_kv grows, while the quantized path plateaus at ~45% of its own halved-byte
+roofline — the per-tile pipeline (LDS staging, barriers, score/AV) does not
+scale with bytes and becomes the floor. −1.5% at 192K is inside noise and inside
+the ±2% gate. e4m3 measured on the same harness was +0.1% @100K / −0.7% @192K,
+i.e. int8 ≈ e4m3 on time while being materially better on quality.
+
+## Resources unchanged — the LDS swizzle is format-invariant
+
+| decode kernel | VGPR | LDS B | scratch | occ |
+|---|---:|---:|---:|---:|
+| `gqa_attn_decode_partial_hg` (f16) | 205 | 21136 | 0 | 6 w/SIMD |
+| `gqa_attn_decode_partial_hg_fp8` (int8) | **203** | **21136** | **0** | **6 w/SIMD** |
+
+The brief flagged a risk that the int8 ring's per-lane LDS stride might differ
+from fp8's and invalidate `DEC_LDS_SWZ`'s conflict analysis. **It does not.** The
+prefetch ring `dec_hw` is `_Float16 ext_vector(WELEM=16)` — it holds *dequantized
+f16*, never the raw 1-byte codes. So the staging store is 16 f16 = 32 B/lane for
+both formats, `WELEM`/`BLKPC`/`DEC_BLK` are untouched, and the 8-way→4-way XOR
+swizzle argument carries over verbatim. int8 uses 2 *fewer* VGPRs (no LUT
+address math), so the 709 B/WG headroom to the 3-WG/CU threshold is preserved.
+
+## Capacity unchanged
+
+Bytes/token (global layers) = `12×8×128×1×2` KV + `12×8×4×2` scale =
+**25344 B**, exactly as before → 4.98 GB at 192K. **Verified by loading, not
+arithmetic**: `LAGUNA_FP8_KV=1` + `laguna_hot_experts_k16.txt` at
+`LAGUNA_BENCH_CTXS=196608` loads and decodes at **20.66 tok/s**. The K=16 tier
+still fits.
+
+Bonus: the 192K quantized run hit the greedy parity token **22718 exactly**
+(`[OK parity/fp8]`) — e4m3 used to flip that near-tie. The f16 default path is
+untouched and still asserts 22718.
+
+## Does this change the DON'T-SHIP-as-default verdict? No.
+int8 removes the *quality* objection's sharpest edge and removes the shallow-ctx
+*speed* objection, but the ≤192K economics are unchanged: f16 fits and is at
+parity-or-faster at the depths that matter, so there is still no reason to pay
+any lossy-KV cost below 192K. int8 makes the >192K capability path (256K on a
+16 GB dGPU, where f16 OOMs) meaningfully better than it was.

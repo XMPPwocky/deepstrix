@@ -256,9 +256,10 @@ impl LagunaOps {
         launch_kernel!(f, cfg, stream, [out.raw(), input.raw(), n])
     }
 
-    /// FP8 (e4m3fn) KV-cache quantize (LAGUNA_FP8_KV). Quantizes `n_rows`
-    /// contiguous f32 rows of `head_dim` (<=128) into 1-byte e4m3fn (`out`) plus
-    /// one f32 per-row symmetric scale (`scale`, `amax/448`). One WG per row.
+    /// INT8 symmetric KV-cache quantize (LAGUNA_FP8_KV — gate name kept; format
+    /// is now int8). Quantizes `n_rows` contiguous f32 rows of `head_dim` (<=128)
+    /// into signed int8 (`out`, two's complement in the u8 buffer) plus one f32
+    /// per-row symmetric scale (`scale`, `amax/127`). One WG per row.
     pub fn quantize_fp8_kv(
         &self,
         stream: &Stream,

@@ -485,13 +485,17 @@ extern "C" __global__ void laguna_cast_f32_f16(
 }
 
 // --------------------------------------------------------------------------
-// FP8 (e4m3fn) KV-cache quantize (LAGUNA_FP8_KV write path). Quantizes `n_rows`
-// contiguous f32 rows of `head_dim` (<=128) into real 1-byte e4m3fn + one f32
-// per-row scale = amax/448 (symmetric, per-(token,kv_head) granularity — robust
-// to per-vector outliers, self-contained, no calibration). Encoding matches
-// fp8_e4m3fn.hip / compressed-tensors. On gfx1200/1201 uses the NATIVE packed
-// VOP3 convert `__builtin_amdgcn_cvt_pk_fp8_f32` (round-to-nearest-even, verified
-// vs the LUT); avoids the VOP1 erratum. Portable LUT fallback for other arches.
+// INT8 symmetric KV-cache quantize (LAGUNA_FP8_KV write path — the gate name is
+// kept; the backing format is now int8, which strictly dominates e4m3 on KV
+// quality at matched bytes, see docs/laguna/FP8_KV_REVIVE.md 2026-07-28). Layout
+// is BYTE-IDENTICAL to the old e4m3 path: 1 byte/elem + one f32 per-row scale.
+// Quantizes `n_rows` contiguous f32 rows of `head_dim` (<=128) into signed int8
+// (two's complement, stored in the u8 buffer) + one f32 per-row symmetric scale
+// = amax/127 (per-(token,kv_head) granularity — robust to per-vector outliers,
+// self-contained, no calibration). q = round-to-nearest(v/scale) clamped to
+// [-127,127]; dequant is (float)q * scale. Same amax/127 scheme as the ds4 q8_0
+// path. amax/127.5 was measured slightly worse, so 127 is used. Portable — no
+// arch intrinsics; identical ISA on gfx1200/1201 and the LUT-free fallback arch.
 //   grid: (n_rows,1,1)  block: (128,1,1); one WG per (token,kv_head) row.
 // --------------------------------------------------------------------------
 #if !(defined(__gfx1200__) || defined(__gfx1201__))
@@ -558,15 +562,18 @@ extern "C" __global__ void laguna_quantize_fp8_kv(
         if (t < s) { const float o = red[t + s]; if (o > red[t]) red[t] = o; }
         __syncthreads();
     }
-    // Per-row symmetric scale = amax/448 (floored to avoid div-by-zero rows).
-    float sc = red[0] * (1.0f / 448.0f);
+    // Per-row symmetric scale = amax/127 (floored to avoid div-by-zero rows).
+    float sc = red[0] * (1.0f / 127.0f);
     if (sc < 1.0e-12f) sc = 1.0e-12f;
     if (t == 0) scale[row] = sc;
     if (t < head_dim) {
-        float q = v / sc;
-        if (q > 448.0f) q = 448.0f;
-        if (q < -448.0f) q = -448.0f;
-        out[(unsigned long long)row * head_dim + t] = laguna_f32_to_fp8(q);
+        // Symmetric int8: round-half-away-from-zero, clamp to [-127,127], store
+        // as two's-complement in the u8 buffer. Matches the LAGUNA_FP8_FAKE
+        // fmt=2 fake-quant that validated the numerics (roundf, amax/127).
+        float q = roundf(v / sc);
+        if (q >  127.0f) q =  127.0f;
+        if (q < -127.0f) q = -127.0f;
+        out[(unsigned long long)row * head_dim + t] = (unsigned char)(signed char)(int)q;
     }
 }
 
