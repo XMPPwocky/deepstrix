@@ -607,8 +607,10 @@ static __device__ __forceinline__ float laguna_bf8_to_f32(unsigned char b) {
 #endif
 }
 
-// Generalized fp8/bf8 fake-quant round-trip with configurable scale block size.
-// fmt: 0=e4m3 (amax scale = 448), 1=e5m2 (amax scale = 57344).
+// Generalized fake-quant round-trip with configurable scale block size.
+// fmt: 0=e4m3 (amax scale = 448), 1=e5m2 (amax scale = 57344),
+//      2=int8 symmetric (scale = amax/127, round-half-away, clamp [-127,127]),
+//      3=int8 symmetric (scale = amax/127.5, round-half-away, full [-128,127]).
 // blk: elements sharing one amax scale (<=head_dim; head_dim => per-row). The
 // per-block amax reduction runs within each contiguous blk-chunk of the row.
 extern "C" __global__ void laguna_fp8_roundtrip_kv(
@@ -623,7 +625,12 @@ extern "C" __global__ void laguna_fp8_roundtrip_kv(
     if (row >= n_rows) return;
     const float * r = in + (unsigned long long)row * head_dim;
 
-    const float fmax = (fmt == 1u) ? 57344.0f : 448.0f;
+    const bool  is_int8 = (fmt == 2u || fmt == 3u);
+    // Denominator that maps amax onto the format's max code.
+    const float fmax = (fmt == 1u) ? 57344.0f
+                     : (fmt == 2u) ? 127.0f
+                     : (fmt == 3u) ? 127.5f
+                     : 448.0f;
     __shared__ float red[128];
     const float v = (t < head_dim) ? r[t] : 0.0f;
     red[t] = (t < head_dim) ? fabsf(v) : 0.0f;
@@ -642,13 +649,24 @@ extern "C" __global__ void laguna_fp8_roundtrip_kv(
     float sc = red[base] / fmax;
     if (sc < 1.0e-12f) sc = 1.0e-12f;
     if (t < head_dim) {
-        float q = v / sc;
-        if (q > fmax) q = fmax;
-        if (q < -fmax) q = -fmax;
         float deq;
-        if (fmt == 1u) deq = laguna_bf8_to_f32(laguna_f32_to_bf8(q));
-        else           deq = laguna_fp8_to_f32(laguna_f32_to_fp8(q));
-        out[(unsigned long long)row * head_dim + t] = (_Float16)(deq * sc);
+        if (is_int8) {
+            // Symmetric int8: round-half-away-from-zero, then clamp to the
+            // signed range and dequantize by the same per-block scale.
+            float q = roundf(v / sc);
+            const float lo = (fmt == 3u) ? -128.0f : -127.0f;
+            if (q >  127.0f) q =  127.0f;
+            if (q <  lo)     q =  lo;
+            deq = q * sc;
+            out[(unsigned long long)row * head_dim + t] = (_Float16)deq;
+        } else {
+            float q = v / sc;
+            if (q > fmax) q = fmax;
+            if (q < -fmax) q = -fmax;
+            if (fmt == 1u) deq = laguna_bf8_to_f32(laguna_f32_to_bf8(q));
+            else           deq = laguna_fp8_to_f32(laguna_f32_to_fp8(q));
+            out[(unsigned long long)row * head_dim + t] = (_Float16)(deq * sc);
+        }
     }
 }
 

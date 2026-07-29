@@ -247,6 +247,18 @@ fn main() -> eyre::Result<()> {
             eprintln!("prefilled {} ids in {:.1}s (last argmax {am} logit {lg:.3})", prefill_n, t.elapsed().as_secs_f32());
             prefill_n
         } else { 0 };
+        // LAGUNA_KV_DUMP_ROWS=<file>: after the prefill, dump the raw f16 K/V rows
+        // so the per-row value DISTRIBUTION (amax/sigma, kurtosis) can be analysed
+        // offline — that is what decides whether int8-per-block or e4m3 wins.
+        if let Ok(p) = std::env::var("LAGUNA_KV_DUMP_ROWS") {
+            let n = std::env::var("LAGUNA_KV_DUMP_TOK")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(512usize);
+            model.dump_kv_rows(&p, n)?;
+            eprintln!("dumped KV rows ({n} tok/layer) -> {p}");
+            return Ok(());
+        }
         for (i, &tok) in ids.iter().enumerate() {
             if i < start {
                 continue; // already ingested by prefill_batched
