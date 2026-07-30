@@ -410,3 +410,61 @@ int8 removes the *quality* objection's sharpest edge and removes the shallow-ctx
 parity-or-faster at the depths that matter, so there is still no reason to pay
 any lossy-KV cost below 192K. int8 makes the >192K capability path (256K on a
 16 GB dGPU, where f16 OOMs) meaningfully better than it was.
+
+---
+
+# ADDENDUM 2026-07-30 — the line is CLOSED: f16 decode attention is compute/DRAM BALANCED
+
+Final experiment in the quantized-KV arc. Hypothesis: int8 sustains only ~45% of its
+own halved-byte roofline at 192K while f16 sustains 89% of the full roofline, so
+int8 must be bound by a byte-INVARIANT per-tile pipeline — because the LDS staging
+holds DEQUANTIZED f16 (32 B/lane) for both formats, discarding int8's saving at the
+LDS level. Fix: stage RAW int8 in LDS, dequantize at point-of-use, which halves LDS
+per key and lets Bc go 32 -> 64 at constant occupancy, halving tile/barrier count.
+
+**Built exactly as specified. REFUTED. Dropped.** (Artifact preserved on branch
+`int8-lds`, commit 719c64e, dormant behind `DEC_I8_LDS`; NOT merged to master.)
+
+## The lever moved nothing
+int8 bandwidth stayed pinned at **42-44% of the halved-byte roofline in EVERY
+config**:
+| config | VGPR | LDS B | scratch | WG/CU | 192K us | vs f16 |
+|---|---:|---:|---:|:--:|---:|---:|
+| f16 (untouched) | 205 | 21136 | 0 | 3 | 1525 | — |
+| int8-lds Bc=64 (PFD=1) | 165 | 21636 | 0 | 3 | 1566 | -2.7% |
+| int8-lds Bc=32 (PFD=2) | 225 | 12036 | 0 | **5** | 1634 | -5.7% |
+| int8-lds Bc=128 | — | 40836 | **1900** | 1 | dead | — |
+
+Three independent attacks on "per-tile staging/barrier overhead" — raw-int8 LDS,
+Bc=64 (tiles and barriers HALVED), and Bc=32 at 5 WG/CU (occupancy RAISED) — all
+left the achieved bandwidth unmoved. The hypothesis was wrong.
+
+## What actually binds (the decisive diagnostic)
+Half-heads (`DEC_I8_HALFHEADS`, score+AV over 3 heads instead of 6) at 192K cut the
+wall only **1634 -> 1326 us (-19%)** and left it at **52% of roofline** — still not
+DRAM-bound. So the floor is **per-head score/AV COMPUTE** (~38%) plus a shared
+per-tile pipeline — and that compute is exactly what f16 performs after its dequant.
+
+## STANDING CONCLUSION — stop optimizing this axis
+**f16 decode attention at depth is PERFECTLY BALANCED: compute ~= DRAM ~= 1525 us.**
+Therefore **no KV quantization scheme can beat f16 at long context on this kernel.**
+Halving bytes does not speed anything up; it exposes a compute wall that was already
+there at the same height. Data placement — LDS format, tile size, occupancy — cannot
+drop below it.
+
+This retroactively explains the whole arc: e4m3 at parity, int8 at parity, MLP
+inert, scale granularity inert. Every one of them rearranged the memory side of a
+kernel whose memory side was already matched to its compute side.
+
+The only remaining lever is cutting the score/AV FLOPs themselves. The shelved
+`decode-attn-WMMA` stash already measured WMMA as BW-neutral on this path.
+
+## Refuted-levers list for int8 decode attention (do not retry)
+dequant/VALU cost · prefetch depth / MLP · load width (fixed, real) · scale
+granularity · e5m2 for V · K/V format asymmetry · **LDS staging bytes** ·
+**tile/barrier count (Bc)** · **occupancy (WG/CU)**.
+
+## What quantized KV IS still for
+Capacity, and only capacity: it halves KV (9.74 -> 5.02 GB at 192K), which buys the
+K=16 hot-expert tier where f16 gets K=0, and it is the only way to fit 256K on 16 GB.
+That remains the entire case for `LAGUNA_FP8_KV=1`, and it is unchanged.
