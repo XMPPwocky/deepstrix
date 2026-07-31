@@ -221,3 +221,85 @@ fn sampler_multinomial_marginal_matches_softmax() -> eyre::Result<()> {
     assert_eq!(other, 0, "tail buckets must have negligible sampling mass");
     Ok(())
 }
+
+#[test]
+#[ignore]
+fn sampler_multinomial_min_p_renormalises() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let device = pick_device()?;
+    device.set_current()?;
+    let arch = device.properties()?.gcn_arch_name;
+    let sampler = Sampler::for_arch(&arch)?;
+    let stream = Stream::new(device.id)?;
+
+    // Same 8-bucket head as the marginal test. With min_p_rel = 0.1,
+    // buckets 0..5 survive (rel probs 1.0, .61, .37, .22, .14) and 5..8
+    // are pruned (.082, .050, .030). Marginals must renormalise over the
+    // survivors; the pre-fix kernel left pruned mass in Z and routed it
+    // to the argmax fallback, inflating bucket 0 by ~6.5 points.
+    let min_p_rel = 0.1f32;
+    let bucket_logits: [f32; 8] = [3.0, 2.5, 2.0, 1.5, 1.0, 0.5, 0.0, -0.5];
+    let mut logits = vec![-30.0f32; N_VOCAB as usize];
+    for (i, &v) in bucket_logits.iter().enumerate() {
+        logits[i] = v;
+    }
+    let max_l = bucket_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let rel: Vec<f64> = bucket_logits.iter().map(|&v| ((v - max_l) as f64).exp()).collect();
+    let z: f64 = rel.iter().filter(|&&e| e >= min_p_rel as f64).sum();
+    let expected_prob: Vec<f64> = rel
+        .iter()
+        .map(|&e| if e >= min_p_rel as f64 { e / z } else { 0.0 })
+        .collect();
+
+    let mut d_logits: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N_VOCAB as usize)?;
+    let mut d_partials_max: DeviceBuffer<f32> =
+        DeviceBuffer::new(device.id, SAMPLER_N_WG as usize)?;
+    let mut d_partials_z: DeviceBuffer<f32> =
+        DeviceBuffer::new(device.id, SAMPLER_N_WG as usize)?;
+    let mut d_u01: DeviceBuffer<f32> = DeviceBuffer::new(device.id, 1)?;
+    let mut d_out: DeviceBuffer<i32> = DeviceBuffer::new(device.id, 1)?;
+    d_logits.copy_from_host(&logits)?;
+
+    let mut counts = [0u64; 8];
+    let mut other = 0u64;
+    let mut rng = SamplerRng::new(0x5EED);
+    let n_samples = 20_000u64;
+    let mut got = [0i32; 1];
+    for _ in 0..n_samples {
+        let u = rng.next_f32();
+        d_u01.copy_from_host(&[u])?;
+        sampler.launch_multinomial(
+            &stream,
+            &mut d_out,
+            &d_logits,
+            &mut d_partials_max,
+            &mut d_partials_z,
+            &d_u01,
+            N_VOCAB,
+            1.0,
+            min_p_rel,
+        )?;
+        stream.synchronize()?;
+        d_out.copy_to_host(&mut got)?;
+        let i = got[0];
+        if i >= 0 && (i as usize) < 8 {
+            counts[i as usize] += 1;
+        } else {
+            other += 1;
+        }
+    }
+    eprintln!("counts: {:?}, other: {}", counts, other);
+
+    for i in 0..8 {
+        let observed = counts[i] as f64 / n_samples as f64;
+        let expected = expected_prob[i];
+        let diff = (observed - expected).abs();
+        eprintln!("  bucket {}: observed={:.4}, expected={:.4}, |Δ|={:.4}", i, observed, expected, diff);
+        assert!(
+            diff < 0.02,
+            "bucket {i} marginal off by {diff:.4} (observed {observed:.4} vs expected {expected:.4})"
+        );
+    }
+    assert_eq!(other, 0, "pruned/tail buckets must never be sampled");
+    Ok(())
+}
