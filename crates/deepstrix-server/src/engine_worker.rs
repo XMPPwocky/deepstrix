@@ -26,7 +26,9 @@ use v4flash_kernels::RopeParams;
 use crate::embed::{build_gpt2_byte_decoder, embed_lookup, gpt2_decode_token};
 use crate::rope_for_layer;
 use crate::snapshot::{self, ModelFingerprint, SnapshotIndex};
-use crate::tokens::{is_turn_end, TOK_ASSISTANT, TOK_EOS, TOK_THINK_BEGIN, TOK_THINK_END};
+use crate::tokens::{
+    is_turn_end, TOK_ASSISTANT, TOK_EOS, TOK_THINK_BEGIN, TOK_THINK_END, TOK_USER,
+};
 
 /// Per-request input.
 pub struct GenerateReq {
@@ -647,7 +649,7 @@ mod tests {
 
     /// Loads the real BPE vocab. Gated since the GGUF is large.
     fn load_vocab() -> Option<BpeVocab> {
-        let path = "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf";
+        let path = "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf";
         if !std::path::Path::new(path).exists() {
             return None;
         }
@@ -1053,6 +1055,7 @@ fn handle_generate_stream(
             &req.tokens,
             TOK_EOS,
             TOK_ASSISTANT,
+            TOK_USER,
             state.vocab.as_ref(),
             &state.byte_decoder,
         );
@@ -1234,14 +1237,62 @@ fn handle_generate_stream(
         save_live_if_dirty(state);
         state.state.reset_in_place(state.dgpu, state.igpu)?;
         state.live = None;
-        prefill_suffix(state, &req.tokens, 0, Some(&cancel))?;
+
+        // Split the prefill at the first `<User>` so the system block
+        // lands on disk as a standalone, conversation-agnostic
+        // snapshot. Reaching the full path means no snapshot covered
+        // this request, so the system prefix is genuinely absent from
+        // the index (had it been there, `find_longest_prefix` would
+        // have matched it at the `<User>` probe and taken the restore
+        // path). Every later conversation sharing this system prompt
+        // restores it instead of re-prefilling ~13-21K tokens.
+        //
+        // Boundary is `first_user + 1` — inclusive of `<User>` — to
+        // match the probe, which hashes AFTER folding in the token it
+        // triggered on.
+        let sys_prefix_len = req
+            .tokens
+            .iter()
+            .position(|&t| t == TOK_USER)
+            .map(|i| i + 1)
+            .filter(|&n| n >= DISK_RESTORE_MIN_TOKENS && n < req.tokens.len());
+        if let Some(n) = sys_prefix_len {
+            prefill_suffix(state, &req.tokens[..n], 0, Some(&cancel))?;
+            if cancel.load(Ordering::Relaxed) {
+                tracing::info!(
+                    fp = %state_fingerprint(state),
+                    "generate: cancelled mid-prefill (system-prefix path)"
+                );
+                return Ok(());
+            }
+            // Session-agnostic on purpose: this snapshot is shared by
+            // every conversation using this system prompt, so it must
+            // not join one lineage's R1 retention pool. Global LRU
+            // still governs it, and each restore `touch()`es it — the
+            // more it's reused, the safer it is from eviction.
+            state.live = Some(LiveSession {
+                tokens: req.tokens[..n].to_vec(),
+                pos: n as u32,
+                dirty: true,
+                session_id: None,
+            });
+            save_live_if_dirty(state);
+            tracing::info!(
+                sys_prefix_tokens = n,
+                req_len = req.tokens.len(),
+                "saved system-prefix snapshot"
+            );
+        }
+        let (resume_from, pos0) = sys_prefix_len.map_or((0, 0u32), |n| (n, n as u32));
+        prefill_suffix(state, &req.tokens[resume_from..], pos0, Some(&cancel))?;
         if cancel.load(Ordering::Relaxed) {
             tracing::info!(
                 fp = %state_fingerprint(state),
                 "generate: cancelled mid-prefill (full path)"
             );
-            // live is already None; KV cache has partial garbage but
-            // the next request's reset_in_place will clear it.
+            // KV cache has partial garbage but the next request's
+            // reset_in_place will clear it.
+            state.live = None;
             return Ok(());
         }
         tracing::info!(

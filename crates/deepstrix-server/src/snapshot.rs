@@ -475,21 +475,30 @@ impl SnapshotIndex {
     /// Walk `tokens` looking for the longest prefix `tokens[..i]` whose
     /// byte-decoded form (`blake3(decode(tokens[..i]))`) matches an
     /// on-disk snapshot. Probes at turn-boundary indices: positions
-    /// `i` where `tokens[i-1]` is either `TOK_EOS` (end-of-message)
-    /// or `TOK_ASSISTANT` (start of an assistant turn — the
-    /// canonical save point for the start-of-think snapshot). The
-    /// latter is essential: post-`<think>`-design snapshots end at
-    /// `<Assistant>` (not EOS), and probing only at EOS would never
-    /// find them. Returns `(req_prefix_len, hash, dir)` of the
-    /// largest match — where `req_prefix_len` is the req-side token
-    /// count for the byte boundary that hashed (the snapshot's
-    /// stored token count may differ, since the same bytes can
-    /// split differently).
+    /// `i` where `tokens[i-1]` is `TOK_EOS` (end-of-message),
+    /// `TOK_ASSISTANT` (start of an assistant turn — the canonical
+    /// save point for the start-of-think snapshot), or `TOK_USER`
+    /// (start of a user turn). `TOK_ASSISTANT` is essential:
+    /// post-`<think>`-design snapshots end at `<Assistant>` (not
+    /// EOS), and probing only at EOS would never find them.
+    /// `TOK_USER` is what makes the *system prompt* reusable across
+    /// conversations: a fresh conversation shares only
+    /// `[BOS + system + tools + <User>]` with anything already on
+    /// disk, and diverges at the first byte of the user message. That
+    /// boundary is the sole probe point a new conversation can hit,
+    /// and it pairs with the system-prefix save in
+    /// `handle_generate_stream`'s full-prefill path.
+    ///
+    /// Returns `(req_prefix_len, hash, dir)` of the largest match —
+    /// where `req_prefix_len` is the req-side token count for the
+    /// byte boundary that hashed (the snapshot's stored token count
+    /// may differ, since the same bytes can split differently).
     pub fn find_longest_prefix(
         &self,
         tokens: &[i32],
         tok_eos: i32,
         tok_assistant: i32,
+        tok_user: i32,
         vocab: &BpeVocab,
         byte_decoder: &std::collections::HashMap<char, u8>,
     ) -> Option<(usize, [u8; 32], PathBuf)> {
@@ -503,7 +512,7 @@ impl SnapshotIndex {
         };
         for (i, &tok) in tokens.iter().enumerate() {
             byte_prefix.extend(decode(tok));
-            if tok == tok_eos || tok == tok_assistant {
+            if tok == tok_eos || tok == tok_assistant || tok == tok_user {
                 let h = *blake3::hash(&byte_prefix).as_bytes();
                 if let Some(entry) = self.by_hash.get(&h) {
                     let req_prefix_len = i + 1;
