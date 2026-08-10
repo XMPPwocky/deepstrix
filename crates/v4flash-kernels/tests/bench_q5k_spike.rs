@@ -122,6 +122,13 @@ fn bench_q5k_vs_q8() -> eyre::Result<()> {
     let t_q8b = time_it(&stream, warmup, iters, || {
         q8.matvec_batched(&stream, &mut outb, &w8, &xqb, &xscaleb, n_rows, k, b_big)
     })?;
+    let gemm = v4flash_kernels::dense_gemm::DenseGemmDp4a::for_arch(&arch)?;
+    let mut xq8k: DeviceBuffer<u8> = DeviceBuffer::new(dgpu.id, (b_big as usize) * (k as usize / 256) * 292)?;
+    xq8k.fill_zero()?;
+    let t_kq = time_it(&stream, warmup, iters, || {
+        gemm.gemm(&stream, v4flash_core::gguf::GgufType::Q5_K, &mut outb, &w5, &xq8k, b_big, n_rows, k / 256)
+    })?;
+    eprintln!("prefill B={b_big}: q5_k dp4a GEMM {t_kq:.3} ms  (vs q8 WMMA {t_gemm:.3})");
     eprintln!(
         "prefill B={b_big}: q8 WMMA GEMM {t_gemm:.3} ms   q8 matvec_batched {t_q8b:.3} ms   q5_k matvec_batched {t_q5b:.3} ms"
     );

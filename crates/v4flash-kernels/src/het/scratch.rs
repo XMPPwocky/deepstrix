@@ -160,6 +160,10 @@ pub struct DgpuScratch {
     pub head_embd: DeviceBuffer<f32>,
     pub head_norm: DeviceBuffer<f32>,
     pub head_xq: DeviceBuffer<i8>,
+    /// Q8_K of head_norm (16×292 B) — Q4_K head via dp4a GEMM@B=1.
+    pub head_q8k: DeviceBuffer<u8>,
+    /// Q8_K of mid_sh (8×292 B) — Q6_K shexp-down via dp4a GEMM@B=1.
+    pub mid_sh_q8k: DeviceBuffer<u8>,
     pub head_xscale: DeviceBuffer<f32>,
     pub logits: DeviceBuffer<f32>,
 
@@ -311,6 +315,8 @@ impl DgpuScratch {
             head_embd: DeviceBuffer::new(device_id, N_EMBD as usize)?,
             head_norm: DeviceBuffer::new(device_id, N_EMBD as usize)?,
             head_xq: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            head_q8k: DeviceBuffer::new(device_id, 16 * 292)?,
+            mid_sh_q8k: DeviceBuffer::new(device_id, 8 * 292)?,
             head_xscale: DeviceBuffer::new(device_id, BLOCKS_N_EMBD as usize)?,
             logits: DeviceBuffer::new(device_id, N_VOCAB as usize)?,
 

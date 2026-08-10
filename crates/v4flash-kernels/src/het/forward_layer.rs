@@ -1634,10 +1634,29 @@ fn issue_shared_expert(
     dense_matvec(de, stream, &mut dgpu_scratch.gate_sh, &dlw.shared.gate, &dgpu_scratch.ffn_input_norm, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_FF_SHARED, N_EMBD)?;
     dense_matvec(de, stream, &mut dgpu_scratch.up_sh, &dlw.shared.up, &dgpu_scratch.ffn_input_norm, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_FF_SHARED, N_EMBD)?;
     de.swiglu.launch(stream, &mut dgpu_scratch.mid_sh, &dgpu_scratch.gate_sh, &dgpu_scratch.up_sh, N_FF_SHARED)?;
-    if any_q8(&[&dlw.shared.down]) {
-        de.q8.quantize_input(stream, &mut dgpu_scratch.mid_sh_xq, &mut dgpu_scratch.mid_sh_xscale, &dgpu_scratch.mid_sh, N_FF_SHARED)?;
+    match dlw.shared.down.dtype {
+        // dp4a GEMM@B=1: 0.019 vs 0.032 ms scalar gemv on [2048->4096]
+        // (bench_kquant_dense_isolated) — ~0.55 ms/token across 43 layers.
+        v4flash_core::gguf::GgufType::Q6_K => {
+            de.q8k.launch(stream, &mut dgpu_scratch.mid_sh_q8k, &dgpu_scratch.mid_sh, 8)?;
+            de.dense_gemm.gemm(
+                stream,
+                v4flash_core::gguf::GgufType::Q6_K,
+                &mut dgpu_scratch.ffn_shared,
+                &dlw.shared.down.buffer,
+                &dgpu_scratch.mid_sh_q8k,
+                1,
+                N_EMBD,
+                8,
+            )?;
+        }
+        _ => {
+            if any_q8(&[&dlw.shared.down]) {
+                de.q8.quantize_input(stream, &mut dgpu_scratch.mid_sh_xq, &mut dgpu_scratch.mid_sh_xscale, &dgpu_scratch.mid_sh, N_FF_SHARED)?;
+            }
+            dense_matvec(de, stream, &mut dgpu_scratch.ffn_shared, &dlw.shared.down, &dgpu_scratch.mid_sh, &dgpu_scratch.mid_sh_xq, &dgpu_scratch.mid_sh_xscale, N_EMBD, N_FF_SHARED)?;
+        }
     }
-    dense_matvec(de, stream, &mut dgpu_scratch.ffn_shared, &dlw.shared.down, &dgpu_scratch.mid_sh, &dgpu_scratch.mid_sh_xq, &dgpu_scratch.mid_sh_xscale, N_EMBD, N_FF_SHARED)?;
     Ok(())
 }
 

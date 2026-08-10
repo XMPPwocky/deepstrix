@@ -87,17 +87,35 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.head.vocab_matvec", &de.compute)?;
-            super::dispatch::dense_matvec(
-                de,
-                &de.compute,
-                &mut scratch.logits,
-                &weights.output,
-                &scratch.head_norm,
-                &scratch.head_xq,
-                &scratch.head_xscale,
-                N_VOCAB,
-                N_EMBD,
-            )?;
+            match weights.output.dtype {
+                // dp4a GEMM@B=1 beats both the scalar Q4_K gemv (0.48 vs
+                // 0.62 ms) and the Q8_0 dp4a matvec (0.90 ms) on the head
+                // shape — bench_kquant_dense_isolated, 2026-08-10.
+                v4flash_core::gguf::GgufType::Q4_K => {
+                    de.q8k.launch(&de.compute, &mut scratch.head_q8k, &scratch.head_norm, 16)?;
+                    de.dense_gemm.gemm(
+                        &de.compute,
+                        v4flash_core::gguf::GgufType::Q4_K,
+                        &mut scratch.logits,
+                        &weights.output.buffer,
+                        &scratch.head_q8k,
+                        1,
+                        N_VOCAB,
+                        16,
+                    )?;
+                }
+                _ => super::dispatch::dense_matvec(
+                    de,
+                    &de.compute,
+                    &mut scratch.logits,
+                    &weights.output,
+                    &scratch.head_norm,
+                    &scratch.head_xq,
+                    &scratch.head_xscale,
+                    N_VOCAB,
+                    N_EMBD,
+                )?,
+            }
         }
         drop(_t_head);
         Ok(())
