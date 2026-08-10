@@ -76,7 +76,7 @@ fn bench_prefill_v2() -> eyre::Result<()> {
     eprintln!("bench_prefill_v2: B={b}, warmup={n_warmup}, iters={n_iters}");
 
     let dump = ActivationDump::open(dump_dir())?;
-    let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
+    let main_gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MAIN_MODEL_PATH.to_string()))?;
     let dgpu = pick_dgpu()?;
     let igpu = pick_igpu()?;
     let dgpu_arch = dgpu.properties()?.gcn_arch_name;
@@ -210,7 +210,7 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
     );
 
     let dump = ActivationDump::open(dump_dir())?;
-    let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
+    let main_gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MAIN_MODEL_PATH.to_string()))?;
     let dgpu = pick_dgpu()?;
     let igpu = pick_igpu()?;
     let dgpu_arch = dgpu.properties()?.gcn_arch_name;
@@ -628,7 +628,7 @@ fn bench_prefill_expert_stats() -> eyre::Result<()> {
     eprintln!("expert-stats run: T={t}");
 
     let dump = ActivationDump::open(dump_dir())?;
-    let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
+    let main_gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MAIN_MODEL_PATH.to_string()))?;
     let dgpu = pick_dgpu()?;
     let igpu = pick_igpu()?;
     let dgpu_arch = dgpu.properties()?.gcn_arch_name;

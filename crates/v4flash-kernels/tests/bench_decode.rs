@@ -81,7 +81,7 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
     eprintln!("bench config: n_tokens={n_tokens}, warmup={warmup}, fake_pos={fake_pos}");
 
     let dump = ActivationDump::open(dump_dir())?;
-    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MODEL_PATH.to_string()))?;
 
     let dgpu = pick_dgpu_device()?;
     let igpu = pick_igpu_device()?;
