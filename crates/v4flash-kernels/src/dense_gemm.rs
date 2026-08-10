@@ -17,9 +17,13 @@ use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
 const LAGUNA_MOE_TILED_GFX1201: &[u8] = include_bytes!(env!("KERNEL_LAGUNA_MOE_TILED_GFX1201"));
 const LAGUNA_MOE_TILED_GFX1151: &[u8] = include_bytes!(env!("KERNEL_LAGUNA_MOE_TILED_GFX1151"));
+const KQ_WMMA_GFX1201: &[u8] = include_bytes!(env!("KERNEL_KQUANT_GEMM_WMMA_GFX1201"));
+const KQ_WMMA_GFX1151: &[u8] = include_bytes!(env!("KERNEL_KQUANT_GEMM_WMMA_GFX1151"));
 
 pub struct DenseGemmDp4a {
     module: Module,
+    /// WMMA GEMM (gfx12 only): dequant-to-f16-in-LDS + matrix cores.
+    wmma: Option<Module>,
 }
 
 impl DenseGemmDp4a {
@@ -32,7 +36,13 @@ impl DenseGemmDp4a {
             return Err(eyre!("unsupported arch for dense_gemm_dp4a: {arch}"));
         };
         let module = Module::load_data(image)?;
-        Ok(Self { module })
+        let wmma = if arch.starts_with("gfx1201") {
+            Some(Module::load_data(KQ_WMMA_GFX1201)?)
+        } else {
+            let _ = KQ_WMMA_GFX1151; // stub image; iGPU never dispatches these
+            None
+        };
+        Ok(Self { module, wmma })
     }
 
     /// `out[b, r] = Σ_k dequant(W[r, k]) * dequant(xq[b, k])` — W in `dt`,
@@ -59,11 +69,22 @@ impl DenseGemmDp4a {
         if n_blk == 0 || n_blk > 16 {
             return Err(eyre!("dense_gemm_dp4a: n_blk={n_blk} not in 1..=16"));
         }
-        let (fname, block_bytes) = match dt {
-            GgufType::Q4_K => ("q4_k_dense_gemm_dp4a_r32_nolds", 144usize),
-            GgufType::Q5_K => ("q5_k_dense_gemm_dp4a_r32_nolds", 176),
-            GgufType::Q6_K => ("q6_k_dense_gemm_dp4a_r32_nolds", 210),
-            other => return Err(eyre!("dense_gemm_dp4a: unsupported dtype {other:?}")),
+        // WMMA path (gfx12) beats dp4a whenever the matrix cores can be
+        // fed — B must fill at least one BN=64 tile to pay for the LDS
+        // dequant, so B=1 decode keeps the dp4a kernel.
+        // KQ_GEMM=dp4a forces the register-tiled path.
+        static FORCE_DP4A: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("KQ_GEMM").map(|v| v == "dp4a").unwrap_or(false)
+        });
+        let use_wmma = !*FORCE_DP4A && b >= 64 && self.wmma.is_some();
+        let (fname, block_bytes) = match (dt, use_wmma) {
+            (GgufType::Q4_K, false) => ("q4_k_dense_gemm_dp4a_r32_nolds", 144usize),
+            (GgufType::Q5_K, false) => ("q5_k_dense_gemm_dp4a_r32_nolds", 176),
+            (GgufType::Q6_K, false) => ("q6_k_dense_gemm_dp4a_r32_nolds", 210),
+            (GgufType::Q4_K, true) => ("q4_k_gemm_wmma_lds_tiled", 144),
+            (GgufType::Q5_K, true) => ("q5_k_gemm_wmma_lds_tiled", 176),
+            (GgufType::Q6_K, true) => ("q6_k_gemm_wmma_lds_tiled", 210),
+            (other, _) => return Err(eyre!("dense_gemm: unsupported dtype {other:?}")),
         };
         let need_w = (n_rows as usize) * (n_blk as usize) * block_bytes;
         if w.byte_len() < need_w {
@@ -74,6 +95,18 @@ impl DenseGemmDp4a {
         }
         if out.len() < (b as usize) * (n_rows as usize) {
             return Err(eyre!("dense_gemm_dp4a: out len {} < B*n_rows", out.len()));
+        }
+        if use_wmma {
+            let function = self.wmma.as_ref().expect("checked").get_function(fname)?;
+            let cfg = LaunchConfig {
+                grid: (n_rows.div_ceil(64), b.div_ceil(64), 1),
+                block: (128, 1, 1), // 4 warps × wave32
+                shared_mem_bytes: 0,
+            };
+            let k = n_blk * 256;
+            return launch_kernel!(function, cfg, stream, [
+                out.raw(), w.raw(), xq.raw(), k, n_rows, b, n_blk
+            ]);
         }
         let function = self.module.get_function(fname)?;
         let cfg = LaunchConfig {

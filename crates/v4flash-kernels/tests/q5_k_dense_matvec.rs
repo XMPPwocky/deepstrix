@@ -9,6 +9,7 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::dense_gemm::DenseGemmDp4a;
 use v4flash_kernels::iq2_xxs_tables::f16_to_f32;
+use v4flash_kernels::weight_contract::f32_to_f16_bits;
 use v4flash_kernels::q5_k_dense::{Q5_KDenseMatvec, Q5_K_DENSE_BLOCK_BYTES};
 
 const QK_K: usize = 256;
@@ -73,7 +74,7 @@ fn run_on(device: Device) -> eyre::Result<()> {
     let k = 4096usize;
     let n_rows = 2048usize;
     let n_super = k / QK_K;
-    let batch = 3usize;
+    let batch = 96usize; // >=64 so the WMMA GEMM path is covered too
 
     let mut rng = Lcg::new(0x51c0de);
     let mut w = vec![0u8; n_rows * n_super * BB];
@@ -176,6 +177,23 @@ fn run_on(device: Device) -> eyre::Result<()> {
             }
         }
     }
+    // f16-operand reference (what the WMMA kernel actually computes).
+    let mut want_h = vec![0f32; batch * n_rows];
+    for r in 0..n_rows {
+        for blk in 0..n_blk {
+            dequant_q5k(&w[(r * n_blk + blk) * BB..(r * n_blk + blk + 1) * BB], &mut deq);
+            for bt in 0..batch {
+                let d = xd[bt * n_blk + blk];
+                let mut s = 0f32;
+                for i in 0..QK_K {
+                    let a = f16_to_f32(f32_to_f16_bits(deq[i]));
+                    let b = f16_to_f32(f32_to_f16_bits(d * xq_int[bt * k + blk * 256 + i] as f32));
+                    s += a * b;
+                }
+                want_h[bt * n_rows + r] += s;
+            }
+        }
+    }
     let mut xq8k_d: DeviceBuffer<u8> = DeviceBuffer::new(device.id, xq8k.len())?;
     xq8k_d.copy_from_host(&xq8k)?;
     let mut outg_d: DeviceBuffer<f32> = DeviceBuffer::new(device.id, batch * n_rows)?;
@@ -184,11 +202,35 @@ fn run_on(device: Device) -> eyre::Result<()> {
     stream.synchronize()?;
     let mut gotg = vec![0f32; batch * n_rows];
     outg_d.copy_to_host(&mut gotg)?;
-    check(&format!("{arch} gemm_dp4a"), &gotg, &want_g)?;
+    // gfx1201 routes B>=64 to the WMMA kernel (f16 operands, f32
+    // accumulate — same precision class as the shipped Q8_0 WMMA GEMM);
+    // gfx1151 has no WMMA module and stays on the exact-integer dp4a.
+    if arch.starts_with("gfx1201") {
+        // Loose vs exact f32: quantifies the f16-operand rounding budget.
+        check_tol(&format!("{arch} gemm wmma (vs exact f32)"), &gotg, &want_g, 1e-3)?;
+        // Tight vs the f16-operand reference: the kernel's own math.
+        check(&format!("{arch} gemm wmma (vs f16-operand ref)"), &gotg, &want_h)?;
+    } else {
+        check(&format!("{arch} gemm dp4a (vs exact f32)"), &gotg, &want_g)?;
+    }
+    // dp4a path: B<64 routes there by the dispatcher's own rule (its
+    // integer math is exact, so it holds the tight tolerance).
+    let b_small = 32usize;
+    let mut outd_d: DeviceBuffer<f32> = DeviceBuffer::new(device.id, b_small * n_rows)?;
+    gemm.gemm(&stream, v4flash_core::gguf::GgufType::Q5_K, &mut outd_d, &w_d, &xq8k_d,
+        b_small as u32, n_rows as u32, n_blk as u32)?;
+    stream.synchronize()?;
+    let mut gotd = vec![0f32; b_small * n_rows];
+    outd_d.copy_to_host(&mut gotd)?;
+    check(&format!("{arch} gemm_dp4a (B={b_small})"), &gotd, &want_g[..b_small * n_rows])?;
     Ok(())
 }
 
 fn check(name: &str, got: &[f32], want: &[f32]) -> eyre::Result<()> {
+    check_tol(name, got, want, 1e-4)
+}
+
+fn check_tol(name: &str, got: &[f32], want: &[f32], tol: f32) -> eyre::Result<()> {
     let mut max_diff = 0f32;
     let mut max_ref = 0f32;
     for (g, w) in got.iter().zip(want) {
@@ -197,7 +239,7 @@ fn check(name: &str, got: &[f32], want: &[f32]) -> eyre::Result<()> {
     }
     let rel = max_diff / max_ref.max(1e-30);
     eprintln!("q5_k {name}: max|ref|={max_ref:.3} max_diff={max_diff:.5} rel={rel:.2e}");
-    if rel >= 1e-4 {
+    if rel >= tol {
         return Err(eyre!("q5_k {name} diverges: rel={rel}"));
     }
     Ok(())
