@@ -26,7 +26,7 @@ use v4flash_kernels::het::{
 use v4flash_kernels::{oracle::ActivationDump, RopeParams};
 
 const MAIN_MODEL_PATH: &str =
-    "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf";
+    "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf";
 const PROMPT_TOKENS: [i32; 7] = [53091, 4374, 1465, 13582, 22, 32958, 344];
 const ROPE_ORIG_CTX: u64 = 65536;
 
@@ -233,11 +233,16 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
     let perfetto_out = std::env::var("PERFETTO_OUT").ok();
     // PIPELINE_LANES=2 turns on the two-lane pipelined prefill driver
     // (two BatchScratch sets, lane A + lane B interleaved per layer).
-    // Default 1 keeps the original single-lane path.
+    //
+    // DEFAULT 2 — it must match production. The old default of 1 measured a
+    // configuration nobody runs, and because single-lane leaves the dGPU
+    // exposed instead of hidden under the iGPU MoE, it made dGPU-side
+    // optimisations look 2-3x more impactful than they are. Set
+    // PIPELINE_LANES=1 explicitly to A/B the serial path.
     let pipeline_lanes: u32 = std::env::var("PIPELINE_LANES")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
+        .unwrap_or(2);
     let mut bd = BatchDgpuScratch::alloc(dgpu)?;
     let mut bi = BatchIgpuScratch::alloc(igpu)?;
     let (mut bd_b, mut bi_b) = if pipeline_lanes >= 2 {

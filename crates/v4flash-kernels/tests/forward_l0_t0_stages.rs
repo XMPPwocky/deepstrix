@@ -17,7 +17,7 @@ use v4flash_kernels::het::{
 use v4flash_kernels::{oracle::ActivationDump, RopeParams};
 
 const MAIN_MODEL_PATH: &str =
-    "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf";
+    "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf";
 const PROMPT_TOKENS: [i32; 7] = [53091, 4374, 1465, 13582, 22, 32958, 344];
 const ROPE_ORIG_CTX: u64 = 65536;
 

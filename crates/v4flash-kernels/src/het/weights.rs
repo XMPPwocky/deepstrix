@@ -502,6 +502,36 @@ impl HotExpertWeights {
     }
 }
 
+/// Path to the hot-expert placement file (`DGPU_HOT_EXPERTS_FILE`, else the
+/// in-repo default). Relative, so it resolves against the process CWD — the
+/// server runs from the repo root.
+pub fn hot_expert_file_path() -> String {
+    std::env::var("DGPU_HOT_EXPERTS_FILE")
+        .unwrap_or_else(|_| "reference/decode_hot_experts.txt".into())
+}
+
+/// Hot experts per layer to mirror onto the dGPU (M56 het-split).
+///
+/// `DGPU_HOT_EXPERTS` overrides. The DEFAULT is 6 **when a placement file is
+/// actually present**, and 0 otherwise.
+///
+/// Why not a flat default: the het-split is worth ~+16% decode, and defaulting
+/// it to 0 meant a bare `deepstrix-server` silently ran without it — no error,
+/// just a slower server. Why gate on the file: residency cannot be built
+/// without placement data, so with no file the answer is 0 regardless, and
+/// this cannot spend dGPU VRAM on a feature that can't engage. K=6 matches the
+/// known-good production launch (K<=6 fits alongside a 192K KV cache; K=8
+/// overflows the dGPU budget past 128K).
+///
+/// NOTE: this is RESIDENCY. `DGPU_HOT_CAP` (default 4) separately caps how many
+/// slots per token the dGPU actually computes; overflow returns to the iGPU.
+pub fn dgpu_hot_experts() -> usize {
+    if let Some(k) = std::env::var("DGPU_HOT_EXPERTS").ok().and_then(|s| s.parse().ok()) {
+        return k;
+    }
+    if std::path::Path::new(&hot_expert_file_path()).exists() { 6 } else { 0 }
+}
+
 /// Parse the hot-expert placement file and allocate the slot budget.
 ///
 /// File format (DEEPSTRIX_EXPERT_STATS probe): one line per layer,
@@ -594,16 +624,11 @@ impl HetModelWeights {
                 rope_params_for_layer,
             )?);
         }
-        // M56 het-split: DGPU_HOT_EXPERTS=K (+ optional
-        // DGPU_HOT_EXPERTS_FILE, default reference/decode_hot_experts.txt)
-        // places the K hottest experts per layer on the dGPU too.
-        let hot_k: usize = std::env::var("DGPU_HOT_EXPERTS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        // M56 het-split: place the K hottest experts per layer on the dGPU too.
+        // K defaults to 6 when a placement file exists (see dgpu_hot_experts).
+        let hot_k: usize = dgpu_hot_experts();
         if hot_k > 0 {
-            let path = std::env::var("DGPU_HOT_EXPERTS_FILE")
-                .unwrap_or_else(|_| "reference/decode_hot_experts.txt".into());
+            let path = hot_expert_file_path();
             match parse_hot_expert_file(&path, hot_k) {
                 Ok(lists) => {
                     for layer in 0..N_LAYER as usize {
