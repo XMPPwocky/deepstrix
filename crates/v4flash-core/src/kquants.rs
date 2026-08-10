@@ -362,6 +362,186 @@ mod tests {
         assert_eq!(f32s[31], 15.5);
     }
 
+
+    /// Bit-for-bit pin of the K-quant dequants against llama.cpp's REAL
+    /// scalar `dequantize_row_*` code. The expected u32 arrays are f32 bit
+    /// patterns produced by a C harness compiled against
+    /// llama.cpp/ggml/src/ggml-quants.c on identical synthetic blocks
+    /// (same LCG, same seeds, d forced to f16 0x2e66, dmin to 0x2a66).
+    #[test]
+    fn dequant_matches_llamacpp_bit_for_bit() {
+    const EXPECTED_Q8_0: [u32; 32] = [
+        0x406cbe00,        0x4134c180,        0x41119080,        0x3ff32400,        0xbfb32800,        0xc0932a00,
+        0x40532600,        0xbe4cc000,        0x4104c480,        0x3ffff000,        0xc117f680,        0xc107f780,
+        0x413b2780,        0xc1132a00,        0x413cc100,        0x40dcbf00,        0xc0265c00,        0x3f7ff000,
+        0xc1065e00,        0x406cbe00,        0xc0665800,        0x414b2680,        0x407ff000,        0x40d32600,
+        0x40eff100,        0xc1332800,        0xbffff000,        0xc0bff400,        0x40665800,        0x3f4cc000,
+        0xc114c380,        0xc124c280,
+    ];
+    const EXPECTED_Q4_K: [u32; 256] = [
+        0x41f32400,        0x3f332800,        0x41f32400,        0x40c32700,        0x4219f660,        0x4137f480,
+        0x420f2a40,        0x41632500,        0x40598c00,        0x4137f480,        0x419cc300,        0x42045e20,
+        0x41c7f380,        0x420f2a40,        0x419cc300,        0x4219f660,        0x41872ac0,        0x41dd8bc0,
+        0x3f332800,        0x42045e20,        0x42045e20,        0x42045e20,        0x40598c00,        0x41872ac0,
+        0x41c7f380,        0x410cc400,        0x4137f480,        0x419cc300,        0x42045e20,        0x41dd8bc0,
+        0x4219f660,        0x420f2a40,        0x41ad8ec0,        0x40ccc000,        0x41925d40,        0x4184c480,
+        0x4184c480,        0x419ff600,        0x419ff600,        0x4184c480,        0x4137f480,        0x41532600,
+        0xbeccc000,        0x419ff600,        0x40ccc000,        0x41532600,        0x41ad8ec0,        0x411cc300,
+        0x4137f480,        0x41019180,        0x411cc300,        0x41019180,        0x416e5780,        0x416e5780,
+        0x41532600,        0x41ad8ec0,        0x41ad8ec0,        0x4137f480,        0x411cc300,        0x40965d00,
+        0x41925d40,        0xc0065e00,        0x411cc300,        0x40ccc000,        0x428d90c0,        0x406cbe00,
+        0x4208c440,        0x42398e00,        0x42b22810,        0xc0199000,        0x42a5f5a0,        0x411cc300,
+        0x411cc300,        0xc0199000,        0x4299c330,        0x41e0bec0,        0x406cbe00,        0x42398e00,
+        0x42212920,        0x41e0bec0,        0x406cbe00,        0x4251f2e0,        0x41e0bec0,        0x411cc300,
+        0x411cc300,        0x4299c330,        0x42212920,        0x4299c330,        0x417e5680,        0x42b22810,
+        0x42212920,        0x41e0bec0,        0x428d90c0,        0x4299c330,        0xc0199000,        0x4208c440,
+        0x4168be40,        0x40b18e80,        0x414bf340,        0x4182c4a0,        0x414bf340,        0x4182c4a0,
+        0x4182c4a0,        0x41bc5aa0,        0x41adf520,        0xbfd32600,        0x40eb2480,        0x4182c4a0,
+        0x4168be40,        0x4168be40,        0x3e199000,        0x41cac020,        0x40eb2480,        0x3ff98a00,
+        0x406ff100,        0x3e199000,        0x40eb2480,        0x4182c4a0,        0x41adf520,        0x41adf520,
+        0x41adf520,        0x3e199000,        0x412f2840,        0x4182c4a0,        0x40eb2480,        0x3ff98a00,
+        0x41cac020,        0x406ff100,        0x41b65b00,        0x421929a0,        0x4157f280,        0x40865e00,
+        0x41e7f180,        0x420cc400,        0x3f8cc400,        0x419d8fc0,        0x3f8cc400,        0x40865e00,
+        0x42005e60,        0x4157f280,        0x40865e00,        0x40e98b00,        0x4157f280,        0x3f8cc400,
+        0x4184c480,        0x41b65b00,        0x4157f280,        0x3f8cc400,        0x42258f40,        0x41e7f180,
+        0x42258f40,        0x419d8fc0,        0x41265c00,        0x4157f280,        0x4157f280,        0x40865e00,
+        0x40865e00,        0xbffff000,        0x40e98b00,        0x41e7f180,        0x416ff100,        0x41f32400,
+        0xbeccc000,        0x416ff100,        0x416ff100,        0x41e18b80,        0x419b2980,        0x41e18b80,
+        0x41065e00,        0x41e18b80,        0xbeccc000,        0x41be5a80,        0xbeccc000,        0x41acc200,
+        0x42025e40,        0xbeccc000,        0x41acc200,        0x419b2980,        0x414cc000,        0x42025e40,
+        0x407ff000,        0xbeccc000,        0x41cff300,        0x41f32400,        0x40c65a00,        0x41be5a80,
+        0x419b2980,        0x41298f00,        0x41899100,        0x419b2980,        0x41065e00,        0x416ff100,
+        0x40b98e00,        0x40532600,        0xbf332800,        0xbfd98c00,        0x40132a00,        0x40999000,
+        0x40899100,        0xbfd98c00,        0xbfd98c00,        0xbfd98c00,        0xbe4cc000,        0xbe4cc000,
+        0x3fa65c00,        0x40732400,        0x40a98f00,        0x3f4cc000,        0x40132a00,        0x3fa65c00,
+        0x40b98e00,        0xbe4cc000,        0x3fe65800,        0xbfd98c00,        0x40332800,        0x40999000,
+        0x40b98e00,        0x3f4cc000,        0x3e999000,        0x40a98f00,        0x3f4cc000,        0x40732400,
+        0xbe4cc000,        0x40132a00,        0x41498d00,        0x41865e00,        0x41865e00,        0x41eb2480,
+        0x41865e00,        0x4238c140,        0x41eb2480,        0x421729c0,        0x4227f580,        0x426b2480,
+        0x41a7f580,        0x41a7f580,        0x40865e00,        0x40865e00,        0x4238c140,        0x41a7f580,
+        0x42065e00,        0x00000000,        0x42065e00,        0x425a58c0,        0x41c98d00,        0x427bf040,
+        0x40865e00,        0x00000000,        0x41a7f580,        0x4238c140,        0x425a58c0,        0x41498d00,
+        0x41865e00,        0x42498d00,        0x4227f580,        0x41065e00,
+    ];
+    const EXPECTED_Q5_K: [u32; 256] = [
+        0x414e5980,        0x416b2480,        0x40065e00,        0x3e999000,        0x408ff700,        0x4144c080,
+        0x40532600,        0x40a32900,        0x40532600,        0xc0065e00,        0x416b2480,        0x40798a00,
+        0x41318e80,        0x40065e00,        0x3fbff400,        0x4174bd80,        0x411e5c80,        0xbf665800,
+        0x4183f7c0,        0x4174bd80,        0x402cc200,        0x414e5980,        0x3e999000,        0x41019180,
+        0x417e5680,        0x414e5980,        0x41618b80,        0x3fbff400,        0x4114c380,        0x4144c080,
+        0x410b2a80,        0x40798a00,        0x4240c0c0,        0x4147f380,        0x417e5680,        0x4217f680,
+        0x4147f380,        0x40ecbe00,        0x42112a20,        0x407ff000,        0x418cc400,        0x421ec2e0,
+        0x41632500,        0x41f98a00,        0x40132a00,        0x3f199000,        0x41d0bfc0,        0x41d0bfc0,
+        0x41632500,        0x4239f460,        0x4240c0c0,        0x407ff000,        0xbf8cc400,        0x42039160,
+        0x412cc200,        0x40ecbe00,        0x3f199000,        0x42332800,        0x417e5680,        0x41ebf140,
+        0x4239f460,        0x41c32700,        0x41b58e40,        0xc0332800,        0x4235f4a0,        0x428e90b0,
+        0x419d8fc0,        0x429fc2d0,        0x42698b00,        0x42f5bd70,        0x41765700,        0x41318e80,
+        0x424726c0,        0x430377c8,        0x42698b00,        0x401ff600,        0x419d8fc0,        0x42fe5680,
+        0x429fc2d0,        0x42a85be0,        0x42c22710,        0x42fe5680,        0x42fe5680,        0x4224c280,
+        0x42698b00,        0x430377c8,        0x41e25840,        0x429fc2d0,        0x429729c0,        0x429fc2d0,
+        0x42c22710,        0x428e90b0,        0x42e48b50,        0x40d98c00,        0x42f5bd70,        0x42fe5680,
+        0x418b90e0,        0xbf598c00,        0x42d9d8c8,        0x40a7f580,        0x429cdc98,        0x4290aa28,
+        0x42fe7018,        0x43179cec,        0x429cdc98,        0x42275bf0,        0x425825b0,        0x4290aa28,
+        0x42cda658,        0x43055144,        0x431183b4,        0x42b54178,        0x4329e894,        0x41358e40,
+        0x418b90e0,        0x43361b04,        0x431183b4,        0x431183b4,        0x42e60b38,        0x42d9d8c8,
+        0x40a7f580,        0x41ed2460,        0x42a90f08,        0x425825b0,        0x428477b8,        0x430b6a7c,
+        0x4290aa28,        0x42d9d8c8,        0x41d4bf80,        0x41b7f480,        0x415ff200,        0x41d4bf80,
+        0x41bf2740,        0x40f65700,        0x4134c180,        0x4117f680,        0x3fb32800,        0x41099100,
+        0x417cbd00,        0x41099100,        0x41432700,        0x418cc400,        0x416e5780,        0x41518c80,
+        0x418cc400,        0x3fb32800,        0x41cd8cc0,        0x41dbf240,        0x40bcc100,        0x4193f6c0,
+        0x41bf2740,        0xbeccc000,        0x40832b00,        0x4134c180,        0xbeccc000,        0x41dbf240,
+        0xbeccc000,        0x41432700,        0x41265c00,        0x41d4bf80,        0x40298f00,        0x3f265c00,
+        0x40298f00,        0x3fd32600,        0x41e524e0,        0x41dd2560,        0x414a59c0,        0x414a59c0,
+        0x41c526e0,        0x3fd32600,        0x418d2a60,        0x41a528e0,        0x41d525e0,        0x41c526e0,
+        0x41cd2660,        0x41e524e0,        0x41dd2560,        0x4094c380,        0x413a5ac0,        0xbeb32800,
+        0x414a59c0,        0x41852ae0,        0x418d2a60,        0x411a5cc0,        0x41f523e0,        0x419529e0,
+        0x411a5cc0,        0x40b4c180,        0x41cd2660,        0x413a5ac0,        0x41ad2860,        0x40f4bd80,
+        0x424dbff0,        0x4295dd08,        0x423af450,        0x41945d20,        0x42e10b88,        0x4295dd08,
+        0x422828b0,        0x42b20e78,        0x422828b0,        0x42608b90,        0x423af450,        0x428c7738,
+        0x42608b90,        0x408e5d80,        0x42bb7448,        0x42029170,        0x43116a1c,        0x423af450,
+        0x42ea7158,        0x43035164,        0x41945d20,        0x42c4da18,        0x4295dd08,        0x424dbff0,
+        0x428c7738,        0x42ce3fe8,        0x428c7738,        0x42ea7158,        0x42d7a5b8,        0x41df8ba0,
+        0x42fd3cf8,        0x41df8ba0,        0x41b58e40,        0x407ff000,        0x4147f380,        0x41de5880,
+        0x407ff000,        0x4147f380,        0x41c32700,        0x41c32700,        0x42478d20,        0x3f199000,
+        0x41f98a00,        0x41f98a00,        0x417e5680,        0x41632500,        0xc0332800,        0x422c5ba0,
+        0x407ff000,        0x40132a00,        0x421ec2e0,        0x41b58e40,        0x42478d20,        0x41a7f580,
+        0x40132a00,        0x418cc400,        0x42332800,        0xc0332800,        0x40ecbe00,        0x41ebf140,
+        0x4147f380,        0x3f199000,        0x42112a20,        0x40b65b00,
+    ];
+    const EXPECTED_Q6_K: [u32; 256] = [
+        0x42225c40,        0x41398e00,        0x432df520,        0x80000000,        0x43398e00,        0xc2b98e00,
+        0x420b2a80,        0xc3055e10,        0x42e7f180,        0xc2225c40,        0x430b2a80,        0xc2b98e00,
+        0xc18b2a80,        0x418b2a80,        0x420b2a80,        0x42398e00,        0x42a65c00,        0xc2932a00,
+        0x414cc000,        0x429ff600,        0xc23ff400,        0x417ff000,        0x428cc400,        0xc2865e00,
+        0xc0ccc000,        0xc1e65800,        0xc2865e00,        0x428cc400,        0xc2932a00,        0xc1999000,
+        0x414cc000,        0x42332800,        0x42065e00,        0xc1acc200,        0xc20b2a80,        0xc0e65800,
+        0xc0665800,        0xc0199000,        0xc20ff700,        0x420ff700,        0xc1a32900,        0x40bff400,
+        0xc1bff400,        0xc1c98d00,        0xc0199000,        0x41c98d00,        0x40e65800,        0x40e65800,
+        0x430ec3e0,        0x431c5ca0,        0x42598c00,        0xc3598c00,        0xc3232900,        0x00000000,
+        0x4307f780,        0xc2959040,        0x42d98c00,        0xc2cbf340,        0x4287f780,        0xc0d98c00,
+        0xc1d98c00,        0x43159040,        0xc287f780,        0xc2959040,        0xc21cc300,        0xc15ff200,
+        0xc200c4c0,        0xc1f65700,        0xc1eb2480,        0x42225c40,        0x41be5a80,        0x41f65700,
+        0xc1f65700,        0xc21cc300,        0x41498d00,        0xc1332800,        0x42065e00,        0xc15ff200,
+        0x420bf740,        0x422d8ec0,        0xc317f680,        0xc327f580,        0x429ff600,        0xc337f480,
+        0x42dff200,        0xc377f080,        0x4367f180,        0xc2cff300,        0xc2aff500,        0xc25ff200,
+        0x435ff200,        0x434ff300,        0x4307f780,        0xc2cff300,        0xc307f780,        0xc35ff200,
+        0x42b8f470,        0xc213f6c0,        0x42d68c30,        0x42318e80,        0x4213f6c0,        0x42c7c050,
+        0x42c7c050,        0x42d68c30,        0xc1b18e80,        0xc293f6c0,        0x41cf2640,        0xc1b18e80,
+        0xc26cbe00,        0xc26cbe00,        0x42cf2640,        0xc2d68c30,        0x4333c190,        0xc3402730,
+        0x41465a00,        0xc3085de0,        0xc277f080,        0x4333c190,        0xc2f7f080,        0x41f7f080,
+        0xc294c380,        0xc1465a00,        0x42d2bfa0,        0x42df2540,        0xc2a12920,        0xc3275bf0,
+        0xc2d2bfa0,        0xc1c65a00,        0x42a9f560,        0x41a32900,        0x41be5a80,        0xc1be5a80,
+        0xc2cbf340,        0x42159040,        0xc0598c00,        0x42b78e20,        0xc1d98c00,        0x42232900,
+        0x426724c0,        0xc1be5a80,        0x428ec3e0,        0x42c526e0,        0x42b78e20,        0xc23e5a80,
+        0xc36ff100,        0xc327f580,        0xc327f580,        0x42bff400,        0xc30ff700,        0xc36ff100,
+        0xc25ff200,        0x437ff000,        0x428ff700,        0x431ff600,        0x437ff000,        0x41fff000,
+        0xc27ff000,        0xc29ff600,        0x42eff100,        0x434ff300,        0xc2a32900,        0x41598c00,
+        0xc2a9f560,        0xc2c526e0,        0x42d2bfa0,        0x42812b20,        0x42598c00,        0x42d2bfa0,
+        0xc2d98c00,        0x42598c00,        0xc2959040,        0xc2598c00,        0x4287f780,        0xc2be5a80,
+        0xc1f4bd80,        0x426724c0,        0x42c58d40,        0xc23b2780,        0x42bb2780,        0xc2798a00,
+        0x42bb2780,        0xc1a65c00,        0xc3212920,        0xc2da58c0,        0xc1cff300,        0x42798a00,
+        0xc2bb2780,        0xc0a65c00,        0x43072ac0,        0xc2872ac0,        0xc2cff300,        0x42f98a00,
+        0xc08ff700,        0xc0dcbf00,        0x3fe65800,        0xc0199000,        0xc10b2a80,        0x41199000,
+        0x40798a00,        0xc0865e00,        0xc0e65800,        0x40eff100,        0x40a32900,        0x40bff400,
+        0xc0bff400,        0xc0865e00,        0x3e999000,        0x3f665800,        0x42ad8ec0,        0x40332800,
+        0x41332800,        0x41f65700,        0x425ff200,        0xc26b2480,        0xc227f580,        0x415ff200,
+        0xc1c98d00,        0xc2a7f580,        0x4254bf80,        0xc25ff200,        0xc21cc300,        0x41065e00,
+        0x40332800,        0x42a7f580,        0x4331c1b0,        0xc24b2680,        0xc33e7418,        0xc3648b50,
+        0xc1cb2680,        0x4357d8e8,        0xc38baa78,        0x427df020,        0xc14b2680,        0x43c4cd4c,
+        0x42185ce0,        0xc2185ce0,        0x433e7418,        0x43855144,        0xc30baa78,        0xc1cb2680,
+        0xc34b4018,        0x43408d90,        0x43a5cf3c,        0x43408d90,        0xc36b57b0,        0x42005e60,
+        0x430b10e8,        0xc3408d90,        0xc3805e60,        0x42c08d90,        0xc3a5cf3c,        0x438b10e8,
+        0xc36b57b0,        0x80000000,        0xc3805e60,        0xc36b57b0,
+    ];
+        struct Case {
+            dt: GgufType,
+            bytes: usize,
+            seed: u32,
+            d_off: usize,
+            m_off: Option<usize>,
+            want: &'static [u32],
+        }
+        let cases = [
+            Case { dt: GgufType::Q8_0, bytes: 34, seed: 0x81, d_off: 0, m_off: None, want: &EXPECTED_Q8_0 },
+            Case { dt: GgufType::Q4_K, bytes: 144, seed: 0x84, d_off: 0, m_off: Some(2), want: &EXPECTED_Q4_K },
+            Case { dt: GgufType::Q5_K, bytes: 176, seed: 0x85, d_off: 0, m_off: Some(2), want: &EXPECTED_Q5_K },
+            Case { dt: GgufType::Q6_K, bytes: 210, seed: 0x86, d_off: 208, m_off: None, want: &EXPECTED_Q6_K },
+        ];
+        for c in cases {
+            let mut blk = lcg_bytes(c.bytes, c.seed);
+            blk[c.d_off..c.d_off + 2].copy_from_slice(&0x2e66u16.to_le_bytes());
+            if let Some(m) = c.m_off {
+                blk[m..m + 2].copy_from_slice(&0x2a66u16.to_le_bytes());
+            }
+            let mut out = Vec::new();
+            dequant_to_f32(c.dt, &blk, &mut out).unwrap();
+            assert_eq!(out.len(), c.want.len(), "{:?}", c.dt);
+            for (i, (&got, &want)) in out.iter().zip(c.want).enumerate() {
+                assert_eq!(got.to_bits(), want, "{:?} elem {i}: got {got}", c.dt);
+            }
+        }
+    }
+
     /// Deterministic byte pattern for block-content tests.
     fn lcg_bytes(n: usize, mut state: u32) -> Vec<u8> {
         let mut v = Vec::with_capacity(n);
