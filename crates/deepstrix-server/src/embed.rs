@@ -7,46 +7,16 @@
 //! into `v4flash-kernels` or a shared `deepstrix-common` crate at that
 //! point.
 
-use v4flash_kernels::config::{HC_DIM, N_EMBD, N_HC};
 
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = (bits >> 15) & 0x1;
-    let exp = (bits >> 10) & 0x1f;
-    let mant = bits & 0x3ff;
-    let s: u32 = (sign as u32) << 31;
-    let f32_bits: u32 = match exp {
-        0 if mant == 0 => s,
-        0 => {
-            let mantissa = mant as f32 / 1024.0;
-            let v = mantissa * (1.0 / (1u64 << 14) as f32);
-            return if sign == 1 { -v } else { v };
-        }
-        0x1f => s | 0x7f800000 | ((mant as u32) << 13),
-        _ => s | ((exp as u32 + 112) << 23) | ((mant as u32) << 13),
-    };
-    f32::from_bits(f32_bits)
-}
-
-/// Fill `out` (length `HC_DIM`) with the token-`token_id` row of the F16
-/// embedding table, broadcast across all `N_HC` HC channels.
-pub fn embed_lookup(token_embd_bytes: &[u8], token_id: i32, out: &mut [f32]) {
-    let n_embd = N_EMBD as usize;
-    let n_hc = N_HC as usize;
-    assert_eq!(out.len(), HC_DIM as usize);
-    assert_eq!(out.len(), n_embd * n_hc);
-    let row_off = (token_id as usize) * n_embd * 2;
-    for i in 0..n_embd {
-        let b0 = token_embd_bytes[row_off + i * 2];
-        let b1 = token_embd_bytes[row_off + i * 2 + 1];
-        let bits = u16::from_le_bytes([b0, b1]);
-        out[i] = f16_to_f32(bits);
-    }
-    for h in 1..n_hc {
-        let (head, tail) = out.split_at_mut(h * n_embd);
-        let src = &head[0..n_embd];
-        let dst = &mut tail[0..n_embd];
-        dst.copy_from_slice(src);
-    }
+/// Dtype-aware row lookup — delegates to the shared implementation.
+pub fn embed_lookup(
+    token_embd_bytes: &[u8],
+    dtype: v4flash_core::gguf::GgufType,
+    token_id: i32,
+    out: &mut [f32],
+) {
+    v4flash_kernels::embed::embed_lookup(token_embd_bytes, dtype, token_id, out)
+        .expect("embed_lookup: validated at load");
 }
 
 /// Build the GPT-2 byte ↔ printable-char mapping table used to decode

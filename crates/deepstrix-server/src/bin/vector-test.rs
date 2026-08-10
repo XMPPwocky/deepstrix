@@ -351,6 +351,7 @@ fn main() -> eyre::Result<()> {
         .gguf()
         .tensor("token_embd.weight")
         .ok_or_else(|| eyre!("missing token_embd.weight"))?;
+    let token_embd_dtype = token_embd_t.dtype;
     let token_embd_bytes = gguf.read_tensor(token_embd_t)?.to_vec();
 
     let rope = |layer: i32| -> eyre::Result<RopeParams> { Ok(rope_for_layer(layer)) };
@@ -431,7 +432,7 @@ fn main() -> eyre::Result<()> {
         let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(prefill_tokens.len());
         for &tok in prefill_tokens {
             let mut v = vec![0f32; HC_DIM as usize];
-            embed_lookup(&token_embd_bytes, tok, &mut v);
+            embed_lookup(&token_embd_bytes, token_embd_dtype, tok, &mut v);
             input_hcs.push(v);
         }
         let t0 = std::time::Instant::now();
@@ -452,7 +453,7 @@ fn main() -> eyre::Result<()> {
         if args.substitute_eval {
             let last_tok = tokens[tokens.len() - 1];
             let mut residual_in = vec![0f32; HC_DIM as usize];
-            embed_lookup(&token_embd_bytes, last_tok, &mut residual_in);
+            embed_lookup(&token_embd_bytes, token_embd_dtype, last_tok, &mut residual_in);
             eprintln!(
                 "substitute_eval: forward_token(id={last_tok}) at pos={pos}…"
             );
@@ -577,7 +578,7 @@ fn main() -> eyre::Result<()> {
                 AdvanceMode::Free => our_tok,
             };
 
-            embed_lookup(&token_embd_bytes, advance_tok, &mut residual);
+            embed_lookup(&token_embd_bytes, token_embd_dtype, advance_tok, &mut residual);
             engine.forward_token(
                 &mut dgpu_scratch, &mut igpu_scratch, &mut state, &weights,
                 &residual, pos, advance_tok,

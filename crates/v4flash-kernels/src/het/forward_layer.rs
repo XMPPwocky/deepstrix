@@ -188,9 +188,9 @@ impl HeterogeneousEngine {
         let _s_moe = debug_span!("routed_moe").entered();
         self.igpu_graphs.run("routed_moe", layer as u32, &ie.compute, |s| {
             ie.q8k.launch(s, &mut igpu_scratch.d_xq_q8k, &igpu_scratch.ffn_input_norm_recv, BLOCKS_Q8K_GATE_IN)?;
-            ie.iq2.launch_fused_swiglu_batch(s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
+            super::dispatch::moe_gate_up_batch(ie, ilw.routed.gate.dtype, s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
             ie.q8k.launch(s, &mut igpu_scratch.d_midq_cat, &igpu_scratch.d_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
-            ie.q2k.launch_batched(s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
+            super::dispatch::moe_down_batched(ie, ilw.routed.down.dtype, s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
             Ok(())
         })?;
         drop(_s_moe);
@@ -389,7 +389,7 @@ impl HeterogeneousEngine {
         if *QKV_GRAPH && !standalone_graphs {
             self.dgpu_graphs.run("qkv_chain", layer as u32, &de.compute, |s| {
                 de.q8.quantize_input(s, &mut dgpu_scratch.xq_n_embd, &mut dgpu_scratch.xscale_n_embd, &dgpu_scratch.attn_input_norm, N_EMBD)?;
-                de.q8.matvec(s, &mut dgpu_scratch.qr, &dlw.attn_q_a.buffer, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_LORA_Q, N_EMBD)?;
+                super::dispatch::dense_matvec(de, s, &mut dgpu_scratch.qr, &dlw.attn_q_a, &dgpu_scratch.attn_input_norm, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_LORA_Q, N_EMBD)?;
                 de.rms_w.launch_weighted_quantize_q8(s, &mut dgpu_scratch.qr_normed, &mut dgpu_scratch.qr_xq, &mut dgpu_scratch.qr_xscale, &dgpu_scratch.qr, &dlw.q_a_norm, N_LORA_Q, RMS_EPS)?;
                 de.q8.matvec(s, &mut dgpu_scratch.q, &dlw.attn_q_b.buffer, &dgpu_scratch.qr_xq, &dgpu_scratch.qr_xscale, Q_FLAT, N_LORA_Q)?;
                 de.rms_nw.launch(s, &mut dgpu_scratch.q_normed, &dgpu_scratch.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
@@ -422,7 +422,7 @@ impl HeterogeneousEngine {
         } else {
         self.dgpu_graphs.run("q_chain_pre_rope", layer as u32, &de.compute, |s| {
                 de.q8.quantize_input(s, &mut dgpu_scratch.xq_n_embd, &mut dgpu_scratch.xscale_n_embd, &dgpu_scratch.attn_input_norm, N_EMBD)?;
-                de.q8.matvec(s, &mut dgpu_scratch.qr, &dlw.attn_q_a.buffer, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_LORA_Q, N_EMBD)?;
+                super::dispatch::dense_matvec(de, s, &mut dgpu_scratch.qr, &dlw.attn_q_a, &dgpu_scratch.attn_input_norm, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_LORA_Q, N_EMBD)?;
                 // M55: fused rms_w + q8 quantize (was two single-WG kernels);
                 // qr_normed is still written for the CSA indexer.
                 de.rms_w.launch_weighted_quantize_q8(s, &mut dgpu_scratch.qr_normed, &mut dgpu_scratch.qr_xq, &mut dgpu_scratch.qr_xscale, &dgpu_scratch.qr, &dlw.q_a_norm, N_LORA_Q, RMS_EPS)?;
@@ -1366,8 +1366,8 @@ impl HeterogeneousEngine {
                 let _t_hot = de.events.stage("dgpu.hot_moe", &de.compute)?;
                 self.dgpu_graphs.run("dgpu_hot_moe", layer as u32, &de.compute, |s| {
                     de.q8k.launch(s, &mut dgpu_scratch.moe_xq, &dgpu_scratch.ffn_input_norm, BLOCKS_Q8K_GATE_IN)?;
-                    de.iq2.launch_fused_swiglu_batch_hetsplit(
-                        s, &mut dgpu_scratch.moe_mid_cat,
+                    super::dispatch::moe_gate_up_batch_hetsplit(
+                        de, ilw.routed.gate.dtype, s, &mut dgpu_scratch.moe_mid_cat,
                         &hot.gate, &hot.up,
                         &dgpu_scratch.moe_xq, &dgpu_scratch.d_ew, &dgpu_scratch.d_selected,
                         &hot.remap, /*mode=*/1, *HOT_CAP,
@@ -1375,8 +1375,8 @@ impl HeterogeneousEngine {
                         N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
                     )?;
                     de.q8k.launch(s, &mut dgpu_scratch.moe_midq_cat, &dgpu_scratch.moe_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
-                    de.q2k.launch_batched_hetsplit(
-                        s, &mut dgpu_scratch.ffn_moe_dgpu,
+                    super::dispatch::moe_down_batched_hetsplit(
+                        de, ilw.routed.down.dtype, s, &mut dgpu_scratch.ffn_moe_dgpu,
                         &hot.down, &dgpu_scratch.moe_midq_cat, &dgpu_scratch.d_selected,
                         &hot.remap, /*mode=*/1, *HOT_CAP,
                         hot_dbpe as u32, mid_blocks_bytes_d as u32,
@@ -1443,13 +1443,13 @@ impl HeterogeneousEngine {
                 static HOT_CAP_I: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
                     std::env::var("DGPU_HOT_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(4)
                 });
-                ie.iq2.launch_fused_swiglu_batch_hetsplit(s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, remap, /*mode=*/0, *HOT_CAP_I, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
+                super::dispatch::moe_gate_up_batch_hetsplit(ie, ilw.routed.gate.dtype, s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, remap, /*mode=*/0, *HOT_CAP_I, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
                 ie.q8k.launch(s, &mut igpu_scratch.d_midq_cat, &igpu_scratch.d_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
-                ie.q2k.launch_batched_hetsplit(s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, remap, /*mode=*/0, *HOT_CAP_I, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
+                super::dispatch::moe_down_batched_hetsplit(ie, ilw.routed.down.dtype, s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, remap, /*mode=*/0, *HOT_CAP_I, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
             } else {
-                ie.iq2.launch_fused_swiglu_batch(s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
+                super::dispatch::moe_gate_up_batch(ie, ilw.routed.gate.dtype, s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
                 ie.q8k.launch(s, &mut igpu_scratch.d_midq_cat, &igpu_scratch.d_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
-                ie.q2k.launch_batched(s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
+                super::dispatch::moe_down_batched(ie, ilw.routed.down.dtype, s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
             }
             Ok(())
         })?;
@@ -1624,12 +1624,20 @@ fn issue_shared_expert(
     dlw: &DgpuLayerWeights,
     stream: &v4flash_hip::Stream,
 ) -> eyre::Result<()> {
-    de.q8.quantize_input(stream, &mut dgpu_scratch.xq_n_embd, &mut dgpu_scratch.xscale_n_embd, &dgpu_scratch.ffn_input_norm, N_EMBD)?;
-    de.q8.matvec(stream, &mut dgpu_scratch.gate_sh, &dlw.shared.gate.buffer, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_FF_SHARED, N_EMBD)?;
-    de.q8.matvec(stream, &mut dgpu_scratch.up_sh, &dlw.shared.up.buffer, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_FF_SHARED, N_EMBD)?;
+    use super::dispatch::{any_q8, dense_matvec};
+    // Q8_0 consumers need the (xq, xscale) pair; K-quant weights (unsloth
+    // mix: Q5_K gate/up, Q6_K down — blk.26 keeps Q8_0 down) take f32
+    // directly, so each quantize runs only when something consumes it.
+    if any_q8(&[&dlw.shared.gate, &dlw.shared.up]) {
+        de.q8.quantize_input(stream, &mut dgpu_scratch.xq_n_embd, &mut dgpu_scratch.xscale_n_embd, &dgpu_scratch.ffn_input_norm, N_EMBD)?;
+    }
+    dense_matvec(de, stream, &mut dgpu_scratch.gate_sh, &dlw.shared.gate, &dgpu_scratch.ffn_input_norm, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_FF_SHARED, N_EMBD)?;
+    dense_matvec(de, stream, &mut dgpu_scratch.up_sh, &dlw.shared.up, &dgpu_scratch.ffn_input_norm, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_FF_SHARED, N_EMBD)?;
     de.swiglu.launch(stream, &mut dgpu_scratch.mid_sh, &dgpu_scratch.gate_sh, &dgpu_scratch.up_sh, N_FF_SHARED)?;
-    de.q8.quantize_input(stream, &mut dgpu_scratch.mid_sh_xq, &mut dgpu_scratch.mid_sh_xscale, &dgpu_scratch.mid_sh, N_FF_SHARED)?;
-    de.q8.matvec(stream, &mut dgpu_scratch.ffn_shared, &dlw.shared.down.buffer, &dgpu_scratch.mid_sh_xq, &dgpu_scratch.mid_sh_xscale, N_EMBD, N_FF_SHARED)?;
+    if any_q8(&[&dlw.shared.down]) {
+        de.q8.quantize_input(stream, &mut dgpu_scratch.mid_sh_xq, &mut dgpu_scratch.mid_sh_xscale, &dgpu_scratch.mid_sh, N_FF_SHARED)?;
+    }
+    dense_matvec(de, stream, &mut dgpu_scratch.ffn_shared, &dlw.shared.down, &dgpu_scratch.mid_sh, &dgpu_scratch.mid_sh_xq, &dgpu_scratch.mid_sh_xscale, N_EMBD, N_FF_SHARED)?;
     Ok(())
 }
 

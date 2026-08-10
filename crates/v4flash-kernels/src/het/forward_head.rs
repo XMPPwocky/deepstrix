@@ -72,7 +72,10 @@ impl HeterogeneousEngine {
                 RMS_EPS,
             )?;
         }
-        {
+        // unsloth mix: output.weight is Q4_K (takes f32 directly, no
+        // quantize step); antirez keeps Q8_0. Covers prefill too — the
+        // prefill logits path loops per-token through this fn.
+        if weights.output.dtype == v4flash_core::gguf::GgufType::Q8_0 {
             let _t = de.events.stage("k.head.quantize", &de.compute)?;
             de.q8.quantize_input(
                 &de.compute,
@@ -84,10 +87,12 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.head.vocab_matvec", &de.compute)?;
-            de.q8.matvec(
+            super::dispatch::dense_matvec(
+                de,
                 &de.compute,
                 &mut scratch.logits,
-                &weights.output.buffer,
+                &weights.output,
+                &scratch.head_norm,
                 &scratch.head_xq,
                 &scratch.head_xscale,
                 N_VOCAB,

@@ -27,6 +27,8 @@ pub mod expert_sel_count;
 pub mod indexer;
 pub mod iq2_xxs;
 pub mod iq2_xxs_tables;
+pub mod dense_gemm;
+pub mod embed;
 pub mod iq2_s;
 pub mod iq2_s_tables;
 pub mod iq3_xxs;

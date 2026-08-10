@@ -854,18 +854,30 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.q_chain.qa_matvec", &de.compute)?;
-            // LDS-tiled WMMA GEMM: matvec_batched re-reads weight per
-            // batch (weight-BW-bound at B=512). GEMM shares weight across
-            // BN=64 batch cols.
-            de.q8_wmma.gemm_lds_tiled(
+            // Q8_0: LDS-tiled WMMA GEMM (weight shared across BN=64 cols;
+            // matvec_batched was weight-BW-bound at B=512). K-quants
+            // (unsloth q_a = Q5_K/Q6_K): dp4a register-tiled GEMM on Q8_K
+            // activations. The i8 quantize above stays either way —
+            // attn_kv (always Q8_0) consumes it.
+            if dlw.attn_q_a.dtype != v4flash_core::gguf::GgufType::Q8_0 {
+                de.q8k.launch(
+                    &de.compute,
+                    &mut bd.kq_attn_q8k,
+                    &bd.attn_input_norm,
+                    crate::config::BLOCKS_Q8K_GATE_IN * b,
+                )?;
+            }
+            super::dispatch::dense_gemm_prefill(
+                de,
                 &de.compute,
                 &mut bd.qr,
-                &dlw.attn_q_a.buffer,
+                &dlw.attn_q_a,
                 &bd.xq_n_embd,
                 &bd.xscale_n_embd,
+                &bd.kq_attn_q8k,
+                b,
                 N_LORA_Q,
                 N_EMBD,
-                b,
             )?;
         }
         {
@@ -2169,42 +2181,40 @@ impl HeterogeneousEngine {
         let _t_shared = de.events.stage("dgpu.shared_expert", &de.compute)?;
         {
             let _t = de.events.stage("k.shared_expert.quantize_input", &de.compute)?;
-            de.q8.quantize_input_batched(
-                &de.compute,
-                &mut bd.xq_n_embd,
-                &mut bd.xscale_n_embd,
-                &bd.ffn_input_norm,
-                N_EMBD,
-                b,
-            )?;
+            // Q8_0 gate/up consume the (i8, scale) pair; K-quants (unsloth
+            // Q5_K/Q6_K) consume Q8_K — quantize only what's consumed.
+            if super::dispatch::any_q8(&[&dlw.shared.gate, &dlw.shared.up]) {
+                de.q8.quantize_input_batched(
+                    &de.compute,
+                    &mut bd.xq_n_embd,
+                    &mut bd.xscale_n_embd,
+                    &bd.ffn_input_norm,
+                    N_EMBD,
+                    b,
+                )?;
+            } else {
+                de.q8k.launch(
+                    &de.compute,
+                    &mut bd.kq_ffn_q8k,
+                    &bd.ffn_input_norm,
+                    crate::config::BLOCKS_Q8K_GATE_IN * b,
+                )?;
+            }
         }
         {
-            // LDS-tiled WMMA GEMM: weight tile loaded ONCE per (m0,n0)
-            // tile and reused across BN=64 batch cols (matvec_batched
-            // re-reads weight per batch — weight-BW-bound at B=512).
             let _t = de.events.stage("k.shared_expert.gate_matvec", &de.compute)?;
-            de.q8_wmma.gemm_lds_tiled(
-                &de.compute,
-                &mut bd.gate_sh,
-                &dlw.shared.gate.buffer,
-                &bd.xq_n_embd,
-                &bd.xscale_n_embd,
-                N_FF_SHARED,
-                N_EMBD,
-                b,
+            super::dispatch::dense_gemm_prefill(
+                de, &de.compute, &mut bd.gate_sh, &dlw.shared.gate,
+                &bd.xq_n_embd, &bd.xscale_n_embd, &bd.kq_ffn_q8k,
+                b, N_FF_SHARED, N_EMBD,
             )?;
         }
         {
             let _t = de.events.stage("k.shared_expert.up_matvec", &de.compute)?;
-            de.q8_wmma.gemm_lds_tiled(
-                &de.compute,
-                &mut bd.up_sh,
-                &dlw.shared.up.buffer,
-                &bd.xq_n_embd,
-                &bd.xscale_n_embd,
-                N_FF_SHARED,
-                N_EMBD,
-                b,
+            super::dispatch::dense_gemm_prefill(
+                de, &de.compute, &mut bd.up_sh, &dlw.shared.up,
+                &bd.xq_n_embd, &bd.xscale_n_embd, &bd.kq_ffn_q8k,
+                b, N_FF_SHARED, N_EMBD,
             )?;
         }
         {
@@ -2220,26 +2230,30 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.shared_expert.quantize_mid", &de.compute)?;
-            de.q8.quantize_input_batched(
-                &de.compute,
-                &mut bd.mid_sh_xq,
-                &mut bd.mid_sh_xscale,
-                &bd.mid_sh,
-                N_FF_SHARED,
-                b,
-            )?;
+            if super::dispatch::any_q8(&[&dlw.shared.down]) {
+                de.q8.quantize_input_batched(
+                    &de.compute,
+                    &mut bd.mid_sh_xq,
+                    &mut bd.mid_sh_xscale,
+                    &bd.mid_sh,
+                    N_FF_SHARED,
+                    b,
+                )?;
+            } else {
+                de.q8k.launch(
+                    &de.compute,
+                    &mut bd.kq_mid_q8k,
+                    &bd.mid_sh,
+                    crate::config::BLOCKS_Q8K_DOWN_IN * b,
+                )?;
+            }
         }
         {
             let _t = de.events.stage("k.shared_expert.down_matvec", &de.compute)?;
-            de.q8_wmma.gemm_lds_tiled(
-                &de.compute,
-                &mut bd.ffn_shared,
-                &dlw.shared.down.buffer,
-                &bd.mid_sh_xq,
-                &bd.mid_sh_xscale,
-                N_EMBD,
-                N_FF_SHARED,
-                b,
+            super::dispatch::dense_gemm_prefill(
+                de, &de.compute, &mut bd.ffn_shared, &dlw.shared.down,
+                &bd.mid_sh_xq, &bd.mid_sh_xscale, &bd.kq_mid_q8k,
+                b, N_EMBD, N_FF_SHARED,
             )?;
         }
         drop(_t_shared);
@@ -2340,49 +2354,87 @@ impl HeterogeneousEngine {
                 &bd.ffn_input_norm,
                 crate::config::BLOCKS_Q8K_GATE_IN * b,
             )?;
-            de.iq2.launch_fused_swiglu_kwide(
-                &de.compute,
-                &mut hd.mid_cat,
-                &hot.gate,
-                &hot.up,
-                &hd.moe_xq,
-                &bd.d_ew,
-                &hd.group_count,
-                &hd.expert_members,
-                &hd.work_items_static,
-                gbpe,
-                ubpe,
-                cs_n_used as u32,
-                B_MAX as u32,
-                HOT_CHUNK as u32,
-                crate::config::SWIGLU_CLAMP_EXP,
-                crate::config::N_FF_EXP,
-                crate::config::BLOCKS_Q8K_GATE_IN,
-                n_wi,
-            )?;
+            match ilw.routed.gate.dtype {
+                v4flash_core::gguf::GgufType::IQ2_S => de.iq2s.launch_fused_swiglu_chunked(
+                    &de.compute,
+                    &mut hd.mid_cat,
+                    &hot.gate,
+                    &hot.up,
+                    &hd.moe_xq,
+                    &bd.d_ew,
+                    &hd.group_count,
+                    &hd.expert_members,
+                    &hd.work_items_static,
+                    n_wi,
+                    gbpe,
+                    ubpe,
+                    cs_n_used as u32,
+                    B_MAX as u32,
+                    HOT_CHUNK as u32,
+                    crate::config::SWIGLU_CLAMP_EXP,
+                    crate::config::N_FF_EXP,
+                    crate::config::BLOCKS_Q8K_GATE_IN,
+                )?,
+                _ => de.iq2.launch_fused_swiglu_kwide(
+                    &de.compute,
+                    &mut hd.mid_cat,
+                    &hot.gate,
+                    &hot.up,
+                    &hd.moe_xq,
+                    &bd.d_ew,
+                    &hd.group_count,
+                    &hd.expert_members,
+                    &hd.work_items_static,
+                    gbpe,
+                    ubpe,
+                    cs_n_used as u32,
+                    B_MAX as u32,
+                    HOT_CHUNK as u32,
+                    crate::config::SWIGLU_CLAMP_EXP,
+                    crate::config::N_FF_EXP,
+                    crate::config::BLOCKS_Q8K_GATE_IN,
+                    n_wi,
+                )?,
+            }
             de.q8k.launch(
                 &de.compute,
                 &mut hd.midq_cat,
                 &hd.mid_cat,
                 crate::config::BLOCKS_Q8K_DOWN_IN * (cs_n_used as u32) * b,
             )?;
-            de.q2k.launch_by_expert_kwide2(
-                &de.compute,
-                &mut hd.partials,
-                &hot.down,
-                &hd.midq_cat,
-                &hd.group_count,
-                &hd.expert_members,
-                &hd.work_items_static,
-                dbpe,
-                mid_blocks_bytes as u32,
-                cs_n_used as u32,
-                B_MAX as u32,
-                HOT_CHUNK as u32,
-                N_EMBD,
-                crate::config::BLOCKS_Q8K_DOWN_IN,
-                n_wi,
-            )?;
+            match ilw.routed.down.dtype {
+                v4flash_core::gguf::GgufType::IQ3_XXS => de.iq3.launch_by_expert_kwide2(
+                    &de.compute, &mut hd.partials, &hot.down, &hd.midq_cat,
+                    &hd.group_count, &hd.expert_members, &hd.work_items_static, n_wi,
+                    dbpe, mid_blocks_bytes as u32, cs_n_used as u32,
+                    B_MAX as u32, HOT_CHUNK as u32, N_EMBD,
+                    crate::config::BLOCKS_Q8K_DOWN_IN,
+                )?,
+                v4flash_core::gguf::GgufType::MXFP4 => de.mxfp4.launch_by_expert_kwide2(
+                    &de.compute, &mut hd.partials, &hot.down, &hd.midq_cat,
+                    &hd.group_count, &hd.expert_members, &hd.work_items_static, n_wi,
+                    dbpe, mid_blocks_bytes as u32, cs_n_used as u32,
+                    B_MAX as u32, HOT_CHUNK as u32, N_EMBD,
+                    crate::config::BLOCKS_Q8K_DOWN_IN,
+                )?,
+                _ => de.q2k.launch_by_expert_kwide2(
+                    &de.compute,
+                    &mut hd.partials,
+                    &hot.down,
+                    &hd.midq_cat,
+                    &hd.group_count,
+                    &hd.expert_members,
+                    &hd.work_items_static,
+                    dbpe,
+                    mid_blocks_bytes as u32,
+                    cs_n_used as u32,
+                    B_MAX as u32,
+                    HOT_CHUNK as u32,
+                    N_EMBD,
+                    crate::config::BLOCKS_Q8K_DOWN_IN,
+                    n_wi,
+                )?,
+            }
             de.q2k.launch_reduce_partials_hetsplit(
                 &de.compute,
                 &mut hd.ffn_moe_dgpu,
@@ -2480,6 +2532,13 @@ impl HeterogeneousEngine {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8);
+        if variant == "hybrid" && ilw.routed.gate.dtype != v4flash_core::gguf::GgufType::IQ2_XXS {
+            return Err(eyre!(
+                "IQ2_VARIANT=hybrid unsupported on a layer with {:?} gate/up \
+                 (unsloth blk.26); unset IQ2_VARIANT",
+                ilw.routed.gate.dtype
+            ));
+        }
         if variant == "hybrid" {
             // launch_work_items_split atomicAdds into these counters.
             // Their doc-comment promises "pre-zeroed per layer" — honour
@@ -2593,7 +2652,22 @@ impl HeterogeneousEngine {
                     work_items,
                     ..
                 } = bi;
-                if variant == "tile8" {
+                if ilw.routed.gate.dtype == v4flash_core::gguf::GgufType::IQ2_S {
+                    // blk.26 (unsloth): IQ2_S has one prefill kernel
+                    // (chunked by-expert); IQ2_VARIANT does not apply.
+                    let _t_2s = ie.events.stage("igpu.iq2s_chunked", &ie.compute)?;
+                    ie.iq2s.launch_fused_swiglu_chunked(
+                        &ie.compute, d_mid_cat,
+                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        d_xq_q8k, d_ew,
+                        group_count, expert_members, work_items,
+                        n_work_items,
+                        gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
+                        crate::config::SWIGLU_CLAMP_EXP,
+                        crate::config::N_FF_EXP,
+                        crate::config::BLOCKS_Q8K_GATE_IN,
+                    )?;
+                } else if variant == "tile8" {
                     let _t_t8 = ie.events.stage("igpu.iq2_tile8", &ie.compute)?;
                     ie.iq2.launch_fused_swiglu_tile8_row32(
                         &ie.compute, d_mid_cat,
@@ -2689,8 +2763,14 @@ impl HeterogeneousEngine {
             // Default kwide2 since M53 (2026-06-09): row-pair activation
             // reuse on top of kwide's unpack-once loop; bit-exact vs
             // by_expert. kwide/by_expert/bxn stay opt-in.
-            let q2k_variant = std::env::var("Q2K_VARIANT")
-                .unwrap_or_else(|_| "kwide2".into());
+            let down_dt = ilw.routed.down.dtype;
+            let q2k_variant = if down_dt == v4flash_core::gguf::GgufType::Q2_K {
+                std::env::var("Q2K_VARIANT").unwrap_or_else(|_| "kwide2".into())
+            } else {
+                // IQ3_XXS / MXFP4 implement only the kwide2 shape; the
+                // env variants are Q2_K-only.
+                "kwide2".into()
+            };
             let use_kwide2 = q2k_variant == "kwide2";
             let use_kwide = q2k_variant == "kwide";
             let use_by_expert = use_kwide || use_kwide2 || q2k_variant == "by_expert";
@@ -2719,7 +2799,25 @@ impl HeterogeneousEngine {
                 // pair is written by exactly one work item. (The 128 MB/layer
                 // fill was ~44 ms/chunk of pure overhead.) If routing ever
                 // allows duplicate experts per token, restore the fill.
-                if use_kwide2 {
+                if use_kwide2 && down_dt == v4flash_core::gguf::GgufType::IQ3_XXS {
+                    ie.iq3.launch_by_expert_kwide2(
+                        &ie.compute, &mut bi.q2k_partials,
+                        &ilw.routed.down.buffer, &bi.d_midq_cat,
+                        &bi.group_count, &bi.expert_members, &bi.work_items,
+                        n_work_items, dbpe, mid_blocks_bytes as u32,
+                        cs_n_used as u32, max_per_expert, CHUNK_SIZE,
+                        N_EMBD, crate::config::BLOCKS_Q8K_DOWN_IN,
+                    )?;
+                } else if use_kwide2 && down_dt == v4flash_core::gguf::GgufType::MXFP4 {
+                    ie.mxfp4.launch_by_expert_kwide2(
+                        &ie.compute, &mut bi.q2k_partials,
+                        &ilw.routed.down.buffer, &bi.d_midq_cat,
+                        &bi.group_count, &bi.expert_members, &bi.work_items,
+                        n_work_items, dbpe, mid_blocks_bytes as u32,
+                        cs_n_used as u32, max_per_expert, CHUNK_SIZE,
+                        N_EMBD, crate::config::BLOCKS_Q8K_DOWN_IN,
+                    )?;
+                } else if use_kwide2 {
                     ie.q2k.launch_by_expert_kwide2(
                         &ie.compute,
                         &mut bi.q2k_partials,

@@ -334,6 +334,7 @@ pub struct WorkerState {
     pub weights: HetModelWeights,
     pub vocab: Arc<BpeVocab>,
     pub token_embd_bytes: Vec<u8>,
+    pub token_embd_dtype: v4flash_core::gguf::GgufType,
     pub byte_decoder: std::collections::HashMap<char, u8>,
 
     pub state: HetModelState,
@@ -428,6 +429,7 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
             v4flash_kernels::weight_contract::TOKEN_EMBD_ALLOWED
         ));
     }
+    let token_embd_dtype = token_embd_t.dtype;
     let token_embd_bytes = gguf.read_tensor(token_embd_t)?.to_vec();
 
     let rope = |layer: i32| -> eyre::Result<RopeParams> { Ok(rope_for_layer(layer)) };
@@ -484,6 +486,7 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         weights,
         vocab: Arc::new(vocab),
         token_embd_bytes,
+        token_embd_dtype,
         byte_decoder,
         state,
         dgpu_scratch,
@@ -1417,7 +1420,7 @@ fn save_and_forward_marker(
     let mut pos_after_marker = pos_at_save;
     let initial_in_think = if let Some(marker) = trailing_marker {
         let mut residual = vec![0f32; HC_DIM as usize];
-        embed_lookup(&state.token_embd_bytes, marker, &mut residual);
+        embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, marker, &mut residual);
         state.engine.forward_token(
             &mut state.dgpu_scratch,
             &mut state.igpu_scratch,
@@ -1639,7 +1642,7 @@ fn finish_decode(
         if (next as u32) >= N_VOCAB {
             return Err(eyre!("generate: sampled token id {next} out of vocab"));
         }
-        embed_lookup(&state.token_embd_bytes, next, &mut residual);
+        embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, next, &mut residual);
         state.engine.forward_token(
             &mut state.dgpu_scratch,
             &mut state.igpu_scratch,
@@ -1687,7 +1690,7 @@ fn finish_decode(
     // the brief window between here and the next request's
     // reset_in_place.
     if matches!(finish, FinishReason::Stop) && !was_cancelled && pos < state.n_kv_max {
-        embed_lookup(&state.token_embd_bytes, TOK_EOS, &mut residual);
+        embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, TOK_EOS, &mut residual);
         state.engine.forward_token(
             &mut state.dgpu_scratch,
             &mut state.igpu_scratch,
@@ -1789,7 +1792,7 @@ fn prefill_suffix(
     let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
     for &tok in tokens {
         let mut v = vec![0f32; HC_DIM as usize];
-        embed_lookup(&state.token_embd_bytes, tok, &mut v);
+        embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, tok, &mut v);
         input_hcs.push(v);
     }
     // Clone the progress handle into a local so the per-chunk pet

@@ -19,20 +19,9 @@ const ANTIREZ_PATH: &str =
 const UNSLOTH_PATH: &str =
     "/persist/lumi/models/ds4f-unsloth/UD-IQ2_XXS/DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00001-of-00003.gguf";
 
-/// Roles whose new dtypes still lack wired kernels (shrinks as plan
-/// Phase 2 lands each family; delete entries as the contract's allowed
-/// lists grow).
-const PENDING_KERNEL_ROLES: &[&str] = &[
-    "blk.N.ffn_down_exps.weight",     // IQ3_XXS ×41, MXFP4 ×2
-    "blk.N.ffn_gate_exps.weight",     // IQ2_S (blk.26)
-    "blk.N.ffn_up_exps.weight",       // IQ2_S (blk.26)
-    "blk.N.ffn_gate_shexp.weight",    // Q5_K/Q6_K
-    "blk.N.ffn_up_shexp.weight",      // Q5_K/Q6_K
-    "blk.N.ffn_down_shexp.weight",    // Q6_K
-    "blk.N.attn_q_a.weight",          // Q5_K/Q6_K
-    "output.weight",                  // Q4_K
-    "token_embd.weight",              // Q4_K
-];
+/// Roles whose new dtypes still lack wired kernels. EMPTY since Phase 2
+/// completed — the unsloth file must validate clean.
+const PENDING_KERNEL_ROLES: &[&str] = &[];
 
 #[test]
 #[ignore]

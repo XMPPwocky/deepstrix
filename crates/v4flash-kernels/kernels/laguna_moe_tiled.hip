@@ -1222,6 +1222,7 @@ extern "C" __global__ void q4_k_down_tiled_reg_w32_col(
 // xq_hidden, which the shared gate/up can reuse verbatim).
 // ===========================================================================
 #define DENSE_MAXB 2
+#define BLOCK_Q5_K_BYTES 176
 
 // ---- Q4_K dense GEMM (n_blk<=12 → LDS stride LDS_XQ_BYTES) ----
 extern "C" __global__ void q4_k_dense_gemm_dp4a(
@@ -2667,4 +2668,87 @@ extern "C" __global__ void moe_down_reduce_slots(
         s += base[(size_t)slot * (size_t)n_rows];
     }
     acc[idx] = s;
+}
+
+// ---- Q5_K dense GEMM, wide register-tiled (unsloth UD het/ shexp+q_a) ----
+// Clone of q4_k_dense_gemm_dp4a_r32_nolds with the 5th bit plane: value =
+// nibble | (qh bit << 4) ∈ [0,32) packed bytewise straight into the dp4a
+// operand. Per-lane registers: qs 2×8 + qh 2×8 dwords + scales.
+// grid (n_rows/32, 1, 1), block (1024,1,1); n_blk <= 16.
+extern "C" __global__ void q5_k_dense_gemm_dp4a_r32_nolds(
+        float          * __restrict__ out,   // [B, n_rows]
+        const uint8_t  * __restrict__ w,     // [n_rows, n_blk*176]
+        const uint8_t  * __restrict__ xq,    // [B, n_blk*292] Q8_K
+        unsigned int     B,
+        unsigned int     n_rows,
+        unsigned int     n_blk) {
+    const unsigned int tid          = threadIdx.x;
+    const unsigned int row_in_block = tid / 32u;
+    const unsigned int lane         = tid & 31u;
+    const unsigned int row          = blockIdx.x * DENSE_ROWS_PER_WG + row_in_block;
+    if (row >= n_rows) return;
+    const unsigned int block_lane   = lane >> 2u;
+    const unsigned int sub          = lane & 3u;   // 64-elem group g
+
+    const uint8_t* row_base = w + (uint64_t)row * n_blk * BLOCK_Q5_K_BYTES;
+
+    unsigned int bb_of[DENSE_MAXB];
+    bool  valid[DENSE_MAXB];
+    float xd[DENSE_MAXB], xdm[DENSE_MAXB];
+    int   da[DENSE_MAXB], ma[DENSE_MAXB], db[DENSE_MAXB], mb[DENSE_MAXB];
+    uint32_t vlo[DENSE_MAXB][8];
+    uint32_t vhi[DENSE_MAXB][8];
+    #pragma unroll
+    for (int k = 0; k < DENSE_MAXB; k++) {
+        const unsigned int bb = block_lane + (unsigned int)k * 8u;
+        bb_of[k] = bb;
+        valid[k] = (bb < n_blk);
+        if (!valid[k]) continue;
+        const uint8_t* wg = row_base + (uint64_t)bb * BLOCK_Q5_K_BYTES;
+        xd[k]  = f16_to_f32_t(*(const uint16_t*)(wg + 0));
+        xdm[k] = f16_to_f32_t(*(const uint16_t*)(wg + 2));
+        uint8_t d0,m0,d1,m1;
+        get_scale_min_q4k_t(2*sub,   wg+4, &d0,&m0);
+        get_scale_min_q4k_t(2*sub+1, wg+4, &d1,&m1);
+        da[k]=d0; ma[k]=m0; db[k]=d1; mb[k]=m1;
+        const uint8_t* qh = wg + 16;
+        const uint8_t* q  = wg + 48 + (size_t)sub*32u;
+        const unsigned int s_lo = 2u*sub;
+        const unsigned int s_hi = 2u*sub + 1u;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const uint32_t qsd = (uint32_t)load_dword_t(q + i*4);
+            const uint32_t qhd = (uint32_t)load_dword_t(qh + i*4);
+            vlo[k][i] = (qsd & 0x0f0f0f0fu)
+                      | (((qhd >> s_lo) & 0x01010101u) << 4);
+            vhi[k][i] = ((qsd >> 4) & 0x0f0f0f0fu)
+                      | (((qhd >> s_hi) & 0x01010101u) << 4);
+        }
+    }
+
+    const unsigned int xq_bytes = n_blk * BLOCK_Q8_K_BYTES;
+    for (unsigned int bcol = 0; bcol < B; bcol++) {
+        const uint8_t* xj = xq + (size_t)bcol * (size_t)xq_bytes;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < DENSE_MAXB; k++) {
+            if (!valid[k]) continue;
+            const uint8_t* y = xj + (size_t)bb_of[k] * BLOCK_Q8_K_BYTES;
+            const float yd = *(const float*)(y + 0);
+            const int8_t* q8 = (const int8_t*)(y + 4) + (size_t)sub*64u;
+            const int16_t* bs = (const int16_t*)(y + 260);
+            int lo=0, hi=0;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                lo = sudot4_t((int32_t)vlo[k][i], load_dword_i8_t(q8 + i*4), lo);
+                hi = sudot4_t((int32_t)vhi[k][i], load_dword_i8_t(q8 + 32 + i*4), hi);
+            }
+            const int32_t bsa = (int32_t)bs[4u*sub+0u]+(int32_t)bs[4u*sub+1u];
+            const int32_t bsb = (int32_t)bs[4u*sub+2u]+(int32_t)bs[4u*sub+3u];
+            acc += yd*xd[k]*((float)da[k]*lo + (float)db[k]*hi)
+                 - yd*xdm[k]*((float)ma[k]*bsa + (float)mb[k]*bsb);
+        }
+        acc = warp_sum_f32_t(acc);
+        if (lane == 0) out[(size_t)bcol * (size_t)n_rows + (size_t)row] = acc;
+    }
 }

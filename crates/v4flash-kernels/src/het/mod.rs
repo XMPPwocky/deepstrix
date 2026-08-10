@@ -17,6 +17,7 @@
 //! `ExecMode::HetParallel`. M13.5 migrates the compressor to iGPU.
 
 pub mod batch_scratch;
+pub mod dispatch;
 pub mod engine;
 pub mod forward_head;
 pub mod forward_layer;

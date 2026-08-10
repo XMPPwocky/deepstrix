@@ -52,7 +52,7 @@
 use std::io::{BufRead, Write};
 
 use color_eyre::eyre::{self, eyre};
-use v4flash_core::{gguf::GgufType, tokenizer::BpeVocab, MappedGguf};
+use v4flash_core::{tokenizer::BpeVocab, MappedGguf};
 use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::config::{COMPRESS_RATIOS, HC_DIM, N_EMBD, N_HC, N_VOCAB};
 use v4flash_kernels::het::{
@@ -280,23 +280,14 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(f32_bits)
 }
 
-fn embed_lookup(token_embd_bytes: &[u8], token_id: i32, out: &mut [f32]) {
-    let n_embd = N_EMBD as usize;
-    let n_hc = N_HC as usize;
-    assert_eq!(out.len(), n_embd * n_hc);
-    let row_off = (token_id as usize) * n_embd * 2;
-    for i in 0..n_embd {
-        let b0 = token_embd_bytes[row_off + i * 2];
-        let b1 = token_embd_bytes[row_off + i * 2 + 1];
-        let bits = u16::from_le_bytes([b0, b1]);
-        out[i] = f16_to_f32(bits);
-    }
-    for h in 1..n_hc {
-        let (head, tail) = out.split_at_mut(h * n_embd);
-        let src = &head[0..n_embd];
-        let dst = &mut tail[0..n_embd];
-        dst.copy_from_slice(src);
-    }
+fn embed_lookup(
+    token_embd_bytes: &[u8],
+    dtype: v4flash_core::gguf::GgufType,
+    token_id: i32,
+    out: &mut [f32],
+) {
+    v4flash_kernels::embed::embed_lookup(token_embd_bytes, dtype, token_id, out)
+        .expect("embed_lookup: dtype validated at load");
 }
 
 fn build_gpt2_byte_decoder() -> std::collections::HashMap<char, u8> {
@@ -406,6 +397,7 @@ fn main() -> eyre::Result<()> {
             v4flash_kernels::weight_contract::TOKEN_EMBD_ALLOWED
         ));
     }
+    let token_embd_dtype = token_embd_t.dtype;
     let token_embd_bytes = gguf.read_tensor(token_embd_t)?;
     let token_embd_bytes: &[u8] = &token_embd_bytes;
 
@@ -523,7 +515,7 @@ fn main() -> eyre::Result<()> {
         let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(turn_tokens.len());
         for &tok in &turn_tokens {
             let mut v = vec![0f32; HC_DIM as usize];
-            embed_lookup(token_embd_bytes, tok, &mut v);
+            embed_lookup(token_embd_bytes, token_embd_dtype, tok, &mut v);
             input_hcs.push(v);
         }
 
@@ -589,7 +581,7 @@ fn main() -> eyre::Result<()> {
                 // Forward EOS into KV so next turn picks up after a clean
                 // boundary. (Also true for hallucinated role markers — we
                 // treat them as if the model meant to end the turn.)
-                embed_lookup(token_embd_bytes, TOK_EOS, &mut residual);
+                embed_lookup(token_embd_bytes, token_embd_dtype, TOK_EOS, &mut residual);
                 engine.forward_token(
                     &mut dgpu_scratch, &mut igpu_scratch, &mut state, &weights,
                     &residual, pos, TOK_EOS,
@@ -599,7 +591,7 @@ fn main() -> eyre::Result<()> {
                 break;
             }
 
-            embed_lookup(token_embd_bytes, next, &mut residual);
+            embed_lookup(token_embd_bytes, token_embd_dtype, next, &mut residual);
             engine.forward_token(
                 &mut dgpu_scratch, &mut igpu_scratch, &mut state, &weights,
                 &residual, pos, next,

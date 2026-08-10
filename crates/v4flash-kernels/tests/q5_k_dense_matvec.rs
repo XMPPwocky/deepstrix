@@ -7,6 +7,7 @@
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
+use v4flash_kernels::dense_gemm::DenseGemmDp4a;
 use v4flash_kernels::iq2_xxs_tables::f16_to_f32;
 use v4flash_kernels::q5_k_dense::{Q5_KDenseMatvec, Q5_K_DENSE_BLOCK_BYTES};
 
@@ -130,6 +131,60 @@ fn run_on(device: Device) -> eyre::Result<()> {
     let mut gotb = vec![0f32; batch * n_rows];
     outb_d.copy_to_host(&mut gotb)?;
     check(&format!("{arch} gemv_batched"), &gotb, &want)?;
+
+    // dp4a GEMM (prefill path): Q8_K activations. Host-quantize x to Q8_K
+    // and build its own CPU reference (integer dot × scales) so the GEMM's
+    // math is checked against the same numbers it actually computes.
+    let gemm = DenseGemmDp4a::for_arch(&arch)?;
+    let n_blk = k / 256;
+    let mut xq8k = vec![0u8; batch * n_blk * 292];
+    let mut want_g = vec![0f32; batch * n_rows];
+    let mut deq = vec![0f32; QK_K];
+    let mut xq_int = vec![0i8; batch * k];
+    let mut xd = vec![0f32; batch * n_blk];
+    for bt in 0..batch {
+        for blk in 0..n_blk {
+            let xs = &x[bt * k + blk * 256..bt * k + (blk + 1) * 256];
+            let amax = xs.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+            let o = (bt * n_blk + blk) * 292;
+            xq8k[o..o + 4].copy_from_slice(&d.to_le_bytes());
+            let mut bsums = [0i16; 16];
+            for i in 0..256 {
+                let q = (xs[i] * id).round().clamp(-127.0, 127.0) as i8;
+                xq_int[bt * k + blk * 256 + i] = q;
+                xq8k[o + 4 + i] = q as u8;
+                bsums[i / 16] += q as i16;
+            }
+            for (j, sv) in bsums.iter().enumerate() {
+                xq8k[o + 260 + 2 * j..o + 262 + 2 * j].copy_from_slice(&sv.to_le_bytes());
+            }
+            xd[bt * n_blk + blk] = d;
+        }
+    }
+    for r in 0..n_rows {
+        for blk in 0..n_blk {
+            dequant_q5k(&w[(r * n_blk + blk) * BB..(r * n_blk + blk + 1) * BB], &mut deq);
+            for bt in 0..batch {
+                let d = xd[bt * n_blk + blk];
+                let mut s = 0f32;
+                for i in 0..QK_K {
+                    s += deq[i] * d * xq_int[bt * k + blk * 256 + i] as f32;
+                }
+                want_g[bt * n_rows + r] += s;
+            }
+        }
+    }
+    let mut xq8k_d: DeviceBuffer<u8> = DeviceBuffer::new(device.id, xq8k.len())?;
+    xq8k_d.copy_from_host(&xq8k)?;
+    let mut outg_d: DeviceBuffer<f32> = DeviceBuffer::new(device.id, batch * n_rows)?;
+    gemm.gemm(&stream, v4flash_core::gguf::GgufType::Q5_K, &mut outg_d, &w_d, &xq8k_d,
+        batch as u32, n_rows as u32, n_blk as u32)?;
+    stream.synchronize()?;
+    let mut gotg = vec![0f32; batch * n_rows];
+    outg_d.copy_to_host(&mut gotg)?;
+    check(&format!("{arch} gemm_dp4a"), &gotg, &want_g)?;
     Ok(())
 }
 

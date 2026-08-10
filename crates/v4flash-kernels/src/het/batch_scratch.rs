@@ -141,6 +141,14 @@ pub struct BatchDgpuScratch {
     pub ffn_cur: DeviceBuffer<f32>,
     pub ffn_input_norm: DeviceBuffer<f32>,
 
+    // ---- K-quant prefill activations (unsloth UD mix) ----
+    /// Q8_K of attn_input_norm `[B, 16*292]` — attn_q_a when Q5_K/Q6_K.
+    pub kq_attn_q8k: DeviceBuffer<u8>,
+    /// Q8_K of ffn_input_norm `[B, 16*292]` — shexp gate/up when Q5_K/Q6_K.
+    pub kq_ffn_q8k: DeviceBuffer<u8>,
+    /// Q8_K of mid_sh `[B, 8*292]` — shexp down when Q6_K.
+    pub kq_mid_q8k: DeviceBuffer<u8>,
+
     // ---- Q chain ----
     pub xq_n_embd: DeviceBuffer<i8>,
     pub xscale_n_embd: DeviceBuffer<f32>,
@@ -500,6 +508,7 @@ impl BatchDgpuScratch {
         let mk_u16 =
             |n: usize| -> eyre::Result<DeviceBuffer<u16>> { DeviceBuffer::new(id, b * n) };
         let mk_i8 = |n: usize| -> eyre::Result<DeviceBuffer<i8>> { DeviceBuffer::new(id, b * n) };
+        let mk_u8 = |n: usize| -> eyre::Result<DeviceBuffer<u8>> { DeviceBuffer::new(id, b * n) };
         let mk_i32 =
             |n: usize| -> eyre::Result<DeviceBuffer<i32>> { DeviceBuffer::new(id, b * n) };
         // Built before the literal so the M61 hot-expert scratch can carve
@@ -529,6 +538,9 @@ impl BatchDgpuScratch {
             ffn_cur: mk_f32(N_EMBD as usize)?,
             ffn_input_norm: mk_f32(N_EMBD as usize)?,
 
+            kq_attn_q8k: mk_u8((BLOCKS_Q8K_GATE_IN as usize) * 292)?,
+            kq_ffn_q8k: mk_u8((BLOCKS_Q8K_GATE_IN as usize) * 292)?,
+            kq_mid_q8k: mk_u8((BLOCKS_Q8K_DOWN_IN as usize) * 292)?,
             xq_n_embd: mk_i8(N_EMBD as usize)?,
             xscale_n_embd: mk_f32(BLOCKS_N_EMBD as usize)?,
             qr: mk_f32(N_LORA_Q as usize)?,

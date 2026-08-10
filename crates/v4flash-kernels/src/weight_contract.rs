@@ -55,28 +55,28 @@ pub fn role_of(name: &str) -> String {
 ///
 /// The `Quant` lists enumerate the types the forward pass has *wired
 /// kernels for today* — extend a list only together with the dispatch that
-/// executes the new type (unsloth-UD plan Phase 2: IQ3_XXS/MXFP4 down,
-/// IQ2_S gate/up, Q5_K/Q6_K shexp+q_a, Q4_K head/embd). Until then,
-/// [`validate_model`] on a file using those types reports them as the
-/// missing-kernel list, which is exactly the intended failure mode.
+/// executes the new type. Phase 2 (unsloth-UD) wired: IQ3_XXS/MXFP4 down,
+/// IQ2_S gate/up, Q5_K/Q6_K shexp+q_a, Q4_K head/embd. [`validate_model`]
+/// on a file using anything else reports it as the missing-kernel list.
 pub fn expectation(role: &str) -> Option<Expect> {
     Some(match role {
         // ---- dense attention / head: kernel-decoded quants ----
-        "output.weight" => Expect::Quant(&[Q8_0]),
-        "blk.N.attn_q_a.weight"
-        | "blk.N.attn_q_b.weight"
+        "output.weight" => Expect::Quant(&[Q8_0, Q4_K]),
+        "blk.N.attn_q_a.weight" => Expect::Quant(&[Q8_0, Q5_K, Q6_K]),
+        "blk.N.attn_q_b.weight"
         | "blk.N.attn_kv.weight"
         | "blk.N.attn_output_a.weight"
         | "blk.N.attn_output_b.weight" => Expect::Quant(&[Q8_0]),
 
         // ---- MoE ----
         "blk.N.ffn_gate_exps.weight" | "blk.N.ffn_up_exps.weight" => {
-            Expect::Quant(&[IQ2_XXS])
+            Expect::Quant(&[IQ2_XXS, IQ2_S])
         }
-        "blk.N.ffn_down_exps.weight" => Expect::Quant(&[Q2_K]),
-        "blk.N.ffn_gate_shexp.weight"
-        | "blk.N.ffn_up_shexp.weight"
-        | "blk.N.ffn_down_shexp.weight" => Expect::Quant(&[Q8_0]),
+        "blk.N.ffn_down_exps.weight" => Expect::Quant(&[Q2_K, IQ3_XXS, MXFP4]),
+        "blk.N.ffn_gate_shexp.weight" | "blk.N.ffn_up_shexp.weight" => {
+            Expect::Quant(&[Q8_0, Q5_K, Q6_K])
+        }
+        "blk.N.ffn_down_shexp.weight" => Expect::Quant(&[Q8_0, Q6_K]),
 
         // ---- consumed by F16 kernels: convert at load ----
         "blk.N.ffn_gate_inp.weight" => Expect::ToF16(&[F16, BF16, F32]),
@@ -97,9 +97,9 @@ pub fn expectation(role: &str) -> Option<Expect> {
 }
 
 /// Types accepted for `token_embd.weight` (host-side embed path, not
-/// loaded through `load_to_device` — validated by its consumers).
-/// Q4_K joins in Phase 2 with the dtype-aware `embed_lookup`.
-pub const TOKEN_EMBD_ALLOWED: &[GgufType] = &[F16];
+/// loaded through `load_to_device` — validated by its consumers; see
+/// [`crate::embed::embed_lookup`]).
+pub const TOKEN_EMBD_ALLOWED: &[GgufType] = &[F16, Q4_K];
 
 /// Expected dims for roles whose shapes are pinned by `config.rs`
 /// constants (the ones a wrong shape would silently corrupt). Dims are in
