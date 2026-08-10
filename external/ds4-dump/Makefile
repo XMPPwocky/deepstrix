@@ -16,7 +16,7 @@ DS4_OBJS := $(DS4_DIR)/ds4.o $(DS4_DIR)/ds4_cuda.o
 
 .PHONY: all clean
 
-all: ds4-dump-logits ds4-dump-tokenize ds4-dump-activations
+all: ds4-dump-logits ds4-dump-tokenize ds4-dump-activations quants-selftest
 
 # Build ds4's .o files if missing, by delegating to its Makefile.
 $(DS4_DIR)/ds4.o $(DS4_DIR)/ds4_cuda.o:
@@ -41,6 +41,19 @@ dump_activations.o: dump_activations.c $(DS4_DIR)/ds4.h
 ds4-dump-activations: dump_activations.o $(DS4_OBJS)
 	$(HIPCC) $(HIPLDFLAGS) -o $@ $^
 
+# Track R: validates ds4's IQ3_XXS/IQ2_S/MXFP4 ports against llama.cpp
+# reference values (quants_selftest_expected.inc). `make check` runs it.
+quants_selftest.o: quants_selftest.c quants_selftest_expected.inc $(DS4_DIR)/ds4.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+quants-selftest: quants_selftest.o $(DS4_OBJS)
+	$(HIPCC) $(HIPLDFLAGS) -o $@ $^
+
+.PHONY: check
+check: quants-selftest
+	./quants-selftest
+
 clean:
 	rm -f dump_logits.o ds4-dump-logits dump_tokenize.o ds4-dump-tokenize \
-	      dump_activations.o ds4-dump-activations
+	      dump_activations.o ds4-dump-activations \
+	      quants_selftest.o quants-selftest

@@ -14,6 +14,7 @@ external/ds4-dump/*.o
 external/ds4-dump/ds4-dump-logits
 external/ds4-dump/ds4-dump-tokenize
 external/ds4-dump/ds4-dump-activations
+external/ds4-dump/quants-selftest
 
 # Phase 1 reference outputs — captured logits live outside the repo (huge);
 # only docs/PHASE1_REFERENCE.md (with SHA256s) is checked in.
