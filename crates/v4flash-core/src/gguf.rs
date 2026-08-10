@@ -58,6 +58,9 @@ pub struct Gguf {
     pub tensor_data_offset: u64,
     pub file_size: u64,
     metadata: HashMap<String, GgufValue>,
+    /// KV keys in file order (parse order; merged shards append their
+    /// new keys). Lets writers reproduce the original KV section order.
+    kv_order: Vec<String>,
     tensors: Vec<GgufTensor>,
     tensor_index: HashMap<String, usize>,
 }
@@ -71,6 +74,12 @@ impl Gguf {
         // a few MB even for huge models.
         let mut reader = BufReader::with_capacity(1 << 16, file);
         Self::parse(&mut reader, file_size)
+    }
+
+    /// Parse from any reader (e.g. an in-memory buffer for tests).
+    /// `file_size` bounds the tensor-data range checks.
+    pub fn parse_reader<R: Read + Seek>(r: &mut R, file_size: u64) -> Result<Self, GgufError> {
+        Self::parse(r, file_size)
     }
 
     fn parse<R: Read + Seek>(r: &mut R, file_size: u64) -> Result<Self, GgufError> {
@@ -87,6 +96,7 @@ impl Gguf {
 
         // Pass 1: metadata. Look for general.alignment along the way.
         let mut metadata = HashMap::with_capacity(n_kv as usize);
+        let mut kv_order = Vec::with_capacity(n_kv as usize);
         let mut alignment = DEFAULT_ALIGNMENT;
         for _ in 0..n_kv {
             let key = read_string(r)?;
@@ -98,6 +108,9 @@ impl Gguf {
                         alignment = *v as u64;
                     }
                 }
+            }
+            if !metadata.contains_key(&key) {
+                kv_order.push(key.clone());
             }
             metadata.insert(key, value);
         }
@@ -175,6 +188,7 @@ impl Gguf {
             tensor_data_offset,
             file_size,
             metadata,
+            kv_order,
             tensors,
             tensor_index,
         })
@@ -186,6 +200,14 @@ impl Gguf {
 
     pub fn metadata_keys(&self) -> impl Iterator<Item = &str> {
         self.metadata.keys().map(String::as_str)
+    }
+
+    /// Metadata entries in file (parse) order. For a merged split GGUF,
+    /// shard-0 keys first, then keys newly introduced by later shards.
+    pub fn metadata_in_order(&self) -> impl Iterator<Item = (&str, &GgufValue)> {
+        self.kv_order
+            .iter()
+            .map(|k| (k.as_str(), &self.metadata[k]))
     }
 
     pub fn tensors(&self) -> &[GgufTensor] {
@@ -235,7 +257,7 @@ impl Gguf {
             }
         }
 
-        for (shard_idx, shard) in it.enumerate() {
+        for (shard_idx, mut shard) in it.enumerate() {
             let shard_idx = shard_idx + 1;
             for mut t in shard.tensors {
                 t.shard = shard_idx;
@@ -248,8 +270,13 @@ impl Gguf {
                 merged.tensor_index.insert(t.name.clone(), merged.tensors.len());
                 merged.tensors.push(t);
             }
-            for (k, v) in shard.metadata {
-                merged.metadata.entry(k).or_insert(v);
+            for k in shard.kv_order {
+                if let Some(v) = shard.metadata.remove(&k) {
+                    if !merged.metadata.contains_key(&k) {
+                        merged.kv_order.push(k.clone());
+                        merged.metadata.insert(k, v);
+                    }
+                }
             }
         }
         merged.n_tensors = merged.tensors.len() as u64;
@@ -449,6 +476,43 @@ pub enum GgufType {
 }
 
 impl GgufType {
+    /// The on-disk GGUF type id (inverse of [`GgufType::from_id`]).
+    pub fn id(&self) -> u32 {
+        match self {
+            Self::F32 => 0,
+            Self::F16 => 1,
+            Self::Q4_0 => 2,
+            Self::Q4_1 => 3,
+            Self::Q5_0 => 6,
+            Self::Q5_1 => 7,
+            Self::Q8_0 => 8,
+            Self::Q8_1 => 9,
+            Self::Q2_K => 10,
+            Self::Q3_K => 11,
+            Self::Q4_K => 12,
+            Self::Q5_K => 13,
+            Self::Q6_K => 14,
+            Self::Q8_K => 15,
+            Self::IQ2_XXS => 16,
+            Self::IQ2_XS => 17,
+            Self::IQ3_XXS => 18,
+            Self::IQ1_S => 19,
+            Self::IQ4_NL => 20,
+            Self::IQ3_S => 21,
+            Self::IQ2_S => 22,
+            Self::IQ4_XS => 23,
+            Self::I8 => 24,
+            Self::I16 => 25,
+            Self::I32 => 26,
+            Self::I64 => 27,
+            Self::F64 => 28,
+            Self::IQ1_M => 29,
+            Self::BF16 => 30,
+            Self::MXFP4 => 39,
+            Self::Unknown(id) => *id,
+        }
+    }
+
     pub fn from_id(id: u32) -> Option<Self> {
         Some(match id {
             0 => Self::F32,

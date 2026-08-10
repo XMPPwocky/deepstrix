@@ -1,0 +1,645 @@
+diff --git a/ds4.c b/ds4.c
+--- a/ds4.c
++++ b/ds4.c
+@@ -2549,6 +2549,59 @@
+     }
+ }
+ 
++/* deepstrix patch (Track R): per-tensor-type dispatch for the routed MoE
++ * dot kernels. The workers below used to hard-code IQ2_XXS (gate/up pair)
++ * and Q2_K (down); each caller now resolves the row dot once from the
++ * tensor's GGUF type and threads it through the worker ctx. For the
++ * original antirez mix the resolved functions are exactly the ones that
++ * were called directly before — identical math, one indirect call. */
++typedef void (*ds4_expert_dot_fn)(int n, float *s, const void *x, const block_q8_K *y);
++typedef void (*ds4_expert_pair_dot_fn)(int n, float *s0, float *s1,
++                                       const void *x0, const void *x1,
++                                       const block_q8_K *y);
++
++static void expert_dot_q2_K(int n, float *s, const void *x, const block_q8_K *y) {
++    ds4_vec_dot_q2_K_q8_K(n, s, (const block_q2_K *)x, y);
++}
++static void expert_dot_iq3_xxs(int n, float *s, const void *x, const block_q8_K *y) {
++    ds4_vec_dot_iq3_xxs_q8_K(n, s, (const block_iq3_xxs *)x, y);
++}
++static void expert_dot_mxfp4(int n, float *s, const void *x, const block_q8_K *y) {
++    ds4_vec_dot_mxfp4_q8_K(n, s, (const block_mxfp4 *)x, y);
++}
++static void expert_pair_dot_iq2_xxs(int n, float *s0, float *s1,
++                                    const void *x0, const void *x1,
++                                    const block_q8_K *y) {
++    ds4_vec_dot_iq2_xxs_pair_q8_K(n, s0, s1,
++                                  (const block_iq2_xxs *)x0,
++                                  (const block_iq2_xxs *)x1, y);
++}
++static void expert_pair_dot_iq2_s(int n, float *s0, float *s1,
++                                  const void *x0, const void *x1,
++                                  const block_q8_K *y) {
++    ds4_vec_dot_iq2_s_q8_K(n, s0, (const block_iq2_s *)x0, y);
++    ds4_vec_dot_iq2_s_q8_K(n, s1, (const block_iq2_s *)x1, y);
++}
++
++/* Down-projection (single-tensor) dot for a routed expert type, or NULL. */
++static ds4_expert_dot_fn expert_down_dot_for_type(uint32_t type) {
++    switch (type) {
++    case 10: return expert_dot_q2_K;
++    case 18: return expert_dot_iq3_xxs;
++    case 39: return expert_dot_mxfp4;
++    default: return NULL;
++    }
++}
++
++/* Gate/up (same-type pair) dot for a routed expert type, or NULL. */
++static ds4_expert_pair_dot_fn expert_pair_dot_for_type(uint32_t type) {
++    switch (type) {
++    case 16: return expert_pair_dot_iq2_xxs;
++    case 22: return expert_pair_dot_iq2_s;
++    default: return NULL;
++    }
++}
++
+ typedef struct {
+     ds4_tensor *hc_attn_fn;
+     ds4_tensor *hc_attn_scale;
+@@ -2785,10 +2838,35 @@
+     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
+ }
+ 
++/* deepstrix patch (Track R): the "dumper variant" GGUF pre-dequantizes
++ * some dense Q8_0 tensors (attn_q_a, shexp, output head) to exact F32.
++ * Accept either; the matvec paths dispatch on the actual type. */
++static void tensor_expect_q8_0_or_f32_layout(
++        const ds4_tensor *t,
++        uint32_t          ndim,
++        uint64_t          d0,
++        uint64_t          d1,
++        uint64_t          d2) {
++    if (!t) ds4_die("internal error: missing tensor while validating layout");
++    if (t->type != DS4_TENSOR_Q8_0 && t->type != DS4_TENSOR_F32) {
++        fprintf(stderr,
++                "ds4: tensor %.*s has type %s, expected Q8_0 or F32\n",
++                (int)t->name.len,
++                t->name.ptr,
++                tensor_type_name(t->type));
++        exit(1);
++    }
++    tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
++}
++
+ static bool tensor_is_routed_expert_type(uint32_t type) {
+     return type == DS4_TENSOR_IQ2_XXS ||
+            type == DS4_TENSOR_Q2_K ||
+-           type == DS4_TENSOR_Q4_K;
++           type == DS4_TENSOR_Q4_K ||
++           /* deepstrix patch (Track R): unsloth UD-IQ2_XXS expert types. */
++           type == DS4_TENSOR_IQ3_XXS ||
++           type == DS4_TENSOR_IQ2_S ||
++           type == DS4_TENSOR_MXFP4;
+ }
+ 
+ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
+@@ -2796,14 +2874,22 @@
+     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
+     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
+     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
++    case DS4_TENSOR_IQ3_XXS: return sizeof(block_iq3_xxs);
++    case DS4_TENSOR_IQ2_S:   return sizeof(block_iq2_s);
++    case DS4_TENSOR_MXFP4:   return sizeof(block_mxfp4);
+     default:                 ds4_die("unsupported routed expert tensor type");
+     }
+     return 0;
+ }
+ 
+ static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
+-    if ((t->dim[0] % QK_K) != 0) ds4_die("routed expert row is not QK_K aligned");
+-    return (t->dim[0] / QK_K) * routed_expert_block_bytes(t->type);
++    /* deepstrix patch (Track R): use the type's real block width — MXFP4
++     * blocks are 32 elements, not QK_K. Identical result for the 256-wide
++     * block types this used to assume. */
++    const gguf_type_info *info = tensor_type(t->type);
++    if (!info || info->block_elems == 0) ds4_die("unsupported routed expert tensor type");
++    if ((t->dim[0] % info->block_elems) != 0) ds4_die("routed expert row is not block aligned");
++    return (t->dim[0] / info->block_elems) * routed_expert_block_bytes(t->type);
+ }
+ 
+ static void tensor_expect_routed_expert(
+@@ -2853,12 +2939,14 @@
+     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+     const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+ 
+-    tensor_expect_layout(w->token_embd,      DS4_TENSOR_F16,  2, DS4_N_EMBD, DS4_N_VOCAB, 0);
++    /* deepstrix patch (Track R): token_embd + output accept the dumper
++     * variant's F32 alongside the original F16/Q8_0. */
++    tensor_expect_plain_layout(w->token_embd,          2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+     tensor_expect_layout(w->output_hc_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
+     tensor_expect_layout(w->output_hc_fn,    DS4_TENSOR_F16,  2, hc_dim, DS4_N_HC, 0);
+     tensor_expect_layout(w->output_hc_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
+     tensor_expect_layout(w->output_norm,     DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+-    tensor_expect_layout(w->output,          DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
++    tensor_expect_q8_0_or_f32_layout(w->output,        2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+ 
+     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+         const ds4_layer_weights *l = &w->layer[il];
+@@ -2868,7 +2956,7 @@
+         tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
+         tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
+         tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+-        tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
++        tensor_expect_q8_0_or_f32_layout(l->attn_q_a,      2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
+         tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
+         tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q, q_dim, 0);
+         tensor_expect_layout(l->attn_kv,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
+@@ -2909,9 +2997,14 @@
+             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
+             exit(1);
+         }
+-        tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+-        tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0,    2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+-        tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0,    2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
++        tensor_expect_q8_0_or_f32_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
++        tensor_expect_q8_0_or_f32_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
++        tensor_expect_q8_0_or_f32_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
++        if (l->ffn_gate_shexp->type != l->ffn_up_shexp->type ||
++            l->ffn_gate_shexp->type != l->ffn_down_shexp->type) {
++            fprintf(stderr, "ds4: shared expert tensors use mixed types in layer %u\n", il);
++            exit(1);
++        }
+         if (il < DS4_N_HASH_LAYER) {
+             tensor_expect_layout(l->ffn_gate_tid2eid, DS4_TENSOR_I32, 2, DS4_N_EXPERT_USED, DS4_N_VOCAB, 0);
+         }
+@@ -3252,8 +3345,17 @@
+         ds4_die("token id is outside the embedding table");
+     }
+ 
+-    const uint16_t *base = tensor_data(m, te);
+     const uint64_t stride = te->dim[0];
++
++    /* deepstrix patch (Track R): the dumper variant stores token_embd as
++     * exact-dequant F32 (the source file's Q4_K has no F16 rendering). */
++    if (te->type == DS4_TENSOR_F32) {
++        const float *base = tensor_data(m, te);
++        memcpy(out, base + (uint64_t)token * stride, (size_t)stride * sizeof(out[0]));
++        return;
++    }
++
++    const uint16_t *base = tensor_data(m, te);
+     const uint16_t *row = base + (uint64_t)token * stride;
+ 
+     for (uint64_t i = 0; i < stride; i++) {
+@@ -4305,6 +4407,36 @@
+     }
+ }
+ 
++/* deepstrix patch (Track R): batched dense matmuls over F32 weights (the
++ * dumper variant's pre-dequantized attn_q_a / shexp / output). Token loop
++ * over the row-parallel matvec — throughput is irrelevant on this path. */
++static void matmul_f32_batch(
++        float           * out,
++        const ds4_model * m,
++        const ds4_tensor * w,
++        const float     * x,
++        uint64_t          n_tok) {
++    const uint64_t in_dim = w->dim[0];
++    const uint64_t out_dim = w->dim[1];
++    for (uint64_t t = 0; t < n_tok; t++) {
++        matvec_f32(out + t * out_dim, m, w, x + t * in_dim);
++    }
++}
++
++static void matmul_any_batch(
++        float           * out,
++        const ds4_model * m,
++        const ds4_tensor * w,
++        const float     * x,
++        uint64_t          n_tok) {
++    switch (w->type) {
++    case 0: matmul_f32_batch(out, m, w, x, n_tok); break;
++    case 8: matmul_q8_0_batch(out, m, w, x, n_tok); break;
++    default:
++        ds4_die("unsupported tensor type for batched dense matmul");
++    }
++}
++
+ static float tensor_1d_value(const ds4_model *m, const ds4_tensor *t, uint64_t i) {
+     if (i >= t->elements) ds4_die("tensor scalar index is out of bounds");
+     if (t->type == 0) {
+@@ -4355,6 +4487,7 @@
+     const uint8_t *base0;
+     const uint8_t *base1;
+     const block_q8_K *xq;
++    ds4_expert_pair_dot_fn dot; /* deepstrix Track R: type-resolved pair dot */
+     uint64_t in_dim;
+     uint64_t row_bytes0;
+     uint64_t row_bytes1;
+@@ -4363,14 +4496,14 @@
+ static void matvec_iq2_xxs_pair_worker(void *vctx, uint64_t row0, uint64_t row1) {
+     matvec_iq2_xxs_pair_ctx *ctx = vctx;
+     for (uint64_t row = row0; row < row1; row++) {
+-        const block_iq2_xxs *br0 = (const block_iq2_xxs *)(ctx->base0 + row * ctx->row_bytes0);
+-        const block_iq2_xxs *br1 = (const block_iq2_xxs *)(ctx->base1 + row * ctx->row_bytes1);
+-        ds4_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &ctx->out0[row], &ctx->out1[row], br0, br1, ctx->xq);
++        const void *br0 = ctx->base0 + row * ctx->row_bytes0;
++        const void *br1 = ctx->base1 + row * ctx->row_bytes1;
++        ctx->dot((int)ctx->in_dim, &ctx->out0[row], &ctx->out1[row], br0, br1, ctx->xq);
+     }
+ }
+ 
+-/* Project one routed expert's gate and up matrices.  Both are IQ2_XXS and
+- * share the same Q8_K activation. */
++/* Project one routed expert's gate and up matrices.  Both share one quant
++ * type (IQ2_XXS, or IQ2_S in the unsloth mix) and one Q8_K activation. */
+ static void matvec_iq2_xxs_expert_pair_prequant(
+         float            *out0,
+         float            *out1,
+@@ -4379,14 +4512,15 @@
+         const ds4_tensor *w1,
+         const block_q8_K *xq,
+         uint32_t          expert) {
+-    if (w0->type != 16 || w1->type != 16) ds4_die("expected IQ2_XXS expert tensors");
++    ds4_expert_pair_dot_fn dot = expert_pair_dot_for_type(w0->type);
++    if (w0->type != w1->type || dot == NULL) ds4_die("expected IQ2_XXS/IQ2_S expert tensors");
+ 
+     uint64_t in_dim0, out_dim0, row_bytes0;
+     uint64_t in_dim1, out_dim1, row_bytes1;
+     const uint8_t *base0 = tensor_expert_bytes(m, w0, expert, &in_dim0, &out_dim0, &row_bytes0);
+     const uint8_t *base1 = tensor_expert_bytes(m, w1, expert, &in_dim1, &out_dim1, &row_bytes1);
+-    if (in_dim0 != in_dim1 || out_dim0 != out_dim1) ds4_die("paired IQ2_XXS expert tensors do not match");
+-    if (in_dim0 % QK_K != 0) ds4_die("IQ2_XXS expert row is not QK_K aligned");
++    if (in_dim0 != in_dim1 || out_dim0 != out_dim1) ds4_die("paired expert tensors do not match");
++    if (in_dim0 % QK_K != 0) ds4_die("expert row is not QK_K aligned");
+ 
+     matvec_iq2_xxs_pair_ctx ctx = {
+         .out0 = out0,
+@@ -4394,6 +4528,7 @@
+         .base0 = base0,
+         .base1 = base1,
+         .xq = xq,
++        .dot = dot,
+         .in_dim = in_dim0,
+         .row_bytes0 = row_bytes0,
+         .row_bytes1 = row_bytes1,
+@@ -4408,6 +4543,7 @@
+     const uint8_t *gate_base[DS4_N_EXPERT_USED];
+     const uint8_t *up_base[DS4_N_EXPERT_USED];
+     const block_q8_K *xq;
++    ds4_expert_pair_dot_fn dot; /* deepstrix Track R: type-resolved pair dot */
+     float expert_weight[DS4_N_EXPERT_USED];
+     float clamp;
+     uint64_t in_dim;
+@@ -4426,9 +4562,9 @@
+         float gate = 0.0f;
+         float up = 0.0f;
+ 
+-        const block_iq2_xxs *gate_row = (const block_iq2_xxs *)(ctx->gate_base[slot] + row * ctx->gate_row_bytes[slot]);
+-        const block_iq2_xxs *up_row = (const block_iq2_xxs *)(ctx->up_base[slot] + row * ctx->up_row_bytes[slot]);
+-        ds4_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &gate, &up, gate_row, up_row, ctx->xq);
++        const void *gate_row = ctx->gate_base[slot] + row * ctx->gate_row_bytes[slot];
++        const void *up_row = ctx->up_base[slot] + row * ctx->up_row_bytes[slot];
++        ctx->dot((int)ctx->in_dim, &gate, &up, gate_row, up_row, ctx->xq);
+ 
+         if (ctx->clamp > 1.0e-6f) {
+             if (gate > ctx->clamp) gate = ctx->clamp;
+@@ -4451,7 +4587,8 @@
+         const float      *expert_weight,
+         int               n_expert,
+         float             clamp) {
+-    if (gate_w->type != 16 || up_w->type != 16) ds4_die("expected IQ2_XXS expert tensors");
++    ds4_expert_pair_dot_fn dot = expert_pair_dot_for_type(gate_w->type);
++    if (gate_w->type != up_w->type || dot == NULL) ds4_die("expected IQ2_XXS/IQ2_S expert tensors");
+     if (n_expert < 1 || n_expert > DS4_N_EXPERT_USED) ds4_die("unexpected routed expert count");
+ 
+     uint64_t in_dim0 = 0;
+@@ -4459,6 +4596,7 @@
+     matvec_iq2_xxs_mid_ctx ctx = {
+         .mid = mid,
+         .xq = xq,
++        .dot = dot,
+         .clamp = clamp,
+         .n_expert = n_expert,
+     };
+@@ -4492,6 +4630,7 @@
+     float *out;
+     const uint8_t *base;
+     const block_q8_K *xq;
++    ds4_expert_dot_fn dot; /* deepstrix Track R: type-resolved down dot */
+     uint64_t in_dim;
+     uint64_t row_bytes;
+ } matvec_q2_k_ctx;
+@@ -4499,23 +4638,24 @@
+ static void matvec_q2_k_worker(void *vctx, uint64_t row0, uint64_t row1) {
+     matvec_q2_k_ctx *ctx = vctx;
+     for (uint64_t row = row0; row < row1; row++) {
+-        const block_q2_K *br = (const block_q2_K *)(ctx->base + row * ctx->row_bytes);
+-        ds4_vec_dot_q2_K_q8_K((int)ctx->in_dim, &ctx->out[row], br, ctx->xq);
++        const void *br = ctx->base + row * ctx->row_bytes;
++        ctx->dot((int)ctx->in_dim, &ctx->out[row], br, ctx->xq);
+     }
+ }
+ 
+-/* Single expert Q2_K down projection, kept mostly for tracing and diagnostics. */
++/* Single expert down projection, kept mostly for tracing and diagnostics. */
+ static void matvec_q2_k_expert(
+         float            *out,
+         const ds4_model  *m,
+         const ds4_tensor *w,
+         const float      *x,
+         uint32_t          expert) {
+-    if (w->type != 10) ds4_die("expected a Q2_K expert tensor");
++    ds4_expert_dot_fn dot = expert_down_dot_for_type(w->type);
++    if (dot == NULL) ds4_die("expected a Q2_K/IQ3_XXS/MXFP4 expert tensor");
+ 
+     uint64_t in_dim, out_dim, row_bytes;
+     const uint8_t *base = tensor_expert_bytes(m, w, expert, &in_dim, &out_dim, &row_bytes);
+-    if (in_dim % QK_K != 0) ds4_die("Q2_K expert row is not QK_K aligned");
++    if (in_dim % QK_K != 0) ds4_die("expert row is not QK_K aligned");
+ 
+     block_q8_K *xq = xmalloc((size_t)(in_dim / QK_K) * sizeof(xq[0]));
+     ds4_quantize_row_q8_K(x, xq, (int64_t)in_dim);
+@@ -4524,6 +4664,7 @@
+         .out = out,
+         .base = base,
+         .xq = xq,
++        .dot = dot,
+         .in_dim = in_dim,
+         .row_bytes = row_bytes,
+     };
+@@ -4536,6 +4677,7 @@
+     float *out;
+     const uint8_t *base[DS4_N_EXPERT_USED];
+     const block_q8_K *xq[DS4_N_EXPERT_USED];
++    ds4_expert_dot_fn dot; /* deepstrix Track R: type-resolved down dot */
+     uint64_t in_dim;
+     uint64_t row_bytes[DS4_N_EXPERT_USED];
+     int n_expert;
+@@ -4548,15 +4690,15 @@
+         float acc = 0.0f;
+         for (int i = 0; i < ctx->n_expert; i++) {
+             float v = 0.0f;
+-            const block_q2_K *br = (const block_q2_K *)(ctx->base[i] + row * ctx->row_bytes[i]);
+-            ds4_vec_dot_q2_K_q8_K((int)ctx->in_dim, &v, br, ctx->xq[i]);
++            const void *br = ctx->base[i] + row * ctx->row_bytes[i];
++            ctx->dot((int)ctx->in_dim, &v, br, ctx->xq[i]);
+             acc += v;
+         }
+         ctx->out[row] = acc;
+     }
+ }
+ 
+-/* Accumulate all selected experts' Q2_K down projections directly into the
++/* Accumulate all selected experts' down projections directly into the
+  * 4096-wide MoE output. */
+ static void matvec_q2_k_experts_accum_prequant(
+         float            *out,
+@@ -4565,7 +4707,8 @@
+         const block_q8_K *xq,
+         const int        *selected,
+         int               n_expert) {
+-    if (w->type != 10) ds4_die("expected a Q2_K expert tensor");
++    ds4_expert_dot_fn dot = expert_down_dot_for_type(w->type);
++    if (dot == NULL) ds4_die("expected a Q2_K/IQ3_XXS/MXFP4 expert tensor");
+     if (n_expert < 1 || n_expert > DS4_N_EXPERT_USED) ds4_die("unexpected routed expert count");
+ 
+     uint64_t in_dim0 = 0;
+@@ -4588,6 +4731,7 @@
+     const uint64_t n_blocks = in_dim0 / QK_K;
+     matvec_q2_k_accum_ctx ctx = {
+         .out = out,
++        .dot = dot,
+         .in_dim = in_dim0,
+         .n_expert = n_expert,
+     };
+@@ -4615,6 +4759,7 @@
+     const uint32_t *expert_offset;
+     const uint32_t *active_expert;
+     const float *pair_weight;
++    ds4_expert_pair_dot_fn dot; /* deepstrix Track R: type-resolved pair dot */
+     float clamp;
+     uint64_t in_dim;
+     uint64_t out_dim;
+@@ -4633,8 +4778,8 @@
+         const uint32_t begin = ctx->expert_offset[expert];
+         const uint32_t end = ctx->expert_offset[expert + 1];
+ 
+-        const block_iq2_xxs *gate_row = (const block_iq2_xxs *)(ctx->gate_base[expert] + row * ctx->gate_row_bytes[expert]);
+-        const block_iq2_xxs *up_row = (const block_iq2_xxs *)(ctx->up_base[expert] + row * ctx->up_row_bytes[expert]);
++        const void *gate_row = ctx->gate_base[expert] + row * ctx->gate_row_bytes[expert];
++        const void *up_row = ctx->up_base[expert] + row * ctx->up_row_bytes[expert];
+ 
+         for (uint32_t i = begin; i < end; i++) {
+             const uint32_t pair_id = ctx->pair_ids[i];
+@@ -4643,7 +4788,7 @@
+             float gate = 0.0f;
+             float up = 0.0f;
+ 
+-            ds4_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &gate, &up, gate_row, up_row, xq);
++            ctx->dot((int)ctx->in_dim, &gate, &up, gate_row, up_row, xq);
+ 
+             if (ctx->clamp > 1.0e-6f) {
+                 if (gate > ctx->clamp) gate = ctx->clamp;
+@@ -4714,6 +4859,7 @@
+     const uint32_t *pair_ids;
+     const uint32_t *expert_offset;
+     const uint32_t *active_expert;
++    ds4_expert_dot_fn dot; /* deepstrix Track R: type-resolved down dot */
+     uint32_t n_active;
+     uint32_t n_tok;
+     uint64_t in_dim;
+@@ -4734,7 +4880,7 @@
+             const uint32_t expert = ctx->active_expert[ai];
+             const uint32_t begin = ctx->expert_offset[expert];
+             const uint32_t end = ctx->expert_offset[expert + 1];
+-            const block_q2_K *br = (const block_q2_K *)(ctx->base[expert] + row * ctx->row_bytes[expert]);
++            const void *br = ctx->base[expert] + row * ctx->row_bytes[expert];
+ 
+             for (uint32_t i = begin; i < end; i++) {
+                 const uint32_t pair_id = ctx->pair_ids[i];
+@@ -4742,7 +4888,7 @@
+                 const block_q8_K *xq = ctx->midq + (uint64_t)pair_id * ctx->midq_blocks;
+                 float v = 0.0f;
+ 
+-                ds4_vec_dot_q2_K_q8_K((int)ctx->in_dim, &v, br, xq);
++                ctx->dot((int)ctx->in_dim, &v, br, xq);
+                 ctx->moe[(uint64_t)pair.token * ctx->out_dim + row] += v;
+             }
+         }
+@@ -5202,7 +5348,7 @@
+ 
+     const float *q_a_norm = tensor_data(model, layer->attn_q_a_norm);
+ 
+-    matvec_q8_0(qr, model, layer->attn_q_a, norm);
++    matvec_any(qr, model, layer->attn_q_a, norm); /* deepstrix Track R: Q8_0 or F32 */
+     rms_norm_weight(qr_norm, qr, q_a_norm, 1024, DS4_RMS_EPS);
+     matvec_q8_0(q, model, layer->attn_q_b, qr_norm);
+     head_rms_norm_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
+@@ -5220,7 +5366,7 @@
+     float *qr = xmalloc(1024 * sizeof(qr[0]));
+     const float *q_a_norm = tensor_data(model, layer->attn_q_a_norm);
+ 
+-    matvec_q8_0(qr, model, layer->attn_q_a, norm);
++    matvec_any(qr, model, layer->attn_q_a, norm); /* deepstrix Track R: Q8_0 or F32 */
+     rms_norm_weight(qr_norm, qr, q_a_norm, 1024, DS4_RMS_EPS);
+     matvec_q8_0(q, model, layer->attn_q_b, qr_norm);
+     head_rms_norm_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
+@@ -5259,7 +5405,7 @@
+                          DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_LORA_Q);
+     }
+ 
+-    matvec_q8_0_decode_scratch(scratch->qr, model, layer->attn_q_a, norm, scratch);
++    matvec_any_decode_scratch(scratch->qr, model, layer->attn_q_a, norm, scratch);
+     ds4_dump_emit_1d("q_a_out", scratch->qr, DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_LORA_Q);
+ 
+     rms_norm_weight(qr_norm, scratch->qr, q_a_norm, 1024, DS4_RMS_EPS);
+@@ -5665,6 +5811,25 @@
+     int8_t *xq = xmalloc((size_t)blocks * 32);
+     float *xscale = xmalloc((size_t)blocks * sizeof(xscale[0]));
+ 
++    /* deepstrix patch (Track R): dumper-variant shexp is exact-dequant F32
++     * (validated same-type across gate/up/down at load). */
++    if (layer->ffn_gate_shexp->type == 0) {
++        if (layer->ffn_up_shexp->dim[0] != in_dim) {
++            ds4_die("shared expert gate/up tensors do not share an input layout");
++        }
++        matvec_f32(gate, model, layer->ffn_gate_shexp, x);
++        matvec_f32(up, model, layer->ffn_up_shexp, x);
++        swiglu(mid, gate, up, DS4_N_FF_EXP);
++        matvec_f32(out, model, layer->ffn_down_shexp, mid);
++
++        free(xscale);
++        free(xq);
++        free(mid);
++        free(up);
++        free(gate);
++        return;
++    }
++
+     if (layer->ffn_up_shexp->type != 8 ||
+         layer->ffn_gate_shexp->type != 8 ||
+         layer->ffn_up_shexp->dim[0] != in_dim) {
+@@ -5693,6 +5858,19 @@
+         const float            * x,
+         ds4_cpu_decode_scratch * scratch) {
+     const uint64_t in_dim = layer->ffn_gate_shexp->dim[0];
++
++    /* deepstrix patch (Track R): dumper-variant shexp is exact-dequant F32. */
++    if (layer->ffn_gate_shexp->type == 0) {
++        if (layer->ffn_up_shexp->dim[0] != in_dim) {
++            ds4_die("shared expert gate/up tensors do not share an input layout");
++        }
++        matvec_f32(scratch->shared_gate, model, layer->ffn_gate_shexp, x);
++        matvec_f32(scratch->shared_up, model, layer->ffn_up_shexp, x);
++        swiglu(scratch->shared_mid, scratch->shared_gate, scratch->shared_up, DS4_N_FF_EXP);
++        matvec_f32(out, model, layer->ffn_down_shexp, scratch->shared_mid);
++        return;
++    }
++
+     if (layer->ffn_up_shexp->type != 8 ||
+         layer->ffn_gate_shexp->type != 8 ||
+         layer->ffn_up_shexp->dim[0] != in_dim) {
+@@ -5735,10 +5913,14 @@
+         uint32_t            n_tok) {
+     const uint64_t in_dim = layer->ffn_gate_shexp->dim[0];
+     const uint64_t hidden = layer->ffn_gate_shexp->dim[1];
+-
+-    if (layer->ffn_up_shexp->type != 8 ||
+-        layer->ffn_gate_shexp->type != 8 ||
+-        layer->ffn_down_shexp->type != 8 ||
++    /* deepstrix patch (Track R): F32 dumper variant rides the same
++     * structure through the type-dispatched batch matmuls. */
++    const bool shexp_f32 = layer->ffn_gate_shexp->type == 0;
++
++    if ((!shexp_f32 &&
++         (layer->ffn_up_shexp->type != 8 ||
++          layer->ffn_gate_shexp->type != 8 ||
++          layer->ffn_down_shexp->type != 8)) ||
+         layer->ffn_up_shexp->dim[0] != in_dim ||
+         layer->ffn_up_shexp->dim[1] != hidden ||
+         layer->ffn_down_shexp->dim[0] != hidden) {
+@@ -5749,11 +5931,16 @@
+     float *up = xmalloc((size_t)n_tok * hidden * sizeof(up[0]));
+     float *mid = xmalloc((size_t)n_tok * hidden * sizeof(mid[0]));
+ 
+-    matmul_q8_0_pair_batch(gate, up, model,
+-                           layer->ffn_gate_shexp,
+-                           layer->ffn_up_shexp,
+-                           x,
+-                           n_tok);
++    if (shexp_f32) {
++        matmul_f32_batch(gate, model, layer->ffn_gate_shexp, x, n_tok);
++        matmul_f32_batch(up, model, layer->ffn_up_shexp, x, n_tok);
++    } else {
++        matmul_q8_0_pair_batch(gate, up, model,
++                               layer->ffn_gate_shexp,
++                               layer->ffn_up_shexp,
++                               x,
++                               n_tok);
++    }
+ 
+     swiglu_batch_ctx swiglu_ctx = {
+         .mid = mid,
+@@ -5763,7 +5950,7 @@
+     };
+     ds4_parallel_for(n_tok, swiglu_batch_worker, &swiglu_ctx);
+ 
+-    matmul_q8_0_batch(out, model, layer->ffn_down_shexp, mid, n_tok);
++    matmul_any_batch(out, model, layer->ffn_down_shexp, mid, n_tok);
+ 
+     free(mid);
+     free(up);
+@@ -6087,6 +6274,14 @@
+     const uint64_t expert_out_dim = layer->ffn_gate_exps->dim[1];
+     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+     const uint64_t down_out_dim = layer->ffn_down_exps->dim[1];
++    /* deepstrix patch (Track R): type-resolved dots (IQ2_XXS/IQ2_S pair,
++     * Q2_K/IQ3_XXS/MXFP4 down). */
++    ds4_expert_pair_dot_fn pair_dot = expert_pair_dot_for_type(layer->ffn_gate_exps->type);
++    ds4_expert_dot_fn down_dot = expert_down_dot_for_type(layer->ffn_down_exps->type);
++    if (pair_dot == NULL || layer->ffn_gate_exps->type != layer->ffn_up_exps->type) {
++        ds4_die("expected IQ2_XXS/IQ2_S expert tensors");
++    }
++    if (down_dot == NULL) ds4_die("expected a Q2_K/IQ3_XXS/MXFP4 expert tensor");
+     if (expert_in_dim % QK_K != 0) ds4_die("IQ2_XXS expert input is not QK_K aligned");
+     if (down_in_dim % QK_K != 0) ds4_die("Q2_K expert input is not QK_K aligned");
+     if (expert_out_dim != down_in_dim || down_out_dim != DS4_N_EMBD) {
+@@ -6151,6 +6346,7 @@
+         .expert_offset = counts,
+         .active_expert = active_expert,
+         .pair_weight = pair_weight,
++        .dot = pair_dot,
+         .clamp = clamp,
+         .in_dim = expert_in_dim,
+         .out_dim = expert_out_dim,
+@@ -6191,6 +6387,7 @@
+         .pair_ids = pair_ids,
+         .expert_offset = counts,
+         .active_expert = active_expert,
++        .dot = down_dot,
+         .n_active = n_active,
+         .n_tok = n_tok,
+         .in_dim = down_in_dim,
+@@ -7842,7 +8039,7 @@
+     if (profile) t_hc_norm = now_sec() - t0;
+ 
+     t0 = profile ? now_sec() : 0.0;
+-    matmul_q8_0_batch(qr, model, layer->attn_q_a, attn_norm, n_tok);
++    matmul_any_batch(qr, model, layer->attn_q_a, attn_norm, n_tok); /* deepstrix Track R: Q8_0 or F32 */
+     for (uint32_t t = 0; t < n_tok; t++) {
+         rms_norm_weight(qr_norm + (uint64_t)t * 1024,
+                         qr + (uint64_t)t * 1024,
+@@ -8860,7 +9057,7 @@
+     output_hc_head_one(embd, model, weights, inp_hc);
+     rms_norm_weight(norm, embd, tensor_data(model, weights->output_norm), DS4_N_EMBD, DS4_RMS_EPS);
+ 
+-    matvec_q8_0(logits, model, weights->output, norm);
++    matvec_any(logits, model, weights->output, norm); /* deepstrix Track R: Q8_0 or F32 */
+ 
+     free(norm);
+     free(embd);
+@@ -8907,7 +9104,7 @@
+      * output-projection matvec — the M3 kernel oracle input. */
+     ds4_dump_emit_1d("output_norm", scratch->output_norm, DS4_DUMP_DTYPE_F32, (int64_t)DS4_N_EMBD);
+ 
+-    matvec_q8_0_decode_scratch(logits, model, weights->output, scratch->output_norm, scratch);
++    matvec_any_decode_scratch(logits, model, weights->output, scratch->output_norm, scratch);
+ }
+ 
+ #ifndef DS4_NO_GPU

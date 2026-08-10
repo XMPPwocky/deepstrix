@@ -196,6 +196,29 @@ impl MappedGguf {
         self.files.len()
     }
 
+    /// pread an arbitrary byte range of one shard into `dst`, then
+    /// drop the range from the page cache. Lets streaming consumers
+    /// (e.g. the GGUF rewriter) copy huge tensors in chunks without
+    /// staging `byte_size` bytes at once.
+    pub fn read_range_into(&self, shard: usize, offset: u64, dst: &mut [u8]) -> eyre::Result<()> {
+        let file = self.files.get(shard).ok_or_else(|| {
+            eyre!("read_range_into: shard {shard} out of range ({} open)", self.files.len())
+        })?;
+        file.read_exact_at(dst, offset).wrap_err_with(|| {
+            format!("pread {} bytes at offset {offset} (shard {shard})", dst.len())
+        })?;
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                offset as i64,
+                dst.len() as i64,
+                libc::POSIX_FADV_DONTNEED,
+            );
+        }
+        Ok(())
+    }
+
     /// Tell the kernel it can drop the page cache of every shard
     /// (whole files). Cheap insurance after a bulk weight-load pass
     /// to guarantee no stray pages are anchored.
