@@ -69,11 +69,27 @@ Per-model snapshot dirs mean first launch starts a cold KV-snapshot cache.
 Hot-expert placement self-regenerates from the stats sidecar (fingerprint
 differs → fresh stats).
 
+## Perf-lever pass (2026-08-10, post-A/B)
+
+- Q4_K head + Q6_K shexp-down decode switched to dp4a GEMM@B=1 (Q8_K
+  activations): decode @4K 28.54 → 28.69 tok/s (−0.7% vs antirez =
+  parity). Q5_K stays on the f32 gemv (measured parity).
+- Prefill gap attributed: ~2% = K-quant dp4a GEMM vs Q8 WMMA
+  (0.70 vs 0.37 ms @B=512 per shexp matmul); the rest is IQ3_XXS's
+  1.167× down-projection bytes — the quality trade itself.
+- **Server @ K=8, 192K ctx works with unsloth** (antirez caps at K=6):
+  the freed 1.24 GB dGPU converts to +2 hot experts/layer.
+- fp8 main-KV DEFERRED by explicit decision: the plan's 4.5 GB saving
+  estimate was wrong (KV is compressed; real total @192K ≈ 1.4 GB, fp8
+  saves ~0.6–1.2 GB) and the latency prior is against it
+  (FP8_KV_REVIVE). Revisit as capacity play only.
+
 ## Follow-ups
 
-- dp4a K-quant dense gemv (decode); prefill per-kernel trace + tuning.
-- Phase 4: fp8 e4m3 main KV (vLLM `fp8_ds_mla` semantics: 448B NoPE e4m3 +
-  64×f16 RoPE + inline block-64 scales, stride padded to 592/608) + fp8/fp4
-  indexer K cache. Capacity win guaranteed; latency win is hypothesis
-  (FP8_KV_REVIVE prior).
+- WMMA-ize the K-quant dense GEMM (recover ~2% prefill); iq2s/iq3
+  prefill variant tuning.
+- fp8/fp4 indexer K cache (small, ~0.4 GB incl. gather scratch). If fp8
+  main KV is ever revisited, the pinned layout is vLLM `fp8_ds_mla` V4
+  semantics: 448 B NoPE e4m3 + 64×f16 RoPE + 7×ue8m0 per-64 scales
+  (amax/448, exp2-ceil), row stride padded to 592/608.
 - MTP acceptance re-measure (optional); franken-mix exploration.
