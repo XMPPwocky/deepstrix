@@ -5,6 +5,8 @@
 //! anything else that doesn't directly touch the GPU.
 
 pub mod gguf;
+pub mod gguf_write;
+pub mod kquants;
 pub mod mapped;
 pub mod tokenizer;
 
