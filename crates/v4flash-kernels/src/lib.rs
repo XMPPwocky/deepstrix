@@ -18,6 +18,7 @@ pub mod compressor;
 pub mod config;
 pub mod f16;
 pub mod ffn;
+pub mod gqa_attention;
 pub mod head;
 pub mod model_weights;
 pub mod routing;
@@ -27,11 +28,19 @@ pub mod indexer;
 pub mod iq2_xxs;
 pub mod iq2_xxs_tables;
 pub mod kv_cache_append;
+pub mod laguna;
+pub mod laguna_het;
+pub mod laguna_het_moe;
+pub mod laguna_moe_tiled;
 pub mod moe_group_builder;
 pub mod oracle;
 pub mod router_topk;
+pub mod weight_contract;
 pub mod q2_k;
 pub mod q4_k;
+pub mod q4_k_dense;
+pub mod q6_k;
+pub mod q6_k_dense;
 pub mod q8_0;
 pub mod q8_k;
 pub mod mhc_pre_fused;
@@ -52,6 +61,7 @@ pub use compressor::{
 pub use expert_sel_count::ExpertSelCount;
 pub use f16::F16Matvec;
 pub use ffn::{Swiglu, SwigluClampWeighted, VecAddInplace};
+pub use gqa_attention::{GqaAttention, FLASH_HEAD_DIM, GQA_HEAD_DIM_MAX};
 pub use head::{HcPost, HcSigmoidBias, HcSinkhorn, HcWeightedSum};
 pub use indexer::{
     IndexerBitpack, IndexerGather, IndexerScore, IndexerScoreWmma, IndexerTopk,
@@ -59,6 +69,8 @@ pub use indexer::{
 };
 pub use iq2_xxs::{Iq2XxsPairMatvec, BLOCK_IQ2_XXS_BYTES};
 pub use kv_cache_append::KvCacheAppend;
+pub use laguna::{LagunaHparams, LagunaModel, LagunaOps};
+pub use laguna_moe_tiled::LagunaMoeTiled;
 pub use moe_group_builder::MoeGroupBuilder;
 // `oracle::{ActivationDump, Dtype, TensorEntry}` is intentionally NOT
 // re-exported at the crate root — it's a test-fixture loader for the
@@ -67,6 +79,9 @@ pub use moe_group_builder::MoeGroupBuilder;
 pub use router_topk::{RouterTopk, ROUTER_MAX_EXPERTS, ROUTER_MAX_USED};
 pub use q2_k::{Q2KAccumulateMatvec, BLOCK_Q2_K_BYTES};
 pub use q4_k::{Q4KMatvec, BLOCK_Q4_K_BYTES};
+pub use q4_k_dense::{Q4_KDenseMatvec, Q4_K_DENSE_BLOCK_BYTES, Q4_K_DENSE_BLOCK_ELEMS};
+pub use q6_k::Q6KMatvec;
+pub use q6_k_dense::{Q6_KDenseMatvec, Q6_K_DENSE_BLOCK_BYTES, Q6_K_DENSE_BLOCK_ELEMS};
 pub use q8_0::{Q8_0GroupedMatvec, Q8_0Matvec, Q8_0MatvecWmma};
 pub use q8_k::{Q8KQuantize, BLOCK_Q8_K_BYTES, QK_K};
 pub use mhc_pre_fused::MhcPreFused;

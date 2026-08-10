@@ -508,10 +508,9 @@ impl BatchDgpuScratch {
             (crate::config::INDEXER_TOP_K * crate::config::N_HEAD_DIM) as usize,
         )?;
         let hot = {
-            let hot_k: usize = std::env::var("DGPU_HOT_EXPERTS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            // Must agree with the residency loader, or the scratch and the
+            // weights disagree about whether the split is active.
+            let hot_k: usize = crate::het::weights::dgpu_hot_experts();
             if hot_k > 0 {
                 Some(BatchDgpuHotScratch::alloc(id, &attn_active_comp_kv)?)
             } else {

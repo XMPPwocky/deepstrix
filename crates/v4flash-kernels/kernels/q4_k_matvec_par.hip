@@ -178,6 +178,9 @@ extern "C" __global__ void q4_k_pair_matvec_fused_swiglu_batch(
     const unsigned int sub        = lane & 3u;
 
     const int e = selected[slot];
+    // het-split sentinel: a slot routed to the OTHER device is marked -1; skip
+    // it before touching any weights (inert for callers that pass ids >= 0).
+    if (e < 0) return;
     const uint8_t* gate_row_base = gate_w_base
                                  + (uint64_t)e * (uint64_t)gate_bpe
                                  + (uint64_t)row * n_blocks_in * BLOCK_Q4_K_BYTES;
@@ -243,6 +246,7 @@ extern "C" __global__ void q4_k_matvec_par_batched(
     float acc = 0.0f;
     for (unsigned int s = 0; s < n_used; s++) {
         const int e = selected[s];
+        if (e < 0) continue; // het-split sentinel (slot owned by the other device)
         const uint8_t* w_expert = w_base + (uint64_t)e * (uint64_t)dbpe;
         const uint8_t* xq_slot  = xq_base + (uint64_t)s * (uint64_t)xq_slot_stride;
         const uint8_t* row_base = w_expert + (uint64_t)row * n_blocks_in * BLOCK_Q4_K_BYTES;
@@ -256,5 +260,121 @@ extern "C" __global__ void q4_k_matvec_par_batched(
 
     if (lane == 0) {
         out[row] = acc;
+    }
+}
+
+// ===========================================================================
+// BATCHED-OVER-TOKENS (BxN) variants for prefill: process B prompt tokens in a
+// single launch (grid.z = B). Each token carries its own top-`n_used` routing
+// selection + activation, so per (token t, slot s) the expert weight is read
+// independently — identical math to looping the B=1 kernels, but one dispatch.
+// This kills the per-token dispatch/latency floor that made sequential prefill
+// ~13 tok/s. (Weight-reuse-by-expert register tiling is a further lever.)
+// ===========================================================================
+
+// q4_k_pair_matvec_fused_swiglu_batch_bxn — B-token gate×up×swiglu×ew.
+//   grid:  (n_rows / 8, n_used, B)   block: (256, 1, 1)
+//   selected : [B, n_used]   expert_w : [B, n_used]
+//   xq       : [B, n_blocks_in * 292]  (token-major)
+//   mid      : [B, n_used, n_rows]      (token-major)
+extern "C" __global__ void q4_k_pair_matvec_fused_swiglu_batch_bxn(
+        float          * __restrict__ mid,
+        const uint8_t  * __restrict__ gate_w_base,
+        const uint8_t  * __restrict__ up_w_base,
+        const uint8_t  * __restrict__ xq,            // [B, n_blocks_in*292]
+        const float    * __restrict__ expert_w,      // [B, n_used]
+        const int      * __restrict__ selected,      // [B, n_used]
+        unsigned int     gate_bpe,
+        unsigned int     up_bpe,
+        float            clamp,
+        unsigned int     n_rows,
+        unsigned int     n_blocks_in,
+        unsigned int     n_used) {
+    const unsigned int slot         = blockIdx.y;
+    const unsigned int t            = blockIdx.z;    // token in the chunk
+    const unsigned int row_in_block = threadIdx.x / 32u;
+    const unsigned int lane         = threadIdx.x & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    if (row >= n_rows) return;
+
+    const unsigned int block_lane = lane >> 2u;
+    const unsigned int sub        = lane & 3u;
+
+    const int e = selected[(uint64_t)t * n_used + slot];
+    const uint8_t* xq_t = xq + (uint64_t)t * n_blocks_in * BLOCK_Q8_K_BYTES;
+    const uint8_t* gate_row_base = gate_w_base
+                                 + (uint64_t)e * (uint64_t)gate_bpe
+                                 + (uint64_t)row * n_blocks_in * BLOCK_Q4_K_BYTES;
+    const uint8_t* up_row_base   = up_w_base
+                                 + (uint64_t)e * (uint64_t)up_bpe
+                                 + (uint64_t)row * n_blocks_in * BLOCK_Q4_K_BYTES;
+
+    float g_sum = 0.0f;
+    float u_sum = 0.0f;
+    for (unsigned int b = block_lane; b < n_blocks_in; b += 8u) {
+        const uint8_t* w_g = gate_row_base + (uint64_t)b * BLOCK_Q4_K_BYTES;
+        const uint8_t* w_u = up_row_base   + (uint64_t)b * BLOCK_Q4_K_BYTES;
+        const uint8_t* y   = xq_t          + (uint64_t)b * BLOCK_Q8_K_BYTES;
+        g_sum += dot_block_quarter_q4k(w_g, y, sub);
+        u_sum += dot_block_quarter_q4k(w_u, y, sub);
+    }
+    g_sum = warp_sum_f32_q4k(g_sum);
+    u_sum = warp_sum_f32_q4k(u_sum);
+
+    if (lane == 0) {
+        const float ew = expert_w[(uint64_t)t * n_used + slot];
+        if (clamp > 1.0e-6f) {
+            if (g_sum > clamp)  g_sum = clamp;
+            if (u_sum > clamp)  u_sum = clamp;
+            if (u_sum < -clamp) u_sum = -clamp;
+        }
+        const float sig = 1.0f / (1.0f + expf(-g_sum));
+        mid[((uint64_t)t * n_used + slot) * (uint64_t)n_rows + (uint64_t)row] =
+            g_sum * sig * u_sum * ew;
+    }
+}
+
+// q4_k_matvec_par_batched_bxn — B-token down projection (sum over n_used).
+//   grid:  (n_rows / 8, 1, B)   block: (256, 1, 1)
+//   selected : [B, n_used]
+//   xq_base  : [B, n_used * xq_slot_stride]  (token-major, slot-major within)
+//   out      : [B, n_rows]                    (token-major)
+extern "C" __global__ void q4_k_matvec_par_batched_bxn(
+        float          * __restrict__ out,
+        const uint8_t  * __restrict__ w_base,
+        const uint8_t  * __restrict__ xq_base,
+        const int      * __restrict__ selected,
+        unsigned int     dbpe,
+        unsigned int     xq_slot_stride,
+        unsigned int     n_used,
+        unsigned int     n_rows,
+        unsigned int     n_blocks_in) {
+    const unsigned int t            = blockIdx.z;
+    const unsigned int row_in_block = threadIdx.x / 32u;
+    const unsigned int lane         = threadIdx.x & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    if (row >= n_rows) return;
+
+    const unsigned int block_lane = lane >> 2u;
+    const unsigned int sub        = lane & 3u;
+
+    const int*     sel_t = selected + (uint64_t)t * n_used;
+    const uint8_t* xq_t  = xq_base  + (uint64_t)t * n_used * (uint64_t)xq_slot_stride;
+
+    float acc = 0.0f;
+    for (unsigned int s = 0; s < n_used; s++) {
+        const int e = sel_t[s];
+        const uint8_t* w_expert = w_base + (uint64_t)e * (uint64_t)dbpe;
+        const uint8_t* xq_slot  = xq_t   + (uint64_t)s * (uint64_t)xq_slot_stride;
+        const uint8_t* row_base = w_expert + (uint64_t)row * n_blocks_in * BLOCK_Q4_K_BYTES;
+        for (unsigned int b = block_lane; b < n_blocks_in; b += 8u) {
+            const uint8_t* w_blk = row_base + (uint64_t)b * BLOCK_Q4_K_BYTES;
+            const uint8_t* y_blk = xq_slot  + (uint64_t)b * BLOCK_Q8_K_BYTES;
+            acc += dot_block_quarter_q4k(w_blk, y_blk, sub);
+        }
+    }
+    acc = warp_sum_f32_q4k(acc);
+    if (lane == 0) {
+        out[(uint64_t)t * n_rows + row] = acc;
     }
 }

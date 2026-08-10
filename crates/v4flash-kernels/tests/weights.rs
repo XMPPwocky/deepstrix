@@ -13,7 +13,7 @@ use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::weights;
 
 const MODEL_PATH: &str =
-    "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf";
+    "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf";
 
 const EXPECTED_OUTPUT_PROJ_BYTES: u64 = 129_280 * 4_096 / 32 * 34;
 

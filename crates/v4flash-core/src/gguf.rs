@@ -140,6 +140,7 @@ impl Gguf {
                 abs_offset: 0, // filled in after we know tensor_data_offset
                 elements,
                 byte_size: bytes,
+                shard: 0,
             });
         }
 
@@ -200,6 +201,72 @@ impl Gguf {
         self.metadata("general.architecture")
             .and_then(GgufValue::as_str)
     }
+
+    /// Merge the per-shard parses of a llama.cpp split GGUF
+    /// (`-NNNNN-of-NNNNN.gguf`) into one logical `Gguf`.
+    ///
+    /// Shards must be passed in `split.no` order. Each tensor keeps its own
+    /// shard's `abs_offset` (already range-checked against that shard at
+    /// parse time) and records which shard it lives in via
+    /// [`GgufTensor::shard`]. Metadata is the union with earlier shards
+    /// winning — by convention shard 0 carries the full metadata (tokenizer,
+    /// arch, hparams) and later shards only the `split.*` bookkeeping keys.
+    ///
+    /// `n_tensors` becomes the merged total; the scalar `tensor_data_offset`
+    /// and `file_size` are shard 0's (display-only — per-tensor offsets are
+    /// what readers use). Validates `split.count` and `split.tensors.count`
+    /// when present.
+    pub fn merge_shards(shards: Vec<Gguf>) -> Result<Self, GgufError> {
+        let bad = |msg: String| GgufError::Io(io::Error::new(io::ErrorKind::InvalidData, msg));
+        let mut it = shards.into_iter();
+        let mut merged = it
+            .next()
+            .ok_or_else(|| bad("merge_shards: no shards".into()))?;
+
+        if let Some(declared) = merged
+            .metadata("split.count")
+            .and_then(GgufValue::as_u64)
+        {
+            let actual = 1 + it.len() as u64;
+            if declared != actual {
+                return Err(bad(format!(
+                    "split.count says {declared} shards, got {actual}"
+                )));
+            }
+        }
+
+        for (shard_idx, shard) in it.enumerate() {
+            let shard_idx = shard_idx + 1;
+            for mut t in shard.tensors {
+                t.shard = shard_idx;
+                if let Some(prev) = merged.tensor_index.get(&t.name) {
+                    return Err(bad(format!(
+                        "tensor {:?} appears in shard {} and shard {}",
+                        t.name, merged.tensors[*prev].shard, shard_idx
+                    )));
+                }
+                merged.tensor_index.insert(t.name.clone(), merged.tensors.len());
+                merged.tensors.push(t);
+            }
+            for (k, v) in shard.metadata {
+                merged.metadata.entry(k).or_insert(v);
+            }
+        }
+        merged.n_tensors = merged.tensors.len() as u64;
+
+        if let Some(total) = merged
+            .metadata("split.tensors.count")
+            .and_then(GgufValue::as_u64)
+        {
+            if total != merged.n_tensors {
+                return Err(bad(format!(
+                    "split.tensors.count says {total} tensors, merged shards hold {}",
+                    merged.n_tensors
+                )));
+            }
+        }
+        Ok(merged)
+    }
 }
 
 /// One tensor's directory entry.
@@ -211,9 +278,14 @@ pub struct GgufTensor {
     /// Offset relative to `Gguf::tensor_data_offset`.
     pub rel_offset: u64,
     /// Absolute byte offset in the file. Caller can mmap or pread here.
+    /// For a merged split GGUF this is relative to the start of the shard
+    /// identified by `shard`, not to any concatenation of the shards.
     pub abs_offset: u64,
     pub elements: u64,
     pub byte_size: u64,
+    /// Which shard file holds this tensor's bytes. 0 for single-file GGUFs
+    /// and for every tensor of a standalone parse; set by [`Gguf::merge_shards`].
+    pub shard: usize,
 }
 
 /// GGUF metadata value. We store everything by value; the parser owns
@@ -369,6 +441,10 @@ pub enum GgufType {
     F64,
     IQ1_M,
     BF16,
+    /// Block-of-32 fp4 (e2m1) + one ue8m0 scale byte. llama.cpp id 39
+    /// (36-38 were removed repacked types). Native format of the official
+    /// DeepSeek-V4-Flash routed experts; unsloth UD quants use it per-layer.
+    MXFP4,
     Unknown(u32),
 }
 
@@ -404,6 +480,7 @@ impl GgufType {
             28 => Self::F64,
             29 => Self::IQ1_M,
             30 => Self::BF16,
+            39 => Self::MXFP4,
             _ => return None,
         })
     }
@@ -418,7 +495,7 @@ impl GgufType {
             Self::Q5_0 => (32, 22),
             Self::Q5_1 => (32, 24),
             Self::Q8_0 => (32, 34),
-            Self::Q8_1 => (32, 40),
+            Self::Q8_1 => (32, 36),
             Self::Q2_K => (256, 84),
             Self::Q3_K => (256, 110),
             Self::Q4_K => (256, 144),
@@ -428,8 +505,8 @@ impl GgufType {
             Self::IQ2_XXS => (256, 66),
             Self::IQ2_XS => (256, 74),
             Self::IQ3_XXS => (256, 98),
-            Self::IQ1_S => (256, 110),
-            Self::IQ4_NL => (256, 50),
+            Self::IQ1_S => (256, 50),
+            Self::IQ4_NL => (32, 18),
             Self::IQ3_S => (256, 110),
             Self::IQ2_S => (256, 82),
             Self::IQ4_XS => (256, 136),
@@ -440,6 +517,7 @@ impl GgufType {
             Self::F64 => (1, 8),
             Self::IQ1_M => (256, 56),
             Self::BF16 => (1, 2),
+            Self::MXFP4 => (32, 17),
             Self::Unknown(_) => return None,
         })
     }
@@ -475,6 +553,7 @@ impl GgufType {
             Self::F64 => "f64",
             Self::IQ1_M => "iq1_m",
             Self::BF16 => "bf16",
+            Self::MXFP4 => "mxfp4",
             Self::Unknown(_) => "<unknown>",
         }
     }

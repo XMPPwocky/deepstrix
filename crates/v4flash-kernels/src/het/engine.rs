@@ -546,15 +546,11 @@ impl HeterogeneousEngine {
                 // same placement file + K the het-split loader uses.
                 static HOTSETS: std::sync::LazyLock<Option<Vec<[bool; 256]>>> =
                     std::sync::LazyLock::new(|| {
-                        let k: usize = std::env::var("DGPU_HOT_EXPERTS")
-                            .ok()
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0);
+                        let k: usize = super::weights::dgpu_hot_experts();
                         if k == 0 {
                             return None;
                         }
-                        let path = std::env::var("DGPU_HOT_EXPERTS_FILE")
-                            .unwrap_or_else(|_| "reference/decode_hot_experts.txt".into());
+                        let path = super::weights::hot_expert_file_path();
                         super::weights::parse_hot_expert_file(&path, k).ok().map(|lists| {
                             lists
                                 .iter()

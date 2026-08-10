@@ -1,0 +1,2702 @@
+// gqa_attention — correctness-first single-query GQA attention for the Laguna
+// model port. Pure score -> stable softmax -> weighted-sum. NO WMMA, NO fancy
+// tiling; one workgroup per query head, online (flash-style) softmax so there
+// is NO n_kv cap (unlike attention_swa's ATTN_SWA_MAX_KV=128 LDS scores array).
+//
+// This is standard Grouped-Query Attention (GQA), NOT ds4's MLA:
+//   head_dim = 128 (Laguna), n_kv_head = 8, n_head = 48 or 72 (runtime arg).
+//   kv_group = n_head / n_kv_head (6 or 9). Query head h reads kv head
+//   kv_head = h / kv_group.
+//
+// The caller has ALREADY applied qk-norm + RoPE to Q/K/V. This kernel does
+// NOT do rope, qk-norm, the softplus gate, or o_proj — pure attention math.
+//
+// Per query head h (blockIdx.x), single query position attending to the whole
+// causal KV history [0 .. n_kv) (history is assumed to already include self):
+//   score[j] = dot(q[h], k[j, kv_head]) * scale        scale = 1/sqrt(head_dim)
+//   softmax over j (numerically stable, running max)
+//   out[h, d] = sum_j softmax[j] * v[j, kv_head, d]
+//
+// Numerical stability: online softmax keeps a running max m and denom l and
+// rescales the value accumulator acc[d] by exp(m_old - m_new) each step — the
+// standard flash-attention recurrence, done in f32. Equivalent to the
+// subtract-the-global-max formulation but single-pass and cap-free.
+//
+// LDS budget per workgroup (head_dim <= GQA_HEAD_DIM_MAX = 256):
+//   qs[256]      = 1024 B   (query, f32)
+//   acc[256]     = 1024 B   (weighted-value accumulator, f32)
+//   partial[256] = 1024 B   (dot-product tree reduction)
+//   score/m/l scalars
+//   ~3 KB total
+
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+
+// Max head_dim this kernel's static LDS supports. Laguna is 128; 256 leaves
+// margin. The Rust binding validates head_dim <= this.
+#define GQA_HEAD_DIM_MAX 256
+// Workgroup size. 256 lanes cooperatively reduce the per-key dot product and
+// stride over head_dim. Uses only portable HIP builtins (no arch intrinsics),
+// so it compiles for gfx1201 AND gfx1151 unchanged.
+#define GQA_BLOCK 256
+
+extern "C" __global__ void gqa_attn_single_query(
+        float          * out,       // [n_head, head_dim]              (f32)
+        const _Float16 * q,         // [n_head, head_dim]              (f16)
+        const _Float16 * k_cache,   // [n_kv, n_kv_head, head_dim]     (f16)
+        const _Float16 * v_cache,   // [n_kv, n_kv_head, head_dim]     (f16)
+        unsigned int     n_head,
+        unsigned int     n_kv_head,
+        unsigned int     head_dim,
+        unsigned int     n_kv,
+        float            scale,     // 1/sqrt(head_dim), host-precomputed
+        unsigned int     k_base,    // absolute position of relative key 0 (SWA window start)
+        unsigned int     kv_capacity) { // ring size: physical row = (k_base+j) % kv_capacity
+    const unsigned int h     = blockIdx.x;
+    const unsigned int tid   = threadIdx.x;
+    const unsigned int block = blockDim.x;
+    if (h >= n_head) return;
+
+    __shared__ float qs[GQA_HEAD_DIM_MAX];
+    __shared__ float acc[GQA_HEAD_DIM_MAX];
+    __shared__ float partial[GQA_BLOCK];
+    __shared__ float score_s;   // broadcast of the current key's score
+    __shared__ float m_s;       // running max
+    __shared__ float l_s;       // running softmax denominator
+
+    // GQA grouping: kv_group = n_head / n_kv_head (validated on the host).
+    const unsigned int kv_group = n_head / n_kv_head;
+    const unsigned int kv_head  = h / kv_group;
+
+    float *oh = out + (unsigned long long)h * head_dim;
+
+    // Load q[h] into LDS (f16 -> f32) and zero the value accumulator.
+    const _Float16 *qh = q + (unsigned long long)h * head_dim;
+    for (unsigned int d = tid; d < head_dim; d += block) {
+        qs[d]  = (float)qh[d];
+        acc[d] = 0.0f;
+    }
+    if (tid == 0) {
+        m_s = -INFINITY;
+        l_s = 0.0f;
+    }
+    __syncthreads();
+
+    // Base offset of kv_head within a key/value row: [j, kv_head, :].
+    const unsigned long long kvh_off = (unsigned long long)kv_head * head_dim;
+    const unsigned long long row_stride = (unsigned long long)n_kv_head * head_dim;
+
+    for (unsigned int j = 0; j < n_kv; j++) {
+        // Ring-buffer physical row for SWA layers; identity for global (k_base=0,
+        // kv_capacity=max_kv, (0+j)%max_kv == j).
+        const unsigned long long jp = (unsigned long long)((k_base + j) % kv_capacity);
+        const _Float16 *kj = k_cache + jp * row_stride + kvh_off;
+
+        // Per-key dot product: each lane sums its strided dims, tree-reduce.
+        float p = 0.0f;
+        for (unsigned int d = tid; d < head_dim; d += block) {
+            p += qs[d] * (float)kj[d];
+        }
+        partial[tid] = p;
+        __syncthreads();
+        for (unsigned int stride = block / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) partial[tid] += partial[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) score_s = partial[0] * scale;
+        __syncthreads();
+
+        // Online softmax update (all lanes read the OLD running max m_s).
+        const float score = score_s;
+        const float m_old = m_s;
+        const float m_new = fmaxf(m_old, score);
+        // m_old == -inf on the first key -> corr = exp(-inf) = 0 (not NaN,
+        // since m_new is finite). p_j is always finite.
+        const float corr  = expf(m_old - m_new);
+        const float p_j   = expf(score - m_new);
+
+        const _Float16 *vj = v_cache + jp * row_stride + kvh_off;
+        for (unsigned int d = tid; d < head_dim; d += block) {
+            acc[d] = acc[d] * corr + p_j * (float)vj[d];
+        }
+        __syncthreads();  // all lanes done reading m_s before thread 0 rewrites
+        if (tid == 0) {
+            l_s = l_s * corr + p_j;
+            m_s = m_new;
+        }
+        __syncthreads();
+    }
+
+    // Normalize. n_kv == 0 (empty history) -> l_s == 0; emit zeros rather than
+    // NaN so the caller gets a defined result.
+    const float l = l_s;
+    const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (unsigned int d = tid; d < head_dim; d += block) {
+        oh[d] = acc[d] * inv;
+    }
+}
+
+// gqa_attn_prefill — BATCHED single-query GQA for a whole B-token prompt chunk
+// in ONE launch. Semantically identical to calling gqa_attn_single_query B
+// times, but with all B*n_head workgroups dispatched at once so the dGPU is
+// filled (the sequential single-token prefill was dispatch/latency bound at
+// B=1). Each workgroup owns one (query position i, head h) pair.
+//
+// Causality: query row i is the token at ABSOLUTE position `q_offset + i`, so
+// it attends to keys [0 .. q_offset + i] inclusive -> n_kv_i = q_offset+i+1.
+// The K/V cache MUST already contain all keys for the whole chunk (the caller
+// appends every chunk position before launching); this kernel only reads its
+// own causal prefix, so later queries in the chunk don't leak into earlier ones.
+//
+// Layout (row-major, matches the append order):
+//   q:       f16 [B, n_head, head_dim]
+//   k_cache: f16 [n_kv_total, n_kv_head, head_dim]   (n_kv_total >= q_offset+B)
+//   v_cache: f16 [n_kv_total, n_kv_head, head_dim]
+//   out:     f32 [B, n_head, head_dim]
+//   grid:  (n_head, B, 1)   block: (GQA_BLOCK, 1, 1)
+extern "C" __global__ void gqa_attn_prefill(
+        float          * out,       // [B, n_head, head_dim]           (f32)
+        const _Float16 * q,         // [B, n_head, head_dim]           (f16)
+        const _Float16 * k_cache,   // [n_kv_total, n_kv_head, head_dim](f16)
+        const _Float16 * v_cache,   // [n_kv_total, n_kv_head, head_dim](f16)
+        unsigned int     n_head,
+        unsigned int     n_kv_head,
+        unsigned int     head_dim,
+        unsigned int     q_offset,  // absolute position of query row 0
+        float            scale,
+        unsigned int     swa_window, // 0 = full causal; else attend last `swa_window` keys
+        unsigned int     kv_capacity) { // ring size: physical row = key_abs % kv_capacity
+    const unsigned int h     = blockIdx.x;
+    const unsigned int qi    = blockIdx.y;         // query row within the chunk
+    const unsigned int tid   = threadIdx.x;
+    const unsigned int block = blockDim.x;
+    if (h >= n_head) return;
+
+    // Causal key count for this query row (>= 1).
+    const unsigned int n_kv = q_offset + qi + 1u;
+    // Sliding-window lower bound: attend keys [j_start, n_kv). j_start=0 for full
+    // layers (swa_window==0) — a NO-OP, so full-attention output is unchanged.
+    const unsigned int j_start = (swa_window != 0u && n_kv > swa_window) ? (n_kv - swa_window) : 0u;
+
+    __shared__ float qs[GQA_HEAD_DIM_MAX];
+    __shared__ float acc[GQA_HEAD_DIM_MAX];
+    __shared__ float partial[GQA_BLOCK];
+    __shared__ float score_s;
+    __shared__ float m_s;
+    __shared__ float l_s;
+
+    const unsigned int kv_group = n_head / n_kv_head;
+    const unsigned int kv_head  = h / kv_group;
+
+    // out[qi, h, :] and q[qi, h, :]
+    float         *oh = out + ((unsigned long long)qi * n_head + h) * head_dim;
+    const _Float16 *qh = q  + ((unsigned long long)qi * n_head + h) * head_dim;
+
+    for (unsigned int d = tid; d < head_dim; d += block) {
+        qs[d]  = (float)qh[d];
+        acc[d] = 0.0f;
+    }
+    if (tid == 0) {
+        m_s = -INFINITY;
+        l_s = 0.0f;
+    }
+    __syncthreads();
+
+    const unsigned long long kvh_off    = (unsigned long long)kv_head * head_dim;
+    const unsigned long long row_stride = (unsigned long long)n_kv_head * head_dim;
+
+    for (unsigned int j = j_start; j < n_kv; j++) {
+        // Ring-buffer physical row (identity for global: kv_capacity=max_kv, j<max_kv).
+        const unsigned long long jp = (unsigned long long)(j % kv_capacity);
+        const _Float16 *kj = k_cache + jp * row_stride + kvh_off;
+
+        float p = 0.0f;
+        for (unsigned int d = tid; d < head_dim; d += block) {
+            p += qs[d] * (float)kj[d];
+        }
+        partial[tid] = p;
+        __syncthreads();
+        for (unsigned int stride = block / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) partial[tid] += partial[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) score_s = partial[0] * scale;
+        __syncthreads();
+
+        const float score = score_s;
+        const float m_old = m_s;
+        const float m_new = fmaxf(m_old, score);
+        const float corr  = expf(m_old - m_new);
+        const float p_j   = expf(score - m_new);
+
+        const _Float16 *vj = v_cache + jp * row_stride + kvh_off;
+        for (unsigned int d = tid; d < head_dim; d += block) {
+            acc[d] = acc[d] * corr + p_j * (float)vj[d];
+        }
+        __syncthreads();
+        if (tid == 0) {
+            l_s = l_s * corr + p_j;
+            m_s = m_new;
+        }
+        __syncthreads();
+    }
+
+    const float l = l_s;
+    const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (unsigned int d = tid; d < head_dim; d += block) {
+        oh[d] = acc[d] * inv;
+    }
+}
+
+// =============================================================================
+// gqa_attn_prefill_flash — FLASH-TILED (block-tiled, K/V-reuse) GQA prefill.
+//
+// Replaces gqa_attn_prefill (grid=(n_head,B), one WG per single query, per-key
+// __syncthreads, whole-K/V re-read from DRAM once PER QUERY -> ~B^2/2 DRAM
+// reads and a barrier storm). This kernel tiles queries into blocks of FBR
+// rows and keys into tiles of FBC, stages one K tile + V tile into LDS ONCE
+// and reuses it across all FBR queries in the block (the whole point of flash
+// attention), and does ONE barrier per key tile instead of one per key. DRAM
+// K/V traffic drops from O(B^2) to O(B^2/FBR); the kernel goes from
+// DRAM/barrier bound to (tiny) compute bound.
+//
+// Standard flash / online-softmax recurrence, all accumulation in f32:
+//   per query row i keep running max m_i, denom l_i, unnormalised out O_i[d].
+//   for each key tile:
+//     S_ij = scale*dot(Q_i, K_j)             (causal-masked to -inf)
+//     m'   = max(m_i, max_j S_ij)
+//     P_ij = exp(S_ij - m')                  (masked -> 0)
+//     corr = exp(m_i - m')
+//     l_i  = l_i*corr + sum_j P_ij
+//     O_i  = O_i*corr + sum_j P_ij*V_j
+//   out_i = O_i / l_i
+//
+// GQA grouping: query head h reads kv_head = h/(n_head/n_kv_head); a whole
+// FBR-row query block shares ONE kv_head's K/V tile (grid.x = head), so K/V is
+// never reloaded per query head redundantly within a block.
+//
+// Causal masking is per-(i,j): query row i has absolute pos q_offset+q0+i and
+// attends keys with global index <= that pos. We iterate key tiles
+// [0 .. max_q_abs] so fully-masked tiles beyond the block are never launched.
+//
+// SCALAR/LDS-tiled flash (f16 K/V/Q staged in LDS, f32 math). Portable (no
+// WMMA intrinsics) so it compiles for gfx1201 AND gfx1151, though it only ever
+// launches on the dGPU (gfx1201). A WMMA upgrade (score + P.V as 16x16x16 f16
+// tiles) is the noted next lever; the scalar version already removes the two
+// dominant costs (redundant DRAM + per-key barrier).
+//
+// Tile shape (Laguna: head_dim=128, n_kv_head=8):
+//   FBR=32 query rows, FBC=32 key cols, FD=128 max head_dim, FBLOCK=256.
+//   LDS: Qs 8K + Ks 8K + Vs 8K (f16) + Sp 4K + Os 16K (f32) + per-row ~ 44.6 KB.
+//
+// Layout (row-major, matches gqa_attn_prefill and the KV-append order):
+//   q:       f16 [B, n_head, head_dim]
+//   k_cache: f16 [n_kv_total, n_kv_head, head_dim]
+//   v_cache: f16 [n_kv_total, n_kv_head, head_dim]
+//   out:     f32 [B, n_head, head_dim]
+//   grid: (n_head, ceil(B/FBR), 1)   block: (FBLOCK, 1, 1)
+// =============================================================================
+#define FBR    32u
+#define FBC    32u
+#define FD     128u   // max head_dim this flash kernel's static LDS supports
+#define FBLOCK 256u
+
+extern "C" __global__ __launch_bounds__(FBLOCK)
+void gqa_attn_prefill_flash(
+        float          * __restrict__ out,         // [B, n_head, head_dim]
+        const _Float16 * __restrict__ q,           // [B, n_head, head_dim]
+        const _Float16 * __restrict__ k_cache,     // [n_kv_total, n_kv_head, head_dim]
+        const _Float16 * __restrict__ v_cache,     // [n_kv_total, n_kv_head, head_dim]
+        unsigned int     n_head,
+        unsigned int     n_kv_head,
+        unsigned int     head_dim,
+        unsigned int     q_offset,                 // abs pos of query row 0
+        unsigned int     batch,                    // B (number of query rows)
+        unsigned int     n_kv_total,               // rows present in the cache
+        float            scale,
+        unsigned int     swa_window,               // 0 = full causal; else sliding window
+        unsigned int     kv_capacity) {            // ring size: physical row = key_g % kv_capacity
+    const unsigned int h   = blockIdx.x;
+    const unsigned int qt  = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    if (h >= n_head) return;
+
+    const unsigned int q_row_base = qt * FBR;      // first query row (within chunk)
+    if (q_row_base >= batch) return;
+    const unsigned int n_rows = (batch - q_row_base < FBR) ? (batch - q_row_base) : FBR;
+    const unsigned int hd = head_dim;              // == FD for Laguna
+
+    const unsigned int kv_group = n_head / n_kv_head;
+    const unsigned int kv_head  = h / kv_group;
+    const unsigned long long kvh_off    = (unsigned long long)kv_head * hd;
+    const unsigned long long row_stride = (unsigned long long)n_kv_head * hd;
+
+    __shared__ _Float16 Qs[FBR * FD];
+    __shared__ _Float16 Ks[FBC * FD];
+    __shared__ _Float16 Vs[FBC * FD];
+    __shared__ float     Sp[FBR * FBC];
+    __shared__ float     Os[FBR * FD];
+    __shared__ float     m_s[FBR];
+    __shared__ float     l_s[FBR];
+    __shared__ float     corr_s[FBR];
+
+    // --- Stage Q + zero the output accumulator ---
+    for (unsigned int p = tid; p < FBR * FD; p += FBLOCK) {
+        const unsigned int i = p / FD;
+        const unsigned int d = p % FD;
+        Os[p] = 0.0f;
+        if (i < n_rows && d < hd) {
+            Qs[p] = q[((unsigned long long)(q_row_base + i) * n_head + h) * hd + d];
+        } else {
+            Qs[p] = (_Float16)0.0f;
+        }
+    }
+    if (tid < FBR) {
+        m_s[tid]    = -INFINITY;
+        l_s[tid]    = 0.0f;
+        corr_s[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    // Absolute position of the LAST valid query row -> last key it attends.
+    const unsigned int max_q_abs   = q_offset + q_row_base + n_rows - 1u;
+    const unsigned int n_key_tiles = max_q_abs / FBC + 1u;
+    // Sliding window: the block's SMALLEST query abs pos is row 0 (q_offset+q_row_base);
+    // keys below its window lower bound are masked for EVERY row, so skip those tiles.
+    const unsigned int min_q_abs = q_offset + q_row_base;
+    const unsigned int win_lo    = (swa_window != 0u && min_q_abs + 1u > swa_window)
+                                     ? (min_q_abs + 1u - swa_window) : 0u;
+    const unsigned int kt_start  = win_lo / FBC;
+
+    for (unsigned int kt = kt_start; kt < n_key_tiles; kt++) {
+        const unsigned int key_base = kt * FBC;
+
+        // --- Stage K/V tile into LDS once (reused across all FBR queries) ---
+        for (unsigned int p = tid; p < FBC * FD; p += FBLOCK) {
+            const unsigned int j = p / FD;
+            const unsigned int d = p % FD;
+            const unsigned int key_g = key_base + j;
+            if (key_g < n_kv_total && d < hd) {
+                // Ring-buffer physical row (identity for global: kv_capacity=max_kv,
+                // key_g<n_kv_total<=max_kv). Only the row index wraps; kvh_off+d unchanged.
+                const unsigned long long off = (unsigned long long)(key_g % kv_capacity) * row_stride + kvh_off + d;
+                Ks[p] = k_cache[off];
+                Vs[p] = v_cache[off];
+            } else {
+                Ks[p] = (_Float16)0.0f;
+                Vs[p] = (_Float16)0.0f;
+            }
+        }
+        __syncthreads();
+
+        // --- Score tile: Sp[i][j] = scale*dot(Q_i,K_j), causal-masked ---
+        for (unsigned int pp = tid; pp < FBR * FBC; pp += FBLOCK) {
+            const unsigned int i = pp / FBC;
+            const unsigned int j = pp % FBC;
+            float s = -INFINITY;
+            if (i < n_rows) {
+                const unsigned int q_abs   = q_offset + q_row_base + i;
+                const unsigned int key_abs = key_base + j;
+                const bool in_win = (swa_window == 0u) || (key_abs + swa_window > q_abs);
+                if (key_abs <= q_abs && key_abs < n_kv_total && in_win) {
+                    const _Float16 *qr = Qs + (unsigned long long)i * FD;
+                    const _Float16 *kr = Ks + (unsigned long long)j * FD;
+                    // 8-way ILP: break the D-deep dependent fma chain so the
+                    // VALU isn't stalled on serial accumulate latency (this is
+                    // the dominant loop; the chain latency, not LDS BW, bounds
+                    // the low-occupancy WG).
+                    float a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;
+                    unsigned int d = 0;
+                    for (; d + 8u <= hd; d += 8u) {
+                        a0 += (float)qr[d]     * (float)kr[d];
+                        a1 += (float)qr[d + 1] * (float)kr[d + 1];
+                        a2 += (float)qr[d + 2] * (float)kr[d + 2];
+                        a3 += (float)qr[d + 3] * (float)kr[d + 3];
+                        a4 += (float)qr[d + 4] * (float)kr[d + 4];
+                        a5 += (float)qr[d + 5] * (float)kr[d + 5];
+                        a6 += (float)qr[d + 6] * (float)kr[d + 6];
+                        a7 += (float)qr[d + 7] * (float)kr[d + 7];
+                    }
+                    float acc = ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7));
+                    for (; d < hd; d++) acc += (float)qr[d] * (float)kr[d];
+                    s = acc * scale;
+                }
+            }
+            Sp[i * FBC + j] = s;
+        }
+        __syncthreads();
+
+        // --- Per-row online-softmax stats (one thread per query row) ---
+        if (tid < FBR && tid < n_rows) {
+            const unsigned int i = tid;
+            float tmax = -INFINITY;
+            #pragma unroll
+            for (unsigned int j = 0; j < FBC; j++) {
+                const float v = Sp[i * FBC + j];
+                if (v > tmax) tmax = v;
+            }
+            const float m_old = m_s[i];
+            const float m_new = fmaxf(m_old, tmax);
+            float corr;
+            float rsum = 0.0f;
+            if (m_new == -INFINITY) {
+                // No valid keys seen yet (only before this row's diagonal
+                // tile); leave running state untouched.
+                corr = 1.0f;
+                #pragma unroll
+                for (unsigned int j = 0; j < FBC; j++) Sp[i * FBC + j] = 0.0f;
+            } else {
+                corr = expf(m_old - m_new);   // m_old=-inf -> 0 (m_new finite)
+                #pragma unroll
+                for (unsigned int j = 0; j < FBC; j++) {
+                    const float sij = Sp[i * FBC + j];
+                    const float p = (sij == -INFINITY) ? 0.0f : expf(sij - m_new);
+                    Sp[i * FBC + j] = p;
+                    rsum += p;
+                }
+            }
+            l_s[i]    = l_s[i] * corr + rsum;
+            m_s[i]    = m_new;
+            corr_s[i] = corr;
+        }
+        __syncthreads();
+
+        // --- Output update: O_i = O_i*corr + sum_j P_ij*V_j ---
+        for (unsigned int p = tid; p < FBR * FD; p += FBLOCK) {
+            const unsigned int i = p / FD;
+            const unsigned int d = p % FD;
+            if (i < n_rows && d < hd) {
+                const float *pr = Sp + (unsigned long long)i * FBC;
+                // 2-way ILP over the BC-deep contraction.
+                float o0 = 0.0f, o1 = 0.0f;
+                #pragma unroll
+                for (unsigned int j = 0; j < FBC; j += 2u) {
+                    o0 += pr[j]      * (float)Vs[j * FD + d];
+                    o1 += pr[j + 1u] * (float)Vs[(j + 1u) * FD + d];
+                }
+                Os[p] = Os[p] * corr_s[i] + (o0 + o1);
+            }
+        }
+        __syncthreads();
+    }
+
+    // --- Normalise + write out[q_row_base+i, h, :] ---
+    for (unsigned int p = tid; p < FBR * FD; p += FBLOCK) {
+        const unsigned int i = p / FD;
+        const unsigned int d = p % FD;
+        if (i < n_rows && d < hd) {
+            const float l = l_s[i];
+            const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+            out[((unsigned long long)(q_row_base + i) * n_head + h) * hd + d] = Os[p] * inv;
+        }
+    }
+}
+
+// =============================================================================
+// gqa_attn_prefill_flash_wmma — WMMA (f16 16x16x16, f32 accumulate) FLASH prefill.
+//
+// Same math, layout, and output contract as gqa_attn_prefill_flash, but the two
+// dominant matmuls run on the gfx1201 (RDNA4) f16 matrix core instead of the
+// 8-way scalar-ILP dot. This is the dGPU-only lever: on gfx1201 the f16 WMMA
+// path has a real ~194-TFLOP matrix engine (the iGPU gfx1151 does NOT — there
+// f16-WMMA ≡ dp4a, a proven dead end — so the iGPU build gets a portable scalar
+// fallback via the #else below and this kernel is never launched there).
+//
+// Tiling: FBR=32 query rows × FBC=32 key cols, head_dim contracted in 16-wide
+// WMMA k-steps. Block = 128 threads = 4 wave32 waves.
+//   SCORE  S[i][j] = scale·Σ_d Q[i][d]·K[j][d]   — C[m][n]=Σ_k A[m][k]B[k][n]
+//          with A=Q (row i, contract d), B=Kᵀ (B[d][j]=K[j][d]). 2×2 wave grid
+//          over the 32×32 score tile (wave→(rt,ct)); 8 k-steps of 16 (hd=128).
+//   softmax (portable): one thread per query row, online max/denom, writes the
+//          probabilities P as f16 into Ps (WMMA A-fragment needs f16).
+//   AV     O[i][d] = Σ_j P[i][j]·V[j][d]           — A=P (contract j), B=V.
+//          2×2 wave grid (wave→(rt row-tile, d-group of 4 16-col d-tiles));
+//          2 k-steps of 16 (FBC=32). The running O accumulator lives in LDS
+//          (Os) and is rescaled by corr each key tile (Os = Os·corr + P·V) — a
+//          fresh WMMA partial per tile added to the rescaled accumulator, so the
+//          proven LDS online-softmax recurrence is reused verbatim.
+//
+// WMMA fragment layout matches the validated f16_gemm_wmma_lds_tiled:
+//   A-fragment: lane holds A[row=lane%16][k=8·(lane/16)+e], e∈0..8
+//   B-fragment: lane holds B[k=8·(lane/16)+e][n=lane%16]
+//   C-fragment: lane holds C[m=8·(lane/16)+e][n=lane%16]
+//
+// LDS: Qs/Ks/Vs (3×8K f16) + Ps (2K f16) + Sp (4K f32) + Os (16K f32) ≈ 46 KB.
+// Env-gated (LAGUNA_ATTN_WMMA=1); gqa_attn_prefill_flash stays the default until
+// this is proven faster AND parity-clean.
+//   grid: (n_head, ceil(B/FBR), 1)   block: (128, 1, 1)
+// =============================================================================
+typedef _Float16 gqa_half8  __attribute__((ext_vector_type(8)));
+typedef float     gqa_float8 __attribute__((ext_vector_type(8)));
+
+// =============================================================================
+// INT8 symmetric KV-cache dequant helper (LAGUNA_FP8_KV — gate name kept; the
+// backing format is now int8, which strictly dominates e4m3 on KV quality at
+// matched bytes, see docs/laguna/FP8_KV_REVIVE.md 2026-07-28). K/V are stored as
+// signed int8 (two's complement in the u8 buffer) + a per-(token,kv_head) f32
+// scale sidecar = amax/127; the attention read dequants back to f16 during
+// LDS/register staging, halving the KV DRAM bytes (the `s_wait_loadcnt`-bound
+// load traffic) that ATT flagged.
+//
+// Dequant is a plain int8->f32 widen (`(float)(signed char)`) then the per-row
+// scale multiply — replacing e4m3's `cvt_pk_f32_fp8`. Layout, load widths, and
+// the f16 LDS staging are byte-identical to the old e4m3 path (still 1 byte/elem
+// + f32 scale), so the LDS swizzle / occupancy / register footprint are
+// unchanged. Fully portable — no arch intrinsics needed (these kernels never
+// launch on the iGPU but must still compile there).
+// =============================================================================
+typedef float gqa_v2f __attribute__((ext_vector_type(2)));
+
+static __device__ __forceinline__ float gqa_fp8_to_f32(unsigned char b) {
+    // Reinterpret the stored byte as two's-complement int8 and widen.
+    return (float)(signed char)b;
+}
+
+// Packed convert: two adjacent int8 bytes (a 16-bit word, low byte first) →
+// two f32. Mirrors the old packed e4m3 helper's interface so every call site is
+// unchanged; the byte layout is identical (1 byte/elem), only the interpretation
+// differs.
+static __device__ __forceinline__ gqa_v2f gqa_fp8x2_to_f32(unsigned short w) {
+    gqa_v2f r;
+    r[0] = (float)(signed char)(unsigned char)(w & 0xffu);
+    r[1] = (float)(signed char)(unsigned char)((w >> 8) & 0xffu);
+    return r;
+}
+
+// Dequant one int8 byte at `off` and apply the row scale at `srow`.
+static __device__ __forceinline__ _Float16 gqa_deq_fp8(
+        const unsigned char * __restrict__ c, unsigned long long off,
+        const float * __restrict__ scale, unsigned long long srow) {
+    return (_Float16)(gqa_fp8_to_f32(c[off]) * scale[srow]);
+}
+
+#define WFBR   32u
+#define WFBC   32u
+#define WFD    128u   // max head_dim this WMMA flash kernel's static LDS supports
+#define WBLOCK 128u
+
+// ---- Head-grouped WMMA prefill (gqa_attn_prefill_flash_wmma_fa2_hg) tiling ----
+// One WG owns ONE KV head-subgroup (HG_G query heads that share a KV head) and a
+// HG_BR-row query tile, and streams each K/V key-tile into LDS ONCE, reusing it
+// across all HG_G heads (kills the kv_group-fold redundant K/V load AND amortizes
+// the per-key-tile barriers over HG_G heads). O accumulator lives in LDS (register
+// O for HG_G heads would spill). Block is 256 (8 waves) so 1 WG/CU still fields 8
+// waves/CU == the baseline's 2×4 — no wave-occupancy loss. Override via
+// -DHG_G=/-DHG_BR= for A/B. Global Laguna: kv_group=6 → HG_G=3 → 2 subgroups.
+#ifndef HG_G
+#define HG_G   3u
+#endif
+#ifndef HG_BR
+#define HG_BR  16u
+#endif
+#define HG_BC    32u
+#define HG_BLOCK 256u
+
+extern "C" __global__ __launch_bounds__(WBLOCK)
+void gqa_attn_prefill_flash_wmma(
+        float          * __restrict__ out,         // [B, n_head, head_dim]
+        const _Float16 * __restrict__ q,           // [B, n_head, head_dim]
+        const _Float16 * __restrict__ k_cache,     // [n_kv_total, n_kv_head, head_dim]
+        const _Float16 * __restrict__ v_cache,     // [n_kv_total, n_kv_head, head_dim]
+        unsigned int     n_head,
+        unsigned int     n_kv_head,
+        unsigned int     head_dim,
+        unsigned int     q_offset,
+        unsigned int     batch,
+        unsigned int     n_kv_total,
+        float            scale,
+        unsigned int     swa_window,     // 0 = full causal; else sliding window
+        unsigned int     kv_capacity) {  // ring size: physical row = key_g % kv_capacity
+    const unsigned int h   = blockIdx.x;
+    const unsigned int qt  = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    if (h >= n_head) return;
+
+    const unsigned int q_row_base = qt * WFBR;
+    if (q_row_base >= batch) return;
+    const unsigned int n_rows = (batch - q_row_base < WFBR) ? (batch - q_row_base) : WFBR;
+    const unsigned int hd = head_dim;              // == WFD for Laguna
+
+    const unsigned int kv_group = n_head / n_kv_head;
+    const unsigned int kv_head  = h / kv_group;
+    const unsigned long long kvh_off    = (unsigned long long)kv_head * hd;
+    const unsigned long long row_stride = (unsigned long long)n_kv_head * hd;
+
+    __shared__ _Float16 Qs[WFBR * WFD];
+    __shared__ _Float16 Ks[WFBC * WFD];
+    __shared__ _Float16 Vs[WFBC * WFD];
+    __shared__ _Float16 Ps[WFBR * WFBC];   // f16 probabilities (WMMA A-fragment)
+    __shared__ float     Sp[WFBR * WFBC];  // f32 scores
+    __shared__ float     Os[WFBR * WFD];   // f32 running output accumulator
+    __shared__ float     m_s[WFBR];
+    __shared__ float     l_s[WFBR];
+    __shared__ float     corr_s[WFBR];
+
+    // --- Stage Q (zero-padded), zero Os + Ps ---
+    for (unsigned int p = tid; p < WFBR * WFD; p += WBLOCK) {
+        const unsigned int i = p / WFD;
+        const unsigned int d = p % WFD;
+        Os[p] = 0.0f;
+        if (i < n_rows && d < hd) {
+            Qs[p] = q[((unsigned long long)(q_row_base + i) * n_head + h) * hd + d];
+        } else {
+            Qs[p] = (_Float16)0.0f;
+        }
+    }
+    for (unsigned int p = tid; p < WFBR * WFBC; p += WBLOCK) Ps[p] = (_Float16)0.0f;
+    if (tid < WFBR) {
+        m_s[tid]    = -INFINITY;
+        l_s[tid]    = 0.0f;
+        corr_s[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    const unsigned int max_q_abs   = q_offset + q_row_base + n_rows - 1u;
+    const unsigned int n_key_tiles = max_q_abs / WFBC + 1u;
+    // Sliding window: skip key tiles entirely below the block's window lower bound.
+    const unsigned int min_q_abs = q_offset + q_row_base;
+    const unsigned int win_lo    = (swa_window != 0u && min_q_abs + 1u > swa_window)
+                                     ? (min_q_abs + 1u - swa_window) : 0u;
+    const unsigned int kt_start  = win_lo / WFBC;
+
+    const unsigned int lane = tid & 31u;
+    const unsigned int wave = tid >> 5;            // 0..3
+
+    for (unsigned int kt = kt_start; kt < n_key_tiles; kt++) {
+        const unsigned int key_base = kt * WFBC;
+
+        // --- Stage K/V tile (zero-padded) ---
+        for (unsigned int p = tid; p < WFBC * WFD; p += WBLOCK) {
+            const unsigned int j = p / WFD;
+            const unsigned int d = p % WFD;
+            const unsigned int key_g = key_base + j;
+            if (key_g < n_kv_total && d < hd) {
+                // Ring-buffer physical row (identity for global: kv_capacity=max_kv,
+                // key_g<n_kv_total<=max_kv). Only the row index wraps; kvh_off+d unchanged.
+                const unsigned long long off = (unsigned long long)(key_g % kv_capacity) * row_stride + kvh_off + d;
+                Ks[p] = k_cache[off];
+                Vs[p] = v_cache[off];
+            } else {
+                Ks[p] = (_Float16)0.0f;
+                Vs[p] = (_Float16)0.0f;
+            }
+        }
+        __syncthreads();
+
+        // --- SCORE: Sp[i][j] = scale·dot(Q_i,K_j), causal-masked ---
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        {
+            const unsigned int rt = wave >> 1;     // row-tile 0..1
+            const unsigned int ct = wave & 1u;     // col-tile 0..1
+            gqa_float8 sacc = {0,0,0,0,0,0,0,0};
+            #pragma unroll
+            for (unsigned int ks = 0; ks < WFD; ks += 16u) {   // 8 k-steps
+                gqa_half8 qf, kf;
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned int row = rt * 16u + (lane & 15u);
+                    const unsigned int d   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                    qf[e] = Qs[row * WFD + d];
+                }
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned int krow = ct * 16u + (lane & 15u);
+                    const unsigned int d    = ks + (lane >> 4) * 8u + (unsigned int)e;
+                    kf[e] = Ks[krow * WFD + d];
+                }
+                sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(qf, kf, sacc);
+            }
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const unsigned int i = rt * 16u + (lane >> 4) * 8u + (unsigned int)e;
+                const unsigned int j = ct * 16u + (lane & 15u);
+                float s = -INFINITY;
+                if (i < n_rows) {
+                    const unsigned int q_abs   = q_offset + q_row_base + i;
+                    const unsigned int key_abs = key_base + j;
+                    const bool in_win = (swa_window == 0u) || (key_abs + swa_window > q_abs);
+                    if (key_abs <= q_abs && key_abs < n_kv_total && in_win) s = sacc[e] * scale;
+                }
+                Sp[i * WFBC + j] = s;
+            }
+        }
+#else
+        for (unsigned int pp = tid; pp < WFBR * WFBC; pp += WBLOCK) {
+            const unsigned int i = pp / WFBC;
+            const unsigned int j = pp % WFBC;
+            float s = -INFINITY;
+            if (i < n_rows) {
+                const unsigned int q_abs   = q_offset + q_row_base + i;
+                const unsigned int key_abs = key_base + j;
+                const bool in_win = (swa_window == 0u) || (key_abs + swa_window > q_abs);
+                if (key_abs <= q_abs && key_abs < n_kv_total && in_win) {
+                    const _Float16 *qr = Qs + (unsigned long long)i * WFD;
+                    const _Float16 *kr = Ks + (unsigned long long)j * WFD;
+                    float acc = 0.0f;
+                    for (unsigned int d = 0; d < hd; d++) acc += (float)qr[d] * (float)kr[d];
+                    s = acc * scale;
+                }
+            }
+            Sp[i * WFBC + j] = s;
+        }
+#endif
+        __syncthreads();
+
+        // --- Online-softmax stats (one thread per query row) -> P into Ps (f16) ---
+        if (tid < WFBR && tid < n_rows) {
+            const unsigned int i = tid;
+            float tmax = -INFINITY;
+            #pragma unroll
+            for (unsigned int j = 0; j < WFBC; j++) {
+                const float v = Sp[i * WFBC + j];
+                if (v > tmax) tmax = v;
+            }
+            const float m_old = m_s[i];
+            const float m_new = fmaxf(m_old, tmax);
+            float corr;
+            float rsum = 0.0f;
+            if (m_new == -INFINITY) {
+                corr = 1.0f;
+                #pragma unroll
+                for (unsigned int j = 0; j < WFBC; j++) Ps[i * WFBC + j] = (_Float16)0.0f;
+            } else {
+                corr = expf(m_old - m_new);
+                #pragma unroll
+                for (unsigned int j = 0; j < WFBC; j++) {
+                    const float sij = Sp[i * WFBC + j];
+                    const float p = (sij == -INFINITY) ? 0.0f : expf(sij - m_new);
+                    Ps[i * WFBC + j] = (_Float16)p;
+                    rsum += p;
+                }
+            }
+            l_s[i]    = l_s[i] * corr + rsum;
+            m_s[i]    = m_new;
+            corr_s[i] = corr;
+        }
+        __syncthreads();
+
+        // --- AV: Os = Os·corr + P·V ---
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        {
+            const unsigned int rt   = wave >> 1;   // row-tile 0..1
+            const unsigned int dgrp = wave & 1u;   // d-tile group 0..1 (cols 0..63 / 64..127)
+            #pragma unroll
+            for (unsigned int dti = 0; dti < 4u; ++dti) {
+                const unsigned int dt = dgrp * 4u + dti;   // d-tile 0..7
+                gqa_float8 oacc = {0,0,0,0,0,0,0,0};
+                #pragma unroll
+                for (unsigned int ks = 0; ks < WFBC; ks += 16u) {   // 2 k-steps
+                    gqa_half8 pf, vf;
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const unsigned int prow = rt * 16u + (lane & 15u);
+                        const unsigned int jj   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                        pf[e] = Ps[prow * WFBC + jj];
+                    }
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const unsigned int jj   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                        const unsigned int dcol = dt * 16u + (lane & 15u);
+                        vf[e] = Vs[jj * WFD + dcol];
+                    }
+                    oacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pf, vf, oacc);
+                }
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned int i = rt * 16u + (lane >> 4) * 8u + (unsigned int)e;
+                    const unsigned int d = dt * 16u + (lane & 15u);
+                    if (i < n_rows) Os[i * WFD + d] = Os[i * WFD + d] * corr_s[i] + oacc[e];
+                }
+            }
+        }
+#else
+        for (unsigned int p = tid; p < WFBR * WFD; p += WBLOCK) {
+            const unsigned int i = p / WFD;
+            const unsigned int d = p % WFD;
+            if (i < n_rows && d < hd) {
+                const _Float16 *pr = Ps + (unsigned long long)i * WFBC;
+                float o = 0.0f;
+                #pragma unroll
+                for (unsigned int j = 0; j < WFBC; j++) o += (float)pr[j] * (float)Vs[j * WFD + d];
+                Os[p] = Os[p] * corr_s[i] + o;
+            }
+        }
+#endif
+        __syncthreads();
+    }
+
+    // --- Normalise + write out[q_row_base+i, h, :] ---
+    for (unsigned int p = tid; p < WFBR * WFD; p += WBLOCK) {
+        const unsigned int i = p / WFD;
+        const unsigned int d = p % WFD;
+        if (i < n_rows && d < hd) {
+            const float l = l_s[i];
+            const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+            out[((unsigned long long)(q_row_base + i) * n_head + h) * hd + d] = Os[p] * inv;
+        }
+    }
+}
+
+// =============================================================================
+// gqa_attn_prefill_flash_wmma_fa2 — FlashAttention-2 REGISTER-RESIDENT-O WMMA
+// prefill. Identical signature, output contract, online-softmax math, causal +
+// sliding-window mask, and kt_start tile-skip as gqa_attn_prefill_flash_wmma —
+// the ONLY difference is where the running O accumulator lives.
+//
+// The predecessor kept O in LDS (`Os[WFBR*WFD] = 16 KB`), which pushed total LDS
+// to ~46 KB → only 1 WG/CU. At 1 WG/CU there is no occupancy to hide the 3
+// __syncthreads per key tile, so as the key-tile count grows with context the
+// barrier latency compounds → super-linear prefill falloff on the O(L²) global
+// layers.
+//
+// FA2 fix: each wave owns a FIXED (row-tile rt, d-group dgrp) region of the
+// 32×128 output for the WHOLE key loop, so the WMMA C-fragment can stay in
+// REGISTERS across every key tile. Per wave that is 4 d-tiles × 8 f32/lane = 32
+// f32/lane persistent (gqa_float8 oacc[4]). Each key tile:
+//   1. rescale the register O by corr_s[row] (per-row, from LDS)
+//   2. WMMA-accumulate P·V into it   →  O = O·corr + P·V   (same recurrence)
+// O never touches LDS; it is written to global only in the final normalize.
+//
+// Dropping Os removes 16 KB → total LDS ≈ 30 KB → ≥2 WG/CU, restoring the
+// latency hiding that flattens the L² curve.
+//
+// LDS: Qs/Ks/Vs (3×8K f16) + Ps (2K f16) + Sp (4K f32) + m/l/corr ≈ 30.4 KB.
+//   grid: (n_head, ceil(B/WFBR), 1)   block: (128, 1, 1)
+// =============================================================================
+// Shared core. FP8=false: k/v_cache_v are const _Float16*, k/v_scale unused.
+// FP8=true: k/v_cache_v are const uint8_t* e4m3fn, dequant with per-(row,kvhead)
+// scale from k/v_scale during LDS staging (all downstream math is f16, identical).
+template<bool FP8> static __device__ __forceinline__
+void gqa_attn_prefill_flash_wmma_fa2_core(
+        float          * __restrict__ out,         // [B, n_head, head_dim]
+        const _Float16 * __restrict__ q,           // [B, n_head, head_dim]
+        const void     * __restrict__ k_cache_v,   // f16 or e4m3fn [n_kv_total, n_kv_head, head_dim]
+        const void     * __restrict__ v_cache_v,
+        const float    * __restrict__ k_scale,     // [n_kv_total, n_kv_head] (FP8 only)
+        const float    * __restrict__ v_scale,
+        unsigned int     n_head,
+        unsigned int     n_kv_head,
+        unsigned int     head_dim,
+        unsigned int     q_offset,
+        unsigned int     batch,
+        unsigned int     n_kv_total,
+        float            scale,
+        unsigned int     swa_window,     // 0 = full causal; else sliding window
+        unsigned int     kv_capacity,    // ring size: physical row = key_g % kv_capacity
+        unsigned int     grid_mode) {    // 0=(head,qtile); 1=KV-first (Infinity-Cache locality)
+    const _Float16      * __restrict__ k_cache = (const _Float16*)k_cache_v;
+    const _Float16      * __restrict__ v_cache = (const _Float16*)v_cache_v;
+    const unsigned char * __restrict__ k_cache8 = (const unsigned char*)k_cache_v;
+    const unsigned char * __restrict__ v_cache8 = (const unsigned char*)v_cache_v;
+    // grid_mode 1 remaps the block index so ALL query heads + query-tiles that
+    // share one KV head are enumerated by CONSECUTIVE linear block ids (KV head =
+    // blockIdx.y, the slow dimension). The HW dispatches blocks roughly in linear
+    // order, so the ~128 concurrently-resident WGs span only ~2-3 KV heads instead
+    // of all 8 → each KV head's K/V (16.8 MB @32K) stays 64 MB-MALL-resident across
+    // its redundant reads. Pure remap: identical math, LDS, VGPR, occupancy.
+    const unsigned int kvg = n_head / n_kv_head;
+    unsigned int h, qt;
+    if (grid_mode == 1u) {
+        const unsigned int kvh = blockIdx.y;          // KV head (slow dim)
+        h  = kvh * kvg + (blockIdx.x % kvg);          // query head within the group
+        qt = blockIdx.x / kvg;                        // query-row tile
+    } else {
+        h  = blockIdx.x;
+        qt = blockIdx.y;
+    }
+    const unsigned int tid = threadIdx.x;
+    if (h >= n_head) return;
+
+    const unsigned int q_row_base = qt * WFBR;
+    if (q_row_base >= batch) return;
+    const unsigned int n_rows = (batch - q_row_base < WFBR) ? (batch - q_row_base) : WFBR;
+    const unsigned int hd = head_dim;              // == WFD for Laguna
+
+    const unsigned int kv_group = n_head / n_kv_head;
+    const unsigned int kv_head  = h / kv_group;
+    const unsigned long long kvh_off    = (unsigned long long)kv_head * hd;
+    const unsigned long long row_stride = (unsigned long long)n_kv_head * hd;
+
+    __shared__ _Float16 Qs[WFBR * WFD];
+    __shared__ _Float16 Ks[WFBC * WFD];
+    __shared__ _Float16 Vs[WFBC * WFD];
+    __shared__ _Float16 Ps[WFBR * WFBC];   // f16 probabilities (WMMA A-fragment)
+    __shared__ float     Sp[WFBR * WFBC];  // f32 scores
+    __shared__ float     m_s[WFBR];
+    __shared__ float     l_s[WFBR];
+    __shared__ float     corr_s[WFBR];
+#if !(defined(__gfx1200__) || defined(__gfx1201__))
+    // Portable (non-gfx120x) fallback keeps the running O in LDS — this kernel is
+    // never launched on the iGPU, but the #else path must still compile/run.
+    __shared__ float     Os[WFBR * WFD];
+#endif
+
+    // --- Stage Q (zero-padded), zero Ps ---
+    for (unsigned int p = tid; p < WFBR * WFD; p += WBLOCK) {
+        const unsigned int i = p / WFD;
+        const unsigned int d = p % WFD;
+#if !(defined(__gfx1200__) || defined(__gfx1201__))
+        Os[p] = 0.0f;
+#endif
+        if (i < n_rows && d < hd) {
+            Qs[p] = q[((unsigned long long)(q_row_base + i) * n_head + h) * hd + d];
+        } else {
+            Qs[p] = (_Float16)0.0f;
+        }
+    }
+    for (unsigned int p = tid; p < WFBR * WFBC; p += WBLOCK) Ps[p] = (_Float16)0.0f;
+    if (tid < WFBR) {
+        m_s[tid]    = -INFINITY;
+        l_s[tid]    = 0.0f;
+        corr_s[tid] = 0.0f;
+    }
+
+    const unsigned int lane = tid & 31u;
+    const unsigned int wave = tid >> 5;            // 0..3
+
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    // FA2 register-resident O accumulator. Wave owns (rt = wave>>1, dgrp = wave&1);
+    // dgrp selects the 4 d-tiles it accumulates. Persistent across the key loop.
+    gqa_float8 oacc[4] = {{0,0,0,0,0,0,0,0}, {0,0,0,0,0,0,0,0},
+                          {0,0,0,0,0,0,0,0}, {0,0,0,0,0,0,0,0}};
+#endif
+    __syncthreads();
+
+    const unsigned int max_q_abs   = q_offset + q_row_base + n_rows - 1u;
+    const unsigned int n_key_tiles = max_q_abs / WFBC + 1u;
+    const unsigned int min_q_abs = q_offset + q_row_base;
+    const unsigned int win_lo    = (swa_window != 0u && min_q_abs + 1u > swa_window)
+                                     ? (min_q_abs + 1u - swa_window) : 0u;
+    const unsigned int kt_start  = win_lo / WFBC;
+
+    for (unsigned int kt = kt_start; kt < n_key_tiles; kt++) {
+        const unsigned int key_base = kt * WFBC;
+
+        // --- Stage K/V tile (zero-padded) ---
+        for (unsigned int p = tid; p < WFBC * WFD; p += WBLOCK) {
+            const unsigned int j = p / WFD;
+            const unsigned int d = p % WFD;
+            const unsigned int key_g = key_base + j;
+            if (key_g < n_kv_total && d < hd) {
+                // Ring-buffer physical row (identity for global: kv_capacity=max_kv,
+                // key_g<n_kv_total<=max_kv). Only the row index wraps; kvh_off+d unchanged.
+                const unsigned long long phys = (unsigned long long)(key_g % kv_capacity);
+                const unsigned long long off = phys * row_stride + kvh_off + d;
+                if constexpr (FP8) {
+                    const unsigned long long srow = phys * n_kv_head + kv_head;
+                    Ks[p] = gqa_deq_fp8(k_cache8, off, k_scale, srow);
+                    Vs[p] = gqa_deq_fp8(v_cache8, off, v_scale, srow);
+                } else {
+                    Ks[p] = k_cache[off];
+                    Vs[p] = v_cache[off];
+                }
+            } else {
+                Ks[p] = (_Float16)0.0f;
+                Vs[p] = (_Float16)0.0f;
+            }
+        }
+        __syncthreads();
+
+        // --- SCORE: Sp[i][j] = scale·dot(Q_i,K_j), causal-masked ---
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        {
+            const unsigned int rt = wave >> 1;     // row-tile 0..1
+            const unsigned int ct = wave & 1u;     // col-tile 0..1
+            gqa_float8 sacc = {0,0,0,0,0,0,0,0};
+            #pragma unroll
+            for (unsigned int ks = 0; ks < WFD; ks += 16u) {   // 8 k-steps
+                gqa_half8 qf, kf;
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned int row = rt * 16u + (lane & 15u);
+                    const unsigned int d   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                    qf[e] = Qs[row * WFD + d];
+                }
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned int krow = ct * 16u + (lane & 15u);
+                    const unsigned int d    = ks + (lane >> 4) * 8u + (unsigned int)e;
+                    kf[e] = Ks[krow * WFD + d];
+                }
+                sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(qf, kf, sacc);
+            }
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const unsigned int i = rt * 16u + (lane >> 4) * 8u + (unsigned int)e;
+                const unsigned int j = ct * 16u + (lane & 15u);
+                float s = -INFINITY;
+                if (i < n_rows) {
+                    const unsigned int q_abs   = q_offset + q_row_base + i;
+                    const unsigned int key_abs = key_base + j;
+                    const bool in_win = (swa_window == 0u) || (key_abs + swa_window > q_abs);
+                    if (key_abs <= q_abs && key_abs < n_kv_total && in_win) s = sacc[e] * scale;
+                }
+                Sp[i * WFBC + j] = s;
+            }
+        }
+#else
+        for (unsigned int pp = tid; pp < WFBR * WFBC; pp += WBLOCK) {
+            const unsigned int i = pp / WFBC;
+            const unsigned int j = pp % WFBC;
+            float s = -INFINITY;
+            if (i < n_rows) {
+                const unsigned int q_abs   = q_offset + q_row_base + i;
+                const unsigned int key_abs = key_base + j;
+                const bool in_win = (swa_window == 0u) || (key_abs + swa_window > q_abs);
+                if (key_abs <= q_abs && key_abs < n_kv_total && in_win) {
+                    const _Float16 *qr = Qs + (unsigned long long)i * WFD;
+                    const _Float16 *kr = Ks + (unsigned long long)j * WFD;
+                    float acc = 0.0f;
+                    for (unsigned int d = 0; d < hd; d++) acc += (float)qr[d] * (float)kr[d];
+                    s = acc * scale;
+                }
+            }
+            Sp[i * WFBC + j] = s;
+        }
+#endif
+        __syncthreads();
+
+        // --- Online-softmax stats (one thread per query row) -> P into Ps (f16) ---
+        if (tid < WFBR && tid < n_rows) {
+            const unsigned int i = tid;
+            float tmax = -INFINITY;
+            #pragma unroll
+            for (unsigned int j = 0; j < WFBC; j++) {
+                const float v = Sp[i * WFBC + j];
+                if (v > tmax) tmax = v;
+            }
+            const float m_old = m_s[i];
+            const float m_new = fmaxf(m_old, tmax);
+            float corr;
+            float rsum = 0.0f;
+            if (m_new == -INFINITY) {
+                corr = 1.0f;
+                #pragma unroll
+                for (unsigned int j = 0; j < WFBC; j++) Ps[i * WFBC + j] = (_Float16)0.0f;
+            } else {
+                corr = expf(m_old - m_new);
+                #pragma unroll
+                for (unsigned int j = 0; j < WFBC; j++) {
+                    const float sij = Sp[i * WFBC + j];
+                    const float p = (sij == -INFINITY) ? 0.0f : expf(sij - m_new);
+                    Ps[i * WFBC + j] = (_Float16)p;
+                    rsum += p;
+                }
+            }
+            l_s[i]    = l_s[i] * corr + rsum;
+            m_s[i]    = m_new;
+            corr_s[i] = corr;
+        }
+        __syncthreads();
+
+        // --- AV: O = O·corr + P·V, with O in REGISTERS (the FA2 lever) ---
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        {
+            const unsigned int rt   = wave >> 1;   // row-tile 0..1
+            const unsigned int dgrp = wave & 1u;   // d-tile group 0..1 (cols 0..63 / 64..127)
+            // Per-lane rescale factors for the 8 rows this lane's C-fragment owns
+            // (row = rt*16 + (lane>>4)*8 + e). corr is the same for all 4 d-tiles.
+            float cr[8];
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const unsigned int i = rt * 16u + (lane >> 4) * 8u + (unsigned int)e;
+                cr[e] = corr_s[i];
+            }
+            #pragma unroll
+            for (unsigned int dti = 0; dti < 4u; ++dti) {
+                const unsigned int dt = dgrp * 4u + dti;   // d-tile 0..7
+                // 1) rescale the persistent register accumulator by corr (FA2)
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) oacc[dti][e] *= cr[e];
+                // 2) WMMA-accumulate P·V into it (2 k-steps of 16, FBC=32)
+                #pragma unroll
+                for (unsigned int ks = 0; ks < WFBC; ks += 16u) {
+                    gqa_half8 pf, vf;
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const unsigned int prow = rt * 16u + (lane & 15u);
+                        const unsigned int jj   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                        pf[e] = Ps[prow * WFBC + jj];
+                    }
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const unsigned int jj   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                        const unsigned int dcol = dt * 16u + (lane & 15u);
+                        vf[e] = Vs[jj * WFD + dcol];
+                    }
+                    oacc[dti] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pf, vf, oacc[dti]);
+                }
+            }
+        }
+#else
+        for (unsigned int p = tid; p < WFBR * WFD; p += WBLOCK) {
+            const unsigned int i = p / WFD;
+            const unsigned int d = p % WFD;
+            if (i < n_rows && d < hd) {
+                const _Float16 *pr = Ps + (unsigned long long)i * WFBC;
+                float o = 0.0f;
+                #pragma unroll
+                for (unsigned int j = 0; j < WFBC; j++) o += (float)pr[j] * (float)Vs[j * WFD + d];
+                Os[p] = Os[p] * corr_s[i] + o;
+            }
+        }
+#endif
+        __syncthreads();
+    }
+
+    // --- Normalise + write out[q_row_base+i, h, :] ---
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    {
+        const unsigned int rt   = wave >> 1;
+        const unsigned int dgrp = wave & 1u;
+        #pragma unroll
+        for (unsigned int dti = 0; dti < 4u; ++dti) {
+            const unsigned int dt = dgrp * 4u + dti;
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const unsigned int i = rt * 16u + (lane >> 4) * 8u + (unsigned int)e;
+                const unsigned int d = dt * 16u + (lane & 15u);
+                if (i < n_rows) {
+                    const float l = l_s[i];
+                    const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+                    out[((unsigned long long)(q_row_base + i) * n_head + h) * hd + d] = oacc[dti][e] * inv;
+                }
+            }
+        }
+    }
+#else
+    for (unsigned int p = tid; p < WFBR * WFD; p += WBLOCK) {
+        const unsigned int i = p / WFD;
+        const unsigned int d = p % WFD;
+        if (i < n_rows && d < hd) {
+            const float l = l_s[i];
+            const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+            out[((unsigned long long)(q_row_base + i) * n_head + h) * hd + d] = Os[p] * inv;
+        }
+    }
+#endif
+}
+
+// f16 (default) + fp8 e4m3fn KV wrappers around the shared fa2 core.
+extern "C" __global__ __launch_bounds__(WBLOCK)
+void gqa_attn_prefill_flash_wmma_fa2(
+        float * __restrict__ out, const _Float16 * __restrict__ q,
+        const _Float16 * __restrict__ k_cache, const _Float16 * __restrict__ v_cache,
+        unsigned int n_head, unsigned int n_kv_head, unsigned int head_dim,
+        unsigned int q_offset, unsigned int batch, unsigned int n_kv_total,
+        float scale, unsigned int swa_window, unsigned int kv_capacity, unsigned int grid_mode) {
+    gqa_attn_prefill_flash_wmma_fa2_core<false>(out, q, k_cache, v_cache, nullptr, nullptr,
+        n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window, kv_capacity, grid_mode);
+}
+extern "C" __global__ __launch_bounds__(WBLOCK)
+void gqa_attn_prefill_flash_wmma_fa2_fp8(
+        float * __restrict__ out, const _Float16 * __restrict__ q,
+        const unsigned char * __restrict__ k_cache, const unsigned char * __restrict__ v_cache,
+        const float * __restrict__ k_scale, const float * __restrict__ v_scale,
+        unsigned int n_head, unsigned int n_kv_head, unsigned int head_dim,
+        unsigned int q_offset, unsigned int batch, unsigned int n_kv_total,
+        float scale, unsigned int swa_window, unsigned int kv_capacity, unsigned int grid_mode) {
+    gqa_attn_prefill_flash_wmma_fa2_core<true>(out, q, k_cache, v_cache, k_scale, v_scale,
+        n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window, kv_capacity, grid_mode);
+}
+
+// =============================================================================
+// gqa_attn_prefill_flash_wmma_fa2_hg — HEAD-GROUPED WMMA FA prefill.
+//
+// The single-head fa2 launches one WG per QUERY head; the kv_group query heads
+// that share a KV head each independently stream that KV head's K/V from DRAM and
+// each pay their own per-key-tile __syncthreads. This kernel launches one WG per
+// (KV head, sub-group of HG_G query heads, query-row tile). Per key tile it stages
+// K/V ONCE into LDS and runs score+online-softmax+P·V for ALL HG_G heads against
+// it — cutting the per-key-tile barrier-rounds (and redundant K/V loads) by HG_G.
+//
+// O accumulator is in LDS (HG_G heads × HG_BR × head_dim f32); register-O would
+// spill for HG_G>1. Block = HG_BLOCK(256) = 8 waves so 1 WG/CU still fields 8
+// waves/CU (== baseline 2 WG × 4 waves) — barrier *count* drops without losing
+// wave occupancy. head_dim == WFD(128). Requires kv_group % HG_G == 0.
+//   grid: (n_kv_head * (kv_group/HG_G), ceil(B/HG_BR), 1)   block: (256,1,1)
+// =============================================================================
+template<bool FP8> static __device__ __forceinline__
+void gqa_attn_prefill_flash_wmma_fa2_hg_core(
+        float          * __restrict__ out,         // [B, n_head, head_dim]
+        const _Float16 * __restrict__ q,           // [B, n_head, head_dim]
+        const void     * __restrict__ k_cache_v,   // f16 or e4m3fn [n_kv_total, n_kv_head, head_dim]
+        const void     * __restrict__ v_cache_v,
+        const float    * __restrict__ k_scale,     // [n_kv_total, n_kv_head] (FP8 only)
+        const float    * __restrict__ v_scale,
+        unsigned int     n_head,
+        unsigned int     n_kv_head,
+        unsigned int     head_dim,
+        unsigned int     q_offset,
+        unsigned int     batch,
+        unsigned int     n_kv_total,
+        float            scale,
+        unsigned int     swa_window,     // 0 = full causal; else sliding window
+        unsigned int     kv_capacity) {  // ring size: physical row = key_g % kv_capacity
+    const _Float16      * __restrict__ k_cache = (const _Float16*)k_cache_v;
+    const _Float16      * __restrict__ v_cache = (const _Float16*)v_cache_v;
+    const unsigned char * __restrict__ k_cache8 = (const unsigned char*)k_cache_v;
+    const unsigned char * __restrict__ v_cache8 = (const unsigned char*)v_cache_v;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int wave = tid >> 5;            // 0..7
+
+    const unsigned int kv_group   = n_head / n_kv_head;
+    const unsigned int n_subgroup = kv_group / HG_G;
+    const unsigned int kv_head    = blockIdx.x / n_subgroup;
+    const unsigned int subgroup   = blockIdx.x % n_subgroup;
+    const unsigned int qt         = blockIdx.y;
+    if (kv_head >= n_kv_head) return;
+
+    const unsigned int q_row_base = qt * HG_BR;
+    if (q_row_base >= batch) return;
+    const unsigned int n_rows = (batch - q_row_base < HG_BR) ? (batch - q_row_base) : HG_BR;
+    const unsigned int hd = head_dim;              // == WFD
+    // First query head of this sub-group; the HG_G heads are contiguous.
+    const unsigned int h0 = kv_head * kv_group + subgroup * HG_G;
+
+    const unsigned long long kvh_off    = (unsigned long long)kv_head * hd;
+    const unsigned long long row_stride = (unsigned long long)n_kv_head * hd;
+
+    __shared__ _Float16 Qs[HG_G * HG_BR * WFD];
+    __shared__ _Float16 Ks[HG_BC * WFD];
+    __shared__ _Float16 Vs[HG_BC * WFD];
+    __shared__ _Float16 Ps[HG_G * HG_BR * HG_BC];
+    __shared__ float    Sp[HG_G * HG_BR * HG_BC];
+    __shared__ float    m_s[HG_G * HG_BR];
+    __shared__ float    l_s[HG_G * HG_BR];
+    __shared__ float    corr_s[HG_G * HG_BR];
+
+    // REGISTER-RESIDENT O accumulator. Wave `w` owns d-tile w (cols w*16..w*16+15)
+    // for all HG_G heads; O_reg[g][e] holds row i=(lane>>4)*8+e of that d-tile.
+    // Keeping O in VGPRs (24/thread) instead of the old 24 KB LDS `Os` frees that
+    // LDS AND — the real win — kills the ~48 KB/tile LDS load+rescale+store round
+    // trip the AV phase used to pay on `Os` every single key tile.
+    gqa_float8 O_reg[HG_G];
+    #pragma unroll
+    for (unsigned int g = 0; g < HG_G; ++g)
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) O_reg[g][e] = 0.0f;
+
+    // --- Stage all HG_G heads' Q (zero-padded) ---
+    for (unsigned int p = tid; p < HG_G * HG_BR * WFD; p += HG_BLOCK) {
+        const unsigned int g = p / (HG_BR * WFD);
+        const unsigned int r = (p / WFD) % HG_BR;
+        const unsigned int d = p % WFD;
+        if (r < n_rows && d < hd) {
+            Qs[p] = q[((unsigned long long)(q_row_base + r) * n_head + (h0 + g)) * hd + d];
+        } else {
+            Qs[p] = (_Float16)0.0f;
+        }
+    }
+    for (unsigned int p = tid; p < HG_G * HG_BR * HG_BC; p += HG_BLOCK) Ps[p] = (_Float16)0.0f;
+    if (tid < HG_G * HG_BR) { m_s[tid] = -INFINITY; l_s[tid] = 0.0f; corr_s[tid] = 0.0f; }
+    __syncthreads();
+
+    const unsigned int max_q_abs   = q_offset + q_row_base + n_rows - 1u;
+    const unsigned int n_key_tiles = max_q_abs / HG_BC + 1u;
+    const unsigned int min_q_abs   = q_offset + q_row_base;
+    const unsigned int win_lo      = (swa_window != 0u && min_q_abs + 1u > swa_window)
+                                       ? (min_q_abs + 1u - swa_window) : 0u;
+    const unsigned int kt_start    = win_lo / HG_BC;
+
+#ifndef ATTN_KV_PREFETCH_OFF  // prefetch is DEFAULT; -DATTN_KV_PREFETCH_OFF restores serial staging (A/B)
+    // ===================================================================
+    // Software-pipelined K/V prefetch (raise memory-level parallelism).
+    // ATT showed 74% of stall cycles on `s_wait_loadcnt` — waves parked on
+    // K/V global loads with too few in flight. Instead of load→store→wait
+    // per element, we PREFETCH the whole next key tile into registers
+    // (all loads issued up front, in flight during this tile's WMMA
+    // compute), then just copy regs→LDS at the top of the next iteration.
+    // Occupancy is LDS-bound (1 block/CU) so the extra ~16 VGPRs are free.
+    // No extra LDS buffer (avoids the "attn double-buffer trap").
+    // ===================================================================
+    // Prefetch DEPTH: how many key tiles are kept in-flight (register-resident)
+    // at once. Depth 1 = the original single-tile-ahead prefetch. Depth 2+ keeps
+    // more outstanding K/V global loads → higher memory-level parallelism → less
+    // s_wait_loadcnt (ATT showed 56% of stall on load-wait). Extra cost is
+    // DEPTH*KVPT*2 half regs (occupancy is LDS-bound so VGPRs are free until 256).
+    // A STATIC shift-register (buf[s] <- buf[s+1]) rotates the tiles so every
+    // buffer index is a compile-time constant — no dynamic-indexed register array
+    // (that would spill to scratch). Bit-exact vs depth 1: only load SCHEDULING
+    // changes; the bytes stored into Ks/Vs are identical.
+#ifndef ATTN_PREFETCH_DEPTH
+#define ATTN_PREFETCH_DEPTH 2
+#endif
+    constexpr unsigned int KVPT = (HG_BC * WFD) / HG_BLOCK;   // regs/thread per K,V
+    constexpr unsigned int PFD  = ATTN_PREFETCH_DEPTH;
+    _Float16 kbuf[PFD][KVPT];
+    _Float16 vbuf[PFD][KVPT];
+    #define ATTN_LOAD_TILE_REG(SLOT, KT) do {                                        \
+        const unsigned int _kbase = (KT) * HG_BC;                                    \
+        _Pragma("unroll")                                                            \
+        for (unsigned int _i = 0; _i < KVPT; ++_i) {                                 \
+            const unsigned int _p  = tid + _i * HG_BLOCK;                            \
+            const unsigned int _j  = _p / WFD;                                       \
+            const unsigned int _d  = _p % WFD;                                       \
+            const unsigned int _kg = _kbase + _j;                                    \
+            if (_kg < n_kv_total && _d < hd) {                                       \
+                const unsigned long long _phys = (unsigned long long)(_kg % kv_capacity); \
+                const unsigned long long _off = _phys * row_stride + kvh_off + _d;   \
+                if constexpr (FP8) {                                                 \
+                    const unsigned long long _sr = _phys * n_kv_head + kv_head;      \
+                    kbuf[SLOT][_i] = gqa_deq_fp8(k_cache8, _off, k_scale, _sr);      \
+                    vbuf[SLOT][_i] = gqa_deq_fp8(v_cache8, _off, v_scale, _sr);      \
+                } else {                                                            \
+                    kbuf[SLOT][_i] = k_cache[_off];                                  \
+                    vbuf[SLOT][_i] = v_cache[_off];                                  \
+                }                                                                    \
+            } else { kbuf[SLOT][_i] = (_Float16)0.0f; vbuf[SLOT][_i] = (_Float16)0.0f; } \
+        }                                                                            \
+    } while (0)
+
+    // Prime the pipeline: issue the first PFD tiles' loads up front.
+    #pragma unroll
+    for (unsigned int _pf = 0; _pf < PFD; ++_pf) {
+        if (kt_start + _pf < n_key_tiles) ATTN_LOAD_TILE_REG(_pf, kt_start + _pf);
+    }
+
+    for (unsigned int kt = kt_start; kt < n_key_tiles; kt++) {
+        // --- Copy the (already-loaded) K/V tile regs → LDS (always buf[0]). ---
+        #pragma unroll
+        for (unsigned int _i = 0; _i < KVPT; ++_i) {
+            const unsigned int _p = tid + _i * HG_BLOCK;
+            Ks[_p] = kbuf[0][_i];
+            Vs[_p] = vbuf[0][_i];
+        }
+        __syncthreads();
+
+        // Shift the register ring down: buf[s] <- buf[s+1] (static indices).
+        #pragma unroll
+        for (unsigned int _s = 0; _s + 1u < PFD; ++_s) {
+            #pragma unroll
+            for (unsigned int _i = 0; _i < KVPT; ++_i) {
+                kbuf[_s][_i] = kbuf[_s + 1u][_i];
+                vbuf[_s][_i] = vbuf[_s + 1u][_i];
+            }
+        }
+        // Issue the load for tile kt+PFD into the freed top slot NOW so its
+        // global loads overlap the whole PFD-tile compute window before consume.
+        if (kt + PFD < n_key_tiles) ATTN_LOAD_TILE_REG(PFD - 1u, kt + PFD);
+
+        const unsigned int key_base = kt * HG_BC;
+#else
+    for (unsigned int kt = kt_start; kt < n_key_tiles; kt++) {
+        const unsigned int key_base = kt * HG_BC;
+
+        // --- Stage K/V tile ONCE (shared across all HG_G heads) ---
+        for (unsigned int p = tid; p < HG_BC * WFD; p += HG_BLOCK) {
+            const unsigned int j = p / WFD;
+            const unsigned int d = p % WFD;
+            const unsigned int key_g = key_base + j;
+            if (key_g < n_kv_total && d < hd) {
+                const unsigned long long phys = (unsigned long long)(key_g % kv_capacity);
+                const unsigned long long off = phys * row_stride + kvh_off + d;
+                if constexpr (FP8) {
+                    const unsigned long long srow = phys * n_kv_head + kv_head;
+                    Ks[p] = gqa_deq_fp8(k_cache8, off, k_scale, srow);
+                    Vs[p] = gqa_deq_fp8(v_cache8, off, v_scale, srow);
+                } else {
+                    Ks[p] = k_cache[off];
+                    Vs[p] = v_cache[off];
+                }
+            } else {
+                Ks[p] = (_Float16)0.0f;
+                Vs[p] = (_Float16)0.0f;
+            }
+        }
+        __syncthreads();
+#endif
+
+        // --- SCORE for every head: Sp[g][i][j] = scale·dot(Qg_i,K_j). One wave per
+        //     (head, col-tile); HG_BR=16 is a single 16-row WMMA tile. ---
+        {
+            const unsigned int g  = wave / 2u;     // 0..HG_G-1
+            const unsigned int ct = wave & 1u;     // col-tile 0..1 (keys 0..15 / 16..31)
+            if (g < HG_G) {
+                const _Float16 *Qg = Qs + (unsigned long long)g * HG_BR * WFD;
+                gqa_float8 sacc = {0,0,0,0,0,0,0,0};
+                #pragma unroll
+                for (unsigned int ks = 0; ks < WFD; ks += 16u) {   // 8 k-steps
+                    gqa_half8 qf, kf;
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const unsigned int row = (lane & 15u);
+                        const unsigned int d   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                        qf[e] = Qg[row * WFD + d];
+                    }
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const unsigned int krow = ct * 16u + (lane & 15u);
+                        const unsigned int d    = ks + (lane >> 4) * 8u + (unsigned int)e;
+                        kf[e] = Ks[krow * WFD + d];
+                    }
+                    sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(qf, kf, sacc);
+                }
+                float *Spg = Sp + (unsigned long long)g * HG_BR * HG_BC;
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned int i = (lane >> 4) * 8u + (unsigned int)e;   // row 0..15
+                    const unsigned int j = ct * 16u + (lane & 15u);
+                    float s = -INFINITY;
+                    if (i < n_rows) {
+                        const unsigned int q_abs   = q_offset + q_row_base + i;
+                        const unsigned int key_abs = key_base + j;
+                        const bool in_win = (swa_window == 0u) || (key_abs + swa_window > q_abs);
+                        if (key_abs <= q_abs && key_abs < n_kv_total && in_win) s = sacc[e] * scale;
+                    }
+                    Spg[i * HG_BC + j] = s;
+                }
+            }
+        }
+        __syncthreads();
+
+        // --- Online-softmax stats: WARP-PARALLEL, 4 lanes per (head,row).
+        //     Each (head,row) softmax task is split across 4 consecutive lanes,
+        //     each owning HG_BC/4 (=8) columns. The scalar version ran one thread
+        //     per row (HG_G*HG_BR=48 threads, each serially scanning 32 keys with
+        //     expf) while the matrix core idled; spreading each row over 4 lanes
+        //     quarters the serial expf chain (8 vs 32) and uses 192 threads. The
+        //     per-row max/sum are combined across the 4 lanes with a 2-step
+        //     __shfl_xor butterfly (mask 1,2 — the 4 lanes are contiguous within
+        //     a wave since 4 | 32). Reassociates the sum across 4 partials; the
+        //     WMMA-f16 tolerance already absorbs the reorder. ---
+        if (tid < HG_G * HG_BR * 4u) {
+            const unsigned int task    = tid >> 2;        // 0..HG_G*HG_BR-1
+            const unsigned int quarter = tid & 3u;        // 0..3
+            const unsigned int g = task / HG_BR;
+            const unsigned int i = task % HG_BR;
+            if (i < n_rows) {
+                float *Spg = Sp + (unsigned long long)g * HG_BR * HG_BC;
+                _Float16 *Psg = Ps + (unsigned long long)g * HG_BR * HG_BC;
+                const unsigned int c0 = quarter * (HG_BC / 4u);   // 8 cols/lane
+                // local max over this lane's 8 columns
+                float lmax = -INFINITY;
+                #pragma unroll
+                for (unsigned int j = 0; j < HG_BC / 4u; j++) {
+                    const float v = Spg[i*HG_BC + c0 + j];
+                    if (v > lmax) lmax = v;
+                }
+                // butterfly-reduce max across the 4 lanes
+                lmax = fmaxf(lmax, __shfl_xor(lmax, 1));
+                lmax = fmaxf(lmax, __shfl_xor(lmax, 2));
+                const float tmax  = lmax;
+                const float m_old = m_s[g*HG_BR+i];
+                const float m_new = fmaxf(m_old, tmax);
+                float corr, lsum = 0.0f;
+                if (m_new == -INFINITY) {
+                    corr = 1.0f;
+                    #pragma unroll
+                    for (unsigned int j = 0; j < HG_BC / 4u; j++) Psg[i*HG_BC + c0 + j] = (_Float16)0.0f;
+                } else {
+                    corr = expf(m_old - m_new);
+                    #pragma unroll
+                    for (unsigned int j = 0; j < HG_BC / 4u; j++) {
+                        const float sij = Spg[i*HG_BC + c0 + j];
+                        const float p = (sij == -INFINITY) ? 0.0f : expf(sij - m_new);
+                        Psg[i*HG_BC + c0 + j] = (_Float16)p;
+                        lsum += p;
+                    }
+                }
+                // butterfly-reduce sum across the 4 lanes
+                lsum += __shfl_xor(lsum, 1);
+                lsum += __shfl_xor(lsum, 2);
+                if (quarter == 0u) {
+                    l_s[g*HG_BR+i]    = l_s[g*HG_BR+i] * corr + lsum;
+                    m_s[g*HG_BR+i]    = m_new;
+                    corr_s[g*HG_BR+i] = corr;
+                }
+            }
+        }
+        __syncthreads();
+
+        // --- AV: O_reg[g] = O_reg[g]·corr + P[g]·V. Wave = d-tile (0..7), loops
+        //     heads. O stays in registers — rescale in place, WMMA-accumulate,
+        //     NO LDS load/store (the old `Os` round trip is gone). ---
+        {
+            const unsigned int dt = wave;          // d-tile 0..7 (cols dt*16..dt*16+15)
+            #pragma unroll
+            for (unsigned int g = 0; g < HG_G; ++g) {
+                _Float16 *Psg = Ps + (unsigned long long)g * HG_BR * HG_BC;
+                const float *crg = corr_s + (unsigned long long)g * HG_BR;
+                gqa_float8 oacc;
+                // rescale the running O fragment by corr (per row)
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned int i = (lane >> 4) * 8u + (unsigned int)e;   // row 0..15
+                    oacc[e] = O_reg[g][e] * crg[i];
+                }
+                #pragma unroll
+                for (unsigned int ks = 0; ks < HG_BC; ks += 16u) {   // 2 k-steps
+                    gqa_half8 pf, vf;
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const unsigned int prow = (lane & 15u);
+                        const unsigned int jj   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                        pf[e] = Psg[prow * HG_BC + jj];
+                    }
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const unsigned int jj   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                        const unsigned int dcol = dt * 16u + (lane & 15u);
+                        vf[e] = Vs[jj * WFD + dcol];
+                    }
+                    oacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pf, vf, oacc);
+                }
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) O_reg[g][e] = oacc[e];
+            }
+        }
+        __syncthreads();
+    }
+
+    // --- Normalise + write out from register-O. Wave = d-tile (dt); it owns cols
+    //     dt*16..dt*16+15 (all < hd since dt<8, hd=128) for rows (lane>>4)*8+e. ---
+    {
+        const unsigned int dt = wave;
+        #pragma unroll
+        for (unsigned int g = 0; g < HG_G; ++g) {
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const unsigned int i = (lane >> 4) * 8u + (unsigned int)e;
+                const unsigned int d = dt * 16u + (lane & 15u);
+                if (i < n_rows) {
+                    const float l = l_s[g*HG_BR+i];
+                    const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+                    out[((unsigned long long)(q_row_base + i) * n_head + (h0 + g)) * hd + d] = O_reg[g][e] * inv;
+                }
+            }
+        }
+    }
+#endif
+}
+
+// f16 (default) + fp8 e4m3fn KV wrappers around the shared fa2_hg core.
+extern "C" __global__ __launch_bounds__(HG_BLOCK)
+void gqa_attn_prefill_flash_wmma_fa2_hg(
+        float * __restrict__ out, const _Float16 * __restrict__ q,
+        const _Float16 * __restrict__ k_cache, const _Float16 * __restrict__ v_cache,
+        unsigned int n_head, unsigned int n_kv_head, unsigned int head_dim,
+        unsigned int q_offset, unsigned int batch, unsigned int n_kv_total,
+        float scale, unsigned int swa_window, unsigned int kv_capacity) {
+    gqa_attn_prefill_flash_wmma_fa2_hg_core<false>(out, q, k_cache, v_cache, nullptr, nullptr,
+        n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window, kv_capacity);
+}
+extern "C" __global__ __launch_bounds__(HG_BLOCK)
+void gqa_attn_prefill_flash_wmma_fa2_hg_fp8(
+        float * __restrict__ out, const _Float16 * __restrict__ q,
+        const unsigned char * __restrict__ k_cache, const unsigned char * __restrict__ v_cache,
+        const float * __restrict__ k_scale, const float * __restrict__ v_scale,
+        unsigned int n_head, unsigned int n_kv_head, unsigned int head_dim,
+        unsigned int q_offset, unsigned int batch, unsigned int n_kv_total,
+        float scale, unsigned int swa_window, unsigned int kv_capacity) {
+    gqa_attn_prefill_flash_wmma_fa2_hg_core<true>(out, q, k_cache, v_cache, k_scale, v_scale,
+        n_head, n_kv_head, head_dim, q_offset, batch, n_kv_total, scale, swa_window, kv_capacity);
+}
+
+// =============================================================================
+// gqa_attn_prefill_flash_wmma_fa2_hg_packed — FULL-GQA-GROUP packed WMMA FA prefill.
+//
+// fa2_hg packs only HG_G(=3) of the kv_group(=6) query heads per WG, so each KV
+// head is split across n_subgroup=2 workgroups and the per-key-tile softmax stats,
+// barriers, and (crucially) the K/V LDS→WMMA-fragment loads are only amortized
+// over 3 heads — the MHA-like (~7% of WMMA peak) regime. llama.cpp's RDNA config
+// packs the FULL GQA group into one tile column (ncols2 = whole group) so one
+// K/V-load + one softmax pass serves all group heads → 22-25% of peak.
+//
+// This variant hardwires HGP_G = 6 (== full-attn kv_group): ONE WG owns ALL 6
+// query heads of a KV head. n_subgroup=1. The score+softmax phases are generalized
+// to wave-/thread-strided loops (fa2_hg hard-assumed HG_G<=4: score needs 2 waves
+// /head <=8 waves, softmax needs 4 lanes*HG_G*HG_BR<=256 threads). At G=6 that is
+// 12 score wave-tasks (loop stride 8) and 384 softmax slots (loop stride 256).
+//
+// O stays REGISTER-resident (O_reg[6] = 48 VGPRs). LDS budget @ G=6:
+//   Qs 24576 + Ks 8192 + Vs 8192 + Ps 6144 + Sp 12288 + (m/l/corr) 1152 = 60544 B
+//   (59.1 KB < 64 KB → 1 block/CU). Moving O to LDS (+49 KB) would NOT fit, so
+//   register-O is mandatory here; if it spills to scratch, G=6 is off the table.
+//   grid: (n_kv_head * (kv_group/6), ceil(B/HG_BR), 1)   block: (256,1,1)
+// Requires kv_group % 6 == 0 (global Laguna: 6). SWA layers (kv_group 9) stay on
+// fa2_hg. Env-gated OFF by default (LAGUNA_ATTN_HG_PACKED=1).
+// =============================================================================
+#ifndef HGP_G
+#define HGP_G 6u
+#endif
+// -----------------------------------------------------------------------------
+// Conflict-free LDS operand layout (HG_LDS_SKEW). The WMMA A/B fragment loads
+// feed from Qs/Ks/Vs/Ps with row stride == the logical tile width (WFD=128 or
+// HG_BC=32). Both are multiples of 64 elements, so consecutive fragment rows
+// alias to the SAME 32-bit LDS bank set (bank = (elem/2) mod 32; row*128/2 ≡ 0):
+//   Q/K score load = 16-way conflict, V load = 4-way, P load = 8-way.
+// The matrix core then starves 99.9% idle on `ds_load`s (ATT: LDS 82% stall).
+// Padding each LDS row stride by +2 halfs makes the row term step by 1 bank
+// (130/2 = 65 ≡ 1 mod 32) so the 16 fragment rows spread across all banks; the
+// high-lane-bit k-half offset (+4 banks, structural) leaves at most a 2-way
+// conflict — an 8× cut on the Q/K operand load, 2× on V, 4× on P. Padding cols
+// are never read (loads index d<WFD, j<HG_BC), so no value changes; parity is
+// exact modulo the WMMA-f16 tolerance the kernel already carries.
+#ifndef HG_LDS_SKEW_OFF  // conflict-free padded LDS stride is DEFAULT; -DHG_LDS_SKEW_OFF for A/B
+#define HGP_QSTRIDE (WFD + 2u)
+#define HGP_KSTRIDE (WFD + 2u)
+#define HGP_VSTRIDE (WFD + 2u)
+#define HGP_PSTRIDE (HG_BC + 2u)
+#else
+#define HGP_QSTRIDE WFD
+#define HGP_KSTRIDE WFD
+#define HGP_VSTRIDE WFD
+#define HGP_PSTRIDE HG_BC
+#endif
+extern "C" __global__ __launch_bounds__(HG_BLOCK)
+void gqa_attn_prefill_flash_wmma_fa2_hg_packed(
+        float          * __restrict__ out,         // [B, n_head, head_dim]
+        const _Float16 * __restrict__ q,           // [B, n_head, head_dim]
+        const _Float16 * __restrict__ k_cache,     // [n_kv_total, n_kv_head, head_dim]
+        const _Float16 * __restrict__ v_cache,     // [n_kv_total, n_kv_head, head_dim]
+        unsigned int     n_head,
+        unsigned int     n_kv_head,
+        unsigned int     head_dim,
+        unsigned int     q_offset,
+        unsigned int     batch,
+        unsigned int     n_kv_total,
+        float            scale,
+        unsigned int     swa_window,     // 0 = full causal; else sliding window
+        unsigned int     kv_capacity) {  // ring size: physical row = key_g % kv_capacity
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int wave = tid >> 5;            // 0..7
+
+    const unsigned int kv_group   = n_head / n_kv_head;
+    const unsigned int n_subgroup = kv_group / HGP_G;
+    const unsigned int kv_head    = blockIdx.x / n_subgroup;
+    const unsigned int subgroup   = blockIdx.x % n_subgroup;
+    const unsigned int qt         = blockIdx.y;
+    if (kv_head >= n_kv_head) return;
+
+    const unsigned int q_row_base = qt * HG_BR;
+    if (q_row_base >= batch) return;
+    const unsigned int n_rows = (batch - q_row_base < HG_BR) ? (batch - q_row_base) : HG_BR;
+    const unsigned int hd = head_dim;              // == WFD
+    const unsigned int h0 = kv_head * kv_group + subgroup * HGP_G;
+
+    const unsigned long long kvh_off    = (unsigned long long)kv_head * hd;
+    const unsigned long long row_stride = (unsigned long long)n_kv_head * hd;
+
+    __shared__ _Float16 Qs[HGP_G * HG_BR * HGP_QSTRIDE];
+    __shared__ _Float16 Ks[HG_BC * HGP_KSTRIDE];
+    __shared__ _Float16 Vs[HG_BC * HGP_VSTRIDE];
+    __shared__ _Float16 Ps[HGP_G * HG_BR * HGP_PSTRIDE];
+    __shared__ float    Sp[HGP_G * HG_BR * HG_BC];
+    __shared__ float    m_s[HGP_G * HG_BR];
+    __shared__ float    l_s[HGP_G * HG_BR];
+    __shared__ float    corr_s[HGP_G * HG_BR];
+
+    gqa_float8 O_reg[HGP_G];
+    #pragma unroll
+    for (unsigned int g = 0; g < HGP_G; ++g)
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) O_reg[g][e] = 0.0f;
+
+    for (unsigned int p = tid; p < HGP_G * HG_BR * WFD; p += HG_BLOCK) {
+        const unsigned int g = p / (HG_BR * WFD);
+        const unsigned int r = (p / WFD) % HG_BR;
+        const unsigned int d = p % WFD;
+        const unsigned int qsp = g * HG_BR * HGP_QSTRIDE + r * HGP_QSTRIDE + d;
+        if (r < n_rows && d < hd) {
+            Qs[qsp] = q[((unsigned long long)(q_row_base + r) * n_head + (h0 + g)) * hd + d];
+        } else {
+            Qs[qsp] = (_Float16)0.0f;
+        }
+    }
+    for (unsigned int p = tid; p < HGP_G * HG_BR * HGP_PSTRIDE; p += HG_BLOCK) Ps[p] = (_Float16)0.0f;
+    for (unsigned int p = tid; p < HGP_G * HG_BR; p += HG_BLOCK) { m_s[p] = -INFINITY; l_s[p] = 0.0f; corr_s[p] = 0.0f; }
+    __syncthreads();
+
+    const unsigned int max_q_abs   = q_offset + q_row_base + n_rows - 1u;
+    const unsigned int n_key_tiles = max_q_abs / HG_BC + 1u;
+    const unsigned int min_q_abs   = q_offset + q_row_base;
+    const unsigned int win_lo      = (swa_window != 0u && min_q_abs + 1u > swa_window)
+                                       ? (min_q_abs + 1u - swa_window) : 0u;
+    const unsigned int kt_start    = win_lo / HG_BC;
+
+    constexpr unsigned int KVPT = (HG_BC * WFD) / HG_BLOCK;   // regs/thread per K,V
+#ifndef ATTN_PREFETCH_DEPTH
+#define ATTN_PREFETCH_DEPTH 2
+#endif
+    constexpr unsigned int PFD  = ATTN_PREFETCH_DEPTH;
+    _Float16 kbuf[PFD][KVPT];
+    _Float16 vbuf[PFD][KVPT];
+    #define ATTN_LOAD_TILE_REG_P(SLOT, KT) do {                                      \
+        const unsigned int _kbase = (KT) * HG_BC;                                    \
+        _Pragma("unroll")                                                            \
+        for (unsigned int _i = 0; _i < KVPT; ++_i) {                                 \
+            const unsigned int _p  = tid + _i * HG_BLOCK;                            \
+            const unsigned int _j  = _p / WFD;                                       \
+            const unsigned int _d  = _p % WFD;                                       \
+            const unsigned int _kg = _kbase + _j;                                    \
+            if (_kg < n_kv_total && _d < hd) {                                       \
+                const unsigned long long _off =                                      \
+                    (unsigned long long)(_kg % kv_capacity) * row_stride + kvh_off + _d; \
+                kbuf[SLOT][_i] = k_cache[_off];                                      \
+                vbuf[SLOT][_i] = v_cache[_off];                                      \
+            } else { kbuf[SLOT][_i] = (_Float16)0.0f; vbuf[SLOT][_i] = (_Float16)0.0f; } \
+        }                                                                            \
+    } while (0)
+
+    #pragma unroll
+    for (unsigned int _pf = 0; _pf < PFD; ++_pf) {
+        if (kt_start + _pf < n_key_tiles) ATTN_LOAD_TILE_REG_P(_pf, kt_start + _pf);
+    }
+
+    for (unsigned int kt = kt_start; kt < n_key_tiles; kt++) {
+        #pragma unroll
+        for (unsigned int _i = 0; _i < KVPT; ++_i) {
+            const unsigned int _p = tid + _i * HG_BLOCK;
+            const unsigned int _j = _p / WFD;
+            const unsigned int _d = _p % WFD;
+            Ks[_j * HGP_KSTRIDE + _d] = kbuf[0][_i];
+            Vs[_j * HGP_VSTRIDE + _d] = vbuf[0][_i];
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (unsigned int _s = 0; _s + 1u < PFD; ++_s) {
+            #pragma unroll
+            for (unsigned int _i = 0; _i < KVPT; ++_i) {
+                kbuf[_s][_i] = kbuf[_s + 1u][_i];
+                vbuf[_s][_i] = vbuf[_s + 1u][_i];
+            }
+        }
+        if (kt + PFD < n_key_tiles) ATTN_LOAD_TILE_REG_P(PFD - 1u, kt + PFD);
+
+        const unsigned int key_base = kt * HG_BC;
+
+        // --- SCORE for every head. 12 (head,col-tile) wave-tasks over 8 waves
+        //     (waves 0-3 run 2 tasks, 4-7 run 1). ---
+        for (unsigned int task = wave; task < HGP_G * 2u; task += 8u) {
+            const unsigned int g  = task >> 1;     // 0..HGP_G-1
+            const unsigned int ct = task & 1u;     // col-tile 0..1
+            const _Float16 *Qg = Qs + (unsigned long long)g * HG_BR * HGP_QSTRIDE;
+            gqa_float8 sacc = {0,0,0,0,0,0,0,0};
+            #pragma unroll
+            for (unsigned int ks = 0; ks < WFD; ks += 16u) {   // 8 k-steps
+                gqa_half8 qf, kf;
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned int row = (lane & 15u);
+                    const unsigned int d   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                    qf[e] = Qg[row * HGP_QSTRIDE + d];
+                }
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned int krow = ct * 16u + (lane & 15u);
+                    const unsigned int d    = ks + (lane >> 4) * 8u + (unsigned int)e;
+                    kf[e] = Ks[krow * HGP_KSTRIDE + d];
+                }
+                sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(qf, kf, sacc);
+            }
+            float *Spg = Sp + (unsigned long long)g * HG_BR * HG_BC;
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const unsigned int i = (lane >> 4) * 8u + (unsigned int)e;   // row 0..15
+                const unsigned int j = ct * 16u + (lane & 15u);
+                float s = -INFINITY;
+                if (i < n_rows) {
+                    const unsigned int q_abs   = q_offset + q_row_base + i;
+                    const unsigned int key_abs = key_base + j;
+                    const bool in_win = (swa_window == 0u) || (key_abs + swa_window > q_abs);
+                    if (key_abs <= q_abs && key_abs < n_kv_total && in_win) s = sacc[e] * scale;
+                }
+                Spg[i * HG_BC + j] = s;
+            }
+        }
+        __syncthreads();
+
+        // --- Online-softmax stats: 4 lanes per (head,row); 384 slots over 256
+        //     threads (thread tid also runs slot tid+256 for tasks 64-95). ---
+        for (unsigned int slot = tid; slot < HGP_G * HG_BR * 4u; slot += HG_BLOCK) {
+            const unsigned int task    = slot >> 2;        // 0..HGP_G*HG_BR-1
+            const unsigned int quarter = slot & 3u;        // 0..3
+            const unsigned int g = task / HG_BR;
+            const unsigned int i = task % HG_BR;
+            if (i < n_rows) {
+                float *Spg = Sp + (unsigned long long)g * HG_BR * HG_BC;
+                _Float16 *Psg = Ps + (unsigned long long)g * HG_BR * HGP_PSTRIDE;
+                const unsigned int c0 = quarter * (HG_BC / 4u);   // 8 cols/lane
+                float lmax = -INFINITY;
+                #pragma unroll
+                for (unsigned int j = 0; j < HG_BC / 4u; j++) {
+                    const float v = Spg[i*HG_BC + c0 + j];
+                    if (v > lmax) lmax = v;
+                }
+                lmax = fmaxf(lmax, __shfl_xor(lmax, 1));
+                lmax = fmaxf(lmax, __shfl_xor(lmax, 2));
+                const float tmax  = lmax;
+                const float m_old = m_s[g*HG_BR+i];
+                const float m_new = fmaxf(m_old, tmax);
+                float corr, lsum = 0.0f;
+                if (m_new == -INFINITY) {
+                    corr = 1.0f;
+                    #pragma unroll
+                    for (unsigned int j = 0; j < HG_BC / 4u; j++) Psg[i*HGP_PSTRIDE + c0 + j] = (_Float16)0.0f;
+                } else {
+                    corr = expf(m_old - m_new);
+                    #pragma unroll
+                    for (unsigned int j = 0; j < HG_BC / 4u; j++) {
+                        const float sij = Spg[i*HG_BC + c0 + j];
+                        const float p = (sij == -INFINITY) ? 0.0f : expf(sij - m_new);
+                        Psg[i*HGP_PSTRIDE + c0 + j] = (_Float16)p;
+                        lsum += p;
+                    }
+                }
+                lsum += __shfl_xor(lsum, 1);
+                lsum += __shfl_xor(lsum, 2);
+                if (quarter == 0u) {
+                    l_s[g*HG_BR+i]    = l_s[g*HG_BR+i] * corr + lsum;
+                    m_s[g*HG_BR+i]    = m_new;
+                    corr_s[g*HG_BR+i] = corr;
+                }
+            }
+        }
+        __syncthreads();
+
+        // --- AV: O_reg[g] = O_reg[g]·corr + P[g]·V. Wave = d-tile (0..7), loops
+        //     all HGP_G heads. O stays in registers. ---
+        {
+            const unsigned int dt = wave;          // d-tile 0..7
+            #pragma unroll
+            for (unsigned int g = 0; g < HGP_G; ++g) {
+                _Float16 *Psg = Ps + (unsigned long long)g * HG_BR * HGP_PSTRIDE;
+                const float *crg = corr_s + (unsigned long long)g * HG_BR;
+                gqa_float8 oacc;
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const unsigned int i = (lane >> 4) * 8u + (unsigned int)e;
+                    oacc[e] = O_reg[g][e] * crg[i];
+                }
+                #pragma unroll
+                for (unsigned int ks = 0; ks < HG_BC; ks += 16u) {   // 2 k-steps
+                    gqa_half8 pf, vf;
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const unsigned int prow = (lane & 15u);
+                        const unsigned int jj   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                        pf[e] = Psg[prow * HGP_PSTRIDE + jj];
+                    }
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const unsigned int jj   = ks + (lane >> 4) * 8u + (unsigned int)e;
+                        const unsigned int dcol = dt * 16u + (lane & 15u);
+                        vf[e] = Vs[jj * HGP_VSTRIDE + dcol];
+                    }
+                    oacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(pf, vf, oacc);
+                }
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) O_reg[g][e] = oacc[e];
+            }
+        }
+        __syncthreads();
+    }
+
+    // --- Normalise + write out from register-O. ---
+    {
+        const unsigned int dt = wave;
+        #pragma unroll
+        for (unsigned int g = 0; g < HGP_G; ++g) {
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const unsigned int i = (lane >> 4) * 8u + (unsigned int)e;
+                const unsigned int d = dt * 16u + (lane & 15u);
+                if (i < n_rows) {
+                    const float l = l_s[g*HG_BR+i];
+                    const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
+                    out[((unsigned long long)(q_row_base + i) * n_head + (h0 + g)) * hd + d] = O_reg[g][e] * inv;
+                }
+            }
+        }
+    }
+#endif
+}
+
+// =============================================================================
+// SPLIT-KV DECODE ("flash decoding") — the fix for single-query decode at long
+// context. The existing gqa_attn_prefill_flash at batch=1 launches only
+// (n_head) workgroups, each of which marches SERIALLY through n_kv/32 key
+// tiles — at 32K that's 1024 serial iterations per WG with only ~48-72 WGs on a
+// 64-CU dGPU (catastrophic occupancy + latency). Measured 82.9% of decode wall
+// and ~9x over the KV-read roofline.
+//
+// Split-KV partitions the causal history across `n_splits` workgroups per head
+// (grid.z), each computing a PARTIAL online-softmax (running max m, denom l,
+// unnormalised accumulator O[d]) over its own key slice. A tiny combine kernel
+// then merges the partials with the standard flash rescale. This raises the WG
+// count from n_head to n_head*n_splits (fills the GPU) and cuts each WG's serial
+// key-tile chain by n_splits. Numerics are the identical flash recurrence, just
+// reassociated across splits — bit-comparable to the reference within f32 order.
+//
+// Layout:
+//   q:          f16 [n_head, head_dim]
+//   k/v_cache:  f16 [n_kv, n_kv_head, head_dim]
+//   out_partial:f32 [n_head, n_splits, head_dim]   (unnormalised acc)
+//   m_partial:  f32 [n_head, n_splits]             (running max)
+//   l_partial:  f32 [n_head, n_splits]             (softmax denom)
+//   grid: (n_head, n_splits, 1)   block: (DEC_BLOCK == head_dim == 128)
+// =============================================================================
+#define DEC_FBC   32u    // keys staged per tile
+#define DEC_FD    128u   // head_dim (Laguna) — also the block size
+#define DEC_BLOCK 128u
+// Keys staged per tile for the HEAD-GROUPED decode kernel. Overridable via
+// -DDEC_FBC_HG=64u (build.rs DEEPSTRIX_KERNEL_CFLAGS) to HALVE the barrier
+// count per key (bigger tile → more score/AV compute between each
+// __syncthreads). MUST be a multiple of 32 (the score phase sub-tiles the
+// tile into 32-key chunks mapped 4 lanes/key over the 128-thread block).
+#ifndef DEC_FBC_HG
+#define DEC_FBC_HG 32u
+#endif
+
+extern "C" __global__ __launch_bounds__(DEC_BLOCK)
+void gqa_attn_decode_partial(
+        float          * __restrict__ out_partial,  // [n_head, n_splits, head_dim]
+        float          * __restrict__ m_partial,    // [n_head, n_splits]
+        float          * __restrict__ l_partial,    // [n_head, n_splits]
+        const _Float16 * __restrict__ q,            // [n_head, head_dim]
+        const _Float16 * __restrict__ k_cache,      // [n_kv, n_kv_head, head_dim]
+        const _Float16 * __restrict__ v_cache,      // [n_kv, n_kv_head, head_dim]
+        unsigned int     n_head,
+        unsigned int     n_kv_head,
+        unsigned int     head_dim,
+        unsigned int     n_kv,
+        unsigned int     n_splits,
+        float            scale,
+        unsigned int     k_base,        // absolute position of relative key 0 (SWA window start)
+        unsigned int     kv_capacity) { // ring size: physical row = (k_base+key_g) % kv_capacity
+    const unsigned int h   = blockIdx.x;
+    const unsigned int s   = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    if (h >= n_head || s >= n_splits) return;
+    const unsigned int hd = head_dim;  // == DEC_FD for Laguna
+
+    const unsigned int kv_group = n_head / n_kv_head;
+    const unsigned int kv_head  = h / kv_group;
+    const unsigned long long kvh_off    = (unsigned long long)kv_head * hd;
+    const unsigned long long row_stride = (unsigned long long)n_kv_head * hd;
+
+    // This split's contiguous key range [k0, k1).
+    const unsigned int per = (n_kv + n_splits - 1u) / n_splits;
+    const unsigned int k0  = s * per;
+    const unsigned int k1  = (k0 + per < n_kv) ? (k0 + per) : n_kv;
+
+    __shared__ float    Qs[DEC_FD];
+    __shared__ _Float16 Ks[DEC_FBC * DEC_FD];
+    __shared__ _Float16 Vs[DEC_FBC * DEC_FD];
+    __shared__ float    Sp[DEC_FBC];
+    __shared__ float    m_s;
+    __shared__ float    l_s;
+    __shared__ float    corr_s;
+
+    // Stage the query (one dim per thread; block == head_dim).
+    if (tid < hd) Qs[tid] = (float)q[(unsigned long long)h * hd + tid];
+    float accd = 0.0f;                 // thread `tid` owns output dim `tid`
+    if (tid == 0) { m_s = -INFINITY; l_s = 0.0f; }
+    __syncthreads();
+
+    if (k0 < k1) {
+        for (unsigned int kb = k0; kb < k1; kb += DEC_FBC) {
+            // --- stage K/V tile into LDS (all threads, coalesced) ---
+            for (unsigned int p = tid; p < DEC_FBC * hd; p += DEC_BLOCK) {
+                const unsigned int j = p / hd;
+                const unsigned int d = p % hd;
+                const unsigned int key_g = kb + j;
+                if (key_g < k1) {
+                    // Ring-buffer physical row: absolute pos = k_base + key_g (key_g is
+                    // relative to the window start). Identity for global (k_base=0,
+                    // kv_capacity=max_kv). key_g/k0/k1 stay relative for the split math.
+                    const unsigned long long off = (unsigned long long)((k_base + key_g) % kv_capacity) * row_stride + kvh_off + d;
+                    Ks[p] = k_cache[off];
+                    Vs[p] = v_cache[off];
+                } else {
+                    Ks[p] = (_Float16)0.0f;
+                    Vs[p] = (_Float16)0.0f;
+                }
+            }
+            __syncthreads();
+
+            // --- scores: one thread per key (DEC_FBC <= DEC_BLOCK) ---
+            const unsigned int n_keys = (kb + DEC_FBC < k1) ? DEC_FBC : (k1 - kb);
+            if (tid < DEC_FBC) {
+                if (tid < n_keys) {
+                    const _Float16 *kr = Ks + (unsigned long long)tid * hd;
+                    // 8-way ILP dot to break the dependent-fma latency chain.
+                    float a0=0,a1=0,a2=0,a3=0,a4=0,a5=0,a6=0,a7=0;
+                    unsigned int d = 0;
+                    for (; d + 8u <= hd; d += 8u) {
+                        a0 += Qs[d]     * (float)kr[d];
+                        a1 += Qs[d + 1] * (float)kr[d + 1];
+                        a2 += Qs[d + 2] * (float)kr[d + 2];
+                        a3 += Qs[d + 3] * (float)kr[d + 3];
+                        a4 += Qs[d + 4] * (float)kr[d + 4];
+                        a5 += Qs[d + 5] * (float)kr[d + 5];
+                        a6 += Qs[d + 6] * (float)kr[d + 6];
+                        a7 += Qs[d + 7] * (float)kr[d + 7];
+                    }
+                    float acc = ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7));
+                    for (; d < hd; d++) acc += Qs[d] * (float)kr[d];
+                    Sp[tid] = acc * scale;
+                } else {
+                    Sp[tid] = -INFINITY;
+                }
+            }
+            __syncthreads();
+
+            // --- online-softmax merge of this tile (thread 0, DEC_FBC scalars) ---
+            if (tid == 0) {
+                float tmax = -INFINITY;
+                for (unsigned int j = 0; j < n_keys; j++) if (Sp[j] > tmax) tmax = Sp[j];
+                const float m_old = m_s;
+                const float m_new = fmaxf(m_old, tmax);
+                const float corr  = (m_old == -INFINITY) ? 1.0f : expf(m_old - m_new);
+                float rsum = 0.0f;
+                for (unsigned int j = 0; j < DEC_FBC; j++) {
+                    const float sij = Sp[j];
+                    const float p = (sij == -INFINITY) ? 0.0f : expf(sij - m_new);
+                    Sp[j] = p;
+                    rsum += p;
+                }
+                l_s    = l_s * corr + rsum;
+                m_s    = m_new;
+                corr_s = corr;
+            }
+            __syncthreads();
+
+            // --- output accumulate: acc[d] = acc[d]*corr + sum_j P_j * V_j[d] ---
+            if (tid < hd) {
+                const float corr = corr_s;
+                float o = 0.0f;
+                #pragma unroll
+                for (unsigned int j = 0; j < DEC_FBC; j++) {
+                    o += Sp[j] * (float)Vs[(unsigned long long)j * hd + tid];
+                }
+                accd = accd * corr + o;
+            }
+            __syncthreads();
+        }
+    }
+
+    // --- write this split's UNNORMALISED partial + (m, l) ---
+    const unsigned long long po = ((unsigned long long)h * n_splits + s) * hd;
+    if (tid < hd) out_partial[po + tid] = accd;
+    if (tid == 0) {
+        m_partial[(unsigned long long)h * n_splits + s] = m_s;
+        l_partial[(unsigned long long)h * n_splits + s] = l_s;
+    }
+}
+
+// =============================================================================
+// HEAD-GROUPED SPLIT-KV DECODE — the GQA-aware fix for gqa_attn_decode_partial.
+//
+// The per-head split kernel above launches one WG per (query_head, split). The
+// 6 or 9 query heads that share a single KV head each re-read that KV head's
+// K/V from DRAM independently (kv_group-fold redundant DRAM traffic), and its
+// score phase uses only DEC_FBC(=32) of the 128 threads. Since long-context
+// decode attention is bound by K/V DRAM bandwidth, that redundancy is the pole.
+//
+// This kernel launches one WG per (KV_head, split): grid (n_kv_head, n_splits).
+// Each WG stages the K/V tile into LDS ONCE and computes ALL kv_group query
+// heads that map to this KV head from it — killing the redundant DRAM reads
+// (K/V read exactly once per KV head per split). The score phase uses all 128
+// threads (4 lanes per key × 32 keys, a per-4-lane shuffle reduction), and the
+// per-head running softmax state + unnormalised accumulator live in LDS so they
+// persist across key tiles while the head loop stays INNERMOST (the K/V LDS
+// tile is reused across the whole group).
+//
+// Output layout is IDENTICAL to gqa_attn_decode_partial (indexed by the derived
+// query head `kh*kv_group + g`), so gqa_attn_decode_combine merges these
+// partials unchanged. Numerically the identical online-softmax flash recurrence;
+// only the per-key dot is reassociated (4-lane f32 sum vs the 8-way single-lane
+// ILP), a ULP-level difference.
+//
+//   grid: (n_kv_head, n_splits, 1)   block: (DEC_BLOCK == head_dim == 128)
+//   LDS (kv_group<=DEC_KVG_MAX): Qs+Os (2*12*128 f32=12KB) + Ks+Vs (2*32*128
+//   f16=16KB) + Sp/m/l/corr ~ 28.4 KB → 2 WG/CU on a 64 KB CU.
+// =============================================================================
+#define DEC_KVG_MAX 12u   // max kv_group (Laguna SWA = 72/8 = 9)
+
+template<bool FP8> static __device__ __forceinline__
+void gqa_attn_decode_partial_hg_core(
+        float          * __restrict__ out_partial,  // [n_head, n_splits, head_dim]
+        float          * __restrict__ m_partial,    // [n_head, n_splits]
+        float          * __restrict__ l_partial,    // [n_head, n_splits]
+        const _Float16 * __restrict__ q,            // [n_head, head_dim]
+        const void     * __restrict__ k_cache_v,    // f16 or e4m3fn [n_kv, n_kv_head, head_dim]
+        const void     * __restrict__ v_cache_v,
+        const float    * __restrict__ k_scale,      // [n_kv, n_kv_head] (FP8 only)
+        const float    * __restrict__ v_scale,
+        unsigned int     n_head,
+        unsigned int     n_kv_head,
+        unsigned int     head_dim,
+        unsigned int     n_kv,
+        unsigned int     n_splits,
+        float            scale,
+        unsigned int     k_base,        // absolute position of relative key 0 (SWA window start)
+        unsigned int     kv_capacity) { // ring size: physical row = (k_base+key_g) % kv_capacity
+    const _Float16      * __restrict__ k_cache = (const _Float16*)k_cache_v;
+    const _Float16      * __restrict__ v_cache = (const _Float16*)v_cache_v;
+    const unsigned char * __restrict__ k_cache8 = (const unsigned char*)k_cache_v;
+    const unsigned char * __restrict__ v_cache8 = (const unsigned char*)v_cache_v;
+    const unsigned int kh  = blockIdx.x;   // KV head
+    const unsigned int s   = blockIdx.y;   // split
+    const unsigned int tid = threadIdx.x;
+    if (kh >= n_kv_head || s >= n_splits) return;
+    const unsigned int hd = head_dim;      // == DEC_FD for Laguna
+    const unsigned int kv_group = n_head / n_kv_head;  // 6 or 9
+
+    const unsigned long long kvh_off    = (unsigned long long)kh * hd;
+    const unsigned long long row_stride = (unsigned long long)n_kv_head * hd;
+
+    // This split's contiguous key range [k0, k1).
+    const unsigned int per = (n_kv + n_splits - 1u) / n_splits;
+    const unsigned int k0  = s * per;
+    const unsigned int k1  = (k0 + per < n_kv) ? (k0 + per) : n_kv;
+
+    // Qs stored f16 (the query IS f16 in DRAM; (float)-widening at read is
+    // exact → bit-identical) to shave DEC_KVG_MAX*DEC_FD*2 = 3 KB more LDS and,
+    // with Os in registers, drop the tile under the 3-WG/CU LDS threshold.
+    // DEC_LDS_SWZ: zero-extra-LDS conflict swizzle. The quantized path's staging
+    // store owns 32 B per lane (half16) — the ring holds DEQUANTIZED f16, not the
+    // raw 1-B codes, so the per-lane LDS byte stride is 32 whether the DRAM format
+    // is int8 or e4m3; this analysis is format-invariant and the e4m3->int8 swap
+    // did not perturb it → per-lane byte stride 32 → the b128 sub-store's bank quad
+    // (block%8) repeats every 4 lanes → 8-way LDS bank conflict (f16 owns 16 B →
+    // 4-way, the 32-lane b128 floor). We XOR each 16-B LDS block index by a
+    // function of its high bits so the 8 colliding lanes fan out across all 8 bank
+    // quads → 4-way = f16 parity. Bijective + block-granular → b128 stays 16-B
+    // aligned and numerics are bit-identical (pure LDS relocation). Same skew is
+    // applied to EVERY Ks/Vs store AND read (below).
+    //
+    // DEFAULT ON: bit-identical, zero extra LDS, measured neutral where the
+    // kernel is not conflict-limited (f16 e2e decode at 4K/32K/128K all within
+    // +0.2%) and +3.0% at 192K.
+    //
+    // It patches only the DEFAULT b128+prefetch staging store, while the reads
+    // are swizzled unconditionally — so it MUST auto-disable on the opt-in
+    // OFF/NARROW store paths (whose stores are unpatched) or store and read
+    // would disagree. Auto-disable rather than #error: those flags are A/B
+    // fallbacks and have to keep building now that the swizzle is the default.
+#if defined(ATTN_KV_PREFETCH_OFF) || defined(DEC_KV_LOAD_NARROW)
+#undef  DEC_LDS_SWZ
+#define DEC_LDS_SWZ 0
+#endif
+#ifndef DEC_LDS_SWZ
+#define DEC_LDS_SWZ 1
+#endif
+#if DEC_LDS_SWZ
+#define DEC_BLK(b) ((b) ^ (((b) >> 3) & 7u))   // logical 16-B block -> physical
+#else
+#define DEC_BLK(b) (b)
+#endif
+    __shared__ _Float16 Qs[DEC_KVG_MAX * DEC_FD];
+    __shared__ _Float16 Ks[DEC_FBC_HG * DEC_FD];
+    __shared__ _Float16 Vs[DEC_FBC_HG * DEC_FD];
+    __shared__ float    Sp[DEC_KVG_MAX * DEC_FBC_HG];   // per-head score tile
+    __shared__ float    m_s[DEC_KVG_MAX];
+    __shared__ float    l_s[DEC_KVG_MAX];
+    __shared__ float    corr_s[DEC_KVG_MAX];
+
+    // Per-head output accumulator lives in REGISTERS, not LDS: Os[g][d] is
+    // touched ONLY by the thread that owns dim d (tid==d) — init, the per-tile
+    // rescale-accumulate, and the final write are all thread-private. Keeping it
+    // in LDS forced a read-modify-write LDS round-trip PER TILE PER HEAD on the
+    // AV critical path (a s_wait_dscnt pole) AND cost DEC_KVG_MAX*DEC_FD*4 =
+    // 6 KB of LDS that capped occupancy at 2 WG/CU. Registers remove both.
+    // Indexed by COMPILE-TIME g (DEC_KVG_MAX-unrolled, kv_group-guarded) so it
+    // stays in VGPRs (a runtime index would spill to scratch).
+    float Oreg[DEC_KVG_MAX];
+    #pragma unroll
+    for (unsigned int g = 0; g < DEC_KVG_MAX; g++) Oreg[g] = 0.0f;
+
+    // Stage all group heads' queries.
+    if (tid < hd) {
+        for (unsigned int g = 0; g < kv_group; g++) {
+            const unsigned int qh_idx = kh * kv_group + g;
+            Qs[g * hd + tid] = q[(unsigned long long)qh_idx * hd + tid];
+        }
+    }
+    if (tid < kv_group) { m_s[tid] = -INFINITY; l_s[tid] = 0.0f; }
+    __syncthreads();
+
+    if (k0 < k1) {
+        // score-phase thread map: 4 lanes per key, 32 keys -> all 128 threads.
+        const unsigned int key = tid >> 2;   // 0..31
+        const unsigned int sub = tid & 3u;   // 0..3 (dim quarter)
+
+#ifndef ATTN_KV_PREFETCH_OFF  // prefetch is DEFAULT; -DATTN_KV_PREFETCH_OFF restores serial staging (A/B)
+        // Software-pipelined DEPTH-2 K/V prefetch: keep PFD key tiles in flight
+        // (register-resident) so multiple K/V global loads overlap this tile's
+        // score/softmax/V-accumulate compute. ATT showed decode_partial_hg
+        // stall = 47% s_wait_loadcnt (K/V load-wait); depth-1 issues only one
+        // tile ahead so a single tile's compute window (~small at B=1) can't
+        // hide the full load latency. A STATIC shift-register ring (buf[s] <-
+        // buf[s+1], compile-time indices) rotates the tiles so no dynamic-
+        // indexed register array (that spills to scratch). Bit-exact vs depth-1:
+        // only load SCHEDULING changes; bytes stored into Ks/Vs are identical.
+        // Occupancy is LDS-bound (2 WG/CU) so the extra PFD*KVPT*2 half regs are
+        // free until 256 VGPR; no second LDS tile (avoids the double-buffer trap).
+        // PACKED half2 ring buffers: each thread's KVPT_D per-tile elements are
+        // 2× the prefill's (128-thread block vs 256 → 32 halfs/tile for K AND V).
+        // A scalar `_Float16 buf[]` array is register-allocated one half per VGPR
+        // (no packing), so depth-2 (4 tiles' worth of K+V) blew past 256 VGPR and
+        // spilled 29 to scratch. Declaring the ring as a native 2-wide half vector
+        // forces 2 halfs/VGPR → HALVES the buffer VGPR footprint so depth-2 fits
+        // with Scratch=0. Consecutive _i map to consecutive keys at the same dim
+        // (tid), so pack pairs (2m, 2m+1) into lane 0/1 of entry m.
+        constexpr unsigned int KVPT_D = (DEC_FBC_HG * DEC_FD) / DEC_BLOCK;   // 32 elems/thread per K,V
+#ifndef DEC_PREFETCH_DEPTH
+#define DEC_PREFETCH_DEPTH 2
+#endif
+        // Prefetch depth is PER-FORMAT so the fp8 knob can never regress f16 (with
+        // both at 2 this folds to a constant; f16 ISA is byte-identical either way).
+        //
+        // MEASURED depth sweep (gfx1201, isolated decode kernel, back-to-back A/B,
+        // fp8 GB/s is of its own halved byte count; f16 holds 86-87% of 600 GB/s):
+        //   depth | VGPR | scratch | occ | fp8 @192K        | fp8 eff
+        //     2   | 164  |    0    |  6  | 1656 us (-7%)    | 42%   <- BEST
+        //     3   | 196  |    0    |  6  | 1630 us (-5%)    | 42%   (noise; +32 VGPR)
+        //     4   | 248  |    0    |  5  | 2011 us (-30%)   | 34%   (occupancy cliff)
+        //     5   | 256  |   92    |  5  | 2054 us (-32%)   | 33%   (SPILLS; invalid)
+        //
+        // So deeper prefetch is NOT the lever: depth 3 doubles the primed loads
+        // (8->12 b128 in the preamble) and adds a full tile of ring registers, yet
+        // achieved BW does not move off 42%. fp8 is therefore NOT MLP-starved. It is
+        // also not VALU/dequant-bound (stripping convert+scale entirely: 843->841 us
+        // @100K). What it IS: the per-tile pipeline (LDS staging + barriers + the
+        // score/AV math) is identical for both formats and does not scale with KV
+        // bytes, so halving the bytes cannot buy time — and depth 4 shows the kernel
+        // is acutely occupancy-sensitive, i.e. latency is hidden by WAVE parallelism,
+        // not per-wave MLP. Keep depth 2; raise only with a re-measure.
+#ifndef DEC_PREFETCH_DEPTH_FP8
+#define DEC_PREFETCH_DEPTH_FP8 2
+#endif
+        constexpr unsigned int PFD_D = FP8 ? DEC_PREFETCH_DEPTH_FP8 : DEC_PREFETCH_DEPTH;
+#ifdef DEC_KV_LOAD_NARROW
+        // --- FALLBACK: half2 (32-bit) scalar-underlying global loads (A/B) ---
+        constexpr unsigned int KVPT2  = KVPT_D / 2u;                       // 16 packed half2/thread
+        typedef _Float16 dec_h2 __attribute__((ext_vector_type(2)));
+        dec_h2 kbuf[PFD_D][KVPT2];
+        dec_h2 vbuf[PFD_D][KVPT2];
+        #define DEC_LOAD_ELEM(SLOT, KB, _i) do {                                         \
+            const unsigned int _p  = tid + (_i) * DEC_BLOCK;                             \
+            const unsigned int _j  = _p / hd;                                            \
+            const unsigned int _d  = _p % hd;                                            \
+            const unsigned int _kg = (KB) + _j;                                          \
+            _Float16 _kv = (_Float16)0.0f, _vv = (_Float16)0.0f;                         \
+            if (_kg < k1) {                                                              \
+                const unsigned long long _phys = (unsigned long long)((k_base + _kg) % kv_capacity); \
+                const unsigned long long _off = _phys * row_stride + kvh_off + _d;       \
+                if constexpr (FP8) {                                                     \
+                    const unsigned long long _sr = _phys * n_kv_head + kh;               \
+                    _kv = gqa_deq_fp8(k_cache8, _off, k_scale, _sr);                     \
+                    _vv = gqa_deq_fp8(v_cache8, _off, v_scale, _sr);                     \
+                } else { _kv = k_cache[_off]; _vv = v_cache[_off]; }                     \
+            }                                                                            \
+            kbuf[SLOT][(_i) >> 1][(_i) & 1u] = _kv;                                      \
+            vbuf[SLOT][(_i) >> 1][(_i) & 1u] = _vv;                                      \
+        } while (0)
+        #define DEC_LOAD_TILE_REG(SLOT, KB) do {                                         \
+            _Pragma("unroll")                                                            \
+            for (unsigned int _i = 0; _i < KVPT_D; ++_i) DEC_LOAD_ELEM(SLOT, KB, _i);    \
+        } while (0)
+
+        // Prime the pipeline: issue the first PFD tiles' loads up front.
+        #pragma unroll
+        for (unsigned int _pf = 0; _pf < PFD_D; ++_pf) {
+            const unsigned int _kb = k0 + _pf * DEC_FBC_HG;
+            if (_kb < k1) DEC_LOAD_TILE_REG(_pf, _kb);
+        }
+        for (unsigned int kb = k0; kb < k1; kb += DEC_FBC_HG) {
+            // copy the (already-loaded) K/V tile regs -> LDS (always buf[0])
+            #pragma unroll
+            for (unsigned int _i = 0; _i < KVPT_D; ++_i) {
+                const unsigned int _p = tid + _i * DEC_BLOCK;
+                Ks[_p] = kbuf[0][_i >> 1][_i & 1u]; Vs[_p] = vbuf[0][_i >> 1][_i & 1u];
+            }
+            __syncthreads();
+            // shift the register ring down: buf[s] <- buf[s+1] (static indices)
+            #pragma unroll
+            for (unsigned int _s = 0; _s + 1u < PFD_D; ++_s) {
+                #pragma unroll
+                for (unsigned int _i = 0; _i < KVPT2; ++_i) {
+                    kbuf[_s][_i] = kbuf[_s + 1u][_i];
+                    vbuf[_s][_i] = vbuf[_s + 1u][_i];
+                }
+            }
+            // issue the load for tile kb+PFD*FBC into the freed top slot NOW so
+            // its global loads overlap the whole PFD-tile compute window.
+            {
+                const unsigned int _next = kb + PFD_D * DEC_FBC_HG;
+                if (_next < k1) DEC_LOAD_TILE_REG(PFD_D - 1u, _next);
+            }
+            const unsigned int n_keys = (kb + DEC_FBC_HG < k1) ? DEC_FBC_HG : (k1 - kb);
+#else
+        // --- DEFAULT: b128 (128-bit) wide coalesced global loads ---
+        // A lane loads WELEM contiguous dims per global_load_b128 (16 B / 128-bit).
+        //   f16: WELEM=8  (8 halfs  = 16 B) → 4 b128/lane/tile for K, 4 for V.
+        //   int8: WELEM=16 (16 int8 = 16 B) → 2 b128/lane/tile for K, 2 for V.
+        // The quantized path keeps the load WIDTH at b128 (16 B) but doubles
+        // ELEMENTS/instruction, so it issues HALF the load instructions of the old
+        // 8-B (b64) path — that path had the SAME load-instruction COUNT as f16
+        // while moving half the bytes, so it never hid load latency (bytes halved,
+        // no speedup, net slower after dequant). At WELEM=16 the load count halves
+        // (the real MLP lever); the dequant is a plain int8->f32 widen + scale.
+        // With PFD_D=2 depth-2 prefetch, loads stay in flight across the compute window.
+        // Register footprint is IDENTICAL: f16 kbuf[2][4] half8 = 32 VGPR; fp8
+        // kbuf[2][2] half16 = 32 VGPR. LDS staging kept (transposes for compute).
+        // Bit-exact vs the scalar path: same halfs, same store layout Ks[key*hd+dim];
+        // only the load WIDTH / lane→data partition changes (a __syncthreads separates
+        // load from compute, so which lane wrote which LDS slot is irrelevant).
+        // b128 needs 16-B alignment: _off is a multiple of WELEM
+        // (row_stride=n_kv_head*128, kvh_off=kh*128, _d%WELEM==0; fp8 bytes → 16-B).
+        constexpr unsigned int WELEM  = FP8 ? 16u : 8u;    // KV elems per b128 load
+        constexpr unsigned int CPK    = DEC_FD / WELEM;    // wide-chunks per key (8 fp8 / 16 f16)
+        constexpr unsigned int KVPT8  = KVPT_D / WELEM;    // b128/thread per K,V (2 fp8 / 4 f16)
+        typedef _Float16 dec_hw __attribute__((ext_vector_type(FP8 ? 16 : 8)));
+        dec_hw kbuf[PFD_D][KVPT8];
+        dec_hw vbuf[PFD_D][KVPT8];
+        // Lane t, chunk _c owns wide-chunk (t + _c*128): key = chunk/CPK, dim = WELEM*(chunk%CPK).
+        // Adjacent lanes → adjacent chunks → adjacent 16-B addresses within a key
+        // (one coalesced transaction: 16 f16-lanes / 8 fp8-lanes cover one key row).
+        #define DEC_LOAD_ELEM(SLOT, KB, _c) do {                                         \
+            const unsigned int _chunk = tid + (_c) * DEC_BLOCK;                          \
+            const unsigned int _j  = _chunk / CPK;                                       \
+            const unsigned int _d  = (_chunk % CPK) * WELEM;                             \
+            const unsigned int _kg = (KB) + _j;                                          \
+            dec_hw _kv = {}, _vv = {};                                                   \
+            if (_kg < k1) {                                                              \
+                const unsigned long long _phys = (unsigned long long)((k_base + _kg) % kv_capacity); \
+                const unsigned long long _off = _phys * row_stride + kvh_off + _d;       \
+                if constexpr (FP8) {                                                     \
+                    /* int8: all WELEM=16 dims are within ONE key (_j), so they share   */\
+                    /* the (_phys, kh) scale. _off is a multiple of 16 (row_stride,     */\
+                    /* kvh_off, _d all %16==0) → the 16 int8 bytes are ONE b128         */\
+                    /* COALESCED load; packed helper widens 2 int8/call.                */\
+                    const unsigned long long _sr = _phys * n_kv_head + kh;               \
+                    const float _ksc = k_scale[_sr];                                     \
+                    const float _vsc = v_scale[_sr];                                     \
+                    typedef unsigned char fp8x16 __attribute__((ext_vector_type(16)));   \
+                    const fp8x16 _kw = *(const fp8x16 *)(k_cache8 + _off);               \
+                    const fp8x16 _vw = *(const fp8x16 *)(v_cache8 + _off);               \
+                    const unsigned short *_kp = (const unsigned short *)&_kw;            \
+                    const unsigned short *_vp = (const unsigned short *)&_vw;            \
+                    _Pragma("unroll")                                                    \
+                    for (unsigned int _e = 0; _e < 8u; ++_e) {                           \
+                        const gqa_v2f _rk = gqa_fp8x2_to_f32(_kp[_e]);                   \
+                        const gqa_v2f _rv = gqa_fp8x2_to_f32(_vp[_e]);                   \
+                        _kv[2u*_e]      = (_Float16)(_rk[0] * _ksc);                     \
+                        _kv[2u*_e + 1u] = (_Float16)(_rk[1] * _ksc);                     \
+                        _vv[2u*_e]      = (_Float16)(_rv[0] * _vsc);                     \
+                        _vv[2u*_e + 1u] = (_Float16)(_rv[1] * _vsc);                     \
+                    }                                                                    \
+                } else {                                                                \
+                    _kv = *(const dec_hw *)(k_cache + _off);                             \
+                    _vv = *(const dec_hw *)(v_cache + _off);                             \
+                }                                                                        \
+            }                                                                            \
+            kbuf[SLOT][_c] = _kv;                                                        \
+            vbuf[SLOT][_c] = _vv;                                                        \
+        } while (0)
+        #define DEC_LOAD_TILE_REG(SLOT, KB) do {                                         \
+            _Pragma("unroll")                                                            \
+            for (unsigned int _c = 0; _c < KVPT8; ++_c) DEC_LOAD_ELEM(SLOT, KB, _c);     \
+        } while (0)
+
+        // Prime the pipeline: issue the first PFD tiles' loads up front.
+        #pragma unroll
+        for (unsigned int _pf = 0; _pf < PFD_D; ++_pf) {
+            const unsigned int _kb = k0 + _pf * DEC_FBC_HG;
+            if (_kb < k1) DEC_LOAD_TILE_REG(_pf, _kb);
+        }
+        for (unsigned int kb = k0; kb < k1; kb += DEC_FBC_HG) {
+            // copy the (already-loaded) K/V tile regs -> LDS (always buf[0]) as b128.
+            // chunk*WELEM == key*hd + dim, so the store lands at Ks[key*hd+dim] (16-B aligned).
+            // Store each chunk as BLKPC 16-B blocks (1 for f16, 2 for fp8), each
+            // relocated by DEC_BLK. logical block = key*(hd/8) + dim/8 + _b, which
+            // equals _chunk*WELEM/8 + _b → at DEC_LDS_SWZ==0 this is the identical
+            // contiguous b128 store. gqa_half8 == one 16-B block.
+            constexpr unsigned int BLKPC = WELEM / 8u;   // 1 (f16) or 2 (fp8)
+            #pragma unroll
+            for (unsigned int _c = 0; _c < KVPT8; ++_c) {
+                const unsigned int _blk0 = (tid + _c * DEC_BLOCK) * (WELEM / 8u);
+                const gqa_half8 *_kp = (const gqa_half8 *)&kbuf[0][_c];
+                const gqa_half8 *_vp = (const gqa_half8 *)&vbuf[0][_c];
+                #pragma unroll
+                for (unsigned int _b = 0; _b < BLKPC; ++_b) {
+                    *(gqa_half8 *)(Ks + DEC_BLK(_blk0 + _b) * 8u) = _kp[_b];
+                    *(gqa_half8 *)(Vs + DEC_BLK(_blk0 + _b) * 8u) = _vp[_b];
+                }
+            }
+            __syncthreads();
+            // shift the register ring down: buf[s] <- buf[s+1] (static indices)
+            #pragma unroll
+            for (unsigned int _s = 0; _s + 1u < PFD_D; ++_s) {
+                #pragma unroll
+                for (unsigned int _c = 0; _c < KVPT8; ++_c) {
+                    kbuf[_s][_c] = kbuf[_s + 1u][_c];
+                    vbuf[_s][_c] = vbuf[_s + 1u][_c];
+                }
+            }
+            // issue the load for tile kb+PFD*FBC into the freed top slot NOW so
+            // its b128 global loads overlap the whole PFD-tile compute window.
+            {
+                const unsigned int _next = kb + PFD_D * DEC_FBC_HG;
+                if (_next < k1) DEC_LOAD_TILE_REG(PFD_D - 1u, _next);
+            }
+            const unsigned int n_keys = (kb + DEC_FBC_HG < k1) ? DEC_FBC_HG : (k1 - kb);
+#endif  // DEC_KV_LOAD_NARROW
+#else   // ATTN_KV_PREFETCH_OFF
+        for (unsigned int kb = k0; kb < k1; kb += DEC_FBC_HG) {
+            // --- stage K/V tile into LDS ONCE (reused across the whole group) ---
+            for (unsigned int p = tid; p < DEC_FBC_HG * hd; p += DEC_BLOCK) {
+                const unsigned int j = p / hd;
+                const unsigned int d = p % hd;
+                const unsigned int key_g = kb + j;
+                if (key_g < k1) {
+                    // Ring-buffer physical row: absolute pos = k_base + key_g (key_g is
+                    // relative to the window start). Identity for global (k_base=0,
+                    // kv_capacity=max_kv). key_g/k0/k1 stay relative for the split math.
+                    const unsigned long long phys = (unsigned long long)((k_base + key_g) % kv_capacity);
+                    const unsigned long long off = phys * row_stride + kvh_off + d;
+                    if constexpr (FP8) {
+                        const unsigned long long srow = phys * n_kv_head + kh;
+                        Ks[p] = gqa_deq_fp8(k_cache8, off, k_scale, srow);
+                        Vs[p] = gqa_deq_fp8(v_cache8, off, v_scale, srow);
+                    } else {
+                        Ks[p] = k_cache[off];
+                        Vs[p] = v_cache[off];
+                    }
+                } else {
+                    Ks[p] = (_Float16)0.0f;
+                    Vs[p] = (_Float16)0.0f;
+                }
+            }
+            __syncthreads();
+            const unsigned int n_keys = (kb + DEC_FBC_HG < k1) ? DEC_FBC_HG : (k1 - kb);
+#endif
+
+            // --- (1) scores for ALL group heads into Sp[g][key] (no barriers:
+            //         every lane writes a distinct Sp slot). 4 lanes/key sum a
+            //         32-dim quarter, then a 4-lane xor-shuffle gives the dot. ---
+            const unsigned int d0 = sub * 32u;
+            // Sub-tile the DEC_FBC_HG-key tile into 32-key chunks (the score
+            // thread map is 4 lanes/key × 32 keys = the 128-thread block). For
+            // DEC_FBC_HG==32 this loop runs ONCE (kk==key) → bit-identical to the
+            // pre-bigtile kernel. For DEC_FBC_HG==64 it runs twice (kk = key,
+            // key+32), so ONE tile's barriers now amortise over 2× the keys.
+#ifndef ATTN_DEC_REGCACHE_OFF
+            for (unsigned int kt = 0; kt < DEC_FBC_HG; kt += 32u) {
+                const unsigned int kk = kt + key;   // 0 .. DEC_FBC_HG-1
+                // REGISTER-CACHE the 32-dim K quarter ONCE per sub-tile. Its value
+                // is IDENTICAL across the kv_group query heads (only Q differs), so
+                // the old code re-read the SAME Ks LDS slot kv_group(=6)× — that
+                // redundant non-broadcast LDS read stream is the s_wait_dscnt pole.
+                _Float16 kreg[32];
+                if (kk < n_keys) {
+                    // 32 contiguous dims = 4 16-B blocks; base block = kk*(hd/8)+d0/8.
+                    // DEC_BLK relocates each; at SWZ==0 this is the contiguous read.
+                    const unsigned int _kb0 = kk * (DEC_FD / 8u) + (d0 >> 3);
+                    #pragma unroll
+                    for (unsigned int _b = 0; _b < 4u; _b++) {
+                        const gqa_half8 _v = *(const gqa_half8 *)(Ks + DEC_BLK(_kb0 + _b) * 8u);
+                        #pragma unroll
+                        for (unsigned int e = 0; e < 8u; e++) kreg[_b * 8u + e] = _v[e];
+                    }
+                }
+                for (unsigned int g = 0; g < kv_group; g++) {
+                    float part = 0.0f;
+                    if (kk < n_keys) {
+                        const _Float16 *qg = Qs + (unsigned long long)g * hd + d0;
+                        #pragma unroll
+                        for (unsigned int dd = 0; dd < 32u; dd++) part += (float)qg[dd] * (float)kreg[dd];
+                    }
+                    part += __shfl_xor(part, 1);
+                    part += __shfl_xor(part, 2);
+                    if (sub == 0) Sp[g * DEC_FBC_HG + kk] = (kk < n_keys) ? part * scale : -INFINITY;
+                }
+            }
+#else
+            for (unsigned int kt = 0; kt < DEC_FBC_HG; kt += 32u) {
+                const unsigned int kk = kt + key;
+                for (unsigned int g = 0; g < kv_group; g++) {
+                    float part = 0.0f;
+                    if (kk < n_keys) {
+                        const _Float16 *kr = Ks + (unsigned long long)kk * hd;  // SWZ n/a (opt-in path)
+                        const _Float16 *qg = Qs + (unsigned long long)g * hd;
+                        #pragma unroll
+                        for (unsigned int dd = 0; dd < 32u; dd++) {
+                            const unsigned int d = d0 + dd;
+                            part += (float)qg[d] * (float)kr[d];
+                        }
+                    }
+                    part += __shfl_xor(part, 1);
+                    part += __shfl_xor(part, 2);
+                    if (sub == 0) Sp[g * DEC_FBC_HG + kk] = (kk < n_keys) ? part * scale : -INFINITY;
+                }
+            }
+#endif
+            __syncthreads();
+
+            // --- (2) online-softmax merge, ONE THREAD PER HEAD (parallel) ---
+            if (tid < kv_group) {
+                const unsigned int g = tid;
+                float *sp = Sp + g * DEC_FBC_HG;
+                float tmax = -INFINITY;
+                for (unsigned int j = 0; j < n_keys; j++) if (sp[j] > tmax) tmax = sp[j];
+                const float m_old = m_s[g];
+                const float m_new = fmaxf(m_old, tmax);
+                const float corr  = (m_old == -INFINITY) ? 1.0f : expf(m_old - m_new);
+                float rsum = 0.0f;
+                for (unsigned int j = 0; j < DEC_FBC_HG; j++) {
+                    const float sij = sp[j];
+                    const float p = (sij == -INFINITY) ? 0.0f : expf(sij - m_new);
+                    sp[j] = p;
+                    rsum += p;
+                }
+                l_s[g]    = l_s[g] * corr + rsum;
+                m_s[g]    = m_new;
+                corr_s[g] = corr;
+            }
+            __syncthreads();
+
+            // --- (3) V-accumulate: thread `tid` owns output dim `tid`, loops
+            //         the group heads (all 128 lanes busy, no inter-head sync) ---
+            if (tid < hd) {
+#if !defined(ATTN_DEC_REGCACHE_OFF) && (DEC_FBC_HG <= 32u)
+                // Same lever as the score: thread `tid`'s V column Vs[j*hd+tid]
+                // is IDENTICAL across the kv_group heads (only Sp/corr differ), so
+                // register-cache the 32 V elements ONCE per tile instead of the
+                // old kv_group(=6)× non-broadcast LDS re-read (the other dscnt
+                // pole). The Sp[g][j] reads that remain are LDS BROADCAST (all 128
+                // lanes hit the same address) → conflict-free/cheap. Bit-exact.
+                // Disabled for big tiles (DEC_FBC_HG>32): vreg[64] + the depth-2
+                // half8 prefetch ring would blow past 256 VGPR → scratch spill;
+                // read V from LDS instead (still ONE staged copy per KV head).
+                _Float16 vreg[DEC_FBC_HG];
+                #pragma unroll
+                for (unsigned int j = 0; j < DEC_FBC_HG; j++) {
+                    const unsigned int _h = j * DEC_FD + tid;   // logical half index
+                    vreg[j] = Vs[DEC_BLK(_h >> 3) * 8u + (_h & 7u)];
+                }
+                #pragma unroll
+                for (unsigned int g = 0; g < DEC_KVG_MAX; g++) {
+                    if (g >= kv_group) break;
+                    const float *sp = Sp + g * DEC_FBC_HG;
+                    const float corr = corr_s[g];
+                    float o = 0.0f;
+                    #pragma unroll
+                    for (unsigned int j = 0; j < DEC_FBC_HG; j++) {
+                        o += sp[j] * (float)vreg[j];
+                    }
+                    Oreg[g] = Oreg[g] * corr + o;
+                }
+#else
+                #pragma unroll
+                for (unsigned int g = 0; g < DEC_KVG_MAX; g++) {
+                    if (g >= kv_group) break;
+                    const float *sp = Sp + g * DEC_FBC_HG;
+                    const float corr = corr_s[g];
+                    float o = 0.0f;
+                    #pragma unroll
+                    for (unsigned int j = 0; j < DEC_FBC_HG; j++) {
+                        { const unsigned int _h = j * DEC_FD + tid;
+                          o += sp[j] * (float)Vs[DEC_BLK(_h >> 3) * 8u + (_h & 7u)]; }
+                    }
+                    Oreg[g] = Oreg[g] * corr + o;
+                }
+#endif
+            }
+            __syncthreads();
+        }
+    }
+
+    // --- write each group head's UNNORMALISED partial + (m, l) ---
+    // Oreg[g] is compile-time indexed (register-resident), so unroll over
+    // DEC_KVG_MAX and guard on the runtime kv_group.
+    #pragma unroll
+    for (unsigned int g = 0; g < DEC_KVG_MAX; g++) {
+        if (g >= kv_group) break;
+        const unsigned int qh_idx = kh * kv_group + g;
+        const unsigned long long po = ((unsigned long long)qh_idx * n_splits + s) * hd;
+        if (tid < hd) out_partial[po + tid] = Oreg[g];
+        if (tid == 0) {
+            m_partial[(unsigned long long)qh_idx * n_splits + s] = m_s[g];
+            l_partial[(unsigned long long)qh_idx * n_splits + s] = l_s[g];
+        }
+    }
+}
+
+// f16 (default) + fp8 e4m3fn KV wrappers around the shared decode_partial_hg core.
+extern "C" __global__ __launch_bounds__(DEC_BLOCK)
+void gqa_attn_decode_partial_hg(
+        float * __restrict__ out_partial, float * __restrict__ m_partial, float * __restrict__ l_partial,
+        const _Float16 * __restrict__ q,
+        const _Float16 * __restrict__ k_cache, const _Float16 * __restrict__ v_cache,
+        unsigned int n_head, unsigned int n_kv_head, unsigned int head_dim,
+        unsigned int n_kv, unsigned int n_splits, float scale,
+        unsigned int k_base, unsigned int kv_capacity) {
+    gqa_attn_decode_partial_hg_core<false>(out_partial, m_partial, l_partial, q,
+        k_cache, v_cache, nullptr, nullptr,
+        n_head, n_kv_head, head_dim, n_kv, n_splits, scale, k_base, kv_capacity);
+}
+extern "C" __global__ __launch_bounds__(DEC_BLOCK)
+void gqa_attn_decode_partial_hg_fp8(
+        float * __restrict__ out_partial, float * __restrict__ m_partial, float * __restrict__ l_partial,
+        const _Float16 * __restrict__ q,
+        const unsigned char * __restrict__ k_cache, const unsigned char * __restrict__ v_cache,
+        const float * __restrict__ k_scale, const float * __restrict__ v_scale,
+        unsigned int n_head, unsigned int n_kv_head, unsigned int head_dim,
+        unsigned int n_kv, unsigned int n_splits, float scale,
+        unsigned int k_base, unsigned int kv_capacity) {
+    gqa_attn_decode_partial_hg_core<true>(out_partial, m_partial, l_partial, q,
+        k_cache, v_cache, k_scale, v_scale,
+        n_head, n_kv_head, head_dim, n_kv, n_splits, scale, k_base, kv_capacity);
+}
+
+// gqa_attn_decode_combine — merge the n_splits partials for each head into the
+// final normalised output. Standard flash rescale: global max M = max_s m_s;
+// out[d] = (sum_s O_s[d] * exp(m_s - M)) / (sum_s l_s * exp(m_s - M)).
+//   grid: (n_head, 1, 1)   block: (DEC_BLOCK == head_dim)
+extern "C" __global__ __launch_bounds__(DEC_BLOCK)
+void gqa_attn_decode_combine(
+        float          * __restrict__ out,          // [n_head, head_dim]
+        const float    * __restrict__ out_partial,  // [n_head, n_splits, head_dim]
+        const float    * __restrict__ m_partial,    // [n_head, n_splits]
+        const float    * __restrict__ l_partial,    // [n_head, n_splits]
+        unsigned int     n_head,
+        unsigned int     head_dim,
+        unsigned int     n_splits) {
+    const unsigned int h   = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    if (h >= n_head) return;
+    const unsigned int hd = head_dim;
+    if (tid >= hd) return;
+
+    const unsigned long long mb = (unsigned long long)h * n_splits;
+
+    // Global max across splits (ignore empty splits: l==0 -> m==-inf anyway).
+    float M = -INFINITY;
+    for (unsigned int s = 0; s < n_splits; s++) {
+        const float m = m_partial[mb + s];
+        if (m > M) M = m;
+    }
+
+    float acc = 0.0f;
+    float L   = 0.0f;
+    for (unsigned int s = 0; s < n_splits; s++) {
+        const float m = m_partial[mb + s];
+        const float l = l_partial[mb + s];
+        if (l <= 0.0f || m == -INFINITY) continue;
+        const float w = expf(m - M);
+        L   += l * w;
+        acc += out_partial[(mb + s) * hd + tid] * w;
+    }
+    const float inv = (L > 0.0f) ? (1.0f / L) : 0.0f;
+    out[(unsigned long long)h * hd + tid] = acc * inv;
+}

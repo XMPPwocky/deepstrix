@@ -24,3 +24,7 @@ path = "src/bin/gguf_inspect.rs"
 [[bin]]
 name = "gguf-compare-llama"
 path = "src/bin/gguf_compare_llama.rs"
+
+[[bin]]
+name = "gguf-diff"
+path = "src/bin/gguf_diff.rs"

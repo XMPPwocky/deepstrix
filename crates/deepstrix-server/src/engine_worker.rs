@@ -421,8 +421,12 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         .gguf()
         .tensor("token_embd.weight")
         .ok_or_else(|| eyre!("missing token_embd.weight"))?;
-    if token_embd_t.dtype != v4flash_core::gguf::GgufType::F16 {
-        return Err(eyre!("token_embd dtype {:?} != F16", token_embd_t.dtype));
+    if !v4flash_kernels::weight_contract::TOKEN_EMBD_ALLOWED.contains(&token_embd_t.dtype) {
+        return Err(eyre!(
+            "token_embd dtype {:?} unsupported (allowed: {:?})",
+            token_embd_t.dtype,
+            v4flash_kernels::weight_contract::TOKEN_EMBD_ALLOWED
+        ));
     }
     let token_embd_bytes = gguf.read_tensor(token_embd_t)?.to_vec();
 
@@ -458,7 +462,8 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     let byte_decoder = build_gpt2_byte_decoder();
 
     // Compute model fingerprint and load (or create) the snapshot index.
-    let fingerprint = ModelFingerprint::compute(vocab.vocab_size() as u32, &token_embd_bytes);
+    let fingerprint =
+        ModelFingerprint::compute(vocab.vocab_size() as u32, &token_embd_bytes, gguf.gguf());
     if !cfg.snapshot_root.exists() {
         std::fs::create_dir_all(&cfg.snapshot_root)
             .map_err(|e| eyre!("create snapshot root {:?}: {e}", cfg.snapshot_root))?;

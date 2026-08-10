@@ -9,7 +9,8 @@ use std::env;
 use std::process::ExitCode;
 
 use color_eyre::eyre;
-use v4flash_core::gguf::{Gguf, GgufArray, GgufValue};
+use v4flash_core::gguf::{GgufArray, GgufValue};
+use v4flash_core::mapped::MappedGguf;
 
 fn main() -> ExitCode {
     color_eyre::install().ok();
@@ -34,15 +35,18 @@ fn main() -> ExitCode {
 }
 
 fn run(path: &str, show_tensors: bool, key_filter: Option<&str>) -> eyre::Result<()> {
-    let g = Gguf::open(path).map_err(|e| eyre::eyre!("{e}"))?;
+    // MappedGguf so split GGUFs (-NNNNN-of-MMMMM) inspect as one model.
+    let m = MappedGguf::open(path)?;
+    let g = m.gguf();
 
     println!("== {path} ==");
     println!("  version             {}", g.version);
     println!("  alignment           {}", g.alignment);
     println!("  n_kv                {}", g.n_kv);
     println!("  n_tensors           {}", g.n_tensors);
-    println!("  tensor_data_offset  {} (0x{:x})", g.tensor_data_offset, g.tensor_data_offset);
-    println!("  file_size           {} ({:.2} GiB)", g.file_size, g.file_size as f64 / (1u64 << 30) as f64);
+    println!("  n_shards            {}", m.n_shards());
+    println!("  tensor_data_offset  {} (0x{:x})  (shard 0)", g.tensor_data_offset, g.tensor_data_offset);
+    println!("  file_size           {} ({:.2} GiB)  (shard 0)", g.file_size, g.file_size as f64 / (1u64 << 30) as f64);
     println!("  architecture        {:?}", g.architecture());
 
     if let Some(key) = key_filter {

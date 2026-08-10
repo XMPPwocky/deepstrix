@@ -139,6 +139,94 @@ impl Q4KMatvec {
             dbpe, xq_slot_stride, n_used, n_rows, n_blocks_in
         ])
     }
+
+    /// BATCHED-over-tokens gate×up×swiglu×ew for `batch` prompt tokens in ONE
+    /// launch (`grid.z = batch`). Token-major layouts: `selected`/`expert_w`
+    /// are `[batch, n_used]`, `xq` is `[batch, n_blocks_in*292]`, and `mid` is
+    /// `[batch, n_used, n_rows]`. Identical math to `launch_pair_swiglu_batched`
+    /// per token — the win is dispatching all `batch` tokens together.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_pair_swiglu_bxn(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,
+        expert_w: &DeviceBuffer<f32>,
+        selected: &DeviceBuffer<i32>,
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks_in: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if n_rows % 8 != 0 {
+            return Err(eyre!("q4_k_pair_swiglu_bxn: n_rows={n_rows} must be %8"));
+        }
+        let need_mid = (batch as usize) * (n_used as usize) * (n_rows as usize);
+        if mid.len() < need_mid {
+            return Err(eyre!("mid len {} < batch*n_used*n_rows = {need_mid}", mid.len()));
+        }
+        if (selected.len() as u32) < batch * n_used {
+            return Err(eyre!("selected len {} < batch*n_used", selected.len()));
+        }
+        if (expert_w.len() as u32) < batch * n_used {
+            return Err(eyre!("expert_w len {} < batch*n_used", expert_w.len()));
+        }
+        let function = self.module.get_function("q4_k_pair_matvec_fused_swiglu_batch_bxn")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, n_used, batch),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(), expert_w.raw(),
+            selected.raw(), gate_bpe, up_bpe, clamp, n_rows, n_blocks_in, n_used
+        ])
+    }
+
+    /// BATCHED-over-tokens down projection: sum over `n_used` experts for each
+    /// of `batch` tokens in ONE launch (`grid.z = batch`). `selected` is
+    /// `[batch, n_used]`, `xq_base` is `[batch, n_used*xq_slot_stride]`, and
+    /// `out` is `[batch, n_rows]` (token-major).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched_bxn(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        w_base: &DeviceBuffer<u8>,
+        xq_base: &DeviceBuffer<u8>,
+        selected: &DeviceBuffer<i32>,
+        dbpe: u32,
+        xq_slot_stride: u32,
+        n_used: u32,
+        n_rows: u32,
+        n_blocks_in: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if n_rows % 8 != 0 {
+            return Err(eyre!("q4_k_matvec_par_batched_bxn: n_rows={n_rows} not %8"));
+        }
+        if out.len() < (batch as usize) * (n_rows as usize) {
+            return Err(eyre!("q4_k bxn out: len {} < batch*n_rows", out.len()));
+        }
+        if (selected.len() as u32) < batch * n_used {
+            return Err(eyre!("selected len {} < batch*n_used", selected.len()));
+        }
+        let function = self.module.get_function("q4_k_matvec_par_batched_bxn")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, 1, batch),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), w_base.raw(), xq_base.raw(), selected.raw(),
+            dbpe, xq_slot_stride, n_used, n_rows, n_blocks_in
+        ])
+    }
 }
 
 /// CPU reference port of ds4's `dev_dot_q4_K_q8_K_block` (ds4_cuda.cu:7279).

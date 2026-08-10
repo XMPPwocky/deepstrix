@@ -28,7 +28,7 @@ use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::{weights, oracle::ActivationDump, Q8_0GroupedMatvec, Q8_0Matvec};
 
 const MODEL_PATH: &str =
-    "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf";
+    "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf";
 
 const N_LAYER: i32 = 43;
 const N_GROUPS: u32 = 8;

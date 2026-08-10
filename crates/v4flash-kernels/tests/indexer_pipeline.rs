@@ -33,6 +33,13 @@ use v4flash_kernels::{
     RopeParams, RopeTail, INDEXER_HEAD_DIM, INDEXER_N_HEAD, INDEXER_TOP_K,
 };
 
+// DELIBERATELY still the May checkpoint, unlike every other test (which moved
+// to `-0731` in Aug 2026). This test is the sole consumer of the long-context
+// dump `reference/v4flash-cpu-long`, which is 692 GB / 11M tensors and was
+// produced from the May weights. An oracle dump only validates against the
+// weights it was dumped from, so this MODEL_PATH must match the dump, and
+// regenerating a 692 GB dump does not fit alongside the existing one on a
+// 1.9T volume. Flip this only together with regenerating that dump.
 const MODEL_PATH: &str =
     "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf";
 

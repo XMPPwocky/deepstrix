@@ -24,6 +24,14 @@ This is the immutable baseline. Every Phase 1 milestone (M2+) validates ported k
 
 ## Model
 
+> **Current default is the `-0731` checkpoint (Aug 2026), not the file recorded
+> below.** This section documents the *M1 milestone* reference and is kept for
+> archaeology. 0731 is structurally identical — same 1328 tensors, same shapes,
+> dtypes and offsets, same tokenizer and chat template, same 86,720,111,488-byte
+> size — differing only in weight values and imatrix provenance (202,100
+> calibration chunks vs 90,042). See the activation-dump section below for the
+> regenerated oracle and the one test deliberately left on the May weights.
+
 - Source: `antirez/deepseek-v4-gguf` (HuggingFace)
 - Filesystem path: `/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`
 - Model SHA256: `efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668`
@@ -68,11 +76,25 @@ Captured by `external/ds4-dump/ds4-dump-activations` using the 0002 patch (`ds4_
   - Both are bit-deterministic across reruns of their respective paths.
 - The M2 dump becomes the canonical reference for kernel ports because every intermediate tensor is captured along *one consistent* trajectory.
 - Storage: `reference/v4flash-cpu-activations/` (gitignored, persistent btrfs)
-  - **M7 (current) dump:**
-    - `manifest.json` SHA256: `255b917f93ffbbe7bef2940566b1207f6521ea30fdce7076e97c0a1589175bc8`
-    - logits.f32 SHA256: `bd3176ea0644067caf7a455db332874e62c23838963f561cac2d2b4b59a2ea0a` (unchanged from M2-M6)
-    - aggregate SHA: `e675e77326c3efd230a83003af72972e1aed61ea7c0e6db4691350eba20dcddb`
-    - 57,373 tensors (M6 + 5 compressor intermediates × 41 layers + 5 indexer-compressor intermediates × 21 layers + 4 indexer-scoring tags — last group never fires on this prompt since n_comp ≤ 14 < top_k=512)
+  - **0731 (current) dump — regenerated 2026-08-02 against the `-0731` checkpoint:**
+    - `manifest.json` SHA256: `aa993353788d6b92158f24bb32c4c526a134b2b7a438dba1b4e51b6826f6a75c`
+    - logits.f32 SHA256: `c709480d79f95c6a8c5bc5a322227fe855f2cc73c2eb0c5a9ad2a8dda08f6d10`
+    - tokens.json SHA256: `45d1431f46336ff360d4337a5e1f5e9aa63c8579588a881b91b197a9ffa37fb3`
+    - 77,880 tensors, 51 logit rows. Wall time 1m38s.
+    - **An oracle dump is only valid against the weights it was dumped from.** This
+      one pairs with `…-chat-v2-imatrix-0731.gguf`; every test's `MODEL_PATH`
+      moved with it. Prompt tokens are unchanged (tokenizer is identical between
+      checkpoints); the generated continuation differs because the weights differ.
+    - The tensor count rose vs the May dump (67,177 → 77,880) because the May dump
+      was produced by an older `ds4-dump-activations` binary that emitted fewer
+      tags — the new set is a superset, so tag/layer/token lookups still resolve.
+    - The May-checkpoint dump is preserved at `reference/v4flash-cpu-activations-may2026/`
+      (manifest `255b917f…`, logits `bd3176ea…`, 67,177 tensors) — restore by
+      swapping the directory names if you roll back to the May GGUF.
+    - EXCEPTION: `tests/indexer_pipeline.rs` still points at the May GGUF, because
+      it is the only consumer of `reference/v4flash-cpu-long` (692 GB, 11M tensors,
+      May weights) and that dump was not regenerated — it does not fit twice on the
+      volume. Flip it only together with regenerating that dump.
   - Previous (M6) dump: manifest `0b10242d…`, aggregate `fb740e8f…`
   - Previous SHAs preserved for archaeology:
     - M3: manifest `a2e8b85b...`, aggregate `d033b20460bc...`
@@ -126,12 +148,16 @@ Captured by `external/ds4-dump/ds4-dump-activations` using the 0002 patch (`ds4_
 - Reproduction:
   ```bash
   nix develop -c ./external/ds4-dump/ds4-dump-activations \
-      /persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf \
+      /persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
       "DeepSeek-V4 Flash is" \
       reference/v4flash-cpu-activations \
       50
   ```
-  Wall time: ~26 s with warm page cache, ~3 min cold.
+  Wall time: ~26 s with warm page cache, ~3 min cold (1m38s observed on the
+  2026-08-02 regen). Stop `deepstrix-server` first if it is running — the dumper
+  mmaps the full 86 GB and the GPU-resident server leaves little headroom.
+  The GGUF argument MUST match the `MODEL_PATH` the tests use, or every oracle
+  fails on weight mismatch rather than on a real kernel bug.
 
 ## Tokenizer cross-check
 

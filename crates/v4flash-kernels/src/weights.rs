@@ -21,6 +21,8 @@ use v4flash_core::gguf::GgufType;
 use v4flash_core::MappedGguf;
 use v4flash_hip::DeviceBuffer;
 
+use crate::weight_contract;
+
 /// A model weight tensor materialized on a HIP device. Includes the
 /// metadata so callers can sanity-check shape/dtype against expectations.
 pub struct DeviceWeight {
@@ -58,11 +60,50 @@ pub fn load_to_device(
         .read_tensor(tensor)
         .wrap_err_with(|| format!("pread `{name}`"))?;
 
+    // Consult the per-tensor contract (weight_contract.rs). Three cases:
+    //  - Quant role: dtype must be one this engine has a kernel for; Q8_0
+    //    additionally gets the M18 repack (below).
+    //  - ToF16 role: host-convert to F16 here (BF16/F32/Q8_0 sources —
+    //    the unsloth UD file stores several F16-kernel-consumed tensors
+    //    in those types); reported dtype becomes F16.
+    //  - Ungoverned role (MTP file, Laguna, ad-hoc test tensors): legacy
+    //    behavior, i.e. repack-if-Q8_0 passthrough.
+    let role = weight_contract::role_of(name);
+    let mut dtype = tensor.dtype;
+    let host = match weight_contract::expectation(&role) {
+        Some(weight_contract::Expect::Quant(allowed)) => {
+            if !allowed.contains(&tensor.dtype) {
+                return Err(eyre!(
+                    "{name}: dtype {} unsupported here (kernels exist for: {})",
+                    tensor.dtype.name(),
+                    allowed.iter().map(|d| d.name()).collect::<Vec<_>>().join("|")
+                ));
+            }
+            host
+        }
+        Some(weight_contract::Expect::ToF16(allowed)) => {
+            if !allowed.contains(&tensor.dtype) {
+                return Err(eyre!(
+                    "{name}: dtype {} unsupported here (F16-convertible from: {})",
+                    tensor.dtype.name(),
+                    allowed.iter().map(|d| d.name()).collect::<Vec<_>>().join("|")
+                ));
+            }
+            dtype = GgufType::F16;
+            weight_contract::convert_to_f16(tensor.dtype, &host, tensor.elements)
+                .wrap_err_with(|| format!("convert `{name}` to f16"))?
+        }
+        None => host,
+    };
+
     // M18: repack Q8_0 weights from per-block [scale|q×32] interleaving
     // to per-row [scales | quants] split. Same total size; result is
     // that quants land 4-byte-aligned (versus offset+=2 mod 4 before),
-    // so the matvec inner loop can issue aligned dword loads.
-    let host = if tensor.dtype == GgufType::Q8_0 {
+    // so the matvec inner loop can issue aligned dword loads. Applies
+    // only to Q8_0 buffers still headed for the Q8 kernels — a Q8_0
+    // tensor that was just converted to F16 above no longer qualifies
+    // (dtype is F16 by then).
+    let host = if dtype == GgufType::Q8_0 {
         let blocks_per_row = (tensor.dims[0] as usize) / 32;
         let row_bytes = blocks_per_row * 34;
         if host.len() % row_bytes != 0 {
@@ -95,7 +136,7 @@ pub fn load_to_device(
     Ok(DeviceWeight {
         buffer,
         n_elements,
-        dtype: tensor.dtype,
+        dtype,
         shape: tensor.dims.clone(),
     })
 }

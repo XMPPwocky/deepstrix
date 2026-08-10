@@ -109,7 +109,9 @@ extern "C" __global__ void logits_max_partial(
 // ---------------------------------------------------------------------------
 // logits_expsum_partial — each WG first reduces partials_max[n_wgs] to get
 // the global max `gmax`, then writes sum(exp(x*inv_T - gmax)) over its slice
-// to partials_z[wg].
+// to partials_z[wg]. Tokens below min_p_rel are excluded so Z renormalises
+// over the surviving set (ds4.c sample_full_vocab); min_p_rel == 0 excludes
+// nothing.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void logits_expsum_partial(
         float *partials_z,            // [n_wgs] f32
@@ -117,7 +119,8 @@ extern "C" __global__ void logits_expsum_partial(
         const float *logits,          // [n]
         unsigned int n,
         unsigned int n_wgs_in,        // n_wgs for partials_max[] (== gridDim.x)
-        float inv_T) {
+        float inv_T,
+        float min_p_rel) {
     __shared__ float sdata[SAMP_BLOCK];
     __shared__ float s_gmax;
     const unsigned int tid     = threadIdx.x;
@@ -142,7 +145,8 @@ extern "C" __global__ void logits_expsum_partial(
     double acc = 0.0;
     for (unsigned int i = tid; i < wg_size; i += SAMP_BLOCK) {
         const float v = logits[base + i] * inv_T;
-        acc += (double)expf(v - gmax);
+        const float e = expf(v - gmax);
+        if (e >= min_p_rel) acc += (double)e;
     }
     sdata[tid] = (float)acc;
     __syncthreads();
@@ -166,8 +170,9 @@ extern "C" __global__ void logits_expsum_partial(
 //
 // min_p_rel: if > 0, tokens with unnormalised prob exp(x*inv_T - gmax)
 // below min_p_rel * 1.0 are excluded from the walk (since exp at gmax = 1,
-// min_p_rel is the threshold relative to the most-likely token). They
-// still count toward Z (we don't renormalise), but the walk skips them.
+// min_p_rel is the threshold relative to the most-likely token). Z from
+// logits_expsum_partial excludes them with the same threshold, so the
+// surviving set is renormalised (matches ds4.c sample_full_vocab).
 // ---------------------------------------------------------------------------
 extern "C" __global__ void softmax_sample_one(
         int *next_token_out,         // [1]
@@ -263,9 +268,9 @@ extern "C" __global__ void softmax_sample_one(
     if (tid == 0) {
         int idx = s_winner;
         if (idx < 0) {
-            // No chunk claimed target. Shouldn't happen for u ∈ [0,1) and
-            // min_p_rel == 0; with min_p_rel > 0 it can happen if every
-            // surviving token's combined mass < target (numerical edge).
+            // No chunk claimed target. Z is now the surviving-set mass, so
+            // this is purely a floating-point edge (rounding gap between
+            // the WG-level expsum and the per-chunk re-sums).
             // Fall back to argmax-of-gmax: any index with logit==gmax.
             // Cheap scan in thread 0.
             for (unsigned int i = 0; i < n; i++) {

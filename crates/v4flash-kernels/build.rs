@@ -21,6 +21,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", kernels_dir.display());
     println!("cargo:rerun-if-env-changed=HIPCC");
     println!("cargo:rerun-if-env-changed=DEEPSTRIX_GFX_TARGETS");
+    println!("cargo:rerun-if-env-changed=DEEPSTRIX_KERNEL_CFLAGS");
 
     if !kernels_dir.exists() {
         return;
@@ -50,10 +51,17 @@ fn compile(hipcc: &str, src: &Path, arch: &str, out_dir: &Path) {
         .expect("utf8 stem");
     let out_path = out_dir.join(format!("{stem}_{arch}.hsaco"));
 
+    // Extra compile flags (e.g. -DOCC_PAD_FLOATS=N) for kernel experiments.
+    let extra: Vec<String> = env::var("DEEPSTRIX_KERNEL_CFLAGS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
     let status = Command::new(hipcc)
         .arg("-O3")
         .arg("--genco")
         .arg(format!("--offload-arch={arch}"))
+        .args(&extra)
         .arg(src)
         .arg("-o")
         .arg(&out_path)

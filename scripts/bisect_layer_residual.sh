@@ -37,7 +37,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-GGUF=${GGUF:-/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf}
+GGUF=${GGUF:-/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf}
 VEC=${VEC:-external/ds4/tests/test-vectors/official.vec}
 DS4_DUMP_DIR=${DS4_DUMP_DIR:-/tmp/ds4-dump}
 DEEPSTRIX_DUMP_DIR=${DEEPSTRIX_DUMP_DIR:-/tmp/deepstrix-dump}

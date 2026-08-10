@@ -324,6 +324,51 @@ impl F16Matvec {
         }
     }
 
+    /// Bandwidth-driven B=1 projection matvec for the Laguna decode path.
+    /// Same result as `matvec` (within f16-dequant tolerance — reduction
+    /// order differs) but streams each weight row with 128-bit vector loads
+    /// (8× __half per load) + 4-way MLP unroll, raising achieved DRAM BW on
+    /// the read-once weight stream. Falls back to the scalar `matvec` when
+    /// `n_rows < NARROW_ROWS_THRESHOLD` (the narrow shapes, e.g. attn_gate)
+    /// or `k % 8 != 0` (vector load precondition). Wired ONLY into the 5
+    /// Laguna decode projections (wq/wk/wv/wo/wg); env-gated by the caller.
+    pub fn matvec_wide_vec(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        x: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+    ) -> eyre::Result<()> {
+        if n_rows < NARROW_ROWS_THRESHOLD || k % 8 != 0 {
+            return self.matvec(stream, out, weight, x, n_rows, k);
+        }
+        let expected_weight_bytes = (n_rows as usize) * (k as usize) * 2;
+        if weight.byte_len() != expected_weight_bytes {
+            return Err(eyre!(
+                "f16 matvec_wide_vec weight bytes: have {}, expected {} (n_rows={n_rows}, k={k})",
+                weight.byte_len(),
+                expected_weight_bytes
+            ));
+        }
+        if out.len() < n_rows as usize {
+            return Err(eyre!("f16 matvec_wide_vec out len {} < n_rows={n_rows}", out.len()));
+        }
+        if x.len() < k as usize {
+            return Err(eyre!("f16 matvec_wide_vec x len {} < k={k}", x.len()));
+        }
+        let function = self.wide.get_function("f16_matvec_wide_vec")?;
+        let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
+        let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [out.raw(), weight.raw(), x.raw(), k, n_rows])
+    }
+
     pub fn matvec(
         &self,
         stream: &Stream,

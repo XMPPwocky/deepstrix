@@ -61,7 +61,9 @@ impl Sampler {
     ///
     /// Three kernels:
     ///   1. logits_max_partial    — per-WG max over (logits * inv_T)
-    ///   2. logits_expsum_partial — per-WG sum(exp(x*inv_T - gmax))
+    ///   2. logits_expsum_partial — per-WG sum(exp(x*inv_T - gmax)),
+    ///      excluding tokens below `min_p_rel` so Z renormalises over the
+    ///      surviving set (ds4.c sample_full_vocab)
     ///   3. softmax_sample_one    — single-WG cumulative-walk picker
     ///
     /// `u01[0]` is the host-supplied uniform sample in [0, 1).
@@ -116,7 +118,7 @@ impl Sampler {
             partials_max.raw(), logits.raw(), n, inv_t
         ])?;
         launch_kernel!(f_z, cfg_partial, stream, [
-            partials_z.raw(), partials_max.raw(), logits.raw(), n, n_wg, inv_t
+            partials_z.raw(), partials_max.raw(), logits.raw(), n, n_wg, inv_t, min_p_rel
         ])?;
         launch_kernel!(f_s, cfg_single, stream, [
             next_token_out.raw(), logits.raw(),
