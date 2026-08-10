@@ -41,9 +41,11 @@ const BLOCKS_TOTAL: u32 = N_GROUPS * BLOCKS_PER_GROUP; // 1024
 const THRESHOLD: f32 = 2.0e-2;
 
 fn dump_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("reference/v4flash-cpu-activations")
+    std::env::var("DEEPSTRIX_DUMP_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("reference/v4flash-cpu-activations")
+    })
 }
 
 fn pick_device() -> eyre::Result<Device> {
@@ -88,7 +90,7 @@ fn q8_0_grouped_matvec_oracle() -> eyre::Result<()> {
     install_panic_handler()?;
 
     let dump = ActivationDump::open(dump_dir())?;
-    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MODEL_PATH.to_string()))?;
     let n_tokens = dump.n_logit_rows as i32;
 
     let device = pick_device()?;

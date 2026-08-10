@@ -27,9 +27,11 @@ const STATE_ROWS_R4: usize = 8; // 2 * ratio
 const THRESHOLD: f32 = 1.0e-4;
 
 fn dump_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("reference/v4flash-cpu-activations")
+    std::env::var("DEEPSTRIX_DUMP_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("reference/v4flash-cpu-activations")
+    })
 }
 
 fn pick_device() -> eyre::Result<Device> {

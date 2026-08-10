@@ -36,9 +36,11 @@ const ROPE_ORIG_CTX: u64 = 65536; // DS4_ROPE_ORIG_CTX
 const THRESHOLD: f32 = 5.0e-5;
 
 fn dump_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("reference/v4flash-cpu-activations")
+    std::env::var("DEEPSTRIX_DUMP_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("reference/v4flash-cpu-activations")
+    })
 }
 
 fn pick_device() -> eyre::Result<Device> {

@@ -31,9 +31,11 @@ const PROMPT_TOKENS: [i32; 7] = [53091, 4374, 1465, 13582, 22, 32958, 344];
 const ROPE_ORIG_CTX: u64 = 65536;
 
 fn dump_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("reference/v4flash-cpu-activations")
+    std::env::var("DEEPSTRIX_DUMP_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("reference/v4flash-cpu-activations")
+    })
 }
 
 fn pick_dgpu() -> eyre::Result<Device> {

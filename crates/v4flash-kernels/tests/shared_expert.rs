@@ -27,9 +27,11 @@ const N_LAYER: i32 = 43;
 const THRESHOLD: f32 = 5.0e-2;
 
 fn dump_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("reference/v4flash-cpu-activations")
+    std::env::var("DEEPSTRIX_DUMP_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("reference/v4flash-cpu-activations")
+    })
 }
 
 fn pick_device() -> eyre::Result<Device> {
@@ -74,7 +76,7 @@ fn shared_expert_oracle() -> eyre::Result<()> {
     install_panic_handler()?;
 
     let dump = ActivationDump::open(dump_dir())?;
-    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MODEL_PATH.to_string()))?;
     let n_tokens = dump.n_logit_rows as i32;
 
     let device = pick_device()?;
@@ -83,6 +85,8 @@ fn shared_expert_oracle() -> eyre::Result<()> {
     eprintln!("using device {} ({arch})", device.id);
 
     let q8 = Q8_0Matvec::for_arch(&arch)?;
+    let q5d = v4flash_kernels::q5_k_dense::Q5_KDenseMatvec::for_arch(&arch)?;
+    let q6d = v4flash_kernels::q6_k_dense::Q6_KDenseMatvec::for_arch(&arch)?;
     let swiglu = Swiglu::for_arch(&arch)?;
     let stream = Stream::new(device.id)?;
 
@@ -123,13 +127,33 @@ fn shared_expert_oracle() -> eyre::Result<()> {
                 .ok_or_else(|| eyre!("missing ffn_input_norm at L{layer} T{token}"))?;
             d_x.copy_from_host(&dump.read_f32(x_entry)?)?;
 
-            q8.quantize_input(&stream, &mut d_xq, &mut d_xscale, &d_x, N_EMBD)?;
-            q8.matvec(&stream, &mut d_gate, &w_gate.buffer, &d_xq, &d_xscale, N_FF, N_EMBD)?;
-            q8.matvec(&stream, &mut d_up, &w_up.buffer, &d_xq, &d_xscale, N_FF, N_EMBD)?;
+            let dm = |q8: &Q8_0Matvec, out: &mut v4flash_hip::DeviceBuffer<f32>,
+                      w: &weights::DeviceWeight,
+                      x: &v4flash_hip::DeviceBuffer<f32>,
+                      xq: &v4flash_hip::DeviceBuffer<i8>,
+                      xs: &v4flash_hip::DeviceBuffer<f32>,
+                      rows: u32, k: u32,
+                      stream: &Stream| -> eyre::Result<()> {
+                match w.dtype {
+                    v4flash_core::gguf::GgufType::Q8_0 => q8.matvec(stream, out, &w.buffer, xq, xs, rows, k),
+                    v4flash_core::gguf::GgufType::Q5_K => q5d.matvec(stream, out, &w.buffer, x, rows, k),
+                    v4flash_core::gguf::GgufType::Q6_K => q6d.matvec(stream, out, &w.buffer, x, rows, k),
+                    other => Err(eyre!("shexp test: dtype {other:?}")),
+                }
+            };
+            if w_gate.dtype == v4flash_core::gguf::GgufType::Q8_0
+                || w_up.dtype == v4flash_core::gguf::GgufType::Q8_0
+            {
+                q8.quantize_input(&stream, &mut d_xq, &mut d_xscale, &d_x, N_EMBD)?;
+            }
+            dm(&q8, &mut d_gate, &w_gate, &d_x, &d_xq, &d_xscale, N_FF, N_EMBD, &stream)?;
+            dm(&q8, &mut d_up, &w_up, &d_x, &d_xq, &d_xscale, N_FF, N_EMBD, &stream)?;
             swiglu.launch(&stream, &mut d_mid, &d_gate, &d_up, N_FF)?;
 
-            q8.quantize_input(&stream, &mut d_mid_xq, &mut d_mid_xscale, &d_mid, N_FF)?;
-            q8.matvec(&stream, &mut d_out, &w_down.buffer, &d_mid_xq, &d_mid_xscale, N_EMBD, N_FF)?;
+            if w_down.dtype == v4flash_core::gguf::GgufType::Q8_0 {
+                q8.quantize_input(&stream, &mut d_mid_xq, &mut d_mid_xscale, &d_mid, N_FF)?;
+            }
+            dm(&q8, &mut d_out, &w_down, &d_mid, &d_mid_xq, &d_mid_xscale, N_EMBD, N_FF, &stream)?;
             stream.synchronize()?;
             d_out.copy_to_host(&mut got)?;
 

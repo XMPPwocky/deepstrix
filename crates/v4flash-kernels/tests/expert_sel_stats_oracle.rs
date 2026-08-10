@@ -25,9 +25,11 @@ const PROMPT_TOKENS: [i32; 7] = [53091, 4374, 1465, 13582, 22, 32958, 344];
 const ROPE_ORIG_CTX: u64 = 65536;
 
 fn dump_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("reference/v4flash-cpu-activations")
+    std::env::var("DEEPSTRIX_DUMP_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("reference/v4flash-cpu-activations")
+    })
 }
 
 fn pick(arch: &str) -> eyre::Result<Device> {
@@ -45,7 +47,7 @@ fn device_histogram_matches_prefill_stats() -> eyre::Result<()> {
     install_panic_handler()?;
     let t = PROMPT_TOKENS.len();
     let dump = ActivationDump::open(dump_dir())?;
-    let gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
+    let gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MAIN_MODEL_PATH.to_string()))?;
     let dgpu = pick("gfx1201")?;
     let igpu = pick("gfx1151")?;
     let dgpu_arch = dgpu.properties()?.gcn_arch_name;

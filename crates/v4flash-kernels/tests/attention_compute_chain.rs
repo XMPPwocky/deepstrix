@@ -47,9 +47,11 @@ const ROPE_ORIG_CTX: u64 = 65536;
 const FINAL_THRESHOLD: f32 = 1.0e-1;
 
 fn dump_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("reference/v4flash-cpu-activations")
+    std::env::var("DEEPSTRIX_DUMP_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("reference/v4flash-cpu-activations")
+    })
 }
 
 /// f32 → f16 bits (RTNE). Matches GPU `(_Float16)` cast.
@@ -128,7 +130,7 @@ fn swa_attention_chain_oracle() -> eyre::Result<()> {
     install_panic_handler()?;
 
     let dump = ActivationDump::open(dump_dir())?;
-    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MODEL_PATH.to_string()))?;
     let n_tokens = dump.n_logit_rows as i32;
     assert!((n_tokens as u32) <= ATTN_SWA_MAX_KV);
 

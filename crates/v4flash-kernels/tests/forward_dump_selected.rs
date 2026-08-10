@@ -7,9 +7,11 @@ use v4flash_kernels::oracle::ActivationDump;
 #[test]
 #[ignore]
 fn dump_selected() -> eyre::Result<()> {
-    let dump = ActivationDump::open(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("reference/v4flash-cpu-activations"))?;
+    let dump = ActivationDump::open(std::env::var("DEEPSTRIX_DUMP_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("reference/v4flash-cpu-activations")
+    }))?;
     for l in 0..43i32 {
         let bytes = dump.read_bytes(dump.tensor("expert_selected", l, 0).unwrap())?;
         let ids: Vec<i32> = bytes.chunks_exact(4).map(|c| i32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();

@@ -35,9 +35,11 @@ const ROPE_ORIG_CTX: u64 = 65536;
 const N_TRACE_TOKENS: i32 = 5;
 
 fn dump_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("reference/v4flash-cpu-activations")
+    std::env::var("DEEPSTRIX_DUMP_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("reference/v4flash-cpu-activations")
+    })
 }
 
 fn pick_dgpu_device() -> eyre::Result<Device> {
@@ -87,7 +89,7 @@ fn capture_perfetto_trace() -> eyre::Result<()> {
         .map_err(|e| eyre!("init tracing-perfetto subscriber: {e}"))?;
 
     let dump = ActivationDump::open(dump_dir())?;
-    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MODEL_PATH.to_string()))?;
 
     let dgpu = pick_dgpu_device()?;
     let igpu = pick_igpu_device()?;

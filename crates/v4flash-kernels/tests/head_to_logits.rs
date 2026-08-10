@@ -37,9 +37,11 @@ const RMS_EPS: f32 = 1.0e-6;
 const THRESHOLD_LOGIT: f32 = 5.0e-2;
 
 fn dump_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("reference/v4flash-cpu-activations")
+    std::env::var("DEEPSTRIX_DUMP_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("reference/v4flash-cpu-activations")
+    })
 }
 
 fn pick_device() -> eyre::Result<Device> {
@@ -97,7 +99,7 @@ fn head_to_logits_oracle() -> eyre::Result<()> {
     install_panic_handler()?;
 
     let dump = ActivationDump::open(dump_dir())?;
-    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MODEL_PATH.to_string()))?;
     let n_tokens = dump.n_logit_rows as i32;
     assert_eq!(dump.vocab_size, N_VOCAB as usize);
 
@@ -139,9 +141,9 @@ fn head_to_logits_oracle() -> eyre::Result<()> {
         N_EMBD as usize,
     )?;
     let w_vocab = weights::load_to_device(&gguf, "output.weight", device.id)?;
-    if w_vocab.dtype != GgufType::Q8_0 {
-        return Err(eyre!("output.weight dtype {:?} != Q8_0", w_vocab.dtype));
-    }
+    // unsloth mix stores the head as Q4_K (f32-input dense gemv);
+    // antirez keeps Q8_0 (quantize + dp4a matvec).
+    let q4d = v4flash_kernels::q4_k_dense::Q4_KDenseMatvec::for_arch(&arch)?;
 
     let mut d_inp: DeviceBuffer<f32> = DeviceBuffer::new(device.id, HC_DIM as usize)?;
     let mut d_flat: DeviceBuffer<f32> = DeviceBuffer::new(device.id, HC_DIM as usize)?;
@@ -178,17 +180,25 @@ fn head_to_logits_oracle() -> eyre::Result<()> {
         // Output RMS norm with learned weight.
         rms_w.launch_weighted(&stream, &mut d_norm, &d_embd, &w_norm, N_EMBD, RMS_EPS)?;
 
-        // Q8_0 vocab projection: quantize input, matvec.
-        q8.quantize_input(&stream, &mut d_xq, &mut d_xscale, &d_norm, N_EMBD)?;
-        q8.matvec(
-            &stream,
-            &mut d_logits,
-            &w_vocab.buffer,
-            &d_xq,
-            &d_xscale,
-            N_VOCAB,
-            N_EMBD,
-        )?;
+        // Vocab projection, dtype-dispatched (mirrors forward_head).
+        match w_vocab.dtype {
+            GgufType::Q8_0 => {
+                q8.quantize_input(&stream, &mut d_xq, &mut d_xscale, &d_norm, N_EMBD)?;
+                q8.matvec(
+                    &stream,
+                    &mut d_logits,
+                    &w_vocab.buffer,
+                    &d_xq,
+                    &d_xscale,
+                    N_VOCAB,
+                    N_EMBD,
+                )?;
+            }
+            GgufType::Q4_K => {
+                q4d.matvec(&stream, &mut d_logits, &w_vocab.buffer, &d_norm, N_VOCAB, N_EMBD)?;
+            }
+            other => return Err(eyre!("head test: unsupported output dtype {other:?}")),
+        }
         stream.synchronize()?;
         d_logits.copy_to_host(&mut got_logits)?;
 

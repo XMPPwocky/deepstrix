@@ -22,7 +22,7 @@ const EXPECTED_OUTPUT_PROJ_BYTES: u64 = 129_280 * 4_096 / 32 * 34;
 fn weights_load_output_proj() -> eyre::Result<()> {
     install_panic_handler()?;
 
-    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MODEL_PATH.to_string()))?;
     let devices = Device::all()?;
     let device = devices
         .iter()

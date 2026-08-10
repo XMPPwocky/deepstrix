@@ -55,9 +55,11 @@ const Q_THRESHOLD: f32 = 5.0e-2;
 const KV_THRESHOLD: f32 = 5.0e-3;
 
 fn dump_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("reference/v4flash-cpu-activations")
+    std::env::var("DEEPSTRIX_DUMP_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("reference/v4flash-cpu-activations")
+    })
 }
 
 fn pick_device() -> eyre::Result<Device> {
@@ -101,6 +103,8 @@ struct Setup {
     dump: ActivationDump,
     gguf: MappedGguf,
     q8: Q8_0Matvec,
+    q5d: v4flash_kernels::q5_k_dense::Q5_KDenseMatvec,
+    q6d: v4flash_kernels::q6_k_dense::Q6_KDenseMatvec,
     rms_w: RmsNorm,
     rms_nw: RmsNormNoWeight,
     rope: RopeTail,
@@ -109,11 +113,13 @@ struct Setup {
 fn setup() -> eyre::Result<Setup> {
     install_panic_handler()?;
     let dump = ActivationDump::open(dump_dir())?;
-    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MODEL_PATH.to_string()))?;
     let device = pick_device()?;
     device.set_current()?;
     let arch = device.properties()?.gcn_arch_name;
     let q8 = Q8_0Matvec::for_arch(&arch)?;
+    let q5d = v4flash_kernels::q5_k_dense::Q5_KDenseMatvec::for_arch(&arch)?;
+    let q6d = v4flash_kernels::q6_k_dense::Q6_KDenseMatvec::for_arch(&arch)?;
     let rms_w = RmsNorm::for_arch(&arch)?;
     let rms_nw = RmsNormNoWeight::for_arch(&arch)?;
     let rope = RopeTail::for_arch(&arch)?;
@@ -129,6 +135,8 @@ fn setup() -> eyre::Result<Setup> {
         dump,
         gguf,
         q8,
+        q5d,
+        q6d,
         rms_w,
         rms_nw,
         rope,
@@ -225,17 +233,29 @@ fn q_lora_chain_oracle() -> eyre::Result<()> {
 
             d_x.copy_from_host(&x_host)?;
 
-            // (1) Q8_0 quantize input (4096-dim) → qr matvec
-            s.q8.quantize_input(&stream, &mut d_xq_n_embd, &mut d_xscale_n_embd, &d_x, N_EMBD)?;
-            s.q8.matvec(
-                &stream,
-                &mut d_qr,
-                &q_a.buffer,
-                &d_xq_n_embd,
-                &d_xscale_n_embd,
-                N_LORA_Q,
-                N_EMBD,
-            )?;
+            // (1) q_a matvec — Q8_0 (antirez: quantize + dp4a) or
+            // Q5_K/Q6_K (unsloth: f32 dense gemv).
+            match q_a.dtype {
+                v4flash_core::gguf::GgufType::Q8_0 => {
+                    s.q8.quantize_input(&stream, &mut d_xq_n_embd, &mut d_xscale_n_embd, &d_x, N_EMBD)?;
+                    s.q8.matvec(
+                        &stream,
+                        &mut d_qr,
+                        &q_a.buffer,
+                        &d_xq_n_embd,
+                        &d_xscale_n_embd,
+                        N_LORA_Q,
+                        N_EMBD,
+                    )?;
+                }
+                v4flash_core::gguf::GgufType::Q5_K => {
+                    s.q5d.matvec(&stream, &mut d_qr, &q_a.buffer, &d_x, N_LORA_Q, N_EMBD)?;
+                }
+                v4flash_core::gguf::GgufType::Q6_K => {
+                    s.q6d.matvec(&stream, &mut d_qr, &q_a.buffer, &d_x, N_LORA_Q, N_EMBD)?;
+                }
+                other => return Err(eyre!("q_a dtype {other:?} unsupported in test")),
+            }
             stream.synchronize()?;
             d_qr.copy_to_host(&mut got_qa)?;
             if let Some(e) = s.dump.tensor("q_a_out", layer, token) {

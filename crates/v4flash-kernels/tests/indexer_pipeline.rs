@@ -424,7 +424,7 @@ fn indexer_pipeline_oracle() -> eyre::Result<()> {
     install_panic_handler()?;
 
     let dump = ActivationDump::open(dump_dir())?;
-    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MODEL_PATH.to_string()))?;
     // n_logit_rows comes from the manifest's trailer fields which are only
     // written when the dump finishes. For partial / mid-prefill dumps fall
     // back to scanning the entries for the max token id, optionally capped

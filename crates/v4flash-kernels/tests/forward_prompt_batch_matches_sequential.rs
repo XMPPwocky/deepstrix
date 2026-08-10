@@ -29,9 +29,11 @@ const PROMPT_TOKENS: [i32; 7] = [53091, 4374, 1465, 13582, 22, 32958, 344];
 const ROPE_ORIG_CTX: u64 = 65536;
 
 fn dump_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("reference/v4flash-cpu-activations")
+    std::env::var("DEEPSTRIX_DUMP_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("reference/v4flash-cpu-activations")
+    })
 }
 
 fn pick_dgpu() -> eyre::Result<Device> {
@@ -128,7 +130,7 @@ fn forward_prompt_batch_v2_matches_sequential() -> eyre::Result<()> {
     eprintln!("v2 oracle: B={b}");
 
     let dump = ActivationDump::open(dump_dir())?;
-    let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
+    let main_gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MAIN_MODEL_PATH.to_string()))?;
     let dgpu = pick_dgpu()?;
     let igpu = pick_igpu()?;
     let dgpu_arch = dgpu.properties()?.gcn_arch_name;
@@ -267,7 +269,7 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
     use v4flash_kernels::config::{HC_DIM, N_LAYER};
 
     let dump = ActivationDump::open(dump_dir())?;
-    let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
+    let main_gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MAIN_MODEL_PATH.to_string()))?;
     let dgpu = pick_dgpu()?;
     let igpu = pick_igpu()?;
     let dgpu_arch = dgpu.properties()?.gcn_arch_name;
@@ -497,7 +499,7 @@ fn forward_prefill_last_only_matches_sequential() -> eyre::Result<()> {
     eprintln!("Phase 6 oracle: T={t} (single chunk)");
 
     let dump = ActivationDump::open(dump_dir())?;
-    let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
+    let main_gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MAIN_MODEL_PATH.to_string()))?;
     let dgpu = pick_dgpu()?;
     let igpu = pick_igpu()?;
     let dgpu_arch = dgpu.properties()?.gcn_arch_name;
@@ -610,7 +612,7 @@ fn forward_prefill_pipelined_matches_single_lane() -> eyre::Result<()> {
     eprintln!("pipelined oracle: T={t} (split = ceil(T/2)={})", t.div_ceil(2));
 
     let dump = ActivationDump::open(dump_dir())?;
-    let main_gguf = MappedGguf::open(MAIN_MODEL_PATH)?;
+    let main_gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MAIN_MODEL_PATH.to_string()))?;
     let dgpu = pick_dgpu()?;
     let igpu = pick_igpu()?;
     let dgpu_arch = dgpu.properties()?.gcn_arch_name;

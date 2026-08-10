@@ -41,9 +41,11 @@ fn test_layer() -> i32 {
 }
 
 fn dump_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("reference/v4flash-cpu-activations")
+    std::env::var("DEEPSTRIX_DUMP_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("reference/v4flash-cpu-activations")
+    })
 }
 
 fn pick_device() -> eyre::Result<Device> {
@@ -88,7 +90,7 @@ fn routed_moe_oracle() -> eyre::Result<()> {
     install_panic_handler()?;
 
     let dump = ActivationDump::open(dump_dir())?;
-    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MODEL_PATH.to_string()))?;
     let n_tokens = dump.n_logit_rows as i32;
 
     let device = pick_device()?;
@@ -105,17 +107,29 @@ fn routed_moe_oracle() -> eyre::Result<()> {
     let q2k = Q2KAccumulateMatvec::for_arch(&arch)?;
     let stream = Stream::new(device.id)?;
 
-    // Verify dtypes.
+    // Verify dtypes: gate/up IQ2_XXS; down Q2_K (antirez) or IQ3_XXS
+    // (unsloth). Pick a different MOE_TEST_LAYER than 26/42 for those
+    // exception layers (this test's per-slot serial launches only cover
+    // the common types).
     for (name, want) in [
-        (format!("blk.{TL}.ffn_gate_exps.weight"), GgufType::IQ2_XXS),
-        (format!("blk.{TL}.ffn_up_exps.weight"), GgufType::IQ2_XXS),
-        (format!("blk.{TL}.ffn_down_exps.weight"), GgufType::Q2_K),
+        (format!("blk.{TL}.ffn_gate_exps.weight"), &[GgufType::IQ2_XXS][..]),
+        (format!("blk.{TL}.ffn_up_exps.weight"), &[GgufType::IQ2_XXS][..]),
+        (
+            format!("blk.{TL}.ffn_down_exps.weight"),
+            &[GgufType::Q2_K, GgufType::IQ3_XXS][..],
+        ),
     ] {
         let t = gguf.gguf().tensor(&name).ok_or_else(|| eyre!("{name} missing"))?;
-        if t.dtype != want {
-            return Err(eyre!("{name} dtype {:?} != {:?}", t.dtype, want));
+        if !want.contains(&t.dtype) {
+            return Err(eyre!("{name} dtype {:?} not in {:?}", t.dtype, want));
         }
     }
+    let down_dt = gguf
+        .gguf()
+        .tensor(&format!("blk.{TL}.ffn_down_exps.weight"))
+        .unwrap()
+        .dtype;
+    let iq3 = v4flash_kernels::iq3_xxs::Iq3XxsMatvec::for_arch(&arch)?;
 
     let gate_t = gguf
         .gguf()
@@ -139,8 +153,11 @@ fn routed_moe_oracle() -> eyre::Result<()> {
     let gate_bytes_per_expert =
         (N_FF_EXP as usize) * (N_BLOCKS_GATE_IN as usize) * BLOCK_IQ2_XXS_BYTES;
     let up_bytes_per_expert = gate_bytes_per_expert;
-    let down_bytes_per_expert =
-        (N_EMBD as usize) * (N_BLOCKS_DOWN_IN as usize) * BLOCK_Q2_K_BYTES;
+    let down_bytes_per_expert = v4flash_kernels::weight_contract::bytes_per_expert(
+        down_dt,
+        N_FF_EXP as u64,
+        N_EMBD as u64,
+    )?;
 
     // Per-slot buffers (one per selected expert, reused token-to-token).
     let mut d_gw: Vec<DeviceBuffer<u8>> = (0..N_EXPERT_USED)
@@ -265,15 +282,28 @@ fn routed_moe_oracle() -> eyre::Result<()> {
                 &staging_full[slot * (N_FF_EXP as usize)..(slot + 1) * (N_FF_EXP as usize)],
             )?;
             q8k.launch(&stream, &mut d_midq, &d_mid_e, N_BLOCKS_DOWN_IN)?;
-            q2k.launch(
-                &stream,
-                &mut d_out,
-                &d_dw[slot],
-                &d_midq,
-                N_EMBD,
-                N_BLOCKS_DOWN_IN,
-                slot == 0,
-            )?;
+            match down_dt {
+                GgufType::Q2_K => q2k.launch(
+                    &stream,
+                    &mut d_out,
+                    &d_dw[slot],
+                    &d_midq,
+                    N_EMBD,
+                    N_BLOCKS_DOWN_IN,
+                    slot == 0,
+                )?,
+                GgufType::IQ3_XXS => iq3.launch_accumulate(
+                    &stream,
+                    &mut d_out,
+                    &d_dw[slot],
+                    0,
+                    &d_midq,
+                    N_EMBD,
+                    N_BLOCKS_DOWN_IN,
+                    slot == 0,
+                )?,
+                other => return Err(eyre!("routed_moe test: unsupported down {other:?}")),
+            }
         }
 
         stream.synchronize()?;

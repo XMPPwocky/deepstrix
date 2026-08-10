@@ -28,9 +28,11 @@ const SWA_LAYERS: &[i32] = &[0, 1]; // ratio==0 in V4 Flash
 const THRESHOLD: f32 = 1.0e-3;
 
 fn dump_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("reference/v4flash-cpu-activations")
+    std::env::var("DEEPSTRIX_DUMP_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("reference/v4flash-cpu-activations")
+    })
 }
 
 /// f32 → f16 bits (RTNE). Matches GPU `(_Float16)` cast.

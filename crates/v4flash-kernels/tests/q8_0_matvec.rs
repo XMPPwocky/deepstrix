@@ -38,9 +38,11 @@ const PROMPT_LEN_PREFILL: i32 = 7; // M1 reference prompt: "DeepSeek-V4 Flash is
 const Q8_0_THRESHOLD: f32 = 5.0e-3;
 
 fn dump_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("reference/v4flash-cpu-activations")
+    std::env::var("DEEPSTRIX_DUMP_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("reference/v4flash-cpu-activations")
+    })
 }
 
 fn pick_device() -> eyre::Result<Device> {
@@ -127,7 +129,7 @@ fn q8_0_matvec_output_projection_oracle() -> eyre::Result<()> {
         dump.vocab_size,
     );
 
-    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MODEL_PATH.to_string()))?;
     let device = pick_device()?;
     device.set_current()?;
     let arch = device.properties()?.gcn_arch_name;
@@ -234,7 +236,7 @@ fn q8_0_matvec_output_projection_oracle() -> eyre::Result<()> {
 fn q8_0_matvec_pair_matches_two_singles() -> eyre::Result<()> {
     install_panic_handler()?;
     let dump = ActivationDump::open(dump_dir())?;
-    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MODEL_PATH.to_string()))?;
     let device = pick_device()?;
     device.set_current()?;
     let arch = device.properties()?.gcn_arch_name;
@@ -341,7 +343,7 @@ fn q8_0_matvec_pair_matches_two_singles() -> eyre::Result<()> {
 fn q8_0_matvec_pair_bench() -> eyre::Result<()> {
     use std::time::Instant;
     install_panic_handler()?;
-    let gguf = MappedGguf::open(MODEL_PATH)?;
+    let gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MODEL_PATH.to_string()))?;
     let device = pick_device()?;
     device.set_current()?;
     let arch = device.properties()?.gcn_arch_name;
