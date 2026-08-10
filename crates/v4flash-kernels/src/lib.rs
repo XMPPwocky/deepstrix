@@ -35,6 +35,7 @@ pub mod laguna_moe_tiled;
 pub mod moe_group_builder;
 pub mod oracle;
 pub mod router_topk;
+pub mod weight_contract;
 pub mod q2_k;
 pub mod q4_k;
 pub mod q4_k_dense;

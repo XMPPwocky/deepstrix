@@ -399,8 +399,12 @@ fn main() -> eyre::Result<()> {
         .gguf()
         .tensor("token_embd.weight")
         .ok_or_else(|| eyre!("missing token_embd.weight"))?;
-    if token_embd_t.dtype != GgufType::F16 {
-        return Err(eyre!("token_embd dtype {:?} != F16", token_embd_t.dtype));
+    if !v4flash_kernels::weight_contract::TOKEN_EMBD_ALLOWED.contains(&token_embd_t.dtype) {
+        return Err(eyre!(
+            "token_embd dtype {:?} unsupported (allowed: {:?})",
+            token_embd_t.dtype,
+            v4flash_kernels::weight_contract::TOKEN_EMBD_ALLOWED
+        ));
     }
     let token_embd_bytes = gguf.read_tensor(token_embd_t)?;
     let token_embd_bytes: &[u8] = &token_embd_bytes;

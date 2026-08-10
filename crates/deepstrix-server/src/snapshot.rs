@@ -68,17 +68,38 @@ pub struct ModelFingerprint {
     pub vocab_size: u32,
     /// blake3 of the first 4 KiB of `token_embd.weight` bytes.
     pub token_embd_prefix_blake3: String,
+    /// blake3 over every tensor's (name, dtype id, byte_size), in
+    /// directory order. The embd prefix alone can collide between two
+    /// quants of the same checkpoint that share an embedding table (e.g.
+    /// a requant touching only expert tensors); the directory hash is
+    /// guaranteed to differ whenever any tensor's dtype or size changes.
+    /// `serde(default)`: indexes written before this field deserialize
+    /// with "" and simply mismatch → snapshots quarantined once.
+    #[serde(default)]
+    pub tensor_directory_blake3: String,
 }
 
 impl ModelFingerprint {
-    pub fn compute(vocab_size: u32, token_embd_bytes: &[u8]) -> Self {
+    pub fn compute(
+        vocab_size: u32,
+        token_embd_bytes: &[u8],
+        gguf: &v4flash_core::gguf::Gguf,
+    ) -> Self {
         let prefix_len = token_embd_bytes.len().min(4096);
         let hash = blake3::hash(&token_embd_bytes[..prefix_len]);
+        let mut dir = blake3::Hasher::new();
+        for t in gguf.tensors() {
+            dir.update(t.name.as_bytes());
+            dir.update(&[0]);
+            dir.update(t.dtype.name().as_bytes());
+            dir.update(&t.byte_size.to_le_bytes());
+        }
         Self {
             n_layer: N_LAYER as u32,
             n_head_dim: N_HEAD_DIM,
             vocab_size,
             token_embd_prefix_blake3: hash.to_hex().to_string(),
+            tensor_directory_blake3: dir.finalize().to_hex().to_string(),
         }
     }
 }

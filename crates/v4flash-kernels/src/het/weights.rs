@@ -11,15 +11,14 @@ use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{Device, DeviceBuffer};
 
 use crate::config::{
-    BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, COMPRESS_RATIOS, HC_MIX_DIM, INDEXER_COMP_WIDTH,
-    N_EMBD, N_HASH_LAYERS, N_HC, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, N_LORA_Q,
+    COMPRESS_RATIOS, HC_MIX_DIM, INDEXER_COMP_WIDTH, N_EMBD, N_EXPERT, N_HASH_LAYERS, N_HC,
+    N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, N_LORA_Q,
 };
 use crate::model_weights::{
     load_f32_weight, load_i32_tensor, CompressorWeights, RoutedExpertWeights, SharedExpertWeights,
 };
-use crate::iq2_xxs::BLOCK_IQ2_XXS_BYTES;
-use crate::q2_k::BLOCK_Q2_K_BYTES;
 use crate::rope::RopeParams;
+use crate::weight_contract;
 use crate::weights::{load_to_device, DeviceWeight};
 
 pub struct DgpuLayerWeights {
@@ -135,14 +134,17 @@ impl HetGlobalWeights {
                 .gguf()
                 .tensor("token_embd.weight")
                 .ok_or_else(|| eyre!("token_embd.weight not found"))?;
-            if te.dtype != GgufType::F16 {
-                return Err(eyre!("token_embd dtype {:?} != F16", te.dtype));
+            if !weight_contract::TOKEN_EMBD_ALLOWED.contains(&te.dtype) {
+                return Err(eyre!(
+                    "token_embd dtype {:?} unsupported (allowed: {:?})",
+                    te.dtype,
+                    weight_contract::TOKEN_EMBD_ALLOWED
+                ));
             }
         }
+        // output.weight dtype is enforced by the contract inside
+        // load_to_device (Quant role).
         let output = load_to_device(gguf, "output.weight", dgpu_id)?;
-        if output.dtype != GgufType::Q8_0 {
-            return Err(eyre!("output dtype {:?} != Q8_0", output.dtype));
-        }
         let output_norm = load_f32_weight(gguf, "output_norm.weight", dgpu_id, N_EMBD as usize)?;
         let output_hc_fn = load_to_device(gguf, "output_hc_fn.weight", dgpu_id)?;
         let output_hc_scale = load_f32_weight(gguf, "output_hc_scale.weight", dgpu_id, 1)?;
@@ -407,11 +409,33 @@ impl IgpuLayerWeights {
             &format!("blk.{layer}.ffn_down_exps.weight"),
             device_id,
         )?;
+        // Strides from the actual dtype, not compile-time constants — the
+        // unsloth UD mix varies expert dtypes per layer (blk.26 gate/up
+        // IQ2_S, blk.26/42 down MXFP4). Cross-checked against the real
+        // buffer size so a stride bug is a load error, not garbage output.
+        let n_ff = crate::config::N_FF_EXP as u64;
         let gate_bytes_per_expert =
-            (crate::config::N_FF_EXP as usize) * (BLOCKS_Q8K_GATE_IN as usize) * BLOCK_IQ2_XXS_BYTES;
-        let up_bytes_per_expert = gate_bytes_per_expert;
+            weight_contract::bytes_per_expert(gate.dtype, N_EMBD as u64, n_ff)?;
+        let up_bytes_per_expert =
+            weight_contract::bytes_per_expert(up.dtype, N_EMBD as u64, n_ff)?;
         let down_bytes_per_expert =
-            (N_EMBD as usize) * (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q2_K_BYTES;
+            weight_contract::bytes_per_expert(down.dtype, n_ff, N_EMBD as u64)?;
+        for (name, w, bpe) in [
+            ("gate_exps", &gate, gate_bytes_per_expert),
+            ("up_exps", &up, up_bytes_per_expert),
+            ("down_exps", &down, down_bytes_per_expert),
+        ] {
+            let expect = (N_EXPERT as usize) * bpe;
+            if w.buffer.len() != expect {
+                return Err(eyre!(
+                    "blk.{layer}.ffn_{name}: buffer {} B != {} experts × {} B/expert ({:?})",
+                    w.buffer.len(),
+                    N_EXPERT,
+                    bpe,
+                    w.dtype
+                ));
+            }
+        }
         let routed = RoutedExpertWeights {
             gate,
             up,
@@ -455,11 +479,6 @@ impl HotExpertWeights {
     ) -> eyre::Result<(Self, Vec<i32>)> {
         dgpu_device.set_current()?;
         let device_id = dgpu_device.id;
-        let gate_bpe = (crate::config::N_FF_EXP as usize)
-            * (BLOCKS_Q8K_GATE_IN as usize)
-            * BLOCK_IQ2_XXS_BYTES;
-        let down_bpe =
-            (N_EMBD as usize) * (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q2_K_BYTES;
         let k = expert_ids.len();
 
         let mut remap_host = vec![-1i32; 256];
@@ -467,11 +486,25 @@ impl HotExpertWeights {
             remap_host[e as usize] = dense as i32;
         }
 
-        let pack = |name: &str, bpe: usize| -> eyre::Result<DeviceBuffer<u8>> {
+        // Per-expert stride from each tensor's actual dtype (per-layer
+        // variable in the unsloth UD mix), cross-checked against the
+        // tensor's real byte size — the second copy of the old
+        // hardcoded-stride bug lived here.
+        let pack = |name: &str, kdim: u64, rows: u64| -> eyre::Result<DeviceBuffer<u8>> {
             let tensor = gguf
                 .gguf()
                 .tensor(name)
                 .ok_or_else(|| eyre!("tensor `{name}` not found"))?;
+            let bpe = weight_contract::bytes_per_expert(tensor.dtype, kdim, rows)?;
+            if tensor.byte_size as usize != (N_EXPERT as usize) * bpe {
+                return Err(eyre!(
+                    "{name}: byte_size {} != {} experts × {} B/expert ({:?})",
+                    tensor.byte_size,
+                    N_EXPERT,
+                    bpe,
+                    tensor.dtype
+                ));
+            }
             let host = gguf.read_tensor(tensor)?;
             let mut packed = vec![0u8; k * bpe];
             for (dense, &e) in expert_ids.iter().enumerate() {
@@ -483,9 +516,10 @@ impl HotExpertWeights {
             Ok(buf)
         };
 
-        let gate = pack(&format!("blk.{layer}.ffn_gate_exps.weight"), gate_bpe)?;
-        let up = pack(&format!("blk.{layer}.ffn_up_exps.weight"), gate_bpe)?;
-        let down = pack(&format!("blk.{layer}.ffn_down_exps.weight"), down_bpe)?;
+        let n_ff = crate::config::N_FF_EXP as u64;
+        let gate = pack(&format!("blk.{layer}.ffn_gate_exps.weight"), N_EMBD as u64, n_ff)?;
+        let up = pack(&format!("blk.{layer}.ffn_up_exps.weight"), N_EMBD as u64, n_ff)?;
+        let down = pack(&format!("blk.{layer}.ffn_down_exps.weight"), n_ff, N_EMBD as u64)?;
         let mut remap = DeviceBuffer::<i32>::new(device_id, 256)?;
         remap.copy_from_host(&remap_host)?;
 
@@ -607,6 +641,10 @@ impl HetModelWeights {
         igpu_device: Device,
         rope_params_for_layer: &dyn Fn(i32) -> eyre::Result<RopeParams>,
     ) -> eyre::Result<Self> {
+        // Fail up front with the COMPLETE list of contract violations
+        // (unsupported dtypes / wrong dims) instead of erroring on the
+        // first tensor mid-load — or worse, slicing at a wrong stride.
+        weight_contract::validate_model(gguf.gguf())?;
         let global = HetGlobalWeights::load(gguf, dgpu_device)?;
         let mut dgpu_layers = Vec::with_capacity(N_LAYER as usize);
         let mut igpu_layers = Vec::with_capacity(N_LAYER as usize);
