@@ -296,7 +296,11 @@ extern "C" __global__ void q2_k_matvec_par_batched_hetsplit(
         if (resident) res_rank++;
         const bool ours = (mode == 0u) ? !dgpu_takes : dgpu_takes;
         if (!ours) continue;
-        const int e = (mode == 0u) ? sel : dense;
+        // M63 iGPU de-dup: remap encodes BOTH devices' slots — hot experts hold
+        // their dGPU dense slot (>=0), cold experts hold -(igpu_slot+1). With the
+        // full 256-expert iGPU buffer igpu_slot == sel, so this is identical to the
+        // old `sel`; with IGPU_DEDUP_HOT it is the packed cold-only slot.
+        const int e = (mode == 0u) ? (-dense - 1) : dense;
         const uint8_t* w_expert = w_base + (uint64_t)e * (uint64_t)dbpe;
         const uint8_t* xq_slot  = xq_base + (uint64_t)s * (uint64_t)xq_slot_stride;
         const uint8_t* row_base = w_expert + (uint64_t)row * n_blocks_in * BLOCK_Q2_K_BYTES;
@@ -729,7 +733,7 @@ extern "C" __global__ void q2_k_reduce_partials_hetsplit(
         float       * __restrict__ out,        // [B, n_rows]
         const float * __restrict__ partials,   // [B*n_used, n_rows]
         const int   * __restrict__ d_selected, // [B, n_used]
-        const int   * __restrict__ remap,      // [N_EXPERT total] id → dense or -1
+        const int   * __restrict__ remap,      // [N_EXPERT total] id → dGPU dense slot, or -(iGPU slot + 1)
         unsigned int  mode,                    // 0 = iGPU misses, 1 = dGPU hits
         unsigned int  cap,
         unsigned int  n_used,

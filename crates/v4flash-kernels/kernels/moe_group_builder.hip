@@ -59,15 +59,20 @@ extern "C" __global__ void moe_group_builder(
 // logic in q2_k_reduce_partials_hetsplit — both scan d_selected in slot
 // order counting resident slots.
 //
-//   mode 0 (iGPU): keep the complement; group ids in ORIGINAL expert space
-//                  (group arrays sized n_expert like the plain builder).
+// M63: remap[e] < 0 additionally CARRIES the iGPU slot as -(igpu_slot+1)
+// (not a bare -1). With the full 256-expert iGPU buffer igpu_slot == e, so
+// the group id below is unchanged; with IGPU_DEDUP_HOT the iGPU holds only
+// the 256-n_hot cold experts packed dense and igpu_slot is that packed slot.
+//
+//   mode 0 (iGPU): keep the complement; group ids in the iGPU SLOT space
+//                  (group arrays sized n_expert = the iGPU slot count).
 //   mode 1 (dGPU): keep the hits; group ids in DENSE remap space (group
 //                  arrays sized n_hot).
 extern "C" __global__ void moe_group_builder_hetsplit(
         int       * __restrict__ group_count,      // [n_expert] — must be pre-zeroed
         int       * __restrict__ expert_members,   // [n_expert * max_per_expert]
         const int * __restrict__ d_selected,       // [B, n_used] — flat
-        const int * __restrict__ remap,            // [N_EXPERT total] id → dense or -1
+        const int * __restrict__ remap,            // [N_EXPERT total] id → dGPU dense slot, or -(iGPU slot + 1)
         unsigned int mode,                         // 0 = iGPU misses, 1 = dGPU hits
         unsigned int cap,                          // max resident slots/token on dGPU
         unsigned int batch,                        // B
@@ -93,8 +98,8 @@ extern "C" __global__ void moe_group_builder_hetsplit(
     }
     const bool dgpu_takes = (dense >= 0) && (rank < cap);
     int g;
-    if (mode == 1) { if (!dgpu_takes) return; g = dense; }
-    else           { if (dgpu_takes)  return; g = e;     }
+    if (mode == 1) { if (!dgpu_takes) return; g = dense;          }
+    else           { if (dgpu_takes)  return; g = -dense - 1;     }
     if ((unsigned int)g >= n_expert) return;
     const int pos = atomicAdd(&group_count[g], 1);
     if ((unsigned int)pos >= max_per_expert) return; // overflow guard

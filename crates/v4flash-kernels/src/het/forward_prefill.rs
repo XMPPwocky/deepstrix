@@ -62,6 +62,11 @@ fn hot_prefill_enabled() -> bool {
 /// tokens with >4 resident slots are vanishingly rare.
 fn hot_prefill_cap() -> u32 {
     static CAP: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        if crate::het::weights::igpu_dedup_hot() {
+            // M63: must equal the decode cap (see dgpu_hot_cap) — both are
+            // pinned to N_EXPERT_USED, so the partitions still match.
+            return crate::het::weights::dgpu_hot_cap();
+        }
         std::env::var("DGPU_HOT_CAP_PREFILL")
             .ok()
             .or_else(|| std::env::var("DGPU_HOT_CAP").ok())
@@ -78,10 +83,20 @@ fn prefill_hot_active(
     ilw: &IgpuLayerWeights,
     bd: &BatchDgpuScratch,
 ) -> bool {
-    hot_prefill_enabled()
+    let active = hot_prefill_enabled()
         && bd.hot.is_some()
         && dlw.hot_experts.is_some()
-        && ilw.hot_remap.is_some()
+        && ilw.hot_remap.is_some();
+    // M63: a packed iGPU buffer has no non-hetsplit fallback — the plain
+    // by-expert builder emits raw expert ids. validate_dedup_preconditions
+    // rules every disabling knob out at load, so this can only fire on a
+    // future path that forgets to.
+    debug_assert!(
+        active || !ilw.igpu_packed,
+        "L{}: iGPU experts packed but the prefill het-split is inactive",
+        ilw.layer_idx
+    );
+    active
 }
 
 impl HeterogeneousEngine {
@@ -2507,6 +2522,15 @@ impl HeterogeneousEngine {
                     max_per_expert,
                 )?;
             } else {
+                // Emits RAW expert ids as group ids — incompatible with a
+                // de-duplicated iGPU buffer (see prefill_hot_active).
+                if ilw.igpu_packed {
+                    return Err(eyre!(
+                        "L{layer}: iGPU experts are packed (IGPU_DEDUP_HOT) but the prefill \
+                         het-split is inactive — the plain group builder would index the \
+                         wrong experts"
+                    ));
+                }
                 ie.moe_group_builder.launch(
                     &ie.compute,
                     group_count,

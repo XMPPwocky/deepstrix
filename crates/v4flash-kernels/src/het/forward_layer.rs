@@ -1353,13 +1353,9 @@ impl HeterogeneousEngine {
         // devices hold, so the q8k quantization is bit-identical.
         if parallel {
             if let Some(hot) = dlw.hot_experts.as_ref() {
-        // M58.3: the dGPU takes at most DGPU_HOT_CAP resident slots per
-        // token (default 4 ≈ the leg-balance point: misses×32.5 µs vs
-        // hits×12.3 µs + shared ~46 µs cross near h*≈3.3-4); overflow goes
-        // back to the otherwise-idle iGPU.
-        static HOT_CAP: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-            std::env::var("DGPU_HOT_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(4)
-        });
+        // M58.3 leg balance; see het::weights::dgpu_hot_cap (single source of
+        // truth — the iGPU leg below must pass the identical value).
+        let hot_cap = crate::het::weights::dgpu_hot_cap();
                 let mid_blocks_bytes_d = (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES;
                 let hot_gbpe = ilw.routed.gate_bytes_per_expert;
                 let hot_dbpe = ilw.routed.down_bytes_per_expert;
@@ -1370,7 +1366,7 @@ impl HeterogeneousEngine {
                         de, ilw.routed.gate.dtype, s, &mut dgpu_scratch.moe_mid_cat,
                         &hot.gate, &hot.up,
                         &dgpu_scratch.moe_xq, &dgpu_scratch.d_ew, &dgpu_scratch.d_selected,
-                        &hot.remap, /*mode=*/1, *HOT_CAP,
+                        &hot.remap, /*mode=*/1, hot_cap,
                         hot_gbpe as u32, hot_gbpe as u32,
                         N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
                     )?;
@@ -1378,7 +1374,7 @@ impl HeterogeneousEngine {
                     super::dispatch::moe_down_batched_hetsplit(
                         de, ilw.routed.down.dtype, s, &mut dgpu_scratch.ffn_moe_dgpu,
                         &hot.down, &dgpu_scratch.moe_midq_cat, &dgpu_scratch.d_selected,
-                        &hot.remap, /*mode=*/1, *HOT_CAP,
+                        &hot.remap, /*mode=*/1, hot_cap,
                         hot_dbpe as u32, mid_blocks_bytes_d as u32,
                         N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN,
                     )?;
@@ -1438,15 +1434,23 @@ impl HeterogeneousEngine {
         self.igpu_graphs.run("routed_moe", layer as u32, &ie.compute, |s| {
             ie.q8k.launch(s, &mut igpu_scratch.d_xq_q8k, &igpu_scratch.ffn_input_norm_recv, BLOCKS_Q8K_GATE_IN)?;
             if let Some(remap) = ilw.hot_remap.as_ref() {
-                // M56: skip dGPU-resident slots (the dGPU computes those,
-                // up to DGPU_HOT_CAP — overflow comes back here).
-                static HOT_CAP_I: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-                    std::env::var("DGPU_HOT_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(4)
-                });
-                super::dispatch::moe_gate_up_batch_hetsplit(ie, ilw.routed.gate.dtype, s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, remap, /*mode=*/0, *HOT_CAP_I, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
+                // M56: skip dGPU-resident slots (the dGPU computes those, up
+                // to the cap — overflow comes back here, unless M63 de-dup
+                // pinned the cap at N_EXPERT_USED, which removes overflow).
+                let hot_cap_i = crate::het::weights::dgpu_hot_cap();
+                super::dispatch::moe_gate_up_batch_hetsplit(ie, ilw.routed.gate.dtype, s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, remap, /*mode=*/0, hot_cap_i, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
                 ie.q8k.launch(s, &mut igpu_scratch.d_midq_cat, &igpu_scratch.d_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
-                super::dispatch::moe_down_batched_hetsplit(ie, ilw.routed.down.dtype, s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, remap, /*mode=*/0, *HOT_CAP_I, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
+                super::dispatch::moe_down_batched_hetsplit(ie, ilw.routed.down.dtype, s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, remap, /*mode=*/0, hot_cap_i, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;
             } else {
+                // The plain kernels index by RAW expert id, so they cannot
+                // read a de-duplicated buffer. Load-time validation should
+                // have made this unreachable; fail loudly if it didn't.
+                if ilw.igpu_packed {
+                    return Err(eyre!(
+                        "L{layer}: iGPU experts are packed (IGPU_DEDUP_HOT) but hot_remap is \
+                         missing — the plain MoE path would read the wrong experts"
+                    ));
+                }
                 super::dispatch::moe_gate_up_batch(ie, ilw.routed.gate.dtype, s, &mut igpu_scratch.d_mid_cat, &ilw.routed.gate.buffer, &ilw.routed.up.buffer, &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected, gbpe as u32, ubpe as u32, N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN)?;
                 ie.q8k.launch(s, &mut igpu_scratch.d_midq_cat, &igpu_scratch.d_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
                 super::dispatch::moe_down_batched(ie, ilw.routed.down.dtype, s, &mut igpu_scratch.ffn_moe, &ilw.routed.down.buffer, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected, dbpe as u32, mid_blocks_bytes as u32, N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN)?;

@@ -242,7 +242,11 @@ extern "C" __global__ void iq2_s_pair_matvec_fused_swiglu_batch_hetsplit(
         }
         return;
     }
-    const int e = (mode == 0u) ? sel : dense;
+    // M63 iGPU de-dup: remap encodes BOTH devices' slots — hot experts hold
+    // their dGPU dense slot (>=0), cold experts hold -(igpu_slot+1). With the
+    // full 256-expert iGPU buffer igpu_slot == sel, so this is identical to the
+    // old `sel`; with IGPU_DEDUP_HOT it is the packed cold-only slot.
+    const int e = (mode == 0u) ? (-dense - 1) : dense;
 
     IQ2S_STAGE_TABLES(s_sign_pair256, s_grid2s);
     const unsigned int xq_bytes = n_blocks * 292u;

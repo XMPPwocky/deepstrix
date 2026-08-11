@@ -93,13 +93,25 @@ pub struct IgpuLayerWeights {
     pub ratio: u32,
     pub is_hash_router: bool,
 
-    // Routed experts (all 256, iGPU-resident)
+    /// Routed experts. All 256 by default; with `IGPU_DEDUP_HOT` only the
+    /// `256 - n_hot` experts that are NOT dGPU-resident, packed dense
+    /// (`routed.n_slots`).
     pub routed: RoutedExpertWeights,
 
     /// M56 het-split: iGPU-resident copy of the resident-expert remap
     /// (remap[e] >= 0 ⇔ expert e is ALSO dGPU-resident; the iGPU MoE
     /// kernels then skip those slots). None = feature off.
+    ///
+    /// M63: the negative branch is no longer a bare -1 — it carries this
+    /// layer's iGPU slot for expert e as `-(slot + 1)`. Without de-dup
+    /// `slot == e`, so the kernels' `-remap[e] - 1` is the old raw id.
     pub hot_remap: Option<DeviceBuffer<i32>>,
+
+    /// M63: true when `routed` holds only the cold experts. Every iGPU MoE
+    /// launch for this layer MUST then go through the hetsplit kernels —
+    /// the plain ones index by raw expert id and would read the wrong
+    /// expert. Enforced at load by `validate_dedup_preconditions`.
+    pub igpu_packed: bool,
 
     /// Per-layer RoPE params. Mirrors the dGPU side for any future
     /// iGPU-resident RoPE call (currently unused — all RoPE runs on dGPU).
@@ -386,29 +398,38 @@ impl DgpuLayerWeights {
 }
 
 impl IgpuLayerWeights {
+    /// `cold_ids` is this layer's iGPU slot space: the expert ids to keep,
+    /// in slot order. Pass all of `0..N_EXPERT` for the classic full-residency
+    /// layout; pass the complement of the dGPU-resident set for M63 de-dup.
     pub fn load(
         gguf: &MappedGguf,
         igpu_device: Device,
         layer: i32,
+        cold_ids: &[u32],
         rope_params_for_layer: &dyn Fn(i32) -> eyre::Result<RopeParams>,
     ) -> eyre::Result<Self> {
         igpu_device.set_current()?;
         let device_id = igpu_device.id;
         let ratio = COMPRESS_RATIOS[layer as usize];
         let is_hash_router = layer < N_HASH_LAYERS;
+        let igpu_packed = cold_ids.len() != N_EXPERT as usize;
 
-        // Routed expert weights — fully iGPU-resident (~1.2 GiB/layer).
-        let gate = load_to_device(
-            gguf,
-            &format!("blk.{layer}.ffn_gate_exps.weight"),
-            device_id,
-        )?;
-        let up = load_to_device(gguf, &format!("blk.{layer}.ffn_up_exps.weight"), device_id)?;
-        let down = load_to_device(
-            gguf,
-            &format!("blk.{layer}.ffn_down_exps.weight"),
-            device_id,
-        )?;
+        // Routed expert weights — iGPU-resident (~1.2 GiB/layer at full
+        // residency). The full-residency path is kept byte-for-byte as it
+        // was: a straight whole-tensor upload with no repacking.
+        let (gate, up, down) = if igpu_packed {
+            (
+                load_experts_packed(gguf, layer, "gate", device_id, cold_ids)?,
+                load_experts_packed(gguf, layer, "up", device_id, cold_ids)?,
+                load_experts_packed(gguf, layer, "down", device_id, cold_ids)?,
+            )
+        } else {
+            (
+                load_to_device(gguf, &format!("blk.{layer}.ffn_gate_exps.weight"), device_id)?,
+                load_to_device(gguf, &format!("blk.{layer}.ffn_up_exps.weight"), device_id)?,
+                load_to_device(gguf, &format!("blk.{layer}.ffn_down_exps.weight"), device_id)?,
+            )
+        };
         // Strides from the actual dtype, not compile-time constants — the
         // unsloth UD mix varies expert dtypes per layer (blk.26 gate/up
         // IQ2_S, blk.26/42 down MXFP4). Cross-checked against the real
@@ -420,17 +441,18 @@ impl IgpuLayerWeights {
             weight_contract::bytes_per_expert(up.dtype, N_EMBD as u64, n_ff)?;
         let down_bytes_per_expert =
             weight_contract::bytes_per_expert(down.dtype, n_ff, N_EMBD as u64)?;
+        let n_slots = cold_ids.len();
         for (name, w, bpe) in [
             ("gate_exps", &gate, gate_bytes_per_expert),
             ("up_exps", &up, up_bytes_per_expert),
             ("down_exps", &down, down_bytes_per_expert),
         ] {
-            let expect = (N_EXPERT as usize) * bpe;
+            let expect = n_slots * bpe;
             if w.buffer.len() != expect {
                 return Err(eyre!(
                     "blk.{layer}.ffn_{name}: buffer {} B != {} experts × {} B/expert ({:?})",
                     w.buffer.len(),
-                    N_EXPERT,
+                    n_slots,
                     bpe,
                     w.dtype
                 ));
@@ -443,6 +465,7 @@ impl IgpuLayerWeights {
             gate_bytes_per_expert,
             up_bytes_per_expert,
             down_bytes_per_expert,
+            n_slots: n_slots as u32,
         };
 
         let rope_params = rope_params_for_layer(layer)?;
@@ -453,9 +476,64 @@ impl IgpuLayerWeights {
             is_hash_router,
             routed,
             hot_remap: None,
+            igpu_packed,
             rope_params,
         })
     }
+}
+
+/// M63: upload one routed-expert tensor keeping only `cold_ids`, packed dense
+/// in slot order.
+///
+/// Streams a single expert at a time (pread → small host staging → device
+/// sub-range) rather than materialising the whole tensor host-side: the
+/// full-tensor path costs an 0.8–1.1 GiB transient `Vec` per tensor, which is
+/// most of the load-time VmHWM spike.
+fn load_experts_packed(
+    gguf: &MappedGguf,
+    layer: i32,
+    which: &str,
+    device_id: i32,
+    cold_ids: &[u32],
+) -> eyre::Result<DeviceWeight> {
+    let name = format!("blk.{layer}.ffn_{which}_exps.weight");
+    let tensor = gguf
+        .gguf()
+        .tensor(&name)
+        .ok_or_else(|| eyre!("tensor `{name}` not found in GGUF"))?;
+    let n_ff = crate::config::N_FF_EXP as u64;
+    let (k, rows) = if which == "down" {
+        (n_ff, N_EMBD as u64)
+    } else {
+        (N_EMBD as u64, n_ff)
+    };
+    let bpe = weight_contract::bytes_per_expert(tensor.dtype, k, rows)?;
+    if tensor.byte_size as usize != (N_EXPERT as usize) * bpe {
+        return Err(eyre!(
+            "{name}: byte_size {} != {} experts × {bpe} B/expert ({:?})",
+            tensor.byte_size,
+            N_EXPERT,
+            tensor.dtype
+        ));
+    }
+    let mut buffer = DeviceBuffer::<u8>::new(device_id, cold_ids.len() * bpe)?;
+    let mut staging = vec![0u8; bpe];
+    for (slot, &e) in cold_ids.iter().enumerate() {
+        gguf.read_range_into(
+            tensor.shard,
+            tensor.abs_offset + (e as u64) * (bpe as u64),
+            &mut staging,
+        )?;
+        buffer
+            .slice_view_mut(slot * bpe, bpe)
+            .copy_from_host(&staging)?;
+    }
+    Ok(DeviceWeight {
+        buffer,
+        n_elements: (cold_ids.len() as u64) * k * rows,
+        dtype: tensor.dtype,
+        shape: vec![k, rows, cold_ids.len() as u64],
+    })
 }
 
 /// M56: dGPU-resident copies of the K hottest routed experts of one layer
@@ -534,6 +612,129 @@ impl HotExpertWeights {
             remap_host,
         ))
     }
+}
+
+/// M63: drop the iGPU copies of the experts the dGPU holds (`IGPU_DEDUP_HOT`).
+///
+/// The iGPU MoE kernels already SKIP every dGPU-resident expert
+/// (`mode 0: process slot iff remap[e] < 0`), so those bytes were read in
+/// exactly one situation: when more than `DGPU_HOT_CAP` of a token's
+/// `N_EXPERT_USED` picks were resident, the surplus fell back to the iGPU and
+/// indexed at the raw expert id. Pinning the cap at `N_EXPERT_USED` makes that
+/// branch unreachable, and the copies become dead weight worth
+/// `K × N_LAYER × (gate+up+down)` bytes of GTT — ~2.4 GiB at K=8 on the
+/// unsloth UD-IQ2_XXS mix.
+///
+/// Off by default until the GPU A/B lands.
+pub fn igpu_dedup_hot() -> bool {
+    std::env::var("IGPU_DEDUP_HOT").map(|v| v != "0").unwrap_or(false)
+}
+
+/// M58.3 leg balance: max dGPU-resident slots the dGPU computes per token;
+/// the rest overflow back to the otherwise-idle iGPU. Default 4 (misses×32.5 µs
+/// vs hits×12.3 µs + shared ~46 µs cross near h*≈3.3-4).
+///
+/// Single source of truth — the decode dGPU leg, the decode iGPU leg and the
+/// prefill group builder must all pass the SAME value or the two devices
+/// disagree about who owns a slot (dropped or double-counted experts).
+///
+/// M63 pins it at `N_EXPERT_USED` under de-dup: with no iGPU copy left, an
+/// overflow slot has nowhere to run.
+pub fn dgpu_hot_cap() -> u32 {
+    static CAP: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        if igpu_dedup_hot() {
+            return crate::config::N_EXPERT_USED as u32;
+        }
+        std::env::var("DGPU_HOT_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(4)
+    });
+    *CAP
+}
+
+/// This layer's iGPU slot space: the expert ids the iGPU keeps, in slot order.
+///
+/// The identity `0..N_EXPERT` unless de-dup is on AND the dGPU actually takes
+/// experts here — a layer the global-greedy allocator gave zero slots stays
+/// fully resident, and so keeps working through the plain kernels.
+pub fn igpu_slot_space(hot_ids: &[u32], dedup: bool) -> Vec<u32> {
+    if !dedup || hot_ids.is_empty() {
+        return (0..N_EXPERT as u32).collect();
+    }
+    let mut is_hot = [false; N_EXPERT as usize];
+    for &e in hot_ids {
+        is_hot[e as usize] = true;
+    }
+    (0..N_EXPERT as u32).filter(|e| !is_hot[*e as usize]).collect()
+}
+
+/// Rewrite the miss branch of a dGPU remap into the iGPU slot encoding.
+///
+/// In: `remap[e]` = dGPU dense slot, or a bare -1 for "not resident".
+/// Out: misses carry the iGPU slot as `-(slot + 1)`, which the MoE kernels
+/// decode with `-remap[e] - 1`. Hits are untouched.
+///
+/// `packed` must match how the iGPU buffer was actually built: packed ⇒ slots
+/// are the cold experts numbered in ascending order; otherwise slot == id.
+pub fn encode_igpu_remap(remap: &mut [i32], packed: bool) {
+    if packed {
+        let mut slot = 0i32;
+        for v in remap.iter_mut() {
+            if *v < 0 {
+                *v = -slot - 1;
+                slot += 1;
+            }
+        }
+    } else {
+        for (e, v) in remap.iter_mut().enumerate() {
+            if *v < 0 {
+                *v = -(e as i32) - 1;
+            }
+        }
+    }
+}
+
+/// Everything that would let a raw expert id reach a packed iGPU buffer.
+///
+/// All of these are load-time-decidable, so de-dup fails the load rather than
+/// silently computing the wrong expert. The runtime predicates that gate the
+/// het-split (`prefill_hot_active`, and the decode `hot_experts.is_some()`
+/// check) are all derived from these same inputs.
+fn validate_dedup_preconditions(placement: &[Vec<u32>]) -> eyre::Result<()> {
+    let n_used = crate::config::N_EXPERT_USED as u32;
+    let mut problems = Vec::new();
+    for (var, val) in [
+        ("DGPU_HOT_CAP", std::env::var("DGPU_HOT_CAP").ok()),
+        ("DGPU_HOT_CAP_PREFILL", std::env::var("DGPU_HOT_CAP_PREFILL").ok()),
+    ] {
+        if let Some(v) = val.as_deref().and_then(|s| s.parse::<u32>().ok()) {
+            if v < n_used {
+                problems.push(format!(
+                    "{var}={v} < N_EXPERT_USED={n_used}: the overflow slots would fall back to \
+                     the iGPU, whose copies IGPU_DEDUP_HOT removes"
+                ));
+            }
+        }
+    }
+    if std::env::var("DGPU_HOT_PREFILL").map(|v| v == "0").unwrap_or(false) {
+        problems.push(
+            "DGPU_HOT_PREFILL=0 routes prefill through the plain by-expert builder, which \
+             indexes by raw expert id"
+                .into(),
+        );
+    }
+    if placement.iter().all(|l| l.is_empty()) {
+        problems.push(
+            "no hot experts placed (DGPU_HOT_EXPERTS=0 or unusable placement file) — nothing \
+             to de-duplicate"
+                .into(),
+        );
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(eyre!(
+        "IGPU_DEDUP_HOT is set but cannot be used safely:\n  - {}",
+        problems.join("\n  - ")
+    ))
 }
 
 /// Path to the hot-expert placement file (`DGPU_HOT_EXPERTS_FILE`, else the
@@ -646,9 +847,37 @@ impl HetModelWeights {
         // first tensor mid-load — or worse, slicing at a wrong stride.
         weight_contract::validate_model(gguf.gguf())?;
         let global = HetGlobalWeights::load(gguf, dgpu_device)?;
+
+        // M56 het-split: place the K hottest experts per layer on the dGPU too.
+        // K defaults to 6 when a placement file exists (see dgpu_hot_experts).
+        //
+        // M63: resolved BEFORE the layer loop, because the iGPU upload now
+        // needs to know which experts the dGPU will take in order to skip
+        // them. A placement file that won't parse disables the split (warn,
+        // as before) rather than failing the load.
+        let hot_k: usize = dgpu_hot_experts();
+        let placement: Vec<Vec<u32>> = if hot_k > 0 {
+            let path = hot_expert_file_path();
+            match parse_hot_expert_file(&path, hot_k) {
+                Ok(lists) => lists,
+                Err(e) => {
+                    eprintln!("WARN DGPU_HOT_EXPERTS set but placement file unusable: {e}");
+                    vec![Vec::new(); N_LAYER as usize]
+                }
+            }
+        } else {
+            vec![Vec::new(); N_LAYER as usize]
+        };
+        let dedup = igpu_dedup_hot();
+        if dedup {
+            validate_dedup_preconditions(&placement)?;
+        }
+
         let mut dgpu_layers = Vec::with_capacity(N_LAYER as usize);
         let mut igpu_layers = Vec::with_capacity(N_LAYER as usize);
+        let mut freed_bytes: u64 = 0;
         for layer in 0..N_LAYER {
+            let cold_ids = igpu_slot_space(&placement[layer as usize], dedup);
             dgpu_layers.push(DgpuLayerWeights::load(
                 gguf,
                 dgpu_device,
@@ -659,49 +888,55 @@ impl HetModelWeights {
                 gguf,
                 igpu_device,
                 layer,
+                &cold_ids,
                 rope_params_for_layer,
             )?);
+            let r = &igpu_layers[layer as usize].routed;
+            freed_bytes += (N_EXPERT as u64 - r.n_slots as u64)
+                * (r.gate_bytes_per_expert + r.up_bytes_per_expert + r.down_bytes_per_expert)
+                    as u64;
         }
-        // M56 het-split: place the K hottest experts per layer on the dGPU too.
-        // K defaults to 6 when a placement file exists (see dgpu_hot_experts).
-        let hot_k: usize = dgpu_hot_experts();
+
         if hot_k > 0 {
-            let path = hot_expert_file_path();
-            match parse_hot_expert_file(&path, hot_k) {
-                Ok(lists) => {
-                    for layer in 0..N_LAYER as usize {
-                        if lists[layer].is_empty() {
-                            // Global greedy gave this (flat-routing) layer
-                            // zero slots — leave it fully iGPU-resident.
-                            continue;
-                        }
-                        match HotExpertWeights::load(
-                            gguf,
-                            dgpu_device,
-                            layer as i32,
-                            &lists[layer],
-                        ) {
-                            Ok((hot, remap_host)) => {
-                                igpu_device.set_current()?;
-                                let mut r =
-                                    DeviceBuffer::<i32>::new(igpu_device.id, 256)?;
-                                r.copy_from_host(&remap_host)?;
-                                igpu_layers[layer].hot_remap = Some(r);
-                                dgpu_layers[layer].hot_experts = Some(hot);
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "WARN hot-expert load failed at L{layer} (disabled): {e}"
-                                );
-                            }
-                        }
+            for layer in 0..N_LAYER as usize {
+                if placement[layer].is_empty() {
+                    // Global greedy gave this (flat-routing) layer zero
+                    // slots — leave it fully iGPU-resident.
+                    continue;
+                }
+                match HotExpertWeights::load(gguf, dgpu_device, layer as i32, &placement[layer]) {
+                    Ok((hot, remap_host)) => {
+                        // M63: rewrite the miss branch from a bare -1 to
+                        // -(iGPU slot + 1). Without de-dup that is -(e + 1),
+                        // which the kernels decode straight back to e.
+                        let mut remap_host = remap_host;
+                        encode_igpu_remap(&mut remap_host, igpu_layers[layer].igpu_packed);
+                        igpu_device.set_current()?;
+                        let mut r = DeviceBuffer::<i32>::new(igpu_device.id, 256)?;
+                        r.copy_from_host(&remap_host)?;
+                        igpu_layers[layer].hot_remap = Some(r);
+                        dgpu_layers[layer].hot_experts = Some(hot);
                     }
-                    dgpu_device.set_current()?;
-                    eprintln!("M56 het-split: {hot_k} hot experts/layer resident on dGPU");
+                    Err(e) => {
+                        if igpu_layers[layer].igpu_packed {
+                            // The iGPU already dropped these experts — there
+                            // is no fallback path that can compute them.
+                            return Err(eyre!(
+                                "IGPU_DEDUP_HOT: hot-expert load failed at L{layer} and the \
+                                 iGPU copies are already gone: {e}"
+                            ));
+                        }
+                        eprintln!("WARN hot-expert load failed at L{layer} (disabled): {e}");
+                    }
                 }
-                Err(e) => {
-                    eprintln!("WARN DGPU_HOT_EXPERTS set but placement file unusable: {e}");
-                }
+            }
+            dgpu_device.set_current()?;
+            eprintln!("M56 het-split: {hot_k} hot experts/layer resident on dGPU");
+            if dedup {
+                eprintln!(
+                    "M63 iGPU de-dup: dropped {:.2} GiB of duplicate iGPU expert copies",
+                    freed_bytes as f64 / (1u64 << 30) as f64
+                );
             }
         }
         Ok(Self {
@@ -709,5 +944,99 @@ impl HetModelWeights {
             dgpu_layers,
             igpu_layers,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the MoE kernels do with the miss branch: `-remap[e] - 1`.
+    fn decode(remap: &[i32], e: u32) -> i32 {
+        -remap[e as usize] - 1
+    }
+
+    /// Build the dGPU-side remap exactly as `HotExpertWeights::load` does.
+    fn dgpu_remap(hot_ids: &[u32]) -> Vec<i32> {
+        let mut r = vec![-1i32; N_EXPERT as usize];
+        for (dense, &e) in hot_ids.iter().enumerate() {
+            r[e as usize] = dense as i32;
+        }
+        r
+    }
+
+    #[test]
+    fn slot_space_is_identity_without_dedup() {
+        let hot = [3u32, 200, 41];
+        let cold = igpu_slot_space(&hot, false);
+        assert_eq!(cold.len(), N_EXPERT as usize);
+        assert!(cold.iter().enumerate().all(|(i, &e)| i as u32 == e));
+    }
+
+    /// A layer the allocator gave no slots must stay fully resident even with
+    /// de-dup on — it still runs the plain, raw-id kernels.
+    #[test]
+    fn slot_space_is_identity_for_a_layer_with_no_hot_experts() {
+        assert_eq!(igpu_slot_space(&[], true).len(), N_EXPERT as usize);
+    }
+
+    #[test]
+    fn slot_space_drops_hot_experts_and_stays_ascending() {
+        let hot = [200u32, 3, 41]; // placement order is by frequency, not id
+        let cold = igpu_slot_space(&hot, true);
+        assert_eq!(cold.len(), N_EXPERT as usize - 3);
+        assert!(!cold.contains(&3) && !cold.contains(&41) && !cold.contains(&200));
+        assert!(cold.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// Without de-dup the encoding must reproduce the raw expert id — this is
+    /// what keeps the kernel change a no-op for the default configuration.
+    #[test]
+    fn encoding_without_packing_decodes_to_the_raw_expert_id() {
+        let hot = [7u32, 99];
+        let mut remap = dgpu_remap(&hot);
+        encode_igpu_remap(&mut remap, false);
+        for e in 0..N_EXPERT as u32 {
+            if hot.contains(&e) {
+                assert!(remap[e as usize] >= 0, "hot expert {e} must stay a dGPU slot");
+            } else {
+                assert_eq!(decode(&remap, e), e as i32);
+            }
+        }
+    }
+
+    /// With packing, decoding a cold expert must land on the slot that
+    /// `load_experts_packed` actually wrote it to — i.e. its index in
+    /// `igpu_slot_space`.
+    #[test]
+    fn encoding_with_packing_decodes_to_the_packed_slot() {
+        let hot = [200u32, 3, 41];
+        let cold = igpu_slot_space(&hot, true);
+        let mut remap = dgpu_remap(&hot);
+        encode_igpu_remap(&mut remap, true);
+        for (slot, &e) in cold.iter().enumerate() {
+            assert_eq!(decode(&remap, e), slot as i32, "expert {e}");
+        }
+        // Hits keep their dGPU dense slot, so the skip predicate (>= 0) and
+        // the dGPU weight index are both unchanged.
+        for (dense, &e) in hot.iter().enumerate() {
+            assert_eq!(remap[e as usize], dense as i32);
+        }
+    }
+
+    /// The skip predicate the kernels use (`remap[e] < 0` ⇔ iGPU computes it)
+    /// must be invariant under the encoding — that is the whole reason the
+    /// negative branch could be overloaded in the first place.
+    #[test]
+    fn encoding_preserves_the_residency_predicate() {
+        let hot = [1u32, 2, 255];
+        for packed in [false, true] {
+            let before = dgpu_remap(&hot);
+            let mut after = before.clone();
+            encode_igpu_remap(&mut after, packed);
+            for e in 0..N_EXPERT as usize {
+                assert_eq!(before[e] >= 0, after[e] >= 0, "expert {e}, packed={packed}");
+            }
+        }
     }
 }

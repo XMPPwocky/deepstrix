@@ -45,6 +45,10 @@ pub struct RoutedExpertWeights {
     pub gate_bytes_per_expert: usize,
     pub up_bytes_per_expert: usize,
     pub down_bytes_per_expert: usize,
+    /// Experts actually present in these buffers. `N_EXPERT` normally; with
+    /// M63 iGPU de-dup, `N_EXPERT - n_hot` for that layer. Slot `s` in
+    /// `0..n_slots` is at `s * *_bytes_per_expert`.
+    pub n_slots: u32,
 }
 
 /// Load a named F32 tensor from GGUF into a fresh per-device buffer.

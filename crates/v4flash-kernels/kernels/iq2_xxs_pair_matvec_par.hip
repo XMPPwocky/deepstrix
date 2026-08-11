@@ -522,7 +522,7 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_batch_hetsplit(
         const uint8_t * __restrict__ xq,
         const float  * __restrict__ expert_w,
         const int    * __restrict__ selected,      // [n_used]
-        const int    * __restrict__ remap,         // [256]; -1 = not dGPU-resident
+        const int    * __restrict__ remap,         // [256]; <0 = not dGPU-resident, encodes -(iGPU slot+1)
         unsigned int    mode,                      // 0 = iGPU share, 1 = dGPU share
         unsigned int    dgpu_cap,                  // max resident slots dGPU takes (overflow → iGPU)
         unsigned int    gate_bpe,
@@ -558,7 +558,11 @@ extern "C" __global__ void iq2_xxs_pair_matvec_fused_swiglu_batch_hetsplit(
         }
         return;
     }
-    const int e = (mode == 0u) ? sel : dense;
+    // M63 iGPU de-dup: remap encodes BOTH devices' slots — hot experts hold
+    // their dGPU dense slot (>=0), cold experts hold -(igpu_slot+1). With the
+    // full 256-expert iGPU buffer igpu_slot == sel, so this is identical to the
+    // old `sel`; with IGPU_DEDUP_HOT it is the packed cold-only slot.
+    const int e = (mode == 0u) ? (-dense - 1) : dense;
 
     if (tid < 128) {
         const uint32_t s = ksigns_iq2xs[tid];
