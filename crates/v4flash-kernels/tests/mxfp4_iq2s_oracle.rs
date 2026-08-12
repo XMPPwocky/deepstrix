@@ -132,10 +132,14 @@ fn mxfp4_kernels_match_cpu() -> eyre::Result<()> {
     check("mxfp4 batched", &got, &want, 5e-3)?;
 
     // hetsplit identity
+    // M63: the kernels read the miss branch as -(iGPU slot + 1), not a bare
+    // -1. Go through the real encoder so this test exercises exactly what
+    // HetModelWeights::load_all builds (packed=false => slot == expert id).
     let mut remap_h = vec![-1i32; 256];
     remap_h[200] = 0;
     remap_h[77] = 1;
     let mut remap_d: DeviceBuffer<i32> = DeviceBuffer::new(igpu.id, 256)?;
+    v4flash_kernels::het::weights::encode_igpu_remap(&mut remap_h, false);
     remap_d.copy_from_host(&remap_h)?;
     let mut hot_host = vec![0u8; 2 * dbpe];
     hot_host[..dbpe].copy_from_slice(&w_host[200 * dbpe..201 * dbpe]);
@@ -301,6 +305,7 @@ fn iq2_s_kernels_match_cpu() -> eyre::Result<()> {
     remap_h[240] = 0;
     remap_h[61] = 1;
     let mut remap_d: DeviceBuffer<i32> = DeviceBuffer::new(igpu.id, 256)?;
+    v4flash_kernels::het::weights::encode_igpu_remap(&mut remap_h, false);
     remap_d.copy_from_host(&remap_h)?;
     let mut hot_g = vec![0u8; 2 * bpe];
     hot_g[..bpe].copy_from_slice(&gate_h[240 * bpe..241 * bpe]);

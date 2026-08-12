@@ -167,6 +167,10 @@ fn iq3_xxs_decode_kernels_match_cpu() -> eyre::Result<()> {
     let mut remap_h = vec![-1i32; 256];
     remap_h[250] = 0;
     remap_h[99] = 1;
+    // M63: the kernels read the miss branch as -(iGPU slot + 1), not a bare
+    // -1. Go through the real encoder so this test exercises exactly what
+    // HetModelWeights::load_all builds (packed=false => slot == expert id).
+    v4flash_kernels::het::weights::encode_igpu_remap(&mut remap_h, false);
     let mut remap_d: DeviceBuffer<i32> = DeviceBuffer::new(igpu.id, 256)?;
     remap_d.copy_from_host(&remap_h)?;
     // dense-packed hot weights: slot 0 = expert 250, slot 1 = expert 99

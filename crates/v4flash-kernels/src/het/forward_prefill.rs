@@ -2369,28 +2369,16 @@ impl HeterogeneousEngine {
                 &bd.ffn_input_norm,
                 crate::config::BLOCKS_Q8K_GATE_IN * b,
             )?;
-            match ilw.routed.gate.dtype {
-                v4flash_core::gguf::GgufType::IQ2_S => de.iq2s.launch_fused_swiglu_chunked(
-                    &de.compute,
-                    &mut hd.mid_cat,
-                    &hot.gate,
-                    &hot.up,
-                    &hd.moe_xq,
-                    &bd.d_ew,
-                    &hd.group_count,
-                    &hd.expert_members,
-                    &hd.work_items_static,
-                    n_wi,
-                    gbpe,
-                    ubpe,
-                    cs_n_used as u32,
-                    B_MAX as u32,
-                    HOT_CHUNK as u32,
-                    crate::config::SWIGLU_CLAMP_EXP,
-                    crate::config::N_FF_EXP,
-                    crate::config::BLOCKS_Q8K_GATE_IN,
-                )?,
-                _ => de.iq2.launch_fused_swiglu_kwide(
+            // Single-prefill-kernel formats (IQ2_S/IQ2_XS/IQ3_XXS) go through
+            // the dispatcher; IQ2_XXS falls through to its kwide kernel.
+            if !super::dispatch::moe_gate_up_chunked(
+                de, ilw.routed.gate.dtype, &de.compute, &mut hd.mid_cat, &hot.gate, &hot.up,
+                &hd.moe_xq, &bd.d_ew, &hd.group_count, &hd.expert_members,
+                &hd.work_items_static, n_wi, gbpe, ubpe, cs_n_used as u32,
+                B_MAX as u32, HOT_CHUNK as u32, crate::config::SWIGLU_CLAMP_EXP,
+                crate::config::N_FF_EXP, crate::config::BLOCKS_Q8K_GATE_IN,
+            )? {
+                de.iq2.launch_fused_swiglu_kwide(
                     &de.compute,
                     &mut hd.mid_cat,
                     &hot.gate,
@@ -2409,7 +2397,7 @@ impl HeterogeneousEngine {
                     crate::config::N_FF_EXP,
                     crate::config::BLOCKS_Q8K_GATE_IN,
                     n_wi,
-                )?,
+                )?;
             }
             de.q8k.launch(
                 &de.compute,
@@ -2676,12 +2664,13 @@ impl HeterogeneousEngine {
                     work_items,
                     ..
                 } = bi;
-                if ilw.routed.gate.dtype == v4flash_core::gguf::GgufType::IQ2_S {
-                    // blk.26 (unsloth): IQ2_S has one prefill kernel
-                    // (chunked by-expert); IQ2_VARIANT does not apply.
-                    let _t_2s = ie.events.stage("igpu.iq2s_chunked", &ie.compute)?;
-                    ie.iq2s.launch_fused_swiglu_chunked(
-                        &ie.compute, d_mid_cat,
+                // Formats with a single prefill kernel (IQ2_S, IQ2_XS,
+                // IQ3_XXS-as-gate/up): chunked by-expert, IQ2_VARIANT does
+                // not apply. IQ2_XXS returns false and takes the zoo below.
+                let handled = {
+                    let _t_ch = ie.events.stage("igpu.pair_chunked", &ie.compute)?;
+                    super::dispatch::moe_gate_up_chunked(
+                        ie, ilw.routed.gate.dtype, &ie.compute, d_mid_cat,
                         &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
                         d_xq_q8k, d_ew,
                         group_count, expert_members, work_items,
@@ -2690,7 +2679,9 @@ impl HeterogeneousEngine {
                         crate::config::SWIGLU_CLAMP_EXP,
                         crate::config::N_FF_EXP,
                         crate::config::BLOCKS_Q8K_GATE_IN,
-                    )?;
+                    )?
+                };
+                if handled {
                 } else if variant == "tile8" {
                     let _t_t8 = ie.events.stage("igpu.iq2_tile8", &ie.compute)?;
                     ie.iq2.launch_fused_swiglu_tile8_row32(

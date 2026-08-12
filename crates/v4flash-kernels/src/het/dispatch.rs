@@ -47,6 +47,12 @@ pub fn moe_gate_up_batch(
         GgufType::IQ2_S => e.iq2s.launch_fused_swiglu_batch(
             s, mid, gate, up, xq, ew, selected, gbpe, ubpe, n_used, clamp, n_rows, n_blocks,
         ),
+        GgufType::IQ2_XS => e.iq2xs.launch_fused_swiglu_batch(
+            s, mid, gate, up, xq, ew, selected, gbpe, ubpe, n_used, clamp, n_rows, n_blocks,
+        ),
+        GgufType::IQ3_XXS => e.iq3pair.launch_fused_swiglu_batch(
+            s, mid, gate, up, xq, ew, selected, gbpe, ubpe, n_used, clamp, n_rows, n_blocks,
+        ),
         other => Err(eyre!("moe gate/up: no decode kernel for {other:?}")),
     }
 }
@@ -79,6 +85,16 @@ pub fn moe_gate_up_batch_hetsplit(
             n_rows, n_blocks,
         ),
         GgufType::IQ2_S => e.iq2s.launch_fused_swiglu_batch_hetsplit(
+            s, mid, gate, up, xq, ew, selected, remap, mode, cap, gbpe, ubpe, n_used, clamp,
+            n_rows, n_blocks,
+        ),
+        GgufType::IQ2_XS => e.iq2xs.launch_fused_swiglu_batch_hetsplit(
+            s, mid, gate, up, xq, ew, selected, remap, mode, cap, gbpe, ubpe, n_used, clamp,
+            n_rows, n_blocks,
+        ),
+        // gate/up at IQ3_XXS is blk.26 of UD-Q2_K_XL only — the PAIR family,
+        // not the down-projection `iq3` one.
+        GgufType::IQ3_XXS => e.iq3pair.launch_fused_swiglu_batch_hetsplit(
             s, mid, gate, up, xq, ew, selected, remap, mode, cap, gbpe, ubpe, n_used, clamp,
             n_rows, n_blocks,
         ),
@@ -212,4 +228,53 @@ pub fn dense_gemm_prefill(
         }
         other => Err(eyre!("dense gemm: no prefill kernel for {other:?}")),
     }
+}
+
+/// Prefill MoE gate/up (chunked by-expert), for the formats that have
+/// exactly one prefill kernel.
+///
+/// Returns `Ok(false)` for IQ2_XXS, which instead has the `IQ2_VARIANT`
+/// kernel zoo (staged / staged_v2 / tile8 / kwide) that the caller selects
+/// between — so callers use this as: try the dispatcher, else fall through
+/// to the variant chain.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gate_up_chunked(
+    e: &DeviceEngine,
+    dt: GgufType,
+    s: &Stream,
+    mid: &mut DeviceBuffer<f32>,
+    gate: &DeviceBuffer<u8>,
+    up: &DeviceBuffer<u8>,
+    xq: &DeviceBuffer<u8>,
+    ew: &DeviceBuffer<f32>,
+    group_count: &DeviceBuffer<i32>,
+    expert_members: &DeviceBuffer<i32>,
+    work_items: &DeviceBuffer<i32>,
+    n_work_items: u32,
+    gbpe: u32,
+    ubpe: u32,
+    n_used: u32,
+    max_per_expert: u32,
+    chunk: u32,
+    clamp: f32,
+    n_rows: u32,
+    n_blocks: u32,
+) -> eyre::Result<bool> {
+    match dt {
+        GgufType::IQ2_S => e.iq2s.launch_fused_swiglu_chunked(
+            s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
+        )?,
+        GgufType::IQ2_XS => e.iq2xs.launch_fused_swiglu_chunked(
+            s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
+        )?,
+        GgufType::IQ3_XXS => e.iq3pair.launch_fused_swiglu_chunked(
+            s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
+        )?,
+        GgufType::IQ2_XXS => return Ok(false),
+        other => return Err(eyre!("moe gate/up prefill: no kernel for {other:?}")),
+    }
+    Ok(true)
 }

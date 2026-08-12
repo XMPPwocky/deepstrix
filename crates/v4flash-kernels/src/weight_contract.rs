@@ -69,8 +69,12 @@ pub fn expectation(role: &str) -> Option<Expect> {
         | "blk.N.attn_output_b.weight" => Expect::Quant(&[Q8_0]),
 
         // ---- MoE ----
+        // IQ2_XXS/IQ2_S: antirez + unsloth UD-IQ2_XXS. IQ2_XS: unsloth
+        // UD-Q2_K_XL's 42 non-exceptional layers. IQ3_XXS: that mix's
+        // blk.26 — the only place IQ3_XXS appears at gate/up rather than
+        // down, hence the separate `iq3_xxs_pair` kernel family.
         "blk.N.ffn_gate_exps.weight" | "blk.N.ffn_up_exps.weight" => {
-            Expect::Quant(&[IQ2_XXS, IQ2_S])
+            Expect::Quant(&[IQ2_XXS, IQ2_S, IQ2_XS, IQ3_XXS])
         }
         "blk.N.ffn_down_exps.weight" => Expect::Quant(&[Q2_K, IQ3_XXS, MXFP4]),
         "blk.N.ffn_gate_shexp.weight" | "blk.N.ffn_up_shexp.weight" => {
@@ -99,7 +103,9 @@ pub fn expectation(role: &str) -> Option<Expect> {
 /// Types accepted for `token_embd.weight` (host-side embed path, not
 /// loaded through `load_to_device` — validated by its consumers; see
 /// [`crate::embed::embed_lookup`]).
-pub const TOKEN_EMBD_ALLOWED: &[GgufType] = &[F16, Q4_K];
+/// Host-side embedding lookup (deepstrix-server/src/embed.rs) — F16 raw,
+/// Q4_K (unsloth UD-IQ2_XXS) and Q5_K (unsloth UD-Q2_K_XL) row-dequant.
+pub const TOKEN_EMBD_ALLOWED: &[GgufType] = &[F16, Q4_K, Q5_K];
 
 /// Expected dims for roles whose shapes are pinned by `config.rs`
 /// constants (the ones a wrong shape would silently corrupt). Dims are in

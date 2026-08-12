@@ -108,6 +108,9 @@ pub struct DeviceEngine {
     pub iq3: crate::iq3_xxs::Iq3XxsMatvec,
     pub mxfp4: crate::mxfp4::Mxfp4Matvec,
     pub iq2s: crate::iq2_s::Iq2SPairMatvec,
+    /// UD-Q2_K_XL gate/up: IQ2_XS on 42 layers, IQ3_XXS (paired form) on blk.26.
+    pub iq2xs: crate::iq2_xs::Iq2XsPairMatvec,
+    pub iq3pair: crate::iq3_xxs_pair::Iq3XxsPairMatvec,
     pub q4d: crate::q4_k_dense::Q4_KDenseMatvec,
     pub q5d: crate::q5_k_dense::Q5_KDenseMatvec,
     pub q6d: crate::q6_k_dense::Q6_KDenseMatvec,
@@ -189,6 +192,8 @@ impl DeviceEngine {
             iq3: crate::iq3_xxs::Iq3XxsMatvec::for_arch(arch)?,
             mxfp4: crate::mxfp4::Mxfp4Matvec::for_arch(arch)?,
             iq2s: crate::iq2_s::Iq2SPairMatvec::for_arch(arch)?,
+            iq2xs: crate::iq2_xs::Iq2XsPairMatvec::for_arch(arch)?,
+            iq3pair: crate::iq3_xxs_pair::Iq3XxsPairMatvec::for_arch(arch)?,
             q4d: crate::q4_k_dense::Q4_KDenseMatvec::for_arch(arch)?,
             q5d: crate::q5_k_dense::Q5_KDenseMatvec::for_arch(arch)?,
             q6d: crate::q6_k_dense::Q6_KDenseMatvec::for_arch(arch)?,
