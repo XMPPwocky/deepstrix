@@ -93,3 +93,77 @@ differs → fresh stats).
   semantics: 448 B NoPE e4m3 + 64×f16 RoPE + 7×ue8m0 per-64 scales
   (amax/448, exp2-ceil), row stride padded to 592/608.
 - MTP acceptance re-measure (optional); franken-mix exploration.
+
+## M63 iGPU hot-expert de-dup (2026-08-12)
+
+The iGPU held all 256 experts/layer while M56 also mirrored the K hottest
+onto the dGPU, and the iGPU MoE kernels *skip* exactly those slots. The
+duplicate bytes were live in one case only: >`DGPU_HOT_CAP` (4) of a
+token's 6 picks resident, whose overflow fell back to the iGPU at the raw
+expert id. Pinning the cap at `N_EXPERT_USED` removes that branch, so the
+copies can go. `IGPU_DEDUP_HOT=1` (default in `run_deepstrix.sh`).
+
+Encoding: remap's miss branch carries the iGPU slot as `-(slot+1)`;
+kernels decode `-remap[e]-1`. Without de-dup `slot == id`, so the default
+path is unchanged. Residency predicate (`remap[e] >= 0`) is untouched.
+
+Measured (unsloth UD-IQ2_XXS, K=8, server placement):
+
+| | off | on |
+|---|---|---|
+| iGPU GTT | 78.27 | **75.91 GiB (−2.36)** |
+| dGPU VRAM | unchanged | unchanged |
+| decode @4K | 27.36 | 27.34 tok/s |
+| prefill @4K | 433.0 | 432.7 tok/s |
+
+`forward_per_layer_vs_ds4` (43 layers), `head_to_logits` and
+`forward_prompt_batch_v2` are **bit-identical** to a cap-6 non-de-dup
+baseline — the device partition is the same, only the weight index moved.
+
+## Corrections to the claims above (2026-08-12)
+
+- **"full oracle suite green" was overstated.** With `DEEPSTRIX_GGUF` +
+  `DEEPSTRIX_DUMP_DIR` and no placement file (which is what `cargo test`
+  gives you — `hot_expert_file_path()` is CWD-relative and does not
+  resolve from the crate root), `forward_prompt_batch_v2_matches_sequential`
+  FAILS on unsloth at 7.8475e-2 vs a 5e-2 bound. Verified **pre-existing**:
+  the pre-M63 commit produces the identical value. antirez passes at
+  3.72e-2; unsloth with the server's placement passes at 2.18e-2.
+- **`reference/decode_hot_experts.txt` is stale** (Jun 10, pre-0731, and
+  derived from antirez's quant). It is also the CWD-relative default, so
+  anything without an explicit placement silently gets a mismatched one.
+  At K=8 it makes cap=4 fail that oracle at 1.79e-1 while cap=6 passes at
+  4.71e-2; the server's own derived placement is insensitive to the cap.
+- **The 16/17 vector-test figure is not a quality metric.** Its
+  `short_code_completion` case measures formatting style: step 0 (a ```
+  fence) misses on every quant we have, and step 3 penalises answering the
+  question as asked. With that case disabled, UD-IQ2_XXS and UD-Q2_K_XL
+  both score **13/13**. Do not use this harness to choose between quants.
+
+## UD-Q2_K_XL (default since 2026-08-12)
+
+Same 0731 checkpoint. Differs from UD-IQ2_XXS in exactly two roles:
+gate/up experts IQ2_XXS→IQ2_XS ×42 (IQ2_S→IQ3_XXS on blk.26), and
+token_embd Q4_K→Q5_K. `ffn_down_exps` is byte-identical. Contains no Q2_K
+tensor — the name is an unsloth size tier, not a format.
+
+New kernels: `iq2_xs_pair_matvec` (IQ2_XS = XXS's 7-bit ksigns codebook +
+IQ2_S's nibble scales over a 512-entry grid) and `iq3_xxs_pair_matvec`
+(IQ3_XXS at gate/up needs the fused-SwiGLU pair form; the in-tree IQ3_XXS
+family is down-projection only). CPU reference pinned against llama.cpp's
+own `ggml_vec_dot_iq2_xs_q8_K_generic` via `tests/ref/iq2_xs_gen.c`.
+
+| | UD-IQ2_XXS | UD-Q2_K_XL |
+|---|---|---|
+| size | 84.6 | 90.2 GiB |
+| iGPU GTT (K=8, de-dup) | 78.66 | **81.64 GiB** |
+| dGPU VRAM @192K | ~14.97 | 15.08 / 15.92 GiB |
+| decode @4K | 27.34 | 27.01 tok/s |
+| vector-test | 13/13 | 13/13 |
+
+**The quality case is UNMEASURED, not demonstrated.** Every instrument we
+have scores the two files identically. The theory (gate/up is 44.6 of
+84.6 GiB and goes 2.06→2.31 bpw) is untested; settling it needs
+teacher-forced top-1/top-5/KL against a reference dump, which needs the
+ds4 dumper taught IQ2_XS. Costs are certain: +3.0 GiB iGPU net of de-dup,
+−1.2% decode.
