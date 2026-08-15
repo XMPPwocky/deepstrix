@@ -40,9 +40,57 @@ const VEC_SCALE_INPLACE_GFX1151: &[u8] = include_bytes!(env!("KERNEL_VEC_SCALE_I
 const INDEXER_BITPACK_GFX1201: &[u8] = include_bytes!(env!("KERNEL_INDEXER_BITPACK_GFX1201"));
 const INDEXER_BITPACK_GFX1151: &[u8] = include_bytes!(env!("KERNEL_INDEXER_BITPACK_GFX1151"));
 
+const INDEXER_QAT_GFX1201: &[u8] = include_bytes!(env!("KERNEL_INDEXER_QAT_GFX1201"));
+const INDEXER_QAT_GFX1151: &[u8] = include_bytes!(env!("KERNEL_INDEXER_QAT_GFX1151"));
+
 pub const INDEXER_TOP_K: u32 = 512;
 pub const INDEXER_N_HEAD: u32 = 64;
 pub const INDEXER_HEAD_DIM: u32 = 128;
+
+/// Hadamard128 + E2M1 FP4 QAT round trip on 128-wide indexer rows,
+/// in-place. Mirrors ds4's `dsv4_indexer_qat_rows_inplace_cpu`
+/// (5bc1e6d, "Flash graph correctness"): the official V4 graph rotates
+/// indexer Q rows and ratio-4 indexer compressor KV rows with a
+/// normalised 128-wide Hadamard transform, then quantize-dequantizes
+/// through E2M1 FP4 (per-32-block power-of-two scale) — after RoPE,
+/// before top-k scoring / comp-cache append.
+pub struct IndexerQat {
+    module: Module,
+}
+
+impl IndexerQat {
+    pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            INDEXER_QAT_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            INDEXER_QAT_GFX1151
+        } else {
+            return Err(eyre!("unsupported arch for indexer_qat: {arch}"));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    /// In-place QAT on `n_rows` contiguous rows of `INDEXER_HEAD_DIM`
+    /// (=128) floats each. One workgroup of 128 threads per row.
+    pub fn launch(
+        &self,
+        stream: &Stream,
+        x: &mut DeviceBuffer<f32>,
+        n_rows: u32,
+    ) -> eyre::Result<()> {
+        if n_rows == 0 {
+            return Ok(());
+        }
+        let function = self.module.get_function("indexer_qat")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows, 1, 1),
+            block: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [x.raw(), n_rows])
+    }
+}
 
 /// Per-comp-row scoring kernel.
 pub struct IndexerScore {

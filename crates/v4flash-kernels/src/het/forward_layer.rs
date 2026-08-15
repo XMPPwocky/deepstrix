@@ -779,6 +779,13 @@ impl HeterogeneousEngine {
                     )?;
                 }
                 // No FP8 step — head_dim=128 ≠ 512 (ds4.c:6702 gates fp8 on head_dim==N_HEAD_DIM).
+                // Instead, ds4 5bc1e6d: indexer compressor KV rows take the
+                // Hadamard128 + FP4 QAT round trip (post-RoPE, pre-append).
+                {
+                    let _t = de.events.stage("k.indexer_compressor.qat", &de.compute)?;
+                    let mut row_view = dgpu_scratch.comp_row.slice_view_mut(0, ihd as usize);
+                    de.indexer_qat.launch(&de.compute, &mut row_view, 1)?;
+                }
                 {
                     let _t = de.events.stage("k.indexer_compressor.f16rt", &de.compute)?;
                     let mut row_view = dgpu_scratch.comp_row.slice_view_mut(0, ihd as usize);
@@ -889,6 +896,9 @@ impl HeterogeneousEngine {
                     pos,
                     &dlw.rope_params,
                 )?;
+                // 2b. ds4 5bc1e6d: Hadamard128 + FP4 QAT round trip on the
+                // indexer Q rows (post-RoPE, pre-scoring).
+                de.indexer_qat.launch(&de.compute, &mut dgpu_scratch.indexer_q, N_INDEXER_HEAD)?;
                 // 3. matvec(indexer.proj × attn_input_norm) → head_weights [N_INDEXER_HEAD]
                 de.f16.matvec(
                     &de.compute,
@@ -1637,7 +1647,9 @@ fn issue_shared_expert(
     }
     dense_matvec(de, stream, &mut dgpu_scratch.gate_sh, &dlw.shared.gate, &dgpu_scratch.ffn_input_norm, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_FF_SHARED, N_EMBD)?;
     dense_matvec(de, stream, &mut dgpu_scratch.up_sh, &dlw.shared.up, &dgpu_scratch.ffn_input_norm, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_FF_SHARED, N_EMBD)?;
-    de.swiglu.launch(stream, &mut dgpu_scratch.mid_sh, &dgpu_scratch.gate_sh, &dgpu_scratch.up_sh, N_FF_SHARED)?;
+    // ds4 5bc1e6d: shared experts use the same swiglu_limit clamp as routed
+    // experts (official V4-Flash graph).
+    de.swiglu.launch_clamped(stream, &mut dgpu_scratch.mid_sh, &dgpu_scratch.gate_sh, &dgpu_scratch.up_sh, N_FF_SHARED, SWIGLU_CLAMP_EXP)?;
     match dlw.shared.down.dtype {
         // dp4a GEMM@B=1: 0.019 vs 0.032 ms scalar gemv on [2048->4096]
         // (bench_kquant_dense_isolated) — ~0.55 ms/token across 43 layers.

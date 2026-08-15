@@ -22,6 +22,15 @@
 //! Requires a dump generated against the patched ds4 (heap-alloc
 //! comp_allowed_mask buffer) so n_comp > 1024 entries aren't truncated.
 //! Set DUMP_DIR env to override the default reference path.
+//!
+//! NOTE: this oracle validates the PRE-5bc1e6d graph (no Hadamard128+FP4
+//! QAT on indexer Q or comp KV rows) because the long-context dump was
+//! generated with pre-fix ds4. Production now applies `IndexerQat` after
+//! RoPE on both Q and comp-KV rows (ds4 5bc1e6d), which changes the top-k
+//! selection; against a post-fix dump this oracle would go red until the
+//! QAT stages are added to the chain below AND the dump is regenerated.
+//! The QAT kernel itself is validated bit-exactly by
+//! `indexer_qat_matches_ds4_cpu_reference` at the bottom of this file.
 
 use std::path::PathBuf;
 
@@ -544,5 +553,179 @@ fn indexer_pipeline_oracle() -> eyre::Result<()> {
         bit_rate, total.total_bit_mismatches, total.mismatch_tokens,
     );
 
+    Ok(())
+}
+
+// ============================================================================
+// Indexer QAT unit test (ds4 5bc1e6d "Flash graph correctness").
+//
+// Faithful Rust port of ds4's `dsv4_indexer_qat_rows_inplace_cpu`:
+// per 128-wide row, a normalised Hadamard128 rotation followed by the E2M1
+// FP4 activation quantize-dequantize round trip (per-32-block power-of-two
+// scale, nearest-even tie break). Kernel output must match bit-exactly —
+// the FP4 round trip is deterministic.
+//
+// No model / dump files needed.
+// ============================================================================
+
+fn e2m1fn_value(i: usize) -> f32 {
+    [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][i & 7]
+}
+
+fn e2m1fn_dequant_cpu(x: f32) -> f32 {
+    let sign = if x < 0.0 { -1.0f32 } else { 1.0f32 };
+    let ax = x.abs().min(6.0);
+    let mut best = 0usize;
+    let mut best_diff = (ax - e2m1fn_value(0)).abs();
+    for i in 1..8 {
+        let diff = (ax - e2m1fn_value(i)).abs();
+        if diff < best_diff || (diff == best_diff && (i & 1) == 0 && (best & 1) != 0) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    sign * e2m1fn_value(best)
+}
+
+fn hadamard128_inplace_cpu(x: &mut [f32]) {
+    assert_eq!(x.len(), 128);
+    let mut stride = 1usize;
+    while stride < 128 {
+        let mut base = 0usize;
+        while base < 128 {
+            for i in 0..stride {
+                let a = x[base + i];
+                let b = x[base + stride + i];
+                x[base + i] = a + b;
+                x[base + stride + i] = a - b;
+            }
+            base += 2 * stride;
+        }
+        stride <<= 1;
+    }
+    for v in x.iter_mut() {
+        *v *= 0.08838834764831845f32;
+    }
+}
+
+fn fp4_act_quantize_row_inplace_cpu(x: &mut [f32]) {
+    assert_eq!(x.len() % 32, 0);
+    for blk in x.chunks_mut(32) {
+        let mut amax = 0f32;
+        for &v in blk.iter() {
+            let av = v.abs();
+            if av > amax {
+                amax = av;
+            }
+        }
+        if amax < 7.052966104933725e-38 {
+            amax = 7.052966104933725e-38;
+        }
+        let scale = ((amax / 6.0f32).log2().ceil()).exp2();
+        for v in blk.iter_mut() {
+            let mut q = *v / scale;
+            if q > 6.0 {
+                q = 6.0;
+            }
+            if q < -6.0 {
+                q = -6.0;
+            }
+            *v = e2m1fn_dequant_cpu(q) * scale;
+        }
+    }
+}
+
+fn indexer_qat_rows_inplace_cpu(x: &mut [f32]) {
+    for row in x.chunks_mut(128) {
+        hadamard128_inplace_cpu(row);
+        fp4_act_quantize_row_inplace_cpu(row);
+    }
+}
+
+#[test]
+fn indexer_qat_matches_ds4_cpu_reference() -> eyre::Result<()> {
+    install_panic_handler()?;
+
+    const N_ROWS: usize = 261; // odd count: exercises grid tail
+    const HD: usize = 128;
+
+    // Deterministic LCG. Rows sweep amplitude regimes: unit-scale (typical
+    // post-RoPE activations), large (>6 post-Hadamard), tiny (deep
+    // subnormal → amax floor), plus pinned constant / zero rows.
+    let mut s: u64 = 0x1dee_c0de_0000_0001;
+    let mut rnd = move || {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0 // [-1, 1)
+    };
+    let mut host = vec![0f32; N_ROWS * HD];
+    for r in 0..N_ROWS {
+        // Smallest tier stays in f32-normal range post-Hadamard so GPU
+        // denormal-flush policy can't diverge from the host; the amax-floor
+        // branch is exercised by the pinned zero/constant rows below.
+        let amp = [1.0f32, 8.0, 64.0, 1.0e-3, 1.0e-20, 1.0e-30][r % 6];
+        for i in 0..HD {
+            host[r * HD + i] = rnd() * amp;
+        }
+    }
+    // Pinned edge rows: all-zero (amax floor on every block) and constant
+    // (Hadamard concentrates everything into x[0]; blocks 1..3 all-zero).
+    for v in host[0..HD].iter_mut() {
+        *v = 0.0;
+    }
+    for v in host[HD..2 * HD].iter_mut() {
+        *v = 1.0;
+    }
+
+    let mut want = host.clone();
+    indexer_qat_rows_inplace_cpu(&mut want);
+
+    for device in Device::all()? {
+        device.set_current()?;
+        let arch = device.properties()?.gcn_arch_name;
+        let stream = Stream::new(device.id)?;
+        let qat = v4flash_kernels::IndexerQat::for_arch(&arch)?;
+
+        let mut d_x: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N_ROWS * HD)?;
+        d_x.copy_from_host(&host)?;
+        qat.launch(&stream, &mut d_x, N_ROWS as u32)?;
+        stream.synchronize()?;
+        let mut got = vec![0f32; N_ROWS * HD];
+        d_x.copy_to_host(&mut got)?;
+
+        let mut max_abs = 0f32;
+        let mut n_bits_diff = 0usize;
+        for i in 0..N_ROWS * HD {
+            if got[i].to_bits() != want[i].to_bits() {
+                n_bits_diff += 1;
+                let d = (got[i] - want[i]).abs();
+                if d > max_abs {
+                    max_abs = d;
+                }
+            }
+        }
+        eprintln!(
+            "[{arch}] indexer_qat: {n_bits_diff}/{} values differ from CPU ref, \
+             max_abs_diff = {max_abs:.3e}",
+            N_ROWS * HD
+        );
+        assert_eq!(
+            n_bits_diff, 0,
+            "[{arch}] indexer_qat not bit-exact: {n_bits_diff} diffs, max_abs {max_abs:.3e}"
+        );
+
+        // Decode-path cost eyeball: production launches this on 64 rows
+        // (indexer Q) per ratio-4 layer per token. Time 1000 back-to-back
+        // 64-row launches.
+        const ITERS: u32 = 1000;
+        qat.launch(&stream, &mut d_x, 64)?; // warm
+        stream.synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            qat.launch(&stream, &mut d_x, 64)?;
+        }
+        stream.synchronize()?;
+        let us = t0.elapsed().as_secs_f64() * 1.0e6 / ITERS as f64;
+        eprintln!("[{arch}] indexer_qat 64-row launch: {us:.2} us/launch (stream-saturated)");
+    }
     Ok(())
 }

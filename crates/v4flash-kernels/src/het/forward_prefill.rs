@@ -1487,6 +1487,13 @@ impl HeterogeneousEngine {
                         &dlw.rope_params,
                     )?;
                 }
+                // ds4 5bc1e6d: indexer compressor KV rows take the
+                // Hadamard128 + FP4 QAT round trip (post-RoPE, pre-append).
+                de.indexer_qat.launch(
+                    &de.compute,
+                    &mut bd.comp_rows_batched,
+                    n_idx_boundaries,
+                )?;
                 de.f16rt.launch(
                     &de.compute,
                     &mut bd.comp_rows_batched,
@@ -1661,6 +1668,16 @@ impl HeterogeneousEngine {
                         N_ROT,
                         b,
                         &dlw.rope_params,
+                    )?;
+                }
+                // ds4 5bc1e6d: Hadamard128 + FP4 QAT round trip on all
+                // B × N_INDEXER_HEAD indexer Q rows (post-RoPE, pre-scoring).
+                {
+                    let _t = de.events.stage("k.indexer.qat", &de.compute)?;
+                    de.indexer_qat.launch(
+                        &de.compute,
+                        &mut bd.indexer_q,
+                        b * N_INDEXER_HEAD,
                     )?;
                 }
                 {
@@ -2235,12 +2252,15 @@ impl HeterogeneousEngine {
         {
             let _t = de.events.stage("k.shared_expert.swiglu", &de.compute)?;
             // swiglu — elementwise; stretch n to B * N_FF_SHARED.
-            de.swiglu.launch(
+            // ds4 5bc1e6d: shared experts use the same swiglu_limit clamp
+            // as routed experts (official V4-Flash graph).
+            de.swiglu.launch_clamped(
                 &de.compute,
                 &mut bd.mid_sh,
                 &bd.gate_sh,
                 &bd.up_sh,
                 b * N_FF_SHARED,
+                crate::config::SWIGLU_CLAMP_EXP,
             )?;
         }
         {

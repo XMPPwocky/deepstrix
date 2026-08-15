@@ -76,7 +76,7 @@ pub use ffn::{Swiglu, SwigluClampWeighted, VecAddInplace};
 pub use gqa_attention::{GqaAttention, FLASH_HEAD_DIM, GQA_HEAD_DIM_MAX};
 pub use head::{HcPost, HcSigmoidBias, HcSinkhorn, HcWeightedSum};
 pub use indexer::{
-    IndexerBitpack, IndexerGather, IndexerScore, IndexerScoreWmma, IndexerTopk,
+    IndexerBitpack, IndexerGather, IndexerQat, IndexerScore, IndexerScoreWmma, IndexerTopk,
     IndexerTopkBitonic, VecScaleInplace, INDEXER_HEAD_DIM, INDEXER_N_HEAD, INDEXER_TOP_K,
 };
 pub use iq2_xxs::{Iq2XxsPairMatvec, BLOCK_IQ2_XXS_BYTES};

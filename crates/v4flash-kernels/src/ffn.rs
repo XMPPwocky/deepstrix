@@ -10,8 +10,11 @@ const SWIGLU_CW_GFX1151: &[u8] = include_bytes!(env!("KERNEL_SWIGLU_CLAMP_WEIGHT
 const VEC_ADD_GFX1201: &[u8] = include_bytes!(env!("KERNEL_VEC_ADD_GFX1201"));
 const VEC_ADD_GFX1151: &[u8] = include_bytes!(env!("KERNEL_VEC_ADD_GFX1151"));
 
-/// SwiGLU activation: `out[i] = silu(gate[i]) * up[i]`. Mirrors ds4
-/// `swiglu()` (ds4.c:5083). Used by the shared expert.
+/// SwiGLU activation: `out[i] = silu(gate[i]) * up[i]`, optionally with
+/// ds4's swiglu_limit clamp (one-sided on gate, two-sided on up). Mirrors
+/// ds4 `swiglu()` post-5bc1e6d. The V4-Flash shared expert uses
+/// `launch_clamped` with `SWIGLU_CLAMP_EXP` (same limit as routed
+/// experts); Laguna uses the unclamped `launch`.
 pub struct Swiglu {
     module: Module,
 }
@@ -29,6 +32,7 @@ impl Swiglu {
         Ok(Self { module })
     }
 
+    /// Unclamped swiglu (`clamp = 0` disables the limit in-kernel).
     pub fn launch(
         &self,
         stream: &Stream,
@@ -36,6 +40,21 @@ impl Swiglu {
         gate: &DeviceBuffer<f32>,
         up: &DeviceBuffer<f32>,
         n: u32,
+    ) -> eyre::Result<()> {
+        self.launch_clamped(stream, out, gate, up, n, 0.0)
+    }
+
+    /// swiglu with ds4's swiglu_limit clamp: `gate = min(gate, clamp)`,
+    /// `up = min(max(up, -clamp), clamp)` before `silu(gate) * up`.
+    /// `clamp <= 1e-6` disables clamping.
+    pub fn launch_clamped(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        gate: &DeviceBuffer<f32>,
+        up: &DeviceBuffer<f32>,
+        n: u32,
+        clamp: f32,
     ) -> eyre::Result<()> {
         let function = self.module.get_function("swiglu")?;
         let block_x = 256u32;
@@ -45,7 +64,7 @@ impl Swiglu {
             block: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        launch_kernel!(function, cfg, stream, [out.raw(), gate.raw(), up.raw(), n])
+        launch_kernel!(function, cfg, stream, [out.raw(), gate.raw(), up.raw(), n, clamp])
     }
 }
 

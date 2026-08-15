@@ -234,6 +234,17 @@ fn indexer_compressor_oracle() -> eyre::Result<()> {
                 &rope_params,
             )?;
             // No FP8 for indexer (head_dim != 512).
+            //
+            // NOTE: deliberately NO Hadamard128+FP4 QAT here, to match the
+            // pre-5bc1e6d dump this oracle was generated with. Production
+            // (het/forward_layer.rs, forward_prefill.rs) now runs
+            // de.indexer_qat after RoPE per ds4 5bc1e6d. Measured post-fix
+            // divergence vs this dump: max_abs 9.9, mean_abs 0.93 — the QAT
+            // rotates rows into Hadamard/FP4 space, so a pre-fix dump cannot
+            // validate it. The QAT kernel itself is validated bit-exactly in
+            // tests/indexer_pipeline.rs (indexer_qat_matches_ds4_cpu_reference).
+            // Add the QAT stage here only together with a dump regenerated
+            // from post-fix ds4.
             stream.synchronize()?;
             d_out.copy_to_host(&mut got)?;
 

@@ -148,6 +148,14 @@ fn shared_expert_oracle() -> eyre::Result<()> {
             }
             dm(&q8, &mut d_gate, &w_gate, &d_x, &d_xq, &d_xscale, N_FF, N_EMBD, &stream)?;
             dm(&q8, &mut d_up, &w_up, &d_x, &d_xq, &d_xscale, N_FF, N_EMBD, &stream)?;
+            // NOTE: deliberately UNCLAMPED to match the pre-5bc1e6d dump this
+            // oracle was generated with. Production (het/forward_layer.rs,
+            // forward_prefill.rs) now uses launch_clamped(SWIGLU_CLAMP_EXP)
+            // per ds4 5bc1e6d ("shared experts use the same swiglu_limit
+            // clamp as routed experts"). Measured post-fix divergence vs this
+            // dump: max_abs 3.1e2, mean_abs 1.5e-2 (clamp genuinely fires on
+            // real shared-expert activations). Flip to launch_clamped only
+            // together with a dump regenerated from post-fix ds4.
             swiglu.launch(&stream, &mut d_mid, &d_gate, &d_up, N_FF)?;
 
             if w_down.dtype == v4flash_core::gguf::GgufType::Q8_0 {
@@ -189,5 +197,133 @@ fn shared_expert_oracle() -> eyre::Result<()> {
         THRESHOLD
     );
 
+    Ok(())
+}
+
+// ============================================================================
+// swiglu_limit clamp unit test (ds4 5bc1e6d "Flash graph correctness").
+//
+// The official V4-Flash graph applies the same swiglu_limit clamp to shared
+// experts as to routed experts. CPU reference mirrors ds4.c swiglu()
+// post-fix exactly:
+//
+//   if (clamp > 1e-6) {
+//       if (g > clamp)  g = clamp;      // one-sided on gate
+//       if (u > clamp)  u = clamp;      // two-sided on up
+//       if (u < -clamp) u = -clamp;
+//   }
+//   out = silu(g) * u
+//
+// No model / dump files needed — random data including values well beyond
+// the clamp threshold (±10).
+// ============================================================================
+
+fn swiglu_clamp_cpu_ref(gate: f32, up: f32, clamp: f32) -> f32 {
+    let mut g = gate;
+    let mut u = up;
+    if clamp > 1.0e-6 {
+        if g > clamp {
+            g = clamp;
+        }
+        if u > clamp {
+            u = clamp;
+        }
+        if u < -clamp {
+            u = -clamp;
+        }
+    }
+    let sig = 1.0f32 / (1.0f32 + (-g).exp());
+    g * sig * u
+}
+
+#[test]
+fn swiglu_clamp_matches_cpu_reference() -> eyre::Result<()> {
+    install_panic_handler()?;
+
+    const N: usize = 8192;
+    const CLAMP: f32 = 10.0; // SWIGLU_CLAMP_EXP
+
+    // Deterministic LCG; amplitudes swept so a large fraction of values
+    // exceed the ±10 clamp threshold.
+    let mut s: u64 = 0x5eed_cafe_f00d_0001;
+    let mut rnd = move || {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0 // [-1, 1)
+    };
+    let mut gate = vec![0f32; N];
+    let mut up = vec![0f32; N];
+    for i in 0..N {
+        // Amplitude cycles 1, 5, 20, 100 — mixes sub-clamp and super-clamp.
+        let amp = [1.0f32, 5.0, 20.0, 100.0][i % 4];
+        gate[i] = rnd() * amp;
+        up[i] = rnd() * amp;
+    }
+    // Pin exact boundary values.
+    gate[0] = 10.0;
+    up[0] = 10.0;
+    gate[1] = -10.0;
+    up[1] = -10.0;
+    gate[2] = 10.0000001;
+    up[2] = -10.0000001;
+
+    for device in Device::all()? {
+        device.set_current()?;
+        let arch = device.properties()?.gcn_arch_name;
+        let stream = Stream::new(device.id)?;
+        let swiglu = Swiglu::for_arch(&arch)?;
+
+        let mut d_gate: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N)?;
+        let mut d_up: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N)?;
+        let mut d_out: DeviceBuffer<f32> = DeviceBuffer::new(device.id, N)?;
+        d_gate.copy_from_host(&gate)?;
+        d_up.copy_from_host(&up)?;
+
+        // Clamped launch vs CPU reference.
+        swiglu.launch_clamped(&stream, &mut d_out, &d_gate, &d_up, N as u32, CLAMP)?;
+        stream.synchronize()?;
+        let mut got = vec![0f32; N];
+        d_out.copy_to_host(&mut got)?;
+
+        let mut max_abs = 0f32;
+        for i in 0..N {
+            let want = swiglu_clamp_cpu_ref(gate[i], up[i], CLAMP);
+            let d = (got[i] - want).abs();
+            if d > max_abs {
+                max_abs = d;
+            }
+        }
+        eprintln!("[{arch}] clamped: max_abs_diff vs CPU ref = {max_abs:.3e}");
+        // Only expf differs between GPU and host libm; outputs are bounded
+        // by |silu(10) * 10| < 100, so a few f32 ulps ≈ 1e-5 absolute.
+        assert!(max_abs < 1.0e-4, "[{arch}] clamped max_abs {max_abs:.3e}");
+
+        // clamp = 0.0 must reproduce the historical unclamped behaviour.
+        swiglu.launch(&stream, &mut d_out, &d_gate, &d_up, N as u32)?;
+        stream.synchronize()?;
+        d_out.copy_to_host(&mut got)?;
+        let mut max_abs_unclamped = 0f32;
+        let mut n_diverge = 0usize;
+        for i in 0..N {
+            let want = swiglu_clamp_cpu_ref(gate[i], up[i], 0.0);
+            let d = (got[i] - want).abs();
+            let rel = d / want.abs().max(1.0);
+            if rel > max_abs_unclamped {
+                max_abs_unclamped = rel;
+            }
+            // Sanity: clamped and unclamped must differ where inputs exceed
+            // the threshold (proves the clamp is live in-kernel).
+            if (gate[i] > CLAMP || up[i].abs() > CLAMP)
+                && swiglu_clamp_cpu_ref(gate[i], up[i], CLAMP) != want
+            {
+                n_diverge += 1;
+            }
+        }
+        eprintln!(
+            "[{arch}] unclamped: max_rel_diff vs CPU ref = {max_abs_unclamped:.3e}, \
+             {n_diverge} inputs where clamp changes the result"
+        );
+        assert!(max_abs_unclamped < 1.0e-5);
+        assert!(n_diverge > 0, "test data never exercised the clamp");
+    }
     Ok(())
 }
