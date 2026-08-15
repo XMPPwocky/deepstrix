@@ -437,14 +437,57 @@ async fn drive_sse_stream(
                 ..
             } => {
                 completion_tokens = ct;
-                // Drain anything still buffered in the scanner.
+                // Drain anything still buffered in the scanner. Since
+                // the DSML-repair port, finish() can also emit
+                // ToolCall / ToolCallsEnd events (truncated tool-call
+                // blocks recovered by appending the missing closing
+                // tags) — stream them exactly like live ones.
                 for de in scanner.finish() {
-                    if let DsmlEvent::Text(t) = de {
-                        let s = drain_valid_utf8(&mut content_pending, &t);
-                        if !s.is_empty()
-                            && out.send(send(text_delta(s), None)).await.is_err()
-                        {
-                            return;
+                    match de {
+                        DsmlEvent::Text(t) => {
+                            let s = drain_valid_utf8(&mut content_pending, &t);
+                            if !s.is_empty()
+                                && out.send(send(text_delta(s), None)).await.is_err()
+                            {
+                                return;
+                            }
+                        }
+                        DsmlEvent::ToolCall {
+                            id: tid,
+                            name,
+                            arguments,
+                            ..
+                        } => {
+                            saw_tool = true;
+                            let tc = ToolCall {
+                                id: tid,
+                                kind: "function".into(),
+                                function: ToolCallFunction { name, arguments },
+                            };
+                            if out
+                                .send(send(
+                                    tool_call_start_delta(&tc, sent_tool_index),
+                                    None,
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if out
+                                .send(send(
+                                    tool_call_args_delta(&tc, sent_tool_index),
+                                    None,
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            sent_tool_index += 1;
+                        }
+                        DsmlEvent::ToolCallsEnd => {
+                            saw_tool = true;
                         }
                     }
                 }

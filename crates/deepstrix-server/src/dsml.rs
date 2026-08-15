@@ -53,7 +53,7 @@ pub fn render_tools_prompt(tools: &[ToolDef]) -> String {
          Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal string characters with XML or HTML entity escapes. \
          Only if a string value itself contains the exact closing parameter tag `</\u{ff5c}DSML\u{ff5c}parameter>`, write that tag as `&lt;/\u{ff5c}DSML\u{ff5c}parameter>` inside the value. \
          For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n\
-         If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n\
+         When thinking mode is enabled, finish reasoning with </think> before any tool calls or final response.\n\n\
          Otherwise, output directly after </think> with tool calls or final response.\n\n\
          ### Available Tool Schemas\n\n",
     );
@@ -244,11 +244,36 @@ pub struct DsmlScanner {
     current_param: Option<(String, bool, Vec<u8>)>,
     /// Sticky flag: true once any unknown-tag fallback occurred
     /// (e.g. the model emitted `<｜DSML｜command name="ls"…>` instead
-    /// of `<｜DSML｜parameter name="command"…>ls`). The handler
+    /// of `<｜DSML｜parameter name="command"…>ls`) or an orphan
+    /// closing tag arrived with no matching open frame. The handler
     /// checks this at end-of-turn and reports
     /// `finish_reason: "error"` so letta knows the turn is broken
     /// rather than treating the corrupted markup as content.
+    ///
+    /// NOTE: since the DSML-repair port (upstream ds4 0ffaabd/596f49c/
+    /// 7bcc4e8), plain truncation (EOS mid-DSML) no longer sets this
+    /// when the open frames can be repaired into valid tool calls —
+    /// see `finish()`.
     malformed: bool,
+    /// Count of ToolCall events emitted this turn (streaming closes +
+    /// repair). Used by `finish()` to decide between "repaired tool
+    /// call" and "hallucinated / unrecoverable" outcomes.
+    tool_calls_emitted: u32,
+    /// True once a closing tag arrived with no matching open frame
+    /// (closes outnumber opens). Not a truncation pattern — when set,
+    /// `finish()` refuses to repair (upstream 7bcc4e8 guard b; there
+    /// the unsigned open-minus-close subtraction would underflow, here
+    /// the stack makes underflow impossible but the refusal semantics
+    /// are kept).
+    saw_orphan_close: bool,
+    /// Text captured while inside a bare `<tool_calls>` block that has
+    /// not opened any `<invoke>` yet. Normally inter-tag whitespace
+    /// (discarded once an invoke opens); but when the model
+    /// hallucinates `<tool_calls>…plain prose…</tool_calls>` (or
+    /// truncates before any invoke), upstream ds4 (596f49c/20df6c7)
+    /// strips the tags and returns the prose as plain content — this
+    /// buffer is what lets us do the same.
+    halluc_buf: Vec<u8>,
 }
 
 impl DsmlScanner {
@@ -270,6 +295,9 @@ impl DsmlScanner {
             buf: Vec::new(),
             current_param: None,
             malformed: false,
+            tool_calls_emitted: 0,
+            saw_orphan_close: false,
+            halluc_buf: Vec::new(),
         }
     }
 
@@ -289,35 +317,63 @@ impl DsmlScanner {
 
     pub fn finish(&mut self) -> Vec<DsmlEvent> {
         let mut events = Vec::new();
-        // End-of-stream cleanup. There are four cases:
+        // End-of-stream cleanup. There are three cases:
         //
         // 1. Clean end (Mode::Text + no open frames): flush pending tail
         //    bytes as text. The normal-path case.
         //
         // 2. Mid-stream EOS inside an open DSML frame (Mode::Text +
         //    frames non-empty, or Mode in {OpenHeader, CloseHeader,
-        //    ParameterBody}): the model hit length-cap or sampled EOS
-        //    before closing `<｜DSML｜tool_calls>` / `<｜DSML｜invoke>` /
-        //    `<｜DSML｜parameter>`. Previously we silently dropped ALL
-        //    accumulated state — producing an EMPTY assistant turn
-        //    (no text, no tool_calls). Letta sees that as
-        //    `Empty LLM response` and triggers retry, which usually
-        //    repeats the same failure (deterministic at low temp +
-        //    same prompt). Now we flush whatever bytes we have as
-        //    plain text and mark the turn malformed so the handler
-        //    reports finish_reason=internal_error AND letta has
-        //    *some* content to attribute to the assistant turn.
+        //    ParameterBody}): the model hit length-cap or dropped the
+        //    closing tags during a long generation (its attention
+        //    degrades past ~2000 tokens of tool-call output). Port of
+        //    upstream ds4's `try_repair_dsml` (0ffaabd, 596f49c,
+        //    20df6c7, guards from 7bcc4e8): instead of failing the
+        //    turn, finalize the in-flight parameter into the open
+        //    invoke, emit a ToolCall for each recoverable open invoke,
+        //    and close the tool_calls block. Upstream measured 100%
+        //    repair success in production (0 finish=error across 156+
+        //    requests).
         //
-        // The flushed bytes are guaranteed not to contain literal
+        // 3. Repair impossible (no recoverable invoke): fall back to
+        //    the pre-repair behavior — flush whatever bytes we have as
+        //    plain text (so letta gets a non-empty turn instead of
+        //    "Empty LLM response" + retry) and mark the turn malformed
+        //    so the handler reports finish_reason=internal_error.
+        //
+        // Think-boundary guard (upstream 7bcc4e8 guard a): upstream's
+        // text-level repair had to explicitly ignore DSML tags before
+        // the last `</think>` — DSML *quoted inside reasoning* would
+        // otherwise inflate the tag counts and trigger false-positive
+        // repairs. Our architecture enforces that guard upstream of
+        // the scanner, twice over:
+        //   1. The engine worker tracks `in_think` off the dedicated
+        //      TOK_THINK_BEGIN / TOK_THINK_END special tokens and tags
+        //      every chunk with `reasoning: in_think`
+        //      (engine_worker.rs); both scanner call sites
+        //      (`accumulate()` and the SSE stream loop in
+        //      openai/handler.rs) `continue` on reasoning chunks
+        //      BEFORE calling `push_token` — think-internal tokens
+        //      never reach the scanner at all.
+        //   2. The scanner is TOK_DSML-driven, not byte-driven: DSML
+        //      markup *quoted as text* (in thinking or anywhere else)
+        //      BPE-encodes to regular tokens, never opens a frame, and
+        //      therefore can neither trigger nor distort repair. See
+        //      the module docs and `think_quoted_dsml_text_is_inert`.
+        //
+        // Extra-closing-tags guard (upstream 7bcc4e8 guard b): upstream
+        // counted opens minus closes with size_t arithmetic and had to
+        // refuse repair when closes outnumbered opens (the subtraction
+        // underflowed and appended a huge suffix). Our scanner tracks
+        // nesting structurally with a frame stack, so a "negative"
+        // count cannot exist by construction: an orphan closing tag
+        // finds no matching open frame in `dispatch_close`, marks the
+        // turn malformed there, and `finish()` only ever repairs
+        // frames that were genuinely opened. No subtraction anywhere.
+        //
+        // The recovered bytes are guaranteed not to contain literal
         // `｜DSML｜` chars (the markers themselves were consumed by
-        // TOK_DSML transitions and stripped from tail). Per-mode
-        // contents:
-        //   OpenHeader/CloseHeader: header text (e.g. "parameter
-        //     name=\"command\"") — half-parsed, no DSML markers.
-        //   ParameterBody:          parameter body text plus any
-        //     tail lookahead bytes — pure content.
-        //   Text + inside frame:    only tail (text content between
-        //     frame tags is dropped on the fly already).
+        // TOK_DSML transitions and stripped from tail).
         let in_open_frame = !self.frames.is_empty();
         let mid_tag = matches!(
             self.mode,
@@ -330,37 +386,204 @@ impl DsmlScanner {
                 events.push(DsmlEvent::Text(drained));
             }
         } else if in_open_frame || mid_tag {
-            // Case 2: truncated mid-DSML. Recover bytes so letta gets
-            // a non-empty turn, then flag malformed so the handler
-            // reports an error (retryable for letta's retry path).
-            self.malformed = true;
-            let mut recovered: Vec<u8> = Vec::new();
-            if !self.buf.is_empty() {
-                recovered.extend(std::mem::take(&mut self.buf));
-            }
-            if !self.tail.is_empty() {
-                recovered.extend(std::mem::take(&mut self.tail));
-            }
-            if !recovered.is_empty() {
-                tracing::warn!(
-                    bytes = recovered.len(),
-                    mode = ?self.mode,
-                    open_frames = self.frames.len(),
-                    "DSML stream ended mid-markup; flushing partial bytes \
-                     as text to avoid empty response"
-                );
-                events.push(DsmlEvent::Text(recovered));
-            } else {
-                tracing::warn!(
-                    mode = ?self.mode,
-                    open_frames = self.frames.len(),
-                    "DSML stream ended mid-markup with no buffered bytes; \
-                     reporting malformed so handler returns retryable error"
-                );
-            }
+            self.repair_truncated(&mut events);
         }
         self.mode = Mode::Done;
         events
+    }
+
+    /// Case 2/3 of `finish()`: EOS arrived mid-DSML. Try to repair
+    /// (upstream semantics: append missing closing tags in reverse
+    /// nesting order parameter → invoke → tool_calls, then verify the
+    /// result parses); fall back to the malformed flush when no valid
+    /// invoke can be recovered.
+    fn repair_truncated(&mut self, events: &mut Vec<DsmlEvent>) {
+        // Snapshot the raw buffered bytes first — the fallback path
+        // flushes them as text so letta gets a non-empty turn (the
+        // pre-repair behavior).
+        let mut recovered_snapshot: Vec<u8> = Vec::new();
+        recovered_snapshot.extend_from_slice(&self.buf);
+        recovered_snapshot.extend_from_slice(&self.tail);
+
+        // Guard b (7bcc4e8): closing tags outnumbered opening tags at
+        // some point in this turn. That is corruption, not truncation
+        // — refuse to fabricate a repair.
+        if self.saw_orphan_close {
+            self.malformed = true;
+            self.frames.clear();
+            self.current_param = None;
+            self.buf.clear();
+            self.tail.clear();
+            if !recovered_snapshot.is_empty() {
+                events.push(DsmlEvent::Text(recovered_snapshot));
+            }
+            tracing::warn!(
+                "DSML stream ended mid-markup after orphan closing tags; \
+                 refusing repair (closes outnumbered opens)"
+            );
+            return;
+        }
+
+        // Step 1: resolve the mode-specific in-flight state, i.e. the
+        // implicit `</parameter>`.
+        match self.mode {
+            Mode::ParameterBody => {
+                // Truncated mid-parameter-body: buf holds the body so
+                // far, tail may hold a `<` / `</` lookahead that never
+                // became a tag. Both are body bytes.
+                let mut body = std::mem::take(&mut self.buf);
+                body.extend(std::mem::take(&mut self.tail));
+                if let Some((_, _, slot)) = self.current_param.as_mut() {
+                    *slot = body;
+                }
+                self.finalize_current_param();
+            }
+            Mode::CloseHeader => {
+                // Truncated inside a `</｜DSML｜…` header. If we came
+                // from ParameterBody the body was already stashed into
+                // current_param; the partial header text in buf is
+                // markup, not content — drop it.
+                self.buf.clear();
+                self.tail.clear();
+                self.finalize_current_param();
+            }
+            Mode::OpenHeader => {
+                // Truncated inside a `<｜DSML｜…` header. The tag never
+                // completed (no `name="…"` guaranteed, no body) — drop
+                // the partial header and repair the frames below it.
+                tracing::warn!(
+                    header = %String::from_utf8_lossy(&self.buf),
+                    "DSML stream truncated mid open-tag header; dropping partial tag"
+                );
+                self.buf.clear();
+                self.tail.clear();
+            }
+            Mode::Text => {
+                // Truncated between tags inside an open frame. Route
+                // any held-back tail like regular inter-tag text
+                // (hallucination capture or drop).
+                self.flush_tail_to_current_mode(events);
+            }
+            Mode::Done => {}
+        }
+
+        // Step 2: did any invoke ever open? Distinguishes truncation
+        // (repairable) from a hallucinated `<tool_calls>` block that
+        // wraps plain prose (strip tags, return prose — upstream
+        // 596f49c/20df6c7 mode 3).
+        let mut had_tool_calls_frame = false;
+        let mut any_invoke_opened = self.tool_calls_emitted > 0;
+        for f in &self.frames {
+            match f {
+                Frame::Invoke { .. } => any_invoke_opened = true,
+                Frame::ToolCalls { next_invoke_index } => {
+                    had_tool_calls_frame = true;
+                    if *next_invoke_index > 0 {
+                        any_invoke_opened = true;
+                    }
+                }
+            }
+        }
+
+        // Step 3: implicit `</invoke>` for every open invoke frame
+        // (reverse nesting order), then the implicit `</tool_calls>`.
+        let emitted_before = self.tool_calls_emitted;
+        self.close_open_invokes(events);
+        self.frames.clear();
+
+        if self.tool_calls_emitted > 0 {
+            // Repair succeeded — at least one structurally valid tool
+            // call this turn (recovered now or streamed earlier).
+            events.push(DsmlEvent::ToolCallsEnd);
+            tracing::warn!(
+                recovered = self.tool_calls_emitted - emitted_before,
+                total = self.tool_calls_emitted,
+                "repaired unterminated DSML tool call block \
+                 (appended missing closing tags)"
+            );
+        } else if had_tool_calls_frame && !any_invoke_opened {
+            // Hallucinated tool_calls: the block never contained an
+            // invoke. Strip the tags and surface the captured inner
+            // text as plain content; NOT an error (upstream 20df6c7).
+            let halluc = std::mem::take(&mut self.halluc_buf);
+            tracing::warn!(
+                bytes = halluc.len(),
+                "DSML stream ended inside a tool_calls block with no \
+                 invoke; treating block contents as plain text"
+            );
+            if !halluc.is_empty() {
+                events.push(DsmlEvent::Text(halluc));
+            }
+        } else {
+            // Unrecoverable (e.g. open invoke with an empty name, or
+            // a parameter with no enclosing invoke). Pre-repair
+            // behavior: flush recovered bytes as text + flag malformed
+            // so the handler reports a retryable error.
+            self.malformed = true;
+            if !recovered_snapshot.is_empty() {
+                tracing::warn!(
+                    bytes = recovered_snapshot.len(),
+                    "DSML stream ended mid-markup and repair found no \
+                     valid invoke; flushing partial bytes as text to \
+                     avoid empty response"
+                );
+                events.push(DsmlEvent::Text(recovered_snapshot));
+            } else {
+                tracing::warn!(
+                    "DSML stream ended mid-markup with no buffered bytes \
+                     and no recoverable invoke; reporting malformed so \
+                     handler returns retryable error"
+                );
+            }
+        }
+    }
+
+    /// Finalize the in-flight `current_param` (if any) into the
+    /// innermost open invoke frame. No-op when there is no pending
+    /// parameter; the parameter is dropped when no invoke frame is
+    /// open to receive it.
+    fn finalize_current_param(&mut self) {
+        if let Some((name, is_string, body_bytes)) = self.current_param.take() {
+            let body_str = if is_string {
+                dsml_param_decode_string(&String::from_utf8_lossy(&body_bytes))
+            } else {
+                dsml_param_decode_json_literal(&String::from_utf8_lossy(&body_bytes))
+            };
+            if let Some(Frame::Invoke { params, .. }) = self.frames.last_mut() {
+                params.push((name, is_string, body_str));
+            }
+        }
+    }
+
+    /// Pop every open `Frame::Invoke` off the stack (innermost first)
+    /// and emit a ToolCall for each one that has a non-empty name.
+    /// Used by repair paths: an explicit `</invoke>` goes through
+    /// `dispatch_close` instead.
+    fn close_open_invokes(&mut self, events: &mut Vec<DsmlEvent>) {
+        while matches!(self.frames.last(), Some(Frame::Invoke { .. })) {
+            if let Some(Frame::Invoke {
+                index,
+                name,
+                params,
+            }) = self.frames.pop()
+            {
+                if name.is_empty() {
+                    tracing::warn!(
+                        index,
+                        "dropping open DSML invoke with empty name during repair"
+                    );
+                    continue;
+                }
+                let arguments = params_to_json(&params);
+                events.push(DsmlEvent::ToolCall {
+                    index,
+                    id: format!("call_{}", uuid::Uuid::now_v7().simple()),
+                    name,
+                    arguments,
+                });
+                self.tool_calls_emitted += 1;
+            }
+        }
     }
 
     fn step(&mut self, tok: i32, bytes: &[u8], events: &mut Vec<DsmlEvent>) -> Vec<u8> {
@@ -455,15 +678,33 @@ impl DsmlScanner {
             Mode::Text => {
                 if self.frames.is_empty() {
                     events.push(DsmlEvent::Text(drained));
+                } else if self.in_bare_tool_calls() {
+                    // Inside <tool_calls> before any <invoke>: keep the
+                    // bytes so a hallucinated block can be surfaced as
+                    // plain text (see halluc_buf).
+                    self.halluc_buf.extend(drained);
                 }
-                // else: inside a frame (ToolCalls/Invoke), between
-                // tags. Drop.
+                // else: inside an Invoke frame (or after invokes
+                // started), between tags. Drop.
             }
             Mode::ParameterBody => {
                 self.buf.extend(drained);
             }
             _ => {}
         }
+    }
+
+    /// True when the innermost open frame is a `<tool_calls>` block
+    /// that has not opened any `<invoke>` yet — the only position
+    /// where inter-tag text might be hallucinated prose we need to
+    /// keep (rather than structural whitespace).
+    fn in_bare_tool_calls(&self) -> bool {
+        matches!(
+            self.frames.last(),
+            Some(Frame::ToolCalls {
+                next_invoke_index: 0
+            })
+        )
     }
 
     fn consume_text_bytes(&mut self, bytes: &[u8], events: &mut Vec<DsmlEvent>) -> Vec<u8> {
@@ -473,6 +714,11 @@ impl DsmlScanner {
             let emit: Vec<u8> = self.tail.drain(..self.tail.len() - hold).collect();
             if self.frames.is_empty() {
                 events.push(DsmlEvent::Text(emit));
+            } else if self.in_bare_tool_calls() {
+                // Possible hallucinated-block prose — keep it (see
+                // halluc_buf). Discarded as soon as a real invoke
+                // opens.
+                self.halluc_buf.extend(emit);
             }
             // else: drop — we're between tags inside a frame.
         }
@@ -519,6 +765,7 @@ impl DsmlScanner {
     fn dispatch_open(&mut self, head: &str) {
         let trimmed = head.trim_start();
         if trimmed.starts_with("tool_calls") {
+            self.halluc_buf.clear();
             self.frames.push(Frame::ToolCalls {
                 next_invoke_index: 0,
             });
@@ -526,6 +773,10 @@ impl DsmlScanner {
             return;
         }
         if trimmed.starts_with("invoke") {
+            // A real invoke: whatever text sat between <tool_calls>
+            // and here was structural whitespace, not hallucinated
+            // prose. Discard it.
+            self.halluc_buf.clear();
             let name = parse_attr(trimmed, "name").unwrap_or_default();
             let next_invoke_index = match self.frames.last_mut() {
                 Some(Frame::ToolCalls { next_invoke_index }) => {
@@ -561,27 +812,84 @@ impl DsmlScanner {
     fn dispatch_close(&mut self, head: &str, events: &mut Vec<DsmlEvent>) {
         let trimmed = head.trim_start();
         if trimmed.starts_with("tool_calls") {
-            // Pop the ToolCalls frame; emit ToolCallsEnd.
-            self.frames.clear();
-            events.push(DsmlEvent::ToolCallsEnd);
-            self.mode = Mode::Done;
+            // Repair (upstream 596f49c mode 2 — outer tags balanced,
+            // inner tags dropped): finalize any in-flight parameter
+            // and close any still-open invokes before closing the
+            // block, so `…<parameter …>body</tool_calls>` still yields
+            // the tool call.
+            self.finalize_current_param();
+            self.close_open_invokes(events);
+            match self.frames.pop() {
+                Some(Frame::ToolCalls { next_invoke_index })
+                    if next_invoke_index == 0 && self.tool_calls_emitted == 0 =>
+                {
+                    // Hallucinated tool_calls: a closed block that
+                    // never contained an invoke. Upstream (596f49c /
+                    // 20df6c7) strips the tags and treats the contents
+                    // as plain text rather than an error. Keep
+                    // scanning in Text mode — the model is still
+                    // producing prose.
+                    let halluc = std::mem::take(&mut self.halluc_buf);
+                    tracing::warn!(
+                        bytes = halluc.len(),
+                        "DSML tool_calls block closed with no invoke; \
+                         treating block contents as plain text"
+                    );
+                    if !halluc.is_empty() {
+                        events.push(DsmlEvent::Text(halluc));
+                    }
+                    self.mode = Mode::Text;
+                }
+                Some(_) => {
+                    // Real block close.
+                    self.halluc_buf.clear();
+                    self.frames.clear();
+                    events.push(DsmlEvent::ToolCallsEnd);
+                    self.mode = Mode::Done;
+                }
+                None => {
+                    // Orphan `</tool_calls>` — closes outnumber opens.
+                    // Not a truncation pattern; record it so `finish()`
+                    // refuses to fabricate a repair (7bcc4e8 guard b).
+                    tracing::warn!(
+                        "orphan </tool_calls> with no open block; repair disabled for this turn"
+                    );
+                    self.saw_orphan_close = true;
+                    self.mode = Mode::Text;
+                }
+            }
             return;
         }
         if trimmed.starts_with("invoke") {
-            // Pop the Invoke frame; emit ToolCall.
-            if let Some(Frame::Invoke {
-                index,
-                name,
-                params,
-            }) = self.pop_frame()
-            {
-                let arguments = params_to_json(&params);
-                events.push(DsmlEvent::ToolCall {
+            // Repair (upstream mode 2): a missing `</parameter>` right
+            // before `</invoke>` leaves current_param pending —
+            // finalize it into this invoke first.
+            self.finalize_current_param();
+            if matches!(self.frames.last(), Some(Frame::Invoke { .. })) {
+                if let Some(Frame::Invoke {
                     index,
-                    id: format!("call_{}", uuid::Uuid::now_v7().simple()),
                     name,
-                    arguments,
-                });
+                    params,
+                }) = self.frames.pop()
+                {
+                    let arguments = params_to_json(&params);
+                    events.push(DsmlEvent::ToolCall {
+                        index,
+                        id: format!("call_{}", uuid::Uuid::now_v7().simple()),
+                        name,
+                        arguments,
+                    });
+                    self.tool_calls_emitted += 1;
+                }
+            } else {
+                // Orphan `</invoke>` — no matching open frame. Don't
+                // pop (it would swallow an enclosing ToolCalls frame,
+                // the pre-fix behavior); record it so `finish()`
+                // refuses to repair (7bcc4e8 guard b).
+                tracing::warn!(
+                    "orphan </invoke> with no open invoke; repair disabled for this turn"
+                );
+                self.saw_orphan_close = true;
             }
             self.mode = Mode::Text;
             return;
@@ -589,26 +897,13 @@ impl DsmlScanner {
         if trimmed.starts_with("parameter") {
             // Finalise the current parameter (body was stashed when
             // we left ParameterBody → CloseHeader).
-            if let Some((name, is_string, body_bytes)) = self.current_param.take() {
-                let body_str = if is_string {
-                    dsml_param_decode_string(&String::from_utf8_lossy(&body_bytes))
-                } else {
-                    dsml_param_decode_json_literal(&String::from_utf8_lossy(&body_bytes))
-                };
-                if let Some(Frame::Invoke { params, .. }) = self.frames.last_mut() {
-                    params.push((name, is_string, body_str));
-                }
-            }
+            self.finalize_current_param();
             self.mode = Mode::Text;
             return;
         }
         tracing::warn!(head, "unknown DSML close tag; falling back to Text");
         self.malformed = true;
         self.mode = Mode::Text;
-    }
-
-    fn pop_frame(&mut self) -> Option<Frame> {
-        self.frames.pop()
     }
 }
 
@@ -744,13 +1039,49 @@ mod tests {
     /// Feed a sequence of (tok, bytes) pairs to the scanner and
     /// collect all events.
     fn drive(seq: &[(i32, &[u8])]) -> Vec<DsmlEvent> {
+        drive_sc(seq).0
+    }
+
+    /// Like `drive` but also returns the scanner so tests can inspect
+    /// `saw_malformed()`.
+    fn drive_sc(seq: &[(i32, &[u8])]) -> (Vec<DsmlEvent>, DsmlScanner) {
         let mut sc = DsmlScanner::new(TOK_DSML_TEST);
         let mut out = Vec::new();
         for &(t, b) in seq {
             out.extend(sc.push_token(t, b));
         }
         out.extend(sc.finish());
-        out
+        (out, sc)
+    }
+
+    /// Collect all Text-event bytes.
+    fn all_text(ev: &[DsmlEvent]) -> Vec<u8> {
+        ev.iter()
+            .filter_map(|e| {
+                if let DsmlEvent::Text(b) = e {
+                    Some(b.clone())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// Collect all (name, arguments) pairs from ToolCall events.
+    fn all_calls(ev: &[DsmlEvent]) -> Vec<(String, String)> {
+        ev.iter()
+            .filter_map(|e| {
+                if let DsmlEvent::ToolCall {
+                    name, arguments, ..
+                } = e
+                {
+                    Some((name.clone(), arguments.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -861,18 +1192,351 @@ mod tests {
         assert_eq!(calls, vec![(0, "a".into()), (1, "b".into())]);
     }
 
+    // ------------------------------------------------------------------
+    // DSML repair suite — port of upstream ds4's
+    // test_dsml_repair_produces_parseable_calls (0ffaabd / 596f49c /
+    // 20df6c7) plus the 7bcc4e8 edge-case guards (tests 11-13). Where
+    // upstream repairs a text buffer by appending closing tags and
+    // re-parsing, our event scanner repairs at finish() by finalizing
+    // the in-flight parameter and closing open frames — the assertions
+    // check the same structural outcomes (tool name + arguments).
+    // ------------------------------------------------------------------
+
+    const DSML_B: &[u8] = b"\xef\xbd\x9cDSML\xef\xbd\x9c";
+
     #[test]
-    fn truncated_mid_parameter_flushes_partial_text_and_marks_malformed() {
-        // Reproduces the "Empty LLM response" bug: the model opens
-        // <tool_calls><invoke><parameter ...> and writes body bytes,
-        // then hits EOS / length-cap before emitting the closing
-        // tags. Pre-fix: finish() silently dropped every byte and
-        // letta saw zero text + zero tool_calls. Now: partial body
-        // text is recovered and `saw_malformed()` flips so the
-        // handler reports a retryable error.
-        let dsml_bytes: &[u8] = b"\xef\xbd\x9cDSML\xef\xbd\x9c";
+    fn repair_missing_tool_calls_close() {
+        // Upstream TEST 1: complete invoke, missing only </tool_calls>.
+        // Previously: finish=error "unterminated tool call" even though
+        // a full ToolCall had already streamed. Now: emit ToolCallsEnd,
+        // no malformed.
+        let (ev, sc) = drive_sc(&[
+            (1, b"thinking done\n\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls>\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"invoke name=\"bash\">\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"parameter name=\"command\" string=\"true\">ls -la</"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"parameter>\n</"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"invoke>\n"),
+            // EOS — missing </tool_calls>.
+        ]);
+        let calls = all_calls(&ev);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "bash");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(v["command"], "ls -la");
+        assert!(ev.iter().any(|e| matches!(e, DsmlEvent::ToolCallsEnd)));
+        assert!(!sc.saw_malformed(), "repairable truncation must not flag malformed");
+    }
+
+    #[test]
+    fn repair_missing_invoke_and_tool_calls_close() {
+        // Upstream TEST 2: missing </invoke> AND </tool_calls>. The
+        // open invoke (with its completed parameter) is finalized at
+        // finish().
+        let (ev, sc) = drive_sc(&[
+            (1, b"\n\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls>\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"invoke name=\"edit\">\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"parameter name=\"path\" string=\"true\">/tmp/test.c</"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"parameter>\n"),
+            // EOS — missing </invoke> + </tool_calls>.
+        ]);
+        let calls = all_calls(&ev);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "edit");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(v["path"], "/tmp/test.c");
+        assert!(ev.iter().any(|e| matches!(e, DsmlEvent::ToolCallsEnd)));
+        assert!(!sc.saw_malformed());
+    }
+
+    #[test]
+    fn repair_missing_parameter_close() {
+        // Upstream TEST 3: truncated mid parameter BODY — missing
+        // </parameter>, </invoke> and </tool_calls>. The in-flight
+        // parameter body is finalized into the invoke.
+        let (ev, sc) = drive_sc(&[
+            (1, b"\n\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls>\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"invoke name=\"bash\">\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"parameter name=\"command\" string=\"true\">echo hello"),
+            // EOS — nothing closed.
+        ]);
+        let calls = all_calls(&ev);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "bash");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(v["command"], "echo hello");
+        assert!(ev.iter().any(|e| matches!(e, DsmlEvent::ToolCallsEnd)));
+        assert!(!sc.saw_malformed());
+        // The recovered body must NOT also leak out as text.
+        assert!(!contains_subseq(&all_text(&ev), b"echo hello"));
+    }
+
+    #[test]
+    fn repair_missing_parameter_close_with_explicit_invoke_close() {
+        // Upstream mode 2 (596f49c): outer tags present but the inner
+        // </parameter> was dropped — `…>pwd</invoke></tool_calls>`.
+        // dispatch_close("invoke") finalizes the pending parameter.
+        let (ev, sc) = drive_sc(&[
+            (1, b"<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls>\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"invoke name=\"execute_command\">\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"parameter name=\"command\" string=\"true\">pwd</"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"invoke>\n</"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls>"),
+        ]);
+        let calls = all_calls(&ev);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "execute_command");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(v["command"], "pwd");
+        assert!(!sc.saw_malformed());
+    }
+
+    #[test]
+    fn repair_multi_parameter_missing_tool_calls_close() {
+        // Upstream TEST 4 analog: two parameters, missing only the
+        // outer close.
+        let (ev, sc) = drive_sc(&[
+            (1, b"<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls>\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"invoke name=\"write_file\">\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"parameter name=\"path\" string=\"true\">/tmp/out.txt</"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"parameter>\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"parameter name=\"content\" string=\"true\">hello world</"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"parameter>\n</"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"invoke>\n"),
+            // EOS — missing </tool_calls>.
+        ]);
+        let calls = all_calls(&ev);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "write_file");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(v["path"], "/tmp/out.txt");
+        assert_eq!(v["content"], "hello world");
+        assert!(!sc.saw_malformed());
+    }
+
+    #[test]
+    fn hallucinated_tool_calls_closed_block_is_plain_text() {
+        // Upstream 596f49c/20df6c7 mode 3: <tool_calls> wrapping plain
+        // prose with no <invoke> inside. The tags are stripped and the
+        // prose surfaces as content; not an error, and NOT reported as
+        // a tool_calls finish (no ToolCallsEnd).
+        let (ev, sc) = drive_sc(&[
+            (1, b"<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls>I should probably call bash here.</"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls> More text after."),
+        ]);
+        assert!(all_calls(&ev).is_empty());
+        assert!(!ev.iter().any(|e| matches!(e, DsmlEvent::ToolCallsEnd)));
+        let text = all_text(&ev);
+        assert!(
+            contains_subseq(&text, b"I should probably call bash here."),
+            "hallucinated block contents must surface as text, got {:?}",
+            String::from_utf8_lossy(&text)
+        );
+        // Scanning continues after the stripped block.
+        assert!(contains_subseq(&text, b" More text after."));
+        assert!(!sc.saw_malformed());
+    }
+
+    #[test]
+    fn hallucinated_tool_calls_truncated_is_plain_text() {
+        // Mode 3 + truncation: <tool_calls> then prose then EOS with
+        // no invoke and no closing tag.
+        let (ev, sc) = drive_sc(&[
+            (1, b"<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls>Let me think about this instead."),
+            // EOS.
+        ]);
+        assert!(all_calls(&ev).is_empty());
+        assert!(!ev.iter().any(|e| matches!(e, DsmlEvent::ToolCallsEnd)));
+        assert!(contains_subseq(
+            &all_text(&ev),
+            b"Let me think about this instead."
+        ));
+        assert!(!sc.saw_malformed());
+    }
+
+    #[test]
+    fn truncated_bare_tool_calls_is_stripped_not_error() {
+        // Model opens <｜DSML｜tool_calls> then EOS immediately. Zero
+        // invokes → hallucinated-block handling (upstream repairs to
+        // an empty content turn, not an error). Must not panic.
+        let (ev, sc) = drive_sc(&[
+            (1, b"preamble <"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls>"),
+        ]);
+        assert!(all_calls(&ev).is_empty());
+        assert!(!ev.iter().any(|e| matches!(e, DsmlEvent::ToolCallsEnd)));
+        assert!(!sc.saw_malformed());
+        assert_eq!(all_text(&ev), b"preamble ".to_vec());
+    }
+
+    #[test]
+    fn extra_closing_tags_refuse_repair() {
+        // Upstream 7bcc4e8 TEST 12: closing tags outnumber opening
+        // tags. Upstream's size_t open-minus-close subtraction would
+        // underflow and append a huge suffix; the guard refuses
+        // instead. Our frame stack cannot underflow by construction —
+        // assert nothing is fabricated and nothing panics.
+        let (ev, _sc) = drive_sc(&[
+            (1, b"done\n\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls></"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls></"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls>"),
+        ]);
+        assert!(all_calls(&ev).is_empty());
+        assert!(!ev.iter().any(|e| matches!(e, DsmlEvent::ToolCallsEnd)));
+    }
+
+    #[test]
+    fn orphan_close_then_truncation_refuses_repair() {
+        // 7bcc4e8 guard b at finish(): an orphan </invoke> earlier in
+        // the turn means tag structure is corrupted, not truncated —
+        // refuse to fabricate tool calls from the open frames.
+        let (ev, sc) = drive_sc(&[
+            (1, b"<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls></"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"invoke>\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"invoke name=\"bash\">"),
+            // EOS with an open invoke — would normally repair, but the
+            // orphan close disables it.
+        ]);
+        assert!(all_calls(&ev).is_empty());
+        assert!(sc.saw_malformed(), "orphan closes + truncation must be malformed");
+    }
+
+    #[test]
+    fn unrecoverable_truncation_still_flushes_text_and_marks_malformed() {
+        // Fallback path (pre-repair behavior): a parameter with no
+        // enclosing invoke is not a recoverable tool call. The partial
+        // body is flushed as text (letta must not see an empty turn)
+        // and the turn is flagged malformed.
+        let (ev, sc) = drive_sc(&[
+            (1, b"<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"parameter name=\"cmd\" string=\"true\">curl --max-time 30"),
+            // EOS.
+        ]);
+        assert!(all_calls(&ev).is_empty());
+        assert!(sc.saw_malformed());
+        assert!(contains_subseq(&all_text(&ev), b"curl --max-time 30"));
+    }
+
+    #[test]
+    fn open_invoke_with_empty_name_is_not_recovered() {
+        // "Emit a ToolCall for each open Frame::Invoke that has a
+        // non-empty name" — an invoke without a name cannot be
+        // executed; with nothing else recoverable the turn falls back
+        // to malformed.
+        let (ev, sc) = drive_sc(&[
+            (1, b"<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls>\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"invoke>"),
+            // EOS — open invoke, no name.
+        ]);
+        assert!(all_calls(&ev).is_empty());
+        assert!(sc.saw_malformed());
+    }
+
+    #[test]
+    fn think_quoted_dsml_text_is_inert() {
+        // Upstream 7bcc4e8 TESTS 11+13: DSML quoted inside <think> must
+        // neither trigger nor distort repair. Our architecture enforces
+        // the guard upstream of the scanner (see the finish() comment):
+        //
+        //  1. Think-internal tokens NEVER reach the scanner: the engine
+        //     worker tags chunks with `reasoning: in_think` (tracked
+        //     off TOK_THINK_BEGIN/TOK_THINK_END special tokens,
+        //     engine_worker.rs) and both call sites skip reasoning
+        //     chunks before push_token. This test therefore simply does
+        //     not feed the quoted-DSML think tokens — exactly what the
+        //     callers guarantee.
+        //
+        //  2. Even if quoted DSML *text* reaches the scanner (model
+        //     quoting markup in its answer), it arrives as regular BPE
+        //     bytes without TOK_DSML transitions and cannot open a
+        //     frame or affect repair accounting.
+        //
+        // Both properties together are the event-scanner equivalent of
+        // upstream's "only scan DSML tags after the last </think>".
+        let (ev, sc) = drive_sc(&[
+            // Property 2: literal DSML-looking bytes, NO TOK_DSML.
+            (1, b"The protocol uses <"),
+            (2, DSML_B), // regular token whose bytes merely LOOK like the marker
+            (1, b"tool_calls> tags, but this is only a quote.\n\n<"),
+            // Property 1 aftermath / TEST 13: real DSML after the quote
+            // still repairs normally.
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"tool_calls>\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"invoke name=\"bash\">\n<"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"parameter name=\"command\" string=\"true\">date</"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"parameter>\n</"),
+            (TOK_DSML_TEST, DSML_B),
+            (1, b"invoke>\n"),
+            // EOS — missing </tool_calls>; repair must recover exactly
+            // ONE call (the quoted tags must not distort the repair).
+        ]);
+        let calls = all_calls(&ev);
+        assert_eq!(calls.len(), 1, "quoted DSML must not add or block tool calls");
+        assert_eq!(calls[0].0, "bash");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(v["command"], "date");
+        assert!(!sc.saw_malformed());
+        // The quoted markup passes through as plain text.
+        let text = all_text(&ev);
+        assert!(contains_subseq(&text, b"tool_calls> tags, but this is only a quote."));
+    }
+
+    #[test]
+    fn balanced_tool_calls_not_modified_by_finish() {
+        // Upstream TEST 6: a fully balanced block needs no repair —
+        // finish() after Mode::Done must add nothing.
+        let dsml_bytes: &[u8] = DSML_B;
         let mut sc = DsmlScanner::new(TOK_DSML_TEST);
-        let mut events: Vec<DsmlEvent> = Vec::new();
+        let mut ev = Vec::new();
         for &(t, b) in &[
             (1i32, &b"<"[..]),
             (TOK_DSML_TEST, dsml_bytes),
@@ -880,45 +1544,21 @@ mod tests {
             (TOK_DSML_TEST, dsml_bytes),
             (1, &b"invoke name=\"bash\">\n<"[..]),
             (TOK_DSML_TEST, dsml_bytes),
-            (1, &b"parameter name=\"cmd\" string=\"true\">curl --max-time 30"[..]),
-            // EOS arrives here — no closing </parameter></invoke></tool_calls>.
-        ] {
-            events.extend(sc.push_token(t, b));
-        }
-        events.extend(sc.finish());
-        // Recovered partial body must arrive as Text.
-        let text: Vec<u8> = events
-            .iter()
-            .filter_map(|e| if let DsmlEvent::Text(b) = e { Some(b.clone()) } else { None })
-            .flatten()
-            .collect();
-        assert!(
-            contains_subseq(&text, b"curl --max-time 30"),
-            "expected partial parameter body in flushed text, got {:?}",
-            String::from_utf8_lossy(&text)
-        );
-        // Malformed flag must be set so the handler returns an error.
-        assert!(sc.saw_malformed(), "truncated DSML must flip saw_malformed");
-        // No ToolCall emitted (the invoke never closed).
-        assert!(!events.iter().any(|e| matches!(e, DsmlEvent::ToolCall { .. })));
-    }
-
-    #[test]
-    fn truncated_at_open_tag_marks_malformed_no_panic() {
-        // Even worse case: model opens <｜DSML｜tool_calls> then EOS
-        // immediately. No body bytes at all. Scanner must mark
-        // malformed without panicking. Pre-fix: silent empty turn.
-        let dsml_bytes: &[u8] = b"\xef\xbd\x9cDSML\xef\xbd\x9c";
-        let mut sc = DsmlScanner::new(TOK_DSML_TEST);
-        for &(t, b) in &[
-            (1i32, &b"<"[..]),
+            (1, &b"parameter name=\"command\" string=\"true\">ls</"[..]),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, &b"parameter>\n</"[..]),
+            (TOK_DSML_TEST, dsml_bytes),
+            (1, &b"invoke>\n</"[..]),
             (TOK_DSML_TEST, dsml_bytes),
             (1, &b"tool_calls>"[..]),
         ] {
-            let _ = sc.push_token(t, b);
+            ev.extend(sc.push_token(t, b));
         }
-        let _ = sc.finish();
-        assert!(sc.saw_malformed());
+        let pre_finish = ev.len();
+        ev.extend(sc.finish());
+        assert_eq!(ev.len(), pre_finish, "finish() added events to a balanced turn");
+        assert_eq!(all_calls(&ev).len(), 1);
+        assert!(!sc.saw_malformed());
     }
 
     fn contains_subseq(haystack: &[u8], needle: &[u8]) -> bool {

@@ -1922,13 +1922,29 @@ pub async fn accumulate(
             WorkerEvent::Error(e) => return Err(eyre!("engine error: {e}")),
         }
     }
-    // Drain scanner state.
+    // Drain scanner state. Since the DSML-repair port, finish() can
+    // also emit ToolCall / ToolCallsEnd events (truncated tool-call
+    // blocks recovered by appending the missing closing tags) — they
+    // must be collected exactly like live-stream ones.
     for de in scanner.finish() {
-        if let DsmlEvent::Text(b) = de {
-            let s = drain_valid_utf8(&mut pending, &b);
-            if !s.is_empty() {
-                text.push_str(&s);
+        match de {
+            DsmlEvent::Text(b) => {
+                let s = drain_valid_utf8(&mut pending, &b);
+                if !s.is_empty() {
+                    text.push_str(&s);
+                }
             }
+            DsmlEvent::ToolCall {
+                id, name, arguments, ..
+            } => {
+                saw_tool = true;
+                tool_calls.push(ToolCall {
+                    id,
+                    kind: "function".into(),
+                    function: ToolCallFunction { name, arguments },
+                });
+            }
+            DsmlEvent::ToolCallsEnd => saw_tool = true,
         }
     }
     if !pending.is_empty() {
