@@ -41,7 +41,7 @@ use crate::openai::types::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, Role, ToolCall,
     ToolCallFunction, Usage,
 };
-use crate::prompt::render_prompt;
+use crate::prompt::{render_prompt, ReasoningEffort};
 
 const DEFAULT_TEMPERATURE: f32 = 1.0;
 const DEFAULT_MIN_P_REL: f32 = 0.0;
@@ -66,12 +66,22 @@ pub async fn chat_completions(
 ) -> Result<Response, ApiError> {
     let stream = req.stream.unwrap_or(false);
 
-    let think_mode = is_reasoning_enabled(&req.reasoning, &req.reasoning_effort);
+    // V4-Flash 0731 reasoning effort. Both request fields map to one
+    // 4-state level (Off/Low/High/Max); `reasoning_effort` wins when
+    // both are set; absent → Low (thinking on, no preamble — same as
+    // the historical think-mode default). Unknown strings are an
+    // invalid parameter → HTTP 400, matching the render_prompt
+    // BadRequest convention below.
+    let effort = ReasoningEffort::from_request_fields(
+        req.reasoning.as_deref(),
+        req.reasoning_effort.as_deref(),
+    )
+    .map_err(ApiError::BadRequest)?;
     let tokens = render_prompt(
         &engine.vocab,
         &req.messages,
         req.tools.as_deref(),
-        think_mode,
+        effort,
     )
     .map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
     let prompt_tokens_count = tokens.len() as u32;
@@ -520,26 +530,6 @@ async fn drive_sse_stream(
     let _ = out
         .send(Ok(Event::default().data("[DONE]".to_string())))
         .await;
-}
-
-/// True if neither `reasoning` nor `reasoning_effort` is set to an
-/// explicit OFF value. Letta sends `reasoning` as a string level
-/// ("low"/"medium"/"high"); OpenAI uses `reasoning_effort`.
-///
-/// Default = **ON**: V4-Flash benefits substantially from a `<think>`
-/// planning phase before emitting tool-call DSML, and most letta
-/// requests omit the field entirely (relying on the server default).
-/// Letta or other clients can disable by sending e.g.
-/// `reasoning: "none"`.
-fn is_reasoning_enabled(reasoning: &Option<String>, effort: &Option<String>) -> bool {
-    let off = |s: &str| {
-        let l = s.to_ascii_lowercase();
-        matches!(l.as_str(), "" | "none" | "off" | "disabled" | "false")
-    };
-    // If EITHER field explicitly says "off", honour it. Otherwise on.
-    let r_off = reasoning.as_deref().map(off).unwrap_or(false);
-    let e_off = effort.as_deref().map(off).unwrap_or(false);
-    !(r_off || e_off)
 }
 
 fn unix_now() -> u64 {

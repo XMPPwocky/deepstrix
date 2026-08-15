@@ -1120,6 +1120,7 @@ mod retention_tests {
             n_head_dim: 1,
             vocab_size: 1,
             token_embd_prefix_blake3: "x".into(),
+            tensor_directory_blake3: "y".into(),
         }
     }
     fn h(tag: u8) -> [u8; 32] {

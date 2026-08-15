@@ -411,7 +411,12 @@ fn main() -> eyre::Result<()> {
             tool_call_id: None,
             name: None,
         }];
-        let tokens = render_prompt(&vocab, &messages, None, /*think_mode=*/ false)?;
+        let tokens = render_prompt(
+            &vocab,
+            &messages,
+            None,
+            deepstrix_server::prompt::ReasoningEffort::Off,
+        )?;
         eprintln!("rendered prompt: {} tokens", tokens.len());
 
         if (tokens.len() as u32) + case.steps.len() as u32 + 1 > n_kv_max {

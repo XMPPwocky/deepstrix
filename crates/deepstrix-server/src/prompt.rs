@@ -9,6 +9,7 @@
 //!
 //! Template structure (after rendering):
 //!   <BOS>
+//!   [reasoning-effort preamble if effort is High/Max — 0731 spec]
 //!   [merged system prompt text]
 //!   [tool schemas block if tools provided]
 //!   For each turn in history:
@@ -24,6 +25,95 @@ use v4flash_core::tokenizer::BpeVocab;
 use crate::dsml::{render_tool_calls_in_history, render_tools_prompt};
 use crate::openai::types::{ChatMessage, Role, ToolDef};
 use crate::tokens::{TOK_ASSISTANT, TOK_BOS, TOK_EOS, TOK_THINK_BEGIN, TOK_THINK_END, TOK_USER};
+
+/// V4-Flash 0731 "high" reasoning-effort preamble. Byte-for-byte copy of
+/// `REASONING_EFFORT_PROMPTS["high"]` from the HF model repo's
+/// `encoding/encoding_dsv4.py` (this is the pre-0731 ds4
+/// `DS4_REASONING_EFFORT_MAX_PREFIX` text). In thinking mode it is
+/// prepended at the very beginning of the conversation — immediately
+/// after BOS, before the system message.
+pub const REASONING_HIGH_PREFIX: &str =
+    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n\
+You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n\
+Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
+
+/// V4-Flash 0731 "max" reasoning-effort preamble. Byte-for-byte copy of
+/// `REASONING_EFFORT_PROMPTS["max"]` from `encoding_dsv4.py`.
+pub const REASONING_MAX_PREFIX: &str =
+    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n\
+You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n\
+Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
+
+/// Reasoning effort for a request, per the V4-Flash 0731 spec
+/// (`REASONING_EFFORT_PROMPTS` in `encoding_dsv4.py`) plus an explicit
+/// Off state for thinking disabled entirely.
+///
+///   * `Off`  — no `<think>` phase (assistant turn opens with `</think>`).
+///   * `Low`  — thinking on, no preamble. 0731's default level; matches
+///     the server's historical think-mode default exactly.
+///   * `High` — thinking on + [`REASONING_HIGH_PREFIX`] after BOS.
+///   * `Max`  — thinking on + [`REASONING_MAX_PREFIX`] after BOS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Off,
+    Low,
+    High,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// True when the assistant turn should open with `<think>`.
+    pub fn thinking_enabled(self) -> bool {
+        !matches!(self, ReasoningEffort::Off)
+    }
+
+    /// The effort preamble to prepend at the very beginning of the
+    /// conversation (empty for Off/Low).
+    pub fn preamble(self) -> &'static str {
+        match self {
+            ReasoningEffort::Off | ReasoningEffort::Low => "",
+            ReasoningEffort::High => REASONING_HIGH_PREFIX,
+            ReasoningEffort::Max => REASONING_MAX_PREFIX,
+        }
+    }
+
+    /// Map one request-field string to a level. Case-insensitive.
+    ///
+    ///   "" | "none" | "off" | "disabled" | "false" → Off
+    ///   "low"                                      → Low
+    ///   "medium" | "high" | "xhigh"                → High  (lenient
+    ///       toward legacy OpenAI `reasoning_effort` values)
+    ///   "max"                                      → Max
+    ///   anything else                              → Err (caller maps this
+    ///       to the invalid-parameter HTTP 400 convention)
+    pub fn parse_str(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "" | "none" | "off" | "disabled" | "false" => Ok(ReasoningEffort::Off),
+            "low" => Ok(ReasoningEffort::Low),
+            "medium" | "high" | "xhigh" => Ok(ReasoningEffort::High),
+            "max" => Ok(ReasoningEffort::Max),
+            other => Err(format!(
+                "invalid reasoning effort {other:?}: expected one of \
+                 \"none\", \"off\", \"disabled\", \"false\", \"low\", \
+                 \"medium\", \"high\", \"xhigh\", \"max\""
+            )),
+        }
+    }
+
+    /// Resolve the effort from the request's `reasoning` (letta / pi-ai)
+    /// and `reasoning_effort` (OpenAI) fields. If both are set,
+    /// `reasoning_effort` wins. Both absent/null → `Low` (thinking on,
+    /// no preamble — the server's historical default behavior).
+    pub fn from_request_fields(
+        reasoning: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> Result<Self, String> {
+        match reasoning_effort.or(reasoning) {
+            None => Ok(ReasoningEffort::Low),
+            Some(s) => Self::parse_str(s),
+        }
+    }
+}
 
 /// The literal bytes of the `｜DSML｜` special token. The V4-Flash BPE
 /// does NOT auto-merge these bytes to the single special-token id at
@@ -75,7 +165,7 @@ pub fn render_prompt(
     vocab: &BpeVocab,
     messages: &[ChatMessage],
     tools: Option<&[ToolDef]>,
-    think_mode: bool,
+    effort: ReasoningEffort,
 ) -> eyre::Result<Vec<i32>> {
     if messages.is_empty() {
         return Err(eyre!("render_prompt: messages array is empty"));
@@ -108,6 +198,17 @@ pub fn render_prompt(
 
     let mut out: Vec<i32> = Vec::new();
     out.push(TOK_BOS);
+    // 0731 reasoning-effort preamble: prepended at the very beginning of
+    // the conversation, before the system message. This full re-render
+    // path always starts from BOS, so "first turn only" == "right after
+    // BOS" here (mirrors ChatTurnBuilder in deepstrix-cli's chat.rs,
+    // which gates the same injection on is_first_turn). The preamble
+    // ends in "\n\n" — that's its separator from the system text; the
+    // text is ours, contains no DSML marker, so plain encode is fine.
+    let preamble = effort.preamble();
+    if !preamble.is_empty() {
+        out.extend(vocab.encode(preamble));
+    }
     if !user_system_text.is_empty() {
         out.extend(vocab.encode(&user_system_text));
     }
@@ -210,13 +311,13 @@ pub fn render_prompt(
         }
     }
 
-    // Final open assistant turn. think_mode=true opens with `<think>`
-    // so the model emits reasoning until it samples `</think>`
+    // Final open assistant turn. Any thinking-enabled effort opens with
+    // `<think>` so the model emits reasoning until it samples `</think>`
     // (TOK_THINK_END) as a proper special token; the SSE handler
     // routes reasoning tokens to `delta.reasoning_content` until then.
     if pending_assistant {
         out.push(TOK_ASSISTANT);
-        out.push(if think_mode {
+        out.push(if effort.thinking_enabled() {
             TOK_THINK_BEGIN
         } else {
             TOK_THINK_END
@@ -362,6 +463,180 @@ fn dump_no_user_assistant_transcript(
             tracing::warn!(error = %e, path = %path, "failed to dump transcript");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embed::build_gpt2_byte_decoder;
+    use crate::snapshot::decode_tokens_to_bytes;
+    use v4flash_core::MappedGguf;
+
+    // ---- string → level mapping ------------------------------------
+
+    #[test]
+    fn effort_off_synonyms() {
+        for s in ["", "none", "off", "disabled", "false", "NONE", "Off"] {
+            assert_eq!(
+                ReasoningEffort::parse_str(s),
+                Ok(ReasoningEffort::Off),
+                "input {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn effort_level_synonyms() {
+        assert_eq!(ReasoningEffort::parse_str("low"), Ok(ReasoningEffort::Low));
+        assert_eq!(ReasoningEffort::parse_str("Low"), Ok(ReasoningEffort::Low));
+        for s in ["medium", "high", "xhigh", "HIGH", "Medium"] {
+            assert_eq!(
+                ReasoningEffort::parse_str(s),
+                Ok(ReasoningEffort::High),
+                "input {s:?}"
+            );
+        }
+        assert_eq!(ReasoningEffort::parse_str("max"), Ok(ReasoningEffort::Max));
+        assert_eq!(ReasoningEffort::parse_str("MAX"), Ok(ReasoningEffort::Max));
+    }
+
+    #[test]
+    fn effort_invalid_is_err() {
+        for s in ["maximum", "ultra", "42", "think"] {
+            assert!(ReasoningEffort::parse_str(s).is_err(), "input {s:?}");
+        }
+    }
+
+    #[test]
+    fn effort_field_resolution() {
+        use ReasoningEffort as E;
+        // Both absent → Low (thinking on, no preamble — historical default).
+        assert_eq!(E::from_request_fields(None, None), Ok(E::Low));
+        // Either field alone works.
+        assert_eq!(E::from_request_fields(Some("max"), None), Ok(E::Max));
+        assert_eq!(E::from_request_fields(None, Some("high")), Ok(E::High));
+        assert_eq!(E::from_request_fields(Some("none"), None), Ok(E::Off));
+        // Both set → reasoning_effort wins.
+        assert_eq!(
+            E::from_request_fields(Some("none"), Some("max")),
+            Ok(E::Max)
+        );
+        assert_eq!(
+            E::from_request_fields(Some("max"), Some("off")),
+            Ok(E::Off)
+        );
+        // Invalid propagates as Err.
+        assert!(E::from_request_fields(None, Some("bogus")).is_err());
+        assert!(E::from_request_fields(Some("bogus"), None).is_err());
+    }
+
+    #[test]
+    fn effort_preamble_and_think_gate() {
+        assert!(!ReasoningEffort::Off.thinking_enabled());
+        assert!(ReasoningEffort::Low.thinking_enabled());
+        assert!(ReasoningEffort::High.thinking_enabled());
+        assert!(ReasoningEffort::Max.thinking_enabled());
+        assert_eq!(ReasoningEffort::Off.preamble(), "");
+        assert_eq!(ReasoningEffort::Low.preamble(), "");
+        assert_eq!(ReasoningEffort::High.preamble(), REASONING_HIGH_PREFIX);
+        assert_eq!(ReasoningEffort::Max.preamble(), REASONING_MAX_PREFIX);
+        // Spec texts end with a blank line ("\n\n") — that's the
+        // separator from the system message.
+        assert!(REASONING_HIGH_PREFIX.ends_with(".\n\n"));
+        assert!(REASONING_MAX_PREFIX.ends_with(".\n\n"));
+    }
+
+    // ---- prompt rendering with the real vocab ----------------------
+    // Same gating pattern as engine_worker::tests::load_vocab — the
+    // GGUF is large, so these are #[ignore] and skip when absent.
+
+    fn load_vocab() -> Option<BpeVocab> {
+        let path = "/persist/lumi/models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf";
+        if !std::path::Path::new(path).exists() {
+            return None;
+        }
+        let gguf = MappedGguf::open(path).ok()?;
+        BpeVocab::from_gguf(gguf.gguf()).ok()
+    }
+
+    fn msg(role: Role, content: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: Some(content.to_string()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn render_to_string(vocab: &BpeVocab, messages: &[ChatMessage], effort: ReasoningEffort) -> String {
+        let toks = render_prompt(vocab, messages, None, effort).expect("render");
+        let dec = build_gpt2_byte_decoder();
+        String::from_utf8(decode_tokens_to_bytes(&toks, vocab, &dec)).expect("utf8")
+    }
+
+    #[test]
+    #[ignore]
+    fn preamble_injected_after_bos_before_system() {
+        let Some(vocab) = load_vocab() else { return };
+        let messages = vec![msg(Role::System, "SYSPROMPT"), msg(Role::User, "hi")];
+        for (effort, prefix) in [
+            (ReasoningEffort::High, REASONING_HIGH_PREFIX),
+            (ReasoningEffort::Max, REASONING_MAX_PREFIX),
+        ] {
+            let s = render_to_string(&vocab, &messages, effort);
+            let bos = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>";
+            let expected_start = format!("{bos}{prefix}SYSPROMPT");
+            assert!(
+                s.starts_with(&expected_start),
+                "{effort:?}: prompt does not start with BOS+preamble+system:\n{}",
+                &s[..s.len().min(600)]
+            );
+            // Preamble appears exactly once.
+            assert_eq!(s.matches("Reasoning Effort:").count(), 1, "{effort:?}");
+            // Thinking is open.
+            assert!(s.ends_with("<think>"), "{effort:?}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn preamble_absent_for_off_and_low() {
+        let Some(vocab) = load_vocab() else { return };
+        let messages = vec![msg(Role::System, "SYSPROMPT"), msg(Role::User, "hi")];
+        let low = render_to_string(&vocab, &messages, ReasoningEffort::Low);
+        assert!(!low.contains("Reasoning Effort:"));
+        assert!(low.ends_with("<think>"));
+        let off = render_to_string(&vocab, &messages, ReasoningEffort::Off);
+        assert!(!off.contains("Reasoning Effort:"));
+        assert!(off.ends_with("</think>"));
+        // Low must be byte-identical to Off except for the final
+        // think-open token — i.e. exactly the historical think_mode
+        // behavior, no extra bytes anywhere.
+        assert_eq!(
+            low.strip_suffix("<think>").unwrap(),
+            off.strip_suffix("</think>").unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn preamble_first_turn_only_in_multi_turn_render() {
+        let Some(vocab) = load_vocab() else { return };
+        let messages = vec![
+            msg(Role::System, "SYS"),
+            msg(Role::User, "turn one"),
+            msg(Role::Assistant, "answer one"),
+            msg(Role::User, "turn two"),
+        ];
+        let s = render_to_string(&vocab, &messages, ReasoningEffort::Max);
+        // Injected once, at the very beginning of the conversation only —
+        // NOT re-injected before later turns.
+        assert_eq!(s.matches("Reasoning Effort: Beyond maximum").count(), 1);
+        let pos = s.find("Reasoning Effort: Beyond maximum").unwrap();
+        let bos = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>";
+        assert_eq!(pos, bos.len());
     }
 }
 

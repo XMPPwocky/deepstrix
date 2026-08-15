@@ -30,17 +30,20 @@
 //!                 reproducible across runs unless explicitly changed.
 //!
 //! REPL commands:
-//!   /think    enable chain-of-thought for subsequent turns
-//!   /nothink  disable (default)
-//!   /thinkmax enable "absolute max" reasoning preamble (≥384K ctx only;
-//!             matches ds4_server.c DS4_THINK_MAX behavior)
+//!   /think     enable chain-of-thought for subsequent turns (0731 "low"
+//!              effort: thinking on, no preamble)
+//!   /nothink   disable (default)
+//!   /thinkhigh enable 0731 "high" reasoning preamble (the pre-0731 ds4
+//!              DS4_THINK_MAX text; ≥384K-ctx guidance, first turn only)
+//!   /thinkmax  enable 0731 "max" reasoning preamble (≥384K-ctx
+//!              guidance, first turn only)
 //!   /load <path>  substitute file contents as one user turn
 //!   /quit     exit
 //!   (EOF)     exit
 //!
 //! Template applied per user turn (matches ds4_server.c render_chat_prompt_text
 //! at the token-ID level — encoder doesn't recognize special-token text):
-//!   (first turn only) <BOS> [think-max preamble if /thinkmax] [CHAT_SYSTEM content]
+//!   (first turn only) <BOS> [effort preamble if /thinkhigh|/thinkmax] [CHAT_SYSTEM content]
 //!   <｜User｜>{user_msg}<｜Assistant｜>{<think> if thinking else </think>}
 //!   …model output… <EOS>
 //! The model emits `</think>` itself at end-of-reasoning, then its answer.
@@ -70,14 +73,26 @@ const TOK_ASSISTANT: i32 = 128804;   // <｜Assistant｜>
 const TOK_THINK_BEGIN: i32 = 128821; // <think>
 const TOK_THINK_END: i32 = 128822;   // </think>
 
-/// DS4 "absolute maximum reasoning" preamble. Per ds4.c (DS4_REASONING_EFFORT_MAX_PREFIX).
-/// Used at /thinkmax. Only safe at ≥384K ctx — preamble is large.
-const REASONING_MAX_PREFIX: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n\
+/// V4-Flash 0731 "high" reasoning-effort preamble — byte-for-byte
+/// `REASONING_EFFORT_PROMPTS["high"]` from the HF repo's
+/// `encoding/encoding_dsv4.py`. This is the pre-0731 ds4.c
+/// DS4_REASONING_EFFORT_MAX_PREFIX text, now the "high" level.
+/// Used at /thinkhigh. Only safe at ≥384K ctx — preamble is large.
+const REASONING_HIGH_PREFIX: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n\
 You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n\
 Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
 
+/// V4-Flash 0731 "max" reasoning-effort preamble — byte-for-byte
+/// `REASONING_EFFORT_PROMPTS["max"]` from `encoding_dsv4.py`.
+/// Used at /thinkmax. Only safe at ≥384K ctx — preamble is large.
+const REASONING_MAX_PREFIX: &str = "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n\
+You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n\
+Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
+
+/// 0731 effort levels: On = "low" (thinking, no preamble), High/Max add
+/// the corresponding preamble on the first turn.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ThinkMode { Off, On, Max }
+enum ThinkMode { Off, On, High, Max }
 
 impl ThinkMode {
     fn is_on(self) -> bool { !matches!(self, ThinkMode::Off) }
@@ -103,8 +118,13 @@ impl ChatTurnBuilder {
         let mut out = Vec::new();
         if self.is_first_turn {
             out.push(TOK_BOS);
-            if think == ThinkMode::Max {
-                out.extend(vocab.encode(REASONING_MAX_PREFIX));
+            // 0731: the selected effort's preamble goes at the very
+            // beginning of the conversation — after BOS, before the
+            // system message. First turn only.
+            match think {
+                ThinkMode::High => out.extend(vocab.encode(REASONING_HIGH_PREFIX)),
+                ThinkMode::Max => out.extend(vocab.encode(REASONING_MAX_PREFIX)),
+                ThinkMode::Off | ThinkMode::On => {}
             }
             if let Some(sys) = &self.system_prompt {
                 if !sys.is_empty() {
@@ -436,7 +456,7 @@ fn main() -> eyre::Result<()> {
         system_prompt: std::env::var("CHAT_SYSTEM").ok(),
     };
 
-    eprintln!("ready. /think, /nothink, /thinkmax, /load <file>, /quit.");
+    eprintln!("ready. /think, /nothink, /thinkhigh, /thinkmax, /load <file>, /quit.");
     loop {
         print!("\n\x1b[1mUser:\x1b[0m ");
         std::io::stdout().flush().ok();
@@ -466,14 +486,29 @@ fn main() -> eyre::Result<()> {
                 eprintln!("[think mode: off]");
                 continue;
             }
+            "/thinkhigh" => {
+                if builder.is_first_turn {
+                    think_mode = ThinkMode::High;
+                    eprintln!("[think mode: HIGH (reasoning preamble will be injected on first turn — \
+                               needs ≥384K ctx per ds4 convention; CHAT_KV_MAX={n_kv_max})]");
+                } else {
+                    // Per ds4: the effort prefix is part of the system block
+                    // which we already passed. Downgrading to on prevents a
+                    // silent no-op.
+                    think_mode = ThinkMode::On;
+                    eprintln!("[think mode: on (HIGH prefix only takes effect on first turn)]");
+                }
+                continue;
+            }
             "/thinkmax" => {
                 if builder.is_first_turn {
                     think_mode = ThinkMode::Max;
                     eprintln!("[think mode: MAX (reasoning preamble will be injected on first turn — \
                                needs ≥384K ctx per ds4 convention; CHAT_KV_MAX={n_kv_max})]");
                 } else {
-                    // Per ds4: max-prefix is part of the system block which we
-                    // already passed. Downgrading to on prevents silent no-op.
+                    // Per ds4: the effort prefix is part of the system block
+                    // which we already passed. Downgrading to on prevents a
+                    // silent no-op.
                     think_mode = ThinkMode::On;
                     eprintln!("[think mode: on (MAX prefix only takes effect on first turn)]");
                 }
@@ -498,7 +533,7 @@ fn main() -> eyre::Result<()> {
         let user_msg = effective_msg;
 
         // Build this turn's prefix via the shared template builder. First
-        // turn includes BOS + (optional) MAX-reasoning preamble + system;
+        // turn includes BOS + (optional) HIGH/MAX effort preamble + system;
         // every turn adds [User|content|Assistant|(<think>|</think>)].
         let turn_tokens = builder.build(&vocab, user_msg, think_mode);
 

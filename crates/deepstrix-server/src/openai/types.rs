@@ -149,11 +149,17 @@ pub struct ChatCompletionRequest {
     /// `include_usage` (emit a final usage chunk in SSE responses).
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
-    /// OpenAI o1/o3-style reasoning toggle: "low" | "medium" | "high".
-    /// Any non-"none" value enables think mode (the assistant turn
-    /// opens with `<think>` instead of `</think>`). Letta sends this
-    /// as `reasoning` in pi-ai's stream adapter; OpenAI clients send
-    /// it as `reasoning_effort`. We accept either.
+    /// V4-Flash 0731 reasoning-effort level. Mapped by
+    /// `prompt::ReasoningEffort::from_request_fields`:
+    ///   ""|"none"|"off"|"disabled"|"false" → Off (no `<think>` phase)
+    ///   absent/null | "low"                → Low (think on, no preamble;
+    ///                                        the server default)
+    ///   "medium"|"high"|"xhigh"            → High (0731 "high" preamble)
+    ///   "max"                              → Max  (0731 "max" preamble)
+    ///   anything else                      → HTTP 400
+    /// Letta sends this as `reasoning` in pi-ai's stream adapter; OpenAI
+    /// clients send it as `reasoning_effort`. We accept either;
+    /// `reasoning_effort` wins if both are set.
     #[serde(default)]
     pub reasoning: Option<String>,
     #[serde(default)]
