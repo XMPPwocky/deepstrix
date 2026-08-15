@@ -87,15 +87,20 @@ impl ReasoningEffort {
     ///   anything else                              → Err (caller maps this
     ///       to the invalid-parameter HTTP 400 convention)
     pub fn parse_str(s: &str) -> Result<Self, String> {
+        // Only low/high/max exist in the 0731 spec; the rest are lenient
+        // aliases for other clients' effort ladders (OpenAI: minimal..xhigh;
+        // Hermes: minimal..ultra, and its LM Studio route statically clamps
+        // max/ultra -> xhigh, so xhigh maps to Max here or Hermes users
+        // could never reach our top tier).
         match s.to_ascii_lowercase().as_str() {
             "" | "none" | "off" | "disabled" | "false" => Ok(ReasoningEffort::Off),
-            "low" => Ok(ReasoningEffort::Low),
-            "medium" | "high" | "xhigh" => Ok(ReasoningEffort::High),
-            "max" => Ok(ReasoningEffort::Max),
+            "minimal" | "low" => Ok(ReasoningEffort::Low),
+            "medium" | "high" => Ok(ReasoningEffort::High),
+            "xhigh" | "max" | "ultra" => Ok(ReasoningEffort::Max),
             other => Err(format!(
                 "invalid reasoning effort {other:?}: expected one of \
-                 \"none\", \"off\", \"disabled\", \"false\", \"low\", \
-                 \"medium\", \"high\", \"xhigh\", \"max\""
+                 \"none\", \"off\", \"disabled\", \"false\", \"minimal\", \
+                 \"low\", \"medium\", \"high\", \"xhigh\", \"max\", \"ultra\""
             )),
         }
     }
@@ -488,17 +493,30 @@ mod tests {
 
     #[test]
     fn effort_level_synonyms() {
-        assert_eq!(ReasoningEffort::parse_str("low"), Ok(ReasoningEffort::Low));
-        assert_eq!(ReasoningEffort::parse_str("Low"), Ok(ReasoningEffort::Low));
-        for s in ["medium", "high", "xhigh", "HIGH", "Medium"] {
+        for s in ["low", "Low", "minimal"] {
+            assert_eq!(
+                ReasoningEffort::parse_str(s),
+                Ok(ReasoningEffort::Low),
+                "input {s:?}"
+            );
+        }
+        for s in ["medium", "high", "HIGH", "Medium"] {
             assert_eq!(
                 ReasoningEffort::parse_str(s),
                 Ok(ReasoningEffort::High),
                 "input {s:?}"
             );
         }
-        assert_eq!(ReasoningEffort::parse_str("max"), Ok(ReasoningEffort::Max));
-        assert_eq!(ReasoningEffort::parse_str("MAX"), Ok(ReasoningEffort::Max));
+        // xhigh/ultra land on Max: Hermes' LM Studio route clamps its
+        // max/ultra to xhigh before sending, so xhigh must reach our top
+        // tier or Hermes users could never request Max.
+        for s in ["xhigh", "max", "MAX", "ultra"] {
+            assert_eq!(
+                ReasoningEffort::parse_str(s),
+                Ok(ReasoningEffort::Max),
+                "input {s:?}"
+            );
+        }
     }
 
     // ---- tool-result rendering -------------------------------------
@@ -545,7 +563,7 @@ mod tests {
 
     #[test]
     fn effort_invalid_is_err() {
-        for s in ["maximum", "ultra", "42", "think"] {
+        for s in ["maximum", "42", "think"] {
             assert!(ReasoningEffort::parse_str(s).is_err(), "input {s:?}");
         }
     }

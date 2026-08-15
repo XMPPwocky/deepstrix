@@ -244,6 +244,43 @@ pub async fn list_models(State(engine): State<EngineHandle>) -> Json<serde_json:
     }))
 }
 
+/// GET /api/v1/models — LM Studio-compatible model listing.
+///
+/// Exists so Hermes can discover that this server supports reasoning:
+/// Hermes hard-codes `supports_reasoning = false` for custom OpenAI
+/// endpoints, but when its provider is set to `lmstudio` it probes
+/// `{server_root}/api/v1/models` for a `models` list (NOT OpenAI's
+/// `data` envelope) and reads `capabilities.reasoning.allowed_options`
+/// per model (matched on `key` or `id`). Any option besides "off"
+/// enables reasoning, after which Hermes sends a flat top-level
+/// `reasoning_effort` string — our native format.
+///
+/// The advertised options are LM Studio's vocabulary (its ladder tops
+/// out at "xhigh"; Hermes statically clamps its max/ultra to xhigh
+/// before the allowed-set check, which is why our parse_str maps
+/// xhigh -> Max). Advertising exactly what we accept means Hermes
+/// clamps rather than sending something we would 400 on.
+pub async fn lmstudio_models(State(engine): State<EngineHandle>) -> Json<serde_json::Value> {
+    let id = engine.model_name.as_str().to_string();
+    let ctx = engine.n_kv_max as u64;
+    Json(serde_json::json!({
+        "models": [{
+            "key": id,
+            "id": id,
+            "object": "model",
+            "type": "llm",
+            "state": "loaded",
+            "max_context_length": ctx,
+            "loaded_context_length": ctx,
+            "capabilities": {
+                "reasoning": {
+                    "allowed_options": ["off", "minimal", "low", "medium", "high", "xhigh"]
+                }
+            }
+        }]
+    }))
+}
+
 /// GET /healthz — process-level liveness. Always 200 once the HTTP
 /// stack is up. Does NOT detect a wedged engine; use /readyz for that.
 pub async fn healthz() -> &'static str {

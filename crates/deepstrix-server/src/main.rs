@@ -19,7 +19,7 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_hip::install_panic_handler;
 
 use deepstrix_server::engine_worker::{run_watchdog, spawn, WorkerConfig};
-use deepstrix_server::openai::handler::{chat_completions, healthz, list_models, readyz};
+use deepstrix_server::openai::handler::{chat_completions, healthz, list_models, lmstudio_models, readyz};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "OpenAI-compatible HTTP server for deepstrix V4-Flash")]
@@ -114,6 +114,7 @@ async fn main() -> eyre::Result<()> {
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
+        .route("/api/v1/models", get(lmstudio_models))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .with_state(engine.clone());
