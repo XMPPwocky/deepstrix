@@ -260,12 +260,27 @@ pub fn moe_gate_up_chunked(
     n_rows: u32,
     n_blocks: u32,
 ) -> eyre::Result<bool> {
+    // IQ2_XS / IQ3_XXS pair kwide (2026-08-15): default prefill kernel is
+    // the M51-structure kwide port (weights dequantized once per lane and
+    // amortized across chunk members). PAIR_VARIANT=chunked rolls back to
+    // the serial per-member kernel.
+    let use_kwide = std::env::var("PAIR_VARIANT")
+        .map(|v| v != "chunked")
+        .unwrap_or(true);
     match dt {
         GgufType::IQ2_S => e.iq2s.launch_fused_swiglu_chunked(
             s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
             gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
         )?,
+        GgufType::IQ2_XS if use_kwide => e.iq2xs.launch_fused_swiglu_kwide(
+            s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
+        )?,
         GgufType::IQ2_XS => e.iq2xs.launch_fused_swiglu_chunked(
+            s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
+        )?,
+        GgufType::IQ3_XXS if use_kwide => e.iq3pair.launch_fused_swiglu_kwide(
             s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
             gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
         )?,

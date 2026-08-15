@@ -161,4 +161,61 @@ impl Iq2XsPairMatvec {
             n_rows, n_blocks
         ])
     }
+
+    /// Prefill kwide (M51-structure port, 2026-08-15): dequant each lane's
+    /// 16 gate+up weights ONCE per super-block pair, amortized across all
+    /// chunk members (the `_chunked` kernel re-dequants per member).
+    /// Same work-items contract as `launch_fused_swiglu_chunked`;
+    /// additionally requires `n_blocks % 2 == 0` and `chunk_size <= 32`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_kwide(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,
+        expert_w: &DeviceBuffer<f32>,
+        group_count: &DeviceBuffer<i32>,
+        expert_members: &DeviceBuffer<i32>,
+        work_items: &DeviceBuffer<i32>,
+        n_work_items: u32,
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+    ) -> eyre::Result<()> {
+        if n_rows % 8 != 0 {
+            return Err(eyre!("iq2_xs kwide: n_rows={n_rows} not %8"));
+        }
+        if n_blocks % 2 != 0 {
+            return Err(eyre!("iq2_xs kwide: n_blocks={n_blocks} must be even"));
+        }
+        if chunk_size > 32 {
+            return Err(eyre!(
+                "iq2_xs kwide: chunk_size={chunk_size} exceeds IQ2XS_KW_MAX_CHUNK=32"
+            ));
+        }
+        if n_work_items == 0 {
+            return Ok(());
+        }
+        let function = self
+            .module
+            .get_function("iq2_xs_pair_matvec_fused_swiglu_kwide")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows / 8, n_work_items, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(),
+            expert_w.raw(), group_count.raw(), expert_members.raw(), work_items.raw(),
+            gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp,
+            n_rows, n_blocks
+        ])
+    }
 }

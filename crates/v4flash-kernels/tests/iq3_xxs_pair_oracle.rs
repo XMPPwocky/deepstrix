@@ -257,5 +257,21 @@ fn iq3_xxs_pair_kernels_match_cpu() -> eyre::Result<()> {
         }
     }
     check("iq3_xxs_pair chunked", &got_t, &want_t, 1e-2)?;
+
+    // kwide prefill: same work-items contract, same inputs, same expected
+    // values (f32 reduction order differs -> same tolerance as chunked).
+    mid2_d.fill_zero()?;
+    iq2s.launch_fused_swiglu_kwide(&stream, &mut mid2_d, &gate_d, &up_d, &xq2_d, &ew2_d,
+        &gc_d, &em_d, &wi_d, wi_h.len() as u32, bpe as u32, bpe as u32,
+        n_used as u32, max_per_expert as u32, chunk, clamp, n_rows as u32, nb as u32)?;
+    stream.synchronize()?;
+    mid2_d.copy_to_host(&mut mid2)?;
+    let mut got_k = Vec::new();
+    for &(_, bi, sl) in &touched {
+        for row in 0..n_rows {
+            got_k.push(mid2[(bi * n_used + sl) * n_rows + row]);
+        }
+    }
+    check("iq3_xxs_pair kwide", &got_k, &want_t, 1e-2)?;
     Ok(())
 }
