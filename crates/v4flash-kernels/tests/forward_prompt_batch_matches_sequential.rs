@@ -19,7 +19,7 @@ use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::config::N_VOCAB;
 use v4flash_kernels::het::{
     BatchDgpuScratch, BatchIgpuScratch, BatchScratch, DgpuScratch, ExecMode, HetModelState,
-    HetModelWeights, HeterogeneousEngine,
+    HetModelWeights, HeterogeneousEngine, B_MAX,
 };
 use v4flash_kernels::{oracle::ActivationDump, RopeParams};
 
@@ -392,7 +392,7 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
             .and_then(|s| s.parse::<usize>().ok())
             == Some(layer)
         {
-            use v4flash_kernels::config::{HC_DIM as HD, N_EMBD as NE, Q_FLAT as QF};
+            use v4flash_kernels::config::{HC_DIM as HD, N_EMBD as NE};
             let compare = |name: &str, ref_buf: &v4flash_hip::DeviceBuffer<f32>,
                             v2_buf_view: v4flash_hip::DeviceBuffer<f32>|
              -> eyre::Result<()> {
@@ -411,16 +411,16 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
             // mhc_pre_attn outputs (stages 1-end).
             compare("attn_input_norm", &bs.shared_dgpu.attn_input_norm,
                 bd.attn_input_norm.slice_view(0, NE as usize))?;
-            // Q chain.
-            compare("q_normed", &bs.shared_dgpu.q_normed,
-                bd.q_normed.slice_view(0, QF as usize))?;
+            // Q chain / attention output: NOT compared here. In the
+            // batched scratch `q_normed` is the backing store for the
+            // out-proj temporaries (heads_xq/low/attn_out) and `heads`
+            // lives in the R1 arena that `flat` and the hot-expert views
+            // reuse later in the layer, so neither survives to the end
+            // of the layer (see batch_scratch.rs lifetime unions).
             // KV chain.
             compare("kv_normed", &bs.shared_dgpu.kv_normed,
                 bd.kv_normed.slice_view(0, v4flash_kernels::config::N_HEAD_DIM as usize))?;
-            // Attention output (heads).
-            compare("heads_post_attn", &bs.shared_dgpu.heads,
-                bd.heads.slice_view(0, QF as usize))?;
-            // Output projection.
+            // Output projection (R2 view; last write of the layer in R2).
             compare("attn_out", &bs.shared_dgpu.attn_out,
                 bd.attn_out.slice_view(0, NE as usize))?;
             // mHC post-attn.
@@ -660,10 +660,12 @@ fn forward_prefill_pipelined_matches_single_lane() -> eyre::Result<()> {
 
     // Test: two-lane pipelined forward_prefill.
     eprintln!("Run B: forward_prefill_pipelined (lanes=2)");
-    let mut bd_p_a = BatchDgpuScratch::alloc(dgpu)?;
-    let mut bi_p_a = BatchIgpuScratch::alloc(igpu)?;
-    let mut bd_p_b = BatchDgpuScratch::alloc(dgpu)?;
-    let mut bi_p_b = BatchIgpuScratch::alloc(igpu)?;
+    // Per-lane sizing as in production (each lane holds ceil(chunk/2) rows).
+    let lane_rows = B_MAX.div_ceil(2);
+    let mut bd_p_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let mut bi_p_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let mut bd_p_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let mut bi_p_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
     let mut state_b = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
     let logits_pipelined = engine.forward_prefill_pipelined(
         &mut bd_p_a,

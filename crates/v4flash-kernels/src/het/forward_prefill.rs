@@ -99,6 +99,27 @@ fn prefill_hot_active(
     active
 }
 
+/// Every batched entry point runs `b` rows through per-lane scratch
+/// that was allocated for `bd.rows` / `bi.rows` tokens
+/// (`BatchDgpuScratch::alloc_rows`). Kernels index by `b`, not by the
+/// allocation size, so an oversized batch would silently overrun the
+/// B-scaled buffers — refuse it up front.
+fn check_scratch_rows(
+    who: &str,
+    b: usize,
+    bd: &BatchDgpuScratch,
+    bi: &BatchIgpuScratch,
+) -> eyre::Result<()> {
+    if b > bd.rows || b > bi.rows {
+        return Err(eyre!(
+            "{who}: batch of {b} rows exceeds scratch capacity (dGPU rows={}, iGPU rows={})",
+            bd.rows,
+            bi.rows
+        ));
+    }
+    Ok(())
+}
+
 impl HeterogeneousEngine {
     /// Layer-major batched prefill using batched kernels.
     ///
@@ -147,6 +168,7 @@ impl HeterogeneousEngine {
                 ));
             }
         }
+        check_scratch_rows("forward_prompt_batch_v2", b, batch_dgpu, batch_igpu)?;
 
         self.current_device
             .store(-1, std::sync::atomic::Ordering::Relaxed);
@@ -244,6 +266,10 @@ impl HeterogeneousEngine {
         }
         let b_a = b.div_ceil(2);
         let b_b = b - b_a;
+        // Lane scratches are usually allocated at B_MAX.div_ceil(2) rows
+        // (see BatchDgpuScratch::alloc_rows); never exceed what they hold.
+        check_scratch_rows("forward_prompt_batch_v2_pipelined lane A", b_a, bd_a, bi_a)?;
+        check_scratch_rows("forward_prompt_batch_v2_pipelined lane B", b_b, bd_b, bi_b)?;
         let tokens_a = &tokens[..b_a];
         let tokens_b = &tokens[b_a..];
         let input_a = &input_hcs[..b_a];
@@ -419,6 +445,10 @@ impl HeterogeneousEngine {
             ));
         }
         let chunk_size = B_MAX;
+        // Single-lane driver: every chunk (up to B_MAX rows) runs through
+        // ONE scratch set, so it must be allocated at full B_MAX rows
+        // (`alloc()`), not the per-lane `alloc_rows(B_MAX.div_ceil(2))`.
+        check_scratch_rows("forward_prefill", chunk_size.min(t), bd, bi)?;
         let cs_hc = HC_DIM as usize;
         let cs_vocab = N_VOCAB as usize;
 
@@ -780,6 +810,7 @@ impl HeterogeneousEngine {
         if b == 0 {
             return Ok(());
         }
+        check_scratch_rows("forward_layer_pre_moe_v2", b as usize, bd, bi)?;
 
         self.set_current_cached(self.dgpu.device)?;
         let de = &self.dgpu;
@@ -1591,11 +1622,13 @@ impl HeterogeneousEngine {
             //
             // For each batch token b at ratio==4 with n_index_comp_per[b] >
             // INDEXER_TOP_K, run matvec(attn_q_b) → RoPE → matvec(proj) →
-            // scale → IndexerScore → IndexerTopk → bitpack into a per-
-            // token slice of bd.attn_comp_allowed_bits. The score kernel
-            // below then sees the mask via its nullable comp_allowed_bits
-            // param and stamps -INF for masked comp rows; softmax
-            // converts to zero weight.
+            // scale → IndexerScore → IndexerTopk → IndexerGather of the
+            // selected comp_kv rows into bd.attn_active_comp_kv. The score
+            // + smwsum kernels below then read that dense per-token top-K
+            // buffer (comp_kv_batch_stride = INDEXER_TOP_K) instead of the
+            // full comp_kv. The topk kernel also bitpacks the selection
+            // into bd.attn_comp_allowed_bits, but the score kernel gets
+            // `None` for the mask — the gather already handles sparsity.
             //
             // For tokens with n_index_comp_per[b] ≤ INDEXER_TOP_K (early-
             // permit) we set an all-1s mask — leaving the score kernel
@@ -2181,7 +2214,7 @@ impl HeterogeneousEngine {
                 all_sel.extend_from_slice(&sel);
                 all_ew.extend_from_slice(&w);
             }
-            // d_selected / d_ew are B_MAX-sized; copy into [0..B*N_USED] view.
+            // d_selected / d_ew are rows-sized; copy into [0..B*N_USED] view.
             let mut sel_v = bd
                 .d_selected
                 .slice_view_mut(0, b as usize * cs_n_used);
@@ -2355,7 +2388,7 @@ impl HeterogeneousEngine {
         // with the iGPU MoE below (which skips those slots). Same
         // group-builder machinery as the iGPU path but in DENSE id space,
         // and with a STATIC work-items list — grid.y covers the worst
-        // case (n_hot × B_MAX/HOT_CHUNK) and the matvec kernels'
+        // case (n_hot × ceil(rows/HOT_CHUNK)) and the matvec kernels'
         // `member_end <= member_start` guard early-exits empty chunks, so
         // nothing here blocks on a host readback of n_work_items (a
         // de.compute sync would stall the lane pipeline). The partial is
@@ -2363,11 +2396,14 @@ impl HeterogeneousEngine {
         // ========================================================
         let hot_active = prefill_hot_active(dlw, ilw, bd);
         if hot_active {
-            use super::batch_scratch::{HOT_CHUNK, HOT_CHUNKS_PER_EXPERT};
+            use super::batch_scratch::HOT_CHUNK;
             let hot = dlw.hot_experts.as_ref().unwrap();
             let hd = bd.hot.as_mut().unwrap();
             let cap = hot_prefill_cap();
-            let n_wi = hot.n_hot * HOT_CHUNKS_PER_EXPERT as u32;
+            // Member-list stride / chunk count follow the lane's scratch
+            // rows (hd.max_per_expert == bd.rows), not B_MAX.
+            let max_per_expert = hd.max_per_expert as u32;
+            let n_wi = hot.n_hot * hd.chunks_per_expert as u32;
             let _t_hot = de.events.stage("dgpu.hot_moe_prefill", &de.compute)?;
             hd.group_count.fill_zero_async(&de.compute)?;
             de.moe_group_builder.launch_hetsplit(
@@ -2381,7 +2417,7 @@ impl HeterogeneousEngine {
                 b,
                 cs_n_used as u32,
                 hot.n_hot,
-                B_MAX as u32,
+                max_per_expert,
             )?;
             de.q8k.launch(
                 &de.compute,
@@ -2395,7 +2431,7 @@ impl HeterogeneousEngine {
                 de, ilw.routed.gate.dtype, &de.compute, &mut hd.mid_cat, &hot.gate, &hot.up,
                 &hd.moe_xq, &bd.d_ew, &hd.group_count, &hd.expert_members,
                 &hd.work_items_static, n_wi, gbpe, ubpe, cs_n_used as u32,
-                B_MAX as u32, HOT_CHUNK as u32, crate::config::SWIGLU_CLAMP_EXP,
+                max_per_expert, HOT_CHUNK as u32, crate::config::SWIGLU_CLAMP_EXP,
                 crate::config::N_FF_EXP, crate::config::BLOCKS_Q8K_GATE_IN,
             )? {
                 de.iq2.launch_fused_swiglu_kwide(
@@ -2411,7 +2447,7 @@ impl HeterogeneousEngine {
                     gbpe,
                     ubpe,
                     cs_n_used as u32,
-                    B_MAX as u32,
+                    max_per_expert,
                     HOT_CHUNK as u32,
                     crate::config::SWIGLU_CLAMP_EXP,
                     crate::config::N_FF_EXP,
@@ -2430,14 +2466,14 @@ impl HeterogeneousEngine {
                     &de.compute, &mut hd.partials, &hot.down, &hd.midq_cat,
                     &hd.group_count, &hd.expert_members, &hd.work_items_static, n_wi,
                     dbpe, mid_blocks_bytes as u32, cs_n_used as u32,
-                    B_MAX as u32, HOT_CHUNK as u32, N_EMBD,
+                    max_per_expert, HOT_CHUNK as u32, N_EMBD,
                     crate::config::BLOCKS_Q8K_DOWN_IN,
                 )?,
                 v4flash_core::gguf::GgufType::MXFP4 => de.mxfp4.launch_by_expert_kwide2(
                     &de.compute, &mut hd.partials, &hot.down, &hd.midq_cat,
                     &hd.group_count, &hd.expert_members, &hd.work_items_static, n_wi,
                     dbpe, mid_blocks_bytes as u32, cs_n_used as u32,
-                    B_MAX as u32, HOT_CHUNK as u32, N_EMBD,
+                    max_per_expert, HOT_CHUNK as u32, N_EMBD,
                     crate::config::BLOCKS_Q8K_DOWN_IN,
                 )?,
                 _ => de.q2k.launch_by_expert_kwide2(
@@ -2451,7 +2487,7 @@ impl HeterogeneousEngine {
                     dbpe,
                     mid_blocks_bytes as u32,
                     cs_n_used as u32,
-                    B_MAX as u32,
+                    max_per_expert,
                     HOT_CHUNK as u32,
                     N_EMBD,
                     crate::config::BLOCKS_Q8K_DOWN_IN,

@@ -245,13 +245,17 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
-    let mut bd = BatchDgpuScratch::alloc(dgpu)?;
-    let mut bi = BatchIgpuScratch::alloc(igpu)?;
+    // Lane sizing mirrors production: with two lanes each scratch set
+    // holds at most ceil(B_MAX/2) rows of a chunk; single-lane
+    // forward_prefill needs the full B_MAX.
+    let lane_rows = if pipeline_lanes >= 2 { B_MAX.div_ceil(2) } else { B_MAX };
+    let mut bd = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let mut bi = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
     let (mut bd_b, mut bi_b) = if pipeline_lanes >= 2 {
-        eprintln!("PIPELINE_LANES=2: allocating second BatchScratch set");
+        eprintln!("PIPELINE_LANES=2: allocating second BatchScratch set ({lane_rows} rows/lane)");
         (
-            Some(BatchDgpuScratch::alloc(dgpu)?),
-            Some(BatchIgpuScratch::alloc(igpu)?),
+            Some(BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?),
+            Some(BatchIgpuScratch::alloc_rows(igpu, lane_rows)?),
         )
     } else {
         (None, None)

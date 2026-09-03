@@ -18,7 +18,7 @@ use v4flash_hip::Device;
 use v4flash_kernels::config::{COMPRESS_RATIOS, HC_DIM, N_VOCAB};
 use v4flash_kernels::het::{
     BatchDgpuScratch, BatchIgpuScratch, DgpuScratch, ExecMode, HetModelState, HetModelWeights,
-    HeterogeneousEngine, IgpuScratch, SampleMode,
+    HeterogeneousEngine, IgpuScratch, SampleMode, B_MAX,
 };
 use v4flash_kernels::sampler::SamplerRng;
 use v4flash_kernels::RopeParams;
@@ -455,10 +455,14 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     let dgpu_scratch = DgpuScratch::alloc(dgpu)?;
     let igpu_scratch = IgpuScratch::alloc(igpu)?;
     let state = HetModelState::alloc(dgpu, igpu, cfg.n_kv_max)?;
-    let bd_a = BatchDgpuScratch::alloc(dgpu)?;
-    let bi_a = BatchIgpuScratch::alloc(igpu)?;
-    let bd_b = BatchDgpuScratch::alloc(dgpu)?;
-    let bi_b = BatchIgpuScratch::alloc(igpu)?;
+    // Two-lane pipelined prefill: each lane holds at most ceil(B_MAX/2)
+    // rows of a chunk (forward_prompt_batch_v2_pipelined), so size the
+    // per-lane scratch at that instead of the full chunk.
+    let lane_rows = B_MAX.div_ceil(2);
+    let bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let bi_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
     tracing::info!(n_kv_max = cfg.n_kv_max, "KV cache allocated");
 
     let byte_decoder = build_gpt2_byte_decoder();

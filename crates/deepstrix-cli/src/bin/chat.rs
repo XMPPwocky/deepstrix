@@ -60,7 +60,7 @@ use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::config::{COMPRESS_RATIOS, HC_DIM, N_EMBD, N_HC, N_VOCAB};
 use v4flash_kernels::het::{
     BatchDgpuScratch, BatchIgpuScratch, DgpuScratch, ExecMode, HetModelState, HetModelWeights,
-    HeterogeneousEngine, IgpuScratch, SampleMode,
+    HeterogeneousEngine, IgpuScratch, SampleMode, B_MAX,
 };
 use v4flash_kernels::sampler::SamplerRng;
 use v4flash_kernels::RopeParams;
@@ -433,12 +433,15 @@ fn main() -> eyre::Result<()> {
     let mut dgpu_scratch = DgpuScratch::alloc(dgpu)?;
     let mut igpu_scratch = IgpuScratch::alloc(igpu)?;
     let mut state = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
-    // Two-lane pipelined prefill scratches (~208 MB total). Reused
-    // across turns. See [[m50-prefill-state]] for the architecture.
-    let mut bd_a = BatchDgpuScratch::alloc(dgpu)?;
-    let mut bi_a = BatchIgpuScratch::alloc(igpu)?;
-    let mut bd_b = BatchDgpuScratch::alloc(dgpu)?;
-    let mut bi_b = BatchIgpuScratch::alloc(igpu)?;
+    // Reused across turns. See [[m50-prefill-state]] for the architecture.
+    // Two-lane pipelined prefill: each lane holds at most ceil(B_MAX/2)
+    // rows of a chunk (forward_prompt_batch_v2_pipelined), so size the
+    // per-lane scratch at that instead of the full chunk.
+    let lane_rows = B_MAX.div_ceil(2);
+    let mut bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let mut bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let mut bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let mut bi_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
     eprintln!("KV cache: {n_kv_max} slots");
 
     let byte_decoder = build_gpt2_byte_decoder();
