@@ -53,6 +53,10 @@ pub fn moe_gate_up_batch(
         GgufType::IQ3_XXS => e.iq3pair.launch_fused_swiglu_batch(
             s, mid, gate, up, xq, ew, selected, gbpe, ubpe, n_used, clamp, n_rows, n_blocks,
         ),
+        // blk.26 of the unsloth UD-IQ3_XXS mixes.
+        GgufType::IQ3_S => e.iq3s.launch_fused_swiglu_batch(
+            s, mid, gate, up, xq, ew, selected, gbpe, ubpe, n_used, clamp, n_rows, n_blocks,
+        ),
         other => Err(eyre!("moe gate/up: no decode kernel for {other:?}")),
     }
 }
@@ -95,6 +99,10 @@ pub fn moe_gate_up_batch_hetsplit(
         // gate/up at IQ3_XXS is blk.26 of UD-Q2_K_XL only — the PAIR family,
         // not the down-projection `iq3` one.
         GgufType::IQ3_XXS => e.iq3pair.launch_fused_swiglu_batch_hetsplit(
+            s, mid, gate, up, xq, ew, selected, remap, mode, cap, gbpe, ubpe, n_used, clamp,
+            n_rows, n_blocks,
+        ),
+        GgufType::IQ3_S => e.iq3s.launch_fused_swiglu_batch_hetsplit(
             s, mid, gate, up, xq, ew, selected, remap, mode, cap, gbpe, ubpe, n_used, clamp,
             n_rows, n_blocks,
         ),
@@ -260,7 +268,7 @@ pub fn moe_gate_up_chunked(
     n_rows: u32,
     n_blocks: u32,
 ) -> eyre::Result<bool> {
-    // IQ2_XS / IQ3_XXS pair kwide (2026-08-15): default prefill kernel is
+    // IQ2_XS / IQ3_XXS / IQ3_S pair kwide (2026-08-15; IQ3_S 2026-09-03): default prefill kernel is
     // the M51-structure kwide port (weights dequantized once per lane and
     // amortized across chunk members). PAIR_VARIANT=chunked rolls back to
     // the serial per-member kernel.
@@ -285,6 +293,14 @@ pub fn moe_gate_up_chunked(
             gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
         )?,
         GgufType::IQ3_XXS => e.iq3pair.launch_fused_swiglu_chunked(
+            s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
+        )?,
+        GgufType::IQ3_S if use_kwide => e.iq3s.launch_fused_swiglu_kwide(
+            s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
+        )?,
+        GgufType::IQ3_S => e.iq3s.launch_fused_swiglu_chunked(
             s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
             gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
         )?,

@@ -36,6 +36,8 @@ pub mod iq2_xs_tables;
 pub mod iq3_xxs;
 pub mod iq3_xxs_pair;
 pub mod iq3_xxs_tables;
+pub mod iq3_s;
+pub mod iq3_s_tables;
 pub mod mxfp4;
 pub mod mxfp4_tables;
 pub mod kv_cache_append;
