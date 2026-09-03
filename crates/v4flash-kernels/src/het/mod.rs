@@ -31,7 +31,9 @@ pub mod sync;
 pub mod trace;
 pub mod weights;
 
-pub use batch_scratch::{BatchDgpuScratch, BatchIgpuScratch, BatchScratch, B_MAX};
+pub use batch_scratch::{
+    BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, BatchScratch, B_MAX,
+};
 pub use prefill_stats::{LayerStats, PerChunkReuse, PrefillStats};
 pub use engine::{DeviceEngine, ExecMode, HeterogeneousEngine, SampleMode};
 pub use scratch::{DgpuScratch, IgpuScratch};

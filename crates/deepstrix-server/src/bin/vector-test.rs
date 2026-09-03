@@ -51,7 +51,8 @@ use v4flash_core::MappedGguf;
 use v4flash_hip::Device;
 use v4flash_kernels::config::{HC_DIM, N_VOCAB};
 use v4flash_kernels::het::{
-    BatchDgpuScratch, BatchIgpuScratch, DgpuScratch, ExecMode, HetModelState, HetModelWeights,
+    BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, DgpuScratch, ExecMode,
+    HetModelState, HetModelWeights,
     HeterogeneousEngine, IgpuScratch, SampleMode, B_MAX,
 };
 use v4flash_kernels::RopeParams;
@@ -378,6 +379,9 @@ fn main() -> eyre::Result<()> {
     let mut bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
     let mut bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
     let mut bi_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    // Shared set: one instance for both lanes, same row capacity.
+    let mut sd = BatchDgpuShared::alloc_rows(dgpu, lane_rows)?;
+    let mut si = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
     eprintln!("KV cache: {n_kv_max} slots");
 
     let byte_decoder = build_gpt2_byte_decoder();
@@ -447,6 +451,7 @@ fn main() -> eyre::Result<()> {
         let t0 = std::time::Instant::now();
         let last_logits = engine.forward_prefill_pipelined(
             &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b,
+            &mut sd, &mut si,
             &mut dgpu_scratch,
             &mut state, &weights,
             &input_hcs, prefill_tokens, /*pos0=*/ 0,

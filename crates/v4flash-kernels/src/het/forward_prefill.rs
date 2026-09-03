@@ -32,7 +32,9 @@ use crate::config::{
 use crate::attention::ATTN_MIXED_MAX_KEYS;
 use crate::routing::hash_router_select;
 
-use super::batch_scratch::{BatchDgpuScratch, BatchIgpuScratch, B_MAX};
+use super::batch_scratch::{
+    BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, B_MAX,
+};
 use super::engine::HeterogeneousEngine;
 use super::prefill_stats::PrefillStats;
 use super::scratch::{DgpuScratch, IgpuScratch};
@@ -77,14 +79,19 @@ fn hot_prefill_cap() -> u32 {
 }
 
 /// Whether the M61 het-split MoE runs for this prefill layer: hot weights
-/// present on BOTH devices, hot scratch allocated, and not rolled back.
+/// present on BOTH devices, hot scratch allocated (the shared R1 views +
+/// member lists AND the lane's reduce output — both are gated by the same
+/// `DGPU_HOT_EXPERTS` env, so they agree unless a caller mixed scratches
+/// from different processes), and not rolled back.
 fn prefill_hot_active(
     dlw: &DgpuLayerWeights,
     ilw: &IgpuLayerWeights,
     bd: &BatchDgpuScratch,
+    sd: &BatchDgpuShared,
 ) -> bool {
     let active = hot_prefill_enabled()
-        && bd.hot.is_some()
+        && bd.hot_ffn_moe_dgpu.is_some()
+        && sd.hot.is_some()
         && dlw.hot_experts.is_some()
         && ilw.hot_remap.is_some();
     // M63: a packed iGPU buffer has no non-hetsplit fallback — the plain
@@ -100,21 +107,27 @@ fn prefill_hot_active(
 }
 
 /// Every batched entry point runs `b` rows through per-lane scratch
-/// that was allocated for `bd.rows` / `bi.rows` tokens
-/// (`BatchDgpuScratch::alloc_rows`). Kernels index by `b`, not by the
-/// allocation size, so an oversized batch would silently overrun the
-/// B-scaled buffers — refuse it up front.
+/// that was allocated for `bd.rows` / `bi.rows` tokens and the shared
+/// scratch allocated for `sd.rows` / `si.rows` (`alloc_rows` on each).
+/// Kernels index by `b`, not by the allocation size, so an oversized
+/// batch would silently overrun the B-scaled buffers — refuse it up
+/// front.
 fn check_scratch_rows(
     who: &str,
     b: usize,
     bd: &BatchDgpuScratch,
     bi: &BatchIgpuScratch,
+    sd: &BatchDgpuShared,
+    si: &BatchIgpuShared,
 ) -> eyre::Result<()> {
-    if b > bd.rows || b > bi.rows {
+    if b > bd.rows || b > bi.rows || b > sd.rows || b > si.rows {
         return Err(eyre!(
-            "{who}: batch of {b} rows exceeds scratch capacity (dGPU rows={}, iGPU rows={})",
+            "{who}: batch of {b} rows exceeds scratch capacity (dGPU lane rows={}, iGPU lane \
+             rows={}, dGPU shared rows={}, iGPU shared rows={})",
             bd.rows,
-            bi.rows
+            bi.rows,
+            sd.rows,
+            si.rows
         ));
     }
     Ok(())
@@ -142,6 +155,8 @@ impl HeterogeneousEngine {
         &self,
         batch_dgpu: &mut BatchDgpuScratch,
         batch_igpu: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
         state: &mut HetModelState,
         weights: &HetModelWeights,
         input_hcs: &[Vec<f32>],
@@ -168,7 +183,7 @@ impl HeterogeneousEngine {
                 ));
             }
         }
-        check_scratch_rows("forward_prompt_batch_v2", b, batch_dgpu, batch_igpu)?;
+        check_scratch_rows("forward_prompt_batch_v2", b, batch_dgpu, batch_igpu, sd, si)?;
 
         self.current_device
             .store(-1, std::sync::atomic::Ordering::Relaxed);
@@ -201,6 +216,8 @@ impl HeterogeneousEngine {
             self.forward_layer_batch_v2(
                 batch_dgpu,
                 batch_igpu,
+                sd,
+                si,
                 &mut state.layers[layer],
                 &weights.dgpu_layers[layer],
                 &weights.igpu_layers[layer],
@@ -234,6 +251,13 @@ impl HeterogeneousEngine {
     /// Lane A uses `self.sync_events`, lane B uses `self.sync_events_t1`
     /// (both pre-allocated at engine construction for the decode pair
     /// path; we reuse them here).
+    ///
+    /// `sd` / `si` are the SHARED scratch sets: one instance serves both
+    /// lanes because every buffer in them is first-written and last-read
+    /// inside a single lane's pre-MoE call on one in-order stream, and
+    /// this driver never interleaves two lanes' pre-MoE work (see
+    /// `BatchDgpuShared`). They must be allocated for at least
+    /// `max(b_a, b_b)` rows.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_prompt_batch_v2_pipelined(
         &self,
@@ -241,6 +265,8 @@ impl HeterogeneousEngine {
         bi_a: &mut BatchIgpuScratch,
         bd_b: &mut BatchDgpuScratch,
         bi_b: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
         state: &mut HetModelState,
         weights: &HetModelWeights,
         input_hcs: &[Vec<f32>],
@@ -261,15 +287,16 @@ impl HeterogeneousEngine {
         // For chunks too small to bother pipelining, fall back to single-lane.
         if b < 2 {
             return self.forward_prompt_batch_v2(
-                bd_a, bi_a, state, weights, input_hcs, tokens, pos0, stats,
+                bd_a, bi_a, sd, si, state, weights, input_hcs, tokens, pos0, stats,
             );
         }
         let b_a = b.div_ceil(2);
         let b_b = b - b_a;
-        // Lane scratches are usually allocated at B_MAX.div_ceil(2) rows
-        // (see BatchDgpuScratch::alloc_rows); never exceed what they hold.
-        check_scratch_rows("forward_prompt_batch_v2_pipelined lane A", b_a, bd_a, bi_a)?;
-        check_scratch_rows("forward_prompt_batch_v2_pipelined lane B", b_b, bd_b, bi_b)?;
+        // Lane and shared scratches are usually allocated at
+        // B_MAX.div_ceil(2) rows (see BatchDgpuScratch::alloc_rows); never
+        // exceed what they hold.
+        check_scratch_rows("forward_prompt_batch_v2_pipelined lane A", b_a, bd_a, bi_a, sd, si)?;
+        check_scratch_rows("forward_prompt_batch_v2_pipelined lane B", b_b, bd_b, bi_b, sd, si)?;
         let tokens_a = &tokens[..b_a];
         let tokens_b = &tokens[b_a..];
         let input_a = &input_hcs[..b_a];
@@ -325,6 +352,8 @@ impl HeterogeneousEngine {
         self.forward_layer_pre_moe_v2(
             bd_a,
             bi_a,
+            sd,
+            si,
             &mut state.layers[layer0],
             &weights.dgpu_layers[layer0],
             &weights.igpu_layers[layer0],
@@ -336,6 +365,8 @@ impl HeterogeneousEngine {
         self.forward_layer_pre_moe_v2(
             bd_b,
             bi_b,
+            sd,
+            si,
             &mut state.layers[layer0],
             &weights.dgpu_layers[layer0],
             &weights.igpu_layers[layer0],
@@ -355,6 +386,7 @@ impl HeterogeneousEngine {
                 &weights.dgpu_layers[layer],
                 &weights.igpu_layers[layer],
                 bd_a,
+                sd,
             );
 
             // Lane A: finish layer L, then start layer L+1.
@@ -363,6 +395,8 @@ impl HeterogeneousEngine {
             self.forward_layer_pre_moe_v2(
                 bd_a,
                 bi_a,
+                sd,
+                si,
                 &mut state.layers[layer + 1],
                 &weights.dgpu_layers[layer + 1],
                 &weights.igpu_layers[layer + 1],
@@ -378,6 +412,8 @@ impl HeterogeneousEngine {
             self.forward_layer_pre_moe_v2(
                 bd_b,
                 bi_b,
+                sd,
+                si,
                 &mut state.layers[layer + 1],
                 &weights.dgpu_layers[layer + 1],
                 &weights.igpu_layers[layer + 1],
@@ -394,6 +430,7 @@ impl HeterogeneousEngine {
             &weights.dgpu_layers[last],
             &weights.igpu_layers[last],
             bd_a,
+            sd,
         );
         self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[last], hot_last)?;
         std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
@@ -425,6 +462,8 @@ impl HeterogeneousEngine {
         &self,
         bd: &mut BatchDgpuScratch,
         bi: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
         head_scratch: &mut DgpuScratch,
         state: &mut HetModelState,
         weights: &HetModelWeights,
@@ -446,9 +485,9 @@ impl HeterogeneousEngine {
         }
         let chunk_size = B_MAX;
         // Single-lane driver: every chunk (up to B_MAX rows) runs through
-        // ONE scratch set, so it must be allocated at full B_MAX rows
-        // (`alloc()`), not the per-lane `alloc_rows(B_MAX.div_ceil(2))`.
-        check_scratch_rows("forward_prefill", chunk_size.min(t), bd, bi)?;
+        // ONE lane + ONE shared set, so all four must be allocated at full
+        // B_MAX rows (`alloc()`), not the per-lane `alloc_rows(B_MAX.div_ceil(2))`.
+        check_scratch_rows("forward_prefill", chunk_size.min(t), bd, bi, sd, si)?;
         let cs_hc = HC_DIM as usize;
         let cs_vocab = N_VOCAB as usize;
 
@@ -474,6 +513,8 @@ impl HeterogeneousEngine {
             self.forward_prompt_batch_v2(
                 bd,
                 bi,
+                sd,
+                si,
                 state,
                 weights,
                 chunk_input,
@@ -544,7 +585,8 @@ impl HeterogeneousEngine {
 
     /// Two-lane pipelined chunked prefill. Same contract as
     /// `forward_prefill` but takes two BatchDgpu/BatchIgpu scratch sets
-    /// (one per lane) and calls `forward_prompt_batch_v2_pipelined`.
+    /// (one per lane) plus one shared set for both lanes, and calls
+    /// `forward_prompt_batch_v2_pipelined`.
     /// For `last_only`, the last token of each chunk lives in lane B if
     /// `chunk_b > 1`, otherwise in lane A.
     #[allow(clippy::too_many_arguments)]
@@ -554,6 +596,8 @@ impl HeterogeneousEngine {
         bi_a: &mut BatchIgpuScratch,
         bd_b: &mut BatchDgpuScratch,
         bi_b: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
         head_scratch: &mut DgpuScratch,
         state: &mut HetModelState,
         weights: &HetModelWeights,
@@ -657,6 +701,8 @@ impl HeterogeneousEngine {
                 bi_a,
                 bd_b,
                 bi_b,
+                sd,
+                si,
                 state,
                 weights,
                 chunk_input,
@@ -748,15 +794,17 @@ impl HeterogeneousEngine {
 
 impl HeterogeneousEngine {
     /// One layer of batched prefill, all phases. Reads
-    /// `batch_dgpu.residual` (per-token input HC), writes
-    /// `batch_dgpu.residual_next` (per-token output HC). All other
-    /// `batch_dgpu` fields are scratch. Thin wrapper over the split
-    /// pre-MoE + post-MoE methods; single-lane callers use this.
+    /// `bd.residual` (per-token input HC), writes `bd.residual_next`
+    /// (per-token output HC). All other `bd` / `sd` fields are scratch.
+    /// Thin wrapper over the split pre-MoE + post-MoE methods;
+    /// single-lane callers use this.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_layer_batch_v2(
         &self,
         bd: &mut BatchDgpuScratch,
         bi: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
         ls: &mut HetLayerState,
         dlw: &DgpuLayerWeights,
         ilw: &IgpuLayerWeights,
@@ -770,8 +818,8 @@ impl HeterogeneousEngine {
             return Ok(());
         }
         let sev = &self.sync_events.layers[layer];
-        let hot_active = prefill_hot_active(dlw, ilw, bd);
-        self.forward_layer_pre_moe_v2(bd, bi, ls, dlw, ilw, pos0, tokens, stats, sev)?;
+        let hot_active = prefill_hot_active(dlw, ilw, bd, sd);
+        self.forward_layer_pre_moe_v2(bd, bi, sd, si, ls, dlw, ilw, pos0, tokens, stats, sev)?;
         self.forward_layer_post_moe_v2(bd, b, sev, hot_active)?;
         Ok(())
     }
@@ -784,11 +832,20 @@ impl HeterogeneousEngine {
     /// that via `forward_layer_post_moe_v2`, which lets two lanes share
     /// the de.compute stream without ffn_combine serializing the second
     /// lane's pre-MoE work behind the first lane's ffn_combine.
+    ///
+    /// `bd` / `bi` are this lane's per-lane scratch; `sd` / `si` are the
+    /// shared sets (one instance for both lanes). Everything this call
+    /// leaves for `forward_layer_post_moe_v2`, for `de.xfer` / `ie.xfer`,
+    /// or for the other lane to run past lives in `bd` / `bi`; every
+    /// `sd` / `si` buffer is dead (last read on de.compute / ie.compute
+    /// in program order) by the time this returns.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_layer_pre_moe_v2(
         &self,
         bd: &mut BatchDgpuScratch,
         bi: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
         ls: &mut HetLayerState,
         dlw: &DgpuLayerWeights,
         ilw: &IgpuLayerWeights,
@@ -810,7 +867,7 @@ impl HeterogeneousEngine {
         if b == 0 {
             return Ok(());
         }
-        check_scratch_rows("forward_layer_pre_moe_v2", b as usize, bd, bi)?;
+        check_scratch_rows("forward_layer_pre_moe_v2", b as usize, bd, bi, sd, si)?;
 
         self.set_current_cached(self.dgpu.device)?;
         let de = &self.dgpu;
@@ -827,15 +884,15 @@ impl HeterogeneousEngine {
         {
             let _t = de.events.stage("k.mhc_pre_attn.rms_nw", &de.compute)?;
             de.rms_nw
-                .launch_batched(&de.compute, &mut bd.flat, &bd.residual, 1, HC_DIM, RMS_EPS, b)?;
+                .launch_batched(&de.compute, &mut sd.flat, &bd.residual, 1, HC_DIM, RMS_EPS, b)?;
         }
         {
             let _t = de.events.stage("k.mhc_pre_attn.f16_matvec", &de.compute)?;
             de.f16.matvec_narrow_batched(
                 &de.compute,
-                &mut bd.mix,
+                &mut sd.mix,
                 &dlw.hc_attn_fn.buffer,
-                &bd.flat,
+                &sd.flat,
                 HC_MIX_DIM,
                 HC_DIM,
                 b,
@@ -846,7 +903,7 @@ impl HeterogeneousEngine {
             de.hc_sinkhorn.launch_batched(
                 &de.compute,
                 &mut bd.split,
-                &bd.mix,
+                &sd.mix,
                 &dlw.hc_attn_scale,
                 &dlw.hc_attn_base,
                 N_HC,
@@ -859,7 +916,7 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.mhc_pre_attn.hc_weighted", &de.compute)?;
             de.hc_weighted.launch_batched(
                 &de.compute,
-                &mut bd.attn_cur,
+                &mut sd.attn_cur,
                 &bd.residual,
                 &bd.split,
                 N_EMBD,
@@ -872,8 +929,8 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.mhc_pre_attn.rms_w", &de.compute)?;
             de.rms_w.launch_weighted_batched(
                 &de.compute,
-                &mut bd.attn_input_norm,
-                &bd.attn_cur,
+                &mut sd.attn_input_norm,
+                &sd.attn_cur,
                 &dlw.attn_norm,
                 N_EMBD,
                 RMS_EPS,
@@ -891,9 +948,9 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.q_chain.quantize_input", &de.compute)?;
             de.q8.quantize_input_batched(
                 &de.compute,
-                &mut bd.xq_n_embd,
-                &mut bd.xscale_n_embd,
-                &bd.attn_input_norm,
+                &mut sd.xq_n_embd,
+                &mut sd.xscale_n_embd,
+                &sd.attn_input_norm,
                 N_EMBD,
                 b,
             )?;
@@ -908,19 +965,19 @@ impl HeterogeneousEngine {
             if dlw.attn_q_a.dtype != v4flash_core::gguf::GgufType::Q8_0 {
                 de.q8k.launch(
                     &de.compute,
-                    &mut bd.kq_attn_q8k,
-                    &bd.attn_input_norm,
+                    &mut sd.kq_attn_q8k,
+                    &sd.attn_input_norm,
                     crate::config::BLOCKS_Q8K_GATE_IN * b,
                 )?;
             }
             super::dispatch::dense_gemm_prefill(
                 de,
                 &de.compute,
-                &mut bd.qr,
+                &mut sd.qr,
                 &dlw.attn_q_a,
-                &bd.xq_n_embd,
-                &bd.xscale_n_embd,
-                &bd.kq_attn_q8k,
+                &sd.xq_n_embd,
+                &sd.xscale_n_embd,
+                &sd.kq_attn_q8k,
                 b,
                 N_LORA_Q,
                 N_EMBD,
@@ -930,8 +987,8 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.q_chain.rms_w", &de.compute)?;
             de.rms_w.launch_weighted_batched(
                 &de.compute,
-                &mut bd.qr_normed,
-                &bd.qr,
+                &mut sd.qr_normed,
+                &sd.qr,
                 &dlw.q_a_norm,
                 N_LORA_Q,
                 RMS_EPS,
@@ -942,9 +999,9 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.q_chain.quantize_qr", &de.compute)?;
             de.q8.quantize_input_batched(
                 &de.compute,
-                &mut bd.qr_xq,
-                &mut bd.qr_xscale,
-                &bd.qr_normed,
+                &mut sd.qr_xq,
+                &mut sd.qr_xscale,
+                &sd.qr_normed,
                 N_LORA_Q,
                 b,
             )?;
@@ -961,22 +1018,22 @@ impl HeterogeneousEngine {
             "0" | "dp4a" => {
                 let _t = de.events.stage("k.q_chain.qb_matvec", &de.compute)?;
                 de.q8.matvec_batched(
-                    &de.compute, &mut bd.q, &dlw.attn_q_b.buffer,
-                    &bd.qr_xq, &bd.qr_xscale, Q_FLAT, N_LORA_Q, b,
+                    &de.compute, &mut sd.q, &dlw.attn_q_b.buffer,
+                    &sd.qr_xq, &sd.qr_xscale, Q_FLAT, N_LORA_Q, b,
                 )?;
             }
             "wmma" => {
                 let _t = de.events.stage("k.q_chain.qb_wmma", &de.compute)?;
                 de.q8_wmma.gemm(
-                    &de.compute, &mut bd.q, &dlw.attn_q_b.buffer,
-                    &bd.qr_xq, &bd.qr_xscale, Q_FLAT, N_LORA_Q, b,
+                    &de.compute, &mut sd.q, &dlw.attn_q_b.buffer,
+                    &sd.qr_xq, &sd.qr_xscale, Q_FLAT, N_LORA_Q, b,
                 )?;
             }
             _ => {
                 let _t = de.events.stage("k.q_chain.qb_lds", &de.compute)?;
                 de.q8_wmma.gemm_lds_tiled(
-                    &de.compute, &mut bd.q, &dlw.attn_q_b.buffer,
-                    &bd.qr_xq, &bd.qr_xscale, Q_FLAT, N_LORA_Q, b,
+                    &de.compute, &mut sd.q, &dlw.attn_q_b.buffer,
+                    &sd.qr_xq, &sd.qr_xscale, Q_FLAT, N_LORA_Q, b,
                 )?;
             }
         }
@@ -986,8 +1043,8 @@ impl HeterogeneousEngine {
             // batched API: grid (B, N_HEAD, 1), inner row of N_HEAD_DIM.
             de.rms_nw.launch_batched(
                 &de.compute,
-                &mut bd.q_normed,
-                &bd.q,
+                &mut sd.q_normed,
+                &sd.q,
                 N_HEAD,
                 N_HEAD_DIM,
                 RMS_EPS,
@@ -999,7 +1056,7 @@ impl HeterogeneousEngine {
             let pos_v = bd.pos_per_b.slice_view(0, b as usize);
             de.rope.launch_forward_batched(
                 &de.compute,
-                &mut bd.q_normed,
+                &mut sd.q_normed,
                 &pos_v,
                 N_HEAD,
                 N_HEAD_DIM,
@@ -1019,10 +1076,10 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.kv_chain.matvec", &de.compute)?;
             de.q8_wmma.gemm_lds_tiled(
                 &de.compute,
-                &mut bd.kv_raw,
+                &mut sd.kv_raw,
                 &dlw.attn_kv.buffer,
-                &bd.xq_n_embd,
-                &bd.xscale_n_embd,
+                &sd.xq_n_embd,
+                &sd.xscale_n_embd,
                 N_HEAD_DIM,
                 N_EMBD,
                 b,
@@ -1032,8 +1089,8 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.kv_chain.rms_w", &de.compute)?;
             de.rms_w.launch_weighted_batched(
                 &de.compute,
-                &mut bd.kv_normed,
-                &bd.kv_raw,
+                &mut sd.kv_normed,
+                &sd.kv_raw,
                 &dlw.kv_a_norm,
                 N_HEAD_DIM,
                 RMS_EPS,
@@ -1045,7 +1102,7 @@ impl HeterogeneousEngine {
             let pos_v = bd.pos_per_b.slice_view(0, b as usize);
             de.rope.launch_forward_batched(
                 &de.compute,
-                &mut bd.kv_normed,
+                &mut sd.kv_normed,
                 &pos_v,
                 1,
                 N_HEAD_DIM,
@@ -1058,7 +1115,7 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.kv_chain.fp8", &de.compute)?;
             de.fp8.launch_batched(
                 &de.compute,
-                &mut bd.kv_normed,
+                &mut sd.kv_normed,
                 N_HEAD_DIM - N_ROT,
                 N_HEAD_DIM,
                 b,
@@ -1067,7 +1124,7 @@ impl HeterogeneousEngine {
         {
             // f16rt is pure elementwise — stretch n by B for a single launch.
             let _t = de.events.stage("k.kv_chain.f16rt", &de.compute)?;
-            de.f16rt.launch(&de.compute, &mut bd.kv_normed, b * N_HEAD_DIM)?;
+            de.f16rt.launch(&de.compute, &mut sd.kv_normed, b * N_HEAD_DIM)?;
         }
 
         // ========================================================
@@ -1127,7 +1184,7 @@ impl HeterogeneousEngine {
         de.kv_append.launch_batched(
             &de.compute,
             &mut ls.kv_cache,
-            &bd.kv_normed,
+            &sd.kv_normed,
             n_raw_before,
             N_HEAD_DIM,
             b,
@@ -1138,7 +1195,7 @@ impl HeterogeneousEngine {
         let n_raw_during_chunk = n_raw_before + b;
 
         // Batched matvec_pair across all B for ratio>0 layers. Produces
-        // bd.kv_cur[B, comp_width] + bd.sc_cur[B, comp_width] in one launch.
+        // sd.kv_cur[B, comp_width] + sd.sc_cur[B, comp_width] in one launch.
         // The per-token loop below just READS from those buffers.
         if ratio > 0 {
             let cw = dlw
@@ -1148,11 +1205,11 @@ impl HeterogeneousEngine {
             let comp_width = cw.width;
             de.f16.matvec_pair_batched(
                 &de.compute,
-                &mut bd.kv_cur,
-                &mut bd.sc_cur,
+                &mut sd.kv_cur,
+                &mut sd.sc_cur,
                 &cw.wkv.buffer,
                 &cw.wgate.buffer,
-                &bd.attn_input_norm,
+                &sd.attn_input_norm,
                 comp_width,
                 N_EMBD,
                 b,
@@ -1183,9 +1240,9 @@ impl HeterogeneousEngine {
             let pos_mod_host: Vec<i32> =
                 (0..b).map(|i| ((pos0 + i) % ratio) as i32).collect();
             {
-                let mut row_v = bd.row_per_b.slice_view_mut(0, b as usize);
+                let mut row_v = sd.row_per_b.slice_view_mut(0, b as usize);
                 row_v.copy_from_host_async(&row_host, &de.compute)?;
-                let mut pm_v = bd.pos_mod_per_b.slice_view_mut(0, b as usize);
+                let mut pm_v = sd.pos_mod_per_b.slice_view_mut(0, b as usize);
                 pm_v.copy_from_host_async(&pos_mod_host, &de.compute)?;
             }
 
@@ -1207,16 +1264,16 @@ impl HeterogeneousEngine {
 
                 // Batched state_write for this segment.
                 let comp_stride = comp_width as usize;
-                let kv_seg = bd.kv_cur.slice_view(
+                let kv_seg = sd.kv_cur.slice_view(
                     (i as usize) * comp_stride,
                     (seg_len as usize) * comp_stride,
                 );
-                let sc_seg = bd.sc_cur.slice_view(
+                let sc_seg = sd.sc_cur.slice_view(
                     (i as usize) * comp_stride,
                     (seg_len as usize) * comp_stride,
                 );
-                let row_seg = bd.row_per_b.slice_view(i as usize, seg_len as usize);
-                let pm_seg = bd.pos_mod_per_b.slice_view(i as usize, seg_len as usize);
+                let row_seg = sd.row_per_b.slice_view(i as usize, seg_len as usize);
+                let pm_seg = sd.pos_mod_per_b.slice_view(i as usize, seg_len as usize);
                 de.compressor_state_write.launch_batched(
                     &de.compute,
                     &mut cs.state_kv,
@@ -1237,10 +1294,10 @@ impl HeterogeneousEngine {
                 if comp_fires {
                     let k = pos_per_boundary_host.len();
                     let snap_off = k * snap_elems;
-                    let mut snap_kv = bd
+                    let mut snap_kv = sd
                         .comp_state_kv_snapshots
                         .slice_view_mut(snap_off, snap_elems);
-                    let mut snap_sc = bd
+                    let mut snap_sc = sd
                         .comp_state_score_snapshots
                         .slice_view_mut(snap_off, snap_elems);
                     de.compressor_state_snapshot.launch(
@@ -1288,35 +1345,35 @@ impl HeterogeneousEngine {
             if n_boundaries > 0 {
                 de.compressor_pool.launch_batched(
                     &de.compute,
-                    &mut bd.comp_pooled_batched,
-                    &bd.comp_state_kv_snapshots,
-                    &bd.comp_state_score_snapshots,
+                    &mut sd.comp_pooled_batched,
+                    &sd.comp_state_kv_snapshots,
+                    &sd.comp_state_score_snapshots,
                     N_HEAD_DIM,
                     ratio,
                     n_boundaries,
                 )?;
                 de.rms_w.launch_weighted_batched(
                     &de.compute,
-                    &mut bd.comp_rows_batched,
-                    &bd.comp_pooled_batched,
+                    &mut sd.comp_rows_batched,
+                    &sd.comp_pooled_batched,
                     &cw.norm,
                     N_HEAD_DIM,
                     RMS_EPS,
                     n_boundaries,
                 )?;
                 {
-                    let mut pv = bd
+                    let mut pv = sd
                         .comp_pos_per_boundary
                         .slice_view_mut(0, n_boundaries as usize);
                     pv.copy_from_host_async(&pos_per_boundary_host, &de.compute)?;
                 }
                 {
-                    let pos_v = bd
+                    let pos_v = sd
                         .comp_pos_per_boundary
                         .slice_view(0, n_boundaries as usize);
                     de.rope.launch_forward_batched(
                         &de.compute,
-                        &mut bd.comp_rows_batched,
+                        &mut sd.comp_rows_batched,
                         &pos_v,
                         1,
                         N_HEAD_DIM,
@@ -1327,20 +1384,20 @@ impl HeterogeneousEngine {
                 }
                 de.fp8.launch_batched(
                     &de.compute,
-                    &mut bd.comp_rows_batched,
+                    &mut sd.comp_rows_batched,
                     N_HEAD_DIM - N_ROT,
                     N_HEAD_DIM,
                     n_boundaries,
                 )?;
                 de.f16rt.launch(
                     &de.compute,
-                    &mut bd.comp_rows_batched,
+                    &mut sd.comp_rows_batched,
                     n_boundaries * N_HEAD_DIM,
                 )?;
                 de.comp_kv_append.launch_batched(
                     &de.compute,
                     &mut cs.comp_kv,
-                    &bd.comp_rows_batched,
+                    &sd.comp_rows_batched,
                     n_comp_start,
                     N_HEAD_DIM,
                     n_boundaries,
@@ -1352,10 +1409,10 @@ impl HeterogeneousEngine {
             }
         }
         // Clamp to the per-token stride of every comp-indexed scratch
-        // buffer (indexer_scores, attn_comp_allowed_bits, ...). Production
-        // can't exceed it (ctx ≤ 4 × ATTN_MIXED_MAX_KEYS by config), but
-        // FAKE_PREFILL_POS benches stamping pos at the cap and decoding
-        // past it used to overrun the bitmap by one word (the 98304 trap).
+        // buffer (indexer_scores, ...). Production can't exceed it (ctx ≤
+        // 4 × ATTN_MIXED_MAX_KEYS by config), but FAKE_PREFILL_POS benches
+        // stamping pos at the cap and decoding past it used to overrun the
+        // (since removed) CSA bitmap by one word (the 98304 trap).
         for v in n_comp_after.iter_mut() {
             *v = (*v).min(ATTN_MIXED_MAX_KEYS);
         }
@@ -1368,7 +1425,7 @@ impl HeterogeneousEngine {
         //   - head_dim = N_INDEXER_HEAD_DIM (128) vs N_HEAD_DIM (512)
         //   - width    = INDEXER_COMP_WIDTH  (256) vs main's (1024)
         //   - NO FP8 step (only valid at head_dim=512 per ds4.c:6702)
-        // Scratch (bd.kv_cur, bd.sc_cur, bd.pooled, bd.comp_row) is
+        // Scratch (sd.kv_cur, sd.sc_cur) is
         // reused via slice views — main compressor block has already
         // consumed its writes by this point on the same compute stream.
         // row_per_b / pos_mod_per_b reuse — ratio=4 row formula is the
@@ -1389,20 +1446,20 @@ impl HeterogeneousEngine {
             let icw = INDEXER_COMP_WIDTH; // 256
             let ihd = N_INDEXER_HEAD_DIM; // 128
 
-            // Batched matvec_pair across all B → bd.kv_cur[B,icw] +
-            // bd.sc_cur[B,icw] (head of buffers, slice view).
+            // Batched matvec_pair across all B → sd.kv_cur[B,icw] +
+            // sd.sc_cur[B,icw] (head of buffers, slice view).
             {
                 let mut kv_view =
-                    bd.kv_cur.slice_view_mut(0, (b as usize) * (icw as usize));
+                    sd.kv_cur.slice_view_mut(0, (b as usize) * (icw as usize));
                 let mut sc_view =
-                    bd.sc_cur.slice_view_mut(0, (b as usize) * (icw as usize));
+                    sd.sc_cur.slice_view_mut(0, (b as usize) * (icw as usize));
                 de.f16.matvec_pair_batched(
                     &de.compute,
                     &mut kv_view,
                     &mut sc_view,
                     &iw.wkv.buffer,
                     &iw.wgate.buffer,
-                    &bd.attn_input_norm,
+                    &sd.attn_input_norm,
                     icw,
                     N_EMBD,
                     b,
@@ -1423,16 +1480,16 @@ impl HeterogeneousEngine {
                 let seg_end = i + seg_len;
 
                 let comp_stride = icw as usize;
-                let kv_seg = bd.kv_cur.slice_view(
+                let kv_seg = sd.kv_cur.slice_view(
                     (i as usize) * comp_stride,
                     (seg_len as usize) * comp_stride,
                 );
-                let sc_seg = bd.sc_cur.slice_view(
+                let sc_seg = sd.sc_cur.slice_view(
                     (i as usize) * comp_stride,
                     (seg_len as usize) * comp_stride,
                 );
-                let row_seg = bd.row_per_b.slice_view(i as usize, seg_len as usize);
-                let pm_seg = bd.pos_mod_per_b.slice_view(i as usize, seg_len as usize);
+                let row_seg = sd.row_per_b.slice_view(i as usize, seg_len as usize);
+                let pm_seg = sd.pos_mod_per_b.slice_view(i as usize, seg_len as usize);
                 de.compressor_state_write.launch_batched(
                     &de.compute,
                     &mut ics.state_kv,
@@ -1450,10 +1507,10 @@ impl HeterogeneousEngine {
                 if comp_fires {
                     let k = pos_per_boundary_idx.len();
                     let snap_off = k * snap_elems_idx;
-                    let mut snap_kv = bd
+                    let mut snap_kv = sd
                         .comp_state_kv_snapshots
                         .slice_view_mut(snap_off, snap_elems_idx);
-                    let mut snap_sc = bd
+                    let mut snap_sc = sd
                         .comp_state_score_snapshots
                         .slice_view_mut(snap_off, snap_elems_idx);
                     de.compressor_state_snapshot.launch(
@@ -1481,35 +1538,35 @@ impl HeterogeneousEngine {
             if n_idx_boundaries > 0 {
                 de.compressor_pool.launch_batched(
                     &de.compute,
-                    &mut bd.comp_pooled_batched,
-                    &bd.comp_state_kv_snapshots,
-                    &bd.comp_state_score_snapshots,
+                    &mut sd.comp_pooled_batched,
+                    &sd.comp_state_kv_snapshots,
+                    &sd.comp_state_score_snapshots,
                     ihd,
                     ratio,
                     n_idx_boundaries,
                 )?;
                 de.rms_w.launch_weighted_batched(
                     &de.compute,
-                    &mut bd.comp_rows_batched,
-                    &bd.comp_pooled_batched,
+                    &mut sd.comp_rows_batched,
+                    &sd.comp_pooled_batched,
                     &iw.norm,
                     ihd,
                     RMS_EPS,
                     n_idx_boundaries,
                 )?;
                 {
-                    let mut pv = bd
+                    let mut pv = sd
                         .comp_pos_per_boundary
                         .slice_view_mut(0, n_idx_boundaries as usize);
                     pv.copy_from_host_async(&pos_per_boundary_idx, &de.compute)?;
                 }
                 {
-                    let pos_v = bd
+                    let pos_v = sd
                         .comp_pos_per_boundary
                         .slice_view(0, n_idx_boundaries as usize);
                     de.rope.launch_forward_batched(
                         &de.compute,
-                        &mut bd.comp_rows_batched,
+                        &mut sd.comp_rows_batched,
                         &pos_v,
                         1,
                         ihd,
@@ -1522,18 +1579,18 @@ impl HeterogeneousEngine {
                 // Hadamard128 + FP4 QAT round trip (post-RoPE, pre-append).
                 de.indexer_qat.launch(
                     &de.compute,
-                    &mut bd.comp_rows_batched,
+                    &mut sd.comp_rows_batched,
                     n_idx_boundaries,
                 )?;
                 de.f16rt.launch(
                     &de.compute,
-                    &mut bd.comp_rows_batched,
+                    &mut sd.comp_rows_batched,
                     n_idx_boundaries * ihd,
                 )?;
                 de.comp_kv_append.launch_batched(
                     &de.compute,
                     &mut ics.comp_kv,
-                    &bd.comp_rows_batched,
+                    &sd.comp_rows_batched,
                     n_idx_comp_start,
                     ihd,
                     n_idx_boundaries,
@@ -1547,7 +1604,7 @@ impl HeterogeneousEngine {
         //
         // Causal: each token i attends to KV prefix [0..n_raw_after[i]]
         // and comp_kv prefix [0..n_comp_after[i]]. Per-token prefix
-        // lengths live in bd.n_raw_per / bd.n_comp_per device buffers
+        // lengths live in sd.n_raw_per / sd.n_comp_per device buffers
         // (uploaded fresh per layer from the host snapshots captured in
         // Stage 4).
         // ========================================================
@@ -1561,26 +1618,26 @@ impl HeterogeneousEngine {
         // attention launch. Avoids the bulk-sync that copy_from_host
         // would impose (~5us each blocks the host AND fences the device).
         {
-            let mut nrp_v = bd.n_raw_per.slice_view_mut(0, b as usize);
+            let mut nrp_v = sd.n_raw_per.slice_view_mut(0, b as usize);
             nrp_v.copy_from_host_async(&n_raw_per_host, &de.compute)?;
         }
         {
-            let mut nrop_v = bd.n_raw_offset_per.slice_view_mut(0, b as usize);
+            let mut nrop_v = sd.n_raw_offset_per.slice_view_mut(0, b as usize);
             nrop_v.copy_from_host_async(&n_raw_offset_per_host, &de.compute)?;
         }
         {
-            let mut ncp_v = bd.n_comp_per.slice_view_mut(0, b as usize);
+            let mut ncp_v = sd.n_comp_per.slice_view_mut(0, b as usize);
             ncp_v.copy_from_host_async(&n_comp_per_host, &de.compute)?;
         }
-        let nrp_view = bd.n_raw_per.slice_view(0, b as usize);
-        let nrop_view = bd.n_raw_offset_per.slice_view(0, b as usize);
-        let ncp_view = bd.n_comp_per.slice_view(0, b as usize);
+        let nrp_view = sd.n_raw_per.slice_view(0, b as usize);
+        let nrop_view = sd.n_raw_offset_per.slice_view(0, b as usize);
+        let ncp_view = sd.n_comp_per.slice_view(0, b as usize);
         if ratio == 0 {
             let _t = de.events.stage("k.attn.swa", &de.compute)?;
             de.attn_swa.launch_batched(
                 &de.compute,
-                &mut bd.heads,
-                &bd.q_normed,
+                &mut sd.heads,
+                &sd.q_normed,
                 &ls.kv_cache,
                 &dlw.attn_sinks,
                 &nrp_view,
@@ -1612,7 +1669,7 @@ impl HeterogeneousEngine {
             // the f32 head-tiled variant on the depth-32k ratio=4 layer.
             // Scores live in DRAM as f16 (the score kernel writes f16,
             // smwsum reads f16). Halves the scores-buffer DRAM round-trip
-            // for free; Phase A softmax keeps f32 math. The bd.attn_scores
+            // for free; Phase A softmax keeps f32 math. The sd.attn_scores
             // scratch is half-sized accordingly — there is no production
             // f32-scores path. ATTN_FUSED=1 takes the fused-FlashAttention
             // single-kernel path (online softmax, no scores buffer); skips
@@ -1623,12 +1680,12 @@ impl HeterogeneousEngine {
             // For each batch token b at ratio==4 with n_index_comp_per[b] >
             // INDEXER_TOP_K, run matvec(attn_q_b) → RoPE → matvec(proj) →
             // scale → IndexerScore → IndexerTopk → IndexerGather of the
-            // selected comp_kv rows into bd.attn_active_comp_kv. The score
+            // selected comp_kv rows into sd.attn_active_comp_kv. The score
             // + smwsum kernels below then read that dense per-token top-K
             // buffer (comp_kv_batch_stride = INDEXER_TOP_K) instead of the
-            // full comp_kv. The topk kernel also bitpacks the selection
-            // into bd.attn_comp_allowed_bits, but the score kernel gets
-            // `None` for the mask — the gather already handles sparsity.
+            // full comp_kv. The topk kernel gets `None` for its CSA bitmap
+            // (it skips the bitpack) and the score kernel gets `None` for
+            // the mask — the gather already handles sparsity.
             //
             // For tokens with n_index_comp_per[b] ≤ INDEXER_TOP_K (early-
             // permit) we set an all-1s mask — leaving the score kernel
@@ -1668,7 +1725,7 @@ impl HeterogeneousEngine {
                 // by the batched topk degenerating to all-valid selection.
                 let n_idx_max: u32 = n_comp_after.iter().copied().max().unwrap_or(0);
                 {
-                    let mut v = bd
+                    let mut v = sd
                         .n_index_comp_per_b
                         .slice_view_mut(0, b as usize);
                     v.copy_from_host_async(&n_comp_after, &de.compute)?;
@@ -1681,9 +1738,9 @@ impl HeterogeneousEngine {
                     let _t = de.events.stage("k.indexer.matvec_q", &de.compute)?;
                     de.f16.gemm_batched_wmma(
                         &de.compute,
-                        &mut bd.indexer_q,
+                        &mut sd.indexer_q,
                         &iw.attn_q_b.buffer,
-                        &bd.qr_normed,
+                        &sd.qr_normed,
                         N_INDEXER_HEAD * N_INDEXER_HEAD_DIM,
                         N_LORA_Q,
                         b,
@@ -1694,7 +1751,7 @@ impl HeterogeneousEngine {
                     let pos_v = bd.pos_per_b.slice_view(0, b as usize);
                     de.rope.launch_forward_batched(
                         &de.compute,
-                        &mut bd.indexer_q,
+                        &mut sd.indexer_q,
                         &pos_v,
                         N_INDEXER_HEAD,
                         N_INDEXER_HEAD_DIM,
@@ -1709,7 +1766,7 @@ impl HeterogeneousEngine {
                     let _t = de.events.stage("k.indexer.qat", &de.compute)?;
                     de.indexer_qat.launch(
                         &de.compute,
-                        &mut bd.indexer_q,
+                        &mut sd.indexer_q,
                         b * N_INDEXER_HEAD,
                     )?;
                 }
@@ -1717,9 +1774,9 @@ impl HeterogeneousEngine {
                     let _t = de.events.stage("k.indexer.matvec_proj", &de.compute)?;
                     de.f16.matvec_batched(
                         &de.compute,
-                        &mut bd.indexer_head_weights,
+                        &mut sd.indexer_head_weights,
                         &iw.proj.buffer,
-                        &bd.attn_input_norm,
+                        &sd.attn_input_norm,
                         N_INDEXER_HEAD,
                         N_EMBD,
                         b,
@@ -1729,7 +1786,7 @@ impl HeterogeneousEngine {
                     let _t = de.events.stage("k.indexer.scale", &de.compute)?;
                     de.vec_scale.launch(
                         &de.compute,
-                        &mut bd.indexer_head_weights,
+                        &mut sd.indexer_head_weights,
                         scale,
                         b * N_INDEXER_HEAD,
                     )?;
@@ -1748,11 +1805,11 @@ impl HeterogeneousEngine {
                     if *SCORE_MW {
                         wmma.launch_batched_mw(
                             &de.compute,
-                            &mut bd.indexer_scores,
-                            &bd.indexer_q,
-                            &bd.indexer_head_weights,
+                            &mut sd.indexer_scores,
+                            &sd.indexer_q,
+                            &sd.indexer_head_weights,
                             &ics.comp_kv,
-                            &bd.n_index_comp_per_b,
+                            &sd.n_index_comp_per_b,
                             n_idx_max,
                             ATTN_MIXED_MAX_KEYS,
                             b,
@@ -1760,11 +1817,11 @@ impl HeterogeneousEngine {
                     } else {
                         wmma.launch_batched(
                             &de.compute,
-                            &mut bd.indexer_scores,
-                            &bd.indexer_q,
-                            &bd.indexer_head_weights,
+                            &mut sd.indexer_scores,
+                            &sd.indexer_q,
+                            &sd.indexer_head_weights,
                             &ics.comp_kv,
-                            &bd.n_index_comp_per_b,
+                            &sd.n_index_comp_per_b,
                             n_idx_max,
                             ATTN_MIXED_MAX_KEYS,
                             b,
@@ -1775,11 +1832,11 @@ impl HeterogeneousEngine {
                     let _t = de.events.stage("k.indexer.topk_bitonic", &de.compute)?;
                     de.indexer_topk_bitonic.launch_batched(
                         &de.compute,
-                        &mut bd.indexer_selected,
-                        &mut bd.attn_comp_allowed_bits,
-                        &mut bd.indexer_topk_scratch,
-                        &bd.indexer_scores,
-                        &bd.n_index_comp_per_b,
+                        &mut sd.indexer_selected,
+                        None, // no CSA bitmap consumer in batched prefill
+                        &mut sd.indexer_topk_scratch,
+                        &sd.indexer_scores,
+                        &sd.n_index_comp_per_b,
                         n_idx_max,
                         ATTN_MIXED_MAX_KEYS,
                         n_words_per_b as u32,
@@ -1800,9 +1857,9 @@ impl HeterogeneousEngine {
                         .ok_or_else(|| eyre!("L{layer}: missing compressor state for gather"))?;
                     de.indexer_gather.launch_batched(
                         &de.compute,
-                        &mut bd.attn_active_comp_kv,
+                        &mut sd.attn_active_comp_kv,
                         &cs_ref.comp_kv,
-                        &bd.indexer_selected,
+                        &sd.indexer_selected,
                         INDEXER_TOP_K,
                         N_HEAD_DIM,
                         b,
@@ -1815,7 +1872,7 @@ impl HeterogeneousEngine {
                         .iter()
                         .map(|&v| v.min(INDEXER_TOP_K) as i32)
                         .collect();
-                    let mut ncp_v = bd.n_comp_per.slice_view_mut(0, b as usize);
+                    let mut ncp_v = sd.n_comp_per.slice_view_mut(0, b as usize);
                     ncp_v.copy_from_host_async(&sparse_n_comp_host, &de.compute)?;
                 }
                 let _ = pos0; // pos consumed via pos_per_b
@@ -1835,7 +1892,7 @@ impl HeterogeneousEngine {
                 let sparse_max = n_raw_after.iter().zip(n_comp_after.iter())
                     .map(|(&r, &c)| r + c.min(INDEXER_TOP_K))
                     .max().unwrap_or(0);
-                (Some(&bd.attn_active_comp_kv), sparse_max, INDEXER_TOP_K)
+                (Some(&sd.attn_active_comp_kv), sparse_max, INDEXER_TOP_K)
             } else {
                 (comp_kv_buf, n_total_max, 0u32)
             };
@@ -1847,8 +1904,8 @@ impl HeterogeneousEngine {
                 if f32_scores {
                     de.attn_mixed.launch_score_batched_htiled_wmma(
                         &de.compute,
-                        &mut bd.attn_scores,
-                        &bd.q_normed,
+                        &mut sd.attn_scores,
+                        &sd.q_normed,
                         &ls.kv_cache,
                         eff_comp_kv_buf,
                         &nrp_view,
@@ -1862,8 +1919,8 @@ impl HeterogeneousEngine {
                 } else {
                     de.attn_mixed.launch_score_batched_htiled_wmma_f16s(
                         &de.compute,
-                        &mut bd.attn_scores,
-                        &bd.q_normed,
+                        &mut sd.attn_scores,
+                        &sd.q_normed,
                         &ls.kv_cache,
                         eff_comp_kv_buf,
                         &nrp_view,
@@ -1893,8 +1950,8 @@ impl HeterogeneousEngine {
                 if fused {
                     de.attn_mixed.launch_fused_wmma(
                         &de.compute,
-                        &mut bd.heads,
-                        &bd.q_normed,
+                        &mut sd.heads,
+                        &sd.q_normed,
                         &dlw.attn_sinks,
                         &ls.kv_cache,
                         eff_comp_kv_buf,
@@ -1909,8 +1966,8 @@ impl HeterogeneousEngine {
                 } else if f32_scores {
                     de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma_ldsv(
                         &de.compute,
-                        &mut bd.heads,
-                        &mut bd.attn_scores,
+                        &mut sd.heads,
+                        &mut sd.attn_scores,
                         &dlw.attn_sinks,
                         &ls.kv_cache,
                         eff_comp_kv_buf,
@@ -1924,8 +1981,8 @@ impl HeterogeneousEngine {
                 } else {
                     de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(
                         &de.compute,
-                        &mut bd.heads,
-                        &mut bd.attn_scores,
+                        &mut sd.heads,
+                        &mut sd.attn_scores,
                         &dlw.attn_sinks,
                         &ls.kv_cache,
                         eff_comp_kv_buf,
@@ -1963,13 +2020,13 @@ impl HeterogeneousEngine {
             let src_offset = (src_first_slot as usize) * head_dim;
             // scratch = cache[src_first_slot..src_first_slot+SWA_WINDOW)
             {
-                let mut ring_v = bd.kv_ring_scratch.slice_view_mut(0, ring_len);
+                let mut ring_v = sd.kv_ring_scratch.slice_view_mut(0, ring_len);
                 let src_v = ls.kv_cache.slice_view(src_offset, ring_len);
                 ring_v.copy_from_buffer_async(&src_v, &de.compute)?;
             }
             // cache[0..SWA_WINDOW) = scratch
             {
-                let ring_src = bd.kv_ring_scratch.slice_view(0, ring_len);
+                let ring_src = sd.kv_ring_scratch.slice_view(0, ring_len);
                 let mut dst_v = ls.kv_cache.slice_view_mut(0, ring_len);
                 dst_v.copy_from_buffer_async(&ring_src, &de.compute)?;
             }
@@ -1990,7 +2047,7 @@ impl HeterogeneousEngine {
             let pos_v = bd.pos_per_b.slice_view(0, b as usize);
             de.rope.launch_inverse_batched(
                 &de.compute,
-                &mut bd.heads,
+                &mut sd.heads,
                 &pos_v,
                 N_HEAD,
                 N_HEAD_DIM,
@@ -2003,9 +2060,9 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.output_proj.quantize_heads", &de.compute)?;
             de.q8.quantize_input_batched(
                 &de.compute,
-                &mut bd.heads_xq,
-                &mut bd.heads_xscale,
-                &bd.heads,
+                &mut sd.heads_xq,
+                &mut sd.heads_xscale,
+                &sd.heads,
                 Q_FLAT,
                 b,
             )?;
@@ -2023,14 +2080,14 @@ impl HeterogeneousEngine {
                 .unwrap_or_else(|_| "lds_tiled".into());
             if grp_variant == "dp4a" {
                 de.q8_grouped.matvec_grouped_batched(
-                    &de.compute, &mut bd.low, &dlw.attn_output_a.buffer,
-                    &bd.heads_xq, &bd.heads_xscale,
+                    &de.compute, &mut sd.low, &dlw.attn_output_a.buffer,
+                    &sd.heads_xq, &sd.heads_xscale,
                     GROUP_DIM, RANK, N_GROUPS, b,
                 )?;
             } else {
                 de.q8_wmma.gemm_lds_tiled_grouped(
-                    &de.compute, &mut bd.low, &dlw.attn_output_a.buffer,
-                    &bd.heads_xq, &bd.heads_xscale,
+                    &de.compute, &mut sd.low, &dlw.attn_output_a.buffer,
+                    &sd.heads_xq, &sd.heads_xscale,
                     GROUP_DIM, RANK, N_GROUPS, b,
                 )?;
             }
@@ -2039,9 +2096,9 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.output_proj.quantize_low", &de.compute)?;
             de.q8.quantize_input_batched(
                 &de.compute,
-                &mut bd.low_xq,
-                &mut bd.low_xscale,
-                &bd.low,
+                &mut sd.low_xq,
+                &mut sd.low_xscale,
+                &sd.low,
                 OUT_LOW,
                 b,
             )?;
@@ -2055,13 +2112,13 @@ impl HeterogeneousEngine {
             let out_variant = std::env::var("Q8_OUT_VARIANT").unwrap_or_else(|_| "lds_tiled".into());
             if out_variant == "dp4a" {
                 de.q8.matvec_batched(
-                    &de.compute, &mut bd.attn_out, &dlw.attn_output_b.buffer,
-                    &bd.low_xq, &bd.low_xscale, N_EMBD, OUT_LOW, b,
+                    &de.compute, &mut sd.attn_out, &dlw.attn_output_b.buffer,
+                    &sd.low_xq, &sd.low_xscale, N_EMBD, OUT_LOW, b,
                 )?;
             } else {
                 de.q8_wmma.gemm_lds_tiled(
-                    &de.compute, &mut bd.attn_out, &dlw.attn_output_b.buffer,
-                    &bd.low_xq, &bd.low_xscale, N_EMBD, OUT_LOW, b,
+                    &de.compute, &mut sd.attn_out, &dlw.attn_output_b.buffer,
+                    &sd.low_xq, &sd.low_xscale, N_EMBD, OUT_LOW, b,
                 )?;
             }
         }
@@ -2074,7 +2131,7 @@ impl HeterogeneousEngine {
         de.hc_post.launch_from_split_batched(
             &de.compute,
             &mut bd.after_attn_hc,
-            &bd.attn_out,
+            &sd.attn_out,
             &bd.residual,
             &bd.split,
             N_HC, // n_w (matches single-token path)
@@ -2092,7 +2149,7 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.mhc_pre_ffn.rms_nw", &de.compute)?;
             de.rms_nw.launch_batched(
                 &de.compute,
-                &mut bd.flat,
+                &mut sd.flat,
                 &bd.after_attn_hc,
                 1,
                 HC_DIM,
@@ -2104,9 +2161,9 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.mhc_pre_ffn.f16_matvec", &de.compute)?;
             de.f16.matvec_narrow_batched(
                 &de.compute,
-                &mut bd.mix,
+                &mut sd.mix,
                 &dlw.hc_ffn_fn.buffer,
-                &bd.flat,
+                &sd.flat,
                 HC_MIX_DIM,
                 HC_DIM,
                 b,
@@ -2117,7 +2174,7 @@ impl HeterogeneousEngine {
             de.hc_sinkhorn.launch_batched(
                 &de.compute,
                 &mut bd.split,
-                &bd.mix,
+                &sd.mix,
                 &dlw.hc_ffn_scale,
                 &dlw.hc_ffn_base,
                 N_HC,
@@ -2130,7 +2187,7 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.mhc_pre_ffn.hc_weighted", &de.compute)?;
             de.hc_weighted.launch_batched(
                 &de.compute,
-                &mut bd.ffn_cur,
+                &mut sd.ffn_cur,
                 &bd.after_attn_hc,
                 &bd.split,
                 N_EMBD,
@@ -2144,7 +2201,7 @@ impl HeterogeneousEngine {
             de.rms_w.launch_weighted_batched(
                 &de.compute,
                 &mut bd.ffn_input_norm,
-                &bd.ffn_cur,
+                &sd.ffn_cur,
                 &dlw.ffn_norm,
                 N_EMBD,
                 RMS_EPS,
@@ -2172,7 +2229,7 @@ impl HeterogeneousEngine {
             // weight-BW-bound; tile-shares across BN=64.
             de.f16.gemm_batched_wmma(
                 &de.compute,
-                &mut bd.router_logits,
+                &mut sd.router_logits,
                 &dlw.ffn_gate_inp.buffer,
                 &bd.ffn_input_norm,
                 N_EXPERT,
@@ -2187,7 +2244,7 @@ impl HeterogeneousEngine {
                 &de.compute,
                 &mut bd.d_selected,
                 &mut bd.d_ew,
-                &bd.router_logits,
+                &sd.router_logits,
                 dlw.router_bias_dev.as_ref(),
                 N_EXPERT,
                 cs_n_used as u32,
@@ -2199,8 +2256,8 @@ impl HeterogeneousEngine {
             // Hash router: readback all B × N_EXPERT logits, run host
             // select per batch element, upload d_selected + d_ew.
             de.compute.synchronize()?;
-            bd.router_logits
-                .copy_to_host(&mut bd.router_logits_host)?;
+            sd.router_logits
+                .copy_to_host(&mut sd.router_logits_host)?;
             let tid2eid = dlw
                 .tid2eid
                 .as_ref()
@@ -2208,7 +2265,7 @@ impl HeterogeneousEngine {
             let mut all_sel: Vec<i32> = Vec::with_capacity(b as usize * cs_n_used);
             let mut all_ew: Vec<f32> = Vec::with_capacity(b as usize * cs_n_used);
             for i in 0..b as usize {
-                let logit_slice = &bd.router_logits_host
+                let logit_slice = &sd.router_logits_host
                     [i * (N_EXPERT as usize)..(i + 1) * (N_EXPERT as usize)];
                 let (sel, w) = hash_router_select(tid2eid, tokens[i], logit_slice);
                 all_sel.extend_from_slice(&sel);
@@ -2251,8 +2308,8 @@ impl HeterogeneousEngine {
             if super::dispatch::any_q8(&[&dlw.shared.gate, &dlw.shared.up]) {
                 de.q8.quantize_input_batched(
                     &de.compute,
-                    &mut bd.xq_n_embd,
-                    &mut bd.xscale_n_embd,
+                    &mut sd.xq_n_embd,
+                    &mut sd.xscale_n_embd,
                     &bd.ffn_input_norm,
                     N_EMBD,
                     b,
@@ -2260,7 +2317,7 @@ impl HeterogeneousEngine {
             } else {
                 de.q8k.launch(
                     &de.compute,
-                    &mut bd.kq_ffn_q8k,
+                    &mut sd.kq_ffn_q8k,
                     &bd.ffn_input_norm,
                     crate::config::BLOCKS_Q8K_GATE_IN * b,
                 )?;
@@ -2269,16 +2326,16 @@ impl HeterogeneousEngine {
         {
             let _t = de.events.stage("k.shared_expert.gate_matvec", &de.compute)?;
             super::dispatch::dense_gemm_prefill(
-                de, &de.compute, &mut bd.gate_sh, &dlw.shared.gate,
-                &bd.xq_n_embd, &bd.xscale_n_embd, &bd.kq_ffn_q8k,
+                de, &de.compute, &mut sd.gate_sh, &dlw.shared.gate,
+                &sd.xq_n_embd, &sd.xscale_n_embd, &sd.kq_ffn_q8k,
                 b, N_FF_SHARED, N_EMBD,
             )?;
         }
         {
             let _t = de.events.stage("k.shared_expert.up_matvec", &de.compute)?;
             super::dispatch::dense_gemm_prefill(
-                de, &de.compute, &mut bd.up_sh, &dlw.shared.up,
-                &bd.xq_n_embd, &bd.xscale_n_embd, &bd.kq_ffn_q8k,
+                de, &de.compute, &mut sd.up_sh, &dlw.shared.up,
+                &sd.xq_n_embd, &sd.xscale_n_embd, &sd.kq_ffn_q8k,
                 b, N_FF_SHARED, N_EMBD,
             )?;
         }
@@ -2289,9 +2346,9 @@ impl HeterogeneousEngine {
             // as routed experts (official V4-Flash graph).
             de.swiglu.launch_clamped(
                 &de.compute,
-                &mut bd.mid_sh,
-                &bd.gate_sh,
-                &bd.up_sh,
+                &mut sd.mid_sh,
+                &sd.gate_sh,
+                &sd.up_sh,
                 b * N_FF_SHARED,
                 crate::config::SWIGLU_CLAMP_EXP,
             )?;
@@ -2301,17 +2358,17 @@ impl HeterogeneousEngine {
             if super::dispatch::any_q8(&[&dlw.shared.down]) {
                 de.q8.quantize_input_batched(
                     &de.compute,
-                    &mut bd.mid_sh_xq,
-                    &mut bd.mid_sh_xscale,
-                    &bd.mid_sh,
+                    &mut sd.mid_sh_xq,
+                    &mut sd.mid_sh_xscale,
+                    &sd.mid_sh,
                     N_FF_SHARED,
                     b,
                 )?;
             } else {
                 de.q8k.launch(
                     &de.compute,
-                    &mut bd.kq_mid_q8k,
-                    &bd.mid_sh,
+                    &mut sd.kq_mid_q8k,
+                    &sd.mid_sh,
                     crate::config::BLOCKS_Q8K_DOWN_IN * b,
                 )?;
             }
@@ -2320,7 +2377,7 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.shared_expert.down_matvec", &de.compute)?;
             super::dispatch::dense_gemm_prefill(
                 de, &de.compute, &mut bd.ffn_shared, &dlw.shared.down,
-                &bd.mid_sh_xq, &bd.mid_sh_xscale, &bd.kq_mid_q8k,
+                &sd.mid_sh_xq, &sd.mid_sh_xscale, &sd.kq_mid_q8k,
                 b, N_EMBD, N_FF_SHARED,
             )?;
         }
@@ -2394,14 +2451,18 @@ impl HeterogeneousEngine {
         // de.compute sync would stall the lane pipeline). The partial is
         // added to ffn_moe_recv at ffn_combine (post_moe).
         // ========================================================
-        let hot_active = prefill_hot_active(dlw, ilw, bd);
+        let hot_active = prefill_hot_active(dlw, ilw, bd, sd);
         if hot_active {
             use super::batch_scratch::HOT_CHUNK;
             let hot = dlw.hot_experts.as_ref().unwrap();
-            let hd = bd.hot.as_mut().unwrap();
+            // Intermediates live in the SHARED R1 arena (this is the last
+            // R1 user of the lane's pre-MoE call; see BatchDgpuHotScratch);
+            // the reduce output is the PER-LANE buffer post_moe reads.
+            let hd = sd.hot.as_mut().unwrap();
+            let ffn_moe_dgpu = bd.hot_ffn_moe_dgpu.as_mut().unwrap();
             let cap = hot_prefill_cap();
-            // Member-list stride / chunk count follow the lane's scratch
-            // rows (hd.max_per_expert == bd.rows), not B_MAX.
+            // Member-list stride / chunk count follow the shared scratch
+            // rows (hd.max_per_expert == sd.rows >= b), not B_MAX.
             let max_per_expert = hd.max_per_expert as u32;
             let n_wi = hot.n_hot * hd.chunks_per_expert as u32;
             let _t_hot = de.events.stage("dgpu.hot_moe_prefill", &de.compute)?;
@@ -2496,7 +2557,7 @@ impl HeterogeneousEngine {
             }
             de.q2k.launch_reduce_partials_hetsplit(
                 &de.compute,
-                &mut hd.ffn_moe_dgpu,
+                ffn_moe_dgpu,
                 &hd.partials,
                 &bd.d_selected,
                 &hot.remap,
@@ -2521,7 +2582,7 @@ impl HeterogeneousEngine {
             let _t_q8k_pre = ie.events.stage("igpu.q8k_quantize_pre_iq2", &ie.compute)?;
             ie.q8k.launch(
                 &ie.compute,
-                &mut bi.d_xq_q8k,
+                &mut si.d_xq_q8k,
                 &bi.ffn_input_norm_recv,
                 crate::config::BLOCKS_Q8K_GATE_IN * b,
             )?;
@@ -2539,16 +2600,16 @@ impl HeterogeneousEngine {
         let variant_peek = std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "kwide".into());
         #[allow(non_snake_case)]
         let CHUNK_SIZE: u32 = if variant_peek == "tile8" { 8 } else { 32 };
-        let max_per_expert = bi.max_per_expert();
+        let max_per_expert = si.max_per_expert();
         bi.group_count.fill_zero()?;
         {
             let _t_grp = ie.events.stage("igpu.moe_group_builder", &ie.compute)?;
             let BatchIgpuScratch {
                 group_count,
-                expert_members,
                 d_selected,
                 ..
             } = bi;
+            let BatchIgpuShared { expert_members, .. } = si;
             if hot_active {
                 // M61: build groups for the MISS slots only — the dGPU
                 // owns the resident slots (up to the per-token cap).
@@ -2618,13 +2679,16 @@ impl HeterogeneousEngine {
             bi.n_chunked_work_items.fill_zero()?;
             {
                 let BatchIgpuScratch {
-                    staged_work_items,
-                    chunked_work_items,
                     n_staged_work_items,
                     n_chunked_work_items,
                     group_count,
                     ..
                 } = bi;
+                let BatchIgpuShared {
+                    staged_work_items,
+                    chunked_work_items,
+                    ..
+                } = si;
                 let _t_wis = ie.events.stage("igpu.moe_work_items_split", &ie.compute)?;
                 let max_items = staged_work_items.len() as u32;
                 ie.moe_group_builder.launch_work_items_split(
@@ -2648,15 +2712,18 @@ impl HeterogeneousEngine {
             let n_chunked = counts[0] as u32;
             {
                 let BatchIgpuScratch {
-                    d_mid_cat,
-                    d_xq_q8k,
                     d_ew,
                     group_count,
+                    ..
+                } = bi;
+                let BatchIgpuShared {
+                    d_mid_cat,
+                    d_xq_q8k,
                     expert_members,
                     staged_work_items,
                     chunked_work_items,
                     ..
-                } = bi;
+                } = si;
                 if n_staged > 0 {
                     let _t_st = ie.events.stage("igpu.iq2_staged", &ie.compute)?;
                     ie.iq2.launch_fused_swiglu_chunked_staged(
@@ -2690,11 +2757,11 @@ impl HeterogeneousEngine {
             bi.n_work_items.fill_zero()?;
             {
                 let BatchIgpuScratch {
-                    work_items,
                     n_work_items,
                     group_count,
                     ..
                 } = bi;
+                let BatchIgpuShared { work_items, .. } = si;
                 let _t_wi = ie.events.stage("igpu.moe_work_items", &ie.compute)?;
                 ie.moe_group_builder.launch_work_items(
                     &ie.compute,
@@ -2712,14 +2779,17 @@ impl HeterogeneousEngine {
             n_work_items = n_wi_host[0] as u32;
             {
                 let BatchIgpuScratch {
-                    d_mid_cat,
-                    d_xq_q8k,
                     d_ew,
                     group_count,
+                    ..
+                } = bi;
+                let BatchIgpuShared {
+                    d_mid_cat,
+                    d_xq_q8k,
                     expert_members,
                     work_items,
                     ..
-                } = bi;
+                } = si;
                 // Formats with a single prefill kernel (IQ2_S, IQ2_XS,
                 // IQ3_XXS-as-gate/up): chunked by-expert, IQ2_VARIANT does
                 // not apply. IQ2_XXS returns false and takes the zoo below.
@@ -2810,8 +2880,8 @@ impl HeterogeneousEngine {
             let _t_q8k_post = ie.events.stage("igpu.q8k_quantize_post_iq2", &ie.compute)?;
             ie.q8k.launch(
                 &ie.compute,
-                &mut bi.d_midq_cat,
-                &bi.d_mid_cat,
+                &mut si.d_midq_cat,
+                &si.d_mid_cat,
                 crate::config::BLOCKS_Q8K_DOWN_IN * (cs_n_used as u32) * b,
             )?;
         }
@@ -2872,18 +2942,18 @@ impl HeterogeneousEngine {
                 // allows duplicate experts per token, restore the fill.
                 if use_kwide2 && down_dt == v4flash_core::gguf::GgufType::IQ3_XXS {
                     ie.iq3.launch_by_expert_kwide2(
-                        &ie.compute, &mut bi.q2k_partials,
-                        &ilw.routed.down.buffer, &bi.d_midq_cat,
-                        &bi.group_count, &bi.expert_members, &bi.work_items,
+                        &ie.compute, &mut si.q2k_partials,
+                        &ilw.routed.down.buffer, &si.d_midq_cat,
+                        &bi.group_count, &si.expert_members, &si.work_items,
                         n_work_items, dbpe, mid_blocks_bytes as u32,
                         cs_n_used as u32, max_per_expert, CHUNK_SIZE,
                         N_EMBD, crate::config::BLOCKS_Q8K_DOWN_IN,
                     )?;
                 } else if use_kwide2 && down_dt == v4flash_core::gguf::GgufType::MXFP4 {
                     ie.mxfp4.launch_by_expert_kwide2(
-                        &ie.compute, &mut bi.q2k_partials,
-                        &ilw.routed.down.buffer, &bi.d_midq_cat,
-                        &bi.group_count, &bi.expert_members, &bi.work_items,
+                        &ie.compute, &mut si.q2k_partials,
+                        &ilw.routed.down.buffer, &si.d_midq_cat,
+                        &bi.group_count, &si.expert_members, &si.work_items,
                         n_work_items, dbpe, mid_blocks_bytes as u32,
                         cs_n_used as u32, max_per_expert, CHUNK_SIZE,
                         N_EMBD, crate::config::BLOCKS_Q8K_DOWN_IN,
@@ -2891,12 +2961,12 @@ impl HeterogeneousEngine {
                 } else if use_kwide2 {
                     ie.q2k.launch_by_expert_kwide2(
                         &ie.compute,
-                        &mut bi.q2k_partials,
+                        &mut si.q2k_partials,
                         &ilw.routed.down.buffer,
-                        &bi.d_midq_cat,
+                        &si.d_midq_cat,
                         &bi.group_count,
-                        &bi.expert_members,
-                        &bi.work_items,
+                        &si.expert_members,
+                        &si.work_items,
                         dbpe,
                         mid_blocks_bytes as u32,
                         cs_n_used as u32,
@@ -2909,12 +2979,12 @@ impl HeterogeneousEngine {
                 } else if use_kwide {
                     ie.q2k.launch_by_expert_kwide(
                         &ie.compute,
-                        &mut bi.q2k_partials,
+                        &mut si.q2k_partials,
                         &ilw.routed.down.buffer,
-                        &bi.d_midq_cat,
+                        &si.d_midq_cat,
                         &bi.group_count,
-                        &bi.expert_members,
-                        &bi.work_items,
+                        &si.expert_members,
+                        &si.work_items,
                         dbpe,
                         mid_blocks_bytes as u32,
                         cs_n_used as u32,
@@ -2927,12 +2997,12 @@ impl HeterogeneousEngine {
                 } else {
                     ie.q2k.launch_by_expert(
                         &ie.compute,
-                        &mut bi.q2k_partials,
+                        &mut si.q2k_partials,
                         &ilw.routed.down.buffer,
-                        &bi.d_midq_cat,
+                        &si.d_midq_cat,
                         &bi.group_count,
-                        &bi.expert_members,
-                        &bi.work_items,
+                        &si.expert_members,
+                        &si.work_items,
                         dbpe,
                         mid_blocks_bytes as u32,
                         cs_n_used as u32,
@@ -2950,7 +3020,7 @@ impl HeterogeneousEngine {
                     ie.q2k.launch_reduce_partials_hetsplit(
                         &ie.compute,
                         &mut bi.ffn_moe,
-                        &bi.q2k_partials,
+                        &si.q2k_partials,
                         &bi.d_selected,
                         ilw.hot_remap.as_ref().unwrap(),
                         /*mode=*/ 0,
@@ -2963,7 +3033,7 @@ impl HeterogeneousEngine {
                     ie.q2k.launch_reduce_partials(
                         &ie.compute,
                         &mut bi.ffn_moe,
-                        &bi.q2k_partials,
+                        &si.q2k_partials,
                         cs_n_used as u32,
                         N_EMBD,
                         b,
@@ -2974,7 +3044,7 @@ impl HeterogeneousEngine {
                     &ie.compute,
                     &mut bi.ffn_moe,
                     &ilw.routed.down.buffer,
-                    &bi.d_midq_cat,
+                    &si.d_midq_cat,
                     &bi.d_selected,
                     dbpe,
                     mid_blocks_bytes as u32,
@@ -3040,11 +3110,14 @@ impl HeterogeneousEngine {
             // de.compute in pre_moe, so stream order already guarantees
             // it's complete here.
             let _t = de.events.stage("k.ffn_combine.vec_add_hot", &de.compute)?;
-            let hd = bd.hot.as_ref().expect("hot_active implies bd.hot");
+            let ffn_moe_dgpu = bd
+                .hot_ffn_moe_dgpu
+                .as_ref()
+                .expect("hot_active implies bd.hot_ffn_moe_dgpu");
             de.vec_add.launch(
                 &de.compute,
                 &mut bd.ffn_moe_recv,
-                &hd.ffn_moe_dgpu,
+                ffn_moe_dgpu,
                 b * N_EMBD,
             )?;
         }

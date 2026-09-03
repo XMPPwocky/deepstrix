@@ -624,8 +624,10 @@ impl AttentionMixed {
         let mask_ptr = comp_allowed_bits
             .map(|b| b.raw())
             .unwrap_or(std::ptr::null_mut());
-        // Mask is still bitpacked over ATTN_MIXED_MAX_KEYS bits — its
-        // allocation in `attn_comp_allowed_bits` hasn't shrunk.
+        // Mask word stride is tied to ATTN_MIXED_MAX_KEYS regardless of
+        // caller: decode passes `DgpuScratch::indexer_allowed_bits`
+        // (sized ceil(ATTN_MIXED_MAX_KEYS/32) words); batched prefill
+        // passes no mask (null).
         let max_keys_words: u32 = (ATTN_MIXED_MAX_KEYS + 31) / 32;
         let key_blocks = n_total_max.div_ceil(256);
         let cfg = LaunchConfig {

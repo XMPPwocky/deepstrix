@@ -14,8 +14,8 @@ use v4flash_kernels::config::{
     BLOCKS_Q8K_GATE_IN, N_EMBD, N_EXPERT, N_EXPERT_USED, N_FF_EXP, SWIGLU_CLAMP_EXP,
 };
 use v4flash_kernels::het::{
-    BatchDgpuScratch, BatchIgpuScratch, BatchScratch, ExecMode, HetModelState, HetModelWeights,
-    HeterogeneousEngine, PrefillStats,
+    BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, BatchScratch, ExecMode,
+    HetModelState, HetModelWeights, HeterogeneousEngine, PrefillStats,
 };
 use v4flash_kernels::{oracle::ActivationDump, RopeParams};
 
@@ -90,6 +90,8 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
     let mut bs = BatchScratch::alloc(dgpu, igpu)?;
     let mut bd = BatchDgpuScratch::alloc(dgpu)?;
     let mut bi = BatchIgpuScratch::alloc(igpu)?;
+    let mut sd = BatchDgpuShared::alloc(dgpu)?;
+    let mut si = BatchIgpuShared::alloc(igpu)?;
 
     // Seed input_hcs (cyclically from dump) for B tokens.
     let n_real = PROMPT_TOKENS.len();
@@ -108,13 +110,15 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
 
     // Warm: run forward_prompt_batch_v2 once with stats. This populates bi
     // with realistic selections from layer 42 (the last layer processed).
-    // Then bi.group_count + bi.expert_members are valid for layer 42's pick.
+    // Then bi.group_count + si.expert_members are valid for layer 42's pick.
     let mut state = HetModelState::alloc(dgpu, igpu, b + 4)?;
     let mut stats = PrefillStats::new(43, N_EXPERT_USED as u32, N_EXPERT);
     eprintln!("warmup: forward_prompt_batch_v2 to populate bi.{{d_xq_q8k,d_selected,d_ew}}");
     engine.forward_prompt_batch_v2(
         &mut bd,
         &mut bi,
+        &mut sd,
+        &mut si,
         &mut state,
         &main_weights,
         &input_hcs,
@@ -144,15 +148,11 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
     // were the LAST layer's groups. All consistent.
 
     // ---- Build group state freshly (in case anything got overwritten). ----
-    let max_per_expert = bi.max_per_expert();
+    let max_per_expert = si.max_per_expert();
     bi.group_count.fill_zero()?;
     {
-        let BatchIgpuScratch {
-            group_count,
-            expert_members,
-            d_selected,
-            ..
-        } = &mut bi;
+        let BatchIgpuScratch { group_count, d_selected, .. } = &mut bi;
+        let BatchIgpuShared { expert_members, .. } = &mut si;
         ie.moe_group_builder.launch(
             &ie.compute,
             group_count,
@@ -174,10 +174,10 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
         start.record(&ie.compute)?;
         ie.iq2.launch_fused_swiglu_batch_bxn(
             &ie.compute,
-            &mut bi.d_mid_cat,
+            &mut si.d_mid_cat,
             &ilw.routed.gate.buffer,
             &ilw.routed.up.buffer,
-            &bi.d_xq_q8k,
+            &si.d_xq_q8k,
             &bi.d_ew,
             &bi.d_selected,
             gbpe,
@@ -199,14 +199,8 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
         let start = Event::new()?;
         let end = Event::new()?;
         start.record(&ie.compute)?;
-        let BatchIgpuScratch {
-            d_mid_cat,
-            d_xq_q8k,
-            d_ew,
-            group_count,
-            expert_members,
-            ..
-        } = &mut bi;
+        let BatchIgpuScratch { d_ew, group_count, .. } = &mut bi;
+        let BatchIgpuShared { d_mid_cat, d_xq_q8k, expert_members, .. } = &mut si;
         ie.iq2.launch_fused_swiglu_by_expert(
             &ie.compute,
             d_mid_cat,
@@ -241,12 +235,8 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
     let CHUNK_SIZE = chunk_size; // for naming consistency below
     bi.n_work_items.fill_zero()?;
     {
-        let BatchIgpuScratch {
-            work_items,
-            n_work_items,
-            group_count,
-            ..
-        } = &mut bi;
+        let BatchIgpuScratch { n_work_items, group_count, .. } = &mut bi;
+        let BatchIgpuShared { work_items, .. } = &mut si;
         let max_items = work_items.len() as u32;
         ie.moe_group_builder.launch_work_items(
             &ie.compute,
@@ -268,15 +258,8 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
         let start = Event::new()?;
         let end = Event::new()?;
         start.record(&ie.compute)?;
-        let BatchIgpuScratch {
-            d_mid_cat,
-            d_xq_q8k,
-            d_ew,
-            group_count,
-            expert_members,
-            work_items,
-            ..
-        } = &mut bi;
+        let BatchIgpuScratch { d_ew, group_count, .. } = &mut bi;
+        let BatchIgpuShared { d_mid_cat, d_xq_q8k, expert_members, work_items, .. } = &mut si;
         ie.iq2.launch_fused_swiglu_chunked(
             &ie.compute,
             d_mid_cat,
@@ -311,15 +294,8 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
         let start = Event::new()?;
         let end = Event::new()?;
         start.record(&ie.compute)?;
-        let BatchIgpuScratch {
-            d_mid_cat,
-            d_xq_q8k,
-            d_ew,
-            group_count,
-            expert_members,
-            work_items,
-            ..
-        } = &mut bi;
+        let BatchIgpuScratch { d_ew, group_count, .. } = &mut bi;
+        let BatchIgpuShared { d_mid_cat, d_xq_q8k, expert_members, work_items, .. } = &mut si;
         ie.iq2.launch_fused_swiglu_chunked_nodot(
             &ie.compute,
             d_mid_cat,
@@ -378,15 +354,8 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
         let start = Event::new()?;
         let end = Event::new()?;
         start.record(&ie.compute)?;
-        let BatchIgpuScratch {
-            d_mid_cat,
-            d_xq_q8k,
-            d_ew,
-            group_count,
-            expert_members,
-            work_items,
-            ..
-        } = &mut bi;
+        let BatchIgpuScratch { d_ew, group_count, .. } = &mut bi;
+        let BatchIgpuShared { d_mid_cat, d_xq_q8k, expert_members, work_items, .. } = &mut si;
         ie.iq2.launch_fused_swiglu_chunked_lds(
             &ie.compute,
             d_mid_cat,
@@ -422,9 +391,8 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
         let start = Event::new()?;
         let end = Event::new()?;
         start.record(&ie.compute)?;
-        let BatchIgpuScratch {
-            d_mid_cat, d_xq_q8k, d_ew, group_count, expert_members, work_items, ..
-        } = &mut bi;
+        let BatchIgpuScratch { d_ew, group_count, .. } = &mut bi;
+        let BatchIgpuShared { d_mid_cat, d_xq_q8k, expert_members, work_items, .. } = &mut si;
         ie.iq2.launch_fused_swiglu_chunked_inline(
             &ie.compute, d_mid_cat,
             &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
@@ -443,11 +411,12 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
 
     // ---- M50 staged: dequant-amortization variant ----
     // First: snapshot the chunked baseline output for correctness comparison.
-    let mid_len = bi.d_mid_cat.len();
+    let mid_len = si.d_mid_cat.len();
     let mut chunked_out = vec![0f32; mid_len];
     {
         // Re-run chunked once to ensure d_mid_cat holds the canonical output.
-        let BatchIgpuScratch { d_mid_cat, d_xq_q8k, d_ew, group_count, expert_members, work_items, .. } = &mut bi;
+        let BatchIgpuScratch { d_ew, group_count, .. } = &mut bi;
+        let BatchIgpuShared { d_mid_cat, d_xq_q8k, expert_members, work_items, .. } = &mut si;
         ie.iq2.launch_fused_swiglu_chunked(
             &ie.compute, d_mid_cat,
             &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
@@ -463,9 +432,8 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
         let start = Event::new()?;
         let end = Event::new()?;
         start.record(&ie.compute)?;
-        let BatchIgpuScratch {
-            d_mid_cat, d_xq_q8k, d_ew, group_count, expert_members, work_items, ..
-        } = &mut bi;
+        let BatchIgpuScratch { d_ew, group_count, .. } = &mut bi;
+        let BatchIgpuShared { d_mid_cat, d_xq_q8k, expert_members, work_items, .. } = &mut si;
         ie.iq2.launch_fused_swiglu_chunked_staged(
             &ie.compute, d_mid_cat,
             &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
@@ -488,7 +456,7 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
     // Correctness check: staged output should match chunked within ~1e-2 (different
     // float reduction order across batched vs per-(sb,m) warp reduces).
     let mut staged_out = vec![0f32; mid_len];
-    bi.d_mid_cat.copy_to_host(&mut staged_out)?;
+    si.d_mid_cat.copy_to_host(&mut staged_out)?;
     let mut max_abs = 0.0f32;
     let mut max_rel = 0.0f32;
     let mut n_nonzero = 0usize;
@@ -516,11 +484,11 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
     // ====================================================
     // Save the production work_items + group_count + expert_members.
     let mut prod_work_items_host = vec![0i32; n_work_items as usize];
-    bi.work_items.slice_view(0, n_work_items as usize).copy_to_host(&mut prod_work_items_host)?;
+    si.work_items.slice_view(0, n_work_items as usize).copy_to_host(&mut prod_work_items_host)?;
     let mut prod_gc_host = vec![0i32; N_EXPERT as usize];
     bi.group_count.copy_to_host(&mut prod_gc_host)?;
-    let mut prod_em_host = vec![0i32; bi.expert_members.len()];
-    bi.expert_members.copy_to_host(&mut prod_em_host)?;
+    let mut prod_em_host = vec![0i32; si.expert_members.len()];
+    si.expert_members.copy_to_host(&mut prod_em_host)?;
 
     // Test A: all WGs hit the SAME expert (expert 0). Build wi where
     // every entry is (0 << 16) | 0. Set group_count[0] = chunk_size and
@@ -530,24 +498,23 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
     let same_wi: Vec<i32> = vec![(0i32 << 16) | 0; n_wi_synthetic];
     let mut same_gc = vec![0i32; N_EXPERT as usize];
     same_gc[0] = CHUNK_SIZE as i32;
-    let mut same_em = vec![0i32; bi.expert_members.len()];
+    let mut same_em = vec![0i32; si.expert_members.len()];
     for i in 0..(CHUNK_SIZE as usize) {
         let b_idx = i % (b as usize);
         let slot = i % (cs_n_used as usize);
         same_em[0 * (max_per_expert as usize) + i] = ((b_idx as i32) << 16) | (slot as i32);
     }
-    bi.work_items.slice_view_mut(0, n_wi_synthetic).copy_from_host(&same_wi)?;
+    si.work_items.slice_view_mut(0, n_wi_synthetic).copy_from_host(&same_wi)?;
     bi.group_count.copy_from_host(&same_gc)?;
-    bi.expert_members.copy_from_host(&same_em)?;
+    si.expert_members.copy_from_host(&same_em)?;
 
     let mut same_ms: Vec<f32> = Vec::with_capacity(iters);
     for _ in 0..iters {
         let start = Event::new()?;
         let end = Event::new()?;
         start.record(&ie.compute)?;
-        let BatchIgpuScratch {
-            d_mid_cat, d_xq_q8k, d_ew, group_count, expert_members, work_items, ..
-        } = &mut bi;
+        let BatchIgpuScratch { d_ew, group_count, .. } = &mut bi;
+        let BatchIgpuShared { d_mid_cat, d_xq_q8k, expert_members, work_items, .. } = &mut si;
         ie.iq2.launch_fused_swiglu_chunked(
             &ie.compute, d_mid_cat,
             &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
@@ -570,7 +537,7 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
         disjoint_wi.push(((e as i32) << 16) | 0);
     }
     let mut disjoint_gc = vec![0i32; N_EXPERT as usize];
-    let mut disjoint_em = vec![0i32; bi.expert_members.len()];
+    let mut disjoint_em = vec![0i32; si.expert_members.len()];
     for e in 0..n_distinct {
         disjoint_gc[e] = CHUNK_SIZE as i32;
         for i in 0..(CHUNK_SIZE as usize) {
@@ -579,18 +546,17 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
             disjoint_em[e * (max_per_expert as usize) + i] = ((b_idx as i32) << 16) | (slot as i32);
         }
     }
-    bi.work_items.slice_view_mut(0, n_wi_synthetic).copy_from_host(&disjoint_wi)?;
+    si.work_items.slice_view_mut(0, n_wi_synthetic).copy_from_host(&disjoint_wi)?;
     bi.group_count.copy_from_host(&disjoint_gc)?;
-    bi.expert_members.copy_from_host(&disjoint_em)?;
+    si.expert_members.copy_from_host(&disjoint_em)?;
 
     let mut disjoint_ms: Vec<f32> = Vec::with_capacity(iters);
     for _ in 0..iters {
         let start = Event::new()?;
         let end = Event::new()?;
         start.record(&ie.compute)?;
-        let BatchIgpuScratch {
-            d_mid_cat, d_xq_q8k, d_ew, group_count, expert_members, work_items, ..
-        } = &mut bi;
+        let BatchIgpuScratch { d_ew, group_count, .. } = &mut bi;
+        let BatchIgpuShared { d_mid_cat, d_xq_q8k, expert_members, work_items, .. } = &mut si;
         ie.iq2.launch_fused_swiglu_chunked(
             &ie.compute, d_mid_cat,
             &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
@@ -606,22 +572,21 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
     // Test C: SORTED — same production expert distribution but work_items
     // sorted by expert_id so consecutive WGs (which the HW scheduler tends
     // to co-dispatch) hit the same expert → max L2 reuse.
-    bi.work_items.slice_view_mut(0, n_work_items as usize).copy_from_host(&prod_work_items_host)?;
+    si.work_items.slice_view_mut(0, n_work_items as usize).copy_from_host(&prod_work_items_host)?;
     bi.group_count.copy_from_host(&prod_gc_host)?;
-    bi.expert_members.copy_from_host(&prod_em_host)?;
+    si.expert_members.copy_from_host(&prod_em_host)?;
     let mut sorted_wi = prod_work_items_host.clone();
     // Sort by expert_id (upper 16 bits).
     sorted_wi.sort_by_key(|&wi| (wi >> 16) & 0xffff);
-    bi.work_items.slice_view_mut(0, n_work_items as usize).copy_from_host(&sorted_wi)?;
+    si.work_items.slice_view_mut(0, n_work_items as usize).copy_from_host(&sorted_wi)?;
 
     let mut sorted_ms: Vec<f32> = Vec::with_capacity(iters);
     for _ in 0..iters {
         let start = Event::new()?;
         let end = Event::new()?;
         start.record(&ie.compute)?;
-        let BatchIgpuScratch {
-            d_mid_cat, d_xq_q8k, d_ew, group_count, expert_members, work_items, ..
-        } = &mut bi;
+        let BatchIgpuScratch { d_ew, group_count, .. } = &mut bi;
+        let BatchIgpuShared { d_mid_cat, d_xq_q8k, expert_members, work_items, .. } = &mut si;
         ie.iq2.launch_fused_swiglu_chunked(
             &ie.compute, d_mid_cat,
             &ilw.routed.gate.buffer, &ilw.routed.up.buffer,

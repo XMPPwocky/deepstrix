@@ -139,10 +139,13 @@ void indexer_topk_merge_4096(
     __shared__ unsigned int idxs[TOPK_SORT_N];
 
     const unsigned int tid = threadIdx.x;
-    // Zero allowed_bits before any atomicOr lands.
+    // Zero allowed_bits before any atomicOr lands. `allowed_bits` may be
+    // nullptr (no CSA bitmap consumer): skip the bitmap entirely.
     const unsigned int n_words = (n_comp + 31u) >> 5u;
-    for (unsigned int i = tid; i < n_words; i += TOPK_BLOCK) {
-        allowed_bits[i] = 0u;
+    if (allowed_bits != nullptr) {
+        for (unsigned int i = tid; i < n_words; i += TOPK_BLOCK) {
+            allowed_bits[i] = 0u;
+        }
     }
     __syncthreads();
     // Load candidates into the sort buffer. Padded slots get sentinels.
@@ -170,7 +173,9 @@ void indexer_topk_merge_4096(
         const unsigned int idx = idxs[i];
         if (idx < n_comp) {
             selected[i] = (int)idx;
-            atomicOr(&allowed_bits[idx >> 5], 1u << (idx & 31u));
+            if (allowed_bits != nullptr) {
+                atomicOr(&allowed_bits[idx >> 5], 1u << (idx & 31u));
+            }
         } else {
             selected[i] = -1;
         }
@@ -192,10 +197,12 @@ void indexer_topk_bitonic_4096(
     __shared__ unsigned int idxs[TOPK_SORT_N];
 
     const unsigned int tid = threadIdx.x;
-    // Self-zero allowed_bits.
+    // Self-zero allowed_bits (nullptr = no bitmap wanted; skip it).
     const unsigned int n_words = (n_comp + 31u) >> 5u;
-    for (unsigned int i = tid; i < n_words; i += TOPK_BLOCK) {
-        allowed_bits[i] = 0u;
+    if (allowed_bits != nullptr) {
+        for (unsigned int i = tid; i < n_words; i += TOPK_BLOCK) {
+            allowed_bits[i] = 0u;
+        }
     }
     for (unsigned int i = tid; i < TOPK_SORT_N; i += TOPK_BLOCK) {
         if (i < n_comp) {
@@ -214,7 +221,9 @@ void indexer_topk_bitonic_4096(
         const unsigned int idx = idxs[i];
         if (idx < n_comp) {
             selected[i] = (int)idx;
-            atomicOr(&allowed_bits[idx >> 5], 1u << (idx & 31u));
+            if (allowed_bits != nullptr) {
+                atomicOr(&allowed_bits[idx >> 5], 1u << (idx & 31u));
+            }
         } else {
             selected[i] = -1;
         }
@@ -243,15 +252,21 @@ void indexer_topk_bitonic_4096_batched(
     const unsigned int n_comp = n_idx_per[bi];
 
     int          * __restrict__ selected     = selected_b     + (size_t)bi * top_k;
-    unsigned int * __restrict__ allowed_bits = allowed_bits_b + (size_t)bi * n_words_per_b;
+    // nullptr bitmap = no CSA-mask consumer (batched prefill gathers the
+    // selected rows instead); skip the self-zero and the atomicOr.
+    unsigned int * __restrict__ allowed_bits = (allowed_bits_b != nullptr)
+        ? allowed_bits_b + (size_t)bi * n_words_per_b
+        : nullptr;
     const float  * __restrict__ scores       = scores_b       + (size_t)bi * n_idx_stride;
 
     __shared__ float        vals[TOPK_SORT_N];
     __shared__ unsigned int idxs[TOPK_SORT_N];
 
     const unsigned int tid = threadIdx.x;
-    for (unsigned int i = tid; i < n_words_per_b; i += TOPK_BLOCK) {
-        allowed_bits[i] = 0u;
+    if (allowed_bits != nullptr) {
+        for (unsigned int i = tid; i < n_words_per_b; i += TOPK_BLOCK) {
+            allowed_bits[i] = 0u;
+        }
     }
     if (n_comp == 0) {
         for (unsigned int i = tid; i < top_k; i += TOPK_BLOCK) {
@@ -276,7 +291,9 @@ void indexer_topk_bitonic_4096_batched(
         const unsigned int idx = idxs[i];
         if (idx < n_comp) {
             selected[i] = (int)idx;
-            atomicOr(&allowed_bits[idx >> 5], 1u << (idx & 31u));
+            if (allowed_bits != nullptr) {
+                atomicOr(&allowed_bits[idx >> 5], 1u << (idx & 31u));
+            }
         } else {
             selected[i] = -1;
         }
@@ -349,7 +366,11 @@ void indexer_topk_merge_4096_batched(
     const unsigned int n_comp = n_idx_per[bi];
 
     int          * __restrict__ selected     = selected_b     + (size_t)bi * top_k;
-    unsigned int * __restrict__ allowed_bits = allowed_bits_b + (size_t)bi * n_words_per_b;
+    // nullptr bitmap = no CSA-mask consumer (batched prefill gathers the
+    // selected rows instead); skip the self-zero and the atomicOr.
+    unsigned int * __restrict__ allowed_bits = (allowed_bits_b != nullptr)
+        ? allowed_bits_b + (size_t)bi * n_words_per_b
+        : nullptr;
     const unsigned int * __restrict__ candidates = candidates_b + (size_t)bi * candidates_stride;
     const float        * __restrict__ scores     = scores_b     + (size_t)bi * n_idx_stride;
 
@@ -357,8 +378,10 @@ void indexer_topk_merge_4096_batched(
     __shared__ unsigned int idxs[TOPK_SORT_N];
 
     const unsigned int tid = threadIdx.x;
-    for (unsigned int i = tid; i < n_words_per_b; i += TOPK_BLOCK) {
-        allowed_bits[i] = 0u;
+    if (allowed_bits != nullptr) {
+        for (unsigned int i = tid; i < n_words_per_b; i += TOPK_BLOCK) {
+            allowed_bits[i] = 0u;
+        }
     }
     if (n_comp == 0) {
         for (unsigned int i = tid; i < top_k; i += TOPK_BLOCK) {
@@ -389,7 +412,9 @@ void indexer_topk_merge_4096_batched(
         const unsigned int idx = idxs[i];
         if (idx < n_comp) {
             selected[i] = (int)idx;
-            atomicOr(&allowed_bits[idx >> 5], 1u << (idx & 31u));
+            if (allowed_bits != nullptr) {
+                atomicOr(&allowed_bits[idx >> 5], 1u << (idx & 31u));
+            }
         } else {
             selected[i] = -1;
         }

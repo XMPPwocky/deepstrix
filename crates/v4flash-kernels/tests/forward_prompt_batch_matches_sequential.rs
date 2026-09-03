@@ -18,8 +18,8 @@ use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::config::N_VOCAB;
 use v4flash_kernels::het::{
-    BatchDgpuScratch, BatchIgpuScratch, BatchScratch, DgpuScratch, ExecMode, HetModelState,
-    HetModelWeights, HeterogeneousEngine, B_MAX,
+    BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, BatchScratch,
+    DgpuScratch, ExecMode, HetModelState, HetModelWeights, HeterogeneousEngine, B_MAX,
 };
 use v4flash_kernels::{oracle::ActivationDump, RopeParams};
 
@@ -167,6 +167,8 @@ fn forward_prompt_batch_v2_matches_sequential() -> eyre::Result<()> {
     let mut batch_scratch = BatchScratch::alloc(dgpu, igpu)?;
     let mut batch_dgpu = BatchDgpuScratch::alloc(dgpu)?;
     let mut batch_igpu = BatchIgpuScratch::alloc(igpu)?;
+    let mut shared_dgpu_b = BatchDgpuShared::alloc(dgpu)?;
+    let mut shared_igpu_b = BatchIgpuShared::alloc(igpu)?;
 
     // Run A: sequential single-token (reference).
     eprintln!("Run A: sequential forward_token × {b}");
@@ -203,6 +205,8 @@ fn forward_prompt_batch_v2_matches_sequential() -> eyre::Result<()> {
     engine.forward_prompt_batch_v2(
         &mut batch_dgpu,
         &mut batch_igpu,
+        &mut shared_dgpu_b,
+        &mut shared_igpu_b,
         &mut v2_state,
         &main_weights,
         &input_hcs,
@@ -307,8 +311,10 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
 
     // Two parallel paths.
     let mut bs = BatchScratch::alloc(dgpu, igpu)?; // Phase 1 reference
-    let mut bd = BatchDgpuScratch::alloc(dgpu)?;   // Phase 2 v2 dGPU side
-    let mut bi = BatchIgpuScratch::alloc(igpu)?;   // Phase 3 v2 iGPU side
+    let mut bd = BatchDgpuScratch::alloc(dgpu)?;   // Phase 2 v2 dGPU side (per-lane)
+    let mut bi = BatchIgpuScratch::alloc(igpu)?;   // Phase 3 v2 iGPU side (per-lane)
+    let mut sd = BatchDgpuShared::alloc(dgpu)?;    // v2 dGPU shared set
+    let mut si = BatchIgpuShared::alloc(igpu)?;    // v2 iGPU shared set
 
     let mut ref_state = HetModelState::alloc(dgpu, igpu, b_n as u32 + 4)?;
     let mut v2_state = HetModelState::alloc(dgpu, igpu, b_n as u32 + 4)?;
@@ -349,6 +355,8 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
         engine.forward_layer_batch_v2(
             &mut bd,
             &mut bi,
+            &mut sd,
+            &mut si,
             &mut v2_state.layers[layer],
             &main_weights.dgpu_layers[layer],
             &main_weights.igpu_layers[layer],
@@ -408,9 +416,11 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
                 );
                 Ok(())
             };
-            // mhc_pre_attn outputs (stages 1-end).
+            // mhc_pre_attn outputs (stages 1-end). Single-lane call: the
+            // shared-set buffers still hold this layer's values (nothing
+            // after pre_moe touches them until the next pre_moe call).
             compare("attn_input_norm", &bs.shared_dgpu.attn_input_norm,
-                bd.attn_input_norm.slice_view(0, NE as usize))?;
+                sd.attn_input_norm.slice_view(0, NE as usize))?;
             // Q chain / attention output: NOT compared here. In the
             // batched scratch `q_normed` is the backing store for the
             // out-proj temporaries (heads_xq/low/attn_out) and `heads`
@@ -419,10 +429,10 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
             // of the layer (see batch_scratch.rs lifetime unions).
             // KV chain.
             compare("kv_normed", &bs.shared_dgpu.kv_normed,
-                bd.kv_normed.slice_view(0, v4flash_kernels::config::N_HEAD_DIM as usize))?;
-            // Output projection (R2 view; last write of the layer in R2).
+                sd.kv_normed.slice_view(0, v4flash_kernels::config::N_HEAD_DIM as usize))?;
+            // Output projection (shared R2 view; last write of the layer in R2).
             compare("attn_out", &bs.shared_dgpu.attn_out,
-                bd.attn_out.slice_view(0, NE as usize))?;
+                sd.attn_out.slice_view(0, NE as usize))?;
             // mHC post-attn.
             compare("after_attn_hc", &bs.shared_dgpu.after_attn_hc,
                 bd.after_attn_hc.slice_view(0, HD as usize))?;
@@ -553,11 +563,15 @@ fn forward_prefill_last_only_matches_sequential() -> eyre::Result<()> {
     eprintln!("Run B: forward_prefill (last_only=true)");
     let mut bd = BatchDgpuScratch::alloc(dgpu)?;
     let mut bi = BatchIgpuScratch::alloc(igpu)?;
+    let mut sd = BatchDgpuShared::alloc(dgpu)?;
+    let mut si = BatchIgpuShared::alloc(igpu)?;
     let mut head_scratch = DgpuScratch::alloc(dgpu)?;
     let mut p6_state = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
     let prefill_logits = engine.forward_prefill(
         &mut bd,
         &mut bi,
+        &mut sd,
+        &mut si,
         &mut head_scratch,
         &mut p6_state,
         &main_weights,
@@ -643,11 +657,15 @@ fn forward_prefill_pipelined_matches_single_lane() -> eyre::Result<()> {
     eprintln!("Run A: single-lane forward_prefill");
     let mut bd_a = BatchDgpuScratch::alloc(dgpu)?;
     let mut bi_a = BatchIgpuScratch::alloc(igpu)?;
+    let mut sd_a = BatchDgpuShared::alloc(dgpu)?;
+    let mut si_a = BatchIgpuShared::alloc(igpu)?;
     let mut head_scratch = DgpuScratch::alloc(dgpu)?;
     let mut state_a = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
     let logits_single = engine.forward_prefill(
         &mut bd_a,
         &mut bi_a,
+        &mut sd_a,
+        &mut si_a,
         &mut head_scratch,
         &mut state_a,
         &main_weights,
@@ -660,18 +678,23 @@ fn forward_prefill_pipelined_matches_single_lane() -> eyre::Result<()> {
 
     // Test: two-lane pipelined forward_prefill.
     eprintln!("Run B: forward_prefill_pipelined (lanes=2)");
-    // Per-lane sizing as in production (each lane holds ceil(chunk/2) rows).
+    // Per-lane sizing as in production (each lane holds ceil(chunk/2)
+    // rows); the shared set is sized the same and serves both lanes.
     let lane_rows = B_MAX.div_ceil(2);
     let mut bd_p_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
     let mut bi_p_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
     let mut bd_p_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
     let mut bi_p_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let mut sd_p = BatchDgpuShared::alloc_rows(dgpu, lane_rows)?;
+    let mut si_p = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
     let mut state_b = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
     let logits_pipelined = engine.forward_prefill_pipelined(
         &mut bd_p_a,
         &mut bi_p_a,
         &mut bd_p_b,
         &mut bi_p_b,
+        &mut sd_p,
+        &mut si_p,
         &mut head_scratch,
         &mut state_b,
         &main_weights,

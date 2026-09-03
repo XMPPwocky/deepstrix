@@ -559,14 +559,17 @@ impl IndexerTopkBitonic {
     ///   - `scores`       stride `n_idx_stride`
     ///   - `scratch`      stride `n_chunks_max * top_k` (chunked path only)
     /// Self-zeros the per-token `allowed_bits` slice before atomic-OR'ing
-    /// in selected bits. Pre-condition: scores past `n_idx_per[bi]` must
-    /// be `-INF` (the batched IndexerScoreWmma stamps this).
+    /// in selected bits. `allowed_bits = None` passes a null pointer and
+    /// the kernels skip the bitmap entirely (batched prefill has no
+    /// bitmap consumer — attention reads the gathered top-K rows).
+    /// Pre-condition: scores past `n_idx_per[bi]` must be `-INF` (the
+    /// batched IndexerScoreWmma stamps this).
     #[allow(clippy::too_many_arguments)]
     pub fn launch_batched(
         &self,
         stream: &Stream,
         selected: &mut DeviceBuffer<i32>,
-        allowed_bits: &mut DeviceBuffer<u32>,
+        allowed_bits: Option<&mut DeviceBuffer<u32>>,
         scratch: &mut DeviceBuffer<u32>,
         scores: &DeviceBuffer<f32>,
         n_idx_per: &DeviceBuffer<u32>,
@@ -581,6 +584,9 @@ impl IndexerTopkBitonic {
         }
         const SORT_N: u32 = 4096;
         const BLOCK: u32 = 1024;
+        let allowed_ptr = allowed_bits
+            .map(|b| b.raw())
+            .unwrap_or(std::ptr::null_mut());
 
         if n_idx_max <= SORT_N {
             let function = self.module.get_function("indexer_topk_bitonic_4096_batched")?;
@@ -590,7 +596,7 @@ impl IndexerTopkBitonic {
                 shared_mem_bytes: 0,
             };
             return launch_kernel!(function, cfg, stream, [
-                selected.raw(), allowed_bits.raw(), scores.raw(), n_idx_per.raw(),
+                selected.raw(), allowed_ptr, scores.raw(), n_idx_per.raw(),
                 n_idx_stride, n_words_per_b, top_k
             ]);
         }
@@ -627,7 +633,7 @@ impl IndexerTopkBitonic {
                 n_idx_stride, candidates_stride, top_k
             ])?;
             return launch_kernel!(merge_fn, merge_cfg, stream, [
-                selected.raw(), allowed_bits.raw(), scratch.raw(), scores.raw(), n_idx_per.raw(),
+                selected.raw(), allowed_ptr, scratch.raw(), scores.raw(), n_idx_per.raw(),
                 n_idx_stride, candidates_stride, n_words_per_b, top_k, n_candidates
             ]);
         }
@@ -674,7 +680,7 @@ impl IndexerTopkBitonic {
         ])?;
 
         launch_kernel!(merge_fn, merge_cfg, stream, [
-            selected.raw(), allowed_bits.raw(), level1.raw(), scores.raw(), n_idx_per.raw(),
+            selected.raw(), allowed_ptr, level1.raw(), scores.raw(), n_idx_per.raw(),
             n_idx_stride, n_grouped, n_words_per_b, top_k, n_grouped
         ])
     }

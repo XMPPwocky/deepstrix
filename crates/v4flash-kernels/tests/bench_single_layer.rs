@@ -23,8 +23,8 @@ use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::config::{COMPRESS_RATIOS, HC_DIM, N_LAYER, SWA_WINDOW};
 use v4flash_kernels::het::{
-    BatchDgpuScratch, BatchIgpuScratch, ExecMode, HetModelState, HetModelWeights,
-    HeterogeneousEngine, B_MAX,
+    BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, ExecMode,
+    HetModelState, HetModelWeights, HeterogeneousEngine, B_MAX,
 };
 use v4flash_kernels::{oracle::ActivationDump, RopeParams};
 
@@ -112,6 +112,8 @@ fn bench_single_layer() -> eyre::Result<()> {
         HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
     let mut bd = BatchDgpuScratch::alloc(dgpu)?;
     let mut bi = BatchIgpuScratch::alloc(igpu)?;
+    let mut sd = BatchDgpuShared::alloc(dgpu)?;
+    let mut si = BatchIgpuShared::alloc(igpu)?;
 
     // State sized for the deepest position we touch on this layer.
     let n_kv_max = fake_pos + b as u32 + 8;
@@ -161,6 +163,8 @@ fn bench_single_layer() -> eyre::Result<()> {
         engine.forward_layer_batch_v2(
             &mut bd,
             &mut bi,
+            &mut sd,
+            &mut si,
             &mut state.layers[layer_idx],
             &main_weights.dgpu_layers[layer_idx],
             &main_weights.igpu_layers[layer_idx],
@@ -188,6 +192,8 @@ fn bench_single_layer() -> eyre::Result<()> {
         engine.forward_layer_batch_v2(
             &mut bd,
             &mut bi,
+            &mut sd,
+            &mut si,
             &mut state.layers[layer_idx],
             &main_weights.dgpu_layers[layer_idx],
             &main_weights.igpu_layers[layer_idx],

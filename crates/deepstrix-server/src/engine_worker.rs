@@ -17,7 +17,8 @@ use v4flash_core::MappedGguf;
 use v4flash_hip::Device;
 use v4flash_kernels::config::{COMPRESS_RATIOS, HC_DIM, N_VOCAB};
 use v4flash_kernels::het::{
-    BatchDgpuScratch, BatchIgpuScratch, DgpuScratch, ExecMode, HetModelState, HetModelWeights,
+    BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, DgpuScratch, ExecMode,
+    HetModelState, HetModelWeights,
     HeterogeneousEngine, IgpuScratch, SampleMode, B_MAX,
 };
 use v4flash_kernels::sampler::SamplerRng;
@@ -344,6 +345,9 @@ pub struct WorkerState {
     pub bi_a: BatchIgpuScratch,
     pub bd_b: BatchDgpuScratch,
     pub bi_b: BatchIgpuScratch,
+    /// Shared prefill scratch (one instance for both lanes).
+    pub sd: BatchDgpuShared,
+    pub si: BatchIgpuShared,
 
     pub n_kv_max: u32,
 
@@ -457,12 +461,15 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     let state = HetModelState::alloc(dgpu, igpu, cfg.n_kv_max)?;
     // Two-lane pipelined prefill: each lane holds at most ceil(B_MAX/2)
     // rows of a chunk (forward_prompt_batch_v2_pipelined), so size the
-    // per-lane scratch at that instead of the full chunk.
+    // per-lane scratch at that instead of the full chunk. The shared set
+    // (one instance, alternating between lanes) is sized the same.
     let lane_rows = B_MAX.div_ceil(2);
     let bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
     let bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
     let bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
     let bi_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let sd = BatchDgpuShared::alloc_rows(dgpu, lane_rows)?;
+    let si = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
     tracing::info!(n_kv_max = cfg.n_kv_max, "KV cache allocated");
 
     let byte_decoder = build_gpt2_byte_decoder();
@@ -499,6 +506,8 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         bi_a,
         bd_b,
         bi_b,
+        sd,
+        si,
         n_kv_max: cfg.n_kv_max,
         live: None,
         snapshot_index,
@@ -1809,6 +1818,8 @@ fn prefill_suffix(
         &mut state.bi_a,
         &mut state.bd_b,
         &mut state.bi_b,
+        &mut state.sd,
+        &mut state.si,
         &mut state.dgpu_scratch,
         &mut state.state,
         &state.weights,

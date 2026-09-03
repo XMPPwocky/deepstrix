@@ -20,8 +20,9 @@ use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::config::{COMPRESS_RATIOS, N_EXPERT, N_EXPERT_USED, N_LAYER, SWA_WINDOW};
 use v4flash_kernels::het::{
-    BatchDgpuScratch, BatchIgpuScratch, BatchScratch, DgpuScratch, ExecMode, HetModelState,
-    HetModelWeights, HeterogeneousEngine, PrefillStats, B_MAX,
+    BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, BatchScratch,
+    DgpuScratch, ExecMode, HetModelState, HetModelWeights, HeterogeneousEngine, PrefillStats,
+    B_MAX,
 };
 use v4flash_kernels::{oracle::ActivationDump, RopeParams};
 
@@ -100,6 +101,8 @@ fn bench_prefill_v2() -> eyre::Result<()> {
     let mut _bs = BatchScratch::alloc(dgpu, igpu)?;
     let mut bd = BatchDgpuScratch::alloc(dgpu)?;
     let mut bi = BatchIgpuScratch::alloc(igpu)?;
+    let mut sd = BatchDgpuShared::alloc(dgpu)?;
+    let mut si = BatchIgpuShared::alloc(igpu)?;
 
     // Load real dump inputs for the first 7 positions; repeat thereafter
     // to support synthetic B>7 timing tests. (Repeated inputs make KV
@@ -127,6 +130,8 @@ fn bench_prefill_v2() -> eyre::Result<()> {
         engine.forward_prompt_batch_v2(
             &mut bd,
             &mut bi,
+            &mut sd,
+            &mut si,
             &mut state,
             &main_weights,
             &input_hcs,
@@ -143,6 +148,8 @@ fn bench_prefill_v2() -> eyre::Result<()> {
         engine.forward_prompt_batch_v2(
             &mut bd,
             &mut bi,
+            &mut sd,
+            &mut si,
             &mut state,
             &main_weights,
             &input_hcs,
@@ -247,10 +254,13 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
         .unwrap_or(2);
     // Lane sizing mirrors production: with two lanes each scratch set
     // holds at most ceil(B_MAX/2) rows of a chunk; single-lane
-    // forward_prefill needs the full B_MAX.
+    // forward_prefill needs the full B_MAX. The shared set (one instance
+    // for however many lanes) is sized at the same rows.
     let lane_rows = if pipeline_lanes >= 2 { B_MAX.div_ceil(2) } else { B_MAX };
     let mut bd = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
     let mut bi = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let mut sd = BatchDgpuShared::alloc_rows(dgpu, lane_rows)?;
+    let mut si = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
     let (mut bd_b, mut bi_b) = if pipeline_lanes >= 2 {
         eprintln!("PIPELINE_LANES=2: allocating second BatchScratch set ({lane_rows} rows/lane)");
         (
@@ -331,6 +341,8 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                     &mut bi,
                     bdb,
                     bib,
+                    &mut sd,
+                    &mut si,
                     &mut head_scratch,
                     &mut state,
                     &main_weights,
@@ -346,6 +358,8 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                 let _ = engine.forward_prefill(
                     &mut bd,
                     &mut bi,
+                    &mut sd,
+                    &mut si,
                     &mut head_scratch,
                     &mut state,
                     &main_weights,
@@ -424,6 +438,8 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                             &mut bi,
                             bdb,
                             bib,
+                            &mut sd,
+                            &mut si,
                             &mut head_scratch,
                             &mut state,
                             &main_weights,
@@ -439,6 +455,8 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                         let _ = engine.forward_prefill(
                             &mut bd,
                             &mut bi,
+                            &mut sd,
+                            &mut si,
                             &mut head_scratch,
                             &mut state,
                             &main_weights,
@@ -523,6 +541,8 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                     bi: &mut BatchIgpuScratch,
                     bd_b: Option<&mut BatchDgpuScratch>,
                     bi_b: Option<&mut BatchIgpuScratch>,
+                    sd: &mut BatchDgpuShared,
+                    si: &mut BatchIgpuShared,
                     state: &mut HetModelState|
      -> eyre::Result<()> {
         if let (Some(bdb), Some(bib)) = (bd_b, bi_b) {
@@ -531,6 +551,8 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                 bi,
                 bdb,
                 bib,
+                sd,
+                si,
                 &mut head_scratch,
                 state,
                 &main_weights,
@@ -546,6 +568,8 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
             let _ = engine.forward_prefill(
                 bd,
                 bi,
+                sd,
+                si,
                 &mut head_scratch,
                 state,
                 &main_weights,
@@ -568,6 +592,8 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
             &mut bi,
             bd_b.as_mut(),
             bi_b.as_mut(),
+            &mut sd,
+            &mut si,
             &mut state,
         )?;
     }
@@ -586,6 +612,8 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
             &mut bi,
             bd_b.as_mut(),
             bi_b.as_mut(),
+            &mut sd,
+            &mut si,
             &mut state,
         )?;
         let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -652,6 +680,8 @@ fn bench_prefill_expert_stats() -> eyre::Result<()> {
         HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
     let mut bd = BatchDgpuScratch::alloc(dgpu)?;
     let mut bi = BatchIgpuScratch::alloc(igpu)?;
+    let mut sd = BatchDgpuShared::alloc(dgpu)?;
+    let mut si = BatchIgpuShared::alloc(igpu)?;
     let mut head_scratch = DgpuScratch::alloc(dgpu)?;
 
     let n_real = PROMPT_TOKENS.len();
@@ -674,6 +704,8 @@ fn bench_prefill_expert_stats() -> eyre::Result<()> {
     let _ = engine.forward_prefill(
         &mut bd,
         &mut bi,
+        &mut sd,
+        &mut si,
         &mut head_scratch,
         &mut state,
         &main_weights,

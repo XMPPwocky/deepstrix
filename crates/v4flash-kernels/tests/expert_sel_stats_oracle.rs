@@ -14,8 +14,8 @@ use v4flash_core::MappedGguf;
 use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::config::{N_EXPERT, N_EXPERT_USED, N_LAYER};
 use v4flash_kernels::het::{
-    BatchDgpuScratch, BatchIgpuScratch, DgpuScratch, ExecMode, HetModelState, HetModelWeights,
-    HeterogeneousEngine, PrefillStats,
+    BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, DgpuScratch, ExecMode,
+    HetModelState, HetModelWeights, HeterogeneousEngine, PrefillStats,
 };
 use v4flash_kernels::{oracle::ActivationDump, RopeParams};
 
@@ -74,12 +74,16 @@ fn device_histogram_matches_prefill_stats() -> eyre::Result<()> {
 
     let mut bd = BatchDgpuScratch::alloc(dgpu)?;
     let mut bi = BatchIgpuScratch::alloc(igpu)?;
+    let mut sd = BatchDgpuShared::alloc(dgpu)?;
+    let mut si = BatchIgpuShared::alloc(igpu)?;
     let mut head = DgpuScratch::alloc(dgpu)?;
     let mut state = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
     let mut stats = PrefillStats::new(N_LAYER as u32, N_EXPERT_USED as u32, N_EXPERT);
     let _ = engine.forward_prefill(
         &mut bd,
         &mut bi,
+        &mut sd,
+        &mut si,
         &mut head,
         &mut state,
         &weights,
