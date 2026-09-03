@@ -64,8 +64,10 @@ extern "C" __global__ void moe_group_builder(
 // the group id below is unchanged; with IGPU_DEDUP_HOT the iGPU holds only
 // the 256-n_hot cold experts packed dense and igpu_slot is that packed slot.
 //
-//   mode 0 (iGPU): keep the complement; group ids in the iGPU SLOT space
-//                  (group arrays sized n_expert = the iGPU slot count).
+//   mode 0 (iGPU): keep the complement (misses AND over-cap resident slots);
+//                  group ids in the iGPU SLOT space (group arrays sized
+//                  n_expert = the iGPU slot count). Over-cap resident slots
+//                  use the raw id — only reachable without de-dup.
 //   mode 1 (dGPU): keep the hits; group ids in DENSE remap space (group
 //                  arrays sized n_hot).
 extern "C" __global__ void moe_group_builder_hetsplit(
@@ -98,8 +100,21 @@ extern "C" __global__ void moe_group_builder_hetsplit(
     }
     const bool dgpu_takes = (dense >= 0) && (rank < cap);
     int g;
-    if (mode == 1) { if (!dgpu_takes) return; g = dense;          }
-    else           { if (dgpu_takes)  return; g = -dense - 1;     }
+    if (mode == 1) {
+        if (!dgpu_takes) return;
+        g = dense;
+    } else {
+        if (dgpu_takes) return;
+        // Miss (dense < 0): the iGPU slot carried by remap. OVER-CAP resident
+        // (dense >= 0, rank >= cap): the iGPU copy sits at the raw id `e`
+        // (full 256-expert buffer). `-dense - 1` would be <= -1 here and the
+        // bound check below would silently DROP the slot while
+        // q2_k_reduce_partials_hetsplit (mode 0) still sums its never-written
+        // partial row. Under IGPU_DEDUP_HOT the cap is pinned to
+        // N_EXPERT_USED (dgpu_hot_cap), so over-cap cannot occur and a raw id
+        // never reaches the packed buffer.
+        g = (dense >= 0) ? e : (-dense - 1);
+    }
     if ((unsigned int)g >= n_expert) return;
     const int pos = atomicAdd(&group_count[g], 1);
     if ((unsigned int)pos >= max_per_expert) return; // overflow guard

@@ -300,7 +300,12 @@ extern "C" __global__ void q2_k_matvec_par_batched_hetsplit(
         // their dGPU dense slot (>=0), cold experts hold -(igpu_slot+1). With the
         // full 256-expert iGPU buffer igpu_slot == sel, so this is identical to the
         // old `sel`; with IGPU_DEDUP_HOT it is the packed cold-only slot.
-        const int e = (mode == 0u) ? (-dense - 1) : dense;
+        // An OVER-CAP resident slot (dense >= 0, rank >= cap) also lands here in
+        // mode 0; its iGPU copy sits at the raw id `sel` (the full 256-expert
+        // buffer). `-dense - 1` would be negative for it. Under IGPU_DEDUP_HOT
+        // the cap is pinned to N_EXPERT_USED, so over-cap cannot occur and the
+        // packed buffer is never indexed by a raw id.
+        const int e = (mode == 0u) ? ((dense >= 0) ? sel : (-dense - 1)) : dense;
         const uint8_t* w_expert = w_base + (uint64_t)e * (uint64_t)dbpe;
         const uint8_t* xq_slot  = xq_base + (uint64_t)s * (uint64_t)xq_slot_stride;
         const uint8_t* row_base = w_expert + (uint64_t)row * n_blocks_in * BLOCK_Q2_K_BYTES;

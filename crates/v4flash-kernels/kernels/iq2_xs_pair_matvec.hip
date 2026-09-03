@@ -259,7 +259,12 @@ extern "C" __global__ void iq2_xs_pair_matvec_fused_swiglu_batch_hetsplit(
     // their dGPU dense slot (>=0), cold experts hold -(igpu_slot+1). With the
     // full 256-expert iGPU buffer igpu_slot == sel, so this is identical to the
     // old `sel`; with IGPU_DEDUP_HOT it is the packed cold-only slot.
-    const int e = (mode == 0u) ? (-dense - 1) : dense;
+    // An OVER-CAP resident slot (dense >= 0, rank >= cap) also lands here in
+    // mode 0; its iGPU copy sits at the raw id `sel` (the full 256-expert
+    // buffer). `-dense - 1` would be negative for it. Under IGPU_DEDUP_HOT
+    // the cap is pinned to N_EXPERT_USED, so over-cap cannot occur and the
+    // packed buffer is never indexed by a raw id.
+    const int e = (mode == 0u) ? ((dense >= 0) ? sel : (-dense - 1)) : dense;
 
     IQ2XS_STAGE_TABLES(s_sign_pair128, s_grid2xs);
     const unsigned int xq_bytes = n_blocks * 292u;
