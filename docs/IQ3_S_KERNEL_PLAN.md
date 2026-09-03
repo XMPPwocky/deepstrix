@@ -1,6 +1,10 @@
 # IQ3_S gate/up kernel plan (unsloth UD-IQ3_XXS blk.26)
 
-Status: PLAN, 2026-09-02. Read-only survey; nothing implemented.
+Status: IMPLEMENTED on branch `iq3s-kernel`, 2026-09-03 (steps 1–7 of §7;
+oracle landed as `tests/iq3_s_oracle.rs`, not `iq3_s_pair_oracle.rs`).
+Outstanding: §3.11 ds4 patch 0012 (deferred until a dump is wanted) and the
+§9 E2E items that need the full UD-IQ3_XXS on disk. Survey text below is
+kept as written on 2026-09-02.
 
 ## 0. Premise check (from the real shard headers)
 
@@ -165,7 +169,7 @@ at :197-199.
    add a `Q6_K` arm with `dequant_q6k_superblock` (port of `dequantize_row_q6_K`,
    210 B = ql[128] qh[64] scales[16] d; ~30 lines); `deepstrix-server/src/embed.rs:12`
    and `engine_worker.rs:337` pass the dtype through unchanged.
-10. Tests: new `tests/iq3_s_pair_oracle.rs`, `tests/iq3_s_cpu_ref.rs` +
+10. Tests: new `tests/iq3_s_oracle.rs`, `tests/iq3_s_cpu_ref.rs` +
     `tests/ref/iq3_s_gen.c`; `tests/weight_contract_models.rs:18-20` add the
     UD-IQ3_XXS path when on disk; `tests/bench_iq2_xs_isolated.rs:60-133`
     add `BENCH_FMT=iq3s`.
@@ -229,7 +233,7 @@ ds4 is the reference only for full-forward dumps.
    checked out for the `-I ggml/src` include). `tests/iq3_s_cpu_ref.rs`
    asserts 3 seeds at rel<1e-6. Optional `dequant_row_iq3_s` in v4flash-core
    only if `gguf_dequant_dense` needs it.
-2. **`tests/iq3_s_pair_oracle.rs`** (copy of `iq3_xxs_pair_oracle.rs`,
+2. **`tests/iq3_s_oracle.rs`** (copy of `iq3_xxs_pair_oracle.rs`,
    110-byte blocks): decode batch at B=1 with `sel=[9,240,33,9,61,128]`
    (duplicate expert), hetsplit identity (mode0+mode1 == full), chunked and
    kwide at B=40, chunk=16, `n_rows=2048`, `nb=16`. **Vary `d` per super-block
@@ -275,7 +279,7 @@ ds4 is the reference only for full-forward dumps.
 | 1 | `iq3_s_tables.{inc,rs}` (grid from ggml-common.h:1052), `cpu_dot_iq3_s_q8_k`, `tests/ref/iq3_s_gen.c` + `iq3_s_cpu_ref.rs` pin | 1.5 h |
 | 2 | `iq3_s_pair_matvec.hip`: decode batch, hetsplit, chunked, kwide | 3 h |
 | 3 | `src/iq3_s.rs`, `lib.rs`, `engine.rs`, `dispatch.rs` arms, `weight_contract.rs` (+test) | 1 h |
-| 4 | `iq3_s_pair_oracle.rs` synthetic, all 4 variants | 1.5 h |
+| 4 | `iq3_s_oracle.rs` synthetic, all 4 variants | 1.5 h |
 | 5 | range-fetch blk.26 experts, realism path in the oracle | 1 h |
 | 6 | Q6_K head contract + embed row dequant (+ unit test vs Q6_K dense dequant) | 1.5 h |
 | 7 | isolated bench `BENCH_FMT=iq3s`; VGPR check via `hipcc --save-temps`/`-Rpass-analysis=kernel-resource-usage` (≤128 for 12 waves) | 1 h |
@@ -315,9 +319,109 @@ Total ≈ 11–13 h; steps 1–7 need no model on disk.
 
 ## 9. E2E validation once UD-IQ3_XXS fits
 
-1. `cargo test -p v4flash-kernels --test iq3_s_pair_oracle --test iq3_s_cpu_ref -- --ignored --nocapture` green (synthetic + `DEEPSTRIX_IQ3S_BLOB_DIR`).
-2. `weight_contract_models` with the UD-IQ3_XXS path: `validate_model` clean, 1328 tensors.
+1. `cargo test -p v4flash-kernels --test iq3_s_oracle --test iq3_s_cpu_ref -- --ignored --nocapture --test-threads=1` green (synthetic + `DEEPSTRIX_IQ3S_BLOB_DIR`).
+2. `weight_contract_models::ud_iq3_xxs_validates_clean` (Vision-Exp path under `/persist/lumi/models/dsv4f-exp-iq3-xxs/UD-IQ3_XXS/`, skips until all 4 shards are on disk): `validate_model` clean, 1328 tensors.
 3. Patch 0012 + dump → `forward_per_layer_vs_ds4` at blk.26 with `DEEPSTRIX_GGUF`/`DEEPSTRIX_DUMP_DIR`, zero tolerance changes.
 4. `deepstrix-vector-test --gguf …UD-IQ3_XXS…` ≥ the 16/17 the other UD mixes score.
 5. Perf, back-to-back same thermal window: `bench_prefill_chunked` 4K/24K at `PIPELINE_LANES=2` and decode @4K vs UD-Q2_K_XL; rocprofv3 kernel trace: `iq3_s_pair_matvec_fused_swiglu_kwide` ≤ 1.12× `iq3_xxs_pair_…_kwide` µs/call.
 6. Server smoke via `run_deepstrix.sh --gguf … --bg` (K=8, dedup on) so blk.26 hot experts exercise the gfx1201 build; wipe the snapshot dir (fingerprint changes).
+
+## IQ3_S status (2026-09-03)
+
+Final verification of branch `iq3s-kernel` (worktree
+`/home/claude-code/deepstrix-iq3s`, uncommitted on top of master 21acf48),
+done with the production server live: no model loaded, every GPU test
+≤ 286 MiB peak on the dGPU (HIP context + 58 MB weights; card1
+`mem_info_vram_used` back to its 57 MiB baseline after each run) and
+≤ 0.5 GB on the iGPU, one test at a time.
+
+### What landed (steps 1–7 of §7)
+
+- `kernels/iq3_s_pair_matvec.hip` (658 lines): `iq3_s_pair_matvec_fused_swiglu_{batch,batch_hetsplit,chunked,kwide}`,
+  built for gfx1100/gfx1151/gfx1201. Wrapper `src/iq3_s.rs`, tables
+  `src/iq3_s_tables.rs` + `kernels/iq3_s_tables.inc` (grid verbatim from
+  ggml-common.h), `lib.rs` registration.
+- CPU reference `v4flash_core::iq3_s_ref` (`dequant_row_iq3_s`,
+  `cpu_dot_iq3_s_q8_k`); `kquants.rs` gained an IQ3_S dense-dequant arm.
+  Pinned to llama.cpp's `ggml_vec_dot_iq3_s_q8_K_generic` by
+  `tests/ref/iq3_s_gen.c` + `tests/iq3_s_cpu_ref.rs`.
+- Dispatch: `het/dispatch.rs` IQ3_S arms for decode batch, decode hetsplit,
+  prefill chunked and prefill kwide (iGPU cold path and dGPU hot-expert
+  path); `het/engine.rs` holds `iq3s`; `forward_prefill.rs` comment-only
+  routing update. Existing kernels untouched (only registration/allow-lists).
+- Contract: IQ3_S allowed at `ffn_{gate,up}_exps` (not down), Q6_K allowed at
+  `output.weight` and `token_embd.weight`; `embed.rs` Q6_K row dequant
+  (+3 unit tests); `bytes_per_expert(IQ3_S) = 3,604,480` pinned.
+- `tests/iq3_s_oracle.rs`: synthetic (8 experts, `d` varied per super-block)
+  and real blk.26 experts 0..4 (`DEEPSTRIX_IQ3S_BLOB_DIR`), all four variants,
+  both devices, B ∈ {1, 7, 40, 64}, chunk 16/32, duplicate expert in `sel`.
+- `bench_iq2_xs_isolated`: `BENCH_FMT=iq3s`, `BENCH_N_EXPERT`, `BENCH_RANDOM_W`.
+- `weight_contract_models::ud_iq3_xxs_validates_clean` (skips until all 4
+  shards exist; today only shards 1–2 are under
+  `/persist/lumi/models/dsv4f-exp-iq3-xxs/UD-IQ3_XXS/`).
+
+### Build
+
+`cargo build --release -p v4flash-kernels -p deepstrix-server -p deepstrix-cli`
+and `cargo test --release -p v4flash-core -p v4flash-kernels --no-run`: clean
+(pre-existing unused-import warnings only).
+
+### Test results (all PASS)
+
+| test | result | numbers |
+|---|---|---|
+| `v4flash-core` unit (32 + 1, incl. 5 `iq3_s_ref` tests) | pass | — |
+| `v4flash-core` `block_shape_matches_ds4_type_traits` (IQ3_S shape vs ds4 `ds4q_type_traits`) | pass | needs `external/ds4` checked out — the worktree's submodule is empty, so it was run against a temporary copy of `quants.c` from the main tree (removed afterwards); it FAILS with "No such file" in the bare worktree |
+| `weight_contract::tests` (5) + `embed::tests` (3) | pass | — |
+| `weight_contract_models` (3, `--ignored`) | pass | antirez file clean; unsloth violations = pending-kernel set; UD-IQ3_XXS skipped (2/4 shards) |
+| `iq3_s_cpu_ref::matches_llama_cpp_reference` | pass | rel < 1e-6 vs upstream generator |
+| `iq3_s_oracle::iq3_s_synthetic_igpu` (gfx1151) | pass | batch B=1 vs int ref rel 2.02e-7 (max_abs 1.7e-5, max\|ref\| 85.0), vs f64 ref 1.80e-7; hetsplit m0+m1 2.02e-7; chunked/kwide B=7 3.18e-7/5.30e-7, B=40 3.10e-7/3.81e-7, B=64 3.63e-7/4.54e-7 |
+| `iq3_s_oracle::iq3_s_synthetic_dgpu` (gfx1201) | pass | batch 2.24e-7 / f64 1.80e-7; hetsplit 2.24e-7; chunked/kwide B=7 3.18e-7/3.18e-7, B=40 3.01e-7/3.01e-7, B=64 3.63e-7/3.63e-7; dGPU peak +286 MiB |
+| `iq3_s_oracle::iq3_s_real_igpu` (blk.26 e0..4, d_max 5.5e-4) | pass | batch 2.24e-7 / f64 1.35e-7; hetsplit 2.24e-7; chunked/kwide B=7 2.33e-7/2.72e-7, B=40 2.22e-7/2.78e-7, B=64 2.38e-7/2.38e-7 |
+| `iq3_s_oracle::iq3_s_real_dgpu` | pass | batch 2.69e-7 / f64 2.69e-7; hetsplit 2.69e-7; chunked/kwide B=7 1.74e-7/2.09e-7, B=40 2.13e-7/1.60e-7, B=64 2.27e-7/2.27e-7; dGPU peak +266 MiB |
+| `iq3_xxs_pair_oracle` (regression) | pass | batch/hetsplit rel 7.79e-5, chunked 7.01e-5, kwide 1.18e-4 (unchanged) |
+| `mxfp4_iq2s_oracle` (3 tests, regression) | pass | iq2_s batch/hetsplit 2.60e-5, chunked 4.42e-5; mxfp4 batched/hetsplit 1.47e-7, kwide2 1.92e-7 (unchanged) |
+| `iq2_xs_oracle` (regression) | pass | batch/hetsplit 3.36e-5, chunked 5.09e-5, kwide 9.16e-5 (unchanged) |
+
+IQ3_S oracle tolerance is 1e-4 relative; measured ≤ 5.3e-7 everywhere
+(the CPU int-dot vs f64 dequant-dot cross-check sits at 2.8e-4..5.4e-4,
+i.e. the kernel matches the integer reference far more tightly than f32
+rounding of the reference itself).
+
+### Isolated kwide timing (iGPU gfx1151, back-to-back, same shape)
+
+`bench_iq2_xs_isolated`, `BENCH_VARIANT=6 BENCH_N_EXPERT=64`, B=64, 60 work
+items, chunk 16, 20 iters, median ms per launch (min–max):
+
+| weights | iq3_s | iq3_xxs | iq2_xs |
+|---|---|---|---|
+| zeros | **4.151** (4.119–4.184) | 5.429 (5.410–5.464) | 4.159 (4.130–4.179) |
+| random bytes | **4.623** (4.526–4.708) | 5.558 (5.519–5.581) | 4.481 (4.448–4.514) |
+
+iq3_s / iq3_xxs = 0.76 (zeros) / 0.83 (random) — well inside the §6 target
+of ≤ 1.12× (byte ratio 110/98). Per launch = 4151 µs / 4623 µs. No
+`iq2_s` arm exists in this bench (iq2_s has no kwide kernel); iq2_xs is
+the third comparator. These match the kernels agent's earlier run
+(4.28 / 5.46 / 4.17 ms) within thermal drift.
+
+### Register/LDS check (step 7, from the compiled code objects)
+
+`iq3_s_pair_matvec_fused_swiglu_kwide`: 114 VGPR (gfx1151) / 113 (gfx1201),
+70 SGPR, 20,864 B LDS, zero spills — under the 128-VGPR line for 12 waves
+(iq2_xs kwide: 109 / 109; iq3_xxs kwide: 174 / 174). Decode batch/hetsplit
+151/148 VGPR, chunked 156/153, LDS 8,768 B, no spills (same shape as
+iq2_xs's 115/154).
+
+### What remains
+
+- **Model-level e2e on the Vision-Exp UD-IQ3_XXS file** (§9 items 2–6):
+  needs shards 3–4 downloaded (only 1–2 on disk, ~49 GiB) AND the production
+  server down (the file needs ~97 GiB, the running UD-Q2_K_XL server holds
+  ~90 GiB). Then: `ud_iq3_xxs_validates_clean`, `deepstrix-vector-test`,
+  prefill/decode A/B at `PIPELINE_LANES=2`, rocprofv3 kernel trace, server
+  smoke with K=8 dedup so blk.26 hot experts exercise the gfx1201 build.
+- ds4 patch 0012 + per-layer dump at blk.26 (`forward_per_layer_vs_ds4`),
+  deferred until a dump is wanted (§3.11).
+- Docs/memory (§7 step 9) beyond this section.
+- `block_shape_vs_ds4` requires the `external/ds4` submodule to be present
+  in whichever tree runs it.
