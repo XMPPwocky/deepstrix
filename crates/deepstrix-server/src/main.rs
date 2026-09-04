@@ -53,6 +53,24 @@ struct Args {
     /// Override with env `DEEPSTRIX_HANG_DEADLINE_MS` (env wins).
     #[arg(long, default_value_t = 60_000)]
     hang_deadline_ms: i64,
+    /// Vision-Exp mmproj GGUF (ViT + aligner). Enables image parts in
+    /// `/v1/chat/completions`; the tower is loaded onto the iGPU at
+    /// startup and the text GGUF must carry the `<｜deepseek_image｜>`
+    /// token. Env `DEEPSTRIX_MMPROJ` is used when the flag is absent.
+    /// Without either, requests with images get HTTP 400.
+    #[arg(long)]
+    mmproj: Option<PathBuf>,
+    /// Allow image parts to reference absolute local file paths under
+    /// this directory (repeatable). OFF by default: without it the
+    /// server only accepts `data:<type>;base64,...` image URLs.
+    ///
+    /// SECURITY: this endpoint has no authentication, so every client
+    /// that can reach `--addr` can read any image file under the
+    /// directories listed here. Only point it at a directory you are
+    /// happy to serve. Env `DEEPSTRIX_ALLOW_IMAGE_DIRS` (`:`-separated)
+    /// is used when the flag is absent.
+    #[arg(long = "allow-image-dir")]
+    allow_image_dir: Vec<PathBuf>,
 }
 
 fn default_snapshot_dir() -> eyre::Result<PathBuf> {
@@ -79,10 +97,26 @@ async fn main() -> eyre::Result<()> {
         None => default_snapshot_dir()?,
     };
     let disk_cap_bytes = args.disk_cap_gb.saturating_mul(1024 * 1024 * 1024);
+    let mmproj_path = args.mmproj.or_else(|| {
+        std::env::var_os("DEEPSTRIX_MMPROJ")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    });
+    let allow_image_dirs = if args.allow_image_dir.is_empty() {
+        std::env::var("DEEPSTRIX_ALLOW_IMAGE_DIRS")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(|v| v.split(':').filter(|p| !p.is_empty()).map(PathBuf::from).collect())
+            .unwrap_or_default()
+    } else {
+        args.allow_image_dir
+    };
     tracing::info!(
         addr = %args.addr,
         ctx = args.ctx,
         gguf = %args.gguf,
+        mmproj = ?mmproj_path,
+        allow_image_dirs = ?allow_image_dirs,
         snapshot_dir = %snapshot_root.display(),
         disk_cap_gb = args.disk_cap_gb,
         "starting deepstrix-server"
@@ -94,6 +128,8 @@ async fn main() -> eyre::Result<()> {
         model_name: args.model_name,
         snapshot_root,
         snapshot_cap_bytes: disk_cap_bytes,
+        mmproj_path,
+        allow_image_dirs,
     })?;
 
     // Forward-progress watchdog. Env override > CLI flag > default.
@@ -111,8 +147,17 @@ async fn main() -> eyre::Result<()> {
         "watchdog armed; on stall the process will abort() for supervisor restart"
     );
 
+    // axum's DefaultBodyLimit is 2 MiB, which caps a base64 `data:` image
+    // at ~1.4 MiB and rejects anything larger with an opaque 413 that
+    // never mentions images. The limit is derived from MAX_IMAGE_BYTES so
+    // the two cannot drift; only the chat route is raised.
     let app = Router::new()
-        .route("/v1/chat/completions", post(chat_completions))
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions).layer(axum::extract::DefaultBodyLimit::max(
+                deepstrix_server::vision_prompt::MAX_REQUEST_BODY_BYTES,
+            )),
+        )
         .route("/v1/models", get(list_models))
         .route("/api/v1/models", get(lmstudio_models))
         .route("/healthz", get(healthz))

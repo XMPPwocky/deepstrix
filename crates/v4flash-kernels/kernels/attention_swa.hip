@@ -22,6 +22,16 @@
 #include <hip/hip_fp16.h>
 
 #define ATTN_SWA_MAX_KV 128
+// Batched prefill rows inside a Vision-Exp image span see a widened raw
+// window (back max(W-1, left), forward right; capped at W + 384 = 512 keys,
+// see het/image_spans.rs). `attention_swa_batched` therefore takes its
+// scores/weights arrays as DYNAMIC LDS sized `2 * max_n_kv` floats at
+// launch: a text-only chunk passes max_n_kv <= 128 and gets exactly the
+// 1024 B the old static arrays used, so occupancy is unchanged; only a
+// chunk containing image rows pays the wider 4096 B. The single-token
+// decode kernel above keeps its static 128-row arrays (decode rows are
+// never image rows).
+#define ATTN_SWA_BATCHED_MAX_KV 512
 
 extern "C" __global__ void attention_swa(
         float        * out,            // [n_head, head_dim]
@@ -113,6 +123,7 @@ extern "C" __global__ void attention_swa_batched(
         const int    * n_raw_offset_per,    // [B] starting slot into oversized cache
         unsigned int   n_head,
         unsigned int   head_dim,
+        unsigned int   max_n_kv,            // dynamic-LDS stride: >= max(n_raw_per)
         float          kq_scale) {
     const unsigned int h   = blockIdx.x;
     const unsigned int b   = blockIdx.y;
@@ -121,9 +132,11 @@ extern "C" __global__ void attention_swa_batched(
     if (h >= n_head) return;
 
     __shared__ float partial[256];
-    __shared__ float scores[ATTN_SWA_MAX_KV];
-    __shared__ float weights[ATTN_SWA_MAX_KV];
     __shared__ float inv_denom_s;
+    // Dynamic LDS: [scores[max_n_kv], weights[max_n_kv]].
+    extern __shared__ float lds_sw[];
+    float *scores  = lds_sw;
+    float *weights = lds_sw + max_n_kv;
 
     const unsigned int n_kv = (unsigned int)n_raw_per[b];
     const unsigned int raw_off = (unsigned int)n_raw_offset_per[b];

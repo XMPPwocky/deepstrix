@@ -21,6 +21,15 @@ const ATTENTION_MIXED_GFX1151: &[u8] = include_bytes!(env!("KERNEL_ATTENTION_MIX
 /// so this is never exceeded.
 pub const ATTN_SWA_MAX_KV: u32 = 128;
 
+/// `attention_swa_batched`'s raw-key cap (`#define ATTN_SWA_BATCHED_MAX_KV`).
+/// Text rows stay at `SWA_WINDOW` (128); Vision-Exp image rows widen the raw
+/// window to at most `SWA_WINDOW + vision_max_n_token = 512` keys
+/// (`het::image_spans::IMAGE_RAW_WINDOW_MAX`). The kernel's scores/weights
+/// arrays are DYNAMIC LDS sized from the caller's `max_n_kv`, so a text-only
+/// chunk allocates exactly the 1 KiB the old static `[128]` arrays did and
+/// its occupancy is unchanged — only image chunks pay 4 KiB.
+pub const ATTN_SWA_BATCHED_MAX_KV: u32 = 512;
+
 /// Compile-time max for `attention_mixed`'s `scores`/`weights` arrays;
 /// must cover `n_raw + n_comp`. Raw is permanently capped at SWA_WINDOW
 /// (128) by the forward orchestrator's sliding eviction; comp grows
@@ -43,17 +52,57 @@ pub const ATTN_MIXED_MAX_KEYS: u32 = 49408;
 /// Stride (in keys) of the `attn_scores` scratch buffer per (batch, head).
 /// Smaller than ATTN_MIXED_MAX_KEYS because the production attention path
 /// runs after the CSA indexer has gathered the top-K=512 most-relevant
-/// comp_kv rows into a dense buffer. So n_total = n_raw (≤128) + n_keys
-/// (≤512) ≈ 640 at any depth. Set to 2048 to cover:
+/// comp_kv rows into a dense buffer. So n_total = n_raw + n_keys (≤512)
+/// ≈ 640 at any depth on a ratio==4 layer. Set to 2048 to cover:
 ///   - ratio==4 with CSA: ≤ 640 keys (post-gather)
 ///   - ratio==4 without CSA (n_index_comp ≤ INDEXER_TOP_K): n_total ≤ 640
-///   - ratio==128 at 256K ctx: n_raw + n_kv/128 = 128 + 2048 = 2176 — close
-///     but headroom ok at our actual max ctx of 96K (1024). Bump if max
-///     ctx is ever raised past ~256K.
+///   - ratio==128 (the ungathered worst case): n_raw + n_kv/128.
+///
+/// THE BINDING CASE IS ratio==128 WITH VISION. A text row's raw window is
+/// SWA_WINDOW = 128 keys; a Vision-Exp image row's is widened to at most
+/// `het::image_spans::IMAGE_RAW_WINDOW_MAX` = SWA_WINDOW + 384 = 512
+/// (a row inside an image block sees the whole block plus its trailing
+/// text window). So the budget is
+///
+///     n_kv_max/128 + IMAGE_RAW_WINDOW_MAX <= ATTN_SCORES_STRIDE
+///
+/// which at the SHIPPED 192K context is 1536 + 512 = 2048 — exact, zero
+/// spare. (The true peak is 508, so 4 keys of real margin.) Raising the
+/// context past 192K, or widening the image window, therefore REQUIRES
+/// raising this constant; `check_vision_ctx_fits` enforces that at
+/// startup so it is a launch-time refusal rather than a mid-prefill 500
+/// after part of the chunk's KV was already appended.
+///
+/// The old comment here said "headroom ok at our actual max ctx of 96K
+/// (1024)" and predated both the 192K default and vision.
 ///
 /// At B=512: 64 * 2048 * 2 (f16) = 256 KB/B = 128 MB scratch (was 1.5 GiB).
 /// At B=1024: 256 MB. Plenty of room for bigger batches.
 pub const ATTN_SCORES_STRIDE: u32 = 2048;
+
+/// Refuse to start when a vision tower is loaded and `n_kv_max` would let
+/// an image row's `n_raw + n_comp` overrun [`ATTN_SCORES_STRIDE`].
+///
+/// Text-only servers are unaffected: without image rows the raw window is
+/// SWA_WINDOW and the bound is ~1.5x looser.
+pub fn check_vision_ctx_fits(n_kv_max: u32) -> eyre::Result<()> {
+    let max_ratio = crate::config::COMPRESS_RATIOS
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let n_comp_max = n_kv_max.div_ceil(max_ratio);
+    let need = n_comp_max + crate::het::image_spans::IMAGE_RAW_WINDOW_MAX;
+    if need > ATTN_SCORES_STRIDE {
+        return Err(eyre!(
+            "vision + ctx {n_kv_max} needs {need} attention score slots per (row, head)              (n_comp {n_comp_max} at ratio {max_ratio} + image raw window {}) but              ATTN_SCORES_STRIDE is {ATTN_SCORES_STRIDE}. Lower --ctx to {} or raise              ATTN_SCORES_STRIDE (and the attn_scores scratch with it).",
+            crate::het::image_spans::IMAGE_RAW_WINDOW_MAX,
+            (ATTN_SCORES_STRIDE - crate::het::image_spans::IMAGE_RAW_WINDOW_MAX) * max_ratio,
+        ));
+    }
+    Ok(())
+}
 
 /// Head-group size for the head-tiled WMMA smwsum kernels. Must match
 /// `#define SMWSUM_HEAD_TILE` in `kernels/attention_mixed.hip`.
@@ -155,21 +204,31 @@ impl AttentionSwa {
         n_head: u32,
         head_dim: u32,
         batch: u32,
+        // Dynamic-LDS stride: must be >= every `n_raw_per[b]` of this
+        // launch. Text-only chunks pass `SWA_WINDOW`; image chunks pass the
+        // widest window in the chunk (<= `ATTN_SWA_BATCHED_MAX_KV`).
+        max_n_kv: u32,
     ) -> eyre::Result<()> {
         if batch == 0 {
             return Ok(());
+        }
+        if max_n_kv == 0 || max_n_kv > ATTN_SWA_BATCHED_MAX_KV {
+            return Err(eyre!(
+                "attention_swa_batched: max_n_kv {max_n_kv} must be in [1, {ATTN_SWA_BATCHED_MAX_KV}]"
+            ));
         }
         let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
         let function = self.module.get_function("attention_swa_batched")?;
         let cfg = LaunchConfig {
             grid: (n_head, batch, 1),
             block: (256, 1, 1),
-            shared_mem_bytes: 0,
+            // scores[max_n_kv] + weights[max_n_kv], f32.
+            shared_mem_bytes: 2 * max_n_kv * 4,
         };
         launch_kernel!(function, cfg, stream, [
             out.raw(), q.raw(), kv.raw(), sinks.raw(),
             n_raw_per.raw(), n_raw_offset_per.raw(),
-            n_head, head_dim, kq_scale
+            n_head, head_dim, max_n_kv, kq_scale
         ])
     }
 }
@@ -888,5 +947,34 @@ impl AttentionMixed {
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
             n_head, head_dim, n_total_max, kq_scale
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shipped configuration (192K ctx + a vision tower) must start,
+    /// and it must sit exactly at the edge — this is the test that fails
+    /// first if someone raises the context without raising the stride.
+    #[test]
+    fn vision_ctx_budget_is_exact_at_192k() {
+        let ctx_192k = 192 * 1024;
+        check_vision_ctx_fits(ctx_192k).expect("192K + vision must fit");
+        // One comp row more (ratio 128 => 128 tokens) does not.
+        assert!(check_vision_ctx_fits(ctx_192k + 128).is_err());
+        // Text-only servers were never near the bound.
+        check_vision_ctx_fits(96 * 1024).unwrap();
+    }
+
+    #[test]
+    fn vision_ctx_error_names_a_workable_ctx() {
+        let e = check_vision_ctx_fits(512 * 1024).unwrap_err().to_string();
+        assert!(e.contains("ATTN_SCORES_STRIDE"), "{e}");
+        // The suggested ctx must itself pass.
+        check_vision_ctx_fits(
+            (ATTN_SCORES_STRIDE - crate::het::image_spans::IMAGE_RAW_WINDOW_MAX) * 128,
+        )
+        .unwrap();
     }
 }

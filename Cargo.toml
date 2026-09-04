@@ -6,6 +6,7 @@ members = [
     "crates/v4flash-kernels",
     "crates/deepstrix-cli",
     "crates/deepstrix-server",
+    "crates/v4flash-vision",
     "crates/phase0",
     "crates/phase1",
 ]
@@ -43,4 +44,25 @@ blake3 = "1.8.5"
 uuid = { version = "1.23.2", features = ["v7"] }
 # Combinators on tokio mpsc / futures Streams used by SSE handler.
 futures-util = "0.3"
+
+# *** PENDING USER SIGN-OFF (vision-exp, 2026-09-03) ***
+#   image: PNG/JPEG decoding for the DeepSeek-V4-Flash-Vision-Exp image
+#   preprocessor (crates/v4flash-vision). Only `decode -> RGB8` is used;
+#   resizing/padding/normalisation are implemented in-crate (PIL semantics).
+#
+#   REAL SURFACE BEING SIGNED OFF — 14 crates enter Cargo.lock, not two:
+#     image
+#     png, fdeflate, flate2, miniz_oxide, zlib-rs, crc32fast, simd-adler32  (PNG)
+#     zune-jpeg, zune-core                                                  (JPEG)
+#     bytemuck, byteorder-lite                                              (glue)
+#     moxcms, pxfm                                                          (ICC colour math)
+#   moxcms/pxfm are NON-OPTIONAL dependencies of image 0.25.10, so
+#   `default-features = false` cannot drop them — this crate cannot be
+#   reduced to "just the two codecs".
+#
+#   Narrower alternative if that surface is unwanted: depend on `png` and
+#   `zune-jpeg` directly and sniff the format in `preprocess::decode_rgb`.
+#   That drops image, moxcms, pxfm, bytemuck and byteorder-lite (5 of 14)
+#   at the cost of hand-rolling the DynamicImage -> RGB8 conversion.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 

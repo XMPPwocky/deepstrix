@@ -412,18 +412,13 @@ fn main() -> eyre::Result<()> {
 
         // Build the chat-rendered prompt. Match the official capture
         // settings: empty system, no tools, thinking disabled.
-        let messages = vec![ChatMessage {
-            role: Role::User,
-            content: Some(prompt_text),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            name: None,
-        }];
+        let messages = vec![ChatMessage::text(Role::User, prompt_text)];
         let tokens = render_prompt(
             &vocab,
             &messages,
             None,
             deepstrix_server::prompt::ReasoningEffort::Off,
+            None,
         )?;
         eprintln!("rendered prompt: {} tokens", tokens.len());
 
@@ -459,6 +454,7 @@ fn main() -> eyre::Result<()> {
             /*stats=*/ None,
             /*cancel=*/ None,
             /*on_chunk_done=*/ None,
+            /*image_spans=*/ None,
         )?;
         let mut pos = prefill_tokens.len() as u32;
         // In substitute_eval mode, now run forward_token for the

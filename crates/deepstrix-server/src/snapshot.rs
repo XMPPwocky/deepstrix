@@ -29,6 +29,7 @@ use v4flash_kernels::config::{COMPRESS_RATIOS, N_HEAD_DIM, N_LAYER, NEG_INF, SWA
 use v4flash_kernels::het::HetModelState;
 
 use crate::embed::gpt2_decode_token;
+use crate::vision_prompt::{span_hash_at, synthetic_token_bytes, ImageSpan};
 
 /// Bumped to 2 when snapshot keys switched from `blake3(token_id_LE_bytes)`
 /// to `blake3(decoded_byte_stream)` — bytes are the source of truth and
@@ -48,10 +49,42 @@ pub fn decode_tokens_to_bytes(
     vocab: &BpeVocab,
     byte_decoder: &std::collections::HashMap<char, u8>,
 ) -> Vec<u8> {
+    decode_tokens_to_bytes_vl(tokens, &[], vocab, byte_decoder)
+}
+
+/// [`decode_tokens_to_bytes`] for a stream that may contain image blocks.
+/// Synthetic image ids have no vocab text; they decode to a per-type
+/// marker, and IMAGE_START additionally carries the image's content hash
+/// (looked up in `image_spans` by position) — so the byte stream, and
+/// therefore the snapshot key, is different for different pixels.
+pub fn decode_tokens_to_bytes_vl(
+    tokens: &[i32],
+    image_spans: &[ImageSpan],
+    vocab: &BpeVocab,
+    byte_decoder: &std::collections::HashMap<char, u8>,
+) -> Vec<u8> {
+    decode_tokens_to_bytes_with(tokens, image_spans, |id| {
+        vocab
+            .token_text(id)
+            .map(|b| gpt2_decode_token(b, byte_decoder))
+            .unwrap_or_default()
+    })
+}
+
+/// [`decode_tokens_to_bytes_vl`] with an injectable per-id text decoder
+/// (unit-testable without a vocab). `decode` is only consulted for
+/// non-synthetic ids.
+pub fn decode_tokens_to_bytes_with(
+    tokens: &[i32],
+    image_spans: &[ImageSpan],
+    decode: impl Fn(i32) -> Vec<u8>,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(tokens.len() * 2);
-    for &id in tokens {
-        if let Some(bytes) = vocab.token_text(id) {
-            out.extend(gpt2_decode_token(bytes, byte_decoder));
+    for (i, &id) in tokens.iter().enumerate() {
+        if let Some(b) = synthetic_token_bytes(id, span_hash_at(image_spans, i)) {
+            out.extend(b);
+        } else {
+            out.extend(decode(id));
         }
     }
     out
@@ -150,6 +183,11 @@ pub struct SnapshotMeta {
     /// Absent on pre-retention snapshots → treated as a singleton lineage.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Image spans inside `tokens.bin` (Vision-Exp). Needed to re-derive
+    /// the byte-stream key and to compare image content on restore.
+    /// Absent on pre-vision snapshots (which contain no image tokens).
+    #[serde(default)]
+    pub image_spans: Vec<ImageSpan>,
 }
 
 /// In-memory record of one on-disk snapshot.
@@ -514,9 +552,17 @@ impl SnapshotIndex {
     /// where `req_prefix_len` is the req-side token count for the
     /// byte boundary that hashed (the snapshot's stored token count
     /// may differ, since the same bytes can split differently).
+    ///
+    /// `image_spans` (Vision-Exp): the request's image spans, so the
+    /// probed byte prefix carries each image's content hash exactly as
+    /// `save` hashed it. Image blocks live strictly inside a user turn
+    /// (after `<User>`, before `<Assistant>`), so the probe points are
+    /// never inside a block and a snapshot saved at `<Assistant>` after
+    /// an image turn hashes identically here.
     pub fn find_longest_prefix(
         &self,
         tokens: &[i32],
+        image_spans: &[ImageSpan],
         tok_eos: i32,
         tok_assistant: i32,
         tok_user: i32,
@@ -532,7 +578,10 @@ impl SnapshotIndex {
                 .unwrap_or_default()
         };
         for (i, &tok) in tokens.iter().enumerate() {
-            byte_prefix.extend(decode(tok));
+            match synthetic_token_bytes(tok, span_hash_at(image_spans, i)) {
+                Some(b) => byte_prefix.extend(b),
+                None => byte_prefix.extend(decode(tok)),
+            }
             if tok == tok_eos || tok == tok_assistant || tok == tok_user {
                 let h = *blake3::hash(&byte_prefix).as_bytes();
                 if let Some(entry) = self.by_hash.get(&h) {
@@ -577,10 +626,11 @@ fn token_ids_as_bytes(tokens: &[i32]) -> Vec<u8> {
 
 fn blake3_decoded(
     tokens: &[i32],
+    image_spans: &[ImageSpan],
     vocab: &BpeVocab,
     byte_decoder: &std::collections::HashMap<char, u8>,
 ) -> [u8; 32] {
-    let bytes = decode_tokens_to_bytes(tokens, vocab, byte_decoder);
+    let bytes = decode_tokens_to_bytes_vl(tokens, image_spans, vocab, byte_decoder);
     *blake3::hash(&bytes).as_bytes()
 }
 
@@ -609,6 +659,7 @@ fn unix_now() -> u64 {
 pub fn save(
     state: &HetModelState,
     tokens: &[i32],
+    image_spans: &[ImageSpan],
     dgpu: Device,
     igpu: Device,
     fingerprint: &ModelFingerprint,
@@ -627,7 +678,7 @@ pub fn save(
     // Key is hash of DECODED bytes, not token IDs — survives tokenizer
     // round-trips (sampled tokens vs. re-encoded history may split
     // differently but produce identical byte streams).
-    let hash = blake3_decoded(tokens, vocab, byte_decoder);
+    let hash = blake3_decoded(tokens, image_spans, vocab, byte_decoder);
     let dir = root.join(hex::encode(hash));
     fs::create_dir_all(&dir)?;
 
@@ -804,6 +855,7 @@ pub fn save(
         layers,
         disk_bytes: 0,
         session_id: session_id.map(|s| s.to_string()),
+        image_spans: image_spans.to_vec(),
     };
     let mut total_bytes: u64 = tokens_bytes.len() as u64 + kv_blob.len() as u64;
     total_bytes += comp_kv_blob.len() as u64;
@@ -834,6 +886,25 @@ pub fn restore(
     igpu: Device,
     fingerprint: &ModelFingerprint,
 ) -> eyre::Result<Vec<i32>> {
+    restore_vl(state, src, dgpu, igpu, fingerprint).map(|r| r.tokens)
+}
+
+/// What [`restore_vl`] loaded.
+#[derive(Debug, Clone)]
+pub struct RestoredSnapshot {
+    pub tokens: Vec<i32>,
+    /// Image spans recorded at save time (empty for pre-vision snapshots).
+    pub image_spans: Vec<ImageSpan>,
+}
+
+/// [`restore`] that also returns the snapshot's image spans.
+pub fn restore_vl(
+    state: &mut HetModelState,
+    src: &Path,
+    dgpu: Device,
+    igpu: Device,
+    fingerprint: &ModelFingerprint,
+) -> eyre::Result<RestoredSnapshot> {
     let meta_bytes = fs::read(src.join("meta.json"))
         .map_err(|e| eyre!("snapshot.restore: read meta.json: {e}"))?;
     let meta: SnapshotMeta = serde_json::from_slice(&meta_bytes)
@@ -1084,7 +1155,7 @@ pub fn restore(
 
     // Leave dgpu current for the caller's subsequent prefill.
     dgpu.set_current()?;
-    Ok(tokens)
+    Ok(RestoredSnapshot { tokens, image_spans: meta.image_spans })
 }
 
 /// hex encode/decode for the snapshot directory names. We avoid pulling
@@ -1199,5 +1270,74 @@ mod retention_tests {
         assert_eq!(idx.len(), 1);
         assert_eq!(idx.total_bytes(), 100, "bytes not double-counted");
         assert_eq!(idx.by_session.get("A").unwrap().len(), 1, "membership not duplicated");
+    }
+
+    // ---- image-aware byte stream / snapshot key ---------------------
+
+    #[test]
+    fn snapshot_key_differs_for_different_image_bytes() {
+        use crate::vision_prompt::{expand_prepared, ImageSpan};
+        use v4flash_vision::PreprocessedImage;
+        let fake = |seed: u8| PreprocessedImage {
+            patches: vec![seed as f32; 4],
+            n_vit_h: 37,
+            n_vit_w: 37,
+            content_hash: *blake3::hash(&[seed]).as_bytes(),
+        };
+        const PH: i32 = 129264;
+        // Same prompt text, same image DIMENSIONS (identical token ids),
+        // different pixels.
+        let base = vec![0, 128803, 11, PH, 12, 128804];
+        let a = expand_prepared(base.clone(), PH, vec![fake(1)]).unwrap();
+        let b = expand_prepared(base.clone(), PH, vec![fake(2)]).unwrap();
+        assert_eq!(a.tokens, b.tokens, "identical layouts → identical ids");
+        let dec = |id: i32| -> Vec<u8> { format!("[{id}]").into_bytes() };
+        let ba = decode_tokens_to_bytes_with(&a.tokens, &a.spans, dec);
+        let bb = decode_tokens_to_bytes_with(&b.tokens, &b.spans, dec);
+        assert_ne!(ba, bb);
+        assert_ne!(blake3::hash(&ba), blake3::hash(&bb));
+        // Same pixels → same key (the property snapshot reuse relies on).
+        let a2 = expand_prepared(base.clone(), PH, vec![fake(1)]).unwrap();
+        let ba2 = decode_tokens_to_bytes_with(&a2.tokens, &a2.spans, dec);
+        assert_eq!(ba, ba2);
+        // The image bytes sit at the START position: the stream before the
+        // block is shared, and the pre-image text-only prefix hashes the
+        // same as a text-only prompt would (role-boundary probing works).
+        let prefix_a = decode_tokens_to_bytes_with(&a.tokens[..3], &a.spans, dec);
+        let prefix_text = decode_tokens_to_bytes_with(&base[..3], &[], dec);
+        assert_eq!(prefix_a, prefix_text);
+        // Without spans (e.g. diag paths) the stream still reflects the
+        // layout, just not the content.
+        let no_spans: &[ImageSpan] = &[];
+        let ba_nospan = decode_tokens_to_bytes_with(&a.tokens, no_spans, dec);
+        let bb_nospan = decode_tokens_to_bytes_with(&b.tokens, no_spans, dec);
+        assert_eq!(ba_nospan, bb_nospan);
+        assert_ne!(ba_nospan, ba);
+    }
+
+    #[test]
+    fn snapshot_meta_image_spans_roundtrip_and_default() {
+        let spans = vec![crate::vision_prompt::ImageSpan { start: 7, len: 198, hash: [9u8; 32] }];
+        let meta = SnapshotMeta {
+            format_version: FORMAT_VERSION,
+            fingerprint: fp(),
+            token_count: 1,
+            n_kv_max: 1,
+            created_at_unix: 0,
+            last_used_unix: 0,
+            layers: Vec::new(),
+            disk_bytes: 0,
+            session_id: None,
+            image_spans: spans.clone(),
+        };
+        let j = serde_json::to_string(&meta).unwrap();
+        let back: SnapshotMeta = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.image_spans, spans);
+        // Pre-vision meta.json (no field) → empty.
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        let mut o = v.as_object().unwrap().clone();
+        o.remove("image_spans");
+        let back2: SnapshotMeta = serde_json::from_value(serde_json::Value::Object(o)).unwrap();
+        assert!(back2.image_spans.is_empty());
     }
 }

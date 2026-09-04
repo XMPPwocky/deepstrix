@@ -10,6 +10,7 @@ pub mod openai;
 pub mod prompt;
 pub mod snapshot;
 pub mod tokens;
+pub mod vision_prompt;
 
 use color_eyre::eyre;
 use v4flash_kernels::config::COMPRESS_RATIOS;
