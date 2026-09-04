@@ -10,12 +10,12 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use color_eyre::eyre::{self, eyre};
+use color_eyre::eyre::{self, eyre, WrapErr};
 use tokio::sync::{mpsc, oneshot};
 use v4flash_core::tokenizer::BpeVocab;
 use v4flash_core::MappedGguf;
 use v4flash_hip::Device;
-use v4flash_kernels::config::{COMPRESS_RATIOS, HC_DIM, N_VOCAB};
+use v4flash_kernels::config::{COMPRESS_RATIOS, HC_DIM, N_EMBD, N_HC, N_VOCAB};
 use v4flash_kernels::het::{
     BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, DgpuScratch, ExecMode,
     HetModelState, HetModelWeights,
@@ -30,10 +30,20 @@ use crate::snapshot::{self, ModelFingerprint, SnapshotIndex};
 use crate::tokens::{
     is_turn_end, TOK_ASSISTANT, TOK_EOS, TOK_THINK_BEGIN, TOK_THINK_END, TOK_USER,
 };
+use crate::vision_prompt::{
+    shift_spans, span_hash_at, synthetic_token_bytes, ImageSpan, PreparedImage,
+};
 
 /// Per-request input.
 pub struct GenerateReq {
     pub tokens: Vec<i32>,
+    /// Vision-Exp: the preprocessed images spliced into `tokens`, in
+    /// stream order. Empty for text-only requests. `images[i]` is the
+    /// image whose block sits at `image_spans[i]`.
+    pub images: Vec<PreparedImage>,
+    /// `[IMAGE_START ..= IMAGE_END]` spans, in `tokens` index space
+    /// (NOT KV positions — the worker rebases them per prefill call).
+    pub image_spans: Vec<ImageSpan>,
     pub max_new: usize,
     pub temperature: f32,
     pub min_p_rel: f32,
@@ -222,6 +232,17 @@ pub struct EngineHandle {
     /// Forward-progress signal. Shared with the watchdog thread and
     /// the /readyz HTTP handler.
     pub progress: WorkerProgress,
+    /// True when the worker loaded a Vision-Exp tower (`--mmproj`) AND
+    /// the text vocab carries `<｜deepseek_image｜>`. The HTTP handler rejects
+    /// image parts with 400 when this is false.
+    pub vision_enabled: bool,
+    /// Vocab id of `<｜deepseek_image｜>`, or `None` when the loaded GGUF has
+    /// no such token. `prompt::render_prompt` needs it to render image
+    /// parts.
+    pub image_placeholder_id: Option<i32>,
+    /// Which image sources the HTTP layer may read. Default-deny for
+    /// absolute local paths; see `vision_prompt::ImagePolicy`.
+    pub image_policy: Arc<crate::vision_prompt::ImagePolicy>,
 }
 
 impl EngineHandle {
@@ -280,13 +301,28 @@ pub struct WorkerConfig {
     pub snapshot_root: std::path::PathBuf,
     /// Soft cap for the snapshot cache. LRU eviction kicks in above this.
     pub snapshot_cap_bytes: u64,
+    /// Vision-Exp mmproj GGUF (ViT + aligner). `None` disables image
+    /// input; requests carrying images then get HTTP 400.
+    pub mmproj_path: Option<std::path::PathBuf>,
+    /// Directories under which absolute local image paths may be read
+    /// (`--allow-image-dir`). Empty = local paths rejected outright.
+    pub allow_image_dirs: Vec<std::path::PathBuf>,
 }
 
 pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
     let (tx, rx) = mpsc::channel::<EngineRequest>(ENGINE_QUEUE_CAP);
     let (ready_tx, ready_rx) =
-        std::sync::mpsc::sync_channel::<eyre::Result<(Arc<BpeVocab>, Arc<String>)>>(1);
+        std::sync::mpsc::sync_channel::<eyre::Result<WorkerReady>>(1);
     let n_kv_max = cfg.n_kv_max;
+    let image_policy = Arc::new(crate::vision_prompt::ImagePolicy::from_dirs(
+        cfg.allow_image_dirs.clone(),
+    ));
+    if !image_policy.allow_local_dirs.is_empty() {
+        tracing::warn!(
+            dirs = ?image_policy.allow_local_dirs,
+            "local image paths ENABLED: any client of this HTTP API can read              image files under these directories"
+        );
+    }
     let progress = WorkerProgress::default();
     let progress_worker = progress.clone();
 
@@ -295,22 +331,38 @@ pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
         .spawn(move || worker_main(cfg, rx, ready_tx, progress_worker))
         .map_err(|e| eyre!("failed to spawn engine thread: {e}"))?;
 
-    let (vocab, model_name) = ready_rx
+    let WorkerReady {
+        vocab,
+        model_name,
+        vision_enabled,
+    } = ready_rx
         .recv()
         .map_err(|_| eyre!("engine thread dropped ready channel"))??;
+    let image_placeholder_id = vocab.lookup_token_id(v4flash_vision::IMAGE_PLACEHOLDER);
     Ok(EngineHandle {
         tx,
         vocab,
         model_name,
         n_kv_max,
         progress,
+        vision_enabled: vision_enabled && image_placeholder_id.is_some(),
+        image_placeholder_id,
+        image_policy,
     })
+}
+
+/// What the worker thread hands back once initialization succeeded.
+struct WorkerReady {
+    vocab: Arc<BpeVocab>,
+    model_name: Arc<String>,
+    /// The worker loaded a vision tower.
+    vision_enabled: bool,
 }
 
 fn worker_main(
     cfg: WorkerConfig,
     mut rx: mpsc::Receiver<EngineRequest>,
-    ready_tx: std::sync::mpsc::SyncSender<eyre::Result<(Arc<BpeVocab>, Arc<String>)>>,
+    ready_tx: std::sync::mpsc::SyncSender<eyre::Result<WorkerReady>>,
     progress: WorkerProgress,
 ) {
     let mut state = match initialize_state(&cfg) {
@@ -323,7 +375,12 @@ fn worker_main(
     state.progress = progress;
     let vocab = state.vocab.clone();
     let model_name = Arc::new(cfg.model_name.clone());
-    let _ = ready_tx.send(Ok((vocab, model_name)));
+    let vision_enabled = state.tower.is_some();
+    let _ = ready_tx.send(Ok(WorkerReady {
+        vocab,
+        model_name,
+        vision_enabled,
+    }));
 
     worker_loop(state, &mut rx);
 }
@@ -337,6 +394,23 @@ pub struct WorkerState {
     pub token_embd_bytes: Vec<u8>,
     pub token_embd_dtype: v4flash_core::gguf::GgufType,
     pub byte_decoder: std::collections::HashMap<char, u8>,
+
+    /// Vision-Exp ViT + aligner, resident on the iGPU. `None` when the
+    /// server was started without `--mmproj` — image requests are then
+    /// rejected by the HTTP handler (`EngineHandle::vision_enabled`).
+    pub tower: Option<v4flash_vision::Tower>,
+
+    /// Bounded memo of `Tower::encode_rows` outputs, keyed by
+    /// `PreprocessedImage::content_hash`, most-recent first.
+    ///
+    /// OpenAI chat completions are stateless: a client replays the whole
+    /// `messages` array (images included) on every turn. Without this,
+    /// turn N re-ran the full ViT for all N images even when their KV
+    /// blocks were already resident and `prefill_suffix` never asked for
+    /// a single row — ~454 ms of iGPU time per 1080p image per turn,
+    /// which is exactly the TTFT the snapshot cache exists to remove.
+    /// Entries are `n_llm * 4096` f32 (≤ 6.3 MiB each).
+    pub vit_rows: Vec<([u8; 32], std::sync::Arc<Vec<f32>>)>,
 
     pub state: HetModelState,
     pub dgpu_scratch: DgpuScratch,
@@ -379,6 +453,10 @@ pub struct WorkerState {
 #[derive(Debug, Clone)]
 pub struct LiveSession {
     pub tokens: Vec<i32>,
+    /// Image spans inside `tokens` (live-token-index space). Empty for
+    /// text-only sessions. Carried so the byte-aligned LCP and the
+    /// snapshot key both see each image's content hash.
+    pub image_spans: Vec<ImageSpan>,
     pub pos: u32,
     /// Set when `live.tokens` advanced past the last save point on disk.
     /// Triggers a save when the session is about to be evicted.
@@ -474,6 +552,63 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
 
     let byte_decoder = build_gpt2_byte_decoder();
 
+    // Vision-Exp tower. Lives on the iGPU (host RAM): ~0.9 GiB of f16
+    // weights plus a small per-image activation workspace. Loaded here so
+    // a bad `--mmproj` fails startup rather than the first image request.
+    let tower = match cfg.mmproj_path.as_deref() {
+        None => None,
+        Some(path) => {
+            if vocab
+                .lookup_token_id(v4flash_vision::IMAGE_PLACEHOLDER)
+                .is_none()
+            {
+                return Err(eyre!(
+                    "--mmproj {} was given but the text GGUF has no `{}` token \
+                     (not a Vision-Exp checkpoint)",
+                    path.display(),
+                    v4flash_vision::IMAGE_PLACEHOLDER
+                ));
+            }
+            // The router needs the `bias_vl` sidecar for every image row.
+            // Check it HERE: otherwise the first image request dies deep
+            // inside layer-0 prefill as a 500, after part of the chunk's
+            // KV has already been appended.
+            if !weights.has_bias_vl() {
+                let where_ = v4flash_kernels::het::weights::bias_vl_sidecar_path(std::path::Path::new(
+                    &cfg.gguf_path,
+                ));
+                return Err(eyre!(
+                    "--mmproj {} was given but the `bias_vl` routing-bias sidecar was not \
+                     loaded (expected at {}). Generate it with scripts/fetch_bias_vl.py, or \
+                     point DEEPSTRIX_BIAS_VL_FILE at it. Image requests cannot be routed \
+                     without it.",
+                    path.display(),
+                    where_
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<unresolvable>".into()),
+                ));
+            }
+            // The attention score scratch is sized for text raw windows;
+            // image rows widen them. Refuse at launch rather than
+            // mid-prefill if --ctx makes that overrun.
+            v4flash_kernels::attention::check_vision_ctx_fits(cfg.n_kv_max)?;
+            tracing::info!(mmproj = %path.display(), "loading vision tower (iGPU)");
+            let t0 = std::time::Instant::now();
+            let mut tower = v4flash_vision::Tower::load(path, igpu)
+                .map_err(|e| eyre!("loading mmproj {}: {e:#}", path.display()))?;
+            // Host mirror is only needed for requantisation experiments;
+            // drop it so the worker doesn't sit on ~0.9 GiB of host RAM.
+            tower.drop_host();
+            tracing::info!(
+                mib = tower.device_bytes() / (1024 * 1024),
+                elapsed_s = t0.elapsed().as_secs_f64(),
+                "vision tower loaded"
+            );
+            dgpu.set_current()?;
+            Some(tower)
+        }
+    };
+
     // Compute model fingerprint and load (or create) the snapshot index.
     let fingerprint =
         ModelFingerprint::compute(vocab.vocab_size() as u32, &token_embd_bytes, gguf.gguf());
@@ -499,6 +634,8 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         token_embd_bytes,
         token_embd_dtype,
         byte_decoder,
+        tower,
+        vit_rows: Vec::new(),
         state,
         dgpu_scratch,
         igpu_scratch,
@@ -562,9 +699,31 @@ struct AlignedLcp {
     first_bridge: Option<(i32, i32)>,
 }
 
+/// Text-only convenience wrapper (the shape the pre-vision tests use).
+#[cfg(test)]
 fn byte_aligned_lcp(
     live: &[i32],
     req: &[i32],
+    vocab: &BpeVocab,
+    byte_decoder: &std::collections::HashMap<char, u8>,
+) -> AlignedLcp {
+    byte_aligned_lcp_vl(live, &[], req, &[], vocab, byte_decoder)
+}
+
+/// [`byte_aligned_lcp`] for streams that may contain image blocks.
+///
+/// Synthetic image ids have no vocab text, so a plain decode would make
+/// EVERY image block contribute zero bytes and two different pictures
+/// would compare equal. Both sides therefore decode through
+/// `synthetic_token_bytes`, which emits a per-type marker and folds the
+/// image's content hash in at its IMAGE_START. The id fast-path gets the
+/// same treatment: two IMAGE_START tokens are only "the same token" when
+/// their spans carry the same hash.
+fn byte_aligned_lcp_vl(
+    live: &[i32],
+    live_spans: &[ImageSpan],
+    req: &[i32],
+    req_spans: &[ImageSpan],
     vocab: &BpeVocab,
     byte_decoder: &std::collections::HashMap<char, u8>,
 ) -> AlignedLcp {
@@ -574,7 +733,10 @@ fn byte_aligned_lcp(
         bridged_tokens: 0,
         first_bridge: None,
     };
-    let decode = |id: i32| -> Vec<u8> {
+    let decode_at = |spans: &[ImageSpan], idx: usize, id: i32| -> Vec<u8> {
+        if let Some(b) = synthetic_token_bytes(id, span_hash_at(spans, idx)) {
+            return b;
+        }
         vocab
             .token_text(id)
             .map(|b| gpt2_decode_token(b, byte_decoder))
@@ -603,15 +765,20 @@ fn byte_aligned_lcp(
             if li >= live.len() || ri >= req.len() {
                 break;
             }
-            if live[li] == req[ri] {
+            // Same id AND (for image slots) the same image. Only
+            // IMAGE_START carries a hash, so this is a no-op everywhere
+            // else.
+            if live[li] == req[ri]
+                && span_hash_at(live_spans, li) == span_hash_at(req_spans, ri)
+            {
                 li += 1;
                 ri += 1;
                 continue;
             }
             // Different ids — start byte-buffering both sides.
             let (l_id, r_id) = (live[li], req[ri]);
-            live_buf = decode(l_id);
-            req_buf = decode(r_id);
+            live_buf = decode_at(live_spans, li, l_id);
+            req_buf = decode_at(req_spans, ri, r_id);
             li += 1;
             ri += 1;
             if first_bridge.is_none() {
@@ -642,7 +809,7 @@ fn byte_aligned_lcp(
                 break;
             }
             let l_id = live[li];
-            live_buf.extend(decode(l_id));
+            live_buf.extend(decode_at(live_spans, li, l_id));
             li += 1;
             bridged_in_round += 1;
         } else {
@@ -652,7 +819,7 @@ fn byte_aligned_lcp(
                 break;
             }
             let r_id = req[ri];
-            req_buf.extend(decode(r_id));
+            req_buf.extend(decode_at(req_spans, ri, r_id));
             ri += 1;
             bridged_in_round += 1;
         }
@@ -758,6 +925,70 @@ mod tests {
         assert_eq!(res.live_tokens, 3, "LCP must stop where bytes diverge");
         assert_eq!(res.req_tokens, 3);
         assert_eq!(res.bridged_tokens, 0);
+    }
+
+    // ---- vision: per-request encoded rows + span rebasing --------
+
+    fn span(start: u32, len: u32, seed: u8) -> ImageSpan {
+        ImageSpan { start, len, hash: [seed; 32] }
+    }
+
+    #[test]
+    fn encoded_images_row_at_covers_exactly_the_block() {
+        let n_embd = N_EMBD as usize;
+        // Two blocks: [10, 14) and [40, 43).
+        let vl = EncodedImages {
+            blocks: vec![
+                (10, 4, (0..4 * n_embd).map(|i| i as f32).collect()),
+                (40, 3, (0..3 * n_embd).map(|i| -(i as f32)).collect()),
+            ],
+            spans: vec![span(11, 3, 1), span(40, 3, 2)],
+        };
+        for i in 0..50usize {
+            let in_block = (10..14).contains(&i) || (40..43).contains(&i);
+            assert_eq!(vl.row_at(i).is_some(), in_block, "idx {i}");
+        }
+        // Rows are handed out in block order, one per block token.
+        assert_eq!(vl.row_at(10).unwrap()[0], 0.0);
+        assert_eq!(vl.row_at(11).unwrap()[0], n_embd as f32);
+        assert_eq!(vl.row_at(13).unwrap()[0], (3 * n_embd) as f32);
+        assert_eq!(vl.row_at(41).unwrap()[0], -(n_embd as f32));
+        assert_eq!(vl.row_at(10).unwrap().len(), n_embd);
+        assert!(EncodedImages::default().row_at(0).is_none());
+    }
+
+    #[test]
+    fn spans_rebase_to_absolute_kv_positions() {
+        use crate::vision_prompt::spans_in_range;
+        let spans = vec![span(10, 4, 1), span(40, 3, 2)];
+        // Suffix req.tokens[8..50] prefilled at KV pos 100: block starts
+        // move to 100 + (10 - 8) = 102 and 100 + (40 - 8) = 132.
+        let (base, pos0) = (8usize, 100u32);
+        let abs: Vec<(u32, u32)> = spans_in_range(&spans, base, 50)
+            .unwrap()
+            .iter()
+            .map(|s| (s.start + pos0, s.len))
+            .collect();
+        assert_eq!(abs, vec![(102, 4), (132, 3)]);
+        // Spans entirely before the range drop out.
+        let abs2: Vec<(u32, u32)> = spans_in_range(&spans, 20, 50)
+            .unwrap()
+            .iter()
+            .map(|s| (s.start, s.len))
+            .collect();
+        assert_eq!(abs2, vec![(20, 3)]);
+        // A boundary cutting a block is a hard error, both edges.
+        assert!(spans_in_range(&spans, 12, 50).is_err());
+        assert!(spans_in_range(&spans, 0, 42).is_err());
+    }
+
+    #[test]
+    fn spans_from_keeps_only_the_suffix_blocks() {
+        let spans = vec![span(10, 4, 1), span(40, 3, 2)];
+        assert_eq!(spans_from(&spans, 0), spans);
+        assert_eq!(spans_from(&spans, 11), vec![span(40, 3, 2)]);
+        assert_eq!(spans_from(&spans, 41), Vec::<ImageSpan>::new());
+        assert_eq!(shift_spans(&spans_from(&spans, 11), -5), vec![span(35, 3, 2)]);
     }
 
     /// The interesting case: live and req represent the same TEXT but
@@ -930,10 +1161,12 @@ fn save_live_if_dirty(state: &mut WorkerState) {
         return;
     }
     let tokens = live.tokens.clone();
+    let image_spans = live.image_spans.clone();
     let session_id = live.session_id.clone();
     match snapshot::save(
         &state.state,
         &tokens,
+        &image_spans,
         state.dgpu,
         state.igpu,
         &state.model_fingerprint,
@@ -1028,6 +1261,18 @@ fn handle_generate_stream(
         req.tokens.truncate(req.tokens.len() - 1);
     }
 
+    // Vision-Exp: run the ViT + aligner once for every image in this
+    // request, up front. The result is a 4096-d row per BLOCK token
+    // (aligner rows at IMAGE slots, sentinel vectors at START / PAD /
+    // NEWLINE / END), which `prefill_suffix` broadcasts into HC_DIM the
+    // same way `embed_lookup` does for text. Doing it here — before any
+    // cache decision — means a tower failure is reported before we
+    // disturb the KV cache. Repeat turns of the same conversation do NOT
+    // re-run the ViT: `encode_request_images` memoises the aligner rows
+    // by content hash (`WorkerState::vit_rows`), so a replayed image
+    // costs only the host-side `place_rows` scatter.
+    let vl = encode_request_images(state, &req)?;
+
     // KV-cache reuse decision. There are three cases:
     //   1. No live session, or new request diverges from live mid-prefix:
     //        reset in place, full prefill from pos=0.
@@ -1041,9 +1286,11 @@ fn handle_generate_stream(
     // a `(live, req)` byte-aligned match can have different token counts.
     let (lcp_live, lcp_req, live_len) = match &state.live {
         Some(live) => {
-            let res = byte_aligned_lcp(
+            let res = byte_aligned_lcp_vl(
                 &live.tokens,
+                &live.image_spans,
                 &req.tokens,
+                &req.image_spans,
                 state.vocab.as_ref(),
                 &state.byte_decoder,
             );
@@ -1074,6 +1321,7 @@ fn handle_generate_stream(
             .and_then(|sid| state.snapshot_index.lookup_session(sid, &req.tokens));
         let disk_hit_walk = state.snapshot_index.find_longest_prefix(
             &req.tokens,
+            &req.image_spans,
             TOK_EOS,
             TOK_ASSISTANT,
             TOK_USER,
@@ -1099,22 +1347,36 @@ fn handle_generate_stream(
             if snap_req_tokens >= DISK_RESTORE_MIN_TOKENS {
                 save_live_if_dirty(state);
                 state.state.reset_in_place(state.dgpu, state.igpu)?;
-                let loaded = snapshot::restore(
+                // `state.live` no longer describes the KV cache from
+                // here on. Clear it BEFORE the restore + suffix prefill
+                // so an error out of either (missing bias_vl, a span
+                // straddle, a tower row-count mismatch) can't leave the
+                // next request computing its LCP against a session that
+                // was thrown away — the full-prefill branch below does
+                // the same thing.
+                state.live = None;
+                let restored = snapshot::restore_vl(
                     &mut state.state,
                     &snap_dir,
                     state.dgpu,
                     state.igpu,
                     &state.model_fingerprint,
                 )?;
+                let crate::snapshot::RestoredSnapshot {
+                    tokens: loaded,
+                    image_spans: loaded_spans,
+                } = restored;
                 let loaded_len = loaded.len() as u32;
                 // Verify the snapshot's BYTE stream is actually a prefix
                 // of req. With byte-hashed keys (format v2) this should
                 // always be true when find_longest_prefix returned this
                 // entry; the session-hint path bypasses that check so
                 // we re-verify here.
-                let verify = byte_aligned_lcp(
+                let verify = byte_aligned_lcp_vl(
                     &loaded,
+                    &loaded_spans,
                     &req.tokens,
+                    &req.image_spans,
                     state.vocab.as_ref(),
                     &state.byte_decoder,
                 );
@@ -1176,7 +1438,9 @@ fn handle_generate_stream(
                         prefill_suffix(
                             state,
                             &req.tokens[verify.req_tokens..],
+                            verify.req_tokens,
                             loaded_len,
+                            &vl,
                             Some(&cancel),
                         )?;
                         if cancel.load(Ordering::Relaxed) {
@@ -1199,8 +1463,17 @@ fn handle_generate_stream(
                         Vec::with_capacity(loaded.len() + suffix_len);
                     new_tokens.extend_from_slice(&loaded);
                     new_tokens.extend_from_slice(&req.tokens[verify.req_tokens..]);
+                    // Live spans = the snapshot's own (already in loaded
+                    // index space) plus the request's suffix spans,
+                    // shifted into it.
+                    let mut new_spans = loaded_spans.clone();
+                    new_spans.extend(shift_spans(
+                        &spans_from(&req.image_spans, verify.req_tokens),
+                        loaded.len() as i64 - verify.req_tokens as i64,
+                    ));
                     state.live = Some(LiveSession {
                         tokens: new_tokens,
+                        image_spans: new_spans,
                         pos: new_pos,
                         dirty: true,
                         session_id: session_id.clone(),
@@ -1276,9 +1549,18 @@ fn handle_generate_stream(
             .iter()
             .position(|&t| t == TOK_USER)
             .map(|i| i + 1)
-            .filter(|&n| n >= DISK_RESTORE_MIN_TOKENS && n < req.tokens.len());
+            .filter(|&n| n >= DISK_RESTORE_MIN_TOKENS && n < req.tokens.len())
+            // An image block must be prefilled inside one KV-visible
+            // unit, so never split the prompt THROUGH one. This is a
+            // straddle test, not a "no images on either side" test: a
+            // cut with one image before it and another after it is
+            // perfectly legal, and rejecting it would silently disable
+            // the system-prefix snapshot (the 28.0s -> 1.1s win) for
+            // every multi-image conversation. Image blocks live after
+            // `<User>` today, so this should never fire at all.
+            .filter(|&n| !crate::vision_prompt::spans_straddle(&req.image_spans, n));
         if let Some(n) = sys_prefix_len {
-            prefill_suffix(state, &req.tokens[..n], 0, Some(&cancel))?;
+            prefill_suffix(state, &req.tokens[..n], 0, 0, &vl, Some(&cancel))?;
             if cancel.load(Ordering::Relaxed) {
                 tracing::info!(
                     fp = %state_fingerprint(state),
@@ -1293,6 +1575,13 @@ fn handle_generate_stream(
             // more it's reused, the safer it is from eviction.
             state.live = Some(LiveSession {
                 tokens: req.tokens[..n].to_vec(),
+                // `?`, not `unwrap_or_default()`: silently dropping the
+                // spans would strip the content hashes out of the saved
+                // snapshot's byte stream, and two different pictures
+                // with the same block layout would then key to the same
+                // hash. The filter above makes a straddle impossible.
+                image_spans: crate::vision_prompt::spans_in_range(&req.image_spans, 0, n)
+                    .wrap_err("system-prefix split cuts through an image block")?,
                 pos: n as u32,
                 dirty: true,
                 session_id: None,
@@ -1305,7 +1594,14 @@ fn handle_generate_stream(
             );
         }
         let (resume_from, pos0) = sys_prefix_len.map_or((0, 0u32), |n| (n, n as u32));
-        prefill_suffix(state, &req.tokens[resume_from..], pos0, Some(&cancel))?;
+        prefill_suffix(
+            state,
+            &req.tokens[resume_from..],
+            resume_from,
+            pos0,
+            &vl,
+            Some(&cancel),
+        )?;
         if cancel.load(Ordering::Relaxed) {
             tracing::info!(
                 fp = %state_fingerprint(state),
@@ -1339,7 +1635,7 @@ fn handle_generate_stream(
             mode = "extend",
             "prefill"
         );
-        prefill_suffix(state, suffix, pos0, Some(&cancel))?;
+        prefill_suffix(state, suffix, lcp_req, pos0, &vl, Some(&cancel))?;
         if cancel.load(Ordering::Relaxed) {
             tracing::info!(
                 fp = %state_fingerprint(state),
@@ -1373,17 +1669,40 @@ fn handle_generate_stream(
     // The live.tokens we record: take live's prefix [..lcp_live] + req's
     // suffix [lcp_req..]. The prefix is what's actually in the KV cache;
     // the suffix is what we just forwarded.
-    let new_live_tokens: Vec<i32> = match &state.live {
+    let rebuilt: eyre::Result<(Vec<i32>, Vec<ImageSpan>)> = match &state.live {
         Some(l) if lcp_live > 0 => {
             let mut v = Vec::with_capacity(lcp_live + suffix_extend);
             v.extend_from_slice(&l.tokens[..lcp_live]);
             v.extend_from_slice(&req.tokens[lcp_req..]);
-            v
+            // `?`, not `unwrap_or_default()`. A straddle means the
+            // byte-aligned LCP stopped INSIDE an image block; dropping
+            // the spans would leave `live.tokens` carrying image ids
+            // with no content hashes, and then both the live LCP and the
+            // snapshot key would treat two different pictures with the
+            // same layout as identical bytes. That is precisely the
+            // aliasing the span hashes exist to prevent, so fail loudly.
+            crate::vision_prompt::spans_in_range(&l.image_spans, 0, lcp_live).map(|mut sp| {
+                sp.extend(shift_spans(
+                    &spans_from(&req.image_spans, lcp_req),
+                    lcp_live as i64 - lcp_req as i64,
+                ));
+                (v, sp)
+            })
         }
-        _ => req.tokens.clone(),
+        _ => Ok((req.tokens.clone(), req.image_spans.clone())),
+    };
+    let (new_live_tokens, new_live_spans) = match rebuilt {
+        Ok(v) => v,
+        Err(e) => {
+            // The KV cache is fine but we cannot describe it honestly.
+            // Drop the session so the next request reset-prefills.
+            state.live = None;
+            return Err(e).wrap_err("live image spans straddle the byte-aligned LCP");
+        }
     };
     state.live = Some(LiveSession {
         tokens: new_live_tokens,
+        image_spans: new_live_spans,
         pos: new_pos,
         // Force dirty=true so save_and_forward_marker below actually
         // writes. State is canonical (no `<think>` baked in) AND new
@@ -1793,21 +2112,210 @@ fn finish_decode(
 /// `cancel` is checked at chunk boundary inside the engine; on trip,
 /// the call returns Ok early and the caller is responsible for
 /// observing the bool and unwinding (clearing `live`, no events).
+/// Spans of `spans` whose START is at or after `from`, unshifted.
+/// (Companion to `shift_spans`; the caller applies the delta.)
+fn spans_from(spans: &[ImageSpan], from: usize) -> Vec<ImageSpan> {
+    spans
+        .iter()
+        .filter(|s| s.start as usize >= from)
+        .cloned()
+        .collect()
+}
+
+/// Tower output for one request: a 4096-d embedding row per image-block
+/// token, keyed by the block's position in `GenerateReq::tokens`.
+#[derive(Default)]
+struct EncodedImages {
+    /// `(block_start, block_len, rows)` where `rows` is
+    /// `block_len * N_EMBD` f32 in block order — aligner rows at IMAGE
+    /// slots, sentinel vectors at PAD / START / NEWLINE / END.
+    blocks: Vec<(usize, usize, Vec<f32>)>,
+    /// The request's spans, in `tokens` index space.
+    spans: Vec<ImageSpan>,
+}
+
+impl EncodedImages {
+    /// The 4096-d row for token index `i`, when `i` is an image slot.
+    fn row_at(&self, i: usize) -> Option<&[f32]> {
+        let n_embd = N_EMBD as usize;
+        self.blocks.iter().find_map(|(start, len, rows)| {
+            (i >= *start && i < start + len).then(|| {
+                let k = i - start;
+                &rows[k * n_embd..(k + 1) * n_embd]
+            })
+        })
+    }
+}
+
+/// How many `Tower::encode_rows` results `WorkerState::vit_rows` keeps.
+/// Four covers a conversation carrying a handful of images without
+/// holding more than ~25 MiB of host RAM.
+const VIT_ROW_CACHE_MAX: usize = 4;
+
+/// Run the ViT + aligner for every image in `req`. No-op (and no tower
+/// required) for text-only requests.
+///
+/// DEVICE DISCIPLINE: `Tower::encode_rows` sets the iGPU current on this
+/// thread and leaves it there. Every text path below assumes the dGPU is
+/// current, and `HeterogeneousEngine::set_current_cached` skips the
+/// driver call whenever its cached id already says "dGPU" — so returning
+/// with the iGPU current would make the NEXT request's decode kernels
+/// launch under the wrong context (`forward_token` only calls
+/// `set_current_cached`; the batched prefill entry points force a reset).
+/// The restore therefore runs on EVERY exit, success or failure, and we
+/// invalidate the engine's cache because the tower changed the thread's
+/// device behind its back.
+fn encode_request_images(
+    state: &mut WorkerState,
+    req: &GenerateReq,
+) -> eyre::Result<EncodedImages> {
+    if req.images.is_empty() {
+        return Ok(EncodedImages::default());
+    }
+    let r = encode_request_images_inner(state, req);
+    state.engine.invalidate_device_cache();
+    match (r, state.dgpu.set_current()) {
+        (Ok(v), Ok(())) => Ok(v),
+        (Err(e), _) => Err(e),
+        (Ok(_), Err(e)) => {
+            Err(eyre!("restoring the dGPU as current after a vision encode: {e:#}"))
+        }
+    }
+}
+
+/// The body of [`encode_request_images`]. May return with the iGPU
+/// current — the caller restores unconditionally.
+fn encode_request_images_inner(
+    state: &mut WorkerState,
+    req: &GenerateReq,
+) -> eyre::Result<EncodedImages> {
+    if req.images.len() != req.image_spans.len() {
+        return Err(eyre!(
+            "generate: {} images but {} image spans",
+            req.images.len(),
+            req.image_spans.len()
+        ));
+    }
+    if state.tower.is_none() {
+        return Err(eyre!(
+            "request carries images but no vision tower is loaded (start with --mmproj)"
+        ));
+    }
+    let mut blocks = Vec::with_capacity(req.images.len());
+    for (k, img) in req.images.iter().enumerate() {
+        let t0 = std::time::Instant::now();
+        let hash = img.image.content_hash;
+        // ViT rows depend only on the normalised pixels, so the memo key
+        // is the content hash; the block LAYOUT (which varies with the
+        // image's position in the prompt) is applied afterwards by the
+        // cheap host-side `place_rows` scatter.
+        let hit = state.vit_rows.iter().position(|(h, _)| *h == hash);
+        let aligner = match hit {
+            Some(i) => {
+                let e = state.vit_rows.remove(i);
+                let rows = std::sync::Arc::clone(&e.1);
+                state.vit_rows.insert(0, e);
+                rows
+            }
+            None => {
+                let tower = state.tower.as_mut().expect("checked above");
+                let rows = std::sync::Arc::new(
+                    tower
+                        .encode_rows(&img.image)
+                        .map_err(|e| eyre!("vision tower encode (image {k}): {e:#}"))?,
+                );
+                state.vit_rows.insert(0, (hash, std::sync::Arc::clone(&rows)));
+                state.vit_rows.truncate(VIT_ROW_CACHE_MAX);
+                rows
+            }
+        };
+        let tower = state.tower.as_ref().expect("checked above");
+        let rows = tower
+            .place_rows(&img.layout, &aligner)
+            .map_err(|e| eyre!("vision tower place_rows (image {k}): {e:#}"))?;
+        let want = img.block_len() * N_EMBD as usize;
+        if rows.len() != want {
+            return Err(eyre!(
+                "vision tower returned {} floats for image {k}, expected {want}",
+                rows.len()
+            ));
+        }
+        tracing::info!(
+            image = k,
+            cached = hit.is_some(),
+            vit = format!("{}x{}", img.image.n_vit_h, img.image.n_vit_w),
+            llm = format!("{}x{}", img.layout.n_llm_h, img.layout.n_llm_w),
+            block_tokens = img.block_len(),
+            ms = t0.elapsed().as_millis() as u64,
+            "encoded image"
+        );
+        blocks.push((img.block_start(), img.block_len(), rows));
+    }
+    Ok(EncodedImages {
+        blocks,
+        spans: req.image_spans.clone(),
+    })
+}
+
+/// Prefill `tokens`, which are `req.tokens[base_idx .. base_idx + len]`,
+/// into KV positions starting at `pos0`.
+///
+/// `vl` supplies the vision embedding rows (image slots) and the image
+/// spans; spans overlapping this range are rebased to absolute KV
+/// positions and handed to the engine, which keeps every span inside one
+/// chunk AND one pipeline lane (`het::image_spans::plan_chunk`). A range
+/// boundary that cuts through a block is a hard error here — the callers
+/// above choose their boundaries so that cannot happen.
 fn prefill_suffix(
     state: &mut WorkerState,
     tokens: &[i32],
+    base_idx: usize,
     pos0: u32,
+    vl: &EncodedImages,
     cancel: Option<&AtomicBool>,
 ) -> eyre::Result<()> {
     if tokens.is_empty() {
         return Ok(());
     }
+    let n_embd = N_EMBD as usize;
     let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
-    for &tok in tokens {
+    for (i, &tok) in tokens.iter().enumerate() {
         let mut v = vec![0f32; HC_DIM as usize];
-        embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, tok, &mut v);
+        match vl.row_at(base_idx + i) {
+            Some(row) => {
+                if !crate::vision_prompt::is_image_token(tok) {
+                    return Err(eyre!(
+                        "prefill: token {tok} at index {} is not an image id but sits inside an \
+                         image block",
+                        base_idx + i
+                    ));
+                }
+                // Broadcast the vision row into the 4 HC copies — exactly
+                // what `embed_lookup` does after dequantising a text row.
+                for h in 0..N_HC as usize {
+                    v[h * n_embd..(h + 1) * n_embd].copy_from_slice(row);
+                }
+            }
+            None => {
+                if crate::vision_prompt::is_image_token(tok) {
+                    return Err(eyre!(
+                        "prefill: synthetic image token {tok} at index {} has no encoded row \
+                         (image block missing from the request)",
+                        base_idx + i
+                    ));
+                }
+                embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, tok, &mut v);
+            }
+        }
         input_hcs.push(v);
     }
+    // Rebase the request's spans onto absolute KV positions.
+    let spans_abs: Vec<(u32, u32)> =
+        crate::vision_prompt::spans_in_range(&vl.spans, base_idx, base_idx + tokens.len())?
+            .iter()
+            .map(|s| (s.start + pos0, s.len))
+            .collect();
+    let image_spans = (!spans_abs.is_empty()).then_some(spans_abs.as_slice());
     // Clone the progress handle into a local so the per-chunk pet
     // closure doesn't co-borrow `state` with state.engine below.
     // WorkerProgress is two Arc clones — effectively free.
@@ -1830,6 +2338,7 @@ fn prefill_suffix(
         None,
         cancel,
         Some(&pet_each_chunk),
+        image_spans,
     )?;
     Ok(())
 }

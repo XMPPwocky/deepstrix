@@ -42,6 +42,7 @@ use crate::openai::types::{
     ToolCallFunction, Usage,
 };
 use crate::prompt::{render_prompt, ReasoningEffort};
+use crate::vision_prompt::{expand_images, VlPrompt};
 
 const DEFAULT_TEMPERATURE: f32 = 1.0;
 const DEFAULT_MIN_P_REL: f32 = 0.0;
@@ -77,13 +78,48 @@ pub async fn chat_completions(
         req.reasoning_effort.as_deref(),
     )
     .map_err(ApiError::BadRequest)?;
+    // Vision-Exp: image parts are allowed only when the worker loaded a
+    // tower (`--mmproj`) AND the vocab has the placeholder token. Reject
+    // up front with a clear 400 rather than failing inside the worker.
+    let has_images = req.messages.iter().any(|m| m.has_images());
+    if has_images && !engine.vision_enabled {
+        return Err(ApiError::BadRequest(
+            "request contains image parts but this server has no vision tower loaded \
+             (start with --mmproj <mmproj-F16.gguf> on a Vision-Exp GGUF)"
+                .to_string(),
+        ));
+    }
     let tokens = render_prompt(
         &engine.vocab,
         &req.messages,
         req.tools.as_deref(),
         effort,
+        engine.image_placeholder_id,
     )
     .map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
+    // Expand each placeholder into its synthetic image block (decode +
+    // resize + layout; CPU-only, ~10-100 ms per image). Also validates the
+    // image sources: http(s) URLs / bad base64 / denied paths → 400.
+    //
+    // PNG/JPEG decode plus a scalar bicubic resample is tens of ms of
+    // pure CPU, so it must not run inline on the async task —
+    // `block_in_place` hands this worker's other tasks to a sibling
+    // thread for the duration (needs the multi-thread runtime, which
+    // `main`'s `#[tokio::main]` gives us). Cheaper than `spawn_blocking`
+    // here because it borrows `req` instead of cloning every payload.
+    let vl = if has_images {
+        let inputs: Vec<&crate::openai::types::ImageInput> =
+            req.messages.iter().flat_map(|m| m.images()).collect();
+        let placeholder = engine
+            .image_placeholder_id
+            .expect("vision_enabled implies placeholder id");
+        let policy = engine.image_policy.clone();
+        tokio::task::block_in_place(|| expand_images(tokens, &inputs, placeholder, &policy))
+            .map_err(|e| ApiError::BadRequest(format!("{e:#}")))?
+    } else {
+        VlPrompt { tokens, images: Vec::new(), spans: Vec::new() }
+    };
+    let VlPrompt { tokens, images, spans: image_spans } = vl;
     let prompt_tokens_count = tokens.len() as u32;
 
     // Up-front ctx check. Without this, an over-long prompt
@@ -112,6 +148,8 @@ pub async fn chat_completions(
 
     let gen_req = GenerateReq {
         tokens,
+        images,
+        image_spans,
         max_new,
         temperature,
         min_p_rel: DEFAULT_MIN_P_REL,
@@ -200,6 +238,7 @@ pub async fn chat_completions(
                 message: ChatMessage {
                     role: Role::Assistant,
                     content,
+                    parts: Vec::new(),
                     tool_calls,
                     tool_call_id: None,
                     name: None,

@@ -572,6 +572,7 @@ fn main() -> eyre::Result<()> {
             None, // stats
             None, // cancel
             None, // on_chunk_done
+            None, // image_spans
         )?;
         pos += turn_tokens.len() as u32;
         let prefill_secs = t0.elapsed().as_secs_f64();

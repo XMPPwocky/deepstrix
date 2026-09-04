@@ -29,8 +29,10 @@ use crate::config::{
     N_INDEXER_HEAD_DIM, N_LAYER, N_LORA_Q, N_ROT, N_VOCAB, OUT_LOW, Q_FLAT, RANK, RMS_EPS,
     SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW,
 };
-use crate::attention::ATTN_MIXED_MAX_KEYS;
+use crate::attention::{ATTN_MIXED_MAX_KEYS, ATTN_SWA_BATCHED_MAX_KV};
 use crate::routing::hash_router_select;
+
+use super::image_spans::{self, ImageSpan};
 
 use super::batch_scratch::{
     BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared, B_MAX,
@@ -133,6 +135,23 @@ fn check_scratch_rows(
     Ok(())
 }
 
+/// Per-row visibility for a batch, or `None` when no span touches it (the
+/// all-text fast path, bit-identical to the pre-vision code). Errors if a
+/// span straddles the batch — see `image_spans::rows_visibility`.
+fn chunk_visibility(pos0: u32, b: usize, spans: &[ImageSpan]) -> eyre::Result<Option<Vec<(u32, u32)>>> {
+    if spans.is_empty() {
+        return Ok(None);
+    }
+    let vis = image_spans::rows_visibility(pos0, b, spans)?;
+    if vis.iter().all(|&(l, r)| l == 0 && r == 0) {
+        // Spans exist elsewhere in the prompt but none inside this batch.
+        // (A 1-token span is impossible — validate_spans requires len >= 2 —
+        // so all-(0,0) really means "no image rows here".)
+        return Ok(None);
+    }
+    Ok(Some(vis))
+}
+
 impl HeterogeneousEngine {
     /// Layer-major batched prefill using batched kernels.
     ///
@@ -163,6 +182,11 @@ impl HeterogeneousEngine {
         tokens: &[i32],
         pos0: u32,
         mut stats: Option<&mut PrefillStats>,
+        // Vision-Exp: `(start_pos, len)` of every `[IMAGE_START ..
+        // IMAGE_END]` span in the prompt (absolute positions; spans that
+        // don't touch this chunk are ignored). A span that straddles the
+        // chunk is an error. `None` == text-only (bit-identical to before).
+        image_spans: Option<&[ImageSpan]>,
     ) -> eyre::Result<()> {
         let b = tokens.len();
         if b == 0 {
@@ -174,6 +198,8 @@ impl HeterogeneousEngine {
                 input_hcs.len()
             ));
         }
+        let spans = image_spans.unwrap_or(&[]);
+        let vis = chunk_visibility(pos0, b, spans)?;
         for (i, hc) in input_hcs.iter().enumerate() {
             if hc.len() != HC_DIM as usize {
                 return Err(eyre!(
@@ -223,6 +249,7 @@ impl HeterogeneousEngine {
                 &weights.igpu_layers[layer],
                 pos0,
                 tokens,
+                vis.as_deref(),
                 stats.as_deref_mut(),
             )?;
             // Swap residual / residual_next for the next layer: the
@@ -273,6 +300,10 @@ impl HeterogeneousEngine {
         tokens: &[i32],
         pos0: u32,
         stats: Option<&mut PrefillStats>,
+        // See `forward_prompt_batch_v2`. Each LANE is a KV-visible unit
+        // (lane A's post-attention eviction runs before lane B appends),
+        // so the lane cut is moved off any image span — `lane_split`.
+        image_spans: Option<&[ImageSpan]>,
     ) -> eyre::Result<()> {
         let b = tokens.len();
         if b == 0 {
@@ -287,10 +318,11 @@ impl HeterogeneousEngine {
         // For chunks too small to bother pipelining, fall back to single-lane.
         if b < 2 {
             return self.forward_prompt_batch_v2(
-                bd_a, bi_a, sd, si, state, weights, input_hcs, tokens, pos0, stats,
+                bd_a, bi_a, sd, si, state, weights, input_hcs, tokens, pos0, stats, image_spans,
             );
         }
-        let b_a = b.div_ceil(2);
+        let spans = image_spans.unwrap_or(&[]);
+        let b_a = image_spans::lane_split(pos0, b, spans, bd_a.rows, bd_b.rows)?;
         let b_b = b - b_a;
         // Lane and shared scratches are usually allocated at
         // B_MAX.div_ceil(2) rows (see BatchDgpuScratch::alloc_rows); never
@@ -303,6 +335,8 @@ impl HeterogeneousEngine {
         let input_b = &input_hcs[b_a..];
         let pos0_a = pos0;
         let pos0_b = pos0 + b_a as u32;
+        let vis_a = chunk_visibility(pos0_a, b_a, spans)?;
+        let vis_b = chunk_visibility(pos0_b, b_b, spans)?;
 
         self.current_device
             .store(-1, std::sync::atomic::Ordering::Relaxed);
@@ -359,6 +393,7 @@ impl HeterogeneousEngine {
             &weights.igpu_layers[layer0],
             pos0_a,
             tokens_a,
+            vis_a.as_deref(),
             stats_a.as_deref_mut(),
             &self.sync_events.layers[layer0],
         )?;
@@ -372,6 +407,7 @@ impl HeterogeneousEngine {
             &weights.igpu_layers[layer0],
             pos0_b,
             tokens_b,
+            vis_b.as_deref(),
             None,
             &self.sync_events_t1.layers[layer0],
         )?;
@@ -402,6 +438,7 @@ impl HeterogeneousEngine {
                 &weights.igpu_layers[layer + 1],
                 pos0_a,
                 tokens_a,
+                vis_a.as_deref(),
                 stats_a.as_deref_mut(),
                 &self.sync_events.layers[layer + 1],
             )?;
@@ -419,6 +456,7 @@ impl HeterogeneousEngine {
                 &weights.igpu_layers[layer + 1],
                 pos0_b,
                 tokens_b,
+                vis_b.as_deref(),
                 None,
                 &self.sync_events_t1.layers[layer + 1],
             )?;
@@ -472,6 +510,9 @@ impl HeterogeneousEngine {
         pos0: u32,
         last_only: bool,
         mut stats: Option<&mut PrefillStats>,
+        // Vision-Exp image spans (absolute `(start_pos, len)`); chunk
+        // boundaries are moved so no span straddles a chunk.
+        image_spans: Option<&[ImageSpan]>,
     ) -> eyre::Result<Vec<f32>> {
         let t = tokens.len();
         if t == 0 {
@@ -483,6 +524,8 @@ impl HeterogeneousEngine {
                 input_hcs.len()
             ));
         }
+        let spans = image_spans.unwrap_or(&[]);
+        image_spans::validate_spans(spans, pos0, t)?;
         let chunk_size = B_MAX;
         // Single-lane driver: every chunk (up to B_MAX rows) runs through
         // ONE lane + ONE shared set, so all four must be allocated at full
@@ -499,7 +542,8 @@ impl HeterogeneousEngine {
 
         let mut chunk_start = 0usize;
         while chunk_start < t {
-            let chunk_end = (chunk_start + chunk_size).min(t);
+            let (chunk_end, _) =
+                image_spans::plan_chunk(pos0, chunk_start, t, chunk_size, None, spans)?;
             let chunk_b = chunk_end - chunk_start;
             let is_last_chunk = chunk_end == t;
             let chunk_input = &input_hcs[chunk_start..chunk_end];
@@ -521,6 +565,7 @@ impl HeterogeneousEngine {
                 chunk_tokens,
                 chunk_pos0,
                 stats.as_deref_mut(),
+                image_spans,
             )?;
 
             // After this chunk: if perfetto is attached, emit slices + re-anchor.
@@ -614,6 +659,12 @@ impl HeterogeneousEngine {
         // chunks can take many seconds and per-call petting would
         // false-fire the watchdog mid-chunk.
         on_chunk_done: Option<&dyn Fn()>,
+        // Vision-Exp image spans (absolute `(start_pos, len)`, sorted,
+        // non-overlapping). Chunk ends AND the lane cut inside each chunk
+        // are moved off spans (`image_spans::plan_chunk`) so every span is
+        // prefilled inside one KV-visible unit; with `None` / empty the
+        // chunking is the historical fixed B_MAX / div_ceil(2).
+        image_spans: Option<&[ImageSpan]>,
     ) -> eyre::Result<Vec<f32>> {
         let t = tokens.len();
         if t == 0 {
@@ -625,6 +676,9 @@ impl HeterogeneousEngine {
                 input_hcs.len()
             ));
         }
+        let spans = image_spans.unwrap_or(&[]);
+        image_spans::validate_spans(spans, pos0, t)?;
+        let lane_caps = (bd_a.rows, bd_b.rows);
         let chunk_size = B_MAX;
         let cs_hc = HC_DIM as usize;
         let cs_vocab = N_VOCAB as usize;
@@ -661,7 +715,16 @@ impl HeterogeneousEngine {
                     return Ok(Vec::new());
                 }
             }
-            let chunk_end = (chunk_start + chunk_size).min(t);
+            // Same planner `forward_prompt_batch_v2_pipelined` re-derives its
+            // lane cut from, so `b_a` below matches the lane contents.
+            let (chunk_end, b_a) = image_spans::plan_chunk(
+                pos0,
+                chunk_start,
+                t,
+                chunk_size,
+                Some(lane_caps),
+                spans,
+            )?;
             let chunk_b = chunk_end - chunk_start;
             let is_last_chunk = chunk_end == t;
             let chunk_input = &input_hcs[chunk_start..chunk_end];
@@ -709,6 +772,7 @@ impl HeterogeneousEngine {
                 chunk_tokens,
                 chunk_pos0,
                 stats.as_deref_mut(),
+                image_spans,
             )?;
 
             if let Some(exp_lock) = &self.perfetto {
@@ -740,9 +804,8 @@ impl HeterogeneousEngine {
                 self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
             }
 
-            // Split point mirrors forward_prompt_batch_v2_pipelined:
-            // first ceil(b/2) tokens → lane A, rest → lane B.
-            let b_a = chunk_b.div_ceil(2);
+            // Split point mirrors forward_prompt_batch_v2_pipelined: `b_a`
+            // rows → lane A (ceil(b/2) without image spans), rest → lane B.
             let b_b = chunk_b - b_a;
 
             if last_only {
@@ -810,6 +873,9 @@ impl HeterogeneousEngine {
         ilw: &IgpuLayerWeights,
         pos0: u32,
         tokens: &[i32],
+        // Per-row `(left, right)` image visibility for THIS batch's rows
+        // (`image_spans::rows_visibility`); `None` == all text.
+        vis: Option<&[(u32, u32)]>,
         stats: Option<&mut PrefillStats>,
     ) -> eyre::Result<()> {
         let layer = dlw.layer_idx as usize;
@@ -819,7 +885,7 @@ impl HeterogeneousEngine {
         }
         let sev = &self.sync_events.layers[layer];
         let hot_active = prefill_hot_active(dlw, ilw, bd, sd);
-        self.forward_layer_pre_moe_v2(bd, bi, sd, si, ls, dlw, ilw, pos0, tokens, stats, sev)?;
+        self.forward_layer_pre_moe_v2(bd, bi, sd, si, ls, dlw, ilw, pos0, tokens, vis, stats, sev)?;
         self.forward_layer_post_moe_v2(bd, b, sev, hot_active)?;
         Ok(())
     }
@@ -851,6 +917,11 @@ impl HeterogeneousEngine {
         ilw: &IgpuLayerWeights,
         pos0: u32,
         tokens: &[i32],
+        // Vision-Exp per-row `(left, right)` visibility inside an image span
+        // (`image_spans::rows_visibility`, already clamped). Drives the raw
+        // attention window only; the router-side image flag comes from
+        // `tokens` (id >= N_VOCAB). `None` == all text.
+        vis: Option<&[(u32, u32)]>,
         stats: Option<&mut PrefillStats>,
         sev: &super::engine::LayerSyncEvents,
     ) -> eyre::Result<()> {
@@ -1158,14 +1229,50 @@ impl HeterogeneousEngine {
         // the last SWA_WINDOW rows back to slots [0..W) and resets ls.n_raw
         // to W (or less, for short prompts) so the steady-state SWA invariant
         // holds for decode and for the next chunk.
+        //
+        // Vision-Exp: rows inside an `[IMAGE_START .. IMAGE_END]` span use
+        // the widened window of `get_window_topk_idxs_visible` —
+        //   slots [causal_end - max(W, left+1) .. causal_end + right),
+        //   capped at W + 384 keys (`image_spans::raw_window`)
+        // — i.e. they also see keys AHEAD of them inside the span. Those
+        // keys exist because the whole chunk's K/V is appended (above)
+        // before this chunk's attention runs, and `chunk_visibility`
+        // guarantees the span lies inside this batch. The compressed /
+        // indexer path below stays causal and untouched.
         let n_raw_before = ls.n_raw;
         let mut n_raw_offset_after: Vec<u32> = Vec::with_capacity(b as usize);
-        for i in 0..b as usize {
-            let causal_end = n_raw_before + i as u32 + 1; // exclusive upper slot
-            let n_per = causal_end.min(SWA_WINDOW);
-            let offset = causal_end.saturating_sub(SWA_WINDOW);
-            n_raw_after.push(n_per);
-            n_raw_offset_after.push(offset);
+        match vis {
+            None => {
+                for i in 0..b as usize {
+                    let causal_end = n_raw_before + i as u32 + 1; // exclusive upper slot
+                    let n_per = causal_end.min(SWA_WINDOW);
+                    let offset = causal_end.saturating_sub(SWA_WINDOW);
+                    n_raw_after.push(n_per);
+                    n_raw_offset_after.push(offset);
+                }
+            }
+            Some(v) => {
+                if v.len() != b as usize {
+                    return Err(eyre!(
+                        "L{layer}: visibility rows {} != batch rows {b}",
+                        v.len()
+                    ));
+                }
+                for (i, &(left, right)) in v.iter().enumerate() {
+                    let (offset, count) =
+                        image_spans::raw_window(n_raw_before, i as u32, left, right);
+                    if offset + count > n_raw_before + b {
+                        return Err(eyre!(
+                            "L{layer}: row {i} raw window [{offset}, {}) reaches past the \
+                             chunk's appended K/V ({} rows) — image span not inside chunk",
+                            offset + count,
+                            n_raw_before + b
+                        ));
+                    }
+                    n_raw_after.push(count);
+                    n_raw_offset_after.push(offset);
+                }
+            }
         }
         // The cache is oversized to SWA_WINDOW + B_MAX rows, so we always
         // use the no-eviction batched append. The post-chunk eviction pass at
@@ -1633,6 +1740,22 @@ impl HeterogeneousEngine {
         let nrop_view = sd.n_raw_offset_per.slice_view(0, b as usize);
         let ncp_view = sd.n_comp_per.slice_view(0, b as usize);
         if ratio == 0 {
+            // Dynamic-LDS stride for attention_swa_batched. Text-only chunks
+            // keep SWA_WINDOW here, so the kernel allocates exactly the 1 KiB
+            // its old static `scores[128]/weights[128]` arrays used and the
+            // occupancy of the text path is unchanged. Image chunks widen it
+            // to the chunk's widest window (<= SWA_WINDOW + 384).
+            let max_n_kv = if vis.is_some() {
+                n_raw_after.iter().copied().max().unwrap_or(0).max(1)
+            } else {
+                SWA_WINDOW
+            };
+            if max_n_kv > ATTN_SWA_BATCHED_MAX_KV {
+                return Err(eyre!(
+                    "L{layer}: raw window {max_n_kv} exceeds attention_swa_batched cap \
+                     {ATTN_SWA_BATCHED_MAX_KV}"
+                ));
+            }
             let _t = de.events.stage("k.attn.swa", &de.compute)?;
             de.attn_swa.launch_batched(
                 &de.compute,
@@ -1645,6 +1768,7 @@ impl HeterogeneousEngine {
                 N_HEAD,
                 N_HEAD_DIM,
                 b,
+                max_n_kv,
             )?;
         } else {
             let cs = ls.compressor.as_ref();
@@ -2237,8 +2361,15 @@ impl HeterogeneousEngine {
                 b,
             )?;
         }
+        // Vision-Exp: contiguous runs of image rows (token id >= N_VOCAB,
+        // compress-pads included — `Gate.forward`'s `image_mask`). They
+        // select experts by top-k(scores + bias_vl) on EVERY layer; text
+        // rows keep exp_probs_b / tid2eid, bit-identical to before.
+        let image_runs = image_spans::image_runs(tokens);
         if !dlw.is_hash_router {
             // Top-k: one block per token in a single launch (B→1 launches).
+            // (Image rows are recomputed with bias_vl right below — same
+            // stream, FIFO — so this full-batch launch stays as-is.)
             let _t = de.events.stage("k.router.topk", &de.compute)?;
             de.router_topk.launch_batched(
                 &de.compute,
@@ -2265,6 +2396,13 @@ impl HeterogeneousEngine {
             let mut all_sel: Vec<i32> = Vec::with_capacity(b as usize * cs_n_used);
             let mut all_ew: Vec<f32> = Vec::with_capacity(b as usize * cs_n_used);
             for i in 0..b as usize {
+                if image_spans::is_image_token(tokens[i]) {
+                    // Synthetic id: no tid2eid row. Placeholder; overwritten
+                    // by the bias_vl top-k launch below.
+                    all_sel.extend_from_slice(&[0i32; N_EXPERT_USED]);
+                    all_ew.extend_from_slice(&[0f32; N_EXPERT_USED]);
+                    continue;
+                }
                 let logit_slice = &sd.router_logits_host
                     [i * (N_EXPERT as usize)..(i + 1) * (N_EXPERT as usize)];
                 let (sel, w) = hash_router_select(tid2eid, tokens[i], logit_slice);
@@ -2278,6 +2416,34 @@ impl HeterogeneousEngine {
             sel_v.copy_from_host(&all_sel)?;
             let mut ew_v = bd.d_ew.slice_view_mut(0, b as usize * cs_n_used);
             ew_v.copy_from_host(&all_ew)?;
+        }
+        if !image_runs.is_empty() {
+            let bias_vl = dlw.router_bias_vl_dev.as_ref().ok_or_else(|| {
+                eyre!(
+                    "L{layer}: image rows in prefill but no bias_vl loaded — put the \
+                     sidecar at {} (see het::weights::bias_vl_sidecar_path)",
+                    super::weights::BIAS_VL_FILE
+                )
+            })?;
+            let _t = de.events.stage("k.router.topk_vl", &de.compute)?;
+            let n_exp = N_EXPERT as usize;
+            for &(r0, n) in &image_runs {
+                let logits_v = sd.router_logits.slice_view(r0 * n_exp, n * n_exp);
+                let mut sel_v = bd.d_selected.slice_view_mut(r0 * cs_n_used, n * cs_n_used);
+                let mut ew_v = bd.d_ew.slice_view_mut(r0 * cs_n_used, n * cs_n_used);
+                de.router_topk.launch_batched(
+                    &de.compute,
+                    &mut sel_v,
+                    &mut ew_v,
+                    &logits_v,
+                    Some(bias_vl),
+                    N_EXPERT,
+                    cs_n_used as u32,
+                    EXPERT_WEIGHT_SCALE,
+                    ROUTER_WEIGHT_EPS,
+                    n as u32,
+                )?;
+            }
         }
         drop(_t_router);
 

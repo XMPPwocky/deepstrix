@@ -213,6 +213,7 @@ fn forward_prompt_batch_v2_matches_sequential() -> eyre::Result<()> {
         &tokens,
         0,
         None,
+        None, // image_spans
     )?;
     let mut v2_hcs: Vec<Vec<f32>> = Vec::with_capacity(b);
     for i in 0..b {
@@ -363,6 +364,7 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
             0,
             &tokens,
             None,
+            None, // vis
         )?;
 
         // ---- Compare each batch element's residual_next ----
@@ -580,6 +582,7 @@ fn forward_prefill_last_only_matches_sequential() -> eyre::Result<()> {
         0,
         true,
         None,
+        None, // image_spans
     )?;
     assert_eq!(prefill_logits.len(), N_VOCAB as usize);
 
@@ -674,6 +677,7 @@ fn forward_prefill_pipelined_matches_single_lane() -> eyre::Result<()> {
         0,
         true,
         None,
+        None, // image_spans
     )?;
 
     // Test: two-lane pipelined forward_prefill.
@@ -705,6 +709,7 @@ fn forward_prefill_pipelined_matches_single_lane() -> eyre::Result<()> {
         None,
         None,
         None,
+        None, // image_spans
     )?;
 
     let (maxd, idx) = max_abs_diff(&logits_single, &logits_pipelined);

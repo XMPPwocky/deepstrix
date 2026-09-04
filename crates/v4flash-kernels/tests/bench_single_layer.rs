@@ -171,6 +171,7 @@ fn bench_single_layer() -> eyre::Result<()> {
             fake_pos,
             &tokens,
             None,
+            None, // vis
         )?;
         engine.dgpu.compute.synchronize()?;
         engine.dgpu.xfer.synchronize()?;
@@ -200,6 +201,7 @@ fn bench_single_layer() -> eyre::Result<()> {
             fake_pos,
             &tokens,
             None,
+            None, // vis
         )?;
         engine.dgpu.compute.synchronize()?;
         engine.dgpu.xfer.synchronize()?;

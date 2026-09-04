@@ -6,6 +6,8 @@
 //!   ~1.2 GiB/layer × 43 layers = ~52 GiB.
 //! * [`HetGlobalWeights`] — output head + embedding, dGPU-resident.
 
+use std::path::{Path, PathBuf};
+
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::{gguf::GgufType, MappedGguf};
 use v4flash_hip::{Device, DeviceBuffer};
@@ -76,6 +78,12 @@ pub struct DgpuLayerWeights {
     pub ffn_gate_inp: DeviceWeight,
     pub tid2eid: Option<Vec<i32>>,
     pub router_bias_dev: Option<DeviceBuffer<f32>>,
+    /// Vision-Exp: `layers.N.ffn.gate.bias_vl` `[N_EXPERT]` f32 — the
+    /// selection bias for IMAGE rows (token id >= N_VOCAB) on EVERY layer,
+    /// hash layers included (there it drives a top-k instead of tid2eid).
+    /// Absent from the GGUF; loaded from the `bias_vl.bin` sidecar
+    /// (`bias_vl_sidecar_path`) when present. `None` = text-only model.
+    pub router_bias_vl_dev: Option<DeviceBuffer<f32>>,
 }
 
 /// CSA indexer projection weights (per ratio==4 layer).
@@ -393,7 +401,116 @@ impl DgpuLayerWeights {
             ffn_gate_inp,
             tid2eid,
             router_bias_dev,
+            router_bias_vl_dev: None,
         })
+    }
+}
+
+/// Sidecar file name for the Vision-Exp routing bias.
+pub const BIAS_VL_FILE: &str = "bias_vl.bin";
+
+/// `~/.cache/deepstrix/models/<gguf file stem>/bias_vl.bin` — the same
+/// per-model sidecar directory the server uses for `expert_stats.json` /
+/// `hot_experts.txt`. `DEEPSTRIX_BIAS_VL_FILE` overrides the full path.
+///
+/// Format: `N_LAYER * N_EXPERT` (43 × 256) f32 little-endian, layer-major
+/// — layer `l` at `[l*256 .. (l+1)*256)`. Produced once by
+/// `scripts/fetch_bias_vl.py` from the HF safetensors shards of
+/// `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` (tensor names
+/// `layers.{0..42}.ffn.gate.bias_vl`, F32 `[256]`).
+pub fn bias_vl_sidecar_path(gguf_path: &Path) -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("DEEPSTRIX_BIAS_VL_FILE") {
+        return Some(PathBuf::from(p));
+    }
+    let stem = gguf_path.file_stem()?.to_str()?;
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join(".cache/deepstrix/models")
+            .join(stem)
+            .join(BIAS_VL_FILE),
+    )
+}
+
+/// Parse a `bias_vl.bin` sidecar into `N_LAYER * N_EXPERT` f32.
+pub fn read_bias_vl_sidecar(path: &Path) -> eyre::Result<Vec<f32>> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| eyre!("read bias_vl sidecar {}: {e}", path.display()))?;
+    let want = (N_LAYER as usize) * (N_EXPERT as usize) * 4;
+    if bytes.len() != want {
+        return Err(eyre!(
+            "{}: expected {want} bytes ({N_LAYER}x{N_EXPERT} f32 LE), got {}",
+            path.display(),
+            bytes.len()
+        ));
+    }
+    let v: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    if let Some(bad) = v.iter().position(|x| !x.is_finite()) {
+        return Err(eyre!("{}: non-finite bias_vl value at index {bad}", path.display()));
+    }
+    Ok(v)
+}
+
+/// Write a sidecar in the format `read_bias_vl_sidecar` reads (tooling / tests).
+pub fn write_bias_vl_sidecar(path: &Path, values: &[f32]) -> eyre::Result<()> {
+    let want = (N_LAYER as usize) * (N_EXPERT as usize);
+    if values.len() != want {
+        return Err(eyre!("write_bias_vl_sidecar: expected {want} values, got {}", values.len()));
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| eyre!("mkdir {}: {e}", dir.display()))?;
+    }
+    let mut out = Vec::with_capacity(values.len() * 4);
+    for v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(path, out).map_err(|e| eyre!("write {}: {e}", path.display()))
+}
+
+impl HetModelWeights {
+    /// `true` once `load_bias_vl_sidecar` attached the Vision-Exp routing
+    /// bias to every dGPU layer. Without it, the router falls over on the
+    /// FIRST image row in prefill (`forward_prefill`: "image rows in
+    /// prefill but no bias_vl loaded"), so a server started with
+    /// `--mmproj` should check this at startup rather than discovering it
+    /// mid-request. The sidecar path is derived from the GGUF stem while
+    /// `--mmproj` is a separate flag, so the two can be inconsistent with
+    /// no other diagnostic.
+    pub fn has_bias_vl(&self) -> bool {
+        !self.dgpu_layers.is_empty()
+            && self
+                .dgpu_layers
+                .iter()
+                .all(|l| l.router_bias_vl_dev.is_some())
+    }
+
+    /// Attach the Vision-Exp routing bias from the sidecar next to
+    /// `gguf_path` (see `bias_vl_sidecar_path`). No sidecar → no-op
+    /// (text-only); a present-but-corrupt sidecar is an error. Uploads
+    /// one `[N_EXPERT]` f32 buffer per layer to the dGPU (43 KiB total).
+    pub fn load_bias_vl_sidecar(
+        &mut self,
+        gguf_path: &Path,
+        dgpu_device: Device,
+    ) -> eyre::Result<Option<PathBuf>> {
+        let Some(path) = bias_vl_sidecar_path(gguf_path) else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        let all = read_bias_vl_sidecar(&path)?;
+        dgpu_device.set_current()?;
+        let n = N_EXPERT as usize;
+        for (l, dlw) in self.dgpu_layers.iter_mut().enumerate() {
+            let mut buf: DeviceBuffer<f32> = DeviceBuffer::new(dgpu_device.id, n)?;
+            buf.copy_from_host(&all[l * n..(l + 1) * n])?;
+            dlw.router_bias_vl_dev = Some(buf);
+        }
+        Ok(Some(path))
     }
 }
 
@@ -939,17 +1056,45 @@ impl HetModelWeights {
                 );
             }
         }
-        Ok(Self {
+        let mut weights = Self {
             global,
             dgpu_layers,
             igpu_layers,
-        })
+        };
+        // Vision-Exp routing bias sidecar (text-only models simply have none).
+        if let Some(path) = weights.load_bias_vl_sidecar(gguf.path(), dgpu_device)? {
+            eprintln!("vision: loaded bias_vl sidecar {}", path.display());
+        }
+        Ok(weights)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bias_vl_sidecar_roundtrip_and_path() {
+        let dir = std::env::temp_dir().join(format!("v4flash-biasvl-{}", std::process::id()));
+        let p = dir.join(BIAS_VL_FILE);
+        let n = (N_LAYER as usize) * (N_EXPERT as usize);
+        let vals: Vec<f32> = (0..n).map(|i| i as f32 * 0.001 - 3.0).collect();
+        write_bias_vl_sidecar(&p, &vals).unwrap();
+        assert_eq!(read_bias_vl_sidecar(&p).unwrap(), vals);
+        // wrong size / NaN are rejected
+        std::fs::write(&p, &[0u8; 16]).unwrap();
+        assert!(read_bias_vl_sidecar(&p).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+        if std::env::var_os("DEEPSTRIX_BIAS_VL_FILE").is_none() {
+            let sp = bias_vl_sidecar_path(Path::new(
+                "/x/y/DeepSeek-V4-Flash-Vision-Exp-UD-Q2_K_XL-00001-of-00003.gguf",
+            ))
+            .unwrap();
+            assert!(sp.ends_with(
+                ".cache/deepstrix/models/DeepSeek-V4-Flash-Vision-Exp-UD-Q2_K_XL-00001-of-00003/bias_vl.bin"
+            ));
+        }
+    }
 
     /// What the MoE kernels do with the miss branch: `-remap[e] - 1`.
     fn decode(remap: &[i32], e: u32) -> i32 {

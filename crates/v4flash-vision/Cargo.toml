@@ -1,0 +1,24 @@
+[package]
+name = "v4flash-vision"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+color-eyre = { workspace = true }
+tracing = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# PENDING USER SIGN-OFF — see the note in the workspace Cargo.toml.
+image = { workspace = true }
+v4flash-core = { path = "../v4flash-core" }
+v4flash-hip = { path = "../v4flash-hip" }
+v4flash-kernels = { path = "../v4flash-kernels" }
+
+
+[lib]
+path = "src/lib.rs"

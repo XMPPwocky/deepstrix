@@ -10,6 +10,7 @@ publish.workspace = true
 v4flash-core = { path = "../v4flash-core" }
 v4flash-hip = { path = "../v4flash-hip" }
 v4flash-kernels = { path = "../v4flash-kernels" }
+v4flash-vision = { path = "../v4flash-vision" }
 
 # Workspace-approved already.
 color-eyre = { workspace = true }

@@ -1,6 +1,8 @@
 //! HTTP error responses, OpenAI-shape.
 //!
-//!     { "error": { "message": "...", "type": "...", "code": "..." } }
+//! ```text
+//! { "error": { "message": "...", "type": "...", "code": "..." } }
+//! ```
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};

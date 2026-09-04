@@ -138,6 +138,7 @@ fn bench_prefill_v2() -> eyre::Result<()> {
             &tokens,
             0,
             None,
+            None, // image_spans
         )?;
     }
 
@@ -156,6 +157,7 @@ fn bench_prefill_v2() -> eyre::Result<()> {
             &tokens,
             0,
             None,
+            None, // image_spans
         )?;
         let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
         walls_ms.push(wall_ms);
@@ -353,6 +355,7 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                     None,
                     None,
                     None,
+                    None, // image_spans
                 )?;
             } else {
                 let _ = engine.forward_prefill(
@@ -368,6 +371,7 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                     w * chunk_b as u32,
                     true,
                     None,
+                    None, // image_spans
                 )?;
             }
         }
@@ -450,6 +454,7 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                             None,
                             None,
                             None,
+                            None, // image_spans
                         )?;
                     } else {
                         let _ = engine.forward_prefill(
@@ -465,6 +470,7 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                             fake_pos,
                             true,
                             None,
+                            None, // image_spans
                         )?;
                     }
                     let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -563,6 +569,7 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                 None,
                 None,
                 None,
+                None, // image_spans
             )?;
         } else {
             let _ = engine.forward_prefill(
@@ -578,6 +585,7 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                 0,
                 last_only,
                 None,
+                None, // image_spans
             )?;
         }
         Ok(())
@@ -714,6 +722,7 @@ fn bench_prefill_expert_stats() -> eyre::Result<()> {
         0,
         true,
         Some(&mut stats),
+        None, // image_spans
     )?;
     stats.print_summary();
     // Dump representative layer's pick counts for offline plotting.
