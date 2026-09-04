@@ -39,11 +39,11 @@ fn main() -> eyre::Result<()> {
         println!("  {:?} → id {:?}", name, id);
     }
 
-    // Verify encode_with_special_marker actually inlines TOK_DSML.
+    // Verify prompt::encode_segments actually inlines TOK_DSML.
     // Run a small DSML-shaped fragment through it, then through plain
     // BPE, and print both token sequences alongside their decoded text.
     println!();
-    println!("encode_with_special_marker spot-check:");
+    println!("encode_segments spot-check:");
     let sample =
         "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"bash\">";
     let dsml_id = vocab.dsml_id.unwrap_or(-1);

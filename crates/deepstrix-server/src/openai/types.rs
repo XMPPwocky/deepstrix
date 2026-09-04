@@ -46,6 +46,14 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Reasoning the assistant emitted on this turn, as sent back by a
+    /// client that stores it (letta / OpenAI `reasoning_content`). The chat
+    /// template replays it inside `<think>…</think>` on history turns that
+    /// keep reasoning (`ds4_server.c:1957` replays `m->reasoning`); without
+    /// this field the replay could never happen and every historical
+    /// assistant turn rendered as an empty think block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl ChatMessage {
@@ -58,6 +66,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
             name: None,
+            reasoning_content: None,
         }
     }
 
@@ -149,6 +158,8 @@ struct ChatMessageWire {
     tool_call_id: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for ChatMessage {
@@ -177,6 +188,7 @@ impl<'de> Deserialize<'de> for ChatMessage {
             tool_calls: w.tool_calls,
             tool_call_id: w.tool_call_id,
             name: w.name,
+            reasoning_content: w.reasoning_content,
         })
     }
 }
@@ -309,20 +321,25 @@ fn parse_content_parts(
                 ContentPart::Image(_) => None,
             })
             .collect();
-        // JOIN RULE. With an image present this is the reference
-        // template's `dsv4_media` rule (parts joined by "\n\n") — and
-        // for those messages `render_prompt` renders from `parts`
-        // anyway, where `encode_user_parts_with` inserts the separators
-        // itself; the text view only has to agree with it.
+        // JOIN RULE. `dsv4_media` (template line 25) joins EVERY part of
+        // an array-form `content` with "\n\n", unconditionally — it never
+        // looks at whether a part is an image. So this join is "\n\n" in
+        // both branches:
         //
-        // With NO image the message renders from this string, and the
-        // pre-vision deserializer concatenated text parts with no
-        // separator. Joining those with "\n\n" would silently change
-        // the rendered prompt (and therefore the blake3 snapshot key and
-        // the byte-aligned LCP) for every existing text-only client that
-        // sends array-form content. The no-image path must be
-        // byte-identical to before, so it keeps the "" join.
-        let joined = texts.join(if any_image { "\n\n" } else { "" });
+        //   * with an image, `render_prompt` renders from `parts` and
+        //     `push_user_parts` inserts the separators itself; this text
+        //     view only has to agree with it;
+        //   * with NO image, `parts` is dropped and the message renders
+        //     from this string, so the separators have to be in here.
+        //
+        // The pre-vision deserializer concatenated text parts with no
+        // separator at all, which silently diverged from the template for
+        // any client sending multi-block text content (Anthropic-shaped
+        // clients, multi-block tool text). Fixing it costs those
+        // conversations a one-off KV-snapshot miss, the same price every
+        // other template-fidelity fix in this change pays. Pinned by the
+        // `user_turn_with_text_parts_only` golden case.
+        let joined = texts.join("\n\n");
         if joined.is_empty() {
             None
         } else {
@@ -347,21 +364,38 @@ pub struct ToolCallFunction {
     pub arguments: String,
 }
 
+/// One entry of the request's `tools` array.
+///
+/// `function` is kept as the **raw JSON value the client sent**, not a
+/// destructured struct. The chat template renders it with `tool['function'] |
+/// tojson`, so every field the client included has to survive — including
+/// ones we have no name for (`strict`, vendor `x-*` hints) — in the client's
+/// own key order (`serde_json`'s `preserve_order` feature, enabled workspace
+/// wide, keeps `Value::Object` insertion-ordered). Destructuring here used to
+/// drop unknown fields, force the key order to name/description/parameters,
+/// and emit `"description": null` for tools that never had one.
+/// `function` is `#[serde(default)]` (→ `Value::Null` when absent) because the
+/// template only ever reads it for entries whose `type` is `"function"`
+/// (lines 78-80) and silently skips every other entry — a client that declares
+/// a provider builtin as `{"type": "web_search"}` with no `function` key must
+/// not get a 400. An entry that DOES claim `type: "function"` but carries no
+/// object there is rejected by [`crate::prompt::build_segments`] instead of
+/// being rendered as the literal line `null` into the schema block. (Under
+/// jinja that case raises out of `tojson`, so a 400 is the faithful answer.)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ToolDef {
     #[serde(rename = "type")]
     pub kind: String, // "function"
-    pub function: ToolDefFunction,
+    #[serde(default)]
+    pub function: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ToolDefFunction {
-    pub name: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    /// JSON Schema describing the parameters object.
-    #[serde(default)]
-    pub parameters: serde_json::Value,
+impl ToolDef {
+    /// The tool's `function.name`, when it has one. Diagnostics only —
+    /// rendering never goes through this.
+    pub fn name(&self) -> Option<&str> {
+        self.function.get("name").and_then(|v| v.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -462,15 +496,23 @@ mod tests {
     }
 
     #[test]
-    fn text_only_array_keeps_the_pre_vision_concatenation() {
-        // No image => byte-identical to the pre-vision deserializer, so
-        // existing clients' snapshot keys stay valid.
+    fn text_only_array_joins_parts_the_template_way() {
+        // `dsv4_media` (template line 25) joins every part of an array-form
+        // content with "\n\n" whether or not an image is present. The
+        // pre-vision deserializer concatenated with no separator, which
+        // diverged from the template for multi-block text content; this now
+        // matches. Pinned end-to-end by the `user_turn_with_text_parts_only`
+        // golden case.
         let m = parse(
             r#"{"role":"user","content":[{"type":"text","text":"a"},"b",{"type":"input_text","text":"c"}]}"#,
         );
-        assert_eq!(m.content.as_deref(), Some("abc"));
-        // Text-only arrays keep the legacy single-string shape.
+        assert_eq!(m.content.as_deref(), Some("a\n\nb\n\nc"));
+        // Text-only arrays still keep the legacy single-string shape (no
+        // `parts`), so `build_segments` renders them from `content`.
         assert!(m.parts.is_empty());
+        // A single text block is unchanged — no trailing/leading separator.
+        let one = parse(r#"{"role":"user","content":[{"type":"text","text":"only"}]}"#);
+        assert_eq!(one.content.as_deref(), Some("only"));
     }
 
     #[test]

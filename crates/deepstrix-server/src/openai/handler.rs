@@ -287,6 +287,10 @@ pub async fn chat_completions(
                     tool_calls,
                     tool_call_id: None,
                     name: None,
+                    // The non-streaming accumulator still discards the
+                    // reasoning trace (engine_worker.rs:2375). `ChatMessage`
+                    // now has a field for it — wiring it up is a follow-up.
+                    reasoning_content: None,
                 },
                 finish_reason,
             }],

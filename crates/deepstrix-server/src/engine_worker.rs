@@ -1755,13 +1755,12 @@ fn handle_generate_stream(
 /// Save the start-of-think snapshot, then forward the trailing
 /// `<think>`/`</think>` marker (if any) into the KV cache.
 ///
-/// The snapshot's saved tokens (== live.tokens at this point) match
-/// what letta will replay for this turn's history on subsequent
-/// requests: canonical bytes through `<Assistant>`, with no
-/// `<think>` baked in. The marker we forward AFTER the save is
-/// transient w.r.t. snapshot identity but still required so the
-/// model starts sampling in the right "thinking vs responding"
-/// mode.
+/// The snapshot's saved tokens (== live.tokens at this point) end at
+/// `<｜Assistant｜>`, which is a byte prefix of what the client replays for
+/// this turn on every subsequent request, whichever marker follows it. The
+/// marker we forward AFTER the save is transient w.r.t. snapshot identity but
+/// still required so the model starts sampling in the right "thinking vs
+/// responding" mode.
 ///
 /// Returns `(pos_after_marker, initial_in_think)` — the KV
 /// position the next sampled token will be written at, and whether
@@ -1790,9 +1789,25 @@ fn save_and_forward_marker(
         pos_after_marker += 1;
         if let Some(live) = state.live.as_mut() {
             live.pos = pos_after_marker;
-            // TOK_THINK_END is canonical (letta renders it at the
-            // start of every historical assistant turn). TOK_THINK_BEGIN
-            // is transient — never in letta's replay.
+            // TOK_THINK_END is canonical: with no tools in play the
+            // replay of a historical assistant turn opens with `</think>`
+            // alone (`prompt.rs` `keep_reasoning`), so pushing it keeps
+            // live.tokens equal to the next request's bytes.
+            //
+            // TOK_THINK_BEGIN is NOT pushed. Note that with tools present
+            // the replay DOES now carry `<think></think>` on every
+            // historical assistant turn (prompt.rs, template line 217), so
+            // this is no longer "never in the replay" — but pushing it here
+            // would not buy the extend path back. Any turn that actually
+            // reasons forwards its reasoning tokens into KV without
+            // recording them in live.tokens, so `live.pos >
+            // live.tokens.len()` at end of turn and `finish_decode` drops
+            // the live session outright (see the transient-token cleanup
+            // there). The in-VRAM extend path is structurally unavailable
+            // after ANY non-empty thinking turn, tools or not; continuity
+            // across turns comes from the disk snapshot saved just above,
+            // whose bytes stop at `<｜Assistant｜>` and therefore prefix
+            // either replay shape.
             if marker == TOK_THINK_END {
                 live.tokens.push(marker);
             }
@@ -2023,12 +2038,23 @@ fn finish_decode(
         pos += 1;
         // Successfully ingested `next` into KV at `pos-1`. live.pos
         // always tracks the KV cache position. live.tokens only
-        // tracks CANONICAL tokens — what letta will replay as
+        // tracks CANONICAL tokens — what the client will replay as
         // history. Transient tokens (TOK_THINK_BEGIN itself; any
         // token sampled while in_think) go into KV but NOT into
-        // live.tokens. TOK_THINK_END IS canonical (letta always
-        // renders it at the start of each historical assistant
-        // turn). See [[think-cache-design]].
+        // live.tokens. TOK_THINK_END IS canonical (every replay of a
+        // historical assistant turn renders it). See
+        // [[think-cache-design]].
+        //
+        // Keeping the reasoning tokens out is what makes live.pos run
+        // ahead of live.tokens.len() on any turn that reasons, which in
+        // turn makes `finish_decode`'s end-of-turn cleanup drop the live
+        // session. That is deliberate: the reasoning trace occupies KV
+        // positions the replay does not describe, so the cache cannot be
+        // extended in place across such a turn at all. If the client ever
+        // starts echoing `reasoning_content` back (prompt.rs replays it
+        // into the `<think>` block), these tokens would have to become
+        // canonical AND TOK_THINK_BEGIN would have to be pushed above,
+        // or the two streams keep diverging.
         let canonical =
             next != TOK_THINK_BEGIN && (next == TOK_THINK_END || !in_think);
         if let Some(ref mut live) = state.live {

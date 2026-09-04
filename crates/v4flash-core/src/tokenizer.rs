@@ -120,6 +120,52 @@ impl BpeVocab {
         })
     }
 
+    /// Build a vocab from an explicit **sparse** token map plus an ordered
+    /// merge list, without a GGUF. `tokens` is `(id, bytes)`; ids not listed
+    /// stay empty and are never emitted. Merge rank is the position in
+    /// `merges` — only the relative order matters to the merge loop, so a
+    /// merge list with entries removed still tokenizes identically as long as
+    /// every merge that could fire is kept.
+    ///
+    /// This exists for golden-vector tests that ship a trimmed vocab (a few
+    /// thousand entries) instead of depending on a multi-GB model file. It is
+    /// not used by any production path.
+    pub fn from_sparse_parts(
+        vocab_size: usize,
+        tokens_in: impl IntoIterator<Item = (i32, Vec<u8>)>,
+        merges_in: impl IntoIterator<Item = Vec<u8>>,
+        pre: Option<String>,
+    ) -> Self {
+        let mut tokens: Vec<Vec<u8>> = vec![Vec::new(); vocab_size];
+        let mut token_to_id: HashMap<Vec<u8>, i32> = HashMap::new();
+        for (id, bytes) in tokens_in {
+            let Ok(idx) = usize::try_from(id) else { continue };
+            if idx >= tokens.len() || bytes.is_empty() {
+                continue;
+            }
+            token_to_id.insert(bytes.clone(), id);
+            tokens[idx] = bytes;
+        }
+        let mut merge_rank: HashMap<Vec<u8>, i32> = HashMap::new();
+        for (rank, m) in merges_in.into_iter().enumerate() {
+            merge_rank.insert(m, rank as i32);
+        }
+        let lookup = |name: &str| token_to_id.get(name.as_bytes()).copied();
+        BpeVocab {
+            bos_id: lookup("<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>"),
+            eos_id: lookup("<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>"),
+            unknown_id: None,
+            padding_id: None,
+            eot_id: None,
+            add_bos: false,
+            dsml_id: lookup("\u{ff5c}DSML\u{ff5c}"),
+            pre,
+            tokens,
+            token_to_id,
+            merge_rank,
+        }
+    }
+
     /// Look up a token id by its raw byte text. Used to resolve
     /// special-control tokens by name at load time (mirrors ds4's
     /// `vocab_lookup`). Returns None if the token is not in the vocab.
