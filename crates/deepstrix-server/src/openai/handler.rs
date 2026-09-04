@@ -42,10 +42,68 @@ use crate::openai::types::{
     ToolCallFunction, Usage,
 };
 use crate::prompt::{render_prompt, ReasoningEffort};
-use crate::vision_prompt::{expand_images, VlPrompt};
+use crate::vision_prompt::{expand_images, ImageSpan, PreparedImage, VlPrompt};
 
 const DEFAULT_TEMPERATURE: f32 = 1.0;
 const DEFAULT_MIN_P_REL: f32 = 0.0;
+/// Nucleus cutoff used when the request omits `top_p`, and the default for
+/// `--default-top-p`.
+///
+/// 0.95 is DeepSeek's own agentic recipe for this model (temperature 1.0 +
+/// top_p 0.95 at maximum reasoning effort). Before this, `top_p` was
+/// accepted by the API and silently dropped, so every token was drawn from
+/// the untruncated 129,280-way distribution — strictly noisier than the
+/// configuration the model's agent benchmarks were measured under, with the
+/// whole 5% tail live on the token that decides "open a tool call" vs
+/// "start prose".
+///
+/// This is a SAMPLING change only: it does not touch the rendered prompt,
+/// so the on-disk KV snapshot cache stays valid. Put it back to 1.0 with
+/// `--default-top-p 1.0` (no rebuild needed) to restore the old behaviour
+/// exactly — 1.0 takes the pre-top_p kernel chain bit-for-bit.
+pub const DEFAULT_TOP_P: f32 = 0.95;
+/// Lower clamp for `top_p`. The sampler needs a strictly positive cutoff,
+/// and anything at or below this is already indistinguishable from greedy
+/// decoding (the nucleus collapses to the argmax token).
+pub const MIN_TOP_P: f32 = 1e-6;
+
+/// Resolve the request's `top_p` against the server default and clamp it
+/// into (0, 1].
+///
+/// Style matches the other sampling params: no 400 for an out-of-range
+/// value, just a clamp (`temperature <= 0` likewise falls through to argmax
+/// rather than erroring). A NaN falls back to the server default.
+pub fn resolve_top_p(requested: Option<f32>, default_top_p: f32) -> f32 {
+    let v = requested.unwrap_or(default_top_p);
+    let v = if v.is_nan() { default_top_p } else { v };
+    v.clamp(MIN_TOP_P, 1.0)
+}
+
+/// Assemble the worker request's sampling parameters from an OpenAI
+/// request. Split out of `chat_completions` so the mapping (in particular
+/// `top_p`, which used to be accepted and silently dropped) is directly
+/// testable without a loaded model.
+pub fn build_generate_req(
+    req: &ChatCompletionRequest,
+    tokens: Vec<i32>,
+    images: Vec<PreparedImage>,
+    image_spans: Vec<ImageSpan>,
+    default_top_p: f32,
+) -> GenerateReq {
+    GenerateReq {
+        tokens,
+        images,
+        image_spans,
+        max_new: req
+            .max_tokens
+            .map(|m| m as usize)
+            .unwrap_or(DEFAULT_MAX_NEW),
+        temperature: req.temperature.unwrap_or(DEFAULT_TEMPERATURE),
+        min_p_rel: DEFAULT_MIN_P_REL,
+        top_p: resolve_top_p(req.top_p, default_top_p),
+        seed: req.seed.unwrap_or_else(default_seed),
+    }
+}
 // Per-turn completion cap applied when the request omits `max_tokens`.
 // Letta-code's pi-ai only sends max_tokens when the registered model
 // has it set explicitly (pi-stream-adapter.ts:486-487); when it
@@ -73,9 +131,10 @@ pub async fn chat_completions(
     // the historical think-mode default). Unknown strings are an
     // invalid parameter → HTTP 400, matching the render_prompt
     // BadRequest convention below.
-    let effort = ReasoningEffort::from_request_fields(
+    let effort = ReasoningEffort::from_request_fields_with_default(
         req.reasoning.as_deref(),
         req.reasoning_effort.as_deref(),
+        engine.default_reasoning_effort,
     )
     .map_err(ApiError::BadRequest)?;
     // Vision-Exp: image parts are allowed only when the worker loaded a
@@ -139,22 +198,8 @@ pub async fn chat_completions(
         )));
     }
 
-    let temperature = req.temperature.unwrap_or(DEFAULT_TEMPERATURE);
-    let max_new = req
-        .max_tokens
-        .map(|m| m as usize)
-        .unwrap_or(DEFAULT_MAX_NEW);
-    let seed = req.seed.unwrap_or_else(default_seed);
-
-    let gen_req = GenerateReq {
-        tokens,
-        images,
-        image_spans,
-        max_new,
-        temperature,
-        min_p_rel: DEFAULT_MIN_P_REL,
-        seed,
-    };
+    let gen_req =
+        build_generate_req(&req, tokens, images, image_spans, engine.default_top_p);
 
     let id = format!("chatcmpl-{}", uuid::Uuid::now_v7().simple());
     let model = engine.model_name.as_str().to_string();

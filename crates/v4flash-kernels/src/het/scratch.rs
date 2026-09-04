@@ -176,6 +176,12 @@ pub struct DgpuScratch {
     pub sampler_partials_z: DeviceBuffer<f32>,
     pub sampler_u01: DeviceBuffer<f32>,
     pub sampler_next_token_id: DeviceBuffer<i32>,
+    /// top-p threshold search scratch. `mass` is [N_WG * TOPP_NEDGE] f32
+    /// (8.4 KB), `bracket` is the [s_lo, s_hi] log-space bracket and `thr`
+    /// the published survivor cutoff. Untouched when top_p >= 1.
+    pub sampler_topp_mass: DeviceBuffer<f32>,
+    pub sampler_topp_bracket: DeviceBuffer<f32>,
+    pub sampler_topp_thr: DeviceBuffer<f32>,
 }
 
 impl DgpuScratch {
@@ -324,6 +330,12 @@ impl DgpuScratch {
             sampler_partials_z: DeviceBuffer::new(device_id, crate::sampler::SAMPLER_N_WG as usize)?,
             sampler_u01: DeviceBuffer::new(device_id, 1)?,
             sampler_next_token_id: DeviceBuffer::new(device_id, 1)?,
+            sampler_topp_mass: DeviceBuffer::new(
+                device_id,
+                crate::sampler::sampler_topp_mass_len(),
+            )?,
+            sampler_topp_bracket: DeviceBuffer::new(device_id, 2)?,
+            sampler_topp_thr: DeviceBuffer::new(device_id, 1)?,
         })
     }
 }

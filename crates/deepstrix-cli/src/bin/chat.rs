@@ -24,6 +24,10 @@
 //!   CHAT_MIN_P    min-p threshold relative to most-likely token
 //!                 (default 0.0 = off, matches the recipe). Try 0.05
 //!                 for a long-tail prune.
+//!   CHAT_TOP_P    nucleus cutoff in (0, 1] (default 1.0 = off, i.e. the
+//!                 pre-top_p sampler chain bit-for-bit; the HTTP server
+//!                 defaults to 0.95). Rejected at startup if unparsable
+//!                 or out of range.
 //!   CHAT_SEED     u64 seed for the host PRNG that feeds the device
 //!                 sampler. 0 = deterministic baseline. Defaults to
 //!                 a fixed value (0xD5C0DE) so chat sessions are
@@ -375,6 +379,28 @@ fn main() -> eyre::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
+    // Default 1.0 = no nucleus truncation, i.e. exactly the pre-top_p
+    // chat behaviour. (The HTTP server defaults to 0.95, the model card's
+    // agent recipe; the dev REPL stays unfiltered unless asked.)
+    //
+    // Validated HERE rather than in the sampler wrapper: an unparsable or
+    // out-of-range value would otherwise only surface at the first sampled
+    // token, i.e. after ~86 GiB of weights have been loaded. Unlike the
+    // HTTP path (which clamps, see `handler::resolve_top_p`) the REPL
+    // rejects, matching CHAT_SAMPLER's style.
+    let top_p: f32 = match std::env::var("CHAT_TOP_P") {
+        Err(_) => 1.0,
+        Ok(raw) => {
+            let v: f32 = raw
+                .trim()
+                .parse()
+                .map_err(|_| eyre!("CHAT_TOP_P={raw} (want a float in (0, 1])"))?;
+            if !(v > 0.0 && v <= 1.0) {
+                return Err(eyre!("CHAT_TOP_P={v} out of range (want (0, 1])"));
+            }
+            v
+        }
+    };
     let seed: u64 = std::env::var("CHAT_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -386,15 +412,15 @@ fn main() -> eyre::Result<()> {
             if temperature <= 0.0 {
                 SampleMode::Argmax
             } else {
-                SampleMode::Multinomial { temperature, min_p_rel }
+                SampleMode::Multinomial { temperature, min_p_rel, top_p }
             }
         }
         other => return Err(eyre!("CHAT_SAMPLER={other} (want \"argmax\" or \"multinomial\")")),
     };
     let mut rng = SamplerRng::new(seed);
     eprintln!(
-        "sampler: {} (T={}, min_p_rel={}, seed=0x{:x})",
-        sampler_kind, temperature, min_p_rel, seed
+        "sampler: {} (T={}, top_p={}, min_p_rel={}, seed=0x{:x})",
+        sampler_kind, temperature, top_p, min_p_rel, seed
     );
 
     eprintln!("loading model from {gguf_path}…");

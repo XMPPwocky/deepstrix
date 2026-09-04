@@ -3,7 +3,8 @@
 //! Usage:
 //!   deepstrix-server --gguf <path> [--addr 127.0.0.1:8080] [--ctx 8192]
 //!                    [--snapshot-dir ~/.cache/deepstrix/snapshots]
-//!                    [--disk-cap-gb 100]
+//!                    [--disk-cap-gb 100] [--default-top-p 0.95]
+//!                    [--default-reasoning-effort low]
 //!
 //! Loads the V4-Flash model into a dedicated engine worker thread,
 //! then serves an OpenAI-compatible `/v1/chat/completions` endpoint
@@ -71,6 +72,28 @@ struct Args {
     /// is used when the flag is absent.
     #[arg(long = "allow-image-dir")]
     allow_image_dir: Vec<PathBuf>,
+    /// Nucleus (top-p) cutoff applied when a request omits `top_p`.
+    /// Default 0.95 = DeepSeek's agentic recipe for this model. Pass 1.0
+    /// to disable truncation and restore the pre-top_p sampler exactly.
+    /// Sampling-only: this does NOT change the rendered prompt, so on-disk
+    /// KV snapshots stay valid when you change it.
+    ///
+    /// Must be in (0, 1]; an out-of-range value is a startup error, NOT a
+    /// clamp. (A per-request `top_p` is what gets clamped instead — see
+    /// `openai::handler::resolve_top_p`.)
+    #[arg(long = "default-top-p", default_value_t = deepstrix_server::openai::handler::DEFAULT_TOP_P)]
+    default_top_p: f32,
+    /// Reasoning effort applied when a request sends neither `reasoning`
+    /// nor `reasoning_effort`. One of none/off/disabled/false, minimal/low,
+    /// medium/high, xhigh/max/ultra. Default "low" — the server's
+    /// historical behaviour.
+    ///
+    /// WARNING: raising this changes the RENDERED PROMPT (high/max prepend
+    /// a preamble to the system block), so every KV prefix cached under the
+    /// old default stops matching and the whole snapshot cache has to be
+    /// re-prefilled. Opt in deliberately.
+    #[arg(long = "default-reasoning-effort", default_value = "low")]
+    default_reasoning_effort: String,
 }
 
 fn default_snapshot_dir() -> eyre::Result<PathBuf> {
@@ -97,6 +120,23 @@ async fn main() -> eyre::Result<()> {
         None => default_snapshot_dir()?,
     };
     let disk_cap_bytes = args.disk_cap_gb.saturating_mul(1024 * 1024 * 1024);
+    let default_reasoning_effort =
+        deepstrix_server::prompt::ReasoningEffort::parse_str(&args.default_reasoning_effort)
+            .map_err(|e| eyre!("--default-reasoning-effort: {e}"))?;
+    if default_reasoning_effort != deepstrix_server::prompt::DEFAULT_EFFORT {
+        tracing::warn!(
+            effort = ?default_reasoning_effort,
+            "--default-reasoning-effort is not the compiled-in default: requests that omit \
+             reasoning_effort now render a DIFFERENT prompt, so previously cached KV prefixes \
+             will not match and must be re-prefilled"
+        );
+    }
+    if !(args.default_top_p > 0.0 && args.default_top_p <= 1.0) {
+        return Err(eyre!(
+            "--default-top-p must be in (0, 1] (got {})",
+            args.default_top_p
+        ));
+    }
     let mmproj_path = args.mmproj.or_else(|| {
         std::env::var_os("DEEPSTRIX_MMPROJ")
             .filter(|v| !v.is_empty())
@@ -119,6 +159,8 @@ async fn main() -> eyre::Result<()> {
         allow_image_dirs = ?allow_image_dirs,
         snapshot_dir = %snapshot_root.display(),
         disk_cap_gb = args.disk_cap_gb,
+        default_top_p = args.default_top_p,
+        default_reasoning_effort = ?default_reasoning_effort,
         "starting deepstrix-server"
     );
 
@@ -130,6 +172,8 @@ async fn main() -> eyre::Result<()> {
         snapshot_cap_bytes: disk_cap_bytes,
         mmproj_path,
         allow_image_dirs,
+        default_top_p: args.default_top_p,
+        default_reasoning_effort,
     })?;
 
     // Forward-progress watchdog. Env override > CLI flag > default.
