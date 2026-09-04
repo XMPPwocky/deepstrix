@@ -24,92 +24,288 @@
 //!    inside markup (structural) or outside (stray — warn + drop).
 
 use crate::openai::types::{ToolCall, ToolDef};
+use crate::prompt::Seg;
 
 // ---------------------------------------------------------------------------
-// Renderer — unchanged from the byte-scanner version. Used to build
-// the system-prompt schema block and to re-render assistant turns
-// that had tool_calls in history.
+// Renderer. Emits [`Seg`]s rather than one flat string so the caller can tell
+// text WE authored (special-token literals inside it materialise as their real
+// ids, matching `ds4_tokenize_rendered_chat`) from text the CLIENT supplied
+// (never allowed to forge a special token). Used to build the system-prompt
+// schema block and to re-render assistant turns that had tool_calls.
+//
+// Every literal below is verbatim from `tokenizer.chat_template` in the model
+// GGUF (`tools_header` / `tools_footer`, template lines 46-47), verified by
+// `scripts/gen_tool_prompt_vectors.py` against the live file.
 // ---------------------------------------------------------------------------
 
-pub fn render_tools_prompt(tools: &[ToolDef]) -> String {
-    if tools.is_empty() {
-        return String::new();
+/// `tools_header` — everything from `## Tools` down to the schema list.
+pub const TOOLS_HEADER: &str = "## Tools\n\n\
+     You have access to a set of tools to help answer the user's question. \
+     You can invoke tools by writing a \"<\u{ff5c}DSML\u{ff5c}tool_calls>\" block like the following:\n\n\
+     <\u{ff5c}DSML\u{ff5c}tool_calls>\n\
+     <\u{ff5c}DSML\u{ff5c}invoke name=\"$TOOL_NAME\">\n\
+     <\u{ff5c}DSML\u{ff5c}parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</\u{ff5c}DSML\u{ff5c}parameter>\n\
+     ...\n\
+     </\u{ff5c}DSML\u{ff5c}invoke>\n\
+     <\u{ff5c}DSML\u{ff5c}invoke name=\"$TOOL_NAME2\">\n\
+     ...\n\
+     </\u{ff5c}DSML\u{ff5c}invoke>\n\
+     </\u{ff5c}DSML\u{ff5c}tool_calls>\n\n\
+     String parameters should be specified as is and set `string=\"true\"`. \
+     For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n\
+     If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n\
+     Otherwise, output directly after </think> with tool calls or final response.\n\n\
+     ### Available Tool Schemas\n\n";
+
+/// `tools_footer`. Note the single leading newline (the schema list already
+/// ends in one) and the trailing newline before the first `<｜User｜>`.
+pub const TOOLS_FOOTER: &str =
+    "\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n";
+
+/// Format an `f64` the way CPython's `repr` does, which is what
+/// `json.dumps` emits for a float.
+///
+/// Rust and Python both print the shortest round-tripping digit string, but
+/// they disagree on the packaging:
+///
+///   * Python switches to exponent notation when the decimal point sits
+///     outside `-3 ..= 16`; Rust's `Display` keeps fixed notation further out
+///     (`1e-5` → Python `1e-05`, serde_json `0.00001`).
+///   * Python pads the exponent to at least two digits (`1e-7` → `1e-07`);
+///     serde_json does not (`1e-7`). Both emit the `+` on a positive
+///     exponent, so that part already agreed.
+///   * Python appends `.0` to a float with no fractional digits in fixed
+///     notation (`1e9` → `1000000000.0`); serde_json agrees here.
+///
+/// Reachable from any tool schema or tool-call argument carrying a
+/// scientific-notation bound or default (`"default": 1e-06`,
+/// `"maximum": 1e30`), where a different byte stream is a different token
+/// stream. Pinned by the `tool_schema_exponent_floats` golden case.
+///
+/// KNOWN RESIDUAL (parser, not formatter). This only re-packages the digits
+/// serde_json already produced, so a literal serde_json *parses* differently
+/// from CPython still differs. serde_json's default decimal fast path is not
+/// correctly rounded: `1e-30` lands one ULP below CPython's value and
+/// therefore renders `9.999999999999999e-31` where `json.dumps` writes
+/// `1e-30` (`2.5e-30` likewise). Rust's own `str::parse::<f64>()` gets both
+/// right, so the fix is serde_json's `float_roundtrip` feature on the
+/// workspace dependency — a Cargo.toml change, deliberately NOT made here.
+/// Reach: extreme exponents only; every exponent inside roughly `1e-20 ..
+/// 1e+30`, which is where real schema bounds live, parses exactly. The
+/// `tool_schema_exponent_floats` golden case is built from exactly-parsed
+/// literals so it pins the formatting rather than the parser.
+fn fmt_f64_python(v: f64) -> String {
+    if !v.is_finite() {
+        // serde_json cannot hold these in a `Value` (they deserialize as an
+        // error), and `json.dumps` would write `NaN`/`Infinity`. Unreachable
+        // via `Value`; keep it total rather than panicking.
+        return "null".to_string();
     }
-    let mut out = String::new();
-    out.push_str(
-        "## Tools\n\n\
-         You have access to a set of tools to help answer the user question. \
-         You can invoke tools by writing a \"<\u{ff5c}DSML\u{ff5c}tool_calls>\" block like the following:\n\n\
-         <\u{ff5c}DSML\u{ff5c}tool_calls>\n\
-         <\u{ff5c}DSML\u{ff5c}invoke name=\"$TOOL_NAME\">\n\
-         <\u{ff5c}DSML\u{ff5c}parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</\u{ff5c}DSML\u{ff5c}parameter>\n\
-         ...\n\
-         </\u{ff5c}DSML\u{ff5c}invoke>\n\
-         <\u{ff5c}DSML\u{ff5c}invoke name=\"$TOOL_NAME2\">\n\
-         ...\n\
-         </\u{ff5c}DSML\u{ff5c}invoke>\n\
-         </\u{ff5c}DSML\u{ff5c}tool_calls>\n\n\
-         String parameters should be specified as raw text and set `string=\"true\"`. \
-         Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal string characters with XML or HTML entity escapes. \
-         Only if a string value itself contains the exact closing parameter tag `</\u{ff5c}DSML\u{ff5c}parameter>`, write that tag as `&lt;/\u{ff5c}DSML\u{ff5c}parameter>` inside the value. \
-         For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n\
-         When thinking mode is enabled, finish reasoning with </think> before any tool calls or final response.\n\n\
-         Otherwise, output directly after </think> with tool calls or final response.\n\n\
-         ### Available Tool Schemas\n\n",
-    );
-    let schemas = serde_json::to_string_pretty(tools).unwrap_or_else(|_| "[]".into());
-    out.push_str(&schemas);
-    out.push_str(
-        "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls. \
-         Use the exact parameter names from the schemas.",
-    );
-    out
+    // `{:e}` is the shortest round-tripping digit string in scientific form:
+    // "1.5e-5", "1e30", "-2.5e-8", "0e0".
+    let sci = format!("{v:e}");
+    let (mant, exp) = match sci.split_once('e') {
+        Some(p) => p,
+        None => return sci,
+    };
+    let exp: i32 = match exp.parse() {
+        Ok(e) => e,
+        Err(_) => return sci,
+    };
+    let neg = mant.starts_with('-');
+    let mant = mant.strip_prefix('-').unwrap_or(mant);
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let sign = if neg { "-" } else { "" };
+    // `value == 0.<digits> * 10^decpt`, matching CPython's `decpt`.
+    let decpt = exp + 1;
+    if (-3..=16).contains(&decpt) {
+        // Fixed notation, always with at least one fractional digit.
+        let n = digits.len() as i32;
+        if decpt <= 0 {
+            format!("{sign}0.{}{digits}", "0".repeat((-decpt) as usize))
+        } else if decpt >= n {
+            format!("{sign}{digits}{}.0", "0".repeat((decpt - n) as usize))
+        } else {
+            let (a, b) = digits.split_at(decpt as usize);
+            format!("{sign}{a}.{b}")
+        }
+    } else {
+        // Exponent notation: one leading digit, exponent signed and padded
+        // to two digits.
+        let e = decpt - 1;
+        let head = &digits[..1];
+        let tail = &digits[1..];
+        let frac = if tail.is_empty() {
+            String::new()
+        } else {
+            format!(".{tail}")
+        };
+        format!("{sign}{head}{frac}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs())
+    }
 }
 
-pub fn render_tool_calls_in_history(calls: &[ToolCall]) -> String {
-    if calls.is_empty() {
-        return String::new();
+/// Serialize a JSON value the way HF `transformers` binds jinja's `tojson`:
+/// `json.dumps(v, ensure_ascii=False)`, i.e. compact but with Python's
+/// DEFAULT separators — `", "` between items and `": "` after a key — and
+/// Python's float formatting (see [`fmt_f64_python`]).
+/// `serde_json::to_string` uses `","`/`":"`, which is a different token
+/// stream for identical semantics.
+pub fn to_json_hf(v: &serde_json::Value) -> String {
+    struct HfFormatter;
+    impl serde_json::ser::Formatter for HfFormatter {
+        fn write_f64<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+            value: f64,
+        ) -> std::io::Result<()> {
+            w.write_all(fmt_f64_python(value).as_bytes())
+        }
+        fn write_f32<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+            value: f32,
+        ) -> std::io::Result<()> {
+            w.write_all(fmt_f64_python(value as f64).as_bytes())
+        }
+        fn begin_array_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if first {
+                Ok(())
+            } else {
+                w.write_all(b", ")
+            }
+        }
+        fn begin_object_key<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if first {
+                Ok(())
+            } else {
+                w.write_all(b", ")
+            }
+        }
+        fn begin_object_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+        ) -> std::io::Result<()> {
+            w.write_all(b": ")
+        }
     }
-    let mut out = String::new();
-    out.push_str("\n\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n");
+    let mut buf = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, HfFormatter);
+    match serde::Serialize::serialize(v, &mut ser) {
+        Ok(()) => String::from_utf8(buf).unwrap_or_else(|_| "null".into()),
+        Err(_) => "null".into(),
+    }
+}
+
+/// The `## Tools` block that is appended to the system turn.
+///
+/// Template lines 75-88: the block is emitted whenever `tools` is a non-empty
+/// list (even if no entry has `type == "function"`, in which case the schema
+/// list is empty), and each function schema is `tool['function'] | tojson`
+/// followed by `'\n'` — one compact object per line, unwrapped, no array, no
+/// indentation.
+pub fn push_tools_prompt(tools: &[ToolDef], out: &mut Vec<Seg>) {
+    if tools.is_empty() {
+        return;
+    }
+    out.push(Seg::Ours(TOOLS_HEADER.to_string()));
+    let mut schemas = String::new();
+    for t in tools {
+        if t.kind != "function" {
+            continue;
+        }
+        schemas.push_str(&to_json_hf(&t.function));
+        schemas.push('\n');
+    }
+    // Client-authored: a tool description must not be able to forge
+    // `<｜User｜>` / `<think>` / `｜DSML｜`. (The reference implementations
+    // tokenize this span with specials enabled and ARE forgeable there.)
+    out.push(Seg::Client(schemas));
+    out.push(Seg::Ours(TOOLS_FOOTER.to_string()));
+}
+
+/// Flat-string form of [`push_tools_prompt`] (tests / diagnostics).
+pub fn render_tools_prompt(tools: &[ToolDef]) -> String {
+    let mut segs = Vec::new();
+    push_tools_prompt(tools, &mut segs);
+    segs.iter().map(Seg::text).collect()
+}
+
+/// Re-render an assistant history turn's `tool_calls` as DSML markup.
+/// Template lines 240-258.
+pub fn push_tool_calls_in_history(calls: &[ToolCall], out: &mut Vec<Seg>) {
+    if calls.is_empty() {
+        return;
+    }
+    out.push(Seg::Ours(
+        "\n\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n".to_string(),
+    ));
     for tc in calls {
-        out.push_str("<\u{ff5c}DSML\u{ff5c}invoke name=\"");
-        push_dsml_attr(&mut out, &tc.function.name);
-        out.push_str("\">\n");
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
-            if let serde_json::Value::Object(map) = v {
+        out.push(Seg::Ours("<\u{ff5c}DSML\u{ff5c}invoke name=\"".to_string()));
+        let mut name = String::new();
+        push_dsml_attr(&mut name, &tc.function.name);
+        out.push(Seg::Client(name));
+        out.push(Seg::Ours("\">\n".to_string()));
+        match serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
+            Ok(serde_json::Value::Object(map)) => {
                 for (key, val) in &map {
                     let is_string = matches!(val, serde_json::Value::String(_));
-                    out.push_str("<\u{ff5c}DSML\u{ff5c}parameter name=\"");
-                    push_dsml_attr(&mut out, key);
-                    out.push_str("\" string=\"");
-                    out.push_str(if is_string { "true" } else { "false" });
-                    out.push_str("\">");
+                    let mut body = String::new();
                     match val {
-                        serde_json::Value::String(s) => push_dsml_parameter_text(&mut out, s),
-                        other => {
-                            let s = serde_json::to_string(other).unwrap_or_default();
-                            push_dsml_json_literal(&mut out, &s);
-                        }
+                        serde_json::Value::String(s) => push_dsml_parameter_text(&mut body, s),
+                        // `val | tojson` — HF spacing, same as the schema block.
+                        other => push_dsml_json_literal(&mut body, &to_json_hf(other)),
                     }
-                    out.push_str("</\u{ff5c}DSML\u{ff5c}parameter>\n");
+                    push_dsml_parameter(out, key, is_string, body);
                 }
-            } else {
-                out.push_str("<\u{ff5c}DSML\u{ff5c}parameter name=\"arguments\" string=\"true\">");
-                push_dsml_parameter_text(&mut out, &tc.function.arguments);
-                out.push_str("</\u{ff5c}DSML\u{ff5c}parameter>\n");
             }
-        } else {
-            out.push_str("<\u{ff5c}DSML\u{ff5c}parameter name=\"arguments\" string=\"true\">");
-            push_dsml_parameter_text(&mut out, &tc.function.arguments);
-            out.push_str("</\u{ff5c}DSML\u{ff5c}parameter>\n");
+            // Not a JSON object (or not JSON at all): pass the raw argument
+            // string through as a single string parameter, as before.
+            _ => {
+                let mut body = String::new();
+                push_dsml_parameter_text(&mut body, &tc.function.arguments);
+                push_dsml_parameter(out, "arguments", true, body);
+            }
         }
-        out.push_str("</\u{ff5c}DSML\u{ff5c}invoke>\n");
+        out.push(Seg::Ours("</\u{ff5c}DSML\u{ff5c}invoke>\n".to_string()));
     }
-    out.push_str("</\u{ff5c}DSML\u{ff5c}tool_calls>");
-    out
+    out.push(Seg::Ours("</\u{ff5c}DSML\u{ff5c}tool_calls>".to_string()));
 }
 
+fn push_dsml_parameter(out: &mut Vec<Seg>, key: &str, is_string: bool, body: String) {
+    out.push(Seg::Ours(
+        "<\u{ff5c}DSML\u{ff5c}parameter name=\"".to_string(),
+    ));
+    let mut k = String::new();
+    push_dsml_attr(&mut k, key);
+    out.push(Seg::Client(k));
+    out.push(Seg::Ours(
+        format!("\" string=\"{}\">", if is_string { "true" } else { "false" }),
+    ));
+    out.push(Seg::Client(body));
+    out.push(Seg::Ours("</\u{ff5c}DSML\u{ff5c}parameter>\n".to_string()));
+}
+
+/// Flat-string form of [`push_tool_calls_in_history`] (tests / diagnostics).
+pub fn render_tool_calls_in_history(calls: &[ToolCall]) -> String {
+    let mut segs = Vec::new();
+    push_tool_calls_in_history(calls, &mut segs);
+    segs.iter().map(Seg::text).collect()
+}
+
+/// DELIBERATE deviation from the template (line 244/251, which interpolates
+/// `func['name']` and `key` raw): entity-escape `& < > "` inside an attribute
+/// value so a tool name or an argument key cannot close the attribute or the
+/// tag. Costs byte-identity with the template only for names/keys that
+/// actually contain one of those four characters — none do in any real schema.
+/// Pinned by `dsml_attr_escaping_is_a_deliberate_deviation`.
 fn push_dsml_attr(out: &mut String, s: &str) {
     for ch in s.chars() {
         match ch {
@@ -122,6 +318,21 @@ fn push_dsml_attr(out: &mut String, s: &str) {
     }
 }
 
+/// DELIBERATE deviation from the template (line 251, which interpolates the
+/// string value raw): rewrite an embedded `</｜DSML｜parameter>` to
+/// `&lt;/｜DSML｜parameter>` so replayed tool-call arguments cannot terminate
+/// the parameter early.
+///
+/// WATCH-ITEM (D6). The old off-template header carried a sentence telling the
+/// model to write that escape itself; the header is now the template's
+/// verbatim text (`TOOLS_HEADER`) and no longer says so, while
+/// [`dsml_attr_decode`] still un-escapes entities in every string parameter
+/// the model emits. So the model sees escaped forms in its own replayed
+/// history with nothing in the prompt explaining them. If truncated string
+/// parameters start showing up in production, the fix belongs on the SCANNER
+/// side — tolerate a raw closing tag while a matching `<｜DSML｜parameter` is
+/// still open — NOT by re-adding off-template prose to the header.
+/// Pinned by `dsml_parameter_body_defangs_the_closing_tag`.
 fn push_dsml_parameter_text(out: &mut String, s: &str) {
     let end = "</\u{ff5c}DSML\u{ff5c}parameter>";
     let mut i = 0;
@@ -1035,6 +1246,113 @@ mod tests {
     // Tests construct sequences directly with bytes.
 
     const TOK_DSML_TEST: i32 = 999;
+
+    // ---- renderer: the deliberate deviations from the chat template -----
+    //
+    // The golden corpus (`tests/tool_prompt_goldens.rs`) proves the renderer
+    // is byte-identical to the template everywhere it is exercised. These
+    // four tests pin the places where it deliberately is NOT, so dropping or
+    // widening one is a test failure rather than a silent change.
+
+    fn call(name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: crate::openai::types::ToolCallFunction {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        }
+    }
+
+    /// DEVIATION 1. The template writes `name="' + func['name'] + '"` raw;
+    /// we entity-escape `& < > "` in both the tool name and the parameter
+    /// keys so neither can close the attribute.
+    #[test]
+    fn dsml_attr_escaping_is_a_deliberate_deviation() {
+        let s = render_tool_calls_in_history(&[call(
+            "a&b<c>\"d",
+            r#"{"k&<>\"y": "v"}"#,
+        )]);
+        assert!(
+            s.contains(r#"invoke name="a&amp;b&lt;c&gt;&quot;d""#),
+            "tool name not escaped: {s}"
+        );
+        assert!(
+            s.contains(r#"parameter name="k&amp;&lt;&gt;&quot;y""#),
+            "parameter key not escaped: {s}"
+        );
+        // The template would have emitted these raw — spelled out so the
+        // deviation is visible at the diff:
+        assert!(!s.contains(r#"name="a&b<c>"#));
+        // A name with none of the four characters is byte-identical to the
+        // template, which is why the golden corpus still passes.
+        let plain = render_tool_calls_in_history(&[call("search_repo", r#"{"pattern": "x"}"#)]);
+        assert!(plain.contains(r#"invoke name="search_repo""#));
+        assert!(plain.contains(r#"parameter name="pattern" string="true">x<"#));
+    }
+
+    /// DEVIATION 2. A string parameter body may not carry the literal
+    /// closing tag; it is rewritten to `&lt;/｜DSML｜parameter>`. A JSON
+    /// (`string="false"`) body gets the JSON-escape form instead, so the
+    /// value still parses.
+    #[test]
+    fn dsml_parameter_body_defangs_the_closing_tag() {
+        let end = "</\u{ff5c}DSML\u{ff5c}parameter>";
+        let payload = format!("before{end}after");
+        let s = render_tool_calls_in_history(&[call(
+            "bash",
+            &serde_json::json!({ "command": payload }).to_string(),
+        )]);
+        assert!(s.contains("before&lt;/\u{ff5c}DSML\u{ff5c}parameter>after"), "{s}");
+        // Exactly the closing tags WE emitted survive: one per parameter.
+        assert_eq!(s.matches(end).count(), 1);
+        // JSON-valued parameters use the \u003c escape so the value still
+        // parses as JSON on the way back in.
+        let s2 = render_tool_calls_in_history(&[call(
+            "bash",
+            &serde_json::json!({ "argv": [payload] }).to_string(),
+        )]);
+        assert!(s2.contains("\\u003c/\u{ff5c}DSML\u{ff5c}parameter>after"), "{s2}");
+        assert_eq!(s2.matches(end).count(), 1);
+    }
+
+    /// DEVIATION 4 lives in `prompt.rs`; DEVIATION 3 (`</tool_result>`) is
+    /// pinned by `prompt::tests::tool_result_body_is_literal_except_closing_sentinel`.
+    /// This one pins the float formatting that makes `to_json_hf` match
+    /// `json.dumps` rather than `serde_json::to_string`.
+    #[test]
+    fn to_json_hf_matches_python_float_repr() {
+        let cases = [
+            ("1e30", "1e+30"),
+            ("1e-7", "1e-07"),
+            ("1e-6", "1e-06"),
+            ("1e9", "1000000000.0"),
+            ("1e15", "1000000000000000.0"),
+            ("1e16", "1e+16"),
+            ("1e17", "1e+17"),
+            ("1.5e-5", "1.5e-05"),
+            ("1e-5", "1e-05"),
+            ("1e-4", "0.0001"),
+            ("0.0001", "0.0001"),
+            ("3.14", "3.14"),
+            ("-2.5e-8", "-2.5e-08"),
+            ("1e100", "1e+100"),
+            ("0.0", "0.0"),
+            ("-0.0", "-0.0"),
+            ("2.0", "2.0"),
+            // Integers stay integers — `json.dumps(120000)` is "120000".
+            ("120000", "120000"),
+        ];
+        for (input, want) in cases {
+            let v: serde_json::Value = serde_json::from_str(input).expect(input);
+            assert_eq!(to_json_hf(&v), want, "input {input}");
+        }
+        // Separators, too: `", "` and `": "`, not serde's `","`/`":"`.
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"a": [1, 2], "b": {"c": 1e-6}}"#).unwrap();
+        assert_eq!(to_json_hf(&v), r#"{"a": [1, 2], "b": {"c": 1e-06}}"#);
+    }
 
     /// Feed a sequence of (tok, bytes) pairs to the scanner and
     /// collect all events.
