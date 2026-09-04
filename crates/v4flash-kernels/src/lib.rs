@@ -119,5 +119,9 @@ pub use q8_k::{Q8KQuantize, BLOCK_Q8_K_BYTES, QK_K};
 pub use mhc_pre_fused::MhcPreFused;
 pub use rms_norm::{RmsNorm, RmsNormNoWeight, RmsNormNoWeightMultiWG};
 pub use rope::{RopeParams, RopeTail};
-pub use sampler::{Sampler, SamplerRng, SAMPLER_N_WG};
+pub use sampler::{
+    sampler_topp_mass_len, top_p_cutoff, top_p_min_p_threshold, Sampler, SamplerRng,
+    SAMPLER_N_WG, SAMPLER_TOPP_LEVELS, SAMPLER_TOPP_LOG_RANGE, SAMPLER_TOPP_NBINS,
+    SAMPLER_TOPP_NEDGE,
+};
 pub use weights::{load_to_device, DeviceWeight};

@@ -392,10 +392,13 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
     /// V4-Flash 0731 reasoning-effort level. Mapped by
-    /// `prompt::ReasoningEffort::from_request_fields`:
+    /// `prompt::ReasoningEffort::from_request_fields_with_default`:
     ///   ""|"none"|"off"|"disabled"|"false" → Off (no `<think>` phase)
-    ///   absent/null | "low"                → Low (think on, no preamble;
-    ///                                        the server default)
+    ///   absent/null                        → the operator default
+    ///                                        (`prompt::DEFAULT_EFFORT` =
+    ///                                        Low, overridable with
+    ///                                        `--default-reasoning-effort`)
+    ///   "low"                              → Low (think on, no preamble)
     ///   "medium"|"high"|"xhigh"            → High (0731 "high" preamble)
     ///   "max"                              → Max  (0731 "max" preamble)
     ///   anything else                      → HTTP 400

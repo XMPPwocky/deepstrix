@@ -47,6 +47,12 @@ pub struct GenerateReq {
     pub max_new: usize,
     pub temperature: f32,
     pub min_p_rel: f32,
+    /// Nucleus cutoff in (0, 1]. `1.0` = no truncation (the pre-top_p
+    /// sampler chain, bit-for-bit). The HTTP layer resolves the request's
+    /// `top_p` (or the server default) and clamps it before it gets here,
+    /// and `finish_decode` re-clamps defensively — a `0.0` (the field's
+    /// natural zero value) or a NaN degrades instead of failing the turn.
+    pub top_p: f32,
     pub seed: u64,
 }
 
@@ -243,6 +249,16 @@ pub struct EngineHandle {
     /// Which image sources the HTTP layer may read. Default-deny for
     /// absolute local paths; see `vision_prompt::ImagePolicy`.
     pub image_policy: Arc<crate::vision_prompt::ImagePolicy>,
+    /// Nucleus cutoff applied when the request omits `top_p`
+    /// (`--default-top-p`). 0.95 = DeepSeek's agent recipe for this model.
+    /// Sampling-only: it does not change the rendered prompt, so on-disk KV
+    /// snapshots stay valid across a change.
+    pub default_top_p: f32,
+    /// What an absent `reasoning` / `reasoning_effort` request field means
+    /// (`--default-reasoning-effort`). Defaults to the historical `Low`.
+    /// Changing it DOES change the rendered prompt and invalidates every
+    /// cached prefix — see `prompt::from_request_fields_with_default`.
+    pub default_reasoning_effort: crate::prompt::ReasoningEffort,
 }
 
 impl EngineHandle {
@@ -307,6 +323,11 @@ pub struct WorkerConfig {
     /// Directories under which absolute local image paths may be read
     /// (`--allow-image-dir`). Empty = local paths rejected outright.
     pub allow_image_dirs: Vec<std::path::PathBuf>,
+    /// Nucleus cutoff for requests that omit `top_p` (`--default-top-p`).
+    pub default_top_p: f32,
+    /// Effort level for requests that omit `reasoning`/`reasoning_effort`
+    /// (`--default-reasoning-effort`).
+    pub default_reasoning_effort: crate::prompt::ReasoningEffort,
 }
 
 pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
@@ -314,6 +335,8 @@ pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
     let (ready_tx, ready_rx) =
         std::sync::mpsc::sync_channel::<eyre::Result<WorkerReady>>(1);
     let n_kv_max = cfg.n_kv_max;
+    let default_top_p = cfg.default_top_p;
+    let default_reasoning_effort = cfg.default_reasoning_effort;
     let image_policy = Arc::new(crate::vision_prompt::ImagePolicy::from_dirs(
         cfg.allow_image_dirs.clone(),
     ));
@@ -348,6 +371,8 @@ pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
         vision_enabled: vision_enabled && image_placeholder_id.is_some(),
         image_placeholder_id,
         image_policy,
+        default_top_p,
+        default_reasoning_effort,
     })
 }
 
@@ -1796,12 +1821,23 @@ fn finish_decode(
 ) -> eyre::Result<()> {
     let mut pos = start_pos;
 
+    // `GenerateReq` is `pub` with no `Default`, so a future caller could hand
+    // us the field's natural zero value (or a NaN). `launch_multinomial_topp`
+    // rejects those with an `Err` — which would surface as a failed request
+    // *after* prefill has already run — so re-clamp here the same way the
+    // HTTP layer does, and treat NaN as "no truncation" rather than an error.
+    let top_p = if req.top_p.is_nan() {
+        1.0
+    } else {
+        req.top_p.clamp(crate::openai::handler::MIN_TOP_P, 1.0)
+    };
     let sample_mode = if req.temperature <= 0.0 {
         SampleMode::Argmax
     } else {
         SampleMode::Multinomial {
             temperature: req.temperature,
             min_p_rel: req.min_p_rel,
+            top_p,
         }
     };
     let mut rng = SamplerRng::new(req.seed);

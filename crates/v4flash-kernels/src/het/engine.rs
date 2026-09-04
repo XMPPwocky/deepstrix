@@ -63,8 +63,8 @@ pub enum SampleMode {
     /// Deterministic — picks argmax. Lowest-index tie-break.
     Argmax,
     /// Multinomial sample from softmax(logits / temperature).
-    /// V4-Flash's recommended setting is `temperature = 1.0,
-    /// min_p_rel = 0.0` (no pruning).
+    /// DeepSeek's agentic recipe for this model is `temperature = 1.0,
+    /// top_p = 0.95, min_p_rel = 0.0`.
     Multinomial {
         temperature: f32,
         /// Min-p threshold relative to the most-likely token (e.g. 0.05).
@@ -72,6 +72,12 @@ pub enum SampleMode {
         /// probability `exp((x*inv_T) - gmax)` falls below this threshold
         /// are skipped during the cumulative walk.
         min_p_rel: f32,
+        /// Nucleus cutoff in (0, 1]. `1.0` disables truncation and takes
+        /// the exact pre-top-p kernel chain (bit-identical results).
+        /// Composes with `min_p_rel` the way llama.cpp does: top-p is taken
+        /// over the full distribution, min-p prunes what is left, and the
+        /// mass is renormalised over the intersection.
+        top_p: f32,
     },
 }
 
@@ -1021,7 +1027,7 @@ impl HeterogeneousEngine {
                     n,
                 )?;
             }
-            SampleMode::Multinomial { temperature, min_p_rel } => {
+            SampleMode::Multinomial { temperature, min_p_rel, top_p } => {
                 if temperature <= 0.0 {
                     self.dgpu.sampler.launch_argmax(
                         &self.dgpu.compute,
@@ -1031,16 +1037,20 @@ impl HeterogeneousEngine {
                     )?;
                 } else {
                     dgpu_scratch.sampler_u01.copy_from_host(&[u01])?;
-                    self.dgpu.sampler.launch_multinomial(
+                    self.dgpu.sampler.launch_multinomial_topp(
                         &self.dgpu.compute,
                         &mut dgpu_scratch.sampler_next_token_id,
                         &dgpu_scratch.logits,
                         &mut dgpu_scratch.sampler_partials_max,
                         &mut dgpu_scratch.sampler_partials_z,
+                        &mut dgpu_scratch.sampler_topp_mass,
+                        &mut dgpu_scratch.sampler_topp_bracket,
+                        &mut dgpu_scratch.sampler_topp_thr,
                         &dgpu_scratch.sampler_u01,
                         n,
                         temperature,
                         min_p_rel,
+                        top_p,
                     )?;
                 }
             }

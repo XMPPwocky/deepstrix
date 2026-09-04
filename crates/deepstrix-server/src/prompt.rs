@@ -113,12 +113,33 @@ impl ReasoningEffort {
         reasoning: Option<&str>,
         reasoning_effort: Option<&str>,
     ) -> Result<Self, String> {
+        Self::from_request_fields_with_default(reasoning, reasoning_effort, DEFAULT_EFFORT)
+    }
+
+    /// As [`Self::from_request_fields`], but the operator picks what an
+    /// absent field means (`--default-reasoning-effort`).
+    ///
+    /// NOTE: raising this changes the RENDERED PROMPT for every request
+    /// that omits the field (High/Max prepend a preamble to the system
+    /// block), so every cached KV prefix built under the old default stops
+    /// matching and has to be re-prefilled. That is why the compiled-in
+    /// default stays `Low` and this is an explicit operator opt-in.
+    pub fn from_request_fields_with_default(
+        reasoning: Option<&str>,
+        reasoning_effort: Option<&str>,
+        default: ReasoningEffort,
+    ) -> Result<Self, String> {
         match reasoning_effort.or(reasoning) {
-            None => Ok(ReasoningEffort::Low),
+            None => Ok(default),
             Some(s) => Self::parse_str(s),
         }
     }
 }
+
+/// What an absent `reasoning` / `reasoning_effort` field means. Do NOT
+/// change this constant — see `from_request_fields_with_default`; use
+/// `--default-reasoning-effort` instead.
+pub const DEFAULT_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 
 /// The literal bytes of the `｜DSML｜` special token. The V4-Flash BPE
 /// does NOT auto-merge these bytes to the single special-token id at
