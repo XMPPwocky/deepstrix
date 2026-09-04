@@ -199,7 +199,7 @@ fn dequant_block_q6_k(blk: &[u8], out: &mut Vec<f32>) {
 }
 
 /// Dequantize `src` (whole blocks of `dt`) to f32, appending to `out`.
-/// Supported: Q8_0, Q4_K, Q5_K, Q6_K, F16, BF16, F32 (widening copies).
+/// Supported: Q8_0, Q4_K, Q5_K, Q6_K, IQ3_S, F16, BF16, F32 (widening copies).
 pub fn dequant_to_f32(dt: GgufType, src: &[u8], out: &mut Vec<f32>) -> eyre::Result<()> {
     let (_, block_bytes) = dt
         .block_shape()
@@ -247,6 +247,15 @@ pub fn dequant_to_f32(dt: GgufType, src: &[u8], out: &mut Vec<f32>) -> eyre::Res
             for blk in src.chunks_exact(block_bytes) {
                 dequant_block_q6_k(blk, out);
             }
+        }
+        // Not reached by `gguf-dequant-dense` today (routed-expert tensors,
+        // the only IQ3_S tensors in the unsloth UD-IQ3_XXS mix, are
+        // `Action::Pass` there); here so every kernel-decoded quant has a
+        // scalar CPU path for tests and future dumpers.
+        GgufType::IQ3_S => {
+            let base = out.len();
+            out.resize(base + src.len() / block_bytes * QK_K, 0.0);
+            crate::iq3_s_ref::dequant_row_iq3_s(src, &mut out[base..]);
         }
         other => return Err(eyre!("dequant_to_f32: unsupported dtype {other:?}")),
     }

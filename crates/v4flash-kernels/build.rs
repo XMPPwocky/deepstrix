@@ -23,6 +23,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DEEPSTRIX_GFX_TARGETS");
     println!("cargo:rerun-if-env-changed=DEEPSTRIX_KERNEL_CFLAGS");
 
+    export_kw_max_chunk();
+
     if !kernels_dir.exists() {
         return;
     }
@@ -40,6 +42,36 @@ fn main() {
                 compile(&hipcc, &path, arch, &out_dir);
             }
         }
+    }
+}
+
+/// Mirror the kwide `*_KW_MAX_CHUNK` bounds into `rustc-env` so the Rust
+/// launch guards can never disagree with the kernel that was actually
+/// compiled.
+///
+/// These macros size the kwide kernels' LDS staging (`s_q8v`, `s_yd`,
+/// `s_member_packed`) and register accumulators. They are `#ifndef`-guarded
+/// in the .hip so a `DEEPSTRIX_KERNEL_CFLAGS=-DIQ2S_KW_MAX_CHUNK=16u`
+/// occupancy probe takes effect — which means a hardcoded `32` on the Rust
+/// side would then let production's `chunk_size = 32` through the guard and
+/// silently overrun LDS. Parsing the same flag string here keeps the two in
+/// lockstep by construction.
+fn export_kw_max_chunk() {
+    let extra = env::var("DEEPSTRIX_KERNEL_CFLAGS").unwrap_or_default();
+    for macro_name in ["IQ2S_KW_MAX_CHUNK", "IQ3S_KW_MAX_CHUNK"] {
+        let prefix = format!("-D{macro_name}=");
+        // Last -D wins, matching the preprocessor.
+        let val = extra
+            .split_whitespace()
+            .filter_map(|tok| tok.strip_prefix(prefix.as_str()))
+            .last()
+            .map(|v| v.trim_end_matches(['u', 'U']).to_string())
+            .unwrap_or_else(|| "32".to_string());
+        assert!(
+            !val.is_empty() && val.bytes().all(|b| b.is_ascii_digit()),
+            "{macro_name}: expected a plain decimal (optionally `u`-suffixed), got {val:?}"
+        );
+        println!("cargo:rustc-env=DEEPSTRIX_{macro_name}={val}");
     }
 }
 

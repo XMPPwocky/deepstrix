@@ -2652,8 +2652,8 @@ impl HeterogeneousEngine {
                 &bd.ffn_input_norm,
                 crate::config::BLOCKS_Q8K_GATE_IN * b,
             )?;
-            // Single-prefill-kernel formats (IQ2_S/IQ2_XS/IQ3_XXS) go through
-            // the dispatcher; IQ2_XXS falls through to its kwide kernel.
+            // Single-prefill-kernel formats (IQ2_S/IQ2_XS/IQ3_XXS/IQ3_S) go
+            // through the dispatcher; IQ2_XXS falls through to its kwide kernel.
             if !super::dispatch::moe_gate_up_chunked(
                 de, ilw.routed.gate.dtype, &de.compute, &mut hd.mid_cat, &hot.gate, &hot.up,
                 &hd.moe_xq, &bd.d_ew, &hd.group_count, &hd.expert_members,
@@ -2957,10 +2957,18 @@ impl HeterogeneousEngine {
                     ..
                 } = si;
                 // Formats with a single prefill kernel (IQ2_S, IQ2_XS,
-                // IQ3_XXS-as-gate/up): chunked by-expert, IQ2_VARIANT does
-                // not apply. IQ2_XXS returns false and takes the zoo below.
+                // IQ3_XXS-as-gate/up, IQ3_S): chunked by-expert, IQ2_VARIANT
+                // does not apply. IQ2_XXS returns false and takes the zoo below.
                 let handled = {
-                    let _t_ch = ie.events.stage("igpu.pair_chunked", &ie.compute)?;
+                    // Label reflects the kernel that actually runs (kwide vs
+                    // the chunked rollback) — a trace is the only way to
+                    // confirm the kwide path is live, and IQ2_S gate/up is
+                    // essentially the whole iGPU MoE prefill in the
+                    // Vision-Exp mix.
+                    let _t_ch = ie.events.stage(
+                        super::dispatch::pair_prefill_stage(ilw.routed.gate.dtype),
+                        &ie.compute,
+                    )?;
                     super::dispatch::moe_gate_up_chunked(
                         ie, ilw.routed.gate.dtype, &ie.compute, d_mid_cat,
                         &ilw.routed.gate.buffer, &ilw.routed.up.buffer,

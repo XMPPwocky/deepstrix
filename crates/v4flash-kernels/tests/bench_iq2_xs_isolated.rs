@@ -3,8 +3,12 @@
 //! pair kernels (chunked vs kwide).
 //!
 //! Env:
-//!   BENCH_FMT     = iq2_xs (default) | iq3
+//!   BENCH_FMT     = iq2_xs (default) | iq2s | iq3 | iq3s
+//!   BENCH_N_EXPERT = experts allocated (default N_EXPERT=256; lower it to
+//!                    bound device memory — work items cycle over
+//!                    min(BENCH_WI, BENCH_N_EXPERT) distinct experts)
 //!   BENCH_VARIANT = 0 chunked (serial per-member) | 6 kwide
+//!   BENCH_RANDOM_W = 1 fills gate/up with random bytes (default: zeros)
 //!   BENCH_B, BENCH_ITERS, BENCH_WI, BENCH_CHUNK as in bench_iq2_isolated.
 //!
 //! Run:
@@ -17,7 +21,9 @@ use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Event, Stream};
 use v4flash_kernels::config::{
     BLOCKS_Q8K_GATE_IN, N_EXPERT, N_EXPERT_USED, N_FF_EXP, SWIGLU_CLAMP_EXP,
 };
+use v4flash_kernels::iq2_s::{Iq2SPairMatvec, BLOCK_IQ2_S_BYTES};
 use v4flash_kernels::iq2_xs::{Iq2XsPairMatvec, BLOCK_IQ2_XS_BYTES};
+use v4flash_kernels::iq3_s::{Iq3SPairMatvec, BLOCK_IQ3_S_BYTES};
 use v4flash_kernels::iq3_xxs_pair::Iq3XxsPairMatvec;
 use v4flash_kernels::q8_k::BLOCK_Q8_K_BYTES;
 
@@ -59,7 +65,17 @@ fn bench_iq2_xs_isolated() -> eyre::Result<()> {
         .unwrap_or(0);
     let fmt = std::env::var("BENCH_FMT").unwrap_or_else(|_| "iq2_xs".into());
     let use_kwide = variant == 6;
-    let block_bytes = if fmt == "iq3" { BLOCK_IQ3_XXS_BYTES } else { BLOCK_IQ2_XS_BYTES };
+    let n_expert_alloc: u32 = std::env::var("BENCH_N_EXPERT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(N_EXPERT)
+        .clamp(1, N_EXPERT);
+    let block_bytes = match fmt.as_str() {
+        "iq3" => BLOCK_IQ3_XXS_BYTES,
+        "iq3s" => BLOCK_IQ3_S_BYTES,
+        "iq2s" => BLOCK_IQ2_S_BYTES,
+        _ => BLOCK_IQ2_XS_BYTES,
+    };
     eprintln!("fmt={fmt} variant={variant} (0=chunked, 6=kwide)");
     eprintln!("isolated probe: B={b}, iters={iters}, n_work_items={n_work_items_target}, chunk={chunk_size}");
 
@@ -69,15 +85,37 @@ fn bench_iq2_xs_isolated() -> eyre::Result<()> {
     let stream = Stream::new(igpu.id)?;
     let iq2xs = Iq2XsPairMatvec::for_arch(&arch)?;
     let iq3p = Iq3XxsPairMatvec::for_arch(&arch)?;
+    let iq3s = Iq3SPairMatvec::for_arch(&arch)?;
+    let iq2s = Iq2SPairMatvec::for_arch(&arch)?;
 
     let gate_bpe = (N_FF_EXP as usize) * (BLOCKS_Q8K_GATE_IN as usize) * block_bytes;
     let up_bpe = gate_bpe;
-    let total_gate_bytes = gate_bpe * (N_EXPERT as usize);
+    let total_gate_bytes = gate_bpe * (n_expert_alloc as usize);
     eprintln!("allocating: gate+up 2 x {} MB", total_gate_bytes / 1_000_000);
     let mut gate_w: DeviceBuffer<u8> = DeviceBuffer::new(igpu.id, total_gate_bytes)?;
     let mut up_w: DeviceBuffer<u8> = DeviceBuffer::new(igpu.id, total_gate_bytes)?;
-    gate_w.fill_zero()?;
-    up_w.fill_zero()?;
+    if std::env::var("BENCH_RANDOM_W").map(|v| v == "1").unwrap_or(false) {
+        // Random block bytes so the data-dependent LDS grid/sign gathers
+        // see real (conflicting) indices instead of all hitting entry 0.
+        // Every bit pattern is a valid block for these formats.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut fill = |dst: &mut DeviceBuffer<u8>| -> eyre::Result<()> {
+            let mut h = vec![0u8; total_gate_bytes];
+            for chunk in h.chunks_exact_mut(8) {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                chunk.copy_from_slice(&state.to_le_bytes());
+            }
+            dst.copy_from_host(&h)
+        };
+        fill(&mut gate_w)?;
+        fill(&mut up_w)?;
+        eprintln!("weights: random bytes (BENCH_RANDOM_W=1)");
+    } else {
+        gate_w.fill_zero()?;
+        up_w.fill_zero()?;
+    }
 
     let xq_bytes_per_token = (BLOCKS_Q8K_GATE_IN as usize) * BLOCK_Q8_K_BYTES;
     let mut xq: DeviceBuffer<u8> =
@@ -97,7 +135,7 @@ fn bench_iq2_xs_isolated() -> eyre::Result<()> {
         DeviceBuffer::new(igpu.id, n_work_items_target as usize)?;
 
     // Distinct experts per work item (same pattern as bench_iq2_isolated).
-    let n_distinct = n_work_items_target.min(N_EXPERT) as usize;
+    let n_distinct = n_work_items_target.min(n_expert_alloc) as usize;
     let mut gc_host = vec![0i32; N_EXPERT as usize];
     let mut em_host = vec![0i32; (N_EXPERT as usize) * (max_per_expert as usize)];
     let mut wi_host = vec![0i32; n_work_items_target as usize];
@@ -124,6 +162,30 @@ fn bench_iq2_xs_isolated() -> eyre::Result<()> {
 
     let launch = |mid: &mut DeviceBuffer<f32>| -> eyre::Result<()> {
         match (fmt.as_str(), use_kwide) {
+            ("iq2s", true) => iq2s.launch_fused_swiglu_kwide(
+                &stream, mid, &gate_w, &up_w, &xq, &expert_w,
+                &group_count, &expert_members, &work_items, n_work_items_target,
+                gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+                chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+            ),
+            ("iq2s", false) => iq2s.launch_fused_swiglu_chunked(
+                &stream, mid, &gate_w, &up_w, &xq, &expert_w,
+                &group_count, &expert_members, &work_items, n_work_items_target,
+                gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+                chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+            ),
+            ("iq3s", true) => iq3s.launch_fused_swiglu_kwide(
+                &stream, mid, &gate_w, &up_w, &xq, &expert_w,
+                &group_count, &expert_members, &work_items, n_work_items_target,
+                gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+                chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+            ),
+            ("iq3s", false) => iq3s.launch_fused_swiglu_chunked(
+                &stream, mid, &gate_w, &up_w, &xq, &expert_w,
+                &group_count, &expert_members, &work_items, n_work_items_target,
+                gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+                chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+            ),
             ("iq3", true) => iq3p.launch_fused_swiglu_kwide(
                 &stream, mid, &gate_w, &up_w, &xq, &expert_w,
                 &group_count, &expert_members, &work_items, n_work_items_target,

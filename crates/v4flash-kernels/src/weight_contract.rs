@@ -56,12 +56,16 @@ pub fn role_of(name: &str) -> String {
 /// The `Quant` lists enumerate the types the forward pass has *wired
 /// kernels for today* — extend a list only together with the dispatch that
 /// executes the new type. Phase 2 (unsloth-UD) wired: IQ3_XXS/MXFP4 down,
-/// IQ2_S gate/up, Q5_K/Q6_K shexp+q_a, Q4_K head/embd. [`validate_model`]
-/// on a file using anything else reports it as the missing-kernel list.
+/// IQ2_S gate/up, Q5_K/Q6_K shexp+q_a, Q4_K head/embd. UD-IQ3_XXS: IQ3_S
+/// gate/up (blk.26), Q6_K head/embd. [`validate_model`] on a file using
+/// anything else reports it as the missing-kernel list.
 pub fn expectation(role: &str) -> Option<Expect> {
     Some(match role {
         // ---- dense attention / head: kernel-decoded quants ----
-        "output.weight" => Expect::Quant(&[Q8_0, Q4_K]),
+        // Q6_K: unsloth UD-IQ3_XXS head (decode: q6d matvec via
+        // `dispatch::dense_matvec`; prefill last-token head loops through
+        // the same `forward_head`).
+        "output.weight" => Expect::Quant(&[Q8_0, Q4_K, Q6_K]),
         "blk.N.attn_q_a.weight" => Expect::Quant(&[Q8_0, Q5_K, Q6_K]),
         "blk.N.attn_q_b.weight"
         | "blk.N.attn_kv.weight"
@@ -72,9 +76,11 @@ pub fn expectation(role: &str) -> Option<Expect> {
         // IQ2_XXS/IQ2_S: antirez + unsloth UD-IQ2_XXS. IQ2_XS: unsloth
         // UD-Q2_K_XL's 42 non-exceptional layers. IQ3_XXS: that mix's
         // blk.26 — the only place IQ3_XXS appears at gate/up rather than
-        // down, hence the separate `iq3_xxs_pair` kernel family.
+        // down, hence the separate `iq3_xxs_pair` kernel family. IQ3_S:
+        // unsloth UD-IQ3_XXS blk.26 gate/up (`iq3_s_pair` family, 110 B
+        // blocks; see docs/IQ3_S_KERNEL_PLAN.md).
         "blk.N.ffn_gate_exps.weight" | "blk.N.ffn_up_exps.weight" => {
-            Expect::Quant(&[IQ2_XXS, IQ2_S, IQ2_XS, IQ3_XXS])
+            Expect::Quant(&[IQ2_XXS, IQ2_S, IQ2_XS, IQ3_XXS, IQ3_S])
         }
         "blk.N.ffn_down_exps.weight" => Expect::Quant(&[Q2_K, IQ3_XXS, MXFP4]),
         "blk.N.ffn_gate_shexp.weight" | "blk.N.ffn_up_shexp.weight" => {
@@ -104,8 +110,9 @@ pub fn expectation(role: &str) -> Option<Expect> {
 /// loaded through `load_to_device` — validated by its consumers; see
 /// [`crate::embed::embed_lookup`]).
 /// Host-side embedding lookup (deepstrix-server/src/embed.rs) — F16 raw,
-/// Q4_K (unsloth UD-IQ2_XXS) and Q5_K (unsloth UD-Q2_K_XL) row-dequant.
-pub const TOKEN_EMBD_ALLOWED: &[GgufType] = &[F16, Q4_K, Q5_K];
+/// Q4_K (unsloth UD-IQ2_XXS), Q5_K (unsloth UD-Q2_K_XL) and Q6_K (unsloth
+/// UD-IQ3_XXS) row-dequant.
+pub const TOKEN_EMBD_ALLOWED: &[GgufType] = &[F16, Q4_K, Q5_K, Q6_K];
 
 /// Expected dims for roles whose shapes are pinned by `config.rs`
 /// constants (the ones a wrong shape would silently corrupt). Dims are in
@@ -329,5 +336,39 @@ mod tests {
             bytes_per_expert(MXFP4, N_FF_EXP as u64, N_EMBD as u64).unwrap(),
             (N_EMBD as usize) * (N_FF_EXP as usize / 32) * 17
         );
+        // IQ3_S gate/up (unsloth UD-IQ3_XXS blk.26): [4096, 2048] per
+        // expert = 2048 rows × 16 blocks × 110 B, matching the GGUF
+        // tensor size 922,746,880 / 256.
+        assert_eq!(bytes_per_expert(IQ3_S, N_EMBD as u64, N_FF_EXP as u64).unwrap(), 3_604_480);
+        assert_eq!(bytes_per_expert(IQ3_S, 4096, 2048).unwrap(), 2048 * 16 * 110);
+        assert_eq!(3_604_480u64 * 256, 922_746_880);
+    }
+
+    #[test]
+    fn contract_accepts_ud_iq3_xxs_mix() {
+        // The four roles that blocked unsloth UD-IQ3_XXS before this change.
+        let gu = match expectation("blk.N.ffn_gate_exps.weight") {
+            Some(Expect::Quant(a)) => a,
+            _ => panic!(),
+        };
+        assert!(gu.contains(&IQ3_S));
+        assert!(gu.contains(&IQ2_S) && gu.contains(&IQ2_XS) && gu.contains(&IQ3_XXS));
+        let up = match expectation("blk.N.ffn_up_exps.weight") {
+            Some(Expect::Quant(a)) => a,
+            _ => panic!(),
+        };
+        assert!(up.contains(&IQ3_S));
+        let head = match expectation("output.weight") {
+            Some(Expect::Quant(a)) => a,
+            _ => panic!(),
+        };
+        assert!(head.contains(&Q6_K) && head.contains(&Q8_0) && head.contains(&Q4_K));
+        assert!(TOKEN_EMBD_ALLOWED.contains(&Q6_K));
+        // Down stays as-is: IQ3_S never appears at down in that mix.
+        let down = match expectation("blk.N.ffn_down_exps.weight") {
+            Some(Expect::Quant(a)) => a,
+            _ => panic!(),
+        };
+        assert!(!down.contains(&IQ3_S));
     }
 }

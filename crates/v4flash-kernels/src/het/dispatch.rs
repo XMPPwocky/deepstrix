@@ -53,6 +53,10 @@ pub fn moe_gate_up_batch(
         GgufType::IQ3_XXS => e.iq3pair.launch_fused_swiglu_batch(
             s, mid, gate, up, xq, ew, selected, gbpe, ubpe, n_used, clamp, n_rows, n_blocks,
         ),
+        // blk.26 of the unsloth UD-IQ3_XXS mixes.
+        GgufType::IQ3_S => e.iq3s.launch_fused_swiglu_batch(
+            s, mid, gate, up, xq, ew, selected, gbpe, ubpe, n_used, clamp, n_rows, n_blocks,
+        ),
         other => Err(eyre!("moe gate/up: no decode kernel for {other:?}")),
     }
 }
@@ -95,6 +99,10 @@ pub fn moe_gate_up_batch_hetsplit(
         // gate/up at IQ3_XXS is blk.26 of UD-Q2_K_XL only — the PAIR family,
         // not the down-projection `iq3` one.
         GgufType::IQ3_XXS => e.iq3pair.launch_fused_swiglu_batch_hetsplit(
+            s, mid, gate, up, xq, ew, selected, remap, mode, cap, gbpe, ubpe, n_used, clamp,
+            n_rows, n_blocks,
+        ),
+        GgufType::IQ3_S => e.iq3s.launch_fused_swiglu_batch_hetsplit(
             s, mid, gate, up, xq, ew, selected, remap, mode, cap, gbpe, ubpe, n_used, clamp,
             n_rows, n_blocks,
         ),
@@ -230,6 +238,39 @@ pub fn dense_gemm_prefill(
     }
 }
 
+/// Whether the kwide prefill kernel — weights dequantized once per lane and
+/// amortized across the chunk's members — handles `dt`, given the
+/// `PAIR_VARIANT=chunked` rollback flag.
+///
+/// Pure and public so the routing is unit-testable without a GPU: a missing
+/// arm here is the whole class of bug that cost IQ2_S ~4x prefill until
+/// 2026-09-04, and it is invisible to the oracles (both kernels are
+/// numerically correct — only one is fast).
+pub fn pair_kwide_selected(dt: GgufType, rollback_to_chunked: bool) -> bool {
+    !rollback_to_chunked
+        && matches!(
+            dt,
+            GgufType::IQ2_S | GgufType::IQ2_XS | GgufType::IQ3_XXS | GgufType::IQ3_S
+        )
+}
+
+/// `PAIR_VARIANT=chunked` rolls the pair formats back to the serial
+/// per-member kernel.
+fn pair_variant_rollback() -> bool {
+    std::env::var("PAIR_VARIANT").map(|v| v == "chunked").unwrap_or(false)
+}
+
+/// Perfetto stage name for a [`moe_gate_up_chunked`] launch, reflecting the
+/// kernel that will actually run. A trace is the only way to confirm the
+/// kwide path is live in production, so the label must not be a constant.
+pub fn pair_prefill_stage(dt: GgufType) -> &'static str {
+    if pair_kwide_selected(dt, pair_variant_rollback()) {
+        "igpu.pair_kwide"
+    } else {
+        "igpu.pair_chunked"
+    }
+}
+
 /// Prefill MoE gate/up (chunked by-expert), for the formats that have
 /// exactly one prefill kernel.
 ///
@@ -260,14 +301,21 @@ pub fn moe_gate_up_chunked(
     n_rows: u32,
     n_blocks: u32,
 ) -> eyre::Result<bool> {
-    // IQ2_XS / IQ3_XXS pair kwide (2026-08-15): default prefill kernel is
-    // the M51-structure kwide port (weights dequantized once per lane and
-    // amortized across chunk members). PAIR_VARIANT=chunked rolls back to
-    // the serial per-member kernel.
-    let use_kwide = std::env::var("PAIR_VARIANT")
-        .map(|v| v != "chunked")
-        .unwrap_or(true);
+    // IQ2_S / IQ2_XS / IQ3_XXS / IQ3_S pair kwide (2026-08-15; IQ3_S 2026-09-03;
+    // IQ2_S 2026-09-04): default prefill kernel is the M51-structure kwide port
+    // (weights dequantized once per lane and amortized across chunk members).
+    // IQ2_XXS returns false and reaches its own kwide path in the caller.
+    // PAIR_VARIANT=chunked rolls back to the serial per-member kernel.
+    //
+    // The per-arm `if use_kwide` guards go through `pair_kwide_selected` so
+    // the format list lives in exactly one place and `pair_prefill_stage`
+    // (the trace label) and the unit tests below cannot drift from it.
+    let use_kwide = pair_kwide_selected(dt, pair_variant_rollback());
     match dt {
+        GgufType::IQ2_S if use_kwide => e.iq2s.launch_fused_swiglu_kwide(
+            s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
+        )?,
         GgufType::IQ2_S => e.iq2s.launch_fused_swiglu_chunked(
             s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
             gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
@@ -288,8 +336,67 @@ pub fn moe_gate_up_chunked(
             s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
             gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
         )?,
+        GgufType::IQ3_S if use_kwide => e.iq3s.launch_fused_swiglu_kwide(
+            s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
+        )?,
+        GgufType::IQ3_S => e.iq3s.launch_fused_swiglu_chunked(
+            s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
+        )?,
         GgufType::IQ2_XXS => return Ok(false),
         other => return Err(eyre!("moe gate/up prefill: no kernel for {other:?}")),
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard for the 2026-09-04 fix: IQ2_S is gate/up on 42 of 43
+    /// layers of the Vision-Exp mix, and before the fix it had no kwide arm,
+    /// so it silently fell to the ~4x-slower per-member re-dequant kernel
+    /// with every oracle still green.
+    #[test]
+    fn pair_formats_default_to_kwide() {
+        for dt in [
+            GgufType::IQ2_S,
+            GgufType::IQ2_XS,
+            GgufType::IQ3_XXS,
+            GgufType::IQ3_S,
+        ] {
+            assert!(
+                pair_kwide_selected(dt, false),
+                "{dt:?} must take the kwide prefill kernel by default"
+            );
+            assert_eq!(
+                pair_prefill_stage(dt),
+                "igpu.pair_kwide",
+                "{dt:?} kwide launches must be traceable as such"
+            );
+        }
+    }
+
+    #[test]
+    fn pair_variant_chunked_rolls_back() {
+        for dt in [
+            GgufType::IQ2_S,
+            GgufType::IQ2_XS,
+            GgufType::IQ3_XXS,
+            GgufType::IQ3_S,
+        ] {
+            assert!(!pair_kwide_selected(dt, true), "{dt:?} rollback");
+        }
+    }
+
+    /// IQ2_XXS has its own `IQ2_VARIANT` kernel zoo in the caller and must
+    /// never be claimed by the pair dispatcher's kwide path.
+    #[test]
+    fn non_pair_formats_are_not_kwide() {
+        for dt in [GgufType::IQ2_XXS, GgufType::Q2_K, GgufType::Q8_0] {
+            assert!(!pair_kwide_selected(dt, false), "{dt:?}");
+            assert!(!pair_kwide_selected(dt, true), "{dt:?}");
+        }
+    }
 }

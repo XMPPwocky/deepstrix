@@ -11,6 +11,24 @@
 //! oracle test under `tests/`. The test loads the relevant tag slices
 //! from the activation dump and asserts `max_abs_diff < threshold`.
 
+/// Decimal parse for build-script-provided bounds, usable in `const` items.
+///
+/// `build.rs` emits the kwide `*_KW_MAX_CHUNK` values as `rustc-env`
+/// strings so the launch guards track the macro the kernels were actually
+/// compiled with; this turns one back into a `u32` at compile time.
+pub(crate) const fn parse_u32_dec(s: &str) -> u32 {
+    let b = s.as_bytes();
+    assert!(!b.is_empty(), "expected a decimal integer");
+    let mut i = 0;
+    let mut v: u32 = 0;
+    while i < b.len() {
+        assert!(b[i] >= b'0' && b[i] <= b'9', "expected a decimal integer");
+        v = v * 10 + (b[i] - b'0') as u32;
+        i += 1;
+    }
+    v
+}
+
 pub mod attention;
 pub mod broadcast;
 pub mod comp_kv_append;
@@ -36,6 +54,8 @@ pub mod iq2_xs_tables;
 pub mod iq3_xxs;
 pub mod iq3_xxs_pair;
 pub mod iq3_xxs_tables;
+pub mod iq3_s;
+pub mod iq3_s_tables;
 pub mod mxfp4;
 pub mod mxfp4_tables;
 pub mod kv_cache_append;
