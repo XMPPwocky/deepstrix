@@ -442,7 +442,14 @@ extern "C" __global__ void iq3_s_pair_matvec_fused_swiglu_chunked(
 // (q.z,q.w) = subgroup 2*half+1's.
 // =============================================================================
 
+// Upper bound on the runtime `chunk_size` (sizes s_q8v / s_yd /
+// s_member_packed and the lane_pacc register arrays). #ifndef so a
+// DEEPSTRIX_KERNEL_CFLAGS=-DIQ3S_KW_MAX_CHUNK=... probe takes effect.
+// The Rust launch guard (src/iq3_s.rs IQ3S_KW_MAX_CHUNK) tracks the same -D
+// via build.rs; edit via -D, not by changing this literal.
+#ifndef IQ3S_KW_MAX_CHUNK
 #define IQ3S_KW_MAX_CHUNK 32u
+#endif
 #ifndef IQ3S_KW_UNROLL
 #define IQ3S_KW_UNROLL 4
 #endif

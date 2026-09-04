@@ -20,6 +20,14 @@ const IQ3_S_GFX1151: &[u8] = include_bytes!(env!("KERNEL_IQ3_S_PAIR_MATVEC_GFX11
 
 pub use crate::iq3_s_tables::BLOCK_IQ3_S_BYTES;
 
+/// Largest `chunk_size` the kwide prefill kernel can take (it sizes the
+/// kernel's LDS staging and register accumulators).
+///
+/// Derived from `build.rs` off the same `-DIQ3S_KW_MAX_CHUNK=...` the kernel
+/// is compiled with; see the note on [`crate::iq2_s::IQ2S_KW_MAX_CHUNK`].
+pub const IQ3S_KW_MAX_CHUNK: u32 =
+    crate::parse_u32_dec(env!("DEEPSTRIX_IQ3S_KW_MAX_CHUNK"));
+
 pub struct Iq3SPairMatvec {
     module: Module,
 }
@@ -247,9 +255,9 @@ impl Iq3SPairMatvec {
         if n_blocks % 2 != 0 {
             return Err(eyre!("iq3_s kwide: n_blocks={n_blocks} must be even"));
         }
-        if chunk_size > 32 {
+        if chunk_size > IQ3S_KW_MAX_CHUNK {
             return Err(eyre!(
-                "iq3_s kwide: chunk_size={chunk_size} exceeds IQ3S_KW_MAX_CHUNK=32"
+                "iq3_s kwide: chunk_size={chunk_size} exceeds                  IQ3S_KW_MAX_CHUNK={IQ3S_KW_MAX_CHUNK}"
             ));
         }
         if n_work_items == 0 {

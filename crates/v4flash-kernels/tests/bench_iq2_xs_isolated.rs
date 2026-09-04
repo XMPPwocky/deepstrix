@@ -3,7 +3,7 @@
 //! pair kernels (chunked vs kwide).
 //!
 //! Env:
-//!   BENCH_FMT     = iq2_xs (default) | iq3 | iq3s
+//!   BENCH_FMT     = iq2_xs (default) | iq2s | iq3 | iq3s
 //!   BENCH_N_EXPERT = experts allocated (default N_EXPERT=256; lower it to
 //!                    bound device memory — work items cycle over
 //!                    min(BENCH_WI, BENCH_N_EXPERT) distinct experts)
@@ -21,6 +21,7 @@ use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Event, Stream};
 use v4flash_kernels::config::{
     BLOCKS_Q8K_GATE_IN, N_EXPERT, N_EXPERT_USED, N_FF_EXP, SWIGLU_CLAMP_EXP,
 };
+use v4flash_kernels::iq2_s::{Iq2SPairMatvec, BLOCK_IQ2_S_BYTES};
 use v4flash_kernels::iq2_xs::{Iq2XsPairMatvec, BLOCK_IQ2_XS_BYTES};
 use v4flash_kernels::iq3_s::{Iq3SPairMatvec, BLOCK_IQ3_S_BYTES};
 use v4flash_kernels::iq3_xxs_pair::Iq3XxsPairMatvec;
@@ -72,6 +73,7 @@ fn bench_iq2_xs_isolated() -> eyre::Result<()> {
     let block_bytes = match fmt.as_str() {
         "iq3" => BLOCK_IQ3_XXS_BYTES,
         "iq3s" => BLOCK_IQ3_S_BYTES,
+        "iq2s" => BLOCK_IQ2_S_BYTES,
         _ => BLOCK_IQ2_XS_BYTES,
     };
     eprintln!("fmt={fmt} variant={variant} (0=chunked, 6=kwide)");
@@ -84,6 +86,7 @@ fn bench_iq2_xs_isolated() -> eyre::Result<()> {
     let iq2xs = Iq2XsPairMatvec::for_arch(&arch)?;
     let iq3p = Iq3XxsPairMatvec::for_arch(&arch)?;
     let iq3s = Iq3SPairMatvec::for_arch(&arch)?;
+    let iq2s = Iq2SPairMatvec::for_arch(&arch)?;
 
     let gate_bpe = (N_FF_EXP as usize) * (BLOCKS_Q8K_GATE_IN as usize) * block_bytes;
     let up_bpe = gate_bpe;
@@ -159,6 +162,18 @@ fn bench_iq2_xs_isolated() -> eyre::Result<()> {
 
     let launch = |mid: &mut DeviceBuffer<f32>| -> eyre::Result<()> {
         match (fmt.as_str(), use_kwide) {
+            ("iq2s", true) => iq2s.launch_fused_swiglu_kwide(
+                &stream, mid, &gate_w, &up_w, &xq, &expert_w,
+                &group_count, &expert_members, &work_items, n_work_items_target,
+                gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+                chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+            ),
+            ("iq2s", false) => iq2s.launch_fused_swiglu_chunked(
+                &stream, mid, &gate_w, &up_w, &xq, &expert_w,
+                &group_count, &expert_members, &work_items, n_work_items_target,
+                gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+                chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+            ),
             ("iq3s", true) => iq3s.launch_fused_swiglu_kwide(
                 &stream, mid, &gate_w, &up_w, &xq, &expert_w,
                 &group_count, &expert_members, &work_items, n_work_items_target,
