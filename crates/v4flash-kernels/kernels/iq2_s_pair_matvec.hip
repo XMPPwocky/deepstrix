@@ -1,9 +1,13 @@
 // iq2_s_pair_matvec — gate+up fused-SwiGLU kernels for IQ2_S weights.
 //
-// unsloth UD mix: blk.26's ffn_gate_exps + ffn_up_exps are IQ2_S (every
-// other layer stays IQ2_XXS). One layer only, so this family mirrors the
-// iq2_xxs pair kernels' three load-bearing variants (decode batch, decode
-// hetsplit, prefill chunked-by-expert) without the deeper staging zoo.
+// unsloth UD mix: blk.26's ffn_gate_exps + ffn_up_exps are IQ2_S in the
+// UD-Q2_K_XL file; in the Vision-Exp UD-IQ3_XXS file IQ2_S is instead the
+// gate/up type on 42 of 43 layers (blk.26 goes IQ3_S). This family mirrors
+// the iq2_xxs pair kernels' three load-bearing variants (decode batch,
+// decode hetsplit, prefill chunked-by-expert) plus the kwide prefill kernel
+// at the bottom (weights dequantized once per lane and amortized across the
+// chunk's members — the `_chunked` kernel re-dequants per member, the
+// ae9bd61 trap).
 //
 // IQ2_S block (82 B per 256 elements), llama.cpp block_iq2_s:
 //   d (half) | qs[64] | qh[8] | scales[8]
@@ -14,10 +18,13 @@
 //                  ls2 = 1+2*(s>>4) (l=2,3)
 //   block result = 0.125 * d * yd * Σ_ib32 (ls1*sumi1 + ls2*sumi2)
 //
-// LDS: s_sign_pair256 (2 KiB; signs are raw bytes → 256-entry pre-expanded
-// mask pairs) + s_grid2s (8 KiB; 1024×u64 codebook) + xq staging (4.7 KiB)
-// ≈ 15 KiB/WG — same class as the iq2 wstage variant's 16.1 KiB, which
-// measured full occupancy.
+// LDS (DECODE + CHUNKED kernels only): s_sign_pair256 (2 KiB; signs are raw
+// bytes → 256-entry pre-expanded mask pairs) + s_grid2s (8 KiB; 1024×u64
+// codebook) + xq staging (4.7 KiB) ≈ 15 KiB/WG — same class as the iq2
+// wstage variant's 16.1 KiB, which measured full occupancy.
+// The kwide PREFILL kernel is NOT in this class: it adds a 16 KiB s_q8v
+// member-staging buffer for 26.4 KiB total → 2 WGs/CU. See its banner
+// ("kwide prefill", below) for the footprint and the occupancy note.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -390,5 +397,288 @@ extern "C" __global__ void iq2_s_pair_matvec_fused_swiglu_chunked(
             }
         }
         __syncthreads(); // before next member's xq overwrite
+    }
+}
+
+
+// =============================================================================
+// kwide — M51-structure port for IQ2_S gate/up (2026-09-04), from
+// iq3_s_pair_matvec_fused_swiglu_kwide (itself the iq3_xxs kwide port).
+//
+// WHY: the `_chunked` kernel above iterates chunk members SERIALLY and
+// re-reads AND re-dequantizes the expert's whole weight rows for every
+// member (grid/sign LUT walk + cond-neg per member). With HOT_CHUNK=32 the
+// same weight block is dequantized up to 32x per WG. That is exactly the
+// ae9bd61 UD-Q2_K_XL trap: gate/up IQ2_S on 42 of 43 layers of the unsloth
+// Vision-Exp UD-IQ3_XXS mix ran this path and pinned prefill at ~152 tok/s.
+//
+// Lane mapping: warp = row; lanes split a super-block PAIR — sbh = lane>>4
+// picks the sb, l15 = lane&15 → ib32 = l15>>1, half = l15&1. The lane owns
+// the 16 weights of subgroups l = 2*half, 2*half+1 (2 grid entries x 8):
+//   qg   = qs[4*ib32 + 2*half .. +2)        (offset 2 + 4*ib32 + 2*half → even)
+//   sg   = qs[32 + 4*ib32 + 2*half .. +2)   (offset 34 + ... → even; RAW sign
+//                                            bytes, kmask domain)
+//   qhn  = (qh[ib32] >> 4*half) & 0xf       (bits (0,1) → 9th/10th index bit
+//                                            of l0, bits (2,3) → those of l1;
+//                                            ggml: qs[l] | ((qh<<(8-2l))&0x300))
+//   ls   = 1 + 2 * ((scales[ib32] >> 4*half) & 0xf)
+//          (ggml's ls1 covers l=0,1 and ls2 covers l=2,3 — i.e. EXACTLY one
+//           lane's 16 weights, so the per-lane scale fold is exact)
+//   gds  = 0.125f * f16(d) * ls             (IQ2_S carries ggml's 0.125
+//                                            prefactor; iq3_s has none,
+//                                            iq3_xxs uses 0.25)
+// Note the same nibble shift 4*half serves BOTH qh and scales.
+//
+// Alignment: 82 ≡ 2 (mod 4), so intra-block dword fields are only 2-aligned;
+// every multi-byte load goes through load_u16_par, as in the 110-byte iq3_s
+// and 98-byte iq3_xxs kernels.
+//
+// The staged s_q8v lane slice [16*l15, +16) of the block's 256 q8 bytes is
+// exactly ib32*32 + 16*half → (q.x,q.y) = subgroup 2*half's two grid halves,
+// (q.z,q.w) = subgroup 2*half+1's.
+//
+// LDS: s_sign_pair256 2 KiB + s_grid2s 8 KiB + s_q8v 16 KiB + s_yd 0.25 +
+// s_member_packed 0.125 ≈ 26.4 KiB (iq2_xs 21.4, iq3_s 20.4, iq3_xxs 18.4)
+// → 2 WGs/CU, the same occupancy class as the iq2_xs kwide kernel.
+//
+// s_q8v dominates that footprint and is the binding limiter: halving
+// IQ2S_KW_MAX_CHUNK to 16 drops the kernel under the 3-WG/CU line and
+// measured -12%/-14.5% in the isolated bench. That number is an OCCUPANCY
+// CEILING, not the expected production delta — it was taken at BENCH_CHUNK=16
+// (bench_iq2_xs_isolated.rs's default), where the whole member set still fits
+// ONE staging pass, so it pays none of the restructuring cost. Production runs
+// chunk_size=32 (HOT_CHUNK / CHUNK_SIZE), where keeping MAX_CHUNK=16 forces
+// s_q8v to be staged twice per super-block pair and adds two extra
+// __syncthreads() per pair on top of the two already in the member loop —
+// 8 pairs × 2 barriers/WG the probe never paid. Re-bench at BENCH_CHUNK=32
+// before believing any part of the -14.5%. MAX_CHUNK=32 is what ships.
+// =============================================================================
+
+// Even-offset u16 load (every multi-byte IQ2_S intra-block field is
+// 2-aligned, never 4-aligned: 82 ≡ 2 mod 4).
+__device__ __forceinline__ uint32_t load_u16_iq2s(const uint8_t* p) {
+    uint16_t v;
+    __builtin_memcpy(&v, p, 2);
+    return (uint32_t)v;
+}
+
+// Upper bound on the runtime `chunk_size`: sizes s_q8v / s_yd /
+// s_member_packed below and the lane_pacc_g|u register arrays. #ifndef so a
+// DEEPSTRIX_KERNEL_CFLAGS=-DIQ2S_KW_MAX_CHUNK=... occupancy probe actually
+// takes effect (an unguarded #define silently wins over the -D).
+// The Rust launch guard (src/iq2_s.rs IQ2S_KW_MAX_CHUNK) tracks the same -D
+// via build.rs, so a probe cannot leave it accepting a chunk_size this
+// kernel has no LDS for. Editing this literal directly bypasses that — pass
+// -D instead.
+#ifndef IQ2S_KW_MAX_CHUNK
+#define IQ2S_KW_MAX_CHUNK 32u
+#endif
+#ifndef IQ2S_KW_UNROLL
+#define IQ2S_KW_UNROLL 4
+#endif
+
+extern "C" __global__ void iq2_s_pair_matvec_fused_swiglu_kwide(
+        float        * __restrict__ mid,           // [B, n_used, n_rows]
+        const uint8_t * __restrict__ gate_w_base,
+        const uint8_t * __restrict__ up_w_base,
+        const uint8_t * __restrict__ xq,           // [B, n_blocks*292]
+        const float  * __restrict__ expert_w,      // [B, n_used]
+        const int    * __restrict__ group_count,   // [n_expert]
+        const int    * __restrict__ expert_members,// [n_expert * max_per_expert]
+        const int    * __restrict__ work_items,    // [n_work_items]
+        unsigned int    gate_bpe,
+        unsigned int    up_bpe,
+        unsigned int    n_used,
+        unsigned int    max_per_expert,
+        unsigned int    chunk_size,
+        float           clamp,
+        unsigned int    n_rows,
+        unsigned int    n_blocks) {
+    const unsigned int w_idx = blockIdx.y;
+    const int packed_item = work_items[w_idx];
+    const unsigned int e            = (unsigned int)(packed_item >> 16) & 0xffffu;
+    const unsigned int member_start = (unsigned int)(packed_item       ) & 0xffffu;
+    const int group_n = group_count[e];
+    const unsigned int member_end = min((unsigned int)group_n, member_start + chunk_size);
+    if (member_end <= member_start) return;
+    const unsigned int n_members = member_end - member_start;
+
+    __shared__ uint64_t s_sign_pair256[256];
+    __shared__ uint64_t s_grid2s[1024];
+    __shared__ uint4    s_q8v[IQ2S_KW_MAX_CHUNK * 2 * 16]; // [mi][sbh][16]
+    __shared__ float    s_yd[IQ2S_KW_MAX_CHUNK * 2];       // [mi][sbh]
+    __shared__ int      s_member_packed[IQ2S_KW_MAX_CHUNK];
+
+    const unsigned int tid = threadIdx.x;
+    for (unsigned int i = tid; i < n_members; i += blockDim.x) {
+        s_member_packed[i] = expert_members[(size_t)e * (size_t)max_per_expert
+                                          + (size_t)(member_start + i)];
+    }
+    IQ2S_STAGE_TABLES(s_sign_pair256, s_grid2s);
+    __syncthreads();
+
+    const unsigned int row_in_block = tid >> 5;            // 0..7 (warp index)
+    const unsigned int lane         = tid & 31u;
+    const unsigned int row          = blockIdx.x * 8u + row_in_block;
+    const bool row_valid = (row < n_rows);
+
+    const unsigned int sbh       = lane >> 4;              // 0..1: sb of pair
+    const unsigned int l15       = lane & 15u;
+    const unsigned int sub_block = l15 >> 1;               // 0..7 (ib32)
+    const unsigned int half      = l15 & 1u;               // 0..1
+    const unsigned int hsh       = 4u * half;              // qh + scale nibble shift
+
+    const uint8_t* gate_e_base = gate_w_base + (uint64_t)e * (uint64_t)gate_bpe;
+    const uint8_t* up_e_base   = up_w_base   + (uint64_t)e * (uint64_t)up_bpe;
+
+    float lane_pacc_g[IQ2S_KW_MAX_CHUNK];
+    float lane_pacc_u[IQ2S_KW_MAX_CHUNK];
+    #pragma unroll
+    for (unsigned int mi = 0; mi < IQ2S_KW_MAX_CHUNK; mi++) {
+        lane_pacc_g[mi] = 0.0f;
+        lane_pacc_u[mi] = 0.0f;
+    }
+
+    const unsigned int n_pairs = n_blocks >> 1;   // wrapper asserts n_blocks even
+    for (unsigned int sbp = 0; sbp < n_pairs; sbp++) {
+        const unsigned int sb_lane = 2u * sbp + sbh;       // this lane's sb
+
+        // --- Dequant: this lane's 16 weights x 2 matrices -> 8 dwords ---
+        int32_t wg0 = 0, wg1 = 0, wg2 = 0, wg3 = 0;
+        int32_t wu0 = 0, wu1 = 0, wu2 = 0, wu3 = 0;
+        float gds = 0.0f, uds = 0.0f;
+        if (row_valid) {
+            const uint8_t* gate_block = gate_e_base
+                                      + (uint64_t)row * (uint64_t)n_blocks * BLOCK_IQ2_S_BYTES
+                                      + (uint64_t)sb_lane * BLOCK_IQ2_S_BYTES;
+            const uint8_t* up_block   = up_e_base
+                                      + (uint64_t)row * (uint64_t)n_blocks * BLOCK_IQ2_S_BYTES
+                                      + (uint64_t)sb_lane * BLOCK_IQ2_S_BYTES;
+            const uint16_t wd_g = (uint16_t)load_u16_iq2s(gate_block);
+            const uint16_t wd_u = (uint16_t)load_u16_iq2s(up_block);
+
+            // 2 grid-index low bytes: qs[4*ib32 + 2*half .. +2)
+            const uint32_t qg_g = load_u16_iq2s(gate_block + 2u + sub_block * 4u + half * 2u);
+            const uint32_t qg_u = load_u16_iq2s(up_block   + 2u + sub_block * 4u + half * 2u);
+            // 2 RAW sign bytes: qs[32 + 4*ib32 + 2*half .. +2)
+            const uint32_t sg_g = load_u16_iq2s(gate_block + 34u + sub_block * 4u + half * 2u);
+            const uint32_t sg_u = load_u16_iq2s(up_block   + 34u + sub_block * 4u + half * 2u);
+            // high index bits: qh[ib32] nibble `half` (bits 0,1 -> l0; 2,3 -> l1)
+            const uint32_t qhn_g = ((uint32_t)gate_block[66u + sub_block] >> hsh) & 0xfu;
+            const uint32_t qhn_u = ((uint32_t)up_block[66u + sub_block]   >> hsh) & 0xfu;
+            // per-16-weight scale nibble (ls1 for half=0, ls2 for half=1)
+            const uint32_t nib_g = ((uint32_t)gate_block[74u + sub_block] >> hsh) & 0xfu;
+            const uint32_t nib_u = ((uint32_t)up_block[74u + sub_block]   >> hsh) & 0xfu;
+
+            {
+                const uint64_t gr0 = s_grid2s[(qg_g & 0xffu) | ((qhn_g & 3u) << 8)];
+                const uint64_t gr1 = s_grid2s[(qg_g >> 8)    | ((qhn_g & 12u) << 6)];
+                const uint64_t sp0 = s_sign_pair256[sg_g & 0xffu];
+                const uint64_t sp1 = s_sign_pair256[sg_g >> 8];
+                wg0 = cond_neg_bytes_fast((int32_t)(uint32_t)gr0,         (uint32_t)sp0);
+                wg1 = cond_neg_bytes_fast((int32_t)(uint32_t)(gr0 >> 32), (uint32_t)(sp0 >> 32));
+                wg2 = cond_neg_bytes_fast((int32_t)(uint32_t)gr1,         (uint32_t)sp1);
+                wg3 = cond_neg_bytes_fast((int32_t)(uint32_t)(gr1 >> 32), (uint32_t)(sp1 >> 32));
+            }
+            {
+                const uint64_t gr0 = s_grid2s[(qg_u & 0xffu) | ((qhn_u & 3u) << 8)];
+                const uint64_t gr1 = s_grid2s[(qg_u >> 8)    | ((qhn_u & 12u) << 6)];
+                const uint64_t sp0 = s_sign_pair256[sg_u & 0xffu];
+                const uint64_t sp1 = s_sign_pair256[sg_u >> 8];
+                wu0 = cond_neg_bytes_fast((int32_t)(uint32_t)gr0,         (uint32_t)sp0);
+                wu1 = cond_neg_bytes_fast((int32_t)(uint32_t)(gr0 >> 32), (uint32_t)(sp0 >> 32));
+                wu2 = cond_neg_bytes_fast((int32_t)(uint32_t)gr1,         (uint32_t)sp1);
+                wu3 = cond_neg_bytes_fast((int32_t)(uint32_t)(gr1 >> 32), (uint32_t)(sp1 >> 32));
+            }
+
+            const int32_t ls_g = (int32_t)(2u * nib_g + 1u);
+            const int32_t ls_u = (int32_t)(2u * nib_u + 1u);
+            gds = (0.125f * f16_to_f32_par(wd_g)) * (float)ls_g;
+            uds = (0.125f * f16_to_f32_par(wd_u)) * (float)ls_u;
+        }
+
+        // --- Cooperative xq stage (M53 pattern, verbatim) ---
+        {
+            uint32_t* s_q8_dw = (uint32_t*)s_q8v;
+            const unsigned int src_blk0 = 2u * sbp;
+            const unsigned int mi = tid >> 3;
+            const unsigned int r  = tid & 7u;
+            if (mi < n_members) {
+                const int packed     = s_member_packed[mi];
+                const unsigned int b = (unsigned int)(packed >> 16);
+                const uint32_t* xq_src_dw = (const uint32_t*)(
+                    xq + (size_t)b * (size_t)n_blocks * (size_t)BLOCK_Q8_K_BYTES
+                       + (size_t)src_blk0 * (size_t)BLOCK_Q8_K_BYTES);
+                #pragma unroll
+                for (unsigned int j = 0; j < 8u; j++) {
+                    const unsigned int ii = r + 8u * j;          // 0..63
+                    s_q8_dw[(mi * 2u + 0u) * 64u + ii] = xq_src_dw[1u + ii];
+                }
+                #pragma unroll
+                for (unsigned int j = 0; j < 8u; j++) {
+                    const unsigned int ii = r + 8u * j;
+                    s_q8_dw[(mi * 2u + 1u) * 64u + ii] = xq_src_dw[74u + ii];
+                }
+            }
+            if (tid < 2u * n_members) {
+                const unsigned int myd = tid >> 1;
+                const unsigned int h   = tid & 1u;
+                const int packed     = s_member_packed[myd];
+                const unsigned int b = (unsigned int)(packed >> 16);
+                const uint32_t* xq_src_dw = (const uint32_t*)(
+                    xq + (size_t)b * (size_t)n_blocks * (size_t)BLOCK_Q8_K_BYTES
+                       + (size_t)src_blk0 * (size_t)BLOCK_Q8_K_BYTES);
+                s_yd[myd * 2u + h] = __uint_as_float(xq_src_dw[h * 73u]);
+            }
+        }
+        __syncthreads();
+
+        // --- Dot phase: one b128 per (member, lane) feeds 8 dot4 ---
+        if (row_valid) {
+            const uint4* q8_lane = &s_q8v[sbh * 16u + l15];   // member mi at +mi*32
+            const float* yd_lane = &s_yd[sbh];                // member mi at +mi*2
+
+            #pragma unroll IQ2S_KW_UNROLL
+            for (unsigned int mi = 0; mi < n_members; mi++) {
+                const uint4 q = q8_lane[mi * 32u];
+                int32_t sumi_g = 0;
+                sumi_g = sudot4_par(wg0, (int32_t)q.x, sumi_g);
+                sumi_g = sudot4_par(wg1, (int32_t)q.y, sumi_g);
+                sumi_g = sudot4_par(wg2, (int32_t)q.z, sumi_g);
+                sumi_g = sudot4_par(wg3, (int32_t)q.w, sumi_g);
+                int32_t sumi_u = 0;
+                sumi_u = sudot4_par(wu0, (int32_t)q.x, sumi_u);
+                sumi_u = sudot4_par(wu1, (int32_t)q.y, sumi_u);
+                sumi_u = sudot4_par(wu2, (int32_t)q.z, sumi_u);
+                sumi_u = sudot4_par(wu3, (int32_t)q.w, sumi_u);
+                const float yd = yd_lane[mi * 2u];
+                lane_pacc_g[mi] += (float)sumi_g * (yd * gds);
+                lane_pacc_u[mi] += (float)sumi_u * (yd * uds);
+            }
+        }
+        __syncthreads();  // protect s_q8v/s_yd from next pair's overwrite
+    }
+
+    // --- Reduce + swiglu + output, fused ---
+    if (row_valid) {
+        for (unsigned int mi = 0; mi < n_members; mi++) {
+            float g_sum = warp_sum_f32_par(lane_pacc_g[mi]);
+            float u_sum = warp_sum_f32_par(lane_pacc_u[mi]);
+            if (lane == 0u) {
+                const int packed          = s_member_packed[mi];
+                const unsigned int b      = (unsigned int)(packed >> 16);
+                const unsigned int slot   = (unsigned int)(packed & 0xFFFFu);
+                if (clamp > 1.0e-6f) {
+                    if (g_sum > clamp)  g_sum = clamp;
+                    if (u_sum > clamp)  u_sum = clamp;
+                    if (u_sum < -clamp) u_sum = -clamp;
+                }
+                const float ew  = expert_w[(size_t)b * (size_t)n_used + (size_t)slot];
+                const float sig = 1.0f / (1.0f + expf(-g_sum));
+                const size_t out_off = ((size_t)b * (size_t)n_used + (size_t)slot)
+                                     * (size_t)n_rows + (size_t)row;
+                mid[out_off] = g_sum * sig * u_sum * ew;
+            }
+        }
     }
 }

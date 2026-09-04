@@ -2794,7 +2794,15 @@ impl HeterogeneousEngine {
                 // IQ3_XXS-as-gate/up, IQ3_S): chunked by-expert, IQ2_VARIANT
                 // does not apply. IQ2_XXS returns false and takes the zoo below.
                 let handled = {
-                    let _t_ch = ie.events.stage("igpu.pair_chunked", &ie.compute)?;
+                    // Label reflects the kernel that actually runs (kwide vs
+                    // the chunked rollback) — a trace is the only way to
+                    // confirm the kwide path is live, and IQ2_S gate/up is
+                    // essentially the whole iGPU MoE prefill in the
+                    // Vision-Exp mix.
+                    let _t_ch = ie.events.stage(
+                        super::dispatch::pair_prefill_stage(ilw.routed.gate.dtype),
+                        &ie.compute,
+                    )?;
                     super::dispatch::moe_gate_up_chunked(
                         ie, ilw.routed.gate.dtype, &ie.compute, d_mid_cat,
                         &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
