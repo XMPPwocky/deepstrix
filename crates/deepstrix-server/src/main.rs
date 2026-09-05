@@ -30,8 +30,12 @@ struct Args {
     #[arg(long)]
     gguf: String,
     /// HTTP bind address (host:port).
+    /// Repeatable: pass `--addr` once per address to listen on, e.g.
+    /// `--addr 127.0.0.1:18080 --addr 100.79.4.101:18080` to serve loopback
+    /// and the tailnet. An address that cannot be bound is warned about and
+    /// skipped — only failing to bind ALL of them is fatal.
     #[arg(long, default_value = "127.0.0.1:8080")]
-    addr: SocketAddr,
+    addr: Vec<SocketAddr>,
     /// KV cache capacity (tokens).
     #[arg(long, default_value_t = 8192)]
     ctx: u32,
@@ -153,7 +157,7 @@ async fn main() -> eyre::Result<()> {
         args.allow_image_dir
     };
     tracing::info!(
-        addr = %args.addr,
+        addrs = ?args.addr,
         ctx = args.ctx,
         gguf = %args.gguf,
         mmproj = ?mmproj_path,
@@ -211,21 +215,55 @@ async fn main() -> eyre::Result<()> {
         .layer(axum::middleware::from_fn(log_error_responses))
         .with_state(engine.clone());
 
-    let listener = tokio::net::TcpListener::bind(args.addr).await?;
-    tracing::info!("listening on http://{}", args.addr);
+    // A listener that will not bind is a warning, not a fatal error: the
+    // usual cause is an interface that is not up yet (tailscale0 after a
+    // cold boot), and refusing to start would take the loopback endpoint
+    // down with it. Binding NONE of them is still fatal.
+    let mut listeners = Vec::with_capacity(args.addr.len());
+    for addr in &args.addr {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => {
+                tracing::info!("listening on http://{addr}");
+                listeners.push(l);
+            }
+            Err(e) => tracing::warn!(%addr, error = %e, "could not bind this address; skipping"),
+        }
+    }
+    if listeners.is_empty() {
+        return Err(eyre!("no listen address could be bound (tried {:?})", args.addr));
+    }
 
-    // Bind the serve task and a shutdown signal in parallel — when
-    // SIGINT/SIGTERM arrives, ask the worker to save its dirty live
-    // state to disk before we exit.
-    let serve = axum::serve(listener, app);
+    // Serve the same router on every listener. `Router` is cheap to clone
+    // (an Arc inside), and they share one engine handle, so the single
+    // worker thread still serializes generation across all of them.
+    let mut serves = tokio::task::JoinSet::new();
+    for listener in listeners {
+        let app = app.clone();
+        serves.spawn(async move { axum::serve(listener, app).await });
+    }
+
+    // Race the listeners against a shutdown signal — when SIGINT/SIGTERM
+    // arrives, ask the worker to save its dirty live state before we exit.
+    // A serve error is stashed rather than returned, so the engine still
+    // gets its chance to flush; dropping the JoinSet aborts the rest.
+    let mut serve_err: Option<eyre::Report> = None;
     tokio::select! {
-        r = serve => { r?; }
+        Some(joined) = serves.join_next() => {
+            match joined {
+                Ok(Ok(())) => tracing::warn!("an HTTP listener stopped on its own"),
+                Ok(Err(e)) => serve_err = Some(e.into()),
+                Err(e) => serve_err = Some(eyre!("HTTP listener task failed: {e}")),
+            }
+        }
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received");
         }
     }
     if let Err(e) = engine.shutdown().await {
         tracing::warn!(error = %e, "engine shutdown returned error");
+    }
+    if let Some(e) = serve_err {
+        return Err(e);
     }
     tracing::info!("deepstrix-server exited cleanly");
     Ok(())
