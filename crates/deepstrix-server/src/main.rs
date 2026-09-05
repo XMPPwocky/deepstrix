@@ -20,6 +20,7 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_hip::install_panic_handler;
 
 use deepstrix_server::engine_worker::{run_watchdog, spawn, WorkerConfig};
+use deepstrix_server::openai::error::log_error_responses;
 use deepstrix_server::openai::handler::{chat_completions, healthz, list_models, lmstudio_models, readyz};
 
 #[derive(Parser, Debug)]
@@ -206,6 +207,8 @@ async fn main() -> eyre::Result<()> {
         .route("/api/v1/models", get(lmstudio_models))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        // Every 4xx/5xx we hand back is otherwise silent server-side.
+        .layer(axum::middleware::from_fn(log_error_responses))
         .with_state(engine.clone());
 
     let listener = tokio::net::TcpListener::bind(args.addr).await?;

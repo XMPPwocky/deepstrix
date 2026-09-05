@@ -4,7 +4,9 @@
 //! { "error": { "message": "...", "type": "...", "code": "..." } }
 //! ```
 
+use axum::extract::Request;
 use axum::http::StatusCode;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
@@ -79,7 +81,17 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status();
         let body = self.body();
+        // Stash code + message in a response extension so the router's
+        // `log_error_responses` layer can log *why* we failed next to the
+        // method and path it already has. Without it every 4xx/5xx we
+        // return is invisible server-side: the body goes to the client
+        // and nowhere else, and the log looks perfectly healthy.
+        let detail = ErrorDetail {
+            code: body.error.code,
+            message: body.error.message.clone(),
+        };
         let mut resp = (status, Json(body)).into_response();
+        resp.extensions_mut().insert(detail);
         // Retry-After tells well-behaved clients (incl. letta's
         // pi-ai retryable-error path) to back off rather than
         // hot-retry into the same full queue. 2s is roughly one
@@ -96,4 +108,52 @@ impl From<color_eyre::eyre::Report> for ApiError {
     fn from(r: color_eyre::eyre::Report) -> Self {
         ApiError::EngineFailed(r)
     }
+}
+
+/// Reason attached to an error response by [`ApiError::into_response`],
+/// read back by [`log_error_responses`]. Server-local — extensions are
+/// not part of the HTTP wire format.
+#[derive(Clone)]
+pub struct ErrorDetail {
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// Router layer: log every response that carries a 4xx/5xx status.
+///
+/// Responses built from [`ApiError`] carry an [`ErrorDetail`], so those
+/// log with their OpenAI error code and message. Everything else logs
+/// with the status alone: axum extractor rejections (413 over the body
+/// limit, 422 malformed JSON), 404s on an unknown route, and the
+/// `/readyz` engine-stall 503.
+///
+/// Cannot see a failure that happens *after* 200 + headers are on the
+/// wire, i.e. mid-SSE-stream — that path terminates the stream instead.
+pub async fn log_error_responses(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let resp = next.run(req).await;
+    let status = resp.status();
+    if status.is_client_error() || status.is_server_error() {
+        match resp.extensions().get::<ErrorDetail>() {
+            Some(d) => tracing::warn!(
+                %method,
+                %path,
+                status = status.as_u16(),
+                code = d.code,
+                // NOT `message` -- tracing treats a field of that name as
+                // the event message, which would swallow the "http error
+                // response" marker the log is grepped by.
+                reason = %d.message,
+                "http error response"
+            ),
+            None => tracing::warn!(
+                %method,
+                %path,
+                status = status.as_u16(),
+                "http error response"
+            ),
+        }
+    }
+    resp
 }
