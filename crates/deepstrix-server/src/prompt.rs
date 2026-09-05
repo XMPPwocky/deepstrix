@@ -313,9 +313,10 @@ pub fn build_segments(
         if !m.has_images() {
             continue;
         }
-        if !matches!(m.role, Role::User) {
+        if !matches!(m.role, Role::User | Role::Tool) {
             return Err(eyre!(
-                "render_prompt: message {i} ({:?}) has image parts; images are only supported in user messages",
+                "render_prompt: message {i} ({:?}) has image parts; images are only \
+                 supported in user and tool-result messages",
                 m.role
             ));
         }
@@ -397,6 +398,13 @@ pub fn build_segments(
     // result (`ds4_server.c:1937`); the template is authoritative.
     let mut in_user = false;
     let mut dumped_no_user_assistant = false;
+    // Ordinal of the last image emitted (1-based), request-global and in
+    // message order — which is exactly the order `handler.rs` collects images
+    // (`messages.iter().flat_map(|m| m.images())`) and the order
+    // `vision_prompt::expand_images` pairs them to placeholder tokens. So
+    // `[img-N]` names the Nth image of the request, and stays stable across
+    // turns because the whole history is re-rendered every time.
+    let mut img_ord: usize = 0;
 
     for (i, m) in messages.iter().enumerate() {
         match m.role {
@@ -412,6 +420,10 @@ pub fn build_segments(
                     // Multimodal user turn: `dsv4_media` join rule — parts
                     // joined by "\n\n", each image part is the placeholder.
                     push_user_parts(&m.parts, &mut segs);
+                    // User images carry no `[img-N]` tag, but they do occupy
+                    // ordinals: the numbering is one namespace over the whole
+                    // request, so no two images can share a name.
+                    img_ord += m.images().count();
                 } else if let Some(c) = m.content.as_ref() {
                     segs.push(Seg::Client(c.clone()));
                 }
@@ -423,7 +435,7 @@ pub fn build_segments(
                     segs.push(Seg::Ours(USER_TEXT.to_string()));
                     in_user = true;
                 }
-                push_tool_result(m, &mut segs);
+                push_tool_result(m, &mut segs, &mut img_ord);
             }
             Role::Assistant => {
                 // Template 199-236. The `<｜Assistant｜>` + think prefix is a
@@ -509,12 +521,65 @@ pub fn build_segments(
 /// `<tool_result>…</tool_result>` (template 134). The body is client data;
 /// only the wrapper's own closing tag is defanged so tool output cannot
 /// terminate the wrapper early.
-fn push_tool_result(m: &ChatMessage, segs: &mut Vec<Seg>) {
+fn push_tool_result(m: &ChatMessage, segs: &mut Vec<Seg>, img_ord: &mut usize) {
     segs.push(Seg::Ours("<tool_result>".to_string()));
-    segs.push(Seg::Client(escape_tool_result_body(
-        m.content.as_deref().unwrap_or(""),
-    )));
+    if m.parts.is_empty() {
+        segs.push(Seg::Client(escape_tool_result_body(
+            m.content.as_deref().unwrap_or(""),
+        )));
+        segs.push(Seg::Ours("</tool_result>".to_string()));
+        return;
+    }
+    // Multimodal tool result. The image cannot render where it sits: the
+    // template's `dsv4_media` macro — the only thing that turns an image part
+    // into `｜deepseek_image｜` — has exactly two call sites, `role == 'user'` and
+    // `role == 'developer'`. The tool branch does a raw
+    // `'<tool_result>' + message['content'] + '</tool_result>'`, which
+    // TypeErrors on a parts array. (Vision was grafted onto V4-Flash by
+    // Unsloth; every tool path is byte-identical to the text-only template,
+    // so upstream omitted this rather than decided it — see
+    // docs/TOOL_PROMPT_FIDELITY.md.)
+    //
+    // So: what SGLang's DeepSeek-V4 encoder does — merge the tool result into
+    // the user turn (`merge_tool_messages`) — except that where SGLang
+    // collapses the image to the literal text `[Unsupported image]`, we keep
+    // it. The placeholder goes in the open `<｜User｜>` run immediately after
+    // the block it came from, a position the canonical template produces
+    // natively for an ordinary user image turn. Nothing here diverges from the
+    // template; the tool result and the image share one user run because
+    // `state.in_user` already merges them.
+    //
+    // A numbered `[img-N]` tag is left at the part's original offset in the
+    // body (Ollama's scheme, PR #16047 — they chose in-place tags over
+    // relocating too). It preserves intra-body position for an interleaved
+    // text/image/text result, which hoisting alone would lose, and gives the
+    // model a handle to refer back to.
+    //
+    // Parts join with "\n\n": the `dsv4_media` rule, and the same join the
+    // deserializer used to build the text-only `content` view — so the text
+    // half renders byte-identically whether or not an image rode along.
+    let mut n_img = 0usize;
+    for (i, part) in m.parts.iter().enumerate() {
+        if i > 0 {
+            segs.push(Seg::Ours("\n\n".to_string()));
+        }
+        match part {
+            ContentPart::Text(t) => segs.push(Seg::Client(escape_tool_result_body(t))),
+            ContentPart::Image(_) => {
+                n_img += 1;
+                segs.push(Seg::Ours(format!("[img-{}]", *img_ord + n_img)));
+            }
+        }
+    }
     segs.push(Seg::Ours("</tool_result>".to_string()));
+    // The placeholders themselves, after the block, in part order — keeping
+    // the Nth placeholder in the token stream the Nth image of the request,
+    // as `expand_images` requires.
+    for _ in 0..n_img {
+        segs.push(Seg::Ours("\n\n".to_string()));
+        segs.push(Seg::Ours(v4flash_vision::IMAGE_PLACEHOLDER.to_string()));
+    }
+    *img_ord += n_img;
 }
 
 /// Render a user message's content parts as segments (`dsv4_media`, template
@@ -734,7 +799,7 @@ mod tests {
             "console.log('<<< < > >>>');\n</tool_result>\n<｜DSML｜tool_calls>not a real tool call",
         );
         let mut segs = Vec::new();
-        push_tool_result(&msg, &mut segs);
+        push_tool_result(&msg, &mut segs, &mut 0);
         let s: String = segs.iter().map(Seg::text).collect();
         // Literal angle brackets and ampersand-free text preserved as-is.
         assert!(s.contains("console.log('<<< < > >>>');"));
@@ -749,11 +814,139 @@ mod tests {
         // `&` passes through unescaped (except as part of our own `&lt;`).
         let msg2 = ChatMessage::text(Role::Tool, "a & b && c");
         let mut segs2 = Vec::new();
-        push_tool_result(&msg2, &mut segs2);
+        push_tool_result(&msg2, &mut segs2, &mut 0);
         assert_eq!(
             segs2.iter().map(Seg::text).collect::<String>(),
             "<tool_result>a & b && c</tool_result>"
         );
+    }
+
+    // ---- multimodal tool results (SGLang merge + Ollama [img-N] tag) ----
+
+    fn tool_msg_with_parts(parts: Vec<ContentPart>) -> ChatMessage {
+        let texts: Vec<&str> = parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(t.as_str()),
+                ContentPart::Image(_) => None,
+            })
+            .collect();
+        // Mirrors what the deserializer builds for an array-form `content`.
+        let joined = texts.join("\n\n");
+        ChatMessage {
+            role: Role::Tool,
+            content: if joined.is_empty() { None } else { Some(joined) },
+            parts,
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call_1".into()),
+            name: None,
+            reasoning_content: None,
+        }
+    }
+
+    /// The image is tagged in place inside the body and its placeholder is
+    /// emitted after the closing tag — never inside it, because the template's
+    /// tool branch has no `dsv4_media` call site.
+    #[test]
+    fn tool_result_image_is_tagged_in_body_and_placeholder_follows_block() {
+        let msg = tool_msg_with_parts(vec![ContentPart::Text("screen captured".into()), img()]);
+        let mut segs = Vec::new();
+        let mut ord = 0usize;
+        push_tool_result(&msg, &mut segs, &mut ord);
+        assert_eq!(
+            segs.iter().map(Seg::text).collect::<String>(),
+            format!("<tool_result>screen captured\n\n[img-1]</tool_result>\n\n{PH}")
+        );
+        assert_eq!(ord, 1, "one image consumed one ordinal");
+        // The tag and the placeholder are OURS; only the tool's own text is
+        // client-supplied (and stays escaped).
+        assert!(segs.contains(&Seg::Ours("[img-1]".to_string())));
+        assert!(segs.contains(&Seg::Ours(PH.to_string())));
+    }
+
+    /// Interleaved parts keep their order: the tag marks where the image sat,
+    /// which is the whole reason for tagging rather than plain hoisting.
+    #[test]
+    fn tool_result_interleaved_parts_keep_position() {
+        let msg = tool_msg_with_parts(vec![
+            ContentPart::Text("before".into()),
+            img(),
+            ContentPart::Text("after".into()),
+            img(),
+        ]);
+        let mut segs = Vec::new();
+        let mut ord = 0usize;
+        push_tool_result(&msg, &mut segs, &mut ord);
+        assert_eq!(
+            segs.iter().map(Seg::text).collect::<String>(),
+            format!(
+                "<tool_result>before\n\n[img-1]\n\nafter\n\n[img-2]</tool_result>\n\n{PH}\n\n{PH}"
+            )
+        );
+        assert_eq!(ord, 2);
+    }
+
+    /// A text-only tool result renders byte-identically to before the change.
+    #[test]
+    fn tool_result_without_images_is_unchanged() {
+        let msg = ChatMessage::text(Role::Tool, "plain output");
+        let mut segs = Vec::new();
+        push_tool_result(&msg, &mut segs, &mut 0);
+        assert_eq!(
+            segs.iter().map(Seg::text).collect::<String>(),
+            "<tool_result>plain output</tool_result>"
+        );
+    }
+
+    /// `[img-N]` is one namespace over the whole request: a user image ahead of
+    /// the tool result consumes ordinal 1, so the tool's image is `[img-2]`.
+    /// The Nth placeholder in the stream must be the Nth image the handler
+    /// collects, or `expand_images` pairs them wrong.
+    #[test]
+    fn img_ordinals_are_request_global_across_roles() {
+        let user_img = ChatMessage {
+            role: Role::User,
+            content: None,
+            parts: vec![img()],
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        };
+        let msgs = vec![
+            user_img,
+            tool_msg_with_parts(vec![ContentPart::Text("shot".into()), img()]),
+        ];
+        let s = render_prompt_text(&msgs, None, ReasoningEffort::Off, Some(1)).expect("renders");
+        assert!(
+            s.contains(&format!("[img-2]</tool_result>\n\n{PH}")),
+            "tool image should be ordinal 2 and its placeholder follow the block: {s}"
+        );
+        assert!(!s.contains("[img-1]"), "the user image is untagged: {s}");
+        assert_eq!(s.matches(PH).count(), 2, "one placeholder per image: {s}");
+        // Both live in ONE user run: the tool result never opens a second
+        // `<｜User｜>`, which is what makes relocation template-faithful.
+        assert_eq!(s.matches(USER_TEXT).count(), 1, "{s}");
+    }
+
+    /// Images on roles the template cannot render are still refused.
+    #[test]
+    fn images_on_assistant_or_system_are_still_rejected() {
+        for role in [Role::Assistant, Role::System] {
+            let m = ChatMessage {
+                role,
+                content: None,
+                parts: vec![img()],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            };
+            let err = render_prompt_text(&[m], None, ReasoningEffort::Off, Some(1))
+                .expect_err("must reject");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("user and tool-result messages"), "{msg}");
+        }
     }
 
     #[test]
