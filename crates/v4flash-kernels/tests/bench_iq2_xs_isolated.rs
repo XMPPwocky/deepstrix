@@ -65,6 +65,10 @@ fn bench_iq2_xs_isolated() -> eyre::Result<()> {
         .unwrap_or(0);
     let fmt = std::env::var("BENCH_FMT").unwrap_or_else(|_| "iq2_xs".into());
     let use_kwide = variant == 6;
+    // 7 = f16 WMMA prototype (f16 grid LUT dequant), 8 = WMMA with per-byte
+    // cvt dequant. Both take f16 activations; iq2_xs only.
+    // 9..12 = ablations (no WMMA / no dequant / no x staging / no B loads).
+    let use_wmma = (7..=13).contains(&variant);   // 13 = wmma magic
     let n_expert_alloc: u32 = std::env::var("BENCH_N_EXPERT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -76,7 +80,7 @@ fn bench_iq2_xs_isolated() -> eyre::Result<()> {
         "iq2s" => BLOCK_IQ2_S_BYTES,
         _ => BLOCK_IQ2_XS_BYTES,
     };
-    eprintln!("fmt={fmt} variant={variant} (0=chunked, 6=kwide)");
+    eprintln!("fmt={fmt} variant={variant} (0=chunked, 6=kwide, 7=wmma, 8=wmma_cvt, 9-12=wmma ablations, 13=wmma_lut)");
     eprintln!("isolated probe: B={b}, iters={iters}, n_work_items={n_work_items_target}, chunk={chunk_size}");
 
     let igpu = pick_igpu()?;
@@ -121,6 +125,11 @@ fn bench_iq2_xs_isolated() -> eyre::Result<()> {
     let mut xq: DeviceBuffer<u8> =
         DeviceBuffer::new(igpu.id, xq_bytes_per_token * (b as usize))?;
     xq.fill_zero()?;
+    // f16 activations for the WMMA variants: [B, K] halves, small non-zero
+    // values (0.5) so the matrix pipe does real work.
+    let k_dim = (BLOCKS_Q8K_GATE_IN as usize) * 256;
+    let mut x16: DeviceBuffer<u16> = DeviceBuffer::new(igpu.id, k_dim * (b as usize))?;
+    x16.copy_from_host(&vec![0x3800u16; k_dim * (b as usize)])?;
 
     let cs_n_used = N_EXPERT_USED as u32;
     let mut expert_w: DeviceBuffer<f32> =
@@ -131,26 +140,84 @@ fn bench_iq2_xs_isolated() -> eyre::Result<()> {
     let mut group_count: DeviceBuffer<i32> = DeviceBuffer::new(igpu.id, N_EXPERT as usize)?;
     let mut expert_members: DeviceBuffer<i32> =
         DeviceBuffer::new(igpu.id, (N_EXPERT as usize) * (max_per_expert as usize))?;
-    let mut work_items: DeviceBuffer<i32> =
-        DeviceBuffer::new(igpu.id, n_work_items_target as usize)?;
 
     // Distinct experts per work item (same pattern as bench_iq2_isolated).
     let n_distinct = n_work_items_target.min(n_expert_alloc) as usize;
     let mut gc_host = vec![0i32; N_EXPERT as usize];
     let mut em_host = vec![0i32; (N_EXPERT as usize) * (max_per_expert as usize)];
     let mut wi_host = vec![0i32; n_work_items_target as usize];
-    for i in 0..n_work_items_target as usize {
-        let e = i % n_distinct;
-        wi_host[i] = ((e as i32) << 16) | 0;
-    }
-    for e in 0..n_distinct {
-        gc_host[e] = chunk_size as i32;
-        for i in 0..(chunk_size as usize) {
-            let b_idx = i % (b as usize);
-            let slot = i % (cs_n_used as usize);
-            em_host[e * (max_per_expert as usize) + i] = ((b_idx as i32) << 16) | (slot as i32);
+    // BENCH_DIST=zipf: realistic routing. Draw B*8 selections per layer
+    // proportional to the prefill counts in BENCH_STATS (expert_stats.json,
+    // layer BENCH_LAYER, default 20), drop the top BENCH_HOT_K experts (the
+    // het-split's dGPU-resident set, default 17), then build
+    // group_count/expert_members/work_items exactly like moe_group_builder +
+    // work_items_builder (chunks of chunk_size per expert). The uniform
+    // default (every work item a full chunk) flatters tile-shaped kernels.
+    let dist = std::env::var("BENCH_DIST").unwrap_or_else(|_| "uniform".into());
+    let n_work_items_real: u32 = if dist == "zipf" {
+        let stats_path = std::env::var("BENCH_STATS").map_err(|_| eyre!("BENCH_DIST=zipf needs BENCH_STATS=<expert_stats.json>"))?;
+        let layer: usize = std::env::var("BENCH_LAYER").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+        let hot_k: usize = std::env::var("BENCH_HOT_K").ok().and_then(|s| s.parse().ok()).unwrap_or(17);
+        let txt = std::fs::read_to_string(&stats_path)?;
+        let js: serde_json::Value = serde_json::from_str(&txt)?;
+        let counts: Vec<f64> = js["prefill"]["counts"].as_array().ok_or_else(|| eyre!("no prefill.counts"))?
+            .iter().skip(layer * 256).take(256).map(|v| v.as_f64().unwrap_or(0.0)).collect();
+        let mut order: Vec<usize> = (0..256).collect();
+        order.sort_by(|&a, &b| counts[b].partial_cmp(&counts[a]).unwrap());
+        let hot: std::collections::HashSet<usize> = order.iter().take(hot_k).cloned().collect();
+        // cumulative distribution over cold experts
+        let mut cdf = Vec::with_capacity(256);
+        let mut acc = 0f64;
+        for e in 0..256 { if !hot.contains(&e) { acc += counts[e]; } cdf.push(acc); }
+        let mut rng: u64 = 0xC0FFEE_2026_0908;
+        let mut per_expert: Vec<Vec<i32>> = vec![Vec::new(); 256];
+        for tok in 0..(b as usize) {
+            let mut picked = std::collections::HashSet::new();
+            let mut slot = 0usize;
+            while slot < cs_n_used as usize {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let u = ((rng >> 11) as f64) / ((1u64 << 53) as f64) * acc;
+                let e = cdf.partition_point(|&c| c <= u).min(255);
+                if hot.contains(&e) || !picked.insert(e) { continue; }
+                per_expert[e].push(((tok as i32) << 16) | (slot as i32));
+                slot += 1;
+            }
         }
-    }
+        // hot slots are the dGPU's; on the iGPU those members simply don't exist
+        // (mirrors moe_group_builder_hetsplit mode 0 with cap = n_used).
+        wi_host.clear();
+        let mut hist = std::collections::BTreeMap::new();
+        for e in 0..256 {
+            let n = per_expert[e].len();
+            gc_host[e] = n as i32;
+            for (i, &m) in per_expert[e].iter().enumerate() {
+                em_host[e * (max_per_expert as usize) + i] = m;
+            }
+            let mut start = 0usize;
+            while start < n { wi_host.push(((e as i32) << 16) | (start as i32)); start += chunk_size as usize; }
+            if n > 0 { *hist.entry((n + 15) / 16).or_insert(0usize) += n; }
+        }
+        let total: usize = per_expert.iter().map(|v| v.len()).sum();
+        eprintln!("zipf dist: layer={layer} hot_k={hot_k} members on iGPU={total} (of {}), work items={}, members by 16-tile count: {:?}",
+            (b as usize) * (cs_n_used as usize), wi_host.len(), hist);
+        wi_host.len() as u32
+    } else {
+        for i in 0..n_work_items_target as usize {
+            let e = i % n_distinct;
+            wi_host[i] = ((e as i32) << 16) | 0;
+        }
+        for e in 0..n_distinct {
+            gc_host[e] = chunk_size as i32;
+            for i in 0..(chunk_size as usize) {
+                let b_idx = i % (b as usize);
+                let slot = i % (cs_n_used as usize);
+                em_host[e * (max_per_expert as usize) + i] = ((b_idx as i32) << 16) | (slot as i32);
+            }
+        }
+        n_work_items_target
+    };
+    let mut work_items: DeviceBuffer<i32> = DeviceBuffer::new(igpu.id, wi_host.len().max(1))?;
+    let n_work_items_target = n_work_items_real;
     group_count.copy_from_host(&gc_host)?;
     expert_members.copy_from_host(&em_host)?;
     work_items.copy_from_host(&wi_host)?;
@@ -161,6 +228,18 @@ fn bench_iq2_xs_isolated() -> eyre::Result<()> {
     )?;
 
     let launch = |mid: &mut DeviceBuffer<f32>| -> eyre::Result<()> {
+        if use_wmma {
+            if fmt != "iq2_xs" {
+                return Err(eyre!("wmma variants exist for iq2_xs only"));
+            }
+            return iq2xs.launch_fused_swiglu_wmma(
+                &stream, mid, &gate_w, &up_w, &x16, &expert_w,
+                &group_count, &expert_members, &work_items, n_work_items_target,
+                gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+                chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+                variant - 7,
+            );
+        }
         match (fmt.as_str(), use_kwide) {
             ("iq2s", true) => iq2s.launch_fused_swiglu_kwide(
                 &stream, mid, &gate_w, &up_w, &xq, &expert_w,

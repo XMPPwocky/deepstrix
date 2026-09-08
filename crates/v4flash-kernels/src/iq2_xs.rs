@@ -17,6 +17,7 @@ pub const BLOCK_IQ2_XS_BYTES: usize = 74;
 
 pub struct Iq2XsPairMatvec {
     module: Module,
+    rdna3: bool,
 }
 
 impl Iq2XsPairMatvec {
@@ -29,7 +30,7 @@ impl Iq2XsPairMatvec {
             return Err(eyre!("unsupported arch for iq2_xs_pair_matvec: {arch}"));
         };
         let module = Module::load_data(image)?;
-        Ok(Self { module })
+        Ok(Self { module, rdna3: arch.starts_with("gfx11") })
     }
 
     /// Decode: fused gate+up+SwiGLU over the n_used selected experts.
@@ -217,5 +218,84 @@ impl Iq2XsPairMatvec {
             gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp,
             n_rows, n_blocks
         ])
+    }
+
+    /// f16 WMMA batched-prefill gate/up (2026-09-08; gfx11 only). Same
+    /// work-item contract as [`Self::launch_fused_swiglu_kwide`] but takes
+    /// f16 activations `x16` = [B, n_blocks*256] instead of Q8_K. `mode` 0
+    /// is the kernel; other modes are bench-only twins (see below). Isolated-bench + oracle only so far.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_wmma(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        x16: &DeviceBuffer<u16>,
+        expert_w: &DeviceBuffer<f32>,
+        group_count: &DeviceBuffer<i32>,
+        expert_members: &DeviceBuffer<i32>,
+        work_items: &DeviceBuffer<i32>,
+        n_work_items: u32,
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+        mode: u32,
+    ) -> eyre::Result<()> {
+        if !self.rdna3 {
+            return Err(eyre!("iq2_xs wmma: RDNA3 (gfx11) WMMA layout only"));
+        }
+        if n_rows % 16 != 0 {
+            return Err(eyre!("iq2_xs wmma: n_rows={n_rows} not %16"));
+        }
+        if chunk_size > 32 {
+            return Err(eyre!(
+                "iq2_xs wmma: chunk_size={chunk_size} exceeds IQ2XS_WM_MAX_CHUNK=32"
+            ));
+        }
+        if x16.len() < (n_blocks as usize) * 256 {
+            return Err(eyre!("iq2_xs wmma: x16 too small for n_blocks={n_blocks}"));
+        }
+        if n_work_items == 0 {
+            return Ok(());
+        }
+        // mode: 0 = the kernel (magic-number dequant); bench-only twins:
+        // 1 = per-byte cvt dequant, 6 = f16-LUT dequant, 2..=5 = ablations 1..4
+        // (no WMMA / no dequant / no x staging / no B loads) — garbage output.
+        let name = match mode {
+            0 => "iq2_xs_pair_matvec_fused_swiglu_wmma",
+            1 => "iq2_xs_pair_matvec_fused_swiglu_wmma_cvt",
+            6 => "iq2_xs_pair_matvec_fused_swiglu_wmma_lut",
+            2 => "iq2_xs_pair_matvec_fused_swiglu_wmma_abl1",
+            3 => "iq2_xs_pair_matvec_fused_swiglu_wmma_abl2",
+            4 => "iq2_xs_pair_matvec_fused_swiglu_wmma_abl3",
+            5 => "iq2_xs_pair_matvec_fused_swiglu_wmma_abl4",
+            m => return Err(eyre!("iq2_xs wmma: unknown mode {m}")),
+        };
+        let function = self.module.get_function(name)?;
+        let cfg = LaunchConfig {
+            grid: (n_rows.div_ceil(128), n_work_items, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            mid.raw(), gate_w_base.raw(), up_w_base.raw(), x16.raw(),
+            expert_w.raw(), group_count.raw(), expert_members.raw(), work_items.raw(),
+            gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp,
+            n_rows, n_blocks
+        ])
+    }
+
+    /// Bench-only: gfx11 WMMA operand-lane probe (see kernel banner).
+    pub fn launch_upper_lane_probe(&self, stream: &Stream, out: &mut DeviceBuffer<f32>) -> eyre::Result<()> {
+        if out.len() < 9 * 256 { return Err(eyre!("probe: out < 2304")); }
+        let function = self.module.get_function("iq2_xs_wmma_upper_lane_probe")?;
+        let cfg = LaunchConfig { grid: (1, 1, 1), block: (32, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(function, cfg, stream, [out.raw()])
     }
 }
