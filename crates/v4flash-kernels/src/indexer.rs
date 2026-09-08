@@ -288,6 +288,54 @@ impl IndexerScoreWmma {
             n_idx_per.raw(), n_idx_stride
         ])
     }
+
+    /// GEMM-shaped batched indexer score (2026-09-08): 8 tokens per WG share
+    /// each staged K tile; Q is `q16` = f16 [B, 64*128] (cast once by the
+    /// caller). Bit-exact with `launch_batched` / `_mw`. `n_splits` WGs per
+    /// 8-token group split the row range; pass 0 for the built-in choice
+    /// (~4 WGs per CU).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched_gemm(
+        &self,
+        stream: &Stream,
+        scores: &mut DeviceBuffer<f32>,
+        q16: &DeviceBuffer<u16>,
+        head_weights: &DeviceBuffer<f32>,
+        index_comp_kv: &DeviceBuffer<u16>,
+        n_idx_per: &DeviceBuffer<u32>,
+        n_idx_max: u32,
+        n_idx_stride: u32,
+        batch: u32,
+        n_splits: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_idx_max == 0 {
+            return Ok(());
+        }
+        if q16.len() < (batch as usize) * 64 * 128 {
+            return Err(eyre!("indexer gemm: q16 too small for batch={batch}"));
+        }
+        const TILE: u32 = 64; // ISG_TILE_ROWS
+        let groups = batch.div_ceil(8);
+        let n_tiles = n_idx_stride.div_ceil(TILE).max(1);
+        let n_splits = if n_splits == 0 {
+            // ~256 WGs total (4/CU on the 64-CU 9070 XT), but never more splits than tiles
+            (256u32.div_ceil(groups)).clamp(1, n_tiles)
+        } else {
+            n_splits.clamp(1, n_tiles)
+        };
+        let span = n_tiles.div_ceil(n_splits) * TILE;
+        let n_splits = n_idx_stride.div_ceil(span);
+        let function = self.module.get_function("indexer_score_wmma_gemm")?;
+        let cfg = LaunchConfig {
+            grid: (n_splits, groups, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            scores.raw(), q16.raw(), head_weights.raw(), index_comp_kv.raw(),
+            n_idx_per.raw(), n_idx_stride, n_idx_max, batch, span
+        ])
+    }
 }
 
 /// Greedy top-K selection over indexer scores. Mirrors ds4's iterative
@@ -578,6 +626,7 @@ impl IndexerTopkBitonic {
         n_words_per_b: u32,
         top_k: u32,
         batch: u32,
+        done: Option<&mut DeviceBuffer<u32>>,
     ) -> eyre::Result<()> {
         if batch == 0 || top_k == 0 {
             return Ok(());
@@ -587,6 +636,28 @@ impl IndexerTopkBitonic {
         let allowed_ptr = allowed_bits
             .map(|b| b.raw())
             .unwrap_or(std::ptr::null_mut());
+        // 2026-09-08: exact threshold select first (O(n) per token, same
+        // selection and order as the chain); tokens it cannot bracket are
+        // left with done=0 and fall through to the chain below, whose
+        // kernels early-out on done=1. Only for the no-bitmap (batched
+        // prefill) path; `done` = [batch] u32.
+        let done_ptr: *const u32 = match done {
+            Some(d) if allowed_ptr.is_null() && top_k <= SORT_N / 2 => {
+                if d.len() < batch as usize {
+                    return Err(eyre!("indexer_topk: done buffer {} < batch {batch}", d.len()));
+                }
+                let f = self.module.get_function("indexer_topk_select_batched")?;
+                let cfg = LaunchConfig { grid: (batch, 1, 1), block: (BLOCK, 1, 1), shared_mem_bytes: 0 };
+                launch_kernel!(f, cfg, stream, [
+                    selected.raw(), d.raw(), scores.raw(), n_idx_per.raw(), n_idx_stride, top_k
+                ])?;
+                if n_idx_max <= SORT_N {
+                    return Ok(()); // the select kernel's small path is exact and complete
+                }
+                d.raw() as *const u32
+            }
+            _ => std::ptr::null(),
+        };
 
         if n_idx_max <= SORT_N {
             let function = self.module.get_function("indexer_topk_bitonic_4096_batched")?;
@@ -630,11 +701,11 @@ impl IndexerTopkBitonic {
             }
             launch_kernel!(chunk_fn, chunk_cfg, stream, [
                 scratch.raw(), scores.raw(), n_idx_per.raw(),
-                n_idx_stride, candidates_stride, top_k
+                n_idx_stride, candidates_stride, top_k, done_ptr
             ])?;
             return launch_kernel!(merge_fn, merge_cfg, stream, [
                 selected.raw(), allowed_ptr, scratch.raw(), scores.raw(), n_idx_per.raw(),
-                n_idx_stride, candidates_stride, n_words_per_b, top_k, n_candidates
+                n_idx_stride, candidates_stride, n_words_per_b, top_k, n_candidates, done_ptr
             ]);
         }
 
@@ -665,7 +736,7 @@ impl IndexerTopkBitonic {
 
         launch_kernel!(chunk_fn, chunk_cfg, stream, [
             level0.raw(), scores.raw(), n_idx_per.raw(),
-            n_idx_stride, candidates_stride, top_k
+            n_idx_stride, candidates_stride, top_k, done_ptr
         ])?;
 
         let regroup_fn = self.module.get_function("indexer_topk_regroup_4096_batched")?;
@@ -676,12 +747,12 @@ impl IndexerTopkBitonic {
         };
         launch_kernel!(regroup_fn, regroup_cfg, stream, [
             level1.raw(), level0.raw(), scores.raw(), n_idx_per.raw(),
-            n_idx_stride, candidates_stride, n_grouped, top_k, group_span
+            n_idx_stride, candidates_stride, n_grouped, top_k, group_span, done_ptr
         ])?;
 
         launch_kernel!(merge_fn, merge_cfg, stream, [
             selected.raw(), allowed_ptr, level1.raw(), scores.raw(), n_idx_per.raw(),
-            n_idx_stride, n_grouped, n_words_per_b, top_k, n_grouped
+            n_idx_stride, n_grouped, n_words_per_b, top_k, n_grouped, done_ptr
         ])
     }
 }

@@ -308,9 +308,11 @@ void indexer_topk_chunk_4096_batched(
         const unsigned int * __restrict__ n_idx_per,// [B]
         unsigned int                n_idx_stride,
         unsigned int                candidates_stride, // = n_chunks * top_k
-        unsigned int                top_k) {
+        unsigned int                top_k,
+        const unsigned int * __restrict__ done_b) { // [B] or null: 1 = token already selected by the fast path
     const unsigned int chunk = blockIdx.x;
     const unsigned int bi    = blockIdx.y;
+    if (done_b != nullptr && done_b[bi] != 0u) return;
     const unsigned int n_comp = n_idx_per[bi];
     const unsigned int chunk_lo = chunk * TOPK_SORT_N;
     unsigned int * __restrict__ candidates = candidates_b + (size_t)bi * candidates_stride;
@@ -361,7 +363,9 @@ void indexer_topk_merge_4096_batched(
         unsigned int                candidates_stride,
         unsigned int                n_words_per_b,
         unsigned int                top_k,
-        unsigned int                n_candidates) {
+        unsigned int                n_candidates,
+        const unsigned int * __restrict__ done_b) {
+    if (done_b != nullptr && done_b[blockIdx.y] != 0u) return;
     const unsigned int bi = blockIdx.y;
     const unsigned int n_comp = n_idx_per[bi];
 
@@ -492,9 +496,11 @@ void indexer_topk_regroup_4096_batched(
         unsigned int                      in_stride,        // = n_chunks * top_k
         unsigned int                      out_stride,       // = n_groups * top_k
         unsigned int                      top_k,
-        unsigned int                      group_span) {
+        unsigned int                      group_span,
+        const unsigned int * __restrict__ done_b) {
     const unsigned int group = blockIdx.x;
     const unsigned int bi    = blockIdx.y;
+    if (done_b != nullptr && done_b[bi] != 0u) return;
     const unsigned int n_comp = n_idx_per[bi];
 
     unsigned int       * __restrict__ candidates_out = candidates_out_b + (size_t)bi * out_stride;
@@ -533,4 +539,203 @@ void indexer_topk_regroup_4096_batched(
     for (unsigned int i = tid; i < top_k; i += TOPK_BLOCK) {
         candidates_out[out_base + i] = idxs[i];
     }
+}
+
+// =============================================================================
+// indexer_topk_select_batched — exact threshold top-k (2026-09-08).
+//
+// The chunk/regroup/merge chain fully bitonic-sorts every 4096-score chunk
+// to keep 512: O(n log^2 n) with ~90% of the compare-exchanges spent on
+// elements that can never be selected. At 192K (12 chunks/token) it was
+// 5.1 ms/launch, 8% of the prefill wall (trace 2026-09-08).
+//
+// This kernel produces the SAME selection (same total order: score desc,
+// index asc) with O(n) work per token:
+//   1. n <= 4096: one bitonic sort of everything (== the single-chunk path).
+//   2. n > 4096: sort a strided 2048-element SAMPLE of the scores (keys
+//      only), pick a deliberately LOW threshold t from the sample rank of
+//      the top_k-th element, then one pass counts #(> t) and #(>= t)
+//      (thread-local counts + one block reduce; no per-element atomics).
+//      Adjust t along the sample (a few retries) until #(> t) <= 4096 and
+//      #(>= t) >= top_k.
+//   3. Compact indices with score > t into LDS; if fewer than top_k, append
+//      the lowest-index elements with score == t (deterministic per-thread
+//      contiguous ranges + block prefix) — exactly the reference tie-break.
+//   4. bitonic_sort_lds the <= 4096 candidates with the reference comparator
+//      and write the first top_k.
+// If the sample cannot bracket a usable threshold (a >4096-element cluster
+// of near-equal scores between two consecutive sample values) the token is
+// left with done_b[bi] = 0 and the existing chain — which now early-outs
+// on done_b[bi] = 1 — handles it. Correctness never depends on the sample.
+// Grid (B), block 1024. LDS: 32 KB sort arrays + 8 KB sample + 4 KB scan.
+// =============================================================================
+#define TOPK_SEL_SAMPLE 2048u
+#define TOPK_SEL_CAP    TOPK_SORT_N
+
+__device__ __forceinline__ static unsigned int topk_key(float f) {
+    unsigned int b = __float_as_uint(f);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);   // monotonic: larger f -> larger key
+}
+
+// Descending bitonic sort of keys[TOPK_SEL_SAMPLE] in LDS (1024 threads).
+__device__ __forceinline__ static void bitonic_sort_keys2048(unsigned int* keys) {
+    const unsigned int tid = threadIdx.x;
+    #pragma unroll 1
+    for (unsigned int k = 2u; k <= TOPK_SEL_SAMPLE; k <<= 1u) {
+        #pragma unroll 1
+        for (unsigned int j = k >> 1u; j > 0u; j >>= 1u) {
+            for (unsigned int i = tid; i < TOPK_SEL_SAMPLE; i += TOPK_BLOCK) {
+                const unsigned int other = i ^ j;
+                if (other > i) {
+                    const unsigned int a = keys[i], b = keys[other];
+                    const bool desc_half = (i & k) == 0u;
+                    if (desc_half ? (b > a) : (a > b)) { keys[i] = b; keys[other] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(TOPK_BLOCK)
+void indexer_topk_select_batched(
+        int          * __restrict__ selected_b,     // [B, top_k]
+        unsigned int * __restrict__ done_b,         // [B]
+        const float  * __restrict__ scores_b,       // [B, n_idx_stride]
+        const unsigned int * __restrict__ n_idx_per,// [B]
+        unsigned int                n_idx_stride,
+        unsigned int                top_k) {
+    const unsigned int bi  = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int n   = n_idx_per[bi];
+    int          * __restrict__ selected = selected_b + (size_t)bi * top_k;
+    const float  * __restrict__ scores   = scores_b   + (size_t)bi * n_idx_stride;
+
+    __shared__ float        vals[TOPK_SORT_N];
+    __shared__ unsigned int idxs[TOPK_SORT_N];
+    __shared__ unsigned int sample[TOPK_SEL_SAMPLE];
+    __shared__ unsigned int red_gt[TOPK_BLOCK / 32], red_ge[TOPK_BLOCK / 32];
+    __shared__ unsigned int scan[TOPK_BLOCK];
+    __shared__ unsigned int s_count;
+    __shared__ unsigned int s_t, s_state;   // state: 0 = searching, 1 = ok, 2 = give up
+
+    if (n == 0u) {
+        for (unsigned int i = tid; i < top_k; i += TOPK_BLOCK) selected[i] = -1;
+        if (tid == 0u) done_b[bi] = 1u;
+        return;
+    }
+
+    unsigned int n_cand = 0u;
+    if (n <= TOPK_SORT_N) {
+        // --- small: sort everything (identical to the single-chunk path)
+        for (unsigned int i = tid; i < TOPK_SORT_N; i += TOPK_BLOCK) {
+            if (i < n) { vals[i] = scores[i]; idxs[i] = i; }
+            else       { vals[i] = TOPK_NEG_INF; idxs[i] = 0xFFFFFFFFu; }
+        }
+        n_cand = n;
+    } else {
+        // --- sample + sort (keys only)
+        for (unsigned int j = tid; j < TOPK_SEL_SAMPLE; j += TOPK_BLOCK) {
+            const unsigned int src = (unsigned int)(((unsigned long long)j * n) / TOPK_SEL_SAMPLE);
+            sample[j] = topk_key(scores[src]);
+        }
+        __syncthreads();
+        bitonic_sort_keys2048(sample);
+        // rank of the top_k-th element in the sample, then a deliberately low threshold
+        const unsigned int r = (unsigned int)(((unsigned long long)top_k * TOPK_SEL_SAMPLE + n - 1u) / n);
+        unsigned int idx_t = min(TOPK_SEL_SAMPLE - 1u, 2u * r + 32u);
+        unsigned int lo_idx = 0u, hi_idx = TOPK_SEL_SAMPLE - 1u;   // search bracket over sample ranks
+        unsigned int t = 0u; unsigned int count_gt = 0u, count_ge = 0u;
+        bool ok = false, giveup = false;
+        #pragma unroll 1
+        for (int attempt = 0; attempt < 8 && !ok && !giveup; attempt++) {
+            if (tid == 0u) s_t = sample[idx_t];
+            __syncthreads();
+            t = s_t;
+            // count > t and >= t
+            unsigned int c_gt = 0u, c_ge = 0u;
+            for (unsigned int i = tid; i < n; i += TOPK_BLOCK) {
+                const unsigned int k = topk_key(scores[i]);
+                c_gt += (k > t); c_ge += (k >= t);
+            }
+            // block reduce
+            #pragma unroll
+            for (unsigned int o = 16; o > 0; o >>= 1) { c_gt += __shfl_down(c_gt, o); c_ge += __shfl_down(c_ge, o); }
+            if ((tid & 31u) == 0u) { red_gt[tid >> 5] = c_gt; red_ge[tid >> 5] = c_ge; }
+            __syncthreads();
+            if (tid == 0u) {
+                unsigned int g = 0u, e = 0u;
+                for (unsigned int w = 0; w < TOPK_BLOCK / 32; w++) { g += red_gt[w]; e += red_ge[w]; }
+                red_gt[0] = g; red_ge[0] = e;
+                // decide
+                unsigned int st = 0u;
+                if (g <= TOPK_SEL_CAP && e >= top_k) st = 1u;
+                else if (g > TOPK_SEL_CAP) {            // too many above: raise t (smaller sample rank)
+                    hi_idx = idx_t;
+                    if (idx_t == 0u) st = 2u; else idx_t = lo_idx + (idx_t - lo_idx) / 2u;
+                } else {                                 // too few >= t: lower t (larger sample rank)
+                    lo_idx = idx_t;
+                    if (idx_t == TOPK_SEL_SAMPLE - 1u) { st = 2u; }
+                    else idx_t = idx_t + (hi_idx - idx_t + 1u) / 2u;
+                }
+                if (st == 0u && lo_idx + 1u >= hi_idx && attempt > 2) st = 2u;   // bracket collapsed
+                s_state = st;
+            }
+            __syncthreads();
+            count_gt = red_gt[0]; count_ge = red_ge[0];
+            ok = (s_state == 1u); giveup = (s_state == 2u);
+            __syncthreads();
+        }
+        if (!ok) {
+            // Last resort before giving up: t = key(-inf) selects everything finite;
+            // usable only when n itself is <= CAP (it is not here) -> give up.
+            if (tid == 0u) done_b[bi] = 0u;
+            return;
+        }
+        // --- compact > t
+        if (tid == 0u) s_count = 0u;
+        for (unsigned int i = tid; i < TOPK_SORT_N; i += TOPK_BLOCK) { vals[i] = TOPK_NEG_INF; idxs[i] = 0xFFFFFFFFu; }
+        __syncthreads();
+        for (unsigned int i = tid; i < n; i += TOPK_BLOCK) {
+            const float f = scores[i];
+            if (topk_key(f) > t) {
+                const unsigned int slot = atomicAdd(&s_count, 1u);
+                vals[slot] = f; idxs[slot] = i;
+            }
+        }
+        __syncthreads();
+        n_cand = count_gt;
+        if (count_gt < top_k) {
+            // append the lowest-index elements with key == t: per-thread contiguous
+            // ranges keep ascending order; block prefix gives global ranks.
+            const unsigned int need  = top_k - count_gt;
+            const unsigned int per   = (n + TOPK_BLOCK - 1u) / TOPK_BLOCK;
+            const unsigned int my_lo = min(n, tid * per), my_hi = min(n, my_lo + per);
+            unsigned int mine = 0u;
+            for (unsigned int i = my_lo; i < my_hi; i++) mine += (topk_key(scores[i]) == t);
+            scan[tid] = mine;
+            __syncthreads();
+            // Hillis-Steele inclusive scan over 1024
+            for (unsigned int o = 1u; o < TOPK_BLOCK; o <<= 1u) {
+                const unsigned int v = (tid >= o) ? scan[tid - o] : 0u;
+                __syncthreads();
+                scan[tid] += v;
+                __syncthreads();
+            }
+            const unsigned int before = scan[tid] - mine;   // exclusive
+            unsigned int rank = before;
+            for (unsigned int i = my_lo; i < my_hi && rank < need; i++) {
+                const float f = scores[i];
+                if (topk_key(f) == t) { vals[count_gt + rank] = f; idxs[count_gt + rank] = i; rank++; }
+            }
+            n_cand = count_gt + need;
+            __syncthreads();
+        }
+    }
+    __syncthreads();
+    bitonic_sort_lds(vals, idxs);
+    for (unsigned int i = tid; i < top_k; i += TOPK_BLOCK) {
+        selected[i] = (i < n_cand) ? (int)idxs[i] : -1;
+    }
+    if (tid == 0u) done_b[bi] = 1u;
 }

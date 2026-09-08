@@ -425,6 +425,11 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
         } else if moe_ab {
             vec![("moe=wmma", vec![("IGPU_MOE_WMMA", Some("1"))]), ("moe=kwide", vec![("IGPU_MOE_WMMA", Some("0"))]),
                  ("moe=wmma(2)", vec![("IGPU_MOE_WMMA", Some("1"))])]
+        } else if std::env::var_os("INDEXER_AB").is_some() {
+            // indexer score gemm + threshold top-k (2026-09-08) vs the mw score + bitonic chain
+            let new = vec![("INDEXER_SCORE_VARIANT", None), ("INDEXER_TOPK_SELECT", None)];
+            let old = vec![("INDEXER_SCORE_VARIANT", Some("mw")), ("INDEXER_TOPK_SELECT", Some("0"))];
+            vec![("indexer=new", new.clone()), ("indexer=old", old), ("indexer=new(2)", new)]
         } else if gemm_ab {
             let legacy = vec![("QB_WMMA", Some("lds_tiled")), ("Q8_GROUPED_VARIANT", Some("lds_tiled")), ("Q8_OUT_VARIANT", Some("lds_tiled"))];
             let f16x = vec![("QB_WMMA", None), ("Q8_GROUPED_VARIANT", None), ("Q8_OUT_VARIANT", None)];

@@ -416,6 +416,12 @@ pub struct BatchDgpuShared {
     /// (matvec(attn_q_b) output, then RoPE + QAT in place). R3 view @0:
     /// written by matvec_q, last read by the indexer score kernel (P5i).
     pub indexer_q: DeviceBuffer<f32>,
+    /// f16 copy of `indexer_q` for the GEMM-shaped score kernel (2026-09-08),
+    /// `[rows, 64*128]` halves = 8 MiB at rows=512.
+    pub indexer_q16: DeviceBuffer<u16>,
+    /// per-token flag for the threshold top-k fast path (2026-09-08): 1 = selected,
+    /// 0 = fall through to the bitonic chain. `[rows]` u32.
+    pub indexer_topk_done: DeviceBuffer<u32>,
     /// `[B, N_INDEXER_HEAD]` — per-token head_weights (matvec(proj)
     /// output, post-scale).
     pub indexer_head_weights: DeviceBuffer<f32>,
@@ -1005,6 +1011,8 @@ impl BatchDgpuShared {
                 mk_f32(per_b)?
             },
             indexer_q,
+            indexer_q16: DeviceBuffer::new(id, b * (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize)?,
+            indexer_topk_done: DeviceBuffer::new(id, b)?,
             // Per-token head_weights [N_INDEXER_HEAD] → 128 KB at rows=512.
             indexer_head_weights: mk_f32(N_INDEXER_HEAD as usize)?,
             indexer_scores,

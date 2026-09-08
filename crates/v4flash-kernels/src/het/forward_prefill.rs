@@ -1916,7 +1916,27 @@ impl HeterogeneousEngine {
                             .map(|v| v != "sw")
                             .unwrap_or(true)
                     });
-                    if *SCORE_MW {
+                    // 2026-09-08: default "gemm" (8 tokens/WG share each K tile,
+                    // 68% of matrix peak vs 15% for mw; bit-exact). mw / sw
+                    // stay selectable via INDEXER_SCORE_VARIANT.
+                    // Read per call (not LazyLock) so in-process A/B sweeps can flip it.
+                    let score_gemm = std::env::var("INDEXER_SCORE_VARIANT").map(|v| v == "gemm").unwrap_or(true);
+                    if score_gemm {
+                        de.q8k.launch_cast_f16(&de.compute, &mut sd.indexer_q16, &sd.indexer_q,
+                            b * N_INDEXER_HEAD * N_INDEXER_HEAD_DIM)?;
+                        wmma.launch_batched_gemm(
+                            &de.compute,
+                            &mut sd.indexer_scores,
+                            &sd.indexer_q16,
+                            &sd.indexer_head_weights,
+                            &ics.comp_kv,
+                            &sd.n_index_comp_per_b,
+                            n_idx_max,
+                            ATTN_MIXED_MAX_KEYS,
+                            b,
+                            0,
+                        )?;
+                    } else if *SCORE_MW {
                         wmma.launch_batched_mw(
                             &de.compute,
                             &mut sd.indexer_scores,
@@ -1944,6 +1964,8 @@ impl HeterogeneousEngine {
                 }
                 {
                     let _t = de.events.stage("k.indexer.topk_bitonic", &de.compute)?;
+                    // INDEXER_TOPK_SELECT=0 disables the threshold fast path.
+                    let topk_select = std::env::var("INDEXER_TOPK_SELECT").map(|v| v != "0").unwrap_or(true);
                     de.indexer_topk_bitonic.launch_batched(
                         &de.compute,
                         &mut sd.indexer_selected,
@@ -1956,6 +1978,7 @@ impl HeterogeneousEngine {
                         n_words_per_b as u32,
                         INDEXER_TOP_K,
                         b,
+                        if topk_select { Some(&mut sd.indexer_topk_done) } else { None },
                     )?;
                 }
                 // Gather selected rows from the MAIN compressor's comp_kv
