@@ -111,3 +111,27 @@ extern "C" __global__ void f32_to_f16_cast(
         for (unsigned int i = i0; i < n; i++) out[i] = __half_as_ushort(__float2half(x[i]));
     }
 }
+
+// f32 [rows][cols] -> f16 [rows][out_pitch] (cols % 8 == 0, out_pitch % 8 == 0).
+// The pitch lets the caller keep activation rows off a power-of-two stride
+// (the q8_0 f16x GEMM's B tiles alias L2 sets otherwise).
+extern "C" __global__ void f32_to_f16_cast_2d(
+        unsigned short * __restrict__ out,
+        const float    * __restrict__ x,
+        unsigned int     rows,
+        unsigned int     cols,
+        unsigned int     out_pitch) {
+    const unsigned int per_row = cols >> 3;                       // 8 elements per thread
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int r = gid / per_row;
+    if (r >= rows) return;
+    const unsigned int c0 = (gid - r * per_row) * 8u;
+    const float4 a = *(const float4*)(x + (size_t)r * cols + c0);
+    const float4 b = *(const float4*)(x + (size_t)r * cols + c0 + 4);
+    uint4 o;
+    o.x = (unsigned)__half_as_ushort(__float2half(a.x)) | ((unsigned)__half_as_ushort(__float2half(a.y)) << 16);
+    o.y = (unsigned)__half_as_ushort(__float2half(a.z)) | ((unsigned)__half_as_ushort(__float2half(a.w)) << 16);
+    o.z = (unsigned)__half_as_ushort(__float2half(b.x)) | ((unsigned)__half_as_ushort(__float2half(b.y)) << 16);
+    o.w = (unsigned)__half_as_ushort(__float2half(b.z)) | ((unsigned)__half_as_ushort(__float2half(b.w)) << 16);
+    *(uint4*)(out + (size_t)r * out_pitch + c0) = o;
+}

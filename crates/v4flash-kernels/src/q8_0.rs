@@ -452,6 +452,59 @@ impl Q8_0MatvecWmma {
     /// the dp4a `matvec_batched()` at long-K shapes (matvec_out, etc).
     /// Requires `M % 64 == 0` and `K % 32 == 0`.
     #[allow(clippy::too_many_arguments)]
+    /// Q8_0 weights x f16 activations, 128x128x32 RDNA4 WMMA GEMM (2026-09-08).
+    /// `x16` = [batch, x_pitch] f16 bits (`x_pitch` >= n_groups*k; pad it off a
+    /// power of two, see the kernel), `out` = [batch, n_groups*m] f32,
+    /// `weight` = [n_groups*m, blocks*34]. `n_groups` = 1 for a plain GEMM;
+    /// output_a passes its 8 groups (group g reads input columns g*k.. and
+    /// writes output columns g*m..). Requires m % 128 == 0, k % 32 == 0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16x(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        x16: &DeviceBuffer<u16>,
+        k: u32,
+        m: u32,
+        n_groups: u32,
+        batch: u32,
+        x_pitch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_groups == 0 {
+            return Ok(());
+        }
+        if k % Q8_0_BLOCK_ELEMS != 0 {
+            return Err(eyre!("gemm_f16x: k={k} not %32"));
+        }
+        if x_pitch < n_groups * k || x_pitch % 8 != 0 {
+            return Err(eyre!("gemm_f16x: x_pitch={x_pitch} must be >= n_groups*k={} and %8", n_groups * k));
+        }
+        if m % 128 != 0 {
+            return Err(eyre!("gemm_f16x: m={m} not %128"));
+        }
+        let blocks = k / Q8_0_BLOCK_ELEMS;
+        let need_w = (n_groups as usize) * (m as usize) * (blocks as usize) * (Q8_0_BLOCK_BYTES as usize);
+        if weight.byte_len() < need_w {
+            return Err(eyre!("gemm_f16x: weight {} B < needed {need_w}", weight.byte_len()));
+        }
+        if x16.len() < (batch as usize) * (x_pitch as usize) {
+            return Err(eyre!("gemm_f16x: x16 too small"));
+        }
+        if out.len() < (batch as usize) * (n_groups as usize) * (m as usize) {
+            return Err(eyre!("gemm_f16x: out too small"));
+        }
+        let function = self.module.get_function("q8_0_gemm_wmma_f16x")?;
+        let cfg = LaunchConfig {
+            grid: (batch.div_ceil(128), m / 128, n_groups),   // N-blocks fastest (weight-tile L2 reuse)
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), weight.raw(), x16.raw(), k, m, n_groups, batch, blocks, x_pitch
+        ])
+    }
+
     pub fn gemm_lds_tiled(
         &self,
         stream: &Stream,

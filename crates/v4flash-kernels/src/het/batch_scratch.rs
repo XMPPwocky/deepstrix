@@ -166,6 +166,11 @@ fn align256(bytes: usize) -> usize {
     (bytes + 255) & !255
 }
 
+/// Row pitch (halves) of the f16 activation buffers: +64 keeps every
+/// production dim off a power-of-two byte stride.
+pub const F16_PAD: u32 = 64;
+pub const fn f16_pitch(dim: u32) -> u32 { dim + F16_PAD }
+
 fn check_rows(who: &str, rows: usize) -> eyre::Result<()> {
     eyre::ensure!(rows > 0 && rows <= B_MAX, "{who} rows={rows} out of (0, B_MAX]");
     Ok(())
@@ -333,6 +338,15 @@ pub struct BatchDgpuShared {
 
     // ---- Q chain (P2; xq/xscale reused in P3 and P10) ----
     pub xq_n_embd: DeviceBuffer<i8>,
+    /// f16 activations for the q8_0 f16x WMMA GEMMs (2026-09-08), row pitch
+    /// `f16_pitch(dim)` = dim + 64 halves so rows never sit at a power-of-two
+    /// stride (out_a's 64 KB rows aliased L2 sets: 18% -> 52% of peak).
+    /// x16_n_embd doubles as the shared-expert input (dead by then).
+    pub x16_n_embd: DeviceBuffer<u16>,
+    pub qr16: DeviceBuffer<u16>,
+    pub heads16: DeviceBuffer<u16>,
+    pub low16: DeviceBuffer<u16>,
+    pub mid_sh16: DeviceBuffer<u16>,
     pub xscale_n_embd: DeviceBuffer<f32>,
     pub qr: DeviceBuffer<f32>,
     /// `[B, N_LORA_Q]` — normed q_a output. Written P2; last read by the
@@ -939,6 +953,11 @@ impl BatchDgpuShared {
             kq_ffn_q8k: mk_u8((BLOCKS_Q8K_GATE_IN as usize) * 292)?,
             kq_mid_q8k: mk_u8((BLOCKS_Q8K_DOWN_IN as usize) * 292)?,
             xq_n_embd: mk_i8(N_EMBD as usize)?,
+            x16_n_embd: DeviceBuffer::new(id, b * f16_pitch(N_EMBD) as usize)?,
+            qr16: DeviceBuffer::new(id, b * f16_pitch(N_LORA_Q) as usize)?,
+            heads16: DeviceBuffer::new(id, b * f16_pitch(Q_FLAT) as usize)?,
+            low16: DeviceBuffer::new(id, b * f16_pitch(OUT_LOW) as usize)?,
+            mid_sh16: DeviceBuffer::new(id, b * f16_pitch(N_FF_SHARED) as usize)?,
             xscale_n_embd: mk_f32(BLOCKS_N_EMBD as usize)?,
             qr: mk_f32(N_LORA_Q as usize)?,
             qr_normed: mk_f32(N_LORA_Q as usize)?,

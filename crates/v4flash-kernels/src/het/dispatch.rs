@@ -211,7 +211,8 @@ pub fn any_q8(ws: &[&DeviceWeight]) -> bool {
 }
 
 /// Prefill dense GEMM with per-dtype input prep:
-/// - Q8_0 rides the existing WMMA GEMM ((xq_i8, xscale) per token)
+/// - Q8_0 rides the f16x WMMA GEMM when f16 activations are supplied
+///   (2026-09-08; 4.4x the lds_tiled kernel), else lds_tiled on (xq_i8, xscale)
 /// - K-quants ride the dp4a register-tiled GEMM (Q8_K activations)
 ///
 /// The two paths take DIFFERENT activation quantizations — the caller
@@ -225,12 +226,16 @@ pub fn dense_gemm_prefill(
     xq_i8: &DeviceBuffer<i8>,
     xscale: &DeviceBuffer<f32>,
     xq_q8k: &DeviceBuffer<u8>,
+    x16: Option<(&DeviceBuffer<u16>, u32)>,   // f16 activations + row pitch (halves): Q8_0 -> f16x GEMM
     b: u32,
     n_rows: u32,
     k: u32,
 ) -> eyre::Result<()> {
     match w.dtype {
-        GgufType::Q8_0 => e.q8_wmma.gemm_lds_tiled(s, out, &w.buffer, xq_i8, xscale, n_rows, k, b),
+        GgufType::Q8_0 => match x16 {
+            Some((x, pitch)) if n_rows % 128 == 0 => e.q8_wmma.gemm_f16x(s, out, &w.buffer, x, k, n_rows, 1, b, pitch),
+            _ => e.q8_wmma.gemm_lds_tiled(s, out, &w.buffer, xq_i8, xscale, n_rows, k, b),
+        },
         GgufType::Q4_K | GgufType::Q5_K | GgufType::Q6_K => {
             e.dense_gemm.gemm(s, w.dtype, out, &w.buffer, xq_q8k, b, n_rows, k / 256)
         }

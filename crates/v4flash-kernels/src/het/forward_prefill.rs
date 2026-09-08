@@ -1016,15 +1016,9 @@ impl HeterogeneousEngine {
         // ========================================================
         let _t_q = de.events.stage("dgpu.q_chain", &de.compute)?;
         {
-            let _t = de.events.stage("k.q_chain.quantize_input", &de.compute)?;
-            de.q8.quantize_input_batched(
-                &de.compute,
-                &mut sd.xq_n_embd,
-                &mut sd.xscale_n_embd,
-                &sd.attn_input_norm,
-                N_EMBD,
-                b,
-            )?;
+            let _t = de.events.stage("k.q_chain.cast_input_f16", &de.compute)?;
+            de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.x16_n_embd, &sd.attn_input_norm,
+                b, N_EMBD, super::batch_scratch::f16_pitch(N_EMBD))?;
         }
         {
             let _t = de.events.stage("k.q_chain.qa_matvec", &de.compute)?;
@@ -1049,6 +1043,7 @@ impl HeterogeneousEngine {
                 &sd.xq_n_embd,
                 &sd.xscale_n_embd,
                 &sd.kq_attn_q8k,
+                Some((&sd.x16_n_embd, super::batch_scratch::f16_pitch(N_EMBD))),
                 b,
                 N_LORA_Q,
                 N_EMBD,
@@ -1067,15 +1062,9 @@ impl HeterogeneousEngine {
             )?;
         }
         {
-            let _t = de.events.stage("k.q_chain.quantize_qr", &de.compute)?;
-            de.q8.quantize_input_batched(
-                &de.compute,
-                &mut sd.qr_xq,
-                &mut sd.qr_xscale,
-                &sd.qr_normed,
-                N_LORA_Q,
-                b,
-            )?;
+            let _t = de.events.stage("k.q_chain.cast_qr_f16", &de.compute)?;
+            de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.qr16, &sd.qr_normed,
+                b, N_LORA_Q, super::batch_scratch::f16_pitch(N_LORA_Q))?;
         }
         // qb up-projection (M=Q_FLAT=32768, K=N_LORA_Q=1024). Default
         // LDS-tiled WMMA: cooperative-load A+B into LDS per K-outer iter,
@@ -1084,8 +1073,17 @@ impl HeterogeneousEngine {
         // at B=512: dp4a 8.82ms / wmma_old 4.24ms / wmma_lds_tiled 1.38ms
         // → 6.4× over dp4a, 3.1× over the older WMMA. Q_FLAT % 64 == 0 ✓.
         // QB_WMMA=wmma forces the older non-tiled WMMA; QB_WMMA=0 forces dp4a.
-        let qb_variant = std::env::var("QB_WMMA").unwrap_or_else(|_| "lds_tiled".into());
+        let qb_variant = std::env::var("QB_WMMA").unwrap_or_else(|_| "f16x".into());
+        if qb_variant != "f16x" {
+            // legacy variants consume the Q8_0 quantization of qr
+            de.q8.quantize_input_batched(&de.compute, &mut sd.qr_xq, &mut sd.qr_xscale, &sd.qr_normed, N_LORA_Q, b)?;
+        }
         match qb_variant.as_str() {
+            "f16x" => {
+                let _t = de.events.stage("k.q_chain.qb_f16x", &de.compute)?;
+                de.q8_wmma.gemm_f16x(&de.compute, &mut sd.q, &dlw.attn_q_b.buffer, &sd.qr16,
+                    N_LORA_Q, Q_FLAT, 1, b, super::batch_scratch::f16_pitch(N_LORA_Q))?;
+            }
             "0" | "dp4a" => {
                 let _t = de.events.stage("k.q_chain.qb_matvec", &de.compute)?;
                 de.q8.matvec_batched(
@@ -1144,17 +1142,9 @@ impl HeterogeneousEngine {
         // ========================================================
         let _t_kv = de.events.stage("dgpu.kv_chain", &de.compute)?;
         {
-            let _t = de.events.stage("k.kv_chain.matvec", &de.compute)?;
-            de.q8_wmma.gemm_lds_tiled(
-                &de.compute,
-                &mut sd.kv_raw,
-                &dlw.attn_kv.buffer,
-                &sd.xq_n_embd,
-                &sd.xscale_n_embd,
-                N_HEAD_DIM,
-                N_EMBD,
-                b,
-            )?;
+            let _t = de.events.stage("k.kv_chain.gemm_f16x", &de.compute)?;
+            de.q8_wmma.gemm_f16x(&de.compute, &mut sd.kv_raw, &dlw.attn_kv.buffer, &sd.x16_n_embd,
+                N_EMBD, N_HEAD_DIM, 1, b, super::batch_scratch::f16_pitch(N_EMBD))?;
         }
         {
             let _t = de.events.stage("k.kv_chain.rms_w", &de.compute)?;
@@ -2181,15 +2171,9 @@ impl HeterogeneousEngine {
             )?;
         }
         {
-            let _t = de.events.stage("k.output_proj.quantize_heads", &de.compute)?;
-            de.q8.quantize_input_batched(
-                &de.compute,
-                &mut sd.heads_xq,
-                &mut sd.heads_xscale,
-                &sd.heads,
-                Q_FLAT,
-                b,
-            )?;
+            let _t = de.events.stage("k.output_proj.cast_heads_f16", &de.compute)?;
+            de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.heads16, &sd.heads,
+                b, Q_FLAT, super::batch_scratch::f16_pitch(Q_FLAT))?;
         }
         {
             let _t = de.events.stage("k.output_proj.grouped_matvec", &de.compute)?;
@@ -2200,9 +2184,17 @@ impl HeterogeneousEngine {
             // M. Isolated A/B per sub-group at B=512: dp4a 0.42ms vs
             // lds_tiled 0.20ms = 2.1× on each, ~2× on the whole grouped
             // call. Q8_GROUPED_VARIANT=dp4a rolls back.
+            // 2026-09-08: default f16x (128x128 f16-activation WMMA GEMM, 52% of
+            // matrix peak with the padded heads16 pitch vs 11% for lds_tiled).
             let grp_variant = std::env::var("Q8_GROUPED_VARIANT")
-                .unwrap_or_else(|_| "lds_tiled".into());
-            if grp_variant == "dp4a" {
+                .unwrap_or_else(|_| "f16x".into());
+            if grp_variant != "f16x" {
+                de.q8.quantize_input_batched(&de.compute, &mut sd.heads_xq, &mut sd.heads_xscale, &sd.heads, Q_FLAT, b)?;
+            }
+            if grp_variant == "f16x" {
+                de.q8_wmma.gemm_f16x(&de.compute, &mut sd.low, &dlw.attn_output_a.buffer, &sd.heads16,
+                    GROUP_DIM, RANK, N_GROUPS, b, super::batch_scratch::f16_pitch(Q_FLAT))?;
+            } else if grp_variant == "dp4a" {
                 de.q8_grouped.matvec_grouped_batched(
                     &de.compute, &mut sd.low, &dlw.attn_output_a.buffer,
                     &sd.heads_xq, &sd.heads_xscale,
@@ -2217,15 +2209,9 @@ impl HeterogeneousEngine {
             }
         }
         {
-            let _t = de.events.stage("k.output_proj.quantize_low", &de.compute)?;
-            de.q8.quantize_input_batched(
-                &de.compute,
-                &mut sd.low_xq,
-                &mut sd.low_xscale,
-                &sd.low,
-                OUT_LOW,
-                b,
-            )?;
+            let _t = de.events.stage("k.output_proj.cast_low_f16", &de.compute)?;
+            de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.low16, &sd.low,
+                b, OUT_LOW, super::batch_scratch::f16_pitch(OUT_LOW))?;
         }
         {
             let _t = de.events.stage("k.output_proj.matvec_out", &de.compute)?;
@@ -2233,8 +2219,14 @@ impl HeterogeneousEngine {
             // (M=N_EMBD=4096, K=OUT_LOW=8192) hits the same s_wait_loadcnt
             // throttle on dp4a; LDS-tiled WMMA wins 6.2× at B=512 isolated
             // (8.82 → 1.42 ms). Q8_OUT_VARIANT=dp4a rolls back.
-            let out_variant = std::env::var("Q8_OUT_VARIANT").unwrap_or_else(|_| "lds_tiled".into());
-            if out_variant == "dp4a" {
+            let out_variant = std::env::var("Q8_OUT_VARIANT").unwrap_or_else(|_| "f16x".into());
+            if out_variant != "f16x" {
+                de.q8.quantize_input_batched(&de.compute, &mut sd.low_xq, &mut sd.low_xscale, &sd.low, OUT_LOW, b)?;
+            }
+            if out_variant == "f16x" {
+                de.q8_wmma.gemm_f16x(&de.compute, &mut sd.attn_out, &dlw.attn_output_b.buffer, &sd.low16,
+                    OUT_LOW, N_EMBD, 1, b, super::batch_scratch::f16_pitch(OUT_LOW))?;
+            } else if out_variant == "dp4a" {
                 de.q8.matvec_batched(
                     &de.compute, &mut sd.attn_out, &dlw.attn_output_b.buffer,
                     &sd.low_xq, &sd.low_xscale, N_EMBD, OUT_LOW, b,
@@ -2472,14 +2464,8 @@ impl HeterogeneousEngine {
             // Q8_0 gate/up consume the (i8, scale) pair; K-quants (unsloth
             // Q5_K/Q6_K) consume Q8_K — quantize only what's consumed.
             if super::dispatch::any_q8(&[&dlw.shared.gate, &dlw.shared.up]) {
-                de.q8.quantize_input_batched(
-                    &de.compute,
-                    &mut sd.xq_n_embd,
-                    &mut sd.xscale_n_embd,
-                    &bd.ffn_input_norm,
-                    N_EMBD,
-                    b,
-                )?;
+                de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.x16_n_embd, &bd.ffn_input_norm,
+                    b, N_EMBD, super::batch_scratch::f16_pitch(N_EMBD))?;
             } else {
                 de.q8k.launch(
                     &de.compute,
@@ -2494,6 +2480,7 @@ impl HeterogeneousEngine {
             super::dispatch::dense_gemm_prefill(
                 de, &de.compute, &mut sd.gate_sh, &dlw.shared.gate,
                 &sd.xq_n_embd, &sd.xscale_n_embd, &sd.kq_ffn_q8k,
+                Some((&sd.x16_n_embd, super::batch_scratch::f16_pitch(N_EMBD))),
                 b, N_FF_SHARED, N_EMBD,
             )?;
         }
@@ -2502,6 +2489,7 @@ impl HeterogeneousEngine {
             super::dispatch::dense_gemm_prefill(
                 de, &de.compute, &mut sd.up_sh, &dlw.shared.up,
                 &sd.xq_n_embd, &sd.xscale_n_embd, &sd.kq_ffn_q8k,
+                Some((&sd.x16_n_embd, super::batch_scratch::f16_pitch(N_EMBD))),
                 b, N_FF_SHARED, N_EMBD,
             )?;
         }
@@ -2522,14 +2510,8 @@ impl HeterogeneousEngine {
         {
             let _t = de.events.stage("k.shared_expert.quantize_mid", &de.compute)?;
             if super::dispatch::any_q8(&[&dlw.shared.down]) {
-                de.q8.quantize_input_batched(
-                    &de.compute,
-                    &mut sd.mid_sh_xq,
-                    &mut sd.mid_sh_xscale,
-                    &sd.mid_sh,
-                    N_FF_SHARED,
-                    b,
-                )?;
+                de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.mid_sh16, &sd.mid_sh,
+                    b, N_FF_SHARED, super::batch_scratch::f16_pitch(N_FF_SHARED))?;
             } else {
                 de.q8k.launch(
                     &de.compute,
@@ -2544,6 +2526,7 @@ impl HeterogeneousEngine {
             super::dispatch::dense_gemm_prefill(
                 de, &de.compute, &mut bd.ffn_shared, &dlw.shared.down,
                 &sd.mid_sh_xq, &sd.mid_sh_xscale, &sd.kq_mid_q8k,
+                Some((&sd.mid_sh16, super::batch_scratch::f16_pitch(N_FF_SHARED))),
                 b, N_EMBD, N_FF_SHARED,
             )?;
         }

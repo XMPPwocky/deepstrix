@@ -416,20 +416,27 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
         // kwide/Q8_K, 2026-09-08). One weight load, back-to-back.
         let ab = std::env::var_os("QB_WMMA_AB").is_some();
         let moe_ab = std::env::var_os("IGPU_MOE_WMMA_AB").is_some();
-        // (label, env var, value-or-unset)
-        let variants: Vec<(&str, &str, Option<&str>)> = if ab {
-            vec![("qb=dp4a", "QB_WMMA", None), ("qb=wmma", "QB_WMMA", Some("1"))]
+        // Q8_GEMM_AB=1: dGPU q8_0 GEMMs f16x (default) vs the legacy lds_tiled
+        // kernels (QB_WMMA / Q8_GROUPED_VARIANT / Q8_OUT_VARIANT = lds_tiled).
+        let gemm_ab = std::env::var_os("Q8_GEMM_AB").is_some();
+        // (label, [(env var, value-or-unset)])
+        let variants: Vec<(&str, Vec<(&str, Option<&str>)>)> = if ab {
+            vec![("qb=dp4a", vec![("QB_WMMA", None)]), ("qb=wmma", vec![("QB_WMMA", Some("1"))])]
         } else if moe_ab {
-            vec![("moe=wmma", "IGPU_MOE_WMMA", Some("1")), ("moe=kwide", "IGPU_MOE_WMMA", Some("0")),
-                 ("moe=wmma(2)", "IGPU_MOE_WMMA", Some("1"))]
+            vec![("moe=wmma", vec![("IGPU_MOE_WMMA", Some("1"))]), ("moe=kwide", vec![("IGPU_MOE_WMMA", Some("0"))]),
+                 ("moe=wmma(2)", vec![("IGPU_MOE_WMMA", Some("1"))])]
+        } else if gemm_ab {
+            let legacy = vec![("QB_WMMA", Some("lds_tiled")), ("Q8_GROUPED_VARIANT", Some("lds_tiled")), ("Q8_OUT_VARIANT", Some("lds_tiled"))];
+            let f16x = vec![("QB_WMMA", None), ("Q8_GROUPED_VARIANT", None), ("Q8_OUT_VARIANT", None)];
+            vec![("gemm=f16x", f16x.clone()), ("gemm=lds_tiled", legacy), ("gemm=f16x(2)", f16x)]
         } else {
-            vec![("qb=current", "", None)]
+            vec![("qb=current", vec![])]
         };
 
         // summary[variant] = Vec<(depth, min_ms, median_ms)>
         let mut summaries: Vec<(&str, Vec<(u32, f64, f64)>)> = Vec::new();
-        for (vname, venv, vval) in &variants {
-            if !venv.is_empty() {
+        for (vname, venvs) in &variants {
+            for (venv, vval) in venvs {
                 match vval {
                     Some(v) => std::env::set_var(venv, v),
                     None => std::env::remove_var(venv),

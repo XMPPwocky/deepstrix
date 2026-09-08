@@ -526,3 +526,181 @@ extern "C" __global__ void q8_0_gemm_wmma_lds_tiled_grouped(
     (void)group_dim; (void)rank; (void)n_groups; (void)batch; (void)blocks;
 #endif
 }
+
+// =============================================================================
+// q8_0_gemm_wmma_f16x — Q8_0 weights x f16 activations, RDNA4 f16 WMMA
+// (2026-09-08). Replaces q8_0_gemm_wmma_lds_tiled (11% of the 194.6-TFLOP
+// matrix peak at B=1024: 64x64 tiles, 4 accumulators/wave, B tile k-major so
+// each fragment was 8 scalar LDS reads, every element re-dequantized per
+// k-step, load -> sync -> compute -> sync with no overlap).
+//
+//   - BM=128 (weight rows) x BN=128 (tokens) x BK=32 (one Q8_0 block);
+//     256 threads = 8 waves as 2 (m) x 4 (n); wave tile 64x32 = 4x2 WMMA
+//     accumulators (64 VGPRs). Per k-step: 4 A + 2 B fragment loads, 8 WMMAs.
+//   - Both LDS tiles [row][k] with k contiguous, row stride 40 halves = 80 B
+//     (20 dwords ≡ 4 banks mod 32): the gfx12 fragment (lane l = row l&15,
+//     k (l>>4)*8..+8) is ONE ds_read_b128 per lane, conflict-free at the
+//     4-cycle minimum for 32 lanes.
+//   - Activations arrive as f16 [B, ldx] (cast once per layer by the caller;
+//     no per-token dequant): the B tile is a b128 global->LDS copy.
+//   - Weights: thread t stages 16 int8 of row t>>1 (one b128 load) and
+//     dequantizes ONCE per k-outer via the perm trick (byte ^ 0x80 -> bias,
+//     0x64|u = 1024+u exactly, pk_add -1152, pk_mul d): 7 VALU per 4 weights.
+//   - Epilogue: each lane holds 8 consecutive m for one n -> two b128 stores
+//     per (m-tile, n-tile) into out[n][m] (row-major [B, ldo]).
+//   - grid.z = group: weights of group g at w + g*M*rowbytes, its input
+//     columns at g*K within ldx, its output columns at g*M within ldo
+//     (output_a's 8 groups; n_groups=1 = plain GEMM).
+//   - Requires M % 128 == 0 (q_b 32768, kv 512, out_b 4096, out_a 1024 per
+//     group) and K % 32 == 0; batch is guarded (zero-filled tokens, no store).
+// LDS 20 KB/WG -> 3 WGs/CU.
+// =============================================================================
+typedef _Float16 half2v_q8 __attribute__((ext_vector_type(2)));
+
+__device__ __forceinline__ void q8x_magic4(uint32_t w, _Float16 scale, uint32_t& lo, uint32_t& hi) {
+    const uint32_t u = w ^ 0x80808080u;                         // bytes = 128 + b (b signed)
+    const uint32_t h01 = __builtin_amdgcn_perm(u, 0x64646464u, 0x00050004u);
+    const uint32_t h23 = __builtin_amdgcn_perm(u, 0x64646464u, 0x00070006u);
+    half2v_q8 a, b;
+    __builtin_memcpy(&a, &h01, 4);
+    __builtin_memcpy(&b, &h23, 4);
+    const half2v_q8 bias = {(_Float16)-1152.0f, (_Float16)-1152.0f};
+    a = (a + bias) * scale;
+    b = (b + bias) * scale;
+    __builtin_memcpy(&lo, &a, 4);
+    __builtin_memcpy(&hi, &b, 4);
+}
+
+extern "C" __global__ void q8_0_gemm_wmma_f16x(
+    float* __restrict__ out,               // [B, ldo], ldo = n_groups*M
+    const unsigned char* __restrict__ w,   // [n_groups*M, blocks*34]
+    const uint16_t* __restrict__ x16,      // [B, ldx] f16 bits (group g at cols g*K..)
+    uint32_t K,                            // per group
+    uint32_t M,                            // per group
+    uint32_t n_groups,
+    uint32_t batch,                        // N = B
+    uint32_t blocks,                       // K / 32
+    uint32_t ldx)                          // activation row pitch in halves (>= n_groups*K; pad
+                                           // it off a power of two: out_a's 65536-B rows aliased L2 sets)
+{
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    constexpr uint32_t BM = 128u, BN = 128u, BK = 32u;
+    constexpr uint32_t LDS_STRIDE = BK + 8u;          // 40 halves = 80 B
+    __shared__ __attribute__((aligned(16))) _Float16 A_tile[BM * LDS_STRIDE];
+    __shared__ __attribute__((aligned(16))) _Float16 B_tile[BN * LDS_STRIDE];
+
+    const uint32_t tid  = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5;                   // 0..7
+    const uint32_t wave_m0 = (wave >> 2) * 64u;       // 0 | 64
+    const uint32_t wave_n0 = (wave & 3u) * 32u;       // 0,32,64,96
+    // grid.x = N-blocks (fastest): the 4 N-blocks sharing one weight tile
+    // run back to back, so the tile is fetched from DRAM once and hits L2
+    // for the others (M-fastest dispatch re-read q_b's 35 MB four times).
+    const uint32_t n0 = blockIdx.x * BN;
+    const uint32_t m0 = blockIdx.y * BM;
+    const uint32_t g  = blockIdx.z;
+    if (m0 >= M) return;
+    const uint32_t ldo = n_groups * M;
+    const size_t rowbytes   = (size_t)blocks * 34u;
+    const size_t scalebytes = (size_t)blocks * 2u;
+    const unsigned char* w_g = w + (size_t)g * (size_t)M * rowbytes;
+
+    // staging roles: thread t -> row/token t>>1, k half (t&1)*16
+    const uint32_t st_row  = tid >> 1;
+    const uint32_t st_koff = (tid & 1u) * 16u;
+    const unsigned char* a_src_row = w_g + (size_t)(m0 + st_row) * rowbytes;   // m0+st_row < M guaranteed by M%128
+    const bool b_valid = (n0 + st_row) < batch;
+    const uint16_t* b_src_row = x16 + (size_t)(n0 + st_row) * (size_t)ldx + (size_t)g * K;
+
+    float8 acc[4][2];
+    #pragma unroll
+    for (int mt = 0; mt < 4; ++mt)
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+            acc[mt][nt] = (float8){0,0,0,0,0,0,0,0};
+
+    // Register prefetch, one k-outer ahead: the raw A bytes + scale and the
+    // B halves for k-outer i+1 are loaded right after the barrier that
+    // publishes tile i, so their latency overlaps tile i's WMMAs.
+    uint4 qa, vb0, vb1;
+    uint16_t sbits;
+    auto load_raw = [&](uint32_t ko) {
+        __builtin_memcpy(&qa, a_src_row + scalebytes + ko + st_koff, 16);
+        __builtin_memcpy(&sbits, a_src_row + 2u * (ko >> 5), 2);
+        vb0 = make_uint4(0u, 0u, 0u, 0u); vb1 = vb0;
+        if (b_valid) {
+            __builtin_memcpy(&vb0, b_src_row + ko + st_koff, 16);
+            __builtin_memcpy(&vb1, b_src_row + ko + st_koff + 8u, 16);
+        }
+    };
+    load_raw(0u);
+    for (uint32_t k_outer = 0; k_outer < K; k_outer += BK) {
+        // --- stage A: 16 int8 -> 16 f16 (scale folded) -> 2 x b128 into LDS
+        {
+            _Float16 d;
+            __builtin_memcpy(&d, &sbits, 2);
+            uint32_t o[8];
+            q8x_magic4(qa.x, d, o[0], o[1]);
+            q8x_magic4(qa.y, d, o[2], o[3]);
+            q8x_magic4(qa.z, d, o[4], o[5]);
+            q8x_magic4(qa.w, d, o[6], o[7]);
+            uint4* dst = (uint4*)(&A_tile[st_row * LDS_STRIDE + st_koff]);
+            dst[0] = make_uint4(o[0], o[1], o[2], o[3]);
+            dst[1] = make_uint4(o[4], o[5], o[6], o[7]);
+        }
+        // --- stage B: straight copy
+        {
+            uint4* dst = (uint4*)(&B_tile[st_row * LDS_STRIDE + st_koff]);
+            dst[0] = vb0;
+            dst[1] = vb1;
+        }
+        __syncthreads();
+        if (k_outer + BK < K) load_raw(k_outer + BK);   // in flight during the WMMAs below
+
+        #pragma unroll
+        for (uint32_t k_inner = 0; k_inner < BK; k_inner += 16u) {
+            const uint32_t kf = k_inner + (lane >> 4) * 8u;
+            half8 a_frags[4];
+            #pragma unroll
+            for (int mt = 0; mt < 4; ++mt) {
+                const uint32_t r = wave_m0 + mt * 16u + (lane & 15u);
+                __builtin_memcpy(&a_frags[mt], &A_tile[r * LDS_STRIDE + kf], 16);
+            }
+            half8 b_frags[2];
+            #pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const uint32_t r = wave_n0 + nt * 16u + (lane & 15u);
+                __builtin_memcpy(&b_frags[nt], &B_tile[r * LDS_STRIDE + kf], 16);
+            }
+            #pragma unroll
+            for (int mt = 0; mt < 4; ++mt)
+                #pragma unroll
+                for (int nt = 0; nt < 2; ++nt)
+                    acc[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                        a_frags[mt], b_frags[nt], acc[mt][nt]);
+        }
+        __syncthreads();
+    }
+
+    // --- epilogue: C lane l elem e = C[m = (l>>4)*8 + e][n = l&15]; the 8 m
+    //     are contiguous in out[n][.] -> two b128 stores.
+    #pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+        const uint32_t n_idx = n0 + wave_n0 + nt * 16u + (lane & 15u);
+        if (n_idx >= batch) continue;
+        #pragma unroll
+        for (int mt = 0; mt < 4; ++mt) {
+            const uint32_t m_idx = m0 + wave_m0 + mt * 16u + (lane >> 4) * 8u;
+            float* dst = out + (size_t)n_idx * (size_t)ldo + (size_t)g * M + m_idx;
+            const float8 c = acc[mt][nt];
+            const float4 c0 = {c[0], c[1], c[2], c[3]};
+            const float4 c1 = {c[4], c[5], c[6], c[7]};
+            __builtin_memcpy(dst, &c0, 16);
+            __builtin_memcpy(dst + 4, &c1, 16);
+        }
+    }
+#else
+    (void)out; (void)w; (void)x16; (void)K; (void)M; (void)n_groups; (void)batch; (void)blocks; (void)ldx;
+#endif
+}

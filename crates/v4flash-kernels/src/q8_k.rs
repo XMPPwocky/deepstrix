@@ -111,4 +111,19 @@ impl Q8KQuantize {
         let cfg = LaunchConfig { grid: (threads.div_ceil(256) as u32, 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(function, cfg, stream, [out.raw(), x.raw(), n])
     }
+
+    /// f32 [rows][cols] -> f16 [rows][out_pitch]; cols and out_pitch % 8 == 0.
+    pub fn launch_cast_f16_2d(&self, stream: &Stream, out: &mut DeviceBuffer<u16>, x: &DeviceBuffer<f32>, rows: u32, cols: u32, out_pitch: u32) -> eyre::Result<()> {
+        if cols % 8 != 0 || out_pitch % 8 != 0 || out_pitch < cols {
+            return Err(eyre!("f32_to_f16_cast_2d: cols={cols} out_pitch={out_pitch} invalid"));
+        }
+        if out.len() < (rows as usize) * (out_pitch as usize) || x.len() < (rows as usize) * (cols as usize) {
+            return Err(eyre!("f32_to_f16_cast_2d: buffers too small (rows={rows})"));
+        }
+        if rows == 0 { return Ok(()); }
+        let function = self.module.get_function("f32_to_f16_cast_2d")?;
+        let threads = (rows as usize) * (cols as usize / 8);
+        let cfg = LaunchConfig { grid: (threads.div_ceil(256) as u32, 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(function, cfg, stream, [out.raw(), x.raw(), rows, cols, out_pitch])
+    }
 }
