@@ -99,4 +99,16 @@ impl Q8KQuantize {
         };
         launch_kernel!(function, cfg, stream, [out_ptr, x_ptr, n_blocks])
     }
+
+    /// f32 -> f16 cast of `n` elements (WMMA MoE activation prep).
+    pub fn launch_cast_f16(&self, stream: &Stream, out: &mut DeviceBuffer<u16>, x: &DeviceBuffer<f32>, n: u32) -> eyre::Result<()> {
+        if out.len() < n as usize || x.len() < n as usize {
+            return Err(eyre!("f32_to_f16_cast: buffers too small for n={n}"));
+        }
+        if n == 0 { return Ok(()); }
+        let function = self.module.get_function("f32_to_f16_cast")?;
+        let threads = (n as usize).div_ceil(8);
+        let cfg = LaunchConfig { grid: (threads.div_ceil(256) as u32, 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(function, cfg, stream, [out.raw(), x.raw(), n])
+    }
 }

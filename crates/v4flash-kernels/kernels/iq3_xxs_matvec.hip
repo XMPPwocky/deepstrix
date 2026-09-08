@@ -445,3 +445,228 @@ extern "C" __global__ void iq3_xxs_matvec_par_by_expert_kwide2(
         }
     }
 }
+
+// =============================================================================
+// wmma — f16 WMMA batched-prefill down-projection for IQ3_XXS (2026-09-08).
+// Twin of iq2_xs_pair_matvec_fused_swiglu_wmma (see its banner for the
+// rationale, layout facts and the measured design decisions); one matrix,
+// partials contract of the kwide2 kernel above (pair with
+// q2_k_reduce_partials / _hetsplit).
+//
+//   - WG = 256 threads = 8 waves x 16-row M-tiles (128 rows per WG); work
+//     item = (expert, <=32 members) -> N-tiles of 16 (template NT = 1|2).
+//   - B = f16 mid [B*n_used][K]: member (b, slot) row at
+//     (b*n_used + slot) * x_member_stride halves; each super-block's 256 k
+//     of the <=32 members staged in LDS (row stride 264 halves).
+//   - A: lane l dequantizes row (m0 + l%16); per super-block one u16 d +
+//     4 x b128 q3 (64 grid bytes) + 2 x b128 aux (8 u32) loads; 16 k-steps
+//     fully unrolled. k-step ks: ib32 = ks>>1, half = ks&1 -> the u32 #ks of
+//     q3 holds the 4 grid indices, aux[ib32] holds the two 7-bit sign
+//     indices at bits 7*(2*half+j) and the 4-bit scale at bits 28-31.
+//   - Dequant (magic): grid u32 (4 unsigned magnitude bytes) ^ biased sign
+//     mask dword -> +(smb & 0x01010101) -> bytes 128 +/- g; v_perm builds
+//     halves 0x64|u = 1024+u; pk_add -1152; pk_mul by 0.25*d*ls.
+//     9 VALU per 4 weights, ~55 VALU per k-step; WMMA 2 x 32 clk (NT=2).
+//   - Epilogue: partials[(b*n_used+slot)*n_rows + row] = C[row][member].
+//
+// LDS: 1 KiB grid + 1 KiB biased signs + 16.5 KiB x-stage + 128 B.
+// =============================================================================
+
+#define IQ3_WM_MAX_CHUNK   32u
+#define IQ3_WM_ROWS_PER_WG 128u
+#define IQ3_WM_X_STRIDE    264u
+
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
+#define IQ3_WMMA_RDNA3 1
+#endif
+
+typedef _Float16 iq3_half16 __attribute__((ext_vector_type(16)));
+typedef _Float16 iq3_half2  __attribute__((ext_vector_type(2)));
+typedef float    iq3_float8 __attribute__((ext_vector_type(8)));
+
+__device__ __forceinline__ void iq3_magic_dword(uint32_t g, uint32_t smb, _Float16 scale,
+                                                uint32_t& lo, uint32_t& hi) {
+    const uint32_t u = (g ^ smb) + (smb & 0x01010101u);
+    const uint32_t h01 = __builtin_amdgcn_perm(u, 0x64646464u, 0x00050004u);
+    const uint32_t h23 = __builtin_amdgcn_perm(u, 0x64646464u, 0x00070006u);
+    iq3_half2 a, b;
+    __builtin_memcpy(&a, &h01, 4);
+    __builtin_memcpy(&b, &h23, 4);
+    const iq3_half2 bias = {(_Float16)-1152.0f, (_Float16)-1152.0f};
+    a = (a + bias) * scale;
+    b = (b + bias) * scale;
+    __builtin_memcpy(&lo, &a, 4);
+    __builtin_memcpy(&hi, &b, 4);
+}
+
+template <int NT>
+__device__ __forceinline__ void iq3_wmma_mainloop(
+        iq3_float8 (&acc)[2],
+        const uint8_t* __restrict__ w_row,          // this lane's row, expert base applied
+        const uint16_t* __restrict__ x16,
+        uint16_t* s_x, const int* s_member_packed,
+        const uint32_t* s_grid3, const uint64_t* s_sign_bias,
+        unsigned int n_members, unsigned int n_used, unsigned int x_member_stride,
+        unsigned int n_blocks_in, bool row_valid, unsigned int tid, unsigned int l16) {
+    for (unsigned int sb = 0; sb < n_blocks_in; sb++) {
+        // --- stage this super-block's 256 k of every member (zeros past n_members)
+        {
+            #pragma unroll
+            for (unsigned int j = 0; j < 4u; j++) {
+                const unsigned int idx = tid + 256u * j;
+                const unsigned int mi  = idx >> 5;
+                const unsigned int c   = idx & 31u;
+                uint4 v = make_uint4(0u, 0u, 0u, 0u);
+                if (mi < n_members) {
+                    const int packed = s_member_packed[mi];
+                    const unsigned int b    = (unsigned int)(packed >> 16) & 0xffffu;
+                    const unsigned int slot = (unsigned int)(packed) & 0xffffu;
+                    const uint4* src = (const uint4*)(x16
+                        + ((size_t)b * (size_t)n_used + (size_t)slot) * (size_t)x_member_stride
+                        + (size_t)sb * 256u + (size_t)c * 8u);
+                    v = *src;
+                }
+                *(uint4*)(&s_x[mi * IQ3_WM_X_STRIDE + c * 8u]) = v;
+            }
+        }
+        __syncthreads();
+
+        // --- this lane's whole 98-B block for row_a: d | q3[64] | aux[8]
+        const uint8_t* blk = w_row + (uint64_t)sb * BLOCK_IQ3_XXS_BYTES;
+        uint4 q3v[4], auxv[2];
+        float dsc = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) q3v[i] = make_uint4(0u, 0u, 0u, 0u);
+        auxv[0] = make_uint4(0u, 0u, 0u, 0u); auxv[1] = auxv[0];
+        if (row_valid) {
+            uint16_t wd;
+            __builtin_memcpy(&wd, blk, 2);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) __builtin_memcpy(&q3v[i], blk + 2 + 16 * i, 16);
+            __builtin_memcpy(&auxv[0], blk + 66, 16);
+            __builtin_memcpy(&auxv[1], blk + 82, 16);
+            dsc = 0.25f * f16_to_f32_par(wd);
+        }
+
+        #pragma unroll
+        for (unsigned int ks = 0; ks < 16u; ks++) {
+            const unsigned int ib32 = ks >> 1;
+            const unsigned int half = ks & 1u;
+            const uint32_t qs = (ks & 3u) == 0u ? q3v[ks >> 2].x : (ks & 3u) == 1u ? q3v[ks >> 2].y
+                              : (ks & 3u) == 2u ? q3v[ks >> 2].z : q3v[ks >> 2].w;
+            const uint32_t aux = (ib32 & 3u) == 0u ? auxv[ib32 >> 2].x : (ib32 & 3u) == 1u ? auxv[ib32 >> 2].y
+                               : (ib32 & 3u) == 2u ? auxv[ib32 >> 2].z : auxv[ib32 >> 2].w;
+            const float ls = (float)(2u * (aux >> 28) + 1u);
+            const _Float16 hs = (_Float16)(dsc * ls);
+            // sign groups l = 2*half, 2*half+1 ; grid bytes 0..3 of qs
+            const uint64_t sm0 = s_sign_bias[(aux >> (7u * (2u * half)))      & 127u];
+            const uint64_t sm1 = s_sign_bias[(aux >> (7u * (2u * half + 1u))) & 127u];
+            const uint32_t g0 = s_grid3[qs & 0xffu];
+            const uint32_t g1 = s_grid3[(qs >> 8) & 0xffu];
+            const uint32_t g2 = s_grid3[(qs >> 16) & 0xffu];
+            const uint32_t g3 = s_grid3[qs >> 24];
+            uint32_t d[8];
+            iq3_magic_dword(g0, (uint32_t)sm0,         hs, d[0], d[1]);
+            iq3_magic_dword(g1, (uint32_t)(sm0 >> 32), hs, d[2], d[3]);
+            iq3_magic_dword(g2, (uint32_t)sm1,         hs, d[4], d[5]);
+            iq3_magic_dword(g3, (uint32_t)(sm1 >> 32), hs, d[6], d[7]);
+            iq3_half16 a;
+            __builtin_memcpy(&a, d, 32);
+
+            #pragma unroll
+            for (unsigned int nt = 0; nt < 2u; nt++) {
+                if (nt < (unsigned int)NT) {
+                    const uint16_t* xb = &s_x[(nt * 16u + l16) * IQ3_WM_X_STRIDE + ks * 16u];
+                    iq3_half16 bf;
+                    __builtin_memcpy(&bf, xb, 32);
+                    acc[nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bf, acc[nt]);
+                }
+            }
+        }
+        __syncthreads();   // s_x reuse by the next super-block
+    }
+}
+
+extern "C" __global__ void iq3_xxs_matvec_par_by_expert_wmma(
+        float          * __restrict__ partials,      // [B*n_used, n_rows]
+        const uint8_t  * __restrict__ w_base,
+        const uint16_t * __restrict__ x16,           // f16 mid [B*n_used, x_member_stride]
+        const int      * __restrict__ group_count,   // [N_EXPERT]
+        const int      * __restrict__ expert_members,// [N_EXPERT * max_per_expert]
+        const int      * __restrict__ work_items,    // [n_work_items]
+        unsigned int     dbpe,
+        unsigned int     x_member_stride,            // halves per (b, slot) row (>= n_blocks_in*256)
+        unsigned int     n_used,
+        unsigned int     max_per_expert,
+        unsigned int     chunk_size,
+        unsigned int     n_rows,
+        unsigned int     n_blocks_in) {
+#if defined(IQ3_WMMA_RDNA3)
+    const unsigned int w_idx = blockIdx.y;
+    const int packed_item = work_items[w_idx];
+    const unsigned int e            = (unsigned int)(packed_item >> 16) & 0xffffu;
+    const unsigned int member_start = (unsigned int)(packed_item       ) & 0xffffu;
+    const int group_n = group_count[e];
+    const unsigned int member_end = min((unsigned int)group_n, member_start + chunk_size);
+    if (member_end <= member_start) return;
+    const unsigned int n_members = member_end - member_start;
+    const unsigned int n_tiles = (n_members + 15u) >> 4;
+
+    __shared__ uint64_t s_sign_bias[128];
+    __shared__ uint32_t s_grid3[256];
+    __shared__ __attribute__((aligned(16))) uint16_t s_x[IQ3_WM_MAX_CHUNK * IQ3_WM_X_STRIDE];
+    __shared__ int s_member_packed[IQ3_WM_MAX_CHUNK];
+
+    const unsigned int tid = threadIdx.x;
+    IQ3_STAGE_TABLES(s_sign_bias, s_grid3);          // ends with __syncthreads
+    if (tid < 128u) s_sign_bias[tid] ^= 0x8080808080808080ull;   // biased masks
+    for (unsigned int i = tid; i < IQ3_WM_MAX_CHUNK; i += blockDim.x) {
+        s_member_packed[i] = (i < n_members)
+            ? expert_members[(size_t)e * (size_t)max_per_expert + (size_t)(member_start + i)]
+            : 0;
+    }
+    __syncthreads();
+
+    const unsigned int wave = tid >> 5;
+    const unsigned int lane = tid & 31u;
+    const unsigned int l16  = lane & 15u;
+    const unsigned int hi   = lane >> 4;
+    const unsigned int m0   = blockIdx.x * IQ3_WM_ROWS_PER_WG + wave * 16u;
+    const unsigned int row_a = m0 + l16;
+    const bool row_valid = (row_a < n_rows);
+    const uint8_t* w_row = w_base + (uint64_t)e * (uint64_t)dbpe
+                         + (uint64_t)row_a * (uint64_t)n_blocks_in * BLOCK_IQ3_XXS_BYTES;
+
+    iq3_float8 acc[2];
+    #pragma unroll
+    for (unsigned int nt = 0; nt < 2u; nt++) {
+        #pragma unroll
+        for (int i = 0; i < 8; i++) acc[nt][i] = 0.0f;
+    }
+    if (n_tiles == 2u) {
+        iq3_wmma_mainloop<2>(acc, w_row, x16, s_x, s_member_packed, s_grid3, s_sign_bias,
+                             n_members, n_used, x_member_stride, n_blocks_in, row_valid, tid, l16);
+    } else {
+        iq3_wmma_mainloop<1>(acc, w_row, x16, s_x, s_member_packed, s_grid3, s_sign_bias,
+                             n_members, n_used, x_member_stride, n_blocks_in, row_valid, tid, l16);
+    }
+
+    #pragma unroll
+    for (unsigned int nt = 0; nt < 2u; nt++) {
+        const unsigned int mi = nt * 16u + l16;
+        if (nt < n_tiles && mi < n_members) {
+            const int packed        = s_member_packed[mi];
+            const unsigned int b    = (unsigned int)(packed >> 16) & 0xffffu;
+            const unsigned int slot = (unsigned int)(packed) & 0xffffu;
+            float* out_base = partials + ((size_t)b * (size_t)n_used + (size_t)slot) * (size_t)n_rows;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const unsigned int row = m0 + 2u * (unsigned int)i + hi;
+                if (row < n_rows) out_base[row] = acc[nt][i];
+            }
+        }
+    }
+#else
+    __builtin_trap();
+#endif
+}

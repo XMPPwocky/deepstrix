@@ -668,6 +668,11 @@ pub struct BatchIgpuShared {
     pub d_mid_cat: DeviceBuffer<f32>,
     /// `[B, n_used, 8*292]` — q8_K of d_mid_cat (q8k → down).
     pub d_midq_cat: DeviceBuffer<u8>,
+    /// WMMA MoE path (IGPU_MOE_WMMA, gfx11): f16 cast of the recv'd
+    /// ffn_input_norm `[B, N_EMBD]` (chain head) and f16 fused-swiglu mid
+    /// `[B*n_used, N_FF_EXP]` (gate/up → down). 4 + 12 MiB at rows=512.
+    pub d_x16: DeviceBuffer<u16>,
+    pub d_mid16: DeviceBuffer<u16>,
     /// By-expert MoE: per-expert (b, slot) member lists, packed as
     /// `(b << 16) | slot`. `[n_expert × max_per_expert]` i32. Only the first
     /// `group_count[e]` entries per expert are valid after the pre-pass.
@@ -751,6 +756,8 @@ impl BatchIgpuShared {
                 b * (N_EXPERT_USED as usize) * (N_FF_EXP as usize),
             )?,
             d_midq_cat: DeviceBuffer::new(id, b * midq_bytes_per_batch)?,
+            d_x16: DeviceBuffer::new(id, b * (N_EMBD as usize))?,
+            d_mid16: DeviceBuffer::new(id, b * (N_EXPERT_USED as usize) * (N_FF_EXP as usize))?,
             expert_members: DeviceBuffer::new(id, (N_EXPERT as usize) * b)?,
             work_items: DeviceBuffer::new(id, work_items_len)?,
             // Hybrid dispatch: two extra work_items arrays, each sized for the

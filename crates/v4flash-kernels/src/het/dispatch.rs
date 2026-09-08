@@ -254,6 +254,33 @@ pub fn pair_kwide_selected(dt: GgufType, rollback_to_chunked: bool) -> bool {
         )
 }
 
+/// Whether the iGPU batched-prefill MoE takes the f16 WMMA path
+/// (`iq2_xs_pair_matvec_fused_swiglu_wmma_h` + `iq3_xxs_matvec_par_by_expert_wmma`,
+/// 2026-09-08): gfx11 iGPU, IQ2_XS gate/up with IQ3_XXS down (42 of 43
+/// layers of UD-Q2_K_XL; blk.26 = IQ3_XXS pair + MXFP4 down and blk.42 =
+/// MXFP4 down stay on the kwide/Q8_K path), default IQ2_VARIANT, and
+/// `IGPU_MOE_WMMA` not "0". Pure and public: the routing is unit-testable
+/// and a missing arm here is invisible to the oracles (both paths are
+/// numerically fine — only one is fast).
+pub fn igpu_moe_wmma_selected(
+    gate: GgufType,
+    down: GgufType,
+    igpu_is_gfx11: bool,
+    iq2_variant: &str,
+    env_enabled: bool,
+) -> bool {
+    env_enabled
+        && igpu_is_gfx11
+        && gate == GgufType::IQ2_XS
+        && down == GgufType::IQ3_XXS
+        && iq2_variant == "kwide"
+}
+
+/// `IGPU_MOE_WMMA=0` rolls the iGPU MoE back to the kwide/Q8_K kernels.
+pub fn igpu_moe_wmma_env_enabled() -> bool {
+    std::env::var("IGPU_MOE_WMMA").map(|v| v != "0").unwrap_or(true)
+}
+
 /// `PAIR_VARIANT=chunked` rolls the pair formats back to the serial
 /// per-member kernel.
 fn pair_variant_rollback() -> bool {
@@ -388,6 +415,18 @@ mod tests {
         ] {
             assert!(!pair_kwide_selected(dt, true), "{dt:?} rollback");
         }
+    }
+
+    #[test]
+    fn wmma_path_routing() {
+        use GgufType::*;
+        assert!(igpu_moe_wmma_selected(IQ2_XS, IQ3_XXS, true, "kwide", true));
+        assert!(!igpu_moe_wmma_selected(IQ2_XS, IQ3_XXS, false, "kwide", true), "dGPU/gfx12 never");
+        assert!(!igpu_moe_wmma_selected(IQ2_XS, IQ3_XXS, true, "kwide", false), "env off");
+        assert!(!igpu_moe_wmma_selected(IQ2_XS, MXFP4, true, "kwide", true), "blk.42");
+        assert!(!igpu_moe_wmma_selected(IQ3_XXS, MXFP4, true, "kwide", true), "blk.26");
+        assert!(!igpu_moe_wmma_selected(IQ2_XXS, Q2_K, true, "kwide", true), "antirez mix");
+        assert!(!igpu_moe_wmma_selected(IQ2_XS, IQ3_XXS, true, "hybrid", true), "variant zoo");
     }
 
     /// IQ2_XXS has its own `IQ2_VARIANT` kernel zoo in the caller and must

@@ -1082,9 +1082,9 @@ __device__ __forceinline__ void iq2xs_wmma_mainloop(
 
 }
 
-template <int DEQ, int ABL>
+template <int DEQ, int ABL, int OUT16>
 __device__ __forceinline__ void iq2xs_wmma_body(
-        float          * __restrict__ mid,
+        float          * __restrict__ mid,           // OUT16=0: f32 [B, n_used, n_rows]; OUT16=1: reinterpreted as f16
         const uint8_t  * __restrict__ gate_w_base,
         const uint8_t  * __restrict__ up_w_base,
         const uint16_t * __restrict__ x16,
@@ -1192,14 +1192,20 @@ __device__ __forceinline__ void iq2xs_wmma_body(
                         if (u < -clamp) u = -clamp;
                     }
                     const float sig = 1.0f / (1.0f + expf(-g));
-                    out_base[row] = g * sig * u * ew;
+                    const float v = g * sig * u * ew;
+                    if (OUT16) {
+                        ((uint16_t*)mid)[((size_t)b * (size_t)n_used + (size_t)slot) * (size_t)n_rows + row]
+                            = __half_as_ushort(__float2half(v));
+                    } else {
+                        out_base[row] = v;
+                    }
                 }
             }
         }
     }
 #else
-    // Non-RDNA3 targets: this prototype has no WMMA path. Trap loudly rather
-    // than return garbage; the wrapper only dispatches it on gfx1151.
+    // Non-RDNA3 targets: no WMMA path. Trap loudly rather than return
+    // garbage; the wrapper only dispatches it on gfx11.
     __builtin_trap();
 #endif
 }
@@ -1212,7 +1218,7 @@ extern "C" __global__ void iq2_xs_pair_matvec_fused_swiglu_wmma_lut(
         unsigned int gate_bpe, unsigned int up_bpe, unsigned int n_used,
         unsigned int max_per_expert, unsigned int chunk_size, float clamp,
         unsigned int n_rows, unsigned int n_blocks) {
-    iq2xs_wmma_body<1, 0>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
+    iq2xs_wmma_body<1, 0, 0>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
                        expert_members, work_items, gate_bpe, up_bpe, n_used,
                        max_per_expert, chunk_size, clamp, n_rows, n_blocks);
 }
@@ -1225,7 +1231,7 @@ extern "C" __global__ void iq2_xs_pair_matvec_fused_swiglu_wmma_cvt(
         unsigned int gate_bpe, unsigned int up_bpe, unsigned int n_used,
         unsigned int max_per_expert, unsigned int chunk_size, float clamp,
         unsigned int n_rows, unsigned int n_blocks) {
-    iq2xs_wmma_body<0, 0>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
+    iq2xs_wmma_body<0, 0, 0>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
                        expert_members, work_items, gate_bpe, up_bpe, n_used,
                        max_per_expert, chunk_size, clamp, n_rows, n_blocks);
 }
@@ -1238,7 +1244,22 @@ extern "C" __global__ void iq2_xs_pair_matvec_fused_swiglu_wmma(
         unsigned int gate_bpe, unsigned int up_bpe, unsigned int n_used,
         unsigned int max_per_expert, unsigned int chunk_size, float clamp,
         unsigned int n_rows, unsigned int n_blocks) {
-    iq2xs_wmma_body<2, 0>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
+    iq2xs_wmma_body<2, 0, 0>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
+                       expert_members, work_items, gate_bpe, up_bpe, n_used,
+                       max_per_expert, chunk_size, clamp, n_rows, n_blocks);
+}
+
+// Production twin: f16 mid out ([B*n_used][n_rows] halves, = the down
+// kernel's B operand), otherwise identical to _wmma.
+extern "C" __global__ void iq2_xs_pair_matvec_fused_swiglu_wmma_h(
+        float* __restrict__ mid, const uint8_t* __restrict__ gate_w_base,
+        const uint8_t* __restrict__ up_w_base, const uint16_t* __restrict__ x16,
+        const float* __restrict__ expert_w, const int* __restrict__ group_count,
+        const int* __restrict__ expert_members, const int* __restrict__ work_items,
+        unsigned int gate_bpe, unsigned int up_bpe, unsigned int n_used,
+        unsigned int max_per_expert, unsigned int chunk_size, float clamp,
+        unsigned int n_rows, unsigned int n_blocks) {
+    iq2xs_wmma_body<2, 0, 1>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
                        expert_members, work_items, gate_bpe, up_bpe, n_used,
                        max_per_expert, chunk_size, clamp, n_rows, n_blocks);
 }
@@ -1252,7 +1273,7 @@ extern "C" __global__ void iq2_xs_pair_matvec_fused_swiglu_wmma_abl1(
         unsigned int gate_bpe, unsigned int up_bpe, unsigned int n_used,
         unsigned int max_per_expert, unsigned int chunk_size, float clamp,
         unsigned int n_rows, unsigned int n_blocks) {
-    iq2xs_wmma_body<2, 1>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
+    iq2xs_wmma_body<2, 1, 0>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
                        expert_members, work_items, gate_bpe, up_bpe, n_used,
                        max_per_expert, chunk_size, clamp, n_rows, n_blocks);
 }
@@ -1266,7 +1287,7 @@ extern "C" __global__ void iq2_xs_pair_matvec_fused_swiglu_wmma_abl2(
         unsigned int gate_bpe, unsigned int up_bpe, unsigned int n_used,
         unsigned int max_per_expert, unsigned int chunk_size, float clamp,
         unsigned int n_rows, unsigned int n_blocks) {
-    iq2xs_wmma_body<2, 2>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
+    iq2xs_wmma_body<2, 2, 0>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
                        expert_members, work_items, gate_bpe, up_bpe, n_used,
                        max_per_expert, chunk_size, clamp, n_rows, n_blocks);
 }
@@ -1280,7 +1301,7 @@ extern "C" __global__ void iq2_xs_pair_matvec_fused_swiglu_wmma_abl3(
         unsigned int gate_bpe, unsigned int up_bpe, unsigned int n_used,
         unsigned int max_per_expert, unsigned int chunk_size, float clamp,
         unsigned int n_rows, unsigned int n_blocks) {
-    iq2xs_wmma_body<2, 3>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
+    iq2xs_wmma_body<2, 3, 0>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
                        expert_members, work_items, gate_bpe, up_bpe, n_used,
                        max_per_expert, chunk_size, clamp, n_rows, n_blocks);
 }
@@ -1294,7 +1315,7 @@ extern "C" __global__ void iq2_xs_pair_matvec_fused_swiglu_wmma_abl4(
         unsigned int gate_bpe, unsigned int up_bpe, unsigned int n_used,
         unsigned int max_per_expert, unsigned int chunk_size, float clamp,
         unsigned int n_rows, unsigned int n_blocks) {
-    iq2xs_wmma_body<2, 4>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
+    iq2xs_wmma_body<2, 4, 0>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
                        expert_members, work_items, gate_bpe, up_bpe, n_used,
                        max_per_expert, chunk_size, clamp, n_rows, n_blocks);
 }

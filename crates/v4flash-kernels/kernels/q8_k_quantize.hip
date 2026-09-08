@@ -88,3 +88,26 @@ extern "C" __global__ void q8_k_quantize(
         *((float *)(blk + D_OFFSET)) = 1.0f / iscale;
     }
 }
+
+
+// f32 -> f16 cast (the WMMA MoE path's activation prep: replaces the Q8_K
+// quantize of ffn_input_norm on the iGPU). n elements, 8 per thread.
+#include <hip/hip_fp16.h>
+extern "C" __global__ void f32_to_f16_cast(
+        unsigned short * __restrict__ out,
+        const float    * __restrict__ x,
+        unsigned int     n) {
+    const unsigned int i0 = (blockIdx.x * blockDim.x + threadIdx.x) * 8u;
+    if (i0 + 8u <= n) {
+        const float4 a = *(const float4*)(x + i0);
+        const float4 b = *(const float4*)(x + i0 + 4);
+        uint4 o;
+        o.x = (unsigned)__half_as_ushort(__float2half(a.x)) | ((unsigned)__half_as_ushort(__float2half(a.y)) << 16);
+        o.y = (unsigned)__half_as_ushort(__float2half(a.z)) | ((unsigned)__half_as_ushort(__float2half(a.w)) << 16);
+        o.z = (unsigned)__half_as_ushort(__float2half(b.x)) | ((unsigned)__half_as_ushort(__float2half(b.y)) << 16);
+        o.w = (unsigned)__half_as_ushort(__float2half(b.z)) | ((unsigned)__half_as_ushort(__float2half(b.w)) << 16);
+        *(uint4*)(out + i0) = o;
+    } else {
+        for (unsigned int i = i0; i < n; i++) out[i] = __half_as_ushort(__float2half(x[i]));
+    }
+}

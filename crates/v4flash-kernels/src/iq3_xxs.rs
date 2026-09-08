@@ -18,6 +18,7 @@ pub const BLOCK_IQ3_XXS_BYTES: usize = 98;
 
 pub struct Iq3XxsMatvec {
     module: Module,
+    rdna3: bool,
 }
 
 impl Iq3XxsMatvec {
@@ -30,7 +31,7 @@ impl Iq3XxsMatvec {
             return Err(eyre!("unsupported arch for iq3_xxs_matvec: {arch}"));
         };
         let module = Module::load_data(image)?;
-        Ok(Self { module })
+        Ok(Self { module, rdna3: arch.starts_with("gfx11") })
     }
 
     /// Decode, single expert: zero_init/accumulate contract as the q2_k
@@ -194,6 +195,58 @@ impl Iq3XxsMatvec {
             partials.raw(), w_base.raw(), xq_base.raw(),
             group_count.raw(), expert_members.raw(), work_items.raw(),
             dbpe, xq_slot_stride, n_used, max_per_expert, chunk_size,
+            n_rows, n_blocks_in
+        ])
+    }
+
+    /// f16 WMMA batched-prefill down projection (2026-09-08; gfx11 only).
+    /// Same work-item / partials contract as [`Self::launch_by_expert_kwide2`]
+    /// but takes f16 mid `x16` = [B*n_used, x_member_stride] halves instead
+    /// of Q8_K. Pair with q2_k_reduce_partials / _hetsplit as before.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_by_expert_wmma(
+        &self,
+        stream: &Stream,
+        partials: &mut DeviceBuffer<f32>,
+        w_base: &DeviceBuffer<u8>,
+        x16: &DeviceBuffer<u16>,
+        group_count: &DeviceBuffer<i32>,
+        expert_members: &DeviceBuffer<i32>,
+        work_items: &DeviceBuffer<i32>,
+        n_work_items: u32,
+        dbpe: u32,
+        x_member_stride: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        n_rows: u32,
+        n_blocks_in: u32,
+    ) -> eyre::Result<()> {
+        if !self.rdna3 {
+            return Err(eyre!("iq3_xxs wmma: RDNA3 (gfx11) WMMA layout only"));
+        }
+        if n_rows % 16 != 0 {
+            return Err(eyre!("iq3_xxs wmma: n_rows={n_rows} not %16"));
+        }
+        if chunk_size == 0 || chunk_size > 32 {
+            return Err(eyre!("iq3_xxs wmma: chunk_size={chunk_size} not in 1..=32"));
+        }
+        if x_member_stride < n_blocks_in * 256 || x_member_stride % 8 != 0 {
+            return Err(eyre!("iq3_xxs wmma: x_member_stride={x_member_stride} invalid for n_blocks_in={n_blocks_in}"));
+        }
+        if n_work_items == 0 {
+            return Ok(());
+        }
+        let function = self.module.get_function("iq3_xxs_matvec_par_by_expert_wmma")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows.div_ceil(128), n_work_items, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            partials.raw(), w_base.raw(), x16.raw(),
+            group_count.raw(), expert_members.raw(), work_items.raw(),
+            dbpe, x_member_stride, n_used, max_per_expert, chunk_size,
             n_rows, n_blocks_in
         ])
     }

@@ -298,4 +298,54 @@ impl Iq2XsPairMatvec {
         let cfg = LaunchConfig { grid: (1, 1, 1), block: (32, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(function, cfg, stream, [out.raw()])
     }
+
+    /// Production form of [`Self::launch_fused_swiglu_wmma`]: writes f16 mid
+    /// `[B*n_used][n_rows]` (the down kernel's B operand). gfx11 only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_wmma_f16out(
+        &self,
+        stream: &Stream,
+        mid16: &mut DeviceBuffer<u16>,
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        x16: &DeviceBuffer<u16>,
+        expert_w: &DeviceBuffer<f32>,
+        group_count: &DeviceBuffer<i32>,
+        expert_members: &DeviceBuffer<i32>,
+        work_items: &DeviceBuffer<i32>,
+        n_work_items: u32,
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+    ) -> eyre::Result<()> {
+        if !self.rdna3 {
+            return Err(eyre!("iq2_xs wmma: RDNA3 (gfx11) WMMA layout only"));
+        }
+        if n_rows % 16 != 0 {
+            return Err(eyre!("iq2_xs wmma: n_rows={n_rows} not %16"));
+        }
+        if chunk_size > 32 {
+            return Err(eyre!("iq2_xs wmma: chunk_size={chunk_size} exceeds 32"));
+        }
+        if n_work_items == 0 {
+            return Ok(());
+        }
+        let function = self.module.get_function("iq2_xs_pair_matvec_fused_swiglu_wmma_h")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows.div_ceil(128), n_work_items, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            mid16.raw(), gate_w_base.raw(), up_w_base.raw(), x16.raw(),
+            expert_w.raw(), group_count.raw(), expert_members.raw(), work_items.raw(),
+            gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp,
+            n_rows, n_blocks
+        ])
+    }
 }

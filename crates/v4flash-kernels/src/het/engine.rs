@@ -86,6 +86,8 @@ pub enum SampleMode {
 /// Memory split happens in [`super::weights`].
 pub struct DeviceEngine {
     pub device: Device,
+    /// RDNA3-class (gfx11xx) target: gates the gfx11-layout WMMA MoE kernels.
+    pub is_gfx11: bool,
     /// Compute stream — all kernel launches go here for single-token paths.
     pub compute: Stream,
     /// Transfer stream — peer copies originating on this device go here.
@@ -183,6 +185,7 @@ impl DeviceEngine {
         let events = EventPool::new(label, EVENT_POOL_CAPACITY)?;
         Ok(Self {
             device,
+            is_gfx11: arch.starts_with("gfx11"),
             compute,
             xfer,
             rms_w: RmsNorm::for_arch(arch)?,

@@ -2743,8 +2743,21 @@ impl HeterogeneousEngine {
         // Wait for the dGPU→iGPU peer-push to land before any iGPU compute
         // reads the recv buffers. Replaces the old de.xfer.synchronize().
         ie.compute.wait_event(&sev.selected_pushed)?;
-        // q8k quantize ain[B*N_EMBD] → d_xq_q8k[B*blocks].
-        {
+        // f16 WMMA MoE path (2026-09-08): f16 activations end to end, no
+        // Q8_K quantize on either side of the gate/up. See dispatch.rs.
+        let variant_peek = std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "kwide".into());
+        let wmma_path = super::dispatch::igpu_moe_wmma_selected(
+            ilw.routed.gate.dtype,
+            ilw.routed.down.dtype,
+            ie.is_gfx11,
+            &variant_peek,
+            super::dispatch::igpu_moe_wmma_env_enabled(),
+        );
+        if wmma_path {
+            let _t_cast = ie.events.stage("igpu.cast_f16_pre_moe", &ie.compute)?;
+            ie.q8k.launch_cast_f16(&ie.compute, &mut si.d_x16, &bi.ffn_input_norm_recv, N_EMBD * b)?;
+        } else {
+            // q8k quantize ain[B*N_EMBD] → d_xq_q8k[B*blocks].
             let _t_q8k_pre = ie.events.stage("igpu.q8k_quantize_pre_iq2", &ie.compute)?;
             ie.q8k.launch(
                 &ie.compute,
@@ -2763,7 +2776,6 @@ impl HeterogeneousEngine {
         // Default kwide since M51 (2026-06-09): k-widened lanes, −35% kernel
         // vs staged, +30% e2e prefill. staged/staged_v2/chunked/tile8/hybrid
         // remain opt-in.
-        let variant_peek = std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "kwide".into());
         #[allow(non_snake_case)]
         let CHUNK_SIZE: u32 = if variant_peek == "tile8" { 8 } else { 32 };
         let max_per_expert = si.max_per_expert();
@@ -2952,6 +2964,8 @@ impl HeterogeneousEngine {
                 let BatchIgpuShared {
                     d_mid_cat,
                     d_xq_q8k,
+                    d_x16,
+                    d_mid16,
                     expert_members,
                     work_items,
                     ..
@@ -2959,7 +2973,21 @@ impl HeterogeneousEngine {
                 // Formats with a single prefill kernel (IQ2_S, IQ2_XS,
                 // IQ3_XXS-as-gate/up, IQ3_S): chunked by-expert, IQ2_VARIANT
                 // does not apply. IQ2_XXS returns false and takes the zoo below.
-                let handled = {
+                let handled = if wmma_path {
+                    let _t_wm = ie.events.stage("igpu.gateup_wmma", &ie.compute)?;
+                    ie.iq2xs.launch_fused_swiglu_wmma_f16out(
+                        &ie.compute, d_mid16,
+                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        d_x16, d_ew,
+                        group_count, expert_members, work_items,
+                        n_work_items,
+                        gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
+                        crate::config::SWIGLU_CLAMP_EXP,
+                        crate::config::N_FF_EXP,
+                        crate::config::BLOCKS_Q8K_GATE_IN,
+                    )?;
+                    true
+                } else {
                     // Label reflects the kernel that actually runs (kwide vs
                     // the chunked rollback) — a trace is the only way to
                     // confirm the kwide path is live, and IQ2_S gate/up is
@@ -3050,7 +3078,7 @@ impl HeterogeneousEngine {
                 }
             }
         }
-        {
+        if !wmma_path {
             let _t_q8k_post = ie.events.stage("igpu.q8k_quantize_post_iq2", &ie.compute)?;
             ie.q8k.launch(
                 &ie.compute,
@@ -3114,7 +3142,17 @@ impl HeterogeneousEngine {
                 // pair is written by exactly one work item. (The 128 MB/layer
                 // fill was ~44 ms/chunk of pure overhead.) If routing ever
                 // allows duplicate experts per token, restore the fill.
-                if use_kwide2 && down_dt == v4flash_core::gguf::GgufType::IQ3_XXS {
+                if wmma_path {
+                    let _t_dw = ie.events.stage("igpu.down_wmma", &ie.compute)?;
+                    ie.iq3.launch_by_expert_wmma(
+                        &ie.compute, &mut si.q2k_partials,
+                        &ilw.routed.down.buffer, &si.d_mid16,
+                        &bi.group_count, &si.expert_members, &si.work_items,
+                        n_work_items, dbpe, crate::config::N_FF_EXP,
+                        cs_n_used as u32, max_per_expert, CHUNK_SIZE,
+                        N_EMBD, crate::config::BLOCKS_Q8K_DOWN_IN,
+                    )?;
+                } else if use_kwide2 && down_dt == v4flash_core::gguf::GgufType::IQ3_XXS {
                     ie.iq3.launch_by_expert_kwide2(
                         &ie.compute, &mut si.q2k_partials,
                         &ilw.routed.down.buffer, &si.d_midq_cat,
