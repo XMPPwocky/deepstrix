@@ -784,3 +784,131 @@ fn forward_prefill_pipelined_matches_single_lane() -> eyre::Result<()> {
     let _ = HC_DIM;
     Ok(())
 }
+
+/// ONE weight load, every driver-level prefill comparison (2026-09-08; the
+/// per-#[test] versions above each reload ~86 GB):
+///   1. sequential forward_token x T (+head)               -> reference R
+///   2. forward_prefill(last_only)                          -> P   (|P-R| < 5e-2 scaled, argmax ==)
+///   3. forward_prefill_pipelined(lanes=2)                  -> Q   (|Q-P| < 1e-3 abs)
+///   4. forward_prefill with IGPU_MOE_WMMA=0 (kwide/Q8_K)   -> K   (|P-K| reported; the WMMA
+///      path is expected to sit a few e-2 of logit scale from the Q8_K paths, argmax ==)
+/// Thresholds for (2): the sequential reference runs decode's Q8_K MoE, so
+/// with the f16 WMMA prefill path (gfx11 + UD-Q2_K_XL) the honest bound is
+/// 8e-2 (measured 5.3e-2 vs kwide's 3.2e-2 on 2026-09-08); 5e-2 otherwise.
+#[test]
+#[ignore]
+fn forward_prefill_all_oracles_one_load() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let t: usize = std::env::var("BENCH_B")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(PROMPT_TOKENS.len())
+        .min(PROMPT_TOKENS.len());
+    eprintln!("all-in-one prefill oracle: T={t}");
+    let dump = ActivationDump::open(dump_dir())?;
+    let main_gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MAIN_MODEL_PATH.to_string()))?;
+    let dgpu = pick_dgpu()?;
+    let igpu = pick_igpu()?;
+    let dgpu_arch = dgpu.properties()?.gcn_arch_name;
+    let igpu_arch = igpu.properties()?.gcn_arch_name;
+    let rope_for_layer = |layer: i32| -> eyre::Result<RopeParams> {
+        let entry = dump
+            .weight("rope_params", layer)
+            .ok_or_else(|| eyre!("missing rope_params L{layer}"))?;
+        let floats = dump.read_f32(entry)?;
+        let n_ctx_orig = if floats[2] != 0.0 { ROPE_ORIG_CTX } else { 0 };
+        RopeParams::from_dump_blob(&floats, n_ctx_orig)
+    };
+    let main_weights = HetModelWeights::load_all(&main_gguf, dgpu, igpu, &rope_for_layer)?;
+    let engine =
+        HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
+    let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(t);
+    for i in 0..t {
+        let entry = dump
+            .tensor("layer_input_residual", 0, i as i32)
+            .ok_or_else(|| eyre!("missing layer_input_residual L0 T{i}"))?;
+        input_hcs.push(dump.read_f32(entry)?);
+    }
+    let tokens: Vec<i32> = PROMPT_TOKENS[..t].to_vec();
+    let wmma_active = {
+        let l = &main_weights.igpu_layers[1];
+        v4flash_kernels::het::dispatch::igpu_moe_wmma_selected(
+            l.routed.gate.dtype, l.routed.down.dtype, igpu_arch.starts_with("gfx11"),
+            "kwide", v4flash_kernels::het::dispatch::igpu_moe_wmma_env_enabled())
+    };
+    eprintln!("iGPU MoE WMMA path active: {wmma_active}");
+
+    // 1. sequential reference
+    eprintln!("Run 1: sequential forward_token x {t} + forward_head");
+    let mut bs = BatchScratch::alloc(dgpu, igpu)?;
+    let mut seq_state = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
+    for i in 0..t {
+        engine.forward_token(&mut bs.shared_dgpu, &mut bs.shared_igpu, &mut seq_state, &main_weights, &input_hcs[i], i as u32, tokens[i])?;
+    }
+    bs.shared_dgpu.residual.copy_from_buffer(&bs.shared_dgpu.residual_next)?;
+    engine.forward_head(&mut bs.shared_dgpu, &main_weights.global)?;
+    let mut r = vec![0f32; N_VOCAB as usize];
+    bs.shared_dgpu.logits.copy_to_host(&mut r)?;
+    drop(bs);
+
+    // 2. single-lane prefill (current path)
+    let mut bd = BatchDgpuScratch::alloc(dgpu)?;
+    let mut bi = BatchIgpuScratch::alloc(igpu)?;
+    let mut sd = BatchDgpuShared::alloc(dgpu)?;
+    let mut si = BatchIgpuShared::alloc(igpu)?;
+    let mut head_scratch = DgpuScratch::alloc(dgpu)?;
+    let mut single = |engine: &HeterogeneousEngine, bd: &mut BatchDgpuScratch, bi: &mut BatchIgpuScratch,
+                      sd: &mut BatchDgpuShared, si: &mut BatchIgpuShared, hs: &mut DgpuScratch| -> eyre::Result<Vec<f32>> {
+        let mut st = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
+        engine.forward_prefill(bd, bi, sd, si, hs, &mut st, &main_weights, &input_hcs, &tokens, 0, true, None, None)
+    };
+    eprintln!("Run 2: forward_prefill(last_only)");
+    let p = single(&engine, &mut bd, &mut bi, &mut sd, &mut si, &mut head_scratch)?;
+
+    // 3. pipelined
+    eprintln!("Run 3: forward_prefill_pipelined(lanes=2)");
+    let lane_rows = B_MAX.div_ceil(2);
+    let mut bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let mut bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let mut bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let mut bi_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let mut sd_p = BatchDgpuShared::alloc_rows(dgpu, lane_rows)?;
+    let mut si_p = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
+    let q = {
+        let mut st = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
+        engine.forward_prefill_pipelined(&mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd_p, &mut si_p,
+            &mut head_scratch, &mut st, &main_weights, &input_hcs, &tokens, 0, true, None, None, None, None)?
+    };
+    drop((bd_a, bi_a, bd_b, bi_b, sd_p, si_p));
+
+    // 4. kwide path (env toggle in-process; the driver reads it per layer call)
+    let k = if wmma_active {
+        eprintln!("Run 4: forward_prefill with IGPU_MOE_WMMA=0");
+        std::env::set_var("IGPU_MOE_WMMA", "0");
+        let k = single(&engine, &mut bd, &mut bi, &mut sd, &mut si, &mut head_scratch)?;
+        std::env::remove_var("IGPU_MOE_WMMA");
+        Some(k)
+    } else { None };
+
+    let mut bad: Vec<String> = Vec::new();
+    let (m2, i2, sc2) = max_diff_vs_scale(&r, &p);
+    let bound2 = if wmma_active { 8e-2 } else { 5e-2 };
+    eprintln!("[2] prefill vs sequential: max scaled diff = {m2:.4e} (scale {sc2:.2}) @i={i2} ref={:.4} prefill={:.4} argmax {} vs {}  (bound {bound2:.0e})",
+        r[i2], p[i2], argmax(&r), argmax(&p));
+    if !(m2 < bound2) { bad.push(format!("prefill vs sequential {m2:.3e} > {bound2:.0e}")); }
+    if argmax(&r) != argmax(&p) { bad.push("prefill vs sequential argmax".into()); }
+    let (m3, i3) = max_abs_diff(&p, &q);
+    eprintln!("[3] pipelined vs single: max abs diff = {m3:.4e} @i={i3}");
+    if !(m3 < 1e-3) { bad.push(format!("pipelined vs single {m3:.3e} > 1e-3")); }
+    if let Some(k) = &k {
+        let (m4, i4, sc4) = max_diff_vs_scale(k, &p);
+        let (mk, _, _) = max_diff_vs_scale(&r, k);
+        eprintln!("[4] wmma vs kwide prefill: max scaled diff = {m4:.4e} (scale {sc4:.2}) @i={i4} kwide={:.4} wmma={:.4} argmax {} vs {}; kwide vs sequential = {mk:.4e}",
+            k[i4], p[i4], argmax(k), argmax(&p));
+        if !(m4 < 8e-2) { bad.push(format!("wmma vs kwide {m4:.3e} > 8e-2")); }
+        if argmax(k) != argmax(&p) { bad.push("wmma vs kwide argmax".into()); }
+    }
+    if !bad.is_empty() { return Err(eyre!("prefill oracles failed: {}", bad.join("; "))); }
+    eprintln!("ALL PREFILL ORACLES PASS (one load)");
+    Ok(())
+}

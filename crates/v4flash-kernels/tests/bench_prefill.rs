@@ -412,20 +412,28 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
         // A/B shares a thermal envelope (back-to-back methodology). The qb
         // kernel reads QB_WMMA fresh on every call, so flipping the env var
         // here switches the path with no rebuild.
+        // IGPU_MOE_WMMA_AB=1: same idea for the iGPU MoE path (f16 WMMA vs
+        // kwide/Q8_K, 2026-09-08). One weight load, back-to-back.
         let ab = std::env::var_os("QB_WMMA_AB").is_some();
-        let variants: Vec<(&str, Option<bool>)> = if ab {
-            vec![("qb=dp4a", Some(false)), ("qb=wmma", Some(true))]
+        let moe_ab = std::env::var_os("IGPU_MOE_WMMA_AB").is_some();
+        // (label, env var, value-or-unset)
+        let variants: Vec<(&str, &str, Option<&str>)> = if ab {
+            vec![("qb=dp4a", "QB_WMMA", None), ("qb=wmma", "QB_WMMA", Some("1"))]
+        } else if moe_ab {
+            vec![("moe=wmma", "IGPU_MOE_WMMA", Some("1")), ("moe=kwide", "IGPU_MOE_WMMA", Some("0")),
+                 ("moe=wmma(2)", "IGPU_MOE_WMMA", Some("1"))]
         } else {
-            vec![("qb=current", None)]
+            vec![("qb=current", "", None)]
         };
 
         // summary[variant] = Vec<(depth, min_ms, median_ms)>
         let mut summaries: Vec<(&str, Vec<(u32, f64, f64)>)> = Vec::new();
-        for (vname, vflag) in &variants {
-            match vflag {
-                Some(true) => std::env::set_var("QB_WMMA", "1"),
-                Some(false) => std::env::remove_var("QB_WMMA"),
-                None => {}
+        for (vname, venv, vval) in &variants {
+            if !venv.is_empty() {
+                match vval {
+                    Some(v) => std::env::set_var(venv, v),
+                    None => std::env::remove_var(venv),
+                }
             }
             eprintln!("\n--- variant {vname} ---");
             let mut summary: Vec<(u32, f64, f64)> = Vec::with_capacity(fake_depths.len());
