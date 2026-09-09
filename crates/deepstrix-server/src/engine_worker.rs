@@ -1069,6 +1069,20 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                     let _ = tx.blocking_send(WorkerEvent::Error(format!("{e:#}")));
                 }
                 // tx is dropped here, signaling end of stream.
+                // Return free heap pages to the kernel and log the heap
+                // shape: in_use vs free is the fragmentation-vs-leak
+                // discriminator (see v4flash_core::heap). Cheap (~ms)
+                // relative to a request.
+                let hs = v4flash_core::heap::trim_and_stats();
+                tracing::info!(
+                    rss_mib = v4flash_core::heap::rss_bytes() >> 20,
+                    heap_in_use_mib = hs.in_use >> 20,
+                    heap_free_mib = hs.free >> 20,
+                    heap_arena_mib = hs.arena >> 20,
+                    heap_mmapped_mib = hs.mmapped >> 20,
+                    trimmed = hs.trimmed,
+                    "host heap after request"
+                );
             }
             EngineRequest::Shutdown { ack } => {
                 tracing::info!("worker received shutdown");

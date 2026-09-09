@@ -295,7 +295,7 @@ impl Tower {
             arch = %arch,
             gemm = ?kernels.gemm_path,
             dev_mib = tally as f64 / (1u64 << 20) as f64,
-            "vision tower loaded (f16 weights, host copy retained)"
+            "vision tower loaded (f16 weights on device; host copy lives until drop_host())"
         );
         Ok(Tower {
             device,

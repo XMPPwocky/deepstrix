@@ -645,6 +645,190 @@ fn hex_to_blake3(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Snapshot blob file that is created on first write, so a blob that ends
+/// up empty leaves no file behind (the on-disk contract `restore` relies
+/// on: `comp_kv.bin` etc. exist iff non-empty).
+struct BlobWriter {
+    path: PathBuf,
+    w: Option<std::io::BufWriter<fs::File>>,
+    bytes: u64,
+}
+
+impl BlobWriter {
+    fn new(path: PathBuf) -> Self {
+        Self { path, w: None, bytes: 0 }
+    }
+    fn write(&mut self, bytes: &[u8]) -> eyre::Result<()> {
+        use std::io::Write;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if self.w.is_none() {
+            self.w = Some(std::io::BufWriter::with_capacity(1 << 20, fs::File::create(&self.path)?));
+        }
+        self.w.as_mut().unwrap().write_all(bytes)?;
+        self.bytes += bytes.len() as u64;
+        Ok(())
+    }
+    fn finish(mut self) -> eyre::Result<u64> {
+        use std::io::Write;
+        if let Some(mut w) = self.w.take() {
+            w.flush()?;
+        }
+        Ok(self.bytes)
+    }
+}
+
+/// Reusable host staging for the per-layer device reads. Peak host cost of
+/// a save is now one layer's live prefix (a few MiB) plus the 1 MiB
+/// BufWriters, instead of every blob in memory at once (~1.5 GB at 177K
+/// tokens) plus a full-capacity copy of each device buffer — the pattern
+/// that grew the server heap by GiBs per day (see v4flash_core::heap).
+#[derive(Default)]
+struct SaveScratch {
+    u16s: Vec<u16>,
+    f32s: Vec<f32>,
+    bytes: Vec<u8>,
+}
+
+impl SaveScratch {
+    /// Copy `n` leading elements of `buf` to the host and append them,
+    /// little-endian, to `out`.
+    fn stream_u16(
+        &mut self,
+        buf: &v4flash_hip::DeviceBuffer<u16>,
+        n: usize,
+        out: &mut BlobWriter,
+    ) -> eyre::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        if self.u16s.len() < n {
+            self.u16s.resize(n, 0);
+        }
+        buf.slice_view(0, n).copy_to_host(&mut self.u16s[..n])?;
+        self.bytes.clear();
+        self.bytes.reserve(n * 2);
+        for v in &self.u16s[..n] {
+            self.bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        out.write(&self.bytes)
+    }
+    fn stream_f32(
+        &mut self,
+        buf: &v4flash_hip::DeviceBuffer<f32>,
+        n: usize,
+        out: &mut BlobWriter,
+    ) -> eyre::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        if self.f32s.len() < n {
+            self.f32s.resize(n, 0.0);
+        }
+        buf.slice_view(0, n).copy_to_host(&mut self.f32s[..n])?;
+        self.bytes.clear();
+        self.bytes.reserve(n * 4);
+        for v in &self.f32s[..n] {
+            self.bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        out.write(&self.bytes)
+    }
+}
+
+/// Streaming reader for a snapshot blob: per-layer exact-size reads into
+/// a reusable host buffer, then a prefix `copy_from_host` through a
+/// `slice_view_mut`. A missing file reads as empty (the save-side contract:
+/// a blob file exists iff it has bytes).
+struct BlobReader {
+    r: Option<std::io::BufReader<fs::File>>,
+    remaining: u64,
+    name: &'static str,
+}
+
+impl BlobReader {
+    fn open(dir: &Path, name: &'static str, required: bool) -> eyre::Result<Self> {
+        match fs::File::open(dir.join(name)) {
+            Ok(f) => {
+                let remaining = f.metadata()?.len();
+                Ok(Self { r: Some(std::io::BufReader::with_capacity(1 << 20, f)), remaining, name })
+            }
+            Err(e) if !required && e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Self { r: None, remaining: 0, name })
+            }
+            Err(e) => Err(eyre!("snapshot.restore: {name}: {e}")),
+        }
+    }
+    fn has(&self, bytes: usize) -> bool {
+        self.remaining >= bytes as u64
+    }
+    fn read_exact(&mut self, dst: &mut [u8]) -> eyre::Result<()> {
+        use std::io::Read;
+        if dst.is_empty() {
+            return Ok(());
+        }
+        let Some(r) = self.r.as_mut() else {
+            return Err(eyre!("snapshot.restore: {} missing", self.name));
+        };
+        r.read_exact(dst)
+            .map_err(|e| eyre!("snapshot.restore: {}: {e}", self.name))?;
+        self.remaining -= dst.len() as u64;
+        Ok(())
+    }
+}
+
+/// Reusable host staging for restore (mirror of `SaveScratch`).
+#[derive(Default)]
+struct RestoreScratch {
+    bytes: Vec<u8>,
+    u16s: Vec<u16>,
+    f32s: Vec<f32>,
+}
+
+impl RestoreScratch {
+    /// Read `n` little-endian u16 from `src` and write them to the first
+    /// `n` elements of `dst` (the rest of `dst` is left as is: its valid
+    /// extent is gated by the row counters, see HetModelState::reset_in_place).
+    fn load_u16(
+        &mut self,
+        src: &mut BlobReader,
+        n: usize,
+        dst: &mut v4flash_hip::DeviceBuffer<u16>,
+    ) -> eyre::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        self.bytes.resize(n * 2, 0);
+        src.read_exact(&mut self.bytes[..n * 2])?;
+        if self.u16s.len() < n {
+            self.u16s.resize(n, 0);
+        }
+        for (i, c) in self.bytes[..n * 2].chunks_exact(2).enumerate() {
+            self.u16s[i] = u16::from_le_bytes([c[0], c[1]]);
+        }
+        dst.slice_view_mut(0, n).copy_from_host(&self.u16s[..n])
+    }
+    fn load_f32(
+        &mut self,
+        src: &mut BlobReader,
+        n: usize,
+        dst: &mut v4flash_hip::DeviceBuffer<f32>,
+    ) -> eyre::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        self.bytes.resize(n * 4, 0);
+        src.read_exact(&mut self.bytes[..n * 4])?;
+        if self.f32s.len() < n {
+            self.f32s.resize(n, 0.0);
+        }
+        for (i, c) in self.bytes[..n * 4].chunks_exact(4).enumerate() {
+            self.f32s[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        dst.slice_view_mut(0, n).copy_from_host(&self.f32s[..n])
+    }
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -691,60 +875,36 @@ pub fn save(
 
     // Pull device data per layer.
     let mut layers = Vec::with_capacity(N_LAYER as usize);
-    let mut kv_blob: Vec<u8> = Vec::new();
-    let mut comp_kv_blob: Vec<u8> = Vec::new();
-    let mut comp_state_blob: Vec<u8> = Vec::new();
-    let mut index_comp_kv_blob: Vec<u8> = Vec::new();
-    let mut index_comp_state_blob: Vec<u8> = Vec::new();
+    let mut kv_blob = BlobWriter::new(dir.join("kv.bin"));
+    let mut comp_kv_blob = BlobWriter::new(dir.join("comp_kv.bin"));
+    let mut comp_state_blob = BlobWriter::new(dir.join("comp_state.bin"));
+    let mut index_comp_kv_blob = BlobWriter::new(dir.join("index_comp_kv.bin"));
+    let mut index_comp_state_blob = BlobWriter::new(dir.join("index_comp_state.bin"));
+    let mut scratch = SaveScratch::default();
     for (li, layer) in state.layers.iter().enumerate() {
         let ratio = COMPRESS_RATIOS[li];
         let kv_rows = layer.n_raw.min(SWA_WINDOW);
-        // DeviceBuffer::copy_to_host requires the host slice length to
-        // match the full buffer length, so we read the entire buffer
-        // and slice the live portion ourselves.
+        // Only the live prefix is read (slice_view) and it is streamed
+        // straight to the file — no full-capacity host copy, no blob.
         dgpu.set_current()?;
-        let kv_full_n = layer.kv_cache.len();
-        let mut kv_host = vec![0u16; kv_full_n];
-        if kv_full_n > 0 {
-            layer.kv_cache.copy_to_host(&mut kv_host)?;
-        }
         let kv_used_n = (kv_rows as usize) * (N_HEAD_DIM as usize);
-        for v in &kv_host[..kv_used_n] {
-            kv_blob.extend_from_slice(&v.to_le_bytes());
-        }
+        scratch.stream_u16(&layer.kv_cache, kv_used_n, &mut kv_blob)?;
 
         let (has_compressor, n_comp, width, head_dim, state_rows, coff) = if let Some(comp) =
             &layer.compressor
         {
             let coff_local = if ratio == 4 { 2u32 } else { 1u32 };
             let state_rows = ratio * coff_local;
-            // comp_kv on dGPU — same full-buffer dance.
-            let ck_full_n = comp.comp_kv.len();
-            let mut comp_kv_host = vec![0u16; ck_full_n];
-            if ck_full_n > 0 {
-                dgpu.set_current()?;
-                comp.comp_kv.copy_to_host(&mut comp_kv_host)?;
-            }
+            // comp_kv on dGPU — live prefix only, streamed.
+            dgpu.set_current()?;
             let ck_used_n = (comp.n_comp as usize) * (comp.head_dim as usize);
-            for v in &comp_kv_host[..ck_used_n] {
-                comp_kv_blob.extend_from_slice(&v.to_le_bytes());
-            }
+            scratch.stream_u16(&comp.comp_kv, ck_used_n, &mut comp_kv_blob)?;
             // state_kv + state_score on iGPU — these ARE allocated at
             // exactly state_rows*width so no slicing needed.
             let n_state = comp.state_kv.len();
-            let mut state_kv_host = vec![0f32; n_state];
-            let mut state_score_host = vec![0f32; n_state];
             igpu.set_current()?;
-            if n_state > 0 {
-                comp.state_kv.copy_to_host(&mut state_kv_host)?;
-                comp.state_score.copy_to_host(&mut state_score_host)?;
-            }
-            for v in &state_kv_host {
-                comp_state_blob.extend_from_slice(&v.to_le_bytes());
-            }
-            for v in &state_score_host {
-                comp_state_blob.extend_from_slice(&v.to_le_bytes());
-            }
+            scratch.stream_f32(&comp.state_kv, n_state, &mut comp_state_blob)?;
+            scratch.stream_f32(&comp.state_score, n_state, &mut comp_state_blob)?;
             (
                 true,
                 comp.n_comp,
@@ -770,30 +930,12 @@ pub fn save(
         ) = if let Some(icomp) = &layer.indexer_compressor {
             let coff_local = 2u32; // ratio==4 only
             let state_rows = ratio * coff_local;
-            let ck_full_n = icomp.comp_kv.len();
-            let mut icomp_kv_host = vec![0u16; ck_full_n];
-            if ck_full_n > 0 {
-                dgpu.set_current()?;
-                icomp.comp_kv.copy_to_host(&mut icomp_kv_host)?;
-            }
+            dgpu.set_current()?;
             let ck_used_n = (icomp.n_comp as usize) * (icomp.head_dim as usize);
-            for v in &icomp_kv_host[..ck_used_n] {
-                index_comp_kv_blob.extend_from_slice(&v.to_le_bytes());
-            }
+            scratch.stream_u16(&icomp.comp_kv, ck_used_n, &mut index_comp_kv_blob)?;
             let n_state = icomp.state_kv.len();
-            let mut state_kv_host = vec![0f32; n_state];
-            let mut state_score_host = vec![0f32; n_state];
-            if n_state > 0 {
-                dgpu.set_current()?;
-                icomp.state_kv.copy_to_host(&mut state_kv_host)?;
-                icomp.state_score.copy_to_host(&mut state_score_host)?;
-            }
-            for v in &state_kv_host {
-                index_comp_state_blob.extend_from_slice(&v.to_le_bytes());
-            }
-            for v in &state_score_host {
-                index_comp_state_blob.extend_from_slice(&v.to_le_bytes());
-            }
+            scratch.stream_f32(&icomp.state_kv, n_state, &mut index_comp_state_blob)?;
+            scratch.stream_f32(&icomp.state_score, n_state, &mut index_comp_state_blob)?;
             (
                 true,
                 icomp.n_comp,
@@ -827,20 +969,17 @@ pub fn save(
     // Restore dgpu as current (callers expect that).
     dgpu.set_current()?;
 
-    // Write the binary blobs.
-    fs::write(dir.join("kv.bin"), &kv_blob)?;
-    if !comp_kv_blob.is_empty() {
-        fs::write(dir.join("comp_kv.bin"), &comp_kv_blob)?;
+    // Finish the streamed blobs (kv.bin always exists, even if empty —
+    // restore reads it unconditionally).
+    let kv_bytes = kv_blob.finish()?;
+    if kv_bytes == 0 {
+        fs::write(dir.join("kv.bin"), b"")?;
     }
-    if !comp_state_blob.is_empty() {
-        fs::write(dir.join("comp_state.bin"), &comp_state_blob)?;
-    }
-    if !index_comp_kv_blob.is_empty() {
-        fs::write(dir.join("index_comp_kv.bin"), &index_comp_kv_blob)?;
-    }
-    if !index_comp_state_blob.is_empty() {
-        fs::write(dir.join("index_comp_state.bin"), &index_comp_state_blob)?;
-    }
+    let comp_kv_bytes = comp_kv_blob.finish()?;
+    let comp_state_bytes = comp_state_blob.finish()?;
+    let _ = index_comp_kv_blob.finish()?;
+    let _ = index_comp_state_blob.finish()?;
+    drop(scratch);
 
     // Total disk bytes (including meta.json's eventual size — we
     // approximate by writing meta first and summing).
@@ -857,9 +996,9 @@ pub fn save(
         session_id: session_id.map(|s| s.to_string()),
         image_spans: image_spans.to_vec(),
     };
-    let mut total_bytes: u64 = tokens_bytes.len() as u64 + kv_blob.len() as u64;
-    total_bytes += comp_kv_blob.len() as u64;
-    total_bytes += comp_state_blob.len() as u64;
+    let mut total_bytes: u64 = tokens_bytes.len() as u64 + kv_bytes;
+    total_bytes += comp_kv_bytes;
+    total_bytes += comp_state_bytes;
     let meta_initial = serde_json::to_vec_pretty(&meta).map_err(|e| eyre!("meta encode: {e}"))?;
     total_bytes += meta_initial.len() as u64;
     meta.disk_bytes = total_bytes;
@@ -955,27 +1094,25 @@ pub fn restore_vl(
         tokens.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
 
-    let kv_bytes = fs::read(src.join("kv.bin"))
-        .map_err(|e| eyre!("snapshot.restore: kv.bin: {e}"))?;
-    let comp_kv_bytes = fs::read(src.join("comp_kv.bin")).unwrap_or_default();
-    let comp_state_bytes = fs::read(src.join("comp_state.bin")).unwrap_or_default();
-    let index_comp_kv_bytes = fs::read(src.join("index_comp_kv.bin")).unwrap_or_default();
-    let index_comp_state_bytes =
-        fs::read(src.join("index_comp_state.bin")).unwrap_or_default();
-
-    let mut kv_off = 0usize;
-    let mut comp_kv_off = 0usize;
-    let mut comp_state_off = 0usize;
-    let mut index_comp_kv_off = 0usize;
-    let mut index_comp_state_off = 0usize;
+    // Blobs are streamed per layer (exact-size reads into reusable host
+    // staging, prefix copies onto the device). Peak host cost is one
+    // layer's slice instead of every blob in memory plus a full-capacity
+    // zero-padded copy of each device buffer.
+    let mut kv_rd = BlobReader::open(src, "kv.bin", true)?;
+    let mut comp_kv_rd = BlobReader::open(src, "comp_kv.bin", false)?;
+    let mut comp_state_rd = BlobReader::open(src, "comp_state.bin", false)?;
+    let mut index_comp_kv_rd = BlobReader::open(src, "index_comp_kv.bin", false)?;
+    let mut index_comp_state_rd = BlobReader::open(src, "index_comp_state.bin", false)?;
+    let mut scratch = RestoreScratch::default();
 
     for (li, layer) in state.layers.iter_mut().enumerate() {
         let m = &meta.layers[li];
 
-        // raw KV — copy_from_host needs full-buffer length; pad with zeros.
+        // raw KV — live prefix only; the rest of the buffer is gated by
+        // n_raw (see HetModelState::reset_in_place).
         let kv_count = (m.kv_rows as usize) * (N_HEAD_DIM as usize);
         let kv_bytes_len = kv_count * 2;
-        if kv_off + kv_bytes_len > kv_bytes.len() {
+        if !kv_rd.has(kv_bytes_len) {
             return Err(eyre!(
                 "snapshot.restore: kv.bin truncated at layer {li}"
             ));
@@ -986,18 +1123,8 @@ pub fn restore_vl(
                 "snapshot.restore: kv_count {kv_count} > layer buffer {kv_full_n}"
             ));
         }
-        let mut kv_host = vec![0u16; kv_full_n];
-        for (i, c) in kv_bytes[kv_off..kv_off + kv_bytes_len]
-            .chunks_exact(2)
-            .enumerate()
-        {
-            kv_host[i] = u16::from_le_bytes([c[0], c[1]]);
-        }
-        if kv_full_n > 0 {
-            dgpu.set_current()?;
-            layer.kv_cache.copy_from_host(&kv_host)?;
-        }
-        kv_off += kv_bytes_len;
+        dgpu.set_current()?;
+        scratch.load_u16(&mut kv_rd, kv_count, &mut layer.kv_cache)?;
         layer.n_raw = m.n_raw;
 
         if m.has_compressor {
@@ -1008,10 +1135,10 @@ pub fn restore_vl(
             };
             comp.n_comp = m.n_comp;
 
-            // comp_kv — full buffer copy with zero pad past n_comp rows.
+            // comp_kv — live prefix only (gated by n_comp).
             let ck_count = (m.n_comp as usize) * (m.head_dim as usize);
             let ck_bytes_len = ck_count * 2;
-            if comp_kv_off + ck_bytes_len > comp_kv_bytes.len() {
+            if !comp_kv_rd.has(ck_bytes_len) {
                 return Err(eyre!(
                     "snapshot.restore: comp_kv.bin truncated at layer {li}"
                 ));
@@ -1022,48 +1149,21 @@ pub fn restore_vl(
                     "snapshot.restore: ck_count {ck_count} > buffer {ck_full_n}"
                 ));
             }
-            if ck_full_n > 0 {
-                let mut ck_host = vec![0u16; ck_full_n];
-                for (i, c) in comp_kv_bytes[comp_kv_off..comp_kv_off + ck_bytes_len]
-                    .chunks_exact(2)
-                    .enumerate()
-                {
-                    ck_host[i] = u16::from_le_bytes([c[0], c[1]]);
-                }
-                dgpu.set_current()?;
-                comp.comp_kv.copy_from_host(&ck_host)?;
-            }
-            comp_kv_off += ck_bytes_len;
+            dgpu.set_current()?;
+            scratch.load_u16(&mut comp_kv_rd, ck_count, &mut comp.comp_kv)?;
 
             // state_kv + state_score (each n_state floats, packed back-to-back).
             let n_state = (m.state_rows as usize) * (m.width as usize);
             let block_bytes = n_state * 4;
             let block_total = 2 * block_bytes;
-            if comp_state_off + block_total > comp_state_bytes.len() {
+            igpu.set_current()?;
+            if !comp_state_rd.has(block_total) {
                 // Fall back to alloc-time defaults if missing.
-                igpu.set_current()?;
                 comp.state_kv.copy_from_host(&vec![0f32; n_state])?;
                 comp.state_score.copy_from_host(&vec![NEG_INF; n_state])?;
             } else {
-                let mut kv = vec![0f32; n_state];
-                let mut score = vec![0f32; n_state];
-                for (i, c) in comp_state_bytes[comp_state_off..comp_state_off + block_bytes]
-                    .chunks_exact(4)
-                    .enumerate()
-                {
-                    kv[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                }
-                for (i, c) in comp_state_bytes
-                    [comp_state_off + block_bytes..comp_state_off + block_total]
-                    .chunks_exact(4)
-                    .enumerate()
-                {
-                    score[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                }
-                igpu.set_current()?;
-                comp.state_kv.copy_from_host(&kv)?;
-                comp.state_score.copy_from_host(&score)?;
-                comp_state_off += block_total;
+                scratch.load_f32(&mut comp_state_rd, n_state, &mut comp.state_kv)?;
+                scratch.load_f32(&mut comp_state_rd, n_state, &mut comp.state_score)?;
             }
         } else if let Some(comp) = layer.compressor.as_mut() {
             // State expects a compressor but snapshot doesn't have one;
@@ -1088,7 +1188,7 @@ pub fn restore_vl(
 
             let ick_count = (m.n_index_comp as usize) * (m.index_head_dim as usize);
             let ick_bytes_len = ick_count * 2;
-            if index_comp_kv_off + ick_bytes_len > index_comp_kv_bytes.len() {
+            if !index_comp_kv_rd.has(ick_bytes_len) {
                 return Err(eyre!(
                     "snapshot.restore: index_comp_kv.bin truncated at layer {li}"
                 ));
@@ -1099,48 +1199,18 @@ pub fn restore_vl(
                     "snapshot.restore: index ck_count {ick_count} > buffer {ick_full_n}"
                 ));
             }
-            if ick_full_n > 0 {
-                let mut ick_host = vec![0u16; ick_full_n];
-                for (i, c) in index_comp_kv_bytes
-                    [index_comp_kv_off..index_comp_kv_off + ick_bytes_len]
-                    .chunks_exact(2)
-                    .enumerate()
-                {
-                    ick_host[i] = u16::from_le_bytes([c[0], c[1]]);
-                }
-                dgpu.set_current()?;
-                icomp.comp_kv.copy_from_host(&ick_host)?;
-            }
-            index_comp_kv_off += ick_bytes_len;
+            dgpu.set_current()?;
+            scratch.load_u16(&mut index_comp_kv_rd, ick_count, &mut icomp.comp_kv)?;
 
             let in_state = (m.index_state_rows as usize) * (m.index_width as usize);
             let in_block_bytes = in_state * 4;
             let in_block_total = 2 * in_block_bytes;
-            if index_comp_state_off + in_block_total > index_comp_state_bytes.len() {
-                dgpu.set_current()?;
+            if !index_comp_state_rd.has(in_block_total) {
                 icomp.state_kv.copy_from_host(&vec![0f32; in_state])?;
                 icomp.state_score.copy_from_host(&vec![NEG_INF; in_state])?;
             } else {
-                let mut kv = vec![0f32; in_state];
-                let mut score = vec![0f32; in_state];
-                for (i, c) in index_comp_state_bytes
-                    [index_comp_state_off..index_comp_state_off + in_block_bytes]
-                    .chunks_exact(4)
-                    .enumerate()
-                {
-                    kv[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                }
-                for (i, c) in index_comp_state_bytes[index_comp_state_off + in_block_bytes
-                    ..index_comp_state_off + in_block_total]
-                    .chunks_exact(4)
-                    .enumerate()
-                {
-                    score[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                }
-                dgpu.set_current()?;
-                icomp.state_kv.copy_from_host(&kv)?;
-                icomp.state_score.copy_from_host(&score)?;
-                index_comp_state_off += in_block_total;
+                scratch.load_f32(&mut index_comp_state_rd, in_state, &mut icomp.state_kv)?;
+                scratch.load_f32(&mut index_comp_state_rd, in_state, &mut icomp.state_score)?;
             }
         } else if let Some(icomp) = layer.indexer_compressor.as_mut() {
             // State expects an indexer_compressor but snapshot doesn't —

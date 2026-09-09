@@ -6,6 +6,7 @@
 
 pub mod gguf;
 pub mod gguf_write;
+pub mod heap;
 pub mod iq3_s_ref;
 pub mod kquants;
 pub mod mapped;
