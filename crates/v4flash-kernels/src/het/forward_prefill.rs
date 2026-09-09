@@ -2981,17 +2981,30 @@ impl HeterogeneousEngine {
                 // does not apply. IQ2_XXS returns false and takes the zoo below.
                 let handled = if wmma_path {
                     let _t_wm = ie.events.stage("igpu.gateup_wmma", &ie.compute)?;
-                    ie.iq2xs.launch_fused_swiglu_wmma_f16out(
-                        &ie.compute, d_mid16,
-                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
-                        d_x16, d_ew,
-                        group_count, expert_members, work_items,
-                        n_work_items,
-                        gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
-                        crate::config::SWIGLU_CLAMP_EXP,
-                        crate::config::N_FF_EXP,
-                        crate::config::BLOCKS_Q8K_GATE_IN,
-                    )?;
+                    match ilw.routed.gate.dtype {
+                        v4flash_core::gguf::GgufType::IQ2_S => ie.iq2s.launch_fused_swiglu_wmma_f16out(
+                            &ie.compute, d_mid16,
+                            &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                            d_x16, d_ew,
+                            group_count, expert_members, work_items,
+                            n_work_items,
+                            gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
+                            crate::config::SWIGLU_CLAMP_EXP,
+                            crate::config::N_FF_EXP,
+                            crate::config::BLOCKS_Q8K_GATE_IN,
+                        )?,
+                        _ => ie.iq2xs.launch_fused_swiglu_wmma_f16out(
+                            &ie.compute, d_mid16,
+                            &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                            d_x16, d_ew,
+                            group_count, expert_members, work_items,
+                            n_work_items,
+                            gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
+                            crate::config::SWIGLU_CLAMP_EXP,
+                            crate::config::N_FF_EXP,
+                            crate::config::BLOCKS_Q8K_GATE_IN,
+                        )?,
+                    }
                     true
                 } else {
                     // Label reflects the kernel that actually runs (kwide vs

@@ -682,3 +682,375 @@ extern "C" __global__ void iq2_s_pair_matvec_fused_swiglu_kwide(
         }
     }
 }
+
+
+// =============================================================================
+// wmma — f16 WMMA batched-prefill gate/up for IQ2_S (2026-09-08).
+//
+// Port of iq2_xs_pair_matvec_fused_swiglu_wmma (see that banner for the
+// design, measurements and the dead ends). Everything about the tiling,
+// the LDS activation staging, the software pipelining and the epilogue is
+// identical; only the block decode differs:
+//
+//   IQ2_XS  74 B: d | qs u16[32] (9-bit grid idx + 7-bit ksigns idx) | scales[8]
+//   IQ2_S   82 B: d | qs_grid u8[32] | qs_sign u8[32] | qh u8[8] | scales[8]
+//           grid idx (10 bit) = qs_grid[4*ib32+l] | (((qh[ib32] >> 2l) & 3) << 8)
+//           sign byte         = qs_sign[4*ib32+l]  (raw, one bit per weight)
+//
+// Per k-step (16 weights = ib32 = ks>>1, half = ks&1, groups l = 2*half+{0,1})
+// the two grid bytes are bytes (2*half, 2*half+1) of dword ib32 of qs_grid,
+// the two sign bytes the same bytes of dword ib32 of qs_sign, the two
+// 2-bit highs are nibble `half` of qh[ib32], the scale nibble is `half`
+// of scales[ib32] — all static after unrolling, exactly as in the XS
+// kernel. The biased sign masks (0x80 = +, 0x7F = -) come from the 256-entry
+// raw-byte table, the grid from the 1024-entry codebook (both LDS, 10 KiB
+// vs the XS kernel's 5 KiB; total ~27 KiB/WG, still 2 WG/CU on gfx1151).
+//
+// Rows: n_rows must be a multiple of 16 (N_FF_EXP = 2048). Members: <= 32
+// per work item (chunk_size), 1 or 2 N-tiles (template).
+// Oracle: tests/iq2_s_wmma_oracle.rs. Bench: bench_iq2_xs_isolated
+// (BENCH_FMT=iq2s BENCH_VARIANT=7).
+// =============================================================================
+
+#define IQ2S_WM_MAX_CHUNK   32u
+#define IQ2S_WM_ROWS_PER_WG 128u
+#define IQ2S_WM_KWIN        256u                       // one window per super-block
+#define IQ2S_WM_X_STRIDE    (IQ2S_WM_KWIN + 8u)        // halves per staged member row (+8 pad = 4 banks)
+
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
+#define IQ2S_WMMA_RDNA3 1
+#endif
+
+typedef _Float16 iq2s_half16 __attribute__((ext_vector_type(16)));
+typedef _Float16 iq2s_half2  __attribute__((ext_vector_type(2)));
+typedef float    iq2s_float8 __attribute__((ext_vector_type(8)));
+
+// "magic" dequant of one dword of 4 unsigned grid bytes g with biased sign
+// mask smb: u = 128 +/- grid, halves 0x64|u = 1024+u exactly, (h-1152)*scale.
+__device__ __forceinline__ void iq2s_magic_dword(uint32_t g, uint32_t smb, _Float16 scale,
+                                                 uint32_t& lo, uint32_t& hi) {
+    const uint32_t u = (g ^ smb) + (smb & 0x01010101u);
+    const uint32_t h01 = __builtin_amdgcn_perm(u, 0x64646464u, 0x00050004u);
+    const uint32_t h23 = __builtin_amdgcn_perm(u, 0x64646464u, 0x00070006u);
+    iq2s_half2 a, b;
+    __builtin_memcpy(&a, &h01, 4);
+    __builtin_memcpy(&b, &h23, 4);
+    const iq2s_half2 bias = {(_Float16)-1152.0f, (_Float16)-1152.0f};
+    a = (a + bias) * scale;
+    b = (b + bias) * scale;
+    __builtin_memcpy(&lo, &a, 4);
+    __builtin_memcpy(&hi, &b, 4);
+}
+// 16 weights of one matrix: two grid entries (u64) + two biased sign masks.
+__device__ __forceinline__ iq2s_half16 iq2s_magic_frag(
+        uint64_t g0, uint64_t sm0, uint64_t g1, uint64_t sm1, _Float16 scale) {
+    uint32_t d[8];
+    iq2s_magic_dword((uint32_t)g0,         (uint32_t)sm0,         scale, d[0], d[1]);
+    iq2s_magic_dword((uint32_t)(g0 >> 32), (uint32_t)(sm0 >> 32), scale, d[2], d[3]);
+    iq2s_magic_dword((uint32_t)g1,         (uint32_t)sm1,         scale, d[4], d[5]);
+    iq2s_magic_dword((uint32_t)(g1 >> 32), (uint32_t)(sm1 >> 32), scale, d[6], d[7]);
+    iq2s_half16 r;
+    __builtin_memcpy(&r, d, 32);
+    return r;
+}
+
+// Raw gathers for one k-step of both matrices. gb/sb = the two grid / sign
+// bytes of this k-step (low byte = group 2*half), qhn = nibble `half` of
+// qh[ib32] (bits [1:0] -> group 2*half, [3:2] -> group 2*half+1).
+struct iq2s_raw8 { uint64_t g0, s0, g1, s1, u0, t0, u1, t1; };
+__device__ __forceinline__ iq2s_raw8 iq2s_gather_raw8(
+        const uint64_t* s_grid2s, const uint64_t* s_sign256b,
+        uint32_t gb_g, uint32_t sb_g, uint32_t qhn_g,
+        uint32_t gb_u, uint32_t sb_u, uint32_t qhn_u) {
+    iq2s_raw8 r;
+    r.g0 = s_grid2s[(gb_g & 0xffu) | ((qhn_g & 3u) << 8)];
+    r.g1 = s_grid2s[((gb_g >> 8) & 0xffu) | (((qhn_g >> 2) & 3u) << 8)];
+    r.s0 = s_sign256b[sb_g & 0xffu];
+    r.s1 = s_sign256b[(sb_g >> 8) & 0xffu];
+    r.u0 = s_grid2s[(gb_u & 0xffu) | ((qhn_u & 3u) << 8)];
+    r.u1 = s_grid2s[((gb_u >> 8) & 0xffu) | (((qhn_u >> 2) & 3u) << 8)];
+    r.t0 = s_sign256b[sb_u & 0xffu];
+    r.t1 = s_sign256b[(sb_u >> 8) & 0xffu];
+    return r;
+}
+
+// Static dword select from a uint4 pair (index is a compile-time constant
+// after unrolling).
+#define IQ2S_DW(v2, i) ((i) == 0u ? (v2)[0].x : (i) == 1u ? (v2)[0].y : (i) == 2u ? (v2)[0].z : (i) == 3u ? (v2)[0].w \
+                      : (i) == 4u ? (v2)[1].x : (i) == 5u ? (v2)[1].y : (i) == 6u ? (v2)[1].z : (v2)[1].w)
+
+template <int NT>
+__device__ __forceinline__ void iq2s_wmma_mainloop(
+        iq2s_float8 (&acc_g)[2], iq2s_float8 (&acc_u)[2],
+        const uint8_t* __restrict__ gate_row, const uint8_t* __restrict__ up_row,
+        const uint16_t* __restrict__ x16,
+        uint16_t* s_x, const int* s_member_packed,
+        const uint64_t* s_grid2s, const uint64_t* s_sign256b,
+        unsigned int n_members, unsigned int n_blocks, bool row_valid,
+        unsigned int tid, unsigned int l16) {
+    const size_t k_total = (size_t)n_blocks * 256u;
+    constexpr unsigned int KSTEPS_PER_WIN    = IQ2S_WM_KWIN / 16u;               // 16
+    constexpr unsigned int CHUNKS_PER_ROW    = IQ2S_WM_KWIN / 8u;                // b128 per member row
+    constexpr unsigned int CHUNKS_PER_WIN    = IQ2S_WM_MAX_CHUNK * CHUNKS_PER_ROW;
+    constexpr unsigned int CHUNKS_PER_THREAD = (CHUNKS_PER_WIN + 255u) / 256u;
+    static_assert(IQ2S_WM_KWIN == 256u, "one window per super-block");
+
+    for (unsigned int sb = 0; sb < n_blocks; sb++) {
+        const uint8_t* gate_block = gate_row + (uint64_t)sb * BLOCK_IQ2_S_BYTES;
+        const uint8_t* up_block   = up_row   + (uint64_t)sb * BLOCK_IQ2_S_BYTES;
+
+        // --- This super-block's block bytes per matrix: d, 2 x b128 grid
+        //     bytes, 2 x b128 sign bytes, qh (u64), scales (u64). Issued
+        //     before the staging barrier so the latency overlaps it.
+        float dsc_g = 0.0f, dsc_u = 0.0f;
+        uint4 gq[2], gs[2], uq[2], us[2];
+        uint2 gqh = make_uint2(0u, 0u), uqh = gqh, gsc = gqh, usc = gqh;
+        #pragma unroll
+        for (unsigned int i = 0; i < 2u; i++) {
+            gq[i] = make_uint4(0u, 0u, 0u, 0u); gs[i] = gq[i]; uq[i] = gq[i]; us[i] = gq[i];
+        }
+        if (row_valid) {
+            uint16_t wd_g, wd_u;
+            __builtin_memcpy(&wd_g, gate_block, 2);
+            __builtin_memcpy(&wd_u, up_block, 2);
+            dsc_g = 0.125f * f16_to_f32_par(wd_g);
+            dsc_u = 0.125f * f16_to_f32_par(wd_u);
+            #pragma unroll
+            for (unsigned int i = 0; i < 2u; i++) {
+                __builtin_memcpy(&gq[i], gate_block + 2  + i * 16u, 16);
+                __builtin_memcpy(&gs[i], gate_block + 34 + i * 16u, 16);
+                __builtin_memcpy(&uq[i], up_block   + 2  + i * 16u, 16);
+                __builtin_memcpy(&us[i], up_block   + 34 + i * 16u, 16);
+            }
+            __builtin_memcpy(&gqh, gate_block + 66, 8);
+            __builtin_memcpy(&gsc, gate_block + 74, 8);
+            __builtin_memcpy(&uqh, up_block   + 66, 8);
+            __builtin_memcpy(&usc, up_block   + 74, 8);
+        }
+
+        // --- Stage every member's 256 k of this super-block (zeros past
+        //     n_members): 32 members x 32 b128 chunks over 256 threads.
+        #pragma unroll
+        for (unsigned int j = 0; j < CHUNKS_PER_THREAD; j++) {
+            const unsigned int idx = tid + 256u * j;
+            if (idx < CHUNKS_PER_WIN) {
+                const unsigned int mi = idx / CHUNKS_PER_ROW;
+                const unsigned int c  = idx % CHUNKS_PER_ROW;
+                uint4 v = make_uint4(0u, 0u, 0u, 0u);
+                if (mi < n_members) {
+                    const unsigned int b = (unsigned int)(s_member_packed[mi] >> 16);
+                    const uint4* src = (const uint4*)(x16 + (size_t)b * k_total
+                                                          + (size_t)sb * 256u + (size_t)c * 8u);
+                    v = *src;
+                }
+                *(uint4*)(&s_x[mi * IQ2S_WM_X_STRIDE + c * 8u]) = v;
+            }
+        }
+        __syncthreads();
+
+        // --- Software pipeline: k-step 0's gathers + B fragments up front.
+        iq2s_raw8 r8_cur, r8_nxt;
+        iq2s_half16 bf_cur[2], bf_nxt[2];
+        r8_cur = iq2s_gather_raw8(s_grid2s, s_sign256b,
+                                  gq[0].x & 0xffffu, gs[0].x & 0xffffu, gqh.x & 0xfu,
+                                  uq[0].x & 0xffffu, us[0].x & 0xffffu, uqh.x & 0xfu);
+        #pragma unroll
+        for (unsigned int nt = 0; nt < 2u; nt++) {
+            if (nt < (unsigned int)NT) {
+                const uint16_t* xb = &s_x[(nt * 16u + l16) * IQ2S_WM_X_STRIDE];
+                __builtin_memcpy(&bf_cur[nt], xb, 32);
+            }
+        }
+
+        #pragma unroll
+        for (unsigned int kw = 0; kw < KSTEPS_PER_WIN; kw++) {
+            const unsigned int ib32 = kw >> 1;
+            const unsigned int half = kw & 1u;
+
+            // scale nibble `half` of scales[ib32]
+            const uint8_t sc_g = (uint8_t)(((ib32 < 4u) ? gsc.x : gsc.y) >> (8u * (ib32 & 3u)));
+            const uint8_t sc_u = (uint8_t)(((ib32 < 4u) ? usc.x : usc.y) >> (8u * (ib32 & 3u)));
+            const int32_t ls_g = 1 + 2 * (int32_t)(half ? (sc_g >> 4) : (sc_g & 0x0F));
+            const int32_t ls_u = 1 + 2 * (int32_t)(half ? (sc_u >> 4) : (sc_u & 0x0F));
+            const float sg = dsc_g * (float)ls_g;   // 0 for invalid rows (dsc=0)
+            const float su = dsc_u * (float)ls_u;
+
+            // prefetch the next k-step's rows (the WMMAs below cover it)
+            if (kw + 1u < KSTEPS_PER_WIN) {
+                const unsigned int kn = kw + 1u;
+                const unsigned int nib32 = kn >> 1;
+                const unsigned int nhalf = kn & 1u;
+                const uint32_t ngq = IQ2S_DW(gq, nib32) >> (16u * nhalf);
+                const uint32_t ngs = IQ2S_DW(gs, nib32) >> (16u * nhalf);
+                const uint32_t nuq = IQ2S_DW(uq, nib32) >> (16u * nhalf);
+                const uint32_t nus = IQ2S_DW(us, nib32) >> (16u * nhalf);
+                const uint32_t nqh_g = (((nib32 < 4u) ? gqh.x : gqh.y) >> (8u * (nib32 & 3u) + 4u * nhalf)) & 0xfu;
+                const uint32_t nqh_u = (((nib32 < 4u) ? uqh.x : uqh.y) >> (8u * (nib32 & 3u) + 4u * nhalf)) & 0xfu;
+                r8_nxt = iq2s_gather_raw8(s_grid2s, s_sign256b,
+                                          ngq & 0xffffu, ngs & 0xffffu, nqh_g,
+                                          nuq & 0xffffu, nus & 0xffffu, nqh_u);
+            }
+            const iq2s_half16 a_g = iq2s_magic_frag(r8_cur.g0, r8_cur.s0, r8_cur.g1, r8_cur.s1, (_Float16)sg);
+            const iq2s_half16 a_u = iq2s_magic_frag(r8_cur.u0, r8_cur.t0, r8_cur.u1, r8_cur.t1, (_Float16)su);
+
+            #pragma unroll
+            for (unsigned int nt = 0; nt < 2u; nt++) {
+                if (nt < (unsigned int)NT) {
+                    const iq2s_half16 bf = bf_cur[nt];
+                    if (kw + 1u < KSTEPS_PER_WIN) {
+                        const uint16_t* xb = &s_x[(nt * 16u + l16) * IQ2S_WM_X_STRIDE + (kw + 1u) * 16u];
+                        __builtin_memcpy(&bf_nxt[nt], xb, 32);
+                    }
+#if defined(IQ2S_WMMA_RDNA3)
+                    acc_g[nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_g, bf, acc_g[nt]);
+                    acc_u[nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_u, bf, acc_u[nt]);
+#else
+                    (void)bf; (void)a_g; (void)a_u;
+#endif
+                }
+            }
+            r8_cur = r8_nxt; bf_cur[0] = bf_nxt[0]; bf_cur[1] = bf_nxt[1];
+        }
+        __syncthreads();   // s_x reuse by the next super-block
+    }
+}
+
+template <int OUT16>
+__device__ __forceinline__ void iq2s_wmma_body(
+        float          * __restrict__ mid,           // OUT16=0: f32 [B, n_used, n_rows]; OUT16=1: f16 halves
+        const uint8_t  * __restrict__ gate_w_base,
+        const uint8_t  * __restrict__ up_w_base,
+        const uint16_t * __restrict__ x16,           // [B, K] f16
+        const float    * __restrict__ expert_w,      // [B, n_used]
+        const int      * __restrict__ group_count,
+        const int      * __restrict__ expert_members,
+        const int      * __restrict__ work_items,
+        unsigned int    gate_bpe,
+        unsigned int    up_bpe,
+        unsigned int    n_used,
+        unsigned int    max_per_expert,
+        unsigned int    chunk_size,
+        float           clamp,
+        unsigned int    n_rows,
+        unsigned int    n_blocks) {
+#if defined(IQ2S_WMMA_RDNA3)
+    const unsigned int w_idx = blockIdx.y;
+    const int packed_item = work_items[w_idx];
+    const unsigned int e            = (unsigned int)(packed_item >> 16) & 0xffffu;
+    const unsigned int member_start = (unsigned int)(packed_item       ) & 0xffffu;
+    const int group_n = group_count[e];
+    const unsigned int member_end = min((unsigned int)group_n, member_start + chunk_size);
+    if (member_end <= member_start) return;
+    const unsigned int n_members = member_end - member_start;
+    const unsigned int n_tiles = (n_members + 15u) >> 4;     // 1 or 2
+
+    __shared__ uint64_t s_sign_pair256[256];
+    __shared__ uint64_t s_grid2s[1024];
+    __shared__ __attribute__((aligned(16))) uint16_t s_x[IQ2S_WM_MAX_CHUNK * IQ2S_WM_X_STRIDE];
+    __shared__ int      s_member_packed[IQ2S_WM_MAX_CHUNK];
+
+    const unsigned int tid = threadIdx.x;
+    IQ2S_STAGE_TABLES(s_sign_pair256, s_grid2s);
+    __syncthreads();
+    if (tid < 256u) s_sign_pair256[tid] ^= 0x8080808080808080ull;   // biased masks
+    for (unsigned int i = tid; i < IQ2S_WM_MAX_CHUNK; i += blockDim.x) {
+        s_member_packed[i] = (i < n_members)
+            ? expert_members[(size_t)e * (size_t)max_per_expert + (size_t)(member_start + i)]
+            : 0;
+    }
+    __syncthreads();
+
+    const unsigned int wave = tid >> 5;                    // 0..7
+    const unsigned int lane = tid & 31u;
+    const unsigned int l16  = lane & 15u;
+    const unsigned int hi   = lane >> 4;                   // C-fragment row parity
+    const unsigned int m0   = blockIdx.x * IQ2S_WM_ROWS_PER_WG + wave * 16u;
+    const unsigned int row_a = m0 + l16;                   // row this lane dequantizes
+    const bool row_valid = (row_a < n_rows);
+
+    const uint8_t* gate_row = gate_w_base + (uint64_t)e * (uint64_t)gate_bpe
+                            + (uint64_t)row_a * (uint64_t)n_blocks * BLOCK_IQ2_S_BYTES;
+    const uint8_t* up_row   = up_w_base   + (uint64_t)e * (uint64_t)up_bpe
+                            + (uint64_t)row_a * (uint64_t)n_blocks * BLOCK_IQ2_S_BYTES;
+
+    iq2s_float8 acc_g[2], acc_u[2];
+    #pragma unroll
+    for (unsigned int nt = 0; nt < 2u; nt++) {
+        #pragma unroll
+        for (int i = 0; i < 8; i++) { acc_g[nt][i] = 0.0f; acc_u[nt][i] = 0.0f; }
+    }
+
+    if (n_tiles == 2u) {
+        iq2s_wmma_mainloop<2>(acc_g, acc_u, gate_row, up_row, x16, s_x, s_member_packed,
+                              s_grid2s, s_sign_pair256, n_members, n_blocks, row_valid, tid, l16);
+    } else {
+        iq2s_wmma_mainloop<1>(acc_g, acc_u, gate_row, up_row, x16, s_x, s_member_packed,
+                              s_grid2s, s_sign_pair256, n_members, n_blocks, row_valid, tid, l16);
+    }
+
+    // --- Epilogue: C lane l elem i = [row 2i+hi][member l16].
+    #pragma unroll
+    for (unsigned int nt = 0; nt < 2u; nt++) {
+        const unsigned int mi = nt * 16u + l16;
+        if (nt < n_tiles && mi < n_members) {
+            const int packed        = s_member_packed[mi];
+            const unsigned int b    = (unsigned int)(packed >> 16);
+            const unsigned int slot = (unsigned int)(packed & 0xFFFFu);
+            const float ew = expert_w[(size_t)b * (size_t)n_used + (size_t)slot];
+            const size_t out_row0 = ((size_t)b * (size_t)n_used + (size_t)slot) * (size_t)n_rows;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const unsigned int row = m0 + 2u * (unsigned int)i + hi;
+                if (row < n_rows) {
+                    float g = acc_g[nt][i];
+                    float u = acc_u[nt][i];
+                    if (clamp > 1.0e-6f) {
+                        if (g > clamp)  g = clamp;
+                        if (u > clamp)  u = clamp;
+                        if (u < -clamp) u = -clamp;
+                    }
+                    const float sig = 1.0f / (1.0f + expf(-g));
+                    const float v = g * sig * u * ew;
+                    if (OUT16) {
+                        ((uint16_t*)mid)[out_row0 + row] = __half_as_ushort(__float2half(v));
+                    } else {
+                        mid[out_row0 + row] = v;
+                    }
+                }
+            }
+        }
+    }
+#else
+    // Non-RDNA3 targets: no WMMA path. Trap loudly rather than return
+    // garbage; the wrapper only dispatches it on gfx11.
+    __builtin_trap();
+#endif
+}
+
+extern "C" __global__ __launch_bounds__(256) void iq2_s_pair_matvec_fused_swiglu_wmma(
+        float* __restrict__ mid, const uint8_t* __restrict__ gate_w_base,
+        const uint8_t* __restrict__ up_w_base, const uint16_t* __restrict__ x16,
+        const float* __restrict__ expert_w, const int* __restrict__ group_count,
+        const int* __restrict__ expert_members, const int* __restrict__ work_items,
+        unsigned int gate_bpe, unsigned int up_bpe, unsigned int n_used,
+        unsigned int max_per_expert, unsigned int chunk_size, float clamp,
+        unsigned int n_rows, unsigned int n_blocks) {
+    iq2s_wmma_body<0>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
+                      expert_members, work_items, gate_bpe, up_bpe, n_used,
+                      max_per_expert, chunk_size, clamp, n_rows, n_blocks);
+}
+
+// Production twin: f16 mid out ([B*n_used][n_rows] halves, = the down
+// kernel's B operand), otherwise identical to _wmma.
+extern "C" __global__ __launch_bounds__(256) void iq2_s_pair_matvec_fused_swiglu_wmma_h(
+        float* __restrict__ mid, const uint8_t* __restrict__ gate_w_base,
+        const uint8_t* __restrict__ up_w_base, const uint16_t* __restrict__ x16,
+        const float* __restrict__ expert_w, const int* __restrict__ group_count,
+        const int* __restrict__ expert_members, const int* __restrict__ work_items,
+        unsigned int gate_bpe, unsigned int up_bpe, unsigned int n_used,
+        unsigned int max_per_expert, unsigned int chunk_size, float clamp,
+        unsigned int n_rows, unsigned int n_blocks) {
+    iq2s_wmma_body<1>(mid, gate_w_base, up_w_base, x16, expert_w, group_count,
+                      expert_members, work_items, gate_bpe, up_bpe, n_used,
+                      max_per_expert, chunk_size, clamp, n_rows, n_blocks);
+}

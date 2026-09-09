@@ -229,8 +229,19 @@ fn bench_iq2_xs_isolated() -> eyre::Result<()> {
 
     let launch = |mid: &mut DeviceBuffer<f32>| -> eyre::Result<()> {
         if use_wmma {
+            if fmt == "iq2s" {
+                if variant != 7 {
+                    return Err(eyre!("iq2s has only the production wmma variant (7)"));
+                }
+                return iq2s.launch_fused_swiglu_wmma(
+                    &stream, mid, &gate_w, &up_w, &x16, &expert_w,
+                    &group_count, &expert_members, &work_items, n_work_items_target,
+                    gate_bpe as u32, up_bpe as u32, cs_n_used, max_per_expert,
+                    chunk_size, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+                );
+            }
             if fmt != "iq2_xs" {
-                return Err(eyre!("wmma variants exist for iq2_xs only"));
+                return Err(eyre!("wmma variants exist for iq2_xs and iq2s only"));
             }
             return iq2xs.launch_fused_swiglu_wmma(
                 &stream, mid, &gate_w, &up_w, &x16, &expert_w,

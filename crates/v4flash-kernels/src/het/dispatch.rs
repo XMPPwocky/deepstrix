@@ -274,9 +274,12 @@ pub fn igpu_moe_wmma_selected(
     iq2_variant: &str,
     env_enabled: bool,
 ) -> bool {
+    // IQ2_S joined 2026-09-08 (the Vision-Exp UD-IQ3_XXS gate/up type on
+    // 42 of 43 layers) with its own WMMA twin; blk.26 (IQ3_S / IQ3_XXS
+    // pair) and blk.42 (MXFP4 down) stay on the kwide kernels.
     env_enabled
         && igpu_is_gfx11
-        && gate == GgufType::IQ2_XS
+        && (gate == GgufType::IQ2_XS || gate == GgufType::IQ2_S)
         && down == GgufType::IQ3_XXS
         && iq2_variant == "kwide"
 }
@@ -426,6 +429,7 @@ mod tests {
     fn wmma_path_routing() {
         use GgufType::*;
         assert!(igpu_moe_wmma_selected(IQ2_XS, IQ3_XXS, true, "kwide", true));
+        assert!(igpu_moe_wmma_selected(IQ2_S, IQ3_XXS, true, "kwide", true), "UD-IQ3_XXS gate/up");
         assert!(!igpu_moe_wmma_selected(IQ2_XS, IQ3_XXS, false, "kwide", true), "dGPU/gfx12 never");
         assert!(!igpu_moe_wmma_selected(IQ2_XS, IQ3_XXS, true, "kwide", false), "env off");
         assert!(!igpu_moe_wmma_selected(IQ2_XS, MXFP4, true, "kwide", true), "blk.42");
