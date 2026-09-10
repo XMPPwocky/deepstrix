@@ -201,7 +201,37 @@ stream_u16/load_u16).
   existing disk-cap LRU.
 - `n_kv_max` compatibility (`:1073-1082`) unchanged: row counts, not bytes.
 
-### Step 5 — in-window verification and ship — PENDING (needs the server down)
+### Step 5 — in-window verification and ship — DONE 2026-09-10 01:25-01:52
+
+Results (UD-IQ3_XXS Vision-Exp, K=15, 192K, binary 9a24678):
+- `fp8_kv_store_ab_one_load`: BIT-IDENTICAL logits packed vs f16 on prefill and 24
+  decode steps at T=3000 (sparse) and T=200 (dense); same-store control 0.0. 78 s.
+- decode `FAKE_POS=196000`: 41.05 ms/token packed vs 40.97 f16 (median) — noise.
+- prefill `FAKE_PREFILL_POS` 4K/96K/192K, 3 variants in-process: packed 716/702/668,
+  f16 727/703/671, packed-again 810/743/700 tok/s — see "bench regimes" below; the
+  store A/B is within noise in the slow regime and +1.3% in the fast one (830 vs 819 @4K).
+- dGPU at idle: 15494 -> 15027 MiB (-467 MiB); 1277 MiB free at K=15/192K before any
+  peak measurement.
+- real v3 snapshot (177K tokens, 931K ratio-4 rows): converts on the host in 8.9 s,
+  0 refusals, every row round-trips; 2848 stored -0.0 words (the sign-of-zero case).
+- server restarted; 94 v3 snapshots indexed; fresh request, v4 system-prefix save,
+  and v4 restore all correct.
+
+**Bench regimes (found in this window, affects every FAKE_*POS number).** With a
+192K-sized state the first two variants of a run measure ~715 tok/s @4K and the
+third and later ~810, every time, regardless of store; with a 4K-sized state every
+variant measures ~830. dGPU GTT stays at 20 MiB (no host spill) and VRAM use is
+identical across the phases. The gap shrinks with depth (170 ms/chunk @4K, 70 ms
+@192K), i.e. the iGPU MoE leg is what differs — consistent with a DATA effect: the
+stamped-but-unwritten KV rows hold whatever the (re)allocated memory contained, the
+attention output over them changes the hidden states, and therefore the routing
+distribution the batched MoE kernels see. The production figure (736 @4K, real
+prompts) sits at the slow regime. Consequences: (1) compare variants only within one
+regime / one process (the existing back-to-back rule); (2) absolute FAKE_*POS numbers
+carry a ±12% data-dependent term; (3) a bench mode that restores a REAL snapshot to
+the target depth (the server's save/restore already exists) would remove it. The
+threshold top-k's degenerate-cluster fallback is a second data-dependent term but only
+above 16K depth.
 
 Each weight load is ~2 min; keep it to two (one oracle process, then the server).
 1. `fp8_kv_store_ab_one_load` (forward_prompt_batch_matches_sequential.rs): packed vs
@@ -220,6 +250,8 @@ Each weight load is ~2 min; keep it to two (one oracle process, then the server)
    use (log line `snapshot.restore: converted compressed-KV encoding`); smoke a
    restored session and a fresh one. Spend the freed VRAM per the section below.
 Rollback: `COMP_KV_FP8=0` in the run script (no rebuild), or the parent commit.
+The v3 acceptance path can be deleted (owner's call, 2026-09-10: old cache entries
+may simply be evicted); it is kept because it is proven and free.
 
 No runtime toggle (as the plan says): a format that fails an oracle does not ship.
 Rollback is the parent commit.
