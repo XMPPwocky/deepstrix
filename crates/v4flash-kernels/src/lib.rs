@@ -32,6 +32,7 @@ pub(crate) const fn parse_u32_dec(s: &str) -> u32 {
 pub mod attention;
 pub mod broadcast;
 pub mod comp_kv_append;
+pub mod comp_kv_fp8;
 pub mod compressor;
 pub mod config;
 pub mod f16;
@@ -86,6 +87,7 @@ pub mod wmma_wsum;
 pub use attention::{AttentionMixed, AttentionSwa, ATTN_MIXED_MAX_KEYS, ATTN_SCORES_STRIDE, ATTN_SWA_BATCHED_MAX_KV, ATTN_SWA_MAX_KV};
 pub use broadcast::BroadcastToHc;
 pub use comp_kv_append::CompKvAppend;
+pub use comp_kv_fp8::{CompKvFp8, FP8_KV_HEAD_ROWS, FP8_KV_ROW_BYTES};
 pub use compressor::{
     CompressorPool, CompressorStateShuffleR4, CompressorStateSnapshot, CompressorStateWrite,
     F16Roundtrip, Fp8E4m3fnQuantize,
