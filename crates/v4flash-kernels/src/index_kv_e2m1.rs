@@ -173,6 +173,34 @@ impl IndexKvE2m1 {
         launch_kernel!(function, cfg, stream, [out.raw()])
     }
 
+    /// Test kernel: the fast 8-nibble expansion (`e2m1_key_expand8`, the
+    /// score kernels' path) versus the general per-nibble expansion, for
+    /// every word in `words` at every `e in e_lo..e_lo+n_e`. Outputs are
+    /// `[n_e * n_words * 4]` u32 (four u32 = eight f16 per (e, word)).
+    pub fn launch_expand8_check(
+        &self,
+        stream: &Stream,
+        out_fast: &mut DeviceBuffer<u32>,
+        out_ref: &mut DeviceBuffer<u32>,
+        words: &DeviceBuffer<u32>,
+        e_lo: i32,
+        n_e: u32,
+    ) -> eyre::Result<()> {
+        let n_words = words.len() as u32;
+        let n = (n_e as usize) * (n_words as usize) * 4;
+        if out_fast.len() < n || out_ref.len() < n {
+            return Err(eyre!("e2m1_key_expand8_check: outputs need {n} slots"));
+        }
+        let function = self.module.get_function("e2m1_key_expand8_check")?;
+        let total = n_e * n_words;
+        let cfg = LaunchConfig {
+            grid: ((total + 255) / 256, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [out_fast.raw(), out_ref.raw(), words.raw(), n_words, e_lo, n_e])
+    }
+
     /// Test kernel: the device expand for every `(nibble, e)`,
     /// `e in e_lo..e_lo+n_e`, laid out `[(e - e_lo) * 16 + nibble]`.
     pub fn launch_expand_exhaustive(

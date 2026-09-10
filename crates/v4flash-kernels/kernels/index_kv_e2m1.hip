@@ -112,6 +112,9 @@ extern "C" __global__ void index_kv_e2m1_expand(
     const unsigned char * src = packed + (unsigned long long)r * E2M1_KEY_ROW_BYTES;
     const unsigned int byte = src[t];
     const int e = (int)(signed char)src[E2M1_KEY_OFF_EXP + (t >> 4)];   // element 2t is in block (2t)/32 = t/16
+    // General (float) path on purpose: this is the reference the fast
+    // byte-permute path (e2m1_key_expand8, used by the score kernels) is
+    // checked against.
     const unsigned int lo = e2m1_key_expand_half_bits(byte & 0xFu, e);
     const unsigned int hi = e2m1_key_expand_half_bits(byte >> 4, e);
     *reinterpret_cast<unsigned int *>(dst + (unsigned long long)r * E2M1_KEY_DIM + 2u * t) = lo | (hi << 16);
@@ -125,6 +128,34 @@ extern "C" __global__ void index_kv_e2m1_expand(
 extern "C" __global__ void e2m1_key_table_check(float * __restrict__ out_table) {
     const unsigned int i = threadIdx.x;
     if (i < 8u) out_table[i] = e2m1fn_value((int)i);
+}
+
+// The fast 8-nibble expansion versus the general per-nibble path: for
+// every e in [e_lo, e_lo + n_e) and every word in `words[n_words]`,
+// out_fast[(ei * n_words + wi) * 4 + j] = expand8(word, e).j and
+// out_ref[...] = the per-nibble general expansion packed the same way.
+extern "C" __global__ void e2m1_key_expand8_check(
+        unsigned int       * __restrict__ out_fast,
+        unsigned int       * __restrict__ out_ref,
+        const unsigned int * __restrict__ words,
+        unsigned int                      n_words,
+        int                               e_lo,
+        unsigned int                      n_e) {
+    const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= n_e * n_words) return;
+    const unsigned int wi = gid % n_words;
+    const int e = e_lo + (int)(gid / n_words);
+    const unsigned int w = words[wi];
+    const uint4 f = e2m1_key_expand8(w, e);
+    out_fast[gid * 4 + 0] = f.x; out_fast[gid * 4 + 1] = f.y; out_fast[gid * 4 + 2] = f.z; out_fast[gid * 4 + 3] = f.w;
+    unsigned int ref[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const unsigned int lo = e2m1_key_expand_half_bits((w >> (8 * j)) & 15u, e);
+        const unsigned int hi = e2m1_key_expand_half_bits((w >> (8 * j + 4)) & 15u, e);
+        ref[j] = lo | (hi << 16);
+    }
+    out_ref[gid * 4 + 0] = ref[0]; out_ref[gid * 4 + 1] = ref[1]; out_ref[gid * 4 + 2] = ref[2]; out_ref[gid * 4 + 3] = ref[3];
 }
 
 // out[(e - e_lo) * 16 + nib] = expand(nib, e) for e in [e_lo, e_lo + n_e).

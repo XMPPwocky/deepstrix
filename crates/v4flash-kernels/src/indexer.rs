@@ -139,6 +139,41 @@ impl IndexerScore {
             n_comp, n_head, head_dim
         ])
     }
+
+    /// [`IndexerScore::launch`] over a packed-E2M1 key cache
+    /// (`index_kv_e2m1`, 80-B rows, head_dim must be 128). Same math,
+    /// bit-identical scores.
+    pub fn launch_e2m1(
+        &self,
+        stream: &Stream,
+        scores: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        head_weights: &DeviceBuffer<f32>,
+        index_comp_kv: &DeviceBuffer<u8>,
+        n_comp: u32,
+        n_head: u32,
+        head_dim: u32,
+    ) -> eyre::Result<()> {
+        if n_comp == 0 {
+            return Err(eyre!("indexer_score_e2m1: n_comp must be > 0"));
+        }
+        if head_dim as usize != crate::index_kv_e2m1::E2M1_KEY_DIM {
+            return Err(eyre!("indexer_score_e2m1: head_dim must be 128, got {head_dim}"));
+        }
+        if index_comp_kv.len() < (n_comp as usize) * crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES {
+            return Err(eyre!("indexer_score_e2m1: packed keys too small for n_comp={n_comp}"));
+        }
+        let function = self.module.get_function("indexer_score_e2m1")?;
+        let cfg = LaunchConfig {
+            grid: (n_comp, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            scores.raw(), q.raw(), head_weights.raw(), index_comp_kv.raw(),
+            n_comp, n_head, head_dim
+        ])
+    }
 }
 
 /// WMMA-based variant of [`IndexerScore`]. Same math, identical I/O
@@ -253,6 +288,35 @@ impl IndexerScoreWmma {
         ])
     }
 
+    /// [`Self::launch_mw`] over a packed-E2M1 key cache (80-B rows).
+    /// Bit-identical scores (the B-fragments expand to the same f16).
+    pub fn launch_mw_e2m1(
+        &self,
+        stream: &Stream,
+        scores: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        head_weights: &DeviceBuffer<f32>,
+        index_comp_kv: &DeviceBuffer<u8>,
+        n_comp: u32,
+    ) -> eyre::Result<()> {
+        if n_comp == 0 {
+            return Err(eyre!("indexer_score_wmma_mw_e2m1: n_comp must be > 0"));
+        }
+        if index_comp_kv.len() < (n_comp as usize) * crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES {
+            return Err(eyre!("indexer_score_wmma_mw_e2m1: packed keys too small for n_comp={n_comp}"));
+        }
+        let function = self.module.get_function("indexer_score_wmma_mw_e2m1")?;
+        const COLS_PER_WG: u32 = 8 * 8 * 16; // 1024
+        let cfg = LaunchConfig {
+            grid: ((n_comp + COLS_PER_WG - 1) / COLS_PER_WG, 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            scores.raw(), q.raw(), head_weights.raw(), index_comp_kv.raw(), n_comp
+        ])
+    }
+
     /// **Multi-wave batched variant (M52)** — 8 waves/WG share one Q staging
     /// (the 1-wave kernel re-staged Q per 128 cols: ~6.3 GB redundant reads
     /// and a 4× staging-to-WMMA instruction ratio at 96K ctx); B-fragments
@@ -276,6 +340,40 @@ impl IndexerScoreWmma {
         }
         let function = self.module.get_function("indexer_score_wmma_batched_mw")?;
         // Must match ISWMW_WAVES × ISW_NT_PER_WG × ISW_N_TILE in the kernel.
+        const COLS_PER_WG: u32 = 8 * 8 * 16; // 1024
+        let n_chunks_x = (n_idx_max + COLS_PER_WG - 1) / COLS_PER_WG;
+        let cfg = LaunchConfig {
+            grid: (n_chunks_x, batch, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            scores.raw(), q.raw(), head_weights.raw(), index_comp_kv.raw(),
+            n_idx_per.raw(), n_idx_stride
+        ])
+    }
+
+    /// [`Self::launch_batched_mw`] over a packed-E2M1 key cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched_mw_e2m1(
+        &self,
+        stream: &Stream,
+        scores: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        head_weights: &DeviceBuffer<f32>,
+        index_comp_kv: &DeviceBuffer<u8>,
+        n_idx_per: &DeviceBuffer<u32>,
+        n_idx_max: u32,
+        n_idx_stride: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_idx_max == 0 {
+            return Ok(());
+        }
+        if index_comp_kv.len() < (n_idx_max as usize) * crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES {
+            return Err(eyre!("indexer_score_wmma_batched_mw_e2m1: packed keys too small for n_idx_max={n_idx_max}"));
+        }
+        let function = self.module.get_function("indexer_score_wmma_batched_mw_e2m1")?;
         const COLS_PER_WG: u32 = 8 * 8 * 16; // 1024
         let n_chunks_x = (n_idx_max + COLS_PER_WG - 1) / COLS_PER_WG;
         let cfg = LaunchConfig {
@@ -326,6 +424,54 @@ impl IndexerScoreWmma {
         let span = n_tiles.div_ceil(n_splits) * TILE;
         let n_splits = n_idx_stride.div_ceil(span);
         let function = self.module.get_function("indexer_score_wmma_gemm")?;
+        let cfg = LaunchConfig {
+            grid: (n_splits, groups, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            scores.raw(), q16.raw(), head_weights.raw(), index_comp_kv.raw(),
+            n_idx_per.raw(), n_idx_stride, n_idx_max, batch, span
+        ])
+    }
+
+    /// [`Self::launch_batched_gemm`] over a packed-E2M1 key cache (80-B
+    /// rows; the 64-row K tiles expand to f16 at LDS publish). Same split
+    /// arithmetic, bit-identical scores.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched_gemm_e2m1(
+        &self,
+        stream: &Stream,
+        scores: &mut DeviceBuffer<f32>,
+        q16: &DeviceBuffer<u16>,
+        head_weights: &DeviceBuffer<f32>,
+        index_comp_kv: &DeviceBuffer<u8>,
+        n_idx_per: &DeviceBuffer<u32>,
+        n_idx_max: u32,
+        n_idx_stride: u32,
+        batch: u32,
+        n_splits: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_idx_max == 0 {
+            return Ok(());
+        }
+        if q16.len() < (batch as usize) * 64 * 128 {
+            return Err(eyre!("indexer gemm e2m1: q16 too small for batch={batch}"));
+        }
+        if index_comp_kv.len() < (n_idx_max as usize) * crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES {
+            return Err(eyre!("indexer gemm e2m1: packed keys too small for n_idx_max={n_idx_max}"));
+        }
+        const TILE: u32 = 64; // ISG_TILE_ROWS
+        let groups = batch.div_ceil(8);
+        let n_tiles = n_idx_stride.div_ceil(TILE).max(1);
+        let n_splits = if n_splits == 0 {
+            (256u32.div_ceil(groups)).clamp(1, n_tiles)
+        } else {
+            n_splits.clamp(1, n_tiles)
+        };
+        let span = n_tiles.div_ceil(n_splits) * TILE;
+        let n_splits = n_idx_stride.div_ceil(span);
+        let function = self.module.get_function("indexer_score_wmma_gemm_e2m1")?;
         let cfg = LaunchConfig {
             grid: (n_splits, groups, 1),
             block: (256, 1, 1),

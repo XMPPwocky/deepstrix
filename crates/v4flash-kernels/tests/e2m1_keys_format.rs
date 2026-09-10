@@ -181,6 +181,48 @@ fn table_and_exhaustive(k: &Kernels, dev: i32, stream: &Stream) -> eyre::Result<
         return Err(eyre!("host reference vs device expand: {bad} mismatches"));
     }
     println!("  host reference == device expand for all {n} (nibble, e) over the i8 field");
+
+    // The fast byte-permute path (what the score kernels use) vs the general
+    // path: every nibble value at every one of the 8 positions (others zero,
+    // and others all-ones), plus random words, at every e in the i8 field.
+    let mut words: Vec<u32> = Vec::new();
+    for pos in 0..8 {
+        for v in 0..16u32 {
+            words.push(v << (4 * pos));
+            words.push((v << (4 * pos)) | (0xFFFF_FFFFu32 & !(0xFu32 << (4 * pos))));
+        }
+    }
+    let mut seed = 0x1357_9BDF_2468_ACE0u64;
+    for _ in 0..768 {
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        words.push(seed as u32);
+    }
+    let n_words = words.len();
+    let mut dw = DeviceBuffer::<u32>::new(dev, n_words)?;
+    dw.copy_from_host(&words)?;
+    let n_out = 256 * n_words * 4;
+    let mut fast = DeviceBuffer::<u32>::new(dev, n_out)?;
+    let mut refd = DeviceBuffer::<u32>::new(dev, n_out)?;
+    k.new.launch_expand8_check(stream, &mut fast, &mut refd, &dw, -128, 256)?;
+    stream.synchronize()?;
+    let mut fh = vec![0u32; n_out];
+    let mut rh = vec![0u32; n_out];
+    fast.copy_to_host(&mut fh)?;
+    refd.copy_to_host(&mut rh)?;
+    let mut bad = 0;
+    for i in 0..n_out {
+        if fh[i] != rh[i] {
+            bad += 1;
+            if bad <= 8 {
+                let g = i / 4;
+                eprintln!("  FAST word {:#010x} e {} lane {}: fast {:#010x} ref {:#010x}", words[g % n_words], -128 + (g / n_words) as i32, i % 4, fh[i], rh[i]);
+            }
+        }
+    }
+    if bad != 0 {
+        return Err(eyre!("fast expand8 vs general: {bad} mismatches"));
+    }
+    println!("  fast byte-permute expand8 == general path for {n_words} words x 256 exponents ({} f16)", n_out * 2);
     Ok(())
 }
 
