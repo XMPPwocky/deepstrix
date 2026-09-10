@@ -40,7 +40,8 @@ use super::batch_scratch::{
 use super::engine::HeterogeneousEngine;
 use super::prefill_stats::PrefillStats;
 use super::scratch::{DgpuScratch, IgpuScratch};
-use super::state::{HetLayerState, HetModelState, KV_CACHE_ROWS};
+use super::state::{CompKvStore, HetLayerState, HetModelState, KV_CACHE_ROWS};
+use crate::comp_kv_fp8::FP8_KV_HEAD_ROWS;
 use super::sync::{peer_push_f32, peer_push_i32};
 use super::weights::{DgpuLayerWeights, HetModelWeights, IgpuLayerWeights};
 
@@ -1479,26 +1480,43 @@ impl HeterogeneousEngine {
                         &dlw.rope_params,
                     )?;
                 }
-                de.fp8.launch_batched(
-                    &de.compute,
-                    &mut sd.comp_rows_batched,
-                    N_HEAD_DIM - N_ROT,
-                    N_HEAD_DIM,
-                    n_boundaries,
-                )?;
-                de.f16rt.launch(
-                    &de.compute,
-                    &mut sd.comp_rows_batched,
-                    n_boundaries * N_HEAD_DIM,
-                )?;
-                de.comp_kv_append.launch_batched(
-                    &de.compute,
-                    &mut cs.comp_kv,
-                    &sd.comp_rows_batched,
-                    n_comp_start,
-                    N_HEAD_DIM,
-                    n_boundaries,
-                )?;
+                match &mut cs.comp_kv {
+                    CompKvStore::F16(buf) => {
+                        de.fp8.launch_batched(
+                            &de.compute,
+                            &mut sd.comp_rows_batched,
+                            N_HEAD_DIM - N_ROT,
+                            N_HEAD_DIM,
+                            n_boundaries,
+                        )?;
+                        de.f16rt.launch(
+                            &de.compute,
+                            &mut sd.comp_rows_batched,
+                            n_boundaries * N_HEAD_DIM,
+                        )?;
+                        de.comp_kv_append.launch_batched(
+                            &de.compute,
+                            buf,
+                            &sd.comp_rows_batched,
+                            n_comp_start,
+                            N_HEAD_DIM,
+                            n_boundaries,
+                        )?;
+                    }
+                    // Packed store: quantise + pack + head-shadow write in
+                    // one launch (replaces fp8 -> f16rt -> append).
+                    CompKvStore::Fp8 { rows, head } => {
+                        de.comp_kv_fp8.launch_append_batched(
+                            &de.compute,
+                            rows,
+                            head,
+                            &sd.comp_rows_batched,
+                            n_comp_start,
+                            n_boundaries,
+                            FP8_KV_HEAD_ROWS as u32,
+                        )?;
+                    }
+                }
             }
         } else {
             for _ in 0..b {
@@ -1686,7 +1704,9 @@ impl HeterogeneousEngine {
                 )?;
                 de.comp_kv_append.launch_batched(
                     &de.compute,
-                    &mut ics.comp_kv,
+                    ics.comp_kv
+                        .f16_mut()
+                        .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16"))?,
                     &sd.comp_rows_batched,
                     n_idx_comp_start,
                     ihd,
@@ -1763,13 +1783,38 @@ impl HeterogeneousEngine {
         } else {
             let cs = ls.compressor.as_ref();
             let any_comp = n_comp_after.iter().any(|&v| v > 0);
-            let comp_kv_buf = if any_comp { cs.map(|c| &c.comp_kv) } else { None };
             let n_total_max = n_raw_after
                 .iter()
                 .zip(n_comp_after.iter())
                 .map(|(&r, &c)| r + c)
                 .max()
                 .unwrap_or(0);
+            // Dense (non-indexer) attention reads rows [0, max n_comp_after)
+            // straight from the cache: the f16 buffer, or the FP8 store's
+            // f16 head shadow. Only consulted when the indexer does not
+            // fire for this chunk (all tokens <= INDEXER_TOP_K comp rows),
+            // which is exactly what the shadow covers; `dense_f16` errors
+            // otherwise instead of reading past it.
+            let comp_kv_buf = if any_comp {
+                match cs {
+                    Some(c) => {
+                        let max_comp = n_comp_after.iter().copied().max().unwrap_or(0);
+                        // Mirrors `need_mask` below exactly.
+                        let dense_needed = !(ratio == 4
+                            && ls.indexer_compressor.is_some()
+                            && max_comp > INDEXER_TOP_K);
+                        if dense_needed {
+                            Some(c.comp_kv.dense_f16(max_comp, &format!("L{layer} prefill"))?)
+                        } else {
+                            // The indexer fires below; dense buffer unused.
+                            None
+                        }
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
             // Always use the batched split (scores in global, per-row grid,
             // wave-parallel softmax, 16-way ILP wsum). The old monolithic
             // `launch_batched` (LDS scores[2304], used below n_total≤2304) was
@@ -1929,7 +1974,9 @@ impl HeterogeneousEngine {
                             &mut sd.indexer_scores,
                             &sd.indexer_q16,
                             &sd.indexer_head_weights,
-                            &ics.comp_kv,
+                            ics.comp_kv
+                                .f16()
+                                .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16"))?,
                             &sd.n_index_comp_per_b,
                             n_idx_max,
                             ATTN_MIXED_MAX_KEYS,
@@ -1942,7 +1989,9 @@ impl HeterogeneousEngine {
                             &mut sd.indexer_scores,
                             &sd.indexer_q,
                             &sd.indexer_head_weights,
-                            &ics.comp_kv,
+                            ics.comp_kv
+                                .f16()
+                                .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16"))?,
                             &sd.n_index_comp_per_b,
                             n_idx_max,
                             ATTN_MIXED_MAX_KEYS,
@@ -1954,7 +2003,9 @@ impl HeterogeneousEngine {
                             &mut sd.indexer_scores,
                             &sd.indexer_q,
                             &sd.indexer_head_weights,
-                            &ics.comp_kv,
+                            ics.comp_kv
+                                .f16()
+                                .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16"))?,
                             &sd.n_index_comp_per_b,
                             n_idx_max,
                             ATTN_MIXED_MAX_KEYS,
@@ -1992,15 +2043,27 @@ impl HeterogeneousEngine {
                         .compressor
                         .as_ref()
                         .ok_or_else(|| eyre!("L{layer}: missing compressor state for gather"))?;
-                    de.indexer_gather.launch_batched(
-                        &de.compute,
-                        &mut sd.attn_active_comp_kv,
-                        &cs_ref.comp_kv,
-                        &sd.indexer_selected,
-                        INDEXER_TOP_K,
-                        N_HEAD_DIM,
-                        b,
-                    )?;
+                    match &cs_ref.comp_kv {
+                        CompKvStore::F16(buf) => de.indexer_gather.launch_batched(
+                            &de.compute,
+                            &mut sd.attn_active_comp_kv,
+                            buf,
+                            &sd.indexer_selected,
+                            INDEXER_TOP_K,
+                            N_HEAD_DIM,
+                            b,
+                        )?,
+                        // Packed store: expand FP8 -> f16 on the way into
+                        // attn_active_comp_kv; attention is unchanged.
+                        CompKvStore::Fp8 { rows, .. } => de.comp_kv_fp8.launch_gather_batched(
+                            &de.compute,
+                            &mut sd.attn_active_comp_kv,
+                            rows,
+                            &sd.indexer_selected,
+                            INDEXER_TOP_K,
+                            b,
+                        )?,
+                    }
                 }
                 // Re-upload sparse n_comp_per (= min(actual, INDEXER_TOP_K))
                 // so score+smwsum iterate only over the gathered top-K rows.

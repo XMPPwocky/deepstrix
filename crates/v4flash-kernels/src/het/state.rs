@@ -7,6 +7,7 @@
 use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer};
 
+use crate::comp_kv_fp8::{FP8_KV_HEAD_ROWS, FP8_KV_ROW_BYTES};
 use crate::config::{COMPRESS_RATIOS, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, NEG_INF, SWA_WINDOW};
 use crate::het::batch_scratch::B_MAX;
 
@@ -16,6 +17,94 @@ use crate::het::batch_scratch::B_MAX;
 /// — see the n_raw_offset_per attention parameter in forward_prefill.rs.
 /// Outside of prefill chunks only the first SWA_WINDOW rows are used.
 pub const KV_CACHE_ROWS: usize = SWA_WINDOW as usize + B_MAX;
+
+/// Storage of a compressor's cumulative pooled cache.
+///
+/// `F16`: `[n_comp_max, head_dim]` f16 (held as `u16`) — the ratio-128
+/// main compressors (tiny caches, read directly by the dense path) and
+/// the indexer compressors (head_dim 128; lever 3 of the VRAM plan).
+///
+/// `Fp8`: the ratio-4 main compressors. `rows` holds packed
+/// [`FP8_KV_ROW_BYTES`]-byte rows (E4M3 codes + block exponents + f16 RoPE
+/// tail, `comp_kv_fp8.rs`), bit-identical to the f16 rows after expansion;
+/// `head` is an f16 shadow of rows `[0, FP8_KV_HEAD_ROWS)` that the dense
+/// attention path reads in place of the old full f16 cache (the dense path
+/// is only taken while `n_comp <= INDEXER_TOP_K == FP8_KV_HEAD_ROWS`).
+/// The sparse path expands selected rows into `active_comp_kv` via
+/// `indexer_gather_fp8`, so the attention kernels never see the packed
+/// format. -42% on the compressed cache (0.42 GiB at 192K).
+pub enum CompKvStore {
+    F16(DeviceBuffer<u16>),
+    Fp8 {
+        rows: DeviceBuffer<u8>,
+        head: DeviceBuffer<u16>,
+    },
+}
+
+impl CompKvStore {
+    /// Whether the packed format is selected for the ratio-4 main
+    /// compressor. Read once per allocation. `COMP_KV_FP8=0` keeps the
+    /// f16 cache: a rollback / in-process A-B knob, not a tuning
+    /// parameter (every consumer dispatches on the variant, so both are
+    /// always correct; snapshots convert either way on restore).
+    pub fn fp8_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("COMP_KV_FP8")
+                .map(|v| !(v == "0" || v.eq_ignore_ascii_case("off")))
+                .unwrap_or(true)
+        });
+        *ON
+    }
+
+    pub fn is_fp8(&self) -> bool {
+        matches!(self, CompKvStore::Fp8 { .. })
+    }
+
+    /// The f16 buffer of an `F16` store.
+    pub fn f16(&self) -> Option<&DeviceBuffer<u16>> {
+        match self {
+            CompKvStore::F16(b) => Some(b),
+            CompKvStore::Fp8 { .. } => None,
+        }
+    }
+
+    pub fn f16_mut(&mut self) -> Option<&mut DeviceBuffer<u16>> {
+        match self {
+            CompKvStore::F16(b) => Some(b),
+            CompKvStore::Fp8 { .. } => None,
+        }
+    }
+
+    /// The f16 buffer the DENSE attention path reads rows `[0, n_comp)`
+    /// from: the whole cache for `F16`, the head shadow for `Fp8`. Errors
+    /// (rather than reading past the shadow) when the caller's `n_comp`
+    /// exceeds what the shadow holds — the `DECODE_INDEXER=off`-at-depth
+    /// and FAKE_POS-overrun cases.
+    pub fn dense_f16(&self, n_comp: u32, what: &str) -> eyre::Result<&DeviceBuffer<u16>> {
+        match self {
+            CompKvStore::F16(b) => Ok(b),
+            CompKvStore::Fp8 { head, .. } => {
+                if n_comp as usize > FP8_KV_HEAD_ROWS {
+                    return Err(eyre::eyre!(
+                        "{what}: dense attention over {n_comp} compressed rows but the FP8 \
+                         cache keeps only {FP8_KV_HEAD_ROWS} f16 rows for the dense path \
+                         (sparse/indexer path required above INDEXER_TOP_K; \
+                         DECODE_INDEXER=off is unsupported at this depth)"
+                    ));
+                }
+                Ok(head)
+            }
+        }
+    }
+
+    /// Row capacity of the store.
+    pub fn capacity_rows(&self, head_dim: u32) -> usize {
+        match self {
+            CompKvStore::F16(b) => b.len() / head_dim as usize,
+            CompKvStore::Fp8 { rows, .. } => rows.len() / FP8_KV_ROW_BYTES,
+        }
+    }
+}
 
 /// Per-layer compressor state. All buffers live on the dGPU: the
 /// compressor kernels run alongside attn_input_norm on dGPU, so
@@ -27,10 +116,10 @@ pub struct HetCompressorState {
     pub state_kv: DeviceBuffer<f32>,
     pub state_score: DeviceBuffer<f32>,
     /// dGPU-resident: cumulative pooled comp-KV cache consumed by
-    /// `attn_mixed`. Stored as f16 (held as u16) — V values come out of
-    /// the compressor as f32, get cast at the comp_kv_append store,
-    /// halving DRAM bw for the dominant V-read cost in long-context attention.
-    pub comp_kv: DeviceBuffer<u16>,
+    /// `attn_mixed`. See [`CompKvStore`] for the two storage formats;
+    /// values come out of the compressor as f32 and are cast (or packed)
+    /// at the append.
+    pub comp_kv: CompKvStore,
     pub n_comp: u32,
     pub width: u32,
     pub head_dim: u32,
@@ -61,8 +150,15 @@ impl HetCompressorState {
         // comp_kv on dGPU.
         dgpu_device.set_current()?;
         let max_n_comp = (n_kv_max + ratio - 1) / ratio;
-        let comp_kv_capacity = (max_n_comp as usize) * (head_dim as usize);
-        let comp_kv: DeviceBuffer<u16> = DeviceBuffer::new(dgpu_device.id, comp_kv_capacity)?;
+        let comp_kv = if ratio == 4 && head_dim == N_HEAD_DIM && CompKvStore::fp8_enabled() {
+            CompKvStore::Fp8 {
+                rows: DeviceBuffer::new(dgpu_device.id, (max_n_comp as usize) * FP8_KV_ROW_BYTES)?,
+                head: DeviceBuffer::new(dgpu_device.id, FP8_KV_HEAD_ROWS * (head_dim as usize))?,
+            }
+        } else {
+            let comp_kv_capacity = (max_n_comp as usize) * (head_dim as usize);
+            CompKvStore::F16(DeviceBuffer::new(dgpu_device.id, comp_kv_capacity)?)
+        };
         Ok(Self {
             state_kv,
             state_score,

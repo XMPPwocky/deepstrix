@@ -12,6 +12,7 @@ use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer, Event, Stream};
 
 use super::graph_cache::GraphCache;
+use super::state::CompKvStore;
 
 use crate::config::N_LAYER;
 
@@ -142,6 +143,9 @@ pub struct DeviceEngine {
     pub f16rt: F16Roundtrip,
     pub kv_append: KvCacheAppend,
     pub comp_kv_append: CompKvAppend,
+    /// Packed-FP8 compressed-KV producer / gather / expand (ratio-4 main
+    /// compressors, see `CompKvStore`).
+    pub comp_kv_fp8: crate::CompKvFp8,
     pub router_topk: RouterTopk,
     /// CSA indexer kernels (used only on the dGPU's ratio==4 layers, but
     /// instantiated unconditionally so the engine struct stays symmetric).
@@ -228,6 +232,7 @@ impl DeviceEngine {
             f16rt: F16Roundtrip::for_arch(arch)?,
             kv_append: KvCacheAppend::for_arch(arch)?,
             comp_kv_append: CompKvAppend::for_arch(arch)?,
+            comp_kv_fp8: crate::CompKvFp8::for_arch(arch)?,
             router_topk: RouterTopk::for_arch(arch)?,
             indexer_qat: crate::IndexerQat::for_arch(arch)?,
             indexer_score: crate::IndexerScore::for_arch(arch)?,
@@ -516,9 +521,26 @@ impl HeterogeneousEngine {
                 let head_dim = crate::config::N_HEAD_DIM as usize;
                 if let Some(comp) = &state.layers[layer].compressor {
                     let n_comp_elems = (comp.n_comp as usize) * head_dim;
-                    maybe_dump_subtensor_f16_as_f32(
-                        layer, "attn_comp_kv", &comp.comp_kv, n_comp_elems
-                    )?;
+                    match &comp.comp_kv {
+                        CompKvStore::F16(buf) => {
+                            maybe_dump_subtensor_f16_as_f32(
+                                layer, "attn_comp_kv", buf, n_comp_elems
+                            )?;
+                        }
+                        CompKvStore::Fp8 { rows, .. } => {
+                            // Expand through the production kernel so the
+                            // dump is exactly what attention would gather.
+                            let mut tmp: DeviceBuffer<u16> =
+                                DeviceBuffer::new(self.dgpu.device.id, n_comp_elems.max(head_dim))?;
+                            self.dgpu.comp_kv_fp8.launch_expand(
+                                &self.dgpu.compute, &mut tmp, rows, comp.n_comp,
+                            )?;
+                            self.dgpu.compute.synchronize()?;
+                            maybe_dump_subtensor_f16_as_f32(
+                                layer, "attn_comp_kv", &tmp, n_comp_elems
+                            )?;
+                        }
+                    }
                 }
                 let n_raw_elems = (state.layers[layer].n_raw as usize) * head_dim;
                 // M55: live window starts at raw_off (monotonic append).

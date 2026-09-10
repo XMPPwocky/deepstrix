@@ -467,3 +467,7 @@ mod tests {
         assert_eq!(code_for_half(0x0000, -5), Some(0x00));
     }
 }
+
+// The dense attention path is taken only while `n_comp <= INDEXER_TOP_K`;
+// the head shadow must cover exactly that.
+const _: () = assert!(FP8_KV_HEAD_ROWS == crate::config::INDEXER_TOP_K as usize);

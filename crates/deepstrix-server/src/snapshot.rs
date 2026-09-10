@@ -28,6 +28,11 @@ use v4flash_hip::Device;
 use v4flash_kernels::config::{COMPRESS_RATIOS, N_HEAD_DIM, N_LAYER, NEG_INF, SWA_WINDOW};
 use v4flash_kernels::het::HetModelState;
 
+use v4flash_kernels::comp_kv_fp8::{
+    pack_row_from_f16_host, unpack_row_host, FP8_KV_HEAD_DIM, FP8_KV_HEAD_ROWS, FP8_KV_ROW_BYTES,
+};
+use v4flash_kernels::het::state::CompKvStore;
+
 use crate::embed::gpt2_decode_token;
 use crate::vision_prompt::{span_hash_at, synthetic_token_bytes, ImageSpan};
 
@@ -39,7 +44,28 @@ use crate::vision_prompt::{span_hash_at, synthetic_token_bytes, ImageSpan};
 // index_comp_state.bin blobs. v2 snapshots get evicted at startup since
 // they lack the indexer state needed for correct ratio==4 attention at
 // long context.
-const FORMAT_VERSION: u32 = 3;
+// v3 → v4: per-layer `comp_kv_format` / `comp_kv_row_bytes` (the ratio-4
+// main compressors store packed FP8 rows, `comp_kv_fp8.rs`; -42% on
+// comp_kv.bin). v3 snapshots stay READABLE: their f16 rows are converted
+// on restore (exact — the f16 cache was already E4M3-rounded; a row that
+// does not round-trip bit-for-bit refuses the snapshot) and the next save
+// rewrites them as v4.
+const FORMAT_VERSION: u32 = 4;
+/// Oldest format `restore` accepts (converted on the fly).
+const MIN_FORMAT_VERSION: u32 = 3;
+
+/// On-disk encoding of one compressor's `comp_kv` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CompKvFormat {
+    /// `[n_comp, head_dim]` f16 little-endian (v3, and the ratio-128 /
+    /// indexer compressors in v4).
+    #[default]
+    F16,
+    /// Packed rows of `FP8_KV_ROW_BYTES` (E4M3 codes, block exponents,
+    /// f16 RoPE tail) — `v4flash_kernels::comp_kv_fp8`.
+    Fp8E4m3B64,
+}
 
 /// Decode a token-id sequence to the raw byte stream the model would
 /// see at the surface level. Used for snapshot keys + byte-level
@@ -165,6 +191,14 @@ pub struct PerLayerMeta {
     pub index_head_dim: u32,
     #[serde(default)]
     pub index_state_rows: u32,
+    /// v4: encoding of this layer's main-compressor rows in comp_kv.bin.
+    /// Absent (v3) = f16.
+    #[serde(default)]
+    pub comp_kv_format: CompKvFormat,
+    /// v4: bytes per row in comp_kv.bin for this layer (0 = `head_dim * 2`
+    /// f16).
+    #[serde(default)]
+    pub comp_kv_row_bytes: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,11 +338,12 @@ impl SnapshotIndex {
                 tracing::warn!(path = ?path, "snapshot meta.json unparseable; skipping");
                 continue;
             };
-            if meta.format_version != FORMAT_VERSION {
+            if meta.format_version < MIN_FORMAT_VERSION || meta.format_version > FORMAT_VERSION {
                 tracing::warn!(
                     path = ?path,
                     saw = meta.format_version,
                     want = FORMAT_VERSION,
+                    min = MIN_FORMAT_VERSION,
                     "snapshot format mismatch; skipping"
                 );
                 continue;
@@ -374,6 +409,12 @@ impl SnapshotIndex {
     /// Fully remove one snapshot: drop it from every index, subtract its
     /// bytes, and delete its on-disk dir. Central path for both eviction
     /// rules so the maps never drift.
+    /// Drop one snapshot (index entry + directory), e.g. after a failed
+    /// restore, so the next matching request does not re-read it.
+    pub fn evict(&mut self, hash: &[u8; 32], reason: &str) {
+        self.remove_entry(hash, reason);
+    }
+
     fn remove_entry(&mut self, hash: &[u8; 32], reason: &str) {
         let Some(entry) = self.by_hash.remove(hash) else {
             return;
@@ -714,6 +755,20 @@ impl SaveScratch {
         }
         out.write(&self.bytes)
     }
+    /// Copy `n` leading bytes of `buf` to the host and append them to `out`.
+    fn stream_u8(
+        &mut self,
+        buf: &v4flash_hip::DeviceBuffer<u8>,
+        n: usize,
+        out: &mut BlobWriter,
+    ) -> eyre::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        self.bytes.resize(n, 0);
+        buf.slice_view(0, n).copy_to_host(&mut self.bytes[..n])?;
+        out.write(&self.bytes[..n])
+    }
     fn stream_f32(
         &mut self,
         buf: &v4flash_hip::DeviceBuffer<f32>,
@@ -808,6 +863,32 @@ impl RestoreScratch {
         }
         dst.slice_view_mut(0, n).copy_from_host(&self.u16s[..n])
     }
+    /// Read `n` bytes from `src` straight into the first `n` bytes of `dst`.
+    fn load_u8(
+        &mut self,
+        src: &mut BlobReader,
+        n: usize,
+        dst: &mut v4flash_hip::DeviceBuffer<u8>,
+    ) -> eyre::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        self.bytes.resize(n, 0);
+        src.read_exact(&mut self.bytes[..n])?;
+        dst.slice_view_mut(0, n).copy_from_host(&self.bytes[..n])
+    }
+    /// Read `n` little-endian u16 into `self.u16s[..n]` (host only).
+    fn read_u16_host(&mut self, src: &mut BlobReader, n: usize) -> eyre::Result<()> {
+        self.bytes.resize(n * 2, 0);
+        src.read_exact(&mut self.bytes[..n * 2])?;
+        if self.u16s.len() < n {
+            self.u16s.resize(n, 0);
+        }
+        for (i, c) in self.bytes[..n * 2].chunks_exact(2).enumerate() {
+            self.u16s[i] = u16::from_le_bytes([c[0], c[1]]);
+        }
+        Ok(())
+    }
     fn load_f32(
         &mut self,
         src: &mut BlobReader,
@@ -890,15 +971,30 @@ pub fn save(
         let kv_used_n = (kv_rows as usize) * (N_HEAD_DIM as usize);
         scratch.stream_u16(&layer.kv_cache, kv_used_n, &mut kv_blob)?;
 
+        let mut comp_kv_format = CompKvFormat::F16;
+        let mut comp_kv_row_bytes = 0u32;
         let (has_compressor, n_comp, width, head_dim, state_rows, coff) = if let Some(comp) =
             &layer.compressor
         {
             let coff_local = if ratio == 4 { 2u32 } else { 1u32 };
             let state_rows = ratio * coff_local;
-            // comp_kv on dGPU — live prefix only, streamed.
+            // comp_kv on dGPU — live prefix only, streamed, in the
+            // store's native encoding (no re-encoding on save).
             dgpu.set_current()?;
-            let ck_used_n = (comp.n_comp as usize) * (comp.head_dim as usize);
-            scratch.stream_u16(&comp.comp_kv, ck_used_n, &mut comp_kv_blob)?;
+            match &comp.comp_kv {
+                CompKvStore::F16(buf) => {
+                    let ck_used_n = (comp.n_comp as usize) * (comp.head_dim as usize);
+                    scratch.stream_u16(buf, ck_used_n, &mut comp_kv_blob)?;
+                    comp_kv_format = CompKvFormat::F16;
+                    comp_kv_row_bytes = comp.head_dim * 2;
+                }
+                CompKvStore::Fp8 { rows, .. } => {
+                    let ck_used_b = (comp.n_comp as usize) * FP8_KV_ROW_BYTES;
+                    scratch.stream_u8(rows, ck_used_b, &mut comp_kv_blob)?;
+                    comp_kv_format = CompKvFormat::Fp8E4m3B64;
+                    comp_kv_row_bytes = FP8_KV_ROW_BYTES as u32;
+                }
+            }
             // state_kv + state_score on iGPU — these ARE allocated at
             // exactly state_rows*width so no slicing needed.
             let n_state = comp.state_kv.len();
@@ -932,7 +1028,11 @@ pub fn save(
             let state_rows = ratio * coff_local;
             dgpu.set_current()?;
             let ck_used_n = (icomp.n_comp as usize) * (icomp.head_dim as usize);
-            scratch.stream_u16(&icomp.comp_kv, ck_used_n, &mut index_comp_kv_blob)?;
+            let ibuf = icomp
+                .comp_kv
+                .f16()
+                .ok_or_else(|| eyre!("snapshot.save: layer {li} indexer store must be f16"))?;
+            scratch.stream_u16(ibuf, ck_used_n, &mut index_comp_kv_blob)?;
             let n_state = icomp.state_kv.len();
             scratch.stream_f32(&icomp.state_kv, n_state, &mut index_comp_state_blob)?;
             scratch.stream_f32(&icomp.state_score, n_state, &mut index_comp_state_blob)?;
@@ -964,6 +1064,8 @@ pub fn save(
             index_width,
             index_head_dim,
             index_state_rows,
+            comp_kv_format,
+            comp_kv_row_bytes,
         });
     }
     // Restore dgpu as current (callers expect that).
@@ -1024,8 +1126,19 @@ pub fn restore(
     dgpu: Device,
     igpu: Device,
     fingerprint: &ModelFingerprint,
+    fp8: RestoreKernels<'_>,
 ) -> eyre::Result<Vec<i32>> {
-    restore_vl(state, src, dgpu, igpu, fingerprint).map(|r| r.tokens)
+    restore_vl(state, src, dgpu, igpu, fingerprint, fp8).map(|r| r.tokens)
+}
+
+/// Device-side helpers `restore` needs for the packed-FP8 compressed-KV
+/// store: the expand kernel (head-shadow rebuild) and the dGPU stream to
+/// run it on. Both live in the engine (`engine.dgpu.comp_kv_fp8`,
+/// `engine.dgpu.compute`).
+#[derive(Clone, Copy)]
+pub struct RestoreKernels<'a> {
+    pub fp8: &'a v4flash_kernels::CompKvFp8,
+    pub stream: &'a v4flash_hip::Stream,
 }
 
 /// What [`restore_vl`] loaded.
@@ -1043,15 +1156,17 @@ pub fn restore_vl(
     dgpu: Device,
     igpu: Device,
     fingerprint: &ModelFingerprint,
+    kernels: RestoreKernels<'_>,
 ) -> eyre::Result<RestoredSnapshot> {
     let meta_bytes = fs::read(src.join("meta.json"))
         .map_err(|e| eyre!("snapshot.restore: read meta.json: {e}"))?;
     let meta: SnapshotMeta = serde_json::from_slice(&meta_bytes)
         .map_err(|e| eyre!("snapshot.restore: parse meta.json: {e}"))?;
-    if meta.format_version != FORMAT_VERSION {
+    if meta.format_version < MIN_FORMAT_VERSION || meta.format_version > FORMAT_VERSION {
         return Err(eyre!(
-            "snapshot.restore: format_version mismatch (saw {}, want {})",
+            "snapshot.restore: format_version mismatch (saw {}, want {}..={})",
             meta.format_version,
+            MIN_FORMAT_VERSION,
             FORMAT_VERSION
         ));
     }
@@ -1104,6 +1219,7 @@ pub fn restore_vl(
     let mut index_comp_kv_rd = BlobReader::open(src, "index_comp_kv.bin", false)?;
     let mut index_comp_state_rd = BlobReader::open(src, "index_comp_state.bin", false)?;
     let mut scratch = RestoreScratch::default();
+    let mut converted_layers = 0usize;
 
     for (li, layer) in state.layers.iter_mut().enumerate() {
         let m = &meta.layers[li];
@@ -1135,22 +1251,99 @@ pub fn restore_vl(
             };
             comp.n_comp = m.n_comp;
 
-            // comp_kv — live prefix only (gated by n_comp).
-            let ck_count = (m.n_comp as usize) * (m.head_dim as usize);
-            let ck_bytes_len = ck_count * 2;
-            if !comp_kv_rd.has(ck_bytes_len) {
+            // comp_kv — live prefix only (gated by n_comp). Four cases:
+            // the file's encoding (f16 in v3 and for ratio-128 layers,
+            // packed FP8 for ratio-4 layers in v4) x the live store's.
+            let n_comp = m.n_comp as usize;
+            let head_dim = m.head_dim as usize;
+            let file_row_bytes = match m.comp_kv_format {
+                CompKvFormat::F16 => head_dim * 2,
+                CompKvFormat::Fp8E4m3B64 => {
+                    if m.comp_kv_row_bytes as usize != FP8_KV_ROW_BYTES || head_dim != FP8_KV_HEAD_DIM {
+                        return Err(eyre!(
+                            "snapshot.restore: layer {li} fp8 rows of {} B (head_dim {head_dim}) unsupported",
+                            m.comp_kv_row_bytes
+                        ));
+                    }
+                    FP8_KV_ROW_BYTES
+                }
+            };
+            if !comp_kv_rd.has(n_comp * file_row_bytes) {
                 return Err(eyre!(
                     "snapshot.restore: comp_kv.bin truncated at layer {li}"
                 ));
             }
-            let ck_full_n = comp.comp_kv.len();
-            if ck_count > ck_full_n {
+            if n_comp > comp.comp_kv.capacity_rows(m.head_dim) {
                 return Err(eyre!(
-                    "snapshot.restore: ck_count {ck_count} > buffer {ck_full_n}"
+                    "snapshot.restore: n_comp {n_comp} > buffer capacity {} rows",
+                    comp.comp_kv.capacity_rows(m.head_dim)
                 ));
             }
             dgpu.set_current()?;
-            scratch.load_u16(&mut comp_kv_rd, ck_count, &mut comp.comp_kv)?;
+            match (m.comp_kv_format, &mut comp.comp_kv) {
+                (CompKvFormat::F16, CompKvStore::F16(buf)) => {
+                    scratch.load_u16(&mut comp_kv_rd, n_comp * head_dim, buf)?;
+                }
+                (CompKvFormat::Fp8E4m3B64, CompKvStore::Fp8 { rows, head }) => {
+                    scratch.load_u8(&mut comp_kv_rd, n_comp * FP8_KV_ROW_BYTES, rows)?;
+                    // Rebuild the dense-path f16 head shadow through the
+                    // production expand kernel.
+                    let head_n = n_comp.min(FP8_KV_HEAD_ROWS) as u32;
+                    kernels.fp8.launch_expand(kernels.stream, head, rows, head_n)?;
+                    kernels.stream.synchronize()?;
+                }
+                (CompKvFormat::F16, CompKvStore::Fp8 { rows, head }) => {
+                    // v3 (or COMP_KV_FP8=0-era) f16 rows into the packed
+                    // store: exact recovery of (code, e) per block, host
+                    // verified against the host expand (== device expand
+                    // for every (code, e), tests/fp8_kv_format.rs). Any
+                    // row that does not round-trip refuses the snapshot.
+                    scratch.read_u16_host(&mut comp_kv_rd, n_comp * head_dim)?;
+                    let f16 = &scratch.u16s[..n_comp * head_dim];
+                    let mut packed = vec![0u8; n_comp * FP8_KV_ROW_BYTES];
+                    for r in 0..n_comp {
+                        if pack_row_from_f16_host(
+                            &f16[r * head_dim..(r + 1) * head_dim],
+                            &mut packed[r * FP8_KV_ROW_BYTES..(r + 1) * FP8_KV_ROW_BYTES],
+                        )
+                        .is_none()
+                        {
+                            return Err(eyre!(
+                                "snapshot.restore: layer {li} row {r} of the f16 compressed KV is not \
+                                 exactly E4M3 x 2^e (cannot convert to the packed store losslessly); \
+                                 refusing this v{} snapshot",
+                                meta.format_version
+                            ));
+                        }
+                    }
+                    rows.slice_view_mut(0, packed.len()).copy_from_host(&packed)?;
+                    // The head shadow IS the f16 prefix.
+                    let head_n = n_comp.min(FP8_KV_HEAD_ROWS);
+                    if head_n > 0 {
+                        head.slice_view_mut(0, head_n * head_dim)
+                            .copy_from_host(&f16[..head_n * head_dim])?;
+                    }
+                    converted_layers += 1;
+                }
+                (CompKvFormat::Fp8E4m3B64, CompKvStore::F16(buf)) => {
+                    // v4 packed rows into an f16 store (COMP_KV_FP8=0):
+                    // host expand (== device expand, see above).
+                    scratch.bytes.resize(n_comp * FP8_KV_ROW_BYTES, 0);
+                    comp_kv_rd.read_exact(&mut scratch.bytes[..n_comp * FP8_KV_ROW_BYTES])?;
+                    if scratch.u16s.len() < n_comp * head_dim {
+                        scratch.u16s.resize(n_comp * head_dim, 0);
+                    }
+                    for r in 0..n_comp {
+                        unpack_row_host(
+                            &scratch.bytes[r * FP8_KV_ROW_BYTES..(r + 1) * FP8_KV_ROW_BYTES],
+                            &mut scratch.u16s[r * head_dim..(r + 1) * head_dim],
+                        );
+                    }
+                    buf.slice_view_mut(0, n_comp * head_dim)
+                        .copy_from_host(&scratch.u16s[..n_comp * head_dim])?;
+                    converted_layers += 1;
+                }
+            }
 
             // state_kv + state_score (each n_state floats, packed back-to-back).
             let n_state = (m.state_rows as usize) * (m.width as usize);
@@ -1193,14 +1386,18 @@ pub fn restore_vl(
                     "snapshot.restore: index_comp_kv.bin truncated at layer {li}"
                 ));
             }
-            let ick_full_n = icomp.comp_kv.len();
+            let ibuf = icomp
+                .comp_kv
+                .f16_mut()
+                .ok_or_else(|| eyre!("snapshot.restore: layer {li} indexer store must be f16"))?;
+            let ick_full_n = ibuf.len();
             if ick_count > ick_full_n {
                 return Err(eyre!(
                     "snapshot.restore: index ck_count {ick_count} > buffer {ick_full_n}"
                 ));
             }
             dgpu.set_current()?;
-            scratch.load_u16(&mut index_comp_kv_rd, ick_count, &mut icomp.comp_kv)?;
+            scratch.load_u16(&mut index_comp_kv_rd, ick_count, ibuf)?;
 
             let in_state = (m.index_state_rows as usize) * (m.index_width as usize);
             let in_block_bytes = in_state * 4;
@@ -1221,6 +1418,15 @@ pub fn restore_vl(
             icomp.state_kv.copy_from_host(&vec![0f32; n_state])?;
             icomp.state_score.copy_from_host(&vec![NEG_INF; n_state])?;
         }
+    }
+
+    if converted_layers > 0 {
+        tracing::info!(
+            format_version = meta.format_version,
+            converted_layers,
+            tokens = tokens.len(),
+            "snapshot.restore: converted compressed-KV encoding on load (next save rewrites as v{FORMAT_VERSION})"
+        );
     }
 
     // Leave dgpu current for the caller's subsequent prefill.

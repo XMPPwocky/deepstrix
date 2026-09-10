@@ -37,7 +37,8 @@ const ROUTER_WEIGHT_EPS: f32 = 6.103515625e-5;
 
 use super::engine::{DeviceEngine, ExecMode, HeterogeneousEngine};
 use super::scratch::{DgpuScratch, IgpuScratch};
-use super::state::HetLayerState;
+use super::state::{CompKvStore, HetLayerState};
+use crate::comp_kv_fp8::FP8_KV_HEAD_ROWS;
 use super::sync::{peer_push_f32, peer_push_i32};
 use super::weights::{DgpuLayerWeights, IgpuLayerWeights};
 use tracing::debug_span;
@@ -633,21 +634,24 @@ impl HeterogeneousEngine {
                         &dlw.rope_params,
                     )?;
                 }
-                {
-                    let _t = de.events.stage("k.compressor_d.fp8", &de.compute)?;
-                    de.fp8.launch(
-                        &de.compute,
-                        &mut dgpu_scratch.comp_row,
-                        N_HEAD_DIM - N_ROT,
-                    )?;
-                }
-                {
-                    let _t = de.events.stage("k.compressor_d.f16rt", &de.compute)?;
-                    de.f16rt.launch(
-                        &de.compute,
-                        &mut dgpu_scratch.comp_row,
-                        N_HEAD_DIM,
-                    )?;
+                let packed_store = cs.comp_kv.is_fp8();
+                if !packed_store {
+                    {
+                        let _t = de.events.stage("k.compressor_d.fp8", &de.compute)?;
+                        de.fp8.launch(
+                            &de.compute,
+                            &mut dgpu_scratch.comp_row,
+                            N_HEAD_DIM - N_ROT,
+                        )?;
+                    }
+                    {
+                        let _t = de.events.stage("k.compressor_d.f16rt", &de.compute)?;
+                        de.f16rt.launch(
+                            &de.compute,
+                            &mut dgpu_scratch.comp_row,
+                            N_HEAD_DIM,
+                        )?;
+                    }
                 }
                 if ratio == 4 {
                     let _t = de.events.stage("k.compressor_d.shuffle", &de.compute)?;
@@ -662,13 +666,25 @@ impl HeterogeneousEngine {
                 // No peer push needed — append directly into local comp_kv.
                 {
                     let _t = de.events.stage("k.compressor_d.comp_kv_append", &de.compute)?;
-                    de.comp_kv_append.launch(
-                        &de.compute,
-                        &mut cs.comp_kv,
-                        &dgpu_scratch.comp_row,
-                        cs.n_comp,
-                        N_HEAD_DIM,
-                    )?;
+                    match &mut cs.comp_kv {
+                        CompKvStore::F16(buf) => de.comp_kv_append.launch(
+                            &de.compute,
+                            buf,
+                            &dgpu_scratch.comp_row,
+                            cs.n_comp,
+                            N_HEAD_DIM,
+                        )?,
+                        // Packed store: quantise + pack + head-shadow write
+                        // in ONE kernel (replaces fp8 -> f16rt -> append).
+                        CompKvStore::Fp8 { rows, head } => de.comp_kv_fp8.launch_append(
+                            &de.compute,
+                            rows,
+                            head,
+                            &dgpu_scratch.comp_row,
+                            cs.n_comp,
+                            FP8_KV_HEAD_ROWS as u32,
+                        )?,
+                    }
                 }
                 cs.n_comp += 1;
             }
@@ -805,7 +821,9 @@ impl HeterogeneousEngine {
                     let row_view = dgpu_scratch.comp_row.slice_view(0, ihd as usize);
                     de.comp_kv_append.launch(
                         &de.compute,
-                        &mut ics.comp_kv,
+                        ics.comp_kv
+                            .f16_mut()
+                            .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16"))?,
                         &row_view,
                         ics.n_comp,
                         ihd,
@@ -923,6 +941,8 @@ impl HeterogeneousEngine {
                 // on iGPU or any arch without WMMA support.
                 let kv_slice = ics_ref
                     .comp_kv
+                    .f16()
+                    .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16"))?
                     .slice_view(0, (n_index_comp * N_INDEXER_HEAD_DIM) as usize);
                 if let Some(wmma) = de.indexer_score_wmma.as_ref() {
                     // M58: multi-wave by default (INDEXER_DECODE=sw rolls
@@ -975,14 +995,25 @@ impl HeterogeneousEngine {
                 )?;
                 // 7. Gather selected rows of cs.comp_kv into active_comp_kv.
                 let cs_ref = cs.expect("ratio==4 must have main compressor state");
-                de.indexer_gather.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.active_comp_kv,
-                    &cs_ref.comp_kv,
-                    &dgpu_scratch.indexer_selected,
-                    INDEXER_TOP_K,
-                    N_HEAD_DIM,
-                )?;
+                match &cs_ref.comp_kv {
+                    CompKvStore::F16(buf) => de.indexer_gather.launch(
+                        &de.compute,
+                        &mut dgpu_scratch.active_comp_kv,
+                        buf,
+                        &dgpu_scratch.indexer_selected,
+                        INDEXER_TOP_K,
+                        N_HEAD_DIM,
+                    )?,
+                    // Packed store: the gather expands FP8 -> f16 on the
+                    // way into active_comp_kv; attention is unchanged.
+                    CompKvStore::Fp8 { rows, .. } => de.comp_kv_fp8.launch_gather(
+                        &de.compute,
+                        &mut dgpu_scratch.active_comp_kv,
+                        rows,
+                        &dgpu_scratch.indexer_selected,
+                        INDEXER_TOP_K,
+                    )?,
+                }
                 drop(_s_ix);
                 _t_ix.end()?;
             }
@@ -992,7 +1023,11 @@ impl HeterogeneousEngine {
             let (attn_comp_kv, attn_n_comp) = if use_sparse {
                 (Some(&dgpu_scratch.active_comp_kv), INDEXER_TOP_K)
             } else if n_comp_full > 0 {
-                (cs.map(|c| &c.comp_kv), n_comp_full)
+                // Dense path: the whole f16 cache, or the FP8 store's f16
+                // head shadow (errors past its 512 rows — DECODE_INDEXER=off
+                // at depth is unsupported with the packed store).
+                let c = cs.expect("n_comp_full > 0 implies compressor state");
+                (Some(c.comp_kv.dense_f16(n_comp_full, &format!("L{layer} decode"))?), n_comp_full)
             } else {
                 (None, 0)
             };

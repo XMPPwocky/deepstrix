@@ -561,6 +561,24 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
     let dgpu_scratch = DgpuScratch::alloc(dgpu)?;
     let igpu_scratch = IgpuScratch::alloc(igpu)?;
+    // The indexer's candidate set is clamped to ATTN_MIXED_MAX_KEYS comp
+    // rows (forward_layer.rs / forward_prefill.rs); a --ctx past that cap
+    // would silently drop the NEWEST rows from indexer scoring at depth.
+    // Refuse at launch instead.
+    {
+        let max_ratio4_rows = cfg.n_kv_max.div_ceil(4);
+        let cap = v4flash_kernels::ATTN_MIXED_MAX_KEYS;
+        if max_ratio4_rows > cap {
+            return Err(eyre!(
+                "--ctx {} needs {} ratio-4 compressed rows but ATTN_MIXED_MAX_KEYS is {} \
+                 (raise it in attention.rs AND kernels/attention_mixed.hip, or use --ctx <= {})",
+                cfg.n_kv_max,
+                max_ratio4_rows,
+                cap,
+                cap * 4
+            ));
+        }
+    }
     let state = HetModelState::alloc(dgpu, igpu, cfg.n_kv_max)?;
     // Two-lane pipelined prefill: each lane holds at most ceil(B_MAX/2)
     // rows of a chunk (forward_prompt_batch_v2_pipelined), so size the
@@ -1400,135 +1418,162 @@ fn handle_generate_stream(
                     state.dgpu,
                     state.igpu,
                     &state.model_fingerprint,
-                )?;
-                let crate::snapshot::RestoredSnapshot {
+                    snapshot::RestoreKernels {
+                        fp8: &state.engine.dgpu.comp_kv_fp8,
+                        stream: &state.engine.dgpu.compute,
+                    },
+                );
+                let restored = match restored {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        // A snapshot that cannot be loaded (truncated
+                        // file, refused format conversion) is a cache
+                        // MISS, not a failed request: wipe whatever was
+                        // partially written, evict the entry so the next
+                        // matching request does not re-read it, and fall
+                        // through to the full prefill below (same shape
+                        // as the byte-prefix verification failure).
+                        tracing::warn!(
+                            snap_hash = %short_hex(&snap_hash[..4]),
+                            error = %e,
+                            "snapshot restore failed; evicting and prefilling from scratch"
+                        );
+                        state.state.reset_in_place(state.dgpu, state.igpu)?;
+                        state.live = None;
+                        state.snapshot_index.evict(&snap_hash, "restore failed");
+                        None
+                    }
+                };
+                if let Some(crate::snapshot::RestoredSnapshot {
                     tokens: loaded,
                     image_spans: loaded_spans,
-                } = restored;
-                let loaded_len = loaded.len() as u32;
-                // Verify the snapshot's BYTE stream is actually a prefix
-                // of req. With byte-hashed keys (format v2) this should
-                // always be true when find_longest_prefix returned this
-                // entry; the session-hint path bypasses that check so
-                // we re-verify here.
-                let verify = byte_aligned_lcp_vl(
-                    &loaded,
-                    &loaded_spans,
-                    &req.tokens,
-                    &req.image_spans,
-                    state.vocab.as_ref(),
-                    &state.byte_decoder,
-                );
-                if verify.live_tokens != loaded.len() {
-                    tracing::warn!(
-                        loaded_len = loaded.len(),
-                        verify_live = verify.live_tokens,
-                        verify_req = verify.req_tokens,
-                        snap_hash = %short_hex(&snap_hash[..4]),
-                        "restored snapshot bytes are NOT a prefix of the request; falling back"
-                    );
-                    state.state.reset_in_place(state.dgpu, state.igpu)?;
-                    state.live = None;
-                } else {
-                    let _ = state.snapshot_index.touch(&snap_hash);
-                    let suffix_len = req.tokens.len() - verify.req_tokens;
-                    // Diagnostic: when there's a LARGER snapshot than
-                    // the one we just restored AND that snapshot shares
-                    // a meaningful byte prefix with the current
-                    // request, log where its bytes first diverge —
-                    // tells us which turn-boundary re-render is broken.
-                    // Suppress when the larger snapshot is clearly
-                    // from a different conversation (tiny common
-                    // prefix) — that's just LRU index noise.
-                    if let Some(diag) = state.snapshot_index.diag_largest_divergence(
+                }) = restored
+                {
+                    let loaded_len = loaded.len() as u32;
+                    // Verify the snapshot's BYTE stream is actually a prefix
+                    // of req. With byte-hashed keys (format v2) this should
+                    // always be true when find_longest_prefix returned this
+                    // entry; the session-hint path bypasses that check so
+                    // we re-verify here.
+                    let verify = byte_aligned_lcp_vl(
+                        &loaded,
+                        &loaded_spans,
                         &req.tokens,
-                        loaded_len,
+                        &req.image_spans,
                         state.vocab.as_ref(),
                         &state.byte_decoder,
-                    ) {
-                        // Threshold: larger snapshot must share at
-                        // least half the request's bytes to be
-                        // considered "same conversation".
-                        if diag.common_byte_len * 2 >= diag.req_byte_len {
-                            tracing::warn!(
-                                picked_token_count = loaded_len,
-                                largest_token_count = diag.snap_token_count,
-                                largest_byte_len = diag.snap_byte_len,
-                                req_byte_len = diag.req_byte_len,
-                                common_byte_len = diag.common_byte_len,
-                                before = %diag.before,
-                                snap_after = %diag.snap_after,
-                                req_after = %diag.req_after,
-                                "byte divergence vs largest snapshot"
-                            );
-                        }
-                    }
-                    tracing::info!(
-                        req_len = req.tokens.len(),
-                        restored_live = loaded_len,
-                        restored_req = verify.req_tokens,
-                        suffix_len,
-                        snap_hash = %short_hex(&snap_hash[..4]),
-                        mode = "restore",
-                        fp = %state_fingerprint(state),
-                        "prefill"
                     );
-                    if suffix_len > 0 {
-                        prefill_suffix(
-                            state,
-                            &req.tokens[verify.req_tokens..],
-                            verify.req_tokens,
+                    if verify.live_tokens != loaded.len() {
+                        tracing::warn!(
+                            loaded_len = loaded.len(),
+                            verify_live = verify.live_tokens,
+                            verify_req = verify.req_tokens,
+                            snap_hash = %short_hex(&snap_hash[..4]),
+                            "restored snapshot bytes are NOT a prefix of the request; falling back"
+                        );
+                        state.state.reset_in_place(state.dgpu, state.igpu)?;
+                        state.live = None;
+                    } else {
+                        let _ = state.snapshot_index.touch(&snap_hash);
+                        let suffix_len = req.tokens.len() - verify.req_tokens;
+                        // Diagnostic: when there's a LARGER snapshot than
+                        // the one we just restored AND that snapshot shares
+                        // a meaningful byte prefix with the current
+                        // request, log where its bytes first diverge —
+                        // tells us which turn-boundary re-render is broken.
+                        // Suppress when the larger snapshot is clearly
+                        // from a different conversation (tiny common
+                        // prefix) — that's just LRU index noise.
+                        if let Some(diag) = state.snapshot_index.diag_largest_divergence(
+                            &req.tokens,
                             loaded_len,
-                            &vl,
-                            Some(&cancel),
-                        )?;
-                        if cancel.load(Ordering::Relaxed) {
-                            tracing::info!(
-                                fp = %state_fingerprint(state),
-                                "generate: cancelled mid-prefill (restore path)"
-                            );
-                            // Restored snapshot is still on-GPU but
-                            // we may have partially appended suffix
-                            // KV beyond it. Drop live so next request
-                            // reset-prefills from a known state.
-                            state.live = None;
-                            return Ok(());
+                            state.vocab.as_ref(),
+                            &state.byte_decoder,
+                        ) {
+                            // Threshold: larger snapshot must share at
+                            // least half the request's bytes to be
+                            // considered "same conversation".
+                            if diag.common_byte_len * 2 >= diag.req_byte_len {
+                                tracing::warn!(
+                                    picked_token_count = loaded_len,
+                                    largest_token_count = diag.snap_token_count,
+                                    largest_byte_len = diag.snap_byte_len,
+                                    req_byte_len = diag.req_byte_len,
+                                    common_byte_len = diag.common_byte_len,
+                                    before = %diag.before,
+                                    snap_after = %diag.snap_after,
+                                    req_after = %diag.req_after,
+                                    "byte divergence vs largest snapshot"
+                                );
+                            }
                         }
-                    }
-                    let new_pos = loaded_len + suffix_len as u32;
-                    // live.tokens after restore + suffix prefill: loaded
-                    // (in saved token-id space) + req.tokens[lcp_req..].
-                    let mut new_tokens: Vec<i32> =
-                        Vec::with_capacity(loaded.len() + suffix_len);
-                    new_tokens.extend_from_slice(&loaded);
-                    new_tokens.extend_from_slice(&req.tokens[verify.req_tokens..]);
-                    // Live spans = the snapshot's own (already in loaded
-                    // index space) plus the request's suffix spans,
-                    // shifted into it.
-                    let mut new_spans = loaded_spans.clone();
-                    new_spans.extend(shift_spans(
-                        &spans_from(&req.image_spans, verify.req_tokens),
-                        loaded.len() as i64 - verify.req_tokens as i64,
-                    ));
-                    state.live = Some(LiveSession {
-                        tokens: new_tokens,
-                        image_spans: new_spans,
-                        pos: new_pos,
-                        dirty: true,
-                        session_id: session_id.clone(),
-                    });
-                    let (pos_after_marker, initial_in_think) =
-                        save_and_forward_marker(state, trailing_marker, new_pos)?;
-                    return finish_decode(
-                        state,
-                        req,
-                        tx,
-                        prompt_tokens,
-                        pos_after_marker,
-                        session_id,
-                        cancel,
-                        initial_in_think,
-                    );
+                        tracing::info!(
+                            req_len = req.tokens.len(),
+                            restored_live = loaded_len,
+                            restored_req = verify.req_tokens,
+                            suffix_len,
+                            snap_hash = %short_hex(&snap_hash[..4]),
+                            mode = "restore",
+                            fp = %state_fingerprint(state),
+                            "prefill"
+                        );
+                        if suffix_len > 0 {
+                            prefill_suffix(
+                                state,
+                                &req.tokens[verify.req_tokens..],
+                                verify.req_tokens,
+                                loaded_len,
+                                &vl,
+                                Some(&cancel),
+                            )?;
+                            if cancel.load(Ordering::Relaxed) {
+                                tracing::info!(
+                                    fp = %state_fingerprint(state),
+                                    "generate: cancelled mid-prefill (restore path)"
+                                );
+                                // Restored snapshot is still on-GPU but
+                                // we may have partially appended suffix
+                                // KV beyond it. Drop live so next request
+                                // reset-prefills from a known state.
+                                state.live = None;
+                                return Ok(());
+                            }
+                        }
+                        let new_pos = loaded_len + suffix_len as u32;
+                        // live.tokens after restore + suffix prefill: loaded
+                        // (in saved token-id space) + req.tokens[lcp_req..].
+                        let mut new_tokens: Vec<i32> =
+                            Vec::with_capacity(loaded.len() + suffix_len);
+                        new_tokens.extend_from_slice(&loaded);
+                        new_tokens.extend_from_slice(&req.tokens[verify.req_tokens..]);
+                        // Live spans = the snapshot's own (already in loaded
+                        // index space) plus the request's suffix spans,
+                        // shifted into it.
+                        let mut new_spans = loaded_spans.clone();
+                        new_spans.extend(shift_spans(
+                            &spans_from(&req.image_spans, verify.req_tokens),
+                            loaded.len() as i64 - verify.req_tokens as i64,
+                        ));
+                        state.live = Some(LiveSession {
+                            tokens: new_tokens,
+                            image_spans: new_spans,
+                            pos: new_pos,
+                            dirty: true,
+                            session_id: session_id.clone(),
+                        });
+                        let (pos_after_marker, initial_in_think) =
+                            save_and_forward_marker(state, trailing_marker, new_pos)?;
+                        return finish_decode(
+                            state,
+                            req,
+                            tx,
+                            prompt_tokens,
+                            pos_after_marker,
+                            session_id,
+                            cancel,
+                            initial_in_think,
+                        );
+                }
                 }
             }
         }
