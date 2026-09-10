@@ -434,6 +434,14 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
             let legacy = vec![("QB_WMMA", Some("lds_tiled")), ("Q8_GROUPED_VARIANT", Some("lds_tiled")), ("Q8_OUT_VARIANT", Some("lds_tiled"))];
             let f16x = vec![("QB_WMMA", None), ("Q8_GROUPED_VARIANT", None), ("Q8_OUT_VARIANT", None)];
             vec![("gemm=f16x", f16x.clone()), ("gemm=lds_tiled", legacy), ("gemm=f16x(2)", f16x)]
+        } else if std::env::var_os("COMP_KV_FP8_AB").is_some() {
+            // packed-FP8 compressed-KV store (2026-09-10) vs the f16 store.
+            // The store is chosen at HetModelState::alloc, so the state is
+            // re-allocated per variant below (prefill is host-driven — no
+            // captured graphs bake state pointers — so the engine and
+            // scratch are shared).
+            vec![("kv=fp8", vec![("COMP_KV_FP8", None)]), ("kv=f16", vec![("COMP_KV_FP8", Some("0"))]),
+                 ("kv=fp8(2)", vec![("COMP_KV_FP8", None)])]
         } else {
             vec![("qb=current", vec![])]
         };
@@ -446,6 +454,11 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                     Some(v) => std::env::set_var(venv, v),
                     None => std::env::remove_var(venv),
                 }
+            }
+            if venvs.iter().any(|(k, _)| *k == "COMP_KV_FP8") {
+                state = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
+                eprintln!("  (state re-allocated: fp8 store = {})",
+                    state.layers[2].compressor.as_ref().map(|c| c.comp_kv.is_fp8()).unwrap_or(false));
             }
             eprintln!("\n--- variant {vname} ---");
             let mut summary: Vec<(u32, f64, f64)> = Vec::with_capacity(fake_depths.len());

@@ -945,7 +945,6 @@ fn fp8_kv_store_ab_one_load() -> eyre::Result<()> {
         RopeParams::from_dump_blob(&floats, n_ctx_orig)
     };
     let main_weights = HetModelWeights::load_all(&main_gguf, dgpu, igpu, &rope_for_layer)?;
-    let engine = HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
 
     let n_real = PROMPT_TOKENS.len();
     let mut real_hcs: Vec<Vec<f32>> = Vec::with_capacity(n_real);
@@ -959,18 +958,25 @@ fn fp8_kv_store_ab_one_load() -> eyre::Result<()> {
     };
 
     let lane_rows = B_MAX.div_ceil(2);
-    let mut bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
-    let mut bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
-    let mut bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
-    let mut bi_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
-    let mut sd_p = BatchDgpuShared::alloc_rows(dgpu, lane_rows)?;
-    let mut si_p = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
-    let mut head_scratch = DgpuScratch::alloc(dgpu)?;
-    let mut bs = BatchScratch::alloc(dgpu, igpu)?;
 
     // One scenario: prefill T tokens (pipelined), then decode n_dec tokens;
     // returns the prefill logits and every decode step's logits.
-    let mut run = |t: usize, label: &str| -> eyre::Result<(Vec<f32>, Vec<Vec<f32>>)> {
+    //
+    // A FRESH engine + scratch per run: the decode graphs (`GraphCache`,
+    // keyed by (stage, layer) only) bake the first state's / scratch's
+    // buffer pointers, so reusing an engine across states would make the
+    // second run's qkv_chain write its raw KV rows into the FIRST run's
+    // cache. Prefill is host-driven and unaffected, decode is not.
+    let run = |t: usize, label: &str| -> eyre::Result<(Vec<f32>, Vec<Vec<f32>>)> {
+        let engine = HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
+        let mut bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+        let mut bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+        let mut bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+        let mut bi_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+        let mut sd_p = BatchDgpuShared::alloc_rows(dgpu, lane_rows)?;
+        let mut si_p = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
+        let mut head_scratch = DgpuScratch::alloc(dgpu)?;
+        let mut bs = BatchScratch::alloc(dgpu, igpu)?;
         let (hcs, toks) = cycled(t + n_dec);
         let mut st = HetModelState::alloc(dgpu, igpu, (t + n_dec) as u32 + 4)?;
         let packed = st.layers[2].compressor.as_ref().map(|c| c.comp_kv.is_fp8()).unwrap_or(false);
@@ -990,6 +996,7 @@ fn fp8_kv_store_ab_one_load() -> eyre::Result<()> {
             dec.push(l);
         }
         eprintln!("  [{label}] done (prefill argmax {}, last decode argmax {})", argmax(&p), argmax(dec.last().unwrap()));
+        engine.shutdown()?;
         Ok((p, dec))
     };
 
