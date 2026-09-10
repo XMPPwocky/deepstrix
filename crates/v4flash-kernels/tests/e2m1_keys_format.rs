@@ -230,12 +230,14 @@ fn constructed(k: &Kernels, dev: i32, stream: &Stream, rng: &mut Rng) -> eyre::R
     let (e_lo, e_hi) = (-40i32, 20i32);
     let mut rows: Vec<f32> = Vec::new();
     for e in e_lo..=e_hi {
-        // Two rows per e so each nibble appears with both neighbours; block
-        // b of row 0 uses exponent e+b, row 1 uses e-b (more coverage).
-        for variant in 0..2 {
+        // Rows per e: variant 0/1 spread the block exponents (e+b / e-b) with
+        // a 5.9 anchor (block max snaps to 6: e' = e0); variants 2/3 use a
+        // 3.0 anchor (max 3: the QAT re-derivation lands on e0 - 1 with
+        // doubled codes) and a 3.5 anchor (the tie, rounds to 4: e' = e0).
+        for variant in 0..4 {
             let mut target = vec![0f32; E2M1_KEY_DIM];
             for blk in 0..4 {
-                let eb = if variant == 0 { e + blk as i32 } else { e - blk as i32 };
+                let eb = if variant % 2 == 0 { e + blk as i32 } else { e - blk as i32 };
                 let scale = 2f32.powi(eb);
                 for j in 0..32 {
                     let nib = if j < 16 { j as u8 } else { (rng.next() % 16) as u8 };
@@ -246,7 +248,15 @@ fn constructed(k: &Kernels, dev: i32, stream: &Stream, rng: &mut Rng) -> eyre::R
                 // (snaps to code 6) rather than exactly 6.0, so a one-ulp
                 // reconstruction error in the device Hadamard cannot push the
                 // max past 6 and bump the exponent (it did on gfx1151).
-                target[blk * 32 + 16] = 5.9 * scale;
+                target[blk * 32 + 16] = match variant { 2 => 3.0, 3 => 3.5, _ => 5.9 } * scale;
+                if variant >= 2 {
+                    // Keep the anchor the block max: cap the other targets at 3.
+                    for j in 0..32 {
+                        if j != 16 && target[blk * 32 + j].abs() > 3.0 * scale {
+                            target[blk * 32 + j] = target[blk * 32 + j].signum() * 3.0 * scale;
+                        }
+                    }
+                }
             }
             rows.extend(inverse_row(&target));
         }

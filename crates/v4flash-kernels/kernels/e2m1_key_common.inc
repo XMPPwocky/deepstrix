@@ -90,7 +90,12 @@ __device__ __forceinline__ int e2m1fn_nearest_index(float ax_in) {
 // Sign applied to the bits (see the header). ONE implementation: every
 // consumer goes through this function.
 __device__ __forceinline__ unsigned short e2m1_key_expand_half_bits_scaled(unsigned int nib, float scale) {
-    const float mag = e2m1fn_value((int)(nib & 7u)) * scale;
+    // Branch-free magnitude: 2m from a byte table {0,1,2,3,4,6,8,12} via
+    // v_perm (e2m1fn_value's switch lowers to a branch tree per nibble,
+    // which made the score twins 25 KB of code), then (float)(2m) * 0.5f
+    // is exactly m, and m * scale is the same f32 product as before.
+    const unsigned int m2 = __builtin_amdgcn_perm(0x0C080604u, 0x03020100u, nib & 7u) & 0xFFu;
+    const float mag = (float)m2 * 0.5f * scale;
     const unsigned short h = __half_as_ushort(__float2half_rn(mag));
     return (unsigned short)(h | ((nib & 8u) << 12));
 }
@@ -145,12 +150,31 @@ __device__ __forceinline__ uint4 e2m1_key_expand8(unsigned int w, int e) {
     return r;
 }
 
-// The WMMA B-fragment for a packed key row: elements [k0, k0 + 8) (k0 a
-// multiple of 8, so inside one 32-element block) as eight f16.
+// A packed key row's raw words for one lane's k-offset: the eight
+// 8-nibble words (one per k-tile, elements kt*16 + k_off .. +8) and the
+// four exponent bytes as one u32. Loaded ALL AT ONCE before any expansion
+// so the compiler can issue the loads back to back and wait once (the
+// range branch inside e2m1_key_expand8 would otherwise split the basic
+// block and serialise one memory round trip per k-tile — the f16 kernel
+// issues all eight b128 loads then one wait).
+struct e2m1_key_row_words {
+    unsigned int w[8];
+    unsigned int ex4;
+};
+__device__ __forceinline__ e2m1_key_row_words e2m1_key_load_row_words(
+        const unsigned char * __restrict__ row, unsigned int k_off) {
+    e2m1_key_row_words r;
+    #pragma unroll
+    for (int kt = 0; kt < 8; kt++) {
+        r.w[kt] = *reinterpret_cast<const unsigned int *>(row + ((kt * 16u + k_off) >> 1));
+    }
+    r.ex4 = *reinterpret_cast<const unsigned int *>(row + E2M1_KEY_OFF_EXP);
+    return r;
+}
+// The WMMA B-fragment for k-tile kt from pre-loaded row words.
 typedef _Float16 e2m1_half8 __attribute__((ext_vector_type(8)));
-__device__ __forceinline__ e2m1_half8 e2m1_key_b_frag(const unsigned char * __restrict__ row, unsigned int k0) {
-    const unsigned int w = *reinterpret_cast<const unsigned int *>(row + (k0 >> 1));
-    const int e = (int)(signed char)row[E2M1_KEY_OFF_EXP + (k0 >> 5)];
-    const uint4 v = e2m1_key_expand8(w, e);
+__device__ __forceinline__ e2m1_half8 e2m1_key_b_frag_kt(const e2m1_key_row_words &r, unsigned int kt) {
+    const int e = (int)(signed char)((r.ex4 >> (8u * (kt >> 1))) & 0xFFu);   // block = kt/2
+    const uint4 v = e2m1_key_expand8(r.w[kt], e);
     return __builtin_bit_cast(e2m1_half8, v);
 }

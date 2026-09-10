@@ -95,7 +95,14 @@ fn indexer_score_e2m1_matches_f16() -> eyre::Result<()> {
         let n_rows = n_idx_max as usize;
         let mut rows = vec![0f32; n_rows * DIM];
         for r in 0..n_rows {
-            let mag = 10f32.powf(rng.unit() * 3.0 - 1.5);
+            // Mostly realistic magnitudes; every 64th row extreme so the
+            // score twins exercise the general (non-normal-f16) expansion
+            // path too: 1e30 (f16 overflow), ±1e-30 (below the f16 range).
+            let mag = match r % 64 {
+                0 => 1e30,
+                32 => 1e-30,
+                _ => 10f32.powf(rng.unit() * 3.0 - 1.5),
+            };
             for v in rows[r * DIM..(r + 1) * DIM].iter_mut() {
                 *v = (rng.unit() * 2.0 - 1.0) * mag;
             }

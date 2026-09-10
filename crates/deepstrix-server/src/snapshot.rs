@@ -368,13 +368,27 @@ impl SnapshotIndex {
                 tracing::warn!(path = ?path, "snapshot meta.json unparseable; skipping");
                 continue;
             };
-            if meta.format_version < MIN_FORMAT_VERSION || meta.format_version > FORMAT_VERSION {
+            if meta.format_version < MIN_FORMAT_VERSION {
+                // An older-format entry is an invalid cache entry: delete
+                // it now, or it would sit outside the disk cap's accounting
+                // forever (the index only counts entries it accepted).
+                match fs::remove_dir_all(&path) {
+                    Ok(()) => tracing::warn!(
+                        path = ?path,
+                        saw = meta.format_version,
+                        min = MIN_FORMAT_VERSION,
+                        "snapshot format too old; deleted"
+                    ),
+                    Err(e) => tracing::warn!(path = ?path, error = %e, "failed to delete old-format snapshot"),
+                }
+                continue;
+            }
+            if meta.format_version > FORMAT_VERSION {
                 tracing::warn!(
                     path = ?path,
                     saw = meta.format_version,
                     want = FORMAT_VERSION,
-                    min = MIN_FORMAT_VERSION,
-                    "snapshot format mismatch; skipping"
+                    "snapshot format newer than this binary; skipping"
                 );
                 continue;
             }

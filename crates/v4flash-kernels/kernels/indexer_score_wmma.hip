@@ -841,13 +841,22 @@ void indexer_score_wmma_mw_e2m1(
         const unsigned int c_row = c_base + col_in_tile;
         const bool c_row_valid = (c_row < n_comp);
         const unsigned char *k_row = index_comp_kv + (size_t)c_row * E2M1_KEY_ROW_BYTES;
+        // All 9 loads for this lane's row up front (see e2m1_key_load_row_words).
+        e2m1_key_row_words kwords;
+        if (c_row_valid) {
+            kwords = e2m1_key_load_row_words(k_row, k_off);
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 8; i++) kwords.w[i] = 0u;
+            kwords.ex4 = 0u;
+        }
 
         #pragma unroll
         for (unsigned int kt = 0; kt < ISW_K_TILES; kt++) {
             const unsigned int kbase = kt * 16u;
             half8 b_frag;
             if (c_row_valid) {
-                b_frag = __builtin_bit_cast(half8, e2m1_key_b_frag(k_row, kbase + k_off));
+                b_frag = __builtin_bit_cast(half8, e2m1_key_b_frag_kt(kwords, kt));
             } else {
                 #pragma unroll
                 for (int e = 0; e < 8; e++) b_frag[e] = (_Float16)0.0f;
@@ -967,6 +976,15 @@ void indexer_score_wmma_batched_mw_e2m1(
         const unsigned int c_row = c_base + col_in_tile;
         const bool c_row_valid = (c_row < n_comp);
         const unsigned char *k_row = index_comp_kv + (size_t)c_row * E2M1_KEY_ROW_BYTES;
+        // All 9 loads for this lane's row up front (see e2m1_key_load_row_words).
+        e2m1_key_row_words kwords;
+        if (c_row_valid) {
+            kwords = e2m1_key_load_row_words(k_row, k_off);
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 8; i++) kwords.w[i] = 0u;
+            kwords.ex4 = 0u;
+        }
 
         #pragma unroll
         for (unsigned int kt = 0; kt < ISW_K_TILES; kt++) {
@@ -974,7 +992,7 @@ void indexer_score_wmma_batched_mw_e2m1(
             // b_frag straight from global: 8 contiguous f16 = one b128.
             half8 b_frag;
             if (c_row_valid) {
-                b_frag = __builtin_bit_cast(half8, e2m1_key_b_frag(k_row, kbase + k_off));
+                b_frag = __builtin_bit_cast(half8, e2m1_key_b_frag_kt(kwords, kt));
             } else {
                 #pragma unroll
                 for (int e = 0; e < 8; e++) b_frag[e] = (_Float16)0.0f;
@@ -1089,6 +1107,12 @@ void indexer_score_wmma_gemm_e2m1(
     // Packed: the quarter (32 halves) is exactly one 32-element block = 16 B
     // of nibbles (one aligned b128) + one exponent byte. Expansion happens
     // at publish so the prefetch stays one tile ahead.
+    // Packed: the quarter (32 halves) is exactly one 32-element block = 16 B
+    // of nibbles (one aligned b128) + one exponent byte. Expansion happens
+    // at publish (~48 VALU per thread per tile, measured +7.5% on this
+    // kernel at n=76800/B=512 = ~0.5% of prefill at 300K). Expanding in the
+    // shadow of the previous tile's WMMAs was tried and is WORSE (+12%): it
+    // forces an early wait on the just-issued prefetch.
     uint4 pre;
     int pre_e;
     auto load_tile = [&](unsigned int tile_r0) {
@@ -1107,7 +1131,7 @@ void indexer_score_wmma_gemm_e2m1(
     __syncthreads();   // lds_hw visible
 
     for (unsigned int tile_r0 = r0; tile_r0 < c_end; tile_r0 += ISG_TILE_ROWS) {
-        // publish the prefetched tile
+        // publish the prefetched tile (expanded here)
         {
             uint4* dst = (uint4*)(&lds_k[st_row * ISG_K_STRIDE + st_off]);
             dst[0] = e2m1_key_expand8(pre.x, pre_e);

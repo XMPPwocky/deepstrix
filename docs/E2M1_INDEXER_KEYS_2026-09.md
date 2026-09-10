@@ -1,8 +1,16 @@
-# E2M1 indexer keys — implementation plan (2026-09-10, rev 1)
+# E2M1 indexer keys — implementation (2026-09-10, rev 2)
 
 Lever 3 of `VRAM_FREE_PLAN_2026-09.md`, built on the packed-FP8 compressed-KV work
 (`FP8_KV_IMPL_2026-09.md`, shipped 2026-09-10). Priority order: quality > RAM >
 decode perf > prefill perf > implementation complexity.
+
+Rev 2 = rev 1 after the architect review and the build (steps 1-4 committed and
+verified beside the live server; step 5 needs the window). Review corrections:
+the expansion is a byte-permute fast path plus a branch-free general path (D2
+rewritten); the decode twins load all nine words before expanding (the range
+branch inside the expansion otherwise serialised one memory round trip per
+k-tile); realistic perf expectations (below); stale-format snapshot dirs are
+deleted at index load, not skipped.
 
 ## What ships
 
@@ -58,9 +66,23 @@ applies it to the f16 bits, not the product — the FP8 lesson.
   `expand(nibble, e)` instead of `kv[i]`.
 - `indexer_score_wmma` / `_batched` (the 1-wave `sw` entry points): hard-error when
   the store is packed (`INDEXER_DECODE=sw`, `INDEXER_SCORE_VARIANT=sw`).
-- Expansion arithmetic: f32 `m x ldexpf(1, e)` then `__float2half_rn`, sign OR'd
-  into the bits. (For `e ∈ [-13, 13]` the result is an exact f16 and an integer
-  exponent-add would do; not used — one code path, proven over the whole i8 field.)
+- Expansion arithmetic, FAST PATH (`e ∈ [-13, 13]`, i.e. every result is a normal
+  f16 — every real block): the f16 of `m x 2^e` has a zero low byte and a high byte
+  `hb[m] + 4e` (`hb = {0, 0x38, 0x3C, 0x3E, 0x40, 0x42, 0x44, 0x46}`), so eight
+  nibbles expand with two `v_perm_b32` table picks from a two-register table
+  pre-biased by the block exponent, two ORs for the signs and four interleaving
+  perms: ~12 VALU ops, no float math. GENERAL PATH otherwise: `(float)(2m) x 0.5f
+  x 2^e` (the `2m` byte also via `v_perm`, so no branch tree) then `__float2half_rn`,
+  sign on the bits. Both proven against the host expand over the whole i8 field and
+  against each other for 1024 words x 256 exponents (`e2m1_key_expand8_check`).
+  The first (float, per-nibble) version made the decode kernel 2x SLOWER.
+- Decode twins load all eight words + the four exponent bytes of a lane's row
+  before any expansion (`e2m1_key_load_row_words`), matching the f16 kernel's
+  "eight loads, one wait" shape; the data-dependent range branch would otherwise
+  split the basic block and serialise the loads (review finding, ISA-verified).
+- GEMM twin: expansion at publish (~48 VALU per thread per 64-row tile). Expanding
+  in the shadow of the previous tile's WMMAs was tried and is worse (+12% vs +7.4%):
+  it forces an early wait on the just-issued prefetch.
 
 ### D3. Store enum, not a toggle in the kernels
 
@@ -107,11 +129,27 @@ once after the restart.
    `FAKE_POS=300000`; `bench_prefill` at 4K/300K, back-to-back key-store A/B in
    process; VRAM; restart with the snapshot dir wiped.
 
-## Expected numbers
+## Measured (kernel level, n=76800 rows = 300K, beside the live server; bit-identical
+scores on 39.8M values per batched kernel, every run)
 
-| | 300K, before | after |
-|---|---|---|
-| index key cache, dGPU | 0.39 GiB | 0.12 GiB |
-| decode index-K bytes read per token (21 layers) | 413 MB | 110 MB |
-| decode ms/token @300K | 41.65 | ~41.2 (-0.5 ms if the mw kernel is BW-bound) |
-| prefill @300K | ~610 | gate: within noise |
+| kernel | f16 | packed | change |
+|---|---|---|---|
+| decode score, B=1 (`_mw`) | ~74 µs | ~74 µs | 0% (latency-bound: 75 WGs on 64 CUs; bytes are not the limiter) |
+| batched multi-wave, B=512 | 22.7 ms | 22.3 ms | -2% |
+| GEMM prefill, B=512 | 5.01 ms | 5.38 ms | +7.4% (~0.5% of prefill at 300K, less at shorter contexts) |
+
+Expectations for the window: decode ms/token unchanged (a decode win from this
+kernel needs a bigger grid, e.g. NT_PER_WG 8 -> 2, or n-tile software pipelining —
+a follow-on that also helps the f16 kernel); prefill @300K within ~0.5% of today;
+dGPU -0.28 GiB at 300K (index key cache 0.39 -> 0.12 GiB). RAM is the lever.
+
+## Step 5 — window (pending)
+
+1. `fp8_kv_store_ab_one_load` now covers all four (main, keys) store combinations
+   with a same-config control: bit-identical logits required, T=3000 and T=200.
+2. `bench_decode COMP_KV_FP8_SWEEP=packed,keys16 FAKE_POS=300000`;
+   `bench_prefill COMP_KV_FP8_AB=packed,keys16,packed FAKE_PREFILL_POS=4096,300000`.
+3. sysfs VRAM at 300K/K=15: expect -0.28 GiB.
+4. Restart. The index loader deletes every pre-v5 snapshot dir (cache entries;
+   ~62 GB); sessions cold-prefill once. Rollback: `INDEXER_KEYS_E2M1=0`
+   (invalidates v5 files on first touch — they are refused and evicted).
