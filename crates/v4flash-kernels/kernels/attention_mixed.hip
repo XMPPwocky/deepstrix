@@ -24,7 +24,7 @@
 typedef _Float16 half8  __attribute__((ext_vector_type(8)));
 typedef float    float8 __attribute__((ext_vector_type(8)));
 
-#define ATTN_MIXED_MAX_KEYS  49408
+#define ATTN_MIXED_MAX_KEYS  82176
 
 // ---------------------------------------------------------------------------
 // Split-kernel decode (perf diagnosis): same math as `attention_mixed`, but

@@ -40,14 +40,17 @@ pub const ATTN_SWA_BATCHED_MAX_KV: u32 = 512;
 /// Hard cap on `n_raw + n_comp` for the split decode kernels
 /// (`attention_mixed_score`, `attention_mixed_softmax_wsum`). Scratch
 /// lives in `DgpuScratch.attn_scores` (global memory), so this isn't
-/// LDS-bound. 49408 covers 128 raw + 49152 comp + 128 chunk-headroom ≈ 192K
-/// context at ratio=4 (worst-case layer ratio across [[compress-ratios]] is 4;
-/// min layers have 128, but they barely grow). Headroom above 192K so a full
-/// chunk (B_MAX tokens, +128 comp rows) prefilled on top of a 192K prefix
-/// still fits. Requires DGPU_HOT_EXPERTS≤6 at 192K to leave ~1 GiB dGPU KV
-/// margin (K=8 overflows the ~17.1 GiB budget past ~128K). Must match
-/// `#define ATTN_MIXED_MAX_KEYS` in `kernels/attention_mixed.hip`.
-pub const ATTN_MIXED_MAX_KEYS: u32 = 49408;
+/// LDS-bound. 82176 = 320K/4 + 256: 128 raw + 81920 comp + 128 chunk-headroom,
+/// i.e. up to a 320K context at ratio=4 (worst-case layer ratio across
+/// [[compress-ratios]] is 4; min layers have 128, but they barely grow); the
+/// headroom lets a full chunk (B_MAX tokens, +128 comp rows) prefill on top of a
+/// full prefix. Raised from 49408 (192K) on 2026-09-10 once the packed-FP8
+/// compressed KV freed the dGPU room (docs/FP8_KV_IMPL_2026-09.md); the cap
+/// itself costs ~512 B of shared prefill scratch + ~64 B of decode scratch per
+/// token of cap. The server refuses `--ctx > 4 * ATTN_MIXED_MAX_KEYS` at
+/// startup. Must match `#define ATTN_MIXED_MAX_KEYS` in
+/// `kernels/attention_mixed.hip`.
+pub const ATTN_MIXED_MAX_KEYS: u32 = 82176;
 
 /// Stride (in keys) of the `attn_scores` scratch buffer per (batch, head).
 /// Smaller than ATTN_MIXED_MAX_KEYS because the production attention path
@@ -66,19 +69,22 @@ pub const ATTN_MIXED_MAX_KEYS: u32 = 49408;
 ///
 ///     n_kv_max/128 + IMAGE_RAW_WINDOW_MAX <= ATTN_SCORES_STRIDE
 ///
-/// which at the SHIPPED 192K context is 1536 + 512 = 2048 — exact, zero
-/// spare. (The true peak is 508, so 4 keys of real margin.) Raising the
-/// context past 192K, or widening the image window, therefore REQUIRES
-/// raising this constant; `check_vision_ctx_fits` enforces that at
-/// startup so it is a launch-time refusal rather than a mid-prefill 500
-/// after part of the chunk's KV was already appended.
+/// which at 192K is 1536 + 512 = 2048. Text-only the bound is
+/// SWA_WINDOW + n_kv_max/128 (the ratio-128 layers are never gathered):
+/// 2048 held to ~245K, and a 300K bench tripped it (n_total_max 2475).
+/// 3072 covers 320K with vision ((3072 - 512) * 128 = 327680) and ~377K
+/// text-only. Raising the context past that, or widening the image
+/// window, REQUIRES raising this constant; `check_vision_ctx_fits`
+/// enforces the vision bound at startup so it is a launch-time refusal
+/// rather than a mid-prefill 500 after part of the chunk's KV was already
+/// appended. Cost: 64 heads x stride x 2 B per scratch row (f16 scores).
 ///
 /// The old comment here said "headroom ok at our actual max ctx of 96K
 /// (1024)" and predated both the 192K default and vision.
 ///
 /// At B=512: 64 * 2048 * 2 (f16) = 256 KB/B = 128 MB scratch (was 1.5 GiB).
 /// At B=1024: 256 MB. Plenty of room for bigger batches.
-pub const ATTN_SCORES_STRIDE: u32 = 2048;
+pub const ATTN_SCORES_STRIDE: u32 = 3072;
 
 /// Refuse to start when a vision tower is loaded and `n_kv_max` would let
 /// an image row's `n_raw + n_comp` overrun [`ATTN_SCORES_STRIDE`].
@@ -958,11 +964,14 @@ mod tests {
     /// and it must sit exactly at the edge — this is the test that fails
     /// first if someone raises the context without raising the stride.
     #[test]
-    fn vision_ctx_budget_is_exact_at_192k() {
-        let ctx_192k = 192 * 1024;
-        check_vision_ctx_fits(ctx_192k).expect("192K + vision must fit");
+    fn vision_ctx_budget_is_exact_at_the_stride() {
+        // The bound is (ATTN_SCORES_STRIDE - IMAGE_RAW_WINDOW_MAX) * 128 tokens:
+        // 192K at the old 2048 stride, 320K at 3072.
+        let max_ctx = (ATTN_SCORES_STRIDE - crate::het::image_spans::IMAGE_RAW_WINDOW_MAX) * 128;
+        check_vision_ctx_fits(max_ctx).expect("max ctx + vision must fit");
         // One comp row more (ratio 128 => 128 tokens) does not.
-        assert!(check_vision_ctx_fits(ctx_192k + 128).is_err());
+        assert!(check_vision_ctx_fits(max_ctx + 128).is_err());
+        check_vision_ctx_fits(192 * 1024).expect("192K + vision must fit");
         // Text-only servers were never near the bound.
         check_vision_ctx_fits(96 * 1024).unwrap();
     }
