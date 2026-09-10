@@ -441,16 +441,22 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
             // captured graphs bake state pointers — so the engine and
             // scratch are shared). COMP_KV_FP8_AB=1 -> fp8,f16,fp8; or a
             // comma list of fp8/f16 in any order and length.
+            // Tokens: "packed" / "fp8" (both packed), "f16" (main f16, keys
+            // packed), "keys16" (main packed, keys f16), "all16" (both f16).
             let order: Vec<&'static str> = if spec == "1" {
-                vec!["fp8", "f16", "fp8"]
+                vec!["packed", "all16", "packed"]
             } else {
-                spec.split(',').map(|t| if t.trim() == "f16" { "f16" } else { "fp8" }).collect()
+                spec.split(',').map(|t| match t.trim() {
+                    "f16" => "f16", "keys16" => "keys16", "all16" => "all16", _ => "packed",
+                }).collect()
             };
             let names: Vec<&'static str> = order.iter().enumerate()
                 .map(|(i, k)| Box::leak(format!("kv={k}#{i}").into_boxed_str()) as &'static str)
                 .collect();
             order.iter().zip(names).map(|(k, n)| {
-                (n, vec![("COMP_KV_FP8", if *k == "f16" { Some("0") } else { None })])
+                let main = if matches!(*k, "f16" | "all16") { Some("0") } else { None };
+                let keys = if matches!(*k, "keys16" | "all16") { Some("0") } else { None };
+                (n, vec![("COMP_KV_FP8", main), ("INDEXER_KEYS_E2M1", keys)])
             }).collect()
         } else {
             vec![("qb=current", vec![])]

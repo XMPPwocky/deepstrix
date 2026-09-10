@@ -109,19 +109,24 @@ fn bench_decode_het_parallel() -> eyre::Result<()> {
     // with a FRESH engine + scratch + state: the decode graphs bake buffer
     // pointers (GraphCache is keyed by (stage, layer) only), so an engine
     // must not outlive the state it first captured against.
-    let sweep = std::env::var("COMP_KV_FP8_SWEEP").map(|v| v == "1").unwrap_or(false);
-    let variants: Vec<(&str, Option<&str>)> = if sweep {
-        vec![("fp8", None), ("f16", Some("0"))]
-    } else {
-        vec![("env", None)]
+    // COMP_KV_FP8_SWEEP=1 -> packed,all16; or a comma list of
+    // packed / f16 (main f16) / keys16 (keys f16) / all16.
+    let sweep_spec = std::env::var("COMP_KV_FP8_SWEEP").ok();
+    let sweep = sweep_spec.is_some();
+    let variants: Vec<&'static str> = match sweep_spec.as_deref() {
+        None => vec!["env"],
+        Some("1") => vec!["packed", "all16"],
+        Some(spec) => spec.split(',').map(|t| match t.trim() {
+            "f16" => "f16", "keys16" => "keys16", "all16" => "all16", _ => "packed",
+        }).collect(),
     };
-    for (vname, vset) in variants {
+    for vname in variants {
     if sweep {
-        match vset {
-            Some(v) => std::env::set_var("COMP_KV_FP8", v),
-            None => std::env::remove_var("COMP_KV_FP8"),
-        }
-        eprintln!("=== COMP_KV_FP8 variant: {vname} ===");
+        let main = if matches!(vname, "f16" | "all16") { Some("0") } else { None };
+        let keys = if matches!(vname, "keys16" | "all16") { Some("0") } else { None };
+        match main { Some(v) => std::env::set_var("COMP_KV_FP8", v), None => std::env::remove_var("COMP_KV_FP8") }
+        match keys { Some(v) => std::env::set_var("INDEXER_KEYS_E2M1", v), None => std::env::remove_var("INDEXER_KEYS_E2M1") }
+        eprintln!("=== store variant: {vname} ===");
     }
         let mut engine =
             HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;

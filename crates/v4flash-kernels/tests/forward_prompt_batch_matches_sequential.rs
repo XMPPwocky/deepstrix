@@ -913,9 +913,10 @@ fn forward_prefill_all_oracles_one_load() -> eyre::Result<()> {
     Ok(())
 }
 
-/// ONE weight load, packed-FP8 compressed-KV store versus the f16 store
-/// (`COMP_KV_FP8=0`), BIT-IDENTICAL logits required (the packed rows expand
-/// to exactly the f16 the old cache held, so nothing downstream may move):
+/// ONE weight load, the packed stores (FP8 compressed KV via `COMP_KV_FP8`,
+/// E2M1 indexer keys via `INDEXER_KEYS_E2M1`) versus the f16 stores in every
+/// combination, BIT-IDENTICAL logits required (the packed rows expand to
+/// exactly the f16 the old caches held, so nothing downstream may move):
 ///   A. long prompt (T_LONG, cycled dump residuals — timing-style inputs,
 ///      but identical for both stores) through the production two-lane
 ///      pipelined prefill, then N_DEC decode tokens: exercises the batched
@@ -1000,32 +1001,46 @@ fn fp8_kv_store_ab_one_load() -> eyre::Result<()> {
         Ok((p, dec))
     };
 
+    // Store combinations: (COMP_KV_FP8, INDEXER_KEYS_E2M1). The default
+    // (both packed) is the reference; a same-config control run proves
+    // determinism; then keys-only-f16 and both-f16 must be bit-identical.
+    let combos: [(&str, Option<&str>, Option<&str>); 3] = [
+        ("keys=f16", None, Some("0")),
+        ("both=f16", Some("0"), Some("0")),
+        ("main=f16", Some("0"), None),
+    ];
+    let set = |fp8: Option<&str>, e2m1: Option<&str>| {
+        match fp8 { Some(v) => std::env::set_var("COMP_KV_FP8", v), None => std::env::remove_var("COMP_KV_FP8") }
+        match e2m1 { Some(v) => std::env::set_var("INDEXER_KEYS_E2M1", v), None => std::env::remove_var("INDEXER_KEYS_E2M1") }
+    };
     let mut bad: Vec<String> = Vec::new();
     for (t, name) in [(t_long, "long"), (t_short, "short")] {
-        std::env::remove_var("COMP_KV_FP8");
-        let (p_fp8, d_fp8) = run(t, &format!("{name}/fp8"))?;
-        // Determinism control: the same store twice must be bit-identical,
+        set(None, None);
+        let (p_ref, d_ref) = run(t, &format!("{name}/packed"))?;
+        // Determinism control: the same stores twice must be bit-identical,
         // otherwise a nonzero A/B diff below is not attributable.
-        let (p_ctl, d_ctl) = run(t, &format!("{name}/fp8-again"))?;
-        let (mc, _) = max_abs_diff(&p_fp8, &p_ctl);
-        let mcd = d_fp8.iter().zip(d_ctl.iter()).map(|(a, b)| max_abs_diff(a, b).0).fold(0f32, f32::max);
-        eprintln!("[{name}] CONTROL fp8 vs fp8: prefill {mc:.4e}, decode {mcd:.4e}");
+        let (p_ctl, d_ctl) = run(t, &format!("{name}/packed-again"))?;
+        let (mc, _) = max_abs_diff(&p_ref, &p_ctl);
+        let mcd = d_ref.iter().zip(d_ctl.iter()).map(|(a, b)| max_abs_diff(a, b).0).fold(0f32, f32::max);
+        eprintln!("[{name}] CONTROL packed vs packed: prefill {mc:.4e}, decode {mcd:.4e}");
         if mc != 0.0 || mcd != 0.0 { bad.push(format!("{name}: control run not deterministic (prefill {mc:.3e}, decode {mcd:.3e})")); }
-        std::env::set_var("COMP_KV_FP8", "0");
-        let (p_f16, d_f16) = run(t, &format!("{name}/f16"))?;
-        std::env::remove_var("COMP_KV_FP8");
-        let (mp, ip) = max_abs_diff(&p_fp8, &p_f16);
-        eprintln!("[{name}] prefill logits: max abs diff = {mp:.4e} @i={ip} (fp8 {:.5} f16 {:.5})", p_fp8[ip], p_f16[ip]);
-        if mp != 0.0 { bad.push(format!("{name}: prefill logits differ by {mp:.3e}")); }
-        let mut worst = (0f32, 0usize, 0usize);
-        for (i, (a, b)) in d_fp8.iter().zip(d_f16.iter()).enumerate() {
-            let (m, j) = max_abs_diff(a, b);
-            if m > worst.0 { worst = (m, i, j); }
+        for (cname, fp8, e2m1) in combos {
+            set(fp8, e2m1);
+            let (p_v, d_v) = run(t, &format!("{name}/{cname}"))?;
+            set(None, None);
+            let (mp, ip) = max_abs_diff(&p_ref, &p_v);
+            eprintln!("[{name}/{cname}] prefill logits: max abs diff = {mp:.4e} @i={ip} (packed {:.5} vs {:.5})", p_ref[ip], p_v[ip]);
+            if mp != 0.0 { bad.push(format!("{name}/{cname}: prefill logits differ by {mp:.3e}")); }
+            let mut worst = (0f32, 0usize, 0usize);
+            for (i, (a, b)) in d_ref.iter().zip(d_v.iter()).enumerate() {
+                let (m, j) = max_abs_diff(a, b);
+                if m > worst.0 { worst = (m, i, j); }
+            }
+            eprintln!("[{name}/{cname}] decode logits over {n_dec} steps: max abs diff = {:.4e} @step={} i={}", worst.0, worst.1, worst.2);
+            if worst.0 != 0.0 { bad.push(format!("{name}/{cname}: decode logits differ by {:.3e} at step {}", worst.0, worst.1)); }
         }
-        eprintln!("[{name}] decode logits over {n_dec} steps: max abs diff = {:.4e} @step={} i={}", worst.0, worst.1, worst.2);
-        if worst.0 != 0.0 { bad.push(format!("{name}: decode logits differ by {:.3e} at step {}", worst.0, worst.1)); }
     }
-    if !bad.is_empty() { return Err(eyre!("fp8 kv store A/B failed: {}", bad.join("; "))); }
-    eprintln!("FP8 KV STORE A/B: BIT-IDENTICAL logits on prefill + decode, long (sparse) and short (dense) — one load");
+    if !bad.is_empty() { return Err(eyre!("packed store A/B failed: {}", bad.join("; "))); }
+    eprintln!("PACKED STORE A/B: BIT-IDENTICAL logits on prefill + decode across all four store combinations, long (sparse) and short (dense) — one load");
     Ok(())
 }
