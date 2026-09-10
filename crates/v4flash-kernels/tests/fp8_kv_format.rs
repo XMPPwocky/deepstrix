@@ -13,16 +13,15 @@
 //! 3. chain oracle on random rows: old chain
 //!    (`fp8_e4m3fn_quantize -> f16_roundtrip -> comp_kv_append`) versus new
 //!    chain (`comp_kv_append_fp8 -> {expand, gather}`) — u16-exact, single
-//!    and batched, plus the head shadow, the host unpack reference, and the
-//!    host f16 -> packed recovery used by the v3 snapshot conversion.
+//!    and batched, plus the head shadow and the host unpack reference.
 //!
 //! `cargo test -p v4flash-kernels --release --test fp8_kv_format -- --nocapture`
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::comp_kv_fp8::{
-    expand_half_bits_host, pack_row_from_f16_host, unpack_row_host, FP8_KV_HEAD_DIM,
-    FP8_KV_HEAD_ROWS, FP8_KV_N_NOPE, FP8_KV_ROW_BYTES,
+    expand_half_bits_host, unpack_row_host, FP8_KV_HEAD_DIM, FP8_KV_HEAD_ROWS, FP8_KV_N_NOPE,
+    FP8_KV_ROW_BYTES,
 };
 use v4flash_kernels::{CompKvAppend, CompKvFp8, F16Roundtrip, Fp8E4m3fnQuantize};
 
@@ -447,41 +446,6 @@ fn chain_oracle(k: &Kernels, dev: i32, stream: &Stream, rng: &mut Rng) -> eyre::
     }
     println!("  host unpack reference: {n_rows}/{n_rows} rows identical to device expand");
 
-    // v3 conversion path: recover packed rows from the OLD f16 rows on the
-    // host, expand on device, compare to the old rows. Rows the host
-    // refuses are reported (expected only for flushed blocks); rows it
-    // accepts MUST round-trip exactly.
-    let mut rec = vec![0u8; n_rows * FP8_KV_ROW_BYTES];
-    let mut refused = 0usize;
-    let mut accepted_rows = Vec::new();
-    for r in 0..n_rows {
-        let row = &old_b[r * FP8_KV_HEAD_DIM..(r + 1) * FP8_KV_HEAD_DIM];
-        if pack_row_from_f16_host(row, &mut rec[r * FP8_KV_ROW_BYTES..(r + 1) * FP8_KV_ROW_BYTES]).is_some() {
-            accepted_rows.push(r);
-        } else {
-            refused += 1;
-        }
-    }
-    let mut recd = DeviceBuffer::<u8>::new(dev, rec.len())?;
-    recd.copy_from_host(&rec)?;
-    let mut rexp = DeviceBuffer::<u16>::new(dev, rows.len())?;
-    k.new.launch_expand(stream, &mut rexp, &recd, n_rows as u32)?;
-    stream.synchronize()?;
-    let mut rh = vec![0u16; rows.len()];
-    rexp.copy_to_host(&mut rh)?;
-    let mut conv_bad = 0usize;
-    for &r in &accepted_rows {
-        if rh[r * FP8_KV_HEAD_DIM..(r + 1) * FP8_KV_HEAD_DIM] != old_b[r * FP8_KV_HEAD_DIM..(r + 1) * FP8_KV_HEAD_DIM] {
-            conv_bad += 1;
-        }
-    }
-    if conv_bad != 0 {
-        return Err(eyre!("v3 conversion: {conv_bad} host-accepted rows do not round-trip on device"));
-    }
-    println!(
-        "  v3 conversion: {} rows recovered and device-verified exact, {refused} refused (flushed blocks)",
-        accepted_rows.len()
-    );
     Ok(())
 }
 

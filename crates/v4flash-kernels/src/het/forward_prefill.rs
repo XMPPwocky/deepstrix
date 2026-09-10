@@ -1516,6 +1516,9 @@ impl HeterogeneousEngine {
                             FP8_KV_HEAD_ROWS as u32,
                         )?;
                     }
+                    CompKvStore::E2m1(_) => {
+                        return Err(eyre!("L{layer}: main compressor store cannot be E2M1"));
+                    }
                 }
             }
         } else {
@@ -1697,21 +1700,34 @@ impl HeterogeneousEngine {
                     &mut sd.comp_rows_batched,
                     n_idx_boundaries,
                 )?;
-                de.f16rt.launch(
-                    &de.compute,
-                    &mut sd.comp_rows_batched,
-                    n_idx_boundaries * ihd,
-                )?;
-                de.comp_kv_append.launch_batched(
-                    &de.compute,
-                    ics.comp_kv
-                        .f16_mut()
-                        .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16"))?,
-                    &sd.comp_rows_batched,
-                    n_idx_comp_start,
-                    ihd,
-                    n_idx_boundaries,
-                )?;
+                match &mut ics.comp_kv {
+                    // Packed-E2M1 keys: (code, e) re-derived from the QAT'd
+                    // rows, no f16 round trip.
+                    CompKvStore::E2m1(rows) => de.index_kv_e2m1.launch_append_batched(
+                        &de.compute,
+                        rows,
+                        &sd.comp_rows_batched,
+                        n_idx_comp_start,
+                        n_idx_boundaries,
+                    )?,
+                    other => {
+                        de.f16rt.launch(
+                            &de.compute,
+                            &mut sd.comp_rows_batched,
+                            n_idx_boundaries * ihd,
+                        )?;
+                        de.comp_kv_append.launch_batched(
+                            &de.compute,
+                            other
+                                .f16_mut()
+                                .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16 or e2m1"))?,
+                            &sd.comp_rows_batched,
+                            n_idx_comp_start,
+                            ihd,
+                            n_idx_boundaries,
+                        )?;
+                    }
+                }
             }
         }
         drop(_t_kv_append_comp);
@@ -1966,7 +1982,43 @@ impl HeterogeneousEngine {
                     // stay selectable via INDEXER_SCORE_VARIANT.
                     // Read per call (not LazyLock) so in-process A/B sweeps can flip it.
                     let score_gemm = std::env::var("INDEXER_SCORE_VARIANT").map(|v| v == "gemm").unwrap_or(true);
-                    if score_gemm {
+                    if let CompKvStore::E2m1(rows) = &ics.comp_kv {
+                        // Packed keys: gemm / mw twins expand at their loads;
+                        // the 1-wave `sw` kernel has no packed twin.
+                        if score_gemm {
+                            de.q8k.launch_cast_f16(&de.compute, &mut sd.indexer_q16, &sd.indexer_q,
+                                b * N_INDEXER_HEAD * N_INDEXER_HEAD_DIM)?;
+                            wmma.launch_batched_gemm_e2m1(
+                                &de.compute,
+                                &mut sd.indexer_scores,
+                                &sd.indexer_q16,
+                                &sd.indexer_head_weights,
+                                rows,
+                                &sd.n_index_comp_per_b,
+                                n_idx_max,
+                                ATTN_MIXED_MAX_KEYS,
+                                b,
+                                0,
+                            )?;
+                        } else if *SCORE_MW {
+                            wmma.launch_batched_mw_e2m1(
+                                &de.compute,
+                                &mut sd.indexer_scores,
+                                &sd.indexer_q,
+                                &sd.indexer_head_weights,
+                                rows,
+                                &sd.n_index_comp_per_b,
+                                n_idx_max,
+                                ATTN_MIXED_MAX_KEYS,
+                                b,
+                            )?;
+                        } else {
+                            return Err(eyre!(
+                                "L{layer}: INDEXER_SCORE_VARIANT=sw is not available with the packed-E2M1 \
+                                 key store (INDEXER_KEYS_E2M1=0 for the f16 store)"
+                            ));
+                        }
+                    } else if score_gemm {
                         de.q8k.launch_cast_f16(&de.compute, &mut sd.indexer_q16, &sd.indexer_q,
                             b * N_INDEXER_HEAD * N_INDEXER_HEAD_DIM)?;
                         wmma.launch_batched_gemm(
@@ -2063,6 +2115,9 @@ impl HeterogeneousEngine {
                             INDEXER_TOP_K,
                             b,
                         )?,
+                        CompKvStore::E2m1(_) => {
+                            return Err(eyre!("L{layer}: main compressor store cannot be E2M1"));
+                        }
                     }
                 }
                 // Re-upload sparse n_comp_per (= min(actual, INDEXER_TOP_K))

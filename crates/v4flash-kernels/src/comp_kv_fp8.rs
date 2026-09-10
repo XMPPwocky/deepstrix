@@ -15,14 +15,12 @@
 //! Device kernels live in `kernels/comp_kv_fp8.hip`; the numerics they
 //! share with the historical quantiser are in
 //! `kernels/fp8_e4m3fn_common.inc`. The host functions here
-//! ([`pack_row_from_f16_host`], [`unpack_row_host`]) are the reference used by the
-//! tests and by the v3 -> v4 snapshot conversion; the device expand is the
-//! authority (the conversion re-verifies on device).
+//! ([`expand_half_bits_host`], [`unpack_row_host`]) are the reference the
+//! tests compare the device expand against.
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
-use crate::iq2_xxs_tables::f16_to_f32;
 use crate::weight_contract::f32_to_f16_bits;
 
 const COMP_KV_FP8_GFX1201: &[u8] = include_bytes!(env!("KERNEL_COMP_KV_FP8_GFX1201"));
@@ -74,8 +72,8 @@ pub fn expand_half_bits_host(code: u8, e: i8) -> u16 {
 /// Sign applied to the f16 bits (see the device expand for why).
 #[inline]
 fn expand_half_bits_scaled(code: u8, scale: f32) -> u16 {
-    let idx = (code & 0x7F) as usize;
-    let m = if idx < 127 { magnitude_table()[idx] } else { 0.0 };
+    let idx = code & 0x7F;
+    let m = if idx < 127 { e4m3fn_magnitude(idx) } else { 0.0 };
     f32_to_f16_bits(m * scale) | ((code as u16 & 0x80) << 8)
 }
 
@@ -90,115 +88,6 @@ pub fn unpack_row_host(packed: &[u8], out: &mut [u16]) {
         let o = FP8_KV_OFF_ROPE + r * 2;
         out[FP8_KV_N_NOPE + r] = u16::from_le_bytes([packed[o], packed[o + 1]]);
     }
-}
-
-/// Recover a packed row from an f16 row that was produced by the f16 path
-/// (`fp8_e4m3fn_quantize -> f16_roundtrip -> comp_kv_append`). Used by the
-/// v3 -> v4 snapshot conversion. Returns `None` when some value in some
-/// block is not exactly `half_rn(±table[idx] * 2^e')` for the recovered
-/// `e'` — the caller must then refuse the row (the amax floor case
-/// `e = -22` can flush to f16 subnormal/zero and is not recoverable in
-/// general). The recovered exponent is `ceil(log2(amax/448))` computed
-/// from the STORED values, which is `e0` or `e0 - 1` (the stored block
-/// max is at most the original amax); both are tried.
-///
-/// A row that converts here must still be verified through the device
-/// expand before it is trusted — host and device f16 rounding agree on
-/// normal values, and the device is what production reads.
-pub fn pack_row_from_f16_host(row: &[u16], out: &mut [u8]) -> Option<()> {
-    assert!(row.len() >= FP8_KV_HEAD_DIM && out.len() >= FP8_KV_ROW_BYTES);
-    for blk in 0..FP8_KV_N_BLOCKS {
-        let vals = &row[blk * 64..blk * 64 + 64];
-        let amax = vals
-            .iter()
-            .map(|&b| f16_to_f32(b).abs())
-            .fold(0f32, f32::max);
-        // The producer's floor (amax < 1e-4 -> 1e-4) gives e = -22 at most
-        // negative; a stored all-zero block therefore came from e = -22
-        // (or from a block whose values all flushed). Try the direct
-        // recovery first, then e0 - 1.
-        let amax_eff = if amax < 1.0e-4 { 1.0e-4 } else { amax };
-        let e_direct = (amax_eff / 448.0).log2().ceil() as i32;
-        let mut found = false;
-        for e_try in [e_direct, e_direct + 1, e_direct - 1] {
-            if !(-128..=127).contains(&e_try) {
-                continue;
-            }
-            let mut ok = true;
-            let mut codes = [0u8; 64];
-            let scale = 2f32.powi(e_try);
-            let inv_scale = 2f32.powi(-e_try);
-            for (j, &b) in vals.iter().enumerate() {
-                match code_for_half(b, scale, inv_scale) {
-                    Some(c) => codes[j] = c,
-                    None => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if ok {
-                out[blk * 64..blk * 64 + 64].copy_from_slice(&codes);
-                out[FP8_KV_OFF_EXP + blk] = e_try as i8 as u8;
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            return None;
-        }
-    }
-    out[FP8_KV_OFF_EXP + FP8_KV_N_BLOCKS] = 0;
-    for r in 0..FP8_KV_N_ROT {
-        let o = FP8_KV_OFF_ROPE + r * 2;
-        out[o..o + 2].copy_from_slice(&row[FP8_KV_N_NOPE + r].to_le_bytes());
-    }
-    for b in out.iter_mut().take(FP8_KV_ROW_BYTES).skip(FP8_KV_OFF_ROPE + FP8_KV_N_ROT * 2) {
-        *b = 0;
-    }
-    Some(())
-}
-
-/// The 127 reachable E4M3FN magnitudes, ascending (index = table index).
-fn magnitude_table() -> &'static [f32; 127] {
-    static T: std::sync::OnceLock<[f32; 127]> = std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        let mut t = [0f32; 127];
-        for (i, v) in t.iter_mut().enumerate() {
-            *v = e4m3fn_magnitude(i as u8);
-        }
-        t
-    })
-}
-
-/// The code whose expansion at exponent `e` is exactly the f16 `bits`,
-/// if any. Sign of zero is preserved (`0x8000` -> code `0x80`).
-///
-/// O(1) per value (a 7-step binary search plus a verification window of
-/// five candidates): a 192K session converts in seconds, not minutes.
-/// The magnitude `|v| * 2^-e` is exactly a table value whenever the store
-/// did not round (every normal-range value); the window covers the
-/// f16-subnormal cases where several neighbouring codes round to the
-/// same stored value.
-fn code_for_half(bits: u16, scale: f32, inv_scale: f32) -> Option<u8> {
-    let sign = (bits & 0x8000) != 0;
-    let mag = f16_to_f32(bits & 0x7FFF) * inv_scale;
-    let table = magnitude_table();
-    // Largest index with table[idx] <= mag (partition_point gives the
-    // first index with table[idx] > mag).
-    let hi = table.partition_point(|&t| t <= mag);
-    let base = hi.saturating_sub(1) as i32;
-    for delta in [0i32, 1, -1, 2, -2] {
-        let idx = base + delta;
-        if !(0..127).contains(&idx) {
-            continue;
-        }
-        let code = if sign { idx as u8 | 0x80 } else { idx as u8 };
-        if expand_half_bits_scaled(code, scale) == bits {
-            return Some(code);
-        }
-    }
-    None
 }
 
 /// Kernel handle for the packed-FP8 compressed-KV path.
@@ -468,141 +357,12 @@ mod tests {
     }
 
     #[test]
-    fn host_pack_unpack_round_trip_from_f16() {
-        // Build an f16 row the way the producer would: codes at a known e.
-        let mut packed = vec![0u8; FP8_KV_ROW_BYTES];
-        for d in 0..FP8_KV_N_NOPE {
-            packed[d] = ((d * 37) % 127) as u8 | if d % 3 == 0 { 0x80 } else { 0 };
-        }
-        for blk in 0..FP8_KV_N_BLOCKS {
-            packed[FP8_KV_OFF_EXP + blk] = (-(blk as i8) - 5) as u8;
-        }
-        for r in 0..FP8_KV_N_ROT {
-            let bits = f32_to_f16_bits(0.25 * r as f32 - 3.0);
-            packed[FP8_KV_OFF_ROPE + r * 2..FP8_KV_OFF_ROPE + r * 2 + 2].copy_from_slice(&bits.to_le_bytes());
-        }
-        let mut row = vec![0u16; FP8_KV_HEAD_DIM];
-        unpack_row_host(&packed, &mut row);
-        let mut repacked = vec![0u8; FP8_KV_ROW_BYTES];
-        pack_row_from_f16_host(&row, &mut repacked).expect("recoverable");
-        let mut row2 = vec![0u16; FP8_KV_HEAD_DIM];
-        unpack_row_host(&repacked, &mut row2);
-        assert_eq!(row, row2, "expansion must be identical after recovery");
-    }
-
-    #[test]
     fn negative_zero_code_is_preserved() {
         assert_eq!(expand_half_bits_host(0x80, -5), 0x8000);
         assert_eq!(expand_half_bits_host(0x00, -5), 0x0000);
-        let (sc, inv) = (2f32.powi(-5), 2f32.powi(5));
-        assert_eq!(code_for_half(0x8000, sc, inv), Some(0x80));
-        assert_eq!(code_for_half(0x0000, sc, inv), Some(0x00));
     }
 }
 
 // The dense attention path is taken only while `n_comp <= INDEXER_TOP_K`;
 // the head shadow must cover exactly that.
 const _: () = assert!(FP8_KV_HEAD_ROWS == crate::config::INDEXER_TOP_K as usize);
-
-#[cfg(test)]
-mod conversion_speed {
-    use super::*;
-
-    /// Host-only: how long the v3 -> v4 recovery takes per row, so the
-    /// restore cost of an old snapshot is known (192K = 21 x 49152 rows).
-    #[test]
-    fn recovery_throughput() {
-        let mut rows: Vec<u16> = Vec::new();
-        let mut packed = vec![0u8; FP8_KV_ROW_BYTES];
-        let mut seed = 0x1234_5678_9abc_def0u64;
-        let n = 2000usize;
-        for _ in 0..n {
-            for d in 0..FP8_KV_N_NOPE {
-                seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
-                packed[d] = (seed % 127) as u8 | if seed & 0x100 != 0 { 0x80 } else { 0 };
-            }
-            for blk in 0..FP8_KV_N_BLOCKS {
-                seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
-                packed[FP8_KV_OFF_EXP + blk] = ((seed % 20) as i8 - 14) as u8;
-            }
-            let mut row = vec![0u16; FP8_KV_HEAD_DIM];
-            unpack_row_host(&packed, &mut row);
-            rows.extend_from_slice(&row);
-        }
-        let mut out = vec![0u8; FP8_KV_ROW_BYTES];
-        let t0 = std::time::Instant::now();
-        let mut ok = 0;
-        for r in 0..n {
-            if pack_row_from_f16_host(&rows[r * FP8_KV_HEAD_DIM..(r + 1) * FP8_KV_HEAD_DIM], &mut out).is_some() {
-                ok += 1;
-            }
-        }
-        let dt = t0.elapsed();
-        let per_row = dt.as_secs_f64() / n as f64;
-        eprintln!(
-            "recovery: {ok}/{n} rows, {:.1} us/row -> 192K session (21 x 49152 rows) = {:.1} s",
-            per_row * 1e6,
-            per_row * 21.0 * 49152.0
-        );
-        assert_eq!(ok, n);
-    }
-}
-
-#[cfg(test)]
-mod real_snapshot_conversion {
-    use super::*;
-
-    /// Host-only check of the v3 -> v4 recovery against a REAL on-disk f16
-    /// comp_kv.bin (FP8_KV_V3_BLOB=<path>, FP8_KV_V3_META=<meta.json>):
-    /// every ratio-4 row must recover and expand back bit-identically.
-    /// Skipped when the env is unset.
-    #[test]
-    fn real_v3_blob_recovers() {
-        let Ok(blob) = std::env::var("FP8_KV_V3_BLOB") else { return };
-        let meta = std::env::var("FP8_KV_V3_META").expect("FP8_KV_V3_META");
-        let bytes = std::fs::read(&blob).expect("read blob");
-        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&meta).expect("read meta")).unwrap();
-        assert_eq!(meta["format_version"].as_u64(), Some(3), "expected a v3 snapshot");
-        let layers = meta["layers"].as_array().unwrap();
-        let mut off = 0usize;
-        let (mut rows_total, mut rows_refused, mut rows_rebased, mut neg_zero, mut values) = (0usize, 0usize, 0usize, 0usize, 0usize);
-        let t0 = std::time::Instant::now();
-        let mut packed = vec![0u8; FP8_KV_ROW_BYTES];
-        let mut back = vec![0u16; FP8_KV_HEAD_DIM];
-        for (li, l) in layers.iter().enumerate() {
-            if !l["has_compressor"].as_bool().unwrap_or(false) { continue; }
-            let n_comp = l["n_comp"].as_u64().unwrap() as usize;
-            let head_dim = l["head_dim"].as_u64().unwrap() as usize;
-            let n = n_comp * head_dim;
-            let words: Vec<u16> = bytes[off..off + n * 2].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-            off += n * 2;
-            if l["ratio"].as_u64() != Some(4) || head_dim != FP8_KV_HEAD_DIM { continue; }
-            for r in 0..n_comp {
-                let row = &words[r * head_dim..(r + 1) * head_dim];
-                rows_total += 1;
-                values += FP8_KV_N_NOPE;
-                neg_zero += row[..FP8_KV_N_NOPE].iter().filter(|&&w| w == 0x8000).count();
-                match pack_row_from_f16_host(row, &mut packed) {
-                    None => { rows_refused += 1; if rows_refused <= 5 { eprintln!("  L{li} row {r}: refused"); } }
-                    Some(()) => {
-                        unpack_row_host(&packed, &mut back);
-                        assert!(back[..] == row[..], "L{li} row {r}: host round trip differs");
-                        // Producer would have used e0 = ceil(log2(amax/448)) of the ORIGINAL amax;
-                        // count rows where any block came back at e0-1 relative to the stored amax's direct e.
-                        for blk in 0..FP8_KV_N_BLOCKS {
-                            let amax = row[blk * 64..blk * 64 + 64].iter().map(|&b| f16_to_f32(b).abs()).fold(0f32, f32::max).max(1e-4);
-                            let e_direct = (amax / 448.0).log2().ceil() as i32;
-                            if packed[FP8_KV_OFF_EXP + blk] as i8 as i32 != e_direct { rows_rebased += 1; break; }
-                        }
-                    }
-                }
-            }
-        }
-        assert_eq!(off, bytes.len(), "blob size mismatch vs meta");
-        eprintln!(
-            "real v3 blob: {rows_total} ratio-4 rows ({values} values): refused {rows_refused}, rebased-exponent rows {rows_rebased}, -0.0 words {neg_zero}, {:.1} s",
-            t0.elapsed().as_secs_f64()
-        );
-        assert_eq!(rows_refused, 0, "real snapshot rows must all convert");
-    }
-}

@@ -39,6 +39,7 @@ use super::engine::{DeviceEngine, ExecMode, HeterogeneousEngine};
 use super::scratch::{DgpuScratch, IgpuScratch};
 use super::state::{CompKvStore, HetLayerState};
 use crate::comp_kv_fp8::FP8_KV_HEAD_ROWS;
+use crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES;
 use super::sync::{peer_push_f32, peer_push_i32};
 use super::weights::{DgpuLayerWeights, IgpuLayerWeights};
 use tracing::debug_span;
@@ -684,6 +685,9 @@ impl HeterogeneousEngine {
                             cs.n_comp,
                             FP8_KV_HEAD_ROWS as u32,
                         )?,
+                        CompKvStore::E2m1(_) => {
+                            return Err(eyre!("L{layer}: main compressor store cannot be E2M1"))
+                        }
                     }
                 }
                 cs.n_comp += 1;
@@ -802,7 +806,10 @@ impl HeterogeneousEngine {
                     let mut row_view = dgpu_scratch.comp_row.slice_view_mut(0, ihd as usize);
                     de.indexer_qat.launch(&de.compute, &mut row_view, 1)?;
                 }
-                {
+                // Packed-E2M1 key store: the append re-derives (code, e) from
+                // the QAT'd f32 row itself (no f16 round trip needed).
+                let packed_keys = ics.comp_kv.is_e2m1();
+                if !packed_keys {
                     let _t = de.events.stage("k.indexer_compressor.f16rt", &de.compute)?;
                     let mut row_view = dgpu_scratch.comp_row.slice_view_mut(0, ihd as usize);
                     de.f16rt.launch(&de.compute, &mut row_view, ihd)?;
@@ -819,15 +826,23 @@ impl HeterogeneousEngine {
                 {
                     let _t = de.events.stage("k.indexer_compressor.comp_kv_append", &de.compute)?;
                     let row_view = dgpu_scratch.comp_row.slice_view(0, ihd as usize);
-                    de.comp_kv_append.launch(
-                        &de.compute,
-                        ics.comp_kv
-                            .f16_mut()
-                            .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16"))?,
-                        &row_view,
-                        ics.n_comp,
-                        ihd,
-                    )?;
+                    match &mut ics.comp_kv {
+                        CompKvStore::E2m1(rows) => de.index_kv_e2m1.launch_append(
+                            &de.compute,
+                            rows,
+                            &row_view,
+                            ics.n_comp,
+                        )?,
+                        other => de.comp_kv_append.launch(
+                            &de.compute,
+                            other
+                                .f16_mut()
+                                .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16 or e2m1"))?,
+                            &row_view,
+                            ics.n_comp,
+                            ihd,
+                        )?,
+                    }
                 }
                 ics.n_comp += 1;
             }
@@ -939,47 +954,81 @@ impl HeterogeneousEngine {
                 // Prefer the WMMA variant when available (28× faster at
                 // production decode shape); fall back to the naive kernel
                 // on iGPU or any arch without WMMA support.
-                let kv_slice = ics_ref
-                    .comp_kv
-                    .f16()
-                    .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16"))?
-                    .slice_view(0, (n_index_comp * N_INDEXER_HEAD_DIM) as usize);
-                if let Some(wmma) = de.indexer_score_wmma.as_ref() {
-                    // M58: multi-wave by default (INDEXER_DECODE=sw rolls
-                    // back to the 1-wave kernel).
-                    static MW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-                        std::env::var("INDEXER_DECODE").map(|v| v != "sw").unwrap_or(true)
-                    });
-                    if *MW {
-                        wmma.launch_mw(
-                            &de.compute,
-                            &mut dgpu_scratch.indexer_scores,
-                            &dgpu_scratch.indexer_q,
-                            &dgpu_scratch.indexer_head_weights,
-                            &kv_slice,
-                            n_index_comp,
-                        )?;
-                    } else {
-                        wmma.launch(
-                            &de.compute,
-                            &mut dgpu_scratch.indexer_scores,
-                            &dgpu_scratch.indexer_q,
-                            &dgpu_scratch.indexer_head_weights,
-                            &kv_slice,
-                            n_index_comp,
-                        )?;
+                // M58: multi-wave by default (INDEXER_DECODE=sw rolls
+                // back to the 1-wave kernel; f16 store only).
+                static MW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                    std::env::var("INDEXER_DECODE").map(|v| v != "sw").unwrap_or(true)
+                });
+                match &ics_ref.comp_kv {
+                    CompKvStore::E2m1(rows) => {
+                        // Packed keys: the *_e2m1 twins expand at their loads.
+                        let kv_slice = rows.slice_view(0, (n_index_comp as usize) * E2M1_KEY_ROW_BYTES);
+                        if let Some(wmma) = de.indexer_score_wmma.as_ref() {
+                            if !*MW {
+                                return Err(eyre!(
+                                    "L{layer}: INDEXER_DECODE=sw is not available with the packed-E2M1 \
+                                     key store (INDEXER_KEYS_E2M1=0 for the f16 store)"
+                                ));
+                            }
+                            wmma.launch_mw_e2m1(
+                                &de.compute,
+                                &mut dgpu_scratch.indexer_scores,
+                                &dgpu_scratch.indexer_q,
+                                &dgpu_scratch.indexer_head_weights,
+                                &kv_slice,
+                                n_index_comp,
+                            )?;
+                        } else {
+                            de.indexer_score.launch_e2m1(
+                                &de.compute,
+                                &mut dgpu_scratch.indexer_scores,
+                                &dgpu_scratch.indexer_q,
+                                &dgpu_scratch.indexer_head_weights,
+                                &kv_slice,
+                                n_index_comp,
+                                N_INDEXER_HEAD,
+                                N_INDEXER_HEAD_DIM,
+                            )?;
+                        }
                     }
-                } else {
-                    de.indexer_score.launch(
-                        &de.compute,
-                        &mut dgpu_scratch.indexer_scores,
-                        &dgpu_scratch.indexer_q,
-                        &dgpu_scratch.indexer_head_weights,
-                        &kv_slice,
-                        n_index_comp,
-                        N_INDEXER_HEAD,
-                        N_INDEXER_HEAD_DIM,
-                    )?;
+                    other => {
+                        let kv_slice = other
+                            .f16()
+                            .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16 or e2m1"))?
+                            .slice_view(0, (n_index_comp * N_INDEXER_HEAD_DIM) as usize);
+                        if let Some(wmma) = de.indexer_score_wmma.as_ref() {
+                            if *MW {
+                                wmma.launch_mw(
+                                    &de.compute,
+                                    &mut dgpu_scratch.indexer_scores,
+                                    &dgpu_scratch.indexer_q,
+                                    &dgpu_scratch.indexer_head_weights,
+                                    &kv_slice,
+                                    n_index_comp,
+                                )?;
+                            } else {
+                                wmma.launch(
+                                    &de.compute,
+                                    &mut dgpu_scratch.indexer_scores,
+                                    &dgpu_scratch.indexer_q,
+                                    &dgpu_scratch.indexer_head_weights,
+                                    &kv_slice,
+                                    n_index_comp,
+                                )?;
+                            }
+                        } else {
+                            de.indexer_score.launch(
+                                &de.compute,
+                                &mut dgpu_scratch.indexer_scores,
+                                &dgpu_scratch.indexer_q,
+                                &dgpu_scratch.indexer_head_weights,
+                                &kv_slice,
+                                n_index_comp,
+                                N_INDEXER_HEAD,
+                                N_INDEXER_HEAD_DIM,
+                            )?;
+                        }
+                    }
                 }
                 // 6. IndexerTopk → sorted indices + bitmap. The bitonic
                 // variant (ported from ds4) is 72× faster than the
@@ -1013,6 +1062,9 @@ impl HeterogeneousEngine {
                         &dgpu_scratch.indexer_selected,
                         INDEXER_TOP_K,
                     )?,
+                    CompKvStore::E2m1(_) => {
+                        return Err(eyre!("L{layer}: main compressor store cannot be E2M1"))
+                    }
                 }
                 drop(_s_ix);
                 _t_ix.end()?;

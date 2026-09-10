@@ -8,6 +8,7 @@ use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer};
 
 use crate::comp_kv_fp8::{FP8_KV_HEAD_ROWS, FP8_KV_ROW_BYTES};
+use crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES;
 use crate::config::{COMPRESS_RATIOS, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, NEG_INF, SWA_WINDOW};
 use crate::het::batch_scratch::B_MAX;
 
@@ -33,12 +34,18 @@ pub const KV_CACHE_ROWS: usize = SWA_WINDOW as usize + B_MAX;
 /// The sparse path expands selected rows into `active_comp_kv` via
 /// `indexer_gather_fp8`, so the attention kernels never see the packed
 /// format. -42% on the compressed cache (0.42 GiB at 192K).
+/// `E2m1`: the ratio-4 INDEXER compressors (lever 3). `rows` holds packed
+/// [`E2M1_KEY_ROW_BYTES`]-byte rows (E2M1 nibbles + block exponents,
+/// `index_kv_e2m1.rs`), bit-identical to the f16 key rows after expansion;
+/// the score kernels expand at their loads (`*_e2m1` twins), so no f16 copy
+/// exists at all. -69% on the index key cache.
 pub enum CompKvStore {
     F16(DeviceBuffer<u16>),
     Fp8 {
         rows: DeviceBuffer<u8>,
         head: DeviceBuffer<u16>,
     },
+    E2m1(DeviceBuffer<u8>),
 }
 
 impl CompKvStore {
@@ -54,22 +61,50 @@ impl CompKvStore {
             .unwrap_or(true)
     }
 
+    /// Whether the packed E2M1 format is selected for the ratio-4 indexer
+    /// compressor. Read at every allocation. `INDEXER_KEYS_E2M1=0` keeps the
+    /// f16 key cache (rollback / one-load A/B knob).
+    pub fn e2m1_enabled() -> bool {
+        std::env::var("INDEXER_KEYS_E2M1")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("off")))
+            .unwrap_or(true)
+    }
+
     pub fn is_fp8(&self) -> bool {
         matches!(self, CompKvStore::Fp8 { .. })
+    }
+
+    pub fn is_e2m1(&self) -> bool {
+        matches!(self, CompKvStore::E2m1(_))
+    }
+
+    /// The packed rows of an `E2m1` store.
+    pub fn e2m1(&self) -> Option<&DeviceBuffer<u8>> {
+        match self {
+            CompKvStore::E2m1(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn e2m1_mut(&mut self) -> Option<&mut DeviceBuffer<u8>> {
+        match self {
+            CompKvStore::E2m1(b) => Some(b),
+            _ => None,
+        }
     }
 
     /// The f16 buffer of an `F16` store.
     pub fn f16(&self) -> Option<&DeviceBuffer<u16>> {
         match self {
             CompKvStore::F16(b) => Some(b),
-            CompKvStore::Fp8 { .. } => None,
+            _ => None,
         }
     }
 
     pub fn f16_mut(&mut self) -> Option<&mut DeviceBuffer<u16>> {
         match self {
             CompKvStore::F16(b) => Some(b),
-            CompKvStore::Fp8 { .. } => None,
+            _ => None,
         }
     }
 
@@ -92,6 +127,9 @@ impl CompKvStore {
                 }
                 Ok(head)
             }
+            CompKvStore::E2m1(_) => Err(eyre::eyre!(
+                "{what}: dense attention over a packed-E2M1 indexer key store (never a main compressor)"
+            )),
         }
     }
 
@@ -100,6 +138,7 @@ impl CompKvStore {
         match self {
             CompKvStore::F16(b) => b.len() / head_dim as usize,
             CompKvStore::Fp8 { rows, .. } => rows.len() / FP8_KV_ROW_BYTES,
+            CompKvStore::E2m1(rows) => rows.len() / E2M1_KEY_ROW_BYTES,
         }
     }
 }
@@ -153,6 +192,8 @@ impl HetCompressorState {
                 rows: DeviceBuffer::new(dgpu_device.id, (max_n_comp as usize) * FP8_KV_ROW_BYTES)?,
                 head: DeviceBuffer::new(dgpu_device.id, FP8_KV_HEAD_ROWS * (head_dim as usize))?,
             }
+        } else if ratio == 4 && head_dim == N_INDEXER_HEAD_DIM && CompKvStore::e2m1_enabled() {
+            CompKvStore::E2m1(DeviceBuffer::new(dgpu_device.id, (max_n_comp as usize) * E2M1_KEY_ROW_BYTES)?)
         } else {
             let comp_kv_capacity = (max_n_comp as usize) * (head_dim as usize);
             CompKvStore::F16(DeviceBuffer::new(dgpu_device.id, comp_kv_capacity)?)

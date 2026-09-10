@@ -146,6 +146,9 @@ pub struct DeviceEngine {
     /// Packed-FP8 compressed-KV producer / gather / expand (ratio-4 main
     /// compressors, see `CompKvStore`).
     pub comp_kv_fp8: crate::CompKvFp8,
+    /// Packed-E2M1 indexer-key producer / expand (ratio-4 indexer
+    /// compressors, see `CompKvStore::E2m1`).
+    pub index_kv_e2m1: crate::IndexKvE2m1,
     pub router_topk: RouterTopk,
     /// CSA indexer kernels (used only on the dGPU's ratio==4 layers, but
     /// instantiated unconditionally so the engine struct stays symmetric).
@@ -233,6 +236,7 @@ impl DeviceEngine {
             kv_append: KvCacheAppend::for_arch(arch)?,
             comp_kv_append: CompKvAppend::for_arch(arch)?,
             comp_kv_fp8: crate::CompKvFp8::for_arch(arch)?,
+            index_kv_e2m1: crate::IndexKvE2m1::for_arch(arch)?,
             router_topk: RouterTopk::for_arch(arch)?,
             indexer_qat: crate::IndexerQat::for_arch(arch)?,
             indexer_score: crate::IndexerScore::for_arch(arch)?,
@@ -539,6 +543,9 @@ impl HeterogeneousEngine {
                             maybe_dump_subtensor_f16_as_f32(
                                 layer, "attn_comp_kv", &tmp, n_comp_elems
                             )?;
+                        }
+                        CompKvStore::E2m1(_) => {
+                            return Err(eyre::eyre!("L{layer}: main compressor store cannot be E2M1"));
                         }
                     }
                 }
