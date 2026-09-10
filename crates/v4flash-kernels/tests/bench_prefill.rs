@@ -434,14 +434,24 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
             let legacy = vec![("QB_WMMA", Some("lds_tiled")), ("Q8_GROUPED_VARIANT", Some("lds_tiled")), ("Q8_OUT_VARIANT", Some("lds_tiled"))];
             let f16x = vec![("QB_WMMA", None), ("Q8_GROUPED_VARIANT", None), ("Q8_OUT_VARIANT", None)];
             vec![("gemm=f16x", f16x.clone()), ("gemm=lds_tiled", legacy), ("gemm=f16x(2)", f16x)]
-        } else if std::env::var_os("COMP_KV_FP8_AB").is_some() {
+        } else if let Ok(spec) = std::env::var("COMP_KV_FP8_AB") {
             // packed-FP8 compressed-KV store (2026-09-10) vs the f16 store.
             // The store is chosen at HetModelState::alloc, so the state is
             // re-allocated per variant below (prefill is host-driven — no
             // captured graphs bake state pointers — so the engine and
-            // scratch are shared).
-            vec![("kv=fp8", vec![("COMP_KV_FP8", None)]), ("kv=f16", vec![("COMP_KV_FP8", Some("0"))]),
-                 ("kv=fp8(2)", vec![("COMP_KV_FP8", None)])]
+            // scratch are shared). COMP_KV_FP8_AB=1 -> fp8,f16,fp8; or a
+            // comma list of fp8/f16 in any order and length.
+            let order: Vec<&'static str> = if spec == "1" {
+                vec!["fp8", "f16", "fp8"]
+            } else {
+                spec.split(',').map(|t| if t.trim() == "f16" { "f16" } else { "fp8" }).collect()
+            };
+            let names: Vec<&'static str> = order.iter().enumerate()
+                .map(|(i, k)| Box::leak(format!("kv={k}#{i}").into_boxed_str()) as &'static str)
+                .collect();
+            order.iter().zip(names).map(|(k, n)| {
+                (n, vec![("COMP_KV_FP8", if *k == "f16" { Some("0") } else { None })])
+            }).collect()
         } else {
             vec![("qb=current", vec![])]
         };
@@ -456,6 +466,9 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                 }
             }
             if venvs.iter().any(|(k, _)| *k == "COMP_KV_FP8") {
+                // Release the previous state BEFORE allocating the next
+                // (a plain reassignment would hold both: OOM at K=15/192K).
+                state = HetModelState::alloc(dgpu, igpu, 8)?;
                 state = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
                 eprintln!("  (state re-allocated: fp8 store = {})",
                     state.layers[2].compressor.as_ref().map(|c| c.comp_kv.is_fp8()).unwrap_or(false));

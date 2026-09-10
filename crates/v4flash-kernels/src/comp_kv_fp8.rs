@@ -547,3 +547,62 @@ mod conversion_speed {
         assert_eq!(ok, n);
     }
 }
+
+#[cfg(test)]
+mod real_snapshot_conversion {
+    use super::*;
+
+    /// Host-only check of the v3 -> v4 recovery against a REAL on-disk f16
+    /// comp_kv.bin (FP8_KV_V3_BLOB=<path>, FP8_KV_V3_META=<meta.json>):
+    /// every ratio-4 row must recover and expand back bit-identically.
+    /// Skipped when the env is unset.
+    #[test]
+    fn real_v3_blob_recovers() {
+        let Ok(blob) = std::env::var("FP8_KV_V3_BLOB") else { return };
+        let meta = std::env::var("FP8_KV_V3_META").expect("FP8_KV_V3_META");
+        let bytes = std::fs::read(&blob).expect("read blob");
+        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&meta).expect("read meta")).unwrap();
+        assert_eq!(meta["format_version"].as_u64(), Some(3), "expected a v3 snapshot");
+        let layers = meta["layers"].as_array().unwrap();
+        let mut off = 0usize;
+        let (mut rows_total, mut rows_refused, mut rows_rebased, mut neg_zero, mut values) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let t0 = std::time::Instant::now();
+        let mut packed = vec![0u8; FP8_KV_ROW_BYTES];
+        let mut back = vec![0u16; FP8_KV_HEAD_DIM];
+        for (li, l) in layers.iter().enumerate() {
+            if !l["has_compressor"].as_bool().unwrap_or(false) { continue; }
+            let n_comp = l["n_comp"].as_u64().unwrap() as usize;
+            let head_dim = l["head_dim"].as_u64().unwrap() as usize;
+            let n = n_comp * head_dim;
+            let words: Vec<u16> = bytes[off..off + n * 2].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            off += n * 2;
+            if l["ratio"].as_u64() != Some(4) || head_dim != FP8_KV_HEAD_DIM { continue; }
+            for r in 0..n_comp {
+                let row = &words[r * head_dim..(r + 1) * head_dim];
+                rows_total += 1;
+                values += FP8_KV_N_NOPE;
+                neg_zero += row[..FP8_KV_N_NOPE].iter().filter(|&&w| w == 0x8000).count();
+                match pack_row_from_f16_host(row, &mut packed) {
+                    None => { rows_refused += 1; if rows_refused <= 5 { eprintln!("  L{li} row {r}: refused"); } }
+                    Some(()) => {
+                        unpack_row_host(&packed, &mut back);
+                        assert!(back[..] == row[..], "L{li} row {r}: host round trip differs");
+                        // Producer would have used e0 = ceil(log2(amax/448)) of the ORIGINAL amax;
+                        // count rows where any block came back at e0-1 relative to the stored amax's direct e.
+                        for blk in 0..FP8_KV_N_BLOCKS {
+                            let amax = row[blk * 64..blk * 64 + 64].iter().map(|&b| f16_to_f32(b).abs()).fold(0f32, f32::max).max(1e-4);
+                            let e_direct = (amax / 448.0).log2().ceil() as i32;
+                            if packed[FP8_KV_OFF_EXP + blk] as i8 as i32 != e_direct { rows_rebased += 1; break; }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(off, bytes.len(), "blob size mismatch vs meta");
+        eprintln!(
+            "real v3 blob: {rows_total} ratio-4 rows ({values} values): refused {rows_refused}, rebased-exponent rows {rows_rebased}, -0.0 words {neg_zero}, {:.1} s",
+            t0.elapsed().as_secs_f64()
+        );
+        assert_eq!(rows_refused, 0, "real snapshot rows must all convert");
+    }
+}
