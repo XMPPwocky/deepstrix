@@ -912,3 +912,113 @@ fn forward_prefill_all_oracles_one_load() -> eyre::Result<()> {
     eprintln!("ALL PREFILL ORACLES PASS (one load)");
     Ok(())
 }
+
+/// ONE weight load, packed-FP8 compressed-KV store versus the f16 store
+/// (`COMP_KV_FP8=0`), BIT-IDENTICAL logits required (the packed rows expand
+/// to exactly the f16 the old cache held, so nothing downstream may move):
+///   A. long prompt (T_LONG, cycled dump residuals — timing-style inputs,
+///      but identical for both stores) through the production two-lane
+///      pipelined prefill, then N_DEC decode tokens: exercises the batched
+///      producer, the prefill gather (sparse chunks) AND head shadow (dense
+///      chunks), the decode producer and the decode sparse gather.
+///   B. short prompt (T_SHORT) + N_DEC decode tokens: the dense decode path
+///      through the head shadow.
+/// Env: FP8_AB_T_LONG (default 3000), FP8_AB_T_SHORT (200), FP8_AB_N_DEC (24).
+#[test]
+#[ignore]
+fn fp8_kv_store_ab_one_load() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let t_long: usize = std::env::var("FP8_AB_T_LONG").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
+    let t_short: usize = std::env::var("FP8_AB_T_SHORT").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+    let n_dec: usize = std::env::var("FP8_AB_N_DEC").ok().and_then(|s| s.parse().ok()).unwrap_or(24);
+    eprintln!("fp8 kv store A/B: T_long={t_long} T_short={t_short} n_dec={n_dec}");
+    let dump = ActivationDump::open(dump_dir())?;
+    let main_gguf = MappedGguf::open(std::env::var("DEEPSTRIX_GGUF").unwrap_or_else(|_| MAIN_MODEL_PATH.to_string()))?;
+    let dgpu = pick_dgpu()?;
+    let igpu = pick_igpu()?;
+    let dgpu_arch = dgpu.properties()?.gcn_arch_name;
+    let igpu_arch = igpu.properties()?.gcn_arch_name;
+    let rope_for_layer = |layer: i32| -> eyre::Result<RopeParams> {
+        let entry = dump.weight("rope_params", layer).ok_or_else(|| eyre!("missing rope_params L{layer}"))?;
+        let floats = dump.read_f32(entry)?;
+        let n_ctx_orig = if floats[2] != 0.0 { ROPE_ORIG_CTX } else { 0 };
+        RopeParams::from_dump_blob(&floats, n_ctx_orig)
+    };
+    let main_weights = HetModelWeights::load_all(&main_gguf, dgpu, igpu, &rope_for_layer)?;
+    let engine = HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
+
+    let n_real = PROMPT_TOKENS.len();
+    let mut real_hcs: Vec<Vec<f32>> = Vec::with_capacity(n_real);
+    for i in 0..n_real {
+        let entry = dump.tensor("layer_input_residual", 0, i as i32).ok_or_else(|| eyre!("missing layer_input_residual L0 T{i}"))?;
+        real_hcs.push(dump.read_f32(entry)?);
+    }
+    let cycled = |n: usize| -> (Vec<Vec<f32>>, Vec<i32>) {
+        (0..n).map(|i| real_hcs[i % n_real].clone()).collect::<Vec<_>>()
+            .into_iter().zip((0..n).map(|i| PROMPT_TOKENS[i % n_real])).unzip()
+    };
+
+    let lane_rows = B_MAX.div_ceil(2);
+    let mut bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let mut bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let mut bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
+    let mut bi_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let mut sd_p = BatchDgpuShared::alloc_rows(dgpu, lane_rows)?;
+    let mut si_p = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
+    let mut head_scratch = DgpuScratch::alloc(dgpu)?;
+    let mut bs = BatchScratch::alloc(dgpu, igpu)?;
+
+    // One scenario: prefill T tokens (pipelined), then decode n_dec tokens;
+    // returns the prefill logits and every decode step's logits.
+    let mut run = |t: usize, label: &str| -> eyre::Result<(Vec<f32>, Vec<Vec<f32>>)> {
+        let (hcs, toks) = cycled(t + n_dec);
+        let mut st = HetModelState::alloc(dgpu, igpu, (t + n_dec) as u32 + 4)?;
+        let packed = st.layers[2].compressor.as_ref().map(|c| c.comp_kv.is_fp8()).unwrap_or(false);
+        eprintln!("  [{label}] store = {} : prefill {t} ...", if packed { "FP8" } else { "f16" });
+        let p = engine.forward_prefill_pipelined(
+            &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd_p, &mut si_p, &mut head_scratch,
+            &mut st, &main_weights, &hcs[..t], &toks[..t], 0, true, None, None, None, None,
+        )?;
+        let mut dec: Vec<Vec<f32>> = Vec::with_capacity(n_dec);
+        for i in 0..n_dec {
+            let pos = (t + i) as u32;
+            engine.forward_token(&mut bs.shared_dgpu, &mut bs.shared_igpu, &mut st, &main_weights, &hcs[t + i], pos, toks[t + i])?;
+            bs.shared_dgpu.residual.copy_from_buffer(&bs.shared_dgpu.residual_next)?;
+            engine.forward_head(&mut bs.shared_dgpu, &main_weights.global)?;
+            let mut l = vec![0f32; N_VOCAB as usize];
+            bs.shared_dgpu.logits.copy_to_host(&mut l)?;
+            dec.push(l);
+        }
+        eprintln!("  [{label}] done (prefill argmax {}, last decode argmax {})", argmax(&p), argmax(dec.last().unwrap()));
+        Ok((p, dec))
+    };
+
+    let mut bad: Vec<String> = Vec::new();
+    for (t, name) in [(t_long, "long"), (t_short, "short")] {
+        std::env::remove_var("COMP_KV_FP8");
+        let (p_fp8, d_fp8) = run(t, &format!("{name}/fp8"))?;
+        // Determinism control: the same store twice must be bit-identical,
+        // otherwise a nonzero A/B diff below is not attributable.
+        let (p_ctl, d_ctl) = run(t, &format!("{name}/fp8-again"))?;
+        let (mc, _) = max_abs_diff(&p_fp8, &p_ctl);
+        let mcd = d_fp8.iter().zip(d_ctl.iter()).map(|(a, b)| max_abs_diff(a, b).0).fold(0f32, f32::max);
+        eprintln!("[{name}] CONTROL fp8 vs fp8: prefill {mc:.4e}, decode {mcd:.4e}");
+        if mc != 0.0 || mcd != 0.0 { bad.push(format!("{name}: control run not deterministic (prefill {mc:.3e}, decode {mcd:.3e})")); }
+        std::env::set_var("COMP_KV_FP8", "0");
+        let (p_f16, d_f16) = run(t, &format!("{name}/f16"))?;
+        std::env::remove_var("COMP_KV_FP8");
+        let (mp, ip) = max_abs_diff(&p_fp8, &p_f16);
+        eprintln!("[{name}] prefill logits: max abs diff = {mp:.4e} @i={ip} (fp8 {:.5} f16 {:.5})", p_fp8[ip], p_f16[ip]);
+        if mp != 0.0 { bad.push(format!("{name}: prefill logits differ by {mp:.3e}")); }
+        let mut worst = (0f32, 0usize, 0usize);
+        for (i, (a, b)) in d_fp8.iter().zip(d_f16.iter()).enumerate() {
+            let (m, j) = max_abs_diff(a, b);
+            if m > worst.0 { worst = (m, i, j); }
+        }
+        eprintln!("[{name}] decode logits over {n_dec} steps: max abs diff = {:.4e} @step={} i={}", worst.0, worst.1, worst.2);
+        if worst.0 != 0.0 { bad.push(format!("{name}: decode logits differ by {:.3e} at step {}", worst.0, worst.1)); }
+    }
+    if !bad.is_empty() { return Err(eyre!("fp8 kv store A/B failed: {}", bad.join("; "))); }
+    eprintln!("FP8 KV STORE A/B: BIT-IDENTICAL logits on prefill + decode, long (sparse) and short (dense) — one load");
+    Ok(())
+}

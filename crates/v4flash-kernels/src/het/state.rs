@@ -43,17 +43,15 @@ pub enum CompKvStore {
 
 impl CompKvStore {
     /// Whether the packed format is selected for the ratio-4 main
-    /// compressor. Read once per allocation. `COMP_KV_FP8=0` keeps the
-    /// f16 cache: a rollback / in-process A-B knob, not a tuning
-    /// parameter (every consumer dispatches on the variant, so both are
-    /// always correct; snapshots convert either way on restore).
+    /// compressor. Read at every allocation (so a one-load A/B test can
+    /// flip it between states). `COMP_KV_FP8=0` keeps the f16 cache: a
+    /// rollback / in-process A-B knob, not a tuning parameter (every
+    /// consumer dispatches on the variant, so both are always correct;
+    /// snapshots convert either way on restore).
     pub fn fp8_enabled() -> bool {
-        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var("COMP_KV_FP8")
-                .map(|v| !(v == "0" || v.eq_ignore_ascii_case("off")))
-                .unwrap_or(true)
-        });
-        *ON
+        std::env::var("COMP_KV_FP8")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("off")))
+            .unwrap_or(true)
     }
 
     pub fn is_fp8(&self) -> bool {
