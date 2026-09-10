@@ -143,13 +143,18 @@ kernel needs a bigger grid, e.g. NT_PER_WG 8 -> 2, or n-tile software pipelining
 a follow-on that also helps the f16 kernel); prefill @300K within ~0.5% of today;
 dGPU -0.28 GiB at 300K (index key cache 0.39 -> 0.12 GiB). RAM is the lever.
 
-## Step 5 — window (pending)
+## Step 5 — window — DONE 2026-09-10 21:30-21:55
 
-1. `fp8_kv_store_ab_one_load` now covers all four (main, keys) store combinations
-   with a same-config control: bit-identical logits required, T=3000 and T=200.
-2. `bench_decode COMP_KV_FP8_SWEEP=packed,keys16 FAKE_POS=300000`;
-   `bench_prefill COMP_KV_FP8_AB=packed,keys16,packed FAKE_PREFILL_POS=4096,300000`.
-3. sysfs VRAM at 300K/K=15: expect -0.28 GiB.
-4. Restart. The index loader deletes every pre-v5 snapshot dir (cache entries;
-   ~62 GB); sessions cold-prefill once. Rollback: `INDEXER_KEYS_E2M1=0`
-   (invalidates v5 files on first touch — they are refused and evicted).
+- `fp8_kv_store_ab_one_load`: BIT-IDENTICAL logits across all four (main, keys)
+  store combinations, prefill + 24 decode steps, T=3000 and T=200, control 0.0.
+- decode `FAKE_POS=300000`: 41.74 ms/token packed keys, 41.81 f16 keys, 41.74
+  packed again — noise, as the kernel-level measurement predicted.
+- prefill 4K / 300K: 716 / 609 tok/s packed, 715 / 609 f16 keys, 727 / 607 packed
+  again — noise (the +7.4% on the gemm kernel is below the run-to-run spread).
+- server idle at 300K / K=15 / vision: 15715 -> 15416 MiB (-299 MiB, 887 MiB free).
+- the index loader deleted 183 pre-v5 snapshot dirs at startup; a fresh request,
+  a v5 system-prefix save and a v5 restore all correct.
+
+Both levers together, 2026-09-10: dGPU idle at 192K went 15494 -> 15027 MiB (FP8
+KV); at 300K the packed stores hold 887 MiB free where the f16 stores would have
+overflowed. Not spent yet: K stays 15.
