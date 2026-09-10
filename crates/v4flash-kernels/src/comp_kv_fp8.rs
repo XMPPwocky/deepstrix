@@ -67,9 +67,16 @@ pub fn e4m3fn_magnitude(idx: u8) -> f32 {
 /// `__float2half_rn` is the same rounding — the device is the authority,
 /// see module docs).
 pub fn expand_half_bits_host(code: u8, e: i8) -> u16 {
-    let m = e4m3fn_magnitude(code & 0x7F);
-    let v = if code & 0x80 != 0 { -m } else { m };
-    f32_to_f16_bits(v * 2f32.powi(e as i32))
+    expand_half_bits_scaled(code, 2f32.powi(e as i32))
+}
+
+/// [`expand_half_bits_host`] with the block scale `2^e` precomputed.
+/// Sign applied to the f16 bits (see the device expand for why).
+#[inline]
+fn expand_half_bits_scaled(code: u8, scale: f32) -> u16 {
+    let idx = (code & 0x7F) as usize;
+    let m = if idx < 127 { magnitude_table()[idx] } else { 0.0 };
+    f32_to_f16_bits(m * scale) | ((code as u16 & 0x80) << 8)
 }
 
 /// Unpack one packed row into 512 f16 bits (host reference).
@@ -119,8 +126,10 @@ pub fn pack_row_from_f16_host(row: &[u16], out: &mut [u8]) -> Option<()> {
             }
             let mut ok = true;
             let mut codes = [0u8; 64];
+            let scale = 2f32.powi(e_try);
+            let inv_scale = 2f32.powi(-e_try);
             for (j, &b) in vals.iter().enumerate() {
-                match code_for_half(b, e_try as i8) {
+                match code_for_half(b, scale, inv_scale) {
                     Some(c) => codes[j] = c,
                     None => {
                         ok = false;
@@ -150,21 +159,43 @@ pub fn pack_row_from_f16_host(row: &[u16], out: &mut [u8]) -> Option<()> {
     Some(())
 }
 
+/// The 127 reachable E4M3FN magnitudes, ascending (index = table index).
+fn magnitude_table() -> &'static [f32; 127] {
+    static T: std::sync::OnceLock<[f32; 127]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [0f32; 127];
+        for (i, v) in t.iter_mut().enumerate() {
+            *v = e4m3fn_magnitude(i as u8);
+        }
+        t
+    })
+}
+
 /// The code whose expansion at exponent `e` is exactly the f16 `bits`,
 /// if any. Sign of zero is preserved (`0x8000` -> code `0x80`).
-fn code_for_half(bits: u16, e: i8) -> Option<u8> {
+///
+/// O(1) per value (a 7-step binary search plus a verification window of
+/// five candidates): a 192K session converts in seconds, not minutes.
+/// The magnitude `|v| * 2^-e` is exactly a table value whenever the store
+/// did not round (every normal-range value); the window covers the
+/// f16-subnormal cases where several neighbouring codes round to the
+/// same stored value.
+fn code_for_half(bits: u16, scale: f32, inv_scale: f32) -> Option<u8> {
     let sign = (bits & 0x8000) != 0;
-    let target_mag = bits & 0x7FFF;
-    // Magnitude search over the 127 table entries (small; called only in
-    // the one-time snapshot conversion).
-    for idx in 0u8..127 {
-        let got = expand_half_bits_host(idx, e);
-        if got & 0x7FFF == target_mag {
-            let code = if sign { idx | 0x80 } else { idx };
-            // Re-check with the sign so that ±0 round-trips exactly.
-            if expand_half_bits_host(code, e) == bits {
-                return Some(code);
-            }
+    let mag = f16_to_f32(bits & 0x7FFF) * inv_scale;
+    let table = magnitude_table();
+    // Largest index with table[idx] <= mag (partition_point gives the
+    // first index with table[idx] > mag).
+    let hi = table.partition_point(|&t| t <= mag);
+    let base = hi.saturating_sub(1) as i32;
+    for delta in [0i32, 1, -1, 2, -2] {
+        let idx = base + delta;
+        if !(0..127).contains(&idx) {
+            continue;
+        }
+        let code = if sign { idx as u8 | 0x80 } else { idx as u8 };
+        if expand_half_bits_scaled(code, scale) == bits {
+            return Some(code);
         }
     }
     None
@@ -463,11 +494,56 @@ mod tests {
     fn negative_zero_code_is_preserved() {
         assert_eq!(expand_half_bits_host(0x80, -5), 0x8000);
         assert_eq!(expand_half_bits_host(0x00, -5), 0x0000);
-        assert_eq!(code_for_half(0x8000, -5), Some(0x80));
-        assert_eq!(code_for_half(0x0000, -5), Some(0x00));
+        let (sc, inv) = (2f32.powi(-5), 2f32.powi(5));
+        assert_eq!(code_for_half(0x8000, sc, inv), Some(0x80));
+        assert_eq!(code_for_half(0x0000, sc, inv), Some(0x00));
     }
 }
 
 // The dense attention path is taken only while `n_comp <= INDEXER_TOP_K`;
 // the head shadow must cover exactly that.
 const _: () = assert!(FP8_KV_HEAD_ROWS == crate::config::INDEXER_TOP_K as usize);
+
+#[cfg(test)]
+mod conversion_speed {
+    use super::*;
+
+    /// Host-only: how long the v3 -> v4 recovery takes per row, so the
+    /// restore cost of an old snapshot is known (192K = 21 x 49152 rows).
+    #[test]
+    fn recovery_throughput() {
+        let mut rows: Vec<u16> = Vec::new();
+        let mut packed = vec![0u8; FP8_KV_ROW_BYTES];
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let n = 2000usize;
+        for _ in 0..n {
+            for d in 0..FP8_KV_N_NOPE {
+                seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                packed[d] = (seed % 127) as u8 | if seed & 0x100 != 0 { 0x80 } else { 0 };
+            }
+            for blk in 0..FP8_KV_N_BLOCKS {
+                seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                packed[FP8_KV_OFF_EXP + blk] = ((seed % 20) as i8 - 14) as u8;
+            }
+            let mut row = vec![0u16; FP8_KV_HEAD_DIM];
+            unpack_row_host(&packed, &mut row);
+            rows.extend_from_slice(&row);
+        }
+        let mut out = vec![0u8; FP8_KV_ROW_BYTES];
+        let t0 = std::time::Instant::now();
+        let mut ok = 0;
+        for r in 0..n {
+            if pack_row_from_f16_host(&rows[r * FP8_KV_HEAD_DIM..(r + 1) * FP8_KV_HEAD_DIM], &mut out).is_some() {
+                ok += 1;
+            }
+        }
+        let dt = t0.elapsed();
+        let per_row = dt.as_secs_f64() / n as f64;
+        eprintln!(
+            "recovery: {ok}/{n} rows, {:.1} us/row -> 192K session (21 x 49152 rows) = {:.1} s",
+            per_row * 1e6,
+            per_row * 21.0 * 49152.0
+        );
+        assert_eq!(ok, n);
+    }
+}
