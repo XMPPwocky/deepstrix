@@ -72,6 +72,25 @@ pub struct ExpertPager {
     /// followed by a dense request would early-return on `window_layer` alone and
     /// silently compute from another layer's experts.
     window_dense: Vec<bool>,
+    /// Slots per PINNED prefill window. `N_EXPERT` (384) reproduces the original
+    /// layout exactly; anything smaller PACKS the window.
+    ///
+    /// A dense window reserved all 384 slots so that `slot == expert id`, but the
+    /// dispatch does not require that — `moe_group_builder.hip:116` mode 0 takes
+    /// the group id FROM the remap (`g = (dense >= 0) ? e : (-dense - 1)`), and the
+    /// MXFP4 kernels index weights by that group id, never by `d_selected`. So a
+    /// window only has to be as wide as the union it must hold.
+    ///
+    /// MEASURED: with box 2 owning 268 of 384 experts per encoder layer, box 1's
+    /// unions ran mean 44.1 / max 118 of 384 — 11.5% occupancy. Packing lets the
+    /// same pool hold ~3x more windows, which is what fixes the 0.478 prefill hit
+    /// rate: with 4 windows over 20 encoder layers a layer's window is always
+    /// evicted before the next chunk returns to it.
+    ///
+    /// Sized from OWNERSHIP, not from that histogram: the cumulative union across
+    /// chunks can exceed any single chunk's max, and a different box-2 assignment
+    /// enlarges box 1's share. `V41_PAGER_STRIDE` overrides.
+    window_stride: u32,
     /// Per-role staging for the batched parallel reader (`batch * bpe` each).
     par_gate: Vec<u8>,
     par_up: Vec<u8>,
@@ -310,7 +329,22 @@ impl ExpertPager {
         // decode should take the pool.
         //
         // `V41_PAGER_WINDOWS=<n>` still forces the dense count outright (0 => 1).
-        let total_windows = n_slots / N_EXPERT;
+        // `V41_PAGER_STRIDE`: slots per pinned window. Default N_EXPERT reproduces
+        // the original layout bit-for-bit. Deriving it automatically from box 2's
+        // HELLO ownership (`N_EXPERT - owned_count(l)`) needs the remote client,
+        // which does not exist yet at pager construction — follow-up.
+        let window_stride = std::env::var("V41_PAGER_STRIDE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(N_EXPERT)
+            .clamp(1, N_EXPERT);
+        // Windows available at this stride: the last one keeps a full N_EXPERT
+        // rotating width, the rest are `window_stride` wide.
+        let total_windows = if n_slots > N_EXPERT {
+            1 + (n_slots - N_EXPERT) / window_stride
+        } else {
+            1
+        };
         let ced = crate::het::forward_prefill::ced_enabled();
         // +1: the rotating window that serves every layer at or above the pin line.
         let prefill_ceiling = if ced {
@@ -336,7 +370,7 @@ impl ExpertPager {
         let gb = gate_bpe * pager_read_batch();
         let ub = up_bpe * pager_read_batch();
         let db = down_bpe * pager_read_batch();
-        let lru_lo = dense_windows * N_EXPERT;
+        let lru_lo = dense_windows.saturating_sub(1) * window_stride + N_EXPERT;
         eprintln!(
             "expert pager: {total_windows} windows of {N_EXPERT}; prefill dense = {dense_windows} \
              (pinned layers 0..{}, rest rotate; ced={ced}, ceiling {prefill_ceiling}, decode_frac {decode_frac:.2}), \
@@ -368,6 +402,7 @@ impl ExpertPager {
             dense_windows,
             window_layer: vec![None; total_windows.max(1) as usize],
             window_dense: vec![false; total_windows.max(1) as usize],
+            window_stride,
             par_gate: vec![0u8; gb],
             par_up: vec![0u8; ub],
             par_down: vec![0u8; db],
@@ -442,7 +477,17 @@ impl ExpertPager {
             ));
         }
         let w = self.window_of(layer);
-        let base = w as usize * N_EXPERT as usize;
+        // A dense fill writes all N_EXPERT slots at `base + e`, which OVERFLOWS a
+        // packed window into its neighbours. Refuse rather than corrupt: the union
+        // path handles every case we actually take (box 1's share is ~116 of 384,
+        // far under the 90% dense shortcut).
+        if self.window_width(w) < N_EXPERT as usize {
+            return Err(eyre!(
+                "expert pager: L{layer} dense fill needs {N_EXPERT} slots but window {w}                  is packed to {} (V41_PAGER_STRIDE)",
+                self.window_width(w)
+            ));
+        }
+        let base = self.window_base(w);
         self.prefill_requests += N_EXPERT as u64;
         if self.window_layer[w as usize] == Some(layer) && self.window_dense[w as usize] {
             return Ok(()); // whole layer already resident in its own window
@@ -591,7 +636,7 @@ impl ExpertPager {
 
         // --- phase 1: classify. Hits are finished here; misses get a slot. ---
         let lru_lo = {
-            let lo = (self.dense_windows * N_EXPERT) as usize;
+            let lo = self.dense_slots();
             if lo >= self.n_slots as usize { 0 } else { lo }
         };
         let mut misses: Vec<(u32, u32)> = Vec::with_capacity(ids.len()); // (id, slot)
@@ -628,10 +673,11 @@ impl ExpertPager {
                     victim
                 }
             };
-            if (slot as usize) < (self.dense_windows * N_EXPERT) as usize {
-                let w = slot / N_EXPERT;
-                if let Some(e) = self.window_layer.get_mut(w as usize) { *e = None; }
-                if let Some(d) = self.window_dense.get_mut(w as usize) { *d = false; }
+            if (slot as usize) < self.dense_slots() {
+                if let Some(w) = self.window_of_slot(slot) {
+                    if let Some(e) = self.window_layer.get_mut(w as usize) { *e = None; }
+                    if let Some(d) = self.window_dense.get_mut(w as usize) { *d = false; }
+                }
             }
             // Claim the slot NOW so a later miss in this same call cannot pick it.
             self.slot_key[slot as usize] = Some(key);
@@ -802,16 +848,53 @@ impl ExpertPager {
         layer: i32,
         is_remote: impl Fn(u32) -> bool,
     ) -> eyre::Result<&DeviceBuffer<i32>> {
+        // Entries must carry the expert's ACTUAL slot within the window view, not
+        // `-e-1`. That identity only held while windows were 384 wide and slot ==
+        // expert id; under packing it would point the dispatch at another expert's
+        // weights — silently, since the kernel cannot tell a wrong slot from a
+        // right one. Anything not resident in THIS window is "not ours" (0), which
+        // is also a strict improvement on the old behaviour: unrouted ids used to
+        // be marked "ours at stale slot e".
+        let w = self.window_of(layer);
+        let base = self.window_base(w);
+        let width = self.window_width(w);
         for e in 0..N_EXPERT {
-            self.remap[e as usize] = if is_remote(e) { 0 } else { -(e as i32) - 1 };
+            self.remap[e as usize] = if is_remote(e) {
+                0
+            } else {
+                match self.slot_of.get(&(layer, e)) {
+                    Some(&sl) if (sl as usize) >= base && (sl as usize) < base + width => {
+                        -((sl as usize - base) as i32) - 1
+                    }
+                    _ => 0,
+                }
+            };
         }
         // The H2D must land on the iGPU: the MoE reads this remap from the iGPU
         // pool, and a copy issued with the dGPU current puts it on the wrong
         // device, where the kernel reads garbage and writes zeros (see the note
         // on `remap_dev`).
+        // CONTENT check, distinct from `verify_routing_exactly_once`: that verifies
+        // WHICH DEVICE claims each pick; this verifies the slot a claim points at
+        // actually holds that expert. A remap entry aimed at the wrong slot passes
+        // exactly-once and silently computes from another expert's weights — the
+        // precise failure packing introduces. 384 lookups per (layer, chunk).
+        for e in 0..N_EXPERT {
+            let r = self.remap[e as usize];
+            if r >= 0 {
+                continue;
+            }
+            let sl = base + (-r - 1) as usize;
+            if self.slot_key.get(sl).copied().flatten() != Some((layer, e)) {
+                return Err(eyre!(
+                    "expert pager: L{layer} remap[{e}]={r} -> slot {sl} holds {:?}, not (L{layer}, {e}).                      Window {w} base {base} width {width} stride {}.",
+                    self.slot_key.get(sl).copied().flatten(),
+                    self.window_stride
+                ));
+            }
+        }
         self.device.set_current()?;
         self.remap_dev.copy_from_host(&self.remap)?;
-        let _ = layer;
         Ok(&self.remap_dev)
     }
 
@@ -840,14 +923,14 @@ impl ExpertPager {
             ));
         }
         let w = self.window_of(layer);
-        let base = w as usize * N_EXPERT as usize;
+        let base = self.window_base(w);
         self.prefill_requests += ids.len() as u64;
         self.device.set_current()?;
         // Reassigning the window to a different layer invalidates every slot in it.
         if self.window_layer[w as usize] != Some(layer) {
             self.window_layer[w as usize] = None;
             self.window_dense[w as usize] = false;
-            for sl in base..base + N_EXPERT as usize {
+            for sl in base..base + self.window_width(w) {
                 if let Some(old) = self.slot_key[sl].take() {
                     self.slot_of.remove(&old);
                 }
@@ -895,16 +978,49 @@ impl ExpertPager {
                 );
             }
         }
-        // Per-slot validity: slot `base + e` holds `(layer, e)` or nothing.
-        let mut need: Vec<u32> = Vec::with_capacity(ids.len());
+        // PACKED assignment: slots are handed out densely by arrival order, not by
+        // expert id, so a window only has to be as wide as the union it holds. The
+        // dispatch reads the slot out of `remap[e]`
+        // (`moe_group_builder.hip:116` mode 0), so it never needed slot == id.
+        let width = self.window_width(w);
+        let mut assign: Vec<(u32, usize)> = Vec::with_capacity(ids.len());
+        let mut need: Vec<(u32, usize)> = Vec::new();
+        let mut next_free = 0usize;
         for &e in ids {
             if e >= N_EXPERT {
                 return Err(eyre!("expert pager: expert id {e} >= {N_EXPERT}"));
             }
-            if self.slot_key[base + e as usize] != Some((layer, e)) && !need.contains(&e) {
-                need.push(e);
+            if assign.iter().any(|&(x, _)| x == e) {
+                continue; // deduped union
             }
+            // Already resident IN THIS WINDOW? (a slot elsewhere is not reusable:
+            // the dispatch only sees `[base, base+width)` through `routed_window`.)
+            if let Some(&sl) = self.slot_of.get(&(layer, e)) {
+                let sl = sl as usize;
+                if sl >= base && sl < base + width && self.slot_key[sl] == Some((layer, e)) {
+                    assign.push((e, sl));
+                    continue;
+                }
+            }
+            while next_free < width && self.slot_key[base + next_free].is_some() {
+                next_free += 1;
+            }
+            if next_free >= width {
+                // Sized from box 2's ownership, so this means the derivation is
+                // wrong — NOT something to paper over by evicting, which would
+                // silently drop an expert this same dispatch still needs.
+                return Err(eyre!(
+                    "expert pager: L{layer} union needs > {width} slots (window {w},                      stride {}). Raise V41_PAGER_STRIDE or give box 2 more of this layer.",
+                    self.window_stride
+                ));
+            }
+            let sl = base + next_free;
+            next_free += 1;
+            assign.push((e, sl));
+            need.push((e, sl));
         }
+        // The remap IS the slot table now, so publish it even when nothing missed.
+        self.write_window_remap(layer, w, &assign)?;
         if need.is_empty() {
             return Ok(());
         }
@@ -924,7 +1040,7 @@ impl ExpertPager {
         let mut k0 = 0usize;
         while k0 < need.len() {
             let n = batch.min(need.len() - k0);
-            let chunk: &[u32] = &need[k0..k0 + n];
+            let chunk: &[(u32, usize)] = &need[k0..k0 + n];
             {
                 let owner = &self.owner;
                 let names = &names;
@@ -949,7 +1065,7 @@ impl ExpertPager {
                         .zip(d.chunks_mut(dbpe))
                         .enumerate()
                     {
-                        read_one(chunk[i], gs, us, ds)?;
+                        read_one(chunk[i].0, gs, us, ds)?;
                     }
                 } else {
                     let per = n.div_ceil(threads);
@@ -969,7 +1085,7 @@ impl ExpertPager {
                                     .zip(dc.chunks_mut(dbpe))
                                     .enumerate()
                                 {
-                                    if let Err(e) = read_one(chunk[t * per + i], gs, us, ds) {
+                                    if let Err(e) = read_one(chunk[t * per + i].0, gs, us, ds) {
                                         *err.lock().unwrap() = Some(format!("{e:#}"));
                                         return;
                                     }
@@ -987,8 +1103,7 @@ impl ExpertPager {
             // Destinations are scattered (slot == base + expert id), so one copy
             // per expert rather than the dense path's single contiguous run.
             let t_h2d = std::time::Instant::now();
-            for (i, &e) in chunk.iter().enumerate() {
-                let slot = base + e as usize;
+            for (i, &(e, slot)) in chunk.iter().enumerate() {
                 self.routed.gate.buffer
                     .slice_view_mut(slot * gbpe, gbpe)
                     .copy_from_host(&self.par_gate[i * gbpe..(i + 1) * gbpe])?;
@@ -1018,6 +1133,69 @@ impl ExpertPager {
     /// evicted, and every remaining layer shares the last dense window as a rotating
     /// stream buffer. That makes the hit rate deterministic at (dense_windows-1)/N_LAYER
     /// rather than luck-dependent.
+    /// Publish `layer`'s window contents as the device remap: `remap[e]` carries
+    /// the expert's slot RELATIVE to the window view (`-idx-1`), everything else 0.
+    fn write_window_remap(
+        &mut self,
+        _layer: i32,
+        w: u32,
+        assign: &[(u32, usize)],
+    ) -> eyre::Result<()> {
+        let base = self.window_base(w);
+        for r in self.remap.iter_mut() {
+            *r = 0;
+        }
+        for &(e, sl) in assign {
+            self.remap[e as usize] = -((sl - base) as i32) - 1;
+        }
+        self.device.set_current()?;
+        self.remap_dev.copy_from_host(&self.remap)?;
+        Ok(())
+    }
+
+    /// Windows that are PINNED to one layer; the last window rotates and keeps a
+    /// full `N_EXPERT` stride so unsplit / replay layers (union up to 384) still fit.
+    fn pinned_windows(&self) -> u32 {
+        self.dense_windows.saturating_sub(1)
+    }
+
+    fn window_base(&self, w: u32) -> usize {
+        w.min(self.pinned_windows()) as usize * self.window_stride as usize
+    }
+
+    fn window_width(&self, w: u32) -> usize {
+        if w < self.pinned_windows() {
+            self.window_stride as usize
+        } else {
+            N_EXPERT as usize
+        }
+    }
+
+    /// First slot of the decode LRU region = end of the last dense window.
+    /// Replaces the old `dense_windows * N_EXPERT`, which assumed every window
+    /// was 384 wide.
+    fn dense_slots(&self) -> usize {
+        let lo = self.pinned_windows() as usize * self.window_stride as usize
+            + N_EXPERT as usize;
+        lo.min(self.n_slots as usize)
+    }
+
+    /// Which window a slot belongs to, or `None` if it is in the LRU region.
+    /// Replaces `slot / N_EXPERT`.
+    fn window_of_slot(&self, slot: u32) -> Option<u32> {
+        let s = slot as usize;
+        if s >= self.dense_slots() {
+            return None;
+        }
+        let stride = self.window_stride as usize;
+        let pinned = self.pinned_windows() as usize;
+        if stride > 0 && s < pinned * stride {
+            Some((s / stride) as u32)
+        } else {
+            Some(pinned as u32)
+        }
+    }
+
     fn window_of(&self, layer: i32) -> u32 {
         let pinned = self.dense_windows.saturating_sub(1);
         if pinned > 0 && (layer as u32) < pinned {
@@ -1032,14 +1210,18 @@ impl ExpertPager {
     /// different layers stay resident in different windows while the kernel still sees
     /// slot == expert id.
     pub fn routed_window(&self, layer: i32) -> RoutedExpertWeights {
-        let base = self.window_of(layer) as usize * N_EXPERT as usize;
-        let n = N_EXPERT as usize;
-        let scale = |v: u64| v / self.n_slots as u64 * N_EXPERT as u64;
+        let w = self.window_of(layer);
+        let base = self.window_base(w);
+        // The view must be exactly the window's width: `n_slots` on the returned
+        // handle is what the dispatch treats as the group-id bound, and a 384-wide
+        // view over a 128-wide window would run off into the next layer's slots.
+        let n = self.window_width(w);
+        let scale = |v: u64| v / self.n_slots as u64 * n as u64;
         let view = |dw: &DeviceWeight, bpe: usize| DeviceWeight {
             buffer: dw.buffer.slice_view(base * bpe, n * bpe),
             n_elements: scale(dw.n_elements),
             dtype: dw.dtype,
-            shape: vec![N_EXPERT as u64, dw.shape[1], dw.shape[2]],
+            shape: vec![n as u64, dw.shape[1], dw.shape[2]],
         };
         RoutedExpertWeights {
             gate: view(&self.routed.gate, self.routed.gate_bytes_per_expert),
@@ -1048,7 +1230,7 @@ impl ExpertPager {
             gate_bytes_per_expert: self.routed.gate_bytes_per_expert,
             up_bytes_per_expert: self.routed.up_bytes_per_expert,
             down_bytes_per_expert: self.routed.down_bytes_per_expert,
-            n_slots: N_EXPERT,
+            n_slots: n as u32,
         }
     }
 
@@ -1138,7 +1320,7 @@ impl ExpertPager {
             // no error. Degenerate pools (no room above the dense region) fall back to
             // sharing and invalidate the affected window instead.
             let lru_lo = {
-                let lo = (self.dense_windows * N_EXPERT) as usize;
+                let lo = self.dense_slots();
                 if lo >= self.n_slots as usize { 0 } else { lo }
             };
             let slot = match self.slot_key.iter().enumerate().skip(lru_lo).find(|(_, k)| k.is_none()) {
@@ -1161,10 +1343,11 @@ impl ExpertPager {
             };
             // Safety net for the degenerate case above: if this slot does fall inside a
             // dense window, that window is no longer a faithful copy of its layer.
-            if (slot as usize) < (self.dense_windows * N_EXPERT) as usize {
-                let w = slot / N_EXPERT;
-                if let Some(e) = self.window_layer.get_mut(w as usize) { *e = None; }
-                if let Some(d) = self.window_dense.get_mut(w as usize) { *d = false; }
+            if (slot as usize) < self.dense_slots() {
+                if let Some(w) = self.window_of_slot(slot) {
+                    if let Some(e) = self.window_layer.get_mut(w as usize) { *e = None; }
+                    if let Some(d) = self.window_dense.get_mut(w as usize) { *d = false; }
+                }
             }
             // Read the three role tensors for this expert into the stage buffers.
             // Scope the source borrow so the device upload + bookkeeping below can
@@ -1285,7 +1468,7 @@ impl ExpertPager {
     /// freezes at fill; windowed-LFU promotion is the follow-up.
     pub fn lru_free_slots(&self) -> usize {
         let lo = {
-            let l = (self.dense_windows * N_EXPERT) as usize;
+            let l = self.dense_slots();
             if l >= self.n_slots as usize { 0 } else { l }
         };
         self.slot_key[lo..].iter().filter(|k| k.is_none()).count()
@@ -1340,7 +1523,7 @@ impl ExpertPager {
 
     /// Slots decode's LRU may allocate from (everything above the dense windows).
     pub fn decode_slots(&self) -> u32 {
-        let lo = self.dense_windows * N_EXPERT;
+        let lo = self.dense_slots() as u32;
         if lo >= self.n_slots { self.n_slots } else { self.n_slots - lo }
     }
 
