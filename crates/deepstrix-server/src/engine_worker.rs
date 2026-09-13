@@ -13,7 +13,11 @@ use std::time::{Duration, SystemTime};
 use color_eyre::eyre::{self, eyre, WrapErr};
 use tokio::sync::{mpsc, oneshot};
 use v4flash_core::tokenizer::BpeVocab;
+#[cfg(any(test, not(feature = "v41")))]
 use v4flash_core::MappedGguf;
+#[cfg(feature = "v41")]
+use v4flash_core::V41HfWeights;
+use v4flash_core::WeightSrc;
 use v4flash_hip::Device;
 use v4flash_kernels::config::{COMPRESS_RATIOS, HC_DIM, N_EMBD, N_HC, N_VOCAB};
 use v4flash_kernels::het::{
@@ -33,6 +37,190 @@ use crate::tokens::{
 use crate::vision_prompt::{
     shift_spans, span_hash_at, synthetic_token_bytes, ImageSpan, PreparedImage,
 };
+
+/// V4.1 Engram context: the n-gram hasher and one table handle per Engram layer
+/// (1 and 14). The tables themselves are 189 GiB on SSD and are never resident —
+/// each token gathers `ENGRAM_COLS` rows per layer through `gather_position`.
+#[cfg(feature = "v41")]
+pub struct EngramCtx {
+    pub hasher: v4flash_core::EngramHash,
+    pub tables: Vec<v4flash_core::EngramTable>,
+    /// Compressed ids of every token forwarded so far, in position order. The
+    /// hash for position `p` reads the last four entries, so this has to track
+    /// the real sequence rather than just the current token.
+    pub compressed: Vec<i32>,
+}
+
+#[cfg(feature = "v41")]
+impl EngramCtx {
+    /// Append `token` and gather its Engram rows, one `Vec<f32>` per Engram layer
+    /// in `ENGRAM_LAYERS` order. `pos` must be the token's KV position.
+    fn rows_for(
+        &mut self,
+        src: &v4flash_core::SafetensorsDir,
+        token: i32,
+        pos: u32,
+    ) -> eyre::Result<Vec<Vec<f32>>> {
+        // Positions must arrive in order; a rewind (snapshot reuse / retry) just
+        // truncates back to the branch point.
+        let p = pos as usize;
+        self.compressed.truncate(p);
+        if self.compressed.len() != p {
+            return Err(eyre!(
+                "engram: position {p} but {} tokens tracked",
+                self.compressed.len()
+            ));
+        }
+        let c = self.hasher.compress(token);
+        self.compressed.push(c);
+        let hashes = self.hasher.hash_ids(&self.compressed, p);
+        let mut out = Vec::with_capacity(self.tables.len());
+        for (li, tbl) in self.tables.iter().enumerate() {
+            let mut rows = vec![0f32; v4flash_kernels::config::ENGRAM_IN as usize];
+            // A dead (image-span) position takes no Engram contribution: all-zero
+            // rows → wkv (no bias) → value 0 → `h += gate · 0`. Exactly the
+            // reference's zeroed gate (`engram_mask`), without touching the kernel.
+            if c != v4flash_core::engram_hash::DEAD {
+                tbl.gather_position(src, &hashes[li], &mut rows)?;
+            }
+            out.push(rows);
+        }
+        Ok(out)
+    }
+
+    /// Batched twin of [`Self::rows_for`]: append `tokens` (starting at KV position
+    /// `pos0`) and gather their Engram rows for the whole chunk.
+    ///
+    /// Returns one flattened `[B * ENGRAM_IN]` buffer per Engram layer, which is
+    /// exactly what `stage_engram_rows_batch` consumes. Batched prefill needs this
+    /// because the per-token path it replaced staged rows one token at a time.
+    fn rows_for_chunk(
+        &mut self,
+        src: &v4flash_core::SafetensorsDir,
+        tokens: &[i32],
+        pos0: u32,
+    ) -> eyre::Result<Vec<Vec<f32>>> {
+        let ein = v4flash_kernels::config::ENGRAM_IN as usize;
+        let p0 = pos0 as usize;
+        self.compressed.truncate(p0);
+        if self.compressed.len() != p0 {
+            return Err(eyre!(
+                "engram: chunk at position {p0} but {} tokens tracked",
+                self.compressed.len()
+            ));
+        }
+        let mut out = vec![vec![0f32; tokens.len() * ein]; self.tables.len()];
+
+        // BATCHED GATHER. This used to call `gather_position` per (token, layer),
+        // and `gather_position` passes `threads = ENGRAM_COLS = 24` for exactly 24
+        // ids — so `per = 1` and it spawned **24 scoped OS threads each doing one
+        // row** (2 preads + 256 MACs), twice per token. MEASURED 2026-09-13: 48
+        // spawns/token = 289,056 for a 6k prompt, and a replica of that shape cost
+        // **3.17 s warm** of which **3.01 s was pthread create/join with zero I/O**.
+        // It is LINEAR at ~0.53 ms/token, so it does not amortise — a 100K prefill
+        // would spend ~53 s here before the first GPU kernel launches. It sits
+        // outside `prefill_start`, which is why it never showed up in any prefill
+        // stage timing.
+        //
+        // Now: hash the whole chunk first, then issue ONE gather per layer per RUN
+        // of live positions — 289,056 spawns -> ~64. Bit-identical by construction:
+        // `hash_ids` only ever reads `c[pos - s]` (strictly backward, engram_hash.rs
+        // :148), so pre-pushing the whole chunk cannot change any position's hashes;
+        // the same ids land in the same destination slots in the same order through
+        // the same `gather`; DEAD positions stay all-zero because runs skip them.
+        debug_assert_eq!(ein, v4flash_core::engram_hash::ENGRAM_COLS * v4flash_core::engram_hash::ENGRAM_ROW_DIM, "ENGRAM_IN must be COLS x ROW_DIM");
+        let mut hashes: Vec<Option<[[i64; v4flash_core::engram_hash::ENGRAM_COLS]; v4flash_core::engram_hash::ENGRAM_LAYERS]>> = Vec::with_capacity(tokens.len());
+        for (i, &tok) in tokens.iter().enumerate() {
+            let c = self.hasher.compress(tok);
+            self.compressed.push(c);
+            // Image-span rows (synthetic ids → DEAD) stay all-zero: no Engram
+            // contribution, and `hash_ids` blocks later look-backs at them.
+            hashes.push(if c == v4flash_core::engram_hash::DEAD {
+                None
+            } else {
+                Some(self.hasher.hash_ids(&self.compressed, p0 + i))
+            });
+        }
+        // One sustained, deep gather beats 24 one-row threads: this box's NVMe
+        // peaks around 32 readers (see safetensors.rs), and the old shape put a
+        // join barrier after every single position.
+        const GATHER_THREADS: usize = 32;
+        let mut i = 0usize;
+        while i < tokens.len() {
+            if hashes[i].is_none() {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < tokens.len() && hashes[i].is_some() {
+                i += 1;
+            }
+            for (li, tbl) in self.tables.iter().enumerate() {
+                let flat: Vec<i64> = hashes[start..i]
+                    .iter()
+                    .flat_map(|h| h.as_ref().expect("run contains only live positions")[li])
+                    .collect();
+                tbl.gather(src, &flat, &mut out[li][start * ein..i * ein], GATHER_THREADS)?;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Drive one decode token, routing through the M7 expert pager when it is active.
+///
+/// Written as a macro rather than a method because the pager and the scratch
+/// buffers are disjoint fields of the same `WorkerState`: a method would have to
+/// borrow all of `self` mutably and conflict with itself.
+#[cfg(feature = "v41")]
+macro_rules! forward_one {
+    ($state:expr, $residual:expr, $pos:expr, $tok:expr) => {
+        if let Some(pg) = $state.pager.as_mut() {
+            // Gather this token's Engram rows before the forward: the tables are
+            // SSD-resident and the gather needs the same HF source the pager owns.
+            let engram_rows = match $state.engram.as_mut() {
+                Some(ec) => Some(ec.rows_for(pg.raw(), $tok, $pos)?),
+                None => None,
+            };
+            $state.engine.forward_token_paged(
+                &mut $state.dgpu_scratch,
+                &mut $state.igpu_scratch,
+                &mut $state.state,
+                &$state.weights,
+                &$residual,
+                $pos,
+                $tok,
+                pg,
+                engram_rows.as_deref(),
+            )
+        } else {
+            $state.engine.forward_token(
+                &mut $state.dgpu_scratch,
+                &mut $state.igpu_scratch,
+                &mut $state.state,
+                &$state.weights,
+                &$residual,
+                $pos,
+                $tok,
+            )
+        }
+    };
+}
+
+#[cfg(not(feature = "v41"))]
+macro_rules! forward_one {
+    ($state:expr, $residual:expr, $pos:expr, $tok:expr) => {
+        $state.engine.forward_token(
+            &mut $state.dgpu_scratch,
+            &mut $state.igpu_scratch,
+            &mut $state.state,
+            &$state.weights,
+            &$residual,
+            $pos,
+            $tok,
+        )
+    };
+}
 
 /// Per-request input.
 pub struct GenerateReq {
@@ -229,6 +417,18 @@ pub fn run_watchdog(progress: WorkerProgress, deadline_ms: i64, poll_ms: u64) {
 #[derive(Clone)]
 pub struct EngineHandle {
     tx: mpsc::Sender<EngineRequest>,
+    /// The engine thread, kept so `shutdown` can JOIN it.
+    ///
+    /// It used to be detached. The worker acks `Shutdown` and only THEN drops
+    /// `WorkerState` — streams, modules, events, device buffers. With the
+    /// handle dropped, `main` returned as soon as the ack landed and libc began
+    /// running static destructors, including libamdhip64's, while the worker was
+    /// still calling into HIP. That race is what produced every teardown crash
+    /// we saw: SIGSEGV in `hip::Device::RemoveStream`, a throwing
+    /// `amd::roc::Kernel::~Kernel` during `hipModuleUnload`, SIGSEGV in
+    /// `hip::setCurrentDevice`, and `malloc_consolidate(): unaligned fastbin
+    /// chunk` on the runs where the damage surfaced as heap corruption instead.
+    worker: Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
     pub vocab: Arc<BpeVocab>,
     pub model_name: Arc<String>,
     /// Total KV-cache capacity in tokens — surfaced on `/v1/models` so
@@ -304,6 +504,17 @@ impl EngineHandle {
         ack_rx
             .await
             .map_err(|_| eyre!("engine worker dropped shutdown ack"))?;
+        // The ack only means the worker LEFT its request loop; it is still
+        // dropping `WorkerState` (and with it every HIP object) as the thread
+        // unwinds. Join before returning, or `main` returns into libc's static
+        // destructors and tears the HIP runtime out from under that drop.
+        let handle = self.worker.lock().ok().and_then(|mut g| g.take());
+        if let Some(h) = handle {
+            tokio::task::spawn_blocking(move || h.join())
+                .await
+                .map_err(|e| eyre!("joining engine thread panicked: {e}"))?
+                .map_err(|_| eyre!("engine thread panicked during teardown"))?;
+        }
         Ok(())
     }
 }
@@ -349,7 +560,7 @@ pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
     let progress = WorkerProgress::default();
     let progress_worker = progress.clone();
 
-    std::thread::Builder::new()
+    let worker = std::thread::Builder::new()
         .name("deepstrix-engine".into())
         .spawn(move || worker_main(cfg, rx, ready_tx, progress_worker))
         .map_err(|e| eyre!("failed to spawn engine thread: {e}"))?;
@@ -364,6 +575,7 @@ pub fn spawn(cfg: WorkerConfig) -> eyre::Result<EngineHandle> {
     let image_placeholder_id = vocab.lookup_token_id(v4flash_vision::IMAGE_PLACEHOLDER);
     Ok(EngineHandle {
         tx,
+        worker: Arc::new(std::sync::Mutex::new(Some(worker))),
         vocab,
         model_name,
         n_kv_max,
@@ -415,6 +627,19 @@ pub struct WorkerState {
     pub igpu: Device,
     pub engine: HeterogeneousEngine,
     pub weights: HetModelWeights,
+
+    /// M7 expert tier: pages V4.1's ~276 GiB of routed experts on demand instead
+    /// of making them resident. Owns the HF source, so the mmap it reads experts
+    /// from lives as long as the model. `None` when `V41_PAGED_EXPERTS` is unset
+    /// (full residency, which only fits for V4-Flash).
+    #[cfg(feature = "v41")]
+    pub pager: Option<v4flash_kernels::het::ExpertPager>,
+
+    /// V4.1 Engram: the n-gram hasher plus one table handle per Engram layer.
+    /// The 189 GiB of tables stay on SSD and are row-gathered per token, so this
+    /// holds only the hash parameters and the tensor descriptors.
+    #[cfg(feature = "v41")]
+    pub engram: Option<EngramCtx>,
     pub vocab: Arc<BpeVocab>,
     pub token_embd_bytes: Vec<u8>,
     pub token_embd_dtype: v4flash_core::gguf::GgufType,
@@ -510,9 +735,30 @@ fn pick_igpu() -> eyre::Result<Device> {
 }
 
 fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
-    tracing::info!(gguf = %cfg.gguf_path, "loading GGUF");
-    let gguf = MappedGguf::open(&cfg.gguf_path)?;
-    let vocab = BpeVocab::from_gguf(gguf.gguf())?;
+    // Model source: a GGUF (V4-Flash) or the HF safetensors dir (V4.1). Both
+    // present their tensors through `WeightSrc`, so everything downstream of
+    // `src` is source-agnostic (compile-time model selection, see ENGINE_PORT §0).
+    #[cfg(not(feature = "v41"))]
+    let src_owner = {
+        tracing::info!(gguf = %cfg.gguf_path, "loading GGUF");
+        MappedGguf::open(&cfg.gguf_path)?
+    };
+    #[cfg(feature = "v41")]
+    let src_owner = {
+        tracing::info!(dir = %cfg.gguf_path, "loading V4.1 HF safetensors");
+        V41HfWeights::open(&cfg.gguf_path, None)?
+    };
+    let src = WeightSrc::from(&src_owner);
+
+    #[cfg(not(feature = "v41"))]
+    let vocab = BpeVocab::from_gguf(src_owner.gguf())?;
+    #[cfg(feature = "v41")]
+    let vocab = {
+        // DeepSeek V4/V4.1 use the "joyai-llm" pre-tokenizer; the tokenizer.json
+        // table is id-for-id identical to the GGUF one (tokenizer.rs).
+        let tj = std::path::Path::new(&cfg.gguf_path).join("tokenizer.json");
+        BpeVocab::from_tokenizer_json(&tj, Some("joyai-llm".to_string()))?
+    };
     tracing::info!(
         vocab_size = vocab.vocab_size(),
         dsml_id = ?vocab.dsml_id,
@@ -525,8 +771,7 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     let igpu_arch = igpu.properties()?.gcn_arch_name;
     tracing::info!(dgpu=%dgpu_arch, dgpu_id=dgpu.id, igpu=%igpu_arch, igpu_id=igpu.id, "selected devices");
 
-    let token_embd_t = gguf
-        .gguf()
+    let token_embd_t = src
         .tensor("token_embd.weight")
         .ok_or_else(|| eyre!("missing token_embd.weight"))?;
     if !v4flash_kernels::weight_contract::TOKEN_EMBD_ALLOWED.contains(&token_embd_t.dtype) {
@@ -537,7 +782,7 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         ));
     }
     let token_embd_dtype = token_embd_t.dtype;
-    let token_embd_bytes = gguf.read_tensor(token_embd_t)?.to_vec();
+    let token_embd_bytes = src.read_tensor(token_embd_t)?;
 
     let rope = |layer: i32| -> eyre::Result<RopeParams> { Ok(rope_for_layer(layer)) };
 
@@ -554,28 +799,62 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
 
     tracing::info!("loading het weights (dGPU ~9 GiB + iGPU ~52 GiB)");
     let t0 = std::time::Instant::now();
-    let weights = HetModelWeights::load_all(&gguf, dgpu, igpu, &rope)?;
+    // V4.1's routed experts are ~276 GiB against 96 GB here, so they cannot be
+    // resident. `V41_PAGED_EXPERTS=1` leaves them out of the per-layer iGPU
+    // weights and an ExpertPager (built below) pages the router's actual picks on
+    // demand. Without the flag `load_all` still tries full residency and OOMs.
+    #[cfg(feature = "v41")]
+    if v4flash_kernels::het::weights::v41_paged_experts() {
+        tracing::info!("V4.1: paged expert tier ON — routed experts are NOT resident");
+    } else {
+        tracing::warn!(
+            "V4.1: V41_PAGED_EXPERTS unset — load_all will try to make ALL routed experts \
+             resident (~276 GiB) and will OOM on this box"
+        );
+    }
+    #[cfg_attr(not(feature = "v41"), allow(unused_mut))]
+    let mut weights = HetModelWeights::load_all(src, dgpu, igpu, &rope)?;
     tracing::info!(elapsed_s = t0.elapsed().as_secs_f64(), "weights loaded");
 
-    let engine =
+    let mut engine =
         HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
+    // `V41_PERFETTO_OUT=<path>`: device-time trace of every kernel stage on all
+    // four streams (dgpu/igpu x compute/xfer) plus the host-time
+    // `remote.expert` track for the two-box round trips. Off unless set —
+    // attaching turns on HIP event timing in both pools, which is not free.
+    if let Ok(path) = std::env::var("V41_PERFETTO_OUT") {
+        engine.attach_perfetto(&path)?;
+        tracing::info!(path = %path, "perfetto device trace attached");
+    }
+    let engine = engine;
     let dgpu_scratch = DgpuScratch::alloc(dgpu)?;
     let igpu_scratch = IgpuScratch::alloc(igpu)?;
-    // The indexer's candidate set is clamped to ATTN_MIXED_MAX_KEYS comp
-    // rows (forward_layer.rs / forward_prefill.rs); a --ctx past that cap
-    // would silently drop the NEWEST rows from indexer scoring at depth.
-    // Refuse at launch instead.
+    // Decode attention writes `n_raw + n_comp` scores per head into
+    // `DgpuScratch.attn_scores`, which is sized at ATTN_MIXED_MAX_KEYS.
+    // A --ctx past that cap used to be accepted and then fail mid-decode.
+    //
+    // The old check divided --ctx by 4, which silently assumed the model's
+    // smallest ungathered compressed store is n_kv/4. True for V4-Flash
+    // (ratio-4 layers are gathered to INDEXER_TOP_K, ratio-128 layers give
+    // n_kv/128) and FALSE for V4.1, whose layers 20-39 are ratio 1 with no
+    // indexer: it accepted `--ctx 328704` while decode died at ~82K.
+    // `attn_max_scored_keys` is the derivation both models share.
     {
-        let max_ratio4_rows = cfg.n_kv_max.div_ceil(4);
+        let raw_window = if cfg.mmproj_path.is_some() {
+            v4flash_kernels::het::image_spans::IMAGE_RAW_WINDOW_MAX
+        } else {
+            v4flash_kernels::config::SWA_WINDOW
+        };
+        let need = v4flash_kernels::attention::attn_max_scored_keys(cfg.n_kv_max, raw_window);
         let cap = v4flash_kernels::ATTN_MIXED_MAX_KEYS;
-        if max_ratio4_rows > cap {
+        if need > cap {
             return Err(eyre!(
-                "--ctx {} needs {} ratio-4 compressed rows but ATTN_MIXED_MAX_KEYS is {} \
-                 (raise it in attention.rs AND kernels/attention_mixed.hip, or use --ctx <= {})",
+                "--ctx {} makes decode attention score {} keys per head but \
+                 ATTN_MIXED_MAX_KEYS is {} (raise it in attention.rs, or use --ctx <= {})",
                 cfg.n_kv_max,
-                max_ratio4_rows,
+                need,
                 cap,
-                cap * 4
+                v4flash_kernels::attention::attn_max_ctx_for_keys(cap, raw_window),
             ));
         }
     }
@@ -589,13 +868,30 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     let bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
     let bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
     let bi_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
-    let sd = BatchDgpuShared::alloc_rows(dgpu, lane_rows)?;
+    // The batched attention scores scratch is the one prefill buffer that
+    // scales with context, and on a model with no sparse indexer it scales
+    // FAST (V4.1: 32 KiB per token of --ctx). Size it from --ctx instead of
+    // the ratio>=4-shaped ATTN_SCORES_STRIDE constant, and say what it cost.
+    {
+        let keys = v4flash_kernels::het::batch_scratch::attn_scores_capacity_keys(
+            lane_rows,
+            cfg.n_kv_max,
+        );
+        tracing::info!(
+            n_kv_max = cfg.n_kv_max,
+            lane_rows,
+            attn_scores_mib = (keys * 2) / (1024 * 1024),
+            "attention scores scratch sized from --ctx"
+        );
+    }
+    let sd = BatchDgpuShared::alloc_rows_ctx(dgpu, lane_rows, cfg.n_kv_max)?;
     let si = BatchIgpuShared::alloc_rows(igpu, lane_rows)?;
     tracing::info!(n_kv_max = cfg.n_kv_max, "KV cache allocated");
 
     let byte_decoder = build_gpt2_byte_decoder();
 
-    // Vision-Exp tower. Lives on the iGPU (host RAM): ~0.9 GiB of f16
+    // Vision tower (V4-Flash: Vision-Exp mmproj GGUF; V4.1: the HF snapshot
+    // dir, `vision_v41`). Lives on the iGPU (host RAM): ~0.9 GiB of f16
     // weights plus a small per-image activation workspace. Loaded here so
     // a bad `--mmproj` fails startup rather than the first image request.
     let tower = match cfg.mmproj_path.as_deref() {
@@ -606,12 +902,21 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
                 .is_none()
             {
                 return Err(eyre!(
-                    "--mmproj {} was given but the text GGUF has no `{}` token \
-                     (not a Vision-Exp checkpoint)",
+                    "--mmproj {} was given but the text vocab has no `{}` token \
+                     (not a vision checkpoint)",
                     path.display(),
                     v4flash_vision::IMAGE_PLACEHOLDER
                 ));
             }
+            // V4.1 carries `bias_vl` in the checkpoint itself: derive the sidecar
+            // the engine reads from the presented `exp_probs_b_vl.bias` tensors.
+            #[cfg(feature = "v41")]
+            crate::vision_v41::ensure_bias_vl(
+                &mut weights,
+                &src,
+                std::path::Path::new(&cfg.gguf_path),
+                dgpu,
+            )?;
             // The router needs the `bias_vl` sidecar for every image row.
             // Check it HERE: otherwise the first image request dies deep
             // inside layer-0 prefill as a 500, after part of the chunk's
@@ -632,13 +937,18 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
                 ));
             }
             // The attention score scratch is sized for text raw windows;
-            // image rows widen them. Refuse at launch rather than
-            // mid-prefill if --ctx makes that overrun.
+            // V4-Flash image rows widen them. Refuse at launch rather than
+            // mid-prefill if --ctx makes that overrun. (V4.1 image tokens
+            // attend causally — no widening, nothing to check.)
+            #[cfg(not(feature = "v41"))]
             v4flash_kernels::attention::check_vision_ctx_fits(cfg.n_kv_max)?;
             tracing::info!(mmproj = %path.display(), "loading vision tower (iGPU)");
             let t0 = std::time::Instant::now();
+            #[cfg(not(feature = "v41"))]
             let mut tower = v4flash_vision::Tower::load(path, igpu)
                 .map_err(|e| eyre!("loading mmproj {}: {e:#}", path.display()))?;
+            #[cfg(feature = "v41")]
+            let mut tower = crate::vision_v41::load_tower(path, igpu)?;
             // Host mirror is only needed for requantisation experiments;
             // drop it so the worker doesn't sit on ~0.9 GiB of host RAM.
             tower.drop_host();
@@ -654,7 +964,7 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
 
     // Compute model fingerprint and load (or create) the snapshot index.
     let fingerprint =
-        ModelFingerprint::compute(vocab.vocab_size() as u32, &token_embd_bytes, gguf.gguf());
+        ModelFingerprint::compute(vocab.vocab_size() as u32, &token_embd_bytes, src.tensors());
     if !cfg.snapshot_root.exists() {
         std::fs::create_dir_all(&cfg.snapshot_root)
             .map_err(|e| eyre!("create snapshot root {:?}: {e}", cfg.snapshot_root))?;
@@ -668,7 +978,50 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     let expert_stats =
         crate::expert_stats::ExpertStatsAgg::load_or_fresh(&expert_stats_path, &fingerprint);
 
+    // M7 expert pager. Takes ownership of the HF source: its mmap must outlive the
+    // model, since every routed expert is read from it on demand for the life of
+    // the process. Built last so the `src` borrow above (load_all, fingerprint) is
+    // finished. Slot count auto-sizes from V41_PAGER_POOL_GB.
+    #[cfg(feature = "v41")]
+    let pager = if v4flash_kernels::het::weights::v41_paged_experts() {
+        let t0 = std::time::Instant::now();
+        let pg = v4flash_kernels::het::ExpertPager::new(src_owner, igpu, 0)?;
+        tracing::info!(elapsed_s = t0.elapsed().as_secs_f64(), "expert pager ready");
+        Some(pg)
+    } else {
+        None
+    };
+
+    // V4.1 Engram. The hash parameters (token map, multipliers, pad id) come from
+    // a dumped dir; the tables are read straight out of the checkpoint. Both
+    // Engram layers must resolve or the forward fails at layer 1, so this is a
+    // hard error rather than a silent skip.
+    #[cfg(feature = "v41")]
+    let engram = match pager.as_ref() {
+        None => None,
+        Some(pg) => {
+            let dir = std::env::var("V41_ENGRAM_DIR").unwrap_or_else(|_| {
+                format!(
+                    "{}/.cache/deepstrix/v41/engram",
+                    std::env::var("HOME").unwrap_or_default()
+                )
+            });
+            let hasher = v4flash_core::EngramHash::load(std::path::Path::new(&dir))
+                .map_err(|e| eyre!("engram hash params at {dir}: {e:#} (set V41_ENGRAM_DIR)"))?;
+            let mut tables = Vec::new();
+            for &l in v4flash_kernels::config::ENGRAM_LAYERS {
+                tables.push(v4flash_core::EngramTable::open(pg.raw(), l as usize)?);
+            }
+            tracing::info!(dir = %dir, layers = ?v4flash_kernels::config::ENGRAM_LAYERS, "engram ready (tables stay on SSD)");
+            Some(EngramCtx { hasher, tables, compressed: Vec::new() })
+        }
+    };
+
     Ok(WorkerState {
+        #[cfg(feature = "v41")]
+        pager,
+        #[cfg(feature = "v41")]
+        engram,
         dgpu,
         igpu,
         engine,
@@ -1083,6 +1436,12 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                 }
                 state.progress.begin();
                 let _guard = InflightGuard(state.progress.clone());
+                #[cfg(feature = "v41")]
+                let pager_c0 = state
+                    .pager
+                    .as_ref()
+                    .map(|p| p.counters())
+                    .unwrap_or_default();
                 if let Err(e) = handle_generate_stream(&mut state, req, session_id, cancel, &tx) {
                     let _ = tx.blocking_send(WorkerEvent::Error(format!("{e:#}")));
                 }
@@ -1091,6 +1450,70 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                 // shape: in_use vs free is the fragmentation-vs-leak
                 // discriminator (see v4flash_core::heap). Cheap (~ms)
                 // relative to a request.
+                // M7: cumulative pager hit rate. Pool size only moves this number,
+                // never correctness, so it is the knob for decode throughput.
+                #[cfg(feature = "v41")]
+                if let Some(pg) = state.pager.as_ref() {
+                    // PREFILL and DECODE are reported separately: prefill's dense
+                    // path issues 384 requests per (layer, chunk) against decode's
+                    // <= 6 per (layer, token), so a merged "hit rate" is a prefill
+                    // number with decode rounded away. Both a per-request delta and
+                    // the cumulative totals, since the LRU warms across requests.
+                    let cum = pg.counters();
+                    let d = cum - pager_c0;
+                    let rate = |m: u64, r: u64| if r > 0 { 1.0 - m as f64 / r as f64 } else { f64::NAN };
+                    tracing::info!(
+                        prefill_requests = d.prefill_requests,
+                        prefill_misses = d.prefill_misses,
+                        prefill_hit = rate(d.prefill_misses, d.prefill_requests),
+                        prefill_read_ms = d.prefill_read_ns / 1_000_000,
+                        prefill_h2d_ms = d.prefill_h2d_ns / 1_000_000,
+                        decode_requests = d.decode_requests,
+                        decode_misses = d.decode_misses,
+                        decode_hit = rate(d.decode_misses, d.decode_requests),
+                        decode_read_ms = d.decode_read_ns / 1_000_000,
+                        decode_h2d_ms = d.decode_h2d_ns / 1_000_000,
+                        decode_ms_per_miss = if d.decode_misses > 0 {
+                            (d.decode_read_ns + d.decode_h2d_ns) as f64 / d.decode_misses as f64 / 1e6
+                        } else { f64::NAN },
+                        // Miss-phase split (M8 measurement E), decode only.
+                        decode_alloc_ms = d.decode_alloc_ns / 1_000_000,
+                        decode_pread_ms = d.decode_pread_ns / 1_000_000,
+                        decode_repack_ms = d.decode_repack_ns / 1_000_000,
+                        decode_pread_gbps = if d.decode_pread_ns > 0 {
+                            d.decode_pread_bytes as f64 / d.decode_pread_ns as f64
+                        } else { 0.0 },
+                        decode_slots = pg.decode_slots(),
+                        dense_windows = pg.dense_windows(),
+                        "expert pager (request)"
+                    );
+                    tracing::info!(
+                        prefill_requests = cum.prefill_requests,
+                        prefill_misses = cum.prefill_misses,
+                        prefill_hit = rate(cum.prefill_misses, cum.prefill_requests),
+                        decode_requests = cum.decode_requests,
+                        decode_misses = cum.decode_misses,
+                        decode_hit = rate(cum.decode_misses, cum.decode_requests),
+                        "expert pager (cumulative)"
+                    );
+                    // Per-miss phase split (M8 measurement E): the pager's host read
+                    // is two cached preads of the HF shard plus a scalar HF->ggml
+                    // MXFP4 repack; only the pread is SSD-bound.
+                    let (calls, alloc_ns, pread_ns, repack_ns, bytes) =
+                        v4flash_core::hf_v41::expert_read_profile();
+                    tracing::info!(
+                        role_reads = calls,
+                        alloc_ms = alloc_ns / 1_000_000,
+                        pread_ms = pread_ns / 1_000_000,
+                        repack_ms = repack_ns / 1_000_000,
+                        pread_gb = bytes as f64 / 1e9,
+                        pread_gbps = if pread_ns > 0 { bytes as f64 / pread_ns as f64 } else { 0.0 },
+                        us_per_role_alloc = if calls > 0 { alloc_ns / calls / 1000 } else { 0 },
+                        us_per_role_pread = if calls > 0 { pread_ns / calls / 1000 } else { 0 },
+                        us_per_role_repack = if calls > 0 { repack_ns / calls / 1000 } else { 0 },
+                        "expert read phases (cumulative)"
+                    );
+                }
                 let hs = v4flash_core::heap::trim_and_stats();
                 tracing::info!(
                     rss_mib = v4flash_core::heap::rss_bytes() >> 20,
@@ -1400,6 +1823,15 @@ fn handle_generate_stream(
         // avoid the ~1-2 s restore overhead for tiny snapshots that
         // wouldn't pay for themselves).
         const DISK_RESTORE_MIN_TOKENS: usize = 64;
+        // V4.1: a KV snapshot does NOT carry the Engram n-gram state. EngramCtx keeps a running
+        // compressed-id sequence over every token seen, and restoring a snapshot skips the prefill
+        // that would have appended those ids — so the next decode asks for rows at position N
+        // while the sequence still holds only the ids from earlier requests
+        // ("engram: position 965 but 44 tokens tracked"), and the request fails. The sequence is a
+        // pure function of the token ids, so the real fix is to rebuild it on restore (or persist
+        // it beside the KV); until then, disable snapshot reuse under v41 so prefill always runs
+        // and the sequence is always consistent. Costs the prefix-cache speedup, not correctness.
+        let disk_hit = if cfg!(feature = "v41") { None } else { disk_hit };
         if let Some((snap_req_tokens, snap_hash, snap_dir)) = disk_hit {
             if snap_req_tokens >= DISK_RESTORE_MIN_TOKENS {
                 save_live_if_dirty(state);
@@ -1836,15 +2268,7 @@ fn save_and_forward_marker(
     let initial_in_think = if let Some(marker) = trailing_marker {
         let mut residual = vec![0f32; HC_DIM as usize];
         embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, marker, &mut residual);
-        state.engine.forward_token(
-            &mut state.dgpu_scratch,
-            &mut state.igpu_scratch,
-            &mut state.state,
-            &state.weights,
-            &residual,
-            pos_after_marker,
-            marker,
-        )?;
+        forward_one!(state, residual, pos_after_marker, marker)?;
         pos_after_marker += 1;
         if let Some(live) = state.live.as_mut() {
             live.pos = pos_after_marker;
@@ -1940,9 +2364,21 @@ fn finish_decode(
     // one-line heartbeat every HEARTBEAT_INTERVAL completion tokens
     // with rolling tok/s since the last beat, so the log keeps
     // breathing.
-    const HEARTBEAT_INTERVAL: u32 = 64;
+    let heartbeat_interval: u32 = std::env::var("DEEPSTRIX_HEARTBEAT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64u32)
+        .max(1);
     let mut hb_last_count: u32 = 0;
     let mut hb_last_at = std::time::Instant::now();
+    #[cfg(feature = "v41")]
+    let mut hb_last_pager = state.pager.as_ref().map(|p| p.counters()).unwrap_or_default();
+    // Expert-read phase profile, deltaed between heartbeats. Heartbeats only fire
+    // inside the decode loop, so a delta is DECODE-only reads (single-threaded, so
+    // the ns sums are real wall) — unlike the cumulative figure, which is dominated
+    // by prefill's 4-thread dense sweeps.
+    #[cfg(feature = "v41")]
+    let mut hb_last_read = state.pager.as_ref().map(|p| p.counters()).unwrap_or_default();
     // Tracks whether the decode loop exited because the client cancelled.
     // FinishReason::Stop covers both natural turn-end AND cancel, so we
     // need a separate signal to disambiguate. On cancel we DROP live
@@ -1959,7 +2395,7 @@ fn finish_decode(
             break FinishReason::Stop;
         }
         if completion_tokens > 0
-            && completion_tokens - hb_last_count >= HEARTBEAT_INTERVAL
+            && completion_tokens - hb_last_count >= heartbeat_interval
         {
             let elapsed = hb_last_at.elapsed().as_secs_f32();
             let delta = completion_tokens - hb_last_count;
@@ -1968,11 +2404,55 @@ fn finish_decode(
             } else {
                 0.0
             };
+            // Decode's TRUE miss rate: `decode_*` counters only, over the tokens
+            // in this beat. The old merged counter could not see this at all.
+            #[cfg(feature = "v41")]
+            let (miss_per_tok, decode_hit, ms_per_miss) = match state.pager.as_ref() {
+                Some(pg) => {
+                    let d = pg.counters() - hb_last_pager;
+                    hb_last_pager = pg.counters();
+                    (
+                        d.decode_misses as f64 / delta as f64,
+                        if d.decode_requests > 0 {
+                            1.0 - d.decode_misses as f64 / d.decode_requests as f64
+                        } else { f64::NAN },
+                        if d.decode_misses > 0 {
+                            (d.decode_read_ns + d.decode_h2d_ns) as f64 / d.decode_misses as f64 / 1e6
+                        } else { f64::NAN },
+                    )
+                }
+                None => (f64::NAN, f64::NAN, f64::NAN),
+            };
+            #[cfg(not(feature = "v41"))]
+            let (miss_per_tok, decode_hit, ms_per_miss) = (f64::NAN, f64::NAN, f64::NAN);
+            #[cfg(feature = "v41")]
+            if let Some(pg) = state.pager.as_ref() {
+                let d = pg.counters() - hb_last_read;
+                hb_last_read = pg.counters();
+                if d.decode_misses > 0 {
+                    let m = d.decode_misses as f64;
+                    tracing::info!(
+                        misses = d.decode_misses,
+                        ms_alloc = d.decode_alloc_ns as f64 / m / 1e6,
+                        ms_pread = d.decode_pread_ns as f64 / m / 1e6,
+                        ms_repack = d.decode_repack_ns as f64 / m / 1e6,
+                        ms_h2d = d.decode_h2d_ns as f64 / m / 1e6,
+                        ms_total = (d.decode_read_ns + d.decode_h2d_ns) as f64 / m / 1e6,
+                        pread_gbps = if d.decode_pread_ns > 0 {
+                            d.decode_pread_bytes as f64 / d.decode_pread_ns as f64
+                        } else { 0.0 },
+                        "decode miss phases (per miss)"
+                    );
+                }
+            }
             tracing::info!(
                 completion_tokens,
                 pos,
                 in_think,
                 tok_per_s = format!("{:.1}", tok_per_s),
+                miss_per_tok = format!("{miss_per_tok:.2}"),
+                decode_hit = format!("{decode_hit:.4}"),
+                ms_per_miss = format!("{ms_per_miss:.2}"),
                 "decode heartbeat"
             );
             hb_last_count = completion_tokens;
@@ -2085,15 +2565,7 @@ fn finish_decode(
             return Err(eyre!("generate: sampled token id {next} out of vocab"));
         }
         embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, next, &mut residual);
-        state.engine.forward_token(
-            &mut state.dgpu_scratch,
-            &mut state.igpu_scratch,
-            &mut state.state,
-            &state.weights,
-            &residual,
-            pos,
-            next,
-        )?;
+        forward_one!(state, residual, pos, next)?;
         pos += 1;
         // Successfully ingested `next` into KV at `pos-1`. live.pos
         // always tracks the KV cache position. live.tokens only
@@ -2144,15 +2616,7 @@ fn finish_decode(
     // reset_in_place.
     if matches!(finish, FinishReason::Stop) && !was_cancelled && pos < state.n_kv_max {
         embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, TOK_EOS, &mut residual);
-        state.engine.forward_token(
-            &mut state.dgpu_scratch,
-            &mut state.igpu_scratch,
-            &mut state.state,
-            &state.weights,
-            &residual,
-            pos,
-            TOK_EOS,
-        )?;
+        forward_one!(state, residual, pos, TOK_EOS)?;
         pos += 1;
         if let Some(ref mut live) = state.live {
             live.tokens.push(TOK_EOS);
@@ -2436,12 +2900,46 @@ fn prefill_suffix(
             .iter()
             .map(|s| (s.start + pos0, s.len))
             .collect();
-    let image_spans = (!spans_abs.is_empty()).then_some(spans_abs.as_slice());
+    // V4-Flash: the engine widens each image row's raw window to the whole
+    // `[START..END]` span (bidirectional inside the image) and keeps every
+    // span inside one chunk / lane. V4.1 has no such rule (`model.py` has no
+    // `get_image_visible`; image tokens attend causally like text), so it gets
+    // NO spans — routing still picks `bias_vl` for image rows off their
+    // synthetic ids, and the Engram rows above are already masked.
+    let image_spans = if cfg!(feature = "v41") {
+        None
+    } else {
+        (!spans_abs.is_empty()).then_some(spans_abs.as_slice())
+    };
     // Clone the progress handle into a local so the per-chunk pet
     // closure doesn't co-borrow `state` with state.engine below.
     // WorkerProgress is two Arc clones — effectively free.
     let progress = state.progress.clone();
     let pet_each_chunk = || progress.pet();
+    // Engram rows for the whole prompt: batched prefill stages them per layer
+    // per lane. Gathered here because the tables are SSD-resident and the gather
+    // needs the same HF source the pager owns.
+    #[cfg(feature = "v41")]
+    let engram_chunk: Option<Vec<Vec<f32>>> = match (state.pager.as_ref(), state.engram.as_mut()) {
+        (Some(pg), Some(ec)) => {
+            let raw = pg.raw();
+            // Timed: this sits OUTSIDE `prefill_start`, so it never appeared in any
+            // prefill stage timing despite being ~0.53 ms/token before the fix.
+            let t_eng = std::time::Instant::now();
+            let rows = ec.rows_for_chunk(raw, tokens, pos0)?;
+            tracing::info!(
+                tokens = tokens.len(),
+                elapsed_ms = t_eng.elapsed().as_millis() as u64,
+                us_per_token = (t_eng.elapsed().as_micros() as f64 / tokens.len().max(1) as f64),
+                "engram rows_for_chunk"
+            );
+            Some(rows)
+        }
+        _ => None,
+    };
+    // M7: batched prefill now pages this layer's experts out of the pool
+    // (forward_layer_pre_moe_v2), so paged mode takes the SAME batched path as
+    // resident mode — no more token-at-a-time fallback.
     let _ = state.engine.forward_prefill_pipelined(
         &mut state.bd_a,
         &mut state.bi_a,
@@ -2460,6 +2958,15 @@ fn prefill_suffix(
         cancel,
         Some(&pet_each_chunk),
         image_spans,
+        // M7: page experts per layer instead of reading resident buffers.
+        #[cfg(feature = "v41")]
+        state.pager.as_mut(),
+        #[cfg(not(feature = "v41"))]
+        None,
+        #[cfg(feature = "v41")]
+        engram_chunk.as_deref(),
+        #[cfg(not(feature = "v41"))]
+        None,
     )?;
     Ok(())
 }

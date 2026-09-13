@@ -18,7 +18,7 @@
 
 use color_eyre::eyre::{self, eyre, WrapErr};
 use v4flash_core::gguf::GgufType;
-use v4flash_core::MappedGguf;
+use v4flash_core::WeightSrc;
 use v4flash_hip::DeviceBuffer;
 
 use crate::weight_contract;
@@ -44,18 +44,90 @@ pub struct DeviceWeight {
 /// effects are bounded by the largest single tensor (~500 MB).
 ///
 /// Errors: tensor not found, zero byte_size, alloc/copy failure.
-pub fn load_to_device(
-    gguf: &MappedGguf,
+/// DEFAULT OFF. Measured back-to-back 2026-09-12: load 77.8 s (off) vs 79.0 s
+/// (on) — **no gain**. The earlier "95 s -> 82 s" was page-cache warmth across
+/// two restarts, not the change (the classic across-time bench confound). The
+/// read is simply not where model-load time goes; ~78 s is elsewhere and has
+/// not been profiled yet. The path is correct (byte-identity oracle
+/// `tests/fast_load_bytes_match.rs` passes over 3.28 GiB, both the 64-thread
+/// and single-pread regimes) and it avoids a host staging buffer, so it is kept
+/// behind the flag — V4.1's mix may differ, since nearly all of its bytes are
+/// passthrough MXFP4 with no Q8_0 repack. Do not enable without re-measuring.
+fn fast_load_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("DEEPSTRIX_FAST_LOAD").map(|v| v == "1").unwrap_or(false)
+    });
+    *ON
+}
+
+pub fn load_to_device<'a>(
+    src: impl Into<WeightSrc<'a>>,
     name: &str,
     device_id: i32,
 ) -> eyre::Result<DeviceWeight> {
+    let gguf: WeightSrc<'a> = src.into();
     let tensor = gguf
-        .gguf()
         .tensor(name)
         .ok_or_else(|| eyre!("tensor `{name}` not found in GGUF"))?;
     if tensor.byte_size == 0 {
         return Err(eyre!("tensor `{name}` has zero byte_size"));
     }
+    // ---- FAST PATH (2026-09-12) -------------------------------------
+    // `hipMalloc` pointers are CPU-addressable on this APU (probed:
+    // write+readback through `dev.raw()`), so when a tensor needs no host-side
+    // transformation we can allocate the device buffer FIRST and `pread`
+    // straight into it. That replaces three passes over the bytes — a
+    // `resize(n, 0)` that zeroes memory the read immediately overwrites, a
+    // single-threaded read, and a staged pageable->device copy — with one
+    // multi-threaded read. Measured: ~690 MB/s end-to-end before, 3.90 GB/s
+    // for the direct path (docs/v41/COLD_EXPERT_CACHING.md phase B).
+    //
+    // Eligible = the bytes on disk are exactly the bytes the device wants:
+    // a Quant-role or ungoverned tensor that is NOT Q8_0 (Q8_0 gets the M18
+    // repack) and NOT ToF16 (which converts). Everything else takes the
+    // original host path below, unchanged.
+    // `DEEPSTRIX_FAST_LOAD=0` disables.
+    let role = weight_contract::role_of(name);
+    let expectation = weight_contract::expectation(&role);
+    let needs_host_work = matches!(expectation, Some(weight_contract::Expect::ToF16(_)))
+        || tensor.dtype == GgufType::Q8_0;
+    if !needs_host_work && fast_load_enabled() {
+        // Contract check still applies — do not let the fast path skip it.
+        if let Some(weight_contract::Expect::Quant(allowed)) = expectation {
+            if !allowed.contains(&tensor.dtype) {
+                return Err(eyre!(
+                    "{name}: dtype {} unsupported here (kernels exist for: {})",
+                    tensor.dtype.name(),
+                    allowed.iter().map(|d| d.name()).collect::<Vec<_>>().join("|")
+                ));
+            }
+        }
+        let n = tensor.byte_size as usize;
+        let mut buffer: DeviceBuffer<u8> = DeviceBuffer::new(device_id, n).wrap_err_with(|| {
+            format!("alloc DeviceBuffer<u8> ({n} bytes) for `{name}` (fast load)")
+        })?;
+        {
+            // The single unsafe step: assert this APU's device allocations are
+            // CPU-addressable. Everything after it is safe — the reader takes a
+            // `&mut [u8]` and splits it with `chunks_mut`.
+            // SAFETY: `buffer` was just allocated here, is exclusively owned,
+            // and no GPU work references it yet.
+            let dst = unsafe { buffer.as_host_slice_mut() };
+            gguf.read_tensor_into_slice_parallel(tensor, dst)
+                .wrap_err_with(|| format!("fast-load pread `{name}`"))?;
+        }
+        // Publish the CPU stores (incl. any write-combining buffers) before the
+        // GPU can read this weight.
+        DeviceBuffer::<u8>::host_write_barrier();
+        let n_elements: u64 = tensor.dims.iter().product();
+        return Ok(DeviceWeight {
+            buffer,
+            n_elements,
+            dtype: tensor.dtype,
+            shape: tensor.dims.clone(),
+        });
+    }
+
     let host = gguf
         .read_tensor(tensor)
         .wrap_err_with(|| format!("pread `{name}`"))?;
@@ -68,9 +140,8 @@ pub fn load_to_device(
     //    in those types); reported dtype becomes F16.
     //  - Ungoverned role (MTP file, Laguna, ad-hoc test tensors): legacy
     //    behavior, i.e. repack-if-Q8_0 passthrough.
-    let role = weight_contract::role_of(name);
     let mut dtype = tensor.dtype;
-    let host = match weight_contract::expectation(&role) {
+    let host = match expectation {
         Some(weight_contract::Expect::Quant(allowed)) => {
             if !allowed.contains(&tensor.dtype) {
                 return Err(eyre!(

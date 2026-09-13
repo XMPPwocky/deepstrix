@@ -57,6 +57,10 @@ pub fn moe_gate_up_batch(
         GgufType::IQ3_S => e.iq3s.launch_fused_swiglu_batch(
             s, mid, gate, up, xq, ew, selected, gbpe, ubpe, n_used, clamp, n_rows, n_blocks,
         ),
+        // V4.1-Flash native experts.
+        GgufType::MXFP4 => e.mxfp4pair.launch_fused_swiglu_batch(
+            s, mid, gate, up, xq, ew, selected, gbpe, ubpe, n_used, clamp, n_rows, n_blocks,
+        ),
         other => Err(eyre!("moe gate/up: no decode kernel for {other:?}")),
     }
 }
@@ -103,6 +107,10 @@ pub fn moe_gate_up_batch_hetsplit(
             n_rows, n_blocks,
         ),
         GgufType::IQ3_S => e.iq3s.launch_fused_swiglu_batch_hetsplit(
+            s, mid, gate, up, xq, ew, selected, remap, mode, cap, gbpe, ubpe, n_used, clamp,
+            n_rows, n_blocks,
+        ),
+        GgufType::MXFP4 => e.mxfp4pair.launch_fused_swiglu_batch_hetsplit(
             s, mid, gate, up, xq, ew, selected, remap, mode, cap, gbpe, ubpe, n_used, clamp,
             n_rows, n_blocks,
         ),
@@ -255,7 +263,7 @@ pub fn pair_kwide_selected(dt: GgufType, rollback_to_chunked: bool) -> bool {
     !rollback_to_chunked
         && matches!(
             dt,
-            GgufType::IQ2_S | GgufType::IQ2_XS | GgufType::IQ3_XXS | GgufType::IQ3_S
+            GgufType::IQ2_S | GgufType::IQ2_XS | GgufType::IQ3_XXS | GgufType::IQ3_S | GgufType::MXFP4
         )
 }
 
@@ -379,6 +387,16 @@ pub fn moe_gate_up_chunked(
             s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
             gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
         )?,
+        // MXFP4 (DeepSeek-V4.1-Flash's native routed experts, 2026-09-12):
+        // same two-kernel family, contracts identical to iq3_s.
+        GgufType::MXFP4 if use_kwide => e.mxfp4pair.launch_fused_swiglu_kwide(
+            s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
+        )?,
+        GgufType::MXFP4 => e.mxfp4pair.launch_fused_swiglu_chunked(
+            s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
+        )?,
         GgufType::IQ2_XXS => return Ok(false),
         other => return Err(eyre!("moe gate/up prefill: no kernel for {other:?}")),
     }
@@ -400,6 +418,7 @@ mod tests {
             GgufType::IQ2_XS,
             GgufType::IQ3_XXS,
             GgufType::IQ3_S,
+            GgufType::MXFP4,
         ] {
             assert!(
                 pair_kwide_selected(dt, false),
@@ -420,6 +439,7 @@ mod tests {
             GgufType::IQ2_XS,
             GgufType::IQ3_XXS,
             GgufType::IQ3_S,
+            GgufType::MXFP4,
         ] {
             assert!(!pair_kwide_selected(dt, true), "{dt:?} rollback");
         }

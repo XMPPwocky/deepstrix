@@ -166,12 +166,12 @@ impl ModelFingerprint {
     pub fn compute(
         vocab_size: u32,
         token_embd_bytes: &[u8],
-        gguf: &v4flash_core::gguf::Gguf,
+        tensors: &[v4flash_core::gguf::GgufTensor],
     ) -> Self {
         let prefix_len = token_embd_bytes.len().min(4096);
         let hash = blake3::hash(&token_embd_bytes[..prefix_len]);
         let mut dir = blake3::Hasher::new();
-        for t in gguf.tensors() {
+        for t in tensors {
             dir.update(t.name.as_bytes());
             dir.update(&[0]);
             dir.update(t.dtype.name().as_bytes());

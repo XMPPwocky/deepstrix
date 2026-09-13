@@ -174,6 +174,46 @@ impl F16Matvec {
         ])
     }
 
+    /// Batch-tiled twin of `matvec_pair_batched`: each warp handles TILE_B
+    /// batch rows for one output row, so a weight pack is loaded once and
+    /// reused TILE_B times instead of once per batch row.
+    ///
+    /// **Bit-exact** with `matvec_pair_batched` — same per-(row, b) 4-way
+    /// accumulation over the same lane stride, same reduction order. Only the
+    /// work-to-workgroup mapping changes. Must match TILE_B in the .hip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_pair_batched_tiled(
+        &self,
+        stream: &Stream,
+        kv: &mut DeviceBuffer<f32>,
+        gate: &mut DeviceBuffer<f32>,
+        kv_w: &DeviceBuffer<u8>,
+        gate_w: &DeviceBuffer<u8>,
+        x: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+        b: u32,
+    ) -> eyre::Result<()> {
+        if b == 0 {
+            return Ok(());
+        }
+        if k % 4 != 0 {
+            return Err(eyre!("f16 matvec_pair_batched_tiled: k={k} must be %4"));
+        }
+        const TILE_B: u32 = 8; // must match the .hip
+        let function = self.pair.get_function("f16_matvec_pair_batched_tiled")?;
+        let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
+        let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, b.div_ceil(TILE_B)),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            kv.raw(), gate.raw(), kv_w.raw(), gate_w.raw(), x.raw(), k, n_rows, b
+        ])
+    }
+
     /// M50 batched: B independent matvec_pair, sharing the two weight
     /// matrices across all B. `kv`/`gate` outputs are [B, n_rows]; `x` is
     /// [B, k]. One launch instead of B.

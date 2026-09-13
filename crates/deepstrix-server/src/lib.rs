@@ -8,9 +8,13 @@ pub mod engine_worker;
 pub mod expert_stats;
 pub mod openai;
 pub mod prompt;
+pub mod prompt_v41;
+mod prompt_v41_templates;
 pub mod snapshot;
 pub mod tokens;
 pub mod vision_prompt;
+#[cfg(feature = "v41")]
+pub mod vision_v41;
 
 use color_eyre::eyre;
 use v4flash_kernels::config::COMPRESS_RATIOS;

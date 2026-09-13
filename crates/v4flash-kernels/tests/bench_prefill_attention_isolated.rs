@@ -29,7 +29,7 @@
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Event, Stream};
-use v4flash_kernels::attention::{AttentionMixed, ATTN_MIXED_MAX_KEYS};
+use v4flash_kernels::attention::{AttentionMixed, AttentionSwa, ATTN_MIXED_MAX_KEYS, ATTN_SCORES_STRIDE};
 use v4flash_kernels::config::{N_HEAD, N_HEAD_DIM};
 
 fn pick_dgpu() -> eyre::Result<Device> {
@@ -113,6 +113,15 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
     let do_smwsum_ldsv_db = phase == "smwsum_ldsv_db";
     let do_smwsum_regv_db = phase == "smwsum_regv_db";
     let do_smwsum_ldsv_f16s = phase == "smwsum_ldsv_f16s";
+    // "swa_ab" times the two ratio-0 candidates back to back in this one
+    // process: `attention_swa_batched` (today's ratio-0 path) against the
+    // batched WMMA score + LDS-V f16-scores smwsum pair run with
+    // `comp_kv = None` / per-row `n_comp = 0`. Use BENCH_N_COMP=0.
+    let do_swa_ab = phase == "swa_ab";
+    // "chain_f16s" times the PRODUCTION prefill attention pair (f16-scores WMMA
+    // score + LDS-V f16-scores smwsum) as one span — the per-layer dense
+    // compressed-attention cost at (B, n_raw, n_comp).
+    let do_chain_f16s = phase == "chain_f16s";
 
     let n_total = n_raw + n_comp;
     if n_total > ATTN_MIXED_MAX_KEYS {
@@ -176,9 +185,18 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
     n_comp_per.copy_from_host_async(&vec![n_comp as i32; b], &stream)?;
     stream.synchronize()?;
 
-    // scores scratch: [B, n_head, ATTN_MIXED_MAX_KEYS]
-    let mut scores: DeviceBuffer<f32> =
-        DeviceBuffer::new(dgpu.id, b * (n_head as usize) * (ATTN_MIXED_MAX_KEYS as usize))?;
+    // scores scratch: [B, n_head, scores_stride]. Sized from the stride the
+    // launches below are given, not from ATTN_MIXED_MAX_KEYS — at the V4.1
+    // cap that allocation is 17 GB.
+    let scores_stride: u32 = n_total.max(ATTN_SCORES_STRIDE);
+    // The `_f16s` kernels index this buffer as f16, so they need half the f32
+    // elements. At B=512 / n_comp=50K that is 3.3 GB instead of 6.6.
+    let f16s_phase = do_swa_ab || do_chain_f16s || do_smwsum_ldsv_f16s;
+    let scores_elems = {
+        let keys = b * (n_head as usize) * (scores_stride as usize);
+        if f16s_phase { keys.div_ceil(2) } else { keys }
+    };
+    let mut scores: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, scores_elems)?;
     scores.fill_zero()?;
 
     // out: [B, n_head, head_dim]
@@ -204,6 +222,7 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
                 head_dim,
                 n_total,
                 batch,
+                scores_stride,
             )?;
         }
         if do_smwsum_wmma {
@@ -220,6 +239,7 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
                 n_head,
                 head_dim,
                 batch,
+                scores_stride,
             )?;
         }
         if do_smwsum_ldsv {
@@ -236,6 +256,19 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
                 n_head,
                 head_dim,
                 batch,
+                scores_stride,
+            )?;
+        }
+        if do_chain_f16s {
+            attn.launch_score_batched_htiled_wmma_f16s(
+                stream, scores, &q, &raw_kv, comp_kv.as_ref(),
+                &n_raw_per, &n_raw_offset_per, &n_comp_per, None,
+                n_head, head_dim, n_total, batch, 0, scores_stride,
+            )?;
+            attn.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(
+                stream, out, scores, &sinks, &raw_kv, comp_kv.as_ref(),
+                &n_raw_per, &n_raw_offset_per, &n_comp_per,
+                n_head, head_dim, batch, 0, scores_stride,
             )?;
         }
         if do_smwsum_ldsv_f16s {
@@ -253,6 +286,7 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
                 head_dim,
                 batch,
                 0,
+                scores_stride,
             )?;
         }
         if do_smwsum_ldsv_db {
@@ -269,6 +303,7 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
                 n_head,
                 head_dim,
                 batch,
+                scores_stride,
             )?;
         }
         if do_smwsum_regv_db {
@@ -285,10 +320,65 @@ fn bench_prefill_attention_isolated() -> eyre::Result<()> {
                 n_head,
                 head_dim,
                 batch,
+                scores_stride,
             )?;
         }
         Ok(())
     };
+
+    if do_swa_ab {
+        if n_comp != 0 {
+            return Err(eyre!("swa_ab needs BENCH_N_COMP=0 (ratio-0 layers have no comp store)"));
+        }
+        let swa = AttentionSwa::for_arch(&arch)?;
+        let mut a_ms: Vec<f32> = Vec::with_capacity(iters);
+        let mut b_ms: Vec<f32> = Vec::with_capacity(iters);
+        for i in 0..(warmup + iters) {
+            let timed = i >= warmup;
+
+            let s0 = Event::new()?;
+            let e0 = Event::new()?;
+            s0.record(&stream)?;
+            swa.launch_batched(
+                &stream, &mut out, &q, &raw_kv, &sinks,
+                &n_raw_per, &n_raw_offset_per,
+                n_head, head_dim, batch, n_raw.max(1),
+            )?;
+            e0.record(&stream)?;
+            stream.synchronize()?;
+            if timed {
+                a_ms.push(Event::elapsed_ms(&s0, &e0)?);
+            }
+
+            let s1 = Event::new()?;
+            let e1 = Event::new()?;
+            s1.record(&stream)?;
+            attn.launch_score_batched_htiled_wmma_f16s(
+                &stream, &mut scores, &q, &raw_kv, None,
+                &n_raw_per, &n_raw_offset_per, &n_comp_per, None,
+                n_head, head_dim, n_total, batch, 0, scores_stride,
+            )?;
+            attn.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(
+                &stream, &mut out, &mut scores, &sinks, &raw_kv, None,
+                &n_raw_per, &n_raw_offset_per, &n_comp_per,
+                n_head, head_dim, batch, 0, scores_stride,
+            )?;
+            e1.record(&stream)?;
+            stream.synchronize()?;
+            if timed {
+                b_ms.push(Event::elapsed_ms(&s1, &e1)?);
+            }
+        }
+        a_ms.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        b_ms.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let pa = a_ms[a_ms.len() / 2];
+        let pb = b_ms[b_ms.len() / 2];
+        eprintln!("swa_ab B={batch} n_raw={n_raw}:");
+        eprintln!("  attention_swa_batched   p50 = {pa:.4} ms (min {:.4})", a_ms[0]);
+        eprintln!("  wmma score+smwsum_f16s  p50 = {pb:.4} ms (min {:.4})", b_ms[0]);
+        eprintln!("  speedup = {:.2}x", pa / pb.max(1e-9));
+        return Ok(());
+    }
 
     for _ in 0..warmup {
         launch_iter(&stream, &mut scores, &mut out)?;
@@ -457,15 +547,16 @@ fn prefill_attention_htiled_offset_oracle() -> eyre::Result<()> {
     let out_len = b * nh * hd;
     let mut out_gpu = DeviceBuffer::new(dgpu.id, out_len)?;
     out_gpu.fill_zero()?;
-    let mut scores_g =
-        DeviceBuffer::new(dgpu.id, b * nh * ATTN_MIXED_MAX_KEYS as usize)?;
-    scores_g.fill_zero()?;
     let n_total_max = n_raw_per_h
         .iter()
         .zip(n_comp_per_h.iter())
         .map(|(&r, &c)| (r + c) as u32)
         .max()
         .unwrap();
+    let scores_stride: u32 = n_total_max.max(ATTN_SCORES_STRIDE);
+    let mut scores_g =
+        DeviceBuffer::new(dgpu.id, b * nh * scores_stride as usize)?;
+    scores_g.fill_zero()?;
 
     let use_f16s = std::env::var_os("CHAIN_F16S").is_some();
     if use_f16s {
@@ -484,6 +575,7 @@ fn prefill_attention_htiled_offset_oracle() -> eyre::Result<()> {
             n_total_max,
             batch,
             0,
+            scores_stride,
         )?;
         attn.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(
             &stream,
@@ -499,6 +591,7 @@ fn prefill_attention_htiled_offset_oracle() -> eyre::Result<()> {
             head_dim,
             batch,
             0,
+            scores_stride,
         )?;
     } else {
         attn.launch_score_batched_htiled_wmma(
@@ -514,6 +607,7 @@ fn prefill_attention_htiled_offset_oracle() -> eyre::Result<()> {
             head_dim,
             n_total_max,
             batch,
+            scores_stride,
         )?;
         attn.launch_softmax_wsum_batched_htiled_wmma_ldsv(
             &stream,
@@ -528,6 +622,7 @@ fn prefill_attention_htiled_offset_oracle() -> eyre::Result<()> {
             n_head,
             head_dim,
             batch,
+            scores_stride,
         )?;
     }
     stream.synchronize()?;
@@ -651,8 +746,14 @@ fn prefill_attention_fused_matches_split() -> eyre::Result<()> {
     let out_len = b * n_head as usize * head_dim as usize;
     let mut out_ref = DeviceBuffer::new(dgpu.id, out_len)?;
     let mut out_fused = DeviceBuffer::new(dgpu.id, out_len)?;
+    let scores_stride: u32 = cases
+        .iter()
+        .flat_map(|(_, nr, _, nc)| nr.iter().zip(nc.iter()).map(|(&r, &c)| (r + c) as u32))
+        .max()
+        .unwrap_or(0)
+        .max(ATTN_SCORES_STRIDE);
     let mut scores_g: DeviceBuffer<f32> =
-        DeviceBuffer::new(dgpu.id, b * n_head as usize * ATTN_MIXED_MAX_KEYS as usize)?;
+        DeviceBuffer::new(dgpu.id, b * n_head as usize * scores_stride as usize)?;
 
     for (label, nr, off, nc) in cases.iter() {
         n_raw_per.copy_from_host(nr)?;
@@ -682,6 +783,7 @@ fn prefill_attention_fused_matches_split() -> eyre::Result<()> {
             head_dim,
             n_total_max,
             batch,
+            scores_stride,
         )?;
         attn.launch_softmax_wsum_batched_htiled_wmma_ldsv(
             &stream,
@@ -696,6 +798,7 @@ fn prefill_attention_fused_matches_split() -> eyre::Result<()> {
             n_head,
             head_dim,
             batch,
+            scores_stride,
         )?;
 
         // Candidate: fused kernel (Steps 2-6).
@@ -814,7 +917,13 @@ fn prefill_attention_ldsv_db_matches_ldsv() -> eyre::Result<()> {
         .collect();
     let sinkh: Vec<f32> = (0..n_head as usize).map(|_| next()).collect();
     // Pre-generate scores so we can reset to the same input for each kernel.
-    let scores_seed: Vec<f32> = (0..b * n_head as usize * ATTN_MIXED_MAX_KEYS as usize)
+    let scores_stride: u32 = cases
+        .iter()
+        .flat_map(|(_, nr, _, nc)| nr.iter().zip(nc.iter()).map(|(&r, &c)| (r + c) as u32))
+        .max()
+        .unwrap_or(0)
+        .max(ATTN_SCORES_STRIDE);
+    let scores_seed: Vec<f32> = (0..b * n_head as usize * scores_stride as usize)
         .map(|_| next() * 4.0)
         .collect();
 
@@ -859,6 +968,7 @@ fn prefill_attention_ldsv_db_matches_ldsv() -> eyre::Result<()> {
             n_head,
             head_dim,
             batch,
+            scores_stride,
         )?;
 
         // Candidate 1: _ldsv_db (LDS double-buffered).
@@ -877,6 +987,7 @@ fn prefill_attention_ldsv_db_matches_ldsv() -> eyre::Result<()> {
             n_head,
             head_dim,
             batch,
+            scores_stride,
         )?;
 
         // Candidate 2: _regv_db (register-V double-buffered).
@@ -895,6 +1006,7 @@ fn prefill_attention_ldsv_db_matches_ldsv() -> eyre::Result<()> {
             n_head,
             head_dim,
             batch,
+            scores_stride,
         )?;
         stream.synchronize()?;
 
@@ -930,3 +1042,56 @@ fn prefill_attention_ldsv_db_matches_ldsv() -> eyre::Result<()> {
     Ok(())
 }
 
+
+
+/// Does the ctx-derived batched attention scratch actually ALLOCATE on this
+/// box, and what does it cost? No model load — allocates the shared prefill
+/// set at `B_MAX/2` rows for a list of contexts and reports free VRAM around
+/// each, so the "V4.1 runs at 100K" claim is measured, not arithmetic.
+///
+///   BENCH_CTXS=8192,32768,100000,131072 nix develop -c cargo test --release \
+///     --features v41 -p v4flash-kernels --test bench_prefill_attention_isolated \
+///     v41_attn_scratch_fits_at_ctx -- --ignored --nocapture
+#[test]
+#[ignore]
+fn v41_attn_scratch_fits_at_ctx() -> eyre::Result<()> {
+    use v4flash_kernels::het::batch_scratch::{attn_scores_capacity_keys, BatchDgpuShared, B_MAX};
+
+    install_panic_handler()?;
+    let ctxs: Vec<u32> = std::env::var("BENCH_CTXS")
+        .unwrap_or_else(|_| "8192,32768,100000,131072".to_string())
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    let dgpu = pick_dgpu()?;
+    dgpu.set_current()?;
+    let rows = B_MAX.div_ceil(2);
+    // amdgpu exposes used/total VRAM through sysfs; no HIP binding needed.
+    let vram_used = || -> u64 {
+        std::fs::read_to_string("/sys/class/drm/card1/device/mem_info_vram_used")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    let used0 = vram_used();
+    eprintln!("dGPU {}: {:.2} GiB VRAM in use before, lane rows = {rows}", dgpu.id,
+        used0 as f64 / (1u64 << 30) as f64);
+    for ctx in ctxs {
+        let keys = attn_scores_capacity_keys(rows, ctx);
+        let want_mib = (keys * 2) as f64 / (1024.0 * 1024.0);
+        match BatchDgpuShared::alloc_rows_ctx(dgpu, rows, ctx) {
+            Ok(sd) => {
+                let used1 = vram_used();
+                eprintln!(
+                    "ctx {ctx:>7}: attn_scores {want_mib:8.1} MiB (budget {keys} keys), \
+                     whole shared set took {:8.1} MiB, {:.2} GiB VRAM in use",
+                    used1.saturating_sub(used0) as f64 / (1024.0 * 1024.0),
+                    used1 as f64 / (1u64 << 30) as f64,
+                );
+                drop(sd);
+            }
+            Err(e) => eprintln!("ctx {ctx:>7}: attn_scores {want_mib:8.1} MiB — ALLOC FAILED: {e}"),
+        }
+    }
+    Ok(())
+}

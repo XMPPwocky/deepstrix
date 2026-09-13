@@ -34,7 +34,7 @@ const PENDING_KERNEL_ROLES: &[&str] = &[];
 #[ignore]
 fn antirez_file_validates_clean() {
     let m = MappedGguf::open(ANTIREZ_PATH).expect("open antirez GGUF");
-    validate_model(m.gguf()).expect("production mix must satisfy the contract");
+    validate_model(m.gguf().tensors()).expect("production mix must satisfy the contract");
 }
 
 #[test]
@@ -62,7 +62,7 @@ fn ud_iq3_xxs_validates_clean() {
     let m = MappedGguf::open(shard(1)).expect("open unsloth UD-IQ3_XXS GGUF (4 shards)");
     // `split.tensors.count` in shard 1's header; same layout as the 0731 files.
     assert_eq!(m.gguf().n_tensors, 1328, "merged shard tensor count");
-    validate_model(m.gguf()).expect("UD-IQ3_XXS must validate clean (IQ3_S + Q6_K wired)");
+    validate_model(m.gguf().tensors()).expect("UD-IQ3_XXS must validate clean (IQ3_S + Q6_K wired)");
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn ud_iq3_xxs_validates_clean() {
 fn unsloth_violations_are_exactly_the_pending_kernel_set() {
     let m = MappedGguf::open(UNSLOTH_PATH).expect("open unsloth GGUF (3 shards)");
     assert_eq!(m.gguf().n_tensors, 1328, "merged shard tensor count");
-    match validate_model(m.gguf()) {
+    match validate_model(m.gguf().tensors()) {
         Ok(()) => {
             assert!(
                 PENDING_KERNEL_ROLES.is_empty(),

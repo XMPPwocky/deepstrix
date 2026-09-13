@@ -160,3 +160,94 @@ extern "C" __global__ void f16_matvec_pair_batched(
         gate[(size_t)b * (size_t)n_rows + row] = g_acc;
     }
 }
+
+// ---------------------------------------------------------------------
+// f16_matvec_pair_batched_tiled — batch-tiled twin of the above.
+//
+// The original launches grid.z = B, so each batch row re-reads the whole
+// weight matrix: at comp_width=1024, k=4096, B=512 that is 8.6 GB per
+// layer per chunk (it only survives because the 16.8 MB weight fits the
+// 64 MB Infinity Cache). This variant gives each warp TILE_B batch rows
+// for the same output row, so a weight pack is loaded ONCE and reused
+// TILE_B times: weight traffic drops by TILE_B.
+//
+// **Bit-exact with the untiled kernel**: per (row, b) the accumulation is
+// the same 4-way split over the same `i = lane, lane+32, ...` sequence,
+// reduced in the same order. Only which workgroup does the work changes.
+// ---------------------------------------------------------------------
+#define TILE_B 8u
+
+extern "C" __global__ void f16_matvec_pair_batched_tiled(
+        float          * __restrict__ kv,         // [B, n_rows]
+        float          * __restrict__ gate,       // [B, n_rows]
+        const __half   * __restrict__ kv_w,       // [n_rows, k]
+        const __half   * __restrict__ gate_w,     // [n_rows, k]
+        const float    * __restrict__ x,          // [B, k]
+        unsigned int     k,
+        unsigned int     n_rows,
+        unsigned int     n_batch) {
+    const uint32_t row  = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t b0   = blockIdx.z * TILE_B;
+    if (row >= n_rows || b0 >= n_batch) return;
+
+    const uint32_t nb = (n_batch - b0) < TILE_B ? (n_batch - b0) : TILE_B;
+
+    const __half *kv_row   = kv_w   + (size_t)row * (size_t)k;
+    const __half *gate_row = gate_w + (size_t)row * (size_t)k;
+    const uint64_t *kv_u64   = reinterpret_cast<const uint64_t*>(kv_row);
+    const uint64_t *gate_u64 = reinterpret_cast<const uint64_t*>(gate_row);
+    const uint32_t  k4       = k >> 2u;
+
+    float kv_a0[TILE_B], kv_a1[TILE_B], kv_a2[TILE_B], kv_a3[TILE_B];
+    float g_a0 [TILE_B], g_a1 [TILE_B], g_a2 [TILE_B], g_a3 [TILE_B];
+#pragma unroll
+    for (uint32_t t = 0; t < TILE_B; ++t) {
+        kv_a0[t] = 0.0f; kv_a1[t] = 0.0f; kv_a2[t] = 0.0f; kv_a3[t] = 0.0f;
+        g_a0 [t] = 0.0f; g_a1 [t] = 0.0f; g_a2 [t] = 0.0f; g_a3 [t] = 0.0f;
+    }
+
+    for (uint32_t i = lane; i < k4; i += WARP) {
+        const uint64_t kv_pack = kv_u64[i];
+        const uint64_t g_pack  = gate_u64[i];
+
+        const __half2 kv_lo = *reinterpret_cast<const __half2*>(&kv_pack);
+        const __half2 kv_hi = *(reinterpret_cast<const __half2*>(&kv_pack) + 1);
+        const __half2 g_lo  = *reinterpret_cast<const __half2*>(&g_pack);
+        const __half2 g_hi  = *(reinterpret_cast<const __half2*>(&g_pack) + 1);
+
+        const float2 fkv_lo = __half22float2(kv_lo);
+        const float2 fkv_hi = __half22float2(kv_hi);
+        const float2 fg_lo  = __half22float2(g_lo);
+        const float2 fg_hi  = __half22float2(g_hi);
+
+#pragma unroll
+        for (uint32_t t = 0; t < TILE_B; ++t) {
+            if (t >= nb) break;
+            const float4 xv =
+                reinterpret_cast<const float4*>(x + (size_t)(b0 + t) * (size_t)k)[i];
+            kv_a0[t] += fkv_lo.x * xv.x;
+            kv_a1[t] += fkv_lo.y * xv.y;
+            kv_a2[t] += fkv_hi.x * xv.z;
+            kv_a3[t] += fkv_hi.y * xv.w;
+            g_a0 [t] += fg_lo.x  * xv.x;
+            g_a1 [t] += fg_lo.y  * xv.y;
+            g_a2 [t] += fg_hi.x  * xv.z;
+            g_a3 [t] += fg_hi.y  * xv.w;
+        }
+    }
+
+#pragma unroll
+    for (uint32_t t = 0; t < TILE_B; ++t) {
+        if (t >= nb) break;
+        float kv_acc = (kv_a0[t] + kv_a1[t]) + (kv_a2[t] + kv_a3[t]);
+        float g_acc  = (g_a0 [t] + g_a1 [t]) + (g_a2 [t] + g_a3 [t]);
+        kv_acc = warp_sum_f32(kv_acc);
+        g_acc  = warp_sum_f32(g_acc);
+        if (lane == 0) {
+            const size_t o = (size_t)(b0 + t) * (size_t)n_rows + row;
+            kv  [o] = kv_acc;
+            gate[o] = g_acc;
+        }
+    }
+}

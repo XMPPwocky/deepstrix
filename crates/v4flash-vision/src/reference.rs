@@ -7,7 +7,7 @@ use v4flash_core::kquants::{f16_to_f32, f32_to_f16_bits};
 
 use crate::mmproj::MmprojHost;
 use crate::rope::{apply_rotary_host, vision_cos_sin};
-use crate::{ALIGNER_IN, PATCH_ELEMS, TEXT_DIM, VIT_DIM, VIT_FFN, VIT_HEAD_DIM, VIT_N_HEADS, VIT_RMS_EPS};
+use crate::{ALIGNER_IN, PATCH_ELEMS, VIT_DIM, VIT_FFN, VIT_HEAD_DIM, VIT_N_HEADS, VIT_RMS_EPS};
 
 fn threads() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 32)
@@ -192,28 +192,16 @@ pub fn vit_trunk_x_prec(
         }
         let mut h = rms_norm(&x, n, VIT_DIM, &blk.ln2);
         prec.round(&mut h);
-        // UNPROVEN ASSUMPTION — the one thing this oracle cannot catch.
-        //
-        // The HF checkpoint has ONE fused `vision.blocks.N.mlp.w1.weight`
-        // and the reference does `gate, up = self.w1(x).chunk(2, -1)`.
-        // The converter split it into `ffn_gate` + `ffn_up`, and nothing
-        // local records which half went where. This CPU twin makes the
-        // same choice as the GPU path (`Tower::upload_block` concatenates
-        // gate‖up, `vit_swiglu_f16` silu's the first half), so a shared
-        // misreading passes `tests/tower_encode.rs` at 1e-3 — a swap is
-        // SILENT under the whole test suite.
-        //
-        // Circumstantial support for the current orientation: in
-        // mmproj-F16.gguf the two slices are byte-contiguous in emission
-        // order (v.blk.0.ffn_gate at 117555200, ffn_up at +5767168 =
-        // 2816*1024*2), as are attn_q/attn_k/attn_v at +2097152 each —
-        // i.e. the writer emitted (first slice -> gate, second -> up).
-        // Consistent, not proof.
-        //
-        // To settle it: diff `Tower::encode_rows` against llama.cpp's
-        // `deepseek4v` clip graph on one image, or check the converter
-        // script. An end-to-end caption A/B (gate/up swapped vs not) also
-        // separates them; a swapped SwiGLU is not subtly wrong.
+        // Gate/up orientation. The HF checkpoint has ONE fused
+        // `vision.blocks.N.mlp.w1.weight` and the reference does
+        // `gate, up = self.w1(x).chunk(2, -1)` — first half gate, second
+        // up. The V4-Flash mmproj converter split that into `ffn_gate` +
+        // `ffn_up` in the same order (byte-contiguous in emission order),
+        // and this twin + `Tower::upload_block` concatenate gate‖up, which
+        // `vit_swiglu_f16` silu's the first half of. SETTLED for V4.1 by
+        // `tests/canonical_v41.rs`: the HF loader hands the fused `w1`
+        // straight through as gate‖up and matches the reference forward
+        // (a swapped SwiGLU is not subtly wrong).
         let g = linear(&h, n, VIT_DIM, &blk.ffn_gate_w, VIT_FFN, None);
         let u = linear(&h, n, VIT_DIM, &blk.ffn_up_w, VIT_FFN, None);
         let mut a: Vec<f32> = g.iter().zip(&u).map(|(&g, &u)| g / (1.0 + (-g).exp()) * u).collect();
@@ -293,15 +281,16 @@ pub fn aligner_forward_prec(host: &MmprojHost, hidden: &[f32], n_h: usize, n_w: 
     let (mut u, lh, lw) = unfold(hidden, n_h, n_w);
     prec.round(&mut u);
     let n_llm = lh * lw;
-    let mut a = linear(&u, n_llm, ALIGNER_IN, &host.mm1_w, TEXT_DIM, Some(&host.mm1_b));
+    let td = host.text_dim;
+    let mut a = linear(&u, n_llm, ALIGNER_IN, &host.mm1_w, td, Some(&host.mm1_b));
     for v in a.iter_mut() {
         *v = gelu_erf(*v);
     }
     prec.round(&mut a);
-    linear(&a, n_llm, TEXT_DIM, &host.mm2_w, TEXT_DIM, Some(&host.mm2_b))
+    linear(&a, n_llm, td, &host.mm2_w, td, Some(&host.mm2_b))
 }
 
-/// Aligner: post-norm hidden → `[n_llm_h*n_llm_w][4096]`, f32 activations.
+/// Aligner: post-norm hidden → `[n_llm_h*n_llm_w][text_dim]`, f32 activations.
 pub fn aligner_forward(host: &MmprojHost, hidden: &[f32], n_h: usize, n_w: usize) -> Vec<f32> {
     aligner_forward_prec(host, hidden, n_h, n_w, ActPrec::F32)
 }

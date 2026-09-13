@@ -36,7 +36,7 @@ use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer};
 
 use crate::attention::{ATTN_MIXED_MAX_KEYS, ATTN_SCORES_STRIDE};
-use crate::config::{
+use crate::config::{ENGRAM_CHUNK, ENGRAM_IN, ENGRAM_OUT, 
     BLOCKS_GROUPED_OUT, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
     BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, HC_DIM, HC_MIX_DIM, INDEXER_TOP_K, N_EMBD, N_EXPERT,
     N_EXPERT_USED, N_FF_EXP, N_FF_SHARED, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD,
@@ -215,6 +215,18 @@ pub struct BatchDgpuScratch {
     /// in P1 (attn) and again in P8 (ffn); the P8 value is read by P12
     /// `hc_post` AFTER the lane switch, so it is per-lane.
     pub split: DeviceBuffer<f32>,
+    /// `[B, HC_MIX_DIM]` — V4.1 single-pass mHC (ARCH_SPEC §1.1): the PREVIOUS
+    /// sub-block's sinkhorn output per row, which the current sub-block's
+    /// collapse reads instead of its own. Reset to one-hot(copy 0) at layer 0;
+    /// only the first N_HC entries of each row are read. Unused on V4-Flash.
+    pub hc_pre_carry: DeviceBuffer<f32>,
+    /// V4.1 Engram prefill: staged rows `[B, ENGRAM_IN]` f32
+    /// (`stage_engram_rows_batch`) and per-`ENGRAM_CHUNK` Q8 / wkv-output scratch.
+    pub engram_rows: DeviceBuffer<f32>,
+    pub engram_xq: DeviceBuffer<i8>,
+    pub engram_xscale: DeviceBuffer<f32>,
+    pub engram_kv: DeviceBuffer<f32>,
+    pub engram_rows_ready: bool,
     /// `[B, HC_DIM]` — mHC post-attention residual (P7 → P8, P12).
     pub after_attn_hc: DeviceBuffer<f32>,
     /// `[B, N_EMBD]` — FFN input (P8). Peer-pushed by `de.xfer` (P11x),
@@ -244,6 +256,39 @@ pub struct BatchDgpuScratch {
     /// `DGPU_HOT_EXPERTS > 0` — must agree with
     /// [`BatchDgpuShared::hot`]. 8 MiB at rows=512.
     pub hot_ffn_moe_dgpu: Option<DeviceBuffer<f32>>,
+    /// The remote shard's weighted MoE partial for this lane's chunk,
+    /// `[B, N_EMBD]` f32, uploaded from the reply and added at `ffn_combine`
+    /// exactly like `hot_ffn_moe_dgpu`.
+    ///
+    /// PER-LANE, not shared: it is produced in pre-MoE and consumed in post-MoE,
+    /// and the two pipeline lanes interleave those phases, so a shared buffer
+    /// would let one lane's partial overwrite the other's.
+    ///
+    /// f32 rather than the protocol's f16 for the first correct version — the
+    /// combine's `vec_add` is f32, and taking f16 would mean writing a new
+    /// `f16_to_f32_add` kernel inside the same change that first alters
+    /// numerics. Costs 2x on the reply (10 KB/token vs 5 KB): ~14.5 ms vs
+    /// 7.2 ms at B=1024 on the measured 724 MB/s link, against ~150 ms of local
+    /// compute. Switch to f16 once the split is validated.
+    pub remote_ffn_moe: Option<DeviceBuffer<f32>>,
+    /// Did pre-MoE actually fill `remote_ffn_moe` for the layer now in flight?
+    /// The buffer is allocated whenever a remote is attached, but only layers
+    /// the remote OWNS produce a partial — and in phase C1 none are consumed at
+    /// all. Set on upload, cleared once combined, so a stale partial can never
+    /// be added to the wrong layer.
+    pub remote_ffn_moe_valid: bool,
+    /// Which layer produced the pending partial. Diagnostic only: post-MoE does
+    /// not otherwise know its layer index, and "which layers actually combined"
+    /// is the question that distinguishes a dead write from a write that lands
+    /// somewhere the final logits never read.
+    pub remote_ffn_moe_layer: i32,
+    /// Request in flight on the remote shard for this lane's layer.
+    ///
+    /// Submitted in pre-MoE and awaited in POST-MoE, so box 2 computes its half
+    /// while this box's iGPU computes the other half. Awaiting it at submit time
+    /// (as the first cut did) serialises the ~74 ms round trip at B=1024 in front
+    /// of local compute and throws away the whole point of overlapping.
+    pub remote_ticket: Option<crate::het::remote_experts::Ticket>,
 }
 
 /// SHARED dGPU scratch: one instance serves both pipeline lanes.
@@ -343,6 +388,19 @@ pub struct BatchDgpuShared {
     /// stride (out_a's 64 KB rows aliased L2 sets: 18% -> 52% of peak).
     /// x16_n_embd doubles as the shared-expert input (dead by then).
     pub x16_n_embd: DeviceBuffer<u16>,
+    /// Q8_K of `ffn_input_norm`, staged for the REMOTE expert shard.
+    ///
+    /// The dGPU hot-expert path already produces exactly these bytes into
+    /// `BatchDgpuHotScratch::moe_xq` ("bit-identical to the iGPU's d_xq_q8k —
+    /// same f32 input, same kernel"), but V4.1 runs with `hot_experts = None`
+    /// so that scratch is never allocated. Same kernel, own buffer, so the
+    /// bytes shipped to box 2 are provably the ones the local iGPU would have
+    /// quantised — the remote's arithmetic matches the local path by
+    /// construction rather than by agreement.
+    ///
+    /// Only allocated when a remote shard is attached; `None` costs nothing.
+    pub remote_xq: Option<DeviceBuffer<u8>>,
+
     pub qr16: DeviceBuffer<u16>,
     pub heads16: DeviceBuffer<u16>,
     pub low16: DeviceBuffer<u16>,
@@ -506,7 +564,7 @@ pub struct BatchDgpuShared {
 /// uploaded ONCE; per-layer launches set grid.y = n_hot × chunks and the
 /// matvec kernels' `member_end <= member_start` guard early-exits empty
 /// chunks — no per-layer host readback of n_work_items on de.compute.
-pub const HOT_MAX_EXPERTS: usize = 256;
+pub const HOT_MAX_EXPERTS: usize = crate::config::N_EXPERT as usize;
 pub const HOT_CHUNK: usize = 32;
 
 /// Chunks per hot expert for a scratch of `rows` tokens.
@@ -804,13 +862,28 @@ fn flat_len(rows: usize) -> usize {
 fn q_len(rows: usize) -> usize {
     rows * Q_FLAT as usize
 }
+/// Keys the per-token indexer scratch must hold. ZERO when this model's
+/// indexer can never fire (V4.1): `indexer_scores` is `rows * keys` f32 and
+/// dominates the R1 arena (268 MiB at rows=512), and `attn_active_comp_kv`
+/// another 268 MiB — all of it dead on a model whose `need_mask` gate
+/// (`ratio == 4`) is unreachable.
+fn indexer_scratch_keys() -> usize {
+    if crate::attention::indexer_ever_fires() {
+        ATTN_MIXED_MAX_KEYS as usize
+    } else {
+        0
+    }
+}
 fn indexer_scores_len(rows: usize) -> usize {
-    rows * ATTN_MIXED_MAX_KEYS as usize
+    rows * indexer_scratch_keys()
 }
 fn indexer_q_len(rows: usize) -> usize {
     rows * (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize
 }
 fn indexer_topk_scratch_len(rows: usize) -> usize {
+    if !crate::attention::indexer_ever_fires() {
+        return 0;
+    }
     // Two-level bitonic tree merge (see scratch.rs): per token
     // L0 = max_chunks*top_k + L1 = n_groups*top_k.
     let max_chunks = (ATTN_MIXED_MAX_KEYS + 4095) / 4096;
@@ -873,6 +946,12 @@ impl BatchDgpuScratch {
             residual: mk_f32(HC_DIM as usize)?,
             residual_next: mk_f32(HC_DIM as usize)?,
             split: mk_f32(HC_MIX_DIM as usize)?,
+            hc_pre_carry: mk_f32(HC_MIX_DIM as usize)?,
+            engram_rows: if cfg!(feature = "v41") { mk_f32(ENGRAM_IN as usize)? } else { DeviceBuffer::new(id, 32)? },
+            engram_xq: DeviceBuffer::new(id, if cfg!(feature = "v41") { (ENGRAM_CHUNK * ENGRAM_IN) as usize } else { 32 })?,
+            engram_xscale: DeviceBuffer::new(id, if cfg!(feature = "v41") { (ENGRAM_CHUNK * ENGRAM_IN / 32) as usize } else { 32 })?,
+            engram_kv: DeviceBuffer::new(id, if cfg!(feature = "v41") { (ENGRAM_CHUNK * ENGRAM_OUT) as usize } else { 32 })?,
+            engram_rows_ready: false,
             after_attn_hc: mk_f32(HC_DIM as usize)?,
             ffn_input_norm: mk_f32(N_EMBD as usize)?,
             d_selected: mk_i32(N_EXPERT_USED)?,
@@ -881,11 +960,85 @@ impl BatchDgpuScratch {
             ffn_moe_recv: mk_f32(N_EMBD as usize)?,
             pos_per_b: mk_i32(1)?,
             hot_ffn_moe_dgpu,
+            remote_ffn_moe: if std::env::var("V41_REMOTE_ADDR").is_ok() {
+                Some(DeviceBuffer::new(id, b * N_EMBD as usize)?)
+            } else {
+                None
+            },
+            remote_ffn_moe_valid: false,
+            remote_ffn_moe_layer: -1,
+            remote_ticket: None,
         })
     }
 }
 
+/// Total score slots (keys) `BatchDgpuShared::attn_scores` must hold for a
+/// shared set of `rows` lane rows at `n_kv_max` context.
+///
+/// Never below the legacy `rows * N_HEAD * ATTN_SCORES_STRIDE`, so V4-Flash
+/// and `n_kv_max == 0` callers keep today's exact allocation.
+pub fn attn_scores_capacity_keys(rows: usize, n_kv_max: u32) -> usize {
+    let legacy = rows * (N_HEAD as usize) * (ATTN_SCORES_STRIDE as usize);
+    if n_kv_max == 0 || crate::attention::attn_legacy_stride() {
+        return legacy;
+    }
+    // Every batch shape the two CED phases can present. `b` is the rows of
+    // ONE lane, and the replay's segment is at most SWA_WINDOW rows split
+    // across two lanes.
+    // Widest raw window a row can have: a text row sees SWA_WINDOW, a row
+    // inside a vision image block sees IMAGE_RAW_WINDOW_MAX. The allocator
+    // does not know whether a tower is loaded, so charge the larger (+25 MiB
+    // at rows=512) rather than error mid-prefill on an image chunk.
+    let w = crate::het::image_spans::IMAGE_RAW_WINDOW_MAX;
+    let replay_rows = (crate::config::SWA_WINDOW as usize).div_ceil(2).min(rows);
+    let ced = crate::het::forward_prefill::ced_enabled();
+    let mut need = 0usize;
+    for (layer, &ratio) in crate::config::COMPRESS_RATIOS.iter().enumerate() {
+        if ratio == 0 {
+            continue;
+        }
+        let keys = if crate::attention::indexer_gathers(ratio) {
+            w + crate::config::INDEXER_TOP_K
+        } else {
+            w + n_kv_max.div_ceil(ratio)
+        } as usize;
+        // Under CED the decoder layers run ONLY in the bounded replay, at
+        // <= SWA_WINDOW/2 rows per lane. Charging them the encoder's `rows`
+        // would cost 8x for nothing. With `V41_CED=0` every layer runs over
+        // the full chunk, so charge `rows`.
+        let b = if ced && layer >= crate::config::CED_DECODER_START {
+            replay_rows.max(1)
+        } else {
+            rows
+        };
+        need = need.max(b * (N_HEAD as usize) * keys);
+    }
+    need.max(legacy)
+}
+
 impl BatchDgpuShared {
+    /// Score slots (keys) `attn_scores` actually holds, in the units the
+    /// kernels index it with (f16 slots on the production `_f16s` pair).
+    pub fn attn_scores_capacity_keys(&self) -> usize {
+        if use_f32_scores() {
+            self.attn_scores.len()
+        } else {
+            self.attn_scores.len() * 2
+        }
+    }
+
+    /// Per-(row, head) stride for ONE batched score + softmax-wsum pair.
+    /// Both kernels must be given this same value; see
+    /// [`crate::attention::attn_scores_stride`].
+    pub fn attn_scores_stride(&self, batch: u32, n_total_max: u32) -> eyre::Result<u32> {
+        crate::attention::attn_scores_stride(
+            self.attn_scores_capacity_keys(),
+            batch,
+            N_HEAD,
+            n_total_max,
+        )
+    }
+
     /// Allocate for the full `B_MAX` chunk (single-lane drivers).
     pub fn alloc(dgpu_device: Device) -> eyre::Result<Self> {
         Self::alloc_rows(dgpu_device, B_MAX)
@@ -894,7 +1047,38 @@ impl BatchDgpuShared {
     /// Allocate for `rows` tokens — the max rows of any lane that will
     /// use this shared set (`B_MAX.div_ceil(2)` for the two-lane driver,
     /// ~629 MiB dGPU). Every batched entry point checks `b <= rows`.
+    ///
+    /// Sizes `attn_scores` at the legacy [`ATTN_SCORES_STRIDE`] floor, which
+    /// is right for V4-Flash at any context but caps V4.1's CED replay at
+    /// ~24K tokens and its ratio-2 encoder at 5888 — use
+    /// [`Self::alloc_rows_ctx`] when the caller knows `n_kv_max`.
     pub fn alloc_rows(dgpu_device: Device, rows: usize) -> eyre::Result<Self> {
+        Self::alloc_rows_ctx(dgpu_device, rows, 0)
+    }
+
+    /// Context-aware twin of [`Self::alloc_rows`]: sizes `attn_scores` so
+    /// that every layer of THIS model can score its whole (ungathered)
+    /// compressed store at `n_kv_max` tokens.
+    ///
+    /// `n_kv_max == 0` keeps the legacy floor sizing.
+    ///
+    /// The buffer must satisfy `b * N_HEAD * (raw + n_comp) <= capacity` for
+    /// every call, and the two callers have very different shapes:
+    ///
+    /// * the CED **encoder** runs `b = rows` (512) over ratio-2 layers, so it
+    ///   needs `rows * N_HEAD * (SWA_WINDOW + n_kv/2)`;
+    /// * the CED **decoder replay** runs `b <= SWA_WINDOW/2` (64) over
+    ///   ratio-1 layers, so it needs `64 * N_HEAD * (SWA_WINDOW + n_kv)`.
+    ///
+    /// Because the stride is chosen per launch from the capacity
+    /// (`attention::attn_scores_stride`), sizing for the max of those two
+    /// PRODUCTS — rather than for one worst-case stride at `rows` — halves
+    /// the allocation: 3.3 GiB instead of 6.6 GiB at 100K.
+    pub fn alloc_rows_ctx(
+        dgpu_device: Device,
+        rows: usize,
+        n_kv_max: u32,
+    ) -> eyre::Result<Self> {
         check_rows("BatchDgpuShared", rows)?;
         dgpu_device.set_current()?;
         let id = dgpu_device.id;
@@ -907,9 +1091,24 @@ impl BatchDgpuShared {
         let mk_u8 = |n: usize| -> eyre::Result<DeviceBuffer<u8>> { DeviceBuffer::new(id, b * n) };
         let mk_i32 =
             |n: usize| -> eyre::Result<DeviceBuffer<i32>> { DeviceBuffer::new(id, b * n) };
-        // Compressor boundaries per chunk: at most one every `ratio >= 4`
-        // positions of a lane's `rows` tokens.
-        let max_boundaries = rows.div_ceil(4);
+        // Compressor boundaries per chunk: at most one every `min_ratio` positions of a lane's
+        // `rows` tokens.
+        //
+        // The divisor MUST be the model's minimum non-zero compress ratio, not a literal. It was
+        // hardcoded to 4, which holds for V4-Flash (its ratios are 4 and 128) but NOT for V4.1:
+        // CSA2 gives layers 20-39 ratio 1, where EVERY position is a boundary. That under-allocated
+        // 4x and `comp_pos_per_boundary` overran as soon as a prefill chunk exceeded `rows/4`
+        // ("slice_view out of range: offset=0 len=204 parent_len=128"), panicking the worker on any
+        // prompt past ~128 tokens. Never exercised before because paged mode took the per-token
+        // fallback and the parity harness runs t_n=6.
+        let min_ratio = crate::config::COMPRESS_RATIOS
+            .iter()
+            .copied()
+            .filter(|&r| r > 0)
+            .min()
+            .unwrap_or(4)
+            .max(1) as usize;
+        let max_boundaries = rows.div_ceil(min_ratio);
 
         // ---- R1 arena: flat / q / indexer_scores / heads @0, hot views
         // after. Built before the literal so the M61 hot-expert scratch
@@ -960,6 +1159,15 @@ impl BatchDgpuShared {
             kq_mid_q8k: mk_u8((BLOCKS_Q8K_DOWN_IN as usize) * 292)?,
             xq_n_embd: mk_i8(N_EMBD as usize)?,
             x16_n_embd: DeviceBuffer::new(id, b * f16_pitch(N_EMBD) as usize)?,
+            remote_xq: if std::env::var("V41_REMOTE_ADDR").is_ok() {
+                Some(DeviceBuffer::new(
+                    id,
+                    b * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES,
+                )?)
+            } else {
+                None
+            },
+
             qr16: DeviceBuffer::new(id, b * f16_pitch(N_LORA_Q) as usize)?,
             heads16: DeviceBuffer::new(id, b * f16_pitch(Q_FLAT) as usize)?,
             low16: DeviceBuffer::new(id, b * f16_pitch(OUT_LOW) as usize)?,
@@ -999,16 +1207,11 @@ impl BatchDgpuShared {
             // Doubled when DEEPSTRIX_F32_SCORES=1 so the f32-scores
             // kernel pair has the headroom it needs.
             attn_scores: {
-                // Sized at ATTN_SCORES_STRIDE (not ATTN_MIXED_MAX_KEYS): the
-                // production batched attention runs on the CSA-gathered dense
-                // top-K buffer so n_total ≤ ~640 keys. 2048 stride leaves
-                // headroom.
-                let per_b = if use_f32_scores() {
-                    (N_HEAD * ATTN_SCORES_STRIDE) as usize
-                } else {
-                    ((N_HEAD * ATTN_SCORES_STRIDE) / 2) as usize
-                };
-                mk_f32(per_b)?
+                let keys = attn_scores_capacity_keys(rows, n_kv_max);
+                // The kernels write f16 unless DEEPSTRIX_F32_SCORES=1, so a
+                // f32 element holds two score slots on the production path.
+                let f32_elems = if use_f32_scores() { keys } else { keys.div_ceil(2) };
+                DeviceBuffer::new(id, f32_elems)?
             },
             indexer_q,
             indexer_q16: DeviceBuffer::new(id, b * (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize)?,
@@ -1020,7 +1223,13 @@ impl BatchDgpuShared {
             indexer_selected: DeviceBuffer::new(id, b * INDEXER_TOP_K as usize)?,
             indexer_topk_scratch,
             n_index_comp_per_b: DeviceBuffer::new(id, b)?,
-            attn_active_comp_kv: mk_u16((INDEXER_TOP_K * N_HEAD_DIM) as usize)?,
+            // Dense per-token top-K gather target — only ever written by the
+            // CSA gather, which cannot run when no layer is gathered.
+            attn_active_comp_kv: if crate::attention::indexer_ever_fires() {
+                mk_u16((INDEXER_TOP_K * N_HEAD_DIM) as usize)?
+            } else {
+                DeviceBuffer::new(id, 1)?
+            },
             // Per-boundary state snapshots scratch. Sized for the largest
             // compressor (main ratio==4: 8 × 1024 f32 = 32 KB) × max
             // boundaries (rows/4) = 4 MiB per buffer at rows=512. Reused

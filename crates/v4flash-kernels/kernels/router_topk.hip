@@ -22,7 +22,9 @@
 
 #include <hip/hip_runtime.h>
 
-#define ROUTER_MAX_EXPERTS 256
+#ifndef ROUTER_MAX_EXPERTS
+#define ROUTER_MAX_EXPERTS 256   // V4.1 build passes 512 (384 experts, padded)
+#endif
 #define ROUTER_MAX_USED    8
 
 __device__ inline float softplus_stable(float x) {

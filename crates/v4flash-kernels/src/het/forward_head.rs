@@ -17,6 +17,13 @@ impl HeterogeneousEngine {
         self.set_current_cached(self.dgpu.device)?;
         let de = &self.dgpu;
         let _t_head = de.events.stage("dgpu.head", &de.compute)?;
+        // V4.1 (CED / single-pass mHC): the final collapse reuses the pre_mix
+        // CARRIED out of the last block — `blocks[-1].hc_pre(h, pre_mix)` in
+        // model.py — so there is no head-level hc projection to evaluate and the
+        // checkpoint has no `output_hc_*`. V4-Flash instead derives the collapse
+        // weights here from `output_hc_fn` + a sigmoid. Validated against the
+        // reference by the layer-major HEAD gate (argmax 11111 at T=6).
+        #[cfg(not(feature = "v41"))]
         {
             let _t = de.events.stage("k.head.rms_nw", &de.compute)?;
             de.rms_nw.launch(
@@ -28,6 +35,7 @@ impl HeterogeneousEngine {
                 RMS_EPS,
             )?;
         }
+        #[cfg(not(feature = "v41"))]
         {
             let _t = de.events.stage("k.head.hc_fn", &de.compute)?;
             de.f16.matvec(
@@ -39,6 +47,7 @@ impl HeterogeneousEngine {
                 HC_DIM,
             )?;
         }
+        #[cfg(not(feature = "v41"))]
         {
             let _t = de.events.stage("k.head.sigmoid", &de.compute)?;
             de.hc_sigmoid.launch(
@@ -50,13 +59,17 @@ impl HeterogeneousEngine {
                 N_HC,
             )?;
         }
+        #[cfg(not(feature = "v41"))]
+        let collapse_w = &scratch.head_w;
+        #[cfg(feature = "v41")]
+        let collapse_w = &scratch.hc_pre_carry;
         {
             let _t = de.events.stage("k.head.hc_weighted", &de.compute)?;
             de.hc_weighted.launch(
                 &de.compute,
                 &mut scratch.head_embd,
                 &scratch.residual,
-                &scratch.head_w,
+                collapse_w,
                 N_EMBD,
                 N_HC,
             )?;

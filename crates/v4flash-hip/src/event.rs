@@ -10,13 +10,18 @@ use crate::sys;
 /// `Event::new_no_timing()` for low-overhead sync-only events.
 pub struct Event {
     raw: sys::hipEvent_t,
+    /// Device current at creation. `hipEventCreate` binds the event to it, and
+    /// `hipEventDestroy` resolves against the CURRENT device, so Drop must
+    /// restore it — see the note on `Stream`'s Drop.
+    device_id: i32,
 }
+
 
 impl Event {
     pub fn new() -> eyre::Result<Self> {
         let mut raw: sys::hipEvent_t = ptr::null_mut();
         check_eyre(unsafe { sys::hipEventCreate(&mut raw) }, "hipEventCreate")?;
-        Ok(Event { raw })
+        Ok(Event { raw, device_id: crate::device::current_device() })
     }
 
     pub fn new_no_timing() -> eyre::Result<Self> {
@@ -27,7 +32,7 @@ impl Event {
             },
             "hipEventCreateWithFlags(DISABLE_TIMING)",
         )?;
-        Ok(Event { raw })
+        Ok(Event { raw, device_id: crate::device::current_device() })
     }
 
     pub fn raw(&self) -> sys::hipEvent_t {
@@ -63,6 +68,7 @@ impl Event {
 impl Drop for Event {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            let _guard = crate::device::DeviceGuard::enter(self.device_id);
             let code = unsafe { sys::hipEventDestroy(self.raw) };
             if code != sys::HIP_SUCCESS {
                 tracing::warn!(code, "hipEventDestroy failed during drop");

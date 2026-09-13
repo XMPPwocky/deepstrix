@@ -975,7 +975,7 @@ impl DsmlScanner {
     /// header is one of: `tool_calls`, `invoke …`, `parameter …`.
     fn dispatch_open(&mut self, head: &str) {
         let trimmed = head.trim_start();
-        if trimmed.starts_with("tool_calls") {
+        if trimmed.starts_with("tool_calls") || trimmed.starts_with("calls") {  // V4-Flash `tool_calls`, V4.1 ` calls`
             self.halluc_buf.clear();
             self.frames.push(Frame::ToolCalls {
                 next_invoke_index: 0,
@@ -1022,7 +1022,7 @@ impl DsmlScanner {
 
     fn dispatch_close(&mut self, head: &str, events: &mut Vec<DsmlEvent>) {
         let trimmed = head.trim_start();
-        if trimmed.starts_with("tool_calls") {
+        if trimmed.starts_with("tool_calls") || trimmed.starts_with("calls") {  // V4-Flash `tool_calls`, V4.1 ` calls`
             // Repair (upstream 596f49c mode 2 — outer tags balanced,
             // inner tags dropped): finalize any in-flight parameter
             // and close any still-open invokes before closing the
@@ -1400,6 +1400,47 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// DeepSeek-V4.1 emits the same DSML markup with a leading space in the
+    /// tag names and ` calls` as the block name (`encoding/encoding.py`).
+    #[test]
+    fn v41_leading_space_tag_names_parse() {
+        const D: &[u8] = b"\xef\xbd\x9cDSML\xef\xbd\x9c";
+        let ev = drive(&[
+            (1, b"Reading.\n\n<"),
+            (TOK_DSML_TEST, D),
+            (1, b" calls>\n<"),
+            (TOK_DSML_TEST, D),
+            (1, b" invoke name=\"read_file\">\n<"),
+            (TOK_DSML_TEST, D),
+            (1, b" parameter name=\"path\" string=\"true\">a.rs</"),
+            (TOK_DSML_TEST, D),
+            (1, b" parameter>\n<"),
+            (TOK_DSML_TEST, D),
+            (1, b" parameter name=\"lines\" string=\"false\">3</"),
+            (TOK_DSML_TEST, D),
+            (1, b" parameter>\n</"),
+            (TOK_DSML_TEST, D),
+            (1, b" invoke>\n</"),
+            (TOK_DSML_TEST, D),
+            (1, b" calls>"),
+        ]);
+        let calls: Vec<(String, String)> = ev
+            .iter()
+            .filter_map(|e| match e {
+                DsmlEvent::ToolCall { name, arguments, .. } => Some((name.clone(), arguments.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "events: {ev:?}");
+        assert_eq!(calls[0].0, "read_file");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(args["path"], "a.rs");
+        assert_eq!(args["lines"], 3);
+        assert!(ev.iter().any(|e| matches!(e, DsmlEvent::ToolCallsEnd)));
+        let text: Vec<u8> = ev.iter().filter_map(|e| if let DsmlEvent::Text(b) = e { Some(b.clone()) } else { None }).flatten().collect();
+        assert_eq!(text, b"Reading.\n\n".to_vec(), "prose before the block");
     }
 
     #[test]

@@ -95,6 +95,15 @@ pub struct DeviceEngine {
     /// Per the load-bearing peer-copy rule, `hipMemcpyPeerAsync` MUST be
     /// queued on the **source** device's stream.
     pub xfer: Stream,
+    /// Side stream for V4.1 single-pass mHC coefficient work (`hc_mixes`).
+    ///
+    /// ARCH_SPEC §1.1 collapses the 4 copies with the PREVIOUS sub-block's
+    /// `pre`, so a sub-block's own `hc_mixes` (RMS + [24,20480] fp32 matvec +
+    /// 20-iteration sinkhorn) feeds only `hc_post` and the NEXT sub-block —
+    /// it is off this sub-block's critical path by construction. That shift is
+    /// the whole point of the design; running the mixes here lets them overlap
+    /// the ~413 us of q/kv/attention/output_proj that follows the collapse.
+    pub hc: Stream,
 
     pub rms_w: RmsNorm,
     pub rms_nw: RmsNormNoWeight,
@@ -122,6 +131,12 @@ pub struct DeviceEngine {
     pub iq3pair: crate::iq3_xxs_pair::Iq3XxsPairMatvec,
     /// UD-IQ3_XXS gate/up: IQ2_S on 42 layers, IQ3_S (paired form) on blk.26.
     pub iq3s: crate::iq3_s::Iq3SPairMatvec,
+    /// V4.1-Flash native experts: MXFP4 gate/up (paired form).
+    pub mxfp4pair: crate::mxfp4_pair::Mxfp4PairMatvec,
+    /// V4.1 Engram gate + residual add (layers 1, 14).
+    pub engram_gate: crate::engram_gate::EngramGateAdd,
+    /// V4.1 compressed-KV fake quant (E2M1 × E4M3 per 16).
+    pub fp4kv: crate::fp4_kv::Fp4KvQuant,
     pub q4d: crate::q4_k_dense::Q4_KDenseMatvec,
     pub q5d: crate::q5_k_dense::Q5_KDenseMatvec,
     pub q6d: crate::q6_k_dense::Q6_KDenseMatvec,
@@ -187,6 +202,7 @@ impl DeviceEngine {
         device.set_current()?;
         let compute = Stream::new(device.id)?;
         let xfer = Stream::new(device.id)?;
+        let hc = Stream::new(device.id)?;
         let is_igpu = device.properties()?.integrated;
         let label: &'static str = if is_igpu { "igpu" } else { "dgpu" };
         let events = EventPool::new(label, EVENT_POOL_CAPACITY)?;
@@ -195,6 +211,7 @@ impl DeviceEngine {
             is_gfx11: arch.starts_with("gfx11"),
             compute,
             xfer,
+            hc,
             rms_w: RmsNorm::for_arch(arch)?,
             rms_nw: RmsNormNoWeight::for_arch(arch)?,
             q8: Q8_0Matvec::for_arch(arch)?,
@@ -216,6 +233,9 @@ impl DeviceEngine {
             iq2xs: crate::iq2_xs::Iq2XsPairMatvec::for_arch(arch)?,
             iq3pair: crate::iq3_xxs_pair::Iq3XxsPairMatvec::for_arch(arch)?,
             iq3s: crate::iq3_s::Iq3SPairMatvec::for_arch(arch)?,
+            mxfp4pair: crate::mxfp4_pair::Mxfp4PairMatvec::for_arch(arch)?,
+            engram_gate: crate::engram_gate::EngramGateAdd::for_arch(arch)?,
+            fp4kv: crate::fp4_kv::Fp4KvQuant::for_arch(arch)?,
             q4d: crate::q4_k_dense::Q4_KDenseMatvec::for_arch(arch)?,
             q5d: crate::q5_k_dense::Q5_KDenseMatvec::for_arch(arch)?,
             q6d: crate::q6_k_dense::Q6_KDenseMatvec::for_arch(arch)?,
@@ -278,6 +298,16 @@ pub struct LayerSyncEvents {
     pub moe_arrived: Event,
     pub selected_ready: Event,
     pub selected_pushed: Event,
+    /// mHC split (V4.1): `hc_src_*` = `residual` final on dgpu.compute, so the
+    /// side stream may read it; `hc_collapse_*` = `hc_weighted` has consumed the
+    /// OLD carry, so the side stream may overwrite it with this sub-block's pre;
+    /// `hc_mixes_*` = `split` written, so `hc_post` may consume it.
+    pub hc_src_attn: Event,
+    pub hc_collapse_attn: Event,
+    pub hc_mixes_attn: Event,
+    pub hc_src_ffn: Event,
+    pub hc_collapse_ffn: Event,
+    pub hc_mixes_ffn: Event,
 }
 
 pub struct HetSyncEvents {
@@ -296,6 +326,12 @@ impl HetSyncEvents {
             let ain_pushed = Event::new_no_timing()?;
             let selected_ready = Event::new_no_timing()?;
             let selected_pushed = Event::new_no_timing()?;
+            let hc_src_attn = Event::new_no_timing()?;
+            let hc_collapse_attn = Event::new_no_timing()?;
+            let hc_mixes_attn = Event::new_no_timing()?;
+            let hc_src_ffn = Event::new_no_timing()?;
+            let hc_collapse_ffn = Event::new_no_timing()?;
+            let hc_mixes_ffn = Event::new_no_timing()?;
             igpu.set_current()?;
             let moe_done = Event::new_no_timing()?;
             let moe_arrived = Event::new_no_timing()?;
@@ -306,6 +342,12 @@ impl HetSyncEvents {
                 moe_arrived,
                 selected_ready,
                 selected_pushed,
+                hc_src_attn,
+                hc_collapse_attn,
+                hc_mixes_attn,
+                hc_src_ffn,
+                hc_collapse_ffn,
+                hc_mixes_ffn,
             });
         }
         Ok(Self { layers })
@@ -375,6 +417,45 @@ pub struct HeterogeneousEngine {
     /// Tokens accumulated into each bank since the last harvest.
     pub sel_tokens_prefill: std::sync::atomic::AtomicU64,
     pub sel_tokens_decode: std::sync::atomic::AtomicU64,
+    /// Optional second box serving a slice of the routed experts
+    /// (`docs/v41/REMOTE_EXPERTS.md`). Connected when `V41_REMOTE_ADDR` is set.
+    ///
+    /// The point is residency, not compute: with the daemon owning
+    /// `L0-L19:192-383`, this box only has to hold the other half of each
+    /// encoder layer, which brings prefill's working set inside the pool so it
+    /// stops re-paging every layer for every chunk.
+    ///
+    /// `Mutex` because the two prefill lanes share one connection and the
+    /// protocol is a single FIFO request stream.
+    pub remote: Option<std::sync::Mutex<super::remote_experts::RemoteExpertClient>>,
+}
+
+/// Connect to the remote expert daemon named by `V41_REMOTE_ADDR` (e.g.
+/// `10.99.0.2:7431`). Returns `None` when unset. A connection FAILURE is a hard
+/// error rather than a silent fallback: running with the remote half of the
+/// experts quietly missing would either page them locally (destroying the point)
+/// or compute without them (silently wrong), and both are worse than refusing to
+/// start.
+fn connect_remote_experts() -> Option<std::sync::Mutex<super::remote_experts::RemoteExpertClient>> {
+    let addr = std::env::var("V41_REMOTE_ADDR").ok()?;
+    let opts = super::remote_experts::SocketOptions::default();
+    match super::remote_experts::RemoteExpertClient::connect(&addr, &opts) {
+        Ok(c) => {
+            let info = c.info();
+            let owned: Vec<u32> = (0..info.n_layer).filter(|&l| info.owned_count(l) > 0).collect();
+            let per_layer = owned.first().map(|&l| info.owned_count(l)).unwrap_or(0);
+            eprintln!(
+                "remote experts: {addr} — {} resident experts, {} layers {:?}, {} per layer, \
+                 max_batch {}, decode_max_b {}",
+                info.n_resident, owned.len(),
+                if owned.len() > 6 { format!("{}..{}", owned[0], owned[owned.len()-1]) }
+                else { format!("{owned:?}") },
+                per_layer, info.max_batch, info.decode_max_b,
+            );
+            Some(std::sync::Mutex::new(c))
+        }
+        Err(e) => panic!("V41_REMOTE_ADDR={addr} set but connect failed: {e:#}"),
+    }
 }
 
 impl HeterogeneousEngine {
@@ -398,7 +479,56 @@ impl HeterogeneousEngine {
         pos: u32,
         token_id: i32,
     ) -> color_eyre::eyre::Result<()> {
-        use crate::config::{HC_DIM, N_LAYER};
+        self.forward_token_impl(
+            dgpu_scratch, igpu_scratch, state, weights, input_hc_host, pos, token_id, None, None,
+        )
+    }
+
+    /// M7 paged-expert decode: identical to [`Self::forward_token`] except each
+    /// layer's routed MoE pages the router's actual picks out of `pager` instead
+    /// of reading iGPU-resident experts. Correctness-first — this takes the
+    /// standalone (non-fused) per-layer path and syncs once per layer to read back
+    /// `d_selected`, so it is slow by construction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_token_paged(
+        &self,
+        dgpu_scratch: &mut super::DgpuScratch,
+        igpu_scratch: &mut super::IgpuScratch,
+        state: &mut super::HetModelState,
+        weights: &super::HetModelWeights,
+        input_hc_host: &[f32],
+        pos: u32,
+        token_id: i32,
+        pager: &mut super::expert_pager::ExpertPager,
+        engram_rows: Option<&[Vec<f32>]>,
+    ) -> color_eyre::eyre::Result<()> {
+        self.forward_token_impl(
+            dgpu_scratch,
+            igpu_scratch,
+            state,
+            weights,
+            input_hc_host,
+            pos,
+            token_id,
+            Some(pager),
+            engram_rows,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_token_impl(
+        &self,
+        dgpu_scratch: &mut super::DgpuScratch,
+        igpu_scratch: &mut super::IgpuScratch,
+        state: &mut super::HetModelState,
+        weights: &super::HetModelWeights,
+        input_hc_host: &[f32],
+        pos: u32,
+        token_id: i32,
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
+        engram_rows: Option<&[Vec<f32>]>,
+    ) -> color_eyre::eyre::Result<()> {
+        use crate::config::{HC_DIM, N_EXPERT, N_LAYER};
         use tracing::debug_span;
 
         if input_hc_host.len() != HC_DIM as usize {
@@ -413,6 +543,8 @@ impl HeterogeneousEngine {
         // Reset event pools for this token.
         self.dgpu.events.reset();
         self.igpu.events.reset();
+        super::trace::phase::reset();
+        let pager_c0 = pager.as_deref().map(|p| p.counters()).unwrap_or_default();
 
         self.set_current_cached(self.dgpu.device)?;
         dgpu_scratch.residual.copy_from_host(input_hc_host)?;
@@ -482,6 +614,12 @@ impl HeterogeneousEngine {
             } else {
                 None
             };
+            // V4.1 reuse layers: lend the KV source's store for this layer's forward.
+            let kv_src = crate::config::kv_source_of(layer);
+            if let Some(src) = kv_src {
+                let st = state.layers[src].compressor.take();
+                state.layers[layer].compressor = st;
+            }
             // When sub-tensor dumping is active at this layer, fall
             // back to the standalone-graphs path. The combined
             // cross-layer graph (ffn_combine fused with next layer's
@@ -490,6 +628,26 @@ impl HeterogeneousEngine {
             // the current layer's values before we can read them.
             // Standalone runs each layer's mhc_pre_attn separately so
             // the post-layer-N buffers are stable.
+            // V4.1 Engram (layers 1 and 14): the n-gram rows for THIS token were
+            // gathered host-side by the caller (SSD-backed 189 GiB tables, never
+            // resident). Stage them before the layer reads them, in the same
+            // ENGRAM_LAYERS order the caller built them in.
+            if weights.dgpu_layers[layer].engram.is_some() {
+                let rows = engram_rows.and_then(|rs| {
+                    crate::config::ENGRAM_LAYERS
+                        .iter()
+                        .position(|&l| l as usize == layer)
+                        .and_then(|i| rs.get(i))
+                });
+                match rows {
+                    Some(r) => self.stage_engram_rows(dgpu_scratch, r)?,
+                    None => {
+                        return Err(color_eyre::eyre::eyre!(
+                            "layer {layer} needs Engram rows but the caller staged none"
+                        ))
+                    }
+                }
+            }
             let force_standalone = dump_subtensor_layers.contains(&layer);
             if force_standalone {
                 self.forward_layer_standalone_graphs(
@@ -572,6 +730,18 @@ impl HeterogeneousEngine {
                 maybe_dump_subtensor_f32(
                     layer, "d_ew", &dgpu_scratch.d_ew
                 )?;
+            } else if let Some(pg) = pager.as_deref_mut() {
+                // M7: page this layer's routed experts from the pager's pool.
+                self.forward_layer_standalone_graphs_paged(
+                    dgpu_scratch,
+                    igpu_scratch,
+                    &mut state.layers[layer],
+                    &weights.dgpu_layers[layer],
+                    &weights.igpu_layers[layer],
+                    pos,
+                    token_id,
+                    pg,
+                )?;
             } else if preissue {
                 self.forward_layer_preissued_moe(
                     dgpu_scratch,
@@ -599,17 +769,21 @@ impl HeterogeneousEngine {
             // (diagnostic; syncs every layer — slow). Prints cumulative
             // top-16 hit-rates every 32 tokens. Used to size M55 static
             // hot-expert placement.
+            if let Some(src) = kv_src {
+                let st = state.layers[layer].compressor.take();
+                state.layers[src].compressor = st;
+            }
             {
                 static STATS: std::sync::LazyLock<
-                    Option<std::sync::Mutex<(Vec<[u64; 256]>, u64)>>,
+                    Option<std::sync::Mutex<(Vec<[u64; N_EXPERT as usize]>, u64)>>,
                 > = std::sync::LazyLock::new(|| {
                     std::env::var_os("DEEPSTRIX_EXPERT_STATS").map(|_| {
-                        std::sync::Mutex::new((vec![[0u64; 256]; N_LAYER as usize], 0u64))
+                        std::sync::Mutex::new((vec![[0u64; N_EXPERT as usize]; N_LAYER as usize], 0u64))
                     })
                 });
                 // Optional hot-set hit-rate histogram: resident sets from the
                 // same placement file + K the het-split loader uses.
-                static HOTSETS: std::sync::LazyLock<Option<Vec<[bool; 256]>>> =
+                static HOTSETS: std::sync::LazyLock<Option<Vec<[bool; N_EXPERT as usize]>>> =
                     std::sync::LazyLock::new(|| {
                         let k: usize = super::weights::dgpu_hot_experts();
                         if k == 0 {
@@ -620,7 +794,7 @@ impl HeterogeneousEngine {
                             lists
                                 .iter()
                                 .map(|ids| {
-                                    let mut m = [false; 256];
+                                    let mut m = [false; N_EXPERT as usize];
                                     for &e in ids {
                                         m[e as usize] = true;
                                     }
@@ -632,23 +806,59 @@ impl HeterogeneousEngine {
                 // (per-token hit counter, 21-bin hit-rate histogram in 5% steps)
                 static HITHIST: std::sync::LazyLock<std::sync::Mutex<(u32, [u32; 21])>> =
                     std::sync::LazyLock::new(|| std::sync::Mutex::new((0, [0; 21])));
-                if let Some(m) = &*STATS {
+                // DEEPSTRIX_EXPERT_TRACE=<path>: per-token, per-layer expert ids
+                // (u16 LE, N_EXPERT_USED per layer, N_LAYER layers per token,
+                // in decode order). Feeds the cold-expert prefetch study — we
+                // need the *sequence*, which the histogram above throws away.
+                static TRACE: std::sync::LazyLock<
+                    Option<std::sync::Mutex<(Vec<u16>, u64)>>,
+                > = std::sync::LazyLock::new(|| {
+                    std::env::var_os("DEEPSTRIX_EXPERT_TRACE")
+                        .map(|_| std::sync::Mutex::new((Vec::new(), 0u64)))
+                });
+                if STATS.is_some() || TRACE.is_some() {
                     self.dgpu.compute.synchronize()?;
                     let mut sel = vec![0i32; crate::config::N_EXPERT_USED];
                     dgpu_scratch
                         .d_selected
                         .slice_view(0, crate::config::N_EXPERT_USED)
                         .copy_to_host(&mut sel)?;
+                    if let Some(t) = &*TRACE {
+                        let mut g = t.lock().unwrap();
+                        for &e in &sel {
+                            g.0.push(e.clamp(0, u16::MAX as i32) as u16);
+                        }
+                        if layer == (N_LAYER as usize) - 1 {
+                            g.1 += 1;
+                            if g.1 % 64 == 0 {
+                                if let Ok(path) = std::env::var("DEEPSTRIX_EXPERT_TRACE") {
+                                    let bytes: Vec<u8> = g
+                                        .0
+                                        .iter()
+                                        .flat_map(|v| v.to_le_bytes())
+                                        .collect();
+                                    let _ = std::fs::write(&path, &bytes);
+                                    eprintln!(
+                                        "EXPERT_TRACE: {} tokens -> {} ({} bytes)",
+                                        g.1,
+                                        path,
+                                        bytes.len()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                  if let Some(m) = &*STATS {
                     let mut g = m.lock().unwrap();
                     for &e in &sel {
-                        if (0..256).contains(&e) {
+                        if (0..N_EXPERT as i32).contains(&e) {
                             g.0[layer][e as usize] += 1;
                         }
                     }
                     if let Some(hs) = &*HOTSETS {
                         let mut h = HITHIST.lock().unwrap();
                         for &e in &sel {
-                            if (0..256).contains(&e) && hs[layer][e as usize] {
+                            if (0..N_EXPERT as i32).contains(&e) && hs[layer][e as usize] {
                                 h.0 += 1;
                             }
                         }
@@ -707,7 +917,7 @@ impl HeterogeneousEngine {
                                     // slot allocation across layers.
                                     let mut out = String::new();
                                     for l in 0..N_LAYER as usize {
-                                        let mut idx: Vec<usize> = (0..256).collect();
+                                        let mut idx: Vec<usize> = (0..N_EXPERT as usize).collect();
                                         idx.sort_unstable_by_key(|&e| {
                                             std::cmp::Reverse(g.0[l][e])
                                         });
@@ -724,6 +934,7 @@ impl HeterogeneousEngine {
                             }
                         }
                     }
+                  }
                 }
             }
             std::mem::swap(&mut dgpu_scratch.residual, &mut dgpu_scratch.residual_next);
@@ -759,7 +970,7 @@ impl HeterogeneousEngine {
             maybe_dump_residual(layer + 1, &dgpu_scratch.residual)?;
         }
         self.forward_head(dgpu_scratch, &weights.global)?;
-        // N_LAYER (43) is odd, so 43 in-loop swaps leave residual /
+        // When N_LAYER is odd (43 in V4-Flash), the in-loop swaps leave residual /
         // residual_next inverted from token start. Without an extra swap
         // here, every token's layer 0 would read from a different
         // physical DeviceBuffer than the previous token's layer 0,
@@ -768,7 +979,9 @@ impl HeterogeneousEngine {
         // alternating tokens). The extra swap restores the initial state
         // so layer N always operates on the same physical buffers across
         // every token.
-        std::mem::swap(&mut dgpu_scratch.residual, &mut dgpu_scratch.residual_next);
+        if N_LAYER % 2 == 1 {
+            std::mem::swap(&mut dgpu_scratch.residual, &mut dgpu_scratch.residual_next);
+        }
         self.set_current_cached(self.dgpu.device)?;
         // Diagnostic split of per-token wall:
         //   host_us = time in this loop before the final sync. If big,
@@ -838,6 +1051,10 @@ impl HeterogeneousEngine {
         // peer copies: ffn_input_norm (N_EMBD f32) + ffn_moe (N_EMBD f32) per layer.
         let peer_bytes = (N_LAYER as u64) * 2 * (crate::config::N_EMBD as u64) * 4;
 
+        let pager_d = pager
+            .as_deref()
+            .map(|p| p.counters() - pager_c0)
+            .unwrap_or_default();
         let summary = super::trace::TokenTiming {
             token_pos: pos,
             total_us: token_elapsed_us,
@@ -846,11 +1063,35 @@ impl HeterogeneousEngine {
             dgpu_idle_us,
             igpu_idle_us,
             peer_bytes,
+            host_us,
+            sync_us,
+            sel_sync_us: super::trace::phase::get(&super::trace::phase::SEL_SYNC_NS) / 1000,
+            pager_ensure_us: super::trace::phase::get(&super::trace::phase::ENSURE_NS) / 1000,
+            pager_read_us: pager_d.decode_read_ns / 1000,
+            pager_h2d_us: pager_d.decode_h2d_ns / 1000,
+            pager_misses: pager_d.decode_misses,
+            remote_rtt_us: super::trace::phase::get(&super::trace::phase::REMOTE_RTT_NS) / 1000,
         };
         summary.emit();
 
-        // DEBUG rollup: per-stage totals.
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        // Per-stage rollup. At INFO under DEEPSTRIX_TOKEN_PROFILE (the M8 decode
+        // breakdown), at DEBUG otherwise.
+        if super::trace::token_profile() {
+            let dgpu_roll = super::trace::rollup_by_name(&dgpu_timings);
+            let igpu_roll = super::trace::rollup_by_name(&igpu_timings);
+            for (name, total_ms, calls) in dgpu_roll {
+                tracing::info!(
+                    token_pos = pos, device = "dgpu", stage = name,
+                    total_us = (total_ms * 1000.0) as u64, calls, "het.stage"
+                );
+            }
+            for (name, total_ms, calls) in igpu_roll {
+                tracing::info!(
+                    token_pos = pos, device = "igpu", stage = name,
+                    total_us = (total_ms * 1000.0) as u64, calls, "het.stage"
+                );
+            }
+        } else if tracing::enabled!(tracing::Level::DEBUG) {
             let dgpu_roll = super::trace::rollup_by_name(&dgpu_timings);
             let igpu_roll = super::trace::rollup_by_name(&igpu_timings);
             for (name, total_ms, calls) in dgpu_roll {
@@ -947,6 +1188,7 @@ impl HeterogeneousEngine {
             }),
             sel_tokens_prefill: std::sync::atomic::AtomicU64::new(0),
             sel_tokens_decode: std::sync::atomic::AtomicU64::new(0),
+            remote: connect_remote_experts(),
         })
     }
 

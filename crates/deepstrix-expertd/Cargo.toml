@@ -1,0 +1,29 @@
+[package]
+name = "deepstrix-expertd"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Remote expert executor daemon (docs/v41/REMOTE_EXPERTS.md) + its client bench.
+# std::net only — no new external dependencies.
+[dependencies]
+v4flash-core = { path = "../v4flash-core" }
+v4flash-hip = { path = "../v4flash-hip" }
+v4flash-kernels = { path = "../v4flash-kernels" }
+color-eyre = { workspace = true }
+
+[[bin]]
+name = "deepstrix-expertd"
+path = "src/main.rs"
+
+[[bin]]
+name = "deepstrix-expert-bench"
+path = "src/bin/bench.rs"
+
+[features]
+# Model selection (non-additive!): the daemon serves DeepSeek-V4.1-Flash experts
+# from the HF checkpoint and only makes sense with `v41`. Build in target-v41
+# (docs/v41/ENGINE_PORT.md §0).
+v41 = ["v4flash-kernels/v41"]

@@ -69,9 +69,11 @@ impl CompressorPool {
         head_dim: u32,
         compress_ratio: u32,
     ) -> eyre::Result<()> {
-        if compress_ratio != 4 && compress_ratio != 128 {
+        // 4 = V4-Flash overlapped layout, 128 = V4-Flash SWA-ish pooling, 2 = V4.1
+        // (generic `ratio` rows of `head_dim`, no overlap: same branch as 128).
+        if compress_ratio != 4 && compress_ratio != 128 && compress_ratio != 2 && compress_ratio != 1 {
             return Err(eyre!(
-                "compressor_pool: compress_ratio={compress_ratio} must be 4 or 128"
+                "compressor_pool: compress_ratio={compress_ratio} must be 1, 2, 4 or 128"
             ));
         }
         let coff: u32 = if compress_ratio == 4 { 2 } else { 1 };
@@ -120,9 +122,9 @@ impl CompressorPool {
         if n_boundaries == 0 {
             return Ok(());
         }
-        if compress_ratio != 4 && compress_ratio != 128 {
+        if compress_ratio != 4 && compress_ratio != 128 && compress_ratio != 2 && compress_ratio != 1 {
             return Err(eyre!(
-                "compressor_pool_batched: compress_ratio={compress_ratio} must be 4 or 128"
+                "compressor_pool_batched: compress_ratio={compress_ratio} must be 1, 2, 4 or 128"
             ));
         }
         let coff: u32 = if compress_ratio == 4 { 2 } else { 1 };
@@ -342,6 +344,66 @@ impl CompressorStateSnapshot {
         };
         launch_kernel!(function, cfg, stream, [
             snap_kv.raw(), snap_score.raw(), state_kv.raw(), state_score.raw(), snap_elems
+        ])
+    }
+
+    /// Batched, launch-free replacement for the serial
+    /// `state_write → snapshot → shuffle` loop on the prefill path.
+    ///
+    /// Writes every boundary's snapshot directly from the chunk's already
+    /// projected `kv_cur`/`sc_cur`, which is bit-for-bit what the serial
+    /// loop produced. Collapses ~3·(B/ratio) launches into one.
+    ///
+    /// **Preconditions** (caller must check; see the fast-path guard in
+    /// `forward_prefill`): `pos0 % ratio == 0`, `n_boundaries >= 1`, and
+    /// every gathered position lies in `[pos0 - (coff-1)*ratio, pos0 + b)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_gather(
+        &self,
+        stream: &Stream,
+        snap_kv: &mut DeviceBuffer<f32>,
+        snap_score: &mut DeviceBuffer<f32>,
+        kv_cur: &DeviceBuffer<f32>,
+        sc_cur: &DeviceBuffer<f32>,
+        state_kv_in: &DeviceBuffer<f32>,
+        state_score_in: &DeviceBuffer<f32>,
+        ape: &DeviceBuffer<u8>,
+        group_start: &DeviceBuffer<i32>,
+        width: u32,
+        ratio: u32,
+        rows: u32,
+        pos0: i32,
+        b: u32,
+        n_boundaries: u32,
+    ) -> eyre::Result<()> {
+        if n_boundaries == 0 || width == 0 || rows == 0 {
+            return Ok(());
+        }
+        let need = (n_boundaries as usize) * (rows as usize) * (width as usize);
+        if snap_kv.len() < need || snap_score.len() < need {
+            return Err(eyre!(
+                "compressor_snapshot_gather: snapshot buffer too small \
+                 (need {need}, have kv={} score={})",
+                snap_kv.len(),
+                snap_score.len()
+            ));
+        }
+        if state_kv_in.len() < (rows * width) as usize
+            || state_score_in.len() < (rows * width) as usize
+        {
+            return Err(eyre!("compressor_snapshot_gather: state buffer too small"));
+        }
+        let function = self.module.get_function("compressor_snapshot_gather")?;
+        const BLOCK: u32 = 256;
+        let cfg = LaunchConfig {
+            grid: (width.div_ceil(BLOCK), rows, n_boundaries),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            snap_kv.raw(), snap_score.raw(), kv_cur.raw(), sc_cur.raw(),
+            state_kv_in.raw(), state_score_in.raw(), ape.raw(), group_start.raw(),
+            width, ratio, rows, pos0, b
         ])
     }
 }

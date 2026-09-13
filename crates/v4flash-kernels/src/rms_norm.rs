@@ -10,6 +10,7 @@
 //! Threshold from `docs/PHASE2_KERNEL_VALIDATION.md`: tests assert
 //! `max_abs_diff < 1e-4` against the canonical ds4 CPU output.
 
+use crate::config::HC_DIM;
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
@@ -66,8 +67,8 @@ impl RmsNorm {
                 weight.len()
             ));
         }
-        if n > 4096 {
-            return Err(eyre!("rms_norm_weighted n={n} exceeds kernel cap of 4096"));
+        if n > HC_DIM as u32 {
+            return Err(eyre!("rms_norm_weighted n={n} exceeds the wrapper cap HC_DIM"));
         }
 
         let function = self.module.get_function("rms_norm_weighted")?;
@@ -107,7 +108,7 @@ impl RmsNorm {
                 weight.len()
             ));
         }
-        if n > 4096 || n % 32 != 0 {
+        if n > HC_DIM as u32 || n % 32 != 0 {
             return Err(eyre!(
                 "rms_norm_weighted_quantize_q8: n={n} must be ≤4096 and %32"
             ));
@@ -155,8 +156,8 @@ impl RmsNorm {
         if weight.len() != n as usize {
             return Err(eyre!("rms_norm_weighted_batched: weight len != n"));
         }
-        if n > 4096 {
-            return Err(eyre!("rms_norm_weighted_batched: n={n} > 4096"));
+        if n > HC_DIM as u32 {
+            return Err(eyre!("rms_norm_weighted_batched: n={n} > HC_DIM"));
         }
         let function = self
             .module

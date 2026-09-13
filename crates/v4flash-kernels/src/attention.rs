@@ -47,64 +47,200 @@ pub const ATTN_SWA_BATCHED_MAX_KV: u32 = 512;
 /// full prefix. Raised from 49408 (192K) on 2026-09-10 once the packed-FP8
 /// compressed KV freed the dGPU room (docs/FP8_KV_IMPL_2026-09.md); the cap
 /// itself costs ~512 B of shared prefill scratch + ~64 B of decode scratch per
-/// token of cap. The server refuses `--ctx > 4 * ATTN_MIXED_MAX_KEYS` at
-/// startup. Must match `#define ATTN_MIXED_MAX_KEYS` in
-/// `kernels/attention_mixed.hip`.
-pub const ATTN_MIXED_MAX_KEYS: u32 = 82176;
-
-/// Stride (in keys) of the `attn_scores` scratch buffer per (batch, head).
-/// Smaller than ATTN_MIXED_MAX_KEYS because the production attention path
-/// runs after the CSA indexer has gathered the top-K=512 most-relevant
-/// comp_kv rows into a dense buffer. So n_total = n_raw + n_keys (≤512)
-/// ≈ 640 at any depth on a ratio==4 layer. Set to 2048 to cover:
-///   - ratio==4 with CSA: ≤ 640 keys (post-gather)
-///   - ratio==4 without CSA (n_index_comp ≤ INDEXER_TOP_K): n_total ≤ 640
-///   - ratio==128 (the ungathered worst case): n_raw + n_kv/128.
+/// token of cap. The server refuses a `--ctx` whose worst-case ungathered
+/// key count (see [`attn_max_scored_keys`]) exceeds this.
 ///
-/// THE BINDING CASE IS ratio==128 WITH VISION. A text row's raw window is
-/// SWA_WINDOW = 128 keys; a Vision-Exp image row's is widened to at most
-/// `het::image_spans::IMAGE_RAW_WINDOW_MAX` = SWA_WINDOW + 384 = 512
-/// (a row inside an image block sees the whole block plus its trailing
-/// text window). So the budget is
+/// PER-MODEL, and the derivation is NOT "ctx / 4". The old value was read as
+/// "320K / 4 + 256" because V4-Flash's smallest *ungathered* contribution is a
+/// ratio-4 layer gathered to INDEXER_TOP_K and its ratio-128 layers give
+/// n_kv/128 — nothing ever reaches n_kv/1. V4.1 has no indexer and its layers
+/// 20-39 are ratio 1, so decode scores `n_raw + n_kv` keys and the cap is a
+/// context limit one-for-one: 82176 made decode fail past ~82K while the
+/// server happily accepted `--ctx 328704`. Sized here for a 128K V4.1 context
+/// (`SWA_WINDOW + 131072`), which costs `N_HEAD * cap * 4 B` = 33.6 MiB of
+/// `DgpuScratch.attn_scores` (was 21.0 MiB) plus `cap/8 B` of
+/// `indexer_allowed_bits`. Decode is B=1, so this cap is cheap — the
+/// expensive one is the batched prefill scratch (see [`attn_scores_stride`]).
+///
+/// The `#define ATTN_MIXED_MAX_KEYS` in `kernels/attention_mixed.hip` is
+/// documentation only: every kernel takes its stride as a launch argument
+/// (`max_keys`), so nothing needs to match it.
+#[cfg(not(feature = "v41"))]
+pub const ATTN_MIXED_MAX_KEYS: u32 = 82176;
+#[cfg(feature = "v41")]
+pub const ATTN_MIXED_MAX_KEYS: u32 = 131_072 + crate::config::SWA_WINDOW; // 131200
+
+/// FLOOR stride (in keys) of the `attn_scores` scratch buffer per
+/// (batch, head). The stride actually used is per-launch — see
+/// [`attn_scores_stride`] — and is never below this value, so V4-Flash's
+/// production layout (3072) is unchanged.
+///
+/// Why 3072 was enough for V4-Flash and is NOT a model-independent number:
+/// the production V4-Flash attention path runs after the CSA indexer has
+/// gathered the top-K=512 most relevant comp_kv rows into a dense buffer, so
+/// a ratio-4 layer scores n_raw + <=512 keys at any depth. Only the
+/// *ungathered* layers (ratio 128) grow with context, at n_kv/128. With
+/// vision the raw window widens to `het::image_spans::IMAGE_RAW_WINDOW_MAX`
+/// = 512, giving the historical budget
 ///
 ///     n_kv_max/128 + IMAGE_RAW_WINDOW_MAX <= ATTN_SCORES_STRIDE
 ///
-/// which at 192K is 1536 + 512 = 2048. Text-only the bound is
-/// SWA_WINDOW + n_kv_max/128 (the ratio-128 layers are never gathered):
-/// 2048 held to ~245K, and a 300K bench tripped it (n_total_max 2475).
-/// 3072 covers 320K with vision ((3072 - 512) * 128 = 327680) and ~377K
-/// text-only. Raising the context past that, or widening the image
-/// window, REQUIRES raising this constant; `check_vision_ctx_fits`
-/// enforces the vision bound at startup so it is a launch-time refusal
-/// rather than a mid-prefill 500 after part of the chunk's KV was already
-/// appended. Cost: 64 heads x stride x 2 B per scratch row (f16 scores).
+/// -> 3072 covers 320K with vision and ~377K text-only.
 ///
-/// The old comment here said "headroom ok at our actual max ctx of 96K
-/// (1024)" and predated both the 192K default and vision.
+/// V4.1 breaks every term of that: no indexer is ported (ENGINE_PORT M5), so
+/// NO layer is gathered, and `COMPRESS_RATIOS` are 2 (layers 2-19) and 1
+/// (layers 20-39). The worst-case ungathered contribution is therefore
+/// n_kv/1, not n_kv/128 — 3072 capped the CED decoder replay at 2944 prompt
+/// tokens and the ratio-2 encoder at 5888. [`attn_max_scored_keys`] is the
+/// model-independent derivation; `BatchDgpuShared::alloc_rows_ctx` sizes the
+/// scratch from it.
 ///
-/// At B=512: 64 * 2048 * 2 (f16) = 256 KB/B = 128 MB scratch (was 1.5 GiB).
-/// At B=1024: 256 MB. Plenty of room for bigger batches.
+/// Cost: 64 heads x stride x 2 B (f16 scores) per scratch row.
+/// At rows=512: 64 * 3072 * 2 = 384 KiB/row = 201 MiB.
 pub const ATTN_SCORES_STRIDE: u32 = 3072;
+
+/// Does the CSA indexer gather layers of this compress ratio down to a dense
+/// `INDEXER_TOP_K` buffer before attention scores them?
+///
+/// Only V4-Flash's ratio-4 layers. V4.1's indexer is unported (and
+/// structurally different: 8 index-source layers, keys on the 4 kv-source
+/// layers, plus the layer-20 candidate pool — ARCH_SPEC 1.4/1.5), so every
+/// V4.1 compressed layer is scored densely over its whole store. Keep this
+/// in lockstep with the `use_sparse` / `need_mask` gates in
+/// `het::forward_layer` and `het::forward_prefill`.
+pub fn indexer_gathers(ratio: u32) -> bool {
+    !cfg!(feature = "v41") && ratio == 4
+}
+
+/// Can the CSA indexer fire on ANY layer of this model? False for V4.1
+/// (unported indexer), which makes every per-token indexer scratch buffer
+/// dead weight — see `het::batch_scratch::indexer_scratch_keys`.
+pub fn indexer_ever_fires() -> bool {
+    crate::config::COMPRESS_RATIOS.iter().any(|&r| indexer_gathers(r))
+}
+
+/// Worst-case `n_raw + n_comp` any single (row, head) can be asked to score
+/// at `n_kv_max` context, over every layer of THIS model.
+///
+/// This is the one derivation the three context caps
+/// (`ATTN_MIXED_MAX_KEYS`, the `attn_scores` scratch, and the server's
+/// `--ctx` admission check) must all come from. A gathered layer contributes
+/// at most `INDEXER_TOP_K`; an ungathered one contributes its full store,
+/// `ceil(n_kv_max / ratio)`. Dense layers (ratio 0) have no compressed store.
+///
+/// `raw_window` is `SWA_WINDOW` for a text-only engine and
+/// `het::image_spans::IMAGE_RAW_WINDOW_MAX` when a vision tower is loaded.
+///
+/// Sanity: V4-Flash at 320K text-only -> 128 + max(512, 320K/128 = 2560)
+/// = 2688, under the historical 3072. V4.1 at 100K -> 128 + max(50000,
+/// 100000) = 100128, i.e. the store itself.
+pub fn attn_max_scored_keys(n_kv_max: u32, raw_window: u32) -> u32 {
+    let mut worst = 0u32;
+    for &ratio in crate::config::COMPRESS_RATIOS.iter() {
+        if ratio == 0 {
+            continue;
+        }
+        let n_comp = n_kv_max.div_ceil(ratio);
+        let scored = if indexer_gathers(ratio) {
+            n_comp.min(crate::config::INDEXER_TOP_K)
+        } else {
+            n_comp
+        };
+        worst = worst.max(scored);
+    }
+    raw_window.saturating_add(worst)
+}
+
+/// Largest context [`attn_max_scored_keys`] keeps within `keys`, i.e. the
+/// inverse of the function above. Used for the "lower --ctx to N" half of
+/// every admission error.
+pub fn attn_max_ctx_for_keys(keys: u32, raw_window: u32) -> u32 {
+    let budget = keys.saturating_sub(raw_window);
+    let mut min_ratio = u32::MAX;
+    for &ratio in crate::config::COMPRESS_RATIOS.iter() {
+        if ratio == 0 || indexer_gathers(ratio) {
+            continue;
+        }
+        min_ratio = min_ratio.min(ratio);
+    }
+    if min_ratio == u32::MAX {
+        // Every compressed layer is gathered: context is unbounded by this
+        // budget as long as the gather itself fits.
+        return u32::MAX;
+    }
+    budget.saturating_mul(min_ratio)
+}
+
+/// `DEEPSTRIX_ATTN_LEGACY_STRIDE=1` restores the pre-2026-09-13 behaviour:
+/// a fixed [`ATTN_SCORES_STRIDE`] and a hard error past it, plus legacy
+/// scratch sizing. Rollback and before/after demonstration only.
+pub fn attn_legacy_stride() -> bool {
+    std::env::var("DEEPSTRIX_ATTN_LEGACY_STRIDE").map(|v| v != "0").unwrap_or(false)
+}
+
+/// Stride (keys per (row, head)) for one batched score + softmax-wsum pair.
+///
+/// The two kernels MUST be given the same value. `capacity_keys` is how many
+/// score slots the caller's `attn_scores` buffer holds in total (f16 slots
+/// for the `_f16s` pair, f32 slots otherwise).
+///
+/// Returns [`ATTN_SCORES_STRIDE`] whenever that is both sufficient and
+/// affordable, so V4-Flash and short-context V4.1 keep today's exact layout;
+/// otherwise the smallest stride that holds `n_total_max`.
+pub fn attn_scores_stride(
+    capacity_keys: usize,
+    batch: u32,
+    n_head: u32,
+    n_total_max: u32,
+) -> eyre::Result<u32> {
+    let rows = (batch as usize) * (n_head as usize);
+    if rows == 0 {
+        return Ok(ATTN_SCORES_STRIDE);
+    }
+    // ROLLBACK / demonstration knob: pin the stride to the old compile-time
+    // constant and refuse anything past it, exactly as the code did before
+    // 2026-09-13. `DEEPSTRIX_ATTN_LEGACY_STRIDE=1` is the switch that turns
+    // "a 3000-token V4.1 prompt" back into a hard error.
+    if attn_legacy_stride() {
+        if n_total_max > ATTN_SCORES_STRIDE {
+            return Err(eyre!(
+                "attention scores: n_total_max={n_total_max} exceeds scratch stride \
+                 {ATTN_SCORES_STRIDE} (DEEPSTRIX_ATTN_LEGACY_STRIDE=1)"
+            ));
+        }
+        return Ok(ATTN_SCORES_STRIDE);
+    }
+    let fits = capacity_keys / rows;
+    if (n_total_max as usize) > fits {
+        return Err(eyre!(
+            "attention scores scratch holds {fits} keys per (row, head) at batch {batch} \
+             (capacity {capacity_keys} keys) but this layer needs {n_total_max}. The scratch is \
+             sized by `BatchDgpuShared::alloc_rows_ctx(rows, n_kv_max)`, which charges the CED \
+             decoder layers only the bounded replay's row count — a NON-CED prefill \
+             (V41_CED=0, or per-token logits) runs those layers over full chunks and needs 8x \
+             more. Lower --ctx, use CED, or size the shared set for the batch you run."
+        ));
+    }
+    if n_total_max <= ATTN_SCORES_STRIDE && (ATTN_SCORES_STRIDE as usize) <= fits {
+        return Ok(ATTN_SCORES_STRIDE);
+    }
+    Ok(n_total_max.max(1))
+}
 
 /// Refuse to start when a vision tower is loaded and `n_kv_max` would let
 /// an image row's `n_raw + n_comp` overrun [`ATTN_SCORES_STRIDE`].
 ///
-/// Text-only servers are unaffected: without image rows the raw window is
-/// SWA_WINDOW and the bound is ~1.5x looser.
+/// NOTE this only guards the *floor* stride. The batched prefill scratch is
+/// sized from `n_kv_max` (`BatchDgpuShared::alloc_rows_ctx`), so a V4.1
+/// engine past 3072 keys is legal — it just costs memory. This check exists
+/// for the models/settings where the floor is also the ceiling.
 pub fn check_vision_ctx_fits(n_kv_max: u32) -> eyre::Result<()> {
-    let max_ratio = crate::config::COMPRESS_RATIOS
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let n_comp_max = n_kv_max.div_ceil(max_ratio);
-    let need = n_comp_max + crate::het::image_spans::IMAGE_RAW_WINDOW_MAX;
-    if need > ATTN_SCORES_STRIDE {
+    let raw = crate::het::image_spans::IMAGE_RAW_WINDOW_MAX;
+    let need = attn_max_scored_keys(n_kv_max, raw);
+    if need > ATTN_SCORES_STRIDE && !cfg!(feature = "v41") {
         return Err(eyre!(
-            "vision + ctx {n_kv_max} needs {need} attention score slots per (row, head)              (n_comp {n_comp_max} at ratio {max_ratio} + image raw window {}) but              ATTN_SCORES_STRIDE is {ATTN_SCORES_STRIDE}. Lower --ctx to {} or raise              ATTN_SCORES_STRIDE (and the attn_scores scratch with it).",
-            crate::het::image_spans::IMAGE_RAW_WINDOW_MAX,
-            (ATTN_SCORES_STRIDE - crate::het::image_spans::IMAGE_RAW_WINDOW_MAX) * max_ratio,
+            "vision + ctx {n_kv_max} needs {need} attention score slots per (row, head)              (image raw window {raw}) but              ATTN_SCORES_STRIDE is {ATTN_SCORES_STRIDE}. Lower --ctx to {} or raise              ATTN_SCORES_STRIDE (and the attn_scores scratch with it).",
+            attn_max_ctx_for_keys(ATTN_SCORES_STRIDE, raw),
         ));
     }
     Ok(())
@@ -563,13 +699,14 @@ impl AttentionMixed {
         head_dim: u32,
         n_total_max: u32,
         batch: u32,
+        scores_stride: u32,
     ) -> eyre::Result<()> {
         if batch == 0 || n_total_max == 0 {
             return Ok(());
         }
-        if n_total_max > ATTN_MIXED_MAX_KEYS {
+        if n_total_max > scores_stride {
             return Err(eyre!(
-                "attention_mixed_score_batched_htiled_wmma: n_total_max={n_total_max} exceeds cap {ATTN_MIXED_MAX_KEYS}"
+                "attention_mixed_score_batched_htiled_wmma: n_total_max={n_total_max} exceeds scores stride {scores_stride}"
             ));
         }
         let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -586,7 +723,7 @@ impl AttentionMixed {
         launch_kernel!(function, cfg, stream, [
             scores_g.raw(), q.raw(), raw_kv.raw(), comp_kv_ptr,
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
-            n_head, head_dim, ATTN_MIXED_MAX_KEYS, kq_scale
+            n_head, head_dim, scores_stride, kq_scale
         ])
     }
 
@@ -609,6 +746,7 @@ impl AttentionMixed {
         n_head: u32,
         head_dim: u32,
         batch: u32,
+        scores_stride: u32,
     ) -> eyre::Result<()> {
         if batch == 0 {
             return Ok(());
@@ -626,7 +764,7 @@ impl AttentionMixed {
         launch_kernel!(function, cfg, stream, [
             out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
-            n_head, head_dim, ATTN_MIXED_MAX_KEYS
+            n_head, head_dim, scores_stride
         ])
     }
 
@@ -669,16 +807,17 @@ impl AttentionMixed {
         n_total_max: u32,
         batch: u32,
         comp_kv_batch_stride: u32,
+        scores_stride: u32,
     ) -> eyre::Result<()> {
         if batch == 0 || n_total_max == 0 {
             return Ok(());
         }
-        // BUFFER bound: scratch is sized at ATTN_SCORES_STRIDE per (b,head).
-        // The user-facing cap stays ATTN_MIXED_MAX_KEYS but the production
-        // CSA gather path never approaches it (post-gather n_total ≤ ~640).
-        if n_total_max > ATTN_SCORES_STRIDE {
+        // BUFFER bound: the caller derives `scores_stride` from the actual
+        // capacity of `scores_g` at this batch (`attn_scores_stride`), so this
+        // is a real bounds check, not a model-shaped guess.
+        if n_total_max > scores_stride {
             return Err(eyre!(
-                "attention_mixed_score_batched_htiled_wmma_f16s: n_total_max={n_total_max} exceeds scratch stride {ATTN_SCORES_STRIDE}"
+                "attention_mixed_score_batched_htiled_wmma_f16s: n_total_max={n_total_max} exceeds scores stride {scores_stride}"
             ));
         }
         let kq_scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -704,7 +843,7 @@ impl AttentionMixed {
             scores_g.raw(), q.raw(), raw_kv.raw(), comp_kv_ptr,
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
             mask_ptr, max_keys_words,
-            n_head, head_dim, ATTN_SCORES_STRIDE, kq_scale,
+            n_head, head_dim, scores_stride, kq_scale,
             comp_kv_batch_stride
         ])
     }
@@ -724,6 +863,7 @@ impl AttentionMixed {
         n_head: u32,
         head_dim: u32,
         batch: u32,
+        scores_stride: u32,
     ) -> eyre::Result<()> {
         if batch == 0 {
             return Ok(());
@@ -741,7 +881,7 @@ impl AttentionMixed {
         launch_kernel!(function, cfg, stream, [
             out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
-            n_head, head_dim, ATTN_MIXED_MAX_KEYS
+            n_head, head_dim, scores_stride
         ])
     }
 
@@ -766,6 +906,7 @@ impl AttentionMixed {
         n_head: u32,
         head_dim: u32,
         batch: u32,
+        scores_stride: u32,
     ) -> eyre::Result<()> {
         if batch == 0 {
             return Ok(());
@@ -783,7 +924,7 @@ impl AttentionMixed {
         launch_kernel!(function, cfg, stream, [
             out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
-            n_head, head_dim, ATTN_MIXED_MAX_KEYS
+            n_head, head_dim, scores_stride
         ])
     }
 
@@ -813,6 +954,7 @@ impl AttentionMixed {
         head_dim: u32,
         batch: u32,
         comp_kv_batch_stride: u32,
+        scores_stride: u32,
     ) -> eyre::Result<()> {
         if batch == 0 {
             return Ok(());
@@ -830,7 +972,7 @@ impl AttentionMixed {
         launch_kernel!(function, cfg, stream, [
             out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
-            n_head, head_dim, ATTN_SCORES_STRIDE, comp_kv_batch_stride
+            n_head, head_dim, scores_stride, comp_kv_batch_stride
         ])
     }
 
@@ -852,6 +994,7 @@ impl AttentionMixed {
         n_head: u32,
         head_dim: u32,
         batch: u32,
+        scores_stride: u32,
     ) -> eyre::Result<()> {
         if batch == 0 {
             return Ok(());
@@ -869,7 +1012,7 @@ impl AttentionMixed {
         launch_kernel!(function, cfg, stream, [
             out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
-            n_head, head_dim, ATTN_MIXED_MAX_KEYS
+            n_head, head_dim, scores_stride
         ])
     }
 
@@ -892,6 +1035,7 @@ impl AttentionMixed {
         n_head: u32,
         head_dim: u32,
         batch: u32,
+        scores_stride: u32,
     ) -> eyre::Result<()> {
         if batch == 0 {
             return Ok(());
@@ -909,7 +1053,7 @@ impl AttentionMixed {
         launch_kernel!(function, cfg, stream, [
             out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
-            n_head, head_dim, ATTN_MIXED_MAX_KEYS
+            n_head, head_dim, scores_stride
         ])
     }
 
@@ -964,6 +1108,7 @@ mod tests {
     /// and it must sit exactly at the edge — this is the test that fails
     /// first if someone raises the context without raising the stride.
     #[test]
+    #[cfg(not(feature = "v41"))]
     fn vision_ctx_budget_is_exact_at_the_stride() {
         // The bound is (ATTN_SCORES_STRIDE - IMAGE_RAW_WINDOW_MAX) * 128 tokens:
         // 192K at the old 2048 stride, 320K at 3072.
@@ -977,6 +1122,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "v41"))]
     fn vision_ctx_error_names_a_workable_ctx() {
         let e = check_vision_ctx_fits(512 * 1024).unwrap_err().to_string();
         assert!(e.contains("ATTN_SCORES_STRIDE"), "{e}");
@@ -985,5 +1131,57 @@ mod tests {
             (ATTN_SCORES_STRIDE - crate::het::image_spans::IMAGE_RAW_WINDOW_MAX) * 128,
         )
         .unwrap();
+    }
+
+    /// The three context caps must all come from `attn_max_scored_keys`.
+    /// This is the regression test for the 2026-09-13 finding: the caps were
+    /// derived assuming compression ratio >= 4, which V4.1 does not have.
+    #[test]
+    fn max_scored_keys_uses_the_minimum_ungathered_ratio() {
+        let w = crate::config::SWA_WINDOW;
+        let min_ungathered = crate::config::COMPRESS_RATIOS
+            .iter()
+            .copied()
+            .filter(|&r| r > 0 && !indexer_gathers(r))
+            .min()
+            .expect("every model has at least one ungathered compressed layer");
+        // 64K of context: the worst layer scores the whole of its own store.
+        let keys = attn_max_scored_keys(65536, w);
+        let expect = w + (65536u32.div_ceil(min_ungathered))
+            .max(if crate::config::COMPRESS_RATIOS.iter().any(|&r| indexer_gathers(r)) {
+                crate::config::INDEXER_TOP_K
+            } else {
+                0
+            });
+        assert_eq!(keys, expect, "min ungathered ratio {min_ungathered}");
+        // Round-trips through the inverse.
+        let ctx = attn_max_ctx_for_keys(keys, w);
+        assert!(ctx >= 65536, "inverse lost context: {ctx}");
+        assert!(attn_max_scored_keys(ctx, w) <= keys);
+    }
+
+    /// The decode cap must cover the context the server is allowed to accept.
+    #[test]
+    fn decode_cap_admits_a_real_context() {
+        let w = crate::config::SWA_WINDOW;
+        let ctx = attn_max_ctx_for_keys(ATTN_MIXED_MAX_KEYS, w);
+        assert!(ctx >= 8192, "decode cap only reaches {ctx} tokens");
+        assert!(attn_max_scored_keys(ctx, w) <= ATTN_MIXED_MAX_KEYS);
+        if cfg!(feature = "v41") {
+            // V4.1: ratio-1 layers make this a 1:1 context limit.
+            assert_eq!(ctx, 131_072);
+        }
+    }
+
+    /// `attn_scores_stride` never hands the two kernels a stride that
+    /// overruns the buffer, and keeps the legacy layout when it fits.
+    #[test]
+    fn scores_stride_is_the_floor_when_it_fits_and_errors_when_it_cannot() {
+        let cap = 512 * 64 * (ATTN_SCORES_STRIDE as usize);
+        assert_eq!(attn_scores_stride(cap, 512, 64, 640).unwrap(), ATTN_SCORES_STRIDE);
+        // Same buffer, a quarter of the rows: deeper contexts become legal.
+        assert_eq!(attn_scores_stride(cap, 128, 64, 9000).unwrap(), 9000);
+        // ... but not without bound.
+        assert!(attn_scores_stride(cap, 512, 64, 4000).is_err());
     }
 }

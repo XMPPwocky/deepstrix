@@ -21,12 +21,19 @@
 //!
 //! Loading rules: only `data:` base64 URLs and absolute local paths are
 //! accepted — the server never fetches http(s) URLs.
+//!
+//! Which checkpoint's image processor / span layout applies is a
+//! compile-time property of this binary ([`vision_cfg`]): V4-Flash
+//! Vision-Exp by default, DeepSeek-V4.1 under the `v41` feature (flat
+//! `START (IMAGE*w NEWLINE)*h END` spans, 1024-token budget, 544² minimum
+//! pixels, 5120-wide rows). The synthetic-id convention is the same for
+//! both.
 
 use std::path::Path;
 
 use color_eyre::eyre::{self, eyre, WrapErr};
 use serde::{Deserialize, Serialize};
-use v4flash_vision::{image_token_type, layout_for, ImageLayout, PreprocessedImage, TokenType, VOCAB_SIZE};
+use v4flash_vision::{image_token_type, layout_for_cfg, ImageLayout, PreprocessedImage, TokenType, VisionCfg, VOCAB_SIZE};
 
 use crate::openai::types::{ImageInput, ImageSource};
 
@@ -102,6 +109,16 @@ pub struct VlPrompt {
     /// In stream order; `spans[i] == images[i].span()`.
     pub images: Vec<PreparedImage>,
     pub spans: Vec<ImageSpan>,
+}
+
+/// The image-processor + span-layout parameters of the model this binary
+/// serves (compile-time model selection, see `docs/v41/ENGINE_PORT.md` §0).
+pub fn vision_cfg() -> &'static VisionCfg {
+    if cfg!(feature = "v41") {
+        &VisionCfg::V41
+    } else {
+        &VisionCfg::V4_FLASH
+    }
 }
 
 // ------------------------------------------------------------ loading
@@ -276,7 +293,7 @@ pub fn expand_images(
     for (i, inp) in inputs.iter().enumerate() {
         let bytes = load_image_bytes(inp, policy).wrap_err_with(|| format!("image {i}"))?;
         let t0 = std::time::Instant::now();
-        let img = v4flash_vision::preprocess(&bytes).wrap_err_with(|| format!("image {i}"))?;
+        let img = v4flash_vision::preprocess_cfg(&bytes, vision_cfg()).wrap_err_with(|| format!("image {i}"))?;
         tracing::debug!(
             image = i,
             bytes = bytes.len(),
@@ -290,11 +307,21 @@ pub fn expand_images(
 }
 
 /// [`expand_images`] on already-preprocessed images (no I/O; unit-testable
-/// with synthetic `PreprocessedImage`s).
+/// with synthetic `PreprocessedImage`s), for this binary's model.
 pub fn expand_prepared(
     tokens: Vec<i32>,
     placeholder: i32,
     images: Vec<PreprocessedImage>,
+) -> eyre::Result<VlPrompt> {
+    expand_prepared_cfg(tokens, placeholder, images, vision_cfg())
+}
+
+/// [`expand_prepared`] with an explicit layout profile.
+pub fn expand_prepared_cfg(
+    tokens: Vec<i32>,
+    placeholder: i32,
+    images: Vec<PreprocessedImage>,
+    cfg: &VisionCfg,
 ) -> eyre::Result<VlPrompt> {
     let n_ph = tokens.iter().filter(|&&t| t == placeholder).count();
     if n_ph != images.len() {
@@ -315,7 +342,7 @@ pub fn expand_prepared(
             continue;
         }
         let image = it.next().expect("counted above");
-        let layout = layout_for(&image, out.tokens.len() as u32);
+        let layout = layout_for_cfg(&image, out.tokens.len() as u32, cfg);
         debug_assert_eq!(layout.start_pos as usize, out.tokens.len());
         out.tokens.extend(layout.token_ids().iter().map(|&id| id as i32));
         let prepared = PreparedImage { image, layout };
@@ -542,7 +569,7 @@ mod tests {
         // prompt: [0, 128803, 11, PH, 12, 128804]  (PH at index 3)
         let tokens = vec![0, 128803, 11, PH, 12, 128804];
         let img = fake_image(37, 37, 1); // 512x512 → 13x13 LLM grid, 198 span tokens
-        let vl = expand_prepared(tokens, PH, vec![img.clone()]).unwrap();
+        let vl = expand_prepared_cfg(tokens, PH, vec![img.clone()], &VisionCfg::V4_FLASH).unwrap();
         let layout = layout_for_grid(37, 37, 3);
         assert_eq!(vl.images.len(), 1);
         assert_eq!(vl.images[0].layout, layout);
@@ -567,7 +594,7 @@ mod tests {
         let tokens = vec![0, PH, 5, PH, 6];
         let a = fake_image(37, 37, 1);
         let b = fake_image(42, 74, 2);
-        let vl = expand_prepared(tokens, PH, vec![a, b]).unwrap();
+        let vl = expand_prepared_cfg(tokens, PH, vec![a, b], &VisionCfg::V4_FLASH).unwrap();
         let la = layout_for_grid(37, 37, 1); // compress_pad = 3-1 = 2 → START at 3
         assert_eq!(la.compress_pad(), 2);
         assert_eq!(vl.images[0].layout, la);
@@ -580,6 +607,37 @@ mod tests {
         assert_eq!(vl.tokens.len(), 3 + la.types.len() + lb.types.len());
         assert_eq!(*vl.tokens.last().unwrap(), 6);
         assert_ne!(vl.spans[0].hash, vl.spans[1].hash);
+    }
+
+    /// V4.1: the placeholder expands to the flat `START (IMAGE*w NEWLINE)*h END`
+    /// span at the running position — no compress pads, no PAD slots, and the
+    /// engine's image predicate still holds exactly on the span.
+    #[test]
+    fn expand_v41_flat_span_at_running_position() {
+        use v4flash_vision::layout::layout_for_grid_cfg;
+        let tokens = vec![0, 128803, 11, PH, 12, 128804];
+        let img = fake_image(35, 46, 1); // 640x480 → 12x16 LLM grid, 206 span tokens
+        let vl = expand_prepared_cfg(tokens, PH, vec![img.clone()], &VisionCfg::V41).unwrap();
+        let layout = layout_for_grid_cfg(35, 46, 3, &VisionCfg::V41);
+        assert_eq!(vl.images[0].layout, layout);
+        assert_eq!(layout.compress_pad(), 0);
+        assert_eq!(vl.spans, vec![ImageSpan { start: 3, len: 206, hash: img.content_hash }]);
+        assert_eq!(vl.tokens.len(), 5 + 206);
+        assert_eq!(&vl.tokens[..3], &[0, 128803, 11]);
+        assert_eq!(vl.tokens[3], synthetic_token_id(TokenType::Start as u8) as i32);
+        assert_eq!(vl.tokens[4], synthetic_token_id(TokenType::Image as u8) as i32);
+        assert_eq!(vl.tokens[3 + 17], synthetic_token_id(TokenType::NewLine as u8) as i32);
+        assert_eq!(vl.tokens[3 + 206 - 1], synthetic_token_id(TokenType::End as u8) as i32);
+        assert!(!vl.tokens.contains(&(synthetic_token_id(TokenType::Pad as u8) as i32)));
+        assert_eq!(&vl.tokens[3 + 206..], &[12, 128804]);
+        for (i, &t) in vl.tokens.iter().enumerate() {
+            assert_eq!(is_image_token(t), (3..3 + 206).contains(&i), "idx {i}");
+        }
+        // Second image starts right after the first span (no pad arithmetic).
+        let vl2 = expand_prepared_cfg(vec![0, PH, 5, PH, 6], PH, vec![fake_image(35, 46, 1), fake_image(33, 47, 2)], &VisionCfg::V41).unwrap();
+        assert_eq!(vl2.spans[0].as_pair(), (1, 206));
+        assert_eq!(vl2.spans[1].as_pair(), (1 + 206 + 1, 189));
+        assert_eq!(*vl2.tokens.last().unwrap(), 6);
     }
 
     #[test]

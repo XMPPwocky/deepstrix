@@ -41,8 +41,110 @@ use super::state::{CompKvStore, HetLayerState};
 use crate::comp_kv_fp8::FP8_KV_HEAD_ROWS;
 use crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES;
 use super::sync::{peer_push_f32, peer_push_i32};
+
+/// Verify every routed pick is computed by EXACTLY ONE device.
+///
+/// The MoE partials from the iGPU pool, box 2, and (once wired) the dGPU hot
+/// tier are summed with `vec_add` at `ffn_combine`. That sum is only correct if
+/// the three claim sets partition the token's picks. Nothing in the types
+/// enforces it: the pager's remap, box 2's ownership bitmap and the hot remap
+/// are built independently, and a per-device CAP can silently drop a pick
+/// (nobody computes it) or hand it to a second device by raw id (computed
+/// twice). Both failure modes are SILENT — wrong logits, no error. The M63
+/// over-cap bug and this session's `hot_prefill_cap()=4` vs `N_EXPERT_USED=6`
+/// bug were both of exactly this shape.
+///
+/// `remap` is the iGPU view: NEGATIVE = the iGPU owns it (slot `-e-1`),
+/// non-negative = some other device's.
+///
+/// UNCONDITIONAL, deliberately. This is <= 6 integer comparisons per layer —
+/// ~240 per token against a ~172 ms token, i.e. unmeasurable. An env gate would
+/// only mean the check was OFF in production, which is the one place a silent
+/// double-count actually costs anything.
+pub fn verify_routing_exactly_once(
+    layer: i32,
+    sel: &[i32],
+    remap: &[i32],
+    owns_remote: Option<&[bool]>,
+) -> eyre::Result<()> {
+    // Bitmap, not `Vec::contains`: decode passes 6 picks but PREFILL passes B*6
+    // (6144 at B=1024), and a linear scan per pick would be ~18M comparisons per
+    // layer per chunk. O(n) either way now.
+    let mut seen = [false; N_EXPERT as usize];
+    for &e in sel {
+        if !(0..N_EXPERT as i32).contains(&e) || seen[e as usize] {
+            continue; // padding / duplicate pick: the pager dedups these too
+        }
+        seen[e as usize] = true;
+        let igpu = remap[e as usize] < 0;
+        let remote = owns_remote.is_some_and(|o| o[e as usize]);
+        let claims = [("igpu", igpu), ("box2", remote)];
+        let n = claims.iter().filter(|(_, c)| *c).count();
+        if n != 1 {
+            let who: Vec<&str> = claims.iter().filter(|(_, c)| *c).map(|(w, _)| *w).collect();
+            return Err(eyre!(
+                "L{layer} expert {e}: computed by {n} devices {who:?} (need exactly 1).                  remap[{e}]={} owns_remote={remote}. A pick claimed twice is DOUBLE-COUNTED                  at ffn_combine; a pick claimed zero times is silently dropped.",
+                remap[e as usize]
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Run V4.1's `hc_mixes` on a side stream instead of inline.
+///
+/// **DEFAULT OFF — MEASURED LOSS (2026-09-13).** Back-to-back, symbol-verified,
+/// identical miss counts (11.11/token both arms) and bit-identical output:
+///
+/// | | prefill | decode | `sel_sync_us` |
+/// |---|---|---|---|
+/// | off | 154 tok/s | **6.95** | **37,333** |
+/// | on  | 159 tok/s | 6.22 | 67,394 |
+///
+/// It made the metric it targets **80% worse**. The ARCHITECTURE reasoning was
+/// right — ARCH_SPEC §1.1's shift really does take `hc_mixes` off this
+/// sub-block's critical path — but a second HIP stream is the wrong mechanism:
+/// two graph launches plus six cross-stream record/wait pairs per layer cost
+/// more than the ~58 us/layer of mixes they hide. Same lesson as `MHC_FUSED`
+/// (fusion lost to a 24-WG matvec): the mHC chain resists both fusion and
+/// stream-splitting, and the win is not where the stage timing suggests. Kept
+/// in tree, off, as a documented negative result; `V41_MHC_SPLIT=1` re-enables.
+/// A cheaper exploit of the same shift would have to avoid per-layer
+/// synchronisation entirely — e.g. batching the mixes for ALL layers into one
+/// launch, which the shift also permits.
+fn mhc_split_enabled() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        cfg!(feature = "v41")
+            && !std::env::var("MHC_FUSED").map(|v| v != "0").unwrap_or(false)
+            && std::env::var("V41_MHC_SPLIT").map(|v| v != "0").unwrap_or(false)
+            && std::env::var("RMS_NW_MW").map(|v| v == "fused").unwrap_or(true)
+    });
+    *B
+}
+use crate::config::{ENGRAM_IN, ENGRAM_OUT};
 use super::weights::{DgpuLayerWeights, IgpuLayerWeights};
+use super::expert_pager::ExpertPager;
 use tracing::debug_span;
+
+
+/// `V41_ATTN_COMP_CAP=<n>`: clamp the DENSE compressed-attention row count to `n`.
+///
+/// A timing ablation for the missing V4.1 sparse indexer (docs/v41/DECODE_M8_PLAN.md
+/// "Measured (2026-09-13)"): with no indexer, V4.1 decode scores + weight-sums over
+/// every compressed row of every layer >= 2, which grows linearly with context. This
+/// makes the kernels do exactly the `n`-row work a working top-`n` indexer would leave
+/// them, so the prize is measurable before the indexer is built. Numerically WRONG
+/// (wrong rows) — never set it on a correctness run. 0 (default) = off.
+fn attn_comp_cap() -> u32 {
+    static N: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        let v = std::env::var("V41_ATTN_COMP_CAP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+        if v > 0 {
+            tracing::warn!(cap = v, "V41_ATTN_COMP_CAP set: dense compressed attention is CLAMPED — output is invalid, timing ablation only");
+        }
+        v
+    });
+    *N
+}
 
 impl HeterogeneousEngine {
     /// Run one layer in the het pipeline. Reads from
@@ -54,6 +156,20 @@ impl HeterogeneousEngine {
     /// ~115 µs/layer host-scheduling gap). Correspondingly, mhc_pre_attn
     /// is launched standalone ONLY for layer 0 — every other layer's
     /// mhc_pre_attn rides the previous layer's combined graph.
+    /// V4.1 Engram: stage one token's dequantised rows (`ENGRAM_IN` f32, from
+    /// `v4flash_core::EngramTable::gather_position`) for the next Engram layer
+    /// this scratch runs. Hashes are token-only, so this can happen as soon as
+    /// the token is known (ENGINE_PORT.md M2: off the critical path).
+    pub fn stage_engram_rows(&self, dgpu_scratch: &mut DgpuScratch, rows: &[f32]) -> eyre::Result<()> {
+        if rows.len() != ENGRAM_IN as usize {
+            return Err(eyre!("stage_engram_rows: {} floats, want {}", rows.len(), ENGRAM_IN));
+        }
+        self.set_current_cached(self.dgpu.device)?;
+        dgpu_scratch.engram_rows.copy_from_host(rows)?;
+        dgpu_scratch.engram_rows_ready = true;
+        Ok(())
+    }
+
     pub fn forward_layer(
         &self,
         dgpu_scratch: &mut DgpuScratch,
@@ -75,6 +191,7 @@ impl HeterogeneousEngine {
             pos,
             token_id,
             false,
+            None,
         )
     }
 
@@ -108,6 +225,38 @@ impl HeterogeneousEngine {
             pos,
             token_id,
             true,
+            None,
+        )
+    }
+
+    /// M7 phase-1 expert paging: like [`forward_layer_standalone_graphs`] but the
+    /// routed MoE reads experts from `pager` (paged on demand from the router's
+    /// actual picks) instead of a fully-resident `ilw.routed`. `dlw.hot_experts`
+    /// must be None (no dGPU hot set) so every routed expert computes on the iGPU
+    /// from the pager's pool.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_layer_standalone_graphs_paged(
+        &self,
+        dgpu_scratch: &mut DgpuScratch,
+        igpu_scratch: &mut IgpuScratch,
+        ls: &mut HetLayerState,
+        dlw: &DgpuLayerWeights,
+        ilw: &IgpuLayerWeights,
+        pos: u32,
+        token_id: i32,
+        pager: &mut ExpertPager,
+    ) -> eyre::Result<()> {
+        self.forward_layer_impl(
+            dgpu_scratch,
+            igpu_scratch,
+            ls,
+            dlw,
+            None,
+            ilw,
+            pos,
+            token_id,
+            true,
+            Some(pager),
         )
     }
 
@@ -137,6 +286,7 @@ impl HeterogeneousEngine {
             token_id,
             false,
             true,
+            None,
         )
     }
 
@@ -222,6 +372,7 @@ impl HeterogeneousEngine {
         pos: u32,
         token_id: i32,
         standalone_graphs: bool,
+        pager: Option<&mut ExpertPager>,
     ) -> eyre::Result<()> {
         self.forward_layer_impl_inner(
             dgpu_scratch,
@@ -234,6 +385,7 @@ impl HeterogeneousEngine {
             token_id,
             standalone_graphs,
             false,
+            pager,
         )
     }
 
@@ -250,6 +402,7 @@ impl HeterogeneousEngine {
         token_id: i32,
         standalone_graphs: bool,
         igpu_moe_preissued: bool,
+        mut pager: Option<&mut ExpertPager>,
     ) -> eyre::Result<()> {
         let layer = dlw.layer_idx;
         if ilw.layer_idx != layer {
@@ -264,8 +417,10 @@ impl HeterogeneousEngine {
         // ffn_combine each layer (i.e. bypasses the cross-layer combined
         // graph). Required when the caller needs to observe layer-N
         // output before layer N+1 starts.
-        let is_first_layer = standalone_graphs || layer == 0;
-        let is_last_layer = standalone_graphs || next_dlw.is_none();
+        // An Engram layer must see the residual AFTER the gate+add, so it always
+        // launches its own mhc_pre_attn (and the layer before it a pure combine).
+        let is_first_layer = standalone_graphs || layer == 0 || dlw.engram.is_some();
+        let is_last_layer = standalone_graphs || next_dlw.is_none() || next_dlw.is_some_and(|n| n.engram.is_some());
 
         let serial = matches!(self.mode, ExecMode::HetSingleStream);
 
@@ -276,6 +431,24 @@ impl HeterogeneousEngine {
         // ============================================================
         self.set_current_cached(self.dgpu.device)?;
         let de = &self.dgpu;
+        if cfg!(feature = "v41") && layer == 0 {
+            // Single-pass mHC: every token's layer-0 attention collapses with
+            // the initial one-hot(copy 0) pre-mix (ARCH_SPEC §1.1).
+            dgpu_scratch.hc_pre_carry.copy_from_host_async(&super::scratch::HC_PRE_ONEHOT, &de.compute)?;
+        }
+        if let Some(eg) = dlw.engram.as_ref() {
+            // V4.1 Engram (ARCH_SPEC §1.7), applied to the residual copies before
+            // the block: staged rows → Q8 → wkv → gate + add (engram_gate_add.hip).
+            if !dgpu_scratch.engram_rows_ready {
+                return Err(eyre!("layer {layer}: Engram rows not staged (stage_engram_rows before the layer)"));
+            }
+            let _t = de.events.stage("dgpu.engram", &de.compute)?;
+            let s = &de.compute;
+            de.q8.quantize_input(s, &mut dgpu_scratch.engram_xq, &mut dgpu_scratch.engram_xscale, &dgpu_scratch.engram_rows, ENGRAM_IN)?;
+            de.q8.matvec(s, &mut dgpu_scratch.engram_kv, &eg.wkv.buffer, &dgpu_scratch.engram_xq, &dgpu_scratch.engram_xscale, ENGRAM_OUT, ENGRAM_IN)?;
+            de.engram_gate.launch(s, &mut dgpu_scratch.residual, &dgpu_scratch.engram_kv, &eg.qk, N_HC, N_EMBD, ENGRAM_OUT, N_HC * N_EMBD, RMS_EPS, 1)?;
+            dgpu_scratch.engram_rows_ready = false;
+        }
 
         // mhc_pre_attn for layer N is launched by the PREVIOUS layer's
         // combined ffn_combine→mhc_pre_attn graph, except for layer 0
@@ -301,7 +474,70 @@ impl HeterogeneousEngine {
             // negative result.
             let mhc_fused = std::env::var("MHC_FUSED")
                 .map(|v| v != "0").unwrap_or(false);
-            if mhc_fused {
+            // V4.1 single-pass mHC: run `hc_mixes` on a SIDE STREAM.
+            //
+            // ARCH_SPEC §1.1 collapses the 4 copies with the PREVIOUS sub-block's
+            // `pre` (`hc_pre_carry`), NOT with the `split` this sub-block is about
+            // to compute. So `hc_weighted` -> `rms_w` -> attention does not depend
+            // on the mixes at all; the mixes are consumed by `hc_post` (after
+            // output_proj) and by the next sub-block's collapse. That shift is the
+            // point of the V4.1 design, and running the mixes inline throws it away:
+            // measured 58.3 us/layer of mhc_pre_attn + 59.6 us/layer of mhc_pre_ffn
+            // = 4.7 ms/token sitting on the critical path in front of ~413 us/layer
+            // of q/kv/attn/output_proj that it could hide behind.
+            //
+            // The mixes are ~9.5x off their byte roofline ([24,20480] fp32 = 1.97 MB
+            // = 6.1 us at 640 GB/s) because `hc_split_sinkhorn` is 20 SEQUENTIAL
+            // 4x4 normalisation iterations — a latency chain, not a bandwidth
+            // problem. That is why MHC_FUSED lost (1 CU vs 24 WGs): fusion was the
+            // wrong axis. Don't make it faster, take it off the critical path.
+            //
+            // Ordering (host enqueue order matters — `wait_event` snapshots the
+            // event's LAST RECORD at call time and is a silent no-op if enqueued
+            // ahead of the record, see Stream::wait_event):
+            //   compute: record hc_src        (residual final)
+            //   hc:      wait hc_src; mixes -> split
+            //   compute: collapse (reads OLD carry); record hc_collapse
+            //   hc:      wait hc_collapse; carry := split[0..N_HC]; record hc_mixes
+            //   compute: wait hc_mixes before hc_post consumes `split`
+            // V41_MHC_SPLIT=0 rolls back to the inline chain.
+            if mhc_split_enabled() {
+                let hsev = &self.sync_events.layers[layer as usize];
+                hsev.hc_src_attn.record(&de.compute)?;
+                de.hc.wait_event(&hsev.hc_src_attn)?;
+                // --- Path B (side stream): hc_mixes -> split
+                self.dgpu_graphs.run("mhc_mixes_attn", layer as u32, &de.hc, |s| {
+                    de.rms_nw_mw.launch_inv_only(s, &mut dgpu_scratch.rms_nw_inv_scalar, &dgpu_scratch.residual, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
+                    let ksplit: u32 = std::env::var("F16_KSPLIT")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(HC_DIM / 1024);
+                    if ksplit > 0 {
+                        de.f16.matvec_narrow_ksplit_pre_scaled(
+                            s, &mut dgpu_scratch.mix, &dlw.hc_attn_fn.buffer,
+                            &dgpu_scratch.residual, &dgpu_scratch.rms_nw_inv_scalar,
+                            &mut dgpu_scratch.mhc_matvec_partials,
+                            HC_MIX_DIM, HC_DIM, ksplit,
+                        )?;
+                    } else {
+                        de.f16.matvec_pre_scaled(s, &mut dgpu_scratch.mix, &dlw.hc_attn_fn.buffer, &dgpu_scratch.residual, &dgpu_scratch.rms_nw_inv_scalar, HC_MIX_DIM, HC_DIM)?;
+                    }
+                    de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &dlw.hc_attn_scale, &dlw.hc_attn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
+                    Ok(())
+                })?;
+                // --- Path A (compute): collapse with the PREVIOUS carry, then norm
+                self.dgpu_graphs.run("mhc_collapse_attn", layer as u32, &de.compute, |s| {
+                    de.hc_weighted.launch(s, &mut dgpu_scratch.attn_cur, &dgpu_scratch.residual, &dgpu_scratch.hc_pre_carry, N_EMBD, N_HC)?;
+                    de.rms_w.launch_weighted(s, &mut dgpu_scratch.attn_input_norm, &dgpu_scratch.attn_cur, &dlw.attn_norm, N_EMBD, RMS_EPS)?;
+                    Ok(())
+                })?;
+                hsev.hc_collapse_attn.record(&de.compute)?;
+                // --- carry := this sub-block's pre, only after BOTH the old carry
+                //     has been read (hc_collapse) and `split` exists (hc stream).
+                de.hc.wait_event(&hsev.hc_collapse_attn)?;
+                let cur_pre = dgpu_scratch.split.slice_view(0, N_HC as usize);
+                let mut carry = dgpu_scratch.hc_pre_carry.slice_view_mut(0, N_HC as usize);
+                carry.copy_from_buffer_async(&cur_pre, &de.hc)?;
+                hsev.hc_mixes_attn.record(&de.hc)?;
+            } else if mhc_fused {
                 self.dgpu_graphs.run("mhc_pre_attn_fused", layer as u32, &de.compute, |s| {
                     de.mhc_pre_fused.launch(
                         s,
@@ -340,7 +576,7 @@ impl HeterogeneousEngine {
                         // F16_KSPLIT=N (default 16 = K-split + u128 vector
                         // loads). N=0 rolls back to legacy narrow.
                         let ksplit: u32 = std::env::var("F16_KSPLIT")
-                            .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(HC_DIM / 1024); // k_chunk ≤ 1024 (kernel LDS): 16 @4096-wide, 20 @5120
                         if ksplit > 0 {
                             de.f16.matvec_narrow_ksplit_pre_scaled(
                                 s, &mut dgpu_scratch.mix, &dlw.hc_attn_fn.buffer,
@@ -354,7 +590,16 @@ impl HeterogeneousEngine {
                     }
                 }
                 de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &dlw.hc_attn_scale, &dlw.hc_attn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
-                de.hc_weighted.launch(s, &mut dgpu_scratch.attn_cur, &dgpu_scratch.residual, &dgpu_scratch.split, N_EMBD, N_HC)?;
+                if cfg!(feature = "v41") {
+                    // Single-pass mHC (ARCH_SPEC §1.1): collapse with the PREVIOUS
+                    // sub-block's pre, then carry this sub-block's pre forward.
+                    de.hc_weighted.launch(s, &mut dgpu_scratch.attn_cur, &dgpu_scratch.residual, &dgpu_scratch.hc_pre_carry, N_EMBD, N_HC)?;
+                    let cur_pre = dgpu_scratch.split.slice_view(0, N_HC as usize);
+                    let mut carry = dgpu_scratch.hc_pre_carry.slice_view_mut(0, N_HC as usize);
+                    carry.copy_from_buffer_async(&cur_pre, s)?;
+                } else {
+                    de.hc_weighted.launch(s, &mut dgpu_scratch.attn_cur, &dgpu_scratch.residual, &dgpu_scratch.split, N_EMBD, N_HC)?;
+                }
                 // RMS_W_MW=1 enables multi-WG weighted RMS. Default OFF: at
                 // N_EMBD=4096 the single-WG version is small enough that
                 // multi-WG's extra kernel launch erases any parallelism
@@ -388,13 +633,23 @@ impl HeterogeneousEngine {
         static QKV_GRAPH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::var("DECODE_QKV_GRAPH").map(|v| v != "0").unwrap_or(true)
         });
-        if *QKV_GRAPH && !standalone_graphs {
+        // V4.1 takes the unfused chain: `kv_post_fused` bakes V4-Flash's window
+        // quantisation (E4M3 over the 448 non-RoPE dims, block 64); V4.1 quantises
+        // the whole post-RoPE row at block 32 (ARCH_SPEC §1.2). Fusing that is an
+        // M7 item (needs a device-slot kv_append for graph capture).
+        if *QKV_GRAPH && !standalone_graphs && !cfg!(feature = "v41") {
             self.dgpu_graphs.run("qkv_chain", layer as u32, &de.compute, |s| {
                 de.q8.quantize_input(s, &mut dgpu_scratch.xq_n_embd, &mut dgpu_scratch.xscale_n_embd, &dgpu_scratch.attn_input_norm, N_EMBD)?;
                 super::dispatch::dense_matvec(de, s, &mut dgpu_scratch.qr, &dlw.attn_q_a, &dgpu_scratch.attn_input_norm, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_LORA_Q, N_EMBD)?;
                 de.rms_w.launch_weighted_quantize_q8(s, &mut dgpu_scratch.qr_normed, &mut dgpu_scratch.qr_xq, &mut dgpu_scratch.qr_xscale, &dgpu_scratch.qr, &dlw.q_a_norm, N_LORA_Q, RMS_EPS)?;
                 de.q8.matvec(s, &mut dgpu_scratch.q, &dlw.attn_q_b.buffer, &dgpu_scratch.qr_xq, &dgpu_scratch.qr_xscale, Q_FLAT, N_LORA_Q)?;
-                de.rms_nw.launch(s, &mut dgpu_scratch.q_normed, &dgpu_scratch.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
+                if cfg!(feature = "v41") {
+                    // V4.1 has no per-head q RMSNorm after wq_b (ARCH_SPEC §1.2: q = wq_b(qr); rope);
+                    // keep the buffer flow, skip the norm.
+                    dgpu_scratch.q_normed.copy_from_buffer_async(&dgpu_scratch.q, s)?;
+                } else {
+                    de.rms_nw.launch(s, &mut dgpu_scratch.q_normed, &dgpu_scratch.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
+                }
                 de.rope.launch_forward_pdev(s, &mut dgpu_scratch.q_normed, &dgpu_scratch.pos_dev, N_HEAD, N_HEAD_DIM, N_ROT, &dlw.rope_params)?;
                 de.q8.matvec(s, &mut dgpu_scratch.kv_raw, &dlw.attn_kv.buffer, &dgpu_scratch.xq_n_embd, &dgpu_scratch.xscale_n_embd, N_HEAD_DIM, N_EMBD)?;
                 // M59: fused rms+rope+fp8+f16rt+append (was 5 kernels).
@@ -429,7 +684,13 @@ impl HeterogeneousEngine {
                 // qr_normed is still written for the CSA indexer.
                 de.rms_w.launch_weighted_quantize_q8(s, &mut dgpu_scratch.qr_normed, &mut dgpu_scratch.qr_xq, &mut dgpu_scratch.qr_xscale, &dgpu_scratch.qr, &dlw.q_a_norm, N_LORA_Q, RMS_EPS)?;
                 de.q8.matvec(s, &mut dgpu_scratch.q, &dlw.attn_q_b.buffer, &dgpu_scratch.qr_xq, &dgpu_scratch.qr_xscale, Q_FLAT, N_LORA_Q)?;
-                de.rms_nw.launch(s, &mut dgpu_scratch.q_normed, &dgpu_scratch.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
+                if cfg!(feature = "v41") {
+                    // V4.1 has no per-head q RMSNorm after wq_b (ARCH_SPEC §1.2: q = wq_b(qr); rope);
+                    // keep the buffer flow, skip the norm.
+                    dgpu_scratch.q_normed.copy_from_buffer_async(&dgpu_scratch.q, s)?;
+                } else {
+                    de.rms_nw.launch(s, &mut dgpu_scratch.q_normed, &dgpu_scratch.q, N_HEAD, N_HEAD_DIM, RMS_EPS)?;
+                }
                 Ok(())
             })?;
             de.rope.launch_forward(
@@ -486,8 +747,13 @@ impl HeterogeneousEngine {
             }
             {
                 let _t = de.events.stage("k.kv_chain.fp8", &de.compute)?;
-                de.fp8
-                    .launch(&de.compute, &mut dgpu_scratch.kv_normed, N_HEAD_DIM - N_ROT)?;
+                if cfg!(feature = "v41") {
+                    // V4.1 window KV: E4M3 × 2^e per 32 over the whole row, RoPE tail included.
+                    de.fp4kv.launch_fp8_window(&de.compute, &mut dgpu_scratch.kv_normed, 1, N_HEAD_DIM)?;
+                } else {
+                    de.fp8
+                        .launch(&de.compute, &mut dgpu_scratch.kv_normed, N_HEAD_DIM - N_ROT)?;
+                }
             }
             {
                 let _t = de.events.stage("k.kv_chain.f16rt", &de.compute)?;
@@ -556,7 +822,12 @@ impl HeterogeneousEngine {
         let _parallel_pre = matches!(self.mode, ExecMode::HetParallel);
         let _sev_pre = &self.sync_events.layers[layer as usize];
 
-        if ratio > 0 {
+        // V4.1 reuse layers have no compressor weights: the store they attend
+        // over is the source layer's (moved in by `HetModelState::with_kv_source`).
+        if ratio > 0 && dlw.compressor.is_none() && ls.compressor.is_none() {
+            return Err(eyre!("L{layer}: reuse layer without its source's store (wrap the forward in HetModelState::with_kv_source)"));
+        }
+        if ratio > 0 && dlw.compressor.is_some() {
             let _t_comp = de.events.stage("dgpu.compressor", &de.compute)?;
             let _s_comp = debug_span!("compressor_dgpu", ratio).entered();
 
@@ -567,7 +838,12 @@ impl HeterogeneousEngine {
             let comp_width = cw.width;
             let pos_mod = pos % ratio;
             let row = if ratio == 4 { 4 + pos_mod } else { pos_mod };
-            {
+            if ratio == 1 {
+                // V4.1 ratio 1 (layer 20): latent = norm(wkv(x)) per token — one
+                // matvec straight into `pooled`, no gate/state/pool.
+                let _t = de.events.stage("k.compressor_d.f16_kv", &de.compute)?;
+                de.f16.matvec(&de.compute, &mut dgpu_scratch.pooled, &cw.wkv.buffer, &dgpu_scratch.attn_input_norm, comp_width, N_EMBD)?;
+            } else {
                 let _t = de.events.stage("k.compressor_d.f16_pair", &de.compute)?;
                 de.f16.matvec_pair(
                     &de.compute,
@@ -584,7 +860,7 @@ impl HeterogeneousEngine {
                 .compressor
                 .as_mut()
                 .ok_or_else(|| eyre!("L{layer}: missing compressor state"))?;
-            {
+            if ratio != 1 {
                 let _t = de.events.stage("k.compressor_d.state_write", &de.compute)?;
                 de.compressor_state_write.launch(
                     &de.compute,
@@ -600,7 +876,7 @@ impl HeterogeneousEngine {
             }
 
             if comp_fires_boundary {
-                {
+                if ratio != 1 {
                     let _t = de.events.stage("k.compressor_d.pool", &de.compute)?;
                     de.compressor_pool.launch(
                         &de.compute,
@@ -636,7 +912,12 @@ impl HeterogeneousEngine {
                     )?;
                 }
                 let packed_store = cs.comp_kv.is_fp8();
-                if !packed_store {
+                if cfg!(feature = "v41") {
+                    // V4.1: E2M1 values with one E4M3 scale per 16 over the
+                    // whole post-RoPE row (ARCH_SPEC §1.3); exact in the f16 store.
+                    let _t = de.events.stage("k.compressor_d.fp4kv", &de.compute)?;
+                    de.fp4kv.launch(&de.compute, &mut dgpu_scratch.comp_row, 1, N_HEAD_DIM)?;
+                } else if !packed_store {
                     {
                         let _t = de.events.stage("k.compressor_d.fp8", &de.compute)?;
                         de.fp8.launch(
@@ -890,12 +1171,25 @@ impl HeterogeneousEngine {
             let ics = ls.indexer_compressor.as_ref();
             // Clamp to the scratch stride (indexer_scores [MAX_KEYS],
             // indexer_allowed_bits [ceil(MAX_KEYS/32)]). Unreachable in
-            // production (ctx ≤ 4 × MAX_KEYS); FAKE_POS benches decoding
-            // past the cap used to overrun the bitmap by one word.
+            // production (the server refuses a --ctx whose
+            // `attn_max_scored_keys` exceeds MAX_KEYS); FAKE_POS benches
+            // decoding past the cap used to overrun the bitmap by one word.
             let n_index_comp = ics
                 .map(|c| c.n_comp)
                 .unwrap_or(0)
                 .min(crate::attention::ATTN_MIXED_MAX_KEYS);
+            // The sparse/top-512 indexer path is gated on `ratio == 4`, which ONLY
+            // V4-Flash has: V4.1's ratios are 1 and 2, so every V4.1 layer >= 2
+            // scores DENSELY over its whole compressed store. Widening this gate is
+            // not enough to fix that — under `v41` neither the indexer weights
+            // (`het::weights` loads `indexer`/`indexer_compressor` only at ratio 4)
+            // nor the `indexer_compressor` state (`state.rs`) exist, and V4.1's
+            // indexer is structurally different anyway (8 index-source layers
+            // 2/8/14/20/24/28/32/36 sharing one top-512 with their reuse layers,
+            // keys on the 4 kv-source layers only, plus the layer-20 hierarchical
+            // candidate pool — ARCH_SPEC §1.4/§1.5, ENGINE_PORT M5 leftover).
+            // `n_index_comp` is 0 under v41, so the condition below is false for
+            // BOTH reasons; see docs/v41/DECODE_M8_PLAN.md "Measured (2026-09-13)".
             let use_sparse = ratio == 4 && n_index_comp > INDEXER_TOP_K;
             let env_disable_sparse = std::env::var("DECODE_INDEXER")
                 .map(|v| v == "off" || v == "0").unwrap_or(false);
@@ -1079,7 +1373,14 @@ impl HeterogeneousEngine {
                 // head shadow (errors past its 512 rows — DECODE_INDEXER=off
                 // at depth is unsupported with the packed store).
                 let c = cs.expect("n_comp_full > 0 implies compressor state");
-                (Some(c.comp_kv.dense_f16(n_comp_full, &format!("L{layer} decode"))?), n_comp_full)
+                // MEASUREMENT ONLY (M8-C). `V41_ATTN_COMP_CAP=<n>` clamps the dense
+                // row count so the attention kernels do the work a WORKING top-n
+                // indexer would leave them, without the indexer existing. The output
+                // is WRONG (it attends to the oldest n rows); this exists to price
+                // the missing sparse path, never to be shipped on.
+                let cap = attn_comp_cap();
+                let n_used = if cap > 0 { n_comp_full.min(cap) } else { n_comp_full };
+                (Some(c.comp_kv.dense_f16(n_comp_full, &format!("L{layer} decode"))?), n_used)
             } else {
                 (None, 0)
             };
@@ -1201,6 +1502,12 @@ impl HeterogeneousEngine {
         // ============================================================
         let _t_mhc_post_attn = de.events.stage("dgpu.mhc_post_attn", &de.compute)?;
         let _s_mhc_post_attn = debug_span!("mhc_post_attn").entered();
+        if mhc_split_enabled() {
+            // `split` is produced on `de.hc`; this is its first consumer. By now
+            // the side stream has had q/kv/attn/output_proj (~413 us) to finish
+            // ~58 us of work, so this should be a no-wait in steady state.
+            de.compute.wait_event(&self.sync_events.layers[layer as usize].hc_mixes_attn)?;
+        }
         de.hc_post.launch_from_split(
             &de.compute,
             &mut dgpu_scratch.after_attn_hc,
@@ -1223,7 +1530,43 @@ impl HeterogeneousEngine {
         let _s_mhc_pre_ffn = debug_span!("mhc_pre_ffn").entered();
         let mhc_fused = std::env::var("MHC_FUSED")
             .map(|v| v != "0").unwrap_or(false);
-        if mhc_fused {
+        // Same side-stream split as the attention sub-block, and even more
+        // lopsided: `ffn_pre/post/comb` are not consumed until `hc_post` AFTER
+        // the MoE, which is ~2.5 ms/layer of paging and expert compute. 59.6
+        // us of mixes hides in that completely.
+        if mhc_split_enabled() {
+            let hsev = &self.sync_events.layers[layer as usize];
+            hsev.hc_src_ffn.record(&de.compute)?;
+            de.hc.wait_event(&hsev.hc_src_ffn)?;
+            self.dgpu_graphs.run("mhc_mixes_ffn", layer as u32, &de.hc, |s| {
+                de.rms_nw_mw.launch_inv_only(s, &mut dgpu_scratch.rms_nw_inv_scalar, &dgpu_scratch.after_attn_hc, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
+                let ksplit: u32 = std::env::var("F16_KSPLIT")
+                    .ok().and_then(|s| s.parse().ok()).unwrap_or(HC_DIM / 1024);
+                if ksplit > 0 {
+                    de.f16.matvec_narrow_ksplit_pre_scaled(
+                        s, &mut dgpu_scratch.mix, &dlw.hc_ffn_fn.buffer,
+                        &dgpu_scratch.after_attn_hc, &dgpu_scratch.rms_nw_inv_scalar,
+                        &mut dgpu_scratch.mhc_matvec_partials,
+                        HC_MIX_DIM, HC_DIM, ksplit,
+                    )?;
+                } else {
+                    de.f16.matvec_pre_scaled(s, &mut dgpu_scratch.mix, &dlw.hc_ffn_fn.buffer, &dgpu_scratch.after_attn_hc, &dgpu_scratch.rms_nw_inv_scalar, HC_MIX_DIM, HC_DIM)?;
+                }
+                de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &dlw.hc_ffn_scale, &dlw.hc_ffn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
+                Ok(())
+            })?;
+            self.dgpu_graphs.run("mhc_collapse_ffn", layer as u32, &de.compute, |s| {
+                de.hc_weighted.launch(s, &mut dgpu_scratch.ffn_cur, &dgpu_scratch.after_attn_hc, &dgpu_scratch.hc_pre_carry, N_EMBD, N_HC)?;
+                de.rms_w.launch_weighted(s, &mut dgpu_scratch.ffn_input_norm, &dgpu_scratch.ffn_cur, &dlw.ffn_norm, N_EMBD, RMS_EPS)?;
+                Ok(())
+            })?;
+            hsev.hc_collapse_ffn.record(&de.compute)?;
+            de.hc.wait_event(&hsev.hc_collapse_ffn)?;
+            let cur_pre = dgpu_scratch.split.slice_view(0, N_HC as usize);
+            let mut carry = dgpu_scratch.hc_pre_carry.slice_view_mut(0, N_HC as usize);
+            carry.copy_from_buffer_async(&cur_pre, &de.hc)?;
+            hsev.hc_mixes_ffn.record(&de.hc)?;
+        } else if mhc_fused {
             self.dgpu_graphs.run("mhc_pre_ffn_fused", layer as u32, &de.compute, |s| {
                 de.mhc_pre_fused.launch(
                     s,
@@ -1253,7 +1596,7 @@ impl HeterogeneousEngine {
                 _ => {
                     de.rms_nw_mw.launch_inv_only(s, &mut dgpu_scratch.rms_nw_inv_scalar, &dgpu_scratch.after_attn_hc, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
                     let ksplit: u32 = std::env::var("F16_KSPLIT")
-                        .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(HC_DIM / 1024); // k_chunk ≤ 1024 (kernel LDS): 16 @4096-wide, 20 @5120
                     if ksplit > 0 {
                         de.f16.matvec_narrow_ksplit_pre_scaled(
                             s, &mut dgpu_scratch.mix, &dlw.hc_ffn_fn.buffer,
@@ -1267,7 +1610,16 @@ impl HeterogeneousEngine {
                 }
             }
             de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &dlw.hc_ffn_scale, &dlw.hc_ffn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
-            de.hc_weighted.launch(s, &mut dgpu_scratch.ffn_cur, &dgpu_scratch.after_attn_hc, &dgpu_scratch.split, N_EMBD, N_HC)?;
+            if cfg!(feature = "v41") {
+                    // Single-pass mHC (ARCH_SPEC §1.1): collapse with the PREVIOUS
+                    // sub-block's pre, then carry this sub-block's pre forward.
+                    de.hc_weighted.launch(s, &mut dgpu_scratch.ffn_cur, &dgpu_scratch.after_attn_hc, &dgpu_scratch.hc_pre_carry, N_EMBD, N_HC)?;
+                    let cur_pre = dgpu_scratch.split.slice_view(0, N_HC as usize);
+                    let mut carry = dgpu_scratch.hc_pre_carry.slice_view_mut(0, N_HC as usize);
+                    carry.copy_from_buffer_async(&cur_pre, s)?;
+                } else {
+                    de.hc_weighted.launch(s, &mut dgpu_scratch.ffn_cur, &dgpu_scratch.after_attn_hc, &dgpu_scratch.split, N_EMBD, N_HC)?;
+                }
             if std::env::var("RMS_W_MW").map(|v| v != "0").unwrap_or(false) {
                 de.rms_nw_mw.launch_weighted(s, &mut dgpu_scratch.ffn_input_norm, &dgpu_scratch.ffn_cur, &dlw.ffn_norm, &mut dgpu_scratch.rms_nw_partials, N_EMBD, 16, RMS_EPS)?;
             } else {
@@ -1528,6 +1880,256 @@ impl HeterogeneousEngine {
         // Per-kernel event staging stays OUTSIDE the capture; the
         // event-record nodes would otherwise become part of the replayed
         // graph and corrupt the per-token harvest.
+        // Decode-path two-box split. Separate env from the prefill one so the
+        // two can be validated and rolled back independently — decode has a
+        // different assignment (all 40 layers) and a different remap discipline
+        // (LRU slots, not a dense window).
+        let decode_split_on = matches!(
+            std::env::var("V41_REMOTE_SPLIT_DECODE").as_deref(),
+            Ok("1") | Ok("on")
+        ) && self
+            .remote
+            .as_ref()
+            .and_then(|r| r.lock().ok().map(|c| c.info().owned_count(layer as u32) > 0))
+            .unwrap_or(false);
+
+        if let Some(pg) = pager.as_deref_mut() {
+            // M7 expert paging: the engine's Q8 routing diverges from the fp8
+            // dump, so page the router's ACTUAL picks (read back from d_selected)
+            // and run the MoE directly from the pager's pool — no graph capture
+            // (correctness-first; the resident graph path stays the default).
+            // dlw.hot_experts is None here, so the all-negative remap sends every
+            // routed expert to the iGPU pool and the ffn_combine adds no dGPU
+            // partial.
+            let mut sel_host = vec![0i32; N_EXPERT_USED];
+            let t_sel = std::time::Instant::now();
+            self.set_current_cached(self.dgpu.device)?;
+            de.compute.synchronize()?;
+            dgpu_scratch.d_selected.copy_to_host(&mut sel_host)?;
+            super::trace::phase::add(
+                &super::trace::phase::SEL_SYNC_NS,
+                t_sel.elapsed().as_nanos() as u64,
+            );
+            let mut ids: Vec<u32> = Vec::with_capacity(N_EXPERT_USED);
+            // Two-box split, decode path. Box 2 owns a share of EVERY layer
+            // (`all:<lo>-383`), unlike the prefill-only encoder assignment, so
+            // decode benefits on all 40 layers rather than half of them.
+            //
+            // Filtering here is what stops this box paging box 2's share — and
+            // decode is ~93% miss service, so that is the whole point. It is
+            // only safe together with `mark_remote_after_ensure` below: a
+            // filtered-out id keeps `ensure`'s default `-(e)-1`, which reads as
+            // "ours at slot e" and would compute from whatever sits in that slot.
+            // Who computes each pick?
+            //
+            // DEFAULT (static split): box 2 owns a fixed assignment declared at
+            // HELLO; the hub pages everything else from its own disk.
+            //
+            // T2-CATCHALL (`V41_T2_CATCHALL=1`, daemon `--paged`): box 2 is an LRU
+            // over ALL experts against its OWN disk, so the hub computes only what
+            // it ALREADY holds and reassigns every miss to box 2. A hub miss then
+            // costs box 2's read (<=6.3 ms, overlapped with hub compute) instead of
+            // the hub's own dm-crypt read (6.9 ms, blocking the layer). Weights
+            // never cross the link — box 2 reads its own copy.
+            let catchall = super::expert_pager::ExpertPager::t2_catchall();
+            let owns_remote: Option<Vec<bool>> = if decode_split_on {
+                if catchall {
+                    // "Not resident here" == "box 2's". Pure lookup, no paging —
+                    // EXCEPT while the pool is still filling, where a miss is a
+                    // first touch (free slot, no eviction) and worth paying once.
+                    let mut budget = pg.lru_free_slots();
+                    Some(
+                        (0..N_EXPERT)
+                            .map(|e| {
+                                if pg.is_resident(layer, e) {
+                                    return false; // ours
+                                }
+                                if budget > 0 && sel_host.contains(&(e as i32)) {
+                                    budget -= 1;
+                                    return false; // ours: page it into a free slot
+                                }
+                                true // box 2's
+                            })
+                            .collect(),
+                    )
+                } else {
+                    self.remote.as_ref().and_then(|r| {
+                        r.lock().ok().map(|c| {
+                            (0..N_EXPERT).map(|e| c.owns(layer as u32, e as i32)).collect()
+                        })
+                    })
+                }
+            } else {
+                None
+            };
+            for &sv in &sel_host {
+                if (0..N_EXPERT as i32).contains(&sv) && !ids.contains(&(sv as u32)) {
+                    if let Some(o) = owns_remote.as_ref() {
+                        if o[sv as usize] {
+                            continue;
+                        }
+                    }
+                    ids.push(sv as u32);
+                }
+            }
+            // Ship this token's activations to box 2 BEFORE the pager runs.
+            //
+            // This used to sit AFTER `ensure`, which meant box 2 idled through the
+            // whole of box 1's paging stall — measured at 37.6-39.8 ms/token of
+            // `sel_sync_us` plus the miss reads, every layer — and only then started
+            // its own work (including its OWN paging). Nothing in the submit depends
+            // on `ensure`: it needs `ffn_input_norm` (computed in pre-MoE), the
+            // router picks (already read back into `sel_host`, that is how `ids` was
+            // built) and `owns_remote`. Only `mark_remote_after_ensure` genuinely has
+            // to follow the pager, and it stays below.
+            if owns_remote.is_some() {
+                let xq_bytes = (crate::config::BLOCKS_Q8K_GATE_IN as usize)
+                    * crate::q8_k::BLOCK_Q8_K_BYTES;
+                self.dgpu.device.set_current()?;
+                self.current_device
+                    .store(self.dgpu.device.id, std::sync::atomic::Ordering::Relaxed);
+                de.q8k.launch(
+                    &de.compute,
+                    &mut dgpu_scratch.moe_xq,
+                    &dgpu_scratch.ffn_input_norm,
+                    crate::config::BLOCKS_Q8K_GATE_IN,
+                )?;
+                de.compute.synchronize()?;
+                let mut xq_host = vec![0u8; xq_bytes];
+                dgpu_scratch
+                    .moe_xq
+                    .slice_view(0, xq_bytes)
+                    .copy_to_host(&mut xq_host)?;
+                let mut ew_host = vec![0f32; N_EXPERT_USED];
+                dgpu_scratch
+                    .d_ew
+                    .slice_view(0, N_EXPERT_USED)
+                    .copy_to_host(&mut ew_host)?;
+                let t_sub = super::perfetto::now_ns();
+                let ticket = self
+                    .remote
+                    .as_ref()
+                    .ok_or_else(|| eyre!("decode split on but no remote client"))?
+                    .lock()
+                    .map_err(|_| eyre!("remote expert client mutex poisoned"))?
+                    .submit(layer as u32, 1, &xq_host, &sel_host, &ew_host, true)?;
+                if let Some(pf) = self.perfetto.as_ref() {
+                    if let Ok(pf) = pf.lock() {
+                        let _ = pf.emit_host_slice(
+                            pf.remote_uuid,
+                            &format!("decode submit L{layer}"),
+                            t_sub,
+                            super::perfetto::now_ns(),
+                        );
+                    }
+                }
+                dgpu_scratch.remote_ticket = ticket;
+            }
+            self.set_current_cached(self.igpu.device)?;
+            // d_selected is already on the iGPU (peer-pushed + selected_pushed waited
+            // above) and equals what we read back, so do NOT overwrite it — it is a
+            // view into the packed sel+ew buffer and a host copy here would clobber d_ew.
+            let t_ens = std::time::Instant::now();
+            let t_ens_ns = super::perfetto::now_ns();
+            if super::expert_pager::pager_batch_miss() {
+                pg.ensure_batched(layer, &ids)?;
+            } else {
+                pg.ensure(layer, &ids)?;
+            }
+            if let Some(pf) = self.perfetto.as_ref() {
+                if let Ok(pf) = pf.lock() {
+                    let _ = pf.emit_host_slice(
+                        pf.pager_uuid,
+                        &format!("ensure L{layer} ids={}", ids.len()),
+                        t_ens_ns,
+                        super::perfetto::now_ns(),
+                    );
+                }
+            }
+            if let Some(o) = owns_remote.as_ref() {
+                // MUST follow `ensure` and must only touch the remote entries;
+                // see the note on the method. The submit itself now runs ABOVE
+                // `ensure` so box 2 works during box 1's paging stall.
+                pg.mark_remote_after_ensure(|e| o[e as usize])?;
+            }
+            verify_routing_exactly_once(layer, &sel_host, pg.remap(), owns_remote.as_deref())?;
+            super::trace::phase::add(
+                &super::trace::phase::ENSURE_NS,
+                t_ens.elapsed().as_nanos() as u64,
+            );
+            if std::env::var("V41_PAGER_DBG").is_ok() && layer == 0 {
+                let mut rmp = vec![0i32; N_EXPERT as usize];
+                pg.remap_dev.copy_to_host(&mut rmp)?;
+                let sel_remap: Vec<i32> = ids.iter().map(|&i| rmp[i as usize]).collect();
+                eprintln!("[pager-dbg] L{layer} sel={sel_host:?} ids={ids:?} remap[sel]={sel_remap:?} cap={} misses={} | pg_gbpe={} ilw_gbpe={} pg_ubpe={} ilw_ubpe={} pg_dbpe={} ilw_dbpe={} gdt={:?} ilw_gdt={:?} ddt={:?} ilw_ddt={:?} pg_nslots={} ilw_nslots={}",
+                    crate::het::weights::dgpu_hot_cap(), pg.misses(),
+                    pg.routed.gate_bytes_per_expert, ilw.routed.gate_bytes_per_expert,
+                    pg.routed.up_bytes_per_expert, ilw.routed.up_bytes_per_expert,
+                    pg.routed.down_bytes_per_expert, ilw.routed.down_bytes_per_expert,
+                    pg.routed.gate.dtype, ilw.routed.gate.dtype,
+                    pg.routed.down.dtype, ilw.routed.down.dtype,
+                    pg.routed.n_slots, ilw.routed.n_slots);
+            }
+            // Under the two-box split the cap MUST be the full top-k. It is a
+            // per-token RANK test over resident (other-device) picks, and the
+            // kernel sends OVER-cap picks back to this device using the RAW
+            // expert id — which we deliberately did not page. A cap of 4 (the
+            // default) would therefore compute two of every six picks from
+            // whatever sits in that pool slot, silently.
+            let hot_cap_i = if decode_split_on {
+                N_EXPERT_USED as u32
+            } else {
+                crate::het::weights::dgpu_hot_cap()
+            };
+            let pg_gbpe = pg.routed.gate_bytes_per_expert as u32;
+            let pg_ubpe = pg.routed.up_bytes_per_expert as u32;
+            let pg_dbpe = pg.routed.down_bytes_per_expert as u32;
+            let gdt = pg.routed.gate.dtype;
+            let ddt = pg.routed.down.dtype;
+            // Diagnostic: V41_PAGER_RESIDENT drives the graph from the resident 384
+            // buffer with a raw-id remap (keeping hot_experts=None) to isolate the pool
+            // buffer from the hot_experts=None combine.
+            let resident_dbg = std::env::var("V41_PAGER_RESIDENT").is_ok();
+            if resident_dbg {
+                let raw: Vec<i32> = (0..N_EXPERT as i32).map(|e| -e - 1).collect();
+                pg.remap_dev.copy_from_host(&raw)?;
+            }
+            let (gbuf, ubuf, dbuf) = if resident_dbg {
+                (&ilw.routed.gate.buffer, &ilw.routed.up.buffer, &ilw.routed.down.buffer)
+            } else {
+                (&pg.routed.gate.buffer, &pg.routed.up.buffer, &pg.routed.down.buffer)
+            };
+            // Run the paged MoE through the SAME captured-graph mechanism as the
+            // resident path (a distinct key), not a bare launch: the pool + remap_dev
+            // buffers are pointer-stable, only their contents change per token, so the
+            // graph stays valid. A bare launch on ie.compute produced wrong output —
+            // the resident path's correctness depends on the graph wrapper.
+            // V41_PAGER_NOGRAPH=1: bypass graph capture and launch directly, to A/B the
+            // capture wrapper against a bare launch on ie.compute.
+            let mut paged_moe = |s: &v4flash_hip::Stream| -> eyre::Result<()> {
+                ie.q8k.launch(s, &mut igpu_scratch.d_xq_q8k, &igpu_scratch.ffn_input_norm_recv, BLOCKS_Q8K_GATE_IN)?;
+                super::dispatch::moe_gate_up_batch_hetsplit(
+                    ie, gdt, s, &mut igpu_scratch.d_mid_cat,
+                    gbuf, ubuf,
+                    &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected,
+                    &pg.remap_dev, /*mode=*/ 0, hot_cap_i, pg_gbpe, pg_ubpe,
+                    N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+                )?;
+                ie.q8k.launch(s, &mut igpu_scratch.d_midq_cat, &igpu_scratch.d_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
+                super::dispatch::moe_down_batched_hetsplit(
+                    ie, ddt, s, &mut igpu_scratch.ffn_moe,
+                    dbuf, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected,
+                    &pg.remap_dev, /*mode=*/ 0, hot_cap_i, pg_dbpe, mid_blocks_bytes as u32,
+                    N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN,
+                )?;
+                Ok(())
+            };
+            if std::env::var("V41_PAGER_NOGRAPH").is_ok() {
+                paged_moe(&ie.compute)?;
+            } else {
+                self.igpu_graphs.run("routed_moe_paged", layer as u32, &ie.compute, paged_moe)?;
+            }
+        } else {
         self.igpu_graphs.run("routed_moe", layer as u32, &ie.compute, |s| {
             ie.q8k.launch(s, &mut igpu_scratch.d_xq_q8k, &igpu_scratch.ffn_input_norm_recv, BLOCKS_Q8K_GATE_IN)?;
             if let Some(remap) = ilw.hot_remap.as_ref() {
@@ -1554,6 +2156,7 @@ impl HeterogeneousEngine {
             }
             Ok(())
         })?;
+        }
         // `selected` is not materialized on host — d_selected stays
         // device-side, peer-pushed from dGPU above.
         drop(_s_moe);
@@ -1607,6 +2210,91 @@ impl HeterogeneousEngine {
             let _t_wait = de.events.stage("dgpu.ffn_combine.wait", &de.compute)?;
             de.compute.wait_event(&sev.moe_arrived)?;
             _t_wait.end()?;
+        }
+        // Two-box split: collect box 2's partial and add it.
+        //
+        // MUST be after the `moe_arrived` wait above — `ffn_moe_recv` is the
+        // landing buffer for the iGPU's peer push, so adding before the push
+        // lands means the push overwrites the addition. (That exact mistake cost
+        // a long debug on the prefill path: the buffer visibly changed and the
+        // output was bit-identical anyway.)
+        if let Some(t) = dgpu_scratch.remote_ticket.take() {
+            let t_wait = super::perfetto::now_ns();
+            let remote = self
+                .remote
+                .as_ref()
+                .ok_or_else(|| eyre!("decode remote ticket pending but no client"))?;
+            let partial = remote
+                .lock()
+                .map_err(|_| eyre!("remote expert client mutex poisoned"))?
+                .wait(t)?;
+            if let Some(pf) = self.perfetto.as_ref() {
+                if let Ok(pf) = pf.lock() {
+                    let _ = pf.emit_host_slice(
+                        pf.remote_uuid,
+                        &format!(
+                            "decode wait L{layer} rtt={}us link={}us remote={}us",
+                            partial.rtt_us, partial.link_us(), partial.t_remote_compute_us,
+                        ),
+                        t_wait,
+                        super::perfetto::now_ns(),
+                    );
+                }
+            }
+            super::trace::phase::add(
+                &super::trace::phase::REMOTE_RTT_NS,
+                (super::perfetto::now_ns() - t_wait) as u64,
+            );
+            let src = partial.f32();
+            if src.len() != N_EMBD as usize {
+                return Err(eyre!(
+                    "L{layer}: decode remote partial has {} f32, expected {N_EMBD}",
+                    src.len()
+                ));
+            }
+            self.set_current_cached(self.dgpu.device)?;
+            dgpu_scratch
+                .remote_ffn_moe
+                .as_mut()
+                .ok_or_else(|| eyre!("decode remote partial but buffer unallocated"))?
+                .copy_from_host(src)?;
+            let rem = dgpu_scratch.remote_ffn_moe.as_ref().unwrap();
+            de.vec_add.launch(&de.compute, &mut dgpu_scratch.ffn_moe_recv, rem, N_EMBD)?;
+            remote
+                .lock()
+                .map_err(|_| eyre!("remote expert client mutex poisoned"))?
+                .recycle(partial);
+        }
+
+        // V41_PAGER_DBG: prove whether the iGPU MoE partial actually reaches the
+        // dGPU combine. Dumps |ffn_moe| (iGPU side) and |ffn_moe_recv| (dGPU side)
+        // right before ffn_combine consumes them.
+        if std::env::var("V41_PAGER_DBG").is_ok() && layer == 0 {
+            de.compute.synchronize()?;
+            self.igpu.compute.synchronize()?;
+            let n2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
+            let mut moe_i = vec![0f32; N_EMBD as usize];
+            self.set_current_cached(self.igpu.device)?;
+            igpu_scratch.ffn_moe.slice_view(0, N_EMBD as usize).copy_to_host(&mut moe_i)?;
+            self.set_current_cached(self.dgpu.device)?;
+            let mut moe_r = vec![0f32; N_EMBD as usize];
+            let mut shared = vec![0f32; N_EMBD as usize];
+            dgpu_scratch.ffn_moe_recv.slice_view(0, N_EMBD as usize).copy_to_host(&mut moe_r)?;
+            dgpu_scratch.ffn_shared.slice_view(0, N_EMBD as usize).copy_to_host(&mut shared)?;
+            self.set_current_cached(self.igpu.device)?;
+            let mut ew = vec![0f32; N_EXPERT_USED];
+            let mut sel_i = vec![0i32; N_EXPERT_USED];
+            let mut mid = vec![0f32; N_EXPERT_USED * N_FF_EXP as usize];
+            igpu_scratch.d_ew.slice_view(0, N_EXPERT_USED).copy_to_host(&mut ew)?;
+            igpu_scratch.d_selected.slice_view(0, N_EXPERT_USED).copy_to_host(&mut sel_i)?;
+            igpu_scratch.d_mid_cat.slice_view(0, mid.len()).copy_to_host(&mut mid)?;
+            let mut fin = vec![0f32; N_EMBD as usize];
+            igpu_scratch.ffn_input_norm_recv.slice_view(0, N_EMBD as usize).copy_to_host(&mut fin)?;
+            self.set_current_cached(self.dgpu.device)?;
+            eprintln!(
+                "[moe-dbg] L{layer} paged={} |ffn_moe(igpu)|={:.4e} |ffn_moe_recv(dgpu)|={:.4e} |ffn_shared|={:.4e} |d_mid_cat|={:.4e} |ffn_in_recv(igpu)|={:.4e} sel_igpu={:?}",
+                pager.is_some(), n2(&moe_i), n2(&moe_r), n2(&shared), n2(&mid), n2(&fin), sel_i
+            );
         }
         // Non-last layers launch the fused cross-layer graph (this
         // layer's ffn_combine + next layer's mhc_pre_attn) for a single
@@ -1662,7 +2350,7 @@ impl HeterogeneousEngine {
                     _ => {
                         de.rms_nw_mw.launch_inv_only(s, &mut dgpu_scratch.rms_nw_inv_scalar, &dgpu_scratch.residual_next, &mut dgpu_scratch.rms_nw_partials, HC_DIM, 16, RMS_EPS)?;
                         let ksplit: u32 = std::env::var("F16_KSPLIT")
-                            .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(HC_DIM / 1024); // k_chunk ≤ 1024 (kernel LDS): 16 @4096-wide, 20 @5120
                         if ksplit > 0 {
                             de.f16.matvec_narrow_ksplit_pre_scaled(
                                 s, &mut dgpu_scratch.mix, &next.hc_attn_fn.buffer,
@@ -1676,7 +2364,16 @@ impl HeterogeneousEngine {
                     }
                 }
                 de.hc_sinkhorn.launch(s, &mut dgpu_scratch.split, &dgpu_scratch.mix, &next.hc_attn_scale, &next.hc_attn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS)?;
-                de.hc_weighted.launch(s, &mut dgpu_scratch.attn_cur, &dgpu_scratch.residual_next, &dgpu_scratch.split, N_EMBD, N_HC)?;
+                if cfg!(feature = "v41") {
+                    // Single-pass mHC (ARCH_SPEC §1.1): collapse with the PREVIOUS
+                    // sub-block's pre, then carry this sub-block's pre forward.
+                    de.hc_weighted.launch(s, &mut dgpu_scratch.attn_cur, &dgpu_scratch.residual_next, &dgpu_scratch.hc_pre_carry, N_EMBD, N_HC)?;
+                    let cur_pre = dgpu_scratch.split.slice_view(0, N_HC as usize);
+                    let mut carry = dgpu_scratch.hc_pre_carry.slice_view_mut(0, N_HC as usize);
+                    carry.copy_from_buffer_async(&cur_pre, s)?;
+                } else {
+                    de.hc_weighted.launch(s, &mut dgpu_scratch.attn_cur, &dgpu_scratch.residual_next, &dgpu_scratch.split, N_EMBD, N_HC)?;
+                }
                 // RMS_W_MW=1 enables multi-WG weighted RMS. Default OFF: at
                 // N_EMBD=4096 the single-WG version is small enough that
                 // multi-WG's extra kernel launch erases any parallelism

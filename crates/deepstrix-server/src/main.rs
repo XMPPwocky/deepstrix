@@ -59,10 +59,14 @@ struct Args {
     /// Override with env `DEEPSTRIX_HANG_DEADLINE_MS` (env wins).
     #[arg(long, default_value_t = 60_000)]
     hang_deadline_ms: i64,
-    /// Vision-Exp mmproj GGUF (ViT + aligner). Enables image parts in
+    /// Vision tower (ViT + aligner). Enables image parts in
     /// `/v1/chat/completions`; the tower is loaded onto the iGPU at
-    /// startup and the text GGUF must carry the `<｜deepseek_image｜>`
-    /// token. Env `DEEPSTRIX_MMPROJ` is used when the flag is absent.
+    /// startup and the text vocab must carry the `<｜deepseek_image｜>`
+    /// token. V4-Flash: the Vision-Exp `mmproj-F16.gguf`. V4.1 build
+    /// (`--features v41`): the HF snapshot directory (normally the same as
+    /// `--gguf`) — the `vision.*` / `aligner.*` safetensors are read from it
+    /// directly, and the `bias_vl` routing sidecar is derived from it on
+    /// first use. Env `DEEPSTRIX_MMPROJ` is used when the flag is absent.
     /// Without either, requests with images get HTTP 400.
     #[arg(long)]
     mmproj: Option<PathBuf>,

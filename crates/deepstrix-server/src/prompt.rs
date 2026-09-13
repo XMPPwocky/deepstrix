@@ -210,6 +210,13 @@ fn special_literals(vocab: &BpeVocab, image_placeholder: Option<i32>) -> Vec<(&'
         by_name(THINK_BEGIN_TEXT, TOK_THINK_BEGIN),
         by_name(THINK_END_TEXT, TOK_THINK_END),
     ];
+    // V4.1 (prompt_v41.rs) emits these; V4-Flash's template never does, and a
+    // literal that is not in the vocab falls back to plain BPE text as before.
+    for name in [crate::prompt_v41::SYSTEM_TEXT, "<\u{ff5c}latest_reminder\u{ff5c}>"] {
+        if let Some(id) = vocab.lookup_token_id(name) {
+            v.push((name, id));
+        }
+    }
     if let Some(id) = vocab.dsml_id {
         v.push((DSML_MARKER, id));
     }
@@ -231,7 +238,7 @@ pub const THINK_END_TEXT: &str = "</think>";
 /// literal appears — and, unlike the reference, only when that literal sits in
 /// text we authored. Text accumulates ACROSS segment boundaries, so the
 /// segmentation itself never shifts a token boundary.
-fn encode_segments(vocab: &BpeVocab, segs: &[Seg], image_placeholder: Option<i32>) -> Vec<i32> {
+pub(crate) fn encode_segments(vocab: &BpeVocab, segs: &[Seg], image_placeholder: Option<i32>) -> Vec<i32> {
     let specials = special_literals(vocab, image_placeholder);
     let mut out: Vec<i32> = Vec::new();
     let mut buf = String::new();

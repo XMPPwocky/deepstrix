@@ -23,3 +23,8 @@ path = "src/bin/laguna_chat.rs"
 [[bin]]
 name = "laguna-oracle-gen"
 path = "src/bin/laguna_oracle_gen.rs"
+
+[features]
+# Model selection (non-additive!): compile for DeepSeek-V4.1-Flash instead of V4-Flash.
+# Never unify with --all-features; build V4.1 in its own CARGO_TARGET_DIR (docs/v41/ENGINE_PORT.md §0).
+v41 = ["v4flash-kernels/v41"]

@@ -130,6 +130,61 @@ impl BpeVocab {
     /// This exists for golden-vector tests that ship a trimmed vocab (a few
     /// thousand entries) instead of depending on a multi-GB model file. It is
     /// not used by any production path.
+    /// Load from a Hugging Face `tokenizer.json` (byte-level BPE): `model.vocab`
+    /// + `added_tokens` give the id table, `model.merges` the ranks (either
+    /// `"a b"` strings or `[a, b]` pairs). Token strings are stored verbatim,
+    /// exactly as `from_gguf` stores llama.cpp's `tokenizer.ggml.tokens` (for
+    /// DeepSeek V4/V4.1 the two tables are identical, id for id). `pre` selects
+    /// the pre-tokenizer as for GGUF (`"joyai-llm"` for DeepSeek V4/V4.1);
+    /// `add_bos` follows the sibling `tokenizer_config.json` when present
+    /// (V4.1's reference encoder puts the BOS text into the prompt itself).
+    pub fn from_tokenizer_json(path: impl AsRef<std::path::Path>, pre: Option<String>) -> eyre::Result<Self> {
+        let path = path.as_ref();
+        let f = std::fs::File::open(path).map_err(|e| eyre!("open {}: {e}", path.display()))?;
+        let v: serde_json::Value =
+            serde_json::from_reader(std::io::BufReader::new(f)).map_err(|e| eyre!("parse {}: {e}", path.display()))?;
+        let model = v.get("model").ok_or_else(|| eyre!("tokenizer.json: no model"))?;
+        let vocab = model
+            .get("vocab")
+            .and_then(|x| x.as_object())
+            .ok_or_else(|| eyre!("tokenizer.json: model.vocab missing"))?;
+        let mut pairs: Vec<(i32, Vec<u8>)> = vocab
+            .iter()
+            .filter_map(|(tok, id)| id.as_i64().map(|i| (i as i32, tok.as_bytes().to_vec())))
+            .collect();
+        if let Some(added) = v.get("added_tokens").and_then(|x| x.as_array()) {
+            for a in added {
+                if let (Some(id), Some(tok)) = (a.get("id").and_then(|x| x.as_i64()), a.get("content").and_then(|x| x.as_str())) {
+                    pairs.push((id as i32, tok.as_bytes().to_vec()));
+                }
+            }
+        }
+        let vocab_size = pairs.iter().map(|(id, _)| *id as usize + 1).max().unwrap_or(0);
+        let merges: Vec<Vec<u8>> = model
+            .get("merges")
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| eyre!("tokenizer.json: model.merges missing"))?
+            .iter()
+            .filter_map(|m| match m {
+                serde_json::Value::String(s) => Some(s.as_bytes().to_vec()),
+                serde_json::Value::Array(ab) if ab.len() == 2 => Some(format!("{} {}", ab[0].as_str()?, ab[1].as_str()?).into_bytes()),
+                _ => None,
+            })
+            .collect();
+        let mut vocab_obj = Self::from_sparse_parts(vocab_size, pairs, merges, pre);
+        // Sibling tokenizer_config.json: add_bos_token (V4.1: false).
+        if let Some(dir) = path.parent() {
+            if let Ok(cfg) = std::fs::read_to_string(dir.join("tokenizer_config.json")) {
+                if let Ok(c) = serde_json::from_str::<serde_json::Value>(&cfg) {
+                    if let Some(b) = c.get("add_bos_token").and_then(|x| x.as_bool()) {
+                        vocab_obj.add_bos = b;
+                    }
+                }
+            }
+        }
+        Ok(vocab_obj)
+    }
+
     pub fn from_sparse_parts(
         vocab_size: usize,
         tokens_in: impl IntoIterator<Item = (i32, Vec<u8>)>,

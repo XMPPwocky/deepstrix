@@ -89,10 +89,17 @@ fn compile(hipcc: &str, src: &Path, arch: &str, out_dir: &Path) {
         .split_whitespace()
         .map(|s| s.to_string())
         .collect();
+    // Model-select feature: the few kernels that bake model dims read these.
+    let model_flags: &[&str] = if env::var("CARGO_FEATURE_V41").is_ok() {
+        &["-DDEEPSTRIX_V41=1", "-DMHC_N_EMBD=5120", "-DMHC_HC_DIM=20480", "-DROUTER_MAX_EXPERTS=512"]
+    } else {
+        &[]
+    };
     let status = Command::new(hipcc)
         .arg("-O3")
         .arg("--genco")
         .arg(format!("--offload-arch={arch}"))
+        .args(model_flags)
         .args(&extra)
         .arg(src)
         .arg("-o")

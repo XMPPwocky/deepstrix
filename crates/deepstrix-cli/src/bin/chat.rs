@@ -599,6 +599,8 @@ fn main() -> eyre::Result<()> {
             None, // cancel
             None, // on_chunk_done
             None, // image_spans
+            None, // pager (V4-Flash keeps all experts resident; paging is the V4.1 path)
+            None, // engram_rows (V4-Flash has no Engram)
         )?;
         pos += turn_tokens.len() as u32;
         let prefill_secs = t0.elapsed().as_secs_f64();

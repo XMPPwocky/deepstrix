@@ -20,9 +20,12 @@
 //!   }
 //!   rmsnorm(post_ln)                  -> h f16
 //!   unfold (3×3, channel-major, zero pad) -> u f16 [n_llm][9216]
-//!   gemm(mm.1 +b, GELU erf)           -> a f16 [n_llm][4096]
-//!   gemm(mm.2 +b)                     -> out f32 [n_llm][4096]  --> host, place_rows
+//!   gemm(mm.1 +b, GELU erf)           -> a f16 [n_llm][text_dim]
+//!   gemm(mm.2 +b)                     -> out f32 [n_llm][text_dim]  --> host, place_rows
 //! ```
+//!
+//! `text_dim` is the loaded checkpoint's aligner width (4096 V4-Flash, 5120
+//! V4.1, `Tower::text_dim`); everything else in the pipeline is shared.
 //!
 //! Weight-format choice: the f16 weights are kept as-is (889.9 MiB on the
 //! device). On gfx1151 the fast GEMM is the RDNA3 f16 WMMA path (the tree's
@@ -67,7 +70,7 @@ use crate::layout::ImageLayout;
 use crate::mmproj::{MmprojHost, MmprojMeta, VitBlockHost};
 use crate::preprocess::PreprocessedImage;
 use crate::rope::vision_cos_sin;
-use crate::{TokenType, ALIGNER_IN, PATCH_ELEMS, TEXT_DIM, VIT_DIM, VIT_FFN, VIT_HEAD_DIM, VIT_RMS_EPS, VIT_ROPE_DIM};
+use crate::{TokenType, ALIGNER_IN, PATCH_ELEMS, VIT_DIM, VIT_FFN, VIT_HEAD_DIM, VIT_RMS_EPS, VIT_ROPE_DIM};
 
 /// Patch-embed GEMM K, zero-padded from 588 to a multiple of 32.
 pub const PATCH_K_PAD: usize = PATCH_ELEMS.div_ceil(32) * 32; // 608
@@ -103,6 +106,7 @@ pub struct MmprojDev {
 struct Workspace {
     n_cap: usize,
     llm_cap: usize,
+    text_dim: usize,
     patches16: DeviceBuffer<u16>,
     x: DeviceBuffer<f32>,
     h16: DeviceBuffer<u16>,
@@ -121,12 +125,13 @@ struct Workspace {
 }
 
 impl Workspace {
-    fn new(dev: i32, n_cap: usize, llm_cap: usize) -> eyre::Result<Self> {
+    fn new(dev: i32, n_cap: usize, llm_cap: usize, text_dim: usize) -> eyre::Result<Self> {
         let b = |len: usize| DeviceBuffer::<u16>::new(dev, len);
         let f = |len: usize| DeviceBuffer::<f32>::new(dev, len);
         Ok(Workspace {
             n_cap,
             llm_cap,
+            text_dim,
             patches16: b(n_cap * PATCH_K_PAD)?,
             x: f(n_cap * VIT_DIM)?,
             h16: b(n_cap * VIT_DIM)?,
@@ -140,14 +145,14 @@ impl Workspace {
             cos: f(n_cap * VIT_ROPE_DIM)?,
             sin: f(n_cap * VIT_ROPE_DIM)?,
             unf16: b(llm_cap * ALIGNER_IN)?,
-            al16: b(llm_cap * TEXT_DIM)?,
-            out32: f(llm_cap * TEXT_DIM)?,
+            al16: b(llm_cap * text_dim)?,
+            out32: f(llm_cap * text_dim)?,
         })
     }
 
     fn bytes(&self) -> usize {
         self.n_cap * (PATCH_K_PAD * 2 + VIT_DIM * 4 + VIT_DIM * 2 * 5 + 3 * VIT_DIM * 4 + 2 * VIT_FFN * 4 + VIT_FFN * 2 + VIT_ROPE_DIM * 8)
-            + self.llm_cap * (ALIGNER_IN * 2 + TEXT_DIM * 2 + TEXT_DIM * 4)
+            + self.llm_cap * (ALIGNER_IN * 2 + self.text_dim * 2 + self.text_dim * 4)
     }
 }
 
@@ -160,8 +165,10 @@ pub struct Tower {
     pub kernels: VitKernels,
     stream: Stream,
     ws: Option<Workspace>,
-    /// Sentinel rows (host, f32 [4096]) — START, PAD, NEWLINE, END.
+    /// Sentinel rows (host, f32 [text_dim]) — START, PAD (V4-Flash only), NEWLINE, END.
     sentinels: Sentinels,
+    /// Aligner output width = text-model hidden size (4096 / 5120).
+    text_dim: usize,
     dev_bytes: usize,
     /// Wall time of the last [`Tower::encode`] (upload → readback), ms.
     pub last_encode_ms: f64,
@@ -210,7 +217,7 @@ macro_rules! mark {
 #[derive(Clone)]
 struct Sentinels {
     start: Vec<f32>,
-    pad: Vec<f32>,
+    pad: Option<Vec<f32>>,
     newline: Vec<f32>,
     end: Vec<f32>,
 }
@@ -254,11 +261,30 @@ fn pad_patch_embd(w: &[u16]) -> Vec<u16> {
 }
 
 impl Tower {
-    /// Read `mmproj_path` and upload all weights to `device` (sets the
-    /// device current on the calling thread). ~890 MiB device + the host
-    /// copy retained in `self.host`.
+    /// Read `mmproj_path` (V4-Flash `mmproj-F16.gguf`) and upload all
+    /// weights to `device` (sets the device current on the calling thread).
+    /// ~890 MiB device + the host copy retained in `self.host`.
     pub fn load(mmproj_path: &Path, device: Device) -> eyre::Result<Tower> {
         let host = MmprojHost::load(mmproj_path)?;
+        Self::from_host(host, device)
+    }
+
+    /// Read the DeepSeek-V4.1 tower straight from the HF snapshot directory
+    /// (`vision.*` / `aligner.*` / `image_*` safetensors, bf16 → f16 at read
+    /// time, see [`crate::hf_v41`]) and upload it to `device`. ~925 MiB.
+    pub fn load_v41(model_dir: &Path, device: Device) -> eyre::Result<Tower> {
+        let host = crate::hf_v41::load_host_dir(model_dir)?;
+        Self::from_host(host, device)
+    }
+
+    /// [`Tower::load_v41`] on an already-open checkpoint (the server shares
+    /// its `V41HfWeights::raw()` handle; `config` = `inference/config.json`).
+    pub fn load_v41_from(
+        st: &v4flash_core::SafetensorsDir,
+        config: &serde_json::Value,
+        device: Device,
+    ) -> eyre::Result<Tower> {
+        let host = crate::hf_v41::load_host(st, config)?;
         Self::from_host(host, device)
     }
 
@@ -290,10 +316,12 @@ impl Tower {
             newline: host.image_newline.clone(),
             end: host.img_end.clone(),
         };
+        let text_dim = host.text_dim;
         tracing::info!(
             device = device.id,
             arch = %arch,
             gemm = ?kernels.gemm_path,
+            text_dim,
             dev_mib = tally as f64 / (1u64 << 20) as f64,
             "vision tower loaded (f16 weights on device; host copy lives until drop_host())"
         );
@@ -306,6 +334,7 @@ impl Tower {
             stream,
             ws: None,
             sentinels,
+            text_dim,
             dev_bytes: tally,
             last_encode_ms: 0.0,
             profile: std::env::var("VIT_PROFILE").map(|v| v == "1").unwrap_or(false),
@@ -316,6 +345,13 @@ impl Tower {
     /// Bytes of weights resident on the device (excludes the workspace).
     pub fn device_bytes(&self) -> usize {
         self.dev_bytes
+    }
+
+    /// Aligner output width = the text model's hidden size this tower was
+    /// trained against (4096 V4-Flash, 5120 V4.1). Rows from
+    /// [`Tower::encode_rows`] / [`Tower::place_rows`] are this wide.
+    pub fn text_dim(&self) -> usize {
+        self.text_dim
     }
 
     /// Bytes of activation workspace currently allocated.
@@ -337,19 +373,19 @@ impl Tower {
     pub fn sentinel(&self, ty: u8) -> Option<&[f32]> {
         match TokenType::from_u8(ty)? {
             TokenType::Start => Some(&self.sentinels.start),
-            TokenType::Pad => Some(&self.sentinels.pad),
+            TokenType::Pad => self.sentinels.pad.as_deref(),
             TokenType::NewLine => Some(&self.sentinels.newline),
             TokenType::End => Some(&self.sentinels.end),
             TokenType::Image => None,
         }
     }
 
-    /// Scatter aligner rows (`[n_llm_h*n_llm_w][4096]`, row-major over the
-    /// LLM grid) into the block: `[types.len()][4096]` with row `i` =
+    /// Scatter aligner rows (`[n_llm_h*n_llm_w][text_dim]`, row-major over
+    /// the LLM grid) into the block: `[types.len()][text_dim]` with row `i` =
     /// `aligner[perm[k]]` for the k-th IMAGE slot, sentinel otherwise
     /// (reference `merge_image_embeddings`; PAD covers both pad kinds).
     pub fn place_rows(&self, layout: &ImageLayout, aligner_rows: &[f32]) -> eyre::Result<Vec<f32>> {
-        place_rows_with(layout, aligner_rows, |ty| self.sentinel(ty))
+        place_rows_with(layout, aligner_rows, self.text_dim, |ty| self.sentinel(ty))
     }
 
     fn workspace(&mut self, n: usize, n_llm: usize) -> eyre::Result<&mut Workspace> {
@@ -359,12 +395,12 @@ impl Tower {
             let cap_n = self.ws.as_ref().map(|w| w.n_cap).unwrap_or(0).max(n);
             let cap_l = self.ws.as_ref().map(|w| w.llm_cap).unwrap_or(0).max(n_llm);
             self.ws = None; // free first: the iGPU workspace comes out of host RAM
-            self.ws = Some(Workspace::new(self.device.id, cap_n, cap_l).wrap_err("Tower: workspace alloc")?);
+            self.ws = Some(Workspace::new(self.device.id, cap_n, cap_l, self.text_dim).wrap_err("Tower: workspace alloc")?);
         }
         Ok(self.ws.as_mut().expect("just allocated"))
     }
 
-    /// Run the ViT + aligner on `img` and return `[layout.types.len(), 4096]`
+    /// Run the ViT + aligner on `img` and return `[layout.types.len(), text_dim]`
     /// f32 rows in block order.
     pub fn encode(&mut self, img: &PreprocessedImage, layout: &ImageLayout) -> eyre::Result<Vec<f32>> {
         let rows = self.encode_rows(img)?;
@@ -392,13 +428,14 @@ impl Tower {
         Ok(out)
     }
 
-    /// ViT + aligner only: `[n_llm_h*n_llm_w][4096]` f32, row-major over the LLM grid.
+    /// ViT + aligner only: `[n_llm_h*n_llm_w][text_dim]` f32, row-major over the LLM grid.
     pub fn encode_rows(&mut self, img: &PreprocessedImage) -> eyre::Result<Vec<f32>> {
         let t0 = Instant::now();
         let (n_h, n_w) = (img.n_vit_h as usize, img.n_vit_w as usize);
         let n = n_h * n_w;
         let (lh, lw) = (n_h.div_ceil(3), n_w.div_ceil(3));
         let n_llm = lh * lw;
+        let td = self.text_dim;
         self.device.set_current().wrap_err("Tower::encode: set_current")?;
         self.upload_inputs(img)?;
 
@@ -423,15 +460,15 @@ impl Tower {
         mark!(prof, st, "rmsnorm");
         kk.unfold(st, &mut ws.unf16, &ws.h16, n_h as u32, n_w as u32, lh as u32, lw as u32, VIT_DIM as u32).wrap_err("unfold")?;
         mark!(prof, st, "unfold");
-        kk.gemm(st, None, Some(&mut ws.al16), &ws.unf16, &dev.mm1_w, Some(&dev.mm1_b), n_llm as u32, ALIGNER_IN as u32, TEXT_DIM as u32, FLAG_GELU)
+        kk.gemm(st, None, Some(&mut ws.al16), &ws.unf16, &dev.mm1_w, Some(&dev.mm1_b), n_llm as u32, ALIGNER_IN as u32, td as u32, FLAG_GELU)
             .wrap_err("mm.1")?;
         mark!(prof, st, "gemm_mm1");
-        kk.gemm(st, Some(&mut ws.out32), None, &ws.al16, &dev.mm2_w, Some(&dev.mm2_b), n_llm as u32, TEXT_DIM as u32, TEXT_DIM as u32, 0)
+        kk.gemm(st, Some(&mut ws.out32), None, &ws.al16, &dev.mm2_w, Some(&dev.mm2_b), n_llm as u32, td as u32, td as u32, 0)
             .wrap_err("mm.2")?;
         mark!(prof, st, "gemm_mm2");
         st.synchronize().wrap_err("Tower::encode: synchronize")?;
-        let mut out = vec![0f32; n_llm * TEXT_DIM];
-        ws.out32.slice_view(0, n_llm * TEXT_DIM).copy_to_host(&mut out)?;
+        let mut out = vec![0f32; n_llm * td];
+        ws.out32.slice_view(0, n_llm * td).copy_to_host(&mut out)?;
         mark!(prof, st, "d2h");
         self.stage_ms = prof.map(|p| std::mem::take(&mut p.stages)).unwrap_or_default();
         self.last_encode_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -508,27 +545,28 @@ impl Tower {
 pub fn place_rows_with<'a>(
     layout: &ImageLayout,
     aligner_rows: &[f32],
+    text_dim: usize,
     sentinel: impl Fn(u8) -> Option<&'a [f32]>,
 ) -> eyre::Result<Vec<f32>> {
     let n_rows = layout.n_llm_h as usize * layout.n_llm_w as usize;
-    if aligner_rows.len() != n_rows * TEXT_DIM {
-        return Err(eyre!("place_rows: aligner rows len {} != {}x{}", aligner_rows.len(), n_rows, TEXT_DIM));
+    if aligner_rows.len() != n_rows * text_dim {
+        return Err(eyre!("place_rows: aligner rows len {} != {}x{}", aligner_rows.len(), n_rows, text_dim));
     }
-    let mut out = vec![0f32; layout.types.len() * TEXT_DIM];
+    let mut out = vec![0f32; layout.types.len() * text_dim];
     let mut k = 0usize;
     for (i, &ty) in layout.types.iter().enumerate() {
-        let dst = &mut out[i * TEXT_DIM..(i + 1) * TEXT_DIM];
+        let dst = &mut out[i * text_dim..(i + 1) * text_dim];
         if ty == TokenType::Image as u8 {
             let r = *layout.perm.get(k).ok_or_else(|| eyre!("place_rows: perm shorter than IMAGE slots"))? as usize;
             if r >= n_rows {
                 return Err(eyre!("place_rows: perm[{k}] = {r} out of range {n_rows}"));
             }
-            dst.copy_from_slice(&aligner_rows[r * TEXT_DIM..(r + 1) * TEXT_DIM]);
+            dst.copy_from_slice(&aligner_rows[r * text_dim..(r + 1) * text_dim]);
             k += 1;
         } else {
             let s = sentinel(ty).ok_or_else(|| eyre!("place_rows: no sentinel for type {ty}"))?;
-            if s.len() != TEXT_DIM {
-                return Err(eyre!("place_rows: sentinel len {}", s.len()));
+            if s.len() != text_dim {
+                return Err(eyre!("place_rows: sentinel len {} != text_dim {text_dim}", s.len()));
             }
             dst.copy_from_slice(s);
         }
@@ -542,7 +580,27 @@ pub fn place_rows_with<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::layout_for_grid;
+    use crate::layout::{layout_for_grid, layout_for_grid_cfg};
+    use crate::{VisionCfg, TEXT_DIM};
+
+    /// V4.1 flat layout: rows land in reading order between the three sentinels;
+    /// a PAD sentinel is never asked for.
+    #[test]
+    fn place_rows_v41_flat_reading_order() {
+        const TD: usize = 8;
+        let layout = layout_for_grid_cfg(5, 4, 11, &VisionCfg::V41); // 2x2 LLM grid
+        assert_eq!(layout.types.len(), 2 * 3 + 2);
+        let aligner: Vec<f32> = (0..4 * TD).map(|i| (i / TD) as f32 + 100.0).collect();
+        let sent = |ty: u8| -> Option<&'static [f32]> {
+            static S: [[f32; TD]; 5] = [[0.0; TD], [f32::NAN; TD], [f32::NAN; TD], [3.0; TD], [4.0; TD]];
+            if ty == 1 || ty == 2 { None } else { Some(&S[ty as usize]) }
+        };
+        let out = place_rows_with(&layout, &aligner, TD, sent).unwrap();
+        let got: Vec<f32> = (0..layout.types.len()).map(|i| out[i * TD]).collect();
+        assert_eq!(got, vec![0.0, 100.0, 101.0, 3.0, 102.0, 103.0, 3.0, 4.0]);
+        // Width mismatch is an error, not a silent stride bug.
+        assert!(place_rows_with(&layout, &aligner, TD + 1, sent).is_err());
+    }
 
     #[test]
     fn place_rows_scatters_by_perm() {
@@ -555,7 +613,7 @@ mod tests {
             static S: [[f32; TEXT_DIM]; 5] = [[0.0; TEXT_DIM], [1.0; TEXT_DIM], [f32::NAN; TEXT_DIM], [3.0; TEXT_DIM], [4.0; TEXT_DIM]];
             if ty == 2 { None } else { Some(&S[ty as usize]) }
         };
-        let out = place_rows_with(&layout, &aligner, sent).unwrap();
+        let out = place_rows_with(&layout, &aligner, TEXT_DIM, sent).unwrap();
         assert_eq!(out.len(), layout.types.len() * TEXT_DIM);
         // Block: PAD PAD PAD START | (r0c0 r1c0 r0c1 r1c1 NL NL) | PAD PAD END
         let expect: Vec<f32> = vec![1.0, 1.0, 1.0, 0.0, 100.0, 102.0, 101.0, 103.0, 3.0, 3.0, 1.0, 1.0, 4.0];

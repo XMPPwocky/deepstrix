@@ -29,3 +29,11 @@ external/ds4-dump/quants-selftest
 
 # Per-session Claude Code local config (not source)
 .claude/
+
+# Alternate cargo target dirs (the v41 build uses CARGO_TARGET_DIR=target-v41).
+# 2.2 GB of build artifacts — never committed.
+/target-*/
+
+# Server/daemon logs and perfetto captures: regenerable, and large.
+/logs/
+/traces/

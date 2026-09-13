@@ -79,7 +79,14 @@ impl EventPool {
                 pairs: Vec::with_capacity(capacity / 2),
             }),
             label,
-            enabled: std::cell::Cell::new(false),
+            // DEEPSTRIX_TOKEN_PROFILE=1 turns per-kernel event timing on without
+            // attaching a perfetto exporter. Until 2026-09-13 the ONLY switch was
+            // `attach_perfetto`, so every `het.token.summary` ever logged by the
+            // server (and every one on the paged decode path) read
+            // `dgpu_busy_us=0 igpu_busy_us=0` — the decode chain had never been
+            // profiled end to end. Costs a pair of hipEventRecord per stage
+            // (~100 us/layer, M20), so it stays opt-in.
+            enabled: std::cell::Cell::new(token_profile()),
         })
     }
 
@@ -236,6 +243,47 @@ impl<'a> Drop for StageScope<'a> {
     }
 }
 
+/// `DEEPSTRIX_TOKEN_PROFILE=1`: enable HIP event timing on every EventPool and
+/// emit the per-stage rollup + host phase breakdown at INFO each token.
+pub fn token_profile() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("DEEPSTRIX_TOKEN_PROFILE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+    });
+    *ON
+}
+
+/// Host-side phase accumulators for the PAGED decode path.
+///
+/// The device EventPools cover kernels; these cover the host work the paged path
+/// interposes between them — the per-layer `synchronize()` + `d_selected`
+/// readback, and `ExpertPager::ensure` (LRU bookkeeping + miss service + the
+/// synchronous `remap_dev` H2D). Reset at token start, read at token end.
+pub mod phase {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub static SEL_SYNC_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ENSURE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ENGRAM_STAGE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Wall time from remote submit to the partial landing. Aggregate only —
+    /// the OVERLAP question needs the `remote.submit`/`remote.wait` perfetto
+    /// host tracks, because this counter looks identical whether the round
+    /// trip hid under local compute or serialised in front of it.
+    pub static REMOTE_RTT_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn reset() {
+        SEL_SYNC_NS.store(0, Relaxed);
+        ENSURE_NS.store(0, Relaxed);
+        ENGRAM_STAGE_NS.store(0, Relaxed);
+        REMOTE_RTT_NS.store(0, Relaxed);
+    }
+    pub fn add(c: &AtomicU64, ns: u64) {
+        c.fetch_add(ns, Relaxed);
+    }
+    pub fn get(c: &AtomicU64) -> u64 {
+        c.load(Relaxed)
+    }
+}
+
 /// Per-token timing summary, emitted at INFO once the token's events
 /// have been harvested.
 #[derive(Debug, Default, Clone)]
@@ -247,6 +295,20 @@ pub struct TokenTiming {
     pub dgpu_idle_us: u64,
     pub igpu_idle_us: u64,
     pub peer_bytes: u64,
+    /// Host wall in the token loop before the final sync, and the sync itself.
+    pub host_us: u64,
+    pub sync_us: u64,
+    /// Paged-path host phases (0 on the resident path).
+    pub sel_sync_us: u64,
+    pub pager_ensure_us: u64,
+    /// Of `pager_ensure_us`: the miss path's host read and its H2D copies.
+    pub pager_read_us: u64,
+    pub pager_h2d_us: u64,
+    pub pager_misses: u64,
+    /// Two-box split: host wall from remote submit to the partial landing.
+    /// Overlapped work, so this is NOT additive with the rest — compare it
+    /// against `total_us` to see whether the round trip is hidden.
+    pub remote_rtt_us: u64,
 }
 
 impl TokenTiming {
@@ -259,6 +321,14 @@ impl TokenTiming {
             dgpu_idle_us = self.dgpu_idle_us,
             igpu_idle_us = self.igpu_idle_us,
             peer_bytes = self.peer_bytes,
+            host_us = self.host_us,
+            sync_us = self.sync_us,
+            remote_rtt_us = self.remote_rtt_us,
+            sel_sync_us = self.sel_sync_us,
+            pager_ensure_us = self.pager_ensure_us,
+            pager_read_us = self.pager_read_us,
+            pager_h2d_us = self.pager_h2d_us,
+            pager_misses = self.pager_misses,
             "het.token.summary"
         );
     }

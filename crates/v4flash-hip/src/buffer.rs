@@ -25,9 +25,12 @@ pub struct DeviceBuffer<T> {
 }
 
 impl<T> DeviceBuffer<T> {
-    /// Allocate `len` elements of T on the current device. Caller must
-    /// `Device::set_current` first, and pass that device's id so the
-    /// buffer knows where it lives.
+    /// Allocate `len` elements of T on `device_id`.
+    ///
+    /// `device_id` is AUTHORITATIVE: this enters a `DeviceGuard` so the allocation physically
+    /// lands on that device regardless of ambient `hipSetDevice` state, and restores the previous
+    /// current device afterwards. The recorded id therefore always matches reality, which the
+    /// copy paths rely on (they compare device ids to route local vs peer transfers).
     #[track_caller]
     pub fn new(device_id: i32, len: usize) -> eyre::Result<Self> {
         let mut raw: sys::hipDeviceptr_t = ptr::null_mut();
@@ -64,6 +67,9 @@ impl<T> DeviceBuffer<T> {
                 loc.line()
             );
         }
+        // `device_id` is authoritative — see DeviceGuard. hipMalloc binds to the CURRENT
+        // device, so without this the buffer silently lands wherever ambient state points.
+        let _guard = crate::device::Device::scoped(device_id)?;
         check_eyre(unsafe { sys::hipMalloc(&mut raw, bytes) }, "hipMalloc")?;
         Ok(DeviceBuffer {
             raw,
@@ -82,6 +88,17 @@ impl<T> DeviceBuffer<T> {
     /// Used for per-batch operations in M50 batched prefill: kernel
     /// wrappers take `&DeviceBuffer<T>`, so a view lets us point at
     /// `parent[offset..offset+len]` without restructuring every wrapper.
+    /// Non-owning `DeviceBuffer` view over an existing device-accessible
+    /// pointer — e.g. the pointer from `hipHostMalloc`, which on an APU is
+    /// system RAM mapped into the GPU's address space.
+    ///
+    /// # Safety
+    /// `raw` must be device-accessible from `device_id` and stay alive for
+    /// the view's lifetime. The view never frees.
+    pub unsafe fn from_raw_parts(raw: sys::hipDeviceptr_t, len: usize, device_id: i32) -> Self {
+        Self { raw, len, device_id, is_view: true, _marker: PhantomData }
+    }
+
     pub fn slice_view(&self, offset: usize, len: usize) -> Self {
         assert!(
             offset.checked_add(len).map(|e| e <= self.len).unwrap_or(false),
@@ -129,6 +146,29 @@ impl<T> DeviceBuffer<T> {
             is_view: true,
             _marker: PhantomData,
         }
+    }
+
+    /// The allocation as a host-writable byte slice.
+    ///
+    /// Only sound on a unified-memory APU, where `hipMalloc` returns a
+    /// CPU-addressable pointer (verified on gfx1151 by writing a sentinel
+    /// through `raw()` and reading it back). This is the ONE unsafe step in
+    /// the fast model-load path — callers then use ordinary safe slice APIs.
+    ///
+    /// # Safety
+    /// The caller asserts this device's allocations are CPU-addressable, and
+    /// that no GPU work touches the buffer concurrently. After writing, issue
+    /// a `SeqCst` fence before the GPU reads (see `host_write_barrier`).
+    pub unsafe fn as_host_slice_mut(&mut self) -> &mut [u8] {
+        std::slice::from_raw_parts_mut(self.raw as *mut u8, self.byte_len())
+    }
+
+    /// Publish CPU writes made through [`as_host_slice_mut`] so the GPU sees
+    /// them. On x86 a `SeqCst` fence lowers to a locked op / `mfence`, which
+    /// also drains write-combining buffers — the case that would otherwise
+    /// leave stores sitting in the core when a kernel launches.
+    pub fn host_write_barrier() {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn raw(&self) -> sys::hipDeviceptr_t {
@@ -337,6 +377,10 @@ impl<T> DeviceBuffer<T> {
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if !self.raw.is_null() && !self.is_view {
+            // `hipFree` resolves the pointer against the CURRENT device; freeing
+            // a dGPU allocation while the iGPU is current corrupts the runtime's
+            // bookkeeping. See the note on `Stream`'s Drop.
+            let _guard = crate::device::DeviceGuard::enter(self.device_id);
             let code = unsafe { sys::hipFree(self.raw) };
             if code != sys::HIP_SUCCESS {
                 tracing::warn!(code, "hipFree failed during drop");
@@ -351,14 +395,25 @@ pub struct PinnedBuffer<T> {
     len: usize,
 }
 
+/// `hipHostMalloc` flags. Non-coherent host memory is COARSE grained, so the
+/// GPU may cache it — which is what makes GPU reads out of it fast on an APU.
+/// Coherent (the default) is fine grained and typically uncached on the GPU.
+pub const HIP_HOST_MALLOC_COHERENT: u32 = 0x4000_0000;
+pub const HIP_HOST_MALLOC_NON_COHERENT: u32 = 0x8000_0000;
+
 impl<T> PinnedBuffer<T> {
     pub fn new(len: usize) -> eyre::Result<Self> {
+        Self::new_with_flags(len, 0)
+    }
+
+    /// As `new`, with explicit `hipHostMalloc` flags.
+    pub fn new_with_flags(len: usize, flags: u32) -> eyre::Result<Self> {
         let bytes = len.checked_mul(std::mem::size_of::<T>()).ok_or_else(|| {
             eyre!("PinnedBuffer size overflow: {} * {}", len, std::mem::size_of::<T>())
         })?;
         let mut raw: *mut c_void = ptr::null_mut();
         check_eyre(
-            unsafe { sys::hipHostMalloc(&mut raw, bytes, 0) },
+            unsafe { sys::hipHostMalloc(&mut raw, bytes, flags) },
             "hipHostMalloc",
         )?;
         // hipHostMalloc does not zero, so the bytes are uninitialized.
@@ -371,6 +426,13 @@ impl<T> PinnedBuffer<T> {
             raw: raw as *mut T,
             len,
         })
+    }
+
+    /// The same allocation viewed as a device pointer. `hipHostMalloc`
+    /// memory is device-accessible under ROCm's unified addressing, and on an
+    /// APU it is the very same physical RAM the iGPU reads through GTT.
+    pub fn device_ptr(&self) -> crate::sys::hipDeviceptr_t {
+        self.raw as crate::sys::hipDeviceptr_t
     }
 
     pub fn as_slice(&self) -> &[T] {

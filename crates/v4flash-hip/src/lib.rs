@@ -24,7 +24,9 @@ mod launch;
 mod module;
 mod stream;
 
-pub use buffer::{DeviceBuffer, PinnedBuffer};
+pub use buffer::{
+    DeviceBuffer, PinnedBuffer, HIP_HOST_MALLOC_COHERENT, HIP_HOST_MALLOC_NON_COHERENT,
+};
 pub use device::{Device, DeviceProperties};
 pub use error::{HipError, check, check_eyre};
 pub use event::Event;

@@ -11,7 +11,7 @@
 use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer};
 
-use crate::config::{
+use crate::config::{ENGRAM_IN, ENGRAM_OUT, 
     BLOCKS_GROUPED_OUT, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
     BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, HC_DIM, HC_MIX_DIM, INDEXER_TOP_K, N_EMBD, N_EXPERT,
     N_EXPERT_USED, N_FF_EXP, N_FF_SHARED, N_HC, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD,
@@ -19,6 +19,20 @@ use crate::config::{
 };
 use crate::attention::ATTN_MIXED_MAX_KEYS;
 use crate::q8_k::BLOCK_Q8_K_BYTES;
+
+/// One-hot(copy 0) pre-mix in `split` layout: the initial `pre_mix` of the
+/// V4.1 single-pass mHC (ARCH_SPEC §1.1), fed to layer 0's attention collapse.
+pub static HC_PRE_ONEHOT: [f32; HC_MIX_DIM as usize] = {
+    let mut a = [0.0f32; HC_MIX_DIM as usize];
+    a[0] = 1.0;
+    a
+};
+
+/// `B_MAX` rows of [`HC_PRE_ONEHOT`] for the batched (prefill) layer-0 reset.
+pub fn hc_pre_onehot_rows() -> &'static [f32] {
+    static ROWS: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    ROWS.get_or_init(|| HC_PRE_ONEHOT.repeat(super::batch_scratch::B_MAX))
+}
 
 pub struct DgpuScratch {
     // Cross-layer residual
@@ -29,6 +43,19 @@ pub struct DgpuScratch {
     pub flat: DeviceBuffer<f32>,
     pub mix: DeviceBuffer<f32>,
     pub split: DeviceBuffer<f32>,
+    /// V4.1 single-pass mHC: the PREVIOUS sub-block's pre-mix, in `split`
+    /// layout (only [0..N_HC) meaningful) so `hc_weighted` takes it as-is.
+    /// Reset to one-hot(copy 0) at layer 0 of every token; carried across
+    /// both sub-blocks of every layer; the head collapses with it (M6).
+    pub hc_pre_carry: DeviceBuffer<f32>,
+    /// V4.1 Engram (layers 1, 14): one token's dequantised rows `[ENGRAM_IN]` f32
+    /// (`stage_engram_rows`), their Q8_0 form, and the wkv output `[ENGRAM_OUT]`.
+    /// 32-element stubs when the feature is off.
+    pub engram_rows: DeviceBuffer<f32>,
+    pub engram_xq: DeviceBuffer<i8>,
+    pub engram_xscale: DeviceBuffer<f32>,
+    pub engram_kv: DeviceBuffer<f32>,
+    pub engram_rows_ready: bool,
     pub attn_cur: DeviceBuffer<f32>,
     pub attn_input_norm: DeviceBuffer<f32>,
     pub after_attn_hc: DeviceBuffer<f32>,
@@ -131,6 +158,13 @@ pub struct DgpuScratch {
     // M56 het-split: dGPU-side MoE scratch for the resident hot experts.
     // Mirrors the iGPU's d_xq_q8k / d_mid_cat / d_midq_cat / ffn_moe.
     pub moe_xq: DeviceBuffer<u8>,
+    /// Decode two-box split: request in flight on the remote shard for this
+    /// token's layer. Submitted before the local MoE graph, collected at the
+    /// combine, so the ~436 us round trip overlaps local compute.
+    pub remote_ticket: Option<crate::het::remote_experts::Ticket>,
+    /// Box 2's weighted partial for this token, `[N_EMBD]` f32.
+    pub remote_ffn_moe: Option<DeviceBuffer<f32>>,
+    pub remote_ffn_moe_valid: bool,
     pub moe_mid_cat: DeviceBuffer<f32>,
     pub moe_midq_cat: DeviceBuffer<u8>,
     pub ffn_moe_dgpu: DeviceBuffer<f32>,
@@ -195,12 +229,23 @@ impl DgpuScratch {
         // consumers agree on the layout; pack lives in the same struct.
         let d_selected = unsafe { sel_ew_pack.view_as::<i32>(0, N_EXPERT_USED) };
         let d_ew = unsafe { sel_ew_pack.view_as::<f32>(24, N_EXPERT_USED) };
+        let eg = |n: u32| -> usize { if cfg!(feature = "v41") { n as usize } else { 32 } };
         Ok(Self {
             residual: DeviceBuffer::new(device_id, HC_DIM as usize)?,
             residual_next: DeviceBuffer::new(device_id, HC_DIM as usize)?,
             flat: DeviceBuffer::new(device_id, HC_DIM as usize)?,
             mix: DeviceBuffer::new(device_id, HC_MIX_DIM as usize)?,
             split: DeviceBuffer::new(device_id, HC_MIX_DIM as usize)?,
+            engram_rows: DeviceBuffer::new(device_id, eg(ENGRAM_IN))?,
+            engram_xq: DeviceBuffer::new(device_id, eg(ENGRAM_IN))?,
+            engram_xscale: DeviceBuffer::new(device_id, eg(ENGRAM_IN / 32))?,
+            engram_kv: DeviceBuffer::new(device_id, eg(ENGRAM_OUT))?,
+            engram_rows_ready: false,
+            hc_pre_carry: {
+                let mut b = DeviceBuffer::new(device_id, HC_MIX_DIM as usize)?;
+                b.copy_from_host(&HC_PRE_ONEHOT)?;
+                b
+            },
             attn_cur: DeviceBuffer::new(device_id, N_EMBD as usize)?,
             attn_input_norm: DeviceBuffer::new(device_id, N_EMBD as usize)?,
             after_attn_hc: DeviceBuffer::new(device_id, HC_DIM as usize)?,
@@ -292,6 +337,13 @@ impl DgpuScratch {
             ffn_shared: DeviceBuffer::new(device_id, N_EMBD as usize)?,
 
             ffn_moe_recv: DeviceBuffer::new(device_id, N_EMBD as usize)?,
+            remote_ticket: None,
+            remote_ffn_moe: if std::env::var("V41_REMOTE_ADDR").is_ok() {
+                Some(DeviceBuffer::new(device_id, N_EMBD as usize)?)
+            } else {
+                None
+            },
+            remote_ffn_moe_valid: false,
             moe_xq: DeviceBuffer::new(
                 device_id,
                 (BLOCKS_Q8K_GATE_IN as usize) * BLOCK_Q8_K_BYTES,

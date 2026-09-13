@@ -209,6 +209,31 @@ impl HetCompressorState {
     }
 }
 
+impl HetModelState {
+    /// Run `f` on layer `layer` with its KV source's compressor state moved in
+    /// (V4.1 reuse layers), moving it back afterwards. A no-op wrapper when the
+    /// layer owns its store. The forward skips the compressor stage for a layer
+    /// without compressor *weights* and only reads the store.
+    pub fn with_kv_source<R>(
+        &mut self,
+        layer: usize,
+        f: impl FnOnce(&mut HetLayerState) -> eyre::Result<R>,
+    ) -> eyre::Result<R> {
+        match crate::config::kv_source_of(layer) {
+            Some(src) => {
+                debug_assert!(self.layers[layer].compressor.is_none());
+                let st = self.layers[src].compressor.take();
+                self.layers[layer].compressor = st;
+                let r = f(&mut self.layers[layer]);
+                let st = self.layers[layer].compressor.take();
+                self.layers[src].compressor = st;
+                r
+            }
+            None => f(&mut self.layers[layer]),
+        }
+    }
+}
+
 pub struct HetLayerState {
     /// SWA raw KV cache. f16-stored (see `HetCompressorState::comp_kv` rationale).
     pub kv_cache: DeviceBuffer<u16>,
@@ -283,7 +308,9 @@ impl HetModelState {
         let mut layers = Vec::with_capacity(N_LAYER as usize);
         for layer in 0..N_LAYER {
             let ratio = COMPRESS_RATIOS[layer as usize];
-            let compressor = if ratio > 0 {
+            // V4.1 reuse layers borrow their source's state at forward time
+            // (`HetModelState::with_kv_source`), so they allocate none.
+            let compressor = if ratio > 0 && crate::config::kv_source_of(layer as usize).is_none() {
                 // Attn compressor state lives on dGPU alongside attn_input_norm
                 // (no peer push needed for the boundary `comp_row` write).
                 Some(HetCompressorState::alloc(

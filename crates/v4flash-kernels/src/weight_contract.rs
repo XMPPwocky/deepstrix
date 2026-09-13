@@ -21,9 +21,9 @@
 //! tensors) keep the legacy loader behavior.
 
 use color_eyre::eyre::{self, eyre};
-use v4flash_core::gguf::{Gguf, GgufType};
+use v4flash_core::gguf::{GgufTensor, GgufType};
 
-use crate::config::{N_EMBD, N_FF_EXP, N_VOCAB};
+use crate::config::{GROUP_DIM, N_EMBD, N_EXPERT, N_FF_EXP, N_HEAD_DIM, N_LORA_Q, N_VOCAB, OUT_LOW, Q_FLAT};
 
 /// What the engine expects of one tensor role.
 #[derive(Debug, Clone, Copy)]
@@ -80,7 +80,7 @@ pub fn expectation(role: &str) -> Option<Expect> {
         // unsloth UD-IQ3_XXS blk.26 gate/up (`iq3_s_pair` family, 110 B
         // blocks; see docs/IQ3_S_KERNEL_PLAN.md).
         "blk.N.ffn_gate_exps.weight" | "blk.N.ffn_up_exps.weight" => {
-            Expect::Quant(&[IQ2_XXS, IQ2_S, IQ2_XS, IQ3_XXS, IQ3_S])
+            Expect::Quant(&[IQ2_XXS, IQ2_S, IQ2_XS, IQ3_XXS, IQ3_S, MXFP4])
         }
         "blk.N.ffn_down_exps.weight" => Expect::Quant(&[Q2_K, IQ3_XXS, MXFP4]),
         "blk.N.ffn_gate_shexp.weight" | "blk.N.ffn_up_shexp.weight" => {
@@ -121,16 +121,21 @@ fn expected_dims(role: &str) -> Option<Vec<u64>> {
     let (e, f, v) = (N_EMBD as u64, N_FF_EXP as u64, N_VOCAB as u64);
     Some(match role {
         "output.weight" | "token_embd.weight" => vec![e, v],
-        "blk.N.ffn_gate_exps.weight" | "blk.N.ffn_up_exps.weight" => vec![e, f, 256],
-        "blk.N.ffn_down_exps.weight" => vec![f, e, 256],
+        "blk.N.ffn_gate_exps.weight" | "blk.N.ffn_up_exps.weight" => vec![e, f, N_EXPERT as u64],
+        "blk.N.ffn_down_exps.weight" => vec![f, e, N_EXPERT as u64],
         "blk.N.ffn_gate_shexp.weight" | "blk.N.ffn_up_shexp.weight" => vec![e, f],
         "blk.N.ffn_down_shexp.weight" => vec![f, e],
-        "blk.N.attn_q_a.weight" => vec![e, 1024],
-        "blk.N.attn_q_b.weight" => vec![1024, 32768],
-        "blk.N.attn_kv.weight" => vec![e, 512],
-        "blk.N.attn_output_a.weight" => vec![e, 8192],
-        "blk.N.attn_output_b.weight" => vec![8192, e],
-        "blk.N.ffn_gate_inp.weight" => vec![e, 256],
+        // Expressed in the model's own constants, not literals: V4.1 widens the q
+        // LoRA rank to 1280 and N_EMBD to 5120, while attn_output_a stays
+        // [GROUP_DIM, OUT_LOW] = [4096, 8192] — which only coincidentally equalled
+        // [N_EMBD, 8192] on V4-Flash. Hardcoding those numbers rejected every V4.1
+        // checkpoint at load.
+        "blk.N.attn_q_a.weight" => vec![e, N_LORA_Q as u64],
+        "blk.N.attn_q_b.weight" => vec![N_LORA_Q as u64, Q_FLAT as u64],
+        "blk.N.attn_kv.weight" => vec![e, N_HEAD_DIM as u64],
+        "blk.N.attn_output_a.weight" => vec![GROUP_DIM as u64, OUT_LOW as u64],
+        "blk.N.attn_output_b.weight" => vec![OUT_LOW as u64, e],
+        "blk.N.ffn_gate_inp.weight" => vec![e, N_EXPERT as u64],
         _ => return None,
     })
 }
@@ -156,9 +161,9 @@ pub fn bytes_per_expert(dt: GgufType, k: u64, rows: u64) -> eyre::Result<usize> 
 /// Returns Ok(()) or ONE error carrying the full list of violations —
 /// the "clean enumerated error list" a new quant mix should fail with
 /// until its kernels exist.
-pub fn validate_model(gguf: &Gguf) -> eyre::Result<()> {
+pub fn validate_model(tensors: &[GgufTensor]) -> eyre::Result<()> {
     let mut violations: Vec<String> = Vec::new();
-    for t in gguf.tensors() {
+    for t in tensors {
         let role = role_of(&t.name);
         let allowed: &[GgufType] = if role == "token_embd.weight" {
             TOKEN_EMBD_ALLOWED

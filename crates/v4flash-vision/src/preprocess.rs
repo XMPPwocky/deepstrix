@@ -14,9 +14,9 @@ use std::io::Cursor;
 
 use color_eyre::eyre::{self, eyre, WrapErr};
 
-use crate::layout::{plan_resize, ResizePlan};
+use crate::layout::{plan_resize_cfg, ResizePlan};
 use crate::resize::{pad_contain, resize_bicubic, Rgb};
-use crate::{IMAGE_MEAN, IMAGE_STD, PAD_GRAY, PATCH, PATCH_ELEMS};
+use crate::{VisionCfg, IMAGE_MEAN, IMAGE_STD, PAD_GRAY, PATCH, PATCH_ELEMS};
 
 /// One image, ready for the ViT.
 #[derive(Debug, Clone)]
@@ -36,8 +36,8 @@ impl PreprocessedImage {
 }
 
 /// Largest decoded side (pixels) accepted by [`decode_rgb`]. The
-/// preprocessor caps the useful canvas at 384 LLM tokens, so anything
-/// beyond this is thrown away by `plan_resize` regardless.
+/// preprocessor caps the useful canvas at `max_n_token` LLM tokens (384 /
+/// 1024), so anything beyond this is thrown away by `plan_resize` regardless.
 pub const MAX_DECODE_SIDE: u32 = 16_384;
 /// Decoder allocation cap. 16384x16384 RGB8 would be 768 MiB, but a
 /// realistic photo at MAX_DECODE_SIDE on one axis is far smaller; 256 MiB
@@ -110,9 +110,15 @@ pub fn patchify(canvas: &Rgb, n_vit_h: u32, n_vit_w: u32) -> Vec<f32> {
     out
 }
 
-/// The pixel half of `load_image` on an already-decoded RGB image.
+/// The pixel half of `load_image` on an already-decoded RGB image (V4-Flash).
 pub fn preprocess_rgb(img: &Rgb) -> eyre::Result<(PreprocessedImage, ResizePlan)> {
-    let plan = plan_resize(img.h, img.w)?;
+    preprocess_rgb_cfg(img, &VisionCfg::V4_FLASH)
+}
+
+/// [`preprocess_rgb`] for either checkpoint. V4.1 (`max_wh_ratio: None`)
+/// always takes the `ImageOps.pad` branch.
+pub fn preprocess_rgb_cfg(img: &Rgb, cfg: &VisionCfg) -> eyre::Result<(PreprocessedImage, ResizePlan)> {
+    let plan = plan_resize_cfg(img.h, img.w, cfg)?;
     let canvas = if plan.plain_resize {
         resize_bicubic(img, plan.best_w, plan.best_h)?
     } else {
@@ -141,10 +147,15 @@ pub fn hash_patches(patches: &[f32]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// `image_processor.load_image` for raw PNG/JPEG bytes.
+/// `image_processor.load_image` for raw PNG/JPEG bytes (V4-Flash).
 pub fn preprocess(bytes: &[u8]) -> eyre::Result<PreprocessedImage> {
+    preprocess_cfg(bytes, &VisionCfg::V4_FLASH)
+}
+
+/// [`preprocess`] for either checkpoint.
+pub fn preprocess_cfg(bytes: &[u8], cfg: &VisionCfg) -> eyre::Result<PreprocessedImage> {
     let img = decode_rgb(bytes)?;
-    let (pre, _plan) = preprocess_rgb(&img)?;
+    let (pre, _plan) = preprocess_rgb_cfg(&img, cfg)?;
     Ok(pre)
 }
 

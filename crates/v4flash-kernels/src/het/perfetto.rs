@@ -131,6 +131,31 @@ pub struct DeviceTimingExporter {
     pub dgpu_xfer: Track,
     pub igpu_compute: Track,
     pub igpu_xfer: Track,
+    /// Host-time track uuids for the remote-expert path. These are NOT
+    /// device tracks — there is no HIP stream and no `Anchor`, because the
+    /// interesting events (submit, wait) happen on the host thread and the
+    /// remote's own compute happens on another machine.
+    ///
+    /// ONE track, not one per operation: `submit` and `wait` are strictly
+    /// sequential (submit returns, then we block), so they sequence on a
+    /// single row — and the GAP between them is precisely the window local
+    /// compute had to hide the round trip in. That gap is the measurement;
+    /// splitting the pair across two rows would render it as an alignment
+    /// exercise instead of as whitespace.
+    ///
+    /// If we ever keep several requests in flight (`RemoteExpertClient::
+    /// in_flight`), submits and waits WILL interleave and a single row stops
+    /// being expressible — at that point add one track per in-flight slot,
+    /// like a thread pool, not one per operation type.
+    pub remote_uuid: u64,
+    /// Box 2's own device timeline, merged in after shifting by
+    /// `RemoteExpertClient::clock().perfetto_shift_ns()`.
+    pub remote_device_uuid: u64,
+    /// Host-side expert paging (`ExpertPager::ensure`). Without this the decode
+    /// timeline is ~93% empty space: the SSD reads that dominate a token happen
+    /// on the host and touch no device stream, so the device tracks show idle
+    /// GPUs and the actual cost is invisible.
+    pub pager_uuid: u64,
 }
 
 impl DeviceTimingExporter {
@@ -176,11 +201,17 @@ impl DeviceTimingExporter {
             dgpu_xfer,
             igpu_compute,
             igpu_xfer,
+            remote_uuid: 0x52454d54_0000_0001,
+            remote_device_uuid: 0x52454d54_0000_0003,
+            pager_uuid: 0x50414745_0000_0001,
         };
         this.declare_track(this.dgpu_compute.uuid, "dgpu.compute (device)")?;
         this.declare_track(this.dgpu_xfer.uuid, "dgpu.xfer (device)")?;
         this.declare_track(this.igpu_compute.uuid, "igpu.compute (device)")?;
         this.declare_track(this.igpu_xfer.uuid, "igpu.xfer (device)")?;
+        this.declare_track(this.remote_uuid, "remote.expert (host)")?;
+        this.declare_track(this.remote_device_uuid, "box2.igpu (device, shifted)")?;
+        this.declare_track(this.pager_uuid, "expert pager (host)")?;
         Ok(this)
     }
 
@@ -217,6 +248,35 @@ impl DeviceTimingExporter {
     /// Emit a slice on `track` from `(start_event, end_event)`. The
     /// caller must have already ensured `end_event` has completed
     /// (e.g. via the EventPool harvest's sync on the last event).
+    /// Emit a slice from explicit HOST nanoseconds, with no `Anchor` and no
+    /// HIP events. For work whose timeline is the host thread (the remote
+    /// submit/wait pair) or another machine (box 2's device slices, already
+    /// shifted into this box's clock by `perfetto_shift_ns`).
+    ///
+    /// Unlike [`Self::emit_slice`] there is no inversion tolerance: these
+    /// timestamps come from one monotonic clock on one thread, so an
+    /// inversion is a bug in the caller rather than cross-device noise.
+    pub fn emit_host_slice(
+        &self,
+        track_uuid: u64,
+        name: &str,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> eyre::Result<()> {
+        if end_ns < start_ns {
+            return Err(eyre!(
+                "perfetto emit_host_slice: end_ns {end_ns} < start_ns {start_ns} for {name}"
+            ));
+        }
+        let begin = encode_track_event(TYPE_SLICE_BEGIN, Some(name), track_uuid);
+        let end = encode_track_event(TYPE_SLICE_END, None, track_uuid);
+        let begin_pkt = encode_packet_event(start_ns, &begin, self.seq_id);
+        let end_pkt = encode_packet_event(end_ns, &end, self.seq_id);
+        let trace = encode_trace(&[begin_pkt, end_pkt]);
+        self.writer.lock().unwrap().write_all(&trace)?;
+        Ok(())
+    }
+
     pub fn emit_slice(
         &self,
         track: &Track,
@@ -252,10 +312,91 @@ impl DeviceTimingExporter {
     }
 }
 
-fn now_ns() -> u64 {
+pub fn now_ns() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Generic multi-track exporter (M8 remote expert daemon).
+//
+// `DeviceTimingExporter` above hardcodes the hub's four dGPU+iGPU streams.
+// Box 2 has only an iGPU and also wants HOST-time application tracks (per-request
+// phases, SSD expert reads). This is the same encoder with an open track set:
+// declare tracks by uuid, emit device-time slices from HIP event pairs, or
+// host-time slices from explicit ns.
+//
+// Cross-machine merge: timestamps here are CLOCK_REALTIME on the emitting box
+// (what `now_ns` returns), so perfetto's trace processor can load box 1's and
+// box 2's files as one timeline. CLOCK_REALTIME between the boxes is only
+// NTP-accurate (100 µs - 1 ms), which is coarse against a 32 µs RTT, so the
+// remote-expert client measures the true offset by NTP's own algorithm over our
+// own link (`remote_experts::ClockSync`) and reports the exact ns to shift box
+// 2's tracks by. Give box 2's tracks distinct uuids (the BOX2_* constants in
+// remote_experts.rs) and a machine-qualified name.
+// ---------------------------------------------------------------------------
+
+/// A perfetto trace file with a caller-chosen set of tracks.
+pub struct TrackExporter {
+    writer: Mutex<File>,
+    seq_id: u32,
+}
+
+impl TrackExporter {
+    pub fn open(path: impl AsRef<std::path::Path>, seq_id: u32) -> eyre::Result<Self> {
+        let path = path.as_ref();
+        let _ = std::fs::remove_file(path);
+        let file = File::create(path)
+            .wrap_err_with(|| format!("create perfetto trace file at {}", path.display()))?;
+        Ok(Self { writer: Mutex::new(file), seq_id })
+    }
+
+    /// Declare a track. Call once per uuid before emitting on it.
+    pub fn declare(&self, uuid: u64, name: &str) -> eyre::Result<()> {
+        let td = encode_track_descriptor(uuid, name);
+        let pkt = encode_packet_descriptor(&td, self.seq_id);
+        let trace = encode_trace(&[pkt]);
+        self.writer.lock().unwrap().write_all(&trace)?;
+        Ok(())
+    }
+
+    /// A device-time track: anchors a stream's clock to host time.
+    pub fn device_track(&self, uuid: u64, name: &str, stream: &Stream, device: Device) -> eyre::Result<Track> {
+        self.declare(uuid, name)?;
+        Ok(Track { uuid, anchor: Anchor::new(stream, device)? })
+    }
+
+    /// Re-record a device track's anchor (bounds GPU/host clock drift).
+    pub fn re_anchor(&self, track: &mut Track, stream: &Stream, device: Device) -> eyre::Result<()> {
+        track.anchor = Anchor::new(stream, device)?;
+        Ok(())
+    }
+
+    /// Slice on a device track, from a HIP event pair (both must have completed).
+    pub fn emit_device_slice(&self, track: &Track, name: &str, start: &Event, end: &Event) -> eyre::Result<()> {
+        let a = track.anchor.ns_for(start)?;
+        let b = track.anchor.ns_for(end)?;
+        self.emit_span(track.uuid, name, a, b.max(a + 1))
+    }
+
+    /// Slice on any track from explicit host-time ns (CLOCK_REALTIME, see `host_now_ns`).
+    pub fn emit_span(&self, track_uuid: u64, name: &str, start_ns: u64, end_ns: u64) -> eyre::Result<()> {
+        let end_ns = if end_ns <= start_ns { start_ns + 1 } else { end_ns };
+        let begin = encode_track_event(TYPE_SLICE_BEGIN, Some(name), track_uuid);
+        let end = encode_track_event(TYPE_SLICE_END, None, track_uuid);
+        let trace = encode_trace(&[
+            encode_packet_event(start_ns, &begin, self.seq_id),
+            encode_packet_event(end_ns, &end, self.seq_id),
+        ]);
+        self.writer.lock().unwrap().write_all(&trace)?;
+        Ok(())
+    }
+}
+
+/// The clock perfetto timestamps are in (CLOCK_REALTIME ns since the epoch).
+pub fn host_now_ns() -> u64 {
+    now_ns()
 }

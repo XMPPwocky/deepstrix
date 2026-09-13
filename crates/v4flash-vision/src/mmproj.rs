@@ -60,22 +60,25 @@ pub struct VitBlockHost {
     pub ffn_down_w: Vec<u16>, // [1024][2816]
 }
 
-/// Whole mmproj on the host.
+/// Whole tower on the host (V4-Flash from the mmproj GGUF, V4.1 from the HF
+/// safetensors via [`crate::hf_v41`]). `text_dim` is 4096 / 5120.
 #[derive(Debug, Clone)]
 pub struct MmprojHost {
     pub meta: MmprojMeta,
+    /// Aligner output width (= text-model hidden size).
+    pub text_dim: usize,
     pub patch_embd_w: Vec<u16>, // [1024][588]
     pub patch_embd_b: Vec<f32>, // [1024]
     pub blocks: Vec<VitBlockHost>,
     pub post_ln: Vec<f32>, // [1024]
-    pub mm1_w: Vec<u16>,   // [4096][9216]
-    pub mm1_b: Vec<f32>,   // [4096]
-    pub mm2_w: Vec<u16>,   // [4096][4096]
-    pub mm2_b: Vec<f32>,   // [4096]
-    pub img_start: Vec<f32>,     // [4096]
-    pub img_pad: Vec<f32>,       // [4096]
-    pub img_end: Vec<f32>,       // [4096]
-    pub image_newline: Vec<f32>, // [4096]
+    pub mm1_w: Vec<u16>,   // [text_dim][9216]
+    pub mm1_b: Vec<f32>,   // [text_dim]
+    pub mm2_w: Vec<u16>,   // [text_dim][text_dim]
+    pub mm2_b: Vec<f32>,   // [text_dim]
+    pub img_start: Vec<f32>,        // [text_dim]
+    pub img_pad: Option<Vec<f32>>,  // [text_dim]; V4.1 has no PAD type
+    pub img_end: Vec<f32>,          // [text_dim]
+    pub image_newline: Vec<f32>,    // [text_dim]
 }
 
 struct Loader<'a> {
@@ -261,6 +264,7 @@ impl MmprojHost {
         }
         Ok(MmprojHost {
             meta,
+            text_dim: TEXT_DIM,
             patch_embd_w,
             patch_embd_b,
             blocks,
@@ -270,7 +274,7 @@ impl MmprojHost {
             mm2_w,
             mm2_b,
             img_start,
-            img_pad,
+            img_pad: Some(img_pad),
             img_end,
             image_newline,
         })
@@ -292,7 +296,7 @@ impl MmprojHost {
     pub fn sentinel(&self, ty: u8) -> Option<&[f32]> {
         match crate::TokenType::from_u8(ty)? {
             crate::TokenType::Start => Some(&self.img_start),
-            crate::TokenType::Pad => Some(&self.img_pad),
+            crate::TokenType::Pad => self.img_pad.as_deref(),
             crate::TokenType::Image => None,
             crate::TokenType::NewLine => Some(&self.image_newline),
             crate::TokenType::End => Some(&self.img_end),

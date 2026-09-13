@@ -455,6 +455,8 @@ fn main() -> eyre::Result<()> {
             /*cancel=*/ None,
             /*on_chunk_done=*/ None,
             /*image_spans=*/ None,
+            /*pager=*/ None,
+            /*engram_rows=*/ None,
         )?;
         let mut pos = prefill_tokens.len() as u32;
         // In substitute_eval mode, now run forward_token for the

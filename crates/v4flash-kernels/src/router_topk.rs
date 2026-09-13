@@ -16,7 +16,12 @@ const ROUTER_TOPK_PAR_GFX1151: &[u8] = include_bytes!(env!("KERNEL_ROUTER_TOPK_P
 
 /// Hard caps mirroring the kernel `#define`s. If the architecture ever
 /// changes these, both have to move in lock-step.
+/// Padded expert count = kernel block size (power of two; ids in
+/// [n_expert, MAX) are -INF-padded). Must match `-DROUTER_MAX_EXPERTS` in build.rs.
+#[cfg(not(feature = "v41"))]
 pub const ROUTER_MAX_EXPERTS: u32 = 256;
+#[cfg(feature = "v41")]
+pub const ROUTER_MAX_EXPERTS: u32 = 512;
 pub const ROUTER_MAX_USED: u32 = 8;
 
 pub struct RouterTopk {
@@ -115,7 +120,9 @@ impl RouterTopk {
         };
         let cfg = LaunchConfig {
             grid: (1, 1, 1),
-            block: (n_expert, 1, 1),
+            // The padded lanes [n_expert, MAX) must exist to write their -INF
+            // sentinels for the tree reduce (== n_expert when the model fills MAX).
+            block: (ROUTER_MAX_EXPERTS, 1, 1),
             shared_mem_bytes: 0,
         };
         launch_kernel!(function, cfg, stream, [
@@ -193,7 +200,9 @@ impl RouterTopk {
         };
         let cfg = LaunchConfig {
             grid: (b, 1, 1),
-            block: (n_expert, 1, 1),
+            // The padded lanes [n_expert, MAX) must exist to write their -INF
+            // sentinels for the tree reduce (== n_expert when the model fills MAX).
+            block: (ROUTER_MAX_EXPERTS, 1, 1),
             shared_mem_bytes: 0,
         };
         launch_kernel!(function, cfg, stream, [

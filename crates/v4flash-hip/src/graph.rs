@@ -27,6 +27,7 @@ use crate::sys;
 /// descriptor. To execute, instantiate into a [`GraphExec`].
 pub struct Graph {
     raw: sys::hipGraph_t,
+    device_id: i32,
 }
 
 // SAFETY: HIP graph handles are reference-counted on the runtime side and
@@ -40,13 +41,13 @@ impl Graph {
     pub fn new() -> eyre::Result<Self> {
         let mut raw: sys::hipGraph_t = ptr::null_mut();
         check_eyre(unsafe { sys::hipGraphCreate(&mut raw, 0) }, "hipGraphCreate")?;
-        Ok(Self { raw })
+        Ok(Self { raw, device_id: crate::device::current_device() })
     }
 
     /// Take ownership of a raw HIP graph handle (e.g. the one returned
     /// from `hipStreamEndCapture`).
     pub fn from_raw(raw: sys::hipGraph_t) -> Self {
-        Self { raw }
+        Self { raw, device_id: crate::device::current_device() }
     }
 
     pub fn raw(&self) -> sys::hipGraph_t {
@@ -98,13 +99,14 @@ impl Graph {
                 log_str
             ));
         }
-        Ok(GraphExec { raw: exec })
+        Ok(GraphExec { raw: exec, device_id: crate::device::current_device() })
     }
 }
 
 impl Drop for Graph {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            let _guard = crate::device::DeviceGuard::enter(self.device_id);
             let rc = unsafe { sys::hipGraphDestroy(self.raw) };
             if rc != sys::HIP_SUCCESS {
                 tracing::warn!(code = rc, "hipGraphDestroy failed during drop");
@@ -116,6 +118,7 @@ impl Drop for Graph {
 /// An instantiated graph ready to launch. Owns device-side resources.
 pub struct GraphExec {
     raw: sys::hipGraphExec_t,
+    device_id: i32,
 }
 
 // SAFETY: same reasoning as Graph — we serialize all use behind &mut
@@ -161,6 +164,7 @@ impl GraphExec {
 impl Drop for GraphExec {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            let _guard = crate::device::DeviceGuard::enter(self.device_id);
             let rc = unsafe { sys::hipGraphExecDestroy(self.raw) };
             if rc != sys::HIP_SUCCESS {
                 tracing::warn!(code = rc, "hipGraphExecDestroy failed during drop");

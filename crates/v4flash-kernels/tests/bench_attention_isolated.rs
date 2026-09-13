@@ -203,6 +203,7 @@ fn bench_attention_isolated() -> eyre::Result<()> {
                 &n_raw_per, &n_raw_offset_per, &n_comp_per,
                 None, // no CSA mask in isolated bench — dense path
                 n_head, head_dim, n_total, /*batch=*/1, 0,
+                v4flash_kernels::ATTN_SCORES_STRIDE.max(n_total),
             )?;
         }
         if do_b1_score {
@@ -216,6 +217,7 @@ fn bench_attention_isolated() -> eyre::Result<()> {
                 stream, out, scores, &sinks, &raw_kv, comp_kv.as_ref(),
                 &n_raw_per, &n_raw_offset_per, &n_comp_per,
                 n_head, head_dim, /*batch=*/1, 0,
+                v4flash_kernels::ATTN_SCORES_STRIDE.max(n_total),
             )?;
         }
         Ok(())
@@ -252,13 +254,15 @@ fn bench_attention_isolated() -> eyre::Result<()> {
             &raw_kv, comp_kv.as_ref(),
             &n_raw_per, &n_raw_offset_per, &n_comp_per,
             None,
-            n_head, head_dim, n_total, 1, 0)?;
+            n_head, head_dim, n_total, 1, 0,
+            v4flash_kernels::ATTN_SCORES_STRIDE.max(n_total))?;
         stream.synchronize()?;
         scores.copy_to_host(&mut s_test)?;
         attn.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(&stream, &mut out,
             &mut scores, &sinks, &raw_kv, comp_kv.as_ref(),
             &n_raw_per, &n_raw_offset_per, &n_comp_per,
-            n_head, head_dim, 1, 0)?;
+            n_head, head_dim, 1, 0,
+            v4flash_kernels::ATTN_SCORES_STRIDE.max(n_total))?;
         stream.synchronize()?;
         out.copy_to_host(&mut o_test)?;
 

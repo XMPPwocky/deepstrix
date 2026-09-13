@@ -116,6 +116,51 @@ fn bench_mhc_pre_isolated() -> eyre::Result<()> {
     let rms_n_wgs: u32 = std::env::var("BENCH_RMS_NWGS")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
 
+    // BENCH_PHASE=premix_ab: the PREFILL (batched) mHC pre-mix A/B at
+    // BENCH_B rows — `f16_matvec_narrow_batched` (grid (24, 1, B), one WG
+    // per (out-row, token), nothing shared) against `f16_gemm_wmma_lds_tiled`
+    // (X read once). Both timed back to back in this process.
+    if phase == "premix_ab" {
+        let bb: u32 = std::env::var("BENCH_B")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(512);
+        let b = bb as usize;
+        let mut x: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, b * HC_DIM as usize)?;
+        x.fill_zero()?;
+        let mut o_narrow: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, b * HC_MIX_DIM as usize)?;
+        let mut o_gemm: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, b * HC_MIX_DIM as usize)?;
+        o_narrow.fill_zero()?;
+        o_gemm.fill_zero()?;
+        eprintln!(
+            "mhc premix A/B: B={bb} M=HC_MIX_DIM={} K=HC_DIM={} (X = {:.1} MiB, W = {:.2} MiB)",
+            HC_MIX_DIM, HC_DIM,
+            (b * HC_DIM as usize * 4) as f64 / (1024.0 * 1024.0),
+            hc_fn_w_bytes as f64 / (1024.0 * 1024.0),
+        );
+        for _ in 0..warmup {
+            f16.matvec_narrow_batched(&stream, &mut o_narrow, &hc_fn_w, &x, HC_MIX_DIM, HC_DIM, bb)?;
+            f16.gemm_batched_wmma(&stream, &mut o_gemm, &hc_fn_w, &x, HC_MIX_DIM, HC_DIM, bb)?;
+        }
+        stream.synchronize()?;
+        let mut a: Vec<f32> = Vec::with_capacity(iters);
+        let mut c: Vec<f32> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let s = Event::new()?; let e = Event::new()?;
+            s.record(&stream)?;
+            f16.matvec_narrow_batched(&stream, &mut o_narrow, &hc_fn_w, &x, HC_MIX_DIM, HC_DIM, bb)?;
+            e.record(&stream)?; stream.synchronize()?;
+            a.push(Event::elapsed_ms(&s, &e)?);
+
+            let s2 = Event::new()?; let e2 = Event::new()?;
+            s2.record(&stream)?;
+            f16.gemm_batched_wmma(&stream, &mut o_gemm, &hc_fn_w, &x, HC_MIX_DIM, HC_DIM, bb)?;
+            e2.record(&stream)?; stream.synchronize()?;
+            c.push(Event::elapsed_ms(&s2, &e2)?);
+        }
+        stats(&mut a, "f16_matvec_narrow_batched");
+        stats(&mut c, "f16_gemm_wmma_lds_tiled  ");
+        return Ok(());
+    }
+
     // Warmup all kernels we'll bench.
     for _ in 0..warmup {
         if do_rms_nw { rms_nw.launch(&stream, &mut flat, &residual, 1, HC_DIM, RMS_EPS)?; }

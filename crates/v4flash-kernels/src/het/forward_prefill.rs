@@ -40,6 +40,7 @@ use super::batch_scratch::{
 use super::engine::HeterogeneousEngine;
 use super::prefill_stats::PrefillStats;
 use super::scratch::{DgpuScratch, IgpuScratch};
+use crate::config::{ENGRAM_CHUNK, ENGRAM_IN, ENGRAM_OUT};
 use super::state::{CompKvStore, HetLayerState, HetModelState, KV_CACHE_ROWS};
 use crate::comp_kv_fp8::FP8_KV_HEAD_ROWS;
 use super::sync::{peer_push_f32, peer_push_i32};
@@ -65,6 +66,65 @@ fn hot_prefill_enabled() -> bool {
 /// logit drift vs the 5e-2 oracle bound; matched caps stay ~2.5e-2).
 /// Offload cost of the cap is ~nil: with ~8 of 256 experts resident,
 /// tokens with >4 resident slots are vanishingly rare.
+/// Is the two-box split ACTIVE (phase C2+), i.e. does the local iGPU skip the
+/// remote-owned experts and consume the remote's partial at the combine?
+/// Default OFF: with it off the local side still computes every expert and the
+/// remote reply is discarded (phase C1), so numerics are untouched.
+fn remote_split_active() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(std::env::var("V41_REMOTE_SPLIT").as_deref(),
+                 Ok("1") | Ok("on") | Ok("2") | Ok("3") | Ok("4"))
+    });
+    *ON
+}
+
+/// Apply the exclusion remap (local iGPU skips remote-owned picks)?
+/// Modes 1 and 3. Mode 2 keeps an all-local remap.
+/// Hand the CED replay's DECODER-layer MoE entirely to box 2 (`V41_REPLAY_OFFLOAD=1`).
+///
+/// Separate from `V41_T2_CATCHALL` on purpose: catch-all is a DECODE-path policy,
+/// this is a PREFILL-path one, and they have different capacity preconditions.
+/// Box 2's per-layer decoder capacity must be >= the replay union (162 at B=128,
+/// measured) or `ensure_layer` cannot make the layer resident for one dispatch.
+/// Tying the two together makes a box-2 spec sized for decode silently fail prefill.
+fn replay_offload_enabled() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_REPLAY_OFFLOAD").map(|v| v != "0").unwrap_or(false)
+    });
+    *B
+}
+
+fn remote_exclude() -> bool {
+    static E: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(std::env::var("V41_REMOTE_SPLIT").as_deref(), Ok("1") | Ok("on") | Ok("3"))
+    });
+    *E
+}
+
+/// Add the remote partial at the combine? Mode 1 only.
+///
+/// The 2/3 split exists to separate the two halves of the change: mode 3
+/// EXCLUDES but does not ADD, so its error is purely "contributions missing",
+/// while mode 1's extra error over mode 3 is purely "what the partial added".
+/// Comparing 1 vs 3 vs 2 says which half is broken without guessing.
+fn remote_add_partial() -> bool {
+    static A: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(std::env::var("V41_REMOTE_SPLIT").as_deref(), Ok("1") | Ok("on") | Ok("4"))
+    });
+    *A
+}
+
+/// `V41_REMOTE_SPLIT=2`: take the het-split dispatch with an ALL-LOCAL remap and
+/// do NOT add the remote partial. Arithmetically identical to the control, so it
+/// isolates "does handing the dispatch a remap change the maths at all?" from
+/// "is the exclusion/combine balance right?".
+fn remote_split_dryrun() -> bool {
+    static D: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(std::env::var("V41_REMOTE_SPLIT").as_deref(), Ok("2"))
+    });
+    *D
+}
+
 fn hot_prefill_cap() -> u32 {
     static CAP: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
         if crate::het::weights::igpu_dedup_hot() {
@@ -139,6 +199,82 @@ fn check_scratch_rows(
 /// Per-row visibility for a batch, or `None` when no span touches it (the
 /// all-text fast path, bit-identical to the pre-vision code). Errors if a
 /// span straddles the batch — see `image_spans::rows_visibility`.
+/// M7 CED: mode of one batched layer call under V4.1 Causal Encoder-Decoder
+/// prefill (tech report §2.2 / §3.2.2, docs/v41/ENGINE_PORT.md "M7 CED").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CedMode {
+    /// The exact all-stage layer (what the reference forward runs everywhere).
+    Exact,
+    /// The decoder's Full-mode layer (`CED_DECODER_START`) over encoder-only
+    /// prompt rows: mHC pre-mix + attn norm + the global-KV projection into
+    /// the shared store, nothing else (no window KV, attention, MoE, and no
+    /// carry update — the residual/carry entering the layer are left as-is).
+    KvSourceOnly,
+    /// The same layer over the bounded-replay segment: the store already holds
+    /// these positions (written by `KvSourceOnly`), so the projection is
+    /// skipped and the causal comp counts are positional (like a reuse
+    /// layer); every other stage runs.
+    Replay,
+}
+
+/// `V41_CED` (default on under the `v41` feature): encoder-only prefill +
+/// Decoder SWA Bounded Replay in `forward_prefill_pipelined` (last-token
+/// path). `V41_CED=0` restores the exact all-40-layer prefill.
+pub fn ced_enabled() -> bool {
+    cfg!(feature = "v41") && std::env::var("V41_CED").map(|v| v != "0").unwrap_or(true)
+}
+
+/// `V41_ENGRAM_GEMV=1` puts the Engram `wkv` prefill projection back on the
+/// `grid.z = batch` Q8 GEMV (see the call site for why it is 65x over
+/// roofline). Rollback knob only.
+fn engram_gemv_fallback() -> bool {
+    std::env::var("V41_ENGRAM_GEMV").map(|v| v != "0").unwrap_or(false)
+}
+
+/// `V41_SWA_MIXED=0` puts the ratio-0 layers (V4.1 layers 0 and 1) back on
+/// `attention_swa_batched`. See the call site: that kernel runs ~1150
+/// `__syncthreads` per workgroup and measured 16.2 ms per 512-row call on
+/// V4-Flash at the identical shape, ~78x its own roofline. The batched WMMA
+/// score + softmax-wsum pair computes the same thing with `comp_kv = None`
+/// and per-row `n_comp = 0` (`attention_mixed.hip`: "when n_comp == 0 and
+/// mask is null, the math reduces exactly to attention_swa").
+fn swa_via_mixed() -> bool {
+    cfg!(feature = "v41")
+        && std::env::var("V41_SWA_MIXED").map(|v| v != "0").unwrap_or(true)
+}
+
+/// `V41_MHC_NARROW=1` puts the mHC pre-mix back on `f16_matvec_narrow_batched`.
+/// That kernel is grid `(HC_MIX_DIM=24, 1, B)` with one workgroup per
+/// (out-row, token) and nothing shared between them: at B=512 / HC_DIM=20480
+/// its 12,288 workgroups each read an 80 KB activation row and a 40 KB weight
+/// row = 1.47 GB of L2/MALL traffic for 42 MB of unique bytes (V4-Flash
+/// measured 559 us per call at the narrower 16384 dim, 2.1 TB/s = the MALL
+/// wall). `f16_gemm_wmma_lds_tiled` reads X once. Rollback knob only.
+fn mhc_narrow_fallback() -> bool {
+    std::env::var("V41_MHC_NARROW").map(|v| v != "0").unwrap_or(false)
+}
+
+
+/// One prompt row entering the decoder (`CED_DECODER_START`), kept on the host
+/// for the bounded replay: token id, residual `[HC_DIM]`, mHC carry
+/// `[HC_MIX_DIM]`.
+struct ReplayRow {
+    tok: i32,
+    hc: Vec<f32>,
+    carry: Vec<f32>,
+}
+
+/// `V41_PREFILL_LOGITS_DUMP=<path>`: append the last-token prefill logits
+/// (raw f32 LE, `N_VOCAB` per call) — the CED-vs-exact bit-equality gate.
+fn dump_prefill_logits(logits: &[f32]) -> eyre::Result<()> {
+    let Ok(path) = std::env::var("V41_PREFILL_LOGITS_DUMP") else { return Ok(()) };
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+    f.write_all(&bytes)?;
+    Ok(())
+}
+
 fn chunk_visibility(pos0: u32, b: usize, spans: &[ImageSpan]) -> eyre::Result<Option<Vec<(u32, u32)>>> {
     if spans.is_empty() {
         return Ok(None);
@@ -165,9 +301,11 @@ impl HeterogeneousEngine {
     /// Stateful per-token kernels (rope, kv_append, compressor, attn,
     /// iGPU MoE) loop in a serial inner B loop using `slice_view`.
     ///
-    /// After return, `batch_dgpu.residual` (or `residual_next` if the
-    /// model layer count is odd — V4-Flash has 43, so `residual` after
-    /// post-loop swap holds it) contains per-token post-last-layer HC.
+    /// After return, `batch_dgpu.residual` contains per-token
+    /// post-last-layer HC: every layer writes `residual_next` and is
+    /// followed by one swap, so the output is in `residual` for any layer
+    /// count (only the *physical* buffer alternates with parity, which
+    /// matters for graph capture in decode, not here).
     /// Does NOT compute logits / head — the caller picks which batch
     /// element(s) to feed `forward_head`.
     #[allow(clippy::too_many_arguments)]
@@ -188,6 +326,9 @@ impl HeterogeneousEngine {
         // don't touch this chunk are ignored). A span that straddles the
         // chunk is an error. `None` == text-only (bit-identical to before).
         image_spans: Option<&[ImageSpan]>,
+        // M7 expert pager: when Some, this layer's experts are paged out of its
+        // pool instead of read from the (placeholder) resident buffers.
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
     ) -> eyre::Result<()> {
         let b = tokens.len();
         if b == 0 {
@@ -240,19 +381,20 @@ impl HeterogeneousEngine {
         //    the swap here for clarity, mirroring forward_token's per-
         //    layer swap).
         for layer in 0..N_LAYER as usize {
-            self.forward_layer_batch_v2(
+            state.with_kv_source(layer, |ls| self.forward_layer_batch_v2(
                 batch_dgpu,
                 batch_igpu,
                 sd,
                 si,
-                &mut state.layers[layer],
+                ls,
                 &weights.dgpu_layers[layer],
                 &weights.igpu_layers[layer],
                 pos0,
                 tokens,
                 vis.as_deref(),
                 stats.as_deref_mut(),
-            )?;
+            pager.as_deref_mut(),
+))?;
             // Swap residual / residual_next for the next layer: the
             // layer wrote residual_next; next layer reads residual.
             std::mem::swap(&mut batch_dgpu.residual, &mut batch_dgpu.residual_next);
@@ -301,14 +443,57 @@ impl HeterogeneousEngine {
         tokens: &[i32],
         pos0: u32,
         stats: Option<&mut PrefillStats>,
+        image_spans: Option<&[ImageSpan]>,
+        pager: Option<&mut super::expert_pager::ExpertPager>,
+        engram_rows: Option<&[Vec<f32>]>,
+    ) -> eyre::Result<()> {
+        self.forward_prompt_batch_v2_pipelined_range(
+            bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, input_hcs, tokens, pos0, stats,
+            image_spans, pager, engram_rows, 0..N_LAYER as usize, CedMode::Exact, None,
+        )
+        .map(|_| ())
+    }
+
+    /// `forward_prompt_batch_v2_pipelined` over the layer range `layers` (M7
+    /// CED). `ced` is the mode of `CED_DECODER_START` when it lies in the range
+    /// (every other layer runs `Exact`): `KvSourceOnly` requires the range to
+    /// END at that layer (no post-MoE / residual swap after it, so on return
+    /// `residual` and `hc_pre_carry` are the rows ENTERING it); `Replay`
+    /// requires the range to START there. `seed_carry` seeds each row's mHC
+    /// carry (`[B, HC_MIX_DIM]`) for a range that does not start at layer 0.
+    /// Returns the lane cut `b_a` (rows `[0, b_a)` are in lane A).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prompt_batch_v2_pipelined_range(
+        &self,
+        bd_a: &mut BatchDgpuScratch,
+        bi_a: &mut BatchIgpuScratch,
+        bd_b: &mut BatchDgpuScratch,
+        bi_b: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        state: &mut HetModelState,
+        weights: &HetModelWeights,
+        input_hcs: &[Vec<f32>],
+        tokens: &[i32],
+        pos0: u32,
+        stats: Option<&mut PrefillStats>,
         // See `forward_prompt_batch_v2`. Each LANE is a KV-visible unit
         // (lane A's post-attention eviction runs before lane B appends),
         // so the lane cut is moved off any image span — `lane_split`.
         image_spans: Option<&[ImageSpan]>,
-    ) -> eyre::Result<()> {
+        // M7 expert pager: when Some, this layer's experts are paged out of its
+        // pool instead of read from the (placeholder) resident buffers.
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
+        // M7/Engram: one flattened [B * ENGRAM_IN] row buffer per Engram layer for
+        // THIS call's tokens; batched prefill stages them per Engram layer.
+        engram_rows: Option<&[Vec<f32>]>,
+        layers: std::ops::Range<usize>,
+        ced: CedMode,
+        seed_carry: Option<&[Vec<f32>]>,
+    ) -> eyre::Result<usize> {
         let b = tokens.len();
         if b == 0 {
-            return Ok(());
+            return Ok(0);
         }
         if input_hcs.len() != b {
             return Err(eyre!(
@@ -316,11 +501,42 @@ impl HeterogeneousEngine {
                 input_hcs.len()
             ));
         }
-        // For chunks too small to bother pipelining, fall back to single-lane.
-        if b < 2 {
-            return self.forward_prompt_batch_v2(
+        let (lo, hi) = (layers.start, layers.end);
+        let split = crate::config::CED_DECODER_START;
+        if lo >= hi || hi > N_LAYER as usize {
+            return Err(eyre!("forward_prompt_batch_v2_pipelined: bad layer range {lo}..{hi}"));
+        }
+        match ced {
+            CedMode::Exact => {}
+            CedMode::KvSourceOnly if hi == split + 1 => {}
+            CedMode::Replay if lo == split => {}
+            _ => {
+                return Err(eyre!(
+                    "forward_prompt_batch_v2_pipelined: {ced:?} over layers {lo}..{hi} (split {split})"
+                ))
+            }
+        }
+        let mode_of = |l: usize| if l == split { ced } else { CedMode::Exact };
+        if let Some(c) = seed_carry {
+            if lo == 0 {
+                return Err(eyre!(
+                    "forward_prompt_batch_v2_pipelined: seed_carry with layer 0 (reset to one-hot there)"
+                ));
+            }
+            if c.len() != b || c.iter().any(|r| r.len() != HC_MIX_DIM as usize) {
+                return Err(eyre!(
+                    "forward_prompt_batch_v2_pipelined: seed_carry must be [{b}, {HC_MIX_DIM}]"
+                ));
+            }
+        }
+        // For chunks too small to bother pipelining, fall back to single-lane
+        // (exact full-depth only: the single-lane driver has no layer range).
+        if b < 2 && ced == CedMode::Exact && lo == 0 && hi == N_LAYER as usize {
+            self.forward_prompt_batch_v2(
                 bd_a, bi_a, sd, si, state, weights, input_hcs, tokens, pos0, stats, image_spans,
-            );
+                pager.as_deref_mut(),
+            )?;
+            return Ok(b);
         }
         let spans = image_spans.unwrap_or(&[]);
         let b_a = image_spans::lane_split(pos0, b, spans, bd_a.rows, bd_b.rows)?;
@@ -355,6 +571,15 @@ impl HeterogeneousEngine {
                 .slice_view_mut(i * HC_DIM as usize, HC_DIM as usize);
             slot.copy_from_host(&input_b[i])?;
         }
+        if let Some(c) = seed_carry {
+            let m = HC_MIX_DIM as usize;
+            for i in 0..b_a {
+                bd_a.hc_pre_carry.slice_view_mut(i * m, m).copy_from_host(&c[i])?;
+            }
+            for i in 0..b_b {
+                bd_b.hc_pre_carry.slice_view_mut(i * m, m).copy_from_host(&c[b_a + i])?;
+            }
+        }
         {
             let pos_a: Vec<i32> = (0..b_a).map(|i| (pos0_a + i as u32) as i32).collect();
             let mut va = bd_a.pos_per_b.slice_view_mut(0, b_a);
@@ -383,7 +608,8 @@ impl HeterogeneousEngine {
         // — the shallow version stalled pre_A(L+1) behind moe_arrived_B(L).
 
         // Warmup: queue layer 0 pre-MoE for both lanes.
-        let layer0 = 0usize;
+        let layer0 = lo;
+        self.stage_engram_lane(bd_a, layer0, engram_rows, 0, b_a)?;
         self.forward_layer_pre_moe_v2(
             bd_a,
             bi_a,
@@ -397,25 +623,32 @@ impl HeterogeneousEngine {
             vis_a.as_deref(),
             stats_a.as_deref_mut(),
             &self.sync_events.layers[layer0],
+            pager.as_deref_mut(),
+            mode_of(layer0),
         )?;
-        self.forward_layer_pre_moe_v2(
-            bd_b,
-            bi_b,
-            sd,
-            si,
-            &mut state.layers[layer0],
-            &weights.dgpu_layers[layer0],
-            &weights.igpu_layers[layer0],
-            pos0_b,
-            tokens_b,
-            vis_b.as_deref(),
-            None,
-            &self.sync_events_t1.layers[layer0],
-        )?;
+        if b_b > 0 {
+            self.stage_engram_lane(bd_b, layer0, engram_rows, b_a, b_b)?;
+            self.forward_layer_pre_moe_v2(
+                bd_b,
+                bi_b,
+                sd,
+                si,
+                &mut state.layers[layer0],
+                &weights.dgpu_layers[layer0],
+                &weights.igpu_layers[layer0],
+                pos0_b,
+                tokens_b,
+                vis_b.as_deref(),
+                None,
+                &self.sync_events_t1.layers[layer0],
+                pager.as_deref_mut(),
+                mode_of(layer0),
+            )?;
+        }
 
         // Steady state: for each layer L in 0..N_LAYER-1, queue post_X(L)
         // followed by pre_X(L+1) for the SAME lane, before moving to lane B.
-        for layer in 0..(N_LAYER as usize - 1) {
+        for layer in lo..(hi - 1) {
             let sev_a_cur = &self.sync_events.layers[layer];
             let sev_b_cur = &self.sync_events_t1.layers[layer];
 
@@ -426,9 +659,17 @@ impl HeterogeneousEngine {
                 sd,
             );
 
+            // V4.1 reuse layers: lend the KV source's store to layer L+1 for both
+            // lanes' pre-MoE halves (post-MoE never touches compressor state).
+            let kv_src_next = crate::config::kv_source_of(layer + 1);
+            if let Some(src) = kv_src_next {
+                let st = state.layers[src].compressor.take();
+                state.layers[layer + 1].compressor = st;
+            }
             // Lane A: finish layer L, then start layer L+1.
             self.forward_layer_post_moe_v2(bd_a, b_a as u32, sev_a_cur, hot_cur)?;
             std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
+            self.stage_engram_lane(bd_a, layer + 1, engram_rows, 0, b_a)?;
             self.forward_layer_pre_moe_v2(
                 bd_a,
                 bi_a,
@@ -442,42 +683,58 @@ impl HeterogeneousEngine {
                 vis_a.as_deref(),
                 stats_a.as_deref_mut(),
                 &self.sync_events.layers[layer + 1],
+                pager.as_deref_mut(),
+                mode_of(layer + 1),
             )?;
 
             // Lane B: same.
-            self.forward_layer_post_moe_v2(bd_b, b_b as u32, sev_b_cur, hot_cur)?;
-            std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
-            self.forward_layer_pre_moe_v2(
-                bd_b,
-                bi_b,
-                sd,
-                si,
-                &mut state.layers[layer + 1],
-                &weights.dgpu_layers[layer + 1],
-                &weights.igpu_layers[layer + 1],
-                pos0_b,
-                tokens_b,
-                vis_b.as_deref(),
-                None,
-                &self.sync_events_t1.layers[layer + 1],
-            )?;
+            if b_b > 0 {
+                self.forward_layer_post_moe_v2(bd_b, b_b as u32, sev_b_cur, hot_cur)?;
+                std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
+                self.stage_engram_lane(bd_b, layer + 1, engram_rows, b_a, b_b)?;
+                self.forward_layer_pre_moe_v2(
+                    bd_b,
+                    bi_b,
+                    sd,
+                    si,
+                    &mut state.layers[layer + 1],
+                    &weights.dgpu_layers[layer + 1],
+                    &weights.igpu_layers[layer + 1],
+                    pos0_b,
+                    tokens_b,
+                    vis_b.as_deref(),
+                    None,
+                    &self.sync_events_t1.layers[layer + 1],
+                    pager.as_deref_mut(),
+                    mode_of(layer + 1),
+                )?;
+            }
+            if let Some(src) = kv_src_next {
+                let st = state.layers[layer + 1].compressor.take();
+                state.layers[src].compressor = st;
+            }
         }
 
-        // Cooldown: post-MoE for the final layer on both lanes.
-        let last = N_LAYER as usize - 1;
-        let hot_last = prefill_hot_active(
-            &weights.dgpu_layers[last],
-            &weights.igpu_layers[last],
-            bd_a,
-            sd,
-        );
-        self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[last], hot_last)?;
-        std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
-        self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[last], hot_last)?;
-        std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
+        // Cooldown: post-MoE for the final layer on both lanes. A source-only
+        // last layer has no MoE and leaves `residual` = its input rows.
+        let last = hi - 1;
+        if mode_of(last) != CedMode::KvSourceOnly {
+            let hot_last = prefill_hot_active(
+                &weights.dgpu_layers[last],
+                &weights.igpu_layers[last],
+                bd_a,
+                sd,
+            );
+            self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[last], hot_last)?;
+            std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
+            if b_b > 0 {
+                self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[last], hot_last)?;
+                std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
+            }
+        }
 
         self.dgpu.compute.synchronize()?;
-        Ok(())
+        Ok(b_a)
     }
 
     /// Chunked prefill driver. Processes `tokens` (length T)
@@ -514,6 +771,9 @@ impl HeterogeneousEngine {
         // Vision-Exp image spans (absolute `(start_pos, len)`); chunk
         // boundaries are moved so no span straddles a chunk.
         image_spans: Option<&[ImageSpan]>,
+        // M7 expert pager: when Some, this layer's experts are paged out of its
+        // pool instead of read from the (placeholder) resident buffers.
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
     ) -> eyre::Result<Vec<f32>> {
         let t = tokens.len();
         if t == 0 {
@@ -532,7 +792,6 @@ impl HeterogeneousEngine {
         // ONE lane + ONE shared set, so all four must be allocated at full
         // B_MAX rows (`alloc()`), not the per-lane `alloc_rows(B_MAX.div_ceil(2))`.
         check_scratch_rows("forward_prefill", chunk_size.min(t), bd, bi, sd, si)?;
-        let cs_hc = HC_DIM as usize;
         let cs_vocab = N_VOCAB as usize;
 
         let mut out_logits: Vec<f32> = if last_only {
@@ -567,7 +826,8 @@ impl HeterogeneousEngine {
                 chunk_pos0,
                 stats.as_deref_mut(),
                 image_spans,
-            )?;
+            pager.as_deref_mut(),
+)?;
 
             // After this chunk: if perfetto is attached, emit slices + re-anchor.
             if let Some(exp_lock) = &self.perfetto {
@@ -599,27 +859,15 @@ impl HeterogeneousEngine {
                 self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
             }
 
-            // residual post-loop holds layer-N output in bd.residual (43
-            // layers + 43 swaps = even number of mutations to residual).
+            // residual post-loop holds layer-N output in bd.residual (one
+            // swap per layer, so this holds for any N_LAYER parity).
             if last_only {
                 if is_last_chunk {
-                    let last_b = chunk_b - 1;
-                    head_scratch.residual.copy_from_buffer(
-                        &bd.residual.slice_view(last_b * cs_hc, cs_hc),
-                    )?;
-                    self.forward_head(head_scratch, &weights.global)?;
-                    let mut logits = vec![0f32; cs_vocab];
-                    head_scratch.logits.copy_to_host(&mut logits)?;
-                    out_logits = logits;
+                    out_logits = self.head_from_row(head_scratch, bd, chunk_b - 1, weights)?;
                 }
             } else {
                 for i in 0..chunk_b {
-                    head_scratch
-                        .residual
-                        .copy_from_buffer(&bd.residual.slice_view(i * cs_hc, cs_hc))?;
-                    self.forward_head(head_scratch, &weights.global)?;
-                    let mut logits = vec![0f32; cs_vocab];
-                    head_scratch.logits.copy_to_host(&mut logits)?;
+                    let logits = self.head_from_row(head_scratch, bd, i, weights)?;
                     out_logits.extend_from_slice(&logits);
                 }
             }
@@ -627,6 +875,32 @@ impl HeterogeneousEngine {
             chunk_start = chunk_end;
         }
         Ok(out_logits)
+    }
+
+    /// Head over one batched row `idx` of `bd`: residual (+ under V4.1 the mHC
+    /// carry the head's collapse reads — decode twin: `forward_head` after
+    /// layer N-1 reads `dgpu_scratch.hc_pre_carry`) → logits `[N_VOCAB]`.
+    fn head_from_row(
+        &self,
+        head_scratch: &mut DgpuScratch,
+        bd: &BatchDgpuScratch,
+        idx: usize,
+        weights: &HetModelWeights,
+    ) -> eyre::Result<Vec<f32>> {
+        let cs_hc = HC_DIM as usize;
+        head_scratch
+            .residual
+            .copy_from_buffer(&bd.residual.slice_view(idx * cs_hc, cs_hc))?;
+        if cfg!(feature = "v41") {
+            let m = HC_MIX_DIM as usize;
+            head_scratch
+                .hc_pre_carry
+                .copy_from_buffer(&bd.hc_pre_carry.slice_view(idx * m, m))?;
+        }
+        self.forward_head(head_scratch, &weights.global)?;
+        let mut logits = vec![0f32; N_VOCAB as usize];
+        head_scratch.logits.copy_to_host(&mut logits)?;
+        Ok(logits)
     }
 
     /// Two-lane pipelined chunked prefill. Same contract as
@@ -666,6 +940,11 @@ impl HeterogeneousEngine {
         // prefilled inside one KV-visible unit; with `None` / empty the
         // chunking is the historical fixed B_MAX / div_ceil(2).
         image_spans: Option<&[ImageSpan]>,
+        // M7 expert pager (see forward_layer_pre_moe_v2).
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
+        // M7/Engram: one flattened [B * ENGRAM_IN] row buffer per Engram layer for
+        // THIS call's tokens; batched prefill stages them per Engram layer.
+        engram_rows: Option<&[Vec<f32>]>,
     ) -> eyre::Result<Vec<f32>> {
         let t = tokens.len();
         if t == 0 {
@@ -681,7 +960,6 @@ impl HeterogeneousEngine {
         image_spans::validate_spans(spans, pos0, t)?;
         let lane_caps = (bd_a.rows, bd_b.rows);
         let chunk_size = B_MAX;
-        let cs_hc = HC_DIM as usize;
         let cs_vocab = N_VOCAB as usize;
 
         let mut out_logits: Vec<f32> = if last_only {
@@ -698,6 +976,16 @@ impl HeterogeneousEngine {
         let total_chunks = t.div_ceil(chunk_size);
         let mut chunk_idx = 0usize;
         let mut chunk_start = 0usize;
+
+        // M7 CED (tech report §2.2 / §3.2.2): the causal encoder runs over every
+        // prompt token and the decoder's global KV is projected from the final
+        // encoder hidden state at `CED_DECODER_START`; the decoder itself runs
+        // only over the last SWA_WINDOW tokens (Decoder SWA Bounded Replay),
+        // after the last chunk. Per-token logits need the decoder over every
+        // row, so only the last-token path takes it.
+        let ced = ced_enabled() && last_only;
+        let split = crate::config::CED_DECODER_START;
+        let mut replay: std::collections::VecDeque<ReplayRow> = std::collections::VecDeque::new();
         while chunk_start < t {
             // Caller-driven cancel (typically: HTTP client disconnect).
             // Checked at chunk boundary so latency is bounded by one
@@ -760,21 +1048,70 @@ impl HeterogeneousEngine {
             self.dgpu.events.reset();
             self.igpu.events.reset();
 
-            self.forward_prompt_batch_v2_pipelined(
-                bd_a,
-                bi_a,
-                bd_b,
-                bi_b,
-                sd,
-                si,
-                state,
-                weights,
-                chunk_input,
-                chunk_tokens,
-                chunk_pos0,
-                stats.as_deref_mut(),
-                image_spans,
-            )?;
+            let chunk_engram: Option<Vec<Vec<f32>>> = engram_rows.map(|rs| {
+                let ein = ENGRAM_IN as usize;
+                let (a, z) = (chunk_start * ein, (chunk_start + chunk_tokens.len()) * ein);
+                rs.iter().map(|r| r[a..z].to_vec()).collect()
+            });
+            if ced {
+                // Encoder + the decoder's KV projection; `residual` /
+                // `hc_pre_carry` come back holding the rows ENTERING `split`.
+                let cut = self.forward_prompt_batch_v2_pipelined_range(
+                    bd_a,
+                    bi_a,
+                    bd_b,
+                    bi_b,
+                    sd,
+                    si,
+                    state,
+                    weights,
+                    chunk_input,
+                    chunk_tokens,
+                    chunk_pos0,
+                    stats.as_deref_mut(),
+                    image_spans,
+                    pager.as_deref_mut(),
+                    chunk_engram.as_deref(),
+                    0..split + 1,
+                    CedMode::KvSourceOnly,
+                    None,
+                )?;
+                if cut != b_a {
+                    return Err(eyre!("CED prefill: lane cut {cut} != planned {b_a}"));
+                }
+                // Keep the last SWA_WINDOW rows entering the decoder (host ring).
+                let take = chunk_b.min(SWA_WINDOW as usize);
+                let (m, hc) = (HC_MIX_DIM as usize, HC_DIM as usize);
+                for i in chunk_b - take..chunk_b {
+                    let (src, idx) = if i < b_a { (&*bd_a, i) } else { (&*bd_b, i - b_a) };
+                    let mut row = ReplayRow { tok: chunk_tokens[i], hc: vec![0f32; hc], carry: vec![0f32; m] };
+                    src.residual.slice_view(idx * hc, hc).copy_to_host(&mut row.hc)?;
+                    src.hc_pre_carry.slice_view(idx * m, m).copy_to_host(&mut row.carry)?;
+                    replay.push_back(row);
+                    if replay.len() > SWA_WINDOW as usize {
+                        replay.pop_front();
+                    }
+                }
+            } else {
+                self.forward_prompt_batch_v2_pipelined(
+                    bd_a,
+                    bi_a,
+                    bd_b,
+                    bi_b,
+                    sd,
+                    si,
+                    state,
+                    weights,
+                    chunk_input,
+                    chunk_tokens,
+                    chunk_pos0,
+                    stats.as_deref_mut(),
+                    image_spans,
+                    pager.as_deref_mut(),
+                    // Slice the prompt-wide Engram rows down to this chunk.
+                    chunk_engram.as_deref(),
+                )?;
+            }
 
             if let Some(exp_lock) = &self.perfetto {
                 let mut exp = exp_lock.lock().unwrap();
@@ -810,44 +1147,108 @@ impl HeterogeneousEngine {
             let b_b = chunk_b - b_a;
 
             if last_only {
-                if is_last_chunk {
+                if is_last_chunk && !ced {
                     // Last token: lives in lane B if b_b > 0, else lane A.
                     let (src_bd, last_idx) = if b_b > 0 {
                         (&*bd_b, b_b - 1)
                     } else {
                         (&*bd_a, b_a - 1)
                     };
-                    head_scratch
-                        .residual
-                        .copy_from_buffer(&src_bd.residual.slice_view(last_idx * cs_hc, cs_hc))?;
-                    self.forward_head(head_scratch, &weights.global)?;
-                    let mut logits = vec![0f32; cs_vocab];
-                    head_scratch.logits.copy_to_host(&mut logits)?;
+                    let logits = self.head_from_row(head_scratch, src_bd, last_idx, weights)?;
+                    dump_prefill_logits(&logits)?;
                     out_logits = logits;
                 }
             } else {
                 for i in 0..b_a {
-                    head_scratch
-                        .residual
-                        .copy_from_buffer(&bd_a.residual.slice_view(i * cs_hc, cs_hc))?;
-                    self.forward_head(head_scratch, &weights.global)?;
-                    let mut logits = vec![0f32; cs_vocab];
-                    head_scratch.logits.copy_to_host(&mut logits)?;
+                    let logits = self.head_from_row(head_scratch, bd_a, i, weights)?;
                     out_logits.extend_from_slice(&logits);
                 }
                 for i in 0..b_b {
-                    head_scratch
-                        .residual
-                        .copy_from_buffer(&bd_b.residual.slice_view(i * cs_hc, cs_hc))?;
-                    self.forward_head(head_scratch, &weights.global)?;
-                    let mut logits = vec![0f32; cs_vocab];
-                    head_scratch.logits.copy_to_host(&mut logits)?;
+                    let logits = self.head_from_row(head_scratch, bd_b, i, weights)?;
                     out_logits.extend_from_slice(&logits);
                 }
             }
 
             chunk_start = chunk_end;
             chunk_idx += 1;
+            if let Some(f) = on_chunk_done {
+                f();
+            }
+        }
+
+        if ced {
+            // Decoder SWA Bounded Replay (§3.2.2): feed the last SWA_WINDOW
+            // rows' encoder outputs through the decoder with the decoder rings
+            // emptied, so a segment query at index i sees window keys in
+            // [max(s, i-W+1), i] and the complete global KV. Approximate by
+            // design for N > SWA_WINDOW (identical to the exact path otherwise).
+            if let Some(c) = cancel {
+                if c.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(Vec::new());
+                }
+            }
+            let b_seg = replay.len();
+            if b_seg == 0 || b_seg > t {
+                return Err(eyre!("CED prefill: replay segment {b_seg} of {t} rows"));
+            }
+            let seg_pos0 = pos0 + (t - b_seg) as u32;
+            for l in split..N_LAYER as usize {
+                state.layers[l].n_raw = 0;
+                state.layers[l].raw_off = 0;
+            }
+            let mut seg_hcs: Vec<Vec<f32>> = Vec::with_capacity(b_seg);
+            let mut seg_carry: Vec<Vec<f32>> = Vec::with_capacity(b_seg);
+            let mut seg_tokens: Vec<i32> = Vec::with_capacity(b_seg);
+            for r in replay.drain(..) {
+                seg_hcs.push(r.hc);
+                seg_carry.push(r.carry);
+                seg_tokens.push(r.tok);
+            }
+            let t0 = std::time::Instant::now();
+            self.dgpu.events.reset();
+            self.igpu.events.reset();
+            let b_a = self.forward_prompt_batch_v2_pipelined_range(
+                bd_a,
+                bi_a,
+                bd_b,
+                bi_b,
+                sd,
+                si,
+                state,
+                weights,
+                &seg_hcs,
+                &seg_tokens,
+                seg_pos0,
+                None,
+                // Text-causal replay: `image_spans` is deliberately None here.
+                // It drives only (a) raw-window widening and (b) chunk/lane cut
+                // planning, both of which exist for V4-Flash's BIDIRECTIONAL
+                // in-span window. V4.1 image tokens attend causally (no
+                // `get_image_visible` in the reference model.py), so the replay
+                // needs neither. Routing is NOT lost: `seg_tokens` carries the
+                // synthetic ids >= N_VOCAB, so `image_runs` still applies
+                // bias_vl on the replayed decoder layers, and a lane split
+                // through an image run stays causally valid. Validated e2e
+                // 2026-09-13 with a replay landing inside an image span
+                // (seg_pos0=328, span 12..455) — see docs/v41/VISION_PORT.md §5.
+                None,
+                pager.as_deref_mut(),
+                None,
+                split..N_LAYER as usize,
+                CedMode::Replay,
+                Some(&seg_carry),
+            )?;
+            let (src_bd, last_idx) = if b_seg > b_a { (&*bd_b, b_seg - b_a - 1) } else { (&*bd_a, b_a - 1) };
+            let logits = self.head_from_row(head_scratch, src_bd, last_idx, weights)?;
+            tracing::info!(
+                replay_tokens = b_seg,
+                seg_pos0,
+                elapsed_s = format!("{:.1}", t0.elapsed().as_secs_f32()),
+                total_s = format!("{:.1}", prefill_start.elapsed().as_secs_f32()),
+                "ced_replay"
+            );
+            dump_prefill_logits(&logits)?;
+            out_logits = logits;
             if let Some(f) = on_chunk_done {
                 f();
             }
@@ -863,6 +1264,49 @@ impl HeterogeneousEngine {
     /// Thin wrapper over the split pre-MoE + post-MoE methods;
     /// single-lane callers use this.
     #[allow(clippy::too_many_arguments)]
+    /// V4.1 Engram prefill twin of `stage_engram_rows`: `rows` = `b × ENGRAM_IN`
+    /// f32, one gathered row set per chunk row, for the next Engram layer.
+    /// Stage one lane's Engram rows for `layer`, if it is an Engram layer.
+    ///
+    /// `rows` holds one flattened `[chunk_b * ENGRAM_IN]` buffer per Engram layer
+    /// (in `ENGRAM_LAYERS` order); `off`/`n` select this lane's slice of the chunk.
+    /// A no-op for non-Engram layers and when the caller supplied no rows.
+    fn stage_engram_lane(
+        &self,
+        bd: &mut BatchDgpuScratch,
+        layer: usize,
+        rows: Option<&[Vec<f32>]>,
+        off: usize,
+        n: usize,
+    ) -> eyre::Result<()> {
+        let Some(rs) = rows else { return Ok(()) };
+        let Some(li) = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer)
+        else {
+            return Ok(());
+        };
+        let ein = ENGRAM_IN as usize;
+        let buf = rs.get(li).ok_or_else(|| {
+            eyre!("engram: layer {layer} is Engram index {li} but only {} buffers given", rs.len())
+        })?;
+        if buf.len() < (off + n) * ein {
+            return Err(eyre!(
+                "engram: layer {layer} rows hold {} floats, lane needs [{}..{}]",
+                buf.len(), off * ein, (off + n) * ein
+            ));
+        }
+        self.stage_engram_rows_batch(bd, &buf[off * ein..(off + n) * ein])
+    }
+
+    pub fn stage_engram_rows_batch(&self, bd: &mut BatchDgpuScratch, rows: &[f32]) -> eyre::Result<()> {
+        if rows.is_empty() || rows.len() % ENGRAM_IN as usize != 0 || rows.len() > bd.engram_rows.len() {
+            return Err(eyre!("stage_engram_rows_batch: {} floats (ENGRAM_IN {}, capacity {})", rows.len(), ENGRAM_IN, bd.engram_rows.len()));
+        }
+        self.set_current_cached(self.dgpu.device)?;
+        bd.engram_rows.slice_view_mut(0, rows.len()).copy_from_host(rows)?;
+        bd.engram_rows_ready = true;
+        Ok(())
+    }
+
     pub fn forward_layer_batch_v2(
         &self,
         bd: &mut BatchDgpuScratch,
@@ -878,6 +1322,9 @@ impl HeterogeneousEngine {
         // (`image_spans::rows_visibility`); `None` == all text.
         vis: Option<&[(u32, u32)]>,
         stats: Option<&mut PrefillStats>,
+        // M7 expert pager: when Some, this layer's experts are paged out of its
+        // pool instead of read from the (placeholder) resident buffers.
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
     ) -> eyre::Result<()> {
         let layer = dlw.layer_idx as usize;
         let b = tokens.len() as u32;
@@ -886,7 +1333,7 @@ impl HeterogeneousEngine {
         }
         let sev = &self.sync_events.layers[layer];
         let hot_active = prefill_hot_active(dlw, ilw, bd, sd);
-        self.forward_layer_pre_moe_v2(bd, bi, sd, si, ls, dlw, ilw, pos0, tokens, vis, stats, sev)?;
+        self.forward_layer_pre_moe_v2(bd, bi, sd, si, ls, dlw, ilw, pos0, tokens, vis, stats, sev, pager.as_deref_mut(), CedMode::Exact)?;
         self.forward_layer_post_moe_v2(bd, b, sev, hot_active)?;
         Ok(())
     }
@@ -925,6 +1372,12 @@ impl HeterogeneousEngine {
         vis: Option<&[(u32, u32)]>,
         stats: Option<&mut PrefillStats>,
         sev: &super::engine::LayerSyncEvents,
+        // M7 expert pager: when Some, this layer's experts are paged out of its
+        // pool instead of read from the (placeholder) resident buffers.
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
+        // M7 CED mode of this call (only `CED_DECODER_START` is ever called
+        // with anything but `Exact`).
+        ced: CedMode,
     ) -> eyre::Result<()> {
         let layer = dlw.layer_idx;
         if ilw.layer_idx != layer {
@@ -953,6 +1406,53 @@ impl HeterogeneousEngine {
         // rms_nw → f16_narrow → sinkhorn → hc_weighted → rms_w
         // ========================================================
         let _t_mhc_pre = de.events.stage("dgpu.mhc_pre_attn", &de.compute)?;
+        if cfg!(feature = "v41") && layer == 0 {
+            // Single-pass mHC: every token's layer-0 attention collapses with
+            // the initial one-hot(copy 0) pre-mix (ARCH_SPEC §1.1). Rows are
+            // independent, so the per-row carry survives the layer-major order.
+            let rows = b as usize * HC_MIX_DIM as usize;
+            bd.hc_pre_carry
+                .slice_view_mut(0, rows)
+                .copy_from_host_async(&super::scratch::hc_pre_onehot_rows()[..rows], &de.compute)?;
+        }
+        if let Some(eg) = dlw.engram.as_ref() {
+            // V4.1 Engram on every row of the chunk, ENGRAM_CHUNK rows per pass
+            // (decode twin: forward_layer.rs).
+            if !bd.engram_rows_ready {
+                return Err(eyre!("forward_layer_pre_moe_v2 L{layer}: Engram rows not staged (stage_engram_rows_batch)"));
+            }
+            let _t = de.events.stage("dgpu.engram", &de.compute)?;
+            let (ein, eout, hcd) = (ENGRAM_IN as usize, ENGRAM_OUT as usize, HC_DIM as usize);
+            let mut c0 = 0usize;
+            while c0 < b as usize {
+                let n = (b as usize - c0).min(ENGRAM_CHUNK as usize);
+                let rows = bd.engram_rows.slice_view(c0 * ein, n * ein);
+                let mut xq = bd.engram_xq.slice_view_mut(0, n * ein);
+                let mut xs = bd.engram_xscale.slice_view_mut(0, n * ein / 32);
+                let mut kv = bd.engram_kv.slice_view_mut(0, n * eout);
+                de.q8.quantize_input_batched(&de.compute, &mut xq, &mut xs, &rows, ENGRAM_IN, n as u32)?;
+                // wkv is [25600, 6144] Q8_0 = 167 MB, by far the largest
+                // single weight the encoder touches. `matvec_batched`
+                // (`q8_0_gemv_batched_warp8`) puts the batch on grid.z with
+                // x fastest, so 3200 workgroups separate two visits to the
+                // same 52 KB row tile: every z-slice is its own DRAM pass and
+                // one 64-row chunk streams 64 x 167 MB = 10.7 GB (16.7 ms at
+                // 640 GB/s), i.e. 267 ms per 512-row lane over the two Engram
+                // layers. `gemm_lds_tiled` is the LDS-tiled WMMA GEMM that
+                // took qb from 8.8 to 1.4 ms on exactly this class of shape:
+                // one pass over the weight per (BM=64 x BN=64) tile.
+                // Rollback: V41_ENGRAM_GEMV=1.
+                if engram_gemv_fallback() {
+                    de.q8.matvec_batched(&de.compute, &mut kv, &eg.wkv.buffer, &xq, &xs, ENGRAM_OUT, ENGRAM_IN, n as u32)?;
+                } else {
+                    de.q8_wmma.gemm_lds_tiled(&de.compute, &mut kv, &eg.wkv.buffer, &xq, &xs, ENGRAM_OUT, ENGRAM_IN, n as u32)?;
+                }
+                let mut h = bd.residual.slice_view_mut(c0 * hcd, n * hcd);
+                de.engram_gate.launch(&de.compute, &mut h, &kv, &eg.qk, N_HC, N_EMBD, ENGRAM_OUT, N_HC * N_EMBD, RMS_EPS, n as u32)?;
+                c0 += n;
+            }
+            bd.engram_rows_ready = false;
+        }
         {
             let _t = de.events.stage("k.mhc_pre_attn.rms_nw", &de.compute)?;
             de.rms_nw
@@ -960,15 +1460,27 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.mhc_pre_attn.f16_matvec", &de.compute)?;
-            de.f16.matvec_narrow_batched(
-                &de.compute,
-                &mut sd.mix,
-                &dlw.hc_attn_fn.buffer,
-                &sd.flat,
-                HC_MIX_DIM,
-                HC_DIM,
-                b,
-            )?;
+            if mhc_narrow_fallback() {
+                de.f16.matvec_narrow_batched(
+                    &de.compute,
+                    &mut sd.mix,
+                    &dlw.hc_attn_fn.buffer,
+                    &sd.flat,
+                    HC_MIX_DIM,
+                    HC_DIM,
+                    b,
+                )?;
+            } else {
+                de.f16.gemm_batched_wmma(
+                    &de.compute,
+                    &mut sd.mix,
+                    &dlw.hc_attn_fn.buffer,
+                    &sd.flat,
+                    HC_MIX_DIM,
+                    HC_DIM,
+                    b,
+                )?;
+            }
         }
         {
             let _t = de.events.stage("k.mhc_pre_attn.sinkhorn", &de.compute)?;
@@ -986,16 +1498,18 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.mhc_pre_attn.hc_weighted", &de.compute)?;
-            de.hc_weighted.launch_batched(
-                &de.compute,
-                &mut sd.attn_cur,
-                &bd.residual,
-                &bd.split,
-                N_EMBD,
-                N_HC,
-                HC_MIX_DIM, // w_stride: split is [B, HC_MIX_DIM]; pre-sigmoid w is first n_hc
-                b,
-            )?;
+            // w_stride: split is [B, HC_MIX_DIM]; pre-sigmoid w is first n_hc.
+            // V4.1 collapses with the PREVIOUS sub-block's pre (carry), then
+            // carries this sub-block's pre forward (decode twin: forward_layer.rs).
+            let w = if cfg!(feature = "v41") { &bd.hc_pre_carry } else { &bd.split };
+            de.hc_weighted.launch_batched(&de.compute, &mut sd.attn_cur, &bd.residual, w, N_EMBD, N_HC, HC_MIX_DIM, b)?;
+            // M7 CED: a source-only call leaves the carry as it entered the
+            // layer (the replay re-runs this sub-block and carries it then).
+            if cfg!(feature = "v41") && ced != CedMode::KvSourceOnly {
+                let rows = b as usize * HC_MIX_DIM as usize;
+                let cur = bd.split.slice_view(0, rows);
+                bd.hc_pre_carry.slice_view_mut(0, rows).copy_from_buffer_async(&cur, &de.compute)?;
+            }
         }
         {
             let _t = de.events.stage("k.mhc_pre_attn.rms_w", &de.compute)?;
@@ -1015,6 +1529,8 @@ impl HeterogeneousEngine {
         // ========================================================
         // Stage 2: Q chain (BATCHED quantize + matvec + rms + ...)
         // ========================================================
+        // M7 CED: a source-only call needs neither Q nor the window KV.
+        if ced != CedMode::KvSourceOnly {
         let _t_q = de.events.stage("dgpu.q_chain", &de.compute)?;
         {
             let _t = de.events.stage("k.q_chain.cast_input_f16", &de.compute)?;
@@ -1109,17 +1625,17 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.q_chain.rms_nw_heads", &de.compute)?;
-            // rms_nw over batch: each batch has [N_HEAD, N_HEAD_DIM] rows.
-            // batched API: grid (B, N_HEAD, 1), inner row of N_HEAD_DIM.
-            de.rms_nw.launch_batched(
-                &de.compute,
-                &mut sd.q_normed,
-                &sd.q,
-                N_HEAD,
-                N_HEAD_DIM,
-                RMS_EPS,
-                b,
-            )?;
+            if cfg!(feature = "v41") {
+                // V4.1 has no per-head q RMSNorm after wq_b (ARCH_SPEC §1.2);
+                // rope reads q_normed, so pass q through (decode twin: forward_layer.rs).
+                let n = b as usize * Q_FLAT as usize;
+                let src = sd.q.slice_view(0, n);
+                sd.q_normed.slice_view_mut(0, n).copy_from_buffer_async(&src, &de.compute)?;
+            } else {
+                // rms_nw over batch: each batch has [N_HEAD, N_HEAD_DIM] rows.
+                // batched API: grid (B, N_HEAD, 1), inner row of N_HEAD_DIM.
+                de.rms_nw.launch_batched(&de.compute, &mut sd.q_normed, &sd.q, N_HEAD, N_HEAD_DIM, RMS_EPS, b)?;
+            }
         }
         {
             let _t = de.events.stage("k.q_chain.rope", &de.compute)?;
@@ -1175,13 +1691,18 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.kv_chain.fp8", &de.compute)?;
-            de.fp8.launch_batched(
-                &de.compute,
-                &mut sd.kv_normed,
-                N_HEAD_DIM - N_ROT,
-                N_HEAD_DIM,
-                b,
-            )?;
+            if cfg!(feature = "v41") {
+                // V4.1 window KV: E4M3 × 2^e per 32 over the whole row (decode twin: forward_layer.rs).
+                de.fp4kv.launch_fp8_window(&de.compute, &mut sd.kv_normed, b, N_HEAD_DIM)?;
+            } else {
+                de.fp8.launch_batched(
+                    &de.compute,
+                    &mut sd.kv_normed,
+                    N_HEAD_DIM - N_ROT,
+                    N_HEAD_DIM,
+                    b,
+                )?;
+            }
         }
         {
             // f16rt is pure elementwise — stretch n by B for a single launch.
@@ -1198,6 +1719,7 @@ impl HeterogeneousEngine {
         // future tokens i+1..B-1).
         // ========================================================
         drop(_t_kv);
+        } // ced != KvSourceOnly (stages 2-3)
         let _t_kv_append_comp = de.events.stage("dgpu.kv_append_compressor_serial", &de.compute)?;
         let mut n_raw_after: Vec<u32> = Vec::with_capacity(b as usize);
         let mut n_comp_after: Vec<u32> = Vec::with_capacity(b as usize);
@@ -1232,6 +1754,7 @@ impl HeterogeneousEngine {
         // indexer path below stays causal and untouched.
         let n_raw_before = ls.n_raw;
         let mut n_raw_offset_after: Vec<u32> = Vec::with_capacity(b as usize);
+        if ced != CedMode::KvSourceOnly {
         match vis {
             None => {
                 for i in 0..b as usize {
@@ -1290,28 +1813,103 @@ impl HeterogeneousEngine {
         // Cache now holds n_raw_before + b rows; attention will index with
         // n_raw_offset_per. ls.n_raw is updated to its post-eviction value
         // at the END of this layer (see the eviction-down pass).
+        } // ced != KvSourceOnly (window KV append)
         let n_raw_during_chunk = n_raw_before + b;
 
         // Batched matvec_pair across all B for ratio>0 layers. Produces
         // sd.kv_cur[B, comp_width] + sd.sc_cur[B, comp_width] in one launch.
         // The per-token loop below just READS from those buffers.
-        if ratio > 0 {
+        // V4.1 reuse layers (no compressor weights) only read the source's store.
+        // M7 CED Replay: the store already holds these positions (written by
+        // the source-only pass), so the projection + store write are skipped
+        // and the causal counts come from the positional reuse formula below.
+        let own_compressor = ratio > 0 && dlw.compressor.is_some() && ced != CedMode::Replay;
+        if own_compressor {
             let cw = dlw
                 .compressor
                 .as_ref()
                 .ok_or_else(|| eyre!("L{layer}: missing compressor weights"))?;
             let comp_width = cw.width;
-            de.f16.matvec_pair_batched(
-                &de.compute,
-                &mut sd.kv_cur,
-                &mut sd.sc_cur,
-                &cw.wkv.buffer,
-                &cw.wgate.buffer,
-                &sd.attn_input_norm,
-                comp_width,
-                N_EMBD,
-                b,
-            )?;
+            // 2026-09-12: `matvec_pair_batched` launches grid.z = b, so EVERY
+            // batch row re-reads the whole weight matrix — at ratio=4
+            // (comp_width=1024) that is b × 2 × 1024 × 4096 × 2 B = 8.6 GB per
+            // layer per chunk. It only survived because the 16.8 MB weight fits
+            // the 64 MB Infinity Cache (~1.5 TB/s), which is still ~5.5 ms and
+            // was the true cost of this stage (the serial loop was only ~2.1).
+            // The WMMA GEMM tiles batch by BN=64, so the weight is read b/64
+            // times instead of b: 8.6 GB -> 134 MB. Roofline ≈ 250 µs.
+            //
+            // NOT bit-exact: WMMA casts the f32 activation to f16 and
+            // accumulates in a different order. `DEEPSTRIX_COMP_GEMM=0` keeps
+            // the exact matvec path (and is what the bit-identity oracle for
+            // the gather runs against).
+            // DEFAULT OFF: measured 2026-09-12, the WMMA GEMM exceeds the
+            // project's 5e-2-of-scale oracle bar (argmax still matched). The
+            // compressor's gate output feeds a softmax in the pool, so the f16
+            // activation cast costs more here than in an ordinary projection.
+            // Kept behind the flag as a reference point; the shipped win is the
+            // batch-tiled matvec below, which is bit-exact.
+            let comp_gemm = std::env::var("DEEPSTRIX_COMP_GEMM")
+                .map(|v| v != "0")
+                .unwrap_or(false);
+            if comp_gemm {
+                de.f16.gemm_batched_wmma(
+                    &de.compute,
+                    &mut sd.kv_cur,
+                    &cw.wkv.buffer,
+                    &sd.attn_input_norm,
+                    comp_width,
+                    N_EMBD,
+                    b,
+                )?;
+                de.f16.gemm_batched_wmma(
+                    &de.compute,
+                    &mut sd.sc_cur,
+                    &cw.wgate.buffer,
+                    &sd.attn_input_norm,
+                    comp_width,
+                    N_EMBD,
+                    b,
+                )?;
+            } else if ratio == 1 {
+                // V4.1 ratio 1 (layer 20): latent = norm(wkv(x)) — one batched matvec,
+                // no gate. `sc_cur` is zeroed so the (identity) 1-row pool sees finite
+                // scores; the state/snapshot machinery below is ratio-generic.
+                de.f16.matvec_batched(
+                    &de.compute,
+                    &mut sd.kv_cur,
+                    &cw.wkv.buffer,
+                    &sd.attn_input_norm,
+                    comp_width,
+                    N_EMBD,
+                    b,
+                )?;
+                sd.sc_cur.slice_view_mut(0, (b * comp_width) as usize).fill_zero_async(&de.compute)?;
+            } else if std::env::var("DEEPSTRIX_COMP_TILED").map(|v| v != "0").unwrap_or(true) {
+                de.f16.matvec_pair_batched_tiled(
+                    &de.compute,
+                    &mut sd.kv_cur,
+                    &mut sd.sc_cur,
+                    &cw.wkv.buffer,
+                    &cw.wgate.buffer,
+                    &sd.attn_input_norm,
+                    comp_width,
+                    N_EMBD,
+                    b,
+                )?;
+            } else {
+                de.f16.matvec_pair_batched(
+                    &de.compute,
+                    &mut sd.kv_cur,
+                    &mut sd.sc_cur,
+                    &cw.wkv.buffer,
+                    &cw.wgate.buffer,
+                    &sd.attn_input_norm,
+                    comp_width,
+                    N_EMBD,
+                    b,
+                )?;
+            }
         }
 
         // Per-segment batched state_write. Each segment is ≤ `ratio`
@@ -1319,7 +1917,7 @@ impl HeterogeneousEngine {
         // rows (rows {pos_mod_start..pos_mod_start+seg_len}) so they're
         // safely batched. Segments are bounded by compressor boundaries
         // (where pool+shuffle fire serially) or the chunk end.
-        if ratio > 0 {
+        if own_compressor {
             let cw = dlw
                 .compressor
                 .as_ref()
@@ -1354,24 +1952,87 @@ impl HeterogeneousEngine {
             let n_comp_start = cs.n_comp;
             let mut pos_per_boundary_host: Vec<i32> = Vec::new();
 
-            let mut i: u32 = 0;
-            while i < b {
-                let pos_mod_now = (pos0 + i) % ratio;
-                let seg_len = std::cmp::min(ratio - pos_mod_now, b - i);
-                let seg_end = i + seg_len;
-
-                // Batched state_write for this segment.
+            // ---- FAST PATH (2026-09-12) --------------------------------
+            // The serial segment loop below exists because it mirrors ds4's
+            // DECODE compressor, which sees one position at a time and keeps
+            // a ring buffer + shuffle. In prefill every position of the chunk
+            // is already projected into kv_cur/sc_cur, so each boundary's
+            // snapshot is a pure gather over those rows and the ring is
+            // unnecessary. Measured: the loop was ~384 launches/layer at
+            // ratio=4 (≈6.4 ms of the stage's 7.8 ms) against ~30 µs of real
+            // work. The gather is bit-for-bit identical — same f32 values,
+            // same APE term — so oracles must not move.
+            //
+            // Preconditions, all satisfied for the production chunk sizes
+            // (b=512, ratio ∈ {4,128}); otherwise we fall through to the
+            // serial loop unchanged:
+            //   - pos0 % ratio == 0  (else carried-in rows for k>0 do not
+            //     line up with the previous chunk's state layout)
+            //   - at least one boundary fires in this chunk
+            let rows_state = coff_main * ratio;
+            // DEEPSTRIX_COMP_GATHER=0 forces the serial loop (A/B + rollback).
+            let gather_enabled = std::env::var("DEEPSTRIX_COMP_GATHER")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            // b % ratio == 0 is REQUIRED, not cosmetic: the end-of-chunk state
+            // write assumes the chunk ends exactly on a group boundary, so the
+            // last complete group is kv_cur[b-ratio .. b) landing in rows
+            // 0..ratio-1. With a ragged tail (e.g. b=7, ratio=4) that slice is
+            // the wrong positions AND the trailing partial group is lost.
+            let fast_ok =
+                gather_enabled && pos0 % ratio == 0 && b % ratio == 0 && b >= ratio;
+            if fast_ok {
+                let n_bnd = b / ratio;
+                for k in 0..n_bnd {
+                    pos_per_boundary_host.push((pos0 + k * ratio) as i32);
+                }
+                cs.n_comp += n_bnd;
+                for k in 0..b {
+                    n_comp_after.push(n_comp_start + (k + 1) / ratio);
+                }
+                {
+                    let mut pv = sd
+                        .comp_pos_per_boundary
+                        .slice_view_mut(0, n_bnd as usize);
+                    pv.copy_from_host_async(&pos_per_boundary_host, &de.compute)?;
+                }
+                de.compressor_state_snapshot.launch_gather(
+                    &de.compute,
+                    &mut sd.comp_state_kv_snapshots,
+                    &mut sd.comp_state_score_snapshots,
+                    &sd.kv_cur,
+                    &sd.sc_cur,
+                    &cs.state_kv,
+                    &cs.state_score,
+                    &cw.ape.buffer,
+                    &sd.comp_pos_per_boundary,
+                    comp_width,
+                    ratio,
+                    rows_state,
+                    pos0 as i32,
+                    b,
+                    n_bnd,
+                )?;
+                // End-of-chunk state for the NEXT chunk. After the last
+                // boundary the serial path leaves rows 0..ratio-1 holding the
+                // final complete group (shuffled down for ratio==4, written
+                // in place for ratio==128); rows above that are dead until
+                // the next group overwrites them. Reproduce with one batched
+                // state_write over those `ratio` positions.
+                let l_last = b - ratio;               // offset into kv_cur
                 let comp_stride = comp_width as usize;
-                let kv_seg = sd.kv_cur.slice_view(
-                    (i as usize) * comp_stride,
-                    (seg_len as usize) * comp_stride,
-                );
-                let sc_seg = sd.sc_cur.slice_view(
-                    (i as usize) * comp_stride,
-                    (seg_len as usize) * comp_stride,
-                );
-                let row_seg = sd.row_per_b.slice_view(i as usize, seg_len as usize);
-                let pm_seg = sd.pos_mod_per_b.slice_view(i as usize, seg_len as usize);
+                let kv_seg = sd
+                    .kv_cur
+                    .slice_view((l_last as usize) * comp_stride, (ratio as usize) * comp_stride);
+                let sc_seg = sd
+                    .sc_cur
+                    .slice_view((l_last as usize) * comp_stride, (ratio as usize) * comp_stride);
+                // Destination rows are 0..ratio-1 (post-shuffle slots), NOT
+                // row_per_b's 4+pos_mod. With pos0 % ratio == 0 and
+                // b % ratio == 0, pos_mod_per_b[0..ratio] == [0..ratio-1],
+                // which is exactly both the row list and the APE index list.
+                let pm_seg = sd.pos_mod_per_b.slice_view(0, ratio as usize);
+                let row_seg = sd.pos_mod_per_b.slice_view(0, ratio as usize);
                 de.compressor_state_write.launch_batched(
                     &de.compute,
                     &mut cs.state_kv,
@@ -1382,57 +2043,89 @@ impl HeterogeneousEngine {
                     &row_seg,
                     &pm_seg,
                     comp_width,
-                    seg_len,
+                    ratio,
                 )?;
+            } else {
+                let mut i: u32 = 0;
+                while i < b {
+                    let pos_mod_now = (pos0 + i) % ratio;
+                    let seg_len = std::cmp::min(ratio - pos_mod_now, b - i);
+                    let seg_end = i + seg_len;
 
-                // Boundary fire? Snapshot state for batched post-pass at
-                // end-of-chunk. Shuffle still runs immediately so the
-                // NEXT segment's state_write sees correct "old" rows.
-                let comp_fires = (pos0 + seg_end) % ratio == 0;
-                if comp_fires {
-                    let k = pos_per_boundary_host.len();
-                    let snap_off = k * snap_elems;
-                    let mut snap_kv = sd
-                        .comp_state_kv_snapshots
-                        .slice_view_mut(snap_off, snap_elems);
-                    let mut snap_sc = sd
-                        .comp_state_score_snapshots
-                        .slice_view_mut(snap_off, snap_elems);
-                    de.compressor_state_snapshot.launch(
+                    // Batched state_write for this segment.
+                    let comp_stride = comp_width as usize;
+                    let kv_seg = sd.kv_cur.slice_view(
+                        (i as usize) * comp_stride,
+                        (seg_len as usize) * comp_stride,
+                    );
+                    let sc_seg = sd.sc_cur.slice_view(
+                        (i as usize) * comp_stride,
+                        (seg_len as usize) * comp_stride,
+                    );
+                    let row_seg = sd.row_per_b.slice_view(i as usize, seg_len as usize);
+                    let pm_seg = sd.pos_mod_per_b.slice_view(i as usize, seg_len as usize);
+                    de.compressor_state_write.launch_batched(
                         &de.compute,
-                        &mut snap_kv,
-                        &mut snap_sc,
-                        &cs.state_kv,
-                        &cs.state_score,
-                        snap_elems as u32,
+                        &mut cs.state_kv,
+                        &mut cs.state_score,
+                        &kv_seg,
+                        &sc_seg,
+                        &cw.ape.buffer,
+                        &row_seg,
+                        &pm_seg,
+                        comp_width,
+                        seg_len,
                     )?;
-                    if ratio == 4 {
-                        de.compressor_shuffle.launch(
-                            &de.compute,
-                            &mut cs.state_kv,
-                            &mut cs.state_score,
-                            comp_width,
-                        )?;
-                    }
-                    pos_per_boundary_host.push((pos0 + seg_end - ratio) as i32);
-                    cs.n_comp += 1;
-                }
 
-                // n_comp_after semantics: for token at pos = pos0+k, value
-                // reflects cs.n_comp AFTER processing that position. If the
-                // boundary fires at the end of this segment, only the LAST
-                // position sees the post-fire n_comp; earlier positions see pre-fire.
-                let post_fire = cs.n_comp;
-                let pre_fire = if comp_fires { post_fire - 1 } else { post_fire };
-                for k in i..seg_end {
-                    let snap = if comp_fires && k == seg_end - 1 {
-                        post_fire
-                    } else {
-                        pre_fire
-                    };
-                    n_comp_after.push(snap);
+                    // Boundary fire? Snapshot state for batched post-pass at
+                    // end-of-chunk. Shuffle still runs immediately so the
+                    // NEXT segment's state_write sees correct "old" rows.
+                    let comp_fires = (pos0 + seg_end) % ratio == 0;
+                    if comp_fires {
+                        let k = pos_per_boundary_host.len();
+                        let snap_off = k * snap_elems;
+                        let mut snap_kv = sd
+                            .comp_state_kv_snapshots
+                            .slice_view_mut(snap_off, snap_elems);
+                        let mut snap_sc = sd
+                            .comp_state_score_snapshots
+                            .slice_view_mut(snap_off, snap_elems);
+                        de.compressor_state_snapshot.launch(
+                            &de.compute,
+                            &mut snap_kv,
+                            &mut snap_sc,
+                            &cs.state_kv,
+                            &cs.state_score,
+                            snap_elems as u32,
+                        )?;
+                        if ratio == 4 {
+                            de.compressor_shuffle.launch(
+                                &de.compute,
+                                &mut cs.state_kv,
+                                &mut cs.state_score,
+                                comp_width,
+                            )?;
+                        }
+                        pos_per_boundary_host.push((pos0 + seg_end - ratio) as i32);
+                        cs.n_comp += 1;
+                    }
+
+                    // n_comp_after semantics: for token at pos = pos0+k, value
+                    // reflects cs.n_comp AFTER processing that position. If the
+                    // boundary fires at the end of this segment, only the LAST
+                    // position sees the post-fire n_comp; earlier positions see pre-fire.
+                    let post_fire = cs.n_comp;
+                    let pre_fire = if comp_fires { post_fire - 1 } else { post_fire };
+                    for k in i..seg_end {
+                        let snap = if comp_fires && k == seg_end - 1 {
+                            post_fire
+                        } else {
+                            pre_fire
+                        };
+                        n_comp_after.push(snap);
+                    }
+                    i = seg_end;
                 }
-                i = seg_end;
             }
 
             // Batched per-boundary stages: pool → rms_w → rope → fp8 →
@@ -1482,18 +2175,24 @@ impl HeterogeneousEngine {
                 }
                 match &mut cs.comp_kv {
                     CompKvStore::F16(buf) => {
-                        de.fp8.launch_batched(
-                            &de.compute,
-                            &mut sd.comp_rows_batched,
-                            N_HEAD_DIM - N_ROT,
-                            N_HEAD_DIM,
-                            n_boundaries,
-                        )?;
-                        de.f16rt.launch(
-                            &de.compute,
-                            &mut sd.comp_rows_batched,
-                            n_boundaries * N_HEAD_DIM,
-                        )?;
+                        if cfg!(feature = "v41") {
+                            // V4.1: E2M1 × E4M3/16 fake quant over the whole row
+                            // (decode twin: forward_layer.rs `k.compressor_d.fp4kv`).
+                            de.fp4kv.launch(&de.compute, &mut sd.comp_rows_batched, n_boundaries, N_HEAD_DIM)?;
+                        } else {
+                            de.fp8.launch_batched(
+                                &de.compute,
+                                &mut sd.comp_rows_batched,
+                                N_HEAD_DIM - N_ROT,
+                                N_HEAD_DIM,
+                                n_boundaries,
+                            )?;
+                            de.f16rt.launch(
+                                &de.compute,
+                                &mut sd.comp_rows_batched,
+                                n_boundaries * N_HEAD_DIM,
+                            )?;
+                        }
                         de.comp_kv_append.launch_batched(
                             &de.compute,
                             buf,
@@ -1521,14 +2220,39 @@ impl HeterogeneousEngine {
                     }
                 }
             }
+        } else if ratio > 0 {
+            // V4.1 reuse layer: `ls.compressor` is the source's store, already
+            // advanced by the source layer this chunk. Row k sees the rows
+            // that existed before the chunk plus the boundaries up to k.
+            let cs = ls.compressor.as_ref().ok_or_else(|| eyre!(
+                "L{layer}: reuse layer without its source's store (wrap the forward in HetModelState::with_kv_source)"
+            ))?;
+            // The store is 1:1 with compressor boundaries from position 0, so
+            // row k's causal count is positional. It must NOT be derived from
+            // `cs.n_comp - boundaries_in_this_call`: in the two-lane driver the
+            // source layer has already appended the OTHER lane's rows by the
+            // time this lane's reuse layer runs, which let lane A attend to
+            // lane B's (future) compressed rows.
+            let need = (pos0 + b) / ratio;
+            if cs.n_comp < need {
+                return Err(eyre!(
+                    "L{layer}: source store n_comp {} < {need} boundaries up to pos {}",
+                    cs.n_comp,
+                    pos0 + b
+                ));
+            }
+            for k in 0..b {
+                n_comp_after.push((pos0 + k + 1) / ratio);
+            }
         } else {
             for _ in 0..b {
                 n_comp_after.push(0);
             }
         }
         // Clamp to the per-token stride of every comp-indexed scratch
-        // buffer (indexer_scores, ...). Production can't exceed it (ctx ≤
-        // 4 × ATTN_MIXED_MAX_KEYS by config), but FAKE_PREFILL_POS benches
+        // buffer (indexer_scores, ...). Production can't exceed it (the
+        // server refuses a --ctx whose `attn_max_scored_keys` exceeds
+        // ATTN_MIXED_MAX_KEYS), but FAKE_PREFILL_POS benches
         // stamping pos at the cap and decoding past it used to overrun the
         // (since removed) CSA bitmap by one word (the 98304 trap).
         for v in n_comp_after.iter_mut() {
@@ -1731,6 +2455,11 @@ impl HeterogeneousEngine {
             }
         }
         drop(_t_kv_append_comp);
+        if ced == CedMode::KvSourceOnly {
+            // M7 CED: the decoder's global KV for these rows is in the store;
+            // nothing below (window KV, attention, MoE) runs for them.
+            return Ok(());
+        }
 
         // ========================================================
         // Stage 5: Attention (BATCHED — grid (n_head, B, 1))
@@ -1765,7 +2494,55 @@ impl HeterogeneousEngine {
         let nrp_view = sd.n_raw_per.slice_view(0, b as usize);
         let nrop_view = sd.n_raw_offset_per.slice_view(0, b as usize);
         let ncp_view = sd.n_comp_per.slice_view(0, b as usize);
-        if ratio == 0 {
+        if ratio == 0 && swa_via_mixed() {
+            // Ratio-0 layers through the batched WMMA mixed pair (see
+            // `swa_via_mixed`). `n_comp_per` is already all-zero here (no
+            // compressor on a dense layer) and `comp_kv = None`, so the
+            // kernels reduce to pure SWA over the raw window.
+            let n_total_max = n_raw_after.iter().copied().max().unwrap_or(0);
+            if n_total_max > 0 {
+                let scores_stride = sd.attn_scores_stride(b, n_total_max)?;
+                {
+                    let _t = de.events.stage("k.attn.score", &de.compute)?;
+                    de.attn_mixed.launch_score_batched_htiled_wmma_f16s(
+                        &de.compute,
+                        &mut sd.attn_scores,
+                        &sd.q_normed,
+                        &ls.kv_cache,
+                        None,
+                        &nrp_view,
+                        &nrop_view,
+                        &ncp_view,
+                        None,
+                        N_HEAD,
+                        N_HEAD_DIM,
+                        n_total_max,
+                        b,
+                        0,
+                        scores_stride,
+                    )?;
+                }
+                {
+                    let _t = de.events.stage("k.attn.smwsum", &de.compute)?;
+                    de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(
+                        &de.compute,
+                        &mut sd.heads,
+                        &mut sd.attn_scores,
+                        &dlw.attn_sinks,
+                        &ls.kv_cache,
+                        None,
+                        &nrp_view,
+                        &nrop_view,
+                        &ncp_view,
+                        N_HEAD,
+                        N_HEAD_DIM,
+                        b,
+                        0,
+                        scores_stride,
+                    )?;
+                }
+            }
+        } else if ratio == 0 {
             // Dynamic-LDS stride for attention_swa_batched. Text-only chunks
             // keep SWA_WINDOW here, so the kernel allocates exactly the 1 KiB
             // its old static `scores[128]/weights[128]` arrays used and the
@@ -2154,6 +2931,13 @@ impl HeterogeneousEngine {
 
             let fused = std::env::var_os("ATTN_FUSED").is_some();
             let f32_scores = super::batch_scratch::use_f32_scores();
+            // Per-(row, head) stride of `sd.attn_scores` for THIS launch pair.
+            // Derived from the buffer's real capacity at this batch, not from
+            // a compile-time constant that assumed compression ratio >= 4:
+            // V4.1's ratio-1 decoder layers score `n_raw + n_kv` keys, and the
+            // old fixed 3072 stride errored out at 2944 prompt tokens.
+            // Score and smwsum MUST be handed the same value.
+            let scores_stride = sd.attn_scores_stride(b, eff_n_total_max)?;
             if !fused {
                 let _t = de.events.stage("k.attn.score", &de.compute)?;
                 if f32_scores {
@@ -2170,6 +2954,7 @@ impl HeterogeneousEngine {
                         N_HEAD_DIM,
                         eff_n_total_max,
                         b,
+                        scores_stride,
                     )?;
                 } else {
                     de.attn_mixed.launch_score_batched_htiled_wmma_f16s(
@@ -2187,6 +2972,7 @@ impl HeterogeneousEngine {
                         eff_n_total_max,
                         b,
                         eff_comp_kv_batch_stride,
+                        scores_stride,
                     )?;
                 }
             }
@@ -2232,6 +3018,7 @@ impl HeterogeneousEngine {
                         N_HEAD,
                         N_HEAD_DIM,
                         b,
+                        scores_stride,
                     )?;
                 } else {
                     de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(
@@ -2248,6 +3035,7 @@ impl HeterogeneousEngine {
                         N_HEAD_DIM,
                         b,
                         eff_comp_kv_batch_stride,
+                        scores_stride,
                     )?;
                 }
             }
@@ -2416,15 +3204,27 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.mhc_pre_ffn.f16_matvec", &de.compute)?;
-            de.f16.matvec_narrow_batched(
-                &de.compute,
-                &mut sd.mix,
-                &dlw.hc_ffn_fn.buffer,
-                &sd.flat,
-                HC_MIX_DIM,
-                HC_DIM,
-                b,
-            )?;
+            if mhc_narrow_fallback() {
+                de.f16.matvec_narrow_batched(
+                    &de.compute,
+                    &mut sd.mix,
+                    &dlw.hc_ffn_fn.buffer,
+                    &sd.flat,
+                    HC_MIX_DIM,
+                    HC_DIM,
+                    b,
+                )?;
+            } else {
+                de.f16.gemm_batched_wmma(
+                    &de.compute,
+                    &mut sd.mix,
+                    &dlw.hc_ffn_fn.buffer,
+                    &sd.flat,
+                    HC_MIX_DIM,
+                    HC_DIM,
+                    b,
+                )?;
+            }
         }
         {
             let _t = de.events.stage("k.mhc_pre_ffn.sinkhorn", &de.compute)?;
@@ -2442,16 +3242,13 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.mhc_pre_ffn.hc_weighted", &de.compute)?;
-            de.hc_weighted.launch_batched(
-                &de.compute,
-                &mut sd.ffn_cur,
-                &bd.after_attn_hc,
-                &bd.split,
-                N_EMBD,
-                N_HC,
-                HC_MIX_DIM,
-                b,
-            )?;
+            let w = if cfg!(feature = "v41") { &bd.hc_pre_carry } else { &bd.split };
+            de.hc_weighted.launch_batched(&de.compute, &mut sd.ffn_cur, &bd.after_attn_hc, w, N_EMBD, N_HC, HC_MIX_DIM, b)?;
+            if cfg!(feature = "v41") {
+                let rows = b as usize * HC_MIX_DIM as usize;
+                let cur = bd.split.slice_view(0, rows);
+                bd.hc_pre_carry.slice_view_mut(0, rows).copy_from_buffer_async(&cur, &de.compute)?;
+            }
         }
         {
             let _t = de.events.stage("k.mhc_pre_ffn.rms_w", &de.compute)?;
@@ -2681,9 +3478,301 @@ impl HeterogeneousEngine {
         // iq2_fused_swiglu → q8k_mid → q2k_down with by-expert dispatch),
         // one peer-push of [B × N_EMBD] ffn_moe back.
         // ========================================================
-        let gbpe = ilw.routed.gate_bytes_per_expert as u32;
-        let ubpe = ilw.routed.up_bytes_per_expert as u32;
-        let dbpe = ilw.routed.down_bytes_per_expert as u32;
+        // ---- M7 paged experts -------------------------------------------------
+        // Page this layer's experts out of the pool before the MoE reads them.
+        //
+        // A prefill chunk's routed union at B >> 1 is essentially ALL experts
+        // (routing is flat: top-15 is ~28% of picks), so we page the full set
+        // rather than read back d_selected. That avoids a host sync on the
+        // critical path, and it is a strict SUPERSET of what the router picked,
+        // so it cannot under-page (under-paging is what produced garbage before).
+        // ---- M7 paged experts -------------------------------------------------
+        // Page this layer's FULL expert set into a dense window (slot == expert id).
+        // Prefill's group builder sizes group_count/expert_members to N_EXPERT, so a
+        // group id must be a raw expert id; the LRU's pool-wide slots would overrun
+        // those arrays. With a dense window the pool is a drop-in for the resident
+        // buffer and every downstream dispatch is unchanged (no remap, not packed).
+        // Two-box split state for this layer, decided once.
+        //
+        // A single remap cannot encode two splits at the same time: the dGPU
+        // hot set wants remote ids NEGATIVE (not its slots) while the iGPU wants
+        // them NON-NEGATIVE (skip). V4.1 runs `hot_experts = None` so this never
+        // co-occurs today; refuse loudly rather than silently mis-route if it
+        // ever does.
+        let remote_owns_layer = self
+            .remote
+            .as_ref()
+            .and_then(|r| r.lock().ok().map(|c| c.info().owned_count(layer as u32) > 0))
+            .unwrap_or(false);
+        let remote_split_on = remote_split_active() && remote_owns_layer;
+        // The het-split builder's cap is a per-token RANK test, not a count of
+        // devices. Under the dGPU hot split it deliberately keeps only the top
+        // `hot_prefill_cap()` picks for the iGPU. Under the remote split the
+        // iGPU must still receive every pick the remote does NOT own, so the cap
+        // has to be the full top-k — anything lower silently drops local picks
+        // beyond that rank and under-computes the layer with no error.
+        // Also pinned whenever the PAGER owns the window: the builder's over-cap
+        // branch (`moe_group_builder.hip:116`) falls back to the RAW expert id
+        // `g = e` once a pick's rank reaches the cap, which indexes a packed window
+        // at the wrong slot. Same shape as the M63 over-cap bug and the
+        // hot_prefill_cap()=4 vs N_EXPERT_USED=6 bug: over-cap picks are handed to
+        // the other device by raw id, silently.
+        let split_cap: u32 = if remote_split_on || pager.is_some() {
+            crate::config::N_EXPERT_USED as u32
+        } else {
+            hot_prefill_cap()
+        };
+        if remote_split_on && prefill_hot_active(dlw, ilw, bd, sd) {
+            return Err(eyre!(
+                "L{layer}: dGPU hot split and the two-box remote split are both active; \
+                 one remap cannot encode both (see set_remote_exclusion)"
+            ));
+        }
+
+        // Router picks for this chunk, read back once and shared by the union
+        // pager and the remote submit below (both need exactly these ids).
+        let mut sel_host_remote: Vec<i32> = Vec::new();
+        if let Some(pg) = pager.as_deref_mut() {
+            // Page the chunk's ACTUAL routed union, not all N_EXPERT. The
+            // "union at B >> 1 is essentially everything" argument above holds
+            // at large B and is badly false at small B: a B-token chunk touches
+            // at most B * N_EXPERT_USED experts, so a 17-token prompt needs 102
+            // of 384 and was reading all 384 — ~7.2 GB/layer, ~288 GB over 40
+            // layers, to prefill 17 tokens. Costs one de.compute sync per layer
+            // to read d_selected back; that is ~1 ms against seconds of reads.
+            // At large B the union really is ~everything, and there the dense
+            // path's single contiguous H2D per role beats 3*|ids| scattered
+            // copies, so keep using it. V41_PAGER_UNION=0 forces dense always.
+            if super::expert_pager::pager_union_prefill() {
+                let n_sel = (b as usize) * cs_n_used;
+                let mut sel_host = vec![0i32; n_sel];
+                de.compute.synchronize()?;
+                bd.d_selected
+                    .slice_view(0, n_sel)
+                    .copy_to_host(&mut sel_host)?;
+                // C3: with the split active, box 2 OWNS half of this layer's
+                // experts and computes them itself — so this box must not page
+                // them at all. That is the whole point of the split: the working
+                // set drops from ~203 experts/layer to ~102, i.e. ~38 GB for all
+                // 20 encoder layers, which fits the pool with every layer pinned
+                // instead of re-paging each one for every chunk.
+                //
+                // Correct ONLY because C2 is correct: the local iGPU already
+                // skips these picks (exclusion remap) and the remote's partial
+                // supplies them at the combine. If either half regresses, this
+                // turns a missing expert into silently wrong output rather than
+                // an error — so it is gated on the same flag.
+                let owns_remote: Option<Vec<bool>> = if remote_split_on {
+                    self.remote.as_ref().and_then(|r| {
+                        r.lock().ok().map(|c| {
+                            (0..N_EXPERT).map(|e| c.owns(layer as u32, e as i32)).collect()
+                        })
+                    })
+                } else {
+                    None
+                };
+                let mut seen = vec![false; N_EXPERT as usize];
+                let mut ids: Vec<u32> = Vec::with_capacity(N_EXPERT as usize);
+                let mut skipped_remote = 0usize;
+                for &sv in &sel_host {
+                    if (0..N_EXPERT as i32).contains(&sv) && !seen[sv as usize] {
+                        seen[sv as usize] = true;
+                        if let Some(o) = owns_remote.as_ref() {
+                            if o[sv as usize] {
+                                skipped_remote += 1;
+                                continue;
+                            }
+                        }
+                        ids.push(sv as u32);
+                    }
+                }
+                if skipped_remote > 0 && std::env::var("V41_REMOTE_DBG").is_ok() {
+                    eprintln!(
+                        "[c3-dbg] L{layer} paging {} experts, skipped {skipped_remote} owned by box 2",
+                        ids.len()
+                    );
+                }
+                // T2 CATCH-ALL on the CED REPLAY (`V41_T2_CATCHALL=1`).
+                //
+                // The replay runs a 128-token window through the 20 DECODER layers,
+                // and box 1 has `dense_windows=1` — so it streams a whole layer union
+                // (~162 experts x 18.8 MB) into its single window, 20 times over:
+                // ~50-60 GB of reads per replay, measured at 11.8 s = 37% of a 6k
+                // prefill. Box 2 already holds these layers, so hand it the ENTIRE
+                // decoder-layer MoE and page nothing here. Box 2's per-layer capacity
+                // must be >= the replay union (162 at B=128) or `ensure_layer` cannot
+                // make them all resident at once for the dispatch.
+                let replay_offload = replay_offload_enabled()
+                    && remote_split_on
+                    && (layer as usize) >= crate::config::CED_DECODER_START;
+                if replay_offload {
+                    ids.clear();
+                } else if ids.len() * 10 >= N_EXPERT as usize * 9 {
+                    pg.ensure_layer_dense(layer as i32)?;
+                } else {
+                    pg.ensure_layer_union(layer as i32, &ids)?;
+                }
+                sel_host_remote = sel_host;
+                // Two-box split: tell the iGPU to skip the experts box 2 owns.
+                // Built here, while we still hold `&mut pg`; consumed below via
+                // `pg.remap_dev` under the shared borrow.
+                if remote_split_on {
+                    if let Some(remote) = self.remote.as_ref() {
+                        let owns: Vec<bool> = {
+                            let c = remote
+                                .lock()
+                                .map_err(|_| eyre!("remote expert client mutex poisoned"))?;
+                            (0..N_EXPERT).map(|e| c.owns(layer as u32, e as i32)).collect()
+                        };
+                        let dry = !remote_exclude();
+                        if std::env::var("V41_REMOTE_DBG").is_ok() {
+                            let n_owned = owns.iter().filter(|&&o| o).count();
+                            let picks_remote = sel_host_remote
+                                .iter()
+                                .filter(|&&e| (0..N_EXPERT as i32).contains(&e) && owns[e as usize])
+                                .count();
+                            eprintln!(
+                                "[excl-dbg] L{layer} owned={n_owned}/{N_EXPERT} \
+                                 picks_remote={picks_remote}/{} dry={dry}",
+                                sel_host_remote.len(),
+                            );
+                        }
+                        // Under replay offload EVERY expert on this layer is box 2's.
+                        let owns_eff: Vec<bool> = (0..N_EXPERT as usize)
+                            .map(|e| replay_offload || (!dry && owns[e]))
+                            .collect();
+                        pg.set_remote_exclusion(layer as i32, |e| owns_eff[e as usize])?;
+                        // Every routed pick must be computed by EXACTLY ONE device.
+                        // Decode has had this check since the catch-all landed
+                        // (`forward_layer.rs`); PREFILL has had none, and it is the
+                        // path about to gain packed windows — where a mis-encoded
+                        // remap entry is silent (wrong slot => another expert's
+                        // weights, no error). O(picks) via a bitmap, so the B*6
+                        // prefill batch is fine.
+                        super::forward_layer::verify_routing_exactly_once(
+                            layer as i32,
+                            &sel_host_remote,
+                            pg.remap(),
+                            Some(&owns_eff),
+                        )?;
+                    }
+                }
+            } else {
+                pg.ensure_layer_dense(layer as i32)?;
+            }
+        }
+
+        // ---- Two-box split, phase C1: ship this layer's activations to the
+        // remote shard. See docs/v41/REMOTE_EXPERTS.md §6.
+        //
+        // Issued BEFORE the local iGPU chain so the ~74 ms round trip at
+        // B=1024 overlaps the ~150 ms of local compute instead of adding to
+        // it. Whether that overlap actually happens is exactly what the
+        // `remote.submit` / `remote.wait` host tracks exist to show: a thin
+        // `remote.wait` beside a fat `igpu.routed_moe` means it is hidden.
+        //
+        // C1 discards the partial — the local iGPU still computes every
+        // expert, so numerics are unchanged and this is purely additive. The
+        // exclusion remap and the combine operand (which DO change numerics)
+        // come next, and only then may `ensure_layer_union` stop paging the
+        // remote-owned half.
+        // Gated on `remote_split_on`, not merely on a remote being attached.
+        // Phase C1 submitted unconditionally and discarded the reply, which was
+        // right while the split was being validated but costs a real ~5.7 MB
+        // round trip per layer once it is off — it showed up as a 48.6 -> 42.5
+        // tok/s regression in the split-OFF arm of every A/B.
+        if let (true, Some(remote), Some(xq_dev)) =
+            (remote_split_on, self.remote.as_ref(), sd.remote_xq.as_mut())
+        {
+            {
+                let n_sel = (b as usize) * cs_n_used;
+                let xq_bytes = (b as usize)
+                    * (crate::config::BLOCKS_Q8K_GATE_IN as usize)
+                    * crate::q8_k::BLOCK_Q8_K_BYTES;
+                // The pager just left the iGPU current (it binds its own device
+                // to allocate slots). `de.q8k` is a dGPU module and HIP resolves
+                // module handles against the CURRENT device, so launching
+                // without rebinding fails with hipErrorInvalidHandle.
+                //
+                // This MUST be the uncached bind. `set_current_cached` skips the
+                // real `hipSetDevice` when its cached id already matches, and the
+                // pager switched devices via `Device::set_current` directly —
+                // the engine's cache never saw it and is stale, so the cached
+                // setter is a silent no-op here. Re-sync the cache after, or the
+                // next cached call inherits the same staleness.
+                self.dgpu.device.set_current()?;
+                self.current_device.store(
+                    self.dgpu.device.id,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                // Same kernel the iGPU would use, so the bytes match by
+                // construction rather than by agreement.
+                de.q8k.launch(
+                    &de.compute,
+                    xq_dev,
+                    &bd.ffn_input_norm,
+                    crate::config::BLOCKS_Q8K_GATE_IN * b,
+                )?;
+                de.compute.synchronize()?;
+                let mut xq_host = vec![0u8; xq_bytes];
+                xq_dev.slice_view(0, xq_bytes).copy_to_host(&mut xq_host)?;
+                let mut ew_host = vec![0f32; n_sel];
+                bd.d_ew.slice_view(0, n_sel).copy_to_host(&mut ew_host)?;
+                // `sel_host` above is this chunk's router picks; reuse it.
+                let t_sub = super::perfetto::now_ns();
+                let ticket = remote
+                    .lock()
+                    .map_err(|_| eyre!("remote expert client mutex poisoned"))?
+                    .submit(layer as u32, b as usize, &xq_host, &sel_host_remote, &ew_host, remote_split_on)?;
+                let t_sub_end = super::perfetto::now_ns();
+                // Stash, don't wait: the local iGPU MoE for this layer is issued
+                // right after this block, and post-MoE collects the reply. The
+                // gap between the `submit` and `wait` slices on the
+                // `remote.expert (host)` track IS the overlap we bought.
+                bd.remote_ticket = ticket;
+                bd.remote_ffn_moe_layer = layer as i32;
+                if let Some(pf) = self.perfetto.as_ref() {
+                    if let Ok(pf) = pf.lock() {
+                        let _ = pf.emit_host_slice(
+                            pf.remote_uuid,
+                            &format!("submit L{layer} b={b}"),
+                            t_sub, t_sub_end,
+                        );
+                    }
+                }
+            }
+        }
+        let pager_window;
+        let (routed_src, moe_remap, moe_packed): (
+            &crate::model_weights::RoutedExpertWeights,
+            Option<&v4flash_hip::DeviceBuffer<i32>>,
+            bool,
+        ) = match pager.as_deref() {
+            // A VIEW of this layer's dense window, not the whole pool: the window's
+            // slot i holds expert i, so the kernel indexes it exactly like a resident
+            // buffer while other layers stay resident in other windows.
+            Some(pg) => {
+                pager_window = pg.routed_window(layer as i32);
+                // ALWAYS hand the dispatch the remap when the pager owns the
+                // window, not just under the remote split.
+                //
+                // With a dense window `slot == raw expert id`, so a `None` remap
+                // used to be harmless — the PLAIN group builder's raw ids happened
+                // to be correct slots. That equivalence is exactly what packed
+                // windows break (`moe_group_builder.hip:116` mode 0 takes the group
+                // id FROM the remap: `g = (dense >= 0) ? e : (-dense - 1)`), so a
+                // layer that fell through to `None` would index a packed window by
+                // raw id and read another expert's weights — silently, with no
+                // error and plausible-looking output. Passing it unconditionally is
+                // a no-op today (mode 0 with an all-local remap is arithmetically
+                // identical to the plain builder) and the precondition for packing.
+                (&pager_window, Some(&pg.remap_dev), false)
+            }
+            None => (&ilw.routed, ilw.hot_remap.as_ref(), ilw.igpu_packed),
+        };
+        let gbpe = routed_src.gate_bytes_per_expert as u32;
+        let ubpe = routed_src.up_bytes_per_expert as u32;
+        let dbpe = routed_src.down_bytes_per_expert as u32;
         let mid_blocks_bytes = (crate::config::BLOCKS_Q8K_DOWN_IN as usize)
             * crate::q8_k::BLOCK_Q8_K_BYTES;
         // Stage 9 router_topk + Stage 10 shared expert wrote bd.d_selected,
@@ -2779,7 +3868,7 @@ impl HeterogeneousEngine {
             // Single-prefill-kernel formats (IQ2_S/IQ2_XS/IQ3_XXS/IQ3_S) go
             // through the dispatcher; IQ2_XXS falls through to its kwide kernel.
             if !super::dispatch::moe_gate_up_chunked(
-                de, ilw.routed.gate.dtype, &de.compute, &mut hd.mid_cat, &hot.gate, &hot.up,
+                de, routed_src.gate.dtype, &de.compute, &mut hd.mid_cat, &hot.gate, &hot.up,
                 &hd.moe_xq, &bd.d_ew, &hd.group_count, &hd.expert_members,
                 &hd.work_items_static, n_wi, gbpe, ubpe, cs_n_used as u32,
                 max_per_expert, HOT_CHUNK as u32, crate::config::SWIGLU_CLAMP_EXP,
@@ -2812,7 +3901,7 @@ impl HeterogeneousEngine {
                 &hd.mid_cat,
                 crate::config::BLOCKS_Q8K_DOWN_IN * (cs_n_used as u32) * b,
             )?;
-            match ilw.routed.down.dtype {
+            match routed_src.down.dtype {
                 v4flash_core::gguf::GgufType::IQ3_XXS => de.iq3.launch_by_expert_kwide2(
                     &de.compute, &mut hd.partials, &hot.down, &hd.midq_cat,
                     &hd.group_count, &hd.expert_members, &hd.work_items_static, n_wi,
@@ -2871,8 +3960,8 @@ impl HeterogeneousEngine {
         // Q8_K quantize on either side of the gate/up. See dispatch.rs.
         let variant_peek = std::env::var("IQ2_VARIANT").unwrap_or_else(|_| "kwide".into());
         let wmma_path = super::dispatch::igpu_moe_wmma_selected(
-            ilw.routed.gate.dtype,
-            ilw.routed.down.dtype,
+            routed_src.gate.dtype,
+            routed_src.down.dtype,
             ie.is_gfx11,
             &variant_peek,
             super::dispatch::igpu_moe_wmma_env_enabled(),
@@ -2912,7 +4001,11 @@ impl HeterogeneousEngine {
                 ..
             } = bi;
             let BatchIgpuShared { expert_members, .. } = si;
-            if hot_active {
+            // Take the het-split builder whenever a remap is in play: either the
+            // M56 dGPU hot split (hot_active), or the M7 pager, whose remap sends
+            // EVERY pick to a pool slot. The plain builder emits raw expert ids,
+            // which cannot index a packed/pooled buffer.
+            if let Some(rm) = moe_remap {
                 // M61: build groups for the MISS slots only — the dGPU
                 // owns the resident slots (up to the per-token cap).
                 ie.moe_group_builder.launch_hetsplit(
@@ -2920,9 +4013,9 @@ impl HeterogeneousEngine {
                     group_count,
                     expert_members,
                     d_selected,
-                    ilw.hot_remap.as_ref().unwrap(),
+                    rm,
                     /*mode=*/ 0,
-                    hot_prefill_cap(),
+                    split_cap,
                     b,
                     cs_n_used as u32,
                     N_EXPERT,
@@ -2931,7 +4024,7 @@ impl HeterogeneousEngine {
             } else {
                 // Emits RAW expert ids as group ids — incompatible with a
                 // de-duplicated iGPU buffer (see prefill_hot_active).
-                if ilw.igpu_packed {
+                if moe_packed {
                     return Err(eyre!(
                         "L{layer}: iGPU experts are packed (IGPU_DEDUP_HOT) but the prefill \
                          het-split is inactive — the plain group builder would index the \
@@ -2963,11 +4056,11 @@ impl HeterogeneousEngine {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8);
-        if variant == "hybrid" && ilw.routed.gate.dtype != v4flash_core::gguf::GgufType::IQ2_XXS {
+        if variant == "hybrid" && routed_src.gate.dtype != v4flash_core::gguf::GgufType::IQ2_XXS {
             return Err(eyre!(
                 "IQ2_VARIANT=hybrid unsupported on a layer with {:?} gate/up \
                  (unsloth blk.26); unset IQ2_VARIANT",
-                ilw.routed.gate.dtype
+                routed_src.gate.dtype
             ));
         }
         if variant == "hybrid" {
@@ -3030,7 +4123,7 @@ impl HeterogeneousEngine {
                     let _t_st = ie.events.stage("igpu.iq2_staged", &ie.compute)?;
                     ie.iq2.launch_fused_swiglu_chunked_staged(
                         &ie.compute, d_mid_cat,
-                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        &routed_src.gate.buffer, &routed_src.up.buffer,
                         d_xq_q8k, d_ew,
                         group_count, expert_members, staged_work_items,
                         gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
@@ -3044,7 +4137,7 @@ impl HeterogeneousEngine {
                     let _t_ch = ie.events.stage("igpu.iq2_chunked", &ie.compute)?;
                     ie.iq2.launch_fused_swiglu_chunked(
                         &ie.compute, d_mid_cat,
-                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        &routed_src.gate.buffer, &routed_src.up.buffer,
                         d_xq_q8k, d_ew,
                         group_count, expert_members, chunked_work_items,
                         gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
@@ -3099,10 +4192,10 @@ impl HeterogeneousEngine {
                 // does not apply. IQ2_XXS returns false and takes the zoo below.
                 let handled = if wmma_path {
                     let _t_wm = ie.events.stage("igpu.gateup_wmma", &ie.compute)?;
-                    match ilw.routed.gate.dtype {
+                    match routed_src.gate.dtype {
                         v4flash_core::gguf::GgufType::IQ2_S => ie.iq2s.launch_fused_swiglu_wmma_f16out(
                             &ie.compute, d_mid16,
-                            &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                            &routed_src.gate.buffer, &routed_src.up.buffer,
                             d_x16, d_ew,
                             group_count, expert_members, work_items,
                             n_work_items,
@@ -3113,7 +4206,7 @@ impl HeterogeneousEngine {
                         )?,
                         _ => ie.iq2xs.launch_fused_swiglu_wmma_f16out(
                             &ie.compute, d_mid16,
-                            &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                            &routed_src.gate.buffer, &routed_src.up.buffer,
                             d_x16, d_ew,
                             group_count, expert_members, work_items,
                             n_work_items,
@@ -3131,12 +4224,12 @@ impl HeterogeneousEngine {
                     // essentially the whole iGPU MoE prefill in the
                     // Vision-Exp mix.
                     let _t_ch = ie.events.stage(
-                        super::dispatch::pair_prefill_stage(ilw.routed.gate.dtype),
+                        super::dispatch::pair_prefill_stage(routed_src.gate.dtype),
                         &ie.compute,
                     )?;
                     super::dispatch::moe_gate_up_chunked(
-                        ie, ilw.routed.gate.dtype, &ie.compute, d_mid_cat,
-                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        ie, routed_src.gate.dtype, &ie.compute, d_mid_cat,
+                        &routed_src.gate.buffer, &routed_src.up.buffer,
                         d_xq_q8k, d_ew,
                         group_count, expert_members, work_items,
                         n_work_items,
@@ -3151,7 +4244,7 @@ impl HeterogeneousEngine {
                     let _t_t8 = ie.events.stage("igpu.iq2_tile8", &ie.compute)?;
                     ie.iq2.launch_fused_swiglu_tile8_row32(
                         &ie.compute, d_mid_cat,
-                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        &routed_src.gate.buffer, &routed_src.up.buffer,
                         d_xq_q8k, d_ew,
                         group_count, expert_members, work_items,
                         gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
@@ -3164,7 +4257,7 @@ impl HeterogeneousEngine {
                     let _t_kw = ie.events.stage("igpu.iq2_kwide", &ie.compute)?;
                     ie.iq2.launch_fused_swiglu_kwide(
                         &ie.compute, d_mid_cat,
-                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        &routed_src.gate.buffer, &routed_src.up.buffer,
                         d_xq_q8k, d_ew,
                         group_count, expert_members, work_items,
                         gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
@@ -3177,7 +4270,7 @@ impl HeterogeneousEngine {
                     let _t_s2 = ie.events.stage("igpu.iq2_staged_v2", &ie.compute)?;
                     ie.iq2.launch_fused_swiglu_chunked_staged_v2(
                         &ie.compute, d_mid_cat,
-                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        &routed_src.gate.buffer, &routed_src.up.buffer,
                         d_xq_q8k, d_ew,
                         group_count, expert_members, work_items,
                         gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
@@ -3190,7 +4283,7 @@ impl HeterogeneousEngine {
                     let _t_st = ie.events.stage("igpu.iq2_staged", &ie.compute)?;
                     ie.iq2.launch_fused_swiglu_chunked_staged(
                         &ie.compute, d_mid_cat,
-                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        &routed_src.gate.buffer, &routed_src.up.buffer,
                         d_xq_q8k, d_ew,
                         group_count, expert_members, work_items,
                         gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
@@ -3203,7 +4296,7 @@ impl HeterogeneousEngine {
                     let _t_ch = ie.events.stage("igpu.iq2_chunked", &ie.compute)?;
                     ie.iq2.launch_fused_swiglu_chunked(
                         &ie.compute, d_mid_cat,
-                        &ilw.routed.gate.buffer, &ilw.routed.up.buffer,
+                        &routed_src.gate.buffer, &routed_src.up.buffer,
                         d_xq_q8k, d_ew,
                         group_count, expert_members, work_items,
                         gbpe, ubpe, cs_n_used as u32, max_per_expert, CHUNK_SIZE,
@@ -3243,7 +4336,7 @@ impl HeterogeneousEngine {
             // Default kwide2 since M53 (2026-06-09): row-pair activation
             // reuse on top of kwide's unpack-once loop; bit-exact vs
             // by_expert. kwide/by_expert/bxn stay opt-in.
-            let down_dt = ilw.routed.down.dtype;
+            let down_dt = routed_src.down.dtype;
             let q2k_variant = if down_dt == v4flash_core::gguf::GgufType::Q2_K {
                 std::env::var("Q2K_VARIANT").unwrap_or_else(|_| "kwide2".into())
             } else {
@@ -3283,7 +4376,7 @@ impl HeterogeneousEngine {
                     let _t_dw = ie.events.stage("igpu.down_wmma", &ie.compute)?;
                     ie.iq3.launch_by_expert_wmma(
                         &ie.compute, &mut si.q2k_partials,
-                        &ilw.routed.down.buffer, &si.d_mid16,
+                        &routed_src.down.buffer, &si.d_mid16,
                         &bi.group_count, &si.expert_members, &si.work_items,
                         n_work_items, dbpe, crate::config::N_FF_EXP,
                         cs_n_used as u32, max_per_expert, CHUNK_SIZE,
@@ -3292,7 +4385,7 @@ impl HeterogeneousEngine {
                 } else if use_kwide2 && down_dt == v4flash_core::gguf::GgufType::IQ3_XXS {
                     ie.iq3.launch_by_expert_kwide2(
                         &ie.compute, &mut si.q2k_partials,
-                        &ilw.routed.down.buffer, &si.d_midq_cat,
+                        &routed_src.down.buffer, &si.d_midq_cat,
                         &bi.group_count, &si.expert_members, &si.work_items,
                         n_work_items, dbpe, mid_blocks_bytes as u32,
                         cs_n_used as u32, max_per_expert, CHUNK_SIZE,
@@ -3301,7 +4394,7 @@ impl HeterogeneousEngine {
                 } else if use_kwide2 && down_dt == v4flash_core::gguf::GgufType::MXFP4 {
                     ie.mxfp4.launch_by_expert_kwide2(
                         &ie.compute, &mut si.q2k_partials,
-                        &ilw.routed.down.buffer, &si.d_midq_cat,
+                        &routed_src.down.buffer, &si.d_midq_cat,
                         &bi.group_count, &si.expert_members, &si.work_items,
                         n_work_items, dbpe, mid_blocks_bytes as u32,
                         cs_n_used as u32, max_per_expert, CHUNK_SIZE,
@@ -3311,7 +4404,7 @@ impl HeterogeneousEngine {
                     ie.q2k.launch_by_expert_kwide2(
                         &ie.compute,
                         &mut si.q2k_partials,
-                        &ilw.routed.down.buffer,
+                        &routed_src.down.buffer,
                         &si.d_midq_cat,
                         &bi.group_count,
                         &si.expert_members,
@@ -3329,7 +4422,7 @@ impl HeterogeneousEngine {
                     ie.q2k.launch_by_expert_kwide(
                         &ie.compute,
                         &mut si.q2k_partials,
-                        &ilw.routed.down.buffer,
+                        &routed_src.down.buffer,
                         &si.d_midq_cat,
                         &bi.group_count,
                         &si.expert_members,
@@ -3347,7 +4440,7 @@ impl HeterogeneousEngine {
                     ie.q2k.launch_by_expert(
                         &ie.compute,
                         &mut si.q2k_partials,
-                        &ilw.routed.down.buffer,
+                        &routed_src.down.buffer,
                         &si.d_midq_cat,
                         &bi.group_count,
                         &si.expert_members,
@@ -3362,7 +4455,17 @@ impl HeterogeneousEngine {
                         n_work_items,
                     )?;
                 }
-                if hot_active {
+                // MUST match the group builder's selector above, which takes the
+                // het-split path on `moe_remap.is_some()`. Keying the reduce off
+                // `hot_active` instead let the two disagree: with the two-box
+                // remap the builder skipped the remote-owned experts, then the
+                // PLAIN reduce summed all `cs_n_used` partial slots anyway —
+                // including the ones nothing had written this layer, i.e. stale
+                // rows from a previous layer. Symptom was a moderate, coherent
+                // perturbation (output kept counting but lost a clause), not
+                // garbage, which is exactly what summing a few stale slots looks
+                // like.
+                if moe_remap.is_some() {
                     // M61: sum ONLY the miss slots this device computed —
                     // resident slots' partials are stale here (the dGPU
                     // holds their contribution).
@@ -3371,9 +4474,9 @@ impl HeterogeneousEngine {
                         &mut bi.ffn_moe,
                         &si.q2k_partials,
                         &bi.d_selected,
-                        ilw.hot_remap.as_ref().unwrap(),
+                        moe_remap.unwrap(),
                         /*mode=*/ 0,
-                        hot_prefill_cap(),
+                        split_cap,
                         cs_n_used as u32,
                         N_EMBD,
                         b,
@@ -3392,7 +4495,7 @@ impl HeterogeneousEngine {
                 ie.q2k.launch_batched_bxn(
                     &ie.compute,
                     &mut bi.ffn_moe,
-                    &ilw.routed.down.buffer,
+                    &routed_src.down.buffer,
                     &si.d_midq_cat,
                     &bi.d_selected,
                     dbpe,
@@ -3453,6 +4556,120 @@ impl HeterogeneousEngine {
                 &bd.ffn_shared,
                 b * N_EMBD,
             )?;
+        }
+
+        // Two-box split: collect the remote's reply. Awaited HERE, not at
+        // submit time, so box 2 computed its half of this layer while this box's
+        // iGPU computed the other half — the local MoE was issued between the
+        // two. The gap between the `submit` and `wait` slices on the
+        // `remote.expert (host)` perfetto track is exactly that overlap.
+        if let Some(t) = bd.remote_ticket.take() {
+            let layer = bd.remote_ffn_moe_layer;
+            let t_wait = super::perfetto::now_ns();
+            let remote = self
+                .remote
+                .as_ref()
+                .ok_or_else(|| eyre!("remote ticket pending but no client"))?;
+            let partial = remote
+                .lock()
+                .map_err(|_| eyre!("remote expert client mutex poisoned"))?
+                .wait(t)?;
+            let t_wait_end = super::perfetto::now_ns();
+            if let Some(pf) = self.perfetto.as_ref() {
+                if let Ok(pf) = pf.lock() {
+                    let _ = pf.emit_host_slice(
+                        pf.remote_uuid,
+                        &format!(
+                            "wait L{layer} rtt={}us link={}us remote={}us",
+                            partial.rtt_us, partial.link_us(), partial.t_remote_compute_us,
+                        ),
+                        t_wait, t_wait_end,
+                    );
+                }
+            }
+            super::trace::phase::add(
+                &super::trace::phase::REMOTE_RTT_NS,
+                (t_wait_end - t_wait) as u64,
+            );
+            if remote_add_partial() {
+                let rows = (b as usize) * N_EMBD as usize;
+                let src = partial.f32();
+                if src.len() != rows {
+                    return Err(eyre!(
+                        "L{layer}: remote partial has {} f32 rows, expected {rows}",
+                        src.len()
+                    ));
+                }
+                bd.remote_ffn_moe
+                    .as_mut()
+                    .ok_or_else(|| eyre!("remote partial pending but buffer unallocated"))?
+                    .slice_view_mut(0, rows)
+                    .copy_from_host(src)?;
+                bd.remote_ffn_moe_valid = true;
+            }
+            remote
+                .lock()
+                .map_err(|_| eyre!("remote expert client mutex poisoned"))?
+                .recycle(partial);
+        }
+
+        // Two-box split: + the remote shard's MoE partial.
+        //
+        // MUST live here in POST-MoE, not pre-MoE. `ffn_moe_recv` is the dGPU's
+        // landing buffer for the iGPU's `ffn_moe`, delivered by peer push and
+        // gated by `sev.moe_arrived` (waited above). Adding to it before the
+        // push OVERWRITES the addition — which is exactly what happened: the
+        // buffer measurably changed (34.71 -> 35.76) and the logits came out
+        // BIT-IDENTICAL to not adding at all.
+        if std::env::var("V41_REMOTE_DBG").is_ok() && bd.remote_ffn_moe.is_some() {
+            // Does the exclusion actually remove mass from the local leg, and is
+            // the remote's partial the right size to replace it? If the local
+            // norm here matches a no-split run, the iGPU never skipped anything
+            // and we are double-counting; if it dropped but the sum is still
+            // wrong, the two sets are not complementary.
+            let n = (b as usize) * N_EMBD as usize;
+            let mut local = vec![0f32; n];
+            let mut rem = vec![0f32; n];
+            de.compute.synchronize()?;
+            bd.ffn_moe_recv.slice_view(0, n).copy_to_host(&mut local)?;
+            if bd.remote_ffn_moe_valid {
+                bd.remote_ffn_moe.as_ref().unwrap().slice_view(0, n).copy_to_host(&mut rem)?;
+            }
+            let l2 = |v: &[f32]| v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+            eprintln!(
+                "[combine-dbg] L{} valid={} b={b} local_l2={:.4} remote_l2={:.4} ratio={:.3}",
+                bd.remote_ffn_moe_layer, bd.remote_ffn_moe_valid,
+                l2(&local), l2(&rem), l2(&rem) / l2(&local).max(1e-9),
+            );
+        }
+        if bd.remote_ffn_moe_valid {
+            // Two-box split: the iGPU skipped every expert box 2 owns (its
+            // remap entry was non-negative), so this partial is the rest of the
+            // sum, not a duplicate. Cleared immediately: the buffer outlives the
+            // layer and adding it twice would double-count.
+            let _t = de.events.stage("k.ffn_combine.vec_add_remote", &de.compute)?;
+            let remote = bd
+                .remote_ffn_moe
+                .as_ref()
+                .expect("remote_ffn_moe_valid implies the buffer exists");
+            de.vec_add.launch(
+                &de.compute,
+                &mut bd.ffn_moe_recv,
+                remote,
+                b * N_EMBD,
+            )?;
+            if std::env::var("V41_REMOTE_DBG").is_ok() {
+                // Did the add actually change the buffer hc_post reads? If
+                // after == before, the vec_add is dead and everything upstream
+                // of it is irrelevant.
+                let n = (b as usize) * N_EMBD as usize;
+                let mut after = vec![0f32; n];
+                de.compute.synchronize()?;
+                bd.ffn_moe_recv.slice_view(0, n).copy_to_host(&mut after)?;
+                let l2: f64 = after.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+                eprintln!("[combine-dbg] AFTER add: ffn_moe_recv l2={l2:.4}");
+            }
+            bd.remote_ffn_moe_valid = false;
         }
         if hot_active {
             // M61: + the dGPU's resident-expert MoE partial. Queued on

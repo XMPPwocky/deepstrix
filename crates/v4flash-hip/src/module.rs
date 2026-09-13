@@ -11,6 +11,8 @@ use crate::sys;
 /// expects the *current* device to be the one we want the module on.
 pub struct Module {
     raw: sys::hipModule_t,
+    /// Device current at load; `hipModuleUnload` must run under it.
+    device_id: i32,
 }
 
 impl Module {
@@ -24,7 +26,7 @@ impl Module {
             unsafe { sys::hipModuleLoadData(&mut raw, image.as_ptr() as *const c_void) },
             "hipModuleLoadData",
         )?;
-        Ok(Module { raw })
+        Ok(Module { raw, device_id: crate::device::current_device() })
     }
 
     pub fn get_function(&self, name: &str) -> eyre::Result<Function<'_>> {
@@ -44,6 +46,9 @@ impl Module {
 impl Drop for Module {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            // Bind the device the module was loaded on: `hipModuleUnload` walks
+            // the current device's code-object state.
+            let _guard = crate::device::DeviceGuard::enter(self.device_id);
             let code = unsafe { sys::hipModuleUnload(self.raw) };
             if code != sys::HIP_SUCCESS {
                 tracing::warn!(code, "hipModuleUnload failed during drop");

@@ -369,6 +369,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepstrix-expertd"
+version = "0.0.0"
+dependencies = [
+ "color-eyre",
+ "v4flash-core",
+ "v4flash-hip",
+ "v4flash-kernels",
+]
+
+[[package]]
 name = "deepstrix-server"
 version = "0.0.0"
 dependencies = [
@@ -1476,7 +1486,6 @@ dependencies = [
  "tracing",
  "v4flash-core",
  "v4flash-hip",
- "v4flash-kernels",
 ]
 
 [[package]]

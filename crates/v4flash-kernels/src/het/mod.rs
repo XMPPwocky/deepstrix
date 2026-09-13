@@ -19,6 +19,7 @@
 pub mod batch_scratch;
 pub mod dispatch;
 pub mod engine;
+pub mod expert_pager;
 pub mod forward_head;
 pub mod forward_layer;
 pub mod forward_prefill;
@@ -26,6 +27,7 @@ pub mod graph_cache;
 pub mod image_spans;
 pub mod perfetto;
 pub mod prefill_stats;
+pub mod remote_experts;
 pub mod scratch;
 pub mod state;
 pub mod sync;
@@ -37,6 +39,8 @@ pub use batch_scratch::{
 };
 pub use prefill_stats::{LayerStats, PerChunkReuse, PrefillStats};
 pub use engine::{DeviceEngine, ExecMode, HeterogeneousEngine, SampleMode};
+pub use expert_pager::{ExpertPager, PagerCounters};
+pub use remote_experts::{ExpertShard, MoeExecutor, RemoteExpertClient};
 pub use scratch::{DgpuScratch, IgpuScratch};
 pub use state::{HetCompressorState, HetLayerState, HetModelState};
 pub use weights::{

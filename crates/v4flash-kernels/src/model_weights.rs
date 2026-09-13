@@ -11,7 +11,7 @@
 //! `DeviceWeight`); this module is the V4-Flash-specific schema.
 
 use color_eyre::eyre::{self, eyre};
-use v4flash_core::{gguf::GgufType, MappedGguf};
+use v4flash_core::{gguf::GgufType, WeightSrc};
 use v4flash_hip::DeviceBuffer;
 
 use crate::weights::DeviceWeight;
@@ -53,14 +53,14 @@ pub struct RoutedExpertWeights {
 
 /// Load a named F32 tensor from GGUF into a fresh per-device buffer.
 /// Validates dtype + byte count against `expected_len` elements.
-pub fn load_f32_weight(
-    gguf: &MappedGguf,
+pub fn load_f32_weight<'a>(
+    src: impl Into<WeightSrc<'a>>,
     name: &str,
     device_id: i32,
     expected_len: usize,
 ) -> eyre::Result<DeviceBuffer<f32>> {
+    let gguf: WeightSrc<'a> = src.into();
     let t = gguf
-        .gguf()
         .tensor(name)
         .ok_or_else(|| eyre!("tensor `{name}` missing"))?;
     if t.dtype != GgufType::F32 {
@@ -84,9 +84,9 @@ pub fn load_f32_weight(
 }
 
 /// Load a named I32 tensor from GGUF into a host-side `Vec<i32>`.
-pub fn load_i32_tensor(gguf: &MappedGguf, name: &str) -> eyre::Result<Vec<i32>> {
+pub fn load_i32_tensor<'a>(src: impl Into<WeightSrc<'a>>, name: &str) -> eyre::Result<Vec<i32>> {
+    let gguf: WeightSrc<'a> = src.into();
     let t = gguf
-        .gguf()
         .tensor(name)
         .ok_or_else(|| eyre!("tensor `{name}` missing"))?;
     if t.dtype != GgufType::I32 {

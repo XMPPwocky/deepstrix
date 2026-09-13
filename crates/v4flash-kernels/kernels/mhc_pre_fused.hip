@@ -27,8 +27,12 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
+#ifndef MHC_HC_DIM
 #define MHC_HC_DIM      16384
+#endif
+#ifndef MHC_N_EMBD
 #define MHC_N_EMBD      4096
+#endif
 #define MHC_HC_MIX_DIM  24
 #define MHC_N_HC        4
 #define MHC_BLOCK       512

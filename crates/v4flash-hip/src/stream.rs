@@ -7,8 +7,10 @@ use crate::event::Event;
 use crate::graph::Graph;
 use crate::sys;
 
-/// A HIP stream. Created on the current device (caller must `Device::set_current`
-/// first). Streams may be prioritized; smaller priority value = higher
+/// A HIP stream. `device_id` is AUTHORITATIVE: the constructors enter a `DeviceGuard` so the
+/// stream is created on that device regardless of ambient `hipSetDevice` state (hipStreamCreate
+/// binds to the CURRENT device), restoring the previous device afterwards. This matters because a
+/// stream's device decides peer-copy direction. Streams may be prioritized; smaller priority value = higher
 /// priority, per hipDeviceGetStreamPriorityRange.
 pub struct Stream {
     raw: sys::hipStream_t,
@@ -18,12 +20,14 @@ pub struct Stream {
 impl Stream {
     pub fn new(device_id: i32) -> eyre::Result<Self> {
         let mut raw: sys::hipStream_t = ptr::null_mut();
+        let _guard = crate::device::Device::scoped(device_id)?;
         check_eyre(unsafe { sys::hipStreamCreate(&mut raw) }, "hipStreamCreate")?;
         Ok(Stream { raw, device_id })
     }
 
     pub fn new_with_priority(device_id: i32, priority: i32) -> eyre::Result<Self> {
         let mut raw: sys::hipStream_t = ptr::null_mut();
+        let _guard = crate::device::Device::scoped(device_id)?;
         check_eyre(
             unsafe {
                 sys::hipStreamCreateWithPriority(&mut raw, sys::HIP_STREAM_DEFAULT, priority)
@@ -123,6 +127,19 @@ impl Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            // Bind the stream's own device first: `hipStreamDestroy` reaches
+            // `hip::Device::RemoveStream`, which erases the stream from the
+            // CURRENT device's stream table, not the one the stream belongs to.
+            // Same recorded-but-unapplied `device_id` footgun that DeviceGuard
+            // was introduced to close elsewhere; the Drop impls were missed.
+            //
+            // NOTE: this is a latent correctness fix, NOT the cause of the
+            // teardown crashes seen on 2026-09-13. Those were a detached engine
+            // thread still dropping HIP objects after `main` returned and libc
+            // began running libamdhip64's static destructors — fixed by joining
+            // the worker in `EngineHandle::shutdown`. Guarding here did not stop
+            // them; joining did.
+            let _guard = crate::device::DeviceGuard::enter(self.device_id);
             // Errors during drop are logged but not propagated.
             let code = unsafe { sys::hipStreamDestroy(self.raw) };
             if code != sys::HIP_SUCCESS {

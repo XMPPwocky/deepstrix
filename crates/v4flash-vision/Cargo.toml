@@ -17,7 +17,9 @@ serde_json = { workspace = true }
 image = { workspace = true }
 v4flash-core = { path = "../v4flash-core" }
 v4flash-hip = { path = "../v4flash-hip" }
-v4flash-kernels = { path = "../v4flash-kernels" }
+# NOT v4flash-kernels: the tower has its own kernels (kernels/vit.hip) and
+# shares only v4flash-core (GGUF/safetensors readers, f16) and v4flash-hip
+# with the engine. The text-side pieces live in the engine crate.
 
 
 [lib]

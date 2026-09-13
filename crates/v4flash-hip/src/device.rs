@@ -35,6 +35,55 @@ impl Device {
         check_eyre(unsafe { sys::hipSetDevice(self.id) }, "hipSetDevice")
     }
 
+    /// Temporarily make `id` current, restoring the previous device on drop.
+    pub(crate) fn scoped(id: i32) -> eyre::Result<DeviceGuard> {
+        DeviceGuard::enter(id)
+    }
+}
+
+/// RAII "make this device current for the duration" guard.
+///
+/// **Why this exists.** HIP binds `hipMalloc` and `hipStreamCreate` to whatever device is
+/// *current on the calling thread*. A constructor that merely RECORDS a `device_id` therefore
+/// looks like it selects a device but does not: the object silently lands wherever the ambient
+/// `hipSetDevice` last pointed. That is not cosmetic here — the recorded id is load-bearing,
+/// because the copy paths compare `src.device_id != dst.device_id` to decide whether a transfer
+/// is local or a peer copy. A buffer that claims one device but physically lives on another
+/// routes those copies wrongly and yields zeros or garbage with no error. This cost a multi-hour
+/// misdiagnosis (an expert pool allocated on the dGPU while the iGPU kernel read it).
+///
+/// Constructors that take a `device_id` now enter this guard, so the parameter is AUTHORITATIVE
+/// and the recorded id always matches the physical device. The previous current device is
+/// restored, so callers see no ambient side effect. `hipSetDevice` is skipped when the device is
+/// already current, so the common path costs one `hipGetDevice`.
+pub(crate) struct DeviceGuard {
+    prev: i32,
+    changed: bool,
+}
+
+impl DeviceGuard {
+    pub(crate) fn enter(id: i32) -> eyre::Result<Self> {
+        let mut prev: i32 = 0;
+        check_eyre(unsafe { sys::hipGetDevice(&mut prev) }, "hipGetDevice")?;
+        if prev == id {
+            return Ok(DeviceGuard { prev, changed: false });
+        }
+        check_eyre(unsafe { sys::hipSetDevice(id) }, "hipSetDevice")?;
+        Ok(DeviceGuard { prev, changed: true })
+    }
+}
+
+impl Drop for DeviceGuard {
+    fn drop(&mut self) {
+        if self.changed {
+            // Best effort: a failure here would mean the HIP context is already broken.
+            unsafe { sys::hipSetDevice(self.prev) };
+        }
+    }
+}
+
+impl Device {
+
     /// Block until ALL streams on this device have completed all queued
     /// work. `hipDeviceSynchronize` acts on the *current* device, so we
     /// `set_current` first. Used at teardown to drain every stream
@@ -164,4 +213,20 @@ fn cstr_to_string(ptr: *const c_char) -> String {
     unsafe { CStr::from_ptr(ptr) }
         .to_string_lossy()
         .into_owned()
+}
+
+/// The device that is current *right now*, or 0 if HIP cannot say.
+///
+/// Every HIP object (stream, module, graph, event, allocation) is owned by the
+/// device that was current when it was created, and the matching destructor
+/// resolves against the device current at DESTROY time — not the one it was
+/// made on. With two GPUs in one process the drop order at teardown is
+/// arbitrary, so each wrapper records this at construction and re-enters it in
+/// `Drop` via [`DeviceGuard`]. Skipping that corrupts the runtime's own
+/// bookkeeping: observed as a SIGSEGV in `hip::Device::RemoveStream` and as
+/// `std::terminate` from `amd::roc::Kernel::~Kernel` during `hipModuleUnload`.
+pub(crate) fn current_device() -> i32 {
+    let mut d: i32 = 0;
+    unsafe { sys::hipGetDevice(&mut d) };
+    d
 }
