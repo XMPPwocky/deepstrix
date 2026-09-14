@@ -128,3 +128,62 @@ expense of the prefill windows.** Neither touches the miss count. This is the
 measured form of the standing intuition that moving picks between boxes does not
 remove work — it is true here for a sharper reason than "the work still happens":
 the work that dominates is the work no policy can place.
+
+## CORRECTION (same day): the Q5_K recommendation above is WRONG
+
+Two challenges, both correct, and together they retract this document's headline
+advice while leaving its diagnosis standing.
+
+### 1. Experts are already FP4. "Requantise to ~Q5_K" is backwards.
+
+`config.json` says `quantization_config.expert_dtype = 'fp4'`, and our storage is
+ggml MXFP4 — a **17-byte block per 32 weights = 4.25 bits/weight**:
+
+    per-expert   3 x 5120 x 2304 = 35.4 M weights x 17/32 B = 18.80 MB
+    box 2 log    6160 x 18.80 MB = 115.8 GB   (logged 115.81 GB)  <- matches exactly
+
+So the earlier "19.25 MB -> 5.6-5.9 bits/weight, Q5_K fits" was a GiB/GB unit error
+stacked on an unchecked assumption that experts were Q8_K. Q5_K is *larger* than
+what is already stored; moving to it would make residency worse, not better.
+
+Real packing headroom is **5.7%**, not 14%: the source keeps one ue8m0 scale per
+32x32 block (4.008 b/w) where ggml MXFP4 keeps one per 32 (4.250 b/w). Recovering
+it is quality-free but small.
+
+And the residency arithmetic, done right:
+
+    full expert set          288.8 GB
+    usable for experts       ~180 GB  (box 2 ~120, box 1 ~60 after non-expert weights/KV)
+    -> current residency     62%
+    -> to hold ALL experts   2.65 bits/weight
+
+**Sub-3-bit experts is not a quantisation tweak, it is a different model.** So full
+residency is not reachable on this hardware, and decode cannot get to 30 tok/s by
+caching, placement, balancing, or requantisation. That leaves amortising the reads
+across more than one accepted token — DSpark — which is what the original goal memo
+said all along.
+
+### 2. "Are the slots actually full, or is it just paging in?"
+
+The right question, and the first measurement could not answer it. That 200-token
+run recorded **5,991 misses against a 6,160-slot pool** — it had not filled the pool
+even once, so every miss may have been a first-touch fill rather than an eviction,
+and its windowed miss rate was falling monotonically 18.5 -> 13.0 -> 10.3 -> 7.4%.
+Quoting hit=0.8763 from it was quoting a cold-start average.
+
+Re-measured with a 1,200-token generation against an expertd deliberately left
+warm (box 1 restarted, box 2 not):
+
+    total misses 41,603 vs 6,160 slots  ->  6.8 full pool turnovers
+    late windows: 11.8 / 14.0 / 13.1 / 10.7 / 11.2 / 10.9 %
+    decode: 1,200 tokens, 359 ms/token; median of the last 200 = 308.6 ms = 3.24 tok/s
+
+The pool is full, eviction is happening, and the miss rate **stabilises at ~11%
+rather than collapsing**. So the diagnosis survives: this is genuine capacity
+pressure, not warm-up. The first number landed near the steady-state value by
+luck, which is exactly why it should not have been trusted.
+
+METHOD, twice in one document: I wrote a method note here warning to check whether
+a residency trace has converged, then quoted a hit rate from a pool that had never
+filled. Checking convergence in the replay is not the same as checking it in the
+measurement.
