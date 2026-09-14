@@ -64,7 +64,36 @@ NOT re-measured today; re-verify before committing effort. And the unexplained
 58 s between the stage totals and the wall is itself worth a look — it is 36% of
 prefill and nothing currently accounts for it.
 
-## UNRESOLVED: this contradicts the earlier roofline analysis by 2.1x
+## RESOLVED AGAINST THIS DOCUMENT — the ~890 tok/s projection is WITHDRAWN
+
+The 2.1x disagreement below is settled, and the earlier analysis was right.
+`reference_rocprofv3_kernel_trace` states the rule plainly: **stage timings
+include intra-stage stream-sync idle and must NOT be used for compute cost** —
+with a recorded case where a stage read 185 ms against ~40 ms of actual kernel
+time, the remaining 123 ms being device idle inside the stage span.
+
+`igpu.pair_kwide` and `igpu.q2k_down` are stage timings. I used them for exactly
+the question the rule forbids.
+
+Against TRUE per-kernel time (`bench_v41_kernel_roofline`, 39.244 + 31.778 ms per
+call at B=1024, all 384 experts), box 1's share at 124/384 ownership:
+
+    (39.244 + 31.778) ms x 0.323 x 20 layers x 95 chunks = 43 s
+
+    stage figure quoted above       94 s   -> inflated 2.2x
+    true share of the 160 s wall    27%    (this document claimed 59%)
+    closing the 2.1x roofline gap   saves ~23 s -> 706 tok/s, NOT 893
+
+**So the MoE kernel program is not the prefill lever, and the earlier analysis
+that said so stands.** Everything below is retained as the record of how the
+error was made; the numbers in it are stage-scoped and overstate GPU cost by
+~2.2x. The remaining candidate lever is the encoder SPLIT (box 2 carries 260/384
+encoder experts on an identical 256 GB/s iGPU while box 1 also does attention,
+projections and the head), which is a config change rather than a kernel program
+— and the 58 s gap between wall and max(device totals) is consistent with that:
+it is idle, not unaccounted compute.
+
+## (superseded) this contradicts the earlier roofline analysis by 2.1x
 
 `project_v41_prefill_moe_roofline_2026-09-14` reached the OPPOSITE conclusion —
 "the MoE kernel program is NOT the prefill lever at 100K" — by scaling its
