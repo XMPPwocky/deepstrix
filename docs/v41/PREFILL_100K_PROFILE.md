@@ -208,3 +208,37 @@ long-context fluency probe), not just a throughput A/B. But the argument itself 
 a mix-up regardless of whether f32 turns out to be desirable, and a `bool` in that
 position is a footgun worth removing — `submit_flags` already takes explicit
 `REQ_FLAG_*` bits.
+
+## The MoE roofline gap is BANDWIDTH-ONLY — it may not be available
+
+Re-ran `bench_v41_kernel_roofline` (BENCH_SECTION=prefill_igpu BENCH_B=1024)
+2026-09-14. The recorded figures reproduce almost exactly:
+
+    pair_matvec_fused_swiglu_kwide (gate+up)  39,119 us  124.6 GB/s   7,411 GFLOP/s
+    matvec_par_by_expert_kwide2    (down)     31,818 us   80.1 GB/s   4,556 GFLOP/s
+    q8_k_quantize                                116 us  231.9 GB/s
+    q2_k_reduce_partials                         641 us  229.0 GB/s
+
+So ~230 GB/s is genuinely achievable on this device for streaming kernels, and the
+two MoE kernels sit at 54% and 35% of it. That is where the "2.1x headroom" comes
+from — and it is a **bandwidth-only roofline that never priced the compute axis.**
+
+gfx1151: 40 CU, RDNA 3.5, ~2.9 GHz.
+
+    fp32 without dual-issue    14.8 TFLOP/s
+    fp32 with full VOPD        29.7 TFLOP/s  (rarely achieved in practice)
+
+    gate+up at 230 GB/s -> 20.9 ms, requiring 13.9 TFLOP/s  = 94% of the non-dual-issue peak
+    down    at 230 GB/s -> 11.0 ms, requiring 13.1 TFLOP/s  = 88%
+
+**If these kernels cannot dual-issue, they are already near the COMPUTE roofline
+and the bandwidth headroom is illusory.** MXFP4 dequantisation is nibble-unpack and
+scale-multiply — integer/shift-heavy work that does not obviously pair into VOPD.
+
+This does not refute the lever, it un-derisks it: the honest next step is a COMPUTE
+roofline on these two kernels (this project has done that before — see
+`project_iq2_roofline_2026-06`, which found the iGPU iq2 fused kernel at 2.4x OVER
+its compute roofline). Until that exists, **treat the ~45 s MoE saving as an upper
+bound with an unknown, possibly small, achievable fraction** — and note that the
+other two prefill levers (f16 partials ~27 s, box-2 serialisation ~22 s) are pure
+data-movement and carry no such doubt.
