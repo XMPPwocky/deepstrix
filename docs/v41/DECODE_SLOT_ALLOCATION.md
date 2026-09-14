@@ -193,12 +193,33 @@ change the verdict, because box 1's overlappable leg (18 ms) is SMALLER than box
 75 ms was approximately right despite an unsound derivation.
 
 **`sel_sync` at 22.9 ms is the largest single serial item** — 64% of everything
-box 1 does outside the box-2 wait, and ~7x the Engram gather that got optimised
-earlier. If it is removable the floor falls to ~48 ms = 21 tok/s, which
-independently matches the review's "~43-46 ms after chain optimisations". What it
-is actually waiting on is NOT yet established; treat 21 tok/s as a hypothesis.
+box 1 does outside the box-2 wait. I first read that as removable overhead worth
+~48 ms / 21 tok/s. **It is not.** It is:
 
-Even at that hypothetical floor, **30 tok/s (33 ms/token) is not reachable
+    let t_sel = Instant::now();
+    self.set_current_cached(self.dgpu.device)?;
+    de.compute.synchronize()?;                       // wait for the dGPU router
+    dgpu_scratch.d_selected.copy_to_host(&mut sel_host)?;
+
+i.e. a per-layer wait (573 us x 40) for the dGPU router's top-k to become
+readable — a genuine data dependency, since the picks cannot be known before the
+router runs, and layer L+1 cannot start before box 2 returns layer L.
+
+The shipped lever-1 reorder already attacked it and measured the ceiling:
+
+    sel_sync_us 27,313 -> 24,258 (-3,055)   remote_rtt_us 21,567 -> 22,647 (+1,080)
+    net -2.65 ms/token, about half the -5 to -7 predicted
+
+with the conclusion recorded in `forward_layer.rs`: "box 2 starting earlier just
+means the hub waits for it longer. While box 2 is the bottleneck, THAT is the
+ceiling for any pre-submit reordering; the rest of the expert phase needs picks
+taken off box 2, not scheduled earlier."
+
+So only ~3 ms of `sel_sync` was ever schedulable and that is already banked. The
+remaining ~20 ms is dGPU work on the critical path. **The floor stays 71 ms =
+14.1 tok/s**; there is no 21 tok/s path here.
+
+**30 tok/s (33 ms/token) is not reachable
 non-speculatively on this hardware**: box 2's 35 ms zero-miss leg alone exceeds
 the entire 33 ms budget. The only ways past it are shrinking that leg (fewer picks
 to box 2, or a faster expert FFN — but that kernel is already at ~87% of
