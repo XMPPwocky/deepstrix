@@ -241,6 +241,57 @@ impl HetCompressorState {
 }
 
 impl HetModelState {
+    /// Snapshot every layer's KV position so a speculative batch can be undone.
+    pub fn mark_kv(&self) -> KvMark {
+        KvMark { per_layer: self.layers.iter().map(|l| (l.n_raw, l.raw_off)).collect() }
+    }
+
+    /// Undo the KV appends made since `mark`.
+    ///
+    /// This is the reject half of speculative decoding: a verify step appends B
+    /// tokens, the first rejected one and everything after it must go away.
+    ///
+    /// # What this does NOT restore
+    /// **The compressor and indexer-compressor streaming state.** Those advance
+    /// with accepted AND rejected tokens and would need
+    /// `compressor_state_snapshot` to roll back properly. Deliberately out of
+    /// scope for now, so a rejected token leaves the compressor slightly ahead of
+    /// the raw KV. Fine while the compressed store is an approximation used for
+    /// scoring, NOT fine if bit-exact continuation is required — wire the
+    /// snapshot before claiming that.
+    ///
+    /// # Errors
+    /// If any layer's `raw_off` went BACKWARDS, the oversized cache wrapped since
+    /// the mark: the eviction-down copy physically relocated the live window, so
+    /// the marked counters no longer address the same rows and the rollback would
+    /// silently serve wrong KV. Refuses instead. A wrap happens roughly once per
+    /// `B_MAX` tokens per layer, so a verify batch of <=8 almost never straddles
+    /// one — but "almost never" is exactly the bug that survives testing.
+    pub fn rollback_kv(&mut self, mark: &KvMark) -> color_eyre::eyre::Result<()> {
+        use color_eyre::eyre::eyre;
+        if mark.per_layer.len() != self.layers.len() {
+            return Err(eyre!(
+                "rollback_kv: mark covers {} layers, state has {}",
+                mark.per_layer.len(),
+                self.layers.len()
+            ));
+        }
+        for (i, (_, raw_off)) in mark.per_layer.iter().copied().enumerate() {
+            if self.layers[i].raw_off < raw_off {
+                return Err(eyre!(
+                    "rollback_kv: layer {i} wrapped since the mark (raw_off {} < marked {raw_off}); \
+                     the eviction-down copy moved the window, so the mark no longer addresses it",
+                    self.layers[i].raw_off
+                ));
+            }
+        }
+        for (i, (n_raw, raw_off)) in mark.per_layer.iter().copied().enumerate() {
+            self.layers[i].n_raw = n_raw;
+            self.layers[i].raw_off = raw_off;
+        }
+        Ok(())
+    }
+
     /// Run `f` on layer `layer` with its KV source's compressor state moved in
     /// (V4.1 reuse layers), moving it back afterwards. A no-op wrapper when the
     /// layer owns its store. The forward skips the compressor stage for a layer
@@ -285,6 +336,19 @@ pub struct HetLayerState {
     /// main compressor exactly; `n_comp` here is what ds4 calls
     /// `cache->n_index_comp`.
     pub indexer_compressor: Option<HetCompressorState>,
+}
+
+/// A per-layer KV position mark, for speculative rollback.
+///
+/// The decode append is monotonic — `n_raw` grows until `SWA_WINDOW`, then
+/// `raw_off` slides — and the row it "evicts" is still physically there, which is
+/// what `HetLayerState::raw_off` means by "the prerequisite for MTP rollback".
+/// So undoing k speculative tokens is restoring two counters per layer; no data
+/// moves and nothing is rewritten.
+#[derive(Clone, Debug, Default)]
+pub struct KvMark {
+    /// `(n_raw, raw_off)` per layer at mark time.
+    pub per_layer: Vec<(u32, u32)>,
 }
 
 pub struct HetModelState {

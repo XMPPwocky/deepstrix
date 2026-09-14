@@ -2393,6 +2393,16 @@ fn finish_decode(
     // one-line heartbeat every HEARTBEAT_INTERVAL completion tokens
     // with rolling tok/s since the last beat, so the log keeps
     // breathing.
+    // `V41_VERIFY_PROBE=K`: every steady-state token, speculatively ingest K extra
+    // tokens into KV, then roll them back with `HetModelState::rollback_kv`, and
+    // require the generation to come out unchanged. This is DSpark's REJECT path
+    // exercised without a drafter — the one piece of speculative decoding that is
+    // testable in isolation. Off unless set; it roughly doubles decode time.
+    #[cfg(feature = "v41")]
+    let verify_probe_k: usize = std::env::var("V41_VERIFY_PROBE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let heartbeat_interval: u32 = std::env::var("DEEPSTRIX_HEARTBEAT_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -2598,6 +2608,33 @@ fn finish_decode(
         }
         if (next as u32) >= N_VOCAB {
             return Err(eyre!("generate: sampled token id {next} out of vocab"));
+        }
+        // Speculative ingest + rollback probe. Placed HERE, before the embed, because
+        // this is the only point in the loop where clobbering `residual` and the
+        // device scratch is harmless: the previous token's logits have already been
+        // sampled into `next`, and both are about to be overwritten anyway. After
+        // `forward_one` below they hold the logits the next iteration samples.
+        #[cfg(feature = "v41")]
+        if verify_probe_k > 0 && completion_tokens > 8 {
+            embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, next, &mut residual);
+            let mark = state.state.mark_kv();
+            let t_probe = std::time::Instant::now();
+            for j in 0..verify_probe_k {
+                forward_one!(state, residual, pos + j as u32, next)?;
+            }
+            let dt = t_probe.elapsed();
+            // A refused rollback means the KV wrapped mid-batch and the mark no
+            // longer addresses the same rows. Continuing would silently serve wrong
+            // KV, so fail loudly instead.
+            state.state.rollback_kv(&mark).map_err(|e| {
+                eyre!("verify probe: rollback refused after {verify_probe_k} tokens: {e}")
+            })?;
+            tracing::info!(
+                k = verify_probe_k,
+                total_us = dt.as_micros() as u64,
+                per_token_us = (dt.as_micros() as u64) / verify_probe_k.max(1) as u64,
+                "verify probe: speculative ingest rolled back"
+            );
         }
         let t_embed = std::time::Instant::now();
         embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, next, &mut residual);
