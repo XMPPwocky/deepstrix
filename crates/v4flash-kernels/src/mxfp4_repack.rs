@@ -25,6 +25,57 @@ impl Mxfp4Repack {
     /// `dst` gets `out_rows * nb * 17` bytes at `dst_off`; `src` holds the raw
     /// HF bytes as the loader read them: `out_rows * nb * 16` packed nibble
     /// bytes followed by `out_rows * nb` scale bytes.
+    /// As [`Self::launch`] but reading the HF bytes from an arbitrary
+    /// device-visible pointer instead of a `DeviceBuffer`.
+    ///
+    /// The point is APU staging: on Strix Halo the "device" pool IS system RAM,
+    /// so a `hipHostMalloc` buffer can be pread into by the CPU and read by the
+    /// iGPU with **no copy between them**. That removes the 18.8 MB H2D a miss
+    /// used to pay (1.23 ms measured on box 2) for bytes that never moved.
+    /// `src_len` is only for the bounds check.
+    ///
+    /// # Safety contract
+    /// `src` must point at `>= out_rows*nb*17` device-readable bytes that stay
+    /// alive and unwritten until `stream` has synchronized.
+    pub fn launch_from_ptr(
+        &self,
+        stream: &Stream,
+        dst: &mut DeviceBuffer<u8>,
+        dst_off: usize,
+        src: v4flash_hip::sys::hipDeviceptr_t,
+        src_len: usize,
+        out_rows: u32,
+        nb: u32,
+    ) -> eyre::Result<()> {
+        let total = out_rows as usize * nb as usize;
+        let packed_bytes = total * 16;
+        if src_len < packed_bytes + total {
+            return Err(eyre!("mxfp4_repack src too small: {src_len} < {}", packed_bytes + total));
+        }
+        if dst.len() < dst_off + total * 17 {
+            return Err(eyre!(
+                "mxfp4_repack dst too small: {} < {}",
+                dst.len(),
+                dst_off + total * 17
+            ));
+        }
+        let function = self.module.get_function("mxfp4_repack_hf_to_ggml")?;
+        let block = 256u32;
+        let cfg = LaunchConfig {
+            grid: ((total as u32).div_ceil(block), 1, 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let dst_v = dst.slice_view_mut(dst_off, total * 17);
+        // Scales live immediately after the packed nibbles in the same buffer.
+        let packed = src;
+        let scale = (src as *mut u8).wrapping_add(packed_bytes) as v4flash_hip::sys::hipDeviceptr_t;
+        launch_kernel!(
+            function, cfg, stream,
+            [dst_v.raw(), packed, scale, out_rows, nb]
+        )
+    }
+
     pub fn launch(
         &self,
         stream: &Stream,

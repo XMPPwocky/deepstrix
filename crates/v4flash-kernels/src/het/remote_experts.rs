@@ -46,13 +46,14 @@ use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{self, eyre, WrapErr};
 use v4flash_core::{gguf::GgufType, V41HfWeights, WeightSrc};
-use v4flash_hip::{Device, DeviceBuffer};
+use v4flash_hip::{Device, DeviceBuffer, PinnedBuffer, Stream, HIP_HOST_MALLOC_NON_COHERENT};
 
 use crate::config::{
     BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, N_EMBD, N_EXPERT, N_EXPERT_USED, N_FF_EXP, N_LAYER,
     SWIGLU_CLAMP_EXP,
 };
 use crate::model_weights::RoutedExpertWeights;
+use crate::mxfp4_repack::Mxfp4Repack;
 use crate::q8_k::BLOCK_Q8_K_BYTES;
 use crate::weight_contract;
 use crate::weights::DeviceWeight;
@@ -1065,6 +1066,14 @@ struct LayerPager {
     pub misses: u64,
     pub read_ns: u64,
     pub h2d_ns: u64,
+    /// Sub-terms of `read_ns`, so a regression lands on the right line. The
+    /// CODEGEN-FRAGILE note in `hf_v41::read_expert_raw` exists because a change
+    /// there once moved 3x of cost from `alloc` into `repack` while tok/s barely
+    /// budged: never judge this path on `read_ns` alone.
+    pub pread_ns: u64,
+    pub repack_cpu_ns: u64,
+    /// GPU permute + the stream sync that waits on it (0 on the CPU path).
+    pub repack_gpu_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1082,6 +1091,34 @@ pub struct ExpertShard {
     layers: Vec<Option<LayerShard>>,
     info: ShardInfo,
     pub load_stats: LoadStats,
+    /// GPU MXFP4 HF->ggml permute, so a miss does not pay a CPU repack. Box 1's
+    /// pager has had this since the M7 tier; this side did the repack on the CPU
+    /// on EVERY miss, which is why its `read_ns` (8.30 ms) sat 1.84x above the
+    /// drive's own 4.52 ms for the same 18.8 MB. `None` = CPU rollback path.
+    repack: Option<Mxfp4Repack>,
+    repack_stream: Option<Stream>,
+    /// Persistent staging, one per role, in `hipHostMalloc` memory.
+    ///
+    /// Two things at once. It is persistent, so the miss path no longer
+    /// allocates `vec![0u8; bpe]` x3 per fault (18.8 MB of fresh pages, ~4.6k
+    /// first-touch faults, on a box already at 118/124 GB). And it is
+    /// device-visible: box 2 is an APU, so this IS the RAM the iGPU reads
+    /// through GTT. The reader threads pread straight into it and the repack
+    /// kernel consumes it in place, so the 18.8 MB H2D a miss used to pay
+    /// (1.23 ms measured) is gone — it was copying system RAM to system RAM.
+    ///
+    /// NON_COHERENT so the iGPU may cache its reads (see `PinnedBuffer`).
+    stage: [PinnedBuffer<u8>; 3],
+}
+
+/// Permute MXFP4 HF->ggml on box 2's iGPU instead of its CPU
+/// (`V41_B2_GPU_REPACK=0` reverts to the CPU path). Separate from box 1's
+/// `V41_PAGER_GPU_REPACK` so the two sides can be A/B'd independently.
+pub fn b2_gpu_repack() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_B2_GPU_REPACK").map(|v| v != "0").unwrap_or(true)
+    });
+    *B
 }
 
 fn role_kr(which: &str) -> (u64, u64) {
@@ -1298,6 +1335,24 @@ impl ExpertShard {
             bytes as f64 / 1e9,
             bytes as f64 / 1e9 / seconds.max(1e-9)
         );
+        // Three landing zones sized to the largest role, so a miss's three
+        // uploads do not serialise on one buffer (mirrors box 1's pager).
+        let bpe3 = [
+            routed.gate_bytes_per_expert,
+            routed.up_bytes_per_expert,
+            routed.down_bytes_per_expert,
+        ];
+        let (repack, repack_stream) = if b2_gpu_repack() {
+            let arch = igpu.properties()?.gcn_arch_name;
+            eprintln!(
+                "expert shard: GPU MXFP4 repack ON ({arch}), zero-copy pinned staging 3 x {:.1} MB",
+                bpe3[0].max(bpe3[1]).max(bpe3[2]) as f64 / 1e6
+            );
+            (Some(Mxfp4Repack::for_arch(&arch)?), Some(Stream::new(igpu.id)?))
+        } else {
+            eprintln!("expert shard: GPU MXFP4 repack OFF — CPU repack on every miss");
+            (None, None)
+        };
         Ok(Self {
             owner,
             device: igpu,
@@ -1305,6 +1360,13 @@ impl ExpertShard {
             layers,
             info,
             load_stats: LoadStats { n_experts: n_slots as usize, bytes, seconds },
+            repack,
+            repack_stream,
+            stage: [
+                PinnedBuffer::<u8>::new_with_flags(bpe3[0], HIP_HOST_MALLOC_NON_COHERENT)?,
+                PinnedBuffer::<u8>::new_with_flags(bpe3[1], HIP_HOST_MALLOC_NON_COHERENT)?,
+                PinnedBuffer::<u8>::new_with_flags(bpe3[2], HIP_HOST_MALLOC_NON_COHERENT)?,
+            ],
         })
     }
 
@@ -1344,6 +1406,7 @@ impl ExpertShard {
             l.page = Some(LayerPager {
                 slot_key, slot_of, lru, remap_host,
                 requests: 0, misses: 0, read_ns: 0, h2d_ns: 0,
+                pread_ns: 0, repack_cpu_ns: 0, repack_gpu_ns: 0,
             });
         }
         // Do NOT touch the advertised HELLO bitmap. `info.owned` is what the hub's
@@ -1385,6 +1448,12 @@ impl ExpertShard {
         let Some(pg) = l.page.as_mut() else { return Ok(()) };
         let base = l.base_slot as usize;
         let r = &mut self.routed;
+        // Disjoint field borrows, hoisted: the per-role read closures below must
+        // capture `owner` alone, not `&self`, or they collide with `&mut stage`.
+        let owner = &self.owner;
+        let repack = self.repack.as_ref();
+        let repack_stream = self.repack_stream.as_ref();
+        let stage = &mut self.stage;
         let mut dirty = false;
         let mut want: Vec<u32> = Vec::with_capacity(ids.len());
         for &e in ids {
@@ -1417,9 +1486,10 @@ impl ExpertShard {
                 format!("blk.{layer}.ffn_up_exps.weight"),
                 format!("blk.{layer}.ffn_down_exps.weight"),
             ];
-            let src = WeightSrc::from(&self.owner);
             let bpe = [r.gate_bytes_per_expert, r.up_bytes_per_expert, r.down_bytes_per_expert];
-            // The three roles are read CONCURRENTLY, then uploaded.
+            // The three roles are read CONCURRENTLY into PERSISTENT staging, then
+            // uploaded — and under `V41_B2_GPU_REPACK` (default on) the MXFP4
+            // HF->ggml permute runs on the iGPU instead of this box's CPU.
             //
             // This loop used to be strictly serial — read role i into one staging buffer,
             // blocking H2D, then role i+1 — so ~18.8 MB moved at ~1.9 GB/s and a miss cost
@@ -1427,25 +1497,41 @@ impl ExpertShard {
             // ~41 faults/token that is ~450 ms of the decode token, i.e. the single
             // largest cost in the engine. Box 1 has read experts with parallel preads
             // since the M7 pager (`read_range_into_cached_par`); this side never did.
+            //
+            // Concurrency got read to 8.30 ms, and there it stuck — because 8.30 was
+            // never the drive. MEASURED with O_DIRECT on box 2's own NVMe, the same
+            // 20.2 MB random read takes **4.52 ms** (4.47 GB/s) and does NOT improve
+            // with queue depth 2..16, so the drive is already saturated by one
+            // expert-sized read. The missing 3.8 ms was CPU: a fresh 18.8 MB
+            // allocation per fault plus the HF->ggml repack, both of which box 1's
+            // pager had already moved off the critical path.
             let (mut read_ns, mut h2d_ns) = (0u64, 0u64);
+            let gpu_repack = repack.is_some();
+            let rp0 = v4flash_core::hf_v41::expert_read_profile();
             let t_r = std::time::Instant::now();
-            let mut stages: [Vec<u8>; 3] = [
-                vec![0u8; bpe[0]], vec![0u8; bpe[1]], vec![0u8; bpe[2]],
-            ];
             {
-                let (s0, rest) = stages.split_at_mut(1);
-                let (s1, s2) = rest.split_at_mut(1);
+                let [p0, p1, p2] = &mut *stage;
+                let bufs: [&mut [u8]; 3] =
+                    [p0.as_mut_slice(), p1.as_mut_slice(), p2.as_mut_slice()];
                 let mut errs: Vec<String> = Vec::new();
                 std::thread::scope(|sc| {
-                    let h: Vec<_> = [(0usize, &mut s0[0]), (1, &mut s1[0]), (2, &mut s2[0])]
+                    let h: Vec<_> = bufs
                         .into_iter()
-                        .map(|(i, buf)| {
+                        .enumerate()
+                        .map(|(i, buf): (usize, &mut [u8])| {
                             let name = names[i].clone();
-                            let src = WeightSrc::from(&self.owner);
+                            let src = WeightSrc::from(owner);
                             sc.spawn(move || -> Result<(), String> {
                                 let t = src.tensor(&name).ok_or(format!("missing {name}"))?;
-                                src.read_expert_into(t, e as usize, buf)
-                                    .map_err(|err| format!("{name}: {err}"))
+                                if gpu_repack {
+                                    // Leave MXFP4 in the HF layout; permuted below.
+                                    src.read_expert_hf_layout(t, e as usize, buf)
+                                        .map(|_| ())
+                                        .map_err(|err| format!("{name}: {err}"))
+                                } else {
+                                    src.read_expert_into(t, e as usize, buf)
+                                        .map_err(|err| format!("{name}: {err}"))
+                                }
                             })
                         })
                         .collect();
@@ -1460,11 +1546,23 @@ impl ExpertShard {
                 }
             }
             read_ns += t_r.elapsed().as_nanos() as u64;
+            let rp1 = v4flash_core::hf_v41::expert_read_profile();
+            pg.pread_ns += rp1.2 - rp0.2;
+            pg.repack_cpu_ns += rp1.3 - rp0.3;
             let t_h = std::time::Instant::now();
-            for i in 0..3 {
-                let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
-                buf.slice_view_mut((base + victim as usize) * bpe[i], bpe[i])
-                    .copy_from_host(&stages[i])?;
+            match (repack, repack_stream) {
+                (Some(rp), Some(st)) => {
+                    pg.repack_gpu_ns += Self::repack_in_place(
+                        rp, st, r, (base + victim as usize) as u32, stage,
+                    )?;
+                }
+                _ => {
+                    for i in 0..3 {
+                        let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
+                        buf.slice_view_mut((base + victim as usize) * bpe[i], bpe[i])
+                            .copy_from_host(stage[i].as_slice())?;
+                    }
+                }
             }
             h2d_ns += t_h.elapsed().as_nanos() as u64;
             pg.read_ns += read_ns;
@@ -1481,11 +1579,67 @@ impl ExpertShard {
         Ok(())
     }
 
+    /// Permute the three staged HF-layout roles into `slot` on the iGPU, reading
+    /// the staging buffers IN PLACE. Returns the ns spent waiting on the repack
+    /// stream. Differs from `ExpertPager::upload_and_repack` on purpose: that one
+    /// uploads to device scratch first because box 1's pager also serves the
+    /// dGPU, which has its own VRAM. Box 2 is APU-only, so the upload is pure
+    /// waste — see `stage`.
+    fn repack_in_place(
+        rp: &Mxfp4Repack,
+        st: &v4flash_hip::Stream,
+        routed: &mut RoutedExpertWeights,
+        slot: u32,
+        stage: &[PinnedBuffer<u8>; 3],
+    ) -> eyre::Result<u64> {
+        // (rows, blocks per row) per role: gate/up are [N_FF_EXP, N_EMBD/32],
+        // down is [N_EMBD, N_FF_EXP/32]. Same block count, different shape —
+        // exactly the `role_kr` geometry this file already uses.
+        let geom = [
+            (N_FF_EXP as u32, (N_EMBD / 32) as u32),
+            (N_FF_EXP as u32, (N_EMBD / 32) as u32),
+            (N_EMBD as u32, (N_FF_EXP / 32) as u32),
+        ];
+        let bpe = [
+            routed.gate_bytes_per_expert,
+            routed.up_bytes_per_expert,
+            routed.down_bytes_per_expert,
+        ];
+        for i in 0..3 {
+            let (rows, nb) = geom[i];
+            debug_assert_eq!(rows as usize * nb as usize * 17, bpe[i]);
+            let dst = match i {
+                0 => &mut routed.gate.buffer,
+                1 => &mut routed.up.buffer,
+                _ => &mut routed.down.buffer,
+            };
+            // No upload: `stage[i]` is hipHostMalloc memory, which on this APU is
+            // the same physical RAM the iGPU reads. The preads above already put
+            // the bytes where the kernel wants them.
+            rp.launch_from_ptr(
+                st, dst, slot as usize * bpe[i],
+                stage[i].device_ptr(), stage[i].len(), rows, nb,
+            )?;
+        }
+        let t = std::time::Instant::now();
+        st.synchronize()?;
+        Ok(t.elapsed().as_nanos() as u64)
+    }
+
     /// `(requests, misses, read_ns, h2d_ns)` summed over layers.
     pub fn page_stats(&self) -> (u64, u64, u64, u64) {
         self.layers.iter().flatten().filter_map(|l| l.page.as_ref()).fold(
             (0, 0, 0, 0),
             |a, p| (a.0 + p.requests, a.1 + p.misses, a.2 + p.read_ns, a.3 + p.h2d_ns),
+        )
+    }
+
+    /// `(pread_ns, repack_cpu_ns, repack_gpu_ns)` summed over layers — the
+    /// sub-terms of `read_ns` plus the GPU permute, so a miss can be attributed.
+    pub fn page_read_split(&self) -> (u64, u64, u64) {
+        self.layers.iter().flatten().filter_map(|l| l.page.as_ref()).fold(
+            (0, 0, 0),
+            |a, p| (a.0 + p.pread_ns, a.1 + p.repack_cpu_ns, a.2 + p.repack_gpu_ns),
         )
     }
     pub fn has_layer(&self, layer: u32) -> bool {
@@ -2216,13 +2370,15 @@ pub fn serve_connection(
                     if shard.is_paged() && n_done % 2000 == 0 {
                         let (req, miss, read_ns, h2d_ns) = shard.page_stats();
                         if miss > 0 {
+                            let (pread_ns, rcpu_ns, rgpu_ns) = shard.page_read_split();
+                            let per = |ns: u64| ns as f64 / miss as f64 / 1e6;
                             eprintln!(
                                 "expertd: page stats requests={req} misses={miss} hit={:.4} \
-ms_per_miss={:.2} (read {:.2} h2d {:.2})",
+ms_per_miss={:.2} (read {:.2} [pread {:.2} repack_cpu {:.2}] h2d {:.2} repack_gpu {:.2})",
                                 1.0 - miss as f64 / req.max(1) as f64,
                                 (read_ns + h2d_ns) as f64 / miss as f64 / 1e6,
-                                read_ns as f64 / miss as f64 / 1e6,
-                                h2d_ns as f64 / miss as f64 / 1e6,
+                                per(read_ns), per(pread_ns), per(rcpu_ns),
+                                per(h2d_ns), per(rgpu_ns),
                             );
                         }
                     }
@@ -2474,6 +2630,15 @@ impl RemoteExpertClient {
     /// As [`Self::submit`] with explicit `proto::REQ_FLAG_*` bits.
     pub fn submit_flags(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32) -> eyre::Result<Option<Ticket>> {
         self.submit_inner(layer, b, xq, sel, ew, flags, true)
+    }
+
+    /// [`Self::submit_flags`] without the advertised-ownership mask — i.e. what
+    /// the hub does under T2 catch-all, where "not resident on box 1" is the
+    /// routing rule and box 2 pages anything it is handed. Needed by the bench to
+    /// exercise the miss path at all: masked submits can only ever request
+    /// resident experts, so they never fault.
+    pub fn submit_flags_unmasked(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32) -> eyre::Result<Option<Ticket>> {
+        self.submit_inner(layer, b, xq, sel, ew, flags, false)
     }
 
     fn submit_inner(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32, mask: bool) -> eyre::Result<Option<Ticket>> {

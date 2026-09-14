@@ -28,7 +28,7 @@ use std::time::Instant;
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::V41HfWeights;
 use v4flash_hip::{install_panic_handler, Device};
-use v4flash_kernels::config::{N_EMBD, N_EXPERT_USED};
+use v4flash_kernels::config::{N_EMBD, N_EXPERT, N_EXPERT_USED};
 use v4flash_kernels::het::remote_experts::{
     f32_to_f16_bits, proto, Assignment, ExpertShard, MoeExecutor, RemoteExpertClient, SocketOptions,
     NO_PICK, XQ_BYTES_PER_TOKEN,
@@ -88,6 +88,26 @@ fn make_picks(rng: &mut Rng, b: usize, k: usize, pool: &[u32]) -> (Vec<i32>, Vec
     (sel, ew)
 }
 
+/// Catch-all submits bypass the advertised-ownership mask so the daemon actually
+/// faults; masked submits can only request resident experts and never miss.
+#[allow(clippy::too_many_arguments)]
+fn submit_maybe_unmasked(
+    c: &mut RemoteExpertClient,
+    unmasked: bool,
+    layer: u32,
+    b: usize,
+    xq: &[u8],
+    sel: &[i32],
+    ew: &[f32],
+    flags: u32,
+) -> eyre::Result<Option<v4flash_kernels::het::remote_experts::Ticket>> {
+    if unmasked {
+        c.submit_flags_unmasked(layer, b, xq, sel, ew, flags)
+    } else {
+        c.submit_flags(layer, b, xq, sel, ew, flags)
+    }
+}
+
 fn pct(v: &mut [u32], p: f64) -> u32 {
     if v.is_empty() {
         return 0;
@@ -108,6 +128,7 @@ struct Args {
     check_n: usize,
     f32_resp: bool,
     batched: bool,
+    catchall: bool,
     gap_us: u64,
     clock_dump: Option<String>,
     socket: SocketOptions,
@@ -128,6 +149,7 @@ fn parse_args() -> eyre::Result<Args> {
         check_n: 4,
         f32_resp: false,
         batched: false,
+        catchall: false,
         gap_us: 0,
         clock_dump: None,
         socket: SocketOptions::default(),
@@ -147,6 +169,7 @@ fn parse_args() -> eyre::Result<Args> {
             "--check-n" => a.check_n = val()?.parse()?,
             "--f32" => a.f32_resp = true,
             "--batched" => a.batched = true,
+            "--catchall" => a.catchall = true,
             "--gap-us" => a.gap_us = val()?.parse()?,
             "--clock-dump" => a.clock_dump = Some(val()?),
             "--busy-poll" => a.socket.busy_poll_us = val()?.parse()?,
@@ -239,6 +262,7 @@ fn main() -> eyre::Result<()> {
         "B", "iters", "depth", "out KB", "in KB", "rtt p50", "rtt p90", "rtt p99", "srv p50", "gpu p50", "link p50", "ms/layer", "GB/s"
     );
     println!("(picks/token {}, pool {}, response {}{})", args.picks, if args.pool == usize::MAX { "all".to_string() } else { args.pool.to_string() }, if args.f32_resp { "f32" } else { "f16" }, if args.batched { ", forced batched path" } else { "" });
+    if args.catchall { println!("(CATCH-ALL: fresh picks/iter drawn from all {N_EXPERT} ids — the daemon pages from disk)"); }
     if args.gap_us > 0 {
         println!("(gap {} us between reply and next request; ms/layer and GB/s exclude the gap)", args.gap_us);
     }
@@ -253,19 +277,37 @@ fn main() -> eyre::Result<()> {
         exec.quantize_q8k(&x, &mut xq)?;
         // Per-layer pick sets (layers round-robin over what the daemon owns).
         let n_layers_used = owned_layers.len().min(8);
-        let picks: Vec<(u32, Vec<i32>, Vec<f32>)> = (0..n_layers_used)
-            .map(|i| {
-                let l = owned_layers[i];
-                let mut pool = info.owned_ids(l);
-                pool.truncate(args.pool);
-                let (s, w) = make_picks(&mut rng, b, args.picks, &pool);
-                (l, s, w)
-            })
-            .collect();
+        // `--catchall`: draw from ALL N_EXPERT ids, not just the ones the daemon
+        // owns, and draw FRESH picks for every iteration. Both matter. The default
+        // path builds one pick set per layer and replays it, so after the warm-up
+        // every expert is resident and the miss path is never exercised; and a pool
+        // of owned ids can only ever hit. This arm makes the daemon page from its
+        // own disk on nearly every request, which is what a real decode does under
+        // T2 catch-all — and it measures that cost with NO box-1 weight load.
+        let picks: Vec<(u32, Vec<i32>, Vec<f32>)> = if args.catchall {
+            let all: Vec<u32> = (0..N_EXPERT).collect();
+            (0..args.iters.max(n_layers_used))
+                .map(|i| {
+                    let l = owned_layers[i % n_layers_used];
+                    let (s, w) = make_picks(&mut rng, b, args.picks, &all);
+                    (l, s, w)
+                })
+                .collect()
+        } else {
+            (0..n_layers_used)
+                .map(|i| {
+                    let l = owned_layers[i];
+                    let mut pool = info.owned_ids(l);
+                    pool.truncate(args.pool);
+                    let (s, w) = make_picks(&mut rng, b, args.picks, &pool);
+                    (l, s, w)
+                })
+                .collect()
+        };
         // Warm-up.
         for i in 0..4 {
             let (l, s, w) = &picks[i % picks.len()];
-            if let Some(t) = client.submit_flags(*l, b, &xq, s, w, flags)? {
+            if let Some(t) = submit_maybe_unmasked(&mut client, args.catchall, *l, b, &xq, s, w, flags)? {
                 let p = client.wait(t)?;
                 client.recycle(p);
             }
@@ -282,7 +324,7 @@ fn main() -> eyre::Result<()> {
         while completed < args.iters {
             while submitted < args.iters && tickets.len() < args.depth {
                 let (l, s, w) = &picks[submitted % picks.len()];
-                let t = client.submit_flags(*l, b, &xq, s, w, flags)?.ok_or_else(|| eyre!("no remote picks"))?;
+                let t = submit_maybe_unmasked(&mut client, args.catchall, *l, b, &xq, s, w, flags)?.ok_or_else(|| eyre!("no remote picks"))?;
                 tickets.push_back(t);
                 submitted += 1;
             }
