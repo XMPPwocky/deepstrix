@@ -178,3 +178,33 @@ Secondary, and cheap: box 2's per-request `write` is 3.5 ms x 3760 = **13 s** an
 `read` 2.45 ms x 3760 = **9 s**, together 22 s of the wall in pure serialisation
 and I/O around the kernels. That is worth more than closing the whole attention
 path and needs no kernel work.
+
+## Likely bug: prefill asks box 2 for f32 responses via a mixed-up argument
+
+`RemoteExpertClient::submit`'s last parameter selects the RESPONSE PRECISION:
+
+    pub fn submit(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32],
+                  ew: &[f32], resp_f32: bool) -> ...
+
+`forward_prefill.rs:3927` passes `remote_split_on` into it — a flag about whether
+the remote split is ACTIVE for this layer, not about precision. Both are `bool`,
+so it compiles silently, and in production `remote_split_on` is true, so prefill
+always requests f32.
+
+Box 2's log confirms the effect: `out 10485.8 KB` = exactly 512 x 5120 x 4 bytes.
+The protocol's default is f16 (`REQ_FLAG_RESP_F32` exists to opt IN, "used by the
+bit-identity tests"), and the decode path passes `true` deliberately with a comment
+— at B=1 that is 20 KB vs 10 KB and irrelevant. At prefill's B=512 it is not:
+
+    f32 (today)  10.49 MB/req x 3760 = 39.4 GB  -> ~54 s of wire at 724 MB/s
+    f16           5.24 MB/req x 3760 = 19.7 GB  -> ~27 s
+
+**~27 s of a 160 s wall**, and box 2's GPU is only 82.9 s, so 54 s of wire cannot
+all hide behind it.
+
+NOT changed here, because it alters numerics: box 2's MoE partials would come back
+f16 before combining with box 1's. That needs a quality check (the CED replay and a
+long-context fluency probe), not just a throughput A/B. But the argument itself is
+a mix-up regardless of whether f32 turns out to be desirable, and a `bool` in that
+position is a footgun worth removing — `submit_flags` already takes explicit
+`REQ_FLAG_*` bits.
