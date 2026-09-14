@@ -187,3 +187,51 @@ METHOD, twice in one document: I wrote a method note here warning to check wheth
 a residency trace has converged, then quoted a hit rate from a pool that had never
 filled. Checking convergence in the replay is not the same as checking it in the
 measurement.
+
+## Belady OPT bound, and which kind of miss these are
+
+OPT (evict the resident whose next use is furthest away) is the optimal offline
+policy, so LRU-minus-OPT is the entire headroom any smarter online policy could
+ever recover. Computed on the Sep-13 trace, scoring the THIRD quarter (first half
+warms the pool; last quarter is left as lookahead runway so OPT is not rewarded
+for evicting things that only look dead because the trace ends). Miss 9.0 ms.
+
+    PER-LAYER regions (what box 2 runs)
+     slots  /layer |     LRU miss/tok      OPT miss/tok | policy headroom
+      4000     100 |  36.5 ->  328 ms   18.8 ->  169 ms |   159 ms
+      6160     154 |  18.6 ->  167 ms   15.0 ->  135 ms |    32 ms
+      8000     200 |  15.2 ->  137 ms   15.0 ->  135 ms |     2 ms
+
+    GLOBAL pool
+      6160         |  15.3 ->  138 ms   15.0 ->  135 ms |     2.8 ms
+
+Two results stand:
+
+**The global pool is within 2% of OPTIMAL** (15.3 vs 15.0 misses/token). It is not
+"an 11% win" as priced earlier in this document — at box 2's capacity it captures
+essentially all the policy headroom that exists, and nothing cleverer than LRU is
+worth building on top of it.
+
+**Total policy headroom is 32 ms/token**: 308 -> ~276 ms, 3.24 -> 3.6 tok/s. A
+perfect clairvoyant cache leaves decode an order of magnitude short of 30.
+
+### The trace's "compulsory-bound" reading is an artifact — DO NOT reuse it
+
+On that trace OPT is flat from 6160 to 12000 slots and every OPT miss is a
+first-ever touch, which reads as "misses are discovery, not eviction — more RAM
+would not help either". That conclusion does not survive contact with the
+1,200-token run:
+
+    337,593 requests, 41,603 misses, pool 6160 (6.8 turnovers)
+    distinct (layer,expert) pairs that EXIST: 40 x 384 = 15,360
+    -> compulsory misses <= 15,360
+    -> capacity misses   >= 26,243 = 63% of all misses
+
+You cannot first-touch 41,603 distinct things out of 15,360. **At least 63% of real
+misses are re-fetches of experts that were evicted**, so the working set genuinely
+exceeds the pool and residency does bind. The 256-token trace is simply too short
+to have finished discovering (7,395 of 15,360 pairs touched), which inflates its
+compulsory share and flattens OPT's capacity curve.
+
+So the capacity diagnosis stands, now on a rigorous counting argument rather than
+a hit rate: **the pool is too small, by a factor the policy cannot make up.**
