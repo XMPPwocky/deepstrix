@@ -61,27 +61,72 @@ Box 1's drive is not the slow one. At the miss's exact shape (3 threads x 6.3 MB
 
 **Box 1's idle drive is 44% faster than box 2's at this access pattern.**
 
-Pointing box 1's pool at the decoder layers box 2 starves:
+### CORRECTED — box 1's slots are not free, and duplication does not help
 
-    config                                          miss/tok  ms/tok
-    today                                              20.4     134
-    box 2 one global pool                              10.4      69
-    + box 1's 2688 slots over DECODER layers            9.4      62   <- best
-    + box 1's 2688 slots over ALL 40 layers             41.3     272  <- thrashes
-    + box 1 on decoders AND box 2 uniform 164          13.7      90
+The first pass of this section modelled "box 1's 2688 slots over decoder layers
+-> 9.4 miss/tok" and called it free. **Two errors, both now fixed.**
 
-Targeting matters: spreading box 1 over all 40 layers makes it a too-small
-first-level cache that evicts faster than it serves, and is 2x WORSE than doing
-nothing. Over decoder layers only it is the single best configuration found.
+**Error 1: those slots belong to prefill.** `forward_layer.rs:2320` says it
+outright — *"Box 1's decode LRU is only ~25 slots (pool minus the packed prefill
+windows)"*. The 52 GB pool is 2,766 slots, of which 2,688 are 21 packed windows
+at stride 128 pinning all 20 CED encoder layers, worth prefill 159 -> 255 tok/s.
+Decode gets the ~25-78 remainder. That also explains why
+[[project_v41_pool_split_not_a_decode_lever]] measured resizing the decode LRU
+inert: 3.5x of 25 slots is 87 slots, 2 per layer.
+
+**Error 2: a front cache duplicates what box 2 already holds.** Modelled properly
+— box 1 checked first, both caches filling independently — an INCLUSIVE box 1
+cache is nearly worthless:
+
+    box1 slots  arrangement          miss/tok  b1 hits/tok  saved
+          25    today                   20.4         0.0      0ms   <- validates
+        1024    inclusive front cache   18.8        96.8     11ms
+        2688    inclusive front cache    8.6       113.3     78ms
+
+At 1024 slots it absorbs **96.8 hits/token and removes 1.6 misses**. Almost every
+hit was one box 2 would have served anyway. Only at 2,688 — box 1's entire
+prefill window set — does it pay, and that trade is prefill 255 -> ~159 tok/s.
+
+### What actually works: an EXCLUSIVE, frequency-ranked band
+
+Box 2 keeps the top-68 per decoder layer. Box 1 **statically pins the NEXT k by
+frequency** — the same freq-ranked placement already shipped for encoder layers
+([[project_v41_freq_ranked_encoder_placement_2026-09-14]]). A pick in box 1's band
+never reaches box 2, and box 1 never pages, so neither box touches disk for it:
+
+    k/decoder  box1 slots    GB  prefill win  miss/tok  saved
+            0           0   0.0    21 of 21      20.4     0ms
+           16         320   6.0    19 of 21      17.4    19ms
+           32         640  12.0    16 of 21      14.8    36ms
+           48         960  18.0    14 of 21      12.7    51ms
+           64        1280  24.1    11 of 21      10.8    63ms
+           96        1920  36.1     6 of 21       7.8    83ms
+
+**960 exclusive slots buy 51 ms; 1024 inclusive slots buy 11 ms.** Same RAM, ~5x
+the return. The lever is DISJOINTNESS, not capacity — which is also why every
+previous attempt to size box 1's decode cache measured flat.
+
+The prefill cost is real and unpaid-for above: k=48 leaves 14 of 21 windows, so 6
+encoder layers lose their pin. Box 1's pool cannot simply grow to cover both —
+52 GB is the measured ceiling and 76 GB OOMs. A full phase swap (release windows
+at decode start, reclaim at prefill) costs 18 GB of re-paging at 4.93 GB/s = 3.7 s
+per switch, too slow per request. **So this needs a prefill A/B before shipping**,
+at k=16 and k=32 where only 2-5 windows are given up.
 
 ## What this is worth
 
-20.2 -> 9.4 misses/token = **~71 ms off a 246 ms token -> ~175 ms = 5.7 tok/s**,
-from 4.06. And the picks box 1 serves are computed on box 1's idle iGPU
-*concurrently* with box 2, so some of box 2's compute leg leaves the critical
-path as well. No format change, no new hardware, no prefill regression — box 1's
-pool is repurposed only in the decode phase, which is exactly the "phase-aware
-split" `DECODE_M8_PLAN.md` lists as step 0 and which was never built.
+At k=32 (640 slots, 5 windows given up): 20.4 -> 14.8 misses/token = **~36 ms off
+a 246 ms token -> 210 ms = 4.8 tok/s**, from 4.06 (+18%). At k=48, 51 ms -> 5.1
+tok/s (+26%). The picks box 1 serves are also computed on its idle iGPU
+*concurrently* with box 2, so some of box 2's compute leg leaves the critical path
+too — not modelled above, so these are lower bounds on wall-clock.
+
+**The hub swap changes this arithmetic favourably.** With box 2 (128 GB) as hub
+holding dense weights and KV, box 1 becomes a PURE expert executor: no dense
+weights, no KV, so most of its 96 GB and all 17.1 GB of idle dGPU VRAM become
+expert slots — roughly 4,000 + 900 against today's 2,766, and with no prefill
+windows to defend, all of it available for an exclusive decode band. Re-run this
+simulation against that split before committing to a k.
 
 ## Correction
 
