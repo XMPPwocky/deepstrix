@@ -148,3 +148,59 @@ longer load-bearing for reaching the goal.
 Reproduce: `scratchpad/geom.py` (per-layer vs global vs two-tier),
 `~/.cache/deepstrix/v41/lru_curve.py` (global curve), `scratchpad/buf_vs_direct.py`
 (both drives).
+
+---
+
+## The 52 GB pool ceiling was false — and capacity still is not the lever
+
+**Retested 2026-09-14** after the user pointed out that this box has loaded 80+ GB
+models. `run_v41_server.sh` carried the note *"52 GB measured usable; 76 OOMs"*,
+and this document leaned on it to defer the box-1 work to after the hub swap.
+
+**76 GB allocates fine:**
+
+    pool 55.8 GB  ->  2969 slots, decode LRU   25 slots (0.5 GB)
+    pool 81.6 GB  ->  4340 slots, decode LRU 1396 slots (26.2 GB)   both 21 prefill windows
+
+The iGPU's GTT ceiling is `100,330,016,768 B` — the whole of system RAM — so the
+driver was never the constraint. The old OOM was most likely measured on a box
+still holding ~58 GB in the amdgpu page pool from a previous run; that memory is
+reclaimable by the next HIP process, which is why a 55.8 GB pool allocates from
+exactly that state today.
+
+Note also that `"loading het weights (dGPU ~9 GiB + iGPU ~52 GiB)"` is a
+**hardcoded log string**, not a measurement. It never said anything about the
+real footprint and should not be read as evidence for any budget.
+
+### But the bigger pool is SLOWER
+
+Back-to-back, same server, 512-token generations at temperature 0:
+
+    pool 55.8 GB, decode LRU   25  ->  4.06 tok/s   decode_misses 0
+    pool 81.6 GB, decode LRU 1396  ->  3.1-3.6      decode_misses 0   (WARM)
+
+The cold run additionally paid 1,396 first-touch misses = 6,198 ms, exactly its
+free-slot count — the `budget = pg.lru_free_slots()` path in `forward_layer.rs`.
+But the **warm** run took zero box-1 decode misses and was still slower, so this
+is not paging cost. Box 2's `ms_per_miss` was unchanged at 7.53.
+
+### Why: leg balance, not capacity
+
+Decode costs `max(box1 iGPU MoE, box2)`. Box 1's iGPU runs the whole dense chain
+— attention, norms, head — **and** its MoE share; box 2's iGPU does MoE only. So
+box 1 is the busier device, and handing it more experts to compute lengthens the
+leg that is already carrying everything else. This matches the previously
+measured optimum of ~5 local picks/layer
+([[project_v41_decode_symmetric_igpus_2026-09-14]]) and the earlier finding that
+pool split is not a decode lever.
+
+**What this changes for the victim cache.** The held-out simulation above scored
+*misses avoided*, which is the right metric, but it did not model box 1's leg
+growing. A victim cache is still the right structure — it holds what box 2
+EVICTED, so the picks it serves are ones that would otherwise cost a 6.6 ms miss
+rather than a 0.1 ms hit — but it must be **budgeted**: serve a local pick only
+while box 1's leg stays under box 2's. An unbudgeted cache reproduces exactly the
+regression measured here.
+
+**And it is no longer gated on the hub swap.** Box 1 can hold 1,396 decode slots
+today while keeping all 21 prefill windows. The missing piece was never capacity.
