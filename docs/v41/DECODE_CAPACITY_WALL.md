@@ -1,3 +1,23 @@
+# *** CORRECTED 2026-09-14 — READ THIS FIRST ***
+
+**The format conclusion at the bottom of this file is WRONG in both directions.**
+It assumes experts are Q8_K (~8.5 bits/weight). They are **MXFP4 at 4.25
+bits/weight, 18.80 MB/expert** — so "Q5_K fits, Q6_K doesn't" would have made the
+experts *larger*, not smaller.
+
+The direction is DOWN, not up. The target is **~2.5 bits/weight (IQ2_S, 11.06
+MB/expert, 169.9 GB)**, which fits ALL 15,360 experts in the 175 GB of expert
+budget the two boxes already have. See `DECODE_MISS_PATH_AND_CAPACITY.md` for the
+arithmetic and for why no miss-path optimisation can substitute for it (380
+MB/token off a measured-flat 4.47 GB/s drive = 85 ms against a 33 ms budget).
+
+The per-expert byte figure used below (19.25 MB) is roughly right by accident;
+the bits/weight reasoning built on it is not. Everything else in this file — the
+pool-policy pricing, the global-vs-per-layer comparison, the miss anatomy — still
+stands.
+
+---
+
 # Decode is capacity-bound, not policy-bound (measured 2026-09-14)
 
 Decode sits at **271 ms/token (3.7 tok/s)**, of which `remote_rtt` is 230 ms (85%).
