@@ -63,3 +63,43 @@ Caveats: the 124/80/230 GB/s figures are from an earlier roofline pass and were
 NOT re-measured today; re-verify before committing effort. And the unexplained
 58 s between the stage totals and the wall is itself worth a look — it is 36% of
 prefill and nothing currently accounts for it.
+
+## UNRESOLVED: this contradicts the earlier roofline analysis by 2.1x
+
+`project_v41_prefill_moe_roofline_2026-09-14` reached the OPPOSITE conclusion —
+"the MoE kernel program is NOT the prefill lever at 100K" — by scaling its
+synthetic bench by production ownership:
+
+    box 1 MoE = 72.24 ms x 116/384 x 20 layers x 101.4 chunks ~= 44 s   (~15% of wall)
+
+Today's direct measurement says box 1's two MoE kernels are **94.0 s**, i.e. 2.1x
+that estimate and 59% of the 160 s wall. Both cannot be right, and the ~890 tok/s
+projection above depends entirely on which is.
+
+Candidate explanations, none verified:
+
+1. **Ownership drift.** The estimate assumed box 1 owns 116/384 encoder experts.
+   Under the T2 catch-all box 1 may be computing more than it nominally owns.
+2. **Stage timings include waiting.** `igpu.pair_kwide` is a GPU-event-scoped
+   stage; if it brackets stream idle it overstates kernel cost. The same
+   suspicion applies to the 58 s that separates the 160 s wall from
+   max(dGPU 93.6, iGPU 102.1) = 102.1 s.
+3. **Chunk count.** 96,935 / 1024 = 95 chunks assumed; the CED encoder pass may
+   issue more.
+
+If (2) holds, the MoE kernels are cheaper than they look and closing the roofline
+gap buys much less than 890 tok/s — and the earlier analysis was right that the
+lever is the SPLIT (box 2 owning 260/384 encoder experts on an identical iGPU),
+not the kernels.
+
+**Do not start a kernel program on the strength of this document.** The cheap
+discriminator is `rocprofv3 --kernel-trace` over one 100K prefill (recipe in
+`reference_rocprofv3_kernel_trace`), which gives true per-kernel GPU wall time and
+settles both the 2.1x gap and the unexplained 58 s at once. That is the honest
+next step, and it is one run.
+
+Recorded because the earlier analysis carried its own warning that this exact class
+of inference — scaling a synthetic bench by ratios — had already produced three
+wrong conclusions in one day. Today's number is a real aggregate rather than an
+extrapolation, which is why it is quoted first, but a measured disagreement of 2.1x
+is not resolved by preferring the newer measurement.
