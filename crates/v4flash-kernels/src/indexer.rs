@@ -44,7 +44,10 @@ const INDEXER_QAT_GFX1201: &[u8] = include_bytes!(env!("KERNEL_INDEXER_QAT_GFX12
 const INDEXER_QAT_GFX1151: &[u8] = include_bytes!(env!("KERNEL_INDEXER_QAT_GFX1151"));
 
 pub const INDEXER_TOP_K: u32 = 512;
-pub const INDEXER_N_HEAD: u32 = 64;
+/// Index heads for THIS model. Was hard-coded 64 (V4-Flash) while
+/// `config::N_INDEXER_HEAD` is cfg-gated 64/32 — a second source of truth that made
+/// `tests/indexer_score.rs` drive the 32-head V4.1 kernel with 64-head data.
+pub const INDEXER_N_HEAD: u32 = crate::config::N_INDEXER_HEAD;
 pub const INDEXER_HEAD_DIM: u32 = 128;
 
 /// Hadamard128 + E2M1 FP4 QAT round trip on 128-wide indexer rows,
@@ -83,6 +86,31 @@ impl IndexerQat {
             return Ok(());
         }
         let function = self.module.get_function("indexer_qat")?;
+        let cfg = LaunchConfig {
+            grid: (n_rows, 1, 1),
+            block: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [x.raw(), n_rows])
+    }
+
+    /// V4.1: FP4 round trip ONLY — no Hadamard128, no 1/sqrt(128).
+    ///
+    /// `fp4_act_quant(x, 32, True)` from the reference `inference/kernel.py:184`.
+    /// V4-Flash rotates before quantizing; V4.1 does not (there is no "hadamard"
+    /// anywhere in its reference). Using `launch` here would give a plausible but
+    /// WRONG selection; skipping quantization ENTIRELY is also wrong — it leaves Q
+    /// in f32 while the index keys are FP4.
+    pub fn launch_fp4(
+        &self,
+        stream: &Stream,
+        x: &mut DeviceBuffer<f32>,
+        n_rows: u32,
+    ) -> eyre::Result<()> {
+        if n_rows == 0 {
+            return Ok(());
+        }
+        let function = self.module.get_function("indexer_fp4")?;
         let cfg = LaunchConfig {
             grid: (n_rows, 1, 1),
             block: (128, 1, 1),
@@ -409,7 +437,14 @@ impl IndexerScoreWmma {
         if batch == 0 || n_idx_max == 0 {
             return Ok(());
         }
-        if q16.len() < (batch as usize) * 64 * 128 {
+        // Head count is a MODEL dimension (64 V4-Flash / 32 V4.1), not a constant:
+        // the kernel derives it from `-DDEEPSTRIX_V41`. Hard-coding 64 here rejected
+        // every V4.1 call with "q16 too small" and was the blocker on the prefill
+        // indexer.
+        let q16_need = (batch as usize)
+            * (crate::config::N_INDEXER_HEAD as usize)
+            * (crate::config::N_INDEXER_HEAD_DIM as usize);
+        if q16.len() < q16_need {
             return Err(eyre!("indexer gemm: q16 too small for batch={batch}"));
         }
         const TILE: u32 = 64; // ISG_TILE_ROWS
@@ -455,7 +490,14 @@ impl IndexerScoreWmma {
         if batch == 0 || n_idx_max == 0 {
             return Ok(());
         }
-        if q16.len() < (batch as usize) * 64 * 128 {
+        // Head count is a MODEL dimension (64 V4-Flash / 32 V4.1), not a constant:
+        // the kernel derives it from `-DDEEPSTRIX_V41`. Hard-coding 64 here rejected
+        // every V4.1 call with "q16 too small" and was the blocker on the prefill
+        // indexer.
+        let q16_need = (batch as usize)
+            * (crate::config::N_INDEXER_HEAD as usize)
+            * (crate::config::N_INDEXER_HEAD_DIM as usize);
+        if q16.len() < q16_need {
             return Err(eyre!("indexer gemm e2m1: q16 too small for batch={batch}"));
         }
         if index_comp_kv.len() < (n_idx_max as usize) * crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES {

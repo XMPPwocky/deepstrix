@@ -72,3 +72,45 @@ extern "C" __global__ void indexer_qat(
     if (q < -6.0f) q = -6.0f;
     xr[tid] = e2m1fn_dequant(q) * scale;
 }
+
+// V4.1 twin: the SAME per-32-block FP4 round trip, WITHOUT the Hadamard128
+// butterfly and its 1/sqrt(128) normalisation (those two are one orthonormal
+// transform). This is exactly `fp4_act_quant(x, 32, True)` from the reference's
+// inference/kernel.py:184 — V4-Flash rotates first, V4.1 does not (there is no
+// "hadamard" anywhere in the V4.1 reference). Skipping the ROTATION is correct;
+// skipping the QUANTIZATION too would leave Q in f32 while the index keys are
+// FP4, which is a real divergence.
+extern "C" __global__ void indexer_fp4(
+        float        * __restrict__ x,   // [n_rows, 128] in-place
+        unsigned int   n_rows) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    if (row >= n_rows || tid >= 128u) return;
+
+    __shared__ float absbuf[128];
+    float *xr = x + (unsigned long long)row * 128u;
+
+    const float v = xr[tid];                 // no rotation, no 1/sqrt(128)
+    const unsigned int block_base = tid & ~31u;
+    const unsigned int lane = tid & 31u;
+    absbuf[tid] = fabsf(v);
+    __syncthreads();
+    for (unsigned int stride = 16u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            absbuf[block_base + lane] =
+                fmaxf(absbuf[block_base + lane], absbuf[block_base + lane + stride]);
+        }
+        __syncthreads();
+    }
+
+    const float amax = fmaxf(absbuf[block_base], 7.052966104933725e-38f);
+    const float t = amax / 6.0f;
+    int e;
+    const float m = frexpf(t, &e);
+    const int cexp = (m == 0.5f) ? e - 1 : e;
+    const float scale = ldexpf(1.0f, cexp);
+    float q = v / scale;
+    if (q > 6.0f) q = 6.0f;
+    if (q < -6.0f) q = -6.0f;
+    xr[tid] = e2m1fn_dequant(q) * scale;
+}

@@ -44,7 +44,14 @@
 #include "e2m1_key_common.inc"
 
 #ifndef N_INDEXER_HEAD
+// V4-Flash has 64 index heads; V4.1 has 32 (`index_n_heads` in config.json).
+// The build passes -DDEEPSTRIX_V41=1 for the few kernels that bake model dims.
+// Everything below derives from this and N_INDEXER_HEAD_DIM — see ISW_M_TILES.
+#ifdef DEEPSTRIX_V41
+#define N_INDEXER_HEAD 32
+#else
 #define N_INDEXER_HEAD 64
+#endif
 #endif
 #ifndef N_INDEXER_HEAD_DIM
 #define N_INDEXER_HEAD_DIM 128
@@ -55,7 +62,8 @@ typedef float    float8 __attribute__((ext_vector_type(8)));
 
 #define ISW_BLOCK    32u
 #define ISW_N_TILE   16u   // comp rows per WG
-#define ISW_M_TILES   4u   // 64 heads / 16 per WMMA m-dim
+// heads / 16 per WMMA m-dim: 4 at 64 heads (V4-Flash), 2 at 32 (V4.1).
+#define ISW_M_TILES   (N_INDEXER_HEAD / 16u)
 #define ISW_K_TILES   8u   // 128 dim  / 16 per WMMA k-dim
 
 extern "C" __global__ __launch_bounds__(ISW_BLOCK)

@@ -128,6 +128,12 @@ pub struct DgpuScratch {
     pub sc_cur: DeviceBuffer<f32>,
     pub pooled: DeviceBuffer<f32>,
     pub comp_row: DeviceBuffer<f32>,
+    /// V4.1 CSA2 index-K staging (S1a): `wk(latent)` then `k_norm(..)`, both
+    /// `N_INDEXER_HEAD_DIM` wide. Separate buffers because the RMSNorm wrapper
+    /// requires distinct in/out. Written between the compressor's `rms_w` and its
+    /// `rope` — the latent must be read BEFORE the main path rotates it in place.
+    pub index_k_row: DeviceBuffer<f32>,
+    pub index_k_normed: DeviceBuffer<f32>,
 
     // CSA indexer scratch (used only on ratio==4 layers with
     // n_index_comp > INDEXER_TOP_K; otherwise the entire indexer pipeline
@@ -302,6 +308,8 @@ impl DgpuScratch {
             sc_cur: DeviceBuffer::new(device_id, (2 * N_HEAD_DIM) as usize)?,
             pooled: DeviceBuffer::new(device_id, N_HEAD_DIM as usize)?,
             comp_row: DeviceBuffer::new(device_id, N_HEAD_DIM as usize)?,
+            index_k_row: DeviceBuffer::new(device_id, N_INDEXER_HEAD_DIM as usize)?,
+            index_k_normed: DeviceBuffer::new(device_id, N_INDEXER_HEAD_DIM as usize)?,
 
             indexer_q: DeviceBuffer::new(
                 device_id,

@@ -208,6 +208,29 @@ pub struct BatchDgpuScratch {
     /// never run a batch larger than this through the scratch.
     pub rows: usize,
 
+    /// S2 shared selection, PER LANE (V4.1 CSA2 §1.4). The 8 index-source layers run the
+    /// indexer; layers between two sources reuse the most recent source's selection.
+    ///
+    /// This lives in the LANE scratch on purpose. `BatchDgpuShared` is one instance and
+    /// the pipelined path runs lane A then lane B at the SAME layer
+    /// (`forward_prefill.rs:425-429`), so `sd.indexer_selected` holds one lane's choice
+    /// and is immediately overwritten by the other's — the lanes are different TOKENS and
+    /// their selections legitimately differ. Keying off the lane's own scratch removes
+    /// the aliasing without threading a lane id anywhere.
+    ///
+    /// `[rows, INDEXER_TOP_K]` i32 (1 MB at rows=512) — the INDICES, not the gathered
+    /// rows: re-running the gather at a reuse layer is cheap (~512 rows/token), while
+    /// caching `attn_active_comp_kv` would cost 268 MB/lane and compete with the 4.3 GB
+    /// attention scratch at 130K. Scoring the whole store is the expensive part, and that
+    /// is what gets skipped.
+    pub indexer_sel_saved: DeviceBuffer<i32>,
+    /// Per-token `min(n_comp, INDEXER_TOP_K)` for the saved selection.
+    pub indexer_nsparse_saved: DeviceBuffer<i32>,
+    /// Store group the saved selection belongs to
+    /// (`kv_source_of(layer).unwrap_or(layer)`), or -1 for none. Guards against a
+    /// selection leaking across a kv-source boundary.
+    pub indexer_saved_store: i32,
+
     /// `[B, HC_DIM]` — per-token residual (cross-layer flow).
     pub residual: DeviceBuffer<f32>,
     pub residual_next: DeviceBuffer<f32>,
@@ -522,6 +545,12 @@ pub struct BatchDgpuShared {
     /// f16rt-ed in place. Final values appended to comp_kv via
     /// comp_kv_append_batched. 256 KB at rows=512.
     pub comp_rows_batched: DeviceBuffer<f32>,
+    /// V4.1 CSA2 index-K staging, batched twin of `DgpuScratch::index_k_{row,normed}`
+    /// (S1a). `[max_boundaries, N_INDEXER_HEAD_DIM]` each: `wk(latent)` then
+    /// `k_norm(..)`. Written between the compressor's batched `rms_w` and its batched
+    /// `rope`, because the latter rotates `comp_rows_batched` in place.
+    pub index_k_rows_batched: DeviceBuffer<f32>,
+    pub index_k_normed_batched: DeviceBuffer<f32>,
     /// `[n_boundaries_max]` i32 — per-boundary RoPE positions, uploaded
     /// once per layer×compressor for the batched rope launch.
     pub comp_pos_per_boundary: DeviceBuffer<i32>,
@@ -868,7 +897,7 @@ fn q_len(rows: usize) -> usize {
 /// another 268 MiB — all of it dead on a model whose `need_mask` gate
 /// (`ratio == 4`) is unreachable.
 fn indexer_scratch_keys() -> usize {
-    if crate::attention::indexer_ever_fires() {
+    if crate::attention::indexer_scratch_needed() {
         ATTN_MIXED_MAX_KEYS as usize
     } else {
         0
@@ -881,7 +910,7 @@ fn indexer_q_len(rows: usize) -> usize {
     rows * (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize
 }
 fn indexer_topk_scratch_len(rows: usize) -> usize {
-    if !crate::attention::indexer_ever_fires() {
+    if !crate::attention::indexer_scratch_needed() {
         return 0;
     }
     // Two-level bitonic tree merge (see scratch.rs): per token
@@ -943,6 +972,9 @@ impl BatchDgpuScratch {
         };
         Ok(Self {
             rows,
+            indexer_sel_saved: mk_i32(crate::indexer::INDEXER_TOP_K as usize)?,
+            indexer_nsparse_saved: mk_i32(1)?,
+            indexer_saved_store: -1,
             residual: mk_f32(HC_DIM as usize)?,
             residual_next: mk_f32(HC_DIM as usize)?,
             split: mk_f32(HC_MIX_DIM as usize)?,
@@ -1225,7 +1257,7 @@ impl BatchDgpuShared {
             n_index_comp_per_b: DeviceBuffer::new(id, b)?,
             // Dense per-token top-K gather target — only ever written by the
             // CSA gather, which cannot run when no layer is gathered.
-            attn_active_comp_kv: if crate::attention::indexer_ever_fires() {
+            attn_active_comp_kv: if crate::attention::indexer_scratch_needed() {
                 mk_u16((INDEXER_TOP_K * N_HEAD_DIM) as usize)?
             } else {
                 DeviceBuffer::new(id, 1)?
@@ -1250,6 +1282,14 @@ impl BatchDgpuShared {
             },
             comp_pooled_batched: DeviceBuffer::new(id, max_boundaries * N_HEAD_DIM as usize)?,
             comp_rows_batched: DeviceBuffer::new(id, max_boundaries * N_HEAD_DIM as usize)?,
+            index_k_rows_batched: DeviceBuffer::new(
+                id,
+                max_boundaries * N_INDEXER_HEAD_DIM as usize,
+            )?,
+            index_k_normed_batched: DeviceBuffer::new(
+                id,
+                max_boundaries * N_INDEXER_HEAD_DIM as usize,
+            )?,
             comp_pos_per_boundary: DeviceBuffer::new(id, max_boundaries)?,
             low,
             heads_xq,

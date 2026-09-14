@@ -115,6 +115,25 @@ pub fn indexer_gathers(ratio: u32) -> bool {
 /// Can the CSA indexer fire on ANY layer of this model? False for V4.1
 /// (unported indexer), which makes every per-token indexer scratch buffer
 /// dead weight — see `het::batch_scratch::indexer_scratch_keys`.
+/// Can the indexer fire in THIS PROCESS? `indexer_ever_fires()` is a static property
+/// of the model (V4-Flash ratio-4 only); this additionally returns true when V4.1's
+/// ported indexer is switched on with `V41_INDEX_K=1`, which is what decides whether the
+/// per-token indexer SCRATCH must be allocated.
+///
+/// Deliberately NOT used by `attn_max_scored_keys`: under V4.1 only the 8
+/// `index_source_layer_ids` gather; the other 32 layers still score their whole store,
+/// so the scores-scratch and `--ctx` caps must stay dense-sized until S2 (shared
+/// selection) makes reuse layers sparse too. Sizing those off this predicate would
+/// under-allocate and read past the end.
+pub fn indexer_scratch_needed() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        indexer_ever_fires()
+            || (cfg!(feature = "v41")
+                && matches!(std::env::var("V41_INDEX_K").as_deref(), Ok("1") | Ok("on")))
+    });
+    *B
+}
+
 pub fn indexer_ever_fires() -> bool {
     crate::config::COMPRESS_RATIOS.iter().any(|&r| indexer_gathers(r))
 }

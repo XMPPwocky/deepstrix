@@ -106,6 +106,37 @@ pub struct DgpuLayerWeights {
 pub struct IndexerWeights {
     pub attn_q_b: DeviceWeight,
     pub proj: DeviceWeight,
+    /// V4.1 ONLY. V4-Flash derives index K from a second (ratio-4) compressor;
+    /// V4.1 has NO indexer compressor — index K is `k_norm(wk(latent))` on the
+    /// PRE-RoPE latent (`model.py:535-537`). Both are `None` on V4-Flash.
+    pub attn_k: Option<DeviceWeight>,
+    /// f32, `N_INDEXER_HEAD_DIM` — consumed directly by `RmsNorm::launch_weighted`,
+    /// so it loads via `load_f32_weight` rather than as a quantized `DeviceWeight`.
+    pub k_norm: Option<DeviceBuffer<f32>>,
+}
+
+/// Does `layer` own indexer weights under V4.1 (CSA2 `index_source_layer_ids`)?
+/// V4-Flash keys indexer presence off `ratio == 4` instead, so this is false there.
+#[cfg(feature = "v41")]
+fn is_index_source(layer: i32) -> bool {
+    crate::config::INDEX_SOURCE_LAYERS.contains(&layer)
+}
+#[cfg(not(feature = "v41"))]
+fn is_index_source(_layer: i32) -> bool {
+    false
+}
+
+/// Does `layer` own the index-K projection? All 8 index-source layers SCORE, but
+/// index K exists only on the 4 KV-source layers (2, 8, 14, 20) — the others reuse
+/// the nearest source's keys, exactly as the main compressed store is reused.
+/// Assuming otherwise fails loudly at load: `blk.24.indexer.attn_k.weight` is absent.
+#[cfg(feature = "v41")]
+fn owns_index_k(layer: i32) -> bool {
+    crate::config::KV_SOURCE_LAYERS.contains(&layer)
+}
+#[cfg(not(feature = "v41"))]
+fn owns_index_k(_layer: i32) -> bool {
+    false
 }
 
 pub struct IgpuLayerWeights {
@@ -388,6 +419,8 @@ impl DgpuLayerWeights {
                     &format!("blk.{layer}.indexer.proj.weight"),
                     device_id,
                 )?,
+                attn_k: None,
+                k_norm: None,
             };
             let ic = CompressorWeights {
                 wkv: load_to_device(
@@ -415,6 +448,43 @@ impl DgpuLayerWeights {
                 head_dim: N_INDEXER_HEAD_DIM,
             };
             (Some(iw), Some(ic))
+        } else if is_index_source(layer) {
+            // V4.1 CSA2 (S0): the 8 `index_source_layer_ids` own indexer weights.
+            // There is NO `indexer_compressor` here — V4.1 builds index K directly
+            // from the pre-RoPE latent, so the second compressor that V4-Flash
+            // allocates at ratio 4 has no counterpart and stays None.
+            let iw = IndexerWeights {
+                attn_q_b: load_to_device(
+                    gguf,
+                    &format!("blk.{layer}.indexer.attn_q_b.weight"),
+                    device_id,
+                )?,
+                proj: load_to_device(
+                    gguf,
+                    &format!("blk.{layer}.indexer.proj.weight"),
+                    device_id,
+                )?,
+                attn_k: if owns_index_k(layer) {
+                    Some(load_to_device(
+                        gguf,
+                        &format!("blk.{layer}.indexer.attn_k.weight"),
+                        device_id,
+                    )?)
+                } else {
+                    None
+                },
+                k_norm: if owns_index_k(layer) {
+                    Some(load_f32_weight(
+                        gguf,
+                        &format!("blk.{layer}.indexer.k_norm.weight"),
+                        device_id,
+                        N_INDEXER_HEAD_DIM as usize,
+                    )?)
+                } else {
+                    None
+                },
+            };
+            (Some(iw), None)
         } else {
             (None, None)
         };

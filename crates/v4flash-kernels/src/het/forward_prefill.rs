@@ -94,6 +94,16 @@ fn replay_offload_enabled() -> bool {
     *B
 }
 
+/// Mirror of `forward_layer::index_k_enabled` — `V41_INDEX_K=1`, default OFF.
+use super::forward_layer::is_index_source_layer;
+
+fn index_k_enabled() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(std::env::var("V41_INDEX_K").as_deref(), Ok("1") | Ok("on"))
+    });
+    *B
+}
+
 fn remote_exclude() -> bool {
     static E: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         matches!(std::env::var("V41_REMOTE_SPLIT").as_deref(), Ok("1") | Ok("on") | Ok("3"))
@@ -811,6 +821,19 @@ impl HeterogeneousEngine {
             let chunk_pos0 = pos0 + chunk_start as u32;
 
             // Reset event pools at chunk start (mirrors decode's per-token cycle).
+            // Fold the PREVIOUS chunk's stages into the request accumulator before
+            // clearing. No-op unless DEEPSTRIX_PREFILL_PROFILE=1 (it synchronises,
+            // which serialises the two lanes — read per-stage busy time, not wall).
+            if super::trace::prefill_profile::enabled() {
+                super::trace::prefill_profile::add(
+                    "dgpu",
+                    &super::trace::rollup_by_name(&self.dgpu.events.harvest()?),
+                );
+                super::trace::prefill_profile::add(
+                    "igpu",
+                    &super::trace::rollup_by_name(&self.igpu.events.harvest()?),
+                );
+            }
             self.dgpu.events.reset();
             self.igpu.events.reset();
 
@@ -1045,6 +1068,19 @@ impl HeterogeneousEngine {
                 );
             }
 
+            // Fold the PREVIOUS chunk's stages into the request accumulator before
+            // clearing. No-op unless DEEPSTRIX_PREFILL_PROFILE=1 (it synchronises,
+            // which serialises the two lanes — read per-stage busy time, not wall).
+            if super::trace::prefill_profile::enabled() {
+                super::trace::prefill_profile::add(
+                    "dgpu",
+                    &super::trace::rollup_by_name(&self.dgpu.events.harvest()?),
+                );
+                super::trace::prefill_profile::add(
+                    "igpu",
+                    &super::trace::rollup_by_name(&self.igpu.events.harvest()?),
+                );
+            }
             self.dgpu.events.reset();
             self.igpu.events.reset();
 
@@ -1205,6 +1241,19 @@ impl HeterogeneousEngine {
                 seg_tokens.push(r.tok);
             }
             let t0 = std::time::Instant::now();
+            // Fold the PREVIOUS chunk's stages into the request accumulator before
+            // clearing. No-op unless DEEPSTRIX_PREFILL_PROFILE=1 (it synchronises,
+            // which serialises the two lanes — read per-stage busy time, not wall).
+            if super::trace::prefill_profile::enabled() {
+                super::trace::prefill_profile::add(
+                    "dgpu",
+                    &super::trace::rollup_by_name(&self.dgpu.events.harvest()?),
+                );
+                super::trace::prefill_profile::add(
+                    "igpu",
+                    &super::trace::rollup_by_name(&self.igpu.events.harvest()?),
+                );
+            }
             self.dgpu.events.reset();
             self.igpu.events.reset();
             let b_a = self.forward_prompt_batch_v2_pipelined_range(
@@ -1252,6 +1301,18 @@ impl HeterogeneousEngine {
             if let Some(f) = on_chunk_done {
                 f();
             }
+        }
+        if super::trace::prefill_profile::enabled() {
+            // Last chunk / replay is still unharvested at this point.
+            super::trace::prefill_profile::add(
+                "dgpu",
+                &super::trace::rollup_by_name(&self.dgpu.events.harvest()?),
+            );
+            super::trace::prefill_profile::add(
+                "igpu",
+                &super::trace::rollup_by_name(&self.igpu.events.harvest()?),
+            );
+            super::trace::prefill_profile::emit_and_clear(t);
         }
         Ok(out_logits)
     }
@@ -2158,6 +2219,61 @@ impl HeterogeneousEngine {
                         .slice_view_mut(0, n_boundaries as usize);
                     pv.copy_from_host_async(&pos_per_boundary_host, &de.compute)?;
                 }
+                // V4.1 CSA2 index-K (S1a, PREFILL twin of forward_layer.rs).
+                // MUST precede the rope below: that rotates `comp_rows_batched` IN
+                // PLACE, and the reference reads the RoPE-free latent. Batched
+                // counterparts of the decode chain, same positions.
+                // Inert until the sparse gate flips — nothing reads `index_k`.
+                if index_k_enabled() {
+                    if let Some(iw) = dlw.indexer.as_ref() {
+                        if let (Some(wk), Some(knorm), Some(ik)) =
+                            (iw.attn_k.as_ref(), iw.k_norm.as_ref(), cs.index_k.as_mut())
+                        {
+                            let _t = de.events.stage("k.comp_b.index_k", &de.compute)?;
+                            de.f16.gemm_batched_wmma(
+                                &de.compute,
+                                &mut sd.index_k_rows_batched,
+                                &wk.buffer,
+                                &sd.comp_rows_batched,
+                                N_INDEXER_HEAD_DIM,
+                                N_HEAD_DIM,
+                                n_boundaries,
+                            )?;
+                            de.rms_w.launch_weighted_batched(
+                                &de.compute,
+                                &mut sd.index_k_normed_batched,
+                                &sd.index_k_rows_batched,
+                                knorm,
+                                N_INDEXER_HEAD_DIM,
+                                RMS_EPS,
+                                n_boundaries,
+                            )?;
+                            let pos_v = sd
+                                .comp_pos_per_boundary
+                                .slice_view(0, n_boundaries as usize);
+                            de.rope.launch_forward_batched(
+                                &de.compute,
+                                &mut sd.index_k_normed_batched,
+                                &pos_v,
+                                1,
+                                N_INDEXER_HEAD_DIM,
+                                N_ROT,
+                                n_boundaries,
+                                &dlw.rope_params,
+                            )?;
+                            // Packs E2M1 + one E8M0 per 32 and appends — the
+                            // reference's `fp4_act_quant(k, 32, True)`.
+                            de.index_kv_e2m1.launch_append_batched(
+                                &de.compute,
+                                ik,
+                                &sd.index_k_normed_batched,
+                                n_comp_start,
+                                n_boundaries,
+                            )?;
+                            cs.n_index_comp = n_comp_start + n_boundaries;
+                        }
+                    }
+                }
                 {
                     let pos_v = sd
                         .comp_pos_per_boundary
@@ -2654,15 +2770,44 @@ impl HeterogeneousEngine {
             // (~70 µs/token at n_index_comp=16K), times B tokens per
             // chunk → maybe ~36 ms added per chunk at B=512, depth 32K.
             // Acceptable per the phase 5 perf budget.
-            let need_mask = ratio == 4
-                && ls.indexer_compressor.is_some()
-                && n_comp_after.iter().any(|&v| v > INDEXER_TOP_K);
+            // V4.1 CSA2 (S1, PREFILL): keys live on the KV-SOURCE's compressor state
+            // (`cs.index_k`, packed E2M1), there is no `indexer_compressor`, and the
+            // scoring layers are `index_source_layer_ids`, not `ratio == 4`.
+            // `n_index_comp_per_b` is filled from `n_comp_after` below, which for V4.1
+            // IS the index-K row count (S1a advances them in lockstep) — no change.
+            //
+            // THIS is the long-context prefill lever: attention is ~30% of prefill at
+            // 32K and ~59% at 100K because every query scores the WHOLE compressed
+            // store; the indexer makes it 512 rows + a 128 window, flat in context.
+            let v41_idx_keys = ls
+                .compressor
+                .as_ref()
+                .and_then(|c| c.index_k.as_ref())
+                .filter(|_| index_k_enabled() && is_index_source_layer(layer));
+            let v41_force = std::env::var("V41_INDEXER_FORCE").as_deref() == Ok("1");
+            // A non-source layer may reuse the last source's selection iff it shares the
+            // same compressed store AND this lane actually has one saved.
+            let s2_reuse = index_k_enabled()
+                && v41_idx_keys.is_none()
+                && ls.compressor.is_some()
+                && bd.indexer_saved_store >= 0
+                && bd.indexer_saved_store
+                    == crate::config::kv_source_of(layer as usize).unwrap_or(layer as usize) as i32
+                && n_comp_after.iter().any(|&v| v > 0);
+            let need_mask = if v41_idx_keys.is_some() {
+                n_comp_after.iter().any(|&v| v > if v41_force { 0 } else { INDEXER_TOP_K })
+            } else {
+                ratio == 4
+                    && ls.indexer_compressor.is_some()
+                    && n_comp_after.iter().any(|&v| v > INDEXER_TOP_K)
+            };
             let indexer_fired = if need_mask {
                 let _t_ix = de.events.stage("dgpu.prefill_indexer", &de.compute)?;
                 let iw = dlw.indexer.as_ref().ok_or_else(|| {
-                    eyre!("L{layer}: ratio==4 mask needed but no indexer weights")
+                    eyre!("L{layer}: indexer mask needed but no indexer weights")
                 })?;
-                let ics = ls.indexer_compressor.as_ref().expect("checked above");
+                // None under v41 — keys come from `v41_idx_keys` instead.
+                let ics_opt = ls.indexer_compressor.as_ref();
                 let n_words_per_b = ((ATTN_MIXED_MAX_KEYS + 31) / 32) as usize;
                 let scale = 1.0f32
                     / ((N_INDEXER_HEAD_DIM as f32) * (N_INDEXER_HEAD as f32)).sqrt();
@@ -2716,11 +2861,14 @@ impl HeterogeneousEngine {
                 // B × N_INDEXER_HEAD indexer Q rows (post-RoPE, pre-scoring).
                 {
                     let _t = de.events.stage("k.indexer.qat", &de.compute)?;
-                    de.indexer_qat.launch(
-                        &de.compute,
-                        &mut sd.indexer_q,
-                        b * N_INDEXER_HEAD,
-                    )?;
+                    // V4.1 does NOT rotate: `fp4_act_quant(q, 32, True)` with no
+                    // Hadamard (reference `inference/kernel.py:184`). Using the
+                    // rotating kernel yields a plausible but WRONG selection, silently.
+                    if v41_idx_keys.is_some() {
+                        de.indexer_qat.launch_fp4(&de.compute, &mut sd.indexer_q, b * N_INDEXER_HEAD)?;
+                    } else {
+                        de.indexer_qat.launch(&de.compute, &mut sd.indexer_q, b * N_INDEXER_HEAD)?;
+                    }
                 }
                 {
                     let _t = de.events.stage("k.indexer.matvec_proj", &de.compute)?;
@@ -2759,7 +2907,12 @@ impl HeterogeneousEngine {
                     // stay selectable via INDEXER_SCORE_VARIANT.
                     // Read per call (not LazyLock) so in-process A/B sweeps can flip it.
                     let score_gemm = std::env::var("INDEXER_SCORE_VARIANT").map(|v| v == "gemm").unwrap_or(true);
-                    if let CompKvStore::E2m1(rows) = &ics.comp_kv {
+                    let v41_rows = v41_idx_keys;
+                    let ics_e2m1 = ics_opt.and_then(|i| match &i.comp_kv {
+                        CompKvStore::E2m1(r) => Some(r),
+                        _ => None,
+                    });
+                    if let Some(rows) = v41_rows.or(ics_e2m1) {
                         // Packed keys: gemm / mw twins expand at their loads;
                         // the 1-wave `sw` kernel has no packed twin.
                         if score_gemm {
@@ -2803,7 +2956,7 @@ impl HeterogeneousEngine {
                             &mut sd.indexer_scores,
                             &sd.indexer_q16,
                             &sd.indexer_head_weights,
-                            ics.comp_kv
+                            ics_opt.expect("f16 indexer key path requires indexer_compressor").comp_kv
                                 .f16()
                                 .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16"))?,
                             &sd.n_index_comp_per_b,
@@ -2818,7 +2971,7 @@ impl HeterogeneousEngine {
                             &mut sd.indexer_scores,
                             &sd.indexer_q,
                             &sd.indexer_head_weights,
-                            ics.comp_kv
+                            ics_opt.expect("f16 indexer key path requires indexer_compressor").comp_kv
                                 .f16()
                                 .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16"))?,
                             &sd.n_index_comp_per_b,
@@ -2832,7 +2985,7 @@ impl HeterogeneousEngine {
                             &mut sd.indexer_scores,
                             &sd.indexer_q,
                             &sd.indexer_head_weights,
-                            ics.comp_kv
+                            ics_opt.expect("f16 indexer key path requires indexer_compressor").comp_kv
                                 .f16()
                                 .ok_or_else(|| eyre!("L{layer}: indexer compressor store must be f16"))?,
                             &sd.n_index_comp_per_b,
@@ -2848,7 +3001,10 @@ impl HeterogeneousEngine {
                     let topk_select = std::env::var("INDEXER_TOPK_SELECT").map(|v| v != "0").unwrap_or(true);
                     de.indexer_topk_bitonic.launch_batched(
                         &de.compute,
-                        &mut sd.indexer_selected,
+                        // S2: write the selection into the LANE's scratch so it survives
+                        // to the reuse layers below. `sd` is shared and would alias with
+                        // the other lane at the same layer.
+                        &mut bd.indexer_sel_saved,
                         None, // no CSA bitmap consumer in batched prefill
                         &mut sd.indexer_topk_scratch,
                         &sd.indexer_scores,
@@ -2877,7 +3033,7 @@ impl HeterogeneousEngine {
                             &de.compute,
                             &mut sd.attn_active_comp_kv,
                             buf,
-                            &sd.indexer_selected,
+                            &bd.indexer_sel_saved,
                             INDEXER_TOP_K,
                             N_HEAD_DIM,
                             b,
@@ -2888,7 +3044,7 @@ impl HeterogeneousEngine {
                             &de.compute,
                             &mut sd.attn_active_comp_kv,
                             rows,
-                            &sd.indexer_selected,
+                            &bd.indexer_sel_saved,
                             INDEXER_TOP_K,
                             b,
                         )?,
@@ -2908,6 +3064,51 @@ impl HeterogeneousEngine {
                     ncp_v.copy_from_host_async(&sparse_n_comp_host, &de.compute)?;
                 }
                 let _ = pos0; // pos consumed via pos_per_b
+                // S2: publish which store group this selection belongs to, for the reuse
+                // layers that follow in THIS lane.
+                if v41_idx_keys.is_some() {
+                    bd.indexer_saved_store = crate::config::kv_source_of(layer as usize)
+                        .unwrap_or(layer as usize) as i32;
+                }
+                _t_ix.end()?;
+                true
+            } else if s2_reuse {
+                // S2 shared selection: this layer is NOT an index source but shares the
+                // compressed store with the most recent one, so it reuses that selection.
+                // Skip matvec_q / RoPE / fp4 / score / topk entirely — scoring the whole
+                // store is the expensive part — and re-run ONLY the gather, which is
+                // ~512 rows per token.
+                let _t_ix = de.events.stage("dgpu.prefill_indexer_reuse", &de.compute)?;
+                // One line per process so a run can be checked for S2 actually engaging
+                // without turning on the prefill profile (stage names only appear there).
+                {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::info!(layer, store = bd.indexer_saved_store,
+                            "S2 shared selection ACTIVE (reuse layer skipped score+topk)");
+                    });
+                }
+                {
+                    let sparse_n_comp_host: Vec<i32> = n_comp_after
+                        .iter()
+                        .map(|&v| v.min(INDEXER_TOP_K) as i32)
+                        .collect();
+                    let mut ncp_v = sd.n_comp_per.slice_view_mut(0, b as usize);
+                    ncp_v.copy_from_host_async(&sparse_n_comp_host, &de.compute)?;
+                }
+                let cs_ref = ls.compressor.as_ref().expect("s2_reuse implies a compressor");
+                match &cs_ref.comp_kv {
+                    CompKvStore::F16(buf) => de.indexer_gather.launch_batched(
+                        &de.compute,
+                        &mut sd.attn_active_comp_kv,
+                        buf,
+                        &bd.indexer_sel_saved,
+                        INDEXER_TOP_K,
+                        N_HEAD_DIM,
+                        b,
+                    )?,
+                    _ => return Err(eyre!("L{layer}: S2 reuse needs an f16 main store")),
+                }
                 _t_ix.end()?;
                 true
             } else {

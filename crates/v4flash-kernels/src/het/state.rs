@@ -160,6 +160,24 @@ pub struct HetCompressorState {
     pub n_comp: u32,
     pub width: u32,
     pub head_dim: u32,
+    /// V4.1 CSA2 index-K cache: `k_norm(wk(latent))` per compressed row, stored
+    /// PACKED E2M1 + one E8M0 scale per 32 (`E2M1_KEY_ROW_BYTES` = 80 B/row),
+    /// which is exactly the reference's `fp4_act_quant(k, 32, True)`. One 128-dim
+    /// key per ROW (shared across the 32 index heads, MLA-style), not per head.
+    /// 80 B/row vs 256 B for f16, so the whole cache is ~26 MB at --ctx 130688.
+    ///
+    /// It lives HERE, in the main compressor state, on purpose. `compressor` is
+    /// allocated exactly on the 4 KV-SOURCE layers, and `with_kv_source` already
+    /// moves that state into the reuse layers for the forward — so putting the
+    /// index-K cache inside it makes reuse work for free. V4.1 has NO indexer
+    /// compressor, so allocating a second `HetCompressorState` (the V4-Flash
+    /// ratio-4 shape) would have been the wrong structure entirely.
+    ///
+    /// `None` on V4-Flash and on the ratio-4 indexer compressor itself.
+    pub index_k: Option<DeviceBuffer<u8>>,
+    /// Rows valid in `index_k`. Tracks `n_comp` once the indexer writes it;
+    /// separate counter so a half-built cache can never be read as complete.
+    pub n_index_comp: u32,
 }
 
 impl HetCompressorState {
@@ -198,6 +216,17 @@ impl HetCompressorState {
             let comp_kv_capacity = (max_n_comp as usize) * (head_dim as usize);
             CompKvStore::F16(DeviceBuffer::new(dgpu_device.id, comp_kv_capacity)?)
         };
+        // Index-K only for V4.1's MAIN compressor (head_dim 512). The ratio-4
+        // indexer compressor passes N_INDEXER_HEAD_DIM and must not get one.
+        let index_k = if cfg!(feature = "v41") && head_dim == N_HEAD_DIM {
+            dgpu_device.set_current()?;
+            Some(DeviceBuffer::new(
+                dgpu_device.id,
+                (max_n_comp as usize) * crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             state_kv,
             state_score,
@@ -205,6 +234,8 @@ impl HetCompressorState {
             n_comp: 0,
             width,
             head_dim,
+            index_k,
+            n_index_comp: 0,
         })
     }
 }
@@ -278,6 +309,7 @@ impl HetModelState {
             layer.raw_off = 0;
             if let Some(comp) = &mut layer.compressor {
                 comp.n_comp = 0;
+                comp.n_index_comp = 0;
                 let n_state = comp.state_kv.len();
                 let zeros = vec![0f32; n_state];
                 let neg_inf = vec![NEG_INF; n_state];
@@ -288,6 +320,7 @@ impl HetModelState {
             // Indexer compressor (ratio==4 only) uses the same reset shape.
             if let Some(comp) = &mut layer.indexer_compressor {
                 comp.n_comp = 0;
+                comp.n_index_comp = 0;
                 let n_state = comp.state_kv.len();
                 let zeros = vec![0f32; n_state];
                 let neg_inf = vec![NEG_INF; n_state];
@@ -296,10 +329,43 @@ impl HetModelState {
                 comp.state_score.copy_from_host(&neg_inf)?;
             }
         }
-        // The kv_cache buffers and comp_kv buffer don't need wiping —
-        // their valid extent is gated by n_raw/n_comp respectively, both
-        // now 0. Set the current device back to dGPU to leave the engine
-        // in the expected state for the next forward pass.
+        // `V41_RESET_ZERO=1`: also wipe the cumulative KV buffers.
+        //
+        // The claim above ("don't need wiping — the extent is gated by n_raw /
+        // n_comp") is what this flag TESTS. Measured 2026-09-14: a 37-token
+        // request poisons a later 104K request, deterministically, and the
+        // corruption CHANGES with the poisoner's prefill size (37-tok ->
+        // sha 5799afaa4959, 32K -> 6d1dbafa35e6) while being INDEPENDENT of its
+        // decode length. The two runs also agree for their first ~11 generated
+        // tokens, so the error is SMALL and compounding, not gross. That is the
+        // signature of a kernel reading a little past n_comp into tile padding:
+        // harmless when those rows are freshly-allocated zeros, poisonous when
+        // they hold the previous request's values.
+        //
+        // If this flag makes the corruption vanish, the gating claim is false
+        // somewhere and the real fix is to find the over-read (this memset is
+        // ~3.9 GB at --ctx 130688, far too expensive to keep on).
+        if std::env::var("V41_RESET_ZERO").as_deref() == Ok("1") {
+            dgpu_device.set_current()?;
+            for layer in &mut self.layers {
+                layer.kv_cache.fill_zero()?;
+                for comp in [layer.compressor.as_mut(), layer.indexer_compressor.as_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    match &mut comp.comp_kv {
+                        CompKvStore::F16(b) => b.fill_zero()?,
+                        CompKvStore::Fp8 { rows, head } => {
+                            rows.fill_zero()?;
+                            head.fill_zero()?;
+                        }
+                        CompKvStore::E2m1(b) => b.fill_zero()?,
+                    }
+                }
+            }
+        }
+        // Set the current device back to dGPU to leave the engine in the
+        // expected state for the next forward pass.
         dgpu_device.set_current()?;
         Ok(())
     }

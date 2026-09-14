@@ -1477,6 +1477,17 @@ impl ExpertPager {
     /// `V41_T2_CATCHALL=1`: box 2 is a catch-all LRU tier, so the hub stops
     /// synchronously paging and reassigns its misses there instead. Requires the
     /// daemon to run with `--paged` (it advertises ownership of everything).
+    /// `V41_T2_CATCHALL=2`: catch-all, but the split is a CONSTANT (everything
+    /// routed goes to box 2) instead of a function of residency. Removes the
+    /// request-history dependence that made long-context output non-reproducible.
+    /// See the long note at the mode-2 branch in `forward_layer.rs`.
+    pub fn t2_catchall_deterministic() -> bool {
+        static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("V41_T2_CATCHALL").as_deref() == Ok("2")
+        });
+        *B
+    }
+
     pub fn t2_catchall() -> bool {
         static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
             std::env::var("V41_T2_CATCHALL").map(|v| v != "0").unwrap_or(false)

@@ -47,6 +47,100 @@ use super::sync::{peer_push_f32, peer_push_i32};
 /// The MoE partials from the iGPU pool, box 2, and (once wired) the dGPU hot
 /// tier are summed with `vec_add` at `ffn_combine`. That sum is only correct if
 /// the three claim sets partition the token's picks. Nothing in the types
+/// Lever 1 — shrink the pre-`submit` critical path (`V41_DECODE_PRESUBMIT=1`).
+///
+/// Decode hands box 2 its work in `submit`, but everything box 1 queues on
+/// `de.compute` BEFORE the `synchronize()` that reads back the router's picks is
+/// time box 2 spends idle. Two things sit there for no reason:
+///
+///   * the shared-expert graph (~97 us/layer measured) — its result is not
+///     consumed until `ffn_combine`, so it can run AFTER the submit and overlap
+///     box 2 instead of preceding it;
+///   * `q8k(ffn_input_norm) -> moe_xq`, which needs only `ffn_input_norm` (the
+///     router's own input) and so can be enqueued before the FIRST sync. That
+///     removes the SECOND full `de.compute.synchronize()` per layer outright.
+///
+/// Kept behind an env flag so both arms live in ONE binary: a `cargo build -p
+/// v4flash-kernels` does not relink deepstrix-server, and an A/B across two
+/// builds has already produced one fabricated result in this project.
+///
+/// MEASURED 2026-09-14, back-to-back in one binary, 3x256-token decode each:
+///     off: 10.70 / 10.86 tok/s   on: 11.34 / 11.30 tok/s   (+5.0%)
+///     total_us 59,857 -> 57,203      sel_sync_us 27,313 -> 24,258 (-3,055)
+///     remote_rtt_us 21,567 -> 22,647 (+1,080)  pager_ensure_us unchanged
+/// Output was BYTE-IDENTICAL across all six runs (sha b7f58f53b529) — the
+/// reorder only moves work nothing downstream had consumed yet.
+///
+/// Note the shape of the win: sel_sync drops the predicted ~3 ms but rtt rises
+/// ~1 ms, because box 2 starting earlier just means the hub waits for it longer.
+/// Net -2.65 ms/token, ~half the -5 to -7 predicted. While box 2 is the
+/// bottleneck, THAT is the ceiling for any pre-submit reordering; the rest of
+/// the 23 ms expert phase needs picks taken off box 2, not scheduled earlier.
+///
+/// Default ON since the A/B above; `V41_DECODE_PRESUBMIT=0` rolls back.
+/// `V41_INDEX_K=1`: compute the V4.1 CSA2 index keys during the compressor step.
+/// Default OFF. Inert while on — nothing reads `HetCompressorState::index_k` until S1
+/// flips the sparse gate — so it is safe to enable for numerical validation.
+/// Mirror of `het::weights::is_index_source` (private there).
+#[cfg(feature = "v41")]
+pub(crate) fn is_index_source_layer(layer: i32) -> bool {
+    crate::config::INDEX_SOURCE_LAYERS.contains(&layer)
+}
+#[cfg(not(feature = "v41"))]
+pub(crate) fn is_index_source_layer(_layer: i32) -> bool {
+    false
+}
+
+/// `V41_LOCAL_PICKS=N`: force box 1 to claim N of the 6 routed picks per layer
+/// REGARDLESS of residency (it pages what it lacks), handing the rest to box 2.
+///
+/// Why this exists: the expert phase costs **max(box1, box2)**, not their sum — box 1's
+/// iGPU MoE is issued between `submit` and `wait`, so the two run concurrently. With
+/// box1(n) = 73n us and box2(m) = 220 + 95m us, the optimum is n~5 at 365 us/layer
+/// versus 790 today, i.e. -17 ms/token. The pool sweep could not test this because box 1
+/// claims only what it ALREADY HOLDS, and its LRU fills by first touch (coverage ~
+/// slots/384), so extra capacity went unused. This forces n directly.
+///
+/// NOTE the confound: forcing n also forces PAGING on box 1's dm-crypt NVMe, which lands
+/// on the critical path via `ensure`. Read `pager_ensure_us` alongside `remote_rtt_us`.
+fn local_picks_override() -> Option<usize> {
+    static N: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_LOCAL_PICKS").ok().and_then(|v| v.parse::<usize>().ok())
+    });
+    *N
+}
+
+/// `V41_LOCAL_CLAIM_MAX=N`: cap how many routed picks box 1 computes locally per layer,
+/// handing the surplus to box 2 even when box 1 HOLDS them.
+///
+/// This is a PRECONDITION for better placement, not a refinement. The expert phase costs
+/// max(box1, box2); with c1 ~= 98 us/pick and box2(m) = 80 + 95m, f(n) for n=0..6 is
+/// 650/555/460/365/392/490/588 — it turns UP after n=3. Measured on the decode trace
+/// (E[f(n)], warm half, 20 encoder layers): a warm-oracle 116-expert share costs
+/// **11.19 ms/token uncapped — WORSE than today's 9.99** because box 1 becomes the long
+/// pole at n~5.5; capped at 3 the same placement is 7.31 ms. Residency and claiming are
+/// separate decisions: hold as much as you like, compute only n*.
+fn local_claim_max() -> Option<usize> {
+    static N: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_LOCAL_CLAIM_MAX").ok().and_then(|v| v.parse::<usize>().ok())
+    });
+    *N
+}
+
+fn index_k_enabled() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(std::env::var("V41_INDEX_K").as_deref(), Ok("1") | Ok("on"))
+    });
+    *B
+}
+
+fn decode_presubmit_reorder() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !matches!(std::env::var("V41_DECODE_PRESUBMIT").as_deref(), Ok("0") | Ok("off"))
+    });
+    *B
+}
+
 /// enforces it: the pager's remap, box 2's ownership bitmap and the hot remap
 /// are built independently, and a per-device CAP can silently drop a pick
 /// (nobody computes it) or hand it to a second device by raw id (computed
@@ -899,6 +993,50 @@ impl HeterogeneousEngine {
                     )?;
                 }
                 let comp_pos = pos + 1 - ratio;
+
+                // V4.1 CSA2 index-K (S1a), `V41_INDEX_K=1`. MUST sit HERE: the
+                // reference reads the RoPE-free latent (`model.py:_compress_kv`,
+                // "the indexer needs the latent before RoPE, so it runs before the
+                // cache is written") and the block below rotates `comp_row` IN PLACE.
+                //
+                //   k = k_norm(wk(latent)); rope(k[-64:]) at the GROUP position
+                //
+                // Stored f16 for now; the reference additionally fp4-quantizes with
+                // 32-block E8M0 (NOT the 16-block E4M3 the compressed KV uses, and
+                // NOT `indexer_qat.hip`, which applies a Hadamard V4.1 does not).
+                // NOTHING READS `index_k` yet — this is inert, like S0.
+                if index_k_enabled() {
+                    if let Some(iw) = dlw.indexer.as_ref() {
+                        if let (Some(wk), Some(knorm)) = (iw.attn_k.as_ref(), iw.k_norm.as_ref()) {
+                            let _t = de.events.stage("k.compressor_d.index_k", &de.compute)?;
+                            de.f16.matvec(
+                                &de.compute,
+                                &mut dgpu_scratch.index_k_row,
+                                &wk.buffer,
+                                &dgpu_scratch.comp_row,
+                                N_INDEXER_HEAD_DIM,
+                                N_HEAD_DIM,
+                            )?;
+                            de.rms_w.launch_weighted(
+                                &de.compute,
+                                &mut dgpu_scratch.index_k_normed,
+                                &dgpu_scratch.index_k_row,
+                                knorm,
+                                N_INDEXER_HEAD_DIM,
+                                RMS_EPS,
+                            )?;
+                            de.rope.launch_forward(
+                                &de.compute,
+                                &mut dgpu_scratch.index_k_normed,
+                                1,
+                                N_INDEXER_HEAD_DIM,
+                                N_ROT,
+                                comp_pos,
+                                &dlw.rope_params,
+                            )?;
+                        }
+                    }
+                }
                 {
                     let _t = de.events.stage("k.compressor_d.rope", &de.compute)?;
                     de.rope.launch_forward(
@@ -943,6 +1081,27 @@ impl HeterogeneousEngine {
                         &mut cs.state_score,
                         comp_width,
                     )?;
+                }
+
+                // V4.1 index-K store (S1a step 5). The VALUE was computed above from
+                // the pre-RoPE latent; it is stored HERE, beside the comp_kv append,
+                // because that is where `cs` is already mutably borrowed. `index_k`
+                // rows are indexed the same way comp_kv rows are, so `n_index_comp`
+                // advances in lockstep with `n_comp`.
+                if index_k_enabled() {
+                    if let Some(ik) = cs.index_k.as_mut() {
+                        let _t = de.events.stage("k.compressor_d.index_k_store", &de.compute)?;
+                        // Packs E2M1 + one E8M0 per 32 and appends — the reference's
+                        // `fp4_act_quant(k, 32, True)`, NOT the compressed-KV 16-block
+                        // E4M3 path and NOT `indexer_qat.hip` (which Hadamards).
+                        de.index_kv_e2m1.launch_append(
+                            &de.compute,
+                            ik,
+                            &dgpu_scratch.index_k_normed,
+                            cs.n_index_comp,
+                        )?;
+                        cs.n_index_comp += 1;
+                    }
                 }
 
                 // No peer push needed — append directly into local comp_kv.
@@ -1190,7 +1349,30 @@ impl HeterogeneousEngine {
             // candidate pool — ARCH_SPEC §1.4/§1.5, ENGINE_PORT M5 leftover).
             // `n_index_comp` is 0 under v41, so the condition below is false for
             // BOTH reasons; see docs/v41/DECODE_M8_PLAN.md "Measured (2026-09-13)".
-            let use_sparse = ratio == 4 && n_index_comp > INDEXER_TOP_K;
+            // V4.1 CSA2 (S1): index-K lives on the KV-SOURCE's compressor state
+            // (`with_kv_source` has already moved it in for reuse layers), NOT in a
+            // separate `indexer_compressor` — V4.1 has none. `n_index_comp` is
+            // maintained by the S1a store.
+            let v41_index_k = cs.and_then(|c| c.index_k.as_ref());
+            let v41_n_index = cs.map(|c| c.n_index_comp).unwrap_or(0);
+            let (n_index_comp, keys_v41) = if cfg!(feature = "v41") && v41_index_k.is_some() {
+                (v41_n_index.min(crate::attention::ATTN_MIXED_MAX_KEYS), v41_index_k)
+            } else {
+                (n_index_comp, None)
+            };
+            // `V41_INDEXER_FORCE=1` lowers the threshold so the sparse path RUNS at
+            // n_index_comp <= INDEXER_TOP_K. That regime is where top-512 selects EVERY
+            // reachable row, so sparse must be BIT-IDENTICAL to dense — which makes it a
+            // genuine end-to-end test of the WIRING. (The plan called the <=512 test a
+            // tautology; it is one only because the normal gate stops the sparse path
+            // from executing there. Forcing execution fixes that.)
+            let force = std::env::var("V41_INDEXER_FORCE").as_deref() == Ok("1");
+            let sparse_min = if force { 0 } else { INDEXER_TOP_K };
+            let use_sparse = if keys_v41.is_some() {
+                index_k_enabled() && is_index_source_layer(layer) && n_index_comp > sparse_min
+            } else {
+                ratio == 4 && n_index_comp > INDEXER_TOP_K
+            };
             let env_disable_sparse = std::env::var("DECODE_INDEXER")
                 .map(|v| v == "off" || v == "0").unwrap_or(false);
             let use_sparse = use_sparse && !env_disable_sparse;
@@ -1202,7 +1384,8 @@ impl HeterogeneousEngine {
                     .indexer
                     .as_ref()
                     .ok_or_else(|| eyre!("L{layer}: ratio==4 but no indexer weights"))?;
-                let ics_ref = ics.expect("ratio==4 must have indexer_compressor state");
+                // V4-Flash only; under v41 the keys come from `keys_v41` instead.
+                let ics_ref_opt = ics;
 
                 // 1. matvec(attn_q_b × qr_normed) → indexer_q [N_INDEXER_HEAD * N_INDEXER_HEAD_DIM]
                 de.f16.matvec(
@@ -1225,7 +1408,18 @@ impl HeterogeneousEngine {
                 )?;
                 // 2b. ds4 5bc1e6d: Hadamard128 + FP4 QAT round trip on the
                 // indexer Q rows (post-RoPE, pre-scoring).
-                de.indexer_qat.launch(&de.compute, &mut dgpu_scratch.indexer_q, N_INDEXER_HEAD)?;
+                //
+                // V4.1 DOES NOT ROTATE. `model.py:535-537` applies plain
+                // `fp4_act_quant(q, 32, True)` with no Hadamard, so running this here
+                // would give a plausible-looking but WRONG selection, silently. This is
+                // the single highest-risk line in the port.
+                if keys_v41.is_none() {
+                    de.indexer_qat.launch(&de.compute, &mut dgpu_scratch.indexer_q, N_INDEXER_HEAD)?;
+                } else {
+                    // V4.1: FP4 round trip WITHOUT the rotation. Dropping the whole
+                    // kernel would leave Q in f32 against FP4 keys — a real divergence.
+                    de.indexer_qat.launch_fp4(&de.compute, &mut dgpu_scratch.indexer_q, N_INDEXER_HEAD)?;
+                }
                 // 3. matvec(indexer.proj × attn_input_norm) → head_weights [N_INDEXER_HEAD]
                 de.f16.matvec(
                     &de.compute,
@@ -1253,6 +1447,30 @@ impl HeterogeneousEngine {
                 static MW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
                     std::env::var("INDEXER_DECODE").map(|v| v != "sw").unwrap_or(true)
                 });
+                if let Some(keys) = keys_v41 {
+                    let kv_slice =
+                        keys.slice_view(0, (n_index_comp as usize) * E2M1_KEY_ROW_BYTES);
+                    // SCALAR ONLY under V4.1. The WMMA score kernels
+                    // (`launch_mw_e2m1`, `launch_batched_mw_e2m1`,
+                    // `launch_batched_gemm_e2m1`) take no `n_head` — they are
+                    // hard-coded to V4-Flash's **64** index heads, and V4.1 has **32**
+                    // (`N_INDEXER_HEAD`). Feeding them 32-head Q makes them read twice
+                    // the rows they should. `launch_e2m1` takes `(n_head, head_dim)` and
+                    // is the variant the passing synthetic oracle
+                    // (`tests/v41_indexer_selection_oracle.rs`) exercises at 32x128.
+                    // A 32-head WMMA twin is the perf follow-up; correctness first.
+                    de.indexer_score.launch_e2m1(
+                        &de.compute,
+                        &mut dgpu_scratch.indexer_scores,
+                        &dgpu_scratch.indexer_q,
+                        &dgpu_scratch.indexer_head_weights,
+                        &kv_slice,
+                        n_index_comp,
+                        N_INDEXER_HEAD,
+                        N_INDEXER_HEAD_DIM,
+                    )?;
+                } else {
+                let ics_ref = ics_ref_opt.expect("ratio==4 must have indexer_compressor state");
                 match &ics_ref.comp_kv {
                     CompKvStore::E2m1(rows) => {
                         // Packed keys: the *_e2m1 twins expand at their loads.
@@ -1324,6 +1542,7 @@ impl HeterogeneousEngine {
                         }
                     }
                 }
+                }
                 // 6. IndexerTopk → sorted indices + bitmap. The bitonic
                 // variant (ported from ds4) is 72× faster than the
                 // greedy fallback at n_comp=16384.
@@ -1336,6 +1555,74 @@ impl HeterogeneousEngine {
                     n_index_comp,
                     INDEXER_TOP_K,
                 )?;
+                // `V41_INDEXER_DBG=<layer>`: one-shot check that at n_index_comp <= 512
+                // the selection really is ALL reachable rows (a permutation of
+                // 0..n_index_comp), and that n_index_comp tracks n_comp. If either is
+                // false, sparse cannot equal dense and the forced-gate comparison is
+                // measuring a real defect rather than reordering.
+                if std::env::var("V41_INDEXER_DBG").ok().and_then(|v| v.parse::<i32>().ok())
+                    == Some(layer)
+                {
+                    de.compute.synchronize()?;
+                    let k = (INDEXER_TOP_K.min(n_index_comp)) as usize;
+                    let mut sel = vec![0i32; k];
+                    dgpu_scratch.indexer_selected.slice_view(0, k).copy_to_host(&mut sel)?;
+                    let mut seen = vec![false; n_index_comp as usize];
+                    let (mut dup, mut oob) = (0usize, 0usize);
+                    for &i in &sel {
+                        if i < 0 || i as u32 >= n_index_comp {
+                            oob += 1;
+                        } else if seen[i as usize] {
+                            dup += 1;
+                        } else {
+                            seen[i as usize] = true;
+                        }
+                    }
+                    let missing = seen.iter().filter(|b| !**b).count();
+                    // LIVE selection-set oracle dump (`V41_INDEXER_DUMP=<dir>`): write the
+                    // exact tensors the GPU scored so a CPU recompute can check the
+                    // top-512 as a SET at n_index_comp > 512 — the regime the code is
+                    // designed for. Comparing logits against the dense path cannot work
+                    // there (they legitimately diverge) and forcing the gate below 512
+                    // leaves the designed envelope.
+                    if let Ok(dir) = std::env::var("V41_INDEXER_DUMP") {
+                        use std::io::Write;
+                        let _ = std::fs::create_dir_all(&dir);
+                        let w = |name: &str, bytes: &[u8]| {
+                            if let Ok(mut f) = std::fs::File::create(format!("{dir}/{name}")) {
+                                let _ = f.write_all(bytes);
+                            }
+                        };
+                        let nq = (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as usize;
+                        let mut q = vec![0f32; nq];
+                        dgpu_scratch.indexer_q.slice_view(0, nq).copy_to_host(&mut q)?;
+                        let mut hw = vec![0f32; N_INDEXER_HEAD as usize];
+                        dgpu_scratch.indexer_head_weights
+                            .slice_view(0, N_INDEXER_HEAD as usize).copy_to_host(&mut hw)?;
+                        // Expand the packed E2M1 keys so the CPU scores EXACTLY what the
+                        // GPU read (quantization error cannot masquerade as a bug).
+                        let nrows = n_index_comp as usize;
+                        let mut exp: DeviceBuffer<u16> =
+                            DeviceBuffer::new(de.device.id, nrows * N_INDEXER_HEAD_DIM as usize)?;
+                        de.index_kv_e2m1.launch_expand(
+                            &de.compute, &mut exp, keys_v41.unwrap(), n_index_comp)?;
+                        de.compute.synchronize()?;
+                        let mut kh = vec![0u16; nrows * N_INDEXER_HEAD_DIM as usize];
+                        exp.copy_to_host(&mut kh)?;
+                        w("q.bin", &q.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+                        w("hw.bin", &hw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+                        w("keys_f16.bin", &kh.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+                        w("sel.bin", &sel.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+                        w("meta.txt", format!("layer={layer}\nn_index_comp={n_index_comp}\nk={k}\n").as_bytes());
+                        tracing::info!(layer, n_index_comp, k, dir = %dir, "indexer.dump written");
+                    }
+                    tracing::info!(
+                        layer, n_index_comp, n_comp_full, k,
+                        oob, dup, missing,
+                        is_permutation = (oob == 0 && dup == 0 && missing == 0),
+                        "indexer.dbg"
+                    );
+                }
                 // 7. Gather selected rows of cs.comp_kv into active_comp_kv.
                 let cs_ref = cs.expect("ratio==4 must have main compressor state");
                 match &cs_ref.comp_kv {
@@ -1360,14 +1647,52 @@ impl HeterogeneousEngine {
                         return Err(eyre!("L{layer}: main compressor store cannot be E2M1"))
                     }
                 }
+                // S2: publish this source's gather so the reuse layers below can use it.
+                if keys_v41.is_some() {
+                    let store = crate::config::kv_source_of(layer as usize)
+                        .unwrap_or(layer as usize) as i32;
+                    self.last_idx_gather_src
+                        .store(store, std::sync::atomic::Ordering::Relaxed);
+                    self.last_idx_gather_rows.store(
+                        INDEXER_TOP_K.min(n_index_comp),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
                 drop(_s_ix);
                 _t_ix.end()?;
             }
 
             // For sparse-attn paths we read from active_comp_kv (≤512
             // rows). Otherwise we read from cs.comp_kv directly.
-            let (attn_comp_kv, attn_n_comp) = if use_sparse {
-                (Some(&dgpu_scratch.active_comp_kv), INDEXER_TOP_K)
+            // S2 shared selection: a V4.1 layer that is NOT an index source reuses the
+            // most recent source's gathered rows, provided they belong to the same
+            // compressed store. This is what takes the indexer from 8 of 40 layers to
+            // all 40 — the reuse layers stop scoring their whole store.
+            let s2_reuse = cfg!(feature = "v41")
+                && index_k_enabled()
+                && !use_sparse
+                && !is_index_source_layer(layer)
+                && n_comp_full > 0
+                && {
+                    let store = crate::config::kv_source_of(layer as usize)
+                        .unwrap_or(layer as usize) as i32;
+                    self.last_idx_gather_src.load(std::sync::atomic::Ordering::Relaxed) == store
+                };
+            let (attn_comp_kv, attn_n_comp) = if s2_reuse {
+                (
+                    Some(&dgpu_scratch.active_comp_kv),
+                    self.last_idx_gather_rows.load(std::sync::atomic::Ordering::Relaxed),
+                )
+            } else if use_sparse {
+                // `min` NOT the bare constant. The gather produces
+                // `min(INDEXER_TOP_K, n_index_comp)` valid rows; scoring a flat 512
+                // makes attention read whatever stale bytes sit past the end.
+                // Benign in production (the gate needs n_index_comp > 512) but WRONG
+                // the moment the gate is lowered — which is exactly what
+                // `V41_INDEXER_FORCE=1` does to make the sparse path testable against
+                // dense. MEASURED 2026-09-14 at n_comp=293: max|logit delta| 3.012 on
+                // magnitude 25.9 (11.6% relative) before this fix.
+                (Some(&dgpu_scratch.active_comp_kv), INDEXER_TOP_K.min(n_index_comp))
             } else if n_comp_full > 0 {
                 // Dense path: the whole f16 cache, or the FP8 store's f16
                 // head shadow (errors past its 512 rows — DECODE_INDEXER=off
@@ -1784,15 +2109,46 @@ impl HeterogeneousEngine {
         drop(_s_peer_sel);
         _t_peer_sel.end()?;
 
+        // Decode-path two-box split. HOISTED here from just above the pager
+        // block so the pre-submit reorder can see it; single binding, one lock.
+        let decode_split_on = matches!(
+            std::env::var("V41_REMOTE_SPLIT_DECODE").as_deref(),
+            Ok("1") | Ok("on")
+        ) && self
+            .remote
+            .as_ref()
+            .and_then(|r| r.lock().ok().map(|c| c.info().owned_count(layer as u32) > 0))
+            .unwrap_or(false);
+        // See `decode_presubmit_reorder`. Only defer when there IS a remote to
+        // wait on; with no split the shared expert is not on anyone's critical
+        // path and moving it would only churn the stream order.
+        let defer_shared = decode_presubmit_reorder() && parallel && decode_split_on;
+        // `moe_xq` is also written by the M56 hot path's captured graph below, so
+        // only pre-quantize when that path is inactive (it is, on the paged path:
+        // the paged entry point requires `hot_experts == None`).
+        let xq_hoisted = defer_shared && dlw.hot_experts.is_none();
+
         // dGPU shared expert can now run on de.compute (after router,
         // before / in parallel with iGPU MoE). It uses the same
         // ffn_input_norm input as the router.
-        if parallel {
+        if parallel && !defer_shared {
             let _t_shared = de.events.stage("dgpu.shared_expert", &de.compute)?;
             let _s_shared = debug_span!("shared_expert").entered();
             self.issue_shared_expert_graph(de, dgpu_scratch, dlw, layer)?;
             drop(_s_shared);
             _t_shared.end()?;
+        }
+        if xq_hoisted {
+            // Enqueued BEFORE the pick-readback sync, so that sync covers it and
+            // the second one below disappears.
+            let _t_xq = de.events.stage("dgpu.moe_xq_pre", &de.compute)?;
+            de.q8k.launch(
+                &de.compute,
+                &mut dgpu_scratch.moe_xq,
+                &dgpu_scratch.ffn_input_norm,
+                crate::config::BLOCKS_Q8K_GATE_IN,
+            )?;
+            _t_xq.end()?;
         }
 
         // M56 het-split: the dGPU computes its RESIDENT hot experts during
@@ -1884,14 +2240,7 @@ impl HeterogeneousEngine {
         // two can be validated and rolled back independently — decode has a
         // different assignment (all 40 layers) and a different remap discipline
         // (LRU slots, not a dense window).
-        let decode_split_on = matches!(
-            std::env::var("V41_REMOTE_SPLIT_DECODE").as_deref(),
-            Ok("1") | Ok("on")
-        ) && self
-            .remote
-            .as_ref()
-            .and_then(|r| r.lock().ok().map(|c| c.info().owned_count(layer as u32) > 0))
-            .unwrap_or(false);
+        // (`decode_split_on` is bound above, before the shared expert.)
 
         if let Some(pg) = pager.as_deref_mut() {
             // M7 expert paging: the engine's Q8 routing diverges from the fp8
@@ -1933,10 +2282,52 @@ impl HeterogeneousEngine {
             // never cross the link — box 2 reads its own copy.
             let catchall = super::expert_pager::ExpertPager::t2_catchall();
             let owns_remote: Option<Vec<bool>> = if decode_split_on {
-                if catchall {
+                if let Some(nloc) = local_picks_override() {
+                    // Box 1 takes the first `nloc` distinct picks; box 2 takes the rest.
+                    let mut taken = 0usize;
+                    let mut mine = vec![false; N_EXPERT as usize];
+                    for &sv in &sel_host {
+                        if taken >= nloc {
+                            break;
+                        }
+                        if (0..N_EXPERT as i32).contains(&sv) && !mine[sv as usize] {
+                            mine[sv as usize] = true;
+                            taken += 1;
+                        }
+                    }
+                    Some((0..N_EXPERT).map(|e| !mine[e as usize]).collect())
+                } else if catchall && super::expert_pager::ExpertPager::t2_catchall_deterministic() {
+                    // `V41_T2_CATCHALL=2` — DETERMINISTIC catch-all: every routed
+                    // pick goes to box 2, regardless of what box 1 happens to hold.
+                    //
+                    // WHY THIS EXISTS. Mode 1 decides the split with
+                    // `pg.is_resident(layer, e)`, so the box1/box2 partition is a
+                    // function of RESIDENCY, hence of REQUEST HISTORY. A different
+                    // partition groups the per-expert partial sums differently and
+                    // f32 addition is not associative, so the engine's output
+                    // depends on what the server served before. MEASURED 2026-09-14,
+                    // same 104K prompt, same binary:
+                    //     mode 1, 100K first      -> sha 4275e8cd231d  (fluent)
+                    //     mode 1, after a 37-tok  -> sha 5799afaa4959  (DEGENERATE)
+                    //     mode 1, after a 32K     -> sha 6d1dbafa35e6  (degenerate)
+                    //     mode 0 (static split)   -> sha a7b0e336b5b8, history-INDEPENDENT
+                    // Divergence starts ~12 generated tokens in and collapses into
+                    // repeated fragments. It is NOT stale KV (`V41_RESET_ZERO=1`
+                    // changes nothing), NOT graphs, NOT rope, NOT context length.
+                    //
+                    // Mode 2 keeps the catch-all's real benefit — box 1 never blocks
+                    // on its own dm-crypt disk for a miss — while making the split a
+                    // constant. Box 1's decode LRU is only ~25 slots (pool minus the
+                    // packed prefill windows), so it was computing ~0.5 picks/layer
+                    // anyway; giving those up costs little and buys reproducibility.
+                    Some(vec![true; N_EXPERT as usize])
+                } else if catchall {
                     // "Not resident here" == "box 2's". Pure lookup, no paging —
                     // EXCEPT while the pool is still filling, where a miss is a
                     // first touch (free slot, no eviction) and worth paying once.
+                    //
+                    // HISTORY-DEPENDENT — see the mode-2 note above. Prefer mode 2
+                    // unless you are reproducing the old behaviour.
                     let mut budget = pg.lru_free_slots();
                     Some(
                         (0..N_EXPERT)
@@ -1961,6 +2352,28 @@ impl HeterogeneousEngine {
                 }
             } else {
                 None
+            };
+            // Claim cap: flip surplus LOCAL picks to remote, in `sel_host` order, so a
+            // layer never pushes box 1 past the crossover. No-op when unset.
+            let owns_remote = match (owns_remote, local_claim_max()) {
+                (Some(mut o), Some(cap)) => {
+                    let mut local = 0usize;
+                    let mut seen: Vec<bool> = vec![false; N_EXPERT as usize];
+                    for &sv in &sel_host {
+                        if !(0..N_EXPERT as i32).contains(&sv) || seen[sv as usize] {
+                            continue;
+                        }
+                        seen[sv as usize] = true;
+                        if !o[sv as usize] {
+                            local += 1;
+                            if local > cap {
+                                o[sv as usize] = true; // hand it to box 2
+                            }
+                        }
+                    }
+                    Some(o)
+                }
+                (o, _) => o,
             };
             for &sv in &sel_host {
                 if (0..N_EXPERT as i32).contains(&sv) && !ids.contains(&(sv as u32)) {
@@ -1988,13 +2401,17 @@ impl HeterogeneousEngine {
                 self.dgpu.device.set_current()?;
                 self.current_device
                     .store(self.dgpu.device.id, std::sync::atomic::Ordering::Relaxed);
-                de.q8k.launch(
-                    &de.compute,
-                    &mut dgpu_scratch.moe_xq,
-                    &dgpu_scratch.ffn_input_norm,
-                    crate::config::BLOCKS_Q8K_GATE_IN,
-                )?;
-                de.compute.synchronize()?;
+                if !xq_hoisted {
+                    de.q8k.launch(
+                        &de.compute,
+                        &mut dgpu_scratch.moe_xq,
+                        &dgpu_scratch.ffn_input_norm,
+                        crate::config::BLOCKS_Q8K_GATE_IN,
+                    )?;
+                    // Second full stream sync per layer. When `xq_hoisted`, the
+                    // pick-readback sync above already covered this quantize.
+                    de.compute.synchronize()?;
+                }
                 let mut xq_host = vec![0u8; xq_bytes];
                 dgpu_scratch
                     .moe_xq
@@ -2028,6 +2445,17 @@ impl HeterogeneousEngine {
                     }
                 }
                 dgpu_scratch.remote_ticket = ticket;
+            }
+            if defer_shared {
+                // Box 2 is now working. Everything from here to `remote.wait` is
+                // free real estate on de.compute, so the shared expert lands in
+                // it instead of delaying the submit. Still BEFORE the iGPU device
+                // switch, so `de.compute` is the current device's stream.
+                let _t_shared = de.events.stage("dgpu.shared_expert", &de.compute)?;
+                let _s_shared = debug_span!("shared_expert").entered();
+                self.issue_shared_expert_graph(de, dgpu_scratch, dlw, layer)?;
+                drop(_s_shared);
+                _t_shared.end()?;
             }
             self.set_current_cached(self.igpu.device)?;
             // d_selected is already on the iGPU (peer-pushed + selected_pushed waited
