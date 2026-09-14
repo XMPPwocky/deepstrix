@@ -168,6 +168,10 @@ pub struct DgpuScratch {
     /// token's layer. Submitted before the local MoE graph, collected at the
     /// combine, so the ~436 us round trip overlaps local compute.
     pub remote_ticket: Option<crate::het::remote_experts::Ticket>,
+    /// The `sel` that went with `remote_ticket`, kept so the reply's miss mask
+    /// (`proto::RESP_MISS_SHIFT`) can be mapped back to expert ids at the wait
+    /// site, where the submit block's `sel_host` is out of scope.
+    pub remote_sel: Vec<i32>,
     /// Box 2's weighted partial for this token, `[N_EMBD]` f32.
     pub remote_ffn_moe: Option<DeviceBuffer<f32>>,
     pub remote_ffn_moe_valid: bool,
@@ -346,6 +350,7 @@ impl DgpuScratch {
 
             ffn_moe_recv: DeviceBuffer::new(device_id, N_EMBD as usize)?,
             remote_ticket: None,
+            remote_sel: Vec::new(),
             remote_ffn_moe: if std::env::var("V41_REMOTE_ADDR").is_ok() {
                 Some(DeviceBuffer::new(device_id, N_EMBD as usize)?)
             } else {

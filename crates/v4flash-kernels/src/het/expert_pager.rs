@@ -163,6 +163,66 @@ pub struct ExpertPager {
 /// together is the only way to use the drive's parallel bandwidth.
 /// Permute MXFP4 HF->ggml on the iGPU instead of the CPU (`V41_PAGER_GPU_REPACK=0`
 /// reverts). Only possible for the HF source; a GGUF is already in ggml layout.
+/// Experts box 2 reported as MISSES, per layer — the victim-cache signal.
+///
+/// Box 1's decode residency used to fill with whatever it happened to see, which
+/// is the same hot set box 2's LRU holds. MEASURED consequence (stage diff in
+/// `WHY_THE_BIG_POOL_REGRESSED.md`): box 1 cost 140 us/expert to serve picks box 2
+/// would have hit for 87 us, and box 2's leg fell only 8 us/pick — a 17x bad
+/// trade that made a 1,396-slot decode LRU SLOWER than a 25-slot one.
+///
+/// The fix is exclusivity: box 1 caches only what box 2 could not serve. Box 2
+/// now reports its misses per response (`proto::RESP_MISS_SHIFT`), so box 1 fills
+/// from that signal instead of from ambient traffic. Break-even from the same
+/// measurement: serving a box-2 HIT is -53 us, serving a box-2 MISS is +6547 us.
+///
+/// 384 bits per layer, lock-free. Set from the decode wait site, read by the
+/// catch-all split. Recency is implicit: an id stays marked until box 1 pages it.
+static BOX2_MISSED: std::sync::LazyLock<Vec<std::sync::atomic::AtomicU64>> =
+    std::sync::LazyLock::new(|| {
+        (0..(crate::config::N_LAYER as usize) * (N_EXPERT as usize).div_ceil(64))
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect()
+    });
+
+fn box2_missed_slot(layer: i32, e: u32) -> Option<(usize, u64)> {
+    if layer < 0 || layer >= crate::config::N_LAYER as i32 || e >= N_EXPERT {
+        return None;
+    }
+    let per = (N_EXPERT as usize).div_ceil(64);
+    Some((layer as usize * per + (e as usize) / 64, 1u64 << (e % 64)))
+}
+
+/// Record that box 2 had to page `e` on `layer`.
+pub fn mark_box2_miss(layer: i32, e: u32) {
+    if let Some((i, bit)) = box2_missed_slot(layer, e) {
+        BOX2_MISSED[i].fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Has box 2 missed `e` on `layer` since box 1 last took it?
+pub fn box2_missed(layer: i32, e: u32) -> bool {
+    box2_missed_slot(layer, e)
+        .is_some_and(|(i, bit)| BOX2_MISSED[i].load(std::sync::atomic::Ordering::Relaxed) & bit != 0)
+}
+
+/// Clear the mark — call when box 1 has paged it, so the bit means "box 2 missed
+/// this and box 1 does not yet hold it".
+pub fn clear_box2_miss(layer: i32, e: u32) {
+    if let Some((i, bit)) = box2_missed_slot(layer, e) {
+        BOX2_MISSED[i].fetch_and(!bit, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Fill box 1's decode LRU only from box-2 misses (`V41_VICTIM_CACHE=0` reverts
+/// to filling from ambient traffic, which measured worse — see `BOX2_MISSED`).
+pub fn victim_cache() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_VICTIM_CACHE").map(|v| v != "0").unwrap_or(true)
+    });
+    *B
+}
+
 pub fn pager_gpu_repack() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var("V41_PAGER_GPU_REPACK").map(|v| v != "0").unwrap_or(true)

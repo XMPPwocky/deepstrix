@@ -291,6 +291,21 @@ pub mod proto {
 
     /// Request flag: return f32 partials instead of f16.
     pub const REQ_FLAG_RESP_F32: u32 = 1;
+    /// RESPONSE-side field packed into the echoed `flags` word: a bitmask over
+    /// the request's first 16 `sel` slots, bit i set = pick i MISSED on box 2 and
+    /// was paged from its disk.
+    ///
+    /// Why here and not a new field: the response's 8 u32s are all used and the
+    /// clock triple after them must stay 8-aligned, so adding one u32 would
+    /// misalign it. `flags` is the request's flags echoed back, and requests only
+    /// ever set bits 0-1, so the high half is free.
+    ///
+    /// Emitted for b==1 (decode) only. A prefill batch's sel is up to 1024x6 and
+    /// nothing consumes a miss mask for it.
+    pub const RESP_MISS_SHIFT: u32 = 16;
+    pub const RESP_MISS_BITS: usize = 16;
+    pub const RESP_MISS_MASK: u32 = 0xFFFF << RESP_MISS_SHIFT;
+
     /// Request flag: take the by-expert (prefill) chain even when
     /// `b <= decode_max_b` — lets the hub choose per request (DSpark verify
     /// batches) and gives the A/B without a daemon restart.
@@ -1519,7 +1534,28 @@ impl ExpertShard {
     /// `layer_views` for a paged shard: the MoE kernel reads `remap[e]`, and a
     /// non-resident id still reads 0 = "the other device takes it", which would
     /// silently drop the expert.
+    /// As [`Self::ensure_layer`], additionally appending every expert id it had to
+    /// PAGE (i.e. that missed) to `missed`.
+    ///
+    /// The hub uses this to make box 1's decode residency EXCLUSIVE: box 1 caches
+    /// what box 2 evicted, so the picks it later serves are ones box 2 would miss
+    /// (6.6 ms) rather than hit (87 us). Measured break-even from the stage diff
+    /// in `WHY_THE_BIG_POOL_REGRESSED.md`: box 1 costs 140 us/expert, so serving a
+    /// box-2 HIT is -53 us and serving a box-2 MISS is +6547 us.
+    pub fn ensure_layer_reporting(
+        &mut self,
+        layer: u32,
+        ids: &[i32],
+        missed: &mut Vec<u32>,
+    ) -> eyre::Result<()> {
+        self.ensure_layer_inner(layer, ids, Some(missed))
+    }
+
     pub fn ensure_layer(&mut self, layer: u32, ids: &[i32]) -> eyre::Result<()> {
+        self.ensure_layer_inner(layer, ids, None)
+    }
+
+    fn ensure_layer_inner(&mut self, layer: u32, ids: &[i32], mut missed: Option<&mut Vec<u32>>) -> eyre::Result<()> {
         let Some(l) = self.layers.get_mut(layer as usize).and_then(|l| l.as_mut()) else {
             // Catch-all needs a region on EVERY layer the hub can send. An
             // encoder-only assignment (e.g. `L0-L19:...`) has none for layers
@@ -1556,6 +1592,9 @@ impl ExpertShard {
                 continue;
             }
             pg.misses += 1;
+            if let Some(m) = missed.as_deref_mut() {
+                m.push(e);
+            }
             // Victim: never one of the ids we are about to need this same call.
             let victim = pg
                 .lru
@@ -1799,6 +1838,10 @@ pub struct ExecTiming {
     pub gpu: Duration,
     pub path_decode: bool,
     pub n_work_items: u32,
+    /// Bitmask over the request's first `RESP_MISS_BITS` sel slots: bit i set =
+    /// pick i had to be paged from this box's disk. Decode (b==1) only; see
+    /// `proto::RESP_MISS_SHIFT`.
+    pub miss_mask: u32,
 }
 
 pub struct MoeExecutor {
@@ -1806,6 +1849,8 @@ pub struct MoeExecutor {
     device: Device,
     rows: usize,
     decode_max_b: usize,
+    /// Reused across requests so the decode miss report never allocates.
+    missed_scratch: Vec<u32>,
     xq: DeviceBuffer<u8>,
     d_selected: DeviceBuffer<i32>,
     d_ew: DeviceBuffer<f32>,
@@ -1840,6 +1885,7 @@ impl MoeExecutor {
         let nu = N_EXPERT_USED;
         let wi_len = N_EXPERT as usize + rows * nu;
         Ok(Self {
+            missed_scratch: Vec::with_capacity(N_EXPERT_USED),
             engine,
             device: igpu,
             rows,
@@ -1953,7 +1999,22 @@ impl MoeExecutor {
         // Catch-all tier: make every requested expert resident first. A paged
         // shard's `remap[e]` is 0 ("the other device takes it") until it is,
         // which the kernel would silently honour and drop the expert.
-        shard.ensure_layer(layer, sel)?;
+        // Report the misses back to the hub for b==1 (decode). The hub uses them to
+        // keep box 1's decode residency EXCLUSIVE of box 2's -- see
+        // `ExpertShard::ensure_layer_reporting`. Prefill batches skip it: their sel
+        // is up to 1024x6 and nothing consumes the mask.
+        let mut miss_mask = 0u32;
+        if b == 1 {
+            self.missed_scratch.clear();
+            shard.ensure_layer_reporting(layer, sel, &mut self.missed_scratch)?;
+            for (i, &sv) in sel.iter().take(proto::RESP_MISS_BITS).enumerate() {
+                if sv != NO_PICK && self.missed_scratch.contains(&(sv as u32)) {
+                    miss_mask |= 1 << i;
+                }
+            }
+        } else {
+            shard.ensure_layer(layer, sel)?;
+        }
         let (gate, up, down, remap) = shard.layer_views(layer)?;
         for (i, &e) in sel.iter().enumerate() {
             if e == NO_PICK {
@@ -1986,6 +2047,7 @@ impl MoeExecutor {
         let gdt = shard.routed.gate.dtype;
         let ddt = shard.routed.down.dtype;
         let mut timing = ExecTiming { path_decode: b <= self.decode_max_b && !force_batched, ..Default::default() };
+        timing.miss_mask = miss_mask;
         if timing.path_decode {
             // Decode kernels, one token at a time: q8k(x) is already done on the
             // hub (the wire carries Q8_K), so 3 launches per token.
@@ -2430,7 +2492,9 @@ pub fn serve_connection(
                 let elem = if f32_out { 4 } else { 2 };
                 let n = b * N_EMBD as usize;
                 let t_compute_us = (t_d2h0 - t_start).as_micros() as u32;
-                proto::begin_response(&mut resp, hdr.seq, req.layer, req.b, req.flags, 0, t_compute_us, 0, N_EMBD, elem, req.t1, t2);
+                let resp_flags = (req.flags & !proto::RESP_MISS_MASK)
+                    | ((timing.miss_mask << proto::RESP_MISS_SHIFT) & proto::RESP_MISS_MASK);
+                proto::begin_response(&mut resp, hdr.seq, req.layer, req.b, resp_flags, 0, t_compute_us, 0, N_EMBD, elem, req.t1, t2);
                 resp.resize(proto::RESP_DATA_OFF + n * elem as usize);
                 if f32_out {
                     exec.read_f32(b, resp.view_mut::<f32>(proto::RESP_DATA_OFF, n))?;
@@ -2564,6 +2628,9 @@ pub struct RemotePartial {
     pub layer: u32,
     pub b: u32,
     pub is_f32: bool,
+    /// Bit i = sel slot i MISSED on box 2 (decode only). See
+    /// `proto::RESP_MISS_SHIFT`. 0 for prefill batches, which do not report.
+    pub miss_mask: u32,
     pub rtt_us: u32,
     pub t_remote_compute_us: u32,
     pub t_remote_server_us: u32,
@@ -2868,6 +2935,7 @@ impl RemoteExpertClient {
             layer: m.layer,
             b: m.b,
             is_f32: m.elem_bytes == 4,
+            miss_mask: (m.flags & proto::RESP_MISS_MASK) >> proto::RESP_MISS_SHIFT,
             rtt_us: (t_recv - ticket.t_submit).as_micros().min(u32::MAX as u128) as u32,
             t_remote_compute_us: m.t_compute_us,
             t_remote_server_us: m.t_server_us,

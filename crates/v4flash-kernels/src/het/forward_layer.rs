@@ -2329,14 +2329,24 @@ impl HeterogeneousEngine {
                     // HISTORY-DEPENDENT — see the mode-2 note above. Prefer mode 2
                     // unless you are reproducing the old behaviour.
                     let mut budget = pg.lru_free_slots();
+                    let victim = super::expert_pager::victim_cache();
                     Some(
                         (0..N_EXPERT)
                             .map(|e| {
                                 if pg.is_resident(layer, e) {
                                     return false; // ours
                                 }
-                                if budget > 0 && sel_host.contains(&(e as i32)) {
+                                // Page into a free slot — but ONLY experts box 2 told
+                                // us it missed. Filling from ambient traffic makes box 1
+                                // a duplicate of box 2's hot set: MEASURED, a 1396-slot
+                                // LRU filled that way was SLOWER than a 25-slot one
+                                // (igpu.routed_moe +89% for 8 us/pick of relief).
+                                if budget > 0
+                                    && sel_host.contains(&(e as i32))
+                                    && (!victim || super::expert_pager::box2_missed(layer, e))
+                                {
                                     budget -= 1;
+                                    super::expert_pager::clear_box2_miss(layer, e);
                                     return false; // ours: page it into a free slot
                                 }
                                 true // box 2's
@@ -2445,6 +2455,10 @@ impl HeterogeneousEngine {
                     }
                 }
                 dgpu_scratch.remote_ticket = ticket;
+                if dgpu_scratch.remote_ticket.is_some() {
+                    dgpu_scratch.remote_sel.clear();
+                    dgpu_scratch.remote_sel.extend_from_slice(&sel_host);
+                }
             }
             if defer_shared {
                 // Box 2 is now working. Everything from here to `remote.wait` is
@@ -2677,6 +2691,23 @@ impl HeterogeneousEngine {
                 &super::trace::phase::REMOTE_RTT_NS,
                 (super::perfetto::now_ns() - t_wait) as u64,
             );
+            // Box 2 reports which of these picks it had to page. Mark them so box 1's
+            // decode LRU fills from box-2 MISSES instead of ambient traffic — the
+            // difference between an exclusive cache (worth +6547 us/pick) and a
+            // duplicate of box 2's hot set (worth -53 us/pick). See
+            // `expert_pager::BOX2_MISSED`.
+            if partial.miss_mask != 0 {
+                for (i, &sv) in dgpu_scratch
+                    .remote_sel
+                    .iter()
+                    .take(super::remote_experts::proto::RESP_MISS_BITS)
+                    .enumerate()
+                {
+                    if partial.miss_mask & (1 << i) != 0 && (0..N_EXPERT as i32).contains(&sv) {
+                        super::expert_pager::mark_box2_miss(layer, sv as u32);
+                    }
+                }
+            }
             let src = partial.f32();
             if src.len() != N_EMBD as usize {
                 return Err(eyre!(

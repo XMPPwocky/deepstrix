@@ -317,6 +317,7 @@ fn main() -> eyre::Result<()> {
         let mut gpu = Vec::with_capacity(args.iters);
         let mut link = Vec::with_capacity(args.iters);
         let (mut bytes_out, mut bytes_in) = (0usize, 0usize);
+        let (mut miss_reports, mut miss_bits) = (0usize, 0usize);
         let t_wall = Instant::now();
         let mut tickets = std::collections::VecDeque::new();
         let mut submitted = 0usize;
@@ -336,6 +337,8 @@ fn main() -> eyre::Result<()> {
                     std::hint::spin_loop();
                 }
             }
+            if p.miss_mask != 0 { miss_reports += 1; }
+            miss_bits += p.miss_mask.count_ones() as usize;
             rtts.push(p.rtt_us);
             srv.push(p.t_remote_server_us);
             gpu.push(p.t_remote_compute_us);
@@ -364,6 +367,12 @@ fn main() -> eyre::Result<()> {
             ms_per_layer,
             gbs
         );
+        if args.catchall {
+            println!(
+                "       box-2 miss reports: {}/{} responses carried a mask, {} missed picks",
+                miss_reports, args.iters, miss_bits
+            );
+        }
     }
 
     // ---- clock sync over the link (NTP's estimator, one sample per request) ----
