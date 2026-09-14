@@ -86,7 +86,9 @@ impl EventPool {
             // `dgpu_busy_us=0 igpu_busy_us=0` — the decode chain had never been
             // profiled end to end. Costs a pair of hipEventRecord per stage
             // (~100 us/layer, M20), so it stays opt-in.
-            enabled: std::cell::Cell::new(token_profile()),
+            // Either profile turns recording on: DEEPSTRIX_TOKEN_PROFILE for the
+            // decode breakdown, DEEPSTRIX_PREFILL_PROFILE for the prefill aggregate.
+            enabled: std::cell::Cell::new(token_profile() || prefill_profile::enabled()),
         })
     }
 
@@ -270,6 +272,25 @@ pub mod phase {
     /// trip hid under local compute or serialised in front of it.
     pub static REMOTE_RTT_NS: AtomicU64 = AtomicU64::new(0);
 
+    /// Host phases OUTSIDE `forward_token_impl`'s `token_start..sync` bracket
+    /// but ON the decode loop's critical path (engine_worker.rs
+    /// `finish_decode` / `forward_one!`): the caller adds to these between one
+    /// forward's return and the next forward's entry. Deliberately NOT cleared
+    /// by `reset()` — that runs at forward entry, i.e. AFTER the caller has
+    /// already added to them — the token summary drains them with `take()`,
+    /// so each `het.token.summary` line reports the glue that ran since the
+    /// previous line (attributed to the token whose forward follows it).
+    ///
+    /// Why: the lever-1 A/B logs (2026-09-14, l1_1.log) put the decode loop's
+    /// wall at 60.8 ms/token against `total_us` 57.6 ms — 3.3 ms/token that no
+    /// counter covered. (The rest of that A/B's "88 ms/token" was the 36-token
+    /// prompt's 6.9 s CED-replay prefill amortised over 256 tokens by a
+    /// curl-wall harness — see `decode.loop.summary` / `request.summary`.)
+    pub static CALLER_ENGRAM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static CALLER_EMBED_NS: AtomicU64 = AtomicU64::new(0);
+    pub static CALLER_SAMPLE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static CALLER_STREAM_NS: AtomicU64 = AtomicU64::new(0);
+
     pub fn reset() {
         SEL_SYNC_NS.store(0, Relaxed);
         ENSURE_NS.store(0, Relaxed);
@@ -282,6 +303,18 @@ pub mod phase {
     pub fn get(c: &AtomicU64) -> u64 {
         c.load(Relaxed)
     }
+    /// Read-and-clear, for the `CALLER_*` counters (see above).
+    pub fn take(c: &AtomicU64) -> u64 {
+        c.swap(0, Relaxed)
+    }
+}
+
+/// Process-wide monotonic clock (ns since first use) for gaps that span two
+/// calls, e.g. `TokenTiming::gap_us` between consecutive `forward_token_impl`s.
+pub fn epoch_ns() -> u64 {
+    static EPOCH: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    EPOCH.elapsed().as_nanos() as u64
 }
 
 /// Per-token timing summary, emitted at INFO once the token's events
@@ -309,6 +342,27 @@ pub struct TokenTiming {
     /// Overlapped work, so this is NOT additive with the rest — compare it
     /// against `total_us` to see whether the round trip is hidden.
     pub remote_rtt_us: u64,
+    /// `stage_engram_rows` H2D inside the bracket (V4.1 Engram layers 1, 14).
+    pub engram_stage_us: u64,
+    /// Bracket edges inside `forward_token_impl`, NOT part of `total_us`:
+    /// `pre_us` = fn entry -> `token_start` (residual H2D + per-token scalar
+    /// writes); `post_us` = final sync -> summary (perfetto export + event
+    /// harvest).
+    pub pre_us: u64,
+    pub post_us: u64,
+    /// Wall from the previous `forward_token_impl`'s return to this one's
+    /// entry: EVERYTHING the caller did between two tokens. On a request's
+    /// first token this spans the whole prefill — exclude it from averages.
+    pub gap_us: u64,
+    /// Caller phases drained from `phase::CALLER_*` (a subset of `gap_us`):
+    /// Engram SSD gather (`EngramCtx::rows_for`), embedding lookup, sampler
+    /// (kernels + sync + 4 B D2H), detokenise + chunk send.
+    /// `gap_us - (engram_us + embed_us + sample_us + stream_us)` is the
+    /// unattributed caller glue.
+    pub engram_us: u64,
+    pub embed_us: u64,
+    pub sample_us: u64,
+    pub stream_us: u64,
 }
 
 impl TokenTiming {
@@ -329,8 +383,83 @@ impl TokenTiming {
             pager_read_us = self.pager_read_us,
             pager_h2d_us = self.pager_h2d_us,
             pager_misses = self.pager_misses,
+            engram_stage_us = self.engram_stage_us,
+            pre_us = self.pre_us,
+            post_us = self.post_us,
+            gap_us = self.gap_us,
+            engram_us = self.engram_us,
+            embed_us = self.embed_us,
+            sample_us = self.sample_us,
+            stream_us = self.stream_us,
             "het.token.summary"
         );
+    }
+}
+
+/// Cumulative per-stage totals across a whole PREFILL (all chunks), emitted once
+/// at the end of the request.
+///
+/// Prefill records stages via `events.stage(..)` but has never harvested them —
+/// the ONLY `het.stage` emit site in the tree is `forward_token_impl`, the DECODE
+/// path. That gap caused a real misreading on 2026-09-14: a one-token_pos dump
+/// from a `max_tokens=1` run was read as "the last prefill token" when it was the
+/// only DECODE token, and a strategy was built on it. This closes the gap.
+///
+/// Gated by `DEEPSTRIX_PREFILL_PROFILE=1` because harvesting SYNCHRONIZES, which
+/// serialises the two prefill lanes. Per-stage GPU busy time survives that; the
+/// `.wait` stages and the wall DO NOT. Read the busy times, not the wall.
+pub mod prefill_profile {
+    use std::sync::{LazyLock, Mutex};
+
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("DEEPSTRIX_PREFILL_PROFILE").as_deref() == Ok("1")
+    });
+    #[allow(clippy::type_complexity)]
+    static ACC: LazyLock<Mutex<Vec<(&'static str, &'static str, f64, u32)>>> =
+        LazyLock::new(|| Mutex::new(Vec::new()));
+
+    pub fn enabled() -> bool {
+        *ON
+    }
+
+    /// Fold one chunk's rollup into the request accumulator.
+    pub fn add(device: &'static str, rolled: &[(&'static str, f32, u32)]) {
+        if !enabled() {
+            return;
+        }
+        let Ok(mut acc) = ACC.lock() else { return };
+        for &(name, ms, calls) in rolled {
+            match acc.iter_mut().find(|e| e.0 == device && e.1 == name) {
+                Some(e) => {
+                    e.2 += ms as f64;
+                    e.3 += calls;
+                }
+                None => acc.push((device, name, ms as f64, calls)),
+            }
+        }
+    }
+
+    /// Emit and clear. Call once at the end of a prefill.
+    pub fn emit_and_clear(prompt_tokens: usize) {
+        if !enabled() {
+            return;
+        }
+        let Ok(mut acc) = ACC.lock() else { return };
+        acc.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        let total: f64 = acc.iter().map(|e| e.2).sum();
+        for (device, name, ms, calls) in acc.iter() {
+            tracing::info!(
+                prompt_tokens,
+                device = *device,
+                stage = *name,
+                total_ms = format!("{ms:.1}"),
+                calls = *calls,
+                pct = format!("{:.1}", if total > 0.0 { 100.0 * ms / total } else { 0.0 }),
+                "prefill.stage"
+            );
+        }
+        tracing::info!(prompt_tokens, total_ms = format!("{total:.1}"), "prefill.stage.total");
+        acc.clear();
     }
 }
 

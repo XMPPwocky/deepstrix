@@ -405,6 +405,21 @@ pub struct HeterogeneousEngine {
     pub last_host_us: std::sync::atomic::AtomicU64,
     /// Diagnostic: time the host spent inside the final `synchronize()`.
     pub last_sync_us: std::sync::atomic::AtomicU64,
+    /// Diagnostic: `trace::epoch_ns()` at which the last `forward_token_impl`
+    /// returned; the next call reports the elapsed gap as `gap_us`. 0 = none yet.
+    pub last_token_end_ns: std::sync::atomic::AtomicU64,
+    /// S2 shared selection (V4.1 CSA2 §1.4). The 8 `index_source_layer_ids` run the
+    /// indexer; every layer between two sources REUSES the most recent source's
+    /// selection (`shared_attn.topk_idxs` in the reference). Because reuse layers also
+    /// share the compressed store, the GATHERED buffer is reusable as-is — no rescore,
+    /// no regather, just point attention at it.
+    ///
+    /// `src` is the store group `kv_source_of(layer).unwrap_or(layer)` the cached gather
+    /// belongs to, or -1 for "none this token"; `rows` is its valid row count. Guarding
+    /// on the store group is what stops a selection leaking across a kv-source boundary
+    /// (e.g. layer 8 starts a new store, so layer 2's selection must not carry into it).
+    pub last_idx_gather_src: std::sync::atomic::AtomicI32,
+    pub last_idx_gather_rows: std::sync::atomic::AtomicU32,
 
     /// M62: persistent expert-selection histogram banks on the dGPU,
     /// `u32[N_LAYER × N_EXPERT]` each (88 KB). Accumulated by
@@ -538,11 +553,21 @@ impl HeterogeneousEngine {
                 HC_DIM
             ));
         }
+        // Caller-side gap since the previous token's return (see
+        // `TokenTiming::gap_us`), taken BEFORE anything else in this call.
+        let fn_entry = std::time::Instant::now();
+        let gap_us = {
+            let prev = self.last_token_end_ns.load(std::sync::atomic::Ordering::Relaxed);
+            if prev == 0 { 0 } else { super::trace::epoch_ns().saturating_sub(prev) / 1000 }
+        };
         let _token_span = debug_span!("het.token", pos, token_id).entered();
 
         // Reset event pools for this token.
         self.dgpu.events.reset();
         self.igpu.events.reset();
+        // A cached selection never crosses a token boundary.
+        self.last_idx_gather_src
+            .store(-1, std::sync::atomic::Ordering::Relaxed);
         super::trace::phase::reset();
         let pager_c0 = pager.as_deref().map(|p| p.counters()).unwrap_or_default();
 
@@ -570,6 +595,7 @@ impl HeterogeneousEngine {
             }
         }
         let token_start = std::time::Instant::now();
+        let pre_us = token_start.duration_since(fn_entry).as_micros() as u64;
         let dump_subtensor_layers: Vec<usize> = subtensor_dump_spec()
             .as_ref()
             .map(|(ls, _)| ls.clone())
@@ -640,7 +666,14 @@ impl HeterogeneousEngine {
                         .and_then(|i| rs.get(i))
                 });
                 match rows {
-                    Some(r) => self.stage_engram_rows(dgpu_scratch, r)?,
+                    Some(r) => {
+                        let t = std::time::Instant::now();
+                        self.stage_engram_rows(dgpu_scratch, r)?;
+                        super::trace::phase::add(
+                            &super::trace::phase::ENGRAM_STAGE_NS,
+                            t.elapsed().as_nanos() as u64,
+                        );
+                    }
                     None => {
                         return Err(color_eyre::eyre::eyre!(
                             "layer {layer} needs Engram rows but the caller staged none"
@@ -970,6 +1003,19 @@ impl HeterogeneousEngine {
             maybe_dump_residual(layer + 1, &dgpu_scratch.residual)?;
         }
         self.forward_head(dgpu_scratch, &weights.global)?;
+        // DECODE logits dump, companion to prefill's `V41_PREFILL_LOGITS_DUMP`.
+        // Added 2026-09-14 because validating a DECODE-path change against PREFILL
+        // logits proves nothing — which I did twice before noticing. Appends
+        // N_VOCAB little-endian f32 per token.
+        if let Ok(path) = std::env::var("V41_DECODE_LOGITS_DUMP") {
+            use std::io::Write;
+            self.dgpu.compute.synchronize()?;
+            let mut host = vec![0f32; crate::config::N_VOCAB as usize];
+            dgpu_scratch.logits.slice_view(0, crate::config::N_VOCAB as usize).copy_to_host(&mut host)?;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+            let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+            f.write_all(&bytes)?;
+        }
         // When N_LAYER is odd (43 in V4-Flash), the in-loop swaps leave residual /
         // residual_next inverted from token start. Without an extra swap
         // here, every token's layer 0 would read from a different
@@ -1055,6 +1101,9 @@ impl HeterogeneousEngine {
             .as_deref()
             .map(|p| p.counters() - pager_c0)
             .unwrap_or_default();
+        // Everything between the bracket's closing sync and this line
+        // (perfetto export, event harvest) — outside `total_us` by construction.
+        let post_us = (token_start.elapsed().as_micros() as u64).saturating_sub(token_elapsed_us);
         let summary = super::trace::TokenTiming {
             token_pos: pos,
             total_us: token_elapsed_us,
@@ -1071,6 +1120,16 @@ impl HeterogeneousEngine {
             pager_h2d_us: pager_d.decode_h2d_ns / 1000,
             pager_misses: pager_d.decode_misses,
             remote_rtt_us: super::trace::phase::get(&super::trace::phase::REMOTE_RTT_NS) / 1000,
+            engram_stage_us: super::trace::phase::get(&super::trace::phase::ENGRAM_STAGE_NS) / 1000,
+            pre_us,
+            post_us,
+            gap_us,
+            // Drained (read-and-clear): these were added by the caller between
+            // the previous forward's return and this one's entry.
+            engram_us: super::trace::phase::take(&super::trace::phase::CALLER_ENGRAM_NS) / 1000,
+            embed_us: super::trace::phase::take(&super::trace::phase::CALLER_EMBED_NS) / 1000,
+            sample_us: super::trace::phase::take(&super::trace::phase::CALLER_SAMPLE_NS) / 1000,
+            stream_us: super::trace::phase::take(&super::trace::phase::CALLER_STREAM_NS) / 1000,
         };
         summary.emit();
 
@@ -1113,6 +1172,9 @@ impl HeterogeneousEngine {
                 );
             }
         }
+        // Stamp the return so the next call can report the caller-side gap.
+        self.last_token_end_ns
+            .store(super::trace::epoch_ns(), std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -1170,6 +1232,9 @@ impl HeterogeneousEngine {
             current_device: std::sync::atomic::AtomicI32::new(-1),
             last_host_us: std::sync::atomic::AtomicU64::new(0),
             last_sync_us: std::sync::atomic::AtomicU64::new(0),
+            last_token_end_ns: std::sync::atomic::AtomicU64::new(0),
+            last_idx_gather_src: std::sync::atomic::AtomicI32::new(-1),
+            last_idx_gather_rows: std::sync::atomic::AtomicU32::new(0),
             sel_stats_prefill: std::sync::Mutex::new({
                 let mut b: DeviceBuffer<u32> = DeviceBuffer::new(
                     dgpu_device.id,

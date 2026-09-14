@@ -178,8 +178,19 @@ macro_rules! forward_one {
         if let Some(pg) = $state.pager.as_mut() {
             // Gather this token's Engram rows before the forward: the tables are
             // SSD-resident and the gather needs the same HF source the pager owns.
+            // Timed into `phase::CALLER_ENGRAM_NS` -> `engram_us` on the next
+            // `het.token.summary`: 2 layers x 24 spawned threads x 2 preads
+            // against a 98 GB NVMe table, all on this thread's critical path.
             let engram_rows = match $state.engram.as_mut() {
-                Some(ec) => Some(ec.rows_for(pg.raw(), $tok, $pos)?),
+                Some(ec) => {
+                    let t = std::time::Instant::now();
+                    let rows = ec.rows_for(pg.raw(), $tok, $pos)?;
+                    v4flash_kernels::het::trace::phase::add(
+                        &v4flash_kernels::het::trace::phase::CALLER_ENGRAM_NS,
+                        t.elapsed().as_nanos() as u64,
+                    );
+                    Some(rows)
+                }
                 None => None,
             };
             $state.engine.forward_token_paged(
@@ -1442,9 +1453,18 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                     .as_ref()
                     .map(|p| p.counters())
                     .unwrap_or_default();
+                let t_req = std::time::Instant::now();
                 if let Err(e) = handle_generate_stream(&mut state, req, session_id, cancel, &tx) {
                     let _ = tx.blocking_send(WorkerEvent::Error(format!("{e:#}")));
                 }
+                // Engine-side end-to-end wall for the request (prefill + decode
+                // loop + snapshot saves). `e2e_ms - decode.loop.summary.loop_ms`
+                // is the per-request fixed cost a curl-wall harness amortises
+                // over completion_tokens.
+                tracing::info!(
+                    e2e_ms = t_req.elapsed().as_millis() as u64,
+                    "request.summary"
+                );
                 // tx is dropped here, signaling end of stream.
                 // Return free heap pages to the kernel and log the heap
                 // shape: in_use vs free is the fragmentation-vs-leak
@@ -2318,6 +2338,10 @@ fn finish_decode(
     initial_in_think: bool,
 ) -> eyre::Result<()> {
     let mut pos = start_pos;
+    // Decode-loop wall, reported as `decode.loop.summary` at the end. Its
+    // ms/token is what a harness must compare against `het.token.summary`;
+    // curl-wall / completion_tokens ALSO carries the prefill and snapshot save.
+    let loop_t0 = std::time::Instant::now();
 
     // `GenerateReq` is `pub` with no `Default`, so a future caller could hand
     // us the field's natural zero value (or a NaN). `launch_multinomial_topp`
@@ -2339,9 +2363,14 @@ fn finish_decode(
         }
     };
     let mut rng = SamplerRng::new(req.seed);
+    let t_sample = std::time::Instant::now();
     let mut next = state
         .engine
         .sample_next(&mut state.dgpu_scratch, sample_mode, rng.next_f32())?;
+    v4flash_kernels::het::trace::phase::add(
+        &v4flash_kernels::het::trace::phase::CALLER_SAMPLE_NS,
+        t_sample.elapsed().as_nanos() as u64,
+    );
     let mut completion_tokens: u32 = 1;
 
     let mut residual = vec![0f32; HC_DIM as usize];
@@ -2490,6 +2519,7 @@ fn finish_decode(
             in_think = false;
             // Token itself is suppressed.
         } else if let Some(bytes) = state.vocab.token_text(next) {
+            let t_stream = std::time::Instant::now();
             let raw = gpt2_decode_token(bytes, &state.byte_decoder);
             // Always emit, even for empty raw — TOK_DSML's bytes are
             // routinely the model's primary signal and must be visible
@@ -2543,6 +2573,11 @@ fn finish_decode(
                     }
                 }
             }
+            // Detokenise + chunk hand-off -> `stream_us` on the next summary.
+            v4flash_kernels::het::trace::phase::add(
+                &v4flash_kernels::het::trace::phase::CALLER_STREAM_NS,
+                t_stream.elapsed().as_nanos() as u64,
+            );
             if send_failed {
                 // Receiver dropped (client disconnected, e.g.) or
                 // remained full past our grace window. The KV cache
@@ -2564,7 +2599,12 @@ fn finish_decode(
         if (next as u32) >= N_VOCAB {
             return Err(eyre!("generate: sampled token id {next} out of vocab"));
         }
+        let t_embed = std::time::Instant::now();
         embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, next, &mut residual);
+        v4flash_kernels::het::trace::phase::add(
+            &v4flash_kernels::het::trace::phase::CALLER_EMBED_NS,
+            t_embed.elapsed().as_nanos() as u64,
+        );
         forward_one!(state, residual, pos, next)?;
         pos += 1;
         // Successfully ingested `next` into KV at `pos-1`. live.pos
@@ -2598,11 +2638,29 @@ fn finish_decode(
         if pos >= state.n_kv_max {
             break FinishReason::Length;
         }
+        let t_sample = std::time::Instant::now();
         next = state
             .engine
             .sample_next(&mut state.dgpu_scratch, sample_mode, rng.next_f32())?;
+        v4flash_kernels::het::trace::phase::add(
+            &v4flash_kernels::het::trace::phase::CALLER_SAMPLE_NS,
+            t_sample.elapsed().as_nanos() as u64,
+        );
         completion_tokens += 1;
     };
+    // The loop's own wall. Measured 2026-09-14 (l1_1.log): 60.8 ms/token here
+    // vs 88 ms/token by curl-wall/256 — the difference was the 6.9 s prefill of
+    // a 36-token prompt (CED replay paging ~1500 decoder experts on box 1).
+    {
+        let wall = loop_t0.elapsed();
+        tracing::info!(
+            completion_tokens,
+            loop_ms = wall.as_millis() as u64,
+            ms_per_tok = format!("{:.2}", wall.as_secs_f64() * 1e3 / completion_tokens.max(1) as f64),
+            finish = ?finish,
+            "decode.loop.summary"
+        );
+    }
 
     // Force EOS into the KV cache at end-of-turn so the next request's
     // history (which always renders EOS after a closed assistant turn,
