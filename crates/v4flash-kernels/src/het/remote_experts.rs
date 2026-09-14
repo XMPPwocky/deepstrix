@@ -1124,6 +1124,38 @@ pub fn b2_gpu_repack() -> bool {
     *B
 }
 
+/// Send `REQ_FLAG_BATCHED` on every multi-token remote submit, so a DSpark
+/// verify batch takes box 2's by-expert chain instead of its decode chain
+/// (`V41_REMOTE_BATCHED_MULTI=0` reverts). Default ON.
+///
+/// The flag has existed since the protocol was written — its own doc says it is
+/// there "to let the hub choose per request (DSpark verify batches)" — but the
+/// hub never set it, so every submit with `b <= decode_max_b` (4) took the
+/// decode chain by default.
+///
+/// That chain does not group tokens by expert: it re-reads an expert's weights
+/// once per token. MEASURED with the expert set held CONSTANT, so the only
+/// variable is the path (`deepstrix-expert-bench --pool 3`, srv p50 us/layer):
+///
+///     B          1     2     4     5     6     8
+///     batched  386   396   444   465   487   527     +20 us per extra token
+///     decode   388   738  1387    --    --    --    +333 us per extra token
+///
+/// 16x on the per-token term, and 3.1x end to end at B=4. `decode_max_b=4` means
+/// B>=5 already escapes onto the good path by accident; this makes B=2..4
+/// deliberate, which is what a shorter draft window needs.
+///
+/// B=1 is deliberately left on the decode chain. Batched is marginally faster
+/// there too (383 vs 403 us with a realistic pool) but that is 0.8 ms of a 246 ms
+/// token, and the two chains sum per-expert partials in a different order, so
+/// switching B=1 would perturb today's decode numerics for ~0.3%. Not worth it.
+pub fn remote_batched_multi() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_REMOTE_BATCHED_MULTI").map(|v| v != "0").unwrap_or(true)
+    });
+    *B
+}
+
 /// Zero-copy O_DIRECT expert reads on box 2. **OFF by default — MEASURED LOSS.**
 /// `V41_B2_ODIRECT=1` enables it. Requires `b2_gpu_repack`, since only the
 /// HF-layout reader can land bytes straight in staging.
@@ -2734,6 +2766,14 @@ impl RemoteExpertClient {
         if b == 0 || b > self.info.max_batch as usize {
             return Err(eyre!("remote submit: b={b} outside 1..={}", self.info.max_batch));
         }
+        // A multi-token request is a DSpark verify batch; take the by-expert
+        // chain, which reads each expert's weights ONCE for the whole batch
+        // instead of once per token. See `remote_batched_multi`.
+        let flags = if b > 1 && remote_batched_multi() {
+            flags | proto::REQ_FLAG_BATCHED
+        } else {
+            flags
+        };
         if xq.len() != b * XQ_BYTES_PER_TOKEN || sel.len() != b * nu || ew.len() != b * nu {
             return Err(eyre!("remote submit: payload sizes do not match b={b}"));
         }
