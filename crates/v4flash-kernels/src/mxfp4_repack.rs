@@ -76,6 +76,44 @@ impl Mxfp4Repack {
         )
     }
 
+    /// As [`Self::launch_from_ptr`] with the packed nibbles and the scale plane
+    /// at INDEPENDENT pointers.
+    ///
+    /// Needed by the zero-copy O_DIRECT path: each region lands at its own file
+    /// offset's 4096-residue, so the two are no longer contiguous. They never
+    /// had to be — the kernel always took two pointers.
+    ///
+    /// # Safety contract
+    /// Both regions must stay alive and unwritten until `stream` synchronizes.
+    pub fn launch_from_ptrs(
+        &self,
+        stream: &Stream,
+        dst: &mut DeviceBuffer<u8>,
+        dst_off: usize,
+        packed: v4flash_hip::sys::hipDeviceptr_t,
+        scale: v4flash_hip::sys::hipDeviceptr_t,
+        out_rows: u32,
+        nb: u32,
+    ) -> eyre::Result<()> {
+        let total = out_rows as usize * nb as usize;
+        if dst.len() < dst_off + total * 17 {
+            return Err(eyre!(
+                "mxfp4_repack dst too small: {} < {}",
+                dst.len(),
+                dst_off + total * 17
+            ));
+        }
+        let function = self.module.get_function("mxfp4_repack_hf_to_ggml")?;
+        let block = 256u32;
+        let cfg = LaunchConfig {
+            grid: ((total as u32).div_ceil(block), 1, 1),
+            block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let dst_v = dst.slice_view_mut(dst_off, total * 17);
+        launch_kernel!(function, cfg, stream, [dst_v.raw(), packed, scale, out_rows, nb])
+    }
+
     pub fn launch(
         &self,
         stream: &Stream,

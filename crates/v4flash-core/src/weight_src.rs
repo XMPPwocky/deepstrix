@@ -97,6 +97,29 @@ impl<'a> WeightSrc<'a> {
         }
     }
 
+    /// Zero-copy O_DIRECT HF-layout expert read into padded, 4096-aligned
+    /// staging. `Ok(None)` = unavailable (GGUF source, or no O_DIRECT handle);
+    /// the caller must fall back to [`Self::read_expert_hf_layout`].
+    pub fn read_expert_hf_layout_direct(
+        &self,
+        t: &GgufTensor,
+        e: usize,
+        dst: &mut [u8],
+    ) -> eyre::Result<Option<(usize, usize, u32, u32)>> {
+        match *self {
+            Self::Gguf(_) => Ok(None),
+            Self::V41(v) => v.read_expert_hf_layout_direct(v.get(&t.name)?, e, dst),
+        }
+    }
+
+    /// Staging bytes [`Self::read_expert_hf_layout_direct`] needs for one role.
+    pub fn hf_layout_direct_capacity(&self, t: &GgufTensor) -> eyre::Result<Option<usize>> {
+        match *self {
+            Self::Gguf(_) => Ok(None),
+            Self::V41(v) => v.hf_layout_direct_capacity(v.get(&t.name)?).map(Some),
+        }
+    }
+
     /// The model's on-disk location: the GGUF file, or the HF snapshot dir.
     pub fn path(&self) -> &'a Path {
         match *self {

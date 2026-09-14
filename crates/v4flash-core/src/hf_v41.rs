@@ -690,6 +690,74 @@ impl V41HfWeights {
         Ok(())
     }
 
+    /// Staging bytes [`Self::read_expert_hf_layout_direct`] needs for one role.
+    pub fn hf_layout_direct_capacity(&self, vt: &VTensor) -> eyre::Result<usize> {
+        let (packed, scale) = self.hf_layout_parts(vt)?;
+        Ok(crate::safetensors::SafetensorsDir::direct_capacity_for(packed)
+            + crate::safetensors::SafetensorsDir::direct_capacity_for(scale))
+    }
+
+    fn hf_layout_parts(&self, vt: &VTensor) -> eyre::Result<(usize, usize)> {
+        let Kind::Experts { layer, which } = &vt.kind else {
+            return Err(eyre!("{}: not a stacked expert tensor", vt.name));
+        };
+        let p = format!("layers.{layer}.ffn.experts.0.{which}.");
+        let wt = self.st.get(&format!("{p}weight"))?;
+        let (out, half) = (wt.shape[0] as usize, wt.shape[1] as usize);
+        let nb = half * 2 / 32;
+        Ok((out * nb * 16, out * nb))
+    }
+
+    /// [`Self::read_expert_hf_layout`] straight into PADDED, 4096-aligned staging
+    /// with **no bounce buffer and no copy** — the whole point of O_DIRECT here.
+    ///
+    /// Returns `(packed_off, scale_off, out_rows, nb)`: where in `dst` each
+    /// region's bytes actually begin, since O_DIRECT places them at the file
+    /// offset's own 4096-residue. `Ok(None)` = no O_DIRECT handle for this shard.
+    ///
+    /// `dst` must be 4096-aligned and at least `hf_layout_direct_capacity`.
+    pub fn read_expert_hf_layout_direct(
+        &self,
+        vt: &VTensor,
+        e: usize,
+        dst: &mut [u8],
+    ) -> eyre::Result<Option<(usize, usize, u32, u32)>> {
+        let Kind::Experts { layer, which } = &vt.kind else {
+            return Err(eyre!("{}: not a stacked expert tensor", vt.name));
+        };
+        if e >= self.n_expert {
+            return Err(eyre!("{}: expert {e} >= {}", vt.name, self.n_expert));
+        }
+        let p = format!("layers.{layer}.ffn.experts.{e}.{which}.");
+        let wt = self.st.get(&format!("{p}weight"))?;
+        let sc = self.st.get(&format!("{p}scale"))?;
+        if !matches!(wt.dtype, StDtype::I8 | StDtype::U8) || sc.dtype != StDtype::F8E8M0 {
+            return Err(eyre!("{p}: expected I8 weight + F8_E8M0 scale, got {:?} + {:?}", wt.dtype, sc.dtype));
+        }
+        let (out, half) = (wt.shape[0] as usize, wt.shape[1] as usize);
+        let nb = half * 2 / 32;
+        let (packed_len, scale_len) = (out * nb * 16, out * nb);
+        if wt.len as usize != packed_len || sc.len as usize != scale_len {
+            return Err(eyre!("{p}: sizes wt={} sc={} != {packed_len}/{scale_len}", wt.len, sc.len));
+        }
+        let cap_w = crate::safetensors::SafetensorsDir::direct_capacity_for(packed_len);
+        if dst.len() < cap_w + crate::safetensors::SafetensorsDir::direct_capacity_for(scale_len) {
+            return Err(eyre!("{p}: direct staging {} too small", dst.len()));
+        }
+        let t_pread = std::time::Instant::now();
+        let (region_w, region_s) = dst.split_at_mut(cap_w);
+        let Some(pad_w) = self.st.read_range_into_direct_padded(wt, 0, packed_len, region_w)? else {
+            return Ok(None);
+        };
+        let Some(pad_s) = self.st.read_range_into_direct_padded(sc, 0, scale_len, region_s)? else {
+            return Ok(None);
+        };
+        EXPERT_READ_PROF.pread_ns.fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
+        EXPERT_READ_PROF.pread_bytes.fetch_add(wt.len + sc.len, Relaxed);
+        EXPERT_READ_PROF.calls.fetch_add(1, Relaxed);
+        Ok(Some((pad_w, cap_w + pad_s, out as u32, nb as u32)))
+    }
+
     /// HF packed nibbles + e8m0 scales of one expert → ggml MXFP4 blocks.
     fn read_expert_raw(&self, layer: usize, which: &str, e: usize, dst: &mut [u8]) -> eyre::Result<()> {
         let p = format!("layers.{layer}.ffn.experts.{e}.{which}.");

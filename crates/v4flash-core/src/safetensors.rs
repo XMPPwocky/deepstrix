@@ -390,6 +390,94 @@ impl SafetensorsDir {
         Ok(true)
     }
 
+    /// O_DIRECT read with **no bounce buffer**: the bytes land straight in
+    /// `dst`, and the caller is told where in `dst` they start.
+    ///
+    /// [`Self::read_range_into_direct`] allocates an aligned bounce of the whole
+    /// extent per call and memcpys out of it. At the expert size that is an
+    /// 18.8 MB allocation plus an 18.8 MB copy **per miss**, which is why
+    /// O_DIRECT measured SLOWER than buffered twice (box 1 -16% decode, box 2
+    /// +6%) despite the drive preferring it 5.89 -> 4.84 ms.
+    ///
+    /// The copy is avoidable because O_DIRECT only needs the file offset, the
+    /// memory address and the length to share an alignment — not to be
+    /// aligned to zero. Every expert tensor in a shard has a length that is a
+    /// multiple of 4096, so they all share ONE residue `pad = offset % 4096`.
+    /// Reading `pad + len` bytes from `offset - pad` into a 4096-aligned `dst`
+    /// therefore satisfies O_DIRECT and puts the requested bytes at `dst[pad]`.
+    ///
+    /// `dst` must be 4096-aligned and hold `pad + len` rounded up to 4096;
+    /// `capacity_for` gives the size to allocate. Returns `Ok(None)` when this
+    /// shard has no O_DIRECT handle (caller falls back to the cached path).
+    ///
+    /// Alignment of `dst` is CHECKED, not assumed — a misaligned buffer makes
+    /// `pread` fail with EINVAL, which is a confusing way to learn this.
+    pub fn read_range_into_direct_padded(
+        &self,
+        t: &StTensor,
+        byte_off: u64,
+        len: usize,
+        dst: &mut [u8],
+    ) -> eyre::Result<Option<usize>> {
+        const A: u64 = 4096;
+        let end = byte_off
+            .checked_add(len as u64)
+            .ok_or_else(|| eyre!("{}: range overflow", t.name))?;
+        if end > t.len {
+            return Err(eyre!("{}: range [{byte_off},{end}) exceeds tensor length {}", t.name, t.len));
+        }
+        let Some(Some(file)) = self.direct_files.get(t.shard) else {
+            return Ok(None);
+        };
+        if len == 0 {
+            return Ok(Some(0));
+        }
+        let abs = t.offset + byte_off;
+        let pad = (abs & (A - 1)) as usize;
+        let span = ((pad + len) as u64).div_ceil(A) as usize * A as usize;
+        if dst.len() < span {
+            return Err(eyre!(
+                "{}: direct dst {} < span {span} (pad {pad}, len {len})",
+                t.name,
+                dst.len()
+            ));
+        }
+        if dst.as_ptr() as usize & (A as usize - 1) != 0 {
+            return Err(eyre!("{}: direct dst is not {A}-aligned", t.name));
+        }
+        // The extent is rounded UP to a block boundary, which can run past EOF on
+        // the last tensor of a shard; the kernel then returns a short read. That is
+        // fine as long as the bytes the caller asked for arrived, so read until the
+        // requested subrange is covered and treat Ok(0) as EOF rather than failure.
+        let need = pad + len;
+        let mut got = 0usize;
+        while got < need {
+            let n = file.read_at(&mut dst[got..span], abs - pad as u64 + got as u64).wrap_err_with(|| {
+                format!(
+                    "O_DIRECT padded pread at {} in {} for {}",
+                    abs - pad as u64 + got as u64,
+                    self.shard_names[t.shard],
+                    t.name
+                )
+            })?;
+            if n == 0 {
+                return Err(eyre!(
+                    "{}: O_DIRECT short read: got {got} of {need} (span {span})",
+                    t.name
+                ));
+            }
+            got += n;
+        }
+        Ok(Some(pad))
+    }
+
+    /// Bytes to allocate so [`Self::read_range_into_direct_padded`] can place
+    /// `len` bytes at any alignment: one extra block for the head, then the
+    /// length rounded up.
+    pub fn direct_capacity_for(len: usize) -> usize {
+        4096 + len.div_ceil(4096) * 4096
+    }
+
     /// Same as [`Self::read_range_into_cached`] but splits the range across
     /// `threads` concurrent preads.
     ///

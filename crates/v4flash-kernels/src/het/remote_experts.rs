@@ -1097,6 +1097,9 @@ pub struct ExpertShard {
     /// drive's own 4.52 ms for the same 18.8 MB. `None` = CPU rollback path.
     repack: Option<Mxfp4Repack>,
     repack_stream: Option<Stream>,
+    /// Zero-copy O_DIRECT reads are usable: GPU repack on, gate on, staging
+    /// 4096-aligned. See [`b2_odirect`].
+    direct: bool,
     /// Persistent staging, one per role, in `hipHostMalloc` memory.
     ///
     /// Two things at once. It is persistent, so the miss path no longer
@@ -1117,6 +1120,42 @@ pub struct ExpertShard {
 pub fn b2_gpu_repack() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var("V41_B2_GPU_REPACK").map(|v| v != "0").unwrap_or(true)
+    });
+    *B
+}
+
+/// Zero-copy O_DIRECT expert reads on box 2. **OFF by default — MEASURED LOSS.**
+/// `V41_B2_ODIRECT=1` enables it. Requires `b2_gpu_repack`, since only the
+/// HF-layout reader can land bytes straight in staging.
+///
+/// This is the THIRD independent rejection of O_DIRECT on this path:
+///
+///   box 1, `read_range_into_direct` (bouncing)      decode -16%
+///   box 2, `read_range_into_direct` (bouncing)      miss 6.60 -> 6.99 ms
+///   box 2, `read_range_into_direct_padded` (no copy) miss 6.60 -> 6.75 ms
+///
+/// The first two were blamed on the bounce buffer — an 18.8 MB aligned alloc
+/// plus an 18.8 MB memcpy per fault. Removing it entirely (this path lands bytes
+/// straight in GTT staging at the file offset's own 4096-residue) recovered only
+/// 0.24 of the 0.39 ms, so the bounce was NOT the main cost.
+///
+/// What the raw-drive numbers actually say, at the miss's shape:
+///
+///   3 threads x 6.3 MB  buffered  5.89 ms   O_DIRECT  4.84 ms   box 2
+///   3 threads x 6.3 MB  buffered  4.10 ms   O_DIRECT  4.86 ms   box 1
+///
+/// O_DIRECT wins on box 2 and LOSES on box 1, and in-engine it loses on both.
+/// The gap is concurrency: the cached reader splits each tensor across
+/// `expert_pread_threads()` preads, while this path issues one pread per tensor
+/// — and a role's 0.37 MB scale plane is a poor O_DIRECT read. Anyone retrying
+/// this must split the direct reads the same way first; without that the drive's
+/// 1.05 ms advantage does not survive contact with the access pattern.
+///
+/// The code is kept because `read_range_into_direct_padded` is strictly better
+/// than the bouncing reader and the measurement is worth preserving.
+pub fn b2_odirect() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(std::env::var("V41_B2_ODIRECT").as_deref(), Ok("1") | Ok("on"))
     });
     *B
 }
@@ -1353,6 +1392,24 @@ impl ExpertShard {
             eprintln!("expert shard: GPU MXFP4 repack OFF — CPU repack on every miss");
             (None, None)
         };
+        // Staging is oversized so an O_DIRECT read can place each region at its
+        // own 4096-residue: one spare block per region, two regions per role.
+        // (packed and scale are each 4096-multiples here, so +2 blocks suffices;
+        // +4 is slack for a checkpoint whose lengths are not.)
+        let stage = [
+            PinnedBuffer::<u8>::new_with_flags(bpe3[0] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
+            PinnedBuffer::<u8>::new_with_flags(bpe3[1] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
+            PinnedBuffer::<u8>::new_with_flags(bpe3[2] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
+        ];
+        // O_DIRECT needs a 4096-aligned buffer. hipHostMalloc gives page-aligned
+        // memory, but CHECK rather than assume: a misaligned buffer fails pread
+        // with EINVAL, which is a confusing way to learn this.
+        let aligned = stage.iter().all(|p| p.as_slice().as_ptr() as usize % 4096 == 0);
+        let direct = repack.is_some() && b2_odirect() && aligned;
+        if b2_odirect() && !aligned {
+            eprintln!("expert shard: O_DIRECT off — pinned staging is not 4096-aligned");
+        }
+        eprintln!("expert shard: zero-copy O_DIRECT expert reads {}", if direct { "ON" } else { "OFF" });
         Ok(Self {
             owner,
             device: igpu,
@@ -1362,11 +1419,8 @@ impl ExpertShard {
             load_stats: LoadStats { n_experts: n_slots as usize, bytes, seconds },
             repack,
             repack_stream,
-            stage: [
-                PinnedBuffer::<u8>::new_with_flags(bpe3[0], HIP_HOST_MALLOC_NON_COHERENT)?,
-                PinnedBuffer::<u8>::new_with_flags(bpe3[1], HIP_HOST_MALLOC_NON_COHERENT)?,
-                PinnedBuffer::<u8>::new_with_flags(bpe3[2], HIP_HOST_MALLOC_NON_COHERENT)?,
-            ],
+            stage,
+            direct,
         })
     }
 
@@ -1454,6 +1508,7 @@ impl ExpertShard {
         let repack = self.repack.as_ref();
         let repack_stream = self.repack_stream.as_ref();
         let stage = &mut self.stage;
+        let direct = self.direct;
         let mut dirty = false;
         let mut want: Vec<u32> = Vec::with_capacity(ids.len());
         for &e in ids {
@@ -1509,6 +1564,9 @@ impl ExpertShard {
             let gpu_repack = repack.is_some();
             let rp0 = v4flash_core::hf_v41::expert_read_profile();
             let t_r = std::time::Instant::now();
+            // Per role: where the packed nibbles and the scale plane actually
+            // landed in staging. `None` = contiguous (the non-direct paths).
+            let mut offs: [Option<(usize, usize, u32, u32)>; 3] = [None; 3];
             {
                 let [p0, p1, p2] = &mut *stage;
                 let bufs: [&mut [u8]; 3] =
@@ -1521,23 +1579,38 @@ impl ExpertShard {
                         .map(|(i, buf): (usize, &mut [u8])| {
                             let name = names[i].clone();
                             let src = WeightSrc::from(owner);
-                            sc.spawn(move || -> Result<(), String> {
+                            let bi = bpe[i];
+                            type R = Result<Option<(usize, usize, u32, u32)>, String>;
+                            sc.spawn(move || -> R {
                                 let t = src.tensor(&name).ok_or(format!("missing {name}"))?;
+                                if gpu_repack && direct {
+                                    // Zero-copy: O_DIRECT lands each region at its
+                                    // own 4096-residue, straight into GTT staging.
+                                    if let Some(o) = src
+                                        .read_expert_hf_layout_direct(t, e as usize, buf)
+                                        .map_err(|err| format!("{name}: {err}"))?
+                                    {
+                                        return Ok(Some(o));
+                                    }
+                                }
                                 if gpu_repack {
                                     // Leave MXFP4 in the HF layout; permuted below.
-                                    src.read_expert_hf_layout(t, e as usize, buf)
-                                        .map(|_| ())
+                                    src.read_expert_hf_layout(t, e as usize, &mut buf[..bi])
+                                        .map(|_| None)
                                         .map_err(|err| format!("{name}: {err}"))
                                 } else {
-                                    src.read_expert_into(t, e as usize, buf)
+                                    src.read_expert_into(t, e as usize, &mut buf[..bi])
+                                        .map(|_| None)
                                         .map_err(|err| format!("{name}: {err}"))
                                 }
                             })
                         })
                         .collect();
-                    for j in h {
-                        if let Ok(Err(msg)) = j.join() {
-                            errs.push(msg);
+                    for (i, j) in h.into_iter().enumerate() {
+                        match j.join() {
+                            Ok(Ok(o)) => offs[i] = o,
+                            Ok(Err(msg)) => errs.push(msg),
+                            Err(_) => errs.push(format!("reader thread {i} panicked")),
                         }
                     }
                 });
@@ -1553,7 +1626,7 @@ impl ExpertShard {
             match (repack, repack_stream) {
                 (Some(rp), Some(st)) => {
                     pg.repack_gpu_ns += Self::repack_in_place(
-                        rp, st, r, (base + victim as usize) as u32, stage,
+                        rp, st, r, (base + victim as usize) as u32, stage, &offs,
                     )?;
                 }
                 _ => {
@@ -1591,6 +1664,7 @@ impl ExpertShard {
         routed: &mut RoutedExpertWeights,
         slot: u32,
         stage: &[PinnedBuffer<u8>; 3],
+        offs: &[Option<(usize, usize, u32, u32)>; 3],
     ) -> eyre::Result<u64> {
         // (rows, blocks per row) per role: gate/up are [N_FF_EXP, N_EMBD/32],
         // down is [N_EMBD, N_FF_EXP/32]. Same block count, different shape —
@@ -1616,10 +1690,24 @@ impl ExpertShard {
             // No upload: `stage[i]` is hipHostMalloc memory, which on this APU is
             // the same physical RAM the iGPU reads. The preads above already put
             // the bytes where the kernel wants them.
-            rp.launch_from_ptr(
-                st, dst, slot as usize * bpe[i],
-                stage[i].device_ptr(), stage[i].len(), rows, nb,
-            )?;
+            let base = stage[i].device_ptr() as *mut u8;
+            match offs[i] {
+                // Zero-copy O_DIRECT: the two regions sit at their own residues.
+                Some((po, so, o_rows, o_nb)) => {
+                    debug_assert_eq!((o_rows, o_nb), (rows, nb));
+                    rp.launch_from_ptrs(
+                        st, dst, slot as usize * bpe[i],
+                        base.wrapping_add(po) as v4flash_hip::sys::hipDeviceptr_t,
+                        base.wrapping_add(so) as v4flash_hip::sys::hipDeviceptr_t,
+                        rows, nb,
+                    )?;
+                }
+                // Cached read: scales follow the nibbles contiguously.
+                None => rp.launch_from_ptr(
+                    st, dst, slot as usize * bpe[i],
+                    stage[i].device_ptr(), stage[i].len(), rows, nb,
+                )?,
+            }
         }
         let t = std::time::Instant::now();
         st.synchronize()?;
