@@ -179,7 +179,7 @@ Secondary, and cheap: box 2's per-request `write` is 3.5 ms x 3760 = **13 s** an
 and I/O around the kernels. That is worth more than closing the whole attention
 path and needs no kernel work.
 
-## Likely bug: prefill asks box 2 for f32 responses via a mixed-up argument
+## Prefill's f32 partials: a latent argument mix-up, but f32 is LOAD-BEARING
 
 `RemoteExpertClient::submit`'s last parameter selects the RESPONSE PRECISION:
 

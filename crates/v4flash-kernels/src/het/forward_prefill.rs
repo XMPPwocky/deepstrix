@@ -3924,7 +3924,21 @@ impl HeterogeneousEngine {
                 let ticket = remote
                     .lock()
                     .map_err(|_| eyre!("remote expert client mutex poisoned"))?
-                    .submit(layer as u32, b as usize, &xq_host, &sel_host_remote, &ew_host, remote_split_on)?;
+                    // Last arg is `resp_f32`, NOT "is the split on". This used to
+                    // read `remote_split_on` — an unrelated boolean that happens to
+                    // be true whenever we get here, so it worked by coincidence and
+                    // would have panicked the moment the two diverged. Now explicit.
+                    //
+                    // f32 is LOAD-BEARING: the consumer below calls
+                    // `RemotePartial::f32()`, which asserts `is_f32`. It is not a
+                    // free choice, and asking for f16 panics with "partial is f16"
+                    // (measured 2026-09-14) until an f16 remote-add path exists.
+                    //
+                    // Worth building: at B=512 an f32 partial is 512*5120*4 =
+                    // 10.49 MB/request, 3760 requests = 39.4 GB over a 724 MB/s
+                    // link = ~54 s of a 160 s prefill. f16 halves it. See
+                    // docs/v41/PREFILL_100K_PROFILE.md.
+                    .submit(layer as u32, b as usize, &xq_host, &sel_host_remote, &ew_host, true)?;
                 let t_sub_end = super::perfetto::now_ns();
                 // Stash, don't wait: the local iGPU MoE for this layer is issued
                 // right after this block, and post-MoE collects the reply. The
