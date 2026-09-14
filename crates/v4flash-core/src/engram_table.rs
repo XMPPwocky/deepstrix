@@ -31,6 +31,23 @@ pub struct EngramTable {
     weight: StTensor,
     scale: StTensor,
     pub rows: u64,
+    /// Decoded-row cache: `row id -> ENGRAM_ROW_DIM bf16-rounded f32`.
+    ///
+    /// WHY. A row is 264 B (256 B weight + 8 B scale) but the page cache works in
+    /// 4 KiB pages, so every miss pulls ~15x what it needs out of a 98 GB table that
+    /// cannot stay resident in 96 GB of RAM. Decode issues 2 layers x 24 cols x 2 reads
+    /// = 96 tiny random reads PER TOKEN and blocks on them: measured **7.9 ms/token
+    /// p50** (`engram_us`), which is latency, not bandwidth — ~12 KB moved in 7.9 ms.
+    /// Threads already hide some of it (24-way fan-out; narrowing it once cost decode
+    /// 14.4 -> 11.9 tok/s) but cannot fix the granularity.
+    ///
+    /// n-gram hashes repeat heavily within a conversation, so a small cache should take
+    /// most of that to zero. `ENGRAM_CACHE_ROWS=0` disables it; default 262144 rows
+    /// ~= 256 MB of f32 (or set it lower — 65536 is ~64 MB).
+    cache: std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<Vec<f32>>>>,
+    cache_cap: usize,
+    pub cache_hits: std::sync::atomic::AtomicU64,
+    pub cache_misses: std::sync::atomic::AtomicU64,
 }
 
 impl EngramTable {
@@ -42,7 +59,22 @@ impl EngramTable {
         {
             return Err(eyre!("engram table L{layer}: unexpected shapes {:?} / {:?}", weight.shape, scale.shape));
         }
-        Ok(Self { layer, rows: weight.shape[0], weight, scale })
+        let cache_cap = std::env::var("ENGRAM_CACHE_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(262_144);
+        Ok(Self {
+            layer,
+            rows: weight.shape[0],
+            weight,
+            scale,
+            cache: std::sync::Mutex::new(std::collections::HashMap::with_capacity(
+                cache_cap.min(1 << 16),
+            )),
+            cache_cap,
+            cache_hits: std::sync::atomic::AtomicU64::new(0),
+            cache_misses: std::sync::atomic::AtomicU64::new(0),
+        })
     }
 
     /// Gather + dequantise `ids.len()` rows into `out` (`ids.len() * 256` f32),
@@ -73,6 +105,62 @@ impl EngramTable {
         // `EngramCtx::rows_for_chunk`, which now issues one gather per layer per run
         // instead of one per position (289k spawns -> ~64, 530 -> 59 us/token) —
         // not to narrow the fan-out of an individual gather.
+        // Serve what the cache already has; only the misses go to disk.
+        if self.cache_cap > 0 {
+            let mut need: Vec<i64> = Vec::new();
+            {
+                let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+                for (k, &id) in ids.iter().enumerate() {
+                    match c.get(&id) {
+                        Some(row) => {
+                            out[k * ENGRAM_ROW_DIM..(k + 1) * ENGRAM_ROW_DIM]
+                                .copy_from_slice(row);
+                            self.cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        None => need.push(id),
+                    }
+                }
+            }
+            if need.is_empty() {
+                return Ok(());
+            }
+            need.sort_unstable();
+            need.dedup();
+            self.cache_misses
+                .fetch_add(need.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let mut fetched = vec![0f32; need.len() * ENGRAM_ROW_DIM];
+            self.gather_uncached(st, &need, &mut fetched, threads)?;
+            {
+                let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+                // Bounded, not LRU: n-gram locality is high and a clear is cheaper
+                // than per-access bookkeeping on the critical path.
+                if c.len() + need.len() > self.cache_cap {
+                    c.clear();
+                }
+                for (j, &id) in need.iter().enumerate() {
+                    c.insert(
+                        id,
+                        std::sync::Arc::new(
+                            fetched[j * ENGRAM_ROW_DIM..(j + 1) * ENGRAM_ROW_DIM].to_vec(),
+                        ),
+                    );
+                }
+                for (k, &id) in ids.iter().enumerate() {
+                    if let Some(row) = c.get(&id) {
+                        out[k * ENGRAM_ROW_DIM..(k + 1) * ENGRAM_ROW_DIM].copy_from_slice(row);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        self.gather_uncached(st, ids, out, threads)
+    }
+
+    /// The original disk path — unchanged; see `gather` for the cache in front of it.
+    fn gather_uncached(&self, st: &SafetensorsDir, ids: &[i64], out: &mut [f32], threads: usize) -> eyre::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
         let threads = threads.clamp(1, ids.len().max(1));
         let per = ids.len().div_ceil(threads);
         let results: Vec<eyre::Result<()>> = std::thread::scope(|sc| {
