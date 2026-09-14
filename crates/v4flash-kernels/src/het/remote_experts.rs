@@ -1419,19 +1419,54 @@ impl ExpertShard {
             ];
             let src = WeightSrc::from(&self.owner);
             let bpe = [r.gate_bytes_per_expert, r.up_bytes_per_expert, r.down_bytes_per_expert];
-            let mut stage = vec![0u8; bpe[0].max(bpe[1]).max(bpe[2])];
+            // The three roles are read CONCURRENTLY, then uploaded.
+            //
+            // This loop used to be strictly serial — read role i into one staging buffer,
+            // blocking H2D, then role i+1 — so ~18.8 MB moved at ~1.9 GB/s and a miss cost
+            // **11.09 ms** (box 2's own page stats: read 9.84 + h2d 1.26). At the measured
+            // ~41 faults/token that is ~450 ms of the decode token, i.e. the single
+            // largest cost in the engine. Box 1 has read experts with parallel preads
+            // since the M7 pager (`read_range_into_cached_par`); this side never did.
             let (mut read_ns, mut h2d_ns) = (0u64, 0u64);
-            for (i, name) in names.iter().enumerate() {
-                let t = src.tensor(name).ok_or_else(|| eyre!("missing {name}"))?;
-                let t_r = std::time::Instant::now();
-                src.read_expert_into(t, e as usize, &mut stage[..bpe[i]])?;
-                read_ns += t_r.elapsed().as_nanos() as u64;
-                let t_h = std::time::Instant::now();
+            let t_r = std::time::Instant::now();
+            let mut stages: [Vec<u8>; 3] = [
+                vec![0u8; bpe[0]], vec![0u8; bpe[1]], vec![0u8; bpe[2]],
+            ];
+            {
+                let (s0, rest) = stages.split_at_mut(1);
+                let (s1, s2) = rest.split_at_mut(1);
+                let mut errs: Vec<String> = Vec::new();
+                std::thread::scope(|sc| {
+                    let h: Vec<_> = [(0usize, &mut s0[0]), (1, &mut s1[0]), (2, &mut s2[0])]
+                        .into_iter()
+                        .map(|(i, buf)| {
+                            let name = names[i].clone();
+                            let src = WeightSrc::from(&self.owner);
+                            sc.spawn(move || -> Result<(), String> {
+                                let t = src.tensor(&name).ok_or(format!("missing {name}"))?;
+                                src.read_expert_into(t, e as usize, buf)
+                                    .map_err(|err| format!("{name}: {err}"))
+                            })
+                        })
+                        .collect();
+                    for j in h {
+                        if let Ok(Err(msg)) = j.join() {
+                            errs.push(msg);
+                        }
+                    }
+                });
+                if let Some(msg) = errs.first() {
+                    return Err(eyre!("expert shard: layer {layer} expert {e}: {msg}"));
+                }
+            }
+            read_ns += t_r.elapsed().as_nanos() as u64;
+            let t_h = std::time::Instant::now();
+            for i in 0..3 {
                 let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
                 buf.slice_view_mut((base + victim as usize) * bpe[i], bpe[i])
-                    .copy_from_host(&stage[..bpe[i]])?;
-                h2d_ns += t_h.elapsed().as_nanos() as u64;
+                    .copy_from_host(&stages[i])?;
             }
+            h2d_ns += t_h.elapsed().as_nanos() as u64;
             pg.read_ns += read_ns;
             pg.h2d_ns += h2d_ns;
             pg.slot_key[victim as usize] = Some(e);
@@ -2412,12 +2447,36 @@ impl RemoteExpertClient {
     /// and weights. Picks the remote does not own are masked out here; if no
     /// token has a remote pick nothing is sent and `None` is returned. Returns
     /// as soon as the frame is handed to the writer thread.
+    /// Submit WITHOUT the advertised-bitmap mask — the caller has already decided the
+    /// partition and the daemon accepts out-of-set experts.
+    ///
+    /// This exists because the two-box design intends exactly that: `enable_paging`
+    /// sets the daemon's `l.owned` all-true "so the executor accepts an expert outside
+    /// the advertised set and `ensure_layer` pages it", and keeps the ADVERTISED bitmap
+    /// static only so PREFILL's exclusion mask stays correct. But `submit_flags` masked
+    /// by that same advertised bitmap, so the hub's decode-side decision never reached
+    /// the wire.
+    ///
+    /// MEASURED 2026-09-14 over a 10-token generation before this fix: 1,858 live picks
+    /// replaced by NO_PICK (~186 of 240 routed experts per token, 77%) and 119 layers
+    /// where every pick was masked — `Ok(None)`, so the hub did not even wait. Those
+    /// experts were computed by NOBODY. `verify_routing_exactly_once` could not see it:
+    /// it validates the hub's INTENT (the remap encoding), not the outcome.
+    pub fn submit_unmasked(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool) -> eyre::Result<Option<Ticket>> {
+        let flags = if resp_f32 { proto::REQ_FLAG_RESP_F32 } else { 0 };
+        self.submit_inner(layer, b, xq, sel, ew, flags, false)
+    }
+
     pub fn submit(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool) -> eyre::Result<Option<Ticket>> {
         self.submit_flags(layer, b, xq, sel, ew, if resp_f32 { proto::REQ_FLAG_RESP_F32 } else { 0 })
     }
 
     /// As [`Self::submit`] with explicit `proto::REQ_FLAG_*` bits.
     pub fn submit_flags(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32) -> eyre::Result<Option<Ticket>> {
+        self.submit_inner(layer, b, xq, sel, ew, flags, true)
+    }
+
+    fn submit_inner(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32, mask: bool) -> eyre::Result<Option<Ticket>> {
         let nu = N_EXPERT_USED;
         if b == 0 || b > self.info.max_batch as usize {
             return Err(eyre!("remote submit: b={b} outside 1..={}", self.info.max_batch));
@@ -2426,17 +2485,38 @@ impl RemoteExpertClient {
             return Err(eyre!("remote submit: payload sizes do not match b={b}"));
         }
         let mut any = false;
+        // `V41_MASK_DBG=1`: count LIVE picks this mask drops. The mask is the STATIC
+        // HELLO bitmap (`self.owns` -> `asg.bitsets()`), NOT the hub's residency-derived
+        // `owns_remote`. Under `V41_T2_CATCHALL=1` the hub marks a pick remote because it
+        // does not hold it; if box 2 does not statically own it either, it is silently
+        // replaced by NO_PICK here and computed by NOBODY —
+        // `verify_routing_exactly_once` cannot see it because it validates the HUB's view.
+        let mut masked_live = 0usize;
         for i in 0..b * nu {
-            if self.owns(layer, sel[i]) {
+            if !mask || self.owns(layer, sel[i]) {
                 self.sel_scratch[i] = sel[i];
                 self.ew_scratch[i] = ew[i];
                 any = true;
             } else {
+                if sel[i] >= 0 && sel[i] < N_EXPERT as i32 {
+                    masked_live += 1;
+                }
                 self.sel_scratch[i] = NO_PICK;
                 self.ew_scratch[i] = 0.0;
             }
         }
+        if masked_live > 0
+            && std::env::var("V41_MASK_DBG").as_deref() == Ok("1")
+        {
+            tracing::warn!(
+                layer, masked_live, live_sent = b * nu - masked_live,
+                "remote submit MASKED live picks (static HELLO bitmap, not owns_remote)"
+            );
+        }
         if !any {
+            if std::env::var("V41_MASK_DBG").as_deref() == Ok("1") {
+                tracing::warn!(layer, "remote submit DROPPED ENTIRE LAYER (no pick survived the mask)");
+            }
             return Ok(None);
         }
         let mut buf = self.rx_req_recycle.try_recv().unwrap_or_else(|_| {

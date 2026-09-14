@@ -329,11 +329,14 @@ fn remote_experts_loopback() -> eyre::Result<()> {
         let setup = (|| -> eyre::Result<(ExpertShard, MoeExecutor)> {
             let hf = V41HfWeights::open(&dir_d, None)?;
             let asg = Assignment::parse(&format!("L{LAYER_A}:0-{},L{LAYER_B}:0-{}", N_SUB - 1, N_SUB - 1))?;
-            let mut shard = ExpertShard::load(hf, igpu, &asg, 4, 8, ROWS as u32, 4)?;
+            let shard = ExpertShard::load(hf, igpu, &asg, 4, 8, ROWS as u32, 4)?;
             let exec = MoeExecutor::new(igpu, ROWS, 4)?;
             Ok((shard, exec))
         })();
-        let (shard, mut exec) = match setup {
+        // `serve_connection` takes `&mut ExpertShard` since the paging re-thread;
+        // this test stopped compiling then, so its bit-identity assertions have
+        // not run since. Keep it building.
+        let (mut shard, mut exec) = match setup {
             Ok(v) => {
                 tx_ready.send(Ok(())).unwrap();
                 v

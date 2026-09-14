@@ -2012,7 +2012,11 @@ impl HeterogeneousEngine {
                     .ok_or_else(|| eyre!("decode split on but no remote client"))?
                     .lock()
                     .map_err(|_| eyre!("remote expert client mutex poisoned"))?
-                    .submit(layer as u32, 1, &xq_host, &sel_host, &ew_host, true)?;
+                    // UNMASKED under the catch-all: the hub has already decided this
+                    // partition in `owns_remote`, and box 2 (`--paged`) accepts any
+                    // expert. Masking here by box 2's ADVERTISED set silently dropped
+                    // 77% of routed picks — see `submit_unmasked`.
+                    .submit_unmasked(layer as u32, 1, &xq_host, &sel_host, &ew_host, true)?;
                 if let Some(pf) = self.perfetto.as_ref() {
                     if let Ok(pf) = pf.lock() {
                         let _ = pf.emit_host_slice(
