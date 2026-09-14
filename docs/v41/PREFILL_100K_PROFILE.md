@@ -132,3 +132,49 @@ of inference — scaling a synthetic bench by ratios — had already produced th
 wrong conclusions in one day. Today's number is a real aggregate rather than an
 extrapolation, which is why it is quoted first, but a measured disagreement of 2.1x
 is not resolved by preferring the newer measurement.
+
+## CORRECTION 2: the kernel program IS the lever — on BOX 2, which emits no stages
+
+The withdrawal above is half right and over-corrects. Box 1's stage timings were
+indeed inflated 2.2x, but "the MoE kernel program is not the prefill lever" does
+not follow, because **box 2 runs the same two kernels on twice the experts and
+does not appear in box 1's stage log at all.**
+
+Box 2's daemon reports its OWN per-request GPU time (not a stage timing). For the
+same 100K prefill:
+
+    expertd B=512  n=3760  us p50: read 2453  h2d 116  gpu 22056  d2h 501  write 3499
+
+    n = 3760 ~= 20 encoder layers x 189 chunks (96,935/512 = 189)   <- accounts exactly
+    box 2 MoE GPU      82.9 s
+    box 2 non-GPU o/h  24.7 s   (read 9 s, write 13 s)
+    box 2 TOTAL       107.6 s   of the 160 s wall  <- the prefill critical path
+    box 1 MoE (true)   43.0 s
+
+**Cross-check:** 82.9 / 43.0 = 1.93 against an ownership ratio of 260/124 = 2.10.
+Two independently measured quantities — box 2's daemon timings and box 1's
+bench-derived kernel time — agree to 8%. That is what makes this trustworthy where
+the stage figure was not.
+
+Applying the recorded roofline gap (124 and 80 GB/s vs ~230 achievable = 2.20x on
+the chain):
+
+    box 2 MoE 82.9 s -> 37.6 s, saving 45.3 s  ->  up to ~845 tok/s
+
+**Read that as an upper bound, not a projection.** Box 1 and box 2 run
+CONCURRENTLY, so the wall is bounded by max(box 1 path, box 2 path); once box 2's
+MoE drops to 37.6 s its total falls to ~62 s and box 1 becomes binding. Box 1's
+true path is unknown — its dGPU stage total (93.6 s) is inflated by the same 2.2x
+effect and has not been re-measured with `rocprofv3 --kernel-trace`. So the gain
+is real and large but its ceiling is not established. Do NOT sum the two boxes'
+savings: that would give 1,063 tok/s and is wrong, because they overlap.
+
+**Net: the MoE kernel roofline gap is the prefill lever after all, and it is worth
+up to ~45 s of a 160 s wall.** The earlier analysis was right that box 1's share is
+too small to matter (43 s) and wrong to stop there — it priced box 1's ownership
+and never priced box 2's, which is 68% of the encoder.
+
+Secondary, and cheap: box 2's per-request `write` is 3.5 ms x 3760 = **13 s** and
+`read` 2.45 ms x 3760 = **9 s**, together 22 s of the wall in pure serialisation
+and I/O around the kernels. That is worth more than closing the whole attention
+path and needs no kernel work.
