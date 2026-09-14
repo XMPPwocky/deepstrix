@@ -224,3 +224,31 @@ non-speculatively on this hardware**: box 2's 35 ms zero-miss leg alone exceeds
 the entire 33 ms budget. The only ways past it are shrinking that leg (fewer picks
 to box 2, or a faster expert FFN — but that kernel is already at ~87% of
 achievable bandwidth) or amortising it across accepted tokens (DSpark).
+
+## The composed path to 30 tok/s (and why it is INSIDE the envelope)
+
+Non-speculative decode tops out at 14.1 tok/s (71 ms), so 30 requires DSpark. But
+"requires DSpark" is not the same as "out of reach" — composing the two:
+
+    DSpark E[tok/verify] = 4.13   (root-caused 2026-09-13: the 0.44 figure was an
+                                   ORACLE HARNESS bug, not a model property)
+
+    decode base        ms/token | x DSpark
+    today   3.65 tok/s      274 |  15.1 tok/s
+    REQUIRED 7.3 tok/s      138 |  30.0 tok/s   <- the goal
+    floor   14.1 tok/s       71 |  58.2 tok/s
+
+**The base only has to double, and the measured floor is 14.1 — nearly 2x beyond
+what is needed.** So the 30 tok/s clause is reachable on this hardware; it needs
+roughly half of box 2's miss cost removed plus DSpark, not a new machine.
+
+Today's 274 ms is ~209 ms of miss cost (18.7 misses x 11.16 ms) over a ~65 ms
+base. Halving the miss cost lands near 170 ms; reaching 138 ms needs miss cost
+down to ~73 ms, i.e. roughly a 3x reduction — via residency (box 2 has ~5 GB of
+headroom left), a faster miss path (O_DIRECT's premise is sound, the pooled-buffer
+implementation is not written), or fewer picks sent remote.
+
+Caveat: E = 4.13 is inherited from the DSpark acceptance work and has not been
+re-measured on the fixed build (the submit-mask bug invalidated decode numbers
+before 2026-09-14). Verify it before planning against it — at E = 3.0 the required
+base becomes 10 tok/s, which is still under the 14.1 floor but with much less room.
