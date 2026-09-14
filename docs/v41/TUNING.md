@@ -1,5 +1,5 @@
 # Tuning reference — every knob touched or ruled out
-### as of 2026-09-14. Re-apply the host settings after any reboot: `~/apply_lumi_tuning.sh`
+### as of 2026-09-14. Re-apply the host settings after any reboot: `scripts/apply_host_tuning.sh`
 
 ## 1. Host settings — NON-PERSISTENT, both boxes
 
