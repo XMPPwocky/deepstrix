@@ -70,3 +70,52 @@ and prefill are goal clauses, so this must be measured on BOTH before adoption.
 3. Re-run prefill at 32K and 100K on the SAME daemon and compare against
    356/395 tok/s. If prefill regresses more than decode gains in goal terms, try
    220/108 or make the split phase-aware (a code change).
+
+## MEASURED (2026-09-14): a hard prefill constraint caps the fix
+
+Ran the rebalance for real. The optimum the simulation picked **breaks prefill**:
+
+    180/128 -> all four 32K prefill passes return HTTP 500:
+      "expert pager: L0 union needs > 128 slots (window 0, stride 128).
+       Raise V41_PAGER_STRIDE or give box 2 more of this layer."
+
+Box 1's prefill window is `stride` = 128 wide, so box 1 can page at most 128
+experts per encoder layer and **box 2 must own >= 384 - 128 = 256 of every encoder
+layer**. Today's 268 clears it; 180 does not. That constraint was not in any model.
+
+Re-solving inside it, with box 2's measured 12 GB of spare RAM:
+
+    config      slots     GB | miss/tok | decode      prefill@32K
+    268/40       6160  115.8 |    33.3  | 3.24 tok/s  466 tok/s   (baseline)
+    260/68       6560  123.3 |    22.6  | 3.65 tok/s  489 tok/s   <- ADOPTED
+    180/128      6160  115.8 |    17.5  | 4.16 tok/s  HTTP 500    <- illegal
+
+**Adopted 260/68**: decode **3.24 -> 3.65 tok/s (+13%)**, prefill unchanged.
+Prefill medians were [66.1, 66.0, 59.0] before and [62.9, 59.1, 62.9] after — both
+carry a 59 s pass, so read that as NEUTRAL, not a gain.
+
+Two honest caveats on the decode number:
+
+* The model predicted ~5.1 tok/s for the constant-memory rebalance and the illegal
+  180/128 actually delivered 4.16 — the simulation over-predicts by ~35%.
+* Per-miss cost ROSE as the miss count fell: 9.00 -> 11.16 ms (read 7.86 -> 10.04).
+  Fewer, more isolated misses appear to lose read pipelining, which eats part of
+  the gain. Any further residency work should expect this.
+
+**What now caps decoder residency is box 1's `V41_PAGER_STRIDE`, not box 2's RAM.**
+Widening box 1's prefill window would let box 2 own less encoder and more decoder;
+that spends box 1 memory and is the next thing to price.
+
+## Box 2's expert compute is NOT a kernel problem
+
+Per layer request box 2 streams 6 x 18.80 MB = 112.8 MB and takes 651 us p50:
+
+    112.8 MB / 651 us = 173 GB/s
+
+against ~200 GB/s achievable on Strix Halo LPDDR5X — **~87% of achievable**. There
+is no kernel win there; at B=1 decode the expert FFN is pure weight streaming.
+
+The consequence is worth stating, because it cuts against the "wall" framing: a
+token needs 40 x 112.8 MB = **4.5 GB of expert weights**, and two boxes at 173 GB/s
+aggregate to ~346 GB/s = **13 ms/token if everything is resident**. Bandwidth is
+NOT what blocks 30 tok/s. Misses are.
