@@ -2398,11 +2398,21 @@ fn finish_decode(
     // require the generation to come out unchanged. This is DSpark's REJECT path
     // exercised without a drafter — the one piece of speculative decoding that is
     // testable in isolation. Off unless set; it roughly doubles decode time.
+    // Accepts a single K or a comma list ("2,4,6,8"), cycled per token, so one
+    // run sweeps every verify width instead of one server load per B.
     #[cfg(feature = "v41")]
-    let verify_probe_k: usize = std::env::var("V41_VERIFY_PROBE")
+    let verify_probe_ks: Vec<usize> = std::env::var("V41_VERIFY_PROBE")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+        .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    #[cfg(feature = "v41")]
+    let verify_probe_k: usize = if verify_probe_ks.is_empty() { 0 } else { 1 };
+    // `V41_VERIFY_BATCHED=1`: make the probe do ONE batched forward over K tokens
+    // (the real DSpark verify step) instead of K sequential decodes (the reject
+    // path). This is the measurement the whole 30 tok/s projection rests on.
+    #[cfg(feature = "v41")]
+    let verify_probe_batched: bool =
+        matches!(std::env::var("V41_VERIFY_BATCHED").as_deref(), Ok("1") | Ok("on"));
     let heartbeat_interval: u32 = std::env::var("DEEPSTRIX_HEARTBEAT_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -2616,11 +2626,52 @@ fn finish_decode(
         // `forward_one` below they hold the logits the next iteration samples.
         #[cfg(feature = "v41")]
         if verify_probe_k > 0 && completion_tokens > 8 {
+            let verify_probe_k =
+                verify_probe_ks[(completion_tokens as usize) % verify_probe_ks.len()];
             embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, next, &mut residual);
             let mark = state.state.mark_kv();
             let t_probe = std::time::Instant::now();
-            for j in 0..verify_probe_k {
-                forward_one!(state, residual, pos + j as u32, next)?;
+            if verify_probe_batched {
+                // The REAL DSpark verify step: ONE batched forward over K tokens
+                // appended to the live KV, which is what a draft batch costs.
+                // K sequential forwards (the else arm) measure the reject path
+                // instead and are ~K x more expensive by construction.
+                let hcs: Vec<Vec<f32>> = (0..verify_probe_k).map(|_| residual.clone()).collect();
+                let toks: Vec<i32> = vec![next; verify_probe_k];
+                // Engram rows must be gathered and handed to the batched path the
+                // same way `prefill_suffix` does it — `forward_prefill` (non-
+                // pipelined) has no engram parameter, and the batched MoE fails
+                // with "Engram rows not staged" without them.
+                let engram_chunk: Option<Vec<Vec<f32>>> =
+                    match (state.pager.as_ref(), state.engram.as_mut()) {
+                        (Some(pg), Some(ec)) => Some(ec.rows_for_chunk(pg.raw(), &toks, pos)?),
+                        _ => None,
+                    };
+                let _ = state.engine.forward_prefill_pipelined(
+                    &mut state.bd_a,
+                    &mut state.bi_a,
+                    &mut state.bd_b,
+                    &mut state.bi_b,
+                    &mut state.sd,
+                    &mut state.si,
+                    &mut state.dgpu_scratch,
+                    &mut state.state,
+                    &state.weights,
+                    &hcs,
+                    &toks,
+                    pos,
+                    true,
+                    None,
+                    None,
+                    None,
+                    None,
+                    state.pager.as_mut(),
+                    engram_chunk.as_deref(),
+                )?;
+            } else {
+                for j in 0..verify_probe_k {
+                    forward_one!(state, residual, pos + j as u32, next)?;
+                }
             }
             let dt = t_probe.elapsed();
             // A refused rollback means the KV wrapped mid-batch and the mark no
