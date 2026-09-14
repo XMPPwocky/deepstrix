@@ -235,3 +235,49 @@ compulsory share and flattens OPT's capacity curve.
 
 So the capacity diagnosis stands, now on a rigorous counting argument rather than
 a hit rate: **the pool is too small, by a factor the policy cannot make up.**
+
+## CORRECTION 2: the Belady numbers above came from a trace that had not converged
+
+Captured a **1,152-token** expert trace (`expert_trace_v41_long.bin`) to redo the
+bound under real eviction pressure. It converges where the 256-token one did not:
+first-touch falls 36.8 -> 1.58 new/token across the eighths, 10,359 of 15,360 pairs
+touched. Re-running OPT on it changes every conclusion in the previous section.
+
+    @6160 slots        LRU miss/tok    OPT miss/tok    policy headroom
+    per-layer (actual)   17.6 (158 ms)   7.0 (63 ms)      94.7 ms/token
+    global               16.9 (152 ms)   5.7 (52 ms)     100.7 ms/token
+
+    capacity curve (per-layer LRU):  6160 -> 17.6   8000 -> 9.5   12000 -> 4.7
+
+**Three things the short trace got wrong:**
+
+1. **Policy headroom is ~95 ms/token, not 32.** LRU is leaving 2.5x on the table.
+2. **The global pool is NOT the lever** (17.6 -> 16.9 = 6 ms), and it is nowhere
+   near "within 2% of optimal". That claim came entirely from the short trace.
+3. **The capacity curve is STEEP, not flat.** 6160 -> 8000 slots halves misses
+   (158 -> 85 ms/token); 12000 reaches the compulsory floor. The earlier "do not
+   tune the LRU, the curve is flat above 300 slots/layer" is withdrawn.
+
+### But online policies cannot capture it
+
+    per-layer @154 slots/layer      miss/tok   ms/tok   % of OPT gap captured
+    LRU (today)                        17.6     158.1            0%
+    LFU (aged, periodic halving)       16.4     147.7           11%
+    SLRU (80% protected)               16.1     144.8           14%
+    OPT                                 7.0      63.4          100%
+
+Frequency- and recency-hybrid policies recover **11-14%** of the gap. OPT's edge is
+not a better ordering heuristic — it is knowing the future. So replacement policy
+is the wrong axis.
+
+**The lever this points at is LOOKAHEAD/PREFETCH.** A prefetch that guesses wrong
+costs bandwidth, not correctness, which makes it categorically unlike speculative
+decoding: nothing has to be verified or rolled back. The open questions are what
+signal predicts the next token's routing, and whether a prefetch can be issued
+early enough to overlap a 9 ms read with the ~29 ms of per-token compute.
+
+METHOD, third time today: this document has now been wrong in both directions from
+trace length alone — first claiming misses were compulsory (too short to finish
+discovering), then claiming policy headroom was small and the capacity curve flat
+(same cause). Check first-touch/token has decayed before quoting ANY residency
+result.
