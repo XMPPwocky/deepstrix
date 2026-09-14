@@ -1044,8 +1044,9 @@ impl Assignment {
 struct LayerShard {
     base_slot: u32,
     ids: Vec<u32>,
-    /// `REMAP_LEN` entries: owned id -> `-(local_slot)-1`; everything else
-    /// (including the sentinel) -> 0 = "the other device takes it".
+    /// `REMAP_LEN` entries: owned id -> `-(ABSOLUTE_slot)-1`; everything else
+    /// (including the sentinel) -> 0 = "the other device takes it". Absolute
+    /// since 2026-09-14 so a layer can hold a slot outside its own region.
     remap_dev: DeviceBuffer<i32>,
     owned: Vec<bool>,
     /// PAGED MODE (catch-all tier). `None` = the classic pinned shard, whose
@@ -1387,7 +1388,12 @@ impl ExpertShard {
             let mut remap = vec![0i32; REMAP_LEN];
             let mut owned = vec![false; N_EXPERT as usize];
             for (local, &e) in ids.iter().enumerate() {
-                remap[e as usize] = -(local as i32) - 1;
+                // ABSOLUTE slot — `layer_views` hands the kernel the WHOLE pool,
+                // so a local index here would address another layer's expert.
+                // This is uploaded to `remap_dev` immediately and is only
+                // re-uploaded from the pager's copy `if dirty`, so a layer that
+                // never takes a miss would read wrong weights forever.
+                remap[e as usize] = -(base as i32 + local as i32) - 1;
                 owned[e as usize] = true;
             }
             let mut remap_dev = DeviceBuffer::<i32>::new(igpu.id, REMAP_LEN)?;
@@ -1499,9 +1505,16 @@ impl ExpertShard {
                 slot_of.insert(e, slot as u32);
                 lru.push_back(slot as u32);
             }
+            // ABSOLUTE slot, not layer-local. The kernel decodes `e = -remap-1`
+            // and indexes the base pointer it is handed by `e`, so making these
+            // absolute and handing it the WHOLE pool (see `layer_views`) is what
+            // frees a layer to use a slot outside its own region — the
+            // precondition for a global/phase-aware pool. Behaviour is unchanged
+            // until eviction is allowed to cross regions.
+            let base = l.base_slot as i32;
             let mut remap_host = vec![0i32; REMAP_LEN];
             for (slot, &e) in l.ids.iter().enumerate() {
-                remap_host[e as usize] = -(slot as i32) - 1;
+                remap_host[e as usize] = -(base + slot as i32) - 1;
             }
             l.owned.iter_mut().for_each(|o| *o = true);
             l.page = Some(LayerPager {
@@ -1714,7 +1727,7 @@ impl ExpertShard {
             pg.slot_key[victim as usize] = Some(e);
             pg.slot_of.insert(e, victim);
             pg.lru.push_back(victim);
-            pg.remap_host[e as usize] = -(victim as i32) - 1;
+            pg.remap_host[e as usize] = -((base as i32) + victim as i32) - 1;
             dirty = true;
         }
         if dirty {
@@ -1816,13 +1829,18 @@ impl ExpertShard {
             .get(layer as usize)
             .and_then(|l| l.as_ref())
             .ok_or_else(|| eyre!("expert shard: layer {layer} not resident"))?;
-        let n = l.ids.len();
-        let b = l.base_slot as usize;
         let r = &self.routed;
+        // The WHOLE pool, not this layer's slice: `remap_dev` holds ABSOLUTE slot
+        // indices, so the kernel's `e = -remap-1` addresses the full buffer. The
+        // old contiguous `[base_slot, base_slot+n)` slice is exactly what
+        // REMOTE_EXPERTS.md called "the executor contract" blocking a global
+        // pool; it was only ever a host-side convention, and the kernel never
+        // cared where the slot lived.
+        let _ = l;
         Ok((
-            r.gate.buffer.slice_view(b * r.gate_bytes_per_expert, n * r.gate_bytes_per_expert),
-            r.up.buffer.slice_view(b * r.up_bytes_per_expert, n * r.up_bytes_per_expert),
-            r.down.buffer.slice_view(b * r.down_bytes_per_expert, n * r.down_bytes_per_expert),
+            r.gate.buffer.slice_view(0, r.gate.buffer.len()),
+            r.up.buffer.slice_view(0, r.up.buffer.len()),
+            r.down.buffer.slice_view(0, r.down.buffer.len()),
             &l.remap_dev,
         ))
     }
