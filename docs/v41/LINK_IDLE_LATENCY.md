@@ -76,3 +76,56 @@ And note the warm baseline: even with the link hot, a bare ICMP round trip is
 0.492 ms and the bench's warm rtt is 434 us for a 5.9 KB request. That is high
 for a direct USB4 link and sits on the critical path 40 times per token — its own
 lever, independent of idle.
+
+## RESULT: both applied — decode 4.07 -> 4.94 tok/s (+21%)
+
+`thunderbolt0/device/power/control=on` on both boxes AND C3 disabled on every CPU
+of both boxes:
+
+    gap 5000 (the real duty cycle)      rtt        link
+      baseline  auto + C3                994        594
+      + TB runtime PM on                 978        574
+      + C3 disabled                      643        231     -35% rtt, -61% link
+
+    raw ICMP idle:  0.788 ms -> 0.203 ms  (3.9x; now better than the old WARM 0.492)
+
+End to end, 512-token generations, same prompt, n=3 each:
+
+    baseline   4.06, 4.07, 4.09 tok/s   (mean 4.07)
+    both on    4.40, 5.44, 4.99         (mean 4.94)     +21%
+
+**The e2e gain is ~44 ms/token, 3x what the link measurement alone predicted
+(14 ms).** The excess is almost certainly `sel_sync`: the host blocks in a HIP
+stream sync once per layer, 40x per token, 22-23 ms/token total. A CPU that drops
+into C3 while blocked pays the same 350 us exit latency on every wake. The link
+and the host sync are two consumers of one fix.
+
+Caveats, recorded honestly:
+  * The baseline was measured earlier in the session on a slightly older server
+    build (the verify probe was added since, but is off by default). Not a
+    same-binary A/B. The effect is 3x the +/-8% e2e noise floor and has an
+    independent bench measurement behind it, but it is not a paired A/B --
+    C3 cannot be re-enabled without root, so one could not be run.
+  * Variance rose: 4.40-5.44 (24%) against the baseline's 1%.
+
+## Making it persistent
+
+Both are non-persistent and reset on reboot. On both boxes:
+
+    echo on | sudo tee /sys/class/net/thunderbolt0/device/power/control
+    sudo sh -c 'for c in /sys/devices/system/cpu/cpu*/cpuidle/state3/disable; do echo 1 > $c; done'
+
+The tidier form for C-states is a PM QoS request — a process holding
+`/dev/cpu_dma_latency` open with a 0 written to it — which bounds exit latency
+without disabling a state globally. It needs a udev rule here (`crw------- root
+root`), and would ideally be held by `deepstrix-expertd` and the server for their
+lifetime rather than set machine-wide.
+
+## What remains
+
+Link at gap 5000 is still 231 us against 44 us warm, so ~187 us/layer = ~7.5
+ms/token of idle penalty survives both fixes. C2's exit latency is only 18 us, so
+the residual is elsewhere — probably remaining Thunderbolt/PCIe link states.
+
+And the warm baseline is untouched: 44 us of link plus ~380 us of `srv` for a
+5.9 KB round trip, 40 times per token. The idle penalty is now the smaller half.
