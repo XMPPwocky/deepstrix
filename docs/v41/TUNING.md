@@ -65,3 +65,33 @@ Box 2 daemon: `--experts-file box2_placement_260_68.txt --experts-k 268 --paged`
   * **`sel_sync` = 22-23 ms/token** (~570 us/layer) waiting to learn six expert
     ids. Racing the picks to box 2 before `pg.ensure` would let box 2 start its
     reads earlier every layer.
+
+## 6. What box 1's page cache is actually buying (measured 2026-09-14)
+
+Prompted by "we're just leaving all this page cache on the machine for no good
+reason". It is not idle — but what it serves is PREFILL, not decode.
+
+Per-generated-token disk slope (same prompt, gen 64 vs gen 512, warm, from
+`/proc/<pid>/io read_bytes`):
+
+    pool 52 GB   page cache 32 GB   slope  +0.993 MB/token   request: 26 / 471 MB
+    pool 76 GB   page cache  9 GB   slope  -1.180 MB/token   request: 5421 / 4893 MB
+
+**The slope is ~0 either way** — decode itself reads ~1 MB per generated token, so
+the page cache is NOT serving the decode path. Engram's 96 random rows/token are
+absorbed by its own row cache.
+
+**The INTERCEPT is what moves**: ~5 GB of disk per REQUEST at pool 76 against
+0.03-0.5 GB at pool 52. That is prefill's expert paging plus the CED replay
+(~41 GB working set, fixed per request) falling out of a 9 GB cache. So the 32 GB
+of page cache at pool 52 is buying ~5 GB/request of avoided prefill I/O.
+
+At 4.93 GB/s that is ~1 s per request — real, but it does NOT account for the
+20-30 s regression on a 512-token generation, so **the pool-76 slowdown still has
+no confirmed cause**. See `WHY_THE_BIG_POOL_REGRESSED.md`, whose kernel
+attribution was retracted.
+
+Method note: an earlier pass dismissed the page-cache hypothesis using a slope
+measured at pool 52 (32 GB of cache) and applied it to pool 76 (9 GB). That does
+not follow — the hypothesis is *about* the smaller cache. Measure the hypothesis
+in the regime it describes.
