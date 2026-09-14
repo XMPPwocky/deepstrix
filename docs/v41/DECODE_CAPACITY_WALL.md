@@ -90,3 +90,41 @@ reported "global saves 20 ms". That number was cold-start contamination: with
 10000 slots every miss in the trace was a first-ever touch, which should have been
 the tell that the working set had not converged. Always check whether a residency
 trace has reached steady state before quoting a hit rate from it.
+
+## Rebalancing the legs does not help either (same day)
+
+Box 1's expert pool is ~2,969 slots, but the packed prefill windows take 2,944 of
+them, leaving **25 slots for decode**. So the T2 catch-all finds box 1 holding
+nothing and reassigns everything: box 2's page stats increment **6 expert requests
+per network request**, i.e. box 2 computes all 6 picks of every layer while box 1's
+MoE leg does nothing. That looks like the obvious imbalance to fix — the two legs
+run concurrently, so a layer costs max(box1, box2), and one leg is empty.
+
+Simulating it over the trace (box 1 = global LRU of S slots computing everything it
+holds, box 2 = per-layer regions taking the rest, warm quarter, measured constants):
+
+    b1 slots  /layer | b1 picks b2 picks  b2 miss |  b1 leg   b2 leg | max() ms  tok/s
+          25       0 |      0.0    240.0     17.3 |   0.0ms  198.4ms |  198.4ms    4.2  <- today
+        1500      37 |    159.0     81.0     17.3 |  20.3ms  179.8ms |  186.6ms    4.4
+        2969      74 |    191.9     48.1     17.6 |  23.6ms  177.5ms |  189.2ms    4.3
+        6000     150 |    225.3     14.7     10.9 |  26.9ms  106.9ms |  127.6ms    5.9
+
+At 25 slots the model gives 198 ms of MoE + 41 ms of measured other = 239 ms/token
+against **271 ms measured** (4.2 vs 3.7 tok/s) — optimistic but faithful.
+
+**Box 2's miss count barely moves: 17.3/token whether it handles 240 picks or 48.**
+That is the whole result. Handing box 1 more slots moves the HOT picks to box 1 —
+the ones that were going to hit on box 2 anyway — while box 2 keeps the cold tail,
+which is exactly what misses. Taking 80% of box 2's traffic away removes 80% of its
+cheap work and none of its expensive work. Rebalancing is worth 4.2 -> 4.4 tok/s.
+
+The 6000-slot row is the only one that helps, and only because box 1's LRU finally
+gets big enough to absorb part of the tail itself — 6000 slots is ~115 GB, which
+box 1 (96 GB, also holding non-expert weights) does not have. It is the capacity
+result again, wearing a different hat.
+
+**So: do not rebalance the legs, and do not enlarge box 1's decode LRU at the
+expense of the prefill windows.** Neither touches the miss count. This is the
+measured form of the standing intuition that moving picks between boxes does not
+remove work — it is true here for a sharper reason than "the work still happens":
+the work that dominates is the work no policy can place.
