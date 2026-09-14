@@ -162,3 +162,44 @@ thread-local staging that regressed repack 2.7x, so it needs measuring against
 `alloc_ns`/`pread_ns`/`repack_ns` individually, not just tok/s.
 
 **Standing result: 260/68 buffered, decode 3.65 tok/s, prefill neutral.**
+
+## The zero-miss floor, measured (not summed)
+
+The architecture review put the non-speculative floor at "box 1's non-remote
+phases (41 ms) + box 2's non-miss request floor (33 ms) = ~75 ms/token". Those two
+do NOT simply add: per layer decode is `dGPU chain -> submit -> max(box1 iGPU MoE,
+box2) -> combine`, so box 1's iGPU MoE leg overlaps box 2 entirely.
+
+Measured with `DEEPSTRIX_TOKEN_PROFILE=1`, token 426, 260/68 placement:
+
+    total_us            332,617
+    remote_rtt_us       278,543   (83.7%, EXPOSED wait on box 2)
+    box 1 non-waiting    54,074   (= total - rtt)
+      igpu.routed_moe    18,185   <- overlaps box 2
+      => serial          35,889
+        sel_sync_us      22,938   <- 64% of box 1's serial time
+        engram_us         ~7,000
+        gap/post/pre      ~4,000
+
+Box 2's zero-miss leg is 40 x (queue 3 + h2d 51 + gpu 651 + d2h 17 + ~150 wire)
+= ~35 ms. So:
+
+    naive sum (review's method)  54.1 + 35 = 89 ms -> 11.2 tok/s
+    with the overlap correction  35.9 + max(18.2, 35) = 71 ms -> 14.1 tok/s
+
+**The overlap objection is correct and worth ~18 ms (20%)** — but it does not
+change the verdict, because box 1's overlappable leg (18 ms) is SMALLER than box
+2's (35 ms), so overlapping can only hide the smaller of the two. The review's
+75 ms was approximately right despite an unsound derivation.
+
+**`sel_sync` at 22.9 ms is the largest single serial item** — 64% of everything
+box 1 does outside the box-2 wait, and ~7x the Engram gather that got optimised
+earlier. If it is removable the floor falls to ~48 ms = 21 tok/s, which
+independently matches the review's "~43-46 ms after chain optimisations". What it
+is actually waiting on is NOT yet established; treat 21 tok/s as a hypothesis.
+
+Even at that hypothetical floor, **30 tok/s (33 ms/token) is not reachable
+non-speculatively on this hardware**: box 2's 35 ms zero-miss leg alone exceeds
+the entire 33 ms budget. The only ways past it are shrinking that leg (fewer picks
+to box 2, or a faster expert FFN — but that kernel is already at ~87% of
+achievable bandwidth) or amortising it across accepted tokens (DSpark).
