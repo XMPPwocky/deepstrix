@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::FileExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -89,6 +90,9 @@ impl StTensor {
 pub struct SafetensorsDir {
     dir: PathBuf,
     files: Vec<File>,
+    /// Second handle per shard opened `O_DIRECT`, for [`Self::read_range_into_direct`].
+    /// `None` where the filesystem refused the flag. See that method for why.
+    direct_files: Vec<Option<File>>,
     shard_names: Vec<String>,
     tensors: HashMap<String, StTensor>,
 }
@@ -125,6 +129,7 @@ impl SafetensorsDir {
         };
 
         let mut files = Vec::with_capacity(shard_names.len());
+        let mut direct_files: Vec<Option<File>> = Vec::with_capacity(shard_names.len());
         let mut tensors = HashMap::new();
         for (shard, sname) in shard_names.iter().enumerate() {
             let path = dir.join(sname);
@@ -190,9 +195,16 @@ impl SafetensorsDir {
                     return Err(eyre!("{}: duplicated across shards", ctx()));
                 }
             }
+            direct_files.push(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&path)
+                    .ok(),
+            );
             files.push(f);
         }
-        Ok(Self { dir, files, shard_names, tensors })
+        Ok(Self { dir, files, direct_files, shard_names, tensors })
     }
 
     pub fn dir(&self) -> &Path {
@@ -282,6 +294,100 @@ impl SafetensorsDir {
         file.read_exact_at(dst, t.offset + byte_off)
             .wrap_err_with(|| format!("pread {} bytes at {} in {} for {}", dst.len(), t.offset + byte_off, self.shard_names[t.shard], t.name))?;
         Ok(())
+    }
+
+    /// `read_range_into_cached` through an `O_DIRECT` handle.
+    ///
+    /// WHY. The buffered path was chosen so the pager's LRU refills could hit the
+    /// page cache (see the note in `hf_v41::read_expert_raw`). That reasoning does
+    /// not survive box 2's memory pressure: the expert file is 101 GB and the box
+    /// has ~5 GB of page cache, so under 5% of it can ever be cached, and the
+    /// copy through the cache costs more than the hits save. Measured on box 2,
+    /// 18.80 MB (one expert) at random offsets, daemon idle:
+    ///
+    ///     O_DIRECT   median  4.70 ms = 4.00 GB/s
+    ///     buffered   median 12.55 ms = 1.50 GB/s
+    ///
+    /// 4.00 GB/s single-threaded also matches this drive's 32-thread buffered
+    /// depth figure (4.31), so one direct pread replaces the threaded split.
+    ///
+    /// `O_DIRECT` requires the file offset, the length AND the buffer address to
+    /// be block-aligned, so this reads an outward-rounded extent into an aligned
+    /// bounce buffer and copies the requested subrange out. The extra copy is
+    /// ~0.6 ms for 6 MB against ~8 ms saved.
+    ///
+    /// Returns `Ok(false)` if this shard has no direct handle (filesystem refused
+    /// the flag), so callers can fall back rather than fail.
+    pub fn read_range_into_direct(
+        &self,
+        t: &StTensor,
+        byte_off: u64,
+        dst: &mut [u8],
+    ) -> eyre::Result<bool> {
+        const A: u64 = 4096;
+        let end = byte_off
+            .checked_add(dst.len() as u64)
+            .ok_or_else(|| eyre!("{}: range overflow", t.name))?;
+        if end > t.len {
+            return Err(eyre!("{}: range [{byte_off},{end}) exceeds tensor length {}", t.name, t.len));
+        }
+        let Some(Some(file)) = self.direct_files.get(t.shard) else {
+            return Ok(false);
+        };
+        if dst.is_empty() {
+            return Ok(true);
+        }
+        let abs = t.offset + byte_off;
+        let lo = abs & !(A - 1);
+        let hi = (abs + dst.len() as u64 + A - 1) & !(A - 1);
+        let span = (hi - lo) as usize;
+
+        // Aligned bounce buffer; freed on drop even if the pread fails.
+        struct Aligned(*mut u8, std::alloc::Layout);
+        impl Drop for Aligned {
+            fn drop(&mut self) {
+                // SAFETY: allocated with this exact layout in the constructor below.
+                unsafe { std::alloc::dealloc(self.0, self.1) }
+            }
+        }
+        let layout = std::alloc::Layout::from_size_align(span, A as usize)
+            .map_err(|e| eyre!("{}: bad direct layout: {e}", t.name))?;
+        // SAFETY: non-zero size (dst non-empty => span >= A), valid layout.
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
+            return Err(eyre!("{}: direct bounce alloc of {span} failed", t.name));
+        }
+        let guard = Aligned(ptr, layout);
+        // SAFETY: `ptr` owns `span` bytes for the lifetime of `guard`.
+        let buf = unsafe { std::slice::from_raw_parts_mut(guard.0, span) };
+
+        // The extent is rounded UP to a block boundary, which can run past EOF on
+        // the last tensor of a shard; the kernel then returns a short read. That is
+        // fine as long as the bytes the caller asked for arrived, so read until the
+        // requested subrange is covered and treat Ok(0) as EOF rather than failure.
+        let head = (abs - lo) as usize;
+        let need = head + dst.len();
+        let mut got = 0usize;
+        while got < need {
+            let n = file.read_at(&mut buf[got..], lo + got as u64).wrap_err_with(|| {
+                format!(
+                    "O_DIRECT pread at {} in {} for {}",
+                    lo + got as u64,
+                    self.shard_names[t.shard],
+                    t.name
+                )
+            })?;
+            if n == 0 {
+                return Err(eyre!(
+                    "{}: O_DIRECT short read at {}: got {got} of {need} (span {span})",
+                    t.name,
+                    lo + got as u64
+                ));
+            }
+            got += n;
+        }
+        dst.copy_from_slice(&buf[head..head + dst.len()]);
+        Ok(true)
     }
 
     /// Same as [`Self::read_range_into_cached`] but splits the range across

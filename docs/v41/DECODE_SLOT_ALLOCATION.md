@@ -119,3 +119,46 @@ The consequence is worth stating, because it cuts against the "wall" framing: a
 token needs 40 x 112.8 MB = **4.5 GB of expert weights**, and two boxes at 173 GB/s
 aggregate to ~346 GB/s = **13 ms/token if everything is resident**. Bandwidth is
 NOT what blocks 30 tok/s. Misses are.
+
+## P2 (O_DIRECT expert reads): faster reads, SLOWER decode — not adopted
+
+The premise checks out. Measured on box 2 directly, 18.80 MB (one expert) at
+random offsets, daemon idle, `pread` in a loop:
+
+    O_DIRECT   median  4.70 ms = 4.00 GB/s
+    buffered   median 12.55 ms = 1.50 GB/s
+
+4.00 GB/s single-threaded matches this drive's documented 32-thread buffered depth
+figure (4.31), so one direct read should replace the threaded split. The buffered
+path was chosen so LRU refills could hit the page cache, and that rationale really
+has expired: 101 GB of experts against ~5 GB of page cache is under 5% cacheable.
+
+Implemented as `SafetensorsDir::read_range_into_direct` behind
+`V41_EXPERT_ODIRECT=1` (default OFF), wired into both expert read paths.
+`O_DIRECT` needs offset, length and buffer address block-aligned, so it reads an
+outward-rounded extent into an aligned bounce buffer and copies the subrange out.
+(First attempt failed on `layers.0.ffn.experts.99.w3.weight`: rounding the extent
+up runs past EOF on a shard's last tensor and the kernel short-reads. Fixed by
+reading until the requested subrange is covered and treating `Ok(0)` as EOF.)
+
+**Result: reads got faster and decode got slower.**
+
+    260/68 buffered   read 10.04 ms/miss   decode 3.65 tok/s
+    260/68 O_DIRECT   read  8.38 ms/miss   decode 3.13 tok/s   (-16%)
+
+Per-miss read improved by 1.7 ms exactly as predicted, and end-to-end decode
+regressed 16% anyway. **Not adopted** — the gate stays default-off.
+
+The most likely cause is the implementation, not the idea: every miss allocates a
+fresh ~6 MB page-aligned bounce buffer (three per expert, one per role), which
+means an mmap plus ~1,500 first-touch page faults plus a 6 MB copy that the
+buffered path does not pay. `hf_v41.rs` already carries a warning that this
+function is codegen-fragile and that allocation behaviour around it has twice cost
+more than the I/O it was meant to save.
+
+A pooled per-thread aligned bounce buffer would test that explanation and is the
+obvious next step — but note the same file records a previous attempt at
+thread-local staging that regressed repack 2.7x, so it needs measuring against
+`alloc_ns`/`pread_ns`/`repack_ns` individually, not just tok/s.
+
+**Standing result: 260/68 buffered, decode 3.65 tok/s, prefill neutral.**

@@ -148,6 +148,23 @@ fn reversed(shape: &[u64]) -> Vec<u64> {
 /// NOTE: `decode_pread_gbps` is meaningless above 1 thread — it divides bytes
 /// by the SUM of per-thread time, so it FALLS as parallelism improves the wall
 /// clock. Judge this knob by `ms_per_miss` and tok/s only.
+/// `V41_EXPERT_ODIRECT=1`: read expert weights through an `O_DIRECT` handle.
+///
+/// The buffered path exists so the pager's LRU refills can hit the page cache.
+/// On box 2 that is a losing trade: 101 GB of experts against ~5 GB of page
+/// cache (<5% cacheable), and the copy through the cache costs more than the
+/// hits save. Measured there, 18.80 MB at random offsets, daemon idle:
+/// O_DIRECT 4.70 ms (4.00 GB/s) vs buffered 12.55 ms (1.50 GB/s).
+///
+/// Default OFF: a box whose page cache CAN hold a useful slice of the expert
+/// set still wants the buffered path.
+pub fn expert_odirect() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_EXPERT_ODIRECT").as_deref() == Ok("1")
+    });
+    *B
+}
+
 pub fn expert_pread_threads() -> usize {
     static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         std::env::var("V41_EXPERT_PREAD_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
@@ -663,7 +680,9 @@ impl V41HfWeights {
         let (dp, ds) = dst.split_at_mut(out * nb * 16);
         // Same CACHED reads as the ggml path: the LRU re-reads evicted experts,
         // and POSIX_FADV_DONTNEED would force every refill back to the SSD.
-        self.st.read_range_into_cached_par(wt, 0, dp, expert_pread_threads())?;
+        if !(expert_odirect() && self.st.read_range_into_direct(wt, 0, dp)?) {
+            self.st.read_range_into_cached_par(wt, 0, dp, expert_pread_threads())?;
+        }
         self.st.read_range_into_cached(sc, 0, ds)?;
         EXPERT_READ_PROF.pread_ns.fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
         EXPERT_READ_PROF.pread_bytes.fetch_add(wt.len + sc.len, Relaxed);
@@ -713,7 +732,9 @@ impl V41HfWeights {
         let t_pread = std::time::Instant::now();
         EXPERT_READ_PROF.alloc_ns.fetch_add(
             t_pread.duration_since(t_alloc).as_nanos() as u64, Relaxed);
-        self.st.read_range_into_cached_par(wt, 0, &mut packed, expert_pread_threads())?;
+        if !(expert_odirect() && self.st.read_range_into_direct(wt, 0, &mut packed)?) {
+            self.st.read_range_into_cached_par(wt, 0, &mut packed, expert_pread_threads())?;
+        }
         self.st.read_range_into_cached(sc, 0, &mut scale)?;
         let t_repack = std::time::Instant::now();
         EXPERT_READ_PROF.pread_ns.fetch_add(
