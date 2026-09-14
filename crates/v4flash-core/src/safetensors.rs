@@ -390,6 +390,50 @@ impl SafetensorsDir {
         Ok(true)
     }
 
+    /// Tell the kernel this tensor's byte range is read RANDOMLY, so it stops
+    /// issuing readahead for it.
+    ///
+    /// **MEASURED INERT on the Engram table (2026-09-14) — do not retry there.**
+    /// A/B on novel (uncacheable) text, `ENGRAM_FADV_RANDOM` on vs off:
+    /// 287.45 vs 301.55 MB of disk per generated token. No effect.
+    ///
+    /// I reached for this after measuring "41.65 MB/token" of process disk reads
+    /// and attributing it to Engram's 96 tiny random rows/token. That attribution
+    /// was WRONG: it was whole-request I/O divided by generated tokens, and it is
+    /// dominated by a FIXED per-request cost (prefill expert paging plus the CED
+    /// replay, documented at ~41 GB/request). Isolating the slope — same prompt,
+    /// 64 vs 512 generated tokens on a warm server — gives 7292.6 MB and 1063.7 MB
+    /// respectively: 8x the tokens, 7x LESS disk. The per-generated-token slope is
+    /// ~zero, i.e. **Engram does almost no disk I/O in steady-state decode.** Its
+    /// row cache plus the page cache absorb it, which is exactly what
+    /// `engram_table.rs` intends by not fadvise-dropping rows. Engram being
+    /// SSD-backed is the design working, not a cost to remove.
+    ///
+    /// The helper is kept because it is correct and per-range (so a sequential
+    /// reader of the same shard keeps its readahead), and because the negative
+    /// result is worth not repeating. `FADV_RANDOM` only disables readahead; it
+    /// does not drop cached pages.
+    pub fn advise_random(&self, t: &StTensor) -> eyre::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let Some(file) = self.files.get(t.shard) else {
+            return Err(eyre!("{}: shard {} out of range", t.name, t.shard));
+        };
+        // SAFETY: `file` is an open fd owned by self; offset/len are in range by
+        // construction. posix_fadvise is advisory and cannot corrupt data.
+        let rc = unsafe {
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                t.offset as libc::off_t,
+                t.len as libc::off_t,
+                libc::POSIX_FADV_RANDOM,
+            )
+        };
+        if rc != 0 {
+            return Err(eyre!("{}: posix_fadvise(RANDOM) failed: {rc}", t.name));
+        }
+        Ok(())
+    }
+
     /// O_DIRECT read with **no bounce buffer**: the bytes land straight in
     /// `dst`, and the caller is told where in `dst` they start.
     ///
