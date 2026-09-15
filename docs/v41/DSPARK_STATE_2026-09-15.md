@@ -159,3 +159,26 @@ two box-2 races) is fixed and proven.
 Diagnostics left in tree, default-off: `V41_B2_DECODE_DOWN=1` (per-token decode
 down over batched gate/up), `V41_DSPARK_XCHECK=1` + `mean_kld_nats`,
 `V41_DUMP_FIRST_LOGITS`.
+
+## Kernel-diff status: same block granularity, residual is subtler (2026-09-15)
+
+Read the kwide gate/up in full: `mxfp4_unpack16` extracts the E8M0 block scale
+`gds` per unpack and applies it per-block (`sumi_g * (yd*gds)`), using the same
+`s_lut` and `yd` as decode's `dot_super_half_mxfp4`. So the 0.276 is NOT
+block-scale granularity. Remaining candidates, all subtle: float accumulation
+(decode) vs int32 dp4a-then-scale (kwide) ordering across the 256-block; a
+rounding difference in `mxfp4_unpack16`'s LUT path; or the `half` gate/up pairing.
+
+DEFINITIVE next experiment (standalone, no server): dump both gate/up `mid`
+outputs for one expert on identical `(xq, weights)` — decode via
+`mxfp4_pair_row`, batched via the kwide inner loop — and diff element-wise. That
+pinpoints the exact diverging operation, which the source read alone could not.
+Then fix the kwide op and re-run `V41_DSPARK_XCHECK` (expect KLD -> ~0), giving a
+fast+faithful verify and ~20 tok/s at E≈3.
+
+Oracle validation note (2026-09-15): a fresh KL(oracle||engine) attempt gave 21.7
+nats — an ORACLE-HARNESS artifact, not an engine error (the oracle mis-processes
+chat special tokens; engine argmax "We" is correct, oracle argmax " (" is not).
+"Which chain is closer to the oracle" therefore rests on existing layer-parity
+validation: decode ~ oracle (M1-M6 PASS); kwide is the lossy prefill kernel. Fix
+kwide toward the float-LUT path.
