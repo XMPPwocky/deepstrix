@@ -1273,9 +1273,37 @@ pub fn remote_batched_multi() -> bool {
 ///
 /// The code is kept because `read_range_into_direct_padded` is strictly better
 /// than the bouncing reader and the measurement is worth preserving.
+/// Zero-copy O_DIRECT expert page-ins on box 2. DEFAULT ON since 2026-09-15;
+/// `V41_B2_ODIRECT=0` reverts to the buffered path.
+///
+/// O_DIRECT was rejected TWICE before, and correctly: that was
+/// `read_range_into_direct`, which allocates an aligned bounce of the whole
+/// extent and memcpys out of it — an 18.8 MB alloc plus an 18.8 MB copy per
+/// miss, which cost more than the drive saved. `read_range_into_direct_padded`
+/// removes both by exploiting the fact that O_DIRECT only needs the offset, the
+/// address and the length to SHARE an alignment, not to be aligned to zero.
+///
+/// Why it wins here: box 2's expert file is 101 GB and the box has ~5 GB of page
+/// cache (123 GB of it is the expert pool), so under 5% can ever be cached and
+/// the copy through the cache costs more than the hits save.
+///
+/// MEASURED on box 2's own page stats, which are a PER-MISS cost and therefore
+/// immune to the LRU-warming confound that dominates end-to-end decode A/Bs:
+///
+///     buffered   ms_per_miss 8.04   (read 7.70  h2d 0.34  repack_gpu 0.32)
+///     O_DIRECT   ms_per_miss 7.00   (read 6.06  h2d 0.16  repack_gpu 0.13)
+///                             6.22 when comparatively idle
+///
+/// 13% per miss under load, ~23% idle. At the measured ~20 misses/token that is
+/// ~20-36 ms/token. The end-to-end decode delta is BELOW this cluster's
+/// measurement resolution (box 2's hit rate drifts more than that between
+/// runs), so this is shipped on the mechanism counter, not on a tok/s number.
+///
+/// Degrades safely: requires GPU repack AND 4096-aligned pinned staging, and
+/// falls back to the buffered path when the filesystem refuses the flag.
 pub fn b2_odirect() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        matches!(std::env::var("V41_B2_ODIRECT").as_deref(), Ok("1") | Ok("on"))
+        std::env::var("V41_B2_ODIRECT").map(|v| v != "0").unwrap_or(true)
     });
     *B
 }
