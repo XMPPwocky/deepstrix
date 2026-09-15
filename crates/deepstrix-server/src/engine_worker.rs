@@ -2563,6 +2563,19 @@ fn finish_decode(
         }
     };
     let mut rng = SamplerRng::new(req.seed);
+    // `V41_DUMP_FIRST_LOGITS=<path>`: dump the decode logits for the first token
+    // after the prompt (the oracle's `logits_last` reference point) so KL(oracle
+    // || engine-decode) can be computed. One-shot correctness probe.
+    if let Ok(path) = std::env::var("V41_DUMP_FIRST_LOGITS") {
+        let nv = v4flash_kernels::config::N_VOCAB as usize;
+        if state.dgpu_scratch.logits.len() >= nv {
+            let mut dl = vec![0.0f32; nv];
+            state.dgpu_scratch.logits.slice_view(0, nv).copy_to_host(&mut dl)?;
+            let bytes: Vec<u8> = dl.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(&path, &bytes).ok();
+            tracing::info!(path = %path, nv, "dumped first-token decode logits");
+        }
+    }
     let t_sample = std::time::Instant::now();
     let mut next = state
         .engine
