@@ -88,3 +88,35 @@ So the oracle run is not just validation — it decides which kernel to change.
 argmax is saved); run it teacher-forced on a fixed prompt, dump the engine's
 decode AND batched verify logits at the same positions, compute both KLs. Slow
 (CPU, lazy streaming) but one-time and decisive.
+
+## Narrowing the 0.276-nat batched-chain divergence (2026-09-15, cont.)
+
+Compared the two box-2 MoE chains kernel by kernel:
+
+- **Gate/up is IDENTICAL.** Decode uses `mxfp4_pair_matvec_fused_swiglu_batch_hetsplit`
+  (via the shared `mxfp4_pair_row`), batched uses
+  `mxfp4_pair_matvec_fused_swiglu_kwide`. Both finalize with exactly:
+      if clamp: g_sum clamped upper; u_sum clamped both sides
+      sig = 1/(1+expf(-g_sum));  mid = g_sum * sig * u_sum * ew
+  Same clamp asymmetry, same sigmoid, same ew multiply point. So gate/up is not
+  the divergence (only matvec accumulation order differs, ~1e-5).
+- **Q8_K(mid) is identical.** Blocks are over N_FF_EXP within a (token,expert)
+  row in both layouts, so the per-block scales match.
+
+Therefore the 0.276 nats is in the DOWN path: decode's
+`mxfp4_matvec_par_batched_hetsplit` (fused down + per-expert hetsplit reduce)
+vs batched's `mxfp4_matvec_par_by_expert_kwide2` (per-expert partials) +
+`reduce_partials_hetsplit`. Either a real numerical difference in the by-expert
+down kernel, or a batch-membership/state issue (a buffer other than `partials`
+— d_mid_cat non-member slots, work_items, or expert_members — carrying stale or
+mis-indexed data at B>1). f32 reduce-order alone is ~1e-5, not 0.276, so a
+structural cause is likely.
+
+Next concrete step: force the batched verify to run the DECODE down kernel while
+keeping the batched gate/up, and see if KLD drops to ~0. That isolates
+down-numerics from batch-state. Then either fix the by-expert down or route the
+verify's down through the decode kernel.
+
+Prefill-side validation (per the user): the verify never runs the decoder, so
+logits aren't comparable there — use activation RMSE at the last ENCODER layer
+against the oracle's `layer_19_residual.pt` instead.
