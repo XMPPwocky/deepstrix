@@ -140,3 +140,42 @@ falsified alternative behind it, not a preference.
    `mtp_batched_kernels_b5.rs` does for the other batched kernels. That test
    already exists as a template and found a real kernel bug once.
 2. Only then revisit expert placement or paging for the verify.
+
+## CORRECTION: the verify divergence is NOT what caps acceptance
+
+I claimed the verify's disagreement with decode capped DSpark's acceptance at
+2.878 against the oracle's 4.38, and that "the drafter was never the limit".
+**That was wrong**, and building the faithful verify is what disproved it.
+
+`V41_VERIFY_DECODE_PATH=1` runs the verify through decode's own per-layer
+function, layer-major over the B rows — numerically what decode computes, by
+construction. If the divergence were the cap, acceptance should have risen
+toward 4.38. It did not:
+
+| verify | E[tokens/step] |
+|---|---|
+| batched prefill driver (diverges from decode) | **2.878** |
+| decode's own per-layer function, layer-major | 2.282 / 1.913 / 2.068 |
+| same, under `V41_T2_CATCHALL=2` | 1.294 / 1.692 / 1.692 |
+
+The faithful verify is not better. And SHADOW mode already had the answer:
+scoring the drafter against decode's ACTUAL output on this content gives
+per-depth `[0.744, 0.492, 0.360, 0.256, 0.152]`, mean accepted 1.258,
+**E ~ 2.26**. Both verifies bracket that. The drafter's own accuracy — no
+prefill window seeding, on this content — explains E ~ 2.3 directly, with no
+appeal to verify fidelity.
+
+**So the divergence (cos 0.75-0.79, argmax agreement 0.49-0.61) is real but
+costs throughput almost nothing.** It costs OUTPUT FIDELITY: the tokens a
+speculative run emits are not the tokens non-speculative decode would emit, so
+byte-identical validation is still impossible. That is a correctness problem,
+not the performance problem, and I conflated the two.
+
+What actually caps DSpark here, in order:
+1. **Acceptance ~2.3-2.9**, set by the drafter without seeding on non-agentic
+   content. The oracle's 4.382 is agentic text WITH window seeding; its
+   no-seed number is 3.281 and its prose number is 1.99.
+2. **Verify cost**: ~950 ms batched (94% box-1 expert misses), or B x decode
+   for the faithful path.
+
+Both must improve together. Neither is the "one blocker" I described.
