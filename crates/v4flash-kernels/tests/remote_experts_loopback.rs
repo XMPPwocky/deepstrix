@@ -363,6 +363,7 @@ fn remote_experts_loopback() -> eyre::Result<()> {
     assert_eq!(info.owned_ids(LAYER_A), (0..N_SUB as u32).collect::<Vec<_>>());
     assert_eq!(info.owned_ids(LAYER_B), (0..N_SUB as u32).collect::<Vec<_>>());
     assert!(!info.owns(LAYER_A, N_SUB as u32) && !info.owns(0, 0));
+
     let mut rng = Rng(0x1234_5678_9abc_def1);
     let pool: Vec<u32> = (0..N_SUB as u32).collect();
 
@@ -378,6 +379,33 @@ fn remote_experts_loopback() -> eyre::Result<()> {
         xqv.copy_to_host(&mut out)?;
         Ok(out)
     };
+
+    // 0. THE DECISIVE ISOLATION (run first, before the strict bit-identity asserts): decode chain vs batched chain, same expert
+    //     weights and same inputs, computed by the two REFERENCE paths (no
+    //     client, no server). If these diverge, box 2's kernels are the source
+    //     of the verify's batched-vs-decode KLD; if they match, the divergence
+    //     is server-level (membership/remap/catch-all), not the kernels.
+    for &b in &[1usize, 6] {
+        let xq = quant(&mut rx, b, &mut rng)?;
+        let (sel, ew) = make_picks(&mut rng, b, 3, &pool);
+        let dec = rx.decode_partial(&ref_a, b, &xq, &sel, &ew)?;
+        let bat = rx.batched_partial(&ref_a, b, &xq, &sel, &ew)?;
+        let scale = dec.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-9);
+        let mut max_abs = 0f32;
+        let mut sse = 0f64;
+        for i in 0..dec.len() {
+            let d = (dec[i] - bat[i]).abs();
+            max_abs = max_abs.max(d);
+            sse += (d as f64) * (d as f64);
+        }
+        let rmse = (sse / dec.len() as f64).sqrt();
+        eprintln!(
+            "CHAIN-DIFF L{LAYER_A} B={b}: decode vs batched  max|diff|={max_abs:.4e}  \
+             max|ref|={scale:.4e}  rel={:.3e}  rmse={rmse:.4e}",
+            max_abs / scale
+        );
+    }
+
 
     // 1. Decode path (B = 1 and 4), both layers, k = 1..=6 remote picks.
     for (layer, r) in [(LAYER_A, &ref_a), (LAYER_B, &ref_b)] {
