@@ -2901,6 +2901,7 @@ fn finish_decode(
                 };
             let mark = state.state.mark_kv();
             let t_step = std::time::Instant::now();
+            let spc0 = state.pager.as_ref().map(|p| p.counters()).unwrap_or_default();
             let mut decode_path_logits: Option<Vec<f32>> = None;
             // `V41_VERIFY_DECODE_PATH=1`: run the verify through DECODE's own
             // per-layer function, layer-major over the B rows, instead of the
@@ -3001,12 +3002,19 @@ fn finish_decode(
                 decode_path_logits = Some(out);
             }
             state.bd_a.mtp_capture_rows = k;
-            let logits_batched = state.engine.forward_prefill_pipelined(
+            // Only when the decode-path verify did not already produce them:
+            // running both would ingest B tokens TWICE and the partial rollback
+            // would then keep a doubly-ingested cache.
+            let logits_batched = if decode_path_logits.is_some() {
+                Vec::new()
+            } else {
+                state.engine.forward_prefill_pipelined(
                 &mut state.bd_a, &mut state.bi_a, &mut state.bd_b, &mut state.bi_b,
                 &mut state.sd, &mut state.si, &mut state.dgpu_scratch, &mut state.state,
                 &state.weights, &hcs, &toks, pos, false, None, None, None, None,
-                state.pager.as_mut(), engram_chunk.as_deref(),
-            )?;
+                    state.pager.as_mut(), engram_chunk.as_deref(),
+                )?
+            };
             state.bd_a.mtp_capture_rows = 0;
             let logits = decode_path_logits.take().unwrap_or(logits_batched);
             let t_fwd = t_step.elapsed();
@@ -3086,8 +3094,16 @@ fn finish_decode(
             )?;
             m.pending = Some(d2);
             if std::env::var("V41_DSPARK_STEP_TIMING").as_deref() == Ok("1") {
+                let d = state
+                    .pager
+                    .as_ref()
+                    .map(|p| p.counters() - spc0)
+                    .unwrap_or_default();
                 tracing::info!(
                     n,
+                    prefill_misses = d.prefill_misses,
+                    decode_misses = d.decode_misses,
+                    read_ms = (d.prefill_read_ns + d.decode_read_ns) / 1_000_000,
                     fwd_ms = format!("{:.1}", t_fwd.as_secs_f64() * 1e3),
                     argmax_ms = format!("{:.1}", (t_argmax - t_fwd).as_secs_f64() * 1e3),
                     roll_ms = format!("{:.1}", (t_roll - t_argmax).as_secs_f64() * 1e3),
