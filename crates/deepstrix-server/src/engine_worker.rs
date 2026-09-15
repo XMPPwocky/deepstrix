@@ -2573,7 +2573,14 @@ fn finish_decode(
             state.dgpu_scratch.logits.slice_view(0, nv).copy_to_host(&mut dl)?;
             let bytes: Vec<u8> = dl.iter().flat_map(|v| v.to_le_bytes()).collect();
             std::fs::write(&path, &bytes).ok();
-            tracing::info!(path = %path, nv, "dumped first-token decode logits");
+            // Also dump the exact input token ids, so the oracle can be run with
+            // `--prompt-ids` on the identical (chat-templated) sequence and
+            // KL(oracle || engine) computed at the same position.
+            if let Some(live) = state.live.as_ref() {
+                let ids: Vec<String> = live.tokens.iter().map(|t| t.to_string()).collect();
+                std::fs::write(format!("{path}.ids"), ids.join(",")).ok();
+            }
+            tracing::info!(path = %path, nv, "dumped first-token decode logits + input ids");
         }
     }
     let t_sample = std::time::Instant::now();
