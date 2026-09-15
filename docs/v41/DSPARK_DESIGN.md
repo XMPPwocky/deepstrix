@@ -4,7 +4,17 @@
 ## What is actually in the checkpoint
 
 `mtp.0`, `mtp.1`, `mtp.2` — **2.65 / 2.57 / 2.71 GB, 7.93 GB total**, so the whole
-drafter is RESIDENT with no paging. Each stage is structurally ONE transformer
+drafter is RESIDENT with no paging.
+
+**They are a 3-LAYER draft MODEL, not three independent drafters** — corrected
+after the loader test caught it. Only the entry layer has `main_proj`/`main_norm`
+and only the exit layer has the final norm and heads:
+
+    mtp.0   main_proj + main_norm -> layer                    (entry)
+    mtp.1   layer                                             (middle)
+    mtp.2   layer -> norm -> confidence_head + markov_head     (exit)
+
+Run autoregressively to emit K draft tokens. Each layer is otherwise a standard
 layer, and every tensor maps onto a kernel the engine already runs:
 
     main_proj.weight      F8_E4M3  (5120, 15360)   <- 3 x 5120 residuals -> 5120
@@ -22,10 +32,13 @@ layer, and every tensor maps onto a kernel the engine already runs:
     ffn.shared_experts    F8_E4M3  w1/w2/w3
     hc_attn_base/fn/scale F32      (24,)/(24,20480)/(3,)   <- mHC
     hc_ffn_base/fn/scale  F32      same
-    confidence_head.proj  BF16     (1, 5376)
+    confidence_head.proj  BF16     (1, 5376)      <- exit layer only
+    markov_head.embed/.head                        <- exit layer only, 256-dim hidden
+    norm.weight           BF16     (5120,)        <- exit layer only
 
-There are NO shared interface tensors outside the stages: each stage carries its
-own `main_proj` and `main_norm`.
+VERIFIED by `crates/v4flash-core/tests/mtp_weights_present.rs`: all three layers
+present with the right geometry, the router 128-wide, and `ffn_norm` means
+**0.1571 / 0.2005 / 0.2405** — the trained gains, not RMSNorm's init of 1.0.
 
 ## The draft step
 
@@ -34,17 +47,17 @@ own `main_proj` and `main_norm`.
     h = layer_forward(h)      // attn_norm -> MLA -> mHC -> ffn_norm -> MoE -> mHC
     logits = tied_head(h)
 
-Three stages give **three draft tokens**, so the verify batch is **B=4**. That is
-exactly the width the checkpoint is built for, and `dspark_accept.py` measures
-**E = 3.57 accepted tokens per verify at K=3** (1.93 / 2.77 / 3.57 / 4.94 at
-K = 1/2/3/5).
+The drafter is run AUTOREGRESSIVELY for K steps, so K is a free parameter rather
+than fixed at 3 by the stage count. `dspark_accept.py` measures
+**E = 1.93 / 2.77 / 3.57 / 4.94 at K = 1/2/3/5**, and the box-2 cost model puts
+the balanced verify width at B=5 (K=4), where the two legs match within 5%.
 
 ## Build order
 
-  * **L. Loader** — `mtp.{0,1,2}.*` into resident device buffers. Mirrors the
-    per-layer loader; the expert tensors are the same MXFP4 layout the shard
-    already reads, just 128 of them. Testable in isolation by shape assertion
-    against `config` constants.
+  * **L. Loader — DONE.** `mtp.{0,1,2}.*` presented through `V41HfWeights` under
+    `mtp.{s}.*` names. The expert `Kind` was generalised from a layer index to a
+    name prefix + count, so the drafter's 128 experts reuse the same MXFP4 read
+    path as the main model's 384. Gate 1 passes.
   * **F. Forward** — `forward_mtp_stage(stage, x15360, pos) -> logits`, composed
     entirely of existing kernels. Testable against `scripts/v41_oracle`'s
     reference for a fixed input.

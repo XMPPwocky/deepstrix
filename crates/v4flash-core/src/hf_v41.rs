@@ -44,7 +44,10 @@ enum Cast {
 enum Kind {
     Cast { src: String, to: Cast },
     Q8 { w: String, scale: Option<String> },
-    Experts { layer: usize, which: &'static str },
+    /// Stacked MXFP4 experts under `prefix` (`layers.{l}.ffn.experts.` for the
+    /// main model, `mtp.{s}.ffn.experts.` for a drafter stage). Carries the
+    /// count because the drafter has 128 where the main model has 384.
+    Experts { prefix: String, which: &'static str, n: usize },
 }
 
 /// A tensor as the engine sees it: GGUF name, ggml dtype, ggml dims
@@ -77,6 +80,10 @@ pub struct V41HfWeights {
     index: HashMap<String, usize>,
     threads: usize,
 }
+
+/// DSpark drafter: three stages, each a transformer layer with a 128-wide router.
+pub const MTP_STAGES: usize = 3;
+pub const MTP_N_EXPERT: usize = 128;
 
 #[inline]
 pub fn bf16_to_f32(bits: u16) -> f32 {
@@ -300,8 +307,8 @@ impl V41HfWeights {
         self.push(name.to_owned(), GgufType::Q8_0, dims, Kind::Q8 { w: w.to_owned(), scale })
     }
 
-    fn push_experts(&mut self, name: &str, layer: usize, which: &'static str) -> eyre::Result<()> {
-        let t = self.st.get(&format!("layers.{layer}.ffn.experts.0.{which}.weight"))?;
+    fn push_experts(&mut self, name: &str, prefix: &str, which: &'static str, n: usize) -> eyre::Result<()> {
+        let t = self.st.get(&format!("{prefix}0.{which}.weight"))?;
         let (out, half) = match t.shape[..] {
             [out, half] => (out, half),
             _ => return Err(eyre!("{}: expected [out, in/2], got {:?}", t.name, t.shape)),
@@ -310,8 +317,9 @@ impl V41HfWeights {
         if inn % 32 != 0 {
             return Err(eyre!("{}: in={inn} not a multiple of 32", t.name));
         }
-        let dims = vec![inn, out, self.n_expert as u64];
-        self.push(name.to_owned(), GgufType::MXFP4, dims, Kind::Experts { layer, which })
+        let dims = vec![inn, out, n as u64];
+        self.push(name.to_owned(), GgufType::MXFP4, dims,
+                  Kind::Experts { prefix: prefix.to_owned(), which, n })
     }
 
     fn build_table(&mut self) -> eyre::Result<()> {
@@ -322,6 +330,85 @@ impl V41HfWeights {
         self.push_cast("output_norm.weight", "norm.weight", Cast::F32)?;
         for l in 0..self.n_layers {
             self.build_layer(l)?;
+        }
+        // DSpark drafter stages, if the checkpoint carries them. Absent on
+        // checkpoints without MTP, so this is best-effort by design.
+        for sgi in 0..MTP_STAGES {
+            if self.st.has(&format!("mtp.{sgi}.attn_norm.weight")) {
+                self.build_mtp(sgi)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One layer of the DSpark drafter, presented under `mtp.{s}.*`.
+    ///
+    /// The three `mtp.*` groups are NOT three independent drafters — they are a
+    /// 3-LAYER draft model, run autoregressively to emit K draft tokens:
+    ///
+    ///   mtp.0   main_proj + main_norm -> layer   (entry: eats the main residuals)
+    ///   mtp.1   layer                            (middle)
+    ///   mtp.2   layer -> norm -> confidence_head + markov_head   (exit: logits)
+    ///
+    /// Each layer is otherwise identical to a main layer — MLA attention, mHC, a
+    /// routed MoE, a shared expert — except the router is 128-wide instead of
+    /// 384. See `docs/v41/DSPARK_DESIGN.md`.
+    fn build_mtp(&mut self, sgi: usize) -> eyre::Result<()> {
+        let p = format!("mtp.{sgi}.");
+        let b = format!("mtp.{sgi}.");
+        // Entry stage only.
+        if self.st.has(&format!("{p}main_proj.weight")) {
+            self.push_q8(&format!("{b}main_proj.weight"), &format!("{p}main_proj.weight"))?;
+            self.push_cast(&format!("{b}main_norm.weight"), &format!("{p}main_norm.weight"), Cast::F32)?;
+        }
+        // Exit stage only: final norm plus the confidence and markov heads.
+        if self.st.has(&format!("{p}norm.weight")) {
+            self.push_cast(&format!("{b}norm.weight"), &format!("{p}norm.weight"), Cast::F32)?;
+        }
+        if self.st.has(&format!("{p}confidence_head.proj.weight")) {
+            self.push_cast(&format!("{b}confidence.weight"), &format!("{p}confidence_head.proj.weight"), Cast::F32)?;
+        }
+        if self.st.has(&format!("{p}markov_head.embed.weight")) {
+            self.push_cast(&format!("{b}markov_embd.weight"), &format!("{p}markov_head.embed.weight"), Cast::F16)?;
+            self.push_q8(&format!("{b}markov_head.weight"), &format!("{p}markov_head.head.weight"))?;
+        }
+        for (src, dst) in [
+            ("attn_norm.weight", "attn_norm.weight"),
+            ("ffn_norm.weight", "ffn_norm.weight"),
+            ("attn.q_norm.weight", "attn_q_a_norm.weight"),
+            ("attn.kv_norm.weight", "attn_kv_a_norm.weight"),
+            ("attn.attn_sink", "attn_sinks.weight"),
+            ("hc_attn_fn", "hc_attn_fn.weight"),
+            ("hc_ffn_fn", "hc_ffn_fn.weight"),
+            ("hc_attn_base", "hc_attn_base.weight"),
+            ("hc_ffn_base", "hc_ffn_base.weight"),
+            ("hc_attn_scale", "hc_attn_scale.weight"),
+            ("hc_ffn_scale", "hc_ffn_scale.weight"),
+            ("ffn.gate.bias", "exp_probs_b.bias"),
+            ("ffn.gate.bias_vl", "exp_probs_b_vl.bias"),
+        ] {
+            self.push_cast(&format!("{b}{dst}"), &format!("{p}{src}"), Cast::F32)?;
+        }
+        for (src, dst) in [
+            ("attn.wq_a", "attn_q_a"),
+            ("attn.wq_b", "attn_q_b"),
+            ("attn.wkv", "attn_kv"),
+            ("attn.wo_a", "attn_output_a"),
+            ("attn.wo_b", "attn_output_b"),
+        ] {
+            self.push_q8(&format!("{b}{dst}.weight"), &format!("{p}{src}.weight"))?;
+        }
+        self.push_cast(&format!("{b}ffn_gate_inp.weight"), &format!("{p}ffn.gate.weight"), Cast::Bf16Raw)?;
+        for (src, dst) in [("w1", "ffn_gate_shexp"), ("w3", "ffn_up_shexp"), ("w2", "ffn_down_shexp")] {
+            self.push_q8(&format!("{b}{dst}.weight"), &format!("{p}ffn.shared_experts.{src}.weight"))?;
+        }
+        for (src, dst) in [("w1", "ffn_gate_exps"), ("w3", "ffn_up_exps"), ("w2", "ffn_down_exps")] {
+            self.push_experts(
+                &format!("{b}{dst}.weight"),
+                &format!("{p}ffn.experts."),
+                src,
+                MTP_N_EXPERT,
+            )?;
         }
         Ok(())
     }
@@ -363,7 +450,7 @@ impl V41HfWeights {
             )?;
         }
         for (src, dst) in [("w1", "ffn_gate_exps"), ("w3", "ffn_up_exps"), ("w2", "ffn_down_exps")] {
-            self.push_experts(&format!("{b}{dst}.weight"), l, src)?;
+            self.push_experts(&format!("{b}{dst}.weight"), &format!("{p}ffn.experts."), src, self.n_expert)?;
         }
         if self.st.has(&format!("{p}attn.compressor.wkv.weight")) {
             self.push_cast(
@@ -423,7 +510,7 @@ impl V41HfWeights {
         match &vt.kind {
             Kind::Cast { src, to } => self.read_cast(src, *to, dst),
             Kind::Q8 { w, scale } => self.read_q8(w, scale.as_deref(), dst),
-            Kind::Experts { layer, which } => {
+            Kind::Experts { prefix, which, .. } => {
                 let per = self.expert_bytes(vt);
                 let mut jobs: Vec<(usize, &mut [u8])> = dst.chunks_mut(per).enumerate().collect();
                 let group = jobs.len().div_ceil(self.threads).max(1);
@@ -433,7 +520,7 @@ impl V41HfWeights {
                         let err = &err;
                         sc.spawn(move || {
                             for (e, slice) in grp.iter_mut() {
-                                if let Err(x) = self.read_expert_raw(*layer, which, *e, slice) {
+                                if let Err(x) = self.read_expert_raw(prefix, which, *e, slice) {
                                     *err.lock().unwrap() = Some(x);
                                     return;
                                 }
@@ -462,31 +549,31 @@ impl V41HfWeights {
 
     /// One expert of a stacked expert tensor (`dst.len() == expert_bytes`).
     pub fn read_expert_into(&self, vt: &VTensor, e: usize, dst: &mut [u8]) -> eyre::Result<()> {
-        let Kind::Experts { layer, which } = &vt.kind else {
+        let Kind::Experts { prefix, which, n } = &vt.kind else {
             return Err(eyre!("{}: not a stacked expert tensor", vt.name));
         };
-        if e >= self.n_expert {
-            return Err(eyre!("{}: expert {e} >= {}", vt.name, self.n_expert));
+        if e >= *n {
+            return Err(eyre!("{}: expert {e} >= {n}", vt.name));
         }
         if dst.len() != self.expert_bytes(vt) {
             return Err(eyre!("{}: dst len {} != expert bytes {}", vt.name, dst.len(), self.expert_bytes(vt)));
         }
-        self.read_expert_raw(*layer, which, e, dst)
+        self.read_expert_raw(prefix, which, e, dst)
     }
 
     /// [`Self::read_expert_into`] but leaving the bytes in the HF layout; see
     /// [`Self::read_expert_hf_layout`].
     pub fn read_expert_hf_layout_into(&self, vt: &VTensor, e: usize, dst: &mut [u8]) -> eyre::Result<()> {
-        let Kind::Experts { layer, which } = &vt.kind else {
+        let Kind::Experts { prefix, which, n } = &vt.kind else {
             return Err(eyre!("{}: not a stacked expert tensor", vt.name));
         };
-        if e >= self.n_expert {
-            return Err(eyre!("{}: expert {e} >= {}", vt.name, self.n_expert));
+        if e >= *n {
+            return Err(eyre!("{}: expert {e} >= {n}", vt.name));
         }
         if dst.len() != self.expert_bytes(vt) {
             return Err(eyre!("{}: dst len {} != expert bytes {}", vt.name, dst.len(), self.expert_bytes(vt)));
         }
-        self.read_expert_hf_layout(*layer, which, e, dst)
+        self.read_expert_hf_layout(prefix, which, e, dst)
     }
 
     /// Arbitrary byte range of the transformed tensor. Expert-granular for
@@ -658,8 +745,8 @@ impl V41HfWeights {
     /// nibble loop only gets good codegen while the compiler can prove
     /// `packed`/`scale`/`dst` are distinct allocations, and anything that muddies
     /// that costs more than the branch saves. Keep the two loops apart.
-    pub fn read_expert_hf_layout(&self, layer: usize, which: &str, e: usize, dst: &mut [u8]) -> eyre::Result<()> {
-        let p = format!("layers.{layer}.ffn.experts.{e}.{which}.");
+    pub fn read_expert_hf_layout(&self, prefix: &str, which: &str, e: usize, dst: &mut [u8]) -> eyre::Result<()> {
+        let p = format!("{prefix}{e}.{which}.");
         let wt = self.st.get(&format!("{p}weight"))?;
         let sc = self.st.get(&format!("{p}scale"))?;
         if !matches!(wt.dtype, StDtype::I8 | StDtype::U8) || sc.dtype != StDtype::F8E8M0 {
@@ -698,10 +785,10 @@ impl V41HfWeights {
     }
 
     fn hf_layout_parts(&self, vt: &VTensor) -> eyre::Result<(usize, usize)> {
-        let Kind::Experts { layer, which } = &vt.kind else {
+        let Kind::Experts { prefix, which, .. } = &vt.kind else {
             return Err(eyre!("{}: not a stacked expert tensor", vt.name));
         };
-        let p = format!("layers.{layer}.ffn.experts.0.{which}.");
+        let p = format!("{prefix}0.{which}.");
         let wt = self.st.get(&format!("{p}weight"))?;
         let (out, half) = (wt.shape[0] as usize, wt.shape[1] as usize);
         let nb = half * 2 / 32;
@@ -722,13 +809,13 @@ impl V41HfWeights {
         e: usize,
         dst: &mut [u8],
     ) -> eyre::Result<Option<(usize, usize, u32, u32)>> {
-        let Kind::Experts { layer, which } = &vt.kind else {
+        let Kind::Experts { prefix, which, n } = &vt.kind else {
             return Err(eyre!("{}: not a stacked expert tensor", vt.name));
         };
-        if e >= self.n_expert {
-            return Err(eyre!("{}: expert {e} >= {}", vt.name, self.n_expert));
+        if e >= *n {
+            return Err(eyre!("{}: expert {e} >= {n}", vt.name));
         }
-        let p = format!("layers.{layer}.ffn.experts.{e}.{which}.");
+        let p = format!("{prefix}{e}.{which}.");
         let wt = self.st.get(&format!("{p}weight"))?;
         let sc = self.st.get(&format!("{p}scale"))?;
         if !matches!(wt.dtype, StDtype::I8 | StDtype::U8) || sc.dtype != StDtype::F8E8M0 {
@@ -759,8 +846,8 @@ impl V41HfWeights {
     }
 
     /// HF packed nibbles + e8m0 scales of one expert → ggml MXFP4 blocks.
-    fn read_expert_raw(&self, layer: usize, which: &str, e: usize, dst: &mut [u8]) -> eyre::Result<()> {
-        let p = format!("layers.{layer}.ffn.experts.{e}.{which}.");
+    fn read_expert_raw(&self, prefix: &str, which: &str, e: usize, dst: &mut [u8]) -> eyre::Result<()> {
+        let p = format!("{prefix}{e}.{which}.");
         let wt = self.st.get(&format!("{p}weight"))?;
         let sc = self.st.get(&format!("{p}scale"))?;
         if !matches!(wt.dtype, StDtype::I8 | StDtype::U8) || sc.dtype != StDtype::F8E8M0 {
