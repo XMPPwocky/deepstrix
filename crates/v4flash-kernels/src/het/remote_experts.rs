@@ -1980,8 +1980,14 @@ impl ExpertShard {
                 _ => {
                     for i in 0..3 {
                         let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
+                        // `stage[i]` is over-allocated by 4 blocks of alignment
+                        // slack for the O_DIRECT path, so copy only the expert's
+                        // own bytes. Copying the whole buffer failed with
+                        // "copy_from_host length mismatch: src=6283264
+                        // dst=6266880" (exactly 4*4096 too many). Latent: this
+                        // branch only runs with GPU repack OFF.
                         buf.slice_view_mut(victim as usize * bpe[i], bpe[i])
-                            .copy_from_host(stage[i].as_slice())?;
+                            .copy_from_host(&stage[i].as_slice()[..bpe[i]])?;
                     }
                 }
             }
