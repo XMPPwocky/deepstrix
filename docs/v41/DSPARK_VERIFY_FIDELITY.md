@@ -411,3 +411,50 @@ stream now synced, so the second source is elsewhere in the response path —
 candidates: the `rx_resp_recycle` buffer lifecycle on either side, or an async
 H2D of the request payload. Same instruments apply: hash the host-side response
 and compare against what was sent.
+
+## RESOLVED: two real bugs in box 2, and the constraint moves to the drafter
+
+The verify's B-dependence was never float non-associativity — the same kernels
+run at every B, so a B-dependent cosine had to be structural. Three causes,
+stacked:
+
+1. **`read_f32` copied `ffn_moe` without syncing the compute stream.** Blocking
+   hipMemcpy orders against the NULL stream only. Its f16 twin always synced, so
+   DECODE (f16) was correct while the verify (f32) got the previous request's
+   result. FIXED.
+2. **The batched MoE never zeroed `partials`.** `group_count` and `n_work_items`
+   are zeroed per request; `partials` was not, so slots whose expert had no
+   members this request were summed in from last time. Only the batched branch
+   accumulates, and the hub sets REQ_FLAG_BATCHED exactly when b > 1 — hence the
+   b>=2 trigger, and hence "rows per lane" (a 1-row lane issues b=1). FIXED:
+   cos 0.569 -> 0.880 at B=3, and the verify got FASTER (821 -> 422 ms at B=6).
+3. **A silent chain switch at `decode_max_b = 4`.** Above it box 2 changes MoE
+   implementation, and its batched by-expert chain disagrees with its decode
+   chain by ~0.11 cosine — far too large to be rounding.
+
+With the chain held fixed, the cosine is FLAT in B, as it always should have
+been:
+
+    box 2 decode chain, decode_max_b=8:  B=2 0.9991  B=3 0.9994  B=6 0.9989
+    box 2 batched chain:                 B=2 0.878   B=3 0.880   B=6 0.889
+
+### The verify is no longer the problem — the drafter is
+
+    verify(B=6), batched chain   149 ms   cos 0.889
+    verify(B=6), decode chain    622 ms   cos 0.999
+    decode token                  67 ms
+
+Break-even needs `verify / E < 67 ms`, i.e. **E > 2.2** with the fast chain.
+MEASURED E in accept mode:
+
+    sloppy verify (cos 0.889)   E 1.44-1.63
+    faithful verify (cos 0.999) E 1.15-1.33
+
+A faithful verify gives LOWER acceptance — a sloppy one agrees with the drafter
+by accident and accepts more, while producing wrong output. So E ~ 1.3 is the
+drafter's true acceptance on this content, against the 2.2 needed.
+
+**The remaining lever is drafter acceptance, not the verify.** Prefill-window
+seeding is the candidate (oracle: no-seed 3.281 -> seeded 4.382). The outstanding
+engineering item is making box 2's batched by-expert chain agree with its decode
+chain, which buys the 149 ms verify AT cos 0.999 instead of having to choose.
