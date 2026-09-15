@@ -2456,6 +2456,14 @@ impl MoeExecutor {
             let n_wi = n_wi[0] as u32;
             timing.n_work_items = n_wi;
             let mut mid_v = self.d_mid_cat.slice_view_mut(0, b * nu * N_FF_EXP as usize);
+            // Under the decode-down diagnostic, zero mid first (as the decode
+            // gate/up does): the chunked gate/up writes only MEMBER slots, and
+            // the decode down sums all nu slots per token, so non-member slots
+            // must be 0 for the isolation to be valid rather than summing stale
+            // data (which gave KLD 1.6).
+            if b2_decode_down() {
+                mid_v.fill_zero_async(s)?;
+            }
             let handled = super::dispatch::moe_gate_up_chunked(
                 e, gdt, s, &mut mid_v, &gate, &up, &xq_v, &ew_v, &self.group_count, &self.expert_members,
                 &self.work_items, n_wi, gbpe, ubpe, nu as u32, max_per_expert, CHUNK_SIZE, SWIGLU_CLAMP_EXP,

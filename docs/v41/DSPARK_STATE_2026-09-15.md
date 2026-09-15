@@ -120,3 +120,42 @@ verify's down through the decode kernel.
 Prefill-side validation (per the user): the verify never runs the decoder, so
 logits aren't comparable there — use activation RMSE at the last ENCODER layer
 against the oracle's `layer_19_residual.pt` instead.
+
+## ROOT CAUSE of the 0.276-nat divergence — FULLY LOCALIZED (2026-09-15)
+
+Decisive isolation, down held constant (mid zeroed so the swap is valid):
+
+    decode gate/up + decode down   KLD 0.0005   (full decode chain)
+    batched gate/up + decode down  KLD 0.277    (ONLY the gate/up kernel differs)
+
+The gate/up kernel accounts for the ENTIRE divergence. The down (`by_expert_kwide2`
++ `reduce_partials_hetsplit`) and the swiglu finalization are both innocent —
+proven identical earlier.
+
+The two gate/up MXFP4 matvecs use different ARITHMETIC:
+- **decode** `mxfp4_pair_row` → `dot_super_half_mxfp4`: dequants each MXFP4 weight
+  through an int8 LUT and accumulates the dot product in FLOAT (`float acc`).
+- **fast/batched** `mxfp4_pair_matvec_fused_swiglu_kwide`: integer dp4a
+  (`sudot4_pair`, int32 accumulation of Q8_K×MXFP4 nibbles) then one float scale
+  `sumi * (yd * gds)` at the end.
+
+MXFP4 carries a per-32-block E8M0 scale, so an integer dp4a that sums across
+blocks before applying scales cannot be bit-faithful to the per-block float
+accumulation. That precision gap is the 0.276 nats (argmax agree 0.80). The
+decode float-LUT path is the validated reference (the engine's decode was built
+against the CPU oracle); the kwide dp4a is the fast prefill kernel, and its
+small per-token error — invisible when prefill only consumes the last token —
+becomes visible when a speculative verify consumes ALL per-token logits.
+
+### The fix for fast + faithful (→ 20 tok/s)
+Make box 2's `kwide` gate/up numerically match the float-LUT path: apply the
+MXFP4 per-block E8M0 scale per block inside the dp4a accumulation (scale each
+32-block's integer partial before summing across blocks), instead of one scale
+at the end. Then the fast chain (283 ms) becomes faithful (KLD → ~0) and, at the
+measured drafter E≈3.0, prices at ~48 ms/token ≈ 20 tok/s. This is the last
+item; everything else (verify window addressing, accept-survives-eviction, the
+two box-2 races) is fixed and proven.
+
+Diagnostics left in tree, default-off: `V41_B2_DECODE_DOWN=1` (per-token decode
+down over batched gate/up), `V41_DSPARK_XCHECK=1` + `mean_kld_nats`,
+`V41_DUMP_FIRST_LOGITS`.
