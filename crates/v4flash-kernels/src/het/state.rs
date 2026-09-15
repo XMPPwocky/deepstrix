@@ -243,7 +243,25 @@ impl HetCompressorState {
 impl HetModelState {
     /// Snapshot every layer's KV position so a speculative batch can be undone.
     pub fn mark_kv(&self) -> KvMark {
-        KvMark { per_layer: self.layers.iter().map(|l| (l.n_raw, l.raw_off)).collect() }
+        self.try_mark_kv().expect("mark_kv: compressor snapshot")
+    }
+
+    /// `mark_kv`, surfacing the compressor-snapshot copy error instead of
+    /// panicking.
+    pub fn try_mark_kv(&self) -> eyre::Result<KvMark> {
+        let per_layer = self.layers.iter().map(|l| (l.n_raw, l.raw_off)).collect();
+        let mut per_layer_comp = Vec::with_capacity(self.layers.len());
+        for l in &self.layers {
+            if l.compressor.is_none() && l.indexer_compressor.is_none() {
+                per_layer_comp.push(None);
+                continue;
+            }
+            per_layer_comp.push(Some(CompMark {
+                main: l.compressor.as_ref().map(CompStateMark::capture).transpose()?,
+                indexer: l.indexer_compressor.as_ref().map(CompStateMark::capture).transpose()?,
+            }));
+        }
+        Ok(KvMark { per_layer, per_layer_comp })
     }
 
     /// Undo the KV appends made since `mark`.
@@ -288,6 +306,27 @@ impl HetModelState {
         for (i, (n_raw, raw_off)) in mark.per_layer.iter().copied().enumerate() {
             self.layers[i].n_raw = n_raw;
             self.layers[i].raw_off = raw_off;
+        }
+        // Compressed KV too, or the raw window rewinds while the compressed
+        // store keeps the speculative rows. A mark taken before this field
+        // existed (empty vec) rolls back the raw window only, as it used to.
+        // `V41_COMP_ROLLBACK=0` restores the OLD (buggy) behaviour: raw window
+        // only. Kept as a flag because the damage is CUMULATIVE across steps,
+        // so the two arms cannot be interleaved inside one run — they have to
+        // be separate runs of the same binary.
+        if !comp_rollback_enabled() {
+            return Ok(());
+        }
+        for (i, cm) in mark.per_layer_comp.iter().enumerate() {
+            let Some(cm) = cm.as_ref() else { continue };
+            if let (Some(m), Some(cs)) = (cm.main.as_ref(), self.layers[i].compressor.as_mut()) {
+                m.restore(cs)?;
+            }
+            if let (Some(m), Some(cs)) =
+                (cm.indexer.as_ref(), self.layers[i].indexer_compressor.as_mut())
+            {
+                m.restore(cs)?;
+            }
         }
         Ok(())
     }
@@ -345,10 +384,122 @@ pub struct HetLayerState {
 /// what `HetLayerState::raw_off` means by "the prerequisite for MTP rollback".
 /// So undoing k speculative tokens is restoring two counters per layer; no data
 /// moves and nothing is rewritten.
+fn comp_rollback_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_COMP_ROLLBACK").as_deref() != Ok("0"))
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct KvMark {
     /// `(n_raw, raw_off)` per layer at mark time.
     pub per_layer: Vec<(u32, u32)>,
+    /// Compressor store per layer at mark time, for the layers that OWN one
+    /// (`with_kv_source` lends it to the reuse layers, so only the 4 KV-source
+    /// layers are `Some`).
+    ///
+    /// Without this a rollback restored the raw window but left the COMPRESSED
+    /// KV advanced: a speculative batch fires ~b/ratio compressor boundaries,
+    /// and those rows stayed in the store for decode to attend to, permanently
+    /// and cumulatively. MEASURED as a verify-vs-decode fidelity cliff at the
+    /// batch width where a second boundary can fire (ratio 2, so B>=3):
+    /// argmax agreement 0.875 at B<=2 against 0.12-0.39 at B>=3.
+    ///
+    /// Only the running segment accumulators and the counters need saving:
+    /// `comp_kv` / `index_k` rows past `n_comp` / `n_index_comp` are never
+    /// read, so truncating the counters is enough to discard them. The
+    /// accumulators are `ratio * coff * width` floats — 4 KB a layer.
+    pub per_layer_comp: Vec<Option<CompMark>>,
+}
+
+/// Snapshot of one layer's compressor stores (main + CSA indexer). See
+/// [`KvMark::per_layer_comp`].
+#[derive(Clone, Debug)]
+pub struct CompMark {
+    pub main: Option<CompStateMark>,
+    pub indexer: Option<CompStateMark>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompStateMark {
+    pub n_comp: u32,
+    pub n_index_comp: u32,
+    pub state_kv: Vec<f32>,
+    pub state_score: Vec<f32>,
+}
+
+impl KvMark {
+    /// A mark advanced by `keep` rows, for the speculative accept path's
+    /// PARTIAL rollback: the first `keep` rows of the verify batch became real
+    /// context and everything after them is discarded.
+    ///
+    /// `abs_pos` is the absolute position of row 0 of the batch.
+    ///
+    /// The raw window is just the mark advanced by `keep`. The compressor needs
+    /// more care, because it is a running accumulator over a `ratio`-position
+    /// segment and cannot be rewound to a row in the middle of a batch:
+    ///
+    ///   - `n_comp` IS positional (`(pos + 1) / ratio`), and every compressed
+    ///     row a boundary wrote inside the accepted prefix was computed from
+    ///     real tokens, so those rows are valid and we keep exactly them.
+    ///   - `state_kv` / `state_score` are restored to their pre-verify values.
+    ///     That is exact when the accepted prefix ends ON a segment boundary
+    ///     (the open segment is empty either way) and approximate otherwise, by
+    ///     at most the `ratio - 1` positions of one open segment — which affects
+    ///     only the NEXT compressed row. The alternative, keeping the batch's
+    ///     accumulator, is wrong by the REJECTED rows, which is strictly worse.
+    ///     Exactness here needs a per-row accumulator snapshot, which the
+    ///     batched compressor (one launch for the whole chunk) cannot provide.
+    pub fn advanced_by(&self, keep: u32, abs_pos: u32) -> Self {
+        let per_layer = self.per_layer.iter().map(|&(nr, off)| (nr + keep, off)).collect();
+        let per_layer_comp = self
+            .per_layer_comp
+            .iter()
+            .enumerate()
+            .map(|(layer, cm)| {
+                let cm = cm.as_ref()?;
+                let ratio = crate::config::COMPRESS_RATIOS[layer];
+                let n_comp = if ratio == 0 {
+                    None
+                } else {
+                    // Rows for absolute positions [0, abs_pos + keep).
+                    Some((abs_pos + keep) / ratio)
+                };
+                let bump = |m: &CompStateMark| {
+                    let mut m = m.clone();
+                    if let Some(n) = n_comp {
+                        // Never go backwards past what the mark already held,
+                        // and never past what the batch actually wrote.
+                        m.n_comp = n.max(m.n_comp).min(m.n_comp + keep);
+                        m.n_index_comp = m.n_index_comp.min(m.n_comp);
+                    }
+                    m
+                };
+                Some(CompMark {
+                    main: cm.main.as_ref().map(&bump),
+                    indexer: cm.indexer.as_ref().map(&bump),
+                })
+            })
+            .collect();
+        Self { per_layer, per_layer_comp }
+    }
+}
+
+impl CompStateMark {
+    fn capture(cs: &HetCompressorState) -> eyre::Result<Self> {
+        let mut state_kv = vec![0f32; cs.state_kv.len()];
+        let mut state_score = vec![0f32; cs.state_score.len()];
+        cs.state_kv.copy_to_host(&mut state_kv)?;
+        cs.state_score.copy_to_host(&mut state_score)?;
+        Ok(Self { n_comp: cs.n_comp, n_index_comp: cs.n_index_comp, state_kv, state_score })
+    }
+
+    fn restore(&self, cs: &mut HetCompressorState) -> eyre::Result<()> {
+        cs.n_comp = self.n_comp;
+        cs.n_index_comp = self.n_index_comp;
+        cs.state_kv.copy_from_host(&self.state_kv)?;
+        cs.state_score.copy_from_host(&self.state_score)?;
+        Ok(())
+    }
 }
 
 pub struct HetModelState {

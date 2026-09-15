@@ -3144,13 +3144,11 @@ fn finish_decode(
             // `KvMark` is per-layer `(n_raw, raw_off)`, so a PARTIAL rollback is
             // just the mark advanced by the number of rows kept.
             let keep = (n + 1) as u32; // `next` plus the n accepted drafts
-            let partial = v4flash_kernels::het::state::KvMark {
-                per_layer: mark
-                    .per_layer
-                    .iter()
-                    .map(|&(nr, off)| (nr + keep, off))
-                    .collect(),
-            };
+            // Row 0 of the verify batch sits at `pos`. `advanced_by` also
+            // rewinds the COMPRESSED store to what the accepted prefix earns —
+            // without it the rejected drafts' compressor boundaries stayed in
+            // the store permanently and decode attended to them.
+            let partial = mark.advanced_by(keep, pos);
             state.state.rollback_kv(&partial).map_err(|e| {
                 eyre!("dspark accept: partial rollback ({keep} of {k}) refused: {e}")
             })?;
