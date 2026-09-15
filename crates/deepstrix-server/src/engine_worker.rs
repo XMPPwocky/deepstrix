@@ -2521,6 +2521,11 @@ fn finish_decode(
     #[cfg(feature = "v41")]
     let dspark_accept: bool = matches!(std::env::var("V41_DSPARK").as_deref(), Ok("accept"));
     #[cfg(feature = "v41")]
+    fn verify_decode_path() -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| std::env::var("V41_VERIFY_DECODE_PATH").as_deref() == Ok("1"))
+    }
+    #[cfg(feature = "v41")]
     let verify_probe_batched: bool =
         matches!(std::env::var("V41_VERIFY_BATCHED").as_deref(), Ok("1") | Ok("on"));
     let heartbeat_interval: u32 = std::env::var("DEEPSTRIX_HEARTBEAT_TOKENS")
@@ -2896,14 +2901,94 @@ fn finish_decode(
                 };
             let mark = state.state.mark_kv();
             let t_step = std::time::Instant::now();
+            let mut decode_path_logits: Option<Vec<f32>> = None;
+            // `V41_VERIFY_DECODE_PATH=1`: run the verify through DECODE's own
+            // per-layer function, layer-major over the B rows, instead of the
+            // batched prefill driver.
+            //
+            // WHY. The batched driver computes a different function than decode
+            // — different kernel families throughout (measured: argmax
+            // agreement 0.49-0.61, cos 0.75-0.79) — and swapping components one
+            // at a time does NOT converge, because each swapped component still
+            // consumes diverged inputs from the ones ahead of it. Decode's
+            // `forward_layer_standalone_graphs_paged` is public and complete, so
+            // the faithful verify needs no change to the prefill path at all.
+            //
+            // Layer-major over rows is numerically IDENTICAL to running the
+            // tokens sequentially: each layer sees the same token order, and
+            // each row's layer-L input is its own layer-(L-1) output, which is
+            // computed first. Only the order of independent work changes.
+            //
+            // This is the correctness step. It costs B x decode's per-layer work
+            // because each row still does its own remote submit — batching those
+            // per layer is the follow-up, and it is where speculation's win is.
+            if verify_decode_path() {
+                use v4flash_kernels::config::{ENGRAM_LAYERS, HC_DIM, N_LAYER, N_VOCAB};
+                let bsz = toks.len();
+                let mut resid: Vec<Vec<f32>> = hcs.clone();
+                let hcm = state.dgpu_scratch.hc_pre_carry.len();
+                let mut carry: Vec<Vec<f32>> = vec![vec![0.0f32; hcm]; bsz];
+                // Engram rows per row, gathered up front: hashes are token-only.
+                let mut erows: Vec<Option<Vec<Vec<f32>>>> = Vec::with_capacity(bsz);
+                for (j, &t) in toks.iter().enumerate() {
+                    erows.push(match (state.pager.as_ref(), state.engram.as_mut()) {
+                        (Some(pg), Some(ec)) => {
+                            Some(ec.rows_for(pg.raw(), t, pos + j as u32)?)
+                        }
+                        _ => None,
+                    });
+                }
+                for layer in 0..N_LAYER as usize {
+                    let eidx = ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
+                    for j in 0..bsz {
+                        state.dgpu_scratch.residual.copy_from_host(&resid[j])?;
+                        if layer > 0 {
+                            state.dgpu_scratch.hc_pre_carry.copy_from_host(&carry[j])?;
+                        }
+                        if let (Some(ei), Some(er)) = (eidx, erows[j].as_ref()) {
+                            state.engine.stage_engram_rows(&mut state.dgpu_scratch, &er[ei])?;
+                        }
+                        let pg = state.pager.as_mut().expect("pager");
+                        state.engine.forward_layer_standalone_graphs_paged(
+                            &mut state.dgpu_scratch,
+                            &mut state.igpu_scratch,
+                            &mut state.state.layers[layer],
+                            &state.weights.dgpu_layers[layer],
+                            &state.weights.igpu_layers[layer],
+                            pos + j as u32,
+                            toks[j],
+                            pg,
+                        )?;
+                        state.dgpu_scratch.residual.copy_to_host(&mut resid[j])?;
+                        state.dgpu_scratch.hc_pre_carry.copy_to_host(&mut carry[j])?;
+                    }
+                }
+                // Head per row, into the same [B * N_VOCAB] layout the batched
+                // path returns.
+                let nv = N_VOCAB as usize;
+                let mut out = vec![0.0f32; bsz * nv];
+                for j in 0..bsz {
+                    state.dgpu_scratch.residual.copy_from_host(&resid[j])?;
+                    state.dgpu_scratch.hc_pre_carry.copy_from_host(&carry[j])?;
+                    state.engine.forward_head(&mut state.dgpu_scratch, &state.weights.global)?;
+                    state
+                        .dgpu_scratch
+                        .logits
+                        .slice_view(0, nv)
+                        .copy_to_host(&mut out[j * nv..(j + 1) * nv])?;
+                }
+                let _ = HC_DIM;
+                decode_path_logits = Some(out);
+            }
             state.bd_a.mtp_capture_rows = k;
-            let logits = state.engine.forward_prefill_pipelined(
+            let logits_batched = state.engine.forward_prefill_pipelined(
                 &mut state.bd_a, &mut state.bi_a, &mut state.bd_b, &mut state.bi_b,
                 &mut state.sd, &mut state.si, &mut state.dgpu_scratch, &mut state.state,
                 &state.weights, &hcs, &toks, pos, false, None, None, None, None,
                 state.pager.as_mut(), engram_chunk.as_deref(),
             )?;
             state.bd_a.mtp_capture_rows = 0;
+            let logits = decode_path_logits.take().unwrap_or(logits_batched);
             let t_fwd = t_step.elapsed();
 
             // Accept the longest prefix whose argmax matches the draft.
