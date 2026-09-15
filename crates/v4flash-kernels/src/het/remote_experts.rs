@@ -1068,16 +1068,10 @@ struct LayerShard {
     page: Option<LayerPager>,
 }
 
-/// Per-layer LRU state for a paged [`LayerShard`].
+/// Per-layer paging COUNTERS. The residency state itself (LRU, slot ownership,
+/// remap mirrors) lives on [`ExpertShard`] as a `ShardPool`, so a layer can evict
+/// a slot belonging to another layer.
 struct LayerPager {
-    /// local slot -> resident expert id (None = free)
-    slot_key: Vec<Option<u32>>,
-    /// expert id -> local slot
-    slot_of: std::collections::HashMap<u32, u32>,
-    /// eviction order, front = least recently used local slot
-    lru: std::collections::VecDeque<u32>,
-    /// host mirror of `remap_dev`, re-uploaded when membership changes
-    remap_host: Vec<i32>,
     pub requests: u64,
     pub misses: u64,
     pub read_ns: u64,
@@ -1128,6 +1122,84 @@ pub struct ExpertShard {
     ///
     /// NON_COHERENT so the iGPU may cache its reads (see `PinnedBuffer`).
     stage: [PinnedBuffer<u8>; 3],
+    /// Shard-wide paging pool. `None` until `enable_paging`.
+    pool: Option<ShardPool>,
+}
+
+/// Residency state for the whole shard, so eviction can cross layer regions.
+///
+/// Per-layer regions were never an executor requirement — `layer_views` hands the
+/// kernel the whole pool and `remap` holds ABSOLUTE slots. What they cost is
+/// capacity migration: decoder layers get 68 slots against encoder layers' 260,
+/// and the routing trace says 92% of decode misses come from those 20 layers. A
+/// global victim search fixes that at identical capacity (simulated 20.4 -> 10.4
+/// misses/token; the static 164/164 version MEASURED 15.8-17.3 -> 9.65, decode
+/// +22%).
+///
+/// PREFILL must not evict across layers: it sweeps a whole layer's union at once
+/// (~203 experts at B=1024) and a global LRU would let one layer's sweep evict
+/// another's. So the search is region-restricted whenever the request is
+/// prefill-shaped. Decode and prefill never overlap within a request, and slot
+/// CONTENTS are untouched by the switch — only which slots are candidates.
+struct ShardPool {
+    /// absolute slot -> (layer, expert) resident there. `None` = free.
+    owner_of: Vec<Option<(u32, u32)>>,
+    /// (layer, expert) -> absolute slot.
+    slot_of: std::collections::HashMap<(u32, u32), u32>,
+    /// eviction order over ABSOLUTE slots, front = least recently used.
+    lru: std::collections::VecDeque<u32>,
+    /// host mirror of each layer's `remap_dev`.
+    remap_hosts: Vec<Vec<i32>>,
+    /// how many slots each layer currently holds, and the minimum it keeps under
+    /// global eviction. See [`b2_pool_floor`].
+    held: Vec<u32>,
+    floor: Vec<u32>,
+    /// this layer's `remap_host` changed and its `remap_dev` is stale. Uploaded
+    /// lazily at the START of that layer's next `ensure_layer`, which is what
+    /// lets an eviction touch another layer without touching its device buffer.
+    dirty: Vec<bool>,
+}
+
+/// Widen the victim search to the whole pool on decode-shaped requests
+/// (`V41_B2_GLOBAL_POOL=0` keeps the per-layer search, which is byte-identical
+/// to the pre-pool behaviour). Prefill-shaped requests are always
+/// region-restricted regardless.
+pub fn b2_global_pool() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_B2_GLOBAL_POOL").map(|v| v != "0").unwrap_or(true)
+    });
+    *B
+}
+
+/// Fraction of its own region a layer is guaranteed to keep, even when a decode
+/// request is evicting globally (`V41_B2_POOL_FLOOR`, default 0.90).
+///
+/// Without a floor the global pool leaks into PREFILL. The phase guard stops a
+/// prefill sweep from evicting other layers, but it does not stop DECODE from
+/// having already scattered the encoder residency prefill then has to re-page.
+///
+/// MEASURED frontier (decode 512 tok n=3, prefill 7208 tok cold/warm):
+///
+///     floor      decode          miss/tok   prefill warm
+///     per-layer  4.44             18.50       496
+///     0.90       4.92  (+11%)     14.15       526   <- free
+///     0.78       5.41  (+22%)     11.26       426   (-14%)
+///     none       5.57  (+25%)     10.44       393   (-21%)
+///
+/// 0.90 protects 234 of an encoder layer's 260 slots — comfortably above the
+/// ~203-expert prefill union at B=1024 — and is the only point on the frontier
+/// that costs prefill NOTHING while still letting the 20 decoder layers (68
+/// slots each, source of 92% of decode misses) borrow the surplus. Lower it only
+/// if prefill throughput is expendable.
+pub fn b2_pool_floor() -> f32 {
+    static F: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_B2_POOL_FLOOR")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .map(|v| v.clamp(0.0, 1.0))
+            .unwrap_or(0.90)
+    });
+    *F
 }
 
 /// Permute MXFP4 HF->ggml on box 2's iGPU instead of its CPU
@@ -1474,6 +1546,7 @@ impl ExpertShard {
             repack_stream,
             stage,
             direct,
+            pool: None,
         })
     }
 
@@ -1497,32 +1570,61 @@ impl ExpertShard {
     pub fn enable_paging(&mut self) -> eyre::Result<()> {
         for l in self.layers.iter_mut().flatten() {
             let cap = l.ids.len();
-            let mut slot_key = vec![None; cap];
-            let mut slot_of = std::collections::HashMap::with_capacity(cap);
-            let mut lru = std::collections::VecDeque::with_capacity(cap);
-            for (slot, &e) in l.ids.iter().enumerate() {
-                slot_key[slot] = Some(e);
-                slot_of.insert(e, slot as u32);
-                lru.push_back(slot as u32);
-            }
-            // ABSOLUTE slot, not layer-local. The kernel decodes `e = -remap-1`
-            // and indexes the base pointer it is handed by `e`, so making these
-            // absolute and handing it the WHOLE pool (see `layer_views`) is what
-            // frees a layer to use a slot outside its own region — the
-            // precondition for a global/phase-aware pool. Behaviour is unchanged
-            // until eviction is allowed to cross regions.
-            let base = l.base_slot as i32;
-            let mut remap_host = vec![0i32; REMAP_LEN];
-            for (slot, &e) in l.ids.iter().enumerate() {
-                remap_host[e as usize] = -(base + slot as i32) - 1;
-            }
+
             l.owned.iter_mut().for_each(|o| *o = true);
             l.page = Some(LayerPager {
-                slot_key, slot_of, lru, remap_host,
                 requests: 0, misses: 0, read_ns: 0, h2d_ns: 0,
                 pread_ns: 0, repack_cpu_ns: 0, repack_gpu_ns: 0,
             });
         }
+        // Shard-wide pool, seeded from what `load` already placed. Slots are
+        // ABSOLUTE throughout; `remap` holds `-(abs_slot)-1` so the kernel can be
+        // handed the whole buffer (see `layer_views`).
+        let n_slots = self.info.n_resident as usize;
+        let mut owner_of: Vec<Option<(u32, u32)>> = vec![None; n_slots];
+        let mut slot_of = std::collections::HashMap::with_capacity(n_slots);
+        let mut lru = std::collections::VecDeque::with_capacity(n_slots);
+        let mut remap_hosts = vec![vec![0i32; REMAP_LEN]; N_LAYER as usize];
+        for (li, l) in self.layers.iter().enumerate() {
+            let Some(l) = l.as_ref() else { continue };
+            if l.page.is_none() {
+                continue;
+            }
+            let base = l.base_slot;
+            for (local, &e) in l.ids.iter().enumerate() {
+                let abs = base + local as u32;
+                owner_of[abs as usize] = Some((li as u32, e));
+                slot_of.insert((li as u32, e), abs);
+                lru.push_back(abs);
+                remap_hosts[li][e as usize] = -(abs as i32) - 1;
+            }
+        }
+        let frac = b2_pool_floor();
+        let mut held = vec![0u32; N_LAYER as usize];
+        let mut floor = vec![0u32; N_LAYER as usize];
+        for (li, l) in self.layers.iter().enumerate() {
+            if let Some(l) = l.as_ref() {
+                if l.page.is_some() {
+                    held[li] = l.ids.len() as u32;
+                    floor[li] = (l.ids.len() as f32 * frac) as u32;
+                }
+            }
+        }
+        eprintln!(
+            "expert shard: global pool {} (floor {:.2} = {} slots on a 260-slot layer)",
+            if b2_global_pool() { "ON" } else { "OFF" },
+            frac,
+            (260.0 * frac) as u32
+        );
+        self.pool = Some(ShardPool {
+            owner_of,
+            slot_of,
+            lru,
+            remap_hosts,
+            dirty: vec![false; N_LAYER as usize],
+            held,
+            floor,
+        });
         // Do NOT touch the advertised HELLO bitmap. `info.owned` is what the hub's
         // PREFILL path uses for its remote exclusion, and prefill's per-layer union
         // (~203 experts at B=1024) would not fit a catch-all region (154 slots), so
@@ -1561,14 +1663,20 @@ impl ExpertShard {
         ids: &[i32],
         missed: &mut Vec<u32>,
     ) -> eyre::Result<()> {
-        self.ensure_layer_inner(layer, ids, Some(missed))
+        self.ensure_layer_inner(layer, ids, Some(missed), false)
+    }
+
+    /// `prefill_shaped`: this request sweeps a layer's union rather than a
+    /// token's six picks, so eviction must stay inside the layer's own region.
+    pub fn ensure_layer_phased(&mut self, layer: u32, ids: &[i32], prefill_shaped: bool) -> eyre::Result<()> {
+        self.ensure_layer_inner(layer, ids, None, prefill_shaped)
     }
 
     pub fn ensure_layer(&mut self, layer: u32, ids: &[i32]) -> eyre::Result<()> {
-        self.ensure_layer_inner(layer, ids, None)
+        self.ensure_layer_inner(layer, ids, None, false)
     }
 
-    fn ensure_layer_inner(&mut self, layer: u32, ids: &[i32], mut missed: Option<&mut Vec<u32>>) -> eyre::Result<()> {
+    fn ensure_layer_inner(&mut self, layer: u32, ids: &[i32], mut missed: Option<&mut Vec<u32>>, prefill_shaped: bool) -> eyre::Result<()> {
         let Some(l) = self.layers.get_mut(layer as usize).and_then(|l| l.as_mut()) else {
             // Catch-all needs a region on EVERY layer the hub can send. An
             // encoder-only assignment (e.g. `L0-L19:...`) has none for layers
@@ -1582,6 +1690,20 @@ impl ExpertShard {
         };
         let Some(pg) = l.page.as_mut() else { return Ok(()) };
         let base = l.base_slot as usize;
+        let n_region = l.ids.len();
+        let Some(pool) = self.pool.as_mut() else {
+            return Err(eyre!("expert shard: paged layer {layer} but no pool"));
+        };
+        // This layer's remap may be stale because ANOTHER layer evicted one of its
+        // slots. Re-upload before anything reads it. Lazy on purpose: an eviction
+        // never touches a foreign device buffer, only the host mirror + this flag.
+        if pool.dirty[layer as usize] {
+            l.remap_dev.copy_from_host(&pool.remap_hosts[layer as usize])?;
+            pool.dirty[layer as usize] = false;
+        }
+        // Prefill sweeps a whole layer's union, so it must stay inside its own
+        // region or one layer's sweep evicts another's. Decode may roam.
+        let global = b2_global_pool() && !prefill_shaped;
         let r = &mut self.routed;
         // Disjoint field borrows, hoisted: the per-role read closures below must
         // capture `owner` alone, not `&self`, or they collide with `&mut stage`.
@@ -1599,26 +1721,50 @@ impl ExpertShard {
         }
         for &e in &want {
             pg.requests += 1;
-            if let Some(&slot) = pg.slot_of.get(&e) {
-                if let Some(p) = pg.lru.iter().position(|&s| s == slot) { pg.lru.remove(p); }
-                pg.lru.push_back(slot);
+            if let Some(&slot) = pool.slot_of.get(&(layer, e)) {
+                if let Some(p) = pool.lru.iter().position(|&s| s == slot) { pool.lru.remove(p); }
+                pool.lru.push_back(slot);
                 continue;
             }
             pg.misses += 1;
             if let Some(m) = missed.as_deref_mut() {
                 m.push(e);
             }
-            // Victim: never one of the ids we are about to need this same call.
-            let victim = pg
+            // Victim, least-recently-used first. Never a slot holding an id we are
+            // about to need on THIS layer in THIS call. Region-restricted unless
+            // the request is decode-shaped and the global pool is enabled.
+            let lo = base as u32;
+            let hi = lo + n_region as u32;
+            let victim = pool
                 .lru
                 .iter()
                 .copied()
-                .find(|&s| pg.slot_key[s as usize].is_none_or(|k| !want.contains(&k)))
+                .find(|&sl| {
+                    if !global && !(lo..hi).contains(&sl) {
+                        return false;
+                    }
+                    match pool.owner_of[sl as usize] {
+                        Some((ol, oe)) => {
+                            if ol == layer && want.contains(&oe) {
+                                return false;
+                            }
+                            // Never take a foreign layer below its floor.
+                            ol == layer || pool.held[ol as usize] > pool.floor[ol as usize]
+                        }
+                        None => true,
+                    }
+                })
                 .ok_or_else(|| eyre!("expert shard: layer {layer} has no evictable slot"))?;
-            if let Some(p) = pg.lru.iter().position(|&s| s == victim) { pg.lru.remove(p); }
-            if let Some(old) = pg.slot_key[victim as usize].take() {
-                pg.slot_of.remove(&old);
-                pg.remap_host[old as usize] = 0;
+            if let Some(p) = pool.lru.iter().position(|&s| s == victim) { pool.lru.remove(p); }
+            // Detach from whoever held it — possibly a DIFFERENT layer, whose
+            // device remap is then stale until its next `ensure_layer`.
+            if let Some((ol, oe)) = pool.owner_of[victim as usize].take() {
+                pool.slot_of.remove(&(ol, oe));
+                pool.remap_hosts[ol as usize][oe as usize] = 0;
+                pool.held[ol as usize] -= 1;
+                if ol != layer {
+                    pool.dirty[ol as usize] = true;
+                }
             }
             let names = [
                 format!("blk.{layer}.ffn_gate_exps.weight"),
@@ -1710,13 +1856,13 @@ impl ExpertShard {
             match (repack, repack_stream) {
                 (Some(rp), Some(st)) => {
                     pg.repack_gpu_ns += Self::repack_in_place(
-                        rp, st, r, (base + victim as usize) as u32, stage, &offs,
+                        rp, st, r, victim, stage, &offs,
                     )?;
                 }
                 _ => {
                     for i in 0..3 {
                         let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
-                        buf.slice_view_mut((base + victim as usize) * bpe[i], bpe[i])
+                        buf.slice_view_mut(victim as usize * bpe[i], bpe[i])
                             .copy_from_host(stage[i].as_slice())?;
                     }
                 }
@@ -1724,14 +1870,16 @@ impl ExpertShard {
             h2d_ns += t_h.elapsed().as_nanos() as u64;
             pg.read_ns += read_ns;
             pg.h2d_ns += h2d_ns;
-            pg.slot_key[victim as usize] = Some(e);
-            pg.slot_of.insert(e, victim);
-            pg.lru.push_back(victim);
-            pg.remap_host[e as usize] = -((base as i32) + victim as i32) - 1;
+            pool.owner_of[victim as usize] = Some((layer, e));
+            pool.slot_of.insert((layer, e), victim);
+            pool.held[layer as usize] += 1;
+            pool.lru.push_back(victim);
+            pool.remap_hosts[layer as usize][e as usize] = -(victim as i32) - 1;
             dirty = true;
         }
         if dirty {
-            l.remap_dev.copy_from_host(&pg.remap_host)?;
+            l.remap_dev.copy_from_host(&pool.remap_hosts[layer as usize])?;
+            pool.dirty[layer as usize] = false;
         }
         Ok(())
     }
@@ -2031,7 +2179,9 @@ impl MoeExecutor {
                 }
             }
         } else {
-            shard.ensure_layer(layer, sel)?;
+            // A verify batch (B<=16) is still decode: six picks per token, not a
+            // layer union. Only a real prefill chunk pins a whole layer.
+            shard.ensure_layer_phased(layer, sel, b > 16)?;
         }
         let (gate, up, down, remap) = shard.layer_views(layer)?;
         for (i, &e) in sel.iter().enumerate() {
