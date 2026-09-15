@@ -4022,7 +4022,21 @@ impl HeterogeneousEngine {
                                 continue;
                             }
                         }
-                        if small_b_catchall && !pg.is_resident(layer as i32, sv as u32) {
+                        // DETERMINISTIC variant (`V41_SMALL_B_CATCHALL_DET=1`):
+                        // hand box 2 EVERY pick, not just the ones box 1 happens
+                        // to be missing. The residency-based rule makes the
+                        // box1/box2 partition a function of request history, and
+                        // f32 addition is not associative, so the verify's output
+                        // then depends on what the server served before — the same
+                        // reasoning that put decode's catch-all on mode 2
+                        // (`t2_catchall_deterministic`). Box 2's per-layer capacity
+                        // is ~68 decoder slots against a B<=6 union of <=18, so it
+                        // can take the whole batch; the 170-slot objection that
+                        // keeps `V41_REPLAY_OFFLOAD` off is a property of the CED
+                        // replay's 162-wide union at B=128, not of a verify.
+                        if small_b_catchall
+                            && (small_b_catchall_det() || !pg.is_resident(layer as i32, sv as u32))
+                        {
                             extra_remote[sv as usize] = true;
                             continue;
                         }
@@ -5417,6 +5431,14 @@ pub fn single_lane_max() -> usize {
 /// Set the single-lane threshold at runtime. See `single_lane_max`.
 pub fn set_single_lane_max(v: usize) {
     SINGLE_LANE_MAX.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `V41_SMALL_B_CATCHALL_DET=1`: the small-B catch-all hands box 2 every pick
+/// instead of only the ones box 1 is missing, making the split history-
+/// independent. See the call site.
+pub fn small_b_catchall_det() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_SMALL_B_CATCHALL_DET").as_deref() == Ok("1"))
 }
 
 /// `V41_COMP_POSITIONAL`: 1 = log and override `n_comp_after` with the
