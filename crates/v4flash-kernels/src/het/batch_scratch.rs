@@ -510,6 +510,17 @@ pub struct BatchDgpuShared {
     /// `_f16s` pair, so allocated at half the f32 element count (128 MiB
     /// at rows=512; 256 MiB under `DEEPSTRIX_F32_SCORES=1`).
     pub attn_scores: DeviceBuffer<f32>,
+    /// DECODE's attention scratch, for the verify's per-row replay of the
+    /// decode attention chain (`V41_VERIFY_DECODE_ATTN=1`).
+    ///
+    /// Separate from `attn_scores` because the stride conventions differ:
+    /// `launch_score_b1_htiled_wmma` hardcodes `ATTN_MIXED_MAX_KEYS` (82176)
+    /// while the batched pair takes `attn_scores_stride` (<= 3072). Slicing the
+    /// batched buffer per row would write ~27x past its end. ~21 MB, reused
+    /// across rows and lanes because both issue on `de.compute` in order.
+    pub verify_scores: DeviceBuffer<f32>,
+    pub verify_inv: DeviceBuffer<f32>,
+    pub verify_partials: DeviceBuffer<f32>,
     // ---- CSA indexer per-token scratch (P5i) ----
     /// `[B, N_INDEXER_HEAD * N_INDEXER_HEAD_DIM]` — per-token indexer Q
     /// (matvec(attn_q_b) output, then RoPE + QAT in place). R3 view @0:
@@ -1269,6 +1280,15 @@ impl BatchDgpuShared {
             //
             // Doubled when DEEPSTRIX_F32_SCORES=1 so the f32-scores
             // kernel pair has the headroom it needs.
+            verify_scores: DeviceBuffer::new(
+                id,
+                N_HEAD as usize * crate::attention::ATTN_MIXED_MAX_KEYS as usize,
+            )?,
+            verify_inv: DeviceBuffer::new(id, N_HEAD as usize)?,
+            verify_partials: DeviceBuffer::new(
+                id,
+                N_HEAD as usize * 16 * N_HEAD_DIM as usize,
+            )?,
             attn_scores: {
                 let keys = attn_scores_capacity_keys(rows, n_kv_max);
                 // The kernels write f16 unless DEEPSTRIX_F32_SCORES=1, so a

@@ -3317,6 +3317,74 @@ impl HeterogeneousEngine {
                     )?;
                 }
             }
+            // `V41_VERIFY_DECODE_ATTN=1`: replay the DECODE attention chain per row,
+            // overwriting `sd.heads`.
+            //
+            // Same reasoning as `V41_VERIFY_DECODE_MOE`: the verify must compute
+            // what decode computes, and the two use different kernel families — the
+            // batched `*_htiled_wmma*` pair here vs decode's
+            // score_b1 -> softmax_only -> wsum_ksplit -> reduce_partials. Decode's
+            // are per token, which is fine: looping them keeps the per-LAYER link
+            // round trip and pick-readback sync shared across the batch, and that
+            // is where speculation's amortisation actually lives.
+            //
+            // Recomputes rather than replaces so this is one self-contained block,
+            // testable with `V41_DSPARK_XCHECK` before anyone pays to delete the
+            // superseded work.
+            if verify_decode_attn() && (b as usize) <= 16 {
+                const K_SPLIT: u32 = 16;
+                let qf = crate::config::Q_FLAT as usize;
+                let _t_va = de.events.stage("dgpu.verify_decode_attn", &de.compute)?;
+                for j in 0..b as usize {
+                    let nr = n_raw_after[j];
+                    let nc = n_comp_after[j];
+                    let q_j = sd.q_normed.slice_view(j * qf, qf);
+                    de.attn_mixed.launch_score_b1_htiled_wmma(
+                        &de.compute,
+                        &mut sd.verify_scores,
+                        &q_j,
+                        &ls.kv_cache,
+                        eff_comp_kv_buf,
+                        nr,
+                        /*raw_off=*/ 0,
+                        nc,
+                        N_HEAD,
+                        N_HEAD_DIM,
+                        nr + nc,
+                    )?;
+                    de.attn_mixed.launch_softmax_only(
+                        &de.compute,
+                        &mut sd.verify_scores,
+                        &dlw.attn_sinks,
+                        &mut sd.verify_inv,
+                        N_HEAD,
+                        nr,
+                        nc,
+                    )?;
+                    de.attn_mixed.launch_wsum_b1_htiled_ksplit_ldsv(
+                        &de.compute,
+                        &mut sd.verify_partials,
+                        &sd.verify_scores,
+                        &ls.kv_cache,
+                        eff_comp_kv_buf,
+                        N_HEAD,
+                        N_HEAD_DIM,
+                        nr,
+                        nc,
+                        K_SPLIT,
+                    )?;
+                    let mut heads_j = sd.heads.slice_view_mut(j * qf, qf);
+                    de.attn_mixed.launch_reduce_partials_apply_inv(
+                        &de.compute,
+                        &mut heads_j,
+                        &sd.verify_partials,
+                        &sd.verify_inv,
+                        N_HEAD,
+                        N_HEAD_DIM,
+                        K_SPLIT,
+                    )?;
+                }
+            }
         }
         drop(nrp_view);
         drop(nrop_view);
@@ -5308,4 +5376,11 @@ pub fn emit_layer_miss_hist(tag: &str) {
 pub fn verify_decode_moe() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("V41_VERIFY_DECODE_MOE").as_deref() == Ok("1"))
+}
+
+/// `V41_VERIFY_DECODE_ATTN=1`: replay DECODE's attention chain per row in the
+/// batched driver, so a speculative verify produces the attention decode would.
+pub fn verify_decode_attn() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_VERIFY_DECODE_ATTN").as_deref() == Ok("1"))
 }
