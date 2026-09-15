@@ -112,6 +112,26 @@ impl<'a> WeightSrc<'a> {
         }
     }
 
+    /// Zero-copy O_DIRECT read of ALL THREE roles of one expert in TWO preads.
+    /// `Ok(None)` = unavailable (GGUF source, no O_DIRECT handle, or the
+    /// checkpoint's expert planes are not contiguous); caller falls back to the
+    /// per-role path. See `V41HfWeights::read_expert_runs_direct`.
+    pub fn read_expert_runs_direct(
+        &self,
+        ts: [&GgufTensor; 3],
+        e: usize,
+        dst_w: &mut [u8],
+        dst_s: &mut [u8],
+    ) -> eyre::Result<Option<[(usize, usize, u32, u32); 3]>> {
+        match *self {
+            Self::Gguf(_) => Ok(None),
+            Self::V41(v) => {
+                let vts = [v.get(&ts[0].name)?, v.get(&ts[1].name)?, v.get(&ts[2].name)?];
+                v.read_expert_runs_direct(vts, e, dst_w, dst_s)
+            }
+        }
+    }
+
     /// Staging bytes [`Self::read_expert_hf_layout_direct`] needs for one role.
     pub fn hf_layout_direct_capacity(&self, t: &GgufTensor) -> eyre::Result<Option<usize>> {
         match *self {

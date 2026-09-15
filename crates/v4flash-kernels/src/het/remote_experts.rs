@@ -1301,6 +1301,46 @@ pub fn remote_batched_multi() -> bool {
 ///
 /// Degrades safely: requires GPU repack AND 4096-aligned pinned staging, and
 /// falls back to the buffered path when the filesystem refuses the flag.
+/// Read all three roles of an expert in TWO preads instead of six.
+/// DEFAULT ON since 2026-09-15; `V41_B2_COALESCE=0` reverts.
+///
+/// The checkpoint is EXPERT-MAJOR: for every expert the three weight planes are
+/// byte-contiguous (3 x 5.625 = 16.875 MB) and so are its three scale planes
+/// (3 x 0.352 = 1.055 MB), with the two runs far apart. The per-role path issues
+/// SIX preads (~5.6 MB + 0.35 MB each) across three threads and measures
+/// 2.96 GB/s aggregate; this drive does 4.47 GB/s on one ~20 MB O_DIRECT read.
+/// NVMe strongly prefers one large read.
+///
+/// MEASURED on box 2's own page stats (a PER-MISS cost, so immune to the
+/// LRU-warming confound that dominates end-to-end decode A/Bs):
+///
+///     buffered            ms_per_miss 8.04   read 7.70   pread 22.13
+///     O_DIRECT per-role                7.11        6.94        17.61
+///     O_DIRECT coalesced               4.54        4.41         4.41
+///
+/// 44% cheaper per miss than the original path. `pread == read` is the signature
+/// that it is actually engaged: the sum across threads collapses to the wall
+/// because it is now two sequential preads instead of six parallel ones.
+///
+/// VALIDATED BIT-IDENTICAL: same prompt at temperature 0 with
+/// `V41_T2_CATCHALL=2`, coalesced vs per-role, produced the same 525-char
+/// generation (sha 13af380180431910) twice each.
+///
+/// Role order is NOT physical order — the loader maps gate<-w1, up<-w3, down<-w2
+/// — so `read_expert_runs_direct` derives each role's slot in the run from its
+/// FILE OFFSET. Encoding the mapping by hand instead swapped up and down and
+/// made generation non-deterministic, which is how this was caught. Per-role
+/// GEOMETRY also differs (gate/up are [N_FF_EXP, ...], down is [N_EMBD, ...]);
+/// only the byte lengths are uniform, which is what makes one run sliceable.
+/// Contiguity and uniform length are CHECKED per expert, falling back to the
+/// per-role path rather than trusting the layout.
+pub fn b2_coalesce() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_B2_COALESCE").map(|v| v != "0").unwrap_or(true)
+    });
+    *B
+}
+
 pub fn b2_odirect() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var("V41_B2_ODIRECT").map(|v| v != "0").unwrap_or(true)
@@ -1550,7 +1590,14 @@ impl ExpertShard {
         // (packed and scale are each 4096-multiples here, so +2 blocks suffices;
         // +4 is slack for a checkpoint whose lengths are not.)
         let stage = [
-            PinnedBuffer::<u8>::new_with_flags(bpe3[0] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
+            // Under `V41_B2_COALESCE` staging is REPURPOSED: [0] holds the whole
+            // 3-role weight run and [1] the 3-role scale run, so one pread fills
+            // each. Sized from bpe3 (which already exceeds packed+scale per role)
+            // so it cannot be too small: 3x covers the weight run, 1x the scales.
+            PinnedBuffer::<u8>::new_with_flags(
+                if b2_coalesce() { 3 * bpe3[0] } else { bpe3[0] } + 4 * 4096,
+                HIP_HOST_MALLOC_NON_COHERENT,
+            )?,
             PinnedBuffer::<u8>::new_with_flags(bpe3[1] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
             PinnedBuffer::<u8>::new_with_flags(bpe3[2] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
         ];
@@ -1825,7 +1872,30 @@ impl ExpertShard {
             // Per role: where the packed nibbles and the scale plane actually
             // landed in staging. `None` = contiguous (the non-direct paths).
             let mut offs: [Option<(usize, usize, u32, u32)>; 3] = [None; 3];
-            {
+            // COALESCED: two preads for all three roles. Falls through to the
+            // per-role path when disabled, when this build has no GPU repack /
+            // O_DIRECT, or when the run-time contiguity check fails.
+            let mut coalesced = false;
+            if gpu_repack && direct && b2_coalesce() {
+                let [p0, p1, _] = &mut *stage;
+                let (dw, ds) = (p0.as_mut_slice(), p1.as_mut_slice());
+                let src0 = WeightSrc::from(owner);
+                // All three ROLE tensors: the run's physical order is derived from
+                // their file offsets, because gate/up/down is NOT w1/w2/w3.
+                let t0 = src0.tensor(&names[0]).ok_or_else(|| eyre!("missing {}", names[0]))?;
+                let t1 = src0.tensor(&names[1]).ok_or_else(|| eyre!("missing {}", names[1]))?;
+                let t2 = src0.tensor(&names[2]).ok_or_else(|| eyre!("missing {}", names[2]))?;
+                if let Some(o) = src0
+                    .read_expert_runs_direct([&t0, &t1, &t2], e as usize, dw, ds)
+                    .map_err(|err| eyre!("expert shard: layer {layer} expert {e}: {err}"))?
+                {
+                    for i in 0..3 {
+                        offs[i] = Some(o[i]);
+                    }
+                    coalesced = true;
+                }
+            }
+            if !coalesced {
                 let [p0, p1, p2] = &mut *stage;
                 let bufs: [&mut [u8]; 3] =
                     [p0.as_mut_slice(), p1.as_mut_slice(), p2.as_mut_slice()];
@@ -1884,7 +1954,7 @@ impl ExpertShard {
             match (repack, repack_stream) {
                 (Some(rp), Some(st)) => {
                     pg.repack_gpu_ns += Self::repack_in_place(
-                        rp, st, r, victim, stage, &offs,
+                        rp, st, r, victim, stage, &offs, coalesced,
                     )?;
                 }
                 _ => {
@@ -1925,6 +1995,9 @@ impl ExpertShard {
         slot: u32,
         stage: &[PinnedBuffer<u8>; 3],
         offs: &[Option<(usize, usize, u32, u32)>; 3],
+        // Coalesced staging: packed bytes for EVERY role live in `stage[0]` and
+        // scales in `stage[1]`, so the two bases differ from the per-role case.
+        coalesced: bool,
     ) -> eyre::Result<u64> {
         // (rows, blocks per row) per role: gate/up are [N_FF_EXP, N_EMBD/32],
         // down is [N_EMBD, N_FF_EXP/32]. Same block count, different shape —
@@ -1950,15 +2023,19 @@ impl ExpertShard {
             // No upload: `stage[i]` is hipHostMalloc memory, which on this APU is
             // the same physical RAM the iGPU reads. The preads above already put
             // the bytes where the kernel wants them.
-            let base = stage[i].device_ptr() as *mut u8;
+            let (pbase, sbase) = if coalesced {
+                (stage[0].device_ptr() as *mut u8, stage[1].device_ptr() as *mut u8)
+            } else {
+                (stage[i].device_ptr() as *mut u8, stage[i].device_ptr() as *mut u8)
+            };
             match offs[i] {
                 // Zero-copy O_DIRECT: the two regions sit at their own residues.
                 Some((po, so, o_rows, o_nb)) => {
                     debug_assert_eq!((o_rows, o_nb), (rows, nb));
                     rp.launch_from_ptrs(
                         st, dst, slot as usize * bpe[i],
-                        base.wrapping_add(po) as v4flash_hip::sys::hipDeviceptr_t,
-                        base.wrapping_add(so) as v4flash_hip::sys::hipDeviceptr_t,
+                        pbase.wrapping_add(po) as v4flash_hip::sys::hipDeviceptr_t,
+                        sbase.wrapping_add(so) as v4flash_hip::sys::hipDeviceptr_t,
                         rows, nb,
                     )?;
                 }

@@ -456,6 +456,57 @@ impl SafetensorsDir {
     ///
     /// Alignment of `dst` is CHECKED, not assumed — a misaligned buffer makes
     /// `pread` fail with EINVAL, which is a confusing way to learn this.
+    /// [`Self::read_range_into_direct_padded`] over an ABSOLUTE file span rather
+    /// than one tensor, so a caller that has PROVEN several tensors adjacent can
+    /// fetch them in a single pread.
+    ///
+    /// The per-tensor entry point refuses `end > t.len` on purpose; this one
+    /// takes the shard and byte range directly and is only safe when the caller
+    /// has checked contiguity itself (see `hf_v41::expert_runs`).
+    ///
+    /// Same alignment contract: `dst` must be 4096-aligned and hold
+    /// `pad + len` rounded up to 4096. Returns the offset within `dst` at which
+    /// the requested bytes start, or `Ok(None)` if this shard has no O_DIRECT
+    /// handle.
+    pub fn read_span_into_direct_padded(
+        &self,
+        shard: usize,
+        abs: u64,
+        len: usize,
+        dst: &mut [u8],
+    ) -> eyre::Result<Option<usize>> {
+        const A: u64 = 4096;
+        let Some(Some(file)) = self.direct_files.get(shard) else {
+            return Ok(None);
+        };
+        if len == 0 {
+            return Ok(Some(0));
+        }
+        let pad = (abs & (A - 1)) as usize;
+        let span = ((pad + len) as u64).div_ceil(A) as usize * A as usize;
+        if dst.len() < span {
+            return Err(eyre!("direct span dst {} < span {span} (pad {pad}, len {len})", dst.len()));
+        }
+        if dst.as_ptr() as usize & (A as usize - 1) != 0 {
+            return Err(eyre!("direct span dst is not {A}-aligned"));
+        }
+        let need = pad + len;
+        let mut got = 0usize;
+        while got < need {
+            let n = file
+                .read_at(&mut dst[got..span], abs - pad as u64 + got as u64)
+                .wrap_err_with(|| format!("O_DIRECT span pread at {} in shard {shard}", abs - pad as u64 + got as u64))?;
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        if got < need {
+            return Err(eyre!("O_DIRECT span short read: got {got} of {need}"));
+        }
+        Ok(Some(pad))
+    }
+
     pub fn read_range_into_direct_padded(
         &self,
         t: &StTensor,

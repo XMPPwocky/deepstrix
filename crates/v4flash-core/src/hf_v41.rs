@@ -820,6 +820,136 @@ impl V41HfWeights {
     /// offset's own 4096-residue. `Ok(None)` = no O_DIRECT handle for this shard.
     ///
     /// `dst` must be 4096-aligned and at least `hf_layout_direct_capacity`.
+    /// Read ALL THREE roles of expert `e` in TWO preads instead of six.
+    ///
+    /// The checkpoint stores experts EXPERT-MAJOR, role-minor: for every expert
+    /// the w1/w2/w3 weight planes are byte-contiguous (3 x 5.625 = 16.875 MB)
+    /// and so are its three scale planes (3 x 0.352 = 1.055 MB), with the two
+    /// runs far apart. VERIFIED across encoder and decoder layers, low and high
+    /// expert ids, and different shards — and CHECKED again here at run time,
+    /// returning `Ok(None)` (caller falls back) rather than trusting it.
+    ///
+    /// Why it matters: the per-role path issues six preads of ~5.6 MB and 0.35 MB
+    /// and measures 2.96 GB/s aggregate, while this drive does 4.47 GB/s on a
+    /// single ~20 MB O_DIRECT read. NVMe strongly prefers one large read.
+    ///
+    /// `dst_w` takes the weight run, `dst_s` the scale run; both must be
+    /// 4096-aligned and sized by `direct_capacity_for` of the RUN length.
+    /// Returns per-role `(packed_off, scale_off, out, nb)` into `dst_w`/`dst_s`.
+    pub fn read_expert_runs_direct(
+        &self,
+        vts: [&VTensor; 3],
+        e: usize,
+        dst_w: &mut [u8],
+        dst_s: &mut [u8],
+    ) -> eyre::Result<Option<[(usize, usize, u32, u32); 3]>> {
+        // ROLE order is the engine's (gate, up, down). PHYSICAL order in the
+        // checkpoint is NOT the same: the loader maps gate<-w1, up<-w3, down<-w2,
+        // so a run laid out w1,w2,w3 is gate,down,up. Rather than encode that
+        // mapping a second time (getting it wrong swapped up and down and made
+        // generation non-deterministic), derive each role's position in the run
+        // from its actual FILE OFFSET.
+        let mut wts = Vec::with_capacity(3);
+        let mut scs = Vec::with_capacity(3);
+        for vt in vts {
+            let Kind::Experts { prefix, which, n } = &vt.kind else {
+                return Err(eyre!("{}: not a stacked expert tensor", vt.name));
+            };
+            if e >= *n {
+                return Err(eyre!("{}: expert {e} >= {n}", vt.name));
+            }
+            let p = format!("{prefix}{e}.{which}.");
+            let wt = self.st.get(&format!("{p}weight"))?;
+            let sc = self.st.get(&format!("{p}scale"))?;
+            if !matches!(wt.dtype, StDtype::I8 | StDtype::U8) || sc.dtype != StDtype::F8E8M0 {
+                return Err(eyre!("{p}: expected I8 weight + F8_E8M0 scale"));
+            }
+            wts.push(wt);
+            scs.push(sc);
+        }
+        // Geometry is PER ROLE: gate/up are [N_FF_EXP, N_EMBD/2] while down is
+        // [N_EMBD, N_FF_EXP/2]. Only the BYTE lengths are uniform (both work out
+        // to rows*nb*16), and `repack_in_place` asserts (rows, nb) against its
+        // own per-role geometry — so these must be returned per role, not taken
+        // from role 0. Requiring equal shapes here silently disabled coalescing.
+        let mut geom = [(0usize, 0usize); 3];
+        for (r, t) in wts.iter().enumerate() {
+            let (out, half) = (t.shape[0] as usize, t.shape[1] as usize);
+            geom[r] = (out, half * 2 / 32);
+        }
+        let (packed_len, scale_len) = {
+            let (out0, nb0) = geom[0];
+            (out0 * nb0 * 16, out0 * nb0)
+        };
+        // Uniform byte length across roles is what makes one run sliceable.
+        if geom.iter().any(|&(o, n)| o * n * 16 != packed_len)
+            || wts.iter().any(|t| t.len as usize != packed_len)
+            || scs.iter().any(|t| t.len as usize != scale_len)
+        {
+            return Ok(None);
+        }
+        // Rank each role by file offset, then require the run to be contiguous
+        // in that order and all in one shard.
+        let rank = |v: &[&crate::safetensors::StTensor]| -> Option<[usize; 3]> {
+            let mut idx = [0usize, 1, 2];
+            idx.sort_by_key(|&i| v[i].offset);
+            let (a, b, c) = (idx[0], idx[1], idx[2]);
+            if v[a].shard != v[b].shard || v[b].shard != v[c].shard {
+                return None;
+            }
+            if v[a].offset + v[a].len != v[b].offset || v[b].offset + v[b].len != v[c].offset {
+                return None;
+            }
+            // position[role] = its slot within the run
+            let mut pos = [0usize; 3];
+            for (slot, &role) in idx.iter().enumerate() {
+                pos[role] = slot;
+            }
+            Some(pos)
+        };
+        let (Some(pos_w), Some(pos_s)) = (rank(&wts), rank(&scs)) else {
+            return Ok(None);
+        };
+        let (run_w, run_s) = (packed_len * 3, scale_len * 3);
+        let (w0, s0) = (
+            wts.iter().map(|t| t.offset).min().unwrap(),
+            scs.iter().map(|t| t.offset).min().unwrap(),
+        );
+        let t_pread = std::time::Instant::now();
+        let Some(pad_w) = self.st.read_span_into_direct_padded(wts[0].shard, w0, run_w, dst_w)?
+        else {
+            return Ok(None);
+        };
+        let Some(pad_s) = self.st.read_span_into_direct_padded(scs[0].shard, s0, run_s, dst_s)?
+        else {
+            return Ok(None);
+        };
+        EXPERT_READ_PROF.pread_ns.fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
+        EXPERT_READ_PROF.pread_bytes.fetch_add((run_w + run_s) as u64, Relaxed);
+        EXPERT_READ_PROF.calls.fetch_add(1, Relaxed);
+        let mut offs = [(0usize, 0usize, 0u32, 0u32); 3];
+        for (r, o) in offs.iter_mut().enumerate() {
+            *o = (
+                pad_w + pos_w[r] * packed_len,
+                pad_s + pos_s[r] * scale_len,
+                geom[r].0 as u32,
+                geom[r].1 as u32,
+            );
+        }
+        Ok(Some(offs))
+    }
+
+    /// Byte length of one expert's weight run and scale run (all three roles).
+    pub fn expert_run_lens(&self, vt: &VTensor) -> eyre::Result<(usize, usize)> {
+        let Kind::Experts { prefix, .. } = &vt.kind else {
+            return Err(eyre!("{}: not a stacked expert tensor", vt.name));
+        };
+        let wt = self.st.get(&format!("{prefix}0.w1.weight"))?;
+        let (out, half) = (wt.shape[0] as usize, wt.shape[1] as usize);
+        let nb = half * 2 / 32;
+        Ok((out * nb * 16 * 3, out * nb * 3))
+    }
+
     pub fn read_expert_hf_layout_direct(
         &self,
         vt: &VTensor,
