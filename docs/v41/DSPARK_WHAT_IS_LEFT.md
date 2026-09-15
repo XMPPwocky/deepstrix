@@ -139,8 +139,18 @@ So each swap replicates a piece of `DgpuScratch` into `BatchDgpuScratch`. That i
 the real cost of the project, and it is why it is multi-session: not algorithmic
 difficulty, but scratch plumbing, with a correctness gate after each step.
 
-**Sequence:** swap one component, run `V41_DSPARK_XCHECK=1` (one ~4-minute
-server run), keep it only if cos moves toward 1.0. When cos reaches ~0.999,
+**CORRECTION (measured): the swaps do NOT compose.** Adding decode's attention
+on top of decode's MoE moved cos 0.685/0.764 -> 0.595/0.788 — no improvement.
+Each swapped component still consumes DIVERGED INPUTS from the components ahead
+of it (the attention replay eats `sd.q_normed` from the prefill q-chain), so
+there is no partial credit and no monotonic progress to steer by. **The wholesale
+version is the only one that converges**: every per-layer kernel swapped at once,
+or the decode driver given a batch dimension. `V41_DSPARK_XCHECK` still gates it
+— it just cannot show progress until the last piece lands.
+
+**Superseded sequence (kept for the reasoning):** swap one component, run
+`V41_DSPARK_XCHECK=1` (one ~4-minute server run), keep it only if cos moves
+toward 1.0. When cos reaches ~0.999,
 acceptance should jump from 2.878 toward the oracle's 4.38 on its own, because
 the drafter is already validated — and only then is the verify's ~700 ms of
 box-1 expert misses worth attacking, since decode's residency is what the pager
