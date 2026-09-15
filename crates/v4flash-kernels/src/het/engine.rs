@@ -532,6 +532,35 @@ impl HeterogeneousEngine {
         )
     }
 
+    /// Publish the per-token device scalars a single layer consumes: the rope
+    /// position and the monotonic KV append slot.
+    ///
+    /// `forward_token_impl` writes these ONCE before its layer loop, because in
+    /// token-major order every layer's counters evolve in lockstep. A
+    /// LAYER-MAJOR driver (the speculative verify: all B rows at layer L, then
+    /// layer L+1) breaks that invariant — after layer 0 has run all B rows its
+    /// `n_raw` is +B while layer 1's is still +0 — so it must publish per
+    /// (row, layer) with the slot taken from THAT layer's state. Without this
+    /// the rope ropes at a stale position and attention is quietly wrong.
+    pub fn publish_pos_slot(
+        &self,
+        dgpu_scratch: &mut super::DgpuScratch,
+        pos: u32,
+        slot: u32,
+    ) -> color_eyre::eyre::Result<()> {
+        self.set_current_cached(self.dgpu.device)?;
+        let pos_ptr = dgpu_scratch.pos_dev.raw() as *mut u32;
+        let slot_ptr = dgpu_scratch.kv_slot_dev.raw() as *mut u32;
+        // SAFETY: scratch outlives the layer; the writes are stream-ordered on
+        // `de.compute` ahead of every consumer, exactly as in
+        // `forward_token_impl`.
+        unsafe {
+            self.dgpu.compute.write_value32(pos_ptr, pos)?;
+            self.dgpu.compute.write_value32(slot_ptr, slot)?;
+        }
+        Ok(())
+    }
+
     /// One DSpark draft step: entry, three drafter layers, exit.
     ///
     /// Spans both devices. The drafter's 7.93 GB of layers only fit on the iGPU;

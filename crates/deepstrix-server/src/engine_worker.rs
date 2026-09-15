@@ -2948,17 +2948,37 @@ fn finish_decode(
                         if let (Some(ei), Some(er)) = (eidx, erows[j].as_ref()) {
                             state.engine.stage_engram_rows(&mut state.dgpu_scratch, &er[ei])?;
                         }
-                        let pg = state.pager.as_mut().expect("pager");
-                        state.engine.forward_layer_standalone_graphs_paged(
-                            &mut state.dgpu_scratch,
-                            &mut state.igpu_scratch,
-                            &mut state.state.layers[layer],
-                            &state.weights.dgpu_layers[layer],
-                            &state.weights.igpu_layers[layer],
-                            pos + j as u32,
-                            toks[j],
-                            pg,
-                        )?;
+                        {
+                            // Layer-major breaks the lockstep the token-major
+                            // path assumes, so publish rope pos + KV slot from
+                            // THIS layer's counters, per row.
+                            let slot = state.state.layers[layer].raw_off
+                                + state.state.layers[layer].n_raw;
+                            state.engine.publish_pos_slot(
+                                &mut state.dgpu_scratch,
+                                pos + j as u32,
+                                slot,
+                            )?;
+                        }
+                        {
+                            // V4.1 reuse layers borrow another layer's
+                            // compressor store; `with_kv_source` lends it for
+                            // the call and gives it back. Without it the layer
+                            // errors with "reuse layer without its source's
+                            // store".
+                            let pg = state.pager.as_mut().expect("pager");
+                            let eng = &state.engine;
+                            let dgs = &mut state.dgpu_scratch;
+                            let igs = &mut state.igpu_scratch;
+                            let dlw = &state.weights.dgpu_layers[layer];
+                            let ilw = &state.weights.igpu_layers[layer];
+                            let (p, t) = (pos + j as u32, toks[j]);
+                            state.state.with_kv_source(layer, |ls| {
+                                eng.forward_layer_standalone_graphs_paged(
+                                    dgs, igs, ls, dlw, ilw, p, t, pg,
+                                )
+                            })?;
+                        }
                         state.dgpu_scratch.residual.copy_to_host(&mut resid[j])?;
                         state.dgpu_scratch.hc_pre_carry.copy_to_host(&mut carry[j])?;
                     }
