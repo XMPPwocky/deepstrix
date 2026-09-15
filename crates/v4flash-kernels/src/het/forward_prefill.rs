@@ -3438,7 +3438,17 @@ impl HeterogeneousEngine {
         // The shift may have source/dest overlap when n_raw_during_chunk is
         // between (SWA_WINDOW, 2*SWA_WINDOW), so route through the kv_ring
         // scratch buffer.
-        if n_raw_during_chunk > SWA_WINDOW {
+        // SPECULATIVE APPEND (a DSpark verify): the caller took a `KvMark` and
+        // will `rollback_kv` after deciding acceptance. The cache is sized
+        // SWA_WINDOW + B_MAX precisely so a small batch appends without evicting,
+        // so DON'T compact and DON'T reset raw_off here — that physically moved
+        // the window and made the mark unaddressable, which capped accept mode at
+        // generations shorter than the window. Leave the bytes and raw_off in
+        // place; `KvMark::advanced_by` slides the window pointer, and decode's
+        // own wrap path compacts later when the append region fills.
+        if speculative_append() {
+            ls.n_raw = n_raw_during_chunk;
+        } else if n_raw_during_chunk > SWA_WINDOW {
             let src_first_slot = n_raw_during_chunk - SWA_WINDOW;
             let head_dim = N_HEAD_DIM as usize;
             let ring_len = (SWA_WINDOW as usize) * head_dim;
@@ -3456,12 +3466,11 @@ impl HeterogeneousEngine {
                 dst_v.copy_from_buffer_async(&ring_src, &de.compute)?;
             }
             ls.n_raw = SWA_WINDOW;
+            ls.raw_off = 0;
         } else {
             ls.n_raw = n_raw_during_chunk;
+            ls.raw_off = 0;
         }
-        // M55: prefill always leaves the live window at slots [0..n_raw);
-        // reset the decode-side monotonic offset to match.
-        ls.raw_off = 0;
 
         // ========================================================
         // Stage 6: Output projection (rope_inv per b, then BATCHED q8)
@@ -5501,6 +5510,30 @@ pub fn single_lane_max() -> usize {
 /// Set the single-lane threshold at runtime. See `single_lane_max`.
 pub fn set_single_lane_max(v: usize) {
     SINGLE_LANE_MAX.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Set for the duration of a DSpark verify so the post-attention pass leaves the
+/// raw window exactly where the caller's `KvMark` addresses it (no compaction,
+/// no raw_off reset). See the eviction block and `KvMark::advanced_by`.
+static SPECULATIVE_APPEND: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn speculative_append() -> bool {
+    SPECULATIVE_APPEND.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Scope guard: sets the speculative-append flag, clears it on drop.
+pub struct SpeculativeAppend;
+impl SpeculativeAppend {
+    pub fn begin() -> Self {
+        SPECULATIVE_APPEND.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+impl Drop for SpeculativeAppend {
+    fn drop(&mut self) {
+        SPECULATIVE_APPEND.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// `V41_GROUP_AUDIT=1`: verify the het-split builder enqueued every local pick.

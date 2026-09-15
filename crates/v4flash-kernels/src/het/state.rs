@@ -261,7 +261,7 @@ impl HetModelState {
                 indexer: l.indexer_compressor.as_ref().map(CompStateMark::capture).transpose()?,
             }));
         }
-        Ok(KvMark { per_layer, per_layer_comp })
+        Ok(KvMark { per_layer, per_layer_comp, slid: false })
     }
 
     /// Undo the KV appends made since `mark`.
@@ -294,12 +294,29 @@ impl HetModelState {
                 self.layers.len()
             ));
         }
-        for (i, (_, raw_off)) in mark.per_layer.iter().copied().enumerate() {
-            if self.layers[i].raw_off < raw_off {
+        if !mark.slid {
+            for (i, (_, raw_off)) in mark.per_layer.iter().copied().enumerate() {
+                if self.layers[i].raw_off < raw_off {
+                    return Err(eyre!(
+                        "rollback_kv: layer {i} wrapped since the mark (raw_off {} < marked {raw_off}); \
+                         the eviction-down copy moved the window, so the mark no longer addresses it",
+                        self.layers[i].raw_off
+                    ));
+                }
+            }
+        }
+        // A slid mark must still fit the oversized cache. If the append pointer
+        // is within MTP_BLOCK of the end, the next verify append would OOB — the
+        // window needs compacting down, which the caller must do before the next
+        // step (decode's own wrap path). Refuse loudly rather than corrupt.
+        for (i, (n_raw, raw_off)) in mark.per_layer.iter().copied().enumerate() {
+            if mark.slid
+                && (raw_off + n_raw) as usize + crate::het::mtp::MTP_BLOCK > KV_CACHE_ROWS
+            {
                 return Err(eyre!(
-                    "rollback_kv: layer {i} wrapped since the mark (raw_off {} < marked {raw_off}); \
-                     the eviction-down copy moved the window, so the mark no longer addresses it",
-                    self.layers[i].raw_off
+                    "rollback_kv: layer {i} slid append pointer {} within MTP_BLOCK of cache \
+                     capacity {KV_CACHE_ROWS} — needs compaction (not yet wired for accept)",
+                    raw_off + n_raw
                 ));
             }
         }
@@ -393,6 +410,11 @@ fn comp_rollback_enabled() -> bool {
 pub struct KvMark {
     /// `(n_raw, raw_off)` per layer at mark time.
     pub per_layer: Vec<(u32, u32)>,
+    /// True when produced by [`Self::advanced_by`]: the target `raw_off` is a
+    /// SLID window pointer that legitimately moved FORWARD, so the wrap check in
+    /// `rollback_kv` (which exists to catch a compaction that moved bytes
+    /// BACKWARD) must not fire on it. A plain `mark_kv` leaves this false.
+    pub slid: bool,
     /// Compressor store per layer at mark time, for the layers that OWN one
     /// (`with_kv_source` lends it to the reuse layers, so only the 4 KV-source
     /// layers are `Some`).
@@ -450,7 +472,23 @@ impl KvMark {
     ///     Exactness here needs a per-row accumulator snapshot, which the
     ///     batched compressor (one launch for the whole chunk) cannot provide.
     pub fn advanced_by(&self, keep: u32, abs_pos: u32) -> Self {
-        let per_layer = self.per_layer.iter().map(|&(nr, off)| (nr + keep, off)).collect();
+        // SLIDING WINDOW, not a growing count. Decode keeps a monotonic append
+        // region of size SWA_WINDOW + B_MAX: the append pointer is `off + nr`,
+        // and the live window is the LAST min(count, SWA_WINDOW) rows. Growing
+        // `nr` past SWA_WINDOW (the old behaviour) let attention read beyond the
+        // window and eventually ran off the buffer, corrupting long
+        // speculative generations. Advance the pointer by `keep`, then re-derive
+        // (nr, off) as the trailing window — no byte movement, because the kept
+        // rows already sit at `[off+nr .. off+nr+keep)` from the verify append.
+        let per_layer = self
+            .per_layer
+            .iter()
+            .map(|&(nr, off)| {
+                let end = off + nr + keep; // append pointer after the kept rows
+                let new_nr = end.min(SWA_WINDOW);
+                (new_nr, end - new_nr)
+            })
+            .collect();
         let per_layer_comp = self
             .per_layer_comp
             .iter()
@@ -480,7 +518,7 @@ impl KvMark {
                 })
             })
             .collect();
-        Self { per_layer, per_layer_comp }
+        Self { per_layer, per_layer_comp, slid: true }
     }
 }
 

@@ -242,6 +242,10 @@ static XCHECK_TOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 static XCHECK_COS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 #[cfg(feature = "v41")]
 static XCHECK_COS_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// KL(decode || verify) in nats x 1e6, summed over row-0 softmax distributions.
+/// The principled "same distribution" measure — cosine on raw logits is
+/// scale-sensitive and ignores the softmax the tokens are actually drawn from.
+static XCHECK_KLD: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// `V41_SMALL_B_CATCHALL_AB=<max>`: interleave the small-B catch-all ON/OFF by
 /// step parity and bucket the xcheck by arm. Under the SHADOW probe this is a
@@ -2848,6 +2852,11 @@ fn finish_decode(
             probe_fp_before = if probe_fprint { Some(probe_fingerprint(state)?) } else { None };
             embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, next, &mut residual);
             let mark = state.state.mark_kv();
+            // Same as the accept path: hold the raw window in decode addressing
+            // so the probe's plain `rollback_kv(&mark)` still addresses it after
+            // an SWA eviction. Without this the probe fails on any long-context
+            // prompt with "rollback refused ... layer 0 wrapped".
+            let _spec = v4flash_kernels::het::forward_prefill::SpeculativeAppend::begin();
             let pc0 = state.pager.as_ref().map(|p| p.counters()).unwrap_or_default();
             // Interleave the small-B catch-all by step parity. Decode drives the
             // text, so both arms verify the SAME token sequence at the same
@@ -3043,6 +3052,15 @@ fn finish_decode(
                 .is_some_and(|m| m.ingested == 0 && m.confirmed.is_empty() && m.pending.is_some())
         {
             let k = v4flash_kernels::het::mtp::MTP_BLOCK;
+            // Hold the raw window in decode's monotonic addressing across the
+            // whole verify: the prefill path would otherwise compact and reset
+            // raw_off, making the `KvMark` below unaddressable and capping accept
+            // mode at generations shorter than SWA_WINDOW. The verify appends B
+            // rows to the oversized tail; `advanced_by` commits only the accepted
+            // prefix by sliding the window pointer, and the rejected rows are
+            // overwritten by the next verify (commit-on-accept; rollback = don't
+            // commit).
+            let _spec = v4flash_kernels::het::forward_prefill::SpeculativeAppend::begin();
             let drafts = state.mtp.as_ref().unwrap().pending.unwrap();
             // Inputs: the head token, then ALL K drafts — K+1 positions.
             //
@@ -3451,6 +3469,30 @@ fn finish_decode(
                     let cos = dot / (na.sqrt() * nb.sqrt()).max(1e-12);
                     XCHECK_COS.fetch_add((cos * 1e6) as i64, Relaxed);
                     XCHECK_COS_N.fetch_add(1, Relaxed);
+                    // KL(decode || verify) in nats. decode (`dl`) is ground
+                    // truth, verify (`xcheck_row0`) the approximation; softmax
+                    // both (max-shifted), then sum q*(log q - log p).
+                    {
+                        let vmax = xcheck_row0.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let dmax = dl.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let mut vz = 0.0f64;
+                        let mut dz = 0.0f64;
+                        for i in 0..nv {
+                            vz += ((xcheck_row0[i] - vmax) as f64).exp();
+                            dz += ((dl[i] - dmax) as f64).exp();
+                        }
+                        let (lvz, ldz) = (vz.ln(), dz.ln());
+                        let mut kld = 0.0f64;
+                        for i in 0..nv {
+                            let lq = (dl[i] - dmax) as f64 - ldz;
+                            let q = lq.exp();
+                            if q > 1e-12 {
+                                let lp = (xcheck_row0[i] - vmax) as f64 - lvz;
+                                kld += q * (lq - lp);
+                            }
+                        }
+                        XCHECK_KLD.fetch_add((kld * 1e6) as i64, Relaxed);
+                    }
                     XCHECK_ARM_COS[xcheck_arm].fetch_add((cos * 1e6) as i64, Relaxed);
                     XCHECK_ARM_COS_N[xcheck_arm].fetch_add(1, Relaxed);
                 }
@@ -3469,8 +3511,14 @@ fn finish_decode(
                 total = tot,
                 rate = format!("{:.4}", ok as f64 / tot as f64),
                 mean_cos = {
-                    let (c, n) = (XCHECK_COS.swap(0, Relaxed), XCHECK_COS_N.swap(0, Relaxed));
+                    let n = XCHECK_COS_N.load(Relaxed);
+                    let c = XCHECK_COS.swap(0, Relaxed);
                     if n > 0 { format!("{:.6}", c as f64 / 1e6 / n as f64) } else { "n/a".into() }
+                },
+                mean_kld_nats = {
+                    let n = XCHECK_COS_N.swap(0, Relaxed);
+                    let k = XCHECK_KLD.swap(0, Relaxed);
+                    if n > 0 { format!("{:.5}", k as f64 / 1e6 / n as f64) } else { "n/a".into() }
                 },
                 "dspark.xcheck: verify-path vs decode-path logits"
             );
