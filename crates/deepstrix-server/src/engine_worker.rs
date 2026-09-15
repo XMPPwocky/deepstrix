@@ -2851,6 +2851,9 @@ fn finish_decode(
                 verify_probe_ks[(completion_tokens as usize) % verify_probe_ks.len()];
             probe_fp_before = if probe_fprint { Some(probe_fingerprint(state)?) } else { None };
             embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, next, &mut residual);
+            // Compact any slid window to [0, n_raw) so the prefill-path verify
+            // attends to the same keys decode does (see normalize_raw_windows).
+            state.engine.normalize_raw_windows(&mut state.dgpu_scratch, &mut state.state)?;
             let mark = state.state.mark_kv();
             // Same as the accept path: hold the raw window in decode addressing
             // so the probe's plain `rollback_kv(&mark)` still addresses it after
@@ -3086,6 +3089,9 @@ fn finish_decode(
                     (Some(pg), Some(ec)) => Some(ec.rows_for_chunk(pg.raw(), &toks, pos)?),
                     _ => None,
                 };
+            // Compact any slid window to [0, n_raw) so the prefill-path verify
+            // attends to the same keys decode does, and the mark records raw_off=0.
+            state.engine.normalize_raw_windows(&mut state.dgpu_scratch, &mut state.state)?;
             let mark = state.state.mark_kv();
             let t_step = std::time::Instant::now();
             let spc0 = state.pager.as_ref().map(|p| p.counters()).unwrap_or_default();

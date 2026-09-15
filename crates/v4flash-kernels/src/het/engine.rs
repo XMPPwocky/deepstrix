@@ -561,6 +561,48 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
+    /// Compact every layer's raw KV window down to slots `[0, n_raw)` and reset
+    /// `raw_off = 0`, so a subsequent PREFILL-path verify (which addresses the
+    /// window from slot 0) attends to exactly the same keys DECODE does.
+    ///
+    /// Decode keeps a MONOTONIC ring `[raw_off, raw_off + n_raw)` and only
+    /// compacts once per B_MAX tokens; the speculative verify runs the prefill
+    /// path, which assumes `[0, n_raw)`. While `raw_off == 0` they coincide, but
+    /// once the window has slid the verify reads the wrong slots (KL(decode||
+    /// verify) jumps from ~0.0008 to ~4 nats). Calling this before the verify's
+    /// `mark_kv` keeps them in agreement. Same overlap-safe two-hop copy the
+    /// decode wrap uses; a no-op on layers already at `raw_off == 0`.
+    pub fn normalize_raw_windows(
+        &self,
+        dgpu_scratch: &mut super::DgpuScratch,
+        state: &mut super::HetModelState,
+    ) -> color_eyre::eyre::Result<()> {
+        use crate::config::N_HEAD_DIM;
+        self.set_current_cached(self.dgpu.device)?;
+        let head_dim = N_HEAD_DIM as usize;
+        for ls in state.layers.iter_mut() {
+            if ls.raw_off == 0 || ls.n_raw == 0 {
+                ls.raw_off = 0;
+                continue;
+            }
+            let win_len = (ls.n_raw as usize) * head_dim;
+            let src_off = (ls.raw_off as usize) * head_dim;
+            {
+                let mut sc = dgpu_scratch.kv_wrap_scratch.slice_view_mut(0, win_len);
+                let src = ls.kv_cache.slice_view(src_off, win_len);
+                sc.copy_from_buffer_async(&src, &self.dgpu.compute)?;
+            }
+            {
+                let sc = dgpu_scratch.kv_wrap_scratch.slice_view(0, win_len);
+                let mut dst = ls.kv_cache.slice_view_mut(0, win_len);
+                dst.copy_from_buffer_async(&sc, &self.dgpu.compute)?;
+            }
+            ls.raw_off = 0;
+        }
+        self.dgpu.compute.synchronize()?;
+        Ok(())
+    }
+
     /// One DSpark draft step: entry, three drafter layers, exit.
     ///
     /// Spans both devices. The drafter's 7.93 GB of layers only fit on the iGPU;
