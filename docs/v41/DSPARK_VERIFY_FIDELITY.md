@@ -169,3 +169,34 @@ work (cost is max(box1, box2), measured three times), and the link is 3% of the
 token. So even a FREE verify leaves decode at 192 ms/token = 5.2 tok/s. Reaching
 20 tok/s needs the expert FORMAT lever (fitting all 15,360 experts in RAM), not
 a better verify.
+
+## Box 2 slot rebalance: REFUTED (2026-09-15)
+
+Decode is 63% box-2 expert service, and box 2's service is almost entirely its
+own page misses. Measured over a 400-token run on the shipped placement
+(260 encoder / 68 decoder slots per layer, 6560 total):
+
+    requests +97,239   misses +7,469   =  18.7 misses/token x 7.14 ms ~ 133 ms/token
+
+and it does NOT warm out (first 80 tokens 228 ms, last 80 210 ms). The obvious
+move is to shift slots from the encoder half — which box 1 already covers with
+21 pinned dense windows — to the decoder half. `box2_placement_164_164.txt` is
+exactly that: same 6560 total slots, 164/164 instead of 260/68, so identical RAM
+and no change to box 1's stride constraint (residency comes from the placement
+file, ownership from `--experts`).
+
+WORSE, on the same prompt with box 2's LRU warmed to convergence:
+
+    260/68    177.95 ms/tok     aggregate hit 0.9386
+    164/164   263.37 ms/tok     aggregate hit 0.9449   (+48% slower)
+
+The aggregate hit rate IMPROVED and decode still got much worse, because the
+aggregate is dominated by prefill traffic: moving slots off the encoder half
+hurts the decode-time working set more than the extra decoder slots help. Keep
+260/68. (Care needed reading this: the first attempt looked favourable only
+because box 2's LRU was cold after the restart — 48k requests against the
+8.5M the incumbent had accumulated. Always warm box 2 to convergence, ~300k
+requests, before comparing placements.)
+
+Box 2's miss rate is therefore a genuine capacity wall at 124 GB, not a
+placement-policy problem, which points back at the expert FORMAT lever.
