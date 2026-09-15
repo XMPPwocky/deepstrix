@@ -60,7 +60,16 @@ fn drafter_loads() {
         total += l.attn_output_a.buffer.len() + l.attn_output_b.buffer.len();
     }
     assert_eq!(w.main_norm.len(), N_EMBD as usize, "main_norm");
-    assert_eq!(w.norm.len(), N_EMBD as usize, "exit norm");
+    // The exit lives on the dGPU in production (beside the tied head), so its
+    // weights load separately; here they share this device.
+    let xw = v4flash_kernels::het::weights::MtpExitWeights::load(&hf, dev)
+        .expect("load exit weights");
+    assert_eq!(xw.norm.len(), N_EMBD as usize, "exit norm");
+    assert_eq!(
+        xw.confidence.len(),
+        N_EMBD as usize + v4flash_kernels::het::mtp::MTP_MARKOV_RANK,
+        "confidence head is [1, dim + markov_rank]"
+    );
     total += w.main_proj.buffer.len();
 
     println!(

@@ -157,6 +157,20 @@ pub fn bytes_per_expert(dt: GgufType, k: u64, rows: u64) -> eyre::Result<usize> 
     Ok((rows as usize) * (k as usize / block_elems as usize) * block_bytes as usize)
 }
 
+/// True for the DSpark drafter's layers.
+///
+/// The drafter is presented as `blk.{N_LAYER + s}` so it reuses the main-layer
+/// loaders unchanged, but it routes top-3 over 128 experts where the main model
+/// is top-6 over 384. Its expert tensors are therefore a third the width, which
+/// is a legitimate shape, not a contract violation.
+fn is_drafter_layer(name: &str) -> bool {
+    name.strip_prefix("blk.")
+        .and_then(|r| r.split('.').next())
+        .and_then(|i| i.parse::<i32>().ok())
+        .map(|i| i >= crate::config::N_LAYER)
+        .unwrap_or(false)
+}
+
 /// Validate every governed tensor of a model against the contract.
 /// Returns Ok(()) or ONE error carrying the full list of violations —
 /// the "clean enumerated error list" a new quant mix should fail with
@@ -185,7 +199,16 @@ pub fn validate_model(tensors: &[GgufTensor]) -> eyre::Result<()> {
                     .join("|")
             ));
         }
-        if let Some(dims) = expected_dims(&role) {
+        if let Some(mut dims) = expected_dims(&role) {
+            // Substitute the drafter's expert count rather than skipping the
+            // check, so its tensors stay governed by the same contract.
+            if is_drafter_layer(&t.name) {
+                for d in dims.iter_mut() {
+                    if *d == N_EXPERT as u64 {
+                        *d = v4flash_core::hf_v41::MTP_N_EXPERT as u64;
+                    }
+                }
+            }
             if t.dims != dims {
                 violations.push(format!(
                     "{}: dims {:?} != expected {:?}",

@@ -224,8 +224,48 @@ pub struct MtpWeights {
     pub main_proj: DeviceWeight,
     pub main_norm: DeviceBuffer<f32>,
     pub layers: Vec<MtpLayerWeights>,
-    /// Exit: final norm before the tied head.
+}
+
+/// The drafter's EXIT weights, loaded separately because they live on a
+/// different device than the layers.
+///
+/// The drafter's head is TIED to the main model's `output` weight, which is
+/// dGPU-resident, and the drafter's 7.93 GB of layers only fit on the iGPU. So
+/// the layer stack runs on the iGPU and the exit on the dGPU, with the residual
+/// handed across. Loading these onto the layer device instead would mean either
+/// a second 662 MB copy of the vocab projection or a cross-device matvec.
+pub struct MtpExitWeights {
+    /// `mtp.2.norm.weight` — final norm before the tied head.
     pub norm: DeviceBuffer<f32>,
+    /// `mtp.2.markov_head.head.weight` [N_VOCAB, 256] — projects a markov
+    /// embedding back to a full-vocab logit bias. Its EMBEDDING half stays
+    /// host-side like `token_embd` (M57): the ids it looks up are produced one
+    /// at a time by the exit's sequential loop, so a device gather would buy
+    /// nothing.
+    pub markov_head: DeviceWeight,
+    /// `mtp.2.confidence_head.proj.weight` [1, N_EMBD + 256]. Loaded but not yet
+    /// consumed — confidence gates HOW MANY drafts to submit, which is a policy
+    /// knob on top of a correct draft, not part of producing one.
+    pub confidence: DeviceBuffer<f32>,
+}
+
+impl MtpExitWeights {
+    pub fn load<'a>(gguf: impl Into<WeightSrc<'a>>, device: Device) -> eyre::Result<Self> {
+        let gguf: WeightSrc<'a> = gguf.into();
+        device.set_current()?;
+        let id = device.id;
+        let last = v4flash_core::hf_v41::MTP_STAGES - 1;
+        Ok(Self {
+            norm: load_f32_weight(gguf, &format!("mtp.{last}.norm.weight"), id, N_EMBD as usize)?,
+            markov_head: load_to_device(gguf, &format!("mtp.{last}.markov_head.weight"), id)?,
+            confidence: load_f32_weight(
+                gguf,
+                &format!("mtp.{last}.confidence.weight"),
+                id,
+                N_EMBD as usize + crate::het::mtp::MTP_MARKOV_RANK,
+            )?,
+        })
+    }
 }
 
 impl MtpWeights {
@@ -244,13 +284,6 @@ impl MtpWeights {
 
         let main_proj = load_to_device(gguf, "mtp.0.main_proj.weight", device_id)?;
         let main_norm = load_f32_weight(gguf, "mtp.0.main_norm.weight", device_id, N_EMBD as usize)?;
-        let norm = load_f32_weight(
-            gguf,
-            &format!("mtp.{}.norm.weight", n_stages - 1),
-            device_id,
-            N_EMBD as usize,
-        )?;
-
         let mut layers = Vec::with_capacity(n_stages);
         for sgi in 0..n_stages {
             let l = n_layers + sgi;
@@ -296,7 +329,7 @@ impl MtpWeights {
                 routed,
             });
         }
-        Ok(Self { main_proj, main_norm, layers, norm })
+        Ok(Self { main_proj, main_norm, layers })
     }
 }
 

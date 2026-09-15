@@ -37,3 +37,4 @@ external/ds4-dump/quants-selftest
 # Server/daemon logs and perfetto captures: regenerable, and large.
 /logs/
 /traces/
+scripts/v41_oracle/__pycache__/
