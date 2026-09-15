@@ -155,3 +155,44 @@ acceptance should jump from 2.878 toward the oracle's 4.38 on its own, because
 the drafter is already validated — and only then is the verify's ~700 ms of
 box-1 expert misses worth attacking, since decode's residency is what the pager
 is already tuned for.
+
+## Driving decode's per-layer function from outside: the undocumented contract
+
+`forward_layer_standalone_graphs_paged` is public and looks like a reusable
+per-layer unit. It is not: `forward_token_impl` maintains several invariants
+around it that are nowhere stated, and a LAYER-MAJOR driver (all B rows at layer
+L, then L+1) violates each one. Found by failure, in this order:
+
+1. **Rope position + KV append slot.** Written ONCE before the token-major layer
+   loop, because "the slot is identical across layers — counters evolve in
+   lockstep". Layer-major breaks that: after layer 0 has run all B rows its
+   `n_raw` is +B while layer 1's is +0. Every row then ropes at a stale
+   position, silently. Fixed by `publish_pos_slot` per (row, layer) — worth
+   E 1.4-1.8 -> 1.9-2.3.
+2. **KV-source lending.** V4.1 reuse layers borrow another layer's compressor
+   store; the call must be wrapped in `HetModelState::with_kv_source`. Fails
+   loudly: "L3: reuse layer without its source's store".
+3. **SWA eviction.** Token-major appends +1 per layer per token and compresses
+   back to the window between tokens. Layer-major appends +B to a layer before
+   any eviction runs, so the window overflows: "attention_swa: n_kv=129 exceeds
+   kernel cap 128". NOT yet handled.
+4. **At least one more.** With 1 and 2 fixed and before 3 could fire, acceptance
+   was still E ~ 1.1-1.24 against a shadow-measured drafter ceiling of ~2.26 —
+   so something else in the per-token contract is still unmet.
+
+**Conclusion: the batched verify belongs INSIDE the engine**, as a real batched
+decode entry point that owns these invariants, not bolted together from the
+server by calling a per-layer function whose contract is implicit. Each fix
+above was a guess validated by a 4-minute run; that is the wrong loop for
+something with this many hidden preconditions.
+
+**What the experiment DID establish, and it is the valuable part:**
+
+    decode-path verify:  prefill_misses=0  decode_misses=0  read_ms=0
+    batched verify:      prefill_misses~275  read_ms~660
+
+**The verify's ~700 ms of expert misses is a property of the BATCHED DRIVER's
+union paging, not of speculation.** Decode's path takes ZERO, because the T2
+catch-all hands misses to box 2's own disk. So a batched decode entry point
+would get the miss elimination for free — the thing four separate attempts to
+patch the prefill driver's expert split could not achieve correctly.
