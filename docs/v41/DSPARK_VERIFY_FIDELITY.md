@@ -328,3 +328,49 @@ curve with the verify on a batched DECODE path (box 2's per-layer cost
 `105 + 20B + 87D` us, sel_sync and link amortised 6x) prices at ~110-130 ms for
 B=6, i.e. ~55-65 ms/token against decode's 80 — the first configuration where
 speculation actually pays.
+
+### Root-cause lead: the remote partial is the WRONG LAYER's (2026-09-15)
+
+`V41_REMOTE_DBG=1` prints, per combine, the L2 of box 1's local MoE leg and of
+box 2's partial. Classifying every repeated `remote_l2` by whether it recurs on
+the SAME layer (legitimate — same computation across verifies) or a DIFFERENT
+layer (impossible unless the partial is misrouted):
+
+    config                     combines   repeats on a DIFFERENT layer
+    1 row per lane (correct)     1280       28   (2.2%)
+    2 rows per lane (broken)      680      274   (40.3%)   <- 18x
+
+Two in five combines in the broken config add a partial byte-identical to another
+layer's, while `remote_ffn_moe_valid` reads true. Directly visible in a single
+pair:
+
+    L38  b=2  local_l2= 59.8256  remote_l2=30.4742
+    L39  b=2  local_l2=300.8327  remote_l2=30.4742   <- identical to 4 dp
+
+So box 1 is adding the wrong layer's expert contribution. That explains both the
+SIZE of the corruption (box 2 carries most of the MoE mass under the catch-all,
+so a misrouted partial is catastrophic rather than a perturbation) and why it
+needs >= 2 rows in a lane to appear.
+
+NOT a stale-flag double-add: `remote_ffn_moe_valid` is cleared immediately after
+the `vec_add` (forward_prefill.rs). The content is wrong while the flag is right,
+so the fault is upstream — in which response `partial.f32()` hands back, or in
+the submit/wait pairing, despite `wait` checking `m.layer != ticket.layer`.
+
+Next: log `(ticket.layer, ticket.seq, m.layer, m.seq)` on every wait in the
+prefill path and find the first layer where the response's seq is not the one
+just submitted.
+
+### Bonus finding: the verify walks every layer TWICE at small B
+
+`DEEPSTRIX_PREFILL_PROFILE=1` on a B=1 verify shows `dgpu.ffn_combine calls=80`
+for 40 layers — lane B is walked even though `lane_split` gives it ZERO rows.
+Collapsing to one lane at B=1 is free and saves 34%:
+
+    B=1  two-lane 222.1 ms cos 0.999045   one-lane 146.7 ms cos 0.999045
+    B=2  two-lane 344.0 ms cos 0.998101   one-lane 423.4 ms cos 0.534637
+
+But it cannot be turned on generally: the driver is correct only at <= 1 row per
+lane, and it has 2 lanes. **That is the structural trap** — B>=3 can never be
+correct in this driver until the >=2-rows-per-lane bug is fixed, and fixing it
+also unlocks the single-lane saving.
