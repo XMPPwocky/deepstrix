@@ -2691,6 +2691,12 @@ impl HeterogeneousEngine {
                 &super::trace::phase::REMOTE_RTT_NS,
                 (super::perfetto::now_ns() - t_wait) as u64,
             );
+            // Box 2's own service time for this exchange, so the summary can
+            // say whether the wait was box 2 working or the link.
+            super::trace::phase::add(
+                &super::trace::phase::REMOTE_SRV_NS,
+                (partial.t_remote_server_us as u64) * 1000,
+            );
             // Box 2 reports which of these picks it had to page. Mark them so box 1's
             // decode LRU fills from box-2 MISSES instead of ambient traffic — the
             // difference between an exclusive cache (worth +6547 us/pick) and a

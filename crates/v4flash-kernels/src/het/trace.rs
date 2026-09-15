@@ -271,6 +271,11 @@ pub mod phase {
     /// host tracks, because this counter looks identical whether the round
     /// trip hid under local compute or serialised in front of it.
     pub static REMOTE_RTT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Box 2's OWN reported service time for the same exchanges, so the
+    /// token summary can split the wait into "box 2 working" and "everything
+    /// else" (wire, wake-up, protocol). Without the split, `remote_rtt_us`
+    /// only says box 1 waited, not what it waited ON.
+    pub static REMOTE_SRV_NS: AtomicU64 = AtomicU64::new(0);
 
     /// Host phases OUTSIDE `forward_token_impl`'s `token_start..sync` bracket
     /// but ON the decode loop's critical path (engine_worker.rs
@@ -296,6 +301,7 @@ pub mod phase {
         ENSURE_NS.store(0, Relaxed);
         ENGRAM_STAGE_NS.store(0, Relaxed);
         REMOTE_RTT_NS.store(0, Relaxed);
+        REMOTE_SRV_NS.store(0, Relaxed);
     }
     pub fn add(c: &AtomicU64, ns: u64) {
         c.fetch_add(ns, Relaxed);
@@ -342,6 +348,7 @@ pub struct TokenTiming {
     /// Overlapped work, so this is NOT additive with the rest — compare it
     /// against `total_us` to see whether the round trip is hidden.
     pub remote_rtt_us: u64,
+    pub remote_srv_us: u64,
     /// `stage_engram_rows` H2D inside the bracket (V4.1 Engram layers 1, 14).
     pub engram_stage_us: u64,
     /// Bracket edges inside `forward_token_impl`, NOT part of `total_us`:
@@ -378,6 +385,8 @@ impl TokenTiming {
             host_us = self.host_us,
             sync_us = self.sync_us,
             remote_rtt_us = self.remote_rtt_us,
+            remote_srv_us = self.remote_srv_us,
+            remote_link_us = self.remote_rtt_us.saturating_sub(self.remote_srv_us),
             sel_sync_us = self.sel_sync_us,
             pager_ensure_us = self.pager_ensure_us,
             pager_read_us = self.pager_read_us,
