@@ -1365,6 +1365,15 @@ pub fn remote_batched_multi() -> bool {
 /// only the byte lengths are uniform, which is what makes one run sliceable.
 /// Contiguity and uniform length are CHECKED per expert, falling back to the
 /// per-role path rather than trusting the layout.
+/// `V41_B2_COALESCE_CHECK=1`: byte-compare every coalesced expert read against
+/// the per-role read. Diagnostic only; costs an extra full read per page-in.
+pub fn coalesce_check() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(std::env::var("V41_B2_COALESCE_CHECK").as_deref(), Ok("1") | Ok("on"))
+    });
+    *B
+}
+
 pub fn b2_coalesce() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         matches!(std::env::var("V41_B2_COALESCE").as_deref(), Ok("1") | Ok("on"))
@@ -1924,6 +1933,42 @@ impl ExpertShard {
                         offs[i] = Some(o[i]);
                     }
                     coalesced = true;
+                }
+            }
+            // `V41_B2_COALESCE_CHECK=1`: verify a coalesced read against the
+            // per-role read of the SAME expert, byte for byte. Run it at
+            // `V41_B2_POOL_FLOOR=0`, where page-ins are frequent — that is the
+            // regime where coalescing was observed to corrupt.
+            if coalesced && coalesce_check() {
+                let (ab, c) = stage.split_at_mut(2);
+                let ref_buf = c[0].as_mut_slice();
+                let src0 = WeightSrc::from(owner);
+                for r in 0..3 {
+                    let name = &names[r];
+                    let t = src0.tensor(name).ok_or_else(|| eyre!("missing {name}"))?;
+                    let Some((pw2, ps2, out2, nb2)) =
+                        src0.read_expert_hf_layout_direct(&t, e as usize, ref_buf)?
+                    else {
+                        continue;
+                    };
+                    let (po, so, out1, nb1) = offs[r].expect("coalesced offs");
+                    let (plen, slen) = (out2 as usize * nb2 as usize * 16, out2 as usize * nb2 as usize);
+                    if (out1, nb1) != (out2, nb2) {
+                        eprintln!("COALESCE_CHECK L{layer} e{e} role{r}: geom {:?} != {:?}",
+                                  (out1, nb1), (out2, nb2));
+                    }
+                    let got_p = &ab[0].as_slice()[po..po + plen];
+                    let ref_p = &ref_buf[pw2..pw2 + plen];
+                    if got_p != ref_p {
+                        let i = got_p.iter().zip(ref_p).position(|(a, b)| a != b).unwrap_or(0);
+                        eprintln!("COALESCE_CHECK L{layer} e{e} role{r}: PACKED differs at byte {i}                                    of {plen} (coalesced off {po}, per-role off {pw2})");
+                    }
+                    let got_s = &ab[1].as_slice()[so..so + slen];
+                    let ref_s = &ref_buf[ps2..ps2 + slen];
+                    if got_s != ref_s {
+                        let i = got_s.iter().zip(ref_s).position(|(a, b)| a != b).unwrap_or(0);
+                        eprintln!("COALESCE_CHECK L{layer} e{e} role{r}: SCALE differs at byte {i}                                    of {slen} (coalesced off {so}, per-role off {ps2})");
+                    }
                 }
             }
             if !coalesced {
