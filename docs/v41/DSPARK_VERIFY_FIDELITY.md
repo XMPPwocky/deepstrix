@@ -70,3 +70,43 @@ under the compressor bug.
 verify cost reduction just to reach parity, and ~12x for 20 tok/s. E also swings
 1.24-2.07 run to run on identical config, so acceptance is not yet a stable
 quantity to optimise against.
+
+## The verify CAN be made 2.9x faster — the blocker is correctness, not cost
+
+Measured with `V41_T2_CATCHALL=2` (deterministic split, so the numbers mean
+something) and the compressor rollback fixed:
+
+| verify arm | prefill_misses | read_ms | verify total | cos |
+|---|---|---|---|---|
+| catch-all off | 298 | 724 | **1250 ms** | 0.814 |
+| `_DET=1` (all picks to box 2) | **0** | **0** | **429 ms** | 0.521 |
+| residency-based | 0 | 0 | 1370 ms | 0.512 |
+| residency, decoder half only | 9 | 130 | 1423 ms | 0.569 |
+
+So the offload DOES eliminate box 1's expert misses and takes the verify from
+1250 ms to 429 ms — a 2.9x cut, and the miss elimination is real
+(`prefill_misses` 298 -> 0). **Every variant loses fidelity the same way**
+(cos ~0.52 against 0.81 with it off), so the remaining blocker is correctness,
+not cost.
+
+### What it is NOT
+
+- **Not the static HELLO mask dropping picks.** `V41_MASK_DBG=1` reports zero
+  masked-live picks: `remote_exclude()` is on by default, so `sel_for_remote` is
+  built and the submit goes out UNMASKED.
+- **Not a double-count from a stale remap.** The decode path needs
+  `mark_remote_after_ensure` because a filtered-out id keeps `-(e)-1` ("ours at
+  slot e"). The prefill path does not: `set_remote_exclusion` rewrites all
+  `N_EXPERT` entries authoritatively from `slot_of` and marks anything not
+  resident in the window as 0. Adding the decode guard here changed nothing
+  (tested), and was reverted as redundant.
+
+### The live hypothesis
+
+At 429 ms with box 1 paging nothing, box 2 cannot have paged ~18 experts/layer
+x 40 layers from its own disk (that would be seconds at 7.14 ms/miss). So box 2
+is most likely returning partials only for the experts it already holds and
+silently contributing nothing for the rest — the "computed by NOBODY" failure,
+one level below the hub's own `verify_routing_exactly_once`, which validates the
+hub's `owns_eff` and not box 2's behaviour. Next step is to instrument box 2's
+side: count, per request, picks received vs experts actually computed.
