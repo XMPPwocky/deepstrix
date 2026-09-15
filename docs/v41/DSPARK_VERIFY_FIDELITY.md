@@ -374,3 +374,40 @@ But it cannot be turned on generally: the driver is correct only at <= 1 row per
 lane, and it has 2 lanes. **That is the structural trap** — B>=3 can never be
 correct in this driver until the >=2-rows-per-lane bug is fixed, and fixing it
 also unlocks the single-lane saving.
+
+### ROOT CAUSE (partial): box 2's `read_f32` never synced the compute stream
+
+`MoeExecutor::read_f32` copied `ffn_moe` to host with no
+`engine.compute.synchronize()`. `copy_to_host` is a blocking hipMemcpy, which
+orders against the NULL stream only — it does not wait for work on the engine's
+own stream — so it returned the PREVIOUS request's result whenever the current
+compute had not finished.
+
+Its f16 twin always synchronised (it has to, for the cast). DECODE asks for f16;
+the speculative verify asks for f32 (`resp_f32` is load-bearing). That asymmetry
+is precisely why decode was always correct and only the verify was wrong.
+
+How it was found, after builder/cap/stride/mask/remap/reduce had all been cleared:
+
+1. `V41_REMOTE_DBG` showed 273 of 680 combines (40%) adding a partial
+   byte-identical to a DIFFERENT layer's, vs 2.2% in the correct config.
+2. Hashing box 2's HOST-SIDE response (not the device readback, which could be a
+   sync artifact) showed five consecutive layers returning the same bytes —
+   hash 8e3e5912bffb0af5, l2 30.7559, 10240/10240 nonzero — with the response's
+   own layer field correct every time (0 mismatches).
+3. Hashing what box 1 SENDS showed a DIFFERENT xq and sel for every layer. So
+   box 1 and the routing were both innocent: identical output from distinct
+   input means box 2 read a stale buffer.
+
+Fixed. Cross-layer duplicates fall **40.1% -> 21.7%** and consecutive layers now
+differ. It also explains the bug's shape: the race needs box 2's compute to
+outlast the copy, so it appeared only at >= 2 rows per lane and was catastrophic
+under the catch-all, where box 2 computes ~22 experts/layer instead of ~3.
+
+**NOT the whole story.** 21.7% of partials still repeat across layers, they are
+dense and nonzero (3-5 repeats each, zero all-zero partials), and B>=3 fidelity
+is still ~0.55 with the catch-all. `run_path` queues on `e.compute`, which is the
+stream now synced, so the second source is elsewhere in the response path —
+candidates: the `rx_resp_recycle` buffer lifecycle on either side, or an async
+H2D of the request payload. Same instruments apply: hash the host-side response
+and compare against what was sent.
