@@ -1,5 +1,20 @@
 # Matching the single-box decode number (2026-09-15)
 
+> **RETRACTED IN PART, SAME DAY.** The `floor 0.00` decode figures below
+> (66-70 ms/tok, 15.1 tok/s) are NOT VALID: that configuration is numerically
+> unsound. With `V41_T2_CATCHALL=2` -- a constant partition, where residency
+> cannot legitimately change a result -- floor 0.00 produces DIFFERENT output on
+> every run (sha 9eee5355594bd024 len 517, sha 5983106de8523886 len 521) while
+> floor 0.90 is bit-identical across runs (sha 13af380180431910 len 525, x3).
+> Unrestricted cross-layer eviction skips experts or reads reused slots. The
+> speedup was largely skipped work.
+>
+> **What survives is section 1 (methodology), which does not touch the
+> computation.** Warming on the measured prompt, at the default floor, with
+> output verified bit-identical: 161-178 -> 115-122 ms/tok = ~8.2-8.6 tok/s.
+> The post's 16 tok/s remains UNMATCHED. See `b2_pool_floor` in
+> remote_experts.rs.
+
 A public report of DeepSeek V4.1-Flash on ONE 128 GB Framework Desktop (Strix
 Halo iGPU, no dGPU) quotes 395 tok/s prefill and **16 tok/s decode**, with peak
 GTT 113 GB — and, two days earlier, **6.3 tok/s decode warm / 4.8 cold, "still
