@@ -1374,6 +1374,14 @@ pub fn coalesce_check() -> bool {
     *B
 }
 
+/// `V41_B2_DECODE_DOWN=1`: batched branch runs the DECODE down kernel per token.
+pub fn b2_decode_down() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(std::env::var("V41_B2_DECODE_DOWN").as_deref(), Ok("1") | Ok("on"))
+    });
+    *B
+}
+
 pub fn b2_coalesce() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         matches!(std::env::var("V41_B2_COALESCE").as_deref(), Ok("1") | Ok("on"))
@@ -2470,6 +2478,29 @@ impl MoeExecutor {
             // REQ_FLAG_BATCHED exactly when b > 1, which is why the corruption
             // appeared only at b >= 2: a b=1 request takes the decode branch,
             // which writes `ffn_moe` directly per token.
+            // `V41_B2_DECODE_DOWN=1`: run the DECODE down kernel per token over the
+            // batched midq (same derivation the decode branch uses: sel/midq/out
+            // sliced by token, NO clobbering of d_selected). Isolates whether the
+            // batched-vs-decode 0.276-nat divergence is in the by-expert DOWN
+            // kernel (KLD -> ~0 here) or upstream/batch-state (unchanged).
+            if b2_decode_down() {
+                for t in 0..b {
+                    let sel_t = self.d_selected.slice_view(t * nu, nu);
+                    let midq_t = self
+                        .d_midq_cat
+                        .slice_view(t * nu * MIDQ_BYTES_PER_SLOT, nu * MIDQ_BYTES_PER_SLOT);
+                    let mut out_t = self.ffn_moe.slice_view_mut(t * N_EMBD as usize, N_EMBD as usize);
+                    super::dispatch::moe_down_batched_hetsplit(
+                        e, ddt, s, &mut out_t, &down, &midq_t, &sel_t, remap, 0, cap, dbpe,
+                        MIDQ_BYTES_PER_SLOT as u32, nu as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN,
+                    )?;
+                }
+                if let Some((_, b)) = self.ev.as_ref() { b.record(s)?; }
+                s.synchronize()?;
+                timing.h2d = t1 - t0;
+                timing.gpu = t1.elapsed();
+                return Ok(timing);
+            }
             part_v.fill_zero_async(s)?;
             match ddt {
                 GgufType::MXFP4 => e.mxfp4.launch_by_expert_kwide2(
