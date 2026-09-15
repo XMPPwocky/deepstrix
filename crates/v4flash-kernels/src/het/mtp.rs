@@ -19,9 +19,18 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{DeviceBuffer, Stream};
 
 use crate::config::{
-    GROUP_DIM, N_EMBD, N_GROUPS, N_HC, N_HEAD, N_HEAD_DIM, N_LORA_Q, N_ROT, OUT_LOW, Q_FLAT,
-    RANK, RMS_EPS,
+    BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, EXPERT_WEIGHT_SCALE, GROUP_DIM, N_EMBD, N_FF_EXP,
+    N_GROUPS, N_HC, N_HEAD, N_HEAD_DIM, N_LORA_Q, N_ROT, OUT_LOW, Q_FLAT, RANK, RMS_EPS,
+    SWIGLU_CLAMP_EXP,
 };
+use v4flash_core::hf_v41::MTP_N_EXPERT;
+
+/// Matches `forward_layer.rs`'s private constant of the same name — the router's
+/// weight floor. Duplicated rather than made public: it is a property of the
+/// router kernel's contract, and the drafter must use the identical value or its
+/// expert weights diverge from the reference.
+const ROUTER_WEIGHT_EPS: f32 = 6.103515625e-5;
+use crate::het::remote_experts::{MIDQ_BYTES_PER_SLOT, SENTINEL_EXPERT};
 use crate::het::engine::DeviceEngine;
 use crate::het::weights::MtpWeights;
 
@@ -99,6 +108,21 @@ pub struct MtpState {
     low_xscale: DeviceBuffer<f32>,
     /// The layer's attention output, `[N_EMBD]`.
     pub attn_out: DeviceBuffer<f32>,
+
+    // ---- MoE ----
+    ffn_norm_out: DeviceBuffer<f32>,
+    ffn_xq: DeviceBuffer<u8>,
+    router_logits: DeviceBuffer<f32>,
+    d_selected: DeviceBuffer<i32>,
+    d_ew: DeviceBuffer<f32>,
+    /// Identity remap over the drafter's 128 resident experts: `-(e)-1` for
+    /// `e < MTP_N_EXPERT`, 0 (= "not ours") for the sentinel. Built once — the
+    /// drafter never pages, so residency never changes.
+    remap: DeviceBuffer<i32>,
+    mid: DeviceBuffer<f32>,
+    midq: DeviceBuffer<u8>,
+    /// Routed-expert output, `[N_EMBD]`.
+    pub ffn_out: DeviceBuffer<f32>,
 }
 
 impl MtpState {
@@ -106,6 +130,15 @@ impl MtpState {
         let k = MTP_SRC_LAYERS.len() * N_EMBD as usize;
         let mut hc_mean = DeviceBuffer::<f32>::new(device_id, N_HC as usize)?;
         hc_mean.copy_from_host(&vec![1.0f32 / N_HC as f32; N_HC as usize])?;
+        // Every drafter expert is resident, so the remap is a constant identity.
+        // Sentinel (and any id past 128) stays 0 = "not ours", which is what makes
+        // an unused pick slot a no-op in the MoE kernel.
+        let mut remap_host = vec![0i32; SENTINEL_EXPERT as usize + 1];
+        for (e, r) in remap_host.iter_mut().enumerate().take(MTP_N_EXPERT) {
+            *r = -(e as i32) - 1;
+        }
+        let mut remap = DeviceBuffer::<i32>::new(device_id, remap_host.len())?;
+        remap.copy_from_host(&remap_host)?;
         let ne = N_EMBD as usize;
         let mut rings = Vec::with_capacity(MTP_SRC_LAYERS.len());
         for _ in 0..MTP_SRC_LAYERS.len() {
@@ -142,6 +175,15 @@ impl MtpState {
             low_xq: DeviceBuffer::new(device_id, OUT_LOW as usize)?,
             low_xscale: DeviceBuffer::new(device_id, (OUT_LOW as usize).div_ceil(32))?,
             attn_out: DeviceBuffer::new(device_id, ne)?,
+            ffn_norm_out: DeviceBuffer::new(device_id, ne)?,
+            ffn_xq: DeviceBuffer::new(device_id, crate::het::remote_experts::XQ_BYTES_PER_TOKEN)?,
+            router_logits: DeviceBuffer::new(device_id, MTP_N_EXPERT)?,
+            d_selected: DeviceBuffer::new(device_id, MTP_TOPK as usize)?,
+            d_ew: DeviceBuffer::new(device_id, MTP_TOPK as usize)?,
+            remap,
+            mid: DeviceBuffer::new(device_id, MTP_TOPK as usize * N_FF_EXP as usize)?,
+            midq: DeviceBuffer::new(device_id, MTP_TOPK as usize * MIDQ_BYTES_PER_SLOT)?,
+            ffn_out: DeviceBuffer::new(device_id, ne)?,
         })
     }
 
@@ -289,6 +331,54 @@ impl MtpState {
         e.q8.matvec(
             s, &mut self.attn_out, &w.attn_output_b.buffer, &self.low_xq, &self.low_xscale,
             N_EMBD, OUT_LOW,
+        )?;
+        Ok(())
+    }
+}
+
+impl MtpState {
+    /// One drafter layer's MoE: router (top-3 of 128) + routed experts.
+    ///
+    /// Same kernels as box 2's resident executor, which is the cleanest example
+    /// of a non-paged MoE in the tree. `router_topk` takes `n_expert` and
+    /// `n_used` at runtime, so 128/3 needs no kernel change against the main
+    /// model's 384/6.
+    ///
+    /// `cap = MTP_TOPK` makes the sentinel path a no-op exactly as it does for
+    /// box 2: a resident expert has `remap < 0` so the kernel claims it, and the
+    /// sentinel has `remap == 0` with `res_rank < cap` so it is skipped.
+    pub fn moe(
+        &mut self,
+        e: &DeviceEngine,
+        s: &Stream,
+        w: &crate::het::weights::MtpLayerWeights,
+        x: &DeviceBuffer<f32>,
+    ) -> eyre::Result<()> {
+        e.rms_w
+            .launch_weighted(s, &mut self.ffn_norm_out, x, &w.ffn_norm, N_EMBD, RMS_EPS)?;
+        e.f16.matvec(
+            s, &mut self.router_logits, &w.ffn_gate_inp.buffer, &self.ffn_norm_out,
+            MTP_N_EXPERT as u32, N_EMBD,
+        )?;
+        e.router_topk.launch(
+            s, &mut self.d_selected, &mut self.d_ew, &self.router_logits,
+            Some(&w.exp_probs_b), MTP_N_EXPERT as u32, MTP_TOPK, EXPERT_WEIGHT_SCALE,
+            ROUTER_WEIGHT_EPS,
+        )?;
+        e.q8k
+            .launch(s, &mut self.ffn_xq, &self.ffn_norm_out, BLOCKS_Q8K_GATE_IN)?;
+        crate::het::dispatch::moe_gate_up_batch_hetsplit(
+            e, w.routed.gate.dtype, s, &mut self.mid, &w.routed.gate.buffer,
+            &w.routed.up.buffer, &self.ffn_xq, &self.d_ew, &self.d_selected, &self.remap, 0,
+            MTP_TOPK, w.routed.gate_bytes_per_expert as u32, w.routed.up_bytes_per_expert as u32,
+            MTP_TOPK, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+        )?;
+        e.q8k
+            .launch(s, &mut self.midq, &self.mid, BLOCKS_Q8K_DOWN_IN * MTP_TOPK)?;
+        crate::het::dispatch::moe_down_batched_hetsplit(
+            e, w.routed.down.dtype, s, &mut self.ffn_out, &w.routed.down.buffer, &self.midq,
+            &self.d_selected, &self.remap, 0, MTP_TOPK, w.routed.down_bytes_per_expert as u32,
+            MIDQ_BYTES_PER_SLOT as u32, MTP_TOPK, N_EMBD, BLOCKS_Q8K_DOWN_IN,
         )?;
         Ok(())
     }
