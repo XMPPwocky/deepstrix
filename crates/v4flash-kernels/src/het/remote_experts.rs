@@ -2489,6 +2489,24 @@ impl MoeExecutor {
     /// Copy the last result's f32 rows to host.
     pub fn read_f32(&self, b: usize, dst: &mut [f32]) -> eyre::Result<()> {
         self.device.set_current()?;
+        // MUST synchronise the compute stream first. `copy_to_host` is a
+        // blocking hipMemcpy, which orders against the NULL stream only — it
+        // does NOT wait for work queued on `engine.compute`. Without this the
+        // copy returns whatever `ffn_moe` happens to hold, i.e. the PREVIOUS
+        // request's result.
+        //
+        // The f16 twin below always synchronised (it has to, for the cast), so
+        // DECODE — which asks for f16 — was correct while the speculative
+        // verify — which asks for f32, see `resp_f32` — silently got stale
+        // partials. MEASURED before the fix, V41_T2_CATCHALL=2, B=2, catch-all
+        // on: five consecutive layers returned byte-identical partials
+        // (hash 8e3e5912bffb0af5, l2 30.7559, 10240/10240 nonzero) although box
+        // 1 sent a DIFFERENT xq and sel for each, and 273 of 680 combines added
+        // another layer's partial. The race needs the compute to outlast the
+        // copy, which is why it appeared only at >= 2 rows per lane and got far
+        // worse under the catch-all (box 2 computes ~22 experts/layer instead
+        // of ~3).
+        self.engine.compute.synchronize()?;
         self.ffn_moe.slice_view(0, b * N_EMBD as usize).copy_to_host(dst)
     }
 

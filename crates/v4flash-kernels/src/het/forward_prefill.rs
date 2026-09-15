@@ -4205,6 +4205,21 @@ impl HeterogeneousEngine {
                 xq_dev.slice_view(0, xq_bytes).copy_to_host(&mut xq_host)?;
                 let mut ew_host = vec![0f32; n_sel];
                 bd.d_ew.slice_view(0, n_sel).copy_to_host(&mut ew_host)?;
+                // Hash what box 1 SENDS. If xq repeats across layers, the stale
+                // value is box 1's own `ffn_input_norm`, not anything remote.
+                if std::env::var("V41_REMOTE_DBG").is_ok() {
+                    let mut hx: u64 = 0xcbf29ce484222325;
+                    for &v in xq_host.iter().step_by(37) {
+                        hx ^= v as u64;
+                        hx = hx.wrapping_mul(0x100000001b3);
+                    }
+                    let mut hs: u64 = 0xcbf29ce484222325;
+                    for &v in sel_host_remote.iter() {
+                        hs ^= v as u64;
+                        hs = hs.wrapping_mul(0x100000001b3);
+                    }
+                    eprintln!("[submit-src] L{layer} b={b} xq_hash={hx:016x} sel_hash={hs:016x}");
+                }
                 // `sel_host` above is this chunk's router picks; reuse it.
                 let t_sub = super::perfetto::now_ns();
                 let ticket = remote
@@ -5222,6 +5237,27 @@ impl HeterogeneousEngine {
             if remote_add_partial() {
                 let rows = (b as usize) * N_EMBD as usize;
                 let src = partial.f32();
+                // Hash box 2's HOST-SIDE response before it is copied anywhere.
+                // The combine-dbg print reads the DEVICE buffer after syncing
+                // de.compute, so a repeated value there could be a readback
+                // artifact. This distinguishes "box 2 sent the same bytes for
+                // two layers" (a routing bug) from "box 1 read stale device
+                // memory" (a stream-ordering artifact).
+                if std::env::var("V41_REMOTE_DBG").is_ok() {
+                    let mut h: u64 = 0xcbf29ce484222325;
+                    for &v in src.iter().step_by(97) {
+                        h ^= v.to_bits() as u64;
+                        h = h.wrapping_mul(0x100000001b3);
+                    }
+                    let l2: f64 =
+                        src.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+                    let nz = src.iter().filter(|&&x| x != 0.0).count();
+                    eprintln!(
+                        "[partial-src] L{layer} b={b} seq_layer={} hash={h:016x} l2={l2:.4} \
+                         nonzero={nz}/{} first={:?}",
+                        partial.layer, src.len(), &src[..4.min(src.len())]
+                    );
+                }
                 if src.len() != rows {
                     return Err(eyre!(
                         "L{layer}: remote partial has {} f32 rows, expected {rows}",
