@@ -36,7 +36,7 @@ fn mtp_stages_are_presented_and_loaded() {
             ("ffn_gate_inp.weight", &[5120, MTP_N_EXPERT as u64]),
         ];
         for (suffix, dims) in expect {
-            let name = format!("mtp.{s}.{suffix}");
+            let name = format!("blk.{}.{suffix}", 40 + s);
             let t = hf.get(&name).unwrap_or_else(|e| panic!("mtp.{s}: {name}: {e}"));
             assert_eq!(
                 &t.dims[..],
@@ -48,7 +48,7 @@ fn mtp_stages_are_presented_and_loaded() {
 
         // --- the router is 128-wide, not the main model's 384 ---
         for role in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
-            let t = hf.get(&format!("mtp.{s}.{role}.weight")).expect("expert tensor");
+            let t = hf.get(&format!("blk.{}.{role}.weight", 40 + s)).expect("expert tensor");
             assert_eq!(
                 t.dims[2], MTP_N_EXPERT as u64,
                 "mtp.{s}.{role}: {} experts, expected {MTP_N_EXPERT}",
@@ -57,7 +57,7 @@ fn mtp_stages_are_presented_and_loaded() {
         }
 
         // --- THE regression test: ffn_norm must be the TRAINED gain, not 1.0 ---
-        let t = hf.get(&format!("mtp.{s}.ffn_norm.weight")).unwrap();
+        let t = hf.get(&format!("blk.{}.ffn_norm.weight", 40 + s)).unwrap();
         let mut buf = vec![0u8; t.byte_size as usize];
         hf.read_range_into(t, 0, &mut buf).expect("read ffn_norm");
         let v: Vec<f32> = buf
@@ -91,7 +91,7 @@ fn mtp_stages_are_presented_and_loaded() {
         assert_eq!(&t.dims[..], dims, "{name}: dims {:?} != {dims:?}", t.dims);
         println!("  {name}: {:?}", t.dims);
     }
-    for absent in ["mtp.1.main_proj.weight", "mtp.0.confidence.weight", "mtp.1.norm.weight"] {
+    for absent in ["mtp.1.main_proj.weight", "mtp.0.confidence.weight", "mtp.1.norm.weight", "blk.43.attn_norm.weight"] {
         assert!(hf.tensor(absent).is_none(), "{absent} should NOT exist — stack shape is wrong");
     }
 }

@@ -355,22 +355,30 @@ impl V41HfWeights {
     /// 384. See `docs/v41/DSPARK_DESIGN.md`.
     fn build_mtp(&mut self, sgi: usize) -> eyre::Result<()> {
         let p = format!("mtp.{sgi}.");
-        let b = format!("mtp.{sgi}.");
+        // Presented as `blk.{n_layers + s}` so `DgpuLayerWeights::load` and
+        // `IgpuLayerWeights::load` pick the drafter up UNCHANGED — a drafter layer
+        // carries exactly a main layer's tensor set, and the 128-wide router is
+        // fine because `router_topk` takes `n_expert` at runtime. Nothing iterates
+        // past `n_layers`, so these are only ever fetched explicitly.
+        let b = format!("blk.{}.", self.n_layers + sgi);
+        // Entry/exit extras keep the `mtp.` prefix: they have no main-layer
+        // counterpart and must not be mistaken for one.
+        let m = format!("mtp.{sgi}.");
         // Entry stage only.
         if self.st.has(&format!("{p}main_proj.weight")) {
-            self.push_q8(&format!("{b}main_proj.weight"), &format!("{p}main_proj.weight"))?;
-            self.push_cast(&format!("{b}main_norm.weight"), &format!("{p}main_norm.weight"), Cast::F32)?;
+            self.push_q8(&format!("{m}main_proj.weight"), &format!("{p}main_proj.weight"))?;
+            self.push_cast(&format!("{m}main_norm.weight"), &format!("{p}main_norm.weight"), Cast::F32)?;
         }
         // Exit stage only: final norm plus the confidence and markov heads.
         if self.st.has(&format!("{p}norm.weight")) {
-            self.push_cast(&format!("{b}norm.weight"), &format!("{p}norm.weight"), Cast::F32)?;
+            self.push_cast(&format!("{m}norm.weight"), &format!("{p}norm.weight"), Cast::F32)?;
         }
         if self.st.has(&format!("{p}confidence_head.proj.weight")) {
-            self.push_cast(&format!("{b}confidence.weight"), &format!("{p}confidence_head.proj.weight"), Cast::F32)?;
+            self.push_cast(&format!("{m}confidence.weight"), &format!("{p}confidence_head.proj.weight"), Cast::F32)?;
         }
         if self.st.has(&format!("{p}markov_head.embed.weight")) {
-            self.push_cast(&format!("{b}markov_embd.weight"), &format!("{p}markov_head.embed.weight"), Cast::F16)?;
-            self.push_q8(&format!("{b}markov_head.weight"), &format!("{p}markov_head.head.weight"))?;
+            self.push_cast(&format!("{m}markov_embd.weight"), &format!("{p}markov_head.embed.weight"), Cast::F16)?;
+            self.push_q8(&format!("{m}markov_head.weight"), &format!("{p}markov_head.head.weight"))?;
         }
         for (src, dst) in [
             ("attn_norm.weight", "attn_norm.weight"),
@@ -543,8 +551,17 @@ impl V41HfWeights {
     }
 
     /// Bytes per expert of a stacked expert tensor.
+    ///
+    /// Divides by the TENSOR's own expert count, not `self.n_expert`. The DSpark
+    /// drafter has 128 where the main model has 384; using the model-wide
+    /// constant sliced a drafter tensor into 384 phantom experts and read past
+    /// the end (`mtp.0.ffn.experts.336.w1.weight` does not exist).
     pub fn expert_bytes(&self, vt: &VTensor) -> usize {
-        (vt.byte_size / self.n_expert as u64) as usize
+        let n = match &vt.kind {
+            Kind::Experts { n, .. } => *n as u64,
+            _ => self.n_expert as u64,
+        };
+        (vt.byte_size / n) as usize
     }
 
     /// One expert of a stacked expert tensor (`dst.len() == expert_bytes`).

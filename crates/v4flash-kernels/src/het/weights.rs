@@ -181,6 +181,125 @@ pub struct HetGlobalWeights {
     pub output_hc_base: DeviceBuffer<f32>,
 }
 
+/// DSpark drafter weights: three layers, fully resident.
+///
+/// Deliberately NOT `DgpuLayerWeights`/`IgpuLayerWeights`. A drafter layer
+/// carries a main layer's tensor set, but the main loaders assume main-layer
+/// facts that are false here: `COMPRESS_RATIOS[layer]` is sized to `N_LAYER` so
+/// `blk.40` would panic, the packed-expert path keys off `N_EXPERT`, and the
+/// hash-router / indexer / engram / compressor branches are all main-model-only.
+/// The drafter needs none of them.
+///
+/// 7.9 GB for all three layers, so this is resident and never paged — the
+/// drafter must not contend with the expert pager on the critical path.
+pub struct MtpLayerWeights {
+    pub hc_attn_fn: DeviceWeight,
+    pub hc_attn_scale: DeviceBuffer<f32>,
+    pub hc_attn_base: DeviceBuffer<f32>,
+    pub hc_ffn_fn: DeviceWeight,
+    pub hc_ffn_scale: DeviceBuffer<f32>,
+    pub hc_ffn_base: DeviceBuffer<f32>,
+
+    pub attn_norm: DeviceBuffer<f32>,
+    pub attn_q_a: DeviceWeight,
+    pub attn_q_b: DeviceWeight,
+    pub q_a_norm: DeviceBuffer<f32>,
+    pub attn_kv: DeviceWeight,
+    pub kv_a_norm: DeviceBuffer<f32>,
+    pub attn_sinks: DeviceBuffer<f32>,
+    pub attn_output_a: DeviceWeight,
+    pub attn_output_b: DeviceWeight,
+
+    pub ffn_norm: DeviceBuffer<f32>,
+    pub ffn_gate_inp: DeviceWeight,
+    pub exp_probs_b: DeviceBuffer<f32>,
+    pub shared: SharedExpertWeights,
+    pub routed: RoutedExpertWeights,
+}
+
+/// The whole drafter: an entry projection, three layers, and the exit heads.
+pub struct MtpWeights {
+    /// `mtp.0.main_proj` [5120, 15360] — eats the concatenated residuals
+    /// entering layers 37/38/39, then `main_norm`.
+    pub main_proj: DeviceWeight,
+    pub main_norm: DeviceBuffer<f32>,
+    pub layers: Vec<MtpLayerWeights>,
+    /// Exit: final norm before the tied head.
+    pub norm: DeviceBuffer<f32>,
+}
+
+impl MtpWeights {
+    /// Load all three drafter layers onto `device`. `n_layers` is the MAIN
+    /// model's layer count — the drafter is presented as `blk.{n_layers + s}`.
+    pub fn load<'a>(
+        gguf: impl Into<WeightSrc<'a>>,
+        device: Device,
+        n_layers: usize,
+    ) -> eyre::Result<Self> {
+        let gguf: WeightSrc<'a> = gguf.into();
+        device.set_current()?;
+        let device_id = device.id;
+        let n_stages = v4flash_core::hf_v41::MTP_STAGES;
+        let n_exp = v4flash_core::hf_v41::MTP_N_EXPERT as u32;
+
+        let main_proj = load_to_device(gguf, "mtp.0.main_proj.weight", device_id)?;
+        let main_norm = load_f32_weight(gguf, "mtp.0.main_norm.weight", device_id, N_EMBD as usize)?;
+        let norm = load_f32_weight(
+            gguf,
+            &format!("mtp.{}.norm.weight", n_stages - 1),
+            device_id,
+            N_EMBD as usize,
+        )?;
+
+        let mut layers = Vec::with_capacity(n_stages);
+        for sgi in 0..n_stages {
+            let l = n_layers + sgi;
+            let routed = RoutedExpertWeights {
+                gate: load_to_device(gguf, &format!("blk.{l}.ffn_gate_exps.weight"), device_id)?,
+                up: load_to_device(gguf, &format!("blk.{l}.ffn_up_exps.weight"), device_id)?,
+                down: load_to_device(gguf, &format!("blk.{l}.ffn_down_exps.weight"), device_id)?,
+                gate_bytes_per_expert: 0,
+                up_bytes_per_expert: 0,
+                down_bytes_per_expert: 0,
+                n_slots: n_exp,
+            };
+            let routed = RoutedExpertWeights {
+                gate_bytes_per_expert: routed.gate.buffer.len() / n_exp as usize,
+                up_bytes_per_expert: routed.up.buffer.len() / n_exp as usize,
+                down_bytes_per_expert: routed.down.buffer.len() / n_exp as usize,
+                ..routed
+            };
+            layers.push(MtpLayerWeights {
+                hc_attn_fn: load_to_device(gguf, &format!("blk.{l}.hc_attn_fn.weight"), device_id)?,
+                hc_attn_scale: load_f32_weight(gguf, &format!("blk.{l}.hc_attn_scale.weight"), device_id, 3)?,
+                hc_attn_base: load_f32_weight(gguf, &format!("blk.{l}.hc_attn_base.weight"), device_id, HC_MIX_DIM as usize)?,
+                hc_ffn_fn: load_to_device(gguf, &format!("blk.{l}.hc_ffn_fn.weight"), device_id)?,
+                hc_ffn_scale: load_f32_weight(gguf, &format!("blk.{l}.hc_ffn_scale.weight"), device_id, 3)?,
+                hc_ffn_base: load_f32_weight(gguf, &format!("blk.{l}.hc_ffn_base.weight"), device_id, HC_MIX_DIM as usize)?,
+                attn_norm: load_f32_weight(gguf, &format!("blk.{l}.attn_norm.weight"), device_id, N_EMBD as usize)?,
+                attn_q_a: load_to_device(gguf, &format!("blk.{l}.attn_q_a.weight"), device_id)?,
+                attn_q_b: load_to_device(gguf, &format!("blk.{l}.attn_q_b.weight"), device_id)?,
+                q_a_norm: load_f32_weight(gguf, &format!("blk.{l}.attn_q_a_norm.weight"), device_id, N_LORA_Q as usize)?,
+                attn_kv: load_to_device(gguf, &format!("blk.{l}.attn_kv.weight"), device_id)?,
+                kv_a_norm: load_f32_weight(gguf, &format!("blk.{l}.attn_kv_a_norm.weight"), device_id, N_HEAD_DIM as usize)?,
+                attn_sinks: load_f32_weight(gguf, &format!("blk.{l}.attn_sinks.weight"), device_id, N_HEAD as usize)?,
+                attn_output_a: load_to_device(gguf, &format!("blk.{l}.attn_output_a.weight"), device_id)?,
+                attn_output_b: load_to_device(gguf, &format!("blk.{l}.attn_output_b.weight"), device_id)?,
+                ffn_norm: load_f32_weight(gguf, &format!("blk.{l}.ffn_norm.weight"), device_id, N_EMBD as usize)?,
+                ffn_gate_inp: load_to_device(gguf, &format!("blk.{l}.ffn_gate_inp.weight"), device_id)?,
+                exp_probs_b: load_f32_weight(gguf, &format!("blk.{l}.exp_probs_b.bias"), device_id, n_exp as usize)?,
+                shared: SharedExpertWeights {
+                    gate: load_to_device(gguf, &format!("blk.{l}.ffn_gate_shexp.weight"), device_id)?,
+                    up: load_to_device(gguf, &format!("blk.{l}.ffn_up_shexp.weight"), device_id)?,
+                    down: load_to_device(gguf, &format!("blk.{l}.ffn_down_shexp.weight"), device_id)?,
+                },
+                routed,
+            });
+        }
+        Ok(Self { main_proj, main_norm, layers, norm })
+    }
+}
+
 pub struct HetModelWeights {
     pub global: HetGlobalWeights,
     pub dgpu_layers: Vec<DgpuLayerWeights>,
