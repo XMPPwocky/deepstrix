@@ -233,6 +233,55 @@ macro_rules! forward_one {
     };
 }
 
+/// Verify-vs-decode argmax agreement (see `V41_DSPARK_XCHECK`).
+#[cfg(feature = "v41")]
+static XCHECK_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "v41")]
+static XCHECK_TOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "v41")]
+static XCHECK_COS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+#[cfg(feature = "v41")]
+static XCHECK_COS_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Everything the DSpark drafter needs, loaded once at startup.
+#[cfg(feature = "v41")]
+pub struct MtpCtx {
+    /// Layers + entry projection, iGPU.
+    pub w: v4flash_kernels::het::weights::MtpWeights,
+    /// Final norm, markov head, confidence — dGPU, beside the tied head.
+    pub xw: v4flash_kernels::het::weights::MtpExitWeights,
+    pub state: v4flash_kernels::het::mtp::MtpState,
+    pub exit: v4flash_kernels::het::mtp::MtpExit,
+    pub capture: v4flash_kernels::het::mtp::MtpCapture,
+    /// Markov EMBEDDING half, host-side like `token_embd` (M57).
+    pub markov_embd: Vec<u8>,
+    pub markov_dtype: v4flash_core::gguf::GgufType,
+    /// `embed_lookup` of `dspark_noise_token_id`, `[HC_DIM]`. Constant.
+    pub noise_row: Vec<f32>,
+    /// Shadow scoring: drafts produced, keyed by the position the FIRST draft
+    /// predicts, plus the tokens actually generated from `actual_base` on.
+    /// Accept mode: drafts produced for the CURRENT head token, the tokens a
+    /// verify has already confirmed AND ingested into KV (so the decode loop
+    /// must not forward them again), and the `main_hidden` of whichever row
+    /// became the new head.
+    pub pending: Option<[i32; v4flash_kernels::het::mtp::MTP_BLOCK]>,
+    pub confirmed: std::collections::VecDeque<i32>,
+    /// Upcoming tokens (including the current `next`) that a verify already
+    /// appended to KV — the decode loop must advance `pos` past them without
+    /// forwarding again.
+    pub ingested: usize,
+    /// The model's own correction after the accepted prefix. Not in KV.
+    pub next_after: Option<i32>,
+    pub main_hidden: Vec<f32>,
+    pub accept_steps: u64,
+    pub accept_tokens: u64,
+    pub drafts: Vec<(u32, [i32; v4flash_kernels::het::mtp::MTP_BLOCK])>,
+    /// Same batches with the markov bias omitted — the ablation.
+    pub drafts_plain: Vec<(u32, [i32; v4flash_kernels::het::mtp::MTP_BLOCK])>,
+    pub actual: Vec<i32>,
+    pub actual_base: u32,
+}
+
 /// Per-request input.
 pub struct GenerateReq {
     pub tokens: Vec<i32>,
@@ -654,6 +703,13 @@ pub struct WorkerState {
     pub vocab: Arc<BpeVocab>,
     pub token_embd_bytes: Vec<u8>,
     pub token_embd_dtype: v4flash_core::gguf::GgufType,
+
+    /// DSpark drafter. `Some` only under `V41_DSPARK=1` — it costs 7.93 GB of
+    /// iGPU residency, so it is not loaded unless asked for. The layer stack
+    /// and its state live on the iGPU; the exit and the residual capture live
+    /// on the dGPU, beside the tied `output` head.
+    #[cfg(feature = "v41")]
+    pub mtp: Option<MtpCtx>,
     pub byte_decoder: std::collections::HashMap<char, u8>,
 
     /// Vision-Exp ViT + aligner, resident on the iGPU. `None` when the
@@ -826,6 +882,53 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     #[cfg_attr(not(feature = "v41"), allow(unused_mut))]
     let mut weights = HetModelWeights::load_all(src, dgpu, igpu, &rope)?;
     tracing::info!(elapsed_s = t0.elapsed().as_secs_f64(), "weights loaded");
+
+    // DSpark drafter (`V41_DSPARK=1`). 7.93 GB of iGPU residency, so opt-in.
+    #[cfg(feature = "v41")]
+    let mtp: Option<MtpCtx> = if matches!(
+        std::env::var("V41_DSPARK").as_deref(),
+        Ok("1") | Ok("on") | Ok("shadow") | Ok("accept")
+    ) {
+        use v4flash_kernels::het::mtp::{MtpCapture, MtpExit, MtpState, MTP_NOISE_TOKEN};
+        use v4flash_kernels::het::weights::{MtpExitWeights, MtpWeights};
+        let t = std::time::Instant::now();
+        let w = MtpWeights::load(src, igpu, v4flash_kernels::config::N_LAYER as usize)?;
+        let xw = MtpExitWeights::load(src, dgpu)?;
+        let mk = src
+            .tensor("mtp.2.markov_embd.weight")
+            .ok_or_else(|| eyre!("mtp.2.markov_embd.weight not found"))?;
+        let markov_dtype = mk.dtype;
+        let markov_embd = src.read_tensor(mk)?;
+        let mut noise_row = vec![0.0f32; v4flash_kernels::config::HC_DIM as usize];
+        embed_lookup(&token_embd_bytes, token_embd_dtype, MTP_NOISE_TOKEN, &mut noise_row);
+        tracing::info!(
+            elapsed_s = t.elapsed().as_secs_f64(),
+            "DSpark drafter loaded (layers+entry on iGPU, exit on dGPU)"
+        );
+        Some(MtpCtx {
+            w,
+            xw,
+            state: MtpState::alloc(igpu.id)?,
+            exit: MtpExit::alloc(dgpu.id)?,
+            capture: MtpCapture::alloc(dgpu.id)?,
+            markov_embd,
+            markov_dtype,
+            noise_row,
+            pending: None,
+            confirmed: std::collections::VecDeque::new(),
+            ingested: 0,
+            next_after: None,
+            main_hidden: Vec::new(),
+            accept_steps: 0,
+            accept_tokens: 0,
+            drafts: Vec::new(),
+            drafts_plain: Vec::new(),
+            actual: Vec::new(),
+            actual_base: 0,
+        })
+    } else {
+        None
+    };
 
     let mut engine =
         HeterogeneousEngine::new(dgpu, &dgpu_arch, igpu, &igpu_arch, ExecMode::HetParallel)?;
@@ -1040,6 +1143,8 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         vocab: Arc::new(vocab),
         token_embd_bytes,
         token_embd_dtype,
+        #[cfg(feature = "v41")]
+        mtp,
         byte_decoder,
         tower,
         vit_rows: Vec::new(),
@@ -2410,6 +2515,11 @@ fn finish_decode(
     // `V41_VERIFY_BATCHED=1`: make the probe do ONE batched forward over K tokens
     // (the real DSpark verify step) instead of K sequential decodes (the reject
     // path). This is the measurement the whole 30 tok/s projection rests on.
+    // `V41_DSPARK=accept`: actually ACT on the drafts — one batched verify per
+    // step, keep the agreed prefix, roll the rest back. `V41_DSPARK=1` (shadow)
+    // drafts and scores without touching the output.
+    #[cfg(feature = "v41")]
+    let dspark_accept: bool = matches!(std::env::var("V41_DSPARK").as_deref(), Ok("accept"));
     #[cfg(feature = "v41")]
     let verify_probe_batched: bool =
         matches!(std::env::var("V41_VERIFY_BATCHED").as_deref(), Ok("1") | Ok("on"));
@@ -2437,6 +2547,10 @@ fn finish_decode(
     // model's own half-finished output, producing "grammatically
     // correct but semantically scrambled" garbage on the retry.
     let mut was_cancelled = false;
+    #[cfg(feature = "v41")]
+    let mut xcheck_pending: Option<i32> = None;
+    #[cfg(feature = "v41")]
+    let mut xcheck_row0: Vec<f32> = Vec::new();
     let finish: FinishReason = loop {
         if cancel.load(Ordering::Relaxed) {
             tracing::info!("generation cancelled by client");
@@ -2630,7 +2744,9 @@ fn finish_decode(
                 verify_probe_ks[(completion_tokens as usize) % verify_probe_ks.len()];
             embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, next, &mut residual);
             let mark = state.state.mark_kv();
+            let pc0 = state.pager.as_ref().map(|p| p.counters()).unwrap_or_default();
             let t_probe = std::time::Instant::now();
+            let mut probe_logits: Vec<f32> = Vec::new();
             if verify_probe_batched {
                 // The REAL DSpark verify step: ONE batched forward over K tokens
                 // appended to the live KV, which is what a draft batch costs.
@@ -2647,7 +2763,16 @@ fn finish_decode(
                         (Some(pg), Some(ec)) => Some(ec.rows_for_chunk(pg.raw(), &toks, pos)?),
                         _ => None,
                     };
-                let _ = state.engine.forward_prefill_pipelined(
+                // `last_only=false`: a REAL verify needs per-token logits, one
+                // per speculative position, to compare against the drafts. It
+                // also turns CED off (`ced = ced_enabled() && last_only`), and
+                // CED is what makes the probe run the layer stack twice — the
+                // per-stage profile shows every dGPU stage at 80 calls for 40
+                // layers while the iGPU MoE runs 40, which is the signature of
+                // a second `CedMode::KvSourceOnly` pass. Measuring with
+                // last_only=true therefore priced a pass a real verify does
+                // not do.
+                probe_logits = state.engine.forward_prefill_pipelined(
                     &mut state.bd_a,
                     &mut state.bi_a,
                     &mut state.bd_b,
@@ -2660,7 +2785,7 @@ fn finish_decode(
                     &hcs,
                     &toks,
                     pos,
-                    true,
+                    false,
                     None,
                     None,
                     None,
@@ -2673,7 +2798,51 @@ fn finish_decode(
                     forward_one!(state, residual, pos + j as u32, next)?;
                 }
             }
+            // XCHECK: row 0 of the probe sits at `pos` with `next` as its
+            // input, exactly like the decode forward that follows, so its
+            // argmax must equal the token decode samples next. This is the
+            // DIRECT correctness test for the verify path — acceptance is only
+            // a proxy, and a bad one, because changing the split changes the
+            // generated text and acceptance is content-dependent.
+            if verify_probe_batched && !probe_logits.is_empty() {
+                let nv = v4flash_kernels::config::N_VOCAB as usize;
+                let row = &probe_logits[..nv.min(probe_logits.len())];
+                let mut bi = 0usize;
+                let mut bv = f32::NEG_INFINITY;
+                for (i, &v) in row.iter().enumerate() {
+                    if v > bv {
+                        bv = v;
+                        bi = i;
+                    }
+                }
+                xcheck_pending = Some(bi as i32);
+                xcheck_row0 = row.to_vec();
+            }
             let dt = t_probe.elapsed();
+            // Per-stage GPU busy for exactly ONE verify. `forward_prefill_pipelined`
+            // feeds the accumulator per chunk but only the real prefill emits, so
+            // the probe's breakdown was never visible. NOTE the harvest
+            // SYNCHRONIZES (it serialises the two lanes): read the busy times,
+            // not the wall.
+            v4flash_kernels::het::trace::prefill_profile::emit_and_clear(verify_probe_k);
+            if let Some(pg) = state.pager.as_ref() {
+                let d = pg.counters() - pc0;
+                tracing::info!(
+                    k = verify_probe_k,
+                    prefill_requests = d.prefill_requests,
+                    prefill_misses = d.prefill_misses,
+                    prefill_read_ms = d.prefill_read_ns / 1_000_000,
+                    prefill_h2d_ms = d.prefill_h2d_ns / 1_000_000,
+                    decode_requests = d.decode_requests,
+                    decode_misses = d.decode_misses,
+                    "verify probe: pager delta"
+                );
+            }
+            v4flash_kernels::het::forward_prefill::emit_layer_miss_hist("verify");
+            v4flash_kernels::het::forward_prefill::emit_layer_host_timing(
+                "verify",
+                v4flash_kernels::config::N_LAYER as usize,
+            );
             // A refused rollback means the KV wrapped mid-batch and the mark no
             // longer addresses the same rows. Continuing would silently serve wrong
             // KV, so fail loudly instead.
@@ -2687,13 +2856,192 @@ fn finish_decode(
                 "verify probe: speculative ingest rolled back"
             );
         }
+        // ---- DSpark ACCEPT ------------------------------------------------
+        // One batched verify over [next, d0..d_{K-2}] appends K positions, and
+        // the longest draft prefix the model agrees with is kept. Everything
+        // past the first disagreement is rolled back. The loop below then emits
+        // the confirmed tokens one per iteration WITHOUT forwarding them again.
+        #[cfg(feature = "v41")]
+        if dspark_accept
+            && state
+                .mtp
+                .as_ref()
+                .is_some_and(|m| m.ingested == 0 && m.confirmed.is_empty() && m.pending.is_some())
+        {
+            let k = v4flash_kernels::het::mtp::MTP_BLOCK;
+            let drafts = state.mtp.as_ref().unwrap().pending.unwrap();
+            // Inputs: the head token, then ALL K drafts — K+1 positions.
+            //
+            // K inputs would validate K drafts too (logits at pos+j predict
+            // pos+j+1), but the last draft would then never be INGESTED, so
+            // accepting all K would claim K+1 tokens in KV when only K are
+            // there. That off-by-one misaligns the cache and the continuation
+            // degrades into garbage. With K+1 inputs every accepted draft is in
+            // KV and `keep = n + 1` is exact.
+            let mut toks = Vec::with_capacity(k + 1);
+            toks.push(next);
+            toks.extend_from_slice(&drafts[..k]);
+            let hcs: Vec<Vec<f32>> = toks
+                .iter()
+                .map(|&t| {
+                    let mut r = vec![0.0f32; v4flash_kernels::config::HC_DIM as usize];
+                    embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, t, &mut r);
+                    r
+                })
+                .collect();
+            let engram_chunk: Option<Vec<Vec<f32>>> =
+                match (state.pager.as_ref(), state.engram.as_mut()) {
+                    (Some(pg), Some(ec)) => Some(ec.rows_for_chunk(pg.raw(), &toks, pos)?),
+                    _ => None,
+                };
+            let mark = state.state.mark_kv();
+            let t_step = std::time::Instant::now();
+            state.bd_a.mtp_capture_rows = k;
+            let logits = state.engine.forward_prefill_pipelined(
+                &mut state.bd_a, &mut state.bi_a, &mut state.bd_b, &mut state.bi_b,
+                &mut state.sd, &mut state.si, &mut state.dgpu_scratch, &mut state.state,
+                &state.weights, &hcs, &toks, pos, false, None, None, None, None,
+                state.pager.as_mut(), engram_chunk.as_deref(),
+            )?;
+            state.bd_a.mtp_capture_rows = 0;
+            let t_fwd = t_step.elapsed();
+
+            // Accept the longest prefix whose argmax matches the draft.
+            let nv = v4flash_kernels::config::N_VOCAB as usize;
+            let row_argmax = |j: usize| -> i32 {
+                let r = &logits[j * nv..(j + 1) * nv];
+                let mut bi = 0usize;
+                let mut bv = f32::NEG_INFINITY;
+                for (i, &v) in r.iter().enumerate() {
+                    if v > bv {
+                        bv = v;
+                        bi = i;
+                    }
+                }
+                bi as i32
+            };
+            let mut n = 0usize;
+            let mut corrected = row_argmax(0);
+            while n < k && corrected == drafts[n] {
+                n += 1;
+                if n < k {
+                    corrected = row_argmax(n);
+                }
+            }
+            let t_argmax = t_step.elapsed();
+            // KV must keep `next` plus the n accepted drafts and drop the rest.
+            // `KvMark` is per-layer `(n_raw, raw_off)`, so a PARTIAL rollback is
+            // just the mark advanced by the number of rows kept.
+            let keep = (n + 1) as u32; // `next` plus the n accepted drafts
+            let partial = v4flash_kernels::het::state::KvMark {
+                per_layer: mark
+                    .per_layer
+                    .iter()
+                    .map(|&(nr, off)| (nr + keep, off))
+                    .collect(),
+            };
+            state.state.rollback_kv(&partial).map_err(|e| {
+                eyre!("dspark accept: partial rollback ({keep} of {k}) refused: {e}")
+            })?;
+
+            // `main_hidden` for the next draft is the row that became the head.
+            let row = n; // row n is the last position kept: `next` + n drafts
+            let ne = v4flash_kernels::config::N_EMBD as usize;
+            let nsrc = v4flash_kernels::het::mtp::MTP_SRC_LAYERS.len();
+            let cap = v4flash_kernels::het::batch_scratch::MTP_CAP_ROWS;
+            let mut whole = vec![0.0f32; nsrc * cap * ne];
+            state.bd_a.mtp_src.copy_to_host(&mut whole)?;
+            let m = state.mtp.as_mut().expect("mtp");
+            m.main_hidden.clear();
+            #[allow(clippy::needless_range_loop)]
+            for sl in 0..nsrc {
+                let o = sl * cap * ne + row * ne;
+                m.main_hidden.extend_from_slice(&whole[o..o + ne]);
+            }
+            m.confirmed.clear();
+            for d in drafts.iter().take(n) {
+                m.confirmed.push_back(*d);
+            }
+            m.ingested = n + 1;
+            let head = if n < k { corrected } else { row_argmax(k) };
+            m.next_after = Some(head);
+            let t_roll = t_step.elapsed();
+            m.accept_steps += 1;
+            m.accept_tokens += (n as u64) + 1;
+
+            // Draft for the NEXT step now, while `main_hidden` is the row that
+            // just became the head: the drafter wants (residual @ p, token @
+            // p+1), and here p = pos + n and the token at p+1 is `head`.
+            let mut token_row = vec![0.0f32; v4flash_kernels::config::HC_DIM as usize];
+            embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, head, &mut token_row);
+            let m = state.mtp.as_mut().expect("mtp");
+            let (d2, _) = state.engine.dspark_draft(
+                &mut m.state, &mut m.exit, &m.main_hidden, &m.w, &m.xw, &state.weights,
+                &m.markov_embd, m.markov_dtype, pos + n as u32, &token_row, &m.noise_row, head,
+            )?;
+            m.pending = Some(d2);
+            if std::env::var("V41_DSPARK_STEP_TIMING").as_deref() == Ok("1") {
+                tracing::info!(
+                    n,
+                    fwd_ms = format!("{:.1}", t_fwd.as_secs_f64() * 1e3),
+                    argmax_ms = format!("{:.1}", (t_argmax - t_fwd).as_secs_f64() * 1e3),
+                    roll_ms = format!("{:.1}", (t_roll - t_argmax).as_secs_f64() * 1e3),
+                    draft_ms = format!("{:.1}", (t_step.elapsed() - t_roll).as_secs_f64() * 1e3),
+                    step_ms = format!("{:.1}", t_step.elapsed().as_secs_f64() * 1e3),
+                    "dspark.step"
+                );
+            }
+        }
+
         let t_embed = std::time::Instant::now();
         embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, next, &mut residual);
         v4flash_kernels::het::trace::phase::add(
             &v4flash_kernels::het::trace::phase::CALLER_EMBED_NS,
             t_embed.elapsed().as_nanos() as u64,
         );
-        forward_one!(state, residual, pos, next)?;
+        // Already in KV from the verify above: advance past it, forward nothing.
+        #[cfg(feature = "v41")]
+        let spec_ingested = state.mtp.as_mut().is_some_and(|m| {
+            let hit = m.ingested > 0;
+            if hit {
+                m.ingested -= 1;
+            }
+            hit
+        });
+        #[cfg(not(feature = "v41"))]
+        let spec_ingested = false;
+        #[cfg(feature = "v41")]
+        let use_mtp = !spec_ingested && state.mtp.is_some() && state.pager.is_some();
+        #[cfg(not(feature = "v41"))]
+        let use_mtp = false;
+        if use_mtp {
+            #[cfg(feature = "v41")]
+            {
+                // Same forward, plus the hc-collapsed residual ENTERING layers
+                // 37/38/39 — the drafter's only input from the main model.
+                let pg = state.pager.as_mut().expect("pager");
+                let engram_rows = match state.engram.as_mut() {
+                    Some(ec) => Some(ec.rows_for(pg.raw(), next, pos)?),
+                    None => None,
+                };
+                let m = state.mtp.as_mut().expect("mtp");
+                m.capture.begin();
+                state.engine.forward_token_paged_mtp(
+                    &mut state.dgpu_scratch,
+                    &mut state.igpu_scratch,
+                    &mut state.state,
+                    &state.weights,
+                    &residual,
+                    pos,
+                    next,
+                    pg,
+                    engram_rows.as_deref(),
+                    &mut m.capture,
+                )?;
+            }
+        } else if !spec_ingested {
+            forward_one!(state, residual, pos, next)?;
+        }
         pos += 1;
         // Successfully ingested `next` into KV at `pos-1`. live.pos
         // always tracks the KV cache position. live.tokens only
@@ -2727,15 +3075,318 @@ fn finish_decode(
             break FinishReason::Length;
         }
         let t_sample = std::time::Instant::now();
-        next = state
-            .engine
-            .sample_next(&mut state.dgpu_scratch, sample_mode, rng.next_f32())?;
+        // Speculative tokens the verify already confirmed (and ingested) come
+        // from the queue; `next_after` is the model's own correction that ends
+        // the accepted run and is NOT yet in KV.
+        #[cfg(feature = "v41")]
+        let spec_next: Option<i32> = state.mtp.as_mut().and_then(|m| {
+            m.confirmed
+                .pop_front()
+                .or_else(|| if m.ingested == 0 { m.next_after.take() } else { None })
+        });
+        #[cfg(not(feature = "v41"))]
+        let spec_next: Option<i32> = None;
+        next = match spec_next {
+            Some(t) => t,
+            None => state
+                .engine
+                .sample_next(&mut state.dgpu_scratch, sample_mode, rng.next_f32())?,
+        };
         v4flash_kernels::het::trace::phase::add(
             &v4flash_kernels::het::trace::phase::CALLER_SAMPLE_NS,
             t_sample.elapsed().as_nanos() as u64,
         );
+        // DSpark SHADOW: draft the next MTP_BLOCK tokens and record them, but
+        // do not act on them. The loop's output is untouched, so this measures
+        // acceptance against the real model without any chance of changing what
+        // the server emits — the drafter is the part that had never been run
+        // against real residuals, and acceptance is the only number that says
+        // whether it is right.
+        #[cfg(feature = "v41")]
+        if use_mtp && pos >= 1 {
+            let mut token_row = vec![0.0f32; v4flash_kernels::config::HC_DIM as usize];
+            embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, next, &mut token_row);
+            let m = state.mtp.as_mut().expect("mtp");
+            if m.actual.is_empty() {
+                m.actual_base = pos;
+            }
+            m.actual.push(next);
+            let mut mh = Vec::new();
+            m.capture.read(&mut mh)?;
+            m.main_hidden = mh;
+            // `capture` is the residual from the forward at `pos - 1`, and
+            // `next` is the token sampled from it, which sits at `pos`. That is
+            // exactly the reference's (main_hidden @ start_pos, input_ids at
+            // start_pos + 1), so the drafts predict `pos + 1 ..= pos + 5`.
+            let (drafts, drafts_plain) = state.engine.dspark_draft(
+                &mut m.state,
+                &mut m.exit,
+                &m.main_hidden,
+                &m.w,
+                &m.xw,
+                &state.weights,
+                &m.markov_embd,
+                m.markov_dtype,
+                pos - 1,
+                &token_row,
+                &m.noise_row,
+                next,
+            )?;
+            m.drafts.push((pos + 1, drafts));
+            m.drafts_plain.push((pos + 1, drafts_plain));
+            m.pending = Some(drafts);
+        }
+        #[cfg(feature = "v41")]
+        if let Some(vt) = xcheck_pending.take() {
+            use std::sync::atomic::Ordering::Relaxed;
+            XCHECK_TOT.fetch_add(1, Relaxed);
+            if vt == next {
+                XCHECK_OK.fetch_add(1, Relaxed);
+            }
+            // Argmax alone cannot tell a near-tie flip from a real numerical
+            // divergence. Compare the whole row: cos ~1 with flips means the
+            // two paths agree and the top-2 are close; low cos means they are
+            // computing different things.
+            if !xcheck_row0.is_empty() {
+                let nv = xcheck_row0.len();
+                let mut dl = vec![0.0f32; nv];
+                if state.dgpu_scratch.logits.len() >= nv {
+                    state.dgpu_scratch.logits.slice_view(0, nv).copy_to_host(&mut dl).ok();
+                    let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+                    for (a, bq) in xcheck_row0.iter().zip(&dl) {
+                        dot += (*a as f64) * (*bq as f64);
+                        na += (*a as f64) * (*a as f64);
+                        nb += (*bq as f64) * (*bq as f64);
+                    }
+                    let cos = dot / (na.sqrt() * nb.sqrt()).max(1e-12);
+                    XCHECK_COS.fetch_add((cos * 1e6) as i64, Relaxed);
+                    XCHECK_COS_N.fetch_add(1, Relaxed);
+                }
+                xcheck_row0.clear();
+            }
+        }
         completion_tokens += 1;
     };
+    #[cfg(feature = "v41")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (ok, tot) = (XCHECK_OK.swap(0, Relaxed), XCHECK_TOT.swap(0, Relaxed));
+        if tot > 0 {
+            tracing::info!(
+                agree = ok,
+                total = tot,
+                rate = format!("{:.4}", ok as f64 / tot as f64),
+                mean_cos = {
+                    let (c, n) = (XCHECK_COS.swap(0, Relaxed), XCHECK_COS_N.swap(0, Relaxed));
+                    if n > 0 { format!("{:.6}", c as f64 / 1e6 / n as f64) } else { "n/a".into() }
+                },
+                "dspark.xcheck: verify-path vs decode-path logits"
+            );
+        }
+    }
+
+    // DSpark shadow scoring: for each draft batch, how long a prefix matched
+    // what the model actually generated. `E` counts the ingested token too, so
+    // it is directly comparable to the Python oracle's 1.93 / 2.77 / 3.57 / 4.94
+    // at K = 1 / 2 / 3 / 5 (a per-token acceptance of ~0.92 reproduces all four).
+    #[cfg(feature = "v41")]
+    if let Some(m) = state.mtp.as_mut() {
+        use v4flash_kernels::het::mtp::MTP_BLOCK;
+        let mut hist = [0usize; MTP_BLOCK + 1];
+        let (mut batches, mut total) = (0usize, 0usize);
+        for (first_pos, d) in &m.drafts {
+            let Some(i0) = first_pos.checked_sub(m.actual_base) else { continue };
+            let i0 = i0 as usize;
+            if i0 + MTP_BLOCK > m.actual.len() {
+                continue;
+            }
+            let mut n = 0usize;
+            while n < MTP_BLOCK && d[n] == m.actual[i0 + n] {
+                n += 1;
+            }
+            hist[n] += 1;
+            total += n;
+            batches += 1;
+        }
+        // Per-depth acceptance, directly comparable to the oracle's `greedy_acc`
+        // in ~/.cache/deepstrix/v41/agentic/gen2/dspark_accept_base.json:
+        //   base (with prefill window seeding) [0.843, 0.730, 0.674, 0.607, 0.562]
+        //   no seed (what we implement today)  [0.764, 0.618, 0.461, 0.348, 0.213]
+        // Those are AGENTIC tool-calling text; freeform prose runs ~2.2x lower
+        // (d1 0.562 / E 1.99), so the content of the probe prompt matters as
+        // much as the implementation.
+        {
+            let mut hit = [0usize; MTP_BLOCK];
+            let mut tot = 0usize;
+            for (first_pos, d) in &m.drafts {
+                let Some(i0) = first_pos.checked_sub(m.actual_base) else { continue };
+                let i0 = i0 as usize;
+                if i0 + MTP_BLOCK > m.actual.len() { continue; }
+                for k in 0..MTP_BLOCK {
+                    if d[k] == m.actual[i0 + k] { hit[k] += 1; }
+                }
+                tot += 1;
+            }
+            if tot > 0 {
+                let acc: Vec<String> = hit
+                    .iter()
+                    .map(|h| format!("{:.3}", *h as f64 / tot as f64))
+                    .collect();
+                tracing::info!(steps = tot, greedy_acc = ?acc, "dspark.shadow.per_depth");
+            }
+        }
+        // A few concrete batches, so "weak" can be distinguished from "broken":
+        // plausible-but-wrong continuations mean a fine-grained problem, junk
+        // means something structural.
+        for (i, (fp, d)) in m.drafts.iter().enumerate().take(6) {
+            let Some(i0) = fp.checked_sub(m.actual_base) else { continue };
+            let i0 = i0 as usize;
+            if i0 + MTP_BLOCK > m.actual.len() { continue; }
+            tracing::info!(
+                pos = *fp,
+                drafts = ?d,
+                plain = ?m.drafts_plain.get(i).map(|x| x.1),
+                actual = ?&m.actual[i0..i0 + MTP_BLOCK],
+                "dspark.shadow.sample"
+            );
+        }
+        // Markov ablation: same scoring over the transformer-only drafts.
+        {
+            let (mut b2, mut t2, mut fh) = (0usize, 0usize, 0usize);
+            for (first_pos, d) in &m.drafts_plain {
+                let Some(i0) = first_pos.checked_sub(m.actual_base) else { continue };
+                let i0 = i0 as usize;
+                if i0 + MTP_BLOCK > m.actual.len() { continue; }
+                let mut n = 0usize;
+                while n < MTP_BLOCK && d[n] == m.actual[i0 + n] { n += 1; }
+                if n > 0 { fh += 1; }
+                t2 += n;
+                b2 += 1;
+            }
+            if b2 > 0 {
+                tracing::info!(
+                    batches = b2,
+                    mean_accepted = format!("{:.3}", t2 as f64 / b2 as f64),
+                    first_draft_hit_rate = format!("{:.3}", fh as f64 / b2 as f64),
+                    "dspark.shadow.no_markov"
+                );
+            }
+        }
+        // Alignment probe: score the same drafts against actual tokens shifted by
+        // -1/0/+1. If a neighbouring shift scores better, the drafts are right
+        // and the position bookkeeping is off by one — which is invisible in any
+        // single-step test and would look exactly like a weak drafter.
+        for shift in [-1i32, 0, 1] {
+            let (mut b2, mut t2, mut first_hit) = (0usize, 0usize, 0usize);
+            for (first_pos, d) in &m.drafts {
+                let Some(base) = (*first_pos as i64 - m.actual_base as i64).checked_add(shift as i64)
+                else { continue };
+                if base < 0 || base as usize + MTP_BLOCK > m.actual.len() {
+                    continue;
+                }
+                let i0 = base as usize;
+                let mut n = 0usize;
+                while n < MTP_BLOCK && d[n] == m.actual[i0 + n] {
+                    n += 1;
+                }
+                if n > 0 {
+                    first_hit += 1;
+                }
+                t2 += n;
+                b2 += 1;
+            }
+            if b2 > 0 {
+                tracing::info!(
+                    shift,
+                    batches = b2,
+                    mean_accepted = format!("{:.3}", t2 as f64 / b2 as f64),
+                    first_draft_hit_rate = format!("{:.3}", first_hit as f64 / b2 as f64),
+                    "dspark.shadow.align"
+                );
+            }
+        }
+        // Cold vs warm ring: the drafter's 128-entry window starts EMPTY (the
+        // reference seeds it from the prompt during prefill; we do not yet), so
+        // early batches see far less context than late ones.
+        {
+            let warm: Vec<usize> = m
+                .drafts
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i >= 128)
+                .filter_map(|(_, (fp, d))| {
+                    let i0 = fp.checked_sub(m.actual_base)? as usize;
+                    if i0 + MTP_BLOCK > m.actual.len() { return None; }
+                    let mut n = 0;
+                    while n < MTP_BLOCK && d[n] == m.actual[i0 + n] { n += 1; }
+                    Some(n)
+                })
+                .collect();
+            if !warm.is_empty() {
+                tracing::info!(
+                    warm_batches = warm.len(),
+                    mean_accepted = format!("{:.3}", warm.iter().sum::<usize>() as f64 / warm.len() as f64),
+                    "dspark.shadow.warm_ring"
+                );
+            }
+        }
+        if batches > 0 {
+            let mean = total as f64 / batches as f64;
+            tracing::info!(
+                batches,
+                mean_accepted = format!("{mean:.3}"),
+                e_tokens_per_verify = format!("{:.3}", 1.0 + mean),
+                per_token_accept = format!("{:.3}", {
+                    // a from E = sum_{k=1..K} a^k, by bisection.
+                    let (mut lo, mut hi) = (0.0f64, 1.0f64);
+                    for _ in 0..60 {
+                        let a = 0.5 * (lo + hi);
+                        let mut sum = 0.0;
+                        let mut p = 1.0;
+                        for _ in 0..MTP_BLOCK { p *= a; sum += p; }
+                        if sum < mean { lo = a } else { hi = a }
+                    }
+                    0.5 * (lo + hi)
+                }),
+                prefix_hist = ?hist,
+                "dspark.shadow: accepted-prefix distribution"
+            );
+        }
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let (ok, tot) = (XCHECK_OK.swap(0, Relaxed), XCHECK_TOT.swap(0, Relaxed));
+            if tot > 0 {
+                tracing::info!(
+                    agree = ok,
+                    total = tot,
+                    rate = format!("{:.4}", ok as f64 / tot as f64),
+                    "dspark.xcheck: verify-path argmax vs decode-path argmax"
+                );
+            }
+        }
+        if m.accept_steps > 0 {
+            tracing::info!(
+                steps = m.accept_steps,
+                tokens = m.accept_tokens,
+                e_tokens_per_step = format!(
+                    "{:.3}",
+                    m.accept_tokens as f64 / m.accept_steps as f64
+                ),
+                "dspark.accept: tokens per verify step"
+            );
+        }
+        m.accept_steps = 0;
+        m.accept_tokens = 0;
+        m.pending = None;
+        m.confirmed.clear();
+        m.ingested = 0;
+        m.next_after = None;
+        m.main_hidden.clear();
+        m.drafts.clear();
+        m.drafts_plain.clear();
+        m.actual.clear();
+    }
+
     // The loop's own wall. Measured 2026-09-14 (l1_1.log): 60.8 ms/token here
     // vs 88 ms/token by curl-wall/256 — the difference was the 6.9 s prefill of
     // a 36-token prompt (CED replay paging ~1500 decoder experts on box 1).

@@ -203,6 +203,10 @@ fn check_rows(who: &str, rows: usize) -> eyre::Result<()> {
 /// ~128 MiB at rows=512: residual / residual_next / after_attn_hc 32 MiB
 /// each, ffn_input_norm / ffn_shared / ffn_moe_recv / hot_ffn_moe_dgpu
 /// 8 MiB each, the rest < 100 KiB.
+/// Rows the DSpark residual capture is sized for. Only speculative verifies
+/// draft, and those are bounded by `V41_SMALL_B_OFFLOAD_MAX` (<= 8).
+pub const MTP_CAP_ROWS: usize = 16;
+
 pub struct BatchDgpuScratch {
     /// Row capacity every B-scaled buffer was sized for. Callers must
     /// never run a batch larger than this through the scratch.
@@ -250,6 +254,20 @@ pub struct BatchDgpuScratch {
     pub engram_xscale: DeviceBuffer<f32>,
     pub engram_kv: DeviceBuffer<f32>,
     pub engram_rows_ready: bool,
+    /// DSpark: hc-collapsed residual ENTERING each of `MTP_SRC_LAYERS`, for
+    /// every row of the batch — `[MTP_CAP_ROWS, 3 * N_EMBD]`.
+    ///
+    /// A speculative verify has to hand the drafter the residual of whatever
+    /// position ends up being the new head, and which row that is is only known
+    /// AFTER the batch has run. So capture every row and select afterwards.
+    /// Lives on the scratch rather than behind a new parameter because
+    /// `forward_layer_pre_moe_v2` already takes `bd` and has five call sites.
+    /// Off unless `mtp_capture_rows > 0`.
+    pub mtp_src: DeviceBuffer<f32>,
+    pub mtp_capture_rows: usize,
+    /// Uniform `1/N_HC` weights, so `hc_weighted` computes the mean over the
+    /// hyper-connection copies — the drafter's `main_hidden`.
+    pub mtp_hc_mean: DeviceBuffer<f32>,
     /// `[B, HC_DIM]` — mHC post-attention residual (P7 → P8, P12).
     pub after_attn_hc: DeviceBuffer<f32>,
     /// `[B, N_EMBD]` — FFN input (P8). Peer-pushed by `de.xfer` (P11x),
@@ -984,6 +1002,19 @@ impl BatchDgpuScratch {
             engram_xscale: DeviceBuffer::new(id, if cfg!(feature = "v41") { (ENGRAM_CHUNK * ENGRAM_IN / 32) as usize } else { 32 })?,
             engram_kv: DeviceBuffer::new(id, if cfg!(feature = "v41") { (ENGRAM_CHUNK * ENGRAM_OUT) as usize } else { 32 })?,
             engram_rows_ready: false,
+            mtp_src: DeviceBuffer::new(
+                id,
+                MTP_CAP_ROWS
+                    * crate::het::mtp::MTP_SRC_LAYERS.len()
+                    * crate::config::N_EMBD as usize,
+            )?,
+            mtp_capture_rows: 0,
+            mtp_hc_mean: {
+                let nh = crate::config::N_HC as usize;
+                let mut mb = DeviceBuffer::<f32>::new(id, nh * MTP_CAP_ROWS)?;
+                mb.copy_from_host(&vec![1.0f32 / nh as f32; nh * MTP_CAP_ROWS])?;
+                mb
+            },
             after_attn_hc: mk_f32(HC_DIM as usize)?,
             ffn_input_norm: mk_f32(N_EMBD as usize)?,
             d_selected: mk_i32(N_EXPERT_USED)?,

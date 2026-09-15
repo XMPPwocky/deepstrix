@@ -496,6 +496,7 @@ impl HeterogeneousEngine {
     ) -> color_eyre::eyre::Result<()> {
         self.forward_token_impl(
             dgpu_scratch, igpu_scratch, state, weights, input_hc_host, pos, token_id, None, None,
+            None,
         )
     }
 
@@ -527,6 +528,98 @@ impl HeterogeneousEngine {
             token_id,
             Some(pager),
             engram_rows,
+            None,
+        )
+    }
+
+    /// One DSpark draft step: entry, three drafter layers, exit.
+    ///
+    /// Spans both devices. The drafter's 7.93 GB of layers only fit on the iGPU;
+    /// its head is TIED to the main model's `output`, which is dGPU-resident.
+    /// So the layer stack runs on the iGPU and the exit on the dGPU, joined by a
+    /// 410 KB host round trip — at decode rates that is far under the noise
+    /// floor, and it sidesteps the peer-copy stream rule entirely.
+    ///
+    /// `pos` is the reference's `start_pos`: the position of the token whose
+    /// residual `main_hidden` holds (from `MtpCapture::read` on the decode
+    /// path, or the batched verify's per-row capture on the accept path). `token_row` is `embed_lookup` of the token
+    /// sampled FROM that forward, which sits at `pos + 1`. The returned drafts
+    /// are therefore predictions for positions `pos + 2 ..= pos + 1 + MTP_BLOCK`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dspark_draft(
+        &self,
+        mtp_state: &mut super::mtp::MtpState,
+        exit: &mut super::mtp::MtpExit,
+        main_hidden: &[f32],
+        w: &super::weights::MtpWeights,
+        xw: &super::weights::MtpExitWeights,
+        weights: &super::HetModelWeights,
+        markov_embd: &[u8],
+        markov_dtype: v4flash_core::gguf::GgufType,
+        pos: u32,
+        token_row: &[f32],
+        noise_row: &[f32],
+        first_token: i32,
+    ) -> color_eyre::eyre::Result<([i32; super::mtp::MTP_BLOCK], [i32; super::mtp::MTP_BLOCK])> {
+        self.set_current_cached(self.igpu.device)?;
+        mtp_state.inject_main_hidden(main_hidden)?;
+        mtp_state.forward(
+            &self.igpu,
+            &self.igpu.compute,
+            w,
+            &super::mtp::mtp_rope(),
+            pos,
+            token_row,
+            noise_row,
+        )?;
+        self.igpu.compute.synchronize()?;
+        let mut h_host = vec![0.0f32; mtp_state.h.len()];
+        mtp_state.h.copy_to_host(&mut h_host)?;
+        let mut pre_host = vec![0.0f32; mtp_state.pre_carry().len()];
+        mtp_state.pre_carry().copy_to_host(&mut pre_host)?;
+
+        self.set_current_cached(self.dgpu.device)?;
+        exit.forward(
+            &self.dgpu,
+            &self.dgpu.compute,
+            &h_host,
+            &pre_host,
+            xw,
+            &weights.global.output,
+            markov_embd,
+            markov_dtype,
+            first_token,
+        )
+    }
+
+    /// `forward_token_paged` that also captures the residuals the DSpark drafter
+    /// eats (entering layers 37/38/39). Separate entry point so the hot path
+    /// keeps its signature; `mtp.begin()` is the caller's to call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_token_paged_mtp(
+        &self,
+        dgpu_scratch: &mut super::DgpuScratch,
+        igpu_scratch: &mut super::IgpuScratch,
+        state: &mut super::HetModelState,
+        weights: &super::HetModelWeights,
+        input_hc_host: &[f32],
+        pos: u32,
+        token_id: i32,
+        pager: &mut super::expert_pager::ExpertPager,
+        engram_rows: Option<&[Vec<f32>]>,
+        mtp: &mut super::mtp::MtpCapture,
+    ) -> color_eyre::eyre::Result<()> {
+        self.forward_token_impl(
+            dgpu_scratch,
+            igpu_scratch,
+            state,
+            weights,
+            input_hc_host,
+            pos,
+            token_id,
+            Some(pager),
+            engram_rows,
+            Some(mtp),
         )
     }
 
@@ -542,6 +635,7 @@ impl HeterogeneousEngine {
         token_id: i32,
         mut pager: Option<&mut super::expert_pager::ExpertPager>,
         engram_rows: Option<&[Vec<f32>]>,
+        mut mtp: Option<&mut super::mtp::MtpCapture>,
     ) -> color_eyre::eyre::Result<()> {
         use crate::config::{HC_DIM, N_EXPERT, N_LAYER};
         use tracing::debug_span;
@@ -635,6 +729,12 @@ impl HeterogeneousEngine {
         }
 
         for layer in 0..N_LAYER as usize {
+            // DSpark: the drafter eats the residual ENTERING layers 37/38/39,
+            // so this must run before the layer does. A no-op for every other
+            // layer.
+            if let Some(c) = mtp.as_deref_mut() {
+                c.on_layer(&self.dgpu, &self.dgpu.compute, layer as i32, &dgpu_scratch.residual)?;
+            }
             let next_dlw = if layer + 1 < N_LAYER as usize {
                 Some(&weights.dgpu_layers[layer + 1])
             } else {
