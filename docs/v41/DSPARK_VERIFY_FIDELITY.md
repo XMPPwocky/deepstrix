@@ -200,3 +200,41 @@ requests, before comparing placements.)
 
 Box 2's miss rate is therefore a genuine capacity wall at 124 GB, not a
 placement-policy problem, which points back at the expert FORMAT lever.
+
+## Leg balance: `V41_LOCAL_PICKS=5` REFUTED (2026-09-15)
+
+Box 2 is saturated and box 1 looks idle, so forcing box 1 to claim picks should
+help — the knob's own doc models the optimum at n~5 for -17 ms/token. Measured,
+with a repeated baseline to bracket drift:
+
+    base    253.90 ms/tok   pager_ensure 2.7 ms    pager_misses 0
+    n=5     772.36 ms/tok   pager_ensure 683 ms    pager_misses 173
+    base    248.44 ms/tok   pager_ensure 3.3 ms    pager_misses 0
+
+3x WORSE. This is the confound the knob's own doc warns about: it claims picks
+REGARDLESS of residency, and box 1's decode LRU is 25 slots, so ~200 forced
+picks/token become ~173 misses on box 1's dm-crypt NVMe, on the critical path via
+`ensure`. Box 1 cannot take decode work it does not already hold, and the pool
+sweep already showed that giving it more slots is itself a loss.
+
+Note `igpu_busy_us=0` in decode summaries is an UNHARVESTED counter under the
+graph path, not proof box 1 is idle. Do not read it as headroom.
+
+## Placement comparison, and a warmth confound worth knowing
+
+Same prompt, box 2 warmed before each:
+
+    260/68 (running)   177.95 ms/tok   hit 0.9386 (8.5M requests, fully warm)
+    164/164            263.37 ms/tok   hit 0.9449 (~340k requests)
+    268/40 (script default) 237.12 ms/tok   hit 0.9001 (~200k requests)
+
+260/68 wins, and is what is restored. But box 2's hit rate is a MOVING TARGET
+that converges over hundreds of thousands of requests, and every arm above sits
+somewhere different on that curve, so the gaps are confounded in the direction
+that favours the incumbent. A clean placement comparison needs each arm warmed to
+convergence — hours, not minutes. Treat the ordering as provisional.
+
+The recorded 57.46 ms/token (17.4 tok/s) for this config was NOT reproduced by
+any placement tried today; today's best is 177.95. That gap is unexplained and is
+the most valuable open thread: it is 3x, and it is in NON-speculative decode,
+where the goal's arithmetic actually lives.
