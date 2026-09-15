@@ -81,6 +81,57 @@ reference rather than inferring from the tensor names:
     `RopeTail::launch_inverse_pdev` already exists for the main model's
     equivalent.
 
+### The drafter runs at B=5, and there is no causal mask inside the block
+
+Two more things that the `h = layer_forward(h)` sketch above hides, both
+confirmed against `forward_spec` / `forward_embed` / `get_dspark_topk_idxs`:
+
+  * The drafter is **not autoregressive**. `forward_embed` builds
+    `draft_input_ids = [real_token, noise, noise, noise, noise]` and embeds all
+    `block_size = 5` of them, so ONE pass over the 3 layers emits all 5 drafts.
+    Every buffer in `MtpState` is therefore `[5, ...]`, not `[1, ...]`. Running
+    it as 5 sequential B=1 steps would be a different (and much slower) model.
+  * `get_dspark_topk_idxs` `.expand(bsz, block_size, -1)`s ONE index vector over
+    every query, so all 5 positions attend the identical set — **the block is
+    bidirectional, not causal**. `n_kv` is the same for all 5 queries and no
+    mask kernel is needed. (The noise placeholders carry no information, so
+    there is nothing to leak.)
+
+Two consequences for the ring layout. The valid ring entries are the prefix
+`[0, min(win, start_pos+1))` — while filling, `start_pos % win == start_pos`;
+once full, all `win` are valid — so `n_valid(pos)` is right either way. And
+because RoPE is baked into each key at cache time, attention is
+**permutation-invariant over the KV set**: the block's transient KV can be
+compacted to `[n_valid, n_valid + 5)` instead of the reference's fixed
+`[win, win + 5)`, which keeps the keys contiguous for `attn_mixed` and costs
+nothing. Anything at or past `n_valid` is scratch, so the next step's `main_kv`
+write at `pos % win` legitimately overwrites it.
+
+### Landmine: the batched attention kernels are dGPU-only
+
+The drafter runs on the **iGPU (gfx1151)**, and every
+`attention_mixed_*_batched_htiled_wmma*` kernel guards its weighted-sum phase
+behind `#if defined(__gfx1200__) || defined(__gfx1201__)`. On the iGPU the
+softmax phase still runs and writes `scores`, and the weighted sum is compiled
+out, so `out` is never written — attention returns **exactly zero** with no
+error. The drafter then looks healthy from the outside: `h` is finite, it varies
+across the block, and only the MoE is actually contributing.
+
+Two things that caught it, both cheap and worth keeping on any new stage:
+
+  * attention output of *exactly* zero is diagnostic on its own — MLA shares K
+    and V, so a zero output means the value path never ran (or the ring is
+    empty), never "the weights came out small";
+  * **assert the output depends on `start_pos`**. Different positions rope at
+    different angles and see a different `n_valid`, so identical output at
+    pos 37 and pos 900 is proof that attention is not contributing.
+
+Use `attention_mixed_score` / `attention_mixed_softmax_wsum` (the B=1 pair, no
+arch guard) in a loop over the five queries. Note their scores stride is
+`ATTN_MIXED_MAX_KEYS` (82176), **not** `n_kv`: one shared `[N_HEAD, 82176]`
+buffer, not a per-query slice sized to the key count, which writes ~600x past
+its end.
+
 ## Build order
 
   * **L. Loader — DONE.** `mtp.{0,1,2}.*` presented through `V41HfWeights` under
