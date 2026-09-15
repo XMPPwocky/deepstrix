@@ -1174,25 +1174,18 @@ pub fn b2_global_pool() -> bool {
 /// Fraction of its own region a layer is guaranteed to keep, even when a decode
 /// request is evicting globally (`V41_B2_POOL_FLOOR`, default 0.90).
 ///
-/// **DO NOT SET THIS TO 0. IT IS LOAD-BEARING FOR CORRECTNESS, NOT ONLY FOR
-/// PREFILL RESIDENCY.** MEASURED 2026-09-15 with `V41_T2_CATCHALL=2`, where the
-/// box1/box2 partition is a CONSTANT so residency cannot legitimately change any
-/// result, same prompt at temperature 0:
+/// **An earlier note here called floor 0 numerically unsound. THAT WAS WRONG and
+/// is retracted.** Floor 0 did produce non-deterministic output, but bisection
+/// showed the corruption was `b2_coalesce` (the two-pread expert read), which
+/// only misbehaves when page-ins are frequent — i.e. exactly what floor 0
+/// causes. With coalescing off, floor 0.00 is BIT-IDENTICAL to floor 0.90
+/// (sha 13af380180431910, len 525, three runs each) and materially faster:
 ///
-///     floor 0.90   sha 13af380180431910 (len 525) x3   deterministic
-///     floor 0.00   sha 9eee5355594bd024 (len 517),
-///                  sha 5983106de8523886 (len 521)      DIFFERENT EVERY RUN
+///     floor 0.90, coalescing off   115-122 ms/tok   hit 0.9433
+///     floor 0.00, coalescing off    76-86  ms/tok   hit 0.9726   <- correct AND fast
 ///
-/// Unrestricted cross-layer eviction therefore changes the COMPUTATION — experts
-/// skipped, or read from a slot that has since been reused. It also looks like a
-/// huge win on the clock (decode 115-122 -> 66-70 ms/tok, box-2 hit 0.9433 ->
-/// 0.9787), which is exactly the "faster because it computed less" trap this
-/// engine has hit before (the submit mask that dropped 77% of experts; the
-/// small-B offload whose 5.3x was skipped work). Score this flag with a
-/// determinism check, never with tok/s.
-///
-/// The frontier below is retained for its PREFILL numbers, which are sound; its
-/// decode column is not trustworthy below the floor that keeps results stable.
+/// So the floor's cost is PREFILL, as originally documented, and nothing else.
+/// Verify it with a determinism check anyway; that is what caught the real bug.
 ///
 /// Without a floor the global pool leaks into PREFILL. The phase guard stops a
 /// prefill sweep from evicting other layers, but it does not stop DECODE from
@@ -1322,7 +1315,25 @@ pub fn remote_batched_multi() -> bool {
 /// Degrades safely: requires GPU repack AND 4096-aligned pinned staging, and
 /// falls back to the buffered path when the filesystem refuses the flag.
 /// Read all three roles of an expert in TWO preads instead of six.
-/// DEFAULT ON since 2026-09-15; `V41_B2_COALESCE=0` reverts.
+///
+/// **DEFAULT OFF — THIS CORRUPTS UNDER HEAVY EVICTION.** It was defaulted ON on
+/// 2026-09-15 and reverted the same day. MEASURED with `V41_T2_CATCHALL=2`
+/// (constant partition), same prompt, temperature 0:
+///
+///     pool floor 0.90, coalescing ON    sha 13af380180431910 (525)  stable
+///     pool floor 0.00, coalescing ON    sha 9eee5355594bd024 (517)
+///                                       sha 5983106de8523886 (521)  DIFFERS
+///     pool floor 0.00, coalescing OFF   sha 13af380180431910 (525)  x3 stable
+///
+/// The bug only fires when page-ins are FREQUENT: at floor 0.90 evictions are
+/// rare, which is why the original bit-identical validation passed — it was run
+/// in the regime where this path almost never executes. Validate any change to
+/// the read path at floor 0.00, where a decode request pages constantly.
+///
+/// The two-pread idea is sound (miss 7.11 -> 4.54 ms) and the layout claim holds
+/// (an expert's three weight planes are contiguous, and its three scale planes);
+/// something in the staging reuse or offset math is wrong under repeated
+/// page-ins. Root cause NOT yet found.
 ///
 /// The checkpoint is EXPERT-MAJOR: for every expert the three weight planes are
 /// byte-contiguous (3 x 5.625 = 16.875 MB) and so are its three scale planes
@@ -1356,7 +1367,7 @@ pub fn remote_batched_multi() -> bool {
 /// per-role path rather than trusting the layout.
 pub fn b2_coalesce() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("V41_B2_COALESCE").map(|v| v != "0").unwrap_or(true)
+        matches!(std::env::var("V41_B2_COALESCE").as_deref(), Ok("1") | Ok("on"))
     });
     *B
 }
