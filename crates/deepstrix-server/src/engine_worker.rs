@@ -1721,6 +1721,50 @@ fn short_hex(bytes: &[u8]) -> String {
 /// Host-side only — no GPU work. Used at restore / cancel / decode-end
 /// transitions to pin down wrong-KV-attended bugs by correlating
 /// snapshot hashes with the in-VRAM counters that should match them.
+/// `V41_PROBE_FPRINT=1`: content hashes of the KV state that a rollback is
+/// supposed to restore, taken before a speculative probe and after its
+/// rollback. Any component that differs is state the rollback does NOT restore
+/// — which is a correctness bug, because decode reads it next.
+///
+/// Hashes only the ACTIVE region of each buffer: rows a probe wrote past
+/// `n_raw` / `n_comp` are expected to differ and are never read.
+#[cfg(feature = "v41")]
+fn probe_fingerprint(state: &WorkerState) -> eyre::Result<Vec<(String, u64)>> {
+    let mut out = Vec::new();
+    let mut h = |name: String, v: &[u8]| out.push((name, u64::from_le_bytes(
+        blake3::hash(v).as_bytes()[..8].try_into().unwrap(),
+    )));
+    for (li, l) in state.state.layers.iter().enumerate() {
+        // Raw SWA window, active region only.
+        let total_rows = v4flash_kernels::het::state::KV_CACHE_ROWS;
+        let row = l.kv_cache.len() / total_rows.max(1);
+        if row > 0 && l.n_raw > 0 {
+            let off = (l.raw_off as usize) * row;
+            let len = (l.n_raw as usize) * row;
+            if off + len <= l.kv_cache.len() {
+                let mut buf = vec![0u16; len];
+                l.kv_cache.slice_view(off, len).copy_to_host(&mut buf)?;
+                let bytes: Vec<u8> = buf.iter().flat_map(|v| v.to_le_bytes()).collect();
+                h(format!("L{li}.kv_raw"), &bytes);
+            }
+        }
+        for (tag, cs) in [("main", l.compressor.as_ref()), ("idx", l.indexer_compressor.as_ref())]
+        {
+            let Some(cs) = cs else { continue };
+            let mut sk = vec![0f32; cs.state_kv.len()];
+            cs.state_kv.copy_to_host(&mut sk)?;
+            let b: Vec<u8> = sk.iter().flat_map(|v| v.to_le_bytes()).collect();
+            h(format!("L{li}.{tag}.state_kv"), &b);
+            let mut ss = vec![0f32; cs.state_score.len()];
+            cs.state_score.copy_to_host(&mut ss)?;
+            let b: Vec<u8> = ss.iter().flat_map(|v| v.to_le_bytes()).collect();
+            h(format!("L{li}.{tag}.state_score"), &b);
+            h(format!("L{li}.{tag}.n_comp"), &cs.n_comp.to_le_bytes());
+        }
+    }
+    Ok(out)
+}
+
 fn state_fingerprint(state: &WorkerState) -> String {
     let (live_h, live_pos, live_toks) = match &state.live {
         Some(l) => {
@@ -2606,6 +2650,10 @@ fn finish_decode(
     // Which arm the in-flight probe ran under: 0 = catch-all off, 1 = on.
     #[cfg(feature = "v41")]
     let mut xcheck_arm: usize = 0;
+    #[cfg(feature = "v41")]
+    let probe_fprint: bool = std::env::var("V41_PROBE_FPRINT").as_deref() == Ok("1");
+    #[cfg(feature = "v41")]
+    let mut probe_fp_before: Option<Vec<(String, u64)>> = None;
     let finish: FinishReason = loop {
         if cancel.load(Ordering::Relaxed) {
             tracing::info!("generation cancelled by client");
@@ -2797,6 +2845,7 @@ fn finish_decode(
         if verify_probe_k > 0 && completion_tokens > 8 {
             let verify_probe_k =
                 verify_probe_ks[(completion_tokens as usize) % verify_probe_ks.len()];
+            probe_fp_before = if probe_fprint { Some(probe_fingerprint(state)?) } else { None };
             embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, next, &mut residual);
             let mark = state.state.mark_kv();
             let pc0 = state.pager.as_ref().map(|p| p.counters()).unwrap_or_default();
@@ -2952,6 +3001,25 @@ fn finish_decode(
             state.state.rollback_kv(&mark).map_err(|e| {
                 eyre!("verify probe: rollback refused after {verify_probe_k} tokens: {e}")
             })?;
+            if let Some(before) = probe_fp_before.take() {
+                let after = probe_fingerprint(state)?;
+                let mut bad = Vec::new();
+                for ((n, a), (_, b)) in before.iter().zip(after.iter()) {
+                    if a != b {
+                        bad.push(n.clone());
+                    }
+                }
+                if !bad.is_empty() {
+                    let n = bad.len();
+                    bad.truncate(12);
+                    tracing::warn!(
+                        k = verify_probe_k, pos, components = n, first = ?bad,
+                        "probe rollback did NOT restore these components"
+                    );
+                } else {
+                    tracing::info!(k = verify_probe_k, pos, "probe rollback restored all components");
+                }
+            }
             tracing::info!(
                 k = verify_probe_k,
                 total_us = dt.as_micros() as u64,

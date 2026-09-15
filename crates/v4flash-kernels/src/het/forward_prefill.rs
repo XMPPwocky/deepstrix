@@ -2456,6 +2456,34 @@ impl HeterogeneousEngine {
         // ATTN_MIXED_MAX_KEYS), but FAKE_PREFILL_POS benches
         // stamping pos at the cap and decoding past it used to overrun the
         // (since removed) CSA bitmap by one word (the 98304 trap).
+        // The OWN-compressor branch derives `n_comp_after` from the live
+        // `cs.n_comp` counter with a pre-fire/post-fire snapshot. The REUSE
+        // branch computes the same quantity positionally and carries an
+        // explicit warning that it must NOT be derived from the live counter,
+        // because in the two-lane driver the source layer has already advanced
+        // it past this lane's rows. Both stores are 1:1 with boundaries from
+        // position 0, so the positional formula is the ground truth for both.
+        //
+        // `V41_COMP_POSITIONAL=1` logs every disagreement and uses the
+        // positional value; `=2` logs without overriding.
+        if comp_positional() > 0 && ratio > 0 && n_comp_after.len() == b as usize {
+            for k in 0..b as usize {
+                let want = (pos0 + k as u32 + 1) / ratio;
+                if n_comp_after[k] != want {
+                    COMP_POS_MISMATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if std::env::var("V41_COMP_POS_DBG").is_ok() {
+                        tracing::warn!(
+                            layer, row = k, b, pos0, ratio,
+                            got = n_comp_after[k], want,
+                            "comp n_comp_after disagrees with the positional formula"
+                        );
+                    }
+                    if comp_positional() == 1 {
+                        n_comp_after[k] = want;
+                    }
+                }
+            }
+        }
         for v in n_comp_after.iter_mut() {
             *v = (*v).min(ATTN_MIXED_MAX_KEYS);
         }
@@ -5390,6 +5418,19 @@ pub fn single_lane_max() -> usize {
 pub fn set_single_lane_max(v: usize) {
     SINGLE_LANE_MAX.store(v, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// `V41_COMP_POSITIONAL`: 1 = log and override `n_comp_after` with the
+/// positional formula, 2 = log only, 0/unset = off.
+pub fn comp_positional() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("V41_COMP_POSITIONAL").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    })
+}
+
+/// Count of rows whose `n_comp_after` disagreed with the positional formula.
+pub static COMP_POS_MISMATCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// `V41_LAYER_MISS_HIST=1`: per-layer expert-miss histogram for one verify.
 pub static LAYER_MISS: [std::sync::atomic::AtomicU64; 40] =
