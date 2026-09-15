@@ -1174,6 +1174,26 @@ pub fn b2_global_pool() -> bool {
 /// Fraction of its own region a layer is guaranteed to keep, even when a decode
 /// request is evicting globally (`V41_B2_POOL_FLOOR`, default 0.90).
 ///
+/// **DO NOT SET THIS TO 0. IT IS LOAD-BEARING FOR CORRECTNESS, NOT ONLY FOR
+/// PREFILL RESIDENCY.** MEASURED 2026-09-15 with `V41_T2_CATCHALL=2`, where the
+/// box1/box2 partition is a CONSTANT so residency cannot legitimately change any
+/// result, same prompt at temperature 0:
+///
+///     floor 0.90   sha 13af380180431910 (len 525) x3   deterministic
+///     floor 0.00   sha 9eee5355594bd024 (len 517),
+///                  sha 5983106de8523886 (len 521)      DIFFERENT EVERY RUN
+///
+/// Unrestricted cross-layer eviction therefore changes the COMPUTATION — experts
+/// skipped, or read from a slot that has since been reused. It also looks like a
+/// huge win on the clock (decode 115-122 -> 66-70 ms/tok, box-2 hit 0.9433 ->
+/// 0.9787), which is exactly the "faster because it computed less" trap this
+/// engine has hit before (the submit mask that dropped 77% of experts; the
+/// small-B offload whose 5.3x was skipped work). Score this flag with a
+/// determinism check, never with tok/s.
+///
+/// The frontier below is retained for its PREFILL numbers, which are sound; its
+/// decode column is not trustworthy below the floor that keeps results stable.
+///
 /// Without a floor the global pool leaks into PREFILL. The phase guard stops a
 /// prefill sweep from evicting other layers, but it does not stop DECODE from
 /// having already scattered the encoder residency prefill then has to re-page.
