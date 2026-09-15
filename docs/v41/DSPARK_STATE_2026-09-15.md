@@ -64,9 +64,27 @@ agreement is a STRUCTURAL difference, not f32 rounding (which is ~1e-4).
 Matches the reference `noseed` config (E≈3.08 shadow, fresh ring). Prefill window
 seeding is unimplemented and worth +1.1 E (oracle noseed 3.281 → base 4.382).
 
-## Validation still owed (per the user)
+## Validation still owed — and it may REDEFINE the blocker
+
 Compare the engine's per-position logits against the **CPU oracle's** logits (KL),
-not just engine-verify vs engine-decode — if both engine paths drift from the true
-model, KLD-vs-decode stays ~0 while both are wrong. `oracle_generate.py` already
-computes full reference logits (`head(norm(x), full_logits=True)`); dump them and
-compute KL(oracle‖engine). Slow but one-time.
+not just engine-verify vs engine-decode. Two reasons, the second decisive:
+
+1. If BOTH engine paths drift from the true model, KL-vs-decode stays ~0 while both
+   are wrong — I would never see it by comparing them to each other.
+2. **The disagreement localises the error.** I have been treating the decode chain
+   as ground truth and calling the batched chain's 0.276-nats divergence "the bug
+   to fix". But the oracle is the actual reference. Computing KL(oracle‖decode) and
+   KL(oracle‖batched) tells us WHICH chain is closer to truth:
+     - if decode is closer, fix the batched down kernel (as assumed);
+     - if BATCHED is closer, then the faithful-but-slow "decode chain" is the wrong
+       one, and the whole faithful/fast tradeoff is inverted — the fast chain was
+       right all along and the *garbage* came only from the two now-fixed races
+       (read_f32 sync, partials zeroing), which the 0.276 was measured BEFORE
+       being fully re-checked against truth.
+
+So the oracle run is not just validation — it decides which kernel to change.
+`oracle_generate.py` already computes full reference logits
+(`head(norm(x), full_logits=True)`) and needs only a dump of them (currently just
+argmax is saved); run it teacher-forced on a fixed prompt, dump the engine's
+decode AND batched verify logits at the same positions, compute both KLs. Slow
+(CPU, lazy streaming) but one-time and decisive.
