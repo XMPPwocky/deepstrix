@@ -238,3 +238,41 @@ The recorded 57.46 ms/token (17.4 tok/s) for this config was NOT reproduced by
 any placement tried today; today's best is 177.95. That gap is unexplained and is
 the most valuable open thread: it is 3x, and it is in NON-speculative decode,
 where the goal's arithmetic actually lives.
+
+## Methodology: box 2's LRU warming dominates every decode A/B on this box
+
+The single most important practical finding from the decode work. Box 2's page
+hit rate converges over HUNDREDS OF THOUSANDS of requests, and every arm of a
+restart-based A/B sits at a different point on that curve. Measured today, same
+prompt, same binary, arms run in sequence with a repeated baseline:
+
+    base0    229.15 ms/tok    box2 misses/100 tok = 2063
+    <arm>    221.49 ms/tok                          1944
+    base1    207.54 ms/tok                          1758
+
+The two BASELINES differ by 10.4% and the miss counts fall monotonically with
+wall-clock, not with the arm. Any decode delta below ~10% measured this way is
+warming, not the change. This retroactively weakens several comparisons made
+earlier today (the placement ordering especially) and explains contradictory
+results across the session.
+
+**Rule: for a decode A/B on this cluster, either warm box 2 to convergence in
+EVERY arm (~300k+ requests, tens of minutes each) or interleave the arms inside
+one process. Restart-per-arm with a short warm-up cannot see a 10% effect.**
+
+## Adaptive victim admission: UNTESTED, code reverted
+
+The GEOMETRY memo's best modelled option is box 1 as a ~960-slot VICTIM cache
+(12.0 miss/tok vs today's 20.4, ~54 ms/token). Victim policy is already the
+default, but the fill budget is `lru_free_slots()`, a ONE-TIME warm-up budget —
+so membership FREEZES at first fill and the LRU becomes a stale snapshot, which
+is why a 1396-slot pool measured slower than a 25-slot one. The code says as
+much: "NOT adaptive ... windowed-LFU promotion is the follow-up."
+
+Implemented admission-with-eviction capped per token (~10 admissions = ~42 ms,
+just under the decode plan's 45 ms cap) and measured: no resolvable effect, AND
+`decode_misses=7` for a whole run — the adaptive path fired SEVEN times, not
+10/token. The `BOX2_MISSED` marks are too sparse at decision time to drive it.
+So the idea is untested rather than refuted, and the code was reverted rather
+than shipped inert and unvalidated. Anyone retrying it must FIRST instrument how
+often `box2_missed` is actually true at the split decision.
