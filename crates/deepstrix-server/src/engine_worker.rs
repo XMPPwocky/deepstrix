@@ -2967,7 +2967,10 @@ fn finish_decode(
             }
             let dt = t_probe.elapsed();
             #[cfg(feature = "v41")]
-            if small_b_catchall_ab() > 0 {
+            {
+                // Record for EVERY bucketing mode, not just the catch-all A/B:
+                // bucketed by width this is the verify's cost curve, which is
+                // what decides the optimal draft depth.
                 XCHECK_ARM_US[xcheck_arm]
                     .fetch_add(dt.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             }

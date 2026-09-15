@@ -110,3 +110,62 @@ silently contributing nothing for the rest — the "computed by NOBODY" failure,
 one level below the hub's own `verify_routing_exactly_once`, which validates the
 hub's `owns_eff` and not box 2's behaviour. Next step is to instrument box 2's
 side: count, per request, picks received vs experts actually computed.
+
+## The verify cost curve — why speculation cannot pay here
+
+One run, `V41_VERIFY_PROBE=1,2,3,4,6`, deterministic split, compressor rollback
+fixed, ZERO box-1 expert misses. Cost and fidelity per batch width:
+
+| B | verify ms | cos |
+|---|---|---|
+| 1 | 489.9 | 0.9983 |
+| 2 | 797.0 | 0.9987 |
+| 3 | 991.7 | 0.804 |
+| 4 | 1083.6 | 0.797 |
+| 6 | 1275.5 | 0.793 |
+
+Least squares over B=1..6:
+
+    verify(B) ~ 333 + 157*B ms        baseline decode token = 192 ms
+
+Two independent reasons speculation loses, both from this fit:
+
+1. **The driver costs 2.5x decode for the SAME work.** At B=1 — one token, one
+   position, no misses — the batched prefill path takes 490 ms where decode's
+   own forward takes 192 ms. That 333 ms intercept is pure path overhead, and it
+   alone exceeds a whole decode token. No drafter quality can repay it.
+
+2. **The marginal row costs more than it can return.** Adding one draft row
+   costs 157 ms. The first draft is accepted with p=0.744, so it is worth at
+   most 0.744 * 192 = 143 ms. The FIRST speculative row already loses, before
+   any acceptance decay. Every deeper row is worse.
+
+Cross-check against the end-to-end measurement, which is what makes this a model
+rather than a curve fit: at B=6 with the measured E=2.07, the fit predicts
+1275 / 2.07 = 616 ms per accepted token; DSpark accept measured 649 ms/tok. The
+cost curve explains the observed 4x loss.
+
+### What any future attempt has to hit
+
+For 20 tok/s (50 ms/token) at a generous E=3, the verify at B=6 must cost
+150 ms total. Against today's `333 + 157*B`:
+
+    intercept   333 ms -> ~30 ms   (11x)
+    per row     157 ms -> ~20 ms   (8x)
+
+The per-row target is roughly box 2's own model (`srv = 105 + 20*B + 87*D`
+us/layer, ~10 ms/token-row summed over 40 layers for 3 new distinct experts), so
+it is not obviously unreachable — but it cannot be reached from the prefill
+driver, whose B=1 cost is already 2.5x decode's. This is the quantitative form of
+the earlier conclusion that the batched verify belongs INSIDE the engine as a
+batched DECODE entry point.
+
+### The other wall, independent of speculation
+
+Decode itself is 192 ms/token and 63% of that is box 2's expert service
+(121 ms), which is dominated by box 2's own 6.14% miss rate at 7.14 ms/miss
+(~53 ms/token). Box 2 is at RAM capacity (118 of 124 GB), box 1 cannot take the
+work (cost is max(box1, box2), measured three times), and the link is 3% of the
+token. So even a FREE verify leaves decode at 192 ms/token = 5.2 tok/s. Reaching
+20 tok/s needs the expert FORMAT lever (fitting all 15,360 experts in RAM), not
+a better verify.
