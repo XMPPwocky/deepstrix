@@ -247,6 +247,24 @@ static XCHECK_COS_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// step parity and bucket the xcheck by arm. Under the SHADOW probe this is a
 /// true control — decode drives the text, so the arm cannot change what is
 /// generated, only whether the batched verify reproduces it.
+/// `V41_SINGLE_LANE_AB=<max>`: interleave the prefill single-lane threshold
+/// ON/OFF by step parity, bucketing the xcheck by arm. Tests whether the
+/// batched verify's divergence from decode comes from the two-lane split.
+fn single_lane_ab() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("V41_SINGLE_LANE_AB").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    })
+}
+
+/// `V41_XCHECK_POISON=1`: see the row-independence probe in the verify probe.
+fn xcheck_poison() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_XCHECK_POISON").as_deref() == Ok("1"))
+}
+/// An ordinary in-vocabulary token, deliberately unrelated to the context.
+const POISON_TOKEN: i32 = 1000;
+
 fn small_b_catchall_ab() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -258,16 +276,19 @@ fn small_b_catchall_ab() -> usize {
 }
 /// Per-arm [off, on]: agreements, totals, summed cosine x1e6, cosine count,
 /// summed probe wall-microseconds.
-static XCHECK_ARM_OK: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-static XCHECK_ARM_TOT: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-static XCHECK_ARM_COS: [std::sync::atomic::AtomicI64; 2] =
-    [const { std::sync::atomic::AtomicI64::new(0) }; 2];
-static XCHECK_ARM_COS_N: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-static XCHECK_ARM_US: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Arms 0/1 for the flag A/Bs; when bucketing by probe WIDTH the arm IS the
+/// width, so this is indexed by `k` up to `XCHECK_ARMS - 1`.
+const XCHECK_ARMS: usize = 17;
+static XCHECK_ARM_OK: [std::sync::atomic::AtomicU64; XCHECK_ARMS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; XCHECK_ARMS];
+static XCHECK_ARM_TOT: [std::sync::atomic::AtomicU64; XCHECK_ARMS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; XCHECK_ARMS];
+static XCHECK_ARM_COS: [std::sync::atomic::AtomicI64; XCHECK_ARMS] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; XCHECK_ARMS];
+static XCHECK_ARM_COS_N: [std::sync::atomic::AtomicU64; XCHECK_ARMS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; XCHECK_ARMS];
+static XCHECK_ARM_US: [std::sync::atomic::AtomicU64; XCHECK_ARMS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; XCHECK_ARMS];
 
 /// Everything the DSpark drafter needs, loaded once at startup.
 #[cfg(feature = "v41")]
@@ -2790,11 +2811,18 @@ fn finish_decode(
                     v4flash_kernels::het::forward_prefill::set_small_b_catchall_max(
                         if xcheck_arm == 1 { ab } else { 0 },
                     );
+                } else if single_lane_ab() > 0 {
+                    xcheck_arm = (completion_tokens as usize) % 2;
+                    v4flash_kernels::het::forward_prefill::set_single_lane_max(
+                        if xcheck_arm == 1 { single_lane_ab() } else { 0 },
+                    );
+                } else if xcheck_poison() {
+                    xcheck_arm = (completion_tokens as usize) % 2;
                 } else if verify_probe_ks.len() > 1 {
-                    // No catch-all A/B: bucket by probe WIDTH instead, so a
-                    // `V41_VERIFY_PROBE=1,6` run answers whether the verify's
-                    // divergence from decode is a BATCHING effect at all.
-                    xcheck_arm = usize::from(verify_probe_k > 1);
+                    // No flag A/B: bucket by probe WIDTH, so one run sweeps B
+                    // and shows whether the verify's divergence from decode
+                    // degrades smoothly with batch or cliffs at a path switch.
+                    xcheck_arm = verify_probe_k.min(XCHECK_ARMS - 1);
                 }
             }
             let t_probe = std::time::Instant::now();
@@ -2804,8 +2832,26 @@ fn finish_decode(
                 // appended to the live KV, which is what a draft batch costs.
                 // K sequential forwards (the else arm) measure the reject path
                 // instead and are ~K x more expensive by construction.
-                let hcs: Vec<Vec<f32>> = (0..verify_probe_k).map(|_| residual.clone()).collect();
-                let toks: Vec<i32> = vec![next; verify_probe_k];
+                // ROW-INDEPENDENCE PROBE (`V41_XCHECK_POISON=1`, interleaved by
+                // step parity). Rows 1.. are a DIFFERENT token. Row 0's input is
+                // untouched, and row 0 is causally first, so its logits must not
+                // move. If they do, the batched path leaks later rows into row 0.
+                let poison = xcheck_poison() && (completion_tokens as usize) % 2 == 1;
+                // Poison BOTH the token and the CARRY of rows 1.. . Tokens alone
+                // leave the mHC pre-mix untouched, and that is precisely the
+                // stage that could mix across the batch dimension.
+                let hcs: Vec<Vec<f32>> = (0..verify_probe_k)
+                    .map(|j| {
+                        if poison && j > 0 {
+                            residual.iter().map(|v| -0.5 * v).collect()
+                        } else {
+                            residual.clone()
+                        }
+                    })
+                    .collect();
+                let toks: Vec<i32> = (0..verify_probe_k)
+                    .map(|j| if poison && j > 0 { POISON_TOKEN } else { next })
+                    .collect();
                 // Engram rows must be gathered and handed to the batched path the
                 // same way `prefill_suffix` does it — `forward_prefill` (non-
                 // pipelined) has no engram parameter, and the batched MoE fails
@@ -3360,8 +3406,9 @@ fn finish_decode(
                 "dspark.xcheck: verify-path vs decode-path logits"
             );
         }
-        if small_b_catchall_ab() > 0 || verify_probe_ks.len() > 1 {
-            for arm in 0..2usize {
+        if small_b_catchall_ab() > 0 || single_lane_ab() > 0 || xcheck_poison() || verify_probe_ks.len() > 1 {
+            let by_width = small_b_catchall_ab() == 0 && single_lane_ab() == 0;
+            for arm in 0..XCHECK_ARMS {
                 let t = XCHECK_ARM_TOT[arm].swap(0, Relaxed);
                 if t == 0 {
                     continue;
@@ -3371,8 +3418,15 @@ fn finish_decode(
                 let us = XCHECK_ARM_US[arm].swap(0, Relaxed);
                 tracing::info!(
                     arm = if small_b_catchall_ab() > 0 {
-                        if arm == 1 { "catchall_on" } else { "catchall_off" }
-                    } else if arm == 1 { "probe_batched" } else { "probe_b1" },
+                        if arm == 1 { "catchall_on".to_string() } else { "catchall_off".to_string() }
+                    } else if single_lane_ab() > 0 {
+                        if arm == 1 { "single_lane".to_string() } else { "two_lane".to_string() }
+                    } else if xcheck_poison() {
+                        if arm == 1 { "rows1+_poisoned".to_string() } else { "clean".to_string() }
+                    } else {
+                        let _ = by_width;
+                        format!("B={arm}")
+                    },
                     agree = o,
                     total = t,
                     rate = format!("{:.4}", o as f64 / t as f64),

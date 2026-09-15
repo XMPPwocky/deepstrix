@@ -579,10 +579,7 @@ impl HeterogeneousEngine {
         // were faster because they computed something different. On the verify
         // path, wall time alone cannot tell a speedup from a wrong answer —
         // score every change with acceptance.
-        let single_lane_max: usize = std::env::var("V41_PREFILL_SINGLE_LANE_MAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let single_lane_max: usize = single_lane_max();
         // ONLY on the non-CED path. The CED branch plans its lane cut in
         // `plan_chunk` and then asserts the range returns the same one
         // ("CED prefill: lane cut N != planned M"), so overriding it here
@@ -5368,6 +5365,30 @@ pub fn small_b_catchall_max() -> usize {
 /// Set the small-B catch-all threshold at runtime. See `small_b_catchall_max`.
 pub fn set_small_b_catchall_max(v: usize) {
     SMALL_B_CATCHALL.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Live value of `V41_PREFILL_SINGLE_LANE_MAX`. Runtime-settable for the same
+/// reason as `small_b_catchall_max`: so the arms interleave in ONE process.
+static SINGLE_LANE_MAX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+pub fn single_lane_max() -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = SINGLE_LANE_MAX.load(Relaxed);
+    if v != usize::MAX {
+        return v;
+    }
+    let seed = std::env::var("V41_PREFILL_SINGLE_LANE_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    SINGLE_LANE_MAX.store(seed, Relaxed);
+    seed
+}
+
+/// Set the single-lane threshold at runtime. See `single_lane_max`.
+pub fn set_single_lane_max(v: usize) {
+    SINGLE_LANE_MAX.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `V41_LAYER_MISS_HIST=1`: per-layer expert-miss histogram for one verify.
