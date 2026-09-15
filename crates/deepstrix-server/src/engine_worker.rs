@@ -243,6 +243,32 @@ static XCHECK_COS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::
 #[cfg(feature = "v41")]
 static XCHECK_COS_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `V41_SMALL_B_CATCHALL_AB=<max>`: interleave the small-B catch-all ON/OFF by
+/// step parity and bucket the xcheck by arm. Under the SHADOW probe this is a
+/// true control — decode drives the text, so the arm cannot change what is
+/// generated, only whether the batched verify reproduces it.
+fn small_b_catchall_ab() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("V41_SMALL_B_CATCHALL_AB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+/// Per-arm [off, on]: agreements, totals, summed cosine x1e6, cosine count,
+/// summed probe wall-microseconds.
+static XCHECK_ARM_OK: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static XCHECK_ARM_TOT: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static XCHECK_ARM_COS: [std::sync::atomic::AtomicI64; 2] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; 2];
+static XCHECK_ARM_COS_N: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static XCHECK_ARM_US: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Everything the DSpark drafter needs, loaded once at startup.
 #[cfg(feature = "v41")]
 pub struct MtpCtx {
@@ -2556,6 +2582,9 @@ fn finish_decode(
     let mut xcheck_pending: Option<i32> = None;
     #[cfg(feature = "v41")]
     let mut xcheck_row0: Vec<f32> = Vec::new();
+    // Which arm the in-flight probe ran under: 0 = catch-all off, 1 = on.
+    #[cfg(feature = "v41")]
+    let mut xcheck_arm: usize = 0;
     let finish: FinishReason = loop {
         if cancel.load(Ordering::Relaxed) {
             tracing::info!("generation cancelled by client");
@@ -2750,6 +2779,24 @@ fn finish_decode(
             embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, next, &mut residual);
             let mark = state.state.mark_kv();
             let pc0 = state.pager.as_ref().map(|p| p.counters()).unwrap_or_default();
+            // Interleave the small-B catch-all by step parity. Decode drives the
+            // text, so both arms verify the SAME token sequence at the same
+            // positions — the comparison is of the verify path alone.
+            #[cfg(feature = "v41")]
+            {
+                let ab = small_b_catchall_ab();
+                if ab > 0 {
+                    xcheck_arm = (completion_tokens as usize) % 2;
+                    v4flash_kernels::het::forward_prefill::set_small_b_catchall_max(
+                        if xcheck_arm == 1 { ab } else { 0 },
+                    );
+                } else if verify_probe_ks.len() > 1 {
+                    // No catch-all A/B: bucket by probe WIDTH instead, so a
+                    // `V41_VERIFY_PROBE=1,6` run answers whether the verify's
+                    // divergence from decode is a BATCHING effect at all.
+                    xcheck_arm = usize::from(verify_probe_k > 1);
+                }
+            }
             let t_probe = std::time::Instant::now();
             let mut probe_logits: Vec<f32> = Vec::new();
             if verify_probe_batched {
@@ -2824,6 +2871,11 @@ fn finish_decode(
                 xcheck_row0 = row.to_vec();
             }
             let dt = t_probe.elapsed();
+            #[cfg(feature = "v41")]
+            if small_b_catchall_ab() > 0 {
+                XCHECK_ARM_US[xcheck_arm]
+                    .fetch_add(dt.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             // Per-stage GPU busy for exactly ONE verify. `forward_prefill_pipelined`
             // feeds the accumulator per chunk but only the real prefill emits, so
             // the probe's breakdown was never visible. NOTE the harvest
@@ -3261,8 +3313,10 @@ fn finish_decode(
         if let Some(vt) = xcheck_pending.take() {
             use std::sync::atomic::Ordering::Relaxed;
             XCHECK_TOT.fetch_add(1, Relaxed);
+            XCHECK_ARM_TOT[xcheck_arm].fetch_add(1, Relaxed);
             if vt == next {
                 XCHECK_OK.fetch_add(1, Relaxed);
+                XCHECK_ARM_OK[xcheck_arm].fetch_add(1, Relaxed);
             }
             // Argmax alone cannot tell a near-tie flip from a real numerical
             // divergence. Compare the whole row: cos ~1 with flips means the
@@ -3282,6 +3336,8 @@ fn finish_decode(
                     let cos = dot / (na.sqrt() * nb.sqrt()).max(1e-12);
                     XCHECK_COS.fetch_add((cos * 1e6) as i64, Relaxed);
                     XCHECK_COS_N.fetch_add(1, Relaxed);
+                    XCHECK_ARM_COS[xcheck_arm].fetch_add((cos * 1e6) as i64, Relaxed);
+                    XCHECK_ARM_COS_N[xcheck_arm].fetch_add(1, Relaxed);
                 }
                 xcheck_row0.clear();
             }
@@ -3303,6 +3359,30 @@ fn finish_decode(
                 },
                 "dspark.xcheck: verify-path vs decode-path logits"
             );
+        }
+        if small_b_catchall_ab() > 0 || verify_probe_ks.len() > 1 {
+            for arm in 0..2usize {
+                let t = XCHECK_ARM_TOT[arm].swap(0, Relaxed);
+                if t == 0 {
+                    continue;
+                }
+                let o = XCHECK_ARM_OK[arm].swap(0, Relaxed);
+                let (c, n) = (XCHECK_ARM_COS[arm].swap(0, Relaxed), XCHECK_ARM_COS_N[arm].swap(0, Relaxed));
+                let us = XCHECK_ARM_US[arm].swap(0, Relaxed);
+                tracing::info!(
+                    arm = if small_b_catchall_ab() > 0 {
+                        if arm == 1 { "catchall_on" } else { "catchall_off" }
+                    } else if arm == 1 { "probe_batched" } else { "probe_b1" },
+                    agree = o,
+                    total = t,
+                    rate = format!("{:.4}", o as f64 / t as f64),
+                    mean_cos = {
+                        if n > 0 { format!("{:.6}", c as f64 / 1e6 / n as f64) } else { "n/a".into() }
+                    },
+                    probe_ms = format!("{:.1}", us as f64 / 1000.0 / t as f64),
+                    "dspark.xcheck.ab: small-B catch-all, interleaved by step parity"
+                );
+            }
         }
     }
 

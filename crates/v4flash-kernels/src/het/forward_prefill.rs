@@ -541,7 +541,18 @@ impl HeterogeneousEngine {
         }
         // For chunks too small to bother pipelining, fall back to single-lane
         // (exact full-depth only: the single-lane driver has no layer range).
-        if b < 2 && ced == CedMode::Exact && lo == 0 && hi == N_LAYER as usize {
+        //
+        // NOT when this chunk carries Engram rows: `forward_prompt_batch_v2`
+        // has no engram parameter, so the fallback cannot stage them and the
+        // first engram layer fails with "Engram rows not staged". Latent in
+        // production (prefill chunks are ~128 wide) but it makes a 1-token
+        // chunk impossible, which is exactly what a B=1 verify probe is.
+        if b < 2
+            && ced == CedMode::Exact
+            && lo == 0
+            && hi == N_LAYER as usize
+            && engram_rows.is_none()
+        {
             self.forward_prompt_batch_v2(
                 bd_a, bi_a, sd, si, state, weights, input_hcs, tokens, pos0, stats, image_spans,
                 pager.as_deref_mut(),
@@ -5328,14 +5339,35 @@ pub fn emit_layer_host_timing(tag: &str, layers: usize) {
 /// This only works because the hub masks box 2's pick list itself (see
 /// `sel_for_remote`): `submit`'s own mask is the static HELLO bitmap and would
 /// silently drop every reassigned pick.
+/// Live value of the small-B catch-all threshold.
+///
+/// RUNTIME-SETTABLE (not a `OnceLock`) so both arms can be interleaved inside
+/// ONE process against ONE weight load. Under the shadow probe that is a true
+/// control: DECODE drives the generated text, so flipping this per step cannot
+/// change WHAT is generated, only whether the batched verify reproduces it.
+/// Every earlier A/B of this flag compared separate servers and was confounded
+/// both by cold start and by its own effect on the text it was scored against.
+/// `usize::MAX` means "not yet seeded from the environment".
+static SMALL_B_CATCHALL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
 pub fn small_b_catchall_max() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("V41_SMALL_B_CATCHALL_MAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    })
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = SMALL_B_CATCHALL.load(Relaxed);
+    if v != usize::MAX {
+        return v;
+    }
+    let seed = std::env::var("V41_SMALL_B_CATCHALL_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    SMALL_B_CATCHALL.store(seed, Relaxed);
+    seed
+}
+
+/// Set the small-B catch-all threshold at runtime. See `small_b_catchall_max`.
+pub fn set_small_b_catchall_max(v: usize) {
+    SMALL_B_CATCHALL.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `V41_LAYER_MISS_HIST=1`: per-layer expert-miss histogram for one verify.
