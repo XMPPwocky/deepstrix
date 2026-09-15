@@ -3914,6 +3914,8 @@ impl HeterogeneousEngine {
         // Router picks for this chunk, read back once and shared by the union
         // pager and the remote submit below (both need exactly these ids).
         let mut sel_host_remote: Vec<i32> = Vec::new();
+        // Lane picks copied for `V41_GROUP_AUDIT`.
+        let mut sel_host_audit: Vec<i32> = Vec::new();
         // Box 2's pick list and weights, masked by the hub's OWN `owns_eff`
         // instead of box 2's advertised HELLO bitmap.
         //
@@ -4074,6 +4076,9 @@ impl HeterogeneousEngine {
                     LAYER_MISS[layer as usize].fetch_add(d, std::sync::atomic::Ordering::Relaxed);
                 }
                 sel_host_remote = sel_host;
+                if group_audit() {
+                    sel_host_audit = sel_host_remote.clone();
+                }
                 // Two-box split: tell the iGPU to skip the experts box 2 owns.
                 // Built here, while we still hold `&mut pg`; consumed below via
                 // `pg.remap_dev` under the shared borrow.
@@ -4544,6 +4549,35 @@ impl HeterogeneousEngine {
                     N_EXPERT,
                     max_per_expert,
                 )?;
+                // `V41_GROUP_AUDIT=1`: every pick the remap marks OURS must end
+                // up in exactly one expert's member list. A short count means the
+                // builder silently dropped local picks and the layer is
+                // under-computed — the failure mode this file warns about twice
+                // (the M63 over-cap bug, hot_prefill_cap()=4 vs N_EXPERT_USED=6)
+                // and the one that matches the small-B catch-all corrupting only
+                // when a LANE HOLDS >= 2 ROWS.
+                if group_audit() {
+                    ie.compute.synchronize()?;
+                    let mut gc = vec![0i32; N_EXPERT as usize];
+                    group_count.slice_view(0, N_EXPERT as usize).copy_to_host(&mut gc)?;
+                    let enqueued: i64 = gc.iter().map(|&v| v as i64).sum();
+                    // Expected: picks whose remap entry is NEGATIVE ("ours at slot").
+                    let mut remap_host = vec![0i32; N_EXPERT as usize];
+                    rm.slice_view(0, N_EXPERT as usize).copy_to_host(&mut remap_host)?;
+                    let expected: i64 = sel_host_audit
+                        .iter()
+                        .filter(|&&e| {
+                            (0..N_EXPERT as i32).contains(&e) && remap_host[e as usize] < 0
+                        })
+                        .count() as i64;
+                    if enqueued != expected {
+                        tracing::warn!(
+                            layer, b, enqueued, expected,
+                            deficit = expected - enqueued,
+                            "GROUP_AUDIT: het-split builder dropped local picks"
+                        );
+                    }
+                }
             } else {
                 // Emits RAW expert ids as group ids — incompatible with a
                 // de-duplicated iGPU buffer (see prefill_hot_active).
@@ -5431,6 +5465,12 @@ pub fn single_lane_max() -> usize {
 /// Set the single-lane threshold at runtime. See `single_lane_max`.
 pub fn set_single_lane_max(v: usize) {
     SINGLE_LANE_MAX.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `V41_GROUP_AUDIT=1`: verify the het-split builder enqueued every local pick.
+pub fn group_audit() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_GROUP_AUDIT").as_deref() == Ok("1"))
 }
 
 /// `V41_SMALL_B_CATCHALL_DET=1`: the small-B catch-all hands box 2 every pick

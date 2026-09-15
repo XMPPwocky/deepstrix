@@ -276,3 +276,55 @@ just under the decode plan's 45 ms cap) and measured: no resolvable effect, AND
 So the idea is untested rather than refuted, and the code was reverted rather
 than shipped inert and unvalidated. Anyone retrying it must FIRST instrument how
 often `box2_missed` is actually true at the split decision.
+
+## The catch-all corrupts iff A LANE HOLDS >= 2 ROWS (2026-09-15)
+
+This is the last thing standing between DSpark and viability, so it is worth
+stating precisely.
+
+With the small-B catch-all on, box 1 pages NOTHING for a verify
+(`prefill_misses=0`) and the cost curve collapses from `476 + 121*B` to
+**`92 + 121*B` ms** — the intercept falls from ~6 decode tokens to ~1. But
+fidelity breaks at B>=3.
+
+The trigger is NOT batch width and NOT the two-lane split. It is how many rows a
+LANE holds. `lane_split` gives `b.div_ceil(2)`, so B=2 is 1+1 — one row per lane.
+Forcing everything into one lane moves the cliff to B=2:
+
+    B   two-lane (rows in lane A)   single-lane (all rows in lane A)
+    1   0.9995   (1 row)            0.9979   (1 row)
+    2   0.9991   (1 row)            0.5446   (2 rows)   <- moved
+    3   0.5692   (2 rows)           0.5377   (3 rows)
+    6   0.7146   (3 rows)           0.5071   (6 rows)
+
+Every arm with ONE row per lane is exact; every arm with two or more is broken.
+
+### Ruled out, each by measurement
+
+| Suspect | Instrument | Result |
+|---|---|---|
+| Static HELLO mask dropping reassigned picks | `V41_MASK_DBG=1` | zero masked-live picks |
+| Stale remap / double count | read `set_remote_exclusion` | rewrites all N_EXPERT from `slot_of`; decode's `mark_remote_after_ensure` added here changed nothing |
+| Het-split cap below top-k | read `split_cap` | already pinned to `N_EXPERT_USED` under the remote split |
+| Member-list overflow | read `max_per_expert` | sized `rows`, the worst case of every token picking one expert |
+| **Builder dropping local picks** | **`V41_GROUP_AUDIT=1`** | **ZERO deficits — every pick the remap marks OURS is enqueued, even in the broken config** |
+| Remote-partial reduce | read the combine | flat `vec_add` over `b*N_EMBD`, length checked; no row indexing |
+| Coalesced reads | `V41_B2_COALESCE_CHECK=1` | byte-identical to per-role |
+
+### What that leaves
+
+Box 1 enqueues the right picks and adds a correctly-shaped remote partial, yet
+the result is wrong once a lane carries multiple rows. The distinguishing
+property of the catch-all is SHAPE: box 1 computes a very small, dense set of
+experts across ALL rows, where normally it computes many experts thinly. The
+next thing to test is whether that shape alone is the trigger, independent of
+the catch-all — e.g. cap box 1's local claim (`V41_LOCAL_CLAIM_MAX`) so it
+computes 2 experts/layer with the catch-all OFF, and see whether B>=2 corrupts.
+If it does, the fault is in the multi-row iGPU MoE chunking, not in the split.
+
+**Worth fixing:** at `92 + 121*B` with correct fidelity, a B=6 verify is ~820 ms
+and at the measured E=2.07 that is ~400 ms/token — still short. But the same
+curve with the verify on a batched DECODE path (box 2's per-layer cost
+`105 + 20B + 87D` us, sel_sync and link amortised 6x) prices at ~110-130 ms for
+B=6, i.e. ~55-65 ms/token against decode's 80 — the first configuration where
+speculation actually pays.
