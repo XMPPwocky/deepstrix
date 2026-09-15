@@ -115,3 +115,43 @@ while a mark is outstanding.
 At E=3.077 and the 149 ms batched verify that is ~48 ms/token (~20.7 tok/s)
 against decode's 67 — but it also needs box 2's batched by-expert chain to agree
 with its decode chain (cos 0.889 vs 0.999), since 149 ms is the batched chain's.
+
+## The last correctness blocker, root-caused (2026-09-15)
+
+Accept mode now RUNS past the SWA window (ring fix) and is FAITHFUL on short
+context (KL(decode||verify) = 0.00077 nats, argmax agree 0.986, decode chain).
+But on long context it diverges hard (KLD ~4 nats), and the cause is exact:
+
+- **decode** addresses the raw window as a MONOTONIC RING: `[raw_off, raw_off +
+  n_raw)`, `raw_off` advancing as tokens are generated.
+- **the verify** runs the PREFILL path, which addresses the window as
+  `[0, n_raw)` (prefill always normalises `raw_off = 0`), appends at slot
+  `n_raw`, and computes attention offsets from slot 0.
+
+While `raw_off == 0` (short context, window never slid) these coincide and the
+verify is bit-faithful. Once the window slides (`raw_off != 0`), the verify
+appends and attends at the WRONG slots — off by `raw_off` — so it reproduces a
+different distribution than decode. KLD 0.0008 short vs ~4 long is exactly this.
+
+### Two ways to fix
+
+1. **Compact-before-verify.** Before taking the `KvMark`, normalise every layer's
+   window to `[0, n_raw)` (the same two-hop copy decode does at wrap), so the
+   verify runs in the coordinates it assumes. One 128-row copy per layer per
+   accept step (~25 us/layer) — more compaction than decode's once-per-B_MAX, but
+   correct and localised to the accept path.
+2. **Teach the verify `raw_off`.** Offset the prefill verify's append slot and
+   attention `n_raw_offset` by `ls.raw_off`. No copy, but touches the hot prefill
+   addressing and must not regress real prefill.
+
+(1) is the safer first cut. Until either lands, accept-mode output past the
+window is not trustworthy even though it runs and reports E ~ 2.6.
+
+### Everything else for a working DSpark is in place
+
+- Verify is cheap: batched chain `92 + 33*B` ms after the box-2 fixes.
+- Verify can be faithful: decode chain, KLD 0.0008 short.
+- Drafter matches the reference `noseed` (E ~3.08 shadow); seeding is +1.1 upside.
+- Accept survives eviction (ring fix).
+- Outstanding: this window-addressing fix, box-2 batched-chain fidelity (so the
+  cheap chain is also the faithful one), and prefill seeding.
