@@ -40,6 +40,16 @@ VERIFIED by `crates/v4flash-core/tests/mtp_weights_present.rs`: all three layers
 present with the right geometry, the router 128-wide, and `ffn_norm` means
 **0.1571 / 0.2005 / 0.2405** — the trained gains, not RMSNorm's init of 1.0.
 
+## Geometry, from the checkpoint's own config (not inferred)
+
+    dspark_block_size          5        draft tokens per speculation step
+    sliding_window           128        the drafter's KV ring depth
+    dspark_n_routed_experts  128        vs the main model's 384
+    dspark_num_experts_per_tok 3        vs the main model's 6
+    dspark_target_layer_ids  [37,38,39] residuals the drafter eats
+    num_nextn_predict_layers   3        drafter layers
+    dspark_markov_rank       256        auxiliary n-gram head width
+
 ## The draft step
 
     x = concat( mean-over-hc-copies of the residual ENTERING layers 37, 38, 39 )   [15360]
@@ -47,10 +57,29 @@ present with the right geometry, the router 128-wide, and `ffn_norm` means
     h = layer_forward(h)      // attn_norm -> MLA -> mHC -> ffn_norm -> MoE -> mHC
     logits = tied_head(h)
 
-The drafter is run AUTOREGRESSIVELY for K steps, so K is a free parameter rather
-than fixed at 3 by the stage count. `dspark_accept.py` measures
-**E = 1.93 / 2.77 / 3.57 / 4.94 at K = 1/2/3/5**, and the box-2 cost model puts
-the balanced verify width at B=5 (K=4), where the two legs match within 5%.
+`dspark_block_size = 5`, so a speculation step drafts **5 tokens** and the verify
+batch is 6. `dspark_accept.py` measures **E = 1.93 / 2.77 / 3.57 / 4.94 at
+K = 1/2/3/5**, so K=5 is both the configured and the best-measured width.
+
+### The attention, which is NOT what it looks like
+
+`DSparkAttention.forward(x, start_pos, main_x)` — corrected after reading the
+reference rather than inferring from the tensor names:
+
+  * `main_x` is the **KV source for EVERY layer**, not just the first. `h` (the
+    query stream) comes from `forward_embed` of the input token. I had this
+    backwards.
+  * The ring holds `kv_norm(wkv(main_x))`, roped at the MAIN position, written at
+    `start_pos % window_size`.
+  * The block's own KV comes from `x`, roped at the block position, and is
+    CONCATENATED after the ring.
+  * `sparse_attn` with `get_dspark_topk_idxs` is **not sparse**: the indices are
+    `[0 .. min(win, start_pos+1)) ++ win+[0 .. block_size)`, identical for every
+    query. It is dense attention over "valid ring prefix ++ current block", which
+    is `attn_swa`'s exact shape at block_size 1.
+  * An **inverse rope is applied to the attention OUTPUT** before `wo_a`/`wo_b`.
+    `RopeTail::launch_inverse_pdev` already exists for the main model's
+    equivalent.
 
 ## Build order
 

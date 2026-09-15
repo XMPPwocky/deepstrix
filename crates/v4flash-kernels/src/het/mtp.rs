@@ -22,8 +22,27 @@ use crate::config::{N_EMBD, N_HC, RMS_EPS};
 use crate::het::engine::DeviceEngine;
 use crate::het::weights::MtpWeights;
 
-/// Main-model layers whose ENTERING residual feeds the drafter, in order.
+// ---------------------------------------------------------------------------
+// Drafter geometry. All from the checkpoint's own config.json (`text_config`)
+// and `inference/model.py`, NOT inferred — several of these differ from the main
+// model in ways that would be silently wrong if guessed.
+// ---------------------------------------------------------------------------
+
+/// `dspark_target_layer_ids` — main-model layers whose ENTERING residual feeds
+/// the drafter, in order.
 pub const MTP_SRC_LAYERS: [i32; 3] = [37, 38, 39];
+/// `dspark_block_size` — draft tokens emitted per speculation step.
+pub const MTP_BLOCK: usize = 5;
+/// `sliding_window` — the drafter's KV ring depth. It attends over a window of
+/// main-model-derived KV, never the full context.
+pub const MTP_WINDOW: usize = 128;
+/// `dspark_num_experts_per_tok` — top-3 of 128, where the main model is top-6
+/// of 384. `router_topk` takes both at runtime, so no kernel change.
+pub const MTP_TOPK: u32 = 3;
+/// `dspark_markov_rank` — the auxiliary n-gram head's hidden width.
+pub const MTP_MARKOV_RANK: usize = 256;
+/// `dspark_noise_token_id`.
+pub const MTP_NOISE_TOKEN: i32 = 128799;
 
 /// Per-request drafter state. Allocated once; `main_x` is refilled every token.
 pub struct MtpState {
