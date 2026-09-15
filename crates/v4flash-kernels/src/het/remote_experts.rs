@@ -2459,6 +2459,18 @@ impl MoeExecutor {
             let mut midq_v = self.d_midq_cat.slice_view_mut(0, b * nu * MIDQ_BYTES_PER_SLOT);
             e.q8k.launch(s, &mut midq_v, &mid_v, BLOCKS_Q8K_DOWN_IN * nu as u32 * bu)?;
             let mut part_v = self.partials.slice_view_mut(0, b * nu * N_EMBD as usize);
+            // MUST be zeroed per request. `launch_by_expert_kwide2` writes only
+            // the (token, slot) partials whose expert has members THIS request;
+            // every other slot keeps the PREVIOUS request's value, and the
+            // reduce below sums `nu` slots per token. `group_count` and
+            // `n_work_items` are both zeroed for the same reason — `partials`
+            // was missed.
+            //
+            // Only the BATCHED branch accumulates this way, and box 1 sets
+            // REQ_FLAG_BATCHED exactly when b > 1, which is why the corruption
+            // appeared only at b >= 2: a b=1 request takes the decode branch,
+            // which writes `ffn_moe` directly per token.
+            part_v.fill_zero_async(s)?;
             match ddt {
                 GgufType::MXFP4 => e.mxfp4.launch_by_expert_kwide2(
                     s, &mut part_v, &down, &midq_v, &self.group_count, &self.expert_members, &self.work_items,
@@ -2873,6 +2885,23 @@ pub fn serve_connection(
                     exec.read_f32(b, resp.view_mut::<f32>(proto::RESP_DATA_OFF, n))?;
                 } else {
                     exec.read_f16(b, resp.view_mut::<u16>(proto::RESP_DATA_OFF, n))?;
+                }
+                // `V41_B2_DBG=1`: hash the payload box 2 is about to SEND. Same
+                // FNV over every 97th f32 as box 1's [partial-src], so the two
+                // sides' duplicate structure is directly comparable: duplicates
+                // here mean box 2 computed/read the same bytes twice; duplicates
+                // only on box 1 mean the wire or client buffer lifecycle.
+                if std::env::var("V41_B2_DBG").is_ok() && f32_out {
+                    let payload = resp.view::<f32>(proto::RESP_DATA_OFF, n);
+                    let mut h: u64 = 0xcbf29ce484222325;
+                    for &v in payload.iter().step_by(97) {
+                        h ^= v.to_bits() as u64;
+                        h = h.wrapping_mul(0x100000001b3);
+                    }
+                    eprintln!(
+                        "[b2-send] L{} seq={} b={} compute_us={} hash={h:016x}",
+                        req.layer, hdr.seq, b, t_compute_us
+                    );
                 }
                 proto::patch_len(&mut resp);
                 let t_ready = Instant::now();
