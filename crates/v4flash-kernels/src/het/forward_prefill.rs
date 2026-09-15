@@ -549,8 +549,48 @@ impl HeterogeneousEngine {
             return Ok(b);
         }
         let spans = image_spans.unwrap_or(&[]);
-        let b_a = image_spans::lane_split(pos0, b, spans, bd_a.rows, bd_b.rows)?;
+        // Two lanes exist to overlap one lane's GPU work with the other's host
+        // scheduling. At speculative-verify batch sizes there is no GPU work to
+        // hide behind — the whole cost IS the per-layer host scopes — so the
+        // split just runs every one of them twice. Below the threshold, put the
+        // whole chunk in lane A and skip lane B entirely. Only safe with no
+        // image spans, which is the case `lane_split` would otherwise have to
+        // cut around.
+        // DEFAULT 0 = OFF. It was briefly defaulted to 8 on a wall-time A/B
+        // (-16.3/-12.6/-10.1/-5.4% at B=2/4/6/8) — and that was WRONG. Scored
+        // against DSpark acceptance instead of the clock, single-lane costs
+        // real quality: E[tokens/step] 2.259 two-lane vs 1.735 single-lane on
+        // the same prompt. Putting the whole chunk in lane A is not the
+        // no-op it looks like; something in the per-lane KV/shared-scratch
+        // path is not row-independent.
+        //
+        // Both "wins" this path produced (this and the small-B expert offload)
+        // were faster because they computed something different. On the verify
+        // path, wall time alone cannot tell a speedup from a wrong answer —
+        // score every change with acceptance.
+        let single_lane_max: usize = std::env::var("V41_PREFILL_SINGLE_LANE_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        // ONLY on the non-CED path. The CED branch plans its lane cut in
+        // `plan_chunk` and then asserts the range returns the same one
+        // ("CED prefill: lane cut N != planned M"), so overriding it here
+        // desynchronises the two. `Exact` is the mode the non-CED branch passes;
+        // CED passes KvSourceOnly / Replay.
+        let b_a = if ced == CedMode::Exact && spans.is_empty() && b <= single_lane_max && b <= bd_a.rows {
+            b
+        } else {
+            image_spans::lane_split(pos0, b, spans, bd_a.rows, bd_b.rows)?
+        };
         let b_b = b - b_a;
+        if std::env::var("V41_PREFILL_LANE_DEBUG").as_deref() == Ok("1") {
+            tracing::warn!(
+                b, b_a, b_b, lo, hi,
+                engram_rows = engram_rows.map(|r| r.len()).unwrap_or(0),
+                ced = ?ced,
+                "prefill.lane_debug"
+            );
+        }
         // Lane and shared scratches are usually allocated at
         // B_MAX.div_ceil(2) rows (see BatchDgpuScratch::alloc_rows); never
         // exceed what they hold.
@@ -677,9 +717,14 @@ impl HeterogeneousEngine {
                 state.layers[layer + 1].compressor = st;
             }
             // Lane A: finish layer L, then start layer L+1.
+            let _t_post = LayerHostTimer::start(&LH_POST);
             self.forward_layer_post_moe_v2(bd_a, b_a as u32, sev_a_cur, hot_cur)?;
+            drop(_t_post);
             std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
+            let _t_eng = LayerHostTimer::start(&LH_ENGRAM);
             self.stage_engram_lane(bd_a, layer + 1, engram_rows, 0, b_a)?;
+            drop(_t_eng);
+            let _t_pre = LayerHostTimer::start(&LH_PRE);
             self.forward_layer_pre_moe_v2(
                 bd_a,
                 bi_a,
@@ -696,6 +741,7 @@ impl HeterogeneousEngine {
                 pager.as_deref_mut(),
                 mode_of(layer + 1),
             )?;
+            drop(_t_pre);
 
             // Lane B: same.
             if b_b > 0 {
@@ -1441,6 +1487,37 @@ impl HeterogeneousEngine {
         ced: CedMode,
     ) -> eyre::Result<()> {
         let layer = dlw.layer_idx;
+        // DSpark: the drafter eats the hc-collapsed residual ENTERING layers
+        // 37/38/39. A batched verify does not know until AFTER it runs which
+        // row becomes the next head, so capture EVERY row and select later.
+        // Stored slot-major, `[3][MTP_CAP_ROWS][N_EMBD]`, because
+        // `hc_weighted.launch_batched` writes one contiguous `[b, n_embd]`
+        // block per call.
+        if bd.mtp_capture_rows > 0 {
+            if let Some(slot) = super::mtp::MtpState::src_slot(layer) {
+                let ne = crate::config::N_EMBD as usize;
+                let rows = bd.mtp_capture_rows.min(super::batch_scratch::MTP_CAP_ROWS);
+                let n = tokens.len().min(rows);
+                if n > 0 {
+                    let de = &self.dgpu;
+                    self.set_current_cached(de.device)?;
+                    let mut dst = bd.mtp_src.slice_view_mut(
+                        slot * super::batch_scratch::MTP_CAP_ROWS * ne,
+                        n * ne,
+                    );
+                    de.hc_weighted.launch_batched(
+                        &de.compute,
+                        &mut dst,
+                        &bd.residual,
+                        &bd.mtp_hc_mean,
+                        crate::config::N_EMBD,
+                        crate::config::N_HC,
+                        crate::config::N_HC,
+                        n as u32,
+                    )?;
+                }
+            }
+        }
         if ilw.layer_idx != layer {
             return Err(eyre!(
                 "forward_layer_pre_moe_v2: dgpu L{} != igpu L{}",
@@ -3733,6 +3810,24 @@ impl HeterogeneousEngine {
         // Router picks for this chunk, read back once and shared by the union
         // pager and the remote submit below (both need exactly these ids).
         let mut sel_host_remote: Vec<i32> = Vec::new();
+        // Box 2's pick list and weights, masked by the hub's OWN `owns_eff`
+        // instead of box 2's advertised HELLO bitmap.
+        //
+        // `submit`'s mask is the STATIC HELLO bitmap, so a pick the hub
+        // reassigned to box 2 without box 2 advertising it is dropped — the
+        // comment on `submit_inner`'s mask loop says exactly this. Doing the
+        // mask here and submitting unmasked lets the hub choose the split.
+        //
+        // The empty-slot value is `NO_PICK` (-1), NOT `SENTINEL_EXPERT`
+        // (= N_EXPERT = 384): the sentinel is the LOCAL het-split convention,
+        // and sending it over the wire gets "expert 384 is not resident here"
+        // from the daemon. `ew` must be zeroed in the same slots.
+        // Empty = no override, use the old path.
+        let mut sel_for_remote: Vec<i32> = Vec::new();
+        let mut ew_for_remote: Vec<f32> = Vec::new();
+        // Picks box 1 declined because it does not hold them; box 2 must claim
+        // exactly these ON TOP of what it advertises.
+        let mut extra_remote = vec![false; N_EXPERT as usize];
         if let Some(pg) = pager.as_deref_mut() {
             // Page the chunk's ACTUAL routed union, not all N_EXPERT. The
             // "union at B >> 1 is essentially everything" argument above holds
@@ -3745,9 +3840,16 @@ impl HeterogeneousEngine {
             // path's single contiguous H2D per role beats 3*|ids| scattered
             // copies, so keep using it. V41_PAGER_UNION=0 forces dense always.
             if super::expert_pager::pager_union_prefill() {
+                let _t_pager = LayerHostTimer::start(&LH_PAGER);
+                // Per-layer miss histogram. Box 1 pins ENCODER windows only
+                // (`prefill_ceiling = CED_DECODER_START + 2`), so a verify's
+                // misses should be concentrated at layer >= 20.
+                let mc0 = if layer_miss_hist() { pg.counters().prefill_misses } else { 0 };
                 let n_sel = (b as usize) * cs_n_used;
                 let mut sel_host = vec![0i32; n_sel];
+                let _t_sync = LayerHostTimer::start(&LH_SEL_SYNC);
                 de.compute.synchronize()?;
+                drop(_t_sync);
                 bd.d_selected
                     .slice_view(0, n_sel)
                     .copy_to_host(&mut sel_host)?;
@@ -3772,6 +3874,38 @@ impl HeterogeneousEngine {
                 } else {
                     None
                 };
+                // SMALL-B CATCH-ALL: box 1 computes only what it ALREADY HOLDS
+                // and hands every MISS to box 2. At B=6 box 1 was otherwise
+                // taking ~250 misses per verify and spending ~700 ms reading
+                // 4.7 GB off NVMe — 94% of the step — while box 2 sat 83% idle
+                // holding its own copy on its own disk.
+                // `V41_SMALL_B_CATCHALL_HALF`: 0/unset = all layers,
+                // 1 = encoder only, 2 = DECODER only.
+                //
+                // MEASURED: 93.7% of a B=6 verify's expert misses are in the
+                // DECODER half (16-17 encoder vs 235-253 decoder, four verifies).
+                // That follows from `prefill_ceiling = CED_DECODER_START + 2` —
+                // box 1 pins encoder windows only, so it holds ~nothing on
+                // layers 20-39 and misses nearly their whole union.
+                //
+                // Decoder-only is also where box 2 can take the hand-off: its
+                // decoder layers have ~68 slots and a B<=6 per-layer union is
+                // <=36. The 170-slot objection that keeps `V41_REPLAY_OFFLOAD`
+                // off is a property of the CED replay's 162-wide union at B=128,
+                // not of a verify.
+                let half = std::env::var("V41_SMALL_B_CATCHALL_HALF")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let in_half = match half {
+                    1 => (layer as usize) < crate::config::CED_DECODER_START,
+                    2 => (layer as usize) >= crate::config::CED_DECODER_START,
+                    _ => true,
+                };
+                let small_b_catchall = remote_split_on
+                    && (b as usize) <= small_b_catchall_max()
+                    && super::expert_pager::ExpertPager::t2_catchall()
+                    && in_half;
                 let mut seen = vec![false; N_EXPERT as usize];
                 let mut ids: Vec<u32> = Vec::with_capacity(N_EXPERT as usize);
                 let mut skipped_remote = 0usize;
@@ -3783,6 +3917,10 @@ impl HeterogeneousEngine {
                                 skipped_remote += 1;
                                 continue;
                             }
+                        }
+                        if small_b_catchall && !pg.is_resident(layer as i32, sv as u32) {
+                            extra_remote[sv as usize] = true;
+                            continue;
                         }
                         ids.push(sv as u32);
                     }
@@ -3813,6 +3951,10 @@ impl HeterogeneousEngine {
                 } else {
                     pg.ensure_layer_union(layer as i32, &ids)?;
                 }
+                if layer_miss_hist() {
+                    let d = pg.counters().prefill_misses.saturating_sub(mc0);
+                    LAYER_MISS[layer as usize].fetch_add(d, std::sync::atomic::Ordering::Relaxed);
+                }
                 sel_host_remote = sel_host;
                 // Two-box split: tell the iGPU to skip the experts box 2 owns.
                 // Built here, while we still hold `&mut pg`; consumed below via
@@ -3839,9 +3981,29 @@ impl HeterogeneousEngine {
                             );
                         }
                         // Under replay offload EVERY expert on this layer is box 2's.
+                        // Box 2 must claim the picks box 1 declined for lack of
+                        // residency, or they are computed by NOBODY — silently,
+                        // since the check below validates this vector, not box
+                        // 2's advertised table.
                         let owns_eff: Vec<bool> = (0..N_EXPERT as usize)
-                            .map(|e| replay_offload || (!dry && owns[e]))
+                            .map(|e| replay_offload || extra_remote[e] || (!dry && owns[e]))
                             .collect();
+                        // Only when the hub actually reassigned something. With
+                        // nothing reassigned `owns_eff` IS box 2's advertised
+                        // bitmap, so this would be a no-op — but leaving the old
+                        // path untouched keeps the default byte-identical.
+                        if !dry && extra_remote.iter().any(|&x| x) {
+                            sel_for_remote = sel_host_remote
+                                .iter()
+                                .map(|&e| {
+                                    if (0..N_EXPERT as i32).contains(&e) && owns_eff[e as usize] {
+                                        e
+                                    } else {
+                                        super::remote_experts::NO_PICK
+                                    }
+                                })
+                                .collect();
+                        }
                         pg.set_remote_exclusion(layer as i32, |e| owns_eff[e as usize])?;
                         // Every routed pick must be computed by EXACTLY ONE device.
                         // Decode has had this check since the catch-all landed
@@ -3886,6 +4048,7 @@ impl HeterogeneousEngine {
             (remote_split_on, self.remote.as_ref(), sd.remote_xq.as_mut())
         {
             {
+                let _t_remote = LayerHostTimer::start(&LH_REMOTE);
                 let n_sel = (b as usize) * cs_n_used;
                 let xq_bytes = (b as usize)
                     * (crate::config::BLOCKS_Q8K_GATE_IN as usize)
@@ -3938,7 +4101,34 @@ impl HeterogeneousEngine {
                     // 10.49 MB/request, 3760 requests = 39.4 GB over a 724 MB/s
                     // link = ~54 s of a 160 s prefill. f16 halves it. See
                     // docs/v41/PREFILL_100K_PROFILE.md.
-                    .submit(layer as u32, b as usize, &xq_host, &sel_host_remote, &ew_host, true)?;
+                    // MASKED vs UNMASKED. `submit` filters the picks down to what
+                    // box 2 ADVERTISED it owns, leaving the rest for box 1. Under
+                    // the small-B offload box 1 computes nothing, so a masked
+                    // submit leaves every unadvertised pick computed by NOBODY —
+                    // silently, because `verify_routing_exactly_once` validates
+                    // the hub's own `owns_eff`, not box 2's advertised table. That
+                    // halved the drafter's acceptance (E 2.12 -> 1.10) before it
+                    // was caught. `submit_unmasked` is what the hub already does
+                    // under T2 catch-all: hand box 2 every pick and let it page.
+                    .submit_dispatch(
+                        !sel_for_remote.is_empty(),
+                        layer as u32,
+                        b as usize,
+                        &xq_host,
+                        if sel_for_remote.is_empty() { &sel_host_remote } else { &sel_for_remote },
+                        if sel_for_remote.is_empty() {
+                            &ew_host
+                        } else {
+                            // Zero the weights of the slots we masked out.
+                            ew_for_remote = ew_host
+                                .iter()
+                                .zip(&sel_for_remote)
+                                .map(|(&w, &e)| if e == super::remote_experts::NO_PICK { 0.0 } else { w })
+                                .collect();
+                            &ew_for_remote
+                        },
+                        true,
+                    )?;
                 let t_sub_end = super::perfetto::now_ns();
                 // Stash, don't wait: the local iGPU MoE for this layer is issued
                 // right after this block, and post-MoE collects the reply. The
@@ -4270,7 +4460,7 @@ impl HeterogeneousEngine {
         let threshold: u32 = std::env::var("IQ2_HYBRID_THRESHOLD")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(8);
+            .unwrap_or(0);
         if variant == "hybrid" && routed_src.gate.dtype != v4flash_core::gguf::GgufType::IQ2_XXS {
             return Err(eyre!(
                 "IQ2_VARIANT=hybrid unsupported on a layer with {:?} gate/up \
@@ -4722,6 +4912,77 @@ impl HeterogeneousEngine {
                 )?;
             }
         }
+        // `V41_VERIFY_DECODE_MOE=1`: recompute this layer's local MoE with the
+        // DECODE path's kernels, overwriting what the by-expert chain above
+        // produced.
+        //
+        // WHY. The verify inherits the PREFILL MoE — `moe_gate_up_chunked` plus
+        // the by-expert kwide/`q2k_down` chain, iterating by EXPERT and
+        // accumulating across the batch, and on the WMMA branch never
+        // quantising activations to Q8_K at all. Decode uses
+        // `moe_*_hetsplit`, per token, over Q8_K activations. Two deliberate
+        // implementations that were never required to agree, because prefill
+        // only consumes the LAST row's logits — a speculative verify is the
+        // first consumer of all of them. MEASURED divergence at B=6: argmax
+        // agreement 0.49-0.61 with decode, cos 0.75-0.79 on the logit vectors
+        // (identical compute would be ~0.9999).
+        //
+        // This recomputes rather than replaces so the change is ONE
+        // self-contained block: it proves or refutes the diagnosis before
+        // anyone pays for the surgery to skip the wasted chain. Bounded by b
+        // because it costs b x decode's MoE.
+        if verify_decode_moe() && (b as usize) <= 16 {
+            if let Some(remap) = moe_remap {
+                let nu = cs_n_used;
+                let ne = crate::config::N_EMBD as usize;
+                let ffe = crate::config::N_FF_EXP as usize;
+                let xqb = super::remote_experts::XQ_BYTES_PER_TOKEN;
+                let mqb = super::remote_experts::MIDQ_BYTES_PER_SLOT;
+                let _t_vm = ie.events.stage("igpu.verify_decode_moe", &ie.compute)?;
+                // Decode quantises the activation to Q8_K; the WMMA branch
+                // above may have cast to f16 instead and left this untouched.
+                ie.q8k.launch(
+                    &ie.compute,
+                    &mut si.d_xq_q8k,
+                    &bi.ffn_input_norm_recv,
+                    crate::config::BLOCKS_Q8K_GATE_IN * b,
+                )?;
+                for j in 0..b as usize {
+                    {
+                        let xq_j = si.d_xq_q8k.slice_view(j * xqb, xqb);
+                        let ew_j = bi.d_ew.slice_view(j * nu, nu);
+                        let sel_j = bi.d_selected.slice_view(j * nu, nu);
+                        let mut mid_j = si.d_mid_cat.slice_view_mut(j * nu * ffe, nu * ffe);
+                        super::dispatch::moe_gate_up_batch_hetsplit(
+                            ie, routed_src.gate.dtype, &ie.compute, &mut mid_j,
+                            &routed_src.gate.buffer, &routed_src.up.buffer,
+                            &xq_j, &ew_j, &sel_j, remap, 0, nu as u32, gbpe, ubpe,
+                            nu as u32, crate::config::SWIGLU_CLAMP_EXP,
+                            crate::config::N_FF_EXP, crate::config::BLOCKS_Q8K_GATE_IN,
+                        )?;
+                    }
+                    {
+                        let mid_j = si.d_mid_cat.slice_view(j * nu * ffe, nu * ffe);
+                        let mut midq_j = si.d_midq_cat.slice_view_mut(j * nu * mqb, nu * mqb);
+                        ie.q8k.launch(
+                            &ie.compute, &mut midq_j, &mid_j,
+                            crate::config::BLOCKS_Q8K_DOWN_IN * nu as u32,
+                        )?;
+                    }
+                    {
+                        let midq_j = si.d_midq_cat.slice_view(j * nu * mqb, nu * mqb);
+                        let sel_j = bi.d_selected.slice_view(j * nu, nu);
+                        let mut out_j = bi.ffn_moe.slice_view_mut(j * ne, ne);
+                        super::dispatch::moe_down_batched_hetsplit(
+                            ie, routed_src.down.dtype, &ie.compute, &mut out_j,
+                            &routed_src.down.buffer, &midq_j, &sel_j, remap, 0,
+                            nu as u32, dbpe, mqb as u32, nu as u32,
+                            crate::config::N_EMBD, crate::config::BLOCKS_Q8K_DOWN_IN,
+                        )?;
+                    }
+                }
+            }
+        }
         // Record MoE-done so the iGPU xfer can wait without a host sync.
         sev.moe_done.record(&ie.compute)?;
         ie.xfer.wait_event(&sev.moe_done)?;
@@ -4918,4 +5179,133 @@ impl HeterogeneousEngine {
         }
         Ok(())
     }
+}
+
+/// Host wall inside the per-layer verify/prefill body, split by phase.
+///
+/// The perfetto gap analysis put 20.8 ms/layer between
+/// `k.shared_expert.down_matvec` and `k.ffn_combine.vec_add` with every DEVICE
+/// track idle and the real work at ~5.6 ms/layer — i.e. ~18 ms/layer running
+/// nowhere and covered by no `events.stage()` scope. These attribute it to the
+/// three host calls the loop actually makes. `V41_LAYER_HOST_TIMING=1`.
+pub static LH_POST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_PRE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_ENGRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_PAGER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_SEL_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_REMOTE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn layer_host_timing() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_LAYER_HOST_TIMING").as_deref() == Ok("1"))
+}
+
+pub struct LayerHostTimer {
+    t0: std::time::Instant,
+    acc: &'static std::sync::atomic::AtomicU64,
+}
+
+impl LayerHostTimer {
+    pub fn start(acc: &'static std::sync::atomic::AtomicU64) -> Option<Self> {
+        layer_host_timing().then(|| Self { t0: std::time::Instant::now(), acc })
+    }
+}
+
+impl Drop for LayerHostTimer {
+    fn drop(&mut self) {
+        self.acc.fetch_add(
+            self.t0.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// Emit and clear; call once per verify/prefill.
+pub fn emit_layer_host_timing(tag: &str, layers: usize) {
+    if !layer_host_timing() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let (post, pre, eng) = (
+        LH_POST.swap(0, Relaxed),
+        LH_PRE.swap(0, Relaxed),
+        LH_ENGRAM.swap(0, Relaxed),
+    );
+    let (pager, sel_sync, remote) = (
+        LH_PAGER.swap(0, Relaxed),
+        LH_SEL_SYNC.swap(0, Relaxed),
+        LH_REMOTE.swap(0, Relaxed),
+    );
+    tracing::info!(
+        tag,
+        layers,
+        post_moe_ms = format!("{:.1}", post as f64 / 1000.0),
+        pre_moe_ms = format!("{:.1}", pre as f64 / 1000.0),
+        engram_ms = format!("{:.1}", eng as f64 / 1000.0),
+        post_per_layer_us = post / layers.max(1) as u64,
+        pre_per_layer_us = pre / layers.max(1) as u64,
+        pager_ms = format!("{:.1}", pager as f64 / 1000.0),
+        sel_sync_ms = format!("{:.1}", sel_sync as f64 / 1000.0),
+        remote_ms = format!("{:.1}", remote as f64 / 1000.0),
+        "prefill.layer_host"
+    );
+}
+
+
+/// `V41_SMALL_B_CATCHALL_MAX=N`: for chunks of N rows or fewer, box 1 computes
+/// only the picks it ALREADY HOLDS and hands every miss to box 2, which pages it
+/// from its own disk — decode's T2 catch-all rule, applied to the speculative
+/// verify. Default 0 (off) so it A/Bs in one binary.
+///
+/// This only works because the hub masks box 2's pick list itself (see
+/// `sel_for_remote`): `submit`'s own mask is the static HELLO bitmap and would
+/// silently drop every reassigned pick.
+pub fn small_b_catchall_max() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("V41_SMALL_B_CATCHALL_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// `V41_LAYER_MISS_HIST=1`: per-layer expert-miss histogram for one verify.
+pub static LAYER_MISS: [std::sync::atomic::AtomicU64; 40] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 40];
+
+pub fn layer_miss_hist() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_LAYER_MISS_HIST").as_deref() == Ok("1"))
+}
+
+/// Emit and clear, split at `CED_DECODER_START` — box 1 pins encoder windows
+/// only, so a verify's misses should be concentrated in the decoder half.
+pub fn emit_layer_miss_hist(tag: &str) {
+    if !layer_miss_hist() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let v: Vec<u64> = LAYER_MISS.iter().map(|a| a.swap(0, Relaxed)).collect();
+    let split = crate::config::CED_DECODER_START;
+    let enc: u64 = v[..split].iter().sum();
+    let dec: u64 = v[split..].iter().sum();
+    let tot = enc + dec;
+    if tot == 0 {
+        return;
+    }
+    tracing::info!(
+        tag,
+        encoder_misses = enc,
+        decoder_misses = dec,
+        decoder_pct = format!("{:.1}", 100.0 * dec as f64 / tot as f64),
+        "prefill.layer_miss_hist"
+    );
+}
+
+/// `V41_VERIFY_DECODE_MOE=1`: recompute the batched path's local MoE with the
+/// DECODE kernels, so a speculative verify produces the logits decode would.
+pub fn verify_decode_moe() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_VERIFY_DECODE_MOE").as_deref() == Ok("1"))
 }

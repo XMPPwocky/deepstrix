@@ -2978,6 +2978,29 @@ impl RemoteExpertClient {
         self.submit_inner(layer, b, xq, sel, ew, flags, false)
     }
 
+    /// `submit` or `submit_unmasked`, chosen by whether box 1 is computing any
+    /// of this layer's experts.
+    ///
+    /// MASKED (`unmasked = false`) filters the picks down to what box 2
+    /// ADVERTISED it owns and leaves the rest for box 1 — correct whenever box 1
+    /// pages its own share. Under the small-B offload box 1 pages NOTHING, so a
+    /// masked submit leaves every unadvertised pick computed by nobody. That is
+    /// silent: `verify_routing_exactly_once` validates the hub's own `owns_eff`,
+    /// not box 2's advertised table. It halved DSpark's acceptance
+    /// (E 2.12 -> 1.10) before it was caught.
+    ///
+    /// Getting this backwards is equally silent in the other direction: an
+    /// unmasked submit while box 1 still computes its share DOUBLE-COUNTS every
+    /// expert both devices claim.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_dispatch(&mut self, unmasked: bool, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool) -> eyre::Result<Option<Ticket>> {
+        if unmasked {
+            self.submit_unmasked(layer, b, xq, sel, ew, resp_f32)
+        } else {
+            self.submit(layer, b, xq, sel, ew, resp_f32)
+        }
+    }
+
     pub fn submit(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool) -> eyre::Result<Option<Ticket>> {
         self.submit_flags(layer, b, xq, sel, ew, if resp_f32 { proto::REQ_FLAG_RESP_F32 } else { 0 })
     }
