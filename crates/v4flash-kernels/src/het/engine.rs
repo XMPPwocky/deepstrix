@@ -652,6 +652,15 @@ impl HeterogeneousEngine {
         noise_row: &[f32],
         first_token: i32,
     ) -> color_eyre::eyre::Result<([i32; super::mtp::MTP_BLOCK], [i32; super::mtp::MTP_BLOCK])> {
+        // `V41_DSPARK_DRAFT_TIMING=1`: split the draft into its three parts. The
+        // drafter is only 3 layers but costs ~26 ms/step against the 40-layer
+        // main model's 68.7 ms/token, and it straddles BOTH GPUs: the layers run
+        // on the iGPU, the exit on the dGPU (the head is tied to the main model's
+        // `output`, which lives there), with a blocking iGPU stream drain and a
+        // ~410 KB host round trip between them. Without this split there is no way
+        // to tell layer cost from handoff cost.
+        let dt = std::env::var("V41_DSPARK_DRAFT_TIMING").as_deref() == Ok("1");
+        let t0 = std::time::Instant::now();
         self.set_current_cached(self.igpu.device)?;
         mtp_state.inject_main_hidden(main_hidden)?;
         mtp_state.forward(
@@ -663,14 +672,29 @@ impl HeterogeneousEngine {
             token_row,
             noise_row,
         )?;
+        let t_enq = std::time::Instant::now();
         self.igpu.compute.synchronize()?;
+        let t_sync = std::time::Instant::now();
         let mut h_host = vec![0.0f32; mtp_state.h.len()];
         mtp_state.h.copy_to_host(&mut h_host)?;
         let mut pre_host = vec![0.0f32; mtp_state.pre_carry().len()];
         mtp_state.pre_carry().copy_to_host(&mut pre_host)?;
+        let t_copy = std::time::Instant::now();
 
         self.set_current_cached(self.dgpu.device)?;
-        exit.forward(
+        if dt {
+            let ms = |a: std::time::Instant, b: std::time::Instant| {
+                format!("{:.2}", (b - a).as_secs_f64() * 1e3)
+            };
+            tracing::info!(
+                igpu_enqueue_ms = ms(t0, t_enq),
+                igpu_sync_ms = ms(t_enq, t_sync),
+                h2d_copy_ms = ms(t_sync, t_copy),
+                bytes = (mtp_state.h.len() + mtp_state.pre_carry().len()) * 4,
+                "dspark.draft.split"
+            );
+        }
+        let r = exit.forward(
             &self.dgpu,
             &self.dgpu.compute,
             &h_host,
@@ -680,7 +704,15 @@ impl HeterogeneousEngine {
             markov_embd,
             markov_dtype,
             first_token,
-        )
+        );
+        if dt {
+            tracing::info!(
+                exit_ms = format!("{:.2}", t_copy.elapsed().as_secs_f64() * 1e3),
+                total_ms = format!("{:.2}", t0.elapsed().as_secs_f64() * 1e3),
+                "dspark.draft.exit"
+            );
+        }
+        r
     }
 
     /// `forward_token_paged` that also captures the residuals the DSpark drafter
