@@ -65,11 +65,26 @@ control, and is not. With `dry=true`, `ids` still skips box-2-owned experts but
 those experts keep `ensure`'s default `-(e)-1` = "ours at pool slot e",
 pointing at whatever occupies slot `e`. The exactly-once audit PASSES.
 
-### 7. OPEN — `V41_RESET_ZERO` parks an open correctness question behind a flag
+### 7. OPEN — the DRAFTER changes the accepted output at temperature 0
+With a correct verify, which tokens are ACCEPTED must not depend on what the
+drafter proposed -- the verify decides, the drafter only decides how many are
+won per step. Measured 2026-09-16, same prompt/temp 0/120 tokens, changing only
+`V41_DSPARK_DENSE_RING`:
+
+    ring off  sha 0a0b617de9cf  E 2.380
+    ring on   sha e63bf762b1bd  E 2.553
+
+Output DIFFERS. Consistent with the known "verify is exact only at B<=2" result
+(f32 non-associativity between a B=6 batched verify and a B=1 decode), so this
+is probably a fidelity limit rather than a logic error -- but it has not been
+confirmed against `scripts/v41_oracle`, and until it is, any A/B that changes
+the drafter is also changing the answer.
+
+### 8. OPEN — `V41_RESET_ZERO` parks an open correctness question behind a flag
 `state.rs`. A 3.9 GB memset that exists to test whether "kernels never read past
 `n_comp`" is false. Resolve it or make it a bounds check in the kernels.
 
-### 8. MITIGATED — compressor lend/return pairs are not exception-safe
+### 9. MITIGATED — compressor lend/return pairs are not exception-safe
 `engine.rs:840`/`:1000` (28 `?` between) and `forward_prefill.rs:727`/`:783`.
 Any `?` in between leaks the store, so every LATER request fails with
 "L{src}: missing compressor state" naming the WRONG layer.
@@ -81,13 +96,13 @@ request inherits that silently. Real fix is a `CompressorLoan` RAII guard;
 
 ## Structural / ergonomic
 
-### 9. OPEN — two sources of truth for the current HIP device
+### 10. OPEN — two sources of truth for the current HIP device
 `DeviceGuard` is correct and `pub(crate)` (invisible to the crate that needs
 it); the engine keeps a `current_device: AtomicI32` mirroring a THREAD-LOCAL
 HIP property. 91 `set_current*` calls in `het/`, zero guards. One site is
 hand-patched with a comment explaining the cache goes stale.
 
-### 10. OPEN — env-var sprawl: 292 `std::env::var` reads in production `src/`
+### 11. OPEN — env-var sprawl: 292 `std::env::var` reads in production `src/`
 113 distinct names in `het/` alone. 21 per layer in the prefill hot path
 (~840/step) -- measured at ~42 us/layer, i.e. NOT a bottleneck, but several
 select different NUMERICS from a free integer rather than a validated enum.
@@ -95,17 +110,17 @@ Should be one `EngineConfig` parsed once, with a `validate()` rejecting the
 contradictory combinations, printed in the startup banner and in run
 fingerprints.
 
-### 11. OPEN — `KvMark.slid: bool` changes the meaning of `per_layer` and
+### 12. OPEN — `KvMark.slid: bool` changes the meaning of `per_layer` and
 disables the wrap check in `rollback_kv`. Two mark kinds in one struct; should
 be an enum so `rollback_kv` cannot be handed a mark whose provenance it must
 trust.
 
-### 12. OPEN — doc-comment drift attaches `///` blocks to the WRONG item
+### 13. OPEN — doc-comment drift attaches `///` blocks to the WRONG item
 Verified at `expert_pager.rs:154`, `:257`, `:1188`, `forward_prefill.rs:61`,
 `:81`, `state.rs:425`. In a codebase where comments ARE the invariant
 documentation, a comment on the wrong item is worse than none.
 
-### 13. OPEN — `CompKvStore::fp8_enabled()`/`e2m1_enabled()` read env at every
+### 14. OPEN — `CompKvStore::fp8_enabled()`/`e2m1_enabled()` read env at every
 allocation, so one process can hold layers that disagree on storage format.
 
 ---
