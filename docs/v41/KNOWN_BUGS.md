@@ -10,8 +10,46 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Silent wrongness
 
-### 0. OPEN — **the engine is NONDETERMINISTIC run-to-run under `V41_T2_CATCHALL=2`**
-This is the highest-priority bug in this file and it invalidates a methodology
+### 0b. OPEN — DSpark accept produces DEGENERATE output on long prompts
+Now cleanly reproducible, and no longer maskable as noise (#0 is fixed, runs are
+bit-identical). Same box 2, same 648-token prompt, same config, temp 0:
+
+    decode only : "# Maintaining a Lighthouse Through a Winter Storm: A Keeper's
+                   Night..."                                        COHERENT
+    DSpark      : "# Maintaining Lamp, Lens and the signal apparatus, and the the
+                   the the"                                         DEGENERATE
+
+The verify decides which tokens are emitted, so the verify is producing them.
+Short prompts stay coherent; long ones degenerate, so suspect state that only a
+multi-chunk / large-B prefill establishes (KV window addressing across the
+speculative append, the compressor rollback, or the ring seeding's interaction
+with either). E is ~2.2 either way, so this is not simply low acceptance.
+
+
+### 0. FIXED (2026-09-16, `7f89090`) — was box 2's batched group-id bound
+**ROOT CAUSE + FIX.** Box 2's remap encodes ABSOLUTE pool slots (since
+2026-09-14) but the batched MoE passed `N_EXPERT` (384) as the group-id bound;
+`moe_group_builder.hip:118` dropped every `g >= 384` while the reducer still
+counted those picks as ours and summed their ZEROED partial rows. Every routed
+expert above slot 383 contributed exactly 0.0 -- essentially all of layers 2..39
+with the shipped 6160-slot assignment. B=1 decode was spared (no group builder);
+every prefill chunk and every DSpark verify batch was hit.
+
+Discrete because each pick is binary; bimodal because the pool settles into a few
+slot layouts; survived box-1 restarts because the ShardPool LRU is never reset.
+
+VERIFIED after the fix, two DSpark runs in separate processes, 648-token prompt:
+
+    relRMSE 0.000e+00   KLD 0.000e+00   BIT-IDENTICAL   (was relRMSE 0.42)
+
+The determinism gate is trustworthy again. **Every two-box measurement taken
+before `7f89090` ran against a model silently missing most of its experts** --
+including everything in this session and any earlier A/B that used the batched
+path. Treat those numbers as void.
+
+Original report follows.
+
+This was the highest-priority bug in this file and it invalidated a methodology
 the project depends on. `scripts/v41_determinism_gate.sh` scores expert-cache
 changes by requiring `T2_CATCHALL=2` + temp 0 + same prompt to reproduce. It does
 not. Three runs of one fixed config (catchall=2, WINDOWS=21, 648-token prompt,
