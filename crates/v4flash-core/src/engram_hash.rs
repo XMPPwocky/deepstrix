@@ -231,7 +231,15 @@ mod tests {
 
     #[test]
     fn matches_reference_self_check() -> eyre::Result<()> {
-        let Some(d) = dir() else { eprintln!("no engram dump; skipping"); return Ok(()); };
+        let Some(d) = dir() else {
+            {
+            if std::env::var("V41_REQUIRE_FIXTURES").as_deref() == Ok("1") {
+                panic!("FIXTURE MISSING (V41_REQUIRE_FIXTURES=1): engram dump (~/.cache/deepstrix/v41/engram) absent");
+            }
+            eprintln!("*** SKIPPED, NOTHING TESTED: engram dump (~/.cache/deepstrix/v41/engram) absent ***");
+        }
+            return Ok(());
+        };
         let h = EngramHash::load(&d)?;
         assert_eq!(h.layer_ids, [1, 14]);
         h.self_check()?;

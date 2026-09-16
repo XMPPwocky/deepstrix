@@ -139,6 +139,7 @@ fn bench_prefill_v2() -> eyre::Result<()> {
             0,
             None,
             None, // image_spans
+            None, // pager
         )?;
     }
 
@@ -158,6 +159,7 @@ fn bench_prefill_v2() -> eyre::Result<()> {
             0,
             None,
             None, // image_spans
+            None, // pager
         )?;
         let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
         walls_ms.push(wall_ms);
@@ -356,6 +358,8 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                     None,
                     None,
                     None, // image_spans
+            None, // pager
+                    None,
                 )?;
             } else {
                 let _ = engine.forward_prefill(
@@ -372,6 +376,7 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                     true,
                     None,
                     None, // image_spans
+            None, // pager
                 )?;
             }
         }
@@ -507,6 +512,8 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                             None,
                             None,
                             None, // image_spans
+            None, // pager
+                            None,
                         )?;
                     } else {
                         let _ = engine.forward_prefill(
@@ -523,6 +530,7 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                             true,
                             None,
                             None, // image_spans
+            None, // pager
                         )?;
                     }
                     let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -622,6 +630,8 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                 None,
                 None,
                 None, // image_spans
+            None, // pager
+                None,
             )?;
         } else {
             let _ = engine.forward_prefill(
@@ -638,6 +648,7 @@ fn bench_prefill_chunked() -> eyre::Result<()> {
                 last_only,
                 None,
                 None, // image_spans
+            None, // pager
             )?;
         }
         Ok(())
@@ -775,6 +786,7 @@ fn bench_prefill_expert_stats() -> eyre::Result<()> {
         true,
         Some(&mut stats),
         None, // image_spans
+            None, // pager
     )?;
     stats.print_summary();
     // Dump representative layer's pick counts for offline plotting.

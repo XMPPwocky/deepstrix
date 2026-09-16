@@ -93,6 +93,7 @@ fn device_histogram_matches_prefill_stats() -> eyre::Result<()> {
         true,
         Some(&mut stats),
         None, // image_spans
+        None,
     )?;
 
     let ((prefill_counts, prefill_tokens), (_, decode_tokens)) = engine.harvest_sel_stats()?;

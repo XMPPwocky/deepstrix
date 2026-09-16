@@ -70,6 +70,8 @@ fn logit_dump_long() -> eyre::Result<()> {
     let p = engine.forward_prefill_pipelined(
         &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut head_scratch,
         &mut st, &weights, &hcs[..t], &toks[..t], 0, true, None, None, None, None,
+        None,
+        None,
     )?;
     eprintln!("prefill done in {:.1} s, argmax {}", t0.elapsed().as_secs_f64(), p.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0);
     let mut f = std::io::BufWriter::new(std::fs::File::create(&out_path)?);

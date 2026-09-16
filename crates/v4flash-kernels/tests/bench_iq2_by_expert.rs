@@ -126,6 +126,7 @@ fn bench_iq2_by_token_vs_by_expert() -> eyre::Result<()> {
         0,
         Some(&mut stats),
         None, // image_spans
+        None,
     )?;
 
     // Pick the last layer's weights as the kernel target (matches the

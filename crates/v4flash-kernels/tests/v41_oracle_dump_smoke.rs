@@ -6,7 +6,12 @@ use v4flash_kernels::oracle::ActivationDump;
 #[test]
 fn v41_dump_opens_and_indexes() {
     let Ok(root) = std::env::var("V41_ORACLE_BINS") else {
-        eprintln!("skip: V41_ORACLE_BINS unset");
+        {
+            if std::env::var("V41_REQUIRE_FIXTURES").as_deref() == Ok("1") {
+                panic!("FIXTURE MISSING (V41_REQUIRE_FIXTURES=1): V41_ORACLE_BINS unset -- this is the only non-ignored v41-named test");
+            }
+            eprintln!("*** SKIPPED, NOTHING TESTED: V41_ORACLE_BINS unset -- this is the only non-ignored v41-named test ***");
+        }
         return;
     };
     let d = ActivationDump::open(&root).expect("open dump");

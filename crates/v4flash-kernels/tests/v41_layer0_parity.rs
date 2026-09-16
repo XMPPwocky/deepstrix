@@ -97,6 +97,35 @@ fn rel(got: &[f32], want: &[f32]) -> (f32, f32) {
     (md, md / mr.max(1e-30))
 }
 
+/// A reference floor file is MISSING.
+///
+/// Failing here is deliberate. The previous behaviour silently substituted a
+/// hardcoded constant -- and for the head gate, the FP8 reference argmax, which
+/// is precisely the target the comment at that gate says is WRONG ("the engine
+/// runs Q8_0 weights, so its ground truth is the Q8 CPU oracle, not the fp8
+/// reference", and there is a known fp8-native argmax flip at near-ties). So on
+/// a box without the floor tables this test ran to completion and printed a
+/// verdict while gating on the wrong thing with a made-up tolerance, which is
+/// worse than not running at all.
+///
+/// `V41_ALLOW_MISSING_FLOORS=1` restores the old fallback for local poking; it
+/// says loudly that the result is not a parity verdict.
+fn missing_floor<T>(file: &str, what: &str, fallback: T) -> T {
+    if std::env::var("V41_ALLOW_MISSING_FLOORS").as_deref() == Ok("1") {
+        eprintln!(
+            "[parity] WARNING: {what} missing ({file}); using a hardcoded fallback \
+             -- THE GATE IS NOT A PARITY VERDICT"
+        );
+        return fallback;
+    }
+    panic!(
+        "v41_layer0_parity: {what} not found ({file}).\n\
+         This gate is only meaningful against the MEASURED Q8 floor; with a hardcoded \
+         fallback it compares against the wrong target. Generate the table (see \
+         scripts/v41_oracle/compare.py) or set V41_ALLOW_MISSING_FLOORS=1 to run anyway."
+    );
+}
+
 /// Measured Q8_0 noise floor of the oracle at layer `layer` (residual Δ/scale of
 /// the Q8-roundtripped oracle vs the fp8-native one, `compare_q8_floor.txt`:
 /// 2.7e-2 @L0, 3.3e-2 @L1, 3.8e-2 @L2 ...); 2.7e-2 when the table is absent.
@@ -118,8 +147,11 @@ fn q8_floor_for(layer: i32, t_n: usize) -> f32 {
                 .find(|l| l.starts_with(&key))
                 .and_then(|l| l.split_whitespace().nth(3).and_then(|v| v.parse::<f32>().ok()))
         })
-        .unwrap_or(2.7e-2)
+        .unwrap_or_else(|| missing_floor(file, &format!("Q8 residual floor for layer {layer}"), 2.7e-2))
 }
+
+/// Name of the per-token floor table, for the missing-reference messages.
+const FLOOR_PERTOK_FILE: &str = "compare_q8_floor_pertok.txt / compare_t200_q8_floor_pertok.txt";
 
 /// Per-token Q8-oracle floors (`compare_q8_floor_pertok.txt`: `layer_NN f0 f1 .. f5`, max|Δ|/max|ref|
 /// per token of the chained Q8 CPU oracle vs the reference) and its logits error (`logits_last x ...`).
@@ -667,13 +699,21 @@ fn v41_layer0_matches_oracle() -> eyre::Result<()> {
             let top5 = |v: &[f32]| { let mut idx: Vec<usize> = (0..v.len()).collect(); idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap()); idx[..5].to_vec() };
             let (mut md, mut mr) = (0f32, 0f32);
             for (a, b) in logits.iter().zip(&want) { md = md.max((a - b).abs()); mr = mr.max(b.abs()); }
-            let fl_log = q8_logits_floor(t_n).unwrap_or(2.05e-1);
+            let fl_log = q8_logits_floor(t_n).unwrap_or_else(|| {
+                missing_floor(FLOOR_PERTOK_FILE, "Q8 logits floor", 2.05e-1)
+            });
             let (ae, ar) = (argmax(&logits), argmax(&want));
             // The engine runs Q8_0 weights, so its ground truth is the Q8 CPU oracle, not the fp8
             // reference. Gate on the Q8 oracle's argmax; report whether the engine also matches the
             // fp8 reference (a bonus that means it beats Q8) or differs from it (the known fp8-native
             // argmax flip at a near-tie — a weights-precision item, not a port bug).
-            let aq = q8_logits_argmax(t_n).unwrap_or(ar);
+            // NEVER fall back to `ar` (the fp8 reference argmax) here: the gate three
+            // lines down is `ae != aq`, and the comment above says the fp8 reference is
+            // the wrong target. Silently substituting it made this gate compare the
+            // engine against something the test explicitly does not want to match.
+            let aq = q8_logits_argmax(t_n).unwrap_or_else(|| {
+                missing_floor(FLOOR_PERTOK_FILE, "Q8 logits argmax", ar)
+            });
             let rel = md / mr.max(1e-30);
             eprintln!("[layer-major] HEAD T{t_last}: argmax engine {ae} (Q8 oracle {aq}, fp8 ref {ar}); top5 engine {:?} ref {:?}; logits Δ/scale {rel:.3e} = {:.2}× Q8 oracle ({fl_log:.3e}); logit[ref argmax] engine {:.3} ref {:.3} ({:.1}s){}",
                 top5(&logits), top5(&want), rel / fl_log, logits[ar], want[ar], t_head.elapsed().as_secs_f64(),

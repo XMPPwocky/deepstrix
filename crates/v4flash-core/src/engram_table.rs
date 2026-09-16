@@ -216,7 +216,18 @@ mod tests {
         let dump = std::path::PathBuf::from(&home).join(".cache/deepstrix/v41/engram");
         let model = std::env::var("V41_MODEL").unwrap_or_else(|_| format!("{home}/.cache/deepstrix/models/dsv4.1f"));
         if !dump.join("rows_L01.bin").exists() || !std::path::Path::new(&model).join("model.safetensors.index.json").exists() {
-            eprintln!("engram rows fixture or model missing; skipping");
+            // A fidelity test whose reference fixture is absent MUST say so unmistakably.
+            // Returning Ok() quietly makes it green while testing nothing -- the survey found
+            // six of these, and this class of silence is how #0b, the 77% submit mask and the
+            // `ffn_norm`-left-at-1.0 bug all reached production. `V41_REQUIRE_FIXTURES=1`
+            // turns any such skip into a hard failure (set it in CI); without it the skip is
+            // loud but non-fatal, so a dev box without the 475 GiB checkpoint still builds.
+            {
+            if std::env::var("V41_REQUIRE_FIXTURES").as_deref() == Ok("1") {
+                panic!("FIXTURE MISSING (V41_REQUIRE_FIXTURES=1): engram rows fixture or model missing");
+            }
+            eprintln!("*** SKIPPED, NOTHING TESTED: engram rows fixture or model missing ***");
+        }
             return Ok(());
         }
         let hs = EngramHash::load(&dump)?;

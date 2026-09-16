@@ -134,6 +134,8 @@ fn compressor_gather_matches_serial() -> eyre::Result<()> {
             None,
             None,
             None,
+            None, // pager
+            None, // engram_rows
         )
     };
 
@@ -260,6 +262,8 @@ fn compressor_gemm_accuracy_vs_matvec() -> eyre::Result<()> {
         engine.forward_prefill_pipelined(
             bd, bi, bdb, bib, sd, si, &mut head_scratch, &mut state, &main_weights,
             &input_hcs, &tokens, 0, true, None, None, None, None,
+            None,
+            None,
         )
     };
 

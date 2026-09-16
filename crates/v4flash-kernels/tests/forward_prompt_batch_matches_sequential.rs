@@ -214,6 +214,7 @@ fn forward_prompt_batch_v2_matches_sequential() -> eyre::Result<()> {
         0,
         None,
         None, // image_spans
+            None, // pager
     )?;
     let mut v2_hcs: Vec<Vec<f32>> = Vec::with_capacity(b);
     for i in 0..b {
@@ -398,6 +399,7 @@ fn forward_prompt_batch_v2_bisect_layer() -> eyre::Result<()> {
             &tokens,
             None,
             None, // vis
+            None,
         )?;
 
         // ---- Compare each batch element's residual_next ----
@@ -641,6 +643,7 @@ fn forward_prefill_last_only_matches_sequential() -> eyre::Result<()> {
         true,
         None,
         None, // image_spans
+            None, // pager
     )?;
     assert_eq!(prefill_logits.len(), N_VOCAB as usize);
 
@@ -736,6 +739,7 @@ fn forward_prefill_pipelined_matches_single_lane() -> eyre::Result<()> {
         true,
         None,
         None, // image_spans
+            None, // pager
     )?;
 
     // Test: two-lane pipelined forward_prefill.
@@ -768,6 +772,8 @@ fn forward_prefill_pipelined_matches_single_lane() -> eyre::Result<()> {
         None,
         None,
         None, // image_spans
+            None, // pager
+        None,
     )?;
 
     let (maxd, idx) = max_abs_diff(&logits_single, &logits_pipelined);
@@ -860,7 +866,9 @@ fn forward_prefill_all_oracles_one_load() -> eyre::Result<()> {
     let mut single = |engine: &HeterogeneousEngine, bd: &mut BatchDgpuScratch, bi: &mut BatchIgpuScratch,
                       sd: &mut BatchDgpuShared, si: &mut BatchIgpuShared, hs: &mut DgpuScratch| -> eyre::Result<Vec<f32>> {
         let mut st = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
-        engine.forward_prefill(bd, bi, sd, si, hs, &mut st, &main_weights, &input_hcs, &tokens, 0, true, None, None)
+        engine.forward_prefill(bd, bi, sd, si, hs, &mut st, &main_weights, &input_hcs, &tokens, 0, true, None, None
+            None,
+        )
     };
     eprintln!("Run 2: forward_prefill(last_only)");
     let p = single(&engine, &mut bd, &mut bi, &mut sd, &mut si, &mut head_scratch)?;
@@ -877,7 +885,10 @@ fn forward_prefill_all_oracles_one_load() -> eyre::Result<()> {
     let q = {
         let mut st = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
         engine.forward_prefill_pipelined(&mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd_p, &mut si_p,
-            &mut head_scratch, &mut st, &main_weights, &input_hcs, &tokens, 0, true, None, None, None, None)?
+            &mut head_scratch, &mut st, &main_weights, &input_hcs, &tokens, 0, true, None, None, None, None
+                None,
+                None,
+            )?
     };
     drop((bd_a, bi_a, bd_b, bi_b, sd_p, si_p));
 
@@ -985,6 +996,8 @@ fn fp8_kv_store_ab_one_load() -> eyre::Result<()> {
         let p = engine.forward_prefill_pipelined(
             &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd_p, &mut si_p, &mut head_scratch,
             &mut st, &main_weights, &hcs[..t], &toks[..t], 0, true, None, None, None, None,
+            None,
+            None,
         )?;
         let mut dec: Vec<Vec<f32>> = Vec::with_capacity(n_dec);
         for i in 0..n_dec {
