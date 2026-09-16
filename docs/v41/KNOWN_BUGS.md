@@ -10,7 +10,30 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Silent wrongness
 
-### 1. OPEN — temperature-0 output depends on `V41_PAGER_WINDOWS`
+### 1. RESOLVED (2026-09-16) — NOT a pager bug; it was mode-1 history dependence
+**RESOLUTION.** Under the DETERMINISTIC split (`V41_T2_CATCHALL=2`) the output
+is geometry-INDEPENDENT. Same prompt, temp 0, 648-token prompt:
+
+    catchall=2, WINDOWS=21 -> sha 0a9a37457b53   167 ms/tok   6.00 tok/s
+    catchall=2, WINDOWS=4  -> sha 0a9a37457b53    70 ms/tok  14.21 tok/s   IDENTICAL
+
+So `V41_PAGER_WINDOWS` does NOT mis-address weights. The geometry-dependence
+seen under `catchall=1` is the documented mode-1 behaviour: the split is decided
+by `pg.is_resident`, so geometry changes WHICH BOX computes which experts,
+changing the f32 partial-sum grouping (`forward_layer.rs:2296-2320`). That is
+exactly what mode 2 exists to remove.
+
+Consequences:
+- **E is not a correctness probe** under mode 1. E moved with geometry because
+  the SPLIT moved, not because the main model computes differently. An earlier
+  note in this file claimed otherwise; it was wrong.
+- **WINDOWS is safe to tune under mode 2**, and there it is worth 2.4x on
+  decode at byte-identical output. Tune it there, never under mode 1.
+- Any A/B that varies residency MUST run under `V41_T2_CATCHALL=2`, per
+  `scripts/v41_determinism_gate.sh`.
+
+Original report follows.
+
 Residency must never change numerics; a miss is a page-in, not a different
 answer. LRU size is correctly neutral (25 -> 1510 slots: byte-identical output).
 But the DENSE packed-window geometry is not. Same prompt, temp 0, 120 tokens:
