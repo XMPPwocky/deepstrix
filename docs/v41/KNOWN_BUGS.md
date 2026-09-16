@@ -25,7 +25,30 @@ argmax was stable (5) in all three, and a is close to b while c is far -- BIMODA
 not drift, which points at a discrete state difference rather than accumulating
 float error.
 
-**Leading hypothesis (unverified):** box 2. Its LRU persists across box-1
+**LOCALISED TO BOX 2 (2026-09-16, measured).** Box 1 run SOLO with no remote at
+all (`V41_REMOTE_SPLIT=0`, `V41_PAGER_STRIDE=384` so the full 384-expert union
+fits a window) is **BIT-IDENTICAL across two separate server processes**:
+
+    box 1 solo        relRMSE 0.000e+00   KLD 0.000e+00   BIT-IDENTICAL
+    box 1 + box 2     relRMSE 0.42        KLD 1.3-1.5     argmax 35 or 5
+
+So box 1's whole pipeline -- prefill, pager, two-lane driver, KV, mHC, MoE -- is
+deterministic. **100% of the nondeterminism is box 2.** That also explains the
+6.02-vs-14.21 tok/s swing on an identical config, the apparent geometry
+sensitivity (#1, retracted), and the long-prompt DSpark degeneracy.
+
+Ruled out inside box 1: float atomics (none in the V4.1 path); HashMap iteration
+order (every map is lookup-only, LRU order comes from a VecDeque); the two-lane
+pager/iGPU race (`V41_PAGER_SYNC_IGPU` guard changed nothing: 0.416 vs 0.406).
+
+**Next:** box 2's `ShardPool` assigns experts to slots by LRU history, which
+persists across box-1 restarts. If its partial-sum reduction iterates or groups
+by SLOT, f32 summation order changes with residency history -- changing results
+without changing which experts are computed, and bimodally if the pool settles
+into one of a few states. Test cheaply by restarting `deepstrix-expertd` between
+two box-1 runs.
+
+**Prior hypothesis (superseded by the solo measurement above):** box 2. Its LRU persists across box-1
 restarts, and with `V41_B2_POOL_FLOOR=0` its global victim search assigns experts
 to different SLOTS depending on history. If its MoE groups/reduces by slot order,
 the f32 summation order changes with residency -- residency changing VALUES, on
