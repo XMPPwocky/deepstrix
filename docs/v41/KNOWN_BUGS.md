@@ -20,8 +20,29 @@ But the DENSE packed-window geometry is not. Same prompt, temp 0, 120 tokens:
     WINDOWS=4   sha (C)  E 1.595
     WINDOWS=1   GARBAGE  E 1.000      <- see #3
 
-E falls monotonically with `dense_windows`, so the PROMPT PREFILL is producing
-geometry-dependent KV. Root cause NOT yet found. #2 was the leading suspect and
+E falls monotonically with `dense_windows`. **E is a CORRECTNESS PROBE here,
+not a tuning knob**: the MTP drafter has its own resident weights and never
+touches the expert pager (`mtp.rs` has zero pager references), so its proposals
+are invariant under geometry. E is the agreement between that fixed drafter and
+the VERIFY, and the verify IS the main model -- so E moving means the main
+model's logits moved, i.e. the pager fed it wrong weights. Use E as a cheap
+correctness signal; the CPU oracle is only needed to say WHICH geometry is right.
+
+**Affects PLAIN DECODE too**, so this is not DSpark-specific and no path is
+safe: same prompt, temp 0, no DSpark --
+
+    WINDOWS=21  sha 93317dccd2e6   124 ms/tok   8.07 tok/s
+    WINDOWS=4   sha 5c9e906bedcc    92 ms/tok  10.91 tok/s
+
+so the faster geometry is computing a different model. Any throughput number
+taken at a non-default WINDOWS is untrustworthy until this is fixed.
+
+Ruled out so far: #2 (`remote_split_on=true` makes `set_remote_exclusion`
+rebuild the remap afterwards); union OVERFLOW (errors loudly at
+`expert_pager.rs:1068`, never truncates); window RECLAIM (clears `slot_key` and
+`slot_of` together, `:990`); LRU/dense REGION overlap (`ensure` skips to
+`lru_lo = dense_slots()` and only evicts above it, `:1382`). Root cause NOT yet
+found. #2 was the leading suspect and
 is ruled out for the default config (`remote_split_on=true` makes
 `set_remote_exclusion` rebuild the remap afterwards). Needs `scripts/v41_oracle`
 to say which geometry is even correct.
