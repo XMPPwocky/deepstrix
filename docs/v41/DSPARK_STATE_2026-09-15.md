@@ -28,6 +28,33 @@
    (a no-op for real prefill, which is always at raw_off=0).
 4. (earlier) The compressor store was never rolled back; the b<2 engram drop.
 
+> **!! SUPERSEDED 2026-09-16 -- the blocker named below is NOT the blocker !!**
+>
+> The 0.276-nat attribution to box 2's batched down/reduce chain was measured
+> while box 2 silently dropped every expert above pool slot 383 (absolute slots
+> vs a 384 group-id bound, fixed in `7f89090`), so it only ever sampled the
+> divergence on the few experts that survived.
+>
+> Re-measured post-fix with `dspark.xcheck`, B=1, 648-token prompt,
+> deterministic split, engine now bit-reproducible:
+>
+>     batched down chain (fast)    KLD 2.026 nats   agree 68/111
+>     faithful decode down chain   KLD 1.898 nats   agree 68/111
+>
+> Swapping to the faithful chain moves KLD 6% and leaves the argmax agreement
+> IDENTICAL. So the down/reduce kernels are ~0.13 of the 2.0 nats, not the cause.
+>
+> Both arms route every expert to box 2 with now-identical MoE arithmetic, so the
+> remaining ~1.9 nats is BOX 1's prefill-vs-decode difference. Ruled out by
+> measurement: batching (B=1 already diverges; B=1->6 adds only 0.2), prompt
+> length (33-tok 1.63 vs 647-tok 2.03 at the same 61% agreement), the mHC carry
+> (both paths reset to one-hot at layer 0, `forward_layer.rs:531`), the indexer
+> (`V41_INDEX_K` defaults off on both), and CED (on/off byte-identical).
+> Remaining candidates: prefill's batched attention windowing vs decode's ring,
+> the compressor path, and the head.
+>
+> See `docs/v41/KNOWN_BUGS.md` #0b.
+
 ## The ONE remaining blocker for 20 tok/s
 
 Box 2 has two MoE chains and the verify must pick one:
