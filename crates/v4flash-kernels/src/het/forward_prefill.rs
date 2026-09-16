@@ -312,6 +312,21 @@ fn swa_via_mixed() -> bool {
 /// for large prefill chunks, where `matvec_batched` re-reads the weight per
 /// batch element and goes weight-BW-bound. `V41_PREFILL_F32_MATVEC=0` restores
 /// the old all-WMMA behaviour; `=1` forces f32 at every batch size.
+/// `V41_PREFILL_PRESUBMIT=1`: issue Stage 10 (the shared expert) AFTER the remote
+/// submit instead of before the pager, so its ~173 us of dGPU work lands inside
+/// the box-2 RPC window rather than ahead of it.
+///
+/// Default OFF pending a measured A/B on the verify. Decode's equivalent
+/// (`decode_presubmit_reorder` -> `defer_shared`, forward_layer.rs:2210) is
+/// default ON and measured +5.0% with byte-identical output, but the verify's
+/// balance is different and it has to be scored on E and KLD too, not just wall.
+fn prefill_presubmit() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_PREFILL_PRESUBMIT").as_deref() == Ok("1")
+    });
+    *B
+}
+
 fn prefill_f32_matvec(b: u32) -> bool {
     match std::env::var("V41_PREFILL_F32_MATVEC").ok().as_deref() {
         Some("0") => false,
@@ -753,6 +768,10 @@ impl HeterogeneousEngine {
         // Warmup: queue layer 0 pre-MoE for both lanes.
         let layer0 = lo;
         self.stage_engram_lane(bd_a, layer0, engram_rows, 0, b_a)?;
+        // Layer 0's pre_moe for both lanes -- the pipeline warm-up. Previously
+        // untimed, so one whole layer of pre_moe was missing from every report
+        // while the pager/sel_sync counters inside it were not.
+        let _t_pre_warm = LayerHostTimer::start(&LH_PRE);
         self.forward_layer_pre_moe_v2(
             bd_a,
             bi_a,
@@ -788,6 +807,7 @@ impl HeterogeneousEngine {
                 mode_of(layer0),
             )?;
         }
+        drop(_t_pre_warm);
 
         // Steady state: for each layer L in 0..N_LAYER-1, queue post_X(L)
         // followed by pre_X(L+1) for the SAME lane, before moving to lane B.
@@ -836,11 +856,22 @@ impl HeterogeneousEngine {
             )?;
             drop(_t_pre);
 
-            // Lane B: same.
+            // Lane B: same. TIMED TOO -- these three calls used to be untimed while
+            // the counters INSIDE `forward_layer_pre_moe_v2` (LH_PAGER, LH_SEL_SYNC,
+            // LH_ENSURE, LH_REMOTE) counted both lanes. That is why a
+            // `prefill.layer_host` line could report pager_ms 102.0 > pre_moe_ms
+            // 66.2 despite the pager being lexically nested inside pre_moe: the
+            // pager total was both lanes and the pre_moe total was lane A only.
+            // Every counter is now a BOTH-LANE total, so they are comparable.
             if b_b > 0 {
+                let _t_post_b = LayerHostTimer::start(&LH_POST);
                 self.forward_layer_post_moe_v2(bd_b, b_b as u32, sev_b_cur, hot_cur)?;
+                drop(_t_post_b);
                 std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
+                let _t_eng_b = LayerHostTimer::start(&LH_ENGRAM);
                 self.stage_engram_lane(bd_b, layer + 1, engram_rows, b_a, b_b)?;
+                drop(_t_eng_b);
+                let _t_pre_b = LayerHostTimer::start(&LH_PRE);
                 self.forward_layer_pre_moe_v2(
                     bd_b,
                     bi_b,
@@ -857,6 +888,7 @@ impl HeterogeneousEngine {
                     pager.as_deref_mut(),
                     mode_of(layer + 1),
                 )?;
+                drop(_t_pre_b);
             }
             if let Some(src) = kv_src_next {
                 let st = state.layers[layer + 1].compressor.take();
@@ -874,12 +906,16 @@ impl HeterogeneousEngine {
                 bd_a,
                 sd,
             );
+            // The LAST layer's post_moe, both lanes -- also previously untimed, so
+            // one whole layer of post_moe was missing from every report.
+            let _t_post_last = LayerHostTimer::start(&LH_POST);
             self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[last], hot_last)?;
             std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
             if b_b > 0 {
                 self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[last], hot_last)?;
                 std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
             }
+            drop(_t_post_last);
         }
 
         self.dgpu.compute.synchronize()?;
@@ -1034,6 +1070,120 @@ impl HeterogeneousEngine {
             chunk_start = chunk_end;
         }
         Ok(out_logits)
+    }
+
+
+    /// Stage 10, the batched shared expert, as a callable unit.
+    ///
+    /// Extracted so it can be issued at EITHER of two points in `pre_moe`:
+    /// before the pager/submit (historical order) or after the remote submit
+    /// (`V41_PREFILL_PRESUBMIT=1`). It writes `bd.ffn_shared`, which is not read
+    /// until `post_moe`'s `vec_add`, so it is free to move within the layer.
+    ///
+    /// WHY MOVING IT HELPS. `k.shared_expert.down_matvec` is the LAST dGPU kernel
+    /// before the measured 1428.8 us x 4265 idle gap, and the remote submit sits
+    /// inside that gap; the dGPU then idles again for 1986.6 us x 4320 waiting on
+    /// box 2. Issuing the shared expert AFTER the submit puts its ~173 us of dGPU
+    /// work inside the RPC window instead of before it. Decode already does this
+    /// (`defer_shared`, forward_layer.rs:2210) and measured +5.0% with
+    /// byte-identical output.
+    #[allow(clippy::too_many_arguments)]
+    fn issue_shared_expert_prefill(
+        &self,
+        sd: &mut BatchDgpuShared,
+        bd: &mut BatchDgpuScratch,
+        dlw: &DgpuLayerWeights,
+        b: u32,
+        layer: usize,
+        pos0: u32,
+    ) -> eyre::Result<()> {
+        let de = &self.dgpu;
+        // ========================================================
+        // Stage 10: Shared expert (BATCHED Q8_0 chains)
+        // swiglu + vec_add are pure elementwise → stretch n by B
+        // ========================================================
+        let _t_shared = de.events.stage("dgpu.shared_expert", &de.compute)?;
+        {
+            let _t = de.events.stage("k.shared_expert.quantize_input", &de.compute)?;
+            // Q8_0 gate/up consume the (i8, scale) pair; K-quants (unsloth
+            // Q5_K/Q6_K) consume Q8_K — quantize only what's consumed.
+            if super::dispatch::any_q8(&[&dlw.shared.gate, &dlw.shared.up]) {
+                de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.x16_n_embd, &bd.ffn_input_norm,
+                    b, N_EMBD, super::batch_scratch::f16_pitch(N_EMBD))?;
+            } else {
+                de.q8k.launch(
+                    &de.compute,
+                    &mut sd.kq_ffn_q8k,
+                    &bd.ffn_input_norm,
+                    crate::config::BLOCKS_Q8K_GATE_IN * b,
+                )?;
+            }
+        }
+        {
+            let _t = de.events.stage("k.shared_expert.gate_matvec", &de.compute)?;
+            super::dispatch::dense_gemm_prefill(
+                de, &de.compute, &mut sd.gate_sh, &dlw.shared.gate,
+                &sd.xq_n_embd, &sd.xscale_n_embd, &sd.kq_ffn_q8k,
+                Some((&sd.x16_n_embd, super::batch_scratch::f16_pitch(N_EMBD))),
+                b, N_FF_SHARED, N_EMBD,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.shared_expert.up_matvec", &de.compute)?;
+            super::dispatch::dense_gemm_prefill(
+                de, &de.compute, &mut sd.up_sh, &dlw.shared.up,
+                &sd.xq_n_embd, &sd.xscale_n_embd, &sd.kq_ffn_q8k,
+                Some((&sd.x16_n_embd, super::batch_scratch::f16_pitch(N_EMBD))),
+                b, N_FF_SHARED, N_EMBD,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.shared_expert.swiglu", &de.compute)?;
+            // swiglu — elementwise; stretch n to B * N_FF_SHARED.
+            // ds4 5bc1e6d: shared experts use the same swiglu_limit clamp
+            // as routed experts (official V4-Flash graph).
+            de.swiglu.launch_clamped(
+                &de.compute,
+                &mut sd.mid_sh,
+                &sd.gate_sh,
+                &sd.up_sh,
+                b * N_FF_SHARED,
+                crate::config::SWIGLU_CLAMP_EXP,
+            )?;
+        }
+        {
+            let _t = de.events.stage("k.shared_expert.quantize_mid", &de.compute)?;
+            if super::dispatch::any_q8(&[&dlw.shared.down]) {
+                de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.mid_sh16, &sd.mid_sh,
+                    b, N_FF_SHARED, super::batch_scratch::f16_pitch(N_FF_SHARED))?;
+            } else {
+                de.q8k.launch(
+                    &de.compute,
+                    &mut sd.kq_mid_q8k,
+                    &sd.mid_sh,
+                    crate::config::BLOCKS_Q8K_DOWN_IN * b,
+                )?;
+            }
+        }
+        {
+            let _t = de.events.stage("k.shared_expert.down_matvec", &de.compute)?;
+            super::dispatch::dense_gemm_prefill(
+                de, &de.compute, &mut bd.ffn_shared, &dlw.shared.down,
+                &sd.mid_sh_xq, &sd.mid_sh_xscale, &sd.kq_mid_q8k,
+                Some((&sd.mid_sh16, super::batch_scratch::f16_pitch(N_FF_SHARED))),
+                b, N_EMBD, N_FF_SHARED,
+            )?;
+        if super::engine::subtensor_dump_armed(layer as usize) {
+            de.compute.synchronize()?;
+            super::engine::maybe_dump_subtensor_f32_view(
+                layer as usize,
+                &format!("pf_ffn_shared_p{pos0}"),
+                &bd.ffn_shared.slice_view(0, crate::config::N_EMBD as usize),
+            )?;
+        }
+        }
+        drop(_t_shared);
+        Ok(())
     }
 
     /// Logits for rows `0..n` of `bd`, via the batched head when it applies.
@@ -4194,91 +4344,13 @@ impl HeterogeneousEngine {
             s.record_batch(layer as usize, &sel_host, b);
         }
 
-        // ========================================================
-        // Stage 10: Shared expert (BATCHED Q8_0 chains)
-        // swiglu + vec_add are pure elementwise → stretch n by B
-        // ========================================================
-        let _t_shared = de.events.stage("dgpu.shared_expert", &de.compute)?;
-        {
-            let _t = de.events.stage("k.shared_expert.quantize_input", &de.compute)?;
-            // Q8_0 gate/up consume the (i8, scale) pair; K-quants (unsloth
-            // Q5_K/Q6_K) consume Q8_K — quantize only what's consumed.
-            if super::dispatch::any_q8(&[&dlw.shared.gate, &dlw.shared.up]) {
-                de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.x16_n_embd, &bd.ffn_input_norm,
-                    b, N_EMBD, super::batch_scratch::f16_pitch(N_EMBD))?;
-            } else {
-                de.q8k.launch(
-                    &de.compute,
-                    &mut sd.kq_ffn_q8k,
-                    &bd.ffn_input_norm,
-                    crate::config::BLOCKS_Q8K_GATE_IN * b,
-                )?;
-            }
+        // Stage 10 (shared expert) is issued HERE by default, or deferred past the
+        // remote submit under `V41_PREFILL_PRESUBMIT=1` so its dGPU work lands
+        // inside the box-2 RPC window. See `issue_shared_expert_prefill`.
+        let defer_shared = prefill_presubmit() && remote_split_active();
+        if !defer_shared {
+            self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, pos0)?;
         }
-        {
-            let _t = de.events.stage("k.shared_expert.gate_matvec", &de.compute)?;
-            super::dispatch::dense_gemm_prefill(
-                de, &de.compute, &mut sd.gate_sh, &dlw.shared.gate,
-                &sd.xq_n_embd, &sd.xscale_n_embd, &sd.kq_ffn_q8k,
-                Some((&sd.x16_n_embd, super::batch_scratch::f16_pitch(N_EMBD))),
-                b, N_FF_SHARED, N_EMBD,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.shared_expert.up_matvec", &de.compute)?;
-            super::dispatch::dense_gemm_prefill(
-                de, &de.compute, &mut sd.up_sh, &dlw.shared.up,
-                &sd.xq_n_embd, &sd.xscale_n_embd, &sd.kq_ffn_q8k,
-                Some((&sd.x16_n_embd, super::batch_scratch::f16_pitch(N_EMBD))),
-                b, N_FF_SHARED, N_EMBD,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.shared_expert.swiglu", &de.compute)?;
-            // swiglu — elementwise; stretch n to B * N_FF_SHARED.
-            // ds4 5bc1e6d: shared experts use the same swiglu_limit clamp
-            // as routed experts (official V4-Flash graph).
-            de.swiglu.launch_clamped(
-                &de.compute,
-                &mut sd.mid_sh,
-                &sd.gate_sh,
-                &sd.up_sh,
-                b * N_FF_SHARED,
-                crate::config::SWIGLU_CLAMP_EXP,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.shared_expert.quantize_mid", &de.compute)?;
-            if super::dispatch::any_q8(&[&dlw.shared.down]) {
-                de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.mid_sh16, &sd.mid_sh,
-                    b, N_FF_SHARED, super::batch_scratch::f16_pitch(N_FF_SHARED))?;
-            } else {
-                de.q8k.launch(
-                    &de.compute,
-                    &mut sd.kq_mid_q8k,
-                    &sd.mid_sh,
-                    crate::config::BLOCKS_Q8K_DOWN_IN * b,
-                )?;
-            }
-        }
-        {
-            let _t = de.events.stage("k.shared_expert.down_matvec", &de.compute)?;
-            super::dispatch::dense_gemm_prefill(
-                de, &de.compute, &mut bd.ffn_shared, &dlw.shared.down,
-                &sd.mid_sh_xq, &sd.mid_sh_xscale, &sd.kq_mid_q8k,
-                Some((&sd.mid_sh16, super::batch_scratch::f16_pitch(N_FF_SHARED))),
-                b, N_EMBD, N_FF_SHARED,
-            )?;
-        if super::engine::subtensor_dump_armed(layer as usize) {
-            de.compute.synchronize()?;
-            super::engine::maybe_dump_subtensor_f32_view(
-                layer as usize,
-                &format!("pf_ffn_shared_p{pos0}"),
-                &bd.ffn_shared.slice_view(0, crate::config::N_EMBD as usize),
-            )?;
-        }
-        }
-        drop(_t_shared);
 
         // ========================================================
         // Stage 11: iGPU routed MoE (batched).
@@ -4852,6 +4924,18 @@ impl HeterogeneousEngine {
                     }
                 }
             }
+        }
+
+        // DEFERRED Stage 10. With `V41_PREFILL_PRESUBMIT=1` the shared expert is
+        // issued HERE, after the remote submit, so its ~173 us of dGPU work lands
+        // inside the box-2 RPC window instead of ahead of it. `bd.ffn_shared` is
+        // not read until `post_moe`'s `vec_add`, so this is the last legal point.
+        //
+        // NOT OPTIONAL once `defer_shared` is set: the call site above SKIPS the
+        // shared expert entirely in that case, so without this the layer would add
+        // a stale `ffn_shared` and be silently wrong.
+        if defer_shared {
+            self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, pos0)?;
         }
         let pager_window;
         let (routed_src, moe_remap, moe_packed): (
@@ -6059,6 +6143,21 @@ impl Drop for LayerHostTimer {
 }
 
 /// Emit and clear; call once per verify/prefill.
+///
+/// UNITS: every counter here is a BOTH-LANE total for the whole call, and the
+/// `*_per_layer_us` fields divide by `layers`, so they are "per layer, both
+/// lanes". They were NOT comparable before 2026-09-16: LH_POST/LH_PRE/LH_ENGRAM
+/// wrapped lane A only (and skipped the warm-up and cool-down layers entirely)
+/// while LH_PAGER/LH_SEL_SYNC/LH_ENSURE/LH_REMOTE live inside
+/// `forward_layer_pre_moe_v2` and always counted both lanes -- which is how a
+/// report could show `pager_ms 102.0 > pre_moe_ms 66.2` with the pager nested
+/// INSIDE pre_moe. If you are comparing against a number recorded before that
+/// fix, the pre/post figures there are roughly half of the real total.
+///
+/// Note `pager_ms` ENCLOSES `sel_sync_ms`; they are not additive. And `sel_sync`
+/// is not overhead -- it is the host waiting for the dGPU to execute the layer's
+/// attention/router/shared-expert chain, and measures about the same as the
+/// dGPU's busy time per lane-layer.
 pub fn emit_layer_host_timing(tag: &str, layers: usize) {
     if !layer_host_timing() {
         return;

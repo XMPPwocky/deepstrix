@@ -1042,12 +1042,39 @@ impl MtpExit {
             .launch_weighted_batched(s, &mut self.xn, &self.x, &w.norm, N_EMBD, RMS_EPS, B)?;
         e.q8
             .quantize_input_batched(s, &mut self.xq, &mut self.xscale, &self.xn, N_EMBD, B)?;
-        for j in 0..MTP_BLOCK {
-            let xj = self.xn.slice_view(j * ne, ne);
-            let qj = self.xq.slice_view(j * ne, ne);
-            let sj = self.xscale.slice_view(j * ne.div_ceil(32), ne.div_ceil(32));
-            let mut lj = self.logits.slice_view_mut(j * nv, nv);
-            crate::het::dispatch::dense_matvec(e, s, &mut lj, head, &xj, &qj, &sj, N_VOCAB, N_EMBD)?;
+        // ONE read of the head for all MTP_BLOCK rows.
+        //
+        // This looped `dense_matvec` per row against the TIED FULL-VOCAB head:
+        // N_VOCAB(129280) x N_EMBD(5120) at Q8_0 is ~703 MB, so five rows pulled
+        // ~3.5 GB of dGPU DRAM every draft step. The kernel is purely
+        // bandwidth-bound (measured 1112-1156 us/call, mean == max, ~630 GB/s),
+        // so that is ~5.6 ms of the measured 8.8-9.2 ms `exit_ms` spent re-reading
+        // the same weights. The input was ALREADY quantized batched on the line
+        // above -- only the matvec was per row.
+        //
+        // `matvec_bpack` keeps the per-(row, b) accumulation identical to
+        // `q8.matvec` (same lane striding, same scale*xscale*dot, same warp
+        // reduction) and only hoists the weight load out of the batch loop, so
+        // the drafts are unchanged. Q8_0 head only; anything else keeps the loop.
+        if head.dtype == v4flash_core::gguf::GgufType::Q8_0 {
+            e.q8.matvec_bpack(
+                s,
+                &mut self.logits,
+                &head.buffer,
+                &self.xq,
+                &self.xscale,
+                N_VOCAB,
+                N_EMBD,
+                B,
+            )?;
+        } else {
+            for j in 0..MTP_BLOCK {
+                let xj = self.xn.slice_view(j * ne, ne);
+                let qj = self.xq.slice_view(j * ne, ne);
+                let sj = self.xscale.slice_view(j * ne.div_ceil(32), ne.div_ceil(32));
+                let mut lj = self.logits.slice_view_mut(j * nv, nv);
+                crate::het::dispatch::dense_matvec(e, s, &mut lj, head, &xj, &qj, &sj, N_VOCAB, N_EMBD)?;
+            }
         }
 
         // Transformer-only drafts, before any markov bias. The markov head is
