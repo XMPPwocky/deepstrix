@@ -260,3 +260,41 @@ prefill forward instead of a batched decode forward (179 ms vs ~67). Both are
 implementation bugs in the accept path, NOT kernel numerics and NOT "economics".
 At the shadow ceiling E=3.077 and an amortized ~90 ms verify, DSpark prices at
 ~30 ms/token — past 20 tok/s.
+
+## Why "both boxes" doesn't work: the verify uses the DENSE-window pager (2026-09-16)
+
+Corrects the earlier claim that "the catch-all is required for speed". It is
+required only because of a residency-structure mismatch, not physics.
+
+Box 1 has two separate expert-residency structures in one pool:
+- **PREFILL: dense windows.** `dense_windows * N_EXPERT` slots from slot 0; prefill
+  needs `slot == expert id` inside a window, so ONE LAYER occupies one contiguous
+  384-slot window. Only `dense_windows` layers can be resident at once.
+- **DECODE: a sparse LRU.** Any experts, mapped through `slot_of`.
+
+The speculative verify runs `forward_prefill_pipelined`, so it inherits the DENSE
+pager — it must reserve 384 slots per layer even though a B=6 verify only picks
+~18 distinct experts per layer. 40 layers cannot fit, so the windows thrash.
+
+MEASURED (box1 windows=4, box2 floor 0, T2_CATCHALL=1 = residency split):
+    decode_slots  2201   decode_misses   56     <- decode LRU is well stocked
+    prefill_misses 4924                          <- the verify pages anyway
+    verify fwd 230 ms, E 1.99, 207 ms/tok        <- worse than box-1-idle
+
+vs box-1-idle (T2_CATCHALL=2, all experts to box 2): fwd 158 ms, E 2.2, 147 ms/tok.
+
+So box 1 holds 2201 resident decode experts with ~0 misses and the verify cannot
+use ANY of them. That is why handing everything to box 2 wins today, and why box
+1's iGPU sits idle during every verify — half the hardware doing nothing.
+
+### The fix
+Give the verify SPARSE residency (decode-LRU style, `slot_of`) instead of dense
+windows. It picks ~18 experts/layer; it does not need 384. Then box 1 serves its
+share out of the 2201-slot decode LRU at ~0 misses, both boxes compute experts in
+parallel, and the verify cost becomes max(box1, box2) instead of box2-alone — the
+two-box principle this engine already applies to decode ("phase costs
+max(box1,box2) NOT sum").
+
+Also corrected: PAGER_WINDOWS=4 raises box 1's decode slots 25 -> 2201 (the 21
+pinned prefill windows were eating the 52 GB pool), but it does NOT help the
+verify, because the verify wants dense windows. Tuning the wrong structure.
