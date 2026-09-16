@@ -1210,7 +1210,13 @@ pub fn b2_pool_floor() -> f32 {
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .map(|v| v.clamp(0.0, 1.0))
-            .unwrap_or(0.90)
+            // DEFAULT 0, not 0.90. The measurement in this very doc-comment says
+            // floor 0.00 is BIT-IDENTICAL to 0.90 with coalescing off and runs
+            // 76-86 ms/tok against 115-122 (hit 0.9726 vs 0.9433) -- the floor's
+            // only cost is prefill residency. It stayed at 0.90 because the
+            // corruption that motivated it was traced to COALESCING, which is
+            // now default off; the floor was never the fix.
+            .unwrap_or(0.0)
     });
     *F
 }
