@@ -709,6 +709,19 @@ impl HeterogeneousEngine {
             }
             drop(_s_mhc_pre);
             _t_mhc_pre.end()?;
+            // Bisect within a layer (KNOWN_BUGS #0b): `attn_cur` is the mHC
+            // COLLAPSE output, before attention. Dumped AFTER the graph closes --
+            // the two collapse sites above sit inside `dgpu_graphs.run` capture
+            // closures and synchronising in there 500s the request. Tag matches
+            // the prefill side's `pf_attn_cur_p<POS>`.
+            if super::engine::subtensor_dump_armed(layer as usize) {
+                de.compute.synchronize()?;
+                super::engine::maybe_dump_subtensor_f32(
+                    layer as usize,
+                    &format!("dec_attn_cur_p{pos}"),
+                    &dgpu_scratch.attn_cur,
+                )?;
+            }
         }
 
         // ============================================================
