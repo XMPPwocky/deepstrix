@@ -10,7 +10,32 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Silent wrongness
 
-### 1. OPEN — temp-0 output depends on `V41_PAGER_WINDOWS` on LONG prompts
+### 1. OPEN — **CONFIRMED CORRUPTION**: `V41_PAGER_WINDOWS` changes the model's logits by ~14% relRMSE
+**CONFIRMED WITH THE RIGHT INSTRUMENT (2026-09-16).** sha comparison cannot
+distinguish 1e-7 from corruption -- greedy decoding amplifies any difference into
+a different token and then totally different text. First-token logits
+(`V41_DUMP_FIRST_LOGITS`) have no trajectory amplification. Deterministic split
+(`T2_CATCHALL=2`), 648-token prompt, ONLY the window geometry varying:
+
+    WINDOWS=21 (reference)   argmax 35    logit rms 4.08
+    WINDOWS=8    max|d|=3.27  RMSE=0.589  relRMSE=14.5%  KLD=0.057 nats  argmax 35
+    WINDOWS=4    max|d|=2.82  RMSE=0.556  relRMSE=13.6%  KLD=0.140 nats  argmax  5  DIFF
+
+**relRMSE ~14%.** f32 re-association is ~1e-6. This is six orders of magnitude
+too large to be numerics: the pager geometry CORRUPTS THE MODEL, and WINDOWS=4
+changes the argmax of the FIRST generated token.
+
+Consequences:
+- Every throughput number taken at a non-default WINDOWS is measured on a
+  different (wrong) model. The 14.21 tok/s decode result at WINDOWS=4 is void.
+- WHICH geometry is correct is still unknown -- 21 is only the reference here,
+  not a verified truth. Needs `scripts/v41_oracle`.
+- This is the highest-priority bug in this file. It is upstream of all perf work.
+
+**Ruled out as the cause:** residency-driven split / f32 re-association (this test
+holds the split deterministic); prefill lane racing (single-lane prefill diverges
+too -- 1-lane W21 sha a03322848dd6 vs 1-lane W4 d2ee0b0f07e3).
+
 **PARTIAL RESOLUTION, THEN REOPENED (2026-09-16).** The "resolved" claim below
 held only for a SHORT prompt and is WRONG in general. With a ~648-token prompt,
 still under the deterministic split, geometry changes the output again:
