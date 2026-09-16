@@ -100,6 +100,31 @@ Compare those two kernel families directly -- tiling, the order keys are
 reduced in, and the softmax normalisation -- rather than swapping variants and
 re-measuring.
 
+**First thing to check there, because it is arithmetic and not numerics:** the
+two kernels express the attended window DIFFERENTLY, and whether they resolve to
+the same slots at row 0 has not been verified.
+
+    decode   attention_mixed_score_b1_htiled_wmma
+             scalar `n_raw`, `raw_off` (passed as 0, buffer pre-sliced), `n_comp`
+    prefill  attention_mixed_score_batched_htiled_wmma
+             per-row `n_raw_per[]`, `n_raw_offset_per[]`, `n_comp_per[]`, built as
+             causal_end = n_raw_before + i + 1
+             n_per      = min(causal_end, SWA_WINDOW)
+             offset     = causal_end - SWA_WINDOW
+
+The verify APPENDS its row before attending, so `n_raw_before` differs from the
+`ls.n_raw` decode passes, and the two can disagree by a slot depending on where
+each sits relative to the append and the `n_raw`/`raw_off` update
+(`forward_layer.rs`: `if ls.n_raw < SWA_WINDOW { ls.n_raw += 1 } else
+{ ls.raw_off += 1 }`). A one-slot window shift is exactly the kind of difference
+that survives every precision fix and produces a differently-shaped
+distribution.
+
+CHEAP TEST: dump `n_raw_per[0]`, `n_raw_offset_per[0]`, `n_comp_per[0]` from the
+verify and the corresponding scalars from decode, at the same position, and
+diff. No kernel work required, and it either finds the bug or removes the whole
+window-convention question from the search.
+
 ## Methodology warning
 
 ### Verify-vs-decode KLD and ACCEPT RATE can move in OPPOSITE directions
