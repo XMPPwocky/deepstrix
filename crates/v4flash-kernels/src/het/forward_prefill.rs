@@ -3802,6 +3802,17 @@ impl HeterogeneousEngine {
             }
         }
         drop(_t_out);
+        // Bisect within layer 0 (KNOWN_BUGS #0b): attn_out is the attention
+        // half's OUTPUT, before hc_post and the whole FFN half. Splits
+        // "attention diverges" from "FFN/MoE diverges".
+        if super::engine::subtensor_dump_armed(layer as usize) {
+            de.compute.synchronize()?;
+            super::engine::maybe_dump_subtensor_f32_view(
+                layer as usize,
+                &format!("pf_attn_out_p{pos0}"),
+                &sd.attn_out.slice_view(0, N_EMBD as usize),
+            )?;
+        }
 
         // ========================================================
         // Stage 7: mhc_post_attn (BATCHED hc_post_from_split)

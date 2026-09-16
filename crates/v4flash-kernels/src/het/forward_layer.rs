@@ -1833,6 +1833,14 @@ impl HeterogeneousEngine {
         })?;
         drop(_s_out);
         _t_out.end()?;
+        if super::engine::subtensor_dump_armed(layer as usize) {
+            de.compute.synchronize()?;
+            super::engine::maybe_dump_subtensor_f32(
+                layer as usize,
+                &format!("dec_attn_out_p{pos}"),
+                &dgpu_scratch.attn_out,
+            )?;
+        }
 
         // ============================================================
         // dGPU: mHC post attn → after_attn_hc. hc_post reads post + comb
