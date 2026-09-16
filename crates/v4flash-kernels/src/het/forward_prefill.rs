@@ -2087,6 +2087,14 @@ impl HeterogeneousEngine {
                     let causal_end = n_raw_before + i as u32 + 1; // exclusive upper slot
                     let n_per = causal_end.min(SWA_WINDOW);
                     let offset = causal_end.saturating_sub(SWA_WINDOW);
+                    // KNOWN_BUGS #0b: does the verify attend the SAME slots as
+                    // decode? Arithmetic, so cheap to settle. V41_WINDOW_DBG=1.
+                    if i == 0 && std::env::var("V41_WINDOW_DBG").as_deref() == Ok("1") {
+                        tracing::info!(
+                            layer, pos0, n_raw_before, causal_end, n_per, offset,
+                            "window.prefill row0"
+                        );
+                    }
                     n_raw_after.push(n_per);
                     n_raw_offset_after.push(offset);
                 }

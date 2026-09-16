@@ -1723,6 +1723,12 @@ impl HeterogeneousEngine {
                 (None, 0)
             };
             {
+                if std::env::var("V41_WINDOW_DBG").as_deref() == Ok("1") {
+                    tracing::info!(
+                        layer, pos, n_raw = ls.n_raw, raw_off = 0,
+                        n_comp = attn_n_comp, "window.decode"
+                    );
+                }
                 let _t = de.events.stage("dgpu.attn_score", &de.compute)?;
                 let _s = debug_span!("attn_score").entered();
                 // Default: B=1 head-tiled WMMA score (scalar-arg variant of
