@@ -478,6 +478,35 @@ to say which geometry is even correct.
 - **ROOT-CAUSED 2026-09-16: the SPARSE VERIFY RESIDENCY path.** One env flag
   moves every metric together, which is the confirmation the KLD warning below
   demands. 71 verify/decode pairs, B=1 probe, otherwise identical config:
+- **FIXED 2026-09-16 (056e262). Root cause: `moe_group_builder.hip:118`.**
+
+      g = (dense >= 0) ? e : (-dense - 1);
+      if ((unsigned int)g >= n_expert) return;        // n_expert = 384
+
+  `group_count` / `expert_members` are sized N_EXPERT and indexed
+  `g * max_per_expert + pos`, so that bound is a BUFFER LIMIT, not a guard. The
+  dense/window view produces `g` in [0,384). The sparse verify-residency view
+  produces `g` = ABSOLUTE pool slot, and `ExpertPager::ensure` allocates from
+  `dense_slots() = (pinned_windows*window_stride + N_EXPERT).min(n_slots)`,
+  which is >= 384 for any pool over 384 slots. Every sparse-resident routed
+  expert was therefore dropped SILENTLY -- no error, plausible output.
+
+  Fix: `ExpertPager::sparse_group_ids_in_range()` is now part of the
+  `sparse_resid_layer` predicate (it cannot be a later check -- once `ensure`
+  has run it has written absolute slots into the shared remap, and the window
+  view needs the identity map, so there is no safe post-hoc fallback).
+
+  MEASURED, default config, 71 verify/decode pairs:
+
+      before   agree 43/71 (0.6056)  cos 0.759226  kld 1.70697
+      after    agree 71/71 (1.0000)  cos 0.998369  kld 0.00658
+
+  Same class as the box-2 `ensure_group_bound` fix (7f89090).
+
+  COST: this disables the sparse view at today's pool size (~1.85x on the
+  probe-inflated clock). It is disabled because it was never correct. Widening
+  the group-id space to the pool, or packing the verify's experts into a
+  <N_EXPERT-wide contiguous region with its own LRU, is the follow-up.
 
       V41_SPARSE_VERIFY_RESIDENCY=0   agree 71/71 (1.0000)  cos 0.998369  kld 0.00658
       V41_SPARSE_VERIFY_RESIDENCY=1   agree 43/71 (0.6056)  cos 0.759226  kld 1.70697
