@@ -94,6 +94,27 @@ fired, `n_comp`/`state_kv` are advanced relative to rolled-back KV and the next
 request inherits that silently. Real fix is a `CompressorLoan` RAII guard;
 `with_kv_source` is the model.
 
+### 15. OPEN — the expert pool is statically partitioned BY PHASE
+`dense_windows` reserves N windows for PREFILL's encoder layers; decode cannot
+use them even when idle. At the default (pool 78 GB, WINDOWS=21) that is 2944
+of 4454 slots withheld from decode, leaving it 1510. Measured 2026-09-16,
+plain decode, per-token:
+
+    1510 LRU slots   219 ms/tok   4.57 tok/s   box2 srv 158.7 ms
+    3174 LRU slots   236 ms/tok   4.23 tok/s   box2 srv  84.2 ms
+    3686 LRU slots   185 ms/tok   5.40 tok/s   box2 srv  83.9 ms
+
+Giving box 1 more slots HALVES box 2's server time, because the hub's
+residency catch-all then keeps the picks locally instead of shipping them --
+the max(t_box1, t_box2 + rtt) rebalance. The partition should be dynamic
+(phase-aware pool), not a startup constant.
+
+NOTE: the windows are NOT id-indexed. `ensure_layer_union` assigns slots
+"densely by arrival order, not by expert id", so a window holds the DEMANDED
+union. The `slot == id` dense twin refuses on a packed window and is
+unreachable at STRIDE<384. Do not repeat the claim that windows pin "each
+layer's first 128 ids" -- that was wrong.
+
 ## Structural / ergonomic
 
 ### 10. OPEN — two sources of truth for the current HIP device
