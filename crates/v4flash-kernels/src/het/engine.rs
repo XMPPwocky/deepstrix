@@ -625,9 +625,14 @@ impl HeterogeneousEngine {
         w: &super::weights::MtpWeights,
         pos: u32,
         main_hidden: &[f32],
+        token_row: &[f32],
+        noise_row: &[f32],
     ) -> color_eyre::eyre::Result<()> {
         self.set_current_cached(self.igpu.device)?;
-        mtp_state.advance_ring(&self.igpu, &self.igpu.compute, w, &super::mtp::mtp_rope(), pos, main_hidden)?;
+        mtp_state.advance_ring(
+            &self.igpu, &self.igpu.compute, w, &super::mtp::mtp_rope(), pos, main_hidden,
+            token_row, noise_row,
+        )?;
         self.igpu.compute.synchronize()?;
         Ok(())
     }

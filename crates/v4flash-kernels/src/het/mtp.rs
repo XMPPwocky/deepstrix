@@ -568,35 +568,20 @@ impl MtpState {
         rope: &crate::RopeParams,
         pos: u32,
         main_hidden: &[f32],
+        token_row: &[f32],
+        noise_row: &[f32],
     ) -> eyre::Result<()> {
-        if pos == 0 {
-            return Err(eyre!("mtp advance_ring: pos 0 is prefill-seed only"));
-        }
+        // CORRECT cheap advance: run the full drafter layer forward (which writes
+        // the ring AND advances the hyper-connection carry `cur`/`pre_carry`),
+        // and skip ONLY the exit/head/markov — the part whose output we discard
+        // when we are just maintaining the ring for a later draft. A ring-write-
+        // only version (no layer forward) leaves the carry stale and drafts
+        // worse (E 1.88 vs 2.22). This is `forward` minus `exit`.
         self.inject_main_hidden(main_hidden)?;
-        self.entry(e, s, w)?;
-        let (_, main_slot) = self.ring_geom();
-        self.slot_dev.slice_view_mut(0, 1).copy_from_host(&[main_slot as u32])?;
-        self.pos_dev.slice_view_mut(0, 1).copy_from_host(&[pos])?;
-        // self.x (entry output) is the same KV source for every layer; quantise once.
-        e.q8
-            .quantize_input(s, &mut self.main_xq, &mut self.main_xscale, &self.x, N_EMBD)?;
-        for li in 0..w.layers.len() {
-            let lw = &w.layers[li];
-            e.q8.matvec(
-                s, &mut self.main_kv_raw, &lw.attn_kv.buffer, &self.main_xq, &self.main_xscale,
-                N_HEAD_DIM, N_EMBD,
-            )?;
-            e.fp8.launch_kv_post_fused(
-                s, &mut self.kv_normed, &mut self.rings[li], &self.main_kv_raw, &lw.kv_a_norm,
-                &self.pos_dev.slice_view(0, 1), &self.slot_dev.slice_view(0, 1), N_HEAD_DIM, N_ROT,
-                RMS_EPS, rope,
-            )?;
-        }
-        self.ring_writes += 1;
-        Ok(())
+        self.forward(e, s, w, rope, pos, token_row, noise_row)
     }
 
-    /// One drafter layer's attention.
+    /// One drafter layer's attention.    /// One drafter layer's attention.
     ///
     /// Mirrors `DSparkAttention.forward(x, start_pos, main_x)`:
     ///
