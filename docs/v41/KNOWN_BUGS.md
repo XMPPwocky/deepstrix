@@ -68,6 +68,18 @@ reduced verify-vs-decode KLD 2.026 -> 1.631 nats while DROPPING accept rate
 a proxy; it is not the objective, and this session shows it can point the wrong
 way.
 
+**Worse: KLD and ARGMAX AGREEMENT are themselves decoupled here.** Three changes
+improved one and degraded the other:
+
+    Q/KV/output projections -> decode kernels   KLD 2.026->1.631  E 1.788->1.372
+    attention scores f16 -> f32 (decode-matching)
+                                                KLD 1.904->1.711  agree 69->66/111
+
+So the verify is not a noisier decode -- reducing average distributional
+distance does not move top-1. It is computing a differently SHAPED
+distribution. Any fix has to be validated on `agree` (and on the generated
+text), because that is what accept mode actually emits.
+
 For reference, what the kept fixes are worth on E (back-to-back, same prompt):
 
     pre-session kernels                     E 1.788
