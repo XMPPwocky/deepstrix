@@ -1824,6 +1824,14 @@ impl HeterogeneousEngine {
             pos,
             &dlw.rope_params,
         )?;
+        if super::engine::subtensor_dump_armed(layer as usize) {
+            de.compute.synchronize()?;
+            super::engine::maybe_dump_subtensor_f32(
+                layer as usize,
+                &format!("dec_heads_p{pos}"),
+                &dgpu_scratch.heads,
+            )?;
+        }
         self.dgpu_graphs.run("output_proj_post_rope", layer as u32, &de.compute, |s| {
             de.q8.quantize_input(s, &mut dgpu_scratch.heads_xq, &mut dgpu_scratch.heads_xscale, &dgpu_scratch.heads, Q_FLAT)?;
             de.q8_grouped.matvec_grouped(s, &mut dgpu_scratch.low, &dlw.attn_output_a.buffer, &dgpu_scratch.heads_xq, &dgpu_scratch.heads_xscale, GROUP_DIM, RANK, N_GROUPS)?;

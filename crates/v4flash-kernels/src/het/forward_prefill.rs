@@ -3749,6 +3749,18 @@ impl HeterogeneousEngine {
             // call. Q8_GROUPED_VARIANT=dp4a rolls back.
             // 2026-09-08: default f16x (128x128 f16-activation WMMA GEMM, 52% of
             // matrix peak with the padded heads16 pitch vs 11% for lds_tiled).
+            // Dump `heads` BEFORE the variant branch -- inside it the dump only
+            // fires on the non-default arm. This is attention's output prior to
+            // the output projection, splitting "attention proper" from "the
+            // projection kernels" for KNOWN_BUGS #0b.
+            if super::engine::subtensor_dump_armed(layer as usize) {
+                de.compute.synchronize()?;
+                super::engine::maybe_dump_subtensor_f32_view(
+                    layer as usize,
+                    &format!("pf_heads_p{pos0}"),
+                    &sd.heads.slice_view(0, Q_FLAT as usize),
+                )?;
+            }
             let grp_variant = std::env::var("Q8_GROUPED_VARIANT")
                 .unwrap_or_else(|_| "f16x".into());
             if grp_variant != "f16x" {
