@@ -205,7 +205,11 @@ fn check_rows(who: &str, rows: usize) -> eyre::Result<()> {
 /// 8 MiB each, the rest < 100 KiB.
 /// Rows the DSpark residual capture is sized for. Only speculative verifies
 /// draft, and those are bounded by `V41_SMALL_B_OFFLOAD_MAX` (<= 8).
-pub const MTP_CAP_ROWS: usize = 16;
+/// Rows of main-model residual the batched path can capture for the DSpark
+/// drafter. 128 = `MTP_WINDOW`, the drafter's ring size: prefill seeding wants
+/// to replay a FULL ring's worth of prompt positions, not just a verify batch.
+/// Costs 3 slots * 128 rows * N_EMBD * 4 B ~= 11 MB.
+pub const MTP_CAP_ROWS: usize = 128;
 
 pub struct BatchDgpuScratch {
     /// Row capacity every B-scaled buffer was sized for. Callers must
@@ -264,6 +268,11 @@ pub struct BatchDgpuScratch {
     /// `forward_layer_pre_moe_v2` already takes `bd` and has five call sites.
     /// Off unless `mtp_capture_rows > 0`.
     pub mtp_src: DeviceBuffer<f32>,
+    /// How many rows the last capture wrote, and the ABSOLUTE position of row 0.
+    /// Prefill is chunked and two-laned, so the server cannot infer which
+    /// positions `mtp_src` holds -- the capture records it here.
+    pub mtp_captured: usize,
+    pub mtp_captured_pos0: u32,
     pub mtp_capture_rows: usize,
     /// Uniform `1/N_HC` weights, so `hc_weighted` computes the mean over the
     /// hyper-connection copies — the drafter's `main_hidden`.
@@ -401,6 +410,16 @@ pub struct BatchDgpuShared {
     /// `[B, HC_DIM]` — rms_nw output going into hc_attn_fn / hc_ffn_fn.
     /// R1 view @0: live P1 (rms_nw → f16_matvec) and P8 (same pair).
     pub flat: DeviceBuffer<f32>,
+    /// mHC PRE-SCALED path (verify-sized batches only). Decode computes
+    /// `mix = (W @ x) * inv_rms` via `rms_nw_mw.launch_inv_only` +
+    /// `matvec_pre_scaled`; prefill computed `mix = W @ normalize(x)`, which
+    /// rounds 20480 normalised values to f32 BEFORE the dot product instead of
+    /// dotting the raw values and scaling once. Mathematically identical,
+    /// numerically not -- and `hc_split_sinkhorn`'s 20 iterations amplify the
+    /// difference, which is the layer-0 seed of KNOWN_BUGS #0b. One row at a
+    /// time, so these are single-row buffers.
+    pub mhc_inv_scalar: DeviceBuffer<f32>,
+    pub mhc_rms_partials: DeviceBuffer<f32>,
     /// `[B, HC_MIX_DIM]` — f16 narrow matvec output (sinkhorn input).
     /// Live P1 and P8 only (written by f16_matvec, read by sinkhorn).
     pub mix: DeviceBuffer<f32>,
@@ -1020,6 +1039,8 @@ impl BatchDgpuScratch {
                     * crate::config::N_EMBD as usize,
             )?,
             mtp_capture_rows: 0,
+            mtp_captured: 0,
+            mtp_captured_pos0: 0,
             mtp_hc_mean: {
                 let nh = crate::config::N_HC as usize;
                 let mut mb = DeviceBuffer::<f32>::new(id, nh * MTP_CAP_ROWS)?;
@@ -1223,6 +1244,10 @@ impl BatchDgpuShared {
             r3_arena,
 
             flat,
+
+            mhc_inv_scalar: DeviceBuffer::new(id, 1)?,
+
+            mhc_rms_partials: DeviceBuffer::new(id, 16)?,
             mix: mk_f32(HC_MIX_DIM as usize)?,
             attn_cur: mk_f32(N_EMBD as usize)?,
             attn_input_norm: mk_f32(N_EMBD as usize)?,

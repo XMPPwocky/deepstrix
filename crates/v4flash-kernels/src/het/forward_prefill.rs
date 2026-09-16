@@ -320,6 +320,23 @@ fn prefill_f32_matvec(b: u32) -> bool {
     }
 }
 
+/// Use DECODE'S EXACT mHC mix kernel (`launch_inv_only` + `matvec_pre_scaled`,
+/// one row at a time) instead of the batched form.
+///
+/// The verify must reproduce decode; the batched path does not, because it
+/// normalises first (`W @ normalize(x)`) where decode scales after
+/// (`(W @ x) * inv_rms`). Sinkhorn's 20 iterations amplify the f32 difference.
+/// Default ON for b <= 8 (a DSpark verify is B<=6); large-B prefill keeps the
+/// batched kernel, where per-row launches would dominate.
+/// `V41_MHC_PRE_SCALED=0` disables, `=1` forces at every batch size.
+fn mhc_pre_scaled_for(b: u32) -> bool {
+    match std::env::var("V41_MHC_PRE_SCALED").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => b <= 8,
+    }
+}
+
 fn mhc_narrow_fallback_for(b: u32) -> bool {
     match std::env::var("V41_MHC_NARROW").ok().as_deref() {
         Some("0") => false,
@@ -1720,7 +1737,44 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.mhc_pre_attn.f16_matvec", &de.compute)?;
-            if mhc_narrow_fallback_for(b) {
+            if mhc_pre_scaled_for(b) {
+                // DECODE-EXACT path. Decode computes `mix = (W @ x) * inv_rms`
+                // (`rms_nw_mw.launch_inv_only` + `matvec_pre_scaled`,
+                // forward_layer.rs); the batched path computed
+                // `mix = W @ normalize(x)`, rounding 20480 normalised values to
+                // f32 BEFORE the dot product instead of dotting raw and scaling
+                // once. `hc_split_sinkhorn` then runs 20 doubly-stochastic
+                // iterations on the result, amplifying the difference -- measured
+                // as the layer-0 seed of the verify-vs-decode divergence
+                // (KNOWN_BUGS #0b): 6.5e-03 leaving layer 0, 5.6e-01 by layer 39.
+                // One row at a time, so it is bit-identical to decode by
+                // construction. Verify-sized batches only; large-B prefill keeps
+                // the batched form.
+                let hcd = HC_DIM as usize;
+                let hmd = HC_MIX_DIM as usize;
+                for r in 0..b as usize {
+                    let row = bd.residual.slice_view(r * hcd, hcd);
+                    de.rms_nw_mw.launch_inv_only(
+                        &de.compute,
+                        &mut sd.mhc_inv_scalar,
+                        &row,
+                        &mut sd.mhc_rms_partials,
+                        HC_DIM,
+                        16,
+                        RMS_EPS,
+                    )?;
+                    let mut mix_row = sd.mix.slice_view_mut(r * hmd, hmd);
+                    de.f16.matvec_pre_scaled(
+                        &de.compute,
+                        &mut mix_row,
+                        &dlw.hc_attn_fn.buffer,
+                        &row,
+                        &sd.mhc_inv_scalar,
+                        HC_MIX_DIM,
+                        HC_DIM,
+                    )?;
+                }
+            } else if mhc_narrow_fallback_for(b) {
                 de.f16.matvec_narrow_batched(
                     &de.compute,
                     &mut sd.mix,
