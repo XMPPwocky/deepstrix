@@ -5790,11 +5790,13 @@ impl HeterogeneousEngine {
                     let _ = pf.emit_host_slice(
                         pf.remote_uuid,
                         &format!(
-                            "wait L{layer} rtt={}us link={}us remote={}us",
+                            "wait L{layer} rtt={}us link={}us remote={}us page={}us/{}",
                             partial.rtt_us, partial.link_us(), partial.t_remote_compute_us,
+                            partial.t_remote_page_us, partial.n_remote_miss,
                         ),
                         t_wait, t_wait_end,
                     );
+                    emit_remote_page_slice(&pf, layer as u32, &partial, t_wait_end);
                 }
             }
             super::trace::phase::add(
@@ -6188,4 +6190,35 @@ pub fn verify_decode_moe() -> bool {
 pub fn verify_decode_attn() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("V41_VERIFY_DECODE_ATTN").as_deref() == Ok("1"))
+}
+
+/// Draw box 2's own paging for one request on the `remote.pager` lane.
+///
+/// Box 2 reports only a DURATION (proto v2 `t_page_us`), not timestamps, so the
+/// position is reconstructed: the request lands on box 2 about half a link-time
+/// after it was sent, and `ensure_layer*` runs BEFORE the MoE compute, so the
+/// paging sits at the front of box 2's service window. The DURATION, the LAYER
+/// and the MISS COUNT are exact; treat the sub-request placement as indicative.
+pub(crate) fn emit_remote_page_slice(
+    pf: &super::perfetto::DeviceTimingExporter,
+    layer: u32,
+    partial: &super::remote_experts::RemotePartial,
+    t_wait_end: u64,
+) {
+    if partial.t_remote_page_us == 0 {
+        return;
+    }
+    let rtt_ns = partial.rtt_us as u64 * 1_000;
+    let half_link_ns = partial.link_us() as u64 * 500;
+    let start = t_wait_end.saturating_sub(rtt_ns).saturating_add(half_link_ns);
+    let end = start + partial.t_remote_page_us as u64 * 1_000;
+    let _ = pf.emit_host_slice(
+        pf.remote_pager_uuid,
+        &format!(
+            "page L{layer} {}us / {} miss",
+            partial.t_remote_page_us, partial.n_remote_miss
+        ),
+        start,
+        end,
+    );
 }

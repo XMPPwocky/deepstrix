@@ -156,6 +156,10 @@ pub struct DeviceTimingExporter {
     /// on the host and touch no device stream, so the device tracks show idle
     /// GPUs and the actual cost is invisible.
     pub pager_uuid: u64,
+    /// Box 2's OWN paging, reported per-request over the wire (proto v2) and
+    /// drawn in hub time. Separate from `pager_uuid`, which is box 1's pager:
+    /// a stall on this lane is box-2 NVMe, not box-1 residency.
+    pub remote_pager_uuid: u64,
 }
 
 impl DeviceTimingExporter {
@@ -204,6 +208,7 @@ impl DeviceTimingExporter {
             remote_uuid: 0x52454d54_0000_0001,
             remote_device_uuid: 0x52454d54_0000_0003,
             pager_uuid: 0x50414745_0000_0001,
+            remote_pager_uuid: 0x50414745_0000_0002,
         };
         this.declare_track(this.dgpu_compute.uuid, "dgpu.compute (device)")?;
         this.declare_track(this.dgpu_xfer.uuid, "dgpu.xfer (device)")?;
@@ -212,6 +217,7 @@ impl DeviceTimingExporter {
         this.declare_track(this.remote_uuid, "remote.expert (host)")?;
         this.declare_track(this.remote_device_uuid, "box2.igpu (device, shifted)")?;
         this.declare_track(this.pager_uuid, "expert pager (host)")?;
+        this.declare_track(this.remote_pager_uuid, "remote.pager (box 2 NVMe)")?;
         Ok(this)
     }
 

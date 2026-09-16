@@ -281,7 +281,11 @@ pub mod proto {
     use std::io::Read;
 
     pub const MAGIC: u32 = 0x5058_5344; // "DSXP"
-    pub const VERSION: u16 = 1;
+    /// Bumped to 2 for the two trailing response u32s (`t_page_us`, `n_miss`)
+    /// that drive the `remote.pager` perfetto lane. Appended AFTER t1/t2/t3 so
+    /// every existing offset is unchanged; the frame LENGTH changes, so both
+    /// boxes must be rebuilt together (a v1 daemon fails the length check).
+    pub const VERSION: u16 = 2;
     /// magic u32 | version u16 | kind u16 | seq u32 | payload_len u32
     pub const HDR_LEN: usize = 16;
     pub const KIND_HELLO: u16 = 1;
@@ -317,7 +321,7 @@ pub mod proto {
     pub const REQ_FIXED: usize = 32;
     /// Fixed response fields after the header (bytes): 8 × u32 then the clock
     /// triple `t1_echo, t2, t3` (u64 each, 8-aligned at 48/56/64).
-    pub const RESP_FIXED: usize = 56;
+    pub const RESP_FIXED: usize = 64;
     /// Byte offset of `t1` inside a REQUEST frame.
     pub const REQ_T1_OFF: usize = HDR_LEN + 24;
     /// Byte offsets of `t1_echo`/`t2`/`t3` inside a RESPONSE frame. The writer
@@ -327,6 +331,11 @@ pub mod proto {
     pub const RESP_T1_OFF: usize = HDR_LEN + 32;
     pub const RESP_T2_OFF: usize = HDR_LEN + 40;
     pub const RESP_T3_OFF: usize = HDR_LEN + 48;
+    /// Microseconds this request spent PAGING experts in from box 2's own NVMe,
+    /// and how many experts missed. Patched by the daemon just before write, like
+    /// `t_server_us`. Zero when nothing was paged.
+    pub const RESP_PAGE_OFF: usize = HDR_LEN + 56;
+    pub const RESP_MISSN_OFF: usize = HDR_LEN + 60;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Header {
@@ -608,6 +617,8 @@ pub mod proto {
         buf.put_u64(t1_echo);
         buf.put_u64(t2);
         buf.put_u64(0); // t3: patched by the writer thread just before write()
+        buf.put_u32(0); // t_page_us: patched below, once paging is accounted
+        buf.put_u32(0); // n_miss
     }
 
     /// Byte offset of the response payload inside the frame (8-aligned).
@@ -628,6 +639,11 @@ pub mod proto {
         pub t1: u64,
         pub t2: u64,
         pub t3: u64,
+        /// Paging this request did on box 2's own disk (v2+). The hub draws these
+        /// on the `remote.pager` lane so a stall can be attributed to box-2 NVMe
+        /// rather than to queueing or compute.
+        pub t_page_us: u32,
+        pub n_miss: u32,
     }
 
     pub fn decode_response_meta(buf: &AlignedBuf) -> eyre::Result<ResponseMeta> {
@@ -651,6 +667,12 @@ pub mod proto {
             t1: read_u64(p, RESP_T1_OFF),
             t2: read_u64(p, RESP_T2_OFF),
             t3: read_u64(p, RESP_T3_OFF),
+            t_page_us: u32::from_le_bytes([
+                p[RESP_PAGE_OFF], p[RESP_PAGE_OFF + 1], p[RESP_PAGE_OFF + 2], p[RESP_PAGE_OFF + 3],
+            ]),
+            n_miss: u32::from_le_bytes([
+                p[RESP_MISSN_OFF], p[RESP_MISSN_OFF + 1], p[RESP_MISSN_OFF + 2], p[RESP_MISSN_OFF + 3],
+            ]),
         };
         let want = RESP_DATA_OFF + (m.b as usize) * (m.n_embd as usize) * (m.elem_bytes as usize);
         if p.len() != want {
@@ -1677,6 +1699,17 @@ impl ExpertShard {
             direct,
             pool: None,
         })
+    }
+
+    /// Cumulative `(misses, page_ns)` for `layer`, or `(0, 0)` when the layer is
+    /// not paged. `page_ns` is the wall cost of making experts resident:
+    /// `read_ns` (NVMe + any CPU repack) plus `h2d_ns` plus the GPU repack.
+    /// Snapshot around a request and difference it to get that request's paging.
+    pub fn layer_page_counters(&self, layer: u32) -> (u64, u64) {
+        match self.layers.get(layer as usize).and_then(|l| l.as_ref()).and_then(|l| l.page.as_ref()) {
+            Some(pg) => (pg.misses, pg.read_ns + pg.h2d_ns + pg.repack_gpu_ns),
+            None => (0, 0),
+        }
     }
 
     pub fn info(&self) -> &ShardInfo {
@@ -2956,7 +2989,17 @@ pub fn serve_connection(
                     return Err(eyre!("request geometry n_used={} xq_bpt={} != {}/{}", req.n_used, req.xq_bpt, N_EXPERT_USED, XQ_BYTES_PER_TOKEN));
                 }
                 let b = req.b as usize;
+                // Paging THIS request did on our own NVMe. `run_path` calls
+                // `ensure_layer*` internally, so bracket it and difference the
+                // layer's cumulative counters. Reported back so the hub can draw a
+                // `remote.pager` lane and tell a box-2 NVMe stall apart from
+                // queueing or compute -- previously indistinguishable from the hub,
+                // which only saw one opaque round trip.
+                let (miss0, page_ns0) = shard.layer_page_counters(req.layer);
                 let timing = exec.run_path(shard, req.layer, b, req.xq, req.sel, req.ew, req.flags & proto::REQ_FLAG_BATCHED != 0)?;
+                let (miss1, page_ns1) = shard.layer_page_counters(req.layer);
+                let t_page_us = (page_ns1.saturating_sub(page_ns0) / 1000).min(u32::MAX as u64) as u32;
+                let n_miss_req = miss1.saturating_sub(miss0).min(u32::MAX as u64) as u32;
                 let t_d2h0 = Instant::now();
                 let f32_out = req.flags & proto::REQ_FLAG_RESP_F32 != 0;
                 let elem = if f32_out { 4 } else { 2 };
@@ -2993,6 +3036,10 @@ pub fn serve_connection(
                 // t_server = frame complete → response handed to the writer.
                 let t_server_us = (t_ready - t_done).as_micros() as u32;
                 resp.as_bytes_mut()[proto::HDR_LEN + 20..proto::HDR_LEN + 24].copy_from_slice(&t_server_us.to_le_bytes());
+                resp.as_bytes_mut()[proto::RESP_PAGE_OFF..proto::RESP_PAGE_OFF + 4]
+                    .copy_from_slice(&t_page_us.to_le_bytes());
+                resp.as_bytes_mut()[proto::RESP_MISSN_OFF..proto::RESP_MISSN_OFF + 4]
+                    .copy_from_slice(&n_miss_req.to_le_bytes());
                 let rec = RequestRecord {
                     seq: hdr.seq,
                     layer: req.layer,
@@ -3120,6 +3167,10 @@ pub struct RemotePartial {
     pub miss_mask: u32,
     pub rtt_us: u32,
     pub t_remote_compute_us: u32,
+    /// Box-2 paging for this request (v2+): microseconds on its NVMe, and how
+    /// many experts missed. Drives the `remote.pager` perfetto lane.
+    pub t_remote_page_us: u32,
+    pub n_remote_miss: u32,
     pub t_remote_server_us: u32,
     pub bytes_in: usize,
     pub bytes_out: usize,
@@ -3448,6 +3499,8 @@ impl RemoteExpertClient {
             miss_mask: (m.flags & proto::RESP_MISS_MASK) >> proto::RESP_MISS_SHIFT,
             rtt_us: (t_recv - ticket.t_submit).as_micros().min(u32::MAX as u128) as u32,
             t_remote_compute_us: m.t_compute_us,
+            t_remote_page_us: m.t_page_us,
+            n_remote_miss: m.n_miss,
             t_remote_server_us: m.t_server_us,
             bytes_in: buf.len(),
             bytes_out: ticket.bytes_out,

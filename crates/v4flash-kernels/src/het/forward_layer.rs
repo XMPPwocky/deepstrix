@@ -2779,11 +2779,15 @@ impl HeterogeneousEngine {
                     let _ = pf.emit_host_slice(
                         pf.remote_uuid,
                         &format!(
-                            "decode wait L{layer} rtt={}us link={}us remote={}us",
+                            "decode wait L{layer} rtt={}us link={}us remote={}us page={}us/{}",
                             partial.rtt_us, partial.link_us(), partial.t_remote_compute_us,
+                            partial.t_remote_page_us, partial.n_remote_miss,
                         ),
                         t_wait,
                         super::perfetto::now_ns(),
+                    );
+                    super::forward_prefill::emit_remote_page_slice(
+                        &pf, layer as u32, &partial, super::perfetto::now_ns(),
                     );
                 }
             }
