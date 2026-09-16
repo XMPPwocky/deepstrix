@@ -866,7 +866,7 @@ fn forward_prefill_all_oracles_one_load() -> eyre::Result<()> {
     let mut single = |engine: &HeterogeneousEngine, bd: &mut BatchDgpuScratch, bi: &mut BatchIgpuScratch,
                       sd: &mut BatchDgpuShared, si: &mut BatchIgpuShared, hs: &mut DgpuScratch| -> eyre::Result<Vec<f32>> {
         let mut st = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
-        engine.forward_prefill(bd, bi, sd, si, hs, &mut st, &main_weights, &input_hcs, &tokens, 0, true, None, None
+        engine.forward_prefill(bd, bi, sd, si, hs, &mut st, &main_weights, &input_hcs, &tokens, 0, true, None, None,
             None,
         )
     };
@@ -885,7 +885,7 @@ fn forward_prefill_all_oracles_one_load() -> eyre::Result<()> {
     let q = {
         let mut st = HetModelState::alloc(dgpu, igpu, t as u32 + 4)?;
         engine.forward_prefill_pipelined(&mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd_p, &mut si_p,
-            &mut head_scratch, &mut st, &main_weights, &input_hcs, &tokens, 0, true, None, None, None, None
+            &mut head_scratch, &mut st, &main_weights, &input_hcs, &tokens, 0, true, None, None, None, None,
                 None,
                 None,
             )?

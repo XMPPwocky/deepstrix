@@ -367,7 +367,16 @@ mod tests {
         // IQ3_S gate/up (unsloth UD-IQ3_XXS blk.26): [4096, 2048] per
         // expert = 2048 rows × 16 blocks × 110 B, matching the GGUF
         // tensor size 922,746,880 / 256.
-        assert_eq!(bytes_per_expert(IQ3_S, N_EMBD as u64, N_FF_EXP as u64).unwrap(), 3_604_480);
+        // Compute from the CONFIG constants, like every other assertion here: this
+        // line hardcoded 3_604_480, which is the V4-FLASH answer (2048 x 16 x 110).
+        // Under `--features v41` the same expression is 2304 x 20 x 110 = 5_068_800,
+        // so the test failed for the shapes it was asked about rather than for any
+        // contract violation. The V4-Flash fact itself is pinned dimension-
+        // independently by the explicit-shape assertion below.
+        assert_eq!(
+            bytes_per_expert(IQ3_S, N_EMBD as u64, N_FF_EXP as u64).unwrap(),
+            (N_FF_EXP as usize) * (N_EMBD as usize / 256) * 110
+        );
         assert_eq!(bytes_per_expert(IQ3_S, 4096, 2048).unwrap(), 2048 * 16 * 110);
         assert_eq!(3_604_480u64 * 256, 922_746_880);
     }
