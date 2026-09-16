@@ -3962,6 +3962,15 @@ impl HeterogeneousEngine {
         // Picks box 1 declined because it does not hold them; box 2 must claim
         // exactly these ON TOP of what it advertises.
         let mut extra_remote = vec![false; N_EXPERT as usize];
+        // Hoisted: the ALLOCATOR (below), the EXCLUSION builder and the WEIGHTS
+        // VIEW must all agree on the slot space, and the view is chosen ~250
+        // lines further down. Deciding this once, here, is what keeps them from
+        // diverging -- see the `routed_src` match.
+        let sparse_resid_layer = speculative_append()
+            && !sparse_verify_residency_off()
+            && !(replay_offload_enabled()
+                && remote_split_on
+                && (layer as usize) >= crate::config::CED_DECODER_START);
         if let Some(pg) = pager.as_deref_mut() {
             // Page the chunk's ACTUAL routed union, not all N_EXPERT. The
             // "union at B >> 1 is essentially everything" argument above holds
@@ -4095,9 +4104,9 @@ impl HeterogeneousEngine {
                 // Paired with the exclusion builder below: the SPARSE LRU and
                 // `set_remote_exclusion` are incompatible (see there), so the two
                 // decisions must be made from ONE predicate.
-                let sparse_resid = !replay_offload
-                    && speculative_append()
-                    && !sparse_verify_residency_off();
+                let sparse_resid = sparse_resid_layer;
+                debug_assert_eq!(sparse_resid, !replay_offload && speculative_append()
+                    && !sparse_verify_residency_off());
                 if replay_offload {
                     ids.clear();
                 } else if sparse_resid {
@@ -4365,7 +4374,28 @@ impl HeterogeneousEngine {
             // slot i holds expert i, so the kernel indexes it exactly like a resident
             // buffer while other layers stay resident in other windows.
             Some(pg) => {
-                pager_window = pg.routed_window(layer as i32);
+                // THIRD half of the allocator/exclusion pairing: the WEIGHTS VIEW.
+                //
+                // `ensure` (sparse decode LRU) writes ABSOLUTE pool slots, which
+                // are only meaningful against the whole pool -- that is what the
+                // decode path hands the dispatch (`pg.routed`, forward_layer.rs).
+                // `ensure_layer_union`/`_dense` write WINDOW-RELATIVE slots, valid
+                // only against `routed_window(layer)`.
+                //
+                // Handing an absolute slot to the window view reads
+                // `window_base(w) + slot`, and with V41_PAGER_WINDOWS=4 /
+                // STRIDE=128 the base is 128/256/384 for most layers while the LRU
+                // slots start at `dense_slots()` = 768. That is off the end of a
+                // 384-wide view: another expert's weights, no error, plausible
+                // output. It is correct only when window_base == 0 for every layer
+                // (dense_windows == 1), which is NOT the default.
+                let routed_view: &crate::model_weights::RoutedExpertWeights =
+                    if sparse_resid_layer {
+                        &pg.routed
+                    } else {
+                        pager_window = pg.routed_window(layer as i32);
+                        &pager_window
+                    };
                 // ALWAYS hand the dispatch the remap when the pager owns the
                 // window, not just under the remote split.
                 //
@@ -4379,7 +4409,7 @@ impl HeterogeneousEngine {
                 // error and plausible-looking output. Passing it unconditionally is
                 // a no-op today (mode 0 with an all-local remap is arithmetically
                 // identical to the plain builder) and the precondition for packing.
-                (&pager_window, Some(&pg.remap_dev), false)
+                (routed_view, Some(&pg.remap_dev), false)
             }
             None => (&ilw.routed, ilw.hot_remap.as_ref(), ilw.igpu_packed),
         };
