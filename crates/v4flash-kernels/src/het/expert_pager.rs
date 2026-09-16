@@ -20,6 +20,7 @@ use v4flash_hip::{Device, DeviceBuffer, Stream};
 
 use crate::config::{N_EMBD, N_EXPERT, N_FF_EXP};
 use crate::model_weights::RoutedExpertWeights;
+use crate::moe_group_builder::MAX_MOE_GROUP_IDS;
 use crate::mxfp4_repack::Mxfp4Repack;
 use crate::weight_contract;
 use crate::weights::DeviceWeight;
@@ -1234,22 +1235,36 @@ impl ExpertPager {
     /// First slot of the decode LRU region = end of the last dense window.
     /// Replaces the old `dense_windows * N_EXPERT`, which assumed every window
     /// was 384 wide.
-    /// Can the SPARSE (absolute-slot) residency produce group ids the MoE
-    /// group builder can actually use?
+    /// Group-id space the SPARSE (absolute-slot) residency needs.
     ///
-    /// `moe_group_builder.hip:118` drops any group id `>= n_expert`, and
-    /// `group_count` / `expert_members` are sized `N_EXPERT` (they are indexed
-    /// `g * max_per_expert + pos`), so the bound is a buffer limit and not a
-    /// guard. The sparse path sets `g` to an ABSOLUTE pool slot, and `ensure`
-    /// allocates those at or above `dense_slots()`, so every one of them is
-    /// dropped SILENTLY unless the whole pool fits under N_EXPERT.
+    /// `ensure` hands out ABSOLUTE pool slots and writes them into the shared
+    /// remap as `-(slot) - 1`, so `moe_group_builder_hetsplit` mode 0 emits a
+    /// pool slot as the group id. The builder's `n_expert` argument is a BUFFER
+    /// LIMIT, not a guard -- `group_count` / `expert_members` are indexed
+    /// `g * max_per_expert + pos` -- so the group arrays and that bound must
+    /// cover the WHOLE POOL, not `N_EXPERT`.
     ///
-    /// This was #0b: the routed experts contributed nothing to a speculative
-    /// verify, with clean inputs, identical expert ids and a clean shared
-    /// expert, for a 0.83 relative error in the layer output and ~60% argmax
-    /// agreement against decode.
+    /// Sizing them to `N_EXPERT` against a multi-thousand-slot pool was #0b:
+    /// every sparse-resident routed expert was dropped SILENTLY while
+    /// `q2_k_reduce_partials_hetsplit` still claimed its (zeroed) partial row
+    /// (it keys on `remap[e] < 0`, which has no bound). Clean inputs, identical
+    /// expert ids, clean shared expert, 0.83 relative error in the layer output
+    /// and ~60% argmax agreement against decode.
+    pub fn sparse_group_bound(&self) -> u32 {
+        self.n_slots
+    }
+
+    /// Can the sparse view's group ids survive the work-item packing?
+    ///
+    /// `moe_work_items_builder` packs `(group_id << 16) | member_start` into an
+    /// `i32` and the consumers read it back as
+    /// `(unsigned)(packed >> 16) & 0xffff`, so ids round-trip for the full
+    /// 16-bit range but not beyond it. A pool this large is not reachable today
+    /// (65536 slots is ~1.2 TB of experts); the check is here so a future pool
+    /// growth fails the predicate and falls back to the dense window instead of
+    /// silently aliasing group ids.
     pub fn sparse_group_ids_in_range(&self) -> bool {
-        self.n_slots as usize <= N_EXPERT as usize
+        self.n_slots as usize <= MAX_MOE_GROUP_IDS
     }
 
     fn dense_slots(&self) -> usize {

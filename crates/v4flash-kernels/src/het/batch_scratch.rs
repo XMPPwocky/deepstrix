@@ -32,7 +32,7 @@
 //! iGPU ~114 MiB (was 2 x 98). See the per-field comments for the
 //! within-lane disjoint-lifetime unions (R1/R2/R3 arenas).
 
-use color_eyre::eyre;
+use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{Device, DeviceBuffer};
 
 use crate::attention::{ATTN_MIXED_MAX_KEYS, ATTN_SCORES_STRIDE};
@@ -880,6 +880,25 @@ impl BatchIgpuScratch {
             n_chunked_work_items: DeviceBuffer::new(id, 1)?,
         })
     }
+
+    /// Grow `group_count` to hold `n_groups` group ids.
+    ///
+    /// The builders' `n_expert` argument is a BUFFER LIMIT, not a guard: a group
+    /// id at or above it is dropped with no error. `N_EXPERT` is right only while
+    /// the group id IS a raw expert id (the plain builder, and the pager's dense
+    /// window where slot == expert id). The speculative verify's SPARSE residency
+    /// emits ABSOLUTE pool slots instead, so its bound is the pool -- sizing this
+    /// to `N_EXPERT` there was #0b (see `ExpertPager::sparse_group_bound`).
+    ///
+    /// Grow-only, and a no-op on the prefill path (`N_EXPERT` is already the
+    /// allocated size). The wide case is ~10 KB.
+    pub fn ensure_group_bound(&mut self, n_groups: u32) -> eyre::Result<()> {
+        if self.group_count.len() >= n_groups as usize {
+            return Ok(());
+        }
+        self.group_count = DeviceBuffer::new(self.group_count.device_id(), n_groups as usize)?;
+        Ok(())
+    }
 }
 
 impl BatchIgpuShared {
@@ -929,6 +948,55 @@ impl BatchIgpuShared {
     /// Max per-expert group capacity (= `rows`). Used by Stage 11's by-expert path.
     pub fn max_per_expert(&self) -> u32 {
         self.rows as u32
+    }
+
+    /// Grow the by-expert member/work lists to hold `n_groups` group ids with a
+    /// stride of `max_per_expert` members, for a chunk of `b` tokens.
+    ///
+    /// Companion to [`BatchIgpuScratch::ensure_group_bound`] -- the builder's
+    /// bound and these three arrays are ONE decision and must be sized together.
+    ///
+    /// `expert_members` is a dense `[n_groups x max_per_expert]` matrix, so the
+    /// wide (sparse-verify) case is only affordable because `max_per_expert` is
+    /// the ACTUAL batch there, not `B_MAX`: a group holds at most one entry per
+    /// token (a token's top-k picks are distinct experts, and the pager maps
+    /// distinct experts to distinct slots), so `b` is exact, and a
+    /// 2600-slot pool at b=6 is 62 KB against prefill's 384 x B_MAX.
+    ///
+    /// Grow-only: a later large-B prefill chunk must still find its own
+    /// `N_EXPERT x B_MAX` capacity, so this never shrinks.
+    /// Whether [`Self::ensure_group_capacity`] would reallocate. Callers must
+    /// drain the stream first when it would: growing FREES the old buffers, and a
+    /// previous layer's by-expert kernels may still be queued reading them.
+    pub fn group_capacity_ok(&self, n_groups: u32, max_per_expert: u32, b: usize) -> bool {
+        self.expert_members.len() >= (n_groups as usize).saturating_mul(max_per_expert as usize)
+            && self.work_items.len() >= (n_groups as usize) + b * (N_EXPERT_USED as usize)
+    }
+
+    pub fn ensure_group_capacity(
+        &mut self,
+        n_groups: u32,
+        max_per_expert: u32,
+        b: usize,
+    ) -> eyre::Result<()> {
+        let members = (n_groups as usize)
+            .checked_mul(max_per_expert as usize)
+            .ok_or_else(|| eyre!("group capacity overflow: {n_groups} x {max_per_expert}"))?;
+        if self.expert_members.len() < members {
+            self.expert_members =
+                DeviceBuffer::new(self.expert_members.device_id(), members)?;
+        }
+        // `moe_work_items_builder` walks the whole group space and emits
+        // `ceil(group_count[g] / chunk)` items per active group: at most one
+        // header per group plus one per member.
+        let wi_len = (n_groups as usize) + b * (N_EXPERT_USED as usize);
+        if self.work_items.len() < wi_len {
+            let id = self.work_items.device_id();
+            self.work_items = DeviceBuffer::new(id, wi_len)?;
+            self.staged_work_items = DeviceBuffer::new(id, wi_len)?;
+            self.chunked_work_items = DeviceBuffer::new(id, wi_len)?;
+        }
+        Ok(())
     }
 }
 

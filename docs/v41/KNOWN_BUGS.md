@@ -10,13 +10,22 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Start here
 
-### Why DSpark output is degenerate, in one paragraph
+### Why DSpark output was degenerate, in one paragraph -- **CLOSED 2026-09-16**
 Accept mode emits `corrected = row_argmax(0)` -- the VERIFY's row-0 token
 (`engine_worker.rs`). Row 0 is the NON-speculative position, i.e. the token
 plain decode would emit. The in-tree cross-check
-(`V41_VERIFY_PROBE=k,k V41_VERIFY_BATCHED=1` -> `dspark.xcheck`) measures that
-agreement at **~64%** (71/111). So **~36% of every generated token differs from
-what decode would produce**, which is exactly the observed degeneracy.
+(`V41_VERIFY_PROBE=k,k V41_VERIFY_BATCHED=1` -> `dspark.xcheck`) measured that
+agreement at **~64%**, so ~36% of every generated token differed from what
+decode would produce -- exactly the observed degeneracy.
+
+**That was #0b, and #0b is fixed** (`b6ce2b8`, `056e262`, and the widening that
+followed): the MoE group builder silently dropped every sparse-resident routed
+expert because its group-id bound was `N_EXPERT` while the sparse verify
+residency emits ABSOLUTE pool slots. Agreement is now 71/71 at B=1 and 68/71 at
+B=6, KLD 1.707 -> 0.0066. **Everything below this line in "Start here" is the
+pre-fix investigation and is kept only as a record of what was ruled out** --
+the attention-kernel hypothesis it builds toward was REFUTED by measurement
+(the kernels are arithmetically identical and attend the same slots).
 
 **This is independent of accept rate.** E reached 3.500 (oracle base 4.382) with
 output still degenerate. E buys SPEED; row-0 agreement buys CORRECTNESS. Do not
@@ -161,7 +170,21 @@ problems here -- raising E does not by itself fix #0b.
 
 ## Silent wrongness
 
-### 0b. OPEN — verify vs decode ~1.9 nats, **SEEDED AT LAYER 0 by a different `hc_mixes` kernel**
+### 0b. ~~FIXED~~ (2026-09-16) — verify vs decode ~1.9 nats: the MoE group builder dropped every sparse-resident expert
+
+**See the FIXED entry under "Sparse verify residency" below for the root cause,
+the fix, and the measured before/after.** In one line: `moe_group_builder.hip:118`
+bounds group ids by `n_expert`, that bound is a BUFFER LIMIT, and the sparse
+verify residency emits absolute pool slots above it. 43/71 -> 71/71, KLD 1.707 ->
+0.0066.
+
+**The section below is the pre-fix investigation, kept as a record of what was
+ruled out. Its conclusion ("a different `hc_mixes` kernel", then "the attention
+kernels themselves") is WRONG** -- the attention kernels were diffed by hand and
+are arithmetically identical, and were shown to attend the same slots at three
+overlapping positions. The per-layer bisection was reading amplification of the
+MoE drop, not a seed in attention.
+
 
 **LOCALISED 2026-09-16.** Per-layer residual diff (both paths now dump; see
 `92257cc`, `3e4a17c`), same position, B=1:
@@ -503,10 +526,48 @@ to say which geometry is even correct.
 
   Same class as the box-2 `ensure_group_bound` fix (7f89090).
 
-  COST: this disables the sparse view at today's pool size (~1.85x on the
-  probe-inflated clock). It is disabled because it was never correct. Widening
-  the group-id space to the pool, or packing the verify's experts into a
-  <N_EXPERT-wide contiguous region with its own LRU, is the follow-up.
+  FOLLOW-UP DONE -- **the sparse view is back ON, widened, not gated off.**
+  The gating fix above bought correctness by disabling the view, which cost
+  ~2.2x on the probe clock. The group-id space is now sized to the space the
+  remap actually encodes:
+
+    * `ExpertPager::sparse_group_bound()` -> the pool (`n_slots`).
+    * `BatchIgpuScratch::ensure_group_bound` / `BatchIgpuShared::
+      ensure_group_capacity` grow `group_count`, `expert_members` and the three
+      work-item arrays to that bound. Grow-only, and callers drain the stream
+      first (growing FREES buffers a queued kernel may still be reading).
+    * `moe_group_bound` is read next to `sparse_resid_layer`, because by the
+      time the builder runs the pager is borrowed by `routed_src`.
+    * `max_per_expert` drops from `B_MAX` to the actual `b` in the wide case --
+      `expert_members` is a dense `[bound x max_per_expert]` matrix, so a
+      4454-slot bound at `B_MAX` would be gigabytes while at b<=6 it is 107 KB
+      and fits the existing 384 x B_MAX allocation with no reallocation at all.
+      A group holds at most one entry per token (a token's top-k picks are
+      distinct experts, and the pager maps distinct experts to distinct slots),
+      so `b` is exact, not a heuristic.
+    * `MAX_MOE_GROUP_IDS` (65536) is the real ceiling: work items pack
+      `(group_id << 16) | member_start`. `sparse_group_ids_in_range()` now
+      guards THAT, and falls back to the dense window above it.
+      Both builders reject an over-wide bound rather than alias ids.
+
+  MEASURED, default config, widened sparse view vs the known-correct window
+  path, back-to-back, same prompt:
+
+      B=1 probe   sparse WIDE   agree 71/71  cos 0.998369  kld 0.00658
+      B=6 probe   sparse WIDE   agree 68/71  cos 0.998397  kld 0.00731   691.5 ms
+      B=6 probe   window (=0)   agree 68/71  cos 0.998397  kld 0.00731  1500.1 ms
+
+  Bit-identical to the correct path at both batch sizes, and 2.17x faster. The
+  server logs `moe group space: WIDE <n> ids x <m> members` once when the wide
+  space is live, so "is the sparse view actually on" is not a guess.
+
+  The residual 3/71 at B=6 is PRE-EXISTING and identical in both arms (cos
+  0.9984, kld 0.0073 -- argmax ties at near-identical logits), so it is batch
+  numerics, not this bug.
+
+  NOT taken: packing the verify's experts into a <N_EXPERT-wide region with its
+  own LRU. Widening is strictly less machinery and has no residency policy to
+  keep in sync.
 
       V41_SPARSE_VERIFY_RESIDENCY=0   agree 71/71 (1.0000)  cos 0.998369  kld 0.00658
       V41_SPARSE_VERIFY_RESIDENCY=1   agree 43/71 (0.6056)  cos 0.759226  kld 1.70697

@@ -4303,23 +4303,29 @@ impl HeterogeneousEngine {
         // VIEW must all agree on the slot space, and the view is chosen ~250
         // lines further down. Deciding this once, here, is what keeps them from
         // diverging -- see the `routed_src` match.
-        // KNOWN_BUGS #0b ROOT CAUSE. The sparse view hands the MoE group builder
-        // ABSOLUTE pool slots as group ids, but `moe_group_builder.hip:118`
-        // drops any id >= n_expert and `group_count`/`expert_members` are sized
-        // N_EXPERT -- so unless the entire pool fits under N_EXPERT, every
-        // sparse-resident routed expert is dropped SILENTLY. Measured cost:
-        // verify/decode argmax agreement 43/71 vs 71/71, kld 1.707 vs 0.0066.
+        // KNOWN_BUGS #0b. The sparse view hands the MoE group builder ABSOLUTE
+        // pool slots as group ids, and the builder's `n_expert` argument is a
+        // BUFFER LIMIT, not a guard: `moe_group_builder.hip:118` drops any id at
+        // or above it with no error, and `group_count`/`expert_members` are
+        // indexed `g * max_per_expert + pos`. Passing N_EXPERT against a
+        // multi-thousand-slot pool therefore dropped EVERY sparse-resident routed
+        // expert, while `q2_k_reduce_partials_hetsplit` still claimed its zeroed
+        // partial row (it keys on `remap[e] < 0`, which has no bound). Measured
+        // cost: verify/decode argmax agreement 43/71 vs 71/71, kld 1.707 vs
+        // 0.0066.
         //
-        // `sparse_group_ids_in_range()` is therefore part of the predicate, not
-        // a check done later: by the time `ensure` has run it has already
-        // written absolute slots into the shared remap, and the window view
-        // needs the identity map, so there is no safe post-hoc fallback.
+        // The fix is to size the group arrays and the bound to the space the
+        // remap actually encodes -- `sparse_group_bound()` below, applied at the
+        // builder via `ensure_group_bound`/`ensure_group_capacity`. This is a
+        // decision that must be made HERE, with the allocator and the weights
+        // view: by the time `ensure` has run it has already written absolute
+        // slots into the shared remap, and the window view needs the identity
+        // map, so there is no safe post-hoc fallback.
         //
-        // With today's pool (thousands of slots) this disables the sparse view.
-        // Re-enabling it needs the group-id space widened to the pool -- size
-        // `group_count`/`expert_members`/`work_items` by the pager's slot count
-        // and pass that as the builder's bound -- or the verify's experts packed
-        // into a <N_EXPERT-wide contiguous region with its own LRU.
+        // `sparse_group_ids_in_range()` is the one case widening cannot rescue:
+        // work items pack the group id into 16 bits. Unreachable at any pool
+        // this box can hold; it falls back to the dense window rather than
+        // silently aliasing ids.
         let sparse_resid_layer = speculative_append()
             && !sparse_verify_residency_off()
             && pager
@@ -4329,6 +4335,19 @@ impl HeterogeneousEngine {
             && !(replay_offload_enabled()
                 && remote_split_on
                 && (layer as usize) >= crate::config::CED_DECODER_START);
+        // Group-id space the MoE by-expert chain must cover for THIS layer.
+        // Read here, next to the predicate that chooses the slot space, because
+        // the pager is borrowed by `routed_src` by the time the builder runs.
+        //   sparse  -> absolute pool slots (`pg.routed`, the whole pool)
+        //   window  -> window-relative slots == raw expert ids (`routed_window`)
+        let moe_group_bound: u32 = if sparse_resid_layer {
+            pager
+                .as_deref()
+                .map(|pg| pg.sparse_group_bound())
+                .unwrap_or(N_EXPERT)
+        } else {
+            N_EXPERT
+        };
         if let Some(pg) = pager.as_deref_mut() {
             // Page the chunk's ACTUAL routed union, not all N_EXPERT. The
             // "union at B >> 1 is essentially everything" argument above holds
@@ -5041,7 +5060,41 @@ impl HeterogeneousEngine {
         // remain opt-in.
         #[allow(non_snake_case)]
         let CHUNK_SIZE: u32 = if variant_peek == "tile8" { 8 } else { 32 };
-        let max_per_expert = si.max_per_expert();
+        // Group arrays and the builder's bound are ONE decision -- the bound is a
+        // buffer limit, so a mismatch drops picks silently (#0b). `moe_group_bound`
+        // is the pool when the sparse verify residency is in play, `N_EXPERT`
+        // otherwise.
+        //
+        // `expert_members` is dense `[bound x max_per_expert]`, so the wide case
+        // pays for itself only by dropping the stride from `B_MAX` to the actual
+        // chunk: a group can hold at most one entry per token, so `b` is exact
+        // (and the sparse path only ever runs a B<=16 verify). Prefill keeps the
+        // `B_MAX` stride it already has allocated.
+        let max_per_expert = if moe_group_bound > N_EXPERT {
+            b
+        } else {
+            si.max_per_expert()
+        };
+        if bi.group_count.len() < moe_group_bound as usize
+            || !si.group_capacity_ok(moe_group_bound, max_per_expert, b as usize)
+        {
+            // Growing FREES the old buffers, and the previous layer's by-expert
+            // kernels can still be queued on them (the chain's only sync is the
+            // work-item readback, ahead of the main kernel). Grow-only, so this
+            // drains at most once per process.
+            ie.compute.synchronize()?;
+        }
+        bi.ensure_group_bound(moe_group_bound)?;
+        si.ensure_group_capacity(moe_group_bound, max_per_expert, b as usize)?;
+        if moe_group_bound > N_EXPERT {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "moe group space: WIDE {moe_group_bound} ids x {max_per_expert} members \
+                     (sparse verify residency; N_EXPERT={N_EXPERT})"
+                );
+            });
+        }
         bi.group_count.fill_zero()?;
         {
             let _t_grp = ie.events.stage("igpu.moe_group_builder", &ie.compute)?;
@@ -5068,7 +5121,7 @@ impl HeterogeneousEngine {
                     split_cap,
                     b,
                     cs_n_used as u32,
-                    N_EXPERT,
+                    moe_group_bound,
                     max_per_expert,
                 )?;
                 // `V41_GROUP_AUDIT=1`: every pick the remap marks OURS must end
@@ -5080,8 +5133,10 @@ impl HeterogeneousEngine {
                 // when a LANE HOLDS >= 2 ROWS.
                 if group_audit() {
                     ie.compute.synchronize()?;
-                    let mut gc = vec![0i32; N_EXPERT as usize];
-                    group_count.slice_view(0, N_EXPERT as usize).copy_to_host(&mut gc)?;
+                    let mut gc = vec![0i32; moe_group_bound as usize];
+                    group_count
+                        .slice_view(0, moe_group_bound as usize)
+                        .copy_to_host(&mut gc)?;
                     let enqueued: i64 = gc.iter().map(|&v| v as i64).sum();
                     // Expected: picks whose remap entry is NEGATIVE ("ours at slot").
                     let mut remap_host = vec![0i32; N_EXPERT as usize];
@@ -5110,6 +5165,11 @@ impl HeterogeneousEngine {
                          wrong experts"
                     ));
                 }
+                // Raw expert ids, so this branch's group space IS N_EXPERT. It is
+                // only reachable with no remap at all, i.e. no pager -- and the
+                // sparse view needs one -- so a wide bound here would mean the
+                // slot space and the builder had diverged.
+                debug_assert_eq!(moe_group_bound, N_EXPERT);
                 ie.moe_group_builder.launch(
                     &ie.compute,
                     group_count,
@@ -5172,7 +5232,7 @@ impl HeterogeneousEngine {
                     n_staged_work_items,
                     n_chunked_work_items,
                     group_count,
-                    N_EXPERT,
+                    moe_group_bound,
                     CHUNK_SIZE,
                     threshold,
                     max_items,
@@ -5242,7 +5302,7 @@ impl HeterogeneousEngine {
                     work_items,
                     n_work_items,
                     group_count,
-                    N_EXPERT,
+                    moe_group_bound,
                     CHUNK_SIZE,
                     work_items.len() as u32,
                 )?;

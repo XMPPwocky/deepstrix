@@ -15,6 +15,21 @@
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{launch_kernel, DeviceBuffer, LaunchConfig, Module, Stream};
 
+/// Largest group-id space the by-expert chain can address.
+///
+/// `moe_work_items_builder` packs a work item as `(group_id << 16) | member_start`
+/// in an `i32`, and every consumer reads it back as
+/// `(unsigned)(packed >> 16) & 0xffff`. The mask makes the round trip exact for
+/// the full unsigned 16-bit range (a group id >= 32768 sets the sign bit and the
+/// arithmetic shift sign-extends, but the mask discards those bits), so 65536 ids
+/// is the hard ceiling and `member_start` owns the low half.
+///
+/// The `n_expert` argument the builders take is a BUFFER LIMIT, not a guard: ids
+/// at or above it are dropped with no error, and `group_count` / `expert_members`
+/// are indexed `g * max_per_expert + pos`. Callers must size those arrays to the
+/// id space they actually emit -- see `BatchIgpuShared::ensure_group_capacity`.
+pub const MAX_MOE_GROUP_IDS: usize = 1 << 16;
+
 const MOE_GROUP_BUILDER_GFX1201: &[u8] = include_bytes!(env!("KERNEL_MOE_GROUP_BUILDER_GFX1201"));
 const MOE_GROUP_BUILDER_GFX1151: &[u8] = include_bytes!(env!("KERNEL_MOE_GROUP_BUILDER_GFX1151"));
 const MOE_WORK_ITEMS_BUILDER_GFX1201: &[u8] =
@@ -140,6 +155,21 @@ impl MoeGroupBuilder {
         if batch == 0 {
             return Ok(());
         }
+        // The group id and the member offset each own 16 bits of a work item
+        // (`moe_work_items_builder`). Overflowing either aliases groups onto one
+        // another silently -- the same class of failure as an undersized bound.
+        if n_expert as usize > MAX_MOE_GROUP_IDS {
+            return Err(eyre!(
+                "moe_group_builder: n_expert={n_expert} exceeds the {MAX_MOE_GROUP_IDS}-id \
+                 work-item packing"
+            ));
+        }
+        if max_per_expert as usize > MAX_MOE_GROUP_IDS {
+            return Err(eyre!(
+                "moe_group_builder: max_per_expert={max_per_expert} exceeds the \
+                 {MAX_MOE_GROUP_IDS}-entry work-item member offset"
+            ));
+        }
         let total = batch * n_used;
         if group_count.len() < n_expert as usize {
             return Err(eyre!("group_count too small"));
@@ -188,6 +218,21 @@ impl MoeGroupBuilder {
     ) -> eyre::Result<()> {
         if batch == 0 {
             return Ok(());
+        }
+        // The group id and the member offset each own 16 bits of a work item
+        // (`moe_work_items_builder`). Overflowing either aliases groups onto one
+        // another silently -- the same class of failure as an undersized bound.
+        if n_expert as usize > MAX_MOE_GROUP_IDS {
+            return Err(eyre!(
+                "moe_group_builder: n_expert={n_expert} exceeds the {MAX_MOE_GROUP_IDS}-id \
+                 work-item packing"
+            ));
+        }
+        if max_per_expert as usize > MAX_MOE_GROUP_IDS {
+            return Err(eyre!(
+                "moe_group_builder: max_per_expert={max_per_expert} exceeds the \
+                 {MAX_MOE_GROUP_IDS}-entry work-item member offset"
+            ));
         }
         let total = batch * n_used;
         if group_count.len() < n_expert as usize {
