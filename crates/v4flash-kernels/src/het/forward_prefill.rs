@@ -1916,16 +1916,7 @@ impl HeterogeneousEngine {
         // at B=512: dp4a 8.82ms / wmma_old 4.24ms / wmma_lds_tiled 1.38ms
         // → 6.4× over dp4a, 3.1× over the older WMMA. Q_FLAT % 64 == 0 ✓.
         // QB_WMMA=wmma forces the older non-tiled WMMA; QB_WMMA=0 forces dp4a.
-        // At verify-sized batches take DECODE'S kernel. The "dp4a" arm below is
-        // `de.q8.matvec_batched`, which is the same per-row math as decode's
-        // `de.q8.matvec` (q8_0.rs: "Same per-row math as `matvec`; B parallel
-        // WGs, one per batch element"), so the verify reproduces decode. The
-        // default "f16x" arm is `q8_wmma.gemm_f16x` -- a different kernel
-        // family, and the measured seed of KNOWN_BUGS #0b lands in exactly this
-        // chain (heads diverges 2-6e-03 while the mHC collapse feeding it is
-        // bit-identical). `QB_WMMA` set explicitly still wins.
-        let qb_variant = std::env::var("QB_WMMA")
-            .unwrap_or_else(|_| if prefill_f32_matvec(b) { "dp4a".into() } else { "f16x".into() });
+        let qb_variant = std::env::var("QB_WMMA").unwrap_or_else(|_| "f16x".into());
         if qb_variant != "f16x" {
             // legacy variants consume the Q8_0 quantization of qr
             de.q8.quantize_input_batched(&de.compute, &mut sd.qr_xq, &mut sd.qr_xscale, &sd.qr_normed, N_LORA_Q, b)?;
@@ -1994,20 +1985,9 @@ impl HeterogeneousEngine {
         // ========================================================
         let _t_kv = de.events.stage("dgpu.kv_chain", &de.compute)?;
         {
-            // Decode uses `de.q8.matvec` here (forward_layer.rs); `matvec_batched`
-            // is its batched twin with identical per-row math, so use it at
-            // verify-sized batches. See the note on `qb_variant` above.
-            if prefill_f32_matvec(b) {
-                let _t = de.events.stage("k.kv_chain.matvec", &de.compute)?;
-                de.q8.matvec_batched(
-                    &de.compute, &mut sd.kv_raw, &dlw.attn_kv.buffer,
-                    &sd.xq_n_embd, &sd.xscale_n_embd, N_HEAD_DIM, N_EMBD, b,
-                )?;
-            } else {
-                let _t = de.events.stage("k.kv_chain.gemm_f16x", &de.compute)?;
-                de.q8_wmma.gemm_f16x(&de.compute, &mut sd.kv_raw, &dlw.attn_kv.buffer, &sd.x16_n_embd,
-                    N_EMBD, N_HEAD_DIM, 1, b, super::batch_scratch::f16_pitch(N_EMBD))?;
-            }
+            let _t = de.events.stage("k.kv_chain.gemm_f16x", &de.compute)?;
+            de.q8_wmma.gemm_f16x(&de.compute, &mut sd.kv_raw, &dlw.attn_kv.buffer, &sd.x16_n_embd,
+                N_EMBD, N_HEAD_DIM, 1, b, super::batch_scratch::f16_pitch(N_EMBD))?;
         }
         {
             let _t = de.events.stage("k.kv_chain.rms_w", &de.compute)?;
@@ -3781,11 +3761,8 @@ impl HeterogeneousEngine {
                     &sd.heads.slice_view(0, Q_FLAT as usize),
                 )?;
             }
-            // At verify-sized batches take DECODE'S kernel: the "dp4a" arm is
-            // `q8_grouped.matvec_grouped_batched`, the batched twin of decode's
-            // `matvec_grouped` (forward_layer.rs). See `qb_variant`.
             let grp_variant = std::env::var("Q8_GROUPED_VARIANT")
-                .unwrap_or_else(|_| if prefill_f32_matvec(b) { "dp4a".into() } else { "f16x".into() });
+                .unwrap_or_else(|_| "f16x".into());
             if grp_variant != "f16x" {
                 de.q8.quantize_input_batched(&de.compute, &mut sd.heads_xq, &mut sd.heads_xscale, &sd.heads, Q_FLAT, b)?;
             }
@@ -3817,10 +3794,7 @@ impl HeterogeneousEngine {
             // (M=N_EMBD=4096, K=OUT_LOW=8192) hits the same s_wait_loadcnt
             // throttle on dp4a; LDS-tiled WMMA wins 6.2× at B=512 isolated
             // (8.82 → 1.42 ms). Q8_OUT_VARIANT=dp4a rolls back.
-            // Same: the "dp4a" arm is `q8.matvec_batched`, decode's kernel with a
-            // row dimension.
-            let out_variant = std::env::var("Q8_OUT_VARIANT")
-                .unwrap_or_else(|_| if prefill_f32_matvec(b) { "dp4a".into() } else { "f16x".into() });
+            let out_variant = std::env::var("Q8_OUT_VARIANT").unwrap_or_else(|_| "f16x".into());
             if out_variant != "f16x" {
                 de.q8.quantize_input_batched(&de.compute, &mut sd.low_xq, &mut sd.low_xscale, &sd.low, OUT_LOW, b)?;
             }
