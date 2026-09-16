@@ -64,6 +64,83 @@ pub const MTP_MARKOV_RANK: usize = 256;
 /// `dspark_noise_token_id`.
 pub const MTP_NOISE_TOKEN: i32 = 128799;
 
+/// HOST-side (enqueue) time inside a drafter layer, in microseconds, accumulated
+/// across every `layer()` call and reported by `take_layer_host_us`.
+///
+/// Why host timers and not `events.stage`: the question here is why the host
+/// spends ~13 ms ENQUEUEING three drafter layers that the iGPU then executes in
+/// ~4 ms (measured, `V41_DSPARK_DRAFT_TIMING=1`). Device stages answer a
+/// different question and are not free -- attaching perfetto was MEASURED to
+/// inflate this engine's per-layer post-MoE time 4.4x and whole-run throughput
+/// 1.40x, so instrumenting an enqueue-cost hunt with HIP events would largely
+/// measure the instrument.
+pub static MTP_H_HCMIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MTP_H_ATTN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MTP_H_MOE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MTP_H_POST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MTP_H_RMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Host time in JUST the per-query score/softmax loop (10 launches/layer), split
+/// out of `MTP_H_ATTN` to tell per-launch overhead from something that blocks.
+pub static MTP_H_ATTNQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MTP_H_ATTNKV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MTP_H_ATTNQA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MTP_H_ATTNO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Host us in the two BLOCKING `copy_from_host` calls (slots/poss, 24 bytes each)
+/// at the top of the drafter's KV section. If a 48-byte H2D costs milliseconds it
+/// is not the copy -- a blocking `hipMemcpy` serialises against blocking streams,
+/// so it is draining whatever the verify left queued on the SHARED igpu.compute.
+pub static MTP_H_KVCOPY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn mtp_host_timing() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_DSPARK_LAYER_TIMING").as_deref() == Ok("1"))
+}
+
+struct HostUs(&'static std::sync::atomic::AtomicU64, std::time::Instant, bool);
+impl HostUs {
+    fn start(c: &'static std::sync::atomic::AtomicU64) -> Self {
+        HostUs(c, std::time::Instant::now(), mtp_host_timing())
+    }
+}
+impl Drop for HostUs {
+    fn drop(&mut self) {
+        if self.2 {
+            self.0.fetch_add(
+                self.1.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+/// Drain the per-sub-block host totals: (hc_mixes, rms, attn, moe, hc_post) us.
+pub fn take_layer_host_us() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        MTP_H_HCMIX.swap(0, Relaxed),
+        MTP_H_RMS.swap(0, Relaxed),
+        MTP_H_ATTN.swap(0, Relaxed),
+        MTP_H_MOE.swap(0, Relaxed),
+        MTP_H_POST.swap(0, Relaxed),
+    )
+}
+
+/// (score/softmax loop, kv section, q_a loop, output projection) host us.
+pub fn take_attn_split_us() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        MTP_H_ATTNQ.swap(0, Relaxed),
+        MTP_H_ATTNKV.swap(0, Relaxed),
+        MTP_H_ATTNQA.swap(0, Relaxed),
+        MTP_H_ATTNO.swap(0, Relaxed),
+    )
+}
+
+/// Host us in the blocking slots/poss H2D pair.
+pub fn take_kvcopy_us() -> u64 {
+    MTP_H_KVCOPY.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The drafter's rope parameters.
 ///
 /// `DSparkAttention.forward` opens with `assert self.compress_ratio == 0`, so
@@ -529,26 +606,53 @@ impl MtpState {
         // igpu.compute with "zero device work on any track". Name it like the
         // main model's layers so the two are directly comparable.
         let _t = e.events.stage("mtp.layer", s)?;
-        self.hc_mixes(e, s, &w.hc_attn_fn, &w.hc_attn_scale, &w.hc_attn_base)?;
-        self.hc_pre_and_carry(e, s)?;
-        e.rms_w.launch_weighted_batched(
-            s, &mut self.normed, &self.cur, &w.attn_norm, N_EMBD, RMS_EPS, B,
-        )?;
+        // `V41_DSPARK_LAYER_TIMING=1`: split the layer's HOST (enqueue) time. The
+        // iGPU runs all three drafter layers in ~4 ms while the host takes ~13 ms
+        // to issue them -- ~200 us per launch across only ~21 launches, 20-40x a
+        // normal HIP launch. Nothing in the source explains that yet, so measure
+        // where inside the layer it accrues before theorising.
+        {
+            let _h = HostUs::start(&MTP_H_HCMIX);
+            self.hc_mixes(e, s, &w.hc_attn_fn, &w.hc_attn_scale, &w.hc_attn_base)?;
+            self.hc_pre_and_carry(e, s)?;
+        }
+        {
+            let _h = HostUs::start(&MTP_H_RMS);
+            e.rms_w.launch_weighted_batched(
+                s, &mut self.normed, &self.cur, &w.attn_norm, N_EMBD, RMS_EPS, B,
+            )?;
+        }
         if no_attn() {
             let z = vec![0.0f32; self.attn_out.len()];
             self.attn_out.copy_from_host(&z)?;
         } else {
+            let _h = HostUs::start(&MTP_H_ATTN);
             self.attn(e, s, w, li, rope, pos)?;
         }
-        self.hc_post(e, s, true)?;
+        {
+            let _h = HostUs::start(&MTP_H_POST);
+            self.hc_post(e, s, true)?;
+        }
 
-        self.hc_mixes(e, s, &w.hc_ffn_fn, &w.hc_ffn_scale, &w.hc_ffn_base)?;
-        self.hc_pre_and_carry(e, s)?;
-        e.rms_w.launch_weighted_batched(
-            s, &mut self.normed, &self.cur, &w.ffn_norm, N_EMBD, RMS_EPS, B,
-        )?;
-        self.moe(e, s, w)?;
-        self.hc_post(e, s, false)?;
+        {
+            let _h = HostUs::start(&MTP_H_HCMIX);
+            self.hc_mixes(e, s, &w.hc_ffn_fn, &w.hc_ffn_scale, &w.hc_ffn_base)?;
+            self.hc_pre_and_carry(e, s)?;
+        }
+        {
+            let _h = HostUs::start(&MTP_H_RMS);
+            e.rms_w.launch_weighted_batched(
+                s, &mut self.normed, &self.cur, &w.ffn_norm, N_EMBD, RMS_EPS, B,
+            )?;
+        }
+        {
+            let _h = HostUs::start(&MTP_H_MOE);
+            self.moe(e, s, w)?;
+        }
+        {
+            let _h = HostUs::start(&MTP_H_POST);
+            self.hc_post(e, s, false)?;
+        }
         Ok(())
     }
 
@@ -645,6 +749,7 @@ impl MtpState {
         rope: &crate::RopeParams,
         pos: u32,
     ) -> eyre::Result<()> {
+        let _hkv = HostUs::start(&MTP_H_ATTNKV);
         let (n_valid, main_slot) = self.ring_geom();
         let n_kv = (n_valid + MTP_BLOCK) as u32;
         if n_kv > crate::attention::ATTN_MIXED_MAX_KEYS {
@@ -667,8 +772,11 @@ impl MtpState {
             slots[j + 1] = (n_valid + j) as u32;
             poss[j + 1] = pos + 1 + j as u32;
         }
-        self.slot_dev.copy_from_host(&slots)?;
-        self.pos_dev.copy_from_host(&poss)?;
+        {
+            let _hc = HostUs::start(&MTP_H_KVCOPY);
+            self.slot_dev.copy_from_host(&slots)?;
+            self.pos_dev.copy_from_host(&poss)?;
+        }
         e.fp8.launch_kv_post_fused(
             s, &mut self.kv_normed, &mut self.rings[li], &self.main_kv_raw, &w.kv_a_norm,
             &self.pos_dev.slice_view(0, 1), &self.slot_dev.slice_view(0, 1), N_HEAD_DIM, N_ROT,
@@ -690,7 +798,10 @@ impl MtpState {
             )?;
         }
 
+        drop(_hkv);
+
         // --- queries ---
+        let _hqa = HostUs::start(&MTP_H_ATTNQA);
         for j in 0..MTP_BLOCK {
             // `attn_q_a` is dtype-dispatched, and `dense_matvec` has no batched
             // twin; B is 5, so the loop is cheaper than a new kernel.
@@ -713,6 +824,7 @@ impl MtpState {
         e.q8.matvec_batched(
             s, &mut self.q, &w.attn_q_b.buffer, &self.qr_xq, &self.qr_xscale, Q_FLAT, N_LORA_Q, B,
         )?;
+        drop(_hqa);
         // V4.1 has no per-head q RMSNorm after wq_b (same as the main model).
         let dpos: Vec<i32> = (0..MTP_BLOCK).map(|j| (pos + 1 + j as u32) as i32).collect();
         self.pos_per_b.copy_from_host(&dpos)?;
@@ -727,6 +839,7 @@ impl MtpState {
         // out — `out` is left untouched and attention silently returns zeros.
         // `attention_mixed_score` / `attention_mixed_softmax_wsum` carry no arch
         // guard. B is 5, so the loop costs 10 small launches per layer.
+        let _hq = HostUs::start(&MTP_H_ATTNQ);
         for j in 0..MTP_BLOCK {
             let qj = self.q.slice_view(j * Q_FLAT as usize, Q_FLAT as usize);
             e.attn_mixed.launch_score(
@@ -738,11 +851,13 @@ impl MtpState {
                 N_HEAD_DIM, n_kv, 0,
             )?;
         }
+        drop(_hq);
         e.rope.launch_inverse_batched(
             s, &mut self.heads, &self.pos_per_b, N_HEAD, N_HEAD_DIM, N_ROT, B, rope,
         )?;
 
         // --- output projection: grouped wo_a, then wo_b ---
+        let _ho = HostUs::start(&MTP_H_ATTNO);
         e.q8.quantize_input_batched(
             s, &mut self.heads_xq, &mut self.heads_xscale, &self.heads, Q_FLAT, B,
         )?;

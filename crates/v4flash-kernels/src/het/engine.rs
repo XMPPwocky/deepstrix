@@ -686,11 +686,23 @@ impl HeterogeneousEngine {
             let ms = |a: std::time::Instant, b: std::time::Instant| {
                 format!("{:.2}", (b - a).as_secs_f64() * 1e3)
             };
+            let (hcmix, rms, attn, moe, post) = super::mtp::take_layer_host_us();
             tracing::info!(
                 igpu_enqueue_ms = ms(t0, t_enq),
                 igpu_sync_ms = ms(t_enq, t_sync),
                 h2d_copy_ms = ms(t_sync, t_copy),
                 bytes = (mtp_state.h.len() + mtp_state.pre_carry().len()) * 4,
+                // Host (enqueue) time INSIDE the 3 layers, summed, us.
+                // `V41_DSPARK_LAYER_TIMING=1` or these are all zero.
+                l_hcmix_us = hcmix,
+                l_rms_us = rms,
+                l_attn_us = attn,
+                l_moe_us = moe,
+                l_hcpost_us = post,
+                l_attn_split_us = {
+                    let (q, kv, qa, o) = super::mtp::take_attn_split_us();
+                    format!("qloop={q} kv={kv} qa={qa} outproj={o} kvcopy={}", super::mtp::take_kvcopy_us())
+                },
                 "dspark.draft.split"
             );
         }
