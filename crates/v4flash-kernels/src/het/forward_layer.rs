@@ -721,6 +721,16 @@ impl HeterogeneousEngine {
                     &format!("dec_attn_cur_p{pos}"),
                     &dgpu_scratch.attn_cur,
                 )?;
+                // Counterpart of `pf_pre_residual_p<POS>`: the layer INPUT (the
+                // previous layer's FULL output -- attention AND MoE). `residual`
+                // is not overwritten until `residual_next` is swapped in, so it
+                // still holds the input here. Layer 1's attn_out is clean while
+                // layer 2's attn_cur is not, so the MoE half needs diffing too.
+                super::engine::maybe_dump_subtensor_f32(
+                    layer as usize,
+                    &format!("dec_pre_residual_p{pos}"),
+                    &dgpu_scratch.residual,
+                )?;
             }
         }
 
@@ -811,6 +821,17 @@ impl HeterogeneousEngine {
             )?;
             drop(_s_q);
             _t_q.end()?;
+            // KNOWN_BUGS #0b counterpart of `pf_q_normed_p<POS>`. Dumped after
+            // the q_chain graph closes (synchronising inside a capture closure
+            // 500s the request -- same trap as dec_attn_cur).
+            if super::engine::subtensor_dump_armed(layer as usize) {
+                de.compute.synchronize()?;
+                super::engine::maybe_dump_subtensor_f32(
+                    layer as usize,
+                    &format!("dec_q_normed_p{pos}"),
+                    &dgpu_scratch.q_normed,
+                )?;
+            }
 
             // ============================================================
             // dGPU: KV chain → kv_post_rope → KV cache push

@@ -1977,6 +1977,19 @@ impl HeterogeneousEngine {
                 &dlw.rope_params,
             )?;
         }
+        // KNOWN_BUGS #0b: q_normed is the LAST attention input not yet diffed
+        // against decode. Slots, windows and the SWA kernel are all proven
+        // identical, so if row 0 of this differs from `dec_q_normed_p<POS>` the
+        // bug is in the Q chain (rope position / rms), not in attention.
+        if super::engine::subtensor_dump_armed(layer as usize) {
+            self.dgpu.compute.synchronize()?;
+            let nq = (crate::config::N_HEAD * crate::config::N_HEAD_DIM) as usize;
+            super::engine::maybe_dump_subtensor_f32_view(
+                layer as usize,
+                &format!("pf_q_normed_p{pos0}"),
+                &sd.q_normed.slice_view(0, nq),
+            )?;
+        }
 
         drop(_t_q);
 
