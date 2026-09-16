@@ -130,11 +130,36 @@ residency catch-all then keeps the picks locally instead of shipping them --
 the max(t_box1, t_box2 + rtt) rebalance. The partition should be dynamic
 (phase-aware pool), not a startup constant.
 
+For contrast, box 2 does NOT have this problem: its `--experts` spec and
+placement file are only the INITIAL LOAD, after which `enable_paging()` sets
+`owned = true` on every layer and runs a shard-wide global LRU with no
+per-layer floor. Box 1 is the statically partitioned, non-evicting side (see
+#16), not box 2.
+
 NOTE: the windows are NOT id-indexed. `ensure_layer_union` assigns slots
 "densely by arrival order, not by expert id", so a window holds the DEMANDED
 union. The `slot == id` dense twin refuses on a packed window and is
 unreachable at STRIDE<384. Do not repeat the claim that windows pin "each
 layer's first 128 ids" -- that was wrong.
+
+### 16. OPEN — box 1's decode "LRU" never evicts (fill-once-then-freeze)
+`forward_layer.rs:2331` takes `budget = pg.lru_free_slots()`, and
+`lru_free_slots` (`expert_pager.rs:1538`) counts slots that are **empty**, not
+evictable. So under the T2 catch-all box 1 admits a new expert only while the
+decode LRU still has VIRGIN slots; once it is full `budget == 0` on every
+subsequent call and box 1 never admits another expert for the life of the
+process. Whatever arrived first is frozen in.
+
+This makes the in-tree note "a 1396-slot LRU filled that way was SLOWER than a
+25-slot one (igpu.routed_moe +89%)" a symptom, not a tuning result: a bigger
+frozen cache just locks in a worse set. Contrast box 2, which pages dynamically
+across its whole pool with no per-layer floor (V41_B2_POOL_FLOOR=0) and reaches
+a 96.9% hit rate.
+
+Note the admission GATE itself is correct and wanted: `victim_cache()` (default
+ON, `expert_pager.rs:219`) only admits experts box 2 reported missing
+(`box2_missed`), so box 1 is a victim cache for box 2 rather than a duplicate of
+its hot set. The bug is the freeze, not the gate.
 
 ## Structural / ergonomic
 
