@@ -1505,7 +1505,16 @@ impl ExpertPager {
             self.touch(slot);
             self.remap[id as usize] = -(slot as i32) - 1;
         }
-        self.remap_dev.copy_from_host(&self.remap)?;
+        // Split the blocking H2D out of the rest of `ensure`. With zero misses
+        // this 1536-byte copy is the ONLY device op in the call, and the call
+        // measures ~10.6 ms/layer-lane -- so this timer says whether a tiny
+        // synchronous `hipMemcpy` is stalling on the iGPU's queued MoE work.
+        {
+            let _t = super::forward_prefill::LayerHostTimer::start(
+                &super::forward_prefill::LH_REMAP_H2D,
+            );
+            self.remap_dev.copy_from_host(&self.remap)?;
+        }
         Ok(&self.remap)
     }
 

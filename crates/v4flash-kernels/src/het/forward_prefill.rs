@@ -4107,6 +4107,7 @@ impl HeterogeneousEngine {
                 let sparse_resid = sparse_resid_layer;
                 debug_assert_eq!(sparse_resid, !replay_offload && speculative_append()
                     && !sparse_verify_residency_off());
+                let _t_ensure = LayerHostTimer::start(&LH_ENSURE);
                 if replay_offload {
                     ids.clear();
                 } else if sparse_resid {
@@ -4133,6 +4134,7 @@ impl HeterogeneousEngine {
                 } else {
                     pg.ensure_layer_union(layer as i32, &ids)?;
                 }
+                drop(_t_ensure);
                 if layer_miss_hist() {
                     let d = pg.counters().prefill_misses.saturating_sub(mc0);
                     LAYER_MISS[layer as usize].fetch_add(d, std::sync::atomic::Ordering::Relaxed);
@@ -4146,12 +4148,14 @@ impl HeterogeneousEngine {
                 // `pg.remap_dev` under the shared borrow.
                 if remote_split_on {
                     if let Some(remote) = self.remote.as_ref() {
+                        let _t_owns = LayerHostTimer::start(&LH_OWNS);
                         let owns: Vec<bool> = {
                             let c = remote
                                 .lock()
                                 .map_err(|_| eyre!("remote expert client mutex poisoned"))?;
                             (0..N_EXPERT).map(|e| c.owns(layer as u32, e as i32)).collect()
                         };
+                        drop(_t_owns);
                         let dry = !remote_exclude();
                         if std::env::var("V41_REMOTE_DBG").is_ok() {
                             let n_owned = owns.iter().filter(|&&o| o).count();
@@ -4202,11 +4206,14 @@ impl HeterogeneousEngine {
                         // `mark_remote_after_ensure` is the decode-path twin: it
                         // only TOUCHES the remote entries and leaves the LRU slots
                         // that `ensure` just assigned intact.
+                        let _t_excl = LayerHostTimer::start(&LH_EXCL);
                         if sparse_resid {
                             pg.mark_remote_after_ensure(|e| owns_eff[e as usize])?;
                         } else {
                             pg.set_remote_exclusion(layer as i32, |e| owns_eff[e as usize])?;
                         }
+                        drop(_t_excl);
+                        let _t_audit = LayerHostTimer::start(&LH_AUDIT);
                         // Every routed pick must be computed by EXACTLY ONE device.
                         // Decode has had this check since the catch-all landed
                         // (`forward_layer.rs`); PREFILL has had none, and it is the
@@ -5482,6 +5489,14 @@ pub static LH_ENGRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 pub static LH_PAGER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_SEL_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_REMOTE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Sub-timers INSIDE the pager block. The perfetto trace puts ~15 ms/layer of
+/// host gap there while the iGPU's whole MoE chain is ~150 us and box 2 answers
+/// in ~150 us, so the block's own breakdown is what names the owner.
+pub static LH_ENSURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_OWNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_EXCL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_AUDIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_REMAP_H2D: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn layer_host_timing() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5535,6 +5550,11 @@ pub fn emit_layer_host_timing(tag: &str, layers: usize) {
         pager_ms = format!("{:.1}", pager as f64 / 1000.0),
         sel_sync_ms = format!("{:.1}", sel_sync as f64 / 1000.0),
         remote_ms = format!("{:.1}", remote as f64 / 1000.0),
+        ensure_ms = format!("{:.1}", LH_ENSURE.swap(0, Relaxed) as f64 / 1000.0),
+        owns_ms = format!("{:.1}", LH_OWNS.swap(0, Relaxed) as f64 / 1000.0),
+        excl_ms = format!("{:.1}", LH_EXCL.swap(0, Relaxed) as f64 / 1000.0),
+        audit_ms = format!("{:.1}", LH_AUDIT.swap(0, Relaxed) as f64 / 1000.0),
+        remap_h2d_ms = format!("{:.1}", LH_REMAP_H2D.swap(0, Relaxed) as f64 / 1000.0),
         "prefill.layer_host"
     );
 }
