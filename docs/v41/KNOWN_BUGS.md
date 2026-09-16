@@ -10,7 +10,32 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Silent wrongness
 
-### 0b. OPEN — DSpark accept produces DEGENERATE output on long prompts
+### 0b. OPEN — **the VERIFY path differs from DECODE by ~2.2 nats** (not precision)
+QUANTIFIED 2026-09-16 with the in-tree cross-check
+(`V41_VERIFY_PROBE=6,6 V41_VERIFY_BATCHED=1` -> `dspark.xcheck`), 648-token
+prompt, deterministic split, box 2 fixed:
+
+    verify vs decode, f32 matvecs : agree 62/111 (55.9%)  cos 0.778  KLD 2.21 nats
+    verify vs decode, all-WMMA    : agree 66/111 (59.5%)  cos 0.781  KLD 2.06 nats
+
+    for scale: decode vs CPU ORACLE = 7.52e-04 nats
+
+So the verify is ~3000x further from decode than decode is from the fp32
+reference, and disagrees outright on ~42% of positions. **This is structural,
+not numeric** -- the f16->f32 matvec fixes moved accept rate a lot (E 2.185 ->
+3.077) but barely moved this (2.06 -> 2.21), so precision was a second-order
+term on top of a path computing something different.
+
+DSpark cannot emit correct tokens at any speed until this closes. Decode is the
+right reference to iterate against (it is near-exact vs the oracle), so no CPU
+oracle is needed in the loop -- just drive `dspark.xcheck` KLD toward ~0.
+
+Candidates not yet separated: the speculative KV append's window addressing
+(`SpeculativeAppend`, the raw_off slide), the compressor rollback, CED mode
+(the verify runs `last_only=false` => `CedMode::Exact` while decode does not),
+and the batched prefill attention at B=6 generally.
+
+Earlier framing (still true, now explained):
 Now cleanly reproducible, and no longer maskable as noise (#0 is fixed, runs are
 bit-identical). Same box 2, same 648-token prompt, same config, temp 0:
 
