@@ -69,6 +69,36 @@ Routing then follows residency, as it already does:
   2's hot set -- that is what the victim gate exists to prevent) is what buys
   coverage.
 
+## What this can and cannot buy — READ BEFORE BUILDING
+
+The capacity wall is MEASURED and post-fix
+(`docs/v41/DECODE_CAPACITY_WALL.md`, memory
+`project_v41_decode_capacity_wall_2026-09-14`):
+
+    40 x 384 x 19.25 MB = 288.8 GB of experts  vs  96 + 128 = 224 GB of RAM
+
+The two boxes CANNOT hold the expert set at Q8_K. Some picks always come off
+disk at ~9.5 ms and **no cache policy changes that**. The same writeup prices
+the global-pool change at **~30 ms/token, "not a transformation"**, and puts
+all-resident decode at 0.65 ms/layer x 40 = 26 ms/token = **25-33 tok/s**,
+i.e. the 20 tok/s goal is reachable ONLY all-resident, which needs
+12.6-13.3 MB/expert = 5.6-5.9 bits/wt (Q5_K fits, Q6_K does not).
+
+So: **this rework is a real but bounded win (~30 ms/token), not the path to
+20 tok/s.** Its value is removing the three defects above -- 66% of box 1
+withheld from decode, a decode cache that never evicts, and inverted tiering --
+which are pure waste on top of the capacity wall. Do not oversell it, and do
+not let it substitute for the format decision.
+
+**Beware `project_v41_expert_placement_2026-09-13`**: it claims 14.8 tok/s with
+ZERO misses and a "~7-8k pair working set that both boxes together hold". That
+file is stamped INVALIDATED -- every number in it was taken while the submit
+mask silently dropped 77% of routed experts, which would make any measured
+working set far too SMALL. Do not size this design from it. The post-fix view
+is that the steady working set is effectively the whole 15,360-pair corpus,
+consistent with the measured cross-domain coverage collapse (a table fit on
+prose covers only 35.2% of CODE picks).
+
 ## Constraints to respect
 
 - Box 1 pool at 86 GB OOMs (`hipErrorOutOfMemory`); 78 GB is near the ceiling
