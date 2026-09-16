@@ -1916,7 +1916,16 @@ impl HeterogeneousEngine {
         // at B=512: dp4a 8.82ms / wmma_old 4.24ms / wmma_lds_tiled 1.38ms
         // → 6.4× over dp4a, 3.1× over the older WMMA. Q_FLAT % 64 == 0 ✓.
         // QB_WMMA=wmma forces the older non-tiled WMMA; QB_WMMA=0 forces dp4a.
-        let qb_variant = std::env::var("QB_WMMA").unwrap_or_else(|_| "f16x".into());
+        // At verify-sized batches take DECODE'S kernel, so the verify reproduces
+        // decode instead of a different kernel family. Re-applies 925fcee/c60a172,
+        // whose revert (16ec20a) blamed the alignment for an accept-rate drop
+        // 1.788 -> 1.372; that drop was the UNGUARDED KV arm below feeding
+        // `matvec_batched` an `xq_n_embd` nothing on the prefill path ever writes,
+        // and the KLD it was scored against (2.026 -> 1.631 nats) was measured
+        // through #0b. `QB_WMMA` / `Q8_GROUPED_VARIANT` / `Q8_OUT_VARIANT` set
+        // explicitly still win.
+        let qb_variant = std::env::var("QB_WMMA")
+            .unwrap_or_else(|_| if prefill_f32_matvec(b) { "dp4a".into() } else { "f16x".into() });
         if qb_variant != "f16x" {
             // legacy variants consume the Q8_0 quantization of qr
             de.q8.quantize_input_batched(&de.compute, &mut sd.qr_xq, &mut sd.qr_xscale, &sd.qr_normed, N_LORA_Q, b)?;
@@ -1998,9 +2007,34 @@ impl HeterogeneousEngine {
         // ========================================================
         let _t_kv = de.events.stage("dgpu.kv_chain", &de.compute)?;
         {
-            let _t = de.events.stage("k.kv_chain.gemm_f16x", &de.compute)?;
-            de.q8_wmma.gemm_f16x(&de.compute, &mut sd.kv_raw, &dlw.attn_kv.buffer, &sd.x16_n_embd,
-                N_EMBD, N_HEAD_DIM, 1, b, super::batch_scratch::f16_pitch(N_EMBD))?;
+            // Decode uses `de.q8.matvec` here (forward_layer.rs:771), preceded at
+            // :759 by quantizing `attn_input_norm` into xq_n_embd/xscale_n_embd.
+            // `matvec_batched` is that kernel with a row dimension.
+            //
+            // THE QUANTIZE IS THE WHOLE POINT. 925fcee replaced this inline with
+            // `matvec_batched(&sd.xq_n_embd, &sd.xscale_n_embd, ..)` and no
+            // quantize -- and NOTHING on the prefill path writes those buffers
+            // (every writer targets `dgpu_scratch`, i.e. decode). It fed the KV
+            // projection uninitialised quantisation state, which is what actually
+            // cost the accept rate that got the alignment reverted. Every other
+            // variant site here guards its own quantize the same way
+            // (`if variant != "f16x" { quantize_input_batched(..) }`); this one
+            // had no such guard because it was not a variant flip.
+            if prefill_f32_matvec(b) {
+                de.q8.quantize_input_batched(
+                    &de.compute, &mut sd.xq_n_embd, &mut sd.xscale_n_embd,
+                    &sd.attn_input_norm, N_EMBD, b,
+                )?;
+                let _t = de.events.stage("k.kv_chain.matvec", &de.compute)?;
+                de.q8.matvec_batched(
+                    &de.compute, &mut sd.kv_raw, &dlw.attn_kv.buffer,
+                    &sd.xq_n_embd, &sd.xscale_n_embd, N_HEAD_DIM, N_EMBD, b,
+                )?;
+            } else {
+                let _t = de.events.stage("k.kv_chain.gemm_f16x", &de.compute)?;
+                de.q8_wmma.gemm_f16x(&de.compute, &mut sd.kv_raw, &dlw.attn_kv.buffer, &sd.x16_n_embd,
+                    N_EMBD, N_HEAD_DIM, 1, b, super::batch_scratch::f16_pitch(N_EMBD))?;
+            }
         }
         {
             let _t = de.events.stage("k.kv_chain.rms_w", &de.compute)?;
@@ -3782,8 +3816,12 @@ impl HeterogeneousEngine {
                     &sd.heads.slice_view(0, Q_FLAT as usize),
                 )?;
             }
+// Same as `qb_variant`: the "dp4a" arm is
+            // `q8_grouped.matvec_grouped_batched`, the batched twin of decode's
+            // `matvec_grouped`. Guarded quantize at the branch above writes
+            // heads_xq/heads_xscale, so this arm has its input.
             let grp_variant = std::env::var("Q8_GROUPED_VARIANT")
-                .unwrap_or_else(|_| "f16x".into());
+                .unwrap_or_else(|_| if prefill_f32_matvec(b) { "dp4a".into() } else { "f16x".into() });
             if grp_variant != "f16x" {
                 de.q8.quantize_input_batched(&de.compute, &mut sd.heads_xq, &mut sd.heads_xscale, &sd.heads, Q_FLAT, b)?;
             }
@@ -3815,7 +3853,10 @@ impl HeterogeneousEngine {
             // (M=N_EMBD=4096, K=OUT_LOW=8192) hits the same s_wait_loadcnt
             // throttle on dp4a; LDS-tiled WMMA wins 6.2× at B=512 isolated
             // (8.82 → 1.42 ms). Q8_OUT_VARIANT=dp4a rolls back.
-            let out_variant = std::env::var("Q8_OUT_VARIANT").unwrap_or_else(|_| "f16x".into());
+            // Same: the "dp4a" arm is `q8.matvec_batched`, decode's kernel with a
+            // row dimension. The guarded quantize below writes low_xq/low_xscale.
+            let out_variant = std::env::var("Q8_OUT_VARIANT")
+                .unwrap_or_else(|_| if prefill_f32_matvec(b) { "dp4a".into() } else { "f16x".into() });
             if out_variant != "f16x" {
                 de.q8.quantize_input_batched(&de.compute, &mut sd.low_xq, &mut sd.low_xscale, &sd.low, OUT_LOW, b)?;
             }
