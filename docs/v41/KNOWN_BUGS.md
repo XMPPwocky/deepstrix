@@ -10,8 +10,37 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Silent wrongness
 
-### 1. RESOLVED (2026-09-16) — NOT a pager bug; it was mode-1 history dependence
-**RESOLUTION.** Under the DETERMINISTIC split (`V41_T2_CATCHALL=2`) the output
+### 1. OPEN — temp-0 output depends on `V41_PAGER_WINDOWS` on LONG prompts
+**PARTIAL RESOLUTION, THEN REOPENED (2026-09-16).** The "resolved" claim below
+held only for a SHORT prompt and is WRONG in general. With a ~648-token prompt,
+still under the deterministic split, geometry changes the output again:
+
+    LONG prompt, catchall=2, two-lane prefill
+      WINDOWS=21 -> sha 328d5151f9de
+      WINDOWS=4  -> sha 2a27d105ff60      DIFFERENT
+
+So f32 re-association from a residency-driven split does NOT explain it. A short
+prompt is a single chunk; a long one is multi-chunk and TWO-LANE, which is the
+discriminator.
+
+**Leading hypothesis (from the architecture review, not yet confirmed):** the
+prefill steady state is `post_A(L), pre_A(L+1), post_B(L), pre_B(L+1)`
+(`forward_prefill.rs:731-760`), so `ensure_layer_union(L+1)` for lane A runs on
+the host BEFORE lane B's layer-L MoE has been waited on. When `window_of(L)` ==
+`window_of(L+1)` the union path clears `slot_key` for the whole window and
+reassigns from `next_free = 0` (`expert_pager.rs:988-996`), overwriting bytes
+lane B's queued kernels will read AND the single shared `remap_dev`. Both
+survive only on an accidental null-stream drain. The failure is MONOTONE IN
+WINDOW COUNT exactly as observed (more windows -> fewer L/L+1 collisions;
+WINDOWS=1 -> all 40 layers in one window -> garbage).
+
+**Decisive test:** single-lane prefill (`V41_PREFILL_SINGLE_LANE_MAX` large) at
+two geometries. If the shas then agree, the lane race is the cause.
+
+The short-prompt observation below is still true and still useful, but it is NOT
+a resolution.
+
+Under the DETERMINISTIC split (`V41_T2_CATCHALL=2`) SHORT-prompt output
 is geometry-INDEPENDENT. Same prompt, temp 0, 648-token prompt:
 
     catchall=2, WINDOWS=21 -> sha 0a9a37457b53   167 ms/tok   6.00 tok/s
