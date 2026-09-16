@@ -3271,6 +3271,17 @@ fn finish_decode(
                 }
             }
             let t_argmax = t_step.elapsed();
+            // Attribute the ACCEPT verify's per-layer host time, not just the
+            // probe's. The perfetto trace puts ~15.2 ms/layer of host gap
+            // between `k.shared_expert.down_matvec` and `k.ffn_combine.vec_add`
+            // with no device work in it (both GPUs <13% busy, box 2 0.4%), so
+            // this breakdown -- sel_sync / pager / pre_moe / post_moe / remote --
+            // is what says WHICH host step owns it. Costs nothing unless
+            // `V41_LAYER_HOST_TIMING=1`.
+            v4flash_kernels::het::forward_prefill::emit_layer_host_timing(
+                "accept",
+                v4flash_kernels::config::N_LAYER as usize,
+            );
             // KV must keep `next` plus the n accepted drafts and drop the rest.
             // `KvMark` is per-layer `(n_raw, raw_off)`, so a PARTIAL rollback is
             // just the mark advanced by the number of rows kept.
