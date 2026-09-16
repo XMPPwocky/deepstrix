@@ -554,6 +554,48 @@ impl MtpState {
         Ok(())
     }
 
+    /// Ring-write-ONLY: advance the drafter's KV ring by one MAIN position using
+    /// `main_hidden` (the main model's residual at `pos`), WITHOUT drafting a
+    /// block. The cheap primitive the tech report's SWA replay implies — for
+    /// prefill window seeding and dense accept-mode ring maintenance. Costs one
+    /// entry + one `attn_kv` matvec per layer + the ring write; no embed, no
+    /// block query/attention/MoE, no exit.
+    pub fn advance_ring(
+        &mut self,
+        e: &DeviceEngine,
+        s: &Stream,
+        w: &MtpWeights,
+        rope: &crate::RopeParams,
+        pos: u32,
+        main_hidden: &[f32],
+    ) -> eyre::Result<()> {
+        if pos == 0 {
+            return Err(eyre!("mtp advance_ring: pos 0 is prefill-seed only"));
+        }
+        self.inject_main_hidden(main_hidden)?;
+        self.entry(e, s, w)?;
+        let (_, main_slot) = self.ring_geom();
+        self.slot_dev.slice_view_mut(0, 1).copy_from_host(&[main_slot as u32])?;
+        self.pos_dev.slice_view_mut(0, 1).copy_from_host(&[pos])?;
+        // self.x (entry output) is the same KV source for every layer; quantise once.
+        e.q8
+            .quantize_input(s, &mut self.main_xq, &mut self.main_xscale, &self.x, N_EMBD)?;
+        for li in 0..w.layers.len() {
+            let lw = &w.layers[li];
+            e.q8.matvec(
+                s, &mut self.main_kv_raw, &lw.attn_kv.buffer, &self.main_xq, &self.main_xscale,
+                N_HEAD_DIM, N_EMBD,
+            )?;
+            e.fp8.launch_kv_post_fused(
+                s, &mut self.kv_normed, &mut self.rings[li], &self.main_kv_raw, &lw.kv_a_norm,
+                &self.pos_dev.slice_view(0, 1), &self.slot_dev.slice_view(0, 1), N_HEAD_DIM, N_ROT,
+                RMS_EPS, rope,
+            )?;
+        }
+        self.ring_writes += 1;
+        Ok(())
+    }
+
     /// One drafter layer's attention.
     ///
     /// Mirrors `DSparkAttention.forward(x, start_pos, main_x)`:

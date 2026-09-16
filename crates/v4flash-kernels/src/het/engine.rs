@@ -617,6 +617,21 @@ impl HeterogeneousEngine {
     /// sampled FROM that forward, which sits at `pos + 1`. The returned drafts
     /// are therefore predictions for positions `pos + 2 ..= pos + 1 + MTP_BLOCK`.
     #[allow(clippy::too_many_arguments)]
+    /// Ring-write-only drafter advance (see `MtpState::advance_ring`): populate
+    /// the drafter's KV ring at `pos` from `main_hidden` without drafting.
+    pub fn dspark_advance_ring(
+        &self,
+        mtp_state: &mut super::mtp::MtpState,
+        w: &super::weights::MtpWeights,
+        pos: u32,
+        main_hidden: &[f32],
+    ) -> color_eyre::eyre::Result<()> {
+        self.set_current_cached(self.igpu.device)?;
+        mtp_state.advance_ring(&self.igpu, &self.igpu.compute, w, &super::mtp::mtp_rope(), pos, main_hidden)?;
+        self.igpu.compute.synchronize()?;
+        Ok(())
+    }
+
     pub fn dspark_draft(
         &self,
         mtp_state: &mut super::mtp::MtpState,

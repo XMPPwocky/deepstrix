@@ -3308,14 +3308,10 @@ fn finish_decode(
                         let o = sl * cap * ne + r * ne;
                         mh.extend_from_slice(&whole[o..o + ne]);
                     }
-                    let tok_at_p1 = drafts[r]; // token at position (pos+r)+1
-                    let mut tr = vec![0.0f32; v4flash_kernels::config::HC_DIM as usize];
-                    embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, tok_at_p1, &mut tr);
                     let m = state.mtp.as_mut().expect("mtp");
-                    let _ = state.engine.dspark_draft(
-                        &mut m.state, &mut m.exit, &mh, &m.w, &m.xw, &state.weights,
-                        &m.markov_embd, m.markov_dtype, pos + r as u32, &tr, &m.noise_row, tok_at_p1,
-                    )?;
+                    // Cheap ring-write-only (no discarded block draft): the
+                    // drafter's residual at pos+r is mtp_src row r.
+                    state.engine.dspark_advance_ring(&mut m.state, &m.w, pos + r as u32, &mh)?;
                 }
             }
 
