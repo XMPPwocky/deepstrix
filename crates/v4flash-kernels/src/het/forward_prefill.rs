@@ -4491,6 +4491,21 @@ impl HeterogeneousEngine {
                     // `ensure` maps arbitrary experts to arbitrary pool slots via
                     // `slot_of` and fills the same `remap_dev` the het-split builder
                     // already indexes through, so the MoE kernels are unchanged.
+                    // #0b ROOT-CAUSE TEST (V41_SPARSE_REMAP_SYNC=1).
+                    //
+                    // `remap_dev` is ONE buffer shared by all 40 layers, and
+                    // `ensure` re-uploads it per layer. The WINDOW path never
+                    // writes remap (ensure_layer_dense/_union leave the identity
+                    // self-map -(e)-1, the same for every layer), so a re-upload
+                    // is a no-op there. The SPARSE path writes PER-LAYER LRU
+                    // slots -- so if the host reaches layer L+1's ensure while
+                    // layer L's MoE is still queued, layer L's kernel reads
+                    // L+1's remap: right expert ids, wrong weights, no error.
+                    // That asymmetry is exactly why only the sparse view breaks.
+                    if std::env::var("V41_SPARSE_REMAP_SYNC").as_deref() == Ok("1") {
+                        self.igpu.compute.synchronize()?;
+                        self.dgpu.compute.synchronize()?;
+                    }
                     pg.ensure(layer as i32, &ids)?;
                 } else if ids.len() * 10 >= N_EXPERT as usize * 9 {
                     pg.ensure_layer_dense(layer as i32)?;
