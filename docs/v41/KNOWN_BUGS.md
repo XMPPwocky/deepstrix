@@ -32,9 +32,28 @@ attention chain to decode's kernel moved it 69 -> 71/111 and cut KLD 2.026 ->
 primitives (`V41_VERIFY_DECODE_PATH=1`) did not help either: still degenerate,
 E 1.073.
 
-So the residual is NOT simply kernel-family mismatch. Next place to look is the
-accept machinery itself -- the speculative KV append and its rollback across the
-batch, and whether row 0's attention sees exactly the KV decode would see.
+So the residual is NOT simply kernel-family mismatch.
+
+**Ruled out: the speculative KV append/rollback.** With `V41_PROBE_FPRINT=1`,
+111 of 111 probes report "probe rollback restored all components" and zero
+report a failure. The probe is transparent, decode is not corrupted by the
+verify running before it, and the row-0 disagreement is genuinely the verify
+computing different logits.
+
+**Everything ruled out so far for the row-0 disagreement:** batching (B=1 alone
+diverges 2.026 nats; B=1->6 adds only 0.2), prompt length (same ~61% agreement
+at 33 and 647 tokens), the mHC carry, the indexer, CED, box 2's batched
+down/reduce (6%), the mHC mix (now bit-identical), every matvec/projection in
+the attention chain (~20% total, and the projection half regresses E), the
+KV append/rollback (fingerprint-clean), and running the verify on decode
+primitives (`V41_VERIFY_DECODE_PATH=1`, still degenerate at E 1.073).
+
+What remains, per the per-layer bisection (`938ebba`): the attention kernels
+themselves. `heads` diverges 2-6e-03 while the mHC collapse feeding it is
+bit-identical, and that divergence GROWS with position (2.2e-03 at pos 42 ->
+5.8e-03 at pos 45), i.e. it scales with the KV window. Decode uses
+B=1-specialised score/smwsum; prefill uses batched per-row windows. Compare
+those two directly -- what each attends over, and in what order it reduces.
 
 ## Methodology warning
 
