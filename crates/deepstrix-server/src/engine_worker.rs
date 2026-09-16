@@ -3328,7 +3328,13 @@ fn finish_decode(
             // the drafter over each accepted position first (its residual is in
             // mtp_src row r; the token AT p+1 is the accepted draft), so the ring
             // is dense like shadow's. The intermediate drafts are discarded.
-            if std::env::var("V41_DSPARK_DENSE_RING").as_deref() == Ok("1") && n > 0 {
+            //
+            // DEFAULT ON since 2026-09-16. Back-to-back at the current defaults
+            // (pool 78 GB, floor 0, sparse verify residency), 120 tokens:
+            //     off: 2.22 tok/s  E 2.380  (50 steps)
+            //     on:  2.33 tok/s  E 2.553  (47 steps)
+            // `V41_DSPARK_DENSE_RING=0` rolls it back.
+            if std::env::var("V41_DSPARK_DENSE_RING").as_deref() != Ok("0") && n > 0 {
                 for r in 0..n {
                     let mut mh = Vec::with_capacity(nsrc * ne);
                     for sl in 0..nsrc {
