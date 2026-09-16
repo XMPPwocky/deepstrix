@@ -1617,6 +1617,20 @@ impl HeterogeneousEngine {
                 }
             }
         }
+        // Sub-tensor dump, row 0 only, SAME tags as decode's
+        // (`engine.rs`, forward_token_impl). Decode has had this since the ds4
+        // port; prefill never did, so there was no way to bisect a
+        // prefill-vs-decode divergence to a layer or a kernel. Armed by
+        // DEEPSTRIX_DUMP_SUBTENSOR_LAYERS + _DIR, no cost otherwise.
+        if super::engine::subtensor_dump_armed(layer as usize) {
+            self.dgpu.compute.synchronize()?;
+            let hc = HC_DIM as usize;
+            let ne = crate::config::N_EMBD as usize;
+            super::engine::maybe_dump_subtensor_f32_view(
+                layer as usize, "pf_pre_residual", &bd.residual.slice_view(0, hc))?;
+            super::engine::maybe_dump_subtensor_f32_view(
+                layer as usize, "pf_attn_input_norm", &sd.attn_input_norm.slice_view(0, ne))?;
+        }
         if ilw.layer_idx != layer {
             return Err(eyre!(
                 "forward_layer_pre_moe_v2: dgpu L{} != igpu L{}",

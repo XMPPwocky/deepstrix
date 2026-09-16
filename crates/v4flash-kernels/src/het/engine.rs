@@ -1838,6 +1838,22 @@ fn subtensor_dump_spec() -> &'static Option<(Vec<usize>, String)> {
     })
 }
 
+/// Is the sub-tensor dump armed for `layer`? Lets the batched prefill path skip
+/// its device sync entirely when dumping is off.
+pub(super) fn subtensor_dump_armed(layer: usize) -> bool {
+    matches!(subtensor_dump_spec(), Some((layers, _)) if layers.contains(&layer))
+}
+
+/// `maybe_dump_subtensor_f32` for a VIEW (the batched path dumps row 0 of a
+/// `[B, ...]` scratch buffer, not a whole buffer).
+pub(super) fn maybe_dump_subtensor_f32_view(
+    layer: usize,
+    tag: &str,
+    buf: &v4flash_hip::DeviceBuffer<f32>,
+) -> eyre::Result<()> {
+    maybe_dump_subtensor_f32(layer, tag, buf)
+}
+
 pub(super) fn maybe_dump_subtensor_f32(
     layer: usize,
     tag: &str,
