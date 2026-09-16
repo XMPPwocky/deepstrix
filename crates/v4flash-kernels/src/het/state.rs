@@ -352,6 +352,34 @@ impl HetModelState {
     /// (V4.1 reuse layers), moving it back afterwards. A no-op wrapper when the
     /// layer owns its store. The forward skips the compressor stage for a layer
     /// without compressor *weights* and only reads the store.
+    /// Restore the "every compressor lives at its KV-source layer" invariant.
+    ///
+    /// The steady-state loops in `forward_prefill` and `engine` lend a source
+    /// layer's compressor store to its V4.1 reuse layer at the top of an
+    /// iteration and hand it back at the bottom. That manual pair is NOT
+    /// exception-safe: any `?` in between leaves the store parked on the reuse
+    /// layer with `layers[src].compressor == None`, and then EVERY later request
+    /// fails with "L{src}: missing compressor state". One real error becomes a
+    /// permanent one, and the reported layer is not the one that broke — which
+    /// is exactly how a dropped-pick error at L18 surfaced as "L14: missing
+    /// compressor state". (`with_kv_source` below gets this right by construction.)
+    ///
+    /// Called at forward entry, where the invariant must hold. 40 Option moves,
+    /// no device work.
+    pub fn restore_compressor_lending(&mut self) {
+        for layer in 0..self.layers.len() {
+            let Some(src) = crate::config::kv_source_of(layer) else {
+                continue;
+            };
+            if self.layers[src].compressor.is_none()
+                && self.layers[layer].compressor.is_some()
+            {
+                let st = self.layers[layer].compressor.take();
+                self.layers[src].compressor = st;
+            }
+        }
+    }
+
     pub fn with_kv_source<R>(
         &mut self,
         layer: usize,

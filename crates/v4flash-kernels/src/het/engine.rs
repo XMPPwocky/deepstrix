@@ -731,6 +731,10 @@ impl HeterogeneousEngine {
         use crate::config::{HC_DIM, N_EXPERT, N_LAYER};
         use tracing::debug_span;
 
+        // A previous request that errored between a compressor lend and its
+        // hand-back leaves the store on the reuse layer. Repair before we read it.
+        state.restore_compressor_lending();
+
         if input_hc_host.len() != HC_DIM as usize {
             return Err(color_eyre::eyre::eyre!(
                 "input_hc_host len {} != HC_DIM {}",

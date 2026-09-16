@@ -501,6 +501,10 @@ impl HeterogeneousEngine {
         ced: CedMode,
         seed_carry: Option<&[Vec<f32>]>,
     ) -> eyre::Result<usize> {
+        // Same repair as `forward_token_impl`: the steady-state loop below lends
+        // each KV-source layer's compressor to its reuse layer and hands it back
+        // at the bottom of the iteration, and any `?` in between leaks it.
+        state.restore_compressor_lending();
         let b = tokens.len();
         if b == 0 {
             return Ok(0);
@@ -3447,7 +3451,22 @@ impl HeterogeneousEngine {
         // place; `KvMark::advanced_by` slides the window pointer, and decode's
         // own wrap path compacts later when the append region fills.
         if speculative_append() {
-            ls.n_raw = n_raw_during_chunk;
+            // Keep the SWA invariant even before the caller's rollback: the
+            // appended speculative rows live past the window in the oversized
+            // cache, but `n_raw` is what the NEXT attention reads, and leaving it
+            // at n_raw_before + B (e.g. 134) trips
+            // "attention_swa: n_kv=134 exceeds kernel cap 128". The caller's
+            // `KvMark::advanced_by` recomputes the real window from the mark.
+            // SLIDE, don't just clamp. The appended rows sit at
+            // [raw_off+n_raw_before, raw_off+n_raw_during_chunk); the live window
+            // must be the LAST min(total, SWA_WINDOW) rows ending at the newest
+            // one. Clamping n_raw alone left raw_off pointing at the OLDEST 128
+            // rows — the newest rows fell outside the window, which is what threw
+            // "L8: missing compressor state". Same formula as
+            // `KvMark::advanced_by`, so the caller's rollback agrees.
+            let end = ls.raw_off + n_raw_during_chunk;
+            ls.n_raw = end.min(SWA_WINDOW);
+            ls.raw_off = end - ls.n_raw;
         } else if n_raw_during_chunk > SWA_WINDOW {
             let src_first_slot = n_raw_during_chunk - SWA_WINDOW;
             let head_dim = N_HEAD_DIM as usize;
@@ -4073,8 +4092,33 @@ impl HeterogeneousEngine {
                 let replay_offload = replay_offload_enabled()
                     && remote_split_on
                     && (layer as usize) >= crate::config::CED_DECODER_START;
+                // Paired with the exclusion builder below: the SPARSE LRU and
+                // `set_remote_exclusion` are incompatible (see there), so the two
+                // decisions must be made from ONE predicate.
+                let sparse_resid = !replay_offload
+                    && speculative_append()
+                    && !sparse_verify_residency_off();
                 if replay_offload {
                     ids.clear();
+                } else if sparse_resid {
+                    // SPECULATIVE VERIFY: use the SPARSE decode-LRU residency, not
+                    // prefill's dense windows.
+                    //
+                    // Prefill needs `slot == expert id` inside a contiguous
+                    // N_EXPERT window, so ONE LAYER occupies one window and only
+                    // `dense_windows` layers are resident at once. A B=6 verify
+                    // picks ~18 DISTINCT experts per layer — it does not need 384
+                    // slots — but inheriting the dense pager made all 40 layers
+                    // thrash the windows (prefill_misses ~4924/run) even while box
+                    // 1's decode LRU sat at 2201 slots with ~0 misses that the
+                    // verify could not touch. That is why the T2 catch-all (hand
+                    // EVERYTHING to box 2) won, leaving box 1's iGPU idle through
+                    // every verify.
+                    //
+                    // `ensure` maps arbitrary experts to arbitrary pool slots via
+                    // `slot_of` and fills the same `remap_dev` the het-split builder
+                    // already indexes through, so the MoE kernels are unchanged.
+                    pg.ensure(layer as i32, &ids)?;
                 } else if ids.len() * 10 >= N_EXPERT as usize * 9 {
                     pg.ensure_layer_dense(layer as i32)?;
                 } else {
@@ -4136,7 +4180,24 @@ impl HeterogeneousEngine {
                                 })
                                 .collect();
                         }
-                        pg.set_remote_exclusion(layer as i32, |e| owns_eff[e as usize])?;
+                        // The exclusion builder MUST match the allocator above.
+                        // `set_remote_exclusion` rebuilds the whole remap from
+                        // `window_of(layer)`, which is only valid for the DENSE
+                        // window where slot == expert id. Under the sparse LRU an
+                        // expert's slot is anywhere in the pool, so that rebuild
+                        // stamps 0 ("not ours") over every LRU assignment outside
+                        // the layer's nominal window — and since box 2 does not own
+                        // those either, the picks are computed by NOBODY. That is
+                        // exactly what `verify_routing_exactly_once` caught:
+                        //   L18 expert 251: computed by 0 devices, remap[251]=0.
+                        // `mark_remote_after_ensure` is the decode-path twin: it
+                        // only TOUCHES the remote entries and leaves the LRU slots
+                        // that `ensure` just assigned intact.
+                        if sparse_resid {
+                            pg.mark_remote_after_ensure(|e| owns_eff[e as usize])?;
+                        } else {
+                            pg.set_remote_exclusion(layer as i32, |e| owns_eff[e as usize])?;
+                        }
                         // Every routed pick must be computed by EXACTLY ONE device.
                         // Decode has had this check since the catch-all landed
                         // (`forward_layer.rs`); PREFILL has had none, and it is the
@@ -5534,6 +5595,15 @@ impl Drop for SpeculativeAppend {
     fn drop(&mut self) {
         SPECULATIVE_APPEND.store(false, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// `V41_SPARSE_VERIFY_RESIDENCY=0` reverts the verify to prefill's dense-window
+/// pager (see the call site).
+pub fn sparse_verify_residency_off() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_SPARSE_VERIFY_RESIDENCY").as_deref() == Ok("0")
+    });
+    *B
 }
 
 /// `V41_GROUP_AUDIT=1`: verify the het-split builder enqueued every local pick.
