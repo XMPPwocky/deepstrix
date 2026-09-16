@@ -29,7 +29,43 @@ so not attention/KV, which would scale with context. Spread over 20380/20480
 channels and all four HC copies (copy 2 is 10x cleaner than the rest), so not a
 few wrong experts or a slot bug -- it is the same math from a DIFFERENT KERNEL.
 
-**Mechanism:** the two paths compute `hc_mixes` with different kernels.
+**ROOT CAUSE (2026-09-16): the verify is built on the PREFILL path, and that
+path uses a different kernel family from decode at EVERY stage.**
+
+`docs/v41/DECODE_M8_PLAN.md:102` already concluded this architecturally --
+"verify forward MUST be built from DECODE primitives ... forward_verify_batch(B
+<= 6) = the decode chain with a row dimension" -- but the verify was built on
+`forward_prefill_pipelined` anyway. The batched path was optimised with WMMA
+GEMMs throughout while decode kept `matvec`, so the verify cannot reproduce
+decode, which is the one property DSpark requires.
+
+Sites found so far (decode kernel -> prefill kernel):
+
+    mHC pre_attn/pre_ffn  matvec_pre_scaled      -> gemm_batched_wmma  FIXED 21cb203,1fa5c35
+    MoE gate              matvec                 -> gemm_batched_wmma  FIXED 5b51bcd
+    compressor kv/score   matvec                 -> gemm_batched_wmma  FIXED e63fd08
+    indexer index_k/q     matvec                 -> gemm_batched_wmma  FIXED e63fd08
+    Q projection (q_b)    q8.matvec              -> q8_wmma.gemm_f16x  OPEN
+    KV projection         q8.matvec              -> q8_wmma.gemm_f16x  OPEN
+    output projection     q8_grouped.matvec_grouped + q8.matvec
+                                                 -> q8_wmma.gemm_f16x  OPEN
+
+Patching these one at a time is chasing symptoms. The durable fix is the one
+DECODE_M8_PLAN specified: a verify built from decode primitives with a row
+dimension, so parity holds by construction rather than by matching kernels
+pairwise forever.
+
+**Measured bracket inside layer 0** (both paths now dump; `938ebba`):
+
+    entering layer 0   0.000e+00   identical
+    mHC collapse       0.000e+00   identical  (after 1fa5c35)
+    heads              2-6e-03     <- seed: QKV chain / attention
+    attn_out           8e-03..1.2e-02         (output projection doubles it)
+    layer 0 out        6.5e-03
+    layer 39           5.6e-01     -> 1.72 nats at the head
+
+**Mechanism (mHC instance, now fixed):** the two paths computed `hc_mixes` with
+different kernels.
 
     decode   forward_layer.rs:609  matvec_narrow_ksplit_pre_scaled
                                    (K split into 20 chunks + reduce, RMS folded IN)
