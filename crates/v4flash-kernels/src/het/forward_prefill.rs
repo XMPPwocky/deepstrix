@@ -4303,8 +4303,29 @@ impl HeterogeneousEngine {
         // VIEW must all agree on the slot space, and the view is chosen ~250
         // lines further down. Deciding this once, here, is what keeps them from
         // diverging -- see the `routed_src` match.
+        // KNOWN_BUGS #0b ROOT CAUSE. The sparse view hands the MoE group builder
+        // ABSOLUTE pool slots as group ids, but `moe_group_builder.hip:118`
+        // drops any id >= n_expert and `group_count`/`expert_members` are sized
+        // N_EXPERT -- so unless the entire pool fits under N_EXPERT, every
+        // sparse-resident routed expert is dropped SILENTLY. Measured cost:
+        // verify/decode argmax agreement 43/71 vs 71/71, kld 1.707 vs 0.0066.
+        //
+        // `sparse_group_ids_in_range()` is therefore part of the predicate, not
+        // a check done later: by the time `ensure` has run it has already
+        // written absolute slots into the shared remap, and the window view
+        // needs the identity map, so there is no safe post-hoc fallback.
+        //
+        // With today's pool (thousands of slots) this disables the sparse view.
+        // Re-enabling it needs the group-id space widened to the pool -- size
+        // `group_count`/`expert_members`/`work_items` by the pager's slot count
+        // and pass that as the builder's bound -- or the verify's experts packed
+        // into a <N_EXPERT-wide contiguous region with its own LRU.
         let sparse_resid_layer = speculative_append()
             && !sparse_verify_residency_off()
+            && pager
+                .as_deref()
+                .map(|pg| pg.sparse_group_ids_in_range())
+                .unwrap_or(false)
             && !(replay_offload_enabled()
                 && remote_split_on
                 && (layer as usize) >= crate::config::CED_DECODER_START);
@@ -4469,7 +4490,8 @@ impl HeterogeneousEngine {
                 // decisions must be made from ONE predicate.
                 let sparse_resid = sparse_resid_layer;
                 debug_assert_eq!(sparse_resid, !replay_offload && speculative_append()
-                    && !sparse_verify_residency_off());
+                    && !sparse_verify_residency_off()
+                    && pg.sparse_group_ids_in_range());
                 let _t_ensure = LayerHostTimer::start(&LH_ENSURE);
                 if replay_offload {
                     ids.clear();

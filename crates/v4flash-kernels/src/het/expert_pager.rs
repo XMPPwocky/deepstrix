@@ -1234,6 +1234,24 @@ impl ExpertPager {
     /// First slot of the decode LRU region = end of the last dense window.
     /// Replaces the old `dense_windows * N_EXPERT`, which assumed every window
     /// was 384 wide.
+    /// Can the SPARSE (absolute-slot) residency produce group ids the MoE
+    /// group builder can actually use?
+    ///
+    /// `moe_group_builder.hip:118` drops any group id `>= n_expert`, and
+    /// `group_count` / `expert_members` are sized `N_EXPERT` (they are indexed
+    /// `g * max_per_expert + pos`), so the bound is a buffer limit and not a
+    /// guard. The sparse path sets `g` to an ABSOLUTE pool slot, and `ensure`
+    /// allocates those at or above `dense_slots()`, so every one of them is
+    /// dropped SILENTLY unless the whole pool fits under N_EXPERT.
+    ///
+    /// This was #0b: the routed experts contributed nothing to a speculative
+    /// verify, with clean inputs, identical expert ids and a clean shared
+    /// expert, for a 0.83 relative error in the layer output and ~60% argmax
+    /// agreement against decode.
+    pub fn sparse_group_ids_in_range(&self) -> bool {
+        self.n_slots as usize <= N_EXPERT as usize
+    }
+
     fn dense_slots(&self) -> usize {
         let lo = self.pinned_windows() as usize * self.window_stride as usize
             + N_EXPERT as usize;
