@@ -2543,6 +2543,77 @@ fn save_and_forward_marker(
 // token will be written at — equals live.pos after byte-aligned
 // extend; differs from prompt_tokens when live's token count for the
 // matched byte prefix differs from the request's.
+/// Replay the drafter over the prompt's last captured positions so its KV ring
+/// is warm when generation starts. See the call site in `finish_decode`.
+///
+/// `tokens` is the CANONICAL live sequence (index == absolute position) and
+/// `start_pos` the position the
+/// first generated token will occupy, so the captured rows cover absolute
+/// positions `[pos0, pos0 + n)` with `pos0` recorded by the capture itself.
+/// For each captured position p we need (residual @ p, token @ p+1) -- the same
+/// pairing `dspark_draft` and the accept path use -- so the LAST captured row
+/// is skipped: the token after it is the one generation is about to produce.
+#[cfg(feature = "v41")]
+fn seed_mtp_ring(state: &mut WorkerState, tokens: &[i32], start_pos: u32) -> eyre::Result<()> {
+    use v4flash_kernels::config::{HC_DIM, N_EMBD};
+    let ne = N_EMBD as usize;
+    let nsrc = v4flash_kernels::het::mtp::MTP_SRC_LAYERS.len();
+    let cap = v4flash_kernels::het::batch_scratch::MTP_CAP_ROWS;
+
+    // Both lanes may have captured; take whichever holds the LATER positions.
+    let (n, pos0, from_b) = {
+        let (na, pa) = (state.bd_a.mtp_captured, state.bd_a.mtp_captured_pos0);
+        let (nb, pb) = (state.bd_b.mtp_captured, state.bd_b.mtp_captured_pos0);
+        if nb > 0 && (na == 0 || pb >= pa) { (nb, pb, true) } else { (na, pa, false) }
+    };
+    if n == 0 {
+        return Ok(());
+    }
+    // The capture must lie inside the COMMITTED context, i.e. end at or before
+    // the position the first generated token will take. It need not end exactly
+    // there: `save_and_forward_marker` can forward a few more tokens after the
+    // prefill, which is the common chat case -- requiring equality there
+    // silently disabled seeding entirely. Anything ENDING PAST `start_pos` is a
+    // stale buffer from an earlier request and must not be used.
+    if pos0 as usize + n > start_pos as usize {
+        tracing::info!(n, pos0, start_pos, "dspark: capture ends past start_pos, not seeding");
+        return Ok(());
+    }
+
+    let mut whole = vec![0.0f32; nsrc * cap * ne];
+    if from_b {
+        state.bd_b.mtp_src.copy_to_host(&mut whole)?;
+    } else {
+        state.bd_a.mtp_src.copy_to_host(&mut whole)?;
+    }
+
+    let mut seeded = 0usize;
+    let mut no_token = 0usize;
+    // Skip the last row: its (p+1) token has not been generated yet.
+    for r in 0..n.saturating_sub(1) {
+        let p = pos0 + r as u32;
+        // Token AT p+1, from the request's own sequence.
+        let idx = (p + 1) as usize;
+        let Some(&tok) = tokens.get(idx) else { no_token += 1; break };
+        let mut mh = Vec::with_capacity(nsrc * ne);
+        for sl in 0..nsrc {
+            let o = sl * cap * ne + r * ne;
+            mh.extend_from_slice(&whole[o..o + ne]);
+        }
+        let mut tr = vec![0.0f32; HC_DIM as usize];
+        embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, tok, &mut tr);
+        let m = state.mtp.as_mut().expect("mtp");
+        state.engine.dspark_advance_ring(&mut m.state, &m.w, p, &mh, &tr, &m.noise_row)?;
+        seeded += 1;
+    }
+    tracing::info!(
+        seeded, n, pos0, start_pos, no_token,
+        seq_len = tokens.len(),
+        "dspark: seeded drafter ring from prefill"
+    );
+    Ok(())
+}
+
 fn finish_decode(
     state: &mut WorkerState,
     req: GenerateReq,
@@ -2554,6 +2625,36 @@ fn finish_decode(
     initial_in_think: bool,
 ) -> eyre::Result<()> {
     let mut pos = start_pos;
+    // ---- DSpark PREFILL RING SEEDING -----------------------------------
+    // The drafter attends over a MTP_WINDOW(128)-entry KV ring. At the start of
+    // generation that ring is EMPTY: the only writes come from accepted
+    // positions, so it takes ~128 tokens to fill and the drafter spends most of
+    // a normal reply attending over a mostly-empty window. That is a large part
+    // of why accept E (~2.5) sits so far under the oracle's seeded 4.382 --
+    // NOT, as previously assumed, because E had reached its ceiling.
+    //
+    // The prompt's positions are real context the drafter should already have.
+    // The batched prefill captured the last `mtp_captured` main-model residuals
+    // (see `MTP_CAP_ROWS`), so replay the drafter over them here -- same
+    // `advance_ring` the accept path uses: full layer forward (ring + carry),
+    // skipping only the exit. `V41_DSPARK_SEED_RING=0` disables.
+    #[cfg(feature = "v41")]
+    if state.mtp.is_some()
+        && std::env::var("V41_DSPARK_SEED_RING").as_deref() != Ok("0")
+    {
+        // `live.tokens` is the CANONICAL sequence backing the KV cache, so its
+        // index IS the absolute position. `req.tokens` is not: on the "extend"
+        // path the live prefix and the request prefix have different lengths
+        // (`lcp_live != lcp_req`) and indexing it by position would seed the
+        // ring with the wrong tokens.
+        let seq: Vec<i32> = state.live.as_ref().map(|l| l.tokens.clone()).unwrap_or_default();
+        if let Err(e) = seed_mtp_ring(state, &seq, start_pos) {
+            // Seeding is a pure accept-rate optimisation: the ring is a cache of
+            // the drafter's own attention, and a cold one only costs acceptance.
+            // Never fail a request over it.
+            tracing::warn!(error = %e, "dspark: prefill ring seeding failed, continuing cold");
+        }
+    }
     // Decode-loop wall, reported as `decode.loop.summary` at the end. Its
     // ms/token is what a harness must compare against `het.token.summary`;
     // curl-wall / completion_tokens ALSO carries the prefill and snapshot save.
@@ -4114,6 +4215,24 @@ fn prefill_suffix(
 ) -> eyre::Result<()> {
     if tokens.is_empty() {
         return Ok(());
+    }
+    // DSpark prefill ring seeding: have the batched path capture the last
+    // MTP_CAP_ROWS main-model residuals of this prefill so `seed_mtp_ring` can
+    // replay the drafter over them. Costs one `hc_weighted` launch per MTP
+    // source layer per chunk and nothing when no drafter is loaded.
+    #[cfg(feature = "v41")]
+    {
+        let rows = if state.mtp.is_some()
+            && std::env::var("V41_DSPARK_SEED_RING").as_deref() != Ok("0")
+        {
+            v4flash_kernels::het::batch_scratch::MTP_CAP_ROWS
+        } else {
+            0
+        };
+        state.bd_a.mtp_capture_rows = rows;
+        state.bd_b.mtp_capture_rows = rows;
+        state.bd_a.mtp_captured = 0;
+        state.bd_b.mtp_captured = 0;
     }
     let n_embd = N_EMBD as usize;
     let mut input_hcs: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());

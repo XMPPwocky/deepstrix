@@ -1817,6 +1817,18 @@ impl HeterogeneousEngine {
             // carries this sub-block's pre forward (decode twin: forward_layer.rs).
             let w = if cfg!(feature = "v41") { &bd.hc_pre_carry } else { &bd.split };
             de.hc_weighted.launch_batched(&de.compute, &mut sd.attn_cur, &bd.residual, w, N_EMBD, N_HC, HC_MIX_DIM, b)?;
+            // Bisect within layer 0 (KNOWN_BUGS #0b): attn_cur is the mHC
+            // COLLAPSE output, before attention runs. If it already differs from
+            // decode's, the residue is still mHC; if it matches, the divergence
+            // is attention onward.
+            if super::engine::subtensor_dump_armed(layer as usize) {
+                de.compute.synchronize()?;
+                super::engine::maybe_dump_subtensor_f32_view(
+                    layer as usize,
+                    &format!("pf_attn_cur_p{pos0}"),
+                    &sd.attn_cur.slice_view(0, N_EMBD as usize),
+                )?;
+            }
             // M7 CED: a source-only call leaves the carry as it entered the
             // layer (the replay re-runs this sub-block and carries it then).
             if cfg!(feature = "v41") && ced != CedMode::KvSourceOnly {
