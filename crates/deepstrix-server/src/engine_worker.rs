@@ -3310,9 +3310,42 @@ fn finish_decode(
                                 )
                             })?;
                         }
-                        state.dgpu_scratch.residual.copy_to_host(&mut resid[j])?;
+                        // A layer READS `residual` and WRITES `residual_next`
+                        // (`forward_layer.rs:245`); decode's loop then swaps them
+                        // (`engine.rs:1189`). This path never swapped and read back
+                        // `residual` -- the layer's own INPUT -- so roughly every
+                        // other layer came back bit-unchanged and the verify was
+                        // running on a residual that had skipped half the model.
+                        // Read the OUTPUT buffer instead; the swap that keeps the
+                        // per-layer buffer PARITY in step with decode is done once
+                        // per layer, after the row loop, not per row: HIP graphs
+                        // capture POINTERS, so layer L must see the same physical
+                        // buffer here that it sees in decode (A for even L, B for
+                        // odd), and every row of layer L must see the same one.
+                        state.dgpu_scratch.residual_next.copy_to_host(&mut resid[j])?;
                         state.dgpu_scratch.hc_pre_carry.copy_to_host(&mut carry[j])?;
+                        // V41_VDP_TRACE=1: row-0 residual norm per layer. A blow-up
+                        // or NaN localises the first bad layer without needing a
+                        // baseline run to diff against.
+                        if j == 0 && std::env::var("V41_VDP_TRACE").as_deref() == Ok("1") {
+                            let r = &resid[0];
+                            let n2: f64 = r.iter().map(|&v| (v as f64) * (v as f64)).sum();
+                            let nan = r.iter().filter(|v| !v.is_finite()).count();
+                            let c = &carry[0];
+                            let cn: f64 = c.iter().map(|&v| (v as f64) * (v as f64)).sum();
+                            eprintln!(
+                                "VDP L{layer:02} pos={} |resid|={:.4e} nonfinite={} |carry|={:.4e}",
+                                pos, n2.sqrt(), nan, cn.sqrt()
+                            );
+                        }
                     }
+                    // One swap per LAYER (not per row), mirroring decode's
+                    // `engine.rs:1189`, so layer L+1's rows read the physical
+                    // buffer its captured graphs were built against.
+                    std::mem::swap(
+                        &mut state.dgpu_scratch.residual,
+                        &mut state.dgpu_scratch.residual_next,
+                    );
                 }
                 // Head per row, into the same [B * N_VOCAB] layout the batched
                 // path returns.
