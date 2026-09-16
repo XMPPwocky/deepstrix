@@ -2371,6 +2371,22 @@ fn handle_generate_stream(
             mode = "extend",
             "prefill"
         );
+        // The prefill path addresses raw KV slots ABSOLUTELY: it appends at
+        // slot `n_raw_before`, computes its per-row SWA windows from slot 0
+        // (`causal_end - SWA_WINDOW`), and resets `raw_off = 0` at the
+        // post-chunk eviction. Decode does NOT: once `n_raw` reaches
+        // SWA_WINDOW it stops growing and advances `raw_off` instead
+        // (forward_layer.rs, "ls.raw_off += 1"), so the live window is
+        // [raw_off, raw_off + n_raw).
+        //
+        // Extending a live cache therefore has to reconcile the two models
+        // FIRST. Without this, any turn that generated more than SWA_WINDOW
+        // (128) tokens leaves raw_off > 0, and the suffix is appended at
+        // absolute slot `n_raw` -- BELOW the live window base -- overwriting
+        // live KV, while attention reads a window containing stale rows.
+        // Wrong attention, no error. DSpark already does this before both of
+        // its verifies; the ordinary chat "extend" path did not.
+        state.engine.normalize_raw_windows(&mut state.dgpu_scratch, &mut state.state)?;
         prefill_suffix(state, suffix, lcp_req, pos0, &vl, Some(&cancel))?;
         if cancel.load(Ordering::Relaxed) {
             tracing::info!(
