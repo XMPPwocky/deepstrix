@@ -472,6 +472,20 @@ found. #2 was the leading suspect and
 is ruled out for the default config (`remote_split_on=true` makes
 `set_remote_exclusion` rebuild the remap afterwards). Needs `scripts/v41_oracle`
 to say which geometry is even correct.
+- **Window arithmetic (REFUTED 2026-09-16, `V41_WINDOW_DBG=1`).** Both paths
+  were instrumented at the point where they compute the attended window and run
+  back-to-back in one process. They agree exactly:
+
+      verify  (prefill row i)  n_raw_before + i + 1 slots, offset 0
+      decode                   n_raw = pos + 1 slots,      raw_off  0
+
+  `n_raw_before + i` IS the absolute position, so both resolve to `[0, pos+1)`.
+  Measured at pos 33: verify 34 slots, decode 34 slots, both offset 0.
+  Layer 0 is `ratio==0` (pure SWA, NO compressed rows), so for the layer #0b is
+  bracketed to, those two scalars describe the window COMPLETELY -- there is no
+  compressed-row component left to disagree about. The two kernels are reading
+  the same KV slots. The divergence is in the kernels or in numerics, not in
+  addressing.
 
 ### 2. OPEN — `ensure_layer_dense` never writes `self.remap`
 `expert_pager.rs:532`. `ensure_layer_union` publishes via `write_window_remap`

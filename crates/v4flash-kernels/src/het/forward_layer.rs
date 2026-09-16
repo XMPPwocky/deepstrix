@@ -1314,6 +1314,15 @@ impl HeterogeneousEngine {
             (ls.n_raw as usize) * (N_HEAD_DIM as usize),
         );
         if ratio == 0 {
+            // KNOWN_BUGS #0b window check, SWA branch (ratio==0, e.g. layer 0).
+            // `kv_win` is sliced at raw_off, so decode attends slots
+            // [raw_off, raw_off + n_raw) and passes n_raw as the count.
+            if std::env::var("V41_WINDOW_DBG").as_deref() == Ok("1") {
+                tracing::info!(
+                    layer, pos, n_raw = ls.n_raw, raw_off = ls.raw_off,
+                    "window.decode swa"
+                );
+            }
             let _t_attn = de.events.stage("dgpu.attn_compute", &de.compute)?;
             let _s_attn = debug_span!("attn_compute").entered();
             de.attn_swa.launch(
