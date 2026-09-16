@@ -475,6 +475,46 @@ to say which geometry is even correct.
 - **Window arithmetic (REFUTED 2026-09-16, `V41_WINDOW_DBG=1`).** Both paths
   were instrumented at the point where they compute the attended window and run
   back-to-back in one process. They agree exactly:
+- **ROOT-CAUSED 2026-09-16: the SPARSE VERIFY RESIDENCY path.** One env flag
+  moves every metric together, which is the confirmation the KLD warning below
+  demands. 71 verify/decode pairs, B=1 probe, otherwise identical config:
+
+      V41_SPARSE_VERIFY_RESIDENCY=0   agree 71/71 (1.0000)  cos 0.998369  kld 0.00658
+      V41_SPARSE_VERIFY_RESIDENCY=1   agree 43/71 (0.6056)  cos 0.759226  kld 1.70697
+
+  The =1 arm's 0.6056 reproduces the long-reported "~64% argmax agreement" that
+  #0b was tracked by all session, and 1.707 nats is the "2.2 nats" that was
+  being hunted separately. They are the same bug.
+
+  Bisected to layer 0, verify vs decode, maxd/scale (bar 5e-2), pos 42/43/44:
+
+      layer input                  0.000e+00   identical
+      attention out                6.4e-03     clean
+      MoE input                    7.5e-03     clean
+      router expert ids            --          IDENTICAL
+      router gate weights          3.1e-03     clean
+      shared expert out            2.5e-03     clean
+      layer OUTPUT                 8.3e-01     WRONG
+
+  Same input, same six experts, same gates, clean shared half => the ROUTED
+  expert compute reads the wrong weights under the sparse view.
+
+  NOT the two-box path: all-local (V41_REMOTE_SPLIT=0) reproduces it identically
+  (cos 0.583 vs 0.569). NOT batching: this is B=1. NOT windows: bit-identical
+  with and without V41_PAGER_WINDOWS=21. NOT attention: the SWA kernels were
+  diffed by hand and are arithmetically identical, and the attended slots were
+  measured equal at three overlapping positions.
+
+  Still OPEN: the exact defect inside the sparse path. `ensure` DOES write the
+  correct negative slot encoding (`-(slot)-1`) that `moe_group_builder.hip:116`
+  decodes, so the sign convention is not it. Next suspects: whether the pool
+  slot's CONTENTS match the id `ensure` recorded (page-in races with
+  `mark_remote_after_ensure`), and whether `pg.routed`'s bytes-per-expert stride
+  matches the window view's.
+
+  MITIGATION AVAILABLE NOW: `V41_SPARSE_VERIFY_RESIDENCY=0` gives a verify that
+  reproduces decode exactly. It costs the sparse-residency perf win, so it is a
+  correctness/throughput trade until the defect above is fixed.
 
       verify  (prefill row i)  n_raw_before + i + 1 slots, offset 0
       decode                   n_raw = pos + 1 slots,      raw_off  0
