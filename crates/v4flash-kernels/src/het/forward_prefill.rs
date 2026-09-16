@@ -4048,6 +4048,32 @@ impl HeterogeneousEngine {
                 // Per-layer miss histogram. Box 1 pins ENCODER windows only
                 // (`prefill_ceiling = CED_DECODER_START + 2`), so a verify's
                 // misses should be concentrated at layer >= 20.
+                // RACE GUARD (`V41_PAGER_SYNC_IGPU`, default ON).
+                //
+                // The pager is about to do HOST-side H2D writes that the OTHER
+                // lane's still-running iGPU MoE may be reading:
+                //   - `remap_dev` is a SINGLE 384-entry buffer, fully rewritten
+                //     every layer by `write_window_remap` / `set_remote_exclusion`.
+                //     `launch_reduce_partials_hetsplit` reads it to decide which
+                //     partial slots this device owns, so a mid-flight change makes
+                //     the builder and the reduce disagree.
+                //   - the window's expert WEIGHT BYTES, whenever
+                //     `window_of(L) == window_of(L+1)` -- with WINDOWS=21 layers
+                //     20..39 all share window 20, so 19 consecutive pairs collide.
+                //
+                // The `de.compute.synchronize()` above transitively drains lane A's
+                // previous layer (via `moe_arrived_A`), but NOT lane B's, which sits
+                // later in the `ie.compute` FIFO (`post_A(L), pre_A(L+1), post_B(L),
+                // pre_B(L+1)`). `copy_from_host` is a blocking `hipMemcpy` that does
+                // NOT wait on pending kernels -- this file already records that
+                // finding for the repack path.
+                //
+                // Suspected cause of KNOWN_BUGS #0 (run-to-run nondeterminism): OS
+                // page-cache warmth re-times the pager's NVMe reads between server
+                // launches, landing the race differently. Set to 0 to measure it.
+                if std::env::var("V41_PAGER_SYNC_IGPU").as_deref() != Ok("0") {
+                    self.igpu.compute.synchronize()?;
+                }
                 let mc0 = if layer_miss_hist() { pg.counters().prefill_misses } else { 0 };
                 let n_sel = (b as usize) * cs_n_used;
                 let mut sel_host = vec![0i32; n_sel];
