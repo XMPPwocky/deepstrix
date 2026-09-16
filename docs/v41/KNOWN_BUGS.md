@@ -10,8 +10,46 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Silent wrongness
 
-### 1. OPEN — **CONFIRMED CORRUPTION**: `V41_PAGER_WINDOWS` changes the model's logits by ~14% relRMSE
-**CONFIRMED WITH THE RIGHT INSTRUMENT (2026-09-16).** sha comparison cannot
+### 0. OPEN — **the engine is NONDETERMINISTIC run-to-run under `V41_T2_CATCHALL=2`**
+This is the highest-priority bug in this file and it invalidates a methodology
+the project depends on. `scripts/v41_determinism_gate.sh` scores expert-cache
+changes by requiring `T2_CATCHALL=2` + temp 0 + same prompt to reproduce. It does
+not. Three runs of one fixed config (catchall=2, WINDOWS=21, 648-token prompt,
+temp 0), first-token logits:
+
+    a vs b : relRMSE 0.170   KLD 0.00196
+    a vs c : relRMSE 0.408   KLD 0.567
+    b vs c : relRMSE 0.428   KLD 0.545
+
+argmax was stable (5) in all three, and a is close to b while c is far -- BIMODAL,
+not drift, which points at a discrete state difference rather than accumulating
+float error.
+
+**Leading hypothesis (unverified):** box 2. Its LRU persists across box-1
+restarts, and with `V41_B2_POOL_FLOOR=0` its global victim search assigns experts
+to different SLOTS depending on history. If its MoE groups/reduces by slot order,
+the f32 summation order changes with residency -- residency changing VALUES, on
+box 2, even under the deterministic split. Test: restart `deepstrix-expertd`
+fresh before each run and see whether the spread collapses.
+
+**Consequence for everything else in this file and in memory:** any logit- or
+sha-based comparison taken without a same-config control is uninterpretable if
+its effect is below ~0.43 relRMSE. That includes the geometry results in #1 and
+the mHC kernel comparison. Re-measure with a noise floor, or interleave arms
+inside ONE process.
+
+
+### 1. RETRACTED — the geometry 'corruption' was NOISE. See #0.
+> **RETRACTED 2026-09-16 (same day).** The 14% relRMSE below is INSIDE the
+> run-to-run noise floor, which I had never measured. Three runs of an IDENTICAL
+> config differ by up to relRMSE 0.43 / KLD 0.57 (see #0). The geometry deltas
+> (0.136, 0.145) are smaller than that. There is no evidence `V41_PAGER_WINDOWS`
+> corrupts anything. I called this bug resolved, then confirmed, then retracted
+> it in one session -- each time by changing one variable and attributing the
+> difference without establishing what "no change" looks like. **Measure the
+> noise floor before attributing any delta.**
+
+**SUPERSEDED — the measurement below is real but is noise-dominated (2026-09-16).** sha comparison cannot
 distinguish 1e-7 from corruption -- greedy decoding amplifies any difference into
 a different token and then totally different text. First-token logits
 (`V41_DUMP_FIRST_LOGITS`) have no trajectory amplification. Deterministic split
