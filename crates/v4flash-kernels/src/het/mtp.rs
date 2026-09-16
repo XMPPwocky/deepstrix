@@ -389,6 +389,26 @@ impl MtpState {
         )
     }
 
+    /// Forget every ring row: the next write lands at slot 0 and the drafter
+    /// attends over its own positions only.
+    ///
+    /// MUST be called whenever the MAIN model's KV is reset, i.e. at every new
+    /// conversation. The ring is process-lifetime state and was never reset,
+    /// so from the SECOND request onward the drafter attended over a 128-row
+    /// window still holding the PREVIOUS conversation's positions
+    /// (`ring_geom` reports `n_valid = min(MTP_WINDOW, ring_writes + 1)`, which
+    /// keeps counting across requests). Measured cost: accept-mode E is
+    /// 1.66-1.86 on the first request after a restart and collapses to
+    /// 1.11-1.27 on every request after it -- reproducibly, in eight separate
+    /// runs. That is ~35% of the acceptance rate, lost on all traffic but the
+    /// first request.
+    ///
+    /// Only the counter needs clearing: `ring_geom` gates reads by `n_valid`,
+    /// so rows beyond it are never attended and do not need zeroing.
+    pub fn reset_ring(&mut self) {
+        self.ring_writes = 0;
+    }
+
     /// Ring rows written so far, capped at the window.
     pub fn ring_filled(&self) -> usize {
         self.ring_writes.min(MTP_WINDOW)

@@ -2056,6 +2056,10 @@ fn handle_generate_stream(
             if snap_req_tokens >= DISK_RESTORE_MIN_TOKENS {
                 save_live_if_dirty(state);
                 state.state.reset_in_place(state.dgpu, state.igpu)?;
+                // The drafter's KV ring is process-lifetime state and is NOT part of
+                // `HetModelState`, so resetting the main KV leaves it holding the
+                // previous conversation's positions. See `MtpState::reset_ring`.
+                reset_drafter_ring(state);
                 // `state.live` no longer describes the KV cache from
                 // here on. Clear it BEFORE the restore + suffix prefill
                 // so an error out of either (missing bias_vl, a span
@@ -2091,6 +2095,10 @@ fn handle_generate_stream(
                             "snapshot restore failed; evicting and prefilling from scratch"
                         );
                         state.state.reset_in_place(state.dgpu, state.igpu)?;
+                        // The drafter's KV ring is process-lifetime state and is NOT part of
+                        // `HetModelState`, so resetting the main KV leaves it holding the
+                        // previous conversation's positions. See `MtpState::reset_ring`.
+                        reset_drafter_ring(state);
                         state.live = None;
                         state.snapshot_index.evict(&snap_hash, "restore failed");
                         None
@@ -2124,6 +2132,10 @@ fn handle_generate_stream(
                             "restored snapshot bytes are NOT a prefix of the request; falling back"
                         );
                         state.state.reset_in_place(state.dgpu, state.igpu)?;
+                        // The drafter's KV ring is process-lifetime state and is NOT part of
+                        // `HetModelState`, so resetting the main KV leaves it holding the
+                        // previous conversation's positions. See `MtpState::reset_ring`.
+                        reset_drafter_ring(state);
                         state.live = None;
                     } else {
                         let _ = state.snapshot_index.touch(&snap_hash);
@@ -2266,6 +2278,10 @@ fn handle_generate_stream(
         }
         save_live_if_dirty(state);
         state.state.reset_in_place(state.dgpu, state.igpu)?;
+        // The drafter's KV ring is process-lifetime state and is NOT part of
+        // `HetModelState`, so resetting the main KV leaves it holding the
+        // previous conversation's positions. See `MtpState::reset_ring`.
+        reset_drafter_ring(state);
         state.live = None;
 
         // Split the prefill at the first `<User>` so the system block
@@ -4525,3 +4541,19 @@ const _: () = {
     let _ = COMPRESS_RATIOS;
     let _: oneshot::Sender<()>;
 };
+
+/// Clear the DSpark drafter's KV ring at a conversation boundary.
+///
+/// Paired with every `state.state.reset_in_place(..)`: the main model's KV lives
+/// in `HetModelState` and is reset there, but the drafter's ring lives on
+/// `MtpState` for the life of the process and had no reset at all. See
+/// `MtpState::reset_ring` for the measured cost of that omission.
+#[cfg(feature = "v41")]
+fn reset_drafter_ring(state: &mut WorkerState) {
+    if let Some(m) = state.mtp.as_mut() {
+        m.state.reset_ring();
+    }
+}
+
+#[cfg(not(feature = "v41"))]
+fn reset_drafter_ring(_state: &mut WorkerState) {}
