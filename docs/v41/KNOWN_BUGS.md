@@ -10,7 +10,45 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Silent wrongness
 
-### 0b. OPEN — **the VERIFY path differs from DECODE by ~2.2 nats** (not precision)
+### 0b. OPEN — verify vs decode ~1.9 nats, **SEEDED AT LAYER 0 by a different `hc_mixes` kernel**
+
+**LOCALISED 2026-09-16.** Per-layer residual diff (both paths now dump; see
+`92257cc`, `3e4a17c`), same position, B=1:
+
+    entering layer 0   relRMSE 0.000e+00   BIT-IDENTICAL
+    entering layer 1   relRMSE 6.504e-03   <- FIRST DIVERGENCE
+    entering layer 2   8.753e-02
+    entering layer 5   2.773e-01
+    entering layer 39  5.602e-01           -> the ~1.9 nats at the head
+
+Both paths enter layer 0 identically and diverge leaving it. Layer 0 is the
+SEED; everything after is amplification.
+
+**Character of the seed:** position-INDEPENDENT (~6e-3 at positions 42,43,44,46),
+so not attention/KV, which would scale with context. Spread over 20380/20480
+channels and all four HC copies (copy 2 is 10x cleaner than the rest), so not a
+few wrong experts or a slot bug -- it is the same math from a DIFFERENT KERNEL.
+
+**Mechanism:** the two paths compute `hc_mixes` with different kernels.
+
+    decode   forward_layer.rs:609  matvec_narrow_ksplit_pre_scaled
+                                   (K split into 20 chunks + reduce, RMS folded IN)
+             forward_layer.rs:615  matvec_pre_scaled  (non-split, RMS folded IN)
+    prefill  forward_prefill.rs    matvec_narrow_batched
+                                   (single-pass warp reduction, RMS applied SEPARATELY)
+
+Different reduction order AND a different point of applying the RMS scalar. Then
+`hc_split_sinkhorn` runs **20 doubly-stochastic iterations** on those coefficients
+(`ARCH_SPEC:45`) before they scale the residual -- an iterative amplifier that
+turns f32-level mix differences into 6e-3 on the residual.
+
+**Fix:** give prefill a BATCHED form of decode's exact kernel
+(`matvec_narrow_ksplit_pre_scaled` / `matvec_pre_scaled`, i.e. pre-scaled and
+K-split the same way), so the verify reproduces decode bit-for-bit at b<=64.
+Swapping to `matvec_narrow_batched` (`21cb203`) fixed the f16 SPEC violation and
+was worth +83% and E 2.185->3.077, but it is still not decode's kernel.
+
+Earlier framing (superseded by the localisation above):
 QUANTIFIED 2026-09-16 with the in-tree cross-check
 (`V41_VERIFY_PROBE=6,6 V41_VERIFY_BATCHED=1` -> `dspark.xcheck`), 648-token
 prompt, deterministic split, box 2 fixed:
