@@ -3745,22 +3745,58 @@ impl HeterogeneousEngine {
         // ========================================================
         let _t_router = de.events.stage("dgpu.router", &de.compute)?;
         {
-            // Gate projection: one wide batched matvec over all B tokens. The
-            // per-row warp reduction is identical to the old per-token loop, so
-            // logits are bit-identical — only the launch count drops from B to 1.
+            // Gate projection.
+            //
+            // **The gate MUST be fp32 and MUST match decode bit-for-bit at the
+            // batch sizes a DSpark verify uses.** `ARCH_SPEC` says so twice --
+            // ":104  s = sqrt(softplus(x_f32 @ W_gate^T)) ... fp32 math" and
+            // ":162  Gate math fp32." -- and decode uses `de.f16.matvec`
+            // (`forward_layer.rs`), whose wide path `matvec_batched` reproduces
+            // bit-identically ("identical single-warp shuffle ... only the launch
+            // count drops to 1", f16.rs).
+            //
+            // `gemm_batched_wmma` does NOT: it casts the activations down to f16
+            // (`f16_gemm_wmma.hip`, `vals[e] = (_Float16)x_row[e]`). This gate
+            // picks the top 6 of 384 experts, so an f16 rounding near the
+            // selection boundary does not perturb a value -- it swaps which
+            // experts execute. Prefill/verify therefore selected a DIFFERENT
+            // expert set than decode would for the same hidden state, which
+            // breaks the property DSpark is built on (the verify must reproduce
+            // decode) and is the suspected cause of KNOWN_BUGS #0b, the
+            // long-prompt accept degeneracy. The comment that stood here claimed
+            // "logits are bit-identical"; that was true of the per-token
+            // `matvec` it replaced, not of the WMMA GEMM that replaced it.
+            //
+            // WMMA is kept only for large prefill chunks, where `matvec_batched`
+            // re-reads the weight per batch element and goes weight-BW-bound.
+            // `V41_ROUTER_WMMA=1` forces the old path, `=0` forces fp32 always.
             let _t = de.events.stage("k.router.f16_matvec", &de.compute)?;
-            // GEMM-tile via LDS-WMMA: M=N_EXPERT=256, K=N_EMBD=4096, N=B.
-            // matvec_batched re-reads weight per batch — at B=512 that's
-            // weight-BW-bound; tile-shares across BN=64.
-            de.f16.gemm_batched_wmma(
-                &de.compute,
-                &mut sd.router_logits,
-                &dlw.ffn_gate_inp.buffer,
-                &bd.ffn_input_norm,
-                N_EXPERT,
-                N_EMBD,
-                b,
-            )?;
+            let router_wmma = match std::env::var("V41_ROUTER_WMMA").ok().as_deref() {
+                Some("1") => true,
+                Some("0") => false,
+                _ => b > 64,
+            };
+            if router_wmma {
+                de.f16.gemm_batched_wmma(
+                    &de.compute,
+                    &mut sd.router_logits,
+                    &dlw.ffn_gate_inp.buffer,
+                    &bd.ffn_input_norm,
+                    N_EXPERT,
+                    N_EMBD,
+                    b,
+                )?;
+            } else {
+                de.f16.matvec_batched(
+                    &de.compute,
+                    &mut sd.router_logits,
+                    &dlw.ffn_gate_inp.buffer,
+                    &bd.ffn_input_norm,
+                    N_EXPERT,
+                    N_EMBD,
+                    b,
+                )?;
+            }
         }
         // Vision-Exp: contiguous runs of image rows (token id >= N_VOCAB,
         // compress-pads included — `Gate.forward`'s `image_mask`). They
