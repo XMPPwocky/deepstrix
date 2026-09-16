@@ -61,6 +61,10 @@ pub const MTP_WINDOW: usize = 128;
 pub const MTP_TOPK: u32 = 3;
 /// `dspark_markov_rank` — the auxiliary n-gram head's hidden width.
 pub const MTP_MARKOV_RANK: usize = 256;
+/// Rotating host-staging slots for the drafter's index uploads. See
+/// `MtpState::stage_slots`.
+const STAGE_N: usize = 64;
+
 /// `dspark_noise_token_id`.
 pub const MTP_NOISE_TOKEN: i32 = 128799;
 
@@ -260,6 +264,24 @@ pub struct MtpState {
     kv_normed: DeviceBuffer<f32>,
     /// Ring slot each `kv_post_fused` call writes at, and the position it ropes
     /// with. One entry per call site; sliced one element at a time.
+    /// Rotating HOST staging for the drafter's tiny index uploads.
+    ///
+    /// These used to be stack `Vec`s written then pushed with the BLOCKING
+    /// `copy_from_host`. That was measured at 9.2 ms per draft for 48 bytes --
+    /// a blocking `hipMemcpy` serialises against blocking streams, so it was
+    /// draining whatever the verify had queued on the SHARED `igpu.compute`
+    /// (`V41_DSPARK_LAYER_TIMING=1`: kvcopy 9164 us of a 13.6 ms "enqueue").
+    ///
+    /// `hipMemcpyAsync` has no such implicit sync, but its source must stay
+    /// valid and UNMODIFIED until the copy actually runs -- a stack Vec would
+    /// drop first, and reusing one buffer would let the next layer overwrite a
+    /// copy still in flight. Hence a rotating pool: `STAGE_N` is far above the
+    /// <= (1 + MTP_BLOCK) * 3 `layer()` calls between two stream syncs, so an
+    /// entry is never revisited while its copy is outstanding.
+    stage_slots: Vec<Vec<u32>>,
+    stage_poss: Vec<Vec<u32>>,
+    stage_dpos: Vec<Vec<i32>>,
+    stage_idx: usize,
     slot_dev: DeviceBuffer<u32>,
     pos_dev: DeviceBuffer<u32>,
     /// Draft positions `pos+1 ..= pos+B` as i32, for the batched rope.
@@ -350,6 +372,10 @@ impl MtpState {
             q: DeviceBuffer::new(device_id, b * Q_FLAT as usize)?,
             kv_raw: DeviceBuffer::new(device_id, b * N_HEAD_DIM as usize)?,
             kv_normed: DeviceBuffer::new(device_id, N_HEAD_DIM as usize)?,
+            stage_slots: (0..STAGE_N).map(|_| vec![0u32; b + 1]).collect(),
+            stage_poss: (0..STAGE_N).map(|_| vec![0u32; b + 1]).collect(),
+            stage_dpos: (0..STAGE_N).map(|_| vec![0i32; b]).collect(),
+            stage_idx: 0,
             slot_dev: DeviceBuffer::new(device_id, b + 1)?,
             pos_dev: DeviceBuffer::new(device_id, b + 1)?,
             pos_per_b: DeviceBuffer::new(device_id, b)?,
@@ -764,18 +790,24 @@ impl MtpState {
             N_HEAD_DIM, N_EMBD,
         )?;
         // Slot 0 of the scratch pair carries the main row, 1..=B the block's.
-        let mut slots = vec![0u32; MTP_BLOCK + 1];
-        let mut poss = vec![0u32; MTP_BLOCK + 1];
-        slots[0] = main_slot as u32;
-        poss[0] = pos;
-        for j in 0..MTP_BLOCK {
-            slots[j + 1] = (n_valid + j) as u32;
-            poss[j + 1] = pos + 1 + j as u32;
+        // Written into ROTATING staging and pushed ASYNC: the blocking form cost
+        // 9.2 ms per draft for these 48 bytes by draining the shared iGPU stream.
+        let si = self.stage_idx % STAGE_N;
+        self.stage_idx = self.stage_idx.wrapping_add(1);
+        {
+            let slots = &mut self.stage_slots[si];
+            let poss = &mut self.stage_poss[si];
+            slots[0] = main_slot as u32;
+            poss[0] = pos;
+            for j in 0..MTP_BLOCK {
+                slots[j + 1] = (n_valid + j) as u32;
+                poss[j + 1] = pos + 1 + j as u32;
+            }
         }
         {
             let _hc = HostUs::start(&MTP_H_KVCOPY);
-            self.slot_dev.copy_from_host(&slots)?;
-            self.pos_dev.copy_from_host(&poss)?;
+            self.slot_dev.copy_from_host_async(&self.stage_slots[si], s)?;
+            self.pos_dev.copy_from_host_async(&self.stage_poss[si], s)?;
         }
         e.fp8.launch_kv_post_fused(
             s, &mut self.kv_normed, &mut self.rings[li], &self.main_kv_raw, &w.kv_a_norm,
@@ -826,8 +858,13 @@ impl MtpState {
         )?;
         drop(_hqa);
         // V4.1 has no per-head q RMSNorm after wq_b (same as the main model).
-        let dpos: Vec<i32> = (0..MTP_BLOCK).map(|j| (pos + 1 + j as u32) as i32).collect();
-        self.pos_per_b.copy_from_host(&dpos)?;
+        {
+            let dpos = &mut self.stage_dpos[si];
+            for (j, d) in dpos.iter_mut().enumerate() {
+                *d = (pos + 1 + j as u32) as i32;
+            }
+        }
+        self.pos_per_b.copy_from_host_async(&self.stage_dpos[si], s)?;
         e.rope.launch_forward_batched(
             s, &mut self.q, &self.pos_per_b, N_HEAD, N_HEAD_DIM, N_ROT, B, rope,
         )?;
