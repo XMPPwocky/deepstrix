@@ -2223,6 +2223,20 @@ pub struct MoeExecutor {
     d_ew: DeviceBuffer<f32>,
     group_count: DeviceBuffer<i32>,
     expert_members: DeviceBuffer<i32>,
+    /// Group-id space the batched builder is currently sized for.
+    ///
+    /// **This MUST equal the slot space `remap` encodes, not `N_EXPERT`.** Box 2's
+    /// remap has carried ABSOLUTE pool slots since 2026-09-14 (`-(abs_slot)-1`,
+    /// see `LayerShard::remap_dev`) so a layer can hold a slot outside its own
+    /// region, and `layer_views` hands the kernel the WHOLE pool. But
+    /// `moe_group_builder.hip:118` drops any `g >= n_expert`, and this was being
+    /// passed `N_EXPERT` (384) against a 6160-slot pool -- so every routed pick
+    /// living above slot 383 was SILENTLY DROPPED from the group build while the
+    /// reducer still counted it as ours (`remap[e] < 0`) and summed its zeroed
+    /// partial row. Net: the expert contributed exactly 0.0, no error anywhere.
+    /// B=1 decode was spared (no group builder); every prefill chunk and every
+    /// DSpark verify batch was affected.
+    group_bound: u32,
     work_items: DeviceBuffer<i32>,
     n_work_items: DeviceBuffer<i32>,
     d_mid_cat: DeviceBuffer<f32>,
@@ -2262,6 +2276,7 @@ impl MoeExecutor {
             d_ew: DeviceBuffer::new(id, rows * nu)?,
             group_count: DeviceBuffer::new(id, N_EXPERT as usize)?,
             expert_members: DeviceBuffer::new(id, N_EXPERT as usize * rows)?,
+            group_bound: N_EXPERT,
             work_items: DeviceBuffer::new(id, wi_len)?,
             n_work_items: DeviceBuffer::new(id, 1)?,
             d_mid_cat: DeviceBuffer::new(id, rows * nu * N_FF_EXP as usize)?,
@@ -2346,6 +2361,26 @@ impl MoeExecutor {
 
     /// As [`Self::run`]; `force_batched` takes the by-expert chain regardless of `b`.
     #[allow(clippy::too_many_arguments)]
+    /// Size the batched group buffers for `n_slots` group ids and return the
+    /// bound to pass the builder. See `group_bound`.
+    fn ensure_group_bound(&mut self, n_slots: u32) -> eyre::Result<u32> {
+        if n_slots <= self.group_bound {
+            return Ok(self.group_bound);
+        }
+        self.device.set_current()?;
+        let id = self.device.id;
+        self.group_count = DeviceBuffer::new(id, n_slots as usize)?;
+        self.expert_members = DeviceBuffer::new(id, n_slots as usize * self.rows)?;
+        // `launch_work_items` walks the whole group space, and its output is
+        // `n_expert + rows*nu` entries (one chunk header per group, worst case).
+        let wi_len = n_slots as usize + self.rows * N_EXPERT_USED;
+        if self.work_items.len() < wi_len {
+            self.work_items = DeviceBuffer::new(id, wi_len)?;
+        }
+        self.group_bound = n_slots;
+        Ok(n_slots)
+    }
+
     pub fn run_path(
         &mut self,
         shard: &mut ExpertShard,
@@ -2407,6 +2442,11 @@ impl MoeExecutor {
         if let Some((a, _)) = self.ev.as_ref() {
             a.record(&self.engine.compute)?;
         }
+        // Size the batched group buffers BEFORE borrowing the engine. The
+        // group-id space is the POOL SLOT space (box 2's remap encodes absolute
+        // pool slots); passing N_EXPERT silently dropped every pick above slot
+        // 383 -- see `group_bound`.
+        let gbound = self.ensure_group_bound(shard.info.n_resident)?;
         let e = &self.engine;
         let s = &e.compute;
         let cap = N_EXPERT_USED as u32;
@@ -2449,12 +2489,12 @@ impl MoeExecutor {
             self.group_count.fill_zero_async(s)?;
             e.moe_group_builder.launch_hetsplit(
                 s, &mut self.group_count, &mut self.expert_members, &sel_v, remap, 0, cap, bu,
-                nu as u32, N_EXPERT, max_per_expert,
+                nu as u32, gbound, max_per_expert,
             )?;
             self.n_work_items.fill_zero_async(s)?;
             let max_items = self.work_items.len() as u32;
             e.moe_group_builder.launch_work_items(
-                s, &mut self.work_items, &mut self.n_work_items, &self.group_count, N_EXPERT, CHUNK_SIZE, max_items,
+                s, &mut self.work_items, &mut self.n_work_items, &self.group_count, gbound, CHUNK_SIZE, max_items,
             )?;
             s.synchronize()?;
             let mut n_wi = [0i32; 1];
