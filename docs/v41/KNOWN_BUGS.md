@@ -8,6 +8,34 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ---
 
+## Start here
+
+### Why DSpark output is degenerate, in one paragraph
+Accept mode emits `corrected = row_argmax(0)` -- the VERIFY's row-0 token
+(`engine_worker.rs`). Row 0 is the NON-speculative position, i.e. the token
+plain decode would emit. The in-tree cross-check
+(`V41_VERIFY_PROBE=k,k V41_VERIFY_BATCHED=1` -> `dspark.xcheck`) measures that
+agreement at **~64%** (71/111). So **~36% of every generated token differs from
+what decode would produce**, which is exactly the observed degeneracy.
+
+**This is independent of accept rate.** E reached 3.500 (oracle base 4.382) with
+output still degenerate. E buys SPEED; row-0 agreement buys CORRECTNESS. Do not
+conflate them -- most of 2026-09-16 was spent doing so.
+
+    to make DSpark USABLE:  drive dspark.xcheck `agree` -> ~100%
+    to make DSpark FAST:    drive `e_tokens_per_step` up
+
+Measured attempts on the agreement axis: aligning every matvec/projection in the
+attention chain to decode's kernel moved it 69 -> 71/111 and cut KLD 2.026 ->
+1.631, i.e. ~20% of the divergence, and the projection half of that REGRESSED E
+(see the methodology warning below, and 16ec20a). Running the verify on decode
+primitives (`V41_VERIFY_DECODE_PATH=1`) did not help either: still degenerate,
+E 1.073.
+
+So the residual is NOT simply kernel-family mismatch. Next place to look is the
+accept machinery itself -- the speculative KV append and its rollback across the
+batch, and whether row 0's attention sees exactly the KV decode would see.
+
 ## Methodology warning
 
 ### Verify-vs-decode KLD and ACCEPT RATE can move in OPPOSITE directions
