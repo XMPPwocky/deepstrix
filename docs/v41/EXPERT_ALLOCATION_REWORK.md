@@ -1,5 +1,32 @@
 # Expert allocation rework — plan
 
+**Status: PLANNED — v1 REWRITTEN 2026-09-16 after adversarial review.**
+
+> **v1's central proposal ("box 1 = hot cache, box 2 = victim cache, one flat
+> LRU, no static placement") is WITHDRAWN.** Three findings killed it, all from
+> in-tree evidence that predates the plan:
+>
+> 1. **`WHY_THE_BIG_POOL_REGRESSED.md:35-60`** — box 1's iGPU costs **140 us per
+>    expert per layer** (it shares the device with attention, norms and the head)
+>    against box 2's **87 us** (MoE only). Serving a pick box 2 would HIT is
+>    **-53 us, a LOSS**; only serving one box 2 would MISS pays (+6547 us). The
+>    victim gate is not backwards -- it is box 1's only sign-positive policy. The
+>    asymmetry is structural and no allocation policy fixes it.
+> 2. **`expert_pager.rs:1188-1193`** — prefill sweeps layers 0..N every chunk,
+>    which is **LRU's worst case: a cyclic scan whose working set exceeds
+>    capacity hits 0%**. That is why the pinned windows exist. "Replace pinning
+>    with a true LRU" would make prefill 0% by construction.
+> 3. **KNOWN_BUGS #1 is RESOLVED and was never a pager bug** -- so the plan's
+>    premise that geometry corrupts the model is gone. Under `T2_CATCHALL=2`,
+>    WINDOWS=21 and WINDOWS=4 produce IDENTICAL output at 6.00 vs **14.21
+>    tok/s**. The geometry knob is safe and already worth 2.4x under mode 2.
+>
+> Also corrected: box 2 is **phase-aware**, not globally flat -- its victim
+> search is region-restricted on prefill-shaped requests
+> (`remote_experts.rs:1835`), and `enable_paging` deliberately does NOT advertise
+> all-true because a B=1024 prefill union (~203/layer) will not fit a catch-all
+> region. v1 proposed importing a structure box 2 does not have.
+
 **Status: PLANNED, not implemented.** Written 2026-09-16 from measurements in
 this session. Supersedes the current three-structure box-1 pager.
 
@@ -151,3 +178,62 @@ prose covers only 35.2% of CODE picks).
 - `V41_PAGER_WINDOWS` currently changes temperature-0 OUTPUT (KNOWN_BUGS #1).
   That bug lives in this same code and should be understood BEFORE or DURING
   the rework -- not inherited into the new policy.
+
+
+---
+
+# v2 — what actually survives
+
+**Do NOT invert the tiers.** Keep box 1 exclusive/victim; the 140-vs-87 us
+asymmetry is structural. Re-target at CAPACITY FOR THE VICTIM SET, not at making
+box 1 the hot cache.
+
+**Make it phase-aware, not flat.** Per-layer regions during prefill (preserving
+the cyclic-scan hit rate the pinning buys), roaming during decode. Slot contents
+survive the switch; only bookkeeping changes. This is the structure box 2 already
+runs, and it captures the decode-capacity prize without breaking prefill.
+
+**Keep the split deterministic.** `T2_CATCHALL=2` is a hard requirement of
+`scripts/v41_determinism_gate.sh`, and mode 1 is history-dependent (documented
+degenerate output). Any residency-driven routing needs an answer to the f32
+association problem FIRST -- a fixed-order reduction, not a hope.
+
+**Known consequence to price:** under mode 2 box 1 computes ZERO routed experts,
+so `victim_cache()` and `lru_free_slots()` are only read on the mode-1 path.
+Box 1's decode LRU is not merely frozen (#16) -- in the shipped config it is
+never populated at all. Any plan to give box 1 decode capacity must first say
+what box 1 is allowed to compute, deterministically.
+
+## Explicit work items v1 budgeted zero effort for
+
+1. **Group-id space = pool slots, not `N_EXPERT`.** `moe_group_builder.hip:118`
+   drops any `g >= n_expert`, and `n_expert` is hardcoded 384 at four call sites
+   (`forward_prefill.rs` hetsplit builder, plain builder, work-items split,
+   work-items) with matching buffers (`group_count[N_EXPERT]`,
+   `expert_members[N_EXPERT * b]`, `work_items_len`). Pool-wide slots would be
+   SILENTLY DROPPED. Cost is bounded: `expert_members` 786 KB -> 9.1 MB. Note the
+   `n_expert > 1024` rejection in `moe_group_builder.rs:110-113` (dead on V4.1).
+2. **Per-layer `remap_dev` + dirty flags.** `ExpertPager` has ONE `remap_dev`
+   valid only for the most-recently-ensured layer. A shared pool where layer L's
+   page-in can evict layer L''s slot requires per-layer remaps -- box 2 already
+   has exactly this (`ShardPool { remap_hosts, dirty }`).
+3. **A pin/epoch set.** Slots claimed by an issued-but-incomplete dispatch must
+   not be eviction candidates. Today safety rests on `ensure_layer_union`
+   REFUSING to evict, on LRU recency, and on layer serialisation -- "real
+   eviction" removes all three at once. Box 2's `want` guard is the minimum
+   viable version.
+4. **A stream-ordering contract for page-ins.** Today ordering is an accidental
+   null-stream drain (`buffer.rs`), with the repack kernel on a separate stream.
+5. **An O(1) LRU.** `touch()` is a linear scan of the deque. Dense-window slots
+   never enter it today; under one pool every prefill hit (~15k/chunk) would cost
+   an O(4454) scan.
+6. **`ExpertPlan { view, remap }`** (KNOWN_BUGS #4) lands in the SAME change, not
+   after -- collapsing two slot spaces into one is exactly when the pairing must
+   become unrepresentable.
+
+## Re-measure defect 1 properly
+
+The 1510 -> 3686 slot table is non-monotonic (4.57 / 4.23 / 5.40) and its
+supporting evidence was box 2's SERVER TIME, which `feedback_exposed_wait_is_not_work`
+says never to quote. Re-run interleaved in ONE process, citing box 1
+`decode_misses` and box 2 `pg.misses`, with a determinism sha check.
