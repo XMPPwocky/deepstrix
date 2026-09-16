@@ -2099,6 +2099,26 @@ impl HeterogeneousEngine {
                 EXPERT_WEIGHT_SCALE,
                 ROUTER_WEIGHT_EPS,
             )?;
+            // Counterpart of `pf_sel_p<POS>` / `pf_ew_p<POS>` for #0b.
+            if super::engine::subtensor_dump_armed(layer as usize) {
+                de.compute.synchronize()?;
+                super::engine::maybe_dump_subtensor_i32(
+                    layer as usize,
+                    &format!("dec_sel_p{pos}"),
+                    &dgpu_scratch.d_selected,
+                    N_EXPERT_USED,
+                )?;
+                super::engine::maybe_dump_subtensor_f32_view(
+                    layer as usize,
+                    &format!("dec_ew_p{pos}"),
+                    &dgpu_scratch.d_ew.slice_view(0, N_EXPERT_USED),
+                )?;
+                super::engine::maybe_dump_subtensor_f32_view(
+                    layer as usize,
+                    &format!("dec_ffn_in_p{pos}"),
+                    &dgpu_scratch.ffn_input_norm.slice_view(0, N_EMBD as usize),
+                )?;
+            }
         } else {
             // Hash router: host sync the router matvec, read 6 chosen
             // logits, write back d_selected and d_ew on dGPU.compute.
@@ -2721,6 +2741,21 @@ impl HeterogeneousEngine {
             let _t_wait = de.events.stage("dgpu.ffn_combine.wait", &de.compute)?;
             de.compute.wait_event(&sev.moe_arrived)?;
             _t_wait.end()?;
+        }
+        // KNOWN_BUGS #0b: split the MoE half into shared vs routed. Dumped
+        // BEFORE `ffn_moe_recv += ffn_shared`, so ffn_moe_recv is routed-only.
+        if super::engine::subtensor_dump_armed(layer as usize) {
+            de.compute.synchronize()?;
+            super::engine::maybe_dump_subtensor_f32_view(
+                layer as usize,
+                &format!("dec_ffn_shared_p{pos}"),
+                &dgpu_scratch.ffn_shared.slice_view(0, N_EMBD as usize),
+            )?;
+            super::engine::maybe_dump_subtensor_f32_view(
+                layer as usize,
+                &format!("dec_ffn_routed_p{pos}"),
+                &dgpu_scratch.ffn_moe_recv.slice_view(0, N_EMBD as usize),
+            )?;
         }
         // Two-box split: collect box 2's partial and add it.
         //

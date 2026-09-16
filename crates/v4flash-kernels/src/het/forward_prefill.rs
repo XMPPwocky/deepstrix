@@ -4027,6 +4027,31 @@ impl HeterogeneousEngine {
                 ROUTER_WEIGHT_EPS,
                 b,
             )?;
+            // KNOWN_BUGS #0b: layer 0's MoE half is where verify diverges from
+            // decode while attention is clean. Expert SELECTION is the first
+            // thing to rule in or out -- different experts fully explain the
+            // observed magnitude. Row 0 only.
+            if super::engine::subtensor_dump_armed(layer as usize) {
+                de.compute.synchronize()?;
+                super::engine::maybe_dump_subtensor_i32(
+                    layer as usize,
+                    &format!("pf_sel_p{pos0}"),
+                    &bd.d_selected,
+                    cs_n_used,
+                )?;
+                super::engine::maybe_dump_subtensor_f32_view(
+                    layer as usize,
+                    &format!("pf_ew_p{pos0}"),
+                    &bd.d_ew.slice_view(0, cs_n_used),
+                )?;
+                // The MoE INPUT. Router ids/gates already match, so if this
+                // matches too the divergence is in the expert compute itself.
+                super::engine::maybe_dump_subtensor_f32_view(
+                    layer as usize,
+                    &format!("pf_ffn_in_p{pos0}"),
+                    &bd.ffn_input_norm.slice_view(0, crate::config::N_EMBD as usize),
+                )?;
+            }
         } else {
             // Hash router: readback all B × N_EXPERT logits, run host
             // select per batch element, upload d_selected + d_ew.
@@ -4181,6 +4206,14 @@ impl HeterogeneousEngine {
                 Some((&sd.mid_sh16, super::batch_scratch::f16_pitch(N_FF_SHARED))),
                 b, N_EMBD, N_FF_SHARED,
             )?;
+        if super::engine::subtensor_dump_armed(layer as usize) {
+            de.compute.synchronize()?;
+            super::engine::maybe_dump_subtensor_f32_view(
+                layer as usize,
+                &format!("pf_ffn_shared_p{pos0}"),
+                &bd.ffn_shared.slice_view(0, crate::config::N_EMBD as usize),
+            )?;
+        }
         }
         drop(_t_shared);
 
