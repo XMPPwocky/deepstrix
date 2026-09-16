@@ -69,6 +69,47 @@ Routing then follows residency, as it already does:
   2's hot set -- that is what the victim gate exists to prevent) is what buys
   coverage.
 
+## MEASURED: the working set is NOT the model (2026-09-16)
+
+From the `expert_stats.json` sidecar -- real device-side routed-pick counters
+(`harvest_sel_stats`), 14,418,780 decode picks over 60,102 decode tokens,
+accumulated across many prompts and sessions:
+
+| coverage of decode picks | top-N pairs | % of corpus | GB |
+|---|---|---|---|
+| 50% | 1,509 | 9.8% | 27.7 |
+| 80% | 4,699 | 30.6% | 86.3 |
+| 90% | 6,913 | 45.0% | 126.9 |
+| 95% | 8,781 | 57.2% | 161.2 |
+| 99% | 11,861 | 77.2% | 217.8 |
+
+    top  4,454 (box 1 alone)         cover 78.51% -> miss 21.49%
+    top  6,560 (box 2 alone)         cover 88.75% -> miss 11.25%
+    top 11,014 (both, DEDUPLICATED)  cover 98.28% -> miss  1.72%
+
+**Half of all decode picks come from 1,509 experts (27.7 GB).** The existing
+combined capacity, deduplicated and holding the actual hot set, covers 98.3%.
+
+**This retires the "some picks always come off disk" framing.** That claim is
+true only at 1.72%, not the 7-12% miss rates measured today. Re-pricing:
+1.72% x 240 picks/token = 4.1 misses x ~7.2 ms = **~30 ms/token of paging**,
+against today's ~20 misses/token = ~145 ms. So the rework is worth
+**~115 ms/token**, not the ~30 ms the capacity-wall writeup assumed -- that
+writeup priced a global pool while holding the STATIC partition and the frozen
+LRU fixed, and assumed working set == corpus.
+
+With compute at ~26 ms/token that puts a token near 56-60 ms = **~17 tok/s,
+within reach of the 20 tok/s goal with NO expert-format change.**
+
+**Caveats.** (a) These counts accumulated across builds that included known
+correctness bugs -- notably the live `V41_PAGER_WINDOWS` output-dependence
+(KNOWN_BUGS #1) and historically the 77% submit-mask bug -- and a routing bug
+distorts which experts appear hot. Re-measure on a clean build. (b) Perfect
+dedup with perfect hot-set knowledge is the CEILING an LRU approximates, not
+achieves. (c) A static frequency table does NOT transfer across domains
+(measured: a prose-fit table covers only 35.2% of CODE picks) -- which is an
+argument FOR a dynamic cache, not for a placement file.
+
 ## What this can and cannot buy — READ BEFORE BUILDING
 
 The capacity wall is MEASURED and post-fix
@@ -84,11 +125,12 @@ all-resident decode at 0.65 ms/layer x 40 = 26 ms/token = **25-33 tok/s**,
 i.e. the 20 tok/s goal is reachable ONLY all-resident, which needs
 12.6-13.3 MB/expert = 5.6-5.9 bits/wt (Q5_K fits, Q6_K does not).
 
-So: **this rework is a real but bounded win (~30 ms/token), not the path to
-20 tok/s.** Its value is removing the three defects above -- 66% of box 1
-withheld from decode, a decode cache that never evicts, and inverted tiering --
-which are pure waste on top of the capacity wall. Do not oversell it, and do
-not let it substitute for the format decision.
+**SUPERSEDED by the measurement above.** The wall's arithmetic assumed the
+working set is the whole 15,360-pair corpus. It is not: the top 11,014 pairs
+cover 98.28% of decode picks, so the existing hardware can hold the hot set and
+the rework is worth ~115 ms/token -- plausibly the goal itself, without a format
+change. Keep the wall's compute figure (0.65 ms/layer x 40 = 26 ms/token) and
+its OOM constraint; discard its "no cache policy changes that" conclusion.
 
 **Beware `project_v41_expert_placement_2026-09-13`**: it claims 14.8 tok/s with
 ZERO misses and a "~7-8k pair working set that both boxes together hold". That
