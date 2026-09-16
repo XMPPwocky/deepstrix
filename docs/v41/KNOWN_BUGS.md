@@ -71,15 +71,34 @@ Per-layer bisection, both paths, same position:
     # writes layer_<NN>_{pf,dec}_{pre_residual,attn_cur,attn_out,heads}_p<POS>.bin
     # diff pf vs dec at the same layer and position.
 
-**Next thing to check (unverified):** whether the two paths attend over the SAME
-compressed rows. Prefill clamps `n_comp_per` to `min(actual, INDEXER_TOP_K)`
-(`forward_prefill.rs`, "so score+smwsum iterate only over the gathered top-K
-rows"); decode picks sparse `INDEXER_TOP_K.min(n_index_comp)` when the indexer
-gate fires and DENSE `n_comp_full` otherwise (`forward_layer.rs`). The counts
-may agree while the SELECTED ROWS differ. That would be a structural difference
-in what attention sees -- which fits a differently-shaped distribution far
-better than any precision mismatch, and fits the position-dependence of the
-`heads` divergence.
+**Compressed-row selection is RULED OUT.** It was the obvious next hypothesis --
+prefill clamps `n_comp_per` to `min(actual, INDEXER_TOP_K)` while decode takes
+sparse `INDEXER_TOP_K.min(n_index_comp)` only when its indexer gate fires and
+dense `n_comp_full` otherwise, so the counts could agree while the SELECTED ROWS
+differ. But at a 33-token prompt `n_comp` is ~10-20, far below
+`INDEXER_TOP_K=512`, so BOTH paths are dense over the SAME rows -- and agreement
+is 50/81 (61.7%), statistically identical to the 647-token case (68/111, 61.3%).
+Same rows, same disagreement.
+
+**THE TIGHTEST STATEMENT OF THE REMAINING BUG.** At a 33-token prompt, B=1:
+
+    residual entering layer 0   bit-identical (0.000e+00)
+    mHC collapse (attn_cur)     bit-identical (0.000e+00)
+    KV attended                 same rows, both dense
+    -> heads                    DIVERGES (2-6e-03)
+    -> row-0 argmax             differs 38% of the time
+
+Identical inputs, identical KV, different attention output. So the attention
+kernels themselves compute different results: decode's
+`launch_score_b1_htiled_wmma` + its smwsum twin versus prefill's
+`launch_score_batched_htiled_wmma*` + `launch_softmax_wsum_batched_*`. Note
+prefill defaults to the `_f16s` (f16 scores) variants while decode uses f32;
+`DEEPSTRIX_F32_SCORES=1` switches prefill to f32 and cuts KLD 1.904 -> 1.711 but
+makes agreement WORSE (69 -> 66/111), so precision alone does not explain it.
+
+Compare those two kernel families directly -- tiling, the order keys are
+reduced in, and the softmax normalisation -- rather than swapping variants and
+re-measuring.
 
 ## Methodology warning
 
