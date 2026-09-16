@@ -824,6 +824,24 @@ impl HeterogeneousEngine {
         }
 
         for layer in 0..N_LAYER as usize {
+            // Per-layer residual dump, decode side, WITHOUT the `force_standalone`
+            // path -- arming `DEEPSTRIX_DUMP_SUBTENSOR_LAYERS` routes decode into
+            // `forward_layer_standalone_graphs`, which crashes with
+            // HIP 700 (hipErrorIllegalAddress), so decode has never actually been
+            // able to dump. See KNOWN_BUGS.
+            //
+            // Reading the residual ENTERING the layer is safe whatever the graph
+            // fusion does, because nothing for this layer has run yet. Tag matches
+            // the prefill side (`pf_pre_residual_p<POS>`) so the two are directly
+            // diffable to find the first layer where verify departs from decode.
+            if subtensor_dump_armed(layer) {
+                self.dgpu.compute.synchronize()?;
+                maybe_dump_subtensor_f32(
+                    layer,
+                    &format!("dec_pre_residual_p{pos}"),
+                    &dgpu_scratch.residual,
+                )?;
+            }
             // DSpark: the drafter eats the residual ENTERING layers 37/38/39,
             // so this must run before the layer does. A no-op for every other
             // layer.
@@ -876,7 +894,10 @@ impl HeterogeneousEngine {
                     }
                 }
             }
-            let force_standalone = dump_subtensor_layers.contains(&layer);
+            // NOTE: this deliberately no longer includes the dump-layer list.
+            // Routing decode through `forward_layer_standalone_graphs` to dump
+            // crashes it (HIP 700); the residual dump above does not need it.
+            let force_standalone = false && dump_subtensor_layers.contains(&layer);
             if force_standalone {
                 self.forward_layer_standalone_graphs(
                     dgpu_scratch,
