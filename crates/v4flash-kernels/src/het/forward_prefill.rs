@@ -5798,8 +5798,15 @@ impl HeterogeneousEngine {
         self.set_current_cached(self.dgpu.device)?;
         let de = &self.dgpu;
         de.compute.wait_event(&sev.moe_arrived)?;
-        let _t_combine = de.events.stage("dgpu.ffn_combine", &de.compute)?;
+        // NOT one bracket around the whole function. The blocking box-2 `wait()`
+        // sits between the two vec_adds below, and a stage bracket spanning it
+        // records the HOST STALL as dGPU device time: on a perfetto trace it
+        // draws one enormous `dgpu.ffn_combine` slice covering the entire RPC,
+        // so the lane reads ~6 ms busy while the GPU is idle. Every "GPU busy %"
+        // taken from that slice was inflated by the RPC wait. Bracket the two
+        // halves separately instead, so the idle between them shows as idle.
         {
+            let _t_combine = de.events.stage("dgpu.ffn_combine.local", &de.compute)?;
             let _t = de.events.stage("k.ffn_combine.vec_add", &de.compute)?;
             de.vec_add.launch(
                 &de.compute,
@@ -5916,6 +5923,9 @@ impl HeterogeneousEngine {
                 l2(&local), l2(&rem), l2(&rem) / l2(&local).max(1e-9),
             );
         }
+        // Second half of the combine, AFTER the blocking wait above. Separate
+        // bracket from `dgpu.ffn_combine.local` on purpose -- see the note there.
+        let _t_combine_remote = de.events.stage("dgpu.ffn_combine.remote", &de.compute)?;
         if bd.remote_ffn_moe_valid {
             // Two-box split: the iGPU skipped every expert box 2 owns (its
             // remap entry was non-negative), so this partial is the rest of the
