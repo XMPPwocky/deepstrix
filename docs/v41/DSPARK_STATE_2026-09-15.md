@@ -182,3 +182,42 @@ chat special tokens; engine argmax "We" is correct, oracle argmax " (" is not).
 "Which chain is closer to the oracle" therefore rests on existing layer-parity
 validation: decode ~ oracle (M1-M6 PASS); kwide is the lossy prefill kernel. Fix
 kwide toward the float-LUT path.
+
+## CORRECTED CONCLUSION (2026-09-16): no kernel is broken; DSpark's economics are the wall
+
+The loopback test overturned the kernel-divergence diagnosis. Full corrected picture:
+
+- **Box 2's batched vs decode MoE kernels are IDENTICAL** (loopback CHAIN-DIFF,
+  same weights+inputs: max rel 1.5e-7). The gate/up-is-the-culprit and
+  down-is-the-culprit diagnoses were both WRONG — artifacts of confounded
+  server-level measurements (separate runs; box 2's global-pool LRU makes the
+  f32 partial sum-order history-dependent).
+- **The verify's server-level KLD decomposes** (clean single run, warm):
+    catch-all ON   0.356 nats   argmax 0.87
+    catch-all OFF  0.074 nats   argmax 0.93
+  The 0.28 the catch-all adds is pure f32 REDUCE-ORDER (verify routes all experts
+  to box 2; decode splits box1/box2 — same values, different grouping), and
+  decode is itself non-deterministic in that order. The residual 0.074 is box 1's
+  prefill-vs-decode forward. Neither is a lossy kernel.
+
+**Measured DSpark accept, all fixes in, fast chain + catch-all, fresh 500-tok:**
+    E 1.811,  190 ms/token = 5.2 tok/s
+vs baseline decode 67 ms/token = 15 tok/s (warm, floor 0). DSpark is a ~3x net
+LOSS, and it is NOT a correctness/kernel problem — it is economics:
+
+- shadow E (drafter scored vs true decode) = 3.077, but accept E = 1.81 because
+  the catch-all's reduce-order drops verify argmax agreement to 0.87, and in
+  accept mode a wrong accept cascades (the faithful catch-all-off verify would
+  raise E but costs box-1 paging, i.e. a slower verify).
+- the verify step is ~190-345 ms (box 1's dense forward + drafter + RTT +
+  normalize), and E×decode_token = 1.8×67 = 121 ms. The verify's fixed cost
+  exceeds what the drafter can repay because DECODE IS ALREADY FAST (15 tok/s
+  after the O_DIRECT + pool-floor work).
+
+**Bottom line:** DSpark cannot beat non-speculative decode on this two-box setup,
+not because of a bug but because decode is now cheap (67 ms) and a two-box verify
+is not. The lever for >15 tok/s is decode residency (fit more experts in RAM: the
+expert-format work), not speculation. Every correctness bug found this pass is
+real and worth keeping (they were corrupting the verify and, via the shared
+KvMark/partials/read_f32 paths, risked decode too), but they do not make
+speculation pay here.
