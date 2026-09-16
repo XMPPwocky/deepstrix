@@ -712,7 +712,39 @@ impl HeterogeneousEngine {
                 "dspark.draft.exit"
             );
         }
+        // The drafter's own stages live in the same pools the per-token export
+        // already drained, so drain again or they are lost at the next reset.
+        let _ = self.export_pending_perfetto();
         r
+    }
+
+    /// Emit any perfetto pairs recorded since the last export.
+    ///
+    /// `forward_token_impl` exports at its END, so anything the caller runs after
+    /// it -- notably `dspark_draft` from the accept loop -- was recorded into the
+    /// pools and then discarded by the next token's `reset()`. The drafter is
+    /// ~26 ms/step across BOTH GPUs and was invisible on every trace because of
+    /// this. Idempotent: the pool's watermark means a pair is emitted once.
+    pub fn export_pending_perfetto(&self) -> eyre::Result<()> {
+        let Some(exp_lock) = &self.perfetto else { return Ok(()) };
+        let Ok(mut exp) = exp_lock.lock() else { return Ok(()) };
+        self.dgpu.events.for_each_pair_new(|name, s, e| {
+            let track = if name.contains(".xfer") || name.contains(".peer_push") {
+                &exp.dgpu_xfer
+            } else {
+                &exp.dgpu_compute
+            };
+            exp.emit_slice(track, name, s, e)
+        })?;
+        self.igpu.events.for_each_pair_new(|name, s, e| {
+            let track = if name.contains(".xfer") || name.contains(".peer_push") {
+                &exp.igpu_xfer
+            } else {
+                &exp.igpu_compute
+            };
+            exp.emit_slice(track, name, s, e)
+        })?;
+        Ok(())
     }
 
     /// `forward_token_paged` that also captures the residuals the DSpark drafter
@@ -1295,7 +1327,10 @@ impl HeterogeneousEngine {
         // completed (we sync on the last event inside for_each_pair).
         if let Some(exp_lock) = &self.perfetto {
             let mut exp = exp_lock.lock().unwrap();
-            self.dgpu.events.for_each_pair(|name, s, e| {
+            // `_new`: emit only what has not been emitted yet. Anything recorded
+            // AFTER this point in the step -- the DSpark drafter, which runs from
+            // the accept loop -- is picked up by `export_pending_perfetto()`.
+            self.dgpu.events.for_each_pair_new(|name, s, e| {
                 let track = if name.contains(".xfer") || name.contains(".peer_push") {
                     &exp.dgpu_xfer
                 } else {
@@ -1303,7 +1338,7 @@ impl HeterogeneousEngine {
                 };
                 exp.emit_slice(track, name, s, e)
             })?;
-            self.igpu.events.for_each_pair(|name, s, e| {
+            self.igpu.events.for_each_pair_new(|name, s, e| {
                 let track = if name.contains(".xfer") || name.contains(".peer_push") {
                     &exp.igpu_xfer
                 } else {

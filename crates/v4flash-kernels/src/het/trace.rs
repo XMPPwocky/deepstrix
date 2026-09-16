@@ -48,6 +48,9 @@ struct EventPoolInner {
     events: Vec<Event>,
     next: usize,
     pairs: Vec<TimingPair>,
+    /// How many `pairs` have already been handed to the perfetto exporter, so
+    /// work recorded after the per-token export still gets emitted exactly once.
+    exported: usize,
 }
 
 struct TimingPair {
@@ -77,6 +80,7 @@ impl EventPool {
                 events,
                 next: 0,
                 pairs: Vec::with_capacity(capacity / 2),
+                exported: 0,
             }),
             label,
             // DEEPSTRIX_TOKEN_PROFILE=1 turns per-kernel event timing on without
@@ -108,6 +112,7 @@ impl EventPool {
         let mut inner = self.inner.borrow_mut();
         inner.next = 0;
         inner.pairs.clear();
+        inner.exported = 0;
     }
 
     /// Open a timing scope on `stream` named `name`. Records a start event
@@ -191,6 +196,35 @@ impl EventPool {
         for p in &inner.pairs {
             f(p.name, &inner.events[p.start_idx], &inner.events[p.end_idx])?;
         }
+        Ok(())
+    }
+
+    /// Like [`Self::for_each_pair`] but only over pairs recorded SINCE the last
+    /// call, and it advances the watermark.
+    ///
+    /// Needed because work can be recorded into this pool AFTER the per-token
+    /// export runs. The DSpark drafter is exactly that: `forward_token_impl`
+    /// exports at its end, then the accept loop runs `dspark_draft`, whose stages
+    /// land here and are then discarded by the NEXT token's `reset()`. The result
+    /// was that the drafter -- ~26 ms/step, both GPUs -- could never appear on a
+    /// perfetto trace at all, showing up only as an unexplained gap.
+    pub fn for_each_pair_new<F>(&self, mut f: F) -> eyre::Result<()>
+    where
+        F: FnMut(&'static str, &Event, &Event) -> eyre::Result<()>,
+    {
+        let mut inner = self.inner.borrow_mut();
+        let from = inner.exported.min(inner.pairs.len());
+        if from >= inner.pairs.len() {
+            return Ok(());
+        }
+        if let Some(last) = inner.pairs.last() {
+            inner.events[last.end_idx].synchronize()?;
+        }
+        for i in from..inner.pairs.len() {
+            let p = &inner.pairs[i];
+            f(p.name, &inner.events[p.start_idx], &inner.events[p.end_idx])?;
+        }
+        inner.exported = inner.pairs.len();
         Ok(())
     }
 }

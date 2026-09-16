@@ -364,6 +364,7 @@ impl MtpState {
                 MTP_SRC_LAYERS[i]
             ));
         }
+        let _t = e.events.stage("mtp.entry", s)?;
         let k = (MTP_SRC_LAYERS.len() * N_EMBD as usize) as u32;
         // `main_proj` is Q8_0, so `dense_matvec` reads the QUANTIZED input, not
         // the f32 one. Skipping this leaves xq/xscale zeroed and the projection
@@ -523,6 +524,11 @@ impl MtpState {
         rope: &crate::RopeParams,
         pos: u32,
     ) -> eyre::Result<()> {
+        // The drafter emitted NO perfetto stages at all, so its ~26 ms/step was
+        // invisible on every trace -- it showed up only as an unexplained gap on
+        // igpu.compute with "zero device work on any track". Name it like the
+        // main model's layers so the two are directly comparable.
+        let _t = e.events.stage("mtp.layer", s)?;
         self.hc_mixes(e, s, &w.hc_attn_fn, &w.hc_attn_scale, &w.hc_attn_base)?;
         self.hc_pre_and_carry(e, s)?;
         e.rms_w.launch_weighted_batched(
@@ -591,6 +597,11 @@ impl MtpState {
         token_row: &[f32],
         noise_row: &[f32],
     ) -> eyre::Result<()> {
+        // Distinct stage name from `mtp.layer`: this is the PER-ACCEPTED-TOKEN
+        // cost (~17 ms measured), paid once per token the verify keeps, whereas
+        // `mtp.layer` is paid once per draft. On the timeline they interleave and
+        // would otherwise be indistinguishable.
+        let _t = e.events.stage("mtp.advance_ring", s)?;
         // CORRECT cheap advance: run the full drafter layer forward (which writes
         // the ring AND advances the hyper-connection carry `cur`/`pre_carry`),
         // and skip ONLY the exit/head/markov — the part whose output we discard
@@ -1004,6 +1015,10 @@ impl MtpExit {
         markov_dtype: v4flash_core::gguf::GgufType,
         first_token: i32,
     ) -> eyre::Result<([i32; MTP_BLOCK], [i32; MTP_BLOCK])> {
+        // Runs on the dGPU (the head is tied to the main model's `output`), so
+        // this lands on dgpu.compute while `mtp.layer` lands on igpu.compute --
+        // the split is visible on the timeline rather than inferred.
+        let _t = e.events.stage("mtp.exit", s)?;
         let ne = N_EMBD as usize;
         let nv = N_VOCAB as usize;
         if h_host.len() != MTP_BLOCK * HC_DIM as usize
