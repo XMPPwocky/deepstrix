@@ -4430,6 +4430,9 @@ impl HeterogeneousEngine {
         // from the daemon. `ew` must be zeroed in the same slots.
         // Empty = no override, use the old path.
         let mut sel_for_remote: Vec<i32> = Vec::new();
+        // Hoisted so the exclusion/audit (which must run AFTER `ensure`) can still
+        // see what the masking (now hoisted ABOVE `ensure`) decided.
+        let mut owns_eff: Vec<bool> = Vec::new();
         let mut ew_for_remote: Vec<f32> = Vec::new();
         // Picks box 1 declined because it does not hold them; box 2 must claim
         // exactly these ON TOP of what it advertises.
@@ -4646,6 +4649,190 @@ impl HeterogeneousEngine {
                 debug_assert_eq!(sparse_resid, !replay_offload && speculative_append()
                     && !sparse_verify_residency_off()
                     && pg.sparse_group_ids_in_range());
+                // MOVED ABOVE `ensure` so box 2 starts while box 1 pages.
+                // Pure reorder, not a policy change: the split DECISION
+                // (`extra_remote` vs `ids`) is taken in the pick loop further up,
+                // before any paging, so nothing here reads residency that `ensure`
+                // is about to change. Only the exclusion/audit below genuinely
+                // need post-`ensure` state, and they stay there.
+                sel_host_remote = sel_host;
+                if group_audit() {
+                    sel_host_audit = sel_host_remote.clone();
+                }
+                // Two-box split: tell the iGPU to skip the experts box 2 owns.
+                // Built here, while we still hold `&mut pg`; consumed below via
+                // `pg.remap_dev` under the shared borrow.
+                if remote_split_on {
+                    if let Some(remote) = self.remote.as_ref() {
+                        let _t_owns = LayerHostTimer::start(&LH_OWNS);
+                        let owns: Vec<bool> = {
+                            let c = remote
+                                .lock()
+                                .map_err(|_| eyre!("remote expert client mutex poisoned"))?;
+                            (0..N_EXPERT).map(|e| c.owns(layer as u32, e as i32)).collect()
+                        };
+                        drop(_t_owns);
+                        let dry = !remote_exclude();
+                        if std::env::var("V41_REMOTE_DBG").is_ok() {
+                            let n_owned = owns.iter().filter(|&&o| o).count();
+                            let picks_remote = sel_host_remote
+                                .iter()
+                                .filter(|&&e| (0..N_EXPERT as i32).contains(&e) && owns[e as usize])
+                                .count();
+                            eprintln!(
+                                "[excl-dbg] L{layer} owned={n_owned}/{N_EXPERT} \
+                                 picks_remote={picks_remote}/{} dry={dry}",
+                                sel_host_remote.len(),
+                            );
+                        }
+                        // Under replay offload EVERY expert on this layer is box 2's.
+                        // Box 2 must claim the picks box 1 declined for lack of
+                        // residency, or they are computed by NOBODY — silently,
+                        // since the check below validates this vector, not box
+                        // 2's advertised table.
+                        owns_eff = (0..N_EXPERT as usize)
+                            .map(|e| replay_offload || extra_remote[e] || (!dry && owns[e]))
+                            .collect();
+                        // Only when the hub actually reassigned something. With
+                        // nothing reassigned `owns_eff` IS box 2's advertised
+                        // bitmap, so this would be a no-op — but leaving the old
+                        // path untouched keeps the default byte-identical.
+                        if !dry && extra_remote.iter().any(|&x| x) {
+                            sel_for_remote = sel_host_remote
+                                .iter()
+                                .map(|&e| {
+                                    if (0..N_EXPERT as i32).contains(&e) && owns_eff[e as usize] {
+                                        e
+                                    } else {
+                                        super::remote_experts::NO_PICK
+                                    }
+                                })
+                                .collect();
+                        }
+                }
+                // SUBMIT BEFORE PAGING. Box 2 needs only the router's picks and the
+                // activations, both ready above; it does NOT need box 1 to have
+                // finished `ensure`. Issued here, box 2's ~33 ms of round trip
+                // overlaps box 1's paging AND its whole dGPU chain, instead of
+                // starting ~160 lines later and being waited on in post_moe.
+                if let (true, Some(remote), Some(xq_dev)) =
+                    (remote_split_on, self.remote.as_ref(), sd.remote_xq.as_mut())
+                {
+                    {
+                        let _t_remote = LayerHostTimer::start(&LH_REMOTE);
+                        let n_sel = (b as usize) * cs_n_used;
+                        let xq_bytes = (b as usize)
+                            * (crate::config::BLOCKS_Q8K_GATE_IN as usize)
+                            * crate::q8_k::BLOCK_Q8_K_BYTES;
+                        // The pager just left the iGPU current (it binds its own device
+                        // to allocate slots). `de.q8k` is a dGPU module and HIP resolves
+                        // module handles against the CURRENT device, so launching
+                        // without rebinding fails with hipErrorInvalidHandle.
+                        //
+                        // This MUST be the uncached bind. `set_current_cached` skips the
+                        // real `hipSetDevice` when its cached id already matches, and the
+                        // pager switched devices via `Device::set_current` directly —
+                        // the engine's cache never saw it and is stale, so the cached
+                        // setter is a silent no-op here. Re-sync the cache after, or the
+                        // next cached call inherits the same staleness.
+                        self.dgpu.device.set_current()?;
+                        self.current_device.store(
+                            self.dgpu.device.id,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        // Same kernel the iGPU would use, so the bytes match by
+                        // construction rather than by agreement.
+                        de.q8k.launch(
+                            &de.compute,
+                            xq_dev,
+                            &bd.ffn_input_norm,
+                            crate::config::BLOCKS_Q8K_GATE_IN * b,
+                        )?;
+                        de.compute.synchronize()?;
+                        let mut xq_host = vec![0u8; xq_bytes];
+                        xq_dev.slice_view(0, xq_bytes).copy_to_host(&mut xq_host)?;
+                        let mut ew_host = vec![0f32; n_sel];
+                        bd.d_ew.slice_view(0, n_sel).copy_to_host(&mut ew_host)?;
+                        // Hash what box 1 SENDS. If xq repeats across layers, the stale
+                        // value is box 1's own `ffn_input_norm`, not anything remote.
+                        if std::env::var("V41_REMOTE_DBG").is_ok() {
+                            let mut hx: u64 = 0xcbf29ce484222325;
+                            for &v in xq_host.iter().step_by(37) {
+                                hx ^= v as u64;
+                                hx = hx.wrapping_mul(0x100000001b3);
+                            }
+                            let mut hs: u64 = 0xcbf29ce484222325;
+                            for &v in sel_host_remote.iter() {
+                                hs ^= v as u64;
+                                hs = hs.wrapping_mul(0x100000001b3);
+                            }
+                            eprintln!("[submit-src] L{layer} b={b} xq_hash={hx:016x} sel_hash={hs:016x}");
+                        }
+                        // `sel_host` above is this chunk's router picks; reuse it.
+                        let t_sub = super::perfetto::now_ns();
+                        let ticket = remote
+                            .lock()
+                            .map_err(|_| eyre!("remote expert client mutex poisoned"))?
+                            // Last arg is `resp_f32`, NOT "is the split on". This used to
+                            // read `remote_split_on` — an unrelated boolean that happens to
+                            // be true whenever we get here, so it worked by coincidence and
+                            // would have panicked the moment the two diverged. Now explicit.
+                            //
+                            // f32 is LOAD-BEARING: the consumer below calls
+                            // `RemotePartial::f32()`, which asserts `is_f32`. It is not a
+                            // free choice, and asking for f16 panics with "partial is f16"
+                            // (measured 2026-09-14) until an f16 remote-add path exists.
+                            //
+                            // Worth building: at B=512 an f32 partial is 512*5120*4 =
+                            // 10.49 MB/request, 3760 requests = 39.4 GB over a 724 MB/s
+                            // link = ~54 s of a 160 s prefill. f16 halves it. See
+                            // docs/v41/PREFILL_100K_PROFILE.md.
+                            // MASKED vs UNMASKED. `submit` filters the picks down to what
+                            // box 2 ADVERTISED it owns, leaving the rest for box 1. Under
+                            // the small-B offload box 1 computes nothing, so a masked
+                            // submit leaves every unadvertised pick computed by NOBODY —
+                            // silently, because `verify_routing_exactly_once` validates
+                            // the hub's own `owns_eff`, not box 2's advertised table. That
+                            // halved the drafter's acceptance (E 2.12 -> 1.10) before it
+                            // was caught. `submit_unmasked` is what the hub already does
+                            // under T2 catch-all: hand box 2 every pick and let it page.
+                            .submit_dispatch(
+                                !sel_for_remote.is_empty(),
+                                layer as u32,
+                                b as usize,
+                                &xq_host,
+                                if sel_for_remote.is_empty() { &sel_host_remote } else { &sel_for_remote },
+                                if sel_for_remote.is_empty() {
+                                    &ew_host
+                                } else {
+                                    // Zero the weights of the slots we masked out.
+                                    ew_for_remote = ew_host
+                                        .iter()
+                                        .zip(&sel_for_remote)
+                                        .map(|(&w, &e)| if e == super::remote_experts::NO_PICK { 0.0 } else { w })
+                                        .collect();
+                                    &ew_for_remote
+                                },
+                                true,
+                            )?;
+                        let t_sub_end = super::perfetto::now_ns();
+                        // Stash, don't wait: the local iGPU MoE for this layer is issued
+                        // right after this block, and post-MoE collects the reply. The
+                        // gap between the `submit` and `wait` slices on the
+                        // `remote.expert (host)` track IS the overlap we bought.
+                        bd.remote_ticket = ticket;
+                        bd.remote_ffn_moe_layer = layer as i32;
+                        if let Some(pf) = self.perfetto.as_ref() {
+                            if let Ok(pf) = pf.lock() {
+                                let _ = pf.emit_host_slice(
+                                    pf.remote_uuid,
+                                    &format!("submit L{layer} b={b}"),
+                                    t_sub, t_sub_end,
+                                );
+                            }
+                        }
+                    }
+                }
                 let _t_ensure = LayerHostTimer::start(&LH_ENSURE);
                 if replay_offload {
                     ids.clear();
@@ -4693,60 +4880,7 @@ impl HeterogeneousEngine {
                     let d = pg.counters().prefill_misses.saturating_sub(mc0);
                     LAYER_MISS[layer as usize].fetch_add(d, std::sync::atomic::Ordering::Relaxed);
                 }
-                sel_host_remote = sel_host;
-                if group_audit() {
-                    sel_host_audit = sel_host_remote.clone();
-                }
-                // Two-box split: tell the iGPU to skip the experts box 2 owns.
-                // Built here, while we still hold `&mut pg`; consumed below via
-                // `pg.remap_dev` under the shared borrow.
-                if remote_split_on {
-                    if let Some(remote) = self.remote.as_ref() {
-                        let _t_owns = LayerHostTimer::start(&LH_OWNS);
-                        let owns: Vec<bool> = {
-                            let c = remote
-                                .lock()
-                                .map_err(|_| eyre!("remote expert client mutex poisoned"))?;
-                            (0..N_EXPERT).map(|e| c.owns(layer as u32, e as i32)).collect()
-                        };
-                        drop(_t_owns);
-                        let dry = !remote_exclude();
-                        if std::env::var("V41_REMOTE_DBG").is_ok() {
-                            let n_owned = owns.iter().filter(|&&o| o).count();
-                            let picks_remote = sel_host_remote
-                                .iter()
-                                .filter(|&&e| (0..N_EXPERT as i32).contains(&e) && owns[e as usize])
-                                .count();
-                            eprintln!(
-                                "[excl-dbg] L{layer} owned={n_owned}/{N_EXPERT} \
-                                 picks_remote={picks_remote}/{} dry={dry}",
-                                sel_host_remote.len(),
-                            );
-                        }
-                        // Under replay offload EVERY expert on this layer is box 2's.
-                        // Box 2 must claim the picks box 1 declined for lack of
-                        // residency, or they are computed by NOBODY — silently,
-                        // since the check below validates this vector, not box
-                        // 2's advertised table.
-                        let owns_eff: Vec<bool> = (0..N_EXPERT as usize)
-                            .map(|e| replay_offload || extra_remote[e] || (!dry && owns[e]))
-                            .collect();
-                        // Only when the hub actually reassigned something. With
-                        // nothing reassigned `owns_eff` IS box 2's advertised
-                        // bitmap, so this would be a no-op — but leaving the old
-                        // path untouched keeps the default byte-identical.
-                        if !dry && extra_remote.iter().any(|&x| x) {
-                            sel_for_remote = sel_host_remote
-                                .iter()
-                                .map(|&e| {
-                                    if (0..N_EXPERT as i32).contains(&e) && owns_eff[e as usize] {
-                                        e
-                                    } else {
-                                        super::remote_experts::NO_PICK
-                                    }
-                                })
-                                .collect();
-                        }
+                if remote_split_on && !owns_eff.is_empty() {
                         // The exclusion builder MUST match the allocator above.
                         // `set_remote_exclusion` rebuilds the whole remap from
                         // `window_of(layer)`, which is only valid for the DENSE
@@ -4781,7 +4915,7 @@ impl HeterogeneousEngine {
                             pg.remap(),
                             Some(&owns_eff),
                         )?;
-                    }
+                }
                 }
             } else {
                 pg.ensure_layer_dense(layer as i32)?;
@@ -4807,124 +4941,6 @@ impl HeterogeneousEngine {
         // right while the split was being validated but costs a real ~5.7 MB
         // round trip per layer once it is off — it showed up as a 48.6 -> 42.5
         // tok/s regression in the split-OFF arm of every A/B.
-        if let (true, Some(remote), Some(xq_dev)) =
-            (remote_split_on, self.remote.as_ref(), sd.remote_xq.as_mut())
-        {
-            {
-                let _t_remote = LayerHostTimer::start(&LH_REMOTE);
-                let n_sel = (b as usize) * cs_n_used;
-                let xq_bytes = (b as usize)
-                    * (crate::config::BLOCKS_Q8K_GATE_IN as usize)
-                    * crate::q8_k::BLOCK_Q8_K_BYTES;
-                // The pager just left the iGPU current (it binds its own device
-                // to allocate slots). `de.q8k` is a dGPU module and HIP resolves
-                // module handles against the CURRENT device, so launching
-                // without rebinding fails with hipErrorInvalidHandle.
-                //
-                // This MUST be the uncached bind. `set_current_cached` skips the
-                // real `hipSetDevice` when its cached id already matches, and the
-                // pager switched devices via `Device::set_current` directly —
-                // the engine's cache never saw it and is stale, so the cached
-                // setter is a silent no-op here. Re-sync the cache after, or the
-                // next cached call inherits the same staleness.
-                self.dgpu.device.set_current()?;
-                self.current_device.store(
-                    self.dgpu.device.id,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                // Same kernel the iGPU would use, so the bytes match by
-                // construction rather than by agreement.
-                de.q8k.launch(
-                    &de.compute,
-                    xq_dev,
-                    &bd.ffn_input_norm,
-                    crate::config::BLOCKS_Q8K_GATE_IN * b,
-                )?;
-                de.compute.synchronize()?;
-                let mut xq_host = vec![0u8; xq_bytes];
-                xq_dev.slice_view(0, xq_bytes).copy_to_host(&mut xq_host)?;
-                let mut ew_host = vec![0f32; n_sel];
-                bd.d_ew.slice_view(0, n_sel).copy_to_host(&mut ew_host)?;
-                // Hash what box 1 SENDS. If xq repeats across layers, the stale
-                // value is box 1's own `ffn_input_norm`, not anything remote.
-                if std::env::var("V41_REMOTE_DBG").is_ok() {
-                    let mut hx: u64 = 0xcbf29ce484222325;
-                    for &v in xq_host.iter().step_by(37) {
-                        hx ^= v as u64;
-                        hx = hx.wrapping_mul(0x100000001b3);
-                    }
-                    let mut hs: u64 = 0xcbf29ce484222325;
-                    for &v in sel_host_remote.iter() {
-                        hs ^= v as u64;
-                        hs = hs.wrapping_mul(0x100000001b3);
-                    }
-                    eprintln!("[submit-src] L{layer} b={b} xq_hash={hx:016x} sel_hash={hs:016x}");
-                }
-                // `sel_host` above is this chunk's router picks; reuse it.
-                let t_sub = super::perfetto::now_ns();
-                let ticket = remote
-                    .lock()
-                    .map_err(|_| eyre!("remote expert client mutex poisoned"))?
-                    // Last arg is `resp_f32`, NOT "is the split on". This used to
-                    // read `remote_split_on` — an unrelated boolean that happens to
-                    // be true whenever we get here, so it worked by coincidence and
-                    // would have panicked the moment the two diverged. Now explicit.
-                    //
-                    // f32 is LOAD-BEARING: the consumer below calls
-                    // `RemotePartial::f32()`, which asserts `is_f32`. It is not a
-                    // free choice, and asking for f16 panics with "partial is f16"
-                    // (measured 2026-09-14) until an f16 remote-add path exists.
-                    //
-                    // Worth building: at B=512 an f32 partial is 512*5120*4 =
-                    // 10.49 MB/request, 3760 requests = 39.4 GB over a 724 MB/s
-                    // link = ~54 s of a 160 s prefill. f16 halves it. See
-                    // docs/v41/PREFILL_100K_PROFILE.md.
-                    // MASKED vs UNMASKED. `submit` filters the picks down to what
-                    // box 2 ADVERTISED it owns, leaving the rest for box 1. Under
-                    // the small-B offload box 1 computes nothing, so a masked
-                    // submit leaves every unadvertised pick computed by NOBODY —
-                    // silently, because `verify_routing_exactly_once` validates
-                    // the hub's own `owns_eff`, not box 2's advertised table. That
-                    // halved the drafter's acceptance (E 2.12 -> 1.10) before it
-                    // was caught. `submit_unmasked` is what the hub already does
-                    // under T2 catch-all: hand box 2 every pick and let it page.
-                    .submit_dispatch(
-                        !sel_for_remote.is_empty(),
-                        layer as u32,
-                        b as usize,
-                        &xq_host,
-                        if sel_for_remote.is_empty() { &sel_host_remote } else { &sel_for_remote },
-                        if sel_for_remote.is_empty() {
-                            &ew_host
-                        } else {
-                            // Zero the weights of the slots we masked out.
-                            ew_for_remote = ew_host
-                                .iter()
-                                .zip(&sel_for_remote)
-                                .map(|(&w, &e)| if e == super::remote_experts::NO_PICK { 0.0 } else { w })
-                                .collect();
-                            &ew_for_remote
-                        },
-                        true,
-                    )?;
-                let t_sub_end = super::perfetto::now_ns();
-                // Stash, don't wait: the local iGPU MoE for this layer is issued
-                // right after this block, and post-MoE collects the reply. The
-                // gap between the `submit` and `wait` slices on the
-                // `remote.expert (host)` track IS the overlap we bought.
-                bd.remote_ticket = ticket;
-                bd.remote_ffn_moe_layer = layer as i32;
-                if let Some(pf) = self.perfetto.as_ref() {
-                    if let Ok(pf) = pf.lock() {
-                        let _ = pf.emit_host_slice(
-                            pf.remote_uuid,
-                            &format!("submit L{layer} b={b}"),
-                            t_sub, t_sub_end,
-                        );
-                    }
-                }
-            }
-        }
 
         // DEFERRED Stage 10. With `V41_PREFILL_PRESUBMIT=1` the shared expert is
         // issued HERE, after the remote submit, so its ~173 us of dGPU work lands
