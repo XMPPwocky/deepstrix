@@ -1028,15 +1028,41 @@ impl HeterogeneousEngine {
                     out_logits = self.head_from_row(head_scratch, bd, chunk_b - 1, weights)?;
                 }
             } else {
-                for i in 0..chunk_b {
-                    let logits = self.head_from_row(head_scratch, bd, i, weights)?;
-                    out_logits.extend_from_slice(&logits);
-                }
+                out_logits.extend_from_slice(&self.head_rows(head_scratch, bd, chunk_b, weights)?);
             }
 
             chunk_start = chunk_end;
         }
         Ok(out_logits)
+    }
+
+    /// Logits for rows `0..n` of `bd`, via the batched head when it applies.
+    /// Falls back to the per-row chain otherwise. See `forward_head_batch`.
+    fn head_rows(
+        &self,
+        head_scratch: &mut DgpuScratch,
+        bd: &BatchDgpuScratch,
+        n: usize,
+        weights: &HetModelWeights,
+    ) -> eyre::Result<Vec<f32>> {
+        #[cfg(feature = "v41")]
+        if self.forward_head_batch(
+            head_scratch,
+            &bd.residual,
+            &bd.hc_pre_carry,
+            n as u32,
+            &weights.global,
+        )? {
+            let nv = N_VOCAB as usize;
+            let mut out = vec![0f32; n * nv];
+            head_scratch.logits_b.slice_view(0, n * nv).copy_to_host(&mut out)?;
+            return Ok(out);
+        }
+        let mut out = Vec::with_capacity(n * N_VOCAB as usize);
+        for i in 0..n {
+            out.extend_from_slice(&self.head_from_row(head_scratch, bd, i, weights)?);
+        }
+        Ok(out)
     }
 
     /// Head over one batched row `idx` of `bd`: residual (+ under V4.1 the mHC
@@ -1334,14 +1360,10 @@ impl HeterogeneousEngine {
                     out_logits = logits;
                 }
             } else {
-                for i in 0..b_a {
-                    let logits = self.head_from_row(head_scratch, bd_a, i, weights)?;
-                    out_logits.extend_from_slice(&logits);
-                }
-                for i in 0..b_b {
-                    let logits = self.head_from_row(head_scratch, bd_b, i, weights)?;
-                    out_logits.extend_from_slice(&logits);
-                }
+                // One weight read per LANE (rows are contiguous within a lane),
+                // not one per row.
+                out_logits.extend_from_slice(&self.head_rows(head_scratch, bd_a, b_a, weights)?);
+                out_logits.extend_from_slice(&self.head_rows(head_scratch, bd_b, b_b, weights)?);
             }
 
             chunk_start = chunk_end;

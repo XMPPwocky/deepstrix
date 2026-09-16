@@ -36,6 +36,8 @@ pub const Q8_0_BLOCK_BYTES: u32 = 34;
 /// One workgroup processes 8 output rows in the gemv kernel.
 const GEMV_ROWS_PER_BLOCK: u32 = 8;
 const GEMV_WARP_LANES: u32 = 32;
+/// Max batch for `matvec_bpack` — mirrors GEMV_BPACK_MAX in q8_0_matvec.hip.
+const GEMV_BPACK_MAX: u32 = 16;
 
 #[allow(non_camel_case_types)]
 pub struct Q8_0Matvec {
@@ -241,6 +243,74 @@ impl Q8_0Matvec {
             shared_mem_bytes: 0,
         };
         launch_kernel!(function, cfg, stream, [out.raw(), weight.raw(), xq.raw(), xscale.raw(), k, n_rows, blocks])
+    }
+
+    /// B-PACKED batched GEMV: reads the weight matrix ONCE for all `batch`
+    /// activations instead of once per batch element.
+    ///
+    /// [`Self::matvec_batched`] puts the batch on `grid.z`, so every batch
+    /// element is an independent workgroup re-reading all of W -- its own doc
+    /// says so ("v0 of batching ... A v1 kernel will pack multiple batch elements
+    /// per WG"). On a bandwidth-bound shape that is the whole cost: the tied
+    /// vocab projection is ~700 MB and measures 1112 us/call at mean == max,
+    /// i.e. already at ~630 GB/s, so B calls cost B x 1.1 ms.
+    ///
+    /// Numerically IDENTICAL to `matvec_batched`, by construction: the per-(row,
+    /// b) accumulation keeps the same lane striding, the same
+    /// `scale * xscale * dot` expression and the same warp-reduction tree. Only
+    /// the weight LOAD is hoisted out of the batch loop.
+    ///
+    /// `batch` must be <= `GEMV_BPACK_MAX` (16) -- the accumulators are registers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_bpack(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        if batch > GEMV_BPACK_MAX {
+            return Err(eyre!(
+                "q8_0 matvec_bpack: batch={batch} exceeds GEMV_BPACK_MAX={GEMV_BPACK_MAX}"
+            ));
+        }
+        if k % Q8_0_BLOCK_ELEMS != 0 {
+            return Err(eyre!("q8_0 matvec_bpack: k={k} not a multiple of 32"));
+        }
+        let blocks = k / Q8_0_BLOCK_ELEMS;
+        let expected_weight_bytes =
+            (n_rows as usize) * (blocks as usize) * (Q8_0_BLOCK_BYTES as usize);
+        if weight.byte_len() != expected_weight_bytes {
+            return Err(eyre!(
+                "q8_0 matvec_bpack weight bytes: have {}, expected {}",
+                weight.byte_len(),
+                expected_weight_bytes
+            ));
+        }
+        if out.len() < (batch as usize) * (n_rows as usize)
+            || xq.len() < (batch as usize) * (k as usize)
+            || xscale.len() < (batch as usize) * (blocks as usize)
+        {
+            return Err(eyre!("q8_0 matvec_bpack: out/xq/xscale too small for batch={batch}"));
+        }
+        let function = self.module.get_function("q8_0_gemv_bpack_warp8")?;
+        let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
+        let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), weight.raw(), xq.raw(), xscale.raw(), k, n_rows, blocks, batch
+        ])
     }
 
     /// M40-P4.5: 2-wide pair GEMV. Same as `matvec` but processes TWO input

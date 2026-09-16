@@ -34,6 +34,10 @@ pub fn hc_pre_onehot_rows() -> &'static [f32] {
     ROWS.get_or_init(|| HC_PRE_ONEHOT.repeat(super::batch_scratch::B_MAX))
 }
 
+/// Rows the batched head handles in one `matvec_bpack` call. Bounds `logits_b`
+/// (16 x N_VOCAB x 4 B = 8.3 MB) and mirrors GEMV_BPACK_MAX.
+pub const HEAD_BATCH_MAX: usize = 16;
+
 pub struct DgpuScratch {
     // Cross-layer residual
     pub residual: DeviceBuffer<f32>,
@@ -210,6 +214,13 @@ pub struct DgpuScratch {
     pub mid_sh_q8k: DeviceBuffer<u8>,
     pub head_xscale: DeviceBuffer<f32>,
     pub logits: DeviceBuffer<f32>,
+    /// BATCHED head. Prep (hc_weighted / rms_w / quantize) stays PER ROW so the
+    /// numerics are untouched; only the vocab matvec is batched, via
+    /// `matvec_bpack`, which reads the ~700 MB tied projection once for all rows
+    /// instead of once per row.
+    pub head_xq_b: DeviceBuffer<i8>,
+    pub head_xscale_b: DeviceBuffer<f32>,
+    pub logits_b: DeviceBuffer<f32>,
 
     // Sampler scratch (see crate::sampler). partials_max / partials_z
     // hold per-WG reductions consumed by softmax_sample_one. u01 is a
@@ -383,6 +394,9 @@ impl DgpuScratch {
             head_flat: DeviceBuffer::new(device_id, HC_DIM as usize)?,
             head_pre: DeviceBuffer::new(device_id, N_HC as usize)?,
             head_w: DeviceBuffer::new(device_id, N_HC as usize)?,
+            head_xq_b: DeviceBuffer::new(device_id, HEAD_BATCH_MAX * N_EMBD as usize)?,
+            head_xscale_b: DeviceBuffer::new(device_id, HEAD_BATCH_MAX * (N_EMBD as usize / 32))?,
+            logits_b: DeviceBuffer::new(device_id, HEAD_BATCH_MAX * N_VOCAB as usize)?,
             head_embd: DeviceBuffer::new(device_id, N_EMBD as usize)?,
             head_norm: DeviceBuffer::new(device_id, N_EMBD as usize)?,
             head_xq: DeviceBuffer::new(device_id, N_EMBD as usize)?,
