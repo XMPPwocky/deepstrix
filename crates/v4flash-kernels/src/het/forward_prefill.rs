@@ -260,8 +260,46 @@ fn swa_via_mixed() -> bool {
 /// row = 1.47 GB of L2/MALL traffic for 42 MB of unique bytes (V4-Flash
 /// measured 559 us per call at the narrower 16384 dim, 2.1 TB/s = the MALL
 /// wall). `f16_gemm_wmma_lds_tiled` reads X once. Rollback knob only.
-fn mhc_narrow_fallback() -> bool {
-    std::env::var("V41_MHC_NARROW").map(|v| v != "0").unwrap_or(false)
+/// Use the NARROW f32 matvec for the mHC pre-mix instead of the WMMA GEMM.
+///
+/// **DEFAULT ON for b <= 64 since 2026-09-16.** Two independent reasons:
+///
+/// 1. CORRECTNESS. `ARCH_SPEC` §1.1 requires "mHC math entirely fp32"
+///    (:167, and `hc_fn [24, 20480] fp32` at :42). `gemm_batched_wmma` casts the
+///    ACTIVATIONS down to f16 before multiplying
+///    (`f16_gemm_wmma.hip:104`, `vals[e] = (_Float16)x_row[e]`), so the mix runs
+///    in f16. `matvec_narrow_batched` upconverts the weight and multiplies and
+///    accumulates in f32 (`f16_matvec_narrow.hip:39`), which is what the spec
+///    asks for.
+///
+/// 2. SPEED at this shape. `HC_MIX_DIM` is 24, and the WMMA grid is
+///    `(ceil(24/64), ceil(b/64), 1)` = ONE workgroup for any b <= 64, while the
+///    K-loop still reads the whole 983 KB weight. Measured 478 us/call at BOTH
+///    b=6 and b=512 -- batch-independent, ~196x off roofline at b=6, with a
+///    useful-work fraction near 0.05%. `f16.rs:28` already documents
+///    `NARROW_ROWS_THRESHOLD = 64` as "calibrated against the mhc_pre_* calls
+///    (n_rows=24) on gfx1201"; the batched path simply bypassed it.
+///
+/// MEASURED back-to-back, DSpark accept, 648-token prompt:
+///
+///     WMMA   193 ms/tok  5.19 tok/s   sel_sync 184.1 ms   E 2.314
+///     narrow 106 ms/tok  9.48 tok/s   sel_sync 115.9 ms   E 2.574
+///
+/// The `sel_sync` drop is the mechanism: the mix sits on the stream the
+/// per-layer `de.compute.synchronize()` waits on, so removing pointless WMMA
+/// work shortens the host's blocking sync. E rising is the correctness half --
+/// the drafter is untouched, so better agreement means the VERIFY moved closer
+/// to the reference.
+///
+/// Kept WMMA above 64: `matvec_narrow_batched` launches `n_rows * b` workgroups
+/// and hits a MALL wall at prefill batches (`forward_prefill.rs` note on the
+/// B=512 case). `V41_MHC_NARROW=0` forces WMMA, `=1` forces narrow.
+fn mhc_narrow_fallback_for(b: u32) -> bool {
+    match std::env::var("V41_MHC_NARROW").ok().as_deref() {
+        Some("0") => false,
+        Some(_) => true,
+        None => b <= 64,
+    }
 }
 
 
@@ -1513,20 +1551,43 @@ impl HeterogeneousEngine {
                 if n > 0 {
                     let de = &self.dgpu;
                     self.set_current_cached(de.device)?;
+                    // Capture the LAST `n` rows of the batch, not the first.
+                    //
+                    // For a VERIFY this is a no-op: `mtp_capture_rows == b`, so
+                    // skip == 0 and the whole batch is taken either way. It
+                    // matters for PREFILL SEEDING, where the chunk can be far
+                    // longer than the ring and the rows we want are the MOST
+                    // RECENT prompt positions -- the ones the drafter will
+                    // actually attend over when generation starts.
+                    let skip = tokens.len() - n;
+                    let nhc = crate::config::N_HC as usize;
                     let mut dst = bd.mtp_src.slice_view_mut(
                         slot * super::batch_scratch::MTP_CAP_ROWS * ne,
                         n * ne,
                     );
+                    // Only `x` moves. The kernel indexes both per batch row
+                    // (`x + b*n_hc*n_embd`, `weights + b*w_stride`), but
+                    // `mtp_hc_mean` is only `N_HC * MTP_CAP_ROWS` long and is a
+                    // CONSTANT 1/n_hc everywhere, so rows [0,n) are numerically
+                    // identical to rows [skip, skip+n) -- and skipping it would
+                    // run off the end for any chunk longer than MTP_CAP_ROWS.
+                    let src = bd.residual.slice_view(skip * nhc * ne, n * nhc * ne);
+                    let wsrc = bd.mtp_hc_mean.slice_view(0, n * nhc);
                     de.hc_weighted.launch_batched(
                         &de.compute,
                         &mut dst,
-                        &bd.residual,
-                        &bd.mtp_hc_mean,
+                        &src,
+                        &wsrc,
                         crate::config::N_EMBD,
                         crate::config::N_HC,
                         crate::config::N_HC,
                         n as u32,
                     )?;
+                    // Which absolute positions these rows are. Both lanes may
+                    // capture; the caller takes whichever ran LATER (higher
+                    // pos0), since that lane holds the most recent positions.
+                    bd.mtp_captured = n;
+                    bd.mtp_captured_pos0 = pos0 + skip as u32;
                 }
             }
         }
@@ -1610,7 +1671,7 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.mhc_pre_attn.f16_matvec", &de.compute)?;
-            if mhc_narrow_fallback() {
+            if mhc_narrow_fallback_for(b) {
                 de.f16.matvec_narrow_batched(
                     &de.compute,
                     &mut sd.mix,
@@ -3614,7 +3675,7 @@ impl HeterogeneousEngine {
         }
         {
             let _t = de.events.stage("k.mhc_pre_ffn.f16_matvec", &de.compute)?;
-            if mhc_narrow_fallback() {
+            if mhc_narrow_fallback_for(b) {
                 de.f16.matvec_narrow_batched(
                     &de.compute,
                     &mut sd.mix,
