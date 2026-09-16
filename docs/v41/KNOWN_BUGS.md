@@ -55,6 +55,32 @@ bit-identical, and that divergence GROWS with position (2.2e-03 at pos 42 ->
 B=1-specialised score/smwsum; prefill uses batched per-row windows. Compare
 those two directly -- what each attends over, and in what order it reduces.
 
+### Reproducing #0b in one command
+
+    env V41_T2_CATCHALL=2 V41_PAGER_WINDOWS=21 \
+        V41_VERIFY_PROBE=1,1 V41_VERIFY_BATCHED=1 \
+        bash ~/run_v41_server.sh
+    # then one long request (>= ~600 prompt tokens), and read:
+    #   dspark.xcheck: ... agree=N total=M ... mean_kld_nats=...
+    # `agree/total` is the number that matters (accept mode emits row_argmax(0)).
+    # Current: ~69/111 (62%), KLD ~1.9 nats.
+
+Per-layer bisection, both paths, same position:
+
+    env ... DEEPSTRIX_DUMP_SUBTENSOR_LAYERS=0,1 DEEPSTRIX_DUMP_SUBTENSOR_DIR=/tmp/d ...
+    # writes layer_<NN>_{pf,dec}_{pre_residual,attn_cur,attn_out,heads}_p<POS>.bin
+    # diff pf vs dec at the same layer and position.
+
+**Next thing to check (unverified):** whether the two paths attend over the SAME
+compressed rows. Prefill clamps `n_comp_per` to `min(actual, INDEXER_TOP_K)`
+(`forward_prefill.rs`, "so score+smwsum iterate only over the gathered top-K
+rows"); decode picks sparse `INDEXER_TOP_K.min(n_index_comp)` when the indexer
+gate fires and DENSE `n_comp_full` otherwise (`forward_layer.rs`). The counts
+may agree while the SELECTED ROWS differ. That would be a structural difference
+in what attention sees -- which fits a differently-shaped distribution far
+better than any precision mismatch, and fits the position-dependence of the
+`heads` divergence.
+
 ## Methodology warning
 
 ### Verify-vs-decode KLD and ACCEPT RATE can move in OPPOSITE directions
