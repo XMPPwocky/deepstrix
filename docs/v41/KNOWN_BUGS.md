@@ -8,6 +8,28 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ---
 
+## Methodology warning
+
+### Verify-vs-decode KLD and ACCEPT RATE can move in OPPOSITE directions
+Measured 2026-09-16. Aligning the Q/KV/output projections to decode's kernels
+reduced verify-vs-decode KLD 2.026 -> 1.631 nats while DROPPING accept rate
+1.788 -> 1.372. Reverted (16ec20a). One of those changes also fed
+`q8.matvec_batched` a stale `xq_n_embd` -- the f16x arm it replaced consumes
+`x16_n_embd`, and the Q8 quantisation is only performed on the non-f16x arms.
+
+**Score verify changes on E and on output coherence, not on KLD alone.** KLD is
+a proxy; it is not the objective, and this session shows it can point the wrong
+way.
+
+For reference, what the kept fixes are worth on E (back-to-back, same prompt):
+
+    pre-session kernels                     E 1.788
+    + mHC pre-scaled, fp32 gate/compressor/indexer
+                                            E 3.500   (oracle base 4.382)
+
+Output is still degenerate at E 3.500, so ACCEPTANCE and COHERENCE are separable
+problems here -- raising E does not by itself fix #0b.
+
 ## Silent wrongness
 
 ### 0b. OPEN — verify vs decode ~1.9 nats, **SEEDED AT LAYER 0 by a different `hc_mixes` kernel**
