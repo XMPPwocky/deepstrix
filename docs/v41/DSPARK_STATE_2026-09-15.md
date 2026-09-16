@@ -221,3 +221,42 @@ expert-format work), not speculation. Every correctness bug found this pass is
 real and worth keeping (they were corrupting the verify and, via the shared
 KvMark/partials/read_f32 paths, risked decode too), but they do not make
 speculation pay here.
+
+## CORRECTED AGAIN (2026-09-16): it's the DRAFTER's accept-mode context, not economics
+
+Retracting the "economics / reduce-order" framing — that was hand-waving. Measured,
+not reasoned:
+
+- accept E is ~1.8 with the catch-all ON *and* OFF (1.81 vs 1.766), so verify
+  fidelity (0.87 vs 0.93 argmax) is NOT the E lever. "Reduce-order" cannot cause
+  0.28 nats anyway — that was an excuse.
+- shadow E (drafter drafts from decode's clean stream, ring fills every token) =
+  3.077. accept E = 1.8. The gap is the DRAFTER drafting worse in accept mode.
+
+Why: in accept mode `dspark_draft` runs ONCE PER STEP (282 calls for 498 tokens),
+so the drafter's own KV ring is written ~282 times for 498 positions — it drafts
+from a **~43% sparse window**. In shadow it gets every position. Plus the
+drafter's `main_hidden` in accept mode is the VERIFY's residual (box-1 prefill
+path), not decode's, so its input is off by the verify's divergence. Both are
+drafter-INPUT problems, and both are fixable:
+  1. write the drafter's ring for EVERY accepted token (not just the redraft
+     position), so its window is dense like shadow's.
+  2. feed the drafter decode's residual for `main_hidden`, not the prefill
+     verify's.
+
+## Throughput, separately: the verify forward is 179 ms, must amortize to ~67
+
+Profile of the accept step (warm): fwd 165-196 ms, draft 26 ms, argmax/roll <1 ms.
+A B=6 verify is ONE forward over 6 positions; the per-layer link RTT and sel_sync
+are fixed and should amortize across the 6 rows, so it should cost ~one decode
+token (67 ms) plus box-2's extra 5-row compute, NOT 179 ms = 2.7x a decode token.
+The verify uses forward_prefill_pipelined (box-1 PREFILL dense chain); the fix is
+to run box-1's DECODE forward batched over the B rows (the batched-decode entry
+point), which is both faithful (matches decode) and amortized.
+
+Net: DSpark's two real blockers are (1) the drafter's accept-mode ring/main_hidden
+context (caps E at 1.8 vs the 3.077 ceiling), and (2) the verify running box-1's
+prefill forward instead of a batched decode forward (179 ms vs ~67). Both are
+implementation bugs in the accept path, NOT kernel numerics and NOT "economics".
+At the shadow ceiling E=3.077 and an amortized ~90 ms verify, DSpark prices at
+~30 ms/token — past 20 tok/s.
