@@ -294,6 +294,32 @@ fn swa_via_mixed() -> bool {
 /// Kept WMMA above 64: `matvec_narrow_batched` launches `n_rows * b` workgroups
 /// and hits a MALL wall at prefill batches (`forward_prefill.rs` note on the
 /// B=512 case). `V41_MHC_NARROW=0` forces WMMA, `=1` forces narrow.
+/// Prefill must reproduce DECODE at verify-sized batches.
+///
+/// The batched path was optimised with `gemm_batched_wmma`, which casts the
+/// activations to f16 (`f16_gemm_wmma.hip`, `vals[e] = (_Float16)x_row[e]`),
+/// while decode kept the f32 `de.f16.matvec` at every one of these sites. The
+/// two paths therefore computed different numbers BY CONSTRUCTION -- fatal for
+/// DSpark, whose verify must reproduce decode -- and each site also violates an
+/// explicit fp32 requirement:
+///
+///   - MoE gate            `ARCH_SPEC:104,162`  "Gate math fp32"
+///   - compressor kv/score `ARCH_SPEC:78`       "fp32 kv = wkv(x), score = wgate(x)"
+///   - mHC pre-mix         `ARCH_SPEC:167`      "mHC math entirely fp32"
+///
+/// `matvec_batched` is bit-identical to a per-batch loop of decode's `matvec`
+/// (see f16.rs), so below the threshold verify == decode exactly. WMMA is kept
+/// for large prefill chunks, where `matvec_batched` re-reads the weight per
+/// batch element and goes weight-BW-bound. `V41_PREFILL_F32_MATVEC=0` restores
+/// the old all-WMMA behaviour; `=1` forces f32 at every batch size.
+fn prefill_f32_matvec(b: u32) -> bool {
+    match std::env::var("V41_PREFILL_F32_MATVEC").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => b <= 64,
+    }
+}
+
 fn mhc_narrow_fallback_for(b: u32) -> bool {
     match std::env::var("V41_MHC_NARROW").ok().as_deref() {
         Some("0") => false,
@@ -2064,24 +2090,48 @@ impl HeterogeneousEngine {
                 .map(|v| v != "0")
                 .unwrap_or(false);
             if comp_gemm {
+                if prefill_f32_matvec(b) {
+                de.f16.matvec_batched(
+                        &de.compute,
+                        &mut sd.kv_cur,
+                        &cw.wkv.buffer,
+                        &sd.attn_input_norm,
+                        comp_width,
+                        N_EMBD,
+                        b,
+                    )?;
+                } else {
                 de.f16.gemm_batched_wmma(
-                    &de.compute,
-                    &mut sd.kv_cur,
-                    &cw.wkv.buffer,
-                    &sd.attn_input_norm,
-                    comp_width,
-                    N_EMBD,
-                    b,
-                )?;
+                        &de.compute,
+                        &mut sd.kv_cur,
+                        &cw.wkv.buffer,
+                        &sd.attn_input_norm,
+                        comp_width,
+                        N_EMBD,
+                        b,
+                    )?;
+                }
+                if prefill_f32_matvec(b) {
+                de.f16.matvec_batched(
+                        &de.compute,
+                        &mut sd.sc_cur,
+                        &cw.wgate.buffer,
+                        &sd.attn_input_norm,
+                        comp_width,
+                        N_EMBD,
+                        b,
+                    )?;
+                } else {
                 de.f16.gemm_batched_wmma(
-                    &de.compute,
-                    &mut sd.sc_cur,
-                    &cw.wgate.buffer,
-                    &sd.attn_input_norm,
-                    comp_width,
-                    N_EMBD,
-                    b,
-                )?;
+                        &de.compute,
+                        &mut sd.sc_cur,
+                        &cw.wgate.buffer,
+                        &sd.attn_input_norm,
+                        comp_width,
+                        N_EMBD,
+                        b,
+                    )?;
+                }
             } else if ratio == 1 {
                 // V4.1 ratio 1 (layer 20): latent = norm(wkv(x)) — one batched matvec,
                 // no gate. `sc_cur` is zeroed so the (identity) 1-row pool sees finite
@@ -2380,15 +2430,27 @@ impl HeterogeneousEngine {
                             (iw.attn_k.as_ref(), iw.k_norm.as_ref(), cs.index_k.as_mut())
                         {
                             let _t = de.events.stage("k.comp_b.index_k", &de.compute)?;
+                            if prefill_f32_matvec(n_boundaries) {
+                            de.f16.matvec_batched(
+                                    &de.compute,
+                                    &mut sd.index_k_rows_batched,
+                                    &wk.buffer,
+                                    &sd.comp_rows_batched,
+                                    N_INDEXER_HEAD_DIM,
+                                    N_HEAD_DIM,
+                                    n_boundaries,
+                                )?;
+                            } else {
                             de.f16.gemm_batched_wmma(
-                                &de.compute,
-                                &mut sd.index_k_rows_batched,
-                                &wk.buffer,
-                                &sd.comp_rows_batched,
-                                N_INDEXER_HEAD_DIM,
-                                N_HEAD_DIM,
-                                n_boundaries,
-                            )?;
+                                    &de.compute,
+                                    &mut sd.index_k_rows_batched,
+                                    &wk.buffer,
+                                    &sd.comp_rows_batched,
+                                    N_INDEXER_HEAD_DIM,
+                                    N_HEAD_DIM,
+                                    n_boundaries,
+                                )?;
+                            }
                             de.rms_w.launch_weighted_batched(
                                 &de.compute,
                                 &mut sd.index_k_normed_batched,
@@ -3011,15 +3073,27 @@ impl HeterogeneousEngine {
                 // weight-BW-bound on per-batch rereads at 156 ms/chunk.
                 {
                     let _t = de.events.stage("k.indexer.matvec_q", &de.compute)?;
+                    if prefill_f32_matvec(b) {
+                    de.f16.matvec_batched(
+                            &de.compute,
+                            &mut sd.indexer_q,
+                            &iw.attn_q_b.buffer,
+                            &sd.qr_normed,
+                            N_INDEXER_HEAD * N_INDEXER_HEAD_DIM,
+                            N_LORA_Q,
+                            b,
+                        )?;
+                    } else {
                     de.f16.gemm_batched_wmma(
-                        &de.compute,
-                        &mut sd.indexer_q,
-                        &iw.attn_q_b.buffer,
-                        &sd.qr_normed,
-                        N_INDEXER_HEAD * N_INDEXER_HEAD_DIM,
-                        N_LORA_Q,
-                        b,
-                    )?;
+                            &de.compute,
+                            &mut sd.indexer_q,
+                            &iw.attn_q_b.buffer,
+                            &sd.qr_normed,
+                            N_INDEXER_HEAD * N_INDEXER_HEAD_DIM,
+                            N_LORA_Q,
+                            b,
+                        )?;
+                    }
                 }
                 {
                     let _t = de.events.stage("k.indexer.rope", &de.compute)?;
