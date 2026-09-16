@@ -1626,10 +1626,19 @@ impl HeterogeneousEngine {
             self.dgpu.compute.synchronize()?;
             let hc = HC_DIM as usize;
             let ne = crate::config::N_EMBD as usize;
+            // Tag with the row's ABSOLUTE position, not just the layer.
+            // This runs once per LANE, and lane B's row 0 is position `b_a`, not
+            // 0 -- an untagged file is silently whichever lane wrote last, which
+            // produced a bogus "diverges at layer 0" reading (relRMSE 1.0 at
+            // every layer) when diffed against an oracle dump indexed by
+            // position. The position must be in the name for the diff to be
+            // well-posed.
+            let tag_r = format!("pf_pre_residual_p{pos0}");
+            let tag_n = format!("pf_attn_input_norm_p{pos0}");
             super::engine::maybe_dump_subtensor_f32_view(
-                layer as usize, "pf_pre_residual", &bd.residual.slice_view(0, hc))?;
+                layer as usize, &tag_r, &bd.residual.slice_view(0, hc))?;
             super::engine::maybe_dump_subtensor_f32_view(
-                layer as usize, "pf_attn_input_norm", &sd.attn_input_norm.slice_view(0, ne))?;
+                layer as usize, &tag_n, &sd.attn_input_norm.slice_view(0, ne))?;
         }
         if ilw.layer_idx != layer {
             return Err(eyre!(
