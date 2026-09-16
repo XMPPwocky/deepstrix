@@ -95,25 +95,57 @@ pub static MTP_H_ATTNO: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// so it is draining whatever the verify left queued on the SHARED igpu.compute.
 pub static MTP_H_KVCOPY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-pub fn mtp_host_timing() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("V41_DSPARK_LAYER_TIMING").as_deref() == Ok("1"))
+/// 0 = off, 1 = HOST (enqueue) time, 2 = DEVICE time via sync-and-time.
+///
+/// Mode 2 synchronises the drafter's stream at the end of each timed sub-block,
+/// so each figure is that block's device cost rather than its enqueue cost. It
+/// SERIALISES the layer, so the total inflates and mode-2 numbers are only
+/// comparable to each other -- but it is the honest way to split device time
+/// here. Perfetto is not: attaching it was MEASURED to inflate this engine's
+/// per-layer post-MoE time 4.4x and whole-run throughput 1.40x.
+pub fn mtp_timing_mode() -> u8 {
+    static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("V41_DSPARK_LAYER_TIMING").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
 }
 
-struct HostUs(&'static std::sync::atomic::AtomicU64, std::time::Instant, bool);
-impl HostUs {
-    fn start(c: &'static std::sync::atomic::AtomicU64) -> Self {
-        HostUs(c, std::time::Instant::now(), mtp_host_timing())
+pub fn mtp_host_timing() -> bool {
+    mtp_timing_mode() > 0
+}
+
+struct HostUs<'a>(
+    &'static std::sync::atomic::AtomicU64,
+    std::time::Instant,
+    u8,
+    Option<&'a Stream>,
+);
+impl<'a> HostUs<'a> {
+    fn start(c: &'static std::sync::atomic::AtomicU64) -> HostUs<'static> {
+        HostUs(c, std::time::Instant::now(), mtp_timing_mode(), None)
+    }
+    /// As `start`, but in mode 2 also drains `s` before stopping the clock, so
+    /// the figure is DEVICE time for this block.
+    fn start_dev(c: &'static std::sync::atomic::AtomicU64, s: &'a Stream) -> Self {
+        HostUs(c, std::time::Instant::now(), mtp_timing_mode(), Some(s))
     }
 }
-impl Drop for HostUs {
+impl<'a> Drop for HostUs<'a> {
     fn drop(&mut self) {
-        if self.2 {
-            self.0.fetch_add(
-                self.1.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+        if self.2 == 0 {
+            return;
         }
+        if self.2 == 2 {
+            if let Some(s) = self.3 {
+                let _ = s.synchronize();
+            }
+        }
+        self.0.fetch_add(
+            self.1.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
@@ -638,12 +670,12 @@ impl MtpState {
         // normal HIP launch. Nothing in the source explains that yet, so measure
         // where inside the layer it accrues before theorising.
         {
-            let _h = HostUs::start(&MTP_H_HCMIX);
+            let _h = HostUs::start_dev(&MTP_H_HCMIX, s);
             self.hc_mixes(e, s, &w.hc_attn_fn, &w.hc_attn_scale, &w.hc_attn_base)?;
             self.hc_pre_and_carry(e, s)?;
         }
         {
-            let _h = HostUs::start(&MTP_H_RMS);
+            let _h = HostUs::start_dev(&MTP_H_RMS, s);
             e.rms_w.launch_weighted_batched(
                 s, &mut self.normed, &self.cur, &w.attn_norm, N_EMBD, RMS_EPS, B,
             )?;
@@ -652,31 +684,31 @@ impl MtpState {
             let z = vec![0.0f32; self.attn_out.len()];
             self.attn_out.copy_from_host(&z)?;
         } else {
-            let _h = HostUs::start(&MTP_H_ATTN);
+            let _h = HostUs::start_dev(&MTP_H_ATTN, s);
             self.attn(e, s, w, li, rope, pos)?;
         }
         {
-            let _h = HostUs::start(&MTP_H_POST);
+            let _h = HostUs::start_dev(&MTP_H_POST, s);
             self.hc_post(e, s, true)?;
         }
 
         {
-            let _h = HostUs::start(&MTP_H_HCMIX);
+            let _h = HostUs::start_dev(&MTP_H_HCMIX, s);
             self.hc_mixes(e, s, &w.hc_ffn_fn, &w.hc_ffn_scale, &w.hc_ffn_base)?;
             self.hc_pre_and_carry(e, s)?;
         }
         {
-            let _h = HostUs::start(&MTP_H_RMS);
+            let _h = HostUs::start_dev(&MTP_H_RMS, s);
             e.rms_w.launch_weighted_batched(
                 s, &mut self.normed, &self.cur, &w.ffn_norm, N_EMBD, RMS_EPS, B,
             )?;
         }
         {
-            let _h = HostUs::start(&MTP_H_MOE);
+            let _h = HostUs::start_dev(&MTP_H_MOE, s);
             self.moe(e, s, w)?;
         }
         {
-            let _h = HostUs::start(&MTP_H_POST);
+            let _h = HostUs::start_dev(&MTP_H_POST, s);
             self.hc_post(e, s, false)?;
         }
         Ok(())
@@ -775,7 +807,7 @@ impl MtpState {
         rope: &crate::RopeParams,
         pos: u32,
     ) -> eyre::Result<()> {
-        let _hkv = HostUs::start(&MTP_H_ATTNKV);
+        let _hkv = HostUs::start_dev(&MTP_H_ATTNKV, s);
         let (n_valid, main_slot) = self.ring_geom();
         let n_kv = (n_valid + MTP_BLOCK) as u32;
         if n_kv > crate::attention::ATTN_MIXED_MAX_KEYS {
@@ -833,19 +865,32 @@ impl MtpState {
         drop(_hkv);
 
         // --- queries ---
-        let _hqa = HostUs::start(&MTP_H_ATTNQA);
-        for j in 0..MTP_BLOCK {
-            // `attn_q_a` is dtype-dispatched, and `dense_matvec` has no batched
-            // twin; B is 5, so the loop is cheaper than a new kernel.
-            let xr = self.normed.slice_view(j * N_EMBD as usize, N_EMBD as usize);
-            let xqr = self.xq.slice_view(j * N_EMBD as usize, N_EMBD as usize);
-            let xsr = self
-                .xscale
-                .slice_view(j * (N_EMBD as usize).div_ceil(32), (N_EMBD as usize).div_ceil(32));
-            let mut qo = self.qr.slice_view_mut(j * N_LORA_Q as usize, N_LORA_Q as usize);
-            crate::het::dispatch::dense_matvec(
-                e, s, &mut qo, &w.attn_q_a, &xr, &xqr, &xsr, N_LORA_Q, N_EMBD,
+        let _hqa = HostUs::start_dev(&MTP_H_ATTNQA, s);
+        // The comment here used to read "B is 5, so the loop is cheaper than a new
+        // kernel". MEASURED, that is false: this block costs 3074 us of DEVICE time
+        // per draft (V41_DSPARK_LAYER_TIMING=2), because each of the 5 iterations
+        // re-reads ALL of `attn_q_a`. `matvec_bpack` reads it once for all B and is
+        // bit-identical per (row, b) -- same lane striding, same scale*xscale*dot,
+        // same warp reduction, only the weight load hoisted out of the batch loop.
+        // Same defect as the verify head (d80ad9b) and the drafter's own exit head.
+        // Q8_0 only; `attn_q_a` is dtype-dispatched, so anything else keeps the loop.
+        if w.attn_q_a.dtype == v4flash_core::gguf::GgufType::Q8_0 {
+            e.q8.matvec_bpack(
+                s, &mut self.qr, &w.attn_q_a.buffer, &self.xq, &self.xscale,
+                N_LORA_Q, N_EMBD, B,
             )?;
+        } else {
+            for j in 0..MTP_BLOCK {
+                let xr = self.normed.slice_view(j * N_EMBD as usize, N_EMBD as usize);
+                let xqr = self.xq.slice_view(j * N_EMBD as usize, N_EMBD as usize);
+                let xsr = self
+                    .xscale
+                    .slice_view(j * (N_EMBD as usize).div_ceil(32), (N_EMBD as usize).div_ceil(32));
+                let mut qo = self.qr.slice_view_mut(j * N_LORA_Q as usize, N_LORA_Q as usize);
+                crate::het::dispatch::dense_matvec(
+                    e, s, &mut qo, &w.attn_q_a, &xr, &xqr, &xsr, N_LORA_Q, N_EMBD,
+                )?;
+            }
         }
         e.rms_w.launch_weighted_batched(
             s, &mut self.qr_normed, &self.qr, &w.q_a_norm, N_LORA_Q, RMS_EPS, B,
@@ -876,7 +921,7 @@ impl MtpState {
         // out — `out` is left untouched and attention silently returns zeros.
         // `attention_mixed_score` / `attention_mixed_softmax_wsum` carry no arch
         // guard. B is 5, so the loop costs 10 small launches per layer.
-        let _hq = HostUs::start(&MTP_H_ATTNQ);
+        let _hq = HostUs::start_dev(&MTP_H_ATTNQ, s);
         for j in 0..MTP_BLOCK {
             let qj = self.q.slice_view(j * Q_FLAT as usize, Q_FLAT as usize);
             e.attn_mixed.launch_score(
@@ -894,7 +939,7 @@ impl MtpState {
         )?;
 
         // --- output projection: grouped wo_a, then wo_b ---
-        let _ho = HostUs::start(&MTP_H_ATTNO);
+        let _ho = HostUs::start_dev(&MTP_H_ATTNO, s);
         e.q8.quantize_input_batched(
             s, &mut self.heads_xq, &mut self.heads_xscale, &self.heads, Q_FLAT, B,
         )?;
