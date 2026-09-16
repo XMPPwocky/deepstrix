@@ -3293,6 +3293,32 @@ fn finish_decode(
             m.accept_steps += 1;
             m.accept_tokens += (n as u64) + 1;
 
+            // DENSE RING (`V41_DSPARK_DENSE_RING=1`): the drafter's KV ring must
+            // contain every position it will attend over. Accept mode only drafts
+            // once per step (at pos+n), so the n intermediate accepted positions
+            // pos..pos+n-1 never got a ring write and the window goes ~43% sparse
+            // — the reason accept E (~1.8) sits far below shadow E (~3.08). Replay
+            // the drafter over each accepted position first (its residual is in
+            // mtp_src row r; the token AT p+1 is the accepted draft), so the ring
+            // is dense like shadow's. The intermediate drafts are discarded.
+            if std::env::var("V41_DSPARK_DENSE_RING").as_deref() == Ok("1") && n > 0 {
+                for r in 0..n {
+                    let mut mh = Vec::with_capacity(nsrc * ne);
+                    for sl in 0..nsrc {
+                        let o = sl * cap * ne + r * ne;
+                        mh.extend_from_slice(&whole[o..o + ne]);
+                    }
+                    let tok_at_p1 = drafts[r]; // token at position (pos+r)+1
+                    let mut tr = vec![0.0f32; v4flash_kernels::config::HC_DIM as usize];
+                    embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, tok_at_p1, &mut tr);
+                    let m = state.mtp.as_mut().expect("mtp");
+                    let _ = state.engine.dspark_draft(
+                        &mut m.state, &mut m.exit, &mh, &m.w, &m.xw, &state.weights,
+                        &m.markov_embd, m.markov_dtype, pos + r as u32, &tr, &m.noise_row, tok_at_p1,
+                    )?;
+                }
+            }
+
             // Draft for the NEXT step now, while `main_hidden` is the row that
             // just became the head: the drafter wants (residual @ p, token @
             // p+1), and here p = pos + n and the token at p+1 is `head`.
