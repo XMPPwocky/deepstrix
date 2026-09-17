@@ -3743,6 +3743,38 @@ fn finish_decode(
                         XUSED_OK[b].fetch_add(1, Relaxed);
                     }
                     XUSED_KLD[b].fetch_add((kld * 1e6) as i64, Relaxed);
+                    // A MEAN is the wrong statistic here: the observed failure is
+                    // a cliff (100+ identical tokens), which 0.05 nats averaged
+                    // cannot produce. If the corruption is a rare catastrophic
+                    // draw, it lives in the TAIL, so bucket it and keep the max.
+                    if used {
+                        let bucket = if kld < 0.01 {
+                            0
+                        } else if kld < 0.1 {
+                            1
+                        } else if kld < 1.0 {
+                            2
+                        } else if kld < 5.0 {
+                            3
+                        } else {
+                            4
+                        };
+                        XTAIL[bucket].fetch_add(1, Relaxed);
+                        let k6 = (kld * 1e6) as i64;
+                        XTAIL_MAX.fetch_max(k6, Relaxed);
+                        // Was the token we EMITTED from this row one the true
+                        // distribution would essentially never produce? That is
+                        // the event that derails a generation.
+                        if kld >= 1.0 {
+                            tracing::warn!(
+                                row = j, n, pos,
+                                kld = format!("{kld:.3}"),
+                                verify_argmax = am(v) as i64,
+                                decode_argmax = am(d) as i64,
+                                "dspark.row_blowup: emitted-from row diverges catastrophically"
+                            );
+                        }
+                    }
                 }
             }
             dspark_stats::record_accept(n, k);
@@ -4217,6 +4249,15 @@ fn finish_decode(
                     })
                     .collect();
                 tracing::info!(by_use = %by.join(" | "), "dspark.xcheck.used");
+                let names = ["<0.01", "<0.1", "<1", "<5", ">=5"];
+                let hist: Vec<String> = (0..5)
+                    .map(|i| format!("{}: {}", names[i], XTAIL[i].swap(0, Relaxed)))
+                    .collect();
+                tracing::info!(
+                    kld_hist = %hist.join("  "),
+                    max_kld = format!("{:.3}", XTAIL_MAX.swap(0, Relaxed) as f64 / 1e6),
+                    "dspark.xcheck.tail (rows we emit from)"
+                );
             }
         }
         if small_b_catchall_ab() > 0 || single_lane_ab() > 0 || xcheck_poison() || verify_probe_ks.len() > 1 {
@@ -5057,6 +5098,10 @@ static XUSED_N: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 static XUSED_OK: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// KLD histogram for rows we EMIT from: <0.01, <0.1, <1, <5, >=5 nats.
+static XTAIL: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+static XTAIL_MAX: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static XUSED_KLD: [std::sync::atomic::AtomicI64; 2] =
     [const { std::sync::atomic::AtomicI64::new(0) }; 2];
 
