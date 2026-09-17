@@ -2419,16 +2419,37 @@ impl HeterogeneousEngine {
         // The cache bound is tight (no margin): n_raw_before ≤ SWA_WINDOW and
         // b ≤ B_MAX must hold, otherwise launch_batched will OOB-write into
         // the next layer's KV allocation. Guard in debug builds.
-        debug_assert!(
-            (n_raw_before + b) as usize <= KV_CACHE_ROWS,
-            "kv_append OOB: n_raw_before={n_raw_before} + b={b} > KV_CACHE_ROWS={}",
+        // APPEND AT `raw_off + n_raw_before`, not `n_raw_before`.
+        //
+        // Readers take their slice from `raw_off * head_dim` and decode appends
+        // monotonically at `raw_off + n_raw` (see `HetLayerState::raw_off`), so
+        // an append that ignores `raw_off` only agrees with the readers while
+        // `raw_off == 0`. It usually is: `normalize_raw_windows` zeroes it
+        // before every verify, so LANE A is always safe -- which is exactly why
+        // this survived.
+        //
+        // But a SPECULATIVE append does not evict; it SLIDES `raw_off` instead
+        // (see the eviction block), and only once the window is full. So after
+        // lane A, `raw_off == b_a`, and LANE B then reads shifted by `b_a`
+        // while writing unshifted: its window drops `b_a` rows of real history
+        // and picks up `b_a` slots that are not causally its own.
+        //
+        // MEASURED before this fix, on the rows the verify EMITS from: 4/4
+        // catastrophic divergences (KL up to 8.07 nats vs a 0.006 baseline) all
+        // at lane B's first row, all at pos >= SWA_WINDOW, minimum pos exactly
+        // 128 -- i.e. from the very first slide, and never before it.
+        let append_at = ls.raw_off + n_raw_before;
+        assert!(
+            (append_at + b) as usize <= KV_CACHE_ROWS,
+            "kv_append OOB: raw_off={} + n_raw_before={n_raw_before} + b={b} >              KV_CACHE_ROWS={}",
+            ls.raw_off,
             KV_CACHE_ROWS,
         );
         de.kv_append.launch_batched(
             &de.compute,
             &mut ls.kv_cache,
             &sd.kv_normed,
-            n_raw_before,
+            append_at,
             N_HEAD_DIM,
             b,
         )?;
@@ -3984,9 +4005,25 @@ impl HeterogeneousEngine {
             // rows — the newest rows fell outside the window, which is what threw
             // "L8: missing compressor state". Same formula as
             // `KvMark::advanced_by`, so the caller's rollback agrees.
-            let end = ls.raw_off + n_raw_during_chunk;
-            ls.n_raw = end.min(SWA_WINDOW);
-            ls.raw_off = end - ls.n_raw;
+            // DO NOT slide `raw_off` here. This block runs per LANE, and the
+            // batched append writes relative to `raw_off` while the whole batch
+            // was set up with `raw_off == 0` by `normalize_raw_windows`. Sliding
+            // it after lane A meant lane B read shifted by `b_a` -- dropping
+            // `b_a` rows of real history and picking up `b_a` slots that are not
+            // causally its own. MEASURED: every catastrophic divergence on a row
+            // the verify EMITS from (KL up to 8.07 nats against a 0.006
+            // baseline) was lane B's first row, at pos >= SWA_WINDOW, minimum
+            // exactly 128 -- i.e. from the first slide onward and never before.
+            //
+            // Sliding it is also unnecessary: the caller's
+            // `KvMark::advanced_by` recomputes the real window from the mark at
+            // rollback, which is the only place the speculative window has to
+            // be right. Carrying the growth in `n_raw` keeps lane B's
+            // `causal_end`/`offset` arithmetic consistent with an append that is
+            // relative to an unmoved base, and the per-row `n_per` is already
+            // `min(causal_end, SWA_WINDOW)` so no row ever asks attention for
+            // more keys than the kernel cap.
+            ls.n_raw = n_raw_during_chunk;
         } else if n_raw_during_chunk > SWA_WINDOW {
             let src_first_slot = n_raw_during_chunk - SWA_WINDOW;
             let head_dim = N_HEAD_DIM as usize;
