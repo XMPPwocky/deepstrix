@@ -46,9 +46,19 @@ pub struct ExpertPager {
     slot_key: Vec<Option<(i32, u32)>>,
     /// Eviction order, front = least-recently-used slot.
     lru: VecDeque<u32>,
-    stage_gate: Vec<u8>,
-    stage_up: Vec<u8>,
-    stage_down: Vec<u8>,
+    /// Per-role miss staging in `hipHostMalloc` memory, one buffer per role.
+    ///
+    /// PINNED, not `Vec<u8>`: this box is an APU, so host-pinned memory IS the
+    /// RAM the iGPU reads through GTT. The reader `pread`s straight into it and
+    /// the repack kernel consumes it in place, which removes the per-miss H2D
+    /// entirely — it was copying system RAM to system RAM. MEASURED on box 1
+    /// before this change: `ms_h2d = 1.14` of an 8.24 ms miss, against box 2's
+    /// 0.15 ms; box 2 has had pinned staging since its own miss-path rework and
+    /// this side never got it back-ported. At ~10,000 box-1 misses per agent
+    /// request that is ~11 s of pure copy per request.
+    ///
+    /// NON_COHERENT so the iGPU may cache its reads (see `PinnedBuffer`).
+    stage: [v4flash_hip::PinnedBuffer<u8>; 3],
     /// Scratch remap of length `N_EXPERT`: global id -> slot, or -1 if absent.
     remap: Vec<i32>,
     /// Device copy of `remap`, ONE BUFFER PER LAYER.
@@ -70,6 +80,21 @@ pub struct ExpertPager {
     /// Layer whose remap `self.remap` currently describes — the one the next
     /// upload targets. Set by every `ensure*`.
     cur_layer: i32,
+    /// SCAN REGION: while set, `ensure` may only take slots from `[lo, hi)`.
+    ///
+    /// Prefill is a scan, not a reuse workload: one 1024-token chunk touches
+    /// ~340 distinct experts at each of 40 layers (~13,600 expert-loads against
+    /// a 4,454-slot pool), so it can never hit on itself and, run through a
+    /// plain LRU, it evicts decode's entire warm working set. Measured cost of
+    /// that: warm decode 17.7 tok/s vs cold 3.4.
+    ///
+    /// The fix is NOT to reserve capacity (prefill and decode never run at the
+    /// same time, so reserved windows are dead weight during decode, and the
+    /// window path cannot even SEE an expert decode already holds -- it
+    /// re-reads it from NVMe at 6-8 ms). It is to split lookup from allocation:
+    /// lookup stays global, so prefill hits for free on anything resident;
+    /// allocation is confined here, so the scan can only evict itself.
+    scan_window: Option<(usize, usize)>,
     /// The iGPU these buffers live on. `DeviceBuffer::new` calls `hipMalloc` on the
     /// CURRENT device and only records `device_id` for bookkeeping, so every alloc and
     /// H2D copy here must pin the device first or the pool/remap silently land on the
@@ -860,12 +885,18 @@ impl ExpertPager {
             slot_of: HashMap::new(),
             slot_key: vec![None; n_slots as usize],
             lru: VecDeque::new(),
-            stage_gate: vec![0u8; gate_bpe],
-            stage_up: vec![0u8; up_bpe],
-            stage_down: vec![0u8; down_bpe],
+            stage: [
+                v4flash_hip::PinnedBuffer::new_with_flags(
+                    gate_bpe, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
+                v4flash_hip::PinnedBuffer::new_with_flags(
+                    up_bpe, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
+                v4flash_hip::PinnedBuffer::new_with_flags(
+                    down_bpe, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
+            ],
             remap: (0..N_EXPERT as i32).map(|e| -e - 1).collect(),
             remap_dev,
             cur_layer: 0,
+            scan_window: None,
             device: igpu,
             prefill_requests: 0,
             prefill_misses: 0,
@@ -909,6 +940,26 @@ impl ExpertPager {
     /// This layer's remap, for the MoE dispatch. Pointer-stable per layer.
     pub fn remap_dev(&self, layer: i32) -> &DeviceBuffer<i32> {
         &self.remap_dev[layer.clamp(0, crate::config::N_LAYER - 1) as usize]
+    }
+
+    /// Confine `ensure`'s ALLOCATION to `[lo, hi)` until cleared. Lookup is
+    /// unaffected: a hit anywhere in the pool is still a hit.
+    pub fn set_scan_window(&mut self, w: Option<(usize, usize)>) {
+        self.scan_window = w;
+    }
+
+    /// Slot range `ensure` may allocate from: the scan window when set, else
+    /// everything above the dense prefill windows.
+    fn alloc_bounds(&self) -> (usize, usize) {
+        if let Some((lo, hi)) = self.scan_window {
+            let hi = hi.min(self.n_slots as usize);
+            if lo < hi {
+                return (lo, hi);
+            }
+        }
+        let lo = self.dense_slots();
+        let lo = if lo >= self.n_slots as usize { 0 } else { lo };
+        (lo, self.n_slots as usize)
     }
 
     /// Mutable twin, for diagnostics that overwrite a layer's remap directly
@@ -1794,6 +1845,55 @@ impl ExpertPager {
     /// the same three scratch buffers, and `copy_from_host` is a blocking
     /// `hipMemcpy` that does NOT wait on pending kernels — without the sync the
     /// next upload would overwrite bytes a repack is still reading.
+    /// Repack a miss STRAIGHT OUT OF PINNED STAGING — no H2D.
+    ///
+    /// `stage[i]` is `hipHostMalloc` memory, which on this APU is the same
+    /// physical RAM the iGPU reads, so the preads have already put the bytes
+    /// where the kernel wants them. Box 2's twin is `repack_in_place` in
+    /// `remote_experts.rs`; this is the back-port. The old
+    /// `upload_and_repack` path (copy into `repack_scratch`, then launch) is
+    /// kept below for the non-pinned/debug route.
+    fn repack_in_place(
+        rp: &Mxfp4Repack,
+        st: &Stream,
+        routed: &mut RoutedExpertWeights,
+        slot: u32,
+        stage: &[v4flash_hip::PinnedBuffer<u8>; 3],
+    ) -> eyre::Result<u64> {
+        let geom = [
+            (N_FF_EXP as u32, (N_EMBD / 32) as u32),
+            (N_FF_EXP as u32, (N_EMBD / 32) as u32),
+            (N_EMBD as u32, (N_FF_EXP / 32) as u32),
+        ];
+        let bpe = [
+            routed.gate_bytes_per_expert,
+            routed.up_bytes_per_expert,
+            routed.down_bytes_per_expert,
+        ];
+        let t = std::time::Instant::now();
+        for i in 0..3 {
+            let (rows, nb) = geom[i];
+            debug_assert_eq!(rows as usize * nb as usize * 17, bpe[i]);
+            let dst = match i {
+                0 => &mut routed.gate.buffer,
+                1 => &mut routed.up.buffer,
+                _ => &mut routed.down.buffer,
+            };
+            rp.launch_from_ptr(
+                st,
+                dst,
+                slot as usize * bpe[i],
+                stage[i].device_ptr(),
+                stage[i].len(),
+                rows,
+                nb,
+            )?;
+        }
+        st.synchronize()?;
+        Ok(t.elapsed().as_nanos() as u64)
+    }
+
+    #[allow(dead_code)]
     fn upload_and_repack(
         rp: &Mxfp4Repack,
         st: &Stream,
@@ -1881,18 +1981,27 @@ impl ExpertPager {
             // experts had been overwritten with another layer's weights — wrong output,
             // no error. Degenerate pools (no room above the dense region) fall back to
             // sharing and invalidate the affected window instead.
-            let lru_lo = {
-                let lo = self.dense_slots();
-                if lo >= self.n_slots as usize { 0 } else { lo }
-            };
-            let slot = match self.slot_key.iter().enumerate().skip(lru_lo).find(|(_, k)| k.is_none()) {
+            // Allocation bounds: the SCAN WINDOW when prefill set one, else
+            // everything above the dense prefill windows. Lookup above is
+            // unbounded, so a hit anywhere in the pool is still free — only
+            // where a MISS may land is restricted, which is what keeps a
+            // prefill scan from evicting decode's warm set.
+            let (lru_lo, lru_hi) = self.alloc_bounds();
+            let slot = match self
+                .slot_key
+                .iter()
+                .enumerate()
+                .take(lru_hi)
+                .skip(lru_lo)
+                .find(|(_, k)| k.is_none())
+            {
                 Some((free, _)) => free as u32,
                 None => {
                     let victim = self
                         .lru
                         .iter()
                         .copied()
-                        .find(|&sl| (sl as usize) >= lru_lo)
+                        .find(|&sl| (sl as usize) >= lru_lo && (sl as usize) < lru_hi)
                         .ok_or_else(|| eyre!("expert pager: no slot to evict"))?;
                     if let Some(pos) = self.lru.iter().position(|&sl| sl == victim) {
                         self.lru.remove(pos);
@@ -1925,10 +2034,14 @@ impl ExpertPager {
                 // nor overlapping the CPU with the device. One thread per role is the
                 // cheapest test of where the floor actually is. Default 1 = old behaviour.
                 let owner = &self.owner;
-                let (sg, su, sd) = (&mut self.stage_gate, &mut self.stage_up, &mut self.stage_down);
+                let [sg, su, sd] = &mut self.stage;
                 let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
                 std::thread::scope(|sc| {
-                    for (name, dst) in [(&names[0], &mut **sg), (&names[1], &mut **su), (&names[2], &mut **sd)] {
+                    for (name, dst) in [
+                        (&names[0], sg.as_mut_slice()),
+                        (&names[1], su.as_mut_slice()),
+                        (&names[2], sd.as_mut_slice()),
+                    ] {
                         let err = &err;
                         sc.spawn(move || {
                             let src = WeightSrc::from(owner);
@@ -1959,13 +2072,15 @@ impl ExpertPager {
                 let td = src.tensor(&names[2]).ok_or_else(|| eyre!("{}", names[2]))?;
                 if gpu_repack {
                     // HF layout in, permutation deferred to the iGPU below.
-                    src.read_expert_hf_layout(tg, id as usize, &mut self.stage_gate)?;
-                    src.read_expert_hf_layout(tu, id as usize, &mut self.stage_up)?;
-                    src.read_expert_hf_layout(td, id as usize, &mut self.stage_down)?;
+                    let [sg, su, sd] = &mut self.stage;
+                    src.read_expert_hf_layout(tg, id as usize, sg.as_mut_slice())?;
+                    src.read_expert_hf_layout(tu, id as usize, su.as_mut_slice())?;
+                    src.read_expert_hf_layout(td, id as usize, sd.as_mut_slice())?;
                 } else {
-                    src.read_expert_into(tg, id as usize, &mut self.stage_gate)?;
-                    src.read_expert_into(tu, id as usize, &mut self.stage_up)?;
-                    src.read_expert_into(td, id as usize, &mut self.stage_down)?;
+                    let [sg, su, sd] = &mut self.stage;
+                    src.read_expert_into(tg, id as usize, sg.as_mut_slice())?;
+                    src.read_expert_into(tu, id as usize, su.as_mut_slice())?;
+                    src.read_expert_into(td, id as usize, sd.as_mut_slice())?;
                 }
             }
             self.decode_read_ns += t_read.elapsed().as_nanos() as u64;
@@ -1980,26 +2095,24 @@ impl ExpertPager {
             let dbpe = self.routed.down_bytes_per_expert;
             if gpu_repack {
                 let (rp, st) = (self.repack.as_ref().unwrap(), self.repack_stream.as_ref().unwrap());
-                self.decode_repack_gpu_ns += Self::upload_and_repack(
-                    rp, st, &mut self.repack_scratch, &mut self.routed, slot,
-                    [&self.stage_gate, &self.stage_up, &self.stage_down],
-                )?;
+                self.decode_repack_gpu_ns +=
+                    Self::repack_in_place(rp, st, &mut self.routed, slot, &self.stage)?;
             } else {
                 self.routed
                     .gate
                     .buffer
                     .slice_view_mut(slot as usize * gbpe, gbpe)
-                    .copy_from_host(&self.stage_gate)?;
+                    .copy_from_host(self.stage[0].as_slice())?;
                 self.routed
                     .up
                     .buffer
                     .slice_view_mut(slot as usize * ubpe, ubpe)
-                    .copy_from_host(&self.stage_up)?;
+                    .copy_from_host(self.stage[1].as_slice())?;
                 self.routed
                     .down
                     .buffer
                     .slice_view_mut(slot as usize * dbpe, dbpe)
-                    .copy_from_host(&self.stage_down)?;
+                    .copy_from_host(self.stage[2].as_slice())?;
             }
             self.decode_h2d_ns += t_h2d.elapsed().as_nanos() as u64;
             self.slot_of.insert(key, slot);

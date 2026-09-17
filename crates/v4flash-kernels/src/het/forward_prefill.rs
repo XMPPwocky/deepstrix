@@ -4593,7 +4593,7 @@ impl HeterogeneousEngine {
         // work items pack the group id into 16 bits. Unreachable at any pool
         // this box can hold; it falls back to the dense window rather than
         // silently aliasing ids.
-        let sparse_resid_layer = speculative_append()
+        let sparse_resid_layer = (speculative_append() || prefill_unified_pool())
             && !sparse_verify_residency_off()
             && pager
                 .as_deref()
@@ -4813,7 +4813,8 @@ impl HeterogeneousEngine {
                 // `set_remote_exclusion` are incompatible (see there), so the two
                 // decisions must be made from ONE predicate.
                 let sparse_resid = sparse_resid_layer;
-                debug_assert_eq!(sparse_resid, !replay_offload && speculative_append()
+                debug_assert_eq!(sparse_resid, !replay_offload
+                    && (speculative_append() || prefill_unified_pool())
                     && !sparse_verify_residency_off()
                     && pg.sparse_group_ids_in_range());
                 // MOVED ABOVE `ensure` so box 2 starts while box 1 pages.
@@ -5039,7 +5040,18 @@ impl HeterogeneousEngine {
                         self.igpu.compute.synchronize()?;
                         self.dgpu.compute.synchronize()?;
                     }
-                    pg.ensure(layer as i32, &ids)?;
+                    // A real prefill chunk is a SCAN: confine its misses so it
+                    // cannot evict decode's warm set. The verify is not a scan
+                    // (it is this conversation's next few tokens), so it keeps
+                    // the whole pool.
+                    if !speculative_append() {
+                        let n = pg.slots() as usize;
+                        let lo = n.saturating_sub(prefill_scan_slots());
+                        pg.set_scan_window(Some((lo, n)));
+                    }
+                    let r = pg.ensure(layer as i32, &ids).map(|_| ());
+                    pg.set_scan_window(None);
+                    r?;
                 } else if ids.len() * 10 >= N_EXPERT as usize * 9 {
                     pg.ensure_layer_dense(layer as i32)?;
                 } else {
@@ -6478,6 +6490,39 @@ impl Drop for SpeculativeAppend {
 
 /// `V41_SPARSE_VERIFY_RESIDENCY=0` reverts the verify to prefill's dense-window
 /// pager (see the call site).
+/// `V41_PREFILL_UNIFIED_POOL=1`: run PREFILL through the same sparse/LRU
+/// residency the verify uses, instead of the dense per-layer windows.
+///
+/// Windows reserve `windows * stride` slots that sit idle through decode (the
+/// two phases never overlap), and a window can only see its OWN contents -- so
+/// an expert decode already holds is invisible to prefill and gets re-read from
+/// NVMe at 6-8 ms. MEASURED on a real agent turn: 5,132-7,152 prefill misses and
+/// 22.7-34.7 s of blocking box-1 reads per request. The unified pool makes every
+/// resident expert a free hit; `V41_PREFILL_SCAN_SLOTS` stops the scan evicting
+/// decode's warm set by confining prefill's MISSES to a small region.
+///
+/// Needs the per-layer `remap_dev`: one shared buffer made the sparse path race
+/// under the two-lane driver, which is why this could not exist before.
+pub fn prefill_unified_pool() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_PREFILL_UNIFIED_POOL").as_deref() == Ok("1")
+    });
+    *B
+}
+
+/// Slots a prefill scan may allocate from (default two layers' worth): big
+/// enough that consecutive layers do not evict each other mid-flight, small
+/// enough that a ~13,600-load scan cannot reach decode's working set.
+pub fn prefill_scan_slots() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_PREFILL_SCAN_SLOTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2 * crate::config::N_EXPERT as usize)
+    });
+    *N
+}
+
 pub fn sparse_verify_residency_off() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var("V41_SPARSE_VERIFY_RESIDENCY").as_deref() == Ok("0")
