@@ -1529,8 +1529,25 @@ impl HeterogeneousEngine {
                 self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
             }
 
-            // Split point mirrors forward_prompt_batch_v2_pipelined: `b_a`
-            // rows → lane A (ceil(b/2) without image spans), rest → lane B.
+            // THE ACTUAL split the range used, not the one `plan_chunk` planned.
+            //
+            // `plan_chunk` computes `ceil(chunk_b/2)` for the two-lane driver,
+            // but `forward_prompt_batch_v2_pipelined_range` re-decides it and
+            // may take the SINGLE-LANE path (`V41_PREFILL_SINGLE_LANE_MAX`),
+            // putting every row in lane A. Reading the logits back at the
+            // PLANNED cut then takes rows `[cut, chunk_b)` out of lane B's
+            // buffer, which that chunk never wrote -- silently, since the
+            // buffer holds a previous chunk's rows (or zeros).
+            //
+            // MEASURED before this fix, single-lane B=6 verify: rows 0-2 agreed
+            // with decode to 6.8e-4 nats and rows 3-5 were garbage at ~11 nats
+            // (KLD); at B=4 the cliff moved to row 2. Both are exactly
+            // `ceil(b/2)`, which is what identified it. That is the "single lane
+            // drops DSpark E to 1.74" retraction: the compute was always right,
+            // the READBACK was wrong. The CED branch above was already immune --
+            // it asserts `cut == b_a` -- which is why this only ever bit the
+            // non-CED path.
+            let b_a = bd_a.mtp_lane_cut.min(chunk_b);
             let b_b = chunk_b - b_a;
 
             if last_only {
