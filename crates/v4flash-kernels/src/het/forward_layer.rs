@@ -2723,8 +2723,20 @@ impl HeterogeneousEngine {
             // the resident path's correctness depends on the graph wrapper.
             // V41_PAGER_NOGRAPH=1: bypass graph capture and launch directly, to A/B the
             // capture wrapper against a bare launch on ie.compute.
+// Per-kernel stages for the paged MoE: `igpu.routed_moe` is ONE
+            // graph-captured stage, so the four kernels inside it are invisible
+            // and the biggest real term in the token (29.5 ms at ~27% of the
+            // iGPU's achievable bandwidth) cannot be attributed. Recorded only
+            // on the NOGRAPH path — an event record inside a capture becomes a
+            // graph node, which would change the thing being measured. Read with
+            // `V41_PAGER_NOGRAPH=1 DEEPSTRIX_TOKEN_PROFILE=1`; absolute times
+            // shift (no replay), the RATIO is the point.
+            let stage_inner = std::env::var("V41_PAGER_NOGRAPH").is_ok();
             let mut paged_moe = |s: &v4flash_hip::Stream| -> eyre::Result<()> {
+                let _t = stage_inner.then(|| ie.events.stage("k.moe.xq_q8k", s)).transpose()?;
                 ie.q8k.launch(s, &mut igpu_scratch.d_xq_q8k, &igpu_scratch.ffn_input_norm_recv, BLOCKS_Q8K_GATE_IN)?;
+                drop(_t);
+                let _t = stage_inner.then(|| ie.events.stage("k.moe.gate_up", s)).transpose()?;
                 super::dispatch::moe_gate_up_batch_hetsplit(
                     ie, gdt, s, &mut igpu_scratch.d_mid_cat,
                     gbuf, ubuf,
@@ -2732,16 +2744,21 @@ impl HeterogeneousEngine {
                     pg.remap_dev(layer), /*mode=*/ 0, hot_cap_i, pg_gbpe, pg_ubpe,
                     N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
                 )?;
+                drop(_t);
+                let _t = stage_inner.then(|| ie.events.stage("k.moe.midq_q8k", s)).transpose()?;
                 ie.q8k.launch(s, &mut igpu_scratch.d_midq_cat, &igpu_scratch.d_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
+                drop(_t);
+                let _t = stage_inner.then(|| ie.events.stage("k.moe.down", s)).transpose()?;
                 super::dispatch::moe_down_batched_hetsplit(
                     ie, ddt, s, &mut igpu_scratch.ffn_moe,
                     dbuf, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected,
                     pg.remap_dev(layer), /*mode=*/ 0, hot_cap_i, pg_dbpe, mid_blocks_bytes as u32,
                     N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN,
                 )?;
+                drop(_t);
                 Ok(())
             };
-            if std::env::var("V41_PAGER_NOGRAPH").is_ok() {
+            if stage_inner {
                 paged_moe(&ie.compute)?;
             } else {
                 self.igpu_graphs.run("routed_moe_paged", layer as u32, &ie.compute, paged_moe)?;
