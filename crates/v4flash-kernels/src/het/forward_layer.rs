@@ -2419,7 +2419,25 @@ impl HeterogeneousEngine {
                             super::expert_pager::set_partition_share(pg.decode_slots(), c.info().n_resident);
                         }
                     }
-                    Some((0..N_EXPERT).map(|e| super::expert_pager::partition_box2(layer, e)).collect())
+                    // With the prefetcher on, box 1 never blocks on its own disk:
+                    // a box-1-share pick that is not resident is handed to box 2
+                    // for THIS token and queued for async admission here, so the
+                    // share converges onto box 1 while box 2 covers the gap.
+                    let pf = super::expert_pager::b1_prefetch();
+                    let o: Vec<bool> = (0..N_EXPERT)
+                        .map(|e| super::expert_pager::partition_box2(layer, e) || (pf && !pg.is_resident(layer, e)))
+                        .collect();
+                    if pf {
+                        for &sv in &sel_host {
+                            if (0..N_EXPERT as i32).contains(&sv)
+                                && !super::expert_pager::partition_box2(layer, sv as u32)
+                                && o[sv as usize]
+                            {
+                                pg.prefetch_hint(layer, sv as u32);
+                            }
+                        }
+                    }
+                    Some(o)
                 } else if catchall && super::expert_pager::b1_prefetch() {
                     // Box 1 = L1, box 2 = victim tier. Compute what is resident
                     // here, hand the rest to box 2, and queue every miss for the

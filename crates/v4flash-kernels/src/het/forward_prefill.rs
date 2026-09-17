@@ -4737,12 +4737,32 @@ impl HeterogeneousEngine {
                         // can take the whole batch; the 170-slot objection that
                         // keeps `V41_REPLAY_OFFLOAD` off is a property of the CED
                         // replay's 162-wide union at B=128, not of a verify.
-                        if remote_split_on
-                            && super::expert_pager::t2_partition()
-                            && super::expert_pager::partition_box2(layer as i32, sv as u32)
-                        {
-                            extra_remote[sv as usize] = true;
-                            continue;
+                        if remote_split_on && super::expert_pager::t2_partition() {
+                            // Box 2's share: always hers.
+                            if super::expert_pager::partition_box2(layer as i32, sv as u32) {
+                                extra_remote[sv as usize] = true;
+                                continue;
+                            }
+                            // Box 1's share but NOT resident. `ensure` would read it
+                            // from this box's dm-crypt disk SYNCHRONOUSLY, blocking
+                            // the layer: measured 285 ms of a 375 ms verify step (42
+                            // misses x ~6.8 ms), against 14 ms of box-2 round trip.
+                            // Hand it to box 2 for THIS step (she is `--paged`, so she
+                            // can serve anything, and her read overlaps our compute)
+                            // and queue the async fill, so the share converges onto
+                            // box 1 without ever blocking a step.
+                            //
+                            // MUST live here as well as in the decode path: the DSpark
+                            // verify runs through THIS driver, and wiring only the
+                            // decode side left the prefetcher firing 64 times a
+                            // request instead of ~1300, with box-1 misses unchanged.
+                            if super::expert_pager::b1_prefetch()
+                                && !pg.is_resident(layer as i32, sv as u32)
+                            {
+                                pg.prefetch_hint(layer as i32, sv as u32);
+                                extra_remote[sv as usize] = true;
+                                continue;
+                            }
                         }
                         if small_b_catchall
                             && (small_b_catchall_det() || !pg.is_resident(layer as i32, sv as u32))
