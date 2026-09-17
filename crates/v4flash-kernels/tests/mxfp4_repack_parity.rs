@@ -21,20 +21,26 @@ fn pick_igpu() -> eyre::Result<Device> {
 
 /// The reference: the CPU loop this kernel replaces, verbatim.
 fn cpu_repack(packed: &[u8], scale: &[u8], out: usize, nb: usize) -> Vec<u8> {
+    assert_eq!(nb % 8, 0, "super-block layout needs nb % 8 == 0");
     let half = nb * 16;
     let mut dst = vec![0u8; out * nb * 17];
     for r in 0..out {
         let prow = &packed[r * half..(r + 1) * half];
         let srow = &scale[r * nb..(r + 1) * nb];
         let drow = &mut dst[r * nb * 17..(r + 1) * nb * 17];
-        for (j, blk) in drow.chunks_exact_mut(17).enumerate() {
-            blk[0] = srow[j];
-            let pb = &prow[j * 16..(j + 1) * 16];
-            for i in 0..8 {
-                let lo = pb[i];
-                let hi = pb[8 + i];
-                blk[1 + 2 * i] = (lo & 0x0F) | (hi << 4);
-                blk[2 + 2 * i] = (lo >> 4) | (hi & 0xF0);
+        // SUPER-BLOCK v2: each 136-byte super-block is [8 x 16 B nibbles][8 B
+        // scales]; block k's nibbles at k*16, its scale at 128+k.
+        for (sb, sup) in drow.chunks_exact_mut(136).enumerate() {
+            for k in 0..8 {
+                let j = sb * 8 + k;
+                sup[128 + k] = srow[j];
+                let pb = &prow[j * 16..(j + 1) * 16];
+                for i in 0..8 {
+                    let lo = pb[i];
+                    let hi = pb[8 + i];
+                    sup[k * 16 + 2 * i] = (lo & 0x0F) | (hi << 4);
+                    sup[k * 16 + 1 + 2 * i] = (lo >> 4) | (hi & 0xF0);
+                }
             }
         }
     }
@@ -80,8 +86,8 @@ fn case(dev: &Device, stream: &Stream, rp: &Mxfp4Repack, out: usize, nb: usize, 
     if tail != want.as_slice() {
         let bad = tail.iter().zip(&want).position(|(a, b)| a != b).unwrap();
         panic!(
-            "out={out} nb={nb}: first mismatch at byte {bad} (block {}, off {}): got {:#04x} want {:#04x}",
-            bad / 17, bad % 17, tail[bad], want[bad]
+            "out={out} nb={nb}: first mismatch at byte {bad} (super {}, off {}): got {:#04x} want {:#04x}",
+            bad / 136, bad % 136, tail[bad], want[bad]
         );
     }
     // The bytes BELOW the offset must be untouched.
@@ -103,6 +109,8 @@ fn mxfp4_repack_matches_cpu() {
     // row/block index swap passes one and fails the other.
     case(&dev, &stream, &rp, 2304, 160, 0x1234_5678);
     case(&dev, &stream, &rp, 5120, 72, 0x9abc_def0);
-    // A grid tail: total blocks not a multiple of the 256-wide block.
-    case(&dev, &stream, &rp, 7, 3, 0xdead_beef);
+    // A grid tail: total blocks not a multiple of the 256-wide block. `nb` must
+    // stay a multiple of 8 — a super-block is 8 blocks and the matvec reads whole
+    // super-blocks, so a partial one has no defined layout.
+    case(&dev, &stream, &rp, 7, 8, 0xdead_beef);
 }

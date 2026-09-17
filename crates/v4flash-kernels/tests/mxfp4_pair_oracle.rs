@@ -127,11 +127,11 @@ fn mxfp4_pair_kernels_match_cpu() -> eyre::Result<()> {
             for r in 0..n_rows {
                 for bi in 0..nb {
                     let o = e * bpe + (r * nb + bi) * SUPER_MXFP4_BYTES;
+                    // v2 super-block: nibbles at b8*16, scale at 128+b8.
                     for b8 in 0..8 {
-                        let bo = o + b8 * 17;
-                        w[bo] = 118 + (rng.next() & 0x0f) as u8; // scale 2^-10..2^5
-                        for j in 1..17 {
-                            w[bo + j] = rng.next_byte();
+                        w[o + 128 + b8] = 118 + (rng.next() & 0x0f) as u8; // 2^-10..2^5
+                        for j in 0..16 {
+                            w[o + b8 * 16 + j] = rng.next_byte();
                         }
                     }
                 }

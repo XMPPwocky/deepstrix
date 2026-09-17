@@ -8,8 +8,29 @@
 pub const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
 /// Per-superblock (256 elems) byte count: 8 × 17.
+///
+/// LAYOUT v2 (struct-of-arrays *within* the super-block): the 136 bytes are
+/// `[8 × 16 B nibbles][8 B scales]` — block `b`'s nibbles at `b*16`, its scale
+/// at `128 + b`. v1 interleaved them as 8 × `[scale][16 B nibbles]`, which put
+/// every nibble run at an odd byte offset and forced byte-at-a-time loads in
+/// the matvecs. Total size and row stride are unchanged, so expert byte counts,
+/// pool slots and snapshots are untouched — but the two layouts are NOT
+/// interchangeable, and box 1 / box 2 must agree (see MXFP4_LAYOUT_VERSION).
 pub const SUPER_MXFP4_BYTES: usize = 136;
+/// Bytes per 32-elem block, as a *row* stride only (`nb * 17` per row). It is
+/// no longer a stride *within* a super-block — use the v2 accessors instead.
 pub const BLOCK_MXFP4_BYTES: usize = 17;
+/// Bumped whenever the packed layout changes. Both boxes repack independently,
+/// so a rolling deploy across a bump silently corrupts: the HELLO handshake
+/// compares this.
+pub const MXFP4_LAYOUT_VERSION: u32 = 2;
+
+/// Byte offset of block `b`'s 16 nibble bytes within a super-block.
+#[inline]
+pub const fn mxfp4_nib_off(b: usize) -> usize { b * 16 }
+/// Byte offset of block `b`'s E8M0 scale within a super-block.
+#[inline]
+pub const fn mxfp4_scale_off(b: usize) -> usize { 128 + b }
 
 /// ggml_e8m0_to_fp32_half: 2^(e-128) with denormal handling for e < 2.
 pub fn e8m0_half_to_f32(e: u8) -> f32 {
@@ -34,9 +55,8 @@ pub fn cpu_dot_mxfp4_q8_k(n_super: usize, w_bytes: &[u8], y_bytes: &[u8]) -> f32
         let q8 = &y[4..4 + 256];
         let mut acc = 0.0f32;
         for b in 0..8 {
-            let blk = &w[b * BLOCK_MXFP4_BYTES..(b + 1) * BLOCK_MXFP4_BYTES];
-            let scale = e8m0_half_to_f32(blk[0]);
-            let qs = &blk[1..17];
+            let scale = e8m0_half_to_f32(w[mxfp4_scale_off(b)]);
+            let qs = &w[mxfp4_nib_off(b)..mxfp4_nib_off(b) + 16];
             let mut sumi: i32 = 0;
             for j in 0..16 {
                 let lo = KVALUES_MXFP4[(qs[j] & 0x0F) as usize] as i32;

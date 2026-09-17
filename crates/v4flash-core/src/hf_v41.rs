@@ -1042,19 +1042,27 @@ impl V41HfWeights {
         EXPERT_READ_PROF.pread_ns.fetch_add(
             t_repack.duration_since(t_pread).as_nanos() as u64, Relaxed);
         EXPERT_READ_PROF.pread_bytes.fetch_add(wt.len + sc.len, Relaxed);
+        assert_eq!(nb % 8, 0, "MXFP4 super-block layout needs nb % 8 == 0, got {nb}");
         for r in 0..out {
             let prow = &packed[r * half..(r + 1) * half];
             let srow = &scale[r * nb..(r + 1) * nb];
             let drow = &mut dst[r * nb * 17..(r + 1) * nb * 17];
-            for (j, blk) in drow.chunks_exact_mut(17).enumerate() {
-                blk[0] = srow[j];
-                let pb = &prow[j * 16..(j + 1) * 16];
-                for i in 0..8 {
-                    // elements 2i, 2i+1 (low half) and 16+2i, 16+2i+1 (high half)
-                    let lo = pb[i];
-                    let hi = pb[8 + i];
-                    blk[1 + 2 * i] = (lo & 0x0F) | (hi << 4);
-                    blk[2 + 2 * i] = (lo >> 4) | (hi & 0xF0);
+            // SUPER-BLOCK v2 (must match `mxfp4_repack.hip` exactly): each
+            // 136-byte super-block is [8 x 16 B nibbles][8 B scales]. Same size
+            // as the old 8 x [scale][16 nibbles]; the matvecs read nibbles 8
+            // bytes at a time, which the interleaved form made impossible.
+            for (sb, sup) in drow.chunks_exact_mut(136).enumerate() {
+                for k in 0..8 {
+                    let j = sb * 8 + k;
+                    sup[128 + k] = srow[j];
+                    let pb = &prow[j * 16..(j + 1) * 16];
+                    for i in 0..8 {
+                        // elements 2i, 2i+1 (low half) and 16+2i, 16+2i+1 (high half)
+                        let lo = pb[i];
+                        let hi = pb[8 + i];
+                        sup[k * 16 + 2 * i] = (lo & 0x0F) | (hi << 4);
+                        sup[k * 16 + 1 + 2 * i] = (lo >> 4) | (hi & 0xF0);
+                    }
                 }
             }
         }
@@ -1148,18 +1156,21 @@ mod tests {
         // Elements k = 0..31 with value k & 0xF, HF-packed: element 2i in the
         // low nibble of byte i.
         let packed: Vec<u8> = (0..16u8).map(|i| ((2 * i) & 0xF) | (((2 * i + 1) & 0xF) << 4)).collect();
-        let mut blk = [0u8; 17];
-        blk[0] = 0x7F;
+        // v2 super-block: nibbles for block k at k*16, scale at 128+k. This
+        // test covers block 0, so nibbles are at offset 0.
+        let mut sup = [0u8; 136];
+        sup[128] = 0x7F;
         for i in 0..8 {
             let lo = packed[i];
             let hi = packed[8 + i];
-            blk[1 + 2 * i] = (lo & 0x0F) | (hi << 4);
-            blk[2 + 2 * i] = (lo >> 4) | (hi & 0xF0);
+            sup[2 * i] = (lo & 0x0F) | (hi << 4);
+            sup[1 + 2 * i] = (lo >> 4) | (hi & 0xF0);
         }
-        // ggml: byte 1+i holds element i (low) and element 16+i (high)
+        // ggml nibble order is unchanged: byte i holds element i (low) and
+        // element 16+i (high).
         for i in 0..16 {
-            let lo = blk[1 + i] & 0xF;
-            let hi = blk[1 + i] >> 4;
+            let lo = sup[i] & 0xF;
+            let hi = sup[i] >> 4;
             assert_eq!(lo as usize, i & 0xF, "elem {i}");
             assert_eq!(hi as usize, (16 + i) & 0xF, "elem {}", 16 + i);
         }

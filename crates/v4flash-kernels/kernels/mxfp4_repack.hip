@@ -17,7 +17,14 @@
 // LAYOUT
 //   in  packed [out, half]   half = in/2, one byte = two 4-bit elements
 //   in  scale  [out, nb]     nb = in/32, one E8M0 byte per 32-element block
-//   out dst    [out, nb, 17] blk[0] = scale, blk[1..17] = 16 nibble bytes
+//   out dst    [out, nb/8, 136] SUPER-BLOCK v2:
+//                bytes   0..128  eight 16-byte nibble blocks (block k at k*16)
+//                bytes 128..136  eight E8M0 scale bytes (block k at 128+k)
+//              Same total size as the old 8 x [scale][16 nibbles]; only the
+//              arrangement inside a super-block moved, so the matvecs can read
+//              nibbles 8 bytes at a time instead of one byte at a time (they
+//              were byte-loading because each byte is a LUT index the compiler
+//              cannot fuse). See mxfp4_pair_matvec.hip for the measurements.
 //
 // HF splits each 32-element block into a low half (bytes 0..8) and a high half
 // (bytes 8..16); ggml wants the two interleaved pairwise. Mirrors the scalar
@@ -40,14 +47,19 @@ extern "C" __global__ void mxfp4_repack_hf_to_ggml(
     const unsigned int half = nb * 16u;  // bytes per row in `packed`
 
     const unsigned char* pb = packed + (size_t)r * (size_t)half + (size_t)j * 16u;
-    unsigned char*       blk = dst    + ((size_t)r * (size_t)nb + (size_t)j) * 17u;
+    // v2: block j lives in super-block j/8 at position j%8 — nibbles at k*16,
+    // scale at 128+k. Row stride is still nb*17 == (nb/8)*136.
+    const unsigned int sb = j >> 3;
+    const unsigned int k  = j & 7u;
+    unsigned char* sup = dst + (size_t)r * (size_t)nb * 17u + (size_t)sb * 136u;
+    unsigned char* nib = sup + (size_t)k * 16u;
 
-    blk[0] = scale[(size_t)r * (size_t)nb + (size_t)j];
+    sup[128u + k] = scale[(size_t)r * (size_t)nb + (size_t)j];
     #pragma unroll
     for (unsigned int i = 0; i < 8u; i++) {
         const unsigned char lo = pb[i];
         const unsigned char hi = pb[8u + i];
-        blk[1u + 2u * i] = (unsigned char)((lo & 0x0Fu) | (hi << 4));
-        blk[2u + 2u * i] = (unsigned char)((lo >> 4)    | (hi & 0xF0u));
+        nib[2u * i]      = (unsigned char)((lo & 0x0Fu) | (hi << 4));
+        nib[1u + 2u * i] = (unsigned char)((lo >> 4)    | (hi & 0xF0u));
     }
 }

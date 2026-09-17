@@ -47,6 +47,9 @@ impl Mxfp4Repack {
         out_rows: u32,
         nb: u32,
     ) -> eyre::Result<()> {
+        if nb % 8 != 0 {
+            return Err(eyre!("mxfp4_repack needs nb % 8 == 0 (super-block is 8 blocks), got {nb}"));
+        }
         let total = out_rows as usize * nb as usize;
         let packed_bytes = total * 16;
         if src_len < packed_bytes + total {
@@ -95,6 +98,9 @@ impl Mxfp4Repack {
         out_rows: u32,
         nb: u32,
     ) -> eyre::Result<()> {
+        if nb % 8 != 0 {
+            return Err(eyre!("mxfp4_repack needs nb % 8 == 0 (super-block is 8 blocks), got {nb}"));
+        }
         let total = out_rows as usize * nb as usize;
         if dst.len() < dst_off + total * 17 {
             return Err(eyre!(
@@ -123,6 +129,9 @@ impl Mxfp4Repack {
         out_rows: u32,
         nb: u32,
     ) -> eyre::Result<()> {
+        if nb % 8 != 0 {
+            return Err(eyre!("mxfp4_repack needs nb % 8 == 0 (super-block is 8 blocks), got {nb}"));
+        }
         let total = out_rows as usize * nb as usize;
         let packed_bytes = total * 16;
         if src.len() < packed_bytes + total {

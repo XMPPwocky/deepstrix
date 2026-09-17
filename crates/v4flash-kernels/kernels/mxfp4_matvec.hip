@@ -24,6 +24,21 @@
 #define QK_K 256
 #define BLOCK_MXFP4_BYTES 17
 #define SUPER_MXFP4_BYTES 136   // 8 × 17 per 256 elements
+
+// Super-block layout v2 — see the long note in mxfp4_pair_matvec.hip.
+//   bytes   0..128  eight 16-byte nibble blocks (block k at k*16)
+//   bytes 128..136  eight E8M0 scale bytes (block k at 128+k)
+// Stride unchanged at 136; only the arrangement inside a super-block moved, so
+// nibbles can be read 8 bytes at a time instead of one byte at a time.
+#define MXFP4_NIB(w_super, b32)   ((w_super) + (b32) * 16u)
+#define MXFP4_SCALE(w_super, b32) ((w_super)[128u + (b32)])
+
+__device__ __forceinline__ void mxfp4_load16(const uint8_t* qs, uint32_t* w) {
+    uint2 a_, b_;
+    __builtin_memcpy(&a_, qs, 8);
+    __builtin_memcpy(&b_, qs + 8, 8);
+    w[0] = a_.x; w[1] = a_.y; w[2] = b_.x; w[3] = b_.y;
+}
 #define BLOCK_Q8_K_BYTES 292
 #define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFull
 
@@ -75,9 +90,9 @@ __device__ __forceinline__ float dot_super_quarter_mxfp4(
     #pragma unroll
     for (unsigned int t = 0; t < 2u; t++) {
         const unsigned int b32 = 2u * sub + t;          // 0..7
-        const uint8_t* blk = w_super + b32 * BLOCK_MXFP4_BYTES;
-        const float scale = e8m0_half_to_f32(blk[0]);
-        const uint8_t* qs = blk + 1;
+        const float scale = e8m0_half_to_f32(MXFP4_SCALE(w_super, b32));
+        uint32_t ws_[4];
+        mxfp4_load16(MXFP4_NIB(w_super, b32), ws_);
         const int8_t* q8 = q8_base + b32 * 32u;
 
         int32_t sumi = 0;
@@ -88,7 +103,7 @@ __device__ __forceinline__ float dot_super_quarter_mxfp4(
             union { int32_t d; int8_t b[4]; } lo, hi;
             #pragma unroll
             for (unsigned int j = 0; j < 4u; j++) {
-                const uint8_t q = qs[4u * i + j];
+                const uint8_t q = (uint8_t)((ws_[i] >> (8u * j)) & 0xFFu);
                 lo.b[j] = s_lut[q & 0x0F];
                 hi.b[j] = s_lut[q >> 4];
             }
@@ -261,9 +276,10 @@ extern "C" __global__ void mxfp4_matvec_par_by_expert_kwide2(
                 unsigned int wi = 0;
                 #pragma unroll
                 for (unsigned int t = 0; t < 2u; t++) {
-                    const uint8_t* blk = w_super + (2u * sub + t) * BLOCK_MXFP4_BYTES;
-                    sc[t] = e8m0_half_to_f32(blk[0]);
-                    const uint8_t* qs = blk + 1;
+                    const unsigned int b32_ = 2u * sub + t;
+                    sc[t] = e8m0_half_to_f32(MXFP4_SCALE(w_super, b32_));
+                    uint32_t qw_[4];
+                    mxfp4_load16(MXFP4_NIB(w_super, b32_), qw_);
                     // 4 lo dwords then 4 hi dwords (matches q8 layout order
                     // below: q[8t..8t+3] lo elems, q[8t+4..8t+7] hi elems).
                     #pragma unroll
@@ -271,7 +287,7 @@ extern "C" __global__ void mxfp4_matvec_par_by_expert_kwide2(
                         union { int32_t d; int8_t b[4]; } lo;
                         #pragma unroll
                         for (unsigned int j = 0; j < 4u; j++) {
-                            lo.b[j] = s_lut[qs[4u * i + j] & 0x0F];
+                            lo.b[j] = s_lut[((qw_[i] >> (8u * j)) & 0xFFu) & 0x0F];
                         }
                         w[wi + i] = lo.d;
                     }
@@ -280,7 +296,7 @@ extern "C" __global__ void mxfp4_matvec_par_by_expert_kwide2(
                         union { int32_t d; int8_t b[4]; } hi;
                         #pragma unroll
                         for (unsigned int j = 0; j < 4u; j++) {
-                            hi.b[j] = s_lut[qs[4u * i + j] >> 4];
+                            hi.b[j] = s_lut[((qw_[i] >> (8u * j)) & 0xFFu) >> 4];
                         }
                         w[wi + 4u + i] = hi.d;
                     }

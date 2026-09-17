@@ -36,6 +36,37 @@
 #define QK_K 256
 #define BLOCK_MXFP4_BYTES 17
 #define SUPER_MXFP4_BYTES (8 * BLOCK_MXFP4_BYTES)   // 136
+
+// ---------------------------------------------------------------------------
+// SUPER-BLOCK LAYOUT (v2, 2026-09-17). Within each 136-byte super-block:
+//     bytes   0..128   eight 16-byte NIBBLE blocks, block k at k*16
+//     bytes 128..136   eight E8M0 scale bytes, block k's at 128+k
+// The old form interleaved them as 8 x [scale][16 nibbles], which put every
+// block's nibbles at an ODD byte offset. Each nibble byte is consumed straight
+// as a LUT index, so the compiler could not fuse them: 16 BYTE loads per block,
+// 4x the memory instructions for the same bytes. That is what `MemUnitBusy=97%`
+// at only 79% of achievable bandwidth was reporting -- a queue of tiny errands,
+// not a bandwidth ceiling. (q8_0 learned this in M18: "load 32 int8s as 2 uint4s
+// then dp4a"; mxfp4 arrived later and kept ggml's 17-byte block.)
+//
+// MEASURED, bench_mxfp4_moe_b1 (B=1, 75.2 MB/launch), 3+ runs:
+//     old, byte loads                     ~410 us   183 GB/s   79% of achievable
+//     new, uint2 (8 B) loads              ~360 us   209 GB/s   +14%
+// Super-block STRIDE is unchanged at 136, so row addressing, bytes_per_expert,
+// pool slots and snapshots are all untouched -- only the arrangement inside a
+// super-block moves. 8-byte loads (not 16) because nb*17 is always a multiple
+// of 8 but not of 16; going wider would need padding, which costs bytes on a
+// bandwidth-bound kernel and was measured WORSE when misaligned.
+#define MXFP4_NIB(w_super, b32)   ((w_super) + (b32) * 16u)
+#define MXFP4_SCALE(w_super, b32) ((w_super)[128u + (b32)])
+
+// 16 nibble bytes -> 4 dwords via two 8-byte loads.
+__device__ __forceinline__ void mxfp4_load16(const uint8_t* qs, uint32_t* w) {
+    uint2 a_, b_;
+    __builtin_memcpy(&a_, qs, 8);
+    __builtin_memcpy(&b_, qs + 8, 8);
+    w[0] = a_.x; w[1] = a_.y; w[2] = b_.x; w[3] = b_.y;
+}
 #define BLOCK_Q8_K_BYTES 292
 #define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFull
 #ifndef MXFP4_PAIR_MAX_BLOCKS
@@ -82,9 +113,9 @@ __device__ __forceinline__ float dot_super_half_mxfp4(
     #pragma unroll
     for (unsigned int t = 0; t < 4u; t++) {
         const unsigned int b32 = 4u * half + t;          // 0..7
-        const uint8_t* blk = w_super + b32 * BLOCK_MXFP4_BYTES;
-        const float scale = e8m0_half_to_f32_pair(blk[0]);
-        const uint8_t* qs = blk + 1;
+        const float scale = e8m0_half_to_f32_pair(MXFP4_SCALE(w_super, b32));
+        uint32_t ws_[4];
+        mxfp4_load16(MXFP4_NIB(w_super, b32), ws_);
         const int8_t* q8 = q8_base + b32 * 32u;
         int32_t sumi = 0;
         #pragma unroll
@@ -92,7 +123,7 @@ __device__ __forceinline__ float dot_super_half_mxfp4(
             union { int32_t d; int8_t b[4]; } lo, hi;
             #pragma unroll
             for (unsigned int j = 0; j < 4u; j++) {
-                const uint8_t q = qs[4u * i + j];
+                const uint8_t q = (uint8_t)((ws_[i] >> (8u * j)) & 0xFFu);
                 lo.b[j] = s_lut[q & 0x0F];
                 hi.b[j] = s_lut[q >> 4];
             }
@@ -328,10 +359,12 @@ extern "C" __global__ void mxfp4_pair_matvec_fused_swiglu_chunked(
 
 // This lane's 16 weights of one mxfp4 block as 4 sudot4-ready dwords.
 __device__ __forceinline__ void mxfp4_unpack16(
-        const uint8_t* blk, unsigned int half, const int8_t* s_lut,
+        const uint8_t* w_super, unsigned int b32, unsigned int half,
+        const int8_t* s_lut,
         int32_t& w0, int32_t& w1, int32_t& w2, int32_t& w3, float& ds) {
-    ds = e8m0_half_to_f32_pair(blk[0]);
-    const uint8_t* qs = blk + 1;
+    ds = e8m0_half_to_f32_pair(MXFP4_SCALE(w_super, b32));
+    uint32_t qw_[4];
+    mxfp4_load16(MXFP4_NIB(w_super, b32), qw_);
     const unsigned int sh = 4u * half;
     int32_t w[4];
     #pragma unroll
@@ -339,7 +372,7 @@ __device__ __forceinline__ void mxfp4_unpack16(
         union { int32_t d; int8_t b[4]; } u;
         #pragma unroll
         for (unsigned int j = 0; j < 4u; j++) {
-            u.b[j] = s_lut[(qs[4u * i + j] >> sh) & 0x0Fu];
+            u.b[j] = s_lut[(((qw_[i] >> (8u * j)) & 0xFFu) >> sh) & 0x0Fu];
         }
         w[i] = u.d;
     }
@@ -419,11 +452,11 @@ extern "C" __global__ void mxfp4_pair_matvec_fused_swiglu_kwide(
         int32_t wu0 = 0, wu1 = 0, wu2 = 0, wu3 = 0;
         float gds = 0.0f, uds = 0.0f;
         if (row_valid) {
+            // Super-block base only; `mxfp4_unpack16` indexes block b32 inside it.
             const uint64_t off = (uint64_t)row * (uint64_t)n_blocks * SUPER_MXFP4_BYTES
-                               + (uint64_t)sb_lane * SUPER_MXFP4_BYTES
-                               + (uint64_t)b32 * BLOCK_MXFP4_BYTES;
-            mxfp4_unpack16(gate_e_base + off, half, s_lut, wg0, wg1, wg2, wg3, gds);
-            mxfp4_unpack16(up_e_base   + off, half, s_lut, wu0, wu1, wu2, wu3, uds);
+                               + (uint64_t)sb_lane * SUPER_MXFP4_BYTES;
+            mxfp4_unpack16(gate_e_base + off, b32, half, s_lut, wg0, wg1, wg2, wg3, gds);
+            mxfp4_unpack16(up_e_base   + off, b32, half, s_lut, wu0, wu1, wu2, wu3, uds);
         }
 
         // --- Cooperative xq stage (M53 pattern, verbatim from iq3_s) ---
