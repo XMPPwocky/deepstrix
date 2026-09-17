@@ -3518,6 +3518,17 @@ fn finish_decode(
                     corrected = row_sample(n, &mut rng);
                 }
             }
+            // `V41_DSPARK_FORCE_N0=1`: run the whole DSpark machinery but keep
+            // NOTHING. The verify still runs batched over B rows and still
+            // supplies the emitted token from row 0; only the drafted rows are
+            // dropped. Isolation probe: if output then matches plain decode,
+            // row 0 of a batched verify is faithful and the divergence lives in
+            // the KV of the KEPT DRAFT rows; if it still diverges, row 0 itself
+            // differs once the verify (not decode) is driving the cache.
+            if n > 0 && std::env::var("V41_DSPARK_FORCE_N0").as_deref() == Ok("1") {
+                n = 0;
+                corrected = row_sample(0, &mut rng);
+            }
             dspark_stats::record_accept(n, k);
             let t_argmax = t_step.elapsed();
             // Attribute the ACCEPT verify's per-layer host time, not just the
