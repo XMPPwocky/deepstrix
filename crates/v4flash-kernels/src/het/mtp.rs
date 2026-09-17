@@ -1449,6 +1449,14 @@ pub struct MtpExit {
     memb_xscale: DeviceBuffer<f32>,
     bias: DeviceBuffer<f32>,
     tok_dev: DeviceBuffer<i32>,
+    /// `DSparkConfidenceHead(x_i, markov_embed_i)` per draft position, filled by
+    /// `forward`. The checkpoint carries this head (`mtp.2.confidence_head`) and
+    /// the reference returns it alongside the drafts; it is the drafter's own
+    /// estimate of whether draft `i` will survive verification, which is exactly
+    /// the signal for deciding HOW MANY drafts to submit.
+    pub conf: [f32; MTP_BLOCK],
+    /// Host copy of the `[1, N_EMBD + MTP_MARKOV_RANK]` projection, read once.
+    conf_w: Option<Vec<f32>>,
 }
 
 impl MtpExit {
@@ -1470,6 +1478,8 @@ impl MtpExit {
             memb_xscale: DeviceBuffer::new(device_id, mr.div_ceil(32))?,
             bias: DeviceBuffer::new(device_id, nv)?,
             tok_dev: DeviceBuffer::new(device_id, 1)?,
+            conf: [0.0; MTP_BLOCK],
+            conf_w: None,
         })
     }
 
@@ -1594,11 +1604,40 @@ impl MtpExit {
             plain[j] = got[0];
         }
 
+        // Confidence head. `x` is the PRE-norm `hc_pre` output the head reads,
+        // and the markov row computed at iteration `i` below is exactly the
+        // reference's `markov_embed[i]` (`markov_head(output_ids[i])`), so the
+        // two halves of the concatenation are both to hand inside the loop. The
+        // projection is one row of N_EMBD+256 f32; caching it host-side makes
+        // each position a 7424-MAC dot product on a thread that is already
+        // synchronising per position for the argmax readback, so this adds no
+        // device work and no extra sync.
+        if self.conf_w.is_none() {
+            let n = ne + MTP_MARKOV_RANK;
+            let mut hw = vec![0.0f32; n];
+            w.confidence.slice_view(0, n).copy_to_host(&mut hw)?;
+            self.conf_w = Some(hw);
+        }
+        let mut x_host = vec![0.0f32; MTP_BLOCK * ne];
+        self.x.slice_view(0, MTP_BLOCK * ne).copy_to_host(&mut x_host)?;
+        self.conf = [0.0; MTP_BLOCK];
+
         let mut ids = [0i32; MTP_BLOCK];
         let mut prev = first_token;
         let mut row = vec![0.0f32; MTP_MARKOV_RANK];
         for i in 0..MTP_BLOCK {
             Self::markov_row(markov_embd, markov_dtype, prev, &mut row)?;
+            if let Some(cw) = self.conf_w.as_ref() {
+                let xi = &x_host[i * ne..(i + 1) * ne];
+                let mut acc = 0.0f64;
+                for (a, b) in cw[..ne].iter().zip(xi) {
+                    acc += (*a as f64) * (*b as f64);
+                }
+                for (a, b) in cw[ne..ne + MTP_MARKOV_RANK].iter().zip(row.iter()) {
+                    acc += (*a as f64) * (*b as f64);
+                }
+                self.conf[i] = acc as f32;
+            }
             self.memb.copy_from_host(&row)?;
             e.q8.quantize_input(
                 s, &mut self.memb_xq, &mut self.memb_xscale, &self.memb,

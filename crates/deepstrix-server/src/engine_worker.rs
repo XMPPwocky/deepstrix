@@ -336,6 +336,10 @@ pub struct MtpCtx {
     /// must not forward them again), and the `main_hidden` of whichever row
     /// became the new head.
     pub pending: Option<[i32; v4flash_kernels::het::mtp::MTP_BLOCK]>,
+    /// `DSparkConfidenceHead` score for each pending draft, from the same
+    /// drafter pass. Calibrated against actual acceptance by
+    /// `dspark_stats::record_conf`; gates `k` once a threshold is set.
+    pub pending_conf: [f32; v4flash_kernels::het::mtp::MTP_BLOCK],
     pub confirmed: std::collections::VecDeque<i32>,
     /// Upcoming tokens (including the current `next`) that a verify already
     /// appended to KV — the decode loop must advance `pos` past them without
@@ -986,6 +990,7 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
             markov_dtype,
             noise_row,
             pending: None,
+            pending_conf: [0.0; v4flash_kernels::het::mtp::MTP_BLOCK],
             confirmed: std::collections::VecDeque::new(),
             ingested: 0,
             next_after: None,
@@ -3403,6 +3408,23 @@ fn finish_decode(
                 Some(cap) => cap.min(v4flash_kernels::het::mtp::MTP_BLOCK),
                 None => v4flash_kernels::het::mtp::MTP_BLOCK,
             };
+            // `V41_DSPARK_CONF_MIN=<f>`: truncate the block at the first draft the
+            // drafter itself is unsure of. A rejected draft costs a verify row --
+            // its share of the batched GEMV, and (cold) the expert reads that row
+            // routes to -- and buys nothing, since everything after a rejection is
+            // discarded too. Calibrate with the `conf` table in `dspark.request`
+            // before setting this.
+            let conf = state.mtp.as_ref().unwrap().pending_conf;
+            let k = match std::env::var("V41_DSPARK_CONF_MIN").ok().and_then(|v| v.parse::<f32>().ok()) {
+                Some(th) => {
+                    let cut = (0..k).position(|j| conf[j] < th).unwrap_or(k);
+                    // Always carry at least one draft: at k=0 the verify is a
+                    // one-row batch that costs a decode step and can accept
+                    // nothing, which is strictly worse than not speculating.
+                    cut.max(1)
+                }
+                None => k,
+            };
             // Hold the raw window in decode's monotonic addressing across the
             // whole verify: the prefill path would otherwise compact and reset
             // raw_off, making the `KvMark` below unaddressable and capping accept
@@ -3890,6 +3912,7 @@ fn finish_decode(
                 }
             }
             dspark_stats::record_accept(n, k);
+            dspark_stats::record_conf(&conf, n, k);
             let t_argmax = t_step.elapsed();
             // Attribute the ACCEPT verify's per-layer host time, not just the
             // probe's. The perfetto trace puts ~15.2 ms/layer of host gap
@@ -4067,6 +4090,7 @@ fn finish_decode(
                 &m.markov_embd, m.markov_dtype, pos + n as u32, &token_row, &m.noise_row, head,
             )?;
             m.pending = Some(d2);
+            m.pending_conf = m.exit.conf;
             if std::env::var("V41_DSPARK_STEP_TIMING").as_deref() == Ok("1") {
                 let d = state
                     .pager
@@ -4682,6 +4706,7 @@ fn finish_decode(
             ms_per_tok = format!("{:.2}", wall.as_secs_f64() * 1e3 / completion_tokens.max(1) as f64),
             tok_per_s = format!("{:.2}", completion_tokens as f64 / wall.as_secs_f64().max(1e-9)),
             stats = %dspark_stats::take(),
+            conf = %dspark_stats::take_conf(),
             box2_page_ms = page_us / 1000,
             box2_miss = miss,
             box2_miss_decode = miss_dec,
@@ -5312,6 +5337,45 @@ mod dspark_stats {
                 break;
             }
         }
+    }
+
+    /// Confidence calibration: bucket each REACHED draft by its confidence and
+    /// count how many were accepted. Answers the only question that matters
+    /// before gating on it -- does a low score actually predict rejection.
+    const CB: usize = 8;
+    static CONF_N: [AtomicU64; CB] = [const { AtomicU64::new(0) }; CB];
+    static CONF_OK: [AtomicU64; CB] = [const { AtomicU64::new(0) }; CB];
+    /// Bucket edges over the raw head output (a logit, not a probability).
+    const CONF_EDGE: [f32; CB] = [-4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0, f32::INFINITY];
+
+    fn conf_bucket(c: f32) -> usize {
+        CONF_EDGE.iter().position(|&e| c < e).unwrap_or(CB - 1)
+    }
+
+    pub fn record_conf(conf: &[f32], n: usize, k: usize) {
+        for j in 0..k.min(conf.len()) {
+            let b = conf_bucket(conf[j]);
+            CONF_N[b].fetch_add(1, Relaxed);
+            if j < n {
+                CONF_OK[b].fetch_add(1, Relaxed);
+            }
+            if j >= n {
+                break; // positions past the first rejection were never reached
+            }
+        }
+    }
+
+    pub fn take_conf() -> String {
+        let n: Vec<u64> = CONF_N.iter().map(|c| c.swap(0, Relaxed)).collect();
+        let a: Vec<u64> = CONF_OK.iter().map(|c| c.swap(0, Relaxed)).collect();
+        (0..CB)
+            .filter(|&i| n[i] > 0)
+            .map(|i| {
+                let lo = if i == 0 { f32::NEG_INFINITY } else { CONF_EDGE[i - 1] };
+                format!("[{lo:.0},{:.0}):{}/{}={:.2}", CONF_EDGE[i], a[i], n[i], a[i] as f64 / n[i] as f64)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// "hist=a/b/c per_pos=x.xx/y.yy" and drains.
