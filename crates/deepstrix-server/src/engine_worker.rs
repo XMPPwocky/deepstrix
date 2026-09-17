@@ -193,6 +193,9 @@ impl EngramCtx {
 macro_rules! forward_one {
     ($state:expr, $residual:expr, $pos:expr, $tok:expr) => {
         if let Some(pg) = $state.pager.as_mut() {
+            // Token boundary: nothing is reading the pool, so admit the
+            // background-read experts now (`V41_B1_PREFETCH`).
+            pg.drain_prefetched()?;
             // Gather this token's Engram rows before the forward: the tables are
             // SSD-resident and the gather needs the same HF source the pager owns.
             // Timed into `phase::CALLER_ENGRAM_NS` -> `engram_us` on the next
@@ -1167,7 +1170,10 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     #[cfg(feature = "v41")]
     let pager = if v4flash_kernels::het::weights::v41_paged_experts() {
         let t0 = std::time::Instant::now();
-        let pg = v4flash_kernels::het::ExpertPager::new(src_owner, igpu, 0)?;
+        let mut pg = v4flash_kernels::het::ExpertPager::new(src_owner, igpu, 0)?;
+        if v4flash_kernels::het::expert_pager::b1_prefetch() {
+            pg.start_prefetcher(std::path::Path::new(&cfg.gguf_path))?;
+        }
         tracing::info!(elapsed_s = t0.elapsed().as_secs_f64(), "expert pager ready");
         Some(pg)
     } else {
@@ -3475,6 +3481,11 @@ fn finish_decode(
             // any site in this step can read it.
             v4flash_kernels::het::mtp::slack_probe_step_advance();
             let t_step = std::time::Instant::now();
+            // Verify-step boundary: the previous step's logits were read back,
+            // so no MoE kernel can be reading the pool. Admit prefetched experts.
+            if let Some(pg) = state.pager.as_mut() {
+                pg.drain_prefetched()?;
+            }
             let spc0 = state.pager.as_ref().map(|p| p.counters()).unwrap_or_default();
             let mut decode_path_logits: Option<Vec<f32>> = None;
             // `V41_VERIFY_DECODE_PATH=1`: run the verify through DECODE's own
@@ -4670,6 +4681,12 @@ fn finish_decode(
             box2_miss_decode = miss_dec,
             box2_page_ms_decode = page_us_dec / 1000,
             box2_miss_by_layer = %miss_by_layer,
+            b1_prefetch = %state
+                .pager
+                .as_ref()
+                .and_then(|p| p.prefetch_stats())
+                .map(|(q, a, d, ms)| format!("queued={q} admitted={a} dropped={d} admit_ms={ms}"))
+                .unwrap_or_else(|| "off".into()),
             link = %link,
             "dspark.request"
         );

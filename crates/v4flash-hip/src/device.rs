@@ -35,6 +35,16 @@ impl Device {
         check_eyre(unsafe { sys::hipSetDevice(self.id) }, "hipSetDevice")
     }
 
+    /// Public twin of `scoped`: make THIS device current until the guard drops,
+    /// then restore whatever was current before. For code that must touch a
+    /// device from a context whose caller keeps its own notion of the current
+    /// device (e.g. the het engine's cached mirror): a bare `set_current` there
+    /// leaves the caller's next `set_current_cached` a no-op on the wrong device
+    /// (KNOWN_BUGS #10; measured as hipErrorInvalidHandle on the next launch).
+    pub fn scoped_current(&self) -> eyre::Result<ScopedDevice> {
+        Ok(ScopedDevice(DeviceGuard::enter(self.id)?))
+    }
+
     /// Temporarily make `id` current, restoring the previous device on drop.
     pub(crate) fn scoped(id: i32) -> eyre::Result<DeviceGuard> {
         DeviceGuard::enter(id)
@@ -72,6 +82,9 @@ impl DeviceGuard {
         Ok(DeviceGuard { prev, changed: true })
     }
 }
+
+/// Public RAII handle from [`Device::scoped_current`].
+pub struct ScopedDevice(#[allow(dead_code)] DeviceGuard);
 
 impl Drop for DeviceGuard {
     fn drop(&mut self) {

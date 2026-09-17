@@ -148,6 +148,9 @@ pub struct ExpertPager {
     /// three roles of one miss upload and permute without waiting on each other;
     /// the stream is synchronised once per miss before they are reused.
     repack_scratch: Vec<DeviceBuffer<u8>>,
+    /// Box 1 as L1: background reader that fills the decode LRU from this box's
+    /// own disk OFF the critical path (`V41_B1_PREFETCH=1`). See [`Prefetcher`].
+    prefetch: Option<Prefetcher>,
     repack_stream: Option<Stream>,
     pub decode_repack_gpu_ns: u64,
 }
@@ -285,6 +288,285 @@ fn pager_read_batch() -> usize {
         std::env::var("V41_PAGER_READ_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(32)
     });
     (*N).max(1)
+}
+
+
+/// `V41_B1_PREFETCH=1`: box 1 is the FIRST-level expert cache and box 2 the
+/// victim tier. The compute decision stays "resident here -> local, else box 2",
+/// but every box-1 miss is queued to a background thread that reads the expert
+/// from THIS box's disk and hands the bytes back; `drain_prefetched` admits
+/// them into the decode LRU (evicting LRU) at token boundaries, a few per
+/// token, so the 8 ms dm-crypt pread never sits on a layer's critical path.
+///
+/// WHY. Under the T2 catch-all box 1 admitted only into EMPTY slots, and
+/// synchronously (8.2 ms blocking each), then froze once full (KNOWN_BUGS
+/// #16). So box 2's 6160 slots were the whole dynamic tier (87-91% hit,
+/// ~21 misses/token x 6.1 ms) while box 1's slots and drive idled. Fed only by
+/// box 1's misses, box 2's LRU converges to what box 1 does NOT hold, so the
+/// pair is exclusive without any hint protocol.
+pub fn b1_prefetch() -> bool {
+    static B: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_B1_PREFETCH").as_deref() == Ok("1"));
+    *B
+}
+
+/// `V41_B1_PREFETCH_ADMIT=N`: admissions per `drain_prefetched` call (default 8;
+/// each is ~1.3 ms of H2D + GPU repack on the calling thread).
+fn prefetch_admit_per_drain() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_B1_PREFETCH_ADMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+    });
+    *N
+}
+
+struct Prefetched {
+    layer: i32,
+    id: u32,
+    /// gate / up / down bytes in the layout `ensure` stages (HF layout when the
+    /// GPU repack is on, ggml blocks otherwise). Empty on a read failure.
+    bufs: [Vec<u8>; 3],
+}
+
+/// Residency changes box 1 made since the last submit, for box 2 (the victim
+/// tier) to act on: ADMITTED -> box 2 marks its copy evict-first, so the two
+/// pools stay exclusive; EVICTED -> (v2) box 2 re-pages it in the background.
+/// Words are `layer << 16 | expert`.
+static RESIDENCY_HINTS: std::sync::Mutex<(Vec<u32>, Vec<u32>)> =
+    std::sync::Mutex::new((Vec::new(), Vec::new()));
+
+/// Take up to `max` of each kind, oldest first.
+pub fn take_residency_hints(max: usize) -> (Vec<u32>, Vec<u32>) {
+    let mut g = RESIDENCY_HINTS.lock().unwrap();
+    let (na, ne) = (g.0.len().min(max), g.1.len().min(max));
+    let a: Vec<u32> = g.0.drain(..na).collect();
+    let e: Vec<u32> = g.1.drain(..ne).collect();
+    (a, e)
+}
+
+fn push_hint(admitted: bool, layer: i32, e: u32) {
+    let w = ((layer as u32) << 16) | (e & 0xFFFF);
+    let mut g = RESIDENCY_HINTS.lock().unwrap();
+    let v = if admitted { &mut g.0 } else { &mut g.1 };
+    if v.len() < 4096 {
+        v.push(w);
+    }
+}
+
+/// LIFO request queue: the most recently missed expert is the one most likely
+/// to be touched again soon, so it is read first. A FIFO drowned in ~200
+/// hints/token and served the oldest.
+type HintStack = std::sync::Arc<(std::sync::Mutex<Vec<(i32, u32)>>, std::sync::Condvar)>;
+
+struct Prefetcher {
+    stack: HintStack,
+    rx: std::sync::mpsc::Receiver<Prefetched>,
+    /// Queued or read-but-not-admitted, so a hint is not queued twice.
+    pending: std::collections::HashSet<(i32, u32)>,
+    pub queued: u64,
+    pub admitted: u64,
+    pub dropped_full: u64,
+    pub admit_ns: u64,
+}
+
+/// Bound on reads in flight or awaiting admission. 64 x 18.8 MB = 1.2 GB of
+/// host staging at most.
+const PREFETCH_INFLIGHT_MAX: usize = 64;
+
+impl ExpertPager {
+    /// Start the background reader. Opens a SECOND handle on the HF dir so the
+    /// thread never touches the pager's own source.
+    pub fn start_prefetcher(&mut self, dir: &std::path::Path) -> eyre::Result<()> {
+        let stack: HintStack = std::sync::Arc::new((std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        let stack_t = stack.clone();
+        let (tx_done, rx_done) = std::sync::mpsc::channel::<Prefetched>();
+        let sizes = [
+            self.routed.gate_bytes_per_expert,
+            self.routed.up_bytes_per_expert,
+            self.routed.down_bytes_per_expert,
+        ];
+        let gpu_repack = self.repack.is_some();
+        let dir = dir.to_path_buf();
+        std::thread::Builder::new()
+            .name("b1-prefetch".into())
+            .spawn(move || {
+                let owner = match V41HfWeights::open(&dir, None) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eprintln!("b1-prefetch: cannot open {}: {e:#}; prefetch disabled", dir.display());
+                        return;
+                    }
+                };
+                let src = WeightSrc::from(&owner);
+                loop {
+                    let (layer, id) = {
+                        let (m, cv) = &*stack_t;
+                        let mut q = m.lock().unwrap();
+                        while q.is_empty() {
+                            q = cv.wait(q).unwrap();
+                        }
+                        q.pop().unwrap()
+                    };
+                    let names = [
+                        format!("blk.{layer}.ffn_gate_exps.weight"),
+                        format!("blk.{layer}.ffn_up_exps.weight"),
+                        format!("blk.{layer}.ffn_down_exps.weight"),
+                    ];
+                    let mut bufs = [vec![0u8; sizes[0]], vec![0u8; sizes[1]], vec![0u8; sizes[2]]];
+                    let mut ok = true;
+                    for (name, dst) in names.iter().zip(bufs.iter_mut()) {
+                        let Some(t) = src.tensor(name) else { ok = false; break };
+                        let r = if gpu_repack {
+                            src.read_expert_hf_layout(t, id as usize, dst).map(|_| ())
+                        } else {
+                            src.read_expert_into(t, id as usize, dst)
+                        };
+                        if let Err(e) = r {
+                            eprintln!("b1-prefetch: L{layer} e{id}: {e:#}");
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        bufs = [Vec::new(), Vec::new(), Vec::new()];
+                    }
+                    if tx_done.send(Prefetched { layer, id, bufs }).is_err() {
+                        return;
+                    }
+                }
+            })?;
+        self.prefetch = Some(Prefetcher {
+            stack,
+            rx: rx_done,
+            pending: std::collections::HashSet::new(),
+            queued: 0,
+            admitted: 0,
+            dropped_full: 0,
+            admit_ns: 0,
+        });
+        eprintln!(
+            "expert pager: box-1 L1 prefetch ON (admit {}/drain, {} in flight max)",
+            prefetch_admit_per_drain(),
+            PREFETCH_INFLIGHT_MAX
+        );
+        Ok(())
+    }
+
+    /// Queue `(layer, id)` for the background read if it is neither resident nor
+    /// already queued. Never blocks: a full queue drops the hint (counted).
+    pub fn prefetch_hint(&mut self, layer: i32, id: u32) {
+        let Some(pf) = self.prefetch.as_mut() else { return };
+        let key = (layer, id);
+        if self.slot_of.contains_key(&key) || pf.pending.contains(&key) {
+            return;
+        }
+        if pf.pending.len() >= PREFETCH_INFLIGHT_MAX {
+            pf.dropped_full += 1;
+            return;
+        }
+        {
+            let (m, cv) = &*pf.stack;
+            m.lock().unwrap().push(key);
+            cv.notify_one();
+        }
+        pf.pending.insert(key);
+        pf.queued += 1;
+    }
+
+    /// Admit up to `V41_B1_PREFETCH_ADMIT` completed reads into the decode LRU
+    /// (free slot above the dense region, else the LRU victim), same slot rules
+    /// and upload path as `ensure`'s miss branch. Call ONLY at a point where no
+    /// MoE kernel can still be reading the pool (a token / verify-step boundary):
+    /// the victim slot is overwritten in place. `remap` is untouched -- `ensure`
+    /// rewrites it per layer from `slot_of`.
+    pub fn drain_prefetched(&mut self) -> eyre::Result<usize> {
+        let Some(pf) = self.prefetch.as_mut() else { return Ok(0) };
+        let cap = prefetch_admit_per_drain();
+        let mut got: Vec<Prefetched> = Vec::new();
+        while got.len() < cap {
+            match pf.rx.try_recv() {
+                Ok(p) => got.push(p),
+                Err(_) => break,
+            }
+        }
+        if got.is_empty() {
+            return Ok(0);
+        }
+        let t0 = std::time::Instant::now();
+        // Scoped, NOT `set_current`: the caller (het engine) mirrors the current
+        // device in a cache, and a bare switch here leaves its next cached switch
+        // a no-op on the wrong device -> hipErrorInvalidHandle on the next launch.
+        let _dev = self.device.scoped_current()?;
+        let mut n = 0usize;
+        for p in got {
+            let key = (p.layer, p.id);
+            if let Some(pf) = self.prefetch.as_mut() {
+                pf.pending.remove(&key);
+            }
+            if p.bufs[0].is_empty() || self.slot_of.contains_key(&key) {
+                continue; // read failed, or `ensure` paged it meanwhile
+            }
+            let lru_lo = {
+                let lo = self.dense_slots();
+                if lo >= self.n_slots as usize { 0 } else { lo }
+            };
+            let slot = match self.slot_key.iter().enumerate().skip(lru_lo).find(|(_, k)| k.is_none()) {
+                Some((free, _)) => free as u32,
+                None => {
+                    let victim = self
+                        .lru
+                        .iter()
+                        .copied()
+                        .find(|&sl| (sl as usize) >= lru_lo)
+                        .ok_or_else(|| eyre!("expert pager: prefetch has no slot to evict"))?;
+                    if let Some(pos) = self.lru.iter().position(|&sl| sl == victim) {
+                        self.lru.remove(pos);
+                    }
+                    if let Some(old) = self.slot_key[victim as usize].take() {
+                        self.slot_of.remove(&old);
+                        push_hint(false, old.0, old.1);
+                    }
+                    victim
+                }
+            };
+            if (slot as usize) < self.dense_slots() {
+                if let Some(w) = self.window_of_slot(slot) {
+                    if let Some(e) = self.window_layer.get_mut(w as usize) { *e = None; }
+                    if let Some(d) = self.window_dense.get_mut(w as usize) { *d = false; }
+                }
+            }
+            push_hint(true, p.layer, p.id);
+            if self.repack.is_some() {
+                let (rp, st) = (self.repack.as_ref().unwrap(), self.repack_stream.as_ref().unwrap());
+                Self::upload_and_repack(
+                    rp, st, &mut self.repack_scratch, &mut self.routed, slot,
+                    [&p.bufs[0], &p.bufs[1], &p.bufs[2]],
+                )?;
+            } else {
+                let gbpe = self.routed.gate_bytes_per_expert;
+                let ubpe = self.routed.up_bytes_per_expert;
+                let dbpe = self.routed.down_bytes_per_expert;
+                self.routed.gate.buffer.slice_view_mut(slot as usize * gbpe, gbpe).copy_from_host(&p.bufs[0])?;
+                self.routed.up.buffer.slice_view_mut(slot as usize * ubpe, ubpe).copy_from_host(&p.bufs[1])?;
+                self.routed.down.buffer.slice_view_mut(slot as usize * dbpe, dbpe).copy_from_host(&p.bufs[2])?;
+            }
+            assert!(slot < self.n_slots, "expert pager: prefetch slot {slot} >= pool {}", self.n_slots);
+            self.slot_of.insert(key, slot);
+            self.slot_key[slot as usize] = Some(key);
+            self.touch(slot);
+            clear_box2_miss(p.layer, p.id);
+            n += 1;
+        }
+        if let Some(pf) = self.prefetch.as_mut() {
+            pf.admitted += n as u64;
+            pf.admit_ns += t0.elapsed().as_nanos() as u64;
+        }
+        Ok(n)
+    }
+
+    /// (queued, admitted, dropped_full, admit_ms) since start; None if off.
+    pub fn prefetch_stats(&self) -> Option<(u64, u64, u64, u64)> {
+        self.prefetch.as_ref().map(|p| (p.queued, p.admitted, p.dropped_full, p.admit_ns / 1_000_000))
+    }
 }
 
 impl ExpertPager {
@@ -510,6 +792,7 @@ impl ExpertPager {
             repack_scratch,
             repack_stream,
             decode_repack_gpu_ns: 0,
+            prefetch: None,
         })
     }
 

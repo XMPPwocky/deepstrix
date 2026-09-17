@@ -314,6 +314,11 @@ pub mod proto {
     /// `b <= decode_max_b` — lets the hub choose per request (DSpark verify
     /// batches) and gives the A/B without a daemon restart.
     pub const REQ_FLAG_BATCHED: u32 = 2;
+    /// Trailing residency hints after `ew`: u32 n_admit, u32 n_evict, then that
+    /// many `layer << 16 | expert` words each. ADMITTED = box 1 now holds it
+    /// (box 2 marks its copy evict-first, keeping the tiers exclusive);
+    /// EVICTED = box 1 dropped it (v2: box 2 re-pages it in the background).
+    pub const REQ_FLAG_HINTS: u32 = 4;
 
     /// Fixed request fields after the header (bytes):
     /// layer, b, flags, n_used, xq_bpt, reserved (6 × u32) then `t1` (u64,
@@ -503,6 +508,7 @@ pub mod proto {
         xq: &[u8],
         sel: &[i32],
         ew: &[f32],
+        hints: (&[u32], &[u32]),
     ) -> u64 {
         debug_assert_eq!(xq.len(), (b * xq_bpt) as usize);
         debug_assert_eq!(sel.len(), (b * n_used) as usize);
@@ -526,6 +532,13 @@ pub mod proto {
         {
             let dst = buf.view_mut::<f32>(off + sel.len() * 4, ew.len());
             dst.copy_from_slice(ew);
+        }
+        if flags & REQ_FLAG_HINTS != 0 {
+            buf.put_u32(hints.0.len() as u32);
+            buf.put_u32(hints.1.len() as u32);
+            for &w in hints.0.iter().chain(hints.1.iter()) {
+                buf.put_u32(w);
+            }
         }
         patch_len(buf);
         0
@@ -553,6 +566,9 @@ pub mod proto {
         pub xq: &'a [u8],
         pub sel: &'a [i32],
         pub ew: &'a [f32],
+        /// `REQ_FLAG_HINTS` residency hints (see the flag); empty otherwise.
+        pub hint_admit: &'a [u32],
+        pub hint_evict: &'a [u32],
     }
 
     /// Parse a REQUEST frame held in `buf` (header included).
@@ -571,11 +587,29 @@ pub mod proto {
         let xq_off = HDR_LEN + REQ_FIXED;
         let sel_off = xq_off + xq_len;
         let ew_off = sel_off + n_sel * 4;
-        if ew_off + n_sel * 4 != p.len() {
+        let hints_off = ew_off + n_sel * 4;
+        let (mut hint_admit, mut hint_evict): (&[u32], &[u32]) = (&[], &[]);
+        let expect_len = if flags & REQ_FLAG_HINTS != 0 {
+            if hints_off + 8 > p.len() {
+                return Err(eyre!("request: hints flagged but frame too short"));
+            }
+            let rd = |o: usize| u32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]) as usize;
+            let (na, ne) = (rd(hints_off), rd(hints_off + 4));
+            let end = hints_off + 8 + (na + ne) * 4;
+            if end > p.len() {
+                return Err(eyre!("request: hints n_admit={na} n_evict={ne} overrun frame"));
+            }
+            hint_admit = buf.view::<u32>(hints_off + 8, na);
+            hint_evict = buf.view::<u32>(hints_off + 8 + na * 4, ne);
+            end
+        } else {
+            hints_off
+        };
+        if expect_len != p.len() {
             return Err(eyre!(
                 "request: frame len {} != expected {} (b={b}, xq_bpt={xq_bpt}, n_used={n_used})",
                 p.len(),
-                ew_off + n_sel * 4
+                expect_len
             ));
         }
         // xq_off = 40 (8-aligned); sel_off = 40 + b*5840 is 4-aligned (5840 % 4 == 0).
@@ -589,6 +623,8 @@ pub mod proto {
             xq: &p[xq_off..sel_off],
             sel: buf.view::<i32>(sel_off, n_sel),
             ew: buf.view::<f32>(ew_off, n_sel),
+            hint_admit,
+            hint_evict,
         })
     }
 
@@ -1114,6 +1150,9 @@ pub struct LoadStats {
     pub bytes: u64,
     pub seconds: f64,
 }
+
+/// ADMITTED hints that matched a resident slot (daemon side).
+pub static HINTS_APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub struct ExpertShard {
     #[allow(dead_code)]
@@ -1704,6 +1743,26 @@ impl ExpertShard {
     /// Cumulative `(misses, page_ns)` for `layer`, or `(0, 0)` when the layer is
     /// not paged. `page_ns` is the wall cost of making experts resident:
     /// `read_ns` (NVMe + any CPU repack) plus `h2d_ns` plus the GPU repack.
+    /// Box 1 now holds these `(layer << 16 | expert)`: move our copies to the
+    /// FRONT of the LRU so they are the next victims. This is what makes the
+    /// two pools exclusive -- without it box 1's L1 was a strict subset of this
+    /// pool (both LRUs over the same miss stream) and added zero capacity.
+    pub fn hint_evict_first(&mut self, words: &[u32]) {
+        let Some(pool) = self.pool.as_mut() else { return };
+        let mut n = 0u64;
+        for &w in words {
+            let key = ((w >> 16) as u32, (w & 0xFFFF) as u32);
+            if let Some(&slot) = pool.slot_of.get(&key) {
+                if let Some(p) = pool.lru.iter().position(|&s| s == slot) {
+                    pool.lru.remove(p);
+                    pool.lru.push_front(slot);
+                    n += 1;
+                }
+            }
+        }
+        HINTS_APPLIED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Snapshot around a request and difference it to get that request's paging.
     pub fn layer_page_counters(&self, layer: u32) -> (u64, u64) {
         match self.layers.get(layer as usize).and_then(|l| l.as_ref()).and_then(|l| l.page.as_ref()) {
@@ -2995,6 +3054,9 @@ pub fn serve_connection(
                 // `remote.pager` lane and tell a box-2 NVMe stall apart from
                 // queueing or compute -- previously indistinguishable from the hub,
                 // which only saw one opaque round trip.
+                if !req.hint_admit.is_empty() {
+                    shard.hint_evict_first(req.hint_admit);
+                }
                 let (miss0, page_ns0) = shard.layer_page_counters(req.layer);
                 let timing = exec.run_path(shard, req.layer, b, req.xq, req.sel, req.ew, req.flags & proto::REQ_FLAG_BATCHED != 0)?;
                 let (miss1, page_ns1) = shard.layer_page_counters(req.layer);
@@ -3521,9 +3583,16 @@ impl RemoteExpertClient {
         });
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
+        // Residency hints ride on the next frame (box 1 = L1, box 2 = victim).
+        let (ha, he) = if super::expert_pager::b1_prefetch() {
+            super::expert_pager::take_residency_hints(64)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let flags = if ha.is_empty() && he.is_empty() { flags } else { flags | proto::REQ_FLAG_HINTS };
         proto::encode_request(
             &mut buf, seq, layer, b as u32, flags, nu as u32, XQ_BYTES_PER_TOKEN as u32, xq,
-            &self.sel_scratch[..b * nu], &self.ew_scratch[..b * nu],
+            &self.sel_scratch[..b * nu], &self.ew_scratch[..b * nu], (&ha, &he),
         );
         let ticket = Ticket { seq, layer, b: b as u32, bytes_out: buf.len(), t_submit: Instant::now() };
         self.tx_req.as_ref().ok_or_else(|| eyre!("client closed"))?.send(buf).map_err(|_| eyre!("writer thread gone"))?;
@@ -3691,7 +3760,7 @@ mod tests {
         let sel: Vec<i32> = (0..b * nu).map(|i| if i % 4 == 0 { NO_PICK } else { (i * 13 % 384) as i32 }).collect();
         let ew: Vec<f32> = (0..b * nu).map(|i| i as f32 * 0.125).collect();
         let mut buf = AlignedBuf::with_capacity(1 << 16);
-        proto::encode_request(&mut buf, 42, 17, b as u32, proto::REQ_FLAG_RESP_F32, nu as u32, XQ_BYTES_PER_TOKEN as u32, &xq, &sel, &ew);
+        proto::encode_request(&mut buf, 42, 17, b as u32, proto::REQ_FLAG_RESP_F32, nu as u32, XQ_BYTES_PER_TOKEN as u32, &xq, &sel, &ew, (&[], &[]));
         proto::patch_u64(&mut buf, proto::REQ_T1_OFF, 111_222_333);
         let h = proto::parse_header(buf.as_bytes()).unwrap();
         assert_eq!((h.kind, h.seq), (proto::KIND_REQUEST, 42));

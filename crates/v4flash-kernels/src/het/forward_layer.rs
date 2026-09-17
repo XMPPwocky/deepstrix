@@ -2406,6 +2406,17 @@ impl HeterogeneousEngine {
                     // packed prefill windows), so it was computing ~0.5 picks/layer
                     // anyway; giving those up costs little and buys reproducibility.
                     Some(vec![true; N_EXPERT as usize])
+                } else if catchall && super::expert_pager::b1_prefetch() {
+                    // Box 1 = L1, box 2 = victim tier. Compute what is resident
+                    // here, hand the rest to box 2, and queue every miss for the
+                    // BACKGROUND fill -- no synchronous admission, no freeze.
+                    let o: Vec<bool> = (0..N_EXPERT).map(|e| !pg.is_resident(layer, e)).collect();
+                    for &sv in &sel_host {
+                        if (0..N_EXPERT as i32).contains(&sv) && o[sv as usize] {
+                            pg.prefetch_hint(layer, sv as u32);
+                        }
+                    }
+                    Some(o)
                 } else if catchall {
                     // "Not resident here" == "box 2's". Pure lookup, no paging —
                     // EXCEPT while the pool is still filling, where a miss is a
