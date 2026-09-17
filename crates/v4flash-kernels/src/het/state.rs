@@ -535,8 +535,29 @@ impl KvMark {
                     if let Some(n) = n_comp {
                         // Never go backwards past what the mark already held,
                         // and never past what the batch actually wrote.
-                        m.n_comp = n.max(m.n_comp).min(m.n_comp + keep);
-                        m.n_index_comp = m.n_index_comp.min(m.n_comp);
+                        let before = m.n_comp;
+                        m.n_comp = n.max(before).min(before + keep);
+                        // `index_k` rows are indexed the same way `comp_kv` rows
+                        // are, so `n_index_comp` advances IN LOCKSTEP with
+                        // `n_comp` -- decode does `cs.n_index_comp += 1` beside
+                        // its comp_kv append, and batched prefill sets
+                        // `n_comp_start + n_boundaries`. Clamping it to the new
+                        // `n_comp` (what this did) advances the main store while
+                        // leaving the indexer at its PRE-VERIFY count, so every
+                        // boundary that fired inside the kept rows was written
+                        // but not counted. The indexer then selects over fewer
+                        // rows than decode would, which changes attention and
+                        // compounds across steps.
+                        let delta = m.n_comp - before;
+                        m.n_index_comp = if m.n_index_comp == 0 {
+                            // The indexer is not storing at all (`V41_INDEX_K`
+                            // off, the default) -- it must stay at zero.
+                            0
+                        } else if m.n_index_comp == before {
+                            m.n_comp
+                        } else {
+                            (m.n_index_comp + delta).min(m.n_comp)
+                        };
                     }
                     m
                 };
