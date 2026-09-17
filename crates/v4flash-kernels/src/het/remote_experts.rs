@@ -3207,7 +3207,13 @@ impl RemotePartial {
     /// size alongside -- so link_us regressed on bytes gives latency as the
     /// intercept and 1/bandwidth as the slope.
     pub fn record_link_stats(&self) {
-        link_stats::record(self.b, self.link_us() as u64, (self.bytes_in + self.bytes_out) as u64);
+        link_stats::record(
+            self.b,
+            self.link_us() as u64,
+            (self.bytes_in + self.bytes_out) as u64,
+            self.t_remote_page_us as u64,
+            self.n_remote_miss as u64,
+        );
     }
 }
 
@@ -3219,12 +3225,25 @@ pub mod link_stats {
     static US: [AtomicU64; MAX_B] = [const { AtomicU64::new(0) }; MAX_B];
     static BYTES: [AtomicU64; MAX_B] = [const { AtomicU64::new(0) }; MAX_B];
     static N: [AtomicU64; MAX_B] = [const { AtomicU64::new(0) }; MAX_B];
+    // Box 2's OWN paging, which box 1's pager counters cannot see: a run can
+    // read `decode_hit 1.0000` on box 1 while box 2 misses on every request.
+    // MEASURED cold vs warm: server time 255 ms -> 28 ms, a 9x swing that is
+    // invisible without these.
+    static PAGE_US: AtomicU64 = AtomicU64::new(0);
+    static MISS: AtomicU64 = AtomicU64::new(0);
 
-    pub fn record(b: u32, us: u64, bytes: u64) {
+    pub fn record(b: u32, us: u64, bytes: u64, page_us: u64, miss: u64) {
         let i = (b as usize).min(MAX_B - 1);
         US[i].fetch_add(us, Relaxed);
         BYTES[i].fetch_add(bytes, Relaxed);
         N[i].fetch_add(1, Relaxed);
+        PAGE_US.fetch_add(page_us, Relaxed);
+        MISS.fetch_add(miss, Relaxed);
+    }
+
+    /// (box-2 page microseconds, box-2 expert misses) since the last call.
+    pub fn take_paging() -> (u64, u64) {
+        (PAGE_US.swap(0, Relaxed), MISS.swap(0, Relaxed))
     }
 
     /// (b, calls, mean link us, mean bytes) for every b that saw traffic.

@@ -148,6 +148,38 @@ pub async fn chat_completions(
                 .to_string(),
         ));
     }
+    // V4.1 ships its OWN chat template (`<|System|>`, DSML tool blocks, an
+    // integer reasoning budget). Rendering a V4.1 model with V4-Flash's
+    // template puts every prompt slightly out of distribution, which costs
+    // quality on tool paths and plausibly costs DSpark acceptance too -- the
+    // drafter is predicting text it was trained to see in the other format.
+    #[cfg(feature = "v41")]
+    let tokens = {
+        // The 4-state effort carries the thinking flag; V4.1 wants a 1..=100
+        // budget alongside it. An explicit integer in the request wins.
+        let budget = req
+            .reasoning_effort
+            .as_deref()
+            .and_then(crate::prompt_v41::V41Effort::from_name)
+            .unwrap_or(match effort {
+                ReasoningEffort::Off | ReasoningEffort::Low => {
+                    crate::prompt_v41::V41Effort(50)
+                }
+                ReasoningEffort::High => crate::prompt_v41::V41Effort(75),
+                ReasoningEffort::Max => crate::prompt_v41::V41Effort(100),
+            });
+        crate::prompt_v41::render_prompt_v41(
+            &engine.vocab,
+            &req.messages,
+            req.tools.as_deref(),
+            effort.thinking_enabled(),
+            budget,
+            None, // V4.1's separate `context` block: nothing in the OpenAI API maps to it
+            engine.image_placeholder_id,
+        )
+        .map_err(|e| ApiError::BadRequest(format!("{e:#}")))?
+    };
+    #[cfg(not(feature = "v41"))]
     let tokens = render_prompt(
         &engine.vocab,
         &req.messages,

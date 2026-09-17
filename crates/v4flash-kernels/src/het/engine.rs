@@ -743,23 +743,6 @@ impl HeterogeneousEngine {
                 "dspark.draft.split"
             );
         }
-        // Per-B link statistics: link_us regressed on bytes across b gives
-        // LATENCY as the intercept and 1/BANDWIDTH as the slope. The aggregate
-        // `remote_link_us` cannot: it subtracts summed server time of
-        // CONCURRENT requests from one exposed wait and clamps at zero.
-        {
-            let rows = super::remote_experts::link_stats::take();
-            if !rows.is_empty() {
-                tracing::info!(
-                    per_b = rows
-                        .iter()
-                        .map(|(b, n, us, by)| format!("b{b}: n={n} link={us:.0}us bytes={by:.0}"))
-                        .collect::<Vec<_>>()
-                        .join(" | "),
-                    "remote.link.split"
-                );
-            }
-        }
         let r = exit.forward(
             &self.dgpu,
             &self.dgpu.compute,

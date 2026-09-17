@@ -3423,6 +3423,7 @@ fn finish_decode(
                     corrected = row_argmax(n);
                 }
             }
+            dspark_stats::record_accept(n, k);
             let t_argmax = t_step.elapsed();
             // Attribute the ACCEPT verify's per-layer host time, not just the
             // probe's. The perfetto trace puts ~15.2 ms/layer of host gap
@@ -4024,6 +4025,27 @@ fn finish_decode(
             finish = ?finish,
             "decode.loop.summary"
         );
+        // One greppable line per request, for reading a long session of real
+        // traffic. `n_hist`/`accept_by_pos` say WHERE the drafter fails (E
+        // alone cannot); the box-2 counters say whether a slow request was
+        // compute or box-2 NVMe, which box 1's own pager counters cannot see.
+        let (page_us, miss) =
+            v4flash_kernels::het::remote_experts::link_stats::take_paging();
+        let link = v4flash_kernels::het::remote_experts::link_stats::take()
+            .iter()
+            .map(|(b, n, us, by)| format!("b{b}:n={n},link={us:.0}us,bytes={by:.0}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::info!(
+            completion_tokens,
+            ms_per_tok = format!("{:.2}", wall.as_secs_f64() * 1e3 / completion_tokens.max(1) as f64),
+            tok_per_s = format!("{:.2}", completion_tokens as f64 / wall.as_secs_f64().max(1e-9)),
+            stats = %dspark_stats::take(),
+            box2_page_ms = page_us / 1000,
+            box2_miss = miss,
+            link = %link,
+            "dspark.request"
+        );
     }
 
     // Force EOS into the KV cache at end-of-turn so the next request's
@@ -4568,6 +4590,55 @@ const _: () = {
 /// `MtpState` for the life of the process and had no reset at all. See
 /// `MtpState::reset_ring` for the measured cost of that omission.
 #[cfg(feature = "v41")]
+/// Per-request DSpark statistics, for reading real traffic rather than a fixed
+/// benchmark prompt.
+///
+/// The acceptance POSITION histogram is the important one. `E` alone says how
+/// many tokens a step won; it cannot say whether the drafter dies at the first
+/// draft position or the fifth, and those call for completely different work.
+/// `accept[j] / reach[j]` is the per-position accept rate, so `d1` is the
+/// drafter's first-token quality — the number the oracles are stated in.
+mod dspark_stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    const MAXB: usize = v4flash_kernels::het::mtp::MTP_BLOCK + 1;
+    static HIST: [AtomicU64; MAXB] = [const { AtomicU64::new(0) }; MAXB];
+    static REACH: [AtomicU64; MAXB] = [const { AtomicU64::new(0) }; MAXB];
+    static ACCEPT: [AtomicU64; MAXB] = [const { AtomicU64::new(0) }; MAXB];
+
+    /// One verify step that accepted `n` of `k` drafts.
+    pub fn record_accept(n: usize, k: usize) {
+        HIST[n.min(MAXB - 1)].fetch_add(1, Relaxed);
+        // Position j was REACHED if the prefix before it was accepted, and
+        // ACCEPTED if the draft there matched. Conditioning on reach is what
+        // makes the rate comparable across positions.
+        for j in 0..k.min(MAXB) {
+            REACH[j].fetch_add(1, Relaxed);
+            if j < n {
+                ACCEPT[j].fetch_add(1, Relaxed);
+            }
+            if j >= n {
+                break;
+            }
+        }
+    }
+
+    /// "hist=a/b/c per_pos=x.xx/y.yy" and drains.
+    pub fn take() -> String {
+        let h: Vec<u64> = HIST.iter().map(|c| c.swap(0, Relaxed)).collect();
+        let r: Vec<u64> = REACH.iter().map(|c| c.swap(0, Relaxed)).collect();
+        let a: Vec<u64> = ACCEPT.iter().map(|c| c.swap(0, Relaxed)).collect();
+        let hist = h.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("/");
+        let pos = r
+            .iter()
+            .zip(&a)
+            .take_while(|(rr, _)| **rr > 0)
+            .map(|(rr, aa)| format!("{:.3}", *aa as f64 / *rr as f64))
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("n_hist={hist} accept_by_pos={pos}")
+    }
+}
+
 fn reset_drafter_ring(state: &mut WorkerState) {
     if let Some(m) = state.mtp.as_mut() {
         m.state.reset_ring();
