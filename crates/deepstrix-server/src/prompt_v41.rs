@@ -279,9 +279,33 @@ fn drop_thinking(msgs: &[Msg]) -> Vec<Msg> {
     out
 }
 
-fn tools_text(tools: &[ToolDef]) -> String {
+/// The tool block, split by PROVENANCE so the `Seg::Ours` / `Seg::Client`
+/// boundary lands in the right place.
+///
+/// `TOOLS_HEAD`/`TOOLS_TAIL` are OUR markup — they demonstrate the DSML syntax,
+/// so their `｜DSML｜` markers must tokenise to the real special id. Only the
+/// SCHEMAS are client-supplied and must stay inert (a tool description
+/// containing a literal `｜DSML｜` must never become a control token).
+///
+/// Emitting the whole block as `Seg::Client` (what this did) BPE'd our own
+/// instructions as ordinary text, so the model was shown look-alike DSML and
+/// faithfully imitated it — producing output the scanner correctly refuses to
+/// parse (it ignores DSML-looking bytes that carry no TOK_DSML). Net effect:
+/// every tool call came back as literal markup in `content` with
+/// `tool_calls: null`, and the scanner logged nothing at all.
+fn tools_segs(tools: &[ToolDef], out: &mut Vec<Seg>) {
     // tools_from_openai_format: the function object as given (name re-assigned
     // to itself; namespaces are not supported here), json.dumps(ensure_ascii=False).
+    let schemas: Vec<String> = tools.iter().map(|t| to_json_hf(&t.function)).collect();
+    out.push(Seg::Ours(TOOLS_HEAD.to_string()));
+    out.push(Seg::Client(schemas.join("\n")));
+    out.push(Seg::Ours(TOOLS_TAIL.to_string()));
+}
+
+/// Flat-string form of [`tools_segs`] (tests / diagnostics only — it loses the
+/// provenance split, so never feed it to the tokeniser).
+#[cfg(test)]
+fn tools_text(tools: &[ToolDef]) -> String {
     let schemas: Vec<String> = tools.iter().map(|t| to_json_hf(&t.function)).collect();
     format!("{TOOLS_HEAD}{}{TOOLS_TAIL}", schemas.join("\n"))
 }
@@ -351,7 +375,7 @@ fn render_message(out: &mut Vec<Seg>, index: usize, msgs: &[Msg], thinking: bool
             out.push(Seg::Client(m.content.clone().unwrap_or_default()));
             if let Some(tools) = m.tools.as_ref().filter(|t| !t.is_empty()) {
                 out.push(Seg::Ours("\n\n".to_string()));
-                out.push(Seg::Client(tools_text(tools)));
+                tools_segs(tools, out);
             }
         }
         R::User => {

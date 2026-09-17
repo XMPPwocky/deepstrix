@@ -53,9 +53,21 @@ use crate::vision_prompt::{span_hash_at, synthetic_token_bytes, ImageSpan};
 // removed with it) — a file whose encoding does not match the live store,
 // or an older version, is refused and evicted, and the session prefills
 // from scratch once.
-const FORMAT_VERSION: u32 = 5;
+// v5 -> v6: per-layer V4.1 sparse-indexer KEY store (`has_index_k`, `n_index_k`)
+// + index_k.bin. V4.1 keeps its index keys in the MAIN compressor
+// (`HetCompressorState::index_k` / `n_index_comp`), not in a separate
+// `indexer_compressor` — that struct is only allocated at ratio==4 and V4.1 has
+// no ratio-4 layer, so the v3 indexer blobs are always empty under V4.1 and the
+// keys were silently NOT persisted. A restored session therefore came back with
+// `n_index_comp == 0`, which fails the decode gate
+// (`n_index_comp > INDEXER_TOP_K`), so no index-source layer gathered, nothing
+// was published for S2, and all 40 layers scored densely — `V41_INDEX_K=1` was
+// inert on any prefix-cache hit. MEASURED before this fix: sel_sync 22.6 ms at
+// 8K -> 44.8 ms at 46K, i.e. attention scaling linearly with context, which is
+// the dense signature.
+const FORMAT_VERSION: u32 = 6;
 /// Oldest format `restore` accepts.
-const MIN_FORMAT_VERSION: u32 = 5;
+const MIN_FORMAT_VERSION: u32 = 6;
 
 /// On-disk encoding of one compressor's `comp_kv` rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -215,6 +227,14 @@ pub struct PerLayerMeta {
     pub index_head_dim: u32,
     #[serde(default)]
     pub index_state_rows: u32,
+    /// v6: V4.1 sparse-indexer key store, which lives in the MAIN compressor
+    /// (`index_k` / `n_index_comp`) rather than in `indexer_compressor`.
+    /// Without this the indexer cannot engage after a restore — see the
+    /// version history above.
+    #[serde(default)]
+    pub has_index_k: bool,
+    #[serde(default)]
+    pub n_index_k: u32,
     /// v4: encoding of this layer's main-compressor rows in comp_kv.bin.
     /// Absent (v3) = f16.
     #[serde(default)]
@@ -993,6 +1013,7 @@ pub fn save(
     let mut comp_state_blob = BlobWriter::new(dir.join("comp_state.bin"));
     let mut index_comp_kv_blob = BlobWriter::new(dir.join("index_comp_kv.bin"));
     let mut index_comp_state_blob = BlobWriter::new(dir.join("index_comp_state.bin"));
+    let mut index_k_blob = BlobWriter::new(dir.join("index_k.bin"));
     let mut scratch = SaveScratch::default();
     for (li, layer) in state.layers.iter().enumerate() {
         let ratio = COMPRESS_RATIOS[li];
@@ -1005,6 +1026,8 @@ pub fn save(
 
         let mut comp_kv_format = CompKvFormat::F16;
         let mut comp_kv_row_bytes = 0u32;
+        let mut has_index_k = false;
+        let mut n_index_k = 0u32;
         let mut index_comp_kv_format = CompKvFormat::F16;
         let mut index_comp_kv_row_bytes = 0u32;
         let (has_compressor, n_comp, width, head_dim, state_rows, coff) = if let Some(comp) =
@@ -1031,6 +1054,17 @@ pub fn save(
                 CompKvStore::E2m1(_) => {
                     return Err(eyre!("snapshot.save: layer {li} main compressor store cannot be E2M1"));
                 }
+            }
+            // v6: V4.1's sparse-indexer KEYS (E2M1 rows) live here, not in
+            // `indexer_compressor`. Stream the live prefix only, same shape
+            // rule as comp_kv above.
+            if let Some(ik) = comp.index_k.as_ref() {
+                let used = (comp.n_index_comp as usize) * E2M1_KEY_ROW_BYTES;
+                if used > 0 {
+                    scratch.stream_u8(ik, used, &mut index_k_blob)?;
+                }
+                has_index_k = true;
+                n_index_k = comp.n_index_comp;
             }
             // state_kv + state_score on iGPU — these ARE allocated at
             // exactly state_rows*width so no slicing needed.
@@ -1111,6 +1145,8 @@ pub fn save(
             index_head_dim,
             index_state_rows,
             comp_kv_format,
+            has_index_k,
+            n_index_k,
             comp_kv_row_bytes,
             index_comp_kv_format,
             index_comp_kv_row_bytes,
@@ -1266,6 +1302,7 @@ pub fn restore_vl(
     let mut comp_state_rd = BlobReader::open(src, "comp_state.bin", false)?;
     let mut index_comp_kv_rd = BlobReader::open(src, "index_comp_kv.bin", false)?;
     let mut index_comp_state_rd = BlobReader::open(src, "index_comp_state.bin", false)?;
+    let mut index_k_rd = BlobReader::open(src, "index_k.bin", false)?;
     let mut scratch = RestoreScratch::default();
 
     for (li, layer) in state.layers.iter_mut().enumerate() {
@@ -1360,10 +1397,35 @@ pub fn restore_vl(
                 scratch.load_f32(&mut comp_state_rd, n_state, &mut comp.state_kv)?;
                 scratch.load_f32(&mut comp_state_rd, n_state, &mut comp.state_score)?;
             }
+
+            // v6: V4.1 sparse-indexer keys. Without these `n_index_comp` comes
+            // back 0 and the decode gate (`n_index_comp > INDEXER_TOP_K`) can
+            // never fire on a restored session, so every layer scores densely.
+            //
+            // Restoring a PARTIAL key store would be worse than restoring none:
+            // the top-512 selection would run over a candidate set missing the
+            // restored prefix and silently attend to the wrong rows. So it is
+            // all-or-nothing — a short/absent blob resets the store to empty and
+            // the session simply runs dense, which is what it did before v6.
+            match (comp.index_k.as_mut(), m.has_index_k) {
+                (Some(ik), true) => {
+                    let want = (m.n_index_k as usize) * E2M1_KEY_ROW_BYTES;
+                    if want > 0 && index_k_rd.has(want) {
+                        dgpu.set_current()?;
+                        scratch.load_u8(&mut index_k_rd, want, ik)?;
+                        comp.n_index_comp = m.n_index_k;
+                    } else {
+                        comp.n_index_comp = 0;
+                    }
+                }
+                (Some(_), false) => comp.n_index_comp = 0,
+                (None, _) => {}
+            }
         } else if let Some(comp) = layer.compressor.as_mut() {
             // State expects a compressor but snapshot doesn't have one;
             // re-init defaults.
             comp.n_comp = 0;
+            comp.n_index_comp = 0;
             let n_state = comp.state_kv.len();
             igpu.set_current()?;
             comp.state_kv.copy_from_host(&vec![0f32; n_state])?;
