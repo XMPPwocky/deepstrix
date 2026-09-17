@@ -171,7 +171,12 @@ extern "C" __global__ void mxfp4_pair_matvec_fused_swiglu_batch(
     const unsigned int tid  = threadIdx.x;
     const unsigned int slot = blockIdx.y;
     const unsigned int lane = tid & 31u;
-    const unsigned int row  = blockIdx.x * 8u + (tid >> 5u);
+    // Rows per workgroup derive from the launch (blockDim.x/32 warps, one
+    // row each) instead of a hardcoded 8, so the geometry is a launch
+    // parameter that can be swept. ds4/llama.cpp select warps- and
+    // rows-per-block from a per-(type, batch, arch) table for exactly
+    // this kernel class; ours was one constant chosen once.
+    const unsigned int row  = blockIdx.x * (blockDim.x >> 5u) + (tid >> 5u);
     if (row >= n_rows) return;
     const int e = selected[slot];
     mxfp4_pair_row(mid + (uint64_t)slot * (uint64_t)n_rows + (uint64_t)row,
@@ -207,7 +212,12 @@ extern "C" __global__ void mxfp4_pair_matvec_fused_swiglu_batch_hetsplit(
     const unsigned int tid  = threadIdx.x;
     const unsigned int slot = blockIdx.y;
     const unsigned int lane = tid & 31u;
-    const unsigned int row  = blockIdx.x * 8u + (tid >> 5u);
+    // Rows per workgroup derive from the launch (blockDim.x/32 warps, one
+    // row each) instead of a hardcoded 8, so the geometry is a launch
+    // parameter that can be swept. ds4/llama.cpp select warps- and
+    // rows-per-block from a per-(type, batch, arch) table for exactly
+    // this kernel class; ours was one constant chosen once.
+    const unsigned int row  = blockIdx.x * (blockDim.x >> 5u) + (tid >> 5u);
     const int sel   = selected[slot];
     const int dense = remap[sel];
     unsigned int res_rank = 0;
@@ -268,7 +278,12 @@ extern "C" __global__ void mxfp4_pair_matvec_fused_swiglu_chunked(
     __syncthreads();
 
     const unsigned int lane = tid & 31u;
-    const unsigned int row  = blockIdx.x * 8u + (tid >> 5u);
+    // Rows per workgroup derive from the launch (blockDim.x/32 warps, one
+    // row each) instead of a hardcoded 8, so the geometry is a launch
+    // parameter that can be swept. ds4/llama.cpp select warps- and
+    // rows-per-block from a per-(type, batch, arch) table for exactly
+    // this kernel class; ours was one constant chosen once.
+    const unsigned int row  = blockIdx.x * (blockDim.x >> 5u) + (tid >> 5u);
     const bool row_valid = row < n_rows;
     const unsigned int xq_bytes = n_blocks * BLOCK_Q8_K_BYTES;
 
@@ -371,7 +386,12 @@ extern "C" __global__ void mxfp4_pair_matvec_fused_swiglu_kwide(
     __syncthreads();
 
     const unsigned int lane = tid & 31u;
-    const unsigned int row  = blockIdx.x * 8u + (tid >> 5u);
+    // Rows per workgroup derive from the launch (blockDim.x/32 warps, one
+    // row each) instead of a hardcoded 8, so the geometry is a launch
+    // parameter that can be swept. ds4/llama.cpp select warps- and
+    // rows-per-block from a per-(type, batch, arch) table for exactly
+    // this kernel class; ours was one constant chosen once.
+    const unsigned int row  = blockIdx.x * (blockDim.x >> 5u) + (tid >> 5u);
     const bool row_valid = (row < n_rows);
 
     const unsigned int sbh  = lane >> 4;               // 0..1: sb of the pair

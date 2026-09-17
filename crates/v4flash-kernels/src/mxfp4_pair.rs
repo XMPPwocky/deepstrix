@@ -19,6 +19,20 @@ pub struct Mxfp4PairMatvec {
     module: Module,
 }
 
+/// Warps per workgroup (= rows per workgroup, one row each) for the decode
+/// pair kernels. `V41_MXFP4_PAIR_WARPS` sweeps it; default 8 = the historical
+/// hardcoded geometry.
+fn pair_warps() -> u32 {
+    static W: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_MXFP4_PAIR_WARPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|w| (1..=32).contains(w))
+            .unwrap_or(8)
+    });
+    *W
+}
+
 impl Mxfp4PairMatvec {
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
         let image: &[u8] = if arch.starts_with("gfx1201") {
@@ -69,8 +83,8 @@ impl Mxfp4PairMatvec {
         Self::check(mid, n_used, n_rows, n_blocks)?;
         let function = self.module.get_function("mxfp4_pair_matvec_fused_swiglu_batch")?;
         let cfg = LaunchConfig {
-            grid: (n_rows / 8, n_used, 1),
-            block: (256, 1, 1),
+            grid: (n_rows.div_ceil(pair_warps()), n_used, 1),
+            block: (pair_warps() * 32, 1, 1),
             shared_mem_bytes: 0,
         };
         launch_kernel!(
@@ -120,8 +134,8 @@ impl Mxfp4PairMatvec {
             .module
             .get_function("mxfp4_pair_matvec_fused_swiglu_batch_hetsplit")?;
         let cfg = LaunchConfig {
-            grid: (n_rows / 8, n_used, 1),
-            block: (256, 1, 1),
+            grid: (n_rows.div_ceil(pair_warps()), n_used, 1),
+            block: (pair_warps() * 32, 1, 1),
             shared_mem_bytes: 0,
         };
         launch_kernel!(
