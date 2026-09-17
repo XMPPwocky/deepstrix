@@ -408,6 +408,23 @@ pub struct TokenTiming {
 
 impl TokenTiming {
     pub fn emit(&self) {
+        // Per-B link statistics. Emitted HERE rather than on the DSpark draft
+        // path because plain decode never takes that path, and b=1 decode is
+        // exactly the second payload point needed to separate link LATENCY
+        // (the intercept) from BANDWIDTH (the slope).
+        {
+            let rows = super::remote_experts::link_stats::take();
+            if !rows.is_empty() {
+                tracing::info!(
+                    per_b = rows
+                        .iter()
+                        .map(|(b, n, us, by)| format!("b{b}: n={n} link={us:.0}us bytes={by:.0}"))
+                        .collect::<Vec<_>>()
+                        .join(" | "),
+                    "remote.link.split"
+                );
+            }
+        }
         tracing::info!(
             token_pos = self.token_pos,
             total_us = self.total_us,

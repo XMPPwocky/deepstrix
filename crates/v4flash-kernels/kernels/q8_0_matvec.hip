@@ -300,3 +300,32 @@ extern "C" __global__ void q8_0_gemv_batched_warp8(
         out[(size_t)b * out_dim + row] = acc;
     }
 }
+
+// ---------------------------------------------------------------------------
+// SLACK PROBE (`V41_SLACK_PROBE`). Not a compute kernel -- a calibrated stall.
+//
+// Every other timer in this tree answers "how big is this work?". None answers
+// "if this work got smaller, would the STEP get smaller?" -- and those differ
+// whenever the work is latency-hidden behind another stream. MEASURED example:
+// B-packing the drafter's attn_q_b removed 8.8 ms/step of device time and moved
+// end-to-end throughput by zero. That was 8.8 ms of pure slack.
+//
+// So measure it causally instead of inferring it: inject a known delay into one
+// stream and sweep it. d(step)/d(delay) is that stream's position on the
+// critical path -- slope 1 means fully critical, slope 0 means fully hidden,
+// and the knee is exactly how much slack there is before it becomes critical.
+//
+// One wave, one block: this occupies almost no hardware. It blocks the STREAM,
+// which is the thing that carries the dependency.
+extern "C" __global__ void slack_probe_spin(unsigned long long ticks)
+{
+    if (threadIdx.x != 0) return;
+    // RDNA (gfx11/12) dropped `s_memrealtime`; `wall_clock64()` is the
+    // constant-rate counter here, and unlike `clock()` it does not track the
+    // shader clock, so a stall in ticks stays a fixed stall in wall time
+    // regardless of DPM state. That matters: the probe is the instrument.
+    unsigned long long t0 = wall_clock64();
+    while ((unsigned long long)(wall_clock64() - t0) < ticks) {
+        __builtin_amdgcn_s_sleep(8);
+    }
+}

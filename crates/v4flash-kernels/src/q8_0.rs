@@ -283,6 +283,18 @@ impl Q8_0Matvec {
     ///
     /// `batch` must be <= `GEMV_BPACK_MAX` (16) -- the accumulators are registers.
     #[allow(clippy::too_many_arguments)]
+    /// Stall this stream for `ticks` of the device's realtime counter.
+    ///
+    /// The unit is deliberately RAW TICKS, not microseconds: the counter's rate
+    /// varies by part, and the probe's whole job is to be trusted. Callers time
+    /// the achieved stall with the event timers and regress the STEP against
+    /// that measured delay, so no rate constant is ever assumed.
+    pub fn slack_probe_spin(&self, stream: &Stream, ticks: u64) -> eyre::Result<()> {
+        let function = self.module.get_function("slack_probe_spin")?;
+        let cfg = LaunchConfig { grid: (1, 1, 1), block: (64, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(function, cfg, stream, [ticks])
+    }
+
     pub fn matvec_bpack(
         &self,
         stream: &Stream,

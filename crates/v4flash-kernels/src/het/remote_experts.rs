@@ -3195,6 +3195,48 @@ impl RemotePartial {
     pub fn link_us(&self) -> u32 {
         self.rtt_us.saturating_sub(self.t_remote_server_us)
     }
+
+    /// Fold this request into the per-B link statistics.
+    ///
+    /// The aggregate `remote_link_us` in `TokenTiming` cannot answer "how much
+    /// of the link cost is LATENCY and how much is BANDWIDTH", and worse, it is
+    /// not even a valid link time: it subtracts a SUM of server times taken
+    /// across CONCURRENT requests from a single exposed wait, so it routinely
+    /// clamps to zero (observed srv 28171 us > rtt 21031 us). This is
+    /// per-request, where the subtraction is sound, and it keeps the payload
+    /// size alongside -- so link_us regressed on bytes gives latency as the
+    /// intercept and 1/bandwidth as the slope.
+    pub fn record_link_stats(&self) {
+        link_stats::record(self.b, self.link_us() as u64, (self.bytes_in + self.bytes_out) as u64);
+    }
+}
+
+/// Per-batch-size link statistics, for splitting link cost into latency and
+/// bandwidth. Indexed by `b` (clamped); b=1 is decode, b=3 a verify lane.
+pub mod link_stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub const MAX_B: usize = 9;
+    static US: [AtomicU64; MAX_B] = [const { AtomicU64::new(0) }; MAX_B];
+    static BYTES: [AtomicU64; MAX_B] = [const { AtomicU64::new(0) }; MAX_B];
+    static N: [AtomicU64; MAX_B] = [const { AtomicU64::new(0) }; MAX_B];
+
+    pub fn record(b: u32, us: u64, bytes: u64) {
+        let i = (b as usize).min(MAX_B - 1);
+        US[i].fetch_add(us, Relaxed);
+        BYTES[i].fetch_add(bytes, Relaxed);
+        N[i].fetch_add(1, Relaxed);
+    }
+
+    /// (b, calls, mean link us, mean bytes) for every b that saw traffic.
+    pub fn take() -> Vec<(u32, u64, f64, f64)> {
+        (0..MAX_B)
+            .filter_map(|i| {
+                let n = N[i].swap(0, Relaxed);
+                let (us, by) = (US[i].swap(0, Relaxed), BYTES[i].swap(0, Relaxed));
+                (n > 0).then(|| (i as u32, n, us as f64 / n as f64, by as f64 / n as f64))
+            })
+            .collect()
+    }
 }
 
 enum ClientInbound {
@@ -3492,7 +3534,7 @@ impl RemoteExpertClient {
         if valid {
             self.clock.push(sample);
         }
-        Ok(RemotePartial {
+        let partial = RemotePartial {
             layer: m.layer,
             b: m.b,
             is_f32: m.elem_bytes == 4,
@@ -3506,7 +3548,12 @@ impl RemoteExpertClient {
             bytes_out: ticket.bytes_out,
             clock: valid.then_some(sample),
             frame: buf,
-        })
+        };
+        // Every partial passes through here, so this is the one place the link
+        // statistics can be complete. The perfetto site below is gated on the
+        // exporter being attached, and the exporter itself perturbs the run.
+        partial.record_link_stats();
+        Ok(partial)
     }
 
     /// Hand a consumed partial's buffer back for reuse.

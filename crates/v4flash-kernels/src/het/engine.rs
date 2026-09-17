@@ -672,6 +672,15 @@ impl HeterogeneousEngine {
             token_row,
             noise_row,
         )?;
+        // SLACK PROBE: stall the drafter's stream by a known amount, so the
+        // step can be regressed against it. See `slack_probe_spin`. Sweeping
+        // this answers whether the drafter is on the critical path at all --
+        // which a device-time counter cannot, and which we got wrong once:
+        // B-packing attn_q_b removed 8.8 ms/step of drafter device time for
+        // zero end-to-end gain.
+        if let Some(ticks) = super::mtp::slack_probe_ticks("draft") {
+            self.igpu.q8.slack_probe_spin(&self.igpu.compute, ticks)?;
+        }
         let t_enq = std::time::Instant::now();
         self.igpu.compute.synchronize()?;
         // The drafter's whole forward is now complete on the device, so every
@@ -715,6 +724,23 @@ impl HeterogeneousEngine {
                 },
                 "dspark.draft.split"
             );
+        }
+        // Per-B link statistics: link_us regressed on bytes across b gives
+        // LATENCY as the intercept and 1/BANDWIDTH as the slope. The aggregate
+        // `remote_link_us` cannot: it subtracts summed server time of
+        // CONCURRENT requests from one exposed wait and clamps at zero.
+        {
+            let rows = super::remote_experts::link_stats::take();
+            if !rows.is_empty() {
+                tracing::info!(
+                    per_b = rows
+                        .iter()
+                        .map(|(b, n, us, by)| format!("b{b}: n={n} link={us:.0}us bytes={by:.0}"))
+                        .collect::<Vec<_>>()
+                        .join(" | "),
+                    "remote.link.split"
+                );
+            }
         }
         let r = exit.forward(
             &self.dgpu,

@@ -174,6 +174,27 @@ impl<'a> Drop for HostUs<'a> {
     }
 }
 
+/// Ticks of stall to inject at slack-probe site `site`, from
+/// `V41_SLACK_PROBE=<site>:<ticks>` (e.g. `draft:500000`).
+///
+/// Sweep it and regress the STEP time against the achieved stall: the slope is
+/// that stream's share of the critical path (1 = fully critical, 0 = fully
+/// hidden) and the knee is how much slack exists before it becomes critical.
+/// This is the only instrument here that answers "would making this faster make
+/// the step faster", which is not what any cost counter measures.
+pub fn slack_probe_ticks(site: &str) -> Option<u64> {
+    static V: std::sync::OnceLock<Option<(String, u64)>> = std::sync::OnceLock::new();
+    let parsed = V.get_or_init(|| {
+        let raw = std::env::var("V41_SLACK_PROBE").ok()?;
+        let (s, t) = raw.split_once(':')?;
+        Some((s.to_string(), t.parse().ok()?))
+    });
+    match parsed {
+        Some((s, t)) if s == site && *t > 0 => Some(*t),
+        _ => None,
+    }
+}
+
 /// Mode-3 (`V41_DSPARK_LAYER_TIMING=3`) event timing.
 ///
 /// Mode 2 syncs the stream at every span boundary, which SERIALISES the layer:
