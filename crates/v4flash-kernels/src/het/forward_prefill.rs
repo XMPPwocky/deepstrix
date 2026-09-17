@@ -4649,6 +4649,13 @@ impl HeterogeneousEngine {
                 bd.d_selected
                     .slice_view(0, n_sel)
                     .copy_to_host(&mut sel_host)?;
+                if super::expert_pager::pick_trace_on() {
+                    for r in 0..b as usize {
+                        let row = &sel_host[r * cs_n_used..(r + 1) * cs_n_used];
+                        let ids: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+                        super::expert_pager::pick_trace(&format!("P {layer} {b} {}", ids.join(" ")));
+                    }
+                }
                 // C3: with the split active, box 2 OWNS half of this layer's
                 // experts and computes them itself — so this box must not page
                 // them at all. That is the whole point of the split: the working
@@ -4661,13 +4668,17 @@ impl HeterogeneousEngine {
                 // supplies them at the combine. If either half regresses, this
                 // turns a missing expert into silently wrong output rather than
                 // an error — so it is gated on the same flag.
-                let owns_remote: Option<Vec<bool>> = if remote_split_on {
+                let owns_remote: Option<Vec<bool>> = if remote_split_on
+                    && !super::expert_pager::t2_partition()
+                {
                     self.remote.as_ref().and_then(|r| {
                         r.lock().ok().map(|c| {
                             (0..N_EXPERT).map(|e| c.owns(layer as u32, e as i32)).collect()
                         })
                     })
                 } else {
+                    // Under the partition the HELLO bitmap is irrelevant: the pick
+                    // loop below assigns every pick by `partition_box2`.
                     None
                 };
                 // SMALL-B CATCH-ALL: box 1 computes only what it ALREADY HOLDS
@@ -4726,6 +4737,13 @@ impl HeterogeneousEngine {
                         // can take the whole batch; the 170-slot objection that
                         // keeps `V41_REPLAY_OFFLOAD` off is a property of the CED
                         // replay's 162-wide union at B=128, not of a verify.
+                        if remote_split_on
+                            && super::expert_pager::t2_partition()
+                            && super::expert_pager::partition_box2(layer as i32, sv as u32)
+                        {
+                            extra_remote[sv as usize] = true;
+                            continue;
+                        }
                         if small_b_catchall
                             && (small_b_catchall_det() || !pg.is_resident(layer as i32, sv as u32))
                         {
@@ -4777,7 +4795,10 @@ impl HeterogeneousEngine {
                 if remote_split_on {
                     if let Some(remote) = self.remote.as_ref() {
                         let _t_owns = LayerHostTimer::start(&LH_OWNS);
-                        let owns: Vec<bool> = {
+                        let owns: Vec<bool> = if super::expert_pager::t2_partition() {
+                            // Partition: box 2 owns exactly what `extra_remote` says.
+                            vec![false; N_EXPERT as usize]
+                        } else {
                             let c = remote
                                 .lock()
                                 .map_err(|_| eyre!("remote expert client mutex poisoned"))?;

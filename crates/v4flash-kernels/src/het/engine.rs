@@ -474,6 +474,14 @@ fn connect_remote_experts() -> Option<std::sync::Mutex<super::remote_experts::Re
 }
 
 impl HeterogeneousEngine {
+    /// See `RemoteExpertClient::drain_in_flight`. Returns the number drained.
+    pub fn remote_drain_in_flight(&self) -> usize {
+        self.remote
+            .as_ref()
+            .and_then(|m| m.lock().ok())
+            .map(|mut c| c.drain_in_flight())
+            .unwrap_or(0)
+    }
     /// Run a full token forward across both devices. Reads the layer-0
     /// residual stream from `input_hc_host` (size `HC_DIM`), runs all
     /// 43 layers, then the head. On return, `dgpu_scratch.logits` holds

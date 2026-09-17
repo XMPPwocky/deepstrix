@@ -2340,6 +2340,10 @@ impl HeterogeneousEngine {
             self.set_current_cached(self.dgpu.device)?;
             de.compute.synchronize()?;
             dgpu_scratch.d_selected.copy_to_host(&mut sel_host)?;
+            if super::expert_pager::pick_trace_on() {
+                let ids: Vec<String> = sel_host.iter().map(|v| v.to_string()).collect();
+                super::expert_pager::pick_trace(&format!("D {layer} {}", ids.join(" ")));
+            }
             super::trace::phase::add(
                 &super::trace::phase::SEL_SYNC_NS,
                 t_sel.elapsed().as_nanos() as u64,
@@ -2406,6 +2410,16 @@ impl HeterogeneousEngine {
                     // packed prefill windows), so it was computing ~0.5 picks/layer
                     // anyway; giving those up costs little and buys reproducibility.
                     Some(vec![true; N_EXPERT as usize])
+                } else if catchall && super::expert_pager::t2_partition() {
+                    // Fixed hash partition of the id space; box 1 pages its
+                    // share synchronously through `ensure` (the LRU evicts), box 2
+                    // pages its share on its own disk. See `t2_partition`.
+                    if let Some(r) = self.remote.as_ref() {
+                        if let Ok(c) = r.lock() {
+                            super::expert_pager::set_partition_share(pg.decode_slots(), c.info().n_resident);
+                        }
+                    }
+                    Some((0..N_EXPERT).map(|e| super::expert_pager::partition_box2(layer, e)).collect())
                 } else if catchall && super::expert_pager::b1_prefetch() {
                     // Box 1 = L1, box 2 = victim tier. Compute what is resident
                     // here, hand the rest to box 2, and queue every miss for the
@@ -2528,6 +2542,20 @@ impl HeterogeneousEngine {
                     .d_ew
                     .slice_view(0, N_EXPERT_USED)
                     .copy_to_host(&mut ew_host)?;
+                let (sel_remote, ew_remote): (Vec<i32>, Vec<f32>) = match owns_remote.as_ref() {
+                    Some(o) if std::env::var("V41_REMOTE_NOMASK").as_deref() != Ok("1") => sel_host
+                        .iter()
+                        .zip(ew_host.iter())
+                        .map(|(&sv, &w)| {
+                            if (0..N_EXPERT as i32).contains(&sv) && o[sv as usize] {
+                                (sv, w)
+                            } else {
+                                (super::remote_experts::NO_PICK, 0.0f32)
+                            }
+                        })
+                        .unzip(),
+                    _ => (sel_host.clone(), ew_host.clone()),
+                };
                 let t_sub = super::perfetto::now_ns();
                 let ticket = self
                     .remote
@@ -2539,7 +2567,17 @@ impl HeterogeneousEngine {
                     // partition in `owns_remote`, and box 2 (`--paged`) accepts any
                     // expert. Masking here by box 2's ADVERTISED set silently dropped
                     // 77% of routed picks — see `submit_unmasked`.
-                    .submit_unmasked(layer as u32, 1, &xq_host, &sel_host, &ew_host, true)?;
+                    //
+                    // BUT the picks box 1 keeps ("ours", owns_remote false) MUST be
+                    // blanked to NO_PICK / weight 0: box 2's `run_path` computes every
+                    // pick it is handed, and `ffn_combine` adds its partial to the
+                    // local one, so an unblanked local pick was computed TWICE and
+                    // DOUBLE-ADDED. `verify_routing_exactly_once` cannot see it — it
+                    // validates the hub's claim, not what box 2 does. Found 2026-09-17;
+                    // it is what made mode-1 output depend on box 1's residency
+                    // history ("DEGENERATE after a 37-tok request", KNOWN_BUGS #0).
+                    // `V41_REMOTE_NOMASK=1` reproduces the old behaviour.
+                    .submit_unmasked(layer as u32, 1, &xq_host, &sel_remote, &ew_remote, true)?;
                 if let Some(pf) = self.perfetto.as_ref() {
                     if let Ok(pf) = pf.lock() {
                         let _ = pf.emit_host_slice(

@@ -1635,6 +1635,12 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                 let t_req = std::time::Instant::now();
                 if let Err(e) = handle_generate_stream(&mut state, req, session_id, cancel, &tx) {
                     let _ = tx.blocking_send(WorkerEvent::Error(format!("{e:#}")));
+                    // A mid-layer failure leaves box-2 requests in flight; drain them
+                    // or every later request dies on a ticket/seq mismatch.
+                    let n = state.engine.remote_drain_in_flight();
+                    if n > 0 {
+                        tracing::warn!(drained = n, "remote expert client: drained in-flight tickets after request error");
+                    }
                 }
                 // Engine-side end-to-end wall for the request (prefill + decode
                 // loop + snapshot saves). `e2e_ms - decode.loop.summary.loop_ms`

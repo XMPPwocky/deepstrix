@@ -198,6 +198,62 @@ fn box2_missed_slot(layer: i32, e: u32) -> Option<(usize, u64)> {
 }
 
 /// Record that box 2 had to page `e` on `layer`.
+/// `V41_PICK_TRACE=<path>`: append every router pick to a text trace, one line
+/// per (phase, layer, row): `D <layer> <ids...>` for a decode token and
+/// `P <layer> <b> <ids...>` for a prefill/verify chunk row. Feeds the offline
+/// cache-policy simulator (scratch `simcache.py`), so LRU vs LFU vs two-tier
+/// at any capacity is answered from one trace instead of one weight load each.
+pub fn pick_trace(line: &str) {
+    static W: std::sync::LazyLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> =
+        std::sync::LazyLock::new(|| {
+            let path = std::env::var("V41_PICK_TRACE").ok()?;
+            let f = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+            Some(std::sync::Mutex::new(std::io::BufWriter::new(f)))
+        });
+    if let Some(m) = W.as_ref() {
+        use std::io::Write;
+        let mut g = m.lock().unwrap();
+        let _ = g.write_all(line.as_bytes());
+        let _ = g.write_all(b"\n");
+    }
+}
+pub fn pick_trace_on() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_PICK_TRACE").is_ok());
+    *B
+}
+
+/// `V41_T2_PARTITION=1`: split the expert id space between the boxes by a
+/// fixed hash, box 1's share proportional to its decode-LRU slots vs box 2's
+/// pool. Each box then runs its OWN LRU over its OWN demand stream and pages
+/// from its OWN disk -- no cross-box protocol, and the simulator says two
+/// LRUs over disjoint streams hit like one LRU of the summed capacity
+/// (4454+6160: 19.2 -> 5.9 decode misses/token on a 9-request trace).
+pub fn t2_partition() -> bool {
+    static B: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_T2_PARTITION").as_deref() == Ok("1"));
+    *B
+}
+static PARTITION_BOX1_MILLI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+/// Set once from (box 1 decode slots, box 2 pool slots). `V41_PARTITION_BOX1_SHARE`
+/// (0..1) overrides.
+pub fn set_partition_share(box1_slots: u32, box2_slots: u32) {
+    let m = std::env::var("V41_PARTITION_BOX1_SHARE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .map(|f| (f.clamp(0.0, 1.0) * 1000.0) as u32)
+        .unwrap_or_else(|| (1000 * box1_slots as u64 / (box1_slots as u64 + box2_slots as u64).max(1)) as u32);
+    if PARTITION_BOX1_MILLI.swap(m, std::sync::atomic::Ordering::Relaxed) == u32::MAX {
+        eprintln!("expert pager: T2 PARTITION on: box 1 takes {:.1}% of expert ids (box1 {box1_slots} slots, box2 {box2_slots})", m as f32 / 10.0);
+    }
+}
+/// Home of `(layer, e)` under the partition: true = box 2.
+pub fn partition_box2(layer: i32, e: u32) -> bool {
+    let m = PARTITION_BOX1_MILLI.load(std::sync::atomic::Ordering::Relaxed);
+    let m = if m == u32::MAX { 420 } else { m };
+    let h = ((layer as u64) * 1000003 + (e as u64) * 7919) % 1000;
+    h >= m as u64
+}
+
 /// Per-layer count of box-2 DECODE misses (from the `miss_mask` box 2 returns
 /// with every decode partial), so a request's misses can be attributed to
 /// layers instead of only summed. `take_box2_miss_by_layer` drains it.
@@ -357,9 +413,22 @@ fn push_hint(admitted: bool, layer: i32, e: u32) {
 /// hints/token and served the oldest.
 type HintStack = std::sync::Arc<(std::sync::Mutex<Vec<(i32, u32)>>, std::sync::Condvar)>;
 
+/// `V41_B1_PREFETCH_MIN_TOUCH=N`: queue an expert only once it has missed N
+/// times (default 2). A one-touch tail expert costs an admission, a box-2
+/// drop (hint) and usually a later re-miss from disk; requiring a repeat keeps
+/// the L1 for experts that recur. Counts saturate and are never reset.
+fn prefetch_min_touch() -> u8 {
+    static N: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_B1_PREFETCH_MIN_TOUCH").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+    });
+    *N
+}
+
 struct Prefetcher {
     stack: HintStack,
     rx: std::sync::mpsc::Receiver<Prefetched>,
+    /// miss count per (layer, expert), for the min-touch gate.
+    touches: std::collections::HashMap<(i32, u32), u8>,
     /// Queued or read-but-not-admitted, so a hint is not queued twice.
     pending: std::collections::HashSet<(i32, u32)>,
     pub queued: u64,
@@ -438,6 +507,7 @@ impl ExpertPager {
             stack,
             rx: rx_done,
             pending: std::collections::HashSet::new(),
+            touches: std::collections::HashMap::new(),
             queued: 0,
             admitted: 0,
             dropped_full: 0,
@@ -457,6 +527,11 @@ impl ExpertPager {
         let Some(pf) = self.prefetch.as_mut() else { return };
         let key = (layer, id);
         if self.slot_of.contains_key(&key) || pf.pending.contains(&key) {
+            return;
+        }
+        let t = pf.touches.entry(key).or_insert(0);
+        *t = t.saturating_add(1);
+        if *t < prefetch_min_touch() {
             return;
         }
         if pf.pending.len() >= PREFETCH_INFLIGHT_MAX {

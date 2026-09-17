@@ -3664,6 +3664,25 @@ impl RemoteExpertClient {
         let _ = self.tx_resp_recycle.send(p.frame);
     }
 
+    /// Consume every outstanding response. A request that errors out mid-layer
+    /// leaves tickets in flight; the next request's first `wait` then fails
+    /// with "ticket seq X but oldest in flight is Y" and EVERY later request
+    /// fails the same way (observed 2026-09-17 after one prompt overflowed the
+    /// prefill window stride). Call from the request error path.
+    pub fn drain_in_flight(&mut self) -> usize {
+        let mut n = 0;
+        while self.in_flight.pop_front().is_some() {
+            match self.rx_resp.recv() {
+                Ok(ClientInbound::Resp { buf, .. }) => {
+                    let _ = self.tx_resp_recycle.send(buf);
+                }
+                Ok(ClientInbound::Err(_)) | Err(_) => break,
+            }
+            n += 1;
+        }
+        n
+    }
+
     /// Convenience: submit + wait.
     pub fn call(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool) -> eyre::Result<Option<RemotePartial>> {
         match self.submit(layer, b, xq, sel, ew, resp_f32)? {
