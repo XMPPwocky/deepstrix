@@ -691,6 +691,9 @@ impl HeterogeneousEngine {
             image_spans::lane_split(pos0, b, spans, bd_a.rows, bd_b.rows)?
         };
         let b_b = b - b_a;
+        // Record where the cut fell. `mtp_src` is captured per lane and indexed
+        // lane-locally, so anything selecting a GLOBAL batch row needs this.
+        bd_a.mtp_lane_cut = b_a;
         if std::env::var("V41_PREFILL_LANE_DEBUG").as_deref() == Ok("1") {
             tracing::warn!(
                 b, b_a, b_b, lo, hi,

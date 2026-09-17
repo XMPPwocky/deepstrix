@@ -3383,7 +3383,24 @@ fn finish_decode(
                 let _ = HC_DIM;
                 decode_path_logits = Some(out);
             }
-            state.bd_a.mtp_capture_rows = k;
+            // Capture on BOTH lanes, and over the WHOLE verify batch.
+            //
+            // The verify splits into two lanes (`single_lane_max` defaults to
+            // 0, so B=6 becomes 3+3), and `mtp_src` is captured per lane into
+            // that lane's own buffer, indexed LANE-LOCALLY. Arming only lane A
+            // left rows [b_a, b) -- about 29% of accepted heads at the measured
+            // n histogram -- reading STALE residuals out of lane A's buffer,
+            // which is what fed the drafter garbage and looked like "the
+            // drafter is a quality bug".
+            //
+            // `k` rather than the full batch was the other half: the capture
+            // takes the LAST `min(tokens, rows)` rows of the lane, so a single
+            // lane holding all 6 tokens with rows=5 skipped row 0 and shifted
+            // every residual by one. That is why forcing single-lane measured
+            // WORSE (E 2.26 -> 1.74) instead of better. `toks.len()` makes the
+            // skip zero in both configurations.
+            state.bd_a.mtp_capture_rows = toks.len();
+            state.bd_b.mtp_capture_rows = toks.len();
             // Only when the decode-path verify did not already produce them:
             // running both would ingest B tokens TWICE and the partial rollback
             // would then keep a doubly-ingested cache.
@@ -3398,6 +3415,7 @@ fn finish_decode(
                 )?
             };
             state.bd_a.mtp_capture_rows = 0;
+            state.bd_b.mtp_capture_rows = 0;
             let logits = decode_path_logits.take().unwrap_or(logits_batched);
             let t_fwd = t_step.elapsed();
 
@@ -3531,14 +3549,25 @@ fn finish_decode(
             let ne = v4flash_kernels::config::N_EMBD as usize;
             let nsrc = v4flash_kernels::het::mtp::MTP_SRC_LAYERS.len();
             let cap = v4flash_kernels::het::batch_scratch::MTP_CAP_ROWS;
+            // Global batch row -> (lane, lane-local row). See the capture
+            // comment above: each lane's `mtp_src` is indexed from 0.
+            let cut = state.bd_a.mtp_lane_cut;
             let mut whole = vec![0.0f32; nsrc * cap * ne];
+            let mut whole_b = vec![0.0f32; nsrc * cap * ne];
             state.bd_a.mtp_src.copy_to_host(&mut whole)?;
+            if cut < toks.len() {
+                state.bd_b.mtp_src.copy_to_host(&mut whole_b)?;
+            }
+            let lane_row = |r: usize| -> (&Vec<f32>, usize) {
+                if r < cut { (&whole, r) } else { (&whole_b, r - cut) }
+            };
             let m = state.mtp.as_mut().expect("mtp");
             m.main_hidden.clear();
             #[allow(clippy::needless_range_loop)]
             for sl in 0..nsrc {
-                let o = sl * cap * ne + row * ne;
-                m.main_hidden.extend_from_slice(&whole[o..o + ne]);
+                let (buf, lr) = lane_row(row);
+                let o = sl * cap * ne + lr * ne;
+                m.main_hidden.extend_from_slice(&buf[o..o + ne]);
             }
             m.confirmed.clear();
             for d in drafts.iter().take(n) {
@@ -3572,8 +3601,9 @@ fn finish_decode(
                 for r in 0..n {
                     let mut mh = Vec::with_capacity(nsrc * ne);
                     for sl in 0..nsrc {
-                        let o = sl * cap * ne + r * ne;
-                        mh.extend_from_slice(&whole[o..o + ne]);
+                        let (buf, lr) = lane_row(r);
+                        let o = sl * cap * ne + lr * ne;
+                        mh.extend_from_slice(&buf[o..o + ne]);
                     }
                     let tok_at_p1 = drafts[r];
                     let mut tr = vec![0.0f32; v4flash_kernels::config::HC_DIM as usize];

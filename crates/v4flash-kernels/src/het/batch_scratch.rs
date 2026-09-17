@@ -274,6 +274,11 @@ pub struct BatchDgpuScratch {
     pub mtp_captured: usize,
     pub mtp_captured_pos0: u32,
     pub mtp_capture_rows: usize,
+    /// Rows `[0, mtp_lane_cut)` of the last batch were in lane A, the rest in
+    /// lane B. The capture is PER LANE and indexed lane-locally, so a caller
+    /// that wants global batch row `r` must know where the cut fell. Recorded
+    /// on lane A's scratch by the pipelined driver.
+    pub mtp_lane_cut: usize,
     /// Uniform `1/N_HC` weights, so `hc_weighted` computes the mean over the
     /// hyper-connection copies — the drafter's `main_hidden`.
     pub mtp_hc_mean: DeviceBuffer<f32>,
@@ -1107,6 +1112,7 @@ impl BatchDgpuScratch {
                     * crate::config::N_EMBD as usize,
             )?,
             mtp_capture_rows: 0,
+            mtp_lane_cut: 0,
             mtp_captured: 0,
             mtp_captured_pos0: 0,
             mtp_hc_mean: {
