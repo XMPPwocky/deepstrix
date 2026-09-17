@@ -3120,6 +3120,77 @@ fn finish_decode(
                     forward_one!(state, residual, pos + j as u32, next)?;
                 }
             }
+            // `V41_XCHECK_ROWS=1`: compare EVERY verify row against decode, not
+            // just row 0.
+            //
+            // Only row 0 has ever been checked, and that gap matters exactly at
+            // temperature > 0: when a draft is accepted at temp 0 the emitted
+            // token is the DRAFT and row j is only a gate (argmax(row j) == d_j),
+            // so a wrong row costs acceptance, not correctness. Above temp 0 the
+            // emitted token IS `y_j` sampled FROM row j, so a wrong distribution
+            // in a non-first row is emitted directly -- and top_p keeps a long
+            // tail for it to be drawn from. This measures those rows.
+            //
+            // Runs the batched verify, rolls back, then re-runs the SAME tokens
+            // through decode capturing per-position logits, and rolls back again,
+            // so both sides see the identical prefix.
+            if xcheck_rows() && verify_probe_batched && !probe_logits.is_empty() {
+                let nv = v4flash_kernels::config::N_VOCAB as usize;
+                let rows = probe_logits.len() / nv;
+                state.state.rollback_kv(&mark)?;
+                let mut truth: Vec<Vec<f32>> = Vec::with_capacity(rows);
+                for j in 0..rows {
+                    // The probe's batch is K copies of `next` (see `toks`
+                    // above), so decode must be fed the same sequence.
+                    let t = next;
+                    let mut r = vec![0.0f32; v4flash_kernels::config::HC_DIM as usize];
+                    embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, t, &mut r);
+                    forward_one!(state, r, pos + j as u32, t)?;
+                    let mut dl = vec![0.0f32; nv];
+                    state.dgpu_scratch.logits.slice_view(0, nv).copy_to_host(&mut dl)?;
+                    truth.push(dl);
+                }
+                state.state.rollback_kv(&mark)?;
+                for j in 0..rows {
+                    let v = &probe_logits[j * nv..(j + 1) * nv];
+                    let d = &truth[j];
+                    let am = |x: &[f32]| {
+                        let mut bi = 0usize;
+                        let mut bv = f32::NEG_INFINITY;
+                        for (i, &q) in x.iter().enumerate() {
+                            if q > bv { bv = q; bi = i; }
+                        }
+                        bi
+                    };
+                    // KL(decode || verify) over the softmaxes, the measure the
+                    // tokens are actually drawn from.
+                    let (dmax, vmax) = (
+                        d.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                        v.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                    );
+                    let (mut dz, mut vz) = (0.0f64, 0.0f64);
+                    for i in 0..nv {
+                        dz += ((d[i] - dmax) as f64).exp();
+                        vz += ((v[i] - vmax) as f64).exp();
+                    }
+                    let (ldz, lvz) = (dz.ln(), vz.ln());
+                    let mut kld = 0.0f64;
+                    for i in 0..nv {
+                        let lp = (d[i] - dmax) as f64 - ldz;
+                        let pq = lp.exp();
+                        if pq > 1e-12 {
+                            kld += pq * (lp - ((v[i] - vmax) as f64 - lvz));
+                        }
+                    }
+                    XROW_N[j.min(XROW_MAX - 1)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if am(v) == am(d) {
+                        XROW_OK[j.min(XROW_MAX - 1)]
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    XROW_KLD[j.min(XROW_MAX - 1)]
+                        .fetch_add((kld * 1e6) as i64, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             // XCHECK: row 0 of the probe sits at `pos` with `next` as its
             // input, exactly like the decode forward that follows, so its
             // argmax must equal the token decode samples next. This is the
@@ -4033,6 +4104,26 @@ fn finish_decode(
                 "dspark.xcheck: verify-path vs decode-path logits"
             );
         }
+        // Per-ROW table. Row 0 is the only row the check above covers, and at
+        // temperature > 0 the emitted token is sampled FROM row j, so rows > 0
+        // being worse would be emitted directly.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let rows: Vec<String> = (0..XROW_MAX)
+                .filter_map(|j| {
+                    let n = XROW_N[j].swap(0, Relaxed);
+                    if n == 0 {
+                        return None;
+                    }
+                    let ok = XROW_OK[j].swap(0, Relaxed);
+                    let kld = XROW_KLD[j].swap(0, Relaxed) as f64 / 1e6 / n as f64;
+                    Some(format!("row{j}: n={n} agree={:.4} kld={kld:.6}", ok as f64 / n as f64))
+                })
+                .collect();
+            if !rows.is_empty() {
+                tracing::info!(per_row = %rows.join(" | "), "dspark.xcheck.rows");
+            }
+        }
         if small_b_catchall_ab() > 0 || single_lane_ab() > 0 || xcheck_poison() || verify_probe_ks.len() > 1 {
             let by_width = small_b_catchall_ab() == 0 && single_lane_ab() == 0;
             for arm in 0..XCHECK_ARMS {
@@ -4855,6 +4946,19 @@ const _: () = {
 /// `accept[j] / reach[j]` is the per-position accept rate, so `d1` is the
 /// drafter's first-token quality — the number the oracles are stated in.
 static VERIFY_DIST_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Per-ROW verify-vs-decode agreement. Row 0 was the only row ever checked.
+const XROW_MAX: usize = 8;
+static XROW_N: [std::sync::atomic::AtomicU64; XROW_MAX] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; XROW_MAX];
+static XROW_OK: [std::sync::atomic::AtomicU64; XROW_MAX] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; XROW_MAX];
+static XROW_KLD: [std::sync::atomic::AtomicI64; XROW_MAX] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; XROW_MAX];
+
+fn xcheck_rows() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_XCHECK_ROWS").as_deref() == Ok("1"))
+}
 /// Token the NEXT verify's row 0 must carry (-1 = not yet armed).
 static DSPARK_EXPECT_NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 pub static DSPARK_DESYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
