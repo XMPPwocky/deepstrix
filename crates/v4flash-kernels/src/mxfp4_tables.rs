@@ -21,8 +21,10 @@ pub const SUPER_MXFP4_BYTES: usize = 136;
 /// no longer a stride *within* a super-block — use the v2 accessors instead.
 pub const BLOCK_MXFP4_BYTES: usize = 17;
 /// Bumped whenever the packed layout changes. Both boxes repack independently,
-/// so a rolling deploy across a bump silently corrupts: the HELLO handshake
-/// compares this.
+/// so a rolling deploy across a bump silently corrupts -- one side would decode
+/// the other's bytes with the wrong layout and report nothing. The guard is the
+/// remote-expert protocol version, which is bumped in step with this and is
+/// checked on every frame; see `het::remote_experts::proto::VERSION`.
 pub const MXFP4_LAYOUT_VERSION: u32 = 2;
 
 /// Byte offset of block `b`'s 16 nibble bytes within a super-block.

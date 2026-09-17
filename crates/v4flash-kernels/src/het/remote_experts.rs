@@ -285,7 +285,15 @@ pub mod proto {
     /// that drive the `remote.pager` perfetto lane. Appended AFTER t1/t2/t3 so
     /// every existing offset is unchanged; the frame LENGTH changes, so both
     /// boxes must be rebuilt together (a v1 daemon fails the length check).
-    pub const VERSION: u16 = 2;
+    ///
+    /// Bumped to 3 for MXFP4 super-block layout v2. The frame SHAPE is unchanged
+    /// here -- what changed is the meaning of the expert bytes each box decodes.
+    /// Both boxes repack from raw HF bytes independently, so a rolling deploy
+    /// across the bump would have one side reading v1 bytes as v2: no error, no
+    /// length mismatch, just silently wrong experts. Tying the layout to the
+    /// protocol version makes that combination refuse to connect instead.
+    /// Keep this in step with `mxfp4_tables::MXFP4_LAYOUT_VERSION`.
+    pub const VERSION: u16 = 3;
     /// magic u32 | version u16 | kind u16 | seq u32 | payload_len u32
     pub const HDR_LEN: usize = 16;
     pub const KIND_HELLO: u16 = 1;
