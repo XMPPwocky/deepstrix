@@ -2596,6 +2596,12 @@ fn seed_mtp_ring(state: &mut WorkerState, tokens: &[i32], start_pos: u32) -> eyr
         return Ok(());
     }
 
+    // `whole` is read at `sl * cap * ne + r * ne` for r in [0, n), so the
+    // capture count the driver recorded must fit the buffer it wrote into.
+    assert!(
+        n <= cap,
+        "dspark seed: prefill recorded {n} captured mtp_src rows but the buffer holds {cap}"
+    );
     let mut whole = vec![0.0f32; nsrc * cap * ne];
     if from_b {
         state.bd_b.mtp_src.copy_to_host(&mut whole)?;
@@ -2696,6 +2702,10 @@ fn finish_decode(
         }
     };
     let mut rng = SamplerRng::new(req.seed);
+    // Per-request: the first verify after a prefill legitimately starts a fresh
+    // stream, so a value left from the PREVIOUS request is not a desync (it
+    // fired three times that way -- all at the first verify, same `got`).
+    DSPARK_EXPECT_NEXT.store(-1, std::sync::atomic::Ordering::Relaxed);
     // `V41_DUMP_FIRST_LOGITS=<path>`: dump the decode logits for the first token
     // after the prompt (the oracle's `logits_last` reference point) so KL(oracle
     // || engine-decode) can be computed. One-shot correctness probe.
@@ -3207,7 +3217,14 @@ fn finish_decode(
                 .as_ref()
                 .is_some_and(|m| m.ingested == 0 && m.confirmed.is_empty() && m.pending.is_some())
         {
-            let k = v4flash_kernels::het::mtp::MTP_BLOCK;
+            // `V41_DSPARK_K=<n>`: cap the drafts the verify carries. n=0 makes
+            // the verify a ONE-ROW batch -- shape-identical to a decode step --
+            // which separates "the accept path diverges" from "a batched verify
+            // diverges".
+            let k = match std::env::var("V41_DSPARK_K").ok().and_then(|v| v.parse::<usize>().ok()) {
+                Some(cap) => cap.min(v4flash_kernels::het::mtp::MTP_BLOCK),
+                None => v4flash_kernels::het::mtp::MTP_BLOCK,
+            };
             // Hold the raw window in decode's monotonic addressing across the
             // whole verify: the prefill path would otherwise compact and reset
             // raw_off, making the `KvMark` below unaddressable and capping accept
@@ -3218,6 +3235,27 @@ fn finish_decode(
             // commit).
             let _spec = v4flash_kernels::het::forward_prefill::SpeculativeAppend::begin();
             let drafts = state.mtp.as_ref().unwrap().pending.unwrap();
+            // INVARIANT: row 0 of this verify is `next`, the token the previous
+            // step emitted LAST. If it is not, the KV and the emitted stream
+            // have desynchronised -- the cache then holds a prefix the client
+            // never saw, which reads exactly like the degeneration we see at
+            // temperature > 0.
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                // Armed only within a request: the first verify after a prefill
+                // legitimately starts a fresh stream, and a value left over from
+                // the PREVIOUS request is not a desync (it fired three times
+                // that way before this guard -- all at the first verify, all
+                // with the same `got`).
+                let exp = DSPARK_EXPECT_NEXT.load(Relaxed);
+                if exp >= 0 && exp != next {
+                    tracing::warn!(
+                        expected = exp, got = next, pos,
+                        "dspark.desync: verify row 0 is not the token the last step emitted"
+                    );
+                    DSPARK_DESYNC.fetch_add(1, Relaxed);
+                }
+            }
             // Inputs: the head token, then ALL K drafts — K+1 positions.
             //
             // K inputs would validate K drafts too (logits at pos+j predict
@@ -3416,11 +3454,39 @@ fn finish_decode(
             };
             state.bd_a.mtp_capture_rows = 0;
             state.bd_b.mtp_capture_rows = 0;
+            // `V41_VERIFY_DECODE_PATH=1` skips `forward_prefill_pipelined`
+            // entirely, and that call is what captures `mtp_src`. So under this
+            // flag `main_hidden` and the dense-ring replay both read the
+            // PREVIOUS step's residuals, and any acceptance number measured with
+            // it is measuring a drafter fed one-step-stale hidden states. Since
+            // the flag exists specifically to adjudicate "does the batched
+            // driver diverge", that silently contaminates the arbiter -- so say
+            // so loudly rather than let it be quoted as evidence again.
+            if decode_path_logits.is_some() {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        "V41_VERIFY_DECODE_PATH: mtp_src is NOT captured on this path;                          main_hidden and the ring replay use the previous step's residuals.                          Acceptance/E from this flag is NOT a valid drafter measurement."
+                    );
+                }
+            }
             let logits = decode_path_logits.take().unwrap_or(logits_batched);
             let t_fwd = t_step.elapsed();
 
             // Accept the longest prefix whose argmax matches the draft.
             let nv = v4flash_kernels::config::N_VOCAB as usize;
+            // `row_sample(j)` slices `logits[j*nv .. (j+1)*nv]` for every row up
+            // to and including row `k`, so the verify must have returned ONE
+            // FULL ROW PER INPUT TOKEN. A short buffer (e.g. a last_only driver)
+            // would silently read one row's distribution as another's.
+            assert_eq!(
+                logits.len(),
+                toks.len() * nv,
+                "dspark accept: verify returned {} logits for {} rows ({nv} per row expected);                  per-row indexing would read the wrong row",
+                logits.len(),
+                toks.len()
+            );
             let row_argmax = |j: usize| -> i32 {
                 let r = &logits[j * nv..(j + 1) * nv];
                 let mut bi = 0usize;
@@ -3546,6 +3612,15 @@ fn finish_decode(
             // `KvMark` is per-layer `(n_raw, raw_off)`, so a PARTIAL rollback is
             // just the mark advanced by the number of rows kept.
             let keep = (n + 1) as u32; // `next` plus the n accepted drafts
+            // The accepted prefix can never be longer than the rows the verify
+            // actually appended to KV: the batch is `next` + k drafts, so
+            // `keep <= toks.len()`. Claiming more rows than were appended
+            // misaligns the cache against the emitted stream permanently.
+            assert!(
+                n <= k && (keep as usize) <= toks.len(),
+                "dspark accept: keeping {keep} rows (n={n} of k={k}) from a {}-row verify",
+                toks.len()
+            );
             // Row 0 of the verify batch sits at `pos`. `advanced_by` also
             // rewinds the COMPRESSED store to what the accepted prefix earns —
             // without it the rejected drafts' compressor boundaries stayed in
@@ -3563,6 +3638,25 @@ fn finish_decode(
             // Global batch row -> (lane, lane-local row). See the capture
             // comment above: each lane's `mtp_src` is indexed from 0.
             let cut = state.bd_a.mtp_lane_cut;
+            // The cut is the ONLY thing tying a global batch row to the lane
+            // that captured its residual, and each lane's `mtp_src` is indexed
+            // from 0. If the cut does not cover the rows each lane actually
+            // captured, `main_hidden` is read out of the wrong lane's buffer and
+            // is silently STALE -- the failure that looked like "the drafter is
+            // degenerate" until it was root-caused to this mapping.
+            assert!(
+                state.bd_a.mtp_captured >= cut.min(toks.len()),
+                "dspark accept: lane A captured {} mtp_src rows, but the recorded lane cut claims                  rows [0,{}) of this {}-row verify came from lane A",
+                state.bd_a.mtp_captured,
+                cut.min(toks.len()),
+                toks.len()
+            );
+            assert!(
+                cut >= toks.len() || state.bd_b.mtp_captured >= toks.len() - cut,
+                "dspark accept: lane B captured {} mtp_src rows, but the recorded lane cut claims                  rows [{cut},{}) of this verify came from lane B",
+                state.bd_b.mtp_captured,
+                toks.len()
+            );
             let mut whole = vec![0.0f32; nsrc * cap * ne];
             let mut whole_b = vec![0.0f32; nsrc * cap * ne];
             state.bd_a.mtp_src.copy_to_host(&mut whole)?;
@@ -3570,7 +3664,14 @@ fn finish_decode(
                 state.bd_b.mtp_src.copy_to_host(&mut whole_b)?;
             }
             let lane_row = |r: usize| -> (&Vec<f32>, usize) {
-                if r < cut { (&whole, r) } else { (&whole_b, r - cut) }
+                let (buf, lr) = if r < cut { (&whole, r) } else { (&whole_b, r - cut) };
+                // LANE-LOCAL row, never a global one: `mtp_src` holds at most
+                // MTP_CAP_ROWS rows per lane.
+                assert!(
+                    lr < cap,
+                    "dspark accept: lane-local mtp_src row {lr} (global row {r}, lane cut {cut})                      >= MTP_CAP_ROWS {cap}"
+                );
+                (buf, lr)
             };
             let m = state.mtp.as_mut().expect("mtp");
             m.main_hidden.clear();
@@ -3580,13 +3681,36 @@ fn finish_decode(
                 let o = sl * cap * ne + lr * ne;
                 m.main_hidden.extend_from_slice(&buf[o..o + ne]);
             }
+            // The drafter's entry projection consumes exactly one N_EMBD row per
+            // MTP source layer; a short/long vector means the capture layout and
+            // the reader disagree.
+            assert_eq!(
+                m.main_hidden.len(),
+                nsrc * ne,
+                "dspark accept: main_hidden has {} floats, expected {} ({nsrc} MTP source layers                  x {ne} N_EMBD)",
+                m.main_hidden.len(),
+                nsrc * ne
+            );
             m.confirmed.clear();
             for d in drafts.iter().take(n) {
                 m.confirmed.push_back(*d);
             }
             m.ingested = n + 1;
+            // The step yields the n confirmed drafts and then the head.
+            // `ingested` counts the rows this verify LEFT IN KV that the decode
+            // loop must not forward again: `next` (row 0) plus those n drafts.
+            assert_eq!(
+                m.confirmed.len() + 1,
+                m.ingested,
+                "dspark accept: {} confirmed drafts queued but ingested={} (must be                  confirmed + 1, the head row `next`)",
+                m.confirmed.len(),
+                m.ingested
+            );
             let head = if n < k { corrected } else { row_sample(k, &mut rng) };
             m.next_after = Some(head);
+            // The LAST token this step yields is `head`; the next verify's row 0
+            // must be exactly that.
+            DSPARK_EXPECT_NEXT.store(head, std::sync::atomic::Ordering::Relaxed);
             let t_roll = t_step.elapsed();
             m.accept_steps += 1;
             m.accept_tokens += (n as u64) + 1;
@@ -3758,6 +3882,20 @@ fn finish_decode(
         // the accepted run and is NOT yet in KV.
         #[cfg(feature = "v41")]
         let spec_next: Option<i32> = state.mtp.as_mut().and_then(|m| {
+            // By this point in the iteration `ingested` has already been
+            // decremented for the token just emitted, so the queue of confirmed
+            // drafts and the count of verify rows still sitting in KV must be
+            // EQUAL. Drift either emits a confirmed token with no KV row behind
+            // it, or skips a forward for a row that was never appended -- both
+            // desynchronise the cache from the emitted stream silently.
+            // Holds trivially (0 == 0) when DSpark accept is off.
+            assert_eq!(
+                m.confirmed.len(),
+                m.ingested,
+                "dspark accept: {} confirmed drafts pending but {} verify rows still marked                  ingested in KV",
+                m.confirmed.len(),
+                m.ingested
+            );
             m.confirmed
                 .pop_front()
                 .or_else(|| if m.ingested == 0 { m.next_after.take() } else { None })
@@ -4717,6 +4855,9 @@ const _: () = {
 /// `accept[j] / reach[j]` is the per-position accept rate, so `d1` is the
 /// drafter's first-token quality — the number the oracles are stated in.
 static VERIFY_DIST_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Token the NEXT verify's row 0 must carry (-1 = not yet armed).
+static DSPARK_EXPECT_NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+pub static DSPARK_DESYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 mod dspark_stats {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
