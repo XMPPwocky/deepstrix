@@ -195,7 +195,20 @@ fn box2_missed_slot(layer: i32, e: u32) -> Option<(usize, u64)> {
 }
 
 /// Record that box 2 had to page `e` on `layer`.
+/// Per-layer count of box-2 DECODE misses (from the `miss_mask` box 2 returns
+/// with every decode partial), so a request's misses can be attributed to
+/// layers instead of only summed. `take_box2_miss_by_layer` drains it.
+pub static BOX2_MISS_BY_LAYER: [std::sync::atomic::AtomicU64; crate::config::N_LAYER as usize] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; crate::config::N_LAYER as usize];
+
+pub fn take_box2_miss_by_layer() -> Vec<u64> {
+    BOX2_MISS_BY_LAYER.iter().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed)).collect()
+}
+
 pub fn mark_box2_miss(layer: i32, e: u32) {
+    if let Some(c) = BOX2_MISS_BY_LAYER.get(layer as usize) {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Some((i, bit)) = box2_missed_slot(layer, e) {
         BOX2_MISSED[i].fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
     }

@@ -88,6 +88,23 @@ impl EngramCtx {
         Ok(out)
     }
 
+    /// Rebuild the compressed-id sequence from a token list, for a KV snapshot
+    /// restore. The sequence is a pure function of the token ids
+    /// (`hasher.compress` per token, image tokens -> DEAD), so a restore that
+    /// skips the prefill can regenerate exactly what that prefill would have
+    /// appended. Without this, the first `rows_for*` after a restore sees
+    /// `compressed.len() != pos` and the request fails -- which is why snapshot
+    /// reuse was disabled under v41 (17 s of prefill + CED replay per request
+    /// for an 86-token prompt, measured 2026-09-17).
+    fn rebuild(&mut self, tokens: &[i32]) {
+        self.compressed.clear();
+        self.compressed.reserve(tokens.len());
+        for &t in tokens {
+            let c = self.hasher.compress(t);
+            self.compressed.push(c);
+        }
+    }
+
     /// Batched twin of [`Self::rows_for`]: append `tokens` (starting at KV position
     /// `pos0`) and gather their Engram rows for the whole chunk.
     ///
@@ -2115,9 +2132,14 @@ fn handle_generate_stream(
         // while the sequence still holds only the ids from earlier requests
         // ("engram: position 965 but 44 tokens tracked"), and the request fails. The sequence is a
         // pure function of the token ids, so the real fix is to rebuild it on restore (or persist
-        // it beside the KV); until then, disable snapshot reuse under v41 so prefill always runs
-        // and the sequence is always consistent. Costs the prefix-cache speedup, not correctness.
-        let disk_hit = if cfg!(feature = "v41") { None } else { disk_hit };
+        // it beside the KV). FIXED 2026-09-17: `EngramCtx::rebuild` regenerates the sequence from
+        // the restored token list right after the byte-prefix verification below, so reuse is on.
+        // `DEEPSTRIX_SNAPSHOT_REUSE=0` forces the full-prefill path (the A/B control for a restore).
+        let disk_hit = if std::env::var("DEEPSTRIX_SNAPSHOT_REUSE").as_deref() == Ok("0") {
+            None
+        } else {
+            disk_hit
+        };
         if let Some((snap_req_tokens, snap_hash, snap_dir)) = disk_hit {
             if snap_req_tokens >= DISK_RESTORE_MIN_TOKENS {
                 save_live_if_dirty(state);
@@ -2205,6 +2227,13 @@ fn handle_generate_stream(
                         state.live = None;
                     } else {
                         let _ = state.snapshot_index.touch(&snap_hash);
+                        // The snapshot carries the KV, not the Engram n-gram sequence; the
+                        // suffix prefill / first decode will ask for rows at `loaded_len`
+                        // and needs `compressed.len() == loaded_len` (see `rows_for`).
+                        #[cfg(feature = "v41")]
+                        if let Some(ec) = state.engram.as_mut() {
+                            ec.rebuild(&loaded);
+                        }
                         let suffix_len = req.tokens.len() - verify.req_tokens;
                         // Diagnostic: when there's a LARGER snapshot than
                         // the one we just restored AND that snapshot shares
@@ -4580,6 +4609,16 @@ fn finish_decode(
         // compute or box-2 NVMe, which box 1's own pager counters cannot see.
         let (page_us, miss) =
             v4flash_kernels::het::remote_experts::link_stats::take_paging();
+        let (page_us_dec, miss_dec) =
+            v4flash_kernels::het::remote_experts::link_stats::take_paging_decode();
+        // Per-layer decode misses on box 2, as `L<layer>:<n>` for layers that missed.
+        let miss_by_layer = v4flash_kernels::het::expert_pager::take_box2_miss_by_layer()
+            .iter()
+            .enumerate()
+            .filter(|(_, &n)| n > 0)
+            .map(|(l, n)| format!("L{l}:{n}"))
+            .collect::<Vec<_>>()
+            .join(",");
         let link = v4flash_kernels::het::remote_experts::link_stats::take()
             .iter()
             .map(|(b, n, us, by)| format!("b{b}:n={n},link={us:.0}us,bytes={by:.0}"))
@@ -4628,6 +4667,9 @@ fn finish_decode(
             stats = %dspark_stats::take(),
             box2_page_ms = page_us / 1000,
             box2_miss = miss,
+            box2_miss_decode = miss_dec,
+            box2_page_ms_decode = page_us_dec / 1000,
+            box2_miss_by_layer = %miss_by_layer,
             link = %link,
             "dspark.request"
         );

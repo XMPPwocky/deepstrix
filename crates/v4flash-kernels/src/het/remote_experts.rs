@@ -3231,6 +3231,12 @@ pub mod link_stats {
     // invisible without these.
     static PAGE_US: AtomicU64 = AtomicU64::new(0);
     static MISS: AtomicU64 = AtomicU64::new(0);
+    // Split by phase: b == 1 is a decode token, anything wider is a prefill
+    // chunk or a verify lane. Prefill forcing box 2's STATIC encoder share
+    // back through the same LRU that decode fills is a suspected source of
+    // decode misses; this is what tells the two apart.
+    static PAGE_US_B1: AtomicU64 = AtomicU64::new(0);
+    static MISS_B1: AtomicU64 = AtomicU64::new(0);
 
     pub fn record(b: u32, us: u64, bytes: u64, page_us: u64, miss: u64) {
         let i = (b as usize).min(MAX_B - 1);
@@ -3239,11 +3245,20 @@ pub mod link_stats {
         N[i].fetch_add(1, Relaxed);
         PAGE_US.fetch_add(page_us, Relaxed);
         MISS.fetch_add(miss, Relaxed);
+        if b == 1 {
+            PAGE_US_B1.fetch_add(page_us, Relaxed);
+            MISS_B1.fetch_add(miss, Relaxed);
+        }
     }
 
     /// (box-2 page microseconds, box-2 expert misses) since the last call.
     pub fn take_paging() -> (u64, u64) {
         (PAGE_US.swap(0, Relaxed), MISS.swap(0, Relaxed))
+    }
+
+    /// Decode-only (b == 1) share of the above, drained together with it.
+    pub fn take_paging_decode() -> (u64, u64) {
+        (PAGE_US_B1.swap(0, Relaxed), MISS_B1.swap(0, Relaxed))
     }
 
     /// (b, calls, mean link us, mean bytes) for every b that saw traffic.
