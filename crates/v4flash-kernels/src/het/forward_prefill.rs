@@ -3980,6 +3980,12 @@ impl HeterogeneousEngine {
         // Stage 6: Output projection (rope_inv per b, then BATCHED q8)
         // ========================================================
         let _t_out = de.events.stage("dgpu.output_proj", &de.compute)?;
+        // SLACK PROBE site `verify_dgpu`: one stall per layer on the dGPU
+        // chain. 40 layers x 2 lanes, so the injected total is 80x the tick
+        // count -- divide before taking the slope.
+        if let Some(ticks) = super::mtp::slack_probe_ticks("verify_dgpu") {
+            de.q8.slack_probe_spin(&de.compute, ticks)?;
+        }
         {
             let _t = de.events.stage("k.output_proj.rope_inverse", &de.compute)?;
             let pos_v = bd.pos_per_b.slice_view(0, b as usize);
@@ -5988,6 +5994,15 @@ impl HeterogeneousEngine {
                 .lock()
                 .map_err(|_| eyre!("remote expert client mutex poisoned"))?
                 .wait(t)?;
+            // SLACK PROBE site `remote`: hold the partial back by a known
+            // amount, i.e. pretend box 2 (or the link) was slower. Regressing
+            // the step against it gives the box-2 leg's share of the critical
+            // path -- the thing an rtt counter cannot tell you, because exposed
+            // wait collapses to ~0 whenever box 1 is the slower side.
+            if let Some(ticks) = super::mtp::slack_probe_ticks("remote") {
+                // wall_clock64 ticks are 100 MHz, so ticks/100 = microseconds.
+                std::thread::sleep(std::time::Duration::from_micros(ticks / 100));
+            }
             let t_wait_end = super::perfetto::now_ns();
             if let Some(pf) = self.perfetto.as_ref() {
                 if let Ok(pf) = pf.lock() {

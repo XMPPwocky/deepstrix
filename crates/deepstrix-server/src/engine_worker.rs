@@ -3246,6 +3246,9 @@ fn finish_decode(
             // attends to the same keys decode does, and the mark records raw_off=0.
             state.engine.normalize_raw_windows(&mut state.dgpu_scratch, &mut state.state)?;
             let mark = state.state.mark_kv();
+            // One phase per step for the alternating slack probe, set before
+            // any site in this step can read it.
+            v4flash_kernels::het::mtp::slack_probe_step_advance();
             let t_step = std::time::Instant::now();
             let spc0 = state.pager.as_ref().map(|p| p.counters()).unwrap_or_default();
             let mut decode_path_logits: Option<Vec<f32>> = None;
@@ -3528,6 +3531,7 @@ fn finish_decode(
                     roll_ms = format!("{:.1}", (t_roll - t_argmax).as_secs_f64() * 1e3),
                     draft_ms = format!("{:.1}", (t_step.elapsed() - t_roll).as_secs_f64() * 1e3),
                     step_ms = format!("{:.1}", t_step.elapsed().as_secs_f64() * 1e3),
+                    probe_on = v4flash_kernels::het::mtp::slack_probe_phase() as u8,
                     "dspark.step"
                 );
             }

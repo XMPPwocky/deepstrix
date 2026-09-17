@@ -183,16 +183,59 @@ impl<'a> Drop for HostUs<'a> {
 /// This is the only instrument here that answers "would making this faster make
 /// the step faster", which is not what any cost counter measures.
 pub fn slack_probe_ticks(site: &str) -> Option<u64> {
-    static V: std::sync::OnceLock<Option<(String, u64)>> = std::sync::OnceLock::new();
-    let parsed = V.get_or_init(|| {
-        let raw = std::env::var("V41_SLACK_PROBE").ok()?;
-        let (s, t) = raw.split_once(':')?;
-        Some((s.to_string(), t.parse().ok()?))
-    });
-    match parsed {
-        Some((s, t)) if s == site && *t > 0 => Some(*t),
-        _ => None,
+    let (s, t, alt) = slack_probe_cfg().as_ref()?;
+    if s != site || *t == 0 {
+        return None;
     }
+    // ALTERNATING mode is the only one whose slope can be trusted. Comparing
+    // whole RUNS does not work: the step time's run-to-run variance is ~10%
+    // (~30 ms), which swamps a 10 ms injection -- MEASURED, a sweep came back
+    // with slopes of -12.1, +5.0 and +2.4 from the same site, one of them
+    // NEGATIVE, on a bracket that failed at 9.5% drift. Alternating the stall
+    // on and off between steps of ONE run pairs the comparison: same box-2 LRU
+    // state, same warmup, same everything but the stall.
+    if *alt && !slack_probe_phase() {
+        return None;
+    }
+    Some(*t)
+}
+
+#[allow(clippy::type_complexity)]
+fn slack_probe_cfg() -> &'static Option<(String, u64, bool)> {
+    static V: std::sync::OnceLock<Option<(String, u64, bool)>> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        let raw = std::env::var("V41_SLACK_PROBE").ok()?;
+        let mut it = raw.split(':');
+        let site = it.next()?.to_string();
+        let ticks = it.next()?.parse().ok()?;
+        Some((site, ticks, it.next() == Some("alt")))
+    })
+}
+
+static SLACK_PHASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Advance the alternating probe one step. Call ONCE per step, at step start,
+/// so every site in that step sees the same phase.
+pub fn slack_probe_step_advance() {
+    SLACK_PHASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this step is a STALLED one.
+///
+/// RANDOMISED, not alternating. Strict alternation was MEASURED to be
+/// confounded: the steps themselves alternate (acceptance varies step to step,
+/// so odd and even steps differ systematically), and a parity-locked probe
+/// reads that structure instead of its own stall. The tell was `draft_ms`
+/// differing by 11 ms between phases in arms whose probe never touches the
+/// drafter. A hashed counter decorrelates the phase from any natural period
+/// while staying deterministic and exactly 50/50 in expectation.
+pub fn slack_probe_phase() -> bool {
+    let n = SLACK_PHASE.load(std::sync::atomic::Ordering::Relaxed);
+    // splitmix64 finaliser: cheap, and its low bit is not periodic in `n`.
+    let mut z = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (z ^ (z >> 31)) & 1 == 1
 }
 
 /// Mode-3 (`V41_DSPARK_LAYER_TIMING=3`) event timing.
