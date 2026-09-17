@@ -980,7 +980,9 @@ impl MtpState {
         // --- the block's own KV, from the draft stream ---
         e.q8
             .quantize_input_batched(s, &mut self.xq, &mut self.xscale, &self.normed, N_EMBD, B)?;
-        e.q8.matvec_batched(
+        // B-packed: `matvec_batched` launches grid.z = B, so every row re-reads
+        // all of `attn_kv`. Bit-identical per (row, b).
+        e.q8.matvec_bpack(
             s, &mut self.kv_raw, &w.attn_kv.buffer, &self.xq, &self.xscale, N_HEAD_DIM, N_EMBD, B,
         )?;
         for j in 0..MTP_BLOCK {
@@ -1028,7 +1030,11 @@ impl MtpState {
         e.q8.quantize_input_batched(
             s, &mut self.qr_xq, &mut self.qr_xscale, &self.qr_normed, N_LORA_Q, B,
         )?;
-        e.q8.matvec_batched(
+        // `attn_q_b` is 44.6 MB and `matvec_batched` read it once per row: at
+        // B=5 that is 223 MB/layer and it DOMINATED this block (12.93 ms/step
+        // measured, against a 0.67 ms single-read roofline for the whole q
+        // chain). Same fix, same bit-identity, as the output projection.
+        e.q8.matvec_bpack(
             s, &mut self.q, &w.attn_q_b.buffer, &self.qr_xq, &self.qr_xscale, Q_FLAT, N_LORA_Q, B,
         )?;
         drop(_hqa);

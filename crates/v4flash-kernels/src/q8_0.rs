@@ -39,6 +39,17 @@ const GEMV_WARP_LANES: u32 = 32;
 /// Max batch for `matvec_bpack` — mirrors GEMV_BPACK_MAX in q8_0_matvec.hip.
 const GEMV_BPACK_MAX: u32 = 16;
 
+/// B-packing is bit-identical to the `grid.z = batch` form, so it is used
+/// automatically wherever the batch fits. `V41_GEMV_BPACK=0` rolls back.
+fn bpack_ok(batch: u32) -> bool {
+    if batch == 0 || batch > GEMV_BPACK_MAX {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("V41_GEMV_BPACK").as_deref() != Ok("0"))
+}
+
+
 #[allow(non_camel_case_types)]
 pub struct Q8_0Matvec {
     module: Module,
@@ -234,6 +245,16 @@ impl Q8_0Matvec {
             ));
         }
 
+        // `q8_0_gemv_batched_warp8` launches grid.z = batch, so EVERY batch row
+        // re-reads the whole weight matrix. At the batch sizes decode and a
+        // DSpark verify actually use (B<=6) that is the dominant cost and it is
+        // pure waste: `matvec_bpack` reads each block once and loops the batch
+        // in registers, bit-identical per (row, b). Large-B prefill keeps the
+        // original kernel -- there the weight read is already amortised and the
+        // 16-wide accumulator would cost registers for nothing.
+        if bpack_ok(batch) {
+            return self.matvec_bpack(stream, out, weight, xq, xscale, n_rows, k, batch);
+        }
         let function = self.module.get_function("q8_0_gemv_batched_warp8")?;
         let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
         let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES; // 8 × 32 = 256
@@ -824,6 +845,12 @@ impl Q8_0GroupedMatvec {
             ));
         }
 
+        // Same grid.z = batch re-read as `matvec_batched`; same bit-identical fix.
+        if bpack_ok(batch) {
+            return self.matvec_grouped_bpack(
+                stream, out, weight, xq, xscale, group_dim, rank, n_groups, batch,
+            );
+        }
         let function = self.module.get_function("q8_0_grouped_gemv_batched")?;
         let grid_x = out_dim.div_ceil(GEMV_ROWS_PER_BLOCK);
         let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
