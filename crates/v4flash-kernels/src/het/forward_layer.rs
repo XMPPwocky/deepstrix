@@ -1493,25 +1493,44 @@ impl HeterogeneousEngine {
                 if let Some(keys) = keys_v41 {
                     let kv_slice =
                         keys.slice_view(0, (n_index_comp as usize) * E2M1_KEY_ROW_BYTES);
-                    // SCALAR ONLY under V4.1. The WMMA score kernels
-                    // (`launch_mw_e2m1`, `launch_batched_mw_e2m1`,
-                    // `launch_batched_gemm_e2m1`) take no `n_head` — they are
-                    // hard-coded to V4-Flash's **64** index heads, and V4.1 has **32**
-                    // (`N_INDEXER_HEAD`). Feeding them 32-head Q makes them read twice
-                    // the rows they should. `launch_e2m1` takes `(n_head, head_dim)` and
-                    // is the variant the passing synthetic oracle
-                    // (`tests/v41_indexer_selection_oracle.rs`) exercises at 32x128.
-                    // A 32-head WMMA twin is the perf follow-up; correctness first.
-                    de.indexer_score.launch_e2m1(
-                        &de.compute,
-                        &mut dgpu_scratch.indexer_scores,
-                        &dgpu_scratch.indexer_q,
-                        &dgpu_scratch.indexer_head_weights,
-                        &kv_slice,
-                        n_index_comp,
-                        N_INDEXER_HEAD,
-                        N_INDEXER_HEAD_DIM,
-                    )?;
+                    // WMMA when we have it; scalar is the fallback and the
+                    // `INDEXER_DECODE=sw` control.
+                    //
+                    // The "WMMA is hard-coded to V4-Flash's 64 index heads"
+                    // blocker is STALE: `indexer_score_wmma.hip` derives
+                    // `N_INDEXER_HEAD` from `-DDEEPSTRIX_V41` (32 for V4.1, and
+                    // `ISW_M_TILES` and the LDS budget derive from that), and the
+                    // Rust wrapper asserts nothing about heads — it validates
+                    // `n_comp` and the packed-key length only. The kernel was
+                    // parameterised when the blocker was found; this call site
+                    // was never switched back off the correctness-first fallback.
+                    //
+                    // It matters: MEASURED at 33K, `dgpu.indexer` cost 16.6 ms/token
+                    // over its 8 source layers while ALL the dense attention it
+                    // replaces (`dgpu.attn_score` + `dgpu.attn_smwsum`, 38 layers)
+                    // cost 1.9 ms — the scalar path made the sparse indexer ~9x
+                    // MORE expensive than the thing it exists to avoid, and ~500x
+                    // its own roofline (2.2 MB of E2M1 keys per layer).
+                    match de.indexer_score_wmma.as_ref().filter(|_| *MW) {
+                        Some(wmma) => wmma.launch_mw_e2m1(
+                            &de.compute,
+                            &mut dgpu_scratch.indexer_scores,
+                            &dgpu_scratch.indexer_q,
+                            &dgpu_scratch.indexer_head_weights,
+                            &kv_slice,
+                            n_index_comp,
+                        )?,
+                        None => de.indexer_score.launch_e2m1(
+                            &de.compute,
+                            &mut dgpu_scratch.indexer_scores,
+                            &dgpu_scratch.indexer_q,
+                            &dgpu_scratch.indexer_head_weights,
+                            &kv_slice,
+                            n_index_comp,
+                            N_INDEXER_HEAD,
+                            N_INDEXER_HEAD_DIM,
+                        )?,
+                    }
                 } else {
                 let ics_ref = ics_ref_opt.expect("ratio==4 must have indexer_compressor state");
                 match &ics_ref.comp_kv {
