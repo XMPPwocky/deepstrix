@@ -1108,8 +1108,19 @@ impl HeterogeneousEngine {
             // Q8_0 gate/up consume the (i8, scale) pair; K-quants (unsloth
             // Q5_K/Q6_K) consume Q8_K — quantize only what's consumed.
             if super::dispatch::any_q8(&[&dlw.shared.gate, &dlw.shared.up]) {
-                de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.x16_n_embd, &bd.ffn_input_norm,
-                    b, N_EMBD, super::batch_scratch::f16_pitch(N_EMBD))?;
+                // Which activation the gate/up GEMM consumes depends on which
+                // arm `dense_gemm_prefill` will take, so the predicate lives in
+                // one place and is asked here too. dp4a wants (i8, scale) --
+                // decode's own `quantize_input_batched` of the same buffer.
+                if super::dispatch::small_b_dense_dp4a(b) {
+                    de.q8.quantize_input_batched(
+                        &de.compute, &mut sd.xq_n_embd, &mut sd.xscale_n_embd,
+                        &bd.ffn_input_norm, N_EMBD, b,
+                    )?;
+                } else {
+                    de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.x16_n_embd, &bd.ffn_input_norm,
+                        b, N_EMBD, super::batch_scratch::f16_pitch(N_EMBD))?;
+                }
             } else {
                 de.q8k.launch(
                     &de.compute,
@@ -1154,8 +1165,16 @@ impl HeterogeneousEngine {
         {
             let _t = de.events.stage("k.shared_expert.quantize_mid", &de.compute)?;
             if super::dispatch::any_q8(&[&dlw.shared.down]) {
-                de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.mid_sh16, &sd.mid_sh,
-                    b, N_FF_SHARED, super::batch_scratch::f16_pitch(N_FF_SHARED))?;
+                // Same fork as the gate/up input above, for `down`'s activation.
+                if super::dispatch::small_b_dense_dp4a(b) {
+                    de.q8.quantize_input_batched(
+                        &de.compute, &mut sd.mid_sh_xq, &mut sd.mid_sh_xscale,
+                        &sd.mid_sh, N_FF_SHARED, b,
+                    )?;
+                } else {
+                    de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.mid_sh16, &sd.mid_sh,
+                        b, N_FF_SHARED, super::batch_scratch::f16_pitch(N_FF_SHARED))?;
+                }
             } else {
                 de.q8k.launch(
                     &de.compute,
@@ -2034,6 +2053,21 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.q_chain.cast_input_f16", &de.compute)?;
             de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.x16_n_embd, &sd.attn_input_norm,
                 b, N_EMBD, super::batch_scratch::f16_pitch(N_EMBD))?;
+            // `qa_matvec` below takes the dp4a arm at small b, which consumes
+            // (xq_n_embd, xscale_n_embd). The only other writer of that pair is
+            // the KV chain FURTHER DOWN, so without this the q_a projection
+            // would read the PREVIOUS layer's quantisation -- the exact defect
+            // the kv_chain comment below records as having cost accept rate.
+            // Same source buffer and shape as that one, so the later write is
+            // an identical no-op.
+            if dlw.attn_q_a.dtype == v4flash_core::gguf::GgufType::Q8_0
+                && super::dispatch::small_b_dense_dp4a(b)
+            {
+                de.q8.quantize_input_batched(
+                    &de.compute, &mut sd.xq_n_embd, &mut sd.xscale_n_embd,
+                    &sd.attn_input_norm, N_EMBD, b,
+                )?;
+            }
         }
         {
             let _t = de.events.stage("k.q_chain.qa_matvec", &de.compute)?;

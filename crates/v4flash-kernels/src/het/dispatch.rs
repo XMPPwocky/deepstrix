@@ -226,6 +226,27 @@ pub fn any_q8(ws: &[&DeviceWeight]) -> bool {
 /// The two paths take DIFFERENT activation quantizations — the caller
 /// provides both (prefill already materializes Q8_K midq for the MoE).
 #[allow(clippy::too_many_arguments)]
+/// Whether a dense Q8_0 GEMM at batch `b` should take decode's dp4a GEMV arm
+/// instead of a WMMA GEMM. OFF by default -- MEASURED, and the measurement is
+/// the point:
+///
+/// A DSpark verify must reproduce decode, and here it does not: decode runs
+/// `dense_matvec` (dp4a over Q8 activations) where this runs `gemm_f16x` (WMMA
+/// over F16 activations) -- same weight, different arithmetic. Turning the arm
+/// on closes that gap and acceptance DOES improve, but only to E 2.477 ->
+/// 2.500 (+0.9%), while the verify forward goes 144.9 -> 220.2 ms/step (+52%).
+/// So the f16-vs-dp4a mismatch is a REAL but MINOR acceptance limiter, and the
+/// WMMA GEMM beats a B-packed GEMV on these shapes even at the B=3 of a verify
+/// lane. Keep WMMA; look elsewhere for the acceptance ceiling.
+///
+/// `V41_SMALL_B_DENSE_DP4A=1` opts in. Callers that prepare activations must
+/// consult this: the dp4a arm consumes (xq_i8, xscale), the WMMA arm f16.
+pub fn small_b_dense_dp4a(b: u32) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Cached: this sits on a per-launch path (3 chains x 40 layers x 2 lanes).
+    *ON.get_or_init(|| std::env::var("V41_SMALL_B_DENSE_DP4A").as_deref() == Ok("1")) && b <= 16
+}
+
 pub fn dense_gemm_prefill(
     e: &DeviceEngine,
     s: &Stream,
@@ -240,6 +261,29 @@ pub fn dense_gemm_prefill(
     k: u32,
 ) -> eyre::Result<()> {
     match w.dtype {
+        // SMALL b: take decode's own kernel, not a WMMA GEMM.
+        //
+        // Two reasons, and the numerics one is the important one. Decode runs
+        // `dense_matvec` (dp4a over Q8 activations); `gemm_f16x` runs WMMA over
+        // F16 activations. A DSpark verify must REPRODUCE decode, and this was
+        // one of the places it could not -- same weight, different arithmetic.
+        // The q_chain and output_proj stages already switch to the dp4a arm for
+        // b <= 64 (`prefill_f32_matvec`); the shared expert never did.
+        //
+        // It is also faster here: a WMMA tile is 16 wide in b, so at the B=3 of
+        // a verify lane most of the tile's math is thrown away, while
+        // `matvec_batched` (B-packed at these sizes) reads the weight once and
+        // does exactly b rows of work.
+        //
+        // The CALLER must have produced (xq_i8, xscale) -- see
+        // `small_b_dense_dp4a` at the shared expert's two quantize stages. The
+        // f16x arm writes only `x16`, so taking this arm without that prep
+        // reads a buffer nothing wrote (E collapsed 2.477 -> 1.000).
+        //
+        // `V41_SMALL_B_DENSE_DP4A=0` rolls back to the WMMA arm.
+        GgufType::Q8_0 if small_b_dense_dp4a(b) => {
+            e.q8.matvec_batched(s, out, &w.buffer, xq_i8, xscale, n_rows, k, b)
+        }
         GgufType::Q8_0 => match x16 {
             Some((x, pitch)) if n_rows % 128 == 0 => e.q8_wmma.gemm_f16x(s, out, &w.buffer, x, k, n_rows, 1, b, pitch),
             _ => e.q8_wmma.gemm_lds_tiled(s, out, &w.buffer, xq_i8, xscale, n_rows, k, b),
