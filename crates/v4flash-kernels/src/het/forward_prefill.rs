@@ -5044,13 +5044,20 @@ impl HeterogeneousEngine {
                     // cannot evict decode's warm set. The verify is not a scan
                     // (it is this conversation's next few tokens), so it keeps
                     // the whole pool.
+                    // Real prefill: count it as prefill (it runs through
+                    // `ensure`, which otherwise books it as decode), and bound
+                    // where its misses may land only if asked to.
                     if !speculative_append() {
-                        let n = pg.slots() as usize;
-                        let lo = n.saturating_sub(prefill_scan_slots());
-                        pg.set_scan_window(Some((lo, n)));
+                        pg.set_count_as_prefill(true);
+                        let scan = prefill_scan_slots();
+                        if scan < pg.slots() as usize {
+                            let n = pg.slots() as usize;
+                            pg.set_scan_window(Some((n - scan, n)));
+                        }
                     }
                     let r = pg.ensure(layer as i32, &ids).map(|_| ());
                     pg.set_scan_window(None);
+                    pg.set_count_as_prefill(false);
                     r?;
                 } else if ids.len() * 10 >= N_EXPERT as usize * 9 {
                     pg.ensure_layer_dense(layer as i32)?;
@@ -6510,15 +6517,25 @@ pub fn prefill_unified_pool() -> bool {
     *B
 }
 
-/// Slots a prefill scan may allocate from (default two layers' worth): big
-/// enough that consecutive layers do not evict each other mid-flight, small
-/// enough that a ~13,600-load scan cannot reach decode's working set.
+/// Slots a prefill scan may allocate from. DEFAULT UNBOUNDED (the whole pool).
+///
+/// The scan-resistance argument assumes prefill is a FOREIGN scan whose
+/// contents the reuse workload does not want. That is false here: turn N+1's
+/// prefill is the suffix of the same conversation decode just generated from,
+/// so the two want largely the SAME experts, and LRU recency already keeps the
+/// right ones (the last chunks prefilled are exactly what decode needs next).
+/// Bounding the scan therefore costs thrash without buying protection —
+/// MEASURED at 768 slots: ~6,840 distinct experts per chunk cycling through
+/// 768 slots, 18,004 misses on a 17.5K-token prefill, ~126 s of the 156 s wall.
+///
+/// Kept as a knob for a genuinely foreign scan (e.g. a cold unrelated prompt
+/// served between turns of a live conversation).
 pub fn prefill_scan_slots() -> usize {
     static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         std::env::var("V41_PREFILL_SCAN_SLOTS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(2 * crate::config::N_EXPERT as usize)
+            .unwrap_or(usize::MAX)
     });
     *N
 }

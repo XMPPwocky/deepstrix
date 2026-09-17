@@ -80,6 +80,13 @@ pub struct ExpertPager {
     /// Layer whose remap `self.remap` currently describes — the one the next
     /// upload targets. Set by every `ensure*`.
     cur_layer: i32,
+    /// Attribute `ensure`'s counters to PREFILL rather than decode.
+    ///
+    /// Under `V41_PREFILL_UNIFIED_POOL` prefill runs through `ensure`, which
+    /// counted everything as decode — so `prefill_misses` read 0 while the
+    /// prefill's paging hid inside `decode_misses`, making the window path and
+    /// the unified path impossible to compare. Set around a prefill `ensure`.
+    count_as_prefill: bool,
     /// SCAN REGION: while set, `ensure` may only take slots from `[lo, hi)`.
     ///
     /// Prefill is a scan, not a reuse workload: one 1024-token chunk touches
@@ -896,6 +903,7 @@ impl ExpertPager {
             remap: (0..N_EXPERT as i32).map(|e| -e - 1).collect(),
             remap_dev,
             cur_layer: 0,
+            count_as_prefill: false,
             scan_window: None,
             device: igpu,
             prefill_requests: 0,
@@ -940,6 +948,11 @@ impl ExpertPager {
     /// This layer's remap, for the MoE dispatch. Pointer-stable per layer.
     pub fn remap_dev(&self, layer: i32) -> &DeviceBuffer<i32> {
         &self.remap_dev[layer.clamp(0, crate::config::N_LAYER - 1) as usize]
+    }
+
+    /// Count the next `ensure`'s requests/misses as PREFILL, not decode.
+    pub fn set_count_as_prefill(&mut self, v: bool) {
+        self.count_as_prefill = v;
     }
 
     /// Confine `ensure`'s ALLOCATION to `[lo, hi)` until cleared. Lookup is
@@ -1172,7 +1185,11 @@ impl ExpertPager {
         };
         let mut misses: Vec<(u32, u32)> = Vec::with_capacity(ids.len()); // (id, slot)
         for &id in ids {
-            self.decode_requests += 1;
+            if self.count_as_prefill {
+                self.prefill_requests += 1;
+            } else {
+                self.decode_requests += 1;
+            }
             let key = (layer, id);
             if let Some(&slot) = self.slot_of.get(&key) {
                 self.touch(slot);
@@ -1191,7 +1208,11 @@ impl ExpertPager {
                 self.remap[id as usize] = -(slot as i32) - 1;
                 continue;
             }
-            self.decode_misses += 1;
+            if self.count_as_prefill {
+                self.prefill_misses += 1;
+            } else {
+                self.decode_misses += 1;
+            }
             let slot = match self
                 .slot_key
                 .iter()
@@ -1954,7 +1975,11 @@ impl ExpertPager {
         ];
         let gpu_repack = self.repack.is_some();
         for &id in ids {
-            self.decode_requests += 1;
+            if self.count_as_prefill {
+                self.prefill_requests += 1;
+            } else {
+                self.decode_requests += 1;
+            }
             let key = (layer, id);
             if let Some(&slot) = self.slot_of.get(&key) {
                 self.touch(slot);
@@ -1973,7 +1998,11 @@ impl ExpertPager {
                 self.remap[id as usize] = -(slot as i32) - 1;
                 continue;
             }
-            self.decode_misses += 1;
+            if self.count_as_prefill {
+                self.prefill_misses += 1;
+            } else {
+                self.decode_misses += 1;
+            }
             // Choose a slot: first free, else the LRU victim — but only ABOVE the dense
             // region. Prefill's windows live in slots [0, dense_windows*N_EXPERT) and it
             // trusts `window_layer` to say a whole layer is resident; if decode's LRU
