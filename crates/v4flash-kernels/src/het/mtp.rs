@@ -89,6 +89,18 @@ pub static MTP_H_ATTNQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub static MTP_H_ATTNKV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MTP_H_ATTNQA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MTP_H_ATTNO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Per-KERNEL device split of the two blocks that dominate a drafter layer:
+/// the attention output projection (`MTP_H_ATTNO`) and the MoE (`MTP_H_MOE`).
+/// Only populated under `V41_DSPARK_LAYER_TIMING=2`; `OQUANT` sums BOTH
+/// `quantize_input_batched` calls, `MGATEUP`/`MDOWN` sum over the B rows.
+pub static MTP_H_OQUANT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MTP_H_OWA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MTP_H_OWB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MTP_H_MROUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MTP_H_MTOPK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MTP_H_MQ8K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MTP_H_MGATEUP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MTP_H_MDOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Host us in the two BLOCKING `copy_from_host` calls (slots/poss, 24 bytes each)
 /// at the top of the drafter's KV section. If a 48-byte H2D costs milliseconds it
 /// is not the copy -- a blocking `hipMemcpy` serialises against blocking streams,
@@ -108,6 +120,7 @@ pub fn mtp_timing_mode() -> u8 {
     *V.get_or_init(|| match std::env::var("V41_DSPARK_LAYER_TIMING").as_deref() {
         Ok("1") => 1,
         Ok("2") => 2,
+        Ok("3") => 3,
         _ => 0,
     })
 }
@@ -129,12 +142,24 @@ impl<'a> HostUs<'a> {
     /// As `start`, but in mode 2 also drains `s` before stopping the clock, so
     /// the figure is DEVICE time for this block.
     fn start_dev(c: &'static std::sync::atomic::AtomicU64, s: &'a Stream) -> Self {
-        HostUs(c, std::time::Instant::now(), mtp_timing_mode(), Some(s))
+        let m = mtp_timing_mode();
+        if m == 3 {
+            ev_open(c, s);
+        }
+        HostUs(c, std::time::Instant::now(), m, Some(s))
     }
 }
 impl<'a> Drop for HostUs<'a> {
     fn drop(&mut self) {
         if self.2 == 0 {
+            return;
+        }
+        if self.2 == 3 {
+            // Mode 3 closes the span by recording the END event; the host clock
+            // is meaningless here and must not be added.
+            if let Some(s) = self.3 {
+                ev_close(self.0, s);
+            }
             return;
         }
         if self.2 == 2 {
@@ -147,6 +172,96 @@ impl<'a> Drop for HostUs<'a> {
             std::sync::atomic::Ordering::Relaxed,
         );
     }
+}
+
+/// Mode-3 (`V41_DSPARK_LAYER_TIMING=3`) event timing.
+///
+/// Mode 2 syncs the stream at every span boundary, which SERIALISES the layer:
+/// nesting a per-kernel span inside a per-block one inflated the drafter's
+/// measured device total 16.7 -> 52.6 ms/step, so its fine split could not be
+/// read. Mode 3 records a hipEvent pair around each span and charges the
+/// counters from `hipEventElapsedTime` after the drafter's own end-of-forward
+/// sync, so nothing extra is serialised. Spans may nest and overlap freely --
+/// each is independently the device interval between its two events.
+///
+/// Events are pooled: a drafter step opens ~70 spans and event creation is a
+/// driver call we do not want on the hot path.
+struct EvSpan {
+    ctr: &'static std::sync::atomic::AtomicU64,
+    a: v4flash_hip::Event,
+    b: v4flash_hip::Event,
+}
+#[derive(Default)]
+struct EvState {
+    open: Vec<EvSpan>,
+    done: Vec<EvSpan>,
+    pool: Vec<(v4flash_hip::Event, v4flash_hip::Event)>,
+}
+// `hipEvent_t` is a raw pointer, so `Event` is not `Send` -- and it does not
+// need to be: the drafter runs entirely on the engine worker thread. The state
+// is `ManuallyDrop` so no `hipEventDestroy` ever runs from a thread-local
+// destructor, which would fire during process teardown after the HIP runtime
+// may already be gone (the teardown-race class we fixed in 2026-09).
+thread_local! {
+    static EV: std::cell::RefCell<std::mem::ManuallyDrop<EvState>> =
+        std::cell::RefCell::new(std::mem::ManuallyDrop::new(EvState::default()));
+}
+
+fn ev_open(ctr: &'static std::sync::atomic::AtomicU64, s: &Stream) {
+    EV.with(|ev| {
+        let mut ev = ev.borrow_mut();
+        let (a, b) = match ev.pool.pop() {
+            Some(p) => p,
+            None => match (v4flash_hip::Event::new(), v4flash_hip::Event::new()) {
+                (Ok(a), Ok(b)) => (a, b),
+                _ => return,
+            },
+        };
+        if a.record(s).is_err() {
+            ev.pool.push((a, b));
+            return;
+        }
+        ev.open.push(EvSpan { ctr, a, b });
+    });
+}
+
+/// Close the innermost OPEN span for `ctr`. Spans for one counter are strictly
+/// nested by construction (one guard per lexical scope), so last-match is right.
+fn ev_close(ctr: &'static std::sync::atomic::AtomicU64, s: &Stream) {
+    EV.with(|ev| {
+        let mut ev = ev.borrow_mut();
+        let Some(i) = ev.open.iter().rposition(|sp| std::ptr::eq(sp.ctr, ctr)) else {
+            return;
+        };
+        let sp = ev.open.remove(i);
+        if sp.b.record(s).is_err() {
+            ev.pool.push((sp.a, sp.b));
+            return;
+        }
+        ev.done.push(sp);
+    });
+}
+
+/// Charge every closed span to its counter and return the events to the pool.
+/// MUST be called only after the stream those events were recorded on has been
+/// synchronised, or `hipEventElapsedTime` reports on work still in flight.
+pub fn drain_event_spans() {
+    if mtp_timing_mode() != 3 {
+        return;
+    }
+    EV.with(|ev| {
+        let mut ev = ev.borrow_mut();
+        let done = std::mem::take(&mut ev.done);
+        for sp in done {
+            if let Ok(ms) = v4flash_hip::Event::elapsed_ms(&sp.a, &sp.b) {
+                sp.ctr.fetch_add(
+                    (ms as f64 * 1000.0) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            ev.pool.push((sp.a, sp.b));
+        }
+    });
 }
 
 /// Drain the per-sub-block host totals: (hc_mixes, rms, attn, moe, hc_post) us.
@@ -170,6 +285,21 @@ pub fn take_attn_split_us() -> (u64, u64, u64, u64) {
         MTP_H_ATTNQA.swap(0, Relaxed),
         MTP_H_ATTNO.swap(0, Relaxed),
     )
+}
+
+/// Per-kernel split of outproj and MoE, us. All zero unless mode 2.
+pub fn take_kernel_split_us() -> [u64; 8] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        MTP_H_OQUANT.swap(0, Relaxed),
+        MTP_H_OWA.swap(0, Relaxed),
+        MTP_H_OWB.swap(0, Relaxed),
+        MTP_H_MROUT.swap(0, Relaxed),
+        MTP_H_MTOPK.swap(0, Relaxed),
+        MTP_H_MQ8K.swap(0, Relaxed),
+        MTP_H_MGATEUP.swap(0, Relaxed),
+        MTP_H_MDOWN.swap(0, Relaxed),
+    ]
 }
 
 /// Host us in the blocking slots/poss H2D pair.
@@ -940,20 +1070,40 @@ impl MtpState {
 
         // --- output projection: grouped wo_a, then wo_b ---
         let _ho = HostUs::start_dev(&MTP_H_ATTNO, s);
-        e.q8.quantize_input_batched(
-            s, &mut self.heads_xq, &mut self.heads_xscale, &self.heads, Q_FLAT, B,
-        )?;
-        e.q8_grouped.matvec_grouped_batched(
-            s, &mut self.low, &w.attn_output_a.buffer, &self.heads_xq, &self.heads_xscale,
-            GROUP_DIM, RANK, N_GROUPS, B,
-        )?;
-        e.q8.quantize_input_batched(
-            s, &mut self.low_xq, &mut self.low_xscale, &self.low, OUT_LOW, B,
-        )?;
-        e.q8.matvec_batched(
-            s, &mut self.attn_out, &w.attn_output_b.buffer, &self.low_xq, &self.low_xscale,
-            N_EMBD, OUT_LOW, B,
-        )?;
+        {
+            let _t = HostUs::start_dev(&MTP_H_OQUANT, s);
+            e.q8.quantize_input_batched(
+                s, &mut self.heads_xq, &mut self.heads_xscale, &self.heads, Q_FLAT, B,
+            )?;
+        }
+        {
+            let _t = HostUs::start_dev(&MTP_H_OWA, s);
+            // B-packed for the same reason as `owb` below: the batched twin
+            // re-read all 35.7 MB of `attn_output_a` once per row (6.05
+            // ms/step vs a 0.47 ms single-read roofline).
+            e.q8_grouped.matvec_grouped_bpack(
+                s, &mut self.low, &w.attn_output_a.buffer, &self.heads_xq, &self.heads_xscale,
+                GROUP_DIM, RANK, N_GROUPS, B,
+            )?;
+        }
+        {
+            let _t = HostUs::start_dev(&MTP_H_OQUANT, s);
+            e.q8.quantize_input_batched(
+                s, &mut self.low_xq, &mut self.low_xscale, &self.low, OUT_LOW, B,
+            )?;
+        }
+        {
+            let _t = HostUs::start_dev(&MTP_H_OWB, s);
+            // B-PACKED: `matvec_batched` launches grid.z = B, so each of the 5
+            // rows re-reads all 44.6 MB of `attn_output_b` -- MEASURED 8.79
+            // ms/step against a 0.58 ms single-read roofline. `matvec_bpack`
+            // reads each weight block once and loops the batch in registers,
+            // bit-identical per (row, b).
+            e.q8.matvec_bpack(
+                s, &mut self.attn_out, &w.attn_output_b.buffer, &self.low_xq, &self.low_xscale,
+                N_EMBD, OUT_LOW, B,
+            )?;
+        }
         Ok(())
     }
 
@@ -972,6 +1122,8 @@ impl MtpState {
         // Per-row, for the same reason as `hc_mixes`: at B=5 the batched WMMA
         // GEMM returned a constant, so every token routed to experts [0, 1, 2]
         // with weight 0.5 — a uniform softmax wearing a router's clothes.
+        {
+        let _t = HostUs::start_dev(&MTP_H_MROUT, s);
         for j in 0..MTP_BLOCK {
             let xj = self.normed.slice_view(j * N_EMBD as usize, N_EMBD as usize);
             let mut lj = self
@@ -979,6 +1131,9 @@ impl MtpState {
                 .slice_view_mut(j * MTP_N_EXPERT, MTP_N_EXPERT);
             e.f16.matvec(s, &mut lj, &w.ffn_gate_inp.buffer, &xj, MTP_N_EXPERT as u32, N_EMBD)?;
         }
+        }
+        {
+        let _t = HostUs::start_dev(&MTP_H_MTOPK, s);
         for j in 0..MTP_BLOCK {
             let lg = self.router_logits.slice_view(j * MTP_N_EXPERT, MTP_N_EXPERT);
             let mut sel = self.d_selected.slice_view_mut(j * MTP_TOPK as usize, MTP_TOPK as usize);
@@ -988,8 +1143,12 @@ impl MtpState {
                 EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS,
             )?;
         }
-        e.q8k
-            .launch(s, &mut self.ffn_xq, &self.normed, BLOCKS_Q8K_GATE_IN * B)?;
+        }
+        {
+            let _t = HostUs::start_dev(&MTP_H_MQ8K, s);
+            e.q8k
+                .launch(s, &mut self.ffn_xq, &self.normed, BLOCKS_Q8K_GATE_IN * B)?;
+        }
         // `moe_*_hetsplit`'s `n_rows` is the OUTPUT WIDTH, not a token batch —
         // these kernels batch over the `n_used` expert slots of ONE token (box
         // 2's executor passes N_FF_EXP / N_EMBD there). So the block's rows are
@@ -1003,18 +1162,24 @@ impl MtpState {
             let ew_j = self.d_ew.slice_view(j * tk, tk);
             let sel_j = self.d_selected.slice_view(j * tk, tk);
             let mut mid_j = self.mid.slice_view_mut(j * tk * ffe, tk * ffe);
+            let _tgu = HostUs::start_dev(&MTP_H_MGATEUP, s);
             crate::het::dispatch::moe_gate_up_batch_hetsplit(
                 e, w.routed.gate.dtype, s, &mut mid_j, &w.routed.gate.buffer,
                 &w.routed.up.buffer, &xq_j, &ew_j, &sel_j, &self.remap, 0, MTP_TOPK,
                 w.routed.gate_bytes_per_expert as u32, w.routed.up_bytes_per_expert as u32,
                 MTP_TOPK, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
             )?;
+            drop(_tgu);
             let mut midq_j = self
                 .midq
                 .slice_view_mut(j * tk * MIDQ_BYTES_PER_SLOT, tk * MIDQ_BYTES_PER_SLOT);
-            e.q8k
-                .launch(s, &mut midq_j, &mid_j, BLOCKS_Q8K_DOWN_IN * MTP_TOPK)?;
+            {
+                let _t = HostUs::start_dev(&MTP_H_MQ8K, s);
+                e.q8k
+                    .launch(s, &mut midq_j, &mid_j, BLOCKS_Q8K_DOWN_IN * MTP_TOPK)?;
+            }
             let mut out_j = self.ffn_out.slice_view_mut(j * ne, ne);
+            let _td = HostUs::start_dev(&MTP_H_MDOWN, s);
             crate::het::dispatch::moe_down_batched_hetsplit(
                 e, w.routed.down.dtype, s, &mut out_j, &w.routed.down.buffer, &midq_j, &sel_j,
                 &self.remap, 0, MTP_TOPK, w.routed.down_bytes_per_expert as u32,

@@ -674,6 +674,9 @@ impl HeterogeneousEngine {
         )?;
         let t_enq = std::time::Instant::now();
         self.igpu.compute.synchronize()?;
+        // The drafter's whole forward is now complete on the device, so every
+        // mode-3 event pair has resolved and can be charged to its counter.
+        super::mtp::drain_event_spans();
         let t_sync = std::time::Instant::now();
         let mut h_host = vec![0.0f32; mtp_state.h.len()];
         mtp_state.h.copy_to_host(&mut h_host)?;
@@ -702,6 +705,13 @@ impl HeterogeneousEngine {
                 l_attn_split_us = {
                     let (q, kv, qa, o) = super::mtp::take_attn_split_us();
                     format!("qloop={q} kv={kv} qa={qa} outproj={o} kvcopy={}", super::mtp::take_kvcopy_us())
+                },
+                l_kernel_split_us = {
+                    let k = super::mtp::take_kernel_split_us();
+                    format!(
+                        "oquant={} owa={} owb={} | mrouter={} mtopk={} mq8k={} mgateup={} mdown={}",
+                        k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7]
+                    )
                 },
                 "dspark.draft.split"
             );

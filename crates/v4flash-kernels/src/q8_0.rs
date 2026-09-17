@@ -714,6 +714,74 @@ impl Q8_0GroupedMatvec {
     /// xq[B, n_groups*group_dim], xscale[B, n_groups*blocks_per_group],
     /// out[B, n_groups*rank]. Weight shared across batch.
     #[allow(clippy::too_many_arguments)]
+    /// B-PACKED grouped GEMV: reads the grouped weight matrix ONCE for all
+    /// `batch` activations instead of once per batch element.
+    ///
+    /// `matvec_grouped_batched` launches `grid.z = batch`, so B=5 reads the
+    /// drafter's 35.7 MB `attn_output_a` five times. Bit-identical per
+    /// (row, b) -- same dp4a chain, same float accumulation order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_grouped_bpack(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        group_dim: u32,
+        rank: u32,
+        n_groups: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        if batch > GEMV_BPACK_MAX {
+            return Err(eyre!(
+                "q8_0 matvec_grouped_bpack: batch={batch} exceeds GEMV_BPACK_MAX={GEMV_BPACK_MAX}"
+            ));
+        }
+        if group_dim % Q8_0_BLOCK_ELEMS != 0 {
+            return Err(eyre!(
+                "q8_0 matvec_grouped_bpack: group_dim={group_dim} not %32"
+            ));
+        }
+        let blocks_per_group = group_dim / Q8_0_BLOCK_ELEMS;
+        let out_dim = n_groups * rank;
+        let expected_weight_bytes =
+            (out_dim as usize) * (blocks_per_group as usize) * (Q8_0_BLOCK_BYTES as usize);
+        if weight.byte_len() != expected_weight_bytes {
+            return Err(eyre!(
+                "q8_0 matvec_grouped_bpack weight bytes: {}!={expected_weight_bytes}",
+                weight.byte_len()
+            ));
+        }
+        let per_batch_in = (n_groups as usize) * (group_dim as usize);
+        let per_batch_scales = (n_groups as usize) * (blocks_per_group as usize);
+        if xq.len() < (batch as usize) * per_batch_in
+            || xscale.len() < (batch as usize) * per_batch_scales
+            || out.len() < (batch as usize) * (out_dim as usize)
+        {
+            return Err(eyre!(
+                "q8_0 matvec_grouped_bpack: buffer too small for batch={batch} (xq {} xs {} out {})",
+                xq.len(), xscale.len(), out.len()
+            ));
+        }
+
+        let function = self.module.get_function("q8_0_grouped_gemv_bpack")?;
+        let grid_x = out_dim.div_ceil(GEMV_ROWS_PER_BLOCK);
+        let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
+        let cfg = LaunchConfig {
+            grid: (grid_x, 1, 1),
+            block: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), weight.raw(), xq.raw(), xscale.raw(),
+            group_dim, rank, blocks_per_group, n_groups, batch
+        ])
+    }
+
     pub fn matvec_grouped_batched(
         &self,
         stream: &Stream,
