@@ -170,6 +170,27 @@ problems here -- raising E does not by itself fix #0b.
 
 ## Silent wrongness
 
+### 0c. FIXED (2026-09-17, `fedbea2`) — decode DOUBLE-COUNTED every pick box 1 held
+
+Under `V41_T2_CATCHALL=1` decode submitted the whole 6-pick `sel_host` to box 2
+(`submit_unmasked`, "the hub already decided the partition in `owns_remote`").
+Box 2's `run_path` computes EVERY non-`NO_PICK` entry it is handed, and
+`ffn_combine` adds that partial to the local iGPU one — so each pick box 1 kept
+(resident) was computed on BOTH boxes and added twice. `verify_routing_exactly_once`
+validates the hub's CLAIM (remap vs `owns_remote`), not what box 2 computes, so it
+never fired. The prefill/verify path already blanked non-remote picks
+(`sel_for_remote`); decode did not.
+
+This is what the mode-2 comment in `forward_layer.rs` described as "mode 1 after a
+37-tok request -> DEGENERATE ... f32 addition is not associative" (it was not
+associativity: it was residency-dependent double-adding), and it is a large part
+of #0's run-to-run nondeterminism and of "a 1396-slot box-1 LRU measured SLOWER".
+
+Fix: `sel_remote`/`ew_remote` blank the local picks (`V41_REMOTE_NOMASK=1`
+reproduces). With the mask, mode 1 is still history-dependent (which box computes
+an expert changes the f32 grouping); `V41_T2_PARTITION=1` (fixed hash home per
+expert) is bit-stable across repeats — measured sha-equal on two turns, twice.
+
 ### 0b. ~~FIXED~~ (2026-09-16) — verify vs decode ~1.9 nats: the MoE group builder dropped every sparse-resident expert
 
 **See the FIXED entry under "Sparse verify residency" below for the root cause,
