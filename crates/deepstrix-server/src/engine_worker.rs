@@ -3727,6 +3727,22 @@ fn finish_decode(
                         XROW_OK[jj].fetch_add(1, Relaxed);
                     }
                     XROW_KLD[jj].fetch_add((kld * 1e6) as i64, Relaxed);
+                    // Bucket by whether this row is one we actually USE.
+                    //
+                    // We emit from row j only when the prefix d_0..d_j-1 was
+                    // ACCEPTED, i.e. matched the model's own draw at every
+                    // earlier row. Rows past the rejection point are conditioned
+                    // on drafts the model rejected, are never emitted from, and
+                    // their disagreement costs nothing. If the divergence lives
+                    // ONLY there, it is not a correctness bug at all -- if it is
+                    // present at j <= n, it is.
+                    let used = j <= n;
+                    let b = if used { 0 } else { 1 };
+                    XUSED_N[b].fetch_add(1, Relaxed);
+                    if am(v) == am(d) {
+                        XUSED_OK[b].fetch_add(1, Relaxed);
+                    }
+                    XUSED_KLD[b].fetch_add((kld * 1e6) as i64, Relaxed);
                 }
             }
             dspark_stats::record_accept(n, k);
@@ -4185,6 +4201,22 @@ fn finish_decode(
                 .collect();
             if !rows.is_empty() {
                 tracing::info!(per_row = %rows.join(" | "), "dspark.xcheck.rows");
+                let lbl = ["used (j<=n)", "unused (j>n)"];
+                let by: Vec<String> = (0..2)
+                    .filter_map(|b| {
+                        let n = XUSED_N[b].swap(0, Relaxed);
+                        if n == 0 {
+                            return None;
+                        }
+                        let ok = XUSED_OK[b].swap(0, Relaxed);
+                        let kld = XUSED_KLD[b].swap(0, Relaxed) as f64 / 1e6 / n as f64;
+                        Some(format!(
+                            "{}: n={n} agree={:.4} kld={kld:.6}",
+                            lbl[b], ok as f64 / n as f64
+                        ))
+                    })
+                    .collect();
+                tracing::info!(by_use = %by.join(" | "), "dspark.xcheck.used");
             }
         }
         if small_b_catchall_ab() > 0 || single_lane_ab() > 0 || xcheck_poison() || verify_probe_ks.len() > 1 {
@@ -5019,6 +5051,15 @@ static XROW_KLD: [std::sync::atomic::AtomicI64; XROW_MAX] =
     [const { std::sync::atomic::AtomicI64::new(0) }; XROW_MAX];
 
 /// `V41_XCHECK_ROWS=2`: the accept-path (real drafts) variant.
+/// [0] = rows at or before the acceptance point (rows we EMIT from),
+/// [1] = rows past it (conditioned on rejected drafts, never emitted from).
+static XUSED_N: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static XUSED_OK: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static XUSED_KLD: [std::sync::atomic::AtomicI64; 2] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; 2];
+
 fn xcheck_rows_accept() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("V41_XCHECK_ROWS").as_deref() == Ok("2"))
