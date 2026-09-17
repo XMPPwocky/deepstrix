@@ -3415,12 +3415,89 @@ fn finish_decode(
                 }
                 bi as i32
             };
+            // DRAW the target token for each verify row, then accept the draft
+            // only if it matches.
+            //
+            // Matching on argmax -- what this did -- is greedy speculative
+            // decoding. It is correct ONLY when the request asked for greedy;
+            // at the model's own agentic recipe (temperature 1.0, top_p 0.95)
+            // it silently threw the sampler away and emitted argmax tokens,
+            // which is both wrong and why generations collapsed into
+            // repetition loops.
+            //
+            // Sampling the TARGET and accepting on equality is exactly
+            // distribution-preserving: the emitted token is `y_j ~ p_j` either
+            // way, so the draft can only change HOW MANY tokens a step yields,
+            // never which. That is the whole guarantee speculative decoding
+            // needs, and unlike rejection sampling it needs no drafter
+            // probabilities.
+            //
+            // It is also all that rejection sampling would buy us TODAY: our
+            // drafts are the drafter's argmax, so `q` is a point mass and
+            // `min(1, p/q)` collapses to `p(draft)` -- the same acceptance this
+            // gets. Beating it requires sampling the drafts from `q` first;
+            // that is the next step, not this one.
+            let row_sample = |j: usize, rng: &mut SamplerRng| -> i32 {
+                match sample_mode {
+                    SampleMode::Argmax => row_argmax(j),
+                    SampleMode::Multinomial { temperature, min_p_rel, top_p } => {
+                        let r = &logits[j * nv..(j + 1) * nv];
+                        let inv_t = 1.0f32 / temperature;
+                        let gmax = r.iter().copied().fold(f32::NEG_INFINITY, f32::max) * inv_t;
+                        // Same weights the device chain forms: exp(logit/T - gmax).
+                        let w: Vec<f64> =
+                            r.iter().map(|&x| ((x * inv_t - gmax) as f64).exp()).collect();
+                        // Same composed top_p/min_p rule as the kernel, so the
+                        // truncated distribution here IS the sampler's.
+                        let thr = v4flash_kernels::sampler::top_p_min_p_threshold(
+                            &w,
+                            top_p as f64,
+                            min_p_rel as f64,
+                        );
+                        let z: f64 = w.iter().filter(|&&v| v >= thr).sum();
+                        let mut acc = 0.0f64;
+                        let target = rng.next_f32() as f64 * z;
+                        let mut pick = 0i32;
+                        for (i, &v) in w.iter().enumerate() {
+                            if v < thr {
+                                continue;
+                            }
+                            acc += v;
+                            pick = i as i32;
+                            if acc >= target {
+                                break;
+                            }
+                        }
+                        pick
+                    }
+                }
+            };
+            // One-shot: is row 0 in the space the sampler assumes (raw logits)?
+            // If `p_max` comes out tiny the distribution is flat, which means
+            // these are not raw logits and exp(x-max) is meaningless.
+            if std::env::var("V41_DUMP_VERIFY_DIST").as_deref() == Ok("1")
+                && VERIFY_DIST_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3
+            {
+                let r = &logits[0..nv];
+                let mx = r.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mn = r.iter().copied().fold(f32::INFINITY, f32::min);
+                let mean = r.iter().sum::<f32>() / nv as f32;
+                let z: f64 = r.iter().map(|&x| ((x - mx) as f64).exp()).sum();
+                let mut top: Vec<f32> = r.to_vec();
+                top.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                tracing::info!(
+                    max = mx, min = mn, mean,
+                    p_max = format!("{:.4}", 1.0 / z),
+                    top5 = format!("{:?}", &top[..5]),
+                    "verify.dist"
+                );
+            }
             let mut n = 0usize;
-            let mut corrected = row_argmax(0);
+            let mut corrected = row_sample(0, &mut rng);
             while n < k && corrected == drafts[n] {
                 n += 1;
                 if n < k {
-                    corrected = row_argmax(n);
+                    corrected = row_sample(n, &mut rng);
                 }
             }
             dspark_stats::record_accept(n, k);
@@ -3468,7 +3545,7 @@ fn finish_decode(
                 m.confirmed.push_back(*d);
             }
             m.ingested = n + 1;
-            let head = if n < k { corrected } else { row_argmax(k) };
+            let head = if n < k { corrected } else { row_sample(k, &mut rng) };
             m.next_after = Some(head);
             let t_roll = t_step.elapsed();
             m.accept_steps += 1;
@@ -4598,6 +4675,8 @@ const _: () = {
 /// draft position or the fifth, and those call for completely different work.
 /// `accept[j] / reach[j]` is the per-position accept rate, so `d1` is the
 /// drafter's first-token quality — the number the oracles are stated in.
+static VERIFY_DIST_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 mod dspark_stats {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     const MAXB: usize = v4flash_kernels::het::mtp::MTP_BLOCK + 1;
