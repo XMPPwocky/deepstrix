@@ -637,6 +637,24 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
+    /// Cheap ring-only advance for an intermediate accepted position. See
+    /// `MtpState::ring_write_only`.
+    pub fn dspark_ring_write_only(
+        &self,
+        mtp_state: &mut super::mtp::MtpState,
+        w: &super::weights::MtpWeights,
+        pos: u32,
+        main_hidden: &[f32],
+    ) -> color_eyre::eyre::Result<()> {
+        self.set_current_cached(self.igpu.device)?;
+        mtp_state.inject_main_hidden(main_hidden)?;
+        mtp_state.ring_write_only(
+            &self.igpu, &self.igpu.compute, w, &super::mtp::mtp_rope(), pos,
+        )?;
+        self.igpu.compute.synchronize()?;
+        Ok(())
+    }
+
     pub fn dspark_draft(
         &self,
         mtp_state: &mut super::mtp::MtpState,

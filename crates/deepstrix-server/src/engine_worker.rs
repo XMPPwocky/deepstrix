@@ -3487,6 +3487,9 @@ fn finish_decode(
             //     off: 2.22 tok/s  E 2.380  (50 steps)
             //     on:  2.33 tok/s  E 2.553  (47 steps)
             // `V41_DSPARK_DENSE_RING=0` rolls it back.
+            // Default ON: MEASURED byte-identical output and E, at 4.2x less
+            // per-accepted-token cost. `V41_DSPARK_RING_FAST=0` rolls back.
+            let ring_fast = std::env::var("V41_DSPARK_RING_FAST").as_deref() != Ok("0");
             if std::env::var("V41_DSPARK_DENSE_RING").as_deref() != Ok("0") && n > 0 {
                 for r in 0..n {
                     let mut mh = Vec::with_capacity(nsrc * ne);
@@ -3500,7 +3503,19 @@ fn finish_decode(
                     let m = state.mtp.as_mut().expect("mtp");
                     // Correct cheap advance: full layer forward (ring + carry),
                     // skip the exit. Residual at pos+r is mtp_src row r.
-                    state.engine.dspark_advance_ring(&mut m.state, &m.w, pos + r as u32, &mh, &tr, &m.noise_row)?;
+                    //
+                    // `V41_DSPARK_RING_FAST`: the full forward is only needed
+                    // for the CARRY; the ring row itself is a projection of the
+                    // main model's residual and needs no draft stream. MEASURED
+                    // `draft_ms = 16.8 + 11.00*n`, so paying a full forward for
+                    // every accepted token makes acceptance tax itself. Write
+                    // the intermediate rings cheaply and let the LAST position
+                    // refresh the carry against the now-dense ring.
+                    if ring_fast && r + 1 < n {
+                        state.engine.dspark_ring_write_only(&mut m.state, &m.w, pos + r as u32, &mh)?;
+                    } else {
+                        state.engine.dspark_advance_ring(&mut m.state, &m.w, pos + r as u32, &mh, &tr, &m.noise_row)?;
+                    }
                 }
             }
 

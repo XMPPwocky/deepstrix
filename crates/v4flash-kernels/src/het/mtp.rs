@@ -991,8 +991,57 @@ impl MtpState {
     /// attended set is identical — this just keeps the keys contiguous, which is
     /// what the batched score kernel requires. Anything at or past `n_valid` is
     /// scratch, so the next step's `main_kv` write legitimately overwrites it.
+    /// RING-ONLY advance: write this token's ring row for every layer and
+    /// nothing else.
+    ///
+    /// `advance_ring` runs the FULL drafter forward per accepted token — it
+    /// drafts MTP_BLOCK tokens and throws them away — because the ring must be
+    /// dense AND the hyper-connection carry must advance. MEASURED, that costs
+    /// 11.0 ms per accepted token (`draft_ms = 16.8 + 11.00*n`), so acceptance
+    /// taxes itself: every token DSpark wins costs 11 ms back.
+    ///
+    /// But the ring row does NOT depend on the draft stream. It is the main
+    /// model's residual at the main position (`self.x`, straight out of
+    /// `entry`), projected by each layer's `attn_kv` — the same source for all
+    /// three layers. So the intermediate accepted positions only need this,
+    /// and one real `advance_ring` at the LAST of them refreshes the carry
+    /// against an already-dense ring.
+    ///
+    /// Ring writes are identical to a full forward's by construction: both go
+    /// through `write_main_ring_row`.
+    pub fn ring_write_only(
+        &mut self,
+        e: &DeviceEngine,
+        s: &Stream,
+        w: &MtpWeights,
+        rope: &crate::RopeParams,
+        pos: u32,
+    ) -> eyre::Result<()> {
+        let _t = e.events.stage("mtp.ring_write_only", s)?;
+        // `entry` produces `self.x` from the injected main residuals; the ring
+        // row is a projection of exactly that.
+        self.entry(e, s, w)?;
+        let (n_valid, main_slot) = self.ring_geom();
+        for li in 0..w.layers.len() {
+            self.write_main_ring_row(e, s, &w.layers[li], li, rope, pos, n_valid, main_slot, false)?;
+        }
+        // Same bookkeeping a full forward does — the ring advanced by one row.
+        self.ring_writes += 1;
+        Ok(())
+    }
+
+    /// Write this token's RING row for one layer: the main model's residual at
+    /// the MAIN position, projected by that layer's `attn_kv`, roped and stored
+    /// at `main_slot`.
+    ///
+    /// Extracted so `attn` and `ring_write_only` cannot drift -- they must
+    /// produce the identical ring, or a cheap advance silently builds a
+    /// different cache than a full forward would.
+    ///
+    /// `with_block` also stages the block's own KV slots (1..=B), which only a
+    /// real draft needs; a ring-only advance has no draft stream.
     #[allow(clippy::too_many_arguments)]
-    fn attn(
+    fn write_main_ring_row(
         &mut self,
         e: &DeviceEngine,
         s: &Stream,
@@ -1000,14 +1049,10 @@ impl MtpState {
         li: usize,
         rope: &crate::RopeParams,
         pos: u32,
+        n_valid: usize,
+        main_slot: usize,
+        with_block: bool,
     ) -> eyre::Result<()> {
-        let _hkv = HostUs::start_dev(&MTP_H_ATTNKV, s);
-        let (n_valid, main_slot) = self.ring_geom();
-        let n_kv = (n_valid + MTP_BLOCK) as u32;
-        if n_kv > crate::attention::ATTN_MIXED_MAX_KEYS {
-            return Err(eyre!("mtp attn: n_kv={n_kv} exceeds the attention key cap"));
-        }
-
         // --- the ring row, from main_x at the MAIN position ---
         e.q8
             .quantize_input(s, &mut self.main_xq, &mut self.main_xscale, &self.x, N_EMBD)?;
@@ -1025,9 +1070,11 @@ impl MtpState {
             let poss = &mut self.stage_poss[si];
             slots[0] = main_slot as u32;
             poss[0] = pos;
-            for j in 0..MTP_BLOCK {
-                slots[j + 1] = (n_valid + j) as u32;
-                poss[j + 1] = pos + 1 + j as u32;
+            if with_block {
+                for j in 0..MTP_BLOCK {
+                    slots[j + 1] = (n_valid + j) as u32;
+                    poss[j + 1] = pos + 1 + j as u32;
+                }
             }
         }
         {
@@ -1040,6 +1087,27 @@ impl MtpState {
             &self.pos_dev.slice_view(0, 1), &self.slot_dev.slice_view(0, 1), N_HEAD_DIM, N_ROT,
             RMS_EPS, rope,
         )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attn(
+        &mut self,
+        e: &DeviceEngine,
+        s: &Stream,
+        w: &MtpLayerWeights,
+        li: usize,
+        rope: &crate::RopeParams,
+        pos: u32,
+    ) -> eyre::Result<()> {
+        let _hkv = HostUs::start_dev(&MTP_H_ATTNKV, s);
+        let (n_valid, main_slot) = self.ring_geom();
+        let n_kv = (n_valid + MTP_BLOCK) as u32;
+        if n_kv > crate::attention::ATTN_MIXED_MAX_KEYS {
+            return Err(eyre!("mtp attn: n_kv={n_kv} exceeds the attention key cap"));
+        }
+
+        self.write_main_ring_row(e, s, w, li, rope, pos, n_valid, main_slot, true)?;
 
         // --- the block's own KV, from the draft stream ---
         e.q8
@@ -1103,6 +1171,10 @@ impl MtpState {
         )?;
         drop(_hqa);
         // V4.1 has no per-head q RMSNorm after wq_b (same as the main model).
+        // Its own staging slot: the ring-row write above now takes (and
+        // advances) one of its own inside `write_main_ring_row`.
+        let si = self.stage_idx % STAGE_N;
+        self.stage_idx = self.stage_idx.wrapping_add(1);
         {
             let dpos = &mut self.stage_dpos[si];
             for (j, d) in dpos.iter_mut().enumerate() {
