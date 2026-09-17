@@ -5168,7 +5168,7 @@ impl HeterogeneousEngine {
                 // error and plausible-looking output. Passing it unconditionally is
                 // a no-op today (mode 0 with an all-local remap is arithmetically
                 // identical to the plain builder) and the precondition for packing.
-                (routed_view, Some(&pg.remap_dev), false)
+                (routed_view, Some(pg.remap_dev(layer as i32)), false)
             }
             None => (&ilw.routed, ilw.hot_remap.as_ref(), ilw.igpu_packed),
         };

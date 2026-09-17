@@ -51,8 +51,25 @@ pub struct ExpertPager {
     stage_down: Vec<u8>,
     /// Scratch remap of length `N_EXPERT`: global id -> slot, or -1 if absent.
     remap: Vec<i32>,
-    /// Device copy of `remap`, pointer-stable for the MoE dispatch; refilled per ensure.
-    pub remap_dev: DeviceBuffer<i32>,
+    /// Device copy of `remap`, ONE BUFFER PER LAYER.
+    ///
+    /// A single shared buffer is only safe while every layer's remap is the
+    /// SAME (the dense-window path's identity self-map). The sparse/LRU path
+    /// writes per-layer absolute pool slots, so with one buffer, reaching layer
+    /// L+1's `ensure` while layer L's MoE is still queued makes layer L's kernel
+    /// read L+1's remap -- right expert ids, wrong weights, no error. That race
+    /// is why the sparse residency was confined to the single-lane verify and
+    /// could not be used by the pipelined prefill driver.
+    ///
+    /// Per LAYER rather than a ring because each layer's MoE is captured as its
+    /// own HIP graph (`igpu_graphs.run("routed_moe_paged", layer, ..)`), which
+    /// bakes the buffer pointer: a rotating buffer would have the replay read a
+    /// stale one. Box 2 already does exactly this (`LayerShard::remap_dev` +
+    /// `pool.dirty[layer]`). 40 x 384 x 4 B = 61 KB.
+    remap_dev: Vec<DeviceBuffer<i32>>,
+    /// Layer whose remap `self.remap` currently describes — the one the next
+    /// upload targets. Set by every `ensure*`.
+    cur_layer: i32,
     /// The iGPU these buffers live on. `DeviceBuffer::new` calls `hipMalloc` on the
     /// CURRENT device and only records `device_id` for bookkeeping, so every alloc and
     /// H2D copy here must pin the device first or the pool/remap silently land on the
@@ -720,7 +737,10 @@ impl ExpertPager {
         let gate = make(g)?;
         let up = make(u)?;
         let down = make(d)?;
-        let remap_dev = DeviceBuffer::<i32>::new(device_id, N_EXPERT as usize)?;
+        let mut remap_dev = Vec::with_capacity(crate::config::N_LAYER as usize);
+        for _ in 0..crate::config::N_LAYER {
+            remap_dev.push(DeviceBuffer::<i32>::new(device_id, N_EXPERT as usize)?);
+        }
         let routed = RoutedExpertWeights {
             gate,
             up,
@@ -845,6 +865,7 @@ impl ExpertPager {
             stage_down: vec![0u8; down_bpe],
             remap: (0..N_EXPERT as i32).map(|e| -e - 1).collect(),
             remap_dev,
+            cur_layer: 0,
             device: igpu,
             prefill_requests: 0,
             prefill_misses: 0,
@@ -869,6 +890,31 @@ impl ExpertPager {
             decode_repack_gpu_ns: 0,
             prefetch: None,
         })
+    }
+
+    /// Upload `remap` into the CURRENT layer's device buffer. Every `ensure*`
+    /// sets `cur_layer` first, so this always targets the layer the host just
+    /// described — never a layer whose MoE may still be queued.
+    fn upload_remap(&mut self) -> eyre::Result<()> {
+        let l = self.cur_layer.clamp(0, crate::config::N_LAYER - 1) as usize;
+        self.device.set_current()?;
+        self.remap_dev[l].copy_from_host(&self.remap)?;
+        Ok(())
+    }
+
+    fn remap_dev_cur(&self) -> &DeviceBuffer<i32> {
+        &self.remap_dev[self.cur_layer.clamp(0, crate::config::N_LAYER - 1) as usize]
+    }
+
+    /// This layer's remap, for the MoE dispatch. Pointer-stable per layer.
+    pub fn remap_dev(&self, layer: i32) -> &DeviceBuffer<i32> {
+        &self.remap_dev[layer.clamp(0, crate::config::N_LAYER - 1) as usize]
+    }
+
+    /// Mutable twin, for diagnostics that overwrite a layer's remap directly
+    /// (`V41_PAGER_RESIDENT`).
+    pub fn remap_dev_mut(&mut self, layer: i32) -> &mut DeviceBuffer<i32> {
+        &mut self.remap_dev[layer.clamp(0, crate::config::N_LAYER - 1) as usize]
     }
 
     fn touch(&mut self, slot: u32) {
@@ -902,6 +948,7 @@ impl ExpertPager {
     /// is flat), so paging the full set costs little over the union and avoids a
     /// host readback of `d_selected` on the critical path.
     pub fn ensure_layer_dense(&mut self, layer: i32) -> eyre::Result<()> {
+        self.cur_layer = layer;
         if self.n_slots < N_EXPERT {
             return Err(eyre!(
                 "expert pager: dense layer window needs >= {N_EXPERT} slots, pool has {}",
@@ -1054,6 +1101,7 @@ impl ExpertPager {
     ///
     /// `V41_PAGER_BATCH_MISS=0` restores the serial path.
     pub fn ensure_batched(&mut self, layer: i32, ids: &[u32]) -> eyre::Result<&[i32]> {
+        self.cur_layer = layer;
         if ids.len() > self.n_slots as usize {
             return Err(eyre!(
                 "expert pager: {} experts requested but only {} slots",
@@ -1128,7 +1176,7 @@ impl ExpertPager {
             misses.push((id, slot));
         }
         if misses.is_empty() {
-            self.remap_dev.copy_from_host(&self.remap)?;
+            self.upload_remap()?;
             return Ok(&self.remap);
         }
 
@@ -1244,7 +1292,7 @@ impl ExpertPager {
         }
         self.decode_h2d_ns += t_h2d.elapsed().as_nanos() as u64;
         self.decode_repack_gpu_ns += gpu_ns;
-        self.remap_dev.copy_from_host(&self.remap)?;
+        self.upload_remap()?;
         Ok(&self.remap)
     }
 
@@ -1275,9 +1323,9 @@ impl ExpertPager {
         }
         if n > 0 {
             self.device.set_current()?;
-            self.remap_dev.copy_from_host(&self.remap)?;
+            self.upload_remap()?;
         }
-        Ok(&self.remap_dev)
+        Ok(self.remap_dev_cur())
     }
 
     /// Build and upload the iGPU's REMOTE-EXCLUSION remap for `layer`.
@@ -1298,6 +1346,7 @@ impl ExpertPager {
         layer: i32,
         is_remote: impl Fn(u32) -> bool,
     ) -> eyre::Result<&DeviceBuffer<i32>> {
+        self.cur_layer = layer;
         // Entries must carry the expert's ACTUAL slot within the window view, not
         // `-e-1`. That identity only held while windows were 384 wide and slot ==
         // expert id; under packing it would point the dispatch at another expert's
@@ -1344,8 +1393,8 @@ impl ExpertPager {
             }
         }
         self.device.set_current()?;
-        self.remap_dev.copy_from_host(&self.remap)?;
-        Ok(&self.remap_dev)
+        self.upload_remap()?;
+        Ok(self.remap_dev_cur())
     }
 
     /// Page only `ids` for `layer`, keeping the dense window layout (slot ==
@@ -1366,6 +1415,7 @@ impl ExpertPager {
     /// partially filled so a later dense request refills it instead of trusting
     /// `window_layer` alone.
     pub fn ensure_layer_union(&mut self, layer: i32, ids: &[u32]) -> eyre::Result<()> {
+        self.cur_layer = layer;
         if self.n_slots < N_EXPERT {
             return Err(eyre!(
                 "expert pager: dense layer window needs >= {N_EXPERT} slots, pool has {}",
@@ -1587,10 +1637,11 @@ impl ExpertPager {
     /// the expert's slot RELATIVE to the window view (`-idx-1`), everything else 0.
     fn write_window_remap(
         &mut self,
-        _layer: i32,
+        layer: i32,
         w: u32,
         assign: &[(u32, usize)],
     ) -> eyre::Result<()> {
+        self.cur_layer = layer;
         let base = self.window_base(w);
         let width = self.window_width(w);
         for r in self.remap.iter_mut() {
@@ -1615,7 +1666,7 @@ impl ExpertPager {
             self.remap[e as usize] = -((sl - base) as i32) - 1;
         }
         self.device.set_current()?;
-        self.remap_dev.copy_from_host(&self.remap)?;
+        self.upload_remap()?;
         Ok(())
     }
 
@@ -1782,6 +1833,7 @@ impl ExpertPager {
     }
 
     pub fn ensure(&mut self, layer: i32, ids: &[u32]) -> eyre::Result<&[i32]> {
+        self.cur_layer = layer;
         if ids.len() > self.n_slots as usize {
             return Err(eyre!(
                 "expert pager: {} experts requested but only {} slots",
@@ -1969,7 +2021,7 @@ impl ExpertPager {
             let _t = super::forward_prefill::LayerHostTimer::start(
                 &super::forward_prefill::LH_REMAP_H2D,
             );
-            self.remap_dev.copy_from_host(&self.remap)?;
+            self.upload_remap()?;
         }
         Ok(&self.remap)
     }

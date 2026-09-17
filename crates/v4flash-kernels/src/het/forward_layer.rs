@@ -2657,7 +2657,7 @@ impl HeterogeneousEngine {
             );
             if std::env::var("V41_PAGER_DBG").is_ok() && layer == 0 {
                 let mut rmp = vec![0i32; N_EXPERT as usize];
-                pg.remap_dev.copy_to_host(&mut rmp)?;
+                pg.remap_dev(layer).copy_to_host(&mut rmp)?;
                 let sel_remap: Vec<i32> = ids.iter().map(|&i| rmp[i as usize]).collect();
                 eprintln!("[pager-dbg] L{layer} sel={sel_host:?} ids={ids:?} remap[sel]={sel_remap:?} cap={} misses={} | pg_gbpe={} ilw_gbpe={} pg_ubpe={} ilw_ubpe={} pg_dbpe={} ilw_dbpe={} gdt={:?} ilw_gdt={:?} ddt={:?} ilw_ddt={:?} pg_nslots={} ilw_nslots={}",
                     crate::het::weights::dgpu_hot_cap(), pg.misses(),
@@ -2690,7 +2690,7 @@ impl HeterogeneousEngine {
             let resident_dbg = std::env::var("V41_PAGER_RESIDENT").is_ok();
             if resident_dbg {
                 let raw: Vec<i32> = (0..N_EXPERT as i32).map(|e| -e - 1).collect();
-                pg.remap_dev.copy_from_host(&raw)?;
+                pg.remap_dev_mut(layer).copy_from_host(&raw)?;
             }
             let (gbuf, ubuf, dbuf) = if resident_dbg {
                 (&ilw.routed.gate.buffer, &ilw.routed.up.buffer, &ilw.routed.down.buffer)
@@ -2710,14 +2710,14 @@ impl HeterogeneousEngine {
                     ie, gdt, s, &mut igpu_scratch.d_mid_cat,
                     gbuf, ubuf,
                     &igpu_scratch.d_xq_q8k, &igpu_scratch.d_ew, &igpu_scratch.d_selected,
-                    &pg.remap_dev, /*mode=*/ 0, hot_cap_i, pg_gbpe, pg_ubpe,
+                    pg.remap_dev(layer), /*mode=*/ 0, hot_cap_i, pg_gbpe, pg_ubpe,
                     N_EXPERT_USED as u32, SWIGLU_CLAMP_EXP, N_FF_EXP, BLOCKS_Q8K_GATE_IN,
                 )?;
                 ie.q8k.launch(s, &mut igpu_scratch.d_midq_cat, &igpu_scratch.d_mid_cat, BLOCKS_Q8K_DOWN_IN * (N_EXPERT_USED as u32))?;
                 super::dispatch::moe_down_batched_hetsplit(
                     ie, ddt, s, &mut igpu_scratch.ffn_moe,
                     dbuf, &igpu_scratch.d_midq_cat, &igpu_scratch.d_selected,
-                    &pg.remap_dev, /*mode=*/ 0, hot_cap_i, pg_dbpe, mid_blocks_bytes as u32,
+                    pg.remap_dev(layer), /*mode=*/ 0, hot_cap_i, pg_dbpe, mid_blocks_bytes as u32,
                     N_EXPERT_USED as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN,
                 )?;
                 Ok(())

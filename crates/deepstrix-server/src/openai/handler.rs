@@ -123,6 +123,21 @@ pub async fn chat_completions(
     State(engine): State<EngineHandle>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
+    // What the CLIENT actually asked for. Without this an empty-content report
+    // cannot be told apart from a too-small budget: "Empty LLM response" is the
+    // documented symptom of `max_tokens` leaving no room after `<think>` (see
+    // DEFAULT_MAX_NEW above), and the request's own cap was invisible in the log.
+    tracing::info!(
+        model = %req.model,
+        max_tokens = ?req.max_tokens,
+        temperature = ?req.temperature,
+        top_p = ?req.top_p,
+        reasoning_effort = ?req.reasoning_effort,
+        n_messages = req.messages.len(),
+        n_tools = req.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+        stream = ?req.stream,
+        "chat request"
+    );
     let stream = req.stream.unwrap_or(false);
 
     // V4-Flash 0731 reasoning effort. Both request fields map to one
