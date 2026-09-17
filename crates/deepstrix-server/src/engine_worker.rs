@@ -3351,6 +3351,27 @@ fn finish_decode(
                     (Some(pg), Some(ec)) => Some(ec.rows_for_chunk(pg.raw(), &toks, pos)?),
                     _ => None,
                 };
+            // `V41_XCHECK_ROWS=2`: per-row verify-vs-decode on the REAL batch.
+            //
+            // The probe form (=1) feeds K copies of the same token, which is not
+            // what a verify sees -- a real batch is [next, d_0..d_k-1], all
+            // distinct -- so its magnitudes were not known to transfer. This
+            // captures decode truth for the ACTUAL drafts, BEFORE the verify
+            // runs, then rolls back so the normal flow is untouched.
+            let mut xrow_truth: Vec<Vec<f32>> = Vec::new();
+            if xcheck_rows_accept() {
+                let nv = v4flash_kernels::config::N_VOCAB as usize;
+                let m0 = state.state.mark_kv();
+                for (j, &t) in toks.iter().enumerate() {
+                    let mut r = vec![0.0f32; v4flash_kernels::config::HC_DIM as usize];
+                    embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, t, &mut r);
+                    forward_one!(state, r, pos + j as u32, t)?;
+                    let mut dl = vec![0.0f32; nv];
+                    state.dgpu_scratch.logits.slice_view(0, nv).copy_to_host(&mut dl)?;
+                    xrow_truth.push(dl);
+                }
+                state.state.rollback_kv(&m0)?;
+            }
             // Compact any slid window to [0, n_raw) so the prefill-path verify
             // attends to the same keys decode does, and the mark records raw_off=0.
             state.engine.normalize_raw_windows(&mut state.dgpu_scratch, &mut state.state)?;
@@ -3665,6 +3686,48 @@ fn finish_decode(
             if n > 0 && std::env::var("V41_DSPARK_FORCE_N0").as_deref() == Ok("1") {
                 n = 0;
                 corrected = row_sample(0, &mut rng);
+            }
+            if !xrow_truth.is_empty() {
+                let nv = v4flash_kernels::config::N_VOCAB as usize;
+                for (j, d) in xrow_truth.iter().enumerate() {
+                    if (j + 1) * nv > logits.len() {
+                        break;
+                    }
+                    let v = &logits[j * nv..(j + 1) * nv];
+                    let am = |x: &[f32]| {
+                        let mut bi = 0usize;
+                        let mut bv = f32::NEG_INFINITY;
+                        for (i, &q) in x.iter().enumerate() {
+                            if q > bv { bv = q; bi = i; }
+                        }
+                        bi
+                    };
+                    let (dmax, vmax) = (
+                        d.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                        v.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+                    );
+                    let (mut dz, mut vz) = (0.0f64, 0.0f64);
+                    for i in 0..nv {
+                        dz += ((d[i] - dmax) as f64).exp();
+                        vz += ((v[i] - vmax) as f64).exp();
+                    }
+                    let (ldz, lvz) = (dz.ln(), vz.ln());
+                    let mut kld = 0.0f64;
+                    for i in 0..nv {
+                        let lp = (d[i] - dmax) as f64 - ldz;
+                        let pq = lp.exp();
+                        if pq > 1e-12 {
+                            kld += pq * (lp - ((v[i] - vmax) as f64 - lvz));
+                        }
+                    }
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let jj = j.min(XROW_MAX - 1);
+                    XROW_N[jj].fetch_add(1, Relaxed);
+                    if am(v) == am(d) {
+                        XROW_OK[jj].fetch_add(1, Relaxed);
+                    }
+                    XROW_KLD[jj].fetch_add((kld * 1e6) as i64, Relaxed);
+                }
             }
             dspark_stats::record_accept(n, k);
             let t_argmax = t_step.elapsed();
@@ -4954,6 +5017,12 @@ static XROW_OK: [std::sync::atomic::AtomicU64; XROW_MAX] =
     [const { std::sync::atomic::AtomicU64::new(0) }; XROW_MAX];
 static XROW_KLD: [std::sync::atomic::AtomicI64; XROW_MAX] =
     [const { std::sync::atomic::AtomicI64::new(0) }; XROW_MAX];
+
+/// `V41_XCHECK_ROWS=2`: the accept-path (real drafts) variant.
+fn xcheck_rows_accept() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("V41_XCHECK_ROWS").as_deref() == Ok("2"))
+}
 
 fn xcheck_rows() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
