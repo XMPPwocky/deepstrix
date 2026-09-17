@@ -1830,6 +1830,72 @@ fn flush_expert_stats(state: &mut WorkerState) {
     if pt == 0 && dt == 0 {
         return;
     }
+    // THIS REQUEST's working set, before it is merged into the cumulative file.
+    //
+    // The on-disk aggregate is fingerprint-keyed and merged across every run, so
+    // reading "distinct experts per layer" out of IT answers a union over
+    // hundreds of varied prompts -- which saturates at 384 and says nothing
+    // about what a cache has to hold for one workload. This harvest is the
+    // per-request set, which is the number that decides whether box 2's slots
+    // are enough.
+    if dt > 0 || pt > 0 {
+        // Harvests fire several times per request (each covers 2-3 tokens), so
+        // OR them into a per-request touched-set; the request-end site reports
+        // it. A single harvest is not the working set.
+        {
+            let mut acc = REQ_TOUCHED.lock().unwrap();
+            if acc.is_empty() {
+                acc.resize(dc.len(), 0u8);
+            }
+            for (i, &v) in dc.iter().enumerate() {
+                if v > 0 {
+                    acc[i] = 1;
+                }
+            }
+            // A DSpark verify runs through the PREFILL driver, so its expert
+            // picks land in `pc`, not `dc`. Measuring only `dc` counts the
+            // handful of non-speculative decode steps and misses the bulk of
+            // the work -- which is what box 2 is actually serving.
+            let mut accp = REQ_TOUCHED_PF.lock().unwrap();
+            if accp.is_empty() {
+                accp.resize(pc.len(), 0u8);
+            }
+            for (i, &v) in pc.iter().enumerate() {
+                if v > 0 {
+                    accp[i] = 1;
+                }
+            }
+        }
+        let ne = v4flash_kernels::config::N_EXPERT as usize;
+        let nl = v4flash_kernels::config::N_LAYER as usize;
+        let mut distinct: Vec<usize> = Vec::with_capacity(nl);
+        let mut cov154: Vec<f64> = Vec::with_capacity(nl);
+        for l in 0..nl {
+            let row = &dc[l * ne..(l + 1) * ne];
+            let tot: u64 = row.iter().map(|&v| v as u64).sum();
+            if tot == 0 {
+                continue;
+            }
+            distinct.push(row.iter().filter(|&&v| v > 0).count());
+            let mut s: Vec<u64> = row.iter().map(|&v| v as u64).collect();
+            s.sort_unstable_by(|a, b| b.cmp(a));
+            let top: u64 = s.iter().take(154).sum();
+            cov154.push(top as f64 / tot as f64);
+        }
+        if !distinct.is_empty() {
+            distinct.sort_unstable();
+            cov154.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med = |v: &Vec<usize>| v[v.len() / 2];
+            tracing::info!(
+                decode_tokens = dt,
+                distinct_per_layer_median = med(&distinct),
+                distinct_per_layer_min = distinct[0],
+                distinct_per_layer_max = distinct[distinct.len() - 1],
+                top154_coverage_median = format!("{:.3}", cov154[cov154.len() / 2]),
+                "expert.working_set (THIS request, not the cumulative file)"
+            );
+        }
+    }
     state.expert_stats.merge_harvest(&pc, pt, &dc, dt);
     if let Err(e) = state.expert_stats.save(&state.expert_stats_path) {
         tracing::warn!("expert_stats save failed: {e}");
@@ -4519,6 +4585,42 @@ fn finish_decode(
             .map(|(b, n, us, by)| format!("b{b}:n={n},link={us:.0}us,bytes={by:.0}"))
             .collect::<Vec<_>>()
             .join(" ");
+        {
+            let mut acc = REQ_TOUCHED.lock().unwrap();
+            if !acc.is_empty() {
+                let ne = v4flash_kernels::config::N_EXPERT as usize;
+                let nl = v4flash_kernels::config::N_LAYER as usize;
+                let mut d: Vec<usize> = (0..nl)
+                    .map(|l| acc[l * ne..(l + 1) * ne].iter().filter(|&&v| v > 0).count())
+                    .filter(|&c| c > 0)
+                    .collect();
+                if !d.is_empty() {
+                    d.sort_unstable();
+                    let mut pf = REQ_TOUCHED_PF.lock().unwrap();
+                    let mut dp: Vec<usize> = if pf.is_empty() {
+                        Vec::new()
+                    } else {
+                        (0..nl)
+                            .map(|l| pf[l * ne..(l + 1) * ne].iter().filter(|&&v| v > 0).count())
+                            .filter(|&c| c > 0)
+                            .collect()
+                    };
+                    dp.sort_unstable();
+                    tracing::info!(
+                        completion_tokens,
+                        decode_distinct_median = d[d.len() / 2],
+                        decode_distinct_max = d[d.len() - 1],
+                        verify_distinct_median = if dp.is_empty() { 0 } else { dp[dp.len() / 2] },
+                        verify_distinct_max = if dp.is_empty() { 0 } else { dp[dp.len() - 1] },
+                        verify_total = dp.iter().sum::<usize>(),
+                        box2_slots_per_layer = 154,
+                        "expert.working_set REQUEST"
+                    );
+                    pf.clear();
+                }
+                acc.clear();
+            }
+        }
         tracing::info!(
             completion_tokens,
             ms_per_tok = format!("{:.2}", wall.as_secs_f64() * 1e3 / completion_tokens.max(1) as f64),
@@ -5081,6 +5183,11 @@ const _: () = {
 /// draft position or the fifth, and those call for completely different work.
 /// `accept[j] / reach[j]` is the per-position accept rate, so `d1` is the
 /// drafter's first-token quality — the number the oracles are stated in.
+/// (layer,expert) touched by the CURRENT request, OR-ed across its harvests.
+static REQ_TOUCHED: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+/// Same, for the PREFILL stream — which is where a DSpark verify's picks land.
+static REQ_TOUCHED_PF: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
 static VERIFY_DIST_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Per-ROW verify-vs-decode agreement. Row 0 was the only row ever checked.
 const XROW_MAX: usize = 8;
