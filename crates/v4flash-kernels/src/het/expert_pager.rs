@@ -191,6 +191,15 @@ pub struct ExpertPager {
     /// Same for the prefill dense path (batched reads + 3 copies per batch).
     pub prefill_read_ns: u64,
     pub prefill_h2d_ns: u64,
+    /// Twins of the decode timers, so `ensure_batched` stops filing PREFILL read
+    /// time under `decode_*` while its miss COUNT goes to `prefill_misses`. That
+    /// mismatch made `decode_read_ms / decode_misses` mix two phases' numerator
+    /// with one phase's denominator and overstated the per-miss cost ~10x.
+    pub prefill_alloc_ns: u64,
+    pub prefill_pread_ns: u64,
+    pub prefill_repack_ns: u64,
+    pub prefill_pread_bytes: u64,
+    pub prefill_repack_gpu_ns: u64,
     /// Union-size distribution per `ensure_layer_union` call. Packing a window
     /// to fewer than `N_EXPERT` slots is only safe if the MAX union fits, so
     /// the max — not the mean — is what sizes a packed window.
@@ -967,6 +976,11 @@ impl ExpertPager {
             decode_n_raw: 0,
             prefill_read_ns: 0,
             prefill_h2d_ns: 0,
+            prefill_alloc_ns: 0,
+            prefill_pread_ns: 0,
+            prefill_repack_ns: 0,
+            prefill_pread_bytes: 0,
+            prefill_repack_gpu_ns: 0,
             union_calls: 0,
             union_sum: 0,
             union_max: 0,
@@ -1376,12 +1390,24 @@ impl ExpertPager {
                 return Err(eyre!("expert pager batched miss read: {e}"));
             }
         }
-        self.decode_read_ns += t_read.elapsed().as_nanos() as u64;
+        // File under the phase this call is serving — `decode_requests` /
+        // `decode_misses` above already do (`count_as_prefill`), and these used
+        // not to, so prefill's read time landed in the decode timers.
         let rp1 = v4flash_core::hf_v41::expert_read_profile();
-        self.decode_alloc_ns += rp1.1 - rp0.1;
-        self.decode_pread_ns += rp1.2 - rp0.2;
-        self.decode_repack_ns += rp1.3 - rp0.3;
-        self.decode_pread_bytes += rp1.4 - rp0.4;
+        let read_ns = t_read.elapsed().as_nanos() as u64;
+        if self.count_as_prefill {
+            self.prefill_read_ns += read_ns;
+            self.prefill_alloc_ns += rp1.1 - rp0.1;
+            self.prefill_pread_ns += rp1.2 - rp0.2;
+            self.prefill_repack_ns += rp1.3 - rp0.3;
+            self.prefill_pread_bytes += rp1.4 - rp0.4;
+        } else {
+            self.decode_read_ns += read_ns;
+            self.decode_alloc_ns += rp1.1 - rp0.1;
+            self.decode_pread_ns += rp1.2 - rp0.2;
+            self.decode_repack_ns += rp1.3 - rp0.3;
+            self.decode_pread_bytes += rp1.4 - rp0.4;
+        }
 
         // --- phase 3: upload + bookkeeping ---
         let t_h2d = std::time::Instant::now();
@@ -1418,8 +1444,14 @@ impl ExpertPager {
             );
             self.remap[id as usize] = -(slot as i32) - 1;
         }
-        self.decode_h2d_ns += t_h2d.elapsed().as_nanos() as u64;
-        self.decode_repack_gpu_ns += gpu_ns;
+        let h2d_ns = t_h2d.elapsed().as_nanos() as u64;
+        if self.count_as_prefill {
+            self.prefill_h2d_ns += h2d_ns;
+            self.prefill_repack_gpu_ns += gpu_ns;
+        } else {
+            self.decode_h2d_ns += h2d_ns;
+            self.decode_repack_gpu_ns += gpu_ns;
+        }
         self.upload_remap()?;
         Ok(&self.remap)
     }
