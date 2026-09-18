@@ -1646,6 +1646,15 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                     if n > 0 {
                         tracing::warn!(drained = n, "remote expert client: drained in-flight tickets after request error");
                     }
+                    // The error may BE the link dying (a box-2 error closes the
+                    // socket, the writer thread exits, and `tx_req` is closed for
+                    // good). Redial here, at the request boundary with nothing in
+                    // flight, or every later request 500s until a manual restart.
+                    match state.engine.remote_reconnect_if_dead() {
+                        Ok(true) => tracing::warn!("remote expert client: link was dead, reconnected"),
+                        Ok(false) => {}
+                        Err(e) => tracing::error!(error = %e, "remote expert client: reconnect FAILED; later requests will fail until box 2 is reachable"),
+                    }
                 }
                 // Engine-side end-to-end wall for the request (prefill + decode
                 // loop + snapshot saves). `e2e_ms - decode.loop.summary.loop_ms`

@@ -475,6 +475,22 @@ fn connect_remote_experts() -> Option<std::sync::Mutex<super::remote_experts::Re
 
 impl HeterogeneousEngine {
     /// See `RemoteExpertClient::drain_in_flight`. Returns the number drained.
+    /// Redial box 2 if the link is known broken. Called at a request BOUNDARY,
+    /// where nothing is in flight. Returns Ok(false) if no reconnect was needed.
+    ///
+    /// Without this a single box-2 error is a permanent outage: the writer thread
+    /// exits on the broken pipe and every later submit fails, so the process
+    /// serves 500s until someone restarts it by hand.
+    pub fn remote_reconnect_if_dead(&self) -> eyre::Result<bool> {
+        let Some(m) = self.remote.as_ref() else { return Ok(false) };
+        let Ok(mut c) = m.lock() else { return Ok(false) };
+        if !c.is_dead() {
+            return Ok(false);
+        }
+        c.ensure_connected()?;
+        Ok(true)
+    }
+
     pub fn remote_drain_in_flight(&self) -> usize {
         self.remote
             .as_ref()

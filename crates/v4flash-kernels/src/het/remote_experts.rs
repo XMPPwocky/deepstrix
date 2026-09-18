@@ -3374,6 +3374,16 @@ enum ClientInbound {
 }
 
 pub struct RemoteExpertClient {
+    /// Redial material. The link is the ONLY path to half the experts, so losing
+    /// it used to end the process's usefulness: the writer thread exits on a
+    /// broken pipe, `tx_req` closes, and every later submit fails forever. One
+    /// box-2 error became a permanent outage needing a manual restart.
+    addr: String,
+    opts: SocketOptions,
+    /// Set when the link is known broken. The request that discovers it still
+    /// fails -- its in-flight tickets can never be answered -- but the NEXT
+    /// request redials instead of inheriting the corpse.
+    dead: bool,
     info: ShardInfo,
     stream: TcpStream,
     tx_req: Option<mpsc::SyncSender<AlignedBuf>>,
@@ -3391,7 +3401,30 @@ pub struct RemoteExpertClient {
 
 impl RemoteExpertClient {
     /// Connect, apply the transport recipe, read the daemon's HELLO.
-    pub fn connect(addr: impl ToSocketAddrs, opts: &SocketOptions) -> eyre::Result<Self> {
+    /// Redial if the link is known broken. Call at the START of a request, when
+    /// nothing is in flight — never mid-request, since the old socket's in-flight
+    /// tickets are unanswerable and a fresh HELLO may report different ownership.
+    ///
+    /// Rebuilding the whole client is deliberate: a new connection means a new
+    /// HELLO, so ownership, geometry and the clock pair must all be re-read
+    /// rather than carried over.
+    pub fn ensure_connected(&mut self) -> eyre::Result<()> {
+        if !self.dead {
+            return Ok(());
+        }
+        let fresh = Self::connect(&self.addr, &self.opts.clone())?;
+        // Dropping the old value closes its channel and joins its threads.
+        *self = fresh;
+        eprintln!("remote_experts: reconnected to {}", self.addr);
+        Ok(())
+    }
+
+    /// Is the link known broken? (Next request will redial.)
+    pub fn is_dead(&self) -> bool {
+        self.dead
+    }
+
+    pub fn connect(addr: &str, opts: &SocketOptions) -> eyre::Result<Self> {
         let stream = TcpStream::connect(addr)?;
         apply_socket_options(&stream, opts)?;
         let mut rd = stream.try_clone()?;
@@ -3456,6 +3489,9 @@ impl RemoteExpertClient {
         // still rejecting a queued outlier.
         let clock = ClockSync::new(info.clock, 32, 200_000);
         Ok(Self {
+            addr: addr.to_string(),
+            opts: opts.clone(),
+            dead: false,
             sel_scratch: vec![NO_PICK; info.max_batch as usize * nu],
             ew_scratch: vec![0.0; info.max_batch as usize * nu],
             clock,
@@ -3628,7 +3664,17 @@ impl RemoteExpertClient {
             &self.sel_scratch[..b * nu], &self.ew_scratch[..b * nu], (&ha, &he),
         );
         let ticket = Ticket { seq, layer, b: b as u32, bytes_out: buf.len(), t_submit: Instant::now() };
-        self.tx_req.as_ref().ok_or_else(|| eyre!("client closed"))?.send(buf).map_err(|_| eyre!("writer thread gone"))?;
+        let sent = match self.tx_req.as_ref() {
+            Some(tx) => tx.send(buf).map_err(|_| eyre!("writer thread gone")),
+            None => Err(eyre!("client closed")),
+        };
+        if let Err(e) = sent {
+            // Do NOT redial here: this request's earlier layers are already in
+            // flight on the old socket and can never be reconciled. Fail it, and
+            // let the next request start clean.
+            self.dead = true;
+            return Err(e);
+        }
         self.in_flight.push_back(ticket);
         Ok(Some(ticket))
     }
@@ -3642,8 +3688,17 @@ impl RemoteExpertClient {
         }
         let (buf, t_recv, t4) = match self.rx_resp.recv() {
             Ok(ClientInbound::Resp { buf, t_recv, t4 }) => (buf, t_recv, t4),
-            Ok(ClientInbound::Err(e)) => return Err(eyre!("remote connection: {e}")),
-            Err(_) => return Err(eyre!("reader thread gone")),
+            // Both arms mean the socket is gone, not that this reply was bad, so
+            // the link must be redialed before the next request rather than
+            // inherited: see `ensure_connected`.
+            Ok(ClientInbound::Err(e)) => {
+                self.dead = true;
+                return Err(eyre!("remote connection: {e}"));
+            }
+            Err(_) => {
+                self.dead = true;
+                return Err(eyre!("reader thread gone"));
+            }
         };
         let h = proto::parse_header(buf.as_bytes())?;
         if h.kind == proto::KIND_ERROR {
