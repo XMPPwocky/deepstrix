@@ -102,14 +102,45 @@ pub const ATTN_SCORES_STRIDE: u32 = 3072;
 /// Does the CSA indexer gather layers of this compress ratio down to a dense
 /// `INDEXER_TOP_K` buffer before attention scores them?
 ///
-/// Only V4-Flash's ratio-4 layers. V4.1's indexer is unported (and
-/// structurally different: 8 index-source layers, keys on the 4 kv-source
-/// layers, plus the layer-20 candidate pool — ARCH_SPEC 1.4/1.5), so every
-/// V4.1 compressed layer is scored densely over its whole store. Keep this
-/// in lockstep with the `use_sparse` / `need_mask` gates in
-/// `het::forward_layer` and `het::forward_prefill`.
+/// Only V4-Flash's ratio-4 layers. This is the V4-FLASH predicate and stays that
+/// way; for "is this layer's score count bounded by the top-k", which is what
+/// sizing wants and which IS true for V4.1 under S2, use
+/// [`scored_keys_are_gathered`]. (Corrected 2026-09-18: the note here used to say
+/// V4.1's indexer was unported and every V4.1 layer scored densely. S1+S2 landed;
+/// it does not.)
 pub fn indexer_gathers(ratio: u32) -> bool {
     !cfg!(feature = "v41") && ratio == 4
+}
+
+/// `V41_INDEX_K=1` — mirror of `het::forward_layer::index_k_enabled`, needed here
+/// because SIZING has to agree with the runtime gate.
+fn v41_index_k_on() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(std::env::var("V41_INDEX_K").as_deref(), Ok("1") | Ok("on"))
+    });
+    *B
+}
+
+/// SIZING predicate: is every compressed layer's score count bounded by
+/// `INDEXER_TOP_K` rather than by its whole store?
+///
+/// True for V4.1 with the indexer on. S2 is implemented: index sources gather to
+/// top-k and reuse layers take that same selection (`s2_reuse` in
+/// `het::forward_layer` / `het::forward_prefill`), matching the reference
+/// `inference/model.py`, whose `_compress_topk_idxs` returns
+/// `shared_attn.topk_idxs` for every non-source layer and which has NO dense
+/// attention path at all.
+///
+/// Dense still runs below the threshold, where the reference itself takes
+/// `topk = min(index_topk, end_pos // ratio)` — so at most `INDEXER_TOP_K` keys
+/// are scored either way, and this bound holds for both paths.
+///
+/// Keep in lockstep with the `use_sparse` / `s2_reuse` gates.
+pub fn scored_keys_are_gathered(ratio: u32) -> bool {
+    if cfg!(feature = "v41") {
+        return ratio > 0 && v41_index_k_on();
+    }
+    indexer_gathers(ratio)
 }
 
 /// Can the CSA indexer fire on ANY layer of this model? False for V4.1
@@ -120,11 +151,13 @@ pub fn indexer_gathers(ratio: u32) -> bool {
 /// ported indexer is switched on with `V41_INDEX_K=1`, which is what decides whether the
 /// per-token indexer SCRATCH must be allocated.
 ///
-/// Deliberately NOT used by `attn_max_scored_keys`: under V4.1 only the 8
-/// `index_source_layer_ids` gather; the other 32 layers still score their whole store,
-/// so the scores-scratch and `--ctx` caps must stay dense-sized until S2 (shared
-/// selection) makes reuse layers sparse too. Sizing those off this predicate would
-/// under-allocate and read past the end.
+/// STALE, corrected 2026-09-18: S2 landed, so the reuse layers do NOT score their
+/// whole store — they take their index source's selection (`s2_reuse`). Sizing now
+/// goes through [`scored_keys_are_gathered`], which is true for every compressed
+/// V4.1 layer when `V41_INDEX_K=1`, so the scores-scratch and the `--ctx` cap are
+/// bounded by `raw_window + INDEXER_TOP_K` rather than `n_kv_max / ratio`. This
+/// predicate stays separate because it answers a different question: whether the
+/// per-token indexer SCRATCH must exist at all.
 pub fn indexer_scratch_needed() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         indexer_ever_fires()
@@ -160,7 +193,7 @@ pub fn attn_max_scored_keys(n_kv_max: u32, raw_window: u32) -> u32 {
             continue;
         }
         let n_comp = n_kv_max.div_ceil(ratio);
-        let scored = if indexer_gathers(ratio) {
+        let scored = if scored_keys_are_gathered(ratio) {
             n_comp.min(crate::config::INDEXER_TOP_K)
         } else {
             n_comp
@@ -177,7 +210,7 @@ pub fn attn_max_ctx_for_keys(keys: u32, raw_window: u32) -> u32 {
     let budget = keys.saturating_sub(raw_window);
     let mut min_ratio = u32::MAX;
     for &ratio in crate::config::COMPRESS_RATIOS.iter() {
-        if ratio == 0 || indexer_gathers(ratio) {
+        if ratio == 0 || scored_keys_are_gathered(ratio) {
             continue;
         }
         min_ratio = min_ratio.min(ratio);

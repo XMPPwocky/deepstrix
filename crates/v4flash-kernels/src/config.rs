@@ -148,6 +148,32 @@ pub const KV_SOURCE_LAYERS: &[i32] = &[2, 8, 14, 20];
 pub const INDEX_SOURCE_LAYERS: &[i32] = &[2, 8, 14, 20, 24, 28, 32, 36];
 #[cfg(feature = "v41")]
 pub const ENGRAM_LAYERS: &[i32] = &[1, 14];
+
+/// The index source whose top-k selection `layer` attends to: the nearest
+/// index-source layer at or below it. Reference `model.py::_compress_topk_idxs`
+/// — "index sources run their own indexer; the layers in between reuse the
+/// result their source published", i.e. the MOST RECENT source, not the KV one.
+///
+/// Distinct from [`kv_source_of`] on purpose. Layers 20/24/28/32/36 are all
+/// index sources but share KV source 20, so keying a published selection on the
+/// KV source cannot tell them apart and a reuse layer could silently consume an
+/// older source's selection.
+#[cfg(feature = "v41")]
+pub fn index_source_of(layer: usize) -> Option<usize> {
+    if COMPRESS_RATIOS[layer] == 0 {
+        return None;
+    }
+    INDEX_SOURCE_LAYERS
+        .iter()
+        .copied()
+        .filter(|&s| (s as usize) <= layer)
+        .max()
+        .map(|s| s as usize)
+}
+#[cfg(not(feature = "v41"))]
+pub fn index_source_of(_layer: usize) -> Option<usize> {
+    None
+}
 /// V4.1 Causal Encoder-Decoder split (tech report §2.2): layers below are the
 /// causal encoder; this layer is the decoder's Full-mode layer whose global KV
 /// is projected from the final encoder hidden state. CED prefill runs the

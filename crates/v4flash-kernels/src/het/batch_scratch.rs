@@ -1166,7 +1166,7 @@ pub fn attn_scores_capacity_keys(rows: usize, n_kv_max: u32) -> usize {
         if ratio == 0 {
             continue;
         }
-        let keys = if crate::attention::indexer_gathers(ratio) {
+        let keys = if crate::attention::scored_keys_are_gathered(ratio) {
             w + crate::config::INDEXER_TOP_K
         } else {
             w + n_kv_max.div_ceil(ratio)

@@ -1715,8 +1715,12 @@ impl HeterogeneousEngine {
                 }
                 // S2: publish this source's gather so the reuse layers below can use it.
                 if keys_v41.is_some() {
-                    let store = crate::config::kv_source_of(layer as usize)
+                    // Keyed on the INDEX source (this layer, since only an index
+                    // source gathers), NOT the KV source: 20/24/28/32/36 all share
+                    // KV source 20, so a KV key cannot say which of them published.
+                    let store = crate::config::index_source_of(layer as usize)
                         .unwrap_or(layer as usize) as i32;
+                    debug_assert_eq!(store, layer, "only an index source publishes a gather");
                     self.last_idx_gather_src
                         .store(store, std::sync::atomic::Ordering::Relaxed);
                     self.last_idx_gather_rows.store(
@@ -1740,7 +1744,7 @@ impl HeterogeneousEngine {
                 && !is_index_source_layer(layer)
                 && n_comp_full > 0
                 && {
-                    let store = crate::config::kv_source_of(layer as usize)
+                    let store = crate::config::index_source_of(layer as usize)
                         .unwrap_or(layer as usize) as i32;
                     self.last_idx_gather_src.load(std::sync::atomic::Ordering::Relaxed) == store
                 };

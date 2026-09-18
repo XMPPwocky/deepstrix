@@ -3455,7 +3455,7 @@ impl HeterogeneousEngine {
                 && ls.compressor.is_some()
                 && bd.indexer_saved_store >= 0
                 && bd.indexer_saved_store
-                    == crate::config::kv_source_of(layer as usize).unwrap_or(layer as usize) as i32
+                    == crate::config::index_source_of(layer as usize).unwrap_or(layer as usize) as i32
                 && n_comp_after.iter().any(|&v| v > 0);
             let need_mask = if v41_idx_keys.is_some() {
                 n_comp_after.iter().any(|&v| v > if v41_force { 0 } else { INDEXER_TOP_K })
@@ -3742,7 +3742,8 @@ impl HeterogeneousEngine {
                 // S2: publish which store group this selection belongs to, for the reuse
                 // layers that follow in THIS lane.
                 if v41_idx_keys.is_some() {
-                    bd.indexer_saved_store = crate::config::kv_source_of(layer as usize)
+                    // INDEX source, not KV source — see `config::index_source_of`.
+                    bd.indexer_saved_store = crate::config::index_source_of(layer as usize)
                         .unwrap_or(layer as usize) as i32;
                 }
                 _t_ix.end()?;
