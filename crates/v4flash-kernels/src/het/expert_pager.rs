@@ -1342,6 +1342,8 @@ impl ExpertPager {
         }
         let t_read = std::time::Instant::now();
         let rp0 = v4flash_core::hf_v41::expert_read_profile();
+        let sp0 = v4flash_core::hf_v41::expert_read_split();
+        let pa0 = v4flash_core::hf_v41::expert_read_paths();
         let gpu_repack = self.repack.is_some();
         {
             let owner = &self.owner;
@@ -1394,7 +1396,21 @@ impl ExpertPager {
         // `decode_misses` above already do (`count_as_prefill`), and these used
         // not to, so prefill's read time landed in the decode timers.
         let rp1 = v4flash_core::hf_v41::expert_read_profile();
+        let sp1 = v4flash_core::hf_v41::expert_read_split();
+        let pa1 = v4flash_core::hf_v41::expert_read_paths();
         let read_ns = t_read.elapsed().as_nanos() as u64;
+        if !self.count_as_prefill {
+            // Same split the non-batched `ensure` records, so weight+scale
+            // account for ALL decode misses instead of only the per-role path.
+            self.decode_weight_ns += sp1.0 - sp0.0;
+            self.decode_weight_bytes += sp1.1 - sp0.1;
+            self.decode_scale_ns += sp1.2 - sp0.2;
+            self.decode_scale_bytes += sp1.3 - sp0.3;
+            self.decode_n_layout += pa1.0 - pa0.0;
+            self.decode_n_runs += pa1.1 - pa0.1;
+            self.decode_n_direct += pa1.2 - pa0.2;
+            self.decode_n_raw += pa1.3 - pa0.3;
+        }
         if self.count_as_prefill {
             self.prefill_read_ns += read_ns;
             self.prefill_alloc_ns += rp1.1 - rp0.1;
