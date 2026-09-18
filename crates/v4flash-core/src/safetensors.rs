@@ -296,6 +296,33 @@ impl SafetensorsDir {
         Ok(())
     }
 
+    /// Ask the kernel to pull this tensor's bytes into the page cache, without
+    /// waiting for them. A hint only: no correctness depends on it, every error
+    /// is swallowed, and the pages may be reclaimed before anyone reads them.
+    ///
+    /// This is the whole mechanism behind prefill read-ahead. It is safe in the
+    /// way a device-side prefetch is not: it touches no pool slot, no remap and
+    /// no LRU, so it cannot race an MoE kernel that is still queued on the
+    /// layer we are running ahead of, and it cannot evict a resident expert.
+    /// The only thing it can cost is page cache.
+    ///
+    /// Useless under `O_DIRECT` (which bypasses the page cache) -- the caller is
+    /// responsible for not bothering when `expert_odirect()` is on.
+    pub fn willneed(&self, t: &StTensor) -> bool {
+        let Some(file) = self.files.get(t.shard) else { return false };
+        // SAFETY: fd is owned by `self` and outlives the call; fadvise only
+        // advises the page cache and never writes through the pointer-free API.
+        let rc = unsafe {
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                t.offset as libc::off_t,
+                t.len as libc::off_t,
+                libc::POSIX_FADV_WILLNEED,
+            )
+        };
+        rc == 0
+    }
+
     /// `read_range_into_cached` through an `O_DIRECT` handle.
     ///
     /// WHY. The buffered path was chosen so the pager's LRU refills could hit the

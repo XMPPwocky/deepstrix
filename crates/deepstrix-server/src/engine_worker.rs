@@ -1193,6 +1193,9 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         if v4flash_kernels::het::expert_pager::b1_prefetch() {
             pg.start_prefetcher(std::path::Path::new(&cfg.gguf_path))?;
         }
+        if v4flash_kernels::het::expert_pager::prefill_readahead() {
+            pg.start_readahead(std::path::Path::new(&cfg.gguf_path))?;
+        }
         tracing::info!(elapsed_s = t0.elapsed().as_secs_f64(), "expert pager ready");
         Some(pg)
     } else {
@@ -1721,6 +1724,7 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                     let cum = pg.counters();
                     let d = cum - pager_c0;
                     let rate = |m: u64, r: u64| if r > 0 { 1.0 - m as f64 / r as f64 } else { f64::NAN };
+                    let ra = pg.readahead_stats();
                     tracing::info!(
                         prefill_requests = d.prefill_requests,
                         prefill_misses = d.prefill_misses,
@@ -1734,6 +1738,14 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                         // overlapping prefill's paging is worth building, so
                         // emit it next to decode's twin rather than making the
                         // reader divide two fields that were not comparable.
+                        // Read-ahead is ADVISORY: nothing fails if the kernel
+                        // ignores it, so it must be observable or you cannot
+                        // tell a working hint from a dead one. `ra_ranges` is
+                        // fadvise calls the kernel accepted; `ra_dropped` is
+                        // hints the queue refused (prefill never blocks on one).
+                        ra_queued = ra.map(|r| r.0).unwrap_or(0),
+                        ra_dropped = ra.map(|r| r.1).unwrap_or(0),
+                        ra_ranges = ra.map(|r| r.2).unwrap_or(0),
                         prefill_ms_per_miss = if d.prefill_misses > 0 {
                             (d.prefill_read_ns + d.prefill_h2d_ns) as f64
                                 / d.prefill_misses as f64

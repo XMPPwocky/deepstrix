@@ -5114,6 +5114,27 @@ impl HeterogeneousEngine {
                     let d = pg.counters().prefill_misses.saturating_sub(mc0);
                     LAYER_MISS[layer as usize].fetch_add(d, std::sync::atomic::Ordering::Relaxed);
                 }
+                // Prefill READ-AHEAD (`V41_PREFILL_READAHEAD=1`, default off).
+                // This layer's `ensure` is done and its MoE is about to be
+                // issued, so a hint fired here has that whole layer's compute as
+                // lead time -- the most this loop can give without predicting
+                // anything. Only NON-RESIDENT owned experts are hinted, so the
+                // volume is the miss set, not the layer.
+                //
+                // It is a page-cache hint, never a pool admission: layer L's MoE
+                // may still be queued against the very slots a device-side
+                // prefetch of L+1 would evict, which is silent wrong output (the
+                // hazard `V41_SPARSE_REMAP_SYNC` exists for). See
+                // `ExpertPager::readahead_layer`.
+                if super::expert_pager::prefill_readahead() {
+                    let ahead = layer as i32 + pg.readahead_depth();
+                    // The SAME ownership predicate the target layer's dispatch
+                    // will use, or the hint warms bytes box 2 reads.
+                    let split = remote_split_on && super::expert_pager::t2_partition();
+                    pg.readahead_layer(ahead, |e| {
+                        split && super::expert_pager::partition_box2(ahead, e)
+                    });
+                }
                 if remote_split_on && !owns_eff.is_empty() {
                         // The exclusion builder MUST match the allocator above.
                         // `set_remote_exclusion` rebuilds the whole remap from

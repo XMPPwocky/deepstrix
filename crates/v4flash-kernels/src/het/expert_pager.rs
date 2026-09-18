@@ -236,6 +236,7 @@ pub struct ExpertPager {
     /// Box 1 as L1: background reader that fills the decode LRU from this box's
     /// own disk OFF the critical path (`V41_B1_PREFETCH=1`). See [`Prefetcher`].
     prefetch: Option<Prefetcher>,
+    readahead: Option<Readahead>,
     repack_stream: Option<Stream>,
     pub decode_repack_gpu_ns: u64,
 }
@@ -555,7 +556,154 @@ struct Prefetcher {
 /// host staging at most.
 const PREFETCH_INFLIGHT_MAX: usize = 64;
 
+/// `V41_PREFILL_READAHEAD=1`: while layer L's MoE runs, ask the page cache to
+/// pull in the experts layer L+d is about to miss on. Default OFF so it A/Bs in
+/// one binary.
+///
+/// WHY THIS SHAPE, and not a device-side prefetch. Prefill's per-layer `ensure`
+/// is synchronous on the host, and its cost is dominated by a BUFFERED pread
+/// (`V41_EXPERT_ODIRECT` is off on box 1). A device-side prefetch of layer L+1
+/// would have to allocate pool slots and evict, which cannot be done while
+/// layer L's MoE kernel may still be queued against those very slots -- the
+/// same hazard `V41_SPARSE_REMAP_SYNC` exists for, and silent wrong output if
+/// you get it wrong. A page-cache hint touches no slot, no remap and no LRU, so
+/// it is safe by construction and its worst case is wasted page cache.
+///
+/// Only the NON-RESIDENT owned experts are hinted, so the volume is the miss
+/// set (prefill hit is ~0.89), not the whole layer. That the union is worth
+/// hinting at all is measured: one 512-row chunk touches ~83% of an ENCODER
+/// layer's experts, so "everything this layer owns" is a tight over-estimate of
+/// "everything this layer will ask for". Decoder layers 20-39 touch 28-40% and
+/// are hinted too, just with worse precision. See
+/// `docs/v41/PREFETCH_STUDY_2026-09-18.md`.
+pub fn prefill_readahead() -> bool {
+    static B: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_PREFILL_READAHEAD").as_deref() == Ok("1"));
+    *B
+}
+
+/// `V41_PREFILL_READAHEAD_DEPTH=N`: how many layers ahead to hint (default 1).
+/// Deeper buys more lead time and costs more page cache; box 1 runs a 78 GB
+/// pool in 93 GB of RAM, so there is not much of it to spend.
+fn prefill_readahead_depth() -> i32 {
+    static N: std::sync::LazyLock<i32> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_PREFILL_READAHEAD_DEPTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    });
+    (*N).max(1)
+}
+
+/// Queue depth for the read-ahead thread. A full queue DROPS the hint rather
+/// than blocking prefill: the hint is advisory, and a prefill host thread that
+/// waits on a hint has inverted the entire point of this.
+const READAHEAD_QUEUE: usize = 4096;
+
+/// fadvise ranges the kernel accepted, cumulative. See `readahead_stats`.
+static READAHEAD_RANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct Readahead {
+    tx: std::sync::mpsc::SyncSender<(i32, u32)>,
+    queued: u64,
+    dropped_full: u64,
+}
+
 impl ExpertPager {
+    /// Start the prefill read-ahead thread. Like [`Self::start_prefetcher`] it
+    /// opens a SECOND handle on the HF dir, so it never touches the pager's own
+    /// source and needs no lock against it.
+    ///
+    /// No-op when `V41_EXPERT_ODIRECT=1`: O_DIRECT bypasses the page cache, so
+    /// a `WILLNEED` hint on that data warms something nobody will read.
+    pub fn start_readahead(&mut self, dir: &std::path::Path) -> eyre::Result<()> {
+        if v4flash_core::hf_v41::expert_odirect() {
+            eprintln!(
+                "expert pager: prefill read-ahead requested but V41_EXPERT_ODIRECT=1 \
+                 bypasses the page cache; NOT started"
+            );
+            return Ok(());
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(i32, u32)>(READAHEAD_QUEUE);
+        let dir = dir.to_path_buf();
+        std::thread::Builder::new()
+            .name("b1-readahead".into())
+            .spawn(move || {
+                let owner = match V41HfWeights::open(&dir, None) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eprintln!(
+                            "b1-readahead: cannot open {}: {e:#}; read-ahead disabled",
+                            dir.display()
+                        );
+                        return;
+                    }
+                };
+                let src = WeightSrc::from(&owner);
+                // `posix_fadvise(WILLNEED)` submits the reads and returns, but it
+                // still allocates page-cache pages and can stall under reclaim --
+                // which is exactly why it runs here and not on the prefill thread.
+                while let Ok((layer, id)) = rx.recv() {
+                    for which in ["gate", "up", "down"] {
+                        let name = format!("blk.{layer}.ffn_{which}_exps.weight");
+                        let Some(t) = src.tensor(&name) else { continue };
+                        let n = src.willneed_expert(t, id as usize).unwrap_or(0);
+                        READAHEAD_RANGES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            })?;
+        self.readahead = Some(Readahead { tx, queued: 0, dropped_full: 0 });
+        eprintln!(
+            "expert pager: prefill READ-AHEAD ON (depth {} layer(s), queue {})",
+            prefill_readahead_depth(),
+            READAHEAD_QUEUE
+        );
+        Ok(())
+    }
+
+    /// Hint every expert of `layer` that this box OWNS and does not already
+    /// hold. Called from the prefill loop `depth` layers before the one that
+    /// needs them; never blocks (a full queue drops the hint).
+    ///
+    /// `box2_owns` must be the SAME ownership predicate the layer's own
+    /// dispatch will use, or the hint warms bytes the other box will read.
+    pub fn readahead_layer(&mut self, layer: i32, box2_owns: impl Fn(u32) -> bool) {
+        if layer < 0 || layer >= crate::config::N_LAYER {
+            return;
+        }
+        // Read the residency map BEFORE borrowing `readahead` mutably; only the
+        // misses are worth a hint, which is what keeps the volume at the miss
+        // set (~11% of the layer) instead of the whole layer.
+        let want: Vec<u32> = (0..N_EXPERT)
+            .filter(|&e| !box2_owns(e) && !self.is_resident(layer, e))
+            .collect();
+        let Some(ra) = self.readahead.as_mut() else { return };
+        for e in want {
+            match ra.tx.try_send((layer, e)) {
+                Ok(()) => ra.queued += 1,
+                Err(_) => ra.dropped_full += 1,
+            }
+        }
+    }
+
+    /// `(queued, dropped_full, ranges_accepted)` — `None` if read-ahead is off.
+    /// `ranges_accepted` counts fadvise calls the kernel took, so a hint that is
+    /// silently doing nothing is visible rather than assumed to be working.
+    pub fn readahead_stats(&self) -> Option<(u64, u64, u64)> {
+        self.readahead.as_ref().map(|r| {
+            (
+                r.queued,
+                r.dropped_full,
+                READAHEAD_RANGES.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+    }
+
+    /// How many layers ahead the prefill loop should hint.
+    pub fn readahead_depth(&self) -> i32 {
+        prefill_readahead_depth()
+    }
+
     /// Start the background reader. Opens a SECOND handle on the HF dir so the
     /// thread never touches the pager's own source.
     pub fn start_prefetcher(&mut self, dir: &std::path::Path) -> eyre::Result<()> {
@@ -1025,6 +1173,7 @@ impl ExpertPager {
             repack_stream,
             decode_repack_gpu_ns: 0,
             prefetch: None,
+            readahead: None,
         })
     }
 

@@ -136,7 +136,51 @@ residency hints were added to buy. It has not been A/B'd since.
 Expected: removes blocking disk from decode; costs box-2 link traffic and
 ~1.3 ms x 8 admissions per token of H2D. Needs a back-to-back A/B, one binary.
 
-### b. Prefill: layer-ahead paging needs no prediction
+### b. Prefill layer-ahead — BUILT, and MEASURED INERT ON BOX 1
+
+Implemented behind `V41_PREFILL_READAHEAD=1` (default off) as a page-cache
+hint, not a device-side prefetch: a background thread fadvises `WILLNEED` on
+the byte ranges layer L+d will miss on, while layer L's MoE runs. It touches no
+pool slot, no remap and no LRU, so it cannot race the queued MoE kernel of the
+layer it runs ahead of, and cannot evict a resident expert.
+
+**It cannot pay on box 1 as configured, and the reason is one number:**
+
+    total 93 GB   used 92 GB   buff/cache 1.5 GB   available 1.1 GB
+
+A 78 GB pager pool on a 93 GB box leaves ~1.5 GB of page cache against 289 GB
+of experts (0.5%). There is nowhere to read ahead *into* — a hinted page is
+reclaimed long before the layer that wants it arrives. The code is committed
+because it is correct, safe and default-off, and becomes live on any box with
+real page cache; **do not enable it here expecting a win.**
+
+The premise that motivated it still holds and is worth recording: one 512-row
+chunk touches ~83% of an ENCODER layer's experts, so a layer-ahead fill needs
+no prediction at all. It is the *destination* that is missing, not the signal.
+
+### b2. O_DIRECT on box 1 — TESTED, NOT A WIN (1.01x)
+
+The same 1.5 GB page cache suggests box 1 should take box 2's `O_DIRECT` path
+(box 2 measured 4.70 ms vs 12.55 ms buffered for one expert, 2.7x). It does
+not transplant. Alternating arms read-by-read with a FRESH random offset every
+read, so no read ever warms another, 18.8 MB each, box under live load:
+
+    buffered   min 10.21  p50 15.89  p90 56.17  max 102.06 ms   (1.19 GB/s)
+    O_DIRECT   min 10.02  p50 15.78  p90 38.57  max  57.00 ms   (1.20 GB/s)
+
+**1.01x at p50**; only the tail improves (p90 1.46x, max 1.79x). A first pass
+that reused offsets across arms showed "buffered 40.97 -> 5.08 ms" and was
+pure self-warming — the arms shared page cache. Worth knowing the tail is
+tighter, not worth a default change on this evidence.
+
+Note production's live `ms_per_miss` is 8.85 ms, FASTER than either arm here:
+it splits one expert across `V41_EXPERT_PREAD_THREADS=8`. The read path is
+already close to what this drive gives under load, which is the argument for
+moving the read OFF the critical path rather than trying to make it quicker.
+
+### b3. Prefill: the signal, for whoever has the RAM
+
+
 
 Distinct experts touched by ONE 512-row chunk at ONE layer:
 

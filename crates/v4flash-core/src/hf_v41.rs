@@ -807,6 +807,30 @@ impl V41HfWeights {
         Ok(())
     }
 
+    /// Page-cache read-ahead for one expert of a stacked tensor: hint the same
+    /// two ranges [`Self::read_expert_hf_layout`] will pread (the packed weight
+    /// and its e8m0 scale), and return without waiting.
+    ///
+    /// Advisory in the strongest sense -- a miss after this is simply a normal
+    /// miss. Returns the number of ranges the kernel accepted, for the counter
+    /// that tells you whether the hint is doing anything at all.
+    pub fn willneed_expert(&self, vt: &VTensor, e: usize) -> eyre::Result<usize> {
+        let Kind::Experts { prefix, which, n } = &vt.kind else {
+            return Err(eyre!("{}: not a stacked expert tensor", vt.name));
+        };
+        if e >= *n {
+            return Err(eyre!("{}: expert {e} >= {n}", vt.name));
+        }
+        let p = format!("{prefix}{e}.{which}.");
+        let mut ok = 0;
+        for suffix in ["weight", "scale"] {
+            if let Ok(t) = self.st.get(&format!("{p}{suffix}")) {
+                ok += usize::from(self.st.willneed(t));
+            }
+        }
+        Ok(ok)
+    }
+
     /// Staging bytes [`Self::read_expert_hf_layout_direct`] needs for one role.
     pub fn hf_layout_direct_capacity(&self, vt: &VTensor) -> eyre::Result<usize> {
         let (packed, scale) = self.hf_layout_parts(vt)?;

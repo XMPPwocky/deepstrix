@@ -97,6 +97,16 @@ impl<'a> WeightSrc<'a> {
         }
     }
 
+    /// Page-cache read-ahead for one expert. `Ok(0)` where the source has no
+    /// such notion (a GGUF is mapped, not pread) or the kernel refused. Pure
+    /// hint: never blocks on I/O, never affects correctness.
+    pub fn willneed_expert(&self, t: &GgufTensor, e: usize) -> eyre::Result<usize> {
+        match *self {
+            Self::Gguf(_) => Ok(0),
+            Self::V41(v) => v.willneed_expert(v.get(&t.name)?, e),
+        }
+    }
+
     /// Zero-copy O_DIRECT HF-layout expert read into padded, 4096-aligned
     /// staging. `Ok(None)` = unavailable (GGUF source, or no O_DIRECT handle);
     /// the caller must fall back to [`Self::read_expert_hf_layout`].
