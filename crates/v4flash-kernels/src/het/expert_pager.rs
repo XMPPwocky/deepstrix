@@ -411,6 +411,18 @@ fn pager_coalesce() -> bool {
     *B
 }
 
+/// `V41_PAGER_COALESCE_CHECK=1`: after a coalesced read, re-read the SAME expert
+/// per-role and compare byte for byte. Mirrors box 2's `V41_B2_COALESCE_CHECK`,
+/// which exists because coalescing was once bisected to a CORRUPTION there —
+/// a wrong byte here is silent, just worse tokens. Run it with misses frequent
+/// (a cold pool) before trusting `V41_PAGER_COALESCE`.
+fn pager_coalesce_check() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(std::env::var("V41_PAGER_COALESCE_CHECK").as_deref(), Ok("1") | Ok("on"))
+    });
+    *B
+}
+
 /// Threads used to service ONE decode miss (`V41_PAGER_MISS_THREADS`). 1 (default) is
 /// the original serial gate->up->down read; 3 puts one thread on each role. See the
 /// comment at the call site; this is the M8-E floor measurement.
@@ -942,14 +954,28 @@ impl ExpertPager {
                     .map(|_| std::sync::atomic::AtomicU32::new(0))
                     .collect()
             }),
-            stage: [
-                v4flash_hip::PinnedBuffer::new_with_flags(
-                    gate_bpe, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
-                v4flash_hip::PinnedBuffer::new_with_flags(
-                    up_bpe, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
-                v4flash_hip::PinnedBuffer::new_with_flags(
-                    down_bpe, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
-            ],
+            stage: {
+                // Per-role sizing is enough for the three separate reads, but a
+                // COALESCED read puts ALL THREE roles' nibbles in stage[0] and all
+                // three scales in stage[1], so those two need room for the whole
+                // expert plus O_DIRECT's alignment padding. stage[2] stays per-role
+                // (the verifier's scratch). Costs ~24 MB of pinned memory when the
+                // flag is on, nothing when it is off.
+                let (w0, w1) = if pager_coalesce() {
+                    let whole = gate_bpe + up_bpe + down_bpe + 3 * 4096;
+                    (whole, whole)
+                } else {
+                    (gate_bpe, up_bpe)
+                };
+                [
+                    v4flash_hip::PinnedBuffer::new_with_flags(
+                        w0, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
+                    v4flash_hip::PinnedBuffer::new_with_flags(
+                        w1, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
+                    v4flash_hip::PinnedBuffer::new_with_flags(
+                        down_bpe, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
+                ]
+            },
             remap: (0..N_EXPERT as i32).map(|e| -e - 1).collect(),
             remap_dev,
             cur_layer: 0,
@@ -2208,6 +2234,29 @@ impl ExpertPager {
                         [&t0, &t1, &t2], id as usize,
                         a[0].as_mut_slice(), b[0].as_mut_slice(),
                     )?;
+                }
+            }
+            if let (true, Some(offs)) = (pager_coalesce_check(), coalesced) {
+                // Re-read each role the per-role way into stage[2] and compare the
+                // bytes the coalesced read placed at its own residues.
+                let src = WeightSrc::from(&self.owner);
+                for r in 0..3 {
+                    let Some(t) = src.tensor(&names[r]) else { continue };
+                    let (po, so, out2, nb2) = offs[r];
+                    let (plen, slen) = (out2 as usize * nb2 as usize * 16, out2 as usize * nb2 as usize);
+                    let mut refbuf = vec![0u8; plen + slen];
+                    if src.read_expert_hf_layout(&t, id as usize, &mut refbuf)? {
+                        let got_p = &self.stage[0].as_slice()[po..po + plen];
+                        let got_s = &self.stage[1].as_slice()[so..so + slen];
+                        if got_p != &refbuf[..plen] {
+                            let i = got_p.iter().zip(&refbuf[..plen]).position(|(a, b)| a != b).unwrap_or(0);
+                            eprintln!("PAGER_COALESCE_CHECK L{layer} e{id} role{r}: PACKED differs at byte {i} of {plen}");
+                        }
+                        if got_s != &refbuf[plen..] {
+                            let i = got_s.iter().zip(&refbuf[plen..]).position(|(a, b)| a != b).unwrap_or(0);
+                            eprintln!("PAGER_COALESCE_CHECK L{layer} e{id} role{r}: SCALE differs at byte {i} of {slen}");
+                        }
+                    }
                 }
             }
             if coalesced.is_some() {
