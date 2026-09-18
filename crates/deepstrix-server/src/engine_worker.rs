@@ -1678,6 +1678,25 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                     e2e_ms = t_req.elapsed().as_millis() as u64,
                     "request.summary"
                 );
+                // Box-1's two per-call thread hops. `link_us` cannot see them:
+                // `rtt_us` includes the submit->writer hop and excludes the
+                // reader->caller one. Against a MEASURED 16.6 us raw TCP round
+                // trip on this link, anything here above a few us is the
+                // scheduler, and it is paid 80x per token.
+                #[cfg(feature = "v41")]
+                {
+                    let (to_write, to_wait, n) =
+                        v4flash_kernels::het::remote_experts::take_hop_stats();
+                    if n > 0 {
+                        tracing::info!(
+                            submit_to_write_us = to_write,
+                            recv_to_wait_us = to_wait,
+                            calls = n,
+                            per_token_ms = (to_write + to_wait) * 80.0 / 1000.0,
+                            "remote.hop.summary"
+                        );
+                    }
+                }
                 // tx is dropped here, signaling end of stream.
                 // Return free heap pages to the kernel and log the heap
                 // shape: in_use vs free is the fragmentation-vs-leak

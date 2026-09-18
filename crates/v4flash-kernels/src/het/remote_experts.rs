@@ -3241,6 +3241,34 @@ ms_per_miss={:.2} (read {:.2} [pread {:.2} repack_cpu {:.2}] h2d {:.2} repack_gp
 // ---------------------------------------------------------------------------
 
 /// Handle of a request in flight. Responses arrive in submission order.
+/// Box-1's own two thread handoffs per remote call, which `link_us` cannot see.
+///
+/// A request crosses caller -> writer thread -> wire -> reader thread -> caller.
+/// `rtt_us = t_recv - ticket.t_submit` INCLUDES the submit->writer hop and
+/// EXCLUDES the reader->caller hop, so neither is attributable from the
+/// `link_us = 205us + bytes/785MBps` regression alone. Worth measuring because a
+/// futex wake is 5-30 us against a MEASURED 16.6 us raw TCP round trip on this
+/// link (64B echo, same socket options), and 80 calls/token makes each hop
+/// ~1 ms/token. Plain relaxed atomics: two adds on a path that already does a
+/// syscall.
+pub static HOP_SUBMIT_TO_WRITE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static HOP_RECV_TO_WAIT_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static HOP_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Drain the accumulated hop timings as `(submit_to_write_us, recv_to_wait_us, n)`.
+pub fn take_hop_stats() -> (f64, f64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = HOP_N.swap(0, Relaxed);
+    let a = HOP_SUBMIT_TO_WRITE_NS.swap(0, Relaxed);
+    let b = HOP_RECV_TO_WAIT_NS.swap(0, Relaxed);
+    if n == 0 {
+        return (0.0, 0.0, 0);
+    }
+    (a as f64 / n as f64 / 1000.0, b as f64 / n as f64 / 1000.0, n)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Ticket {
     pub seq: u32,
@@ -3386,7 +3414,7 @@ pub struct RemoteExpertClient {
     dead: bool,
     info: ShardInfo,
     stream: TcpStream,
-    tx_req: Option<mpsc::SyncSender<AlignedBuf>>,
+    tx_req: Option<mpsc::SyncSender<(AlignedBuf, u64)>>,
     rx_resp: mpsc::Receiver<ClientInbound>,
     rx_req_recycle: mpsc::Receiver<AlignedBuf>,
     tx_resp_recycle: mpsc::Sender<AlignedBuf>,
@@ -3443,16 +3471,23 @@ impl RemoteExpertClient {
             ));
         }
         let mut wr = stream.try_clone()?;
-        let (tx_req, rx_req) = mpsc::sync_channel::<AlignedBuf>(16);
+        let (tx_req, rx_req) = mpsc::sync_channel::<(AlignedBuf, u64)>(16);
         let (tx_req_recycle, rx_req_recycle) = mpsc::channel::<AlignedBuf>();
         let (tx_resp, rx_resp) = mpsc::sync_channel::<ClientInbound>(16);
         let (tx_resp_recycle, rx_resp_recycle) = mpsc::channel::<AlignedBuf>();
         let writer = std::thread::Builder::new().name("rexp-writer".into()).spawn(move || {
-            for mut buf in rx_req {
+            for (mut buf, t_submit_raw) in rx_req {
                 // t1 immediately before write(), so frame encoding is outside the sample.
+                let t1 = monotonic_raw_ns();
                 if buf.len() >= proto::REQ_T1_OFF + 8 {
-                    proto::patch_u64(&mut buf, proto::REQ_T1_OFF, monotonic_raw_ns());
+                    proto::patch_u64(&mut buf, proto::REQ_T1_OFF, t1);
                 }
+                // Everything between `submit` returning the buffer and this
+                // instant is channel + scheduler, not work.
+                HOP_SUBMIT_TO_WRITE_NS.fetch_add(
+                    t1.saturating_sub(t_submit_raw),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 if let Err(e) = wr.write_all(buf.as_bytes()) {
                     eprintln!("remote_experts: write error: {e}");
                     return;
@@ -3665,7 +3700,9 @@ impl RemoteExpertClient {
         );
         let ticket = Ticket { seq, layer, b: b as u32, bytes_out: buf.len(), t_submit: Instant::now() };
         let sent = match self.tx_req.as_ref() {
-            Some(tx) => tx.send(buf).map_err(|_| eyre!("writer thread gone")),
+            Some(tx) => tx
+                .send((buf, monotonic_raw_ns()))
+                .map_err(|_| eyre!("writer thread gone")),
             None => Err(eyre!("client closed")),
         };
         if let Err(e) = sent {
@@ -3687,7 +3724,16 @@ impl RemoteExpertClient {
             return Err(eyre!("wait: ticket seq {} but oldest in flight is {}", ticket.seq, head.seq));
         }
         let (buf, t_recv, t4) = match self.rx_resp.recv() {
-            Ok(ClientInbound::Resp { buf, t_recv, t4 }) => (buf, t_recv, t4),
+            Ok(ClientInbound::Resp { buf, t_recv, t4 }) => {
+                // The reader thread stamped `t_recv` the instant the frame was
+                // whole; everything since is the channel handing it to us.
+                HOP_RECV_TO_WAIT_NS.fetch_add(
+                    t_recv.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                HOP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (buf, t_recv, t4)
+            }
             // Both arms mean the socket is gone, not that this reply was bad, so
             // the link must be redialed before the next request rather than
             // inherited: see `ensure_connected`.
