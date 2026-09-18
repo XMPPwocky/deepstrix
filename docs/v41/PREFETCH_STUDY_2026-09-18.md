@@ -101,8 +101,19 @@ For every real box-1 capacity miss, how long since that expert was last picked?
 This is structural. A 4,070-slot LRU fed by ~7.6 new distinct keys per token
 retains roughly 500 tokens of history, so *anything recent is already
 resident*. A recency prefetcher's entire target set is already in the cache;
-it would issue reads for nothing. (22% of misses are first-touch cold, which
-no predictor of any kind can see.)
+it would issue reads for nothing.
+
+**CORRECTION (same day).** The "22% of misses are first-touch cold" figure above
+is a cold-START artifact, not a property of the workload. Measured per 2,000-token
+window with the cache never reset, cold share runs 83.4% / 15.3% / 7.9% / 2.9% /
+1.5% / 0.5% — it decays to a **settled 1.6%**, and 22.2% is just the first window
+dominating a whole-trace average taken from an empty cache. Production's pool
+persists across requests, so it sits in the settled regime. So ~98% of steady-state
+misses are CAPACITY misses, not compulsory ones. That makes the irreducible floor
+far smaller than stated and slightly *helps* the case for prediction; it does not
+change the conclusion, which is that recall on the cold tail is the wall.
+Cold misses are also irreducible only for a DEMAND-FILLED cache — preloading
+eliminates them, and box 1's pool has a load step.
 
 Scoring the cross-layer predictor on the only population that matters — the
 accesses that actually MISS:
