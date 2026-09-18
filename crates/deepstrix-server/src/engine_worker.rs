@@ -1715,6 +1715,17 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                         } else { 0.0 },
                         decode_setup_ms = d.decode_pread_ns.saturating_sub(
                             d.decode_weight_ns + d.decode_scale_ns) / 1_000_000,
+                        // Raw byte counters: `weight_bytes + scale_bytes` MUST equal
+                        // `pread_bytes` (every site adds wt.len / sc.len to both), so
+                        // a mismatch means a read path is bypassing the split.
+                        decode_pread_mb = d.decode_pread_bytes / 1_048_576,
+                        decode_w_mb = d.decode_weight_bytes / 1_048_576,
+                        decode_sc_mb = d.decode_scale_bytes / 1_048_576,
+                        // Which read function served these misses?
+                        n_layout = d.decode_n_layout,
+                        n_runs = d.decode_n_runs,
+                        n_direct = d.decode_n_direct,
+                        n_raw = d.decode_n_raw,
                         decode_slots = pg.decode_slots(),
                         dense_windows = pg.dense_windows(),
                         "expert pager (request)"

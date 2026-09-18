@@ -183,6 +183,11 @@ pub struct ExpertPager {
     pub decode_weight_bytes: u64,
     pub decode_scale_ns: u64,
     pub decode_scale_bytes: u64,
+    /// Calls per read function, so the byte mismatch localises to a path.
+    pub decode_n_layout: u64,
+    pub decode_n_runs: u64,
+    pub decode_n_direct: u64,
+    pub decode_n_raw: u64,
     /// Same for the prefill dense path (batched reads + 3 copies per batch).
     pub prefill_read_ns: u64,
     pub prefill_h2d_ns: u64,
@@ -378,6 +383,23 @@ fn pager_read_threads() -> usize {
         std::env::var("V41_PAGER_READ_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
     });
     (*N).max(1)
+}
+
+/// `V41_PAGER_COALESCE=1`: read all THREE roles of a miss as one contiguous span
+/// (packed nibbles) plus one span of scales, instead of three separate ~6.3 MB
+/// reads. MEASURED on this device: 6300k 3,320 MB/s vs 18900k 3,788 MB/s (+14%),
+/// and a third as many requests. Falls back automatically when the checkpoint's
+/// expert planes are not contiguous (`read_expert_runs_direct` returns None).
+///
+/// DEFAULT OFF: box 2's equivalent (`V41_B2_COALESCE`) is off because coalescing
+/// was once bisected to a CORRUPTION there. `V41_B2_COALESCE_CHECK=1` verifies a
+/// coalesced read against the per-role read byte for byte; run the same check
+/// here before trusting this.
+fn pager_coalesce() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(std::env::var("V41_PAGER_COALESCE").as_deref(), Ok("1") | Ok("on"))
+    });
+    *B
 }
 
 /// Threads used to service ONE decode miss (`V41_PAGER_MISS_THREADS`). 1 (default) is
@@ -939,6 +961,10 @@ impl ExpertPager {
             decode_weight_bytes: 0,
             decode_scale_ns: 0,
             decode_scale_bytes: 0,
+            decode_n_layout: 0,
+            decode_n_runs: 0,
+            decode_n_direct: 0,
+            decode_n_raw: 0,
             prefill_read_ns: 0,
             prefill_h2d_ns: 0,
             union_calls: 0,
@@ -1904,12 +1930,23 @@ impl ExpertPager {
     /// `remote_experts.rs`; this is the back-port. The old
     /// `upload_and_repack` path (copy into `repack_scratch`, then launch) is
     /// kept below for the non-pinned/debug route.
+    /// `offs` = `Some([(packed_off, scale_off, rows, nb); 3])` when the three
+    /// roles were read COALESCED: all packed nibbles in `stage[0]`, all scales in
+    /// `stage[1]`, each role at its own residue. `None` = the per-role layout,
+    /// where role `i` owns `stage[i]` with scales following its nibbles.
+    ///
+    /// Same dispatch box 2 has used since its coalesced path landed; box 1 read
+    /// three separate 6.3 MB ranges where one ~17.7 MB range measures +14% on
+    /// this device (3,320 -> 3,788 MB/s at bs 6300k vs 18900k) and issues a third
+    /// as many requests, which matters more than the bandwidth on a CPU-bound
+    /// crypt layer.
     fn repack_in_place(
         rp: &Mxfp4Repack,
         st: &Stream,
         routed: &mut RoutedExpertWeights,
         slot: u32,
         stage: &[v4flash_hip::PinnedBuffer<u8>; 3],
+        offs: Option<[(usize, usize, u32, u32); 3]>,
     ) -> eyre::Result<u64> {
         let geom = [
             (N_FF_EXP as u32, (N_EMBD / 32) as u32),
@@ -1930,6 +1967,22 @@ impl ExpertPager {
                 1 => &mut routed.up.buffer,
                 _ => &mut routed.down.buffer,
             };
+            match offs {
+                Some(o) => {
+                    let (po, so, o_rows, o_nb) = o[i];
+                    debug_assert_eq!((o_rows, o_nb), (rows, nb));
+                    let pbase = stage[0].device_ptr() as *mut u8;
+                    let sbase = stage[1].device_ptr() as *mut u8;
+                    rp.launch_from_ptrs(
+                        st, dst, slot as usize * bpe[i],
+                        pbase.wrapping_add(po) as v4flash_hip::sys::hipDeviceptr_t,
+                        sbase.wrapping_add(so) as v4flash_hip::sys::hipDeviceptr_t,
+                        rows, nb,
+                    )?;
+                    continue;
+                }
+                None => {}
+            }
             rp.launch_from_ptr(
                 st,
                 dst,
@@ -2093,7 +2146,25 @@ impl ExpertPager {
             let t_read = std::time::Instant::now();
             let rp0 = v4flash_core::hf_v41::expert_read_profile();
             let sp0 = v4flash_core::hf_v41::expert_read_split();
-            if miss_read_threads() > 1 {
+            let pa0 = v4flash_core::hf_v41::expert_read_paths();
+            // ONE span for all three roles' nibbles + one for their scales.
+            // `None` => this checkpoint's planes are not contiguous; fall through
+            // to the per-role reads below, which are always correct.
+            let mut coalesced: Option<[(usize, usize, u32, u32); 3]> = None;
+            if gpu_repack && pager_coalesce() {
+                let src = WeightSrc::from(&self.owner);
+                let (t0, t1, t2) = (src.tensor(&names[0]), src.tensor(&names[1]), src.tensor(&names[2]));
+                if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
+                    let (a, b) = self.stage.split_at_mut(1);
+                    coalesced = src.read_expert_runs_direct(
+                        [&t0, &t1, &t2], id as usize,
+                        a[0].as_mut_slice(), b[0].as_mut_slice(),
+                    )?;
+                }
+            }
+            if coalesced.is_some() {
+                // bytes already staged; skip the per-role reads
+            } else if miss_read_threads() > 1 {
                 // MEASUREMENT (M8-E, `V41_PAGER_MISS_THREADS`): the three roles of one
                 // miss are three independent 6.3 MB (pread + scalar repack) jobs. Serially
                 // they run at ~3.1 GB/s, well under the NVMe's 4.3 GB/s, and the repack is
@@ -2153,6 +2224,11 @@ impl ExpertPager {
             self.decode_read_ns += t_read.elapsed().as_nanos() as u64;
             let rp1 = v4flash_core::hf_v41::expert_read_profile();
             let sp1 = v4flash_core::hf_v41::expert_read_split();
+            let pa1 = v4flash_core::hf_v41::expert_read_paths();
+            self.decode_n_layout += pa1.0 - pa0.0;
+            self.decode_n_runs += pa1.1 - pa0.1;
+            self.decode_n_direct += pa1.2 - pa0.2;
+            self.decode_n_raw += pa1.3 - pa0.3;
             self.decode_weight_ns += sp1.0 - sp0.0;
             self.decode_weight_bytes += sp1.1 - sp0.1;
             self.decode_scale_ns += sp1.2 - sp0.2;
@@ -2168,7 +2244,7 @@ impl ExpertPager {
             if gpu_repack {
                 let (rp, st) = (self.repack.as_ref().unwrap(), self.repack_stream.as_ref().unwrap());
                 self.decode_repack_gpu_ns +=
-                    Self::repack_in_place(rp, st, &mut self.routed, slot, &self.stage)?;
+                    Self::repack_in_place(rp, st, &mut self.routed, slot, &self.stage, coalesced)?;
             } else {
                 self.routed
                     .gate
@@ -2342,6 +2418,10 @@ impl ExpertPager {
             decode_weight_bytes: self.decode_weight_bytes,
             decode_scale_ns: self.decode_scale_ns,
             decode_scale_bytes: self.decode_scale_bytes,
+            decode_n_layout: self.decode_n_layout,
+            decode_n_runs: self.decode_n_runs,
+            decode_n_direct: self.decode_n_direct,
+            decode_n_raw: self.decode_n_raw,
         }
     }
 
@@ -2416,6 +2496,11 @@ pub struct PagerCounters {
     pub decode_weight_bytes: u64,
     pub decode_scale_ns: u64,
     pub decode_scale_bytes: u64,
+    /// Calls per read function, so the byte mismatch localises to a path.
+    pub decode_n_layout: u64,
+    pub decode_n_runs: u64,
+    pub decode_n_direct: u64,
+    pub decode_n_raw: u64,
 }
 
 impl std::ops::Sub for PagerCounters {
@@ -2438,6 +2523,10 @@ impl std::ops::Sub for PagerCounters {
             decode_weight_bytes: self.decode_weight_bytes - o.decode_weight_bytes,
             decode_scale_ns: self.decode_scale_ns - o.decode_scale_ns,
             decode_scale_bytes: self.decode_scale_bytes - o.decode_scale_bytes,
+            decode_n_layout: self.decode_n_layout - o.decode_n_layout,
+            decode_n_runs: self.decode_n_runs - o.decode_n_runs,
+            decode_n_direct: self.decode_n_direct - o.decode_n_direct,
+            decode_n_raw: self.decode_n_raw - o.decode_n_raw,
         }
     }
 }

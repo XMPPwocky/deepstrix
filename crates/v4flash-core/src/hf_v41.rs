@@ -800,6 +800,7 @@ impl V41HfWeights {
         self.st.read_range_into_cached(sc, 0, ds)?;
         EXPERT_READ_PROF.scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
         EXPERT_READ_PROF.scale_bytes.fetch_add(sc.len, Relaxed);
+        EXPERT_READ_PROF.n_layout.fetch_add(1, Relaxed);
         EXPERT_READ_PROF.pread_ns.fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
         EXPERT_READ_PROF.pread_bytes.fetch_add(wt.len + sc.len, Relaxed);
         EXPERT_READ_PROF.calls.fetch_add(1, Relaxed);
@@ -942,6 +943,7 @@ impl V41HfWeights {
         };
         EXPERT_READ_PROF.scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
         EXPERT_READ_PROF.scale_bytes.fetch_add(run_s as u64, Relaxed);
+        EXPERT_READ_PROF.n_runs.fetch_add(1, Relaxed);
         EXPERT_READ_PROF.pread_ns.fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
         EXPERT_READ_PROF.pread_bytes.fetch_add((run_w + run_s) as u64, Relaxed);
         EXPERT_READ_PROF.calls.fetch_add(1, Relaxed);
@@ -1010,6 +1012,7 @@ impl V41HfWeights {
         };
         EXPERT_READ_PROF.scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
         EXPERT_READ_PROF.scale_bytes.fetch_add(sc.len, Relaxed);
+        EXPERT_READ_PROF.n_direct.fetch_add(1, Relaxed);
         EXPERT_READ_PROF.pread_ns.fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
         EXPERT_READ_PROF.pread_bytes.fetch_add(wt.len + sc.len, Relaxed);
         EXPERT_READ_PROF.calls.fetch_add(1, Relaxed);
@@ -1069,6 +1072,7 @@ impl V41HfWeights {
         EXPERT_READ_PROF.scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
         EXPERT_READ_PROF.scale_bytes.fetch_add(sc.len, Relaxed);
         let t_repack = std::time::Instant::now();
+        EXPERT_READ_PROF.n_raw.fetch_add(1, Relaxed);
         EXPERT_READ_PROF.pread_ns.fetch_add(
             t_repack.duration_since(t_pread).as_nanos() as u64, Relaxed);
         EXPERT_READ_PROF.pread_bytes.fetch_add(wt.len + sc.len, Relaxed);
@@ -1123,6 +1127,14 @@ pub struct ExpertReadProfile {
     pub weight_bytes: AtomicU64,
     pub scale_ns: AtomicU64,
     pub scale_bytes: AtomicU64,
+    /// Calls per read FUNCTION, so "which path do the bytes come from" is a
+    /// counter rather than an inference. `pread_bytes` is incremented by all
+    /// four; the weight/scale split only by the ones instrumented, so a
+    /// mismatch localises to whichever of these is hot.
+    pub n_layout: AtomicU64,
+    pub n_runs: AtomicU64,
+    pub n_direct: AtomicU64,
+    pub n_raw: AtomicU64,
 }
 
 pub static EXPERT_READ_PROF: ExpertReadProfile = ExpertReadProfile {
@@ -1135,12 +1147,26 @@ pub static EXPERT_READ_PROF: ExpertReadProfile = ExpertReadProfile {
     weight_bytes: AtomicU64::new(0),
     scale_ns: AtomicU64::new(0),
     scale_bytes: AtomicU64::new(0),
+    n_layout: AtomicU64::new(0),
+    n_runs: AtomicU64::new(0),
+    n_direct: AtomicU64::new(0),
+    n_raw: AtomicU64::new(0),
 };
 
 /// `(calls, alloc_ns, pread_ns, repack_ns, pread_bytes)` — cumulative.
 /// The `pread_ns` split: `(weight_ns, weight_bytes, scale_ns, scale_bytes)`.
 /// Separate from `expert_read_profile` so the existing 5-tuple's arity — and its
 /// four call sites — stay untouched.
+/// Calls per read function: `(layout, runs, direct, raw)`.
+pub fn expert_read_paths() -> (u64, u64, u64, u64) {
+    (
+        EXPERT_READ_PROF.n_layout.load(Relaxed),
+        EXPERT_READ_PROF.n_runs.load(Relaxed),
+        EXPERT_READ_PROF.n_direct.load(Relaxed),
+        EXPERT_READ_PROF.n_raw.load(Relaxed),
+    )
+}
+
 pub fn expert_read_split() -> (u64, u64, u64, u64) {
     (
         EXPERT_READ_PROF.weight_ns.load(Relaxed),
