@@ -168,6 +168,56 @@ For reference, what the kept fixes are worth on E (back-to-back, same prompt):
 Output is still degenerate at E 3.500, so ACCEPTANCE and COHERENCE are separable
 problems here -- raising E does not by itself fix #0b.
 
+## Fixed 2026-09-18
+
+### FIXED — box 2's per-layer region was a HARD BOUND (`3eede97`, `eb002bb`)
+Box 2 carved its 6160 slots into 40 equal 154-slot regions and confined the
+prefill victim search to the layer's own region. A chunk whose union for one
+layer exceeded 154 found no legal victim and failed the request outright
+("layer 19 has no evictable slot") while ~6000 slots sat evictable elsewhere.
+Now one global LRU for every request shape; `V41_B2_GLOBAL_POOL=0` restores the
+old search. Measured: prefill 9.3K tok 27.1 -> 21.6 s, 13.3K tok 31.5 -> 25.4 s.
+
+### FIXED — one box-2 error bricked the server permanently (`11a6c82`)
+The writer thread exits on the broken pipe, `tx_req` closes, and every later
+submit fails forever: the process served 500s until restarted by hand. The client
+now redials at the next request BOUNDARY (never mid-request — the old socket's
+in-flight tickets cannot be reconciled and a fresh HELLO may report different
+ownership). Verified by killing box 2 and watching box 1 recover unaided.
+
+### FIXED — attention scratch was sized off a DEAD predicate (`3409948`)
+`attn_max_scored_keys` branched on `indexer_gathers(ratio)` = `!cfg!(v41) &&
+ratio == 4`, dead under V4.1, so every compressed layer was charged its whole
+store. S2 makes every layer attend only its index source's top-512, so the real
+bound is `raw_window + INDEXER_TOP_K`, with no `n_kv_max` term. Scratch 2080 ->
+192 MiB and CONSTANT in context; dGPU freed 1.9 GiB; `--ctx 307200` now boots
+with identical throughput and bit-identical output.
+
+### FIXED — the `developer` role 422'd every request (`c6888df`)
+OpenAI renamed the system role for o1-era models; prime-agent sends `developer`
+and we accepted only `system`, so deserialization failed on messages[0] and the
+client's retries gave up. `#[serde(alias = "developer")]` on the existing variant.
+
+## Open, found 2026-09-18
+
+### 17. OPEN — ARCH_SPEC 1.5 candidate pool is NOT wired (fidelity)
+`CANDIDATE_SOURCE_LAYER/TOPK_BLOCKS/BLOCK_SIZE` sat in config.rs referenced by
+nothing. The reference masks index sources 24/28/32/36 to the 2048x8 = 16384
+candidate positions layer 20 publishes (`index_score.masked_fill(~candidates,
+-inf)`); we select from the whole store, so those layers can pick positions the
+model never considers. Kernels + oracle landed (`candidate_blocks.hip`,
+`candidate_blocks_oracle.rs`, verified against the CPU transcription of
+`select_candidate_blocks` at 16385/65536/307200 and a ragged batch) but are NOT
+wired into forward_layer/forward_prefill. NO-OP BELOW 16384 compressed positions,
+so short context was always conformant; long context is not.
+
+### 18. OPEN — relaunching box 1 races the driver's VRAM reclaim
+Killing the server frees its VRAM asynchronously: `mem_info_vram_used` drops
+below 1 GiB before a large `hipMalloc` can succeed, so a relaunch inside that
+window dies mid-weight-load with `hipErrorOutOfMemory`. Observed 3x on
+2026-09-18; a retry always succeeded. Waiting on the counter is necessary but not
+sufficient — `~/scripts/start_v41.sh` retries up to 5 times.
+
 ## Silent wrongness
 
 ### 0c. FIXED (2026-09-17, `fedbea2`) — decode DOUBLE-COUNTED every pick box 1 held
@@ -707,6 +757,15 @@ request inherits that silently. Real fix is a `CompressorLoan` RAII guard;
 `with_kv_source` is the model.
 
 ### 15. OPEN — the expert pool is statically partitioned BY PHASE
+
+UPDATE 2026-09-18: still true (384 dense slots reserved for prefill, 4070 for
+decode), but the measured stakes are smaller than the table below suggests. On a
+pick trace of live traffic the cache is near its ceiling at this capacity: LRU
+2.247% miss vs a frequency ORACLE 1.965%, the hash partition exactly matches an
+ideal shared pool, and only ~18 GB of host RAM headroom exists on the two boxes
+combined. The dominant term is per-miss COST (~13 ms for an 18.8 MB expert at
+1.8-2.4 GB/s through dm-crypt), not slot allocation.
+
 `dense_windows` reserves N windows for PREFILL's encoder layers; decode cannot
 use them even when idle. At the default (pool 78 GB, WINDOWS=21) that is 2944
 of 4454 slots withheld from decode, leaving it 1510. Measured 2026-09-16,
@@ -733,7 +792,17 @@ union. The `slot == id` dense twin refuses on a packed window and is
 unreachable at STRIDE<384. Do not repeat the claim that windows pin "each
 layer's first 128 ids" -- that was wrong.
 
-### 16. OPEN — box 1's decode "LRU" never evicts (fill-once-then-freeze)
+### 16. OPEN (CATCH-ALL MODE ONLY) — box 1's decode "LRU" never evicts
+
+SCOPE CORRECTION 2026-09-18: the `budget = pg.lru_free_slots()` gate is inside the
+`else if catchall` branch (`forward_layer.rs:2493`). Production runs
+`V41_T2_PARTITION=1`, which takes the partition branch instead, where residency is
+decided by `partition_box2()` and the pager pages normally. Measured on live
+traffic in partition mode: box 1 decode_hit 0.969-0.986 with thousands of misses
+and real disk reads per request, and a pick-trace refetch ratio of 7.2 — i.e. it
+evicts and re-admits constantly. The freeze below is real for catch-all, not for
+the mode we ship.
+
 `forward_layer.rs:2331` takes `budget = pg.lru_free_slots()`, and
 `lru_free_slots` (`expert_pager.rs:1538`) counts slots that are **empty**, not
 evictable. So under the T2 catch-all box 1 admits a new expert only while the
