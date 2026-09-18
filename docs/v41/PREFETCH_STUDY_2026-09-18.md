@@ -196,6 +196,72 @@ prediction** — the union is nearly the whole layer anyway. Decoder layers
 Prefill hit is 0.88-0.90, the worst of the two phases, so this is where the
 remaining paging headroom actually is.
 
+### d. HOW MUCH could prediction buy? The economics, from first principles
+
+Scripts: `scripts/belady_bound.py`, `scripts/prefetch_economics.py`,
+`scripts/ced_predictor.py`.
+
+**Prefetch cannot reduce the fetch COUNT.** At a fixed capacity C the minimum
+number of disk fetches over a trace is exactly Belady's OPT; a prefetched
+expert occupies a slot, and OPT already assumes optimal slot use. So prefetch
+moves a fetch EARLIER, never removes it. The objective is therefore exposed
+latency, not miss rate.
+
+**Bandwidth is not the constraint — this is the surprise.** We issue 1.17
+demand misses per token against a drive that serves ~13 expert-reads in a 97 ms
+token: `rho = 0.09`. Modelling a demand miss as `c_s/(1-rho)` with
+`c_s = 8.85*(1-0.15) = 7.50 ms`, net gain over recall h and precision p:
+
+                p:    1%     2%     5%    10%    25%    50%   100%
+        h= 25%      SAT    SAT   -42%    +3%   +19%   +23%   +25%
+        h= 75%      SAT    SAT    SAT   +24%   +68%   +73%   +75%
+        h=100%      SAT    SAT    SAT  +100%  +100%  +100%  +100%
+
+**Break-even precision is ~10%.** A predictor may be wrong nine times out of
+ten and still pay. Below ~5% the prefetch stream saturates the drive and the
+1/(1-rho) term punishes every miss it failed to hide. Precision was never the
+blocker; RECALL on the cold tail is.
+
+**The ceiling is +10% tok/s.** A perfect oracle takes exposed latency from
+9.66 to 0.02 ms/token, i.e. 10.3 -> 11.4 tok/s. That bounds every decode
+prefetch scheme, including all of the above.
+
+**Every id-based predictor in this trace is dead**, measured end to end with
+pollution charged (prefetched experts take slots and evict):
+
+    BASELINE                    demand/tok 1.17                    9.66 ms
+    ORACLE (p=1)                demand/tok 0.00  prefetch 1.50     0.02 ms  +99.8%
+    recency (last token)        demand/tok 1.17  prefetch 0.00     9.66 ms    0.0%
+    frequency top-32/layer      demand/tok 1.17  prefetch 0.01     9.65 ms   +0.1%
+
+Recency and frequency issue ~NOTHING: every expert they name is already
+resident. That is section 4's dead zone restated as economics.
+
+### e. The CED-seam predictor (L19 -> L20..39) — closest miss
+
+Layer 20 is the encoder/decoder seam and 19->20 was the strongest cross-layer
+pair (7x over marginal on the miss subset), so predicting the WHOLE decoder
+from the seam gives half the network as lead time: 17 of 20 decoder layers
+clear the 8.85 ms read.
+
+     n_pred  demand/tok  prefetch/tok  precision    rho   exposed   vs base
+          0        1.17          0.00          -  0.091    9.66ms   baseline
+          8        1.17          0.21       5.1%  0.107    9.86ms     -2.1%
+        128        1.17          0.23       4.8%  0.109    9.89ms     -2.3%
+
+The first predictor that FIRES at all (0.23 non-resident candidates/token vs
+0.00 for recency), but 4.8% precision is just under break-even, so it lands at
+-2%. Demand misses do not move: its hits are cancelled by what its admissions
+evict. It needs ~25x the recall and ~2x the precision.
+
+**Caveat, and the one live variant.** This bounds ID-BASED prediction only —
+the trace carries 6 discrete ids per layer, which is all the predictor above
+gets. The router works from the 5120-dim hidden state. Untested and not
+refutable from a trace: at layer 19, speculatively run layers 20-39's GATE
+matrices on layer 19's hidden state (20 x 5120 x 384 x 2 = 78 MFLOP, nothing on
+a GPU) and prefetch their top-k. At a 10% break-even precision, gate_L(h19)
+does not have to rank much like gate_L(h_L) to pay. Needs a model run.
+
 ### c. Capacity still beats both
 
 +50% slots = -3.7x misses (section 2). Nothing above comes close.
