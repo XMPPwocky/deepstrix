@@ -3670,6 +3670,42 @@ impl HeterogeneousEngine {
                         )?;
                     }
                 }
+                // ARCH_SPEC §1.5 — the same two-level top-k decode runs, PER ROW:
+                // layer 20 publishes its best blocks, 24/28/32/36 select only from
+                // inside them. Wiring decode alone would make prefill and decode
+                // pick different positions on those four layers, which is the
+                // prefill/decode divergence class this engine has been bitten by.
+                if super::forward_layer::candidate_pool_enabled() {
+                    let _t = de.events.stage("k.indexer.candidates", &de.compute)?;
+                    let nb_stride = crate::candidate_blocks::CandidateBlocks::n_blocks(
+                        ATTN_MIXED_MAX_KEYS,
+                    );
+                    if layer == crate::config::CANDIDATE_SOURCE_LAYER {
+                        de.candidate_blocks.launch_build(
+                            &de.compute,
+                            &sd.indexer_scores,
+                            &mut sd.candidate_block_score,
+                            &mut sd.candidate_threshold,
+                            sd.n_index_comp_per_b.raw(),
+                            ATTN_MIXED_MAX_KEYS,
+                            nb_stride,
+                            n_idx_max,
+                            b,
+                        )?;
+                    } else if layer > crate::config::CANDIDATE_SOURCE_LAYER {
+                        de.candidate_blocks.launch_mask(
+                            &de.compute,
+                            &mut sd.indexer_scores,
+                            &sd.candidate_block_score,
+                            &sd.candidate_threshold,
+                            sd.n_index_comp_per_b.raw(),
+                            ATTN_MIXED_MAX_KEYS,
+                            nb_stride,
+                            n_idx_max,
+                            b,
+                        )?;
+                    }
+                }
                 {
                     let _t = de.events.stage("k.indexer.topk_bitonic", &de.compute)?;
                     // INDEXER_TOPK_SELECT=0 disables the threshold fast path.

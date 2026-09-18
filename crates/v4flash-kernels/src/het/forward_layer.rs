@@ -1631,7 +1631,13 @@ impl HeterogeneousEngine {
                 // 16384 compressed positions, where `min(topk_blocks, num_blocks)`
                 // stops keeping everything.
                 if candidate_pool_enabled() {
-                    let n_per = dgpu_scratch.attn_n_comp_per_b1.raw();
+                    // Upload this token's reachable count (4 bytes). The kernels
+                    // derive the block count from it, so a stale/zero value makes
+                    // the pool silently do nothing.
+                    dgpu_scratch
+                        .candidate_n_per
+                        .copy_from_host(&[n_index_comp])?;
+                    let n_per = dgpu_scratch.candidate_n_per.raw();
                     let nb_stride = crate::candidate_blocks::CandidateBlocks::n_blocks(
                         crate::attention::ATTN_MIXED_MAX_KEYS,
                     );

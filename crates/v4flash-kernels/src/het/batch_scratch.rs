@@ -563,6 +563,11 @@ pub struct BatchDgpuShared {
     /// per token = MAX_KEYS. R1 view @0 (the largest R1 member: 96.5 MiB
     /// at rows=512): written by the score kernel, last read by topk (P5i).
     pub indexer_scores: DeviceBuffer<f32>,
+    /// ARCH_SPEC §1.5: the candidate blocks layer 20 publishes, per ROW, consumed
+    /// by index sources 24/28/32/36. `[B, ceil(MAX_KEYS / CANDIDATE_BLOCK_SIZE)]`
+    /// — 6.3 MiB at rows=512, and only allocated when the pool is on.
+    pub candidate_block_score: DeviceBuffer<f32>,
+    pub candidate_threshold: DeviceBuffer<u32>,
     /// `[B, INDEXER_TOP_K]` — batched IndexerTopk output (selected
     /// indices per token, sentinel -1 in unused slots). Written by topk,
     /// read by the gather (both P5i). 1 MiB at rows=512.
@@ -1405,6 +1410,20 @@ impl BatchDgpuShared {
             indexer_selected: DeviceBuffer::new(id, b * INDEXER_TOP_K as usize)?,
             indexer_topk_scratch,
             n_index_comp_per_b: DeviceBuffer::new(id, b)?,
+            candidate_block_score: if crate::het::forward_layer::candidate_pool_enabled() {
+                DeviceBuffer::new(
+                    id,
+                    b * (crate::attention::ATTN_MIXED_MAX_KEYS as usize)
+                        .div_ceil(crate::config::CANDIDATE_BLOCK_SIZE as usize),
+                )?
+            } else {
+                DeviceBuffer::new(id, 1)?
+            },
+            candidate_threshold: if crate::het::forward_layer::candidate_pool_enabled() {
+                DeviceBuffer::new(id, b)?
+            } else {
+                DeviceBuffer::new(id, 1)?
+            },
             // Dense per-token top-K gather target — only ever written by the
             // CSA gather, which cannot run when no layer is gathered.
             attn_active_comp_kv: if crate::attention::indexer_scratch_needed() {

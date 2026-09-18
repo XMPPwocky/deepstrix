@@ -157,6 +157,10 @@ pub struct DgpuScratch {
     /// the block count is `ceil(n_comp / CANDIDATE_BLOCK_SIZE)`.
     pub candidate_block_score: DeviceBuffer<f32>,
     pub candidate_threshold: DeviceBuffer<u32>,
+    /// Reachable compressed positions for THIS token, as the candidate kernels
+    /// want it (device, u32). `attn_n_comp_per_b1` is not written on the decode
+    /// path — reading it gave 0, which made the whole pool silently inert.
+    pub candidate_n_per: DeviceBuffer<u32>,
     pub active_comp_kv: DeviceBuffer<u16>,       // [INDEXER_TOP_K * N_HEAD_DIM]
 
     // Shared expert
@@ -348,6 +352,7 @@ impl DgpuScratch {
                     .div_ceil(crate::config::CANDIDATE_BLOCK_SIZE as usize),
             )?,
             candidate_threshold: DeviceBuffer::new(device_id, 1)?,
+            candidate_n_per: DeviceBuffer::new(device_id, 1)?,
             indexer_topk_scratch: {
                 // Two-level bitonic tree merge: L0 = max_chunks*top_k
                 // candidates, plus L1 = n_groups*top_k regrouped candidates
