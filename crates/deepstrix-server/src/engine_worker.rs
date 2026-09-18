@@ -1702,6 +1702,19 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                         decode_pread_gbps = if d.decode_pread_ns > 0 {
                             d.decode_pread_bytes as f64 / d.decode_pread_ns as f64
                         } else { 0.0 },
+                        // Which of the two reads is slow? The weight read is
+                        // O_DIRECT (~5.9 MB); the scale read is BUFFERED (~368 KB).
+                        // `setup` is whatever pread_ns has left after both.
+                        decode_w_ms = d.decode_weight_ns / 1_000_000,
+                        decode_w_gbps = if d.decode_weight_ns > 0 {
+                            d.decode_weight_bytes as f64 / d.decode_weight_ns as f64
+                        } else { 0.0 },
+                        decode_sc_ms = d.decode_scale_ns / 1_000_000,
+                        decode_sc_gbps = if d.decode_scale_ns > 0 {
+                            d.decode_scale_bytes as f64 / d.decode_scale_ns as f64
+                        } else { 0.0 },
+                        decode_setup_ms = d.decode_pread_ns.saturating_sub(
+                            d.decode_weight_ns + d.decode_scale_ns) / 1_000_000,
                         decode_slots = pg.decode_slots(),
                         dense_windows = pg.dense_windows(),
                         "expert pager (request)"

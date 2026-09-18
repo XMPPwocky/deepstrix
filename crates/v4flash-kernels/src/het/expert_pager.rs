@@ -177,6 +177,12 @@ pub struct ExpertPager {
     pub decode_pread_ns: u64,
     pub decode_repack_ns: u64,
     pub decode_pread_bytes: u64,
+    /// `decode_pread_ns` split: the O_DIRECT weight read vs the BUFFERED scale
+    /// read, so an aggregate that says "slow" can say WHICH read is slow.
+    pub decode_weight_ns: u64,
+    pub decode_weight_bytes: u64,
+    pub decode_scale_ns: u64,
+    pub decode_scale_bytes: u64,
     /// Same for the prefill dense path (batched reads + 3 copies per batch).
     pub prefill_read_ns: u64,
     pub prefill_h2d_ns: u64,
@@ -929,6 +935,10 @@ impl ExpertPager {
             decode_pread_ns: 0,
             decode_repack_ns: 0,
             decode_pread_bytes: 0,
+            decode_weight_ns: 0,
+            decode_weight_bytes: 0,
+            decode_scale_ns: 0,
+            decode_scale_bytes: 0,
             prefill_read_ns: 0,
             prefill_h2d_ns: 0,
             union_calls: 0,
@@ -2082,6 +2092,7 @@ impl ExpertPager {
             // `self.touch()` needs all of self).
             let t_read = std::time::Instant::now();
             let rp0 = v4flash_core::hf_v41::expert_read_profile();
+            let sp0 = v4flash_core::hf_v41::expert_read_split();
             if miss_read_threads() > 1 {
                 // MEASUREMENT (M8-E, `V41_PAGER_MISS_THREADS`): the three roles of one
                 // miss are three independent 6.3 MB (pread + scalar repack) jobs. Serially
@@ -2141,6 +2152,11 @@ impl ExpertPager {
             }
             self.decode_read_ns += t_read.elapsed().as_nanos() as u64;
             let rp1 = v4flash_core::hf_v41::expert_read_profile();
+            let sp1 = v4flash_core::hf_v41::expert_read_split();
+            self.decode_weight_ns += sp1.0 - sp0.0;
+            self.decode_weight_bytes += sp1.1 - sp0.1;
+            self.decode_scale_ns += sp1.2 - sp0.2;
+            self.decode_scale_bytes += sp1.3 - sp0.3;
             self.decode_alloc_ns += rp1.1 - rp0.1;
             self.decode_pread_ns += rp1.2 - rp0.2;
             self.decode_repack_ns += rp1.3 - rp0.3;
@@ -2322,6 +2338,10 @@ impl ExpertPager {
             decode_pread_ns: self.decode_pread_ns,
             decode_repack_ns: self.decode_repack_ns,
             decode_pread_bytes: self.decode_pread_bytes,
+            decode_weight_ns: self.decode_weight_ns,
+            decode_weight_bytes: self.decode_weight_bytes,
+            decode_scale_ns: self.decode_scale_ns,
+            decode_scale_bytes: self.decode_scale_bytes,
         }
     }
 
@@ -2392,6 +2412,10 @@ pub struct PagerCounters {
     pub decode_pread_ns: u64,
     pub decode_repack_ns: u64,
     pub decode_pread_bytes: u64,
+    pub decode_weight_ns: u64,
+    pub decode_weight_bytes: u64,
+    pub decode_scale_ns: u64,
+    pub decode_scale_bytes: u64,
 }
 
 impl std::ops::Sub for PagerCounters {
@@ -2410,6 +2434,10 @@ impl std::ops::Sub for PagerCounters {
             decode_pread_ns: self.decode_pread_ns - o.decode_pread_ns,
             decode_repack_ns: self.decode_repack_ns - o.decode_repack_ns,
             decode_pread_bytes: self.decode_pread_bytes - o.decode_pread_bytes,
+            decode_weight_ns: self.decode_weight_ns - o.decode_weight_ns,
+            decode_weight_bytes: self.decode_weight_bytes - o.decode_weight_bytes,
+            decode_scale_ns: self.decode_scale_ns - o.decode_scale_ns,
+            decode_scale_bytes: self.decode_scale_bytes - o.decode_scale_bytes,
         }
     }
 }

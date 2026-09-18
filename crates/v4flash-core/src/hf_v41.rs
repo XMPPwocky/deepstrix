@@ -784,10 +784,22 @@ impl V41HfWeights {
         let (dp, ds) = dst.split_at_mut(out * nb * 16);
         // Same CACHED reads as the ggml path: the LRU re-reads evicted experts,
         // and POSIX_FADV_DONTNEED would force every refill back to the SSD.
+        //
+        // TIMED SEPARATELY (2026-09-18): `pread_ns` used to bracket all of this,
+        // so the O_DIRECT weight read, the BUFFERED scale read and the setup were
+        // indistinguishable. Production reads ~480 MB/s per stream where fio does
+        // ~3,400 MB/s on the same block size against the same device, and one
+        // aggregate counter cannot say which of the three is responsible.
+        let t_w = std::time::Instant::now();
         if !(expert_odirect() && self.st.read_range_into_direct(wt, 0, dp)?) {
             self.st.read_range_into_cached_par(wt, 0, dp, expert_pread_threads())?;
         }
+        EXPERT_READ_PROF.weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
+        EXPERT_READ_PROF.weight_bytes.fetch_add(wt.len, Relaxed);
+        let t_s = std::time::Instant::now();
         self.st.read_range_into_cached(sc, 0, ds)?;
+        EXPERT_READ_PROF.scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
+        EXPERT_READ_PROF.scale_bytes.fetch_add(sc.len, Relaxed);
         EXPERT_READ_PROF.pread_ns.fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
         EXPERT_READ_PROF.pread_bytes.fetch_add(wt.len + sc.len, Relaxed);
         EXPERT_READ_PROF.calls.fetch_add(1, Relaxed);
@@ -916,14 +928,20 @@ impl V41HfWeights {
             scs.iter().map(|t| t.offset).min().unwrap(),
         );
         let t_pread = std::time::Instant::now();
+        let t_w = std::time::Instant::now();
         let Some(pad_w) = self.st.read_span_into_direct_padded(wts[0].shard, w0, run_w, dst_w)?
         else {
             return Ok(None);
         };
+        EXPERT_READ_PROF.weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
+        EXPERT_READ_PROF.weight_bytes.fetch_add(run_w as u64, Relaxed);
+        let t_s = std::time::Instant::now();
         let Some(pad_s) = self.st.read_span_into_direct_padded(scs[0].shard, s0, run_s, dst_s)?
         else {
             return Ok(None);
         };
+        EXPERT_READ_PROF.scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
+        EXPERT_READ_PROF.scale_bytes.fetch_add(run_s as u64, Relaxed);
         EXPERT_READ_PROF.pread_ns.fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
         EXPERT_READ_PROF.pread_bytes.fetch_add((run_w + run_s) as u64, Relaxed);
         EXPERT_READ_PROF.calls.fetch_add(1, Relaxed);
@@ -980,12 +998,18 @@ impl V41HfWeights {
         }
         let t_pread = std::time::Instant::now();
         let (region_w, region_s) = dst.split_at_mut(cap_w);
+        let t_w = std::time::Instant::now();
         let Some(pad_w) = self.st.read_range_into_direct_padded(wt, 0, packed_len, region_w)? else {
             return Ok(None);
         };
+        EXPERT_READ_PROF.weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
+        EXPERT_READ_PROF.weight_bytes.fetch_add(wt.len, Relaxed);
+        let t_s = std::time::Instant::now();
         let Some(pad_s) = self.st.read_range_into_direct_padded(sc, 0, scale_len, region_s)? else {
             return Ok(None);
         };
+        EXPERT_READ_PROF.scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
+        EXPERT_READ_PROF.scale_bytes.fetch_add(sc.len, Relaxed);
         EXPERT_READ_PROF.pread_ns.fetch_add(t_pread.elapsed().as_nanos() as u64, Relaxed);
         EXPERT_READ_PROF.pread_bytes.fetch_add(wt.len + sc.len, Relaxed);
         EXPERT_READ_PROF.calls.fetch_add(1, Relaxed);
@@ -1034,10 +1058,16 @@ impl V41HfWeights {
         let t_pread = std::time::Instant::now();
         EXPERT_READ_PROF.alloc_ns.fetch_add(
             t_pread.duration_since(t_alloc).as_nanos() as u64, Relaxed);
+        let t_w = std::time::Instant::now();
         if !(expert_odirect() && self.st.read_range_into_direct(wt, 0, &mut packed)?) {
             self.st.read_range_into_cached_par(wt, 0, &mut packed, expert_pread_threads())?;
         }
+        EXPERT_READ_PROF.weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
+        EXPERT_READ_PROF.weight_bytes.fetch_add(wt.len, Relaxed);
+        let t_s = std::time::Instant::now();
         self.st.read_range_into_cached(sc, 0, &mut scale)?;
+        EXPERT_READ_PROF.scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);
+        EXPERT_READ_PROF.scale_bytes.fetch_add(sc.len, Relaxed);
         let t_repack = std::time::Instant::now();
         EXPERT_READ_PROF.pread_ns.fetch_add(
             t_repack.duration_since(t_pread).as_nanos() as u64, Relaxed);
@@ -1087,6 +1117,12 @@ pub struct ExpertReadProfile {
     pub pread_ns: AtomicU64,
     pub repack_ns: AtomicU64,
     pub pread_bytes: AtomicU64,
+    /// `pread_ns` split: the O_DIRECT weight read vs the BUFFERED scale read.
+    /// `pread_ns - weight_ns - scale_ns` is the setup left over.
+    pub weight_ns: AtomicU64,
+    pub weight_bytes: AtomicU64,
+    pub scale_ns: AtomicU64,
+    pub scale_bytes: AtomicU64,
 }
 
 pub static EXPERT_READ_PROF: ExpertReadProfile = ExpertReadProfile {
@@ -1095,9 +1131,25 @@ pub static EXPERT_READ_PROF: ExpertReadProfile = ExpertReadProfile {
     pread_ns: AtomicU64::new(0),
     repack_ns: AtomicU64::new(0),
     pread_bytes: AtomicU64::new(0),
+    weight_ns: AtomicU64::new(0),
+    weight_bytes: AtomicU64::new(0),
+    scale_ns: AtomicU64::new(0),
+    scale_bytes: AtomicU64::new(0),
 };
 
 /// `(calls, alloc_ns, pread_ns, repack_ns, pread_bytes)` — cumulative.
+/// The `pread_ns` split: `(weight_ns, weight_bytes, scale_ns, scale_bytes)`.
+/// Separate from `expert_read_profile` so the existing 5-tuple's arity — and its
+/// four call sites — stay untouched.
+pub fn expert_read_split() -> (u64, u64, u64, u64) {
+    (
+        EXPERT_READ_PROF.weight_ns.load(Relaxed),
+        EXPERT_READ_PROF.weight_bytes.load(Relaxed),
+        EXPERT_READ_PROF.scale_ns.load(Relaxed),
+        EXPERT_READ_PROF.scale_bytes.load(Relaxed),
+    )
+}
+
 pub fn expert_read_profile() -> (u64, u64, u64, u64, u64) {
     (
         EXPERT_READ_PROF.calls.load(Relaxed),
