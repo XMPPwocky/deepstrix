@@ -31,6 +31,7 @@ pub(crate) const fn parse_u32_dec(s: &str) -> u32 {
 
 pub mod attention;
 pub mod broadcast;
+pub mod candidate_blocks;
 pub mod comp_kv_append;
 pub mod comp_kv_fp8;
 pub mod index_kv_e2m1;
