@@ -62,7 +62,7 @@ fn case(dev: &Device, stream: &Stream, cb: &CandidateBlocks, n_per_host: &[u32],
     let mut d_n = DeviceBuffer::<u32>::new(dev.id, batch as usize)?;
     d_n.copy_from_host(n_per_host)?;
 
-    cb.launch_apply(stream, &mut d_scores, &mut d_block, &mut d_thr, &d_n, stride, nb_stride, n_max, batch)?;
+    cb.launch_apply(stream, &mut d_scores, &mut d_block, &mut d_thr, d_n.raw(), stride, nb_stride, n_max, batch)?;
     stream.synchronize()?;
 
     let mut got = vec![0f32; scores.len()];

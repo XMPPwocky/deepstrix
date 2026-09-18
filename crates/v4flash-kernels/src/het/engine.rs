@@ -180,6 +180,9 @@ pub struct DeviceEngine {
     /// at n_comp=16384 than the greedy fallback. Always available.
     pub indexer_topk_bitonic: crate::IndexerTopkBitonic,
     pub indexer_gather: crate::IndexerGather,
+    /// ARCH_SPEC 1.5 level one: layer 20 publishes the candidate blocks that
+    /// index sources 24/28/32/36 mask against. See `candidate_blocks`.
+    pub candidate_blocks: crate::candidate_blocks::CandidateBlocks,
     pub indexer_bitpack: crate::IndexerBitpack,
     pub vec_scale: crate::VecScaleInplace,
     /// By-expert MoE pre-pass — inverts d_selected into per-expert
@@ -268,6 +271,7 @@ impl DeviceEngine {
             indexer_topk: crate::IndexerTopk::for_arch(arch)?,
             indexer_topk_bitonic: crate::IndexerTopkBitonic::for_arch(arch)?,
             indexer_gather: crate::IndexerGather::for_arch(arch)?,
+            candidate_blocks: crate::candidate_blocks::CandidateBlocks::for_arch(arch)?,
             indexer_bitpack: crate::IndexerBitpack::for_arch(arch)?,
             vec_scale: crate::VecScaleInplace::for_arch(arch)?,
             moe_group_builder: crate::moe_group_builder::MoeGroupBuilder::for_arch(arch)?,

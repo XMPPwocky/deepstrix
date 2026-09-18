@@ -108,6 +108,10 @@ mod tests {
 }
 
 /// GPU side of §1.5: block max (+pin) -> top-k threshold -> mask apply.
+///
+/// The reachable-count buffer is taken as a RAW device pointer: the kernel reads
+/// it as `unsigned int` (counts are non-negative) while callers hold it as
+/// `DeviceBuffer<i32>` on the decode path and `<u32>` in the oracle.
 pub struct CandidateBlocks {
     module: Module,
 }
@@ -129,6 +133,61 @@ impl CandidateBlocks {
         n_comp.div_ceil(CANDIDATE_BLOCK_SIZE)
     }
 
+    /// LEVEL ONE, at the candidate source (layer 20): score each block and pick
+    /// the threshold, leaving `block_score` / `threshold` for the layers above to
+    /// consume. The source does NOT mask its own scores — the reference publishes
+    /// `shared_attn.candidates` and then takes its own full top-k.
+    pub fn launch_build(
+        &self,
+        stream: &Stream,
+        scores: &DeviceBuffer<f32>,
+        block_score: &mut DeviceBuffer<f32>,
+        threshold: &mut DeviceBuffer<u32>,
+        n_per: v4flash_hip::sys::hipDeviceptr_t,
+        stride: u32,
+        nb_stride: u32,
+        n_comp_max: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_comp_max == 0 {
+            return Ok(());
+        }
+        const T: u32 = 256;
+        let nb_max = Self::n_blocks(n_comp_max);
+        let f = self.module.get_function("candidate_block_max")?;
+        let cfg = LaunchConfig { grid: (nb_max.div_ceil(T), batch, 1), block: (T, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(f, cfg, stream, [block_score.raw(), scores.raw(), n_per, stride, nb_stride, CANDIDATE_BLOCK_SIZE])?;
+        let f = self.module.get_function("candidate_threshold")?;
+        let cfg = LaunchConfig { grid: (batch, 1, 1), block: (T, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(f, cfg, stream, [threshold.raw(), block_score.raw(), n_per, nb_stride, CANDIDATE_BLOCK_SIZE, CANDIDATE_TOPK_BLOCKS])
+    }
+
+    /// LEVEL TWO, at an index source ABOVE the candidate source (24/28/32/36):
+    /// `-inf` every position outside the published candidate blocks, so the
+    /// top-k that follows selects only from within them. Mirrors
+    /// `index_score.masked_fill(~shared_attn.candidates, -inf)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mask(
+        &self,
+        stream: &Stream,
+        scores: &mut DeviceBuffer<f32>,
+        block_score: &DeviceBuffer<f32>,
+        threshold: &DeviceBuffer<u32>,
+        n_per: v4flash_hip::sys::hipDeviceptr_t,
+        stride: u32,
+        nb_stride: u32,
+        n_comp_max: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 || n_comp_max == 0 {
+            return Ok(());
+        }
+        const T: u32 = 256;
+        let f = self.module.get_function("candidate_mask_apply")?;
+        let cfg = LaunchConfig { grid: (n_comp_max.div_ceil(T), batch, 1), block: (T, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(f, cfg, stream, [scores.raw(), block_score.raw(), threshold.raw(), n_per, stride, nb_stride, CANDIDATE_BLOCK_SIZE])
+    }
+
     /// Build the mask AND apply it, in place, to `scores`.
     ///
     /// `scores` is the batched indexer layout (row `b` at `b * stride`), `n_per`
@@ -141,7 +200,7 @@ impl CandidateBlocks {
         scores: &mut DeviceBuffer<f32>,
         block_score: &mut DeviceBuffer<f32>,
         threshold: &mut DeviceBuffer<u32>,
-        n_per: &DeviceBuffer<u32>,
+        n_per: v4flash_hip::sys::hipDeviceptr_t,
         stride: u32,
         nb_stride: u32,
         n_comp_max: u32,
@@ -156,14 +215,14 @@ impl CandidateBlocks {
 
         let f = self.module.get_function("candidate_block_max")?;
         let cfg = LaunchConfig { grid: (nb_max.div_ceil(T), batch, 1), block: (T, 1, 1), shared_mem_bytes: 0 };
-        launch_kernel!(f, cfg, stream, [block_score.raw(), scores.raw(), n_per.raw(), stride, nb_stride, cb])?;
+        launch_kernel!(f, cfg, stream, [block_score.raw(), scores.raw(), n_per, stride, nb_stride, cb])?;
 
         let f = self.module.get_function("candidate_threshold")?;
         let cfg = LaunchConfig { grid: (batch, 1, 1), block: (T, 1, 1), shared_mem_bytes: 0 };
-        launch_kernel!(f, cfg, stream, [threshold.raw(), block_score.raw(), n_per.raw(), nb_stride, cb, CANDIDATE_TOPK_BLOCKS])?;
+        launch_kernel!(f, cfg, stream, [threshold.raw(), block_score.raw(), n_per, nb_stride, cb, CANDIDATE_TOPK_BLOCKS])?;
 
         let f = self.module.get_function("candidate_mask_apply")?;
         let cfg = LaunchConfig { grid: (n_comp_max.div_ceil(T), batch, 1), block: (T, 1, 1), shared_mem_bytes: 0 };
-        launch_kernel!(f, cfg, stream, [scores.raw(), block_score.raw(), threshold.raw(), n_per.raw(), stride, nb_stride, cb])
+        launch_kernel!(f, cfg, stream, [scores.raw(), block_score.raw(), threshold.raw(), n_per, stride, nb_stride, cb])
     }
 }

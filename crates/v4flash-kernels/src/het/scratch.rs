@@ -152,6 +152,11 @@ pub struct DgpuScratch {
     /// × INDEXER_TOP_K candidates per chunk = up to 6 × 512 = 3072 u32
     /// at ATTN_MIXED_MAX_KEYS=24576.
     pub indexer_topk_scratch: DeviceBuffer<u32>,
+    /// ARCH_SPEC 1.5: the candidate blocks layer 20 publishes, consumed by index
+    /// sources above it. Sized for the widest store attention can score, since
+    /// the block count is `ceil(n_comp / CANDIDATE_BLOCK_SIZE)`.
+    pub candidate_block_score: DeviceBuffer<f32>,
+    pub candidate_threshold: DeviceBuffer<u32>,
     pub active_comp_kv: DeviceBuffer<u16>,       // [INDEXER_TOP_K * N_HEAD_DIM]
 
     // Shared expert
@@ -337,6 +342,12 @@ impl DgpuScratch {
                 device_id,
                 ((ATTN_MIXED_MAX_KEYS + 31) / 32) as usize,
             )?,
+            candidate_block_score: DeviceBuffer::new(
+                device_id,
+                (crate::attention::ATTN_MIXED_MAX_KEYS as usize)
+                    .div_ceil(crate::config::CANDIDATE_BLOCK_SIZE as usize),
+            )?,
+            candidate_threshold: DeviceBuffer::new(device_id, 1)?,
             indexer_topk_scratch: {
                 // Two-level bitonic tree merge: L0 = max_chunks*top_k
                 // candidates, plus L1 = n_groups*top_k regrouped candidates

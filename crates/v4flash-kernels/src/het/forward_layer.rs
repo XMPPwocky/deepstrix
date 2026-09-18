@@ -127,6 +127,18 @@ fn local_claim_max() -> Option<usize> {
     *N
 }
 
+/// `V41_CANDIDATE_POOL=1`: ARCH_SPEC §1.5's hierarchical candidate pool. Default
+/// OFF until it is validated — it CHANGES long-context output by construction
+/// (that is the point: it makes 24/28/32/36 select from the same positions the
+/// reference does), so it cannot be gated on bit-identity above 16384 compressed
+/// positions. Below that the mask keeps every block and is a provable no-op.
+pub fn candidate_pool_enabled() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(std::env::var("V41_CANDIDATE_POOL").as_deref(), Ok("1") | Ok("on"))
+    });
+    *B
+}
+
 fn index_k_enabled() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         matches!(std::env::var("V41_INDEX_K").as_deref(), Ok("1") | Ok("on"))
@@ -1608,6 +1620,46 @@ impl HeterogeneousEngine {
                         }
                     }
                 }
+                }
+                // 5b. ARCH_SPEC §1.5, the two-level top-k. The candidate source
+                // (layer 20) publishes its best `CANDIDATE_TOPK_BLOCKS` blocks;
+                // index sources ABOVE it score with their own weights but select
+                // only from inside that mask, which is
+                // `index_score.masked_fill(~shared_attn.candidates, -inf)` in
+                // `inference/model.py`. Without it those layers pick positions the
+                // reference never considers — a fidelity gap that only opens above
+                // 16384 compressed positions, where `min(topk_blocks, num_blocks)`
+                // stops keeping everything.
+                if candidate_pool_enabled() {
+                    let n_per = dgpu_scratch.attn_n_comp_per_b1.raw();
+                    let nb_stride = crate::candidate_blocks::CandidateBlocks::n_blocks(
+                        crate::attention::ATTN_MIXED_MAX_KEYS,
+                    );
+                    if layer == crate::config::CANDIDATE_SOURCE_LAYER {
+                        de.candidate_blocks.launch_build(
+                            &de.compute,
+                            &dgpu_scratch.indexer_scores,
+                            &mut dgpu_scratch.candidate_block_score,
+                            &mut dgpu_scratch.candidate_threshold,
+                            n_per,
+                            n_index_comp,
+                            nb_stride,
+                            n_index_comp,
+                            1,
+                        )?;
+                    } else if layer > crate::config::CANDIDATE_SOURCE_LAYER {
+                        de.candidate_blocks.launch_mask(
+                            &de.compute,
+                            &mut dgpu_scratch.indexer_scores,
+                            &dgpu_scratch.candidate_block_score,
+                            &dgpu_scratch.candidate_threshold,
+                            n_per,
+                            n_index_comp,
+                            nb_stride,
+                            n_index_comp,
+                            1,
+                        )?;
+                    }
                 }
                 // 6. IndexerTopk → sorted indices + bitmap. The bitonic
                 // variant (ported from ds4) is 72× faster than the
