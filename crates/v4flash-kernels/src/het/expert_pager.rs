@@ -46,6 +46,14 @@ pub struct ExpertPager {
     slot_key: Vec<Option<(i32, u32)>>,
     /// Eviction order, front = least-recently-used slot.
     lru: VecDeque<u32>,
+    /// `V41_MISS_HIST=1`: misses counted per (layer, expert), so the SHAPE of the
+    /// miss stream can be read instead of just its rate. The rate alone cannot
+    /// tell apart three cases with opposite fixes — a working set that genuinely
+    /// exceeds the pool (capacity), a small set being evicted and re-read
+    /// (admission/pinning), and particular layers losing the eviction race
+    /// because their reuse distance is longer (eviction policy). `None` unless
+    /// the env is set, so this costs nothing in production.
+    miss_hist: Option<Vec<std::sync::atomic::AtomicU32>>,
     /// Per-role miss staging in `hipHostMalloc` memory, one buffer per role.
     ///
     /// PINNED, not `Vec<u8>`: this box is an APU, so host-pinned memory IS the
@@ -892,6 +900,11 @@ impl ExpertPager {
             slot_of: HashMap::new(),
             slot_key: vec![None; n_slots as usize],
             lru: VecDeque::new(),
+            miss_hist: (std::env::var("V41_MISS_HIST").as_deref() == Ok("1")).then(|| {
+                (0..(crate::config::N_LAYER as usize) * (N_EXPERT as usize))
+                    .map(|_| std::sync::atomic::AtomicU32::new(0))
+                    .collect()
+            }),
             stage: [
                 v4flash_hip::PinnedBuffer::new_with_flags(
                     gate_bpe, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
@@ -1212,6 +1225,13 @@ impl ExpertPager {
                 self.prefill_misses += 1;
             } else {
                 self.decode_misses += 1;
+            }
+            if let Some(h) = self.miss_hist.as_ref() {
+                let l = layer.clamp(0, crate::config::N_LAYER - 1) as usize;
+                if (id as usize) < N_EXPERT as usize {
+                    h[l * N_EXPERT as usize + id as usize]
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             let slot = match self
                 .slot_key
@@ -2003,6 +2023,13 @@ impl ExpertPager {
             } else {
                 self.decode_misses += 1;
             }
+            if let Some(h) = self.miss_hist.as_ref() {
+                let l = layer.clamp(0, crate::config::N_LAYER - 1) as usize;
+                if (id as usize) < N_EXPERT as usize {
+                    h[l * N_EXPERT as usize + id as usize]
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             // Choose a slot: first free, else the LRU victim — but only ABOVE the dense
             // region. Prefill's windows live in slots [0, dense_windows*N_EXPERT) and it
             // trusts `window_layer` to say a whole layer is resident; if decode's LRU
@@ -2234,6 +2261,37 @@ impl ExpertPager {
 
     /// A point-in-time snapshot of every paging counter, for per-request /
     /// per-token deltas.
+    /// Summarise and CLEAR the miss histogram. `None` unless `V41_MISS_HIST=1`.
+    ///
+    /// Clearing makes each dump a window rather than a cumulative total — a
+    /// cumulative expert histogram is what made `expert_stats.json` useless for
+    /// sizing anything.
+    pub fn take_miss_shape(&self) -> Option<MissShape> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let h = self.miss_hist.as_ref()?;
+        let ne = N_EXPERT as usize;
+        // swap-to-zero: each dump is a window, and the read clears in one pass.
+        let vals: Vec<u32> = h.iter().map(|a| a.swap(0, Relaxed)).collect();
+        let total: u64 = vals.iter().map(|&v| v as u64).sum();
+        if total == 0 {
+            return Some(MissShape { total: 0, ..Default::default() });
+        }
+        let distinct = vals.iter().filter(|&&v| v > 0).count() as u32;
+        let mut by_layer = vec![0u64; crate::config::N_LAYER as usize];
+        for (i, &v) in vals.iter().enumerate() {
+            by_layer[i / ne] += v as u64;
+        }
+        let mut top: Vec<u32> = vals.iter().copied().filter(|&v| v > 0).collect();
+        top.sort_unstable_by(|a, b| b.cmp(a));
+        let top16: u64 = top.iter().take(16).map(|&v| v as u64).sum();
+        Some(MissShape {
+            total,
+            distinct,
+            top16_pct: 100.0 * top16 as f64 / total as f64,
+            by_layer,
+        })
+    }
+
     pub fn counters(&self) -> PagerCounters {
         PagerCounters {
             prefill_requests: self.prefill_requests,
@@ -2282,6 +2340,24 @@ impl ExpertPager {
     fn dtype(&self) -> GgufType {
         self.routed.gate.dtype
     }
+}
+
+/// Shape of the miss stream, for `V41_MISS_HIST=1`. See `ExpertPager::miss_hist`.
+///
+/// Reports the three things that distinguish capacity from policy:
+///   * `distinct` — how many (layer, expert) pairs missed at all. Close to the
+///     number of pairs the workload touches => capacity. Far below it => a small
+///     set is thrashing.
+///   * `top16_pct` — share of misses from the 16 worst pairs. High => pinning
+///     those would pay; low => the misses are spread and pinning cannot help.
+///   * `by_layer` — misses per layer. A flat LRU starves layers whose reuse
+///     distance is longer, which reads as concentration here.
+#[derive(Debug, Default, Clone)]
+pub struct MissShape {
+    pub total: u64,
+    pub distinct: u32,
+    pub top16_pct: f64,
+    pub by_layer: Vec<u64>,
 }
 
 /// Snapshot of [`ExpertPager`]'s counters. Subtract two snapshots for a

@@ -1706,6 +1706,28 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                         dense_windows = pg.dense_windows(),
                         "expert pager (request)"
                     );
+                    // `V41_MISS_HIST=1`: the SHAPE of this request's misses.
+                    // The rate alone cannot separate capacity from policy —
+                    // see `ExpertPager::miss_hist`. `total` MUST equal this
+                    // request's prefill+decode misses; if it does not, the
+                    // histogram is miscounting and its shape means nothing,
+                    // so the mismatch is logged rather than silently trusted.
+                    if let Some(ms) = pg.take_miss_shape() {
+                        if ms.total > 0 {
+                            let want = d.prefill_misses + d.decode_misses;
+                            let by_layer: Vec<String> =
+                                ms.by_layer.iter().map(|v| v.to_string()).collect();
+                            tracing::info!(
+                                miss_total = ms.total,
+                                counter_misses = want,
+                                agrees = ms.total == want,
+                                distinct_pairs = ms.distinct,
+                                top16_pct = format!("{:.1}", ms.top16_pct),
+                                by_layer = by_layer.join(","),
+                                "expert pager miss SHAPE"
+                            );
+                        }
+                    }
                     tracing::info!(
                         prefill_requests = cum.prefill_requests,
                         prefill_misses = cum.prefill_misses,
