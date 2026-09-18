@@ -1964,11 +1964,8 @@ impl ExpertShard {
             // the request is decode-shaped and the global pool is enabled.
             let lo = base as u32;
             let hi = lo + n_region as u32;
-            let victim = pool
-                .lru
-                .iter()
-                .copied()
-                .find(|&sl| {
+            let pick = |global: bool, pool: &ShardPool| {
+                pool.lru.iter().copied().find(|&sl| {
                     if !global && !(lo..hi).contains(&sl) {
                         return false;
                     }
@@ -1983,7 +1980,24 @@ impl ExpertShard {
                         None => true,
                     }
                 })
-                .ok_or_else(|| eyre!("expert shard: layer {layer} has no evictable slot"))?;
+            };
+            // Region first (a prefill sweep should not evict its neighbours as a
+            // matter of course), but the region is a PREFERENCE, not a bound. The
+            // per-layer carve is arbitrary -- 154 slots each -- so a layer whose
+            // union exceeds its own share used to die with "no evictable slot"
+            // while thousands of slots sat evictable in other layers' regions.
+            // Borrowing is always better than failing the request.
+            let victim = match pick(global, pool) {
+                Some(v) => v,
+                None => pick(true, pool).ok_or_else(|| {
+                    eyre!(
+                        "expert shard: layer {layer} has no evictable slot anywhere \
+                         (want {} > region {n_region}, pool {} slots)",
+                        want.len(),
+                        pool.owner_of.len(),
+                    )
+                })?,
+            };
             if let Some(p) = pool.lru.iter().position(|&s| s == victim) { pool.lru.remove(p); }
             // Detach from whoever held it — possibly a DIFFERENT layer, whose
             // device remap is then stale until its next `ensure_layer`.
