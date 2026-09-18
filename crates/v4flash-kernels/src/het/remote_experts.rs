@@ -1229,10 +1229,16 @@ struct ShardPool {
     dirty: Vec<bool>,
 }
 
-/// Widen the victim search to the whole pool on decode-shaped requests
-/// (`V41_B2_GLOBAL_POOL=0` keeps the per-layer search, which is byte-identical
-/// to the pre-pool behaviour). Prefill-shaped requests are always
-/// region-restricted regardless.
+/// ONE pool across all layers -- the victim search is a single global LRU and the
+/// per-layer regions are only where a layer's experts happen to be loaded, not a
+/// residency boundary. `V41_B2_GLOBAL_POOL=0` restores the per-layer search
+/// (region preferred, whole pool as fallback), which is what shipped before
+/// 2026-09-18 and is useful for A/B.
+///
+/// Prefill used to be excluded from this on the theory that a layer's sweep would
+/// evict its neighbours. That theory cost an outage: a union larger than one
+/// layer's 154-slot share had no legal victim and failed the request outright
+/// while thousands of slots sat evictable elsewhere.
 pub fn b2_global_pool() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var("V41_B2_GLOBAL_POOL").map(|v| v != "0").unwrap_or(true)
@@ -1930,9 +1936,14 @@ impl ExpertShard {
             l.remap_dev.copy_from_host(&pool.remap_hosts[layer as usize])?;
             pool.dirty[layer as usize] = false;
         }
-        // Prefill sweeps a whole layer's union, so it must stay inside its own
-        // region or one layer's sweep evicts another's. Decode may roam.
-        let global = b2_global_pool() && !prefill_shaped;
+        // ONE POOL for all layers. The per-layer carve was never load-bearing: it
+        // is just the ownership count spread evenly across 40 layers, and grouping
+        // residency by layer is not what the working set looks like -- a layer that
+        // needs more than its equal share should take slots from a layer that needs
+        // fewer, which is exactly what a single global LRU does. `V41_B2_GLOBAL_POOL=0`
+        // restores the old per-layer search (region first, pool as fallback).
+        let _ = prefill_shaped;
+        let global = b2_global_pool();
         let r = &mut self.routed;
         // Disjoint field borrows, hoisted: the per-role read closures below must
         // capture `owner` alone, not `&self`, or they collide with `&mut stage`.
