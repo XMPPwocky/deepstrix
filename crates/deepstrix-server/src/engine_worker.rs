@@ -1727,6 +1727,20 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                         prefill_hit = rate(d.prefill_misses, d.prefill_requests),
                         prefill_read_ms = d.prefill_read_ns / 1_000_000,
                         prefill_h2d_ms = d.prefill_h2d_ns / 1_000_000,
+                        // Read 0 on every real prefill until 2026-09-18:
+                        // `ExpertPager::ensure` filed its time under `decode_*`
+                        // while its miss COUNT went to `prefill_misses`. The
+                        // per-miss cost is the number that decides whether
+                        // overlapping prefill's paging is worth building, so
+                        // emit it next to decode's twin rather than making the
+                        // reader divide two fields that were not comparable.
+                        prefill_ms_per_miss = if d.prefill_misses > 0 {
+                            (d.prefill_read_ns + d.prefill_h2d_ns) as f64
+                                / d.prefill_misses as f64
+                                / 1e6
+                        } else {
+                            f64::NAN
+                        },
                         decode_requests = d.decode_requests,
                         decode_misses = d.decode_misses,
                         decode_hit = rate(d.decode_misses, d.decode_requests),

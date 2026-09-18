@@ -195,6 +195,14 @@ pub struct ExpertPager {
     /// time under `decode_*` while its miss COUNT goes to `prefill_misses`. That
     /// mismatch made `decode_read_ms / decode_misses` mix two phases' numerator
     /// with one phase's denominator and overstated the per-miss cost ~10x.
+    ///
+    /// **`ensure` was missed by that fix and kept the bug until 2026-09-18.**
+    /// It is the path a REAL prefill chunk runs (`forward_prefill.rs`, the
+    /// scan-window branch), so `prefill_read_ms` logged 0 on every request that
+    /// actually prefilled and prefill's paging cost was never measured at all.
+    /// If you are reading a `decode_ms_per_miss` from a per-request line dated
+    /// before then, it has prefill's reads in it; the decode HEARTBEAT does
+    /// not (it deltas between beats during generation).
     pub prefill_alloc_ns: u64,
     pub prefill_pread_ns: u64,
     pub prefill_repack_ns: u64,
@@ -2318,10 +2326,11 @@ impl ExpertPager {
                     src.read_expert_into(td, id as usize, sd.as_mut_slice())?;
                 }
             }
-            self.decode_read_ns += t_read.elapsed().as_nanos() as u64;
+            let read_ns = t_read.elapsed().as_nanos() as u64;
             let rp1 = v4flash_core::hf_v41::expert_read_profile();
             let sp1 = v4flash_core::hf_v41::expert_read_split();
             let pa1 = v4flash_core::hf_v41::expert_read_paths();
+            // These four have no prefill twin and stay BOTH-PHASE totals.
             self.decode_n_layout += pa1.0 - pa0.0;
             self.decode_n_runs += pa1.1 - pa0.1;
             self.decode_n_direct += pa1.2 - pa0.2;
@@ -2330,18 +2339,46 @@ impl ExpertPager {
             self.decode_weight_bytes += sp1.1 - sp0.1;
             self.decode_scale_ns += sp1.2 - sp0.2;
             self.decode_scale_bytes += sp1.3 - sp0.3;
-            self.decode_alloc_ns += rp1.1 - rp0.1;
-            self.decode_pread_ns += rp1.2 - rp0.2;
-            self.decode_repack_ns += rp1.3 - rp0.3;
-            self.decode_pread_bytes += rp1.4 - rp0.4;
+            // Route the timers to the SAME phase the miss COUNT went to above.
+            // `ensure` is the path a REAL prefill chunk runs, and it filed every
+            // nanosecond under `decode_*` while its miss count went to
+            // `prefill_misses` -- precisely the mismatch the prefill twins were
+            // added to fix for `ensure_batched`, which `ensure` never got. Two
+            // consequences, both live until 2026-09-18:
+            //   * `prefill_read_ms` logged 0 on every request that actually
+            //     prefilled, so prefill's paging cost was invisible -- you
+            //     cannot decide whether to overlap a cost you cannot see;
+            //   * the per-request `decode_ms_per_miss` carried prefill's reads
+            //     in the numerator and none of its misses in the denominator,
+            //     which is why it read 15-28 ms against a decode HEARTBEAT of a
+            //     tight 8.4-9.3. The heartbeat is unaffected: it deltas between
+            //     beats during generation, where no prefill runs.
+            if self.count_as_prefill {
+                self.prefill_read_ns += read_ns;
+                self.prefill_alloc_ns += rp1.1 - rp0.1;
+                self.prefill_pread_ns += rp1.2 - rp0.2;
+                self.prefill_repack_ns += rp1.3 - rp0.3;
+                self.prefill_pread_bytes += rp1.4 - rp0.4;
+            } else {
+                self.decode_read_ns += read_ns;
+                self.decode_alloc_ns += rp1.1 - rp0.1;
+                self.decode_pread_ns += rp1.2 - rp0.2;
+                self.decode_repack_ns += rp1.3 - rp0.3;
+                self.decode_pread_bytes += rp1.4 - rp0.4;
+            }
             let t_h2d = std::time::Instant::now();
             let gbpe = self.routed.gate_bytes_per_expert;
             let ubpe = self.routed.up_bytes_per_expert;
             let dbpe = self.routed.down_bytes_per_expert;
             if gpu_repack {
                 let (rp, st) = (self.repack.as_ref().unwrap(), self.repack_stream.as_ref().unwrap());
-                self.decode_repack_gpu_ns +=
+                let gpu_ns =
                     Self::repack_in_place(rp, st, &mut self.routed, slot, &self.stage, coalesced)?;
+                if self.count_as_prefill {
+                    self.prefill_repack_gpu_ns += gpu_ns;
+                } else {
+                    self.decode_repack_gpu_ns += gpu_ns;
+                }
             } else {
                 self.routed
                     .gate
@@ -2359,7 +2396,12 @@ impl ExpertPager {
                     .slice_view_mut(slot as usize * dbpe, dbpe)
                     .copy_from_host(self.stage[2].as_slice())?;
             }
-            self.decode_h2d_ns += t_h2d.elapsed().as_nanos() as u64;
+            let h2d_ns = t_h2d.elapsed().as_nanos() as u64;
+            if self.count_as_prefill {
+                self.prefill_h2d_ns += h2d_ns;
+            } else {
+                self.decode_h2d_ns += h2d_ns;
+            }
             self.slot_of.insert(key, slot);
             self.slot_key[slot as usize] = Some(key);
             self.touch(slot);
