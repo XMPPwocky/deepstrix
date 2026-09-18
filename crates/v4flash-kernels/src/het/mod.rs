@@ -20,6 +20,7 @@ pub mod batch_scratch;
 pub mod dispatch;
 pub mod engine;
 pub mod expert_pager;
+pub mod probe_dump;
 pub mod forward_head;
 pub mod forward_layer;
 pub mod forward_prefill;

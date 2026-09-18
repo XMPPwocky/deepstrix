@@ -2445,6 +2445,21 @@ impl HeterogeneousEngine {
                 let ids: Vec<String> = sel_host.iter().map(|v| v.to_string()).collect();
                 super::expert_pager::pick_trace(&format!("D {layer} {}", ids.join(" ")));
             }
+            // Router-probe dataset (`V41_PROBE_DUMP`). Placed HERE because the
+            // stream is already synchronised for the `d_selected` readback
+            // above, so the extra 20 KB D2H of `ffn_input_norm` adds no stall --
+            // and `ffn_input_norm` is exactly the vector this layer's gate
+            // consumed, post-`ffn_norm`, which is what a probe must be fed.
+            if super::probe_dump::on() {
+                let act = if super::probe_dump::src_layers().contains(&(layer as u32)) {
+                    let mut h = vec![0f32; N_EMBD as usize];
+                    dgpu_scratch.ffn_input_norm.copy_to_host(&mut h)?;
+                    Some(h)
+                } else {
+                    None
+                };
+                super::probe_dump::observe_decode(layer as u32, act.as_deref(), &sel_host, pos);
+            }
             super::trace::phase::add(
                 &super::trace::phase::SEL_SYNC_NS,
                 t_sel.elapsed().as_nanos() as u64,
