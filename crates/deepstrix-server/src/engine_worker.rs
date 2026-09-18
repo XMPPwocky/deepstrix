@@ -1712,16 +1712,33 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                     // request's prefill+decode misses; if it does not, the
                     // histogram is miscounting and its shape means nothing,
                     // so the mismatch is logged rather than silently trusted.
-                    if let Some(ms) = pg.take_miss_shape() {
-                        if ms.total > 0 {
-                            let want = d.prefill_misses + d.decode_misses;
+                    // Window = `V41_MISS_HIST_EVERY` requests (default 20). Over one
+                    // request `distinct == total` is nearly tautological; the ratio
+                    // only becomes informative once pairs have had a chance to recur.
+                    // See `ExpertPager::take_miss_shape`.
+                    static MH_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let every: u64 = std::env::var("V41_MISS_HIST_EVERY")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(20);
+                    let nth = MH_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let closing = every > 0 && nth % every == 0;
+                    if let Some(ms) = pg.take_miss_shape(closing) {
+                        if closing && ms.total > 0 {
+                            // Cross-check only holds for a 1-request window; across a
+                            // longer one the counter delta covers just the last request.
+                            let want = if every == 1 { d.prefill_misses + d.decode_misses } else { ms.total };
                             let by_layer: Vec<String> =
                                 ms.by_layer.iter().map(|v| v.to_string()).collect();
                             tracing::info!(
+                                window_requests = every,
                                 miss_total = ms.total,
                                 counter_misses = want,
                                 agrees = ms.total == want,
                                 distinct_pairs = ms.distinct,
+                                // >1 means pairs MISS AGAIN after being dropped: capacity.
+                                // ~1 means each is fetched once and never returns: compulsory.
+                                refetch_ratio = format!("{:.2}", ms.total as f64 / ms.distinct.max(1) as f64),
                                 top16_pct = format!("{:.1}", ms.top16_pct),
                                 by_layer = by_layer.join(","),
                                 "expert pager miss SHAPE"

@@ -2261,17 +2261,33 @@ impl ExpertPager {
 
     /// A point-in-time snapshot of every paging counter, for per-request /
     /// per-token deltas.
-    /// Summarise and CLEAR the miss histogram. `None` unless `V41_MISS_HIST=1`.
+    /// Summarise the miss histogram, clearing it only when `clear` is set.
+    /// `None` unless `V41_MISS_HIST=1`.
     ///
-    /// Clearing makes each dump a window rather than a cumulative total — a
-    /// cumulative expert histogram is what made `expert_stats.json` useless for
-    /// sizing anything.
-    pub fn take_miss_shape(&self) -> Option<MissShape> {
+    /// The WINDOW is the whole point. Over ONE request `distinct == total` is
+    /// nearly tautological — a pair that misses becomes resident and cannot miss
+    /// again in that request — so a per-request window proves only that nothing
+    /// thrashes inside a turn. Accumulated across MANY requests the same ratio
+    /// separates the two cases that matter:
+    ///
+    ///   distinct ~= total  -> the same pair never misses twice: COMPULSORY.
+    ///                         A tail being streamed once each; no pool size helps.
+    ///   distinct <<  total -> pairs recur: CAPACITY. total/distinct is roughly
+    ///                         how many times the pool re-fetches what it dropped,
+    ///                         and a bigger pool should pay.
+    ///
+    /// Still never cumulative-forever: `expert_stats.json` is cumulative across
+    /// runs and that is exactly what makes it useless for sizing.
+    pub fn take_miss_shape(&self, clear: bool) -> Option<MissShape> {
         use std::sync::atomic::Ordering::Relaxed;
         let h = self.miss_hist.as_ref()?;
         let ne = N_EXPERT as usize;
         // swap-to-zero: each dump is a window, and the read clears in one pass.
-        let vals: Vec<u32> = h.iter().map(|a| a.swap(0, Relaxed)).collect();
+        let vals: Vec<u32> = if clear {
+            h.iter().map(|a| a.swap(0, Relaxed)).collect()
+        } else {
+            h.iter().map(|a| a.load(Relaxed)).collect()
+        };
         let total: u64 = vals.iter().map(|&v| v as u64).sum();
         if total == 0 {
             return Some(MissShape { total: 0, ..Default::default() });
