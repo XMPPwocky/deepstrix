@@ -3,7 +3,16 @@
 
 Costs split into what does and does not scale with S:
   * link (40 remote calls/step, ONE per layer) is B-INVARIANT -> divides by S
-  * expert weight streaming divides by S only as far as streams SHARE experts
+  * DENSE weights (~5.8 GB of attention / shared-expert / router, dGPU-resident)
+    are also B-INVARIANT: a GEMM reads its weight matrix once whether B is 1 or
+    32, and every stream in the batch uses it. This is the term the first
+    version of this model wrongly held CONSTANT per token, which understated
+    multi-stream by ~10 tok/s.
+  * expert weight streaming divides by S only as far as streams SHARE experts,
+    AND the two boxes stream their shares on INDEPENDENT memory systems, so the
+    cost is max(box1, box2) = 0.6x the total, not the sum
+  * KV / attention is genuinely per-token (each stream has its own cache) and is
+    the one term batching can never amortise -- it sets the asymptote
   * misses depend on whether S live working sets fit the pool -- simulated, not
     assumed, because the production data point everyone quotes (50 agents ->
     3.37 misses/token) was SERIAL serving with a context switch per request,
