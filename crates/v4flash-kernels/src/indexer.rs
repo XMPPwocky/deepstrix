@@ -634,6 +634,53 @@ impl IndexerTopk {
 ///                                  merge. Covers ATTN_MIXED_MAX_KEYS=49408.
 ///
 /// Self-zeroes `allowed_bits` so the API matches [`IndexerTopk`].
+/// Bitonic-merge sort width. A single workgroup sorts this many candidates.
+pub const TOPK_SORT_N: u32 = 4096;
+
+/// Candidate counts at each level of the bitonic merge ladder.
+///
+/// `[0]` is the L0 chunk output (`ceil(n_comp / SORT_N) * top_k`); each later
+/// level folds the previous by `SORT_N / top_k` (8 at top_k=512) until one
+/// merge workgroup can finish. The SUM is the per-row scratch the launcher
+/// needs, so the launchers and the two scratch sizers all derive from here --
+/// they used to compute it three times and a single regroup pass was baked in.
+///
+/// Why this is iterative: one regroup pass caps `n_comp` at 262,144, which
+/// `--ctx 307200` exceeds. The launcher then failed MID-LAYER instead of at
+/// admission, which wedged the GPU for every later request. Two passes reach
+/// 2,097,152. The kernels needed no change -- `indexer_topk_regroup_4096`
+/// already bounds its input by `in_stride` and drops padding via `idx < n_comp`.
+pub fn topk_merge_levels(n_comp: u32, top_k: u32) -> Vec<u32> {
+    if n_comp <= TOPK_SORT_N || top_k == 0 {
+        return Vec::new();
+    }
+    let group_chunks = (TOPK_SORT_N / top_k).max(1);
+    let group_span = group_chunks * top_k;
+    let mut levels = vec![n_comp.div_ceil(TOPK_SORT_N) * top_k];
+    while *levels.last().unwrap() > TOPK_SORT_N {
+        let n = *levels.last().unwrap();
+        let next = n.div_ceil(group_span) * top_k;
+        // `next < n` because group_span > top_k; guard anyway so a pathological
+        // top_k cannot spin here.
+        if next >= n {
+            break;
+        }
+        levels.push(next);
+    }
+    levels
+}
+
+/// Byte offsets (in u32s) of each ladder level inside one row's scratch.
+pub fn topk_merge_offsets(levels: &[u32]) -> Vec<usize> {
+    let mut offs = Vec::with_capacity(levels.len());
+    let mut o = 0usize;
+    for &n in levels {
+        offs.push(o);
+        o += n as usize;
+    }
+    offs
+}
+
 pub struct IndexerTopkBitonic {
     module: Module,
 }
@@ -738,53 +785,50 @@ impl IndexerTopkBitonic {
             ]);
         }
 
-        // Two-level tree merge: chunk -> regroup -> merge.
-        // Each regroup group folds `group_chunks` chunks' top_k candidates
-        // (≤ SORT_N) down to top_k. n_groups*top_k must then fit one merge.
+        // N-level tree merge: chunk -> regroup* -> merge. See
+        // [`topk_merge_levels`] for why this iterates instead of doing one pass.
         let group_chunks = SORT_N / top_k; // 8 for SORT_N=4096, top_k=512
         let group_span = group_chunks * top_k;
-        let n_groups = (n_chunks + group_chunks - 1) / group_chunks;
-        let n_grouped = n_groups * top_k;
-        if n_grouped > SORT_N {
-            return Err(eyre!(
-                "indexer_topk_bitonic: n_grouped={n_grouped} exceeds merge cap {SORT_N} \
-                 (n_chunks={n_chunks}, n_groups={n_groups}, top_k={top_k}); a 3rd merge \
-                 level would be needed for n_comp={n_comp}."
-            ));
-        }
-        let scratch_need = (n_candidates + n_grouped) as usize;
+        let levels = crate::indexer::topk_merge_levels(n_comp, top_k);
+        let offs = crate::indexer::topk_merge_offsets(&levels);
+        let scratch_need: usize = levels.iter().map(|&n| n as usize).sum();
         if scratch.len() < scratch_need {
             return Err(eyre!(
-                "indexer_topk_bitonic: scratch has {} u32, need {} (tree merge: \
-                 {n_candidates} L0 + {n_grouped} L1)",
+                "indexer_topk_bitonic: scratch has {} u32, need {} (ladder {levels:?})",
                 scratch.len(),
                 scratch_need
             ));
         }
-
-        // L0 candidates in scratch[0..n_candidates], L1 grouped candidates
-        // in scratch[n_candidates..n_candidates+n_grouped]. Non-owning views.
-        let level0 = scratch.slice_view_mut(0, n_candidates as usize);
-        let level1 = scratch.slice_view_mut(n_candidates as usize, n_grouped as usize);
+        // Non-owning views; `.raw()` copies the pointer out so no borrow of
+        // `scratch` outlives the expression.
+        let ptrs: Vec<_> = levels
+            .iter()
+            .zip(&offs)
+            .map(|(&n, &o)| scratch.slice_view(o, n as usize).raw())
+            .collect();
 
         launch_kernel!(chunk_fn, chunk_cfg, stream, [
-            level0.raw(), scores.raw(), n_comp, top_k
+            ptrs[0], scores.raw(), n_comp, top_k
         ])?;
 
         let regroup_fn = self.module.get_function("indexer_topk_regroup_4096")?;
-        let regroup_cfg = LaunchConfig {
-            grid: (n_groups, 1, 1),
-            block: (BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        launch_kernel!(regroup_fn, regroup_cfg, stream, [
-            level1.raw(), level0.raw(), scores.raw(),
-            n_comp, n_candidates, top_k, group_span
-        ])?;
+        for i in 0..levels.len() - 1 {
+            let n_in = levels[i];
+            let regroup_cfg = LaunchConfig {
+                grid: (n_in.div_ceil(group_span), 1, 1),
+                block: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            launch_kernel!(regroup_fn, regroup_cfg, stream, [
+                ptrs[i + 1], ptrs[i], scores.raw(),
+                n_comp, n_in, top_k, group_span
+            ])?;
+        }
 
+        let last = *levels.last().unwrap();
         launch_kernel!(merge_fn, merge_cfg, stream, [
-            selected.raw(), allowed_bits.raw(), level1.raw(), scores.raw(),
-            n_comp, top_k, n_grouped
+            selected.raw(), allowed_bits.raw(), ptrs[levels.len() - 1], scores.raw(),
+            n_comp, top_k, last
         ])
     }
 
@@ -897,50 +941,58 @@ impl IndexerTopkBitonic {
             ]);
         }
 
-        // Two-level tree merge: chunk -> regroup -> merge.
+        // N-level tree merge: chunk -> regroup* -> merge. See
+        // [`topk_merge_levels`]. THIS is the launcher `--ctx 307200` broke: one
+        // regroup pass caps n_comp at 262,144, and exceeding it errored
+        // mid-layer, which left the GPU faulted for every later request.
         let group_chunks = SORT_N / top_k;
         let group_span = group_chunks * top_k;
-        let n_groups = (n_chunks + group_chunks - 1) / group_chunks;
-        let n_grouped = n_groups * top_k;
-        if n_grouped > SORT_N {
+        let levels = crate::indexer::topk_merge_levels(n_idx_max, top_k);
+        let offs = crate::indexer::topk_merge_offsets(&levels);
+        // Scratch layout: each level is [B, levels[i]], levels laid end to end.
+        let per_row: usize = levels.iter().map(|&n| n as usize).sum();
+        let need = (batch as usize) * per_row;
+        if scratch.len() < need {
             return Err(eyre!(
-                "indexer_topk_bitonic_batched: n_grouped={n_grouped} exceeds merge cap {SORT_N} \
-                 (n_chunks={n_chunks}, n_groups={n_groups}, top_k={top_k}); 3rd merge level needed."
-            ));
-        }
-        // Scratch layout: [B * n_candidates] L0 then [B * n_grouped] L1.
-        let l0_len = (batch * n_candidates) as usize;
-        let l1_len = (batch * n_grouped) as usize;
-        if scratch.len() < l0_len + l1_len {
-            return Err(eyre!(
-                "indexer_topk_bitonic_batched: scratch has {} u32, need {} (B={batch}: \
-                 {n_candidates} L0 + {n_grouped} L1 per token)",
+                "indexer_topk_bitonic_batched: scratch has {} u32, need {} \
+                 (B={batch}, ladder {levels:?} = {per_row} per token)",
                 scratch.len(),
-                l0_len + l1_len
+                need
             ));
         }
-        let level0 = scratch.slice_view_mut(0, l0_len);
-        let level1 = scratch.slice_view_mut(l0_len, l1_len);
+        let ptrs: Vec<_> = levels
+            .iter()
+            .zip(&offs)
+            .map(|(&n, &o)| {
+                scratch
+                    .slice_view((batch as usize) * o, (batch as usize) * n as usize)
+                    .raw()
+            })
+            .collect();
 
         launch_kernel!(chunk_fn, chunk_cfg, stream, [
-            level0.raw(), scores.raw(), n_idx_per.raw(),
+            ptrs[0], scores.raw(), n_idx_per.raw(),
             n_idx_stride, candidates_stride, top_k, done_ptr
         ])?;
 
         let regroup_fn = self.module.get_function("indexer_topk_regroup_4096_batched")?;
-        let regroup_cfg = LaunchConfig {
-            grid: (n_groups, batch, 1),
-            block: (BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        launch_kernel!(regroup_fn, regroup_cfg, stream, [
-            level1.raw(), level0.raw(), scores.raw(), n_idx_per.raw(),
-            n_idx_stride, candidates_stride, n_grouped, top_k, group_span, done_ptr
-        ])?;
+        for i in 0..levels.len() - 1 {
+            let n_in = levels[i];
+            let regroup_cfg = LaunchConfig {
+                grid: (n_in.div_ceil(group_span), batch, 1),
+                block: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            launch_kernel!(regroup_fn, regroup_cfg, stream, [
+                ptrs[i + 1], ptrs[i], scores.raw(), n_idx_per.raw(),
+                n_idx_stride, n_in, levels[i + 1], top_k, group_span, done_ptr
+            ])?;
+        }
 
+        let last = *levels.last().unwrap();
         launch_kernel!(merge_fn, merge_cfg, stream, [
-            selected.raw(), allowed_ptr, level1.raw(), scores.raw(), n_idx_per.raw(),
-            n_idx_stride, n_grouped, n_words_per_b, top_k, n_grouped, done_ptr
+            selected.raw(), allowed_ptr, ptrs[levels.len() - 1], scores.raw(), n_idx_per.raw(),
+            n_idx_stride, last, n_words_per_b, top_k, last, done_ptr
         ])
     }
 }
@@ -1189,5 +1241,39 @@ impl IndexerBitpack {
             shared_mem_bytes: 0,
         };
         launch_kernel!(function, cfg, stream, [bits.raw(), n_comp])
+    }
+}
+
+#[cfg(test)]
+mod topk_ladder_tests {
+    use super::*;
+    use crate::config::INDEXER_TOP_K;
+
+    /// REGRESSION for the 2026-09-18 outage: the launcher hardcoded a single
+    /// regroup pass, which caps `n_comp` at 262,144. `--ctx 307200` exceeded it
+    /// and the launcher returned an error MID-LAYER -- leaving the GPU faulted,
+    /// so every later request died with `hipErrorIllegalAddress` until restart.
+    #[test]
+    fn merge_ladder_covers_the_shipped_cap() {
+        let k = INDEXER_TOP_K;
+
+        // The old two-level scheme's exact ceiling.
+        let at_cap = topk_merge_levels(262_144, k);
+        assert_eq!(at_cap.len(), 2, "262144 should need 2 levels, got {at_cap:?}");
+
+        // One past it needs a third -- this is what used to hard-error.
+        let over = topk_merge_levels(307_200, k);
+        assert!(over.len() >= 3, "307200 needs a 3rd level, got {over:?}");
+
+        // Whatever the engine's cap is, the ladder must terminate inside one
+        // merge workgroup and strictly shrink at every step.
+        let shipped = topk_merge_levels(crate::attention::ATTN_MIXED_MAX_KEYS, k);
+        assert!(
+            *shipped.last().unwrap() <= TOPK_SORT_N,
+            "ladder does not reach a single merge WG: {shipped:?}"
+        );
+        for w in shipped.windows(2) {
+            assert!(w[1] < w[0], "ladder must shrink: {shipped:?}");
+        }
     }
 }

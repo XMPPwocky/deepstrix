@@ -1039,12 +1039,14 @@ fn indexer_topk_scratch_len(rows: usize) -> usize {
     if !crate::attention::indexer_scratch_needed() {
         return 0;
     }
-    // Two-level bitonic tree merge (see scratch.rs): per token
-    // L0 = max_chunks*top_k + L1 = n_groups*top_k.
-    let max_chunks = (ATTN_MIXED_MAX_KEYS + 4095) / 4096;
-    let group_chunks = 4096 / INDEXER_TOP_K;
-    let n_groups = (max_chunks + group_chunks - 1) / group_chunks;
-    rows * ((max_chunks + n_groups) * INDEXER_TOP_K) as usize
+    // N-level bitonic tree merge, sized from the SAME ladder the launcher
+    // walks (`indexer::topk_merge_levels`). It used to hardcode exactly two
+    // levels here and in `scratch.rs` and a third time in the launcher; the
+    // launcher then hard-errored past 262,144 compressed positions, mid-layer.
+    let per_row: u32 = crate::indexer::topk_merge_levels(ATTN_MIXED_MAX_KEYS, INDEXER_TOP_K)
+        .iter()
+        .sum();
+    rows * per_row as usize
 }
 
 /// R1 arena byte size: the largest of its offset-0 members and the hot

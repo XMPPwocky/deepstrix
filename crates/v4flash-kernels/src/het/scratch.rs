@@ -354,14 +354,15 @@ impl DgpuScratch {
             candidate_threshold: DeviceBuffer::new(device_id, 1)?,
             candidate_n_per: DeviceBuffer::new(device_id, 1)?,
             indexer_topk_scratch: {
-                // Two-level bitonic tree merge: L0 = max_chunks*top_k
-                // candidates, plus L1 = n_groups*top_k regrouped candidates
-                // (group = 4096/top_k chunks). Covers n_comp up to
-                // ATTN_MIXED_MAX_KEYS without the old 32768 merge-cap wall.
-                let max_chunks = (ATTN_MIXED_MAX_KEYS + 4095) / 4096;
-                let group_chunks = 4096 / INDEXER_TOP_K;
-                let n_groups = (max_chunks + group_chunks - 1) / group_chunks;
-                DeviceBuffer::new(device_id, ((max_chunks + n_groups) * INDEXER_TOP_K) as usize)?
+                // N-level bitonic tree merge, sized from the SAME ladder the
+                // launcher walks (`indexer::topk_merge_levels`) rather than a
+                // hardcoded two levels -- see that function for why one pass
+                // capped n_comp at 262,144.
+                let per_row: u32 =
+                    crate::indexer::topk_merge_levels(ATTN_MIXED_MAX_KEYS, INDEXER_TOP_K)
+                        .iter()
+                        .sum();
+                DeviceBuffer::new(device_id, per_row as usize)?
             },
             active_comp_kv: DeviceBuffer::new(
                 device_id,
