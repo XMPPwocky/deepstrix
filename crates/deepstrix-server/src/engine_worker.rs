@@ -1035,16 +1035,30 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         } else {
             v4flash_kernels::config::SWA_WINDOW
         };
-        let need = v4flash_kernels::attention::attn_max_scored_keys(cfg.n_kv_max, raw_window);
+        // TWO bounds, and the indexer's is the binding one under v41.
+        // `attn_max_scored_keys` asks what ATTENTION scores after the gather,
+        // and `scored_keys_are_gathered` reads `V41_INDEX_K` at runtime — so
+        // with the indexer on it answers 640 at ANY context and admits a --ctx
+        // whose comp-indexed scratch does not exist. The indexer still has to
+        // score the whole store to pick that top-k. Check both; the max wins.
+        let attn_need =
+            v4flash_kernels::attention::attn_max_scored_keys(cfg.n_kv_max, raw_window);
+        let index_need =
+            v4flash_kernels::attention::indexer_max_scored_keys(cfg.n_kv_max, raw_window);
+        let need = attn_need.max(index_need);
         let cap = v4flash_kernels::ATTN_MIXED_MAX_KEYS;
         if need > cap {
+            let max_ctx = v4flash_kernels::attention::attn_max_ctx_for_keys(cap, raw_window)
+                .min(v4flash_kernels::attention::indexer_max_ctx_for_keys(cap, raw_window));
             return Err(eyre!(
-                "--ctx {} makes decode attention score {} keys per head but \
+                "--ctx {} needs {} keys per head (attention {}, indexer {}) but \
                  ATTN_MIXED_MAX_KEYS is {} (raise it in attention.rs, or use --ctx <= {})",
                 cfg.n_kv_max,
                 need,
+                attn_need,
+                index_need,
                 cap,
-                v4flash_kernels::attention::attn_max_ctx_for_keys(cap, raw_window),
+                max_ctx,
             ));
         }
     }

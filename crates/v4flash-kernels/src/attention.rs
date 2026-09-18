@@ -67,8 +67,30 @@ pub const ATTN_SWA_BATCHED_MAX_KV: u32 = 512;
 /// (`max_keys`), so nothing needs to match it.
 #[cfg(not(feature = "v41"))]
 pub const ATTN_MIXED_MAX_KEYS: u32 = 82176;
+/// Largest `--ctx` V4.1 can serve. The INDEXER scores its whole compressed
+/// store densely to PRODUCE the top-k, and layers 20-39 are ratio 1, so the
+/// widest store is one row per token: this cap is a context limit 1:1.
 #[cfg(feature = "v41")]
-pub const ATTN_MIXED_MAX_KEYS: u32 = 131_072 + crate::config::SWA_WINDOW; // 131200
+pub const V41_MAX_CTX: u32 = 307_200;
+
+/// RAISED 2026-09-18 from `131_072 + SWA_WINDOW`, closing a SILENT TRUNCATION.
+///
+/// [`scored_keys_are_gathered`] reads `V41_INDEX_K` at RUNTIME, so with the
+/// indexer on [`attn_max_scored_keys`] collapsed to `SWA_WINDOW +
+/// INDEXER_TOP_K` = 640 and the server admitted `--ctx 307200` — while every
+/// comp-indexed scratch buffer was still sized for 131_200. `n_index_comp` was
+/// then `.min()`ed to the cap, so past 131_200 tokens the indexer scored only
+/// the FIRST 131_200 compressed positions and every later token was invisible
+/// to all 38 compressed layers, reachable only through the 128-token raw
+/// window. No test caught it because the env var is unset under `cargo test`,
+/// which is exactly the regime where the old bound is correct.
+///
+/// Two things prevent a recurrence: the admission check now derives from
+/// [`indexer_max_scored_keys`], which has NO gathered shortcut and no env
+/// dependence, and the truncating `.min()`s are hard errors.
+#[cfg(feature = "v41")]
+pub const ATTN_MIXED_MAX_KEYS: u32 =
+    V41_MAX_CTX + crate::het::image_spans::IMAGE_RAW_WINDOW_MAX;
 
 /// FLOOR stride (in keys) of the `attn_scores` scratch buffer per
 /// (batch, head). The stride actually used is per-launch — see
@@ -220,6 +242,42 @@ pub fn attn_max_ctx_for_keys(keys: u32, raw_window: u32) -> u32 {
         // budget as long as the gather itself fits.
         return u32::MAX;
     }
+    budget.saturating_mul(min_ratio)
+}
+
+/// Worst-case compressed positions the INDEXER scores DENSELY at `n_kv_max`,
+/// over every layer of this model.
+///
+/// Distinct from [`attn_max_scored_keys`], and the distinction is the whole
+/// point: that function bounds what ATTENTION scores AFTER the gather, so a
+/// gathered layer contributes only `INDEXER_TOP_K`. The indexer has to rank the
+/// WHOLE store to produce that top-k, so its bound does not shrink when a layer
+/// is gathered — and unlike the attention bound it must not depend on a runtime
+/// flag, because the buffers it sizes are allocated once.
+///
+/// This is the quantity `indexer_scores`, `indexer_allowed_bits`,
+/// `indexer_topk_scratch` and `candidate_block_score` are all strided by.
+pub fn indexer_max_scored_keys(n_kv_max: u32, raw_window: u32) -> u32 {
+    let mut worst = 0u32;
+    for &ratio in crate::config::COMPRESS_RATIOS.iter() {
+        if ratio == 0 {
+            continue;
+        }
+        worst = worst.max(n_kv_max.div_ceil(ratio));
+    }
+    raw_window.saturating_add(worst)
+}
+
+/// Inverse of [`indexer_max_scored_keys`]: the largest context whose dense
+/// indexer scoring fits in `keys`.
+pub fn indexer_max_ctx_for_keys(keys: u32, raw_window: u32) -> u32 {
+    let budget = keys.saturating_sub(raw_window);
+    let min_ratio = crate::config::COMPRESS_RATIOS
+        .iter()
+        .copied()
+        .filter(|&r| r > 0)
+        .min()
+        .unwrap_or(1);
     budget.saturating_mul(min_ratio)
 }
 
@@ -1212,6 +1270,50 @@ mod tests {
         assert!(attn_max_scored_keys(ctx, w) <= keys);
     }
 
+    /// REGRESSION for the 2026-09-18 silent truncation.
+    ///
+    /// `attn_max_scored_keys` reaches `scored_keys_are_gathered`, which reads
+    /// `V41_INDEX_K` at RUNTIME — so it answers one thing under `cargo test`
+    /// (var unset) and another in production (`=1`), and the production answer
+    /// admitted a `--ctx` 2.3x wider than the buffers. That is why every
+    /// existing cap test passed while production truncated: they all went
+    /// through the env-dependent function. This one does not.
+    #[test]
+    fn indexer_bound_does_not_depend_on_the_env() {
+        let w = crate::config::SWA_WINDOW;
+        let min_ratio = crate::config::COMPRESS_RATIOS
+            .iter()
+            .copied()
+            .filter(|&r| r > 0)
+            .min()
+            .expect("model has a compressed layer");
+        // No gathered shortcut: the indexer ranks the WHOLE store.
+        assert_eq!(
+            indexer_max_scored_keys(65536, w),
+            w + 65536u32.div_ceil(min_ratio)
+        );
+        // Whatever the cap is, the inverse round-trips inside it.
+        let ctx = indexer_max_ctx_for_keys(ATTN_MIXED_MAX_KEYS, w);
+        assert!(indexer_max_scored_keys(ctx, w) <= ATTN_MIXED_MAX_KEYS);
+    }
+
+    /// The cap must cover the context we actually ship, computed through the
+    /// env-independent bound.
+    #[cfg(feature = "v41")]
+    #[test]
+    fn cap_covers_the_shipped_ctx() {
+        // The WIDEST raw window, not the text-only one: `engine_worker` passes
+        // `IMAGE_RAW_WINDOW_MAX` whenever `--mmproj` is set, which production
+        // does. Sizing this test off `SWA_WINDOW` made it pass against a cap
+        // that was 384 keys short, and the server refused to start.
+        let w = crate::het::image_spans::IMAGE_RAW_WINDOW_MAX;
+        let need = indexer_max_scored_keys(V41_MAX_CTX, w);
+        assert!(
+            need <= ATTN_MIXED_MAX_KEYS,
+            "--ctx {V41_MAX_CTX} needs {need} indexer keys, cap is {ATTN_MIXED_MAX_KEYS}"
+        );
+    }
+
     /// The decode cap must cover the context the server is allowed to accept.
     #[test]
     fn decode_cap_admits_a_real_context() {
@@ -1219,9 +1321,16 @@ mod tests {
         let ctx = attn_max_ctx_for_keys(ATTN_MIXED_MAX_KEYS, w);
         assert!(ctx >= 8192, "decode cap only reaches {ctx} tokens");
         assert!(attn_max_scored_keys(ctx, w) <= ATTN_MIXED_MAX_KEYS);
-        if cfg!(feature = "v41") {
-            // V4.1: ratio-1 layers make this a 1:1 context limit.
-            assert_eq!(ctx, 131_072);
+        #[cfg(feature = "v41")]
+        {
+            // V4.1: ratio-1 layers make this a 1:1 context limit. `ctx` here is
+            // the TEXT-only inverse while the cap carries the wider vision raw
+            // window, so it sits a little above `V41_MAX_CTX` — the invariant
+            // that matters is that it covers what we ship, not equality.
+            assert!(
+                ctx >= V41_MAX_CTX,
+                "text-only inverse {ctx} below the shipped --ctx {V41_MAX_CTX}"
+            );
         }
     }
 

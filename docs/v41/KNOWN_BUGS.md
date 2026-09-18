@@ -821,6 +821,63 @@ ON, `expert_pager.rs:219`) only admits experts box 2 reported missing
 (`box2_missed`), so box 1 is a victim cache for box 2 rather than a duplicate of
 its hot set. The bug is the freeze, not the gate.
 
+### 19. ~~FIXED~~ (2026-09-18) — `--ctx 307200` SILENTLY TRUNCATED the indexer to 131,200 positions
+
+**The worst bug found in this engine to date**, because it degraded answers
+without a single error, warning or failing test, for a day of live agent use.
+
+`scored_keys_are_gathered()` reads `V41_INDEX_K` **at runtime**. With the
+indexer on it reports every compressed layer as gathered, so
+`attn_max_scored_keys()` — the sole input to the server's `--ctx` admission
+check — collapsed to `SWA_WINDOW + INDEXER_TOP_K` = **640 at any context**. The
+check therefore admitted `--ctx 307200` while every comp-indexed scratch buffer
+was still sized off the compile-time `ATTN_MIXED_MAX_KEYS` = 131,200.
+
+`n_index_comp` was then `.min(ATTN_MIXED_MAX_KEYS)`-ed at three sites
+(`forward_layer.rs` x2, `forward_prefill.rs` x1), each carrying a comment
+asserting production could not reach it. So past 131,200 tokens the indexer
+scored only the FIRST 131,200 compressed positions, and **every later token was
+invisible to all 38 compressed layers** — reachable only through the 128-token
+raw sliding window. Layers 0-1 are sliding-window-only. The model saw the head
+of the conversation, a hole, and the last 128 tokens.
+
+Presented to the user as "it's like it isn't listening to me, sometimes — like
+it sees my messages out of order."
+
+**Why no test caught it.** Every cap test routes through the env-dependent
+`attn_max_scored_keys`, and `V41_INDEX_K` is unset under `cargo test` — the one
+regime where the old bound is correct. `decode_cap_admits_a_real_context`
+asserted `ctx == 131_072` and passed, in a process configured unlike production.
+
+**Introduced by `3409948`** (2026-09-18), which changed the gather predicate and
+raised the default `--ctx` to 307200 in the same commit. The ceiling that had
+been refusing `--ctx > 131_072` was load-bearing and its removal was not noticed
+because it was never the stated subject of the change.
+
+**Fixed:** `ATTN_MIXED_MAX_KEYS` raised to
+`V41_MAX_CTX + IMAGE_RAW_WINDOW_MAX` (+~550 MB dGPU at `lane_rows` 512) — NOT
+`+ SWA_WINDOW`, which was the first attempt: `engine_worker` passes the wider
+vision raw window whenever `--mmproj` is set, which production does, so the cap
+came out 384 keys short and the server refused to start. The first version of
+`cap_covers_the_shipped_ctx` made the same substitution and passed anyway; it
+now takes `IMAGE_RAW_WINDOW_MAX`. Same class of error as the bug itself — a
+bound computed in a configuration unlike production. Also new:
+`indexer_max_scored_keys()` with no
+gathered shortcut and no env dependence, which the admission check now takes the
+max against; all three truncating `.min()`s are hard errors; two regression
+tests, one verified to fail at the old cap.
+
+**Follow-up (not done):** the indexer buffers are still strided by the constant
+rather than by `n_kv_max`, so a small `--ctx` pays the 307K footprint.
+`alloc_rows_ctx` already carries `n_kv_max`; tightening means threading the
+stride to ~10 launch sites that currently pass `ATTN_MIXED_MAX_KEYS`, and a
+missed site is silent corruption. Do it with the stride as a struct field, once.
+
+**How to apply:** a runtime flag must never be an input to a bound that sizes a
+buffer allocated once. And a `.min()` on a quantity an admission check is
+supposed to guarantee is not defensive — it converts a loud failure into a
+silent one, and deletes the evidence.
+
 ## Structural / ergonomic
 
 ### 10. OPEN — two sources of truth for the current HIP device

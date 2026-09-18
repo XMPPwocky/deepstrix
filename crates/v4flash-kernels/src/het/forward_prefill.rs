@@ -3034,8 +3034,16 @@ impl HeterogeneousEngine {
                 }
             }
         }
-        for v in n_comp_after.iter_mut() {
-            *v = (*v).min(ATTN_MIXED_MAX_KEYS);
+        // HARD ERROR, not a clamp — see the matching note in `forward_layer`.
+        // Clamping here truncated the indexer's view of a >131K prompt during
+        // PREFILL, silently, on the same stale "production can't reach it"
+        // premise that `V41_INDEX_K` invalidated.
+        if let Some(&over) = n_comp_after.iter().find(|&&v| v > ATTN_MIXED_MAX_KEYS) {
+            return Err(eyre!(
+                "L{layer}: prefill n_comp_after {over} exceeds the comp-indexed \
+                 scratch stride {ATTN_MIXED_MAX_KEYS} — --ctx admission should \
+                 have refused this"
+            ));
         }
 
         // ========================================================

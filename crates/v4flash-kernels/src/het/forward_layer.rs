@@ -1383,15 +1383,21 @@ impl HeterogeneousEngine {
             let cs = ls.compressor.as_ref();
             let n_comp_full = cs.map(|c| c.n_comp).unwrap_or(0);
             let ics = ls.indexer_compressor.as_ref();
-            // Clamp to the scratch stride (indexer_scores [MAX_KEYS],
-            // indexer_allowed_bits [ceil(MAX_KEYS/32)]). Unreachable in
-            // production (the server refuses a --ctx whose
-            // `attn_max_scored_keys` exceeds MAX_KEYS); FAKE_POS benches
-            // decoding past the cap used to overrun the bitmap by one word.
-            let n_index_comp = ics
-                .map(|c| c.n_comp)
-                .unwrap_or(0)
-                .min(crate::attention::ATTN_MIXED_MAX_KEYS);
+            // HARD ERROR against the scratch stride (indexer_scores [MAX_KEYS],
+            // indexer_allowed_bits [ceil(MAX_KEYS/32)]). This used to `.min()`,
+            // on the claim that production could not reach it — which stopped
+            // being true the moment `scored_keys_are_gathered` started reading
+            // `V41_INDEX_K`, and then truncated context SILENTLY for a day. A
+            // clamp on a bound the admission check is supposed to guarantee is
+            // not defensive, it is a way to lose the evidence.
+            let n_index_comp = ics.map(|c| c.n_comp).unwrap_or(0);
+            if n_index_comp > crate::attention::ATTN_MIXED_MAX_KEYS {
+                return Err(eyre!(
+                    "L{layer}: n_index_comp {n_index_comp} exceeds the comp-indexed \
+                     scratch stride {} — --ctx admission should have refused this",
+                    crate::attention::ATTN_MIXED_MAX_KEYS
+                ));
+            }
             // The sparse/top-512 indexer path is gated on `ratio == 4`, which ONLY
             // V4-Flash has: V4.1's ratios are 1 and 2, so every V4.1 layer >= 2
             // scores DENSELY over its whole compressed store. Widening this gate is
@@ -1414,8 +1420,18 @@ impl HeterogeneousEngine {
             // maintained by the S1a store.
             let v41_index_k = cs.and_then(|c| c.index_k.as_ref());
             let v41_n_index = cs.map(|c| c.n_index_comp).unwrap_or(0);
+            if cfg!(feature = "v41")
+                && v41_index_k.is_some()
+                && v41_n_index > crate::attention::ATTN_MIXED_MAX_KEYS
+            {
+                return Err(eyre!(
+                    "L{layer}: n_index_comp {v41_n_index} exceeds the comp-indexed \
+                     scratch stride {} — --ctx admission should have refused this",
+                    crate::attention::ATTN_MIXED_MAX_KEYS
+                ));
+            }
             let (n_index_comp, keys_v41) = if cfg!(feature = "v41") && v41_index_k.is_some() {
-                (v41_n_index.min(crate::attention::ATTN_MIXED_MAX_KEYS), v41_index_k)
+                (v41_n_index, v41_index_k)
             } else {
                 (n_index_comp, None)
             };
