@@ -1685,14 +1685,21 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                 // scheduler, and it is paid 80x per token.
                 #[cfg(feature = "v41")]
                 {
-                    let (to_write, to_wait, n) =
+                    let (to_write, wake, slack, n_blocked, n) =
                         v4flash_kernels::het::remote_experts::take_hop_stats();
                     if n > 0 {
+                        // `exposed_pct` is the number that matters: the fraction
+                        // of calls where we were already blocked waiting for the
+                        // reply. The rest finished behind local work and cost
+                        // nothing, so per-call link latency must NOT be
+                        // multiplied by 80 to get a per-token figure.
                         tracing::info!(
                             submit_to_write_us = to_write,
-                            recv_to_wait_us = to_wait,
+                            wake_us = wake,
+                            slack_us = slack,
+                            exposed_pct = 100.0 * n_blocked as f64 / n as f64,
+                            blocked = n_blocked,
                             calls = n,
-                            per_token_ms = (to_write + to_wait) * 80.0 / 1000.0,
                             "remote.hop.summary"
                         );
                     }

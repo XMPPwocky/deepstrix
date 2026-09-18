@@ -3253,20 +3253,42 @@ ms_per_miss={:.2} (read {:.2} [pread {:.2} repack_cpu {:.2}] h2d {:.2} repack_gp
 /// syscall.
 pub static HOP_SUBMIT_TO_WRITE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-pub static HOP_RECV_TO_WAIT_NS: std::sync::atomic::AtomicU64 =
+/// True reader->caller wakeup: only counted when the caller was ALREADY blocked
+/// in `recv()` when the frame landed.
+pub static HOP_WAIT_WAKE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// How EARLY a reply arrived, when the caller was still busy. This is slack, not
+/// cost -- it means the remote leg was hidden behind local work for that call.
+pub static HOP_SLACK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Calls where the caller was already blocked, i.e. the link WAS exposed.
+pub static HOP_N_BLOCKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static HOP_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Drain the accumulated hop timings as `(submit_to_write_us, recv_to_wait_us, n)`.
-pub fn take_hop_stats() -> (f64, f64, u64) {
+/// Drain as `(submit_to_write_us, wake_us, slack_us, n_blocked, n)`.
+///
+/// `wake_us` averages over BLOCKED calls only and `slack_us` over early ones, so
+/// neither is diluted by the other. The first version of this averaged one
+/// number over everything and reported 2715 us -- which was not a handoff at
+/// all, but replies sitting in the channel while the caller was still doing GPU
+/// work between `wait(laneA)` and `wait(laneB)`. Slack read as cost.
+pub fn take_hop_stats() -> (f64, f64, f64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let n = HOP_N.swap(0, Relaxed);
+    let nb = HOP_N_BLOCKED.swap(0, Relaxed);
     let a = HOP_SUBMIT_TO_WRITE_NS.swap(0, Relaxed);
-    let b = HOP_RECV_TO_WAIT_NS.swap(0, Relaxed);
+    let w = HOP_WAIT_WAKE_NS.swap(0, Relaxed);
+    let sl = HOP_SLACK_NS.swap(0, Relaxed);
     if n == 0 {
-        return (0.0, 0.0, 0);
+        return (0.0, 0.0, 0.0, 0, 0);
     }
-    (a as f64 / n as f64 / 1000.0, b as f64 / n as f64 / 1000.0, n)
+    let early = n.saturating_sub(nb).max(1);
+    (
+        a as f64 / n as f64 / 1000.0,
+        w as f64 / nb.max(1) as f64 / 1000.0,
+        sl as f64 / early as f64 / 1000.0,
+        nb,
+        n,
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3723,15 +3745,24 @@ impl RemoteExpertClient {
         if head.seq != ticket.seq {
             return Err(eyre!("wait: ticket seq {} but oldest in flight is {}", ticket.seq, head.seq));
         }
+        // Stamped BEFORE the blocking recv, so we can tell "we waited for the
+        // reply" apart from "the reply waited for us".
+        let t_wait_enter = Instant::now();
         let (buf, t_recv, t4) = match self.rx_resp.recv() {
             Ok(ClientInbound::Resp { buf, t_recv, t4 }) => {
-                // The reader thread stamped `t_recv` the instant the frame was
-                // whole; everything since is the channel handing it to us.
-                HOP_RECV_TO_WAIT_NS.fetch_add(
-                    t_recv.elapsed().as_nanos() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                HOP_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                use std::sync::atomic::Ordering::Relaxed;
+                let now = Instant::now();
+                if t_recv >= t_wait_enter {
+                    // We were already parked in recv() when the frame landed:
+                    // this is a genuine wakeup, and the remote leg was EXPOSED.
+                    HOP_WAIT_WAKE_NS.fetch_add((now - t_recv).as_nanos() as u64, Relaxed);
+                    HOP_N_BLOCKED.fetch_add(1, Relaxed);
+                } else {
+                    // The frame was already sitting in the channel: the remote
+                    // leg finished behind local work and cost us nothing.
+                    HOP_SLACK_NS.fetch_add((t_wait_enter - t_recv).as_nanos() as u64, Relaxed);
+                }
+                HOP_N.fetch_add(1, Relaxed);
                 (buf, t_recv, t4)
             }
             // Both arms mean the socket is gone, not that this reply was bad, so
