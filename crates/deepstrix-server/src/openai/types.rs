@@ -11,6 +11,13 @@ use serde::{Deserialize, Deserializer, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    /// `"developer"` deserializes here too. OpenAI renamed the system role to
+    /// `developer` for o1-era models and clients now send either; prime-agent
+    /// sends `developer` and was getting a 422 that killed the request. The two
+    /// mean the same thing to us, and serde `alias` keeps ONE variant so every
+    /// `match` on Role stays exhaustive and the system-merge path is unchanged.
+    /// We always SERIALIZE it back as `system`.
+    #[serde(alias = "developer")]
     System,
     User,
     Assistant,
@@ -630,5 +637,42 @@ mod tests {
         assert_eq!(r.messages.len(), 2);
         assert!(r.messages[1].has_images());
         assert_eq!(r.messages[1].content.as_deref(), Some("hi"));
+    }
+}
+
+#[cfg(test)]
+mod role_alias_tests {
+    use super::*;
+
+    /// prime-agent sends OpenAI's `developer` role; rejecting it 422'd the whole
+    /// request ("unknown variant `developer`") and the client's retry gave up.
+    #[test]
+    fn developer_role_deserializes_as_system() {
+        let m: ChatMessage = serde_json::from_str(
+            r#"{"role":"developer","content":"you are a helpful agent"}"#,
+        )
+        .expect("developer role must deserialize");
+        assert_eq!(m.role, Role::System);
+    }
+
+    #[test]
+    fn system_still_works_and_round_trips_as_system() {
+        let m: ChatMessage = serde_json::from_str(r#"{"role":"system","content":"x"}"#).unwrap();
+        assert_eq!(m.role, Role::System);
+        // We normalise on the way out: one spelling downstream.
+        assert_eq!(serde_json::to_value(Role::System).unwrap(), serde_json::json!("system"));
+    }
+
+    #[test]
+    fn the_other_roles_are_untouched() {
+        for (s, want) in [
+            ("user", Role::User),
+            ("assistant", Role::Assistant),
+            ("tool", Role::Tool),
+        ] {
+            let m: ChatMessage =
+                serde_json::from_str(&format!(r#"{{"role":"{s}","content":"x"}}"#)).unwrap();
+            assert_eq!(m.role, want);
+        }
     }
 }
