@@ -22,12 +22,16 @@
 //!    read. Two sources cost 20 KB/token and let the source be A/B'd offline
 //!    instead of guessed.
 //!
-//! 3. **Leave room for PREFILL rows** (`V41_PROBE_PREFILL_STRIDE`, not wired
-//!    yet). A decode request yields ~400 samples; a 93K-token prefill yields
-//!    93K, so one subsampled request is worth hours of decode. Prefill rows
-//!    carry a mild distribution shift (different positions) but the same gates
-//!    and the same residual dynamics; `phase` is in the record so they can be
-//!    held out. Today only decode is collected.
+//! 3. **DECODE ONLY, and prefill is not worth wiring.** The obvious idea is to
+//!    harvest prefill rows too, since a request prefills ~93K tokens and
+//!    decodes only ~400. CED kills it: the decoder half only runs over the
+//!    replay window, so on a real trace prefill touched layers 20-39 on **1,186
+//!    of 97,559 rows (1.2%)** against 19,140 decode tokens -- prefill is worth
+//!    **0.06x** what decode is for this dataset, not the 100x the raw token
+//!    counts suggest. And the decoder layers are the only predictable targets
+//!    here (they are the only ones with lead time from the seam), so decoder
+//!    rows are the only rows that count. `phase` stays in the record so the
+//!    format survives if that ever changes.
 //!
 //! THE ZERO-SHOT TEST RUNS OFFLINE FROM THIS SAME FILE. `W_L` and `b_L` are in
 //! the checkpoint, so "how well does layer L's own gate do when fed layer 19's
@@ -65,19 +69,6 @@ pub fn src_layers() -> &'static [u32] {
             .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
             .unwrap_or_else(|| vec![19, 20])
     })
-}
-
-/// `V41_PROBE_PREFILL_STRIDE=N`: **NOT WIRED YET.** The knob and the `phase`
-/// field exist so the format does not change when it lands, but only the DECODE
-/// path calls `observe_decode` today, so setting this does nothing. Wiring it
-/// means handling `ffn_input_norm` as `[b, N_EMBD]` in `forward_prefill` and
-/// picking rows by stride. Worth it: a decode request yields ~400 samples and a
-/// 93K-token prefill at stride 16 yields ~5,800.
-pub fn prefill_stride() -> usize {
-    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("V41_PROBE_PREFILL_STRIDE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
-    });
-    *N
 }
 
 fn f32_to_f16(x: f32) -> u16 {
@@ -184,11 +175,10 @@ fn writer() -> Option<&'static Writer> {
                 })
                 .ok()?;
             eprintln!(
-                "probe dump ON -> {p_log} (src layers {:?}, targets L{}..{}, prefill stride {})",
+                "probe dump ON -> {p_log} (src layers {:?}, targets L{}..{}, decode only)",
                 src_layers(),
                 DST0,
-                N_LAYER - 1,
-                prefill_stride()
+                N_LAYER - 1
             );
             Some(Writer { tx })
         })
