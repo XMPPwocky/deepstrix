@@ -1390,8 +1390,12 @@ impl HeterogeneousEngine {
             // 2/8/14/20/24/28/32/36 sharing one top-512 with their reuse layers,
             // keys on the 4 kv-source layers only, plus the layer-20 hierarchical
             // candidate pool — ARCH_SPEC §1.4/§1.5, ENGINE_PORT M5 leftover).
-            // `n_index_comp` is 0 under v41, so the condition below is false for
-            // BOTH reasons; see docs/v41/DECODE_M8_PLAN.md "Measured (2026-09-13)".
+            // STALE AS OF S1 (corrected 2026-09-18): `n_index_comp` is no longer 0
+            // under v41 — the CSA2 note below is the current state, and the sparse
+            // path DOES run, on the 8 index-source layers. What remains true is that
+            // the 32 REUSE layers still score densely (see `use_sparse`, gated on
+            // `is_index_source_layer`), which is what keeps the scores-scratch and
+            // the --ctx ceiling dense-sized. See docs/v41/DECODE_M8_PLAN.md.
             // V4.1 CSA2 (S1): index-K lives on the KV-SOURCE's compressor state
             // (`with_kv_source` has already moved it in for reuse layers), NOT in a
             // separate `indexer_compressor` — V4.1 has none. `n_index_comp` is
@@ -2410,10 +2414,17 @@ impl HeterogeneousEngine {
                     //
                     // WHY THIS EXISTS. Mode 1 decides the split with
                     // `pg.is_resident(layer, e)`, so the box1/box2 partition is a
-                    // function of RESIDENCY, hence of REQUEST HISTORY. A different
-                    // partition groups the per-expert partial sums differently and
-                    // f32 addition is not associative, so the engine's output
-                    // depends on what the server served before. MEASURED 2026-09-14,
+                    // function of RESIDENCY, hence of REQUEST HISTORY.
+                    //
+                    // CORRECTED 2026-09-18: the f32-associativity story below is
+                    // WRONG and the "degenerate" outputs were a BUG, not rounding.
+                    // Reassociating a sum of ~6 expert partials moves the result by
+                    // ~1e-7 relative; it cannot produce repeated fragments. The real
+                    // cause was decode double-counting box 1's resident picks on
+                    // box 2 (fixed in fedbea2, KNOWN_BUGS 0c) — genuinely wrong
+                    // logits. History-dependent GROUPING is still a real reason to
+                    // prefer a fixed partition for reproducibility, but it was never
+                    // the reason the output collapsed. MEASURED 2026-09-14,
                     // same 104K prompt, same binary:
                     //     mode 1, 100K first      -> sha 4275e8cd231d  (fluent)
                     //     mode 1, after a 37-tok  -> sha 5799afaa4959  (DEGENERATE)
