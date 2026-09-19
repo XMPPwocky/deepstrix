@@ -436,6 +436,7 @@ impl HeterogeneousEngine {
         // pool instead of read from the (placeholder) resident buffers.
         mut pager: Option<&mut super::expert_pager::ExpertPager>,
     ) -> eyre::Result<()> {
+        self.remote_set_phase_busy_poll(false);
         let b = tokens.len();
         if b == 0 {
             return Ok(());
@@ -553,6 +554,7 @@ impl HeterogeneousEngine {
         pager: Option<&mut super::expert_pager::ExpertPager>,
         engram_rows: Option<&[Vec<f32>]>,
     ) -> eyre::Result<()> {
+        self.remote_set_phase_busy_poll(false);
         self.forward_prompt_batch_v2_pipelined_range(
             bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, input_hcs, tokens, pos0, stats,
             image_spans, pager, engram_rows, 0..N_LAYER as usize, CedMode::Exact, None,
@@ -597,6 +599,7 @@ impl HeterogeneousEngine {
         ced: CedMode,
         seed_carry: Option<&[Vec<f32>]>,
     ) -> eyre::Result<usize> {
+        self.remote_set_phase_busy_poll(false);
         // Same repair as `forward_token_impl`: the steady-state loop below lends
         // each KV-source layer's compressor to its reuse layer and hands it back
         // at the bottom of the iteration, and any `?` in between leaks it.
@@ -977,6 +980,7 @@ impl HeterogeneousEngine {
         // pool instead of read from the (placeholder) resident buffers.
         mut pager: Option<&mut super::expert_pager::ExpertPager>,
     ) -> eyre::Result<Vec<f32>> {
+        self.remote_set_phase_busy_poll(false);
         let t = tokens.len();
         if t == 0 {
             return Ok(Vec::new());
@@ -1320,6 +1324,7 @@ impl HeterogeneousEngine {
         // THIS call's tokens; batched prefill stages them per Engram layer.
         engram_rows: Option<&[Vec<f32>]>,
     ) -> eyre::Result<Vec<f32>> {
+        self.remote_set_phase_busy_poll(false);
         let t = tokens.len();
         if t == 0 {
             return Ok(Vec::new());

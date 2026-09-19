@@ -495,6 +495,37 @@ impl HeterogeneousEngine {
         Ok(true)
     }
 
+    /// Per-phase `SO_BUSY_POLL` on the box-2 link (docs/v41/LINK_IDLE_LATENCY.md,
+    /// 2026-09-19). Decode's 20 KB response is ONE TCP segment: a reader that is
+    /// still spinning when it lands drains all its 4 KB frames in one poll
+    /// (~50 us of link) where a sleeping reader pays an interrupt+wake per frame
+    /// (~190 us). The reader's spin starts at the previous handoff, so the
+    /// window must cover a whole per-layer period (~2.2 ms): 3000 us. But a
+    /// response LARGER than the 65,520 B MTU (>= 2 segments: any B >= 4, every
+    /// prefill/verify chunk) is HELD by the busy-poll loop until the window
+    /// expires -- link ~= window - 1.9 ms -- so those phases must run at 500.
+    /// Measured with `deepstrix-expert-bench`, table in the doc.
+    ///
+    /// The kernel refuses a window above `net.core.busy_read` for an
+    /// unprivileged process (`scripts/link_latency_step.sh 4s on` raises it);
+    /// refusal is logged once and the socket keeps its previous window.
+    /// `V41_DECODE_BUSY_POLL_US` / `V41_BATCH_BUSY_POLL_US` override the
+    /// defaults (3000 / 500); `V41_DECODE_BUSY_POLL_US=0` disables the switch.
+    pub fn remote_set_phase_busy_poll(&self, decode: bool) {
+        static DECODE_US: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+            std::env::var("V41_DECODE_BUSY_POLL_US").ok().and_then(|v| v.parse().ok()).unwrap_or(3000)
+        });
+        static BATCH_US: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+            std::env::var("V41_BATCH_BUSY_POLL_US").ok().and_then(|v| v.parse().ok()).unwrap_or(500)
+        });
+        if *DECODE_US == 0 {
+            return;
+        }
+        let Some(m) = self.remote.as_ref() else { return };
+        let Ok(mut c) = m.lock() else { return };
+        c.set_busy_poll_us(if decode { *DECODE_US } else { *BATCH_US });
+    }
+
     pub fn remote_drain_in_flight(&self) -> usize {
         self.remote
             .as_ref()
@@ -522,6 +553,7 @@ impl HeterogeneousEngine {
         pos: u32,
         token_id: i32,
     ) -> color_eyre::eyre::Result<()> {
+        self.remote_set_phase_busy_poll(true);
         self.forward_token_impl(
             dgpu_scratch, igpu_scratch, state, weights, input_hc_host, pos, token_id, None, None,
             None,
@@ -546,6 +578,7 @@ impl HeterogeneousEngine {
         pager: &mut super::expert_pager::ExpertPager,
         engram_rows: Option<&[Vec<f32>]>,
     ) -> color_eyre::eyre::Result<()> {
+        self.remote_set_phase_busy_poll(true);
         self.forward_token_impl(
             dgpu_scratch,
             igpu_scratch,
@@ -841,6 +874,7 @@ impl HeterogeneousEngine {
         engram_rows: Option<&[Vec<f32>]>,
         mtp: &mut super::mtp::MtpCapture,
     ) -> color_eyre::eyre::Result<()> {
+        self.remote_set_phase_busy_poll(true);
         self.forward_token_impl(
             dgpu_scratch,
             igpu_scratch,

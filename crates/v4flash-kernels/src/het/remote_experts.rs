@@ -1215,8 +1215,13 @@ struct ShardPool {
     owner_of: Vec<Option<(u32, u32)>>,
     /// (layer, expert) -> absolute slot.
     slot_of: std::collections::HashMap<(u32, u32), u32>,
-    /// eviction order over ABSOLUTE slots, front = least recently used.
-    lru: std::collections::VecDeque<u32>,
+    /// Recency per ABSOLUTE slot: the tick of its last use (0 = "evict me
+    /// first"). A touch is one store; the victim search is a min-scan over the
+    /// candidate slots and runs only on a miss (~2/token). The previous
+    /// `VecDeque` LRU cost `iter().position()` + `remove()` on EVERY hit (~3,000
+    /// compares + ~1,500 moves, six times per request at 6,160 slots).
+    last_use: Vec<u64>,
+    tick: u64,
     /// host mirror of each layer's `remap_dev`.
     remap_hosts: Vec<Vec<i32>>,
     /// how many slots each layer currently holds, and the minimum it keeps under
@@ -1767,11 +1772,8 @@ impl ExpertShard {
         for &w in words {
             let key = ((w >> 16) as u32, (w & 0xFFFF) as u32);
             if let Some(&slot) = pool.slot_of.get(&key) {
-                if let Some(p) = pool.lru.iter().position(|&s| s == slot) {
-                    pool.lru.remove(p);
-                    pool.lru.push_front(slot);
-                    n += 1;
-                }
+                pool.last_use[slot as usize] = 0; // front of the LRU: next victim
+                n += 1;
             }
         }
         HINTS_APPLIED.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -1818,7 +1820,8 @@ impl ExpertShard {
         let n_slots = self.info.n_resident as usize;
         let mut owner_of: Vec<Option<(u32, u32)>> = vec![None; n_slots];
         let mut slot_of = std::collections::HashMap::with_capacity(n_slots);
-        let mut lru = std::collections::VecDeque::with_capacity(n_slots);
+        let mut last_use = vec![0u64; n_slots];
+        let mut tick = 0u64;
         let mut remap_hosts = vec![vec![0i32; REMAP_LEN]; N_LAYER as usize];
         for (li, l) in self.layers.iter().enumerate() {
             let Some(l) = l.as_ref() else { continue };
@@ -1830,7 +1833,8 @@ impl ExpertShard {
                 let abs = base + local as u32;
                 owner_of[abs as usize] = Some((li as u32, e));
                 slot_of.insert((li as u32, e), abs);
-                lru.push_back(abs);
+                tick += 1;
+                last_use[abs as usize] = tick;
                 remap_hosts[li][e as usize] = -(abs as i32) - 1;
             }
         }
@@ -1854,7 +1858,8 @@ impl ExpertShard {
         self.pool = Some(ShardPool {
             owner_of,
             slot_of,
-            lru,
+            last_use,
+            tick,
             remap_hosts,
             dirty: vec![false; N_LAYER as usize],
             held,
@@ -1962,8 +1967,8 @@ impl ExpertShard {
         for &e in &want {
             pg.requests += 1;
             if let Some(&slot) = pool.slot_of.get(&(layer, e)) {
-                if let Some(p) = pool.lru.iter().position(|&s| s == slot) { pool.lru.remove(p); }
-                pool.lru.push_back(slot);
+                pool.tick += 1;
+                pool.last_use[slot as usize] = pool.tick;
                 continue;
             }
             pg.misses += 1;
@@ -1975,22 +1980,33 @@ impl ExpertShard {
             // the request is decode-shaped and the global pool is enabled.
             let lo = base as u32;
             let hi = lo + n_region as u32;
-            let pick = |global: bool, pool: &ShardPool| {
-                pool.lru.iter().copied().find(|&sl| {
-                    if !global && !(lo..hi).contains(&sl) {
-                        return false;
-                    }
-                    match pool.owner_of[sl as usize] {
+            let pick = |global: bool, pool: &ShardPool| -> Option<u32> {
+                // Least recently used candidate = smallest tick. Same predicate
+                // as the old front-to-back deque scan.
+                let n = pool.owner_of.len() as u32;
+                let range = if global { 0..n } else { lo.min(n)..hi.min(n) };
+                let mut best: Option<(u64, u32)> = None;
+                for sl in range {
+                    let ok = match pool.owner_of[sl as usize] {
                         Some((ol, oe)) => {
                             if ol == layer && want.contains(&oe) {
-                                return false;
+                                false
+                            } else {
+                                // Never take a foreign layer below its floor.
+                                ol == layer || pool.held[ol as usize] > pool.floor[ol as usize]
                             }
-                            // Never take a foreign layer below its floor.
-                            ol == layer || pool.held[ol as usize] > pool.floor[ol as usize]
                         }
                         None => true,
+                    };
+                    if !ok {
+                        continue;
                     }
-                })
+                    let t = pool.last_use[sl as usize];
+                    if best.is_none_or(|(bt, _)| t < bt) {
+                        best = Some((t, sl));
+                    }
+                }
+                best.map(|(_, sl)| sl)
             };
             // Region first (a prefill sweep should not evict its neighbours as a
             // matter of course), but the region is a PREFERENCE, not a bound. The
@@ -2009,7 +2025,6 @@ impl ExpertShard {
                     )
                 })?,
             };
-            if let Some(p) = pool.lru.iter().position(|&s| s == victim) { pool.lru.remove(p); }
             // Detach from whoever held it — possibly a DIFFERENT layer, whose
             // device remap is then stale until its next `ensure_layer`.
             if let Some((ol, oe)) = pool.owner_of[victim as usize].take() {
@@ -2192,7 +2207,8 @@ impl ExpertShard {
             pool.owner_of[victim as usize] = Some((layer, e));
             pool.slot_of.insert((layer, e), victim);
             pool.held[layer as usize] += 1;
-            pool.lru.push_back(victim);
+            pool.tick += 1;
+            pool.last_use[victim as usize] = pool.tick;
             pool.remap_hosts[layer as usize][e as usize] = -(victim as i32) - 1;
             dirty = true;
         }
@@ -2346,6 +2362,14 @@ pub struct MoeExecutor {
     xq: DeviceBuffer<u8>,
     d_selected: DeviceBuffer<i32>,
     d_ew: DeviceBuffer<f32>,
+    /// Pinned host staging for the per-request uploads, so they can be queued
+    /// with `hipMemcpyAsync` on the compute stream instead of three blocking
+    /// `hipMemcpy`s (measured 33 us for one 5.9 KB request, roadmap item 4).
+    /// Safe to reuse per request: the previous request's stream work has
+    /// completed before its response was read back.
+    xq_pin: PinnedBuffer<u8>,
+    sel_pin: PinnedBuffer<i32>,
+    ew_pin: PinnedBuffer<f32>,
     group_count: DeviceBuffer<i32>,
     expert_members: DeviceBuffer<i32>,
     /// Group-id space the batched builder is currently sized for.
@@ -2399,6 +2423,9 @@ impl MoeExecutor {
             xq: DeviceBuffer::new(id, rows * XQ_BYTES_PER_TOKEN)?,
             d_selected: DeviceBuffer::new(id, rows * nu)?,
             d_ew: DeviceBuffer::new(id, rows * nu)?,
+            xq_pin: PinnedBuffer::new(rows * XQ_BYTES_PER_TOKEN)?,
+            sel_pin: PinnedBuffer::new(rows * nu)?,
+            ew_pin: PinnedBuffer::new(rows * nu)?,
             group_count: DeviceBuffer::new(id, N_EXPERT as usize)?,
             expert_members: DeviceBuffer::new(id, N_EXPERT as usize * rows)?,
             group_bound: N_EXPERT,
@@ -2558,11 +2585,18 @@ impl MoeExecutor {
         }
         self.device.set_current()?;
         let t0 = Instant::now();
-        // Uploads: the caller's slices are ordinary (unpinned) host memory, so
-        // these are synchronous memcpys into GTT.
-        self.xq.slice_view_mut(0, xq.len()).copy_from_host(xq)?;
-        self.d_selected.slice_view_mut(0, b * nu).copy_from_host(&self.sel_host[..b * nu])?;
-        self.d_ew.slice_view_mut(0, b * nu).copy_from_host(&self.ew_host[..b * nu])?;
+        // Uploads: stage through pinned host memory and queue them on the
+        // compute stream. The caller's slices are unpinned, and a blocking
+        // `hipMemcpy` from unpinned memory cost ~11 us EACH here (three per
+        // request = 33 us of a ~380 us decode request). The memcpy into the
+        // pinned staging is ~6 KB; the DMA then overlaps whatever the stream is
+        // still finishing and orders ahead of this request's kernels.
+        self.xq_pin.as_mut_slice()[..xq.len()].copy_from_slice(xq);
+        self.sel_pin.as_mut_slice()[..b * nu].copy_from_slice(&self.sel_host[..b * nu]);
+        self.ew_pin.as_mut_slice()[..b * nu].copy_from_slice(&self.ew_host[..b * nu]);
+        self.xq.slice_view_mut(0, xq.len()).copy_from_host_async(&self.xq_pin.as_slice()[..xq.len()], &self.engine.compute)?;
+        self.d_selected.slice_view_mut(0, b * nu).copy_from_host_async(&self.sel_pin.as_slice()[..b * nu], &self.engine.compute)?;
+        self.d_ew.slice_view_mut(0, b * nu).copy_from_host_async(&self.ew_pin.as_slice()[..b * nu], &self.engine.compute)?;
         let t1 = Instant::now();
         if let Some((a, _)) = self.ev.as_ref() {
             a.record(&self.engine.compute)?;
@@ -2937,8 +2971,8 @@ pub fn serve(
         let (stream, peer) = listener.accept()?;
         eprintln!("expertd: connection from {peer}");
         match serve_connection(stream, &mut *shard, exec, opts, tracer) {
-            Ok(records) => {
-                eprintln!("expertd: {peer} closed after {} requests", records.len());
+            Ok((records, n_total)) => {
+                eprintln!("expertd: {peer} closed after {n_total} requests");
                 summarize(&records, "expertd");
             }
             Err(e) => eprintln!("expertd: {peer} error: {e:#}"),
@@ -2953,7 +2987,7 @@ pub fn serve_connection(
     exec: &mut MoeExecutor,
     opts: &ServeOptions,
     tracer: Option<&ExpertdTracer>,
-) -> eyre::Result<Vec<RequestRecord>> {
+) -> eyre::Result<(Vec<RequestRecord>, u64)> {
     apply_socket_options(&stream, &opts.socket)?;
     let max_payload = proto::REQ_FIXED + exec.rows() * (XQ_BYTES_PER_TOKEN + 8 * N_EXPERT_USED) + 64;
     // HELLO first.
@@ -2976,6 +3010,7 @@ pub fn serve_connection(
     let (tx_written, rx_written) = mpsc::channel::<(u32, Instant)>();
     let sock_opts = opts.socket.clone();
     let mut records: Vec<RequestRecord> = Vec::new();
+    let mut n_total: u64 = 0; // every request served, including those dropped from `records`
     let result: eyre::Result<()> = std::thread::scope(|sc| {
         // Reader.
         sc.spawn(move || {
@@ -3035,7 +3070,7 @@ pub fn serve_connection(
         // channel senders can be dropped and the socket shut down BEFORE the
         // scope joins the reader/writer threads (the writer ends when every
         // `tx_out` sender is gone; the reader when its blocking read fails).
-        let mut compute = |tx_out: mpsc::SyncSender<(AlignedBuf, Instant, u32)>, records: &mut Vec<RequestRecord>| -> eyre::Result<()> {
+        let mut compute = |tx_out: mpsc::SyncSender<(AlignedBuf, Instant, u32)>, records: &mut Vec<RequestRecord>, n_total: &mut u64| -> eyre::Result<()> {
         let mut n_done = 0usize;
         loop {
             let msg = if opts.keep_warm_us == 0 {
@@ -3114,7 +3149,9 @@ pub fn serve_connection(
                 // sides' duplicate structure is directly comparable: duplicates
                 // here mean box 2 computed/read the same bytes twice; duplicates
                 // only on box 1 mean the wire or client buffer lifecycle.
-                if std::env::var("V41_B2_DBG").is_ok() && f32_out {
+                static B2_DBG: std::sync::LazyLock<bool> =
+                    std::sync::LazyLock::new(|| std::env::var("V41_B2_DBG").is_ok());
+                if *B2_DBG && f32_out {
                     let payload = resp.view::<f32>(proto::RESP_DATA_OFF, n);
                     let mut h: u64 = 0xcbf29ce484222325;
                     for &v in payload.iter().step_by(97) {
@@ -3173,10 +3210,20 @@ pub fn serve_connection(
                         }
                     }
                     records.push(rec);
+                    // Bound the per-connection history: it reached 1,088,120
+                    // entries (~90 MB) on a day-long link. Keep the newest
+                    // RECORDS_CAP for `summarize`; fold in the writer's
+                    // completion stamps before dropping the older half.
+                    const RECORDS_CAP: usize = 100_000;
+                    if records.len() >= 2 * RECORDS_CAP {
+                        apply_written(records, &rx_written);
+                        records.drain(..records.len() - RECORDS_CAP);
+                    }
                     if tx_out.send((resp, rec.t_ready, seq)).is_err() {
                         return Err(eyre!("writer thread gone"));
                     }
                     n_done += 1;
+                    *n_total = n_done as u64;
                     // Catch-all tier: box 2 now owns ALL the paging, so its miss
                     // rate is the number that matters and the hub cannot see it.
                     // One line per 2000 requests (= per ~50 tokens at 40 layers).
@@ -3218,13 +3265,21 @@ ms_per_miss={:.2} (read {:.2} [pread {:.2} repack_cpu {:.2}] h2d {:.2} repack_gp
         }
         Ok(())
         };
-        let res = compute(tx_out, &mut records);
+        let res = compute(tx_out, &mut records, &mut n_total);
         // Senders are gone (tx_out moved into `compute`); unblock the reader
         // (it may sit in read_exact) so the scope can join both threads.
         let _ = stream.shutdown(std::net::Shutdown::Both);
         res
     });
     // The writer has exited (scope joined it): fill in write completion times.
+    apply_written(&mut records, &rx_written);
+    result?;
+    Ok((records, n_total))
+}
+
+/// Drain the writer's `(seq, written_at)` stamps into `write_us` of the records
+/// still held; stamps for records already dropped are discarded.
+fn apply_written(records: &mut Vec<RequestRecord>, rx_written: &mpsc::Receiver<(u32, Instant)>) {
     let mut by_seq: std::collections::HashMap<u32, usize> =
         records.iter().enumerate().map(|(i, r)| (r.seq, i)).collect();
     while let Ok((wseq, t_w)) = rx_written.try_recv() {
@@ -3232,8 +3287,6 @@ ms_per_miss={:.2} (read {:.2} [pread {:.2} repack_cpu {:.2}] h2d {:.2} repack_gp
             records[i].write_us = (t_w - records[i].t_ready).as_micros().min(u32::MAX as u128) as u32;
         }
     }
-    result?;
-    Ok(records)
 }
 
 // ---------------------------------------------------------------------------
@@ -3430,6 +3483,9 @@ pub struct RemoteExpertClient {
     /// box-2 error became a permanent outage needing a manual restart.
     addr: String,
     opts: SocketOptions,
+    /// The `SO_BUSY_POLL` window currently on `stream`, so the per-phase switch
+    /// (`HetEngine::remote_set_phase_busy_poll`) is a no-op when unchanged.
+    busy_poll_now: u32,
     /// Set when the link is known broken. The request that discovers it still
     /// fails -- its in-flight tickets can never be answered -- but the NEXT
     /// request redials instead of inheriting the corpse.
@@ -3472,6 +3528,31 @@ impl RemoteExpertClient {
     /// Is the link known broken? (Next request will redial.)
     pub fn is_dead(&self) -> bool {
         self.dead
+    }
+
+    /// Change the socket's `SO_BUSY_POLL` window (microseconds) in place; a
+    /// plain `setsockopt`, safe from any thread while the reader spins. Returns
+    /// whether the kernel accepted it. Above `net.core.busy_read` it is refused
+    /// for an unprivileged process: logged ONCE, and the window stays as it was.
+    /// Why the window is phase-dependent: `HetEngine::remote_set_phase_busy_poll`.
+    pub fn set_busy_poll_us(&mut self, us: u32) -> bool {
+        if us == self.busy_poll_now {
+            return true;
+        }
+        if set_opt_i32(&self.stream, SOL_SOCKET, SO_BUSY_POLL, us as i32) {
+            self.busy_poll_now = us;
+            true
+        } else {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "remote_experts: SO_BUSY_POLL={us} refused (net.core.busy_read is the cap for an unprivileged process; \
+                     see scripts/link_latency_step.sh 4s) -- keeping {}",
+                    self.busy_poll_now
+                );
+            }
+            false
+        }
     }
 
     pub fn connect(addr: &str, opts: &SocketOptions) -> eyre::Result<Self> {
@@ -3549,6 +3630,7 @@ impl RemoteExpertClient {
             addr: addr.to_string(),
             opts: opts.clone(),
             dead: false,
+            busy_poll_now: opts.busy_poll_us,
             sel_scratch: vec![NO_PICK; info.max_batch as usize * nu],
             ew_scratch: vec![0.0; info.max_batch as usize * nu],
             clock,
