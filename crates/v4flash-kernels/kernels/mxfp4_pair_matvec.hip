@@ -57,6 +57,19 @@
 // super-block moves. 8-byte loads (not 16) because nb*17 is always a multiple
 // of 8 but not of 16; going wider would need padding, which costs bytes on a
 // bandwidth-bound kernel and was measured WORSE when misaligned.
+//
+// MEASURED NEGATIVE RESULTS (2026-09-19, bench_mxfp4_moe_b1 with a ROTATING
+// 24-expert selection so the 32 MB last-level cache serves nothing; a fixed
+// 3-slot selection reads 238 GB/s and is NOT a kernel measurement):
+//     baseline (this kernel)          3 slots 189 GB/s   6 slots 201 GB/s
+//     balanced lanes (each lane owns 5 MXFP4 blocks of gate + 5 of up,
+//       no 16-lane/20-superblock imbalance)      189           195
+//     row-SoA layout probe (every block 16-B aligned, ONE uint4 load;
+//       timing-only, wrong results on v2 data)   190           202
+// Neither the lane imbalance nor the 8-byte loads are the limiter; the kernel
+// streams at ~93% of this iGPU's measured 214 GB/s. The ablation note's
+// "226 GB/s with uint4" was taken with a fixed selection and is cache-assisted.
+// Do not convert the layout to row-SoA for this kernel's sake.
 #define MXFP4_NIB(w_super, b32)   ((w_super) + (b32) * 16u)
 #define MXFP4_SCALE(w_super, b32) ((w_super)[128u + (b32)])
 

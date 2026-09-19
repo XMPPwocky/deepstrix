@@ -45,14 +45,20 @@ fn bench_mxfp4_moe_b1() -> eyre::Result<()> {
     let stream = Stream::new(dev.id)?;
     let k = Mxfp4PairMatvec::for_arch(&arch)?;
 
-    let n_used = N_EXPERT_USED as u32;
+    // BENCH_N_USED: slots per launch. Production box 2 serves ~3.6 of the 6 picks
+    // under the hash partition, so 3-4 is the representative shape, not 6.
+    let n_used: u32 = std::env::var("BENCH_N_USED").ok().and_then(|v| v.parse().ok()).unwrap_or(N_EXPERT_USED as u32);
     let n_rows = N_FF_EXP;            // 2304
     let n_blocks = BLOCKS_Q8K_GATE_IN; // N_EMBD/256 = 20
 
     // One expert's gate (or up) matrix: n_rows x N_EMBD at MXFP4.
     let bpe = n_rows as usize * (N_EMBD as usize / MXFP4_BLOCK_ELEMS) * MXFP4_BLOCK_BYTES;
-    // Distinct experts so nothing is served from cache across slots.
-    let n_expert_alloc = n_used as usize;
+    // Distinct experts so nothing is served from cache across slots. And
+    // BENCH_N_ALLOC (default 24) allocates MORE experts than a launch uses so
+    // the selection can rotate every iteration: a fixed 3-slot selection is
+    // 37.6 MB re-read 200 times, and the 32 MB last-level cache serves part of
+    // it (measured 238 GB/s at 3 slots vs 198 at 6 with a fixed selection).
+    let n_expert_alloc: usize = std::env::var("BENCH_N_ALLOC").ok().and_then(|v| v.parse().ok()).unwrap_or(24).max(n_used as usize);
     let iters: usize = std::env::var("BENCH_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
     let warmup: usize = std::env::var("BENCH_WARMUP").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
 
@@ -82,7 +88,10 @@ fn bench_mxfp4_moe_b1() -> eyre::Result<()> {
     stream.synchronize()?;
 
     let mut us: Vec<f32> = Vec::with_capacity(iters);
-    for _ in 0..iters {
+    for it in 0..iters {
+        // Rotate the selection so consecutive launches touch different experts.
+        let sel_host: Vec<i32> = (0..n_used as usize).map(|i| ((it * n_used as usize + i) % n_expert_alloc) as i32).collect();
+        sel.copy_from_host(&sel_host)?;
         let a = Event::new()?;
         let b = Event::new()?;
         a.record(&stream)?;
