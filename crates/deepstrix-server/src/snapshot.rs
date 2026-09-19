@@ -675,7 +675,21 @@ impl SnapshotIndex {
         byte_decoder: &std::collections::HashMap<char, u8>,
     ) -> Option<(usize, [u8; 32], PathBuf)> {
         let mut best: Option<(usize, [u8; 32], PathBuf)> = None;
-        let mut byte_prefix: Vec<u8> = Vec::with_capacity(tokens.len() * 2);
+        // ONE running hasher, cloned at each boundary.
+        //
+        // This used to accumulate a `byte_prefix: Vec<u8>` and call
+        // `blake3::hash(&byte_prefix)` at EVERY boundary token -- re-hashing the
+        // whole prefix from byte zero each time, so O(prefix x boundaries). On a
+        // 348-message request that is ~700 boundaries against a prefix reaching
+        // ~1.4 MB: ~500 MB hashed to produce 700 hashes, ~0.3-0.5 s single
+        // threaded, which is about the measured p50 of the whole pre-prefill
+        // window. Incremental hashing makes it ~1.4 MB.
+        //
+        // blake3 guarantees `Hasher::new().update(x).finalize() == hash(x)`, so
+        // the keys are BIT-IDENTICAL -- which they must be: these hashes address
+        // every snapshot already on disk (108 GB, 521 entries). Guarded by
+        // `incremental_hash_matches_whole_prefix_hash` below.
+        let mut hasher = blake3::Hasher::new();
         let decode = |id: i32| -> Vec<u8> {
             vocab
                 .token_text(id)
@@ -684,11 +698,11 @@ impl SnapshotIndex {
         };
         for (i, &tok) in tokens.iter().enumerate() {
             match synthetic_token_bytes(tok, span_hash_at(image_spans, i)) {
-                Some(b) => byte_prefix.extend(b),
-                None => byte_prefix.extend(decode(tok)),
-            }
+                Some(b) => hasher.update(&b),
+                None => hasher.update(&decode(tok)),
+            };
             if tok == tok_eos || tok == tok_assistant || tok == tok_user {
-                let h = *blake3::hash(&byte_prefix).as_bytes();
+                let h = *hasher.clone().finalize().as_bytes();
                 if let Some(entry) = self.by_hash.get(&h) {
                     let req_prefix_len = i + 1;
                     if best.as_ref().map(|(b, _, _)| *b).unwrap_or(0) < req_prefix_len {
@@ -1680,5 +1694,47 @@ mod retention_tests {
         o.remove("image_spans");
         let back2: SnapshotMeta = serde_json::from_value(serde_json::Value::Object(o)).unwrap();
         assert!(back2.image_spans.is_empty());
+    }
+
+    /// `find_longest_prefix` keys every on-disk snapshot by the blake3 of the
+    /// byte prefix at a boundary token. It used to re-hash the WHOLE prefix at
+    /// each boundary (O(prefix x boundaries), ~500 MB of hashing on a long
+    /// conversation); it now keeps one running `Hasher` and clones it.
+    ///
+    /// These two must agree byte for byte forever, or every snapshot already on
+    /// disk becomes unreachable and every request silently falls back to a full
+    /// prefill. Covers the cases the real loop produces: EMPTY chunks (an
+    /// unknown token decodes to `unwrap_or_default()`), single bytes, and a run
+    /// long enough to cross blake3's 1024-byte chunk boundary.
+    #[test]
+    fn incremental_hash_matches_whole_prefix_hash() {
+        let chunks: Vec<Vec<u8>> = vec![
+            b"hello".to_vec(),
+            Vec::new(),
+            b" world".to_vec(),
+            vec![0xEF],
+            vec![7u8; 1500],
+            Vec::new(),
+            vec![0xFFu8; 3000],
+            b"tail".to_vec(),
+        ];
+        let mut whole: Vec<u8> = Vec::new();
+        let mut running = blake3::Hasher::new();
+        for c in &chunks {
+            whole.extend_from_slice(c);
+            running.update(c);
+            assert_eq!(
+                *running.clone().finalize().as_bytes(),
+                *blake3::hash(&whole).as_bytes(),
+                "incremental hash diverged after {} bytes -- this would orphan \
+                 every snapshot on disk",
+                whole.len()
+            );
+        }
+        // Cloning must not disturb the running state: the next update has to
+        // continue the same stream, not a finalized one.
+        running.update(b"more");
+        whole.extend_from_slice(b"more");
+        assert_eq!(*running.finalize().as_bytes(), *blake3::hash(&whole).as_bytes());
     }
 }
