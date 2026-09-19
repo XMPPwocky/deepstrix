@@ -129,3 +129,115 @@ the residual is elsewhere — probably remaining Thunderbolt/PCIe link states.
 
 And the warm baseline is untouched: 44 us of link plus ~380 us of `srv` for a
 5.9 KB round trip, 40 times per token. The idle penalty is now the smaller half.
+
+## 2026-09-19: the link is Gen2 x2 (20 Gb/s) because of the CABLE; CLx is ruled out
+
+`tbdump -r 0 -a 2 -vv` on box 1 (route 0 = own host router, adapter 2 = the port
+facing box 2; box 2 is the XDomain at route 2):
+
+    LANE_ADP_CS_0  Supported Link Speeds  0xc   Gen2 + Gen3 (port can do 40 Gb/s)
+    LANE_ADP_CS_1  Target Link Speed      0xc   "attempt Gen 3"
+    LANE_ADP_CS_1  Current Link Speed     0x8   Gen 2, width x2  (= sysfs 10.0 Gb/s x2)
+    PORT_CS_18     Cable Gen 3 Support    0     the cable's e-marker declares no Gen3
+
+The port wants Gen3 and the cable refuses it. Retimers are Parade PS8830 (box 1
+board) and PS8833 (box 2 board), seen in MIRRORED order from the two ends, i.e.
+one per board and none in the cable: it is a passive cable. Fix: a 40 Gb/s
+cable (passive <= 0.8 m marked "40", or active). Verify afterwards: CG3 = 1,
+Current Link Speed = 0x4, sysfs `tx_speed` = 20.0 Gb/s. This moves prefill's
+bandwidth term (785 MB/s), not decode latency (26 KB/call).
+
+Also from the dump: LANE_ADP_CS_0 CL0s/CL1/CL2 Support = 0 and PORT_CS_18 Cable
+CLx Support = 0, nothing enabled. **USB4 low-power link states are NOT the ~187
+us/layer residual** named in "What remains" above; `thunderbolt.clx=Y` is moot.
+The residual is on the CPU/PCIe side. 99 logical-layer errors in 6 days: the
+link is not marginal.
+
+Box 2 has no tailscale; reach it with `ssh -J mimir@lumi-brain mimir@10.99.0.2`.
+
+## 2026-09-19 evening: the residual is PER-FRAME wakeups on a multi-frame response
+
+Host state: governor performance, C2 off, POLL-only idle on the link CCX of each
+box, expertd pinned to box 2's NHI CCX, TB runtime PM on. Production plain decode
+still paid ~211 us/call of link. A 3-expert test daemon on box 2 (port 7432) and
+`deepstrix-expert-bench --batches 1 --picks 3 --pool 3` from box 1, concurrent
+with production:
+
+    resp   gap us  busy-poll   rtt   srv   link p50   one-way p50
+    f16     0       500        376   339     37          -
+    f16  1500       500        424   360     62          29 us
+    f16  1500         0        428   359     64          -
+    f16  3000       500        442   359     71          -
+    f32  1500       500        551   356    193          95 us   <- production's shape
+    f32     0       500        384   337     46          22 us
+    f32  1500  500 +quickack   542   351    193          -
+    B=4 f16 1500    500        797   452    335         166 us
+    B=4 f32 1500    500        819   452    362         179 us
+
+* Scheduler queueing is NOT it: hub rexp-reader runq_wait 0.19 ms over 3,430
+  wakeups in 8 s; box 2 daemon 0.3 ms. C-states/frequency are not it (all set).
+* The idle penalty is SIZE-dependent: a 20.6 KB f32 response (5-6 thunderbolt-net
+  4 KB frames) after a 1.5 ms gap costs 193 us; the same bytes with the reader
+  still busy-polling (gap 0) cost 46. A 10 KB f16 response after the same gap
+  costs 62. The penalty scales with FRAME COUNT (B=4: 335-362), i.e. each frame of
+  a packet that lands on a sleeping reader pays an interrupt->NAPI->wake cycle,
+  while a spinning reader drains all frames in one poll.
+* Production's reader spins its 500 us SO_BUSY_POLL window right after the
+  PREVIOUS frame, ~1.5 ms before the next response, so every production response
+  lands on a sleeping reader. That is the ~150 us/call = ~6 ms/token.
+
+Fixes, in order of cost: (1) reader spins through the RTT — SO_BUSY_POLL >= the
+per-layer period (~2.5 ms) on the hub, plus `--busy-poll` on expertd for the
+request direction; needs `net.core.busy_read` raised (script step 4s) and both
+processes restarted; bench prediction 193 -> ~46 us/call. (2) f16 responses
+(10 KB, 3 frames): 62 us/call, but changes decode numerics. (3) kernel: call
+`tb_ring_throttling(rx_ring, ~20 us)` in thunderbolt-net so a burst of frames
+raises one interrupt; the API exists, the net driver never uses it.
+
+### The fix, measured: spin through the round trip — but ONLY for single-segment responses
+
+`net.core.busy_read` raised to 5000 on both boxes (`link_latency_step.sh 4s on`), then
+the client window swept (f32 responses, gap 1500 us unless noted):
+
+    shape            resp     daemon bp   client bp    link p50
+    B=1 (decode)     20.6 KB     500         500        179-193   <- production today
+    B=1              20.6 KB     500        3000         54       <- the fix: -130 us/call
+    B=1              20.6 KB    5000     2000..5000     50-54       (gap-independent: 3000 us gap = 53)
+    B=4              82 KB       500     500 / 2000    367 / 358
+    B=4              82 KB      5000     500/2000/3000/4000/5000   230/153/1139/2102/3172
+    B=64 (prefill)   1.3 MB      500     500 / 2000   1945 / 3490
+    B=64             1.3 MB     5000     500/2000/3000   6628/8123/9209
+
+Two hard rules fall out:
+  1. A response LARGER THAN THE 65,520 B MTU (>= 2 TCP segments) is HELD by the
+     busy-poll loop until the window expires: B=4 link ~= window - 1900 us. And a
+     spinning reader on the DAEMON side wrecks its own big sends (1.3 MB: 1.9 -> 6.6 ms).
+     So the daemon stays at `--busy-poll 500`, and the hub's window must be small
+     (<= 500) whenever responses exceed one segment: prefill, verify, any B >= 4.
+  2. Decode's 20.6 KB response is one segment and gains the full 130 us/call at any
+     window >= 2000; use ~3000 (the per-layer period is ~2.2 ms and the reader's spin
+     starts at the previous handoff, so it must cover a whole period).
+  => hub: SO_BUSY_POLL = 3000 while decoding, 500 otherwise (setsockopt per phase;
+     needs `net.core.busy_read` >= 3000 since the hub is unprivileged). Predicted
+     -5..-5.5 ms/token (~6-7%). `--busy-poll 0` on the bench/daemon does NOT mean
+     "off": the socket then inherits the sysctl default.
+
+### SHIPPED 2026-09-19 19:27Z (build with `HetEngine::remote_set_phase_busy_poll`)
+
+First 3,700 production tokens after the restart, cold pool (box-1 misses p50 1):
+
+    warm tokens (0 box-1 misses)   before (2c+3)   after
+      exposed remote wait            30.3 ms       21.1    <- now BELOW box 2's srv
+      box-2 srv                      22.0          21.6
+      sel_sync                       22.9          22.2
+      total                          68.8          58.5    (-15%; ~17 tok/s warm)
+    all tokens, total p50            78.7          66.3    (-16%)
+    per-request true link (dspark.request link=b1:)  254-266 -> 91 us/call
+
+The response now lands while box 1 is still doing its post-submit work (shared
+expert, ensure, local MoE), so `wait` finds it already there and the remote leg
+is HIDDEN. Consequence for reading `het.token.summary`: `remote_rtt_us` is the
+EXPOSED wait (`now - t_wait`), and `remote_link_us = exposed - srv` (saturating),
+so both now read below srv / ~0. That is the accounting, not a regression; the
+per-request `link=b1:` figure is the true per-call link. The pole on a warm token
+is box 1 itself: sel_sync ~22 ms + its own misses + ~10 ms glue.

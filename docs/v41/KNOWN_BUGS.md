@@ -8,6 +8,20 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ---
 
+## Open
+
+### `deepstrix-expert-bench --check-layer` MISMATCHES at B=4 (decode branch) — **OPEN**, found 2026-09-19
+`--check-layer 0 --check-n 3` against a 3-expert daemon: B=1 and B=64 are
+BIT-IDENTICAL to the local shard, **B=4 differs in 16,769/20,480 f32 values (19 in
+f16)** — identically on the 2026-09-18 box-2 build and on the 2026-09-19 build
+with the fixed-cost changes, so it is not from those. `REMOTE_EXPERTS.md` records
+B=4 as bit-identical at the time it was written, so this is a regression since.
+B=4 takes the daemon's DECODE branch (`b <= decode_max_b`), B=64 the batched one;
+the local reference in the bench uses the same executor. Suspects: the
+batch-size-dependent decode-vs-verify disagreement (`VERIFY_DISAGREES_WITH_DECODE.md`)
+or the B>1 `moe_gate_up_batch_hetsplit`/`moe_down_batched_hetsplit` row handling.
+Production decode is B=1 (identical), so this bites DSpark verify (B=2..6) only.
+
 ## Start here
 
 ### Why DSpark output was degenerate, in one paragraph -- **CLOSED 2026-09-16**

@@ -20,6 +20,16 @@ HIP stream sync in `sel_sync` (22-23 ms/token). That is why the e2e gain
 disabling a state machine-wide. Needs a udev rule (`crw------- root root`) and
 should be held by `deepstrix-expertd` and `deepstrix-server` for their lifetimes.
 
+### Added 2026-09-19 (all in `scripts/apply_host_tuning.sh`, measured in LINK_IDLE_LATENCY.md)
+
+| knob | set to | measured effect (warm token) |
+|---|---|---|
+| `cpufreq scaling_governor` (all cpus, both boxes) | `performance` | link -1 ms/token: idle cores no longer wake at 1.8 GHz |
+| `cpuidle/state2/disable` (all cpus, both boxes) | `1` | link -1 ms/token (C1 kept elsewhere) |
+| `cpuidle/state1/disable` on the LINK CCX only (box 1: 0-7,16-23; box 2: 8-15,24-31) | `1` | POLL-only idle: sel_sync -0.7..-1.7 ms/token (no IPI on the HIP-sync wake) |
+| expertd `taskset` 8-15,24-31 (box 2) | pinned | srv -0.8 ms/token (reader->compute handoff stays on one L3) |
+| `net.core.busy_read` / `busy_poll` (both boxes) | `5000` | REQUIRED for the server's per-phase SO_BUSY_POLL (3000 us in decode): -6 ms/token exposed link |
+
 ## 2. Engine defaults CHANGED in code this session
 
 | env | default now | why |
