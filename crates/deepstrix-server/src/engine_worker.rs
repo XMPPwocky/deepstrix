@@ -2297,6 +2297,14 @@ fn handle_generate_stream(
         };
         if let Some((snap_req_tokens, snap_hash, snap_dir)) = disk_hit {
             if snap_req_tokens >= DISK_RESTORE_MIN_TOKENS {
+                // The window between picking a request up and its `prefill` line
+                // measured 12.2% of all engine-busy time (p50 0.31 s, MEAN 8.70 s,
+                // max 302 s, scaling with context: 15.05 s above 50k tokens vs
+                // 6.06 s below 20k). That window was bounded by LOG LINES, so it
+                // lumps restore together with prompt render, tokenisation and LCP
+                // matching, and the attribution was a guess. Time the two halves
+                // directly instead: the reset preamble and `restore_vl` itself.
+                let t_reset = std::time::Instant::now();
                 save_live_if_dirty(state);
                 state.state.reset_in_place(state.dgpu, state.igpu)?;
                 // The drafter's KV ring is process-lifetime state and is NOT part of
@@ -2311,6 +2319,8 @@ fn handle_generate_stream(
                 // was thrown away — the full-prefill branch below does
                 // the same thing.
                 state.live = None;
+                let reset_ms = t_reset.elapsed().as_millis() as u64;
+                let t_restore = std::time::Instant::now();
                 let restored = snapshot::restore_vl(
                     &mut state.state,
                     &snap_dir,
@@ -2322,6 +2332,7 @@ fn handle_generate_stream(
                         stream: &state.engine.dgpu.compute,
                     },
                 );
+                let restore_ms = t_restore.elapsed().as_millis() as u64;
                 let restored = match restored {
                     Ok(r) => Some(r),
                     Err(e) => {
@@ -2427,6 +2438,11 @@ fn handle_generate_stream(
                             restored_req = verify.req_tokens,
                             suffix_len,
                             snap_hash = %short_hex(&snap_hash[..4]),
+                            // Splits the 12.2% pre-prefill window. Whatever these
+                            // two do NOT account for is render/tokenise/LCP, which
+                            // is then a subtraction rather than a guess.
+                            reset_ms,
+                            restore_ms,
                             mode = "restore",
                             fp = %state_fingerprint(state),
                             "prefill"
