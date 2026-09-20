@@ -10,7 +10,27 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Open
 
-### 20. OPEN — the batched layer driver's LOCAL MoE output depends on prior pager/decode history (found 2026-09-20)
+### 20. FIXED 2026-09-20 — the batched layer driver paged its local experts ONLY when a remote was attached
+
+**Root cause (found with `V41_GROUP_AUDIT_VERBOSE` + brace counting):** since
+`f1fbe3f` (2026-09-16, "submit to box 2 BEFORE box-1 paging") the `if
+remote_split_on {` block in the union branch of the pager stage closed at the very
+end of the branch, so the box-2 submit, `pg.ensure(...)` (the LOCAL paging), the
+exclusion and the routing audit all sat inside it. With a remote attached
+(production) everything ran; without one (the harness, any layer whose
+`owned_count == 0`) nothing was ever paged: every pick kept the pool's stale remap
+(0 = "owned elsewhere"), the group builder skipped it, and the routed MoE was
+silently DROPPED. The history dependence was the stale per-layer `remap_dev`: a step
+whose picks decode had just paged inherited a valid map and computed correctly
+(the 0.013-nat case); after other tokens the map belonged to other picks.
+**Fix:** close the remote block right after the submit; the paging always runs (the
+later exclusion/audit are self-gated on the remote). After the fix, on Paris:
+arena == decode at **0.002 nats** in every history (warm, three prior tokens, fresh
+pager); alone == batched == the contiguous reference **bit-identically**; 4 streams x
+6 steps G5a 0/24 differ. The two "open" paragraphs below are kept as the record of
+what was ruled out before the audit found it.
+
+#### (pre-fix record) the batched layer driver's LOCAL MoE output depends on prior pager/decode history
 
 Found by the multi-stream harness (`tests/multistream_step.rs`, run with the server
 DOWN). On the 6-token Paris prompt, one K=1 arena step (`forward_step_arena`,
@@ -64,7 +84,18 @@ pager slot_of / FNV of the slot's first 64 KB of gate bytes`. Run it in the good
 until this is closed. It very likely also bites PRODUCTION prefill after decode
 (a second turn's prefill runs this same driver after decode tokens).
 
-### 21. OPEN — decode is 0.9-1.2 nats from the CPU oracle on the Paris prompt (found 2026-09-20, pre-existing)
+### 21. FIXED 2026-09-20 — same root cause as #20: the harness's prompt prefill dropped every routed expert
+
+After the #20 fix, on Paris: **KL(bf16 oracle || decode) = 0.0033 nats (was 1.24)**,
+max |logit Δ| 1.2 (was 16); the arena step 0.0019; against the Q8-weights oracle
+0.027 / 0.029 (the format floor, ROADMAP item 6). Decode's own math was never wrong:
+the prompt prefill in the harness ran the batched driver with no remote, paged
+nothing, and built layer >= 1 K/V without any routed MoE; decode then attended that
+KV. Production prefill has a remote and was not affected on layers box 2 owns
+experts in. The layer-1 "seed" in the record below is exactly the first layer whose
+K/V depends on layer 0's MoE.
+
+#### (pre-fix record) decode is 0.9-1.2 nats from the CPU oracle on the Paris prompt
 
 `scripts/v41_oracle` (DeepSeek's unmodified model.py, layer-streamed on CPU) on
 `[0,671,6102,294,8760,344]`: top-1 " Paris" 23.77, then " a" 21.28. The engine's

@@ -432,7 +432,17 @@ the server down — the first harness run rides the M0 window.
   gathered top-K path changes the attention reduction order for every row: alone vs
   batch then differ at the LSB (not bit-exact). G5a at that scale needs a KL-level
   self-invariance metric, not bit equality (harness change pending).
-* **G5b: the arena reproduces today's decode at 0.013 nats** (Paris, " Paris")
+* **UPDATE 2026-09-20 evening — G5b PASSES.** Root cause of the history dependence
+  found and fixed (KNOWN_BUGS #20: the batched driver's local paging was inside the
+  remote-submit block; with no remote it paged nothing). After the fix: Paris arena
+  == decode at 0.002 nats in every history; alone == batched == contiguous reference
+  bit-identically; decode == bf16 oracle at 0.0033 nats (#21 closed by the same fix).
+  Random-token prompts: KL(dec||batch) mean 0.12 / max 0.62 (decode itself is 1.8
+  nats from the oracle there; not a usable referee). Step time with paging REAL:
+  S=4 on a cold 40 GB pool 530-1010 ms — the earlier 108-127 ms figure was measured
+  with the MoE dropped and is void. The M1a gate is met on fidelity; the timing
+  gate moves to M1b with the production pool and box 2 attached.
+* (superseded) **G5b: the arena reproduces today's decode at 0.013 nats** (Paris, " Paris")
   when it is the first batched step after one decode token — and is 1.2-2.2 nats
   off after any longer engine history. Root cause open, bisected to the batched
   driver's local MoE output with bit-identical inputs: KNOWN_BUGS #20. Every

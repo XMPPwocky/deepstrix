@@ -5021,6 +5021,7 @@ impl HeterogeneousEngine {
             // At large B the union really is ~everything, and there the dense
             // path's single contiguous H2D per role beats 3*|ids| scattered
             // copies, so keep using it. V41_PAGER_UNION=0 forces dense always.
+            if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[pager-stage] L{layer} b={b} union={} unified={} sparse_resid_layer={sparse_resid_layer} bound={moe_group_bound}", super::expert_pager::pager_union_prefill(), prefill_unified_pool()); }
             if super::expert_pager::pager_union_prefill() {
                 let _t_pager = LayerHostTimer::start(&LH_PAGER);
                 // Per-layer miss histogram. Box 1 pins ENCODER windows only
@@ -5061,6 +5062,7 @@ impl HeterogeneousEngine {
                 bd.d_selected
                     .slice_view(0, n_sel)
                     .copy_to_host(&mut sel_host)?;
+                if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} A after readback"); }
                 if super::expert_pager::pick_trace_on() {
                     for r in 0..b as usize {
                         let row = &sel_host[r * cs_n_used..(r + 1) * cs_n_used];
@@ -5201,6 +5203,7 @@ impl HeterogeneousEngine {
                 // decoder-layer MoE and page nothing here. Box 2's per-layer capacity
                 // must be >= the replay union (162 at B=128) or `ensure_layer` cannot
                 // make them all resident at once for the dispatch.
+                if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} B after pick loop"); }
                 let replay_offload = replay_offload_enabled()
                     && remote_split_on
                     && (layer as usize) >= crate::config::CED_DECODER_START;
@@ -5219,6 +5222,7 @@ impl HeterogeneousEngine {
                 // is about to change. Only the exclusion/audit below genuinely
                 // need post-`ensure` state, and they stay there.
                 sel_host_remote = sel_host;
+                if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} C before remote submit: remote_split_on={remote_split_on} remote={} replay_offload={} ids={}", self.remote.is_some(), replay_offload, ids.len()); }
                 if group_audit() {
                     sel_host_audit = sel_host_remote.clone();
                 }
@@ -5399,7 +5403,16 @@ impl HeterogeneousEngine {
                         }
                     }
                 }
+                } // if remote_split_on -- box-2 submit only. Local paging below runs with or
+                  // without a remote (it did NOT after f1fbe3f: the whole tail of this block,
+                  // ensure included, sat inside the remote branch; KNOWN_BUGS #20/#21).
+                if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} D at ensure site"); }
                 let _t_ensure = LayerHostTimer::start(&LH_ENSURE);
+                let audit_v = std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1");
+                if audit_v {
+                    eprintln!("[ensure-audit] L{layer} b={b} replay_offload={replay_offload} sparse_resid={sparse_resid} ids={} first={:?} owns_remote={} remote_split_on={remote_split_on}",
+                        ids.len(), ids.first(), owns_remote.is_some());
+                }
                 if replay_offload {
                     ids.clear();
                 } else if sparse_resid {
@@ -5460,6 +5473,10 @@ impl HeterogeneousEngine {
                     pg.ensure_layer_union(layer as i32, &ids)?;
                 }
                 drop(_t_ensure);
+                if audit_v {
+                    let probe: Vec<(u32, Option<u32>, i32)> = ids.iter().take(3).map(|&e| (e, pg.resident_slot(layer as i32, e), pg.remap()[e as usize])).collect();
+                    eprintln!("[ensure-audit] L{layer} after ensure: (id, slot_of, host remap) = {probe:?}");
+                }
                 // DIAGNOSTIC (multi-stream harness): `V41_PAGER_SYNC_AFTER_ENSURE=1`
                 // drains BOTH devices after paging, before the MoE dispatch reads
                 // the pool — tests whether missed experts can be read before they land.
@@ -5531,8 +5548,8 @@ impl HeterogeneousEngine {
                             Some(&owns_eff),
                         )?;
                 }
-                }
             } else {
+                if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[pager-stage] L{layer} b={b} -> ensure_layer_dense (union off)"); }
                 pg.ensure_layer_dense(layer as i32)?;
             }
         }
