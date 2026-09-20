@@ -660,9 +660,17 @@ impl HeterogeneousEngine {
             return Err(eyre!("PrefillJob: replay segment {b_seg} of {t} rows"));
         }
         let seg_pos0 = job.pos0 + (t - b_seg) as u32;
-        for l in split..N_LAYER as usize {
-            state.layers[l].n_raw = 0;
-            state.layers[l].raw_off = 0;
+        // Empty the decoder rings ONLY for a fresh prompt. On a continuation
+        // (snapshot restored, `pos0 > 0`) they hold the previous turn's replay
+        // rows at positions [pos0 - k, pos0), which is exactly the window the
+        // reference decoder carries incrementally; emptying them gave a 1-token
+        // suffix a 1-row window for the first SWA_WINDOW generated tokens
+        // (KNOWN_BUGS #25). The append below evicts past SWA_WINDOW as usual.
+        if job.pos0 == 0 {
+            for l in split..N_LAYER as usize {
+                state.layers[l].n_raw = 0;
+                state.layers[l].raw_off = 0;
+            }
         }
         let mut seg_hcs: Vec<Vec<f32>> = Vec::with_capacity(b_seg);
         let mut seg_carry: Vec<Vec<f32>> = Vec::with_capacity(b_seg);
@@ -1896,9 +1904,12 @@ impl HeterogeneousEngine {
                 return Err(eyre!("CED prefill: replay segment {b_seg} of {t} rows"));
             }
             let seg_pos0 = pos0 + (t - b_seg) as u32;
-            for l in split..N_LAYER as usize {
-                state.layers[l].n_raw = 0;
-                state.layers[l].raw_off = 0;
+            // Fresh prompt only (see `prefill_job_finish`, KNOWN_BUGS #25).
+            if pos0 == 0 {
+                for l in split..N_LAYER as usize {
+                    state.layers[l].n_raw = 0;
+                    state.layers[l].raw_off = 0;
+                }
             }
             let mut seg_hcs: Vec<Vec<f32>> = Vec::with_capacity(b_seg);
             let mut seg_carry: Vec<Vec<f32>> = Vec::with_capacity(b_seg);

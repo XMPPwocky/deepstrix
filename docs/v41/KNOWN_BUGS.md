@@ -10,6 +10,22 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Open
 
+### 25. FIXED 2026-09-20 — CED replay emptied the decoder rings on a CONTINUATION, so a short suffix decoded with a 1-row window
+
+Both CED drivers (`prefill_job_finish` and `forward_prefill_pipelined`) set
+`n_raw = raw_off = 0` on layers 20..39 before replaying the suffix's last
+`SWA_WINDOW` rows. That is the design for a fresh prompt (ENGINE_PORT M7 step 4:
+"empty rings + W=128 give exactly the paper's truncation"), but a restored
+snapshot's decoder rings hold the previous turn's replay rows at positions
+`[pos0 - k, pos0)` — the window the reference decoder carries incrementally. Every
+agent turn is a continuation with a short suffix (typically the 1-token turn
+marker or a few hundred tool-result tokens), so the decoder saw a window of
+`len(suffix)` rows instead of 128 for its first ~128 generated tokens. The
+multistream harness had already tripped over it ("pf1 reference with
+`last_only=true` wiped decoder windows, n_raw=1 at layers 20-39") and it was
+mis-filed as a harness mistake. Fix: empty the rings only when `pos0 == 0`; on a
+continuation the replay appends and evicts like any other batch.
+
 ### 23. FIXED 2026-09-20 — multistream prefill hashed DOUBLE-compressed ids for its Engram rows (production, 20:10-20:48 UTC)
 
 `multistream::start_prefill` built `compressed = token_map[tok]` for the whole
