@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Host-level tuning for the deepstrix two-box cluster.
-# NON-PERSISTENT — every one of these resets on reboot. Re-run after any reboot,
-# on BOTH boxes, from box 1. Needs sudo here and on box 2.
+# PERSISTED in the NixOS flake since 2026-09-20 (modules/host-tuning.nix +
+# modules/interconnect.nix, both hosts rebuilt and verified). This script is now
+# the manual fallback / verifier only; it needs sudo here and on box 2.
 #
 # From your dev machine (keys live there; box 1 is the bastion):
 #   ssh -A -t mimir@lumi-brain sudo --preserve-env=SSH_AUTH_SOCK /home/claude-code/deepstrix/scripts/apply_host_tuning.sh
