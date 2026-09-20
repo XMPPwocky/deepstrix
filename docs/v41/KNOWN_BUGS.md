@@ -82,9 +82,11 @@ the multi-stream work (the arena reproduces decode to 0.013 nats when it works).
 Repro: oracle `--prompt-ids 0,671,6102,294,8760,344 --dump-argmax`, harness
 `MS_PROMPT_IDS=0,671,6102 MS_FORCE_CONT=6102,294,8760,344 MS_SAVE_LOGITS=DIR`, then
 compare `s0_t3_dec.bin` with `logits_last.pt` (scratch `cmp_oracle2.py`).
-A known component: the load-time Q8_0 requant of the fp8 dense projections
-(ENGINE_PORT.md R19 floor; ROADMAP item 6 says stop doing it). The Q8-weights oracle
-(`V41_ORACLE_Q8=1`) on Paris gives the size of that component.
+MEASURED 2026-09-20: the load-time Q8_0 requant of the fp8 dense projections
+(ENGINE_PORT.md R19; ROADMAP item 6) is NOT the cause — the Q8-weights oracle
+(`V41_ORACLE_Q8=1`) is only **0.037 nats** from the bf16 oracle on Paris (same top-1,
+max |Δ| 4.9), while decode is **1.19 nats** from the Q8 oracle (decode-only 0.87).
+So ~1 nat is engine error. Per-layer bisection vs both oracles: scratch `cmp_floor.py`.
 
 ### `deepstrix-expert-bench --check-layer` MISMATCHES at B=4 (decode branch) — **OPEN**, found 2026-09-19
 `--check-layer 0 --check-n 3` against a 3-expert daemon: B=1 and B=64 are
