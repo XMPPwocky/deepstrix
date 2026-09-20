@@ -182,6 +182,8 @@ enum Phase { Decode, Prefill }
 
 #[derive(Default)]
 struct ProfileAcc {
+    last_misses: u64,
+    last_read_ns: u64,
     steps: u64,
     rows: u64,
     wall_ms: f64,
@@ -454,9 +456,34 @@ impl Sched {
         if self.prefills.is_empty() { return Ok(()); }
         let i = self.rr % self.prefills.len();
         self.rr = self.rr.wrapping_add(1);
-        let pf = self.prefills.remove(i);
+        let mut pf = self.prefills.remove(i);
         if pf.p.cancel.load(Ordering::Relaxed) || pf.p.tx.is_closed() {
-            tracing::info!("multistream: prefill cancelled");
+            // CHECKPOINT the partial prefill: a client that times out (the
+            // agent's HTTP limit is ~15 min) re-sends the same prompt, and
+            // without this the retry started from zero (2026-09-20: a 135K
+            // prompt lost 115K prefilled tokens). The encoder state at a chunk
+            // boundary is exactly what a resumed prefill restores (the decoder
+            // rings are rebuilt by the replay at finish either way), so the
+            // snapshot key is the prefix plus the suffix rows done so far.
+            let done = pf.job.done_rows();
+            if done >= checkpoint_min_rows() && !pf.job.chunks_done() {
+                let t = Instant::now();
+                pf.kv.restore_compressor_lending();
+                let mut tokens_saved: Vec<i32> = pf.prefix.clone();
+                tokens_saved.extend_from_slice(&pf.job.tokens()[..done]);
+                match snapshot::save(&pf.kv, &tokens_saved, &[], state.dgpu, state.igpu, &state.model_fingerprint,
+                    state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, None) {
+                    Ok(entry) => {
+                        let hash = entry.hash;
+                        state.snapshot_index.insert(entry);
+                        if let Some(sid) = pf.p.session_id.clone() { state.snapshot_index.session_to_hash.insert(sid, hash); }
+                        tracing::info!(tokens = tokens_saved.len(), done, total = pf.job.total(), ms = t.elapsed().as_millis() as u64, "multistream: prefill cancelled; partial snapshot saved");
+                    }
+                    Err(e) => tracing::warn!(error = %e, "multistream: prefill cancelled; partial snapshot FAILED"),
+                }
+            } else {
+                tracing::info!(done, total = pf.job.total(), "multistream: prefill cancelled");
+            }
             self.spare_states.push(pf.kv);
             return Ok(());
         }
@@ -670,6 +697,16 @@ impl Sched {
                 e.0 += ns as f64 / 1e6;
                 e.1 += 1;
             }
+            if let Some(pg) = pager.as_ref() {
+                let c = pg.counters();
+                let (dm, dr) = (c.prefill_misses.saturating_sub(acc.last_misses), c.prefill_read_ns.saturating_sub(acc.last_read_ns));
+                acc.last_misses = c.prefill_misses;
+                acc.last_read_ns = c.prefill_read_ns;
+                let e = acc.stages.entry(("host", "pager.misses_per_step")).or_insert((0.0, 0));
+                e.0 += dm as f64; e.1 += 1;
+                let e = acc.stages.entry(("host", "pager.read_ms")).or_insert((0.0, 0));
+                e.0 += dr as f64 / 1e6; e.1 += 1;
+            }
             for (name, us) in v4flash_kernels::het::forward_prefill::take_layer_host_timing() {
                 let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
                 e.0 += us as f64 / 1e3;
@@ -722,6 +759,9 @@ impl Sched {
     }
 }
 
+/// Cancelled prefills with at least this many rows done are checkpointed
+/// (`V41_MS_CHECKPOINT_MIN_ROWS`, default 4096).
+fn checkpoint_min_rows() -> usize { env_usize("V41_MS_CHECKPOINT_MIN_ROWS", 4096) }
 fn chunk_rows_idle() -> usize { env_usize("V41_MS_CHUNK_ROWS_IDLE", 1024) }
 fn chunk_rows_busy() -> usize { env_usize("V41_MS_CHUNK_ROWS", 1024) }
 
