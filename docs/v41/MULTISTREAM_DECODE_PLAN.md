@@ -567,7 +567,11 @@ production regime (a few misses per layer vs several ms of compute) and is
 measured by flipping the flag on the live daemon between token windows. Scripts:
 scratchpad `m0_measure.sh` (parts a-d, D).
 
-**M1a — the batched step in a HARNESS (no server changes).** Row table + KvArena;
+**M1a — the batched step in a HARNESS (no server changes).** Progress: step 1
+DONE 2026-09-21 — per-row KV bases in the seven batched KV kernels (`*_rows`
+wrappers; `tests/multistream_row_bases.rs`, bit-identical to single-sequence
+runs on the dGPU). Next: the `KvArena` (per-stream regions + the per-row tables
+those kernels take), then the multi-stream layer driver over the batched family. Row table + KvArena;
 row-grid per-row kernels; the K-launch compressor/kv_append; by-expert local MoE with
 device inputs; multi-row remote requests; the multi-segment hold fix; row-grid
 sampler; G5a against the serial oracle; G5b against today's decode; measured step
