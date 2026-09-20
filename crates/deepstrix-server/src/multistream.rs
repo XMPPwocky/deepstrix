@@ -107,7 +107,6 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
     // 190 MiB free (unsafe), 2 x --ctx 1.0 GiB.
     let ctx_rows = env_usize("V41_MS_CTX_ROWS", 2 * state.n_kv_max as usize) as u32;
     let chunk_rows = env_usize("V41_MS_CHUNK_ROWS", 256);
-    let prefill_share = env_usize("V41_MS_PREFILL_SHARE", 2).max(1); // 1 chunk per this many ticks
     let arena = match KvArena::alloc_ctx(state.dgpu, n_slots, ctx_rows) {
         Ok(a) => a,
         Err(e) => {
@@ -122,7 +121,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             return;
         }
     };
-    tracing::info!(n_slots, ctx_rows, chunk_rows, prefill_share, "multistream scheduler ON");
+    tracing::info!(n_slots, ctx_rows, chunk_rows, prefill_burst_ms = env_usize("V41_MS_PREFILL_BURST_MS", 4000), decode_burst_ms = env_usize("V41_MS_DECODE_BURST_MS", 4000), "multistream scheduler ON");
     let n_jobs = env_usize("V41_MS_PREFILL_JOBS", 2).max(1);
     let mut spare_states = Vec::with_capacity(n_jobs);
     for _ in 0..n_jobs {
@@ -132,7 +131,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         }
     }
     tracing::info!(n_jobs, "multistream: prefill scratch states allocated");
-    let mut sched = Sched { arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
+    let mut sched = Sched { phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
 
     loop {
         // 1. Intake: never block while there is work; block when idle.
@@ -167,7 +166,16 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
     let _ = state.engine.shutdown();
 }
 
+/// Scheduler phase with hysteresis (plan 5.3 + locality): prefill chunks and
+/// decode steps run in BURSTS, not alternately — one 256-row chunk drags ~100
+/// experts per layer through the pool and evicts the decode working set, so
+/// alternating chunk/step made every step pay the misses back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase { Decode, Prefill }
+
 struct Sched {
+    phase: Phase,
+    phase_since: Instant,
     arena: KvArena,
     dev: RowTablesDev,
     streams: Vec<Stream>,
@@ -271,17 +279,35 @@ impl Sched {
             }
             if !started { break; }
         }
-        // Chunk or step?
-        let want_chunk = !self.prefills.is_empty() && (self.streams.is_empty() || self.tick % prefill_share_u64() == 0);
-        if want_chunk {
-            self.prefill_tick(state)?;
+        // Chunk or step? Bursts with hysteresis: stay in a phase until its
+        // budget elapses (V41_MS_PREFILL_BURST_MS / V41_MS_DECODE_BURST_MS,
+        // default 4000 each) or it runs out of work.
+        let have_pf = !self.prefills.is_empty();
+        let have_dec = !self.streams.is_empty();
+        let budget = |ph: Phase| std::time::Duration::from_millis(match ph {
+            Phase::Prefill => env_usize("V41_MS_PREFILL_BURST_MS", 4000) as u64,
+            Phase::Decode => env_usize("V41_MS_DECODE_BURST_MS", 4000) as u64,
+        });
+        let next = match (have_pf, have_dec) {
+            (true, false) => Phase::Prefill,
+            (false, true) => Phase::Decode,
+            (false, false) => return Ok(()),
+            (true, true) => {
+                if self.phase_since.elapsed() >= budget(self.phase) {
+                    match self.phase { Phase::Prefill => Phase::Decode, Phase::Decode => Phase::Prefill }
+                } else {
+                    self.phase
+                }
+            }
+        };
+        if next != self.phase {
+            tracing::info!(from = ?self.phase, to = ?next, live = self.streams.len(), prefills = self.prefills.len(), queued = self.queue.len(), "ms.phase");
+            self.phase = next;
+            self.phase_since = Instant::now();
         }
-        if !self.streams.is_empty() && !want_chunk {
-            self.decode_step(state)?;
-        } else if !self.streams.is_empty() && self.prefills.is_empty() {
-            // The chunk finished the last prefill this tick; still run the step
-            // so decode never idles behind an empty prefill.
-            self.decode_step(state)?;
+        match self.phase {
+            Phase::Prefill => self.prefill_tick(state)?,
+            Phase::Decode => self.decode_step(state)?,
         }
         Ok(())
     }
@@ -567,7 +593,6 @@ impl Sched {
     }
 }
 
-fn prefill_share_u64() -> u64 { env_usize("V41_MS_PREFILL_SHARE", 2).max(1) as u64 }
 fn chunk_rows_idle() -> usize { env_usize("V41_MS_CHUNK_ROWS_IDLE", 512) }
 fn chunk_rows_busy() -> usize { env_usize("V41_MS_CHUNK_ROWS", 256) }
 
