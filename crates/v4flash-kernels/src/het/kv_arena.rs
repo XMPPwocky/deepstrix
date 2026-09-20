@@ -47,7 +47,11 @@ use crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES;
 /// Index into `KvArena::stores` / `RowTables::stores` of the store `layer`
 /// reads (its KV source's), `None` for the dense layers.
 pub fn store_index_of(layer: usize) -> Option<usize> {
-    let src = kv_source_of(layer)?;
+    if COMPRESS_RATIOS[layer] == 0 {
+        return None;
+    }
+    // `kv_source_of` is None for a source layer ITSELF (it owns the store).
+    let src = kv_source_of(layer).unwrap_or(layer);
     KV_SOURCE_LAYERS.iter().position(|&l| l as usize == src)
 }
 

@@ -1985,6 +1985,12 @@ impl HeterogeneousEngine {
                 None => pos0 + i,
             }
         };
+        // Sub-tensor dumps are tagged with row 0's position (== `pos0` for a
+        // contiguous chunk; the stream's position for arena rows).
+        let dump_pos = pos_at(0);
+        if super::engine::subtensor_dump_armed(layer as usize) {
+            DUMP_LAYER_POS.store(((layer as u64) << 32) | dump_pos as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         // DSpark: the drafter eats the hc-collapsed residual ENTERING layers
         // 37/38/39. A batched verify does not know until AFTER it runs which
         // row becomes the next head, so capture EVERY row and select later.
@@ -2073,8 +2079,8 @@ impl HeterogeneousEngine {
             // every layer) when diffed against an oracle dump indexed by
             // position. The position must be in the name for the diff to be
             // well-posed.
-            let tag_r = format!("pf_pre_residual_p{pos0}");
-            let tag_n = format!("pf_attn_input_norm_p{pos0}");
+            let tag_r = format!("pf_pre_residual_p{dump_pos}");
+            let tag_n = format!("pf_attn_input_norm_p{dump_pos}");
             super::engine::maybe_dump_subtensor_f32_view(
                 layer as usize, &tag_r, &bd.residual.slice_view(0, hc))?;
             super::engine::maybe_dump_subtensor_f32_view(
@@ -2248,7 +2254,7 @@ impl HeterogeneousEngine {
                 de.compute.synchronize()?;
                 super::engine::maybe_dump_subtensor_f32_view(
                     layer as usize,
-                    &format!("pf_attn_cur_p{pos0}"),
+                    &format!("pf_attn_cur_p{dump_pos}"),
                     &sd.attn_cur.slice_view(0, N_EMBD as usize),
                 )?;
             }
@@ -2433,7 +2439,7 @@ impl HeterogeneousEngine {
             let nq = (crate::config::N_HEAD * crate::config::N_HEAD_DIM) as usize;
             super::engine::maybe_dump_subtensor_f32_view(
                 layer as usize,
-                &format!("pf_q_normed_p{pos0}"),
+                &format!("pf_q_normed_p{dump_pos}"),
                 &sd.q_normed.slice_view(0, nq),
             )?;
         }
@@ -4502,7 +4508,7 @@ impl HeterogeneousEngine {
                 de.compute.synchronize()?;
                 super::engine::maybe_dump_subtensor_f32_view(
                     layer as usize,
-                    &format!("pf_heads_p{pos0}"),
+                    &format!("pf_heads_p{dump_pos}"),
                     &sd.heads.slice_view(0, Q_FLAT as usize),
                 )?;
             }
@@ -4573,7 +4579,7 @@ impl HeterogeneousEngine {
             de.compute.synchronize()?;
             super::engine::maybe_dump_subtensor_f32_view(
                 layer as usize,
-                &format!("pf_attn_out_p{pos0}"),
+                &format!("pf_attn_out_p{dump_pos}"),
                 &sd.attn_out.slice_view(0, N_EMBD as usize),
             )?;
         }
@@ -4766,20 +4772,20 @@ impl HeterogeneousEngine {
                 de.compute.synchronize()?;
                 super::engine::maybe_dump_subtensor_i32(
                     layer as usize,
-                    &format!("pf_sel_p{pos0}"),
+                    &format!("pf_sel_p{dump_pos}"),
                     &bd.d_selected,
                     cs_n_used,
                 )?;
                 super::engine::maybe_dump_subtensor_f32_view(
                     layer as usize,
-                    &format!("pf_ew_p{pos0}"),
+                    &format!("pf_ew_p{dump_pos}"),
                     &bd.d_ew.slice_view(0, cs_n_used),
                 )?;
                 // The MoE INPUT. Router ids/gates already match, so if this
                 // matches too the divergence is in the expert compute itself.
                 super::engine::maybe_dump_subtensor_f32_view(
                     layer as usize,
-                    &format!("pf_ffn_in_p{pos0}"),
+                    &format!("pf_ffn_in_p{dump_pos}"),
                     &bd.ffn_input_norm.slice_view(0, crate::config::N_EMBD as usize),
                 )?;
             }
@@ -4867,7 +4873,7 @@ impl HeterogeneousEngine {
         // inside the box-2 RPC window. See `issue_shared_expert_prefill`.
         let defer_shared = prefill_presubmit() && remote_split_active();
         if !defer_shared {
-            self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, pos0)?;
+            self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos)?;
         }
 
         // ========================================================
@@ -5454,6 +5460,16 @@ impl HeterogeneousEngine {
                     pg.ensure_layer_union(layer as i32, &ids)?;
                 }
                 drop(_t_ensure);
+                // DIAGNOSTIC (multi-stream harness): `V41_PAGER_SYNC_AFTER_ENSURE=1`
+                // drains BOTH devices after paging, before the MoE dispatch reads
+                // the pool — tests whether missed experts can be read before they land.
+                if std::env::var("V41_PAGER_SYNC_AFTER_ENSURE").is_ok() {
+                    self.igpu.device.set_current()?;
+                    self.igpu.device.synchronize()?;
+                    self.dgpu.device.set_current()?;
+                    self.dgpu.device.synchronize()?;
+                    self.current_device.store(self.dgpu.device.id, std::sync::atomic::Ordering::Relaxed);
+                }
                 if layer_miss_hist() {
                     let d = pg.counters().prefill_misses.saturating_sub(mc0);
                     LAYER_MISS[layer as usize].fetch_add(d, std::sync::atomic::Ordering::Relaxed);
@@ -5550,7 +5566,7 @@ impl HeterogeneousEngine {
         // shared expert entirely in that case, so without this the layer would add
         // a stale `ffn_shared` and be silently wrong.
         if defer_shared {
-            self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, pos0)?;
+            self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos)?;
         }
         let pager_window;
         let (routed_src, moe_remap, moe_packed): (
@@ -6519,6 +6535,21 @@ impl HeterogeneousEngine {
         self.set_current_cached(self.dgpu.device)?;
         let de = &self.dgpu;
         de.compute.wait_event(&sev.moe_arrived)?;
+        // KNOWN_BUGS-style routed-only dump (twin of decode's `dec_ffn_routed`):
+        // `ffn_moe_recv` row 0 BEFORE the shared/remote/hot adds below.
+        {
+            let lp = DUMP_LAYER_POS.load(std::sync::atomic::Ordering::Relaxed);
+            let (dl, dp) = ((lp >> 32) as usize, (lp & 0xffff_ffff) as u32);
+            if lp != u64::MAX && super::engine::subtensor_dump_armed(dl) {
+                de.compute.synchronize()?;
+                super::engine::maybe_dump_subtensor_f32_view(
+                    dl,
+                    &format!("pf_ffn_routed_p{dp}"),
+                    &bd.ffn_moe_recv.slice_view(0, N_EMBD as usize),
+                )?;
+                DUMP_LAYER_POS.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         // NOT one bracket around the whole function. The blocking box-2 `wait()`
         // sits between the two vec_adds below, and a stage bracket spanning it
         // records the HOST STALL as dGPU device time: on a perfetto trace it
@@ -6884,6 +6915,11 @@ pub fn set_single_lane_max(v: usize) {
 /// Set for the duration of a DSpark verify so the post-attention pass leaves the
 /// raw window exactly where the caller's `KvMark` addresses it (no compaction,
 /// no raw_off reset). See the eviction block and `KvMark::advanced_by`.
+/// (layer << 32 | pos) of the batched layer whose sub-tensor dump is armed, set
+/// by `forward_layer_pre_moe_v2`, consumed by `forward_layer_post_moe_v2` for the
+/// routed-only dump. Dump-only plumbing; `u64::MAX` = nothing pending.
+static DUMP_LAYER_POS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
 static SPECULATIVE_APPEND: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 

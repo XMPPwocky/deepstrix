@@ -120,6 +120,21 @@ impl Engram {
     }
 }
 
+fn half_to_f32(h: u16) -> f32 {
+    let s = ((h >> 15) & 1) as u32;
+    let e = ((h >> 10) & 0x1f) as u32;
+    let m = (h & 0x3ff) as u32;
+    let bits = if e == 0 {
+        if m == 0 { s << 31 } else {
+            let mut e2 = 127 - 15 + 1;
+            let mut m2 = m;
+            while m2 & 0x400 == 0 { m2 <<= 1; e2 -= 1; }
+            (s << 31) | ((e2 as u32) << 23) | ((m2 & 0x3ff) << 13)
+        }
+    } else if e == 31 { (s << 31) | 0x7f80_0000 | (m << 13) } else { (s << 31) | ((e + 127 - 15) << 23) | (m << 13) };
+    f32::from_bits(bits)
+}
+
 fn argmax(v: &[f32]) -> usize {
     let mut best = 0;
     for (i, &x) in v.iter().enumerate() {
@@ -167,7 +182,11 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         format!("{}/.cache/deepstrix/v41/engram", std::env::var("HOME").unwrap_or_default())
     });
     let n_streams = env_usize("MS_STREAMS", 4);
-    let n_steps = env_usize("MS_STEPS", 6);
+    // MS_FORCE_CONT="a,b,c": teacher-force these tokens through the decode
+    // oracle (and everything else) instead of decode's own greedy picks;
+    // overrides MS_STEPS with its length.
+    let force_cont: Option<Vec<i32>> = std::env::var("MS_FORCE_CONT").ok().map(|v| v.split(',').map(|x| x.trim().parse().unwrap()).collect());
+    let n_steps = force_cont.as_ref().map(|c| c.len()).unwrap_or_else(|| env_usize("MS_STEPS", 6));
     let lens: Vec<usize> = match std::env::var("MS_LENS") {
         Ok(v) => v.split(',').map(|s| s.trim().parse().unwrap()).collect(),
         // Below / at / past the SWA window, odd and even (ratio-2 parity).
@@ -176,7 +195,14 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let allow_inexact = std::env::var("MS_ALLOW_INEXACT").as_deref() == Ok("1");
     let kld_mean_bar = env_f64("MS_KLD_MEAN", 0.02);
     let kld_max_bar = env_f64("MS_KLD_MAX", 0.5);
-    let prompts: Vec<Vec<i32>> = (0..n_streams).map(|s| synth_prompt(s as u64 + 1, lens[s % lens.len()])).collect();
+    // MS_PROMPT_IDS="a,b,c,...": stream 0 runs THIS sequence — prompt = all but
+    // the last id, and the last id is the forced first decode token (so the
+    // step-0 logits line up with an oracle dump of the full sequence).
+    let forced: Option<Vec<i32>> = std::env::var("MS_PROMPT_IDS").ok().map(|v| v.split(',').map(|x| x.trim().parse().unwrap()).collect());
+    let mut prompts: Vec<Vec<i32>> = (0..n_streams).map(|s| synth_prompt(s as u64 + 1, lens[s % lens.len()])).collect();
+    if let Some(f) = &forced {
+        prompts[0] = f[..f.len() - 1].to_vec();
+    }
     let max_len = prompts.iter().map(|p| p.len()).max().unwrap();
     eprintln!(
         "multistream harness: S={n_streams} T={n_steps} lens={:?}",
@@ -203,6 +229,14 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let weights = HetModelWeights::load_all(src, dgpu, igpu, &rope_for_layer)?;
     eprintln!("weights loaded in {:.1} s", t0.elapsed().as_secs_f64());
     let engine = HeterogeneousEngine::new(dgpu, &darch, igpu, &iarch, ExecMode::HetParallel)?;
+    // MS_ENGINE2=1: the decode oracle runs on a SECOND engine instance (own
+    // streams, events, graph caches, atomics), everything else shared.
+    let engine_dec = if std::env::var("MS_ENGINE2").as_deref() == Ok("1") {
+        Some(HeterogeneousEngine::new(dgpu, &darch, igpu, &iarch, ExecMode::HetParallel)?)
+    } else {
+        None
+    };
+    let eng_dec: &HeterogeneousEngine = engine_dec.as_ref().unwrap_or(&engine);
     let mut ds = DgpuScratch::alloc(dgpu)?;
     let mut is = IgpuScratch::alloc(igpu)?;
     let n_kv_max: u32 = (max_len + n_steps + 64).next_power_of_two().max(1024) as u32;
@@ -249,8 +283,58 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         slots_alone.push(arena_alone.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
         slots_batch.push(arena_batch.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
         engine.dgpu.compute.synchronize()?;
-        first_tok.push(argmax(&logits) as i32);
+        first_tok.push(if s == 0 { forced.as_ref().map(|f| *f.last().unwrap()) } else { None }.unwrap_or(argmax(&logits) as i32));
         states.push(st);
+    }
+    // MS_DIAG=kv: prefill each prompt a SECOND time and compare the two states'
+    // KV bit for bit (raw windows per layer, comp rows / keys / accumulators per
+    // store). Says whether two prefills of one prompt even agree before any
+    // decode-vs-prefill question is asked.
+    if std::env::var("MS_DIAG").as_deref() == Ok("kv") {
+        let hd = v4flash_kernels::config::N_HEAD_DIM as usize;
+        for (s, toks) in prompts.iter().enumerate() {
+            let mut st2 = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
+            let hcs: Vec<Vec<f32>> = toks.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
+            let rows = engram.rows_for_prompt(pg.raw(), toks)?;
+            let l2 = engine.forward_prefill_pipelined(
+                &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st2, &weights,
+                &hcs, toks, 0, true, None, None, None, None, Some(&mut pg), Some(&rows),
+            )?;
+            st2.restore_compressor_lending();
+            engine.dgpu.compute.synchronize()?;
+            eprintln!("stream {s}: second prefill argmax {} (first {}); per-layer raw-window compare:", argmax(&l2), first_tok[s]);
+            let a = &states[s];
+            for l in 0..v4flash_kernels::config::N_LAYER as usize {
+                let (la, lb) = (&a.layers[l], &st2.layers[l]);
+                let n = la.n_raw.min(lb.n_raw) as usize;
+                let mut x = vec![0u16; n * hd];
+                let mut y = vec![0u16; n * hd];
+                la.kv_cache.slice_view(la.raw_off as usize * hd, n * hd).copy_to_host(&mut x)?;
+                lb.kv_cache.slice_view(lb.raw_off as usize * hd, n * hd).copy_to_host(&mut y)?;
+                let rows_diff = (0..n).filter(|&r| x[r * hd..(r + 1) * hd] != y[r * hd..(r + 1) * hd]).count();
+                let mut comp = String::new();
+                if let (Some(ca), Some(cb)) = (la.compressor.as_ref(), lb.compressor.as_ref()) {
+                    let nc = ca.n_comp.min(cb.n_comp) as usize;
+                    let w = ca.width as usize;
+                    let (Some(fa), Some(fb)) = (ca.comp_kv.f16(), cb.comp_kv.f16()) else { continue };
+                    let mut cx = vec![0u16; nc * w];
+                    let mut cy = vec![0u16; nc * w];
+                    fa.slice_view(0, nc * w).copy_to_host(&mut cx)?;
+                    fb.slice_view(0, nc * w).copy_to_host(&mut cy)?;
+                    let cd = (0..nc).filter(|&r| cx[r * w..(r + 1) * w] != cy[r * w..(r + 1) * w]).count();
+                    let mut sx = vec![0f32; ca.state_kv.len()];
+                    let mut sy = vec![0f32; cb.state_kv.len()];
+                    ca.state_kv.copy_to_host(&mut sx)?;
+                    cb.state_kv.copy_to_host(&mut sy)?;
+                    let sd_max = sx.iter().zip(&sy).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+                    comp = format!("  comp n={}/{} rows_diff={cd} state max|d|={sd_max:.3e}", ca.n_comp, cb.n_comp);
+                }
+                if rows_diff > 0 || !comp.is_empty() || l < 3 {
+                    eprintln!("  L{l:2}: raw n={}/{} off={}/{} rows_diff={rows_diff}{comp}", la.n_raw, lb.n_raw, la.raw_off, lb.raw_off);
+                }
+            }
+        }
+        return Ok(());
     }
     let st_n_raw: Vec<u32> = states.iter().map(|s| s.layers[0].n_raw).collect();
     eprintln!("admitted; raw windows {:?} (W={SWA_WINDOW})", st_n_raw);
@@ -267,15 +351,139 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             seq.push(tok);
             let rows = engram.rows_at(pg.raw(), &seq, pos)?;
             let hc = embed(tok)?;
-            engine.forward_token_paged(&mut ds, &mut is, &mut states[s], &weights, &hc, pos as u32, tok, &mut pg, Some(&rows))?;
-            engine.dgpu.compute.synchronize()?;
+            eng_dec.forward_token_paged(&mut ds, &mut is, &mut states[s], &weights, &hc, pos as u32, tok, &mut pg, Some(&rows))?;
+            eng_dec.dgpu.compute.synchronize()?;
             let mut l = vec![0f32; nv];
             ds.logits.slice_view(0, nv).copy_to_host(&mut l)?;
             cont[s].push(tok);
-            tok = argmax(&l) as i32;
+            tok = match (&force_cont, s) {
+                (Some(c), 0) if cont[s].len() < c.len() => c[cont[s].len()],
+                _ => argmax(&l) as i32,
+            };
             logits_dec[s].push(l);
         }
         eprintln!("stream {s}: decode oracle tokens {:?}", cont[s]);
+    }
+    if std::env::var("MS_DEVSYNC").as_deref() == Ok("1") {
+        dgpu.set_current()?;
+        dgpu.synchronize()?;
+        igpu.set_current()?;
+        igpu.synchronize()?;
+        dgpu.set_current()?;
+        engine.invalidate_device_cache();
+        eprintln!("MS_DEVSYNC: both devices synchronized after the decode oracle");
+    }
+
+    // MS_SPEC=1: hold the DSpark verify's `SpeculativeAppend` scope over the
+    // continuation steps (pf1 AND the arena). It flips the batched driver's
+    // eviction (none), the sparse-residency predicate, and — the suspect — the
+    // pager's "count this as prefill + scan window" mode.
+    let spec_guard = if std::env::var("MS_SPEC").as_deref() == Ok("1") {
+        Some(v4flash_kernels::het::forward_prefill::SpeculativeAppend::begin())
+    } else {
+        None
+    };
+
+    // 2b. The CONTIGUOUS batched path, one token per call on a fresh prefilled
+    //     state (what the DSpark verify runs at B=1): separates "arena arm
+    //     wrong" (pf1 != alone) from "prefill family vs decode" (pf1 == alone).
+    let mut logits_pf1: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_streams];
+    let skip_pf1 = std::env::var("MS_SKIP_PF1").as_deref() == Ok("1");
+    if skip_pf1 {
+        logits_pf1 = vec![vec![vec![0f32; nv]; n_steps]; n_streams];
+    }
+    for s in 0..n_streams {
+        if skip_pf1 { break; }
+        let toks = &prompts[s];
+        let mut st = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
+        let hcs: Vec<Vec<f32>> = toks.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
+        let rows = engram.rows_for_prompt(pg.raw(), toks)?;
+        let _ = engine.forward_prefill_pipelined(
+            &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights,
+            &hcs, toks, 0, true, None, None, None, None, Some(&mut pg), Some(&rows),
+        )?;
+        st.restore_compressor_lending();
+        let mut seq = toks.clone();
+        for t in 0..n_steps {
+            let tok = cont[s][t];
+            let pos = seq.len();
+            seq.push(tok);
+            let rows = engram.rows_at(pg.raw(), &seq, pos)?;
+            engine.normalize_raw_windows(&mut ds, &mut st)?;
+            // last_only=false: `ced_enabled() && last_only` would otherwise turn
+            // CED on and replay the decoder over THIS call's rows only (the
+            // one new token), wiping layers 20-39's window. The DSpark verify
+            // passes false for the same reason.
+            let l = engine.forward_prefill_pipelined(
+                &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights,
+                &[embed(tok)?], &[tok], pos as u32, false, None, None, None, None, Some(&mut pg), Some(&rows),
+            )?;
+            st.restore_compressor_lending();
+            logits_pf1[s].push(l);
+            // MS_DIAG=kvrow (after step 0): compare this state's raw windows with the
+            // decode state's, row by row, per layer. Rows before the step must be
+            // identical (same prefill); the step's own row shows whether the two
+            // paths WRITE the same K/V.
+            if t == 0 && std::env::var("MS_DIAG").as_deref() == Ok("kvrow") {
+                let hd = v4flash_kernels::config::N_HEAD_DIM as usize;
+                let f = |u: u16| -> f32 { half_to_f32(u) };
+                eprintln!("kvrow: layer  n_raw(dec/pf1)  rows_identical/total  last-row relRMSE(pf1 vs dec)");
+                for l in 0..v4flash_kernels::config::N_LAYER as usize {
+                    let (la, lb) = (&states[s].layers[l], &st.layers[l]);
+                    let n = la.n_raw.min(lb.n_raw) as usize;
+                    let mut x = vec![0u16; n * hd];
+                    let mut y = vec![0u16; n * hd];
+                    la.kv_cache.slice_view(la.raw_off as usize * hd, n * hd).copy_to_host(&mut x)?;
+                    lb.kv_cache.slice_view(lb.raw_off as usize * hd, n * hd).copy_to_host(&mut y)?;
+                    let same = (0..n).filter(|&r| x[r * hd..(r + 1) * hd] == y[r * hd..(r + 1) * hd]).count();
+                    let (mut num, mut den) = (0f64, 0f64);
+                    for i in (n - 1) * hd..n * hd {
+                        let (a, b) = (f(x[i]) as f64, f(y[i]) as f64);
+                        num += (a - b) * (a - b);
+                        den += a * a;
+                    }
+                    if l < 4 || same != n {
+                        eprintln!("kvrow: L{l:2}  {}/{}  {same}/{n}  {:.3e}", la.n_raw, lb.n_raw, (num / den.max(1e-30)).sqrt());
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(dir) = std::env::var("MS_SAVE_LOGITS") {
+        std::fs::create_dir_all(&dir)?;
+        let f32s = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        for s in 0..n_streams {
+            let mut seq = prompts[s].clone();
+            seq.extend_from_slice(&cont[s]);
+            std::fs::write(format!("{dir}/s{s}_tokens.json"), serde_json::to_string(&seq)?)?;
+            for t in 0..n_steps {
+                std::fs::write(format!("{dir}/s{s}_t{t}_dec.bin"), f32s(&logits_dec[s][t]))?;
+                std::fs::write(format!("{dir}/s{s}_t{t}_pf1.bin"), f32s(&logits_pf1[s][t]))?;
+            }
+        }
+        eprintln!("MS_SAVE_LOGITS: wrote {dir}");
+    }
+    if std::env::var("MS_STOP_AFTER").as_deref() == Ok("pf1") {
+        let mut kls = Vec::new();
+        for s in 0..n_streams {
+            for t in 0..n_steps {
+                let kp = kld(&logits_dec[s][t], &logits_pf1[s][t]);
+                eprintln!("{s:2} {t:2}  argmax dec/pf1 {:6}/{:6}  KL(dec||pf1) {kp:.5}", argmax(&logits_dec[s][t]), argmax(&logits_pf1[s][t]));
+                kls.push(kp);
+            }
+        }
+        eprintln!("MS_STOP_AFTER=pf1: KL(dec||pf1) mean {:.5}", kls.iter().sum::<f64>() / kls.len() as f64);
+        return Ok(());
+    }
+
+    // MS_FRESH_PAGER=1: throw the pager away and build a new one right before
+    // the arena passes, so its pool/remap carry no history from the decode
+    // oracle and the contiguous reference.
+    if std::env::var("MS_FRESH_PAGER").as_deref() == Ok("1") {
+        drop(pg);
+        pg = ExpertPager::new(V41HfWeights::open(&dir, None)?, igpu, 0)?;
+        eprintln!("MS_FRESH_PAGER: pager rebuilt");
     }
 
     // 3. Arena, one row per step (alone).
@@ -328,23 +536,37 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     }
     eprintln!("batched step wall (S={n_streams}, incl. head): {:?} ms", step_ms.iter().map(|x| (*x * 10.0).round() / 10.0).collect::<Vec<_>>());
 
+    if let Ok(dir) = std::env::var("MS_SAVE_LOGITS") {
+        let f32s = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        for s in 0..n_streams {
+            for t in 0..n_steps {
+                std::fs::write(format!("{dir}/s{s}_t{t}_alone.bin"), f32s(&logits_alone[s][t]))?;
+                std::fs::write(format!("{dir}/s{s}_t{t}_batch.bin"), f32s(&logits_batch[s][t]))?;
+            }
+        }
+    }
+
+    drop(spec_guard);
+
     // 5. Compare.
     let mut g5a_fail = 0;
     let mut kls = Vec::new();
     let mut kls_alone = Vec::new();
-    eprintln!(" s  t   |alone-batch|  argmax(dec/alone/batch)   KL(dec||batch)  KL(dec||alone)");
+    eprintln!(" s  t   |alone-batch|  |pf1-alone|  argmax(dec/pf1/alone/batch)   KL(dec||batch)  KL(dec||alone)  KL(dec||pf1)");
     for s in 0..n_streams {
         for t in 0..n_steps {
             let d = max_abs_diff(&logits_alone[s][t], &logits_batch[s][t]);
+            let dp = max_abs_diff(&logits_pf1[s][t], &logits_alone[s][t]);
             let kb = kld(&logits_dec[s][t], &logits_batch[s][t]);
             let ka = kld(&logits_dec[s][t], &logits_alone[s][t]);
-            let (ad, aa, ab) = (argmax(&logits_dec[s][t]), argmax(&logits_alone[s][t]), argmax(&logits_batch[s][t]));
+            let kp = kld(&logits_dec[s][t], &logits_pf1[s][t]);
+            let (ad, ap, aa, ab) = (argmax(&logits_dec[s][t]), argmax(&logits_pf1[s][t]), argmax(&logits_alone[s][t]), argmax(&logits_batch[s][t]));
             if d != 0.0 {
                 g5a_fail += 1;
             }
             kls.push(kb);
             kls_alone.push(ka);
-            eprintln!("{s:2} {t:2}   {d:10.3e}   {ad:6}/{aa:6}/{ab:6}          {kb:9.5}       {ka:9.5}");
+            eprintln!("{s:2} {t:2}   {d:10.3e}   {dp:10.3e}   {ad:6}/{ap:6}/{aa:6}/{ab:6}     {kb:9.5}       {ka:9.5}      {kp:9.5}");
         }
     }
     let mean = kls.iter().sum::<f64>() / kls.len() as f64;
