@@ -242,9 +242,26 @@ pub fn any_q8(ws: &[&DeviceWeight]) -> bool {
 /// `V41_SMALL_B_DENSE_DP4A=1` opts in. Callers that prepare activations must
 /// consult this: the dp4a arm consumes (xq_i8, xscale), the WMMA arm f16.
 pub fn small_b_dense_dp4a(b: u32) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // DEFAULT ON up to 8 rows since 2026-09-20 (multi-stream decode steps are
+    // B = 1..8): measured on the 9070 XT with the weight ring defeating the
+    // infinity cache (tests/bench_small_b_dense.rs, event-timed min), the
+    // B-packed dp4a GEMV vs the WMMA f16x GEMM is 13.5 vs 96 us (q_a
+    // 1280x5120), 15 vs 89 (shared gate 2304x5120), 15 vs 66 (shared down),
+    // 24 vs 90 / 32 vs 86 / 31 vs 67 at B = 8. The WMMA kernel has a ~70-90 us
+    // floor at small B: one 128-row tile per workgroup, so a 1280-row matrix
+    // runs on 10 CUs. The earlier "+52% verify forward" reading (e0ec9eb) was
+    // a whole-step number with box 2 restarted per arm, i.e. the cold point.
+    // `V41_SMALL_B_DENSE_DP4A=0` rolls back to WMMA at every B;
+    // `V41_SMALL_B_DENSE_MAX=<n>` moves the crossover (kernel cap 16).
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     // Cached: this sits on a per-launch path (3 chains x 40 layers x 2 lanes).
-    *ON.get_or_init(|| std::env::var("V41_SMALL_B_DENSE_DP4A").as_deref() == Ok("1")) && b <= 16
+    let max = *MAX.get_or_init(|| {
+        if std::env::var("V41_SMALL_B_DENSE_DP4A").as_deref() == Ok("0") {
+            return 0;
+        }
+        std::env::var("V41_SMALL_B_DENSE_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(8).min(16)
+    });
+    b <= max
 }
 
 pub fn dense_gemm_prefill(
