@@ -341,6 +341,41 @@ its own KLD gate in M3) and a busy-poll setting that does not hold multi-segment
 replies (a 64-row f32 reply is 20 segments; M1). `miss_mask` feedback is b==1-only
 and irrelevant under `V41_T2_PARTITION=1`.
 
+### 3.7 REV (rev 1.2): the multi-stream driver is the batched layer driver, parametrized
+
+MULTISTREAM_M1A_DRIVER_MAP.md classifies `forward_layer_pre_moe_v2` (forward_prefill.rs
+1787-6167) stage by stage: from the output projection onward — mHC post/pre-ffn,
+router, shared expert, local (pager) and remote MoE, combine — it is activation math
+over independent rows (the MoE never reads a position or a KV table; the router
+reads `tokens[r]` only). The per-sequence surface is exactly: the rope positions
+(`bd.pos_per_b`, already a table), the raw window (`ls.kv_cache/n_raw/raw_off`,
+the tables derived at FP:2349-2452 and the eviction at FP:4033-4116), the
+compressor state (`cs.state_kv/state_score/n_comp/comp_kv/index_k/n_index_comp`,
+FP:2613-3053), and the index-k / candidate per-row counts (FP:3500-3505).
+
+So M1a step 3 does NOT write a second driver. It adds a `RowLayout` argument:
+
+    Contiguous { pos0, ls }          today's meaning, byte-identical by construction
+    Arena { tables: &RowTables, view: per-layer raw buffer + per-store buffers }
+
+and at the ~15 per-sequence sites uses the table instead of `pos0 + i` /
+`ls.n_raw` / `cs.n_comp`: `pos_per_b` from `tables.pos_per`; `n_raw_per`,
+`n_raw_offset_per` from the arena (no causal-prefix math: every row is one
+position of its own stream); `kv_append.launch_batched_rows(slot_per)`;
+the compressor as one-position segments per row (`row_per_b = pos % ratio`,
+`compressor_state_write.launch_batched_rows(state_base_per)`, the firing rows via
+`compressor_pool.launch_batched_rows(state_idx_per)` -> rms -> index-k -> rope at
+`comp_pos_per_boundary` -> fp4 -> `comp_kv_append`/`index_kv_append_*_rows(dst_row_per)`);
+`n_comp_per`/`n_index_comp_per_b` from the arena's counters (the "positional
+n_comp" audit becomes per row); the attention/indexer launches take
+`comp_base_per`/`keys_base_per`; the post-attention eviction becomes
+`KvArena::advance` per stream (compaction before the step for streams whose
+region is full). Text-only, K=1 rows in v1: no image spans, no MTP capture, no
+CED replay rows. The single-sequence `Contiguous` arm keeps every current caller
+and the prefill parity tests unchanged; the `Arena` arm is what the harness
+exercises. Testing constraint: every driver iteration needs the model loaded, i.e.
+the server down — the first harness run rides the M0 window.
+
 ### 3.5 Graphs
 
 Capture per (layer segment, bucket) once the row table carries every per-token
@@ -570,8 +605,9 @@ scratchpad `m0_measure.sh` (parts a-d, D).
 **M1a — the batched step in a HARNESS (no server changes).** Progress: step 1
 DONE 2026-09-21 — per-row KV bases in the seven batched KV kernels (`*_rows`
 wrappers; `tests/multistream_row_bases.rs`, bit-identical to single-sequence
-runs on the dGPU). Next: the `KvArena` (per-stream regions + the per-row tables
-those kernels take), then the multi-stream layer driver over the batched family. Row table + KvArena;
+runs on the dGPU). Step 2 DONE 2026-09-21 — `het/kv_arena.rs` (regions, tables, advance/compact/restore) and the
+row-gridded argmax sampler. Next: step 3, the `RowLayout` parametrization of the batched
+driver (3.7), then the harness at the M0 window. Row table + KvArena;
 row-grid per-row kernels; the K-launch compressor/kv_append; by-expert local MoE with
 device inputs; multi-row remote requests; the multi-segment hold fix; row-grid
 sampler; G5a against the serial oracle; G5b against today's decode; measured step
