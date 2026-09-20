@@ -418,6 +418,239 @@ fn chunk_visibility(pos0: u32, b: usize, spans: &[ImageSpan]) -> eyre::Result<Op
     Ok(Some(vis))
 }
 
+/// A prompt prefill that the caller drives one chunk at a time, so a scheduler can
+/// interleave batched decode steps with it (docs/v41/MULTISTREAM_DECODE_PLAN.md
+/// 5.3: chunks and decode steps are separate forwards). Numerically the same as
+/// `forward_prefill_pipelined(last_only = true)`: under CED every chunk runs the
+/// encoder range in `KvSourceOnly` and the decoder replays the last `SWA_WINDOW`
+/// rows at the end; without CED every chunk runs all layers and the last row's
+/// logits are taken. `engram_rows`: one flattened `[T * ENGRAM_IN]` buffer per
+/// Engram layer for the whole prompt.
+pub struct PrefillJob {
+    tokens: Vec<i32>,
+    input_hcs: Vec<Vec<f32>>,
+    engram_rows: Option<Vec<Vec<f32>>>,
+    image_spans: Vec<ImageSpan>,
+    pos0: u32,
+    chunk_rows: usize,
+    chunk_start: usize,
+    chunk_idx: usize,
+    replay: std::collections::VecDeque<ReplayRow>,
+    ced: bool,
+    started: std::time::Instant,
+    /// Set by `prefill_job_chunk` after the last chunk when CED is off (the head
+    /// is taken there); `prefill_job_finish` returns it.
+    last_logits: Option<Vec<f32>>,
+}
+
+impl PrefillJob {
+    pub fn new(
+        tokens: Vec<i32>,
+        input_hcs: Vec<Vec<f32>>,
+        engram_rows: Option<Vec<Vec<f32>>>,
+        image_spans: Option<&[ImageSpan]>,
+        pos0: u32,
+        chunk_rows: usize,
+    ) -> eyre::Result<Self> {
+        let t = tokens.len();
+        if t == 0 {
+            return Err(eyre!("PrefillJob: empty prompt"));
+        }
+        if input_hcs.len() != t {
+            return Err(eyre!("PrefillJob: input_hcs len {} != tokens len {t}", input_hcs.len()));
+        }
+        let spans = image_spans.unwrap_or(&[]);
+        image_spans::validate_spans(spans, pos0, t)?;
+        if let Some(rs) = engram_rows.as_ref() {
+            let ein = ENGRAM_IN as usize;
+            if rs.iter().any(|r| r.len() != t * ein) {
+                return Err(eyre!("PrefillJob: engram rows must be [T * ENGRAM_IN] per Engram layer"));
+            }
+        }
+        Ok(Self {
+            tokens,
+            input_hcs,
+            engram_rows,
+            image_spans: spans.to_vec(),
+            pos0,
+            chunk_rows: chunk_rows.clamp(1, B_MAX),
+            chunk_start: 0,
+            chunk_idx: 0,
+            replay: std::collections::VecDeque::new(),
+            ced: ced_enabled(),
+            started: std::time::Instant::now(),
+            last_logits: None,
+        })
+    }
+    pub fn total(&self) -> usize { self.tokens.len() }
+    pub fn done_rows(&self) -> usize { self.chunk_start }
+    pub fn chunks_done(&self) -> bool { self.chunk_start >= self.tokens.len() }
+    pub fn pos0(&self) -> u32 { self.pos0 }
+    pub fn tokens(&self) -> &[i32] { &self.tokens }
+}
+
+impl HeterogeneousEngine {
+    fn emit_prefill_perfetto(&self) -> eyre::Result<()> {
+        if let Some(exp_lock) = &self.perfetto {
+            let mut exp = exp_lock.lock().unwrap();
+            self.dgpu.events.for_each_pair(|name, s, e| {
+                let track = if name.contains(".xfer") || name.contains(".peer_push") { &exp.dgpu_xfer } else { &exp.dgpu_compute };
+                exp.emit_slice(track, name, s, e)
+            })?;
+            self.igpu.events.for_each_pair(|name, s, e| {
+                let track = if name.contains(".xfer") || name.contains(".peer_push") { &exp.igpu_xfer } else { &exp.igpu_compute };
+                exp.emit_slice(track, name, s, e)
+            })?;
+            exp.re_anchor(self.dgpu.device, &self.dgpu.compute, &self.dgpu.xfer, self.igpu.device, &self.igpu.compute, &self.igpu.xfer)?;
+            self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Run the job's next chunk (at most `chunk_rows` rows, split across the two
+    /// lanes as the pipelined prefill does). Returns the rows processed, 0 when
+    /// the chunks are already done.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_job_chunk(
+        &self,
+        job: &mut PrefillJob,
+        bd_a: &mut BatchDgpuScratch,
+        bi_a: &mut BatchIgpuScratch,
+        bd_b: &mut BatchDgpuScratch,
+        bi_b: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        head_scratch: &mut DgpuScratch,
+        state: &mut HetModelState,
+        weights: &HetModelWeights,
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
+    ) -> eyre::Result<usize> {
+        let t = job.tokens.len();
+        if job.chunk_start >= t {
+            return Ok(0);
+        }
+        self.remote_set_phase_busy_poll(false);
+        let lane_caps = (bd_a.rows, bd_b.rows);
+        let chunk_size = job.chunk_rows.min(lane_caps.0 + lane_caps.1);
+        let split = crate::config::CED_DECODER_START;
+        let (chunk_end, b_a) = image_spans::plan_chunk(job.pos0, job.chunk_start, t, chunk_size, Some(lane_caps), &job.image_spans)?;
+        let chunk_b = chunk_end - job.chunk_start;
+        let is_last_chunk = chunk_end == t;
+        let chunk_input = &job.input_hcs[job.chunk_start..chunk_end];
+        let chunk_tokens = &job.tokens[job.chunk_start..chunk_end];
+        let chunk_pos0 = job.pos0 + job.chunk_start as u32;
+        if job.chunk_idx == 0 || job.chunk_idx % 16 == 0 || is_last_chunk {
+            let elapsed_s = job.started.elapsed().as_secs_f32();
+            tracing::info!(chunk = job.chunk_idx, chunk_pos0, tokens_done = job.chunk_start, tokens_total = t,
+                elapsed_s = format!("{elapsed_s:.1}"), "prefill_job_progress");
+        }
+        self.dgpu.events.reset();
+        self.igpu.events.reset();
+        let chunk_engram: Option<Vec<Vec<f32>>> = job.engram_rows.as_ref().map(|rs| {
+            let ein = ENGRAM_IN as usize;
+            let (a, z) = (job.chunk_start * ein, chunk_end * ein);
+            rs.iter().map(|r| r[a..z].to_vec()).collect()
+        });
+        if job.ced {
+            let cut = self.forward_prompt_batch_v2_pipelined_range(
+                bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, chunk_input, chunk_tokens, chunk_pos0,
+                None, Some(&job.image_spans), pager.as_deref_mut(), chunk_engram.as_deref(),
+                0..split + 1, CedMode::KvSourceOnly, None,
+            )?;
+            if cut != b_a {
+                return Err(eyre!("PrefillJob: CED lane cut {cut} != planned {b_a}"));
+            }
+            let take = chunk_b.min(SWA_WINDOW as usize);
+            let (m, hc) = (HC_MIX_DIM as usize, HC_DIM as usize);
+            for i in chunk_b - take..chunk_b {
+                let (src, idx) = if i < b_a { (&*bd_a, i) } else { (&*bd_b, i - b_a) };
+                let mut row = ReplayRow { tok: chunk_tokens[i], hc: vec![0f32; hc], carry: vec![0f32; m] };
+                src.residual.slice_view(idx * hc, hc).copy_to_host(&mut row.hc)?;
+                src.hc_pre_carry.slice_view(idx * m, m).copy_to_host(&mut row.carry)?;
+                job.replay.push_back(row);
+                if job.replay.len() > SWA_WINDOW as usize {
+                    job.replay.pop_front();
+                }
+            }
+        } else {
+            self.forward_prompt_batch_v2_pipelined(
+                bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, chunk_input, chunk_tokens, chunk_pos0,
+                None, Some(&job.image_spans), pager.as_deref_mut(), chunk_engram.as_deref(),
+            )?;
+            if is_last_chunk {
+                let b_a = bd_a.mtp_lane_cut.min(chunk_b);
+                let b_b = chunk_b - b_a;
+                let (src_bd, last_idx) = if b_b > 0 { (&*bd_b, b_b - 1) } else { (&*bd_a, b_a - 1) };
+                job.last_logits = Some(self.head_from_row(head_scratch, src_bd, last_idx, weights)?);
+            }
+        }
+        self.emit_prefill_perfetto()?;
+        job.chunk_start = chunk_end;
+        job.chunk_idx += 1;
+        Ok(chunk_b)
+    }
+
+    /// After every chunk: the CED decoder replay over the last window (or,
+    /// without CED, the logits the last chunk already produced). Returns the
+    /// next-token logits `[N_VOCAB]`; `state` then holds the prompt's KV exactly as
+    /// `forward_prefill_pipelined` would have left it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_job_finish(
+        &self,
+        job: &mut PrefillJob,
+        bd_a: &mut BatchDgpuScratch,
+        bi_a: &mut BatchIgpuScratch,
+        bd_b: &mut BatchDgpuScratch,
+        bi_b: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        head_scratch: &mut DgpuScratch,
+        state: &mut HetModelState,
+        weights: &HetModelWeights,
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
+    ) -> eyre::Result<Vec<f32>> {
+        if !job.chunks_done() {
+            return Err(eyre!("PrefillJob: finish called with {} of {} rows done", job.chunk_start, job.tokens.len()));
+        }
+        if !job.ced {
+            return job.last_logits.take().ok_or_else(|| eyre!("PrefillJob: no logits from the last chunk"));
+        }
+        let t = job.tokens.len();
+        let split = crate::config::CED_DECODER_START;
+        let b_seg = job.replay.len();
+        if b_seg == 0 || b_seg > t {
+            return Err(eyre!("PrefillJob: replay segment {b_seg} of {t} rows"));
+        }
+        let seg_pos0 = job.pos0 + (t - b_seg) as u32;
+        for l in split..N_LAYER as usize {
+            state.layers[l].n_raw = 0;
+            state.layers[l].raw_off = 0;
+        }
+        let mut seg_hcs: Vec<Vec<f32>> = Vec::with_capacity(b_seg);
+        let mut seg_carry: Vec<Vec<f32>> = Vec::with_capacity(b_seg);
+        let mut seg_tokens: Vec<i32> = Vec::with_capacity(b_seg);
+        for r in job.replay.drain(..) {
+            seg_hcs.push(r.hc);
+            seg_carry.push(r.carry);
+            seg_tokens.push(r.tok);
+        }
+        let t0 = std::time::Instant::now();
+        self.dgpu.events.reset();
+        self.igpu.events.reset();
+        let b_a = self.forward_prompt_batch_v2_pipelined_range(
+            bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, &seg_hcs, &seg_tokens, seg_pos0,
+            None, None, pager.as_deref_mut(), None, split..N_LAYER as usize, CedMode::Replay, Some(&seg_carry),
+        )?;
+        let (src_bd, last_idx) = if b_seg > b_a { (&*bd_b, b_seg - b_a - 1) } else { (&*bd_a, b_a - 1) };
+        let logits = self.head_from_row(head_scratch, src_bd, last_idx, weights)?;
+        self.emit_prefill_perfetto()?;
+        tracing::info!(replay_tokens = b_seg, seg_pos0, elapsed_s = format!("{:.1}", t0.elapsed().as_secs_f32()),
+            total_s = format!("{:.1}", job.started.elapsed().as_secs_f32()), "prefill_job_replay");
+        dump_prefill_logits(&logits)?;
+        Ok(logits)
+    }
+}
+
 impl HeterogeneousEngine {
     /// Layer-major batched prefill using batched kernels.
     ///
@@ -4167,6 +4400,16 @@ impl HeterogeneousEngine {
                 _t_ix.end()?;
                 true
             } else {
+                // An INDEX-SOURCE layer that did NOT fire (its rows are all
+                // within INDEXER_TOP_K) must also retract any selection a
+                // previous call published for this store: `indexer_saved_store`
+                // lives in the lane scratch and outlived the request/chunk/step
+                // that wrote it, so the reuse layers below (21-23, 25-27, ...)
+                // gathered with a STALE selection whenever a short prompt
+                // followed a long one (KNOWN_BUGS #22, 2026-09-20).
+                if v41_idx_keys.is_some() {
+                    bd.indexer_saved_store = -1;
+                }
                 false
             };
 

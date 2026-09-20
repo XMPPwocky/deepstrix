@@ -10,6 +10,28 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Open
 
+### 22. FIXED 2026-09-20 — a short prompt after a long one reused the LONG one's indexer top-k selection (PRODUCTION prefill bug)
+
+`bd.indexer_saved_store` (the S2 "shared selection" gate, per prefill lane) was
+set whenever an index-source layer's indexer FIRED (rows with > INDEXER_TOP_K comp
+rows, i.e. prompts beyond ~1K tokens) and never cleared. The reuse layers (21-23,
+25-27, 29-31, 33-35, 37-39) take `s2_reuse` when `saved_store == index_source_of
+(layer)`, so every later batched forward whose own layer 20 did NOT fire — any
+short prompt, chunk, or arena step after a long prompt — gathered attention rows
+with the PREVIOUS request's `indexer_sel_saved` (row indices into a store that is
+now shorter), then attended garbage on 15 of 40 layers. Found in the multi-stream
+harness: a 260-token prompt prefilled on a cold process was 0.686 nats from the same
+prompt prefilled after a 1500-token one, deterministic, independent of chunking
+(`MS_DIAG=job:*` and `MS_DIAG=kv`); the 1500-token prompt itself was bit-identical
+(its layer 20 re-fires), and a 33-token prompt run only after the long one was
+"identical" both times because both were wrong the same way. Also the reason the
+S=8/16 harness runs with a 1500-token stream failed G5a (alone vs batched differed
+on 21/24 rows). Fix: at an index-source layer that does not fire, set
+`indexer_saved_store = -1`, so the reuse layers see this call's own decision.
+Production impact: every short user turn following a > ~1K-token one in the same
+server process, since 40d1201 (2026-09-14, S2). The decode path was not affected
+(its `last_idx_gather_src` is reset per token).
+
 ### 20. FIXED 2026-09-20 — the batched layer driver paged its local experts ONLY when a remote was attached
 
 **Root cause (found with `V41_GROUP_AUDIT_VERBOSE` + brace counting):** since
