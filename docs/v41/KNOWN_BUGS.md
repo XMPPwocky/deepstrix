@@ -10,6 +10,32 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Open
 
+### 23. FIXED 2026-09-20 — multistream prefill hashed DOUBLE-compressed ids for its Engram rows (production, 20:10-20:48 UTC)
+
+`multistream::start_prefill` built `compressed = token_map[tok]` for the whole
+sequence and then called `hasher.hash_sequence(&compressed)`, which compresses
+its input again (`engram_hash.rs:171`). `token_map` is not idempotent (128,613 of
+129,280 entries map to a different id on the second application), so nearly every
+suffix row of every multistream prefill gathered Engram rows for the wrong n-grams
+at layers 1 and 14. Decode rows (`hash_ids(&s.compressed, ..)`) and the legacy
+path (`EngramCtx::rows_for_chunk`) were correct; snapshots saved from those
+prefills carry the wrong contribution baked into their KV. Fix `da7f8f2`: hash the
+compressed ids once with `hash_ids`; then `1249a98` moved the whole gather into
+per-chunk lazy inputs (the same code shape as `rows_for_chunk`). Lesson: two
+functions named `hash_*` took different input spaces (raw vs compressed ids);
+neither the type nor the name said so.
+
+### 24. FIXED 2026-09-20 — multistream prefill blocked the scheduler for a bulk Engram gather and held the whole prompt's inputs in host RAM
+
+`start_prefill` called `gather_position` per (token, layer) — 24 spawned OS
+threads per call, ~1.5 ms/token (a 51,877-token suffix took 78 s, every live stream
+frozen, and looked like a hang) — and allocated `HC_DIM` + 2 x `ENGRAM_IN` f32 per
+token up front (~15 GB for a 135K prompt on a 96 GB box running a 78 GB pool). The
+batched gather (`da7f8f2`) cut it to ~0.26 ms/token (35 s for 135K, still one
+blocking call); `1249a98` makes `PrefillJob` take lazy per-chunk inputs
+(`next_chunk_range` / `set_chunk_inputs`), so each 512-row chunk costs ~60 MB and
+~150 ms of gather inside the prefill burst.
+
 ### 22. FIXED 2026-09-20 — a short prompt after a long one reused the LONG one's indexer top-k selection (PRODUCTION prefill bug)
 
 `bd.indexer_saved_store` (the S2 "shared selection" gate, per prefill lane) was
