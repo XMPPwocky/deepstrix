@@ -212,29 +212,46 @@ fn main() -> eyre::Result<()> {
 
     // ---- bit-identity check against a local shard of a few of the daemon's experts ----
     if let Some(layer) = args.check_layer {
-        let ids = info.owned_ids(layer);
+        // `--catchall`: check ids the daemon does NOT advertise, so a `--paged`
+        // daemon has to fault them in — with `--check-n` above its pool size every
+        // call faults, which is how the hits-first second pass
+        // (`MoeExecutor::run_path`) gets its bit-identity check against a local
+        // single-pass shard. Submits go unmasked for the same reason.
+        let ids = if args.catchall { (0..N_EXPERT).collect::<Vec<u32>>() } else { info.owned_ids(layer) };
         if ids.is_empty() {
             return Err(eyre!("check: daemon does not own layer {layer}"));
         }
         let ids: Vec<u32> = ids.into_iter().take(args.check_n).collect();
+        let check_flags = if args.batched { proto::REQ_FLAG_BATCHED } else { 0 };
         eprintln!("check: loading local shard L{layer}:{ids:?} from {}", args.model);
         let hf = V41HfWeights::open(&args.model, None)?;
         let asg = Assignment { layers: vec![(layer, ids.clone())] };
         let mut local = ExpertShard::load(hf, igpu, &asg, 4, 8, rows as u32, info.decode_max_b as u32)?;
         let mut all_ok = true;
-        for &b in &[1usize, 4, 64] {
+        // Under `--catchall` the check's batch sizes come from `--batches`, so a
+        // request's wanted set can be kept inside a small pool while still
+        // faulting; the default trio is the original cross-box bit-identity check.
+        let check_bs: Vec<usize> = if args.catchall { args.batches.clone() } else { vec![1, 4, 64] };
+        for &b in &check_bs {
             let b = b.min(rows);
             let x: Vec<f32> = (0..b * N_EMBD as usize).map(|_| rng.f32()).collect();
             let mut xq = vec![0u8; b * XQ_BYTES_PER_TOKEN];
             exec.quantize_q8k(&x, &mut xq)?;
             let (sel, ew) = make_picks(&mut rng, b, args.picks.min(ids.len()), &ids);
-            exec.run(&mut local, layer, b, &xq, &sel, &ew)?;
+            // Same executor path locally as remotely: `--batched` forces the
+            // by-expert chain on both sides, so a mismatch is a real one and not
+            // the known ~1e-7 batched-vs-decode difference.
+            exec.run_path(&mut local, layer, b, &xq, &sel, &ew, args.batched)?;
             let mut ref32 = vec![0f32; b * N_EMBD as usize];
             exec.read_f32(b, &mut ref32)?;
             let mut ref16 = vec![0u16; b * N_EMBD as usize];
             exec.read_f16(b, &mut ref16)?;
-            let r32 = client.call(layer, b, &xq, &sel, &ew, true)?.ok_or_else(|| eyre!("no remote picks?"))?;
-            let r16 = client.call(layer, b, &xq, &sel, &ew, false)?.ok_or_else(|| eyre!("no remote picks?"))?;
+            let t32 = submit_maybe_unmasked(&mut client, args.catchall, layer, b, &xq, &sel, &ew, check_flags | proto::REQ_FLAG_RESP_F32)?
+                .ok_or_else(|| eyre!("no remote picks?"))?;
+            let r32 = client.wait(t32)?;
+            let t16 = submit_maybe_unmasked(&mut client, args.catchall, layer, b, &xq, &sel, &ew, check_flags)?
+                .ok_or_else(|| eyre!("no remote picks?"))?;
+            let r16 = client.wait(t16)?;
             let n32 = r32.f32().iter().zip(&ref32).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
             let n16 = r16.f16().iter().zip(&ref16).filter(|(a, b)| a != b).count();
             let n16cpu = r16.f16().iter().zip(&ref32).filter(|(a, b)| **a != f32_to_f16_bits(**b)).count();

@@ -1461,6 +1461,48 @@ pub fn coalesce_check() -> bool {
 }
 
 /// `V41_B2_DECODE_DOWN=1`: batched branch runs the DECODE down kernel per token.
+/// Hits-first on the batched path: launch the resident experts, read the misses
+/// while they run, launch the missed ones as a second pass into their own partial
+/// slots (`MoeExecutor::run_path`). Default OFF; `V41_B2_HITS_FIRST=1` turns it on
+/// at start, and `SIGUSR1` flips it at RUNTIME so it can be A/B'd on a warm pool
+/// without a restart (a cold restart costs ~116 GB of refills and confounds any
+/// comparison). MEASURED 2026-09-21 against a paged 200-slot test daemon: bit-
+/// identical to the single-pass path at B=1/4/32 while faulting; timing neutral
+/// in a catch-all regime where ~150 serial disk reads dwarf ~4 ms of compute
+/// (269 vs 274 ms at B=8, 1045 vs 1175 at B=32, p90 spread larger than the delta).
+/// The predicted gain is in the production regime (a few misses per layer against
+/// several ms of compute, MULTISTREAM_DECODE_PLAN.md 4.1) — unmeasured there.
+static HITS_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HITS_FIRST_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+pub fn b2_hits_first() -> bool {
+    HITS_FIRST_INIT.get_or_init(|| {
+        let on = matches!(std::env::var("V41_B2_HITS_FIRST").as_deref(), Ok("1") | Ok("on"));
+        HITS_FIRST.store(on, std::sync::atomic::Ordering::Relaxed);
+    });
+    HITS_FIRST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+extern "C" fn hits_first_toggle(_sig: i32) {
+    // Async-signal-safe: one atomic op, nothing else.
+    HITS_FIRST.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Install the `SIGUSR1` toggle for [`b2_hits_first`] (daemon main). Returns the
+/// initial state so the daemon can log it.
+pub fn install_hits_first_toggle() -> bool {
+    extern "C" {
+        fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+    }
+    const SIGUSR1: i32 = 10;
+    let on = b2_hits_first(); // initialise from the env BEFORE the handler can flip it
+    // SAFETY: plain libc signal(2) with an async-signal-safe handler.
+    unsafe {
+        signal(SIGUSR1, hits_first_toggle);
+    }
+    on
+}
+
 pub fn b2_decode_down() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         matches!(std::env::var("V41_B2_DECODE_DOWN").as_deref(), Ok("1") | Ok("on"))
@@ -1916,6 +1958,42 @@ impl ExpertShard {
         self.ensure_layer_inner(layer, ids, None, false)
     }
 
+    /// Is `layer` a PAGED layer (catch-all pool)? Hits-first only applies there:
+    /// an unpaged layer is fully resident by construction.
+    pub fn layer_is_paged(&self, layer: u32) -> bool {
+        self.pool.is_some()
+            && self.layers.get(layer as usize).and_then(|l| l.as_ref()).is_some_and(|l| l.page.is_some())
+    }
+
+    /// Which of `ids` are resident on `layer` RIGHT NOW, reading nothing. `NO_PICK`
+    /// and out-of-range ids count as resident (nothing to fetch); an unpaged layer
+    /// is all-resident. This is the split the hits-first executor launches on
+    /// before `ensure_layer*` reads the rest (docs/v41/MULTISTREAM_DECODE_PLAN.md 4.1).
+    pub fn resident_mask(&self, layer: u32, ids: &[i32], out: &mut Vec<bool>) {
+        out.clear();
+        if !self.layer_is_paged(layer) {
+            out.resize(ids.len(), true);
+            return;
+        }
+        let pool = self.pool.as_ref().expect("layer_is_paged checked the pool");
+        out.extend(ids.iter().map(|&e| {
+            !(0..N_EXPERT as i32).contains(&e) || pool.slot_of.contains_key(&(layer, e as u32))
+        }));
+    }
+
+    /// Re-upload `layer`'s remap if another layer's eviction left it stale — the
+    /// lazy upload `ensure_layer_inner` does first. Hits-first launches the
+    /// resident experts BEFORE calling ensure, so it needs this on its own.
+    pub fn sync_remap(&mut self, layer: u32) -> eyre::Result<()> {
+        let Some(l) = self.layers.get_mut(layer as usize).and_then(|l| l.as_mut()) else { return Ok(()) };
+        let Some(pool) = self.pool.as_mut() else { return Ok(()) };
+        if pool.dirty[layer as usize] {
+            l.remap_dev.copy_from_host(&pool.remap_hosts[layer as usize])?;
+            pool.dirty[layer as usize] = false;
+        }
+        Ok(())
+    }
+
     fn ensure_layer_inner(&mut self, layer: u32, ids: &[i32], mut missed: Option<&mut Vec<u32>>, prefill_shaped: bool) -> eyre::Result<()> {
         let Some(l) = self.layers.get_mut(layer as usize).and_then(|l| l.as_mut()) else {
             // Catch-all needs a region on EVERY layer the hub can send. An
@@ -2350,6 +2428,22 @@ pub struct ExecTiming {
     /// pick i had to be paged from this box's disk. Decode (b==1) only; see
     /// `proto::RESP_MISS_SHIFT`.
     pub miss_mask: u32,
+    /// Hits-first: distinct experts this request had to page, and whether the
+    /// two-pass path ran (misses > 0 on the batched path).
+    pub n_missing: u32,
+    pub two_pass: bool,
+}
+
+/// Per-request kernel geometry shared by the by-expert passes.
+struct PassGeo {
+    b: usize,
+    gbound: u32,
+    cap: u32,
+    gbpe: u32,
+    ubpe: u32,
+    dbpe: u32,
+    gdt: GgufType,
+    ddt: GgufType,
 }
 
 pub struct MoeExecutor {
@@ -2359,6 +2453,9 @@ pub struct MoeExecutor {
     decode_max_b: usize,
     /// Reused across requests so the decode miss report never allocates.
     missed_scratch: Vec<u32>,
+    /// Hits-first scratch: per-pick residency and the distinct missing ids.
+    resident_scratch: Vec<bool>,
+    missing_scratch: Vec<i32>,
     xq: DeviceBuffer<u8>,
     d_selected: DeviceBuffer<i32>,
     d_ew: DeviceBuffer<f32>,
@@ -2416,6 +2513,8 @@ impl MoeExecutor {
         let wi_len = N_EXPERT as usize + rows * nu;
         Ok(Self {
             missed_scratch: Vec::with_capacity(N_EXPERT_USED),
+            resident_scratch: Vec::with_capacity(rows * nu),
+            missing_scratch: Vec::with_capacity(rows * nu),
             engine,
             device: igpu,
             rows,
@@ -2424,8 +2523,11 @@ impl MoeExecutor {
             d_selected: DeviceBuffer::new(id, rows * nu)?,
             d_ew: DeviceBuffer::new(id, rows * nu)?,
             xq_pin: PinnedBuffer::new(rows * XQ_BYTES_PER_TOKEN)?,
-            sel_pin: PinnedBuffer::new(rows * nu)?,
-            ew_pin: PinnedBuffer::new(rows * nu)?,
+            // Three regions: pass A, pass B and the reduce each upload their own
+            // sel/ew from pinned memory, and an earlier region's DMA may still be
+            // queued when the next is written.
+            sel_pin: PinnedBuffer::new(3 * rows * nu)?,
+            ew_pin: PinnedBuffer::new(3 * rows * nu)?,
             group_count: DeviceBuffer::new(id, N_EXPERT as usize)?,
             expert_members: DeviceBuffer::new(id, N_EXPERT as usize * rows)?,
             group_bound: N_EXPERT,
@@ -2558,7 +2660,33 @@ impl MoeExecutor {
         // `ExpertShard::ensure_layer_reporting`. Prefill batches skip it: their sel
         // is up to 1024x6 and nothing consumes the mask.
         let mut miss_mask = 0u32;
-        if b == 1 {
+        let path_decode = b <= self.decode_max_b && !force_batched;
+        // HITS-FIRST (docs/v41/MULTISTREAM_DECODE_PLAN.md 4.1). On the batched path,
+        // split the picks into resident / missing WITHOUT reading anything, launch
+        // the resident experts' pass, read the misses while those kernels run, then
+        // launch the missed experts as a second pass into their own `partials`
+        // slots and reduce once. Numerics are unchanged by construction: a (token,
+        // slot) partial is written exactly once, by whichever pass owns it, by the
+        // same kernel on the same inputs, and the reduce sums a token's `nu` slots
+        // in slot order whichever pass wrote them. The decode path (per token,
+        // `ffn_moe` written directly) stays single-pass. `V41_B2_HITS_FIRST=0`
+        // restores ensure-then-launch.
+        let hits_first = !path_decode && b2_hits_first() && !b2_decode_down() && shard.layer_is_paged(layer);
+        self.missing_scratch.clear();
+        if hits_first {
+            shard.resident_mask(layer, sel, &mut self.resident_scratch);
+            for (i, &e) in sel.iter().enumerate() {
+                if e != NO_PICK && !self.resident_scratch[i] && !self.missing_scratch.contains(&e) {
+                    self.missing_scratch.push(e);
+                }
+            }
+        }
+        let two_pass = hits_first && !self.missing_scratch.is_empty();
+        if two_pass {
+            // Pass A reads this layer's remap: a foreign eviction's pending
+            // re-upload must land before anything reads it.
+            shard.sync_remap(layer)?;
+        } else if b == 1 {
             self.missed_scratch.clear();
             shard.ensure_layer_reporting(layer, sel, &mut self.missed_scratch)?;
             for (i, &sv) in sel.iter().take(proto::RESP_MISS_BITS).enumerate() {
@@ -2571,9 +2699,10 @@ impl MoeExecutor {
             // layer union. Only a real prefill chunk pins a whole layer.
             shard.ensure_layer_phased(layer, sel, b > 16)?;
         }
-        let (gate, up, down, remap) = shard.layer_views(layer)?;
+        // Pass-A sel: a missing pick is SENTINEL (the mode-0 kernels skip it);
+        // single-pass: everything is resident by now or the request is malformed.
         for (i, &e) in sel.iter().enumerate() {
-            if e == NO_PICK {
+            if e == NO_PICK || (two_pass && !self.resident_scratch[i]) {
                 self.sel_host[i] = SENTINEL_EXPERT;
                 self.ew_host[i] = 0.0;
             } else if shard.owns(layer, e) {
@@ -2592,11 +2721,8 @@ impl MoeExecutor {
         // pinned staging is ~6 KB; the DMA then overlaps whatever the stream is
         // still finishing and orders ahead of this request's kernels.
         self.xq_pin.as_mut_slice()[..xq.len()].copy_from_slice(xq);
-        self.sel_pin.as_mut_slice()[..b * nu].copy_from_slice(&self.sel_host[..b * nu]);
-        self.ew_pin.as_mut_slice()[..b * nu].copy_from_slice(&self.ew_host[..b * nu]);
         self.xq.slice_view_mut(0, xq.len()).copy_from_host_async(&self.xq_pin.as_slice()[..xq.len()], &self.engine.compute)?;
-        self.d_selected.slice_view_mut(0, b * nu).copy_from_host_async(&self.sel_pin.as_slice()[..b * nu], &self.engine.compute)?;
-        self.d_ew.slice_view_mut(0, b * nu).copy_from_host_async(&self.ew_pin.as_slice()[..b * nu], &self.engine.compute)?;
+        self.upload_sel(0, b)?;
         let t1 = Instant::now();
         if let Some((a, _)) = self.ev.as_ref() {
             a.record(&self.engine.compute)?;
@@ -2606,19 +2732,30 @@ impl MoeExecutor {
         // pool slots); passing N_EXPERT silently dropped every pick above slot
         // 383 -- see `group_bound`.
         let gbound = self.ensure_group_bound(shard.info.n_resident)?;
-        let e = &self.engine;
-        let s = &e.compute;
-        let cap = N_EXPERT_USED as u32;
-        let gbpe = shard.routed.gate_bytes_per_expert as u32;
-        let ubpe = shard.routed.up_bytes_per_expert as u32;
-        let dbpe = shard.routed.down_bytes_per_expert as u32;
-        let gdt = shard.routed.gate.dtype;
-        let ddt = shard.routed.down.dtype;
-        let mut timing = ExecTiming { path_decode: b <= self.decode_max_b && !force_batched, ..Default::default() };
-        timing.miss_mask = miss_mask;
-        if timing.path_decode {
+        let geo = PassGeo {
+            b,
+            gbound,
+            cap: N_EXPERT_USED as u32,
+            gbpe: shard.routed.gate_bytes_per_expert as u32,
+            ubpe: shard.routed.up_bytes_per_expert as u32,
+            dbpe: shard.routed.down_bytes_per_expert as u32,
+            gdt: shard.routed.gate.dtype,
+            ddt: shard.routed.down.dtype,
+        };
+        let mut timing = ExecTiming {
+            path_decode,
+            miss_mask,
+            n_missing: self.missing_scratch.len() as u32,
+            two_pass,
+            ..Default::default()
+        };
+        if path_decode {
             // Decode kernels, one token at a time: q8k(x) is already done on the
             // hub (the wire carries Q8_K), so 3 launches per token.
+            let (gate, up, down, remap) = shard.layer_views(layer)?;
+            let e = &self.engine;
+            let s = &e.compute;
+            let (cap, gbpe, ubpe, dbpe, gdt, ddt) = (geo.cap, geo.gbpe, geo.ubpe, geo.dbpe, geo.gdt, geo.ddt);
             for t in 0..b {
                 let xq_t = self.xq.slice_view(t * XQ_BYTES_PER_TOKEN, XQ_BYTES_PER_TOKEN);
                 let sel_t = self.d_selected.slice_view(t * nu, nu);
@@ -2638,108 +2775,191 @@ impl MoeExecutor {
             }
         } else {
             // Production prefill chain (forward_prefill.rs stage 11, MXFP4 arm):
-            // hetsplit group builder → work items (host readback) → kwide
-            // gate/up → q8k(mid) → by-expert kwide2 down → hetsplit reduce.
-            let bu = b as u32;
-            let max_per_expert = self.rows as u32;
-            let sel_v = self.d_selected.slice_view(0, b * nu);
-            let ew_v = self.d_ew.slice_view(0, b * nu);
-            let xq_v = self.xq.slice_view(0, b * XQ_BYTES_PER_TOKEN);
-            self.group_count.fill_zero_async(s)?;
-            e.moe_group_builder.launch_hetsplit(
-                s, &mut self.group_count, &mut self.expert_members, &sel_v, remap, 0, cap, bu,
-                nu as u32, gbound, max_per_expert,
-            )?;
-            self.n_work_items.fill_zero_async(s)?;
-            let max_items = self.work_items.len() as u32;
-            e.moe_group_builder.launch_work_items(
-                s, &mut self.work_items, &mut self.n_work_items, &self.group_count, gbound, CHUNK_SIZE, max_items,
-            )?;
-            s.synchronize()?;
-            let mut n_wi = [0i32; 1];
-            self.n_work_items.copy_to_host(&mut n_wi)?;
-            let n_wi = n_wi[0] as u32;
-            timing.n_work_items = n_wi;
-            let mut mid_v = self.d_mid_cat.slice_view_mut(0, b * nu * N_FF_EXP as usize);
-            // Under the decode-down diagnostic, zero mid first (as the decode
-            // gate/up does): the chunked gate/up writes only MEMBER slots, and
-            // the decode down sums all nu slots per token, so non-member slots
-            // must be 0 for the isolation to be valid rather than summing stale
-            // data (which gave KLD 1.6).
-            if b2_decode_down() {
-                mid_v.fill_zero_async(s)?;
+            // hetsplit group builder -> work items (host readback) -> kwide
+            // gate/up -> q8k(mid) -> by-expert kwide2 down -> hetsplit reduce.
+            let diag_done;
+            {
+                let (gate, up, down, remap) = shard.layer_views(layer)?;
+                let (n_wi, done) = self.batched_pass(&gate, &up, &down, remap, &geo, true)?;
+                timing.n_work_items = n_wi;
+                diag_done = done;
             }
-            let handled = super::dispatch::moe_gate_up_chunked(
-                e, gdt, s, &mut mid_v, &gate, &up, &xq_v, &ew_v, &self.group_count, &self.expert_members,
-                &self.work_items, n_wi, gbpe, ubpe, nu as u32, max_per_expert, CHUNK_SIZE, SWIGLU_CLAMP_EXP,
-                N_FF_EXP, BLOCKS_Q8K_GATE_IN,
-            )?;
-            if !handled {
-                return Err(eyre!("executor: no prefill gate/up kernel for {gdt:?}"));
-            }
-            let mut midq_v = self.d_midq_cat.slice_view_mut(0, b * nu * MIDQ_BYTES_PER_SLOT);
-            e.q8k.launch(s, &mut midq_v, &mid_v, BLOCKS_Q8K_DOWN_IN * nu as u32 * bu)?;
-            let mut part_v = self.partials.slice_view_mut(0, b * nu * N_EMBD as usize);
-            // MUST be zeroed per request. `launch_by_expert_kwide2` writes only
-            // the (token, slot) partials whose expert has members THIS request;
-            // every other slot keeps the PREVIOUS request's value, and the
-            // reduce below sums `nu` slots per token. `group_count` and
-            // `n_work_items` are both zeroed for the same reason — `partials`
-            // was missed.
-            //
-            // Only the BATCHED branch accumulates this way, and box 1 sets
-            // REQ_FLAG_BATCHED exactly when b > 1, which is why the corruption
-            // appeared only at b >= 2: a b=1 request takes the decode branch,
-            // which writes `ffn_moe` directly per token.
-            // `V41_B2_DECODE_DOWN=1`: run the DECODE down kernel per token over the
-            // batched midq (same derivation the decode branch uses: sel/midq/out
-            // sliced by token, NO clobbering of d_selected). Isolates whether the
-            // batched-vs-decode 0.276-nat divergence is in the by-expert DOWN
-            // kernel (KLD -> ~0 here) or upstream/batch-state (unchanged).
-            if b2_decode_down() {
-                for t in 0..b {
-                    let sel_t = self.d_selected.slice_view(t * nu, nu);
-                    let midq_t = self
-                        .d_midq_cat
-                        .slice_view(t * nu * MIDQ_BYTES_PER_SLOT, nu * MIDQ_BYTES_PER_SLOT);
-                    let mut out_t = self.ffn_moe.slice_view_mut(t * N_EMBD as usize, N_EMBD as usize);
-                    super::dispatch::moe_down_batched_hetsplit(
-                        e, ddt, s, &mut out_t, &down, &midq_t, &sel_t, remap, 0, cap, dbpe,
-                        MIDQ_BYTES_PER_SLOT as u32, nu as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN,
-                    )?;
+            if diag_done {
+                // `V41_B2_DECODE_DOWN` wrote `ffn_moe` directly; nothing to reduce.
+            } else if two_pass {
+                // The misses: read them NOW, while pass A's kernels run. `ensure`
+                // gets the FULL pick list so its victim search never evicts an
+                // expert pass A is reading from (a wanted id is never a victim)
+                // and so the hits' recency is touched as usual.
+                shard.ensure_layer_phased(layer, sel, b > 16)?;
+                for (i, &e) in sel.iter().enumerate() {
+                    let live = e != NO_PICK && !self.resident_scratch[i];
+                    self.sel_host[i] = if live { e } else { SENTINEL_EXPERT };
+                    self.ew_host[i] = if live { ew[i] } else { 0.0 };
                 }
-                if let Some((_, b)) = self.ev.as_ref() { b.record(s)?; }
-                s.synchronize()?;
-                timing.h2d = t1 - t0;
-                timing.gpu = t1.elapsed();
-                return Ok(timing);
+                self.upload_sel(1, b)?;
+                let (gate, up, down, remap) = shard.layer_views(layer)?;
+                let (n_wi, _) = self.batched_pass(&gate, &up, &down, remap, &geo, false)?;
+                timing.n_work_items += n_wi;
+                // Reduce over the FULL pick list: every real slot, whichever pass
+                // wrote its partial.
+                for (i, &e) in sel.iter().enumerate() {
+                    self.sel_host[i] = if e == NO_PICK { SENTINEL_EXPERT } else { e };
+                    self.ew_host[i] = if e == NO_PICK { 0.0 } else { ew[i] };
+                }
+                self.upload_sel(2, b)?;
+                self.reduce_partials(remap, b)?;
+            } else {
+                let (_, _, _, remap) = shard.layer_views(layer)?;
+                self.reduce_partials(remap, b)?;
             }
-            part_v.fill_zero_async(s)?;
-            match ddt {
-                GgufType::MXFP4 => e.mxfp4.launch_by_expert_kwide2(
-                    s, &mut part_v, &down, &midq_v, &self.group_count, &self.expert_members, &self.work_items,
-                    n_wi, dbpe, MIDQ_BYTES_PER_SLOT as u32, nu as u32, max_per_expert, CHUNK_SIZE, N_EMBD,
-                    BLOCKS_Q8K_DOWN_IN,
-                )?,
-                GgufType::IQ3_XXS => e.iq3.launch_by_expert_kwide2(
-                    s, &mut part_v, &down, &midq_v, &self.group_count, &self.expert_members, &self.work_items,
-                    n_wi, dbpe, MIDQ_BYTES_PER_SLOT as u32, nu as u32, max_per_expert, CHUNK_SIZE, N_EMBD,
-                    BLOCKS_Q8K_DOWN_IN,
-                )?,
-                other => return Err(eyre!("executor: no prefill down kernel for {other:?}")),
-            }
-            let mut out_v = self.ffn_moe.slice_view_mut(0, b * N_EMBD as usize);
-            e.q2k.launch_reduce_partials_hetsplit(
-                s, &mut out_v, &part_v, &sel_v, remap, 0, cap, nu as u32, N_EMBD, bu,
-            )?;
         }
-        if let Some((_, b)) = self.ev.as_ref() {
-            b.record(s)?;
+        if let Some((_, ev_b)) = self.ev.as_ref() {
+            ev_b.record(&self.engine.compute)?;
         }
-        s.synchronize()?;
+        self.engine.compute.synchronize()?;
         timing.h2d = t1 - t0;
         timing.gpu = t1.elapsed();
         Ok(timing)
+    }
+
+    /// Stage `sel_host`/`ew_host` (first `b * nu` entries) through pinned region
+    /// `region` (0: pass A / single pass, 1: pass B, 2: the reduce) and queue the
+    /// upload on the compute stream. Regions are distinct because an earlier
+    /// region's DMA may still be queued when the next is written; the stream sync
+    /// at the end of `run_path` retires them all before the next request.
+    fn upload_sel(&mut self, region: usize, b: usize) -> eyre::Result<()> {
+        let nu = N_EXPERT_USED;
+        let n = b * nu;
+        let off = region * self.rows * nu;
+        self.sel_pin.as_mut_slice()[off..off + n].copy_from_slice(&self.sel_host[..n]);
+        self.ew_pin.as_mut_slice()[off..off + n].copy_from_slice(&self.ew_host[..n]);
+        self.d_selected.slice_view_mut(0, n).copy_from_host_async(&self.sel_pin.as_slice()[off..off + n], &self.engine.compute)?;
+        self.d_ew.slice_view_mut(0, n).copy_from_host_async(&self.ew_pin.as_slice()[off..off + n], &self.engine.compute)?;
+        Ok(())
+    }
+
+    /// One by-expert pass over whatever `d_selected`/`d_ew` hold right now: group
+    /// build -> work items (host readback) -> gate/up -> q8k(mid) -> down into
+    /// `partials`. `first` zeroes `partials` (once per request; a second pass adds
+    /// its own slots beside the first's). Returns (work items, diagnostic-done):
+    /// under `V41_B2_DECODE_DOWN` the decode down kernel writes `ffn_moe` directly
+    /// and there is nothing to reduce.
+    fn batched_pass(
+        &mut self,
+        gate: &DeviceBuffer<u8>,
+        up: &DeviceBuffer<u8>,
+        down: &DeviceBuffer<u8>,
+        remap: &DeviceBuffer<i32>,
+        g: &PassGeo,
+        first: bool,
+    ) -> eyre::Result<(u32, bool)> {
+        let nu = N_EXPERT_USED;
+        let b = g.b;
+        let bu = b as u32;
+        let e = &self.engine;
+        let s = &e.compute;
+        let max_per_expert = self.rows as u32;
+        let sel_v = self.d_selected.slice_view(0, b * nu);
+        let ew_v = self.d_ew.slice_view(0, b * nu);
+        let xq_v = self.xq.slice_view(0, b * XQ_BYTES_PER_TOKEN);
+        self.group_count.fill_zero_async(s)?;
+        e.moe_group_builder.launch_hetsplit(
+            s, &mut self.group_count, &mut self.expert_members, &sel_v, remap, 0, g.cap, bu,
+            nu as u32, g.gbound, max_per_expert,
+        )?;
+        self.n_work_items.fill_zero_async(s)?;
+        let max_items = self.work_items.len() as u32;
+        e.moe_group_builder.launch_work_items(
+            s, &mut self.work_items, &mut self.n_work_items, &self.group_count, g.gbound, CHUNK_SIZE, max_items,
+        )?;
+        s.synchronize()?;
+        let mut n_wi = [0i32; 1];
+        self.n_work_items.copy_to_host(&mut n_wi)?;
+        let n_wi = n_wi[0] as u32;
+        let mut mid_v = self.d_mid_cat.slice_view_mut(0, b * nu * N_FF_EXP as usize);
+        // Under the decode-down diagnostic, zero mid first (as the decode
+        // gate/up does): the chunked gate/up writes only MEMBER slots, and
+        // the decode down sums all nu slots per token, so non-member slots
+        // must be 0 for the isolation to be valid rather than summing stale
+        // data (which gave KLD 1.6).
+        if b2_decode_down() {
+            mid_v.fill_zero_async(s)?;
+        }
+        let handled = super::dispatch::moe_gate_up_chunked(
+            e, g.gdt, s, &mut mid_v, gate, up, &xq_v, &ew_v, &self.group_count, &self.expert_members,
+            &self.work_items, n_wi, g.gbpe, g.ubpe, nu as u32, max_per_expert, CHUNK_SIZE, SWIGLU_CLAMP_EXP,
+            N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+        )?;
+        if !handled {
+            return Err(eyre!("executor: no prefill gate/up kernel for {:?}", g.gdt));
+        }
+        let mut midq_v = self.d_midq_cat.slice_view_mut(0, b * nu * MIDQ_BYTES_PER_SLOT);
+        e.q8k.launch(s, &mut midq_v, &mid_v, BLOCKS_Q8K_DOWN_IN * nu as u32 * bu)?;
+        // `V41_B2_DECODE_DOWN=1`: run the DECODE down kernel per token over the
+        // batched midq (same derivation the decode branch uses: sel/midq/out
+        // sliced by token, NO clobbering of d_selected). Isolates whether the
+        // batched-vs-decode 0.276-nat divergence is in the by-expert DOWN
+        // kernel (KLD -> ~0 here) or upstream/batch-state (unchanged).
+        if b2_decode_down() {
+            for t in 0..b {
+                let sel_t = self.d_selected.slice_view(t * nu, nu);
+                let midq_t = self
+                    .d_midq_cat
+                    .slice_view(t * nu * MIDQ_BYTES_PER_SLOT, nu * MIDQ_BYTES_PER_SLOT);
+                let mut out_t = self.ffn_moe.slice_view_mut(t * N_EMBD as usize, N_EMBD as usize);
+                super::dispatch::moe_down_batched_hetsplit(
+                    e, g.ddt, s, &mut out_t, down, &midq_t, &sel_t, remap, 0, g.cap, g.dbpe,
+                    MIDQ_BYTES_PER_SLOT as u32, nu as u32, N_EMBD, BLOCKS_Q8K_DOWN_IN,
+                )?;
+            }
+            return Ok((n_wi, true));
+        }
+        let mut part_v = self.partials.slice_view_mut(0, b * nu * N_EMBD as usize);
+        // MUST be zeroed per request. `launch_by_expert_kwide2` writes only
+        // the (token, slot) partials whose expert has members THIS pass;
+        // every other slot keeps the PREVIOUS request's value, and the
+        // reduce below sums `nu` slots per token. `group_count` and
+        // `n_work_items` are both zeroed for the same reason -- `partials`
+        // was missed once. Only the FIRST pass of a request zeroes: the second
+        // pass writes the slots the first left at zero.
+        //
+        // Only the BATCHED branch accumulates this way, and box 1 sets
+        // REQ_FLAG_BATCHED exactly when b > 1, which is why the corruption
+        // appeared only at b >= 2: a b=1 request takes the decode branch,
+        // which writes `ffn_moe` directly per token.
+        if first {
+            part_v.fill_zero_async(s)?;
+        }
+        match g.ddt {
+            GgufType::MXFP4 => e.mxfp4.launch_by_expert_kwide2(
+                s, &mut part_v, down, &midq_v, &self.group_count, &self.expert_members, &self.work_items,
+                n_wi, g.dbpe, MIDQ_BYTES_PER_SLOT as u32, nu as u32, max_per_expert, CHUNK_SIZE, N_EMBD,
+                BLOCKS_Q8K_DOWN_IN,
+            )?,
+            GgufType::IQ3_XXS => e.iq3.launch_by_expert_kwide2(
+                s, &mut part_v, down, &midq_v, &self.group_count, &self.expert_members, &self.work_items,
+                n_wi, g.dbpe, MIDQ_BYTES_PER_SLOT as u32, nu as u32, max_per_expert, CHUNK_SIZE, N_EMBD,
+                BLOCKS_Q8K_DOWN_IN,
+            )?,
+            other => return Err(eyre!("executor: no prefill down kernel for {other:?}")),
+        }
+        Ok((n_wi, false))
+    }
+
+    /// Sum each token's `nu` partial slots into `ffn_moe`, in slot order, over the
+    /// pick list currently in `d_selected` (a sentinel/no-pick slot contributes
+    /// nothing: its partial is zero and mode 0 skips it).
+    fn reduce_partials(&mut self, remap: &DeviceBuffer<i32>, b: usize) -> eyre::Result<()> {
+        let nu = N_EXPERT_USED;
+        let e = &self.engine;
+        let s = &e.compute;
+        let sel_v = self.d_selected.slice_view(0, b * nu);
+        let part_v = self.partials.slice_view(0, b * nu * N_EMBD as usize);
+        let mut out_v = self.ffn_moe.slice_view_mut(0, b * N_EMBD as usize);
+        e.q2k.launch_reduce_partials_hetsplit(
+            s, &mut out_v, &part_v, &sel_v, remap, 0, N_EXPERT_USED as u32, nu as u32, N_EMBD, b as u32,
+        )
     }
 
     /// Copy the last result's f32 rows to host.
