@@ -121,7 +121,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             return;
         }
     };
-    tracing::info!(n_slots, ctx_rows, chunk_rows, prefill_burst_ms = env_usize("V41_MS_PREFILL_BURST_MS", 4000), decode_burst_ms = env_usize("V41_MS_DECODE_BURST_MS", 4000), "multistream scheduler ON");
+    tracing::info!(n_slots, ctx_rows, chunk_rows, prefill_burst_ms = env_usize("V41_MS_PREFILL_BURST_MS", 30_000), decode_burst_ms = env_usize("V41_MS_DECODE_BURST_MS", 30_000), "multistream scheduler ON");
     let n_jobs = env_usize("V41_MS_PREFILL_JOBS", 2).max(1);
     let mut spare_states = Vec::with_capacity(n_jobs);
     for _ in 0..n_jobs {
@@ -131,7 +131,14 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         }
     }
     tracing::info!(n_jobs, "multistream: prefill scratch states allocated");
-    let mut sched = Sched { phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
+    let (bounce_f16, bounce_u8) = match (|| -> eyre::Result<_> {
+        state.dgpu.set_current()?;
+        Ok((v4flash_hip::DeviceBuffer::<u16>::new(state.dgpu.id, 4096 * 512)?, v4flash_hip::DeviceBuffer::<u8>::new(state.dgpu.id, 4096 * 80)?))
+    })() {
+        Ok(b) => b,
+        Err(e) => { tracing::error!(error = %e, "multistream: bounce alloc failed"); return; }
+    };
+    let mut sched = Sched { parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
 
     loop {
         // 1. Intake: never block while there is work; block when idle.
@@ -174,6 +181,11 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
 enum Phase { Decode, Prefill }
 
 struct Sched {
+    /// Prefilled requests waiting for arena room (their scratch state stays
+    /// parked with them; admission is retried every tick).
+    parked: Vec<(Prefill, Vec<f32>)>,
+    bounce_f16: v4flash_hip::DeviceBuffer<u16>,
+    bounce_u8: v4flash_hip::DeviceBuffer<u8>,
     phase: Phase,
     phase_since: Instant,
     arena: KvArena,
@@ -206,6 +218,10 @@ impl Sched {
             let _ = p.p.tx.try_send(WorkerEvent::Error(why.to_string()));
             self.spare_states.push(p.kv);
         }
+        for (p, _) in self.parked.drain(..) {
+            let _ = p.p.tx.try_send(WorkerEvent::Error(why.to_string()));
+            self.spare_states.push(p.kv);
+        }
         for p in self.queue.drain(..) {
             let _ = p.tx.try_send(WorkerEvent::Error(why.to_string()));
         }
@@ -223,6 +239,31 @@ impl Sched {
                 tracing::info!(slot = s.slot, completion_tokens = s.completion_tokens, "multistream: stream cancelled");
                 self.arena.release(s.slot)?;
             } else {
+                i += 1;
+            }
+        }
+        // Parked (prefilled, no room yet): retry admission now that streams may
+        // have finished. Oldest first.
+        if !self.parked.is_empty() {
+            let mut i = 0;
+            while i < self.parked.len() {
+                let (pf, _) = &self.parked[i];
+                if pf.p.cancel.load(Ordering::Relaxed) || pf.p.tx.is_closed() {
+                    let (pf, _) = self.parked.remove(i);
+                    self.spare_states.push(pf.kv);
+                    continue;
+                }
+                let ctx_cap = pf.prefix.len() as u32 + pf.p.req.max_new as u32 + 2;
+                if self.arena.live() < self.arena.n_slots as usize && self.arena.fits_after_compaction(ctx_cap) {
+                    let (pf, logits) = self.parked.remove(i);
+                    let tx = pf.p.tx.clone();
+                    if let Err((kv, e)) = self.try_admit(state, pf, logits) {
+                        tracing::error!(error = %e, "multistream: parked admission failed");
+                        let _ = tx.try_send(WorkerEvent::Error(format!("{e:#}")));
+                        if let Some(kv) = kv { self.spare_states.push(kv); }
+                    }
+                    continue;
+                }
                 i += 1;
             }
         }
@@ -285,8 +326,8 @@ impl Sched {
         let have_pf = !self.prefills.is_empty();
         let have_dec = !self.streams.is_empty();
         let budget = |ph: Phase| std::time::Duration::from_millis(match ph {
-            Phase::Prefill => env_usize("V41_MS_PREFILL_BURST_MS", 4000) as u64,
-            Phase::Decode => env_usize("V41_MS_DECODE_BURST_MS", 4000) as u64,
+            Phase::Prefill => env_usize("V41_MS_PREFILL_BURST_MS", 30_000) as u64,
+            Phase::Decode => env_usize("V41_MS_DECODE_BURST_MS", 30_000) as u64,
         });
         let next = match (have_pf, have_dec) {
             (true, false) => Phase::Prefill,
@@ -475,17 +516,35 @@ impl Sched {
             }
             Err(e) => tracing::error!(error = %e, "multistream: snapshot.save failed"),
         }
-        // Admit. `ctx_cap` = what this turn can grow to; the arena carves that
-        // many comp rows per store (first fit). No room => this request fails
-        // with a clear message (the client retries later); nothing else is touched.
+        self.try_admit(state, pf, logits)
+    }
+
+    /// Admit a prefilled request: `ctx_cap` = what this turn can grow to; the
+    /// arena carves that many comp rows per store (first fit). Fragmented =>
+    /// compact the stores first. No room at all => park it (its scratch state
+    /// stays with it) and retry as streams finish.
+    fn try_admit(&mut self, state: &mut WorkerState, pf: Prefill, logits: Vec<f32>) -> Result<(), (Option<v4flash_kernels::het::HetModelState>, eyre::Report)> {
         let pos = pf.prefix.len() as u32;
         let ctx_cap = pos + pf.p.req.max_new as u32 + 2;
         if ctx_cap > state.n_kv_max {
             return Err((Some(pf.kv), eyre!("prompt {pos} + max_tokens {} exceeds the context {}", pf.p.req.max_new, state.n_kv_max)));
         }
-        let slot = match self.arena.admit_from_state(&pf.kv, ctx_cap, pos, &state.engine.dgpu.compute) {
+        let mut slot = self.arena.admit_from_state(&pf.kv, ctx_cap, pos, &state.engine.dgpu.compute);
+        if slot.is_err() && self.arena.live() < self.arena.n_slots as usize && self.arena.fits_after_compaction(ctx_cap) {
+            let t = Instant::now();
+            if let Err(e) = self.arena.compact_stores(&state.engine.dgpu.compute, &mut self.bounce_f16, &mut self.bounce_u8) {
+                return Err((Some(pf.kv), e));
+            }
+            tracing::info!(ms = t.elapsed().as_millis() as u64, live = self.streams.len(), "multistream: stores compacted");
+            slot = self.arena.admit_from_state(&pf.kv, ctx_cap, pos, &state.engine.dgpu.compute);
+        }
+        let slot = match slot {
             Ok(s) => s,
-            Err(e) => return Err((Some(pf.kv), eyre!("no room for a {ctx_cap}-token stream right now ({} live): {e}", self.streams.len()))),
+            Err(e) => {
+                tracing::warn!(ctx_cap, live = self.streams.len(), parked = self.parked.len() + 1, error = %e, "multistream: no room; parking the request until a stream finishes");
+                self.parked.push((pf, logits));
+                return Ok(());
+            }
         };
         if let Err(e) = state.engine.dgpu.compute.synchronize() { return Err((Some(pf.kv), e)); }
         let Prefill { p: pp, job, kv: kv_done, prefix, compressed, started } = pf;

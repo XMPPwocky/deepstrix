@@ -536,6 +536,85 @@ impl KvArena {
         Ok(())
     }
 
+    /// Would `admit(ctx_cap, ..)` fit if the stores were defragmented?
+    pub fn fits_after_compaction(&self, ctx_cap: u32) -> bool {
+        self.stores.iter().all(|st| st.free.free_rows() >= ctx_cap.div_ceil(st.ratio).max(1))
+    }
+
+    /// Slide every live region of every store down to make the free space one
+    /// contiguous run at the end. D2D through `bounce` (>= 4096 * width f16 and
+    /// >= 4096 * E2M1_KEY_ROW_BYTES bytes; the raw ring scratch is too small,
+    /// pass a dedicated buffer). Nothing may be reading the stores (call it
+    /// between steps, on the scheduler thread); `stream` is synchronized before
+    /// return. Accumulator blocks are per slot and do not move.
+    pub fn compact_stores(&mut self, stream: &Stream, bounce_f16: &mut DeviceBuffer<u16>, bounce_u8: &mut DeviceBuffer<u8>) -> eyre::Result<()> {
+        self.dgpu.set_current()?;
+        let n_stores = self.stores.len();
+        for si in 0..n_stores {
+            let width = self.stores[si].width as usize;
+            let chunk_rows = (bounce_f16.len() / width).min(bounce_u8.len() / E2M1_KEY_ROW_BYTES).max(1);
+            // (slot, base, n_comp) of every live region, ascending by base.
+            let mut regs: Vec<(usize, u32, u32)> = self.streams.iter().enumerate()
+                .filter_map(|(sl, s)| s.as_ref().map(|s| (sl, s.comp[si].base, s.comp[si].cap)))
+                .collect();
+            regs.sort_by_key(|&(_, b, _)| b);
+            let mut next_base: u32 = 0;
+            for (sl, base, cap) in regs {
+                if base != next_base {
+                    debug_assert!(base > next_base);
+                    let s = self.streams[sl].as_ref().expect("live");
+                    let (n_comp, n_keys) = (s.comp[si].n_comp as usize, s.comp[si].n_index_comp as usize);
+                    let l = self.stores[si].layer;
+                    let cs = self.state.layers[l].compressor.as_mut().expect("arena store");
+                    // comp rows
+                    if n_comp > 0 {
+                        let buf = cs.comp_kv.f16_mut().expect("f16 store");
+                        let mut r = 0usize;
+                        while r < n_comp {
+                            let n = (n_comp - r).min(chunk_rows);
+                            {
+                                let src = buf.slice_view((base as usize + r) * width, n * width);
+                                let mut b = bounce_f16.slice_view_mut(0, n * width);
+                                b.copy_from_buffer_async(&src, stream)?;
+                            }
+                            {
+                                let b = bounce_f16.slice_view(0, n * width);
+                                let mut dst = buf.slice_view_mut((next_base as usize + r) * width, n * width);
+                                dst.copy_from_buffer_async(&b, stream)?;
+                            }
+                            r += n;
+                        }
+                    }
+                    // index keys
+                    if n_keys > 0 {
+                        let kb = cs.index_k.as_mut().expect("keys");
+                        let mut r = 0usize;
+                        while r < n_keys {
+                            let n = (n_keys - r).min(chunk_rows);
+                            {
+                                let src = kb.slice_view((base as usize + r) * E2M1_KEY_ROW_BYTES, n * E2M1_KEY_ROW_BYTES);
+                                let mut b = bounce_u8.slice_view_mut(0, n * E2M1_KEY_ROW_BYTES);
+                                b.copy_from_buffer_async(&src, stream)?;
+                            }
+                            {
+                                let b = bounce_u8.slice_view(0, n * E2M1_KEY_ROW_BYTES);
+                                let mut dst = kb.slice_view_mut((next_base as usize + r) * E2M1_KEY_ROW_BYTES, n * E2M1_KEY_ROW_BYTES);
+                                dst.copy_from_buffer_async(&b, stream)?;
+                            }
+                            r += n;
+                        }
+                    }
+                    self.streams[sl].as_mut().expect("live").comp[si].base = next_base;
+                }
+                next_base += cap;
+            }
+            let rows_cap = self.stores[si].rows_cap;
+            self.stores[si].free = RowFreeList { free: if rows_cap > next_base { vec![(next_base, rows_cap - next_base)] } else { Vec::new() } };
+        }
+        stream.synchronize()?;
+        Ok(())
+    }
+
     pub fn release(&mut self, slot: u32) -> eyre::Result<()> {
         let s = self.streams.get_mut(slot as usize).and_then(|s| s.take())
             .ok_or_else(|| eyre!("kv arena: slot {slot} not live"))?;
