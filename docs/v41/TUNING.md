@@ -108,3 +108,13 @@ in the regime it describes.
 
 | 2026-09-21 | `ethtool -K thunderbolt0 tso off gso off` (both boxes; ethtool from the nix store path in apply_host_tuning.sh) | removes the ~1 ms sender-side hold on every link reply over one 65,520-B segment (f32 >= 4 rows, f16 >= 8, every prefill/verify chunk); non-persistent | LINK_IDLE_LATENCY.md 2026-09-21 |
 | 2026-09-21 | `V41_BATCH_BUSY_POLL_US` default 500 -> 50 | the receiver-side hold on multi-segment replies scales with the window (2.1 ms at 3000, 0.36 at 20); decode stays at 3000 | same |
+
+**Persisted 2026-09-21** in the system flake (`~/lumi-brain/lumi-brain`, uncommitted,
+pending `nixos-rebuild switch` on both hosts): `modules/host-tuning.nix`
+(`lumi.tuning.enable`, `linkCpus`; governor performance + a `deepstrix-cpuidle`
+oneshot for C2/C3 off everywhere and C1 off on the link CCX) and
+`modules/interconnect.nix` (busy_read/busy_poll 5000, a `.link` with TSO/GSO off on
+thunderbolt0, udev `power/control=on` for thunderbolt devices, ethtool in the
+profile). `scripts/apply_host_tuning.sh` remains the runtime re-apply and the
+reference for what the flake must reproduce; the expertd CPU pin is not persisted
+(the daemon is launched by hand).
