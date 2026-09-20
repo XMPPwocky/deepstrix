@@ -138,7 +138,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         Ok(b) => b,
         Err(e) => { tracing::error!(error = %e, "multistream: bounce alloc failed"); return; }
     };
-    let mut sched = Sched { parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
+    let mut sched = Sched { profile_acc: ProfileAcc::default(), parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
 
     loop {
         // 1. Intake: never block while there is work; block when idle.
@@ -180,7 +180,21 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase { Decode, Prefill }
 
+#[derive(Default)]
+struct ProfileAcc {
+    steps: u64,
+    rows: u64,
+    wall_ms: f64,
+    stages: std::collections::HashMap<(&'static str, &'static str), (f64, u64)>,
+}
+
+fn ms_profile() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| matches!(std::env::var("V41_MS_PROFILE").as_deref(), Ok("1")));
+    *ON
+}
+
 struct Sched {
+    profile_acc: ProfileAcc,
     /// Prefilled requests waiting for arena room (their scratch state stays
     /// parked with them; admission is retried every tick).
     parked: Vec<(Prefill, Vec<f32>)>,
@@ -627,10 +641,67 @@ impl Sched {
         };
         let engram_ms = t_eng.elapsed().as_secs_f64() * 1e3;
         let WorkerState { engine, bd_a, bi_a, sd, si, dgpu_scratch, weights, pager, .. } = state;
+        // V41_MS_PROFILE=1: per-stage GPU busy time of the batched step (HIP
+        // events per stage, ~100 us/layer), rolled up over V41_MS_PROFILE_EVERY
+        // steps and logged as "ms.stage". Wall - busy = host / link / sync.
+        let profile = ms_profile();
+        if profile {
+            engine.dgpu.events.set_enabled(true);
+            engine.igpu.events.set_enabled(true);
+            engine.dgpu.events.reset();
+            engine.igpu.events.reset();
+            v4flash_kernels::het::trace::phase::reset();
+        }
         let t_fwd = Instant::now();
         engine.forward_step_arena(bd_a, bi_a, sd, si, &mut self.arena, &mut self.dev, &slots, weights, &hcs, &toks, engram_rows.as_deref(), pager.as_mut())?;
+        let fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
         let logits = engine.head_rows(dgpu_scratch, bd_a, b, weights)?;
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
+        if profile {
+            use v4flash_kernels::het::trace::{phase as counters, rollup_by_name};
+            let dg = rollup_by_name(&engine.dgpu.events.harvest()?);
+            let ig = rollup_by_name(&engine.igpu.events.harvest()?);
+            let host = [
+                ("host.sel_sync", counters::get(&counters::SEL_SYNC_NS)),
+                ("host.ensure", counters::get(&counters::ENSURE_NS)),
+                ("host.engram_stage", counters::get(&counters::ENGRAM_STAGE_NS)),
+                ("host.remote_rtt", counters::get(&counters::REMOTE_RTT_NS)),
+                ("host.remote_srv", counters::get(&counters::REMOTE_SRV_NS)),
+            ];
+            let acc = &mut self.profile_acc;
+            acc.steps += 1;
+            acc.rows += b as u64;
+            acc.wall_ms += fwd_only_ms;
+            for (dev, r) in [("dgpu", &dg), ("igpu", &ig)] {
+                for &(name, ms, calls) in r {
+                    let e = acc.stages.entry((dev, name)).or_insert((0.0, 0));
+                    e.0 += ms as f64;
+                    e.1 += calls as u64;
+                }
+            }
+            for (name, ns) in host {
+                let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
+                e.0 += ns as f64 / 1e6;
+                e.1 += 1;
+            }
+            let every = env_usize("V41_MS_PROFILE_EVERY", 20) as u64;
+            if acc.steps >= every {
+                let mut v: Vec<_> = acc.stages.iter().map(|(&(d, n), &(ms, c))| (d, n, ms / acc.steps as f64, c)).collect();
+                v.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                let dgpu_busy: f64 = v.iter().filter(|e| e.0 == "dgpu").map(|e| e.2).sum();
+                let igpu_busy: f64 = v.iter().filter(|e| e.0 == "igpu").map(|e| e.2).sum();
+                tracing::info!(steps = acc.steps, rows_avg = format!("{:.1}", acc.rows as f64 / acc.steps as f64),
+                    wall_ms = format!("{:.1}", acc.wall_ms / acc.steps as f64), dgpu_busy_ms = format!("{dgpu_busy:.1}"),
+                    igpu_busy_ms = format!("{igpu_busy:.1}"), "ms.stage.total (per step)");
+                for (d, n, ms, c) in v.iter().take(24) {
+                    tracing::info!(device = *d, stage = *n, ms_per_step = format!("{ms:.2}"), calls = *c, "ms.stage");
+                }
+                acc.stages.clear();
+                acc.steps = 0;
+                acc.rows = 0;
+                acc.wall_ms = 0.0;
+            }
+        }
         let nv = N_VOCAB as usize;
         // Sample, emit, retire.
         let t_s = Instant::now();
