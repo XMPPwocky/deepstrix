@@ -101,9 +101,11 @@ const CHUNK_SEND_FAILURES_MAX: u32 = 30;
 pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
     let n_slots = env_usize("V41_MS_SLOTS", 8) as u32;
     // Context budget across all live streams (positions); each store gets
-    // budget / ratio rows. Default 3 x --ctx: e.g. three 240K agents, or twelve
-    // 60K ones. ~1 KB per row at ratio 1 plus 0.5 KB per ratio-2 store.
-    let ctx_rows = env_usize("V41_MS_CTX_ROWS", 3 * state.n_kv_max as usize) as u32;
+    // budget / ratio rows. Default 2 x --ctx: two 240K agents, or eight 75K
+    // ones. ~1 KB per row at ratio 1 plus 0.5 KB per ratio-2 store; MEASURED
+    // 2026-09-20 on the 16 GB dGPU with two prefill states: 3 x --ctx left
+    // 190 MiB free (unsafe), 2 x --ctx 1.0 GiB.
+    let ctx_rows = env_usize("V41_MS_CTX_ROWS", 2 * state.n_kv_max as usize) as u32;
     let chunk_rows = env_usize("V41_MS_CHUNK_ROWS", 256);
     let prefill_share = env_usize("V41_MS_PREFILL_SHARE", 2).max(1); // 1 chunk per this many ticks
     let arena = match KvArena::alloc_ctx(state.dgpu, n_slots, ctx_rows) {
