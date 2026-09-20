@@ -121,6 +121,13 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             return;
         }
     };
+    let dev_b = match RowTablesDev::alloc(state.dgpu, n_slots, arena.stores.len()) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, "multistream: row tables (lane B) alloc failed");
+            return;
+        }
+    };
     tracing::info!(n_slots, ctx_rows, chunk_rows, prefill_burst_ms = env_usize("V41_MS_PREFILL_BURST_MS", 120_000), decode_burst_ms = env_usize("V41_MS_DECODE_BURST_MS", 30_000), "multistream scheduler ON");
     let n_jobs = env_usize("V41_MS_PREFILL_JOBS", 2).max(1);
     let mut spare_states = Vec::with_capacity(n_jobs);
@@ -138,7 +145,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         Ok(b) => b,
         Err(e) => { tracing::error!(error = %e, "multistream: bounce alloc failed"); return; }
     };
-    let mut sched = Sched { profile_acc: ProfileAcc::default(), parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
+    let mut sched = Sched { profile_acc: ProfileAcc::default(), dev_b, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
 
     loop {
         // 1. Intake: never block while there is work; block when idle.
@@ -191,6 +198,11 @@ struct ProfileAcc {
     stages: std::collections::HashMap<(&'static str, &'static str), (f64, u64)>,
 }
 
+fn ms_pipeline() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_MS_PIPELINE").as_deref() != Ok("0"));
+    *ON
+}
+
 fn ms_profile() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| matches!(std::env::var("V41_MS_PROFILE").as_deref(), Ok("1")));
     *ON
@@ -198,6 +210,8 @@ fn ms_profile() -> bool {
 
 struct Sched {
     profile_acc: ProfileAcc,
+    /// Lane-B tables for the two-lane step (`V41_MS_PIPELINE`).
+    dev_b: RowTablesDev,
     /// Prefilled requests waiting for arena room (their scratch state stays
     /// parked with them; admission is retried every tick).
     parked: Vec<(Prefill, Vec<f32>)>,
@@ -661,7 +675,7 @@ impl Sched {
             _ => None,
         };
         let engram_ms = t_eng.elapsed().as_secs_f64() * 1e3;
-        let WorkerState { engine, bd_a, bi_a, sd, si, dgpu_scratch, weights, pager, .. } = state;
+        let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, weights, pager, .. } = state;
         // V41_MS_PROFILE=1: per-stage GPU busy time of the batched step (HIP
         // events per stage, ~100 us/layer), rolled up over V41_MS_PROFILE_EVERY
         // steps and logged as "ms.stage". Wall - busy = host / link / sync.
@@ -676,9 +690,22 @@ impl Sched {
             v4flash_kernels::het::trace::phase::reset();
         }
         let t_fwd = Instant::now();
-        engine.forward_step_arena(bd_a, bi_a, sd, si, &mut self.arena, &mut self.dev, &slots, weights, &hcs, &toks, engram_rows.as_deref(), pager.as_mut())?;
-        let fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
-        let logits = engine.head_rows(dgpu_scratch, bd_a, b, weights)?;
+        // Two-lane pipelined step (default for >= 2 rows, `V41_MS_PIPELINE=0`
+        // disables): lane B's layer runs under lane A's box-2 wait.
+        let pipelined = b >= 2 && ms_pipeline();
+        let fwd_only_ms;
+        let logits = if pipelined {
+            engine.forward_step_arena_pipelined(bd_a, bi_a, bd_b, bi_b, sd, si, &mut self.arena, &mut self.dev, &mut self.dev_b, &slots, weights, &hcs, &toks, engram_rows.as_deref(), pager.as_mut())?;
+            fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
+            let b_a = b.div_ceil(2);
+            let mut l = engine.head_rows(dgpu_scratch, bd_a, b_a, weights)?;
+            l.extend(engine.head_rows(dgpu_scratch, bd_b, b - b_a, weights)?);
+            l
+        } else {
+            engine.forward_step_arena(bd_a, bi_a, sd, si, &mut self.arena, &mut self.dev, &slots, weights, &hcs, &toks, engram_rows.as_deref(), pager.as_mut())?;
+            fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
+            engine.head_rows(dgpu_scratch, bd_a, b, weights)?
+        };
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
         if profile {
             use v4flash_kernels::het::trace::{phase as counters, rollup_by_name};
