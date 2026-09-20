@@ -86,7 +86,22 @@ MEASURED 2026-09-20: the load-time Q8_0 requant of the fp8 dense projections
 (ENGINE_PORT.md R19; ROADMAP item 6) is NOT the cause — the Q8-weights oracle
 (`V41_ORACLE_Q8=1`) is only **0.037 nats** from the bf16 oracle on Paris (same top-1,
 max |Δ| 4.9), while decode is **1.19 nats** from the Q8 oracle (decode-only 0.87).
-So ~1 nat is engine error. Per-layer bisection vs both oracles: scratch `cmp_floor.py`.
+So ~1 nat is engine error. Per-layer bisection vs both oracles (scratch
+`cmp_floor.py`, port-doc metric max|Δ|/max|ref| at position 5): the residual
+ENTERING layer 1 is at the floor (1.3e-2 vs 4.9e-3) and entering layer 2 it is
+0.19 (batched) / 0.25 (decode) against a 0.035 floor — 6x over — then it compounds.
+**Layer 1's output is the seed, in BOTH paths.** Layer 1 differs from layer 0 only
+by Engram. Verified static (2026-09-20): `engram_gate_add.hip` matches the
+reference `Engram.forward` line for line; the gather (`gather_uncached` and the
+row cache) round identically and are unchanged since 2026-09-13 apart from the
+cache; the hash-parameter dumps date from 2026-09-12; coalesced expert reads are
+off on box 1. Unverified: the Engram `wkv` projection's activation quantisation
+(engine Q8 int8 vs the reference's fp8 `act_quant` of the bf16 rows) and layer 1's
+loaded weights. The 2026-09-13 M6 "layer 1 passes at 2x floor" ran with ALL experts
+resident (no pager) and before 4616474 tightened the vacuous gates, so it may never
+have tested this. Next window: `v41_layer0_parity` with `V41_LAYER=1 V41_ISOLATED=1`
+on the Paris fixture, resident and with `V41_PAGER=1`; if isolated layer 1 fails,
+dump `engram_kv` (key/value after wkv) and compare against the reference's.
 
 ### `deepstrix-expert-bench --check-layer` MISMATCHES at B=4 (decode branch) — **OPEN**, found 2026-09-19
 `--check-layer 0 --check-n 3` against a 3-expert daemon: B=1 and B=64 are
