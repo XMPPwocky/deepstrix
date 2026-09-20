@@ -6344,7 +6344,9 @@ impl HeterogeneousEngine {
                     max_items,
                 )?;
             }
+            let _t_wi = LayerHostTimer::start(&LH_WORK_ITEMS_SYNC);
             ie.compute.synchronize()?;
+            drop(_t_wi);
             let mut counts = [0i32; 1];
             bi.n_staged_work_items.copy_to_host(&mut counts)?;
             let n_staged = counts[0] as u32;
@@ -6940,6 +6942,9 @@ impl HeterogeneousEngine {
                 &super::trace::phase::REMOTE_RTT_NS,
                 (t_wait_end - t_wait) as u64,
             );
+            if layer_host_timing() {
+                LH_REMOTE_WAIT.fetch_add((t_wait_end - t_wait) as u64 / 1000, std::sync::atomic::Ordering::Relaxed);
+            }
             if remote_add_partial() {
                 let rows = (b as usize) * N_EMBD as usize;
                 let src = partial.f32();
@@ -7100,9 +7105,39 @@ pub static LH_EXCL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 pub static LH_AUDIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_REMAP_H2D: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// iGPU work-item readback sync (one per layer, MoE dispatch) and the exposed
+/// box-2 wait, so a caller reading the counters sees the whole per-layer host
+/// serialization.
+pub static LH_WORK_ITEMS_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_REMOTE_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Programmatic switch (the multistream profile turns it on): OR-ed with the env.
+pub static LH_FORCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn layer_host_timing() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("V41_LAYER_HOST_TIMING").as_deref() == Ok("1"))
+    LH_FORCE.load(std::sync::atomic::Ordering::Relaxed)
+        || *V.get_or_init(|| std::env::var("V41_LAYER_HOST_TIMING").as_deref() == Ok("1"))
+}
+
+/// Read-and-clear every LH_* counter (microseconds), for a caller that folds
+/// them into its own per-step profile (`multistream` "ms.stage").
+pub fn take_layer_host_timing() -> Vec<(&'static str, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    vec![
+        ("lh.pre_moe", LH_PRE.swap(0, Relaxed)),
+        ("lh.post_moe", LH_POST.swap(0, Relaxed)),
+        ("lh.engram", LH_ENGRAM.swap(0, Relaxed)),
+        ("lh.pager_block", LH_PAGER.swap(0, Relaxed)),
+        ("lh.sel_sync", LH_SEL_SYNC.swap(0, Relaxed)),
+        ("lh.remote_submit", LH_REMOTE.swap(0, Relaxed)),
+        ("lh.ensure", LH_ENSURE.swap(0, Relaxed)),
+        ("lh.owns", LH_OWNS.swap(0, Relaxed)),
+        ("lh.excl", LH_EXCL.swap(0, Relaxed)),
+        ("lh.audit", LH_AUDIT.swap(0, Relaxed)),
+        ("lh.remap_h2d", LH_REMAP_H2D.swap(0, Relaxed)),
+        ("lh.work_items_sync", LH_WORK_ITEMS_SYNC.swap(0, Relaxed)),
+        ("lh.remote_wait", LH_REMOTE_WAIT.swap(0, Relaxed)),
+    ]
 }
 
 pub struct LayerHostTimer {

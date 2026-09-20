@@ -106,7 +106,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
     // 2026-09-20 on the 16 GB dGPU with two prefill states: 3 x --ctx left
     // 190 MiB free (unsafe), 2 x --ctx 1.0 GiB.
     let ctx_rows = env_usize("V41_MS_CTX_ROWS", 2 * state.n_kv_max as usize) as u32;
-    let chunk_rows = env_usize("V41_MS_CHUNK_ROWS", 512);
+    let chunk_rows = env_usize("V41_MS_CHUNK_ROWS", 1024);
     let arena = match KvArena::alloc_ctx(state.dgpu, n_slots, ctx_rows) {
         Ok(a) => a,
         Err(e) => {
@@ -121,7 +121,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             return;
         }
     };
-    tracing::info!(n_slots, ctx_rows, chunk_rows, prefill_burst_ms = env_usize("V41_MS_PREFILL_BURST_MS", 30_000), decode_burst_ms = env_usize("V41_MS_DECODE_BURST_MS", 30_000), "multistream scheduler ON");
+    tracing::info!(n_slots, ctx_rows, chunk_rows, prefill_burst_ms = env_usize("V41_MS_PREFILL_BURST_MS", 120_000), decode_burst_ms = env_usize("V41_MS_DECODE_BURST_MS", 30_000), "multistream scheduler ON");
     let n_jobs = env_usize("V41_MS_PREFILL_JOBS", 2).max(1);
     let mut spare_states = Vec::with_capacity(n_jobs);
     for _ in 0..n_jobs {
@@ -340,7 +340,7 @@ impl Sched {
         let have_pf = !self.prefills.is_empty();
         let have_dec = !self.streams.is_empty();
         let budget = |ph: Phase| std::time::Duration::from_millis(match ph {
-            Phase::Prefill => env_usize("V41_MS_PREFILL_BURST_MS", 30_000) as u64,
+            Phase::Prefill => env_usize("V41_MS_PREFILL_BURST_MS", 120_000) as u64,
             Phase::Decode => env_usize("V41_MS_DECODE_BURST_MS", 30_000) as u64,
         });
         let next = match (have_pf, have_dec) {
@@ -630,6 +630,8 @@ impl Sched {
         // steps and logged as "ms.stage". Wall - busy = host / link / sync.
         let profile = ms_profile();
         if profile {
+            v4flash_kernels::het::forward_prefill::LH_FORCE.store(true, Ordering::Relaxed);
+            let _ = v4flash_kernels::het::forward_prefill::take_layer_host_timing();
             engine.dgpu.events.set_enabled(true);
             engine.igpu.events.set_enabled(true);
             engine.dgpu.events.reset();
@@ -668,6 +670,19 @@ impl Sched {
                 e.0 += ns as f64 / 1e6;
                 e.1 += 1;
             }
+            for (name, us) in v4flash_kernels::het::forward_prefill::take_layer_host_timing() {
+                let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
+                e.0 += us as f64 / 1e3;
+                e.1 += 1;
+            }
+            {
+                let e = acc.stages.entry(("host", "step.fwd_wall")).or_insert((0.0, 0));
+                e.0 += fwd_only_ms;
+                e.1 += 1;
+                let e = acc.stages.entry(("host", "step.head")).or_insert((0.0, 0));
+                e.0 += fwd_ms - fwd_only_ms;
+                e.1 += 1;
+            }
             let every = env_usize("V41_MS_PROFILE_EVERY", 20) as u64;
             if acc.steps >= every {
                 let mut v: Vec<_> = acc.stages.iter().map(|(&(d, n), &(ms, c))| (d, n, ms / acc.steps as f64, c)).collect();
@@ -677,7 +692,7 @@ impl Sched {
                 tracing::info!(steps = acc.steps, rows_avg = format!("{:.1}", acc.rows as f64 / acc.steps as f64),
                     wall_ms = format!("{:.1}", acc.wall_ms / acc.steps as f64), dgpu_busy_ms = format!("{dgpu_busy:.1}"),
                     igpu_busy_ms = format!("{igpu_busy:.1}"), "ms.stage.total (per step)");
-                for (d, n, ms, c) in v.iter().take(24) {
+                for (d, n, ms, c) in v.iter().take(40) {
                     tracing::info!(device = *d, stage = *n, ms_per_step = format!("{ms:.2}"), calls = *c, "ms.stage");
                 }
                 acc.stages.clear();
@@ -707,8 +722,8 @@ impl Sched {
     }
 }
 
-fn chunk_rows_idle() -> usize { env_usize("V41_MS_CHUNK_ROWS_IDLE", 512) }
-fn chunk_rows_busy() -> usize { env_usize("V41_MS_CHUNK_ROWS", 512) }
+fn chunk_rows_idle() -> usize { env_usize("V41_MS_CHUNK_ROWS_IDLE", 1024) }
+fn chunk_rows_busy() -> usize { env_usize("V41_MS_CHUNK_ROWS", 1024) }
 
 /// Same rule as `HeterogeneousEngine::sample_next` / the DSpark host twin.
 fn sample_row(r: &[f32], mode: &SampleMode, rng: &mut SamplerRng) -> i32 {
