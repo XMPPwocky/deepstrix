@@ -1,4 +1,4 @@
-//! Multi-stream KV arena (docs/v41/MULTISTREAM_DECODE_PLAN.md 3.2).
+//! Multi-stream KV arena (docs/v41/MULTISTREAM_DECODE_PLAN.md 3.2 / 3.7).
 //!
 //! `HetModelState` holds ONE sequence's KV. For S live streams the batched
 //! kernels want every row's KV somewhere in ONE allocation per store, addressed
@@ -15,18 +15,41 @@
 //!     first-fit region allocator over comp rows;
 //!   * per stream, the counters the kernels' tables are derived from.
 //!
+//! The buffers live inside a `HetModelState` (`KvArena::state`): layer `l`'s
+//! `kv_cache` IS the arena's raw buffer for that layer, and the four KV-source
+//! layers carry a `HetCompressorState` whose `state_kv`/`state_score` hold every
+//! stream's accumulator block and whose `comp_kv`/`index_k` are the shared
+//! stores. That is what lets the batched layer driver
+//! (`forward_layer_pre_moe_v2`) run S streams through the SAME `&mut
+//! HetLayerState` argument it runs one sequence through, with a
+//! `RowLayout::Arena` telling it to take bases and counts from the per-row
+//! tables instead of the state's scalars. The state's own counters (`n_raw`,
+//! `raw_off`, `n_comp`, `n_index_comp`) are meaningless in the arena and stay 0;
+//! `with_kv_source` lends the store to the reuse layers exactly as for one
+//! sequence.
+//!
 //! The raw counters are kept ONCE per stream, not per layer: decode advances
 //! every layer's window in lockstep (`forward_token_impl` takes the slot from
 //! layer 0 for that reason), and a multi-stream step keeps that invariant.
 //!
 //! Nothing here launches a kernel except the region compaction copy; the
-//! tables are plain host vectors the step uploads once.
+//! tables are plain host vectors (`RowTables`) the step uploads once into a
+//! `RowTablesDev`.
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{Device, DeviceBuffer, Stream};
 
-use crate::config::{COMPRESS_RATIOS, KV_SOURCE_LAYERS, N_HEAD_DIM, N_LAYER, SWA_WINDOW};
-use crate::het::state::KV_CACHE_ROWS;
+use crate::config::{
+    kv_source_of, COMPRESS_RATIOS, KV_SOURCE_LAYERS, NEG_INF, N_HEAD_DIM, N_LAYER, SWA_WINDOW,
+};
+use crate::het::state::{CompKvStore, HetCompressorState, HetLayerState, HetModelState, KV_CACHE_ROWS};
 use crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES;
+
+/// Index into `KvArena::stores` / `RowTables::stores` of the store `layer`
+/// reads (its KV source's), `None` for the dense layers.
+pub fn store_index_of(layer: usize) -> Option<usize> {
+    let src = kv_source_of(layer)?;
+    KV_SOURCE_LAYERS.iter().position(|&l| l as usize == src)
+}
 
 /// One stream's region in one compressed store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,27 +122,27 @@ impl RowFreeList {
     }
 }
 
-/// One compressed store (one KV-source layer) for all streams.
+/// One compressed store (one KV-source layer) for all streams: allocator +
+/// geometry. Its buffers are `KvArena::state.layers[layer].compressor`.
 pub struct CompStore {
     pub layer: usize,
     pub ratio: u32,
     pub width: u32,
-    pub comp_kv: DeviceBuffer<u16>,
-    pub index_k: DeviceBuffer<u8>,
-    /// `[n_slots, ratio * width]` running segment accumulators, one block per slot.
-    pub state_kv: DeviceBuffer<f32>,
-    pub state_score: DeviceBuffer<f32>,
     pub rows_cap: u32,
     pub free: RowFreeList,
 }
 
 /// Per-row tables for one step, in the order the rows were given. Host
-/// vectors; the step uploads them once. Names match the kernel parameters.
+/// vectors; the step uploads them once (`RowTablesDev::upload`). Names match
+/// the kernel parameters. Every value is PRE-step: the row's stream has
+/// `n_raw` raw rows and `n_comp` comp rows before this row runs; the driver
+/// derives the causal counts (`min(n_raw + 1, SWA_WINDOW)`, `n_comp + fires`).
 #[derive(Clone, Debug, Default)]
 pub struct RowTables {
     pub pos_per: Vec<i32>,
-    /// Raw window per row: rows valid and the row's window start in the LAYER
-    /// buffer (`slot * KV_CACHE_ROWS + raw_off`), the same for every layer.
+    /// Raw window per row BEFORE the append: rows valid and the window start in
+    /// the LAYER buffer (`slot * KV_CACHE_ROWS + raw_off`), the same for every
+    /// layer.
     pub n_raw_per: Vec<i32>,
     pub n_raw_offset_per: Vec<i32>,
     /// Raw append destination per row (`window start + n_raw`), every layer.
@@ -130,6 +153,8 @@ pub struct RowTables {
 
 #[derive(Clone, Debug, Default)]
 pub struct StoreTables {
+    /// Comp rows written before this step (the row's own boundary, if it
+    /// fires this step, is NOT counted).
     pub n_comp_per: Vec<i32>,
     pub comp_base_per: Vec<i32>,
     /// Same rows as `comp_base_per` (index keys parallel the comp rows), as
@@ -140,17 +165,86 @@ pub struct StoreTables {
     pub state_base_per: Vec<i32>,
     pub state_idx_per: Vec<i32>,
     /// Rows whose compressor boundary FIRES this step (`(pos + 1) % ratio == 0`),
-    /// as row indices into the batch, and their comp destination rows
-    /// (`base + n_comp`) — what the batched pool/append/index-k launches take.
+    /// as row indices into the batch, with — per firing row, same order — the
+    /// stream's accumulator block (`state_idx_per[row]`), the comp destination
+    /// row (`base + n_comp`) and the boundary's position (`pos + 1 - ratio`,
+    /// what decode ropes the pooled row at: forward_layer.rs `comp_pos`).
     pub fire_rows: Vec<i32>,
-    pub dst_row_per: Vec<i32>,
+    pub fire_state_idx: Vec<i32>,
+    pub fire_dst_row: Vec<i32>,
+    pub fire_comp_pos: Vec<i32>,
+}
+
+/// Device copies of the per-row base arrays the `*_rows` launches take.
+/// Allocated once for `rows_cap` rows; `upload` refills the used prefix.
+pub struct StoreTablesDev {
+    pub comp_base_per: DeviceBuffer<i32>,
+    pub keys_base_per: DeviceBuffer<u32>,
+    pub state_base_per: DeviceBuffer<i32>,
+    pub fire_state_idx: DeviceBuffer<i32>,
+    pub fire_dst_row: DeviceBuffer<i32>,
+}
+
+pub struct RowTablesDev {
+    pub rows_cap: u32,
+    pub slot_per: DeviceBuffer<i32>,
+    pub stores: Vec<StoreTablesDev>,
+}
+
+impl RowTablesDev {
+    pub fn alloc(dgpu: Device, rows_cap: u32, n_stores: usize) -> eyre::Result<Self> {
+        dgpu.set_current()?;
+        let n = rows_cap.max(1) as usize;
+        let mut stores = Vec::with_capacity(n_stores);
+        for _ in 0..n_stores {
+            stores.push(StoreTablesDev {
+                comp_base_per: DeviceBuffer::<i32>::new(dgpu.id, n)?,
+                keys_base_per: DeviceBuffer::<u32>::new(dgpu.id, n)?,
+                state_base_per: DeviceBuffer::<i32>::new(dgpu.id, n)?,
+                fire_state_idx: DeviceBuffer::<i32>::new(dgpu.id, n)?,
+                fire_dst_row: DeviceBuffer::<i32>::new(dgpu.id, n)?,
+            });
+        }
+        Ok(Self { rows_cap, slot_per: DeviceBuffer::<i32>::new(dgpu.id, n)?, stores })
+    }
+
+    /// Async copies on `stream`, so they FIFO ahead of the step's launches.
+    pub fn upload(&mut self, t: &RowTables, stream: &Stream) -> eyre::Result<()> {
+        let b = t.pos_per.len();
+        if b > self.rows_cap as usize {
+            return Err(eyre!("row tables: {b} rows > capacity {}", self.rows_cap));
+        }
+        if t.stores.len() != self.stores.len() {
+            return Err(eyre!("row tables: {} stores, device has {}", t.stores.len(), self.stores.len()));
+        }
+        fn up<T: Copy>(dst: &mut DeviceBuffer<T>, src: &[T], stream: &Stream) -> eyre::Result<()> {
+            if !src.is_empty() {
+                let mut v = dst.slice_view_mut(0, src.len());
+                v.copy_from_host_async(src, stream)?;
+            }
+            Ok(())
+        }
+        up(&mut self.slot_per, &t.slot_per, stream)?;
+        for (d, h) in self.stores.iter_mut().zip(&t.stores) {
+            up(&mut d.comp_base_per, &h.comp_base_per, stream)?;
+            up(&mut d.keys_base_per, &h.keys_base_per, stream)?;
+            up(&mut d.state_base_per, &h.state_base_per, stream)?;
+            up(&mut d.fire_state_idx, &h.fire_state_idx, stream)?;
+            up(&mut d.fire_dst_row, &h.fire_dst_row, stream)?;
+        }
+        Ok(())
+    }
 }
 
 pub struct KvArena {
     pub dgpu: Device,
     pub n_slots: u32,
-    /// Per layer, `n_slots * KV_CACHE_ROWS * N_HEAD_DIM` f16.
-    pub raw: Vec<DeviceBuffer<u16>>,
+    /// The buffers, as the layer driver takes them (module doc). Layer `l`:
+    /// `kv_cache` = `n_slots * KV_CACHE_ROWS * N_HEAD_DIM` f16; KV-source
+    /// layers: `compressor = Some(..)` with `state_kv`/`state_score` =
+    /// `[n_slots, ratio * width]` f32, `comp_kv = F16([rows_cap, width])`,
+    /// `index_k = Some([rows_cap, E2M1_KEY_ROW_BYTES])`. Counters stay 0.
+    pub state: HetModelState,
     pub stores: Vec<CompStore>,
     streams: Vec<Option<StreamKv>>,
 }
@@ -164,31 +258,53 @@ impl KvArena {
         }
         dgpu.set_current()?;
         let raw_rows = (n_slots as usize) * KV_CACHE_ROWS;
-        let mut raw = Vec::with_capacity(N_LAYER as usize);
-        for _ in 0..N_LAYER {
-            raw.push(DeviceBuffer::<u16>::new(dgpu.id, raw_rows * N_HEAD_DIM as usize)?);
-        }
         let mut stores = Vec::with_capacity(KV_SOURCE_LAYERS.len());
-        for &l in KV_SOURCE_LAYERS {
-            let ratio = COMPRESS_RATIOS[l as usize];
-            if ratio == 0 {
-                return Err(eyre!("kv arena: KV-source layer {l} has ratio 0"));
-            }
-            let width = N_HEAD_DIM;
-            let state_per = (ratio * width) as usize;
-            stores.push(CompStore {
-                layer: l as usize,
-                ratio,
-                width,
-                comp_kv: DeviceBuffer::<u16>::new(dgpu.id, (comp_rows_cap as usize) * width as usize)?,
-                index_k: DeviceBuffer::<u8>::new(dgpu.id, (comp_rows_cap as usize) * E2M1_KEY_ROW_BYTES)?,
-                state_kv: DeviceBuffer::<f32>::new(dgpu.id, (n_slots as usize) * state_per)?,
-                state_score: DeviceBuffer::<f32>::new(dgpu.id, (n_slots as usize) * state_per)?,
-                rows_cap: comp_rows_cap,
-                free: RowFreeList::new(comp_rows_cap),
-            });
+        let mut layers = Vec::with_capacity(N_LAYER as usize);
+        for l in 0..N_LAYER as usize {
+            let kv_cache = DeviceBuffer::<u16>::new(dgpu.id, raw_rows * N_HEAD_DIM as usize)?;
+            let compressor = if KV_SOURCE_LAYERS.iter().any(|&s| s as usize == l) {
+                let ratio = COMPRESS_RATIOS[l];
+                if ratio == 0 || ratio == 4 {
+                    // ratio 4 is V4-Flash's FP8/shuffle shape; the arena's f16
+                    // store + `ratio * width` accumulators are V4.1's (1, 2).
+                    return Err(eyre!("kv arena: KV-source layer {l} has ratio {ratio} (need 1 or 2)"));
+                }
+                let width = N_HEAD_DIM;
+                let n_state = (n_slots as usize) * (ratio * width) as usize;
+                let mut state_kv = DeviceBuffer::<f32>::new(dgpu.id, n_state)?;
+                let mut state_score = DeviceBuffer::<f32>::new(dgpu.id, n_state)?;
+                state_kv.copy_from_host(&vec![0f32; n_state])?;
+                state_score.copy_from_host(&vec![NEG_INF; n_state])?;
+                stores.push(CompStore {
+                    layer: l,
+                    ratio,
+                    width,
+                    rows_cap: comp_rows_cap,
+                    free: RowFreeList::new(comp_rows_cap),
+                });
+                Some(HetCompressorState {
+                    state_kv,
+                    state_score,
+                    comp_kv: CompKvStore::F16(DeviceBuffer::<u16>::new(
+                        dgpu.id,
+                        (comp_rows_cap as usize) * width as usize,
+                    )?),
+                    n_comp: 0,
+                    width,
+                    head_dim: N_HEAD_DIM,
+                    index_k: Some(DeviceBuffer::<u8>::new(
+                        dgpu.id,
+                        (comp_rows_cap as usize) * E2M1_KEY_ROW_BYTES,
+                    )?),
+                    n_index_comp: 0,
+                })
+            } else {
+                None
+            };
+            layers.push(HetLayerState { kv_cache, n_raw: 0, raw_off: 0, compressor, indexer_compressor: None });
         }
-        Ok(Self { dgpu, n_slots, raw, stores, streams: vec![None; n_slots as usize] })
+        let state = HetModelState { layers, n_kv_max: comp_rows_cap };
+        Ok(Self { dgpu, n_slots, state, stores, streams: vec![None; n_slots as usize] })
     }
 
     pub fn stream(&self, slot: u32) -> Option<&StreamKv> {
@@ -229,6 +345,94 @@ impl KvArena {
         Ok(slot)
     }
 
+    /// Admit a stream whose prompt was prefilled into `src` (a single-sequence
+    /// state, compressors at rest on their source layers) and copy its KV in:
+    /// every layer's live raw window to the start of the slot's region, each
+    /// store's comp rows / index keys to the carved region and its accumulator
+    /// block to the slot's. `pos` is the NEXT position (the prompt length).
+    /// D2D copies on `stream`; the caller synchronizes before reading.
+    pub fn admit_from_state(
+        &mut self,
+        src: &HetModelState,
+        ctx_cap: u32,
+        pos: u32,
+        stream: &Stream,
+    ) -> eyre::Result<u32> {
+        if src.layers.len() != self.state.layers.len() {
+            return Err(eyre!("kv arena: source state has {} layers, arena {}", src.layers.len(), self.state.layers.len()));
+        }
+        let (n_raw, raw_off) = (src.layers[0].n_raw, src.layers[0].raw_off);
+        if src.layers.iter().any(|l| l.n_raw != n_raw) {
+            return Err(eyre!("kv arena: source state's raw windows are not in lockstep"));
+        }
+        if n_raw > SWA_WINDOW || pos < n_raw {
+            return Err(eyre!("kv arena: source window {n_raw} rows at pos {pos}"));
+        }
+        let slot = self.admit(ctx_cap.max(pos + 1), pos)?;
+        let hd = N_HEAD_DIM as usize;
+        self.dgpu.set_current()?;
+        let region = Self::raw_region_base(slot) as usize;
+        for (dst, s) in self.state.layers.iter_mut().zip(&src.layers) {
+            if s.n_raw == 0 {
+                continue;
+            }
+            let win = s.n_raw as usize * hd;
+            let sv = s.kv_cache.slice_view(s.raw_off as usize * hd, win);
+            let mut dv = dst.kv_cache.slice_view_mut(region * hd, win);
+            dv.copy_from_buffer_async(&sv, stream)?;
+        }
+        let _ = raw_off;
+        let mut comp = Vec::with_capacity(self.stores.len());
+        for (si, st) in self.stores.iter().enumerate() {
+            let l = st.layer;
+            let scs = src.layers[l].compressor.as_ref().ok_or_else(|| {
+                eyre!("kv arena: source state has no compressor at rest on L{l} (lent to a reuse layer?)")
+            })?;
+            let dcs = self.state.layers[l].compressor.as_mut().expect("arena store");
+            let region = self.streams[slot as usize].as_ref().expect("just admitted").comp[si];
+            if scs.n_comp > region.cap || scs.n_index_comp > scs.n_comp {
+                return Err(eyre!(
+                    "kv arena: L{l} source has {} comp rows ({} keys), region holds {}",
+                    scs.n_comp, scs.n_index_comp, region.cap
+                ));
+            }
+            let width = st.width as usize;
+            if scs.width != st.width {
+                return Err(eyre!("kv arena: L{l} source width {} != arena {}", scs.width, st.width));
+            }
+            if scs.n_comp > 0 {
+                let sbuf = scs.comp_kv.f16().ok_or_else(|| eyre!("kv arena: L{l} source store is not f16"))?;
+                let dbuf = dcs.comp_kv.f16_mut().expect("arena store is f16");
+                let n = scs.n_comp as usize * width;
+                let mut dv = dbuf.slice_view_mut(region.base as usize * width, n);
+                dv.copy_from_buffer_async(&sbuf.slice_view(0, n), stream)?;
+            }
+            if scs.n_index_comp > 0 {
+                let sk = scs.index_k.as_ref().ok_or_else(|| eyre!("kv arena: L{l} source has no index keys"))?;
+                let dk = dcs.index_k.as_mut().expect("arena store has keys");
+                let n = scs.n_index_comp as usize * E2M1_KEY_ROW_BYTES;
+                let mut dv = dk.slice_view_mut(region.base as usize * E2M1_KEY_ROW_BYTES, n);
+                dv.copy_from_buffer_async(&sk.slice_view(0, n), stream)?;
+            }
+            let block = (st.ratio * st.width) as usize;
+            if scs.state_kv.len() != block {
+                return Err(eyre!("kv arena: L{l} source accumulator has {} floats, arena block {block}", scs.state_kv.len()));
+            }
+            {
+                let mut dv = dcs.state_kv.slice_view_mut(slot as usize * block, block);
+                dv.copy_from_buffer_async(&scs.state_kv.slice_view(0, block), stream)?;
+                let mut dv = dcs.state_score.slice_view_mut(slot as usize * block, block);
+                dv.copy_from_buffer_async(&scs.state_score.slice_view(0, block), stream)?;
+            }
+            comp.push(CompRegion { n_comp: scs.n_comp, n_index_comp: scs.n_index_comp, ..region });
+        }
+        let s = self.streams[slot as usize].as_mut().expect("just admitted");
+        s.n_raw = n_raw;
+        s.raw_off = 0;
+        s.comp = comp;
+        Ok(slot)
+    }
+
     pub fn release(&mut self, slot: u32) -> eyre::Result<()> {
         let s = self.streams.get_mut(slot as usize).and_then(|s| s.take())
             .ok_or_else(|| eyre!("kv arena: slot {slot} not live"))?;
@@ -248,6 +452,11 @@ impl KvArena {
     pub fn tables(&self, slots: &[u32]) -> eyre::Result<RowTables> {
         let mut t = RowTables { stores: vec![StoreTables::default(); self.stores.len()], ..Default::default() };
         for (b, &slot) in slots.iter().enumerate() {
+            // K=1 in v1: one row per stream (two rows of one stream would
+            // write the same accumulator block / append slot in one launch).
+            if slots[..b].contains(&slot) {
+                return Err(eyre!("kv arena: slot {slot} appears twice in the step"));
+            }
             let s = self.stream(slot).ok_or_else(|| eyre!("kv arena: slot {slot} not live"))?;
             let region = Self::raw_region_base(slot);
             t.pos_per.push(s.pos as i32);
@@ -270,7 +479,9 @@ impl KvArena {
                         ));
                     }
                     ts.fire_rows.push(b as i32);
-                    ts.dst_row_per.push((r.base + r.n_comp) as i32);
+                    ts.fire_state_idx.push(slot as i32);
+                    ts.fire_dst_row.push((r.base + r.n_comp) as i32);
+                    ts.fire_comp_pos.push((s.pos + 1 - st.ratio) as i32);
                 }
             }
         }
@@ -302,7 +513,8 @@ impl KvArena {
         }
         let region = Self::raw_region_base(slot) as usize * hd;
         self.dgpu.set_current()?;
-        for buf in self.raw.iter_mut() {
+        for ls in self.state.layers.iter_mut() {
+            let buf = &mut ls.kv_cache;
             {
                 let src = buf.slice_view(region + raw_off as usize * hd, win);
                 let mut sc = scratch.slice_view_mut(0, win);

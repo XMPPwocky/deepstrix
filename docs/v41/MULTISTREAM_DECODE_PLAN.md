@@ -376,6 +376,53 @@ and the prefill parity tests unchanged; the `Arena` arm is what the harness
 exercises. Testing constraint: every driver iteration needs the model loaded, i.e.
 the server down — the first harness run rides the M0 window.
 
+**Step 3 WRITTEN 2026-09-20 (untested: needs the model).** What landed:
+
+* `RowLayout<'_>` is the last parameter of `forward_layer_pre_moe_v2`; the five
+  existing callers pass `Contiguous`. Under `Arena` the driver takes positions
+  from `tables.pos_per` (via one `pos_at(i)` closure that is `pos0 + i` for
+  `Contiguous`), the raw counts from `n_raw_per`/`slot_per` (`min(n_raw+1, W)`
+  rows ending at the append slot), the append through `kv_append
+  .launch_batched_rows(slot_per)`, the compressor as ONE `state_write` over all
+  rows into per-stream accumulator blocks (`state_base_per`) followed by the
+  pool over the firing rows straight out of their blocks (`fire_state_idx`; no
+  snapshot, no shuffle — V4.1 ratios are 1 and 2), the comp / index-K appends at
+  `fire_dst_row`, `n_comp_after = n_comp + fires` checked per row against the
+  positional formula (own AND reuse layers), the indexer score through
+  `launch_batched_mw_e2m1_rows(keys_base_per)` (gemm has no per-row twin; mw is
+  bit-exact with it), the gathers through `launch_batched_rows(comp_base_per)`,
+  dense attention through the `_f16s_rows` pair with `comp_base_per` (None once
+  the indexer gathered), and NO eviction (the arena advances after the step).
+  Refused under `Arena`: image visibility, CED modes other than Exact, MTP
+  capture, FP8 main stores, `ATTN_FUSED`, f32 scores, `V41_VERIFY_DECODE_ATTN`.
+* `KvArena` now holds its buffers inside a `HetModelState` (`arena.state`):
+  layer `l`'s `kv_cache` is the arena's raw buffer and the four KV-source layers
+  carry a `HetCompressorState` whose accumulators are `[n_slots, ratio*width]`
+  and whose `comp_kv`/`index_k` are the shared stores. That is what lets the
+  driver take S streams through the same `&mut HetLayerState` (lent by
+  `with_kv_source`) it takes one sequence through. `RowTablesDev` holds the
+  device copies of the base arrays (`upload` once per step on `de.compute`);
+  `admit_from_state` copies a prefilled single-sequence state into a slot (raw
+  windows, comp rows, keys, accumulator block, counters).
+* `HeterogeneousEngine::forward_step_arena` (forward_prefill.rs): one K=1 step —
+  compaction of full regions, tables, `pos_per_b` upload, Engram staging per
+  Engram layer, the 40 `with_kv_source(pre_moe(Arena) + post_moe)` calls, advance.
+  `head_rows` (now pub) gives the `[b, N_VOCAB]` logits.
+* Harness: `crates/v4flash-kernels/tests/multistream_step.rs` (`#[ignore]`): S
+  synthetic prompts (lengths 5/40/131/260 by default) prefilled the ordinary way,
+  admitted into two arenas; T greedy tokens from today's decode path are the
+  forced continuation for `alone` (one row per step) and `batch` (S rows). Reports
+  per (stream, step) `|alone - batch|`, argmaxes and KL(dec||batch); G5a = 0
+  difference, G5b = KL mean/max under `MS_KLD_MEAN`/`MS_KLD_MAX` (0.02/0.5).
+  Run (server DOWN):
+  `HIP_VISIBLE_DEVICES=0,1 V41_PAGED_EXPERTS=1 V41_INDEX_K=1 V41_CANDIDATE_POOL=1
+  CARGO_TARGET_DIR=target-v41 nix develop -c cargo test -p v4flash-kernels
+  --features v41 --release --test multistream_step -- --ignored --nocapture`.
+  What the first run tells us: whether the by-expert MoE chain and the batched
+  weight-streaming kernels are batch-invariant (G5a, plan 3.6's fallback if not),
+  and the arena-vs-decode KL floor (G5b). No remote (box 2) in the harness: all
+  experts through the local pager.
+
 ### 3.5 Graphs
 
 Capture per (layer segment, bucket) once the row table carries every per-token
@@ -606,8 +653,10 @@ scratchpad `m0_measure.sh` (parts a-d, D).
 DONE 2026-09-21 — per-row KV bases in the seven batched KV kernels (`*_rows`
 wrappers; `tests/multistream_row_bases.rs`, bit-identical to single-sequence
 runs on the dGPU). Step 2 DONE 2026-09-21 — `het/kv_arena.rs` (regions, tables, advance/compact/restore) and the
-row-gridded argmax sampler. Next: step 3, the `RowLayout` parametrization of the batched
-driver (3.7), then the harness at the M0 window. Row table + KvArena;
+row-gridded argmax sampler. Step 3 WRITTEN 2026-09-20 (3.7): `RowLayout` arm in the
+batched driver, `KvArena` over a `HetModelState`, `forward_step_arena`, and the
+harness `tests/multistream_step.rs` — all compiled, none run (needs the model: the
+first run is the M0 window). Row table + KvArena;
 row-grid per-row kernels; the K-launch compressor/kv_append; by-expert local MoE with
 device inputs; multi-row remote requests; the multi-segment hold fix; row-grid
 sampler; G5a against the serial oracle; G5b against today's decode; measured step

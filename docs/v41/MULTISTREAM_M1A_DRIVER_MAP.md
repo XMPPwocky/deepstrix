@@ -242,3 +242,32 @@ Everything MoE consumes exactly three B-shaped things: `bd.ffn_input_norm` `[b, 
 - `CedMode` FP:1129-1148 gates whole stage groups: `KvSourceOnly` skips stages 2-3 (FP:2107, 2481), the window append, and returns at FP:3247-3251 before attention/MoE; `Replay` skips the compressor projection and store write (`own_compressor` FP:2491) and takes the positional `n_comp` formula.
 - `COMPRESS_RATIOS` (CFG:131/138), `KV_SOURCE_LAYERS = [2,8,14,20]`, `INDEX_SOURCE_LAYERS = [2,8,14,20,24,28,32,36]`, `ENGRAM_LAYERS = [1,14]` (CFG:150-156), `CED_DECODER_START = 20` (CFG:183), `CANDIDATE_SOURCE_LAYER = 20` (CFG:189).
 - `HetCompressorState` (ST:~145-181) holds `state_kv`/`state_score` (iGPU), `comp_kv` (dGPU, `CompKvStore::{F16, Fp8{rows,head}, E2m1}`), `n_comp`, `width`, `head_dim`, `index_k: Option<DeviceBuffer<u8>>`, `n_index_comp`; capacity is `max_n_comp = (n_kv_max + ratio - 1)/ratio` rows fixed at alloc (ST:206).
+
+
+---
+
+## 6. What step 3 changed (2026-09-20)
+
+The `RowLayout` arm touches exactly the per-sequence rows of the stage table.
+Line numbers are post-edit (`forward_prefill.rs`).
+
+| stage | contiguous (unchanged) | arena |
+|---|---|---|
+| entry | — | validates tables vs `tokens.len()`, refuses `vis`/CED/MTP; binds `arena_comp_base`, `arena_keys_base`, `arena_state_base`, `arena_fire_state_idx`, `arena_fire_dst_row` for this layer's store (`store_index_of`) and the `pos_at(i)` closure |
+| 4a raw counts | `causal_end = n_raw_before + i + 1` | `n_per = min(n_raw_per[i] + 1, W)`, `offset = slot_per[i] + 1 - n_per` |
+| 4b append | `launch_batched(append_at)` | `launch_batched_rows(0, Some(slot_per))` after a buffer-length check |
+| 4d row/pos_mod | `pos0 + i` | `pos_at(i)` |
+| 4e/4e′ state write | fast gather / serial segments | one `launch_batched_rows(.., Some(state_base_per))` over all b rows; `n_comp_after[i] = n_comp_per[i] + fires`, checked `== (pos+1)/ratio` |
+| 4f pool | snapshots | `launch_batched_rows(cs.state_kv, cs.state_score, .., Some(fire_state_idx))` |
+| 4f index-K / comp appends | `n_comp_start` | `Some(fire_dst_row)`; `cs.n_index_comp` not touched |
+| 4g reuse-layer counts | positional from `pos0` | `n_comp_per[i] + fires`, checked positional |
+| 4h positional audit | `pos0 + k + 1` | `pos_at(k) + 1` |
+| 6c-2 indexer score | gemm / mw / sw | `launch_batched_mw_e2m1_rows(.., Some(keys_base_per))` (V4.1 keys only) |
+| 6c-2 / 6c-3 gathers | `launch_batched` | `launch_batched_rows(.., Some(comp_base_per))` |
+| 6c-4 score + smwsum | `_f16s` | `_f16s_rows(.., if indexer_fired { None } else { Some(comp_base_per) })`; fused / f32-scores refused |
+| 6c-5 verify replay | env-gated | refused |
+| 7 eviction | three branches | no-op (`KvArena::advance` after the step) |
+
+Everything else (Q/KV chains, mHC, router, shared expert, MoE local/remote,
+combine, output projection) runs as before: the caller uploads `tables.pos_per`
+into `bd.pos_per_b`, which is all the rope stages read.

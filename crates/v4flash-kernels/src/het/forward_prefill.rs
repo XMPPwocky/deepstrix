@@ -42,6 +42,7 @@ use super::prefill_stats::PrefillStats;
 use super::scratch::{DgpuScratch, IgpuScratch};
 use crate::config::{ENGRAM_CHUNK, ENGRAM_IN, ENGRAM_OUT};
 use super::state::{CompKvStore, HetLayerState, HetModelState, KV_CACHE_ROWS};
+use super::kv_arena::{store_index_of, KvArena, RowTables, RowTablesDev};
 use crate::comp_kv_fp8::FP8_KV_HEAD_ROWS;
 use super::sync::{peer_push_f32, peer_push_i32};
 use super::weights::{DgpuLayerWeights, HetModelWeights, IgpuLayerWeights};
@@ -209,6 +210,28 @@ fn check_scratch_rows(
 /// Per-row visibility for a batch, or `None` when no span touches it (the
 /// all-text fast path, bit-identical to the pre-vision code). Errors if a
 /// span straddles the batch — see `image_spans::rows_visibility`.
+/// How the rows of a `forward_layer_pre_moe_v2` call relate to the KV state
+/// it is handed (docs/v41/MULTISTREAM_DECODE_PLAN.md 3.7).
+///
+/// `Contiguous`: today's meaning — `b` consecutive positions `pos0..pos0+b` of
+/// ONE sequence whose KV is `ls` (window at `ls.raw_off/n_raw`, store at
+/// `cs.n_comp`), appended and evicted in place. Every existing caller.
+///
+/// `Arena`: `b` rows of `b` DIFFERENT streams, one position each (K=1), whose
+/// KV lives in a `KvArena` handed over as the same `&mut HetLayerState` (the
+/// arena's `state.layers[layer]`, lent through `with_kv_source` like a
+/// sequence's). Bases and counts come from the per-row `tables`
+/// (`KvArena::tables`) and their device copies `dev` (`RowTablesDev::upload`,
+/// on `de.compute`, before the step); the state's scalar counters are ignored;
+/// nothing is evicted or advanced here (`KvArena::advance` after the step,
+/// `compact_raw` before it). The caller has already uploaded `tables.pos_per`
+/// into `bd.pos_per_b[0..b]` (rope), as the contiguous callers do per chunk.
+/// Text-only, `CedMode::Exact`, no MTP capture, no image visibility.
+pub enum RowLayout<'a> {
+    Contiguous,
+    Arena { tables: &'a RowTables, dev: &'a RowTablesDev },
+}
+
 /// M7 CED: mode of one batched layer call under V4.1 Causal Encoder-Decoder
 /// prefill (tech report §2.2 / §3.2.2, docs/v41/ENGINE_PORT.md "M7 CED").
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -807,6 +830,7 @@ impl HeterogeneousEngine {
             &self.sync_events.layers[layer0],
             pager.as_deref_mut(),
             mode_of(layer0),
+            RowLayout::Contiguous,
         )?;
         if b_b > 0 {
             self.stage_engram_lane(bd_b, layer0, engram_rows, b_a, b_b)?;
@@ -825,6 +849,7 @@ impl HeterogeneousEngine {
                 &self.sync_events_t1.layers[layer0],
                 pager.as_deref_mut(),
                 mode_of(layer0),
+                RowLayout::Contiguous,
             )?;
         }
         drop(_t_pre_warm);
@@ -873,6 +898,7 @@ impl HeterogeneousEngine {
                 &self.sync_events.layers[layer + 1],
                 pager.as_deref_mut(),
                 mode_of(layer + 1),
+                RowLayout::Contiguous,
             )?;
             drop(_t_pre);
 
@@ -907,6 +933,7 @@ impl HeterogeneousEngine {
                     &self.sync_events_t1.layers[layer + 1],
                     pager.as_deref_mut(),
                     mode_of(layer + 1),
+                    RowLayout::Contiguous,
                 )?;
                 drop(_t_pre_b);
             }
@@ -1228,7 +1255,8 @@ impl HeterogeneousEngine {
 
     /// Logits for rows `0..n` of `bd`, via the batched head when it applies.
     /// Falls back to the per-row chain otherwise. See `forward_head_batch`.
-    fn head_rows(
+    /// Also the head of a multi-stream step (`forward_step_arena`).
+    pub fn head_rows(
         &self,
         head_scratch: &mut DgpuScratch,
         bd: &BatchDgpuScratch,
@@ -1737,6 +1765,108 @@ impl HeterogeneousEngine {
         Ok(())
     }
 
+    /// One multi-stream decode step, K=1 (docs/v41/MULTISTREAM_DECODE_PLAN.md
+    /// 3.7, M1a step 3): row `i` is `tokens[i]` at the next position of the
+    /// stream in `slots[i]`, all `b` rows through the batched layer driver with
+    /// `RowLayout::Arena`. `input_hcs[i]` is `embed(tokens[i])` broadcast to
+    /// HC_DIM (as for the prompt drivers); `engram_rows` one flattened
+    /// `[b * ENGRAM_IN]` buffer per Engram layer, in `ENGRAM_LAYERS` order,
+    /// rows in slot order. Compacts any stream whose raw region is full first,
+    /// uploads the step's tables, runs the 40 layers, advances every stream.
+    /// On return `bd.residual` holds the post-last-layer HC per row and
+    /// `bd.hc_pre_carry` the carries: `head_rows(ds, bd, b, weights)` turns
+    /// them into `[b * N_VOCAB]` logits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_step_arena(
+        &self,
+        bd: &mut BatchDgpuScratch,
+        bi: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        arena: &mut KvArena,
+        dev: &mut RowTablesDev,
+        slots: &[u32],
+        weights: &HetModelWeights,
+        input_hcs: &[Vec<f32>],
+        tokens: &[i32],
+        engram_rows: Option<&[Vec<f32>]>,
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
+    ) -> eyre::Result<RowTables> {
+        // Decode-phase link window (the rows are decode rows of live streams).
+        self.remote_set_phase_busy_poll(true);
+        let b = tokens.len();
+        if b == 0 {
+            return Ok(RowTables::default());
+        }
+        if slots.len() != b || input_hcs.len() != b {
+            return Err(eyre!(
+                "forward_step_arena: {} slots / {} hcs for {b} tokens",
+                slots.len(),
+                input_hcs.len()
+            ));
+        }
+        for (i, hc) in input_hcs.iter().enumerate() {
+            if hc.len() != HC_DIM as usize {
+                return Err(eyre!("forward_step_arena: input_hcs[{i}] len {} != HC_DIM", hc.len()));
+            }
+        }
+        check_scratch_rows("forward_step_arena", b, bd, bi, sd, si)?;
+        if bd.mtp_capture_rows > 0 {
+            return Err(eyre!("forward_step_arena: MTP capture is not supported on arena rows (v1)"));
+        }
+        self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
+        self.set_current_cached(self.dgpu.device)?;
+        arena.state.restore_compressor_lending();
+
+        // A full raw region moves its window down before the tables are
+        // derived (the tables carry the append slot).
+        for &slot in slots {
+            if arena.needs_compaction(slot) {
+                arena.compact_raw(slot, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
+            }
+        }
+        let tables = arena.tables(slots)?;
+        dev.upload(&tables, &self.dgpu.compute)?;
+
+        for (i, hc) in input_hcs.iter().enumerate() {
+            let mut slot = bd.residual.slice_view_mut(i * HC_DIM as usize, HC_DIM as usize);
+            slot.copy_from_host(hc)?;
+        }
+        {
+            let mut pos_v = bd.pos_per_b.slice_view_mut(0, b);
+            pos_v.copy_from_host_async(&tables.pos_per, &self.dgpu.compute)?;
+        }
+        let ein = ENGRAM_IN as usize;
+        for layer in 0..N_LAYER as usize {
+            if weights.dgpu_layers[layer].engram.is_some() {
+                let li = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
+                let rows = engram_rows.and_then(|rs| li.and_then(|i| rs.get(i)));
+                match rows {
+                    Some(r) if r.len() >= b * ein => self.stage_engram_rows_batch(bd, &r[..b * ein])?,
+                    _ => return Err(eyre!("forward_step_arena: layer {layer} needs Engram rows for {b} rows")),
+                }
+            }
+            let dlw = &weights.dgpu_layers[layer];
+            let ilw = &weights.igpu_layers[layer];
+            let sev = &self.sync_events.layers[layer];
+            let hot_active = prefill_hot_active(dlw, ilw, bd, sd);
+            arena.state.with_kv_source(layer, |ls| {
+                self.forward_layer_pre_moe_v2(
+                    bd, bi, sd, si, ls, dlw, ilw, 0, tokens, None, None, sev,
+                    pager.as_deref_mut(), CedMode::Exact,
+                    RowLayout::Arena { tables: &tables, dev },
+                )?;
+                self.forward_layer_post_moe_v2(bd, b as u32, sev, hot_active)
+            })?;
+            std::mem::swap(&mut bd.residual, &mut bd.residual_next);
+        }
+        self.dgpu.compute.synchronize()?;
+        for &slot in slots {
+            arena.advance(slot)?;
+        }
+        Ok(tables)
+    }
+
     pub fn forward_layer_batch_v2(
         &self,
         bd: &mut BatchDgpuScratch,
@@ -1763,7 +1893,7 @@ impl HeterogeneousEngine {
         }
         let sev = &self.sync_events.layers[layer];
         let hot_active = prefill_hot_active(dlw, ilw, bd, sd);
-        self.forward_layer_pre_moe_v2(bd, bi, sd, si, ls, dlw, ilw, pos0, tokens, vis, stats, sev, pager.as_deref_mut(), CedMode::Exact)?;
+        self.forward_layer_pre_moe_v2(bd, bi, sd, si, ls, dlw, ilw, pos0, tokens, vis, stats, sev, pager.as_deref_mut(), CedMode::Exact, RowLayout::Contiguous)?;
         self.forward_layer_post_moe_v2(bd, b, sev, hot_active)?;
         Ok(())
     }
@@ -1808,8 +1938,53 @@ impl HeterogeneousEngine {
         // M7 CED mode of this call (only `CED_DECODER_START` is ever called
         // with anything but `Exact`).
         ced: CedMode,
+        // Multi-stream: which per-row layout the KV in `ls` has (see `RowLayout`).
+        rows: RowLayout<'_>,
     ) -> eyre::Result<()> {
         let layer = dlw.layer_idx;
+        let arena: Option<(&RowTables, &RowTablesDev)> = match &rows {
+            RowLayout::Arena { tables, dev } => Some((*tables, *dev)),
+            RowLayout::Contiguous => None,
+        };
+        let arena_store = arena.and_then(|_| store_index_of(layer as usize));
+        if let Some((t, d)) = arena {
+            if t.pos_per.len() != tokens.len() || (d.rows_cap as usize) < tokens.len() {
+                return Err(eyre!(
+                    "L{layer}: arena tables cover {} rows (device cap {}) but the call has {}",
+                    t.pos_per.len(),
+                    d.rows_cap,
+                    tokens.len()
+                ));
+            }
+            if vis.is_some() || ced != CedMode::Exact || bd.mtp_capture_rows > 0 {
+                return Err(eyre!(
+                    "L{layer}: RowLayout::Arena is text-only, CedMode::Exact, no MTP capture (v1)"
+                ));
+            }
+            if t.stores.len() != d.stores.len() || (dlw.ratio > 0 && arena_store.map_or(true, |si| si >= t.stores.len())) {
+                return Err(eyre!("L{layer}: arena tables have no store for this layer"));
+            }
+        }
+        // Per-row base arrays for this layer's store (None: contiguous, or a
+        // dense layer). The `*_rows` launches take them; their `None` form is
+        // byte-identical to the old entry points.
+        let arena_comp_base: Option<&DeviceBuffer<i32>> =
+            arena.zip(arena_store).map(|((_, d), si)| &d.stores[si].comp_base_per);
+        let arena_keys_base: Option<&DeviceBuffer<u32>> =
+            arena.zip(arena_store).map(|((_, d), si)| &d.stores[si].keys_base_per);
+        let arena_state_base: Option<&DeviceBuffer<i32>> =
+            arena.zip(arena_store).map(|((_, d), si)| &d.stores[si].state_base_per);
+        let arena_fire_state_idx: Option<&DeviceBuffer<i32>> =
+            arena.zip(arena_store).map(|((_, d), si)| &d.stores[si].fire_state_idx);
+        let arena_fire_dst_row: Option<&DeviceBuffer<i32>> =
+            arena.zip(arena_store).map(|((_, d), si)| &d.stores[si].fire_dst_row);
+        // Position of row `i`: the sequence's `pos0 + i`, or the row's stream's.
+        let pos_at = |i: u32| -> u32 {
+            match arena {
+                Some((t, _)) => t.pos_per[i as usize] as u32,
+                None => pos0 + i,
+            }
+        };
         // DSpark: the drafter eats the hc-collapsed residual ENTERING layers
         // 37/38/39. A batched verify does not know until AFTER it runs which
         // row becomes the next head, so capture EVERY row and select later.
@@ -2392,6 +2567,18 @@ impl HeterogeneousEngine {
         let mut n_raw_offset_after: Vec<u32> = Vec::with_capacity(b as usize);
         if ced != CedMode::KvSourceOnly {
         match vis {
+            None if arena.is_some() => {
+                // One position of its own stream per row: the window is the
+                // stream's `n_raw` rows plus the row itself, capped at W, ending
+                // at the row's append slot (absolute row in the layer buffer).
+                let (t, _) = arena.expect("checked");
+                for i in 0..b as usize {
+                    let n_per = (t.n_raw_per[i] as u32 + 1).min(SWA_WINDOW);
+                    let offset = (t.slot_per[i] as u32 + 1).saturating_sub(n_per);
+                    n_raw_after.push(n_per);
+                    n_raw_offset_after.push(offset);
+                }
+            }
             None => {
                 for i in 0..b as usize {
                     let causal_end = n_raw_before + i as u32 + 1; // exclusive upper slot
@@ -2460,6 +2647,27 @@ impl HeterogeneousEngine {
         // catastrophic divergences (KL up to 8.07 nats vs a 0.006 baseline) all
         // at lane B's first row, all at pos >= SWA_WINDOW, minimum pos exactly
         // 128 -- i.e. from the very first slide, and never before it.
+        if let Some((t, d)) = arena {
+            // Per-row destination slots in the layer's arena buffer
+            // (`KvArena::tables`: `region + raw_off + n_raw`, compaction before
+            // the step keeps it inside the stream's region).
+            let need = t.slot_per.iter().map(|&s| s as usize + 1).max().unwrap_or(0) * N_HEAD_DIM as usize;
+            if ls.kv_cache.len() < need {
+                return Err(eyre!(
+                    "L{layer}: arena raw append slot past the layer buffer ({} f16 < {need})",
+                    ls.kv_cache.len()
+                ));
+            }
+            de.kv_append.launch_batched_rows(
+                &de.compute,
+                &mut ls.kv_cache,
+                &sd.kv_normed,
+                0,
+                N_HEAD_DIM,
+                b,
+                Some(&d.slot_per),
+            )?;
+        } else {
         let append_at = ls.raw_off + n_raw_before;
         assert!(
             (append_at + b) as usize <= KV_CACHE_ROWS,
@@ -2475,6 +2683,7 @@ impl HeterogeneousEngine {
             N_HEAD_DIM,
             b,
         )?;
+        }
         // Cache now holds n_raw_before + b rows; attention will index with
         // n_raw_offset_per. ls.n_raw is updated to its post-eviction value
         // at the END of this layer (see the eviction-down pass).
@@ -2616,14 +2825,14 @@ impl HeterogeneousEngine {
             // Precompute per-b (row, pos_mod) and upload once.
             let row_host: Vec<i32> = (0..b)
                 .map(|i| {
-                    let pos = pos0 + i;
+                    let pos = pos_at(i);
                     let pm = pos % ratio;
                     let row = if ratio == 4 { 4 + pm } else { pm };
                     row as i32
                 })
                 .collect();
             let pos_mod_host: Vec<i32> =
-                (0..b).map(|i| ((pos0 + i) % ratio) as i32).collect();
+                (0..b).map(|i| (pos_at(i) % ratio) as i32).collect();
             {
                 let mut row_v = sd.row_per_b.slice_view_mut(0, b as usize);
                 row_v.copy_from_host_async(&row_host, &de.compute)?;
@@ -2669,8 +2878,58 @@ impl HeterogeneousEngine {
             // 0..ratio-1. With a ragged tail (e.g. b=7, ratio=4) that slice is
             // the wrong positions AND the trailing partial group is lost.
             let fast_ok =
-                gather_enabled && pos0 % ratio == 0 && b % ratio == 0 && b >= ratio;
-            if fast_ok {
+                gather_enabled && arena.is_none() && pos0 % ratio == 0 && b % ratio == 0 && b >= ratio;
+            if let Some((t, _)) = arena {
+                // ARENA: every row is one position of its own stream, so all b
+                // state writes go to distinct accumulator blocks (one launch,
+                // `state_base_per`), and the rows whose boundary fires
+                // (`fire_rows`, prepared by `KvArena::tables`) are pooled
+                // straight out of their blocks below (`fire_state_idx`) — no
+                // snapshot, no shuffle (V4.1 ratios 1 and 2 have none; the
+                // arena refuses ratio 4). The decode twin is forward_layer.rs
+                // `comp_fires_boundary`, one row at a time.
+                let si = arena_store.expect("checked at entry");
+                let ts = &t.stores[si];
+                let row_v = sd.row_per_b.slice_view(0, b as usize);
+                let pm_v = sd.pos_mod_per_b.slice_view(0, b as usize);
+                de.compressor_state_write.launch_batched_rows(
+                    &de.compute,
+                    &mut cs.state_kv,
+                    &mut cs.state_score,
+                    &sd.kv_cur,
+                    &sd.sc_cur,
+                    &cw.ape.buffer,
+                    &row_v,
+                    &pm_v,
+                    comp_width,
+                    b,
+                    arena_state_base,
+                )?;
+                pos_per_boundary_host.extend_from_slice(&ts.fire_comp_pos);
+                for k in 0..b {
+                    let pos = pos_at(k);
+                    let fires = (pos + 1) % ratio == 0;
+                    let after = ts.n_comp_per[k as usize] as u32 + u32::from(fires);
+                    // The store is 1:1 with boundaries from position 0, so the
+                    // stream's counter must agree with the positional formula
+                    // (the per-row form of the `V41_COMP_POSITIONAL` audit).
+                    if after != (pos + 1) / ratio {
+                        return Err(eyre!(
+                            "L{layer}: arena row {k} at pos {pos} has n_comp {} (+{}) but the \
+                             store should hold {} rows up to it",
+                            ts.n_comp_per[k as usize],
+                            u32::from(fires),
+                            (pos + 1) / ratio
+                        ));
+                    }
+                    n_comp_after.push(after);
+                }
+                if ts.fire_rows.len() != ts.fire_comp_pos.len()
+                    || ts.fire_rows.iter().any(|&r| r < 0 || r as u32 >= b)
+                {
+                    return Err(eyre!("L{layer}: arena fire table malformed"));
+                }
+            } else if fast_ok {
                 let n_bnd = b / ratio;
                 for k in 0..n_bnd {
                     pos_per_boundary_host.push((pos0 + k * ratio) as i32);
@@ -2823,6 +3082,20 @@ impl HeterogeneousEngine {
             // serial loop (~200ms of launch overhead per chunk).
             let n_boundaries = pos_per_boundary_host.len() as u32;
             if n_boundaries > 0 {
+                if arena.is_some() {
+                    // Pool each firing row's stream block in place (the state
+                    // write above already holds its last position).
+                    de.compressor_pool.launch_batched_rows(
+                        &de.compute,
+                        &mut sd.comp_pooled_batched,
+                        &cs.state_kv,
+                        &cs.state_score,
+                        N_HEAD_DIM,
+                        ratio,
+                        n_boundaries,
+                        arena_fire_state_idx,
+                    )?;
+                } else {
                 de.compressor_pool.launch_batched(
                     &de.compute,
                     &mut sd.comp_pooled_batched,
@@ -2832,6 +3105,7 @@ impl HeterogeneousEngine {
                     ratio,
                     n_boundaries,
                 )?;
+                }
                 de.rms_w.launch_weighted_batched(
                     &de.compute,
                     &mut sd.comp_rows_batched,
@@ -2903,14 +3177,17 @@ impl HeterogeneousEngine {
                             )?;
                             // Packs E2M1 + one E8M0 per 32 and appends — the
                             // reference's `fp4_act_quant(k, 32, True)`.
-                            de.index_kv_e2m1.launch_append_batched(
+                            de.index_kv_e2m1.launch_append_batched_rows(
                                 &de.compute,
                                 ik,
                                 &sd.index_k_normed_batched,
                                 n_comp_start,
                                 n_boundaries,
+                                arena_fire_dst_row,
                             )?;
-                            cs.n_index_comp = n_comp_start + n_boundaries;
+                            if arena.is_none() {
+                                cs.n_index_comp = n_comp_start + n_boundaries;
+                            }
                         }
                     }
                 }
@@ -2949,18 +3226,22 @@ impl HeterogeneousEngine {
                                 n_boundaries * N_HEAD_DIM,
                             )?;
                         }
-                        de.comp_kv_append.launch_batched(
+                        de.comp_kv_append.launch_batched_rows(
                             &de.compute,
                             buf,
                             &sd.comp_rows_batched,
                             n_comp_start,
                             N_HEAD_DIM,
                             n_boundaries,
+                            arena_fire_dst_row,
                         )?;
                     }
                     // Packed store: quantise + pack + head-shadow write in
                     // one launch (replaces fp8 -> f16rt -> append).
                     CompKvStore::Fp8 { rows, head } => {
+                        if arena.is_some() {
+                            return Err(eyre!("L{layer}: arena rows need an f16 main store"));
+                        }
                         de.comp_kv_fp8.launch_append_batched(
                             &de.compute,
                             rows,
@@ -2989,6 +3270,23 @@ impl HeterogeneousEngine {
             // source layer has already appended the OTHER lane's rows by the
             // time this lane's reuse layer runs, which let lane A attend to
             // lane B's (future) compressed rows.
+            if let Some((t, _)) = arena {
+                // Per stream: its store count plus the source layer's boundary
+                // for this row, checked against the positional formula.
+                let ts = &t.stores[arena_store.expect("checked at entry")];
+                for k in 0..b {
+                    let pos = pos_at(k);
+                    let after = ts.n_comp_per[k as usize] as u32 + u32::from((pos + 1) % ratio == 0);
+                    if after != (pos + 1) / ratio {
+                        return Err(eyre!(
+                            "L{layer}: arena row {k} at pos {pos}: source store holds {after} rows, \
+                             positional formula wants {}",
+                            (pos + 1) / ratio
+                        ));
+                    }
+                    n_comp_after.push(after);
+                }
+            } else {
             let need = (pos0 + b) / ratio;
             if cs.n_comp < need {
                 return Err(eyre!(
@@ -2999,6 +3297,7 @@ impl HeterogeneousEngine {
             }
             for k in 0..b {
                 n_comp_after.push((pos0 + k + 1) / ratio);
+            }
             }
         } else {
             for _ in 0..b {
@@ -3023,7 +3322,7 @@ impl HeterogeneousEngine {
         // positional value; `=2` logs without overriding.
         if comp_positional() > 0 && ratio > 0 && n_comp_after.len() == b as usize {
             for k in 0..b as usize {
-                let want = (pos0 + k as u32 + 1) / ratio;
+                let want = (pos_at(k as u32) + 1) / ratio;
                 if n_comp_after[k] != want {
                     COMP_POS_MISMATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if std::env::var("V41_COMP_POS_DBG").is_ok() {
@@ -3603,7 +3902,25 @@ impl HeterogeneousEngine {
                     if let Some(rows) = v41_rows.or(ics_e2m1) {
                         // Packed keys: gemm / mw twins expand at their loads;
                         // the 1-wave `sw` kernel has no packed twin.
-                        if score_gemm {
+                        if arena.is_some() {
+                            // Per-row key bases: only the mw kernel takes them
+                            // (bit-exact with gemm, which has no per-row twin).
+                            if v41_rows.is_none() {
+                                return Err(eyre!("L{layer}: arena rows need the V4.1 index-K store"));
+                            }
+                            wmma.launch_batched_mw_e2m1_rows(
+                                &de.compute,
+                                &mut sd.indexer_scores,
+                                &sd.indexer_q,
+                                &sd.indexer_head_weights,
+                                rows,
+                                &sd.n_index_comp_per_b,
+                                n_idx_max,
+                                ATTN_MIXED_MAX_KEYS,
+                                b,
+                                arena_keys_base,
+                            )?;
+                        } else if score_gemm {
                             de.q8k.launch_cast_f16(&de.compute, &mut sd.indexer_q16, &sd.indexer_q,
                                 b * N_INDEXER_HEAD * N_INDEXER_HEAD_DIM)?;
                             wmma.launch_batched_gemm_e2m1(
@@ -3636,6 +3953,8 @@ impl HeterogeneousEngine {
                                  key store (INDEXER_KEYS_E2M1=0 for the f16 store)"
                             ));
                         }
+                    } else if arena.is_some() {
+                        return Err(eyre!("L{layer}: arena rows need the packed V4.1 index-K store"));
                     } else if score_gemm {
                         de.q8k.launch_cast_f16(&de.compute, &mut sd.indexer_q16, &sd.indexer_q,
                             b * N_INDEXER_HEAD * N_INDEXER_HEAD_DIM)?;
@@ -3753,7 +4072,7 @@ impl HeterogeneousEngine {
                         .as_ref()
                         .ok_or_else(|| eyre!("L{layer}: missing compressor state for gather"))?;
                     match &cs_ref.comp_kv {
-                        CompKvStore::F16(buf) => de.indexer_gather.launch_batched(
+                        CompKvStore::F16(buf) => de.indexer_gather.launch_batched_rows(
                             &de.compute,
                             &mut sd.attn_active_comp_kv,
                             buf,
@@ -3761,9 +4080,13 @@ impl HeterogeneousEngine {
                             INDEXER_TOP_K,
                             N_HEAD_DIM,
                             b,
+                            arena_comp_base,
                         )?,
                         // Packed store: expand FP8 -> f16 on the way into
                         // attn_active_comp_kv; attention is unchanged.
+                        CompKvStore::Fp8 { .. } if arena.is_some() => {
+                            return Err(eyre!("L{layer}: arena rows need an f16 main store"));
+                        }
                         CompKvStore::Fp8 { rows, .. } => de.comp_kv_fp8.launch_gather_batched(
                             &de.compute,
                             &mut sd.attn_active_comp_kv,
@@ -3823,7 +4146,7 @@ impl HeterogeneousEngine {
                 }
                 let cs_ref = ls.compressor.as_ref().expect("s2_reuse implies a compressor");
                 match &cs_ref.comp_kv {
-                    CompKvStore::F16(buf) => de.indexer_gather.launch_batched(
+                    CompKvStore::F16(buf) => de.indexer_gather.launch_batched_rows(
                         &de.compute,
                         &mut sd.attn_active_comp_kv,
                         buf,
@@ -3831,6 +4154,7 @@ impl HeterogeneousEngine {
                         INDEXER_TOP_K,
                         N_HEAD_DIM,
                         b,
+                        arena_comp_base,
                     )?,
                     _ => return Err(eyre!("L{layer}: S2 reuse needs an f16 main store")),
                 }
@@ -3864,6 +4188,12 @@ impl HeterogeneousEngine {
             // old fixed 3072 stride errored out at 2944 prompt tokens.
             // Score and smwsum MUST be handed the same value.
             let scores_stride = sd.attn_scores_stride(b, eff_n_total_max)?;
+            // Dense comp rows straight from the shared store need the row's
+            // base; the gathered top-K buffer is already per row.
+            let attn_comp_base = if indexer_fired { None } else { arena_comp_base };
+            if arena.is_some() && (fused || f32_scores) {
+                return Err(eyre!("L{layer}: arena rows need the f16-scores split attention (no ATTN_FUSED / f32 scores)"));
+            }
             if !fused {
                 let _t = de.events.stage("k.attn.score", &de.compute)?;
                 if f32_scores {
@@ -3883,7 +4213,7 @@ impl HeterogeneousEngine {
                         scores_stride,
                     )?;
                 } else {
-                    de.attn_mixed.launch_score_batched_htiled_wmma_f16s(
+                    de.attn_mixed.launch_score_batched_htiled_wmma_f16s_rows(
                         &de.compute,
                         &mut sd.attn_scores,
                         &sd.q_normed,
@@ -3899,6 +4229,7 @@ impl HeterogeneousEngine {
                         b,
                         eff_comp_kv_batch_stride,
                         scores_stride,
+                        attn_comp_base,
                     )?;
                 }
             }
@@ -3947,7 +4278,7 @@ impl HeterogeneousEngine {
                         scores_stride,
                     )?;
                 } else {
-                    de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(
+                    de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s_rows(
                         &de.compute,
                         &mut sd.heads,
                         &mut sd.attn_scores,
@@ -3962,6 +4293,7 @@ impl HeterogeneousEngine {
                         b,
                         eff_comp_kv_batch_stride,
                         scores_stride,
+                        attn_comp_base,
                     )?;
                 }
             }
@@ -3979,6 +4311,9 @@ impl HeterogeneousEngine {
             // Recomputes rather than replaces so this is one self-contained block,
             // testable with `V41_DSPARK_XCHECK` before anyone pays to delete the
             // superseded work.
+            if verify_decode_attn() && arena.is_some() {
+                return Err(eyre!("L{layer}: V41_VERIFY_DECODE_ATTN replays one sequence at raw_off 0; not for arena rows"));
+            }
             if verify_decode_attn() && (b as usize) <= 16 {
                 const K_SPLIT: u32 = 16;
                 let qf = crate::config::Q_FLAT as usize;
@@ -4058,7 +4393,11 @@ impl HeterogeneousEngine {
         // generations shorter than the window. Leave the bytes and raw_off in
         // place; `KvMark::advanced_by` slides the window pointer, and decode's
         // own wrap path compacts later when the append region fills.
-        if speculative_append() {
+        if arena.is_some() {
+            // ARENA: the windows and store counters are the KvArena's; the
+            // caller advances every row's stream after the step
+            // (`KvArena::advance`) and compacts a full region before it.
+        } else if speculative_append() {
             // Keep the SWA invariant even before the caller's rollback: the
             // appended speculative rows live past the window in the oversized
             // cache, but `n_raw` is what the NEXT attention reads, and leaving it
