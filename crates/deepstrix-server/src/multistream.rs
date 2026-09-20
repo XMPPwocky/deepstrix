@@ -437,15 +437,31 @@ impl Sched {
         let engram_rows = match (state.pager.as_ref(), state.engram.as_mut()) {
             (Some(pg), Some(ec)) => {
                 for &t in prefix.iter().chain(suffix.iter()) { compressed.push(ec.hasher.compress(t)); }
-                let hashes = ec.hasher.hash_sequence(&compressed);
+                // `hash_ids` over the COMPRESSED ids (as `rows_for_chunk` and
+                // `decode_step` do). `hash_sequence` compresses its input itself,
+                // so feeding it `compressed` double-compressed every id.
+                let hashes: Vec<[[i64; v4flash_core::engram_hash::ENGRAM_COLS]; v4flash_core::engram_hash::ENGRAM_LAYERS]> =
+                    (0..compressed.len()).map(|q| if q < pos0 as usize { [[0i64; v4flash_core::engram_hash::ENGRAM_COLS]; v4flash_core::engram_hash::ENGRAM_LAYERS] } else { ec.hasher.hash_ids(&compressed, q) }).collect();
                 let ein = ENGRAM_IN as usize;
                 let mut rows = vec![vec![0f32; suffix.len() * ein]; ec.tables.len()];
                 let te = Instant::now();
-                for (li, tbl) in ec.tables.iter().enumerate() {
-                    for (k, t) in (pos0 as usize..pos0 as usize + suffix.len()).enumerate() {
-                        if compressed[t] != v4flash_core::engram_hash::DEAD {
-                            if let Err(e) = tbl.gather_position(pg.raw(), &hashes[t][li], &mut rows[li][k * ein..(k + 1) * ein]) { return Err((p, kv, e)); }
-                        }
+                // BATCHED gather over runs of live positions, exactly as
+                // `EngramCtx::rows_for_chunk` does. `gather_position` spawns 24
+                // OS threads per call (~1.5 ms/token measured 2026-09-20: a
+                // 51,877-token suffix took 78 s here, blocking every live
+                // stream); one deep `gather` per run per table is bit-identical
+                // and ~50x cheaper. DEAD (image-span) positions stay all-zero.
+                const GATHER_THREADS: usize = 32;
+                let p0 = pos0 as usize;
+                let n = suffix.len();
+                let mut k = 0usize;
+                while k < n {
+                    if compressed[p0 + k] == v4flash_core::engram_hash::DEAD { k += 1; continue; }
+                    let start = k;
+                    while k < n && compressed[p0 + k] != v4flash_core::engram_hash::DEAD { k += 1; }
+                    for (li, tbl) in ec.tables.iter().enumerate() {
+                        let flat: Vec<i64> = hashes[p0 + start..p0 + k].iter().flat_map(|h| h[li]).collect();
+                        if let Err(e) = tbl.gather(pg.raw(), &flat, &mut rows[li][start * ein..k * ein], GATHER_THREADS) { return Err((p, kv, e)); }
                     }
                 }
                 tracing::info!(rows = suffix.len(), ms = te.elapsed().as_millis() as u64, "multistream: engram rows for the suffix");
