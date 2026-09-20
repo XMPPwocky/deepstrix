@@ -81,7 +81,8 @@ extern "C" __global__ void compressor_pool_batched(
         const float * __restrict__ state_kv_b,    // [n_boundaries, coff*ratio, width]
         const float * __restrict__ state_score_b, // same shape
         unsigned int  head_dim,
-        unsigned int  compress_ratio) {
+        unsigned int  compress_ratio,
+        const int   * __restrict__ state_idx_per) {   // nullable [n_boundaries]: state block index per boundary
     const unsigned int j = threadIdx.x;
     const unsigned int k = blockIdx.y;
     if (j >= head_dim) return;
@@ -90,8 +91,9 @@ extern "C" __global__ void compressor_pool_batched(
     const unsigned int width = coff * head_dim;
     const unsigned int state_per_boundary = (coff * compress_ratio) * width;
 
-    const float *state_kv    = state_kv_b    + (size_t)k * state_per_boundary;
-    const float *state_score = state_score_b + (size_t)k * state_per_boundary;
+    const unsigned int sk = state_idx_per ? (unsigned int)state_idx_per[k] : k;
+    const float *state_kv    = state_kv_b    + (size_t)sk * state_per_boundary;
+    const float *state_score = state_score_b + (size_t)sk * state_per_boundary;
     float       *out         = out_b         + (size_t)k * head_dim;
 
     float max_score = POOL_NEG_INF;

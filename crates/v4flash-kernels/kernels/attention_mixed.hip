@@ -883,7 +883,10 @@ extern "C" __global__ void attention_mixed_score_batched_htiled_wmma_f16s(
         // active_comp_kv, where batch b's rows live at offset
         // b * comp_kv_batch_stride * head_dim. Pairs with the CSA
         // gather → sparse-attention path.
-        unsigned int     comp_kv_batch_stride) {
+        unsigned int     comp_kv_batch_stride,
+        // nullable [B]: per-row comp_kv base ROW (multi-stream arena, each row
+        // its own sequence). Overrides the stride when non-null.
+        const int      * comp_base_per) {
     const unsigned int b    = blockIdx.z;
     const unsigned int tid  = threadIdx.x;
     const unsigned int warp = tid >> 5;
@@ -898,7 +901,9 @@ extern "C" __global__ void attention_mixed_score_batched_htiled_wmma_f16s(
     const unsigned int kh   = (lane >> 4) * 8u;
     const unsigned int bkey = n0 + col;
     const unsigned int n_kc = head_dim / 16u;
-    const size_t comp_kv_b_off = (size_t)b * comp_kv_batch_stride;
+    const size_t comp_kv_b_off = comp_base_per
+        ? (size_t)(unsigned int)comp_base_per[b]
+        : (size_t)b * comp_kv_batch_stride;
     const _Float16 *brow = nullptr;
     if (bkey < n_total) {
         brow = (bkey < n_raw)
@@ -2284,7 +2289,9 @@ extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled_wmma_ldsv
         unsigned int     max_keys,
         // 0 = legacy shared comp_kv. >0 = per-batch active_comp_kv, where
         // batch b's rows live at offset b * comp_kv_batch_stride * head_dim.
-        unsigned int     comp_kv_batch_stride) {
+        unsigned int     comp_kv_batch_stride,
+        // nullable [B]: per-row comp_kv base ROW (multi-stream arena).
+        const int      * comp_base_per) {
     const unsigned int hg    = blockIdx.x;
     const unsigned int b     = blockIdx.y;
     const unsigned int tid   = threadIdx.x;
@@ -2296,9 +2303,11 @@ extern "C" __global__ void attention_mixed_softmax_wsum_batched_htiled_wmma_ldsv
     const unsigned int raw_off= (unsigned int)n_raw_offset_per[b];
     const unsigned int n_comp = (unsigned int)n_comp_per[b];
     const unsigned int n_total = n_raw + n_comp;
-    const _Float16 * comp_kv_b = (comp_kv && comp_kv_batch_stride != 0u)
-        ? comp_kv + (size_t)b * comp_kv_batch_stride * head_dim
-        : comp_kv;
+    const _Float16 * comp_kv_b = (comp_kv && comp_base_per)
+        ? comp_kv + (size_t)(unsigned int)comp_base_per[b] * head_dim
+        : (comp_kv && comp_kv_batch_stride != 0u)
+            ? comp_kv + (size_t)b * comp_kv_batch_stride * head_dim
+            : comp_kv;
 
     __shared__ float    s_inv[SMWSUM_HEAD_TILE];
     __shared__ _Float16 v_lds[16 * 512];  // 16 KB

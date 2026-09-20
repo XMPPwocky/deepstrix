@@ -45,7 +45,8 @@ extern "C" __global__ void indexer_gather_batched(
         const _Float16 * __restrict__ comp_kv,         // [n_comp, head_dim] f16 (shared)
         const int    * __restrict__ selected_b,        // [B, top_k]
         unsigned int                top_k,
-        unsigned int                head_dim) {
+        unsigned int                head_dim,
+        const int    * __restrict__ comp_base_per) {   // nullable [B]: per-row comp_kv base row (multi-stream arena)
     const unsigned int i = blockIdx.x;                 // 0..top_k
     const unsigned int b = blockIdx.y;
     if (i >= top_k) return;
@@ -58,7 +59,8 @@ extern "C" __global__ void indexer_gather_batched(
     const unsigned int d = dim_chunk + tid;
     if (d >= head_dim) return;
 
-    const size_t src_base = (size_t)(unsigned int)src_idx * head_dim;
+    const size_t src_base = ((size_t)(comp_base_per ? (unsigned int)comp_base_per[b] : 0u)
+                             + (unsigned int)src_idx) * head_dim;
     const size_t dst_base = ((size_t)b * top_k + i) * head_dim;
     active_comp_kv_b[dst_base + d] = comp_kv[src_base + d];
 }

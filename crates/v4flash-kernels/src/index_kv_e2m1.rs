@@ -107,6 +107,8 @@ impl IndexKvE2m1 {
     }
 
     /// Batched append: rows `rows_b[k*128]` land at `n_comp_start + k`.
+    /// Single-sequence form of [`Self::launch_append_batched_rows`] (per-row base = none).
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_append_batched(
         &self,
         stream: &Stream,
@@ -115,10 +117,25 @@ impl IndexKvE2m1 {
         n_comp_start: u32,
         n_boundaries: u32,
     ) -> eyre::Result<()> {
+        self.launch_append_batched_rows(stream, packed, rows_b, n_comp_start, n_boundaries, None)
+    }
+
+    pub fn launch_append_batched_rows(
+        &self,
+        stream: &Stream,
+        packed: &mut DeviceBuffer<u8>,
+        rows_b: &DeviceBuffer<f32>,
+        n_comp_start: u32,
+        n_boundaries: u32,
+        dst_row_per: Option<&DeviceBuffer<i32>>,
+    ) -> eyre::Result<()> {
+        let dst_row_per_ptr = dst_row_per.map(|b| b.raw() as *const i32).unwrap_or(std::ptr::null());
         if n_boundaries == 0 {
             return Ok(());
         }
-        Self::check_packed(packed, (n_comp_start + n_boundaries) as usize, "index_kv_append_e2m1_batched")?;
+        if dst_row_per.is_none() {
+            Self::check_packed(packed, (n_comp_start + n_boundaries) as usize, "index_kv_append_e2m1_batched")?;
+        }
         if rows_b.len() < (n_boundaries as usize) * E2M1_KEY_DIM {
             return Err(eyre!(
                 "index_kv_append_e2m1_batched: rows_b len {} < {}",
@@ -132,7 +149,7 @@ impl IndexKvE2m1 {
             block: (E2M1_KEY_DIM as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        launch_kernel!(function, cfg, stream, [packed.raw(), rows_b.raw(), n_comp_start])
+        launch_kernel!(function, cfg, stream, [packed.raw(), rows_b.raw(), n_comp_start, dst_row_per_ptr])
     }
 
     /// `dst[r, :] = expand(packed[r, :])` for `r in 0..n_rows`.

@@ -109,6 +109,8 @@ impl CompressorPool {
     /// Batched variant: pool `n_boundaries` per-boundary state snapshots
     /// into `out_b[k * head_dim]`. Snapshots are strided by
     /// `(coff * compress_ratio) * width` floats per boundary.
+    /// Single-sequence form of [`Self::launch_batched_rows`] (per-row base = none).
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_batched(
         &self,
         stream: &Stream,
@@ -119,6 +121,21 @@ impl CompressorPool {
         compress_ratio: u32,
         n_boundaries: u32,
     ) -> eyre::Result<()> {
+        self.launch_batched_rows(stream, out_b, state_kv_b, state_score_b, head_dim, compress_ratio, n_boundaries, None)
+    }
+
+    pub fn launch_batched_rows(
+        &self,
+        stream: &Stream,
+        out_b: &mut DeviceBuffer<f32>,
+        state_kv_b: &DeviceBuffer<f32>,
+        state_score_b: &DeviceBuffer<f32>,
+        head_dim: u32,
+        compress_ratio: u32,
+        n_boundaries: u32,
+        state_idx_per: Option<&DeviceBuffer<i32>>,
+    ) -> eyre::Result<()> {
+        let state_idx_per_ptr = state_idx_per.map(|b| b.raw() as *const i32).unwrap_or(std::ptr::null());
         if n_boundaries == 0 {
             return Ok(());
         }
@@ -131,7 +148,7 @@ impl CompressorPool {
         let width = coff * head_dim;
         let state_per_b = ((coff * compress_ratio) * width) as usize;
         let need_state = (n_boundaries as usize) * state_per_b;
-        if state_kv_b.len() < need_state || state_score_b.len() < need_state {
+        if state_idx_per.is_none() && (state_kv_b.len() < need_state || state_score_b.len() < need_state) {
             return Err(eyre!(
                 "compressor_pool_batched: state buffers have {}/{} elems, need {} (n_boundaries={n_boundaries}, per_b={state_per_b})",
                 state_kv_b.len(),
@@ -153,7 +170,7 @@ impl CompressorPool {
             shared_mem_bytes: 0,
         };
         launch_kernel!(function, cfg, stream, [
-            out_b.raw(), state_kv_b.raw(), state_score_b.raw(), head_dim, compress_ratio
+            out_b.raw(), state_kv_b.raw(), state_score_b.raw(), head_dim, compress_ratio, state_idx_per_ptr
         ])
     }
 }
@@ -461,6 +478,8 @@ impl CompressorStateWrite {
     /// monotonically — collisions only happen across compressor BOUNDARIES,
     /// not within a single batch on stable rows).
     #[allow(clippy::too_many_arguments)]
+    /// Single-sequence form of [`Self::launch_batched_rows`] (per-row base = none).
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_batched(
         &self,
         stream: &Stream,
@@ -474,6 +493,24 @@ impl CompressorStateWrite {
         width: u32,
         b: u32,
     ) -> eyre::Result<()> {
+        self.launch_batched_rows(stream, state_kv, state_score, kv_cur, sc_cur, ape, row_per_b, pos_mod_per_b, width, b, None)
+    }
+
+    pub fn launch_batched_rows(
+        &self,
+        stream: &Stream,
+        state_kv: &mut DeviceBuffer<f32>,
+        state_score: &mut DeviceBuffer<f32>,
+        kv_cur: &DeviceBuffer<f32>,
+        sc_cur: &DeviceBuffer<f32>,
+        ape: &DeviceBuffer<u8>,
+        row_per_b: &DeviceBuffer<i32>,
+        pos_mod_per_b: &DeviceBuffer<i32>,
+        width: u32,
+        b: u32,
+        state_base_per: Option<&DeviceBuffer<i32>>,
+    ) -> eyre::Result<()> {
+        let state_base_per_ptr = state_base_per.map(|b| b.raw() as *const i32).unwrap_or(std::ptr::null());
         if b == 0 {
             return Ok(());
         }
@@ -487,7 +524,7 @@ impl CompressorStateWrite {
         };
         launch_kernel!(function, cfg, stream, [
             state_kv.raw(), state_score.raw(), kv_cur.raw(), sc_cur.raw(),
-            ape.raw(), row_per_b.raw(), pos_mod_per_b.raw(), width
+            ape.raw(), row_per_b.raw(), pos_mod_per_b.raw(), width, state_base_per_ptr
         ])
     }
 }

@@ -93,9 +93,11 @@ extern "C" __global__ void index_kv_append_e2m1(
 extern "C" __global__ void index_kv_append_e2m1_batched(
         unsigned char * __restrict__ packed,
         const float   * __restrict__ rows_b,   // [n_boundaries, 128]
-        unsigned int                 n_comp_start) {
+        unsigned int                 n_comp_start,
+        const int   * __restrict__ dst_row_per) {   // nullable [n_boundaries]: per-row destination row
     const unsigned int k = blockIdx.y;
-    index_kv_pack_row(packed, rows_b + (unsigned long long)k * E2M1_KEY_DIM, n_comp_start + k);
+    index_kv_pack_row(packed, rows_b + (unsigned long long)k * E2M1_KEY_DIM,
+                      dst_row_per ? (unsigned int)dst_row_per[k] : n_comp_start + k);
 }
 
 // dst[r, :] = expand(packed[r, :]) for r in [0, n_rows): 64 threads per

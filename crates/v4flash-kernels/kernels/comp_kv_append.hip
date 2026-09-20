@@ -26,11 +26,12 @@ extern "C" __global__ void comp_kv_append_batched(
         _Float16     * __restrict__ comp_kv,
         const float  * __restrict__ rows_b,
         unsigned int   n_comp_start,
-        unsigned int   head_dim) {
+        unsigned int   head_dim,
+        const int    * __restrict__ dst_row_per) {   // nullable [n_boundaries]: per-row destination row
     const unsigned int d = threadIdx.x;
     const unsigned int k = blockIdx.y;
     if (d >= head_dim) return;
-    const size_t out_off = (size_t)(n_comp_start + k) * head_dim;
+    const size_t out_off = (size_t)(dst_row_per ? (unsigned int)dst_row_per[k] : n_comp_start + k) * head_dim;
     const size_t in_off  = (size_t)k * head_dim;
     comp_kv[out_off + d] = (_Float16)rows_b[in_off + d];
 }

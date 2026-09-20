@@ -383,6 +383,8 @@ impl IndexerScoreWmma {
 
     /// [`Self::launch_batched_mw`] over a packed-E2M1 key cache.
     #[allow(clippy::too_many_arguments)]
+    /// Single-sequence form of [`Self::launch_batched_mw_e2m1_rows`] (per-row base = none).
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_batched_mw_e2m1(
         &self,
         stream: &Stream,
@@ -395,10 +397,27 @@ impl IndexerScoreWmma {
         n_idx_stride: u32,
         batch: u32,
     ) -> eyre::Result<()> {
+        self.launch_batched_mw_e2m1_rows(stream, scores, q, head_weights, index_comp_kv, n_idx_per, n_idx_max, n_idx_stride, batch, None)
+    }
+
+    pub fn launch_batched_mw_e2m1_rows(
+        &self,
+        stream: &Stream,
+        scores: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        head_weights: &DeviceBuffer<f32>,
+        index_comp_kv: &DeviceBuffer<u8>,
+        n_idx_per: &DeviceBuffer<u32>,
+        n_idx_max: u32,
+        n_idx_stride: u32,
+        batch: u32,
+        keys_base_per: Option<&DeviceBuffer<u32>>,
+    ) -> eyre::Result<()> {
+        let keys_base_per_ptr = keys_base_per.map(|b| b.raw() as *const u32).unwrap_or(std::ptr::null());
         if batch == 0 || n_idx_max == 0 {
             return Ok(());
         }
-        if index_comp_kv.len() < (n_idx_max as usize) * crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES {
+        if keys_base_per.is_none() && index_comp_kv.len() < (n_idx_max as usize) * crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES {
             return Err(eyre!("indexer_score_wmma_batched_mw_e2m1: packed keys too small for n_idx_max={n_idx_max}"));
         }
         let function = self.module.get_function("indexer_score_wmma_batched_mw_e2m1")?;
@@ -411,7 +430,7 @@ impl IndexerScoreWmma {
         };
         launch_kernel!(function, cfg, stream, [
             scores.raw(), q.raw(), head_weights.raw(), index_comp_kv.raw(),
-            n_idx_per.raw(), n_idx_stride
+            n_idx_per.raw(), n_idx_stride, keys_base_per_ptr
         ])
     }
 
@@ -1066,6 +1085,8 @@ impl IndexerGather {
     /// `top_k * head_dim`. `comp_kv` is shared across the batch (the layer's
     /// single main compressor). Sentinel slots (selected[bi, i] == -1) are
     /// skipped; downstream attention must respect per-token n_comp_per ≤ top_k.
+    /// Single-sequence form of [`Self::launch_batched_rows`] (per-row base = none).
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_batched(
         &self,
         stream: &Stream,
@@ -1076,6 +1097,21 @@ impl IndexerGather {
         head_dim: u32,
         batch: u32,
     ) -> eyre::Result<()> {
+        self.launch_batched_rows(stream, active_comp_kv_b, comp_kv, selected_b, top_k, head_dim, batch, None)
+    }
+
+    pub fn launch_batched_rows(
+        &self,
+        stream: &Stream,
+        active_comp_kv_b: &mut DeviceBuffer<u16>,
+        comp_kv: &DeviceBuffer<u16>,
+        selected_b: &DeviceBuffer<i32>,
+        top_k: u32,
+        head_dim: u32,
+        batch: u32,
+        comp_base_per: Option<&DeviceBuffer<i32>>,
+    ) -> eyre::Result<()> {
+        let comp_base_per_ptr = comp_base_per.map(|b| b.raw() as *const i32).unwrap_or(std::ptr::null());
         if batch == 0 || top_k == 0 || head_dim == 0 {
             return Ok(());
         }
@@ -1103,7 +1139,7 @@ impl IndexerGather {
             shared_mem_bytes: 0,
         };
         launch_kernel!(function, cfg, stream, [
-            active_comp_kv_b.raw(), comp_kv.raw(), selected_b.raw(), top_k, head_dim
+            active_comp_kv_b.raw(), comp_kv.raw(), selected_b.raw(), top_k, head_dim, comp_base_per_ptr
         ])
     }
 }

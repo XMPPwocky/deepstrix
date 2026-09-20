@@ -108,6 +108,8 @@ impl KvCacheAppend {
         ])
     }
 
+    /// Single-sequence form of [`Self::launch_batched_rows`] (per-row base = none).
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_batched(
         &self,
         stream: &Stream,
@@ -117,6 +119,20 @@ impl KvCacheAppend {
         head_dim: u32,
         b: u32,
     ) -> eyre::Result<()> {
+        self.launch_batched_rows(stream, cache, kv_new, n_raw_before, head_dim, b, None)
+    }
+
+    pub fn launch_batched_rows(
+        &self,
+        stream: &Stream,
+        cache: &mut DeviceBuffer<u16>,
+        kv_new: &DeviceBuffer<f32>,
+        n_raw_before: u32,
+        head_dim: u32,
+        b: u32,
+        slot_per: Option<&DeviceBuffer<i32>>,
+    ) -> eyre::Result<()> {
+        let slot_per_ptr = slot_per.map(|b| b.raw() as *const i32).unwrap_or(std::ptr::null());
         if b == 0 {
             return Ok(());
         }
@@ -126,7 +142,7 @@ impl KvCacheAppend {
             block: (head_dim, 1, 1),
             shared_mem_bytes: 0,
         };
-        launch_kernel!(function, cfg, stream, [cache.raw(), kv_new.raw(), n_raw_before, head_dim])
+        launch_kernel!(function, cfg, stream, [cache.raw(), kv_new.raw(), n_raw_before, head_dim, slot_per_ptr])
     }
 
 }

@@ -66,6 +66,8 @@ impl CompKvAppend {
 
     /// Batched: append `n_boundaries` rows from `rows_b[k*head_dim]` to
     /// `comp_kv[(n_comp_start+k)*head_dim]` for k in 0..n_boundaries.
+    /// Single-sequence form of [`Self::launch_batched_rows`] (per-row base = none).
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_batched(
         &self,
         stream: &Stream,
@@ -75,6 +77,20 @@ impl CompKvAppend {
         head_dim: u32,
         n_boundaries: u32,
     ) -> eyre::Result<()> {
+        self.launch_batched_rows(stream, comp_kv, rows_b, n_comp_start, head_dim, n_boundaries, None)
+    }
+
+    pub fn launch_batched_rows(
+        &self,
+        stream: &Stream,
+        comp_kv: &mut DeviceBuffer<u16>,
+        rows_b: &DeviceBuffer<f32>,
+        n_comp_start: u32,
+        head_dim: u32,
+        n_boundaries: u32,
+        dst_row_per: Option<&DeviceBuffer<i32>>,
+    ) -> eyre::Result<()> {
+        let dst_row_per_ptr = dst_row_per.map(|b| b.raw() as *const i32).unwrap_or(std::ptr::null());
         if n_boundaries == 0 {
             return Ok(());
         }
@@ -84,7 +100,7 @@ impl CompKvAppend {
             ));
         }
         let need = ((n_comp_start + n_boundaries) as usize) * (head_dim as usize);
-        if comp_kv.len() < need {
+        if dst_row_per.is_none() && comp_kv.len() < need {
             return Err(eyre!(
                 "comp_kv_append_batched: comp_kv len {} < {}",
                 comp_kv.len(),
@@ -105,7 +121,7 @@ impl CompKvAppend {
             shared_mem_bytes: 0,
         };
         launch_kernel!(function, cfg, stream, [
-            comp_kv.raw(), rows_b.raw(), n_comp_start, head_dim
+            comp_kv.raw(), rows_b.raw(), n_comp_start, head_dim, dst_row_per_ptr
         ])
     }
 }

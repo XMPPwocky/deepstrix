@@ -41,13 +41,15 @@ extern "C" __global__ void compressor_state_write_batched(
         const __half * __restrict__ ape,
         const int    * __restrict__ row_per_b,     // [B]
         const int    * __restrict__ pos_mod_per_b, // [B]
-        unsigned int   width) {
+        unsigned int   width,
+        const int    * __restrict__ state_base_per) {   // nullable [B]: per-row state base (float elements)
     const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int b = blockIdx.y;
     if (j >= width) return;
     const int row     = row_per_b[b];
     const int pos_mod = pos_mod_per_b[b];
-    const unsigned long long stride       = (unsigned long long)row * width;
+    const unsigned long long stride       = (unsigned long long)row * width
+        + (state_base_per ? (unsigned long long)(unsigned int)state_base_per[b] : 0ull);
     const unsigned long long batch_stride = (unsigned long long)b   * width;
     state_kv[stride + j] = kv_cur[batch_stride + j];
     const float ape_val = __half2float(ape[(unsigned long long)pos_mod * width + j]);

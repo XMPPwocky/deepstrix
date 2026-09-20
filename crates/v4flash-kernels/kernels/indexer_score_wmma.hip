@@ -913,7 +913,8 @@ void indexer_score_wmma_batched_mw_e2m1(
         const float    * __restrict__ head_weights,    // [B, N_INDEXER_HEAD]
         const unsigned char * __restrict__ index_comp_kv,   // [n_idx_max, N_INDEXER_HEAD_DIM]
         const unsigned int * __restrict__ n_idx_per,   // [B]
-        unsigned int     n_idx_stride) {
+        unsigned int     n_idx_stride,
+        const unsigned int * __restrict__ keys_base_per) {   // nullable [B]: per-row key base row (multi-stream arena)
     const unsigned int tid  = threadIdx.x;
     const unsigned int lane = tid & 31u;
     const unsigned int wave = tid >> 5;
@@ -983,7 +984,8 @@ void indexer_score_wmma_batched_mw_e2m1(
         // B-fragment row for this lane: comp row c_base+col_in_tile.
         const unsigned int c_row = c_base + col_in_tile;
         const bool c_row_valid = (c_row < n_comp);
-        const unsigned char *k_row = index_comp_kv + (size_t)c_row * E2M1_KEY_ROW_BYTES;
+        const unsigned char *k_row = index_comp_kv
+            + (size_t)((keys_base_per ? keys_base_per[bi] : 0u) + c_row) * E2M1_KEY_ROW_BYTES;
         // All 9 loads for this lane's row up front (see e2m1_key_load_row_words).
         e2m1_key_row_words kwords;
         if (c_row_valid) {

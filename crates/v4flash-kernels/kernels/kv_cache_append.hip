@@ -54,11 +54,12 @@ extern "C" __global__ void kv_cache_append_batched(
         _Float16     * __restrict__ cache,         // [swa_window * head_dim] (f16)
         const float  * __restrict__ kv_new,        // [B, head_dim]           (f32 input)
         unsigned int   n_raw_before,
-        unsigned int   head_dim) {
+        unsigned int   head_dim,
+        const int    * __restrict__ slot_per) {   // nullable [B]: per-row destination slot
     const unsigned int d = threadIdx.x;
     const unsigned int b = blockIdx.x;
     if (d >= head_dim) return;
-    const unsigned int slot = n_raw_before + b;
+    const unsigned int slot = slot_per ? (unsigned int)slot_per[b] : n_raw_before + b;
     cache[(unsigned long long)slot * head_dim + d] =
         (_Float16)kv_new[(unsigned long long)b * head_dim + d];
 }

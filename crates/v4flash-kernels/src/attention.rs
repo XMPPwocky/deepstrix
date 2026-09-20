@@ -901,6 +901,8 @@ impl AttentionMixed {
     /// gathered top-K dense rows per batch instead of doing per-row mask
     /// tests on the full sparse set.
     #[allow(clippy::too_many_arguments)]
+    /// Single-sequence form of [`Self::launch_score_batched_htiled_wmma_f16s_rows`] (per-row base = none).
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_score_batched_htiled_wmma_f16s(
         &self,
         stream: &Stream,
@@ -919,6 +921,29 @@ impl AttentionMixed {
         comp_kv_batch_stride: u32,
         scores_stride: u32,
     ) -> eyre::Result<()> {
+        self.launch_score_batched_htiled_wmma_f16s_rows(stream, scores_g, q, raw_kv, comp_kv, n_raw_per, n_raw_offset_per, n_comp_per, comp_allowed_bits, n_head, head_dim, n_total_max, batch, comp_kv_batch_stride, scores_stride, None)
+    }
+
+    pub fn launch_score_batched_htiled_wmma_f16s_rows(
+        &self,
+        stream: &Stream,
+        scores_g: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
+        n_raw_per: &DeviceBuffer<i32>,
+        n_raw_offset_per: &DeviceBuffer<i32>,
+        n_comp_per: &DeviceBuffer<i32>,
+        comp_allowed_bits: Option<&DeviceBuffer<u32>>,
+        n_head: u32,
+        head_dim: u32,
+        n_total_max: u32,
+        batch: u32,
+        comp_kv_batch_stride: u32,
+        scores_stride: u32,
+        comp_base_per: Option<&DeviceBuffer<i32>>,
+    ) -> eyre::Result<()> {
+        let comp_base_per_ptr = comp_base_per.map(|b| b.raw() as *const i32).unwrap_or(std::ptr::null());
         if batch == 0 || n_total_max == 0 {
             return Ok(());
         }
@@ -954,7 +979,7 @@ impl AttentionMixed {
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
             mask_ptr, max_keys_words,
             n_head, head_dim, scores_stride, kq_scale,
-            comp_kv_batch_stride
+            comp_kv_batch_stride, comp_base_per_ptr
         ])
     }
 
@@ -1047,7 +1072,29 @@ impl AttentionMixed {
     /// `0` = legacy shared comp_kv; `>0` = per-batch comp_kv at offset
     /// `b * comp_kv_batch_stride * head_dim`. Pairs with CSA gather.
     #[allow(clippy::too_many_arguments)]
+    /// Single-sequence form of [`Self::launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s_rows`] (per-row base = none).
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        scores_g: &mut DeviceBuffer<f32>,
+        sinks: &DeviceBuffer<f32>,
+        raw_kv: &DeviceBuffer<u16>,
+        comp_kv: Option<&DeviceBuffer<u16>>,
+        n_raw_per: &DeviceBuffer<i32>,
+        n_raw_offset_per: &DeviceBuffer<i32>,
+        n_comp_per: &DeviceBuffer<i32>,
+        n_head: u32,
+        head_dim: u32,
+        batch: u32,
+        comp_kv_batch_stride: u32,
+        scores_stride: u32,
+    ) -> eyre::Result<()> {
+        self.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s_rows(stream, out, scores_g, sinks, raw_kv, comp_kv, n_raw_per, n_raw_offset_per, n_comp_per, n_head, head_dim, batch, comp_kv_batch_stride, scores_stride, None)
+    }
+
+    pub fn launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s_rows(
         &self,
         stream: &Stream,
         out: &mut DeviceBuffer<f32>,
@@ -1065,7 +1112,9 @@ impl AttentionMixed {
         batch: u32,
         comp_kv_batch_stride: u32,
         scores_stride: u32,
+        comp_base_per: Option<&DeviceBuffer<i32>>,
     ) -> eyre::Result<()> {
+        let comp_base_per_ptr = comp_base_per.map(|b| b.raw() as *const i32).unwrap_or(std::ptr::null());
         if batch == 0 {
             return Ok(());
         }
@@ -1082,7 +1131,7 @@ impl AttentionMixed {
         launch_kernel!(function, cfg, stream, [
             out.raw(), scores_g.raw(), sinks.raw(), raw_kv.raw(), comp_kv_ptr,
             n_raw_per.raw(), n_raw_offset_per.raw(), n_comp_per.raw(),
-            n_head, head_dim, scores_stride, comp_kv_batch_stride
+            n_head, head_dim, scores_stride, comp_kv_batch_stride, comp_base_per_ptr
         ])
     }
 
