@@ -1190,7 +1190,7 @@ pub struct ExpertShard {
     /// (1.23 ms measured) is gone — it was copying system RAM to system RAM.
     ///
     /// NON_COHERENT so the iGPU may cache its reads (see `PinnedBuffer`).
-    stage: [PinnedBuffer<u8>; 3],
+    stages: Vec<[PinnedBuffer<u8>; 3]>,
     /// Shard-wide paging pool. `None` until `enable_paging`.
     pool: Option<ShardPool>,
 }
@@ -1510,6 +1510,16 @@ pub fn b2_decode_down() -> bool {
     *B
 }
 
+/// `V41_B2_MISS_PAR=N`: missing experts of one layer read concurrently (default 4;
+/// the drive's aggregate random-read peak, see `ensure_layer_inner`). 1 = the
+/// old serial loop.
+pub fn b2_miss_par() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_B2_MISS_PAR").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
+    });
+    (*N).clamp(1, 16)
+}
+
 pub fn b2_coalesce() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         matches!(std::env::var("V41_B2_COALESCE").as_deref(), Ok("1") | Ok("on"))
@@ -1765,7 +1775,8 @@ impl ExpertShard {
         // own 4096-residue: one spare block per region, two regions per role.
         // (packed and scale are each 4096-multiples here, so +2 blocks suffices;
         // +4 is slack for a checkpoint whose lengths are not.)
-        let stage = [
+        let mut stages: Vec<[PinnedBuffer<u8>; 3]> = Vec::new();
+        for _ in 0..b2_miss_par() { stages.push([
             // Under `V41_B2_COALESCE` staging is REPURPOSED: [0] holds the whole
             // 3-role weight run and [1] the 3-role scale run, so one pread fills
             // each. Sized from bpe3 (which already exceeds packed+scale per role)
@@ -1776,11 +1787,11 @@ impl ExpertShard {
             )?,
             PinnedBuffer::<u8>::new_with_flags(bpe3[1] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
             PinnedBuffer::<u8>::new_with_flags(bpe3[2] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
-        ];
+        ]); }
         // O_DIRECT needs a 4096-aligned buffer. hipHostMalloc gives page-aligned
         // memory, but CHECK rather than assume: a misaligned buffer fails pread
         // with EINVAL, which is a confusing way to learn this.
-        let aligned = stage.iter().all(|p| p.as_slice().as_ptr() as usize % 4096 == 0);
+        let aligned = stages.iter().flatten().all(|p| p.as_slice().as_ptr() as usize % 4096 == 0);
         let direct = repack.is_some() && b2_odirect() && aligned;
         if b2_odirect() && !aligned {
             eprintln!("expert shard: O_DIRECT off — pinned staging is not 4096-aligned");
@@ -1795,7 +1806,7 @@ impl ExpertShard {
             load_stats: LoadStats { n_experts: n_slots as usize, bytes, seconds },
             repack,
             repack_stream,
-            stage,
+            stages,
             direct,
             pool: None,
         })
@@ -2033,7 +2044,7 @@ impl ExpertShard {
         let owner = &self.owner;
         let repack = self.repack.as_ref();
         let repack_stream = self.repack_stream.as_ref();
-        let stage = &mut self.stage;
+        let stages = &mut self.stages;
         let direct = self.direct;
         let mut dirty = false;
         let mut want: Vec<u32> = Vec::with_capacity(ids.len());
@@ -2042,6 +2053,8 @@ impl ExpertShard {
             let e = e as u32;
             if !want.contains(&e) { want.push(e); }
         }
+        let bpe = [r.gate_bytes_per_expert, r.up_bytes_per_expert, r.down_bytes_per_expert];
+        let mut pending: Vec<(u32, u32)> = Vec::new();
         for &e in &want {
             pg.requests += 1;
             if let Some(&slot) = pool.slot_of.get(&(layer, e)) {
@@ -2113,12 +2126,100 @@ impl ExpertShard {
                     pool.dirty[ol as usize] = true;
                 }
             }
+            // Slot claimed NOW (so the next pick cannot choose it again); the
+            // remap entry is written only once the data has landed.
+            pool.owner_of[victim as usize] = Some((layer, e));
+            pool.slot_of.insert((layer, e), victim);
+            pool.held[layer as usize] += 1;
+            pool.tick += 1;
+            pool.last_use[victim as usize] = pool.tick;
+            pending.push((e, victim));
+        }
+        // Read the misses `stages.len()` at a time, concurrently (MEASURED on box
+        // 2's Crucial E100 2026-09-20: random 18.8 MB O_DIRECT reads aggregate
+        // 2.5 GB/s at 1 reader, 3.4 at 4, and fall off beyond; one reader is
+        // what the serial loop got). Uploads/repacks follow in order on the
+        // repack stream.
+        let gpu_repack = repack.is_some();
+        let (mut read_ns, mut h2d_ns) = (0u64, 0u64);
+        let k = stages.len().max(1);
+        for chunk in pending.chunks(k) {
+            let rp0 = v4flash_core::hf_v41::expert_read_profile();
+            let t_r = std::time::Instant::now();
+            type R = Result<([Option<(usize, usize, u32, u32)>; 3], bool), String>;
+            let mut results: Vec<R> = Vec::with_capacity(chunk.len());
+            std::thread::scope(|sc| {
+                let mut hs = Vec::with_capacity(chunk.len());
+                for (&(e, _), st) in chunk.iter().zip(stages.iter_mut()) {
+                    let [p0, p1, p2] = st;
+                    let (b0, b1, b2) = (p0.as_mut_slice(), p1.as_mut_slice(), p2.as_mut_slice());
+                    hs.push(sc.spawn(move || -> R {
+                        Self::read_miss_into(owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2)
+                            .map_err(|err| format!("{err:#}"))
+                    }));
+                }
+                for h in hs {
+                    results.push(h.join().unwrap_or_else(|_| Err("miss reader panicked".into())));
+                }
+            });
+            read_ns += t_r.elapsed().as_nanos() as u64;
+            let rp1 = v4flash_core::hf_v41::expert_read_profile();
+            pg.pread_ns += rp1.2 - rp0.2;
+            pg.repack_cpu_ns += rp1.3 - rp0.3;
+            for ((&(e, victim), st), res) in chunk.iter().zip(stages.iter()).zip(results) {
+                let (offs, coalesced) = res.map_err(|m| eyre!("expert shard: layer {layer} expert {e}: {m}"))?;
+                let t_h = std::time::Instant::now();
+                match (repack, repack_stream) {
+                    (Some(rp), Some(rs)) => {
+                        pg.repack_gpu_ns += Self::repack_in_place(rp, rs, r, victim, st, &offs, coalesced)?;
+                    }
+                    _ => {
+                        for i in 0..3 {
+                            let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
+                            // `st[i]` is over-allocated by 4 blocks of alignment slack
+                            // for the O_DIRECT path, so copy only the expert's bytes.
+                            buf.slice_view_mut(victim as usize * bpe[i], bpe[i])
+                                .copy_from_host(&st[i].as_slice()[..bpe[i]])?;
+                        }
+                    }
+                }
+                h2d_ns += t_h.elapsed().as_nanos() as u64;
+                pool.remap_hosts[layer as usize][e as usize] = -(victim as i32) - 1;
+                dirty = true;
+            }
+        }
+        pg.read_ns += read_ns;
+        pg.h2d_ns += h2d_ns;
+        if dirty {
+            l.remap_dev.copy_from_host(&pool.remap_hosts[layer as usize])?;
+            pool.dirty[layer as usize] = false;
+        }
+        Ok(())
+    }
+
+
+    /// Read ONE missing expert's three roles into a staging set (`b0..b2`, the
+    /// caller's pinned buffers). Pure I/O + CPU: safe to run for several misses
+    /// concurrently (`V41_B2_MISS_PAR`). Returns the per-role staging offsets
+    /// and whether the coalesced (two-pread) path was taken.
+    #[allow(clippy::too_many_arguments)]
+    fn read_miss_into(
+        owner: &V41HfWeights,
+        direct: bool,
+        gpu_repack: bool,
+        layer: u32,
+        e: u32,
+        bpe: [usize; 3],
+        b0: &mut [u8],
+        b1: &mut [u8],
+        b2: &mut [u8],
+    ) -> eyre::Result<([Option<(usize, usize, u32, u32)>; 3], bool)> {
+        {
             let names = [
                 format!("blk.{layer}.ffn_gate_exps.weight"),
                 format!("blk.{layer}.ffn_up_exps.weight"),
                 format!("blk.{layer}.ffn_down_exps.weight"),
             ];
-            let bpe = [r.gate_bytes_per_expert, r.up_bytes_per_expert, r.down_bytes_per_expert];
             // The three roles are read CONCURRENTLY into PERSISTENT staging, then
             // uploaded — and under `V41_B2_GPU_REPACK` (default on) the MXFP4
             // HF->ggml permute runs on the iGPU instead of this box's CPU.
@@ -2137,10 +2238,6 @@ impl ExpertShard {
             // expert-sized read. The missing 3.8 ms was CPU: a fresh 18.8 MB
             // allocation per fault plus the HF->ggml repack, both of which box 1's
             // pager had already moved off the critical path.
-            let (mut read_ns, mut h2d_ns) = (0u64, 0u64);
-            let gpu_repack = repack.is_some();
-            let rp0 = v4flash_core::hf_v41::expert_read_profile();
-            let t_r = std::time::Instant::now();
             // Per role: where the packed nibbles and the scale plane actually
             // landed in staging. `None` = contiguous (the non-direct paths).
             let mut offs: [Option<(usize, usize, u32, u32)>; 3] = [None; 3];
@@ -2149,8 +2246,7 @@ impl ExpertShard {
             // O_DIRECT, or when the run-time contiguity check fails.
             let mut coalesced = false;
             if gpu_repack && direct && b2_coalesce() {
-                let [p0, p1, _] = &mut *stage;
-                let (dw, ds) = (p0.as_mut_slice(), p1.as_mut_slice());
+                let (dw, ds) = (&mut *b0, &mut *b1);
                 let src0 = WeightSrc::from(owner);
                 // All three ROLE tensors: the run's physical order is derived from
                 // their file offsets, because gate/up/down is NOT w1/w2/w3.
@@ -2172,8 +2268,7 @@ impl ExpertShard {
             // `V41_B2_POOL_FLOOR=0`, where page-ins are frequent — that is the
             // regime where coalescing was observed to corrupt.
             if coalesced && coalesce_check() {
-                let (ab, c) = stage.split_at_mut(2);
-                let ref_buf = c[0].as_mut_slice();
+                let ref_buf = &mut *b2;
                 let src0 = WeightSrc::from(owner);
                 for r in 0..3 {
                     let name = &names[r];
@@ -2189,13 +2284,13 @@ impl ExpertShard {
                         eprintln!("COALESCE_CHECK L{layer} e{e} role{r}: geom {:?} != {:?}",
                                   (out1, nb1), (out2, nb2));
                     }
-                    let got_p = &ab[0].as_slice()[po..po + plen];
+                    let got_p = &b0[po..po + plen];
                     let ref_p = &ref_buf[pw2..pw2 + plen];
                     if got_p != ref_p {
                         let i = got_p.iter().zip(ref_p).position(|(a, b)| a != b).unwrap_or(0);
                         eprintln!("COALESCE_CHECK L{layer} e{e} role{r}: PACKED differs at byte {i}                                    of {plen} (coalesced off {po}, per-role off {pw2})");
                     }
-                    let got_s = &ab[1].as_slice()[so..so + slen];
+                    let got_s = &b1[so..so + slen];
                     let ref_s = &ref_buf[ps2..ps2 + slen];
                     if got_s != ref_s {
                         let i = got_s.iter().zip(ref_s).position(|(a, b)| a != b).unwrap_or(0);
@@ -2204,9 +2299,7 @@ impl ExpertShard {
                 }
             }
             if !coalesced {
-                let [p0, p1, p2] = &mut *stage;
-                let bufs: [&mut [u8]; 3] =
-                    [p0.as_mut_slice(), p1.as_mut_slice(), p2.as_mut_slice()];
+                let bufs: [&mut [u8]; 3] = [b0, b1, b2];
                 let mut errs: Vec<String> = Vec::new();
                 std::thread::scope(|sc| {
                     let h: Vec<_> = bufs
@@ -2254,47 +2347,8 @@ impl ExpertShard {
                     return Err(eyre!("expert shard: layer {layer} expert {e}: {msg}"));
                 }
             }
-            read_ns += t_r.elapsed().as_nanos() as u64;
-            let rp1 = v4flash_core::hf_v41::expert_read_profile();
-            pg.pread_ns += rp1.2 - rp0.2;
-            pg.repack_cpu_ns += rp1.3 - rp0.3;
-            let t_h = std::time::Instant::now();
-            match (repack, repack_stream) {
-                (Some(rp), Some(st)) => {
-                    pg.repack_gpu_ns += Self::repack_in_place(
-                        rp, st, r, victim, stage, &offs, coalesced,
-                    )?;
-                }
-                _ => {
-                    for i in 0..3 {
-                        let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
-                        // `stage[i]` is over-allocated by 4 blocks of alignment
-                        // slack for the O_DIRECT path, so copy only the expert's
-                        // own bytes. Copying the whole buffer failed with
-                        // "copy_from_host length mismatch: src=6283264
-                        // dst=6266880" (exactly 4*4096 too many). Latent: this
-                        // branch only runs with GPU repack OFF.
-                        buf.slice_view_mut(victim as usize * bpe[i], bpe[i])
-                            .copy_from_host(&stage[i].as_slice()[..bpe[i]])?;
-                    }
-                }
-            }
-            h2d_ns += t_h.elapsed().as_nanos() as u64;
-            pg.read_ns += read_ns;
-            pg.h2d_ns += h2d_ns;
-            pool.owner_of[victim as usize] = Some((layer, e));
-            pool.slot_of.insert((layer, e), victim);
-            pool.held[layer as usize] += 1;
-            pool.tick += 1;
-            pool.last_use[victim as usize] = pool.tick;
-            pool.remap_hosts[layer as usize][e as usize] = -(victim as i32) - 1;
-            dirty = true;
+            Ok((offs, coalesced))
         }
-        if dirty {
-            l.remap_dev.copy_from_host(&pool.remap_hosts[layer as usize])?;
-            pool.dirty[layer as usize] = false;
-        }
-        Ok(())
     }
 
     /// Permute the three staged HF-layout roles into `slot` on the iGPU, reading
