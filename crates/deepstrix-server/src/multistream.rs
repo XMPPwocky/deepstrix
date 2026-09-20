@@ -426,50 +426,15 @@ impl Sched {
             }
         }
         let pos0 = prefix.len() as u32;
-        let mut hcs: Vec<Vec<f32>> = Vec::with_capacity(suffix.len());
-        for &tok in &suffix {
-            let mut v = vec![0f32; HC_DIM as usize];
-            embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, tok, &mut v);
-            hcs.push(v);
-        }
-        // Engram: hash the whole sequence (prefix + suffix); rows for the suffix.
+        // Engram: compress the whole sequence now (cheap); embeddings and
+        // Engram rows are produced PER CHUNK in `prefill_job_tick` (lazy job
+        // inputs) so a long prompt neither blocks the scheduler for a bulk
+        // gather nor holds its whole prompt's inputs in host RAM.
         let mut compressed: Vec<i32> = Vec::with_capacity(tokens.len() + 1);
-        let engram_rows = match (state.pager.as_ref(), state.engram.as_mut()) {
-            (Some(pg), Some(ec)) => {
-                for &t in prefix.iter().chain(suffix.iter()) { compressed.push(ec.hasher.compress(t)); }
-                // `hash_ids` over the COMPRESSED ids (as `rows_for_chunk` and
-                // `decode_step` do). `hash_sequence` compresses its input itself,
-                // so feeding it `compressed` double-compressed every id.
-                let hashes: Vec<[[i64; v4flash_core::engram_hash::ENGRAM_COLS]; v4flash_core::engram_hash::ENGRAM_LAYERS]> =
-                    (0..compressed.len()).map(|q| if q < pos0 as usize { [[0i64; v4flash_core::engram_hash::ENGRAM_COLS]; v4flash_core::engram_hash::ENGRAM_LAYERS] } else { ec.hasher.hash_ids(&compressed, q) }).collect();
-                let ein = ENGRAM_IN as usize;
-                let mut rows = vec![vec![0f32; suffix.len() * ein]; ec.tables.len()];
-                let te = Instant::now();
-                // BATCHED gather over runs of live positions, exactly as
-                // `EngramCtx::rows_for_chunk` does. `gather_position` spawns 24
-                // OS threads per call (~1.5 ms/token measured 2026-09-20: a
-                // 51,877-token suffix took 78 s here, blocking every live
-                // stream); one deep `gather` per run per table is bit-identical
-                // and ~50x cheaper. DEAD (image-span) positions stay all-zero.
-                const GATHER_THREADS: usize = 32;
-                let p0 = pos0 as usize;
-                let n = suffix.len();
-                let mut k = 0usize;
-                while k < n {
-                    if compressed[p0 + k] == v4flash_core::engram_hash::DEAD { k += 1; continue; }
-                    let start = k;
-                    while k < n && compressed[p0 + k] != v4flash_core::engram_hash::DEAD { k += 1; }
-                    for (li, tbl) in ec.tables.iter().enumerate() {
-                        let flat: Vec<i64> = hashes[p0 + start..p0 + k].iter().flat_map(|h| h[li]).collect();
-                        if let Err(e) = tbl.gather(pg.raw(), &flat, &mut rows[li][start * ein..k * ein], GATHER_THREADS) { return Err((p, kv, e)); }
-                    }
-                }
-                tracing::info!(rows = suffix.len(), ms = te.elapsed().as_millis() as u64, "multistream: engram rows for the suffix");
-                Some(rows)
-            }
-            _ => None,
-        };
-        let job = match PrefillJob::new(suffix.clone(), hcs, engram_rows, None, pos0, if self.streams.is_empty() { chunk_rows_idle() } else { chunk_rows_busy() }) {
+        if let Some(ec) = state.engram.as_ref() {
+            for &t in prefix.iter().chain(suffix.iter()) { compressed.push(ec.hasher.compress(t)); }
+        }
+        let job = match PrefillJob::new(suffix.clone(), Vec::new(), None, None, pos0, if self.streams.is_empty() { chunk_rows_idle() } else { chunk_rows_busy() }) {
             Ok(j) => j,
             Err(e) => return Err((p, kv, e)),
         };
@@ -515,20 +480,23 @@ impl Sched {
     /// One chunk (or the finish + admit) of `pf`. On error returns the scratch
     /// state (if still owned) for recycling.
     fn prefill_job_tick(&mut self, state: &mut WorkerState, mut pf: Prefill, i: usize) -> Result<(), (Option<v4flash_kernels::het::HetModelState>, eyre::Report)> {
-        let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, weights, pager, .. } = state;
-        let kv = &mut pf.kv;
         if !pf.job.chunks_done() {
             let t = Instant::now();
-            let rows = match engine.prefill_job_chunk(&mut pf.job, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, kv, weights, pager.as_mut()) {
+            if let Err(e) = chunk_inputs(&mut pf, state) { return Err((Some(pf.kv), e)); }
+            let inputs_ms = t.elapsed().as_millis() as u64;
+            let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, weights, pager, .. } = state;
+            let rows = match engine.prefill_job_chunk(&mut pf.job, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, &mut pf.kv, weights, pager.as_mut()) {
                 Ok(r) => r,
                 Err(e) => return Err((Some(pf.kv), e)),
             };
-            tracing::debug!(rows, done = pf.job.done_rows(), total = pf.job.total(), ms = t.elapsed().as_millis() as u64, "multistream: prefill chunk");
+            tracing::debug!(rows, done = pf.job.done_rows(), total = pf.job.total(), inputs_ms, ms = t.elapsed().as_millis() as u64, "multistream: prefill chunk");
             if !pf.job.chunks_done() {
                 self.prefills.insert(i.min(self.prefills.len()), pf);
                 return Ok(());
             }
         }
+        let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, weights, pager, .. } = state;
+        let kv = &mut pf.kv;
         let logits = match engine.prefill_job_finish(&mut pf.job, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, kv, weights, pager.as_mut()) {
             Ok(l) => l,
             Err(e) => return Err((Some(pf.kv), e)),
@@ -800,6 +768,43 @@ fn stop_reason(s: &Stream, tok: i32) -> Option<FinishReason> {
     if is_turn_end(tok) { return Some(FinishReason::Stop); }
     if s.completion_tokens as usize >= s.max_new { return Some(FinishReason::Length); }
     None
+}
+
+/// Lazy job inputs for the next chunk: layer-0 embeddings and Engram rows
+/// (batched gather over runs of live positions, as `EngramCtx::rows_for_chunk`).
+fn chunk_inputs(pf: &mut Prefill, state: &mut WorkerState) -> eyre::Result<()> {
+    let (a, z) = pf.job.next_chunk_range((state.bd_a.rows, state.bd_b.rows))?;
+    let toks = &pf.job.tokens()[a..z];
+    let mut hcs: Vec<Vec<f32>> = Vec::with_capacity(toks.len());
+    for &tok in toks {
+        let mut v = vec![0f32; HC_DIM as usize];
+        embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, tok, &mut v);
+        hcs.push(v);
+    }
+    let engram = match (state.pager.as_ref(), state.engram.as_ref()) {
+        (Some(pg), Some(ec)) => {
+            const GATHER_THREADS: usize = 32;
+            let ein = ENGRAM_IN as usize;
+            let p0 = pf.job.pos0() as usize;
+            let n = z - a;
+            let mut rows = vec![vec![0f32; n * ein]; ec.tables.len()];
+            let mut k = 0usize;
+            while k < n {
+                if pf.compressed[p0 + a + k] == v4flash_core::engram_hash::DEAD { k += 1; continue; }
+                let start = k;
+                while k < n && pf.compressed[p0 + a + k] != v4flash_core::engram_hash::DEAD { k += 1; }
+                let hashes: Vec<_> = (start..k).map(|q| ec.hasher.hash_ids(&pf.compressed, p0 + a + q)).collect();
+                for (li, tbl) in ec.tables.iter().enumerate() {
+                    let flat: Vec<i64> = hashes.iter().flat_map(|h| h[li]).collect();
+                    tbl.gather(pg.raw(), &flat, &mut rows[li][start * ein..k * ein], GATHER_THREADS)?;
+                }
+            }
+            Some(rows)
+        }
+        _ => None,
+    };
+    pf.job.set_chunk_inputs(hcs, engram);
+    Ok(())
 }
 
 fn finish(state: &mut WorkerState, arena: &mut KvArena, s: Stream, f: FinishReason) -> eyre::Result<()> {

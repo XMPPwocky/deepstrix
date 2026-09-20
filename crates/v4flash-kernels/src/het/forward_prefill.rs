@@ -441,6 +441,12 @@ pub struct PrefillJob {
     /// Set by `prefill_job_chunk` after the last chunk when CED is off (the head
     /// is taken there); `prefill_job_finish` returns it.
     last_logits: Option<Vec<f32>>,
+    /// LAZY inputs: when `input_hcs` is empty the caller supplies the next
+    /// chunk's rows through `set_chunk_inputs` right before `prefill_job_chunk`
+    /// (embeddings + Engram rows for `next_chunk_range()` only). A 135K-token
+    /// prompt's whole-prompt inputs are ~15 GB of host RAM and a 35 s Engram
+    /// gather up front; per chunk they are ~60 MB and ~150 ms.
+    chunk_inputs: Option<(Vec<Vec<f32>>, Option<Vec<Vec<f32>>>)>,
 }
 
 impl PrefillJob {
@@ -456,8 +462,8 @@ impl PrefillJob {
         if t == 0 {
             return Err(eyre!("PrefillJob: empty prompt"));
         }
-        if input_hcs.len() != t {
-            return Err(eyre!("PrefillJob: input_hcs len {} != tokens len {t}", input_hcs.len()));
+        if input_hcs.len() != t && !input_hcs.is_empty() {
+            return Err(eyre!("PrefillJob: input_hcs len {} != tokens len {t} (empty = lazy per-chunk inputs)", input_hcs.len()));
         }
         let spans = image_spans.unwrap_or(&[]);
         image_spans::validate_spans(spans, pos0, t)?;
@@ -480,6 +486,7 @@ impl PrefillJob {
             ced: ced_enabled(),
             started: std::time::Instant::now(),
             last_logits: None,
+            chunk_inputs: None,
         })
     }
     pub fn total(&self) -> usize { self.tokens.len() }
@@ -487,6 +494,22 @@ impl PrefillJob {
     pub fn chunks_done(&self) -> bool { self.chunk_start >= self.tokens.len() }
     pub fn pos0(&self) -> u32 { self.pos0 }
     pub fn tokens(&self) -> &[i32] { &self.tokens }
+    /// True when `new` got no `input_hcs`: every chunk needs `set_chunk_inputs`.
+    pub fn lazy_inputs(&self) -> bool { self.input_hcs.is_empty() }
+    /// `[start, end)` token indices (into `tokens()`) of the chunk the next
+    /// `prefill_job_chunk` will run, given the lane capacities it will see.
+    pub fn next_chunk_range(&self, lane_caps: (usize, usize)) -> eyre::Result<(usize, usize)> {
+        let t = self.tokens.len();
+        let chunk_size = self.chunk_rows.min(lane_caps.0 + lane_caps.1);
+        let (end, _) = image_spans::plan_chunk(self.pos0, self.chunk_start, t, chunk_size, Some(lane_caps), &self.image_spans)?;
+        Ok((self.chunk_start, end))
+    }
+    /// Lazy mode: the next chunk's layer-0 HCs (one per token of
+    /// `next_chunk_range`) and, if the model has Engram, its rows
+    /// (`[n * ENGRAM_IN]` per Engram layer).
+    pub fn set_chunk_inputs(&mut self, hcs: Vec<Vec<f32>>, engram: Option<Vec<Vec<f32>>>) {
+        self.chunk_inputs = Some((hcs, engram));
+    }
 }
 
 impl HeterogeneousEngine {
@@ -536,7 +559,19 @@ impl HeterogeneousEngine {
         let (chunk_end, b_a) = image_spans::plan_chunk(job.pos0, job.chunk_start, t, chunk_size, Some(lane_caps), &job.image_spans)?;
         let chunk_b = chunk_end - job.chunk_start;
         let is_last_chunk = chunk_end == t;
-        let chunk_input = &job.input_hcs[job.chunk_start..chunk_end];
+        let (lazy_hcs, lazy_engram) = match job.chunk_inputs.take() {
+            Some((h, e)) => {
+                if h.len() != chunk_b || e.as_ref().is_some_and(|rs| rs.iter().any(|r| r.len() != chunk_b * ENGRAM_IN as usize)) {
+                    return Err(eyre!("prefill_job_chunk: chunk inputs for {} rows, chunk is {chunk_b}", h.len()));
+                }
+                (Some(h), e)
+            }
+            None if job.lazy_inputs() => {
+                return Err(eyre!("prefill_job_chunk: lazy job has no inputs for chunk {} (set_chunk_inputs)", job.chunk_idx));
+            }
+            None => (None, None),
+        };
+        let chunk_input: &[Vec<f32>] = match lazy_hcs.as_ref() { Some(h) => h.as_slice(), None => &job.input_hcs[job.chunk_start..chunk_end] };
         let chunk_tokens = &job.tokens[job.chunk_start..chunk_end];
         let chunk_pos0 = job.pos0 + job.chunk_start as u32;
         if job.chunk_idx == 0 || job.chunk_idx % 16 == 0 || is_last_chunk {
@@ -546,11 +581,14 @@ impl HeterogeneousEngine {
         }
         self.dgpu.events.reset();
         self.igpu.events.reset();
-        let chunk_engram: Option<Vec<Vec<f32>>> = job.engram_rows.as_ref().map(|rs| {
-            let ein = ENGRAM_IN as usize;
-            let (a, z) = (job.chunk_start * ein, chunk_end * ein);
-            rs.iter().map(|r| r[a..z].to_vec()).collect()
-        });
+        let chunk_engram: Option<Vec<Vec<f32>>> = match lazy_hcs.is_some() {
+            true => lazy_engram,
+            false => job.engram_rows.as_ref().map(|rs| {
+                let ein = ENGRAM_IN as usize;
+                let (a, z) = (job.chunk_start * ein, chunk_end * ein);
+                rs.iter().map(|r| r[a..z].to_vec()).collect()
+            }),
+        };
         if job.ced {
             let cut = self.forward_prompt_batch_v2_pipelined_range(
                 bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, chunk_input, chunk_tokens, chunk_pos0,
