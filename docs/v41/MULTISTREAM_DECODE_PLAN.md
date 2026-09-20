@@ -1,4 +1,4 @@
-# Multi-stream decode: plan, ceiling, scheduler (2026-09-19, rev 1.1, APPROVED by review)
+# Multi-stream decode: plan, ceiling, scheduler (2026-09-19, rev 1.2, APPROVED by review at 1.1)
 
 Rev 1 after an adversarial architecture review of rev 0 (31 findings; the ones that
 changed conclusions are marked "REV" below); rev 1.1 after the re-review (7 new
@@ -277,11 +277,28 @@ the decode layer today (`pos_dev`/`kv_slot_dev`, `ls.n_raw`, the `kv_win` slice 
   covers the sub-64 tail of the other tiled kernels (`tests/mtp_batched_kernels_b5.rs`
   is the template).
 * **Per-row KV kernels** (`attn_swa`, `attn_mixed` score/smwsum, the indexer chain,
-  `kv_append`, the compressor append, `index_k`): the EXISTING B=1 decode kernels with
-  a grid dimension over rows and per-row bases from the row table. Each row then
-  computes exactly what today's decode computes for that stream, which is the
-  batch-invariance property (3.6a), and the per-row causal limit for draft rows is a
-  per-row `n_raw`/`n_comp` from the table.
+  `kv_append`, the compressor append, `index_k`). REV (rev 1.2, after the launch
+  inventory in MULTISTREAM_M1A_INVENTORY.md): batched twins of every one of these
+  already exist and are what the prefill/verify driver runs — `attn_swa.launch_batched`
+  (`n_raw_per`, `n_raw_offset_per`), `attn_mixed.launch_score_batched_htiled_wmma_f16s`
+  and `launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s`, `indexer_score_wmma
+  .launch_batched_mw_e2m1` (`n_idx_per`), `indexer_topk_bitonic.launch_batched`,
+  `indexer_gather.launch_batched`, `rope.launch_forward_batched` (`pos_per`),
+  `kv_append.launch_batched`, the compressor `launch_batched` family (`row_per_b`,
+  `pos_mod_per_b`, `comp_pos_per_boundary`), `router_topk.launch_batched`,
+  `hc_*`/`rms_*` batched. Their ONE single-sequence assumption is a single KV base
+  pointer per store with a uniform per-row stride (`comp_kv_batch_stride`; one
+  `raw_kv` base with per-row offsets). So the multi-stream step uses this family
+  with per-row BASE OFFSETS into one arena allocation per KV-source layer (the
+  KvArena of 3.2), not re-gridded B=1 kernels. Consequences: (a) per-row numerics
+  are the prefill/verify family's, so G5b (KLD vs today's decode) is the fidelity
+  gate and G5a is self-invariance across buckets and co-rows; (b) the per-row
+  causal limit for draft rows is the per-row `n_raw`/`n_comp` those kernels
+  already take; (c) what is genuinely new is the per-row base arrays, a batched
+  sampler (none exists: `sample_next` is one row with a stream sync and a 4-byte
+  D2H), and moving three pieces of single-row engine state per row (`hc_pre_carry`
+  is already per lane; `last_idx_gather_src/rows` are engine-level atomics; the
+  `engram_rows_ready` flag).
 * **REV: the compressor is a per-stream recurrence with a per-row boundary.** For
   K=1 the boundary predicate moves into the kernel (rows at different parities
   fire or no-op individually). For K>1 a stream's draft rows go through it in
