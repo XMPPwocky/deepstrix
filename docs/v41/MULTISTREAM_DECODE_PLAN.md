@@ -631,6 +631,24 @@ demux samples -> update the live miss-rate estimate.
 * **Admission**: a real queue with the G2 floor and a queue-time bound replaces the
   8-deep 503.
 
+### 5.7 Shipped since M1b v1 (2026-09-20 evening)
+
+* **Bursts with hysteresis** (`7612ead`): the tick runs in `Phase::Prefill` /
+  `Phase::Decode` bursts of `V41_MS_PREFILL_BURST_MS` / `V41_MS_DECODE_BURST_MS`
+  (default 30 s each) whenever both kinds of work exist. Alternating one 256-row
+  chunk with one decode step evicted the decode working set from the expert pool
+  every tick; 30 s bursts keep locality and still bound the wait for either side.
+  512-row chunks while decoding (`48205c2`).
+* **Store compaction** (`affd80a`): `KvArena::compact_stores` slides every live
+  region down through a bounce buffer so each store's free space is one run.
+  The scheduler compacts when admission fails on fragmentation but the total
+  free rows suffice (`fits_after_compaction`). GPU test `tests/kv_arena_compact.rs`.
+* **Parking** (`affd80a`): a prefilled request that still has no room keeps its
+  scratch state and is retried every tick as streams finish; it is no longer
+  failed. (Consequence: one prefill scratch state is tied up while it waits.)
+* Budget: three ~269K-context agents need ratio-2 stores of >= 403365 rows, i.e.
+  `V41_MS_CTX_ROWS=844800` (2.75x `--ctx`); the 2x default fits two.
+
 ## 6. DSpark on the batched path
 
 Rows = streams x (1 + K). The verify IS the batched step over one stream's rows;
