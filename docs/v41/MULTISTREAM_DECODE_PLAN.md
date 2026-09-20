@@ -709,6 +709,26 @@ per-term decomposition matching the model to within 20%.
 misses. **Gate:** S=8 >= 33 tok/s aggregate in a paired A/B against today (the e2e
 noise floor is ~8%), G1, G6.
 
+**M1b v1 SHIPPED 2026-09-20 (commit 1d53675, `V41_MULTISTREAM=1`).**
+`crates/deepstrix-server/src/multistream.rs`: one `KvArena` of `V41_MS_SLOTS` (8)
+slots; one batched decode step per tick (`forward_step_arena` + `head_rows` + host
+per-row sampling with the kernel's composed top_p/min_p rule); up to
+`V41_MS_PREFILL_JOBS` (2) prompts prefilling at once, each in its own scratch
+`HetModelState`, round-robin one chunk (`V41_MS_CHUNK_ROWS` 256 while decoding,
+512 idle) per chunk tick, chunk ticks 1 in `V41_MS_PREFILL_SHARE` (2) while decode
+rows exist; shortest prompt first with `V41_MS_AGING_S` (60 s) aging; snapshot
+probe/restore on entry and the prompt snapshot saved after the prefill (as the
+legacy path); per-step watchdog pet; `try_send` emits with a 30-failure drop;
+cancellation per row; a step error aborts every live stream and drains/redials
+box 2; image and DSpark requests take the legacy serial handler when nothing is
+live. NOT in v1: RESIDENT streams / the extend path (every turn = snapshot restore
++ suffix prefill), background snapshot save, per-stream KvMark rollback + step
+retry, the G2 admission floor (admission = free arena slot + store room), SJF on
+the post-probe suffix (uses the prompt length). First production run 2026-09-20
+20:10 UTC: single row 120-300 ms/step cold, ~104 ms warm; 4 rows 190-350 ms;
+a real 33K-token agent prompt restored 6,367 tokens and prefilled the rest in 105
+chunks (~213 tok/s incl. the interleaved steps).
+
 **M2 — scheduler, pool, and the chunk path.** Hits-first on both boxes (validated in
 M0-D5); prefill chunks with `prefill_share`; SJF + aging; REPLAY offload; RESIDENT
 streams and the extend path; background snapshot writer; the protected-generation
