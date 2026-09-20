@@ -13,6 +13,11 @@ pub struct Module {
     raw: sys::hipModule_t,
     /// Device current at load; `hipModuleUnload` must run under it.
     device_id: i32,
+    /// `hipModuleGetFunction` results by name. Every kernel wrapper called
+    /// `get_function(name)` per LAUNCH (a CString + a runtime symbol lookup
+    /// each time); the batched decode step launches ~50 kernels per layer, so
+    /// this sat on the host critical path 2000 times per step.
+    functions: std::sync::Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl Module {
@@ -26,16 +31,24 @@ impl Module {
             unsafe { sys::hipModuleLoadData(&mut raw, image.as_ptr() as *const c_void) },
             "hipModuleLoadData",
         )?;
-        Ok(Module { raw, device_id: crate::device::current_device() })
+        Ok(Module { raw, device_id: crate::device::current_device(), functions: std::sync::Mutex::new(std::collections::HashMap::new()) })
     }
 
     pub fn get_function(&self, name: &str) -> eyre::Result<Function<'_>> {
+        if let Ok(cache) = self.functions.lock() {
+            if let Some(&raw) = cache.get(name) {
+                return Ok(Function { raw: raw as sys::hipFunction_t, _marker: std::marker::PhantomData });
+            }
+        }
         let c_name = CString::new(name).expect("kernel name has null byte");
         let mut raw: sys::hipFunction_t = ptr::null_mut();
         check_eyre(
             unsafe { sys::hipModuleGetFunction(&mut raw, self.raw, c_name.as_ptr()) },
             "hipModuleGetFunction",
         )?;
+        if let Ok(mut cache) = self.functions.lock() {
+            cache.insert(name.to_string(), raw as usize);
+        }
         Ok(Function {
             raw,
             _marker: std::marker::PhantomData,

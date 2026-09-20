@@ -142,6 +142,9 @@ impl Q8_0Matvec {
     /// `out[i] = sum_b f16_scale_w[i, b] * xscale[b] * dot_i8x32(qs_w[i, b], xq[b])`
     /// for i in 0..n_rows. The Q8_0 weight buffer holds `n_rows` rows of
     /// `(k/32) * 34` bytes each, row-major.
+    /// The loaded module (benches: function-lookup cost).
+    pub fn module(&self) -> &Module { &self.module }
+
     pub fn matvec(
         &self,
         stream: &Stream,
