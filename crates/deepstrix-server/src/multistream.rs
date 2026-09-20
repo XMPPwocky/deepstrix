@@ -100,10 +100,13 @@ const CHUNK_SEND_FAILURES_MAX: u32 = 30;
 
 pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
     let n_slots = env_usize("V41_MS_SLOTS", 8) as u32;
-    let store_rows = env_usize("V41_MS_STORE_ROWS", 400_000) as u32;
+    // Context budget across all live streams (positions); each store gets
+    // budget / ratio rows. Default 3 x --ctx: e.g. three 240K agents, or twelve
+    // 60K ones. ~1 KB per row at ratio 1 plus 0.5 KB per ratio-2 store.
+    let ctx_rows = env_usize("V41_MS_CTX_ROWS", 3 * state.n_kv_max as usize) as u32;
     let chunk_rows = env_usize("V41_MS_CHUNK_ROWS", 256);
     let prefill_share = env_usize("V41_MS_PREFILL_SHARE", 2).max(1); // 1 chunk per this many ticks
-    let arena = match KvArena::alloc(state.dgpu, n_slots, store_rows) {
+    let arena = match KvArena::alloc_ctx(state.dgpu, n_slots, ctx_rows) {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(error = %e, "multistream: arena alloc failed; falling back to the serial loop is not possible here — aborting");
@@ -117,7 +120,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             return;
         }
     };
-    tracing::info!(n_slots, store_rows, chunk_rows, prefill_share, "multistream scheduler ON");
+    tracing::info!(n_slots, ctx_rows, chunk_rows, prefill_share, "multistream scheduler ON");
     let n_jobs = env_usize("V41_MS_PREFILL_JOBS", 2).max(1);
     let mut spare_states = Vec::with_capacity(n_jobs);
     for _ in 0..n_jobs {
@@ -387,24 +390,50 @@ impl Sched {
         if self.prefills.is_empty() { return Ok(()); }
         let i = self.rr % self.prefills.len();
         self.rr = self.rr.wrapping_add(1);
-        let mut pf = self.prefills.remove(i);
+        let pf = self.prefills.remove(i);
         if pf.p.cancel.load(Ordering::Relaxed) || pf.p.tx.is_closed() {
             tracing::info!("multistream: prefill cancelled");
             self.spare_states.push(pf.kv);
             return Ok(());
         }
+        // A failure in ONE job (paging, admission, box 2) fails that request
+        // only; the live streams keep going. The engine-level drain/redial is
+        // still done, since a box-2 fault leaves tickets in flight.
+        let tx = pf.p.tx.clone();
+        match self.prefill_job_tick(state, pf, i) {
+            Ok(()) => Ok(()),
+            Err((kv, e)) => {
+                tracing::error!(error = %e, "multistream: prefill failed; failing that request only");
+                let _ = tx.try_send(WorkerEvent::Error(format!("{e:#}")));
+                if let Some(kv) = kv { self.spare_states.push(kv); }
+                let _ = state.engine.remote_drain_in_flight();
+                let _ = state.engine.remote_reconnect_if_dead();
+                Ok(())
+            }
+        }
+    }
+
+    /// One chunk (or the finish + admit) of `pf`. On error returns the scratch
+    /// state (if still owned) for recycling.
+    fn prefill_job_tick(&mut self, state: &mut WorkerState, mut pf: Prefill, i: usize) -> Result<(), (Option<v4flash_kernels::het::HetModelState>, eyre::Report)> {
         let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, weights, pager, .. } = state;
         let kv = &mut pf.kv;
         if !pf.job.chunks_done() {
             let t = Instant::now();
-            let rows = engine.prefill_job_chunk(&mut pf.job, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, kv, weights, pager.as_mut())?;
+            let rows = match engine.prefill_job_chunk(&mut pf.job, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, kv, weights, pager.as_mut()) {
+                Ok(r) => r,
+                Err(e) => return Err((Some(pf.kv), e)),
+            };
             tracing::debug!(rows, done = pf.job.done_rows(), total = pf.job.total(), ms = t.elapsed().as_millis() as u64, "multistream: prefill chunk");
             if !pf.job.chunks_done() {
-                self.prefills.insert(i, pf);
+                self.prefills.insert(i.min(self.prefills.len()), pf);
                 return Ok(());
             }
         }
-        let logits = engine.prefill_job_finish(&mut pf.job, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, kv, weights, pager.as_mut())?;
+        let logits = match engine.prefill_job_finish(&mut pf.job, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, kv, weights, pager.as_mut()) {
+            Ok(l) => l,
+            Err(e) => return Err((Some(pf.kv), e)),
+        };
         kv.restore_compressor_lending();
         // Snapshot the prompt (the legacy path saves here too, before the marker).
         let tokens_saved: Vec<i32> = pf.prefix.clone();
@@ -418,19 +447,26 @@ impl Sched {
             }
             Err(e) => tracing::error!(error = %e, "multistream: snapshot.save failed"),
         }
-        // Admit.
+        // Admit. `ctx_cap` = what this turn can grow to; the arena carves that
+        // many comp rows per store (first fit). No room => this request fails
+        // with a clear message (the client retries later); nothing else is touched.
         let pos = pf.prefix.len() as u32;
         let ctx_cap = pos + pf.p.req.max_new as u32 + 2;
-        if pos + pf.p.req.max_new as u32 + 2 > state.n_kv_max {
-            let _ = pf.p.tx.try_send(WorkerEvent::Error(format!("prompt {pos} + max_tokens {} exceeds the context {}", pf.p.req.max_new, state.n_kv_max)));
-            self.spare_states.push(pf.kv);
-            return Ok(());
+        if ctx_cap > state.n_kv_max {
+            return Err((Some(pf.kv), eyre!("prompt {pos} + max_tokens {} exceeds the context {}", pf.p.req.max_new, state.n_kv_max)));
         }
-        let slot = self.arena.admit_from_state(&pf.kv, ctx_cap, pos, &state.engine.dgpu.compute)?;
-        state.engine.dgpu.compute.synchronize()?;
+        let slot = match self.arena.admit_from_state(&pf.kv, ctx_cap, pos, &state.engine.dgpu.compute) {
+            Ok(s) => s,
+            Err(e) => return Err((Some(pf.kv), eyre!("no room for a {ctx_cap}-token stream right now ({} live): {e}", self.streams.len()))),
+        };
+        if let Err(e) = state.engine.dgpu.compute.synchronize() { return Err((Some(pf.kv), e)); }
         let Prefill { p: pp, job, kv: kv_done, prefix, compressed, started } = pf;
         self.spare_states.push(kv_done);
         let pf = PrefillDone { p: pp, job, prefix, compressed, started };
+        self.admit_stream(state, pf, slot, logits).map_err(|e| (None, e))
+    }
+
+    fn admit_stream(&mut self, state: &mut WorkerState, pf: PrefillDone, slot: u32, logits: Vec<f32>) -> eyre::Result<()> {
         let top_p = if pf.p.req.top_p.is_finite() && pf.p.req.top_p > 0.0 { pf.p.req.top_p.min(1.0) } else { 1.0 };
         let sample_mode = if pf.p.req.temperature <= 0.0 { SampleMode::Argmax } else {
             SampleMode::Multinomial { temperature: pf.p.req.temperature, min_p_rel: pf.p.req.min_p_rel, top_p }
@@ -465,7 +501,7 @@ impl Sched {
                 }
             }
         }
-        tracing::info!(slot, prompt = pos, restored = pf.prefix.len() - pf.job.total(), prefill_ms = pf.started.elapsed().as_millis() as u64,
+        tracing::info!(slot, prompt = pf.prefix.len(), restored = pf.prefix.len() - pf.job.total(), prefill_ms = pf.started.elapsed().as_millis() as u64,
             live = self.streams.len() + 1, "multistream: stream admitted");
         self.streams.push(s);
         Ok(())

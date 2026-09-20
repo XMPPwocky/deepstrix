@@ -2811,9 +2811,11 @@ impl HeterogeneousEngine {
                 // stream's `n_raw` rows plus the row itself, capped at W, ending
                 // at the row's append slot (absolute row in the layer buffer).
                 let (t, _) = arena.expect("checked");
+                let dec = (layer as usize) >= crate::config::CED_DECODER_START;
+                let (nrp, slp) = if dec { (&t.n_raw_per_dec, &t.slot_per_dec) } else { (&t.n_raw_per, &t.slot_per) };
                 for i in 0..b as usize {
-                    let n_per = (t.n_raw_per[i] as u32 + 1).min(SWA_WINDOW);
-                    let offset = (t.slot_per[i] as u32 + 1).saturating_sub(n_per);
+                    let n_per = (nrp[i] as u32 + 1).min(SWA_WINDOW);
+                    let offset = (slp[i] as u32 + 1).saturating_sub(n_per);
                     n_raw_after.push(n_per);
                     n_raw_offset_after.push(offset);
                 }
@@ -2890,7 +2892,9 @@ impl HeterogeneousEngine {
             // Per-row destination slots in the layer's arena buffer
             // (`KvArena::tables`: `region + raw_off + n_raw`, compaction before
             // the step keeps it inside the stream's region).
-            let need = t.slot_per.iter().map(|&s| s as usize + 1).max().unwrap_or(0) * N_HEAD_DIM as usize;
+            let dec = (layer as usize) >= crate::config::CED_DECODER_START;
+            let slp = if dec { &t.slot_per_dec } else { &t.slot_per };
+            let need = slp.iter().map(|&s| s as usize + 1).max().unwrap_or(0) * N_HEAD_DIM as usize;
             if ls.kv_cache.len() < need {
                 return Err(eyre!(
                     "L{layer}: arena raw append slot past the layer buffer ({} f16 < {need})",
@@ -2904,7 +2908,7 @@ impl HeterogeneousEngine {
                 0,
                 N_HEAD_DIM,
                 b,
-                Some(&d.slot_per),
+                Some(if dec { &d.slot_per_dec } else { &d.slot_per }),
             )?;
         } else {
         let append_at = ls.raw_off + n_raw_before;

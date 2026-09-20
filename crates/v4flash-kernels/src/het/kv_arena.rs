@@ -39,7 +39,7 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{Device, DeviceBuffer, Stream};
 
 use crate::config::{
-    kv_source_of, COMPRESS_RATIOS, KV_SOURCE_LAYERS, NEG_INF, N_HEAD_DIM, N_LAYER, SWA_WINDOW,
+    kv_source_of, CED_DECODER_START, COMPRESS_RATIOS, KV_SOURCE_LAYERS, NEG_INF, N_HEAD_DIM, N_LAYER, SWA_WINDOW,
 };
 use crate::het::state::{CompKvStore, HetCompressorState, HetLayerState, HetModelState, KV_CACHE_ROWS};
 use crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES;
@@ -73,9 +73,16 @@ pub struct CompRegion {
 pub struct StreamKv {
     /// Next token's position (the KV position of the row this stream will run).
     pub pos: u32,
-    /// Live raw window inside the stream's raw region, per `HetLayerState`.
+    /// Live raw window inside the stream's raw region, per `HetLayerState`, for
+    /// the ENCODER layers (`< CED_DECODER_START`).
     pub raw_off: u32,
     pub n_raw: u32,
+    /// Same for the DECODER layers: under CED a prefill replays only the last
+    /// window of the suffix into them, so their window can be shorter than the
+    /// encoder's after a snapshot restore + short suffix. Decode advances both
+    /// in lockstep from there on.
+    pub raw_off_dec: u32,
+    pub n_raw_dec: u32,
     /// One region per KV-source store, in `KV_SOURCE_LAYERS` order.
     pub comp: Vec<CompRegion>,
 }
@@ -149,8 +156,12 @@ pub struct RowTables {
     /// layer.
     pub n_raw_per: Vec<i32>,
     pub n_raw_offset_per: Vec<i32>,
-    /// Raw append destination per row (`window start + n_raw`), every layer.
+    /// Raw append destination per row (`window start + n_raw`), encoder layers.
     pub slot_per: Vec<i32>,
+    /// The decoder layers' (`>= CED_DECODER_START`) window and append slot.
+    pub n_raw_per_dec: Vec<i32>,
+    pub n_raw_offset_per_dec: Vec<i32>,
+    pub slot_per_dec: Vec<i32>,
     /// One entry per KV-source store, `KV_SOURCE_LAYERS` order.
     pub stores: Vec<StoreTables>,
 }
@@ -192,6 +203,7 @@ pub struct StoreTablesDev {
 pub struct RowTablesDev {
     pub rows_cap: u32,
     pub slot_per: DeviceBuffer<i32>,
+    pub slot_per_dec: DeviceBuffer<i32>,
     pub stores: Vec<StoreTablesDev>,
 }
 
@@ -209,7 +221,7 @@ impl RowTablesDev {
                 fire_dst_row: DeviceBuffer::<i32>::new(dgpu.id, n)?,
             });
         }
-        Ok(Self { rows_cap, slot_per: DeviceBuffer::<i32>::new(dgpu.id, n)?, stores })
+        Ok(Self { rows_cap, slot_per: DeviceBuffer::<i32>::new(dgpu.id, n)?, slot_per_dec: DeviceBuffer::<i32>::new(dgpu.id, n)?, stores })
     }
 
     /// Async copies on `stream`, so they FIFO ahead of the step's launches.
@@ -229,6 +241,7 @@ impl RowTablesDev {
             Ok(())
         }
         up(&mut self.slot_per, &t.slot_per, stream)?;
+        up(&mut self.slot_per_dec, &t.slot_per_dec, stream)?;
         for (d, h) in self.stores.iter_mut().zip(&t.stores) {
             up(&mut d.comp_base_per, &h.comp_base_per, stream)?;
             up(&mut d.keys_base_per, &h.keys_base_per, stream)?;
@@ -256,7 +269,18 @@ pub struct KvArena {
 impl KvArena {
     /// `comp_rows_cap`: rows per compressed store shared by all streams (a
     /// stream at context `c` needs `ceil(c / ratio)` rows in each store).
+    /// `alloc` with a CONTEXT budget: every store gets `ctx_rows_budget /
+    /// ratio` rows, so `ctx_rows_budget` positions of context can be live
+    /// across all streams whatever the per-layer ratio.
+    pub fn alloc_ctx(dgpu: Device, n_slots: u32, ctx_rows_budget: u32) -> eyre::Result<Self> {
+        Self::alloc_inner(dgpu, n_slots, |ratio| ctx_rows_budget.div_ceil(ratio).max(1))
+    }
+
     pub fn alloc(dgpu: Device, n_slots: u32, comp_rows_cap: u32) -> eyre::Result<Self> {
+        Self::alloc_inner(dgpu, n_slots, |_| comp_rows_cap)
+    }
+
+    fn alloc_inner(dgpu: Device, n_slots: u32, cap_of: impl Fn(u32) -> u32) -> eyre::Result<Self> {
         if n_slots == 0 {
             return Err(eyre!("kv arena: n_slots must be >= 1"));
         }
@@ -274,6 +298,7 @@ impl KvArena {
                     return Err(eyre!("kv arena: KV-source layer {l} has ratio {ratio} (need 1 or 2)"));
                 }
                 let width = N_HEAD_DIM;
+                let comp_rows_cap = cap_of(ratio);
                 let n_state = (n_slots as usize) * (ratio * width) as usize;
                 let mut state_kv = DeviceBuffer::<f32>::new(dgpu.id, n_state)?;
                 let mut state_score = DeviceBuffer::<f32>::new(dgpu.id, n_state)?;
@@ -307,7 +332,7 @@ impl KvArena {
             };
             layers.push(HetLayerState { kv_cache, n_raw: 0, raw_off: 0, compressor, indexer_compressor: None });
         }
-        let state = HetModelState { layers, n_kv_max: comp_rows_cap };
+        let state = HetModelState { layers, n_kv_max: cap_of(1) };
         Ok(Self { dgpu, n_slots, state, stores, streams: vec![None; n_slots as usize] })
     }
 
@@ -345,7 +370,7 @@ impl KvArena {
             let base = st.free.carve(need[i]).expect("checked above");
             comp.push(CompRegion { base, cap: need[i], n_comp: 0, n_index_comp: 0 });
         }
-        self.streams[slot as usize] = Some(StreamKv { pos: pos0, raw_off: 0, n_raw: 0, comp });
+        self.streams[slot as usize] = Some(StreamKv { pos: pos0, raw_off: 0, n_raw: 0, raw_off_dec: 0, n_raw_dec: 0, comp });
         Ok(slot)
     }
 
@@ -365,13 +390,16 @@ impl KvArena {
         if src.layers.len() != self.state.layers.len() {
             return Err(eyre!("kv arena: source state has {} layers, arena {}", src.layers.len(), self.state.layers.len()));
         }
-        let (n_raw, raw_off) = (src.layers[0].n_raw, src.layers[0].raw_off);
-        if src.layers.iter().any(|l| l.n_raw != n_raw) {
-            return Err(eyre!("kv arena: source state's raw windows are not in lockstep"));
+        let split = CED_DECODER_START.min(src.layers.len());
+        let n_raw = src.layers[0].n_raw;
+        let n_raw_dec = src.layers.get(split).map(|l| l.n_raw).unwrap_or(n_raw);
+        if src.layers[..split].iter().any(|l| l.n_raw != n_raw) || src.layers[split..].iter().any(|l| l.n_raw != n_raw_dec) {
+            return Err(eyre!("kv arena: source state's raw windows are not in lockstep within the encoder/decoder groups"));
         }
-        if n_raw > SWA_WINDOW || pos < n_raw {
-            return Err(eyre!("kv arena: source window {n_raw} rows at pos {pos}"));
+        if n_raw > SWA_WINDOW || pos < n_raw || n_raw_dec > SWA_WINDOW || pos < n_raw_dec {
+            return Err(eyre!("kv arena: source windows {n_raw}/{n_raw_dec} rows at pos {pos}"));
         }
+        let raw_off = src.layers[0].raw_off;
         let slot = self.admit(ctx_cap.max(pos + 1), pos)?;
         let hd = N_HEAD_DIM as usize;
         self.dgpu.set_current()?;
@@ -433,6 +461,8 @@ impl KvArena {
         let s = self.streams[slot as usize].as_mut().expect("just admitted");
         s.n_raw = n_raw;
         s.raw_off = 0;
+        s.n_raw_dec = n_raw_dec;
+        s.raw_off_dec = 0;
         s.comp = comp;
         Ok(slot)
     }
@@ -451,17 +481,18 @@ impl KvArena {
         let hd = N_HEAD_DIM as usize;
         self.dgpu.set_current()?;
         let region = Self::raw_region_base(slot) as usize;
-        for (src, d) in self.state.layers.iter().zip(dst.layers.iter_mut()) {
-            if s.n_raw > 0 {
-                let win = s.n_raw as usize * hd;
+        for (l, (src, d)) in self.state.layers.iter().zip(dst.layers.iter_mut()).enumerate() {
+            let (n_raw, raw_off) = if l < CED_DECODER_START { (s.n_raw, s.raw_off) } else { (s.n_raw_dec, s.raw_off_dec) };
+            if n_raw > 0 {
+                let win = n_raw as usize * hd;
                 if d.kv_cache.len() < win {
                     return Err(eyre!("kv arena: export target raw cache too small"));
                 }
-                let sv = src.kv_cache.slice_view((region + s.raw_off as usize) * hd, win);
+                let sv = src.kv_cache.slice_view((region + raw_off as usize) * hd, win);
                 let mut dv = d.kv_cache.slice_view_mut(0, win);
                 dv.copy_from_buffer_async(&sv, stream)?;
             }
-            d.n_raw = s.n_raw;
+            d.n_raw = n_raw;
             d.raw_off = 0;
         }
         for (si, st) in self.stores.iter().enumerate() {
@@ -535,6 +566,9 @@ impl KvArena {
             t.n_raw_per.push(s.n_raw as i32);
             t.n_raw_offset_per.push((region + s.raw_off) as i32);
             t.slot_per.push((region + s.raw_off + s.n_raw) as i32);
+            t.n_raw_per_dec.push(s.n_raw_dec as i32);
+            t.n_raw_offset_per_dec.push((region + s.raw_off_dec) as i32);
+            t.slot_per_dec.push((region + s.raw_off_dec + s.n_raw_dec) as i32);
             for (si, st) in self.stores.iter().enumerate() {
                 let r = s.comp[si];
                 let ts = &mut t.stores[si];
@@ -563,32 +597,34 @@ impl KvArena {
     /// True when the next append of `slot` would run off its raw region: the
     /// caller must `compact_raw` first (a D2D copy per layer, on `stream`).
     pub fn needs_compaction(&self, slot: u32) -> bool {
-        self.stream(slot).is_some_and(|s| (s.raw_off + s.n_raw) as usize >= KV_CACHE_ROWS)
+        self.stream(slot).is_some_and(|s| {
+            (s.raw_off + s.n_raw) as usize >= KV_CACHE_ROWS || (s.raw_off_dec + s.n_raw_dec) as usize >= KV_CACHE_ROWS
+        })
     }
 
     /// Move `slot`'s live window to the start of its region in every layer, the
     /// same two-hop copy `forward_layer` and `normalize_raw_windows` do, using
     /// `scratch` (>= `SWA_WINDOW * N_HEAD_DIM` f16) as the bounce buffer.
     pub fn compact_raw(&mut self, slot: u32, stream: &Stream, scratch: &mut DeviceBuffer<u16>) -> eyre::Result<()> {
-        let (raw_off, n_raw) = {
+        let (raw_off, n_raw, raw_off_dec, n_raw_dec) = {
             let s = self.stream(slot).ok_or_else(|| eyre!("kv arena: slot {slot} not live"))?;
-            (s.raw_off, s.n_raw)
+            (s.raw_off, s.n_raw, s.raw_off_dec, s.n_raw_dec)
         };
-        if raw_off == 0 || n_raw == 0 {
-            if let Some(s) = self.stream_mut(slot) { s.raw_off = 0; }
-            return Ok(());
-        }
         let hd = N_HEAD_DIM as usize;
-        let win = n_raw as usize * hd;
-        if scratch.len() < win {
-            return Err(eyre!("kv arena: compaction scratch {} < window {}", scratch.len(), win));
-        }
         let region = Self::raw_region_base(slot) as usize * hd;
         self.dgpu.set_current()?;
-        for ls in self.state.layers.iter_mut() {
+        for (l, ls) in self.state.layers.iter_mut().enumerate() {
+            let (off, n) = if l < CED_DECODER_START { (raw_off, n_raw) } else { (raw_off_dec, n_raw_dec) };
+            if off == 0 || n == 0 {
+                continue;
+            }
+            let win = n as usize * hd;
+            if scratch.len() < win {
+                return Err(eyre!("kv arena: compaction scratch {} < window {}", scratch.len(), win));
+            }
             let buf = &mut ls.kv_cache;
             {
-                let src = buf.slice_view(region + raw_off as usize * hd, win);
+                let src = buf.slice_view(region + off as usize * hd, win);
                 let mut sc = scratch.slice_view_mut(0, win);
                 sc.copy_from_buffer_async(&src, stream)?;
             }
@@ -598,7 +634,7 @@ impl KvArena {
                 dst.copy_from_buffer_async(&sc, stream)?;
             }
         }
-        if let Some(s) = self.stream_mut(slot) { s.raw_off = 0; }
+        if let Some(s) = self.stream_mut(slot) { s.raw_off = 0; s.raw_off_dec = 0; }
         Ok(())
     }
 
@@ -612,6 +648,11 @@ impl KvArena {
             s.n_raw += 1;
         } else {
             s.raw_off += 1;
+        }
+        if s.n_raw_dec < SWA_WINDOW {
+            s.n_raw_dec += 1;
+        } else {
+            s.raw_off_dec += 1;
         }
         for (r, ratio) in s.comp.iter_mut().zip(ratios) {
             if (s.pos + 1) % ratio == 0 {
