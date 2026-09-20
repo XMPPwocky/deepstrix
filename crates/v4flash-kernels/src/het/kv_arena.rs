@@ -437,6 +437,74 @@ impl KvArena {
         Ok(slot)
     }
 
+    /// Inverse of `admit_from_state`: copy `slot`'s live KV into a single-sequence
+    /// state (raw windows compacted to `[0, n_raw)`, comp rows / keys /
+    /// accumulators to the store's start) and set its counters, so the existing
+    /// single-state consumers (snapshot save, verify) can read it. `dst` must be
+    /// at rest (compressors on their source layers) and large enough. D2D on
+    /// `stream`; the caller synchronizes.
+    pub fn export_to_state(&self, slot: u32, dst: &mut HetModelState, stream: &Stream) -> eyre::Result<()> {
+        let s = self.stream(slot).ok_or_else(|| eyre!("kv arena: slot {slot} not live"))?.clone();
+        if dst.layers.len() != self.state.layers.len() {
+            return Err(eyre!("kv arena: export target has {} layers, arena {}", dst.layers.len(), self.state.layers.len()));
+        }
+        let hd = N_HEAD_DIM as usize;
+        self.dgpu.set_current()?;
+        let region = Self::raw_region_base(slot) as usize;
+        for (src, d) in self.state.layers.iter().zip(dst.layers.iter_mut()) {
+            if s.n_raw > 0 {
+                let win = s.n_raw as usize * hd;
+                if d.kv_cache.len() < win {
+                    return Err(eyre!("kv arena: export target raw cache too small"));
+                }
+                let sv = src.kv_cache.slice_view((region + s.raw_off as usize) * hd, win);
+                let mut dv = d.kv_cache.slice_view_mut(0, win);
+                dv.copy_from_buffer_async(&sv, stream)?;
+            }
+            d.n_raw = s.n_raw;
+            d.raw_off = 0;
+        }
+        for (si, st) in self.stores.iter().enumerate() {
+            let l = st.layer;
+            let r = s.comp[si];
+            let scs = self.state.layers[l].compressor.as_ref().expect("arena store");
+            let dcs = dst.layers[l].compressor.as_mut().ok_or_else(|| {
+                eyre!("kv arena: export target has no compressor at rest on L{l}")
+            })?;
+            let width = st.width as usize;
+            if r.n_comp > 0 {
+                let sbuf = scs.comp_kv.f16().expect("arena store is f16");
+                let dbuf = dcs.comp_kv.f16_mut().ok_or_else(|| eyre!("kv arena: L{l} export target store is not f16"))?;
+                let n = r.n_comp as usize * width;
+                if dbuf.len() < n {
+                    return Err(eyre!("kv arena: L{l} export target store too small ({} < {n})", dbuf.len()));
+                }
+                let mut dv = dbuf.slice_view_mut(0, n);
+                dv.copy_from_buffer_async(&sbuf.slice_view(r.base as usize * width, n), stream)?;
+            }
+            if r.n_index_comp > 0 {
+                let sk = scs.index_k.as_ref().expect("arena store has keys");
+                let dk = dcs.index_k.as_mut().ok_or_else(|| eyre!("kv arena: L{l} export target has no index keys"))?;
+                let n = r.n_index_comp as usize * E2M1_KEY_ROW_BYTES;
+                let mut dv = dk.slice_view_mut(0, n);
+                dv.copy_from_buffer_async(&sk.slice_view(r.base as usize * E2M1_KEY_ROW_BYTES, n), stream)?;
+            }
+            let block = (st.ratio * st.width) as usize;
+            if dcs.state_kv.len() != block {
+                return Err(eyre!("kv arena: L{l} export target accumulator has {} floats, arena block {block}", dcs.state_kv.len()));
+            }
+            {
+                let mut dv = dcs.state_kv.slice_view_mut(0, block);
+                dv.copy_from_buffer_async(&scs.state_kv.slice_view(slot as usize * block, block), stream)?;
+                let mut dv = dcs.state_score.slice_view_mut(0, block);
+                dv.copy_from_buffer_async(&scs.state_score.slice_view(slot as usize * block, block), stream)?;
+            }
+            dcs.n_comp = r.n_comp;
+            dcs.n_index_comp = r.n_index_comp;
+        }
+        Ok(())
+    }
+
     pub fn release(&mut self, slot: u32) -> eyre::Result<()> {
         let s = self.streams.get_mut(slot as usize).and_then(|s| s.take())
             .ok_or_else(|| eyre!("kv arena: slot {slot} not live"))?;

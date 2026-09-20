@@ -265,6 +265,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     // 1. Prefill each prompt on its own state; admit into both arenas.
     let mut states: Vec<HetModelState> = Vec::new();
     let mut first_tok: Vec<i32> = Vec::new();
+    let mut prefill_logits: Vec<Vec<f32>> = Vec::new();
     let mut slots_alone: Vec<u32> = Vec::new();
     let mut slots_batch: Vec<u32> = Vec::new();
     for (s, toks) in prompts.iter().enumerate() {
@@ -284,25 +285,45 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         slots_batch.push(arena_batch.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
         engine.dgpu.compute.synchronize()?;
         first_tok.push(if s == 0 { forced.as_ref().map(|f| *f.last().unwrap()) } else { None }.unwrap_or(argmax(&logits) as i32));
+        prefill_logits.push(logits);
         states.push(st);
     }
     // MS_DIAG=kv: prefill each prompt a SECOND time and compare the two states'
     // KV bit for bit (raw windows per layer, comp rows / keys / accumulators per
     // store). Says whether two prefills of one prompt even agree before any
     // decode-vs-prefill question is asked.
-    if std::env::var("MS_DIAG").as_deref() == Ok("kv") {
+    // MS_DIAG=job[:rows]: the second prefill runs through `PrefillJob` (chunk by
+    // chunk, `rows` per chunk, default 3) — must be bit-identical to the one-shot
+    // `forward_prefill_pipelined` in KV and in the last logits.
+    let diag = std::env::var("MS_DIAG").unwrap_or_default();
+    let job_rows: Option<usize> = diag.strip_prefix("job").map(|r| r.trim_start_matches(':').parse().unwrap_or(3));
+    if diag == "kv" || job_rows.is_some() {
         let hd = v4flash_kernels::config::N_HEAD_DIM as usize;
         for (s, toks) in prompts.iter().enumerate() {
             let mut st2 = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
             let hcs: Vec<Vec<f32>> = toks.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
             let rows = engram.rows_for_prompt(pg.raw(), toks)?;
-            let l2 = engine.forward_prefill_pipelined(
-                &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st2, &weights,
-                &hcs, toks, 0, true, None, None, None, None, Some(&mut pg), Some(&rows),
-            )?;
+            let l2 = if let Some(cr) = job_rows {
+                let mut job = v4flash_kernels::het::forward_prefill::PrefillJob::new(toks.clone(), hcs.clone(), Some(rows.clone()), None, 0, cr)?;
+                let mut n_chunks = 0;
+                while !job.chunks_done() {
+                    engine.prefill_job_chunk(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st2, &weights, Some(&mut pg))?;
+                    n_chunks += 1;
+                }
+                let l = engine.prefill_job_finish(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st2, &weights, Some(&mut pg))?;
+                eprintln!("stream {s}: PrefillJob ran {n_chunks} chunks of <= {cr} rows");
+                l
+            } else {
+                engine.forward_prefill_pipelined(
+                    &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st2, &weights,
+                    &hcs, toks, 0, true, None, None, None, None, Some(&mut pg), Some(&rows),
+                )?
+            };
             st2.restore_compressor_lending();
             engine.dgpu.compute.synchronize()?;
-            eprintln!("stream {s}: second prefill argmax {} (first {}); per-layer raw-window compare:", argmax(&l2), first_tok[s]);
+            let first_logits = &prefill_logits[s];
+            let dl = max_abs_diff(first_logits, &l2);
+            eprintln!("stream {s}: second prefill argmax {} (first {}); |logits diff| max {dl:.3e}; KL(first||second) {:.5}; per-layer raw-window compare:", argmax(&l2), argmax(first_logits), kld(first_logits, &l2));
             let a = &states[s];
             for l in 0..v4flash_kernels::config::N_LAYER as usize {
                 let (la, lb) = (&a.layers[l], &st2.layers[l]);

@@ -55,7 +55,7 @@ pub struct EngramCtx {
 impl EngramCtx {
     /// Append `token` and gather its Engram rows, one `Vec<f32>` per Engram layer
     /// in `ENGRAM_LAYERS` order. `pos` must be the token's KV position.
-    fn rows_for(
+    pub(crate) fn rows_for(
         &mut self,
         src: &v4flash_core::SafetensorsDir,
         token: i32,
@@ -1626,6 +1626,10 @@ mod tests {
 }
 
 fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
+    #[cfg(feature = "v41")]
+    if crate::multistream::enabled() {
+        return crate::multistream::worker_loop_ms(state, rx);
+    }
     while let Some(msg) = rx.blocking_recv() {
         match msg {
             EngineRequest::Generate {
@@ -1885,7 +1889,7 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
     let _ = state.engine.shutdown();
 }
 
-fn short_hex(bytes: &[u8]) -> String {
+pub(crate) fn short_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push_str(&format!("{b:02x}"));
@@ -1941,7 +1945,7 @@ fn probe_fingerprint(state: &WorkerState) -> eyre::Result<Vec<(String, u64)>> {
     Ok(out)
 }
 
-fn state_fingerprint(state: &WorkerState) -> String {
+pub(crate) fn state_fingerprint(state: &WorkerState) -> String {
     let (live_h, live_pos, live_toks) = match &state.live {
         Some(l) => {
             let bytes: Vec<u8> = l.tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
@@ -1991,7 +1995,7 @@ fn deepstrix_server_placement_path(snapshot_root: &std::path::Path) -> std::path
 /// M62: harvest the engine's device-side expert-selection banks into the
 /// on-disk aggregate. Cheap (2 × 88 KB readback) and skipped when nothing
 /// accumulated. Called from the same points that save snapshots.
-fn flush_expert_stats(state: &mut WorkerState) {
+pub(crate) fn flush_expert_stats(state: &mut WorkerState) {
     let ((pc, pt), (dc, dt)) = match state.engine.harvest_sel_stats() {
         Ok(h) => h,
         Err(e) => {
@@ -2092,7 +2096,7 @@ fn flush_expert_stats(state: &mut WorkerState) {
 /// If the live session has uncommitted state, persist it to disk and
 /// clear its dirty flag. Called before any operation that would evict
 /// the live state (conversation switch, shutdown).
-fn save_live_if_dirty(state: &mut WorkerState) {
+pub(crate) fn save_live_if_dirty(state: &mut WorkerState) {
     flush_expert_stats(state);
     let Some(live) = &state.live else { return };
     if !live.dirty {
@@ -2138,7 +2142,7 @@ fn save_live_if_dirty(state: &mut WorkerState) {
     }
 }
 
-fn handle_generate_stream(
+pub(crate) fn handle_generate_stream(
     state: &mut WorkerState,
     mut req: GenerateReq,
     session_id: Option<String>,
@@ -5549,11 +5553,11 @@ mod dspark_stats {
     }
 }
 
-fn reset_drafter_ring(state: &mut WorkerState) {
+pub(crate) fn reset_drafter_ring(state: &mut WorkerState) {
     if let Some(m) = state.mtp.as_mut() {
         m.state.reset_ring();
     }
 }
 
 #[cfg(not(feature = "v41"))]
-fn reset_drafter_ring(_state: &mut WorkerState) {}
+pub(crate) fn reset_drafter_ring(_state: &mut WorkerState) {}
