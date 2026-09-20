@@ -46,9 +46,19 @@ Repro (server down, ~90 s each; see the harness header for the env):
 0.013) vs `MS_STEPS=3` (bad, 1.196) vs `MS_STEPS=3 MS_FRESH_PAGER=1` (bad, 2.169).
 Dumps: `DEEPSTRIX_DUMP_SUBTENSOR_LAYERS=0,1 DEEPSTRIX_DUMP_SUBTENSOR_DIR=...`
 (pf_ tags carry the row's real position; `pf_ffn_routed_p<pos>` is routed-only).
-Next: dump the iGPU side of the MoE (group_count / work items / expert_members /
-per-expert partials) in both histories — the dGPU inputs are identical, so the
-divergence is inside the iGPU by-expert chain's bookkeeping or the slot map it reads.
+Static pass (2026-09-20, after the window): with no box 2 attached nothing in the
+pick loop can leave a pick out of `ids` (every exclusion is gated on
+`remote_split_on` / `owns_remote`), `ensure` resets `remap` to identity slots and
+writes `-(slot)-1` for hits AND misses, the builder's bound is the pool size under
+the unified pool, and every expert-offset in the MXFP4 kernels is 64-bit. So the
+mechanism is not visible from the code; the bad routed output has ~1/6 of the
+magnitude, i.e. most picks are DROPPED or land on empty groups, not computed wrong.
+Probe for the next window (compiled, off by default): `V41_GROUP_AUDIT=1
+V41_GROUP_AUDIT_VERBOSE=1` prints per layer the groups the builder filled
+(`slot:count`), enqueued vs expected, and for row 0's six picks `id / remap /
+pager slot_of / FNV of the slot's first 64 KB of gate bytes`. Run it in the good
+(`MS_STEPS=1`) and bad (`MS_STEPS=3`, `MS_FRESH_PAGER=1`) histories with
+`DEEPSTRIX_DUMP_SUBTENSOR_LAYERS=0`; the first line that differs is the bug.
 
 **Why it matters:** the arena is the multi-stream decode step; G5b cannot pass
 until this is closed. It very likely also bites PRODUCTION prefill after decode

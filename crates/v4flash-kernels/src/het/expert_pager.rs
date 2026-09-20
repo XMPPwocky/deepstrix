@@ -2583,6 +2583,11 @@ impl ExpertPager {
         self.slot_of.contains_key(&(layer, e))
     }
 
+    /// Pool slot of `(layer, e)` if resident (diagnostics).
+    pub fn resident_slot(&self, layer: i32, e: u32) -> Option<u32> {
+        self.slot_of.get(&(layer, e)).copied()
+    }
+
     /// Unused slots in the decode LRU region.
     ///
     /// T2-catch-all uses this as a one-time WARM-UP budget: while the hub's pool

@@ -5932,6 +5932,32 @@ impl HeterogeneousEngine {
                             "GROUP_AUDIT: het-split builder dropped local picks"
                         );
                     }
+                    // `V41_GROUP_AUDIT_VERBOSE=1` (multi-stream harness, KNOWN_BUGS #20):
+                    // print, on stderr (no tracing subscriber in tests), the groups the
+                    // builder filled and, for row 0's picks, id / remap / pager slot /
+                    // a checksum of the slot's gate bytes — the per-history diff of the
+                    // batched MoE's bookkeeping.
+                    if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") {
+                        let groups: Vec<(usize, i32)> = gc.iter().enumerate().filter(|(_, &c)| c != 0).map(|(g, &c)| (g, c)).collect();
+                        eprintln!("[group-audit] L{layer} b={b} enqueued={enqueued} expected={expected} bound={moe_group_bound} max_per_expert={max_per_expert} groups(slot:count)={groups:?}");
+                        if let Some(pg) = pager.as_deref() {
+                            let gbpe = pg.routed.gate_bytes_per_expert;
+                            let probe = gbpe.min(65536);
+                            let mut bytes = vec![0u8; probe];
+                            for (k, &e) in sel_host_audit.iter().take(cs_n_used).enumerate() {
+                                if !(0..N_EXPERT as i32).contains(&e) { continue; }
+                                let slot = pg.resident_slot(layer as i32, e as u32);
+                                let sum = match slot {
+                                    Some(sl) if (sl as usize + 1) * gbpe <= pg.routed.gate.buffer.len() => {
+                                        pg.routed.gate.buffer.slice_view(sl as usize * gbpe, probe).copy_to_host(&mut bytes)?;
+                                        bytes.iter().fold(0u64, |a, &x| a.wrapping_mul(1099511628211).wrapping_add(x as u64))
+                                    }
+                                    _ => 0,
+                                };
+                                eprintln!("[group-audit]   pick{k}: id={e} remap={} slot_of={slot:?} gate_fnv={sum:#x}", remap_host[e as usize]);
+                            }
+                        }
+                    }
                 }
             } else {
                 // Emits RAW expert ids as group ids — incompatible with a
