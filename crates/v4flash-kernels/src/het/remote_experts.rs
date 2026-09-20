@@ -1510,12 +1510,14 @@ pub fn b2_decode_down() -> bool {
     *B
 }
 
-/// `V41_B2_MISS_PAR=N`: missing experts of one layer read concurrently (default 4;
+/// `V41_B2_MISS_PAR=N`: missing experts of one layer read concurrently (default 1: MEASURED
+/// 2026-09-20 no gain at 4 -- each expert read is already 8 preads wide and the drive is at its
+/// ceiling; per-thread pread doubled instead. Kept for a faster drive.
 /// the drive's aggregate random-read peak, see `ensure_layer_inner`). 1 = the
 /// old serial loop.
 pub fn b2_miss_par() -> usize {
     static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("V41_B2_MISS_PAR").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
+        std::env::var("V41_B2_MISS_PAR").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
     });
     (*N).clamp(1, 16)
 }
