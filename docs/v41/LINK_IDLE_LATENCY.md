@@ -269,3 +269,32 @@ of the partial last skb, qdisc fq_codel quantum 65546). Root-level test, not yet
 `tcp_tso_win_divisor`), then the same bench. Until that is settled, every multi-row
 decode design (MULTISTREAM_DECODE_PLAN.md M1a) has to assume ~0.65-2 ms per call
 above one segment, i.e. f32 at >= 4 rows and f16 at >= 8.
+
+### RESOLVED 2026-09-21: two stacked effects, both fixed
+
+`ethtool -K thunderbolt0 tso off gso off` on the SENDER (box 2) and the same bench:
+
+    rows   reply KB   link us: TSO on / busy 3000   TSO off / busy 3000   TSO off / busy 20   TSO off / busy 20 + quickack
+      1      20.6            62                        68                   206                 203
+      2      41.0           213                        88                   347                 353
+      4      82.0          1992                      2135                   364                 368
+      8     163.9          1897                      2073                   404                 396
+     16     327.8          1712                      1908                   503                 494
+     32     655.4          1122                      3831                   781                 778
+     64    1310.8          2209                      4622                  1797                1766
+
+1. The **sender's TSO/GSO** defers the partial second segment by ~1 ms at any
+   receiver window (the 1075-1272 us column of the previous section). Off, the
+   link at a 20 us window is bytes-shaped: ~200 us fixed + bytes / ~1.1 GB/s.
+2. The **receiver's busy-poll window** holds a multi-segment reply for about the
+   window (2.1 ms at 3000 even with TSO off; 0.36 ms at 20): the spinning reader
+   defers the softirq that delivers the later segments. Single-segment replies
+   still want the big window (B=1: 68 us at 3000 vs 206 at 20).
+
+So: TSO/GSO off on both boxes (`scripts/apply_host_tuning.sh`; requests over one
+segment go hub -> box 2 too), decode keeps 3000 us, and the batch phase
+(`V41_BATCH_BUSY_POLL_US`) now defaults to 50 us. Quick-ACK adds nothing once TSO
+is off. Persisting the ethtool setting needs the flake (systemd-networkd
+`[Link] TCPSegmentationOffload=no GenericSegmentationOffload=no` for thunderbolt0).
+For the multi-stream plan this puts the per-call link at 0.4-0.8 ms for 8-32 rows
+f32, i.e. the model's 19-34 ms/step link term, not the 80+ ms the hold implied.

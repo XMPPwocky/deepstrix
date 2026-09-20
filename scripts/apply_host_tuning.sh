@@ -51,6 +51,17 @@ apply_host() {                     # runs on EACH box; hostname decides the CCX
   #    (HetEngine::remote_set_phase_busy_poll); the daemon stays at 500.
   $S sysctl -q -w net.core.busy_read=5000 net.core.busy_poll=5000
   echo "  sysctl busy_read=$(sysctl -n net.core.busy_read) busy_poll=$(sysctl -n net.core.busy_poll)"
+  # 2026-09-21: the SENDER's TSO/GSO defers the second segment of any link reply
+  # over one 65,520-B MTU by ~1 ms on thunderbolt-net (docs/v41/LINK_IDLE_LATENCY.md);
+  # off on both boxes (requests over one segment go hub -> box 2). ethtool is not in
+  # the system profile; this store path was copied to box 2 with `nix copy`.
+  ET=/nix/store/d8dzlcfskzpk8wxlypj8h1lj8mwisxdd-ethtool-7.1/bin/ethtool
+  if [ -x "$ET" ]; then
+    $S "$ET" -K thunderbolt0 tso off gso off 2>/dev/null || echo "  ethtool tso/gso off FAILED on $(hostname)"
+    echo "  thunderbolt0 $("$ET" -k thunderbolt0 | grep -E '^tcp-segmentation-offload|^generic-segmentation-offload' | tr '\n' ' ')"
+  else
+    echo "  $ET missing on $(hostname): nix copy --to ssh://<box> $(dirname "$(dirname "$ET")")"
+  fi
   # 5. box 2 only: keep the expert daemon on the NHI CCX (its reader<->compute
   #    handoff then never crosses an L3; ~-0.8 ms/token). The restart script
   #    launches it pinned; this re-pins a running one after a host-tuning re-run.

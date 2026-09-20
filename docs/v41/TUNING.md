@@ -105,3 +105,6 @@ Method note: an earlier pass dismissed the page-cache hypothesis using a slope
 measured at pool 52 (32 GB of cache) and applied it to pool 76 (9 GB). That does
 not follow — the hypothesis is *about* the smaller cache. Measure the hypothesis
 in the regime it describes.
+
+| 2026-09-21 | `ethtool -K thunderbolt0 tso off gso off` (both boxes; ethtool from the nix store path in apply_host_tuning.sh) | removes the ~1 ms sender-side hold on every link reply over one 65,520-B segment (f32 >= 4 rows, f16 >= 8, every prefill/verify chunk); non-persistent | LINK_IDLE_LATENCY.md 2026-09-21 |
+| 2026-09-21 | `V41_BATCH_BUSY_POLL_US` default 500 -> 50 | the receiver-side hold on multi-segment replies scales with the window (2.1 ms at 3000, 0.36 at 20); decode stays at 3000 | same |

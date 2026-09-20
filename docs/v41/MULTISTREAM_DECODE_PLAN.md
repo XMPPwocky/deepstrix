@@ -526,8 +526,10 @@ cache-defeated: sets `bw_moe` and the 20 us/row term for box 1. (c) DONE 2026-09
 against a second 3-expert daemon on :7432 (no downtime; the production daemon serves
 one connection): any reply over one 65,520-B segment costs ~1.1-1.3 ms of link at
 every busy-poll window, ~0.65 ms with TCP_QUICKACK; not autocorking, not a receiver
-delayed ACK (kernel counters); the sender's segmentation path is the suspect, root
-test `ethtool -K thunderbolt0 tso off gso off` on box 2 pending (LINK_IDLE_LATENCY.md).
+delayed ACK (kernel counters); RESOLVED the same day: `ethtool -K thunderbolt0 tso off gso
+off` on the sender removes the ~1 ms deferral, and the rest scales with the
+receiver's busy-poll window (batch phase now 50 us): link 364/404/503/781 us at
+4/8/16/32 rows f32 — the model's link term holds (LINK_IDLE_LATENCY.md).
 (D1) DONE: the Engram gather is disk-latency-bound (1.7 ms per 24 cold rows on the
 loaded drive), a persistent pool changed nothing; the lever is the row cache or the
 plaintext drive, and under batching the gather overlaps other rows' work. (d) fio, 6.3 MB reads,

@@ -510,13 +510,21 @@ impl HeterogeneousEngine {
     /// unprivileged process (`scripts/link_latency_step.sh 4s on` raises it);
     /// refusal is logged once and the socket keeps its previous window.
     /// `V41_DECODE_BUSY_POLL_US` / `V41_BATCH_BUSY_POLL_US` override the
-    /// defaults (3000 / 500); `V41_DECODE_BUSY_POLL_US=0` disables the switch.
+    /// defaults (3000 / 50); `V41_DECODE_BUSY_POLL_US=0` disables the switch.
+    ///
+    /// 2026-09-21: the multi-segment hold is TWO effects. The sender's TSO/GSO
+    /// deferral (~1 ms per reply over one segment at ANY window) is removed by
+    /// `ethtool -K thunderbolt0 tso off gso off` on the sending box
+    /// (scripts/apply_host_tuning.sh); what remains scales with the RECEIVER's
+    /// window (2.1 ms at 3000, 0.36 ms at 20 for an 82 KB reply), so the batch
+    /// phase now defaults to 50 us: measured link 364/404/503/781 us at 4/8/16/32
+    /// rows f32 with TSO off + window 20, against 1075-1272 before.
     pub fn remote_set_phase_busy_poll(&self, decode: bool) {
         static DECODE_US: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
             std::env::var("V41_DECODE_BUSY_POLL_US").ok().and_then(|v| v.parse().ok()).unwrap_or(3000)
         });
         static BATCH_US: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-            std::env::var("V41_BATCH_BUSY_POLL_US").ok().and_then(|v| v.parse().ok()).unwrap_or(500)
+            std::env::var("V41_BATCH_BUSY_POLL_US").ok().and_then(|v| v.parse().ok()).unwrap_or(50)
         });
         if *DECODE_US == 0 {
             return;
