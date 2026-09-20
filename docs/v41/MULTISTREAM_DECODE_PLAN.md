@@ -423,6 +423,36 @@ the server down — the first harness run rides the M0 window.
   and the arena-vs-decode KL floor (G5b). No remote (box 2) in the harness: all
   experts through the local pager.
 
+**FIRST WINDOW 2026-09-20 (server down 3.5 h; commits 7a5f9ce, 08c6222).**
+
+* **G5a PASSES at S <= 4**: alone vs co-batched bit-identical at every (stream,
+  step) in every configuration (Paris + 5/40/131/260-token synthetic prompts, 6
+  steps). The by-expert MoE chain IS batch-invariant — 3.6's fallback is not needed.
+  At S=8/16 with a 1500-token stream present the indexer fires for the batch and the
+  gathered top-K path changes the attention reduction order for every row: alone vs
+  batch then differ at the LSB (not bit-exact). G5a at that scale needs a KL-level
+  self-invariance metric, not bit equality (harness change pending).
+* **G5b: the arena reproduces today's decode at 0.013 nats** (Paris, " Paris")
+  when it is the first batched step after one decode token — and is 1.2-2.2 nats
+  off after any longer engine history. Root cause open, bisected to the batched
+  driver's local MoE output with bit-identical inputs: KNOWN_BUGS #20. Every
+  hypothesis tried is listed there. The contiguous verify path has the same class
+  of problem in every history (1.14 nats). Until #20 is closed the harness cannot
+  pass G5b, and the plan's M1a gate stays open.
+* **Decode itself is 0.9-1.2 nats from the CPU oracle** on Paris (KNOWN_BUGS #21,
+  pre-existing). The plan's fidelity bar ("decode-vs-oracle 7.x nats" in 3.6) was
+  taken from a wrong number and must be restated once #21 is understood.
+* **Step time, all experts LOCAL (40 GB pool, no box 2, synthetic prompts,
+  including the head):** S=4 108-127 ms, S=8 172-186 ms, S=16 231-251 ms, i.e.
+  ~35 / 44 / 65 tok/s aggregate. Not comparable to the model's A-scenario numbers
+  (which include box 2's leg and the link); a first data point only.
+* Harness reads: the two-prefill KV comparison is bit-identical (prefill is
+  deterministic); `forward_prefill_pipelined(last_only=true)` on a continuation
+  turns CED on and wipes the decoder layers' window (the reference must pass
+  `false`, as the verify does); box 1's NVMe (dm-crypt btrfs) reads 6.3 MB
+  O_DIRECT at 3.6 GB/s QD1 (1.7 ms) rising to 4.6 GB/s at QD4-8 — better than the
+  2.4 GB/s the model assumed; box 2's fio half did not run (ssh from box 1).
+
 ### 3.5 Graphs
 
 Capture per (layer segment, bucket) once the row table carries every per-token

@@ -10,6 +10,69 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Open
 
+### 20. OPEN — the batched layer driver's LOCAL MoE output depends on prior pager/decode history (found 2026-09-20)
+
+Found by the multi-stream harness (`tests/multistream_step.rs`, run with the server
+DOWN). On the 6-token Paris prompt, one K=1 arena step (`forward_step_arena`,
+`RowLayout::Arena`) after the prefill matches today's decode at **0.013 nats** and
+predicts " Paris" — but only when exactly ONE decode token ran on the engine before
+it. After three decode tokens (or a second stream's prefill) the SAME step on the
+SAME KV copy is 1.2-2.2 nats off and predicts token 8760. Bisected by per-stage dumps
+of the step in both histories: layer 0's residual, mHC collapse, Q, attention output,
+expert selection and expert weights are BIT-IDENTICAL, and the routed-MoE output
+(`ffn_moe_recv` before the shared add, new `pf_ffn_routed` dump) differs — the bad
+one has ~30% of the magnitude and correlation 0.47 with the good one (the good one
+matches decode's own routed output to 1.2%). Same experts, same inputs, wrong sum.
+
+Ruled out, each by a harness arm: pager pool state (fresh `ExpertPager` before the
+step: still wrong, DIFFERENT value 2.169 vs 1.196 — so the output IS a function of
+pool state, but a cold pool is wrong too), pager pool size (20/40/60 GB identical),
+`V41_T2_CATCHALL`/`T2_PARTITION`/`REMOTE_SPLIT` off (identical), unified prefill
+pool off, `SpeculativeAppend` scope, decode HIP graphs off (`V41_PAGER_NOGRAPH`),
+a SECOND `HeterogeneousEngine` instance for the decode tokens (identical), full
+device syncs after decode, and full device syncs after `pg.ensure` before the MoE
+dispatch (`V41_PAGER_SYNC_AFTER_ENSURE=1`, identical). The miss path is synchronous
+(`repack_in_place` drains its stream; `copy_from_host` blocks). Everything is
+deterministic run to run (bit-identical dumps).
+
+The contiguous one-row continuation (`forward_prefill_pipelined` at `pos0 > 0`,
+`last_only=false`, the DSpark verify's call) is off by **1.14 nats** on the same
+prompt even with one prior decode token — so it has this or a related problem in
+every history; the 0.0066-nat verify measurement of 2026-09-16 does not reproduce
+in the harness. `V41_VERIFY_DECODE_MOE=1` does not fix either path.
+
+Repro (server down, ~90 s each; see the harness header for the env):
+`MS_STREAMS=1 MS_PROMPT_IDS=0,671,6102,294,8760,344 MS_SKIP_PF1=1 MS_STEPS=1` (good,
+0.013) vs `MS_STEPS=3` (bad, 1.196) vs `MS_STEPS=3 MS_FRESH_PAGER=1` (bad, 2.169).
+Dumps: `DEEPSTRIX_DUMP_SUBTENSOR_LAYERS=0,1 DEEPSTRIX_DUMP_SUBTENSOR_DIR=...`
+(pf_ tags carry the row's real position; `pf_ffn_routed_p<pos>` is routed-only).
+Next: dump the iGPU side of the MoE (group_count / work items / expert_members /
+per-expert partials) in both histories — the dGPU inputs are identical, so the
+divergence is inside the iGPU by-expert chain's bookkeeping or the slot map it reads.
+
+**Why it matters:** the arena is the multi-stream decode step; G5b cannot pass
+until this is closed. It very likely also bites PRODUCTION prefill after decode
+(a second turn's prefill runs this same driver after decode tokens).
+
+### 21. OPEN — decode is 0.9-1.2 nats from the CPU oracle on the Paris prompt (found 2026-09-20, pre-existing)
+
+`scripts/v41_oracle` (DeepSeek's unmodified model.py, layer-streamed on CPU) on
+`[0,671,6102,294,8760,344]`: top-1 " Paris" 23.77, then " a" 21.28. The engine's
+DECODE path after a 5-token batched prefill: top-1 " Paris" too, but **KL(oracle||
+dec) = 1.24 nats, max |logit diff| 16.0**, top-5 `[Paris, 'Ġ', 16, ' a', 680]`.
+Decode-only (2-token prefill `[0,671]`, then 6102/294/8760/344 teacher-forced
+through decode): **0.88 nats**, max |d| 14.0, and the per-position argmax matches
+the oracle at 3 of 4 positions (pos 4: engine 734 vs oracle 344 " is"). On a random
+33-token prompt: 1.8 nats, argmax differs. This was never measured as a KL before;
+the 2026-09-12 `compare_t200_q8_floor` record already showed a DIFFERENT top-1 on a
+200-token real prompt and per-position deep-layer relative errors of 0.1-0.9, filed
+as the "Q8 floor". Q8_0 dense projections + f16 KV + f32-vs-bf16 residual do not
+plausibly cost a nat; something is structurally off vs the reference. Not caused by
+the multi-stream work (the arena reproduces decode to 0.013 nats when it works).
+Repro: oracle `--prompt-ids 0,671,6102,294,8760,344 --dump-argmax`, harness
+`MS_PROMPT_IDS=0,671,6102 MS_FORCE_CONT=6102,294,8760,344 MS_SAVE_LOGITS=DIR`, then
+compare `s0_t3_dec.bin` with `logits_last.pt` (scratch `cmp_oracle2.py`).
+
 ### `deepstrix-expert-bench --check-layer` MISMATCHES at B=4 (decode branch) — **OPEN**, found 2026-09-19
 `--check-layer 0 --check-n 3` against a 3-expert daemon: B=1 and B=64 are
 BIT-IDENTICAL to the local shard, **B=4 differs in 16,769/20,480 f32 values (19 in
