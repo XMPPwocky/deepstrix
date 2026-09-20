@@ -733,12 +733,14 @@ impl Sched {
             if acc.steps >= every {
                 let mut v: Vec<_> = acc.stages.iter().map(|(&(d, n), &(ms, c))| (d, n, ms / acc.steps as f64, c)).collect();
                 v.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-                let dgpu_busy: f64 = v.iter().filter(|e| e.0 == "dgpu").map(|e| e.2).sum();
-                let igpu_busy: f64 = v.iter().filter(|e| e.0 == "igpu").map(|e| e.2).sum();
+                // Parent stages only ("dgpu.*" / "igpu.*"): the "k.*" kernel
+                // sub-stages nest inside them and would double count.
+                let dgpu_busy: f64 = v.iter().filter(|e| e.0 == "dgpu" && e.1.starts_with("dgpu.")).map(|e| e.2).sum();
+                let igpu_busy: f64 = v.iter().filter(|e| e.0 == "igpu" && e.1.starts_with("igpu.")).map(|e| e.2).sum();
                 tracing::info!(steps = acc.steps, rows_avg = format!("{:.1}", acc.rows as f64 / acc.steps as f64),
                     wall_ms = format!("{:.1}", acc.wall_ms / acc.steps as f64), dgpu_busy_ms = format!("{dgpu_busy:.1}"),
                     igpu_busy_ms = format!("{igpu_busy:.1}"), "ms.stage.total (per step)");
-                for (d, n, ms, c) in v.iter().take(40) {
+                for (d, n, ms, c) in v.iter().take(96) {
                     tracing::info!(device = *d, stage = *n, ms_per_step = format!("{ms:.2}"), calls = *c, "ms.stage");
                 }
                 acc.stages.clear();

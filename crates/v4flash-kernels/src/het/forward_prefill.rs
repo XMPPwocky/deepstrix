@@ -2430,7 +2430,11 @@ impl HeterogeneousEngine {
                 // took qb from 8.8 to 1.4 ms on exactly this class of shape:
                 // one pass over the weight per (BM=64 x BN=64) tile.
                 // Rollback: V41_ENGRAM_GEMV=1.
-                if engram_gemv_fallback() {
+                // At n <= 8 rows (multi-stream decode steps) the B-packed
+                // GEMV reads the 167 MB once for all rows and runs at the
+                // dGPU's bandwidth; the LDS-tiled WMMA GEMM at 1-3 rows costs
+                // ~1 ms per Engram layer (dgpu.engram 2.15 ms/step, 2 layers).
+                if engram_gemv_fallback() || super::dispatch::small_b_dense_dp4a(n as u32) {
                     de.q8.matvec_batched(&de.compute, &mut kv, &eg.wkv.buffer, &xq, &xs, ENGRAM_OUT, ENGRAM_IN, n as u32)?;
                 } else {
                     de.q8_wmma.gemm_lds_tiled(&de.compute, &mut kv, &eg.wkv.buffer, &xq, &xs, ENGRAM_OUT, ENGRAM_IN, n as u32)?;
