@@ -6957,6 +6957,9 @@ impl HeterogeneousEngine {
                 &super::trace::phase::REMOTE_RTT_NS,
                 (t_wait_end - t_wait) as u64,
             );
+            super::trace::phase::add(&super::trace::phase::REMOTE_PAGE_NS, partial.t_remote_page_us as u64 * 1000);
+            super::trace::phase::add(&super::trace::phase::REMOTE_COMPUTE_NS, partial.t_remote_compute_us as u64 * 1000);
+            super::trace::phase::add(&super::trace::phase::REMOTE_MISSES, partial.n_remote_miss as u64);
             if layer_host_timing() {
                 LH_REMOTE_WAIT.fetch_add((t_wait_end - t_wait) as u64 / 1000, std::sync::atomic::Ordering::Relaxed);
             }

@@ -310,6 +310,11 @@ pub mod phase {
     /// else" (wire, wake-up, protocol). Without the split, `remote_rtt_us`
     /// only says box 1 waited, not what it waited ON.
     pub static REMOTE_SRV_NS: AtomicU64 = AtomicU64::new(0);
+    /// Box 2's own accounting from each reply: page (disk) time, compute
+    /// time and miss count, summed over the layers of one step.
+    pub static REMOTE_PAGE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static REMOTE_COMPUTE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static REMOTE_MISSES: AtomicU64 = AtomicU64::new(0);
 
     /// Host phases OUTSIDE `forward_token_impl`'s `token_start..sync` bracket
     /// but ON the decode loop's critical path (engine_worker.rs
@@ -336,6 +341,9 @@ pub mod phase {
         ENGRAM_STAGE_NS.store(0, Relaxed);
         REMOTE_RTT_NS.store(0, Relaxed);
         REMOTE_SRV_NS.store(0, Relaxed);
+        REMOTE_PAGE_NS.store(0, Relaxed);
+        REMOTE_COMPUTE_NS.store(0, Relaxed);
+        REMOTE_MISSES.store(0, Relaxed);
     }
     pub fn add(c: &AtomicU64, ns: u64) {
         c.fetch_add(ns, Relaxed);

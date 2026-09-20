@@ -182,6 +182,7 @@ enum Phase { Decode, Prefill }
 
 #[derive(Default)]
 struct ProfileAcc {
+    pf_last: (u64, u64, u64, u64),
     last_misses: u64,
     last_read_ns: u64,
     steps: u64,
@@ -689,6 +690,9 @@ impl Sched {
                 ("host.engram_stage", counters::get(&counters::ENGRAM_STAGE_NS)),
                 ("host.remote_rtt", counters::get(&counters::REMOTE_RTT_NS)),
                 ("host.remote_srv", counters::get(&counters::REMOTE_SRV_NS)),
+                ("box2.page_ms", counters::get(&counters::REMOTE_PAGE_NS)),
+                ("box2.compute_ms", counters::get(&counters::REMOTE_COMPUTE_NS)),
+                ("box2.misses_x1e6", counters::get(&counters::REMOTE_MISSES) * 1_000_000),
             ];
             let acc = &mut self.profile_acc;
             acc.steps += 1;
@@ -707,6 +711,14 @@ impl Sched {
                 e.1 += 1;
             }
             if let Some(pg) = pager.as_ref() {
+                if let Some((q, a, df, ams)) = pg.prefetch_stats() {
+                    let (dq, da, ddf, dms) = (q.saturating_sub(acc.pf_last.0), a.saturating_sub(acc.pf_last.1), df.saturating_sub(acc.pf_last.2), ams.saturating_sub(acc.pf_last.3));
+                    acc.pf_last = (q, a, df, ams);
+                    for (name, v) in [("prefetch.queued", dq as f64), ("prefetch.admitted", da as f64), ("prefetch.dropped_full", ddf as f64), ("prefetch.admit_ms", dms as f64)] {
+                        let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
+                        e.0 += v; e.1 += 1;
+                    }
+                }
                 let c = pg.counters();
                 let (dm, dr) = (c.prefill_misses.saturating_sub(acc.last_misses), c.prefill_read_ns.saturating_sub(acc.last_read_ns));
                 acc.last_misses = c.prefill_misses;
