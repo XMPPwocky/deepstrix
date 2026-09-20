@@ -509,6 +509,9 @@ impl Sched {
     fn prefill_job_tick(&mut self, state: &mut WorkerState, mut pf: Prefill, i: usize) -> Result<(), (Option<v4flash_kernels::het::HetModelState>, eyre::Report)> {
         if !pf.job.chunks_done() {
             let t = Instant::now();
+            if let Some(pg) = state.pager.as_mut() {
+                if let Err(e) = pg.drain_prefetched() { return Err((Some(pf.kv), e)); }
+            }
             if let Err(e) = chunk_inputs(&mut pf, state) { return Err((Some(pf.kv), e)); }
             let inputs_ms = t.elapsed().as_millis() as u64;
             let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, weights, pager, .. } = state;
@@ -621,6 +624,12 @@ impl Sched {
 
     /// One batched decode step over every live stream.
     fn decode_step(&mut self, state: &mut WorkerState) -> eyre::Result<()> {
+        // Token boundary: nothing is reading the pool (the previous step and
+        // chunk both synchronized), so admit box-1's background-read experts
+        // (`V41_B1_PREFETCH`, catch-all mode: misses are computed on box 2 and
+        // read from box 1's disk off the critical path). Same as decode's
+        // `forward_one!`; without this the multistream path never warmed box 1.
+        if let Some(pg) = state.pager.as_mut() { pg.drain_prefetched()?; }
         let t0 = Instant::now();
         let b = self.streams.len();
         let slots: Vec<u32> = self.streams.iter().map(|s| s.slot).collect();
