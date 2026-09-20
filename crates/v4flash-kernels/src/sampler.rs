@@ -81,6 +81,33 @@ impl Sampler {
         launch_kernel!(f, cfg, stream, [next_token_out.raw(), logits.raw(), n])
     }
 
+    /// [`Self::launch_argmax`] over `b` rows of logits (`[b, n]`) into
+    /// `next_token_out[0..b]` in one launch — the multi-stream decode sampler.
+    /// Same kernel body per row (`argmax_rows`), so each row is bit-identical to
+    /// `argmax_one` on its slice.
+    pub fn launch_argmax_rows(
+        &self,
+        stream: &Stream,
+        next_token_out: &mut DeviceBuffer<i32>, // [b]
+        logits: &DeviceBuffer<f32>,             // [b, n]
+        n: u32,
+        b: u32,
+    ) -> eyre::Result<()> {
+        if b == 0 {
+            return Ok(());
+        }
+        if next_token_out.len() < b as usize || logits.len() < (b as usize) * (n as usize) {
+            return Err(eyre!("argmax_rows: buffer too small (b={b}, n={n})"));
+        }
+        let f = self.module.get_function("argmax_rows")?;
+        let cfg = LaunchConfig {
+            grid: (1, b, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(f, cfg, stream, [next_token_out.raw(), logits.raw(), n])
+    }
+
     /// Multinomial sample from softmax(logits / temperature).
     ///
     /// Three kernels:

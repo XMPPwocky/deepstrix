@@ -245,6 +245,22 @@ fn per_row_bases_match_single_sequence() -> eyre::Result<()> {
     }
     eprintln!("compressor pool (per-boundary state index): {m} mismatches");
     assert_eq!(m, 0);
+    // ---- (6) batched argmax sampler vs the one-row kernel per row
+    let n_vocab = 129_280usize;
+    let logits_h: Vec<f32> = (0..B * n_vocab).map(|_| rng.f32()).collect();
+    let logits = dev_f32(id, &logits_h);
+    let mut tok_rows = dev_i32(id, &[0; B]);
+    e.sampler.launch_argmax_rows(s, &mut tok_rows, &logits, n_vocab as u32, B as u32)?;
+    let mut m = 0usize;
+    for b in 0..B {
+        let mut t1 = dev_i32(id, &[0]);
+        let lb = logits.slice_view(b * n_vocab, n_vocab);
+        e.sampler.launch_argmax(s, &mut t1, &lb, n_vocab as u32)?;
+        s.synchronize()?;
+        if host(&t1)[0] != host(&tok_rows)[b] { m += 1; }
+    }
+    eprintln!("argmax rows vs one-row: {m} mismatches of {B}");
+    assert_eq!(m, 0);
     eprintln!("ALL per-row-base kernels bit-identical to their single-sequence runs");
     Ok(())
 }

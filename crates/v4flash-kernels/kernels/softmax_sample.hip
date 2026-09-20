@@ -76,6 +76,58 @@ extern "C" __global__ void argmax_one(
 // logits_max_partial — per-WG max of (logits * inv_T) over a contiguous slice.
 // Writes partials_max[wg].
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// argmax_rows — the same reduce as argmax_one, one work-group per ROW
+// (grid.y = B): multi-stream decode samples every stream's logits in one
+// launch. Bit-identical per row to argmax_one by construction (same code on the
+// row's slice).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void argmax_rows(
+        int *next_token_out,     // [B]
+        const float *logits,     // [B, n]
+        unsigned int n) {
+    const unsigned int b = blockIdx.y;
+    next_token_out += b;
+    logits += (size_t)b * n;
+    __shared__ float s_val[SAMP_BLOCK];
+    __shared__ int   s_idx[SAMP_BLOCK];
+    const unsigned int tid = threadIdx.x;
+
+    float best_v = -INFINITY;
+    int   best_i = (int)n; // sentinel; if everything is -inf this becomes n-1 after clamp
+    for (unsigned int i = tid; i < n; i += SAMP_BLOCK) {
+        const float v = logits[i];
+        if (v > best_v || (v == best_v && (int)i < best_i)) {
+            best_v = v;
+            best_i = (int)i;
+        }
+    }
+    s_val[tid] = best_v;
+    s_idx[tid] = best_i;
+    __syncthreads();
+
+    for (unsigned int stride = SAMP_BLOCK / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            const float v_other = s_val[tid + stride];
+            const int   i_other = s_idx[tid + stride];
+            if (v_other > s_val[tid] || (v_other == s_val[tid] && i_other < s_idx[tid])) {
+                s_val[tid] = v_other;
+                s_idx[tid] = i_other;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        int idx = s_idx[0];
+        if (idx >= (int)n) idx = (int)n - 1;
+        next_token_out[0] = idx;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// logits_max_partial — per-WG max of (logits * inv_T) over a contiguous slice.
+// Writes partials_max[wg].
+// ---------------------------------------------------------------------------
 extern "C" __global__ void logits_max_partial(
         float *partials_max,     // [n_wgs] f32
         const float *logits,     // [n]
