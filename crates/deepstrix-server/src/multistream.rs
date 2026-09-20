@@ -106,7 +106,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
     // 2026-09-20 on the 16 GB dGPU with two prefill states: 3 x --ctx left
     // 190 MiB free (unsafe), 2 x --ctx 1.0 GiB.
     let ctx_rows = env_usize("V41_MS_CTX_ROWS", 2 * state.n_kv_max as usize) as u32;
-    let chunk_rows = env_usize("V41_MS_CHUNK_ROWS", 256);
+    let chunk_rows = env_usize("V41_MS_CHUNK_ROWS", 512);
     let arena = match KvArena::alloc_ctx(state.dgpu, n_slots, ctx_rows) {
         Ok(a) => a,
         Err(e) => {
@@ -594,7 +594,7 @@ impl Sched {
 }
 
 fn chunk_rows_idle() -> usize { env_usize("V41_MS_CHUNK_ROWS_IDLE", 512) }
-fn chunk_rows_busy() -> usize { env_usize("V41_MS_CHUNK_ROWS", 256) }
+fn chunk_rows_busy() -> usize { env_usize("V41_MS_CHUNK_ROWS", 512) }
 
 /// Same rule as `HeterogeneousEngine::sample_next` / the DSpark host twin.
 fn sample_row(r: &[f32], mode: &SampleMode, rng: &mut SamplerRng) -> i32 {
