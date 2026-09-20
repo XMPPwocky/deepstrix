@@ -26,6 +26,7 @@ pub mod forward_layer;
 pub mod forward_prefill;
 pub mod graph_cache;
 pub mod image_spans;
+pub mod kv_arena;
 pub mod perfetto;
 pub mod prefill_stats;
 pub mod remote_experts;
