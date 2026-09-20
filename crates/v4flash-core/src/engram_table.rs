@@ -99,6 +99,12 @@ impl EngramTable {
         // read is ~80 us and a spawn ~15 us, so 48 serial cold preads cost ~3.8 ms
         // per token versus ~160 us overlapped.
         //
+        // MEASURED 2026-09-21 (`engram_gather_timing`, 24 cold rows, live box): a
+        // persistent 32-thread reader pool gave p50 1,705 us against 1,663 us for
+        // these scoped spawns. The cost is the cold 4 KB reads on the loaded
+        // dm-crypt drive (min ~830 us per gather), not thread creation; the pool
+        // was removed. The levers are the row cache and a faster/plaintext drive.
+        //
         // A microbenchmark that says serial wins here is measuring a PAGE-CACHE-HOT
         // table (warm read ~2 us, so spawning dominates) and does not describe
         // production. The real fix for spawn cost is to BATCH the call — see
@@ -198,6 +204,37 @@ impl EngramTable {
 mod tests {
     use super::*;
     use crate::engram_hash::{EngramHash, ENGRAM_LAYERS};
+
+    /// Cold random-row gather cost on the REAL tables (`ENGRAM_CACHE_ROWS=0` keeps
+    /// the row cache out of it; needs `V41_MODEL`, the HF snapshot dir). 2026-09-21
+    /// on the live box: p50 1.7 ms, min 0.83 ms per 24-row gather — disk latency,
+    /// not spawn cost (a persistent pool measured the same and was removed).
+    #[test]
+    #[ignore]
+    fn engram_gather_timing() -> eyre::Result<()> {
+        let dir = std::env::var("V41_MODEL").expect("V41_MODEL=<hf snapshot dir>");
+        let st = SafetensorsDir::open(&dir)?;
+        let tbl = EngramTable::open(&st, 1)?;
+        let rows = tbl.rows;
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; (seed % rows) as i64 };
+        let mut out = vec![0f32; ENGRAM_COLS * ENGRAM_ROW_DIM];
+        let mut us: Vec<u128> = Vec::new();
+        for _ in 0..120 {
+            let ids: Vec<i64> = (0..ENGRAM_COLS).map(|_| next()).collect();
+            let t = std::time::Instant::now();
+            tbl.gather(&st, &ids, &mut out, ENGRAM_COLS)?;
+            us.push(t.elapsed().as_micros());
+        }
+        us.sort_unstable();
+        let n = us.len();
+        eprintln!(
+            "engram gather 24 cold rows x{}: p50 {} us  p90 {} us  min {} us  (pool threads {:?}, cache rows {:?})",
+            n, us[n / 2], us[n * 9 / 10], us[0],
+            std::env::var("ENGRAM_GATHER_THREADS").ok(), std::env::var("ENGRAM_CACHE_ROWS").ok()  // pool env is historical
+        );
+        Ok(())
+    }
 
     #[test]
     fn bf16_rounding() {

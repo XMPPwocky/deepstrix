@@ -241,3 +241,31 @@ EXPOSED wait (`now - t_wait`), and `remote_link_us = exposed - srv` (saturating)
 so both now read below srv / ~0. That is the accounting, not a regression; the
 per-request `link=b1:` figure is the true per-call link. The pole on a warm token
 is box 1 itself: sel_sync ~22 ms + its own misses + ~10 ms glue.
+
+## 2026-09-21: multi-row replies — the hold is NOT the client's busy-poll window
+
+Measured against a 3-expert-per-layer test daemon on box 2 (`--experts L0-L39:0-2
+--listen :7432`; the production daemon serves one connection, so a bench against it
+queues forever), `--picks 3 --pool 3 --batched --gap-us 500`, link = rtt - srv, us p50:
+
+    rows   reply KB (f32)   busy 3000   busy 500   busy 100   busy 20   busy 20 + quickack
+      1        20.6            62          -          -         -           -
+      2        41.0           213        336        226       217         228
+      4        82.0          1992       1204       1075      1272         759
+      8       163.9          1897       1087       1262      1258         651
+     16       327.8          1712       1262       1138      1200          -
+     32       655.4          1122       1064        970       936          -
+     64      1310.8          2209       2117       2097      2081          -
+    f16 replies (10.3 KB/row): 4 rows = one segment, link 225; 8 rows = two, 1941.
+
+Any reply over ONE segment (65,520-B MTU) costs ~1.1-1.3 ms of link whatever the
+window, ~2 ms at the decode window, ~0.65 ms with TCP_QUICKACK re-armed per frame.
+Ruled out on the daemon box during a 120-request run: `TcpExtTCPAutoCorking` did
+not move (99,350 -> 99,350), `TcpExtDelayedACKs` +2. So it is neither autocorking
+nor a receiver-side delayed ACK alone; the ~1 ms scale and the window-independence
+point at the SENDER's segmentation path on this 64 KB-MTU device (TSO/GSO deferral
+of the partial last skb, qdisc fq_codel quantum 65546). Root-level test, not yet run:
+`ethtool -K thunderbolt0 tso off gso off` on box 2 (and/or `net.ipv4.tcp_min_tso_segs`,
+`tcp_tso_win_divisor`), then the same bench. Until that is settled, every multi-row
+decode design (MULTISTREAM_DECODE_PLAN.md M1a) has to assume ~0.65-2 ms per call
+above one segment, i.e. f32 at >= 4 rows and f16 at >= 8.

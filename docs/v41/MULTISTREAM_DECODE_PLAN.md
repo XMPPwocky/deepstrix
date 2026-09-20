@@ -522,16 +522,30 @@ prefill driver's per-stage GPU time on 1/4/16/64-token prompts at short context 
 `d1`; the driver's host overhead is excluded by reading stage GPU time), rocprofv3
 kernel trace if the stage brackets are ambiguous. (b) the by-expert MoE chain on box
 1's iGPU over the pager's pool at 1..64 rows, D fixed (`--pool 3`) and growing,
-cache-defeated: sets `bw_moe` and the 20 us/row term for box 1. (c) link at 1..64
-rows f32/f16 with the daemon idle (the bench queues behind the server's connection
-otherwise — it did today): quantifies the multi-segment hold. (d) fio, 6.3 MB reads,
+cache-defeated: sets `bw_moe` and the 20 us/row term for box 1. (c) DONE 2026-09-21
+against a second 3-expert daemon on :7432 (no downtime; the production daemon serves
+one connection): any reply over one 65,520-B segment costs ~1.1-1.3 ms of link at
+every busy-poll window, ~0.65 ms with TCP_QUICKACK; not autocorking, not a receiver
+delayed ACK (kernel counters); the sender's segmentation path is the suspect, root
+test `ethtool -K thunderbolt0 tso off gso off` on box 2 pending (LINK_IDLE_LATENCY.md).
+(D1) DONE: the Engram gather is disk-latency-bound (1.7 ms per 24 cold rows on the
+loaded drive), a persistent pool changed nothing; the lever is the row cache or the
+plaintext drive, and under batching the gather overlaps other rows' work. (d) fio, 6.3 MB reads,
 QD 1..16, both drives; on box 1 plaintext and dm-crypt SEPARATELY (needs a plaintext
 path; a loop file is not one). (D1) `rows_for_chunk` at 1/4/16/64 rows. (D2) box-2
 per-miss cost today from `t_remote_page_us`/`n_remote_miss`. (D3) VRAM of a second
 `HetModelState` at 307K and 100K. (D4) `a1`: the serial layer-major driver
 (`V41_VERIFY_DECODE_PATH=1`) with 1/4/16 rows at ~100K, per-stage GPU time — the
-row cost the row-grid kernels must beat. (D5) hits-first prototype in the daemon's
-`run_path`, measured at B=8..32 with `--pool all` on a cold pool. Scripts:
+row cost the row-grid kernels must beat. (D5) DONE 2026-09-21: hits-first is IMPLEMENTED in the daemon (`run_path`: resident
+pass, `ensure` with the full pick list while it runs, missed pass into the same
+partials, one reduce; `V41_B2_HITS_FIRST=1`, default OFF, `SIGUSR1` flips it at
+runtime for a warm-pool A/B). Bit-identical to the single-pass path in 30 checks
+(L5/L7, B=1/4/32, 40- and 200-slot paged pools, while faulting). Timing on the
+test daemon was NEUTRAL (269 vs 274 ms at B=8, 1045 vs 1175 at B=32, p90 spread
+larger than the delta) because a catch-all request there is ~150 SERIAL disk reads
+against ~4 ms of compute, i.e. nothing to hide; the predicted gain needs the
+production regime (a few misses per layer vs several ms of compute) and is
+measured by flipping the flag on the live daemon between token windows. Scripts:
 scratchpad `m0_measure.sh` (parts a-d, D).
 
 **M1a — the batched step in a HARNESS (no server changes).** Row table + KvArena;

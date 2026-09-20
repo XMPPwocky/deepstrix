@@ -22,6 +22,16 @@ batch-size-dependent decode-vs-verify disagreement (`VERIFY_DISAGREES_WITH_DECOD
 or the B>1 `moe_gate_up_batch_hetsplit`/`moe_down_batched_hetsplit` row handling.
 Production decode is B=1 (identical), so this bites DSpark verify (B=2..6) only.
 
+2026-09-21 addendum: with the bench's local reference forced onto the SAME path as
+the remote (`--batched` on both, bench patched that day), a `--paged` daemon and
+`--catchall` ids, 30 checks at L5/L7, B=1/4/32, hits-first on and off, 40- and
+200-slot pools were ALL bit-identical, including B=4 while faulting. One B=4 run
+that day showed 2 of 4 rows off at the f32 LSB (f16 identical) and could not be
+reproduced in 6 repeats of its exact configuration; the bench binary of that run
+predates the same-path patch, so it most likely compared the batched remote against
+the local DECODE path — the ~1e-7 batched-vs-decode difference above. The original
+entry (decode branch on both sides, static 3-expert daemon) is still open.
+
 ## Start here
 
 ### Why DSpark output was degenerate, in one paragraph -- **CLOSED 2026-09-16**
