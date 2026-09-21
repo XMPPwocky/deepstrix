@@ -395,9 +395,20 @@ impl Sched {
         // default 4000 each) or it runs out of work.
         let have_pf = !self.prefills.is_empty();
         let have_dec = !self.streams.is_empty();
+        // Burst budgets scale with the OTHER side's backlog (2026-09-21): a
+        // prefill that arrived during a decode burst used to wait out the full
+        // 30 s before it could start (time-to-first-token 30 s + prefill), and
+        // a prefill phase ran every queued job back to back while every live
+        // stream froze. Decode burst = base / (1 + waiting prefills), floored;
+        // prefill burst = base / (1 + live streams), floored. The switch lands
+        // between chunks, so a partly-done prefill simply resumes next burst.
+        let waiting_pf = self.prefills.len() + self.queue.len();
+        let live = self.streams.len();
         let budget = |ph: Phase| std::time::Duration::from_millis(match ph {
-            Phase::Prefill => env_usize("V41_MS_PREFILL_BURST_MS", 120_000) as u64,
-            Phase::Decode => env_usize("V41_MS_DECODE_BURST_MS", 30_000) as u64,
+            Phase::Prefill => (env_usize("V41_MS_PREFILL_BURST_MS", 120_000) / (1 + live))
+                .max(env_usize("V41_MS_PREFILL_BURST_MIN_MS", 10_000)) as u64,
+            Phase::Decode => (env_usize("V41_MS_DECODE_BURST_MS", 30_000) / (1 + waiting_pf))
+                .max(env_usize("V41_MS_DECODE_BURST_MIN_MS", 3_000)) as u64,
         });
         let next = match (have_pf, have_dec) {
             (true, false) => Phase::Prefill,
@@ -412,7 +423,8 @@ impl Sched {
             }
         };
         if next != self.phase {
-            tracing::info!(from = ?self.phase, to = ?next, live = self.streams.len(), prefills = self.prefills.len(), queued = self.queue.len(), "ms.phase");
+            tracing::info!(from = ?self.phase, to = ?next, live = self.streams.len(), prefills = self.prefills.len(), queued = self.queue.len(),
+                burst_ms = self.phase_since.elapsed().as_millis() as u64, next_budget_ms = budget(next).as_millis() as u64, "ms.phase");
             self.phase = next;
             self.phase_since = Instant::now();
         }
