@@ -573,6 +573,28 @@ impl Sched {
             };
             tracing::debug!(rows, done = pf.job.done_rows(), total = pf.job.total(), inputs_ms, ms = t.elapsed().as_millis() as u64, "multistream: prefill chunk");
             if !pf.job.chunks_done() {
+                // PERIODIC CHECKPOINT (every V41_MS_CHECKPOINT_EVERY rows, default
+                // 32768): a server restart does not run the cancel path, so a
+                // long prefill used to restart from zero (2026-09-22: a 262K
+                // prompt lost 98K rows). The encoder state at a chunk boundary is
+                // what a resumed prefill restores.
+                let every = env_usize("V41_MS_CHECKPOINT_EVERY", 32768);
+                let done = pf.job.done_rows();
+                if every > 0 && done >= every && (done - rows) / every != done / every {
+                    let t = Instant::now();
+                    pf.kv.restore_compressor_lending();
+                    let mut tokens_saved: Vec<i32> = pf.prefix.clone();
+                    tokens_saved.extend_from_slice(&pf.job.tokens()[..done]);
+                    let spans_saved = crate::vision_prompt::spans_in_range(&pf.p.req.image_spans, 0, tokens_saved.len()).unwrap_or_default();
+                    match snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
+                        state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, None) {
+                        Ok(entry) => {
+                            state.snapshot_index.insert(entry);
+                            tracing::info!(tokens = tokens_saved.len(), done, total = pf.job.total(), ms = t.elapsed().as_millis() as u64, "multistream: prefill checkpoint saved");
+                        }
+                        Err(e) => tracing::warn!(error = %e, "multistream: prefill checkpoint FAILED"),
+                    }
+                }
                 self.prefills.insert(i.min(self.prefills.len()), pf);
                 return Ok(());
             }
