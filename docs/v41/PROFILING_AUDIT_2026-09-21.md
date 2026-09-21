@@ -260,3 +260,26 @@ asymmetry (box 2 never receives out of order) points at the hub's receive
 path (SO_BUSY_POLL 500 µs on the client socket) rather than the wire.
 `rtt - srv` = 1.3 ms/request at 8 rows is where this lands. A/B in progress
 via `V41_REMOTE_BUSY_POLL_US` / `V41_REMOTE_QUICKACK` (`~/scratch-ms/link_ab.sh`).
+
+**Link A/B (19:13-19:22, one 8-row 150-token burst per hub restart, ~12k
+requests each):**
+
+| hub variant | hub rcv_ooopack | box2 spurious retrans | link ms/step @8 rows |
+|---|---|---|---|
+| default (busy_poll 500) | +11519 | +1379 (90 MB) | 92 |
+| `V41_REMOTE_BUSY_POLL_US=0` | +10215 | +1285 (84 MB) | (7 rows) 52-67 |
+| `V41_REMOTE_QUICKACK=1` | +12220 | +1633 (107 MB) | 92-95 |
+| default again | +10838 | +1392 (91 MB) | 96 |
+
+Neither application knob moves it: ~95% of replies reach the hub out of
+order and ~11% are retransmitted spuriously regardless. The reply is ONE
+`write_all` on box 2 (single 61 KB TCP segment at MSS 65468), yet the hub
+sees it as ~3 segments (`rcvmss 20560`): the thunderbolt-net TSO path on box 2
+splits it and the hub's GRO reassembles the pieces out of order. Box 2 never
+receives out of order because the hub's 110 KB requests take the same path
+in reverse... and do not get reordered, so the asymmetry is between the two
+boxes' driver/GRO state, not the protocol. Next A/Bs need root (user):
+`ethtool -K thunderbolt0 gro off` on the hub, `ethtool -K thunderbolt0 tso off`
+on box 2, then `tcpdump` on both ends if neither helps. Expected prize: the
+1.2 ms/request `link` term, ~90 ms/step at 8 rows, though most of it is
+currently hidden under box 2's paging.
