@@ -729,13 +729,29 @@ impl Sched {
         let engram_rows: Option<Vec<Vec<f32>>> = match (state.pager.as_ref(), state.engram.as_ref()) {
             (Some(pg), Some(ec)) => {
                 let mut rows = vec![vec![0f32; b * ein]; ec.tables.len()];
-                for (r, s) in self.streams.iter_mut().enumerate() {
+                // ONE batched gather per table over all live rows (as the
+                // prefill path does), not `gather_position` per row: that
+                // spawned 24 threads per (row, layer) and serialised ten disk
+                // round trips per 5-row step, which cost 0.8-5.7 s whenever the
+                // page cache had been flushed by prefill or a snapshot save
+                // (2026-09-21 03:39-03:44). Gathered rows land at row r; DEAD
+                // (image) rows stay zero.
+                let mut live: Vec<(usize, [[i64; v4flash_core::engram_hash::ENGRAM_COLS]; v4flash_core::engram_hash::ENGRAM_LAYERS])> = Vec::with_capacity(b);
+                for (r, s) in self.streams.iter().enumerate() {
                     // `seq` already ends with `next` (pushed when it was chosen).
                     let pos = s.seq.len() - 1;
-                    let hashes = ec.hasher.hash_ids(&s.compressed, pos);
                     if s.compressed[pos] == v4flash_core::engram_hash::DEAD { continue; }
+                    live.push((r, ec.hasher.hash_ids(&s.compressed, pos)));
+                }
+                if !live.is_empty() {
+                    const GATHER_THREADS: usize = 32;
+                    let mut tmp = vec![0f32; live.len() * ein];
                     for (li, tbl) in ec.tables.iter().enumerate() {
-                        tbl.gather_position(pg.raw(), &hashes[li], &mut rows[li][r * ein..(r + 1) * ein])?;
+                        let flat: Vec<i64> = live.iter().flat_map(|(_, h)| h[li]).collect();
+                        tbl.gather(pg.raw(), &flat, &mut tmp, GATHER_THREADS)?;
+                        for (k, (r, _)) in live.iter().enumerate() {
+                            rows[li][r * ein..(r + 1) * ein].copy_from_slice(&tmp[k * ein..(k + 1) * ein]);
+                        }
                     }
                 }
                 Some(rows)
