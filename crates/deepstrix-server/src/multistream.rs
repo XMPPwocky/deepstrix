@@ -331,7 +331,9 @@ impl Sched {
         }
         let mut deferred: Vec<Pending> = Vec::new();
         while !self.spare_states.is_empty() && !self.queue.is_empty() {
-            if let Some(i) = self.queue.iter().position(|p| p.queued.elapsed() >= aging) {
+            // Aged requests go first, OLDEST first (ties in the starvation rule
+            // below break by request age too); otherwise shortest prompt first.
+            if let Some((i, _)) = self.queue.iter().enumerate().filter(|(_, p)| p.queued.elapsed() >= aging).max_by_key(|(_, p)| p.queued.elapsed()) {
                 let p = self.queue.remove(i).unwrap();
                 self.queue.push_front(p);
             } else if let Some((i, _)) = self.queue.iter().enumerate().min_by_key(|(_, p)| p.req.tokens.len()) {
@@ -395,15 +397,20 @@ impl Sched {
         // default 4000 each) or it runs out of work.
         let have_pf = !self.prefills.is_empty();
         let have_dec = !self.streams.is_empty();
-        // Burst budgets scale with the OTHER side's backlog (2026-09-21): a
-        // prefill that arrived during a decode burst used to wait out the full
-        // 30 s before it could start (time-to-first-token 30 s + prefill), and
-        // a prefill phase ran every queued job back to back while every live
-        // stream froze. Decode burst = base / (1 + waiting prefills), floored;
-        // prefill burst = base / (1 + live streams), floored. The switch lands
-        // between chunks, so a partly-done prefill simply resumes next burst.
-        let waiting_pf = self.prefills.len() + self.queue.len();
-        let live = self.streams.len();
+        // STARVATION RULE (2026-09-21): a request that has not started its
+        // prefill within `V41_MS_STARVE_S` (default 600) is prefilled before
+        // anything else -- the scheduler stays in the prefill phase, budget or
+        // not, until it is admitted; among starved requests the OLDEST goes
+        // first (admission order above). Everything else keeps the plain
+        // alternating bursts. `V41_MS_BURST_SCALE=1` additionally scales the
+        // bursts with the other side's backlog (decode / (1 + waiting
+        // prefills), prefill / (1 + live streams), floored).
+        let starve = std::time::Duration::from_secs(env_usize("V41_MS_STARVE_S", 600) as u64);
+        let starved = self.queue.iter().any(|p| p.queued.elapsed() >= starve)
+            || self.prefills.iter().any(|pf| !pf.job.chunks_done() && pf.p.queued.elapsed() >= starve);
+        let scale = env_usize("V41_MS_BURST_SCALE", 0) == 1;
+        let waiting_pf = if scale { self.prefills.len() + self.queue.len() } else { 0 };
+        let live = if scale { self.streams.len() } else { 0 };
         let budget = |ph: Phase| std::time::Duration::from_millis(match ph {
             Phase::Prefill => (env_usize("V41_MS_PREFILL_BURST_MS", 120_000) / (1 + live))
                 .max(env_usize("V41_MS_PREFILL_BURST_MIN_MS", 10_000)) as u64,
@@ -415,7 +422,9 @@ impl Sched {
             (false, true) => Phase::Decode,
             (false, false) => return Ok(()),
             (true, true) => {
-                if self.phase_since.elapsed() >= budget(self.phase) {
+                if starved {
+                    Phase::Prefill
+                } else if self.phase_since.elapsed() >= budget(self.phase) {
                     match self.phase { Phase::Prefill => Phase::Decode, Phase::Decode => Phase::Prefill }
                 } else {
                     self.phase
@@ -424,7 +433,7 @@ impl Sched {
         };
         if next != self.phase {
             tracing::info!(from = ?self.phase, to = ?next, live = self.streams.len(), prefills = self.prefills.len(), queued = self.queue.len(),
-                burst_ms = self.phase_since.elapsed().as_millis() as u64, next_budget_ms = budget(next).as_millis() as u64, "ms.phase");
+                burst_ms = self.phase_since.elapsed().as_millis() as u64, next_budget_ms = budget(next).as_millis() as u64, starved, "ms.phase");
             self.phase = next;
             self.phase_since = Instant::now();
         }
