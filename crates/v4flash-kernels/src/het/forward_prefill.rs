@@ -722,9 +722,18 @@ pub fn lookahead_topk() -> usize {
         std::sync::LazyLock::new(|| std::env::var("V41_LOOKAHEAD_TOPK").ok().and_then(|v| v.parse().ok()).unwrap_or(5).clamp(1, 8));
     *B
 }
+/// `V41_LOOKAHEAD_PREFETCH=1` opts in to speculative look-ahead routing
+/// hints. DEFAULT OFF since 2026-09-21: A/B at 5 rows on diverse prompts, same
+/// daemon (early paging of the queued request on) -- hints ON: step 227-257 ms,
+/// exposed box-2 wait 96-133 ms, box-2 busy 175-212 ms; hints OFF: step
+/// 165-237, wait 13-52, busy 93-120. The speculative reads (~40/step, 26%
+/// wrong, 26% still in flight at ensure) contend with the demand misses on
+/// box 2's two drives and their admits/waits sit on the request path; the
+/// daemon's CERTAIN early paging of the queued request gets the overlap
+/// without the waste.
 pub fn lookahead_prefetch() -> bool {
     static B: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("V41_LOOKAHEAD_PREFETCH").as_deref() != Ok("0"));
+        std::sync::LazyLock::new(|| std::env::var("V41_LOOKAHEAD_PREFETCH").as_deref() == Ok("1"));
     *B
 }
 
