@@ -1218,13 +1218,24 @@ struct PfDone {
 
 struct B2Prefetch {
     tx_hint: std::sync::mpsc::Sender<(u32, u32, usize)>,
-    rx_done: std::sync::mpsc::Receiver<Result<PfDone, (usize, String)>>,
+    rx_done: std::sync::mpsc::Receiver<Result<PfDone, (usize, u32, u32, String)>>,
     stages: Vec<[PinnedBuffer<u8>; 3]>,
     free: Vec<usize>,
     pending: std::collections::HashSet<(u32, u32)>,
     pub hinted: u64,
     pub admitted: u64,
     pub dropped: u64,
+    /// Wanted ids whose prefetch read was still in flight at `ensure`: waited
+    /// for instead of re-read (a partial win: the read was already started).
+    pub waited: u64,
+}
+
+/// `V41_B2_PREFETCH_PAR`: concurrent prefetch readers (default 4). One reader
+/// serialised the hints (3.3 ms each with the mirror split) against a lead of
+/// ~6-10 ms from the hint to the next layer's `ensure`, so only the first two
+/// or three hints per layer ever landed in time.
+fn b2_prefetch_par() -> usize {
+    std::env::var("V41_B2_PREFETCH_PAR").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).clamp(1, 16)
 }
 
 /// `V41_B2_PREFETCH_SETS`: staging sets = max prefetch reads in flight (default 8).
@@ -1940,7 +1951,8 @@ impl ExpertShard {
                 return;
             }
             let (tx_hint, rx_hint) = std::sync::mpsc::channel::<(u32, u32, usize)>();
-            let (tx_done, rx_done) = std::sync::mpsc::channel::<Result<PfDone, (usize, String)>>();
+            let rx_hint = std::sync::Arc::new(std::sync::Mutex::new(rx_hint));
+            let (tx_done, rx_done) = std::sync::mpsc::channel::<Result<PfDone, (usize, u32, u32, String)>>();
             let stages = std::mem::take(&mut self.pf_stages_spare);
             let ptrs: Vec<SetPtr> = stages.iter().map(|st| SetPtr {
                 p: [st[0].as_slice().as_ptr() as *mut u8, st[1].as_slice().as_ptr() as *mut u8, st[2].as_slice().as_ptr() as *mut u8],
@@ -1950,10 +1962,17 @@ impl ExpertShard {
             let direct = self.direct;
             let gpu_repack = self.repack.is_some();
             let bpe = [self.routed.gate_bytes_per_expert, self.routed.up_bytes_per_expert, self.routed.down_bytes_per_expert];
+            let n_par = b2_prefetch_par().min(stages.len().max(1));
+            for _ in 0..n_par {
+            let rx_hint = rx_hint.clone();
+            let tx_done = tx_done.clone();
+            let ptrs = ptrs.clone();
             std::thread::Builder::new().name("b2-prefetch".into()).spawn(move || {
                 let owner = owner;
                 let ptrs = ptrs;
-                while let Ok((layer, e, set)) = rx_hint.recv() {
+                loop {
+                    let got = rx_hint.lock().unwrap().recv();
+                    let Ok((layer, e, set)) = got else { break };
                     let sp = ptrs[set];
                     // SAFETY: the set is owned by this thread until `Done`; the
                     // shard (and its owner) outlives the thread (daemon lifetime).
@@ -1963,16 +1982,17 @@ impl ExpertShard {
                     let r = Self::read_miss_into(unsafe { &*owner.0 }, direct, gpu_repack, layer, e, bpe, b0, b1, b2);
                     let msg = match r {
                         Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, offs, coalesced }),
-                        Err(err) => Err((set, format!("{err:#}"))),
+                        Err(err) => Err((set, layer, e, format!("{err:#}"))),
                     };
                     if tx_done.send(msg).is_err() {
                         break;
                     }
                 }
             }).expect("spawn b2-prefetch");
+            }
             let n = stages.len();
-            self.prefetch = Some(B2Prefetch { tx_hint, rx_done, stages, free: (0..n).collect(), pending: Default::default(), hinted: 0, admitted: 0, dropped: 0 });
-            eprintln!("expertd: look-ahead prefetch ON ({n} staging sets)");
+            self.prefetch = Some(B2Prefetch { tx_hint, rx_done, stages, free: (0..n).collect(), pending: Default::default(), hinted: 0, admitted: 0, dropped: 0, waited: 0 });
+            eprintln!("expertd: look-ahead prefetch ON ({n} staging sets, {n_par} readers)");
         }
         let pool = self.pool.as_ref().unwrap();
         let pf = self.prefetch.as_mut().unwrap();
@@ -1994,9 +2014,9 @@ impl ExpertShard {
         }
     }
 
-    /// `(hinted, admitted, dropped)` since start.
-    pub fn prefetch_stats(&self) -> Option<(u64, u64, u64)> {
-        self.prefetch.as_ref().map(|p| (p.hinted, p.admitted, p.dropped))
+    /// `(hinted, admitted, dropped, waited)` since start.
+    pub fn prefetch_stats(&self) -> Option<(u64, u64, u64, u64)> {
+        self.prefetch.as_ref().map(|p| (p.hinted, p.admitted, p.dropped, p.waited))
     }
 
     /// Land every completed prefetch read into the pool (victim + repack), for
@@ -2011,11 +2031,19 @@ impl ExpertShard {
         let repack_stream = self.repack_stream.as_ref();
         let r = &mut self.routed;
         let bpe = [r.gate_bytes_per_expert, r.up_bytes_per_expert, r.down_bytes_per_expert];
+        // A wanted id whose prefetch read is still in flight: wait for it rather
+        // than issue a second read of the same bytes (the miss loop below does
+        // not know about `pending`, so it would page it again into a NEW slot
+        // and the prefetch would land as a duplicate). In flight means a few
+        // ms at most.
+        let in_flight = |pf: &B2Prefetch| want.iter().any(|&e| pf.pending.contains(&(cur_layer, e)));
         loop {
-            let d = match pf.rx_done.try_recv() {
-                Ok(Ok(d)) => d,
-                Ok(Err((set, msg))) => {
-                    eprintln!("expertd: prefetch read failed: {msg}");
+            let must_wait = in_flight(pf);
+            let d = match if must_wait { pf.rx_done.recv().map_err(|_| std::sync::mpsc::TryRecvError::Disconnected) } else { pf.rx_done.try_recv() } {
+                Ok(Ok(d)) => { if must_wait && d.layer == cur_layer && want.contains(&d.e) { pf.waited += 1; } d }
+                Ok(Err((set, layer, e, msg))) => {
+                    eprintln!("expertd: prefetch read failed (L{layer} e{e}): {msg}");
+                    pf.pending.remove(&(layer, e));
                     pf.free.push(set);
                     continue;
                 }
@@ -3801,9 +3829,10 @@ pub fn serve_connection(
                         if miss > 0 {
                             let (pread_ns, rcpu_ns, rgpu_ns) = shard.page_read_split();
                             let per = |ns: u64| ns as f64 / miss as f64 / 1e6;
+                            let pfs = shard.prefetch_stats().map(|(h, a, d, w)| format!(" prefetch hinted={h} admitted={a} dropped={d} waited={w}")).unwrap_or_default();
                             eprintln!(
                                 "expertd: page stats requests={req} misses={miss} hit={:.4} \
-ms_per_miss={:.2} (read {:.2} [pread {:.2} repack_cpu {:.2}] h2d {:.2} repack_gpu {:.2})",
+ms_per_miss={:.2} (read {:.2} [pread {:.2} repack_cpu {:.2}] h2d {:.2} repack_gpu {:.2}){pfs}",
                                 1.0 - miss as f64 / req.max(1) as f64,
                                 (read_ns + h2d_ns) as f64 / miss as f64 / 1e6,
                                 per(read_ns), per(pread_ns), per(rcpu_ns),
