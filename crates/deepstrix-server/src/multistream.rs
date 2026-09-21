@@ -730,7 +730,10 @@ impl Sched {
         let t_fwd = Instant::now();
         // Two-lane pipelined step (default for >= 2 rows, `V41_MS_PIPELINE=0`
         // disables): lane B's layer runs under lane A's box-2 wait.
-        let pipelined = b >= 2 && ms_pipeline();
+        // MEASURED 2026-09-22 with partitioned paging: at 2 rows the two-lane
+        // step's doubled dGPU chain (+55 ms) exceeds the box-2 wait it hides
+        // (~30 ms), at 4 it is a wash; default to lanes from 6 rows.
+        let pipelined = b >= env_usize("V41_MS_PIPELINE_MIN_ROWS", 6) && ms_pipeline();
         let fwd_only_ms;
         let logits = if pipelined {
             engine.forward_step_arena_pipelined(bd_a, bi_a, bd_b, bi_b, sd, si, &mut self.arena, &mut self.dev, &mut self.dev_b, &slots, weights, &hcs, &toks, engram_rows.as_deref(), pager.as_mut())?;
