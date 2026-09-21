@@ -1522,6 +1522,13 @@ pub fn b2_miss_par() -> usize {
     (*N).clamp(1, 16)
 }
 
+/// `V41_B2_SCAN_CLASS=0` disables the two-class LRU (see `ensure_layer_inner`).
+pub fn b2_scan_class() -> bool {
+    static B: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_B2_SCAN_CLASS").as_deref() != Ok("0"));
+    *B
+}
+
 pub fn b2_coalesce() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         matches!(std::env::var("V41_B2_COALESCE").as_deref(), Ok("1") | Ok("on"))
@@ -2038,7 +2045,18 @@ impl ExpertShard {
         // needs more than its equal share should take slots from a layer that needs
         // fewer, which is exactly what a single global LRU does. `V41_B2_GLOBAL_POOL=0`
         // restores the old per-layer search (region first, pool as fallback).
-        let _ = prefill_shaped;
+        // TWO-CLASS LRU (2026-09-22): a prefill chunk (`prefill_shaped`, b > 16)
+        // is a scan of most of a layer's experts, and with box 1 owning the hot
+        // set this pool is decode's COLD TIER, whose working set a 120 s burst
+        // of chunks evicted entirely (decode then re-faulted 20-50 experts per
+        // step for a minute). Slots paged by prefill are stamped older than
+        // every decode-touched slot (their own LRU order kept, so prefill still
+        // reuses across chunks); prefill hits do not refresh a decode slot;
+        // a decode hit promotes. Victims come from the prefill class first and
+        // only then from decode's, so decode's set survives a burst intact.
+        // `V41_B2_SCAN_CLASS=0` restores the single LRU.
+        let scan_class = prefill_shaped && b2_scan_class();
+        const PREFILL_AGE: u64 = 1u64 << 40;
         let global = b2_global_pool();
         let r = &mut self.routed;
         // Disjoint field borrows, hoisted: the per-role read closures below must
@@ -2061,7 +2079,13 @@ impl ExpertShard {
             pg.requests += 1;
             if let Some(&slot) = pool.slot_of.get(&(layer, e)) {
                 pool.tick += 1;
-                pool.last_use[slot as usize] = pool.tick;
+                let lu = &mut pool.last_use[slot as usize];
+                if scan_class {
+                    // Prefill hit: refresh only within the prefill class.
+                    if *lu < PREFILL_AGE { *lu = pool.tick.saturating_sub(PREFILL_AGE).max(1); }
+                } else {
+                    *lu = pool.tick;
+                }
                 continue;
             }
             pg.misses += 1;
@@ -2134,7 +2158,7 @@ impl ExpertShard {
             pool.slot_of.insert((layer, e), victim);
             pool.held[layer as usize] += 1;
             pool.tick += 1;
-            pool.last_use[victim as usize] = pool.tick;
+            pool.last_use[victim as usize] = if scan_class { pool.tick.saturating_sub(PREFILL_AGE).max(1) } else { pool.tick };
             pending.push((e, victim));
         }
         // Read the misses `stages.len()` at a time, concurrently (MEASURED on box
