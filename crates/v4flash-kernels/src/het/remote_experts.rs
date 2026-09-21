@@ -293,7 +293,9 @@ pub mod proto {
     /// length mismatch, just silently wrong experts. Tying the layout to the
     /// protocol version makes that combination refuse to connect instead.
     /// Keep this in step with `mxfp4_tables::MXFP4_LAYOUT_VERSION`.
-    pub const VERSION: u16 = 3;
+    /// Bumped to 4 for the optional PREFETCH word list after the hints
+    /// (`REQ_FLAG_PREFETCH`): the frame length changes, both boxes rebuild.
+    pub const VERSION: u16 = 4;
     /// magic u32 | version u16 | kind u16 | seq u32 | payload_len u32
     pub const HDR_LEN: usize = 16;
     pub const KIND_HELLO: u16 = 1;
@@ -327,6 +329,12 @@ pub mod proto {
     /// (box 2 marks its copy evict-first, keeping the tiers exclusive);
     /// EVICTED = box 1 dropped it (v2: box 2 re-pages it in the background).
     pub const REQ_FLAG_HINTS: u32 = 4;
+    /// Request flag: after the hints block (present or not), `n u32` then n
+    /// words `(layer << 16) | expert` the daemon should PREFETCH into its pool
+    /// in the background (look-ahead routing: the hub's prediction of the
+    /// NEXT layer's picks that this box owns; ~75% precision on decoder layers,
+    /// MEASURED 2026-09-22). Wrong words cost bandwidth only.
+    pub const REQ_FLAG_PREFETCH: u32 = 8;
 
     /// Fixed request fields after the header (bytes):
     /// layer, b, flags, n_used, xq_bpt, reserved (6 × u32) then `t1` (u64,
@@ -517,6 +525,7 @@ pub mod proto {
         sel: &[i32],
         ew: &[f32],
         hints: (&[u32], &[u32]),
+        prefetch: &[u32],
     ) -> u64 {
         debug_assert_eq!(xq.len(), (b * xq_bpt) as usize);
         debug_assert_eq!(sel.len(), (b * n_used) as usize);
@@ -545,6 +554,12 @@ pub mod proto {
             buf.put_u32(hints.0.len() as u32);
             buf.put_u32(hints.1.len() as u32);
             for &w in hints.0.iter().chain(hints.1.iter()) {
+                buf.put_u32(w);
+            }
+        }
+        if flags & REQ_FLAG_PREFETCH != 0 {
+            buf.put_u32(prefetch.len() as u32);
+            for &w in prefetch {
                 buf.put_u32(w);
             }
         }
@@ -577,6 +592,8 @@ pub mod proto {
         /// `REQ_FLAG_HINTS` residency hints (see the flag); empty otherwise.
         pub hint_admit: &'a [u32],
         pub hint_evict: &'a [u32],
+        /// `REQ_FLAG_PREFETCH` words; empty otherwise.
+        pub prefetch: &'a [u32],
     }
 
     /// Parse a REQUEST frame held in `buf` (header included).
@@ -613,6 +630,21 @@ pub mod proto {
         } else {
             hints_off
         };
+        let mut prefetch: &[u32] = &[];
+        let expect_len = if flags & REQ_FLAG_PREFETCH != 0 {
+            if expect_len + 4 > p.len() {
+                return Err(eyre!("request: prefetch flagged but frame too short"));
+            }
+            let n = u32::from_le_bytes([p[expect_len], p[expect_len + 1], p[expect_len + 2], p[expect_len + 3]]) as usize;
+            let end = expect_len + 4 + n * 4;
+            if end > p.len() {
+                return Err(eyre!("request: prefetch n={n} overruns frame"));
+            }
+            prefetch = buf.view::<u32>(expect_len + 4, n);
+            end
+        } else {
+            expect_len
+        };
         if expect_len != p.len() {
             return Err(eyre!(
                 "request: frame len {} != expected {} (b={b}, xq_bpt={xq_bpt}, n_used={n_used})",
@@ -633,6 +665,7 @@ pub mod proto {
             ew: buf.view::<f32>(ew_off, n_sel),
             hint_admit,
             hint_evict,
+            prefetch,
         })
     }
 
@@ -1162,6 +1195,43 @@ pub struct LoadStats {
 /// ADMITTED hints that matched a resident slot (daemon side).
 pub static HINTS_APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// One staging set handed to the reader thread by address (the set is owned by
+/// exactly one side at a time: the thread from hint to `Done`, the main thread
+/// from `Done` to admission, then back). Pinned memory never moves.
+#[derive(Clone, Copy)]
+struct SetPtr {
+    p: [*mut u8; 3],
+    n: [usize; 3],
+}
+unsafe impl Send for SetPtr {}
+#[derive(Clone, Copy)]
+struct OwnerPtr(*const V41HfWeights);
+unsafe impl Send for OwnerPtr {}
+
+struct PfDone {
+    layer: u32,
+    e: u32,
+    set: usize,
+    offs: [Option<(usize, usize, u32, u32)>; 3],
+    coalesced: bool,
+}
+
+struct B2Prefetch {
+    tx_hint: std::sync::mpsc::Sender<(u32, u32, usize)>,
+    rx_done: std::sync::mpsc::Receiver<Result<PfDone, (usize, String)>>,
+    stages: Vec<[PinnedBuffer<u8>; 3]>,
+    free: Vec<usize>,
+    pending: std::collections::HashSet<(u32, u32)>,
+    pub hinted: u64,
+    pub admitted: u64,
+    pub dropped: u64,
+}
+
+/// `V41_B2_PREFETCH_SETS`: staging sets = max prefetch reads in flight (default 8).
+fn b2_prefetch_sets() -> usize {
+    std::env::var("V41_B2_PREFETCH_SETS").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize).clamp(0, 32)
+}
+
 pub struct ExpertShard {
     #[allow(dead_code)]
     owner: V41HfWeights,
@@ -1191,6 +1261,12 @@ pub struct ExpertShard {
     ///
     /// NON_COHERENT so the iGPU may cache its reads (see `PinnedBuffer`).
     stages: Vec<[PinnedBuffer<u8>; 3]>,
+    /// Look-ahead prefetch (`REQ_FLAG_PREFETCH`): background reads into
+    /// dedicated staging sets, admitted at the top of the next `ensure`.
+    prefetch: Option<B2Prefetch>,
+    /// Prefetch staging sets before the reader thread starts (it starts on
+    /// the first hint, once the shard sits at its final address).
+    pf_stages_spare: Vec<[PinnedBuffer<u8>; 3]>,
     /// Shard-wide paging pool. `None` until `enable_paging`.
     pool: Option<ShardPool>,
 }
@@ -1474,6 +1550,24 @@ pub fn coalesce_check() -> bool {
 /// several ms of compute, MULTISTREAM_DECODE_PLAN.md 4.1) — unmeasured there.
 static HITS_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static HITS_FIRST_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Look-ahead prefetch words `(layer << 16) | expert` queued by the batched
+/// driver for the NEXT layer (box-2-owned ids of its predicted picks) and
+/// drained into the next `submit`.
+static PREFETCH_WORDS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+pub fn push_prefetch_words(words: &[u32]) {
+    let mut g = PREFETCH_WORDS.lock().unwrap();
+    if g.len() < 4096 {
+        g.extend_from_slice(words);
+    }
+}
+
+pub fn take_prefetch_words(max: usize) -> Vec<u32> {
+    let mut g = PREFETCH_WORDS.lock().unwrap();
+    let n = g.len().min(max);
+    g.drain(..n).collect()
+}
 
 pub fn b2_hits_first() -> bool {
     HITS_FIRST_INIT.get_or_init(|| {
@@ -1797,6 +1891,15 @@ impl ExpertShard {
             PinnedBuffer::<u8>::new_with_flags(bpe3[1] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
             PinnedBuffer::<u8>::new_with_flags(bpe3[2] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
         ]); }
+        // Look-ahead prefetch staging + reader thread (see `B2Prefetch`).
+        let mut pf_stages: Vec<[PinnedBuffer<u8>; 3]> = Vec::new();
+        for _ in 0..b2_prefetch_sets() {
+            pf_stages.push([
+                PinnedBuffer::<u8>::new_with_flags(if b2_coalesce() { 3 * bpe3[0] } else { bpe3[0] } + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
+                PinnedBuffer::<u8>::new_with_flags(bpe3[1] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
+                PinnedBuffer::<u8>::new_with_flags(bpe3[2] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
+            ]);
+        }
         // O_DIRECT needs a 4096-aligned buffer. hipHostMalloc gives page-aligned
         // memory, but CHECK rather than assume: a misaligned buffer fails pread
         // with EINVAL, which is a confusing way to learn this.
@@ -1816,9 +1919,166 @@ impl ExpertShard {
             repack,
             repack_stream,
             stages,
+            prefetch: None,
+            pf_stages_spare: pf_stages,
             direct,
             pool: None,
         })
+    }
+
+    /// Queue look-ahead prefetch words `(layer << 16) | expert` (the hub's
+    /// prediction of the NEXT layer's picks that this box owns). Non-resident,
+    /// not-pending ids are read in the background into a free staging set;
+    /// `admit_prefetched` lands them at the next `ensure`. Drops when every
+    /// set is busy (bandwidth is the only cost of a wrong hint).
+    pub fn prefetch_words(&mut self, words: &[u32]) {
+        if words.is_empty() || self.pool.is_none() {
+            return;
+        }
+        if self.prefetch.is_none() {
+            if self.pf_stages_spare.is_empty() {
+                return;
+            }
+            let (tx_hint, rx_hint) = std::sync::mpsc::channel::<(u32, u32, usize)>();
+            let (tx_done, rx_done) = std::sync::mpsc::channel::<Result<PfDone, (usize, String)>>();
+            let stages = std::mem::take(&mut self.pf_stages_spare);
+            let ptrs: Vec<SetPtr> = stages.iter().map(|st| SetPtr {
+                p: [st[0].as_slice().as_ptr() as *mut u8, st[1].as_slice().as_ptr() as *mut u8, st[2].as_slice().as_ptr() as *mut u8],
+                n: [st[0].len(), st[1].len(), st[2].len()],
+            }).collect();
+            let owner = OwnerPtr(&self.owner as *const V41HfWeights);
+            let direct = self.direct;
+            let gpu_repack = self.repack.is_some();
+            let bpe = [self.routed.gate_bytes_per_expert, self.routed.up_bytes_per_expert, self.routed.down_bytes_per_expert];
+            std::thread::Builder::new().name("b2-prefetch".into()).spawn(move || {
+                let owner = owner;
+                let ptrs = ptrs;
+                while let Ok((layer, e, set)) = rx_hint.recv() {
+                    let sp = ptrs[set];
+                    // SAFETY: the set is owned by this thread until `Done`; the
+                    // shard (and its owner) outlives the thread (daemon lifetime).
+                    let (b0, b1, b2) = unsafe {
+                        (std::slice::from_raw_parts_mut(sp.p[0], sp.n[0]), std::slice::from_raw_parts_mut(sp.p[1], sp.n[1]), std::slice::from_raw_parts_mut(sp.p[2], sp.n[2]))
+                    };
+                    let r = Self::read_miss_into(unsafe { &*owner.0 }, direct, gpu_repack, layer, e, bpe, b0, b1, b2);
+                    let msg = match r {
+                        Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, offs, coalesced }),
+                        Err(err) => Err((set, format!("{err:#}"))),
+                    };
+                    if tx_done.send(msg).is_err() {
+                        break;
+                    }
+                }
+            }).expect("spawn b2-prefetch");
+            let n = stages.len();
+            self.prefetch = Some(B2Prefetch { tx_hint, rx_done, stages, free: (0..n).collect(), pending: Default::default(), hinted: 0, admitted: 0, dropped: 0 });
+            eprintln!("expertd: look-ahead prefetch ON ({n} staging sets)");
+        }
+        let pool = self.pool.as_ref().unwrap();
+        let pf = self.prefetch.as_mut().unwrap();
+        for &w in words {
+            let key = ((w >> 16) as u32, (w & 0xFFFF) as u32);
+            if key.0 as usize >= self.layers.len() || key.1 >= N_EXPERT || self.layers[key.0 as usize].is_none() {
+                continue;
+            }
+            if pool.slot_of.contains_key(&key) || pf.pending.contains(&key) {
+                continue;
+            }
+            let Some(set) = pf.free.pop() else { pf.dropped += 1; continue };
+            pf.pending.insert(key);
+            pf.hinted += 1;
+            if pf.tx_hint.send((key.0, key.1, set)).is_err() {
+                pf.free.push(set);
+                pf.pending.remove(&key);
+            }
+        }
+    }
+
+    /// `(hinted, admitted, dropped)` since start.
+    pub fn prefetch_stats(&self) -> Option<(u64, u64, u64)> {
+        self.prefetch.as_ref().map(|p| (p.hinted, p.admitted, p.dropped))
+    }
+
+    /// Land every completed prefetch read into the pool (victim + repack), for
+    /// any layer. Called at the top of `ensure_layer_inner`, where nothing
+    /// reads the pool. `want` protects the current layer's picks from eviction.
+    fn admit_prefetched(&mut self, cur_layer: u32, want: &[u32]) -> eyre::Result<()> {
+        let Some(pf) = self.prefetch.as_mut() else { return Ok(()) };
+        let Some(pool) = self.pool.as_mut() else { return Ok(()) };
+        const PREFILL_AGE: u64 = 1u64 << 40;
+        let global = b2_global_pool();
+        let repack = self.repack.as_ref();
+        let repack_stream = self.repack_stream.as_ref();
+        let r = &mut self.routed;
+        let bpe = [r.gate_bytes_per_expert, r.up_bytes_per_expert, r.down_bytes_per_expert];
+        loop {
+            let d = match pf.rx_done.try_recv() {
+                Ok(Ok(d)) => d,
+                Ok(Err((set, msg))) => {
+                    eprintln!("expertd: prefetch read failed: {msg}");
+                    pf.free.push(set);
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let key = (d.layer, d.e);
+            pf.pending.remove(&key);
+            if pool.slot_of.contains_key(&key) {
+                pf.free.push(d.set);
+                continue;
+            }
+            let Some(l) = self.layers.get(d.layer as usize).and_then(|l| l.as_ref()) else { pf.free.push(d.set); continue };
+            let (lo, hi) = (l.base_slot as u32, l.base_slot as u32 + l.ids.len() as u32);
+            let pick = |global: bool, pool: &ShardPool| -> Option<u32> {
+                let n = pool.owner_of.len() as u32;
+                let range = if global { 0..n } else { lo.min(n)..hi.min(n) };
+                let mut best: Option<(u64, u32)> = None;
+                for sl in range {
+                    let ok = match pool.owner_of[sl as usize] {
+                        Some((ol, oe)) => {
+                            if ol == cur_layer && want.contains(&oe) {
+                                false
+                            } else {
+                                ol == d.layer || pool.held[ol as usize] > pool.floor[ol as usize]
+                            }
+                        }
+                        None => true,
+                    };
+                    if !ok { continue; }
+                    let t = pool.last_use[sl as usize];
+                    if best.is_none_or(|(bt, _)| t < bt) { best = Some((t, sl)); }
+                }
+                best.map(|(_, sl)| sl)
+            };
+            let Some(victim) = pick(global, pool).or_else(|| pick(true, pool)) else { pf.free.push(d.set); continue };
+            if let Some((ol, oe)) = pool.owner_of[victim as usize].take() {
+                pool.slot_of.remove(&(ol, oe));
+                pool.remap_hosts[ol as usize][oe as usize] = 0;
+                pool.held[ol as usize] -= 1;
+                if ol != cur_layer { pool.dirty[ol as usize] = true; }
+            }
+            match (repack, repack_stream) {
+                (Some(rp), Some(rs)) => {
+                    Self::repack_in_place(rp, rs, r, victim, &pf.stages[d.set], &d.offs, d.coalesced)?;
+                }
+                _ => {
+                    for i in 0..3 {
+                        let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
+                        buf.slice_view_mut(victim as usize * bpe[i], bpe[i]).copy_from_host(&pf.stages[d.set][i].as_slice()[..bpe[i]])?;
+                    }
+                }
+            }
+            pool.owner_of[victim as usize] = Some(key);
+            pool.slot_of.insert(key, victim);
+            pool.held[d.layer as usize] += 1;
+            pool.tick += 1;
+            pool.last_use[victim as usize] = pool.tick + PREFILL_AGE;
+            pool.remap_hosts[d.layer as usize][d.e as usize] = -(victim as i32) - 1;
+            pool.dirty[d.layer as usize] = true;
+            pf.admitted += 1;
+            pf.free.push(d.set);
+        }
+        Ok(())
     }
 
     /// Cumulative `(misses, page_ns)` for `layer`, or `(0, 0)` when the layer is
@@ -2015,6 +2275,12 @@ impl ExpertShard {
     }
 
     fn ensure_layer_inner(&mut self, layer: u32, ids: &[i32], mut missed: Option<&mut Vec<u32>>, prefill_shaped: bool) -> eyre::Result<()> {
+        // Land completed look-ahead prefetches first (any layer): nothing reads
+        // the pool here, and this layer's picks are protected from eviction.
+        if self.prefetch.is_some() {
+            let want_pre: Vec<u32> = ids.iter().filter(|&&e| (0..N_EXPERT as i32).contains(&e)).map(|&e| e as u32).collect();
+            self.admit_prefetched(layer, &want_pre)?;
+        }
         let Some(l) = self.layers.get_mut(layer as usize).and_then(|l| l.as_mut()) else {
             // Catch-all needs a region on EVERY layer the hub can send. An
             // encoder-only assignment (e.g. `L0-L19:...`) has none for layers
@@ -3425,6 +3691,9 @@ pub fn serve_connection(
                 if !req.hint_admit.is_empty() {
                     shard.hint_evict_first(req.hint_admit);
                 }
+                if !req.prefetch.is_empty() {
+                    shard.prefetch_words(req.prefetch);
+                }
                 let (miss0, page_ns0) = shard.layer_page_counters(req.layer);
                 let timing = exec.run_path(shard, req.layer, b, req.xq, req.sel, req.ew, req.flags & proto::REQ_FLAG_BATCHED != 0)?;
                 let (miss1, page_ns1) = shard.layer_page_counters(req.layer);
@@ -4098,9 +4367,11 @@ impl RemoteExpertClient {
             (Vec::new(), Vec::new())
         };
         let flags = if ha.is_empty() && he.is_empty() { flags } else { flags | proto::REQ_FLAG_HINTS };
+        let pf = take_prefetch_words(128);
+        let flags = if pf.is_empty() { flags } else { flags | proto::REQ_FLAG_PREFETCH };
         proto::encode_request(
             &mut buf, seq, layer, b as u32, flags, nu as u32, XQ_BYTES_PER_TOKEN as u32, xq,
-            &self.sel_scratch[..b * nu], &self.ew_scratch[..b * nu], (&ha, &he),
+            &self.sel_scratch[..b * nu], &self.ew_scratch[..b * nu], (&ha, &he), &pf,
         );
         let ticket = Ticket { seq, layer, b: b as u32, bytes_out: buf.len(), t_submit: Instant::now() };
         let sent = match self.tx_req.as_ref() {
@@ -4326,7 +4597,7 @@ mod tests {
         let sel: Vec<i32> = (0..b * nu).map(|i| if i % 4 == 0 { NO_PICK } else { (i * 13 % 384) as i32 }).collect();
         let ew: Vec<f32> = (0..b * nu).map(|i| i as f32 * 0.125).collect();
         let mut buf = AlignedBuf::with_capacity(1 << 16);
-        proto::encode_request(&mut buf, 42, 17, b as u32, proto::REQ_FLAG_RESP_F32, nu as u32, XQ_BYTES_PER_TOKEN as u32, &xq, &sel, &ew, (&[], &[]));
+        proto::encode_request(&mut buf, 42, 17, b as u32, proto::REQ_FLAG_RESP_F32, nu as u32, XQ_BYTES_PER_TOKEN as u32, &xq, &sel, &ew, (&[], &[]), &[]);
         proto::patch_u64(&mut buf, proto::REQ_T1_OFF, 111_222_333);
         let h = proto::parse_header(buf.as_bytes()).unwrap();
         assert_eq!((h.kind, h.seq), (proto::KIND_REQUEST, 42));

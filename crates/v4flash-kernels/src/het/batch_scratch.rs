@@ -626,6 +626,10 @@ pub struct BatchDgpuShared {
     /// `[B, N_EXPERT]` — gate logits; read by router_topk (P9) which
     /// writes the per-lane `d_selected` / `d_ew`.
     pub router_logits: DeviceBuffer<f32>,
+    /// Look-ahead routing (multistream prefetch): next layer's top-k on this
+    /// layer's router input. `[B_MAX * N_EXPERT_USED]`.
+    pub look_sel: DeviceBuffer<i32>,
+    pub look_ew: DeviceBuffer<f32>,
     /// Host readback area for the hash router path (synchronous readback
     /// inside P9). `[B, N_EXPERT]`.
     pub router_logits_host: Vec<f32>,
@@ -1470,6 +1474,8 @@ impl BatchDgpuShared {
             attn_out,
 
             router_logits: mk_f32(N_EXPERT as usize)?,
+            look_sel: mk_i32(N_EXPERT_USED)?,
+            look_ew: mk_f32(N_EXPERT_USED)?,
             router_logits_host: vec![0.0f32; b * (N_EXPERT as usize)],
 
             gate_sh: mk_f32(N_FF_SHARED as usize)?,
