@@ -232,7 +232,9 @@ pub enum RowLayout<'a> {
     /// `next_router`: the NEXT layer's weights, for look-ahead routing (the
     /// router of layer+1 applied to this layer's router input; its box-2-owned
     /// picks are sent as prefetch words with this layer's request).
-    Arena { tables: &'a RowTables, dev: &'a RowTablesDev, next_router: Option<&'a DgpuLayerWeights> },
+    /// `next_router2`: layer+2's weights for a second layer of lead
+    /// (`V41_LOOKAHEAD_DEPTH=2`); measured 0.68 precision two layers out.
+    Arena { tables: &'a RowTables, dev: &'a RowTablesDev, next_router: Option<&'a DgpuLayerWeights>, next_router2: Option<&'a DgpuLayerWeights> },
 }
 
 /// M7 CED: mode of one batched layer call under V4.1 Causal Encoder-Decoder
@@ -706,6 +708,20 @@ impl HeterogeneousEngine {
 /// a captured stage replays as one launch.
 /// `V41_LOOKAHEAD_PREFETCH=0` disables look-ahead routing prefetch (see the
 /// router stage of `forward_layer_pre_moe_v2`).
+/// `V41_LOOKAHEAD_DEPTH`: layers of routing lead sent as prefetch words
+/// (1 = layer+1 only, 2 = also layer+2; default 2).
+pub fn lookahead_depth() -> usize {
+    static B: std::sync::LazyLock<usize> =
+        std::sync::LazyLock::new(|| std::env::var("V41_LOOKAHEAD_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 2));
+    *B
+}
+/// `V41_LOOKAHEAD_TOPK`: how many of each row's look-ahead picks (by rank)
+/// become prefetch hints (default 5 of 6).
+pub fn lookahead_topk() -> usize {
+    static B: std::sync::LazyLock<usize> =
+        std::sync::LazyLock::new(|| std::env::var("V41_LOOKAHEAD_TOPK").ok().and_then(|v| v.parse().ok()).unwrap_or(5).clamp(1, 8));
+    *B
+}
 pub fn lookahead_prefetch() -> bool {
     static B: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("V41_LOOKAHEAD_PREFETCH").as_deref() != Ok("0"));
@@ -2268,7 +2284,7 @@ impl HeterogeneousEngine {
                 self.forward_layer_pre_moe_v2(
                     bd, bi, sd, si, ls, dlw, ilw, 0, tokens, None, None, sev,
                     pager.as_deref_mut(), CedMode::Exact,
-                    RowLayout::Arena { tables: &tables, dev, next_router: weights.dgpu_layers.get(layer + 1) },
+                    RowLayout::Arena { tables: &tables, dev, next_router: weights.dgpu_layers.get(layer + 1), next_router2: weights.dgpu_layers.get(layer + 2) },
                 )?;
                 self.route_probe_after_layer(bd, weights, layer, b, 0)?;
                 self.forward_layer_post_moe_v2(bd, b as u32, sev, hot_active)
@@ -2374,14 +2390,14 @@ impl HeterogeneousEngine {
         stage(self, bd_a, 0, 0, b_a)?;
         arena.state.with_kv_source(0, |ls| {
             self.forward_layer_pre_moe_v2(bd_a, bi_a, sd, si, ls, &weights.dgpu_layers[0], &weights.igpu_layers[0], 0, tokens_a, None, None,
-                &self.sync_events.layers[0], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_a, dev: dev_a, next_router: weights.dgpu_layers.get(1) })
+                &self.sync_events.layers[0], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_a, dev: dev_a, next_router: weights.dgpu_layers.get(1), next_router2: weights.dgpu_layers.get(2) })
 ?;
             self.route_probe_after_layer(bd_a, weights, 0, b_a, 0)
         })?;
         stage(self, bd_b, 0, b_a, b_b)?;
         arena.state.with_kv_source(0, |ls| {
             self.forward_layer_pre_moe_v2(bd_b, bi_b, sd, si, ls, &weights.dgpu_layers[0], &weights.igpu_layers[0], 0, tokens_b, None, None,
-                &self.sync_events_t1.layers[0], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_b, dev: dev_b, next_router: weights.dgpu_layers.get(1) })
+                &self.sync_events_t1.layers[0], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_b, dev: dev_b, next_router: weights.dgpu_layers.get(1), next_router2: weights.dgpu_layers.get(2) })
 ?;
             self.route_probe_after_layer(bd_b, weights, 0, b_b, 1)
         })?;
@@ -2392,7 +2408,7 @@ impl HeterogeneousEngine {
             stage(self, bd_a, layer + 1, 0, b_a)?;
             arena.state.with_kv_source(layer + 1, |ls| {
                 self.forward_layer_pre_moe_v2(bd_a, bi_a, sd, si, ls, &weights.dgpu_layers[layer + 1], &weights.igpu_layers[layer + 1], 0, tokens_a, None, None,
-                    &self.sync_events.layers[layer + 1], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_a, dev: dev_a, next_router: weights.dgpu_layers.get(layer + 2) })
+                    &self.sync_events.layers[layer + 1], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_a, dev: dev_a, next_router: weights.dgpu_layers.get(layer + 2), next_router2: weights.dgpu_layers.get(layer + 3) })
 ?;
                 self.route_probe_after_layer(bd_a, weights, layer + 1, b_a, 0)
             })?;
@@ -2402,7 +2418,7 @@ impl HeterogeneousEngine {
             stage(self, bd_b, layer + 1, b_a, b_b)?;
             arena.state.with_kv_source(layer + 1, |ls| {
                 self.forward_layer_pre_moe_v2(bd_b, bi_b, sd, si, ls, &weights.dgpu_layers[layer + 1], &weights.igpu_layers[layer + 1], 0, tokens_b, None, None,
-                    &self.sync_events_t1.layers[layer + 1], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_b, dev: dev_b, next_router: weights.dgpu_layers.get(layer + 2) })
+                    &self.sync_events_t1.layers[layer + 1], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_b, dev: dev_b, next_router: weights.dgpu_layers.get(layer + 2), next_router2: weights.dgpu_layers.get(layer + 3) })
 ?;
                 self.route_probe_after_layer(bd_b, weights, layer + 1, b_b, 1)
             })?;
@@ -5355,6 +5371,10 @@ impl HeterogeneousEngine {
             RowLayout::Arena { next_router, .. } if lookahead_prefetch() => next_router.filter(|nl| !nl.is_hash_router),
             _ => None,
         };
+        let look_next2: Option<&DgpuLayerWeights> = match &rows {
+            RowLayout::Arena { next_router2, .. } if lookahead_prefetch() && lookahead_depth() >= 2 => next_router2.filter(|nl| !nl.is_hash_router),
+            _ => None,
+        };
         let image_runs = image_spans::image_runs(tokens);
         if !dlw.is_hash_router {
             // Top-k: one block per token in a single launch (B→1 launches).
@@ -5377,6 +5397,12 @@ impl HeterogeneousEngine {
             let _t = de.events.stage("k.router.lookahead", &de.compute)?;
             de.f16.matvec_batched(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
             de.router_topk.launch_batched(&de.compute, &mut sd.look_sel, &mut sd.look_ew, &sd.router_logits, nl.router_bias_dev.as_ref(),
+                N_EXPERT, cs_n_used as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, b)?;
+        }
+        if let Some(nl) = look_next2 {
+            let _t = de.events.stage("k.router.lookahead2", &de.compute)?;
+            de.f16.matvec_batched(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
+            de.router_topk.launch_batched(&de.compute, &mut sd.look_sel2, &mut sd.look_ew2, &sd.router_logits, nl.router_bias_dev.as_ref(),
                 N_EXPERT, cs_n_used as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, b)?;
         }
             // KNOWN_BUGS #0b: layer 0's MoE half is where verify diverges from
@@ -5682,6 +5708,11 @@ impl HeterogeneousEngine {
                     look_host = vec![0i32; n_sel];
                     sd.look_sel.slice_view(0, n_sel).copy_to_host(&mut look_host)?;
                 }
+                let mut look_host2: Vec<i32> = Vec::new();
+                if look_next2.is_some() {
+                    look_host2 = vec![0i32; n_sel];
+                    sd.look_sel2.slice_view(0, n_sel).copy_to_host(&mut look_host2)?;
+                }
                 if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} A after readback"); }
                 if super::expert_pager::pick_trace_on() {
                     for r in 0..b as usize {
@@ -5825,17 +5856,28 @@ impl HeterogeneousEngine {
                         ids.push(sv as u32);
                     }
                 }
-                if !look_host.is_empty() && remote_split_on {
-                    let nl = layer as i32 + 1;
-                    let mut words: Vec<u32> = Vec::with_capacity(look_host.len());
-                    let mut seen_l = vec![false; N_EXPERT as usize];
-                    for &sv in &look_host {
-                        if !(0..N_EXPERT as i32).contains(&sv) || seen_l[sv as usize] { continue; }
-                        seen_l[sv as usize] = true;
-                        let box2 = owns_remote.as_ref().is_some_and(|o| o[sv as usize])
-                            || (super::expert_pager::t2_partition() && super::expert_pager::partition_box2(nl, sv as u32));
-                        if box2 {
-                            words.push(((nl as u32) << 16) | (sv as u32));
+                if remote_split_on && (!look_host.is_empty() || !look_host2.is_empty()) {
+                    // Rank cut (`V41_LOOKAHEAD_TOPK`): the look-ahead picks come
+                    // back in descending selection order and their precision
+                    // falls with rank -- decoder 0.97/0.92/0.83/0.72/0.57/0.43
+                    // (probe, 2026-09-21). The 5th/6th are mostly wasted reads
+                    // that contend with the demand misses on box 2's drives.
+                    // L+1 words first (nearest deadline), then L+2.
+                    let topk = lookahead_topk().min(cs_n_used);
+                    let mut words: Vec<u32> = Vec::with_capacity(look_host.len() + look_host2.len());
+                    for (lh, nl) in [(&look_host, layer as i32 + 1), (&look_host2, layer as i32 + 2)] {
+                        if lh.is_empty() { continue; }
+                        let mut seen_l = vec![false; N_EXPERT as usize];
+                        for row in lh.chunks(cs_n_used) {
+                            for &sv in &row[..topk] {
+                                if !(0..N_EXPERT as i32).contains(&sv) || seen_l[sv as usize] { continue; }
+                                seen_l[sv as usize] = true;
+                                let box2 = owns_remote.as_ref().is_some_and(|o| o[sv as usize])
+                                    || (super::expert_pager::t2_partition() && super::expert_pager::partition_box2(nl, sv as u32));
+                                if box2 {
+                                    words.push(((nl as u32) << 16) | (sv as u32));
+                                }
+                            }
                         }
                     }
                     super::remote_experts::push_prefetch_words(&words);

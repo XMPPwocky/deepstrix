@@ -630,6 +630,8 @@ pub struct BatchDgpuShared {
     /// layer's router input. `[B_MAX * N_EXPERT_USED]`.
     pub look_sel: DeviceBuffer<i32>,
     pub look_ew: DeviceBuffer<f32>,
+    pub look_sel2: DeviceBuffer<i32>,
+    pub look_ew2: DeviceBuffer<f32>,
     /// Host readback area for the hash router path (synchronous readback
     /// inside P9). `[B, N_EXPERT]`.
     pub router_logits_host: Vec<f32>,
@@ -1476,6 +1478,8 @@ impl BatchDgpuShared {
             router_logits: mk_f32(N_EXPERT as usize)?,
             look_sel: mk_i32(N_EXPERT_USED)?,
             look_ew: mk_f32(N_EXPERT_USED)?,
+            look_sel2: mk_i32(N_EXPERT_USED)?,
+            look_ew2: mk_f32(N_EXPERT_USED)?,
             router_logits_host: vec![0.0f32; b * (N_EXPERT as usize)],
 
             gate_sh: mk_f32(N_FF_SHARED as usize)?,

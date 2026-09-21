@@ -1217,7 +1217,7 @@ struct PfDone {
 }
 
 struct B2Prefetch {
-    tx_hint: std::sync::mpsc::Sender<(u32, u32, usize)>,
+    tx_hint: std::sync::mpsc::Sender<(u32, u32, usize, bool)>,
     rx_done: std::sync::mpsc::Receiver<Result<PfDone, (usize, u32, u32, String)>>,
     stages: Vec<[PinnedBuffer<u8>; 3]>,
     free: Vec<usize>,
@@ -1234,6 +1234,21 @@ struct B2Prefetch {
 /// serialised the hints (3.3 ms each with the mirror split) against a lead of
 /// ~6-10 ms from the hint to the next layer's `ensure`, so only the first two
 /// or three hints per layer ever landed in time.
+/// Demand (miss) reads in flight on this box. Speculative prefetch reads wait
+/// for zero before starting: v2 (2026-09-21) raised the per-miss cost from
+/// 3.25 to 4.85 ms because the L+1 hints arrive in the same request as layer
+/// L's demand misses and raced them on the same two drives. A CERTAIN hint (a
+/// queued request's own non-resident picks, see the compute loop) is a demand
+/// read that merely started early and never waits.
+static DEMAND_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `V41_B2_EARLY_PAGE=0`: do not start a queued request's misses under the
+/// current request's tail (default on).
+fn b2_early_page() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_B2_EARLY_PAGE").as_deref() != Ok("0"));
+    *B
+}
+
 fn b2_prefetch_par() -> usize {
     std::env::var("V41_B2_PREFETCH_PAR").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).clamp(1, 16)
 }
@@ -1260,6 +1275,10 @@ pub struct ExpertShard {
     /// Zero-copy O_DIRECT reads are usable: GPU repack on, gate on, staging
     /// 4096-aligned. See [`b2_odirect`].
     direct: bool,
+    /// `(layer, expert)` slots a request still computing on the GPU reads:
+    /// never a victim while set (the compute loop pins the in-flight request's
+    /// picks around a queued request's early paging).
+    pub pinned: Vec<(u32, u32)>,
     /// Persistent staging, one per role, in `hipHostMalloc` memory.
     ///
     /// Two things at once. It is persistent, so the miss path no longer
@@ -1934,6 +1953,7 @@ impl ExpertShard {
             pf_stages_spare: pf_stages,
             direct,
             pool: None,
+            pinned: Vec::new(),
         })
     }
 
@@ -1943,6 +1963,12 @@ impl ExpertShard {
     /// `admit_prefetched` lands them at the next `ensure`. Drops when every
     /// set is busy (bandwidth is the only cost of a wrong hint).
     pub fn prefetch_words(&mut self, words: &[u32]) {
+        self.prefetch_words_ex(words, false)
+    }
+
+    /// `certain`: the words are a queued request's own picks (not a guess):
+    /// read at demand priority, i.e. without waiting for in-flight misses.
+    pub fn prefetch_words_ex(&mut self, words: &[u32], certain: bool) {
         if words.is_empty() || self.pool.is_none() {
             return;
         }
@@ -1950,7 +1976,7 @@ impl ExpertShard {
             if self.pf_stages_spare.is_empty() {
                 return;
             }
-            let (tx_hint, rx_hint) = std::sync::mpsc::channel::<(u32, u32, usize)>();
+            let (tx_hint, rx_hint) = std::sync::mpsc::channel::<(u32, u32, usize, bool)>();
             let rx_hint = std::sync::Arc::new(std::sync::Mutex::new(rx_hint));
             let (tx_done, rx_done) = std::sync::mpsc::channel::<Result<PfDone, (usize, u32, u32, String)>>();
             let stages = std::mem::take(&mut self.pf_stages_spare);
@@ -1972,7 +1998,15 @@ impl ExpertShard {
                 let ptrs = ptrs;
                 loop {
                     let got = rx_hint.lock().unwrap().recv();
-                    let Ok((layer, e, set)) = got else { break };
+                    let Ok((layer, e, set, certain)) = got else { break };
+                    if !certain {
+                        // Yield the drives to demand misses (bounded: a hint that
+                        // waits longer than a layer is late anyway).
+                        let t = std::time::Instant::now();
+                        while DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) > 0 && t.elapsed() < std::time::Duration::from_millis(20) {
+                            std::thread::sleep(std::time::Duration::from_micros(50));
+                        }
+                    }
                     let sp = ptrs[set];
                     // SAFETY: the set is owned by this thread until `Done`; the
                     // shard (and its owner) outlives the thread (daemon lifetime).
@@ -2007,7 +2041,7 @@ impl ExpertShard {
             let Some(set) = pf.free.pop() else { pf.dropped += 1; continue };
             pf.pending.insert(key);
             pf.hinted += 1;
-            if pf.tx_hint.send((key.0, key.1, set)).is_err() {
+            if pf.tx_hint.send((key.0, key.1, set, certain)).is_err() {
                 pf.free.push(set);
                 pf.pending.remove(&key);
             }
@@ -2023,6 +2057,7 @@ impl ExpertShard {
     /// any layer. Called at the top of `ensure_layer_inner`, where nothing
     /// reads the pool. `want` protects the current layer's picks from eviction.
     fn admit_prefetched(&mut self, cur_layer: u32, want: &[u32]) -> eyre::Result<()> {
+        let pinned = self.pinned.clone();
         let Some(pf) = self.prefetch.as_mut() else { return Ok(()) };
         let Some(pool) = self.pool.as_mut() else { return Ok(()) };
         const PREFILL_AGE: u64 = 1u64 << 40;
@@ -2064,7 +2099,7 @@ impl ExpertShard {
                 for sl in range {
                     let ok = match pool.owner_of[sl as usize] {
                         Some((ol, oe)) => {
-                            if ol == cur_layer && want.contains(&oe) {
+                            if (ol == cur_layer && want.contains(&oe)) || pinned.contains(&(ol, oe)) {
                                 false
                             } else {
                                 ol == d.layer || pool.held[ol as usize] > pool.floor[ol as usize]
@@ -2268,6 +2303,11 @@ impl ExpertShard {
 
     /// Is `layer` a PAGED layer (catch-all pool)? Hits-first only applies there:
     /// an unpaged layer is fully resident by construction.
+    /// Resident in the paged pool right now (false for unpaged layers).
+    pub fn is_resident_pool(&self, layer: u32, e: u32) -> bool {
+        self.pool.as_ref().is_some_and(|p| p.slot_of.contains_key(&(layer, e)))
+    }
+
     pub fn layer_is_paged(&self, layer: u32) -> bool {
         self.pool.is_some()
             && self.layers.get(layer as usize).and_then(|l| l.as_ref()).is_some_and(|l| l.page.is_some())
@@ -2303,6 +2343,7 @@ impl ExpertShard {
     }
 
     fn ensure_layer_inner(&mut self, layer: u32, ids: &[i32], mut missed: Option<&mut Vec<u32>>, prefill_shaped: bool) -> eyre::Result<()> {
+        let pinned = self.pinned.clone();
         // Land completed look-ahead prefetches first (any layer): nothing reads
         // the pool here, and this layer's picks are protected from eviction.
         if self.prefetch.is_some() {
@@ -2400,7 +2441,7 @@ impl ExpertShard {
                 for sl in range {
                     let ok = match pool.owner_of[sl as usize] {
                         Some((ol, oe)) => {
-                            if ol == layer && want.contains(&oe) {
+                            if (ol == layer && want.contains(&oe)) || pinned.contains(&(ol, oe)) {
                                 false
                             } else {
                                 // Never take a foreign layer below its floor.
@@ -2468,6 +2509,7 @@ impl ExpertShard {
             let t_r = std::time::Instant::now();
             type R = Result<([Option<(usize, usize, u32, u32)>; 3], bool), String>;
             let mut results: Vec<R> = Vec::with_capacity(chunk.len());
+            DEMAND_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             std::thread::scope(|sc| {
                 let mut hs = Vec::with_capacity(chunk.len());
                 for (&(e, _), st) in chunk.iter().zip(stages.iter_mut()) {
@@ -2482,6 +2524,7 @@ impl ExpertShard {
                     results.push(h.join().unwrap_or_else(|_| Err("miss reader panicked".into())));
                 }
             });
+            DEMAND_READS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             read_ns += t_r.elapsed().as_nanos() as u64;
             let rp1 = v4flash_core::hf_v41::expert_read_profile();
             pg.pread_ns += rp1.2 - rp0.2;
@@ -2984,7 +3027,7 @@ impl MoeExecutor {
         sel: &[i32],
         ew: &[f32],
     ) -> eyre::Result<ExecTiming> {
-        self.run_path(shard, layer, b, xq, sel, ew, false)
+        self.run_path(shard, layer, b, xq, sel, ew, false, &mut |_| Ok(()))
     }
 
     /// As [`Self::run`]; `force_batched` takes the by-expert chain regardless of `b`.
@@ -3018,6 +3061,7 @@ impl MoeExecutor {
         sel: &[i32],
         ew: &[f32],
         force_batched: bool,
+        overlap: &mut dyn FnMut(&mut ExpertShard) -> eyre::Result<()>,
     ) -> eyre::Result<ExecTiming> {
         let nu = N_EXPERT_USED;
         if b == 0 || b > self.rows {
@@ -3191,6 +3235,10 @@ impl MoeExecutor {
         if let Some((_, ev_b)) = self.ev.as_ref() {
             ev_b.record(&self.engine.compute)?;
         }
+        // A queued request's own misses can start reading now, under this
+        // request's GPU tail + D2H + reply + the hub's turnaround (see the
+        // compute loop). Cheap (decode + a few hash lookups); never waits.
+        overlap(shard)?;
         self.engine.compute.synchronize()?;
         timing.h2d = t1 - t0;
         timing.gpu = t1.elapsed();
@@ -3666,8 +3714,13 @@ pub fn serve_connection(
         // `tx_out` sender is gone; the reader when its blocking read fails).
         let mut compute = |tx_out: mpsc::SyncSender<(AlignedBuf, Instant, u32)>, records: &mut Vec<RequestRecord>, n_total: &mut u64| -> eyre::Result<()> {
         let mut n_done = 0usize;
+        // A frame the overlap hook already pulled off the reader (and whose
+        // misses it may have started paging) while the previous request ran.
+        let mut pending: Option<Inbound> = None;
         loop {
-            let msg = if opts.keep_warm_us == 0 {
+            let msg = if let Some(m) = pending.take() {
+                m
+            } else if opts.keep_warm_us == 0 {
                 match rx_in.recv() {
                     Ok(m) => m,
                     Err(_) => break,
@@ -3723,7 +3776,48 @@ pub fn serve_connection(
                     shard.prefetch_words(req.prefetch);
                 }
                 let (miss0, page_ns0) = shard.layer_page_counters(req.layer);
-                let timing = exec.run_path(shard, req.layer, b, req.xq, req.sel, req.ew, req.flags & proto::REQ_FLAG_BATCHED != 0)?;
+                // Early paging for the NEXT queued request: the daemon used to
+                // start B's misses only after A's reply, so with two hub lanes
+                // B's read latency sat fully exposed behind A's GPU tail, D2H,
+                // reply and the hub's turnaround (~1-2 ms per request, 2026-09-21
+                // profile: box 2 ~70% busy, ~25% of it waiting). Here A's picks
+                // are pinned and B's non-resident picks go to the prefetch
+                // readers as CERTAIN hints; B's own `ensure` then finds them in
+                // flight and waits for the remainder (`waited`) instead of
+                // reading from scratch. `V41_B2_EARLY_PAGE=0` disables.
+                let cur_pins: Vec<(u32, u32)> = req.sel.iter().filter(|&&e| e >= 0).map(|&e| (req.layer, e as u32)).collect();
+                let rx_in_ref = &rx_in;
+                let pending_ref = &mut pending;
+                let mut overlap = |shard: &mut ExpertShard| -> eyre::Result<()> {
+                    if !b2_early_page() || pending_ref.is_some() {
+                        return Ok(());
+                    }
+                    let Ok(m) = rx_in_ref.try_recv() else { return Ok(()) };
+                    if let Inbound::Frame { hdr, buf, .. } = &m {
+                        if hdr.kind == proto::KIND_REQUEST {
+                            if let Ok(nreq) = proto::decode_request(buf) {
+                                if shard.layer_is_paged(nreq.layer) {
+                                    let mut words: Vec<u32> = Vec::with_capacity(nreq.sel.len());
+                                    for &e in nreq.sel {
+                                        if (0..N_EXPERT as i32).contains(&e) && !shard.is_resident_pool(nreq.layer, e as u32) {
+                                            let w = (nreq.layer << 16) | e as u32;
+                                            if !words.contains(&w) { words.push(w); }
+                                        }
+                                    }
+                                    if !words.is_empty() {
+                                        shard.pinned = cur_pins.clone();
+                                        shard.prefetch_words_ex(&words, true);
+                                        shard.pinned.clear();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    *pending_ref = Some(m);
+                    Ok(())
+                };
+                let timing = exec.run_path(shard, req.layer, b, req.xq, req.sel, req.ew, req.flags & proto::REQ_FLAG_BATCHED != 0, &mut overlap)?;
+                drop(overlap);
                 let (miss1, page_ns1) = shard.layer_page_counters(req.layer);
                 let t_page_us = (page_ns1.saturating_sub(page_ns0) / 1000).min(u32::MAX as u64) as u32;
                 let n_miss_req = miss1.saturating_sub(miss0).min(u32::MAX as u64) as u32;

@@ -241,7 +241,7 @@ fn main() -> eyre::Result<()> {
             // Same executor path locally as remotely: `--batched` forces the
             // by-expert chain on both sides, so a mismatch is a real one and not
             // the known ~1e-7 batched-vs-decode difference.
-            exec.run_path(&mut local, layer, b, &xq, &sel, &ew, args.batched)?;
+            exec.run_path(&mut local, layer, b, &xq, &sel, &ew, args.batched, &mut |_| Ok(()))?;
             let mut ref32 = vec![0f32; b * N_EMBD as usize];
             exec.read_f32(b, &mut ref32)?;
             let mut ref16 = vec![0u16; b * N_EMBD as usize];
