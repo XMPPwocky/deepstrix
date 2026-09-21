@@ -789,12 +789,16 @@ impl Sched {
         // step's doubled dGPU chain (+55 ms) exceeds the box-2 wait it hides
         // (~30 ms), at 4 it is a wash; default to lanes from 6 rows.
         let pipelined = b >= env_usize("V41_MS_PIPELINE_MIN_ROWS", 6) && ms_pipeline();
-        // Three lanes (`V41_MS_LANES`, default 3) from `V41_MS_LANES3_MIN_ROWS`
-        // rows (default 6): box 2 then always has a request queued, which is
-        // what its early paging of the queued request needs (2026-09-21: two
-        // lanes run in lockstep with the hub's turnaround, queue depth <= 1,
-        // early paging covered 43% of non-resident experts).
-        let lanes3 = pipelined && env_usize("V41_MS_LANES", 3) >= 3 && b >= env_usize("V41_MS_LANES3_MIN_ROWS", 6) && b >= 3;
+        // Three lanes (`V41_MS_LANES=3`, DEFAULT 2) from `V41_MS_LANES3_MIN_ROWS`
+        // rows (default 6). MEASURED 2026-09-21 at 8 rows, box-1 hot set warm:
+        // 2 lanes 272 ms/step (27.2 tok/s), 3 lanes 324 (23.3). The third lane
+        // does keep a request queued on box 2 (its exposed wait fell 131 -> 24
+        // ms while box 1 was still paging its hash share), but every lane
+        // splits the rows further, so each request shares fewer expert reads:
+        // box-2 compute 94 -> 135 ms, dGPU 91 -> 126, box-1 iGPU 72 -> 93 per
+        // step, and box 2 -- the saturated resource -- ends up busier, not
+        // idler. Lanes cost bytes; only worth it when the pole has slack.
+        let lanes3 = pipelined && env_usize("V41_MS_LANES", 2) >= 3 && b >= env_usize("V41_MS_LANES3_MIN_ROWS", 6) && b >= 3;
         let fwd_only_ms;
         let logits = if lanes3 {
             let mut lanes: [(&mut v4flash_kernels::het::batch_scratch::BatchDgpuScratch, &mut v4flash_kernels::het::batch_scratch::BatchIgpuScratch, &mut RowTablesDev); 3] =
