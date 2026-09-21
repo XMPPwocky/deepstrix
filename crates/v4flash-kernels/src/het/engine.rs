@@ -460,7 +460,17 @@ pub struct HeterogeneousEngine {
 /// start.
 fn connect_remote_experts() -> Option<std::sync::Mutex<super::remote_experts::RemoteExpertClient>> {
     let addr = std::env::var("V41_REMOTE_ADDR").ok()?;
-    let opts = super::remote_experts::SocketOptions::default();
+    let mut opts = super::remote_experts::SocketOptions::default();
+    // Link A/B knobs (profile audit 2026-09-21: the hub's socket sees ~24k
+    // out-of-order segments and box 2 sends ~3.8k spurious retransmits per
+    // 8-row burst; suspects are the hub's SO_BUSY_POLL receive path and the
+    // delayed ACKs that inflate box 2's srtt to ~6 ms).
+    if let Some(v) = std::env::var("V41_REMOTE_BUSY_POLL_US").ok().and_then(|v| v.parse().ok()) {
+        opts.busy_poll_us = v;
+    }
+    if std::env::var("V41_REMOTE_QUICKACK").as_deref() == Ok("1") {
+        opts.quickack = true;
+    }
     match super::remote_experts::RemoteExpertClient::connect(&addr, &opts) {
         Ok(c) => {
             let info = c.info();
