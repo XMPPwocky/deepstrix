@@ -485,6 +485,15 @@ fn pager_read_batch() -> usize {
 /// ~21 misses/token x 6.1 ms) while box 1's slots and drive idled. Fed only by
 /// box 1's misses, box 2's LRU converges to what box 1 does NOT hold, so the
 /// pair is exclusive without any hint protocol.
+/// `V41_B1_PAGE_MISSES=1`: box 1 pages the misses of its partition half itself
+/// (batched driver pick loop). Split with `V41_PARTITION_BOX1_SHARE`
+/// (bandwidth-proportional: ~0.5 with today's drives).
+pub fn b1_page_misses() -> bool {
+    static B: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_B1_PAGE_MISSES").as_deref() == Ok("1"));
+    *B
+}
+
 pub fn b1_prefetch() -> bool {
     static B: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("V41_B1_PREFETCH").as_deref() == Ok("1"));

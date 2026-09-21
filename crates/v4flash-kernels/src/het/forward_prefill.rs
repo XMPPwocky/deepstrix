@@ -5588,6 +5588,18 @@ impl HeterogeneousEngine {
                                 extra_remote[sv as usize] = true;
                                 continue;
                             }
+                            // PARTITIONED PAGING (`V41_B1_PAGE_MISSES=1`): box 1's
+                            // hash-half is paged from box 1's OWN disk (concurrent
+                            // misses, `V41_PAGER_MISS_PAR`) and computed here, so both
+                            // NVMes carry miss traffic (MEASURED 2026-09-21: box 1
+                            // 4.2 GB/s + box 2 3.4). Overrides the prefetch hand-off
+                            // below and the small-B catch-all for this half; only
+                            // sensible with the two-lane step, which hides the read
+                            // under box 2's leg.
+                            if super::expert_pager::b1_page_misses() {
+                                ids.push(sv as u32);
+                                continue;
+                            }
                             // Box 1's share but NOT resident. `ensure` would read it
                             // from this box's dm-crypt disk SYNCHRONOUSLY, blocking
                             // the layer: measured 285 ms of a 375 ms verify step (42
