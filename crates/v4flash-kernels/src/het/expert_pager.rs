@@ -332,12 +332,102 @@ pub fn set_partition_share(box1_slots: u32, box2_slots: u32) {
         eprintln!("expert pager: T2 PARTITION on: box 1 takes {:.1}% of expert ids (box1 {box1_slots} slots, box2 {box2_slots})", m as f32 / 10.0);
     }
 }
-/// Home of `(layer, e)` under the partition: true = box 2.
+/// Home of `(layer, e)` under the partition: true = box 2. With the HOT-SET
+/// ownership warm (`hot_set`), box 1 owns each layer's hottest ids by
+/// measured decode pick mass and everything else is box 2's; before that (or
+/// with `V41_B1_HOT=0`) the hash split by `V41_PARTITION_BOX1_SHARE`.
 pub fn partition_box2(layer: i32, e: u32) -> bool {
+    if let Some(own) = hot_set::box1_owns(layer, e) {
+        return !own;
+    }
     let m = PARTITION_BOX1_MILLI.load(std::sync::atomic::Ordering::Relaxed);
     let m = if m == u32::MAX { 420 } else { m };
     let h = ((layer as u64) * 1000003 + (e as u64) * 7919) % 1000;
     h >= m as u64
+}
+
+/// HOT-SET OWNERSHIP (2026-09-22). Box 1's pool (4,150 slots ~ 104/layer) is
+/// large enough to hold the hottest ~25% of every layer's experts permanently,
+/// and routing is Zipfian, so those ids carry most picks. Owning THEM instead
+/// of a random hash slice makes box 1's synchronous miss reads (the step's pole
+/// under partitioned paging) nearly vanish, and keeps most of the MoE compute
+/// on box 1's otherwise idle iGPU; box 2 becomes the cold tier, whose paging is
+/// hidden. The set is measured LIVE (a static placement retains only ~30% of
+/// its coverage held out): decode picks are counted per (layer, expert), the
+/// per-layer top-K by count (K = `V41_B1_HOT_PER_LAYER`, default 90; also
+/// capped at `V41_B1_HOT_MASS` of the layer's mass) is recomputed by the
+/// scheduler every `V41_B1_HOT_REFRESH` steps with the counts halved (decaying
+/// window). Until the first refresh with enough data the hash split applies.
+pub mod hot_set {
+    use crate::config::{N_EXPERT, N_LAYER};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+    const NE: usize = N_EXPERT as usize;
+    const NL: usize = N_LAYER as usize;
+    static COUNTS: [AtomicU32; NL * NE] = [const { AtomicU32::new(0) }; NL * NE];
+    static OWN: [AtomicBool; NL * NE] = [const { AtomicBool::new(false) }; NL * NE];
+    static WARM: AtomicBool = AtomicBool::new(false);
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub fn enabled() -> bool {
+        static B: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var("V41_B1_HOT").as_deref() != Ok("0"));
+        *B
+    }
+    /// Count a decode pick.
+    #[inline]
+    pub fn note_pick(layer: usize, e: u32) {
+        if layer < NL && (e as usize) < NE {
+            COUNTS[layer * NE + e as usize].fetch_add(1, Relaxed);
+            TOTAL.fetch_add(1, Relaxed);
+        }
+    }
+    /// `Some(owned)` once warm, `None` before.
+    #[inline]
+    pub fn box1_owns(layer: i32, e: u32) -> Option<bool> {
+        if !WARM.load(Relaxed) || layer < 0 || layer as usize >= NL || (e as usize) >= NE {
+            return None;
+        }
+        Some(OWN[layer as usize * NE + e as usize].load(Relaxed))
+    }
+    pub fn picks_seen() -> u64 { TOTAL.load(Relaxed) }
+    fn env_f(k: &str, d: f32) -> f32 { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }
+    fn env_u(k: &str, d: usize) -> usize { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }
+    /// Recompute the ownership from the counts and decay them. Returns
+    /// (owned ids total, mass fraction covered, changed ids) or None when
+    /// there is not enough data yet (< `V41_B1_HOT_MIN_PICKS`, default 20000).
+    pub fn refresh() -> Option<(usize, f32, usize)> {
+        if !enabled() || TOTAL.load(Relaxed) < env_u("V41_B1_HOT_MIN_PICKS", 20_000) as u64 {
+            return None;
+        }
+        let per_layer = env_u("V41_B1_HOT_PER_LAYER", 90).min(NE);
+        let mass_cap = env_f("V41_B1_HOT_MASS", 0.9).clamp(0.0, 1.0);
+        let (mut owned, mut changed, mut mass_sum) = (0usize, 0usize, 0f32);
+        for l in 0..NL {
+            let mut v: Vec<(u32, usize)> = (0..NE).map(|e| (COUNTS[l * NE + e].load(Relaxed), e)).collect();
+            let total: u64 = v.iter().map(|&(c, _)| c as u64).sum();
+            v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            let mut acc = 0u64;
+            let mut own = vec![false; NE];
+            for (i, &(c, e)) in v.iter().enumerate() {
+                if i >= per_layer || c == 0 || (total > 0 && acc as f32 / total as f32 >= mass_cap) {
+                    break;
+                }
+                own[e] = true;
+                acc += c as u64;
+            }
+            mass_sum += if total > 0 { acc as f32 / total as f32 } else { 0.0 };
+            for e in 0..NE {
+                let prev = OWN[l * NE + e].swap(own[e], Relaxed);
+                if prev != own[e] { changed += 1; }
+                if own[e] { owned += 1; }
+                // decay: half-life = one refresh interval
+                let c = COUNTS[l * NE + e].load(Relaxed);
+                COUNTS[l * NE + e].store(c / 2, Relaxed);
+            }
+        }
+        TOTAL.store(TOTAL.load(Relaxed) / 2, Relaxed);
+        WARM.store(true, Relaxed);
+        Some((owned, mass_sum / NL as f32, changed))
+    }
 }
 
 /// Per-layer count of box-2 DECODE misses (from the `miss_mask` box 2 returns

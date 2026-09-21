@@ -677,6 +677,14 @@ impl Sched {
 
     /// One batched decode step over every live stream.
     fn decode_step(&mut self, state: &mut WorkerState) -> eyre::Result<()> {
+        // Hot-set ownership refresh (see expert_pager::hot_set); `tick` is
+        // advanced once per scheduler tick.
+        if self.tick % env_usize("V41_B1_HOT_REFRESH", 500) as u64 == 0 {
+            if let Some((owned, mass, changed)) = v4flash_kernels::het::expert_pager::hot_set::refresh() {
+                tracing::info!(owned, per_layer = owned / v4flash_kernels::config::N_LAYER as usize, mass = format!("{mass:.3}"), changed,
+                    picks = v4flash_kernels::het::expert_pager::hot_set::picks_seen(), "multistream: box-1 hot set refreshed");
+            }
+        }
         // Token boundary: nothing is reading the pool (the previous step and
         // chunk both synchronized), so admit box-1's background-read experts
         // (`V41_B1_PREFETCH`, catch-all mode: misses are computed on box 2 and

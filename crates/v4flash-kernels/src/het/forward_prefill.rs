@@ -5561,7 +5561,13 @@ impl HeterogeneousEngine {
                 let mut seen = vec![false; N_EXPERT as usize];
                 let mut ids: Vec<u32> = Vec::with_capacity(N_EXPERT as usize);
                 let mut skipped_remote = 0usize;
+                let note_hot = super::expert_pager::hot_set::enabled() && (b as usize) <= small_b_catchall_max().max(8);
                 for &sv in &sel_host {
+                    if note_hot && (0..N_EXPERT as i32).contains(&sv) {
+                        // Every pick (not just the first per expert): the mass
+                        // is what the hot set is ranked by.
+                        super::expert_pager::hot_set::note_pick(layer as usize, sv as u32);
+                    }
                     if (0..N_EXPERT as i32).contains(&sv) && !seen[sv as usize] {
                         seen[sv as usize] = true;
                         if let Some(o) = owns_remote.as_ref() {
