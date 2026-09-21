@@ -66,7 +66,7 @@ pub struct ExpertPager {
     /// request that is ~11 s of pure copy per request.
     ///
     /// NON_COHERENT so the iGPU may cache its reads (see `PinnedBuffer`).
-    stage: [v4flash_hip::PinnedBuffer<u8>; 3],
+    stages: Vec<[v4flash_hip::PinnedBuffer<u8>; 3]>,
     /// Scratch remap of length `N_EXPERT`: global id -> slot, or -1 if absent.
     remap: Vec<i32>,
     /// Device copy of `remap`, ONE BUFFER PER LAYER.
@@ -435,6 +435,16 @@ fn pager_coalesce_check() -> bool {
 /// Threads used to service ONE decode miss (`V41_PAGER_MISS_THREADS`). 1 (default) is
 /// the original serial gate->up->down read; 3 puts one thread on each role. See the
 /// comment at the call site; this is the M8-E floor measurement.
+/// `V41_PAGER_MISS_PAR=N`: missing experts of one `ensure` call read concurrently
+/// (default 4). MEASURED 2026-09-21 on box 1's btrfs-on-dm-crypt volume with
+/// random 18.8 MB O_DIRECT reads: 2.7 GB/s at 1 reader, 3.8 at 4, 4.2 at 8.
+fn pager_miss_par() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_PAGER_MISS_PAR").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
+    });
+    (*N).clamp(1, 16)
+}
+
 fn miss_read_threads() -> usize {
     static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         std::env::var("V41_PAGER_MISS_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
@@ -1110,7 +1120,7 @@ impl ExpertPager {
                     .map(|_| std::sync::atomic::AtomicU32::new(0))
                     .collect()
             }),
-            stage: {
+            stages: {
                 // Per-role sizing is enough for the three separate reads, but a
                 // COALESCED read puts ALL THREE roles' nibbles in stage[0] and all
                 // three scales in stage[1], so those two need room for the whole
@@ -1123,14 +1133,19 @@ impl ExpertPager {
                 } else {
                     (gate_bpe, up_bpe)
                 };
-                [
-                    v4flash_hip::PinnedBuffer::new_with_flags(
-                        w0, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
-                    v4flash_hip::PinnedBuffer::new_with_flags(
-                        w1, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
-                    v4flash_hip::PinnedBuffer::new_with_flags(
-                        down_bpe, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
-                ]
+                // One set per concurrent miss read (`V41_PAGER_MISS_PAR`).
+                let mut v = Vec::new();
+                for _ in 0..pager_miss_par() {
+                    v.push([
+                        v4flash_hip::PinnedBuffer::new_with_flags(
+                            w0, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
+                        v4flash_hip::PinnedBuffer::new_with_flags(
+                            w1, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
+                        v4flash_hip::PinnedBuffer::new_with_flags(
+                            down_bpe, v4flash_hip::HIP_HOST_MALLOC_NON_COHERENT)?,
+                    ]);
+                }
+                v
             },
             remap: (0..N_EXPERT as i32).map(|e| -e - 1).collect(),
             remap_dev,
@@ -2141,6 +2156,114 @@ impl ExpertPager {
             n_slots: n as u32,
         }
     }
+    /// Read ONE missing expert into a staging set (pure I/O + CPU repack; runs
+    /// for several misses concurrently under `V41_PAGER_MISS_PAR`). Returns the
+    /// coalesced offsets when the two-pread path was taken.
+    #[allow(clippy::too_many_arguments)]
+    fn read_miss_into(
+        owner: &V41HfWeights,
+        gpu_repack: bool,
+        layer: i32,
+        id: u32,
+        names: &[String; 3],
+        b0: &mut [u8],
+        b1: &mut [u8],
+        b2: &mut [u8],
+    ) -> eyre::Result<Option<[(usize, usize, u32, u32); 3]>> {
+            // ONE span for all three roles' nibbles + one for their scales.
+            // `None` => this checkpoint's planes are not contiguous; fall through
+            // to the per-role reads below, which are always correct.
+            let mut coalesced: Option<[(usize, usize, u32, u32); 3]> = None;
+            if gpu_repack && pager_coalesce() {
+                let src = WeightSrc::from(owner);
+                let (t0, t1, t2) = (src.tensor(&names[0]), src.tensor(&names[1]), src.tensor(&names[2]));
+                if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
+                    coalesced = src.read_expert_runs_direct(
+                        [&t0, &t1, &t2], id as usize,
+                        &mut *b0, &mut *b1,
+                    )?;
+                }
+            }
+            if let (true, Some(offs)) = (pager_coalesce_check(), coalesced) {
+                // Re-read each role the per-role way into stage[2] and compare the
+                // bytes the coalesced read placed at its own residues.
+                let src = WeightSrc::from(owner);
+                for r in 0..3 {
+                    let Some(t) = src.tensor(&names[r]) else { continue };
+                    let (po, so, out2, nb2) = offs[r];
+                    let (plen, slen) = (out2 as usize * nb2 as usize * 16, out2 as usize * nb2 as usize);
+                    let mut refbuf = vec![0u8; plen + slen];
+                    if src.read_expert_hf_layout(&t, id as usize, &mut refbuf)? {
+                        let got_p = &b0[po..po + plen];
+                        let got_s = &b1[so..so + slen];
+                        if got_p != &refbuf[..plen] {
+                            let i = got_p.iter().zip(&refbuf[..plen]).position(|(a, b)| a != b).unwrap_or(0);
+                            eprintln!("PAGER_COALESCE_CHECK L{layer} e{id} role{r}: PACKED differs at byte {i} of {plen}");
+                        }
+                        if got_s != &refbuf[plen..] {
+                            let i = got_s.iter().zip(&refbuf[plen..]).position(|(a, b)| a != b).unwrap_or(0);
+                            eprintln!("PAGER_COALESCE_CHECK L{layer} e{id} role{r}: SCALE differs at byte {i} of {slen}");
+                        }
+                    }
+                }
+            }
+            if coalesced.is_some() {
+                // bytes already staged; skip the per-role reads
+            } else if miss_read_threads() > 1 {
+                // MEASUREMENT (M8-E, `V41_PAGER_MISS_THREADS`): the three roles of one
+                // miss are three independent 6.3 MB (pread + scalar repack) jobs. Serially
+                // they run at ~3.1 GB/s, well under the NVMe's 4.3 GB/s, and the repack is
+                // pure single-core CPU — so the serial read is neither at the device floor
+                // nor overlapping the CPU with the device. One thread per role is the
+                // cheapest test of where the floor actually is. Default 1 = old behaviour.
+                let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+                std::thread::scope(|sc| {
+                    for (name, dst) in [
+                        (&names[0], &mut *b0),
+                        (&names[1], &mut *b1),
+                        (&names[2], &mut *b2),
+                    ] {
+                        let err = &err;
+                        sc.spawn(move || {
+                            let src = WeightSrc::from(owner);
+                            match src.tensor(name) {
+                                None => *err.lock().unwrap() = Some(format!("missing {name}")),
+                                Some(t) => {
+                                    let r = if gpu_repack {
+                                        src.read_expert_hf_layout(t, id as usize, dst).map(|_| ())
+                                    } else {
+                                        src.read_expert_into(t, id as usize, dst)
+                                    };
+                                    if let Err(e) = r {
+                                        *err.lock().unwrap() = Some(format!("{e:#}"));
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+                let failed = err.lock().unwrap().take();
+                if let Some(e) = failed {
+                    return Err(eyre!("expert pager miss read: {e}"));
+                }
+            } else {
+                let src = WeightSrc::from(owner);
+                let tg = src.tensor(&names[0]).ok_or_else(|| eyre!("{}", names[0]))?;
+                let tu = src.tensor(&names[1]).ok_or_else(|| eyre!("{}", names[1]))?;
+                let td = src.tensor(&names[2]).ok_or_else(|| eyre!("{}", names[2]))?;
+                if gpu_repack {
+                    src.read_expert_hf_layout(tg, id as usize, b0)?;
+                    src.read_expert_hf_layout(tu, id as usize, b1)?;
+                    src.read_expert_hf_layout(td, id as usize, b2)?;
+                } else {
+                    src.read_expert_into(tg, id as usize, b0)?;
+                    src.read_expert_into(tu, id as usize, b1)?;
+                    src.read_expert_into(td, id as usize, b2)?;
+                }
+            }
+        Ok(coalesced)
+    }
+
 
     /// Upload one miss's three roles in HF layout and permute them into `slot`
     /// on the iGPU.
@@ -2288,6 +2411,7 @@ impl ExpertPager {
             format!("blk.{layer}.ffn_down_exps.weight"),
         ];
         let gpu_repack = self.repack.is_some();
+        let mut pending: Vec<(u32, u32)> = Vec::new();
         for &id in ids {
             if self.count_as_prefill {
                 self.prefill_requests += 1;
@@ -2374,112 +2498,47 @@ impl ExpertPager {
             // Scope the source borrow so the device upload + bookkeeping below can
             // take `&mut self` (owner and the stage/routed fields are disjoint, but
             // `self.touch()` needs all of self).
+            // Slot claimed NOW so the next miss cannot pick it again; the remap
+            // entry is written once the bytes have landed.
+            self.slot_of.insert(key, slot);
+            self.slot_key[slot as usize] = Some(key);
+            self.touch(slot);
+            pending.push((id, slot));
+        }
+        // Read the misses `stages.len()` at a time, concurrently, then upload /
+        // repack in order (see `pager_miss_par`).
+        let k = self.stages.len().max(1);
+        let pending = std::mem::take(&mut pending);
+        for chunk in pending.chunks(k) {
             let t_read = std::time::Instant::now();
             let rp0 = v4flash_core::hf_v41::expert_read_profile();
             let sp0 = v4flash_core::hf_v41::expert_read_split();
             let pa0 = v4flash_core::hf_v41::expert_read_paths();
-            // ONE span for all three roles' nibbles + one for their scales.
-            // `None` => this checkpoint's planes are not contiguous; fall through
-            // to the per-role reads below, which are always correct.
-            let mut coalesced: Option<[(usize, usize, u32, u32); 3]> = None;
-            if gpu_repack && pager_coalesce() {
-                let src = WeightSrc::from(&self.owner);
-                let (t0, t1, t2) = (src.tensor(&names[0]), src.tensor(&names[1]), src.tensor(&names[2]));
-                if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
-                    let (a, b) = self.stage.split_at_mut(1);
-                    coalesced = src.read_expert_runs_direct(
-                        [&t0, &t1, &t2], id as usize,
-                        a[0].as_mut_slice(), b[0].as_mut_slice(),
-                    )?;
-                }
-            }
-            if let (true, Some(offs)) = (pager_coalesce_check(), coalesced) {
-                // Re-read each role the per-role way into stage[2] and compare the
-                // bytes the coalesced read placed at its own residues.
-                let src = WeightSrc::from(&self.owner);
-                for r in 0..3 {
-                    let Some(t) = src.tensor(&names[r]) else { continue };
-                    let (po, so, out2, nb2) = offs[r];
-                    let (plen, slen) = (out2 as usize * nb2 as usize * 16, out2 as usize * nb2 as usize);
-                    let mut refbuf = vec![0u8; plen + slen];
-                    if src.read_expert_hf_layout(&t, id as usize, &mut refbuf)? {
-                        let got_p = &self.stage[0].as_slice()[po..po + plen];
-                        let got_s = &self.stage[1].as_slice()[so..so + slen];
-                        if got_p != &refbuf[..plen] {
-                            let i = got_p.iter().zip(&refbuf[..plen]).position(|(a, b)| a != b).unwrap_or(0);
-                            eprintln!("PAGER_COALESCE_CHECK L{layer} e{id} role{r}: PACKED differs at byte {i} of {plen}");
-                        }
-                        if got_s != &refbuf[plen..] {
-                            let i = got_s.iter().zip(&refbuf[plen..]).position(|(a, b)| a != b).unwrap_or(0);
-                            eprintln!("PAGER_COALESCE_CHECK L{layer} e{id} role{r}: SCALE differs at byte {i} of {slen}");
-                        }
-                    }
-                }
-            }
-            if coalesced.is_some() {
-                // bytes already staged; skip the per-role reads
-            } else if miss_read_threads() > 1 {
-                // MEASUREMENT (M8-E, `V41_PAGER_MISS_THREADS`): the three roles of one
-                // miss are three independent 6.3 MB (pread + scalar repack) jobs. Serially
-                // they run at ~3.1 GB/s, well under the NVMe's 4.3 GB/s, and the repack is
-                // pure single-core CPU — so the serial read is neither at the device floor
-                // nor overlapping the CPU with the device. One thread per role is the
-                // cheapest test of where the floor actually is. Default 1 = old behaviour.
+            type R = Result<Option<[(usize, usize, u32, u32); 3]>, String>;
+            let mut results: Vec<R> = Vec::with_capacity(chunk.len());
+            {
                 let owner = &self.owner;
-                let [sg, su, sd] = &mut self.stage;
-                let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+                let stages = &mut self.stages;
+                let names = &names;
                 std::thread::scope(|sc| {
-                    for (name, dst) in [
-                        (&names[0], sg.as_mut_slice()),
-                        (&names[1], su.as_mut_slice()),
-                        (&names[2], sd.as_mut_slice()),
-                    ] {
-                        let err = &err;
-                        sc.spawn(move || {
-                            let src = WeightSrc::from(owner);
-                            match src.tensor(name) {
-                                None => *err.lock().unwrap() = Some(format!("missing {name}")),
-                                Some(t) => {
-                                    let r = if gpu_repack {
-                                        src.read_expert_hf_layout(t, id as usize, dst).map(|_| ())
-                                    } else {
-                                        src.read_expert_into(t, id as usize, dst)
-                                    };
-                                    if let Err(e) = r {
-                                        *err.lock().unwrap() = Some(format!("{e:#}"));
-                                    }
-                                }
-                            }
-                        });
+                    let mut hs = Vec::with_capacity(chunk.len());
+                    for (&(id, _), st) in chunk.iter().zip(stages.iter_mut()) {
+                        let [p0, p1, p2] = st;
+                        let (b0, b1, b2) = (p0.as_mut_slice(), p1.as_mut_slice(), p2.as_mut_slice());
+                        hs.push(sc.spawn(move || -> R {
+                            Self::read_miss_into(owner, gpu_repack, layer, id, names, b0, b1, b2)
+                                .map_err(|e| format!("{e:#}"))
+                        }));
+                    }
+                    for h in hs {
+                        results.push(h.join().unwrap_or_else(|_| Err("miss reader panicked".into())));
                     }
                 });
-                let failed = err.lock().unwrap().take();
-                if let Some(e) = failed {
-                    return Err(eyre!("expert pager miss read: {e}"));
-                }
-            } else {
-                let src = WeightSrc::from(&self.owner);
-                let tg = src.tensor(&names[0]).ok_or_else(|| eyre!("{}", names[0]))?;
-                let tu = src.tensor(&names[1]).ok_or_else(|| eyre!("{}", names[1]))?;
-                let td = src.tensor(&names[2]).ok_or_else(|| eyre!("{}", names[2]))?;
-                if gpu_repack {
-                    // HF layout in, permutation deferred to the iGPU below.
-                    let [sg, su, sd] = &mut self.stage;
-                    src.read_expert_hf_layout(tg, id as usize, sg.as_mut_slice())?;
-                    src.read_expert_hf_layout(tu, id as usize, su.as_mut_slice())?;
-                    src.read_expert_hf_layout(td, id as usize, sd.as_mut_slice())?;
-                } else {
-                    let [sg, su, sd] = &mut self.stage;
-                    src.read_expert_into(tg, id as usize, sg.as_mut_slice())?;
-                    src.read_expert_into(tu, id as usize, su.as_mut_slice())?;
-                    src.read_expert_into(td, id as usize, sd.as_mut_slice())?;
-                }
             }
             let read_ns = t_read.elapsed().as_nanos() as u64;
             let rp1 = v4flash_core::hf_v41::expert_read_profile();
             let sp1 = v4flash_core::hf_v41::expert_read_split();
             let pa1 = v4flash_core::hf_v41::expert_read_paths();
-            // These four have no prefill twin and stay BOTH-PHASE totals.
             self.decode_n_layout += pa1.0 - pa0.0;
             self.decode_n_runs += pa1.1 - pa0.1;
             self.decode_n_direct += pa1.2 - pa0.2;
@@ -2488,20 +2547,6 @@ impl ExpertPager {
             self.decode_weight_bytes += sp1.1 - sp0.1;
             self.decode_scale_ns += sp1.2 - sp0.2;
             self.decode_scale_bytes += sp1.3 - sp0.3;
-            // Route the timers to the SAME phase the miss COUNT went to above.
-            // `ensure` is the path a REAL prefill chunk runs, and it filed every
-            // nanosecond under `decode_*` while its miss count went to
-            // `prefill_misses` -- precisely the mismatch the prefill twins were
-            // added to fix for `ensure_batched`, which `ensure` never got. Two
-            // consequences, both live until 2026-09-18:
-            //   * `prefill_read_ms` logged 0 on every request that actually
-            //     prefilled, so prefill's paging cost was invisible -- you
-            //     cannot decide whether to overlap a cost you cannot see;
-            //   * the per-request `decode_ms_per_miss` carried prefill's reads
-            //     in the numerator and none of its misses in the denominator,
-            //     which is why it read 15-28 ms against a decode HEARTBEAT of a
-            //     tight 8.4-9.3. The heartbeat is unaffected: it deltas between
-            //     beats during generation, where no prefill runs.
             if self.count_as_prefill {
                 self.prefill_read_ns += read_ns;
                 self.prefill_alloc_ns += rp1.1 - rp0.1;
@@ -2515,52 +2560,40 @@ impl ExpertPager {
                 self.decode_repack_ns += rp1.3 - rp0.3;
                 self.decode_pread_bytes += rp1.4 - rp0.4;
             }
-            let t_h2d = std::time::Instant::now();
-            let gbpe = self.routed.gate_bytes_per_expert;
-            let ubpe = self.routed.up_bytes_per_expert;
-            let dbpe = self.routed.down_bytes_per_expert;
-            if gpu_repack {
-                let (rp, st) = (self.repack.as_ref().unwrap(), self.repack_stream.as_ref().unwrap());
-                let gpu_ns =
-                    Self::repack_in_place(rp, st, &mut self.routed, slot, &self.stage, coalesced)?;
-                if self.count_as_prefill {
-                    self.prefill_repack_gpu_ns += gpu_ns;
+            for (ci, (&(id, slot), res)) in chunk.iter().zip(results).enumerate() {
+                let coalesced = res.map_err(|m| eyre!("expert pager miss read L{layer} e{id}: {m}"))?;
+                let t_h2d = std::time::Instant::now();
+                let gbpe = self.routed.gate_bytes_per_expert;
+                let ubpe = self.routed.up_bytes_per_expert;
+                let dbpe = self.routed.down_bytes_per_expert;
+                if gpu_repack {
+                    let (rp, st) = (self.repack.as_ref().unwrap(), self.repack_stream.as_ref().unwrap());
+                    let gpu_ns =
+                        Self::repack_in_place(rp, st, &mut self.routed, slot, &self.stages[ci], coalesced)?;
+                    if self.count_as_prefill {
+                        self.prefill_repack_gpu_ns += gpu_ns;
+                    } else {
+                        self.decode_repack_gpu_ns += gpu_ns;
+                    }
                 } else {
-                    self.decode_repack_gpu_ns += gpu_ns;
+                    let st = &self.stages[ci];
+                    self.routed.gate.buffer.slice_view_mut(slot as usize * gbpe, gbpe).copy_from_host(st[0].as_slice())?;
+                    self.routed.up.buffer.slice_view_mut(slot as usize * ubpe, ubpe).copy_from_host(st[1].as_slice())?;
+                    self.routed.down.buffer.slice_view_mut(slot as usize * dbpe, dbpe).copy_from_host(st[2].as_slice())?;
                 }
-            } else {
-                self.routed
-                    .gate
-                    .buffer
-                    .slice_view_mut(slot as usize * gbpe, gbpe)
-                    .copy_from_host(self.stage[0].as_slice())?;
-                self.routed
-                    .up
-                    .buffer
-                    .slice_view_mut(slot as usize * ubpe, ubpe)
-                    .copy_from_host(self.stage[1].as_slice())?;
-                self.routed
-                    .down
-                    .buffer
-                    .slice_view_mut(slot as usize * dbpe, dbpe)
-                    .copy_from_host(self.stage[2].as_slice())?;
+                let h2d_ns = t_h2d.elapsed().as_nanos() as u64;
+                if self.count_as_prefill {
+                    self.prefill_h2d_ns += h2d_ns;
+                } else {
+                    self.decode_h2d_ns += h2d_ns;
+                }
+                assert!(
+                    slot < self.n_slots,
+                    "expert pager: L{layer} e{id} paged into slot {slot} >= pool size {}",
+                    self.n_slots
+                );
+                self.remap[id as usize] = -(slot as i32) - 1;
             }
-            let h2d_ns = t_h2d.elapsed().as_nanos() as u64;
-            if self.count_as_prefill {
-                self.prefill_h2d_ns += h2d_ns;
-            } else {
-                self.decode_h2d_ns += h2d_ns;
-            }
-            self.slot_of.insert(key, slot);
-            self.slot_key[slot as usize] = Some(key);
-            self.touch(slot);
-            // ABSOLUTE pool slot; see the resident-hit branch above.
-            assert!(
-                slot < self.n_slots,
-                "expert pager: L{layer} e{id} paged into slot {slot} >= pool size {}",
-                self.n_slots
-            );
-            self.remap[id as usize] = -(slot as i32) - 1;
         }
         // Split the blocking H2D out of the rest of `ensure`. With zero misses
         // this 1536-byte copy is the ONLY device op in the call, and the call
