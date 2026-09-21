@@ -2082,9 +2082,9 @@ impl ExpertShard {
                 let lu = &mut pool.last_use[slot as usize];
                 if scan_class {
                     // Prefill hit: refresh only within the prefill class.
-                    if *lu < PREFILL_AGE { *lu = pool.tick.saturating_sub(PREFILL_AGE).max(1); }
+                    if *lu < PREFILL_AGE { *lu = pool.tick; }
                 } else {
-                    *lu = pool.tick;
+                    *lu = pool.tick + PREFILL_AGE;
                 }
                 continue;
             }
@@ -2158,7 +2158,7 @@ impl ExpertShard {
             pool.slot_of.insert((layer, e), victim);
             pool.held[layer as usize] += 1;
             pool.tick += 1;
-            pool.last_use[victim as usize] = if scan_class { pool.tick.saturating_sub(PREFILL_AGE).max(1) } else { pool.tick };
+            pool.last_use[victim as usize] = if scan_class { pool.tick } else { pool.tick + PREFILL_AGE };
             pending.push((e, victim));
         }
         // Read the misses `stages.len()` at a time, concurrently (MEASURED on box
