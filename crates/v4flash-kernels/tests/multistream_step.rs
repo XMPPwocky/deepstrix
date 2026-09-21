@@ -519,7 +519,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             let rows_b: Vec<Vec<f32>> = rows;
             engine.forward_step_arena(
                 &mut bd_a, &mut bi_a, &mut sd, &mut si, &mut arena_alone, &mut dev, &[slots_alone[s]], &weights,
-                &[embed(tok)?], &[tok], Some(&rows_b), Some(&mut pg),
+                &[embed(tok)?], &[tok], &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b.clone())), Some(&mut pg),
             )?;
             let l = engine.head_rows(&mut ds, &bd_a, 1, &weights)?;
             logits_alone[s].push(l);
@@ -547,7 +547,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         let t0 = std::time::Instant::now();
         engine.forward_step_arena(
             &mut bd_a, &mut bi_a, &mut sd, &mut si, &mut arena_batch, &mut dev, &slots_batch, &weights,
-            &hcs, &toks, Some(&rows_b), Some(&mut pg),
+            &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b.clone())), Some(&mut pg),
         )?;
         let all = engine.head_rows(&mut ds, &bd_a, n_streams, &weights)?;
         step_ms.push(t0.elapsed().as_secs_f64() * 1e3);

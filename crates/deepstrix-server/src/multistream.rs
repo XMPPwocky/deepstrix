@@ -20,7 +20,7 @@ use std::time::Instant;
 use color_eyre::eyre::{self, eyre};
 use tokio::sync::mpsc;
 use v4flash_kernels::config::{ENGRAM_IN, HC_DIM, N_VOCAB};
-use v4flash_kernels::het::forward_prefill::PrefillJob;
+use v4flash_kernels::het::forward_prefill::{LazyEngramRows, PrefillJob};
 use v4flash_kernels::het::kv_arena::{KvArena, RowTablesDev};
 use v4flash_kernels::het::SampleMode;
 use v4flash_kernels::sampler::SamplerRng;
@@ -732,43 +732,25 @@ impl Sched {
             embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, t, &mut v);
             hcs.push(v);
         }
-        // Engram rows: one hash per row from its own stream's sequence.
+        // Engram rows: one hash per row from its own stream's sequence. The
+        // hashing stays here (cheap); the SSD gather (13.8 ms/step at 8 rows,
+        // 5-26, profile audit 2026-09-21) runs on a helper thread under layer 0
+        // and is joined at the first Engram layer (`LazyEngramRows`); the
+        // exposed remainder shows as `lh.engram_join`.
         let ein = ENGRAM_IN as usize;
         let t_eng = Instant::now();
-        let engram_rows: Option<Vec<Vec<f32>>> = match (state.pager.as_ref(), state.engram.as_ref()) {
-            (Some(pg), Some(ec)) => {
-                let mut rows = vec![vec![0f32; b * ein]; ec.tables.len()];
-                // ONE batched gather per table over all live rows (as the
-                // prefill path does), not `gather_position` per row: that
-                // spawned 24 threads per (row, layer) and serialised ten disk
-                // round trips per 5-row step, which cost 0.8-5.7 s whenever the
-                // page cache had been flushed by prefill or a snapshot save
-                // (2026-09-21 03:39-03:44). Gathered rows land at row r; DEAD
-                // (image) rows stay zero.
-                let mut live: Vec<(usize, [[i64; v4flash_core::engram_hash::ENGRAM_COLS]; v4flash_core::engram_hash::ENGRAM_LAYERS])> = Vec::with_capacity(b);
-                for (r, s) in self.streams.iter().enumerate() {
-                    // `seq` already ends with `next` (pushed when it was chosen).
-                    let pos = s.seq.len() - 1;
-                    if s.compressed[pos] == v4flash_core::engram_hash::DEAD { continue; }
-                    live.push((r, ec.hasher.hash_ids(&s.compressed, pos)));
-                }
-                if !live.is_empty() {
-                    const GATHER_THREADS: usize = 32;
-                    let mut tmp = vec![0f32; live.len() * ein];
-                    for (li, tbl) in ec.tables.iter().enumerate() {
-                        let flat: Vec<i64> = live.iter().flat_map(|(_, h)| h[li]).collect();
-                        tbl.gather(pg.raw(), &flat, &mut tmp, GATHER_THREADS)?;
-                        for (k, (r, _)) in live.iter().enumerate() {
-                            rows[li][r * ein..(r + 1) * ein].copy_from_slice(&tmp[k * ein..(k + 1) * ein]);
-                        }
-                    }
-                }
-                Some(rows)
+        let engram_on = state.pager.is_some() && state.engram.is_some();
+        let mut live: Vec<(usize, [[i64; v4flash_core::engram_hash::ENGRAM_COLS]; v4flash_core::engram_hash::ENGRAM_LAYERS])> = Vec::with_capacity(b);
+        if let Some(ec) = state.engram.as_ref().filter(|_| engram_on) {
+            for (r, s) in self.streams.iter().enumerate() {
+                // `seq` already ends with `next` (pushed when it was chosen).
+                let pos = s.seq.len() - 1;
+                if s.compressed[pos] == v4flash_core::engram_hash::DEAD { continue; }
+                live.push((r, ec.hasher.hash_ids(&s.compressed, pos)));
             }
-            _ => None,
-        };
+        }
         let engram_ms = t_eng.elapsed().as_secs_f64() * 1e3;
-        let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, bd_c, bi_c, sd, si, dgpu_scratch, weights, pager, .. } = state;
+        let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, bd_c, bi_c, sd, si, dgpu_scratch, weights, pager, engram, .. } = state;
         // V41_MS_PROFILE=1: per-stage GPU busy time of the batched step (HIP
         // events per stage, ~100 us/layer), rolled up over V41_MS_PROFILE_EVERY
         // steps and logged as "ms.stage". Wall - busy = host / link / sync.
@@ -799,11 +781,23 @@ impl Sched {
         // step, and box 2 -- the saturated resource -- ends up busier, not
         // idler. Lanes cost bytes; only worth it when the pole has slack.
         let lanes3 = pipelined && env_usize("V41_MS_LANES", 2) >= 3 && b >= env_usize("V41_MS_LANES3_MIN_ROWS", 6) && b >= 3;
-        let fwd_only_ms;
+        let mut fwd_only_ms = 0.0f64;
+        let n_tables = engram.as_ref().map(|ec| ec.tables.len()).unwrap_or(0);
+        let logits = std::thread::scope(|sc| {
+        let mut engram_rows = if engram_on && !live.is_empty() {
+            let ec: &crate::engine_worker::EngramCtx = engram.as_ref().expect("engram_on");
+            let live = &live;
+            LazyEngramRows::pending(sc.spawn(move || gather_engram_rows(ec, live, b)))
+        } else if engram_on {
+            // Every live row is DEAD (image rows): zero rows, no reads.
+            LazyEngramRows::ready(Some(vec![vec![0f32; b * ein]; n_tables]))
+        } else {
+            LazyEngramRows::ready(None)
+        };
         let logits = if lanes3 {
             let mut lanes: [(&mut v4flash_kernels::het::batch_scratch::BatchDgpuScratch, &mut v4flash_kernels::het::batch_scratch::BatchIgpuScratch, &mut RowTablesDev); 3] =
                 [(bd_a, bi_a, &mut self.dev), (bd_b, bi_b, &mut self.dev_b), (bd_c, bi_c, &mut self.dev_c)];
-            engine.forward_step_arena_lanes(&mut lanes, sd, si, &mut self.arena, &slots, weights, &hcs, &toks, engram_rows.as_deref(), pager.as_mut())?;
+            engine.forward_step_arena_lanes(&mut lanes, sd, si, &mut self.arena, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
             let mut l = Vec::with_capacity(b);
             let mut off = 0;
@@ -815,17 +809,19 @@ impl Sched {
             debug_assert_eq!(off, b);
             l
         } else if pipelined {
-            engine.forward_step_arena_pipelined(bd_a, bi_a, bd_b, bi_b, sd, si, &mut self.arena, &mut self.dev, &mut self.dev_b, &slots, weights, &hcs, &toks, engram_rows.as_deref(), pager.as_mut())?;
+            engine.forward_step_arena_pipelined(bd_a, bi_a, bd_b, bi_b, sd, si, &mut self.arena, &mut self.dev, &mut self.dev_b, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
             let b_a = b.div_ceil(2);
             let mut l = engine.head_rows(dgpu_scratch, bd_a, b_a, weights)?;
             l.extend(engine.head_rows(dgpu_scratch, bd_b, b - b_a, weights)?);
             l
         } else {
-            engine.forward_step_arena(bd_a, bi_a, sd, si, &mut self.arena, &mut self.dev, &slots, weights, &hcs, &toks, engram_rows.as_deref(), pager.as_mut())?;
+            engine.forward_step_arena(bd_a, bi_a, sd, si, &mut self.arena, &mut self.dev, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
             engine.head_rows(dgpu_scratch, bd_a, b, weights)?
         };
+        Ok::<_, eyre::Report>(logits)
+        })?;
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
         if profile {
             use v4flash_kernels::het::trace::{phase as counters, rollup_by_name};
@@ -1108,4 +1104,40 @@ fn finish(state: &mut WorkerState, arena: &mut KvArena, s: Stream, f: FinishReas
     arena.release(s.slot)?;
     let _ = state; // (RESIDENT streams / turn-end snapshots: M2)
     Ok(())
+}
+
+
+/// The Engram SSD gather for one step: one thread per table (the two tables
+/// used to be read back to back), each a batched `EngramTable::gather` over
+/// the live rows. Runs on the scoped helper thread `decode_step` spawns.
+fn gather_engram_rows(
+    ec: &crate::engine_worker::EngramCtx,
+    live: &[(usize, [[i64; v4flash_core::engram_hash::ENGRAM_COLS]; v4flash_core::engram_hash::ENGRAM_LAYERS])],
+    b: usize,
+) -> eyre::Result<Vec<Vec<f32>>> {
+    const GATHER_THREADS: usize = 32;
+    let ein = ENGRAM_IN as usize;
+    let mut rows = vec![vec![0f32; b * ein]; ec.tables.len()];
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = rows
+            .iter_mut()
+            .enumerate()
+            .map(|(li, out)| {
+                sc.spawn(move || -> eyre::Result<()> {
+                    let flat: Vec<i64> = live.iter().flat_map(|(_, h)| h[li]).collect();
+                    let mut tmp = vec![0f32; live.len() * ein];
+                    ec.tables[li].gather(&ec.st, &flat, &mut tmp, GATHER_THREADS)?;
+                    for (k, (r, _)) in live.iter().enumerate() {
+                        out[r * ein..(r + 1) * ein].copy_from_slice(&tmp[k * ein..(k + 1) * ein]);
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().map_err(|_| eyre!("engram gather thread panicked"))??;
+        }
+        Ok::<(), eyre::Report>(())
+    })?;
+    Ok(rows)
 }

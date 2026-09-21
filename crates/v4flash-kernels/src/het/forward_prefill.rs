@@ -2228,7 +2228,7 @@ impl HeterogeneousEngine {
         weights: &HetModelWeights,
         input_hcs: &[Vec<f32>],
         tokens: &[i32],
-        engram_rows: Option<&[Vec<f32>]>,
+        engram_rows: &mut LazyEngramRows<'_>,
         mut pager: Option<&mut super::expert_pager::ExpertPager>,
     ) -> eyre::Result<RowTables> {
         // Decode-phase link window (the rows are decode rows of live streams).
@@ -2279,7 +2279,7 @@ impl HeterogeneousEngine {
         for layer in 0..N_LAYER as usize {
             if weights.dgpu_layers[layer].engram.is_some() {
                 let li = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
-                let rows = engram_rows.and_then(|rs| li.and_then(|i| rs.get(i)));
+                let rows = match li { Some(i) => engram_rows.get()?.and_then(|rs| rs.get(i)), None => None };
                 match rows {
                     Some(r) if r.len() >= b * ein => self.stage_engram_rows_batch(bd, &r[..b * ein])?,
                     _ => return Err(eyre!("forward_step_arena: layer {layer} needs Engram rows for {b} rows")),
@@ -2333,7 +2333,7 @@ impl HeterogeneousEngine {
         weights: &HetModelWeights,
         input_hcs: &[Vec<f32>],
         tokens: &[i32],
-        engram_rows: Option<&[Vec<f32>]>,
+        engram_rows: &mut LazyEngramRows<'_>,
         mut pager: Option<&mut super::expert_pager::ExpertPager>,
     ) -> eyre::Result<(RowTables, RowTables)> {
         self.remote_set_phase_busy_poll(true);
@@ -2383,10 +2383,10 @@ impl HeterogeneousEngine {
         }
         let ein = ENGRAM_IN as usize;
         // Per-lane Engram staging for `layer` (rows are in slot order).
-        let stage = |this: &Self, bd: &mut BatchDgpuScratch, layer: usize, off: usize, n: usize| -> eyre::Result<()> {
+        let mut stage = |this: &Self, bd: &mut BatchDgpuScratch, layer: usize, off: usize, n: usize| -> eyre::Result<()> {
             if weights.dgpu_layers[layer].engram.is_some() {
                 let li = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
-                let rows = engram_rows.and_then(|rs| li.and_then(|i| rs.get(i)));
+                let rows = match li { Some(i) => engram_rows.get()?.and_then(|rs| rs.get(i)), None => None };
                 match rows {
                     Some(r) if r.len() >= (off + n) * ein => this.stage_engram_rows_batch(bd, &r[off * ein..(off + n) * ein])?,
                     _ => return Err(eyre!("forward_step_arena_pipelined: layer {layer} needs Engram rows for {n} rows")),
@@ -2465,7 +2465,7 @@ impl HeterogeneousEngine {
         weights: &HetModelWeights,
         input_hcs: &[Vec<f32>],
         tokens: &[i32],
-        engram_rows: Option<&[Vec<f32>]>,
+        engram_rows: &mut LazyEngramRows<'_>,
         mut pager: Option<&mut super::expert_pager::ExpertPager>,
     ) -> eyre::Result<Vec<RowTables>> {
         self.remote_set_phase_busy_poll(true);
@@ -2518,10 +2518,10 @@ impl HeterogeneousEngine {
             tables.push(t);
         }
         let ein = ENGRAM_IN as usize;
-        let stage = |this: &Self, bd: &mut BatchDgpuScratch, layer: usize, off: usize, nrows: usize| -> eyre::Result<()> {
+        let mut stage = |this: &Self, bd: &mut BatchDgpuScratch, layer: usize, off: usize, nrows: usize| -> eyre::Result<()> {
             if weights.dgpu_layers[layer].engram.is_some() {
                 let li = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
-                let rows = engram_rows.and_then(|rs| li.and_then(|i| rs.get(i)));
+                let rows = match li { Some(i) => engram_rows.get()?.and_then(|rs| rs.get(i)), None => None };
                 match rows {
                     Some(r) if r.len() >= (off + nrows) * ein => this.stage_engram_rows_batch(bd, &r[off * ein..(off + nrows) * ein])?,
                     _ => return Err(eyre!("forward_step_arena_lanes: layer {layer} needs Engram rows for {nrows} rows")),
@@ -7682,6 +7682,9 @@ pub static LH_REMOTE_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// the `V41_PAGER_SYNC_IGPU` cross-lane iGPU drain, the D2H copies after
 /// `sel_sync`, and the dGPU drain + D2H inside `lh.remote_submit`.
 pub static LH_PAGER_SYNC_IGPU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Exposed part of the Engram SSD gather: time the first Engram layer waited
+/// for the helper thread (`LazyEngramRows::get`).
+pub static LH_ENGRAM_JOIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_SEL_D2H: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_REMOTE_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Programmatic switch (the multistream profile turns it on): OR-ed with the env.
@@ -7712,6 +7715,7 @@ pub fn take_layer_host_timing() -> Vec<(&'static str, u64)> {
         ("lh.work_items_sync", LH_WORK_ITEMS_SYNC.swap(0, Relaxed)),
         ("lh.remote_wait", LH_REMOTE_WAIT.swap(0, Relaxed)),
         ("lh.pager_sync_igpu", LH_PAGER_SYNC_IGPU.swap(0, Relaxed)),
+        ("lh.engram_join", LH_ENGRAM_JOIN.swap(0, Relaxed)),
         ("lh.sel_d2h", LH_SEL_D2H.swap(0, Relaxed)),
         ("lh.remote_sync", LH_REMOTE_SYNC.swap(0, Relaxed)),
     ]
@@ -8036,4 +8040,38 @@ pub(crate) fn emit_remote_page_slice(
         start,
         end,
     );
+}
+
+
+/// Engram rows for one decode step: gathered on a helper thread while the step
+/// runs layer 0, joined at the first Engram layer. The synchronous gather was
+/// 13.8 ms/step at 8 rows (5-26), serial on the hub thread before the forward
+/// (profile audit 2026-09-21); layers 1 and 14 are the only consumers, so the
+/// SSD reads can hide under layer 0. `get()` joins at most once and counts the
+/// exposed wait into `lh.engram_join`.
+pub struct LazyEngramRows<'scope> {
+    ready: Option<Vec<Vec<f32>>>,
+    pending: Option<std::thread::ScopedJoinHandle<'scope, eyre::Result<Vec<Vec<f32>>>>>,
+}
+
+impl<'scope> LazyEngramRows<'scope> {
+    /// Rows already in hand (or `None` when the model has no Engram layers).
+    pub fn ready(rows: Option<Vec<Vec<f32>>>) -> Self {
+        Self { ready: rows, pending: None }
+    }
+    /// Rows still being gathered on a scoped thread.
+    pub fn pending(h: std::thread::ScopedJoinHandle<'scope, eyre::Result<Vec<Vec<f32>>>>) -> Self {
+        Self { ready: None, pending: Some(h) }
+    }
+    pub fn get(&mut self) -> eyre::Result<Option<&[Vec<f32>]>> {
+        if let Some(h) = self.pending.take() {
+            let t = std::time::Instant::now();
+            let rows = h.join().map_err(|_| eyre!("engram gather thread panicked"))??;
+            if layer_host_timing() {
+                LH_ENGRAM_JOIN.fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.ready = Some(rows);
+        }
+        Ok(self.ready.as_deref())
+    }
 }

@@ -49,6 +49,9 @@ pub struct EngramCtx {
     /// hash for position `p` reads the last four entries, so this has to track
     /// the real sequence rather than just the current token.
     pub compressed: Vec<i32>,
+    /// Own handle on the checkpoint for the gather thread: the pager holds the
+    /// other one and is mutably borrowed by the forward the gather overlaps.
+    pub st: v4flash_core::SafetensorsDir,
 }
 
 #[cfg(feature = "v41")]
@@ -1230,7 +1233,8 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
                 tables.push(v4flash_core::EngramTable::open(pg.raw(), l as usize)?);
             }
             tracing::info!(dir = %dir, layers = ?v4flash_kernels::config::ENGRAM_LAYERS, "engram ready (tables stay on SSD)");
-            Some(EngramCtx { hasher, tables, compressed: Vec::new() })
+            let st = v4flash_core::SafetensorsDir::open(pg.raw().dir())?;
+            Some(EngramCtx { hasher, tables, compressed: Vec::new(), st })
         }
     };
 
