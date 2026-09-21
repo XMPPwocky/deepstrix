@@ -6978,9 +6978,14 @@ impl HeterogeneousEngine {
                     work_items.len() as u32,
                 )?;
             }
+            // Host readback of the work-item COUNT to size the kwide launch: a
+            // full iGPU drain per lane-layer that also waits for the OTHER lane's
+            // MoE queued ahead of it (profile audit 2026-09-21; untimed until now).
+            let _t_wic = LayerHostTimer::start(&LH_WORK_ITEMS_COUNT);
             ie.compute.synchronize()?;
             let mut n_wi_host = [0i32; 1];
             bi.n_work_items.copy_to_host(&mut n_wi_host)?;
+            drop(_t_wic);
             n_work_items = n_wi_host[0] as u32;
             {
                 let BatchIgpuScratch {
@@ -7685,6 +7690,8 @@ pub static LH_PAGER_SYNC_IGPU: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// Exposed part of the Engram SSD gather: time the first Engram layer waited
 /// for the helper thread (`LazyEngramRows::get`).
 pub static LH_ENGRAM_JOIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// kwide path: iGPU drain + D2H of the work-item count before the MoE launch.
+pub static LH_WORK_ITEMS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_SEL_D2H: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_REMOTE_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Programmatic switch (the multistream profile turns it on): OR-ed with the env.
@@ -7716,6 +7723,7 @@ pub fn take_layer_host_timing() -> Vec<(&'static str, u64)> {
         ("lh.remote_wait", LH_REMOTE_WAIT.swap(0, Relaxed)),
         ("lh.pager_sync_igpu", LH_PAGER_SYNC_IGPU.swap(0, Relaxed)),
         ("lh.engram_join", LH_ENGRAM_JOIN.swap(0, Relaxed)),
+        ("lh.work_items_count", LH_WORK_ITEMS_COUNT.swap(0, Relaxed)),
         ("lh.sel_d2h", LH_SEL_D2H.swap(0, Relaxed)),
         ("lh.remote_sync", LH_REMOTE_SYNC.swap(0, Relaxed)),
     ]
