@@ -5835,6 +5835,10 @@ impl HeterogeneousEngine {
                 // page-cache warmth re-times the pager's NVMe reads between server
                 // launches, landing the race differently. Set to 0 to measure it.
                 if std::env::var("V41_PAGER_SYNC_IGPU").as_deref() != Ok("0") {
+                    // Timed on its own: this is a CROSS-LANE drain (lane A waits
+                    // for lane B's MoE) and was the largest untimed block in the
+                    // 2026-09-21 profile audit.
+                    let _t_isync = LayerHostTimer::start(&LH_PAGER_SYNC_IGPU);
                     self.igpu.compute.synchronize()?;
                 }
                 let mc0 = if layer_miss_hist() { pg.counters().prefill_misses } else { 0 };
@@ -5843,6 +5847,7 @@ impl HeterogeneousEngine {
                 let _t_sync = LayerHostTimer::start(&LH_SEL_SYNC);
                 de.compute.synchronize()?;
                 drop(_t_sync);
+                let _t_d2h = LayerHostTimer::start(&LH_SEL_D2H);
                 bd.d_selected
                     .slice_view(0, n_sel)
                     .copy_to_host(&mut sel_host)?;
@@ -5856,6 +5861,7 @@ impl HeterogeneousEngine {
                     look_host2 = vec![0i32; n_sel];
                     sd.look_sel2.slice_view(0, n_sel).copy_to_host(&mut look_host2)?;
                 }
+                drop(_t_d2h);
                 if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} A after readback"); }
                 if super::expert_pager::pick_trace_on() {
                     for r in 0..b as usize {
@@ -6156,11 +6162,15 @@ impl HeterogeneousEngine {
                             &bd.ffn_input_norm,
                             crate::config::BLOCKS_Q8K_GATE_IN * b,
                         )?;
+                        // The dGPU drain + two D2H copies, NOT the send: at 8 rows
+                        // this was all of `lh.remote_submit` (7 ms/step).
+                        let _t_rsync = LayerHostTimer::start(&LH_REMOTE_SYNC);
                         de.compute.synchronize()?;
                         let mut xq_host = vec![0u8; xq_bytes];
                         xq_dev.slice_view(0, xq_bytes).copy_to_host(&mut xq_host)?;
                         let mut ew_host = vec![0f32; n_sel];
                         bd.d_ew.slice_view(0, n_sel).copy_to_host(&mut ew_host)?;
+                        drop(_t_rsync);
                         // Hash what box 1 SENDS. If xq repeats across layers, the stale
                         // value is box 1's own `ffn_input_norm`, not anything remote.
                         if std::env::var("V41_REMOTE_DBG").is_ok() {
@@ -7492,9 +7502,11 @@ impl HeterogeneousEngine {
                 }
             }
             super::trace::phase::add(
-                &super::trace::phase::REMOTE_RTT_NS,
+                &super::trace::phase::REMOTE_WAIT_NS,
                 (t_wait_end - t_wait) as u64,
             );
+            super::trace::phase::add(&super::trace::phase::REMOTE_RTT_NS, (partial.rtt_us as u64) * 1000);
+            super::trace::phase::add(&super::trace::phase::REMOTE_SRV_NS, (partial.t_remote_server_us as u64) * 1000);
             super::trace::phase::add(&super::trace::phase::REMOTE_PAGE_NS, partial.t_remote_page_us as u64 * 1000);
             super::trace::phase::add(&super::trace::phase::REMOTE_COMPUTE_NS, partial.t_remote_compute_us as u64 * 1000);
             super::trace::phase::add(&super::trace::phase::REMOTE_MISSES, partial.n_remote_miss as u64);
@@ -7666,6 +7678,12 @@ pub static LH_REMAP_H2D: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// serialization.
 pub static LH_WORK_ITEMS_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_REMOTE_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Inside `lh.pager_block`, previously untimed (profile audit 2026-09-21):
+/// the `V41_PAGER_SYNC_IGPU` cross-lane iGPU drain, the D2H copies after
+/// `sel_sync`, and the dGPU drain + D2H inside `lh.remote_submit`.
+pub static LH_PAGER_SYNC_IGPU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_SEL_D2H: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_REMOTE_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Programmatic switch (the multistream profile turns it on): OR-ed with the env.
 pub static LH_FORCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -7693,6 +7711,9 @@ pub fn take_layer_host_timing() -> Vec<(&'static str, u64)> {
         ("lh.remap_h2d", LH_REMAP_H2D.swap(0, Relaxed)),
         ("lh.work_items_sync", LH_WORK_ITEMS_SYNC.swap(0, Relaxed)),
         ("lh.remote_wait", LH_REMOTE_WAIT.swap(0, Relaxed)),
+        ("lh.pager_sync_igpu", LH_PAGER_SYNC_IGPU.swap(0, Relaxed)),
+        ("lh.sel_d2h", LH_SEL_D2H.swap(0, Relaxed)),
+        ("lh.remote_sync", LH_REMOTE_SYNC.swap(0, Relaxed)),
     ]
 }
 

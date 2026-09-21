@@ -831,14 +831,27 @@ impl Sched {
             use v4flash_kernels::het::trace::{phase as counters, rollup_by_name};
             let dg = rollup_by_name(&engine.dgpu.events.harvest()?);
             let ig = rollup_by_name(&engine.igpu.events.harvest()?);
+            // Box-2 leg, all per step, all sums over both lanes x 40 layers.
+            // (`host.sel_sync/ensure/engram_stage` were the LEGACY path's
+            // counters and read 0.00 here for a week; the live ones are `lh.*`.)
+            let wait = counters::get(&counters::REMOTE_WAIT_NS);
+            let rtt = counters::get(&counters::REMOTE_RTT_NS);
+            let srv = counters::get(&counters::REMOTE_SRV_NS);
+            let page = counters::get(&counters::REMOTE_PAGE_NS);
+            let service = counters::get(&counters::REMOTE_COMPUTE_NS);
             let host = [
-                ("host.sel_sync", counters::get(&counters::SEL_SYNC_NS)),
-                ("host.ensure", counters::get(&counters::ENSURE_NS)),
-                ("host.engram_stage", counters::get(&counters::ENGRAM_STAGE_NS)),
-                ("host.remote_rtt", counters::get(&counters::REMOTE_RTT_NS)),
-                ("host.remote_srv", counters::get(&counters::REMOTE_SRV_NS)),
-                ("box2.page_ms", counters::get(&counters::REMOTE_PAGE_NS)),
-                ("box2.compute_ms", counters::get(&counters::REMOTE_COMPUTE_NS)),
+                // hub thread BLOCKED in wait(): the exposed part of the round trip
+                ("host.remote_wait", wait),
+                // submit -> reply landed, hidden or not
+                ("host.remote_rtt", rtt),
+                // box 2: frame complete -> reply handed to its writer (INCLUDES its queue wait)
+                ("host.remote_srv", srv),
+                // wire + wake-ups + hub reader/writer handoffs
+                ("box2.link_ms", rtt.saturating_sub(srv)),
+                // box 2 run_path wall INCLUDING its own paging (was misnamed box2.compute_ms)
+                ("box2.service_ms", service),
+                ("box2.page_ms", page),
+                ("box2.compute_ms", service.saturating_sub(page)),
                 ("box2.misses_x1e6", counters::get(&counters::REMOTE_MISSES) * 1_000_000),
             ];
             let acc = &mut self.profile_acc;
@@ -856,6 +869,18 @@ impl Sched {
                 let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
                 e.0 += ns as f64 / 1e6;
                 e.1 += 1;
+            }
+            // Per-wait phase split (remote_experts::take_hop_stats): of the
+            // box-2 waits this step, how many found the reply already in the
+            // channel (slack: box 2 finished under local work) vs. blocked
+            // (wake: the leg was exposed). `hop.wake_us` / `hop.slack_us` are
+            // per-call means, so they are folded as ms-per-step means too.
+            {
+                let (a, wake, slack, nb, n) = v4flash_kernels::het::remote_experts::take_hop_stats();
+                for (name, v) in [("hop.waits_per_step", n as f64), ("hop.blocked_per_step", nb as f64), ("hop.wake_us_mean", wake), ("hop.slack_us_mean", slack), ("hop.submit_to_write_us_mean", a)] {
+                    let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
+                    e.0 += v; e.1 += 1;
+                }
             }
             if let Some(pg) = pager.as_ref() {
                 if let Some((q, a, df, ams)) = pg.prefetch_stats() {
@@ -899,7 +924,8 @@ impl Sched {
                 tracing::info!(steps = acc.steps, rows_avg = format!("{:.1}", acc.rows as f64 / acc.steps as f64),
                     wall_ms = format!("{:.1}", acc.wall_ms / acc.steps as f64), dgpu_busy_ms = format!("{dgpu_busy:.1}"),
                     igpu_busy_ms = format!("{igpu_busy:.1}"), "ms.stage.total (per step)");
-                for (d, n, ms, c) in v.iter().take(96) {
+                // Zero rows are counters this path never feeds; drop them.
+                for (d, n, ms, c) in v.iter().filter(|e| e.2 >= 0.005).take(96) {
                     tracing::info!(device = *d, stage = *n, ms_per_step = format!("{ms:.2}"), calls = *c, "ms.stage");
                 }
                 acc.stages.clear();

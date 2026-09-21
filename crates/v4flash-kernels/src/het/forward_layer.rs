@@ -2999,9 +2999,10 @@ impl HeterogeneousEngine {
                 }
             }
             super::trace::phase::add(
-                &super::trace::phase::REMOTE_RTT_NS,
+                &super::trace::phase::REMOTE_WAIT_NS,
                 (super::perfetto::now_ns() - t_wait) as u64,
             );
+            super::trace::phase::add(&super::trace::phase::REMOTE_RTT_NS, (partial.rtt_us as u64) * 1000);
             // Box 2's own service time for this exchange, so the summary can
             // say whether the wait was box 2 working or the link.
             super::trace::phase::add(

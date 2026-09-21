@@ -1533,6 +1533,7 @@ impl HeterogeneousEngine {
             pager_h2d_us: pager_d.decode_h2d_ns / 1000,
             pager_misses: pager_d.decode_misses,
             remote_rtt_us: super::trace::phase::get(&super::trace::phase::REMOTE_RTT_NS) / 1000,
+            remote_wait_us: super::trace::phase::get(&super::trace::phase::REMOTE_WAIT_NS) / 1000,
             remote_srv_us: super::trace::phase::get(&super::trace::phase::REMOTE_SRV_NS) / 1000,
             engram_stage_us: super::trace::phase::get(&super::trace::phase::ENGRAM_STAGE_NS) / 1000,
             pre_us,
@@ -1898,6 +1899,8 @@ impl HeterogeneousEngine {
         self.perfetto = Some(std::sync::Mutex::new(exporter));
         self.dgpu.events.set_enabled(true);
         self.igpu.events.set_enabled(true);
+        self.dgpu.events.set_kernel_stages(true);
+        self.igpu.events.set_kernel_stages(true);
         self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }

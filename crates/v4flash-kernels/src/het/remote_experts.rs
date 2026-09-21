@@ -3749,7 +3749,14 @@ pub fn serve_connection(
         // A frame the overlap hook already pulled off the reader (and whose
         // misses it may have started paging) while the previous request ran.
         let mut pending: std::collections::VecDeque<Inbound> = std::collections::VecDeque::new();
+        // USE saturation for this thread (profile audit 2026-09-21): how often a
+        // request found the queue non-empty, how deep, and how long the GPU sat
+        // idle between requests. Windowed with the page-stats print.
+        let mut t_prev_ready: Option<Instant> = None;
+        let (mut w_idle_ns, mut w_service_ns, mut w_depth_sum, mut w_queued, mut w_n) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut w_t0 = Instant::now();
         loop {
+            let depth_on_take = pending.len() as u64;
             let msg = if let Some(m) = pending.pop_front() {
                 m
             } else if opts.keep_warm_us == 0 {
@@ -3782,6 +3789,14 @@ pub fn serve_connection(
                 Inbound::Frame { hdr, buf, t_first, t_done, t2 } => (hdr, buf, t_first, t_done, t2),
             };
             let t_start = Instant::now();
+            if let Some(p) = t_prev_ready {
+                w_idle_ns += t_start.saturating_duration_since(p).as_nanos() as u64;
+            }
+            w_n += 1;
+            if depth_on_take > 0 {
+                w_queued += 1;
+                w_depth_sum += depth_on_take;
+            }
             let t_start_rt = tracer.map(|_| super::perfetto::host_now_ns());
             let mut resp = rx_resp_recycle.try_recv().unwrap_or_else(|_| AlignedBuf::with_capacity(proto::RESP_DATA_OFF + exec.rows() * N_EMBD as usize * 4));
             if hdr.kind != proto::KIND_REQUEST {
@@ -3937,6 +3952,8 @@ pub fn serve_connection(
                             let _ = tr.re_anchor(exec.device(), &exec.engine.compute);
                         }
                     }
+                    t_prev_ready = Some(rec.t_ready);
+                    w_service_ns += rec.t_ready.saturating_duration_since(t_start).as_nanos() as u64;
                     records.push(rec);
                     // Bound the per-connection history: it reached 1,088,120
                     // entries (~90 MB) on a day-long link. Keep the newest
@@ -3961,14 +3978,27 @@ pub fn serve_connection(
                             let (pread_ns, rcpu_ns, rgpu_ns) = shard.page_read_split();
                             let per = |ns: u64| ns as f64 / miss as f64 / 1e6;
                             let pfs = shard.prefetch_stats().map(|(h, a, d, w)| format!(" prefetch hinted={h} admitted={a} dropped={d} waited={w}")).unwrap_or_default();
+                            // `pread` here is the PROCESS-WIDE read counter differenced
+                            // around demand chunks, so concurrent prefetch reads inflate
+                            // it; read `read` (per-miss wall) instead.
+                            let wall = w_t0.elapsed().as_secs_f64().max(1e-9);
+                            let win = format!(
+                                " | window {:.1}s: busy {:.0}% idle/req {:.2} ms queued {:.0}% depth {:.2}",
+                                wall, 100.0 * w_service_ns as f64 / 1e9 / wall,
+                                w_idle_ns as f64 / 1e6 / w_n.max(1) as f64,
+                                100.0 * w_queued as f64 / w_n.max(1) as f64,
+                                w_depth_sum as f64 / w_queued.max(1) as f64,
+                            );
                             eprintln!(
                                 "expertd: page stats requests={req} misses={miss} hit={:.4} \
-ms_per_miss={:.2} (read {:.2} [pread {:.2} repack_cpu {:.2}] h2d {:.2} repack_gpu {:.2}){pfs}",
+ms_per_miss={:.2} (read {:.2} [pread {:.2} repack_cpu {:.2}] h2d {:.2} repack_gpu {:.2}){pfs}{win}",
                                 1.0 - miss as f64 / req.max(1) as f64,
                                 (read_ns + h2d_ns) as f64 / miss as f64 / 1e6,
                                 per(read_ns), per(pread_ns), per(rcpu_ns),
                                 per(h2d_ns), per(rgpu_ns),
                             );
+                            w_t0 = Instant::now();
+                            w_idle_ns = 0; w_service_ns = 0; w_depth_sum = 0; w_queued = 0; w_n = 0;
                         }
                     }
                     if opts.verbose {

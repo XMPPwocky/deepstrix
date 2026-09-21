@@ -47,6 +47,12 @@ pub struct EventPool {
     /// pool could not harvest (the parent stage around the graph launch still
     /// times the whole replay).
     capturing: std::cell::Cell<bool>,
+    /// `k.*` kernel sub-stages (one pair per launch inside a parent stage).
+    /// The `ms.stage` rollup sums PARENT stages only, so these ~630 pairs per
+    /// 8-row step bought nothing there while costing ~8 us of dGPU stream time
+    /// each (bench_event_overhead, 2026-09-21). Off unless perfetto is attached
+    /// or `V41_PROFILE_KERNEL_STAGES=1`.
+    sub: std::cell::Cell<bool>,
 }
 
 struct EventPoolInner {
@@ -99,7 +105,13 @@ impl EventPool {
             // decode breakdown, DEEPSTRIX_PREFILL_PROFILE for the prefill aggregate.
             enabled: std::cell::Cell::new(token_profile() || prefill_profile::enabled()),
             capturing: std::cell::Cell::new(false),
+            sub: std::cell::Cell::new(kernel_stages()),
         })
+    }
+
+    /// Record `k.*` kernel sub-stages too (perfetto wants them; the rollup does not).
+    pub fn set_kernel_stages(&self, on: bool) {
+        self.sub.set(on);
     }
 
     /// Turn recording on or off. When off, `stage()` returns a no-op
@@ -136,7 +148,7 @@ impl EventPool {
         name: &'static str,
         stream: &'a Stream,
     ) -> eyre::Result<StageScope<'a>> {
-        if !self.enabled.get() || self.capturing.get() {
+        if !self.enabled.get() || self.capturing.get() || (!self.sub.get() && name.starts_with("k.")) {
             return Ok(StageScope {
                 pool: self,
                 stream,
@@ -289,6 +301,14 @@ impl<'a> Drop for StageScope<'a> {
     }
 }
 
+/// `V41_PROFILE_KERNEL_STAGES=1`: also record the `k.*` per-launch sub-stages.
+pub fn kernel_stages() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_PROFILE_KERNEL_STAGES").as_deref() == Ok("1")
+    });
+    *ON
+}
+
 /// `DEEPSTRIX_TOKEN_PROFILE=1`: enable HIP event timing on every EventPool and
 /// emit the per-stage rollup + host phase breakdown at INFO each token.
 pub fn token_profile() -> bool {
@@ -310,10 +330,12 @@ pub mod phase {
     pub static SEL_SYNC_NS: AtomicU64 = AtomicU64::new(0);
     pub static ENSURE_NS: AtomicU64 = AtomicU64::new(0);
     pub static ENGRAM_STAGE_NS: AtomicU64 = AtomicU64::new(0);
-    /// Wall time from remote submit to the partial landing. Aggregate only —
-    /// the OVERLAP question needs the `remote.submit`/`remote.wait` perfetto
-    /// host tracks, because this counter looks identical whether the round
-    /// trip hid under local compute or serialised in front of it.
+    /// Host wall BLOCKED in `wait()` for the partial: the EXPOSED part of the
+    /// round trip. Was misnamed `REMOTE_RTT_NS` until 2026-09-21 and quoted
+    /// as link cost; it collapses to ~0 whenever box 1 is the slower side.
+    pub static REMOTE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    /// True submit -> reply-landed round trip (`RemotePartial::rtt_us`), the
+    /// whole of it, hidden or not. `rtt - srv` is the link + hub-side handoffs.
     pub static REMOTE_RTT_NS: AtomicU64 = AtomicU64::new(0);
     /// Box 2's OWN reported service time for the same exchanges, so the
     /// token summary can split the wait into "box 2 working" and "everything
@@ -349,6 +371,7 @@ pub mod phase {
         SEL_SYNC_NS.store(0, Relaxed);
         ENSURE_NS.store(0, Relaxed);
         ENGRAM_STAGE_NS.store(0, Relaxed);
+        REMOTE_WAIT_NS.store(0, Relaxed);
         REMOTE_RTT_NS.store(0, Relaxed);
         REMOTE_SRV_NS.store(0, Relaxed);
         REMOTE_PAGE_NS.store(0, Relaxed);
@@ -400,6 +423,7 @@ pub struct TokenTiming {
     /// Overlapped work, so this is NOT additive with the rest — compare it
     /// against `total_us` to see whether the round trip is hidden.
     pub remote_rtt_us: u64,
+    pub remote_wait_us: u64,
     pub remote_srv_us: u64,
     /// `stage_engram_rows` H2D inside the bracket (V4.1 Engram layers 1, 14).
     pub engram_stage_us: u64,
@@ -437,6 +461,7 @@ impl TokenTiming {
             host_us = self.host_us,
             sync_us = self.sync_us,
             remote_rtt_us = self.remote_rtt_us,
+            remote_wait_us = self.remote_wait_us,
             remote_srv_us = self.remote_srv_us,
             remote_link_us = self.remote_rtt_us.saturating_sub(self.remote_srv_us),
             sel_sync_us = self.sel_sync_us,
