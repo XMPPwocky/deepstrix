@@ -811,6 +811,10 @@ pub struct WorkerState {
     pub bi_a: BatchIgpuScratch,
     pub bd_b: BatchDgpuScratch,
     pub bi_b: BatchIgpuScratch,
+    /// Lane C of the N-lane arena decode step (`V41_MS_LANES=3`): decode-sized
+    /// (a few rows), so it costs MBs, not the GBs of a prefill lane.
+    pub bd_c: BatchDgpuScratch,
+    pub bi_c: BatchIgpuScratch,
     /// Shared prefill scratch (one instance for both lanes).
     pub sd: BatchDgpuShared,
     pub si: BatchIgpuShared,
@@ -1072,6 +1076,9 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     let bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
     let bd_b = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
     let bi_b = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
+    let lane_c_rows = std::env::var("V41_MS_LANE_C_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(16usize).max(1);
+    let bd_c = BatchDgpuScratch::alloc_rows(dgpu, lane_c_rows)?;
+    let bi_c = BatchIgpuScratch::alloc_rows(igpu, lane_c_rows)?;
     // The batched attention scores scratch is the one prefill buffer that
     // scales with context, and on a model with no sparse indexer it scales
     // FAST (V4.1: 32 KiB per token of --ctx). Size it from --ctx instead of
@@ -1251,6 +1258,8 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         bi_a,
         bd_b,
         bi_b,
+        bd_c,
+        bi_c,
         sd,
         si,
         n_kv_max: cfg.n_kv_max,

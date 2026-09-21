@@ -3748,9 +3748,9 @@ pub fn serve_connection(
         let mut n_done = 0usize;
         // A frame the overlap hook already pulled off the reader (and whose
         // misses it may have started paging) while the previous request ran.
-        let mut pending: Option<Inbound> = None;
+        let mut pending: std::collections::VecDeque<Inbound> = std::collections::VecDeque::new();
         loop {
-            let msg = if let Some(m) = pending.take() {
+            let msg = if let Some(m) = pending.pop_front() {
                 m
             } else if opts.keep_warm_us == 0 {
                 match rx_in.recv() {
@@ -3820,32 +3820,37 @@ pub fn serve_connection(
                 let cur_pins: Vec<(u32, u32)> = req.sel.iter().filter(|&&e| e >= 0).map(|&e| (req.layer, e as u32)).collect();
                 let rx_in_ref = &rx_in;
                 let pending_ref = &mut pending;
+                // Pull EVERY frame the reader has (three hub lanes keep up to
+                // two queued); each one's misses start now, in arrival order.
                 let mut overlap = |shard: &mut ExpertShard| -> eyre::Result<()> {
-                    if !b2_early_page() || pending_ref.is_some() {
+                    if !b2_early_page() {
                         return Ok(());
                     }
-                    let Ok(m) = rx_in_ref.try_recv() else { return Ok(()) };
-                    if let Inbound::Frame { hdr, buf, .. } = &m {
-                        if hdr.kind == proto::KIND_REQUEST {
-                            if let Ok(nreq) = proto::decode_request(buf) {
-                                if shard.layer_is_paged(nreq.layer) {
-                                    let mut words: Vec<u32> = Vec::with_capacity(nreq.sel.len());
-                                    for &e in nreq.sel {
-                                        if (0..N_EXPERT as i32).contains(&e) && !shard.is_resident_pool(nreq.layer, e as u32) {
-                                            let w = (nreq.layer << 16) | e as u32;
-                                            if !words.contains(&w) { words.push(w); }
+                    while let Ok(m) = rx_in_ref.try_recv() {
+                        if let Inbound::Frame { hdr, buf, .. } = &m {
+                            if hdr.kind == proto::KIND_REQUEST {
+                                if let Ok(nreq) = proto::decode_request(buf) {
+                                    if shard.layer_is_paged(nreq.layer) {
+                                        let mut words: Vec<u32> = Vec::with_capacity(nreq.sel.len());
+                                        for &e in nreq.sel {
+                                            if (0..N_EXPERT as i32).contains(&e) && !shard.is_resident_pool(nreq.layer, e as u32) {
+                                                let w = (nreq.layer << 16) | e as u32;
+                                                if !words.contains(&w) { words.push(w); }
+                                            }
                                         }
-                                    }
-                                    if !words.is_empty() {
-                                        shard.pinned = cur_pins.clone();
-                                        shard.prefetch_words_ex(&words, true);
-                                        shard.pinned.clear();
+                                        if !words.is_empty() {
+                                            shard.pinned = cur_pins.clone();
+                                            shard.prefetch_words_ex(&words, true);
+                                            shard.pinned.clear();
+                                        }
                                     }
                                 }
                             }
                         }
+                        let stop = matches!(m, Inbound::Closed(_));
+                        pending_ref.push_back(m);
+                        if stop { break; }
                     }
-                    *pending_ref = Some(m);
                     Ok(())
                 };
                 let timing = exec.run_path(shard, req.layer, b, req.xq, req.sel, req.ew, req.flags & proto::REQ_FLAG_BATCHED != 0, &mut overlap)?;

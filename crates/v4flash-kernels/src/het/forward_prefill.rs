@@ -2446,6 +2446,140 @@ impl HeterogeneousEngine {
         Ok((tables_a, tables_b))
     }
 
+    /// N-lane pipelined arena decode step (2026-09-21): `forward_step_arena_pipelined`
+    /// generalised to `lanes.len()` lanes. Rows are split into contiguous
+    /// balanced chunks, one per lane, and the layer loop round-robins
+    /// post(lane, L) -> pre(lane, L+1) across lanes, so lane i's box-2 wait
+    /// overlaps the other lanes' dGPU/iGPU work AND box 2 always has a request
+    /// queued (the daemon's early paging of the queued request only pays when
+    /// a frame is already there; with two lanes the hub's turnaround equals
+    /// box 2's per-request time and the queue never exceeds one).
+    /// Lane i uses `self.sync_events_lane(i)`. Returns one `RowTables` per lane.
+    pub fn forward_step_arena_lanes(
+        &self,
+        lanes: &mut [(&mut BatchDgpuScratch, &mut BatchIgpuScratch, &mut RowTablesDev)],
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        arena: &mut KvArena,
+        slots: &[u32],
+        weights: &HetModelWeights,
+        input_hcs: &[Vec<f32>],
+        tokens: &[i32],
+        engram_rows: Option<&[Vec<f32>]>,
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
+    ) -> eyre::Result<Vec<RowTables>> {
+        self.remote_set_phase_busy_poll(true);
+        let b = tokens.len();
+        let n = lanes.len();
+        if n < 2 || b < n {
+            return Err(eyre!("forward_step_arena_lanes: needs >= 2 lanes and >= 1 row per lane (got {n} lanes, {b} rows)"));
+        }
+        if slots.len() != b || input_hcs.len() != b {
+            return Err(eyre!("forward_step_arena_lanes: {} slots / {} hcs for {b} tokens", slots.len(), input_hcs.len()));
+        }
+        for (i, hc) in input_hcs.iter().enumerate() {
+            if hc.len() != HC_DIM as usize {
+                return Err(eyre!("forward_step_arena_lanes: input_hcs[{i}] len {} != HC_DIM", hc.len()));
+            }
+        }
+        // Contiguous balanced split: the first (b % n) lanes get one extra row.
+        let mut offs: Vec<usize> = Vec::with_capacity(n + 1);
+        offs.push(0);
+        for i in 0..n {
+            let sz = b / n + usize::from(i < b % n);
+            offs.push(offs[i] + sz);
+        }
+        for (i, (bd, bi, _)) in lanes.iter().enumerate() {
+            let bl = offs[i + 1] - offs[i];
+            check_scratch_rows("forward_step_arena_lanes", bl, bd, bi, sd, si)?;
+            if bd.mtp_capture_rows > 0 {
+                return Err(eyre!("forward_step_arena_lanes: MTP capture is not supported on arena rows"));
+            }
+        }
+        self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
+        self.set_current_cached(self.dgpu.device)?;
+        arena.state.restore_compressor_lending();
+        for &slot in slots {
+            if arena.needs_compaction(slot) {
+                arena.compact_raw(slot, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
+            }
+        }
+        let mut tables: Vec<RowTables> = Vec::with_capacity(n);
+        for (i, (bd, _, dev)) in lanes.iter_mut().enumerate() {
+            let (lo, hi) = (offs[i], offs[i + 1]);
+            let t = arena.tables(&slots[lo..hi])?;
+            dev.upload(&t, &self.dgpu.compute)?;
+            for (k, hc) in input_hcs[lo..hi].iter().enumerate() {
+                let mut slot = bd.residual.slice_view_mut(k * HC_DIM as usize, HC_DIM as usize);
+                slot.copy_from_host(hc)?;
+            }
+            let mut v = bd.pos_per_b.slice_view_mut(0, hi - lo);
+            v.copy_from_host_async(&t.pos_per, &self.dgpu.compute)?;
+            tables.push(t);
+        }
+        let ein = ENGRAM_IN as usize;
+        let stage = |this: &Self, bd: &mut BatchDgpuScratch, layer: usize, off: usize, nrows: usize| -> eyre::Result<()> {
+            if weights.dgpu_layers[layer].engram.is_some() {
+                let li = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
+                let rows = engram_rows.and_then(|rs| li.and_then(|i| rs.get(i)));
+                match rows {
+                    Some(r) if r.len() >= (off + nrows) * ein => this.stage_engram_rows_batch(bd, &r[off * ein..(off + nrows) * ein])?,
+                    _ => return Err(eyre!("forward_step_arena_lanes: layer {layer} needs Engram rows for {nrows} rows")),
+                }
+            }
+            Ok(())
+        };
+        let n_layer = N_LAYER as usize;
+        // pre(lane, layer): stage Engram rows, then the pre-MoE half (attention,
+        // router, box-2 submit, box-1 MoE) with this lane's tables and events.
+        macro_rules! pre {
+            ($i:expr, $layer:expr) => {{
+                let i: usize = $i;
+                let layer: usize = $layer;
+                let (lo, hi) = (offs[i], offs[i + 1]);
+                let (bd, bi, dev) = &mut lanes[i];
+                stage(self, bd, layer, lo, hi - lo)?;
+                let t = &tables[i];
+                let sev = &self.sync_events_lane(i).layers[layer];
+                arena.state.with_kv_source(layer, |ls| {
+                    self.forward_layer_pre_moe_v2(bd, bi, sd, si, ls, &weights.dgpu_layers[layer], &weights.igpu_layers[layer], 0, &tokens[lo..hi], None, None,
+                        sev, pager.as_deref_mut(), CedMode::Exact,
+                        RowLayout::Arena { tables: t, dev, next_router: weights.dgpu_layers.get(layer + 1), next_router2: weights.dgpu_layers.get(layer + 2) })?;
+                    self.route_probe_after_layer(bd, weights, layer, hi - lo, i)
+                })?;
+            }};
+        }
+        macro_rules! post {
+            ($i:expr, $layer:expr) => {{
+                let i: usize = $i;
+                let layer: usize = $layer;
+                let bl = (offs[i + 1] - offs[i]) as u32;
+                let (bd, _, _) = &mut lanes[i];
+                let hot = prefill_hot_active(&weights.dgpu_layers[layer], &weights.igpu_layers[layer], bd, sd);
+                self.forward_layer_post_moe_v2(bd, bl, &self.sync_events_lane(i).layers[layer], hot)?;
+                std::mem::swap(&mut bd.residual, &mut bd.residual_next);
+            }};
+        }
+        for i in 0..n {
+            pre!(i, 0);
+        }
+        for layer in 0..n_layer - 1 {
+            for i in 0..n {
+                post!(i, layer);
+                pre!(i, layer + 1);
+            }
+        }
+        let last = n_layer - 1;
+        for i in 0..n {
+            post!(i, last);
+        }
+        self.dgpu.compute.synchronize()?;
+        for &slot in slots {
+            arena.advance(slot)?;
+        }
+        Ok(tables)
+    }
+
     pub fn forward_layer_batch_v2(
         &self,
         bd: &mut BatchDgpuScratch,

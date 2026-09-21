@@ -370,6 +370,9 @@ pub struct HeterogeneousEngine {
     /// in `forward_prefill_pipelined` — lane A uses `sync_events`, lane B
     /// uses this. Allocated identically.
     pub sync_events_t1: HetSyncEvents,
+    /// Third per-layer event set: lane C of the N-lane arena decode step
+    /// (`forward_step_arena_lanes`, 2026-09-21).
+    pub sync_events_t2: HetSyncEvents,
     /// M54: per-layer MoE-ready signal words (pinned host memory). The
     /// dGPU xfer stream writes `signal[layer] = token_seq` right after the
     /// selected push; the pre-issued iGPU lane waits GTE on it. Value
@@ -478,6 +481,14 @@ fn connect_remote_experts() -> Option<std::sync::Mutex<super::remote_experts::Re
 }
 
 impl HeterogeneousEngine {
+    /// Per-layer sync events for lane `lane` of an N-lane step (0..=2).
+    pub fn sync_events_lane(&self, lane: usize) -> &HetSyncEvents {
+        match lane {
+            0 => &self.sync_events,
+            1 => &self.sync_events_t1,
+            _ => &self.sync_events_t2,
+        }
+    }
     /// See `RemoteExpertClient::drain_in_flight`. Returns the number drained.
     /// Redial box 2 if the link is known broken. Called at a request BOUNDARY,
     /// where nothing is in flight. Returns Ok(false) if no reconnect was needed.
@@ -1619,6 +1630,7 @@ impl HeterogeneousEngine {
 
         let sync_events = HetSyncEvents::alloc(dgpu_device, igpu_device)?;
         let sync_events_t1 = HetSyncEvents::alloc(dgpu_device, igpu_device)?;
+        let sync_events_t2 = HetSyncEvents::alloc(dgpu_device, igpu_device)?;
         dgpu_device.set_current()?;
 
         Ok(Self {
@@ -1627,6 +1639,7 @@ impl HeterogeneousEngine {
             mode,
             sync_events,
             sync_events_t1,
+            sync_events_t2,
             moe_signal: v4flash_hip::PinnedBuffer::new(N_LAYER as usize)?,
             token_seq: std::sync::atomic::AtomicU32::new(0),
             perfetto: None,

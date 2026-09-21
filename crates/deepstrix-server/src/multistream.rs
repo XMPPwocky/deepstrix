@@ -131,6 +131,13 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             return;
         }
     };
+    let dev_c = match RowTablesDev::alloc(state.dgpu, n_slots, arena.stores.len()) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, "multistream: row tables (lane C) alloc failed");
+            return;
+        }
+    };
     tracing::info!(n_slots, ctx_rows, chunk_rows, prefill_burst_ms = env_usize("V41_MS_PREFILL_BURST_MS", 120_000), decode_burst_ms = env_usize("V41_MS_DECODE_BURST_MS", 30_000), "multistream scheduler ON");
     let n_jobs = env_usize("V41_MS_PREFILL_JOBS", 2).max(1);
     let mut spare_states = Vec::with_capacity(n_jobs);
@@ -148,7 +155,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         Ok(b) => b,
         Err(e) => { tracing::error!(error = %e, "multistream: bounce alloc failed"); return; }
     };
-    let mut sched = Sched { profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
+    let mut sched = Sched { profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
 
     loop {
         // 1. Intake: never block while there is work; block when idle.
@@ -216,6 +223,8 @@ struct Sched {
     legacy_wait_logged: Option<Instant>,
     /// Lane-B tables for the two-lane step (`V41_MS_PIPELINE`).
     dev_b: RowTablesDev,
+    /// Lane-C tables for the three-lane step (`V41_MS_LANES=3`).
+    dev_c: RowTablesDev,
     /// Prefilled requests waiting for arena room (their scratch state stays
     /// parked with them; admission is retried every tick).
     parked: Vec<(Prefill, Vec<f32>)>,
@@ -759,7 +768,7 @@ impl Sched {
             _ => None,
         };
         let engram_ms = t_eng.elapsed().as_secs_f64() * 1e3;
-        let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, sd, si, dgpu_scratch, weights, pager, .. } = state;
+        let WorkerState { engine, bd_a, bi_a, bd_b, bi_b, bd_c, bi_c, sd, si, dgpu_scratch, weights, pager, .. } = state;
         // V41_MS_PROFILE=1: per-stage GPU busy time of the batched step (HIP
         // events per stage, ~100 us/layer), rolled up over V41_MS_PROFILE_EVERY
         // steps and logged as "ms.stage". Wall - busy = host / link / sync.
@@ -780,8 +789,28 @@ impl Sched {
         // step's doubled dGPU chain (+55 ms) exceeds the box-2 wait it hides
         // (~30 ms), at 4 it is a wash; default to lanes from 6 rows.
         let pipelined = b >= env_usize("V41_MS_PIPELINE_MIN_ROWS", 6) && ms_pipeline();
+        // Three lanes (`V41_MS_LANES`, default 3) from `V41_MS_LANES3_MIN_ROWS`
+        // rows (default 6): box 2 then always has a request queued, which is
+        // what its early paging of the queued request needs (2026-09-21: two
+        // lanes run in lockstep with the hub's turnaround, queue depth <= 1,
+        // early paging covered 43% of non-resident experts).
+        let lanes3 = pipelined && env_usize("V41_MS_LANES", 3) >= 3 && b >= env_usize("V41_MS_LANES3_MIN_ROWS", 6) && b >= 3;
         let fwd_only_ms;
-        let logits = if pipelined {
+        let logits = if lanes3 {
+            let mut lanes: [(&mut v4flash_kernels::het::batch_scratch::BatchDgpuScratch, &mut v4flash_kernels::het::batch_scratch::BatchIgpuScratch, &mut RowTablesDev); 3] =
+                [(bd_a, bi_a, &mut self.dev), (bd_b, bi_b, &mut self.dev_b), (bd_c, bi_c, &mut self.dev_c)];
+            engine.forward_step_arena_lanes(&mut lanes, sd, si, &mut self.arena, &slots, weights, &hcs, &toks, engram_rows.as_deref(), pager.as_mut())?;
+            fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
+            let mut l = Vec::with_capacity(b);
+            let mut off = 0;
+            for (i, (bd, _, _)) in lanes.iter_mut().enumerate() {
+                let sz = b / 3 + usize::from(i < b % 3);
+                l.extend(engine.head_rows(dgpu_scratch, bd, sz, weights)?);
+                off += sz;
+            }
+            debug_assert_eq!(off, b);
+            l
+        } else if pipelined {
             engine.forward_step_arena_pipelined(bd_a, bi_a, bd_b, bi_b, sd, si, &mut self.arena, &mut self.dev, &mut self.dev_b, &slots, weights, &hcs, &toks, engram_rows.as_deref(), pager.as_mut())?;
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
             let b_a = b.div_ceil(2);
