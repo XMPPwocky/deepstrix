@@ -10,6 +10,19 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Open
 
+### 26. FIXED 2026-09-21 — a legacy (image) request head-of-line blocked the multistream queue
+
+`Sched::tick`'s start loop popped the next request and, if it needed the legacy
+serial path (images / DSpark) while the arena was not empty, pushed it back to the
+FRONT and `break`-ed, so nothing behind it could start until every live stream
+had finished. With agents streaming continuously the arena never empties, so one
+screenshot request stalled three normal requests for 20+ minutes (01:13-01:37
+UTC) while one stream decoded alone at 1 row. Nothing was logged: the path had
+no tracing. Fix `0d5a0c4`: legacy requests step aside (deferred, re-queued at the
+front) and normal requests start; once a legacy request has aged past
+`V41_MS_AGING_S` no new streams are admitted, so the arena drains and it runs.
+An INFO line now records the first deferral.
+
 ### 25. FIXED 2026-09-20 — CED replay emptied the decoder rings on a CONTINUATION, so a short suffix decoded with a 1-row window
 
 Both CED drivers (`prefill_job_finish` and `forward_prefill_pipelined`) set
