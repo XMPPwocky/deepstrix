@@ -172,6 +172,15 @@ pub fn expert_odirect() -> bool {
     *B
 }
 
+/// `V41_EXPERT_MIRROR_FRAC`: share of each split weight read served by the
+/// mirror drive (default 0.6: box 2's SN5000 mirror is faster than its E100).
+pub fn expert_mirror_frac() -> f32 {
+    static F: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_EXPERT_MIRROR_FRAC").ok().and_then(|v| v.parse().ok()).unwrap_or(0.6)
+    });
+    *F
+}
+
 pub fn expert_pread_threads() -> usize {
     static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         std::env::var("V41_EXPERT_PREAD_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
@@ -1025,7 +1034,9 @@ impl V41HfWeights {
         let t_pread = std::time::Instant::now();
         let (region_w, region_s) = dst.split_at_mut(cap_w);
         let t_w = std::time::Instant::now();
-        let Some(pad_w) = self.st.read_range_into_direct_padded(wt, 0, packed_len, region_w)? else {
+        // Mirror split (`V41_EXPERT_MIRROR_DIR`): the packed weights, ~6 MB per
+        // role, come half from each drive; the scale plane stays on the primary.
+        let Some(pad_w) = self.st.read_range_into_direct_split(wt, 0, packed_len, region_w, expert_mirror_frac())? else {
             return Ok(None);
         };
         EXPERT_READ_PROF.weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);

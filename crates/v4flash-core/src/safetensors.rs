@@ -93,6 +93,12 @@ pub struct SafetensorsDir {
     /// Second handle per shard opened `O_DIRECT`, for [`Self::read_range_into_direct`].
     /// `None` where the filesystem refused the flag. See that method for why.
     direct_files: Vec<Option<File>>,
+    /// `V41_EXPERT_MIRROR_DIR`: a second copy of the checkpoint on another
+    /// drive; per shard an `O_DIRECT` handle to the same-named file there
+    /// (None when absent). `read_range_into_direct_split` reads the tail of a
+    /// range from it concurrently with the head from `direct_files`, so ONE
+    /// expert miss is served by two drives (box 2, 2026-09-22).
+    mirror_files: Vec<Option<File>>,
     shard_names: Vec<String>,
     tensors: HashMap<String, StTensor>,
 }
@@ -130,6 +136,8 @@ impl SafetensorsDir {
 
         let mut files = Vec::with_capacity(shard_names.len());
         let mut direct_files: Vec<Option<File>> = Vec::with_capacity(shard_names.len());
+        let mirror_dir: Option<std::path::PathBuf> = std::env::var_os("V41_EXPERT_MIRROR_DIR").map(std::path::PathBuf::from);
+        let mut mirror_files: Vec<Option<File>> = Vec::with_capacity(shard_names.len());
         let mut tensors = HashMap::new();
         for (shard, sname) in shard_names.iter().enumerate() {
             let path = dir.join(sname);
@@ -202,9 +210,18 @@ impl SafetensorsDir {
                     .open(&path)
                     .ok(),
             );
+            mirror_files.push(mirror_dir.as_ref().and_then(|d| {
+                let mp = d.join(path.file_name()?);
+                // Same size, or it is not a copy of this shard.
+                let same = std::fs::metadata(&mp).ok()?.len() == std::fs::metadata(&path).ok()?.len();
+                same.then(|| std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(&mp).ok()).flatten()
+            }));
             files.push(f);
         }
-        Ok(Self { dir, files, direct_files, shard_names, tensors })
+        if mirror_dir.is_some() {
+            eprintln!("safetensors: expert mirror {} shards of {} usable from {}", mirror_files.iter().filter(|m| m.is_some()).count(), shard_names.len(), mirror_dir.as_ref().unwrap().display());
+        }
+        Ok(Self { dir, files, direct_files, mirror_files, shard_names, tensors })
     }
 
     pub fn dir(&self) -> &Path {
@@ -531,6 +548,73 @@ impl SafetensorsDir {
         if got < need {
             return Err(eyre!("O_DIRECT span short read: got {got} of {need}"));
         }
+        Ok(Some(pad))
+    }
+
+    /// Whether shard `shard` has a mirror handle.
+    pub fn has_mirror(&self, shard: usize) -> bool {
+        matches!(self.mirror_files.get(shard), Some(Some(_)))
+    }
+
+    /// `read_range_into_direct_padded`, with the range split at a 4096-aligned
+    /// point: the head `[0, p)` read from the primary handle and the tail
+    /// `[p, len)` from the mirror handle CONCURRENTLY (`mirror_frac` = share of
+    /// the bytes on the mirror, e.g. 0.6 for a faster mirror drive). Falls back
+    /// to the single read when there is no mirror. Same padded layout and
+    /// return value as the unsplit read.
+    pub fn read_range_into_direct_split(
+        &self,
+        t: &StTensor,
+        byte_off: u64,
+        len: usize,
+        dst: &mut [u8],
+        mirror_frac: f32,
+    ) -> eyre::Result<Option<usize>> {
+        const A: u64 = 4096;
+        let (Some(Some(file)), Some(Some(mirror))) = (self.direct_files.get(t.shard), self.mirror_files.get(t.shard)) else {
+            return self.read_range_into_direct_padded(t, byte_off, len, dst);
+        };
+        let end = byte_off.checked_add(len as u64).ok_or_else(|| eyre!("{}: range overflow", t.name))?;
+        if end > t.len {
+            return Err(eyre!("{}: range [{byte_off},{end}) exceeds tensor length {}", t.name, t.len));
+        }
+        if len < 2 * A as usize {
+            return self.read_range_into_direct_padded(t, byte_off, len, dst);
+        }
+        let abs = t.offset + byte_off;
+        let pad = (abs & (A - 1)) as usize;
+        let span = ((pad + len) as u64).div_ceil(A) as usize * A as usize;
+        if dst.len() < span {
+            return Err(eyre!("{}: direct dst {} < span {span} (pad {pad}, len {len})", t.name, dst.len()));
+        }
+        if dst.as_ptr() as usize & (A as usize - 1) != 0 {
+            return Err(eyre!("{}: direct dst is not {A}-aligned", t.name));
+        }
+        // Split point in the padded span, 4096-aligned: the primary reads
+        // [0, cut) of the span, the mirror [cut, span).
+        let frac = (1.0 - mirror_frac.clamp(0.0, 1.0)) as f64;
+        let mut cut = ((span as f64 * frac) as usize / A as usize) * A as usize;
+        cut = cut.clamp(A as usize, span - A as usize);
+        let base = abs - pad as u64;
+        let (head, tail) = dst[..span].split_at_mut(cut);
+        let read_all = |f: &File, buf: &mut [u8], off: u64| -> eyre::Result<()> {
+            let mut got = 0usize;
+            while got < buf.len() {
+                let n = f.read_at(&mut buf[got..], off + got as u64).wrap_err_with(|| format!("O_DIRECT split pread at {} for {}", off + got as u64, t.name))?;
+                if n == 0 { break; }
+                got += n;
+            }
+            // The last block of the file may be short: only the bytes inside
+            // [pad, pad + len) of the span must have landed.
+            Ok(())
+        };
+        let (ra, rb) = std::thread::scope(|sc| {
+            let hb = sc.spawn(move || read_all(mirror, tail, base + cut as u64));
+            let ra = read_all(file, head, base);
+            (ra, hb.join().unwrap_or_else(|_| Err(eyre!("mirror reader panicked"))))
+        });
+        ra?;
+        rb?;
         Ok(Some(pad))
     }
 
