@@ -211,3 +211,52 @@ watches. The USE-driven measurements to add, cheapest first: daemon queue depth
 + idle gap per page-stats window; `/proc/diskstats` in-flight sampler on box 2
 during bursts; `ss -tin` deltas per burst; `perf record -g` on the hub thread
 for its on-CPU share; rocprofv3 `--hip-trace` for its blocked share.
+
+## 8. Results of the step-1 fixes (2026-09-21, commits 8c551be / later)
+
+**Profile cost in tok/s: not measurable.** Same seeds (70/80/90), hub restarted
+between phases, box 2 untouched, 8-row 400-token bursts:
+
+| phase | rows=8 steps | mean step | tok/s |
+|---|---|---|---|
+| profile on (k.* gated) | 122 | 325.1 ms | 24.6 |
+| profile off | 77 | 329.1 ms | 24.3 |
+| profile on again | 157 | 321.8 ms | 24.9 |
+
+Within the 8% noise floor; the ~8 ms of dGPU stream time hides under the
+box-2 pole and the ~2 ms of host time is <1% of a step. Keep `V41_MS_PROFILE=1`.
+(These bursts read 24-25 tok/s where the 16:08 burst read 27.2: different
+prompt seed, 25-31 box-2 misses/step vs 23-25. Seed-to-seed spread exceeds
+the noise floor; always A/B on the same seed.)
+
+**First honest 8-row breakdown** (phase 1, first six windows, ms/step, 80
+box-2 waits per step):
+
+    wall ~300 | dgpu 83 igpu 121 | box2 service 245 = page 140 + compute 105
+    hub blocked in wait 170 on 70-76% of waits | rtt 465 (5.8 ms/req) srv 361 (4.5) link 104 (1.3 ms/req)
+    lh.pager_sync_igpu 31-39 (54 at 7 rows) | lh.sel_sync 44-49 | lh.remote_sync 7 | lh.ensure 7-9
+
+The pager block is now fully attributed: the previously untimed 31 ms was the
+`V41_PAGER_SYNC_IGPU` cross-lane iGPU drain (grows to 54 ms/step at 7 rows,
+where lane B is thinner and lane A waits for it more often), plus 2.4 ms of
+D2H after the router readback. `lh.remote_submit` (7 ms) is entirely the
+dGPU drain + xq/ew D2H, not the send.
+
+Daemon percentiles for these runs (B=4, per connection close): queue p50 1 µs
+/ p90 3.1 ms / p99 11 ms; service p50 1.44 ms / p90 6.4 / p99 14.3. More than
+half the requests arrive to an EMPTY daemon queue and take 1.4 ms: the median
+request is a hit-only lockstep exchange; the mean is paging tails.
+
+**The link is not a 205 µs constant.** Per 8-row 400-token burst (~34k
+requests), from the new `ss -tin` deltas in `e2e_div.sh`:
+
+    hub<-box2: retrans +3761, ALL DSACK'd (spurious), bytes_retrans +246 MB, reord_seen +21643
+    hub socket: rcv_ooopack +24355;   box2 socket: rcv_ooopack +0
+
+Every reply is two segments (header write + body write) and on the hub side
+they arrive out of order tens of thousands of times per burst; box 2 then
+retransmits the whole ~65 KB reply spuriously ~11% of the time. The
+asymmetry (box 2 never receives out of order) points at the hub's receive
+path (SO_BUSY_POLL 500 µs on the client socket) rather than the wire.
+`rtt - srv` = 1.3 ms/request at 8 rows is where this lands. A/B in progress
+via `V41_REMOTE_BUSY_POLL_US` / `V41_REMOTE_QUICKACK` (`~/scratch-ms/link_ab.sh`).
