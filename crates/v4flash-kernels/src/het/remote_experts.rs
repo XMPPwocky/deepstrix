@@ -1244,6 +1244,17 @@ static DEMAND_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 
 /// `V41_B2_EARLY_PAGE=0`: do not start a queued request's misses under the
 /// current request's tail (default on).
+/// `V41_B2_MERGE` (default ON): when the next queued frame is a request for the
+/// SAME layer (the other hub lane), run both as one MoE pass and answer both
+/// from its output. Dedups the experts across all rows and pays the fixed
+/// per-request cost once; with two lanes each request otherwise re-reads the
+/// experts the other lane's rows also picked ("lanes cost bytes", 2026-09-21).
+fn b2_merge() -> bool {
+    static B: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_B2_MERGE").as_deref() != Ok("0"));
+    *B
+}
+
 fn b2_early_page() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("V41_B2_EARLY_PAGE").as_deref() != Ok("0"));
     *B
@@ -3440,6 +3451,24 @@ impl MoeExecutor {
         self.ffn_moe.slice_view(0, b * N_EMBD as usize).copy_to_host(dst)
     }
 
+    /// Rows `[off_rows, off_rows + b)` of the last result (a coalesced pass
+    /// answers two requests from one output buffer).
+    pub fn read_f32_at(&self, off_rows: usize, b: usize, dst: &mut [f32]) -> eyre::Result<()> {
+        self.device.set_current()?;
+        self.engine.compute.synchronize()?;
+        self.ffn_moe.slice_view(off_rows * N_EMBD as usize, b * N_EMBD as usize).copy_to_host(dst)
+    }
+
+    pub fn read_f16_at(&mut self, off_rows: usize, b: usize, dst: &mut [u16]) -> eyre::Result<()> {
+        self.device.set_current()?;
+        let n = b * N_EMBD as usize;
+        let src = self.ffn_moe.slice_view(off_rows * N_EMBD as usize, n);
+        let mut o = self.out16.slice_view_mut(0, n);
+        self.engine.q8k.launch_cast_f16(&self.engine.compute, &mut o, &src, n as u32)?;
+        self.engine.compute.synchronize()?;
+        o.copy_to_host(dst)
+    }
+
     /// Cast the last result to f16 on the device (`f32_to_f16_cast`, RNE) and
     /// copy to host.
     pub fn read_f16(&mut self, b: usize, dst: &mut [u16]) -> eyre::Result<()> {
@@ -3753,7 +3782,7 @@ pub fn serve_connection(
         // request found the queue non-empty, how deep, and how long the GPU sat
         // idle between requests. Windowed with the page-stats print.
         let mut t_prev_ready: Option<Instant> = None;
-        let (mut w_idle_ns, mut w_service_ns, mut w_depth_sum, mut w_queued, mut w_n) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut w_idle_ns, mut w_service_ns, mut w_depth_sum, mut w_queued, mut w_n, mut w_merged) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         let mut w_t0 = Instant::now();
         loop {
             let depth_on_take = pending.len() as u64;
@@ -3804,12 +3833,52 @@ pub fn serve_connection(
                 let _ = tx_out.send((resp, Instant::now(), hdr.seq));
                 return Err(eyre!("unexpected frame kind {}", hdr.kind));
             }
-            let outcome: eyre::Result<(RequestRecord, u32)> = (|| {
+            // Same-layer coalescing (`b2_merge`): the next queued frame, when it is
+            // the other lane's request for this layer with the same reply format
+            // and both take the batched path, rides along in this pass.
+            let mut partner: Option<(proto::Header, AlignedBuf, Instant, Instant, u64)> = None;
+            if b2_merge() {
+                let take = match pending.front() {
+                    Some(Inbound::Frame { hdr: h2, buf: buf2, .. }) if h2.kind == proto::KIND_REQUEST => {
+                        match (proto::decode_request(&buf), proto::decode_request(buf2)) {
+                            (Ok(ra), Ok(rb)) => {
+                                let fm = proto::REQ_FLAG_RESP_F32 | proto::REQ_FLAG_BATCHED;
+                                ra.layer == rb.layer
+                                    && (ra.flags & fm) == (rb.flags & fm)
+                                    && ra.b as usize > exec.decode_max_b()
+                                    && rb.b as usize > exec.decode_max_b()
+                                    && (ra.b + rb.b) as usize <= exec.rows()
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                };
+                if take {
+                    if let Some(Inbound::Frame { hdr: h2, buf: buf2, t_first: tf2, t_done: td2, t2: t22 }) = pending.pop_front() {
+                        partner = Some((h2, buf2, tf2, td2, t22));
+                    }
+                }
+            }
+            let outcome: eyre::Result<(RequestRecord, u32, Option<(RequestRecord, u32, AlignedBuf)>)> = (|| {
                 let req = proto::decode_request(&buf)?;
                 if req.n_used != N_EXPERT_USED as u32 || req.xq_bpt != XQ_BYTES_PER_TOKEN as u32 {
                     return Err(eyre!("request geometry n_used={} xq_bpt={} != {}/{}", req.n_used, req.xq_bpt, N_EXPERT_USED, XQ_BYTES_PER_TOKEN));
                 }
                 let b = req.b as usize;
+                let reqb = match partner.as_ref() {
+                    Some((_, bufb, ..)) => Some(proto::decode_request(bufb)?),
+                    None => None,
+                };
+                let bb = reqb.as_ref().map(|r| r.b as usize).unwrap_or(0);
+                if let Some(rb) = reqb.as_ref() {
+                    if !rb.hint_admit.is_empty() {
+                        shard.hint_evict_first(rb.hint_admit);
+                    }
+                    if !rb.prefetch.is_empty() {
+                        shard.prefetch_words(rb.prefetch);
+                    }
+                }
                 // Paging THIS request did on our own NVMe. `run_path` calls
                 // `ensure_layer*` internally, so bracket it and difference the
                 // layer's cumulative counters. Reported back so the hub can draw a
@@ -3832,7 +3901,10 @@ pub fn serve_connection(
                 // readers as CERTAIN hints; B's own `ensure` then finds them in
                 // flight and waits for the remainder (`waited`) instead of
                 // reading from scratch. `V41_B2_EARLY_PAGE=0` disables.
-                let cur_pins: Vec<(u32, u32)> = req.sel.iter().filter(|&&e| e >= 0).map(|&e| (req.layer, e as u32)).collect();
+                let mut cur_pins: Vec<(u32, u32)> = req.sel.iter().filter(|&&e| e >= 0).map(|&e| (req.layer, e as u32)).collect();
+                if let Some(rb) = reqb.as_ref() {
+                    cur_pins.extend(rb.sel.iter().filter(|&&e| e >= 0).map(|&e| (req.layer, e as u32)));
+                }
                 let rx_in_ref = &rx_in;
                 let pending_ref = &mut pending;
                 // Pull EVERY frame the reader has (three hub lanes keep up to
@@ -3868,7 +3940,17 @@ pub fn serve_connection(
                     }
                     Ok(())
                 };
-                let timing = exec.run_path(shard, req.layer, b, req.xq, req.sel, req.ew, req.flags & proto::REQ_FLAG_BATCHED != 0, &mut overlap)?;
+                let (xq_m, sel_m, ew_m);
+                let (xq_run, sel_run, ew_run): (&[u8], &[i32], &[f32]) = match reqb.as_ref() {
+                    Some(rb) => {
+                        xq_m = [req.xq, rb.xq].concat();
+                        sel_m = [req.sel, rb.sel].concat();
+                        ew_m = [req.ew, rb.ew].concat();
+                        (&xq_m, &sel_m, &ew_m)
+                    }
+                    None => (req.xq, req.sel, req.ew),
+                };
+                let timing = exec.run_path(shard, req.layer, b + bb, xq_run, sel_run, ew_run, req.flags & proto::REQ_FLAG_BATCHED != 0, &mut overlap)?;
                 drop(overlap);
                 let (miss1, page_ns1) = shard.layer_page_counters(req.layer);
                 let t_page_us = (page_ns1.saturating_sub(page_ns0) / 1000).min(u32::MAX as u64) as u32;
@@ -3883,10 +3965,51 @@ pub fn serve_connection(
                 proto::begin_response(&mut resp, hdr.seq, req.layer, req.b, resp_flags, 0, t_compute_us, 0, N_EMBD, elem, req.t1, t2);
                 resp.resize(proto::RESP_DATA_OFF + n * elem as usize);
                 if f32_out {
-                    exec.read_f32(b, resp.view_mut::<f32>(proto::RESP_DATA_OFF, n))?;
+                    exec.read_f32_at(0, b, resp.view_mut::<f32>(proto::RESP_DATA_OFF, n))?;
                 } else {
-                    exec.read_f16(b, resp.view_mut::<u16>(proto::RESP_DATA_OFF, n))?;
+                    exec.read_f16_at(0, b, resp.view_mut::<u16>(proto::RESP_DATA_OFF, n))?;
                 }
+                // The partner's reply: rows [b, b + bb) of the same pass. Page
+                // time and miss count are reported on THIS request only, so the
+                // hub's per-step sums are unchanged.
+                let extra: Option<(RequestRecord, u32, AlignedBuf)> = match (reqb.as_ref(), partner.as_ref()) {
+                    (Some(rb), Some((hb, bufb, tfb, tdb, t2b))) => {
+                        let nb = bb * N_EMBD as usize;
+                        let mut resp_b = rx_resp_recycle.try_recv().unwrap_or_else(|_| AlignedBuf::with_capacity(proto::RESP_DATA_OFF + exec.rows() * N_EMBD as usize * 4));
+                        proto::begin_response(&mut resp_b, hb.seq, rb.layer, rb.b, resp_flags, 0, t_compute_us, 0, N_EMBD, elem, rb.t1, *t2b);
+                        resp_b.resize(proto::RESP_DATA_OFF + nb * elem as usize);
+                        if f32_out {
+                            exec.read_f32_at(b, bb, resp_b.view_mut::<f32>(proto::RESP_DATA_OFF, nb))?;
+                        } else {
+                            exec.read_f16_at(b, bb, resp_b.view_mut::<u16>(proto::RESP_DATA_OFF, nb))?;
+                        }
+                        proto::patch_len(&mut resp_b);
+                        let t_ready_b = Instant::now();
+                        let t_server_us_b = (t_ready_b - *tdb).as_micros() as u32;
+                        resp_b.as_bytes_mut()[proto::HDR_LEN + 20..proto::HDR_LEN + 24].copy_from_slice(&t_server_us_b.to_le_bytes());
+                        resp_b.as_bytes_mut()[proto::RESP_PAGE_OFF..proto::RESP_PAGE_OFF + 4].copy_from_slice(&0u32.to_le_bytes());
+                        resp_b.as_bytes_mut()[proto::RESP_MISSN_OFF..proto::RESP_MISSN_OFF + 4].copy_from_slice(&0u32.to_le_bytes());
+                        let rec_b = RequestRecord {
+                            seq: hb.seq,
+                            layer: rb.layer,
+                            b: rb.b,
+                            bytes_in: bufb.len(),
+                            bytes_out: resp_b.len(),
+                            read_us: (*tdb - *tfb).as_micros() as u32,
+                            queue_us: (t_start - *tdb).as_micros() as u32,
+                            h2d_us: 0,
+                            gpu_us: timing.gpu.as_micros() as u32,
+                            d2h_us: (t_ready_b - t_d2h0).as_micros() as u32,
+                            write_us: 0,
+                            path_decode: timing.path_decode,
+                            t_ready: t_ready_b,
+                            t1: rb.t1,
+                            t2: *t2b,
+                        };
+                        Some((rec_b, hb.seq, resp_b))
+                    }
+                    _ => None,
+                };
                 // `V41_B2_DBG=1`: hash the payload box 2 is about to SEND. Same
                 // FNV over every 97th f32 as box 1's [partial-src], so the two
                 // sides' duplicate structure is directly comparable: duplicates
@@ -3932,11 +4055,14 @@ pub fn serve_connection(
                     t1: req.t1,
                     t2,
                 };
-                Ok((rec, hdr.seq))
+                Ok((rec, hdr.seq, extra))
             })();
             let _ = tx_req_recycle.send(buf);
+            if let Some((_, bufb, ..)) = partner.take() {
+                let _ = tx_req_recycle.send(bufb);
+            }
             match outcome {
-                Ok((rec, seq)) => {
+                Ok((rec, seq, extra)) => {
                     if let (Some(tr), Some(t0)) = (tracer, t_start_rt) {
                         let now = super::perfetto::host_now_ns();
                         tr.span(
@@ -3969,6 +4095,19 @@ pub fn serve_connection(
                     }
                     n_done += 1;
                     *n_total = n_done as u64;
+                    if let Some((rec_b, seq_b, resp_b)) = extra {
+                        // Coalesced partner: its reply follows A's on the wire
+                        // (the hub waits FIFO by seq).
+                        t_prev_ready = Some(rec_b.t_ready);
+                        records.push(rec_b);
+                        if tx_out.send((resp_b, rec_b.t_ready, seq_b)).is_err() {
+                            return Err(eyre!("writer thread gone"));
+                        }
+                        n_done += 1;
+                        *n_total = n_done as u64;
+                        w_n += 1;
+                        w_merged += 1;
+                    }
                     // Catch-all tier: box 2 now owns ALL the paging, so its miss
                     // rate is the number that matters and the hub cannot see it.
                     // One line per 2000 requests (= per ~50 tokens at 40 layers).
@@ -3983,11 +4122,12 @@ pub fn serve_connection(
                             // it; read `read` (per-miss wall) instead.
                             let wall = w_t0.elapsed().as_secs_f64().max(1e-9);
                             let win = format!(
-                                " | window {:.1}s: busy {:.0}% idle/req {:.2} ms queued {:.0}% depth {:.2}",
+                                " | window {:.1}s: busy {:.0}% idle/req {:.2} ms queued {:.0}% depth {:.2} merged {:.0}%",
                                 wall, 100.0 * w_service_ns as f64 / 1e9 / wall,
                                 w_idle_ns as f64 / 1e6 / w_n.max(1) as f64,
                                 100.0 * w_queued as f64 / w_n.max(1) as f64,
                                 w_depth_sum as f64 / w_queued.max(1) as f64,
+                                100.0 * w_merged as f64 / w_n.max(1) as f64,
                             );
                             eprintln!(
                                 "expertd: page stats requests={req} misses={miss} hit={:.4} \
@@ -3998,7 +4138,7 @@ ms_per_miss={:.2} (read {:.2} [pread {:.2} repack_cpu {:.2}] h2d {:.2} repack_gp
                                 per(h2d_ns), per(rgpu_ns),
                             );
                             w_t0 = Instant::now();
-                            w_idle_ns = 0; w_service_ns = 0; w_depth_sum = 0; w_queued = 0; w_n = 0;
+                            w_idle_ns = 0; w_service_ns = 0; w_depth_sum = 0; w_queued = 0; w_n = 0; w_merged = 0;
                         }
                     }
                     if opts.verbose {

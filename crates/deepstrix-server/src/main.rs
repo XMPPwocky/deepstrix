@@ -261,6 +261,16 @@ async fn main() -> eyre::Result<()> {
         }
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received");
+            // The engine worker's blocking loop does not observe signals, so an
+            // idle server used to survive SIGTERM until SIGKILL (which skips the
+            // atexit handlers an attached rocprofv3 needs to flush its trace).
+            // Guarantee a real `exit()` after a grace period.
+            let grace = std::env::var("V41_EXIT_GRACE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(5u64);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(grace));
+                tracing::warn!(grace_s = grace, "shutdown grace elapsed; exiting the process");
+                std::process::exit(0);
+            });
         }
     }
     if let Err(e) = engine.shutdown().await {

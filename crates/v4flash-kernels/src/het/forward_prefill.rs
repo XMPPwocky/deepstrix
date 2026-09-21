@@ -5834,13 +5834,12 @@ impl HeterogeneousEngine {
                 // Suspected cause of KNOWN_BUGS #0 (run-to-run nondeterminism): OS
                 // page-cache warmth re-times the pager's NVMe reads between server
                 // launches, landing the race differently. Set to 0 to measure it.
-                if std::env::var("V41_PAGER_SYNC_IGPU").as_deref() != Ok("0") {
-                    // Timed on its own: this is a CROSS-LANE drain (lane A waits
-                    // for lane B's MoE) and was the largest untimed block in the
-                    // 2026-09-21 profile audit.
-                    let _t_isync = LayerHostTimer::start(&LH_PAGER_SYNC_IGPU);
-                    self.igpu.compute.synchronize()?;
-                }
+                // The iGPU drain this guard needs is issued BELOW, right before
+                // `ensure` (the first iGPU-side write), not here: the router
+                // readback, ownership split and the box-2 submit between here and
+                // there need nothing from the iGPU, and issuing the drain first
+                // put lane B's whole MoE in front of lane A's submit -- 31-59
+                // ms/step of turnaround at 7-8 rows (profile audit 2026-09-21).
                 let mc0 = if layer_miss_hist() { pg.counters().prefill_misses } else { 0 };
                 let n_sel = (b as usize) * cs_n_used;
                 let mut sel_host = vec![0i32; n_sel];
@@ -6255,6 +6254,14 @@ impl HeterogeneousEngine {
                   // without a remote (it did NOT after f1fbe3f: the whole tail of this block,
                   // ensure included, sat inside the remote branch; KNOWN_BUGS #20/#21).
                 if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} D at ensure site"); }
+                if std::env::var("V41_PAGER_SYNC_IGPU").as_deref() != Ok("0") {
+                    // RACE GUARD (see the comment at the top of this block): the
+                    // pager is about to write `remap_dev` / pool slots the OTHER
+                    // lane's MoE may still be reading. Timed on its own: a
+                    // cross-lane drain, moved here from before the router readback.
+                    let _t_isync = LayerHostTimer::start(&LH_PAGER_SYNC_IGPU);
+                    self.igpu.compute.synchronize()?;
+                }
                 let _t_ensure = LayerHostTimer::start(&LH_ENSURE);
                 let audit_v = std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1");
                 if audit_v {
