@@ -400,20 +400,42 @@ pub mod hot_set {
         }
         let per_layer = env_u("V41_B1_HOT_PER_LAYER", 90).min(NE);
         let mass_cap = env_f("V41_B1_HOT_MASS", 0.9).clamp(0.0, 1.0);
+        // HYSTERESIS (`V41_B1_HOT_HYST`, default 40 ranks): an incumbent keeps
+        // its slot until it falls below rank per_layer + hyst; newcomers only
+        // fill the slots that frees. Without it a refresh flipped ~1/3 of the
+        // set (the cutoff sits in the flat part of the distribution) and every
+        // flipped id was a synchronous box-1 read on its next pick.
+        let hyst = env_u("V41_B1_HOT_HYST", 40);
+        let warm = WARM.load(Relaxed);
         let (mut owned, mut changed, mut mass_sum) = (0usize, 0usize, 0f32);
         for l in 0..NL {
             let mut v: Vec<(u32, usize)> = (0..NE).map(|e| (COUNTS[l * NE + e].load(Relaxed), e)).collect();
             let total: u64 = v.iter().map(|&(c, _)| c as u64).sum();
             v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-            let mut acc = 0u64;
+            let mut rank = vec![NE; NE];
+            for (i, &(_, e)) in v.iter().enumerate() { rank[e] = i; }
             let mut own = vec![false; NE];
-            for (i, &(c, e)) in v.iter().enumerate() {
-                if i >= per_layer || c == 0 || (total > 0 && acc as f32 / total as f32 >= mass_cap) {
-                    break;
+            let mut n_own = 0usize;
+            if warm {
+                // Incumbents first, if still within the hysteresis band and alive.
+                for e in 0..NE {
+                    if OWN[l * NE + e].load(Relaxed) && rank[e] < per_layer + hyst && COUNTS[l * NE + e].load(Relaxed) > 0 && n_own < per_layer {
+                        own[e] = true;
+                        n_own += 1;
+                    }
                 }
-                own[e] = true;
-                acc += c as u64;
             }
+            // Newcomers: top ranks only, into the slots incumbents left free.
+            let mut acc = 0u64;
+            for (i, &(c, e)) in v.iter().enumerate() {
+                if c == 0 || i >= per_layer + hyst { break; }
+                if !own[e] && n_own < per_layer && i < per_layer {
+                    own[e] = true;
+                    n_own += 1;
+                }
+                if own[e] { acc += c as u64; }
+            }
+            let _ = mass_cap; // ranks decide; the mass is reported, not enforced
             mass_sum += if total > 0 { acc as f32 / total as f32 } else { 0.0 };
             for e in 0..NE {
                 let prev = OWN[l * NE + e].swap(own[e], Relaxed);
