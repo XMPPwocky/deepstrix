@@ -27,8 +27,8 @@ use v4flash_kernels::sampler::SamplerRng;
 
 use crate::embed::{embed_lookup, gpt2_decode_token};
 use crate::engine_worker::{
-    flush_expert_stats, handle_generate_stream, save_live_if_dirty, EngineRequest, FinishReason,
-    GenerateReq, WorkerEvent, WorkerState,
+    encode_request_images, flush_expert_stats, handle_generate_stream, save_live_if_dirty, EncodedImages,
+    EngineRequest, FinishReason, GenerateReq, WorkerEvent, WorkerState,
 };
 use crate::snapshot;
 use crate::tokens::{is_turn_end, TOK_ASSISTANT, TOK_EOS, TOK_THINK_BEGIN, TOK_THINK_END, TOK_USER};
@@ -85,6 +85,9 @@ struct Prefill {
     prefix: Vec<i32>,
     compressed: Vec<i32>,
     started: Instant,
+    /// Tower output for the request's images (empty when none): rows for
+    /// the synthetic image ids, spliced into the chunk inputs.
+    vl: EncodedImages,
 }
 
 /// `Prefill` after its scratch state has been recycled.
@@ -305,7 +308,9 @@ impl Sched {
         // longer than `V41_MS_AGING_S` (default 60 s) goes first regardless.
         let aging = std::time::Duration::from_secs(env_usize("V41_MS_AGING_S", 60) as u64);
         let mtp_on = state.mtp.is_some();
-        let is_legacy = move |p: &Pending| !p.req.images.is_empty() || mtp_on;
+        // Images ride the multistream path since 2026-09-21 (tower rows spliced
+        // into the chunk inputs); only DSpark still needs the legacy driver.
+        let is_legacy = move |_p: &Pending| mtp_on;
         // A legacy (vision / DSpark) request can only run on an empty arena. It
         // must NOT block the requests behind it (2026-09-21: one screenshot
         // request held three normal ones for 20+ min while a single stream kept
@@ -350,7 +355,7 @@ impl Sched {
                     if deferred.is_empty() && self.legacy_wait_logged.is_none_or(|t| t.elapsed().as_secs() >= 60) {
                         self.legacy_wait_logged = Some(Instant::now());
                         tracing::info!(queued = self.queue.len(), live = self.streams.len(), waited_s = p.queued.elapsed().as_secs(),
-                            "multistream: legacy (image) request waits for an empty arena; others proceed");
+                            "multistream: legacy (DSpark) request waits for an empty arena; others proceed");
                     }
                     deferred.push(p);
                     continue;
@@ -480,7 +485,13 @@ impl Sched {
             Ok(j) => j,
             Err(e) => return Err((p, kv, e)),
         };
-        let mut pf = Prefill { p, job, kv, prefix, compressed, started: t0 };
+        // Vision: run the tower now (dGPU, between steps) so the chunk inputs
+        // can splice the aligned rows in at the image positions.
+        let vl = match encode_request_images(state, &p.req) {
+            Ok(v) => v,
+            Err(e) => return Err((p, kv, e)),
+        };
+        let mut pf = Prefill { p, job, kv, prefix, compressed, started: t0, vl };
         if marker_in_prefill {
             pf.p.trailing_marker = None; // consumed
             pf.prefix.push(suffix[0]);
@@ -511,7 +522,8 @@ impl Sched {
                 pf.kv.restore_compressor_lending();
                 let mut tokens_saved: Vec<i32> = pf.prefix.clone();
                 tokens_saved.extend_from_slice(&pf.job.tokens()[..done]);
-                match snapshot::save(&pf.kv, &tokens_saved, &[], state.dgpu, state.igpu, &state.model_fingerprint,
+                let spans_saved = crate::vision_prompt::spans_in_range(&pf.p.req.image_spans, 0, tokens_saved.len()).unwrap_or_default();
+                match snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
                     state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, None) {
                     Ok(entry) => {
                         let hash = entry.hash;
@@ -575,7 +587,8 @@ impl Sched {
         // Snapshot the prompt (the legacy path saves here too, before the marker).
         let tokens_saved: Vec<i32> = pf.prefix.clone();
         flush_expert_stats(state);
-        match snapshot::save(&pf.kv, &tokens_saved, &[], state.dgpu, state.igpu, &state.model_fingerprint,
+        let spans_saved = crate::vision_prompt::spans_in_range(&pf.p.req.image_spans, 0, tokens_saved.len()).unwrap_or_default();
+        match snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
             state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, pf.p.session_id.as_deref()) {
             Ok(entry) => {
                 let hash = entry.hash;
@@ -615,7 +628,7 @@ impl Sched {
             }
         };
         if let Err(e) = state.engine.dgpu.compute.synchronize() { return Err((Some(pf.kv), e)); }
-        let Prefill { p: pp, job, kv: kv_done, prefix, compressed, started } = pf;
+        let Prefill { p: pp, job, kv: kv_done, prefix, compressed, started, vl: _ } = pf;
         self.spare_states.push(kv_done);
         let pf = PrefillDone { p: pp, job, prefix, compressed, started };
         self.admit_stream(state, pf, slot, logits).map_err(|e| (None, e))
@@ -929,17 +942,35 @@ fn stop_reason(s: &Stream, tok: i32) -> Option<FinishReason> {
 fn chunk_inputs(pf: &mut Prefill, state: &mut WorkerState) -> eyre::Result<()> {
     let (a, z) = pf.job.next_chunk_range((state.bd_a.rows, state.bd_b.rows))?;
     let toks = &pf.job.tokens()[a..z];
+    let p0 = pf.job.pos0() as usize;
     let mut hcs: Vec<Vec<f32>> = Vec::with_capacity(toks.len());
-    for &tok in toks {
+    for (k, &tok) in toks.iter().enumerate() {
         let mut v = vec![0f32; HC_DIM as usize];
-        embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, tok, &mut v);
+        // Absolute prompt index = prefix + suffix offset (the tower rows are
+        // indexed over the whole request's tokens).
+        match pf.vl.row_at(p0 + a + k) {
+            Some(row) => {
+                if !crate::vision_prompt::is_image_token(tok) {
+                    return Err(eyre!("prefill: token {tok} at index {} is not an image id but sits inside an image block", p0 + a + k));
+                }
+                let n_embd = v4flash_kernels::config::N_EMBD as usize;
+                for h in 0..v4flash_kernels::config::N_HC as usize {
+                    v[h * n_embd..(h + 1) * n_embd].copy_from_slice(row);
+                }
+            }
+            None => {
+                if crate::vision_prompt::is_image_token(tok) {
+                    return Err(eyre!("prefill: synthetic image token {tok} at index {} has no encoded row", p0 + a + k));
+                }
+                embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, tok, &mut v);
+            }
+        }
         hcs.push(v);
     }
     let engram = match (state.pager.as_ref(), state.engram.as_ref()) {
         (Some(pg), Some(ec)) => {
             const GATHER_THREADS: usize = 32;
             let ein = ENGRAM_IN as usize;
-            let p0 = pf.job.pos0() as usize;
             let n = z - a;
             let mut rows = vec![vec![0f32; n * ein]; ec.tables.len()];
             let mut k = 0usize;

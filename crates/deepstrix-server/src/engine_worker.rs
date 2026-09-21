@@ -4987,7 +4987,7 @@ fn spans_from(spans: &[ImageSpan], from: usize) -> Vec<ImageSpan> {
 /// Tower output for one request: a 4096-d embedding row per image-block
 /// token, keyed by the block's position in `GenerateReq::tokens`.
 #[derive(Default)]
-struct EncodedImages {
+pub(crate) struct EncodedImages {
     /// `(block_start, block_len, rows)` where `rows` is
     /// `block_len * N_EMBD` f32 in block order — aligner rows at IMAGE
     /// slots, sentinel vectors at PAD / START / NEWLINE / END.
@@ -4998,7 +4998,7 @@ struct EncodedImages {
 
 impl EncodedImages {
     /// The 4096-d row for token index `i`, when `i` is an image slot.
-    fn row_at(&self, i: usize) -> Option<&[f32]> {
+    pub(crate) fn row_at(&self, i: usize) -> Option<&[f32]> {
         let n_embd = N_EMBD as usize;
         self.blocks.iter().find_map(|(start, len, rows)| {
             (i >= *start && i < start + len).then(|| {
@@ -5027,7 +5027,7 @@ const VIT_ROW_CACHE_MAX: usize = 4;
 /// The restore therefore runs on EVERY exit, success or failure, and we
 /// invalidate the engine's cache because the tower changed the thread's
 /// device behind its back.
-fn encode_request_images(
+pub(crate) fn encode_request_images(
     state: &mut WorkerState,
     req: &GenerateReq,
 ) -> eyre::Result<EncodedImages> {
