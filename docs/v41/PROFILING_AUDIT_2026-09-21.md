@@ -183,3 +183,31 @@ records, `ms.step` line) is atomics and one log line; negligible.
    burst script.
 5. Only then decide between the multistream perfetto export (per-lane host
    spans on a monotonic clock) and continuing on rocprofv3 windows.
+
+## 7. USE table (Gregg: Utilization / Saturation / Errors per resource)
+
+8-row two-lane step, 298 ms wall, from the 16:08 UTC `ms.stage` block and the
+daemon / socket counters read at 16:50. "—" = nothing measures it today.
+
+| Resource | Utilization | Saturation | Errors |
+|---|---|---|---|
+| dGPU (9070 XT) | 92 ms / 298 = **31%** (event-pair sum; ~8 ms of it is the profiling itself) | — (single compute stream; "idle because the host has not enqueued" is the number and nothing records it) | none logged |
+| Box-1 iGPU | 114 / 298 = **38%** | — | none logged |
+| Box-2 iGPU | ~100 / 298 = **34%** real compute (the 232 ms "busy" is service INCLUDING 132 ms of paging) | daemon queue time p50 0.9 / p90 5.9 / p99 15 ms at B=3 — printed only at connection close; no per-window depth | none logged |
+| Hub host thread | on-CPU ≈ 298 − 161 wait − 50 sel_sync − ≤31 untimed syncs = **56-87 ms, 19-29%**; blocked the rest | it is the serialiser: box 2 idle while the hub has not yet submitted = the ~70 ms we are hunting; no run-queue or off-CPU data | 0 errors since 16:30 |
+| Daemon compute thread | 232 / 298 = **78%** in service, but most of the paging part is waiting on reads (join / `ev_done` poll) | `pending` queue depth on arrival — not recorded | 26 lines in the whole log, all connection resets from hub restarts |
+| Box-2 NVMe x2 | 24 misses x 18.8 MB / 0.298 s = **1.5 GB/s of ~10 GB/s** aggregate (15%) | latency-bound, not bandwidth-bound: QD1 4.1 / 3.6 ms, linear in concurrency; prefetch readers contend with demand (3.25 → 4.85 ms/miss); in-flight depth under the real workload never sampled (`/proc/diskstats` field 9) | none (SMART needs root) |
+| Box-1 NVMe | 0.25 misses/step warm ≈ **0** | — | — |
+| Thunderbolt link | ~80 req x (110 KB + 61 KB) ≈ 14 MB/step → **~46 MB/s of ~785 MB/s** (6%) | `rwnd_limited` 1.5%, reordering holds (`reord_seen` 13226, `rcv_ooopack` 4051), cwnd 10-15 x 65 KB segments | **retrans 621 (daemon→hub, 40 MB) + 112 (hub→daemon, all spurious)** — the only non-zero E in the system and nothing of ours measures it |
+| dGPU↔iGPU peer copies | `peer_push` stages ~7 ms/step | xfer-stream depth — | none |
+| Host RAM / GTT | box 1: 78 GB pool of 93; box 2: 116 of 128 | box 1 has ~1.5 GB of page cache, so every file read is a disk read | no OOM since the launch fix |
+| CPU cores (both boxes) | load avg 1.3 (box 1) / 0.3 (box 2) on 32 threads | none | none |
+
+Reading: no device is above ~40% real utilization, so the step is not a
+utilization problem on any single resource. It is a saturation problem on the
+hub host thread (the one serial resource every lane passes through), and the
+only resource with non-zero errors is the link, which no instrumentation of ours
+watches. The USE-driven measurements to add, cheapest first: daemon queue depth
++ idle gap per page-stats window; `/proc/diskstats` in-flight sampler on box 2
+during bursts; `ss -tin` deltas per burst; `perf record -g` on the hub thread
+for its on-CPU share; rocprofv3 `--hip-trace` for its blocked share.
