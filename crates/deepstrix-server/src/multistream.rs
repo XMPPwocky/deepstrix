@@ -145,7 +145,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         Ok(b) => b,
         Err(e) => { tracing::error!(error = %e, "multistream: bounce alloc failed"); return; }
     };
-    let mut sched = Sched { profile_acc: ProfileAcc::default(), dev_b, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
+    let mut sched = Sched { profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
 
     loop {
         // 1. Intake: never block while there is work; block when idle.
@@ -210,6 +210,7 @@ fn ms_profile() -> bool {
 
 struct Sched {
     profile_acc: ProfileAcc,
+    legacy_wait_logged: Option<Instant>,
     /// Lane-B tables for the two-lane step (`V41_MS_PIPELINE`).
     dev_b: RowTablesDev,
     /// Prefilled requests waiting for arena room (their scratch state stays
@@ -346,7 +347,8 @@ impl Sched {
                         for d in deferred.drain(..) { self.queue.push_front(d); }
                         return Ok(());
                     }
-                    if deferred.is_empty() {
+                    if deferred.is_empty() && self.legacy_wait_logged.is_none_or(|t| t.elapsed().as_secs() >= 60) {
+                        self.legacy_wait_logged = Some(Instant::now());
                         tracing::info!(queued = self.queue.len(), live = self.streams.len(), waited_s = p.queued.elapsed().as_secs(),
                             "multistream: legacy (image) request waits for an empty arena; others proceed");
                     }
