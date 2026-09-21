@@ -302,8 +302,20 @@ impl Sched {
         // (plan 5.3: SJF on the suffix; the prompt length is the proxy we have
         // before the snapshot probe), with aging: a request that has waited
         // longer than `V41_MS_AGING_S` (default 60 s) goes first regardless.
+        let aging = std::time::Duration::from_secs(env_usize("V41_MS_AGING_S", 60) as u64);
+        let mtp_on = state.mtp.is_some();
+        let is_legacy = move |p: &Pending| !p.req.images.is_empty() || mtp_on;
+        // A legacy (vision / DSpark) request can only run on an empty arena. It
+        // must NOT block the requests behind it (2026-09-21: one screenshot
+        // request held three normal ones for 20+ min while a single stream kept
+        // decoding). It steps aside; once it has aged, admissions stop so the
+        // arena drains and it gets its turn.
+        let legacy_aged = self.queue.iter().any(|p| is_legacy(p) && p.queued.elapsed() >= aging);
+        if legacy_aged && !(self.streams.is_empty() && self.prefills.is_empty()) {
+            tracing::debug!(queued = self.queue.len(), live = self.streams.len(), "multistream: draining the arena for an aged legacy request");
+        }
+        let mut deferred: Vec<Pending> = Vec::new();
         while !self.spare_states.is_empty() && !self.queue.is_empty() {
-            let aging = std::time::Duration::from_secs(env_usize("V41_MS_AGING_S", 60) as u64);
             if let Some(i) = self.queue.iter().position(|p| p.queued.elapsed() >= aging) {
                 let p = self.queue.remove(i).unwrap();
                 self.queue.push_front(p);
@@ -316,7 +328,7 @@ impl Sched {
                 if p.cancel.load(Ordering::Relaxed) || p.tx.is_closed() {
                     continue;
                 }
-                if !p.req.images.is_empty() || state.mtp.is_some() {
+                if is_legacy(&p) {
                     // Legacy serial path (vision / DSpark): only with an empty arena
                     // and no prefill in flight.
                     if self.streams.is_empty() && self.prefills.is_empty() {
@@ -331,8 +343,18 @@ impl Sched {
                         save_live_if_dirty(state);
                         state.live = None;
                         state.state.reset_in_place(state.dgpu, state.igpu)?;
+                        for d in deferred.drain(..) { self.queue.push_front(d); }
                         return Ok(());
                     }
+                    if deferred.is_empty() {
+                        tracing::info!(queued = self.queue.len(), live = self.streams.len(), waited_s = p.queued.elapsed().as_secs(),
+                            "multistream: legacy (image) request waits for an empty arena; others proceed");
+                    }
+                    deferred.push(p);
+                    continue;
+                }
+                if legacy_aged {
+                    // Drain: no new streams until the aged legacy request has run.
                     self.queue.push_front(p);
                     break;
                 }
@@ -351,6 +373,7 @@ impl Sched {
             }
             if !started { break; }
         }
+        for d in deferred.drain(..).rev() { self.queue.push_front(d); }
         // Chunk or step? Bursts with hysteresis: stay in a phase until its
         // budget elapses (V41_MS_PREFILL_BURST_MS / V41_MS_DECODE_BURST_MS,
         // default 4000 each) or it runs out of work.
