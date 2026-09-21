@@ -42,6 +42,11 @@ pub struct EventPool {
     inner: RefCell<EventPoolInner>,
     label: &'static str,
     enabled: std::cell::Cell<bool>,
+    /// While a stage is being captured into a HIP graph, `stage()` is a no-op:
+    /// event records inside a capture become graph nodes whose timings the
+    /// pool could not harvest (the parent stage around the graph launch still
+    /// times the whole replay).
+    capturing: std::cell::Cell<bool>,
 }
 
 struct EventPoolInner {
@@ -93,6 +98,7 @@ impl EventPool {
             // Either profile turns recording on: DEEPSTRIX_TOKEN_PROFILE for the
             // decode breakdown, DEEPSTRIX_PREFILL_PROFILE for the prefill aggregate.
             enabled: std::cell::Cell::new(token_profile() || prefill_profile::enabled()),
+            capturing: std::cell::Cell::new(false),
         })
     }
 
@@ -101,6 +107,10 @@ impl EventPool {
     /// empty.
     pub fn set_enabled(&self, on: bool) {
         self.enabled.set(on);
+    }
+
+    pub fn set_capturing(&self, on: bool) {
+        self.capturing.set(on);
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -126,7 +136,7 @@ impl EventPool {
         name: &'static str,
         stream: &'a Stream,
     ) -> eyre::Result<StageScope<'a>> {
-        if !self.enabled.get() {
+        if !self.enabled.get() || self.capturing.get() {
             return Ok(StageScope {
                 pool: self,
                 stream,

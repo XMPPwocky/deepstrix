@@ -49,6 +49,20 @@ impl GraphCache {
     /// instantiate on the first call, but released before the launch.
     /// On steady-state calls the mutex is held only long enough to
     /// `Arc::clone` the `GraphExec` out.
+    /// The instantiated graph for `(stage, key)`, if captured already.
+    pub fn get(&self, stage: &'static str, key: u32) -> Option<Arc<GraphExec>> {
+        self.entries.lock().unwrap().get(&(stage, key)).cloned()
+    }
+
+    /// Store a graph captured by the caller.
+    pub fn insert(&self, stage: &'static str, key: u32, exec: Arc<GraphExec>) {
+        self.entries.lock().unwrap().insert((stage, key), exec);
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+
     pub fn run<F>(
         &self,
         stage: &'static str,

@@ -697,7 +697,82 @@ impl HeterogeneousEngine {
     }
 }
 
+/// `V41_MS_GRAPHS=0` disables the per-stage HIP graphs of the arena (decode)
+/// lane-layer. Default ON: at 1-8 rows the batched driver is host-launch-bound
+/// (~40 kernels per lane-layer at 20-40 us each for a few us of GPU work), and
+/// a captured stage replays as one launch.
+pub fn ms_graphs() -> bool {
+    static B: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_MS_GRAPHS").as_deref() != Ok("0"));
+    *B
+}
+
+/// One stage's capture-or-replay handle (see `HeterogeneousEngine::stage_cap`).
+/// `skip` = a graph was replayed, run nothing. Dropping an unfinished capture
+/// ends it and discards the graph, so an error inside the stage cannot leave
+/// the stream in capture mode.
+pub struct StageCap<'a> {
+    pub skip: bool,
+    capturing: bool,
+    name: &'static str,
+    key: u32,
+    de: &'a super::engine::DeviceEngine,
+    graphs: &'a super::graph_cache::GraphCache,
+}
+
+impl<'a> StageCap<'a> {
+    /// Finish: on a fresh capture, instantiate, store and launch it.
+    pub fn end(mut self) -> eyre::Result<()> {
+        if self.capturing {
+            self.capturing = false;
+            self.de.events.set_capturing(false);
+            let graph = self.de.compute.end_capture()?;
+            let exec = std::sync::Arc::new(graph.instantiate()?);
+            self.graphs.insert(self.name, self.key, exec.clone());
+            exec.launch(&self.de.compute)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StageCap<'_> {
+    fn drop(&mut self) {
+        if self.capturing {
+            self.de.events.set_capturing(false);
+            let _ = self.de.compute.end_capture();
+        }
+    }
+}
+
 impl HeterogeneousEngine {
+    /// Begin a capture-or-replay of a dGPU stage of the arena lane-layer.
+    /// `allow` = the caller's static-shape guarantee (arena layout, no dumps
+    /// armed). Key = layer | rows << 8 | lane hash << 16, where the lane is
+    /// identified by its scratch buffer address (bd_a vs bd_b).
+    pub fn stage_cap<'a>(
+        &'a self,
+        de: &'a super::engine::DeviceEngine,
+        name: &'static str,
+        layer: usize,
+        b: u32,
+        lane_ptr: usize,
+        allow: bool,
+    ) -> eyre::Result<StageCap<'a>> {
+        let graphs = &self.dgpu_graphs;
+        if !allow || !ms_graphs() {
+            return Ok(StageCap { skip: false, capturing: false, name, key: 0, de, graphs });
+        }
+        let lane = ((lane_ptr >> 8) as u32).wrapping_mul(2654435761) >> 16;
+        let key = (layer as u32) | (b << 8) | (lane << 16);
+        if let Some(exec) = graphs.get(name, key) {
+            exec.launch(&de.compute)?;
+            return Ok(StageCap { skip: true, capturing: false, name, key, de, graphs });
+        }
+        de.compute.begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        de.events.set_capturing(true);
+        Ok(StageCap { skip: false, capturing: true, name, key, de, graphs })
+    }
+
     /// Layer-major batched prefill using batched kernels.
     ///
     /// Reads `input_hcs[i]` = layer-0 input HC for token `i`, broadcast of
@@ -1423,6 +1498,7 @@ impl HeterogeneousEngine {
         b: u32,
         layer: usize,
         pos0: u32,
+        graphs_ok: bool,
     ) -> eyre::Result<()> {
         let de = &self.dgpu;
         // ========================================================
@@ -1430,6 +1506,8 @@ impl HeterogeneousEngine {
         // swiglu + vec_add are pure elementwise → stretch n by B
         // ========================================================
         let _t_shared = de.events.stage("dgpu.shared_expert", &de.compute)?;
+        let cap = self.stage_cap(de, "g.shared_expert", layer, b, bd.residual.raw() as usize, graphs_ok)?;
+        if !cap.skip {
         {
             let _t = de.events.stage("k.shared_expert.quantize_input", &de.compute)?;
             // Q8_0 gate/up consume the (i8, scale) pair; K-quants (unsloth
@@ -1528,6 +1606,8 @@ impl HeterogeneousEngine {
             )?;
         }
         }
+        }
+        cap.end()?;
         drop(_t_shared);
         Ok(())
     }
@@ -2359,6 +2439,10 @@ impl HeterogeneousEngine {
             RowLayout::Arena { tables, dev } => Some((*tables, *dev)),
             RowLayout::Contiguous => None,
         };
+        // Per-stage HIP graphs (arena decode steps only: static shapes per
+        // (layer, rows, lane); a prefill chunk's pos0/visibility vary per call).
+        let cap_ok = arena.is_some() && !super::engine::subtensor_dump_armed(layer as usize);
+        let lane_ptr = bd.residual.raw() as usize;
         let arena_store = arena.and_then(|_| store_index_of(layer as usize));
         if let Some((t, d)) = arena {
             if t.pos_per.len() != tokens.len() || (d.rows_cap as usize) < tokens.len() {
@@ -2576,6 +2660,8 @@ impl HeterogeneousEngine {
             }
             bd.engram_rows_ready = false;
         }
+        let cap = self.stage_cap(de, "g.mhc_pre_attn", layer as usize, b, lane_ptr, cap_ok)?;
+        if !cap.skip {
         {
             let _t = de.events.stage("k.mhc_pre_attn.rms_nw", &de.compute)?;
             de.rms_nw
@@ -2696,6 +2782,8 @@ impl HeterogeneousEngine {
             )?;
         }
 
+        }
+        cap.end()?;
         drop(_t_mhc_pre);
 
         // ========================================================
@@ -2704,6 +2792,8 @@ impl HeterogeneousEngine {
         // M7 CED: a source-only call needs neither Q nor the window KV.
         if ced != CedMode::KvSourceOnly {
         let _t_q = de.events.stage("dgpu.q_chain", &de.compute)?;
+        let cap = self.stage_cap(de, "g.q_chain", layer as usize, b, lane_ptr, cap_ok)?;
+        if !cap.skip {
         {
             let _t = de.events.stage("k.q_chain.cast_input_f16", &de.compute)?;
             de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.x16_n_embd, &sd.attn_input_norm,
@@ -2851,6 +2941,8 @@ impl HeterogeneousEngine {
         // against decode. Slots, windows and the SWA kernel are all proven
         // identical, so if row 0 of this differs from `dec_q_normed_p<POS>` the
         // bug is in the Q chain (rope position / rms), not in attention.
+        }
+        cap.end()?;
         if super::engine::subtensor_dump_armed(layer as usize) {
             self.dgpu.compute.synchronize()?;
             let nq = (crate::config::N_HEAD * crate::config::N_HEAD_DIM) as usize;
@@ -2867,6 +2959,8 @@ impl HeterogeneousEngine {
         // Stage 3: KV chain (BATCHED matvec + rms; per-token rope/fp8/f16rt)
         // ========================================================
         let _t_kv = de.events.stage("dgpu.kv_chain", &de.compute)?;
+        let cap = self.stage_cap(de, "g.kv_chain", layer as usize, b, lane_ptr, cap_ok)?;
+        if !cap.skip {
         {
             // Decode uses `de.q8.matvec` here (forward_layer.rs:771), preceded at
             // :759 by quantizing `attn_input_norm` into xq_n_embd/xscale_n_embd.
@@ -2952,6 +3046,8 @@ impl HeterogeneousEngine {
         // final post-loop values (which would let token i attend to
         // future tokens i+1..B-1).
         // ========================================================
+        }
+        cap.end()?;
         drop(_t_kv);
         } // ced != KvSourceOnly (stages 2-3)
         let _t_kv_append_comp = de.events.stage("dgpu.kv_append_compressor_serial", &de.compute)?;
@@ -4895,6 +4991,8 @@ impl HeterogeneousEngine {
         // Stage 6: Output projection (rope_inv per b, then BATCHED q8)
         // ========================================================
         let _t_out = de.events.stage("dgpu.output_proj", &de.compute)?;
+        let cap = self.stage_cap(de, "g.output_proj", layer as usize, b, lane_ptr, cap_ok)?;
+        if !cap.skip {
         // SLACK PROBE site `verify_dgpu`: one stall per layer on the dGPU
         // chain. 40 layers x 2 lanes, so the injected total is 80x the tick
         // count -- divide before taking the slope.
@@ -5002,6 +5100,8 @@ impl HeterogeneousEngine {
                 )?;
             }
         }
+        }
+        cap.end()?;
         drop(_t_out);
         // Bisect within layer 0 (KNOWN_BUGS #0b): attn_out is the attention
         // half's OUTPUT, before hc_post and the whole FFN half. Splits
@@ -5036,6 +5136,8 @@ impl HeterogeneousEngine {
         // Stage 8: mhc_pre_ffn (BATCHED, same shape as Stage 1)
         // ========================================================
         let _t_mhc_pre_ffn = de.events.stage("dgpu.mhc_pre_ffn", &de.compute)?;
+        let cap = self.stage_cap(de, "g.mhc_pre_ffn", layer as usize, b, lane_ptr, cap_ok)?;
+        if !cap.skip {
         {
             let _t = de.events.stage("k.mhc_pre_ffn.rms_nw", &de.compute)?;
             de.rms_nw.launch_batched(
@@ -5108,6 +5210,8 @@ impl HeterogeneousEngine {
                 b,
             )?;
         }
+        }
+        cap.end()?;
         drop(_t_mhc_pre_ffn);
 
         // ========================================================
@@ -5119,6 +5223,8 @@ impl HeterogeneousEngine {
         // batched variant could remove the per-token launch overhead.)
         // ========================================================
         let _t_router = de.events.stage("dgpu.router", &de.compute)?;
+        let cap = self.stage_cap(de, "g.router_matvec", layer as usize, b, lane_ptr, cap_ok)?;
+        if !cap.skip {
         {
             // Gate projection.
             //
@@ -5177,6 +5283,8 @@ impl HeterogeneousEngine {
         // compress-pads included — `Gate.forward`'s `image_mask`). They
         // select experts by top-k(scores + bias_vl) on EVERY layer; text
         // rows keep exp_probs_b / tid2eid, bit-identical to before.
+        }
+        cap.end()?;
         let image_runs = image_spans::image_runs(tokens);
         if !dlw.is_hash_router {
             // Top-k: one block per token in a single launch (B→1 launches).
@@ -5304,7 +5412,7 @@ impl HeterogeneousEngine {
         // inside the box-2 RPC window. See `issue_shared_expert_prefill`.
         let defer_shared = prefill_presubmit() && remote_split_active();
         if !defer_shared {
-            self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos)?;
+            self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos, cap_ok)?;
         }
 
         // ========================================================
@@ -6032,7 +6140,7 @@ impl HeterogeneousEngine {
         // shared expert entirely in that case, so without this the layer would add
         // a stale `ffn_shared` and be silently wrong.
         if defer_shared {
-            self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos)?;
+            self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos, cap_ok)?;
         }
         let pager_window;
         let (routed_src, moe_remap, moe_packed): (
