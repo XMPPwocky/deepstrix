@@ -773,6 +773,47 @@ impl HeterogeneousEngine {
         Ok(StageCap { skip: false, capturing: true, name, key, de, graphs })
     }
 
+    /// Route probe hook (`V41_ROUTE_PROBE`): after `forward_layer_pre_moe_v2`
+    /// of `layer` on one lane, log the real picks, compute+log the one-layer
+    /// look-ahead proxy for layer+1, and the layer-20 activation. Syncs.
+    fn route_probe_after_layer(
+        &self,
+        bd: &BatchDgpuScratch,
+        weights: &HetModelWeights,
+        layer: usize,
+        b: usize,
+        lane: usize,
+    ) -> eyre::Result<()> {
+        if !super::route_probe::enabled() { return Ok(()); }
+        let de = &self.dgpu;
+        let nu = N_EXPERT_USED;
+        let mut look: Option<Vec<i32>> = None;
+        if layer + 1 < N_LAYER as usize {
+            let nl = &weights.dgpu_layers[layer + 1];
+            if !nl.is_hash_router {
+                let mut logits = v4flash_hip::DeviceBuffer::<f32>::new(de.device.id, b * N_EXPERT as usize)?;
+                let mut sel = v4flash_hip::DeviceBuffer::<i32>::new(de.device.id, b * nu)?;
+                let mut ew = v4flash_hip::DeviceBuffer::<f32>::new(de.device.id, b * nu)?;
+                de.f16.matvec_batched(&de.compute, &mut logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b as u32)?;
+                de.router_topk.launch_batched(&de.compute, &mut sel, &mut ew, &logits, nl.router_bias_dev.as_ref(), N_EXPERT, nu as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, b as u32)?;
+                de.compute.synchronize()?;
+                let mut v = vec![0i32; b * nu];
+                sel.copy_to_host(&mut v)?;
+                look = Some(v);
+            }
+        }
+        de.compute.synchronize()?;
+        let mut picks = vec![0i32; b * nu];
+        bd.d_selected.slice_view(0, b * nu).copy_to_host(&mut picks)?;
+        let mut act: Option<Vec<f32>> = None;
+        if layer == crate::config::CANDIDATE_SOURCE_LAYER as usize {
+            let mut a = vec![0f32; b * N_EMBD as usize];
+            bd.ffn_input_norm.slice_view(0, b * N_EMBD as usize).copy_to_host(&mut a)?;
+            act = Some(a);
+        }
+        super::route_probe::note(lane, layer, b, &picks, look.as_deref(), act.as_deref())
+    }
+
     /// Layer-major batched prefill using batched kernels.
     ///
     /// Reads `input_hcs[i]` = layer-0 input HC for token `i`, broadcast of
@@ -2218,6 +2259,7 @@ impl HeterogeneousEngine {
                     pager.as_deref_mut(), CedMode::Exact,
                     RowLayout::Arena { tables: &tables, dev },
                 )?;
+                self.route_probe_after_layer(bd, weights, layer, b, 0)?;
                 self.forward_layer_post_moe_v2(bd, b as u32, sev, hot_active)
             })?;
             std::mem::swap(&mut bd.residual, &mut bd.residual_next);
@@ -2322,11 +2364,15 @@ impl HeterogeneousEngine {
         arena.state.with_kv_source(0, |ls| {
             self.forward_layer_pre_moe_v2(bd_a, bi_a, sd, si, ls, &weights.dgpu_layers[0], &weights.igpu_layers[0], 0, tokens_a, None, None,
                 &self.sync_events.layers[0], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_a, dev: dev_a })
+?;
+            self.route_probe_after_layer(bd_a, weights, 0, b_a, 0)
         })?;
         stage(self, bd_b, 0, b_a, b_b)?;
         arena.state.with_kv_source(0, |ls| {
             self.forward_layer_pre_moe_v2(bd_b, bi_b, sd, si, ls, &weights.dgpu_layers[0], &weights.igpu_layers[0], 0, tokens_b, None, None,
                 &self.sync_events_t1.layers[0], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_b, dev: dev_b })
+?;
+            self.route_probe_after_layer(bd_b, weights, 0, b_b, 1)
         })?;
         for layer in 0..n_layer - 1 {
             let hot_a = prefill_hot_active(&weights.dgpu_layers[layer], &weights.igpu_layers[layer], bd_a, sd);
@@ -2336,6 +2382,8 @@ impl HeterogeneousEngine {
             arena.state.with_kv_source(layer + 1, |ls| {
                 self.forward_layer_pre_moe_v2(bd_a, bi_a, sd, si, ls, &weights.dgpu_layers[layer + 1], &weights.igpu_layers[layer + 1], 0, tokens_a, None, None,
                     &self.sync_events.layers[layer + 1], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_a, dev: dev_a })
+?;
+                self.route_probe_after_layer(bd_a, weights, layer + 1, b_a, 0)
             })?;
             let hot_b = prefill_hot_active(&weights.dgpu_layers[layer], &weights.igpu_layers[layer], bd_b, sd);
             self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[layer], hot_b)?;
@@ -2344,6 +2392,8 @@ impl HeterogeneousEngine {
             arena.state.with_kv_source(layer + 1, |ls| {
                 self.forward_layer_pre_moe_v2(bd_b, bi_b, sd, si, ls, &weights.dgpu_layers[layer + 1], &weights.igpu_layers[layer + 1], 0, tokens_b, None, None,
                     &self.sync_events_t1.layers[layer + 1], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_b, dev: dev_b })
+?;
+                self.route_probe_after_layer(bd_b, weights, layer + 1, b_b, 1)
             })?;
         }
         let last = n_layer - 1;
