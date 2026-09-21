@@ -2508,48 +2508,66 @@ impl ExpertShard {
             let rp0 = v4flash_core::hf_v41::expert_read_profile();
             let t_r = std::time::Instant::now();
             type R = Result<([Option<(usize, usize, u32, u32)>; 3], bool), String>;
-            let mut results: Vec<R> = Vec::with_capacity(chunk.len());
+            // Raw pointers into the persistent pinned staging (like the prefetch
+            // thread's `SetPtr`): the reader threads must not BORROW `stages`, or
+            // the borrow lasts for the whole scope and no expert can repack until
+            // every read in the chunk has joined. Each set is touched by exactly
+            // one reader until its handle is joined, then only by this thread.
+            let ptrs: Vec<SetPtr> = stages.iter().take(chunk.len()).map(|st| SetPtr {
+                p: [st[0].as_slice().as_ptr() as *mut u8, st[1].as_slice().as_ptr() as *mut u8, st[2].as_slice().as_ptr() as *mut u8],
+                n: [st[0].len(), st[1].len(), st[2].len()],
+            }).collect();
             DEMAND_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            std::thread::scope(|sc| {
+            let scoped: eyre::Result<()> = std::thread::scope(|sc| {
                 let mut hs = Vec::with_capacity(chunk.len());
-                for (&(e, _), st) in chunk.iter().zip(stages.iter_mut()) {
-                    let [p0, p1, p2] = st;
-                    let (b0, b1, b2) = (p0.as_mut_slice(), p1.as_mut_slice(), p2.as_mut_slice());
+                for (&(e, _), &sp) in chunk.iter().zip(ptrs.iter()) {
                     hs.push(sc.spawn(move || -> R {
+                        let sp = sp; // capture the whole (Send) wrapper, not its pointer field
+                        // SAFETY: see `ptrs`; the set is exclusively this thread's until joined.
+                        let (b0, b1, b2) = unsafe {
+                            (std::slice::from_raw_parts_mut(sp.p[0], sp.n[0]), std::slice::from_raw_parts_mut(sp.p[1], sp.n[1]), std::slice::from_raw_parts_mut(sp.p[2], sp.n[2]))
+                        };
                         Self::read_miss_into(owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2)
                             .map_err(|err| format!("{err:#}"))
                     }));
                 }
-                for h in hs {
-                    results.push(h.join().unwrap_or_else(|_| Err("miss reader panicked".into())));
+                // Join in spawn order and repack each expert as soon as ITS read
+                // has landed (2026-09-21): with join-all-then-repack-all, one slow
+                // read held every expert's repack in the chunk, and the repacks
+                // then ran back to back after the last read instead of under the
+                // others.
+                for (j, h) in hs.into_iter().enumerate() {
+                    let (e, victim) = chunk[j];
+                    let res: R = h.join().unwrap_or_else(|_| Err("miss reader panicked".into()));
+                    let (offs, coalesced) = res.map_err(|m| eyre!("expert shard: layer {layer} expert {e}: {m}"))?;
+                    let st = &stages[j];
+                    let t_h = std::time::Instant::now();
+                    match (repack, repack_stream) {
+                        (Some(rp), Some(rs)) => {
+                            pg.repack_gpu_ns += Self::repack_in_place(rp, rs, r, victim, st, &offs, coalesced)?;
+                        }
+                        _ => {
+                            for i in 0..3 {
+                                let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
+                                // `st[i]` is over-allocated by 4 blocks of alignment slack
+                                // for the O_DIRECT path, so copy only the expert's bytes.
+                                buf.slice_view_mut(victim as usize * bpe[i], bpe[i])
+                                    .copy_from_host(&st[i].as_slice()[..bpe[i]])?;
+                            }
+                        }
+                    }
+                    h2d_ns += t_h.elapsed().as_nanos() as u64;
+                    pool.remap_hosts[layer as usize][e as usize] = -(victim as i32) - 1;
+                    dirty = true;
                 }
+                Ok(())
             });
             DEMAND_READS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             read_ns += t_r.elapsed().as_nanos() as u64;
             let rp1 = v4flash_core::hf_v41::expert_read_profile();
             pg.pread_ns += rp1.2 - rp0.2;
             pg.repack_cpu_ns += rp1.3 - rp0.3;
-            for ((&(e, victim), st), res) in chunk.iter().zip(stages.iter()).zip(results) {
-                let (offs, coalesced) = res.map_err(|m| eyre!("expert shard: layer {layer} expert {e}: {m}"))?;
-                let t_h = std::time::Instant::now();
-                match (repack, repack_stream) {
-                    (Some(rp), Some(rs)) => {
-                        pg.repack_gpu_ns += Self::repack_in_place(rp, rs, r, victim, st, &offs, coalesced)?;
-                    }
-                    _ => {
-                        for i in 0..3 {
-                            let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
-                            // `st[i]` is over-allocated by 4 blocks of alignment slack
-                            // for the O_DIRECT path, so copy only the expert's bytes.
-                            buf.slice_view_mut(victim as usize * bpe[i], bpe[i])
-                                .copy_from_host(&st[i].as_slice()[..bpe[i]])?;
-                        }
-                    }
-                }
-                h2d_ns += t_h.elapsed().as_nanos() as u64;
-                pool.remap_hosts[layer as usize][e as usize] = -(victim as i32) - 1;
-                dirty = true;
-            }
+            scoped?;
         }
         pg.read_ns += read_ns;
         pg.h2d_ns += h2d_ns;
@@ -2914,6 +2932,12 @@ pub struct MoeExecutor {
     warm_out: DeviceBuffer<u8>,
     /// Device-time bracket around a request's GPU work, for the perfetto track.
     ev: Option<(v4flash_hip::Event, v4flash_hip::Event)>,
+    /// Recorded after a request's last launch; polled (not blocked on) so the
+    /// compute thread keeps pulling the next queued frame -- and starting its
+    /// misses -- for the whole GPU tail, not just once (2026-09-21: the early
+    /// paging caught only 40% of non-resident experts because the next frame
+    /// had usually not arrived at the single poll point).
+    ev_done: v4flash_hip::Event,
 }
 
 impl MoeExecutor {
@@ -2961,6 +2985,7 @@ impl MoeExecutor {
             warm_in: DeviceBuffer::new(id, 256)?,
             warm_out: DeviceBuffer::new(id, BLOCK_Q8_K_BYTES)?,
             ev: None,
+            ev_done: v4flash_hip::Event::new_no_timing()?,
         })
     }
 
@@ -3239,7 +3264,14 @@ impl MoeExecutor {
         // request's GPU tail + D2H + reply + the hub's turnaround (see the
         // compute loop). Cheap (decode + a few hash lookups); never waits.
         overlap(shard)?;
-        self.engine.compute.synchronize()?;
+        self.ev_done.record(&self.engine.compute)?;
+        // Poll instead of block: every ~20 us give the overlap hook another
+        // chance at the reader queue while the GPU drains. Bounded by the GPU
+        // itself; the hook is a no-op once it holds a frame.
+        while !self.ev_done.query()? {
+            overlap(shard)?;
+            std::thread::sleep(std::time::Duration::from_micros(20));
+        }
         timing.h2d = t1 - t0;
         timing.gpu = t1.elapsed();
         Ok(timing)

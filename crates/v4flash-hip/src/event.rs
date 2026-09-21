@@ -53,6 +53,16 @@ impl Event {
         )
     }
 
+    /// Non-blocking: `Ok(true)` once every operation before the record has
+    /// completed (`hipEventQuery` == hipSuccess), `Ok(false)` while pending
+    /// (hipErrorNotReady = 600).
+    pub fn query(&self) -> eyre::Result<bool> {
+        let r = unsafe { sys::hipEventQuery(self.raw) };
+        if r == sys::HIP_SUCCESS { return Ok(true); }
+        if r == 600 { return Ok(false); }
+        check_eyre(r, "hipEventQuery").map(|_| true)
+    }
+
     /// Elapsed milliseconds between two events. Both events must have been
     /// recorded with timing enabled.
     pub fn elapsed_ms(start: &Event, end: &Event) -> eyre::Result<f32> {

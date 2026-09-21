@@ -304,6 +304,7 @@ unsafe extern "C" {
     pub fn hipEventDestroy(event: hipEvent_t) -> hipError_t;
     pub fn hipEventRecord(event: hipEvent_t, stream: hipStream_t) -> hipError_t;
     pub fn hipEventSynchronize(event: hipEvent_t) -> hipError_t;
+    pub fn hipEventQuery(event: hipEvent_t) -> hipError_t;
     pub fn hipEventElapsedTime(ms: *mut f32, start: hipEvent_t, end: hipEvent_t)
         -> hipError_t;
 
