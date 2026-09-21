@@ -73,6 +73,15 @@ impl V41Effort {
             };
         }
         if let Some(s) = v.as_str() {
+            // Numeric strings too ("88"): clients that map levels to numbers
+            // often serialise them as strings.
+            if let Ok(n) = s.trim().parse::<i64>() {
+                return if (1..=100).contains(&n) {
+                    Ok(V41Effort(n as u8))
+                } else {
+                    Err(eyre!("reasoning_effort {n} outside 1..=100"))
+                };
+            }
             return Self::from_name(s).ok_or_else(|| eyre!("reasoning_effort {s:?}: expected low|high|max or 1..100"));
         }
         Err(eyre!("reasoning_effort must be an integer or low|high|max"))

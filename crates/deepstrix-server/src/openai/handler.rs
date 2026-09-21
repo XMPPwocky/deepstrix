@@ -146,12 +146,30 @@ pub async fn chat_completions(
     // the historical think-mode default). Unknown strings are an
     // invalid parameter → HTTP 400, matching the render_prompt
     // BadRequest convention below.
-    let effort = ReasoningEffort::from_request_fields_with_default(
-        req.reasoning.as_deref(),
-        req.reasoning_effort.as_deref(),
-        engine.default_reasoning_effort,
-    )
-    .map_err(ApiError::BadRequest)?;
+    // A NUMERIC `reasoning_effort` ("88" or 88) is V4.1's native 1..=100
+    // budget: thinking on, budget as given (0 = off). Clients that spread
+    // their effort ladder over numbers (prime-agent's thinkingLevelMap) get
+    // finer grain than the three named tiers.
+    let numeric_budget: Option<u8> = req
+        .reasoning_effort
+        .as_deref()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .map(|n| {
+            if (0..=100).contains(&n) { Ok(n as u8) } else { Err(ApiError::BadRequest(format!("reasoning_effort {n} outside 0..=100"))) }
+        })
+        .transpose()?;
+    let effort = match numeric_budget {
+        Some(0) => ReasoningEffort::Off,
+        Some(n) if n >= 100 => ReasoningEffort::Max,
+        Some(n) if n > 50 => ReasoningEffort::High,
+        Some(_) => ReasoningEffort::Low,
+        None => ReasoningEffort::from_request_fields_with_default(
+            req.reasoning.as_deref(),
+            req.reasoning_effort.as_deref(),
+            engine.default_reasoning_effort,
+        )
+        .map_err(ApiError::BadRequest)?,
+    };
     // Vision-Exp: image parts are allowed only when the worker loaded a
     // tower (`--mmproj`) AND the vocab has the placeholder token. Reject
     // up front with a clear 400 rather than failing inside the worker.
@@ -172,10 +190,10 @@ pub async fn chat_completions(
     let tokens = {
         // The 4-state effort carries the thinking flag; V4.1 wants a 1..=100
         // budget alongside it. An explicit integer in the request wins.
-        let budget = req
-            .reasoning_effort
-            .as_deref()
-            .and_then(crate::prompt_v41::V41Effort::from_name)
+        let budget = numeric_budget
+            .filter(|&n| n >= 1)
+            .map(crate::prompt_v41::V41Effort)
+            .or_else(|| req.reasoning_effort.as_deref().and_then(crate::prompt_v41::V41Effort::from_name))
             .unwrap_or(match effort {
                 ReasoningEffort::Off | ReasoningEffort::Low => {
                     crate::prompt_v41::V41Effort(50)
