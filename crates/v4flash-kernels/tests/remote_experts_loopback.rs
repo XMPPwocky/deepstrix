@@ -547,7 +547,7 @@ fn remote_experts_loopback() -> eyre::Result<()> {
         assert!(o50.abs() < 100_000, "loopback median offset should be ~0, got {o50} ns");
         assert!(d50 >= 0 && d50 < 500_000, "loopback one-way delay implausible: {d50} ns");
         assert!(o99.abs() < 5_000_000, "loopback offset p99 {o99} ns");
-        for s in cs.samples() {
+        for s in cs.iter() {
             assert!(s.t2 >= s.t1 && s.t3 >= s.t2 && s.t4 >= s.t3, "timestamps out of order: {s:?}");
         }
     }

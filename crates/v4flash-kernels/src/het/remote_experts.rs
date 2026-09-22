@@ -848,7 +848,7 @@ impl ClockSample {
 /// static estimate is useless within ~50 ms; the published windowed median
 /// tracks it to |err| p50 1.6 µs / p90 4.5 µs at window 32 on quiet boxes.
 pub struct ClockSync {
-    samples: Vec<ClockSample>,
+    samples: std::collections::VecDeque<ClockSample>,
     window: usize,
     /// Cap on retained samples (0 = unbounded). Raw samples are the point, so
     /// the default keeps a lot: 200k × 40 B ≈ 8 MB.
@@ -871,7 +871,7 @@ pub struct ClockSync {
 impl ClockSync {
     pub fn new(remote_clock: ClockPair, window: usize, capacity: usize) -> Self {
         Self {
-            samples: Vec::new(),
+            samples: std::collections::VecDeque::new(),
             window: window.max(1),
             capacity,
             remote_clock,
@@ -895,28 +895,33 @@ impl ClockSync {
     }
 
     pub fn push(&mut self, s: ClockSample) {
-        // BATCH the eviction. This was `samples.remove(0)` on a 200,000-entry
-        // Vec of 40-byte samples -- an 8 MB memmove per call, and `push` is on
+        // O(1). This was `Vec::remove(0)` on a 200,000-entry Vec of 40-byte
+        // samples -- an 8 MB memmove per call -- and `push` is on
         // `RemoteExpertClient::wait`, the hub's blocking per-layer call: 80 per
-        // decode step. Steady state arrives after 200_000/80 = 2,500 steps and
-        // then costs ~640 MB of memmove per step, permanently, on the thread
-        // that serialises the whole step -- i.e. "the box gets slower the longer
-        // a session runs" (audit 2026-09-22 A5).
+        // decode step. Steady state arrived after 200_000/80 = 2,500 steps and
+        // then cost ~640 MB of memmove per step, permanently, on the thread that
+        // serialises the whole step: "the box gets slower the longer a session
+        // runs" (audit 2026-09-22 A5).
         //
-        // Dropping a quarter at a time makes it amortised O(1): one memmove per
-        // 50,000 pushes, ~625 steps. A VecDeque would be O(1) outright but
-        // `samples()` hands out a contiguous `&[ClockSample]` that callers index
-        // (deepstrix-expertd/src/bin/bench.rs, the loopback test), and
-        // `make_contiguous` needs `&mut`.
+        // A deque rather than a batched drain because every reader here is
+        // iterator-based; only `samples()` wants a contiguous slice, and that is
+        // the bench binary and the loopback test, never the hub.
         if self.capacity > 0 && self.samples.len() >= self.capacity {
-            let drop_n = (self.capacity / 4).max(1);
-            self.samples.drain(..drop_n.min(self.samples.len()));
+            self.samples.pop_front();
         }
-        self.samples.push(s);
+        self.samples.push_back(s);
     }
 
-    pub fn samples(&self) -> &[ClockSample] {
-        &self.samples
+    /// Contiguous view, for callers that index or slice. Takes `&mut` because
+    /// making a deque contiguous can move elements once; the hub never calls
+    /// this, so the cost lands only in the bench/dump paths.
+    pub fn samples(&mut self) -> &[ClockSample] {
+        self.samples.make_contiguous()
+    }
+
+    /// Iterate without requiring `&mut` (oldest first).
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &ClockSample> {
+        self.samples.iter()
     }
     pub fn len(&self) -> usize {
         self.samples.len()
@@ -991,8 +996,8 @@ impl ClockSync {
 
     /// Median one-way delay over the window (ns).
     pub fn delay_ns(&self) -> Option<i64> {
-        let tail = &self.samples[self.samples.len().saturating_sub(self.window)..];
-        Self::median(tail.iter().map(|s| s.delay_ns()).collect())
+        let skip = self.samples.len().saturating_sub(self.window);
+        Self::median(self.samples.iter().skip(skip).map(|s| s.delay_ns()).collect())
     }
 
     /// (min, p50, p90, p99, max) of a per-sample series over ALL samples.

@@ -394,6 +394,9 @@ fn main() -> eyre::Result<()> {
 
     // ---- clock sync over the link (NTP's estimator, one sample per request) ----
     let cs = client.clock();
+    // `samples()` needs `&mut` since the buffer became a deque (audit A5);
+    // snapshot it once here instead, which is what every use below wants anyway.
+    let cs_all: Vec<v4flash_kernels::het::remote_experts::ClockSample> = cs.iter().copied().collect();
     if cs.is_empty() {
         eprintln!("clock: no samples (peer did not stamp t1..t3)");
         return Ok(());
@@ -431,9 +434,9 @@ fn main() -> eyre::Result<()> {
                 v.sort_unstable();
                 v[v.len() / 2]
             };
-            let first = med(&cs.samples()[..k]);
-            let last = med(&cs.samples()[n - k..]);
-            let span_s = (cs.samples()[n - 1].t1 - cs.samples()[0].t1) as f64 / 1e9;
+            let first = med(&cs_all[..k]);
+            let last = med(&cs_all[n - k..]);
+            let span_s = (cs_all[n - 1].t1 - cs_all[0].t1) as f64 / 1e9;
             println!(
                 "  drift: first-tenth median {:.3} us -> last-tenth {:.3} us over {:.1} s = {:.1} ppm",
                 first as f64 / 1e3, last as f64 / 1e3, span_s,
@@ -445,7 +448,7 @@ fn main() -> eyre::Result<()> {
         use std::io::Write;
         let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
         writeln!(f, "seq,layer,b,t1,t2,t3,t4,offset_ns,delay_ns,rtt_ns,remote_service_ns")?;
-        for s in cs.samples() {
+        for s in &cs_all {
             writeln!(
                 f, "{},{},{},{},{},{},{},{},{},{},{}",
                 s.seq, s.layer, s.b, s.t1, s.t2, s.t3, s.t4,
