@@ -30,7 +30,7 @@
 //!        the per-layer `remap_dev` exclusion mask -- both of which the ordinary
 //!        `alone`/`batch` gates are blind to because they are single-lane.
 //!
-//!   G5d  alone == stag bit-exactly (same KLD bars): the TWO-LANE STAGGERED
+//!   G5d  pipe == stag bit-exactly (same KLD bars): the TWO-LANE STAGGERED
 //!        driver (`forward_step_arena_lanes` with 2 lanes), where the lanes are
 //!        offset by half a layer so box 2 always has the other lane's request
 //!        queued. Unlike the lockstep driver, the two lanes here are on
@@ -703,9 +703,16 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
                 g5c_fail += 1;
             }
             let dstag = max_abs_diff(&logits_alone[s][t], &logits_stag[s][t]);
-            if dstag != 0.0 {
+            // G5d's discriminating comparison is against the LOCKSTEP pipelined
+            // driver (same rows, same two-lane split, same box-2 batched path):
+            // `alone` runs 1-row steps, which with the two-box split take box 2's
+            // per-token decode kernels and are not bit-identical to any multi-row
+            // arm (G5a fails the same way there), so it cannot isolate the lanes.
+            let dsp = max_abs_diff(&logits_pipe[s][t], &logits_stag[s][t]);
+            if dsp != 0.0 {
                 g5d_fail += 1;
             }
+            eprintln!("   G5d row s={s} t={t} lane={}: |pipe-stag| {dsp:.3e}  |batch-stag| {:.3e}", if s < b_a { "A" } else { "B" }, max_abs_diff(&logits_batch[s][t], &logits_stag[s][t]));
             kls_stag.push(kld(&logits_dec[s][t], &logits_stag[s][t]));
             kls.push(kb);
             kls_alone.push(ka);
@@ -738,7 +745,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mean_s = kls_stag.iter().sum::<f64>() / kls_stag.len() as f64;
     let max_s = kls_stag.iter().cloned().fold(0.0, f64::max);
     eprintln!(
-        "G5d: {} of {} (stream, step) rows differ between alone and STAGGERED (want 0); KL(dec||stag) mean {mean_s:.5} max {max_s:.5}",
+        "G5d: {} of {} (stream, step) rows differ between PIPELINED and STAGGERED (want 0); KL(dec||stag) mean {mean_s:.5} max {max_s:.5}",
         g5d_fail,
         kls_stag.len()
     );
@@ -755,7 +762,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         return Err(eyre!("G5c failed: pipelined KL mean {mean_p:.5} / max {max_p:.5} over bars {kld_mean_bar} / {kld_max_bar}"));
     }
     if g5d_fail > 0 && !allow_inexact {
-        return Err(eyre!("G5d failed: {g5d_fail} rows not invariant between alone and the STAGGERED driver (MS_ALLOW_INEXACT=1 to report only)"));
+        return Err(eyre!("G5d failed: {g5d_fail} rows differ between the lockstep and STAGGERED drivers (MS_ALLOW_INEXACT=1 to report only)"));
     }
     if mean_s > kld_mean_bar || max_s > kld_max_bar {
         return Err(eyre!("G5d failed: staggered KL mean {mean_s:.5} / max {max_s:.5} over bars {kld_mean_bar} / {kld_max_bar}"));
