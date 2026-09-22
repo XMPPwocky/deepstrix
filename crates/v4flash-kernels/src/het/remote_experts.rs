@@ -335,6 +335,16 @@ pub mod proto {
     /// NEXT layer's picks that this box owns; ~75% precision on decoder layers,
     /// MEASURED 2026-09-22). Wrong words cost bandwidth only.
     pub const REQ_FLAG_PREFETCH: u32 = 8;
+    /// The sender is about to submit ANOTHER request for this SAME layer (the
+    /// other hub lane; `forward_step_arena_pipelined` routes the two lanes back
+    /// to back). The daemon may therefore WAIT a bounded moment for it and run
+    /// both as one MoE pass instead of streaming the layer's experts twice
+    /// (`b2_merge`). Without the bit the daemon has to guess, and measured
+    /// 2026-09-22 it guessed wrong ~97% of the time: it is usually idle, so it
+    /// dequeues lane A before lane B's frame has even arrived, and once a pass
+    /// has started merging is impossible. Purely advisory: a daemon that
+    /// ignores it is correct, just slower.
+    pub const REQ_FLAG_PARTNER: u32 = 16;
 
     /// Fixed request fields after the header (bytes):
     /// layer, b, flags, n_used, xq_bpt, reserved (6 × u32) then `t1` (u64,
@@ -1249,6 +1259,18 @@ static DEMAND_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// from its output. Dedups the experts across all rows and pays the fixed
 /// per-request cost once; with two lanes each request otherwise re-reads the
 /// experts the other lane's rows also picked ("lanes cost bytes", 2026-09-21).
+/// `V41_B2_MERGE_WAIT_US` (default 400): how long the daemon may wait for a
+/// promised partner (`REQ_FLAG_PARTNER`) before giving up and running alone.
+/// Bounded because the promise can go unfulfilled -- the hub's other lane can
+/// fail its own route, or the step can end -- and an unfulfilled promise costs
+/// exactly this much. 0 disables the wait (plain try_recv).
+fn b2_merge_wait_us() -> u64 {
+    static N: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_B2_MERGE_WAIT_US").ok().and_then(|v| v.parse().ok()).unwrap_or(400)
+    });
+    *N
+}
+
 fn b2_merge() -> bool {
     static B: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("V41_B2_MERGE").as_deref() != Ok("0"));
@@ -3783,6 +3805,9 @@ pub fn serve_connection(
         // idle between requests. Windowed with the page-stats print.
         let mut t_prev_ready: Option<Instant> = None;
         let (mut w_idle_ns, mut w_service_ns, mut w_depth_sum, mut w_queued, mut w_n, mut w_merged) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        // Why a merge did NOT happen: no frame available at all vs. one there but
+        // not mergeable (different layer / reply format / would exceed max_batch).
+        let (mut w_merge_no_frame, mut w_merge_unmergeable, mut w_promised) = (0u64, 0u64, 0u64);
         let mut w_t0 = Instant::now();
         loop {
             let depth_on_take = pending.len() as u64;
@@ -3826,6 +3851,9 @@ pub fn serve_connection(
                 w_queued += 1;
                 w_depth_sum += depth_on_take;
             }
+            if proto::decode_request(&buf).map(|r| r.flags & proto::REQ_FLAG_PARTNER != 0).unwrap_or(false) {
+                w_promised += 1;
+            }
             let t_start_rt = tracer.map(|_| super::perfetto::host_now_ns());
             let mut resp = rx_resp_recycle.try_recv().unwrap_or_else(|_| AlignedBuf::with_capacity(proto::RESP_DATA_OFF + exec.rows() * N_EMBD as usize * 4));
             if hdr.kind != proto::KIND_REQUEST {
@@ -3857,8 +3885,18 @@ pub fn serve_connection(
                         _ => false,
                     }
                 };
+                // Does the SENDER say a partner is coming? `REQ_FLAG_PARTNER` is
+                // set by the hub on the first of the two lanes' same-layer
+                // requests, so an idle daemon knows to hold instead of starting
+                // a pass it cannot merge into.
+                let partner_promised = proto::decode_request(&buf)
+                    .map(|r| r.flags & proto::REQ_FLAG_PARTNER != 0)
+                    .unwrap_or(false);
                 let from_pending = matches!(pending.front(),
                     Some(Inbound::Frame { hdr: h2, buf: buf2, .. }) if h2.kind == proto::KIND_REQUEST && mergeable(buf2));
+                if !pending.is_empty() && !from_pending {
+                    w_merge_unmergeable += 1;
+                }
                 if from_pending {
                     if let Some(Inbound::Frame { hdr: h2, buf: buf2, t_first: tf2, t_done: td2, t2: t22 }) = pending.pop_front() {
                         partner = Some((h2, buf2, tf2, td2, t22));
@@ -3867,16 +3905,30 @@ pub fn serve_connection(
                     // Nothing queued here: take a look at the socket. A frame that
                     // is NOT mergeable goes to `pending` untouched, so ordering and
                     // the early-paging hook are unaffected.
-                    if let Ok(m) = rx_in.try_recv() {
-                        let ok = matches!(&m,
-                            Inbound::Frame { hdr: h2, buf: buf2, .. } if h2.kind == proto::KIND_REQUEST && mergeable(buf2));
-                        if ok {
-                            if let Inbound::Frame { hdr: h2, buf: buf2, t_first: tf2, t_done: td2, t2: t22 } = m {
-                                partner = Some((h2, buf2, tf2, td2, t22));
+                    // Bounded wait ONLY when the sender promised a partner; a
+                    // plain try_recv loses the race almost always (the reader
+                    // thread has not decoded the frame yet, or it is still in the
+                    // socket buffer). `V41_B2_MERGE_WAIT_US` (default 400) caps
+                    // what an unfulfilled promise can cost; 0 restores try_recv.
+                    let got = if partner_promised && b2_merge_wait_us() > 0 {
+                        rx_in.recv_timeout(Duration::from_micros(b2_merge_wait_us())).ok()
+                    } else {
+                        rx_in.try_recv().ok()
+                    };
+                    match got {
+                        Some(m) => {
+                            let ok = matches!(&m,
+                                Inbound::Frame { hdr: h2, buf: buf2, .. } if h2.kind == proto::KIND_REQUEST && mergeable(buf2));
+                            if ok {
+                                if let Inbound::Frame { hdr: h2, buf: buf2, t_first: tf2, t_done: td2, t2: t22 } = m {
+                                    partner = Some((h2, buf2, tf2, td2, t22));
+                                }
+                            } else {
+                                w_merge_unmergeable += 1;
+                                pending.push_back(m);
                             }
-                        } else {
-                            pending.push_back(m);
                         }
+                        None => w_merge_no_frame += 1,
                     }
                 }
             }
@@ -4142,12 +4194,15 @@ pub fn serve_connection(
                             // it; read `read` (per-miss wall) instead.
                             let wall = w_t0.elapsed().as_secs_f64().max(1e-9);
                             let win = format!(
-                                " | window {:.1}s: busy {:.0}% idle/req {:.2} ms queued {:.0}% depth {:.2} merged {:.0}%",
+                                " | window {:.1}s: busy {:.0}% idle/req {:.2} ms queued {:.0}% depth {:.2} \
+merged {:.0}% (promised {:.0}%, miss: no-frame {} unmergeable {})",
                                 wall, 100.0 * w_service_ns as f64 / 1e9 / wall,
                                 w_idle_ns as f64 / 1e6 / w_n.max(1) as f64,
                                 100.0 * w_queued as f64 / w_n.max(1) as f64,
                                 w_depth_sum as f64 / w_queued.max(1) as f64,
                                 100.0 * w_merged as f64 / w_n.max(1) as f64,
+                                100.0 * w_promised as f64 / w_n.max(1) as f64,
+                                w_merge_no_frame, w_merge_unmergeable,
                             );
                             eprintln!(
                                 "expertd: page stats requests={req} misses={miss} hit={:.4} \
@@ -4159,6 +4214,7 @@ ms_per_miss={:.2} (read {:.2} [pread {:.2} repack_cpu {:.2}] h2d {:.2} repack_gp
                             );
                             w_t0 = Instant::now();
                             w_idle_ns = 0; w_service_ns = 0; w_depth_sum = 0; w_queued = 0; w_n = 0; w_merged = 0;
+                            w_merge_no_frame = 0; w_merge_unmergeable = 0; w_promised = 0;
                         }
                     }
                     if opts.verbose {
@@ -4613,6 +4669,11 @@ impl RemoteExpertClient {
         self.submit_inner(layer, b, xq, sel, ew, flags, false)
     }
 
+    /// As [`Self::submit_unmasked`] with explicit `proto::REQ_FLAG_*` bits.
+    pub fn submit_unmasked_flags(&mut self, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], flags: u32) -> eyre::Result<Option<Ticket>> {
+        self.submit_inner(layer, b, xq, sel, ew, flags, false)
+    }
+
     /// `submit` or `submit_unmasked`, chosen by whether box 1 is computing any
     /// of this layer's experts.
     ///
@@ -4628,11 +4689,13 @@ impl RemoteExpertClient {
     /// unmasked submit while box 1 still computes its share DOUBLE-COUNTS every
     /// expert both devices claim.
     #[allow(clippy::too_many_arguments)]
-    pub fn submit_dispatch(&mut self, unmasked: bool, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool) -> eyre::Result<Option<Ticket>> {
+    pub fn submit_dispatch(&mut self, unmasked: bool, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool, partner: bool) -> eyre::Result<Option<Ticket>> {
+        let extra = if partner { proto::REQ_FLAG_PARTNER } else { 0 };
+        let f = if resp_f32 { proto::REQ_FLAG_RESP_F32 } else { 0 } | extra;
         if unmasked {
-            self.submit_unmasked(layer, b, xq, sel, ew, resp_f32)
+            self.submit_unmasked_flags(layer, b, xq, sel, ew, f)
         } else {
-            self.submit(layer, b, xq, sel, ew, resp_f32)
+            self.submit_flags(layer, b, xq, sel, ew, f)
         }
     }
 

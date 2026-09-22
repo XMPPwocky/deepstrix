@@ -2180,6 +2180,11 @@ pub struct PreMoeCarry {
     /// SEQUENTIAL path: they are read from shared scratch (`sd.look_sel*`) that
     /// the other lane's chain clobbers in the pipelined order.
     pub lookahead_hints_ok: bool,
+    /// Promise the daemon (`REQ_FLAG_PARTNER`) that another request for this
+    /// same layer follows immediately, so it can merge the two lanes' passes
+    /// instead of streaming the layer's experts twice. Set by the pipelined
+    /// driver on the lane it routes FIRST; false everywhere else.
+    pub partner_follows: bool,
     // route -> prep
     sel_host_remote: Vec<i32>,
     sel_host_audit: Vec<i32>,
@@ -2517,6 +2522,17 @@ impl HeterogeneousEngine {
                 let (ca, cb): (&mut PreMoeCarry, &mut PreMoeCarry) = ($ca, $cb);
                 let sev_a = &self.sync_events.layers[l];
                 let sev_b = &self.sync_events_t1.layers[l];
+                // The look-ahead prefetch hints are read from SHARED scratch
+                // (`sd.look_sel*`) that the other lane's chain has already
+                // overwritten here, so this path does not emit them (they are
+                // default OFF and measured a loss anyway).
+                ca.lookahead_hints_ok = false;
+                cb.lookahead_hints_ok = false;
+                // Lane A's request is followed immediately by lane B's for the
+                // same layer: promise it, so an IDLE daemon holds for the pair
+                // instead of starting a pass it cannot merge into.
+                ca.partner_follows = true;
+                cb.partner_follows = false;
                 // Both routes first: each waits on its own router EVENT, and both
                 // submits are out before any pager work.
                 { let rl = rl!(tables_a, dev_a, l); self.pre_moe_route(ca, bd_a, sd, sev_a, pager.as_deref_mut(), &rl)?; }
@@ -5960,6 +5976,7 @@ impl HeterogeneousEngine {
             defer_shared, remote_split_on, split_cap, sparse_resid_layer, moe_group_bound,
             drain_before_ensure: true,
             lookahead_hints_ok: true,
+            partner_follows: false,
             ..Default::default()
         })
     }
@@ -5979,7 +5996,7 @@ impl HeterogeneousEngine {
         rows: &RowLayout<'_>,
     ) -> eyre::Result<()> {
         if !c.advance(PreMoePhase::Chained, PreMoePhase::Routed)? { return Ok(()); }
-        let PreMoeCarry { layer, b, cs_n_used, cs_n_embd, remote_split_on, sparse_resid_layer, moe_group_bound, split_cap, lookahead_hints_ok, .. } = *c;
+        let PreMoeCarry { layer, b, cs_n_used, cs_n_embd, remote_split_on, sparse_resid_layer, moe_group_bound, split_cap, lookahead_hints_ok, partner_follows, .. } = *c;
         let _ = (cs_n_embd, split_cap, moe_group_bound);
         let _ = &self.dgpu;
         let look_next: Option<&DgpuLayerWeights> = match &rows {
@@ -6433,6 +6450,12 @@ impl HeterogeneousEngine {
                                     &ew_for_remote
                                 },
                                 true,
+                                // Another request for this SAME layer follows
+                                // immediately (the other lane, routed next by the
+                                // pipelined driver), so the daemon may hold for it
+                                // and run both as one MoE pass. False on the
+                                // sequential path, where nothing follows.
+                                partner_follows,
                             )?;
                         let t_sub_end = super::perfetto::now_ns();
                         // Stash, don't wait: the local iGPU MoE for this layer is issued
