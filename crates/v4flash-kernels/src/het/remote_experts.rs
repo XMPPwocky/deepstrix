@@ -3833,30 +3833,50 @@ pub fn serve_connection(
                 let _ = tx_out.send((resp, Instant::now(), hdr.seq));
                 return Err(eyre!("unexpected frame kind {}", hdr.kind));
             }
-            // Same-layer coalescing (`b2_merge`): the next queued frame, when it is
-            // the other lane's request for this layer with the same reply format
-            // and both take the batched path, rides along in this pass.
+            // Same-layer coalescing (`b2_merge`): the OTHER hub lane's request for
+            // this same layer rides along in this pass, so the two lanes stop
+            // streaming the same experts twice (at prefill B=512 the union is
+            // ~all 384, so a merged 1024-row pass is half the bytes).
+            //
+            // The partner is looked for in `pending` AND on the socket channel:
+            // the loop above pops `pending`'s only entry as THIS request, so with
+            // two hub lanes `pending` is empty here and a pending-only check never
+            // fired (measured 2026-09-22: "queued 79% ... merged 0%").
             let mut partner: Option<(proto::Header, AlignedBuf, Instant, Instant, u64)> = None;
             if b2_merge() {
-                let take = match pending.front() {
-                    Some(Inbound::Frame { hdr: h2, buf: buf2, .. }) if h2.kind == proto::KIND_REQUEST => {
-                        match (proto::decode_request(&buf), proto::decode_request(buf2)) {
-                            (Ok(ra), Ok(rb)) => {
-                                let fm = proto::REQ_FLAG_RESP_F32 | proto::REQ_FLAG_BATCHED;
-                                ra.layer == rb.layer
-                                    && (ra.flags & fm) == (rb.flags & fm)
-                                    && ra.b as usize > exec.decode_max_b()
-                                    && rb.b as usize > exec.decode_max_b()
-                                    && (ra.b + rb.b) as usize <= exec.rows()
-                            }
-                            _ => false,
+                let mergeable = |buf2: &AlignedBuf| -> bool {
+                    match (proto::decode_request(&buf), proto::decode_request(buf2)) {
+                        (Ok(ra), Ok(rb)) => {
+                            let fm = proto::REQ_FLAG_RESP_F32 | proto::REQ_FLAG_BATCHED;
+                            ra.layer == rb.layer
+                                && (ra.flags & fm) == (rb.flags & fm)
+                                && ra.b as usize > exec.decode_max_b()
+                                && rb.b as usize > exec.decode_max_b()
+                                && (ra.b + rb.b) as usize <= exec.rows()
                         }
+                        _ => false,
                     }
-                    _ => false,
                 };
-                if take {
+                let from_pending = matches!(pending.front(),
+                    Some(Inbound::Frame { hdr: h2, buf: buf2, .. }) if h2.kind == proto::KIND_REQUEST && mergeable(buf2));
+                if from_pending {
                     if let Some(Inbound::Frame { hdr: h2, buf: buf2, t_first: tf2, t_done: td2, t2: t22 }) = pending.pop_front() {
                         partner = Some((h2, buf2, tf2, td2, t22));
+                    }
+                } else if pending.is_empty() {
+                    // Nothing queued here: take a look at the socket. A frame that
+                    // is NOT mergeable goes to `pending` untouched, so ordering and
+                    // the early-paging hook are unaffected.
+                    if let Ok(m) = rx_in.try_recv() {
+                        let ok = matches!(&m,
+                            Inbound::Frame { hdr: h2, buf: buf2, .. } if h2.kind == proto::KIND_REQUEST && mergeable(buf2));
+                        if ok {
+                            if let Inbound::Frame { hdr: h2, buf: buf2, t_first: tf2, t_done: td2, t2: t22 } = m {
+                                partner = Some((h2, buf2, tf2, td2, t22));
+                            }
+                        } else {
+                            pending.push_back(m);
+                        }
                     }
                 }
             }
