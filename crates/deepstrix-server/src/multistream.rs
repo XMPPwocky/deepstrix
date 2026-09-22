@@ -811,7 +811,13 @@ impl Sched {
         // A's next request is out while box 1 works on lane B -- with the SAME
         // row split, so unlike three lanes it costs no extra expert reads; it
         // gives up the daemon's same-layer merge in exchange for overlap.
-        let stagger2 = pipelined && !lanes3 && std::env::var("V41_MS_STAGGER").as_deref() == Ok("1");
+        // `V41_MS_STAGGER=2`: the READY-FIRST variant of the same driver --
+        // the host runs whichever lane's next step is ready instead of a fixed
+        // round robin (it was blocking 67 ms/step on its own dGPU router while
+        // 52 of 80 box-2 replies sat ready). Gated by multistream_step G5e.
+        let stagger_mode = std::env::var("V41_MS_STAGGER").unwrap_or_default();
+        let stagger2 = pipelined && !lanes3 && (stagger_mode == "1" || stagger_mode == "2");
+        let ready_first = stagger_mode == "2";
         let mut fwd_only_ms = 0.0f64;
         let n_tables = engram.as_ref().map(|ec| ec.tables.len()).unwrap_or(0);
         let logits = std::thread::scope(|sc| {
@@ -843,7 +849,11 @@ impl Sched {
             {
                 let mut lanes: [(&mut v4flash_kernels::het::batch_scratch::BatchDgpuScratch, &mut v4flash_kernels::het::batch_scratch::BatchIgpuScratch, &mut RowTablesDev); 2] =
                     [(&mut *bd_a, &mut *bi_a, &mut self.dev), (&mut *bd_b, &mut *bi_b, &mut self.dev_b)];
-                engine.forward_step_arena_lanes(&mut lanes, sd, si, &mut self.arena, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
+                if ready_first {
+                    engine.forward_step_arena_ready_first(&mut lanes, sd, si, &mut self.arena, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
+                } else {
+                    engine.forward_step_arena_lanes(&mut lanes, sd, si, &mut self.arena, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
+                }
             }
             fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
             // Same split as the lanes driver: the first lane takes the odd row.

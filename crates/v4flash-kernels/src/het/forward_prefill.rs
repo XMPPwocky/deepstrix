@@ -2708,6 +2708,210 @@ impl HeterogeneousEngine {
         Ok(tables)
     }
 
+    /// READY-FIRST N-lane arena decode step (`V41_MS_STAGGER=2`, 2026-09-22).
+    ///
+    /// Same lanes, row split and per-lane phases as `forward_step_arena_lanes`,
+    /// but instead of a fixed `post(i,L) -> pre(i,L+1)` round robin the host
+    /// runs whichever lane's next step is READY. Under the fixed order the host
+    /// blocks on one thing at a time: measured on live traffic with 2 lanes,
+    /// 126 ms/step waiting on box 2 plus 67 ms/step (`lh.sel_sync`) waiting on
+    /// its own dGPU for a lane's router -- while 52 of every 80 box-2 replies
+    /// were already sitting in the channel (`hop.slack`), i.e. box 2 had
+    /// finished and box 1's host thread was the pole.
+    ///
+    /// Each lane is in one of two waits: `Route(L)` (chain launched, router
+    /// event pending) or `Post(L)` (box-2 request out, reply pending). The loop
+    /// polls both kinds (`Event::query`, `RemoteExpertClient::head_ready`) and
+    /// runs the first that is ready. The polls are HINTS: every step still
+    /// performs its own blocking wait, so a wrong hint costs time, never
+    /// numerics. The only reordering this allows is another lane's post+chain
+    /// landing between a lane's chain and its route -- the interleave the
+    /// lockstep driver already runs (combine A, chain A, combine B, chain B,
+    /// route A). route+prep+launch stays ONE unit per lane (G5c: the shared
+    /// `BatchIgpuShared` scratch and the per-layer `remap_dev` exclusion mask).
+    /// Replies are FIFO, so a lane may only post when its ticket is the oldest
+    /// in flight; the head lane is always in `Post`, so the loop cannot stall.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_step_arena_ready_first(
+        &self,
+        lanes: &mut [(&mut BatchDgpuScratch, &mut BatchIgpuScratch, &mut RowTablesDev)],
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        arena: &mut KvArena,
+        slots: &[u32],
+        weights: &HetModelWeights,
+        input_hcs: &[Vec<f32>],
+        tokens: &[i32],
+        engram_rows: &mut LazyEngramRows<'_>,
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
+    ) -> eyre::Result<Vec<RowTables>> {
+        self.remote_set_phase_busy_poll(true);
+        let b = tokens.len();
+        let n = lanes.len();
+        if n < 2 || b < n {
+            return Err(eyre!("forward_step_arena_ready_first: needs >= 2 lanes and >= 1 row per lane (got {n} lanes, {b} rows)"));
+        }
+        if slots.len() != b || input_hcs.len() != b {
+            return Err(eyre!("forward_step_arena_ready_first: {} slots / {} hcs for {b} tokens", slots.len(), input_hcs.len()));
+        }
+        for (i, hc) in input_hcs.iter().enumerate() {
+            if hc.len() != HC_DIM as usize {
+                return Err(eyre!("forward_step_arena_ready_first: input_hcs[{i}] len {} != HC_DIM", hc.len()));
+            }
+        }
+        // Contiguous balanced split: the first (b % n) lanes get one extra row.
+        let mut offs: Vec<usize> = Vec::with_capacity(n + 1);
+        offs.push(0);
+        for i in 0..n {
+            let sz = b / n + usize::from(i < b % n);
+            offs.push(offs[i] + sz);
+        }
+        for (i, (bd, bi, _)) in lanes.iter().enumerate() {
+            let bl = offs[i + 1] - offs[i];
+            check_scratch_rows("forward_step_arena_ready_first", bl, bd, bi, sd, si)?;
+            if bd.mtp_capture_rows > 0 {
+                return Err(eyre!("forward_step_arena_ready_first: MTP capture is not supported on arena rows"));
+            }
+        }
+        self.current_device.store(-1, std::sync::atomic::Ordering::Relaxed);
+        self.set_current_cached(self.dgpu.device)?;
+        arena.state.restore_compressor_lending();
+        for &slot in slots {
+            if arena.needs_compaction(slot) {
+                arena.compact_raw(slot, &self.dgpu.compute, &mut sd.kv_ring_scratch)?;
+            }
+        }
+        let mut tables: Vec<RowTables> = Vec::with_capacity(n);
+        for (i, (bd, _, dev)) in lanes.iter_mut().enumerate() {
+            let (lo, hi) = (offs[i], offs[i + 1]);
+            let t = arena.tables(&slots[lo..hi])?;
+            dev.upload(&t, &self.dgpu.compute)?;
+            for (k, hc) in input_hcs[lo..hi].iter().enumerate() {
+                let mut slot = bd.residual.slice_view_mut(k * HC_DIM as usize, HC_DIM as usize);
+                slot.copy_from_host(hc)?;
+            }
+            let mut v = bd.pos_per_b.slice_view_mut(0, hi - lo);
+            v.copy_from_host_async(&t.pos_per, &self.dgpu.compute)?;
+            tables.push(t);
+        }
+        let ein = ENGRAM_IN as usize;
+        let mut stage = |this: &Self, bd: &mut BatchDgpuScratch, layer: usize, off: usize, nrows: usize| -> eyre::Result<()> {
+            if weights.dgpu_layers[layer].engram.is_some() {
+                let li = crate::config::ENGRAM_LAYERS.iter().position(|&l| l as usize == layer);
+                let rows = match li { Some(i) => engram_rows.get()?.and_then(|rs| rs.get(i)), None => None };
+                match rows {
+                    Some(r) if r.len() >= (off + nrows) * ein => this.stage_engram_rows_batch(bd, &r[off * ein..(off + nrows) * ein])?,
+                    _ => return Err(eyre!("forward_step_arena_ready_first: layer {layer} needs Engram rows for {nrows} rows")),
+                }
+            }
+            Ok(())
+        };
+        let n_layer = N_LAYER as usize;
+        macro_rules! chain {
+            ($i:expr, $l:expr) => {{
+                let (i, l): (usize, usize) = ($i, $l);
+                let (lo, hi) = (offs[i], offs[i + 1]);
+                let (bd, bi, dev) = &mut lanes[i];
+                stage(self, bd, l, lo, hi - lo)?;
+                let t = &tables[i];
+                let sev = &self.sync_events_lane(i).layers[l];
+                let mut c = arena.state.with_kv_source(l, |ls| {
+                    let rl = RowLayout::Arena { tables: t, dev: &**dev, next_router: weights.dgpu_layers.get(l + 1), next_router2: weights.dgpu_layers.get(l + 2) };
+                    self.pre_moe_chain(bd, bi, sd, si, ls, &weights.dgpu_layers[l], &weights.igpu_layers[l], 0, &tokens[lo..hi], None, None,
+                        sev, pager.as_deref_mut(), CedMode::Exact, &rl)
+                })?;
+                // Look-ahead hints read SHARED scratch (`sd.look_sel*`) that the
+                // other lane's chain may overwrite before this lane routes.
+                c.lookahead_hints_ok = false;
+                // Lanes are not in lockstep: never hold the daemon for a partner.
+                c.partner_follows = false;
+                c
+            }};
+        }
+        // route + prep + launch as ONE unit for lane i (see the doc comment).
+        macro_rules! rest {
+            ($i:expr, $l:expr, $c:expr) => {{
+                let (i, l): (usize, usize) = ($i, $l);
+                let c: &mut PreMoeCarry = $c;
+                let (lo, hi) = (offs[i], offs[i + 1]);
+                let (bd, bi, dev) = &mut lanes[i];
+                let sev = &self.sync_events_lane(i).layers[l];
+                let rl = RowLayout::Arena { tables: &tables[i], dev: &**dev, next_router: weights.dgpu_layers.get(l + 1), next_router2: weights.dgpu_layers.get(l + 2) };
+                self.pre_moe_route(c, bd, sd, sev, pager.as_deref_mut(), &rl)?;
+                self.pre_moe_prep(c, bd, bi, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev, pager.as_deref_mut())?;
+                self.pre_moe_launch(c, bd, bi, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev, pager.as_deref_mut())?;
+                self.route_probe_after_layer(bd, weights, l, hi - lo, i)?;
+            }};
+        }
+        macro_rules! post {
+            ($i:expr, $l:expr) => {{
+                let (i, l): (usize, usize) = ($i, $l);
+                let bl = (offs[i + 1] - offs[i]) as u32;
+                let (bd, _, _) = &mut lanes[i];
+                let hot = prefill_hot_active(&weights.dgpu_layers[l], &weights.igpu_layers[l], bd, sd);
+                self.forward_layer_post_moe_v2(bd, bl, &self.sync_events_lane(i).layers[l], hot)?;
+                std::mem::swap(&mut bd.residual, &mut bd.residual_next);
+            }};
+        }
+        #[derive(Clone, Copy, PartialEq)]
+        enum Ph { Route(usize), Post(usize), Done }
+        let mut carry: Vec<Option<PreMoeCarry>> = Vec::with_capacity(n);
+        for i in 0..n {
+            carry.push(Some(chain!(i, 0)));
+        }
+        let mut ph: Vec<Ph> = vec![Ph::Route(0); n];
+        let mut spins: u64 = 0;
+        while ph.iter().any(|&p| p != Ph::Done) {
+            let mut progressed = false;
+            for i in 0..n {
+                match ph[i] {
+                    Ph::Route(l) => {
+                        let ready = self.sync_events_lane(i).layers[l].selected_ready.query().unwrap_or(true);
+                        if ready {
+                            let mut c = carry[i].take().expect("carry for Route");
+                            rest!(i, l, &mut c);
+                            ph[i] = Ph::Post(l);
+                            progressed = true;
+                        }
+                    }
+                    Ph::Post(l) => {
+                        let ready = match lanes[i].0.remote_ticket.as_ref() {
+                            None => true,
+                            Some(t) => match self.remote.as_ref() {
+                                None => true,
+                                Some(m) => {
+                                    let mut r = m.lock().map_err(|_| eyre!("remote expert client mutex poisoned"))?;
+                                    r.head_seq() == Some(t.seq) && r.head_ready()
+                                }
+                            },
+                        };
+                        if ready {
+                            post!(i, l);
+                            if l + 1 < n_layer {
+                                carry[i] = Some(chain!(i, l + 1));
+                                ph[i] = Ph::Route(l + 1);
+                            } else {
+                                ph[i] = Ph::Done;
+                            }
+                            progressed = true;
+                        }
+                    }
+                    Ph::Done => {}
+                }
+            }
+            if !progressed {
+                spins += 1;
+                std::hint::spin_loop();
+            }
+        }
+        READY_FIRST_SPINS.fetch_add(spins, std::sync::atomic::Ordering::Relaxed);
+        self.dgpu.compute.synchronize()?;
+        for &slot in slots {
+            arena.advance(slot)?;
+        }
+        Ok(tables)
+    }
+
     pub fn forward_layer_batch_v2(
         &self,
         bd: &mut BatchDgpuScratch,
@@ -8101,6 +8305,8 @@ pub static LH_ENGRAM_JOIN: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// kwide path: iGPU drain + D2H of the work-item count before the MoE launch.
 pub static LH_WORK_ITEMS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_SEL_D2H: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Idle polls of the ready-first lane driver (nothing ready anywhere). Diagnostic only.
+pub static READY_FIRST_SPINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_REMOTE_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// EXPOSED-WAIT PROBE (2026-09-22). `lh.work_items_count` (90.7 ms/step) and
 /// `lh.sel_d2h` (39.4) are blocking readbacks, and a blocking readback costs one

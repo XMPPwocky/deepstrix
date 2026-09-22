@@ -4627,6 +4627,9 @@ pub struct RemoteExpertClient {
     stream: TcpStream,
     tx_req: Option<mpsc::SyncSender<(AlignedBuf, u64)>>,
     rx_resp: mpsc::Receiver<ClientInbound>,
+    /// One frame taken off `rx_resp` by `head_ready` but not yet consumed by
+    /// `wait`. Replies are FIFO, so it is always the oldest in-flight ticket's.
+    stash: Option<ClientInbound>,
     rx_req_recycle: mpsc::Receiver<AlignedBuf>,
     tx_resp_recycle: mpsc::Sender<AlignedBuf>,
     next_seq: u32,
@@ -4775,6 +4778,7 @@ impl RemoteExpertClient {
             tx_resp_recycle,
             next_seq: 1,
             in_flight: Default::default(),
+            stash: None,
             writer: Some(writer),
             reader: Some(reader),
         })
@@ -4962,6 +4966,32 @@ impl RemoteExpertClient {
         Ok(Some(ticket))
     }
 
+    /// `seq` of the oldest in-flight request -- the only one whose reply can be
+    /// next, since replies are FIFO. `None` when nothing is in flight.
+    pub fn head_seq(&self) -> Option<u32> {
+        self.in_flight.front().map(|t| t.seq)
+    }
+
+    /// Non-blocking: has the oldest in-flight request's reply arrived? Takes the
+    /// frame off the channel into `stash` without consuming it, so `wait` still
+    /// does all the accounting. A closed channel reports READY so the caller's
+    /// `wait` surfaces the error instead of spinning. A scheduling HINT for the
+    /// ready-first lane driver only -- correctness never depends on it, because
+    /// `wait` blocks for real either way.
+    pub fn head_ready(&mut self) -> bool {
+        if self.stash.is_some() {
+            return true;
+        }
+        match self.rx_resp.try_recv() {
+            Ok(m) => {
+                self.stash = Some(m);
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => true,
+        }
+    }
+
     /// Block until the oldest in-flight request has answered. `ticket` must be
     /// that request (FIFO).
     pub fn wait(&mut self, ticket: Ticket) -> eyre::Result<RemotePartial> {
@@ -4972,7 +5002,13 @@ impl RemoteExpertClient {
         // Stamped BEFORE the blocking recv, so we can tell "we waited for the
         // reply" apart from "the reply waited for us".
         let t_wait_enter = Instant::now();
-        let (buf, t_recv, t4) = match self.rx_resp.recv() {
+        // A frame `head_ready` already took off the channel comes first; its
+        // `t_recv` predates `t_wait_enter`, so it is correctly counted as slack.
+        let next = match self.stash.take() {
+            Some(m) => Ok(m),
+            None => self.rx_resp.recv(),
+        };
+        let (buf, t_recv, t4) = match next {
             Ok(ClientInbound::Resp { buf, t_recv, t4 }) => {
                 use std::sync::atomic::Ordering::Relaxed;
                 let now = Instant::now();
