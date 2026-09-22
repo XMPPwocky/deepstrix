@@ -6271,6 +6271,22 @@ impl HeterogeneousEngine {
                 // was paying a full cross-lane iGPU drain (31-59 ms/step) for a
                 // write that never came. The dense/union paths always rewrite the
                 // window, so they keep the drain unconditionally.
+                //
+                // *** THIS IS THE SECOND-BEST FIX. *** It makes the common case
+                // free but leaves the drain on exactly the lane-layers that page,
+                // which are the expensive ones, and it still couples the lanes
+                // whenever it fires. The PROPER fix is to make eviction incapable
+                // of touching the other lane's live slots, so no drain is ever
+                // needed: give the pager a `pinned` set -- the other lane's
+                // in-flight picks for the layer its MoE is still running -- and
+                // have the victim search skip it, which is exactly what box 2's
+                // `ExpertShard::pinned` already does for its own queued requests.
+                // With that in place delete this block and `V41_PAGER_SYNC_IGPU`
+                // outright. Related: the router readback below (`LH_SEL_SYNC`,
+                // 25-49 ms/step) is still a full dGPU drain issued the instant the
+                // chain is launched; it wants software pipelining -- launch this
+                // lane's chain, go service the OTHER lane's reply and chain, then
+                // come back for these picks with the wait already over.
                 let ensure_may_evict = !replay_offload
                     && (!sparse_resid || ids.iter().any(|&e| !pg.is_resident(layer as i32, e)));
                 if ensure_may_evict && std::env::var("V41_PAGER_SYNC_IGPU").as_deref() != Ok("0") {
