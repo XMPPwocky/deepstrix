@@ -260,6 +260,8 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let comp_rows_cap = (n_streams as u32) * n_kv_max;
     let mut arena_alone = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut arena_batch = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
+    let mut arena_pipe = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
+    let mut dev_b = RowTablesDev::alloc(dgpu, n_streams as u32, KV_SOURCE_LAYERS.len())?;
     let mut dev = RowTablesDev::alloc(dgpu, n_streams as u32, KV_SOURCE_LAYERS.len())?;
 
     // 1. Prefill each prompt on its own state; admit into both arenas.
@@ -268,6 +270,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mut prefill_logits: Vec<Vec<f32>> = Vec::new();
     let mut slots_alone: Vec<u32> = Vec::new();
     let mut slots_batch: Vec<u32> = Vec::new();
+    let mut slots_pipe: Vec<u32> = Vec::new();
     for (s, toks) in prompts.iter().enumerate() {
         let mut st = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
         let hcs: Vec<Vec<f32>> = toks.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
@@ -283,6 +286,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         let cap = pos + n_steps as u32 + 8;
         slots_alone.push(arena_alone.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
         slots_batch.push(arena_batch.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
+        slots_pipe.push(arena_pipe.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
         engine.dgpu.compute.synchronize()?;
         first_tok.push(if s == 0 { forced.as_ref().map(|f| *f.last().unwrap()) } else { None }.unwrap_or(argmax(&logits) as i32));
         prefill_logits.push(logits);
@@ -557,12 +561,51 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     }
     eprintln!("batched step wall (S={n_streams}, incl. head): {:?} ms", step_ms.iter().map(|x| (*x * 10.0).round() / 10.0).collect::<Vec<_>>());
 
+    // 4b. Arena, all rows co-batched, TWO-LANE PIPELINED driver (the production
+    // step at >= 6 rows). Since 2026-09-22 this driver runs the pre-MoE phases
+    // in dependency-graph order (chain A, chain B, route A, route B, prep A,
+    // prep B, launch A, launch B) with the cross-lane iGPU drain removed; the
+    // invariant it relies on -- no MoE in flight during `ensure` -- is checked
+    // inside the driver, and THIS comparison is what says the reorder kept the
+    // numerics: same rows, same tokens, must match `alone` like `batch` does.
+    let mut logits_pipe: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_streams];
+    let mut seqs_p: Vec<Vec<i32>> = prompts.clone();
+    let mut step_ms_p = Vec::new();
+    let b_a = n_streams.div_ceil(2);
+    for t in 0..n_steps {
+        let toks: Vec<i32> = (0..n_streams).map(|s| cont[s][t]).collect();
+        let mut rows_b = vec![vec![0f32; n_streams * ein]; ENGRAM_LAYERS.len()];
+        let mut hcs = Vec::with_capacity(n_streams);
+        for s in 0..n_streams {
+            let pos = seqs_p[s].len();
+            seqs_p[s].push(toks[s]);
+            let rows = engram.rows_at(pg.raw(), &seqs_p[s], pos)?;
+            for (li, r) in rows.iter().enumerate() {
+                rows_b[li][s * ein..(s + 1) * ein].copy_from_slice(r);
+            }
+            hcs.push(embed(toks[s])?);
+        }
+        let t0 = std::time::Instant::now();
+        engine.forward_step_arena_pipelined(
+            &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut arena_pipe, &mut dev, &mut dev_b, &slots_pipe, &weights,
+            &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b.clone())), Some(&mut pg),
+        )?;
+        let mut all = engine.head_rows(&mut ds, &bd_a, b_a, &weights)?;
+        all.extend(engine.head_rows(&mut ds, &bd_b, n_streams - b_a, &weights)?);
+        step_ms_p.push(t0.elapsed().as_secs_f64() * 1e3);
+        for s in 0..n_streams {
+            logits_pipe[s].push(all[s * nv..(s + 1) * nv].to_vec());
+        }
+    }
+    eprintln!("pipelined step wall (S={n_streams}, 2 lanes, incl. head): {:?} ms", step_ms_p.iter().map(|x| (*x * 10.0).round() / 10.0).collect::<Vec<_>>());
+
     if let Ok(dir) = std::env::var("MS_SAVE_LOGITS") {
         let f32s = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
         for s in 0..n_streams {
             for t in 0..n_steps {
                 std::fs::write(format!("{dir}/s{s}_t{t}_alone.bin"), f32s(&logits_alone[s][t]))?;
                 std::fs::write(format!("{dir}/s{s}_t{t}_batch.bin"), f32s(&logits_batch[s][t]))?;
+                std::fs::write(format!("{dir}/s{s}_t{t}_pipe.bin"), f32s(&logits_pipe[s][t]))?;
             }
         }
     }
@@ -571,8 +614,10 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
 
     // 5. Compare.
     let mut g5a_fail = 0;
+    let mut g5c_fail = 0;
     let mut kls = Vec::new();
     let mut kls_alone = Vec::new();
+    let mut kls_pipe = Vec::new();
     eprintln!(" s  t   |alone-batch|  |pf1-alone|  argmax(dec/pf1/alone/batch)   KL(dec||batch)  KL(dec||alone)  KL(dec||pf1)");
     for s in 0..n_streams {
         for t in 0..n_steps {
@@ -585,8 +630,14 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             if d != 0.0 {
                 g5a_fail += 1;
             }
+            let dpipe = max_abs_diff(&logits_alone[s][t], &logits_pipe[s][t]);
+            let kpipe = kld(&logits_dec[s][t], &logits_pipe[s][t]);
+            if dpipe != 0.0 {
+                g5c_fail += 1;
+            }
             kls.push(kb);
             kls_alone.push(ka);
+            kls_pipe.push(kpipe);
             eprintln!("{s:2} {t:2}   {d:10.3e}   {dp:10.3e}   {ad:6}/{ap:6}/{aa:6}/{ab:6}     {kb:9.5}       {ka:9.5}      {kp:9.5}");
         }
     }
@@ -599,11 +650,24 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         kls.len()
     );
     eprintln!("G5b: KL(dec||batch) mean {mean:.5} max {max:.5} nats (bars {kld_mean_bar} / {kld_max_bar}); KL(dec||alone) mean {mean_a:.5}");
+    let mean_p = kls_pipe.iter().sum::<f64>() / kls_pipe.len() as f64;
+    let max_p = kls_pipe.iter().cloned().fold(0.0, f64::max);
+    eprintln!(
+        "G5c: {} of {} (stream, step) rows differ between alone and PIPELINED (want 0); KL(dec||pipe) mean {mean_p:.5} max {max_p:.5}",
+        g5c_fail,
+        kls_pipe.len()
+    );
     if g5a_fail > 0 && !allow_inexact {
         return Err(eyre!("G5a failed: {g5a_fail} rows not batch-invariant (MS_ALLOW_INEXACT=1 to report only)"));
     }
     if mean > kld_mean_bar || max > kld_max_bar {
         return Err(eyre!("G5b failed: KL mean {mean:.5} / max {max:.5} over bars {kld_mean_bar} / {kld_max_bar}"));
+    }
+    if g5c_fail > 0 && !allow_inexact {
+        return Err(eyre!("G5c failed: {g5c_fail} rows not invariant between alone and the pipelined driver (MS_ALLOW_INEXACT=1 to report only)"));
+    }
+    if mean_p > kld_mean_bar || max_p > kld_max_bar {
+        return Err(eyre!("G5c failed: pipelined KL mean {mean_p:.5} / max {max_p:.5} over bars {kld_mean_bar} / {kld_max_bar}"));
     }
     Ok(())
 }

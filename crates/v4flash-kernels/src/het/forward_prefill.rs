@@ -2154,6 +2154,73 @@ impl HeterogeneousEngine {
     }
 }
 
+/// State carried between the four phases of one lane-layer's pre-MoE work
+/// (`pre_moe_chain` -> `pre_moe_route` -> `pre_moe_prep` -> `pre_moe_launch`).
+/// Owned values only: no phase borrows the pager or the weights across a phase
+/// boundary, so the driver can interleave the other lane's phases in between.
+#[derive(Default)]
+pub struct PreMoeCarry {
+    phase: PreMoePhase,
+    pub layer: i32,
+    pub b: u32,
+    cs_n_used: usize,
+    cs_n_embd: usize,
+    dump_pos: u32,
+    cap_ok: bool,
+    defer_shared: bool,
+    pub remote_split_on: bool,
+    split_cap: u32,
+    sparse_resid_layer: bool,
+    moe_group_bound: u32,
+    /// Sequential callers keep the cross-lane iGPU drain in front of `ensure`
+    /// (conditional on it being able to evict); the pipelined driver runs both
+    /// lanes' preps before either launch and sets this false.
+    pub drain_before_ensure: bool,
+    // route -> prep
+    sel_host_remote: Vec<i32>,
+    sel_host_audit: Vec<i32>,
+    owns_eff: Vec<bool>,
+    ids: Vec<u32>,
+    replay_offload: bool,
+    sparse_resid: bool,
+    mc0: u64,
+    owns_remote_some: bool,
+    // prep -> launch
+    n_work_items: u32,
+    variant: String,
+    wmma_path: bool,
+    hot_active: bool,
+    max_per_expert: u32,
+    chunk_size: u32,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PreMoePhase {
+    #[default]
+    New,
+    Chained,
+    Routed,
+    Prepped,
+    Launched,
+    Skipped,
+}
+
+impl PreMoeCarry {
+    /// Phase-order invariant: each phase runs exactly once, in order.
+    /// Returns `Ok(false)` when the chain skipped this lane-layer entirely
+    /// (`b == 0`, `CedMode::KvSourceOnly`): the later phases are then no-ops.
+    fn advance(&mut self, from: PreMoePhase, to: PreMoePhase) -> eyre::Result<bool> {
+        if self.phase == PreMoePhase::Skipped {
+            return Ok(false);
+        }
+        if self.phase != from {
+            return Err(eyre!("pre-MoE phase order violated on L{}: expected {from:?}, carry is at {:?} (wanted {to:?})", self.layer, self.phase));
+        }
+        self.phase = to;
+        Ok(true)
+    }
+}
+
 impl HeterogeneousEngine {
     /// One layer of batched prefill, all phases. Reads
     /// `bd.residual` (per-token input HC), writes `bd.residual_next`
@@ -2395,42 +2462,90 @@ impl HeterogeneousEngine {
             Ok(())
         };
         let n_layer = N_LAYER as usize;
-        // Warm-up: pre(A, 0), pre(B, 0).
-        stage(self, bd_a, 0, 0, b_a)?;
-        arena.state.with_kv_source(0, |ls| {
-            self.forward_layer_pre_moe_v2(bd_a, bi_a, sd, si, ls, &weights.dgpu_layers[0], &weights.igpu_layers[0], 0, tokens_a, None, None,
-                &self.sync_events.layers[0], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_a, dev: dev_a, next_router: weights.dgpu_layers.get(1), next_router2: weights.dgpu_layers.get(2) })
-?;
-            self.route_probe_after_layer(bd_a, weights, 0, b_a, 0)
-        })?;
-        stage(self, bd_b, 0, b_a, b_b)?;
-        arena.state.with_kv_source(0, |ls| {
-            self.forward_layer_pre_moe_v2(bd_b, bi_b, sd, si, ls, &weights.dgpu_layers[0], &weights.igpu_layers[0], 0, tokens_b, None, None,
-                &self.sync_events_t1.layers[0], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_b, dev: dev_b, next_router: weights.dgpu_layers.get(1), next_router2: weights.dgpu_layers.get(2) })
-?;
-            self.route_probe_after_layer(bd_b, weights, 0, b_b, 1)
-        })?;
+        // DEPENDENCY-GRAPH ORDER (2026-09-22). Per layer: both lanes' dGPU
+        // chains are launched back to back (each right after its own combine,
+        // so the dGPU never idles while the host waits on the other lane's
+        // reply), then both lanes ROUTE (event wait, readback, box-2 submit),
+        // then both PREP (ensure, peer push, group builder), then both LAUNCH.
+        //  * the router readback is an event wait that is already over by the
+        //    time the other lane's chain has been launched -- no stream drain;
+        //  * box 2 receives both requests within one chain's time of each
+        //    other instead of one per lane turnaround;
+        //  * no MoE is in flight on the iGPU while either `ensure` evicts, so
+        //    the cross-lane drain (`V41_PAGER_SYNC_IGPU`) is not needed here:
+        //    `drain_before_ensure = false`, and the invariant is CHECKED with
+        //    `moe_done` queries -- a violation fails the step instead of racing.
+        macro_rules! rl {
+            ($t:expr, $d:expr, $l:expr) => {
+                RowLayout::Arena { tables: &$t, dev: &*$d, next_router: weights.dgpu_layers.get($l + 1), next_router2: weights.dgpu_layers.get($l + 2) }
+            };
+        }
+        macro_rules! chain_a {
+            ($l:expr) => {{
+                let l: usize = $l;
+                stage(self, bd_a, l, 0, b_a)?;
+                arena.state.with_kv_source(l, |ls| {
+                    let rl = rl!(tables_a, dev_a, l);
+                    self.pre_moe_chain(bd_a, bi_a, sd, si, ls, &weights.dgpu_layers[l], &weights.igpu_layers[l], 0, tokens_a, None, None,
+                        &self.sync_events.layers[l], pager.as_deref_mut(), CedMode::Exact, &rl)
+                })?
+            }};
+        }
+        macro_rules! chain_b {
+            ($l:expr) => {{
+                let l: usize = $l;
+                stage(self, bd_b, l, b_a, b_b)?;
+                arena.state.with_kv_source(l, |ls| {
+                    let rl = rl!(tables_b, dev_b, l);
+                    self.pre_moe_chain(bd_b, bi_b, sd, si, ls, &weights.dgpu_layers[l], &weights.igpu_layers[l], 0, tokens_b, None, None,
+                        &self.sync_events_t1.layers[l], pager.as_deref_mut(), CedMode::Exact, &rl)
+                })?
+            }};
+        }
+        macro_rules! rest_layer {
+            ($l:expr, $ca:expr, $cb:expr) => {{
+                let l: usize = $l;
+                let (ca, cb): (&mut PreMoeCarry, &mut PreMoeCarry) = ($ca, $cb);
+                let sev_a = &self.sync_events.layers[l];
+                let sev_b = &self.sync_events_t1.layers[l];
+                { let rl = rl!(tables_a, dev_a, l); self.pre_moe_route(ca, bd_a, sd, sev_a, pager.as_deref_mut(), &rl)?; }
+                { let rl = rl!(tables_b, dev_b, l); self.pre_moe_route(cb, bd_b, sd, sev_b, pager.as_deref_mut(), &rl)?; }
+                if l > 0 {
+                    // INVARIANT (what lets `ensure` run without the iGPU drain):
+                    // both lanes' previous-layer MoEs have retired. True by
+                    // construction -- each lane's route above waited on its
+                    // router event, which sits behind its combine, which waited
+                    // on its `moe_arrived` -- and cheap to check (hipEventQuery).
+                    for (name, ev) in [("A", &self.sync_events.layers[l - 1].moe_done), ("B", &self.sync_events_t1.layers[l - 1].moe_done)] {
+                        if !ev.query()? {
+                            return Err(eyre!("pipelined step L{l}: lane {name}'s MoE for L{} is still in flight at prep (order invariant violated)", l - 1));
+                        }
+                    }
+                }
+                ca.drain_before_ensure = false;
+                cb.drain_before_ensure = false;
+                self.pre_moe_prep(ca, bd_a, bi_a, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev_a, pager.as_deref_mut())?;
+                self.pre_moe_prep(cb, bd_b, bi_b, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev_b, pager.as_deref_mut())?;
+                self.pre_moe_launch(ca, bd_a, bi_a, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev_a, pager.as_deref_mut())?;
+                self.pre_moe_launch(cb, bd_b, bi_b, sd, si, &weights.dgpu_layers[l], &weights.igpu_layers[l], sev_b, pager.as_deref_mut())?;
+                self.route_probe_after_layer(bd_a, weights, l, b_a, 0)?;
+                self.route_probe_after_layer(bd_b, weights, l, b_b, 1)?;
+            }};
+        }
+        // Warm-up: chain(A, 0), chain(B, 0), then the rest of layer 0.
+        let mut ca = chain_a!(0);
+        let mut cb = chain_b!(0);
+        rest_layer!(0, &mut ca, &mut cb);
         for layer in 0..n_layer - 1 {
             let hot_a = prefill_hot_active(&weights.dgpu_layers[layer], &weights.igpu_layers[layer], bd_a, sd);
             self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[layer], hot_a)?;
             std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
-            stage(self, bd_a, layer + 1, 0, b_a)?;
-            arena.state.with_kv_source(layer + 1, |ls| {
-                self.forward_layer_pre_moe_v2(bd_a, bi_a, sd, si, ls, &weights.dgpu_layers[layer + 1], &weights.igpu_layers[layer + 1], 0, tokens_a, None, None,
-                    &self.sync_events.layers[layer + 1], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_a, dev: dev_a, next_router: weights.dgpu_layers.get(layer + 2), next_router2: weights.dgpu_layers.get(layer + 3) })
-?;
-                self.route_probe_after_layer(bd_a, weights, layer + 1, b_a, 0)
-            })?;
+            let mut ca = chain_a!(layer + 1);
             let hot_b = prefill_hot_active(&weights.dgpu_layers[layer], &weights.igpu_layers[layer], bd_b, sd);
             self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[layer], hot_b)?;
             std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
-            stage(self, bd_b, layer + 1, b_a, b_b)?;
-            arena.state.with_kv_source(layer + 1, |ls| {
-                self.forward_layer_pre_moe_v2(bd_b, bi_b, sd, si, ls, &weights.dgpu_layers[layer + 1], &weights.igpu_layers[layer + 1], 0, tokens_b, None, None,
-                    &self.sync_events_t1.layers[layer + 1], pager.as_deref_mut(), CedMode::Exact, RowLayout::Arena { tables: &tables_b, dev: dev_b, next_router: weights.dgpu_layers.get(layer + 2), next_router2: weights.dgpu_layers.get(layer + 3) })
-?;
-                self.route_probe_after_layer(bd_b, weights, layer + 1, b_b, 1)
-            })?;
+            let mut cb = chain_b!(layer + 1);
+            rest_layer!(layer + 1, &mut ca, &mut cb);
         }
         let last = n_layer - 1;
         let hot_a = prefill_hot_active(&weights.dgpu_layers[last], &weights.igpu_layers[last], bd_a, sd);
@@ -2654,6 +2769,41 @@ impl HeterogeneousEngine {
         // Multi-stream: which per-row layout the KV in `ls` has (see `RowLayout`).
         rows: RowLayout<'_>,
     ) -> eyre::Result<()> {
+        // Sequential composition of the four phases (see `pre_moe_chain`); the
+        // pipelined arena driver interleaves them across lanes instead.
+        let mut c = self.pre_moe_chain(bd, bi, sd, si, ls, dlw, ilw, pos0, tokens, vis, stats, sev, pager.as_deref_mut(), ced, &rows)?;
+        self.pre_moe_route(&mut c, bd, sd, sev, pager.as_deref_mut(), &rows)?;
+        self.pre_moe_prep(&mut c, bd, bi, sd, si, dlw, ilw, sev, pager.as_deref_mut())?;
+        self.pre_moe_launch(&mut c, bd, bi, sd, si, dlw, ilw, sev, pager)
+    }
+
+    pub fn pre_moe_chain(
+        &self,
+        bd: &mut BatchDgpuScratch,
+        bi: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        ls: &mut HetLayerState,
+        dlw: &DgpuLayerWeights,
+        ilw: &IgpuLayerWeights,
+        pos0: u32,
+        tokens: &[i32],
+        // Vision-Exp per-row `(left, right)` visibility inside an image span
+        // (`image_spans::rows_visibility`, already clamped). Drives the raw
+        // attention window only; the router-side image flag comes from
+        // `tokens` (id >= N_VOCAB). `None` == all text.
+        vis: Option<&[(u32, u32)]>,
+        stats: Option<&mut PrefillStats>,
+        sev: &super::engine::LayerSyncEvents,
+        // M7 expert pager: when Some, this layer's experts are paged out of its
+        // pool instead of read from the (placeholder) resident buffers.
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
+        // M7 CED mode of this call (only `CED_DECODER_START` is ever called
+        // with anything but `Exact`).
+        ced: CedMode,
+        // Multi-stream: which per-row layout the KV in `ls` has (see `RowLayout`).
+        rows: &RowLayout<'_>,
+    ) -> eyre::Result<PreMoeCarry> {
         let layer = dlw.layer_idx;
         let arena: Option<(&RowTables, &RowTablesDev)> = match &rows {
             RowLayout::Arena { tables, dev, .. } => Some((*tables, *dev)),
@@ -2813,7 +2963,7 @@ impl HeterogeneousEngine {
         let ratio = dlw.ratio;
         let b = tokens.len() as u32;
         if b == 0 {
-            return Ok(());
+            return Ok(PreMoeCarry { phase: PreMoePhase::Skipped, layer, ..Default::default() });
         }
         check_scratch_rows("forward_layer_pre_moe_v2", b as usize, bd, bi, sd, si)?;
 
@@ -4292,7 +4442,7 @@ impl HeterogeneousEngine {
         if ced == CedMode::KvSourceOnly {
             // M7 CED: the decoder's global KV for these rows is in the store;
             // nothing below (window KV, attention, MoE) runs for them.
-            return Ok(());
+            return Ok(PreMoeCarry { phase: PreMoePhase::Skipped, layer, ..Default::default() });
         }
 
         // ========================================================
@@ -5636,6 +5786,31 @@ impl HeterogeneousEngine {
             }
         }
         drop(_t_router);
+        let remote_owns_layer = self
+            .remote
+            .as_ref()
+            .and_then(|r| r.lock().ok().map(|c| c.info().owned_count(layer as u32) > 0))
+            .unwrap_or(false);
+        let remote_split_on = remote_split_active() && remote_owns_layer;
+        // DEPENDENCY-GRAPH REORDER (2026-09-22): everything the box-2 request
+        // needs from the dGPU is ready right here -- picks, weights, and the
+        // activations -- so quantise the activations NOW and mark the router
+        // outputs ready. `pre_moe_route` then waits on this EVENT (already past
+        // by the time the other lane's chain has been launched) instead of
+        // draining the whole compute stream, and the peer push in
+        // `pre_moe_prep` waits on the same event.
+        if remote_split_on {
+            if let Some(xq_dev) = sd.remote_xq.as_mut() {
+                self.set_current_cached(self.dgpu.device)?;
+                de.q8k.launch(
+                    &de.compute,
+                    xq_dev,
+                    &bd.ffn_input_norm,
+                    crate::config::BLOCKS_Q8K_GATE_IN * b,
+                )?;
+            }
+        }
+        sev.selected_ready.record(&de.compute)?;
 
         // M62: accumulate the chunk's picks into the prefill stats bank
         // (one tiny atomicAdd kernel on de.compute, no readback).
@@ -5689,12 +5864,6 @@ impl HeterogeneousEngine {
         // them NON-NEGATIVE (skip). V4.1 runs `hot_experts = None` so this never
         // co-occurs today; refuse loudly rather than silently mis-route if it
         // ever does.
-        let remote_owns_layer = self
-            .remote
-            .as_ref()
-            .and_then(|r| r.lock().ok().map(|c| c.info().owned_count(layer as u32) > 0))
-            .unwrap_or(false);
-        let remote_split_on = remote_split_active() && remote_owns_layer;
         // The het-split builder's cap is a per-token RANK test, not a count of
         // devices. Under the dGPU hot split it deliberately keeps only the top
         // `hot_prefill_cap()` picks for the iGPU. Under the remote split the
@@ -5721,9 +5890,7 @@ impl HeterogeneousEngine {
 
         // Router picks for this chunk, read back once and shared by the union
         // pager and the remote submit below (both need exactly these ids).
-        let mut sel_host_remote: Vec<i32> = Vec::new();
         // Lane picks copied for `V41_GROUP_AUDIT`.
-        let mut sel_host_audit: Vec<i32> = Vec::new();
         // Box 2's pick list and weights, masked by the hub's OWN `owns_eff`
         // instead of box 2's advertised HELLO bitmap.
         //
@@ -5737,14 +5904,10 @@ impl HeterogeneousEngine {
         // and sending it over the wire gets "expert 384 is not resident here"
         // from the daemon. `ew` must be zeroed in the same slots.
         // Empty = no override, use the old path.
-        let mut sel_for_remote: Vec<i32> = Vec::new();
         // Hoisted so the exclusion/audit (which must run AFTER `ensure`) can still
         // see what the masking (now hoisted ABOVE `ensure`) decided.
-        let mut owns_eff: Vec<bool> = Vec::new();
-        let mut ew_for_remote: Vec<f32> = Vec::new();
         // Picks box 1 declined because it does not hold them; box 2 must claim
         // exactly these ON TOP of what it advertises.
-        let mut extra_remote = vec![false; N_EXPERT as usize];
         // Hoisted: the ALLOCATOR (below), the EXCLUSION builder and the WEIGHTS
         // VIEW must all agree on the slot space, and the view is chosen ~250
         // lines further down. Deciding this once, here, is what keeps them from
@@ -5794,6 +5957,47 @@ impl HeterogeneousEngine {
         } else {
             N_EXPERT
         };
+        Ok(PreMoeCarry {
+            phase: PreMoePhase::Chained,
+            layer, b, cs_n_used, cs_n_embd, dump_pos, cap_ok,
+            defer_shared, remote_split_on, split_cap, sparse_resid_layer, moe_group_bound,
+            drain_before_ensure: true,
+            ..Default::default()
+        })
+    }
+
+    /// Phase 2 of the pre-MoE lane-layer: wait for the ROUTER (an event, not a
+    /// stream drain), read the picks back, split ownership, and SUBMIT the
+    /// box-2 request. Touches no iGPU state, so the pipelined driver runs it
+    /// for both lanes before either lane's `pre_moe_prep`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pre_moe_route(
+        &self,
+        c: &mut PreMoeCarry,
+        bd: &mut BatchDgpuScratch,
+        sd: &mut BatchDgpuShared,
+        sev: &super::engine::LayerSyncEvents,
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
+        rows: &RowLayout<'_>,
+    ) -> eyre::Result<()> {
+        if !c.advance(PreMoePhase::Chained, PreMoePhase::Routed)? { return Ok(()); }
+        let PreMoeCarry { layer, b, cs_n_used, cs_n_embd, remote_split_on, sparse_resid_layer, moe_group_bound, split_cap, .. } = *c;
+        let _ = (cs_n_embd, split_cap, moe_group_bound);
+        let _ = &self.dgpu;
+        let look_next: Option<&DgpuLayerWeights> = match &rows {
+            RowLayout::Arena { next_router, .. } if lookahead_prefetch() => next_router.filter(|nl| !nl.is_hash_router),
+            _ => None,
+        };
+        let look_next2: Option<&DgpuLayerWeights> = match &rows {
+            RowLayout::Arena { next_router2, .. } if lookahead_prefetch() && lookahead_depth() >= 2 => next_router2.filter(|nl| !nl.is_hash_router),
+            _ => None,
+        };
+        let mut sel_host_remote: Vec<i32> = Vec::new();
+        let mut sel_host_audit: Vec<i32> = Vec::new();
+        let mut sel_for_remote: Vec<i32> = Vec::new();
+        let mut owns_eff: Vec<bool> = Vec::new();
+        let mut ew_for_remote: Vec<f32> = Vec::new();
+        let mut extra_remote = vec![false; N_EXPERT as usize];
         if let Some(pg) = pager.as_deref_mut() {
             // Page the chunk's ACTUAL routed union, not all N_EXPERT. The
             // "union at B >> 1 is essentially everything" argument above holds
@@ -5844,7 +6048,9 @@ impl HeterogeneousEngine {
                 let n_sel = (b as usize) * cs_n_used;
                 let mut sel_host = vec![0i32; n_sel];
                 let _t_sync = LayerHostTimer::start(&LH_SEL_SYNC);
-                de.compute.synchronize()?;
+                // Wait on the ROUTER-DONE EVENT, not the stream: the other lane's
+                // whole chain may sit behind ours on `de.compute` by now.
+                sev.selected_ready.synchronize()?;
                 drop(_t_sync);
                 let _t_d2h = LayerHostTimer::start(&LH_SEL_D2H);
                 bd.d_selected
@@ -6155,16 +6361,9 @@ impl HeterogeneousEngine {
                         );
                         // Same kernel the iGPU would use, so the bytes match by
                         // construction rather than by agreement.
-                        de.q8k.launch(
-                            &de.compute,
-                            xq_dev,
-                            &bd.ffn_input_norm,
-                            crate::config::BLOCKS_Q8K_GATE_IN * b,
-                        )?;
-                        // The dGPU drain + two D2H copies, NOT the send: at 8 rows
-                        // this was all of `lh.remote_submit` (7 ms/step).
+                        // xq was quantised on the chain right after the router and is
+                        // covered by `selected_ready`, already waited on above: D2H only.
                         let _t_rsync = LayerHostTimer::start(&LH_REMOTE_SYNC);
-                        de.compute.synchronize()?;
                         let mut xq_host = vec![0u8; xq_bytes];
                         xq_dev.slice_view(0, xq_bytes).copy_to_host(&mut xq_host)?;
                         let mut ew_host = vec![0f32; n_sel];
@@ -6253,6 +6452,49 @@ impl HeterogeneousEngine {
                 } // if remote_split_on -- box-2 submit only. Local paging below runs with or
                   // without a remote (it did NOT after f1fbe3f: the whole tail of this block,
                   // ensure included, sat inside the remote branch; KNOWN_BUGS #20/#21).
+                c.ids = ids;
+                c.replay_offload = replay_offload;
+                c.sparse_resid = sparse_resid;
+                c.mc0 = mc0;
+            }
+        }
+        c.sel_host_remote = sel_host_remote;
+        c.sel_host_audit = sel_host_audit;
+        c.owns_eff = owns_eff;
+        Ok(())
+    }
+
+    /// Phase 3: box-1 residency (`ensure`), exclusion, the peer push of the
+    /// picks to the iGPU, the group builder and the work-item COUNT readback.
+    /// The pipelined driver runs this for both lanes AFTER both `pre_moe_route`s
+    /// and BEFORE either `pre_moe_launch`, so no MoE is in flight on the iGPU
+    /// while `ensure` evicts (the driver checks that with `moe_done` queries)
+    /// and it sets `drain_before_ensure = false`; sequential callers keep the
+    /// (conditional) cross-lane drain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pre_moe_prep(
+        &self,
+        c: &mut PreMoeCarry,
+        bd: &mut BatchDgpuScratch,
+        bi: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        dlw: &DgpuLayerWeights,
+        ilw: &IgpuLayerWeights,
+        sev: &super::engine::LayerSyncEvents,
+        mut pager: Option<&mut super::expert_pager::ExpertPager>,
+    ) -> eyre::Result<()> {
+        if !c.advance(PreMoePhase::Routed, PreMoePhase::Prepped)? { return Ok(()); }
+        let PreMoeCarry {
+            layer, b, cs_n_used, cs_n_embd, dump_pos, cap_ok, defer_shared, remote_split_on, split_cap,
+            sparse_resid_layer, moe_group_bound, replay_offload, sparse_resid, mc0, drain_before_ensure, owns_remote_some,
+            ref mut ids, ref owns_eff, ref sel_host_remote, ref sel_host_audit, ..
+        } = *c;
+        let de = &self.dgpu;
+        self.set_current_cached(self.dgpu.device)?;
+        if let Some(pg) = pager.as_deref_mut() {
+            if super::expert_pager::pager_union_prefill() {
+                let _t_pager = LayerHostTimer::start(&LH_PAGER);
                 if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} D at ensure site"); }
                 // RACE GUARD (see the note at the top of this block), now paid
                 // ONLY when this `ensure` can actually write (2026-09-22).
@@ -6289,7 +6531,7 @@ impl HeterogeneousEngine {
                 // come back for these picks with the wait already over.
                 let ensure_may_evict = !replay_offload
                     && (!sparse_resid || ids.iter().any(|&e| !pg.is_resident(layer as i32, e)));
-                if ensure_may_evict && std::env::var("V41_PAGER_SYNC_IGPU").as_deref() != Ok("0") {
+                if drain_before_ensure && ensure_may_evict && std::env::var("V41_PAGER_SYNC_IGPU").as_deref() != Ok("0") {
                     let _t_isync = LayerHostTimer::start(&LH_PAGER_SYNC_IGPU);
                     self.igpu.compute.synchronize()?;
                 }
@@ -6297,7 +6539,7 @@ impl HeterogeneousEngine {
                 let audit_v = std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1");
                 if audit_v {
                     eprintln!("[ensure-audit] L{layer} b={b} replay_offload={replay_offload} sparse_resid={sparse_resid} ids={} first={:?} owns_remote={} remote_split_on={remote_split_on}",
-                        ids.len(), ids.first(), owns_remote.is_some());
+                        ids.len(), ids.first(), owns_remote_some);
                 }
                 if replay_offload {
                     ids.clear();
@@ -6431,7 +6673,7 @@ impl HeterogeneousEngine {
                             layer as i32,
                             &sel_host_remote,
                             pg.remap(),
-                            Some(&owns_eff),
+                            Some(&owns_eff[..]),
                         )?;
                 }
             } else {
@@ -6532,7 +6774,7 @@ impl HeterogeneousEngine {
         // instead of a host sync, so de.compute is free to keep queuing
         // the next lane's pre-MoE work while xfer/igpu drain this lane.
         self.set_current_cached(self.dgpu.device)?;
-        sev.selected_ready.record(&de.compute)?;
+        // `selected_ready` was recorded on the chain right after the router.
         de.xfer.wait_event(&sev.selected_ready)?;
         // Single batched peer-push of all B activations + routing.
         let ain_v = bd
@@ -7025,6 +7267,98 @@ impl HeterogeneousEngine {
             bi.n_work_items.copy_to_host(&mut n_wi_host)?;
             drop(_t_wic);
             n_work_items = n_wi_host[0] as u32;
+        }
+        c.n_work_items = n_work_items;
+        c.variant = variant;
+        c.wmma_path = wmma_path;
+        c.hot_active = hot_active;
+        c.max_per_expert = max_per_expert;
+        c.chunk_size = CHUNK_SIZE;
+        Ok(())
+    }
+
+    /// Phase 4: the iGPU MoE kernels through `moe_done` / `moe_arrived`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pre_moe_launch(
+        &self,
+        c: &mut PreMoeCarry,
+        bd: &mut BatchDgpuScratch,
+        bi: &mut BatchIgpuScratch,
+        sd: &mut BatchDgpuShared,
+        si: &mut BatchIgpuShared,
+        dlw: &DgpuLayerWeights,
+        ilw: &IgpuLayerWeights,
+        sev: &super::engine::LayerSyncEvents,
+        pager: Option<&mut super::expert_pager::ExpertPager>,
+    ) -> eyre::Result<()> {
+        if !c.advance(PreMoePhase::Prepped, PreMoePhase::Launched)? { return Ok(()); }
+        let PreMoeCarry {
+            layer, b, cs_n_used, cs_n_embd, moe_group_bound, split_cap, sparse_resid_layer, n_work_items, wmma_path,
+            hot_active, max_per_expert, chunk_size, ref variant, ..
+        } = *c;
+        let _ = (sd, dlw, moe_group_bound);
+        let de = &self.dgpu;
+        let _ = de;
+        let ie = &self.igpu;
+        self.set_current_cached(self.igpu.device)?;
+        #[allow(non_snake_case)]
+        let CHUNK_SIZE: u32 = chunk_size;
+        let pager_window;
+        let (routed_src, moe_remap, moe_packed): (
+            &crate::model_weights::RoutedExpertWeights,
+            Option<&v4flash_hip::DeviceBuffer<i32>>,
+            bool,
+        ) = match pager.as_deref() {
+            // A VIEW of this layer's dense window, not the whole pool: the window's
+            // slot i holds expert i, so the kernel indexes it exactly like a resident
+            // buffer while other layers stay resident in other windows.
+            Some(pg) => {
+                // THIRD half of the allocator/exclusion pairing: the WEIGHTS VIEW.
+                //
+                // `ensure` (sparse decode LRU) writes ABSOLUTE pool slots, which
+                // are only meaningful against the whole pool -- that is what the
+                // decode path hands the dispatch (`pg.routed`, forward_layer.rs).
+                // `ensure_layer_union`/`_dense` write WINDOW-RELATIVE slots, valid
+                // only against `routed_window(layer)`.
+                //
+                // Handing an absolute slot to the window view reads
+                // `window_base(w) + slot`, and with V41_PAGER_WINDOWS=4 /
+                // STRIDE=128 the base is 128/256/384 for most layers while the LRU
+                // slots start at `dense_slots()` = 768. That is off the end of a
+                // 384-wide view: another expert's weights, no error, plausible
+                // output. It is correct only when window_base == 0 for every layer
+                // (dense_windows == 1), which is NOT the default.
+                let routed_view: &crate::model_weights::RoutedExpertWeights =
+                    if sparse_resid_layer {
+                        &pg.routed
+                    } else {
+                        pager_window = pg.routed_window(layer as i32);
+                        &pager_window
+                    };
+                // ALWAYS hand the dispatch the remap when the pager owns the
+                // window, not just under the remote split.
+                //
+                // With a dense window `slot == raw expert id`, so a `None` remap
+                // used to be harmless — the PLAIN group builder's raw ids happened
+                // to be correct slots. That equivalence is exactly what packed
+                // windows break (`moe_group_builder.hip:116` mode 0 takes the group
+                // id FROM the remap: `g = (dense >= 0) ? e : (-dense - 1)`), so a
+                // layer that fell through to `None` would index a packed window by
+                // raw id and read another expert's weights — silently, with no
+                // error and plausible-looking output. Passing it unconditionally is
+                // a no-op today (mode 0 with an all-local remap is arithmetically
+                // identical to the plain builder) and the precondition for packing.
+                (routed_view, Some(pg.remap_dev(layer as i32)), false)
+            }
+            None => (&ilw.routed, ilw.hot_remap.as_ref(), ilw.igpu_packed),
+        };
+        let gbpe = routed_src.gate_bytes_per_expert as u32;
+        let ubpe = routed_src.up_bytes_per_expert as u32;
+        let dbpe = routed_src.down_bytes_per_expert as u32;
+        let mid_blocks_bytes = (crate::config::BLOCKS_Q8K_DOWN_IN as usize)
+            * crate::q8_k::BLOCK_Q8_K_BYTES;
+        let _ = moe_packed;
+        if variant != "hybrid" {
             {
                 let BatchIgpuScratch {
                     d_ew,
