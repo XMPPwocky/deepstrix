@@ -1287,6 +1287,7 @@ pub mod knobs {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
     pub static DIRTY: AtomicBool = AtomicBool::new(false);
     static MERGE: AtomicBool = AtomicBool::new(true);
+    static COALESCE: AtomicBool = AtomicBool::new(false);
     static MERGE_WAIT_US: AtomicU64 = AtomicU64::new(400);
     static MISS_PAR: AtomicUsize = AtomicUsize::new(1);
     static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -1301,11 +1302,27 @@ pub mod knobs {
                 std::env::var("V41_B2_MISS_PAR").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
                 Relaxed,
             );
+            COALESCE.store(
+                matches!(std::env::var("V41_B2_COALESCE").as_deref(), Ok("1") | Ok("on")),
+                Relaxed,
+            );
         });
     }
     pub fn merge() -> bool { init(); MERGE.load(Relaxed) }
     pub fn merge_wait_us() -> u64 { init(); MERGE_WAIT_US.load(Relaxed) }
     pub fn miss_par() -> usize { init(); MISS_PAR.load(Relaxed).clamp(1, 16) }
+    /// Two preads per miss instead of eight (the whole 3-role run at once).
+    /// ROOT CAUSE of the 2026-09-18 corruption, for the record: the checkpoint
+    /// stores w1/w2/w3 but the loader maps gate<-w1, up<-w3, down<-w2, so a
+    /// physically-ordered run is gate,down,up and an implementation assuming
+    /// gate,up,down swapped two roles on every page-in. It was blessed warm, at
+    /// temp 0, where page-ins are rare and the path barely ran.
+    /// `read_expert_runs_direct` now derives each role's position from its file
+    /// OFFSET, and `V41_B2_COALESCE_CHECK=1` byte-compares every coalesced read
+    /// against the per-role one. NOTE it also gives up the mirror split (the
+    /// span read only touches the primary drive), so it trades 8 preads at
+    /// ~9.9 GB/s for 2 at ~4.5.
+    pub fn coalesce() -> bool { init(); COALESCE.load(Relaxed) }
     pub fn path() -> String {
         std::env::var("V41_B2_KNOBS").unwrap_or_else(|_| {
             format!("{}/expertd-knobs.txt", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
@@ -1316,7 +1333,7 @@ pub mod knobs {
         init();
         let p = path();
         let Ok(text) = std::fs::read_to_string(&p) else {
-            return format!("knobs: {p} unreadable; keeping merge={} wait_us={} miss_par={}", merge(), merge_wait_us(), miss_par());
+            return format!("knobs: {p} unreadable; keeping merge={} wait_us={} miss_par={} coalesce={}", merge(), merge_wait_us(), miss_par(), coalesce());
         };
         for line in text.lines() {
             let line = line.trim();
@@ -1325,10 +1342,13 @@ pub mod knobs {
                 ("merge", v) => MERGE.store(v != "0", Relaxed),
                 ("merge_wait_us", v) => { if let Ok(n) = v.parse() { MERGE_WAIT_US.store(n, Relaxed) } }
                 ("miss_par", v) => { if let Ok(n) = v.parse::<usize>() { MISS_PAR.store(n.clamp(1, 16), Relaxed) } }
+                ("coalesce", v) => COALESCE.store(v != "0", Relaxed),
+                ("mirror_frac", v) => { if let Ok(f) = v.parse::<f32>() { v4flash_core::hf_v41::set_expert_mirror_frac(f) } }
                 _ => {}
             }
         }
-        format!("knobs reloaded from {p}: merge={} wait_us={} miss_par={}", merge(), merge_wait_us(), miss_par())
+        format!("knobs reloaded from {p}: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3}",
+            merge(), merge_wait_us(), miss_par(), coalesce(), v4flash_core::hf_v41::expert_mirror_frac())
     }
 }
 
@@ -1342,8 +1362,9 @@ pub fn install_knobs_toggle() -> String {
         fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
     }
     const SIGUSR2: i32 = 12;
-    let init = format!("knobs: merge={} wait_us={} miss_par={} (SIGUSR2 reloads {})",
-        knobs::merge(), knobs::merge_wait_us(), knobs::miss_par(), knobs::path());
+    let init = format!("knobs: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} (SIGUSR2 reloads {})",
+        knobs::merge(), knobs::merge_wait_us(), knobs::miss_par(), knobs::coalesce(),
+        v4flash_core::hf_v41::expert_mirror_frac(), knobs::path());
     unsafe { signal(SIGUSR2, knobs_signal); }
     init
 }
@@ -1762,10 +1783,7 @@ pub fn b2_scan_class() -> bool {
 }
 
 pub fn b2_coalesce() -> bool {
-    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        matches!(std::env::var("V41_B2_COALESCE").as_deref(), Ok("1") | Ok("on"))
-    });
-    *B
+    knobs::coalesce()
 }
 
 pub fn b2_odirect() -> bool {
@@ -2022,8 +2040,11 @@ impl ExpertShard {
             // 3-role weight run and [1] the 3-role scale run, so one pread fills
             // each. Sized from bpe3 (which already exceeds packed+scale per role)
             // so it cannot be too small: 3x covers the weight run, 1x the scales.
+            // ALWAYS coalesce-sized (3x role 0) so `knobs::coalesce` can be
+            // flipped at runtime: the span read bounds-checks its destination and
+            // would fail the request otherwise. ~75 MB of extra pinned memory.
             PinnedBuffer::<u8>::new_with_flags(
-                if b2_coalesce() { 3 * bpe3[0] } else { bpe3[0] } + 4 * 4096,
+                3 * bpe3[0] + 4 * 4096,
                 HIP_HOST_MALLOC_NON_COHERENT,
             )?,
             PinnedBuffer::<u8>::new_with_flags(bpe3[1] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
@@ -2033,7 +2054,7 @@ impl ExpertShard {
         let mut pf_stages: Vec<[PinnedBuffer<u8>; 3]> = Vec::new();
         for _ in 0..b2_prefetch_sets() {
             pf_stages.push([
-                PinnedBuffer::<u8>::new_with_flags(if b2_coalesce() { 3 * bpe3[0] } else { bpe3[0] } + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
+                PinnedBuffer::<u8>::new_with_flags(3 * bpe3[0] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
                 PinnedBuffer::<u8>::new_with_flags(bpe3[1] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
                 PinnedBuffer::<u8>::new_with_flags(bpe3[2] + 4 * 4096, HIP_HOST_MALLOC_NON_COHERENT)?,
             ]);

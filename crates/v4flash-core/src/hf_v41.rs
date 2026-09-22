@@ -174,11 +174,32 @@ pub fn expert_odirect() -> bool {
 
 /// `V41_EXPERT_MIRROR_FRAC`: share of each split weight read served by the
 /// mirror drive (default 0.6: box 2's SN5000 mirror is faster than its E100).
+/// Runtime-settable (`set_expert_mirror_frac`) so box 2's daemon can A/B it on a
+/// warm pool; the env value is only the seed. The QD1 optimum is
+/// 5.4/(4.5+5.4) = 0.545, but the E100 sheds bandwidth faster under concurrency,
+/// so the best value under load is an open question (2026-09-22).
+static MIRROR_FRAC_MILLI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
 pub fn expert_mirror_frac() -> f32 {
-    static F: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
-        std::env::var("V41_EXPERT_MIRROR_FRAC").ok().and_then(|v| v.parse().ok()).unwrap_or(0.6)
-    });
-    *F
+    use std::sync::atomic::Ordering::Relaxed;
+    let m = MIRROR_FRAC_MILLI.load(Relaxed);
+    if m != u32::MAX {
+        return m as f32 / 1000.0;
+    }
+    let seed = std::env::var("V41_EXPERT_MIRROR_FRAC")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(0.6)
+        .clamp(0.0, 1.0);
+    MIRROR_FRAC_MILLI.store((seed * 1000.0) as u32, Relaxed);
+    seed
+}
+
+pub fn set_expert_mirror_frac(f: f32) {
+    MIRROR_FRAC_MILLI.store(
+        (f.clamp(0.0, 1.0) * 1000.0) as u32,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 pub fn expert_pread_threads() -> usize {
