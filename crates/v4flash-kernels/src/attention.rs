@@ -70,8 +70,28 @@ pub const ATTN_MIXED_MAX_KEYS: u32 = 82176;
 /// Largest `--ctx` V4.1 can serve. The INDEXER scores its whole compressed
 /// store densely to PRODUCE the top-k, and layers 20-39 are ratio 1, so the
 /// widest store is one row per token: this cap is a context limit 1:1.
+///
+/// RAISED 2026-09-22, 307_200 -> 368_640 (360K). A client hit
+/// `context_length_exceeded: prompt length 320795 >= 307200` and could not
+/// recover: auto-compaction sends the WHOLE conversation plus a summarisation
+/// wrapper, so once a transcript passes the window the request that would
+/// shrink it no longer fits. Headroom above the transcript is what breaks that
+/// deadlock. Cost, measured on the live box (1,027 MB dGPU free of 17,095):
+/// ~45 MB -- `attn_scores` and `verify_scores` are each N_HEAD(64) x this x f32,
+/// so +15.7 MB apiece, the per-lane batch scores ~+12 MB, and the indexer-side
+/// buffers +0.3 MB.
+///
+/// NOTE the asymmetry, worth fixing separately: only the INDEXER-side buffers
+/// genuinely scale with context (~1.4 MB total). `attn_scores` is 79 MB because
+/// it is sized by this constant, yet with the indexer on attention only ever
+/// scores `raw_window + INDEXER_TOP_K` = 640 keys -- 0.29 MB. Splitting this
+/// into an indexer ceiling and an attention-scores ceiling would free ~150 MB
+/// and make future `--ctx` raises cost ~1.4 MB instead of ~45. The trap is that
+/// `scored_keys_are_gathered` reads `V41_INDEX_K` at RUNTIME, which is the
+/// env-dependence that caused the truncation bug documented below; any split
+/// must resolve the mode at startup and hard-error if it changes.
 #[cfg(feature = "v41")]
-pub const V41_MAX_CTX: u32 = 307_200;
+pub const V41_MAX_CTX: u32 = 368_640;
 
 /// RAISED 2026-09-18 from `131_072 + SWA_WINDOW`, closing a SILENT TRUNCATION.
 ///
