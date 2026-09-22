@@ -222,6 +222,8 @@ uses it); the hub decides at decode time to send us anything it does not hold.",
     let hits_first = v4flash_kernels::het::remote_experts::install_hits_first_toggle();
     eprintln!("expertd: hits-first batched MoE {} (V41_B2_HITS_FIRST=1 at start; `kill -USR1 {}` flips it at runtime)",
         if hits_first { "ON" } else { "OFF" }, std::process::id());
+    eprintln!("expertd: {} (`kill -USR2 {}` after editing it)",
+        v4flash_kernels::het::remote_experts::install_knobs_toggle(), std::process::id());
     let listener = TcpListener::bind(&args.listen)?;
     let opts = ServeOptions {
         socket: args.socket,

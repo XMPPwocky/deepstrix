@@ -1265,16 +1265,87 @@ static DEMAND_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// fail its own route, or the step can end -- and an unfulfilled promise costs
 /// exactly this much. 0 disables the wait (plain try_recv).
 fn b2_merge_wait_us() -> u64 {
-    static N: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-        std::env::var("V41_B2_MERGE_WAIT_US").ok().and_then(|v| v.parse().ok()).unwrap_or(400)
-    });
-    *N
+    knobs::merge_wait_us()
 }
 
 fn b2_merge() -> bool {
-    static B: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("V41_B2_MERGE").as_deref() != Ok("0"));
-    *B
+    knobs::merge()
+}
+
+/// RUNTIME KNOBS (2026-09-22). A daemon restart costs a 116 GB cold pool and
+/// ~10 minutes of warm-up, so A/B-ing two settings used to mean two restarts and
+/// two confounded warm-ups. These three are read from atomics instead of the
+/// env, seeded from the env at startup, and reloaded from a small key=value file
+/// when the daemon gets SIGUSR2 (the signal only sets a flag; the file is read
+/// by the compute loop, not the handler).
+///
+///     printf 'merge=0\nmiss_par=2\n' > ~/expertd-knobs.txt && kill -USR2 <pid>
+///
+/// `miss_par` can only be LOWERED below the startup `V41_B2_MISS_PAR`, which
+/// sizes the pinned staging sets.
+pub mod knobs {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+    pub static DIRTY: AtomicBool = AtomicBool::new(false);
+    static MERGE: AtomicBool = AtomicBool::new(true);
+    static MERGE_WAIT_US: AtomicU64 = AtomicU64::new(400);
+    static MISS_PAR: AtomicUsize = AtomicUsize::new(1);
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    fn init() {
+        INIT.get_or_init(|| {
+            MERGE.store(std::env::var("V41_B2_MERGE").as_deref() != Ok("0"), Relaxed);
+            MERGE_WAIT_US.store(
+                std::env::var("V41_B2_MERGE_WAIT_US").ok().and_then(|v| v.parse().ok()).unwrap_or(400),
+                Relaxed,
+            );
+            MISS_PAR.store(
+                std::env::var("V41_B2_MISS_PAR").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+                Relaxed,
+            );
+        });
+    }
+    pub fn merge() -> bool { init(); MERGE.load(Relaxed) }
+    pub fn merge_wait_us() -> u64 { init(); MERGE_WAIT_US.load(Relaxed) }
+    pub fn miss_par() -> usize { init(); MISS_PAR.load(Relaxed).clamp(1, 16) }
+    pub fn path() -> String {
+        std::env::var("V41_B2_KNOBS").unwrap_or_else(|_| {
+            format!("{}/expertd-knobs.txt", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+        })
+    }
+    /// Re-read the file; returns a one-line summary for the log.
+    pub fn reload() -> String {
+        init();
+        let p = path();
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            return format!("knobs: {p} unreadable; keeping merge={} wait_us={} miss_par={}", merge(), merge_wait_us(), miss_par());
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            let Some((k, v)) = line.split_once('=') else { continue };
+            match (k.trim(), v.trim()) {
+                ("merge", v) => MERGE.store(v != "0", Relaxed),
+                ("merge_wait_us", v) => { if let Ok(n) = v.parse() { MERGE_WAIT_US.store(n, Relaxed) } }
+                ("miss_par", v) => { if let Ok(n) = v.parse::<usize>() { MISS_PAR.store(n.clamp(1, 16), Relaxed) } }
+                _ => {}
+            }
+        }
+        format!("knobs reloaded from {p}: merge={} wait_us={} miss_par={}", merge(), merge_wait_us(), miss_par())
+    }
+}
+
+extern "C" fn knobs_signal(_sig: i32) {
+    knobs::DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Install the SIGUSR2 handler for [`knobs::reload`] (daemon main).
+pub fn install_knobs_toggle() -> String {
+    extern "C" {
+        fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+    }
+    const SIGUSR2: i32 = 12;
+    let init = format!("knobs: merge={} wait_us={} miss_par={} (SIGUSR2 reloads {})",
+        knobs::merge(), knobs::merge_wait_us(), knobs::miss_par(), knobs::path());
+    unsafe { signal(SIGUSR2, knobs_signal); }
+    init
 }
 
 fn b2_early_page() -> bool {
@@ -2536,7 +2607,12 @@ impl ExpertShard {
         // repack stream.
         let gpu_repack = repack.is_some();
         let (mut read_ns, mut h2d_ns) = (0u64, 0u64);
-        let k = stages.len().max(1);
+        // Runtime-capped (`knobs::miss_par`): the staging sets are sized once at
+        // startup by `V41_B2_MISS_PAR`, but the CONCURRENCY can be lowered live.
+        // The E100 loses ~25% of its aggregate bandwidth past ~8 outstanding reads
+        // and a single miss already issues 3 role reads split across both drives,
+        // so 4 concurrent misses put ~24 on the primary drive (2026-09-22).
+        let k = knobs::miss_par().min(stages.len()).max(1);
         for chunk in pending.chunks(k) {
             let rp0 = v4flash_core::hf_v41::expert_read_profile();
             let t_r = std::time::Instant::now();
@@ -3842,6 +3918,9 @@ pub fn serve_connection(
                 Inbound::Closed(Some(e)) => return Err(eyre!("reader: {e}")),
                 Inbound::Frame { hdr, buf, t_first, t_done, t2 } => (hdr, buf, t_first, t_done, t2),
             };
+            if knobs::DIRTY.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("expertd: {}", knobs::reload());
+            }
             let t_start = Instant::now();
             if let Some(p) = t_prev_ready {
                 w_idle_ns += t_start.saturating_duration_since(p).as_nanos() as u64;
