@@ -1383,6 +1383,10 @@ pub struct ExpertShard {
     /// never a victim while set (the compute loop pins the in-flight request's
     /// picks around a queued request's early paging).
     pub pinned: Vec<(u32, u32)>,
+    /// Cumulative time the compute thread spent BLOCKED in `admit_prefetched`
+    /// waiting for a prefetch read it needs this request (2026-09-22). Also
+    /// added to the layer's `read_ns`, see the note there.
+    pub prefetch_wait_ns: u64,
     /// Persistent staging, one per role, in `hipHostMalloc` memory.
     ///
     /// Two things at once. It is persistent, so the miss path no longer
@@ -2058,6 +2062,7 @@ impl ExpertShard {
             direct,
             pool: None,
             pinned: Vec::new(),
+            prefetch_wait_ns: 0,
         })
     }
 
@@ -2176,11 +2181,25 @@ impl ExpertShard {
         // and the prefetch would land as a duplicate). In flight means a few
         // ms at most.
         let in_flight = |pf: &B2Prefetch| want.iter().any(|&e| pf.pending.contains(&(cur_layer, e)));
+        // TIME the blocking wait (2026-09-22). It happens inside `run_path`, so
+        // it was landing in the request's `t_compute_us` while contributing
+        // nothing to `t_page_us` -- i.e. the hub's `box2.compute_ms` (service
+        // minus page) counted box 2 WAITING FOR ITS DISK as compute. The stats
+        // line already hinted at it: `waited` == `admitted` == `hinted`, so
+        // every prefetched expert was blocked on. Folded into the layer's page
+        // accounting below so "compute" means compute.
+        let mut wait_ns = 0u64;
         loop {
             let must_wait = in_flight(pf);
+            let t_w = must_wait.then(std::time::Instant::now);
             let d = match if must_wait { pf.rx_done.recv().map_err(|_| std::sync::mpsc::TryRecvError::Disconnected) } else { pf.rx_done.try_recv() } {
-                Ok(Ok(d)) => { if must_wait && d.layer == cur_layer && want.contains(&d.e) { pf.waited += 1; } d }
+                Ok(Ok(d)) => {
+                    if let Some(t) = t_w { wait_ns += t.elapsed().as_nanos() as u64; }
+                    if must_wait && d.layer == cur_layer && want.contains(&d.e) { pf.waited += 1; }
+                    d
+                }
                 Ok(Err((set, layer, e, msg))) => {
+                    if let Some(t) = t_w { wait_ns += t.elapsed().as_nanos() as u64; }
                     eprintln!("expertd: prefetch read failed (L{layer} e{e}): {msg}");
                     pf.pending.remove(&(layer, e));
                     pf.free.push(set);
@@ -2244,6 +2263,21 @@ impl ExpertShard {
             pool.dirty[d.layer as usize] = true;
             pf.admitted += 1;
             pf.free.push(d.set);
+        }
+        // Attribute the blocking wait to the LAYER's page accounting, so the
+        // hub's `box2.page_ms` covers it and `box2.compute_ms` (service minus
+        // page) stops counting disk waits as compute. Also tracked separately
+        // in `prefetch_wait_ns` for the stats line.
+        if wait_ns > 0 {
+            self.prefetch_wait_ns += wait_ns;
+            if let Some(pg) = self
+                .layers
+                .get_mut(cur_layer as usize)
+                .and_then(|l| l.as_mut())
+                .and_then(|l| l.page.as_mut())
+            {
+                pg.read_ns += wait_ns;
+            }
         }
         Ok(())
     }
@@ -4267,7 +4301,7 @@ pub fn serve_connection(
                         if miss > 0 {
                             let (pread_ns, rcpu_ns, rgpu_ns) = shard.page_read_split();
                             let per = |ns: u64| ns as f64 / miss as f64 / 1e6;
-                            let pfs = shard.prefetch_stats().map(|(h, a, d, w)| format!(" prefetch hinted={h} admitted={a} dropped={d} waited={w}")).unwrap_or_default();
+                            let pfs = shard.prefetch_stats().map(|(h, a, d, w)| format!(" prefetch hinted={h} admitted={a} dropped={d} waited={w} wait_ms={:.0}", shard.prefetch_wait_ns as f64 / 1e6)).unwrap_or_default();
                             // `pread` here is the PROCESS-WIDE read counter differenced
                             // around demand chunks, so concurrent prefetch reads inflate
                             // it; read `read` (per-miss wall) instead.
