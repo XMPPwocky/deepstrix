@@ -30,6 +30,13 @@
 //!        the per-layer `remap_dev` exclusion mask -- both of which the ordinary
 //!        `alone`/`batch` gates are blind to because they are single-lane.
 //!
+//!   G5d  alone == stag bit-exactly (same KLD bars): the TWO-LANE STAGGERED
+//!        driver (`forward_step_arena_lanes` with 2 lanes), where the lanes are
+//!        offset by half a layer so box 2 always has the other lane's request
+//!        queued. Unlike the lockstep driver, the two lanes here are on
+//!        DIFFERENT layers at once (pager eviction, per-layer remap, shared
+//!        scratch all see that), so it needs its own gate before production.
+//!
 //! Needs the model loaded, i.e. the server DOWN. Run:
 //! ```text
 //! HIP_VISIBLE_DEVICES=0,1 V41_PAGED_EXPERTS=1 V41_INDEX_K=1 V41_CANDIDATE_POOL=1 \
@@ -276,6 +283,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mut arena_alone = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut arena_batch = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut arena_pipe = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
+    let mut arena_stag = KvArena::alloc(dgpu, n_streams as u32, comp_rows_cap)?;
     let mut dev_b = RowTablesDev::alloc(dgpu, n_streams as u32, KV_SOURCE_LAYERS.len())?;
     let mut dev = RowTablesDev::alloc(dgpu, n_streams as u32, KV_SOURCE_LAYERS.len())?;
 
@@ -286,6 +294,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mut slots_alone: Vec<u32> = Vec::new();
     let mut slots_batch: Vec<u32> = Vec::new();
     let mut slots_pipe: Vec<u32> = Vec::new();
+    let mut slots_stag: Vec<u32> = Vec::new();
     for (s, toks) in prompts.iter().enumerate() {
         let mut st = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
         let hcs: Vec<Vec<f32>> = toks.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
@@ -302,6 +311,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         slots_alone.push(arena_alone.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
         slots_batch.push(arena_batch.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
         slots_pipe.push(arena_pipe.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
+        slots_stag.push(arena_stag.admit_from_state(&st, cap, pos, &engine.dgpu.compute)?);
         engine.dgpu.compute.synchronize()?;
         first_tok.push(if s == 0 { forced.as_ref().map(|f| *f.last().unwrap()) } else { None }.unwrap_or(argmax(&logits) as i32));
         prefill_logits.push(logits);
@@ -614,6 +624,46 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     }
     eprintln!("pipelined step wall (S={n_streams}, 2 lanes, incl. head): {:?} ms", step_ms_p.iter().map(|x| (*x * 10.0).round() / 10.0).collect::<Vec<_>>());
 
+    // 4c. Arena, all rows co-batched, TWO-LANE STAGGERED driver
+    // (`forward_step_arena_lanes` with 2 lanes): per layer post(A,L) -> pre(A,L+1)
+    // -> post(B,L) -> pre(B,L+1), so lane A's next box-2 request is out while
+    // box 1 still works on lane B -- the lanes are offset by half a layer instead
+    // of in lockstep. The lanes sit on DIFFERENT layers at the same time here,
+    // which the lockstep driver never does, so this is its own gate (G5d).
+    let mut logits_stag: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_streams];
+    let mut seqs_s: Vec<Vec<i32>> = prompts.clone();
+    let mut step_ms_s = Vec::new();
+    for t in 0..n_steps {
+        let toks: Vec<i32> = (0..n_streams).map(|s| cont[s][t]).collect();
+        let mut rows_b = vec![vec![0f32; n_streams * ein]; ENGRAM_LAYERS.len()];
+        let mut hcs = Vec::with_capacity(n_streams);
+        for s in 0..n_streams {
+            let pos = seqs_s[s].len();
+            seqs_s[s].push(toks[s]);
+            let rows = engram.rows_at(pg.raw(), &seqs_s[s], pos)?;
+            for (li, r) in rows.iter().enumerate() {
+                rows_b[li][s * ein..(s + 1) * ein].copy_from_slice(r);
+            }
+            hcs.push(embed(toks[s])?);
+        }
+        let t0 = std::time::Instant::now();
+        {
+            let mut lanes: [(&mut BatchDgpuScratch, &mut BatchIgpuScratch, &mut RowTablesDev); 2] =
+                [(&mut bd_a, &mut bi_a, &mut dev), (&mut bd_b, &mut bi_b, &mut dev_b)];
+            engine.forward_step_arena_lanes(
+                &mut lanes, &mut sd, &mut si, &mut arena_stag, &slots_stag, &weights,
+                &hcs, &toks, &mut v4flash_kernels::het::forward_prefill::LazyEngramRows::ready(Some(rows_b.clone())), Some(&mut pg),
+            )?;
+        }
+        let mut all = engine.head_rows(&mut ds, &bd_a, b_a, &weights)?;
+        all.extend(engine.head_rows(&mut ds, &bd_b, n_streams - b_a, &weights)?);
+        step_ms_s.push(t0.elapsed().as_secs_f64() * 1e3);
+        for s in 0..n_streams {
+            logits_stag[s].push(all[s * nv..(s + 1) * nv].to_vec());
+        }
+    }
+    eprintln!("staggered step wall (S={n_streams}, 2 lanes, incl. head): {:?} ms", step_ms_s.iter().map(|x| (*x * 10.0).round() / 10.0).collect::<Vec<_>>());
+
     if let Ok(dir) = std::env::var("MS_SAVE_LOGITS") {
         let f32s = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
         for s in 0..n_streams {
@@ -630,10 +680,12 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     // 5. Compare.
     let mut g5a_fail = 0;
     let mut g5c_fail = 0;
+    let mut g5d_fail = 0;
+    let mut kls_stag = Vec::new();
     let mut kls = Vec::new();
     let mut kls_alone = Vec::new();
     let mut kls_pipe = Vec::new();
-    eprintln!(" s  t  lane  |alone-batch|  |alone-pipe|  argmax(dec/alone/batch/pipe)   KL(dec||batch)  KL(dec||pipe)");
+    eprintln!(" s  t  lane  |alone-batch|  |alone-pipe|  argmax(dec/alone/batch/pipe)   KL(dec||batch)  KL(dec||pipe)  |alone-stag|");
     for s in 0..n_streams {
         for t in 0..n_steps {
             let d = max_abs_diff(&logits_alone[s][t], &logits_batch[s][t]);
@@ -650,6 +702,11 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             if dpipe != 0.0 {
                 g5c_fail += 1;
             }
+            let dstag = max_abs_diff(&logits_alone[s][t], &logits_stag[s][t]);
+            if dstag != 0.0 {
+                g5d_fail += 1;
+            }
+            kls_stag.push(kld(&logits_dec[s][t], &logits_stag[s][t]));
             kls.push(kb);
             kls_alone.push(ka);
             kls_pipe.push(kpipe);
@@ -659,7 +716,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             // clobbered across lanes, which is how the 2026-09-22 regression
             // presented (12 of 24 rows = one lane).
             let lane = if s < b_a { "A" } else { "B" };
-            eprintln!("{s:2} {t:2}   {lane}    {d:10.3e}    {dpipe:10.3e}   {ad:6}/{aa:6}/{ab:6}/{:6}     {kb:9.5}      {kpipe:9.5}", argmax(&logits_pipe[s][t]));
+            eprintln!("{s:2} {t:2}   {lane}    {d:10.3e}    {dpipe:10.3e}   {ad:6}/{aa:6}/{ab:6}/{:6}     {kb:9.5}      {kpipe:9.5}    {dstag:10.3e}", argmax(&logits_pipe[s][t]));
         }
     }
     let mean = kls.iter().sum::<f64>() / kls.len() as f64;
@@ -678,6 +735,13 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         g5c_fail,
         kls_pipe.len()
     );
+    let mean_s = kls_stag.iter().sum::<f64>() / kls_stag.len() as f64;
+    let max_s = kls_stag.iter().cloned().fold(0.0, f64::max);
+    eprintln!(
+        "G5d: {} of {} (stream, step) rows differ between alone and STAGGERED (want 0); KL(dec||stag) mean {mean_s:.5} max {max_s:.5}",
+        g5d_fail,
+        kls_stag.len()
+    );
     if g5a_fail > 0 && !allow_inexact {
         return Err(eyre!("G5a failed: {g5a_fail} rows not batch-invariant (MS_ALLOW_INEXACT=1 to report only)"));
     }
@@ -689,6 +753,12 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     }
     if mean_p > kld_mean_bar || max_p > kld_max_bar {
         return Err(eyre!("G5c failed: pipelined KL mean {mean_p:.5} / max {max_p:.5} over bars {kld_mean_bar} / {kld_max_bar}"));
+    }
+    if g5d_fail > 0 && !allow_inexact {
+        return Err(eyre!("G5d failed: {g5d_fail} rows not invariant between alone and the STAGGERED driver (MS_ALLOW_INEXACT=1 to report only)"));
+    }
+    if mean_s > kld_mean_bar || max_s > kld_max_bar {
+        return Err(eyre!("G5d failed: staggered KL mean {mean_s:.5} / max {max_s:.5} over bars {kld_mean_bar} / {kld_max_bar}"));
     }
     Ok(())
 }

@@ -802,6 +802,16 @@ impl Sched {
         // step, and box 2 -- the saturated resource -- ends up busier, not
         // idler. Lanes cost bytes; only worth it when the pole has slack.
         let lanes3 = pipelined && env_usize("V41_MS_LANES", 2) >= 3 && b >= env_usize("V41_MS_LANES3_MIN_ROWS", 6) && b >= 3;
+        // STAGGERED two lanes (`V41_MS_STAGGER=1`, default OFF until A/B'd on real
+        // traffic; gated bit-exact by `multistream_step` G5d). The lockstep driver
+        // above fuses both lanes into ONE box-2 pass per layer, so box 1 and box 2
+        // take turns: the daemon logs `queued 0%` and the step costs box1 + box2
+        // (2026-09-22: box 2 idle ~37%, box 1 in `lh.remote_wait` ~45%). The
+        // N-lane driver at n=2 offsets the lanes by half a layer instead -- lane
+        // A's next request is out while box 1 works on lane B -- with the SAME
+        // row split, so unlike three lanes it costs no extra expert reads; it
+        // gives up the daemon's same-layer merge in exchange for overlap.
+        let stagger2 = pipelined && !lanes3 && std::env::var("V41_MS_STAGGER").as_deref() == Ok("1");
         let mut fwd_only_ms = 0.0f64;
         let n_tables = engram.as_ref().map(|ec| ec.tables.len()).unwrap_or(0);
         let logits = std::thread::scope(|sc| {
@@ -828,6 +838,18 @@ impl Sched {
                 off += sz;
             }
             debug_assert_eq!(off, b);
+            l
+        } else if stagger2 {
+            {
+                let mut lanes: [(&mut v4flash_kernels::het::batch_scratch::BatchDgpuScratch, &mut v4flash_kernels::het::batch_scratch::BatchIgpuScratch, &mut RowTablesDev); 2] =
+                    [(&mut *bd_a, &mut *bi_a, &mut self.dev), (&mut *bd_b, &mut *bi_b, &mut self.dev_b)];
+                engine.forward_step_arena_lanes(&mut lanes, sd, si, &mut self.arena, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
+            }
+            fwd_only_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
+            // Same split as the lanes driver: the first lane takes the odd row.
+            let b_a = b.div_ceil(2);
+            let mut l = engine.head_rows(dgpu_scratch, bd_a, b_a, weights)?;
+            l.extend(engine.head_rows(dgpu_scratch, bd_b, b - b_a, weights)?);
             l
         } else if pipelined {
             engine.forward_step_arena_pipelined(bd_a, bi_a, bd_b, bi_b, sd, si, &mut self.arena, &mut self.dev, &mut self.dev_b, &slots, weights, &hcs, &toks, &mut engram_rows, pager.as_mut())?;
