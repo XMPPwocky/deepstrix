@@ -6704,9 +6704,21 @@ impl HeterogeneousEngine {
                             Some(&owns_eff[..]),
                         )?;
                 }
+                // ONE stream-ordered remap upload for the whole ensure+exclusion
+                // block -- AFTER the exclusion, which is the last mutator here --
+                // on the stream the MoE dispatch below runs on. Replaces up to
+                // three blocking null-stream `hipMemcpy`s costing 53-55 ms/step
+                // between them (`lh.remap_h2d`, audit 2026-09-22 A1): every stream
+                // is created blocking, so a 1536-byte copy waited for BOTH GPUs.
+                {
+                    let _t_remap = LayerHostTimer::start(&LH_REMAP_H2D);
+                    pg.sync_remap_async(layer as i32, &self.igpu.compute)?;
+                }
             } else {
                 if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[pager-stage] L{layer} b={b} -> ensure_layer_dense (union off)"); }
                 pg.ensure_layer_dense(layer as i32)?;
+                // Non-union branch: same one stream-ordered upload.
+                pg.sync_remap_async(layer as i32, &self.igpu.compute)?;
             }
         }
 

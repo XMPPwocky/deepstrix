@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::{gguf::GgufType, V41HfWeights, WeightSrc};
-use v4flash_hip::{Device, DeviceBuffer, Stream};
+use v4flash_hip::{Device, DeviceBuffer, PinnedBuffer, Stream};
 
 use crate::config::{N_EMBD, N_EXPERT, N_FF_EXP};
 use crate::model_weights::RoutedExpertWeights;
@@ -95,6 +95,24 @@ pub struct ExpertPager {
     /// stale one. Box 2 already does exactly this (`LayerShard::remap_dev` +
     /// `pool.dirty[layer]`). 40 x 384 x 4 B = 61 KB.
     remap_dev: Vec<DeviceBuffer<i32>>,
+    /// The remap upload is DEFERRED: mutators set this, and `sync_remap_async`
+    /// does one stream-ordered async copy before the dispatch reads the buffer.
+    ///
+    /// It used to be a blocking `hipMemcpy` per mutation (up to three per
+    /// lane-layer). MEASURED 2026-09-22: `lh.remap_h2d` = 53-55 ms/step, 17% of
+    /// a 318 ms step, to move 123 KB -- because `Stream::new` uses
+    /// `hipStreamCreate` (flags 0 = BLOCKING), so a null-stream memcpy waits for
+    /// every queued op on BOTH GPUs. Async on the iGPU compute stream orders it
+    /// exactly where it is needed (after the previous dispatch that read the old
+    /// contents, before the one that reads the new) and returns to the host at once.
+    remap_dirty: Option<i32>,
+    /// Pinned staging ring for those copies: the host must not rewrite a buffer
+    /// while its DMA is pending, and both lanes write the same layer's remap
+    /// within a step. 8 x 1536 B. (The iGPU compute stream is fully drained once
+    /// per lane-layer by the work-item count readback, so at most a couple are
+    /// ever in flight; 8 is margin.)
+    remap_stage: Vec<PinnedBuffer<i32>>,
+    remap_stage_next: usize,
     /// Layer whose remap `self.remap` currently describes — the one the next
     /// upload targets. Set by every `ensure*`.
     cur_layer: i32,
@@ -1275,6 +1293,15 @@ impl ExpertPager {
             },
             remap: (0..N_EXPERT as i32).map(|e| -e - 1).collect(),
             remap_dev,
+            remap_dirty: None,
+            remap_stage: {
+                let mut v = Vec::with_capacity(8);
+                for _ in 0..8 {
+                    v.push(PinnedBuffer::<i32>::new(N_EXPERT as usize)?);
+                }
+                v
+            },
+            remap_stage_next: 0,
             cur_layer: 0,
             count_as_prefill: false,
             scan_window: None,
@@ -1321,10 +1348,50 @@ impl ExpertPager {
     /// Upload `remap` into the CURRENT layer's device buffer. Every `ensure*`
     /// sets `cur_layer` first, so this always targets the layer the host just
     /// described — never a layer whose MoE may still be queued.
+    /// Mark the current layer's remap as needing an upload. The copy itself is
+    /// deferred to `sync_remap_async` (see the `remap_dirty` note).
     fn upload_remap(&mut self) -> eyre::Result<()> {
-        let l = self.cur_layer.clamp(0, crate::config::N_LAYER - 1) as usize;
+        self.remap_dirty = Some(self.cur_layer.clamp(0, crate::config::N_LAYER - 1));
+        Ok(())
+    }
+
+    /// Queue the pending remap upload on `stream`, which MUST be the stream the
+    /// MoE dispatch that reads `remap_dev(layer)` runs on. Idempotent and cheap
+    /// when nothing is dirty. Callers: every site that is about to hand
+    /// `remap_dev(layer)` to a launch.
+    pub fn sync_remap_async(&mut self, layer: i32, stream: &Stream) -> eyre::Result<()> {
+        let Some(dirty) = self.remap_dirty else { return Ok(()) };
         self.device.set_current()?;
+        if dirty != layer {
+            // `self.remap` describes `dirty`, not `layer`. Cannot happen on the
+            // paths we know (ensure sets cur_layer first), so take the safe road
+            // rather than uploading the wrong layer's table: blocking copy to
+            // where it belongs, and leave `layer` alone.
+            let d = dirty.clamp(0, crate::config::N_LAYER - 1) as usize;
+            self.remap_dev[d].copy_from_host(&self.remap)?;
+            self.remap_dirty = None;
+            return Ok(());
+        }
+        let l = layer.clamp(0, crate::config::N_LAYER - 1) as usize;
+        let i = self.remap_stage_next % self.remap_stage.len().max(1);
+        self.remap_stage_next = self.remap_stage_next.wrapping_add(1);
+        if let Some(st) = self.remap_stage.get_mut(i) {
+            st.as_mut_slice().copy_from_slice(&self.remap);
+            self.remap_dev[l].copy_from_host_async(st.as_slice(), stream)?;
+        } else {
+            self.remap_dev[l].copy_from_host(&self.remap)?;
+        }
+        self.remap_dirty = None;
+        Ok(())
+    }
+
+    /// Blocking flush, for callers with no stream at hand (teardown, tests).
+    pub fn sync_remap_blocking(&mut self) -> eyre::Result<()> {
+        let Some(dirty) = self.remap_dirty else { return Ok(()) };
+        self.device.set_current()?;
+        let l = dirty.clamp(0, crate::config::N_LAYER - 1) as usize;
         self.remap_dev[l].copy_from_host(&self.remap)?;
+        self.remap_dirty = None;
         Ok(())
     }
 

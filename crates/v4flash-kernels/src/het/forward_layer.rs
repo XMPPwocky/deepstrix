@@ -2774,6 +2774,9 @@ impl HeterogeneousEngine {
                 pg.mark_remote_after_ensure(|e| o[e as usize])?;
             }
             verify_routing_exactly_once(layer, &sel_host, pg.remap(), owns_remote.as_deref())?;
+            // Stream-ordered remap upload for the single-row path, on the stream
+            // its dispatch runs on (see ExpertPager::remap_dirty).
+            pg.sync_remap_async(layer, &self.igpu.compute)?;
             super::trace::phase::add(
                 &super::trace::phase::ENSURE_NS,
                 t_ens.elapsed().as_nanos() as u64,

@@ -895,8 +895,22 @@ impl ClockSync {
     }
 
     pub fn push(&mut self, s: ClockSample) {
+        // BATCH the eviction. This was `samples.remove(0)` on a 200,000-entry
+        // Vec of 40-byte samples -- an 8 MB memmove per call, and `push` is on
+        // `RemoteExpertClient::wait`, the hub's blocking per-layer call: 80 per
+        // decode step. Steady state arrives after 200_000/80 = 2,500 steps and
+        // then costs ~640 MB of memmove per step, permanently, on the thread
+        // that serialises the whole step -- i.e. "the box gets slower the longer
+        // a session runs" (audit 2026-09-22 A5).
+        //
+        // Dropping a quarter at a time makes it amortised O(1): one memmove per
+        // 50,000 pushes, ~625 steps. A VecDeque would be O(1) outright but
+        // `samples()` hands out a contiguous `&[ClockSample]` that callers index
+        // (deepstrix-expertd/src/bin/bench.rs, the loopback test), and
+        // `make_contiguous` needs `&mut`.
         if self.capacity > 0 && self.samples.len() >= self.capacity {
-            self.samples.remove(0);
+            let drop_n = (self.capacity / 4).max(1);
+            self.samples.drain(..drop_n.min(self.samples.len()));
         }
         self.samples.push(s);
     }
