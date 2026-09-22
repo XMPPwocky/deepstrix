@@ -36,6 +36,9 @@
 #define MHC_HC_MIX_DIM  24
 #define MHC_N_HC        4
 #define MHC_BLOCK       512
+#if (MHC_HC_DIM % MHC_BLOCK) || (MHC_N_EMBD % MHC_BLOCK)
+#error "MHC_BLOCK must divide both MHC_HC_DIM and MHC_N_EMBD; the strided loops truncate otherwise"
+#endif
 #define MHC_WAVES       16
 #define MHC_LANES       32
 
@@ -72,7 +75,14 @@ extern "C" __global__ void mhc_pre_fused(
     // Per thread: 32 elements (HC_DIM / BLOCK = 32).
     float partial_sq = 0.0f;
     #pragma unroll
-    for (unsigned int i = 0; i < 32; i++) {
+    // TRIP COUNT MUST BE DERIVED. It was the literal 32 = 16384/512, i.e. V4-Flash's
+    // MHC_HC_DIM -- but build.rs passes -DMHC_HC_DIM=20480 for v41, where the right
+    // count is 40. With the literal, the RMS reduced 16384 of 20480 elements and the
+    // three N_EMBD loops below wrote 4096 of 5120 dims, leaving 1024 dims untouched:
+    // SILENTLY WRONG NUMERICS, not a slow kernel, for anyone who flips MHC_FUSED=1
+    // to A/B it (2026-09-22 audit). The kernel is off by default and kept as a
+    // documented negative result; that is exactly why the trap was invisible.
+    for (unsigned int i = 0; i < MHC_HC_DIM / MHC_BLOCK; i++) {
         const float v = residual[tid + i * MHC_BLOCK];
         partial_sq += v * v;
     }
@@ -215,7 +225,7 @@ extern "C" __global__ void mhc_pre_fused(
     const float w2 = s_split[2];
     const float w3 = s_split[3];
     #pragma unroll
-    for (unsigned int i = 0; i < 8; i++) {
+    for (unsigned int i = 0; i < MHC_N_EMBD / MHC_BLOCK; i++) {   // was the literal 8 = 4096/512
         const unsigned int d = tid + i * MHC_BLOCK;
         if (d < MHC_N_EMBD) {
             float acc = 0.0f;
@@ -231,7 +241,7 @@ extern "C" __global__ void mhc_pre_fused(
     // ===== Step 5: rms_w over post (N_EMBD=4096), multiply by norm_w, write to out =====
     float pa = 0.0f;
     #pragma unroll
-    for (unsigned int i = 0; i < 8; i++) {
+    for (unsigned int i = 0; i < MHC_N_EMBD / MHC_BLOCK; i++) {   // was the literal 8 = 4096/512
         const unsigned int d = tid + i * MHC_BLOCK;
         if (d < MHC_N_EMBD) {
             const float v = s_post[d];
@@ -253,7 +263,7 @@ extern "C" __global__ void mhc_pre_fused(
     const float inv_rms_b = s_scalar[0];
 
     #pragma unroll
-    for (unsigned int i = 0; i < 8; i++) {
+    for (unsigned int i = 0; i < MHC_N_EMBD / MHC_BLOCK; i++) {   // was the literal 8 = 4096/512
         const unsigned int d = tid + i * MHC_BLOCK;
         if (d < MHC_N_EMBD) {
             out[d] = s_post[d] * inv_rms_b * norm_w[d];

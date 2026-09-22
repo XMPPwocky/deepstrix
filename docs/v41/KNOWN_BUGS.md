@@ -425,7 +425,29 @@ client's retries gave up. `#[serde(alias = "developer")]` on the existing varian
 
 ## Open, found 2026-09-18
 
-### 17. OPEN — ARCH_SPEC 1.5 candidate pool is NOT wired (fidelity)
+### 17. WIRED AND ON IN PRODUCTION, STILL UNVALIDATED ABOVE 16384 (fidelity)
+
+**CORRECTED 2026-09-22.** The text below ("are NOT wired") was stale and had been
+for a while. The kernels ARE wired — `forward_layer.rs:1649` (decode) and
+`forward_prefill.rs:4916` (prefill), scratch at `batch_scratch.rs:1440/1449` —
+and **`V41_CANDIDATE_POOL=1` is in every live launch line** (`run_v41_server.sh`
+callers, `audit_ab.sh`, `link_ab.sh`, `rocprof_window.sh`). So production runs it.
+
+What has NOT changed is the validation gap, and `candidate_pool_enabled()`'s own
+doc states it plainly: the feature *"CHANGES long-context output by construction
+… it cannot be gated on bit-identity above 16384 compressed positions. Below that
+the mask keeps every block and is a provable no-op."* Nobody has run a fidelity
+check above that threshold.
+
+That combination — on in production, no-op on short context, output-changing and
+unvalidated on long context — is the leading suspect whenever a long-running
+agent appears to lose information from early in its context. Probe without a
+restart: `python3 ~/scratch-ms/needle.py 8000 96000` (needle-in-haystack recall
+at five depths per length, questions share the haystack prefix so the snapshot
+cache serves all but the first). The confirmation, which costs one restart, is
+the same probe with `V41_CANDIDATE_POOL=0`.
+
+Original entry, kept for the wiring history:
 `CANDIDATE_SOURCE_LAYER/TOPK_BLOCKS/BLOCK_SIZE` sat in config.rs referenced by
 nothing. The reference masks index sources 24/28/32/36 to the 2048x8 = 16384
 candidate positions layer 20 publishes (`index_score.masked_fill(~candidates,

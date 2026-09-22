@@ -1511,6 +1511,18 @@ impl HeterogeneousEngine {
         let dgpu_timings = self.dgpu.events.harvest()?;
         let igpu_timings = self.igpu.events.harvest()?;
 
+        // INFLATED, TWICE OVER (2026-09-22 audit B10) -- these are not "busy":
+        //  (1) they sum the `.wait` scopes, which are pure STALLS. In decode
+        //      `dgpu.ffn_combine.wait` (forward_layer.rs, right before
+        //      `wait_event(&sev.moe_arrived)`) covers the whole MoE + box-2 leg.
+        //      `trace.rs`'s own note states the convention: "the `.wait` stages
+        //      and the wall DO NOT [survive]. Read the busy times, not the wait."
+        //  (2) with `set_kernel_stages(true)` they sum parent stages AND their
+        //      nested `k.*` children.
+        // The multistream rollup already fixed exactly this (f25b715: "Parent
+        // stages only"; it filters `dgpu.` / `igpu.` prefixes); this twin was
+        // missed. Any "the dGPU is N% busy" figure taken from `het.token.summary`
+        // is therefore too high. Fix by filtering the same way here.
         let dgpu_busy_us: u64 = (dgpu_timings.iter().map(|t| t.ms as f64).sum::<f64>() * 1000.0) as u64;
         let igpu_busy_us: u64 = (igpu_timings.iter().map(|t| t.ms as f64).sum::<f64>() * 1000.0) as u64;
 

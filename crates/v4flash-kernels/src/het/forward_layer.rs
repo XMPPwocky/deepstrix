@@ -127,8 +127,19 @@ fn local_claim_max() -> Option<usize> {
     *N
 }
 
-/// `V41_CANDIDATE_POOL=1`: ARCH_SPEC §1.5's hierarchical candidate pool. Default
-/// OFF until it is validated — it CHANGES long-context output by construction
+/// `V41_CANDIDATE_POOL=1`: ARCH_SPEC §1.5's hierarchical candidate pool.
+///
+/// **THE DEFAULT IS OFF AND PRODUCTION SETS IT TO 1** (every launch line:
+/// `run_v41_server.sh` callers, `audit_ab.sh`, `link_ab.sh`, `rocprof_window.sh`).
+/// So the "until it is validated" below is not a hypothetical — we are running
+/// the unvalidated configuration, and have been. `docs/v41/KNOWN_BUGS.md` #17
+/// claimed until 2026-09-22 that these kernels were not even wired; they are,
+/// here and at `forward_prefill.rs:4916`.
+///
+/// Symptom to watch for: a long-running agent losing information from early in
+/// its context. Probe it without a restart with `~/scratch-ms/needle.py`.
+///
+/// Default OFF until it is validated — it CHANGES long-context output by construction
 /// (that is the point: it makes 24/28/32/36 select from the same positions the
 /// reference does), so it cannot be gated on bit-identity above 16384 compressed
 /// positions. Below that the mask keeps every block and is a provable no-op.

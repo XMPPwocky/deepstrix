@@ -1177,7 +1177,17 @@ pub fn save(
     }
     let comp_kv_bytes = comp_kv_blob.finish()?;
     let comp_state_bytes = comp_state_blob.finish()?;
-    let _ = index_comp_kv_blob.finish()?;
+    // `index_k.bin` was NEVER finish()ed and neither it nor `index_comp_kv.bin`
+    // fed `total_bytes` (2026-09-22 audit A7). Consequences, measured on the live
+    // cache (416 entries): the index believed it held 99.92 GiB against a 100 GiB
+    // cap while `du` said 107.57 -- `index_k.bin` alone was 7.64 GiB -- so the LRU
+    // under-evicted and the gap grew with every save. And an unfinished BlobWriter
+    // flushes in Drop, which SWALLOWS io errors: an ENOSPC left a short
+    // `index_k.bin`, which `load` silently degrades to `n_index_comp = 0`, i.e.
+    // the dense-attention regression the v5->v6 note at the top of this file
+    // measured. Bind both, and count both.
+    let index_comp_kv_bytes = index_comp_kv_blob.finish()?;
+    let index_k_bytes = index_k_blob.finish()?;
     let _ = index_comp_state_blob.finish()?;
     drop(scratch);
 
@@ -1199,6 +1209,8 @@ pub fn save(
     let mut total_bytes: u64 = tokens_bytes.len() as u64 + kv_bytes;
     total_bytes += comp_kv_bytes;
     total_bytes += comp_state_bytes;
+    total_bytes += index_comp_kv_bytes;
+    total_bytes += index_k_bytes;
     let meta_initial = serde_json::to_vec_pretty(&meta).map_err(|e| eyre!("meta encode: {e}"))?;
     total_bytes += meta_initial.len() as u64;
     meta.disk_bytes = total_bytes;

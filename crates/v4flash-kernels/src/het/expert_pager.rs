@@ -118,6 +118,17 @@ pub struct ExpertPager {
     cur_layer: i32,
     /// Attribute `ensure`'s counters to PREFILL rather than decode.
     ///
+    /// *** ON EVERY ARENA DECODE STEP, TOO (2026-09-22 audit A3). *** The
+    /// multistream driver sets it around its `ensure` (`forward_prefill.rs`,
+    /// "Real prefill: count it as prefill") guarded by `!speculative_append()`,
+    /// and `speculative_append()` is only ever true inside DSpark verify, which
+    /// is off (`V41_DSPARK=0`). So every decode miss is booked as prefill, which
+    /// makes `decode_hit` structurally 1.0000 and `decode_misses` structurally 0
+    /// in `het.token.summary` / the request summary. Those two fields are not
+    /// measuring anything; read `prefill_misses` or the `ms.stage` rollup instead.
+    ///
+    /// Gating it on row layout rather than on the verify marker is the fix.
+    ///
     /// Under `V41_PREFILL_UNIFIED_POOL` prefill runs through `ensure`, which
     /// counted everything as decode — so `prefill_misses` read 0 while the
     /// prefill's paging hid inside `decode_misses`, making the window path and

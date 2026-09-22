@@ -1772,6 +1772,11 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                         },
                         decode_requests = d.decode_requests,
                         decode_misses = d.decode_misses,
+                        // STRUCTURALLY 1.0000 on the multistream path, and
+                        // decode_misses structurally 0: `count_as_prefill` is set
+                        // around every arena `ensure`, so decode misses are booked
+                        // as prefill (see its doc in expert_pager.rs, audit A3).
+                        // Do not read these two as a residency signal.
                         decode_hit = rate(d.decode_misses, d.decode_requests),
                         decode_read_ms = d.decode_read_ns / 1_000_000,
                         decode_h2d_ms = d.decode_h2d_ns / 1_000_000,

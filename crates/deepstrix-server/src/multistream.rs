@@ -908,6 +908,14 @@ impl Sched {
                         e.0 += v; e.1 += 1;
                     }
                 }
+                // CONTAMINATED BY PREFILL (2026-09-22 audit A2). These delta a
+                // LIFETIME counter across consecutive DECODE steps, but the counter
+                // is also advanced by prefill chunks (`count_as_prefill`), and a
+                // prefill burst runs up to 120 s between two decode steps. So the
+                // first decode step after a burst is charged with the whole burst:
+                // one observed rollup read 381 misses and 1.66 s of read inside a
+                // 295 ms forward. Snapshot at the top and bottom of THIS step to
+                // fix. Until then, treat a large value as "a prefill happened".
                 let c = pg.counters();
                 let (dm, dr) = (c.prefill_misses.saturating_sub(acc.last_misses), c.prefill_read_ns.saturating_sub(acc.last_read_ns));
                 acc.last_misses = c.prefill_misses;
