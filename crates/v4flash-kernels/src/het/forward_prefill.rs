@@ -6254,11 +6254,26 @@ impl HeterogeneousEngine {
                   // without a remote (it did NOT after f1fbe3f: the whole tail of this block,
                   // ensure included, sat inside the remote branch; KNOWN_BUGS #20/#21).
                 if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} D at ensure site"); }
-                if std::env::var("V41_PAGER_SYNC_IGPU").as_deref() != Ok("0") {
-                    // RACE GUARD (see the comment at the top of this block): the
-                    // pager is about to write `remap_dev` / pool slots the OTHER
-                    // lane's MoE may still be reading. Timed on its own: a
-                    // cross-lane drain, moved here from before the router readback.
+                // RACE GUARD (see the note at the top of this block), now paid
+                // ONLY when this `ensure` can actually write (2026-09-22).
+                //
+                // The two hazards were (a) `remap_dev` being one shared 384-entry
+                // buffer and (b) evicting a slot whose bytes the OTHER lane's
+                // in-flight MoE is reading. (a) IS GONE: `ExpertPager::remap_dev`
+                // is `Vec<DeviceBuffer<i32>>`, one per layer (its own doc-comment:
+                // "Per LAYER rather than a ring because each layer's MoE is
+                // captured as its own HIP graph"), and the two lanes are never on
+                // the same layer inside one step. (b) needs an EVICTION, which
+                // only happens when some id is not already resident.
+                //
+                // At 8 rows `pager.misses_per_step` is 0.25-0.95 for the whole
+                // step -- i.e. ~99% of the 80 lane-layers page nothing, and each
+                // was paying a full cross-lane iGPU drain (31-59 ms/step) for a
+                // write that never came. The dense/union paths always rewrite the
+                // window, so they keep the drain unconditionally.
+                let ensure_may_evict = !replay_offload
+                    && (!sparse_resid || ids.iter().any(|&e| !pg.is_resident(layer as i32, e)));
+                if ensure_may_evict && std::env::var("V41_PAGER_SYNC_IGPU").as_deref() != Ok("0") {
                     let _t_isync = LayerHostTimer::start(&LH_PAGER_SYNC_IGPU);
                     self.igpu.compute.synchronize()?;
                 }
