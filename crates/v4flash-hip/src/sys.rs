@@ -271,6 +271,8 @@ unsafe extern "C" {
     ) -> hipError_t;
     pub fn hipStreamDestroy(stream: hipStream_t) -> hipError_t;
     pub fn hipStreamSynchronize(stream: hipStream_t) -> hipError_t;
+    /// hipSuccess when the stream has no outstanding work, hipErrorNotReady (600) otherwise.
+    pub fn hipStreamQuery(stream: hipStream_t) -> hipError_t;
     pub fn hipStreamWaitEvent(
         stream: hipStream_t,
         event: hipEvent_t,

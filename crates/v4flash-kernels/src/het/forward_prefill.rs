@@ -6067,6 +6067,11 @@ impl HeterogeneousEngine {
                 // whole chain may sit behind ours on `de.compute` by now.
                 sev.selected_ready.synchronize()?;
                 drop(_t_sync);
+                // `selected_ready` is already satisfied above, so our own
+                // dependency is met: anything this blocking copy still waits for
+                // is OTHER queued work (the copy is on the null stream, which
+                // implicitly syncs with every blocking stream). Probe says which.
+                probe_stream_busy(&self.dgpu.compute, &LH_SEL_D2H_BUSY, &LH_SEL_D2H_IDLE);
                 let _t_d2h = LayerHostTimer::start(&LH_SEL_D2H);
                 bd.d_selected
                     .slice_view(0, n_sel)
@@ -7383,6 +7388,7 @@ impl HeterogeneousEngine {
             // Host readback of the work-item COUNT to size the kwide launch: a
             // full iGPU drain per lane-layer that also waits for the OTHER lane's
             // MoE queued ahead of it (profile audit 2026-09-21; untimed until now).
+            probe_stream_busy(&ie.compute, &LH_WIC_BUSY, &LH_WIC_IDLE);
             let _t_wic = LayerHostTimer::start(&LH_WORK_ITEMS_COUNT);
             ie.compute.synchronize()?;
             let mut n_wi_host = [0i32; 1];
@@ -8096,6 +8102,23 @@ pub static LH_ENGRAM_JOIN: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 pub static LH_WORK_ITEMS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_SEL_D2H: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_REMOTE_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// EXPOSED-WAIT PROBE (2026-09-22). `lh.work_items_count` (90.7 ms/step) and
+/// `lh.sel_d2h` (39.4) are blocking readbacks, and a blocking readback costs one
+/// of two things that need OPPOSITE fixes: real device work we depend on
+/// (exposed compute -- overlap it) or nothing at all (host overhead -- delete
+/// it). A stage timer cannot tell them apart; `Stream::query` immediately before
+/// the block can. Evidence for "exposed compute" already: `lh.sel_d2h` is 39.4
+/// ms/step at 6-7 rows but 4.7 at 1-3, and fixed overhead does not scale with
+/// batch size.
+///
+/// Counted, not timed: each pair is incremented by 1000 per probe so that
+/// `take_layer_host_timing`'s us->ms divide leaves a plain PER-STEP COUNT in the
+/// `ms.stage` rollup (same trick as `box2.misses_x1e6`). busy + idle == the
+/// number of lane-layers that reached the block.
+pub static LH_WIC_BUSY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_WIC_IDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_SEL_D2H_BUSY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LH_SEL_D2H_IDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Programmatic switch (the multistream profile turns it on): OR-ed with the env.
 pub static LH_FORCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -8127,8 +8150,31 @@ pub fn take_layer_host_timing() -> Vec<(&'static str, u64)> {
         ("lh.engram_join", LH_ENGRAM_JOIN.swap(0, Relaxed)),
         ("lh.work_items_count", LH_WORK_ITEMS_COUNT.swap(0, Relaxed)),
         ("lh.sel_d2h", LH_SEL_D2H.swap(0, Relaxed)),
+        ("lh.wic_busy_x1e3", LH_WIC_BUSY.swap(0, Relaxed)),
+        ("lh.wic_idle_x1e3", LH_WIC_IDLE.swap(0, Relaxed)),
+        ("lh.seld2h_busy_x1e3", LH_SEL_D2H_BUSY.swap(0, Relaxed)),
+        ("lh.seld2h_idle_x1e3", LH_SEL_D2H_IDLE.swap(0, Relaxed)),
         ("lh.remote_sync", LH_REMOTE_SYNC.swap(0, Relaxed)),
     ]
+}
+
+/// Record whether `stream` still had outstanding work at this instant, into a
+/// (busy, idle) counter pair. Call it IMMEDIATELY before a blocking readback:
+/// busy means that block is exposed device compute, idle means it is host
+/// overhead. One `hipStreamQuery`, and only when layer-host timing is on.
+#[inline]
+pub fn probe_stream_busy(
+    stream: &v4flash_hip::Stream,
+    busy: &'static std::sync::atomic::AtomicU64,
+    idle: &'static std::sync::atomic::AtomicU64,
+) {
+    if !layer_host_timing() {
+        return;
+    }
+    // A query error is not worth failing the step over; count it as busy so the
+    // probe can never make a wait look cheaper than it is.
+    let c = if matches!(stream.query(), Ok(true)) { idle } else { busy };
+    c.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub struct LayerHostTimer {

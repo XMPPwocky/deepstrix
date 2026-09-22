@@ -18,6 +18,20 @@ pub enum ApiError {
     ContextExhausted(String),
     /// Engine queue is full. Maps to HTTP 503 with a Retry-After hint.
     Busy(String),
+    /// An axum EXTRACTOR rejection, re-wrapped so it carries an [`ErrorDetail`].
+    ///
+    /// A rejection short-circuits before the handler runs, so it never passed
+    /// through `ApiError` and `log_error_responses` logged a bare `status=400`
+    /// with no code and no reason -- indistinguishable in the log from the
+    /// `context_length_exceeded` 400 the handler raises, which sent us hunting
+    /// the wrong bug (2026-09-22). `status` is the rejection's OWN status, so
+    /// wire behaviour is unchanged: 400 for a malformed body, 422 for a shape
+    /// mismatch, 413 over the size limit, 415 for a missing content type.
+    Rejection {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
 }
 
 impl ApiError {
@@ -27,7 +41,22 @@ impl ApiError {
             ApiError::ContextExhausted(_) => StatusCode::BAD_REQUEST,
             ApiError::EngineFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::Rejection { status, .. } => *status,
         }
+    }
+
+    /// Wrap an extractor rejection WITHOUT changing the status it would have
+    /// produced on its own; the point is only to make the reason visible.
+    pub fn from_json_rejection(e: axum::extract::rejection::JsonRejection) -> Self {
+        use axum::extract::rejection::JsonRejection as J;
+        let code = match &e {
+            J::JsonDataError(_) => "json_data_error",
+            J::JsonSyntaxError(_) => "json_syntax_error",
+            J::MissingJsonContentType(_) => "missing_json_content_type",
+            J::BytesRejection(_) => "bytes_rejection",
+            _ => "invalid_request_body",
+        };
+        ApiError::Rejection { status: e.status(), code, message: e.body_text() }
     }
 
     fn body(&self) -> ApiErrorBody {
@@ -58,6 +87,13 @@ impl ApiError {
                     message: msg.clone(),
                     kind: "server_error",
                     code: "engine_busy",
+                },
+            },
+            ApiError::Rejection { code, message, .. } => ApiErrorBody {
+                error: ApiErrorDetail {
+                    message: message.clone(),
+                    kind: "invalid_request_error",
+                    code,
                 },
             },
         }

@@ -52,6 +52,26 @@ impl Stream {
         )
     }
 
+    /// Non-blocking: `Ok(true)` when every operation queued on this stream has
+    /// completed, `Ok(false)` while any is still pending (hipErrorNotReady).
+    ///
+    /// EXPOSED WAIT vs HOST OVERHEAD. A blocking readback costs one of two very
+    /// different things, and they need opposite fixes: either it waits on real
+    /// device work we depend on (exposed compute — the fix is to OVERLAP it), or
+    /// it waits on nothing (pure host overhead — the fix is to DELETE it). The
+    /// stage timer alone cannot tell them apart. Calling this immediately before
+    /// the blocking call does: busy = exposed compute, idle = overhead.
+    pub fn query(&self) -> eyre::Result<bool> {
+        let r = unsafe { sys::hipStreamQuery(self.raw) };
+        if r == sys::HIP_SUCCESS {
+            return Ok(true);
+        }
+        if r == 600 {
+            return Ok(false);
+        }
+        check_eyre(r, "hipStreamQuery").map(|_| true)
+    }
+
     pub fn wait_event(&self, event: &Event) -> eyre::Result<()> {
         check_eyre(
             unsafe { sys::hipStreamWaitEvent(self.raw, event.raw(), 0) },

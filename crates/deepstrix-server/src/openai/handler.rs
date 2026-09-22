@@ -121,8 +121,13 @@ const DEFAULT_MAX_NEW: usize = 16384;
 
 pub async fn chat_completions(
     State(engine): State<EngineHandle>,
-    Json(req): Json<ChatCompletionRequest>,
+    // `Result<_, JsonRejection>` rather than `Json<_>`: a bare extractor
+    // rejection short-circuits before this body runs and logs as a reasonless
+    // `status=400`, which reads exactly like the `context_length_exceeded` 400
+    // raised below. Taking the rejection lets `ApiError` attach the real cause.
+    payload: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ApiError> {
+    let Json(req) = payload.map_err(ApiError::from_json_rejection)?;
     // What the CLIENT actually asked for. Without this an empty-content report
     // cannot be told apart from a too-small budget: "Empty LLM response" is the
     // documented symptom of `max_tokens` leaving no room after `<think>` (see
