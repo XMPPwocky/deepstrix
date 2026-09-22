@@ -12,7 +12,7 @@
 //! then a synchronous page-in of the ≤ TOPK missing experts. Phase 2 (LRU
 //! residency across both boxes, overlap, prefetch) is docs/v41/M7_EXPERT_TIER.md.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use color_eyre::eyre::{self, eyre};
 use v4flash_core::{gguf::GgufType, V41HfWeights, WeightSrc};
@@ -44,8 +44,18 @@ pub struct ExpertPager {
     slot_of: HashMap<(i32, u32), u32>,
     /// slot -> the key it currently holds (None = free).
     slot_key: Vec<Option<(i32, u32)>>,
-    /// Eviction order, front = least-recently-used slot.
-    lru: VecDeque<u32>,
+    /// Eviction order as a TICK STAMP per slot, not an ordered list. Was a
+    /// `VecDeque<u32>` walked front-to-back, which made every resident HIT
+    /// O(pool): `touch` did `iter().position()` plus a mid-deque `remove()`
+    /// over up to 4,454 entries. MEASURED 2026-09-22 at 4 rows: `lh.ensure`
+    /// cost 59-61 ms/step while the pager missed 0.5 times/step and spent
+    /// 4 ms on disk -- ~960 touches/step x a 4,454-entry scan and memmove,
+    /// 18% of the step, on the HUB THREAD, for pure bookkeeping. The hit path
+    /// is now a single store and the O(pool) work moved into the victim
+    /// search, which runs only on a miss. Box 2's pool has always worked this
+    /// way (`ShardPool::last_use` + `tick`).
+    last_use: Vec<u64>,
+    tick: u64,
     /// `V41_MISS_HIST=1`: misses counted per (layer, expert), so the SHAPE of the
     /// miss stream can be read instead of just its rate. The rate alone cannot
     /// tell apart three cases with opposite fixes — a working set that genuinely
@@ -981,14 +991,8 @@ impl ExpertPager {
                 Some((free, _)) => free as u32,
                 None => {
                     let victim = self
-                        .lru
-                        .iter()
-                        .copied()
-                        .find(|&sl| (sl as usize) >= lru_lo)
+                        .lru_victim(lru_lo..self.n_slots as usize)
                         .ok_or_else(|| eyre!("expert pager: prefetch has no slot to evict"))?;
-                    if let Some(pos) = self.lru.iter().position(|&sl| sl == victim) {
-                        self.lru.remove(pos);
-                    }
                     if let Some(old) = self.slot_key[victim as usize].take() {
                         self.slot_of.remove(&old);
                         push_hint(false, old.0, old.1);
@@ -1235,7 +1239,8 @@ impl ExpertPager {
             par_down: vec![0u8; db],
             slot_of: HashMap::new(),
             slot_key: vec![None; n_slots as usize],
-            lru: VecDeque::new(),
+            last_use: vec![0; n_slots as usize],
+            tick: 0,
             miss_hist: (std::env::var("V41_MISS_HIST").as_deref() == Ok("1")).then(|| {
                 (0..(crate::config::N_LAYER as usize) * (N_EXPERT as usize))
                     .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -1363,11 +1368,30 @@ impl ExpertPager {
         &mut self.remap_dev[layer.clamp(0, crate::config::N_LAYER - 1) as usize]
     }
 
+    #[inline]
     fn touch(&mut self, slot: u32) {
-        if let Some(pos) = self.lru.iter().position(|&s| s == slot) {
-            self.lru.remove(pos);
+        self.tick += 1;
+        if let Some(t) = self.last_use.get_mut(slot as usize) {
+            *t = self.tick;
         }
-        self.lru.push_back(slot);
+    }
+
+    /// Least-recently-used slot in `range`, or `None` if the range is empty.
+    /// O(range) and paid only on a MISS; the old deque paid O(pool) per HIT.
+    /// A never-used slot has stamp 0 and so is picked first, which is what the
+    /// deque did too (it only ever held slots that had been filled).
+    fn lru_victim(&self, range: std::ops::Range<usize>) -> Option<u32> {
+        let mut best: Option<(u64, u32)> = None;
+        for sl in range {
+            if sl >= self.last_use.len() {
+                break;
+            }
+            let t = self.last_use[sl];
+            if best.is_none_or(|(bt, _)| t < bt) {
+                best = Some((t, sl as u32));
+            }
+        }
+        best.map(|(_, sl)| sl)
     }
 
     /// Page in every expert in `ids` for `layer` and return a `global id -> slot`
@@ -1612,14 +1636,8 @@ impl ExpertPager {
                 Some((free, _)) => free as u32,
                 None => {
                     let victim = self
-                        .lru
-                        .iter()
-                        .copied()
-                        .find(|&sl| (sl as usize) >= lru_lo)
+                        .lru_victim(lru_lo..self.n_slots as usize)
                         .ok_or_else(|| eyre!("expert pager: no slot to evict"))?;
-                    if let Some(pos) = self.lru.iter().position(|&sl| sl == victim) {
-                        self.lru.remove(pos);
-                    }
                     if let Some(old) = self.slot_key[victim as usize].take() {
                         self.slot_of.remove(&old);
                     }
@@ -2593,14 +2611,8 @@ impl ExpertPager {
                 Some((free, _)) => free as u32,
                 None => {
                     let victim = self
-                        .lru
-                        .iter()
-                        .copied()
-                        .find(|&sl| (sl as usize) >= lru_lo && (sl as usize) < lru_hi)
+                        .lru_victim(lru_lo..lru_hi)
                         .ok_or_else(|| eyre!("expert pager: no slot to evict"))?;
-                    if let Some(pos) = self.lru.iter().position(|&sl| sl == victim) {
-                        self.lru.remove(pos);
-                    }
                     if let Some(old) = self.slot_key[victim as usize].take() {
                         self.slot_of.remove(&old);
                     }
@@ -2896,7 +2908,10 @@ impl ExpertPager {
         for k in self.slot_key.iter_mut() {
             *k = None;
         }
-        self.lru.clear();
+        for t in self.last_use.iter_mut() {
+            *t = 0;
+        }
+        self.tick = 0;
     }
 
     #[allow(dead_code)]
