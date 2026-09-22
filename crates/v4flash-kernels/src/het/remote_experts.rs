@@ -1362,6 +1362,11 @@ pub fn install_knobs_toggle() -> String {
         fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
     }
     const SIGUSR2: i32 = 12;
+    // Read the file ONCE at startup, not only on SIGUSR2. Without this the file is
+    // inert until someone signals, so a launch script that writes `miss_par=1` into
+    // it while passing `V41_B2_MISS_PAR=4` on the command line runs at 4 and looks
+    // like it is running at 1 (found by the 2026-09-22 audit, B4).
+    let _ = knobs::reload();
     let init = format!("knobs: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} (SIGUSR2 reloads {})",
         knobs::merge(), knobs::merge_wait_us(), knobs::miss_par(), knobs::coalesce(),
         v4flash_core::hf_v41::expert_mirror_frac(), knobs::path());
