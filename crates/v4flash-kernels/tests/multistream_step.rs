@@ -9,11 +9,26 @@
 //!   alone  — the arena step (`forward_step_arena`) with ONE row per step;
 //!   batch  — the arena step with all S rows co-batched.
 //!
+//!   pipe   — the arena step with all S rows on the TWO-LANE PIPELINED driver
+//!            (`forward_step_arena_pipelined`), which production uses from 4
+//!            rows up and which interleaves the lanes' pre-MoE phases.
+//!
 //! Gates:
 //!   G5a  alone == batch bit-exactly (a row's output does not depend on its
 //!        co-rows), unless MS_ALLOW_INEXACT=1 (then reported only);
 //!   G5b  KLD(dec || batch) per token under MS_KLD_MEAN / MS_KLD_MAX (defaults
 //!        0.02 / 0.5 nats; the decode-vs-verify baseline is ~1e-3).
+//!        NOTE: with the default tiny prompts (5/40/131/260) and the two-box
+//!        split attached, the BASELINE itself sits at mean ~0.08 / max ~0.43,
+//!        so G5b fails on an unmodified tree; raise MS_KLD_MEAN for that
+//!        configuration. G5a and G5c are the gates that discriminate.
+//!   G5c  alone == pipe bit-exactly, same bars as G5b on KLD(dec || pipe). This
+//!        is the gate on the LANE INTERLEAVING: shared scratch clobbered across
+//!        lanes shows up as exactly one lane's rows differing (a `lane` column
+//!        in the per-row table says which). It caught two such hazards when the
+//!        phases were first split on 2026-09-22 -- `BatchIgpuShared` scratch and
+//!        the per-layer `remap_dev` exclusion mask -- both of which the ordinary
+//!        `alone`/`batch` gates are blind to because they are single-lane.
 //!
 //! Needs the model loaded, i.e. the server DOWN. Run:
 //! ```text
@@ -618,7 +633,7 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let mut kls = Vec::new();
     let mut kls_alone = Vec::new();
     let mut kls_pipe = Vec::new();
-    eprintln!(" s  t   |alone-batch|  |pf1-alone|  argmax(dec/pf1/alone/batch)   KL(dec||batch)  KL(dec||alone)  KL(dec||pf1)");
+    eprintln!(" s  t  lane  |alone-batch|  |alone-pipe|  argmax(dec/alone/batch/pipe)   KL(dec||batch)  KL(dec||pipe)");
     for s in 0..n_streams {
         for t in 0..n_steps {
             let d = max_abs_diff(&logits_alone[s][t], &logits_batch[s][t]);
@@ -638,7 +653,13 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
             kls.push(kb);
             kls_alone.push(ka);
             kls_pipe.push(kpipe);
-            eprintln!("{s:2} {t:2}   {d:10.3e}   {dp:10.3e}   {ad:6}/{ap:6}/{aa:6}/{ab:6}     {kb:9.5}       {ka:9.5}      {kp:9.5}");
+            let _ = (dp, ap, ka, kp);
+            // `lane` is which pipeline lane the row belongs to (rows [0, b_a) =
+            // A): a G5c failure that is entirely one lane means shared scratch
+            // clobbered across lanes, which is how the 2026-09-22 regression
+            // presented (12 of 24 rows = one lane).
+            let lane = if s < b_a { "A" } else { "B" };
+            eprintln!("{s:2} {t:2}   {lane}    {d:10.3e}    {dpipe:10.3e}   {ad:6}/{aa:6}/{ab:6}/{:6}     {kb:9.5}      {kpipe:9.5}", argmax(&logits_pipe[s][t]));
         }
     }
     let mean = kls.iter().sum::<f64>() / kls.len() as f64;

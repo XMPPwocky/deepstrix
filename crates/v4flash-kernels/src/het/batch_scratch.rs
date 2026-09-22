@@ -325,6 +325,17 @@ pub struct BatchDgpuScratch {
     /// numerics. Costs 2x on the reply (10 KB/token vs 5 KB): ~14.5 ms vs
     /// 7.2 ms at B=1024 on the measured 724 MB/s link, against ~150 ms of local
     /// compute. Switch to f16 once the split is validated.
+    /// This lane's q8_k activations for the box-2 request, quantised at the end
+    /// of `pre_moe_chain` and read back in `pre_moe_route`.
+    ///
+    /// PER-LANE, not shared, for the same reason as `remote_ffn_moe` below:
+    /// the pipelined driver runs BOTH lanes' chains before either route, so a
+    /// shared buffer (`BatchDgpuShared::remote_xq`, which this replaces on the
+    /// arena path) had lane B's chain overwrite lane A's activations and lane A
+    /// then submitted lane B's data to box 2 -- half the rows silently wrong,
+    /// caught by `multistream_step`'s G5c gate on 2026-09-22.
+    pub remote_xq_lane: Option<DeviceBuffer<u8>>,
+
     pub remote_ffn_moe: Option<DeviceBuffer<f32>>,
     /// Did pre-MoE actually fill `remote_ffn_moe` for the layer now in flight?
     /// The buffer is allocated whenever a remote is attached, but only layers
@@ -1142,6 +1153,14 @@ impl BatchDgpuScratch {
             ffn_moe_recv: mk_f32(N_EMBD as usize)?,
             pos_per_b: mk_i32(1)?,
             hot_ffn_moe_dgpu,
+            remote_xq_lane: if std::env::var("V41_REMOTE_ADDR").is_ok() {
+                Some(DeviceBuffer::new(
+                    id,
+                    b * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES,
+                )?)
+            } else {
+                None
+            },
             remote_ffn_moe: if std::env::var("V41_REMOTE_ADDR").is_ok() {
                 Some(DeviceBuffer::new(id, b * N_EMBD as usize)?)
             } else {
