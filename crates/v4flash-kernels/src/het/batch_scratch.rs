@@ -234,6 +234,10 @@ pub struct BatchDgpuScratch {
     pub indexer_sel_saved: DeviceBuffer<i32>,
     /// Per-token `min(n_comp, INDEXER_TOP_K)` for the saved selection.
     pub indexer_nsparse_saved: DeviceBuffer<i32>,
+    /// `(layer << 32) | pos` of the sub-tensor dump armed by this lane's chain,
+    /// consumed by the SAME lane's post-MoE (`u64::MAX` = none). Per lane: a
+    /// process-wide static let the other lane's chain retag it in between.
+    pub dump_layer_pos: u64,
     /// Store group the saved selection belongs to
     /// (`kv_source_of(layer).unwrap_or(layer)`), or -1 for none. Guards against a
     /// selection leaking across a kv-source boundary.
@@ -340,10 +344,14 @@ pub struct BatchDgpuScratch {
     ///
     /// PER-LANE, not shared, for the same reason as `remote_ffn_moe` below:
     /// the pipelined driver runs BOTH lanes' chains before either route, so a
-    /// shared buffer (`BatchDgpuShared::remote_xq`, which this replaces on the
-    /// arena path) had lane B's chain overwrite lane A's activations and lane A
+    /// shared buffer (the old `BatchDgpuShared::remote_xq`, removed) had lane
+    /// B's chain overwrite lane A's activations and lane A
     /// then submitted lane B's data to box 2 -- half the rows silently wrong,
     /// caught by `multistream_step`'s G5c gate on 2026-09-22.
+    ///
+    /// Same kernel and input as the iGPU's `d_xq_q8k`, so the bytes shipped to
+    /// box 2 are the ones the local path would have quantised: the remote's
+    /// arithmetic matches by construction rather than by agreement.
     pub remote_xq_lane: Option<DeviceBuffer<u8>>,
 
     pub remote_ffn_moe: Option<DeviceBuffer<f32>>,
@@ -474,18 +482,6 @@ pub struct BatchDgpuShared {
     /// stride (out_a's 64 KB rows aliased L2 sets: 18% -> 52% of peak).
     /// x16_n_embd doubles as the shared-expert input (dead by then).
     pub x16_n_embd: DeviceBuffer<u16>,
-    /// Q8_K of `ffn_input_norm`, staged for the REMOTE expert shard.
-    ///
-    /// The dGPU hot-expert path already produces exactly these bytes into
-    /// `BatchDgpuHotScratch::moe_xq` ("bit-identical to the iGPU's d_xq_q8k —
-    /// same f32 input, same kernel"), but V4.1 runs with `hot_experts = None`
-    /// so that scratch is never allocated. Same kernel, own buffer, so the
-    /// bytes shipped to box 2 are provably the ones the local iGPU would have
-    /// quantised — the remote's arithmetic matches the local path by
-    /// construction rather than by agreement.
-    ///
-    /// Only allocated when a remote shard is attached; `None` costs nothing.
-    pub remote_xq: Option<DeviceBuffer<u8>>,
 
     pub qr16: DeviceBuffer<u16>,
     pub heads16: DeviceBuffer<u16>,
@@ -1124,6 +1120,7 @@ impl BatchDgpuScratch {
             rows,
             indexer_sel_saved: mk_i32(crate::indexer::INDEXER_TOP_K as usize)?,
             indexer_nsparse_saved: mk_i32(1)?,
+            dump_layer_pos: u64::MAX,
             indexer_saved_store: -1,
             candidate_block_score: if crate::het::forward_layer::candidate_pool_enabled() {
                 DeviceBuffer::new(
@@ -1383,14 +1380,6 @@ impl BatchDgpuShared {
             kq_mid_q8k: mk_u8((BLOCKS_Q8K_DOWN_IN as usize) * 292)?,
             xq_n_embd: mk_i8(N_EMBD as usize)?,
             x16_n_embd: DeviceBuffer::new(id, b * f16_pitch(N_EMBD) as usize)?,
-            remote_xq: if std::env::var("V41_REMOTE_ADDR").is_ok() {
-                Some(DeviceBuffer::new(
-                    id,
-                    b * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES,
-                )?)
-            } else {
-                None
-            },
 
             qr16: DeviceBuffer::new(id, b * f16_pitch(N_LORA_Q) as usize)?,
             heads16: DeviceBuffer::new(id, b * f16_pitch(Q_FLAT) as usize)?,

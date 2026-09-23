@@ -2172,9 +2172,11 @@ pub struct PreMoeCarry {
     split_cap: u32,
     sparse_resid_layer: bool,
     moe_group_bound: u32,
-    /// Sequential callers keep the cross-lane iGPU drain in front of `ensure`
-    /// (conditional on it being able to evict); the pipelined driver runs both
-    /// lanes' preps before either launch and sets this false.
+    /// The cross-lane iGPU drain in front of `ensure` (conditional on it being
+    /// able to evict). EVERY caller leaves it true today: the pipelined driver
+    /// was meant to clear it, but it queues launch A before prep B, so lane A's
+    /// MoE can be in flight while lane B pages (see the note in
+    /// `forward_step_arena_pipelined`).
     pub drain_before_ensure: bool,
     /// May `pre_moe_route` emit box-2 look-ahead prefetch hints? Only on the
     /// SEQUENTIAL path: they are read from shared scratch (`sd.look_sel*`) that
@@ -3074,7 +3076,7 @@ impl HeterogeneousEngine {
         // contiguous chunk; the stream's position for arena rows).
         let dump_pos = pos_at(0);
         if super::engine::subtensor_dump_armed(layer as usize) {
-            DUMP_LAYER_POS.store(((layer as u64) << 32) | dump_pos as u64, std::sync::atomic::Ordering::Relaxed);
+            bd.dump_layer_pos = ((layer as u64) << 32) | dump_pos as u64;
         }
         // DSpark: the drafter eats the hc-collapsed residual ENTERING layers
         // 37/38/39. A batched verify does not know until AFTER it runs which
@@ -6704,11 +6706,9 @@ impl HeterogeneousEngine {
     /// expert, and the peer push of this lane's picks/activations to the iGPU.
     /// Stops BEFORE the iGPU MoE dispatch, which reads shared `si` scratch and
     /// therefore must not be interleaved across lanes.
-    /// The pipelined driver runs this for both lanes AFTER both `pre_moe_route`s
-    /// and BEFORE either `pre_moe_launch`, so no MoE is in flight on the iGPU
-    /// while `ensure` evicts (the driver checks that with `moe_done` queries)
-    /// and it sets `drain_before_ensure = false`; sequential callers keep the
-    /// (conditional) cross-lane drain.
+    /// Every driver keeps the (conditional) cross-lane iGPU drain in front of
+    /// `ensure` (`drain_before_ensure` is never cleared): the other lane's MoE
+    /// may still be in flight when this lane pages.
     #[allow(clippy::too_many_arguments)]
     pub fn pre_moe_prep(
         &self,
@@ -6742,8 +6742,12 @@ impl HeterogeneousEngine {
                 // in-flight MoE is reading. (a) IS GONE: `ExpertPager::remap_dev`
                 // is `Vec<DeviceBuffer<i32>>`, one per layer (its own doc-comment:
                 // "Per LAYER rather than a ring because each layer's MoE is
-                // captured as its own HIP graph"), and the two lanes are never on
-                // the same layer inside one step. (b) needs an EVICTION, which
+                // captured as its own HIP graph"). The two lanes DO run the same
+                // layer back to back (ready-first, lockstep pipelined), and share
+                // that layer's buffer; it stays correct because the upload
+                // (`sync_remap_async`) goes through a pinned staging ring onto
+                // `ie.compute`, the MoE's own stream, so it lands after the
+                // other lane's reduce. (b) needs an EVICTION, which
                 // only happens when some id is not already resident.
                 //
                 // At 8 rows `pager.misses_per_step` is 0.25-0.95 for the whole
@@ -8049,7 +8053,7 @@ impl HeterogeneousEngine {
         // KNOWN_BUGS-style routed-only dump (twin of decode's `dec_ffn_routed`):
         // `ffn_moe_recv` row 0 BEFORE the shared/remote/hot adds below.
         {
-            let lp = DUMP_LAYER_POS.load(std::sync::atomic::Ordering::Relaxed);
+            let lp = bd.dump_layer_pos;
             let (dl, dp) = ((lp >> 32) as usize, (lp & 0xffff_ffff) as u32);
             if lp != u64::MAX && super::engine::subtensor_dump_armed(dl) {
                 de.compute.synchronize()?;
@@ -8058,7 +8062,7 @@ impl HeterogeneousEngine {
                     &format!("pf_ffn_routed_p{dp}"),
                     &bd.ffn_moe_recv.slice_view(0, N_EMBD as usize),
                 )?;
-                DUMP_LAYER_POS.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+                bd.dump_layer_pos = u64::MAX;
             }
         }
         // NOT one bracket around the whole function. The blocking box-2 `wait()`
@@ -8522,11 +8526,6 @@ pub fn set_single_lane_max(v: usize) {
 /// Set for the duration of a DSpark verify so the post-attention pass leaves the
 /// raw window exactly where the caller's `KvMark` addresses it (no compaction,
 /// no raw_off reset). See the eviction block and `KvMark::advanced_by`.
-/// (layer << 32 | pos) of the batched layer whose sub-tensor dump is armed, set
-/// by `forward_layer_pre_moe_v2`, consumed by `forward_layer_post_moe_v2` for the
-/// routed-only dump. Dump-only plumbing; `u64::MAX` = nothing pending.
-static DUMP_LAYER_POS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-
 static SPECULATIVE_APPEND: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
