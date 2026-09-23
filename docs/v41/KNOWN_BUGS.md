@@ -10,6 +10,34 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Open
 
+### 28. FIXED 2026-09-23 (cc47607, deployed 23:38 UTC) — a restored continuation with a suffix longer than SWA_WINDOW replayed onto STALE decoder rings
+
+`prefill_job_finish` (forward_prefill.rs) emptied the decoder rings (layers
+20-39) only for a fresh prompt; the #25 fix keeps them on a continuation so a
+short suffix sees the previous turn's rows. But the CED replay runs only the
+last `b_seg` (<= 128) rows, from `seg_pos0 = pos0 + t - b_seg`. With a suffix
+`t > 128` the kept rows sit `t - 128` positions back, and replay row i attended
+127-i of them as if adjacent. The wrong K/V it wrote on layers 21-39 fed the
+first token and the next ~128 generated tokens. Hit nearly every agent turn
+(tool results, file contents) since #25 (2026-09-20); suspected cause of the
+intermittent looping reported at 170-180K context. Fix: empty the rings when
+`pos0 == 0 || t > b_seg`. Same review (read-only, 2 agents): mid-prefill
+checkpoints saved never-updated decoder rings (now saved empty); a short or
+partial `index_k.bin` half-restored with another request's keys (now a cache
+miss; all 446 live snapshots were checked clean); a failed session-hint restore
+fell back to a FULL prefill (now tries the walk match); `admit_from_state`
+leaked its slot on failure; legacy saves ignored `raw_off`.
+
+Regression: `MS_DIAG=restore[:P,S]` in `tests/multistream_step.rs` (continued vs
+uninterrupted prefill, KL on the last row). FIRST RUN (fixed build, P=600):
+S=500 -> 0.068 (argmax equal) and 0.026; S=60 (rings kept by design) -> 0.010.
+The 0.05 bar FAILED on one case. NOT yet known whether that is residual error or
+chunk-split noise (fresh = 1024+76 rows, continued = 600 then 500; chunk size
+alone moves KL 0.01-0.04): run the same mode on the PRE-fix build (0920276)
+and with MS_RESTORE_CHUNK equalised before trusting or re-setting the bar.
+Also: `tests/snapshot_v41_restore_guards.rs`, `kv_arena_compact`
+`failed_admit_from_state_releases_its_slot`, `restore_candidates` unit test (all pass).
+
 ### 27. FIXED 2026-09-23 — the candidate-pool mask was ONE buffer shared by every lane: in a two-lane step, lane A's rows were masked with lane B's rows' blocks (another STREAM's) on layers 24-39
 
 `candidate_block_score` / `candidate_threshold` (ARCH_SPEC §1.5: layer 20 publishes
