@@ -2729,8 +2729,9 @@ impl HeterogeneousEngine {
     /// lockstep driver already runs (combine A, chain A, combine B, chain B,
     /// route A). route+prep+launch stays ONE unit per lane (G5c: the shared
     /// `BatchIgpuShared` scratch and the per-layer `remap_dev` exclusion mask).
-    /// Replies are FIFO, so a lane may only post when its ticket is the oldest
-    /// in flight; the head lane is always in `Post`, so the loop cannot stall.
+    /// Replies are matched by seq and box 2 may answer out of order (it parks a
+    /// request that is paging, `REQ_FLAG_OOO`), so a lane posts as soon as ITS
+    /// reply is in; some lane's reply always arrives, so the loop cannot stall.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_step_arena_ready_first(
         &self,
@@ -2881,7 +2882,7 @@ impl HeterogeneousEngine {
                                 None => true,
                                 Some(m) => {
                                     let mut r = m.lock().map_err(|_| eyre!("remote expert client mutex poisoned"))?;
-                                    r.head_seq() == Some(t.seq) && r.head_ready()
+                                    r.ready(t.seq)
                                 }
                             },
                         };

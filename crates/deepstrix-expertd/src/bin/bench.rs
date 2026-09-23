@@ -7,6 +7,8 @@
 //!       [--gap-us N]   (spin N µs between a reply and the next request: the hub's
 //!                       per-layer attention time; exposes the daemon's wake-up cost)
 //!       [--clock-dump FILE]  (write every raw NTP quadruple as CSV)
+//!       [--check-park ROUNDS]  (with --check-layer/--catchall: pipelined, faulting
+//!                               requests waited in REVERSE order; see below)
 //!
 //! Every request/response carries the NTP quadruple (t1..t4, CLOCK_MONOTONIC_RAW),
 //! so each run also reports the measured clock offset between the boxes, its
@@ -126,6 +128,7 @@ struct Args {
     pool: usize,
     check_layer: Option<u32>,
     check_n: usize,
+    check_park: usize,
     f32_resp: bool,
     batched: bool,
     catchall: bool,
@@ -147,6 +150,7 @@ fn parse_args() -> eyre::Result<Args> {
         pool: usize::MAX,
         check_layer: None,
         check_n: 4,
+        check_park: 0,
         f32_resp: false,
         batched: false,
         catchall: false,
@@ -167,6 +171,7 @@ fn parse_args() -> eyre::Result<Args> {
             "--pool" => a.pool = val()?.parse::<usize>()?.max(1),
             "--check-layer" => a.check_layer = Some(val()?.parse()?),
             "--check-n" => a.check_n = val()?.parse()?,
+            "--check-park" => a.check_park = val()?.parse()?,
             "--f32" => a.f32_resp = true,
             "--batched" => a.batched = true,
             "--catchall" => a.catchall = true,
@@ -241,7 +246,7 @@ fn main() -> eyre::Result<()> {
             // Same executor path locally as remotely: `--batched` forces the
             // by-expert chain on both sides, so a mismatch is a real one and not
             // the known ~1e-7 batched-vs-decode difference.
-            exec.run_path(&mut local, layer, b, &xq, &sel, &ew, args.batched, &mut |_| Ok(()))?;
+            exec.run_path(&mut local, layer, b, &xq, &sel, &ew, args.batched, &mut |_, _| Ok(()))?;
             let mut ref32 = vec![0f32; b * N_EMBD as usize];
             exec.read_f32(b, &mut ref32)?;
             let mut ref16 = vec![0u16; b * N_EMBD as usize];
@@ -267,6 +272,49 @@ fn main() -> eyre::Result<()> {
             );
             client.recycle(r32);
             client.recycle(r16);
+        }
+        // `--check-park R`: R rounds of 3 requests submitted BACK TO BACK
+        // (distinct random picks, every one faulting under `--catchall` with a
+        // small daemon pool), then waited in REVERSE order. With the daemon's
+        // `park=1` knob, a request that pages is parked while the ones queued
+        // behind it are served on its second executor and answered first --
+        // so this checks the parked AND the interleaved results bit for bit
+        // against the local single-pass shard, and the hub's by-seq matching.
+        let bs_park: Vec<usize> = check_bs.iter().copied().filter(|&b| b > 1 && b <= 16).collect();
+        let bs_park = if bs_park.is_empty() { vec![2, 4] } else { bs_park };
+        for round in 0..args.check_park {
+            let mut want: Vec<(Vec<f32>, v4flash_kernels::het::remote_experts::Ticket, usize)> = Vec::new();
+            let mut reqs = Vec::new();
+            for j in 0..3 {
+                let b = bs_park[(round + j) % bs_park.len()].min(rows);
+                let x: Vec<f32> = (0..b * N_EMBD as usize).map(|_| rng.f32()).collect();
+                let mut xq = vec![0u8; b * XQ_BYTES_PER_TOKEN];
+                exec.quantize_q8k(&x, &mut xq)?;
+                let (sel, ew) = make_picks(&mut rng, b, args.picks.min(ids.len()), &ids);
+                exec.run_path(&mut local, layer, b, &xq, &sel, &ew, true, &mut |_, _| Ok(()))?;
+                let mut r32 = vec![0f32; b * N_EMBD as usize];
+                exec.read_f32(b, &mut r32)?;
+                reqs.push((b, xq, sel, ew, r32));
+            }
+            for (b, xq, sel, ew, r32) in reqs {
+                let t = submit_maybe_unmasked(&mut client, args.catchall, layer, b, &xq, &sel, &ew, proto::REQ_FLAG_BATCHED | proto::REQ_FLAG_RESP_F32)?
+                    .ok_or_else(|| eyre!("no remote picks?"))?;
+                want.push((r32, t, b));
+            }
+            let mut bad = 0usize;
+            for (r32, t, b) in want.into_iter().rev() {
+                let got = client.wait(t)?;
+                let n = got.f32().iter().zip(&r32).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                if n > 0 {
+                    eprintln!("check-park: round {round} seq {} B={b}: {n} f32 mismatches", t.seq);
+                }
+                bad += n;
+                client.recycle(got);
+            }
+            all_ok &= bad == 0;
+        }
+        if args.check_park > 0 {
+            eprintln!("check-park: {} rounds x 3 pipelined requests: {}", args.check_park, if all_ok { "BIT-IDENTICAL" } else { "MISMATCH" });
         }
         if !all_ok {
             return Err(eyre!("check FAILED"));

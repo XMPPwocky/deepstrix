@@ -345,6 +345,12 @@ pub mod proto {
     /// has started merging is impossible. Purely advisory: a daemon that
     /// ignores it is correct, just slower.
     pub const REQ_FLAG_PARTNER: u32 = 16;
+    /// Capability: the sender matches replies to tickets by `seq`, so the daemon
+    /// may answer this request OUT OF ORDER. Box 2 uses it to PARK a request
+    /// that has to page experts in (knob `park`): the resident pass runs, the
+    /// misses read in the background, and a request queued behind it is served
+    /// and answered in the meantime instead of waiting out the NVMe read.
+    pub const REQ_FLAG_OOO: u32 = 32;
 
     /// Fixed request fields after the header (bytes):
     /// layer, b, flags, n_used, xq_bpt, reserved (6 × u32) then `t1` (u64,
@@ -1309,6 +1315,7 @@ pub mod knobs {
     static COALESCE: AtomicBool = AtomicBool::new(false);
     static MERGE_WAIT_US: AtomicU64 = AtomicU64::new(400);
     static MISS_PAR: AtomicUsize = AtomicUsize::new(1);
+    static PARK: AtomicBool = AtomicBool::new(false);
     static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     fn init() {
         INIT.get_or_init(|| {
@@ -1325,6 +1332,7 @@ pub mod knobs {
                 matches!(std::env::var("V41_B2_COALESCE").as_deref(), Ok("1") | Ok("on")),
                 Relaxed,
             );
+            PARK.store(std::env::var("V41_B2_PARK").as_deref() == Ok("1"), Relaxed);
         });
     }
     pub fn merge() -> bool { init(); MERGE.load(Relaxed) }
@@ -1342,6 +1350,13 @@ pub mod knobs {
     /// span read only touches the primary drive), so it trades 8 preads at
     /// ~9.9 GB/s for 2 at ~4.5.
     pub fn coalesce() -> bool { init(); COALESCE.load(Relaxed) }
+    /// PARK a request that must page (batched hits-first path, sender set
+    /// `REQ_FLAG_OOO`): its misses go to the prefetch readers and requests
+    /// already queued behind it are served and ANSWERED while they read, on a
+    /// second executor. Without it a queued request (the other hub lane) waits
+    /// out the whole NVMe read: measured 2026-09-23 at 4 rows, ~131 ms/step of
+    /// box-2 queueing, ~as much as box 2's own page time.
+    pub fn park() -> bool { init(); PARK.load(Relaxed) }
     pub fn path() -> String {
         std::env::var("V41_B2_KNOBS").unwrap_or_else(|_| {
             format!("{}/expertd-knobs.txt", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
@@ -1362,11 +1377,12 @@ pub mod knobs {
                 ("merge_wait_us", v) => { if let Ok(n) = v.parse() { MERGE_WAIT_US.store(n, Relaxed) } }
                 ("miss_par", v) => { if let Ok(n) = v.parse::<usize>() { MISS_PAR.store(n.clamp(1, 16), Relaxed) } }
                 ("coalesce", v) => COALESCE.store(v != "0", Relaxed),
+                ("park", v) => PARK.store(v != "0", Relaxed),
                 ("mirror_frac", v) => { if let Ok(f) = v.parse::<f32>() { v4flash_core::hf_v41::set_expert_mirror_frac(f) } }
                 _ => {}
             }
         }
-        format!("knobs reloaded from {p}: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3}",
+        format!("knobs reloaded from {p}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3}", park(),
             merge(), merge_wait_us(), miss_par(), coalesce(), v4flash_core::hf_v41::expert_mirror_frac())
     }
 }
@@ -1428,6 +1444,13 @@ pub struct ExpertShard {
     /// never a victim while set (the compute loop pins the in-flight request's
     /// picks around a queued request's early paging).
     pub pinned: Vec<(u32, u32)>,
+    /// A PARKED request's picks (`knobs::park`): never victims while other
+    /// requests are served under its in-flight reads. Separate from `pinned`,
+    /// which the early-paging hook sets and clears around each hint.
+    pub parked_pins: Vec<(u32, u32)>,
+    /// The parked request's non-resident picks as `layer << 16 | expert`, for
+    /// the park hook to hand to the prefetch readers.
+    pub park_words: Vec<u32>,
     /// Cumulative time the compute thread spent BLOCKED in `admit_prefetched`
     /// waiting for a prefetch read it needs this request (2026-09-22). Also
     /// added to the layer's `read_ns`, see the note there.
@@ -2107,6 +2130,8 @@ impl ExpertShard {
             direct,
             pool: None,
             pinned: Vec::new(),
+            parked_pins: Vec::new(),
+            park_words: Vec::new(),
             prefetch_wait_ns: 0,
         })
     }
@@ -2211,7 +2236,7 @@ impl ExpertShard {
     /// any layer. Called at the top of `ensure_layer_inner`, where nothing
     /// reads the pool. `want` protects the current layer's picks from eviction.
     fn admit_prefetched(&mut self, cur_layer: u32, want: &[u32]) -> eyre::Result<()> {
-        let pinned = self.pinned.clone();
+        let pinned: Vec<(u32, u32)> = self.pinned.iter().chain(self.parked_pins.iter()).copied().collect();
         let Some(pf) = self.prefetch.as_mut() else { return Ok(()) };
         let Some(pool) = self.pool.as_mut() else { return Ok(()) };
         const PREFILL_AGE: u64 = 1u64 << 40;
@@ -2526,7 +2551,7 @@ impl ExpertShard {
     }
 
     fn ensure_layer_inner(&mut self, layer: u32, ids: &[i32], mut missed: Option<&mut Vec<u32>>, prefill_shaped: bool) -> eyre::Result<()> {
-        let pinned = self.pinned.clone();
+        let pinned: Vec<(u32, u32)> = self.pinned.iter().chain(self.parked_pins.iter()).copied().collect();
         // Land completed look-ahead prefetches first (any layer): nothing reads
         // the pool here, and this layer's picks are protected from eviction.
         if self.prefetch.is_some() {
@@ -3240,7 +3265,7 @@ impl MoeExecutor {
         sel: &[i32],
         ew: &[f32],
     ) -> eyre::Result<ExecTiming> {
-        self.run_path(shard, layer, b, xq, sel, ew, false, &mut |_| Ok(()))
+        self.run_path(shard, layer, b, xq, sel, ew, false, &mut |_, _| Ok(()))
     }
 
     /// As [`Self::run`]; `force_batched` takes the by-expert chain regardless of `b`.
@@ -3274,7 +3299,7 @@ impl MoeExecutor {
         sel: &[i32],
         ew: &[f32],
         force_batched: bool,
-        overlap: &mut dyn FnMut(&mut ExpertShard) -> eyre::Result<()>,
+        overlap: &mut dyn FnMut(&mut ExpertShard, bool) -> eyre::Result<()>,
     ) -> eyre::Result<ExecTiming> {
         let nu = N_EXPERT_USED;
         if b == 0 || b > self.rows {
@@ -3422,6 +3447,27 @@ impl MoeExecutor {
                 // gets the FULL pick list so its victim search never evicts an
                 // expert pass A is reading from (a wanted id is never a victim)
                 // and so the hits' recency is touched as usual.
+                //
+                // PARK first (`knobs::park`): offer the hook the chance to serve
+                // requests queued behind this one while these misses read on the
+                // prefetch readers. Pass A's kernels keep running on OUR stream;
+                // the hook uses its own executor, and every pick of this request
+                // is pinned so nothing it serves can evict them. The `ensure`
+                // below then admits whatever has landed and waits for the rest.
+                if knobs::park() {
+                    shard.park_words.clear();
+                    for &e in &self.missing_scratch {
+                        shard.park_words.push((layer << 16) | e as u32);
+                    }
+                    shard.parked_pins.clear();
+                    for &e in sel.iter().filter(|&&e| e != NO_PICK && (0..N_EXPERT as i32).contains(&e)) {
+                        shard.parked_pins.push((layer, e as u32));
+                    }
+                    let r = overlap(shard, true);
+                    shard.parked_pins.clear();
+                    shard.park_words.clear();
+                    r?;
+                }
                 shard.ensure_layer_phased(layer, sel, b > 16)?;
                 for (i, &e) in sel.iter().enumerate() {
                     let live = e != NO_PICK && !self.resident_scratch[i];
@@ -3451,13 +3497,13 @@ impl MoeExecutor {
         // A queued request's own misses can start reading now, under this
         // request's GPU tail + D2H + reply + the hub's turnaround (see the
         // compute loop). Cheap (decode + a few hash lookups); never waits.
-        overlap(shard)?;
+        overlap(shard, false)?;
         self.ev_done.record(&self.engine.compute)?;
         // Poll instead of block: every ~20 us give the overlap hook another
         // chance at the reader queue while the GPU drains. Bounded by the GPU
         // itself; the hook is a no-op once it holds a frame.
         while !self.ev_done.query()? {
-            overlap(shard)?;
+            overlap(shard, false)?;
             std::thread::sleep(std::time::Duration::from_micros(20));
         }
         timing.h2d = t1 - t0;
@@ -3952,6 +3998,11 @@ pub fn serve_connection(
         // `tx_out` sender is gone; the reader when its blocking read fails).
         let mut compute = |tx_out: mpsc::SyncSender<(AlignedBuf, Instant, u32)>, records: &mut Vec<RequestRecord>, n_total: &mut u64| -> eyre::Result<()> {
         let mut n_done = 0usize;
+        // PARKING (`knobs::park`): requests served while an earlier one waits on
+        // its miss reads run on this second executor, so the parked request's
+        // xq / partials / sel regions on `exec` stay intact. Created on first use.
+        let mut exec2: Option<MoeExecutor> = None;
+        let (mut w_parks, mut w_park_served) = (0u64, 0u64);
         // A frame the overlap hook already pulled off the reader (and whose
         // misses it may have started paging) while the previous request ran.
         let mut pending: std::collections::VecDeque<Inbound> = std::collections::VecDeque::new();
@@ -4135,11 +4186,25 @@ pub fn serve_connection(
                 if let Some(rb) = reqb.as_ref() {
                     cur_pins.extend(rb.sel.iter().filter(|&&e| e >= 0).map(|&e| (req.layer, e as u32)));
                 }
+                let (exec_device, exec_rows, exec_decode_max_b) = (exec.device(), exec.rows(), exec.decode_max_b());
                 let rx_in_ref = &rx_in;
                 let pending_ref = &mut pending;
+                // May THIS request be answered after ones queued behind it?
+                let may_park = req.flags & proto::REQ_FLAG_OOO != 0 && reqb.is_none();
+                let exec2_ref = &mut exec2;
+                let records_ref = &mut *records;
+                let n_done_ref = &mut n_done;
+                let (parks_ref, park_served_ref) = (&mut w_parks, &mut w_park_served);
+                let tx_out_ref = &tx_out;
+                let rx_resp_recycle_ref = &rx_resp_recycle;
+                let tx_req_recycle_ref = &tx_req_recycle;
                 // Pull EVERY frame the reader has (three hub lanes keep up to
                 // two queued); each one's misses start now, in arrival order.
-                let mut overlap = |shard: &mut ExpertShard| -> eyre::Result<()> {
+                // With `park`, also serve queued requests while this one's
+                // misses read (see `MoeExecutor::run_path`).
+                let mut overlap = |shard: &mut ExpertShard, park: bool| -> eyre::Result<()> {
+                    // Parking needs the pull below too: it only serves frames
+                    // already taken off the reader.
                     if !b2_early_page() {
                         return Ok(());
                     }
@@ -4167,6 +4232,63 @@ pub fn serve_connection(
                         let stop = matches!(m, Inbound::Closed(_));
                         pending_ref.push_back(m);
                         if stop { break; }
+                    }
+                    if !(park && may_park) {
+                        return Ok(());
+                    }
+                    let rows2 = 16usize.min(exec_rows);
+                    let servable = |m: &Inbound| -> bool {
+                        match m {
+                            Inbound::Frame { hdr, buf, .. } if hdr.kind == proto::KIND_REQUEST => {
+                                proto::decode_request(buf)
+                                    .map(|r| r.flags & proto::REQ_FLAG_OOO != 0 && (r.b as usize) <= rows2)
+                                    .unwrap_or(false)
+                            }
+                            _ => false,
+                        }
+                    };
+                    if !pending_ref.front().is_some_and(|m| servable(m)) {
+                        return Ok(());
+                    }
+                    // Start the parked request's reads NOW, before serving.
+                    let words = std::mem::take(&mut shard.park_words);
+                    shard.prefetch_words_ex(&words, true);
+                    shard.park_words = words;
+                    if exec2_ref.is_none() {
+                        *exec2_ref = Some(MoeExecutor::new(exec_device, rows2, exec_decode_max_b)?);
+                        eprintln!("expertd: park executor ready ({rows2} rows)");
+                    }
+                    let ex2 = exec2_ref.as_mut().unwrap();
+                    *parks_ref += 1;
+                    static PARK_LOG: std::sync::LazyLock<bool> =
+                        std::sync::LazyLock::new(|| std::env::var("V41_B2_PARK_LOG").as_deref() == Ok("1"));
+                    if *PARK_LOG {
+                        eprintln!("expertd: park L{} misses={} queued={}", req.layer, shard.park_words.len(), pending_ref.len());
+                    }
+                    while pending_ref.front().is_some_and(|m| servable(m)) {
+                        let Some(Inbound::Frame { hdr, buf, t_first, t_done, t2 }) = pending_ref.pop_front() else { unreachable!() };
+                        let resp = rx_resp_recycle_ref.try_recv().unwrap_or_else(|_| AlignedBuf::with_capacity(proto::RESP_DATA_OFF + exec_rows * N_EMBD as usize * 4));
+                        let out = serve_interleaved(ex2, shard, &hdr, &buf, t_first, t_done, t2, resp);
+                        let _ = tx_req_recycle_ref.send(buf);
+                        match out {
+                            Ok((rec, resp)) => {
+                                let t_ready = rec.t_ready;
+                                records_ref.push(rec);
+                                if tx_out_ref.send((resp, t_ready, hdr.seq)).is_err() {
+                                    return Err(eyre!("writer thread gone"));
+                                }
+                                *n_done_ref += 1;
+                                *park_served_ref += 1;
+                            }
+                            Err(e) => {
+                                let msg = format!("{e:#}");
+                                eprintln!("expertd: interleaved request seq {} failed: {msg}", hdr.seq);
+                                let mut eb = AlignedBuf::with_capacity(4096);
+                                proto::encode_error(&mut eb, hdr.seq, 1, &msg);
+                                let _ = tx_out_ref.send((eb, Instant::now(), hdr.seq));
+                                return Err(eyre!("interleaved request failed: {msg}"));
+                            }
+                        }
                     }
                     Ok(())
                 };
@@ -4353,14 +4475,14 @@ pub fn serve_connection(
                             let wall = w_t0.elapsed().as_secs_f64().max(1e-9);
                             let win = format!(
                                 " | window {:.1}s: busy {:.0}% idle/req {:.2} ms queued {:.0}% depth {:.2} \
-merged {:.0}% (promised {:.0}%, miss: no-frame {} unmergeable {})",
+merged {:.0}% (promised {:.0}%, miss: no-frame {} unmergeable {}) parks {} served-under-park {}",
                                 wall, 100.0 * w_service_ns as f64 / 1e9 / wall,
                                 w_idle_ns as f64 / 1e6 / w_n.max(1) as f64,
                                 100.0 * w_queued as f64 / w_n.max(1) as f64,
                                 w_depth_sum as f64 / w_queued.max(1) as f64,
                                 100.0 * w_merged as f64 / w_n.max(1) as f64,
                                 100.0 * w_promised as f64 / w_n.max(1) as f64,
-                                w_merge_no_frame, w_merge_unmergeable,
+                                w_merge_no_frame, w_merge_unmergeable, w_parks, w_park_served,
                             );
                             eprintln!(
                                 "expertd: page stats requests={req} misses={miss} hit={:.4} \
@@ -4373,6 +4495,7 @@ ms_per_miss={:.2} (read {:.2} [pread {:.2} repack_cpu {:.2}] h2d {:.2} repack_gp
                             w_t0 = Instant::now();
                             w_idle_ns = 0; w_service_ns = 0; w_depth_sum = 0; w_queued = 0; w_n = 0; w_merged = 0;
                             w_merge_no_frame = 0; w_merge_unmergeable = 0; w_promised = 0;
+                            w_parks = 0; w_park_served = 0;
                         }
                     }
                     if opts.verbose {
@@ -4408,6 +4531,79 @@ ms_per_miss={:.2} (read {:.2} [pread {:.2} repack_cpu {:.2}] h2d {:.2} repack_gp
     apply_written(&mut records, &rx_written);
     result?;
     Ok((records, n_total))
+}
+
+/// Serve ONE plain request start to finish on `exec` (the park executor) and
+/// build its reply: the non-merged half of `serve_connection`'s compute body.
+/// Runs INSIDE a parked request's `run_path`, so it gets no hook of its own: a
+/// miss here is read synchronously (it shares the drives with the parked
+/// request's reads either way).
+#[allow(clippy::too_many_arguments)]
+fn serve_interleaved(
+    exec: &mut MoeExecutor,
+    shard: &mut ExpertShard,
+    hdr: &proto::Header,
+    buf: &AlignedBuf,
+    t_first: Instant,
+    t_done: Instant,
+    t2: u64,
+    mut resp: AlignedBuf,
+) -> eyre::Result<(RequestRecord, AlignedBuf)> {
+    let t_start = Instant::now();
+    let req = proto::decode_request(buf)?;
+    if req.n_used != N_EXPERT_USED as u32 || req.xq_bpt != XQ_BYTES_PER_TOKEN as u32 {
+        return Err(eyre!("request geometry n_used={} xq_bpt={} != {}/{}", req.n_used, req.xq_bpt, N_EXPERT_USED, XQ_BYTES_PER_TOKEN));
+    }
+    let b = req.b as usize;
+    if !req.hint_admit.is_empty() {
+        shard.hint_evict_first(req.hint_admit);
+    }
+    if !req.prefetch.is_empty() {
+        shard.prefetch_words(req.prefetch);
+    }
+    let (miss0, page_ns0) = shard.layer_page_counters(req.layer);
+    let timing = exec.run_path(shard, req.layer, b, req.xq, req.sel, req.ew, req.flags & proto::REQ_FLAG_BATCHED != 0, &mut |_, _| Ok(()))?;
+    let (miss1, page_ns1) = shard.layer_page_counters(req.layer);
+    let t_page_us = (page_ns1.saturating_sub(page_ns0) / 1000).min(u32::MAX as u64) as u32;
+    let n_miss_req = miss1.saturating_sub(miss0).min(u32::MAX as u64) as u32;
+    let t_d2h0 = Instant::now();
+    let f32_out = req.flags & proto::REQ_FLAG_RESP_F32 != 0;
+    let elem = if f32_out { 4 } else { 2 };
+    let n = b * N_EMBD as usize;
+    let t_compute_us = (t_d2h0 - t_start).as_micros() as u32;
+    let resp_flags = (req.flags & !proto::RESP_MISS_MASK)
+        | ((timing.miss_mask << proto::RESP_MISS_SHIFT) & proto::RESP_MISS_MASK);
+    proto::begin_response(&mut resp, hdr.seq, req.layer, req.b, resp_flags, 0, t_compute_us, 0, N_EMBD, elem, req.t1, t2);
+    resp.resize(proto::RESP_DATA_OFF + n * elem as usize);
+    if f32_out {
+        exec.read_f32_at(0, b, resp.view_mut::<f32>(proto::RESP_DATA_OFF, n))?;
+    } else {
+        exec.read_f16_at(0, b, resp.view_mut::<u16>(proto::RESP_DATA_OFF, n))?;
+    }
+    proto::patch_len(&mut resp);
+    let t_ready = Instant::now();
+    let t_server_us = (t_ready - t_done).as_micros() as u32;
+    resp.as_bytes_mut()[proto::HDR_LEN + 20..proto::HDR_LEN + 24].copy_from_slice(&t_server_us.to_le_bytes());
+    resp.as_bytes_mut()[proto::RESP_PAGE_OFF..proto::RESP_PAGE_OFF + 4].copy_from_slice(&t_page_us.to_le_bytes());
+    resp.as_bytes_mut()[proto::RESP_MISSN_OFF..proto::RESP_MISSN_OFF + 4].copy_from_slice(&n_miss_req.to_le_bytes());
+    let rec = RequestRecord {
+        seq: hdr.seq,
+        layer: req.layer,
+        b: req.b,
+        bytes_in: buf.len(),
+        bytes_out: resp.len(),
+        read_us: (t_done - t_first).as_micros() as u32,
+        queue_us: (t_start - t_done).as_micros() as u32,
+        h2d_us: timing.h2d.as_micros() as u32,
+        gpu_us: timing.gpu.as_micros() as u32,
+        d2h_us: (t_ready - t_d2h0).as_micros() as u32,
+        write_us: 0,
+        path_decode: timing.path_decode,
+        t_ready,
+        t1: req.t1,
+        t2,
+    };
+    Ok((rec, resp))
 }
 
 /// Drain the writer's `(seq, written_at)` stamps into `write_us` of the records
@@ -4627,9 +4823,11 @@ pub struct RemoteExpertClient {
     stream: TcpStream,
     tx_req: Option<mpsc::SyncSender<(AlignedBuf, u64)>>,
     rx_resp: mpsc::Receiver<ClientInbound>,
-    /// One frame taken off `rx_resp` by `head_ready` but not yet consumed by
-    /// `wait`. Replies are FIFO, so it is always the oldest in-flight ticket's.
-    stash: Option<ClientInbound>,
+    /// Reply frames taken off `rx_resp` (by `ready` or by a `wait` for another
+    /// ticket) but not yet consumed, keyed by `seq`. Replies may arrive out of
+    /// order (`REQ_FLAG_OOO`: box 2 answers a parked request after the one
+    /// queued behind it), so every consumer matches by seq.
+    stash: Vec<(u32, AlignedBuf, Instant, u64)>,
     rx_req_recycle: mpsc::Receiver<AlignedBuf>,
     tx_resp_recycle: mpsc::Sender<AlignedBuf>,
     next_seq: u32,
@@ -4778,7 +4976,7 @@ impl RemoteExpertClient {
             tx_resp_recycle,
             next_seq: 1,
             in_flight: Default::default(),
-            stash: None,
+            stash: Vec::new(),
             writer: Some(writer),
             reader: Some(reader),
         })
@@ -4944,6 +5142,8 @@ impl RemoteExpertClient {
         let flags = if ha.is_empty() && he.is_empty() { flags } else { flags | proto::REQ_FLAG_HINTS };
         let pf = take_prefetch_words(128);
         let flags = if pf.is_empty() { flags } else { flags | proto::REQ_FLAG_PREFETCH };
+        // `wait` matches by seq, so any reply order is fine from here.
+        let flags = flags | proto::REQ_FLAG_OOO;
         proto::encode_request(
             &mut buf, seq, layer, b as u32, flags, nu as u32, XQ_BYTES_PER_TOKEN as u32, xq,
             &self.sel_scratch[..b * nu], &self.ew_scratch[..b * nu], (&ha, &he), &pf,
@@ -4966,77 +5166,97 @@ impl RemoteExpertClient {
         Ok(Some(ticket))
     }
 
-    /// `seq` of the oldest in-flight request -- the only one whose reply can be
-    /// next, since replies are FIFO. `None` when nothing is in flight.
+    /// `seq` of the oldest in-flight request. `None` when nothing is in flight.
     pub fn head_seq(&self) -> Option<u32> {
         self.in_flight.front().map(|t| t.seq)
     }
 
-    /// Non-blocking: has the oldest in-flight request's reply arrived? Takes the
-    /// frame off the channel into `stash` without consuming it, so `wait` still
-    /// does all the accounting. A closed channel reports READY so the caller's
-    /// `wait` surfaces the error instead of spinning. A scheduling HINT for the
-    /// ready-first lane driver only -- correctness never depends on it, because
-    /// `wait` blocks for real either way.
-    pub fn head_ready(&mut self) -> bool {
-        if self.stash.is_some() {
-            return true;
-        }
-        match self.rx_resp.try_recv() {
-            Ok(m) => {
-                self.stash = Some(m);
-                true
+    /// Move every frame the reader has delivered into `stash`. A closed channel
+    /// or a socket error is returned so the caller can surface it.
+    fn drain_into_stash(&mut self) -> Result<(), String> {
+        loop {
+            match self.rx_resp.try_recv() {
+                Ok(ClientInbound::Resp { buf, t_recv, t4 }) => {
+                    let seq = proto::parse_header(buf.as_bytes()).map(|h| h.seq).unwrap_or(u32::MAX);
+                    self.stash.push((seq, buf, t_recv, t4));
+                }
+                Ok(ClientInbound::Err(e)) => return Err(e),
+                Err(mpsc::TryRecvError::Empty) => return Ok(()),
+                Err(mpsc::TryRecvError::Disconnected) => return Err("reader thread gone".into()),
             }
-            Err(mpsc::TryRecvError::Empty) => false,
-            Err(mpsc::TryRecvError::Disconnected) => true,
         }
     }
 
-    /// Block until the oldest in-flight request has answered. `ticket` must be
-    /// that request (FIFO).
-    pub fn wait(&mut self, ticket: Ticket) -> eyre::Result<RemotePartial> {
-        let head = self.in_flight.pop_front().ok_or_else(|| eyre!("wait: nothing in flight"))?;
-        if head.seq != ticket.seq {
-            return Err(eyre!("wait: ticket seq {} but oldest in flight is {}", ticket.seq, head.seq));
+    /// Non-blocking: has request `seq`'s reply arrived? Takes frames off the
+    /// channel into `stash` without consuming them, so `wait` still does all
+    /// the accounting. A broken link reports READY so the caller's `wait`
+    /// surfaces the error instead of spinning. A scheduling HINT for the
+    /// ready-first lane driver only -- correctness never depends on it,
+    /// because `wait` blocks for real either way.
+    pub fn ready(&mut self, seq: u32) -> bool {
+        if self.drain_into_stash().is_err() {
+            return true;
         }
+        self.stash.iter().any(|f| f.0 == seq)
+    }
+
+    /// `ready` for the oldest in-flight request (the FIFO-era API).
+    pub fn head_ready(&mut self) -> bool {
+        match self.head_seq() {
+            Some(s) => self.ready(s),
+            None => true,
+        }
+    }
+
+    /// Block until request `ticket` has answered. Any in-flight ticket may be
+    /// waited for, in any order: replies are matched by `seq`.
+    pub fn wait(&mut self, ticket: Ticket) -> eyre::Result<RemotePartial> {
+        let pos = self.in_flight.iter().position(|t| t.seq == ticket.seq)
+            .ok_or_else(|| eyre!("wait: ticket seq {} is not in flight", ticket.seq))?;
+        self.in_flight.remove(pos);
         // Stamped BEFORE the blocking recv, so we can tell "we waited for the
         // reply" apart from "the reply waited for us".
         let t_wait_enter = Instant::now();
-        // A frame `head_ready` already took off the channel comes first; its
-        // `t_recv` predates `t_wait_enter`, so it is correctly counted as slack.
-        let next = match self.stash.take() {
-            Some(m) => Ok(m),
-            None => self.rx_resp.recv(),
-        };
-        let (buf, t_recv, t4) = match next {
-            Ok(ClientInbound::Resp { buf, t_recv, t4 }) => {
-                use std::sync::atomic::Ordering::Relaxed;
-                let now = Instant::now();
-                if t_recv >= t_wait_enter {
-                    // We were already parked in recv() when the frame landed:
-                    // this is a genuine wakeup, and the remote leg was EXPOSED.
-                    HOP_WAIT_WAKE_NS.fetch_add((now - t_recv).as_nanos() as u64, Relaxed);
-                    HOP_N_BLOCKED.fetch_add(1, Relaxed);
-                } else {
-                    // The frame was already sitting in the channel: the remote
-                    // leg finished behind local work and cost us nothing.
-                    HOP_SLACK_NS.fetch_add((t_wait_enter - t_recv).as_nanos() as u64, Relaxed);
+        let mut found = self.stash.iter().position(|f| f.0 == ticket.seq).map(|i| self.stash.swap_remove(i));
+        while found.is_none() {
+            match self.rx_resp.recv() {
+                Ok(ClientInbound::Resp { buf, t_recv, t4 }) => {
+                    let seq = proto::parse_header(buf.as_bytes()).map(|h| h.seq).unwrap_or(u32::MAX);
+                    if seq == ticket.seq {
+                        found = Some((seq, buf, t_recv, t4));
+                    } else {
+                        self.stash.push((seq, buf, t_recv, t4));
+                    }
                 }
-                HOP_N.fetch_add(1, Relaxed);
-                (buf, t_recv, t4)
+                // Both arms mean the socket is gone, not that this reply was bad, so
+                // the link must be redialed before the next request rather than
+                // inherited: see `ensure_connected`.
+                Ok(ClientInbound::Err(e)) => {
+                    self.dead = true;
+                    return Err(eyre!("remote connection: {e}"));
+                }
+                Err(_) => {
+                    self.dead = true;
+                    return Err(eyre!("reader thread gone"));
+                }
             }
-            // Both arms mean the socket is gone, not that this reply was bad, so
-            // the link must be redialed before the next request rather than
-            // inherited: see `ensure_connected`.
-            Ok(ClientInbound::Err(e)) => {
-                self.dead = true;
-                return Err(eyre!("remote connection: {e}"));
+        }
+        let (_, buf, t_recv, t4) = found.expect("loop exits with a frame");
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let now = Instant::now();
+            if t_recv >= t_wait_enter {
+                // We were already parked in recv() when the frame landed:
+                // this is a genuine wakeup, and the remote leg was EXPOSED.
+                HOP_WAIT_WAKE_NS.fetch_add((now - t_recv).as_nanos() as u64, Relaxed);
+                HOP_N_BLOCKED.fetch_add(1, Relaxed);
+            } else {
+                // The frame was already sitting in the stash/channel: the remote
+                // leg finished behind local work and cost us nothing.
+                HOP_SLACK_NS.fetch_add((t_wait_enter - t_recv).as_nanos() as u64, Relaxed);
             }
-            Err(_) => {
-                self.dead = true;
-                return Err(eyre!("reader thread gone"));
-            }
-        };
+            HOP_N.fetch_add(1, Relaxed);
+        }
         let h = proto::parse_header(buf.as_bytes())?;
         if h.kind == proto::KIND_ERROR {
             let (st, msg) = proto::decode_error(&buf);
@@ -5096,6 +5316,15 @@ impl RemoteExpertClient {
     /// prefill window stride). Call from the request error path.
     pub fn drain_in_flight(&mut self) -> usize {
         let mut n = 0;
+        // Replies already stashed (out-of-order arrivals) answer in-flight
+        // tickets too; receiving for them would block forever.
+        for (seq, buf, ..) in std::mem::take(&mut self.stash) {
+            if let Some(pos) = self.in_flight.iter().position(|t| t.seq == seq) {
+                self.in_flight.remove(pos);
+                n += 1;
+            }
+            let _ = self.tx_resp_recycle.send(buf);
+        }
         while self.in_flight.pop_front().is_some() {
             match self.rx_resp.recv() {
                 Ok(ClientInbound::Resp { buf, .. }) => {
