@@ -348,7 +348,8 @@ fn remote_experts_loopback() -> eyre::Result<()> {
         };
         let (stream, _) = listener.accept()?;
         let opts = ServeOptions { socket: SocketOptions::default(), verbose: false, log_every: 0, keep_warm_us: 250, re_anchor_every: 512 };
-        v4flash_kernels::het::remote_experts::serve_connection(stream, &mut shard, &mut exec, &opts, None)
+        // Returns (records kept, requests served); the test only needs the records.
+        v4flash_kernels::het::remote_experts::serve_connection(stream, &mut shard, &mut exec, &opts, None).map(|(records, _)| records)
     });
     rx_ready.recv()??;
 
@@ -357,7 +358,7 @@ fn remote_experts_loopback() -> eyre::Result<()> {
     let ref_a = DenseRef::load(&hf, igpu, LAYER_A)?;
     let ref_b = DenseRef::load(&hf, igpu, LAYER_B)?;
     let mut rx = RefExec::new(igpu)?;
-    let mut client = RemoteExpertClient::connect(addr, &SocketOptions::default())?;
+    let mut client = RemoteExpertClient::connect(&addr.to_string(), &SocketOptions::default())?;
     let info = client.info().clone();
     assert_eq!(info.n_resident, 2 * N_SUB as u32);
     assert_eq!(info.owned_ids(LAYER_A), (0..N_SUB as u32).collect::<Vec<_>>());
