@@ -99,7 +99,6 @@ struct PrefillDone {
     started: Instant,
 }
 
-const CHUNK_SEND_FAILURES_MAX: u32 = 30;
 
 pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
     let n_slots = env_usize("V41_MS_SLOTS", 8) as u32;
@@ -1086,11 +1085,15 @@ fn emit(state: &WorkerState, s: &mut Stream, tok: i32) -> bool {
     match s.tx.try_send(WorkerEvent::Chunk { token_id: tok, bytes: raw, reasoning: s.in_think }) {
         Ok(()) => { s.send_failures = 0; true }
         Err(mpsc::error::TrySendError::Full(_)) => {
+            // NEVER skip a token and carry on: that hands the client a response
+            // with a silent hole in it. The buffer is `STREAM_CHUNK_BUFFER`
+            // tokens deep, so being full means the client has not read for
+            // minutes -- drop it cleanly and say so.
             s.send_failures += 1;
-            if s.send_failures > CHUNK_SEND_FAILURES_MAX {
-                tracing::warn!(slot = s.slot, "multistream: stream consumer slow; dropping client");
-                false
-            } else { true }
+            tracing::warn!(slot = s.slot, completion_tokens = s.completion_tokens,
+                buffered = crate::engine_worker::STREAM_CHUNK_BUFFER,
+                "multistream: stream consumer stalled (token buffer full); dropping client");
+            false
         }
         Err(mpsc::error::TrySendError::Closed(_)) => false,
     }

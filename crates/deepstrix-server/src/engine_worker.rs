@@ -38,6 +38,10 @@ use crate::vision_prompt::{
     shift_spans, span_hash_at, synthetic_token_bytes, ImageSpan, PreparedImage,
 };
 
+/// Tokens a stream may run ahead of its client before `emit` gives up on it
+/// (see `EngineHandle::submit`). ~27 min at 10 tok/s; a few hundred KB per stream.
+pub(crate) const STREAM_CHUNK_BUFFER: usize = 16_384;
+
 /// V4.1 Engram context: the n-gram hasher and one table handle per Engram layer
 /// (1 and 14). The tables themselves are 189 GiB on SSD and are never resident —
 /// each token gathers `ENGRAM_COLS` rows per layer through `gather_position`.
@@ -612,7 +616,13 @@ impl EngineHandle {
         req: GenerateReq,
         session_id: Option<String>,
     ) -> Result<(mpsc::Receiver<WorkerEvent>, Arc<AtomicBool>), SubmitError> {
-        let (tx, rx) = mpsc::channel(64);
+        // Per-stream token buffer between the engine and the SSE task. It was
+        // 64: a client pause of a few seconds filled it, after which the
+        // multistream `emit` silently DISCARDED tokens (the response came back
+        // with holes) and after 30 losses dropped the client and killed the
+        // generation -- ten drops on 2026-09-22 alone, one of them a 320K-token
+        // compaction. Token chunks are tiny, so buffer minutes, not seconds.
+        let (tx, rx) = mpsc::channel(STREAM_CHUNK_BUFFER);
         let cancel = Arc::new(AtomicBool::new(false));
         match self.tx.try_send(EngineRequest::Generate {
             req,
