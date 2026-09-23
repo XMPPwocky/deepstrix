@@ -296,7 +296,15 @@ fn main() -> eyre::Result<()> {
                 exec.read_f32(b, &mut r32)?;
                 reqs.push((b, xq, sel, ew, r32));
             }
-            for (b, xq, sel, ew, r32) in reqs {
+            for (j, (b, xq, sel, ew, r32)) in reqs.into_iter().enumerate() {
+                // `--gap-us`: space the submits so later frames land DURING the
+                // first request's miss read (the production case), not before it.
+                if j > 0 && args.gap_us > 0 {
+                    let t0 = Instant::now();
+                    while t0.elapsed().as_micros() < args.gap_us as u128 {
+                        std::hint::spin_loop();
+                    }
+                }
                 let t = submit_maybe_unmasked(&mut client, args.catchall, layer, b, &xq, &sel, &ew, proto::REQ_FLAG_BATCHED | proto::REQ_FLAG_RESP_F32)?
                     .ok_or_else(|| eyre!("no remote picks?"))?;
                 want.push((r32, t, b));

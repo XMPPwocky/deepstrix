@@ -2227,6 +2227,20 @@ impl ExpertShard {
         }
     }
 
+    /// Land every prefetch read that has COMPLETED, without waiting for any
+    /// (the park loop, `knobs::park`). `layer` is only the caller's current
+    /// layer for the dirty bookkeeping; nothing is protected beyond `pinned` /
+    /// `parked_pins`.
+    pub fn admit_landed(&mut self, layer: u32) -> eyre::Result<()> {
+        self.admit_prefetched(layer, &[])
+    }
+
+    /// Is any of `words` (`layer << 16 | expert`) still being read by the
+    /// prefetch readers (hinted, not yet admitted)?
+    pub fn prefetch_pending_any(&self, words: &[u32]) -> bool {
+        self.prefetch.as_ref().is_some_and(|pf| words.iter().any(|&w| pf.pending.contains(&((w >> 16), (w & 0xFFFF)))))
+    }
+
     /// `(hinted, admitted, dropped, waited)` since start.
     pub fn prefetch_stats(&self) -> Option<(u64, u64, u64, u64)> {
         self.prefetch.as_ref().map(|p| (p.hinted, p.admitted, p.dropped, p.waited))
@@ -4208,31 +4222,39 @@ pub fn serve_connection(
                     if !b2_early_page() {
                         return Ok(());
                     }
-                    while let Ok(m) = rx_in_ref.try_recv() {
-                        if let Inbound::Frame { hdr, buf, .. } = &m {
-                            if hdr.kind == proto::KIND_REQUEST {
-                                if let Ok(nreq) = proto::decode_request(buf) {
-                                    if shard.layer_is_paged(nreq.layer) {
-                                        let mut words: Vec<u32> = Vec::with_capacity(nreq.sel.len());
-                                        for &e in nreq.sel {
-                                            if (0..N_EXPERT as i32).contains(&e) && !shard.is_resident_pool(nreq.layer, e as u32) {
-                                                let w = (nreq.layer << 16) | e as u32;
-                                                if !words.contains(&w) { words.push(w); }
-                                            }
-                                        }
-                                        if !words.is_empty() {
-                                            shard.pinned = cur_pins.clone();
-                                            shard.prefetch_words_ex(&words, true);
-                                            shard.pinned.clear();
-                                        }
-                                    }
-                                }
+                    // A queued request's misses start reading as soon as its frame
+                    // is seen, pinned against this request's picks.
+                    let early_page = |shard: &mut ExpertShard, m: &Inbound| {
+                        let Inbound::Frame { hdr, buf, .. } = m else { return };
+                        if hdr.kind != proto::KIND_REQUEST {
+                            return;
+                        }
+                        let Ok(nreq) = proto::decode_request(buf) else { return };
+                        if !shard.layer_is_paged(nreq.layer) {
+                            return;
+                        }
+                        let mut words: Vec<u32> = Vec::with_capacity(nreq.sel.len());
+                        for &e in nreq.sel {
+                            if (0..N_EXPERT as i32).contains(&e) && !shard.is_resident_pool(nreq.layer, e as u32) {
+                                let w = (nreq.layer << 16) | e as u32;
+                                if !words.contains(&w) { words.push(w); }
                             }
                         }
-                        let stop = matches!(m, Inbound::Closed(_));
-                        pending_ref.push_back(m);
-                        if stop { break; }
-                    }
+                        if !words.is_empty() {
+                            shard.pinned = cur_pins.clone();
+                            shard.prefetch_words_ex(&words, true);
+                            shard.pinned.clear();
+                        }
+                    };
+                    let pull = |shard: &mut ExpertShard, pending: &mut std::collections::VecDeque<Inbound>| {
+                        while let Ok(m) = rx_in_ref.try_recv() {
+                            early_page(shard, &m);
+                            let stop = matches!(m, Inbound::Closed(_));
+                            pending.push_back(m);
+                            if stop { break; }
+                        }
+                    };
+                    pull(shard, pending_ref);
                     if !(park && may_park) {
                         return Ok(());
                     }
@@ -4247,49 +4269,85 @@ pub fn serve_connection(
                             _ => false,
                         }
                     };
-                    if !pending_ref.front().is_some_and(|m| servable(m)) {
-                        return Ok(());
-                    }
-                    // Start the parked request's reads NOW, before serving.
+                    // Hand this request's misses to the prefetch readers NOW,
+                    // whether or not anything is queued yet: the other lane's
+                    // frame usually lands DURING the read (checking once, before
+                    // it, parked 2-5 of ~2000 requests on 2026-09-23). Then, until
+                    // the reads have landed, serve every servable frame that
+                    // arrives. `ensure` afterwards admits what is left.
                     let words = std::mem::take(&mut shard.park_words);
                     shard.prefetch_words_ex(&words, true);
-                    shard.park_words = words;
-                    if exec2_ref.is_none() {
-                        *exec2_ref = Some(MoeExecutor::new(exec_device, rows2, exec_decode_max_b)?);
-                        eprintln!("expertd: park executor ready ({rows2} rows)");
-                    }
-                    let ex2 = exec2_ref.as_mut().unwrap();
-                    *parks_ref += 1;
                     static PARK_LOG: std::sync::LazyLock<bool> =
                         std::sync::LazyLock::new(|| std::env::var("V41_B2_PARK_LOG").as_deref() == Ok("1"));
-                    if *PARK_LOG {
-                        eprintln!("expertd: park L{} misses={} queued={}", req.layer, shard.park_words.len(), pending_ref.len());
-                    }
-                    while pending_ref.front().is_some_and(|m| servable(m)) {
-                        let Some(Inbound::Frame { hdr, buf, t_first, t_done, t2 }) = pending_ref.pop_front() else { unreachable!() };
-                        let resp = rx_resp_recycle_ref.try_recv().unwrap_or_else(|_| AlignedBuf::with_capacity(proto::RESP_DATA_OFF + exec_rows * N_EMBD as usize * 4));
-                        let out = serve_interleaved(ex2, shard, &hdr, &buf, t_first, t_done, t2, resp);
-                        let _ = tx_req_recycle_ref.send(buf);
-                        match out {
-                            Ok((rec, resp)) => {
-                                let t_ready = rec.t_ready;
-                                records_ref.push(rec);
-                                if tx_out_ref.send((resp, t_ready, hdr.seq)).is_err() {
-                                    return Err(eyre!("writer thread gone"));
+                    // Bound: a lost read (dropped hint, failed prefetch) falls
+                    // through to `ensure`, which reads it itself.
+                    const PARK_MAX: Duration = Duration::from_millis(50);
+                    let t_park = Instant::now();
+                    let mut counted = false;
+                    loop {
+                        while pending_ref.front().is_some_and(|m| servable(m)) {
+                            if exec2_ref.is_none() {
+                                *exec2_ref = Some(MoeExecutor::new(exec_device, rows2, exec_decode_max_b)?);
+                                eprintln!("expertd: park executor ready ({rows2} rows)");
+                            }
+                            if !counted {
+                                counted = true;
+                                *parks_ref += 1;
+                                if *PARK_LOG {
+                                    eprintln!("expertd: park L{} misses={} queued={} after {} us", req.layer, words.len(), pending_ref.len(), t_park.elapsed().as_micros());
                                 }
-                                *n_done_ref += 1;
-                                *park_served_ref += 1;
                             }
-                            Err(e) => {
-                                let msg = format!("{e:#}");
-                                eprintln!("expertd: interleaved request seq {} failed: {msg}", hdr.seq);
-                                let mut eb = AlignedBuf::with_capacity(4096);
-                                proto::encode_error(&mut eb, hdr.seq, 1, &msg);
-                                let _ = tx_out_ref.send((eb, Instant::now(), hdr.seq));
-                                return Err(eyre!("interleaved request failed: {msg}"));
+                            let ex2 = exec2_ref.as_mut().unwrap();
+                            let Some(Inbound::Frame { hdr, buf, t_first, t_done, t2 }) = pending_ref.pop_front() else { unreachable!() };
+                            let resp = rx_resp_recycle_ref.try_recv().unwrap_or_else(|_| AlignedBuf::with_capacity(proto::RESP_DATA_OFF + exec_rows * N_EMBD as usize * 4));
+                            let out = serve_interleaved(ex2, shard, &hdr, &buf, t_first, t_done, t2, resp);
+                            let _ = tx_req_recycle_ref.send(buf);
+                            match out {
+                                Ok((rec, resp)) => {
+                                    let t_ready = rec.t_ready;
+                                    records_ref.push(rec);
+                                    if tx_out_ref.send((resp, t_ready, hdr.seq)).is_err() {
+                                        return Err(eyre!("writer thread gone"));
+                                    }
+                                    *n_done_ref += 1;
+                                    *park_served_ref += 1;
+                                }
+                                Err(e) => {
+                                    let msg = format!("{e:#}");
+                                    eprintln!("expertd: interleaved request seq {} failed: {msg}", hdr.seq);
+                                    let mut eb = AlignedBuf::with_capacity(4096);
+                                    proto::encode_error(&mut eb, hdr.seq, 1, &msg);
+                                    let _ = tx_out_ref.send((eb, Instant::now(), hdr.seq));
+                                    return Err(eyre!("interleaved request failed: {msg}"));
+                                }
                             }
+                            pull(shard, pending_ref);
+                        }
+                        // Land finished reads (never blocks: nothing is `want`ed);
+                        // this request's picks are pinned, so none is a victim.
+                        shard.admit_landed(req.layer)?;
+                        if !shard.prefetch_pending_any(&words) || t_park.elapsed() >= PARK_MAX {
+                            break;
+                        }
+                        // Anything already queued that is NOT servable waits its
+                        // turn behind us anyway; stop polling for it.
+                        if pending_ref.front().is_some_and(|m| !servable(m)) {
+                            break;
+                        }
+                        match rx_in_ref.recv_timeout(Duration::from_micros(100)) {
+                            Ok(m) => {
+                                early_page(shard, &m);
+                                let stop = matches!(m, Inbound::Closed(_));
+                                pending_ref.push_back(m);
+                                if stop {
+                                    break;
+                                }
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         }
                     }
+                    shard.park_words = words;
                     Ok(())
                 };
                 let (xq_m, sel_m, ew_m);
