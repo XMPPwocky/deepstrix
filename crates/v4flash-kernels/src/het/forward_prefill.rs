@@ -5127,8 +5127,8 @@ impl HeterogeneousEngine {
                         de.candidate_blocks.launch_build(
                             &de.compute,
                             &sd.indexer_scores,
-                            &mut sd.candidate_block_score,
-                            &mut sd.candidate_threshold,
+                            &mut bd.candidate_block_score,
+                            &mut bd.candidate_threshold,
                             sd.n_index_comp_per_b.raw(),
                             ATTN_MIXED_MAX_KEYS,
                             nb_stride,
@@ -5139,8 +5139,8 @@ impl HeterogeneousEngine {
                         de.candidate_blocks.launch_mask(
                             &de.compute,
                             &mut sd.indexer_scores,
-                            &sd.candidate_block_score,
-                            &sd.candidate_threshold,
+                            &bd.candidate_block_score,
+                            &bd.candidate_threshold,
                             sd.n_index_comp_per_b.raw(),
                             ATTN_MIXED_MAX_KEYS,
                             nb_stride,

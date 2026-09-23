@@ -10,6 +10,37 @@ Status key: **OPEN** / *MITIGATED* / ~~FIXED~~
 
 ## Open
 
+### 27. FIXED 2026-09-23 — the candidate-pool mask was ONE buffer shared by every lane: in a two-lane step, lane A's rows were masked with lane B's rows' blocks (another STREAM's) on layers 24-39
+
+`candidate_block_score` / `candidate_threshold` (ARCH_SPEC §1.5: layer 20 publishes
+each row's top-2048 blocks and a threshold; index sources 24/28/32/36 mask their
+indexer scores to them) lived in `BatchDgpuShared`, which every lane of every
+multi-lane driver shares. The drivers interleave lanes layer by layer
+(ready-first `V41_MS_STAGGER=2`, pipelined, `_lanes`, and the pipelined prefill), so
+lane B's layer-20 build overwrote the buffers before lane A's layers 24-36 read
+them: lane A's row i was masked with lane B's row i's ranking and threshold. When
+lane B's row belongs to a stream with > 16384 comp rows (16K tokens; layers 20+ are
+ratio 1) the mask is live, so lane A's stream -- at ANY context length above the
+512-row top-k, including 1.5K -- kept only blocks another conversation's query
+chose, on 4 index sources and the 12 reuse layers that inherit their top-k. Same
+class as `indexer_sel_saved`, which had already been moved per lane for this reason.
+Production ran >= `V41_MS_PIPELINE_MIN_ROWS` (4) rows almost all the time with 5-8
+agent streams, so most decode tokens were affected.
+
+Symptoms (live probes `~/scratch-ms/quality/echo2.py`, 2026-09-23, 5-8 rows):
+verbatim echo of a 100-word passage buried in 1.5K tokens failed at word 6-11 with
+invented words; at 6K and 24K (passage near the start) it looped (4-gram repeat 0.57-
+0.90, hit max_tokens). Prompts <= ~500 tokens were clean (top-k keeps every row, the
+mask cannot remove anything) and so were 8K/96K needle probes (salient single codes;
+layers 0-23 suffice). Stored KV and snapshots are NOT affected: only layers
+2/8/14/20 own KV and index keys, all written before the mask; the prefill form only
+touched lane A's hidden states, whose logits are discarded.
+
+Fix: the two buffers are per-lane `BatchDgpuScratch` fields (+~95 MB dGPU per 512-row
+lane). Gap that let it through: the multistream_step gates use 5-260-token prompts,
+below both the 512-row top-k and the 16384-row mask threshold. A lane-isolation
+gate needs a lane-B stream > 16K comp rows next to a short lane-A stream.
+
 ### 26. FIXED 2026-09-21 — a legacy (image) request head-of-line blocked the multistream queue
 
 `Sched::tick`'s start loop popped the next request and, if it needed the legacy
