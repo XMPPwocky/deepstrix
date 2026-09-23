@@ -88,6 +88,11 @@ struct Prefill {
     /// Tower output for the request's images (empty when none): rows for
     /// the synthetic image ids, spliced into the chunk inputs.
     vl: EncodedImages,
+    /// Save the prompt snapshot at finish? False when the restored snapshot
+    /// already covers the whole prompt and only the think marker is prefilled:
+    /// prompt + marker is a key the prefix walk (EOS/Assistant/User
+    /// boundaries) can never match, and it took one of the lineage's slots.
+    save_at_finish: bool,
 }
 
 /// `Prefill` after its scratch state has been recycled.
@@ -467,31 +472,33 @@ impl Sched {
         if std::env::var("DEEPSTRIX_SNAPSHOT_REUSE").as_deref() != Ok("0") {
             let hit_session = p.session_id.as_deref().and_then(|sid| state.snapshot_index.lookup_session(sid, tokens));
             let hit_walk = state.snapshot_index.find_longest_prefix(tokens, &p.req.image_spans, TOK_EOS, TOK_ASSISTANT, TOK_USER, state.vocab.as_ref(), &state.byte_decoder);
-            let hit = match (hit_session, hit_walk) {
-                (Some(a), Some(b)) => Some(if a.0 >= b.0 { a } else { b }),
-                (a, b) => a.or(b),
-            };
-            if let Some((snap_req_tokens, snap_hash, snap_dir)) = hit {
+            // Candidates, longest first (the session hint wins a tie). Each one
+            // that fails -- load error or not a token prefix -- falls through
+            // to the NEXT instead of to a full prefill: at 180K tokens a failed
+            // session hint used to throw away a perfectly good walk match and
+            // cost minutes of prefill (enough to trip the client's timeout).
+            for (snap_req_tokens, snap_hash, snap_dir) in restore_candidates(hit_session, hit_walk) {
                 // Keep >= 1 suffix token to prefill (or a marker to forward).
                 let usable = snap_req_tokens >= 64 && (snap_req_tokens < tokens.len() || p.trailing_marker.is_some());
-                if usable {
-                    match snapshot::restore_vl(&mut kv, &snap_dir, state.dgpu, state.igpu, &state.model_fingerprint,
-                        snapshot::RestoreKernels { fp8: &state.engine.dgpu.comp_kv_fp8, stream: &state.engine.dgpu.compute }) {
-                        Ok(r) => {
-                            if r.tokens.len() <= tokens.len() && tokens[..r.tokens.len()] == r.tokens[..] {
-                                let _ = state.snapshot_index.touch(&snap_hash);
-                                prefix = r.tokens;
-                                tracing::info!(restored = prefix.len(), total = tokens.len(), ms = t0.elapsed().as_millis() as u64, "multistream: snapshot restored");
-                            } else {
-                                tracing::warn!("multistream: restored snapshot is not a token prefix of the request; full prefill");
-                                if let Err(e) = kv.reset_in_place(state.dgpu, state.igpu) { return Err((p, kv, e)); }
-                            }
+                if !usable {
+                    continue;
+                }
+                match snapshot::restore_vl(&mut kv, &snap_dir, state.dgpu, state.igpu, &state.model_fingerprint,
+                    snapshot::RestoreKernels { fp8: &state.engine.dgpu.comp_kv_fp8, stream: &state.engine.dgpu.compute }) {
+                    Ok(r) => {
+                        if r.tokens.len() <= tokens.len() && tokens[..r.tokens.len()] == r.tokens[..] {
+                            let _ = state.snapshot_index.touch(&snap_hash);
+                            prefix = r.tokens;
+                            tracing::info!(restored = prefix.len(), total = tokens.len(), ms = t0.elapsed().as_millis() as u64, "multistream: snapshot restored");
+                            break;
                         }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "multistream: snapshot restore failed; evicting, full prefill");
-                            state.snapshot_index.evict(&snap_hash, "multistream: restore failed");
-                            if let Err(e) = kv.reset_in_place(state.dgpu, state.igpu) { return Err((p, kv, e)); }
-                        }
+                        tracing::warn!("multistream: restored snapshot is not a token prefix of the request; trying the next candidate");
+                        if let Err(e) = kv.reset_in_place(state.dgpu, state.igpu) { return Err((p, kv, e)); }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "multistream: snapshot restore failed; evicting, trying the next candidate");
+                        state.snapshot_index.evict(&snap_hash, "multistream: restore failed");
+                        if let Err(e) = kv.reset_in_place(state.dgpu, state.igpu) { return Err((p, kv, e)); }
                     }
                 }
             }
@@ -527,7 +534,7 @@ impl Sched {
             Ok(v) => v,
             Err(e) => return Err((p, kv, e)),
         };
-        let mut pf = Prefill { p, job, kv, prefix, compressed, started: t0, vl };
+        let mut pf = Prefill { p, job, kv, prefix, compressed, started: t0, vl, save_at_finish: !marker_in_prefill };
         if marker_in_prefill {
             pf.p.trailing_marker = None; // consumed
             pf.prefix.push(suffix[0]);
@@ -549,13 +556,16 @@ impl Sched {
             // agent's HTTP limit is ~15 min) re-sends the same prompt, and
             // without this the retry started from zero (2026-09-20: a 135K
             // prompt lost 115K prefilled tokens). The encoder state at a chunk
-            // boundary is exactly what a resumed prefill restores (the decoder
-            // rings are rebuilt by the replay at finish either way), so the
-            // snapshot key is the prefix plus the suffix rows done so far.
+            // boundary is exactly what a resumed prefill restores, so the
+            // snapshot key is the prefix plus the suffix rows done so far. The
+            // DECODER rings are not: under CED the chunks never touch them, so
+            // they are saved EMPTY (a resume replays onto empty rings, like a
+            // fresh prompt) rather than stale by `done` positions.
             let done = pf.job.done_rows();
             if done >= checkpoint_min_rows() && !pf.job.chunks_done() {
                 let t = Instant::now();
                 pf.kv.restore_compressor_lending();
+                pf.job.clear_decoder_rings_for_checkpoint(&mut pf.kv);
                 let mut tokens_saved: Vec<i32> = pf.prefix.clone();
                 tokens_saved.extend_from_slice(&pf.job.tokens()[..done]);
                 let spans_saved = crate::vision_prompt::spans_in_range(&pf.p.req.image_spans, 0, tokens_saved.len()).unwrap_or_default();
@@ -613,12 +623,14 @@ impl Sched {
                 // 32768): a server restart does not run the cancel path, so a
                 // long prefill used to restart from zero (2026-09-22: a 262K
                 // prompt lost 98K rows). The encoder state at a chunk boundary is
-                // what a resumed prefill restores.
+                // what a resumed prefill restores; the decoder rings are saved
+                // empty (see the cancel checkpoint above).
                 let every = env_usize("V41_MS_CHECKPOINT_EVERY", 32768);
                 let done = pf.job.done_rows();
                 if every > 0 && done >= every && (done - rows) / every != done / every {
                     let t = Instant::now();
                     pf.kv.restore_compressor_lending();
+                    pf.job.clear_decoder_rings_for_checkpoint(&mut pf.kv);
                     let mut tokens_saved: Vec<i32> = pf.prefix.clone();
                     tokens_saved.extend_from_slice(&pf.job.tokens()[..done]);
                     let spans_saved = crate::vision_prompt::spans_in_range(&pf.p.req.image_spans, 0, tokens_saved.len()).unwrap_or_default();
@@ -643,17 +655,19 @@ impl Sched {
         };
         kv.restore_compressor_lending();
         // Snapshot the prompt (the legacy path saves here too, before the marker).
-        let tokens_saved: Vec<i32> = pf.prefix.clone();
         flush_expert_stats(state);
-        let spans_saved = crate::vision_prompt::spans_in_range(&pf.p.req.image_spans, 0, tokens_saved.len()).unwrap_or_default();
-        match snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
-            state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, pf.p.session_id.as_deref()) {
-            Ok(entry) => {
-                let hash = entry.hash;
-                state.snapshot_index.insert(entry);
-                if let Some(sid) = pf.p.session_id.clone() { state.snapshot_index.session_to_hash.insert(sid, hash); }
+        if pf.save_at_finish {
+            let tokens_saved: Vec<i32> = pf.prefix.clone();
+            let spans_saved = crate::vision_prompt::spans_in_range(&pf.p.req.image_spans, 0, tokens_saved.len()).unwrap_or_default();
+            match snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
+                state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, pf.p.session_id.as_deref()) {
+                Ok(entry) => {
+                    let hash = entry.hash;
+                    state.snapshot_index.insert(entry);
+                    if let Some(sid) = pf.p.session_id.clone() { state.snapshot_index.session_to_hash.insert(sid, hash); }
+                }
+                Err(e) => tracing::error!(error = %e, "multistream: snapshot.save failed"),
             }
-            Err(e) => tracing::error!(error = %e, "multistream: snapshot.save failed"),
         }
         self.try_admit(state, pf, logits)
     }
@@ -692,7 +706,7 @@ impl Sched {
             }
         };
         if let Err(e) = state.engine.dgpu.compute.synchronize() { return Err((Some(pf.kv), e)); }
-        let Prefill { p: pp, job, kv: kv_done, prefix, compressed, started, vl: _ } = pf;
+        let Prefill { p: pp, job, kv: kv_done, prefix, compressed, started, vl: _, save_at_finish: _ } = pf;
         self.spare_states.push(kv_done);
         let pf = PrefillDone { p: pp, job, prefix, compressed, started };
         self.admit_stream(state, pf, slot, logits).map_err(|e| (None, e))
@@ -1021,6 +1035,37 @@ impl Sched {
         tracing::info!(rows = b, step_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1e3), fwd_ms = format!("{fwd_ms:.1}"),
             engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(), "ms.step");
         Ok(())
+    }
+}
+
+/// Snapshot restore candidates in the order to try them: longest first, the
+/// session hint winning a tie, the same snapshot never twice. `start_prefill`
+/// falls through to the next one when a restore fails.
+fn restore_candidates<H: PartialEq, D>(session: Option<(usize, H, D)>, walk: Option<(usize, H, D)>) -> Vec<(usize, H, D)> {
+    match (session, walk) {
+        (Some(a), Some(b)) if a.1 == b.1 => vec![a],
+        (Some(a), Some(b)) if a.0 >= b.0 => vec![a, b],
+        (Some(a), Some(b)) => vec![b, a],
+        (a, b) => a.into_iter().chain(b).collect(),
+    }
+}
+
+#[cfg(test)]
+mod restore_candidate_tests {
+    use super::restore_candidates;
+
+    #[test]
+    fn longest_first_session_wins_ties_no_duplicates() {
+        // Regression (2026-09-23): a failed session-hint restore used to fall
+        // straight to a FULL prefill; now every candidate is tried in order.
+        let order = |s, w| restore_candidates::<u8, &str>(s, w).into_iter().map(|c| c.2).collect::<Vec<_>>();
+        assert_eq!(order(Some((100, 1, "sess")), Some((90, 2, "walk"))), vec!["sess", "walk"]);
+        assert_eq!(order(Some((80, 1, "sess")), Some((90, 2, "walk"))), vec!["walk", "sess"]);
+        assert_eq!(order(Some((90, 1, "sess")), Some((90, 2, "walk"))), vec!["sess", "walk"], "tie: session hint first");
+        assert_eq!(order(Some((90, 7, "sess")), Some((90, 7, "walk"))), vec!["sess"], "same snapshot only once");
+        assert_eq!(order(None, Some((90, 2, "walk"))), vec!["walk"]);
+        assert_eq!(order(Some((90, 1, "sess")), None), vec!["sess"]);
+        assert!(order(None, None).is_empty());
     }
 }
 

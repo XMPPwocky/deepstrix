@@ -819,13 +819,24 @@ impl SaveScratch {
         n: usize,
         out: &mut BlobWriter,
     ) -> eyre::Result<()> {
+        self.stream_u16_at(buf, 0, n, out)
+    }
+    /// Copy elements `[off, off + n)` of `buf` to the host and append them,
+    /// little-endian, to `out`.
+    fn stream_u16_at(
+        &mut self,
+        buf: &v4flash_hip::DeviceBuffer<u16>,
+        off: usize,
+        n: usize,
+        out: &mut BlobWriter,
+    ) -> eyre::Result<()> {
         if n == 0 {
             return Ok(());
         }
         if self.u16s.len() < n {
             self.u16s.resize(n, 0);
         }
-        buf.slice_view(0, n).copy_to_host(&mut self.u16s[..n])?;
+        buf.slice_view(off, n).copy_to_host(&mut self.u16s[..n])?;
         self.bytes.clear();
         self.bytes.reserve(n * 2);
         for v in &self.u16s[..n] {
@@ -1032,11 +1043,16 @@ pub fn save(
     for (li, layer) in state.layers.iter().enumerate() {
         let ratio = COMPRESS_RATIOS[li];
         let kv_rows = layer.n_raw.min(SWA_WINDOW);
-        // Only the live prefix is read (slice_view) and it is streamed
-        // straight to the file — no full-capacity host copy, no blob.
+        // Only the live window is read (slice_view) and it is streamed
+        // straight to the file — no full-capacity host copy, no blob. It
+        // starts at `raw_off`, not slot 0: the decode append is monotonic and
+        // slides `raw_off` past SWA_WINDOW, so a state saved after a long
+        // decode (the legacy `save_live_if_dirty`) used to write the rows that
+        // had already been evicted. Restore puts them at slot 0, `raw_off = 0`.
         dgpu.set_current()?;
         let kv_used_n = (kv_rows as usize) * (N_HEAD_DIM as usize);
-        scratch.stream_u16(&layer.kv_cache, kv_used_n, &mut kv_blob)?;
+        let kv_first = (layer.raw_off + layer.n_raw - kv_rows) as usize * (N_HEAD_DIM as usize);
+        scratch.stream_u16_at(&layer.kv_cache, kv_first, kv_used_n, &mut kv_blob)?;
 
         let mut comp_kv_format = CompKvFormat::F16;
         let mut comp_kv_row_bytes = 0u32;
@@ -1352,6 +1368,7 @@ pub fn restore_vl(
         dgpu.set_current()?;
         scratch.load_u16(&mut kv_rd, kv_count, &mut layer.kv_cache)?;
         layer.n_raw = m.n_raw;
+        layer.raw_off = 0; // saved rows land at slot 0 (see the save side)
 
         if m.has_compressor {
             let Some(comp) = &mut layer.compressor else {
@@ -1428,21 +1445,41 @@ pub fn restore_vl(
             // back 0 and the decode gate (`n_index_comp > INDEXER_TOP_K`) can
             // never fire on a restored session, so every layer scores densely.
             //
-            // Restoring a PARTIAL key store would be worse than restoring none:
-            // the top-512 selection would run over a candidate set missing the
-            // restored prefix and silently attend to the wrong rows. So it is
-            // all-or-nothing — a short/absent blob resets the store to empty and
-            // the session simply runs dense, which is what it did before v6.
+            // A key store that does not cover every compressed row is REFUSED:
+            // the snapshot is a cache miss (callers evict it and prefill fully).
+            // It used to "degrade" to `n_index_comp = 0` with `n_comp` kept, on
+            // the theory that the session would run dense -- but the next
+            // prefill appends keys from `n_comp` on and then declares the whole
+            // store valid (`n_index_comp = n_comp_start + fired`), while the
+            // indexer scores `n_comp` rows: rows [0, n_comp) were whatever the
+            // reused scratch state last held, i.e. ANOTHER request's keys, and
+            // the next snapshot saved them as valid for the rest of the chain.
             match (comp.index_k.as_mut(), m.has_index_k) {
                 (Some(ik), true) => {
                     let want = (m.n_index_k as usize) * E2M1_KEY_ROW_BYTES;
-                    if want > 0 && index_k_rd.has(want) {
+                    if m.n_index_k != m.n_comp {
+                        return Err(eyre!(
+                            "snapshot.restore: layer {li} holds {} index keys for {} compressed rows",
+                            m.n_index_k, m.n_comp
+                        ));
+                    }
+                    if want > 0 {
+                        if !index_k_rd.has(want) {
+                            return Err(eyre!(
+                                "snapshot.restore: layer {li} index_k.bin is short ({} key rows expected)",
+                                m.n_index_k
+                            ));
+                        }
                         dgpu.set_current()?;
                         scratch.load_u8(&mut index_k_rd, want, ik)?;
-                        comp.n_index_comp = m.n_index_k;
-                    } else {
-                        comp.n_index_comp = 0;
                     }
+                    comp.n_index_comp = m.n_index_k;
+                }
+                (Some(_), false) if m.n_comp > 0 => {
+                    return Err(eyre!(
+                        "snapshot.restore: layer {li} has {} compressed rows but no index keys",
+                        m.n_comp
+                    ));
                 }
                 (Some(_), false) => comp.n_index_comp = 0,
                 (None, _) => {}

@@ -265,7 +265,14 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     let eng_dec: &HeterogeneousEngine = engine_dec.as_ref().unwrap_or(&engine);
     let mut ds = DgpuScratch::alloc(dgpu)?;
     let mut is = IgpuScratch::alloc(igpu)?;
-    let n_kv_max: u32 = (max_len + n_steps + 64).next_power_of_two().max(1024) as u32;
+    // MS_DIAG=restore[:P,S] (see the restore block below) needs P + S positions.
+    let restore_ps: Option<(usize, usize)> = std::env::var("MS_DIAG").ok().and_then(|d| {
+        let r = d.strip_prefix("restore")?.trim_start_matches(':').to_string();
+        let mut it = r.split(',').filter(|x| !x.is_empty()).map(|x| x.trim().parse::<usize>().unwrap());
+        Some((it.next().unwrap_or(600), it.next().unwrap_or(500)))
+    });
+    let restore_need = restore_ps.map(|(p, s)| p + s).unwrap_or(0);
+    let n_kv_max: u32 = (max_len.max(restore_need) + n_steps + 64).next_power_of_two().max(1024) as u32;
     let lane_rows = v4flash_kernels::het::batch_scratch::B_MAX.div_ceil(2);
     let mut bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
     let mut bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
@@ -281,6 +288,61 @@ fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
         tables.push(EngramTable::open(pg.raw(), l as usize)?);
     }
     let engram = Engram { hasher, tables };
+
+    // MS_DIAG=restore[:P,S] -- REGRESSION for KNOWN_BUGS #28 (2026-09-23): a
+    // continuation (snapshot restored at P, suffix S) must match an
+    // UNINTERRUPTED prefill of P+S. Under CED the replay runs only the last
+    // SWA_WINDOW rows; with S > SWA_WINDOW the decoder rings used to keep the
+    // previous turn's rows from `S - 128` positions back and attend them as
+    // neighbours. Gate: KL(fresh || continued) on the last row below
+    // MS_RESTORE_KLD (default 0.05; the only legitimate difference is the chunk
+    // split). A short suffix (S = 60, the #25 path: rings kept by design) is
+    // reported, not gated -- it is not expected to equal a fresh prefill.
+    if let Some((plen, slen)) = restore_ps {
+        let bar = env_f64("MS_RESTORE_KLD", 0.05);
+        let chunk = env_usize("MS_RESTORE_CHUNK", 1024);
+        let ein = ENGRAM_IN as usize;
+        let mut worst = 0f64;
+        let run = |toks: &[i32], pos0: usize, rows_all: &[Vec<f32>], st: &mut HetModelState,
+                   bd_a: &mut BatchDgpuScratch, bi_a: &mut BatchIgpuScratch, bd_b: &mut BatchDgpuScratch, bi_b: &mut BatchIgpuScratch,
+                   sd: &mut BatchDgpuShared, si: &mut BatchIgpuShared, ds: &mut DgpuScratch, pg: &mut ExpertPager| -> eyre::Result<Vec<f32>> {
+            let hcs: Vec<Vec<f32>> = toks.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
+            let rows: Vec<Vec<f32>> = rows_all.iter().map(|r| r[pos0 * ein..(pos0 + toks.len()) * ein].to_vec()).collect();
+            let mut job = v4flash_kernels::het::forward_prefill::PrefillJob::new(toks.to_vec(), hcs, Some(rows), None, pos0 as u32, chunk)?;
+            while !job.chunks_done() {
+                engine.prefill_job_chunk(&mut job, bd_a, bi_a, bd_b, bi_b, sd, si, ds, st, &weights, Some(pg))?;
+            }
+            let l = engine.prefill_job_finish(&mut job, bd_a, bi_a, bd_b, bi_b, sd, si, ds, st, &weights, Some(pg))?;
+            st.restore_compressor_lending();
+            engine.dgpu.compute.synchronize()?;
+            Ok(l)
+        };
+        for (case, (seed, s_len, gated)) in [(1u64, slen, true), (2u64, slen, true), (3u64, 60usize, false)].into_iter().enumerate() {
+            let p = synth_prompt(seed * 101, plen);
+            let sfx = synth_prompt(seed * 101 + 7, s_len);
+            let full: Vec<i32> = p.iter().chain(sfx.iter()).copied().collect();
+            let rows_all = engram.rows_for_prompt(pg.raw(), &full)?;
+            let mut st_f = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
+            let l_fresh = run(&full, 0, &rows_all, &mut st_f, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut pg)?;
+            drop(st_f);
+            let mut st_c = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
+            let _ = run(&p, 0, &rows_all, &mut st_c, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut pg)?;
+            let l_cont = run(&sfx, p.len(), &rows_all, &mut st_c, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut pg)?;
+            let kl = kld(&l_fresh, &l_cont);
+            eprintln!(
+                "restore case {case}: P={} S={} KL(fresh||continued) {kl:.5} argmax {} / {}{}",
+                p.len(), sfx.len(), argmax(&l_fresh), argmax(&l_cont), if gated { "" } else { "  (S <= SWA_WINDOW: report only)" }
+            );
+            if gated {
+                worst = worst.max(kl);
+            }
+        }
+        if worst > bar {
+            return Err(eyre!("MS_DIAG=restore failed: worst KL(fresh||continued) {worst:.5} > {bar} (KNOWN_BUGS #28 regression?)"));
+        }
+        eprintln!("MS_DIAG=restore: OK (worst gated KL {worst:.5} <= {bar})");
+        return Ok(());
+    }
 
     // Arenas: one slot per stream in both; the store cap covers every stream.
     let comp_rows_cap = (n_streams as u32) * n_kv_max;

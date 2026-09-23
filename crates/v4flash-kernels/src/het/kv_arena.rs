@@ -399,8 +399,20 @@ impl KvArena {
         if n_raw > SWA_WINDOW || pos < n_raw || n_raw_dec > SWA_WINDOW || pos < n_raw_dec {
             return Err(eyre!("kv arena: source windows {n_raw}/{n_raw_dec} rows at pos {pos}"));
         }
-        let raw_off = src.layers[0].raw_off;
         let slot = self.admit(ctx_cap.max(pos + 1), pos)?;
+        // Any failure below must give the slot back: it used to stay allocated
+        // with no Stream owning it, and a parked request retried every tick.
+        match self.fill_admitted(src, slot, n_raw, n_raw_dec, stream) {
+            Ok(()) => Ok(slot),
+            Err(e) => {
+                let _ = self.release(slot);
+                Err(e)
+            }
+        }
+    }
+
+    /// Copy `src`'s live KV into freshly admitted `slot` (`admit_from_state`).
+    fn fill_admitted(&mut self, src: &HetModelState, slot: u32, n_raw: u32, n_raw_dec: u32, stream: &Stream) -> eyre::Result<()> {
         let hd = N_HEAD_DIM as usize;
         self.dgpu.set_current()?;
         let region = Self::raw_region_base(slot) as usize;
@@ -413,7 +425,6 @@ impl KvArena {
             let mut dv = dst.kv_cache.slice_view_mut(region * hd, win);
             dv.copy_from_buffer_async(&sv, stream)?;
         }
-        let _ = raw_off;
         let mut comp = Vec::with_capacity(self.stores.len());
         for (si, st) in self.stores.iter().enumerate() {
             let l = st.layer;
@@ -422,7 +433,12 @@ impl KvArena {
             })?;
             let dcs = self.state.layers[l].compressor.as_mut().expect("arena store");
             let region = self.streams[slot as usize].as_ref().expect("just admitted").comp[si];
-            if scs.n_comp > region.cap || scs.n_index_comp > scs.n_comp {
+            // Keys must cover EVERY comp row when the layer has a key store: the
+            // indexer scores `n_comp` rows, so a gap would be scored as whatever
+            // the region held before (another stream's keys).
+            if scs.n_comp > region.cap || scs.n_index_comp > scs.n_comp
+                || (scs.index_k.is_some() && scs.n_index_comp != scs.n_comp)
+            {
                 return Err(eyre!(
                     "kv arena: L{l} source has {} comp rows ({} keys), region holds {}",
                     scs.n_comp, scs.n_index_comp, region.cap
@@ -464,7 +480,7 @@ impl KvArena {
         s.n_raw_dec = n_raw_dec;
         s.raw_off_dec = 0;
         s.comp = comp;
-        Ok(slot)
+        Ok(())
     }
 
     /// Inverse of `admit_from_state`: copy `slot`'s live KV into a single-sequence

@@ -495,6 +495,23 @@ impl PrefillJob {
         })
     }
     pub fn total(&self) -> usize { self.tokens.len() }
+    /// Make `state` safe to CHECKPOINT mid-job. Under CED the chunks never run
+    /// the decoder layers, so their rings still hold whatever the job started
+    /// from (the restored snapshot's rows at `pos0`, or nothing) -- stale by
+    /// `done_rows()` positions. A snapshot saved like that would hand a resume
+    /// with <= SWA_WINDOW rows left non-adjacent rows as its window. Empty them
+    /// instead: a resume then replays onto empty rings, like a fresh prompt.
+    /// Harmless for this job: `prefill_job_finish` empties them anyway when
+    /// the suffix exceeds the replay, which any checkpointable job does.
+    pub fn clear_decoder_rings_for_checkpoint(&self, state: &mut HetModelState) {
+        if !self.ced {
+            return;
+        }
+        for l in crate::config::CED_DECODER_START..N_LAYER as usize {
+            state.layers[l].n_raw = 0;
+            state.layers[l].raw_off = 0;
+        }
+    }
     pub fn done_rows(&self) -> usize { self.chunk_start }
     pub fn chunks_done(&self) -> bool { self.chunk_start >= self.tokens.len() }
     pub fn pos0(&self) -> u32 { self.pos0 }
@@ -665,13 +682,21 @@ impl HeterogeneousEngine {
             return Err(eyre!("PrefillJob: replay segment {b_seg} of {t} rows"));
         }
         let seg_pos0 = job.pos0 + (t - b_seg) as u32;
-        // Empty the decoder rings ONLY for a fresh prompt. On a continuation
-        // (snapshot restored, `pos0 > 0`) they hold the previous turn's replay
-        // rows at positions [pos0 - k, pos0), which is exactly the window the
-        // reference decoder carries incrementally; emptying them gave a 1-token
-        // suffix a 1-row window for the first SWA_WINDOW generated tokens
-        // (KNOWN_BUGS #25). The append below evicts past SWA_WINDOW as usual.
-        if job.pos0 == 0 {
+        // Keep the decoder rings ONLY when the replay starts exactly at `pos0`
+        // of a continuation (snapshot restored, suffix <= SWA_WINDOW): they then
+        // hold the previous turn's rows at [pos0 - k, pos0), directly before the
+        // replay -- the window the reference decoder carries incrementally.
+        // Emptying them there gave a 1-token suffix a 1-row window for the first
+        // SWA_WINDOW generated tokens (KNOWN_BUGS #25).
+        //
+        // A LONGER suffix replays only its last `b_seg` rows, from
+        // `seg_pos0 = pos0 + t - b_seg`, so those ring rows sit `t - b_seg`
+        // positions back and are NOT adjacent: kept, replay row i attended
+        // 127-i rows from hundreds of positions earlier as if they were its
+        // neighbours, and the wrong K/V it wrote on layers 21-39 fed the first
+        // token and the next ~128 (KNOWN_BUGS #28, nearly every agent turn since
+        // #25). Empty them, exactly like a fresh prompt of the same length.
+        if job.pos0 == 0 || t > b_seg {
             for l in split..N_LAYER as usize {
                 state.layers[l].n_raw = 0;
                 state.layers[l].raw_off = 0;

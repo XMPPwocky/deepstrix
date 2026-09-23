@@ -90,3 +90,54 @@ fn compaction_makes_free_space_contiguous_and_preserves_rows() -> eyre::Result<(
     println!("kv_arena_compact: OK (stores {})", arena.stores.len());
     Ok(())
 }
+
+/// Regression (2026-09-23 review): a failed `admit_from_state` used to leave
+/// its freshly admitted slot allocated with no Stream owning it, and a parked
+/// request retried every tick. Also the stricter key check: a source whose
+/// index keys do not cover every compressed row is refused (the indexer scores
+/// `n_comp` rows, so a gap would be scored as another stream's keys).
+#[test]
+fn failed_admit_from_state_releases_its_slot() -> eyre::Result<()> {
+    use v4flash_kernels::het::state::HetModelState;
+    color_eyre::install().ok();
+    let dgpu = Device::new(std::env::var("DGPU").ok().and_then(|s| s.parse().ok()).unwrap_or(1));
+    dgpu.set_current()?;
+    let stream = Stream::new(dgpu.id)?;
+    let mut arena = KvArena::alloc(dgpu, 4, 4096)?;
+    let free_before: Vec<u32> = arena.stores.iter().map(|s| s.free.free_rows()).collect();
+    let mut src = HetModelState::alloc(dgpu, dgpu, 4096)?;
+    let pos = 400u32;
+    for si in 0..arena.stores.len() {
+        let l = arena.stores[si].layer;
+        let ratio = arena.stores[si].ratio;
+        let cs = src.layers[l].compressor.as_mut().unwrap();
+        cs.n_comp = pos / ratio;
+        cs.n_index_comp = cs.n_comp;
+    }
+    // Keys short on the last store: must be refused, and leave nothing behind.
+    {
+        let l = arena.stores[arena.stores.len() - 1].layer;
+        let cs = src.layers[l].compressor.as_mut().unwrap();
+        cs.n_index_comp = cs.n_comp / 2;
+    }
+    let err = arena.admit_from_state(&src, 1000, pos, &stream).expect_err("keys short of n_comp must be refused");
+    assert!(format!("{err:#}").contains("comp rows"), "unexpected error: {err:#}");
+    assert_eq!(arena.live(), 0, "the slot admitted before the failure must be released");
+    let free_after: Vec<u32> = arena.stores.iter().map(|s| s.free.free_rows()).collect();
+    assert_eq!(free_after, free_before, "every store's rows must be given back");
+    // Positive control: a consistent source admits, and releases cleanly.
+    {
+        let l = arena.stores[arena.stores.len() - 1].layer;
+        let cs = src.layers[l].compressor.as_mut().unwrap();
+        cs.n_index_comp = cs.n_comp;
+    }
+    stream.synchronize()?;
+    let slot = arena.admit_from_state(&src, 1000, pos, &stream)?;
+    stream.synchronize()?;
+    assert_eq!(arena.live(), 1);
+    arena.release(slot)?;
+    let free_end: Vec<u32> = arena.stores.iter().map(|s| s.free.free_rows()).collect();
+    assert_eq!(free_end, free_before);
+    println!("failed_admit_from_state_releases_its_slot: OK");
+    Ok(())
+}
