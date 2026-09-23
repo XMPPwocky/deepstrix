@@ -159,6 +159,13 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
     loop {
         // 1. Intake: never block while there is work; block when idle.
         let idle = sched.streams.is_empty() && sched.prefills.is_empty() && sched.queue.is_empty();
+        if idle {
+            // Clear `inflight` BEFORE blocking: the tick that finished the last
+            // stream left it set, and the hang watchdog then aborted an IDLE
+            // engine 30 min later (DEEPSTRIX_HANG_DEADLINE_MS) -- twice on
+            // 2026-09-23, each exactly 30:00 after the last "stream done".
+            state.progress.end();
+        }
         let msg = if idle { rx.blocking_recv() } else { match rx.try_recv() { Ok(m) => Some(m), Err(_) => None } };
         match msg {
             Some(EngineRequest::Generate { req, tx, session_id, cancel }) => {
