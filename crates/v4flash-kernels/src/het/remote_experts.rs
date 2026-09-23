@@ -1249,10 +1249,14 @@ struct PfDone {
     set: usize,
     offs: [Option<(usize, usize, u32, u32)>; 3],
     coalesced: bool,
+    /// Hint sent -> a reader picked it up (queueing behind other reads).
+    queue_ns: u64,
+    /// The read itself (`read_miss_into` wall).
+    read_ns: u64,
 }
 
 struct B2Prefetch {
-    tx_hint: std::sync::mpsc::Sender<(u32, u32, usize, bool)>,
+    tx_hint: std::sync::mpsc::Sender<(u32, u32, usize, bool, std::time::Instant)>,
     rx_done: std::sync::mpsc::Receiver<Result<PfDone, (usize, u32, u32, String)>>,
     stages: Vec<[PinnedBuffer<u8>; 3]>,
     free: Vec<usize>,
@@ -1263,6 +1267,10 @@ struct B2Prefetch {
     /// Wanted ids whose prefetch read was still in flight at `ensure`: waited
     /// for instead of re-read (a partial win: the read was already started).
     pub waited: u64,
+    /// Sums over completed reads: hint->start queueing, read wall, count.
+    pub queue_ns: u64,
+    pub read_ns: u64,
+    pub n_read: u64,
 }
 
 /// `V41_B2_PREFETCH_PAR`: concurrent prefetch readers (default 4). One reader
@@ -2155,7 +2163,7 @@ impl ExpertShard {
             if self.pf_stages_spare.is_empty() {
                 return;
             }
-            let (tx_hint, rx_hint) = std::sync::mpsc::channel::<(u32, u32, usize, bool)>();
+            let (tx_hint, rx_hint) = std::sync::mpsc::channel::<(u32, u32, usize, bool, std::time::Instant)>();
             let rx_hint = std::sync::Arc::new(std::sync::Mutex::new(rx_hint));
             let (tx_done, rx_done) = std::sync::mpsc::channel::<Result<PfDone, (usize, u32, u32, String)>>();
             let stages = std::mem::take(&mut self.pf_stages_spare);
@@ -2177,7 +2185,7 @@ impl ExpertShard {
                 let ptrs = ptrs;
                 loop {
                     let got = rx_hint.lock().unwrap().recv();
-                    let Ok((layer, e, set, certain)) = got else { break };
+                    let Ok((layer, e, set, certain, t_hint)) = got else { break };
                     if !certain {
                         // Yield the drives to demand misses (bounded: a hint that
                         // waits longer than a layer is late anyway).
@@ -2192,9 +2200,12 @@ impl ExpertShard {
                     let (b0, b1, b2) = unsafe {
                         (std::slice::from_raw_parts_mut(sp.p[0], sp.n[0]), std::slice::from_raw_parts_mut(sp.p[1], sp.n[1]), std::slice::from_raw_parts_mut(sp.p[2], sp.n[2]))
                     };
+                    let t_read = std::time::Instant::now();
+                    let queue_ns = (t_read - t_hint).as_nanos() as u64;
                     let r = Self::read_miss_into(unsafe { &*owner.0 }, direct, gpu_repack, layer, e, bpe, b0, b1, b2);
+                    let read_ns = t_read.elapsed().as_nanos() as u64;
                     let msg = match r {
-                        Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, offs, coalesced }),
+                        Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, offs, coalesced, queue_ns, read_ns }),
                         Err(err) => Err((set, layer, e, format!("{err:#}"))),
                     };
                     if tx_done.send(msg).is_err() {
@@ -2204,7 +2215,7 @@ impl ExpertShard {
             }).expect("spawn b2-prefetch");
             }
             let n = stages.len();
-            self.prefetch = Some(B2Prefetch { tx_hint, rx_done, stages, free: (0..n).collect(), pending: Default::default(), hinted: 0, admitted: 0, dropped: 0, waited: 0 });
+            self.prefetch = Some(B2Prefetch { tx_hint, rx_done, stages, free: (0..n).collect(), pending: Default::default(), hinted: 0, admitted: 0, dropped: 0, waited: 0, queue_ns: 0, read_ns: 0, n_read: 0 });
             eprintln!("expertd: look-ahead prefetch ON ({n} staging sets, {n_par} readers)");
         }
         let pool = self.pool.as_ref().unwrap();
@@ -2220,7 +2231,7 @@ impl ExpertShard {
             let Some(set) = pf.free.pop() else { pf.dropped += 1; continue };
             pf.pending.insert(key);
             pf.hinted += 1;
-            if pf.tx_hint.send((key.0, key.1, set, certain)).is_err() {
+            if pf.tx_hint.send((key.0, key.1, set, certain, std::time::Instant::now())).is_err() {
                 pf.free.push(set);
                 pf.pending.remove(&key);
             }
@@ -2239,6 +2250,11 @@ impl ExpertShard {
     /// prefetch readers (hinted, not yet admitted)?
     pub fn prefetch_pending_any(&self, words: &[u32]) -> bool {
         self.prefetch.as_ref().is_some_and(|pf| words.iter().any(|&w| pf.pending.contains(&((w >> 16), (w & 0xFFFF)))))
+    }
+
+    /// `(queue_ns, read_ns, n_read)` summed over completed prefetch reads.
+    pub fn prefetch_read_timing(&self) -> (u64, u64, u64) {
+        self.prefetch.as_ref().map_or((0, 0, 0), |p| (p.queue_ns, p.read_ns, p.n_read))
     }
 
     /// `(hinted, admitted, dropped, waited)` since start.
@@ -2280,6 +2296,9 @@ impl ExpertShard {
                 Ok(Ok(d)) => {
                     if let Some(t) = t_w { wait_ns += t.elapsed().as_nanos() as u64; }
                     if must_wait && d.layer == cur_layer && want.contains(&d.e) { pf.waited += 1; }
+                    pf.queue_ns += d.queue_ns;
+                    pf.read_ns += d.read_ns;
+                    pf.n_read += 1;
                     d
                 }
                 Ok(Err((set, layer, e, msg))) => {
@@ -4017,6 +4036,10 @@ pub fn serve_connection(
         // xq / partials / sel regions on `exec` stay intact. Created on first use.
         let mut exec2: Option<MoeExecutor> = None;
         let (mut w_parks, mut w_park_served) = (0u64, 0u64);
+        // Park loop time split: serving others vs waiting on own reads (window sums).
+        let (mut w_park_wait_ns, mut w_park_serve_ns) = (0u64, 0u64);
+        // Prefetch read timing at the last stats line (for window deltas).
+        let mut pf_prev = (0u64, 0u64, 0u64);
         // A frame the overlap hook already pulled off the reader (and whose
         // misses it may have started paging) while the previous request ran.
         let mut pending: std::collections::VecDeque<Inbound> = std::collections::VecDeque::new();
@@ -4209,6 +4232,11 @@ pub fn serve_connection(
                 let records_ref = &mut *records;
                 let n_done_ref = &mut n_done;
                 let (parks_ref, park_served_ref) = (&mut w_parks, &mut w_park_served);
+                // THIS request's park loop: time spent serving others (not its
+                // compute) and waiting on its own reads (its paging). Reported
+                // in its reply so the hub's box2.compute/page stay honest.
+                let (mut this_park_serve_ns, mut this_park_wait_ns) = (0u64, 0u64);
+                let (serve_acc, wait_acc) = (&mut this_park_serve_ns, &mut this_park_wait_ns);
                 let tx_out_ref = &tx_out;
                 let rx_resp_recycle_ref = &rx_resp_recycle;
                 let tx_req_recycle_ref = &tx_req_recycle;
@@ -4300,8 +4328,10 @@ pub fn serve_connection(
                             let ex2 = exec2_ref.as_mut().unwrap();
                             let Some(Inbound::Frame { hdr, buf, t_first, t_done, t2 }) = pending_ref.pop_front() else { unreachable!() };
                             let resp = rx_resp_recycle_ref.try_recv().unwrap_or_else(|_| AlignedBuf::with_capacity(proto::RESP_DATA_OFF + exec_rows * N_EMBD as usize * 4));
+                            let t_serve = Instant::now();
                             let out = serve_interleaved(ex2, shard, &hdr, &buf, t_first, t_done, t2, resp);
                             let _ = tx_req_recycle_ref.send(buf);
+                            *serve_acc += t_serve.elapsed().as_nanos() as u64;
                             match out {
                                 Ok((rec, resp)) => {
                                     let t_ready = rec.t_ready;
@@ -4347,6 +4377,7 @@ pub fn serve_connection(
                             Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         }
                     }
+                    *wait_acc += (t_park.elapsed().as_nanos() as u64).saturating_sub(*serve_acc);
                     shard.park_words = words;
                     Ok(())
                 };
@@ -4362,14 +4393,18 @@ pub fn serve_connection(
                 };
                 let timing = exec.run_path(shard, req.layer, b + bb, xq_run, sel_run, ew_run, req.flags & proto::REQ_FLAG_BATCHED != 0, &mut overlap)?;
                 drop(overlap);
+                w_park_wait_ns += this_park_wait_ns;
+                w_park_serve_ns += this_park_serve_ns;
                 let (miss1, page_ns1) = shard.layer_page_counters(req.layer);
-                let t_page_us = (page_ns1.saturating_sub(page_ns0) / 1000).min(u32::MAX as u64) as u32;
+                // Own park-loop wait IS this request's paging (its reads, landing).
+                let t_page_us = ((page_ns1.saturating_sub(page_ns0) + this_park_wait_ns) / 1000).min(u32::MAX as u64) as u32;
                 let n_miss_req = miss1.saturating_sub(miss0).min(u32::MAX as u64) as u32;
                 let t_d2h0 = Instant::now();
                 let f32_out = req.flags & proto::REQ_FLAG_RESP_F32 != 0;
                 let elem = if f32_out { 4 } else { 2 };
                 let n = b * N_EMBD as usize;
-                let t_compute_us = (t_d2h0 - t_start).as_micros() as u32;
+                // Time spent serving OTHER requests while parked is not ours.
+                let t_compute_us = ((t_d2h0 - t_start).as_micros() as u64).saturating_sub(this_park_serve_ns / 1000) as u32;
                 let resp_flags = (req.flags & !proto::RESP_MISS_MASK)
                     | ((timing.miss_mask << proto::RESP_MISS_SHIFT) & proto::RESP_MISS_MASK);
                 proto::begin_response(&mut resp, hdr.seq, req.layer, req.b, resp_flags, 0, t_compute_us, 0, N_EMBD, elem, req.t1, t2);
@@ -4531,9 +4566,11 @@ pub fn serve_connection(
                             // around demand chunks, so concurrent prefetch reads inflate
                             // it; read `read` (per-miss wall) instead.
                             let wall = w_t0.elapsed().as_secs_f64().max(1e-9);
+                            let pf_now = shard.prefetch_read_timing();
                             let win = format!(
                                 " | window {:.1}s: busy {:.0}% idle/req {:.2} ms queued {:.0}% depth {:.2} \
-merged {:.0}% (promised {:.0}%, miss: no-frame {} unmergeable {}) parks {} served-under-park {}",
+merged {:.0}% (promised {:.0}%, miss: no-frame {} unmergeable {}) parks {} served-under-park {} \
+park wait {:.2} serve {:.2} ms/park | pf reads {} queue {:.2} read {:.2} ms/read",
                                 wall, 100.0 * w_service_ns as f64 / 1e9 / wall,
                                 w_idle_ns as f64 / 1e6 / w_n.max(1) as f64,
                                 100.0 * w_queued as f64 / w_n.max(1) as f64,
@@ -4541,7 +4578,13 @@ merged {:.0}% (promised {:.0}%, miss: no-frame {} unmergeable {}) parks {} serve
                                 100.0 * w_merged as f64 / w_n.max(1) as f64,
                                 100.0 * w_promised as f64 / w_n.max(1) as f64,
                                 w_merge_no_frame, w_merge_unmergeable, w_parks, w_park_served,
+                                w_park_wait_ns as f64 / 1e6 / w_parks.max(1) as f64,
+                                w_park_serve_ns as f64 / 1e6 / w_parks.max(1) as f64,
+                                pf_now.2 - pf_prev.2,
+                                (pf_now.0 - pf_prev.0) as f64 / 1e6 / (pf_now.2 - pf_prev.2).max(1) as f64,
+                                (pf_now.1 - pf_prev.1) as f64 / 1e6 / (pf_now.2 - pf_prev.2).max(1) as f64,
                             );
+                            pf_prev = pf_now;
                             eprintln!(
                                 "expertd: page stats requests={req} misses={miss} hit={:.4} \
 ms_per_miss={:.2} (read {:.2} [pread {:.2} repack_cpu {:.2}] h2d {:.2} repack_gpu {:.2}){pfs}{win}",
@@ -4553,7 +4596,7 @@ ms_per_miss={:.2} (read {:.2} [pread {:.2} repack_cpu {:.2}] h2d {:.2} repack_gp
                             w_t0 = Instant::now();
                             w_idle_ns = 0; w_service_ns = 0; w_depth_sum = 0; w_queued = 0; w_n = 0; w_merged = 0;
                             w_merge_no_frame = 0; w_merge_unmergeable = 0; w_promised = 0;
-                            w_parks = 0; w_park_served = 0;
+                            w_parks = 0; w_park_served = 0; w_park_wait_ns = 0; w_park_serve_ns = 0;
                         }
                     }
                     if opts.verbose {
