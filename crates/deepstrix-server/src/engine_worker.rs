@@ -375,6 +375,10 @@ pub struct GenerateReq {
     /// (NOT KV positions — the worker rebases them per prefill call).
     pub image_spans: Vec<ImageSpan>,
     pub max_new: usize,
+    /// `max_new` is the server default, not the client's `max_tokens`: the
+    /// multistream admission may then shrink it to fit the context the prompt
+    /// leaves instead of rejecting the request.
+    pub max_new_defaulted: bool,
     pub temperature: f32,
     pub min_p_rel: f32,
     /// Nucleus cutoff in (0, 1]. `1.0` = no truncation (the pre-top_p

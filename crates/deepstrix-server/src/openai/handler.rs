@@ -98,6 +98,7 @@ pub fn build_generate_req(
             .max_tokens
             .map(|m| m as usize)
             .unwrap_or(DEFAULT_MAX_NEW),
+        max_new_defaulted: req.max_tokens.is_none(),
         temperature: req.temperature.unwrap_or(DEFAULT_TEMPERATURE),
         min_p_rel: DEFAULT_MIN_P_REL,
         top_p: resolve_top_p(req.top_p, default_top_p),
@@ -113,11 +114,14 @@ pub fn build_generate_req(
 // almost nothing for the actual response, and the model truncates
 // mid-DSML — surfaces to letta as "Empty LLM response, retrying"
 // (now caught by `DsmlScanner::finish()`'s mid-markup flush) or as
-// malformed tool args even when caught. 16K accommodates think + a
-// multi-kB file Write comfortably while still bounding runaway
-// generation. Clients can override either direction by sending
-// max_tokens explicitly in the request.
-const DEFAULT_MAX_NEW: usize = 16384;
+// malformed tool args even when caught. 16K was the cap until 2026-09-23,
+// when an agent turn ended `finish=Length` at exactly 16384 tokens; DeepSeek's
+// model card recommends max_tokens >= 256K for V4.1-Flash. 64K still bounds a
+// runaway generation. A DEFAULTED cap is clamped to the context the prompt
+// leaves (`GenerateReq::max_new_defaulted`), so a long prompt never fails for a
+// budget the client did not ask for. Clients can override either direction by
+// sending max_tokens explicitly in the request.
+const DEFAULT_MAX_NEW: usize = 65536;
 
 pub async fn chat_completions(
     State(engine): State<EngineHandle>,

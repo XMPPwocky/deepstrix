@@ -32,6 +32,21 @@ fn request_top_p_reaches_generate_req() {
 }
 
 #[test]
+fn omitted_max_tokens_is_the_64k_default_and_flagged_as_such() {
+    // No max_tokens: the server default (64K since 2026-09-23; DeepSeek's card
+    // recommends >= 256K), flagged so admission may shrink it to fit the
+    // context instead of rejecting a long prompt.
+    let gen = build_generate_req(&req_with(""), Vec::new(), Vec::new(), Vec::new(), DEFAULT_TOP_P);
+    assert_eq!(gen.max_new, 65536);
+    assert!(gen.max_new_defaulted);
+
+    // An explicit cap is the client's: kept as sent, never silently shrunk.
+    let gen = build_generate_req(&req_with(r#","max_tokens":1000"#), Vec::new(), Vec::new(), Vec::new(), DEFAULT_TOP_P);
+    assert_eq!(gen.max_new, 1000);
+    assert!(!gen.max_new_defaulted);
+}
+
+#[test]
 fn omitted_top_p_takes_the_server_default() {
     let req = req_with("");
     assert_eq!(req.top_p, None);

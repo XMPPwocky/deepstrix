@@ -662,8 +662,14 @@ impl Sched {
     /// arena carves that many comp rows per store (first fit). Fragmented =>
     /// compact the stores first. No room at all => park it (its scratch state
     /// stays with it) and retry as streams finish.
-    fn try_admit(&mut self, state: &mut WorkerState, pf: Prefill, logits: Vec<f32>) -> Result<(), (Option<v4flash_kernels::het::HetModelState>, eyre::Report)> {
+    fn try_admit(&mut self, state: &mut WorkerState, mut pf: Prefill, logits: Vec<f32>) -> Result<(), (Option<v4flash_kernels::het::HetModelState>, eyre::Report)> {
         let pos = pf.prefix.len() as u32;
+        if pf.p.req.max_new_defaulted {
+            // The client sent no max_tokens: never fail a long prompt for the
+            // server's own default. Shrink it to what the context leaves.
+            let room = state.n_kv_max.saturating_sub(pos + 2) as usize;
+            pf.p.req.max_new = pf.p.req.max_new.min(room).max(1);
+        }
         let ctx_cap = pos + pf.p.req.max_new as u32 + 2;
         if ctx_cap > state.n_kv_max {
             return Err((Some(pf.kv), eyre!("prompt {pos} + max_tokens {} exceeds the context {}", pf.p.req.max_new, state.n_kv_max)));
