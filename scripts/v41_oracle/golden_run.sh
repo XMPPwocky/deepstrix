@@ -19,7 +19,7 @@ OUT_ROOT=${1:?out root}; shift
 PY=${PY:-/nix/store/b5bpi6zfajzzrwwpgba2q6li3nnya4bs-python3-3.14.7/bin/python3}
 export PYTHONPATH=$(cat "$HOME/pypath.txt")
 export V41_MODEL=${V41_MODEL:-/weights2/dsv4.1f}
-export OMP_NUM_THREADS=12 MKL_NUM_THREADS=12
+export OMP_NUM_THREADS=12 MKL_NUM_THREADS=12 PYTHONUNBUFFERED=1  # live per-layer progress in oracle.log
 MEM_FLOOR_KB=${MEM_FLOOR_KB:-3000000}
 CPUS=${CPUS:-0-5,16-21}
 mkdir -p "$OUT_ROOT"
