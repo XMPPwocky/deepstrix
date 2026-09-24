@@ -1239,9 +1239,6 @@ struct SetPtr {
     n: [usize; 3],
 }
 unsafe impl Send for SetPtr {}
-#[derive(Clone, Copy)]
-struct OwnerPtr(*const V41HfWeights);
-unsafe impl Send for OwnerPtr {}
 
 struct PfDone {
     layer: u32,
@@ -1258,6 +1255,9 @@ struct PfDone {
 struct B2Prefetch {
     tx_hint: std::sync::mpsc::Sender<(u32, u32, usize, bool, std::time::Instant)>,
     rx_done: std::sync::mpsc::Receiver<Result<PfDone, (usize, u32, u32, String)>>,
+    /// Reader threads; they write into `stages` by address, so `Drop` joins
+    /// them before the staging is freed.
+    readers: Vec<std::thread::JoinHandle<()>>,
     stages: Vec<[PinnedBuffer<u8>; 3]>,
     free: Vec<usize>,
     pending: std::collections::HashSet<(u32, u32)>,
@@ -1271,6 +1271,18 @@ struct B2Prefetch {
     pub queue_ns: u64,
     pub read_ns: u64,
     pub n_read: u64,
+}
+
+impl Drop for B2Prefetch {
+    fn drop(&mut self) {
+        // Close the hint channel (the only sender), so each reader finishes its
+        // current read into `stages` and then sees `recv` fail. Fields --
+        // `stages` included -- are dropped only after this returns.
+        drop(std::mem::replace(&mut self.tx_hint, std::sync::mpsc::channel().0));
+        for h in self.readers.drain(..) {
+            let _ = h.join();
+        }
+    }
 }
 
 /// `V41_B2_PREFETCH_PAR`: concurrent prefetch readers (default 4). One reader
@@ -1432,8 +1444,8 @@ fn b2_prefetch_sets() -> usize {
 }
 
 pub struct ExpertShard {
-    #[allow(dead_code)]
-    owner: V41HfWeights,
+    /// Shared with the look-ahead reader threads (which hold their own clone).
+    owner: std::sync::Arc<V41HfWeights>,
     device: Device,
     pub routed: RoutedExpertWeights,
     layers: Vec<Option<LayerShard>>,
@@ -2124,7 +2136,7 @@ impl ExpertShard {
         }
         eprintln!("expert shard: zero-copy O_DIRECT expert reads {}", if direct { "ON" } else { "OFF" });
         Ok(Self {
-            owner,
+            owner: std::sync::Arc::new(owner),
             device: igpu,
             routed,
             layers,
@@ -2171,17 +2183,18 @@ impl ExpertShard {
                 p: [st[0].as_slice().as_ptr() as *mut u8, st[1].as_slice().as_ptr() as *mut u8, st[2].as_slice().as_ptr() as *mut u8],
                 n: [st[0].len(), st[1].len(), st[2].len()],
             }).collect();
-            let owner = OwnerPtr(&self.owner as *const V41HfWeights);
+            let owner = std::sync::Arc::clone(&self.owner);
             let direct = self.direct;
             let gpu_repack = self.repack.is_some();
             let bpe = [self.routed.gate_bytes_per_expert, self.routed.up_bytes_per_expert, self.routed.down_bytes_per_expert];
             let n_par = b2_prefetch_par().min(stages.len().max(1));
+            let mut readers = Vec::with_capacity(n_par);
             for _ in 0..n_par {
             let rx_hint = rx_hint.clone();
             let tx_done = tx_done.clone();
             let ptrs = ptrs.clone();
-            std::thread::Builder::new().name("b2-prefetch".into()).spawn(move || {
-                let owner = owner;
+            let owner = std::sync::Arc::clone(&owner);
+            readers.push(std::thread::Builder::new().name("b2-prefetch".into()).spawn(move || {
                 let ptrs = ptrs;
                 loop {
                     let got = rx_hint.lock().unwrap().recv();
@@ -2195,14 +2208,15 @@ impl ExpertShard {
                         }
                     }
                     let sp = ptrs[set];
-                    // SAFETY: the set is owned by this thread until `Done`; the
-                    // shard (and its owner) outlives the thread (daemon lifetime).
+                    // SAFETY: the set is owned by this thread until `Done`, and
+                    // `B2Prefetch::drop` joins this thread before its staging
+                    // buffers are freed.
                     let (b0, b1, b2) = unsafe {
                         (std::slice::from_raw_parts_mut(sp.p[0], sp.n[0]), std::slice::from_raw_parts_mut(sp.p[1], sp.n[1]), std::slice::from_raw_parts_mut(sp.p[2], sp.n[2]))
                     };
                     let t_read = std::time::Instant::now();
                     let queue_ns = (t_read - t_hint).as_nanos() as u64;
-                    let r = Self::read_miss_into(unsafe { &*owner.0 }, direct, gpu_repack, layer, e, bpe, b0, b1, b2);
+                    let r = Self::read_miss_into(&owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2);
                     let read_ns = t_read.elapsed().as_nanos() as u64;
                     let msg = match r {
                         Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, offs, coalesced, queue_ns, read_ns }),
@@ -2212,10 +2226,10 @@ impl ExpertShard {
                         break;
                     }
                 }
-            }).expect("spawn b2-prefetch");
+            }).expect("spawn b2-prefetch"));
             }
             let n = stages.len();
-            self.prefetch = Some(B2Prefetch { tx_hint, rx_done, stages, free: (0..n).collect(), pending: Default::default(), hinted: 0, admitted: 0, dropped: 0, waited: 0, queue_ns: 0, read_ns: 0, n_read: 0 });
+            self.prefetch = Some(B2Prefetch { tx_hint, rx_done, readers, stages, free: (0..n).collect(), pending: Default::default(), hinted: 0, admitted: 0, dropped: 0, waited: 0, queue_ns: 0, read_ns: 0, n_read: 0 });
             eprintln!("expertd: look-ahead prefetch ON ({n} staging sets, {n_par} readers)");
         }
         let pool = self.pool.as_ref().unwrap();
@@ -2651,6 +2665,10 @@ impl ExpertShard {
         }
         let bpe = [r.gate_bytes_per_expert, r.up_bytes_per_expert, r.down_bytes_per_expert];
         let mut pending: Vec<(u32, u32)> = Vec::new();
+        // First error of the call. Victim search and reads stop on it, and every
+        // slot claimed but not yet landed is rolled back below, so the pool never
+        // reports an expert resident that nobody wrote.
+        let mut failed: Option<eyre::Report> = None;
         for &e in &want {
             pg.requests += 1;
             if let Some(&slot) = pool.slot_of.get(&(layer, e)) {
@@ -2707,16 +2725,14 @@ impl ExpertShard {
             // union exceeds its own share used to die with "no evictable slot"
             // while thousands of slots sat evictable in other layers' regions.
             // Borrowing is always better than failing the request.
-            let victim = match pick(global, pool) {
-                Some(v) => v,
-                None => pick(true, pool).ok_or_else(|| {
-                    eyre!(
-                        "expert shard: layer {layer} has no evictable slot anywhere \
-                         (want {} > region {n_region}, pool {} slots)",
-                        want.len(),
-                        pool.owner_of.len(),
-                    )
-                })?,
+            let Some(victim) = pick(global, pool).or_else(|| pick(true, pool)) else {
+                failed = Some(eyre!(
+                    "expert shard: layer {layer} has no evictable slot anywhere \
+                     (want {} > region {n_region}, pool {} slots)",
+                    want.len(),
+                    pool.owner_of.len(),
+                ));
+                break;
             };
             // Detach from whoever held it — possibly a DIFFERENT layer, whose
             // device remap is then stale until its next `ensure_layer`.
@@ -2751,6 +2767,9 @@ impl ExpertShard {
         // so 4 concurrent misses put ~24 on the primary drive (2026-09-22).
         let k = knobs::miss_par().min(stages.len()).max(1);
         for chunk in pending.chunks(k) {
+            if failed.is_some() {
+                break;
+            }
             let rp0 = v4flash_core::hf_v41::expert_read_profile();
             let t_r = std::time::Instant::now();
             type R = Result<([Option<(usize, usize, u32, u32)>; 3], bool), String>;
@@ -2813,10 +2832,32 @@ impl ExpertShard {
             let rp1 = v4flash_core::hf_v41::expert_read_profile();
             pg.pread_ns += rp1.2 - rp0.2;
             pg.repack_cpu_ns += rp1.3 - rp0.3;
-            scoped?;
+            if let Err(err) = scoped {
+                failed = Some(err);
+            }
         }
         pg.read_ns += read_ns;
         pg.h2d_ns += h2d_ns;
+        if let Some(err) = failed {
+            // Roll back every claim whose data never landed: its remap entry is
+            // written only after the read + upload succeed, so an entry that
+            // does not point at its victim was never committed. The slot is
+            // freed and aged to the front of the LRU (its device bytes may be
+            // half-written, but nothing maps it any more).
+            for &(e, victim) in &pending {
+                if pool.remap_hosts[layer as usize][e as usize] != -(victim as i32) - 1 {
+                    pool.owner_of[victim as usize] = None;
+                    pool.slot_of.remove(&(layer, e));
+                    pool.held[layer as usize] -= 1;
+                    pool.last_use[victim as usize] = 0;
+                }
+            }
+            // This layer's device remap may still name an evicted victim whose
+            // bytes were being overwritten, and the upload below is skipped:
+            // force a re-upload before anything reads it.
+            pool.dirty[layer as usize] = true;
+            return Err(err);
+        }
         if dirty {
             l.remap_dev.copy_from_host(&pool.remap_hosts[layer as usize])?;
             pool.dirty[layer as usize] = false;

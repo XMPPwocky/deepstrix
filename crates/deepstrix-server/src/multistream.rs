@@ -27,7 +27,7 @@ use v4flash_kernels::sampler::SamplerRng;
 
 use crate::embed::{embed_lookup, gpt2_decode_token};
 use crate::engine_worker::{
-    encode_request_images, flush_expert_stats, handle_generate_stream, save_live_if_dirty, EncodedImages,
+    byte_aligned_lcp_vl, encode_request_images, flush_expert_stats, handle_generate_stream, save_live_if_dirty, trim_heap_and_log, EncodedImages,
     EngineRequest, FinishReason, GenerateReq, WorkerEvent, WorkerState,
 };
 use crate::snapshot;
@@ -161,9 +161,17 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
     };
     let mut sched = Sched { profile_acc: ProfileAcc::default(), legacy_wait_logged: None, dev_b, dev_c, parked: Vec::new(), bounce_f16, bounce_u8, phase: Phase::Decode, phase_since: Instant::now(), arena, dev, streams: Vec::new(), queue: VecDeque::new(), prefills: Vec::new(), spare_states, rr: 0, tick: 0 };
 
+    // Set by a tick, cleared once the idle-transition housekeeping has run.
+    let mut worked = false;
     loop {
         // 1. Intake: never block while there is work; block when idle.
         let idle = sched.streams.is_empty() && sched.prefills.is_empty() && sched.queue.is_empty();
+        if idle && worked {
+            // The serial loop trims after every request; here streams overlap,
+            // so trim only when the last one has drained and nothing waits.
+            worked = false;
+            trim_heap_and_log("host heap at idle");
+        }
         if idle {
             // Clear `inflight` BEFORE blocking: the tick that finished the last
             // stream left it set, and the hang watchdog then aborted an IDLE
@@ -190,6 +198,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             continue;
         }
         state.progress.begin();
+        worked = true;
         if let Err(e) = sched.tick(&mut state) {
             tracing::error!(error = %e, "multistream: step failed; aborting every live stream");
             sched.abort_all(&format!("{e:#}"));
@@ -486,13 +495,22 @@ impl Sched {
                 match snapshot::restore_vl(&mut kv, &snap_dir, state.dgpu, state.igpu, &state.model_fingerprint,
                     snapshot::RestoreKernels { fp8: &state.engine.dgpu.comp_kv_fp8, stream: &state.engine.dgpu.compute }) {
                     Ok(r) => {
-                        if r.tokens.len() <= tokens.len() && tokens[..r.tokens.len()] == r.tokens[..] {
+                        // Token ids alone are not enough: synthetic image ids
+                        // encode only the block layout, so a same-session
+                        // request with a different picture of the same size
+                        // would match. Verify the byte stream with the image
+                        // content hashes folded in, as the serial path does.
+                        let is_prefix = r.tokens.len() <= tokens.len()
+                            && tokens[..r.tokens.len()] == r.tokens[..]
+                            && byte_aligned_lcp_vl(&r.tokens, &r.image_spans, tokens, &p.req.image_spans,
+                                state.vocab.as_ref(), &state.byte_decoder).live_tokens == r.tokens.len();
+                        if is_prefix {
                             let _ = state.snapshot_index.touch(&snap_hash);
                             prefix = r.tokens;
                             tracing::info!(restored = prefix.len(), total = tokens.len(), ms = t0.elapsed().as_millis() as u64, "multistream: snapshot restored");
                             break;
                         }
-                        tracing::warn!("multistream: restored snapshot is not a token prefix of the request; trying the next candidate");
+                        tracing::warn!("multistream: restored snapshot is not a prefix of the request (tokens or image content); trying the next candidate");
                         if let Err(e) = kv.reset_in_place(state.dgpu, state.igpu) { return Err((p, kv, e)); }
                     }
                     Err(e) => {
@@ -568,9 +586,8 @@ impl Sched {
                 pf.job.clear_decoder_rings_for_checkpoint(&mut pf.kv);
                 let mut tokens_saved: Vec<i32> = pf.prefix.clone();
                 tokens_saved.extend_from_slice(&pf.job.tokens()[..done]);
-                let spans_saved = crate::vision_prompt::spans_in_range(&pf.p.req.image_spans, 0, tokens_saved.len()).unwrap_or_default();
-                match snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
-                    state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, None) {
+                match checkpoint_spans(&pf.p.req.image_spans, tokens_saved.len()).and_then(|spans_saved| snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
+                    state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, None)) {
                     Ok(entry) => {
                         let hash = entry.hash;
                         state.snapshot_index.insert(entry);
@@ -633,9 +650,8 @@ impl Sched {
                     pf.job.clear_decoder_rings_for_checkpoint(&mut pf.kv);
                     let mut tokens_saved: Vec<i32> = pf.prefix.clone();
                     tokens_saved.extend_from_slice(&pf.job.tokens()[..done]);
-                    let spans_saved = crate::vision_prompt::spans_in_range(&pf.p.req.image_spans, 0, tokens_saved.len()).unwrap_or_default();
-                    match snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
-                        state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, None) {
+                    match checkpoint_spans(&pf.p.req.image_spans, tokens_saved.len()).and_then(|spans_saved| snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
+                        state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, None)) {
                         Ok(entry) => {
                             state.snapshot_index.insert(entry);
                             tracing::info!(tokens = tokens_saved.len(), done, total = pf.job.total(), ms = t.elapsed().as_millis() as u64, "multistream: prefill checkpoint saved");
@@ -658,9 +674,8 @@ impl Sched {
         flush_expert_stats(state);
         if pf.save_at_finish {
             let tokens_saved: Vec<i32> = pf.prefix.clone();
-            let spans_saved = crate::vision_prompt::spans_in_range(&pf.p.req.image_spans, 0, tokens_saved.len()).unwrap_or_default();
-            match snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
-                state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, pf.p.session_id.as_deref()) {
+            match checkpoint_spans(&pf.p.req.image_spans, tokens_saved.len()).and_then(|spans_saved| snapshot::save(&pf.kv, &tokens_saved, &spans_saved, state.dgpu, state.igpu, &state.model_fingerprint,
+                state.snapshot_index.root(), state.vocab.as_ref(), &state.byte_decoder, pf.p.session_id.as_deref())) {
                 Ok(entry) => {
                     let hash = entry.hash;
                     state.snapshot_index.insert(entry);
@@ -1036,6 +1051,16 @@ impl Sched {
             engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(), "ms.step");
         Ok(())
     }
+}
+
+/// The image spans of the saved prefix `[0, n)`. A cut that straddles an image
+/// block is an error, never an empty span list: dropping the spans strips the
+/// content hashes from the snapshot's byte stream, and two different pictures
+/// with the same block layout would then key to the same hash (same rule as
+/// the serial path's system-prefix save).
+fn checkpoint_spans(spans: &[crate::vision_prompt::ImageSpan], n: usize) -> eyre::Result<Vec<crate::vision_prompt::ImageSpan>> {
+    use color_eyre::eyre::WrapErr;
+    crate::vision_prompt::spans_in_range(spans, 0, n).wrap_err("snapshot cut splits an image block; not saved")
 }
 
 /// Snapshot restore candidates in the order to try them: longest first, the

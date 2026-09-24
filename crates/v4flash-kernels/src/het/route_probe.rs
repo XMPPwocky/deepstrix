@@ -60,7 +60,7 @@ pub fn note(lane: usize, layer: usize, b: usize, picks: &[i32], look_next: Optio
     let Some(d) = dir() else { return Ok(()) };
     let mut g = STATE.lock().unwrap();
     let st = g.get_or_insert_with(|| State { lanes: [None, None, None, None], rows: 0, hit: [0; NL], tot: [0; NL], last_report: 0 });
-    let lane = lane.min(1);
+    let lane = lane.min(st.lanes.len() - 1);
     if layer == 0 {
         st.lanes[lane] = Some(Lane { b, picks: vec![-1; b * NL * NU], look: vec![-1; b * NL * NU], act20: vec![0.0; b * N_EMBD as usize] });
     }

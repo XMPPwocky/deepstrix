@@ -102,14 +102,16 @@ enum R {
 #[derive(Clone, Debug)]
 enum Part {
     Text(String),
-    Image,
+    /// Ordinal of this image among the request messages' images, in message
+    /// order (the order the handler collects their pixels in).
+    Image(usize),
 }
 
 #[derive(Clone, Debug)]
 enum Block {
     Text(String),
-    /// An image part of a user message → the placeholder.
-    Image,
+    /// An image part of a user message → the placeholder (see `Part::Image`).
+    Image(usize),
     ToolResult(Vec<Part>),
 }
 
@@ -142,7 +144,7 @@ fn text_of(m: &ChatMessage) -> eyre::Result<Option<String>> {
 
 /// A user message's content blocks (`parts` when it carries images — the
 /// deserializer keeps `parts` only then — else the text view).
-fn user_blocks(m: &ChatMessage) -> Vec<Block> {
+fn user_blocks(m: &ChatMessage, next_img: &mut usize) -> Vec<Block> {
     if m.parts.is_empty() {
         return vec![Block::Text(m.content.clone().unwrap_or_default())];
     }
@@ -150,13 +152,16 @@ fn user_blocks(m: &ChatMessage) -> Vec<Block> {
         .iter()
         .map(|p| match p {
             ContentPart::Text(t) => Block::Text(t.clone()),
-            ContentPart::Image(_) => Block::Image,
+            ContentPart::Image(_) => {
+                *next_img += 1;
+                Block::Image(*next_img - 1)
+            }
         })
         .collect()
 }
 
 /// A tool message's result body as parts.
-fn tool_parts(m: &ChatMessage) -> Vec<Part> {
+fn tool_parts(m: &ChatMessage, next_img: &mut usize) -> Vec<Part> {
     if m.parts.is_empty() {
         return vec![Part::Text(m.content.clone().unwrap_or_default())];
     }
@@ -164,7 +169,10 @@ fn tool_parts(m: &ChatMessage) -> Vec<Part> {
         .iter()
         .map(|p| match p {
             ContentPart::Text(t) => Part::Text(t.clone()),
-            ContentPart::Image(_) => Part::Image,
+            ContentPart::Image(_) => {
+                *next_img += 1;
+                Part::Image(*next_img - 1)
+            }
         })
         .collect()
 }
@@ -173,10 +181,11 @@ fn tool_parts(m: &ChatMessage) -> Vec<Part> {
 /// preceding user turn (or a new one); consecutive user turns merge.
 fn merge(messages: &[ChatMessage], tools: Option<&[ToolDef]>) -> eyre::Result<Vec<Msg>> {
     let mut out: Vec<Msg> = Vec::new();
+    let mut next_img = 0usize;
     for (i, m) in messages.iter().enumerate() {
         match m.role {
             Role::Tool => {
-                let block = Block::ToolResult(tool_parts(m));
+                let block = Block::ToolResult(tool_parts(m, &mut next_img));
                 let id = m.tool_call_id.clone();
                 match out.last_mut() {
                     Some(last) if last.role == R::User && last.blocks.is_some() => {
@@ -195,7 +204,7 @@ fn merge(messages: &[ChatMessage], tools: Option<&[ToolDef]>) -> eyre::Result<Ve
                 }
             }
             Role::User => {
-                let blocks = user_blocks(m);
+                let blocks = user_blocks(m, &mut next_img);
                 let n = blocks.len();
                 match out.last_mut() {
                     Some(last) if last.role == R::User && last.blocks.is_some() => {
@@ -362,7 +371,8 @@ fn push_tool_call(out: &mut Vec<Seg>, tc: &ToolCall) {
 }
 
 /// `render_message`.
-fn render_message(out: &mut Vec<Seg>, index: usize, msgs: &[Msg], thinking: bool, drop: bool, effort: V41Effort) {
+/// `images` receives each emitted placeholder's image ordinal, in prompt order.
+fn render_message(out: &mut Vec<Seg>, images: &mut Vec<usize>, index: usize, msgs: &[Msg], thinking: bool, drop: bool, effort: V41Effort) {
     let m = &msgs[index];
     let lu = last_user_index(msgs);
     let effort_prompt = if index == 0 && thinking {
@@ -397,7 +407,10 @@ fn render_message(out: &mut Vec<Seg>, index: usize, msgs: &[Msg], thinking: bool
                         }
                         match b {
                             Block::Text(t) => out.push(Seg::Client(t.clone())),
-                            Block::Image => out.push(Seg::Ours(v4flash_vision::IMAGE_PLACEHOLDER.to_string())),
+                            Block::Image(k) => {
+                                images.push(*k);
+                                out.push(Seg::Ours(v4flash_vision::IMAGE_PLACEHOLDER.to_string()));
+                            }
                             Block::ToolResult(parts) => {
                                 out.push(Seg::Ours("<tool_result>".to_string()));
                                 for (j, p) in parts.iter().enumerate() {
@@ -406,7 +419,10 @@ fn render_message(out: &mut Vec<Seg>, index: usize, msgs: &[Msg], thinking: bool
                                     }
                                     match p {
                                         Part::Text(t) => out.push(Seg::Client(t.clone())),
-                                        Part::Image => out.push(Seg::Ours(v4flash_vision::IMAGE_PLACEHOLDER.to_string())),
+                                        Part::Image(k) => {
+                                            images.push(*k);
+                                            out.push(Seg::Ours(v4flash_vision::IMAGE_PLACEHOLDER.to_string()));
+                                        }
                                     }
                                 }
                                 out.push(Seg::Ours("</tool_result>".to_string()));
@@ -461,6 +477,20 @@ pub fn build_segments_v41(
     effort: V41Effort,
     context: Option<&[ChatMessage]>,
 ) -> eyre::Result<Vec<Seg>> {
+    Ok(build_v41(messages, tools, thinking, effort, context)?.0)
+}
+
+/// The segments plus, per emitted image placeholder in prompt order, the
+/// ordinal of its image among `messages`' images in message order. The two
+/// orders differ when `sort_tool_results` reorders image-carrying tool
+/// results; pairing pixels by message order then swapped pictures.
+fn build_v41(
+    messages: &[ChatMessage],
+    tools: Option<&[ToolDef]>,
+    thinking: bool,
+    effort: V41Effort,
+    context: Option<&[ChatMessage]>,
+) -> eyre::Result<(Vec<Seg>, Vec<usize>)> {
     if messages.is_empty() {
         return Err(eyre!("V4.1 prompt: messages array is empty"));
     }
@@ -494,10 +524,13 @@ pub fn build_segments_v41(
     } else {
         (full, ctx_len)
     };
+    // Only the `messages` part renders (`context_len..`), so every ordinal
+    // pushed here indexes `messages`' images.
+    let mut images = Vec::new();
     for idx in context_len..rendered.len() {
-        render_message(&mut out, idx, &rendered, thinking, effective_drop, effort);
+        render_message(&mut out, &mut images, idx, &rendered, thinking, effective_drop, effort);
     }
-    Ok(out)
+    Ok((out, images))
 }
 
 /// The rendered prompt as text — exactly what the reference `encode_messages` returns.
@@ -515,9 +548,11 @@ pub fn render_prompt_text_v41(
 ///
 /// `image_placeholder` is the vocab id of `<｜deepseek_image｜>` (129264 in
 /// V4.1's tokenizer.json; `EngineHandle::image_placeholder_id`). Every image
-/// part renders as exactly one placeholder id, in message order, which
-/// `vision_prompt::expand_images` pairs with the request's images. A
-/// request with images and no placeholder id is an error.
+/// part renders as exactly one placeholder id. Returns the token ids and,
+/// per placeholder in prompt order, the index of its image among the
+/// request messages' images in message order: the caller must hand
+/// `vision_prompt::expand_images` the images in THAT order. A request with
+/// images and no placeholder id is an error.
 pub fn render_prompt_v41(
     vocab: &BpeVocab,
     messages: &[ChatMessage],
@@ -526,15 +561,15 @@ pub fn render_prompt_v41(
     effort: V41Effort,
     context: Option<&[ChatMessage]>,
     image_placeholder: Option<i32>,
-) -> eyre::Result<Vec<i32>> {
+) -> eyre::Result<(Vec<i32>, Vec<usize>)> {
     if image_placeholder.is_none() && messages.iter().chain(context.unwrap_or(&[])).any(|m| m.has_images()) {
         return Err(eyre!(
             "V4.1 prompt: a message has image parts but the loaded vocab has no `{}` token",
             v4flash_vision::IMAGE_PLACEHOLDER
         ));
     }
-    let segs = build_segments_v41(messages, tools, thinking, effort, context)?;
-    Ok(encode_segments(vocab, &segs, image_placeholder))
+    let (segs, image_order) = build_v41(messages, tools, thinking, effort, context)?;
+    Ok((encode_segments(vocab, &segs, image_placeholder), image_order))
 }
 
 #[cfg(test)]
@@ -585,6 +620,29 @@ mod tests {
         let s = render_prompt_text_v41(&m, None, false, V41Effort::DEFAULT, None).unwrap();
         assert!(s.contains("<tool_result>screen:\n\n<\u{ff5c}deepseek_image\u{ff5c}></tool_result>"), "{s}");
         assert_eq!(s.matches(v4flash_vision::IMAGE_PLACEHOLDER).count(), 1);
+    }
+
+    /// Tool results that arrive out of call order are sorted into call order,
+    /// images included; the reported image order must follow the prompt, not
+    /// the messages, or the handler pairs each placeholder with the wrong
+    /// picture.
+    #[test]
+    fn image_order_follows_sorted_tool_results() {
+        let img = |u: &str| serde_json::json!({"type": "image_url", "image_url": {"url": u}});
+        let m = msgs(serde_json::json!([
+            {"role": "user", "content": [{"type": "text", "text": "first"}, img("data:image/png;base64,AA==")]},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "shot", "arguments": "{}"}},
+                {"id": "b", "type": "function", "function": {"name": "shot", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "b", "content": [{"type": "text", "text": "B"}, img("data:image/png;base64,Qg==")]},
+            {"role": "tool", "tool_call_id": "a", "content": [{"type": "text", "text": "A"}, img("data:image/png;base64,QQ==")]}
+        ]));
+        let (segs, order) = build_v41(&m, None, false, V41Effort::DEFAULT, None).unwrap();
+        let s: String = segs.iter().map(Seg::text).collect();
+        assert!(s.find("<tool_result>A").unwrap() < s.find("<tool_result>B").unwrap(), "{s}");
+        // Message order: 0 = user's, 1 = B's, 2 = A's. Prompt order: user, A, B.
+        assert_eq!(order, vec![0, 2, 1]);
     }
 
     #[test]

@@ -1182,8 +1182,13 @@ fn dsml_attr_decode(s: &str) -> String {
     out
 }
 
+/// Inverse of [`push_dsml_parameter_text`], and nothing more: the only escape
+/// a string parameter body ever carries is the defanged closing tag. Bodies
+/// are otherwise raw (template line 251; the upstream convention unescapes
+/// only this sequence), so general entity decoding -- as for attribute values
+/// -- would turn a literal `&lt;` in, say, a Write tool call's HTML into `<`.
 fn dsml_param_decode_string(s: &str) -> String {
-    dsml_attr_decode(s)
+    s.replace("&lt;/\u{ff5c}DSML\u{ff5c}parameter>", "</\u{ff5c}DSML\u{ff5c}parameter>")
 }
 
 fn dsml_param_decode_json_literal(s: &str) -> String {
@@ -1315,6 +1320,18 @@ mod tests {
         )]);
         assert!(s2.contains("\\u003c/\u{ff5c}DSML\u{ff5c}parameter>after"), "{s2}");
         assert_eq!(s2.matches(end).count(), 1);
+    }
+
+    /// A string parameter decodes exactly the one escape the renderer adds:
+    /// literal entities in the model's argument (HTML, XML, shell) survive.
+    #[test]
+    fn dsml_string_param_decodes_only_the_defanged_closing_tag() {
+        let end = "</\u{ff5c}DSML\u{ff5c}parameter>";
+        let raw = format!("<p>a &lt; b &amp;&amp; c &gt; d &quot;q&quot;</p> x{end}y");
+        let mut rendered = String::new();
+        push_dsml_parameter_text(&mut rendered, &raw);
+        assert_eq!(dsml_param_decode_string(&rendered), raw);
+        assert_eq!(dsml_param_decode_string("if (a &lt; b) {}"), "if (a &lt; b) {}");
     }
 
     /// DEVIATION 4 lives in `prompt.rs`; DEVIATION 3 (`</tool_result>`) is

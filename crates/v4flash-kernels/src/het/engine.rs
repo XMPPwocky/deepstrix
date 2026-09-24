@@ -491,12 +491,17 @@ fn connect_remote_experts() -> Option<std::sync::Mutex<super::remote_experts::Re
 }
 
 impl HeterogeneousEngine {
-    /// Per-layer sync events for lane `lane` of an N-lane step (0..=2).
+    /// Lanes that have their own sync events (`sync_events_lane`).
+    pub const MAX_LANES: usize = 3;
+    /// Per-layer sync events for lane `lane` of an N-lane step (0..MAX_LANES).
+    /// A lane past the last set used to alias lane 2's events silently; the
+    /// drivers now reject `n > MAX_LANES`, so reaching the panic is a bug.
     pub fn sync_events_lane(&self, lane: usize) -> &HetSyncEvents {
         match lane {
             0 => &self.sync_events,
             1 => &self.sync_events_t1,
-            _ => &self.sync_events_t2,
+            2 => &self.sync_events_t2,
+            _ => panic!("sync_events_lane({lane}): only {} lanes have sync events", Self::MAX_LANES),
         }
     }
     /// See `RemoteExpertClient::drain_in_flight`. Returns the number drained.

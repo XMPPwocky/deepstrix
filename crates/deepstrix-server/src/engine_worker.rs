@@ -1327,8 +1327,8 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
 /// next request re-encodes the same text as `["foob", "ar"]`, the byte
 /// stream "foobar" matches and we keep the in-VRAM KV state.
 #[derive(Debug, Clone, Copy)]
-struct AlignedLcp {
-    live_tokens: usize,
+pub(crate) struct AlignedLcp {
+    pub(crate) live_tokens: usize,
     req_tokens: usize,
     bridged_tokens: usize,
     first_bridge: Option<(i32, i32)>,
@@ -1354,7 +1354,7 @@ fn byte_aligned_lcp(
 /// image's content hash in at its IMAGE_START. The id fast-path gets the
 /// same treatment: two IMAGE_START tokens are only "the same token" when
 /// their spans carry the same hash.
-fn byte_aligned_lcp_vl(
+pub(crate) fn byte_aligned_lcp_vl(
     live: &[i32],
     live_spans: &[ImageSpan],
     req: &[i32],
@@ -1652,6 +1652,21 @@ mod tests {
     }
 }
 
+/// Return freed glibc heap to the OS and log the heap shape. Can take a few ms
+/// on a large heap, so call it where no stream is waiting on the worker.
+pub(crate) fn trim_heap_and_log(what: &'static str) {
+    let hs = v4flash_core::heap::trim_and_stats();
+    tracing::info!(
+        rss_mib = v4flash_core::heap::rss_bytes() >> 20,
+        heap_in_use_mib = hs.in_use >> 20,
+        heap_free_mib = hs.free >> 20,
+        heap_arena_mib = hs.arena >> 20,
+        heap_mmapped_mib = hs.mmapped >> 20,
+        trimmed = hs.trimmed,
+        "{what}"
+    );
+}
+
 fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
     #[cfg(feature = "v41")]
     if crate::multistream::enabled() {
@@ -1898,16 +1913,7 @@ fn worker_loop(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequest>) {
                         "expert read phases (cumulative)"
                     );
                 }
-                let hs = v4flash_core::heap::trim_and_stats();
-                tracing::info!(
-                    rss_mib = v4flash_core::heap::rss_bytes() >> 20,
-                    heap_in_use_mib = hs.in_use >> 20,
-                    heap_free_mib = hs.free >> 20,
-                    heap_arena_mib = hs.arena >> 20,
-                    heap_mmapped_mib = hs.mmapped >> 20,
-                    trimmed = hs.trimmed,
-                    "host heap after request"
-                );
+                trim_heap_and_log("host heap after request");
             }
             EngineRequest::Shutdown { ack } => {
                 tracing::info!("worker received shutdown");

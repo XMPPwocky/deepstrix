@@ -776,7 +776,7 @@ pub struct StageCap<'a> {
     pub skip: bool,
     capturing: bool,
     name: &'static str,
-    key: u32,
+    key: u64,
     de: &'a super::engine::DeviceEngine,
     graphs: &'a super::graph_cache::GraphCache,
 }
@@ -823,8 +823,12 @@ impl HeterogeneousEngine {
         if !allow || !ms_graphs() {
             return Ok(StageCap { skip: false, capturing: false, name, key: 0, de, graphs });
         }
-        let lane = ((lane_ptr >> 8) as u32).wrapping_mul(2654435761) >> 16;
-        let key = (layer as u32) | (b << 8) | (lane << 16);
+        // Exact, collision-free key: layer (8 bits) | b (16) | lane buffer
+        // address >> 8 (40 bits: device VAs fit in 48, lane buffers are
+        // 256-aligned). The old 32-bit key hashed the lane into 16 bits and
+        // let `b << 8` overlap it once b >= 256.
+        debug_assert!(layer < 256 && b < 65536 && (lane_ptr as u64) >> 48 == 0);
+        let key = (layer as u64) | ((b as u64) << 8) | (((lane_ptr as u64) >> 8) << 24);
         if let Some(exec) = graphs.get(name, key) {
             exec.launch(&de.compute)?;
             return Ok(StageCap { skip: true, capturing: false, name, key, de, graphs });
@@ -2086,8 +2090,12 @@ impl HeterogeneousEngine {
                 return Err(eyre!("CED prefill: replay segment {b_seg} of {t} rows"));
             }
             let seg_pos0 = pos0 + (t - b_seg) as u32;
-            // Fresh prompt only (see `prefill_job_finish`, KNOWN_BUGS #25).
-            if pos0 == 0 {
+            // Keep the decoder rings only when the replay starts exactly at
+            // `pos0` of a continuation; empty them for a fresh prompt or a
+            // suffix longer than the replay segment. Same rule as
+            // `prefill_job_finish` (KNOWN_BUGS #25, #28) -- this copy missed
+            // the #28 half, and the serial `prefill_suffix` path reaches it.
+            if pos0 == 0 || t > b_seg {
                 for l in split..N_LAYER as usize {
                     state.layers[l].n_raw = 0;
                     state.layers[l].raw_off = 0;
@@ -2626,8 +2634,8 @@ impl HeterogeneousEngine {
         self.remote_set_phase_busy_poll(true);
         let b = tokens.len();
         let n = lanes.len();
-        if n < 2 || b < n {
-            return Err(eyre!("forward_step_arena_lanes: needs >= 2 lanes and >= 1 row per lane (got {n} lanes, {b} rows)"));
+        if n < 2 || n > Self::MAX_LANES || b < n {
+            return Err(eyre!("forward_step_arena_lanes: needs 2..={} lanes and >= 1 row per lane (got {n} lanes, {b} rows)", Self::MAX_LANES));
         }
         if slots.len() != b || input_hcs.len() != b {
             return Err(eyre!("forward_step_arena_lanes: {} slots / {} hcs for {b} tokens", slots.len(), input_hcs.len()));
@@ -2776,8 +2784,8 @@ impl HeterogeneousEngine {
         self.remote_set_phase_busy_poll(true);
         let b = tokens.len();
         let n = lanes.len();
-        if n < 2 || b < n {
-            return Err(eyre!("forward_step_arena_ready_first: needs >= 2 lanes and >= 1 row per lane (got {n} lanes, {b} rows)"));
+        if n < 2 || n > Self::MAX_LANES || b < n {
+            return Err(eyre!("forward_step_arena_ready_first: needs 2..={} lanes and >= 1 row per lane (got {n} lanes, {b} rows)", Self::MAX_LANES));
         }
         if slots.len() != b || input_hcs.len() != b {
             return Err(eyre!("forward_step_arena_ready_first: {} slots / {} hcs for {b} tokens", slots.len(), input_hcs.len()));

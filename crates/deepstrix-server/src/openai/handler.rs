@@ -196,7 +196,7 @@ pub async fn chat_completions(
     // quality on tool paths and plausibly costs DSpark acceptance too -- the
     // drafter is predicting text it was trained to see in the other format.
     #[cfg(feature = "v41")]
-    let tokens = {
+    let (tokens, image_order) = {
         // The 4-state effort carries the thinking flag; V4.1 wants a 1..=100
         // budget alongside it. An explicit integer in the request wins.
         let budget = numeric_budget
@@ -222,6 +222,8 @@ pub async fn chat_completions(
         .map_err(|e| ApiError::BadRequest(format!("{e:#}")))?
     };
     #[cfg(not(feature = "v41"))]
+    let image_order: Vec<usize> = (0..req.messages.iter().map(|m| m.images().count()).sum()).collect();
+    #[cfg(not(feature = "v41"))]
     let tokens = render_prompt(
         &engine.vocab,
         &req.messages,
@@ -241,8 +243,19 @@ pub async fn chat_completions(
     // `main`'s `#[tokio::main]` gives us). Cheaper than `spawn_blocking`
     // here because it borrows `req` instead of cloning every payload.
     let vl = if has_images {
-        let inputs: Vec<&crate::openai::types::ImageInput> =
+        // In PROMPT order: V4.1 reorders tool results (and the images in
+        // them) to the assistant's call order, so message order is not the
+        // placeholder order.
+        let by_msg: Vec<&crate::openai::types::ImageInput> =
             req.messages.iter().flat_map(|m| m.images()).collect();
+        if image_order.len() != by_msg.len() {
+            return Err(ApiError::BadRequest(format!(
+                "prompt renders {} image placeholders for {} images",
+                image_order.len(),
+                by_msg.len()
+            )));
+        }
+        let inputs: Vec<&crate::openai::types::ImageInput> = image_order.iter().map(|&k| by_msg[k]).collect();
         let placeholder = engine
             .image_placeholder_id
             .expect("vision_enabled implies placeholder id");
@@ -456,6 +469,10 @@ pub async fn healthz() -> &'static str {
 ///
 /// Body is a one-line summary so an operator curling the endpoint can
 /// see why a 503 fired.
+/// The hang deadline the watchdog was armed with (env > CLI flag > default),
+/// published by `main` so /readyz judges staleness by the same number.
+pub static HANG_DEADLINE_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(60_000);
+
 pub async fn readyz(
     State(engine): State<crate::engine_worker::EngineHandle>,
 ) -> Response {
@@ -463,10 +480,7 @@ pub async fn readyz(
     let p = &engine.progress;
     let inflight = p.inflight.load(std::sync::atomic::Ordering::Relaxed);
     let stale_ms = p.stale_ms();
-    let deadline_ms = std::env::var("DEEPSTRIX_HANG_DEADLINE_MS")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(60_000);
+    let deadline_ms = HANG_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed);
     if inflight && stale_ms > deadline_ms {
         (
             StatusCode::SERVICE_UNAVAILABLE,
