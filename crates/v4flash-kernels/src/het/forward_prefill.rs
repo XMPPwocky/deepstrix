@@ -5921,6 +5921,21 @@ impl HeterogeneousEngine {
                 )?;
             }
         }
+        // Fidelity gate: force the reference's picks (`routing_tap` PIN), after
+        // the image-row recompute so every row is final.
+        if super::routing_tap::pin_on() {
+            super::routing_tap::pin_device_rows(
+                &de.compute,
+                layer as usize,
+                &pos_at,
+                b as usize,
+                &sd.router_logits,
+                &mut bd.d_selected,
+                &mut bd.d_ew,
+                EXPERT_WEIGHT_SCALE,
+                ROUTER_WEIGHT_EPS,
+            )?;
+        }
         drop(_t_router);
         let remote_owns_layer = self
             .remote
@@ -6212,9 +6227,9 @@ impl HeterogeneousEngine {
                         super::expert_pager::pick_trace(&format!("P {layer} {b} {}", ids.join(" ")));
                     }
                 }
-                if super::expert_pager::pick_sink_on() {
+                if super::routing_tap::pick_sink_on() {
                     for r in 0..b as usize {
-                        super::expert_pager::pick_sink_push(true, layer as usize, r as u32, b, &sel_host[r * cs_n_used..(r + 1) * cs_n_used]);
+                        super::routing_tap::pick_sink_push(true, layer as usize, r as u32, b, &sel_host[r * cs_n_used..(r + 1) * cs_n_used]);
                     }
                 }
                 // C3: with the split active, box 2 OWNS half of this layer's

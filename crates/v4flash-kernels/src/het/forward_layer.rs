@@ -2150,6 +2150,20 @@ impl HeterogeneousEngine {
                 )?;
             }
         }
+        // Fidelity gate: force the reference's picks (`routing_tap` PIN).
+        if super::routing_tap::pin_on() {
+            super::routing_tap::pin_device_rows(
+                &de.compute,
+                layer as usize,
+                |_| pos,
+                1,
+                &dgpu_scratch.router_logits,
+                &mut dgpu_scratch.d_selected,
+                &mut dgpu_scratch.d_ew,
+                EXPERT_WEIGHT_SCALE,
+                ROUTER_WEIGHT_EPS,
+            )?;
+        }
         drop(_s_router);
         _t_router.end()?;
 
@@ -2315,8 +2329,8 @@ impl HeterogeneousEngine {
                 let ids: Vec<String> = sel_host.iter().map(|v| v.to_string()).collect();
                 super::expert_pager::pick_trace(&format!("D {layer} {}", ids.join(" ")));
             }
-            if super::expert_pager::pick_sink_on() {
-                super::expert_pager::pick_sink_push(false, layer as usize, 0, 1, &sel_host);
+            if super::routing_tap::pick_sink_on() {
+                super::routing_tap::pick_sink_push(false, layer as usize, 0, 1, &sel_host);
             }
             // Router-probe dataset (`V41_PROBE_DUMP`). Placed HERE because the
             // stream is already synchronised for the `d_selected` readback
