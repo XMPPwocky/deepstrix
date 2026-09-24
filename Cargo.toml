@@ -9,7 +9,6 @@ members = [
     "crates/deepstrix-expertd",
     "crates/v4flash-vision",
     "crates/phase0",
-    "crates/phase1",
 ]
 
 [workspace.package]
