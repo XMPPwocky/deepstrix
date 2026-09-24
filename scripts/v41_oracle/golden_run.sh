@@ -64,6 +64,20 @@ for c in "$@"; do
       # generated positions only (assistant spans), as substitution would run in production
       run_case "$tag" --no-layer-dumps --swap-eps "$eps" "${extra[@]}" --swap-positions "$HERE/agentic_generated_positions.json" \
         --prompt-ids "$(tr -d '[] \n' < "$HERE/agentic_tokens.json")" ;;
+    # Ungated substitution policy runs (generated positions only):
+    #   policy:upper  6th -> 7th whenever the 6th is outside the box-1 hot-set proxy
+    #   policy:rate   same, but only a seeded 9% of eligible (~1 swap/token, the production rate)
+    #   policy:drop   as rate, but drop the 6th and renormalise over 5 (fallback when the 7th is not resident)
+    policy:*)
+      pol=${c#policy:}; extra=(--swap-eps inf --swap-sixth-cold "$HOME/b1_hotset_proxy.json")
+      case $pol in
+        upper) ;;
+        rate)  extra+=(--swap-frac 0.09 --swap-seed 1) ;;
+        drop)  extra+=(--swap-frac 0.09 --swap-seed 1 --swap-mode drop) ;;
+        *) echo "unknown policy $pol"; exit 2 ;;
+      esac
+      run_case "policy_$pol" --no-layer-dumps "${extra[@]}" --swap-positions "$HERE/agentic_generated_positions.json" \
+        --prompt-ids "$(tr -d '[] \n' < "$HERE/agentic_tokens.json")" ;;
     *) echo "unknown case $c"; exit 2 ;;
   esac || { echo "[$(date -u +%T)] stopping after $c failed"; exit 1; }
 done
