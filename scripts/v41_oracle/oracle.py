@@ -80,8 +80,15 @@ def main():
     ap.add_argument("--swap-frac", type=float, default=1.0,
                     help="apply the swap to only this fraction of eligible token-layers (deterministic, --swap-seed)")
     ap.add_argument("--swap-seed", type=int, default=0)
-    ap.add_argument("--swap-mode", choices=("seventh", "drop"), default="seventh",
-                    help="seventh: route to the 7th instead; drop: drop the 6th and renormalise over the other 5")
+    ap.add_argument("--swap-mode", choices=("seventh", "drop", "bf16"), default="seventh",
+                    help="seventh: route to the 7th instead; drop: drop the 6th and renormalise over the other 5; "
+                         "bf16 (null control): keep routing, round the 6th expert's contribution to bf16")
+    ap.add_argument("--swap-rank", type=int, default=None,
+                    help="which rank to replace with the 7th (1..topk; default topk = the 6th). "
+                         "Eligibility (--swap-sixth-cold, --swap-frac) is still decided on the 6th pick.")
+    ap.add_argument("--swap-check-sites", type=int, default=0,
+                    help="per layer, log this many swapped rows: routing before/after and ||dFFN|| "
+                         "(recomputes those rows' FFN with the original routing) to swap_checks.json")
     ap.add_argument("--no-layer-dumps", action="store_true", help="skip per-layer residual/routing files")
     a = ap.parse_args()
     if a.swap_eps is not None:
@@ -93,6 +100,7 @@ def main():
     if a.swap_sixth_cold:
         sixth_cold_sets = [set(x) for x in __import__("json").load(open(a.swap_sixth_cold))]
     swap_counts = []
+    swap_checks = []
     swap_pos = None
     if a.swap_positions:
         swap_pos = __import__("json").load(open(a.swap_positions))
@@ -204,7 +212,7 @@ def main():
             gate = block.ffn.gate
             gate_fwd = gate.forward
 
-            def gate_tap(x, image_mask=None, _gate=gate, _fwd=gate_fwd):
+            def gate_tap(x, image_mask=None, _gate=gate, _fwd=gate_fwd, _moe=block.ffn):
                 w, idx = _fwd(x, image_mask)
                 # The SELECTION scores top-k ranks, recomputed exactly as ref.Gate.forward
                 # does (model.py): score_func(x W^T / temp) + bias. Their gap at rank k vs
@@ -245,17 +253,25 @@ def main():
                         g = torch.Generator().manual_seed(a.swap_seed * 1000003 + L)
                         swap = swap & (torch.rand(swap.shape[0], generator=g) < a.swap_frac)
                     idx = top.indices[:, :k].clone()
+                    col = (a.swap_rank or k) - 1
+                    w_ref, idx_ref = w.clone(), idx.clone()
+                    if a.swap_mode == "bf16":
+                        _moe.bf16_round = (swap.clone(), idx[:, col].clone())
                     if a.swap_mode == "seventh":
-                        idx[swap, k - 1] = top.indices[swap, k]
+                        idx[swap, col] = top.indices[swap, k]
                     # Weights exactly as ref.Gate.forward: unbiased scores of the chosen set,
                     # renormalised, times route_scale. "drop" zeroes the 6th before renormalising.
                     w = sc.gather(1, idx)
                     if a.swap_mode == "drop":
-                        w[swap, k - 1] = 0.0
+                        w[swap, col] = 0.0
                     if _gate.norm_topk_prob and k > 1:
                         w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
                     w = w * _gate.route_scale
                     swap_counts.append(int(swap.sum()))
+                    if a.swap_check_sites:
+                        rows = swap.nonzero().flatten()[: a.swap_check_sites].tolist()
+                        _moe.check = {"layer": L, "rows": rows, "w_ref": w_ref, "idx_ref": idx_ref,
+                                      "w_new": w.clone(), "idx_new": idx.clone(), "out": swap_checks}
                 return w, idx
             gate.forward = gate_tap
             if args.compress_ratios[L]:
@@ -356,12 +372,15 @@ def main():
         json.dump({"tokens": len(ids), "layers": n_layers, "engram": layout is not None,
                    "swap_eps": a.swap_eps, "swap_cold_only": a.swap_cold_only, "swap_positions": a.swap_positions,
                    "swap_sixth_cold": a.swap_sixth_cold, "swap_frac": a.swap_frac, "swap_seed": a.swap_seed,
-                   "swap_mode": a.swap_mode,
+                   "swap_mode": a.swap_mode, "swap_rank": a.swap_rank or 6,
                    "swap_counts_per_layer": swap_counts,
                    "model_dir": MODEL, "config_sha256": cfg_sha, "reference_model_py_sha256": model_py_sha,
                    "oracle_rev": rev or os.environ.get("V41_ORACLE_REV", ""), "files": files},
                   open(os.path.join(a.out, "manifest.json"), "w"), indent=1)
         print(f"manifest: {len(files)} files")
+    if swap_checks:
+        json.dump(swap_checks, open(os.path.join(a.out, "swap_checks.json"), "w"), indent=1)
+        print(f"swap_checks: {len(swap_checks)} sites")
     top = torch.topk(logits[0].float(), 8)
     print("top-8 next tokens:")
     for v, i in zip(top.values.tolist(), top.indices.tolist()):
