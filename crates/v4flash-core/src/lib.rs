@@ -7,7 +7,6 @@
 pub mod engram_hash;
 pub mod engram_table;
 pub mod gguf;
-pub mod gguf_write;
 pub mod hf_v41;
 pub mod heap;
 pub mod iq3_s_ref;
