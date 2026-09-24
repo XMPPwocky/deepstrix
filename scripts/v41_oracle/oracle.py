@@ -75,6 +75,13 @@ def main():
     ap.add_argument("--swap-positions", default=None,
                     help="JSON list of token positions where swapping is allowed (e.g. only the generated "
                          "tokens, so prompt KV stays exact as it would in production); default: all")
+    ap.add_argument("--swap-sixth-cold", default=None,
+                    help="JSON [layer][ids] hot set: eligible only when the 6th pick is OUTSIDE it (7th unconstrained)")
+    ap.add_argument("--swap-frac", type=float, default=1.0,
+                    help="apply the swap to only this fraction of eligible token-layers (deterministic, --swap-seed)")
+    ap.add_argument("--swap-seed", type=int, default=0)
+    ap.add_argument("--swap-mode", choices=("seventh", "drop"), default="seventh",
+                    help="seventh: route to the 7th instead; drop: drop the 6th and renormalise over the other 5")
     ap.add_argument("--no-layer-dumps", action="store_true", help="skip per-layer residual/routing files")
     a = ap.parse_args()
     if a.swap_eps is not None:
@@ -82,6 +89,9 @@ def main():
     hot_sets = None
     if a.swap_cold_only:
         hot_sets = [set(x) for x in __import__("json").load(open(a.swap_cold_only))]
+    sixth_cold_sets = None
+    if a.swap_sixth_cold:
+        sixth_cold_sets = [set(x) for x in __import__("json").load(open(a.swap_sixth_cold))]
     swap_counts = []
     swap_pos = None
     if a.swap_positions:
@@ -227,11 +237,21 @@ def main():
                         sixth, seventh = top.indices[:, k - 1].tolist(), top.indices[:, k].tolist()
                         cold_ok = torch.tensor([(s6 not in hs) and (s7 in hs) for s6, s7 in zip(sixth, seventh)])
                         swap = swap & cold_ok
+                    if sixth_cold_sets is not None:
+                        hs6 = sixth_cold_sets[L]
+                        swap = swap & torch.tensor([e not in hs6 for e in top.indices[:, k - 1].tolist()])
+                    if a.swap_frac < 1.0:
+                        # Deterministic per (seed, layer, position): a seeded generator over the rows.
+                        g = torch.Generator().manual_seed(a.swap_seed * 1000003 + L)
+                        swap = swap & (torch.rand(swap.shape[0], generator=g) < a.swap_frac)
                     idx = top.indices[:, :k].clone()
-                    idx[swap, k - 1] = top.indices[swap, k]
+                    if a.swap_mode == "seventh":
+                        idx[swap, k - 1] = top.indices[swap, k]
                     # Weights exactly as ref.Gate.forward: unbiased scores of the chosen set,
-                    # renormalised, times route_scale.
+                    # renormalised, times route_scale. "drop" zeroes the 6th before renormalising.
                     w = sc.gather(1, idx)
+                    if a.swap_mode == "drop":
+                        w[swap, k - 1] = 0.0
                     if _gate.norm_topk_prob and k > 1:
                         w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
                     w = w * _gate.route_scale
@@ -335,6 +355,8 @@ def main():
             rev = ""
         json.dump({"tokens": len(ids), "layers": n_layers, "engram": layout is not None,
                    "swap_eps": a.swap_eps, "swap_cold_only": a.swap_cold_only, "swap_positions": a.swap_positions,
+                   "swap_sixth_cold": a.swap_sixth_cold, "swap_frac": a.swap_frac, "swap_seed": a.swap_seed,
+                   "swap_mode": a.swap_mode,
                    "swap_counts_per_layer": swap_counts,
                    "model_dir": MODEL, "config_sha256": cfg_sha, "reference_model_py_sha256": model_py_sha,
                    "oracle_rev": rev or os.environ.get("V41_ORACLE_REV", ""), "files": files},
