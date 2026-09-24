@@ -59,11 +59,41 @@ class LazyMoE(torch.nn.Module):
         weights, indices = self.gate(x, None if image_mask is None else image_mask.flatten())
         self.last_indices = indices.detach().clone()  # [n, k] routed expert ids (dumped by oracle.py)
         y = torch.zeros_like(x, dtype=torch.float32)
+        # Null-control hook (oracle.py --swap-mode bf16): rows whose rank-k expert's
+        # contribution is rounded to bf16 instead of being swapped. None = off.
+        rnd = getattr(self, "bf16_round", None)
         for e in torch.unique(indices).tolist():
             idx, top = torch.where(indices == e)
             self.touched[e] = self.touched.get(e, 0) + idx.numel()
-            y[idx] += self._expert(e, x[idx], weights[idx, top, None])
+            out = self._expert(e, x[idx], weights[idx, top, None])
+            if rnd is not None:
+                rows, experts = rnd
+                m = rows[idx] & (experts[idx] == e)
+                if m.any():
+                    out = out.clone()
+                    out[m] = out[m].to(torch.bfloat16).float()
+            y[idx] += out
         y += self.shared_experts(x)
+        # Swap-takes-effect check (oracle.py --swap-check-sites): recompute the sampled
+        # rows' routed output with the ORIGINAL routing and record the difference.
+        chk = getattr(self, "check", None)
+        if chk is not None:
+            for r in chk["rows"]:
+                def routed(ids, ws):
+                    acc = torch.zeros(self.dim, dtype=torch.float32)
+                    for j, e in enumerate(ids.tolist()):
+                        acc += self._expert(e, x[r:r + 1], ws[j:j + 1, None])[0].float()
+                    return acc
+                y_ref = routed(chk["idx_ref"][r], chk["w_ref"][r])
+                y_new = routed(chk["idx_new"][r], chk["w_new"][r])
+                chk["out"].append({
+                    "layer": chk["layer"], "row": r,
+                    "ids_ref": chk["idx_ref"][r].tolist(), "ids_used": chk["idx_new"][r].tolist(),
+                    "w_ref": [round(v, 5) for v in chk["w_ref"][r].tolist()],
+                    "w_used": [round(v, 5) for v in chk["w_new"][r].tolist()],
+                    "ffn_norm": y_ref.norm().item(), "dffn_norm": (y_new - y_ref).norm().item(),
+                })
+            self.check = None
         return y.type_as(x).view(shape)
 
 

@@ -74,6 +74,17 @@ for c in "$@"; do
         upper) ;;
         rate)  extra+=(--swap-frac 0.09 --swap-seed 1) ;;
         drop)  extra+=(--swap-frac 0.09 --swap-seed 1 --swap-mode drop) ;;
+        # null controls: (n1) a random 0.1% of ALL generated token-layers swapped 6th->7th;
+        # (n2) policy_rate's selection pattern, but round the 6th expert's output to bf16
+        null_rand) extra=(--swap-eps inf --swap-frac 0.001 --swap-seed 2) ;;
+        null_bf16) extra+=(--swap-frac 0.09 --swap-seed 1 --swap-mode bf16) ;;
+        # validity controls:
+        #   zero   policy_rate's exact flags with eps=0 -> 0 swaps; logits must equal the baseline bit for bit
+        #   rank1  positive control: same 9% selection, but replace the RANK-1 pick with the 7th
+        #   rate2  policy_rate again + per-layer site checks; logits must equal the first policy_rate run
+        zero)  extra=(--swap-eps 0 --swap-sixth-cold "$HOME/b1_hotset_proxy.json" --swap-frac 0.09 --swap-seed 1) ;;
+        rank1) extra+=(--swap-frac 0.09 --swap-seed 1 --swap-rank 1 --swap-check-sites 3) ;;
+        rate2) extra+=(--swap-frac 0.09 --swap-seed 1 --swap-check-sites 3) ;;
         *) echo "unknown policy $pol"; exit 2 ;;
       esac
       run_case "policy_$pol" --no-layer-dumps "${extra[@]}" --swap-positions "$HERE/agentic_generated_positions.json" \
