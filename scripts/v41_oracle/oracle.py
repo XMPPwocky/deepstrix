@@ -62,6 +62,10 @@ def main():
     ap.add_argument("--no-engram", action="store_true")
     ap.add_argument("--prompt-ids", default=None, help="comma-separated token ids, used verbatim instead of --prompt")
     ap.add_argument("--dump-argmax", action="store_true", help="also dump the greedy token at every position")
+    ap.add_argument("--golden", action="store_true",
+                    help="golden-corpus capture: per-layer router selection scores + weights, the compressed "
+                         "positions each layer attends to, the candidate-block mask, full logits at every "
+                         "position, and a manifest with sha256 of every file")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
 
@@ -166,6 +170,40 @@ def main():
                         return out
                     return wrapped
                 block.attn.wo_b.forward = tap_io("attn_wo_b", block.attn.wo_b.forward)
+        golden = {}
+        if a.golden:
+            gate = block.ffn.gate
+            gate_fwd = gate.forward
+
+            def gate_tap(x, image_mask=None, _gate=gate, _fwd=gate_fwd):
+                w, idx = _fwd(x, image_mask)
+                # The SELECTION scores top-k ranks, recomputed exactly as ref.Gate.forward
+                # does (model.py): score_func(x W^T / temp) + bias. Their gap at rank k vs
+                # k+1 is the margin a routing flip has to cross.
+                sc = ref.linear(x.float(), _gate.weight.float()) / _gate.gate_temp
+                if _gate.score_func == "softmax":
+                    sc = sc.softmax(dim=-1)
+                elif _gate.score_func == "sigmoid":
+                    sc = sc.sigmoid()
+                else:
+                    sc = torch.nn.functional.softplus(sc).sqrt()
+                bias = _gate.bias
+                if image_mask is not None and _gate.bias_vl is not None:
+                    bias = torch.where(image_mask.unsqueeze(-1), _gate.bias_vl, bias)
+                sel = sc + bias
+                assert torch.equal(sel.topk(_gate.topk, dim=-1)[1], idx), "recomputed selection != reference"
+                golden["router_sel"] = sel.float().clone()
+                golden["router_w"] = w.float().clone()
+                return w, idx
+            gate.forward = gate_tap
+            if args.compress_ratios[L]:
+                ctk = block.attn._compress_topk_idxs
+
+                def ctk_tap(*a_, _f=ctk, **k_):
+                    r = _f(*a_, **k_)
+                    golden["compress_idxs"] = r.clone()
+                    return r
+                block.attn._compress_topk_idxs = ctk_tap
         with torch.inference_mode():
             if block.engram is not None:
                 h = block.engram(h, hashes[:, :, block.engram.layer_hash_index, :], None)
@@ -193,6 +231,12 @@ def main():
         torch.save(h.float(), os.path.join(a.out, f"layer_{L:02d}_residual.pt"))
         if getattr(block.ffn, "last_indices", None) is not None:
             torch.save(block.ffn.last_indices.to(torch.int32), os.path.join(a.out, f"layer_{L:02d}_topk_ids.pt"))
+        for name, t in golden.items():
+            torch.save(t.cpu() if name != "compress_idxs" else t.to(torch.int32).cpu(),
+                       os.path.join(a.out, f"layer_{L:02d}_{name}.pt"))
+        idxr = getattr(block.attn, "indexer", None)
+        if a.golden and idxr is not None and getattr(idxr, "is_candidate_source", False):
+            torch.save(ref.shared_attn.candidates.clone().cpu(), os.path.join(a.out, f"layer_{L:02d}_candidates.pt"))
         touched = len(block.ffn.touched)
         rms = h.float().pow(2).mean().sqrt().item()
         nan = torch.isnan(h).any().item()
@@ -220,7 +264,35 @@ def main():
             torch.save(torch.cat(am).to(torch.int32), os.path.join(a.out, "main_argmax.pt"))
             torch.save(torch.cat(top5).to(torch.int32), os.path.join(a.out, "main_top5.pt"))
             print("dumped main_argmax/top5 for", x.shape[1], "positions")
+        if a.golden:
+            # f32 [T, V], chunked through the head so the activations stay small.
+            chunks = []
+            for c0 in range(0, x.shape[1], 32):
+                chunks.append(head(norm(x[:, c0:c0 + 32]), full_logits=True).float()[0].cpu())
+            torch.save(torch.cat(chunks), os.path.join(a.out, "logits_all.pt"))
     torch.save(logits.float(), os.path.join(a.out, "logits_last.pt"))
+    if a.golden:
+        import hashlib, subprocess
+        files = {}
+        for fn in sorted(os.listdir(a.out)):
+            if fn == "manifest.json":
+                continue
+            h_ = hashlib.sha256()
+            with open(os.path.join(a.out, fn), "rb") as fh:
+                for blk in iter(lambda: fh.read(1 << 20), b""):
+                    h_.update(blk)
+            files[fn] = {"sha256": h_.hexdigest(), "bytes": os.path.getsize(os.path.join(a.out, fn))}
+        cfg_sha = hashlib.sha256(open(os.path.join(MODEL, "config.json"), "rb").read()).hexdigest()
+        model_py_sha = hashlib.sha256(open(os.path.join(MODEL, "inference", "model.py"), "rb").read()).hexdigest()
+        try:
+            rev = subprocess.run(["git", "-C", HERE, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        except Exception:
+            rev = ""
+        json.dump({"tokens": len(ids), "layers": n_layers, "engram": layout is not None,
+                   "model_dir": MODEL, "config_sha256": cfg_sha, "reference_model_py_sha256": model_py_sha,
+                   "oracle_rev": rev or os.environ.get("V41_ORACLE_REV", ""), "files": files},
+                  open(os.path.join(a.out, "manifest.json"), "w"), indent=1)
+        print(f"manifest: {len(files)} files")
     top = torch.topk(logits[0].float(), 8)
     print("top-8 next tokens:")
     for v, i in zip(top.values.tolist(), top.indices.tolist()):
