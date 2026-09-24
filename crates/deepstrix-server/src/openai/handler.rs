@@ -42,7 +42,7 @@ use crate::openai::types::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, Role, ToolCall,
     ToolCallFunction, Usage,
 };
-use crate::prompt::{render_prompt, ReasoningEffort};
+use crate::prompt::{ReasoningEffort};
 use crate::vision_prompt::{expand_images, ImageSpan, PreparedImage, VlPrompt};
 
 const DEFAULT_TEMPERATURE: f32 = 1.0;
