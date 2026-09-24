@@ -55,13 +55,14 @@ for c in "$@"; do
     agentic) run_case agentic --prompt-ids "$(tr -d '[] \n' < "$HERE/agentic_tokens.json")" ;;
     smoke)   run_case smoke --layers 2 --prompt "The capital of France is" ;;
     # Routing-swap experiments on the agentic prompt (logits only):
-    #   swap:EPS        swap every 6th/7th near-tie with gap < EPS
+    #   swap:EPS        swap every 6th/7th near-tie with gap < EPS, at generated (assistant) positions only
     #   swap:EPS:cold   only when the 6th is outside the box-1 hot-set proxy and the 7th inside
     swap:*)
       IFS=: read -r _ eps mode <<< "$c"
       extra=(); tag="swap_${eps}"
       if [ "${mode:-}" = cold ]; then extra=(--swap-cold-only "$HOME/b1_hotset_proxy.json"); tag="${tag}_cold"; fi
-      run_case "$tag" --no-layer-dumps --swap-eps "$eps" "${extra[@]}" \
+      # generated positions only (assistant spans), as substitution would run in production
+      run_case "$tag" --no-layer-dumps --swap-eps "$eps" "${extra[@]}" --swap-positions "$HERE/agentic_generated_positions.json" \
         --prompt-ids "$(tr -d '[] \n' < "$HERE/agentic_tokens.json")" ;;
     *) echo "unknown case $c"; exit 2 ;;
   esac || { echo "[$(date -u +%T)] stopping after $c failed"; exit 1; }

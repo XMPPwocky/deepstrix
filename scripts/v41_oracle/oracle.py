@@ -72,6 +72,9 @@ def main():
                          "Implies --golden's router tap; compare logits_all against an unswapped run.")
     ap.add_argument("--swap-cold-only", default=None,
                     help="JSON [layer][ids] hot set: only swap when the 6th pick is OUTSIDE it and the 7th inside")
+    ap.add_argument("--swap-positions", default=None,
+                    help="JSON list of token positions where swapping is allowed (e.g. only the generated "
+                         "tokens, so prompt KV stays exact as it would in production); default: all")
     ap.add_argument("--no-layer-dumps", action="store_true", help="skip per-layer residual/routing files")
     a = ap.parse_args()
     if a.swap_eps is not None:
@@ -80,6 +83,9 @@ def main():
     if a.swap_cold_only:
         hot_sets = [set(x) for x in __import__("json").load(open(a.swap_cold_only))]
     swap_counts = []
+    swap_pos = None
+    if a.swap_positions:
+        swap_pos = __import__("json").load(open(a.swap_positions))
     os.makedirs(a.out, exist_ok=True)
 
     ckpt = Checkpoint(MODEL)
@@ -212,6 +218,10 @@ def main():
                     k = _gate.topk
                     gap = top.values[:, k - 1] - top.values[:, k]
                     swap = gap < a.swap_eps
+                    if swap_pos is not None:
+                        allowed = torch.zeros_like(swap)
+                        allowed[torch.tensor(swap_pos, dtype=torch.long)] = True
+                        swap = swap & allowed
                     if hot_sets is not None:
                         hs = hot_sets[L]
                         sixth, seventh = top.indices[:, k - 1].tolist(), top.indices[:, k].tolist()
@@ -324,7 +334,8 @@ def main():
         except Exception:
             rev = ""
         json.dump({"tokens": len(ids), "layers": n_layers, "engram": layout is not None,
-                   "swap_eps": a.swap_eps, "swap_cold_only": a.swap_cold_only, "swap_counts_per_layer": swap_counts,
+                   "swap_eps": a.swap_eps, "swap_cold_only": a.swap_cold_only, "swap_positions": a.swap_positions,
+                   "swap_counts_per_layer": swap_counts,
                    "model_dir": MODEL, "config_sha256": cfg_sha, "reference_model_py_sha256": model_py_sha,
                    "oracle_rev": rev or os.environ.get("V41_ORACLE_REV", ""), "files": files},
                   open(os.path.join(a.out, "manifest.json"), "w"), indent=1)
