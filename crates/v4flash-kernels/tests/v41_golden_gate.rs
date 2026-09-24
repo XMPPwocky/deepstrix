@@ -1,4 +1,4 @@
-//! Golden gate, milestone 1: the production V4.1 engine against the frozen CPU
+//! Golden gate: the production V4.1 engine against the frozen CPU
 //! reference (DeepSeek's unmodified `inference/model.py`, captured by
 //! `scripts/v41_oracle/oracle.py --golden` and exported by `export_golden.py`).
 //!
@@ -16,6 +16,15 @@
 //!     A small gap is a near-tie flip (expected under numeric error); a large gap
 //!     is a bug, whatever the KL says.
 //!
+//! Routing modes (`GOLDEN_ROUTING`, default both):
+//!   * `free`: the engine routes itself, as in production;
+//!   * `pinned`: every routing decision, prompt and decode, is forced to the
+//!     reference's top-6 (`het::routing_tap` PIN), weighted from the engine's own
+//!     router scores. Selection is the one discontinuity in the forward pass, so
+//!     pinned KL prices the engine's numerics alone; free minus pinned is what
+//!     the routing flips cost. A pinned run must show zero differing picks (the
+//!     pin is checked, not assumed) and reports how many rows it overrode.
+//!
 //! Reports KL(ref || engine) mean / p50 / p90 / p99 / max, top-1 agreement and the
 //! transcript NLL, over generated positions (the assistant spans) and over all
 //! decoded positions, plus the routing-flip table. The first runs establish the
@@ -31,7 +40,7 @@
 //!   cargo test -p v4flash-kernels --release --test v41_golden_gate -- --ignored --nocapture
 //! ```
 //! Env: GOLDEN_CASE (fixture dir, default ~/.cache/deepstrix/goldens/agentic),
-//! GOLDEN_PATHS (serial,arena), GOLDEN_MAX_STEPS, GOLDEN_REPORT (JSON path),
+//! GOLDEN_PATHS (serial,arena), GOLDEN_ROUTING (free,pinned), GOLDEN_MAX_STEPS, GOLDEN_REPORT (JSON path),
 //! V41_HF_DIR, V41_ENGRAM_DIR, V41_PAGER_POOL_GB (default 40 here).
 
 use std::path::{Path, PathBuf};
@@ -43,7 +52,9 @@ use v4flash_kernels::config::{
     COMPRESS_RATIOS, ENGRAM_IN, ENGRAM_LAYERS, HC_DIM, KV_SOURCE_LAYERS, N_EXPERT, N_EXPERT_USED, N_LAYER, N_VOCAB,
 };
 use v4flash_kernels::embed::embed_lookup;
-use v4flash_kernels::het::expert_pager::{pick_sink_enable, pick_sink_take, PickRecord};
+use v4flash_kernels::het::routing_tap::{
+    pick_sink_enable, pick_sink_take, pin_overrides_take, pin_set, PickRecord, PinTable,
+};
 use v4flash_kernels::het::forward_prefill::{LazyEngramRows, PrefillJob};
 use v4flash_kernels::het::kv_arena::{KvArena, RowTablesDev};
 use v4flash_kernels::het::{
@@ -238,6 +249,8 @@ struct FlipStats {
     gaps: Vec<f32>,
     per_layer_diff: Vec<usize>,
     large: Vec<(usize, usize, f32)>,
+    /// Pinned runs: rows whose pick set the pin replaced (prompt, decode).
+    pin_overrides: (u64, u64),
 }
 
 impl FlipStats {
@@ -284,6 +297,8 @@ impl FlipStats {
             "gap_ge_0.05": share(LARGE_FLIP_GAP, f32::INFINITY),
             "large_flips": self.large.iter().take(50).map(|&(p, l, g)| serde_json::json!({"pos": p, "layer": l, "gap": g})).collect::<Vec<_>>(),
             "per_layer_differing": self.per_layer_diff,
+            "pin_overrides_prompt": self.pin_overrides.0,
+            "pin_overrides_decode": self.pin_overrides.1,
         })
     }
 }
@@ -303,7 +318,16 @@ fn v41_golden_gate() -> eyre::Result<()> {
     }
     let home = std::env::var("HOME").unwrap_or_default();
     let case = PathBuf::from(std::env::var("GOLDEN_CASE").unwrap_or_else(|_| format!("{home}/.cache/deepstrix/goldens/agentic")));
-    let paths: Vec<String> = std::env::var("GOLDEN_PATHS").unwrap_or_else(|_| "serial,arena".into()).split(',').map(|s| s.trim().to_string()).collect();
+    let list = |k: &str, d: &str| -> Vec<String> {
+        std::env::var(k).unwrap_or_else(|_| d.into()).split(',').map(|s| s.trim().to_string()).collect()
+    };
+    let paths = list("GOLDEN_PATHS", "serial,arena");
+    let routings = list("GOLDEN_ROUTING", "free,pinned");
+    if let Some(r) = routings.iter().find(|r| !matches!(r.as_str(), "free" | "pinned")) {
+        return Err(eyre!("unknown GOLDEN_ROUTING entry {r}"));
+    }
+    let runs: Vec<(String, bool)> =
+        paths.iter().flat_map(|p| routings.iter().map(move |r| (p.clone(), r == "pinned"))).collect();
     let dir = std::env::var("V41_HF_DIR").unwrap_or_else(|_| HF_DIR_DEFAULT.to_string());
     let engram_dir = std::env::var("V41_ENGRAM_DIR").unwrap_or_else(|_| format!("{home}/.cache/deepstrix/v41/engram"));
 
@@ -361,7 +385,9 @@ fn v41_golden_gate() -> eyre::Result<()> {
     report.insert("prompt_tokens".into(), prompt.len().into());
     report.insert("remote".into(), std::env::var("V41_REMOTE_ADDR").is_ok().into());
 
-    for path in &paths {
+    for (path, pinned) in &runs {
+        let name = if *pinned { format!("{path}+pin") } else { path.clone() };
+        pin_set(if *pinned { Some(PinTable::new(N_LAYER as usize, t_n, fx.topk.clone())?) } else { None });
         let t0 = std::time::Instant::now();
         let mut st = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
         let mut steps = StepStats::default();
@@ -385,6 +411,7 @@ fn v41_golden_gate() -> eyre::Result<()> {
         engine.dgpu.compute.synchronize()?;
         let mut prefill_stats = StepStats::default();
         prefill_stats.push(&fx, prompt.len() - 1, &prefill_logits)?;
+        flips.pin_overrides.0 = pin_overrides_take();
         let t_prefill = t0.elapsed().as_secs_f64();
 
         // ---- teacher-forced decode over the rest of the transcript
@@ -422,10 +449,12 @@ fn v41_golden_gate() -> eyre::Result<()> {
             steps.push(&fx, pos, &logits)?;
             flips.observe(&fx, pos, &pick_sink_take())?;
             if (pos - think) % 100 == 0 {
-                eprintln!("  [{path}] pos {pos}: KL {:.5} top1 {}", steps.kl.last().unwrap(), steps.top1.last().unwrap());
+                eprintln!("  [{name}] pos {pos}: KL {:.5} top1 {}", steps.kl.last().unwrap(), steps.top1.last().unwrap());
             }
         }
         pick_sink_enable(false);
+        flips.pin_overrides.1 = pin_overrides_take();
+        pin_set(None);
         if let Some(a) = arena.as_mut() {
             a.release(slot)?;
         }
@@ -437,8 +466,8 @@ fn v41_golden_gate() -> eyre::Result<()> {
             "routing": flips.summary(),
             "seconds": {"prefill": t_prefill, "total": secs},
         });
-        eprintln!("[{path}] {}", serde_json::to_string_pretty(&r)?);
-        report.insert(path.clone(), r);
+        eprintln!("[{name}] {}", serde_json::to_string_pretty(&r)?);
+        report.insert(name, r);
     }
 
     let out = std::env::var("GOLDEN_REPORT").map(PathBuf::from).unwrap_or_else(|_| {
@@ -452,11 +481,15 @@ fn v41_golden_gate() -> eyre::Result<()> {
     engine.shutdown()?;
 
     // Hard failures only for now; thresholds tighten once a baseline exists.
-    for path in &paths {
-        let d = &report[path]["decode_all"];
+    for (name, r) in &report {
+        let Some(d) = r.get("decode_all") else { continue };
         let (mean, top1) = (d["kl_mean"].as_f64().unwrap_or(f64::NAN), d["top1_agree"].as_f64().unwrap_or(0.0));
         if !(mean < 0.5) || top1 < 0.8 {
-            return Err(eyre!("[{path}] gross divergence from the reference: KL mean {mean:.4}, top-1 {top1:.3}"));
+            return Err(eyre!("[{name}] gross divergence from the reference: KL mean {mean:.4}, top-1 {top1:.3}"));
+        }
+        let differing = r["routing"]["differing"].as_u64().unwrap_or(u64::MAX);
+        if name.ends_with("+pin") && differing != 0 {
+            return Err(eyre!("[{name}] the pin did not hold: {differing} token-layers differ from the reference picks"));
         }
     }
     Ok(())
