@@ -499,6 +499,19 @@ Run each case through serial prefill, serial decode, multistream rows at S=1/2/4
 - (f) Run `on_request_end` telemetry and heap trim from multistream; check RSS on a long agent session.
 - (g) readyz uses the resolved hang deadline.
 - (h) V4.1 tool-result image order (`sort_tool_results` vs `handler.rs:244`), and validation of non-function tools.
+- (i) **Localhost-only status endpoint** (requested 2026-09-24). Today the only way to see what is in flight is to reconstruct it from the log; `/readyz` just says `inflight=true`.
+  - **Contents:** a `GET /v1/status` returning JSON with:
+    - live slots: prompt tokens, restored tokens, tokens generated so far, tok/s, age, session id
+    - parked requests: required rows versus the largest free run, and time parked
+    - the queue: length and message count per entry
+    - scheduler phase
+    - KV-arena occupancy per store: free rows and largest free run
+  - **Localhost only, enforced structurally.** Serve it from a separate listener bound to `127.0.0.1` (e.g. `:18081`), not from the main router. The main router also listens on the tailnet address (`100.79.4.101:18080`), so a peer-address check on that router is one refactor away from exposing it.
+  - **How the data gets out:** the worker publishes a snapshot (an `Arc<Mutex<StatusSnapshot>>` updated once per tick) that the handler reads. The HTTP task never touches scheduler state.
+  - **Gates:**
+    - a unit test that the main router has no `/v1/status` route
+    - a test that the status listener binds only a loopback address
+    - `curl 100.79.4.101:18081/v1/status` must fail (the listener isn't there)
 - The snapshot cache keys on prompt bytes, so prompt-fidelity changes (effort default 50 vs 75, tools without a system message) are **separate, announced** changes, not refactors.
 
 **Step 2: knob registry (2-3 days).**
