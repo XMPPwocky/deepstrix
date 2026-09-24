@@ -147,6 +147,15 @@ profile can show `box2.subs_per_step` next to `box2.page_ms`.
    local reference computed with the *rewritten* `sel`. The bench needs the plan
    echoed back for that (debug flag).
 5. Every determinism gate runs with `sub=0`, and says so.
+6. **Substituted KV must not outlive its turn.** Today it cannot. The multistream
+   path snapshots only at the prompt end (`multistream.rs:657-669`, at
+   `<｜Assistant｜>`), `finish()` just releases the slot (turn-end snapshots are
+   the unbuilt "M2", `:1221-1229`), and the next request re-prefills the previous
+   assistant turn exactly. Prefill never substitutes. If turn-end or RESIDENT
+   snapshots are built, a stream that substituted must not snapshot past its
+   first substitution. Otherwise the downstream-prompt tail the reference measured
+   (KL 0.8-1.3 at tool-result openings after a perturbed turn) becomes part of
+   the price.
 
 ## Rollout
 
