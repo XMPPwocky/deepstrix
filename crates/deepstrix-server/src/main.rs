@@ -31,7 +31,7 @@ struct Args {
     gguf: String,
     /// HTTP bind address (host:port).
     /// Repeatable: pass `--addr` once per address to listen on, e.g.
-    /// `--addr 127.0.0.1:18080 --addr 100.79.4.101:18080` to serve loopback
+    /// `--addr 127.0.0.1:18080 --addr <tailnet-ip>:18080` to serve loopback
     /// and the tailnet. An address that cannot be bound is warned about and
     /// skipped — only failing to bind ALL of them is fatal.
     #[arg(long, default_value = "127.0.0.1:8080")]
