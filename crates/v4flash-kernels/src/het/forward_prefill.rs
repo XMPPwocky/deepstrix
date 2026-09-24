@@ -49,15 +49,6 @@ use super::weights::{DgpuLayerWeights, HetModelWeights, IgpuLayerWeights};
 
 const ROUTER_WEIGHT_EPS: f32 = 6.103515625e-5;
 
-/// M61 prefill het-split rollback: `DGPU_HOT_PREFILL=0` keeps the decode
-/// het-split but routes ALL prefill MoE slots to the iGPU (pre-M61
-/// behaviour). Default on when hot experts are loaded.
-fn hot_prefill_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("DGPU_HOT_PREFILL").map(|v| v != "0").unwrap_or(true)
-    });
-    *ON
-}
 
 /// Max dGPU-resident slots per token in prefill. Defaults to decode's
 /// DGPU_HOT_CAP (default 4) so the prefill slot→device partition matches
@@ -152,33 +143,6 @@ fn hot_prefill_cap() -> u32 {
     *CAP
 }
 
-/// Whether the M61 het-split MoE runs for this prefill layer: hot weights
-/// present on BOTH devices, hot scratch allocated (the shared R1 views +
-/// member lists AND the lane's reduce output — both are gated by the same
-/// `DGPU_HOT_EXPERTS` env, so they agree unless a caller mixed scratches
-/// from different processes), and not rolled back.
-fn prefill_hot_active(
-    dlw: &DgpuLayerWeights,
-    ilw: &IgpuLayerWeights,
-    bd: &BatchDgpuScratch,
-    sd: &BatchDgpuShared,
-) -> bool {
-    let active = hot_prefill_enabled()
-        && bd.hot_ffn_moe_dgpu.is_some()
-        && sd.hot.is_some()
-        && dlw.hot_experts.is_some()
-        && ilw.hot_remap.is_some();
-    // M63: a packed iGPU buffer has no non-hetsplit fallback — the plain
-    // by-expert builder emits raw expert ids. validate_dedup_preconditions
-    // rules every disabling knob out at load, so this can only fire on a
-    // future path that forgets to.
-    debug_assert!(
-        active || !ilw.igpu_packed,
-        "L{}: iGPU experts packed but the prefill het-split is inactive",
-        ilw.layer_idx
-    );
-    active
-}
 
 /// Every batched entry point runs `b` rows through per-lane scratch
 /// that was allocated for `bd.rows` / `bi.rows` tokens and the shared
@@ -1319,12 +1283,6 @@ impl HeterogeneousEngine {
             let sev_a_cur = &self.sync_events.layers[layer];
             let sev_b_cur = &self.sync_events_t1.layers[layer];
 
-            let hot_cur = prefill_hot_active(
-                &weights.dgpu_layers[layer],
-                &weights.igpu_layers[layer],
-                bd_a,
-                sd,
-            );
 
             // V4.1 reuse layers: lend the KV source's store to layer L+1 for both
             // lanes' pre-MoE halves (post-MoE never touches compressor state).
@@ -1335,7 +1293,7 @@ impl HeterogeneousEngine {
             }
             // Lane A: finish layer L, then start layer L+1.
             let _t_post = LayerHostTimer::start(&LH_POST);
-            self.forward_layer_post_moe_v2(bd_a, b_a as u32, sev_a_cur, hot_cur)?;
+            self.forward_layer_post_moe_v2(bd_a, b_a as u32, sev_a_cur)?;
             drop(_t_post);
             std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
             let _t_eng = LayerHostTimer::start(&LH_ENGRAM);
@@ -1370,7 +1328,7 @@ impl HeterogeneousEngine {
             // Every counter is now a BOTH-LANE total, so they are comparable.
             if b_b > 0 {
                 let _t_post_b = LayerHostTimer::start(&LH_POST);
-                self.forward_layer_post_moe_v2(bd_b, b_b as u32, sev_b_cur, hot_cur)?;
+                self.forward_layer_post_moe_v2(bd_b, b_b as u32, sev_b_cur)?;
                 drop(_t_post_b);
                 std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
                 let _t_eng_b = LayerHostTimer::start(&LH_ENGRAM);
@@ -1406,19 +1364,13 @@ impl HeterogeneousEngine {
         // last layer has no MoE and leaves `residual` = its input rows.
         let last = hi - 1;
         if mode_of(last) != CedMode::KvSourceOnly {
-            let hot_last = prefill_hot_active(
-                &weights.dgpu_layers[last],
-                &weights.igpu_layers[last],
-                bd_a,
-                sd,
-            );
             // The LAST layer's post_moe, both lanes -- also previously untimed, so
             // one whole layer of post_moe was missing from every report.
             let _t_post_last = LayerHostTimer::start(&LH_POST);
-            self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[last], hot_last)?;
+            self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[last])?;
             std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
             if b_b > 0 {
-                self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[last], hot_last)?;
+                self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[last])?;
                 std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
             }
             drop(_t_post_last);
@@ -2232,7 +2184,6 @@ pub struct PreMoeCarry {
     n_work_items: u32,
     variant: String,
     wmma_path: bool,
-    hot_active: bool,
     max_per_expert: u32,
     chunk_size: u32,
 }
@@ -2398,7 +2349,6 @@ impl HeterogeneousEngine {
             let dlw = &weights.dgpu_layers[layer];
             let ilw = &weights.igpu_layers[layer];
             let sev = &self.sync_events.layers[layer];
-            let hot_active = prefill_hot_active(dlw, ilw, bd, sd);
             arena.state.with_kv_source(layer, |ls| {
                 self.forward_layer_pre_moe_v2(
                     bd, bi, sd, si, ls, dlw, ilw, 0, tokens, None, None, sev,
@@ -2406,7 +2356,7 @@ impl HeterogeneousEngine {
                     RowLayout::Arena { tables: &tables, dev, next_router: weights.dgpu_layers.get(layer + 1), next_router2: weights.dgpu_layers.get(layer + 2) },
                 )?;
                 self.route_probe_after_layer(bd, weights, layer, b, 0)?;
-                self.forward_layer_post_moe_v2(bd, b as u32, sev, hot_active)
+                self.forward_layer_post_moe_v2(bd, b as u32, sev)
             })?;
             std::mem::swap(&mut bd.residual, &mut bd.residual_next);
         }
@@ -2584,22 +2534,18 @@ impl HeterogeneousEngine {
         let mut cb = chain!(bd_b, bi_b, tables_b, dev_b, tokens_b, self.sync_events_t1, b_a, b_b, 0);
         rest_layer!(0, &mut ca, &mut cb);
         for layer in 0..n_layer - 1 {
-            let hot_a = prefill_hot_active(&weights.dgpu_layers[layer], &weights.igpu_layers[layer], bd_a, sd);
-            self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[layer], hot_a)?;
+            self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[layer])?;
             std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
             let mut ca = chain!(bd_a, bi_a, tables_a, dev_a, tokens_a, self.sync_events, 0, b_a, layer + 1);
-            let hot_b = prefill_hot_active(&weights.dgpu_layers[layer], &weights.igpu_layers[layer], bd_b, sd);
-            self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[layer], hot_b)?;
+            self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[layer])?;
             std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
             let mut cb = chain!(bd_b, bi_b, tables_b, dev_b, tokens_b, self.sync_events_t1, b_a, b_b, layer + 1);
             rest_layer!(layer + 1, &mut ca, &mut cb);
         }
         let last = n_layer - 1;
-        let hot_a = prefill_hot_active(&weights.dgpu_layers[last], &weights.igpu_layers[last], bd_a, sd);
-        self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[last], hot_a)?;
+        self.forward_layer_post_moe_v2(bd_a, b_a as u32, &self.sync_events.layers[last])?;
         std::mem::swap(&mut bd_a.residual, &mut bd_a.residual_next);
-        let hot_b = prefill_hot_active(&weights.dgpu_layers[last], &weights.igpu_layers[last], bd_b, sd);
-        self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[last], hot_b)?;
+        self.forward_layer_post_moe_v2(bd_b, b_b as u32, &self.sync_events_t1.layers[last])?;
         std::mem::swap(&mut bd_b.residual, &mut bd_b.residual_next);
         self.dgpu.compute.synchronize()?;
         for &slot in slots {
@@ -2717,8 +2663,7 @@ impl HeterogeneousEngine {
                 let layer: usize = $layer;
                 let bl = (offs[i + 1] - offs[i]) as u32;
                 let (bd, _, _) = &mut lanes[i];
-                let hot = prefill_hot_active(&weights.dgpu_layers[layer], &weights.igpu_layers[layer], bd, sd);
-                self.forward_layer_post_moe_v2(bd, bl, &self.sync_events_lane(i).layers[layer], hot)?;
+                self.forward_layer_post_moe_v2(bd, bl, &self.sync_events_lane(i).layers[layer])?;
                 std::mem::swap(&mut bd.residual, &mut bd.residual_next);
             }};
         }
@@ -2883,8 +2828,7 @@ impl HeterogeneousEngine {
                 let (i, l): (usize, usize) = ($i, $l);
                 let bl = (offs[i + 1] - offs[i]) as u32;
                 let (bd, _, _) = &mut lanes[i];
-                let hot = prefill_hot_active(&weights.dgpu_layers[l], &weights.igpu_layers[l], bd, sd);
-                self.forward_layer_post_moe_v2(bd, bl, &self.sync_events_lane(i).layers[l], hot)?;
+                self.forward_layer_post_moe_v2(bd, bl, &self.sync_events_lane(i).layers[l])?;
                 std::mem::swap(&mut bd.residual, &mut bd.residual_next);
             }};
         }
@@ -2972,9 +2916,8 @@ impl HeterogeneousEngine {
             return Ok(());
         }
         let sev = &self.sync_events.layers[layer];
-        let hot_active = prefill_hot_active(dlw, ilw, bd, sd);
         self.forward_layer_pre_moe_v2(bd, bi, sd, si, ls, dlw, ilw, pos0, tokens, vis, stats, sev, pager.as_deref_mut(), CedMode::Exact, RowLayout::Contiguous)?;
-        self.forward_layer_post_moe_v2(bd, b, sev, hot_active)?;
+        self.forward_layer_post_moe_v2(bd, b, sev)?;
         Ok(())
     }
 
@@ -6108,12 +6051,6 @@ impl HeterogeneousEngine {
         } else {
             hot_prefill_cap()
         };
-        if remote_split_on && prefill_hot_active(dlw, ilw, bd, sd) {
-            return Err(eyre!(
-                "L{layer}: dGPU hot split and the two-box remote split are both active; \
-                 one remap cannot encode both (see set_remote_exclusion)"
-            ));
-        }
 
         // Router picks for this chunk, read back once and shared by the union
         // pager and the remote submit below (both need exactly these ids).
@@ -6974,60 +6911,6 @@ impl HeterogeneousEngine {
         if defer_shared {
             self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos, cap_ok)?;
         }
-        let pager_window;
-        let (routed_src, moe_remap, moe_packed): (
-            &crate::model_weights::RoutedExpertWeights,
-            Option<&v4flash_hip::DeviceBuffer<i32>>,
-            bool,
-        ) = match pager.as_deref() {
-            // A VIEW of this layer's dense window, not the whole pool: the window's
-            // slot i holds expert i, so the kernel indexes it exactly like a resident
-            // buffer while other layers stay resident in other windows.
-            Some(pg) => {
-                // THIRD half of the allocator/exclusion pairing: the WEIGHTS VIEW.
-                //
-                // `ensure` (sparse decode LRU) writes ABSOLUTE pool slots, which
-                // are only meaningful against the whole pool -- that is what the
-                // decode path hands the dispatch (`pg.routed`, forward_layer.rs).
-                // `ensure_layer_union`/`_dense` write WINDOW-RELATIVE slots, valid
-                // only against `routed_window(layer)`.
-                //
-                // Handing an absolute slot to the window view reads
-                // `window_base(w) + slot`, and with V41_PAGER_WINDOWS=4 /
-                // STRIDE=128 the base is 128/256/384 for most layers while the LRU
-                // slots start at `dense_slots()` = 768. That is off the end of a
-                // 384-wide view: another expert's weights, no error, plausible
-                // output. It is correct only when window_base == 0 for every layer
-                // (dense_windows == 1), which is NOT the default.
-                let routed_view: &crate::model_weights::RoutedExpertWeights =
-                    if sparse_resid_layer {
-                        &pg.routed
-                    } else {
-                        pager_window = pg.routed_window(layer as i32);
-                        &pager_window
-                    };
-                // ALWAYS hand the dispatch the remap when the pager owns the
-                // window, not just under the remote split.
-                //
-                // With a dense window `slot == raw expert id`, so a `None` remap
-                // used to be harmless — the PLAIN group builder's raw ids happened
-                // to be correct slots. That equivalence is exactly what packed
-                // windows break (`moe_group_builder.hip:116` mode 0 takes the group
-                // id FROM the remap: `g = (dense >= 0) ? e : (-dense - 1)`), so a
-                // layer that fell through to `None` would index a packed window by
-                // raw id and read another expert's weights — silently, with no
-                // error and plausible-looking output. Passing it unconditionally is
-                // a no-op today (mode 0 with an all-local remap is arithmetically
-                // identical to the plain builder) and the precondition for packing.
-                (routed_view, Some(pg.remap_dev(layer as i32)), false)
-            }
-            None => (&ilw.routed, ilw.hot_remap.as_ref(), ilw.igpu_packed),
-        };
-        let gbpe = routed_src.gate_bytes_per_expert as u32;
-        let ubpe = routed_src.up_bytes_per_expert as u32;
-        let dbpe = routed_src.down_bytes_per_expert as u32;
-        let mid_blocks_bytes = (crate::config::BLOCKS_Q8K_DOWN_IN as usize)
-            * crate::q8_k::BLOCK_Q8_K_BYTES;
         // Stage 9 router_topk + Stage 10 shared expert wrote bd.d_selected,
         // bd.d_ew, bd.ffn_input_norm on de.compute. We're about to read
         // them from de.xfer. Use the LayerSyncEvents event chain
@@ -7071,140 +6954,10 @@ impl HeterogeneousEngine {
         drop(bi_sel);
         drop(bi_ew);
 
-        // ========================================================
-        // M61 prefill het-split: the dGPU computes its RESIDENT (hot)
-        // experts' (b, slot) members itself, on de.compute, fully async
-        // with the iGPU MoE below (which skips those slots). Same
-        // group-builder machinery as the iGPU path but in DENSE id space,
-        // and with a STATIC work-items list — grid.y covers the worst
-        // case (n_hot × ceil(rows/HOT_CHUNK)) and the matvec kernels'
-        // `member_end <= member_start` guard early-exits empty chunks, so
-        // nothing here blocks on a host readback of n_work_items (a
-        // de.compute sync would stall the lane pipeline). The partial is
-        // added to ffn_moe_recv at ffn_combine (post_moe).
-        // ========================================================
-        let hot_active = prefill_hot_active(dlw, ilw, bd, sd);
-        if hot_active {
-            use super::batch_scratch::HOT_CHUNK;
-            let hot = dlw.hot_experts.as_ref().unwrap();
-            // Intermediates live in the SHARED R1 arena (this is the last
-            // R1 user of the lane's pre-MoE call; see BatchDgpuHotScratch);
-            // the reduce output is the PER-LANE buffer post_moe reads.
-            let hd = sd.hot.as_mut().unwrap();
-            let ffn_moe_dgpu = bd.hot_ffn_moe_dgpu.as_mut().unwrap();
-            let cap = hot_prefill_cap();
-            // Member-list stride / chunk count follow the shared scratch
-            // rows (hd.max_per_expert == sd.rows >= b), not B_MAX.
-            let max_per_expert = hd.max_per_expert as u32;
-            let n_wi = hot.n_hot * hd.chunks_per_expert as u32;
-            let _t_hot = de.events.stage("dgpu.hot_moe_prefill", &de.compute)?;
-            hd.group_count.fill_zero_async(&de.compute)?;
-            de.moe_group_builder.launch_hetsplit(
-                &de.compute,
-                &mut hd.group_count,
-                &mut hd.expert_members,
-                &bd.d_selected,
-                &hot.remap,
-                /*mode=*/ 1,
-                cap,
-                b,
-                cs_n_used as u32,
-                hot.n_hot,
-                max_per_expert,
-            )?;
-            de.q8k.launch(
-                &de.compute,
-                &mut hd.moe_xq,
-                &bd.ffn_input_norm,
-                crate::config::BLOCKS_Q8K_GATE_IN * b,
-            )?;
-            // Single-prefill-kernel formats (IQ2_S/IQ2_XS/IQ3_XXS/IQ3_S) go
-            // through the dispatcher; IQ2_XXS falls through to its kwide kernel.
-            if !super::dispatch::moe_gate_up_chunked(
-                de, routed_src.gate.dtype, &de.compute, &mut hd.mid_cat, &hot.gate, &hot.up,
-                &hd.moe_xq, &bd.d_ew, &hd.group_count, &hd.expert_members,
-                &hd.work_items_static, n_wi, gbpe, ubpe, cs_n_used as u32,
-                max_per_expert, HOT_CHUNK as u32, crate::config::SWIGLU_CLAMP_EXP,
-                crate::config::N_FF_EXP, crate::config::BLOCKS_Q8K_GATE_IN,
-            )? {
-                de.iq2.launch_fused_swiglu_kwide(
-                    &de.compute,
-                    &mut hd.mid_cat,
-                    &hot.gate,
-                    &hot.up,
-                    &hd.moe_xq,
-                    &bd.d_ew,
-                    &hd.group_count,
-                    &hd.expert_members,
-                    &hd.work_items_static,
-                    gbpe,
-                    ubpe,
-                    cs_n_used as u32,
-                    max_per_expert,
-                    HOT_CHUNK as u32,
-                    crate::config::SWIGLU_CLAMP_EXP,
-                    crate::config::N_FF_EXP,
-                    crate::config::BLOCKS_Q8K_GATE_IN,
-                    n_wi,
-                )?;
-            }
-            de.q8k.launch(
-                &de.compute,
-                &mut hd.midq_cat,
-                &hd.mid_cat,
-                crate::config::BLOCKS_Q8K_DOWN_IN * (cs_n_used as u32) * b,
-            )?;
-            match routed_src.down.dtype {
-                v4flash_core::gguf::GgufType::IQ3_XXS => de.iq3.launch_by_expert_kwide2(
-                    &de.compute, &mut hd.partials, &hot.down, &hd.midq_cat,
-                    &hd.group_count, &hd.expert_members, &hd.work_items_static, n_wi,
-                    dbpe, mid_blocks_bytes as u32, cs_n_used as u32,
-                    max_per_expert, HOT_CHUNK as u32, N_EMBD,
-                    crate::config::BLOCKS_Q8K_DOWN_IN,
-                )?,
-                v4flash_core::gguf::GgufType::MXFP4 => de.mxfp4.launch_by_expert_kwide2(
-                    &de.compute, &mut hd.partials, &hot.down, &hd.midq_cat,
-                    &hd.group_count, &hd.expert_members, &hd.work_items_static, n_wi,
-                    dbpe, mid_blocks_bytes as u32, cs_n_used as u32,
-                    max_per_expert, HOT_CHUNK as u32, N_EMBD,
-                    crate::config::BLOCKS_Q8K_DOWN_IN,
-                )?,
-                _ => de.q2k.launch_by_expert_kwide2(
-                    &de.compute,
-                    &mut hd.partials,
-                    &hot.down,
-                    &hd.midq_cat,
-                    &hd.group_count,
-                    &hd.expert_members,
-                    &hd.work_items_static,
-                    dbpe,
-                    mid_blocks_bytes as u32,
-                    cs_n_used as u32,
-                    max_per_expert,
-                    HOT_CHUNK as u32,
-                    N_EMBD,
-                    crate::config::BLOCKS_Q8K_DOWN_IN,
-                    n_wi,
-                )?,
-            }
-            de.q2k.launch_reduce_partials_hetsplit(
-                &de.compute,
-                ffn_moe_dgpu,
-                &hd.partials,
-                &bd.d_selected,
-                &hot.remap,
-                /*mode=*/ 1,
-                cap,
-                cs_n_used as u32,
-                N_EMBD,
-                b,
-            )?;
-        }
 
         // Single batched iGPU MoE call chain. iq2 uses by-expert
         // dispatch (group_builder + work_items pre-pass), q2_k stays
         // by-token (could also be by-expert but smaller perf lever).
-        c.hot_active = hot_active;
         Ok(())
     }
 
@@ -7229,14 +6982,13 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<()> {
         if !c.advance(PreMoePhase::Prepped, PreMoePhase::Launched)? { return Ok(()); }
         let PreMoeCarry {
-            layer, b, cs_n_used, cs_n_embd, moe_group_bound, split_cap, sparse_resid_layer, hot_active, ref sel_host_audit, ..
+            layer, b, cs_n_used, cs_n_embd, moe_group_bound, split_cap, sparse_resid_layer, ref sel_host_audit, ..
         } = *c;
-        let _ = (sd, dlw, ilw, hot_active, cs_n_embd);
+        let _ = (sd, dlw, ilw, cs_n_embd);
         let pager_window;
-        let (routed_src, moe_remap, moe_packed): (
+        let (routed_src, moe_remap): (
             &crate::model_weights::RoutedExpertWeights,
             Option<&v4flash_hip::DeviceBuffer<i32>>,
-            bool,
         ) = match pager.as_deref() {
             // A VIEW of this layer's dense window, not the whole pool: the window's
             // slot i holds expert i, so the kernel indexes it exactly like a resident
@@ -7277,9 +7029,9 @@ impl HeterogeneousEngine {
                 // error and plausible-looking output. Passing it unconditionally is
                 // a no-op today (mode 0 with an all-local remap is arithmetically
                 // identical to the plain builder) and the precondition for packing.
-                (routed_view, Some(pg.remap_dev(layer as i32)), false)
+                (routed_view, Some(pg.remap_dev(layer as i32)))
             }
-            None => (&ilw.routed, ilw.hot_remap.as_ref(), ilw.igpu_packed),
+            None => (&ilw.routed, None),
         };
         let gbpe = routed_src.gate_bytes_per_expert as u32;
         let ubpe = routed_src.up_bytes_per_expert as u32;
@@ -7448,15 +7200,6 @@ impl HeterogeneousEngine {
                     }
                 }
             } else {
-                // Emits RAW expert ids as group ids — incompatible with a
-                // de-duplicated iGPU buffer (see prefill_hot_active).
-                if moe_packed {
-                    return Err(eyre!(
-                        "L{layer}: iGPU experts are packed (IGPU_DEDUP_HOT) but the prefill \
-                         het-split is inactive — the plain group builder would index the \
-                         wrong experts"
-                    ));
-                }
                 // Raw expert ids, so this branch's group space IS N_EXPERT. It is
                 // only reachable with no remap at all, i.e. no pager -- and the
                 // sparse view needs one -- so a wide bound here would mean the
@@ -7793,17 +7536,6 @@ impl HeterogeneousEngine {
                      Set Q2K_VARIANT=bxn to opt out."
                 ));
             }
-            if hot_active && !use_by_expert {
-                // bxn iterates d_selected directly: it would read mid for
-                // the dGPU-resident slots the iGPU never computed (garbage)
-                // and double-count them after the combine adds the dGPU
-                // partial.
-                return Err(eyre!(
-                    "Q2K_VARIANT=bxn incompatible with prefill het-split \
-                     (dGPU owns the resident slots). Set DGPU_HOT_PREFILL=0 \
-                     to roll back the split instead."
-                ));
-            }
             if use_by_expert {
                 // No partials zero-fill (M53): router topk yields 8 DISTINCT
                 // experts per token, so group_count[e] ≤ B = max_per_expert —
@@ -8052,7 +7784,6 @@ impl HeterogeneousEngine {
         bd: &mut BatchDgpuScratch,
         b: u32,
         sev: &super::engine::LayerSyncEvents,
-        hot_active: bool,
     ) -> eyre::Result<()> {
         self.set_current_cached(self.dgpu.device)?;
         let de = &self.dgpu;
@@ -8245,22 +7976,6 @@ impl HeterogeneousEngine {
                 eprintln!("[combine-dbg] AFTER add: ffn_moe_recv l2={l2:.4}");
             }
             bd.remote_ffn_moe_valid = false;
-        }
-        if hot_active {
-            // M61: + the dGPU's resident-expert MoE partial. Queued on
-            // de.compute in pre_moe, so stream order already guarantees
-            // it's complete here.
-            let _t = de.events.stage("k.ffn_combine.vec_add_hot", &de.compute)?;
-            let ffn_moe_dgpu = bd
-                .hot_ffn_moe_dgpu
-                .as_ref()
-                .expect("hot_active implies bd.hot_ffn_moe_dgpu");
-            de.vec_add.launch(
-                &de.compute,
-                &mut bd.ffn_moe_recv,
-                ffn_moe_dgpu,
-                b * N_EMBD,
-            )?;
         }
         {
             let _t = de.events.stage("k.ffn_combine.hc_post", &de.compute)?;

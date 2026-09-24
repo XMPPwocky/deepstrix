@@ -34,7 +34,7 @@ use v4flash_kernels::het::engine::{ExecMode, HeterogeneousEngine};
 use v4flash_kernels::het::{BatchDgpuScratch, BatchDgpuShared, BatchIgpuScratch, BatchIgpuShared};
 use v4flash_kernels::het::scratch::{DgpuScratch, IgpuScratch};
 use v4flash_kernels::het::state::HetModelState;
-use v4flash_kernels::het::weights::{encode_igpu_remap, DgpuLayerWeights, HotExpertWeights, IgpuLayerWeights};
+use v4flash_kernels::het::weights::{DgpuLayerWeights, IgpuLayerWeights};
 use v4flash_kernels::{oracle::ActivationDump, RopeParams};
 
 /// "The capital of France is" (BOS + 5), as the oracle tokenised it.
@@ -306,8 +306,6 @@ fn read_i32(d: &ActivationDump, tag: &str, layer: i32, token: i32) -> eyre::Resu
 #[ignore]
 fn v41_layer0_matches_oracle() -> eyre::Result<()> {
     install_panic_handler()?;
-    // Every routed hit goes to the dGPU hot set (read by het::weights::dgpu_hot_cap).
-    std::env::set_var("DGPU_HOT_CAP", N_EXPERT_USED.to_string());
     let bins = std::env::var("V41_ORACLE_BINS").unwrap_or_else(|_| {
         format!("{}/.cache/deepstrix/v41/oracle_full_bins", std::env::var("HOME").unwrap())
     });
@@ -364,15 +362,14 @@ fn v41_layer0_matches_oracle() -> eyre::Result<()> {
     let shape = src.model_shape()?.unwrap();
     assert_eq!((shape.n_layer, shape.n_embd, shape.n_expert), (40, 5120, N_EXPERT));
 
-    eprintln!("loading layer {layer} (dGPU non-routed, {} experts hot on dGPU, all {} on iGPU)...", hot_ids.len(), N_EXPERT);
+    eprintln!("loading layer {layer} (routed experts paged on demand: {} distinct over the prompt)...", hot_ids.len());
     let t0 = std::time::Instant::now();
     // Layers 0..=layer chained per token: an Engram layer's attention collapse
     // needs the previous layer's FFN pre-mix as its single-pass mHC carry, so a
-    // layer > 0 cannot run alone. Each layer gets its own oracle-routed dGPU
-    // hot set (cap = n_used) plus the full identity-mapped expert set on the
-    // iGPU (7.2 GB/layer; the server is down anyway), so a routing deviation
-    // computes on the iGPU instead of indexing past a packed buffer.
-    let all_ids: Vec<u32> = (0..N_EXPERT).collect();
+    // layer > 0 cannot run alone. Routed experts go through the ExpertPager,
+    // exactly as in production: the router's actual picks are paged onto the
+    // iGPU pool (the dGPU hot tier and full iGPU residency no longer exist).
+    let pager_slots: u32 = std::env::var("V41_PAGER_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
     let hasher = EngramHash::load(std::path::Path::new(&engram_dir)).ok();
     let mut chain: Vec<(DgpuLayerWeights, IgpuLayerWeights, Option<Vec<f32>>)> = Vec::new();
     // A reuse layer (V4.1 layers 3..7 etc.) is tested from its KV source onwards so the
@@ -387,21 +384,7 @@ fn v41_layer0_matches_oracle() -> eyre::Result<()> {
     let chain_layers: Vec<_> = if layer_major { Vec::new() } else { (l_first..=layer).collect() };
     for l in chain_layers {
         let mut dl = DgpuLayerWeights::load(src, dgpu, l, &rope_for_layer)?;
-        let mut il = IgpuLayerWeights::load(src, igpu, l, &all_ids, &rope_for_layer)?;
-        if dump.tensor("topk_ids", l, 0).is_some() {
-            let mut set = BTreeSet::new();
-            for t in 0..t_n {
-                set.extend(read_i32(&dump, "topk_ids", l, t as i32)?);
-            }
-            let hot: Vec<u32> = set.iter().map(|&e| e as u32).collect();
-            let (hot_w, mut remap_host) = HotExpertWeights::load(src, dgpu, l, &hot)?;
-            encode_igpu_remap(&mut remap_host, false);
-            igpu.set_current()?;
-            let mut remap_d = DeviceBuffer::<i32>::new(igpu.id, remap_host.len())?;
-            remap_d.copy_from_host(&remap_host)?;
-            il.hot_remap = Some(remap_d);
-            dl.hot_experts = Some(hot_w);
-        }
+        let il = IgpuLayerWeights::load(src, igpu, l, &rope_for_layer)?;
         // Engram rows for every token (host gather through the SSD tables).
         let rows = if dl.engram.is_some() {
             let hs = hasher.as_ref().ok_or_else(|| eyre!("layer {l} has Engram but no hash dump at {engram_dir}"))?;
@@ -465,6 +448,7 @@ fn v41_layer0_matches_oracle() -> eyre::Result<()> {
         ExecMode::HetParallel
     };
     let engine = HeterogeneousEngine::new(dgpu, &darch, igpu, &iarch, mode)?;
+    let mut chain_pager = v4flash_kernels::het::ExpertPager::new(V41HfWeights::open(&dir, None)?, igpu, pager_slots)?;
     dgpu.set_current()?;
     let mut ds = DgpuScratch::alloc(dgpu)?;
     igpu.set_current()?;
@@ -516,13 +500,8 @@ fn v41_layer0_matches_oracle() -> eyre::Result<()> {
             let lsb = (u >> 16) & 1;
             f32::from_bits((u.wrapping_add(0x7fff + lsb)) & 0xffff_0000)
         };
-        // V41_PAGER=1: source routed experts on demand through the ExpertPager (packed pool +
-        // remap) instead of loading all 384 resident, to validate the pager == resident path.
-        let use_pager = std::env::var("V41_PAGER").map(|v| v == "1").unwrap_or(false);
-        let mut pager = if use_pager {
-            Some(v4flash_kernels::het::ExpertPager::new(V41HfWeights::open(&dir, None)?, igpu,
-                std::env::var("V41_PAGER_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(48))?)
-        } else { None };
+        // Routed experts on demand through the ExpertPager (the only expert tier).
+        let mut pager = Some(v4flash_kernels::het::ExpertPager::new(V41HfWeights::open(&dir, None)?, igpu, pager_slots)?);
         for l in 0..=layer {
             let tl = std::time::Instant::now();
             if reseed && l > 0 {
@@ -531,28 +510,7 @@ fn v41_layer0_matches_oracle() -> eyre::Result<()> {
                 }
             }
             let mut dl = DgpuLayerWeights::load(src, dgpu, l, &rope_for_layer)?;
-            let mut il = IgpuLayerWeights::load(src, igpu, l, &all_ids, &rope_for_layer)?;
-            if dump.tensor("topk_ids", l, 0).is_some() {
-                let mut set = BTreeSet::new();
-                for t in 0..t_n { set.extend(read_i32(&dump, "topk_ids", l, t as i32)?); }
-                let hot: Vec<u32> = set.iter().map(|&e| e as u32).collect();
-                if use_pager {
-                    // Pager path: no dGPU hot set. The forward reads the router's ACTUAL
-                    // picks back from d_selected and pages them onto the iGPU pool; the
-                    // all-negative remap sends every routed expert to that pool, so the
-                    // dGPU contributes no MoE partial. `il.routed` (resident 384) is
-                    // loaded but unused by the paged forward.
-                    dl.hot_experts = None;
-                } else {
-                    let (hot_w, mut remap_host) = HotExpertWeights::load(src, dgpu, l, &hot)?;
-                    encode_igpu_remap(&mut remap_host, false);
-                    igpu.set_current()?;
-                    let mut remap_d = DeviceBuffer::<i32>::new(igpu.id, remap_host.len())?;
-                    remap_d.copy_from_host(&remap_host)?;
-                    il.hot_remap = Some(remap_d);
-                    dl.hot_experts = Some(hot_w);
-                }
-            }
+            let il = IgpuLayerWeights::load(src, igpu, l, &rope_for_layer)?;
             let rows = if dl.engram.is_some() {
                 let hs = hasher.as_ref().ok_or_else(|| eyre!("layer {l} has Engram but no hash dump"))?;
                 let li = hs.layer_ids.iter().position(|&x| x == l as usize).unwrap();
@@ -756,7 +714,7 @@ fn v41_layer0_matches_oracle() -> eyre::Result<()> {
             if let Some(r) = &chain[ci].2 {
                 engine.stage_engram_rows_batch(&mut bd, &r[..t_n * ENGRAM_IN as usize])?;
             }
-            state.with_kv_source(l, |ls| engine.forward_layer_batch_v2(&mut bd, &mut bi, &mut sdd, &mut si, ls, &chain[ci].0, &chain[ci].1, 0, &tokens, None, None, None))?;
+            state.with_kv_source(l, |ls| engine.forward_layer_batch_v2(&mut bd, &mut bi, &mut sdd, &mut si, ls, &chain[ci].0, &chain[ci].1, 0, &tokens, None, None, Some(&mut chain_pager)))?;
             if l < layer as usize {
                 std::mem::swap(&mut bd.residual, &mut bd.residual_next);
             }
@@ -840,7 +798,7 @@ fn v41_layer0_matches_oracle() -> eyre::Result<()> {
                 let ein = ENGRAM_IN as usize;
                 engine.stage_engram_rows(&mut ds, &r[t * ein..(t + 1) * ein])?;
             }
-            state.with_kv_source(l, |ls| engine.forward_layer_standalone_graphs(&mut ds, &mut is, ls, dl, il, t as u32, tokens[t]))?;
+            state.with_kv_source(l, |ls| engine.forward_layer_standalone_graphs_paged(&mut ds, &mut is, ls, dl, il, t as u32, tokens[t], &mut chain_pager))?;
             if l < layer as usize {
                 std::mem::swap(&mut ds.residual, &mut ds.residual_next);
             }

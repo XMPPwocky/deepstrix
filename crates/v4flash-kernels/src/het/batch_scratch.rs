@@ -197,11 +197,11 @@ fn check_rows(who: &str, rows: usize) -> eyre::Result<()> {
 /// * `d_selected` / `d_ew` — read by `de.xfer` (same push) and by the
 ///   P11h hot leg.
 /// * `pos_per_b` — uploaded once per chunk, read every layer.
-/// * `hot_ffn_moe_dgpu` — the M61 hot-expert reduce output (P11h), read
+/// * (removed 2026-09-24: `hot_ffn_moe_dgpu`, the M61 dGPU hot-tier reduce output) read
 ///   by P12 `vec_add_hot` after the lane switch.
 ///
 /// ~128 MiB at rows=512: residual / residual_next / after_attn_hc 32 MiB
-/// each, ffn_input_norm / ffn_shared / ffn_moe_recv / hot_ffn_moe_dgpu
+/// each, ffn_input_norm / ffn_shared / ffn_moe_recv
 /// 8 MiB each, the rest < 100 KiB.
 /// Rows the DSpark residual capture is sized for. Only speculative verifies
 /// draft, and those are bounded by `V41_SMALL_B_OFFLOAD_MAX` (<= 8).
@@ -319,15 +319,8 @@ pub struct BatchDgpuScratch {
     /// Uploaded once per chunk, read by every layer's rope launches.
     pub pos_per_b: DeviceBuffer<i32>,
 
-    /// M61 prefill het-split: `[B, N_EMBD]` f32 hetsplit-reduced dGPU MoE
-    /// partial (P11h reduce output); added to `ffn_moe_recv` at
-    /// ffn_combine (P12, AFTER the lane switch). `Some` only when
-    /// `DGPU_HOT_EXPERTS > 0` — must agree with
-    /// [`BatchDgpuShared::hot`]. 8 MiB at rows=512.
-    pub hot_ffn_moe_dgpu: Option<DeviceBuffer<f32>>,
     /// The remote shard's weighted MoE partial for this lane's chunk,
-    /// `[B, N_EMBD]` f32, uploaded from the reply and added at `ffn_combine`
-    /// exactly like `hot_ffn_moe_dgpu`.
+    /// `[B, N_EMBD]` f32, uploaded from the reply and added at `ffn_combine`.
     ///
     /// PER-LANE, not shared: it is produced in pre-MoE and consumed in post-MoE,
     /// and the two pipeline lanes interleave those phases, so a shared buffer
@@ -655,11 +648,6 @@ pub struct BatchDgpuShared {
     pub mid_sh_xq: DeviceBuffer<i8>,
     pub mid_sh_xscale: DeviceBuffer<f32>,
 
-    /// M61 prefill het-split: dGPU-side MoE scratch for the hot-expert leg
-    /// (P11h). `Some` only when `DGPU_HOT_EXPERTS > 0` (~81 MiB of R1
-    /// views + member/work-item lists at rows=512). The reduce OUTPUT is
-    /// the per-lane [`BatchDgpuScratch::hot_ffn_moe_dgpu`].
-    pub hot: Option<BatchDgpuHotScratch>,
 }
 
 /// Static work-item geometry for the dGPU hot-expert prefill leg.
@@ -670,132 +658,10 @@ pub struct BatchDgpuShared {
 /// matvec kernels' `member_end <= member_start` guard early-exits empty
 /// chunks — no per-layer host readback of n_work_items on de.compute.
 pub const HOT_MAX_EXPERTS: usize = crate::config::N_EXPERT as usize;
-pub const HOT_CHUNK: usize = 32;
 
-/// Chunks per hot expert for a scratch of `rows` tokens.
-pub fn hot_chunks_per_expert(rows: usize) -> usize {
-    rows.div_ceil(HOT_CHUNK)
-}
 
-/// M61 prefill het-split: dGPU scratch mirroring the iGPU batched MoE
-/// pipeline, sized for the hot-expert (resident) slots only. The matvec
-/// kernels are the SAME kwide/kwide2 kernels the iGPU runs — only the
-/// group builder (dense ids, hits only) and the reduce (own-slots only)
-/// differ. Lives in [`BatchDgpuShared`]: everything here is written and
-/// read inside one lane's P11h on `de.compute`; the reduce output goes to
-/// the per-lane `hot_ffn_moe_dgpu`.
-///
-/// VRAM: the four big intermediates (`partials`, `mid_cat`, `midq_cat`,
-/// `moe_xq`; ~81 MiB at rows=512) are non-owning VIEWS into the parent's
-/// R1 arena at fixed offsets. LIFETIME CONTRACT: they are written and read
-/// only inside the hot leg (P11h: group_builder → q8k → gate/up → q8k →
-/// down → reduce), which is enqueued on de.compute after every other R1
-/// user of the layer (flat's P8 read is the last), and the reduce's output
-/// goes to the OWNED per-lane `hot_ffn_moe_dgpu`, so nothing in R1 is read
-/// after P11h. The next R1 access is the next pre-MoE call's P1 `flat`
-/// write (the other lane's, or this lane's next layer). Earlier R1 users
-/// (heads/flat) leave stale f32 bit patterns (possibly NaN) in the miss
-/// slots of `mid_cat`; the post-gate/up q8k quantize reads them but the
-/// resulting q8 blocks are never dotted (work items cover hot members
-/// only), so that is harmless.
-pub struct BatchDgpuHotScratch {
-    /// Per-expert member-list capacity (= parent `rows`). Passed to the
-    /// hetsplit group builder and the kwide kernels as `max_per_expert`.
-    pub max_per_expert: usize,
-    /// `ceil(max_per_expert / HOT_CHUNK)` — static work items per expert.
-    pub chunks_per_expert: usize,
-    /// `[B, BLOCKS_Q8K_GATE_IN × 292]` — q8_K-quantized ffn_input_norm.
-    /// Bit-identical to the iGPU's d_xq_q8k (same f32 input, same kernel).
-    /// R1 view.
-    pub moe_xq: DeviceBuffer<u8>,
-    /// `[B, n_used, N_FF_EXP]` f32 — fused-swiglu mid, hit slots only.
-    /// R1 view.
-    pub mid_cat: DeviceBuffer<f32>,
-    /// `[B, n_used, BLOCKS_Q8K_DOWN_IN × 292]` — quantized mid. R1 view.
-    pub midq_cat: DeviceBuffer<u8>,
-    /// `[B*n_used, N_EMBD]` f32 — q2k by-expert partials, hit slots only.
-    /// R1 view. Read by the reduce, which writes the per-lane
-    /// `hot_ffn_moe_dgpu`.
-    pub partials: DeviceBuffer<f32>,
-    /// `[HOT_MAX_EXPERTS]` i32 — DENSE-id group counts. Zeroed per layer
-    /// via fill_zero_async on de.compute (stream-ordered, so sharing
-    /// between lanes is safe). Owned.
-    pub group_count: DeviceBuffer<i32>,
-    /// `[HOT_MAX_EXPERTS × max_per_expert]` i32 — dense-id member lists,
-    /// `(b<<16)|slot` packed like the iGPU arrays. Owned.
-    pub expert_members: DeviceBuffer<i32>,
-    /// `[HOT_MAX_EXPERTS × chunks_per_expert]` i32 — STATIC e-major
-    /// work items `(e<<16)|(c×HOT_CHUNK)`, uploaded once at alloc. Owned.
-    pub work_items_static: DeviceBuffer<i32>,
-}
 
-impl BatchDgpuHotScratch {
-    fn xq_len(rows: usize) -> usize {
-        rows * (BLOCKS_Q8K_GATE_IN as usize) * BLOCK_Q8_K_BYTES
-    }
-    fn midq_len(rows: usize) -> usize {
-        rows * N_EXPERT_USED * (BLOCKS_Q8K_DOWN_IN as usize) * BLOCK_Q8_K_BYTES
-    }
-    fn mid_len(rows: usize) -> usize {
-        rows * N_EXPERT_USED * (N_FF_EXP as usize)
-    }
-    fn partials_len(rows: usize) -> usize {
-        rows * N_EXPERT_USED * (N_EMBD as usize)
-    }
 
-    /// Bytes the four R1 views occupy (each 256-B aligned), in carve
-    /// order `partials, mid_cat, moe_xq, midq_cat`.
-    pub fn r1_view_bytes(rows: usize) -> usize {
-        align256(Self::partials_len(rows) * 4)
-            + align256(Self::mid_len(rows) * 4)
-            + align256(Self::xq_len(rows))
-            + align256(Self::midq_len(rows))
-    }
-
-    /// Carve the four intermediates out of the parent's R1 arena (see
-    /// LIFETIME CONTRACT on the struct); allocate the rest owned.
-    fn alloc(id: i32, rows: usize, r1: &DeviceBuffer<u8>) -> eyre::Result<Self> {
-        let chunks_per_expert = hot_chunks_per_expert(rows);
-
-        // f32 views first (offset stays 4-aligned), byte views after.
-        // Order must match `r1_view_bytes`.
-        let mut carve = Carver::new(r1);
-        let partials = carve.take::<f32>(Self::partials_len(rows));
-        let mid_cat = carve.take::<f32>(Self::mid_len(rows));
-        let moe_xq = carve.take::<u8>(Self::xq_len(rows));
-        let midq_cat = carve.take::<u8>(Self::midq_len(rows));
-        debug_assert_eq!(carve.off, Self::r1_view_bytes(rows));
-
-        let mut work_items_static: DeviceBuffer<i32> =
-            DeviceBuffer::new(id, HOT_MAX_EXPERTS * chunks_per_expert)?;
-        let mut wi_host = vec![0i32; HOT_MAX_EXPERTS * chunks_per_expert];
-        for e in 0..HOT_MAX_EXPERTS {
-            for c in 0..chunks_per_expert {
-                wi_host[e * chunks_per_expert + c] =
-                    ((e as i32) << 16) | ((c * HOT_CHUNK) as i32);
-            }
-        }
-        work_items_static.copy_from_host(&wi_host)?;
-        Ok(Self {
-            max_per_expert: rows,
-            chunks_per_expert,
-            moe_xq,
-            mid_cat,
-            midq_cat,
-            partials,
-            group_count: DeviceBuffer::new(id, HOT_MAX_EXPERTS)?,
-            expert_members: DeviceBuffer::new(id, HOT_MAX_EXPERTS * rows)?,
-            work_items_static,
-        })
-    }
-}
-
-/// Whether the M61 hot-expert prefill scratch should be allocated. Must
-/// agree with the residency loader, or the scratch and the weights
-/// disagree about whether the split is active.
-fn hot_scratch_wanted() -> bool {
-    crate::het::weights::dgpu_hot_experts() > 0
-}
 
 /// PER-LANE iGPU scratch: the buffers the peer pushes and the group
 /// pre-pass touch across stream / lane boundaries.
@@ -1075,7 +941,6 @@ pub fn r1_arena_bytes(rows: usize) -> usize {
         q_len(rows) * 4,
         indexer_scores_len(rows) * 4,
         q_len(rows) * 4, // heads
-        BatchDgpuHotScratch::r1_view_bytes(rows),
     ]
     .into_iter()
     .map(align256)
@@ -1109,13 +974,6 @@ impl BatchDgpuScratch {
             |n: usize| -> eyre::Result<DeviceBuffer<f32>> { DeviceBuffer::new(id, b * n) };
         let mk_i32 =
             |n: usize| -> eyre::Result<DeviceBuffer<i32>> { DeviceBuffer::new(id, b * n) };
-        // M61: hot-expert reduce output, only when the het-split weights
-        // will be loaded (same env gate as weights.rs and the shared set).
-        let hot_ffn_moe_dgpu = if hot_scratch_wanted() {
-            Some(mk_f32(N_EMBD as usize)?)
-        } else {
-            None
-        };
         Ok(Self {
             rows,
             indexer_sel_saved: mk_i32(crate::indexer::INDEXER_TOP_K as usize)?,
@@ -1168,7 +1026,6 @@ impl BatchDgpuScratch {
             ffn_shared: mk_f32(N_EMBD as usize)?,
             ffn_moe_recv: mk_f32(N_EMBD as usize)?,
             pos_per_b: mk_i32(1)?,
-            hot_ffn_moe_dgpu,
             remote_xq_lane: if std::env::var("V41_REMOTE_ADDR").is_ok() {
                 Some(DeviceBuffer::new(
                     id,
@@ -1329,18 +1186,13 @@ impl BatchDgpuShared {
 
         // ---- R1 arena: flat / q / indexer_scores / heads @0, hot views
         // after. Built before the literal so the M61 hot-expert scratch
-        // can carve its views out of it (see BatchDgpuHotScratch LIFETIME
+        // could carve its views out of it (the hot tier is gone; see the LIFETIME
         // CONTRACT and the struct doc's lifetime-union table).
         let r1_arena: DeviceBuffer<u8> = DeviceBuffer::new(id, r1_arena_bytes(rows))?;
         let flat = Carver::new(&r1_arena).take::<f32>(flat_len(rows));
         let q = Carver::new(&r1_arena).take::<f32>(q_len(rows));
         let indexer_scores = Carver::new(&r1_arena).take::<f32>(indexer_scores_len(rows));
         let heads = Carver::new(&r1_arena).take::<f32>(q_len(rows));
-        let hot = if hot_scratch_wanted() {
-            Some(BatchDgpuHotScratch::alloc(id, rows, &r1_arena)?)
-        } else {
-            None
-        };
 
         // ---- R3 arena: indexer_q / indexer_topk_scratch @0.
         let r3_arena: DeviceBuffer<u8> = DeviceBuffer::new(id, r3_arena_bytes(rows))?;
@@ -1503,7 +1355,6 @@ impl BatchDgpuShared {
 
             // M61: hot-expert prefill scratch, only when the het-split
             // weights will be loaded (same env gate as weights.rs).
-            hot,
         })
     }
 }

@@ -1070,6 +1070,76 @@ pub struct Assignment {
     pub layers: Vec<(u32, Vec<u32>)>,
 }
 
+/// Moved here from `het::weights` when the dGPU hot tier was removed
+/// (2026-09-24); box 2's `--experts-file` is now its only user.
+/// Parse the hot-expert placement file and allocate the slot budget.
+///
+/// File format (DEEPSTRIX_EXPERT_STATS probe): one line per layer,
+/// descending-frequency `id` or `id:count` entries. With counts present,
+/// the TOTAL budget of `k_avg × N_LAYER` slots is allocated by GLOBAL
+/// GREEDY — all (layer, expert) pairs ranked by count, top budget taken —
+/// so skewed layers get more slots than flat ones (optimal for expected
+/// hits under a stationary distribution: every expert costs the same
+/// 7.08 MB and a miss in any layer is equally serial). Legacy count-less
+/// files fall back to uniform per-layer top-k.
+fn parse_placement_file(path: &str, k_avg: usize) -> eyre::Result<Vec<Vec<u32>>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| eyre!("read hot-expert file {path}: {e}"))?;
+    let mut per_layer: Vec<Vec<(u32, u64)>> = Vec::with_capacity(N_LAYER as usize);
+    let mut have_counts = true;
+    for line in text.lines().take(N_LAYER as usize) {
+        let mut row = Vec::new();
+        for tok in line.split(',') {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            if let Some((id, cnt)) = tok.split_once(':') {
+                if let (Ok(id), Ok(cnt)) = (id.parse::<u32>(), cnt.parse::<u64>()) {
+                    row.push((id, cnt));
+                }
+            } else if let Ok(id) = tok.parse::<u32>() {
+                have_counts = false;
+                row.push((id, 0));
+            }
+        }
+        per_layer.push(row);
+    }
+    if per_layer.len() != N_LAYER as usize {
+        return Err(eyre!(
+            "hot-expert file {path}: {} lines, need {}",
+            per_layer.len(),
+            N_LAYER
+        ));
+    }
+    let budget = k_avg * N_LAYER as usize;
+    let mut out: Vec<Vec<u32>> = vec![Vec::new(); N_LAYER as usize];
+    if have_counts {
+        let mut all: Vec<(u64, usize, u32)> = Vec::new();
+        for (l, row) in per_layer.iter().enumerate() {
+            for &(id, cnt) in row {
+                all.push((cnt, l, id));
+            }
+        }
+        all.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        for &(_, l, id) in all.iter().take(budget) {
+            out[l].push(id);
+        }
+        let (min_k, max_k) = (
+            out.iter().map(|v| v.len()).min().unwrap_or(0),
+            out.iter().map(|v| v.len()).max().unwrap_or(0),
+        );
+        eprintln!(
+            "hot-expert global-greedy: budget {budget} slots, per-layer K range {min_k}..{max_k}"
+        );
+    } else {
+        for (l, row) in per_layer.iter().enumerate() {
+            out[l] = row.iter().take(k_avg).map(|&(id, _)| id).collect();
+        }
+    }
+    Ok(out)
+}
+
 impl Assignment {
     /// Build an assignment from a **frequency-ranked placement file** instead of
     /// an id range.
@@ -1085,12 +1155,12 @@ impl Assignment {
     /// page, which box 2's cannot.)
     ///
     /// Same file format and the same global-greedy allocator as the dGPU
-    /// hot-expert placement file (`weights::parse_hot_expert_file`): one line per
+    /// hot-expert placement file the dGPU hot tier used to read ([`parse_placement_file`]): one line per
     /// layer, comma-separated `id:count` in descending order, and the budget of
     /// `k_avg * N_LAYER` is taken by GLOBAL count rank — so skewed layers get more
     /// slots than flat ones.
     pub fn from_placement_file(path: &str, k_avg: usize) -> eyre::Result<Self> {
-        let per_layer = crate::het::weights::parse_hot_expert_file(path, k_avg)?;
+        let per_layer = parse_placement_file(path, k_avg)?;
         let layers: Vec<(u32, Vec<u32>)> = per_layer
             .into_iter()
             .enumerate()

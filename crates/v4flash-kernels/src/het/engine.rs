@@ -1010,10 +1010,7 @@ impl HeterogeneousEngine {
         });
         let preissue = *PREISSUE
             && matches!(self.mode, ExecMode::HetParallel)
-            && dump_subtensor_layers.is_empty()
-            // M56: pre-issue's iGPU lane doesn't carry the het-split
-            // branch; the two are not composed yet.
-            && weights.dgpu_layers[0].hot_experts.is_none();
+            && dump_subtensor_layers.is_empty();
         // Advance the token sequence for the moe_signal protocol (the
         // write side in forward_layer reads this with `load`). Done
         // unconditionally so the signal words stay in lockstep with
@@ -1239,31 +1236,6 @@ impl HeterogeneousEngine {
                         std::sync::Mutex::new((vec![[0u64; N_EXPERT as usize]; N_LAYER as usize], 0u64))
                     })
                 });
-                // Optional hot-set hit-rate histogram: resident sets from the
-                // same placement file + K the het-split loader uses.
-                static HOTSETS: std::sync::LazyLock<Option<Vec<[bool; N_EXPERT as usize]>>> =
-                    std::sync::LazyLock::new(|| {
-                        let k: usize = super::weights::dgpu_hot_experts();
-                        if k == 0 {
-                            return None;
-                        }
-                        let path = super::weights::hot_expert_file_path();
-                        super::weights::parse_hot_expert_file(&path, k).ok().map(|lists| {
-                            lists
-                                .iter()
-                                .map(|ids| {
-                                    let mut m = [false; N_EXPERT as usize];
-                                    for &e in ids {
-                                        m[e as usize] = true;
-                                    }
-                                    m
-                                })
-                                .collect()
-                        })
-                    });
-                // (per-token hit counter, 21-bin hit-rate histogram in 5% steps)
-                static HITHIST: std::sync::LazyLock<std::sync::Mutex<(u32, [u32; 21])>> =
-                    std::sync::LazyLock::new(|| std::sync::Mutex::new((0, [0; 21])));
                 // DEEPSTRIX_EXPERT_TRACE=<path>: per-token, per-layer expert ids
                 // (u16 LE, N_EXPERT_USED per layer, N_LAYER layers per token,
                 // in decode order). Feeds the cold-expert prefetch study — we
@@ -1311,36 +1283,6 @@ impl HeterogeneousEngine {
                     for &e in &sel {
                         if (0..N_EXPERT as i32).contains(&e) {
                             g.0[layer][e as usize] += 1;
-                        }
-                    }
-                    if let Some(hs) = &*HOTSETS {
-                        let mut h = HITHIST.lock().unwrap();
-                        for &e in &sel {
-                            if (0..N_EXPERT as i32).contains(&e) && hs[layer][e as usize] {
-                                h.0 += 1;
-                            }
-                        }
-                        if layer == (N_LAYER as usize) - 1 {
-                            let total = (N_LAYER as usize)
-                                * crate::config::N_EXPERT_USED;
-                            let rate = h.0 as f64 / total as f64;
-                            let bin = ((rate * 20.0).round() as usize).min(20);
-                            h.1[bin] += 1;
-                            h.0 = 0;
-                            let tokens: u32 = h.1.iter().sum();
-                            if tokens % 32 == 0 {
-                                let hist: Vec<String> = h
-                                    .1
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(_, c)| **c > 0)
-                                    .map(|(b, c)| format!("{}%:{}", b * 5, c))
-                                    .collect();
-                                eprintln!(
-                                    "HOT_HIT_HIST after {tokens} tokens (per-token hit-rate bins): {}",
-                                    hist.join(" ")
-                                );
-                            }
                         }
                     }
                     if layer == (N_LAYER as usize) - 1 {

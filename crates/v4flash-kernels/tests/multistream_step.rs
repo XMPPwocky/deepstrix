@@ -43,7 +43,7 @@
 //!
 //! Needs the model loaded, i.e. the server DOWN. Run:
 //! ```text
-//! HIP_VISIBLE_DEVICES=0,1 V41_PAGED_EXPERTS=1 V41_INDEX_K=1 V41_CANDIDATE_POOL=1 \
+//! HIP_VISIBLE_DEVICES=0,1 V41_INDEX_K=1 V41_CANDIDATE_POOL=1 \
 //!   MS_STREAMS=4 MS_STEPS=6 CARGO_TARGET_DIR=target-v41 \
 //!   nix develop -c cargo test -p v4flash-kernels --features v41 --release \
 //!     --test multistream_step -- --ignored --nocapture
@@ -196,9 +196,6 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 #[ignore]
 fn multistream_step_matches_alone_and_decode() -> eyre::Result<()> {
     install_panic_handler()?;
-    if std::env::var("V41_PAGED_EXPERTS").is_err() {
-        std::env::set_var("V41_PAGED_EXPERTS", "1");
-    }
     if std::env::var("V41_PAGER_POOL_GB").is_err() {
         std::env::set_var("V41_PAGER_POOL_GB", "40");
     }

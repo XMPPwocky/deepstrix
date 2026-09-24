@@ -759,7 +759,7 @@ pub struct WorkerState {
 
     /// M7 expert tier: pages V4.1's ~276 GiB of routed experts on demand instead
     /// of making them resident. Owns the HF source, so the mmap it reads experts
-    /// from lives as long as the model. `None` when `V41_PAGED_EXPERTS` is unset
+    /// from lives as long as the model. always `Some` (paged experts are the only mode)
     /// (full residency, which only fits for V4-Flash).
     pub pager: Option<v4flash_kernels::het::ExpertPager>,
 
@@ -914,31 +914,11 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
 
     let rope = |layer: i32| -> eyre::Result<RopeParams> { Ok(rope_for_layer(layer)) };
 
-    // M62: if a derived placement file from a previous run exists and the
-    // user hasn't pinned one, point the hot-expert loader at it BEFORE the
-    // weights load — restarts then self-improve from accumulated stats.
-    if std::env::var("DGPU_HOT_EXPERTS_FILE").is_err() {
-        let placement = deepstrix_server_placement_path(&cfg.snapshot_root);
-        if placement.exists() {
-            tracing::info!(path = %placement.display(), "using accumulated expert-stats placement");
-            std::env::set_var("DGPU_HOT_EXPERTS_FILE", &placement);
-        }
-    }
-
     tracing::info!("loading het weights (dGPU ~9 GiB + iGPU ~52 GiB)");
     let t0 = std::time::Instant::now();
-    // V4.1's routed experts are ~276 GiB against 96 GB here, so they cannot be
-    // resident. `V41_PAGED_EXPERTS=1` leaves them out of the per-layer iGPU
-    // weights and an ExpertPager (built below) pages the router's actual picks on
-    // demand. Without the flag `load_all` still tries full residency and OOMs.
-    if v4flash_kernels::het::weights::v41_paged_experts() {
-        tracing::info!("V4.1: paged expert tier ON — routed experts are NOT resident");
-    } else {
-        tracing::warn!(
-            "V4.1: V41_PAGED_EXPERTS unset — load_all will try to make ALL routed experts \
-             resident (~276 GiB) and will OOM on this box"
-        );
-    }
+    // V4.1's routed experts are ~276 GiB against 96 GB here, so they are never
+    // resident: the per-layer iGPU weights carry a placeholder and the
+    // ExpertPager (built below) pages the router's actual picks on demand.
     let mut weights = HetModelWeights::load_all(src, dgpu, igpu, &rope)?;
     tracing::info!(elapsed_s = t0.elapsed().as_secs_f64(), "weights loaded");
 
@@ -1165,7 +1145,7 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
     // model, since every routed expert is read from it on demand for the life of
     // the process. Built last so the `src` borrow above (load_all, fingerprint) is
     // finished. Slot count auto-sizes from V41_PAGER_POOL_GB.
-    let pager = if v4flash_kernels::het::weights::v41_paged_experts() {
+    let pager = {
         let t0 = std::time::Instant::now();
         let mut pg = v4flash_kernels::het::ExpertPager::new(src_owner, igpu, 0)?;
         if v4flash_kernels::het::expert_pager::b1_prefetch() {
@@ -1176,8 +1156,6 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
         }
         tracing::info!(elapsed_s = t0.elapsed().as_secs_f64(), "expert pager ready");
         Some(pg)
-    } else {
-        None
     };
 
     // V4.1 Engram. The hash parameters (token map, multipliers, pad id) come from
@@ -1968,12 +1946,6 @@ pub(crate) fn state_fingerprint(state: &WorkerState) -> String {
     )
 }
 
-/// M62: derived placement path from the snapshot root (sidecar dir).
-fn deepstrix_server_placement_path(snapshot_root: &std::path::Path) -> std::path::PathBuf {
-    crate::expert_stats::ExpertStatsAgg::placement_path(
-        &crate::expert_stats::ExpertStatsAgg::path_for(snapshot_root),
-    )
-}
 
 /// M62: harvest the engine's device-side expert-selection banks into the
 /// on-disk aggregate. Cheap (2 × 88 KB readback) and skipped when nothing
@@ -2059,15 +2031,6 @@ pub(crate) fn flush_expert_stats(state: &mut WorkerState) {
     if let Err(e) = state.expert_stats.save(&state.expert_stats_path) {
         tracing::warn!("expert_stats save failed: {e}");
         return;
-    }
-    // Derived placement for the NEXT server start (loader-format txt).
-    let alpha: f64 = std::env::var("DGPU_HOT_ALPHA")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.5);
-    let placement = crate::expert_stats::ExpertStatsAgg::placement_path(&state.expert_stats_path);
-    if let Err(e) = state.expert_stats.write_placement(&placement, alpha) {
-        tracing::warn!("expert_stats placement write failed: {e}");
     }
     tracing::debug!(
         prefill_tokens = state.expert_stats.prefill.tokens,
@@ -5134,12 +5097,8 @@ fn prefill_suffix(
         }
         input_hcs.push(v);
     }
-    // Rebase the request's spans onto absolute KV positions.
-    let spans_abs: Vec<(u32, u32)> =
-        crate::vision_prompt::spans_in_range(&vl.spans, base_idx, base_idx + tokens.len())?
-            .iter()
-            .map(|s| (s.start + pos0, s.len))
-            .collect();
+    // The suffix must not cut through an image block (an error on a straddle).
+    crate::vision_prompt::spans_in_range(&vl.spans, base_idx, base_idx + tokens.len())?;
     // V4-Flash: the engine widens each image row's raw window to the whole
     // `[START..END]` span (bidirectional inside the image) and keeps every
     // span inside one chunk / lane. V4.1 has no such rule (`model.py` has no

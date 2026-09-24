@@ -40,6 +40,8 @@ fi
 echo "=== deepstrix-server starting $(date -uIs) ==="
 # -------------------------------------------------------------------------
 
+# Paged experts are the only mode from the 2026-09-24 builds on (this is then a
+# no-op); binaries built before that REQUIRE it or they try full residency and OOM.
 export V41_PAGED_EXPERTS=1
 export V41_CED=${V41_CED:-1}
 
