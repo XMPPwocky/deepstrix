@@ -1,0 +1,184 @@
+# Box-2 miss substitution — design sketch
+### 2026-09-24 · status: SKETCH, nothing built · quality validation in progress
+
+## The idea
+
+When a box-2 decode pick is not resident, do not block on the NVMe read. Compute
+the next-ranked expert that *is* resident in its place, give it the missing
+pick's weight, and (optionally) read the missing expert in the background so that
+later tokens get it. Decode only (DSpark verify included), never prefill.
+
+It trades bit-determinism for paging: output now depends on what box 2 has
+resident. That is the whole cost, and it is why everything below is a knob that
+defaults off.
+
+## Why it is worth building (measured)
+
+**Box 2's paging sets the step.** Server log, medians over 1,317 four-row
+windows (2026-09-24): wall 266 ms; box-2 round trip 256 ms, of which server time
+241 = service 160 (**page 124** + compute 36) + ~81 queued behind the other lane;
+link 15. Box 1's own paging is ~0.75 misses per *step* and 4 ms: negligible. The
+live fit is `step = 137 + 0.93 x box2.page_ms` (r = 0.99), so zero box-2 paging
+is ~1.9x at 4 rows.
+
+**Misses sit at the bottom of the ranking.** Replaying
+`~/logs/picks-20260918-1501.trace` (its `D` lines are rank-ordered:
+`router_topk` sorts descending) with box 1 = top-103/layer and a 6,160-slot
+box-2 LRU: box-2 misses by rank 1..6 = 5 / 7 / 11 / 17 / 25 / **35%**. 94% of
+layers that miss at all miss exactly one expert; **34% miss only the 6th pick.**
+The balancing bias (`noaux_tc`) is what pushes cold experts into the last slot.
+
+**The model tolerates it.** Golden CPU reference (DeepSeek's `model.py`), one
+1,006-token agentic transcript, teacher-forced, swaps at the 668 generated
+positions only, prompt KV exact:
+
+| run | swaps/token | KL p50 | KL p90 | KL p99 | top-1 |
+|---|---|---|---|---|---|
+| cold rank-6 -> 7th, rate-matched | 1.36 | 0.0030 | 0.023 | 0.066 | 96.7% |
+| cold rank-6 -> 7th, every one | 15.6 | 0.0035 | 0.030 | 0.102 | 96.9% |
+| cold rank-6 dropped, renormalized | 1.38 | 0.0030 | 0.025 | 0.067 | 97.3% |
+| rank-**1** -> 7th (positive control) | 1.37 | 0.0050 | 0.040 | 0.105 | 96.1% |
+
+Controls: zero swaps is bit-identical to the baseline; re-runs are bit-identical;
+every swap changes that layer's routed output (median 21% for rank 6, 66% for
+rank 1). Dropping instead of swapping costs transcript likelihood (+0.012 nats/
+token, +0.041 on the final turn); swapping does not. **Pending:** a bf16-rounding
+null and a random-0.1% null (is ~0.01 a compounding floor?), any-rank swaps at
+~2.5 and ~5 per token, and the inherit-weight rule this design actually uses.
+Teacher forcing understates the damage free-running generation would see.
+
+## Policy (v1)
+
+Per request, per layer, on box 2:
+
+1. `resident_mask(sel)` as today, giving the distinct missing experts.
+2. For each missing expert `e`, take every row slot `(r, k)` with `sel[r*nu+k] == e`.
+   `e` is **substitutable** iff *every* such slot has `k + 1 >= sub_min_rank`
+   and its row has an alternative `a` (in rank order) that is resident on box 2,
+   is not already one of that row's picks, and has not been used by an earlier
+   substitution in that row.
+3. If substitutable, rewrite each such slot `sel[r*nu+k] = a`. `ew` is unchanged
+   (**inherit the weight**, see below). `e` leaves the missing set.
+   If not, touch nothing: the read happens anyway, so substituting only some of
+   its rows would cost quality and save no time.
+4. If the missing set is now empty, the request is single-pass with no read.
+   Otherwise the existing hits-first / PARK path runs on the smaller set.
+5. `sub_admit`: queue every substituted-away `e` for a background read
+   (`ExpertShard::prefetch_words_ex`), so a cold expert still enters the pool.
+   A missed box-2 expert gets a mean 6.5 hits before eviction, and its first reuse
+   is a median 95 tokens later, so the read has plenty of slack.
+
+`sub_min_rank` starts at 6. It drops to 1 (any rank) only if the any-rank
+reference runs pass.
+
+## Weights: inherit (v1) vs exact (v2)
+
+`ref.Gate` renormalizes the six unbiased scores over the chosen set. Swapping one
+member changes *every* weight by S/S'. That includes weights of box-1 picks, which
+box 1 has already applied by the time box 2 decides. Exactness therefore needs
+box 2 to return a per-row scale and `ffn_combine` to multiply box 1's local
+partial by it. That's a combine-kernel change plus a response-field change.
+
+**v1 inherits instead:** the substitute takes the missing pick's final weight
+verbatim, so the sum stays 1.5, box 1's combine is untouched, and box 2 needs no
+scores at all, only ranked candidate ids. In the reference, a swap moves the
+6th's weight by a median of 0.009 (p90 0.030) out of 1.5. The inherit rule is
+being validated on its own (`anyrank25_inherit`). Build v2 only if that run is
+clearly worse.
+
+## Wire protocol (VERSION 4 -> 5)
+
+New request flag `REQ_FLAG_ALTS = 64`. After the prefetch block: `u32 m`, then
+`b * m` `i32` alternative ids, per row in rank order (ranks 7..6+m), `NO_PICK`
+for an unusable slot. The frame length changes when the flag is set, so both boxes
+rebuild together (the convention since VERSION 2). `decode_request` gains
+`alts: &[i32]`.
+
+Response: widen the fixed fields by one `u64` (keeps the clock triple 8-aligned):
+`n_subs:u16 | n_reads_avoided:u16 | n_sub_admits:u16 | reserved:u16`, so box 1's
+profile can show `box2.subs_per_step` next to `box2.page_ms`.
+
+## Box 1 (hub) changes
+
+- **Router emits candidates.** `router_topk` insertion-sorts into `n_used + m`
+  slots and writes ranks 7..6+m to a new optional `alts` output. Weights are still
+  computed over the first `n_used` only. A top-6 prefix of an insertion sort is the
+  same whatever the array length (each element's position depends only on the
+  comparisons ahead of it), so `sel`/`ew` must stay **bit-identical**: test it.
+  `ROUTER_MAX_USED` is 8, so m <= 2 fits as is; m = 3 needs 9.
+  Call sites: `forward_prefill.rs` ~5922 and ~6019 (arena decode lanes), `:859`.
+- **Readback** with `sel` in the existing sync (`lh.sel_d2h`): b*m*4 bytes.
+- **Mask** each alternative to box-2-owned (`owns_eff[a]`), else `NO_PICK`. A 7th
+  that box 1 owns (hot set) cannot be computed on box 2 in v1. The reference says
+  about 21% of near-ties are that case, so m = 2-3 buys some headroom.
+- **Set `REQ_FLAG_ALTS` only on decode/verify submits** (the arena decode path at
+  `forward_prefill.rs` ~6672 and single-stream `forward_layer.rs` ~2724), never
+  prefill chunks. Env `V41_B2_SUB_ALTS=m` (default 0 = off).
+- **Pick trace**: write `DA <layer> <ids x6> | <alts x m>` when the trace is on.
+  That is the production data (rank x gap x residency) the offline estimate
+  below needs, and this step alone changes no output.
+
+## Box 2 (daemon) changes
+
+- **Decision** in `ExpertExecutor::run` (`remote_experts.rs` ~3336), before the
+  `path_decode` / hits-first split, on a local copy `self.sel_sub` (b x nu). Guard:
+  alternatives present && `b <= 16` (the existing "verify is still decode" line)
+  && `knobs::sub()`. Everything downstream (`resident_mask`, pass A/B, reduce,
+  `ensure_layer_*`) then sees `sel_sub` in place of `sel`. Merged lanes
+  (`b2_merge`, ~4110) must concatenate `alts` exactly as they concatenate `sel`.
+- **Pure function, unit-tested:**
+  `plan_substitutions(sel: &mut [i32], alts: &[i32], nu, m, resident: impl Fn(i32) -> bool, min_rank) -> SubPlan { subs: Vec<(slot, from, to)>, avoided: Vec<i32> }`.
+  Cases: all rows substitutable; one row not (so none); an alternative duplicates
+  a pick; an alternative not resident; two missing picks in one row (take the 7th,
+  then the 8th); `NO_PICK` slots; the rank gate.
+- **Knobs** (knobs file + SIGUSR2, as `park`): `sub` (default 0),
+  `sub_min_rank` (6), `sub_admit` (1). Env mirrors `V41_B2_SUB*`.
+- **Counters** into `ExecTiming` + the daemon stats line + the new response word.
+  Emit a trace event per substituted slot (layer, row, rank, from, to).
+
+## Invariants and tests
+
+1. `V41_B2_SUB_ALTS=0` or `sub=0`: **bit-identical** to today (the existing
+   `deepstrix-expert-bench --check-*` and determinism recipe).
+2. Router with m > 0: `sel`/`ew` bit-identical to m = 0.
+3. Substitution on but everything resident: bit-identical (the plan is empty).
+4. Test daemon (`:7432`, small pool, `--catchall`), `sub=1`: substituted requests
+   do no read (`n_reads_avoided` > 0, pread count drops), and the result equals the
+   local reference computed with the *rewritten* `sel`. The bench needs the plan
+   echoed back for that (debug flag).
+5. Every determinism gate runs with `sub=0`, and says so.
+
+## Rollout
+
+1. **Box 1 alternatives + `DA` trace only** (no behavior change, invariant 2).
+   Collect a production trace, then replay with the box-2 LRU for the real
+   substitutable fraction at each `sub_min_rank` and m, **before** touching box 2.
+2. Box 2 decision + knobs, deployed with `sub=0`. Invariant 1 on production traffic.
+3. ABBA `sub=0/1` by SIGUSR2 on a **warm** pool, never across a restart (box-2
+   warming dominates A/Bs): `box2.page_ms`, step wall, subs/step, and
+   `sub_admit` on/off (background reads share the drives with foreground misses).
+4. Free-running quality with `sub=1` vs `0`: echo2 at 1.5K/6K under >= 4 rows,
+   needle, and the golden fidelity gate once it exists (engine vs reference KL is
+   the scale these numbers still lack).
+
+## Expected gain
+
+`sub_min_rank = 6`: ~1 swap per token, removing ~40% of box-2 misses: roughly
+**+15-25% at 4 rows** (less once PARK removes the queueing half). Any rank, if
+validated: every box-2 miss whose row has a resident box-2 alternative. The
+ceiling is ~1.9x at zero box-2 paging, cut by the all-rows rule, by box-1-owned
+7ths and by non-resident alternatives. Rollout step 1 measures that fraction.
+
+## Open questions
+
+- m = 2 or 3? It depends on how often the 7th is box-1-owned or also cold.
+  The `DA` trace answers it.
+- A miss nobody can substitute still blocks. The low-bit on-disk fallback (read a
+  ~half-size IQ2 copy now, the MXFP4 copy in the background) is the v2 for that
+  remainder. It differs from `MIXED_PRECISION_BY_RESIDENCY.md`, which kept IQ2
+  resident and verified speculatively.
+- `sub_admit` background reads vs foreground misses on the same drives: they need
+  foreground-first scheduling (chunked background reads) if step 3 shows
+  contention.
+- Rates rise with streams (misses/token 1.24 -> 1.62 from S = 1 to 32, 09-18 model),
+  so the anyrank ~5/token run is the headroom check.
