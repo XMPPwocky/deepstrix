@@ -90,6 +90,9 @@ for c in "$@"; do
         # agentic transcript, so 0.032 ~ 2.5 swaps/token (production box-2 miss rate), 0.064 ~ 5.
         anyrank25) extra=(--swap-eps inf --swap-anyrank-cold "$HOME/b1_hotset_proxy.json" --swap-frac 0.032 --swap-seed 3 --swap-check-sites 2) ;;
         anyrank50) extra=(--swap-eps inf --swap-anyrank-cold "$HOME/b1_hotset_proxy.json" --swap-frac 0.064 --swap-seed 3 --swap-check-sites 2) ;;
+        # the shippable weight rule: the substitute inherits the replaced pick's weight, no renormalization
+        anyrank25_inherit) extra=(--swap-eps inf --swap-anyrank-cold "$HOME/b1_hotset_proxy.json" --swap-frac 0.032 --swap-seed 3 --swap-check-sites 2 --swap-weights inherit) ;;
+        rate_inherit) extra+=(--swap-frac 0.09 --swap-seed 1 --swap-check-sites 3 --swap-weights inherit) ;;
         *) echo "unknown policy $pol"; exit 2 ;;
       esac
       run_case "policy_$pol" --no-layer-dumps "${extra[@]}" --swap-positions "$HERE/agentic_generated_positions.json" \

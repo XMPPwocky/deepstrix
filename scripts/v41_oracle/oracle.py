@@ -90,6 +90,10 @@ def main():
                     help="JSON [layer][ids] hot set: swap a seeded random --swap-frac of the COLD picks at ANY "
                          "rank 1..6 (generated positions only if --swap-positions), each replaced by the "
                          "best-ranked expert not already chosen in that row (7th, then 8th, ...). No gap gate.")
+    ap.add_argument("--swap-weights", choices=("refgate", "inherit"), default="refgate",
+                    help="refgate: weights of the new set exactly as ref.Gate (renormalized); inherit: the "
+                         "replacement takes the replaced pick's final weight verbatim, nothing renormalized "
+                         "(the shippable v1 rule: box 1 has already applied its own picks' weights)")
     ap.add_argument("--swap-check-sites", type=int, default=0,
                     help="per layer, log this many swapped rows: routing before/after and ||dFFN|| "
                          "(recomputes those rows' FFN with the original routing) to swap_checks.json")
@@ -105,6 +109,7 @@ def main():
     if a.swap_anyrank_cold:
         anyrank_sets = [set(x) for x in __import__("json").load(open(a.swap_anyrank_cold))]
     swap_rank_counts = [0] * 6
+    inherit_absdiff = []  # |w_inherited - w_refgate| at every swapped (row, rank)
     if a.swap_sixth_cold:
         sixth_cold_sets = [set(x) for x in __import__("json").load(open(a.swap_sixth_cold))]
     swap_counts = []
@@ -259,10 +264,16 @@ def main():
                                 idx[r, c] = top.indices[r, k + j]  # best-ranked expert not yet chosen
                                 j += 1
                                 swap_rank_counts[c] += 1
-                    w = sc.gather(1, idx)
+                    w_gate = sc.gather(1, idx)
                     if _gate.norm_topk_prob and k > 1:
-                        w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
-                    w = w * _gate.route_scale
+                        w_gate = w_gate / (w_gate.sum(dim=-1, keepdim=True) + 1e-20)
+                    w_gate = w_gate * _gate.route_scale
+                    if a.swap_weights == "inherit":
+                        w = w_ref.clone()  # replacement inherits the replaced pick's weight; no renorm
+                        if sw.any():
+                            inherit_absdiff.extend((w[sw] - w_gate[sw]).abs().tolist())
+                    else:
+                        w = w_gate
                     swap_counts.append(int(sw.sum()))
                     if a.swap_check_sites:
                         rows = sw.any(dim=1).nonzero().flatten()[: a.swap_check_sites].tolist()
@@ -304,6 +315,11 @@ def main():
                     if _gate.norm_topk_prob and k > 1:
                         w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
                     w = w * _gate.route_scale
+                    if a.swap_weights == "inherit" and a.swap_mode == "seventh":
+                        w_gate = w
+                        w = w_ref.clone()
+                        if swap.any():
+                            inherit_absdiff.extend((w[swap, col] - w_gate[swap, col]).abs().tolist())
                     swap_counts.append(int(swap.sum()))
                     if a.swap_check_sites:
                         rows = swap.nonzero().flatten()[: a.swap_check_sites].tolist()
@@ -411,6 +427,10 @@ def main():
                    "swap_sixth_cold": a.swap_sixth_cold, "swap_frac": a.swap_frac, "swap_seed": a.swap_seed,
                    "swap_mode": a.swap_mode, "swap_rank": a.swap_rank or 6,
                    "swap_anyrank_cold": a.swap_anyrank_cold, "swap_rank_counts": swap_rank_counts,
+                   "swap_weights": a.swap_weights,
+                   "inherit_weight_absdiff": (lambda v: {"n": len(v), **({} if not v else {
+                       "mean": sum(v) / len(v), "p50": sorted(v)[len(v) // 2], "p90": sorted(v)[int(len(v) * .9)],
+                       "p99": sorted(v)[int(len(v) * .99)], "max": max(v)})})(inherit_absdiff),
                    "swap_counts_per_layer": swap_counts,
                    "model_dir": MODEL, "config_sha256": cfg_sha, "reference_model_py_sha256": model_py_sha,
                    "oracle_rev": rev or os.environ.get("V41_ORACLE_REV", ""), "files": files},
