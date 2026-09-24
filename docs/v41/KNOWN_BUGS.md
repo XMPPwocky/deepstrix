@@ -25,7 +25,7 @@ intermittent looping reported at 170-180K context. Fix: empty the rings when
 the duplicate CED replay inside `forward_prefill_pipelined` (serial
 `prefill_suffix`, reached by any launch without `V41_MULTISTREAM=1` or with
 DSpark on) still had `pos0 == 0` -- fixed the same way on branch
-`worktree-architecture-review`, not deployed. Same review (read-only, 2 agents): mid-prefill
+`worktree-architecture-review`, deployed 2026-09-24 01:17 UTC (with the rest of f79fe04). Same review (read-only, 2 agents): mid-prefill
 checkpoints saved never-updated decoder rings (now saved empty); a short or
 partial `index_k.bin` half-restored with another request's keys (now a cache
 miss; all 446 live snapshots were checked clean); a failed session-hint restore
