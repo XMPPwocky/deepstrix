@@ -320,13 +320,6 @@ fn tools_segs(tools: &[ToolDef], out: &mut Vec<Seg>) {
     out.push(Seg::Ours(TOOLS_TAIL.to_string()));
 }
 
-/// Flat-string form of [`tools_segs`] (tests / diagnostics only — it loses the
-/// provenance split, so never feed it to the tokeniser).
-#[cfg(test)]
-fn tools_text(tools: &[ToolDef]) -> String {
-    let schemas: Vec<String> = tools.iter().map(|t| to_json_hf(&t.function)).collect();
-    format!("{TOOLS_HEAD}{}{TOOLS_TAIL}", schemas.join("\n"))
-}
 
 /// `encode_arguments_to_dsml`: the tool call's arguments (a JSON string,
 /// possibly double-encoded) → parameter tags.

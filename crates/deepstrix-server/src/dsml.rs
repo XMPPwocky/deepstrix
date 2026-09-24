@@ -23,45 +23,13 @@
 //!    that cycle by suppressing TOK_DSML's bytes unconditionally —
 //!    inside markup (structural) or outside (stray — warn + drop).
 
-use crate::openai::types::{ToolCall, ToolDef};
-use crate::prompt::Seg;
+use crate::openai::types::ToolCall;
 
 // ---------------------------------------------------------------------------
-// Renderer. Emits [`Seg`]s rather than one flat string so the caller can tell
-// text WE authored (special-token literals inside it materialise as their real
-// ids, matching `ds4_tokenize_rendered_chat`) from text the CLIENT supplied
-// (never allowed to forge a special token). Used to build the system-prompt
-// schema block and to re-render assistant turns that had tool_calls.
-//
-// Every literal below is verbatim from `tokenizer.chat_template` in the model
-// GGUF (`tools_header` / `tools_footer`, template lines 46-47), verified by
-// `scripts/gen_tool_prompt_vectors.py` against the live file.
+// JSON formatting for tool schemas and replayed tool-call arguments, used by
+// the V4.1 renderer (`prompt_v41.rs`). Output must match Python's
+// `json.dumps`, which is what the reference encoder emits.
 // ---------------------------------------------------------------------------
-
-/// `tools_header` — everything from `## Tools` down to the schema list.
-pub const TOOLS_HEADER: &str = "## Tools\n\n\
-     You have access to a set of tools to help answer the user's question. \
-     You can invoke tools by writing a \"<\u{ff5c}DSML\u{ff5c}tool_calls>\" block like the following:\n\n\
-     <\u{ff5c}DSML\u{ff5c}tool_calls>\n\
-     <\u{ff5c}DSML\u{ff5c}invoke name=\"$TOOL_NAME\">\n\
-     <\u{ff5c}DSML\u{ff5c}parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</\u{ff5c}DSML\u{ff5c}parameter>\n\
-     ...\n\
-     </\u{ff5c}DSML\u{ff5c}invoke>\n\
-     <\u{ff5c}DSML\u{ff5c}invoke name=\"$TOOL_NAME2\">\n\
-     ...\n\
-     </\u{ff5c}DSML\u{ff5c}invoke>\n\
-     </\u{ff5c}DSML\u{ff5c}tool_calls>\n\n\
-     String parameters should be specified as is and set `string=\"true\"`. \
-     For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n\
-     If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n\
-     Otherwise, output directly after </think> with tool calls or final response.\n\n\
-     ### Available Tool Schemas\n\n";
-
-/// `tools_footer`. Note the single leading newline (the schema list already
-/// ends in one) and the trailing newline before the first `<｜User｜>`.
-pub const TOOLS_FOOTER: &str =
-    "\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n";
-
 /// Format an `f64` the way CPython's `repr` does, which is what
 /// `json.dumps` emits for a float.
 ///
@@ -204,186 +172,14 @@ pub fn to_json_hf(v: &serde_json::Value) -> String {
     }
 }
 
-/// The `## Tools` block that is appended to the system turn.
-///
-/// Template lines 75-88: the block is emitted whenever `tools` is a non-empty
-/// list (even if no entry has `type == "function"`, in which case the schema
-/// list is empty), and each function schema is `tool['function'] | tojson`
-/// followed by `'\n'` — one compact object per line, unwrapped, no array, no
-/// indentation.
-pub fn push_tools_prompt(tools: &[ToolDef], out: &mut Vec<Seg>) {
-    if tools.is_empty() {
-        return;
-    }
-    out.push(Seg::Ours(TOOLS_HEADER.to_string()));
-    let mut schemas = String::new();
-    for t in tools {
-        if t.kind != "function" {
-            continue;
-        }
-        schemas.push_str(&to_json_hf(&t.function));
-        schemas.push('\n');
-    }
-    // Client-authored: a tool description must not be able to forge
-    // `<｜User｜>` / `<think>` / `｜DSML｜`. (The reference implementations
-    // tokenize this span with specials enabled and ARE forgeable there.)
-    out.push(Seg::Client(schemas));
-    out.push(Seg::Ours(TOOLS_FOOTER.to_string()));
-}
 
-/// Flat-string form of [`push_tools_prompt`] (tests / diagnostics).
-pub fn render_tools_prompt(tools: &[ToolDef]) -> String {
-    let mut segs = Vec::new();
-    push_tools_prompt(tools, &mut segs);
-    segs.iter().map(Seg::text).collect()
-}
 
-/// Re-render an assistant history turn's `tool_calls` as DSML markup.
-/// Template lines 240-258.
-pub fn push_tool_calls_in_history(calls: &[ToolCall], out: &mut Vec<Seg>) {
-    if calls.is_empty() {
-        return;
-    }
-    out.push(Seg::Ours(
-        "\n\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n".to_string(),
-    ));
-    for tc in calls {
-        out.push(Seg::Ours("<\u{ff5c}DSML\u{ff5c}invoke name=\"".to_string()));
-        let mut name = String::new();
-        push_dsml_attr(&mut name, &tc.function.name);
-        out.push(Seg::Client(name));
-        out.push(Seg::Ours("\">\n".to_string()));
-        match serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
-            Ok(serde_json::Value::Object(map)) => {
-                for (key, val) in &map {
-                    let is_string = matches!(val, serde_json::Value::String(_));
-                    let mut body = String::new();
-                    match val {
-                        serde_json::Value::String(s) => push_dsml_parameter_text(&mut body, s),
-                        // `val | tojson` — HF spacing, same as the schema block.
-                        other => push_dsml_json_literal(&mut body, &to_json_hf(other)),
-                    }
-                    push_dsml_parameter(out, key, is_string, body);
-                }
-            }
-            // Not a JSON object (or not JSON at all): pass the raw argument
-            // string through as a single string parameter, as before.
-            _ => {
-                let mut body = String::new();
-                push_dsml_parameter_text(&mut body, &tc.function.arguments);
-                push_dsml_parameter(out, "arguments", true, body);
-            }
-        }
-        out.push(Seg::Ours("</\u{ff5c}DSML\u{ff5c}invoke>\n".to_string()));
-    }
-    out.push(Seg::Ours("</\u{ff5c}DSML\u{ff5c}tool_calls>".to_string()));
-}
 
-fn push_dsml_parameter(out: &mut Vec<Seg>, key: &str, is_string: bool, body: String) {
-    out.push(Seg::Ours(
-        "<\u{ff5c}DSML\u{ff5c}parameter name=\"".to_string(),
-    ));
-    let mut k = String::new();
-    push_dsml_attr(&mut k, key);
-    out.push(Seg::Client(k));
-    out.push(Seg::Ours(
-        format!("\" string=\"{}\">", if is_string { "true" } else { "false" }),
-    ));
-    out.push(Seg::Client(body));
-    out.push(Seg::Ours("</\u{ff5c}DSML\u{ff5c}parameter>\n".to_string()));
-}
 
-/// Flat-string form of [`push_tool_calls_in_history`] (tests / diagnostics).
-pub fn render_tool_calls_in_history(calls: &[ToolCall]) -> String {
-    let mut segs = Vec::new();
-    push_tool_calls_in_history(calls, &mut segs);
-    segs.iter().map(Seg::text).collect()
-}
 
-/// DELIBERATE deviation from the template (line 244/251, which interpolates
-/// `func['name']` and `key` raw): entity-escape `& < > "` inside an attribute
-/// value so a tool name or an argument key cannot close the attribute or the
-/// tag. Costs byte-identity with the template only for names/keys that
-/// actually contain one of those four characters — none do in any real schema.
-/// Pinned by `dsml_attr_escaping_is_a_deliberate_deviation`.
-fn push_dsml_attr(out: &mut String, s: &str) {
-    for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            other => out.push(other),
-        }
-    }
-}
 
-/// DELIBERATE deviation from the template (line 251, which interpolates the
-/// string value raw): rewrite an embedded `</｜DSML｜parameter>` to
-/// `&lt;/｜DSML｜parameter>` so replayed tool-call arguments cannot terminate
-/// the parameter early.
-///
-/// WATCH-ITEM (D6). The old off-template header carried a sentence telling the
-/// model to write that escape itself; the header is now the template's
-/// verbatim text (`TOOLS_HEADER`) and no longer says so, while
-/// [`dsml_attr_decode`] still un-escapes entities in every string parameter
-/// the model emits. So the model sees escaped forms in its own replayed
-/// history with nothing in the prompt explaining them. If truncated string
-/// parameters start showing up in production, the fix belongs on the SCANNER
-/// side — tolerate a raw closing tag while a matching `<｜DSML｜parameter` is
-/// still open — NOT by re-adding off-template prose to the header.
-/// Pinned by `dsml_parameter_body_defangs_the_closing_tag`.
-fn push_dsml_parameter_text(out: &mut String, s: &str) {
-    let end = "</\u{ff5c}DSML\u{ff5c}parameter>";
-    let mut i = 0;
-    let bytes = s.as_bytes();
-    let end_bytes = end.as_bytes();
-    while i < bytes.len() {
-        if bytes[i..].starts_with(end_bytes) {
-            out.push_str("&lt;");
-            i += 1;
-        } else {
-            let ch_len = utf8_char_len(bytes[i]);
-            if let Ok(s) = std::str::from_utf8(&bytes[i..i + ch_len]) {
-                out.push_str(s);
-            }
-            i += ch_len;
-        }
-    }
-}
 
-fn push_dsml_json_literal(out: &mut String, s: &str) {
-    let end = "</\u{ff5c}DSML\u{ff5c}parameter>";
-    let mut i = 0;
-    let bytes = s.as_bytes();
-    let end_bytes = end.as_bytes();
-    while i < bytes.len() {
-        if bytes[i..].starts_with(end_bytes) {
-            out.push_str("\\u003c");
-            i += 1;
-        } else {
-            let ch_len = utf8_char_len(bytes[i]);
-            if let Ok(s) = std::str::from_utf8(&bytes[i..i + ch_len]) {
-                out.push_str(s);
-            }
-            i += ch_len;
-        }
-    }
-}
 
-fn utf8_char_len(first: u8) -> usize {
-    if first < 0x80 {
-        1
-    } else if first < 0xC0 {
-        1
-    } else if first < 0xE0 {
-        2
-    } else if first < 0xF0 {
-        3
-    } else {
-        4
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Scanner — token-driven.
@@ -1182,11 +978,11 @@ fn dsml_attr_decode(s: &str) -> String {
     out
 }
 
-/// Inverse of [`push_dsml_parameter_text`], and nothing more: the only escape
-/// a string parameter body ever carries is the defanged closing tag. Bodies
-/// are otherwise raw (template line 251; the upstream convention unescapes
-/// only this sequence), so general entity decoding -- as for attribute values
-/// -- would turn a literal `&lt;` in, say, a Write tool call's HTML into `<`.
+/// Undo the one escape a string parameter body can carry: a defanged closing
+/// tag `&lt;/｜DSML｜parameter>`. Bodies are otherwise raw (the upstream
+/// convention unescapes only this sequence), so general entity decoding -- as
+/// for attribute values -- would turn a literal `&lt;` in, say, a Write tool
+/// call's HTML into `<`.
 fn dsml_param_decode_string(s: &str) -> String {
     s.replace("&lt;/\u{ff5c}DSML\u{ff5c}parameter>", "</\u{ff5c}DSML\u{ff5c}parameter>")
 }
@@ -1259,68 +1055,8 @@ mod tests {
     // four tests pin the places where it deliberately is NOT, so dropping or
     // widening one is a test failure rather than a silent change.
 
-    fn call(name: &str, arguments: &str) -> ToolCall {
-        ToolCall {
-            id: "call_1".into(),
-            kind: "function".into(),
-            function: crate::openai::types::ToolCallFunction {
-                name: name.into(),
-                arguments: arguments.into(),
-            },
-        }
-    }
 
-    /// DEVIATION 1. The template writes `name="' + func['name'] + '"` raw;
-    /// we entity-escape `& < > "` in both the tool name and the parameter
-    /// keys so neither can close the attribute.
-    #[test]
-    fn dsml_attr_escaping_is_a_deliberate_deviation() {
-        let s = render_tool_calls_in_history(&[call(
-            "a&b<c>\"d",
-            r#"{"k&<>\"y": "v"}"#,
-        )]);
-        assert!(
-            s.contains(r#"invoke name="a&amp;b&lt;c&gt;&quot;d""#),
-            "tool name not escaped: {s}"
-        );
-        assert!(
-            s.contains(r#"parameter name="k&amp;&lt;&gt;&quot;y""#),
-            "parameter key not escaped: {s}"
-        );
-        // The template would have emitted these raw — spelled out so the
-        // deviation is visible at the diff:
-        assert!(!s.contains(r#"name="a&b<c>"#));
-        // A name with none of the four characters is byte-identical to the
-        // template, which is why the golden corpus still passes.
-        let plain = render_tool_calls_in_history(&[call("search_repo", r#"{"pattern": "x"}"#)]);
-        assert!(plain.contains(r#"invoke name="search_repo""#));
-        assert!(plain.contains(r#"parameter name="pattern" string="true">x<"#));
-    }
 
-    /// DEVIATION 2. A string parameter body may not carry the literal
-    /// closing tag; it is rewritten to `&lt;/｜DSML｜parameter>`. A JSON
-    /// (`string="false"`) body gets the JSON-escape form instead, so the
-    /// value still parses.
-    #[test]
-    fn dsml_parameter_body_defangs_the_closing_tag() {
-        let end = "</\u{ff5c}DSML\u{ff5c}parameter>";
-        let payload = format!("before{end}after");
-        let s = render_tool_calls_in_history(&[call(
-            "bash",
-            &serde_json::json!({ "command": payload }).to_string(),
-        )]);
-        assert!(s.contains("before&lt;/\u{ff5c}DSML\u{ff5c}parameter>after"), "{s}");
-        // Exactly the closing tags WE emitted survive: one per parameter.
-        assert_eq!(s.matches(end).count(), 1);
-        // JSON-valued parameters use the \u003c escape so the value still
-        // parses as JSON on the way back in.
-        let s2 = render_tool_calls_in_history(&[call(
-            "bash",
-            &serde_json::json!({ "argv": [payload] }).to_string(),
-        )]);
-        assert!(s2.contains("\\u003c/\u{ff5c}DSML\u{ff5c}parameter>after"), "{s2}");
-        assert_eq!(s2.matches(end).count(), 1);
-    }
 
     /// A string parameter decodes exactly the one escape the renderer adds:
     /// literal entities in the model's argument (HTML, XML, shell) survive.
@@ -1328,8 +1064,8 @@ mod tests {
     fn dsml_string_param_decodes_only_the_defanged_closing_tag() {
         let end = "</\u{ff5c}DSML\u{ff5c}parameter>";
         let raw = format!("<p>a &lt; b &amp;&amp; c &gt; d &quot;q&quot;</p> x{end}y");
-        let mut rendered = String::new();
-        push_dsml_parameter_text(&mut rendered, &raw);
+        // The one escape the convention allows: a defanged closing tag.
+        let rendered = format!("<p>a &lt; b &amp;&amp; c &gt; d &quot;q&quot;</p> x&lt;/\u{ff5c}DSML\u{ff5c}parameter>y");
         assert_eq!(dsml_param_decode_string(&rendered), raw);
         assert_eq!(dsml_param_decode_string("if (a &lt; b) {}"), "if (a &lt; b) {}");
     }

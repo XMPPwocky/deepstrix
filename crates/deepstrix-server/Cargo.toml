@@ -30,14 +30,6 @@ blake3 = { workspace = true }
 name = "deepstrix-server"
 path = "src/main.rs"
 
-[[bin]]
-name = "deepstrix-tok-dump"
-path = "src/bin/tok-dump.rs"
-
-[[bin]]
-name = "deepstrix-vector-test"
-path = "src/bin/vector-test.rs"
-
 [features]
 # No-op since 2026-09-24: V4.1-Flash is the only DeepSeek model (V4-Flash was
 # dropped). Kept so existing `--features v41` build commands keep working.
