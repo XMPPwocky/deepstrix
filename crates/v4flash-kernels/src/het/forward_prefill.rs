@@ -30,7 +30,6 @@ use crate::config::{
     SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW,
 };
 use crate::attention::{ATTN_MIXED_MAX_KEYS, ATTN_SWA_BATCHED_MAX_KV};
-use crate::routing::hash_router_select;
 
 use super::image_spans::{self, ImageSpan};
 
@@ -1782,9 +1781,8 @@ fn substitution_active(rows: &RowLayout<'_>, remote_split_on: bool, n_alt: usize
 /// Is the CACHE-PRIOR (`V41_SUB=3`) live for this lane-layer's router launch?
 /// Decode rows only, learned router, under the T2 partition with a remote
 /// that owns this layer. Fidelity/determinism runs must leave `V41_SUB` unset.
-fn cache_prior_active(rows: &RowLayout<'_>, hash_router: bool, remote_owns_layer: bool) -> bool {
+fn cache_prior_active(rows: &RowLayout<'_>, remote_owns_layer: bool) -> bool {
     super::b2_mirror::mode() == 3
-        && !hash_router
         && matches!(rows, RowLayout::Arena { .. })
         && remote_split_active()
         && remote_owns_layer
@@ -1913,7 +1911,7 @@ impl HeterogeneousEngine {
         let mut look: Option<Vec<i32>> = None;
         if layer + 1 < N_LAYER as usize {
             let nl = &weights.dgpu_layers[layer + 1];
-            if !nl.is_hash_router {
+{
                 let mut logits = v4flash_hip::DeviceBuffer::<f32>::new(de.device.id, b * N_EXPERT as usize)?;
                 let mut sel = v4flash_hip::DeviceBuffer::<i32>::new(de.device.id, b * nu)?;
                 let mut ew = v4flash_hip::DeviceBuffer::<f32>::new(de.device.id, b * nu)?;
@@ -7796,19 +7794,18 @@ impl HeterogeneousEngine {
         // on live agent traffic: 62% (encoder) / 75% (decoder) of next-layer
         // picks predicted; break-even is ~40%.
         let look_next: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router, .. } if lookahead_prefetch() => next_router.filter(|nl| !nl.is_hash_router),
+            RowLayout::Arena { next_router, .. } if lookahead_prefetch() => *next_router,
             _ => None,
         };
         let look_next2: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router2, .. } if lookahead_prefetch() && lookahead_depth() >= 2 => next_router2.filter(|nl| !nl.is_hash_router),
+            RowLayout::Arena { next_router2, .. } if lookahead_prefetch() && lookahead_depth() >= 2 => *next_router2,
             _ => None,
         };
         // Router alternatives (`V41_ROUTER_ALTS`) only where they are used: decode
         // rows (box-2 miss substitution) or when the pick trace records them.
         // Prefill chunks otherwise skip the extra argmax passes and readbacks.
-        let n_alt_layer: u32 = if !dlw.is_hash_router
-            && ((matches!(rows, RowLayout::Arena { .. }) && super::b2_mirror::mode() != 3)
-                || super::expert_pager::pick_trace_on())
+        let n_alt_layer: u32 = if (matches!(rows, RowLayout::Arena { .. }) && super::b2_mirror::mode() != 3)
+            || super::expert_pager::pick_trace_on()
         {
             router_alts()
         } else {
@@ -7819,14 +7816,13 @@ impl HeterogeneousEngine {
             && image_runs.is_empty()
             && cache_prior_active(
                 rows,
-                dlw.is_hash_router,
                 self.remote
                     .as_ref()
                     .and_then(|r| r.lock().ok().map(|c| c.info().owned_count(layer as u32) > 0))
                     .unwrap_or(false),
             );
         let mut prior_on = false;
-        if !dlw.is_hash_router {
+        {
             // Top-k: one block per token in a single launch (B→1 launches).
             // (Image rows are recomputed with bias_vl right below — same
             // stream, FIFO — so this full-batch launch stays as-is.)
@@ -7908,39 +7904,6 @@ impl HeterogeneousEngine {
                     &bd.ffn_input_norm.slice_view(0, crate::config::N_EMBD as usize),
                 )?;
             }
-        } else {
-            // Hash router: readback all B × N_EXPERT logits, run host
-            // select per batch element, upload d_selected + d_ew.
-            de.compute.synchronize()?;
-            sd.router_logits
-                .copy_to_host(&mut sd.router_logits_host)?;
-            let tid2eid = dlw
-                .tid2eid
-                .as_ref()
-                .ok_or_else(|| eyre!("L{layer}: hash router but no tid2eid"))?;
-            let mut all_sel: Vec<i32> = Vec::with_capacity(b as usize * cs_n_used);
-            let mut all_ew: Vec<f32> = Vec::with_capacity(b as usize * cs_n_used);
-            for i in 0..b as usize {
-                if image_spans::is_image_token(tokens[i]) {
-                    // Synthetic id: no tid2eid row. Placeholder; overwritten
-                    // by the bias_vl top-k launch below.
-                    all_sel.extend_from_slice(&[0i32; N_EXPERT_USED]);
-                    all_ew.extend_from_slice(&[0f32; N_EXPERT_USED]);
-                    continue;
-                }
-                let logit_slice = &sd.router_logits_host
-                    [i * (N_EXPERT as usize)..(i + 1) * (N_EXPERT as usize)];
-                let (sel, w) = hash_router_select(tid2eid, tokens[i], logit_slice);
-                all_sel.extend_from_slice(&sel);
-                all_ew.extend_from_slice(&w);
-            }
-            // d_selected / d_ew are rows-sized; copy into [0..B*N_USED] view.
-            let mut sel_v = bd
-                .d_selected
-                .slice_view_mut(0, b as usize * cs_n_used);
-            sel_v.copy_from_host(&all_sel)?;
-            let mut ew_v = bd.d_ew.slice_view_mut(0, b as usize * cs_n_used);
-            ew_v.copy_from_host(&all_ew)?;
         }
         if !image_runs.is_empty() {
             let bias_vl = dlw.router_bias_vl_dev.as_ref().ok_or_else(|| {
@@ -8341,11 +8304,11 @@ impl HeterogeneousEngine {
         let deferring = !defer_pos.is_empty();
         let _ = &self.dgpu;
         let look_next: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router, .. } if lookahead_prefetch() => next_router.filter(|nl| !nl.is_hash_router),
+            RowLayout::Arena { next_router, .. } if lookahead_prefetch() => *next_router,
             _ => None,
         };
         let look_next2: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router2, .. } if lookahead_prefetch() && lookahead_depth() >= 2 => next_router2.filter(|nl| !nl.is_hash_router),
+            RowLayout::Arena { next_router2, .. } if lookahead_prefetch() && lookahead_depth() >= 2 => *next_router2,
             _ => None,
         };
         let mut sel_host_remote: Vec<i32> = Vec::new();
