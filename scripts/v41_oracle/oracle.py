@@ -66,7 +66,20 @@ def main():
                     help="golden-corpus capture: per-layer router selection scores + weights, the compressed "
                          "positions each layer attends to, the candidate-block mask, full logits at every "
                          "position, and a manifest with sha256 of every file")
+    ap.add_argument("--swap-eps", type=float, default=None,
+                    help="routing-swap experiment: wherever the biased 6th-vs-7th selection gap is < EPS, "
+                         "route to the 7th expert instead of the 6th (weights recomputed as ref.Gate does). "
+                         "Implies --golden's router tap; compare logits_all against an unswapped run.")
+    ap.add_argument("--swap-cold-only", default=None,
+                    help="JSON [layer][ids] hot set: only swap when the 6th pick is OUTSIDE it and the 7th inside")
+    ap.add_argument("--no-layer-dumps", action="store_true", help="skip per-layer residual/routing files")
     a = ap.parse_args()
+    if a.swap_eps is not None:
+        a.golden = True
+    hot_sets = None
+    if a.swap_cold_only:
+        hot_sets = [set(x) for x in __import__("json").load(open(a.swap_cold_only))]
+    swap_counts = []
     os.makedirs(a.out, exist_ok=True)
 
     ckpt = Checkpoint(MODEL)
@@ -194,6 +207,25 @@ def main():
                 assert torch.equal(sel.topk(_gate.topk, dim=-1)[1], idx), "recomputed selection != reference"
                 golden["router_sel"] = sel.float().clone()
                 golden["router_w"] = w.float().clone()
+                if a.swap_eps is not None:
+                    top = sel.topk(_gate.topk + 1, dim=-1)
+                    k = _gate.topk
+                    gap = top.values[:, k - 1] - top.values[:, k]
+                    swap = gap < a.swap_eps
+                    if hot_sets is not None:
+                        hs = hot_sets[L]
+                        sixth, seventh = top.indices[:, k - 1].tolist(), top.indices[:, k].tolist()
+                        cold_ok = torch.tensor([(s6 not in hs) and (s7 in hs) for s6, s7 in zip(sixth, seventh)])
+                        swap = swap & cold_ok
+                    idx = top.indices[:, :k].clone()
+                    idx[swap, k - 1] = top.indices[swap, k]
+                    # Weights exactly as ref.Gate.forward: unbiased scores of the chosen set,
+                    # renormalised, times route_scale.
+                    w = sc.gather(1, idx)
+                    if _gate.norm_topk_prob and k > 1:
+                        w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
+                    w = w * _gate.route_scale
+                    swap_counts.append(int(swap.sum()))
                 return w, idx
             gate.forward = gate_tap
             if args.compress_ratios[L]:
@@ -228,8 +260,11 @@ def main():
                         torch.save(o.detach().float().cpu(), os.path.join(a.out, f"layer_{L:02d}_stage_{name}{ci}_{oi}.pt"))
                 else:
                     torch.save(out.detach().float().cpu(), os.path.join(a.out, f"layer_{L:02d}_stage_{name}{ci}.pt"))
-        torch.save(h.float(), os.path.join(a.out, f"layer_{L:02d}_residual.pt"))
-        if getattr(block.ffn, "last_indices", None) is not None:
+        if a.no_layer_dumps:
+            golden.clear()
+        else:
+            torch.save(h.float(), os.path.join(a.out, f"layer_{L:02d}_residual.pt"))
+        if not a.no_layer_dumps and getattr(block.ffn, "last_indices", None) is not None:
             torch.save(block.ffn.last_indices.to(torch.int32), os.path.join(a.out, f"layer_{L:02d}_topk_ids.pt"))
         for name, t in golden.items():
             torch.save(t.cpu() if name != "compress_idxs" else t.to(torch.int32).cpu(),
@@ -289,6 +324,7 @@ def main():
         except Exception:
             rev = ""
         json.dump({"tokens": len(ids), "layers": n_layers, "engram": layout is not None,
+                   "swap_eps": a.swap_eps, "swap_cold_only": a.swap_cold_only, "swap_counts_per_layer": swap_counts,
                    "model_dir": MODEL, "config_sha256": cfg_sha, "reference_model_py_sha256": model_py_sha,
                    "oracle_rev": rev or os.environ.get("V41_ORACLE_REV", ""), "files": files},
                   open(os.path.join(a.out, "manifest.json"), "w"), indent=1)
