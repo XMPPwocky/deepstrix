@@ -95,9 +95,15 @@ for c in "$@"; do
         rate_inherit) extra+=(--swap-frac 0.09 --swap-seed 1 --swap-check-sites 3 --swap-weights inherit) ;;
         # matched-count null for anyrank25: its exact site stream, no swap, bf16-round each marked pick
         anyrank25_bf16null) extra=(--swap-eps inf --swap-anyrank-cold "$HOME/b1_hotset_proxy.json" --swap-frac 0.032 --swap-seed 3 --swap-mode bf16) ;;
+        # production-faithful (turn-local): production re-prefills every turn, so perturb ONLY inside
+        # the longest assistant turn (inputs 467..682, 217 predictions); everything before it stays exact
+        anyrank25_turn3) extra=(--swap-eps inf --swap-anyrank-cold "$HOME/b1_hotset_proxy.json" --swap-frac 0.032 --swap-seed 3 --swap-check-sites 2) ;;
+        anyrank25_bf16null_turn3) extra=(--swap-eps inf --swap-anyrank-cold "$HOME/b1_hotset_proxy.json" --swap-frac 0.032 --swap-seed 3 --swap-mode bf16) ;;
         *) echo "unknown policy $pol"; exit 2 ;;
       esac
-      run_case "policy_$pol" --no-layer-dumps "${extra[@]}" --swap-positions "$HERE/agentic_generated_positions.json" \
+      posf="$HERE/agentic_generated_positions.json"
+      case $pol in *_turn3) posf="$HERE/agentic_turn3_positions.json" ;; esac
+      run_case "policy_$pol" --no-layer-dumps "${extra[@]}" --swap-positions "$posf" \
         --prompt-ids "$(tr -d '[] \n' < "$HERE/agentic_tokens.json")" ;;
     *) echo "unknown case $c"; exit 2 ;;
   esac || { echo "[$(date -u +%T)] stopping after $c failed"; exit 1; }
