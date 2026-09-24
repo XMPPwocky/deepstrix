@@ -509,7 +509,7 @@ impl HeterogeneousEngine {
         next_dlw: Option<&DgpuLayerWeights>,
         ilw: &IgpuLayerWeights,
         pos: u32,
-        token_id: i32,
+        _token_id: i32, // was the hash router's input (removed with V4-Flash); still in the public wrappers
         standalone_graphs: bool,
         igpu_moe_preissued: bool,
         mut pager: Option<&mut ExpertPager>,
@@ -2314,6 +2314,9 @@ impl HeterogeneousEngine {
             if super::expert_pager::pick_trace_on() {
                 let ids: Vec<String> = sel_host.iter().map(|v| v.to_string()).collect();
                 super::expert_pager::pick_trace(&format!("D {layer} {}", ids.join(" ")));
+            }
+            if super::expert_pager::pick_sink_on() {
+                super::expert_pager::pick_sink_push(false, layer as usize, 0, 1, &sel_host);
             }
             // Router-probe dataset (`V41_PROBE_DUMP`). Placed HERE because the
             // stream is already synchronised for the `d_selected` readback

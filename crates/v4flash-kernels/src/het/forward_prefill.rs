@@ -6212,6 +6212,11 @@ impl HeterogeneousEngine {
                         super::expert_pager::pick_trace(&format!("P {layer} {b} {}", ids.join(" ")));
                     }
                 }
+                if super::expert_pager::pick_sink_on() {
+                    for r in 0..b as usize {
+                        super::expert_pager::pick_sink_push(true, layer as usize, r as u32, b, &sel_host[r * cs_n_used..(r + 1) * cs_n_used]);
+                    }
+                }
                 // C3: with the split active, box 2 OWNS half of this layer's
                 // experts and computes them itself — so this box must not page
                 // them at all. That is the whole point of the split: the working

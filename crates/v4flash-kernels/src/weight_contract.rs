@@ -51,7 +51,7 @@ pub fn role_of(name: &str) -> String {
 
 /// The engine's expectation for a role, or None if this module doesn't
 /// govern it (unknown tensors keep legacy loader behavior; F32/I32 tensors
-/// go through `load_f32_weight`/`load_i32_tensor` which self-validate).
+/// go through `load_f32_weight` which self-validates).
 ///
 /// The `Quant` lists enumerate the types the forward pass has *wired
 /// kernels for today* — extend a list only together with the dispatch that

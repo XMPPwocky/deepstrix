@@ -347,6 +347,45 @@ pub fn pick_trace_on() -> bool {
     *B
 }
 
+/// One router pick as read back by the pager path, for [`pick_sink_take`].
+#[derive(Clone, Debug)]
+pub struct PickRecord {
+    /// `false` = serial decode (`D` in the text trace), `true` = a batched call
+    /// row (prefill chunk, CED replay or arena step; `P`).
+    pub batched: bool,
+    pub layer: u16,
+    /// Row within the call and the call's row count (always 0 / 1 for decode).
+    pub row: u32,
+    pub rows: u32,
+    /// Routed expert ids in the router's rank order.
+    pub ids: [i32; crate::config::N_EXPERT_USED],
+}
+
+static PICK_SINK_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PICK_SINK: std::sync::Mutex<Vec<PickRecord>> = std::sync::Mutex::new(Vec::new());
+
+/// In-process pick sink for tests (the golden gate compares every routing
+/// decision against the reference's). Off by default: a disabled sink costs one
+/// relaxed atomic load per layer at the two sites that already read the picks
+/// back for paging, so it adds no readback and no sync.
+pub fn pick_sink_enable(on: bool) {
+    PICK_SINK_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+#[inline]
+pub fn pick_sink_on() -> bool {
+    PICK_SINK_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn pick_sink_push(batched: bool, layer: usize, row: u32, rows: u32, ids: &[i32]) {
+    let mut rec = PickRecord { batched, layer: layer as u16, row, rows, ids: [-1; crate::config::N_EXPERT_USED] };
+    let n = ids.len().min(rec.ids.len());
+    rec.ids[..n].copy_from_slice(&ids[..n]);
+    PICK_SINK.lock().unwrap().push(rec);
+}
+/// Everything recorded since the last take, in call order.
+pub fn pick_sink_take() -> Vec<PickRecord> {
+    std::mem::take(&mut *PICK_SINK.lock().unwrap())
+}
+
 /// `V41_T2_PARTITION=1`: split the expert id space between the boxes by a
 /// fixed hash, box 1's share proportional to its decode-LRU slots vs box 2's
 /// pool. Each box then runs its OWN LRU over its OWN demand stream and pages
