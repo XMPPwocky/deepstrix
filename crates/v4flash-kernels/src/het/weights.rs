@@ -17,7 +17,7 @@ use crate::config::{
     N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, N_LORA_Q,
 };
 use crate::model_weights::{
-    load_f32_weight, load_i32_tensor, CompressorWeights, RoutedExpertWeights, SharedExpertWeights,
+    load_f32_weight, CompressorWeights, RoutedExpertWeights, SharedExpertWeights,
 };
 use crate::rope::RopeParams;
 use crate::weight_contract;

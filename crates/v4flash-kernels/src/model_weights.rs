@@ -83,18 +83,3 @@ pub fn load_f32_weight<'a>(
     Ok(buf)
 }
 
-/// Load a named I32 tensor from GGUF into a host-side `Vec<i32>`.
-pub fn load_i32_tensor<'a>(src: impl Into<WeightSrc<'a>>, name: &str) -> eyre::Result<Vec<i32>> {
-    let gguf: WeightSrc<'a> = src.into();
-    let t = gguf
-        .tensor(name)
-        .ok_or_else(|| eyre!("tensor `{name}` missing"))?;
-    if t.dtype != GgufType::I32 {
-        return Err(eyre!("{name}: dtype {:?} != I32", t.dtype));
-    }
-    let bytes = gguf.read_tensor(t)?;
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
-}
