@@ -6,8 +6,8 @@ line or in someone's notes is a setting the next restart silently drops.
 
 | File | Runs on | What |
 |---|---|---|
-| `run-hub.sh` | box 1 | The hub server launch: every production env var (as overridable `${VAR:-default}`), log rotation to `~/logs/v41-server.log`, `exec` of the server. A bare run is production. |
-| `restart-hub.sh` | box 1 | SIGKILL the running hub, optionally install a new binary (`INSTALL=...`, previous kept as `.prev`), relaunch via `run-hub.sh`, wait for `listening on`. |
+| `run-hub.sh [EXTERNAL_HOST]` | box 1 | The hub server launch: every production env var (as overridable `${VAR:-default}`), log rotation to `~/logs/v41-server.log`, `exec` of the server. Its only argument is the external address to serve on besides loopback (IP or hostname, port 18080); omit it for loopback only. |
+| `restart-hub.sh [EXTERNAL_HOST]` | box 1 | SIGKILL the running hub, optionally install a new binary (`INSTALL=...`, previous kept as `.prev`), relaunch via `run-hub.sh`, wait for `listening on`. |
 | `restart-expertd-b2.sh` | box 1 (ssh → box 2) | Restart box 2's `deepstrix-expertd`: waits for the old GTT pool to drain, writes its runtime knobs file (`~/expertd-knobs.txt`, reloaded on SIGUSR2), launches, waits for the listener. |
 
 **Order:** box 2 first. The hub connects to `V41_REMOTE_ADDR` while loading and

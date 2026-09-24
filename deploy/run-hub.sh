@@ -5,6 +5,12 @@
 # script IS production and any var can still be overridden from the caller.
 # Restart: deploy/restart-hub.sh. Box 2 first: deploy/restart-expertd-b2.sh.
 #
+#   Usage: run-hub.sh [EXTERNAL_HOST]
+#     EXTERNAL_HOST  where to serve (port 18080) besides 127.0.0.1: an IP, an
+#                    interface name (tailscale0 -> its IPv4) or a hostname (the
+#                    MagicDNS name; the bare box name resolves to loopback and is
+#                    refused). Omit for loopback only.
+#
 # Historical header (config as first validated, 2026-09-13):
 #
 # Measured with this exact config (6.0k prefill probe + 2048-tok decode,
@@ -19,6 +25,7 @@
 # Box 2 MUST be `--paged` and MUST span all 40 layers, or decode dies on layer 20
 # (prefill survives — CED only runs layers 0-19 — so the failure looks like a
 # decode-only bug).
+EXTERNAL_HOST=${1:-}
 set -x
 
 # ---- standard log destination -------------------------------------------
@@ -187,10 +194,12 @@ export V41_DSPARK=${V41_DSPARK:-0}
 
 export DEEPSTRIX_HANG_DEADLINE_MS=1800000
 export GLIBC_TUNABLES=${GLIBC_TUNABLES:-glibc.malloc.arena_max=2}
-# Second listen address: the tailnet IP, same as run_deepstrix.sh, so other
-# tailscale devices can reach this server. The server binds each --addr
-# independently and only WARNS on one it cannot bind. Set ADDR2= to disable.
-# NOTE: no auth -- anything routing to this host can use the model.
+# External listen address: the script's only argument (IP, interface name or
+# hostname; see Usage above), served on port 18080 beside loopback. It is
+# resolved to an IPv4 address here because --addr takes a socket address.
+# No argument = loopback only. The server binds each --addr
+# independently and only WARNS on one it cannot bind.
+# NOTE: no auth -- anything that can reach that address can use the model.
 # --ctx since 2026-09-18. CAUTION, read this before touching --ctx: the same
 # change that freed the attention scratch also removed the ceiling that was
 # refusing --ctx > 131_072, and for a day the indexer SILENTLY scored only the
@@ -206,13 +215,28 @@ export GLIBC_TUNABLES=${GLIBC_TUNABLES:-glibc.malloc.arena_max=2}
 # always run on 18080 with --ctx 65536, but only ever via explicit command-line
 # overrides -- the script still defaulted to the 18141/8192 dev pair, so a restart
 # "from the script" silently brought up a different server on a port nothing
-# connects to. Override ADDR/ADDR2/CTX for a scratch instance.
-ADDR2=${ADDR2-100.79.4.101:18080}
+# connects to. Override ADDR/CTX for a scratch instance.
+EXTERNAL_ADDR=
+if [ -n "${EXTERNAL_HOST:-}" ]; then
+  if [[ $EXTERNAL_HOST =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+    ip=$EXTERNAL_HOST
+  elif ip -4 -o addr show dev "$EXTERNAL_HOST" >/dev/null 2>&1; then
+    # an interface name, e.g. tailscale0: serve on its IPv4 address
+    ip=$(ip -4 -o addr show dev "$EXTERNAL_HOST" | awk 'NR==1 {sub(/\/.*/, "", $4); print $4}')
+  else
+    ip=$(getent ahostsv4 "$EXTERNAL_HOST" | awk 'NR==1 {print $1}')
+  fi
+  [ -n "${ip:-}" ] || { echo "cannot resolve external host '$EXTERNAL_HOST'" >&2; exit 1; }
+  # A box's own short hostname resolves to 127.0.0.2 on NixOS: refuse loopback,
+  # it would silently serve nothing external.
+  case $ip in 127.*) echo "external host '$EXTERNAL_HOST' resolves to loopback ($ip); pass an IP, an interface (tailscale0) or the MagicDNS name" >&2; exit 1 ;; esac
+  EXTERNAL_ADDR="$ip:18080"
+fi
 MODEL=$(readlink -f ~/.cache/deepstrix/models/dsv4.1f)
 MMPROJ=${MMPROJ-$MODEL}
 exec ${DEEPSTRIX_BIN:-/home/claude-code/deepstrix/target-v41/release/deepstrix-server} \
   --gguf "$MODEL" --addr "${ADDR:-127.0.0.1:18080}" \
-  ${ADDR2:+--addr "$ADDR2"} --ctx ${CTX:-368640} \
+  ${EXTERNAL_ADDR:+--addr "$EXTERNAL_ADDR"} --ctx ${CTX:-368640} \
   --model-name deepseek-v4.1-flash \
   ${MMPROJ:+--mmproj "$MMPROJ"} \
   --snapshot-dir /home/claude-code/.cache/deepstrix/snapshots-v41
