@@ -257,6 +257,14 @@ def main():
                     g = torch.Generator().manual_seed(a.swap_seed * 1000003 + L)
                     sw = cold & (torch.rand(idx.shape, generator=g) < a.swap_frac)
                     w_ref, idx_ref = w.clone(), idx.clone()
+                    if a.swap_mode == "bf16":
+                        # matched-count null: same sites, no substitution; each marked pick's
+                        # expert output is rounded to bf16 instead
+                        _moe.bf16_round = (sw.clone(), idx.clone())
+                        for c in range(k):
+                            swap_rank_counts[c] += int(sw[:, c].sum())
+                        sw_sites = sw
+                        sw = torch.zeros_like(sw)
                     for r in sw.any(dim=1).nonzero().flatten().tolist():
                         j = 0
                         for c in range(k):
@@ -274,7 +282,7 @@ def main():
                             inherit_absdiff.extend((w[sw] - w_gate[sw]).abs().tolist())
                     else:
                         w = w_gate
-                    swap_counts.append(int(sw.sum()))
+                    swap_counts.append(int(sw_sites.sum()) if a.swap_mode == "bf16" else int(sw.sum()))
                     if a.swap_check_sites:
                         rows = sw.any(dim=1).nonzero().flatten()[: a.swap_check_sites].tolist()
                         _moe.check = {"layer": L, "rows": rows, "w_ref": w_ref, "idx_ref": idx_ref,

@@ -68,7 +68,10 @@ class LazyMoE(torch.nn.Module):
             out = self._expert(e, x[idx], weights[idx, top, None])
             if rnd is not None:
                 rows, experts = rnd
-                m = rows[idx] & (experts[idx] == e)
+                if rows.dim() == 2:  # [n, k] site mask over the picks (any-rank null)
+                    m = (rows[idx] & (experts[idx] == e)).any(dim=1)
+                else:  # [n] rows, one marked expert per row
+                    m = rows[idx] & (experts[idx] == e)
                 if m.any():
                     out = out.clone()
                     out[m] = out[m].to(torch.bfloat16).float()

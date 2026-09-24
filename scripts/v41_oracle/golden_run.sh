@@ -93,6 +93,8 @@ for c in "$@"; do
         # the shippable weight rule: the substitute inherits the replaced pick's weight, no renormalization
         anyrank25_inherit) extra=(--swap-eps inf --swap-anyrank-cold "$HOME/b1_hotset_proxy.json" --swap-frac 0.032 --swap-seed 3 --swap-check-sites 2 --swap-weights inherit) ;;
         rate_inherit) extra+=(--swap-frac 0.09 --swap-seed 1 --swap-check-sites 3 --swap-weights inherit) ;;
+        # matched-count null for anyrank25: its exact site stream, no swap, bf16-round each marked pick
+        anyrank25_bf16null) extra=(--swap-eps inf --swap-anyrank-cold "$HOME/b1_hotset_proxy.json" --swap-frac 0.032 --swap-seed 3 --swap-mode bf16) ;;
         *) echo "unknown policy $pol"; exit 2 ;;
       esac
       run_case "policy_$pol" --no-layer-dumps "${extra[@]}" --swap-positions "$HERE/agentic_generated_positions.json" \
