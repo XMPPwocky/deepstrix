@@ -86,6 +86,10 @@ def main():
     ap.add_argument("--swap-rank", type=int, default=None,
                     help="which rank to replace with the 7th (1..topk; default topk = the 6th). "
                          "Eligibility (--swap-sixth-cold, --swap-frac) is still decided on the 6th pick.")
+    ap.add_argument("--swap-anyrank-cold", default=None,
+                    help="JSON [layer][ids] hot set: swap a seeded random --swap-frac of the COLD picks at ANY "
+                         "rank 1..6 (generated positions only if --swap-positions), each replaced by the "
+                         "best-ranked expert not already chosen in that row (7th, then 8th, ...). No gap gate.")
     ap.add_argument("--swap-check-sites", type=int, default=0,
                     help="per layer, log this many swapped rows: routing before/after and ||dFFN|| "
                          "(recomputes those rows' FFN with the original routing) to swap_checks.json")
@@ -97,6 +101,10 @@ def main():
     if a.swap_cold_only:
         hot_sets = [set(x) for x in __import__("json").load(open(a.swap_cold_only))]
     sixth_cold_sets = None
+    anyrank_sets = None
+    if a.swap_anyrank_cold:
+        anyrank_sets = [set(x) for x in __import__("json").load(open(a.swap_anyrank_cold))]
+    swap_rank_counts = [0] * 6
     if a.swap_sixth_cold:
         sixth_cold_sets = [set(x) for x in __import__("json").load(open(a.swap_sixth_cold))]
     swap_counts = []
@@ -231,7 +239,36 @@ def main():
                 assert torch.equal(sel.topk(_gate.topk, dim=-1)[1], idx), "recomputed selection != reference"
                 golden["router_sel"] = sel.float().clone()
                 golden["router_w"] = w.float().clone()
-                if a.swap_eps is not None:
+                if a.swap_eps is not None and anyrank_sets is not None:
+                    k = _gate.topk
+                    top = sel.topk(2 * k, dim=-1)  # enough replacements for every rank of a row
+                    idx = top.indices[:, :k].clone()
+                    hs = anyrank_sets[L]
+                    cold = torch.tensor([[e not in hs for e in row] for row in idx.tolist()])
+                    if swap_pos is not None:
+                        allowed = torch.zeros(idx.shape[0], dtype=torch.bool)
+                        allowed[torch.tensor(swap_pos, dtype=torch.long)] = True
+                        cold &= allowed[:, None]
+                    g = torch.Generator().manual_seed(a.swap_seed * 1000003 + L)
+                    sw = cold & (torch.rand(idx.shape, generator=g) < a.swap_frac)
+                    w_ref, idx_ref = w.clone(), idx.clone()
+                    for r in sw.any(dim=1).nonzero().flatten().tolist():
+                        j = 0
+                        for c in range(k):
+                            if sw[r, c]:
+                                idx[r, c] = top.indices[r, k + j]  # best-ranked expert not yet chosen
+                                j += 1
+                                swap_rank_counts[c] += 1
+                    w = sc.gather(1, idx)
+                    if _gate.norm_topk_prob and k > 1:
+                        w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
+                    w = w * _gate.route_scale
+                    swap_counts.append(int(sw.sum()))
+                    if a.swap_check_sites:
+                        rows = sw.any(dim=1).nonzero().flatten()[: a.swap_check_sites].tolist()
+                        _moe.check = {"layer": L, "rows": rows, "w_ref": w_ref, "idx_ref": idx_ref,
+                                      "w_new": w.clone(), "idx_new": idx.clone(), "out": swap_checks}
+                elif a.swap_eps is not None:
                     top = sel.topk(_gate.topk + 1, dim=-1)
                     k = _gate.topk
                     gap = top.values[:, k - 1] - top.values[:, k]
@@ -373,6 +410,7 @@ def main():
                    "swap_eps": a.swap_eps, "swap_cold_only": a.swap_cold_only, "swap_positions": a.swap_positions,
                    "swap_sixth_cold": a.swap_sixth_cold, "swap_frac": a.swap_frac, "swap_seed": a.swap_seed,
                    "swap_mode": a.swap_mode, "swap_rank": a.swap_rank or 6,
+                   "swap_anyrank_cold": a.swap_anyrank_cold, "swap_rank_counts": swap_rank_counts,
                    "swap_counts_per_layer": swap_counts,
                    "model_dir": MODEL, "config_sha256": cfg_sha, "reference_model_py_sha256": model_py_sha,
                    "oracle_rev": rev or os.environ.get("V41_ORACLE_REV", ""), "files": files},

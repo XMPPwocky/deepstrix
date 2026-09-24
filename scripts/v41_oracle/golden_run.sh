@@ -85,6 +85,11 @@ for c in "$@"; do
         zero)  extra=(--swap-eps 0 --swap-sixth-cold "$HOME/b1_hotset_proxy.json" --swap-frac 0.09 --swap-seed 1) ;;
         rank1) extra+=(--swap-frac 0.09 --swap-seed 1 --swap-rank 1 --swap-check-sites 3) ;;
         rate2) extra+=(--swap-frac 0.09 --swap-seed 1 --swap-check-sites 3) ;;
+        # any-rank cold substitution (the zero-blocking-miss policy): a seeded fraction of the
+        # cold picks at ANY rank -> best unchosen expert. 78 cold picks/generated token on the
+        # agentic transcript, so 0.032 ~ 2.5 swaps/token (production box-2 miss rate), 0.064 ~ 5.
+        anyrank25) extra=(--swap-eps inf --swap-anyrank-cold "$HOME/b1_hotset_proxy.json" --swap-frac 0.032 --swap-seed 3 --swap-check-sites 2) ;;
+        anyrank50) extra=(--swap-eps inf --swap-anyrank-cold "$HOME/b1_hotset_proxy.json" --swap-frac 0.064 --swap-seed 3 --swap-check-sites 2) ;;
         *) echo "unknown policy $pol"; exit 2 ;;
       esac
       run_case "policy_$pol" --no-layer-dumps "${extra[@]}" --swap-positions "$HERE/agentic_generated_positions.json" \
