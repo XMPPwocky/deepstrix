@@ -42,7 +42,6 @@ pub mod ffn;
 pub mod gqa_attention;
 pub mod head;
 pub mod model_weights;
-pub mod routing;
 pub mod het;
 pub mod expert_sel_count;
 pub mod indexer;

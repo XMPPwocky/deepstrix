@@ -30,7 +30,6 @@ use crate::config::{
     SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW,
 };
 use crate::attention::{ATTN_MIXED_MAX_KEYS, ATTN_SWA_BATCHED_MAX_KV};
-use crate::routing::hash_router_select;
 
 use super::image_spans::{self, ImageSpan};
 
@@ -818,7 +817,7 @@ impl HeterogeneousEngine {
         let mut look: Option<Vec<i32>> = None;
         if layer + 1 < N_LAYER as usize {
             let nl = &weights.dgpu_layers[layer + 1];
-            if !nl.is_hash_router {
+{
                 let mut logits = v4flash_hip::DeviceBuffer::<f32>::new(de.device.id, b * N_EXPERT as usize)?;
                 let mut sel = v4flash_hip::DeviceBuffer::<i32>::new(de.device.id, b * nu)?;
                 let mut ew = v4flash_hip::DeviceBuffer::<f32>::new(de.device.id, b * nu)?;
@@ -5831,15 +5830,15 @@ impl HeterogeneousEngine {
         // on live agent traffic: 62% (encoder) / 75% (decoder) of next-layer
         // picks predicted; break-even is ~40%.
         let look_next: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router, .. } if lookahead_prefetch() => next_router.filter(|nl| !nl.is_hash_router),
+            RowLayout::Arena { next_router, .. } if lookahead_prefetch() => *next_router,
             _ => None,
         };
         let look_next2: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router2, .. } if lookahead_prefetch() && lookahead_depth() >= 2 => next_router2.filter(|nl| !nl.is_hash_router),
+            RowLayout::Arena { next_router2, .. } if lookahead_prefetch() && lookahead_depth() >= 2 => *next_router2,
             _ => None,
         };
         let image_runs = image_spans::image_runs(tokens);
-        if !dlw.is_hash_router {
+{
             // Top-k: one block per token in a single launch (B→1 launches).
             // (Image rows are recomputed with bias_vl right below — same
             // stream, FIFO — so this full-batch launch stays as-is.)
@@ -5893,39 +5892,6 @@ impl HeterogeneousEngine {
                     &bd.ffn_input_norm.slice_view(0, crate::config::N_EMBD as usize),
                 )?;
             }
-        } else {
-            // Hash router: readback all B × N_EXPERT logits, run host
-            // select per batch element, upload d_selected + d_ew.
-            de.compute.synchronize()?;
-            sd.router_logits
-                .copy_to_host(&mut sd.router_logits_host)?;
-            let tid2eid = dlw
-                .tid2eid
-                .as_ref()
-                .ok_or_else(|| eyre!("L{layer}: hash router but no tid2eid"))?;
-            let mut all_sel: Vec<i32> = Vec::with_capacity(b as usize * cs_n_used);
-            let mut all_ew: Vec<f32> = Vec::with_capacity(b as usize * cs_n_used);
-            for i in 0..b as usize {
-                if image_spans::is_image_token(tokens[i]) {
-                    // Synthetic id: no tid2eid row. Placeholder; overwritten
-                    // by the bias_vl top-k launch below.
-                    all_sel.extend_from_slice(&[0i32; N_EXPERT_USED]);
-                    all_ew.extend_from_slice(&[0f32; N_EXPERT_USED]);
-                    continue;
-                }
-                let logit_slice = &sd.router_logits_host
-                    [i * (N_EXPERT as usize)..(i + 1) * (N_EXPERT as usize)];
-                let (sel, w) = hash_router_select(tid2eid, tokens[i], logit_slice);
-                all_sel.extend_from_slice(&sel);
-                all_ew.extend_from_slice(&w);
-            }
-            // d_selected / d_ew are rows-sized; copy into [0..B*N_USED] view.
-            let mut sel_v = bd
-                .d_selected
-                .slice_view_mut(0, b as usize * cs_n_used);
-            sel_v.copy_from_host(&all_sel)?;
-            let mut ew_v = bd.d_ew.slice_view_mut(0, b as usize * cs_n_used);
-            ew_v.copy_from_host(&all_ew)?;
         }
         if !image_runs.is_empty() {
             let bias_vl = dlw.router_bias_vl_dev.as_ref().ok_or_else(|| {
@@ -6151,11 +6117,11 @@ impl HeterogeneousEngine {
         let _ = (cs_n_embd, split_cap, moe_group_bound);
         let _ = &self.dgpu;
         let look_next: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router, .. } if lookahead_prefetch() => next_router.filter(|nl| !nl.is_hash_router),
+            RowLayout::Arena { next_router, .. } if lookahead_prefetch() => *next_router,
             _ => None,
         };
         let look_next2: Option<&DgpuLayerWeights> = match &rows {
-            RowLayout::Arena { next_router2, .. } if lookahead_prefetch() && lookahead_depth() >= 2 => next_router2.filter(|nl| !nl.is_hash_router),
+            RowLayout::Arena { next_router2, .. } if lookahead_prefetch() && lookahead_depth() >= 2 => *next_router2,
             _ => None,
         };
         let mut sel_host_remote: Vec<i32> = Vec::new();

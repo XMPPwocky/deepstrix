@@ -28,7 +28,6 @@ use crate::config::{
     N_GROUPS, N_HC, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD, N_INDEXER_HEAD_DIM, N_LORA_Q, N_ROT,
     OUT_LOW, Q_FLAT, RANK, RMS_EPS, SINKHORN_EPS, SINKHORN_ITERS, SWA_WINDOW, SWIGLU_CLAMP_EXP,
 };
-use crate::routing::hash_router_select;
 use crate::q8_k::BLOCK_Q8_K_BYTES;
 
 /// Floor for the router-weight sum, mirroring the host topk path (f16
@@ -2117,7 +2116,7 @@ impl HeterogeneousEngine {
                 N_EMBD,
             )?;
         }
-        if !dlw.is_hash_router {
+{
             let _t = de.events.stage("k.router.topk", &de.compute)?;
             de.router_topk.launch(
                 &de.compute,
@@ -2150,25 +2149,6 @@ impl HeterogeneousEngine {
                     &dgpu_scratch.ffn_input_norm.slice_view(0, N_EMBD as usize),
                 )?;
             }
-        } else {
-            // Hash router: host sync the router matvec, read 6 chosen
-            // logits, write back d_selected and d_ew on dGPU.compute.
-            // The shared expert that runs after this will be FIFO-
-            // serialized behind the copy_from_host; the iGPU MoE
-            // wait depends on selected_pushed which depends on these
-            // writes via stream-FIFO.
-            de.compute.synchronize()?;
-            dgpu_scratch
-                .router_logits
-                .copy_to_host(&mut dgpu_scratch.router_logits_host)?;
-            let tid2eid = dlw
-                .tid2eid
-                .as_ref()
-                .ok_or_else(|| eyre!("L{layer}: hash router but no tid2eid"))?;
-            let (sel, w) =
-                hash_router_select(tid2eid, token_id, &dgpu_scratch.router_logits_host);
-            dgpu_scratch.d_selected.copy_from_host(&sel)?;
-            dgpu_scratch.d_ew.copy_from_host(&w)?;
         }
         drop(_s_router);
         _t_router.end()?;

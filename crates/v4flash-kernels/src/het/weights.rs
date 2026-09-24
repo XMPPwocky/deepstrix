@@ -13,7 +13,7 @@ use v4flash_core::{gguf::GgufType, WeightSrc};
 use v4flash_hip::{Device, DeviceBuffer};
 
 use crate::config::{
-    COMPRESS_RATIOS, HC_MIX_DIM, INDEXER_COMP_WIDTH, N_EMBD, N_EXPERT, N_HASH_LAYERS, N_HC,
+    COMPRESS_RATIOS, HC_MIX_DIM, INDEXER_COMP_WIDTH, N_EMBD, N_EXPERT, N_HC,
     N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD_DIM, N_LAYER, N_LORA_Q,
 };
 use crate::model_weights::{
@@ -84,9 +84,7 @@ pub struct DgpuLayerWeights {
     // on dGPU's BW, and (b) keeping it off iGPU lifts it from the iGPU
     // MoE critical path. After the router runs on dGPU, selected/d_ew
     // are peer-pushed to iGPU and the MoE pipeline starts immediately.
-    pub is_hash_router: bool,
     pub ffn_gate_inp: DeviceWeight,
-    pub tid2eid: Option<Vec<i32>>,
     pub router_bias_dev: Option<DeviceBuffer<f32>>,
     /// Vision-Exp: `layers.N.ffn.gate.bias_vl` `[N_EXPERT]` f32 — the
     /// selection bias for IMAGE rows (token id >= N_VOCAB) on EVERY layer,
@@ -130,7 +128,6 @@ fn owns_index_k(layer: i32) -> bool {
 pub struct IgpuLayerWeights {
     pub layer_idx: i32,
     pub ratio: u32,
-    pub is_hash_router: bool,
 
     /// Routed experts: a 1-slot placeholder (the ExpertPager holds the real ones). Historically all 256; with `IGPU_DEDUP_HOT` only the
     /// `256 - n_hot` experts that are NOT dGPU-resident, packed dense
@@ -607,18 +604,9 @@ impl DgpuLayerWeights {
         };
 
         // Router weights live on dGPU.
-        let is_hash_router = layer < N_HASH_LAYERS;
         let ffn_gate_inp =
             load_to_device(gguf, &format!("blk.{layer}.ffn_gate_inp.weight"), device_id)?;
-        let tid2eid = if is_hash_router {
-            Some(load_i32_tensor(
-                gguf,
-                &format!("blk.{layer}.ffn_gate_tid2eid.weight"),
-            )?)
-        } else {
-            None
-        };
-        let router_bias_dev = if !is_hash_router {
+        let router_bias_dev = {
             let bias_name = format!("blk.{layer}.exp_probs_b.bias");
             if let Some(t) = gguf.tensor(&bias_name) {
                 if t.dtype != GgufType::F32 {
@@ -635,8 +623,6 @@ impl DgpuLayerWeights {
             } else {
                 None
             }
-        } else {
-            None
         };
 
         Ok(DgpuLayerWeights {
@@ -664,9 +650,7 @@ impl DgpuLayerWeights {
             compressor,
             indexer,
             indexer_compressor,
-            is_hash_router,
             ffn_gate_inp,
-            tid2eid,
             router_bias_dev,
             router_bias_vl_dev: None,
         })
@@ -796,7 +780,6 @@ impl IgpuLayerWeights {
         igpu_device.set_current()?;
         let device_id = igpu_device.id;
         let ratio = COMPRESS_RATIOS[layer as usize];
-        let is_hash_router = layer < N_HASH_LAYERS;
 
         let placeholder = |which: &str, k: u64, rows: u64| -> eyre::Result<(DeviceWeight, usize)> {
             let name = format!("blk.{layer}.ffn_{which}_exps.weight");
@@ -822,7 +805,6 @@ impl IgpuLayerWeights {
         Ok(IgpuLayerWeights {
             layer_idx: layer,
             ratio,
-            is_hash_router,
             routed: RoutedExpertWeights {
                 gate,
                 up,

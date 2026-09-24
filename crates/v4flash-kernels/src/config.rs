@@ -141,4 +141,3 @@ pub const CANDIDATE_BLOCK_SIZE: u32 = 8;
 /// Which model this binary was compiled for (see docs/v41/ENGINE_PORT.md §0).
 pub const MODEL_NAME: &str = "DeepSeek-V4.1-Flash";
 
-pub const N_HASH_LAYERS: i32 = 0;
