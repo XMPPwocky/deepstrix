@@ -15,7 +15,6 @@
 //! production snapshot dir) and both GPUs.
 //!
 //! `cargo test -p deepstrix-server --features v41 --release --test snapshot_v41_restore_guards -- --ignored --nocapture`
-#![cfg(feature = "v41")]
 
 use std::path::PathBuf;
 

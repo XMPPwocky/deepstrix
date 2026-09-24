@@ -26,7 +26,6 @@
 //!   HIP_VISIBLE_DEVICES=0,1 CARGO_TARGET_DIR=target-v41 nix develop -c \
 //!     cargo test --release --features v41 -p v4flash-kernels \
 //!     --test bench_v41_kernel_roofline -- --ignored --nocapture
-#![cfg(feature = "v41")]
 
 use std::cell::Cell;
 use std::io::Write;

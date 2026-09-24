@@ -218,7 +218,7 @@ impl HetCompressorState {
         };
         // Index-K only for V4.1's MAIN compressor (head_dim 512). The ratio-4
         // indexer compressor passes N_INDEXER_HEAD_DIM and must not get one.
-        let index_k = if cfg!(feature = "v41") && head_dim == N_HEAD_DIM {
+        let index_k = if head_dim == N_HEAD_DIM {
             dgpu_device.set_current()?;
             Some(DeviceBuffer::new(
                 dgpu_device.id,

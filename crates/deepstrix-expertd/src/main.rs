@@ -152,9 +152,6 @@ fn parse_args() -> eyre::Result<Args> {
 
 fn main() -> eyre::Result<()> {
     install_panic_handler()?;
-    if !cfg!(feature = "v41") {
-        return Err(eyre!("deepstrix-expertd must be built with --features v41 (V4.1 experts from the HF checkpoint)"));
-    }
     let args = parse_args()?;
     // A frequency-ranked placement file beats a contiguous id range by a wide
     // margin on V4.1 (Zipfian routing); see `Assignment::from_placement_file`.

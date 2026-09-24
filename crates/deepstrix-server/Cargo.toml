@@ -39,6 +39,6 @@ name = "deepstrix-vector-test"
 path = "src/bin/vector-test.rs"
 
 [features]
-# Model selection (non-additive!): compile for DeepSeek-V4.1-Flash instead of V4-Flash.
-# Never unify with --all-features; build V4.1 in its own CARGO_TARGET_DIR (docs/v41/ENGINE_PORT.md §0).
+# No-op since 2026-09-24: V4.1-Flash is the only DeepSeek model (V4-Flash was
+# dropped). Kept so existing `--features v41` build commands keep working.
 v41 = ["v4flash-kernels/v41"]

@@ -117,26 +117,16 @@ pub struct IndexerWeights {
 
 /// Does `layer` own indexer weights under V4.1 (CSA2 `index_source_layer_ids`)?
 /// V4-Flash keys indexer presence off `ratio == 4` instead, so this is false there.
-#[cfg(feature = "v41")]
 fn is_index_source(layer: i32) -> bool {
     crate::config::INDEX_SOURCE_LAYERS.contains(&layer)
-}
-#[cfg(not(feature = "v41"))]
-fn is_index_source(_layer: i32) -> bool {
-    false
 }
 
 /// Does `layer` own the index-K projection? All 8 index-source layers SCORE, but
 /// index K exists only on the 4 KV-source layers (2, 8, 14, 20) — the others reuse
 /// the nearest source's keys, exactly as the main compressed store is reused.
 /// Assuming otherwise fails loudly at load: `blk.24.indexer.attn_k.weight` is absent.
-#[cfg(feature = "v41")]
 fn owns_index_k(layer: i32) -> bool {
     crate::config::KV_SOURCE_LAYERS.contains(&layer)
-}
-#[cfg(not(feature = "v41"))]
-fn owns_index_k(_layer: i32) -> bool {
-    false
 }
 
 pub struct IgpuLayerWeights {
@@ -365,7 +355,6 @@ impl HetGlobalWeights {
         // `blocks[-1].hc_pre(h, pre_mix)` in model.py), so `output_hc_*` simply do
         // not exist in the checkpoint. Stub them; `forward_head` takes the v41
         // branch and never reads these.
-        #[cfg(feature = "v41")]
         let (output_hc_fn, output_hc_scale, output_hc_base) = {
             let _ = &gguf;
             (
@@ -379,13 +368,6 @@ impl HetGlobalWeights {
                 DeviceBuffer::<f32>::new(dgpu_id, N_HC as usize)?,
             )
         };
-        #[cfg(not(feature = "v41"))]
-        let output_hc_fn = load_to_device(gguf, "output_hc_fn.weight", dgpu_id)?;
-        #[cfg(not(feature = "v41"))]
-        let output_hc_scale = load_f32_weight(gguf, "output_hc_scale.weight", dgpu_id, 1)?;
-        #[cfg(not(feature = "v41"))]
-        let output_hc_base =
-            load_f32_weight(gguf, "output_hc_base.weight", dgpu_id, N_HC as usize)?;
         Ok(Self {
             output,
             output_norm,

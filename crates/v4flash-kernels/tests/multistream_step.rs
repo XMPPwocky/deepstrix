@@ -50,7 +50,6 @@
 //! ```
 //! `V41_HF_DIR` (default: the production snapshot), `V41_ENGRAM_DIR`,
 //! `V41_PAGER_POOL_GB` (default 40 here), `MS_LENS` (comma list of prompt lengths).
-#![cfg(feature = "v41")]
 
 use std::path::Path;
 

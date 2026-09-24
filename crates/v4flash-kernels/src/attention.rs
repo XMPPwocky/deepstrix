@@ -30,43 +30,6 @@ pub const ATTN_SWA_MAX_KV: u32 = 128;
 /// its occupancy is unchanged — only image chunks pay 4 KiB.
 pub const ATTN_SWA_BATCHED_MAX_KV: u32 = 512;
 
-/// Compile-time max for `attention_mixed`'s `scores`/`weights` arrays;
-/// must cover `n_raw + n_comp`. Raw is permanently capped at SWA_WINDOW
-/// (128) by the forward orchestrator's sliding eviction; comp grows
-/// unbounded until cap_comp (set per allocation in `ModelState::alloc`).
-/// 2304 covers up to 128 raw + 2176 comp ≈ 8832 tokens at ratio=4, sized
-/// for chat sessions up to CHAT_KV_MAX=8192. Costs ~16 KiB extra LDS/WG
-/// vs the original 256-cap; one WG per head so occupancy is fine.
-/// Hard cap on `n_raw + n_comp` for the split decode kernels
-/// (`attention_mixed_score`, `attention_mixed_softmax_wsum`). Scratch
-/// lives in `DgpuScratch.attn_scores` (global memory), so this isn't
-/// LDS-bound. 82176 = 320K/4 + 256: 128 raw + 81920 comp + 128 chunk-headroom,
-/// i.e. up to a 320K context at ratio=4 (worst-case layer ratio across
-/// [[compress-ratios]] is 4; min layers have 128, but they barely grow); the
-/// headroom lets a full chunk (B_MAX tokens, +128 comp rows) prefill on top of a
-/// full prefix. Raised from 49408 (192K) on 2026-09-10 once the packed-FP8
-/// compressed KV freed the dGPU room (docs/FP8_KV_IMPL_2026-09.md); the cap
-/// itself costs ~512 B of shared prefill scratch + ~64 B of decode scratch per
-/// token of cap. The server refuses a `--ctx` whose worst-case ungathered
-/// key count (see [`attn_max_scored_keys`]) exceeds this.
-///
-/// PER-MODEL, and the derivation is NOT "ctx / 4". The old value was read as
-/// "320K / 4 + 256" because V4-Flash's smallest *ungathered* contribution is a
-/// ratio-4 layer gathered to INDEXER_TOP_K and its ratio-128 layers give
-/// n_kv/128 — nothing ever reaches n_kv/1. V4.1 has no indexer and its layers
-/// 20-39 are ratio 1, so decode scores `n_raw + n_kv` keys and the cap is a
-/// context limit one-for-one: 82176 made decode fail past ~82K while the
-/// server happily accepted `--ctx 328704`. Sized here for a 128K V4.1 context
-/// (`SWA_WINDOW + 131072`), which costs `N_HEAD * cap * 4 B` = 33.6 MiB of
-/// `DgpuScratch.attn_scores` (was 21.0 MiB) plus `cap/8 B` of
-/// `indexer_allowed_bits`. Decode is B=1, so this cap is cheap — the
-/// expensive one is the batched prefill scratch (see [`attn_scores_stride`]).
-///
-/// The `#define ATTN_MIXED_MAX_KEYS` in `kernels/attention_mixed.hip` is
-/// documentation only: every kernel takes its stride as a launch argument
-/// (`max_keys`), so nothing needs to match it.
-#[cfg(not(feature = "v41"))]
-pub const ATTN_MIXED_MAX_KEYS: u32 = 82176;
 /// Largest `--ctx` V4.1 can serve. The INDEXER scores its whole compressed
 /// store densely to PRODUCE the top-k, and layers 20-39 are ratio 1, so the
 /// widest store is one row per token: this cap is a context limit 1:1.
@@ -90,7 +53,6 @@ pub const ATTN_MIXED_MAX_KEYS: u32 = 82176;
 /// `scored_keys_are_gathered` reads `V41_INDEX_K` at RUNTIME, which is the
 /// env-dependence that caused the truncation bug documented below; any split
 /// must resolve the mode at startup and hard-error if it changes.
-#[cfg(feature = "v41")]
 pub const V41_MAX_CTX: u32 = 368_640;
 
 /// RAISED 2026-09-18 from `131_072 + SWA_WINDOW`, closing a SILENT TRUNCATION.
@@ -108,7 +70,6 @@ pub const V41_MAX_CTX: u32 = 368_640;
 /// Two things prevent a recurrence: the admission check now derives from
 /// [`indexer_max_scored_keys`], which has NO gathered shortcut and no env
 /// dependence, and the truncating `.min()`s are hard errors.
-#[cfg(feature = "v41")]
 pub const ATTN_MIXED_MAX_KEYS: u32 =
     V41_MAX_CTX + crate::het::image_spans::IMAGE_RAW_WINDOW_MAX;
 
@@ -150,8 +111,9 @@ pub const ATTN_SCORES_STRIDE: u32 = 3072;
 /// [`scored_keys_are_gathered`]. (Corrected 2026-09-18: the note here used to say
 /// V4.1's indexer was unported and every V4.1 layer scored densely. S1+S2 landed;
 /// it does not.)
-pub fn indexer_gathers(ratio: u32) -> bool {
-    !cfg!(feature = "v41") && ratio == 4
+pub fn indexer_gathers(_ratio: u32) -> bool {
+    // V4-Flash's ratio-4 compressor indexer only; V4.1 has no ratio-4 layer.
+    false
 }
 
 /// `V41_INDEX_K=1` — mirror of `het::forward_layer::index_k_enabled`, needed here
@@ -179,10 +141,7 @@ fn v41_index_k_on() -> bool {
 ///
 /// Keep in lockstep with the `use_sparse` / `s2_reuse` gates.
 pub fn scored_keys_are_gathered(ratio: u32) -> bool {
-    if cfg!(feature = "v41") {
-        return ratio > 0 && v41_index_k_on();
-    }
-    indexer_gathers(ratio)
+    ratio > 0 && v41_index_k_on()
 }
 
 /// Can the CSA indexer fire on ANY layer of this model? False for V4.1
@@ -202,9 +161,7 @@ pub fn scored_keys_are_gathered(ratio: u32) -> bool {
 /// per-token indexer SCRATCH must exist at all.
 pub fn indexer_scratch_needed() -> bool {
     static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        indexer_ever_fires()
-            || (cfg!(feature = "v41")
-                && matches!(std::env::var("V41_INDEX_K").as_deref(), Ok("1") | Ok("on")))
+        indexer_ever_fires() || matches!(std::env::var("V41_INDEX_K").as_deref(), Ok("1") | Ok("on"))
     });
     *B
 }
@@ -355,25 +312,6 @@ pub fn attn_scores_stride(
         return Ok(ATTN_SCORES_STRIDE);
     }
     Ok(n_total_max.max(1))
-}
-
-/// Refuse to start when a vision tower is loaded and `n_kv_max` would let
-/// an image row's `n_raw + n_comp` overrun [`ATTN_SCORES_STRIDE`].
-///
-/// NOTE this only guards the *floor* stride. The batched prefill scratch is
-/// sized from `n_kv_max` (`BatchDgpuShared::alloc_rows_ctx`), so a V4.1
-/// engine past 3072 keys is legal — it just costs memory. This check exists
-/// for the models/settings where the floor is also the ceiling.
-pub fn check_vision_ctx_fits(n_kv_max: u32) -> eyre::Result<()> {
-    let raw = crate::het::image_spans::IMAGE_RAW_WINDOW_MAX;
-    let need = attn_max_scored_keys(n_kv_max, raw);
-    if need > ATTN_SCORES_STRIDE && !cfg!(feature = "v41") {
-        return Err(eyre!(
-            "vision + ctx {n_kv_max} needs {need} attention score slots per (row, head)              (image raw window {raw}) but              ATTN_SCORES_STRIDE is {ATTN_SCORES_STRIDE}. Lower --ctx to {} or raise              ATTN_SCORES_STRIDE (and the attn_scores scratch with it).",
-            attn_max_ctx_for_keys(ATTN_SCORES_STRIDE, raw),
-        ));
-    }
-    Ok(())
 }
 
 /// Head-group size for the head-tiled WMMA smwsum kernels. Must match
@@ -1283,35 +1221,6 @@ impl AttentionMixed {
 mod tests {
     use super::*;
 
-    /// The shipped configuration (192K ctx + a vision tower) must start,
-    /// and it must sit exactly at the edge — this is the test that fails
-    /// first if someone raises the context without raising the stride.
-    #[test]
-    #[cfg(not(feature = "v41"))]
-    fn vision_ctx_budget_is_exact_at_the_stride() {
-        // The bound is (ATTN_SCORES_STRIDE - IMAGE_RAW_WINDOW_MAX) * 128 tokens:
-        // 192K at the old 2048 stride, 320K at 3072.
-        let max_ctx = (ATTN_SCORES_STRIDE - crate::het::image_spans::IMAGE_RAW_WINDOW_MAX) * 128;
-        check_vision_ctx_fits(max_ctx).expect("max ctx + vision must fit");
-        // One comp row more (ratio 128 => 128 tokens) does not.
-        assert!(check_vision_ctx_fits(max_ctx + 128).is_err());
-        check_vision_ctx_fits(192 * 1024).expect("192K + vision must fit");
-        // Text-only servers were never near the bound.
-        check_vision_ctx_fits(96 * 1024).unwrap();
-    }
-
-    #[test]
-    #[cfg(not(feature = "v41"))]
-    fn vision_ctx_error_names_a_workable_ctx() {
-        let e = check_vision_ctx_fits(512 * 1024).unwrap_err().to_string();
-        assert!(e.contains("ATTN_SCORES_STRIDE"), "{e}");
-        // The suggested ctx must itself pass.
-        check_vision_ctx_fits(
-            (ATTN_SCORES_STRIDE - crate::het::image_spans::IMAGE_RAW_WINDOW_MAX) * 128,
-        )
-        .unwrap();
-    }
-
     /// The three context caps must all come from `attn_max_scored_keys`.
     /// This is the regression test for the 2026-09-13 finding: the caps were
     /// derived assuming compression ratio >= 4, which V4.1 does not have.
@@ -1368,7 +1277,6 @@ mod tests {
 
     /// The cap must cover the context we actually ship, computed through the
     /// env-independent bound.
-    #[cfg(feature = "v41")]
     #[test]
     fn cap_covers_the_shipped_ctx() {
         // The WIDEST raw window, not the text-only one: `engine_worker` passes
@@ -1390,7 +1298,6 @@ mod tests {
         let ctx = attn_max_ctx_for_keys(ATTN_MIXED_MAX_KEYS, w);
         assert!(ctx >= 8192, "decode cap only reaches {ctx} tokens");
         assert!(attn_max_scored_keys(ctx, w) <= ATTN_MIXED_MAX_KEYS);
-        #[cfg(feature = "v41")]
         {
             // V4.1: ratio-1 layers make this a 1:1 context limit. `ctx` here is
             // the TEXT-only inverse while the cap carries the wider vision raw

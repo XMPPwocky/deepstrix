@@ -195,7 +195,6 @@ pub async fn chat_completions(
     // template puts every prompt slightly out of distribution, which costs
     // quality on tool paths and plausibly costs DSpark acceptance too -- the
     // drafter is predicting text it was trained to see in the other format.
-    #[cfg(feature = "v41")]
     let (tokens, image_order) = {
         // The 4-state effort carries the thinking flag; V4.1 wants a 1..=100
         // budget alongside it. An explicit integer in the request wins.
@@ -221,17 +220,6 @@ pub async fn chat_completions(
         )
         .map_err(|e| ApiError::BadRequest(format!("{e:#}")))?
     };
-    #[cfg(not(feature = "v41"))]
-    let image_order: Vec<usize> = (0..req.messages.iter().map(|m| m.images().count()).sum()).collect();
-    #[cfg(not(feature = "v41"))]
-    let tokens = render_prompt(
-        &engine.vocab,
-        &req.messages,
-        req.tools.as_deref(),
-        effort,
-        engine.image_placeholder_id,
-    )
-    .map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
     // Expand each placeholder into its synthetic image block (decode +
     // resize + layout; CPU-only, ~10-100 ms per image). Also validates the
     // image sources: http(s) URLs / bad base64 / denied paths → 400.

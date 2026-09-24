@@ -5,7 +5,6 @@
 pub mod dsml;
 pub mod embed;
 pub mod engine_worker;
-#[cfg(feature = "v41")]
 pub mod multistream;
 pub mod expert_stats;
 pub mod openai;
@@ -15,7 +14,6 @@ mod prompt_v41_templates;
 pub mod snapshot;
 pub mod tokens;
 pub mod vision_prompt;
-#[cfg(feature = "v41")]
 pub mod vision_v41;
 
 use color_eyre::eyre;

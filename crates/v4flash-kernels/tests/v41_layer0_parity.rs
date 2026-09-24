@@ -23,7 +23,6 @@
 //! Needs the V4-Flash server DOWN (decode scratch + state on the dGPU):
 //!   CARGO_TARGET_DIR=target-v41 cargo test --features v41 -p v4flash-kernels --release \
 //!       --test v41_layer0_parity -- --ignored --nocapture
-#![cfg(feature = "v41")]
 
 use std::collections::BTreeSet;
 

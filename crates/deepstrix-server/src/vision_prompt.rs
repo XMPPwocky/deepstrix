@@ -114,11 +114,8 @@ pub struct VlPrompt {
 /// The image-processor + span-layout parameters of the model this binary
 /// serves (compile-time model selection, see `docs/v41/ENGINE_PORT.md` §0).
 pub fn vision_cfg() -> &'static VisionCfg {
-    if cfg!(feature = "v41") {
-        &VisionCfg::V41
-    } else {
-        &VisionCfg::V4_FLASH
-    }
+    &VisionCfg::V41
+
 }
 
 // ------------------------------------------------------------ loading

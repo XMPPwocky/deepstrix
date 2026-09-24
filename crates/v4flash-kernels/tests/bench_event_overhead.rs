@@ -3,7 +3,6 @@
 //! (1020 dGPU pairs + 280 iGPU pairs, ms.stage `calls` / steps, 2026-09-21).
 //! HIP_VISIBLE_DEVICES=0,1 CARGO_TARGET_DIR=target-v41 nix develop -c cargo test --release \
 //!   --features v41 -p v4flash-kernels --test bench_event_overhead -- --ignored --nocapture
-#![cfg(feature = "v41")]
 use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer, Event, Stream};
 use v4flash_kernels::het::engine::DeviceEngine;

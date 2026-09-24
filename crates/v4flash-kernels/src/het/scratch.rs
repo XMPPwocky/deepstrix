@@ -259,7 +259,7 @@ impl DgpuScratch {
         // consumers agree on the layout; pack lives in the same struct.
         let d_selected = unsafe { sel_ew_pack.view_as::<i32>(0, N_EXPERT_USED) };
         let d_ew = unsafe { sel_ew_pack.view_as::<f32>(24, N_EXPERT_USED) };
-        let eg = |n: u32| -> usize { if cfg!(feature = "v41") { n as usize } else { 32 } };
+        let eg = |n: u32| -> usize { n as usize };
         Ok(Self {
             residual: DeviceBuffer::new(device_id, HC_DIM as usize)?,
             residual_next: DeviceBuffer::new(device_id, HC_DIM as usize)?,

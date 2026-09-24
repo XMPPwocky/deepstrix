@@ -29,7 +29,6 @@ impl HeterogeneousEngine {
     ///
     /// Q8_0 output only; anything else returns `Ok(false)` and the caller keeps
     /// the per-row path.
-    #[cfg(feature = "v41")]
     pub fn forward_head_batch(
         &self,
         scratch: &mut DgpuScratch,
@@ -119,45 +118,6 @@ impl HeterogeneousEngine {
         // checkpoint has no `output_hc_*`. V4-Flash instead derives the collapse
         // weights here from `output_hc_fn` + a sigmoid. Validated against the
         // reference by the layer-major HEAD gate (argmax 11111 at T=6).
-        #[cfg(not(feature = "v41"))]
-        {
-            let _t = de.events.stage("k.head.rms_nw", &de.compute)?;
-            de.rms_nw.launch(
-                &de.compute,
-                &mut scratch.head_flat,
-                &scratch.residual,
-                1,
-                HC_DIM,
-                RMS_EPS,
-            )?;
-        }
-        #[cfg(not(feature = "v41"))]
-        {
-            let _t = de.events.stage("k.head.hc_fn", &de.compute)?;
-            de.f16.matvec(
-                &de.compute,
-                &mut scratch.head_pre,
-                &weights.output_hc_fn.buffer,
-                &scratch.head_flat,
-                N_HC,
-                HC_DIM,
-            )?;
-        }
-        #[cfg(not(feature = "v41"))]
-        {
-            let _t = de.events.stage("k.head.sigmoid", &de.compute)?;
-            de.hc_sigmoid.launch(
-                &de.compute,
-                &mut scratch.head_w,
-                &scratch.head_pre,
-                &weights.output_hc_scale,
-                &weights.output_hc_base,
-                N_HC,
-            )?;
-        }
-        #[cfg(not(feature = "v41"))]
-        let collapse_w = &scratch.head_w;
-        #[cfg(feature = "v41")]
         let collapse_w = &scratch.hc_pre_carry;
         {
             let _t = de.events.stage("k.head.hc_weighted", &de.compute)?;

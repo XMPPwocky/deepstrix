@@ -16,7 +16,6 @@
 //!   cargo test -p v4flash-kernels --features v41 --test kv_rollback_compressor \
 //!     -- --ignored --nocapture
 
-#![cfg(feature = "v41")]
 
 use v4flash_hip::{install_panic_handler, Device};
 use v4flash_kernels::het::state::HetModelState;

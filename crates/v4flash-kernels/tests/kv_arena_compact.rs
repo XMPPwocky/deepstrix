@@ -3,7 +3,6 @@
 //! fits after compaction, and the surviving streams' comp rows / index keys are
 //! byte-identical at their new bases. Small arena: runs alongside a live server.
 //! `cargo test --release -p v4flash-kernels --features v41 --test kv_arena_compact -- --nocapture`
-#![cfg(feature = "v41")]
 
 use color_eyre::eyre;
 use v4flash_hip::{Device, DeviceBuffer, Stream};
