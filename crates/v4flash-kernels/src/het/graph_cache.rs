@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use v4flash_hip::{sys, GraphExec, Stream};
 
-pub type GraphKey = (&'static str, u32);
+pub type GraphKey = (&'static str, u64);
 
 #[derive(Default)]
 pub struct GraphCache {
@@ -50,12 +50,12 @@ impl GraphCache {
     /// On steady-state calls the mutex is held only long enough to
     /// `Arc::clone` the `GraphExec` out.
     /// The instantiated graph for `(stage, key)`, if captured already.
-    pub fn get(&self, stage: &'static str, key: u32) -> Option<Arc<GraphExec>> {
+    pub fn get(&self, stage: &'static str, key: u64) -> Option<Arc<GraphExec>> {
         self.entries.lock().unwrap().get(&(stage, key)).cloned()
     }
 
     /// Store a graph captured by the caller.
-    pub fn insert(&self, stage: &'static str, key: u32, exec: Arc<GraphExec>) {
+    pub fn insert(&self, stage: &'static str, key: u64, exec: Arc<GraphExec>) {
         self.entries.lock().unwrap().insert((stage, key), exec);
     }
 
@@ -73,7 +73,7 @@ impl GraphCache {
     where
         F: FnOnce(&Stream) -> eyre::Result<()>,
     {
-        let key: GraphKey = (stage, layer);
+        let key: GraphKey = (stage, layer as u64);
         let exec = {
             let mut entries = self.entries.lock().unwrap();
             if let Some(e) = entries.get(&key) {

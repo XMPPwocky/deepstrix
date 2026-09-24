@@ -190,6 +190,7 @@ async fn main() -> eyre::Result<()> {
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(args.hang_deadline_ms);
+    deepstrix_server::openai::handler::HANG_DEADLINE_MS.store(hang_deadline_ms, std::sync::atomic::Ordering::Relaxed);
     let watchdog_progress = engine.progress.clone();
     std::thread::Builder::new()
         .name("deepstrix-watchdog".into())

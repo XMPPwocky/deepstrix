@@ -21,7 +21,11 @@ last `b_seg` (<= 128) rows, from `seg_pos0 = pos0 + t - b_seg`. With a suffix
 first token and the next ~128 generated tokens. Hit nearly every agent turn
 (tool results, file contents) since #25 (2026-09-20); suspected cause of the
 intermittent looping reported at 170-180K context. Fix: empty the rings when
-`pos0 == 0 || t > b_seg`. Same review (read-only, 2 agents): mid-prefill
+`pos0 == 0 || t > b_seg`. **2026-09-24:** cc47607 fixed only `prefill_job_finish`;
+the duplicate CED replay inside `forward_prefill_pipelined` (serial
+`prefill_suffix`, reached by any launch without `V41_MULTISTREAM=1` or with
+DSpark on) still had `pos0 == 0` -- fixed the same way on branch
+`worktree-architecture-review`, not deployed. Same review (read-only, 2 agents): mid-prefill
 checkpoints saved never-updated decoder rings (now saved empty); a short or
 partial `index_k.bin` half-restored with another request's keys (now a cache
 miss; all 446 live snapshots were checked clean); a failed session-hint restore
