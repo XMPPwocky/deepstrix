@@ -577,3 +577,38 @@ Run each case through serial prefill, serial decode, multistream rows at S=1/2/4
 10. **Renames.** Is a workspace-wide rename acceptable (crates to `deepstrix-*`, `het/` to `engine/`, `mtp` to `drafter`, `--gguf` to `--model` with an alias)? It is behaviour-free but touches most of the tree and will conflict with any in-flight branches.
 11. **Lane ceiling.** Should `MAX_LANES` be 3, matching the multistream cap, or should the fabric be sized dynamically?
 12. **Scripts and journals.** Can the ~110 one-off analysis scripts and the dated docs leave `main` (for a `journal` branch or an external store), or do you want them kept in-tree under `docs/journal/` and `scripts/journal/`?
+---
+
+## 9. Progress log
+
+**2026-09-24 (branch `worktree-architecture-review`):**
+
+*Correctness fixes (§5 #1, #5, #6, #7, #10, #12 and the readyz/tool-image items).* All in `f79fe04`, deployed to both boxes at 01:17 UTC.
+
+*Owner decisions:* drop V4-Flash, drop non-paged V4.1, keep DSpark and integrate it cleanly.
+
+*Production launch checked in.* `deploy/` (`06bd689`). A dry run reproduces the live server's 33 env vars and its command line exactly.
+
+*V4-Flash removal:*
+- `86a2aeb`: the `v41` feature collapsed to always-on. Verified with an expanded-source diff; that diff caught and fixed one bad fold.
+- `e39e0c2`: non-paged mode and the dGPU hot tier removed (−1,482 lines).
+- `f0a73b3`: the V4 chat template, tool renderer, and their bins and tests removed.
+- `d03d089`: tests and bins that need V4 GGUFs or dumps removed, plus `crates/phase1` (−12,264 lines).
+- `b40174d`: the hash router removed.
+
+*Deferred.* These touch the prefill hot path or on-disk formats, so they should land behind the step-0 golden gate:
+- **V4-only quant kernel families:** IQ2_XXS/IQ2_S/IQ2_XS/IQ3_XXS/IQ3_S, Q2_K matvec (keep `q2_k_reduce_partials*`, which MXFP4 uses), Q5_K dense, `DenseGemmDp4a`, and the Q4_K/Q6_K arms in the *het* engine (Laguna keeps its own). The prefill MoE launch (`forward_prefill.rs` ~7040–7700) interleaves the IQ2/Q2_K variant selection with the live MXFP4 path, so it needs a careful restructure. Also delete their oracle and bench tests and `v4flash-core/src/iq3_s_ref.rs`.
+- **`ratio == 4` indexer-compressor:**
+  - the `CompKvStore::{Fp8, E2m1}` stores
+  - `CompKvFp8` and `CompressorStateShuffleR4`
+  - the matching `CompKvFormat` branches in `snapshot.rs` (keep the f16 format readable)
+  - `IndexerBitpack`
+  - `INDEXER_COMP_WIDTH`
+- **V4 bidirectional image window:** the server always passes `image_spans = None`. Remove `rows_visibility`/`raw_window`/`chunk_visibility`, the `vis` plumbing, the `IMAGE_RAW_WINDOW_MAX` sizing and the V4 `VISION_MAX_N_TOKEN = 384`. Keep `is_image_token`/`image_runs` (bias_vl).
+- **v4flash-vision:** collapse `VisionCfg` to V4.1 only. Remove the mmproj GGUF tower path (`Tower::load`, `MmprojHost::load*`), `LayoutKind::V4FlashInterleaved`, the V4 layout and preprocess defaults, and the V4-valued constants.
+- **Uncertain tests:** these test live kernels, but only against V4 CPU dumps (`attention_swa`, `compressor_pool`, `fp8_quantize`, `q8_k_quantize`, `rms_norm*`, `rope_tail`). Re-fixture them from the V4.1 golden corpus, then delete the V4 versions.
+- **Env knobs:** `DGPU_HOT_CAP` / `DGPU_HOT_CAP_PREFILL` / `IGPU_DEDUP_HOT` still feed the paged path's split cap. Rename them in the knob registry.
+- **Types:** `state.pager` is always `Some`. Make it non-`Option`.
+
+*Found during removal (not yet fixed):*
+- **DSpark drafter KV quantisation may be V4-style.** `het/mtp.rs:1085,1122` calls `Fp8E4m3fnQuantize::launch_kv_post_fused`. `forward_layer.rs` documents that this kernel bakes V4-Flash's window quantisation (E4M3 over the 448 non-RoPE dims, block 64), while V4.1 quantises the whole post-RoPE row at block 32. Check this before re-enabling DSpark.
