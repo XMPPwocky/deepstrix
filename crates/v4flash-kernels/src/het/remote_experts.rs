@@ -1314,15 +1314,30 @@ struct PfQueue {
 struct PfQueueInner {
     jobs: std::collections::VecDeque<PfJob>,
     /// Keys made urgent after a reader had already popped them: a reader that
-    /// is still yielding to demand reads stops yielding.
+    /// is still yielding stops yielding. Cleared when the key LANDS
+    /// (`admit_prefetched`), since urgency only means something while the key
+    /// is pending.
     urgent: std::collections::HashSet<(u32, u32)>,
+    /// Readers currently holding a speculative / a certain job.
+    running_spec: usize,
+    running_certain: usize,
+    /// At most this many speculative jobs run at once: the rest of the readers
+    /// (`V41_B2_PREFETCH_RESERVE`) are kept for certain ones.
+    max_spec: usize,
     closed: bool,
 }
 
 impl PfQueue {
-    fn new() -> Self {
+    fn new(max_spec: usize) -> Self {
         Self {
-            inner: std::sync::Mutex::new(PfQueueInner { jobs: Default::default(), urgent: Default::default(), closed: false }),
+            inner: std::sync::Mutex::new(PfQueueInner {
+                jobs: Default::default(),
+                urgent: Default::default(),
+                running_spec: 0,
+                running_certain: 0,
+                max_spec: max_spec.max(1),
+                closed: false,
+            }),
             cv: std::sync::Condvar::new(),
         }
     }
@@ -1342,25 +1357,35 @@ impl PfQueue {
     }
 
     /// A request needs `(layer, e)`, which is already pending: move its job up
-    /// to the urgent section, or, if a reader already has it, tell that reader
-    /// to stop yielding. Returns whether it was still queued.
+    /// to the urgent section, or, if a reader already has it (or it has been
+    /// read but not landed), mark it urgent so a yielding reader stops
+    /// yielding. Returns whether anything changed (a job that is already
+    /// certain is left alone).
     fn promote(&self, layer: u32, e: u32) -> bool {
         let mut g = self.inner.lock().unwrap();
-        match g.jobs.iter().position(|j| j.layer == layer && j.e == e) {
+        let changed = match g.jobs.iter().position(|j| j.layer == layer && j.e == e) {
+            Some(i) if g.jobs[i].certain => false,
             Some(i) => {
-                if !g.jobs[i].certain {
-                    let mut job = g.jobs.remove(i).expect("index from position");
-                    job.certain = true;
-                    let at = g.jobs.iter().position(|j| !j.certain).unwrap_or(g.jobs.len());
-                    g.jobs.insert(at, job);
-                }
+                let mut job = g.jobs.remove(i).expect("index from position");
+                job.certain = true;
+                let at = g.jobs.iter().position(|j| !j.certain).unwrap_or(g.jobs.len());
+                g.jobs.insert(at, job);
                 true
             }
-            None => {
-                g.urgent.insert((layer, e));
-                false
-            }
+            None => g.urgent.insert((layer, e)),
+        };
+        drop(g);
+        if changed {
+            self.cv.notify_all();
         }
+        changed
+    }
+
+    /// Is a certain job running or waiting? A speculative reader that has not
+    /// started its read yet keeps yielding while this holds.
+    fn certain_active(&self) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.running_certain > 0 || g.jobs.front().is_some_and(|j| j.certain)
     }
 
     fn is_urgent(&self, layer: u32, e: u32) -> bool {
@@ -1371,18 +1396,45 @@ impl PfQueue {
         self.inner.lock().unwrap().urgent.remove(&(layer, e));
     }
 
-    /// Blocks for the next job; `None` once closed.
+    /// Blocks for the next job the caller may run; `None` once closed and
+    /// drained. A certain job is always handed out. A speculative one only
+    /// while fewer than `max_spec` run and no certain job is running or
+    /// waiting, so the reserved readers, and the drives, are free for urgent
+    /// reads. The caller must call `finished` with the returned `certain`.
     fn pop(&self) -> Option<PfJob> {
         let mut g = self.inner.lock().unwrap();
         loop {
-            if let Some(j) = g.jobs.pop_front() {
+            if g.closed {
+                // Shutdown drains everything, ungated.
+                let j = g.jobs.pop_front()?;
+                if j.certain { g.running_certain += 1 } else { g.running_spec += 1 }
                 return Some(j);
             }
-            if g.closed {
-                return None;
+            match g.jobs.front() {
+                Some(j) if j.certain => {
+                    g.running_certain += 1;
+                    return g.jobs.pop_front();
+                }
+                Some(_) if g.running_spec < g.max_spec && g.running_certain == 0 => {
+                    g.running_spec += 1;
+                    return g.jobs.pop_front();
+                }
+                _ => {}
             }
             g = self.cv.wait(g).unwrap();
         }
+    }
+
+    /// A reader finished a job it popped as `certain` (or not).
+    fn finished(&self, certain: bool) {
+        let mut g = self.inner.lock().unwrap();
+        if certain {
+            g.running_certain = g.running_certain.saturating_sub(1);
+        } else {
+            g.running_spec = g.running_spec.saturating_sub(1);
+        }
+        drop(g);
+        self.cv.notify_all();
     }
 
     fn close(&self) {
@@ -1577,6 +1629,14 @@ fn b2_early_page() -> bool {
 
 fn b2_prefetch_par() -> usize {
     std::env::var("V41_B2_PREFETCH_PAR").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).clamp(1, 16)
+}
+
+/// `V41_B2_PREFETCH_RESERVE` (default 1): prefetch READERS kept for certain
+/// reads (a request's own picks); twice as many staging sets are kept free of
+/// speculative ones (look-ahead, substitution admissions), which are dropped
+/// instead. Clamped so at least one reader stays for speculative work.
+fn b2_prefetch_reserve() -> usize {
+    std::env::var("V41_B2_PREFETCH_RESERVE").ok().and_then(|v| v.parse().ok()).unwrap_or(1usize).min(8)
 }
 
 /// `V41_B2_PREFETCH_SETS`: staging sets = max prefetch reads in flight (default 8).
@@ -2316,7 +2376,8 @@ impl ExpertShard {
             if self.pf_stages_spare.is_empty() {
                 return;
             }
-            let queue = std::sync::Arc::new(PfQueue::new());
+            let n_par_q = b2_prefetch_par().min(self.pf_stages_spare.len().max(1));
+            let queue = std::sync::Arc::new(PfQueue::new(n_par_q.saturating_sub(b2_prefetch_reserve())));
             let (tx_done, rx_done) = std::sync::mpsc::channel::<Result<PfDone, (usize, u32, u32, String)>>();
             let stages = std::mem::take(&mut self.pf_stages_spare);
             let ptrs: Vec<SetPtr> = stages.iter().map(|st| SetPtr {
@@ -2344,14 +2405,13 @@ impl ExpertShard {
                         // request needs this very expert, in which case it IS the
                         // demand read.
                         let t = std::time::Instant::now();
-                        while DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) > 0
+                        while (DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) > 0 || queue_r.certain_active())
                             && t.elapsed() < std::time::Duration::from_millis(20)
                             && !queue_r.is_urgent(layer, e)
                         {
                             std::thread::sleep(std::time::Duration::from_micros(50));
                         }
                     }
-                    queue_r.clear_urgent(layer, e);
                     let sp = ptrs[set];
                     // SAFETY: the set is owned by this thread until `Done`, and
                     // `B2Prefetch::drop` joins this thread before its staging
@@ -2363,6 +2423,7 @@ impl ExpertShard {
                     let queue_ns = (t_read - t_hint).as_nanos() as u64;
                     let r = Self::read_miss_into(&owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2);
                     let read_ns = t_read.elapsed().as_nanos() as u64;
+                    queue_r.finished(certain);
                     let msg = match r {
                         Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, offs, coalesced, queue_ns, read_ns }),
                         Err(err) => Err((set, layer, e, format!("{err:#}"))),
@@ -2391,10 +2452,16 @@ impl ExpertShard {
                 // Already being fetched. If a request needs it now, make that
                 // read urgent rather than letting the request wait behind the
                 // speculative queue.
-                if certain {
-                    pf.queue.promote(key.0, key.1);
+                if certain && pf.queue.promote(key.0, key.1) {
                     pf.promoted += 1;
                 }
+                continue;
+            }
+            // Keep sets free for certain words: a speculative word that would
+            // take one of the last reserved sets is dropped (it is retried by
+            // whoever wants it next); a certain word may use any set.
+            if !certain && pf.free.len() <= 2 * b2_prefetch_reserve() {
+                pf.dropped += 1;
                 continue;
             }
             let Some(set) = pf.free.pop() else { pf.dropped += 1; continue };
@@ -2428,6 +2495,11 @@ impl ExpertShard {
         self.prefetch.as_ref().map(|p| (p.hinted, p.admitted, p.dropped, p.waited))
     }
 
+    /// Pending speculative reads made urgent because a request needed them.
+    pub fn prefetch_promoted(&self) -> u64 {
+        self.prefetch.as_ref().map_or(0, |p| p.promoted)
+    }
+
     /// Land every completed prefetch read into the pool (victim + repack), for
     /// any layer. Called at the top of `ensure_layer_inner`, where nothing
     /// reads the pool. `want` protects the current layer's picks from eviction.
@@ -2455,6 +2527,14 @@ impl ExpertShard {
         // every prefetched expert was blocked on. Folded into the layer's page
         // accounting below so "compute" means compute.
         let mut wait_ns = 0u64;
+        // About to block on this request's own picks: whatever of them is still
+        // pending as a speculative read becomes urgent, so the wait is one read,
+        // not the speculative queue ahead of it plus its yield.
+        for &e in want {
+            if pf.pending.contains(&(cur_layer, e)) && pf.queue.promote(cur_layer, e) {
+                pf.promoted += 1;
+            }
+        }
         loop {
             let must_wait = in_flight(pf);
             let t_w = must_wait.then(std::time::Instant::now);
@@ -2471,6 +2551,7 @@ impl ExpertShard {
                     if let Some(t) = t_w { wait_ns += t.elapsed().as_nanos() as u64; }
                     eprintln!("expertd: prefetch read failed (L{layer} e{e}): {msg}");
                     pf.pending.remove(&(layer, e));
+                    pf.queue.clear_urgent(layer, e);
                     pf.free.push(set);
                     continue;
                 }
@@ -2478,6 +2559,7 @@ impl ExpertShard {
             };
             let key = (d.layer, d.e);
             pf.pending.remove(&key);
+            pf.queue.clear_urgent(d.layer, d.e);
             if pool.slot_of.contains_key(&key) {
                 pf.free.push(d.set);
                 continue;
@@ -2512,16 +2594,18 @@ impl ExpertShard {
                 pool.held[ol as usize] -= 1;
                 if ol != cur_layer { pool.dirty[ol as usize] = true; }
             }
-            match (repack, repack_stream) {
-                (Some(rp), Some(rs)) => {
-                    Self::repack_in_place(rp, rs, r, victim, &pf.stages[d.set], &d.offs, d.coalesced)?;
-                }
-                _ => {
-                    for i in 0..3 {
-                        let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
-                        buf.slice_view_mut(victim as usize * bpe[i], bpe[i]).copy_from_host(&pf.stages[d.set][i].as_slice()[..bpe[i]])?;
-                    }
-                }
+            let landed: eyre::Result<()> = match (repack, repack_stream) {
+                (Some(rp), Some(rs)) => Self::repack_in_place(rp, rs, r, victim, &pf.stages[d.set], &d.offs, d.coalesced).map(|_| ()),
+                _ => (0..3).try_for_each(|i| {
+                    let buf = match i { 0 => &mut r.gate.buffer, 1 => &mut r.up.buffer, _ => &mut r.down.buffer };
+                    buf.slice_view_mut(victim as usize * bpe[i], bpe[i]).copy_from_host(&pf.stages[d.set][i].as_slice()[..bpe[i]])
+                }),
+            };
+            if let Err(err) = landed {
+                // The victim is already detached (free, unowned); give the set
+                // back rather than leak it, then report.
+                pf.free.push(d.set);
+                return Err(err);
             }
             pool.owner_of[victim as usize] = Some(key);
             pool.slot_of.insert(key, victim);
@@ -4783,7 +4867,7 @@ pub fn serve_connection(
                         if miss > 0 {
                             let (pread_ns, rcpu_ns, rgpu_ns) = shard.page_read_split();
                             let per = |ns: u64| ns as f64 / miss as f64 / 1e6;
-                            let pfs = shard.prefetch_stats().map(|(h, a, d, w)| format!(" prefetch hinted={h} admitted={a} dropped={d} waited={w} wait_ms={:.0}", shard.prefetch_wait_ns as f64 / 1e6)).unwrap_or_default();
+                            let pfs = shard.prefetch_stats().map(|(h, a, d, w)| format!(" prefetch hinted={h} admitted={a} dropped={d} waited={w} promoted={} wait_ms={:.0}", shard.prefetch_promoted(), shard.prefetch_wait_ns as f64 / 1e6)).unwrap_or_default();
                             // `pread` here is the PROCESS-WIDE read counter differenced
                             // around demand chunks, so concurrent prefetch reads inflate
                             // it; read `read` (per-miss wall) instead.
@@ -5809,6 +5893,56 @@ mod tests {
         let mut err = AlignedBuf::with_capacity(64);
         proto::encode_error(&mut err, 7, 9, "nope");
         assert_eq!(proto::decode_error(&err), (9, "nope".to_string()));
+    }
+
+    /// The box-2 prefetch readers' queue: certain jobs first, a speculative job
+    /// only within `max_spec` and never while a certain one runs or waits,
+    /// promotion of a queued job vs. urgency for a popped one, and `close`
+    /// draining everything before `None`.
+    #[test]
+    fn prefetch_queue_priority_and_reservation() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let job = |e: u32, certain: bool| PfJob { layer: 3, e, set: e as usize, certain, t_hint: Instant::now() };
+        let q = Arc::new(PfQueue::new(1));
+        q.push(job(1, false));
+        q.push(job(2, false));
+        q.push(job(3, true));
+        // Certain first.
+        let a = q.pop().unwrap();
+        assert_eq!((a.e, a.certain), (3, true));
+        // A speculative job may not start while a certain one runs.
+        let q2 = Arc::clone(&q);
+        let h = std::thread::spawn(move || q2.pop().map(|j| j.e));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!h.is_finished(), "speculative job handed out while a certain one runs");
+        q.finished(true);
+        assert_eq!(h.join().unwrap(), Some(1));
+        // max_spec = 1 and one speculative job runs: the next one waits...
+        let q3 = Arc::clone(&q);
+        let h = std::thread::spawn(move || q3.pop().map(|j| (j.e, j.certain)));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!h.is_finished(), "second speculative job exceeded max_spec");
+        // ...but a PROMOTED job is certain and goes at once.
+        assert!(q.promote(3, 2), "promote a queued speculative job");
+        assert_eq!(h.join().unwrap(), Some((2, true)));
+        assert!(!q.promote(3, 2) || q.is_urgent(3, 2), "promote of a popped job marks it urgent");
+        assert!(q.is_urgent(3, 2));
+        q.clear_urgent(3, 2);
+        assert!(!q.is_urgent(3, 2));
+        q.finished(true);
+        q.finished(false);
+        // Already-certain jobs are left alone.
+        q.push(job(7, true));
+        assert!(!q.promote(3, 7));
+        // Close drains remaining jobs, ungated, then None.
+        q.push(job(8, false));
+        q.push(job(9, false));
+        q.close();
+        let mut drained: Vec<u32> = std::iter::from_fn(|| q.pop().map(|j| j.e)).collect();
+        drained.sort();
+        assert_eq!(drained, vec![7, 8, 9]);
+        assert!(q.pop().is_none());
     }
 
     /// `REQ_FLAG_RESID`: the residency map rides behind the partial, flagged by
