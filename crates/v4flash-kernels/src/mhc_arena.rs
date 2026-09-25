@@ -125,6 +125,9 @@ impl MhcArena {
         {
             return Err(eyre!("mhc_arena ksplit: buffer too small for batch {batch}"));
         }
+        if scale.len() < 3 || base.len() < m || N_HC != 4 {
+            return Err(eyre!("mhc_arena ksplit: scale/base shape (n_hc must be 4)"));
+        }
         let function = self.module.get_function("mhc_mix_ksplit_batched")?;
         let cfg = LaunchConfig { grid: (HC_MIX_DIM * MIX_KSPLIT, 1, batch), block: (256, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(function, cfg, stream, [
