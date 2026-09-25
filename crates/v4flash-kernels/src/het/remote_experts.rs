@@ -195,18 +195,22 @@ pub fn b2_adapt_busy_poll(s: &TcpStream, reply_bytes: usize, base_us: u32) {
     static DECODE_US: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
         std::env::var("V41_B2_DECODE_BUSY_POLL_US").ok().and_then(|v| v.parse().ok()).unwrap_or(5000)
     });
-    static CUR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
     if *DECODE_US == 0 || base_us == 0 {
         return;
     }
     const ONE_SEGMENT: usize = 64 * 1024;
     let want = if reply_bytes <= ONE_SEGMENT { *DECODE_US } else { base_us };
-    if CUR.swap(want, std::sync::atomic::Ordering::Relaxed) != want {
+    if B2_SPIN_CUR.swap(want, std::sync::atomic::Ordering::Relaxed) != want {
         let _ = set_opt_i32(s, SOL_SOCKET, SO_BUSY_POLL, want as i32);
     }
 }
 
+/// The window `b2_adapt_busy_poll` last set. Reset by `apply_socket_options`,
+/// which puts a (new) connection's socket back at the base window.
+static B2_SPIN_CUR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
 pub fn apply_socket_options(s: &TcpStream, o: &SocketOptions) -> eyre::Result<()> {
+    B2_SPIN_CUR.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
     s.set_nodelay(true)?;
     if o.sndbuf > 0 && !set_opt_i32(s, SOL_SOCKET, SO_SNDBUF, o.sndbuf as i32) {
         eprintln!("remote_experts: SO_SNDBUF={} refused (net.core.wmem_max?)", o.sndbuf);
