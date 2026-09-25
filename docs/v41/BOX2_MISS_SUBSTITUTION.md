@@ -217,6 +217,17 @@ profile can show `box2.subs_per_step` next to `box2.page_ms`.
    local reference computed with the *rewritten* `sel`. The bench needs the plan
    echoed back for that (debug flag).
 5. Every determinism gate runs with `sub=0`, and says so.
+7. **Never under the fidelity pin.** The golden gate's routing pin
+   (`het::fidelity_tap::pin_device_rows`, branch `worktree-architecture-review`)
+   rewrites rows to the CPU reference's picks right after the router launch in
+   `pre_moe_chain`. Box-1 substitution runs later (`pre_moe_route`, after the
+   readback), so it is ordered after the pin. It must also be skipped entirely
+   when `fidelity_tap::pin_on()`. Otherwise the pinned gate hard-fails reading
+   a substitution as "pin did not hold".
+8. **Renormalize by dividing.** With `c = 1 - w_j/1.5 + alt_w/1.5` (= S'/S),
+   every kept weight becomes `w_i / c` and the substitute gets `alt_w / c`.
+   Clamp `c` so S' stays at or above `ROUTER_WEIGHT_EPS` (the kernel's own floor
+   on S). It never binds in practice.
 6. **Substituted KV must not outlive its turn.** Today it cannot. The multistream
    path snapshots only at the prompt end (`multistream.rs:657-669`, at
    `<｜Assistant｜>`), `finish()` just releases the slot (turn-end snapshots are
