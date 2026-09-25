@@ -22,29 +22,42 @@ export V41_MODEL=${V41_MODEL:-/weights2/dsv4.1f}
 export OMP_NUM_THREADS=12 MKL_NUM_THREADS=12 PYTHONUNBUFFERED=1  # live per-layer progress in oracle.log
 MEM_FLOOR_KB=${MEM_FLOOR_KB:-3000000}
 CPUS=${CPUS:-0-5,16-21}
+# Expert round-trip caches (build_rt_cache.py): on nvme0 (the encrypted root), while
+# the checkpoint the builder reads is on nvme1 (/weights2).
+RT_ROOT=${RT_ROOT:-$HOME/rt-cache}
+HOT=${HOT:-$HOME/b1_hotset_proxy.json}
 mkdir -p "$OUT_ROOT"
+
+# guarded NAME LOG CMD...: run CMD in the background under the safety rules above
+# (oom_score_adj 1000, nice 19, the pinned CPUs, the MemAvailable watchdog), appending
+# to LOG; returns CMD's exit status.
+guarded() {
+  local name=$1 log=$2; shift 2
+  (
+    echo 1000 > /proc/self/oom_score_adj
+    exec nice -n 19 taskset -c "$CPUS" "$@"
+  ) >> "$log" 2>&1 &
+  local pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    avail=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+    if [ "$avail" -lt "$MEM_FLOOR_KB" ]; then
+      echo "[$(date -u +%T)] $name: MemAvailable ${avail} kB < floor; killing it to protect expertd"
+      kill -TERM "$pid"; sleep 5; kill -KILL "$pid" 2>/dev/null
+      return 1
+    fi
+    sleep 5
+  done
+  wait "$pid"
+}
 
 run_case() {
   local name=$1; shift
   local out="$OUT_ROOT/$name"
   if [ -f "$out/manifest.json" ]; then echo "[$(date -u +%T)] $name: already complete, skipping"; return 0; fi
   mkdir -p "$out"
+  : > "$out/oracle.log"
   echo "[$(date -u +%T)] $name: start ($*)"
-  (
-    echo 1000 > /proc/self/oom_score_adj
-    exec nice -n 19 taskset -c "$CPUS" "$PY" "$HERE/oracle.py" --golden --out "$out" "$@"
-  ) > "$out/oracle.log" 2>&1 &
-  local pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
-    avail=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
-    if [ "$avail" -lt "$MEM_FLOOR_KB" ]; then
-      echo "[$(date -u +%T)] $name: MemAvailable ${avail} kB < floor; killing oracle to protect expertd"
-      kill -TERM "$pid"; sleep 5; kill -KILL "$pid" 2>/dev/null
-      return 1
-    fi
-    sleep 5
-  done
-  wait "$pid"; local rc=$?
+  guarded "$name" "$out/oracle.log" "$PY" "$HERE/oracle.py" --golden --out "$out" "$@"; local rc=$?
   echo "[$(date -u +%T)] $name: exit $rc"
   return $rc
 }
@@ -107,6 +120,40 @@ for c in "$@"; do
       # name keeps reproducing its numbers bit for bit (a new case wanting exact fractions
       # appends --swap-rand-dtype float32 to its extra, which wins as the later flag).
       run_case "policy_$pol" --no-layer-dumps --swap-rand-dtype bfloat16 "${extra[@]}" --swap-positions "$posf" \
+        --prompt-ids "$(tr -d '[] \n' < "$HERE/agentic_tokens.json")" ;;
+    # Expert-weight round trips (IQ2 study), agentic transcript, teacher-forced over the WHOLE
+    # transcript (a weight format touches prefill as well as decode):
+    #   build:DIR:TYPE:COVER:IMX  pre-quantize into $RT_ROOT/DIR; COVER all|cold (outside $HOT),
+    #                             IMX none|imx (the in-sample imatrix from quant:imxcap); resumable.
+    #                             A failed build stops the series.
+    #   quant:imxcap  reference pass that captures the in-sample imatrix (logits must equal agentic's)
+    #   quant:v1a     IQ2_XXS, box-2-cold experts only, no imatrix
+    #   quant:v1b     IQ2_XXS, box-2-cold experts only, in-sample imatrix
+    #   quant:v0      Q8_0 for every expert (the "perturb every expert slightly" scale reference)
+    #   quant:v2b     IQ2_XXS for every expert, in-sample imatrix
+    #   quant:v3b     IQ2_S for every expert, in-sample imatrix
+    build:*)
+      IFS=: read -r _ dir typ cov imx <<< "$c"
+      [ "$cov" = cold ] && cov=$HOT
+      [ "$imx" = imx ] && imx=$OUT_ROOT/imatrix_agentic.pt
+      mkdir -p "$RT_ROOT/$dir"
+      echo "[$(date -u +%T)] build $dir ($typ cover=$cov imatrix=$imx): start"
+      guarded "build_$dir" "$RT_ROOT/$dir/build.log" "$PY" "$HERE/build_rt_cache.py" \
+        --type "$typ" --cover "$cov" --imatrix "$imx" --out "$RT_ROOT/$dir" --procs 12; rc=$?
+      echo "[$(date -u +%T)] build $dir: exit $rc"
+      [ "$rc" = 0 ] || { echo "[$(date -u +%T)] stopping: build $dir failed"; exit 1; } ;;
+    quant:*)
+      q=${c#quant:}
+      case $q in
+        imxcap) extra=(--imatrix-capture "$OUT_ROOT/imatrix_agentic.pt") ;;
+        v1a) extra=(--expert-rt "cache:$RT_ROOT/iq2xxs_uniform" --expert-rt-cover "$HOT") ;;
+        v1b) extra=(--expert-rt "cache:$RT_ROOT/iq2xxs_imx" --expert-rt-cover "$HOT") ;;
+        v0)  extra=(--expert-rt q8_0) ;;
+        v2b) extra=(--expert-rt "cache:$RT_ROOT/iq2xxs_imx") ;;
+        v3b) extra=(--expert-rt "cache:$RT_ROOT/iq2s_imx") ;;
+        *) echo "unknown quant case $q"; exit 2 ;;
+      esac
+      run_case "quant_$q" --no-layer-dumps "${extra[@]}" \
         --prompt-ids "$(tr -d '[] \n' < "$HERE/agentic_tokens.json")" ;;
     *) echo "unknown case $c"; exit 2 ;;
   esac || { echo "[$(date -u +%T)] stopping after $c failed"; exit 1; }
