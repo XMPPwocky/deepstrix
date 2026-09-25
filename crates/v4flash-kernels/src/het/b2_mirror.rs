@@ -65,8 +65,10 @@
 //! (`begin_step`, called first by every arena decode driver) for N steps. Not
 //! in the same step: the other lane may route this layer after the mark --
 //! under the ready-first driver even after this lane's reply is consumed --
-//! and must not ride on a read queued a moment ago. By the next step every
-//! request of this one has been answered, so the word has reached box 2. If
+//! and must not ride on a read queued a moment ago. The word leaves on this
+//! lane's next submit, at the latest the first one of the next step, and box 2
+//! handles a request's words before its picks. Any prefill pass ends every
+//! mark (`expire_incoming`): a chunk churns box 2's pool. If
 //! the read has not landed when a request needs it, box 2 promotes it and
 //! waits (`ensure`'s in-flight wait): at most one read, already queued, never a
 //! second. A mark is NOT cleared when a reply shows the expert held: under
@@ -264,6 +266,15 @@ pub fn incoming_steps() -> u32 {
 /// driver calls this first; a path that never does leaves marks inactive.
 pub fn begin_step() {
     STEP.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A prefill-shaped pass begins (every prefill entry calls this after
+/// switching the link to batch phase): end every live mark. A chunk pulls ~100
+/// experts per layer through box 2's pool, so what was on its way before it is
+/// likely evicted after. `+ N + 1`: a mark made at step s (`from = s + 1`) is
+/// then at least N steps old.
+pub fn expire_incoming() {
+    STEP.fetch_add(incoming_steps() + 1, Ordering::Relaxed);
 }
 
 /// Admissions `(layer << 16) | e` were just queued for box 2: count them as
@@ -941,6 +952,9 @@ mod tests {
         assert_eq!(lookup(l as i32, 8), Some(Residency { held: true, pending: false, incoming: true }));
         update(l, &empty);
         assert_eq!(resident(l as i32, 8), Some(true), "still covered by its mark");
+        // A prefill pass ends it at once.
+        expire_incoming();
+        assert_eq!(resident(l as i32, 8), Some(false), "expired by prefill");
 
         // Covered picks: distinct, box 2's only, in-window marks only.
         note_incoming(&[(l << 16) | 10]);

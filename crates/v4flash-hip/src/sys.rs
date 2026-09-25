@@ -26,6 +26,8 @@ pub const HIP_SUCCESS: hipError_t = 0;
 // Stream priorities: smaller = higher priority. Phase 0 will check
 // hipDeviceGetStreamPriorityRange to learn actual bounds.
 pub const HIP_STREAM_DEFAULT: c_uint = 0;
+/// `hipStreamNonBlocking`: the stream does not synchronize with the null stream.
+pub const HIP_STREAM_NON_BLOCKING: c_uint = 1;
 
 // Event creation flags
 pub const HIP_EVENT_DEFAULT: c_uint = 0;
@@ -264,6 +266,7 @@ unsafe extern "C" {
     ) -> hipError_t;
 
     pub fn hipStreamCreate(stream: *mut hipStream_t) -> hipError_t;
+    pub fn hipStreamCreateWithFlags(stream: *mut hipStream_t, flags: c_uint) -> hipError_t;
     pub fn hipStreamCreateWithPriority(
         stream: *mut hipStream_t,
         flags: c_uint,

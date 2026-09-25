@@ -575,6 +575,7 @@ impl HeterogeneousEngine {
             return Ok(0);
         }
         self.remote_set_phase_busy_poll(false);
+        super::b2_mirror::expire_incoming();
         let lane_caps = (bd_a.rows, bd_b.rows);
         let chunk_size = job.chunk_rows.min(lane_caps.0 + lane_caps.1);
         let split = crate::config::CED_DECODER_START;
@@ -961,6 +962,7 @@ impl HeterogeneousEngine {
         mut pager: Option<&mut super::expert_pager::ExpertPager>,
     ) -> eyre::Result<()> {
         self.remote_set_phase_busy_poll(false);
+        super::b2_mirror::expire_incoming();
         let b = tokens.len();
         if b == 0 {
             return Ok(());
@@ -1079,6 +1081,7 @@ impl HeterogeneousEngine {
         engram_rows: Option<&[Vec<f32>]>,
     ) -> eyre::Result<()> {
         self.remote_set_phase_busy_poll(false);
+        super::b2_mirror::expire_incoming();
         self.forward_prompt_batch_v2_pipelined_range(
             bd_a, bi_a, bd_b, bi_b, sd, si, state, weights, input_hcs, tokens, pos0, stats,
             image_spans, pager, engram_rows, 0..N_LAYER as usize, CedMode::Exact, None,
@@ -1124,6 +1127,7 @@ impl HeterogeneousEngine {
         seed_carry: Option<&[Vec<f32>]>,
     ) -> eyre::Result<usize> {
         self.remote_set_phase_busy_poll(false);
+        super::b2_mirror::expire_incoming();
         // Same repair as `forward_token_impl`: the steady-state loop below lends
         // each KV-source layer's compressor to its reuse layer and hands it back
         // at the bottom of the iteration, and any `?` in between leaks it.
@@ -1509,6 +1513,7 @@ impl HeterogeneousEngine {
         mut pager: Option<&mut super::expert_pager::ExpertPager>,
     ) -> eyre::Result<Vec<f32>> {
         self.remote_set_phase_busy_poll(false);
+        super::b2_mirror::expire_incoming();
         let t = tokens.len();
         if t == 0 {
             return Ok(Vec::new());
@@ -1859,6 +1864,7 @@ impl HeterogeneousEngine {
         engram_rows: Option<&[Vec<f32>]>,
     ) -> eyre::Result<Vec<f32>> {
         self.remote_set_phase_busy_poll(false);
+        super::b2_mirror::expire_incoming();
         let t = tokens.len();
         if t == 0 {
             return Ok(Vec::new());
@@ -6430,51 +6436,78 @@ impl HeterogeneousEngine {
                 // ms/step of turnaround at 7-8 rows (profile audit 2026-09-21).
                 let mc0 = if layer_miss_hist() { pg.counters().prefill_misses } else { 0 };
                 let n_sel = (b as usize) * cs_n_used;
-                let mut sel_host = vec![0i32; n_sel];
                 let _t_sync = LayerHostTimer::start(&LH_SEL_SYNC);
                 // Wait on the ROUTER-DONE EVENT, not the stream: the other lane's
                 // whole chain may sit behind ours on `de.compute` by now.
                 sev.selected_ready.synchronize()?;
                 drop(_t_sync);
-                // `selected_ready` is already satisfied above, so our own
-                // dependency is met: anything this blocking copy still waits for
-                // is OTHER queued work (the copy is on the null stream, which
-                // implicitly syncs with every blocking stream). Probe says which.
+                // ROUTER READBACK (2026-09-25). Everything the host needs from
+                // this lane's router -- picks, look-ahead picks, alternatives, the
+                // prior's original picks and ranges, the weights, and box 2's `xq`
+                // (quantized on the chain right after the router, so also covered
+                // by `selected_ready`) -- in ONE batch of async copies on the
+                // lane's NON-blocking `rb_stream`, behind `selected_ready` only.
+                // These were blocking `hipMemcpy`s on the null stream, which waits
+                // for every blocking stream, i.e. for the OTHER lane's whole chain
+                // queued on `de.compute` (probe at 4 rows: dGPU still busy in 48
+                // of 80 lane-layers, 36.7 ms/step). The probe stays: it now counts
+                // work we no longer wait for.
                 probe_stream_busy(&self.dgpu.compute, &LH_SEL_D2H_BUSY, &LH_SEL_D2H_IDLE);
                 let _t_d2h = LayerHostTimer::start(&LH_SEL_D2H);
-                bd.d_selected
-                    .slice_view(0, n_sel)
-                    .copy_to_host(&mut sel_host)?;
-                let mut look_host: Vec<i32> = Vec::new();
-                if look_next.is_some() {
-                    look_host = vec![0i32; n_sel];
-                    sd.look_sel.slice_view(0, n_sel).copy_to_host(&mut look_host)?;
-                }
-                let mut look_host2: Vec<i32> = Vec::new();
-                if look_next2.is_some() {
-                    look_host2 = vec![0i32; n_sel];
-                    sd.look_sel2.slice_view(0, n_sel).copy_to_host(&mut look_host2)?;
-                }
-                // Ranks 7..6+n_alt per row, same sync (a few bytes).
                 let na = n_alt as usize;
-                let mut alts_host: Vec<i32> = Vec::new();
-                let mut alt_w_host: Vec<f32> = Vec::new();
-                if na > 0 {
-                    alts_host = vec![0i32; (b as usize) * na];
-                    bd.d_alts.slice_view(0, alts_host.len()).copy_to_host(&mut alts_host)?;
-                    alt_w_host = vec![0f32; (b as usize) * na];
-                    bd.d_alt_w.slice_view(0, alt_w_host.len()).copy_to_host(&mut alt_w_host)?;
+                let nb = b as usize;
+                let xq_bytes_rb = nb * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES;
+                let want_xq = remote_split_on && self.remote.is_some() && bd.remote_xq_lane.is_some() && bd.rb_u8.is_some();
+                // Staging offsets: i32 [sel | look | look2 | alts | orig],
+                // f32 [alt_w | range | ew].
+                let (o_look, o_look2, o_alts) = (n_sel, 2 * n_sel, 3 * n_sel);
+                let o_orig = o_alts + nb * na;
+                let (o_range, o_ew) = (nb * na, nb * na + nb);
+                {
+                    let rs = &bd.rb_stream;
+                    rs.wait_event(&sev.selected_ready)?;
+                    bd.d_selected.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, 0, rs)?;
+                    if look_next.is_some() {
+                        sd.look_sel.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, o_look, rs)?;
+                    }
+                    if look_next2.is_some() {
+                        sd.look_sel2.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, o_look2, rs)?;
+                    }
+                    if na > 0 {
+                        bd.d_alts.slice_view(0, nb * na).copy_to_pinned_async(&mut bd.rb_i32, o_alts, rs)?;
+                        bd.d_alt_w.slice_view(0, nb * na).copy_to_pinned_async(&mut bd.rb_f32, 0, rs)?;
+                    }
+                    if sub3 {
+                        bd.d_orig_sel.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, o_orig, rs)?;
+                        bd.d_range.slice_view(0, nb).copy_to_pinned_async(&mut bd.rb_f32, o_range, rs)?;
+                    }
+                    bd.d_ew.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_f32, o_ew, rs)?;
+                    if want_xq {
+                        if let (Some(xq_dev), Some(pin)) = (bd.remote_xq_lane.as_ref(), bd.rb_u8.as_mut()) {
+                            xq_dev.slice_view(0, xq_bytes_rb).copy_to_pinned_async(pin, 0, rs)?;
+                        }
+                    }
+                    rs.synchronize()?;
                 }
+                let (ri, rf) = (bd.rb_i32.as_slice(), bd.rb_f32.as_slice());
+                let mut sel_host: Vec<i32> = ri[..n_sel].to_vec();
+                let look_host: Vec<i32> = if look_next.is_some() { ri[o_look..o_look + n_sel].to_vec() } else { Vec::new() };
+                let look_host2: Vec<i32> = if look_next2.is_some() { ri[o_look2..o_look2 + n_sel].to_vec() } else { Vec::new() };
+                // Ranks 7..6+n_alt per row.
+                let (alts_host, alt_w_host): (Vec<i32>, Vec<f32>) = if na > 0 {
+                    (ri[o_alts..o_alts + nb * na].to_vec(), rf[..nb * na].to_vec())
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 // Cache-prior (`V41_SUB=3`): the picks without the prior, and the
                 // score ranges that feed the layer's running Delta.
-                let mut orig_host: Vec<i32> = Vec::new();
+                let orig_host: Vec<i32> = if sub3 { ri[o_orig..o_orig + n_sel].to_vec() } else { Vec::new() };
                 if sub3 {
-                    orig_host = vec![0i32; n_sel];
-                    bd.d_orig_sel.slice_view(0, n_sel).copy_to_host(&mut orig_host)?;
-                    let mut range_host = vec![0f32; b as usize];
-                    bd.d_range.slice_view(0, b as usize).copy_to_host(&mut range_host)?;
-                    super::b2_mirror::observe_range(layer, &range_host);
+                    super::b2_mirror::observe_range(layer, &rf[o_range..o_range + nb]);
                 }
+                let ew_read: Vec<f32> = rf[o_ew..o_ew + n_sel].to_vec();
+                let mut xq_read: Option<Vec<u8>> =
+                    if want_xq { bd.rb_u8.as_ref().map(|p| p.as_slice()[..xq_bytes_rb].to_vec()) } else { None };
                 drop(_t_d2h);
                 if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} A after readback"); }
                 // BOX-2 MISS SUBSTITUTION (`V41_SUB`, het::b2_mirror,
@@ -6492,20 +6525,9 @@ impl HeterogeneousEngine {
                         && super::b2_mirror::resident(layer, e as u32) == Some(false)
                 };
                 let any_predicted = sub_on && sel_host.iter().any(|&e| predicted_miss(e));
-                // The router weights, read at most once per lane-layer: for the
-                // trace, the substitution, and the box-2 submit below (which would
-                // otherwise read them again).
-                let mut ew_pre: Option<Vec<f32>> = None;
-                if any_predicted || (trace_on && na > 0) {
-                    let _t_sub = LayerHostTimer::start(&LH_SUB);
-                    // Uncached bind: the pager may have switched devices behind the
-                    // engine's cache (see the box-2 submit below).
-                    self.dgpu.device.set_current()?;
-                    self.current_device.store(self.dgpu.device.id, std::sync::atomic::Ordering::Relaxed);
-                    let mut w = vec![0f32; n_sel];
-                    bd.d_ew.slice_view(0, n_sel).copy_to_host(&mut w)?;
-                    ew_pre = Some(w);
-                }
+                // The router weights, from the readback batch above: for the
+                // trace, the substitution, and the box-2 submit below.
+                let mut ew_pre: Option<Vec<f32>> = Some(ew_read);
                 if trace_on {
                     for r in 0..b as usize {
                         let row = &sel_host[r * cs_n_used..(r + 1) * cs_n_used];
@@ -7056,12 +7078,18 @@ impl HeterogeneousEngine {
                         // Same kernel the iGPU would use, so the bytes match by
                         // construction rather than by agreement.
                         // xq was quantised on the chain right after the router and is
-                        // covered by `selected_ready`, already waited on above: D2H only.
+                        // covered by `selected_ready`: read in the readback batch above.
                         let _t_rsync = LayerHostTimer::start(&LH_REMOTE_SYNC);
-                        let mut xq_host = vec![0u8; xq_bytes];
-                        xq_dev.slice_view(0, xq_bytes).copy_to_host(&mut xq_host)?;
-                        // Read once above when the trace or the substitution needed it
-                        // (and then already rewritten); otherwise read it now.
+                        let xq_host = match xq_read.take() {
+                            Some(x) => x,
+                            None => {
+                                let mut x = vec![0u8; xq_bytes];
+                                xq_dev.slice_view(0, xq_bytes).copy_to_host(&mut x)?;
+                                x
+                            }
+                        };
+                        // From the readback batch (and rewritten by a mode-2
+                        // substitution); the fallback read is for safety only.
                         let ew_host = match ew_pre.take() {
                             Some(w) => w,
                             None => {

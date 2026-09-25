@@ -323,6 +323,20 @@ pub struct BatchDgpuScratch {
     pub d_orig_sel: DeviceBuffer<i32>,
     /// `[B]` each row's selection-score range (max - min).
     pub d_range: DeviceBuffer<f32>,
+    /// ROUTER READBACK (2026-09-25): everything the host reads after this
+    /// lane's router -- picks, look-ahead picks, alternatives, the prior's
+    /// original picks, ranges, weights, box 2's `xq` -- goes as ONE batch of
+    /// async copies on this NON-blocking stream, behind this lane's
+    /// `selected_ready` only. A blocking `hipMemcpy` runs on the null stream,
+    /// which waits for every blocking stream: for the other lane's whole chain
+    /// queued on `de.compute`.
+    pub rb_stream: v4flash_hip::Stream,
+    /// Pinned staging for the batch: i32 `[sel | look | look2 | alts | orig]`,
+    /// f32 `[alt_w | range | ew]` (offsets per call, from the call's `b`), u8
+    /// = `xq` (only with a box 2).
+    pub rb_i32: v4flash_hip::PinnedBuffer<i32>,
+    pub rb_f32: v4flash_hip::PinnedBuffer<f32>,
+    pub rb_u8: Option<v4flash_hip::PinnedBuffer<u8>>,
 
     // ---- Shared expert output ----
     /// `[B, N_EMBD]` — P10 output, read by P12 `vec_add`.
@@ -1189,6 +1203,20 @@ impl BatchDgpuScratch {
             prior_pin: v4flash_hip::PinnedBuffer::new(crate::config::N_LAYER as usize * N_EXPERT as usize)?,
             d_orig_sel: mk_i32(N_EXPERT_USED)?,
             d_range: mk_f32(1)?,
+            rb_stream: v4flash_hip::Stream::new_non_blocking(id)?,
+            rb_i32: v4flash_hip::PinnedBuffer::new(
+                b * (4 * N_EXPERT_USED + crate::router_topk::ROUTER_MAX_ALT as usize),
+            )?,
+            rb_f32: v4flash_hip::PinnedBuffer::new(
+                b * (crate::router_topk::ROUTER_MAX_ALT as usize + 1 + N_EXPERT_USED),
+            )?,
+            rb_u8: if std::env::var("V41_REMOTE_ADDR").is_ok() {
+                Some(v4flash_hip::PinnedBuffer::new(
+                    b * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES,
+                )?)
+            } else {
+                None
+            },
             ffn_shared: mk_f32(N_EMBD as usize)?,
             ffn_moe_recv: mk_f32(N_EMBD as usize)?,
             pos_per_b: mk_i32(1)?,

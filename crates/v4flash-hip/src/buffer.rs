@@ -255,6 +255,38 @@ impl<T> DeviceBuffer<T> {
         )
     }
 
+    /// Async device-to-host copy of the whole view into `dst[dst_offset..]`,
+    /// queued on `stream`. `dst` holds the bytes only once `stream` has been
+    /// synchronized (or an event recorded after this copy has); reading it
+    /// earlier races the DMA.
+    pub fn copy_to_pinned_async(
+        &self,
+        dst: &mut PinnedBuffer<T>,
+        dst_offset: usize,
+        stream: &Stream,
+    ) -> eyre::Result<()> {
+        if dst_offset.checked_add(self.len).is_none_or(|end| end > dst.len()) {
+            return Err(eyre!(
+                "copy_to_pinned_async out of range: offset={} len={} dst={}",
+                dst_offset,
+                self.len,
+                dst.len()
+            ));
+        }
+        check_eyre(
+            unsafe {
+                sys::hipMemcpyAsync(
+                    dst.as_mut_slice().as_mut_ptr().add(dst_offset) as sys::hipDeviceptr_t,
+                    self.raw,
+                    self.byte_len(),
+                    sys::HIP_MEMCPY_DEVICE_TO_HOST,
+                    stream.raw(),
+                )
+            },
+            "hipMemcpyAsync(DtoH)",
+        )
+    }
+
     /// Async device-to-device copy on the SAME device, queued on
     /// `stream`. Returns immediately; the copy completes when prior
     /// work on `stream` completes. Used by the spec-decode snapshot

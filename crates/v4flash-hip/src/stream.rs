@@ -25,6 +25,20 @@ impl Stream {
         Ok(Stream { raw, device_id })
     }
 
+    /// A stream that does NOT synchronize with the null stream
+    /// (`hipStreamNonBlocking`). A blocking `hipMemcpy` runs on the null stream,
+    /// which waits for every blocking stream on the device; work queued here is
+    /// ordered only by this stream and the events it waits on.
+    pub fn new_non_blocking(device_id: i32) -> eyre::Result<Self> {
+        let mut raw: sys::hipStream_t = ptr::null_mut();
+        let _guard = crate::device::Device::scoped(device_id)?;
+        check_eyre(
+            unsafe { sys::hipStreamCreateWithFlags(&mut raw, sys::HIP_STREAM_NON_BLOCKING) },
+            "hipStreamCreateWithFlags",
+        )?;
+        Ok(Stream { raw, device_id })
+    }
+
     pub fn new_with_priority(device_id: i32, priority: i32) -> eyre::Result<Self> {
         let mut raw: sys::hipStream_t = ptr::null_mut();
         let _guard = crate::device::Device::scoped(device_id)?;

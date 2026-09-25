@@ -168,8 +168,9 @@ The box-2-side policy below stays as the fallback for mirror errors.
   where state is one char per pick then alternative: box 2's mirror R held /
   I a queued background read covers it (incoming overlay, below; counts as
   resident, so it wins over P) / P in a sent, unanswered request / M missing /
-  ? not reported yet, box 1's pager r/m. Plus `S <layer> <b> <row> <rank> <from> <to> <w_from> <w_to>` per
-  swap, and `s` (same fields) per swap the DRY RUN would have made. Enough to
+  ? not reported yet, box 1's pager r/m. Plus
+  `S <layer> <b> <row> <rank> <from> <to> <w_from> <w_to>` per swap, and `s`
+  (same fields) per swap the DRY RUN would have made. Enough to
   replay any gate (rank, weight cap) offline. `P` is recorded even with
   `V41_SUB_PENDING=0`, so a replay must apply that knob itself.
 - **Pending overlay vs box-2 PARK.** The overlay assumes box 2 serves a layer's
@@ -197,6 +198,10 @@ The box-2-side policy below stays as the fallback for mirror errors.
     (`ensure`'s in-flight wait): one read already queued, never a second.
   - A mark is not cleared when a reply shows the expert held, because under
     PARK an older map can be consumed after a newer one.
+  - Any prefill pass ends every mark (`expire_incoming`, called at each
+    prefill entry): a chunk pulls ~100 experts per layer through box 2's pool.
+  - The word leaves on the lane's next submit, at the latest the first one of
+    the next step; box 2 handles a request's words before its picks.
   - A stale mark costs at most one demand read within its window (an eviction
     inside the window, or a word box 2 dropped: its speculative queue drops
     words when at most 2x the reserve of staging sets is free, and ignores
