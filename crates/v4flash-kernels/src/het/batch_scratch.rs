@@ -398,6 +398,10 @@ pub struct BatchDgpuScratch {
     /// is the question that distinguishes a dead write from a write that lands
     /// somewhere the final logits never read.
     pub remote_ffn_moe_layer: i32,
+    /// `V41_MS_MHC_SPLIT`: this lane's pre-FFN mixes were queued on `de.hc`
+    /// this layer; the FFN combine must wait `hc_mixes_ffn` before `hc_post`
+    /// reads `split`.
+    pub mhc_ffn_split_pending: bool,
     /// Request in flight on the remote shard for this lane's layer.
     ///
     /// Submitted in pre-MoE and awaited in POST-MoE, so box 2 computes its half
@@ -1236,6 +1240,7 @@ impl BatchDgpuScratch {
             },
             remote_ffn_moe_valid: false,
             remote_ffn_moe_layer: -1,
+            mhc_ffn_split_pending: false,
             remote_ticket: None,
         })
     }

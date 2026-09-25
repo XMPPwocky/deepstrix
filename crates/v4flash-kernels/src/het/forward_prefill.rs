@@ -749,6 +749,22 @@ pub fn lookahead_topk() -> usize {
     *B
 }
 
+/// `V41_MS_MHC_SPLIT=1` (default OFF until A/B'd live): arena decode runs each
+/// sub-block's mHC MIXES (rms inv / matvec / Sinkhorn -> `split`) on the side
+/// stream `de.hc`, off the critical path. V4.1 collapses with the PREVIOUS
+/// sub-block's `pre` (the carry), so the collapse -> rms_w -> attention (or ->
+/// router/MoE) never waits for them; `split` is first read by `hc_post` after
+/// output_proj (attn) or in the FFN combine (ffn), and the carry by the NEXT
+/// collapse. Same kernels, same order: bit-identical. The single-stream decode
+/// path's twin (`V41_MHC_SPLIT`) LOST (DECODE_TO_30_BRIEF: 2 graph launches + 6
+/// record/wait pairs per layer > the ~58 us it hid); here the mixes are ~60 us
+/// (attn) + ~50 us (ffn) per LANE-layer and two lanes interleave, so measure.
+pub fn ms_mhc_split() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_MS_MHC_SPLIT").as_deref() == Ok("1"));
+    *D
+}
+
 /// `V41_MOE_WI_DEVCOUNT` (default on; `0` = the host readback): keep the iGPU
 /// MoE work-item count on the device. The gate/up and down kernels are launched
 /// with an upper-bound grid right behind the builder and exit past the count,
@@ -832,6 +848,8 @@ pub struct StageCap<'a> {
     name: &'static str,
     key: u64,
     de: &'a super::engine::DeviceEngine,
+    /// The stream captured on / replayed on (`de.compute`, or `de.hc`).
+    stream: &'a v4flash_hip::Stream,
     graphs: &'a super::graph_cache::GraphCache,
 }
 
@@ -841,10 +859,10 @@ impl<'a> StageCap<'a> {
         if self.capturing {
             self.capturing = false;
             self.de.events.set_capturing(false);
-            let graph = self.de.compute.end_capture()?;
+            let graph = self.stream.end_capture()?;
             let exec = std::sync::Arc::new(graph.instantiate()?);
             self.graphs.insert(self.name, self.key, exec.clone());
-            exec.launch(&self.de.compute)?;
+            exec.launch(self.stream)?;
         }
         Ok(())
     }
@@ -854,7 +872,7 @@ impl Drop for StageCap<'_> {
     fn drop(&mut self) {
         if self.capturing {
             self.de.events.set_capturing(false);
-            let _ = self.de.compute.end_capture();
+            let _ = self.stream.end_capture();
         }
     }
 }
@@ -873,9 +891,25 @@ impl HeterogeneousEngine {
         lane_ptr: usize,
         allow: bool,
     ) -> eyre::Result<StageCap<'a>> {
+        self.stage_cap_on(de, &de.compute, name, layer, b, lane_ptr, allow)
+    }
+
+    /// `stage_cap` on another stream of the same device (`de.hc` for the mHC
+    /// side stream). Graph names must be distinct per stream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_cap_on<'a>(
+        &'a self,
+        de: &'a super::engine::DeviceEngine,
+        stream: &'a v4flash_hip::Stream,
+        name: &'static str,
+        layer: usize,
+        b: u32,
+        lane_ptr: usize,
+        allow: bool,
+    ) -> eyre::Result<StageCap<'a>> {
         let graphs = &self.dgpu_graphs;
         if !allow || !ms_graphs() {
-            return Ok(StageCap { skip: false, capturing: false, name, key: 0, de, graphs });
+            return Ok(StageCap { skip: false, capturing: false, name, key: 0, de, stream, graphs });
         }
         // Exact, collision-free key: layer (8 bits) | b (16) | lane buffer
         // address >> 8 (40 bits: device VAs fit in 48, lane buffers are
@@ -884,12 +918,12 @@ impl HeterogeneousEngine {
         debug_assert!(layer < 256 && b < 65536 && (lane_ptr as u64) >> 48 == 0);
         let key = (layer as u64) | ((b as u64) << 8) | (((lane_ptr as u64) >> 8) << 24);
         if let Some(exec) = graphs.get(name, key) {
-            exec.launch(&de.compute)?;
-            return Ok(StageCap { skip: true, capturing: false, name, key, de, graphs });
+            exec.launch(stream)?;
+            return Ok(StageCap { skip: true, capturing: false, name, key, de, stream, graphs });
         }
-        de.compute.begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        stream.begin_capture(v4flash_hip::sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
         de.events.set_capturing(true);
-        Ok(StageCap { skip: false, capturing: true, name, key, de, graphs })
+        Ok(StageCap { skip: false, capturing: true, name, key, de, stream, graphs })
     }
 
     /// Route probe hook (`V41_ROUTE_PROBE`): after `forward_layer_pre_moe_v2`
@@ -3354,9 +3388,64 @@ impl HeterogeneousEngine {
             }
             bd.engram_rows_ready = false;
         }
+        // V4.1 mHC SPLIT (`ms_mhc_split`): mixes on `de.hc`, collapse on compute.
+        // Host enqueue order matters: `wait_event` snapshots the event's LAST
+        // record, so every record below precedes its wait.
+        //   compute: record hc_src_attn (residual final, Engram included)
+        //   hc:      wait; mixes -> split
+        //   compute: collapse with the OLD carry, rms_w; record hc_collapse_attn
+        //   hc:      wait; carry := split; record hc_mixes_attn
+        //   compute: waits hc_mixes_attn before `hc_post` (stage 7) reads split
+        let mhc_split = cap_ok && ms_mhc_split() && cfg!(feature = "v41") && ced != CedMode::KvSourceOnly;
+        if mhc_split {
+            sev.hc_src_attn.record(&de.compute)?;
+            de.hc.wait_event(&sev.hc_src_attn)?;
+            {
+                let _t = de.events.stage("dgpu.mhc_mixes_attn", &de.hc)?;
+                let s = &de.hc;
+                let cap = self.stage_cap_on(de, s, "g.mhc_mixes_attn", layer as usize, b, lane_ptr, cap_ok)?;
+                if !cap.skip {
+                    if mhc_pre_scaled_for(b) {
+                        let hcd = HC_DIM as usize;
+                        let hmd = HC_MIX_DIM as usize;
+                        for r in 0..b as usize {
+                            let row = bd.residual.slice_view(r * hcd, hcd);
+                            de.rms_nw_mw.launch_inv_only(s, &mut sd.mhc_inv_scalar, &row, &mut sd.mhc_rms_partials, HC_DIM, 16, RMS_EPS)?;
+                            let mut mix_row = sd.mix.slice_view_mut(r * hmd, hmd);
+                            de.f16.matvec_pre_scaled(s, &mut mix_row, &dlw.hc_attn_fn.buffer, &row, &sd.mhc_inv_scalar, HC_MIX_DIM, HC_DIM)?;
+                        }
+                    } else {
+                        de.rms_nw.launch_batched(s, &mut sd.flat, &bd.residual, 1, HC_DIM, RMS_EPS, b)?;
+                        if mhc_narrow_fallback_for(b) {
+                            de.f16.matvec_narrow_batched(s, &mut sd.mix, &dlw.hc_attn_fn.buffer, &sd.flat, HC_MIX_DIM, HC_DIM, b)?;
+                        } else {
+                            de.f16.gemm_batched_wmma(s, &mut sd.mix, &dlw.hc_attn_fn.buffer, &sd.flat, HC_MIX_DIM, HC_DIM, b)?;
+                        }
+                    }
+                    de.hc_sinkhorn.launch_batched(s, &mut bd.split, &sd.mix, &dlw.hc_attn_scale, &dlw.hc_attn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS, b)?;
+                }
+                cap.end()?;
+            }
+            let cap = self.stage_cap(de, "g.mhc_collapse_attn", layer as usize, b, lane_ptr, cap_ok)?;
+            if !cap.skip {
+                de.hc_weighted.launch_batched(&de.compute, &mut sd.attn_cur, &bd.residual, &bd.hc_pre_carry, N_EMBD, N_HC, HC_MIX_DIM, b)?;
+                de.rms_w.launch_weighted_batched(&de.compute, &mut sd.attn_input_norm, &sd.attn_cur, &dlw.attn_norm, N_EMBD, RMS_EPS, b)?;
+            }
+            cap.end()?;
+            sev.hc_collapse_attn.record(&de.compute)?;
+            de.hc.wait_event(&sev.hc_collapse_attn)?;
+            let rows = b as usize * HC_MIX_DIM as usize;
+            let cur = bd.split.slice_view(0, rows);
+            bd.hc_pre_carry.slice_view_mut(0, rows).copy_from_buffer_async(&cur, &de.hc)?;
+            sev.hc_mixes_attn.record(&de.hc)?;
+        } else {
         let cap = self.stage_cap(de, "g.mhc_pre_attn", layer as usize, b, lane_ptr, cap_ok)?;
         if !cap.skip {
-        {
+        // `flat` feeds only the batched matvecs below; the decode-exact path
+        // (`mhc_pre_scaled_for`) reads the raw residual and was paying a dead
+        // 31 us single-WG pass here (bench_mhc_arena_v41: chain 98.5 -> 72.5 us
+        // at b=2).
+        if !mhc_pre_scaled_for(b) {
             let _t = de.events.stage("k.mhc_pre_attn.rms_nw", &de.compute)?;
             de.rms_nw
                 .launch_batched(&de.compute, &mut sd.flat, &bd.residual, 1, HC_DIM, RMS_EPS, b)?;
@@ -3478,6 +3567,7 @@ impl HeterogeneousEngine {
 
         }
         cap.end()?;
+        }
         drop(_t_mhc_pre);
 
         // ========================================================
@@ -5813,6 +5903,9 @@ impl HeterogeneousEngine {
         // Stage 7: mhc_post_attn (BATCHED hc_post_from_split)
         // ========================================================
         let _t_mhc_post = de.events.stage("dgpu.mhc_post_attn", &de.compute)?;
+        if mhc_split {
+            de.compute.wait_event(&sev.hc_mixes_attn)?;
+        }
         de.hc_post.launch_from_split_batched(
             &de.compute,
             &mut bd.after_attn_hc,
@@ -5830,6 +5923,41 @@ impl HeterogeneousEngine {
         // Stage 8: mhc_pre_ffn (BATCHED, same shape as Stage 1)
         // ========================================================
         let _t_mhc_pre_ffn = de.events.stage("dgpu.mhc_pre_ffn", &de.compute)?;
+        // mHC SPLIT, FFN side (see stage 1): the mixes read `after_attn_hc`, so
+        // hc_src_ffn is recorded after stage 7 -- which is also the last reader
+        // of the attn `split` these mixes overwrite.
+        if mhc_split {
+            sev.hc_src_ffn.record(&de.compute)?;
+            de.hc.wait_event(&sev.hc_src_ffn)?;
+            {
+                let _t = de.events.stage("dgpu.mhc_mixes_ffn", &de.hc)?;
+                let s = &de.hc;
+                let cap = self.stage_cap_on(de, s, "g.mhc_mixes_ffn", layer as usize, b, lane_ptr, cap_ok)?;
+                if !cap.skip {
+                    de.rms_nw.launch_batched(s, &mut sd.flat, &bd.after_attn_hc, 1, HC_DIM, RMS_EPS, b)?;
+                    if mhc_narrow_fallback_for(b) {
+                        de.f16.matvec_narrow_batched(s, &mut sd.mix, &dlw.hc_ffn_fn.buffer, &sd.flat, HC_MIX_DIM, HC_DIM, b)?;
+                    } else {
+                        de.f16.gemm_batched_wmma(s, &mut sd.mix, &dlw.hc_ffn_fn.buffer, &sd.flat, HC_MIX_DIM, HC_DIM, b)?;
+                    }
+                    de.hc_sinkhorn.launch_batched(s, &mut bd.split, &sd.mix, &dlw.hc_ffn_scale, &dlw.hc_ffn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS, b)?;
+                }
+                cap.end()?;
+            }
+            let cap = self.stage_cap(de, "g.mhc_collapse_ffn", layer as usize, b, lane_ptr, cap_ok)?;
+            if !cap.skip {
+                de.hc_weighted.launch_batched(&de.compute, &mut sd.ffn_cur, &bd.after_attn_hc, &bd.hc_pre_carry, N_EMBD, N_HC, HC_MIX_DIM, b)?;
+                de.rms_w.launch_weighted_batched(&de.compute, &mut bd.ffn_input_norm, &sd.ffn_cur, &dlw.ffn_norm, N_EMBD, RMS_EPS, b)?;
+            }
+            cap.end()?;
+            sev.hc_collapse_ffn.record(&de.compute)?;
+            de.hc.wait_event(&sev.hc_collapse_ffn)?;
+            let rows = b as usize * HC_MIX_DIM as usize;
+            let cur = bd.split.slice_view(0, rows);
+            bd.hc_pre_carry.slice_view_mut(0, rows).copy_from_buffer_async(&cur, &de.hc)?;
+            sev.hc_mixes_ffn.record(&de.hc)?;
+            bd.mhc_ffn_split_pending = true;
+        } else {
         let cap = self.stage_cap(de, "g.mhc_pre_ffn", layer as usize, b, lane_ptr, cap_ok)?;
         if !cap.skip {
         {
@@ -5906,6 +6034,7 @@ impl HeterogeneousEngine {
         }
         }
         cap.end()?;
+        }
         drop(_t_mhc_pre_ffn);
 
         // ========================================================
@@ -8812,6 +8941,10 @@ impl HeterogeneousEngine {
                 ffn_moe_dgpu,
                 b * N_EMBD,
             )?;
+        }
+        if std::mem::take(&mut bd.mhc_ffn_split_pending) {
+            // `V41_MS_MHC_SPLIT`: this layer's FFN mixes (split + carry) ran on `de.hc`.
+            self.dgpu.compute.wait_event(&sev.hc_mixes_ffn)?;
         }
         {
             let _t = de.events.stage("k.ffn_combine.hc_post", &de.compute)?;
