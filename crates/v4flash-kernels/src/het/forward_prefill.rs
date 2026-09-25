@@ -755,7 +755,9 @@ pub fn lookahead_topk() -> usize {
 /// sub-block's `pre` (the carry), so the collapse -> rms_w -> attention (or ->
 /// router/MoE) never waits for them; `split` is first read by `hc_post` after
 /// output_proj (attn) or in the FFN combine (ffn), and the carry by the NEXT
-/// collapse. Same kernels, same order: bit-identical. The single-stream decode
+/// collapse. Same kernels, same order: bit-identical. The mixes use their own
+/// `sd.mhc_flat_hc` (the R1 `flat` aliases attention scratch) and only lanes of
+/// <= `MHC_SPLIT_MAX_ROWS` rows split. The single-stream decode
 /// path's twin (`V41_MHC_SPLIT`) LOST (DECODE_TO_30_BRIEF: 2 graph launches + 6
 /// record/wait pairs per layer > the ~58 us it hid); here the mixes are ~60 us
 /// (attn) + ~50 us (ffn) per LANE-layer and two lanes interleave, so measure.
@@ -3396,7 +3398,11 @@ impl HeterogeneousEngine {
         //   compute: collapse with the OLD carry, rms_w; record hc_collapse_attn
         //   hc:      wait; carry := split; record hc_mixes_attn
         //   compute: waits hc_mixes_attn before `hc_post` (stage 7) reads split
-        let mhc_split = cap_ok && ms_mhc_split() && cfg!(feature = "v41") && ced != CedMode::KvSourceOnly;
+        let mhc_split = cap_ok
+            && ms_mhc_split()
+            && cfg!(feature = "v41")
+            && ced != CedMode::KvSourceOnly
+            && b <= super::batch_scratch::MHC_SPLIT_MAX_ROWS;
         if mhc_split {
             sev.hc_src_attn.record(&de.compute)?;
             de.hc.wait_event(&sev.hc_src_attn)?;
@@ -3415,11 +3421,11 @@ impl HeterogeneousEngine {
                             de.f16.matvec_pre_scaled(s, &mut mix_row, &dlw.hc_attn_fn.buffer, &row, &sd.mhc_inv_scalar, HC_MIX_DIM, HC_DIM)?;
                         }
                     } else {
-                        de.rms_nw.launch_batched(s, &mut sd.flat, &bd.residual, 1, HC_DIM, RMS_EPS, b)?;
+                        de.rms_nw.launch_batched(s, &mut sd.mhc_flat_hc, &bd.residual, 1, HC_DIM, RMS_EPS, b)?;
                         if mhc_narrow_fallback_for(b) {
-                            de.f16.matvec_narrow_batched(s, &mut sd.mix, &dlw.hc_attn_fn.buffer, &sd.flat, HC_MIX_DIM, HC_DIM, b)?;
+                            de.f16.matvec_narrow_batched(s, &mut sd.mix, &dlw.hc_attn_fn.buffer, &sd.mhc_flat_hc, HC_MIX_DIM, HC_DIM, b)?;
                         } else {
-                            de.f16.gemm_batched_wmma(s, &mut sd.mix, &dlw.hc_attn_fn.buffer, &sd.flat, HC_MIX_DIM, HC_DIM, b)?;
+                            de.f16.gemm_batched_wmma(s, &mut sd.mix, &dlw.hc_attn_fn.buffer, &sd.mhc_flat_hc, HC_MIX_DIM, HC_DIM, b)?;
                         }
                     }
                     de.hc_sinkhorn.launch_batched(s, &mut bd.split, &sd.mix, &dlw.hc_attn_scale, &dlw.hc_attn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS, b)?;
@@ -5934,11 +5940,11 @@ impl HeterogeneousEngine {
                 let s = &de.hc;
                 let cap = self.stage_cap_on(de, s, "g.mhc_mixes_ffn", layer as usize, b, lane_ptr, cap_ok)?;
                 if !cap.skip {
-                    de.rms_nw.launch_batched(s, &mut sd.flat, &bd.after_attn_hc, 1, HC_DIM, RMS_EPS, b)?;
+                    de.rms_nw.launch_batched(s, &mut sd.mhc_flat_hc, &bd.after_attn_hc, 1, HC_DIM, RMS_EPS, b)?;
                     if mhc_narrow_fallback_for(b) {
-                        de.f16.matvec_narrow_batched(s, &mut sd.mix, &dlw.hc_ffn_fn.buffer, &sd.flat, HC_MIX_DIM, HC_DIM, b)?;
+                        de.f16.matvec_narrow_batched(s, &mut sd.mix, &dlw.hc_ffn_fn.buffer, &sd.mhc_flat_hc, HC_MIX_DIM, HC_DIM, b)?;
                     } else {
-                        de.f16.gemm_batched_wmma(s, &mut sd.mix, &dlw.hc_ffn_fn.buffer, &sd.flat, HC_MIX_DIM, HC_DIM, b)?;
+                        de.f16.gemm_batched_wmma(s, &mut sd.mix, &dlw.hc_ffn_fn.buffer, &sd.mhc_flat_hc, HC_MIX_DIM, HC_DIM, b)?;
                     }
                     de.hc_sinkhorn.launch_batched(s, &mut bd.split, &sd.mix, &dlw.hc_ffn_scale, &dlw.hc_ffn_base, N_HC, SINKHORN_ITERS, SINKHORN_EPS, b)?;
                 }

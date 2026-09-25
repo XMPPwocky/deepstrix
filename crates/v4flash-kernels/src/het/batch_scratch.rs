@@ -411,6 +411,10 @@ pub struct BatchDgpuScratch {
     pub remote_ticket: Option<crate::het::remote_experts::Ticket>,
 }
 
+/// Lane rows up to which `V41_MS_MHC_SPLIT` runs the mHC mixes on the side
+/// stream (the size of `BatchDgpuShared::mhc_flat_hc`); larger calls stay inline.
+pub const MHC_SPLIT_MAX_ROWS: u32 = 16;
+
 /// SHARED dGPU scratch: one instance serves both pipeline lanes.
 ///
 /// Every field is a single contiguous `DeviceBuffer` (or a non-owning
@@ -493,6 +497,13 @@ pub struct BatchDgpuShared {
     /// `[B, HC_MIX_DIM]` — f16 narrow matvec output (sinkhorn input).
     /// Live P1 and P8 only (written by f16_matvec, read by sinkhorn).
     pub mix: DeviceBuffer<f32>,
+    /// `V41_MS_MHC_SPLIT` only: the mHC side stream's own `flat`
+    /// (`[MHC_SPLIT_MAX_ROWS, HC_DIM]`), a STANDALONE allocation. The R1 `flat`
+    /// sits at offset 0 with `q` / `indexer_scores` / `heads` (lifetime union
+    /// above), which is safe only in program order on ONE stream: mixes on
+    /// `de.hc` writing it while `de.compute` runs another lane's Q chain would
+    /// corrupt both (review 2026-09-25).
+    pub mhc_flat_hc: DeviceBuffer<f32>,
     /// `[B, N_EMBD]` — hc_weighted output for attention input (P1).
     pub attn_cur: DeviceBuffer<f32>,
     /// `[B, N_EMBD]` — attention input norm. Written P1; last read by the
@@ -1425,6 +1436,7 @@ impl BatchDgpuShared {
             flat,
 
             mhc_inv_scalar: DeviceBuffer::new(id, 1)?,
+            mhc_flat_hc: DeviceBuffer::new(id, MHC_SPLIT_MAX_ROWS as usize * HC_DIM as usize)?,
 
             mhc_rms_partials: DeviceBuffer::new(id, 16)?,
             mix: mk_f32(HC_MIX_DIM as usize)?,
