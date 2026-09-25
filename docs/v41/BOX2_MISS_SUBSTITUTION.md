@@ -153,7 +153,10 @@ The box-2-side policy below stays as the fallback for mirror errors.
     held alternative), then re-plans until nothing new is blocked, so a blocked
     expert frees the alternative it would have taken.
   - Optional mass cap `V41_SUB_MAX_W`: both the missing pick's weight and the
-    substitute's renormalized weight must be at or below it (any rank).
+    substitute's renormalized weight must be at or below it (any rank). It is
+    checked at swap time. A later swap in the same row divides every weight by
+    its `c` again, which can lift an earlier substitute slightly past the cap
+    (1 in ~770 capped trials in the reviewer's port).
   - Accepted box-1 substitutes are made most-recently-used in the pager, so the
     other lane's `ensure` does not evict them first.
   - Router weights are read at most once per lane-layer, and only when there is a
@@ -166,7 +169,8 @@ The box-2-side policy below stays as the fallback for mirror errors.
   P in a sent, unanswered request / M missing / ? not reported yet, box 1's
   pager r/m. Plus `S <layer> <b> <row> <rank> <from> <to> <w_from> <w_to>` per
   swap, and `s` (same fields) per swap the DRY RUN would have made. Enough to
-  replay any gate (rank, weight cap) offline.
+  replay any gate (rank, weight cap) offline. `P` is recorded even with
+  `V41_SUB_PENDING=0`, so a replay must apply that knob itself.
 - **Pending overlay vs box-2 PARK.** The overlay assumes box 2 serves a layer's
   requests in order (or merged), so an expert one lane is having read is free
   for the other. Under PARK (`knobs::park`, OOO replies) box 2 serves the other

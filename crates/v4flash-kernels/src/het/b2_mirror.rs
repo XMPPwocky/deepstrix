@@ -538,6 +538,7 @@ mod tests {
             (s % n as u64) as u32
         };
         let (nu, na) = (6usize, 4usize);
+        let (mut total_slots, mut multi_row_swaps) = (0u32, 0u32);
         for trial in 0..3000 {
             let b = 1 + rnd(6) as usize;
             let pool = 16 + rnd(24) as i32; // small id space => collisions
@@ -545,6 +546,7 @@ mod tests {
             let mut alts = Vec::with_capacity(b * na);
             let mut ew = Vec::with_capacity(b * nu);
             let mut alt_w = Vec::with_capacity(b * na);
+            let mut probs: Vec<std::collections::HashMap<i32, f32>> = Vec::with_capacity(b);
             for _ in 0..b {
                 // 6 + 4 distinct ids per row, in rank order.
                 let mut ids: Vec<i32> = Vec::new();
@@ -557,6 +559,7 @@ mod tests {
                 let mut p: Vec<f32> = (0..nu + na).map(|_| 0.05 + rnd(1000) as f32 / 1000.0).collect();
                 p.sort_by(|a, b| b.partial_cmp(a).unwrap());
                 let sum: f32 = p[..nu].iter().sum();
+                probs.push(ids.iter().copied().zip(p.iter().copied()).collect());
                 sel.extend_from_slice(&ids[..nu]);
                 alts.extend_from_slice(&ids[nu..]);
                 ew.extend(p[..nu].iter().map(|x| x / sum * S));
@@ -574,18 +577,46 @@ mod tests {
             let before = sel.clone();
             let o = substitute(&mut sel, &mut ew, &alts, &alt_w, nu, na, rules, miss, acceptable);
             assert_eq!(o.failed, 0, "trial {trial}: {o:?}");
-            assert_eq!(o.avoided + o.blocked, o.predicted, "trial {trial}");
+            total_slots += o.slots;
+            // Accounting: the predicted misses no longer picked anywhere are
+            // exactly the avoided reads.
+            let mut missing: Vec<i32> = before.iter().copied().filter(|&e| miss(e)).collect();
+            missing.sort();
+            missing.dedup();
+            let gone = missing.iter().filter(|e| !sel.contains(e)).count() as u32;
+            assert_eq!(gone, o.avoided, "trial {trial}: {o:?}");
+            let mut rows_swapped = 0;
             for r in 0..b {
                 let row = &sel[r * nu..(r + 1) * nu];
                 let sum: f32 = ew[r * nu..(r + 1) * nu].iter().sum();
                 assert!((sum - S).abs() < 1e-3, "trial {trial} row {r}: weights sum {sum}");
+                // Exact against ref.Gate over the FINAL chosen set.
+                let p_sum: f32 = row.iter().map(|e| probs[r][e]).sum();
+                for k in 0..nu {
+                    let want = probs[r][&row[k]] / p_sum * S;
+                    assert!((ew[r * nu + k] - want).abs() < 1e-5, "trial {trial} row {r} slot {k}: {} vs ref.Gate {want}", ew[r * nu + k]);
+                }
+                if row != &before[r * nu..(r + 1) * nu] {
+                    rows_swapped += 1;
+                }
                 for k in 0..nu {
                     assert!(!row[k + 1..].contains(&row[k]), "trial {trial} row {r}: duplicate pick");
                     if row[k] != before[r * nu + k] {
                         assert!(acceptable(row[k]), "trial {trial}: swapped in a non-acceptable expert");
                         assert!(k + 1 >= rules.min_rank, "trial {trial}: swapped above min_rank");
+                        if let Some(cap) = rules.max_w {
+                            // The cap holds at swap time. A later swap in the
+                            // same row divides everything by its `c` again, which
+                            // can lift an earlier substitute a little.
+                            let p_before: f32 = before[r * nu..(r + 1) * nu].iter().map(|e| probs[r][e]).sum();
+                            assert!(probs[r][&before[r * nu + k]] / p_before * S <= cap + 1e-4 || !miss(before[r * nu + k]), "trial {trial}: swapped a pick heavier than the cap");
+                            assert!(ew[r * nu + k] <= cap * 1.25, "trial {trial}: substitute far above the cap: {}", ew[r * nu + k]);
+                        }
                     }
                 }
+            }
+            if rows_swapped > 1 {
+                multi_row_swaps += 1;
             }
             // All-rows rule: an expert still picked anywhere was not swapped away
             // anywhere else.
@@ -595,6 +626,9 @@ mod tests {
                 }
             }
         }
+        // Not vacuous: a planner that never swaps would fail here.
+        assert!(total_slots > 1000, "only {total_slots} swaps in 3000 trials");
+        assert!(multi_row_swaps > 300, "only {multi_row_swaps} trials swapped in several rows");
     }
 
     /// The mirror is process-global; this is its only test, on a layer no
