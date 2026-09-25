@@ -111,6 +111,11 @@ for c in "$@"; do
         # production-faithful (turn-local): production re-prefills every turn, so perturb ONLY inside
         # the longest assistant turn (inputs 467..682, 217 predictions); everything before it stays exact
         anyrank25_turn3) extra=(--swap-eps inf --swap-anyrank-cold "$HOME/b1_hotset_proxy.json" --swap-frac 0.032 --swap-seed 3 --swap-check-sites 2) ;;
+        # the live CACHE-PRIOR router (V41_SUB=3, lambda 0.25, top 2 protected), turn-local, with the
+        # held set = top-260/layer by production decode counts: calibrated on the reference routing to
+        # ~7 swaps/token, the live rate (5-10); the static capacity estimate (185/layer) gives ~21
+        cacheprior_turn3) extra=(--swap-cache-prior "$HOME/cp/held_k260.json" --swap-cp-lambda 0.25 --swap-cp-protect 2 --swap-check-sites 2) ;;
+        cacheprior_bf16null_turn3) extra=(--swap-cache-prior "$HOME/cp/held_k260.json" --swap-cp-lambda 0.25 --swap-cp-protect 2 --swap-mode bf16) ;;
         anyrank25_bf16null_turn3) extra=(--swap-eps inf --swap-anyrank-cold "$HOME/b1_hotset_proxy.json" --swap-frac 0.032 --swap-seed 3 --swap-mode bf16) ;;
         *) echo "unknown policy $pol"; exit 2 ;;
       esac

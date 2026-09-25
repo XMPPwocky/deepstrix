@@ -102,6 +102,13 @@ def main():
                     help="per layer, log this many swapped rows: routing before/after and ||dFFN|| "
                          "(recomputes those rows' FFN with the original routing) to swap_checks.json")
     ap.add_argument("--no-layer-dumps", action="store_true", help="skip per-layer residual/routing files")
+    ap.add_argument("--swap-cache-prior", help="replay the live CACHE-PRIOR router (V41_SUB=3): a hot-set JSON "
+                    "(one id list per layer) of the experts held on either box; each held expert's selection score "
+                    "gets +lambda*Delta_layer (Delta = the layer's mean per-token max-min score range), the original "
+                    "top --swap-cp-protect picks are kept, the rest refilled from the boosted scores, weights "
+                    "renormalised over the final set. Honours --swap-positions and --swap-mode bf16 (matched null)")
+    ap.add_argument("--swap-cp-lambda", type=float, default=0.25)
+    ap.add_argument("--swap-cp-protect", type=int, default=2)
     ap.add_argument("--expert-rt", help="replace covered routed experts' weights by a ggml round trip: "
                     "q8_0 (quantized on the fly) or cache:DIR (pre-quantized by build_rt_cache.py)")
     ap.add_argument("--expert-rt-cover", default="all",
@@ -118,6 +125,10 @@ def main():
         hot_sets = [set(x) for x in __import__("json").load(open(a.swap_cold_only))]
     sixth_cold_sets = None
     anyrank_sets = None
+    cp_held = None
+    if a.swap_cache_prior:
+        a.golden = True
+        cp_held = [set(x) for x in __import__("json").load(open(a.swap_cache_prior))]
     if a.swap_anyrank_cold:
         anyrank_sets = [set(x) for x in __import__("json").load(open(a.swap_anyrank_cold))]
     swap_rank_counts = [0] * 6
@@ -267,7 +278,37 @@ def main():
                 assert torch.equal(sel.topk(_gate.topk, dim=-1)[1], idx), "recomputed selection != reference"
                 golden["router_sel"] = sel.float().clone()
                 golden["router_w"] = w.float().clone()
-                if a.swap_eps is not None and anyrank_sets is not None:
+                if cp_held is not None:
+                    k, P = _gate.topk, a.swap_cp_protect
+                    idx_ref, w_ref = idx.clone(), w.clone()
+                    held = torch.zeros(sel.shape[-1], dtype=torch.bool)
+                    held[list(cp_held[L])] = True
+                    delta = (sel.max(-1).values - sel.min(-1).values).mean()
+                    boosted = sel + a.swap_cp_lambda * delta * held.to(sel.dtype)
+                    boosted.scatter_(1, idx_ref[:, :P], float("-inf"))  # the protected top P stay
+                    new = torch.cat([idx_ref[:, :P], boosted.topk(k - P, dim=-1).indices], dim=1)
+                    if swap_pos is not None:
+                        allowed = torch.zeros(idx.shape[0], dtype=torch.bool)
+                        allowed[torch.tensor(swap_pos, dtype=torch.long)] = True
+                        new = torch.where(allowed[:, None], new, idx_ref)
+                    # a displaced pick is never held (held experts all move up together)
+                    disp = ~(idx_ref[:, :, None] == new[:, None, :]).any(-1)  # [n, k] at the ref ranks
+                    for c in range(k):
+                        swap_rank_counts[c] += int(disp[:, c].sum())
+                    swap_counts.append(int(disp.sum()))
+                    if a.swap_mode == "bf16":
+                        _moe.bf16_round = (disp.clone(), idx_ref.clone())  # matched null: same sites, no swap
+                    else:
+                        idx = new
+                        w = sc.gather(1, idx)
+                        if _gate.norm_topk_prob and k > 1:
+                            w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
+                        w = w * _gate.route_scale
+                    if a.swap_check_sites:
+                        rows = disp.any(dim=1).nonzero().flatten()[: a.swap_check_sites].tolist()
+                        _moe.check = {"layer": L, "rows": rows, "w_ref": w_ref, "idx_ref": idx_ref,
+                                      "w_new": w.clone(), "idx_new": idx.clone(), "out": swap_checks}
+                elif a.swap_eps is not None and anyrank_sets is not None:
                     k = _gate.topk
                     top = sel.topk(2 * k, dim=-1)  # enough replacements for every rank of a row
                     idx = top.indices[:, :k].clone()
@@ -468,6 +509,8 @@ def main():
                    "swap_mode": a.swap_mode, "swap_rank": a.swap_rank or 6,
                    "swap_anyrank_cold": a.swap_anyrank_cold, "swap_rank_counts": swap_rank_counts,
                    "swap_weights": a.swap_weights,
+                   "swap_cache_prior": a.swap_cache_prior, "swap_cp_lambda": a.swap_cp_lambda,
+                   "swap_cp_protect": a.swap_cp_protect,
                    "inherit_weight_absdiff": (lambda v: {"n": len(v), **({} if not v else {
                        "mean": sum(v) / len(v), "p50": sorted(v)[len(v) // 2], "p90": sorted(v)[int(len(v) * .9)],
                        "p99": sorted(v)[int(len(v) * .99)], "max": max(v)})})(inherit_absdiff),
