@@ -11,7 +11,7 @@
 use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{install_panic_handler, Device, DeviceBuffer, Stream};
 use v4flash_kernels::config::{HC_DIM, HC_MIX_DIM, N_HC, RMS_EPS, SINKHORN_EPS, SINKHORN_ITERS};
-use v4flash_kernels::mhc_arena::{MIX_NORMED, MIX_PRE_SCALED};
+use v4flash_kernels::mhc_arena::{MIX_KSPLIT, MIX_NORMED, MIX_PRE_SCALED};
 use v4flash_kernels::{F16Matvec, HcSinkhorn, MhcArena, RmsNormNoWeight, RmsNormNoWeightMultiWG};
 
 struct Lcg(u64);
@@ -141,6 +141,91 @@ fn mhc_arena_is_bit_identical() -> eyre::Result<()> {
     }
     if ran == 0 {
         return Err(eyre!("no gfx1201/gfx1151 device"));
+    }
+    Ok(())
+}
+
+/// TIER 2 (`launch_mix_ksplit`) is NOT bit-identical: report how far it lands
+/// from the exact chains (pre-attn pre-scaled; pre-ffn normalize-then-dot).
+#[test]
+#[ignore]
+fn mhc_arena_ksplit_error() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let dev = Device::all()?
+        .into_iter()
+        .find(|d| d.properties().map(|p| p.gcn_arch_name.starts_with("gfx1201")).unwrap_or(false))
+        .ok_or_else(|| eyre!("no gfx1201"))?;
+    let arch = dev.properties()?.gcn_arch_name;
+    dev.set_current()?;
+    let id = dev.id;
+    let s = Stream::new(id)?;
+    let rms_nw = RmsNormNoWeight::for_arch(&arch)?;
+    let rms_nw_mw = RmsNormNoWeightMultiWG::for_arch(&arch)?;
+    let f16 = F16Matvec::for_arch(&arch)?;
+    let sink = HcSinkhorn::for_arch(&arch)?;
+    let arena = MhcArena::for_arch(&arch)?;
+    let (hcd, m, bmax, sp) = (HC_DIM as usize, HC_MIX_DIM as usize, 4usize, MIX_KSPLIT as usize);
+    let mut rng = Lcg(0x6b73_706c_6974);
+    let w_bits: Vec<u16> = (0..m * hcd)
+        .map(|_| {
+            let r = rng.next();
+            (((r >> 31) as u16) << 15) | ((10 + (r % 5) as u16) << 10) | ((r >> 8) as u16 & 0x3ff)
+        })
+        .collect();
+    let w_bytes: Vec<u8> = w_bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let w = up(id, &w_bytes)?;
+    let x = up(id, &(0..bmax * hcd).map(|_| rng.unit() * 2.0).collect::<Vec<f32>>())?;
+    let scale = up(id, &[0.8f32, 1.3, 0.6])?;
+    let base = up(id, &(0..m).map(|_| rng.unit()).collect::<Vec<f32>>())?;
+    let z = |n: usize| -> eyre::Result<DeviceBuffer<f32>> {
+        let mut d = DeviceBuffer::new(id, n)?;
+        d.fill_zero()?;
+        Ok(d)
+    };
+    let (mut mix_o, mut split_o, mut mix_k, mut split_k) = (z(bmax * m)?, z(bmax * m)?, z(bmax * m)?, z(bmax * m)?);
+    let (mut flat, mut inv, mut part, mut dotp, mut sqp) = (z(bmax * hcd)?, z(1)?, z(16)?, z(bmax * m * sp)?, z(bmax * sp)?);
+    let mut counters: DeviceBuffer<u32> = DeviceBuffer::new(id, bmax)?;
+    counters.fill_zero()?;
+    let b = bmax as u32;
+    for mode in [MIX_PRE_SCALED, MIX_NORMED] {
+        if mode == MIX_PRE_SCALED {
+            for r in 0..bmax {
+                let row = x.slice_view(r * hcd, hcd);
+                rms_nw_mw.launch_inv_only(&s, &mut inv, &row, &mut part, HC_DIM, 16, RMS_EPS)?;
+                let mut mr = mix_o.slice_view_mut(r * m, m);
+                f16.matvec_pre_scaled(&s, &mut mr, &w, &row, &inv, HC_MIX_DIM, HC_DIM)?;
+            }
+        } else {
+            rms_nw.launch_batched(&s, &mut flat, &x, 1, HC_DIM, RMS_EPS, b)?;
+            f16.matvec_narrow_batched(&s, &mut mix_o, &w, &flat, HC_MIX_DIM, HC_DIM, b)?;
+        }
+        sink.launch_batched(&s, &mut split_o, &mix_o, &scale, &base, N_HC, SINKHORN_ITERS, SINKHORN_EPS, b)?;
+        arena.launch_mix_ksplit(&s, &mut split_k, &mut mix_k, &mut dotp, &mut sqp, &mut counters, &w, &x, &scale, &base, HC_DIM, RMS_EPS, SINKHORN_ITERS, SINKHORN_EPS, b)?;
+        s.synchronize()?;
+        let f = |d: &DeviceBuffer<f32>| -> eyre::Result<Vec<f32>> {
+            let mut h = vec![0f32; bmax * m];
+            d.slice_view(0, bmax * m).copy_to_host(&mut h)?;
+            Ok(h)
+        };
+        let (mo, mk, so, sk) = (f(&mix_o)?, f(&mix_k)?, f(&split_o)?, f(&split_k)?);
+        let err = |a: &[f32], c: &[f32]| -> (f32, f32, usize) {
+            let mut mx = 0f32;
+            let mut rel = 0f32;
+            let mut n_diff = 0;
+            for (u, v) in a.iter().zip(c) {
+                let d = (u - v).abs();
+                if u.to_bits() != v.to_bits() { n_diff += 1; }
+                mx = mx.max(d);
+                rel = rel.max(d / u.abs().max(1e-6));
+            }
+            (mx, rel, n_diff)
+        };
+        let (ma, mr, mn) = err(&mo, &mk);
+        let (sa, srl, sn) = err(&so, &sk);
+        eprintln!("ksplit vs exact, mode {mode}: mix max|d| {ma:.3e} max rel {mr:.3e} ({mn}/{} differ); split max|d| {sa:.3e} max rel {srl:.3e} ({sn}/{} differ)", bmax * m, bmax * m);
+        if !(mr < 1e-3 && sa < 1e-3) {
+            return Err(eyre!("ksplit error too large in mode {mode}"));
+        }
     }
     Ok(())
 }

@@ -19,6 +19,10 @@ pub const MIX_NORMED: u32 = 1;
 /// Slices of the pre-scaled RMS scalar (`launch_inv_only`'s `n_wgs`).
 pub const MIX_RMS_WGS: u32 = 16;
 
+/// TIER 2 (`launch_mix_ksplit`, NOT bit-identical): K-chunks per mix row.
+/// `k` must be a multiple of `MIX_KSPLIT * 256`.
+pub const MIX_KSPLIT: u32 = 10;
+
 pub struct MhcArena {
     module: Module,
 }
@@ -86,4 +90,46 @@ impl MhcArena {
         ])
     }
 
+    /// TIER 2, NOT bit-identical: mix + split with each row's dot split over
+    /// `MIX_KSPLIT` K-chunks (grid (HC_MIX_DIM * S, 1, B)), dot-then-scale for
+    /// both sub-blocks. `dotp` >= [B, HC_MIX_DIM, S], `sqp` >= [B, S] scratch;
+    /// `counters` as in `launch_mix`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mix_ksplit(
+        &self,
+        stream: &Stream,
+        split_out: &mut DeviceBuffer<f32>,
+        mix_out: &mut DeviceBuffer<f32>,
+        dotp: &mut DeviceBuffer<f32>,
+        sqp: &mut DeviceBuffer<f32>,
+        counters: &mut DeviceBuffer<u32>,
+        weight: &DeviceBuffer<u8>,
+        x: &DeviceBuffer<f32>,
+        scale: &DeviceBuffer<f32>,
+        base: &DeviceBuffer<f32>,
+        k: u32,
+        rms_eps: f32,
+        sinkhorn_iters: u32,
+        sinkhorn_eps: f32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        let (bu, ku, m, sp) = (batch as usize, k as usize, HC_MIX_DIM as usize, MIX_KSPLIT as usize);
+        if k % (MIX_KSPLIT * 256) != 0 {
+            return Err(eyre!("mhc_arena ksplit: k={k} not a multiple of {}", MIX_KSPLIT * 256));
+        }
+        if weight.byte_len() != m * ku * 2 || x.len() < bu * ku || split_out.len() < bu * m || mix_out.len() < bu * m
+            || dotp.len() < bu * m * sp || sqp.len() < bu * sp || counters.len() < bu
+        {
+            return Err(eyre!("mhc_arena ksplit: buffer too small for batch {batch}"));
+        }
+        let function = self.module.get_function("mhc_mix_ksplit_batched")?;
+        let cfg = LaunchConfig { grid: (HC_MIX_DIM * MIX_KSPLIT, 1, batch), block: (256, 1, 1), shared_mem_bytes: 0 };
+        launch_kernel!(function, cfg, stream, [
+            split_out.raw(), mix_out.raw(), dotp.raw(), sqp.raw(), counters.raw(), weight.raw(), x.raw(),
+            scale.raw(), base.raw(), k, HC_MIX_DIM, MIX_KSPLIT, rms_eps, N_HC, sinkhorn_iters, sinkhorn_eps
+        ])
+    }
 }

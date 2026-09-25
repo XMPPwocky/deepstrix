@@ -107,6 +107,8 @@ fn bench_mhc_arena_ab() -> eyre::Result<()> {
             show("old collapse (wsum + rms_w)", capture(&s, |s| { wsum.launch_batched(s, &mut cur, &x, &carry, N_EMBD, N_HC, HC_MIX_DIM, b)?; rms_w.launch_weighted_batched(s, &mut norm, &cur, &norm_w, N_EMBD, RMS_EPS, b) })?)?;
             show("new mix PRE_SCALED (incl sinkhorn)", capture(&s, |s| arena.launch_mix(s, &mut split, &mut mix, &mut counters, &w, &x, &scale, &base, HC_DIM, MIX_PRE_SCALED, RMS_EPS, SINKHORN_ITERS, SINKHORN_EPS, b))?)?;
             show("new mix NORMED (incl sinkhorn)", capture(&s, |s| arena.launch_mix(s, &mut split, &mut mix, &mut counters, &w, &x, &scale, &base, HC_DIM, MIX_NORMED, RMS_EPS, SINKHORN_ITERS, SINKHORN_EPS, b))?)?;
+            let (mut dotp, mut sqp) = (z(bmax * m * 16)?, z(bmax * 16)?);
+            show("tier-2 mix KSPLIT (incl sinkhorn)", capture(&s, |s| arena.launch_mix_ksplit(s, &mut split, &mut mix, &mut dotp, &mut sqp, &mut counters, &w, &x, &scale, &base, HC_DIM, RMS_EPS, SINKHORN_ITERS, SINKHORN_EPS, b))?)?;
         }
         return Ok(());
     }
