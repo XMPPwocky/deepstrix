@@ -1288,8 +1288,111 @@ struct PfDone {
     read_ns: u64,
 }
 
+/// One background read for the prefetch readers.
+struct PfJob {
+    layer: u32,
+    e: u32,
+    set: usize,
+    /// A request needs it now (a parked request's own pick), as opposed to a
+    /// guess (look-ahead) or a background admission (box-2 miss substitution).
+    certain: bool,
+    t_hint: std::time::Instant,
+}
+
+/// The readers' job queue. URGENT (`certain`) jobs run before every
+/// speculative one, and a speculative job already queued is PROMOTED when a
+/// request turns out to need it. Before this it was one FIFO channel: a
+/// parked request whose pick was already queued as a background admission was
+/// deduped onto that job and waited out the whole queue ahead of it, plus the
+/// job's own yield to demand reads (2026-09-25: `box2.page_ms` 37 ms/step of
+/// parked waits with ~0 demand misses).
+struct PfQueue {
+    inner: std::sync::Mutex<PfQueueInner>,
+    cv: std::sync::Condvar,
+}
+
+struct PfQueueInner {
+    jobs: std::collections::VecDeque<PfJob>,
+    /// Keys made urgent after a reader had already popped them: a reader that
+    /// is still yielding to demand reads stops yielding.
+    urgent: std::collections::HashSet<(u32, u32)>,
+    closed: bool,
+}
+
+impl PfQueue {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(PfQueueInner { jobs: Default::default(), urgent: Default::default(), closed: false }),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Urgent jobs go behind the other urgent ones and ahead of every
+    /// speculative one; speculative jobs go to the back.
+    fn push(&self, job: PfJob) {
+        let mut g = self.inner.lock().unwrap();
+        if job.certain {
+            let at = g.jobs.iter().position(|j| !j.certain).unwrap_or(g.jobs.len());
+            g.jobs.insert(at, job);
+        } else {
+            g.jobs.push_back(job);
+        }
+        drop(g);
+        self.cv.notify_one();
+    }
+
+    /// A request needs `(layer, e)`, which is already pending: move its job up
+    /// to the urgent section, or, if a reader already has it, tell that reader
+    /// to stop yielding. Returns whether it was still queued.
+    fn promote(&self, layer: u32, e: u32) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        match g.jobs.iter().position(|j| j.layer == layer && j.e == e) {
+            Some(i) => {
+                if !g.jobs[i].certain {
+                    let mut job = g.jobs.remove(i).expect("index from position");
+                    job.certain = true;
+                    let at = g.jobs.iter().position(|j| !j.certain).unwrap_or(g.jobs.len());
+                    g.jobs.insert(at, job);
+                }
+                true
+            }
+            None => {
+                g.urgent.insert((layer, e));
+                false
+            }
+        }
+    }
+
+    fn is_urgent(&self, layer: u32, e: u32) -> bool {
+        self.inner.lock().unwrap().urgent.contains(&(layer, e))
+    }
+
+    fn clear_urgent(&self, layer: u32, e: u32) {
+        self.inner.lock().unwrap().urgent.remove(&(layer, e));
+    }
+
+    /// Blocks for the next job; `None` once closed.
+    fn pop(&self) -> Option<PfJob> {
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            if let Some(j) = g.jobs.pop_front() {
+                return Some(j);
+            }
+            if g.closed {
+                return None;
+            }
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+
+    fn close(&self) {
+        self.inner.lock().unwrap().closed = true;
+        self.cv.notify_all();
+    }
+}
+
 struct B2Prefetch {
-    tx_hint: std::sync::mpsc::Sender<(u32, u32, usize, bool, std::time::Instant)>,
+    queue: std::sync::Arc<PfQueue>,
     rx_done: std::sync::mpsc::Receiver<Result<PfDone, (usize, u32, u32, String)>>,
     /// Reader threads; they write into `stages` by address, so `Drop` joins
     /// them before the staging is freed.
@@ -1303,6 +1406,8 @@ struct B2Prefetch {
     /// Wanted ids whose prefetch read was still in flight at `ensure`: waited
     /// for instead of re-read (a partial win: the read was already started).
     pub waited: u64,
+    /// Urgent requests for a key already pending (promoted instead of deduped).
+    pub promoted: u64,
     /// Sums over completed reads: hint->start queueing, read wall, count.
     pub queue_ns: u64,
     pub read_ns: u64,
@@ -1311,10 +1416,10 @@ struct B2Prefetch {
 
 impl Drop for B2Prefetch {
     fn drop(&mut self) {
-        // Close the hint channel (the only sender), so each reader finishes its
-        // current read into `stages` and then sees `recv` fail. Fields --
-        // `stages` included -- are dropped only after this returns.
-        drop(std::mem::replace(&mut self.tx_hint, std::sync::mpsc::channel().0));
+        // Close the queue, so each reader finishes its current read into
+        // `stages` and then sees `pop` return None. Fields -- `stages`
+        // included -- are dropped only after this returns.
+        self.queue.close();
         for h in self.readers.drain(..) {
             let _ = h.join();
         }
@@ -2211,8 +2316,7 @@ impl ExpertShard {
             if self.pf_stages_spare.is_empty() {
                 return;
             }
-            let (tx_hint, rx_hint) = std::sync::mpsc::channel::<(u32, u32, usize, bool, std::time::Instant)>();
-            let rx_hint = std::sync::Arc::new(std::sync::Mutex::new(rx_hint));
+            let queue = std::sync::Arc::new(PfQueue::new());
             let (tx_done, rx_done) = std::sync::mpsc::channel::<Result<PfDone, (usize, u32, u32, String)>>();
             let stages = std::mem::take(&mut self.pf_stages_spare);
             let ptrs: Vec<SetPtr> = stages.iter().map(|st| SetPtr {
@@ -2226,23 +2330,28 @@ impl ExpertShard {
             let n_par = b2_prefetch_par().min(stages.len().max(1));
             let mut readers = Vec::with_capacity(n_par);
             for _ in 0..n_par {
-            let rx_hint = rx_hint.clone();
+            let queue_r = std::sync::Arc::clone(&queue);
             let tx_done = tx_done.clone();
             let ptrs = ptrs.clone();
             let owner = std::sync::Arc::clone(&owner);
             readers.push(std::thread::Builder::new().name("b2-prefetch".into()).spawn(move || {
                 let ptrs = ptrs;
                 loop {
-                    let got = rx_hint.lock().unwrap().recv();
-                    let Ok((layer, e, set, certain, t_hint)) = got else { break };
+                    let Some(PfJob { layer, e, set, certain, t_hint }) = queue_r.pop() else { break };
                     if !certain {
                         // Yield the drives to demand misses (bounded: a hint that
-                        // waits longer than a layer is late anyway).
+                        // waits longer than a layer is late anyway) -- unless a
+                        // request needs this very expert, in which case it IS the
+                        // demand read.
                         let t = std::time::Instant::now();
-                        while DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) > 0 && t.elapsed() < std::time::Duration::from_millis(20) {
+                        while DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) > 0
+                            && t.elapsed() < std::time::Duration::from_millis(20)
+                            && !queue_r.is_urgent(layer, e)
+                        {
                             std::thread::sleep(std::time::Duration::from_micros(50));
                         }
                     }
+                    queue_r.clear_urgent(layer, e);
                     let sp = ptrs[set];
                     // SAFETY: the set is owned by this thread until `Done`, and
                     // `B2Prefetch::drop` joins this thread before its staging
@@ -2265,7 +2374,7 @@ impl ExpertShard {
             }).expect("spawn b2-prefetch"));
             }
             let n = stages.len();
-            self.prefetch = Some(B2Prefetch { tx_hint, rx_done, readers, stages, free: (0..n).collect(), pending: Default::default(), hinted: 0, admitted: 0, dropped: 0, waited: 0, queue_ns: 0, read_ns: 0, n_read: 0 });
+            self.prefetch = Some(B2Prefetch { queue, rx_done, readers, stages, free: (0..n).collect(), pending: Default::default(), hinted: 0, admitted: 0, dropped: 0, waited: 0, promoted: 0, queue_ns: 0, read_ns: 0, n_read: 0 });
             eprintln!("expertd: look-ahead prefetch ON ({n} staging sets, {n_par} readers)");
         }
         let pool = self.pool.as_ref().unwrap();
@@ -2275,16 +2384,23 @@ impl ExpertShard {
             if key.0 as usize >= self.layers.len() || key.1 >= N_EXPERT || self.layers[key.0 as usize].is_none() {
                 continue;
             }
-            if pool.slot_of.contains_key(&key) || pf.pending.contains(&key) {
+            if pool.slot_of.contains_key(&key) {
+                continue;
+            }
+            if pf.pending.contains(&key) {
+                // Already being fetched. If a request needs it now, make that
+                // read urgent rather than letting the request wait behind the
+                // speculative queue.
+                if certain {
+                    pf.queue.promote(key.0, key.1);
+                    pf.promoted += 1;
+                }
                 continue;
             }
             let Some(set) = pf.free.pop() else { pf.dropped += 1; continue };
             pf.pending.insert(key);
             pf.hinted += 1;
-            if pf.tx_hint.send((key.0, key.1, set, certain, std::time::Instant::now())).is_err() {
-                pf.free.push(set);
-                pf.pending.remove(&key);
-            }
+            pf.queue.push(PfJob { layer: key.0, e: key.1, set, certain, t_hint: std::time::Instant::now() });
         }
     }
 

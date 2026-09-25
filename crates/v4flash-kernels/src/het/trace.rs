@@ -347,6 +347,10 @@ pub mod phase {
     pub static REMOTE_PAGE_NS: AtomicU64 = AtomicU64::new(0);
     pub static REMOTE_COMPUTE_NS: AtomicU64 = AtomicU64::new(0);
     pub static REMOTE_MISSES: AtomicU64 = AtomicU64::new(0);
+    /// Replies whose page time was non-zero: a demand read OR a parked wait
+    /// for a read to land (`knobs::park`, which the miss count does not see).
+    /// `page / paged` = cost per paging reply.
+    pub static REMOTE_PAGED: AtomicU64 = AtomicU64::new(0);
 
     /// Host phases OUTSIDE `forward_token_impl`'s `token_start..sync` bracket
     /// but ON the decode loop's critical path (engine_worker.rs
@@ -377,6 +381,7 @@ pub mod phase {
         REMOTE_PAGE_NS.store(0, Relaxed);
         REMOTE_COMPUTE_NS.store(0, Relaxed);
         REMOTE_MISSES.store(0, Relaxed);
+        REMOTE_PAGED.store(0, Relaxed);
     }
     pub fn add(c: &AtomicU64, ns: u64) {
         c.fetch_add(ns, Relaxed);

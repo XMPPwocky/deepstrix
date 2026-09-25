@@ -943,6 +943,8 @@ impl Sched {
                 ("box2.page_ms", page),
                 ("box2.compute_ms", service.saturating_sub(page)),
                 ("box2.misses_x1e6", counters::get(&counters::REMOTE_MISSES) * 1_000_000),
+                // replies that paged or PARKED (count; page_ms / this = ms each)
+                ("box2.paged_x1e6", counters::get(&counters::REMOTE_PAGED) * 1_000_000),
             ];
             let acc = &mut self.profile_acc;
             acc.steps += 1;
