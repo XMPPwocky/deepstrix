@@ -9,6 +9,7 @@ pub mod engram_table;
 pub mod gguf;
 pub mod gguf_write;
 pub mod hf_v41;
+pub mod io_throttle;
 pub mod heap;
 pub mod iq3_s_ref;
 pub mod kquants;

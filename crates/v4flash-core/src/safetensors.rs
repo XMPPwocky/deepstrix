@@ -597,10 +597,23 @@ impl SafetensorsDir {
         cut = cut.clamp(A as usize, span - A as usize);
         let base = abs - pad as u64;
         let (head, tail) = dst[..span].split_at_mut(cut);
-        let read_all = |f: &File, buf: &mut [u8], off: u64| -> eyre::Result<()> {
+        // A BACKGROUND read (`io_throttle`) goes in page-aligned chunks with the
+        // pause hook before each, so an urgent read never queues behind more
+        // than the chunks already at the drive. Read the mark HERE: the mirror
+        // half runs on a thread spawned below, which would not inherit it.
+        let bg = crate::io_throttle::background();
+        let chunk = match bg {
+            Some(_) if crate::io_throttle::chunk_bytes() > 0 => crate::io_throttle::chunk_bytes(),
+            _ => usize::MAX,
+        };
+        let read_all = move |f: &File, buf: &mut [u8], off: u64| -> eyre::Result<()> {
             let mut got = 0usize;
             while got < buf.len() {
-                let n = f.read_at(&mut buf[got..], off + got as u64).wrap_err_with(|| format!("O_DIRECT split pread at {} for {}", off + got as u64, t.name))?;
+                if let Some(token) = bg {
+                    crate::io_throttle::pause(token);
+                }
+                let end = got.saturating_add(chunk).min(buf.len());
+                let n = f.read_at(&mut buf[got..end], off + got as u64).wrap_err_with(|| format!("O_DIRECT split pread at {} for {}", off + got as u64, t.name))?;
                 if n == 0 { break; }
                 got += n;
             }

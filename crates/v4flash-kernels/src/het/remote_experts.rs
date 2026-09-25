@@ -180,6 +180,32 @@ fn set_opt_i32(s: &TcpStream, level: i32, name: i32, v: i32) -> bool {
     r == 0
 }
 
+/// Box 2's reader window, adapted per request (the daemon twin of the hub's
+/// `HetEngine::remote_set_phase_busy_poll`). Single-lane decode sends one
+/// request per layer, ~3.5-4 ms apart at 1-3 rows, far past the base 500 us
+/// window, so the reader sleeps and every request pays an idle wake-up (the
+/// ~60 us link measured with both ends hot was ~170-280 us live, 2026-09-25).
+/// After a request whose REPLY fits one 64 KB segment (<= 3 rows of f32, the
+/// decode case) the reader spins `V41_B2_DECODE_BUSY_POLL_US` (default 5000,
+/// the sysctl cap; 0 = never adapt). After a bigger one it returns to `base_us`:
+/// a spinning daemon reader slowed its own large sends (1.3 MB: 1.9 -> 6.6 ms,
+/// LINK_IDLE_LATENCY.md). Calls `setsockopt` only when the value changes; the
+/// new window applies from the reader's next `recv`.
+pub fn b2_adapt_busy_poll(s: &TcpStream, reply_bytes: usize, base_us: u32) {
+    static DECODE_US: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_B2_DECODE_BUSY_POLL_US").ok().and_then(|v| v.parse().ok()).unwrap_or(5000)
+    });
+    static CUR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+    if *DECODE_US == 0 || base_us == 0 {
+        return;
+    }
+    const ONE_SEGMENT: usize = 64 * 1024;
+    let want = if reply_bytes <= ONE_SEGMENT { *DECODE_US } else { base_us };
+    if CUR.swap(want, std::sync::atomic::Ordering::Relaxed) != want {
+        let _ = set_opt_i32(s, SOL_SOCKET, SO_BUSY_POLL, want as i32);
+    }
+}
+
 pub fn apply_socket_options(s: &TcpStream, o: &SocketOptions) -> eyre::Result<()> {
     s.set_nodelay(true)?;
     if o.sndbuf > 0 && !set_opt_i32(s, SOL_SOCKET, SO_SNDBUF, o.sndbuf as i32) {
@@ -1452,6 +1478,35 @@ impl PfQueue {
     }
 }
 
+/// The readers' queue, for the background-read pause hook
+/// (`v4flash_core::io_throttle`); set when the readers start (one shard per
+/// daemon).
+static PF_QUEUE: std::sync::OnceLock<std::sync::Arc<PfQueue>> = std::sync::OnceLock::new();
+
+/// `V41_B2_SPEC_CHUNK_KB` (default 1024; 0 = unchunked): background expert
+/// reads (look-ahead, substitution admissions) go to the drive in pieces of
+/// this size and pause before each while a demand or urgent read is active,
+/// so an urgent read waits for at most the pieces already in flight instead
+/// of whole 18.8 MB reads (io_throttle).
+fn b2_spec_chunk_bytes() -> usize {
+    std::env::var("V41_B2_SPEC_CHUNK_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024) * 1024
+}
+
+/// Before each chunk of a background read: wait while a demand read runs or an
+/// urgent (certain) read is active, unless this very expert has become
+/// urgent; at most 20 ms per chunk.
+fn b2_background_pause(token: u64) {
+    let (layer, e) = ((token >> 16) as u32, (token & 0xFFFF) as u32);
+    let Some(q) = PF_QUEUE.get() else { return };
+    let t = std::time::Instant::now();
+    while (DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) > 0 || q.certain_active())
+        && !q.is_urgent(layer, e)
+        && t.elapsed() < std::time::Duration::from_millis(20)
+    {
+        std::thread::sleep(std::time::Duration::from_micros(50));
+    }
+}
+
 /// Calls `PfQueue::finished` when a reader is done with a job, including by
 /// panic, so a failed read can never leave the gate counters raised (which
 /// would keep speculative reads off for good).
@@ -2407,6 +2462,9 @@ impl ExpertShard {
             }
             let n_par_q = b2_prefetch_par().min(self.pf_stages_spare.len().max(1));
             let queue = std::sync::Arc::new(PfQueue::new(n_par_q.saturating_sub(b2_prefetch_reserve())));
+            let _ = PF_QUEUE.set(std::sync::Arc::clone(&queue));
+            v4flash_core::io_throttle::set_chunk_bytes(b2_spec_chunk_bytes());
+            v4flash_core::io_throttle::install_pause(b2_background_pause);
             let (tx_done, rx_done) = std::sync::mpsc::channel::<Result<PfDone, (usize, u32, u32, String)>>();
             let stages = std::mem::take(&mut self.pf_stages_spare);
             let ptrs: Vec<SetPtr> = stages.iter().map(|st| SetPtr {
@@ -2455,7 +2513,11 @@ impl ExpertShard {
                     };
                     let t_read = std::time::Instant::now();
                     let queue_ns = (t_read - t_hint).as_nanos() as u64;
+                    // A job still speculative at read start reads in chunks and
+                    // yields to urgent reads (io_throttle); certain ones do not.
+                    v4flash_core::io_throttle::set_background((!done.certain).then_some(((layer as u64) << 16) | e as u64));
                     let r = Self::read_miss_into(&owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2);
+                    v4flash_core::io_throttle::set_background(None);
                     let read_ns = t_read.elapsed().as_nanos() as u64;
                     drop(done);
                     let msg = match r {
@@ -3262,6 +3324,9 @@ impl ExpertShard {
             if !coalesced {
                 let bufs: [&mut [u8]; 3] = [b0, b1, b2];
                 let mut errs: Vec<String> = Vec::new();
+                // The caller's background mark (io_throttle) must reach the role
+                // threads: thread-locals do not cross `spawn`.
+                let bg = v4flash_core::io_throttle::background();
                 std::thread::scope(|sc| {
                     let h: Vec<_> = bufs
                         .into_iter()
@@ -3272,6 +3337,7 @@ impl ExpertShard {
                             let bi = bpe[i];
                             type R = Result<Option<(usize, usize, u32, u32)>, String>;
                             sc.spawn(move || -> R {
+                                v4flash_core::io_throttle::set_background(bg);
                                 let t = src.tensor(&name).ok_or(format!("missing {name}"))?;
                                 if gpu_repack && direct {
                                     // Zero-copy: O_DIRECT lands each region at its
@@ -4523,6 +4589,9 @@ pub fn serve_connection(
                     None => None,
                 };
                 let bb = reqb.as_ref().map(|r| r.b as usize).unwrap_or(0);
+                // Reader spin window for the NEXT request, by this reply's size.
+                let elem_out = if req.flags & proto::REQ_FLAG_RESP_F32 != 0 { 4 } else { 2 };
+                b2_adapt_busy_poll(&stream, b.max(bb) * N_EMBD as usize * elem_out, opts.socket.busy_poll_us);
                 if let Some(rb) = reqb.as_ref() {
                     if !rb.hint_admit.is_empty() {
                         shard.hint_evict_first(rb.hint_admit);
