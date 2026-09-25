@@ -116,6 +116,9 @@ for c in "$@"; do
         # ~7 swaps/token, the live rate (5-10); the static capacity estimate (185/layer) gives ~21
         cacheprior_turn3) extra=(--swap-cache-prior "$HOME/cp/held_k260.json" --swap-cp-lambda 0.25 --swap-cp-protect 2 --swap-check-sites 2) ;;
         cacheprior_bf16null_turn3) extra=(--swap-cache-prior "$HOME/cp/held_k260.json" --swap-cp-lambda 0.25 --swap-cp-protect 2 --swap-mode bf16) ;;
+        # the 1-row regime bracket: held top-220 -> ~13 swaps/token (live single-lane: ~12)
+        cacheprior_k220_turn3) extra=(--swap-cache-prior "$HOME/cp/held_k220.json" --swap-cp-lambda 0.25 --swap-cp-protect 2 --swap-check-sites 2) ;;
+        cacheprior_k220_bf16null_turn3) extra=(--swap-cache-prior "$HOME/cp/held_k220.json" --swap-cp-lambda 0.25 --swap-cp-protect 2 --swap-mode bf16) ;;
         anyrank25_bf16null_turn3) extra=(--swap-eps inf --swap-anyrank-cold "$HOME/b1_hotset_proxy.json" --swap-frac 0.032 --swap-seed 3 --swap-mode bf16) ;;
         *) echo "unknown policy $pol"; exit 2 ;;
       esac
