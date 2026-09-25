@@ -27,6 +27,26 @@ pub const ROUTER_MAX_USED: u32 = 8;
 /// `ROUTER_MAX_ALT` in both kernels.
 pub const ROUTER_MAX_ALT: u32 = 4;
 
+/// Optional extras for [`RouterTopk::launch_batched_ex`]. `Default` = the
+/// plain router.
+#[derive(Default)]
+pub struct RouterEx<'a> {
+    /// Ranks n_used+1..=n_used+n_alt per token (`[B, n_alt]`).
+    pub alts: Option<&'a mut DeviceBuffer<i32>>,
+    pub n_alt: u32,
+    /// The alternatives' weights on `weights`' scale (`[B, n_alt]`, needs `alts`).
+    pub alt_w: Option<&'a mut DeviceBuffer<f32>>,
+    /// CACHE-PRIOR (`[n_expert]`, shared by all tokens): added to each expert's
+    /// selection score; the original top-`n_protect` are always kept; weights
+    /// from the unbiased probs of the final set. `None` = off (bit-identical).
+    pub prior: Option<&'a DeviceBuffer<f32>>,
+    pub n_protect: u32,
+    /// The ORIGINAL top-n_used per token (`[B, n_used]`), without the prior.
+    pub orig_sel: Option<&'a mut DeviceBuffer<i32>>,
+    /// max - min of each token's selection scores (`[B]`).
+    pub range_out: Option<&'a mut DeviceBuffer<f32>>,
+}
+
 pub struct RouterTopk {
     module: Module,
 }
@@ -128,11 +148,11 @@ impl RouterTopk {
             block: (ROUTER_MAX_EXPERTS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let no_alts: sys::hipDeviceptr_t = std::ptr::null_mut();
-        let no_alt_w: sys::hipDeviceptr_t = std::ptr::null_mut();
+        let null: sys::hipDeviceptr_t = std::ptr::null_mut();
         launch_kernel!(function, cfg, stream, [
             selected.raw(), weights.raw(), logits.raw(), b_ptr,
-            n_expert, n_used, expert_weight_scale, weight_eps, no_alts, 0u32, no_alt_w
+            n_expert, n_used, expert_weight_scale, weight_eps, null, 0u32, null,
+            null, 0u32, null, null
         ])
     }
 
@@ -154,8 +174,8 @@ impl RouterTopk {
         weight_eps: f32,
         b: u32,
     ) -> eyre::Result<()> {
-        self.launch_batched_alts(
-            stream, selected, weights, logits, bias, n_expert, n_used, expert_weight_scale, weight_eps, b, None, 0, None,
+        self.launch_batched_ex(
+            stream, selected, weights, logits, bias, n_expert, n_used, expert_weight_scale, weight_eps, b, RouterEx::default(),
         )
     }
 
@@ -187,6 +207,30 @@ impl RouterTopk {
         n_alt: u32,
         alt_w: Option<&mut DeviceBuffer<f32>>,
     ) -> eyre::Result<()> {
+        self.launch_batched_ex(
+            stream, selected, weights, logits, bias, n_expert, n_used, expert_weight_scale, weight_eps, b,
+            RouterEx { alts, n_alt, alt_w, ..Default::default() },
+        )
+    }
+
+    /// The batched router with every option (`RouterEx`): alternatives, their
+    /// weights, the cache-prior, the original picks and the score range.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched_ex(
+        &self,
+        stream: &Stream,
+        selected: &mut DeviceBuffer<i32>,
+        weights: &mut DeviceBuffer<f32>,
+        logits: &DeviceBuffer<f32>,
+        bias: Option<&DeviceBuffer<f32>>,
+        n_expert: u32,
+        n_used: u32,
+        expert_weight_scale: f32,
+        weight_eps: f32,
+        b: u32,
+        ex: RouterEx<'_>,
+    ) -> eyre::Result<()> {
+        let RouterEx { alts, n_alt, alt_w, prior, n_protect, orig_sel, range_out } = ex;
         if b == 0 {
             return Ok(());
         }
@@ -252,6 +296,25 @@ impl RouterTopk {
             Some(w) if n_alt > 0 => w.raw(),
             _ => std::ptr::null_mut(),
         };
+        if let Some(p) = prior {
+            if p.len() < n_expert as usize {
+                return Err(eyre!("router_topk batched: prior len {} < n_expert {n_expert}", p.len()));
+            }
+        }
+        if let Some(o) = orig_sel.as_ref() {
+            if o.len() < bn * n_used as usize {
+                return Err(eyre!("router_topk batched: orig_sel len {} < b*n_used {}", o.len(), bn * n_used as usize));
+            }
+        }
+        if let Some(r) = range_out.as_ref() {
+            if r.len() < bn {
+                return Err(eyre!("router_topk batched: range_out len {} < b {bn}", r.len()));
+            }
+        }
+        let pr_ptr: sys::hipDeviceptr_t = prior.map_or(std::ptr::null_mut(), |p| p.raw());
+        let os_ptr: sys::hipDeviceptr_t = orig_sel.map_or(std::ptr::null_mut(), |o| o.raw());
+        let ro_ptr: sys::hipDeviceptr_t = range_out.map_or(std::ptr::null_mut(), |r| r.raw());
+        let n_protect = n_protect.min(n_used);
         // Batched path needs the par kernel's blockIdx.x offsetting.
         let function = self.module.get_function("router_topk_par")?;
         let b_ptr: sys::hipDeviceptr_t = match bias {
@@ -267,7 +330,8 @@ impl RouterTopk {
         };
         launch_kernel!(function, cfg, stream, [
             selected.raw(), weights.raw(), logits.raw(), b_ptr,
-            n_expert, n_used, expert_weight_scale, weight_eps, a_ptr, n_alt, aw_ptr
+            n_expert, n_used, expert_weight_scale, weight_eps, a_ptr, n_alt, aw_ptr,
+            pr_ptr, n_protect, os_ptr, ro_ptr
         ])
     }
 }

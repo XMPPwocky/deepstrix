@@ -40,7 +40,17 @@
 //! swapped expert is never read, never admitted, and swapped again on every
 //! later pick (measured live: 3-5x the swaps).
 //!
-//! Which picks may be swapped:
+//! * 3 = CACHE-PRIOR (Skliar et al. 2024, arXiv 2412.00099): no host-side
+//!   rewrite. The router itself adds `lambda * Delta_layer` to the selection
+//!   score of every expert held by the box that computes it (box 2's mirror,
+//!   box 1's pager), keeps the original top `V41_SUB_PROTECT` (default 2)
+//!   picks, and renormalizes the weights over the final set. `Delta_layer` is
+//!   a running average of each token's selection-score range (max - min), so
+//!   one knob, `V41_SUB_LAMBDA`, is a per-layer gap gate: a missing pick is
+//!   displaced only by a held expert within lambda * Delta of it. Displaced
+//!   box-2 experts are admitted in the background as in mode 2.
+//!
+//! Which picks may be swapped (modes 1-2):
 //! * `V41_SUB_MIN_RANK` (1..=6, default 6): only picks at this rank or lower
 //!   (6 = the 6th pick only).
 //! * `V41_SUB_MAX_W` (unset = no cap): a swap is allowed only if the missing
@@ -65,8 +75,10 @@ static SEEN: [AtomicBool; LAYERS] = [const { AtomicBool::new(false) }; LAYERS];
 /// `V41_SUB`: 0 off, 1 dry run, 2 on.
 pub fn mode() -> u32 {
     static M: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-        let m = std::env::var("V41_SUB").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0).min(2);
-        if m > 0 {
+        let m = std::env::var("V41_SUB").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0).min(3);
+        if m == 3 {
+            eprintln!("b2 mirror: V41_SUB=3 CACHE-PRIOR, lambda {}, protect top {}", lambda(), protect());
+        } else if m > 0 {
             eprintln!(
                 "b2 mirror: V41_SUB={m} ({}), min rank {}, max weight {}",
                 if m == 1 { "dry run" } else { "SUBSTITUTING" },
@@ -94,6 +106,54 @@ pub fn min_rank() -> usize {
         std::env::var("V41_SUB_MIN_RANK").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(6).clamp(1, 6)
     });
     *R
+}
+
+/// `V41_SUB_LAMBDA` (mode 3; default 0.1, clamped to [0, 1]): the cache-prior
+/// strength, as a fraction of the layer's running selection-score range.
+pub fn lambda() -> f32 {
+    static L: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_SUB_LAMBDA").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.1).clamp(0.0, 1.0)
+    });
+    *L
+}
+
+/// `V41_SUB_PROTECT` (mode 3; default 2): the original top picks the prior
+/// may never displace (the paper's J; 2 for fine-grained MoEs).
+pub fn protect() -> u32 {
+    static J: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_SUB_PROTECT").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(2).min(6)
+    });
+    *J
+}
+
+/// Running per-layer average of the selection-score range (`Delta_layer`),
+/// as f32 bits; 0 = not observed yet.
+static DELTA_BITS: [std::sync::atomic::AtomicU32; LAYERS] = [const { std::sync::atomic::AtomicU32::new(0) }; LAYERS];
+
+/// Fold one call's per-row ranges into the layer's running average
+/// (exponential, alpha 0.05 per lane-layer call; the first call seeds it).
+pub fn observe_range(layer: i32, ranges: &[f32]) {
+    let l = layer as usize;
+    if l >= LAYERS || ranges.is_empty() {
+        return;
+    }
+    let mean = ranges.iter().copied().filter(|r| r.is_finite() && *r > 0.0).sum::<f32>() / ranges.len() as f32;
+    if !(mean.is_finite() && mean > 0.0) {
+        return;
+    }
+    let old = f32::from_bits(DELTA_BITS[l].load(Ordering::Relaxed));
+    let new = if old > 0.0 { old + 0.05 * (mean - old) } else { mean };
+    DELTA_BITS[l].store(new.to_bits(), Ordering::Relaxed);
+}
+
+/// `Delta_layer`, once observed.
+pub fn delta(layer: i32) -> Option<f32> {
+    let l = layer as usize;
+    if l >= LAYERS {
+        return None;
+    }
+    let d = f32::from_bits(DELTA_BITS[l].load(Ordering::Relaxed));
+    (d > 0.0).then_some(d)
 }
 
 /// `V41_SUB_PENDING` (default on): overlay picks of sent, unanswered requests
@@ -653,6 +713,21 @@ mod tests {
         // Not vacuous: a planner that never swaps would fail here.
         assert!(total_slots > 1000, "only {total_slots} swaps in 3000 trials");
         assert!(multi_row_swaps > 300, "only {multi_row_swaps} trials swapped in several rows");
+    }
+
+    /// Cache-prior Delta: the first call seeds it, later calls move it by 5%
+    /// of the gap; non-finite and non-positive ranges are ignored.
+    #[test]
+    fn delta_running_average() {
+        let l = (LAYERS - 2) as i32;
+        assert_eq!(delta(l), None);
+        observe_range(l, &[]);
+        observe_range(l, &[f32::NAN, 0.0]);
+        assert_eq!(delta(l), None, "no valid range yet");
+        observe_range(l, &[2.0, 4.0]);
+        assert_eq!(delta(l), Some(3.0));
+        observe_range(l, &[5.0]);
+        assert!((delta(l).unwrap() - 3.1).abs() < 1e-6);
     }
 
     /// The mirror is process-global; this is its only test, on a layer no

@@ -189,3 +189,113 @@ fn alts_slice_views_land_at_the_right_rows() -> eyre::Result<()> {
     assert_eq!(bits(&got_w), bits(&full.alt_w[r0 * na..(r0 + n) * na]), "sub-range alt weights");
     Ok(())
 }
+
+/// CACHE-PRIOR (`RouterEx::prior`): a zero prior is bit-identical to none;
+/// the original top-J are never displaced; a boost moves a non-protected
+/// expert in exactly when it beats the displaced one's score; weights are the
+/// exact renormalization over the final set; `orig_sel` is the plain top-K
+/// and `range_out` the max - min of the selection scores.
+#[test]
+fn cache_prior_protects_top_j_and_renormalizes_exactly() -> eyre::Result<()> {
+    use v4flash_kernels::router_topk::RouterEx;
+    let Some(dev) = pick("gfx1151") else {
+        eprintln!("no gfx1151 device; skipping");
+        return Ok(());
+    };
+    dev.set_current()?;
+    let arch = dev.properties()?.gcn_arch_name;
+    let s = Stream::new(dev.id)?;
+    let (ne, nu) = (N_EXPERT as usize, N_EXPERT_USED);
+    let mut g = rng(0x51f15e);
+    let logits_h: Vec<f32> = (0..B * ne).map(|_| g()).collect();
+    let bias_h: Vec<f32> = (0..ne).map(|_| g() * 0.02).collect();
+    let mut logits = DeviceBuffer::<f32>::new(dev.id, B * ne)?;
+    logits.copy_from_host(&logits_h)?;
+    let mut bias = DeviceBuffer::<f32>::new(dev.id, ne)?;
+    bias.copy_from_host(&bias_h)?;
+    let par = RouterTopk::for_arch(&arch)?;
+    let prob = |t: usize, e: usize| -> f64 {
+        let x = logits_h[t * ne + e] as f64;
+        let sp = if x > 20.0 { x } else if x < -20.0 { x.exp() } else { x.exp().ln_1p() };
+        sp.sqrt()
+    };
+    let score = |t: usize, e: usize| prob(t, e) + bias_h[e] as f64;
+
+    // Runs the router with an optional prior; returns (sel, ew, orig, range).
+    let go = |prior_h: Option<&[f32]>, n_protect: u32| -> eyre::Result<(Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>)> {
+        let mut sel = DeviceBuffer::<i32>::new(dev.id, B * nu)?;
+        let mut ew = DeviceBuffer::<f32>::new(dev.id, B * nu)?;
+        let mut orig = DeviceBuffer::<i32>::new(dev.id, B * nu)?;
+        let mut range = DeviceBuffer::<f32>::new(dev.id, B)?;
+        let mut pr = DeviceBuffer::<f32>::new(dev.id, ne)?;
+        if let Some(p) = prior_h {
+            pr.copy_from_host(p)?;
+        }
+        par.launch_batched_ex(
+            &s, &mut sel, &mut ew, &logits, Some(&bias), N_EXPERT, nu as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, B as u32,
+            RouterEx { prior: prior_h.map(|_| &pr), n_protect, orig_sel: Some(&mut orig), range_out: Some(&mut range), ..Default::default() },
+        )?;
+        s.synchronize()?;
+        let (mut a, mut b, mut c, mut d) = (vec![0i32; B * nu], vec![0f32; B * nu], vec![0i32; B * nu], vec![0f32; B]);
+        sel.copy_to_host(&mut a)?;
+        ew.copy_to_host(&mut b)?;
+        orig.copy_to_host(&mut c)?;
+        range.copy_to_host(&mut d)?;
+        Ok((a, b, c, d))
+    };
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+
+    // 1. No prior: orig == sel, range matches the host; zero prior is bit-identical.
+    let (sel0, ew0, orig0, range0) = go(None, 2)?;
+    assert_eq!(orig0, sel0, "orig_sel without a prior");
+    for t in 0..B {
+        let (mx, mn) = (0..ne).fold((f64::MIN, f64::MAX), |(a, b), e| (a.max(score(t, e)), b.min(score(t, e))));
+        assert!((range0[t] as f64 - (mx - mn)).abs() < 1e-4, "t={t}: range {} vs {}", range0[t], mx - mn);
+    }
+    let zeros = vec![0f32; ne];
+    let (sel_z, ew_z, _, _) = go(Some(&zeros), 2)?;
+    assert_eq!(sel_z, sel0, "zero prior moved picks");
+    assert_eq!(bits(&ew_z), bits(&ew0), "zero prior moved weights");
+
+    // 2. A boost on a random half of the experts ("held"), sized like the
+    //    policy (lambda * range): protected ranks stay, final set is the
+    //    top-(nu-J) of score + prior among the rest, weights exact.
+    for (n_protect, boost) in [(2u32, 0.05f32), (1, 0.3), (2, 10.0)] {
+        let held: Vec<bool> = (0..ne).map(|e| (e * 2654435761usize) % 7 < 3).collect();
+        let prior_h: Vec<f32> = held.iter().map(|&h| if h { boost } else { 0.0 }).collect();
+        let (sel, ew, orig, _) = go(Some(&prior_h), n_protect)?;
+        assert_eq!(orig, orig0, "orig_sel must ignore the prior");
+        for t in 0..B {
+            let row = &sel[t * nu..(t + 1) * nu];
+            let j = n_protect as usize;
+            assert_eq!(&row[..j], &orig0[t * nu..t * nu + j], "t={t}: protected picks displaced");
+            // The rest: host top-(nu-j) of score + prior over experts not protected.
+            let prot: Vec<i32> = orig0[t * nu..t * nu + j].to_vec();
+            let mut cand: Vec<usize> = (0..ne).filter(|&e| !prot.contains(&(e as i32))).collect();
+            let bs = |e: usize| score(t, e) + prior_h[e] as f64;
+            cand.sort_by(|&a, &b| bs(b).partial_cmp(&bs(a)).unwrap().then(a.cmp(&b)));
+            for (k, &e) in row[j..].iter().enumerate() {
+                let want = cand[k];
+                if e as usize != want {
+                    let gap = (bs(e as usize) - bs(want)).abs();
+                    assert!(gap < 1e-5, "t={t} slot {}: got {e} want {want} (gap {gap:e})", j + k);
+                }
+            }
+            // Weights: exact renormalization of the unbiased probs over the final set.
+            let sum: f64 = row.iter().map(|&e| prob(t, e as usize)).sum();
+            for (k, &e) in row.iter().enumerate() {
+                let want = prob(t, e as usize) / sum * EXPERT_WEIGHT_SCALE as f64;
+                assert!((ew[t * nu + k] as f64 - want).abs() < 1e-5, "t={t} slot {k}: w {} vs {want}", ew[t * nu + k]);
+            }
+        }
+        if boost >= 10.0 {
+            // A huge boost: every non-protected slot is a held expert.
+            for t in 0..B {
+                for &e in &sel[t * nu + n_protect as usize..(t + 1) * nu] {
+                    assert!(held[e as usize], "t={t}: huge boost left an unheld expert {e}");
+                }
+            }
+        }
+    }
+    Ok(())
+}

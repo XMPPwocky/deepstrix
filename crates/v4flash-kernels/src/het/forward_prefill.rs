@@ -778,10 +778,22 @@ pub fn router_alts() -> u32 {
 /// (the only ownership mode it predicts), and router alternatives present.
 /// A fidelity-gate routing pin must also switch it off here.
 fn substitution_active(rows: &RowLayout<'_>, remote_split_on: bool, n_alt: usize) -> bool {
-    super::b2_mirror::mode() > 0
+    matches!(super::b2_mirror::mode(), 1 | 2)
         && n_alt > 0
         && matches!(rows, RowLayout::Arena { .. })
         && remote_split_on
+        && super::expert_pager::t2_partition()
+}
+
+/// Is the CACHE-PRIOR (`V41_SUB=3`) live for this lane-layer's router launch?
+/// Decode rows only, learned router, under the T2 partition with a remote
+/// that owns this layer. A fidelity-gate routing pin must also switch it off.
+fn cache_prior_active(rows: &RowLayout<'_>, hash_router: bool, remote_owns_layer: bool) -> bool {
+    super::b2_mirror::mode() == 3
+        && !hash_router
+        && matches!(rows, RowLayout::Arena { .. })
+        && remote_split_active()
+        && remote_owns_layer
         && super::expert_pager::t2_partition()
 }
 
@@ -2249,6 +2261,10 @@ pub struct PreMoeCarry {
     /// instead of streaming the layer's experts twice. Set by the pipelined
     /// driver on the lane it routes FIRST; false everywhere else.
     pub partner_follows: bool,
+    /// Cache-prior (`V41_SUB=3`): the router wrote `d_orig_sel` / `d_range`
+    /// for this lane-layer (`sub3`), and applied a non-zero prior (`prior_on`).
+    sub3: bool,
+    prior_on: bool,
     /// Alternatives per row the router wrote to `bd.d_alts` for THIS layer
     /// (`router_alts()`, or 0 on a hash-router layer, whose picks come from
     /// the host and leave `d_alts` stale).
@@ -5965,13 +5981,49 @@ impl HeterogeneousEngine {
             0
         };
         let image_runs = image_spans::image_runs(tokens);
+        let remote_owns_layer_early = self
+            .remote
+            .as_ref()
+            .and_then(|r| r.lock().ok().map(|c| c.info().owned_count(layer as u32) > 0))
+            .unwrap_or(false);
+        let sub3 = cache_prior_active(rows, dlw.is_hash_router, remote_owns_layer_early);
+        let mut prior_on = false;
         if !dlw.is_hash_router {
             // Top-k: one block per token in a single launch (B→1 launches).
             // (Image rows are recomputed with bias_vl right below — same
             // stream, FIFO — so this full-batch launch stays as-is.)
             let _t = de.events.stage("k.router.topk", &de.compute)?;
             let n_alt = n_alt_layer;
-            de.router_topk.launch_batched_alts(
+            // CACHE-PRIOR (`V41_SUB=3`, het::b2_mirror): boost the selection score
+            // of every expert held by the box that computes it by lambda * Delta
+            // (the layer's running score range), so a pick box 2 would have to
+            // read is displaced by a held expert within that gap. Built from
+            // box 2's mirror and box 1's pager, and copied ASYNC on the chain's
+            // stream (a blocking copy here would stall the host behind this
+            // lane's queued attention) from a per-layer pinned slot.
+            if sub3 {
+                if let (Some(delta), Some(pg)) = (super::b2_mirror::delta(layer), pager.as_deref()) {
+                    let boost = super::b2_mirror::lambda() * delta;
+                    if boost > 0.0 && super::b2_mirror::resident(layer, 0).is_some() {
+                        let ne = N_EXPERT as usize;
+                        let slot = (layer as usize) * ne;
+                        {
+                            let dst = &mut bd.prior_pin.as_mut_slice()[slot..slot + ne];
+                            for (e, d) in dst.iter_mut().enumerate() {
+                                let held = if super::expert_pager::partition_box2(layer, e as u32) {
+                                    super::b2_mirror::resident(layer, e as u32) == Some(true)
+                                } else {
+                                    pg.is_resident(layer, e as u32)
+                                };
+                                *d = if held { boost } else { 0.0 };
+                            }
+                        }
+                        bd.d_prior.copy_from_host_async(&bd.prior_pin.as_slice()[slot..slot + ne], &de.compute)?;
+                        prior_on = true;
+                    }
+                }
+            }
+            de.router_topk.launch_batched_ex(
                 &de.compute,
                 &mut bd.d_selected,
                 &mut bd.d_ew,
@@ -5982,9 +6034,15 @@ impl HeterogeneousEngine {
                 EXPERT_WEIGHT_SCALE,
                 ROUTER_WEIGHT_EPS,
                 b,
-                if n_alt > 0 { Some(&mut bd.d_alts) } else { None },
-                n_alt,
-                if n_alt > 0 { Some(&mut bd.d_alt_w) } else { None },
+                crate::router_topk::RouterEx {
+                    alts: if n_alt > 0 { Some(&mut bd.d_alts) } else { None },
+                    n_alt,
+                    alt_w: if n_alt > 0 { Some(&mut bd.d_alt_w) } else { None },
+                    prior: if prior_on { Some(&bd.d_prior) } else { None },
+                    n_protect: super::b2_mirror::protect(),
+                    orig_sel: if sub3 { Some(&mut bd.d_orig_sel) } else { None },
+                    range_out: if sub3 { Some(&mut bd.d_range) } else { None },
+                },
             )?;
         if let Some(nl) = look_next {
             let _t = de.events.stage("k.router.lookahead", &de.compute)?;
@@ -6273,6 +6331,8 @@ impl HeterogeneousEngine {
             lookahead_hints_ok: true,
             partner_follows: false,
             n_alt: n_alt_layer,
+            sub3,
+            prior_on,
             ..Default::default()
         })
     }
@@ -6292,7 +6352,7 @@ impl HeterogeneousEngine {
         rows: &RowLayout<'_>,
     ) -> eyre::Result<()> {
         if !c.advance(PreMoePhase::Chained, PreMoePhase::Routed)? { return Ok(()); }
-        let PreMoeCarry { layer, b, cs_n_used, cs_n_embd, remote_split_on, sparse_resid_layer, moe_group_bound, split_cap, lookahead_hints_ok, partner_follows, n_alt, .. } = *c;
+        let PreMoeCarry { layer, b, cs_n_used, cs_n_embd, remote_split_on, sparse_resid_layer, moe_group_bound, split_cap, lookahead_hints_ok, partner_follows, n_alt, sub3, prior_on, .. } = *c;
         let _ = (cs_n_embd, split_cap, moe_group_bound);
         let _ = &self.dgpu;
         let look_next: Option<&DgpuLayerWeights> = match &rows {
@@ -6392,6 +6452,16 @@ impl HeterogeneousEngine {
                     alt_w_host = vec![0f32; (b as usize) * na];
                     bd.d_alt_w.slice_view(0, alt_w_host.len()).copy_to_host(&mut alt_w_host)?;
                 }
+                // Cache-prior (`V41_SUB=3`): the picks without the prior, and the
+                // score ranges that feed the layer's running Delta.
+                let mut orig_host: Vec<i32> = Vec::new();
+                if sub3 {
+                    orig_host = vec![0i32; n_sel];
+                    bd.d_orig_sel.slice_view(0, n_sel).copy_to_host(&mut orig_host)?;
+                    let mut range_host = vec![0f32; b as usize];
+                    bd.d_range.slice_view(0, b as usize).copy_to_host(&mut range_host)?;
+                    super::b2_mirror::observe_range(layer, &range_host);
+                }
                 drop(_t_d2h);
                 if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} A after readback"); }
                 // BOX-2 MISS SUBSTITUTION (`V41_SUB`, het::b2_mirror,
@@ -6476,6 +6546,56 @@ impl HeterogeneousEngine {
                                 pw.join(" ")
                             ));
                         }
+                    }
+                }
+                // Cache-prior accounting: what the router's prior displaced, and
+                // background admission of displaced box-2 experts (as in mode 2).
+                if sub3 && prior_on && orig_host.len() == sel_host.len() {
+                    let _t_sub = LayerHostTimer::start(&LH_SUB);
+                    let box2_missing = |e: i32| {
+                        (0..N_EXPERT as i32).contains(&e)
+                            && super::expert_pager::partition_box2(layer, e as u32)
+                            && super::b2_mirror::resident(layer, e as u32) == Some(false)
+                    };
+                    let mut predicted: Vec<i32> = Vec::new();
+                    for &e in &orig_host {
+                        if box2_missing(e) && !predicted.contains(&e) {
+                            predicted.push(e);
+                        }
+                    }
+                    let mut slots = 0u32;
+                    let mut admit: Vec<u32> = Vec::new();
+                    for r in 0..b as usize {
+                        let orow = &orig_host[r * cs_n_used..(r + 1) * cs_n_used];
+                        let frow = &sel_host[r * cs_n_used..(r + 1) * cs_n_used];
+                        let gone: Vec<i32> = orow.iter().copied().filter(|e| !frow.contains(e)).collect();
+                        let added: Vec<i32> = frow.iter().copied().filter(|e| !orow.contains(e)).collect();
+                        slots += gone.len() as u32;
+                        for (k, &f) in gone.iter().enumerate() {
+                            if trace_on {
+                                // `C <layer> <b> <row> <from> <to>`: a cache-prior swap.
+                                let t = added.get(k).copied().unwrap_or(-1);
+                                super::expert_pager::pick_trace(&format!("C {layer} {b} {r} {f} {t}"));
+                            }
+                            if super::b2_mirror::admit_on() && box2_missing(f) {
+                                let w = ((layer as u32) << 16) | f as u32;
+                                if !admit.contains(&w) {
+                                    admit.push(w);
+                                }
+                            }
+                        }
+                    }
+                    let avoided = predicted.iter().filter(|e| !sel_host.contains(e)).count() as u32;
+                    super::b2_mirror::record(&super::b2_mirror::SubOutcome {
+                        predicted: predicted.len() as u32,
+                        avoided,
+                        slots,
+                        blocked: predicted.len() as u32 - avoided,
+                        failed: 0,
+                    });
+                    if !admit.is_empty() {
+                        super::remote_experts::push_prefetch_words(&admit);
+                        super::b2_mirror::note_admits(admit.len());
                     }
                 }
                 let mut sel_orig: Vec<i32> = Vec::new();

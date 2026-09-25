@@ -46,7 +46,14 @@ extern "C" __global__ void router_topk(
         float          weight_eps,
         int          * __restrict__ alts,          // may be nullptr; [n_alt]
         unsigned int   n_alt,
-        float        * __restrict__ alt_w) {       // may be nullptr; see router_topk_par.hip
+        float        * __restrict__ alt_w,         // may be nullptr; see router_topk_par.hip
+        // Cache-prior arguments (see router_topk_par.hip). This serial REFERENCE
+        // does not implement the prior: it must be nullptr here. `orig_sel`
+        // (= the plain picks) and `range_out` are filled when given.
+        const float  * __restrict__ prior,
+        unsigned int   n_protect,
+        int          * __restrict__ orig_sel,
+        float        * __restrict__ range_out) {
     __shared__ float s_probs[ROUTER_MAX_EXPERTS];
     __shared__ float s_select[ROUTER_MAX_EXPERTS];
     __shared__ int   s_sel[ROUTER_MAX_USED + ROUTER_MAX_ALT];
@@ -96,6 +103,16 @@ extern "C" __global__ void router_topk(
             sum += p;
         }
         if (sum < weight_eps) sum = weight_eps;
+        if (range_out != nullptr) {
+            float mx = -INFINITY, mn = INFINITY;
+            for (unsigned int i = 0; i < n_expert; ++i) {
+                mx = fmaxf(mx, s_select[i]);
+                mn = fminf(mn, s_select[i]);
+            }
+            range_out[0] = mx - mn;
+        }
+        (void)prior;
+        (void)n_protect;
         s_sum = sum;
     }
     __syncthreads();
@@ -103,6 +120,7 @@ extern "C" __global__ void router_topk(
     if (tid < n_used) {
         selected[tid] = s_sel[tid];
         weights[tid]  = s_w[tid] / s_sum * expert_weight_scale;
+        if (orig_sel != nullptr) orig_sel[tid] = s_sel[tid];
     } else if (tid < n_used + n_alt) {
         const int a = s_sel[tid];
         alts[tid - n_used] = a;
