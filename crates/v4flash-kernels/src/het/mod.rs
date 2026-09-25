@@ -35,7 +35,7 @@ pub mod state;
 pub mod sync;
 pub mod trace;
 pub mod route_probe;
-pub mod routing_tap;
+pub mod fidelity_tap;
 pub mod weights;
 
 pub use batch_scratch::{

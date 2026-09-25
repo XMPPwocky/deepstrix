@@ -1368,6 +1368,9 @@ impl HeterogeneousEngine {
             // top of forward_token. Together this gives us a
             // ds4-comparable set of 43 files (indices 00..42).
             maybe_dump_residual(layer + 1, &dgpu_scratch.residual)?;
+            if super::fidelity_tap::residual_sink_on() {
+                super::fidelity_tap::residual_sink_push(&self.dgpu.compute, layer, &dgpu_scratch.residual)?;
+            }
         }
         self.forward_head(dgpu_scratch, &weights.global)?;
         // DECODE logits dump, companion to prefill's `V41_PREFILL_LOGITS_DUMP`.

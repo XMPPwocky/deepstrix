@@ -5921,10 +5921,10 @@ impl HeterogeneousEngine {
                 )?;
             }
         }
-        // Fidelity gate: force the reference's picks (`routing_tap` PIN), after
+        // Fidelity gate: force the reference's picks (`fidelity_tap` PIN), after
         // the image-row recompute so every row is final.
-        if super::routing_tap::pin_on() {
-            super::routing_tap::pin_device_rows(
+        if super::fidelity_tap::pin_on() {
+            super::fidelity_tap::pin_device_rows(
                 &de.compute,
                 layer as usize,
                 &pos_at,
@@ -6227,9 +6227,9 @@ impl HeterogeneousEngine {
                         super::expert_pager::pick_trace(&format!("P {layer} {b} {}", ids.join(" ")));
                     }
                 }
-                if super::routing_tap::pick_sink_on() {
+                if super::fidelity_tap::pick_sink_on() {
                     for r in 0..b as usize {
-                        super::routing_tap::pick_sink_push(true, layer as usize, r as u32, b, &sel_host[r * cs_n_used..(r + 1) * cs_n_used]);
+                        super::fidelity_tap::pick_sink_push(true, layer as usize, r as u32, b, &sel_host[r * cs_n_used..(r + 1) * cs_n_used]);
                     }
                 }
                 // C3: with the split active, box 2 OWNS half of this layer's
