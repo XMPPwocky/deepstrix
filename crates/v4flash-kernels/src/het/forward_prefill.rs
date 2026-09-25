@@ -772,6 +772,19 @@ pub fn router_alts() -> u32 {
     *M
 }
 
+/// Is box-2 miss substitution (`het::b2_mirror`) live for this lane-layer?
+/// Decode rows only (`RowLayout::Arena`: prefill chunks, the CED replay and the
+/// DSpark verify are `Contiguous`), with the box split under the T2 partition
+/// (the only ownership mode it predicts), and router alternatives present.
+/// A fidelity-gate routing pin must also switch it off here.
+fn substitution_active(rows: &RowLayout<'_>, remote_split_on: bool, n_alt: usize) -> bool {
+    super::b2_mirror::mode() > 0
+        && n_alt > 0
+        && matches!(rows, RowLayout::Arena { .. })
+        && remote_split_on
+        && super::expert_pager::t2_partition()
+}
+
 pub fn lookahead_prefetch() -> bool {
     static B: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("V41_LOOKAHEAD_PREFETCH").as_deref() == Ok("1"));
@@ -5941,13 +5954,23 @@ impl HeterogeneousEngine {
             RowLayout::Arena { next_router2, .. } if lookahead_prefetch() && lookahead_depth() >= 2 => next_router2.filter(|nl| !nl.is_hash_router),
             _ => None,
         };
+        // Router alternatives (`V41_ROUTER_ALTS`) only where they are used: decode
+        // rows (box-2 miss substitution) or when the pick trace records them.
+        // Prefill chunks otherwise skip the extra argmax passes and readbacks.
+        let n_alt_layer: u32 = if !dlw.is_hash_router
+            && (matches!(rows, RowLayout::Arena { .. }) || super::expert_pager::pick_trace_on())
+        {
+            router_alts()
+        } else {
+            0
+        };
         let image_runs = image_spans::image_runs(tokens);
         if !dlw.is_hash_router {
             // Top-k: one block per token in a single launch (B→1 launches).
             // (Image rows are recomputed with bias_vl right below — same
             // stream, FIFO — so this full-batch launch stays as-is.)
             let _t = de.events.stage("k.router.topk", &de.compute)?;
-            let n_alt = router_alts();
+            let n_alt = n_alt_layer;
             de.router_topk.launch_batched_alts(
                 &de.compute,
                 &mut bd.d_selected,
@@ -6050,7 +6073,7 @@ impl HeterogeneousEngine {
                 let mut ew_v = bd.d_ew.slice_view_mut(r0 * cs_n_used, n * cs_n_used);
                 // Rewrite these rows' alternatives too, or they would be the
                 // text-bias ranking under image-bias picks.
-                let n_alt = router_alts() as usize;
+                let n_alt = n_alt_layer as usize;
                 let mut alts_v = bd.d_alts.slice_view_mut(r0 * n_alt, n * n_alt);
                 let mut alt_w_v = bd.d_alt_w.slice_view_mut(r0 * n_alt, n * n_alt);
                 de.router_topk.launch_batched_alts(
@@ -6249,7 +6272,7 @@ impl HeterogeneousEngine {
             drain_before_ensure: true,
             lookahead_hints_ok: true,
             partner_follows: false,
-            n_alt: if dlw.is_hash_router { 0 } else { router_alts() },
+            n_alt: n_alt_layer,
             ..Default::default()
         })
     }
@@ -6371,75 +6394,94 @@ impl HeterogeneousEngine {
                 }
                 drop(_t_d2h);
                 if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} A after readback"); }
-                if super::expert_pager::pick_trace_on() {
+                // BOX-2 MISS SUBSTITUTION (`V41_SUB`, het::b2_mirror,
+                // docs/v41/BOX2_MISS_SUBSTITUTION.md). A pick bound for box 2 that the
+                // mirror says box 2 will not hold is swapped for the row's best-ranked
+                // alternative that one box holds, and the row is renormalized exactly.
+                // Runs AFTER the pick trace (which keeps the router's own picks) and
+                // BEFORE the pick loop, ownership split and box-2 submit, so everything
+                // below sees ordinary picks.
+                let sub_on = substitution_active(rows, remote_split_on, na);
+                let trace_on = super::expert_pager::pick_trace_on();
+                let predicted_miss = |e: i32| {
+                    (0..N_EXPERT as i32).contains(&e)
+                        && super::expert_pager::partition_box2(layer, e as u32)
+                        && super::b2_mirror::resident(layer, e as u32) == Some(false)
+                };
+                let any_predicted = sub_on && sel_host.iter().any(|&e| predicted_miss(e));
+                // The router weights, read at most once per lane-layer: for the
+                // trace, the substitution, and the box-2 submit below (which would
+                // otherwise read them again).
+                let mut ew_pre: Option<Vec<f32>> = None;
+                if any_predicted || (trace_on && na > 0) {
+                    let _t_sub = LayerHostTimer::start(&LH_SUB);
+                    // Uncached bind: the pager may have switched devices behind the
+                    // engine's cache (see the box-2 submit below).
+                    self.dgpu.device.set_current()?;
+                    self.current_device.store(self.dgpu.device.id, std::sync::atomic::Ordering::Relaxed);
+                    let mut w = vec![0f32; n_sel];
+                    bd.d_ew.slice_view(0, n_sel).copy_to_host(&mut w)?;
+                    ew_pre = Some(w);
+                }
+                if trace_on {
                     for r in 0..b as usize {
                         let row = &sel_host[r * cs_n_used..(r + 1) * cs_n_used];
                         let ids: Vec<String> = row.iter().map(|v| v.to_string()).collect();
                         super::expert_pager::pick_trace(&format!("P {layer} {b} {}", ids.join(" ")));
-                        // `A <layer> <b> <alts...> / <owner> / <alt_w...>`:
-                        // this row's alternatives in rank order, then one char
-                        // per pick and alternative (6 + n_alt; 2 = box 2 owns it
-                        // under the partition, 1 = box 1), then each
-                        // alternative's weight on `d_ew`'s scale. Parsers keyed
-                        // on `P`/`D` skip it.
+                        // `A <layer> <b> <alts> / <owner> / <alt_w> / <pick_w> / <state>`:
+                        // this row's alternatives in rank order; one char per pick
+                        // then alternative (6 + n_alt) for the box that computes it
+                        // (2 = box 2 under the partition, 1 = box 1); the
+                        // alternatives' weights and the picks' weights, both on
+                        // `d_ew`'s scale (sum 1.5); then one char per pick then
+                        // alternative for residency at route time: box 2's mirror
+                        // R held / M missing / ? not yet reported, box 1's pager
+                        // r held / m missing. Enough to replay any substitution
+                        // gate offline. Parsers keyed on `P`/`D` skip it.
                         if na > 0 {
                             let alts = &alts_host[r * na..(r + 1) * na];
                             let a: Vec<String> = alts.iter().map(|v| v.to_string()).collect();
                             let aw: Vec<String> =
                                 alt_w_host[r * na..(r + 1) * na].iter().map(|w| format!("{w:.4}")).collect();
-                            let owner: String = row
-                                .iter()
-                                .chain(alts.iter())
-                                .map(|&e| {
-                                    if (0..N_EXPERT as i32).contains(&e)
-                                        && super::expert_pager::partition_box2(layer, e as u32)
-                                    {
-                                        '2'
-                                    } else {
-                                        '1'
+                            let pw: Vec<String> = match ew_pre.as_ref() {
+                                Some(w) => w[r * cs_n_used..(r + 1) * cs_n_used].iter().map(|w| format!("{w:.4}")).collect(),
+                                None => Vec::new(),
+                            };
+                            let mut owner = String::with_capacity(cs_n_used + na);
+                            let mut state = String::with_capacity(cs_n_used + na);
+                            for &e in row.iter().chain(alts.iter()) {
+                                let valid = (0..N_EXPERT as i32).contains(&e);
+                                let box2 = valid && super::expert_pager::partition_box2(layer, e as u32);
+                                owner.push(if box2 { '2' } else { '1' });
+                                state.push(if !valid {
+                                    '-'
+                                } else if box2 {
+                                    match super::b2_mirror::resident(layer, e as u32) {
+                                        Some(true) => 'R',
+                                        Some(false) => 'M',
+                                        None => '?',
                                     }
-                                })
-                                .collect();
+                                } else if pg.is_resident(layer, e as u32) {
+                                    'r'
+                                } else {
+                                    'm'
+                                });
+                            }
                             super::expert_pager::pick_trace(&format!(
-                                "A {layer} {b} {} / {owner} / {}",
+                                "A {layer} {b} {} / {owner} / {} / {} / {state}",
                                 a.join(" "),
-                                aw.join(" ")
+                                aw.join(" "),
+                                pw.join(" ")
                             ));
                         }
                     }
                 }
-                // BOX-2 MISS SUBSTITUTION (`V41_SUB`, het::b2_mirror,
-                // docs/v41/BOX2_MISS_SUBSTITUTION.md). Decode rows only (Arena), under
-                // the T2 partition, with router alternatives. A pick bound for box 2
-                // that the mirror says box 2 does not hold is swapped for the row's
-                // best-ranked alternative that one box holds, and the row is
-                // renormalized exactly. Placed AFTER the pick trace (which keeps the
-                // router's own picks) and BEFORE the pick loop, ownership split and
-                // box-2 submit, so everything below sees ordinary picks. The device
-                // copies are rewritten here as well: `pre_moe_prep` peer-pushes them
-                // to the iGPU, and the box-2 submit reads `d_ew` back further down.
-                // Nothing already queued reads them after this point
-                // (`record_sel_stats` finished under the blocking readback above).
                 let mut sel_orig: Vec<i32> = Vec::new();
-                if super::b2_mirror::mode() > 0
-                    && na > 0
-                    && matches!(rows, RowLayout::Arena { .. })
-                    && remote_split_on
-                    && super::expert_pager::t2_partition()
-                {
-                    // Uncached bind: the pager may have switched devices behind the
-                    // engine's cache (see the box-2 submit below).
-                    self.dgpu.device.set_current()?;
-                    self.current_device.store(self.dgpu.device.id, std::sync::atomic::Ordering::Relaxed);
-                    let mut ew_sub = vec![0f32; n_sel];
-                    bd.d_ew.slice_view(0, n_sel).copy_to_host(&mut ew_sub)?;
+                if any_predicted {
+                    let _t_sub = LayerHostTimer::start(&LH_SUB);
+                    let mut ew_sub = ew_pre.clone().unwrap_or_default();
                     let mut sel_sub = sel_host.clone();
                     let pg_ref: &super::expert_pager::ExpertPager = pg;
-                    let predicted_miss = |e: i32| {
-                        (0..N_EXPERT as i32).contains(&e)
-                            && super::expert_pager::partition_box2(layer, e as u32)
-                            && super::b2_mirror::resident(layer, e as u32) == Some(false)
-                    };
                     let acceptable = |a: i32| {
                         (0..N_EXPERT as i32).contains(&a)
                             && if super::expert_pager::partition_box2(layer, a as u32) {
@@ -6455,28 +6497,43 @@ impl HeterogeneousEngine {
                         &alt_w_host,
                         cs_n_used,
                         na,
-                        super::b2_mirror::min_rank(),
-                        EXPERT_WEIGHT_SCALE,
-                        predicted_miss,
+                        super::b2_mirror::SubRules::from_env(EXPERT_WEIGHT_SCALE),
+                        &predicted_miss,
                         acceptable,
                     );
                     super::b2_mirror::record(&o);
                     if o.slots > 0 && super::b2_mirror::mode() == 2 {
-                        if super::expert_pager::pick_trace_on() {
-                            // `S <layer> <b> <row> <rank> <from> <to>` per rewritten pick.
-                            for (i, (&f, &t)) in sel_host.iter().zip(sel_sub.iter()).enumerate() {
-                                if f != t {
-                                    super::expert_pager::pick_trace(&format!(
-                                        "S {layer} {b} {} {} {f} {t}",
-                                        i / cs_n_used,
-                                        i % cs_n_used + 1
-                                    ));
-                                }
+                        for (i, (&f, &t)) in sel_host.iter().zip(sel_sub.iter()).enumerate() {
+                            if f == t {
+                                continue;
+                            }
+                            if trace_on {
+                                // `S <layer> <b> <row> <rank> <from> <to> <w_from> <w_to>`
+                                // per rewritten pick (weights before / after).
+                                let w0 = ew_pre.as_ref().map_or(0.0, |w| w[i]);
+                                super::expert_pager::pick_trace(&format!(
+                                    "S {layer} {b} {} {} {f} {t} {w0:.4} {:.4}",
+                                    i / cs_n_used,
+                                    i % cs_n_used + 1,
+                                    ew_sub[i]
+                                ));
+                            }
+                            // A box-1 substitute was accepted because it is resident
+                            // NOW; the other lane's `ensure` runs before ours in the
+                            // pipelined order, so make it most-recently-used or it may
+                            // be that ensure's victim and the stall just moves here.
+                            if !super::expert_pager::partition_box2(layer, t as u32) {
+                                pg.touch_resident(layer, t as u32);
                             }
                         }
+                        // `pre_moe_prep` peer-pushes these to the iGPU; nothing already
+                        // queued reads them after the blocking readback above.
+                        self.dgpu.device.set_current()?;
+                        self.current_device.store(self.dgpu.device.id, std::sync::atomic::Ordering::Relaxed);
                         bd.d_selected.slice_view_mut(0, n_sel).copy_from_host(&sel_sub)?;
                         bd.d_ew.slice_view_mut(0, n_sel).copy_from_host(&ew_sub)?;
                         sel_orig = std::mem::replace(&mut sel_host, sel_sub);
+                        ew_pre = Some(ew_sub);
                     }
                 }
                 // C3: with the split active, box 2 OWNS half of this layer's
@@ -6782,8 +6839,16 @@ impl HeterogeneousEngine {
                         let _t_rsync = LayerHostTimer::start(&LH_REMOTE_SYNC);
                         let mut xq_host = vec![0u8; xq_bytes];
                         xq_dev.slice_view(0, xq_bytes).copy_to_host(&mut xq_host)?;
-                        let mut ew_host = vec![0f32; n_sel];
-                        bd.d_ew.slice_view(0, n_sel).copy_to_host(&mut ew_host)?;
+                        // Read once above when the trace or the substitution needed it
+                        // (and then already rewritten); otherwise read it now.
+                        let ew_host = match ew_pre.take() {
+                            Some(w) => w,
+                            None => {
+                                let mut w = vec![0f32; n_sel];
+                                bd.d_ew.slice_view(0, n_sel).copy_to_host(&mut w)?;
+                                w
+                            }
+                        };
                         drop(_t_rsync);
                         // Hash what box 1 SENDS. If xq repeats across layers, the stale
                         // value is box 1's own `ffn_input_norm`, not anything remote.
@@ -8497,6 +8562,9 @@ pub static LH_SEL_D2H: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// Idle polls of the ready-first lane driver (nothing ready anywhere). Diagnostic only.
 pub static READY_FIRST_SPINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LH_REMOTE_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Box-2 miss substitution (`het::b2_mirror`): the weights readback, planning,
+/// and the picks/weights write-back, per lane-layer.
+pub static LH_SUB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// EXPOSED-WAIT PROBE (2026-09-22). `lh.work_items_count` (90.7 ms/step) and
 /// `lh.sel_d2h` (39.4) are blocking readbacks, and a blocking readback costs one
 /// of two things that need OPPOSITE fixes: real device work we depend on
@@ -8545,6 +8613,7 @@ pub fn take_layer_host_timing() -> Vec<(&'static str, u64)> {
         ("lh.engram_join", LH_ENGRAM_JOIN.swap(0, Relaxed)),
         ("lh.work_items_count", LH_WORK_ITEMS_COUNT.swap(0, Relaxed)),
         ("lh.sel_d2h", LH_SEL_D2H.swap(0, Relaxed)),
+        ("lh.sub", LH_SUB.swap(0, Relaxed)),
         ("lh.wic_busy_x1e3", LH_WIC_BUSY.swap(0, Relaxed)),
         ("lh.wic_idle_x1e3", LH_WIC_IDLE.swap(0, Relaxed)),
         ("lh.seld2h_busy_x1e3", LH_SEL_D2H_BUSY.swap(0, Relaxed)),

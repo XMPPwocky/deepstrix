@@ -1,5 +1,5 @@
 # Box-2 miss substitution — design sketch
-### 2026-09-24 · status: SKETCH, nothing built · quality validation in progress
+### 2026-09-24/25 · status: BUILT (`V41_SUB`, branch `worktree-b2-miss-substitution`), not deployed
 
 ## The idea
 
@@ -144,6 +144,31 @@ The box-2-side policy below stays as the fallback for mirror errors.
   `sub.predicted_miss` with `box2.misses_x1e6` for mirror accuracy. The pick
   trace gets an `S <layer> <b> <row> <rank> <from> <to>` line per rewritten
   pick.
+- **After review (same day):**
+  - Picks in box-2 requests already sent for a layer count as resident until
+    that layer's next reply (`note_submitted`), so a lane does not avoid a read
+    the other lane already asked for.
+  - The planner blocks up front what fails whatever the competition (rank, no
+    held alternative), then re-plans until nothing new is blocked, so a blocked
+    expert frees the alternative it would have taken.
+  - Optional mass cap `V41_SUB_MAX_W`: both the missing pick's weight and the
+    substitute's renormalized weight must be at or below it (any rank).
+  - Accepted box-1 substitutes are made most-recently-used in the pager, so the
+    other lane's `ensure` does not evict them first.
+  - Router weights are read at most once per lane-layer, and only when there is a
+    predicted miss or the trace is on, then handed to the box-2 submit. The time
+    goes to `lh.sub`.
+  - Alternatives are computed only for decode rows (or when the trace is on).
+  - The hub's reply size limit allows for the map.
+- **Trace:** `A <layer> <b> <alts> / <owner> / <alt_w> / <pick_w> / <state>`,
+  where state is one char per pick then alternative: box 2's mirror R/M/?, box
+  1's pager r/m. Plus `S <layer> <b> <row> <rank> <from> <to> <w_from> <w_to>`
+  per swap. Enough to replay any gate (rank, weight cap) offline.
+- **Known limitation:** lanes are planned one at a time. Lane A can swap away an
+  expert that lane B then reads anyway (B picked it above `min_rank`, or had no
+  alternative), so A pays the quality cost for no time saved. Fixing it means
+  planning both lanes after both readbacks. Cross-lane overlap is ~24% overall
+  and lower for cold experts.
 - Not yet: DSpark verify rows (Contiguous + `speculative_append`, excluded),
   the fidelity-pin skip (the pin lives on `worktree-architecture-review`), and
   the box-2-side fallback.
@@ -187,12 +212,14 @@ scores at all, only ranked candidate ids. In the reference, a swap moves the
 being validated on its own (`anyrank25_inherit`). Build v2 only if that run is
 clearly worse.
 
-## Wire protocol (VERSION 4 -> 5)
+## Wire protocol for the box-2-side fallback (NOT built)
 
-New request flag `REQ_FLAG_ALTS = 64`. After the prefetch block: `u32 m`, then
+What is built is the residency map (`REQ_FLAG_RESID` = 64, see above); this
+section is the fallback's own design. New request flag `REQ_FLAG_ALTS = 128`. After the prefetch block: `u32 m`, then
 `b * m` `i32` alternative ids, per row in rank order (ranks 7..6+m), `NO_PICK`
-for an unusable slot. The frame length changes when the flag is set, so both boxes
-rebuild together (the convention since VERSION 2). `decode_request` gains
+for an unusable slot. The frame length changes when the flag is set, and a daemon
+that does not know the flag rejects the length, so the hub may set it only once
+box 2 has it (or bump VERSION, the convention since VERSION 2). `decode_request` gains
 `alts: &[i32]`.
 
 Response: widen the fixed fields by one `u64` (keeps the clock triple 8-aligned):
@@ -239,7 +266,7 @@ profile can show `box2.subs_per_step` next to `box2.page_ms`.
 
 ## Invariants and tests
 
-1. `V41_B2_SUB_ALTS=0` or `sub=0`: **bit-identical** to today (the existing
+1. `V41_SUB=0` (and `V41_ROUTER_ALTS=0`): **bit-identical** to today (the existing
    `deepstrix-expert-bench --check-*` and determinism recipe).
 2. Router with m > 0: `sel`/`ew` bit-identical to m = 0.
 3. Substitution on but everything resident: bit-identical (the plan is empty).
@@ -248,18 +275,20 @@ profile can show `box2.subs_per_step` next to `box2.page_ms`.
    local reference computed with the *rewritten* `sel`. The bench needs the plan
    echoed back for that (debug flag).
 5. Every determinism gate runs with `sub=0`, and says so.
-7. **Never under the fidelity pin.** The golden gate's routing pin
+6. **Never under the fidelity pin.** The golden gate's routing pin
    (`het::fidelity_tap::pin_device_rows`, branch `worktree-architecture-review`)
    rewrites rows to the CPU reference's picks right after the router launch in
    `pre_moe_chain`. Box-1 substitution runs later (`pre_moe_route`, after the
    readback), so it is ordered after the pin. It must also be skipped entirely
    when `fidelity_tap::pin_on()`. Otherwise the pinned gate hard-fails reading
-   a substitution as "pin did not hold".
-8. **Renormalize by dividing.** With `c = 1 - w_j/1.5 + alt_w/1.5` (= S'/S),
+   a substitution as "pin did not hold". Add it to `substitution_active`
+   (forward_prefill.rs), the single gate. Under the pin, `d_alts`/`d_alt_w`
+   also come from the unpinned router, so `alt_w` would be on the wrong scale.
+7. **Renormalize by dividing.** With `c = 1 - w_j/1.5 + alt_w/1.5` (= S'/S),
    every kept weight becomes `w_i / c` and the substitute gets `alt_w / c`.
-   Clamp `c` so S' stays at or above `ROUTER_WEIGHT_EPS` (the kernel's own floor
-   on S). It never binds in practice.
-6. **Substituted KV must not outlive its turn.** Today it cannot. The multistream
+   The code clamps `c` at 1e-6 only to avoid a division by zero. The router's
+   own floor on S (`ROUTER_WEIGHT_EPS`) never binds in practice.
+8. **Substituted KV must not outlive its turn.** Today it cannot. The multistream
    path snapshots only at the prompt end (`multistream.rs:657-669`, at
    `<｜Assistant｜>`), `finish()` just releases the slot (turn-end snapshots are
    the unbuilt "M2", `:1221-1229`), and the next request re-prefills the previous
@@ -281,21 +310,23 @@ profile can show `box2.subs_per_step` next to `box2.page_ms`.
    `alt_w` matches a host f64 computation, and the renormalized weights sum to
    1.5.
    Cost when on: m extra argmax passes per token-layer.
-2. **Mirror, dry run.** Pool changes in box-2 responses (VERSION 5) plus the
-   box-1 mirror. Log would-substitute counts, and mirror accuracy against box 2's
-   actual misses. No output change.
-3. **Box-1 route-time substitution** behind a knob, `sub_min_rank` staged
+2. **Mirror, dry run.** BUILT: per-layer residency maps on box-2 replies
+   (`REQ_FLAG_RESID`, no VERSION bump) plus the box-1 mirror. `V41_SUB=1` logs
+   would-substitute counts (`sub.*`) against box 2's actual misses
+   (`box2.misses_x1e6`). No output change.
+3. **Box-1 route-time substitution** BUILT, `V41_SUB=2`, `V41_SUB_MIN_RANK` staged
    6 -> 5 -> 1. ABBA on a warm pool (`box2.page_ms`, step wall, subs/step), with
    free-running quality at each step: echo2 at 1.5K/6K under >= 4 rows, needle,
    and the golden fidelity gate once it exists.
-4. **Box-2-side fallback** (policy above, `REQ_FLAG_ALTS`), only if mirror errors
+4. **Box-2-side fallback** (policy above, `REQ_FLAG_ALTS` = 128), only if mirror errors
    leave material paging. `sub_admit` background reads can come with step 3 or 4.
 
 ## Expected gain
 
-`sub_min_rank = 6`: ~1 swap per token, removing ~40% of box-2 misses: roughly
-**+15-25% at 4 rows** (less once PARK removes the queueing half). Any rank, if
-validated: every box-2 miss whose row has a resident box-2 alternative. The
+`V41_SUB_MIN_RANK=6`: ~1 swap per token, removing ~40% of box-2 misses: roughly
+**+15-25% at 4 rows** (less once PARK removes the queueing half). Any rank (the
+turn-local reference run: 1.20x its null): every box-2 miss whose row has an
+alternative held by EITHER box, which with box-1 alternatives is nearly all. The
 ceiling is ~1.9x at zero box-2 paging, cut by the all-rows rule, by box-1-owned
 7ths and by non-resident alternatives. Rollout step 1 measures that fraction.
 

@@ -2827,6 +2827,21 @@ impl ExpertPager {
         self.slot_of.contains_key(&(layer, e))
     }
 
+    /// Mark `(layer, e)` most-recently-used if resident; returns whether it was.
+    /// Box-2 miss substitution (`het::b2_mirror`) accepts a box-1 substitute at
+    /// ROUTE time because it is resident, and the pipelined order runs the
+    /// other lane's `ensure` before this lane's, so without this the substitute
+    /// can be the victim and the stall merely moves to box 1's disk.
+    pub fn touch_resident(&mut self, layer: i32, e: u32) -> bool {
+        match self.slot_of.get(&(layer, e)).copied() {
+            Some(slot) => {
+                self.touch(slot);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Pool slot of `(layer, e)` if resident (diagnostics).
     pub fn resident_slot(&self, layer: i32, e: u32) -> Option<u32> {
         self.slot_of.get(&(layer, e)).copied()

@@ -5146,7 +5146,8 @@ impl RemoteExpertClient {
                 let _ = tx_req_recycle.send(buf);
             }
         })?;
-        let max_resp = proto::RESP_DATA_OFF + info.max_batch as usize * N_EMBD as usize * 4;
+        // + the optional residency map (`REQ_FLAG_RESID`) behind the partial.
+        let max_resp = proto::RESP_DATA_OFF + info.max_batch as usize * N_EMBD as usize * 4 + proto::RESID_WORDS * 4;
         let sock_opts = opts.clone();
         let reader = std::thread::Builder::new().name("rexp-reader".into()).spawn(move || {
             loop {
@@ -5265,7 +5266,14 @@ impl RemoteExpertClient {
     #[allow(clippy::too_many_arguments)]
     pub fn submit_dispatch(&mut self, unmasked: bool, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool, partner: bool) -> eyre::Result<Option<Ticket>> {
         let extra = if partner { proto::REQ_FLAG_PARTNER } else { 0 };
-        let resid = if super::b2_mirror::wanted() { proto::REQ_FLAG_RESID } else { 0 };
+        let resid = if super::b2_mirror::wanted() {
+            // These picks will be resident on box 2 by the time the other lane's
+            // request for this layer is served: overlay them until the reply.
+            super::b2_mirror::note_submitted(layer, sel);
+            proto::REQ_FLAG_RESID
+        } else {
+            0
+        };
         let f = if resp_f32 { proto::REQ_FLAG_RESP_F32 } else { 0 } | extra | resid;
         if unmasked {
             self.submit_unmasked_flags(layer, b, xq, sel, ew, f)

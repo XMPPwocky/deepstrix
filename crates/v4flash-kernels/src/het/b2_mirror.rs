@@ -6,6 +6,15 @@
 //! layer's row, so the mirror corrects itself and is never more than one
 //! request per layer stale. There's no delta stream to reorder or drop.
 //!
+//! Requests sent but not yet answered are overlaid as PENDING
+//! (`note_submitted`): the picks a lane just asked box 2 for will be resident
+//! by the time the other lane's request for the same layer is served, so the
+//! other lane must neither avoid them (it would pay the quality cost of a
+//! swap for a read box 2 is making anyway) nor count them as misses. `update`
+//! clears the layer's pending row: a layer's replies are consumed (`wait`)
+//! only after both lanes have routed it, and the next route of that layer is
+//! the next step.
+//!
 //! `V41_SUB` (default 0):
 //! * 0 = off: no flag on the wire, no mirror, bit-identical to before.
 //! * 1 = DRY RUN: mirror kept, the substitution is planned and counted
@@ -15,16 +24,26 @@
 //!   `V41_ROUTER_ALTS`) held by either box. The row is renormalized exactly
 //!   (ref.Gate).
 //!
-//! `V41_SUB_MIN_RANK` (1..=6, default 6): only picks at this rank or lower are
-//! eligible (6 = the 6th pick only).
+//! Which picks may be swapped:
+//! * `V41_SUB_MIN_RANK` (1..=6, default 6): only picks at this rank or lower
+//!   (6 = the 6th pick only).
+//! * `V41_SUB_MAX_W` (unset = no cap): a swap is allowed only if the missing
+//!   pick's weight AND the substitute's renormalized weight are both <= this
+//!   (weights sum to 1.5). The local damage of a swap is about
+//!   `w x ||E_sub - E_miss||`, so this caps the MASS moved whatever the rank:
+//!   in a flat row every rank can qualify, in a peaked row only the small tail.
+//!   ~0.2 is the 90th percentile of the 6th pick's weight in the golden data.
 
 use crate::config::{N_EXPERT, N_LAYER};
+use crate::router_topk::ROUTER_MAX_ALT;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const WORDS: usize = (N_EXPERT as usize).div_ceil(64);
 const LAYERS: usize = N_LAYER as usize;
+const MAX_ALT: usize = ROUTER_MAX_ALT as usize;
 
 static BITS: [[AtomicU64; WORDS]; LAYERS] = [const { [const { AtomicU64::new(0) }; WORDS] }; LAYERS];
+static PENDING: [[AtomicU64; WORDS]; LAYERS] = [const { [const { AtomicU64::new(0) }; WORDS] }; LAYERS];
 static SEEN: [AtomicBool; LAYERS] = [const { AtomicBool::new(false) }; LAYERS];
 
 /// `V41_SUB`: 0 off, 1 dry run, 2 on.
@@ -33,10 +52,14 @@ pub fn mode() -> u32 {
         let m = std::env::var("V41_SUB").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0).min(2);
         if m > 0 {
             eprintln!(
-                "b2 mirror: V41_SUB={m} ({}), min rank {}",
+                "b2 mirror: V41_SUB={m} ({}), min rank {}, max weight {}",
                 if m == 1 { "dry run" } else { "SUBSTITUTING" },
-                min_rank()
+                min_rank(),
+                max_w().map_or("none".to_string(), |w| format!("{w}")),
             );
+            if super::forward_prefill::router_alts() == 0 {
+                eprintln!("b2 mirror: WARNING V41_SUB={m} but V41_ROUTER_ALTS=0: there are no alternatives, nothing will be substituted");
+            }
         }
         m
     });
@@ -57,8 +80,16 @@ pub fn min_rank() -> usize {
     *R
 }
 
+/// `V41_SUB_MAX_W`: cap on the weight moved by a swap (see the module doc).
+pub fn max_w() -> Option<f32> {
+    static W: std::sync::LazyLock<Option<f32>> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_SUB_MAX_W").ok().and_then(|v| v.parse::<f32>().ok()).filter(|w| *w > 0.0)
+    });
+    *W
+}
+
 /// Overwrite `layer`'s row from a reply's residency map
-/// (`proto::RESID_WORDS` u32s, bit e = expert e).
+/// (`proto::RESID_WORDS` u32s, bit e = expert e), and drop its pending row.
 pub fn update(layer: u32, words: &[u32]) {
     let l = layer as usize;
     if l >= LAYERS {
@@ -68,19 +99,37 @@ pub fn update(layer: u32, words: &[u32]) {
         let lo = words.get(2 * i).copied().unwrap_or(0) as u64;
         let hi = words.get(2 * i + 1).copied().unwrap_or(0) as u64;
         slot.store(lo | (hi << 32), Ordering::Relaxed);
+        PENDING[l][i].store(0, Ordering::Relaxed);
     }
     SEEN[l].store(true, Ordering::Release);
 }
 
-/// Does box 2 hold `(layer, e)`, as of its last reply for `layer`? `None`
+/// A request for `layer` with these picks (`NO_PICK` / out of range ignored)
+/// was just sent to box 2: overlay them as pending until the layer's next
+/// reply.
+pub fn note_submitted(layer: u32, sel: &[i32]) {
+    let l = layer as usize;
+    if l >= LAYERS {
+        return;
+    }
+    for &e in sel {
+        if (0..N_EXPERT as i32).contains(&e) {
+            PENDING[l][(e / 64) as usize].fetch_or(1u64 << (e % 64), Ordering::Relaxed);
+        }
+    }
+}
+
+/// Will box 2 serve `(layer, e)` without a read? Its last reply for `layer`
+/// says it holds `e`, or a request already sent will bring it in. `None`
 /// until box 2 has reported `layer` at all.
 pub fn resident(layer: i32, e: u32) -> Option<bool> {
     let l = layer as usize;
     if l >= LAYERS || e >= N_EXPERT || !SEEN[l].load(Ordering::Acquire) {
         return None;
     }
-    let w = BITS[l][(e / 64) as usize].load(Ordering::Relaxed);
-    Some((w >> (e % 64)) & 1 == 1)
+    let (w, b) = ((e / 64) as usize, e % 64);
+    let bits = BITS[l][w].load(Ordering::Relaxed) | PENDING[l][w].load(Ordering::Relaxed);
+    Some((bits >> b) & 1 == 1)
 }
 
 // ---- per-step counters (drained by the multistream profile) ----
@@ -90,10 +139,11 @@ static N_AVOIDED: AtomicU64 = AtomicU64::new(0);
 static N_SLOTS: AtomicU64 = AtomicU64::new(0);
 static N_BLOCKED: AtomicU64 = AtomicU64::new(0);
 
-/// `(predicted box-2 misses, reads avoided, picks substituted, misses that
-/// could not be substituted)` since the last call, all counted per distinct
-/// (layer, expert) per request except `picks substituted`. In dry-run mode
-/// "avoided"/"substituted" are what WOULD have happened.
+/// `(predicted box-2 misses, reads avoided, picks substituted, misses left
+/// alone)` since the last call. The first, second and fourth count distinct
+/// experts per lane-layer; box 2 counts a miss once per (possibly merged)
+/// pass, so compare with `box2.misses_x1e6` as an upper bound. In dry-run mode
+/// "avoided" and "substituted" are what WOULD have happened.
 pub fn take_sub_stats() -> (u64, u64, u64, u64) {
     (
         N_PREDICTED.swap(0, Ordering::Relaxed),
@@ -118,9 +168,27 @@ pub struct SubOutcome {
     pub avoided: u32,
     /// Pick slots rewritten.
     pub slots: u32,
-    /// ... predicted misses left alone: some row had no acceptable
-    /// alternative, or picked it above `min_rank`.
+    /// ... predicted misses left alone: some row picked them above `min_rank`,
+    /// or had no alternative that is held and within the weight cap.
     pub blocked: u32,
+}
+
+/// Which picks may be swapped, and for what.
+#[derive(Debug, Clone, Copy)]
+pub struct SubRules {
+    /// 1-based: picks at a rank < this (heavier) are never swapped.
+    pub min_rank: usize,
+    /// Cap on both the missing pick's weight and the substitute's
+    /// renormalized weight.
+    pub max_w: Option<f32>,
+    /// The weights' sum (1.5).
+    pub scale: f32,
+}
+
+impl SubRules {
+    pub fn from_env(scale: f32) -> Self {
+        Self { min_rank: min_rank(), max_w: max_w(), scale }
+    }
 }
 
 /// Plan (and apply) substitutions over a batch of rows.
@@ -128,20 +196,20 @@ pub struct SubOutcome {
 /// * `sel` / `ew`: `[b, nu]` picks in rank order and their weights, rewritten
 ///   in place.
 /// * `alts` / `alt_w`: `[b, na]` alternatives in rank order, with weights on
-///   `ew`'s scale (router `alt_w`).
-/// * `min_rank`: 1-based. A pick at rank < `min_rank` (a heavier pick) is
-///   never substituted, and a predicted miss that any row picked at such a
-///   rank is left alone everywhere (it is read anyway).
+///   `ew`'s ORIGINAL scale (router `alt_w`: prob / top-`nu` prob sum x scale).
 /// * `predicted_miss(e)`: will this pick make box 2 read from disk?
 /// * `acceptable(a)`: is alternative `a` served without a read (resident on
 ///   whichever box computes it)?
 ///
 /// A missing expert is substituted only if EVERY row that picked it can be;
 /// otherwise box 2 reads it anyway and substituting the other rows would cost
-/// quality for no time. Each substitution renormalizes its row exactly: with
-/// the row's weights on the current sum's scale, swapping slot k for an
-/// alternative whose current-scale weight is `wa` divides every weight by
-/// `c = 1 - ew[k]/scale + wa/scale` and gives the substitute `wa / c`.
+/// quality for no time. That is found by planning every row, blocking each
+/// expert some row cannot swap, and re-planning until nothing new is blocked
+/// (a blocked expert frees the alternatives it had taken). Each swap
+/// renormalizes its row exactly: with the row's weights on the current sum's
+/// scale, swapping slot k for an alternative whose current-scale weight is
+/// `wa` divides every weight by `c = 1 - ew[k]/scale + wa/scale` and gives the
+/// substitute `wa / c`.
 #[allow(clippy::too_many_arguments)]
 pub fn substitute(
     sel: &mut [i32],
@@ -150,19 +218,18 @@ pub fn substitute(
     alt_w: &[f32],
     nu: usize,
     na: usize,
-    min_rank: usize,
-    scale: f32,
+    rules: SubRules,
     predicted_miss: impl Fn(i32) -> bool,
     acceptable: impl Fn(i32) -> bool,
 ) -> SubOutcome {
     let mut out = SubOutcome::default();
+    let na = na.min(MAX_ALT);
     if nu == 0 || na == 0 || sel.is_empty() {
         return out;
     }
     let b = sel.len() / nu;
     debug_assert_eq!(ew.len(), sel.len());
-    debug_assert_eq!(alts.len(), b * na);
-    debug_assert_eq!(alt_w.len(), b * na);
+    debug_assert!(alts.len() >= b * na && alt_w.len() >= b * na);
 
     // Distinct predicted misses.
     let mut missing: Vec<i32> = Vec::new();
@@ -176,59 +243,99 @@ pub fn substitute(
         return out;
     }
 
-    // Choose the alternative for (row r, slot k), given the alternatives this
-    // row has already taken. Never an alternative the row already picks, never
-    // one that is itself missing.
-    let choose = |row: &[i32], r: usize, taken: &[bool]| -> Option<usize> {
-        (0..na).find(|&j| {
-            let a = alts[r * na + j];
-            a >= 0 && !taken[j] && !row.contains(&a) && acceptable(a)
-        })
+    // Plan one row in place (on `row`/`w`), skipping blocked experts; returns
+    // the swaps made and marks in `failed` every missing expert this row could
+    // not swap.
+    let plan_row = |row: &mut [i32], w: &mut [f32], r: usize, blocked: &[bool], failed: &mut [bool]| -> u32 {
+        let mut taken = [false; MAX_ALT];
+        let mut c_cum = 1.0f32; // this row's current sum / the router's original
+        let mut swaps = 0u32;
+        for k in 0..nu {
+            let Some(mi) = missing.iter().position(|&m| m == row[k]) else { continue };
+            if blocked[mi] {
+                continue;
+            }
+            if k + 1 < rules.min_rank {
+                failed[mi] = true;
+                continue;
+            }
+            let pick = (0..na).find_map(|j| {
+                let a = alts[r * na + j];
+                if a < 0 || taken[j] || row.contains(&a) || !acceptable(a) {
+                    return None;
+                }
+                let wa = alt_w[r * na + j] / c_cum;
+                let c = (1.0 - w[k] / rules.scale + wa / rules.scale).max(1e-6);
+                if let Some(cap) = rules.max_w {
+                    if w[k] > cap || wa / c > cap {
+                        return None;
+                    }
+                }
+                Some((j, wa, c))
+            });
+            match pick {
+                Some((j, wa, c)) => {
+                    taken[j] = true;
+                    for x in w.iter_mut() {
+                        *x /= c;
+                    }
+                    w[k] = wa / c;
+                    row[k] = alts[r * na + j];
+                    c_cum *= c;
+                    swaps += 1;
+                }
+                None => failed[mi] = true,
+            }
+        }
+        swaps
     };
 
-    // Pass 1: which missing experts can be substituted in every row?
+    // Block up front what fails regardless of competition for alternatives: a
+    // row that picked the expert above `min_rank`, or a row with no held
+    // alternative at all. Otherwise such an expert could take a row's only
+    // alternative in the first round, fail another expert on contention, and be
+    // blocked itself too late to free it (the blocked set only grows).
     let mut blocked = vec![false; missing.len()];
     for r in 0..b {
         let row = &sel[r * nu..(r + 1) * nu];
-        let mut taken = vec![false; na];
-        for k in 0..nu {
-            let Some(mi) = missing.iter().position(|&m| m == row[k]) else { continue };
-            if k + 1 < min_rank {
-                blocked[mi] = true;
-                continue;
-            }
-            match choose(row, r, &taken) {
-                Some(j) => taken[j] = true,
-                None => blocked[mi] = true,
-            }
-        }
-    }
-
-    // Pass 2: apply. Fewer experts qualify than pass 1 tried, so every slot
-    // that qualifies still finds an alternative.
-    for r in 0..b {
-        let mut taken = vec![false; na];
-        let mut c_cum = 1.0f32; // current row sum / router's original sum
-        for k in 0..nu {
-            let e = sel[r * nu + k];
+        for (k, &e) in row.iter().enumerate() {
             let Some(mi) = missing.iter().position(|&m| m == e) else { continue };
-            if blocked[mi] || k + 1 < min_rank {
-                continue;
+            let any_alt = (0..na).any(|j| {
+                let a = alts[r * na + j];
+                a >= 0 && !row.contains(&a) && acceptable(a)
+            });
+            if k + 1 < rules.min_rank || !any_alt {
+                blocked[mi] = true;
             }
-            let row = &sel[r * nu..(r + 1) * nu];
-            let Some(j) = choose(row, r, &taken) else { continue };
-            taken[j] = true;
-            let wa = alt_w[r * na + j] / c_cum;
-            let c = (1.0 - ew[r * nu + k] / scale + wa / scale).max(1e-6);
-            for w in &mut ew[r * nu..(r + 1) * nu] {
-                *w /= c;
-            }
-            ew[r * nu + k] = wa / c;
-            sel[r * nu + k] = alts[r * na + j];
-            c_cum *= c;
-            out.slots += 1;
         }
     }
+    // Fixpoint over what remains (contention, the weight cap), on scratch
+    // copies.
+    loop {
+        let mut failed = vec![false; missing.len()];
+        for r in 0..b {
+            let mut row = sel[r * nu..(r + 1) * nu].to_vec();
+            let mut w = ew[r * nu..(r + 1) * nu].to_vec();
+            plan_row(&mut row, &mut w, r, &blocked, &mut failed);
+        }
+        let mut grew = false;
+        for (bl, f) in blocked.iter_mut().zip(&failed) {
+            if *f && !*bl {
+                *bl = true;
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    // Apply: the same deterministic plan, now with nothing left to fail.
+    let mut failed = vec![false; missing.len()];
+    for r in 0..b {
+        let (row, w) = (&mut sel[r * nu..(r + 1) * nu], &mut ew[r * nu..(r + 1) * nu]);
+        out.slots += plan_row(row, w, r, &blocked, &mut failed);
+    }
+    debug_assert!(!failed.iter().any(|&f| f), "the fixpoint left a failing swap");
     out.blocked = blocked.iter().filter(|&&x| x).count() as u32;
     out.avoided = out.predicted - out.blocked;
     out
@@ -239,6 +346,7 @@ mod tests {
     use super::*;
 
     const S: f32 = 1.5;
+    const R6: SubRules = SubRules { min_rank: 6, max_w: None, scale: S };
 
     /// Weights like the router's: probs / sum * scale.
     fn weights(p: &[f32]) -> Vec<f32> {
@@ -255,7 +363,7 @@ mod tests {
         // Alternative 20 has prob 0.39; alt_w is on the ORIGINAL sum's scale.
         let alts = vec![20, 21];
         let alt_w = vec![0.39 / sum * S, 0.38 / sum * S];
-        let o = substitute(&mut sel, &mut ew, &alts, &alt_w, 6, 2, 6, S, |e| e == 15, |_| true);
+        let o = substitute(&mut sel, &mut ew, &alts, &alt_w, 6, 2, R6, |e| e == 15, |_| true);
         assert_eq!(o, SubOutcome { predicted: 1, avoided: 1, slots: 1, blocked: 0 });
         assert_eq!(sel, vec![10, 11, 12, 13, 14, 20]);
         let want = weights(&[0.9, 0.8, 0.7, 0.6, 0.5, 0.39]);
@@ -272,7 +380,8 @@ mod tests {
         let mut ew = weights(&probs);
         let alts = vec![20, 21, 22];
         let alt_w: Vec<f32> = [0.39f32, 0.30, 0.2].iter().map(|p| p / sum * S).collect();
-        let o = substitute(&mut sel, &mut ew, &alts, &alt_w, 6, 3, 5, S, |e| e == 14 || e == 15, |_| true);
+        let r5 = SubRules { min_rank: 5, ..R6 };
+        let o = substitute(&mut sel, &mut ew, &alts, &alt_w, 6, 3, r5, |e| e == 14 || e == 15, |_| true);
         assert_eq!(o.slots, 2);
         assert_eq!(sel, vec![10, 11, 12, 13, 20, 21]);
         let want = weights(&[0.9, 0.8, 0.7, 0.6, 0.39, 0.30]);
@@ -290,7 +399,7 @@ mod tests {
         let alts = vec![20, 21, 22, 23];
         let alt_w = vec![0.1; 4];
         let before = (sel.clone(), ew.clone());
-        let o = substitute(&mut sel, &mut ew, &alts, &alt_w, 6, 2, 6, S, |e| e == 15, |_| true);
+        let o = substitute(&mut sel, &mut ew, &alts, &alt_w, 6, 2, R6, |e| e == 15, |_| true);
         assert_eq!(o, SubOutcome { predicted: 1, avoided: 0, slots: 0, blocked: 1 });
         assert_eq!((sel, ew), before);
     }
@@ -303,10 +412,50 @@ mod tests {
         let alts = vec![20, 21, 30, 31];
         let alt_w = vec![0.1; 4];
         let before = sel.clone();
-        let o = substitute(&mut sel, &mut ew, &alts, &alt_w, 6, 2, 6, S, |e| e == 15, |a| a < 30);
+        let o = substitute(&mut sel, &mut ew, &alts, &alt_w, 6, 2, R6, |e| e == 15, |a| a < 30);
         assert_eq!(o.blocked, 1);
         assert_eq!(o.slots, 0);
         assert_eq!(sel, before);
+    }
+
+    #[test]
+    fn a_blocked_expert_frees_its_alternative() {
+        // Row 0 misses Y=14 (rank 5) and X=15 (rank 6) with ONE usable
+        // alternative. Row 1 picks Y at rank 1, so Y is blocked; X must then get
+        // the alternative Y would have taken.
+        let mut sel = vec![10, 11, 12, 13, 14, 15, 14, 1, 2, 3, 4, 5];
+        let mut ew = vec![0.25; 12];
+        let alts = vec![20, 21, 30, 31];
+        let alt_w = vec![0.1; 4];
+        let r5 = SubRules { min_rank: 5, ..R6 };
+        let o = substitute(&mut sel, &mut ew, &alts, &alt_w, 6, 2, r5, |e| e == 14 || e == 15, |a| a == 20);
+        assert_eq!((o.predicted, o.avoided, o.blocked, o.slots), (2, 1, 1, 1));
+        assert_eq!(&sel[..6], &[10, 11, 12, 13, 14, 20]);
+    }
+
+    #[test]
+    fn max_w_caps_the_mass_moved_at_any_rank() {
+        // Flat row: every pick 0.25. Heavy row: rank 1 is 0.6. With the cap at
+        // 0.3 and min_rank 1, the flat row's rank-1 miss swaps; the heavy row's
+        // does not.
+        let any = SubRules { min_rank: 1, max_w: Some(0.3), scale: S };
+        let mut flat = vec![15, 11, 12, 13, 14, 16];
+        let mut w_flat = vec![0.25f32; 6];
+        let o = substitute(&mut flat, &mut w_flat, &[20], &[0.24], 6, 1, any, |e| e == 15, |_| true);
+        assert_eq!(o.slots, 1);
+        assert_eq!(flat[0], 20);
+
+        let mut heavy = vec![15, 11, 12, 13, 14, 16];
+        let mut w_heavy = vec![0.6f32, 0.3, 0.2, 0.15, 0.15, 0.1];
+        let o = substitute(&mut heavy, &mut w_heavy, &[20], &[0.09], 6, 1, any, |e| e == 15, |_| true);
+        assert_eq!((o.slots, o.blocked), (0, 1));
+        assert_eq!(heavy[0], 15);
+
+        // The SUBSTITUTE's renormalized weight is capped too.
+        let mut s = vec![10, 11, 12, 13, 14, 15];
+        let mut w = vec![0.4f32, 0.3, 0.3, 0.2, 0.2, 0.1];
+        let o = substitute(&mut s, &mut w, &[20], &[0.5], 6, 1, SubRules { min_rank: 6, max_w: Some(0.3), scale: S }, |e| e == 15, |_| true);
+        assert_eq!(o.slots, 0, "a weak pick replaced by a heavy substitute moves too much mass");
     }
 
     #[test]
@@ -316,7 +465,7 @@ mod tests {
         let mut ew = vec![0.25; 6];
         let alts = vec![20, 11, 22];
         let alt_w = vec![0.1, 0.1, 0.1];
-        let o = substitute(&mut sel, &mut ew, &alts, &alt_w, 6, 3, 6, S, |e| e == 15, |a| a != 20);
+        let o = substitute(&mut sel, &mut ew, &alts, &alt_w, 6, 3, R6, |e| e == 15, |a| a != 20);
         assert_eq!(o.slots, 1);
         assert_eq!(sel[5], 22);
     }
@@ -328,7 +477,7 @@ mod tests {
         let alts = vec![20, 21];
         let alt_w = vec![0.1, 0.1];
         let miss = |e: i32| e == 15 || e == 20;
-        let o = substitute(&mut sel, &mut ew, &alts, &alt_w, 6, 2, 6, S, miss, |a| !miss(a));
+        let o = substitute(&mut sel, &mut ew, &alts, &alt_w, 6, 2, R6, miss, |a| !miss(a));
         assert_eq!(sel[5], 21);
         assert_eq!(o.predicted, 1, "20 is not a pick, so it is not a predicted miss");
     }
@@ -338,22 +487,30 @@ mod tests {
         let mut sel = vec![10, 11, 12, 13, 14, 15];
         let mut ew = vec![0.25; 6];
         let before = (sel.clone(), ew.clone());
-        let o = substitute(&mut sel, &mut ew, &[20, 21], &[0.1, 0.1], 6, 2, 6, S, |_| false, |_| true);
+        let o = substitute(&mut sel, &mut ew, &[20, 21], &[0.1, 0.1], 6, 2, R6, |_| false, |_| true);
         assert_eq!(o, SubOutcome::default());
         assert_eq!((sel, ew), before);
     }
 
+    /// The mirror is process-global; this is its only test, on a layer no
+    /// other test touches.
     #[test]
-    fn mirror_update_and_lookup() {
-        let l = 7u32;
+    fn mirror_update_pending_and_lookup() {
+        let l = (LAYERS - 1) as u32;
         assert_eq!(resident(l as i32, 3), None, "unseen layer is unknown");
         let mut w = vec![0u32; (N_EXPERT as usize).div_ceil(32)];
         w[0] = 1 << 3;
-        w[11] = 1 << 31; // expert 383
+        w[(N_EXPERT as usize).div_ceil(32) - 1] = 1 << 31; // the last expert
         update(l, &w);
         assert_eq!(resident(l as i32, 3), Some(true));
         assert_eq!(resident(l as i32, 4), Some(false));
-        assert_eq!(resident(l as i32, 383), Some(true));
-        assert_eq!(resident(l as i32, 384), None, "out of range");
+        assert_eq!(resident(l as i32, N_EXPERT - 1), Some(true));
+        assert_eq!(resident(l as i32, N_EXPERT), None, "out of range");
+        // A request already sent for this layer brings 4 in.
+        note_submitted(l, &[4, -1, 9999]);
+        assert_eq!(resident(l as i32, 4), Some(true));
+        // The next reply is authoritative again.
+        update(l, &w);
+        assert_eq!(resident(l as i32, 4), Some(false));
     }
 }
