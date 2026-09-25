@@ -411,6 +411,18 @@ pub fn moe_gate_up_chunked(
     )
 }
 
+/// Upper bound on the work-item builder's count, for the device-count grid.
+/// `members` = rows x picks (each group entry is one (row, pick)); `groups` =
+/// the builder's id bound; `chunk` = members per work item; `cap` = the
+/// work-item buffer. With G non-empty groups of sizes c_g (sum = M):
+/// sum ceil(c_g / C) <= G + (M - G) / C <= min(M, groups) + ceil(M / C), and
+/// never more than M. Decode (M <= 48): M itself; B=512 prefill: ~480, not 3072.
+pub fn moe_wi_upper_bound(members: usize, groups: u32, chunk: u32, cap: usize) -> u32 {
+    let m = members;
+    let g = m.min(groups as usize);
+    m.min(g + m.div_ceil(chunk.max(1) as usize)).min(cap) as u32
+}
+
 /// Can the MoE work-item count stay on the device (`V41_MOE_WI_DEVCOUNT`)?
 /// Only the MXFP4 kwide gate/up + MXFP4 kwide2 down pair checks a device count.
 pub fn moe_wi_devcount_supported(gate: GgufType, down: GgufType) -> bool {
@@ -508,6 +520,38 @@ pub fn moe_gate_up_chunked_ex(
 
 #[cfg(test)]
 mod tests {
+    /// `moe_wi_upper_bound` is >= the exact count for every split of M
+    /// members into groups (brute force over small cases and a few big ones).
+    #[test]
+    fn work_item_bound_covers_every_grouping() {
+        fn exact(sizes: &[usize], c: usize) -> usize {
+            sizes.iter().map(|&n| n.div_ceil(c)).sum()
+        }
+        let mut seed = 0x5749_4443u64;
+        for &(m, groups, c) in &[(1usize, 384u32, 32u32), (12, 384, 32), (24, 384, 8), (48, 384, 32), (3072, 384, 32), (3072, 1024, 8), (100, 3, 32)] {
+            let bound = moe_wi_upper_bound(m, groups, c, usize::MAX) as usize;
+            assert!(bound <= m);
+            for trial in 0..2000 {
+                // Random split of m members over at most `groups` groups.
+                let k = 1 + (trial % (groups as usize).min(m));
+                let mut sizes = vec![0usize; k];
+                for _ in 0..m {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    sizes[(seed >> 33) as usize % k] += 1;
+                }
+                assert!(exact(&sizes, c as usize) <= bound, "m={m} groups={groups} c={c} sizes={sizes:?}");
+            }
+            // The worst case: every group but one holds a single member.
+            let k = (groups as usize).min(m);
+            let mut sizes = vec![1usize; k];
+            sizes[0] += m - k;
+            assert!(exact(&sizes, c as usize) <= bound, "worst case m={m} groups={groups} c={c}");
+        }
+        assert_eq!(moe_wi_upper_bound(12, 384, 32, usize::MAX), 12, "decode: M itself");
+        assert_eq!(moe_wi_upper_bound(3072, 384, 32, usize::MAX), 480);
+        assert_eq!(moe_wi_upper_bound(3072, 384, 32, 100), 100, "never past the buffer");
+    }
+
     use super::*;
 
     /// Regression guard for the 2026-09-04 fix: IQ2_S is gate/up on 42 of 43

@@ -3539,6 +3539,8 @@ pub struct ExecTiming {
     pub h2d: Duration,
     pub gpu: Duration,
     pub path_decode: bool,
+    /// Work items launched: the builder's count, or its upper bound under
+    /// `V41_MOE_WI_DEVCOUNT` (`batched_pass`).
     pub n_work_items: u32,
     /// Bitmask over the request's first `RESP_MISS_BITS` sel slots: bit i set =
     /// pick i had to be paged from this box's disk. Decode (b==1) only; see
@@ -3996,10 +3998,17 @@ impl MoeExecutor {
     }
 
     /// One by-expert pass over whatever `d_selected`/`d_ew` hold right now: group
-    /// build -> work items (host readback; under `V41_MOE_WI_DEVCOUNT` none: an
-    /// upper-bound grid and kernels that exit past the device-side count, so the
-    /// GPU never idles for a host round trip) -> gate/up -> q8k(mid) -> down into
-    /// `partials`. The returned work-item count is then that upper bound. `first` zeroes `partials` (once per request; a second pass adds
+    /// build -> work items -> gate/up -> q8k(mid) -> down into `partials`.
+    ///
+    /// The work-item count was read back to size the grids, a GPU-idle host round
+    /// trip per pass. Under `V41_MOE_WI_DEVCOUNT` (MXFP4 kwide pair + kwide2) the
+    /// grids take `dispatch::moe_wi_upper_bound` and the kernels exit past the
+    /// device-side count; the returned count is then that bound. With the
+    /// hits-first two passes, pass A's builder may now RUN after the host has
+    /// already paged the misses (`ensure_layer_phased`) or served a parked
+    /// request that rewrote this layer's remap: still correct, since pass A's
+    /// misses are SENTINEL and its hits are wanted/pinned, so their slots cannot
+    /// move. `first` zeroes `partials` (once per request; a second pass adds
     /// its own slots beside the first's). Returns (work items, diagnostic-done):
     /// under `V41_B2_DECODE_DOWN` the decode down kernel writes `ffn_moe` directly
     /// and there is nothing to reduce.
@@ -4035,8 +4044,7 @@ impl MoeExecutor {
             && !b2_decode_down()
             && super::dispatch::moe_wi_devcount_supported(g.gdt, g.ddt);
         let n_wi = if devcount {
-            // A work item holds >= 1 member; every member is one (row, pick) pair.
-            ((b * nu) as u32).min(max_items)
+            super::dispatch::moe_wi_upper_bound(b * nu, g.gbound, CHUNK_SIZE, max_items as usize)
         } else {
             s.synchronize()?;
             let mut n_wi = [0i32; 1];

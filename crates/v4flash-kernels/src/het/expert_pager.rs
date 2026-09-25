@@ -108,10 +108,14 @@ pub struct ExpertPager {
     remap_dirty: Option<i32>,
     /// Pinned staging ring for those copies: the host must not rewrite a buffer
     /// while its DMA is pending, and both lanes write the same layer's remap
-    /// within a step. 8 x 1536 B. (The iGPU compute stream is fully drained once
-    /// per lane-layer by the work-item count readback, so at most a couple are
-    /// ever in flight; 8 is margin.)
+    /// within a step. 8 x 1536 B. Each slot records an event after its copy and
+    /// the host waits on it before rewriting the slot (`remap_stage_done`): the
+    /// ring used to rely on the work-item count readback draining the iGPU once
+    /// per lane-layer, which `V41_MOE_WI_DEVCOUNT` removed. In practice a lane's
+    /// route already waits for its previous MoE (via `selected_ready` after
+    /// `moe_arrived`), so at most ~2-5 copies are pending and the wait is free.
     remap_stage: Vec<PinnedBuffer<i32>>,
+    remap_stage_done: Vec<Option<v4flash_hip::Event>>,
     remap_stage_next: usize,
     /// Layer whose remap `self.remap` currently describes — the one the next
     /// upload targets. Set by every `ensure*`.
@@ -1312,6 +1316,7 @@ impl ExpertPager {
                 }
                 v
             },
+            remap_stage_done: (0..8).map(|_| None).collect(),
             remap_stage_next: 0,
             cur_layer: 0,
             count_as_prefill: false,
@@ -1387,8 +1392,20 @@ impl ExpertPager {
         let i = self.remap_stage_next % self.remap_stage.len().max(1);
         self.remap_stage_next = self.remap_stage_next.wrapping_add(1);
         if let Some(st) = self.remap_stage.get_mut(i) {
+            // The slot's previous copy must have landed before it is rewritten.
+            if let Some(ev) = self.remap_stage_done.get(i).and_then(|e| e.as_ref()) {
+                ev.synchronize()?;
+            }
             st.as_mut_slice().copy_from_slice(&self.remap);
             self.remap_dev[l].copy_from_host_async(st.as_slice(), stream)?;
+            let ev = match self.remap_stage_done.get_mut(i).and_then(|e| e.take()) {
+                Some(ev) => ev,
+                None => v4flash_hip::Event::new_no_timing()?,
+            };
+            ev.record(stream)?;
+            if let Some(slot) = self.remap_stage_done.get_mut(i) {
+                *slot = Some(ev);
+            }
         } else {
             self.remap_dev[l].copy_from_host(&self.remap)?;
         }

@@ -748,6 +748,18 @@ pub fn lookahead_topk() -> usize {
         std::sync::LazyLock::new(|| std::env::var("V41_LOOKAHEAD_TOPK").ok().and_then(|v| v.parse().ok()).unwrap_or(5).clamp(1, 8));
     *B
 }
+
+/// `V41_MOE_WI_DEVCOUNT` (default on; `0` = the host readback): keep the iGPU
+/// MoE work-item count on the device. The gate/up and down kernels are launched
+/// with an upper-bound grid right behind the builder and exit past the count,
+/// instead of the host draining the iGPU (and the OTHER lane's MoE queued ahead
+/// of this one) to read one integer. MXFP4 kwide pair + kwide2 down only
+/// (`dispatch::moe_wi_devcount_supported`).
+pub fn moe_wi_devcount() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_MOE_WI_DEVCOUNT").as_deref() != Ok("0"));
+    *D
+}
 /// `V41_LOOKAHEAD_PREFETCH=1` opts in to speculative look-ahead routing
 /// hints. DEFAULT OFF since 2026-09-21: A/B at 5 rows on diverse prompts, same
 /// daemon (early paging of the queued request on) -- hints ON: step 227-257 ms,
@@ -762,18 +774,6 @@ pub fn lookahead_topk() -> usize {
 /// written to the pick trace as `A` lines. Groundwork for box-2 miss
 /// substitution (docs/v41/BOX2_MISS_SUBSTITUTION.md); picks and weights are
 /// bit-identical with it on.
-/// `V41_MOE_WI_DEVCOUNT` (default on; `0` = the host readback): keep the iGPU
-/// MoE work-item count on the device. The gate/up and down kernels are launched
-/// with an upper-bound grid right behind the builder and exit past the count,
-/// instead of the host draining the iGPU (and the OTHER lane's MoE queued ahead
-/// of this one) to read one integer. MXFP4 kwide pair + kwide2 down only
-/// (`dispatch::moe_wi_devcount_supported`).
-pub fn moe_wi_devcount() -> bool {
-    static D: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("V41_MOE_WI_DEVCOUNT").as_deref() != Ok("0"));
-    *D
-}
-
 pub fn router_alts() -> u32 {
     static M: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
         std::env::var("V41_ROUTER_ALTS")
@@ -8138,9 +8138,14 @@ impl HeterogeneousEngine {
             // full iGPU drain per lane-layer that also waits for the OTHER lane's
             // MoE queued ahead of it (profile audit 2026-09-21; untimed until now).
             if wi_devcount {
-                // Upper bound: a work item holds >= 1 member and every member is
-                // one (row, pick) pair; the kernels exit past `bi.n_work_items`.
-                n_work_items = ((b as usize) * (cs_n_used as usize)).min(si.work_items.len()) as u32;
+                // Upper bound (`dispatch::moe_wi_upper_bound`); the kernels exit
+                // past `bi.n_work_items`.
+                n_work_items = super::dispatch::moe_wi_upper_bound(
+                    (b as usize) * (cs_n_used as usize),
+                    moe_group_bound,
+                    CHUNK_SIZE,
+                    si.work_items.len(),
+                );
             } else {
                 probe_stream_busy(&ie.compute, &LH_WIC_BUSY, &LH_WIC_IDLE);
                 let _t_wic = LayerHostTimer::start(&LH_WORK_ITEMS_COUNT);
