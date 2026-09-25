@@ -13,7 +13,14 @@
 //! swap for a read box 2 is making anyway) nor count them as misses. `update`
 //! clears the layer's pending row: a layer's replies are consumed (`wait`)
 //! only after both lanes have routed it, and the next route of that layer is
-//! the next step.
+//! the next step. `V41_SUB_PENDING=0` turns the overlay off. Do that when box
+//! 2 PARKs (`knobs::park`): there it serves the other lane while this lane's
+//! read is parked, so an expert "being read" is NOT free for the other lane,
+//! and swapping it away is what lets that lane skip the wait. Known leftovers:
+//! a submit that fails after `note_submitted` leaves its bits until the
+//! layer's next reply, and the map just after a prefill chunk includes its
+//! scan admissions (which box 2 evicts first). Both err toward "resident": a
+//! read box 2 makes anyway, never wrong output.
 //!
 //! `V41_SUB` (default 0):
 //! * 0 = off: no flag on the wire, no mirror, bit-identical to before.
@@ -80,6 +87,14 @@ pub fn min_rank() -> usize {
     *R
 }
 
+/// `V41_SUB_PENDING` (default on): overlay picks of sent, unanswered requests
+/// as resident (module doc; turn off under box-2 PARK).
+pub fn pending_on() -> bool {
+    static P: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_SUB_PENDING").as_deref() != Ok("0"));
+    *P
+}
+
 /// `V41_SUB_MAX_W`: cap on the weight moved by a swap (see the module doc).
 pub fn max_w() -> Option<f32> {
     static W: std::sync::LazyLock<Option<f32>> = std::sync::LazyLock::new(|| {
@@ -123,13 +138,20 @@ pub fn note_submitted(layer: u32, sel: &[i32]) {
 /// says it holds `e`, or a request already sent will bring it in. `None`
 /// until box 2 has reported `layer` at all.
 pub fn resident(layer: i32, e: u32) -> Option<bool> {
+    lookup(layer, e).map(|(held, pending)| held || (pending && pending_on()))
+}
+
+/// `(held per box 2's last reply, in a sent unanswered request)`; `None` until
+/// box 2 has reported `layer`. For the trace, which keeps the two apart.
+pub fn lookup(layer: i32, e: u32) -> Option<(bool, bool)> {
     let l = layer as usize;
     if l >= LAYERS || e >= N_EXPERT || !SEEN[l].load(Ordering::Acquire) {
         return None;
     }
     let (w, b) = ((e / 64) as usize, e % 64);
-    let bits = BITS[l][w].load(Ordering::Relaxed) | PENDING[l][w].load(Ordering::Relaxed);
-    Some((bits >> b) & 1 == 1)
+    let held = (BITS[l][w].load(Ordering::Relaxed) >> b) & 1 == 1;
+    let pending = (PENDING[l][w].load(Ordering::Relaxed) >> b) & 1 == 1;
+    Some((held, pending))
 }
 
 // ---- per-step counters (drained by the multistream profile) ----
@@ -138,18 +160,21 @@ static N_PREDICTED: AtomicU64 = AtomicU64::new(0);
 static N_AVOIDED: AtomicU64 = AtomicU64::new(0);
 static N_SLOTS: AtomicU64 = AtomicU64::new(0);
 static N_BLOCKED: AtomicU64 = AtomicU64::new(0);
+static N_FAILED: AtomicU64 = AtomicU64::new(0);
 
 /// `(predicted box-2 misses, reads avoided, picks substituted, misses left
-/// alone)` since the last call. The first, second and fourth count distinct
+/// alone, planner failures)` since the last call. Failures should be 0 (see
+/// `SubOutcome::failed`). The first, second and fourth count distinct
 /// experts per lane-layer; box 2 counts a miss once per (possibly merged)
 /// pass, so compare with `box2.misses_x1e6` as an upper bound. In dry-run mode
 /// "avoided" and "substituted" are what WOULD have happened.
-pub fn take_sub_stats() -> (u64, u64, u64, u64) {
+pub fn take_sub_stats() -> (u64, u64, u64, u64, u64) {
     (
         N_PREDICTED.swap(0, Ordering::Relaxed),
         N_AVOIDED.swap(0, Ordering::Relaxed),
         N_SLOTS.swap(0, Ordering::Relaxed),
         N_BLOCKED.swap(0, Ordering::Relaxed),
+        N_FAILED.swap(0, Ordering::Relaxed),
     )
 }
 
@@ -158,6 +183,7 @@ pub fn record(o: &SubOutcome) {
     N_AVOIDED.fetch_add(o.avoided as u64, Ordering::Relaxed);
     N_SLOTS.fetch_add(o.slots as u64, Ordering::Relaxed);
     N_BLOCKED.fetch_add(o.blocked as u64, Ordering::Relaxed);
+    N_FAILED.fetch_add(o.failed as u64, Ordering::Relaxed);
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +197,11 @@ pub struct SubOutcome {
     /// ... predicted misses left alone: some row picked them above `min_rank`,
     /// or had no alternative that is held and within the weight cap.
     pub blocked: u32,
+    /// Slots the APPLY pass could not swap although the plan said it could.
+    /// Must be 0: the apply pass repeats the fixpoint's last plan exactly. If
+    /// it ever is not, the row is still consistent (unswapped, sums to the
+    /// scale), but another row may have swapped the same expert for nothing.
+    pub failed: u32,
 }
 
 /// Which picks may be swapped, and for what.
@@ -335,7 +366,8 @@ pub fn substitute(
         let (row, w) = (&mut sel[r * nu..(r + 1) * nu], &mut ew[r * nu..(r + 1) * nu]);
         out.slots += plan_row(row, w, r, &blocked, &mut failed);
     }
-    debug_assert!(!failed.iter().any(|&f| f), "the fixpoint left a failing swap");
+    out.failed = failed.iter().filter(|&&f| f).count() as u32;
+    debug_assert_eq!(out.failed, 0, "the fixpoint left a failing swap");
     out.blocked = blocked.iter().filter(|&&x| x).count() as u32;
     out.avoided = out.predicted - out.blocked;
     out
@@ -364,7 +396,7 @@ mod tests {
         let alts = vec![20, 21];
         let alt_w = vec![0.39 / sum * S, 0.38 / sum * S];
         let o = substitute(&mut sel, &mut ew, &alts, &alt_w, 6, 2, R6, |e| e == 15, |_| true);
-        assert_eq!(o, SubOutcome { predicted: 1, avoided: 1, slots: 1, blocked: 0 });
+        assert_eq!(o, SubOutcome { predicted: 1, avoided: 1, slots: 1, blocked: 0, failed: 0 });
         assert_eq!(sel, vec![10, 11, 12, 13, 14, 20]);
         let want = weights(&[0.9, 0.8, 0.7, 0.6, 0.5, 0.39]);
         for (g, w) in ew.iter().zip(&want) {
@@ -400,7 +432,7 @@ mod tests {
         let alt_w = vec![0.1; 4];
         let before = (sel.clone(), ew.clone());
         let o = substitute(&mut sel, &mut ew, &alts, &alt_w, 6, 2, R6, |e| e == 15, |_| true);
-        assert_eq!(o, SubOutcome { predicted: 1, avoided: 0, slots: 0, blocked: 1 });
+        assert_eq!(o, SubOutcome { predicted: 1, avoided: 0, slots: 0, blocked: 1, failed: 0 });
         assert_eq!((sel, ew), before);
     }
 
@@ -492,6 +524,79 @@ mod tests {
         assert_eq!((sel, ew), before);
     }
 
+    /// Randomized batches (fixed seed): the apply pass never fails, every
+    /// swapped row still sums to the scale, no row ends up with a duplicate
+    /// pick, and every swapped-in expert was acceptable. Runs the invariant
+    /// the release-mode `debug_assert` cannot.
+    #[test]
+    fn randomized_plans_apply_cleanly() {
+        let mut s = 0x2545f4914f6cdd1du64;
+        let mut rnd = move |n: u32| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s % n as u64) as u32
+        };
+        let (nu, na) = (6usize, 4usize);
+        for trial in 0..3000 {
+            let b = 1 + rnd(6) as usize;
+            let pool = 16 + rnd(24) as i32; // small id space => collisions
+            let mut sel = Vec::with_capacity(b * nu);
+            let mut alts = Vec::with_capacity(b * na);
+            let mut ew = Vec::with_capacity(b * nu);
+            let mut alt_w = Vec::with_capacity(b * na);
+            for _ in 0..b {
+                // 6 + 4 distinct ids per row, in rank order.
+                let mut ids: Vec<i32> = Vec::new();
+                while ids.len() < nu + na {
+                    let e = rnd(pool as u32) as i32;
+                    if !ids.contains(&e) {
+                        ids.push(e);
+                    }
+                }
+                let mut p: Vec<f32> = (0..nu + na).map(|_| 0.05 + rnd(1000) as f32 / 1000.0).collect();
+                p.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let sum: f32 = p[..nu].iter().sum();
+                sel.extend_from_slice(&ids[..nu]);
+                alts.extend_from_slice(&ids[nu..]);
+                ew.extend(p[..nu].iter().map(|x| x / sum * S));
+                alt_w.extend(p[nu..].iter().map(|x| x / sum * S));
+            }
+            let miss_mask: u64 = ((rnd(u32::MAX) as u64) << 32) | rnd(u32::MAX) as u64;
+            let ok_mask: u64 = ((rnd(u32::MAX) as u64) << 32) | rnd(u32::MAX) as u64;
+            let miss = |e: i32| (miss_mask >> (e % 64)) & 1 == 1;
+            let acceptable = |a: i32| !miss(a) && (ok_mask >> (a % 64)) & 1 == 1;
+            let rules = SubRules {
+                min_rank: 1 + rnd(6) as usize,
+                max_w: if rnd(2) == 0 { None } else { Some(0.1 + rnd(30) as f32 / 100.0) },
+                scale: S,
+            };
+            let before = sel.clone();
+            let o = substitute(&mut sel, &mut ew, &alts, &alt_w, nu, na, rules, miss, acceptable);
+            assert_eq!(o.failed, 0, "trial {trial}: {o:?}");
+            assert_eq!(o.avoided + o.blocked, o.predicted, "trial {trial}");
+            for r in 0..b {
+                let row = &sel[r * nu..(r + 1) * nu];
+                let sum: f32 = ew[r * nu..(r + 1) * nu].iter().sum();
+                assert!((sum - S).abs() < 1e-3, "trial {trial} row {r}: weights sum {sum}");
+                for k in 0..nu {
+                    assert!(!row[k + 1..].contains(&row[k]), "trial {trial} row {r}: duplicate pick");
+                    if row[k] != before[r * nu + k] {
+                        assert!(acceptable(row[k]), "trial {trial}: swapped in a non-acceptable expert");
+                        assert!(k + 1 >= rules.min_rank, "trial {trial}: swapped above min_rank");
+                    }
+                }
+            }
+            // All-rows rule: an expert still picked anywhere was not swapped away
+            // anywhere else.
+            for (i, &e) in before.iter().enumerate() {
+                if sel[i] != e {
+                    assert!(!sel.contains(&e), "trial {trial}: {e} swapped in one row, kept in another");
+                }
+            }
+        }
+    }
+
     /// The mirror is process-global; this is its only test, on a layer no
     /// other test touches.
     #[test]
@@ -509,6 +614,7 @@ mod tests {
         // A request already sent for this layer brings 4 in.
         note_submitted(l, &[4, -1, 9999]);
         assert_eq!(resident(l as i32, 4), Some(true));
+        assert_eq!(lookup(l as i32, 4), Some((false, true)), "pending, not held");
         // The next reply is authoritative again.
         update(l, &w);
         assert_eq!(resident(l as i32, 4), Some(false));

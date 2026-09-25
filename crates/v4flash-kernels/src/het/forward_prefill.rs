@@ -6435,9 +6435,10 @@ impl HeterogeneousEngine {
                         // alternatives' weights and the picks' weights, both on
                         // `d_ew`'s scale (sum 1.5); then one char per pick then
                         // alternative for residency at route time: box 2's mirror
-                        // R held / M missing / ? not yet reported, box 1's pager
-                        // r held / m missing. Enough to replay any substitution
-                        // gate offline. Parsers keyed on `P`/`D` skip it.
+                        // R held / P not held but in a sent, unanswered request /
+                        // M missing / ? not yet reported, box 1's pager r held /
+                        // m missing. Enough to replay any substitution gate
+                        // offline. Parsers keyed on `P`/`D` skip it.
                         if na > 0 {
                             let alts = &alts_host[r * na..(r + 1) * na];
                             let a: Vec<String> = alts.iter().map(|v| v.to_string()).collect();
@@ -6456,9 +6457,10 @@ impl HeterogeneousEngine {
                                 state.push(if !valid {
                                     '-'
                                 } else if box2 {
-                                    match super::b2_mirror::resident(layer, e as u32) {
-                                        Some(true) => 'R',
-                                        Some(false) => 'M',
+                                    match super::b2_mirror::lookup(layer, e as u32) {
+                                        Some((true, _)) => 'R',
+                                        Some((false, true)) => 'P',
+                                        Some((false, false)) => 'M',
                                         None => '?',
                                     }
                                 } else if pg.is_resident(layer, e as u32) {
@@ -6502,6 +6504,21 @@ impl HeterogeneousEngine {
                         acceptable,
                     );
                     super::b2_mirror::record(&o);
+                    if o.slots > 0 && super::b2_mirror::mode() == 1 && trace_on {
+                        // DRY RUN: `s ...` (same fields as `S`) for each swap that
+                        // WOULD have been made. Nothing is rewritten.
+                        for (i, (&f, &t)) in sel_host.iter().zip(sel_sub.iter()).enumerate() {
+                            if f != t {
+                                let w0 = ew_pre.as_ref().map_or(0.0, |w| w[i]);
+                                super::expert_pager::pick_trace(&format!(
+                                    "s {layer} {b} {} {} {f} {t} {w0:.4} {:.4}",
+                                    i / cs_n_used,
+                                    i % cs_n_used + 1,
+                                    ew_sub[i]
+                                ));
+                            }
+                        }
+                    }
                     if o.slots > 0 && super::b2_mirror::mode() == 2 {
                         for (i, (&f, &t)) in sel_host.iter().zip(sel_sub.iter()).enumerate() {
                             if f == t {

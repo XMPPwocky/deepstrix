@@ -138,12 +138,13 @@ The box-2-side policy below stays as the fallback for mirror errors.
   `d_selected`/`d_ew` are written back before the peer push. The hot-set
   counter sees the router's original picks.
 - **Knobs:** `V41_SUB` = 0 off / 1 dry run (plan and count, no rewrite) / 2 on;
-  `V41_SUB_MIN_RANK` (default 6); needs `V41_ROUTER_ALTS > 0`.
+  `V41_SUB_MIN_RANK` (default 6); `V41_SUB_MAX_W` (unset = no cap);
+  `V41_SUB_PENDING` (default on; turn OFF when box 2 PARKs, see below); needs
+  `V41_ROUTER_ALTS > 0`.
 - **Profile** (`ms.stage`, per step): `sub.predicted_miss`,
-  `sub.reads_avoided`, `sub.picks_swapped`, `sub.blocked`. Compare
-  `sub.predicted_miss` with `box2.misses_x1e6` for mirror accuracy. The pick
-  trace gets an `S <layer> <b> <row> <rank> <from> <to>` line per rewritten
-  pick.
+  `sub.reads_avoided`, `sub.picks_swapped`, `sub.blocked`, `sub.plan_failed`
+  (must stay 0). Compare `sub.predicted_miss` with `box2.misses_x1e6` for
+  mirror accuracy; the former counts per lane, box 2 per (merged) pass.
 - **After review (same day):**
   - Picks in box-2 requests already sent for a layer count as resident until
     that layer's next reply (`note_submitted`), so a lane does not avoid a read
@@ -161,9 +162,16 @@ The box-2-side policy below stays as the fallback for mirror errors.
   - Alternatives are computed only for decode rows (or when the trace is on).
   - The hub's reply size limit allows for the map.
 - **Trace:** `A <layer> <b> <alts> / <owner> / <alt_w> / <pick_w> / <state>`,
-  where state is one char per pick then alternative: box 2's mirror R/M/?, box
-  1's pager r/m. Plus `S <layer> <b> <row> <rank> <from> <to> <w_from> <w_to>`
-  per swap. Enough to replay any gate (rank, weight cap) offline.
+  where state is one char per pick then alternative: box 2's mirror R held /
+  P in a sent, unanswered request / M missing / ? not reported yet, box 1's
+  pager r/m. Plus `S <layer> <b> <row> <rank> <from> <to> <w_from> <w_to>` per
+  swap, and `s` (same fields) per swap the DRY RUN would have made. Enough to
+  replay any gate (rank, weight cap) offline.
+- **Pending overlay vs box-2 PARK.** The overlay assumes box 2 serves a layer's
+  requests in order (or merged), so an expert one lane is having read is free
+  for the other. Under PARK (`knobs::park`, OOO replies) box 2 serves the other
+  lane while the read is parked, so that lane would WAIT on the read the
+  overlay told it not to avoid. Run `V41_SUB_PENDING=0` whenever park is on.
 - **Known limitation:** lanes are planned one at a time. Lane A can swap away an
   expert that lane B then reads anyway (B picked it above `min_rank`, or had no
   alternative), so A pays the quality cost for no time saved. Fixing it means
