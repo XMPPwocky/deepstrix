@@ -504,6 +504,9 @@ pub struct BatchDgpuShared {
     /// `de.hc` writing it while `de.compute` runs another lane's Q chain would
     /// corrupt both (review 2026-09-25).
     pub mhc_flat_hc: DeviceBuffer<f32>,
+    /// `MhcArena::launch_mix` last-WG counters, one per row; zero between
+    /// launches (the kernel resets them). Used only on `de.compute`.
+    pub mhc_counters: DeviceBuffer<u32>,
     /// `[B, N_EMBD]` — hc_weighted output for attention input (P1).
     pub attn_cur: DeviceBuffer<f32>,
     /// `[B, N_EMBD]` — attention input norm. Written P1; last read by the
@@ -1437,6 +1440,11 @@ impl BatchDgpuShared {
 
             mhc_inv_scalar: DeviceBuffer::new(id, 1)?,
             mhc_flat_hc: DeviceBuffer::new(id, MHC_SPLIT_MAX_ROWS as usize * HC_DIM as usize)?,
+            mhc_counters: {
+                let mut c = DeviceBuffer::<u32>::new(id, rows)?;
+                c.fill_zero()?;
+                c
+            },
 
             mhc_rms_partials: DeviceBuffer::new(id, 16)?,
             mix: mk_f32(HC_MIX_DIM as usize)?,

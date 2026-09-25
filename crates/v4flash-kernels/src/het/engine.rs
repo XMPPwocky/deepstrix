@@ -145,6 +145,8 @@ pub struct DeviceEngine {
     pub hc_weighted: HcWeightedSum,
     pub hc_sinkhorn: HcSinkhorn,
     pub mhc_pre_fused: crate::MhcPreFused,
+    /// Arena mHC pre-mix in 2 launches per sub-block (`V41_MHC_ARENA_FUSED`).
+    pub mhc_arena: crate::MhcArena,
     pub rms_nw_mw: crate::RmsNormNoWeightMultiWG,
     /// On-device sampler. Used only on dGPU (logits live there) but
     /// instantiated on both arches so the engine struct stays symmetric.
@@ -247,6 +249,7 @@ impl DeviceEngine {
             hc_weighted: HcWeightedSum::for_arch(arch)?,
             hc_sinkhorn: HcSinkhorn::for_arch(arch)?,
             mhc_pre_fused: crate::MhcPreFused::for_arch(arch)?,
+            mhc_arena: crate::MhcArena::for_arch(arch)?,
             rms_nw_mw: crate::RmsNormNoWeightMultiWG::for_arch(arch)?,
             sampler: crate::Sampler::for_arch(arch)?,
             hc_post: HcPost::for_arch(arch)?,

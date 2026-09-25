@@ -776,6 +776,31 @@ pub fn ms_mhc_split() -> bool {
     *D
 }
 
+/// `V41_MHC_ARENA_FUSED` (default ON; `0` = the old kernel chains): the mHC
+/// MIXES (RMS scalar + matvec + Sinkhorn split) as ONE `MhcArena::launch_mix`
+/// per sub-block, BIT-IDENTICAL to the chains (tests/mhc_arena_bitexact.rs).
+/// Pre-attn where `mhc_pre_scaled_for(b)`, pre-ffn where
+/// `mhc_narrow_fallback_for(b)`. bench_mhc_arena_ab (gfx1201, paired, 2000
+/// rounds): pre-attn -1.6 / -22.4 / -41.7 us at b = 1 / 2 / 3, pre-ffn -11 us.
+pub fn mhc_arena_fused() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_MHC_ARENA_FUSED").as_deref() != Ok("0"));
+    *D
+}
+
+/// `V41_MHC_FFN_LATE` (default ON; arena decode, V4.1, fused mixes): queue the
+/// pre-ffn MIXES after the router instead of before it, on the same stream.
+/// V4.1 collapses with the carry, so the router path (collapse -> rms_w ->
+/// router -> readback -> MoE) never needed them; their `split` is first read by
+/// the FFN combine's hc_post and the carry by the next layer's collapse. The
+/// ~46 us/lane-layer then runs while the MoE is out. Pure reordering on one
+/// stream: bit-identical.
+pub fn mhc_ffn_late() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_MHC_FFN_LATE").as_deref() != Ok("0"));
+    *D
+}
+
 /// `V41_MOE_WI_DEVCOUNT` (default on; `0` = the host readback): keep the iGPU
 /// MoE work-item count on the device. The gate/up and down kernels are launched
 /// with an upper-bound grid right behind the builder and exit past the count,
@@ -3465,6 +3490,26 @@ impl HeterogeneousEngine {
             de.rms_nw
                 .launch_batched(&de.compute, &mut sd.flat, &bd.residual, 1, HC_DIM, RMS_EPS, b)?;
         }
+        let fused_attn = mhc_arena_fused() && mhc_pre_scaled_for(b) && (b as usize) <= sd.mhc_counters.len();
+        if fused_attn {
+            let _t = de.events.stage("k.mhc_pre_attn.mix_fused", &de.compute)?;
+            de.mhc_arena.launch_mix(
+                &de.compute,
+                &mut bd.split,
+                &mut sd.mix,
+                &mut sd.mhc_counters,
+                &dlw.hc_attn_fn.buffer,
+                &bd.residual,
+                &dlw.hc_attn_scale,
+                &dlw.hc_attn_base,
+                HC_DIM,
+                crate::mhc_arena::MIX_PRE_SCALED,
+                RMS_EPS,
+                SINKHORN_ITERS,
+                SINKHORN_EPS,
+                b,
+            )?;
+        } else {
         {
             let _t = de.events.stage("k.mhc_pre_attn.f16_matvec", &de.compute)?;
             if mhc_pre_scaled_for(b) {
@@ -3539,6 +3584,7 @@ impl HeterogeneousEngine {
                 SINKHORN_EPS,
                 b,
             )?;
+        }
         }
         {
             let _t = de.events.stage("k.mhc_pre_attn.hc_weighted", &de.compute)?;
@@ -5938,6 +5984,8 @@ impl HeterogeneousEngine {
         // Stage 8: mhc_pre_ffn (BATCHED, same shape as Stage 1)
         // ========================================================
         let _t_mhc_pre_ffn = de.events.stage("dgpu.mhc_pre_ffn", &de.compute)?;
+        // `mhc_ffn_late`: set when the fused pre-ffn mixes are queued after the router.
+        let mut ffn_mix_late = false;
         // mHC SPLIT, FFN side (see stage 1): the mixes read `after_attn_hc`, so
         // hc_src_ffn is recorded after stage 7 -- which is also the last reader
         // of the attn `split` these mixes overwrite.
@@ -5973,8 +6021,31 @@ impl HeterogeneousEngine {
             sev.hc_mixes_ffn.record(&de.hc)?;
             bd.mhc_ffn_split_pending = true;
         } else {
+        let fused_ffn = mhc_arena_fused() && mhc_narrow_fallback_for(b) && (b as usize) <= sd.mhc_counters.len();
+        ffn_mix_late = fused_ffn && mhc_ffn_late() && cap_ok && cfg!(feature = "v41") && ced != CedMode::KvSourceOnly;
         let cap = self.stage_cap(de, "g.mhc_pre_ffn", layer as usize, b, lane_ptr, cap_ok)?;
         if !cap.skip {
+        if fused_ffn {
+            if !ffn_mix_late {
+                let _t = de.events.stage("k.mhc_pre_ffn.mix_fused", &de.compute)?;
+                de.mhc_arena.launch_mix(
+                    &de.compute,
+                    &mut bd.split,
+                    &mut sd.mix,
+                    &mut sd.mhc_counters,
+                    &dlw.hc_ffn_fn.buffer,
+                    &bd.after_attn_hc,
+                    &dlw.hc_ffn_scale,
+                    &dlw.hc_ffn_base,
+                    HC_DIM,
+                    crate::mhc_arena::MIX_NORMED,
+                    RMS_EPS,
+                    SINKHORN_ITERS,
+                    SINKHORN_EPS,
+                    b,
+                )?;
+            }
+        } else {
         {
             let _t = de.events.stage("k.mhc_pre_ffn.rms_nw", &de.compute)?;
             de.rms_nw.launch_batched(
@@ -6025,11 +6096,13 @@ impl HeterogeneousEngine {
                 b,
             )?;
         }
+        }
         {
             let _t = de.events.stage("k.mhc_pre_ffn.hc_weighted", &de.compute)?;
             let w = if cfg!(feature = "v41") { &bd.hc_pre_carry } else { &bd.split };
             de.hc_weighted.launch_batched(&de.compute, &mut sd.ffn_cur, &bd.after_attn_hc, w, N_EMBD, N_HC, HC_MIX_DIM, b)?;
-            if cfg!(feature = "v41") {
+            // Late mixes: the carry := split copy follows them after the router.
+            if cfg!(feature = "v41") && !ffn_mix_late {
                 let rows = b as usize * HC_MIX_DIM as usize;
                 let cur = bd.split.slice_view(0, rows);
                 bd.hc_pre_carry.slice_view_mut(0, rows).copy_from_buffer_async(&cur, &de.compute)?;
@@ -6374,6 +6447,37 @@ impl HeterogeneousEngine {
         let defer_shared = prefill_presubmit() && remote_split_active();
         if !defer_shared {
             self.issue_shared_expert_prefill(sd, bd, dlw, b, layer as usize, dump_pos, cap_ok)?;
+        }
+
+        // `mhc_ffn_late`: the pre-ffn mixes, off the router path (their `split`
+        // is first read by the FFN combine's hc_post, the carry by the next
+        // layer's collapse -- both later on this stream). Then carry := split,
+        // after the stage-8 collapse read the old carry.
+        if ffn_mix_late {
+            let _t = de.events.stage("dgpu.mhc_mix_ffn_late", &de.compute)?;
+            let cap = self.stage_cap(de, "g.mhc_mix_ffn_late", layer as usize, b, lane_ptr, cap_ok)?;
+            if !cap.skip {
+                de.mhc_arena.launch_mix(
+                    &de.compute,
+                    &mut bd.split,
+                    &mut sd.mix,
+                    &mut sd.mhc_counters,
+                    &dlw.hc_ffn_fn.buffer,
+                    &bd.after_attn_hc,
+                    &dlw.hc_ffn_scale,
+                    &dlw.hc_ffn_base,
+                    HC_DIM,
+                    crate::mhc_arena::MIX_NORMED,
+                    RMS_EPS,
+                    SINKHORN_ITERS,
+                    SINKHORN_EPS,
+                    b,
+                )?;
+                let rows = b as usize * HC_MIX_DIM as usize;
+                let cur = bd.split.slice_view(0, rows);
+                bd.hc_pre_carry.slice_view_mut(0, rows).copy_from_buffer_async(&cur, &de.compute)?;
+            }
+            cap.end()?;
         }
 
         // ========================================================
