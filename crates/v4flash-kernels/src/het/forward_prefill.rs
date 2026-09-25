@@ -6520,9 +6520,25 @@ impl HeterogeneousEngine {
                         }
                     }
                     if o.slots > 0 && super::b2_mirror::mode() == 2 {
+                        // Swapped-away box-2 experts are still READ, in the
+                        // background: queued as prefetch words, they ride on this
+                        // lane's own submit below, box 2 admits them off the
+                        // critical path, and the mirror shows them resident next
+                        // time. Without this they are never read and get swapped
+                        // on every later pick.
+                        let mut admit: Vec<u32> = Vec::new();
                         for (i, (&f, &t)) in sel_host.iter().zip(sel_sub.iter()).enumerate() {
                             if f == t {
                                 continue;
+                            }
+                            if super::b2_mirror::admit_on()
+                                && (0..N_EXPERT as i32).contains(&f)
+                                && super::expert_pager::partition_box2(layer, f as u32)
+                            {
+                                let w = ((layer as u32) << 16) | f as u32;
+                                if !admit.contains(&w) {
+                                    admit.push(w);
+                                }
                             }
                             if trace_on {
                                 // `S <layer> <b> <row> <rank> <from> <to> <w_from> <w_to>`
@@ -6549,6 +6565,10 @@ impl HeterogeneousEngine {
                         self.current_device.store(self.dgpu.device.id, std::sync::atomic::Ordering::Relaxed);
                         bd.d_selected.slice_view_mut(0, n_sel).copy_from_host(&sel_sub)?;
                         bd.d_ew.slice_view_mut(0, n_sel).copy_from_host(&ew_sub)?;
+                        if !admit.is_empty() {
+                            super::remote_experts::push_prefetch_words(&admit);
+                            super::b2_mirror::note_admits(admit.len());
+                        }
                         sel_orig = std::mem::replace(&mut sel_host, sel_sub);
                         ew_pre = Some(ew_sub);
                     }

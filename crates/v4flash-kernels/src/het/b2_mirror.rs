@@ -31,6 +31,15 @@
 //!   `V41_ROUTER_ALTS`) held by either box. The row is renormalized exactly
 //!   (ref.Gate).
 //!
+//! Swapped-away box-2 experts are still READ, just not on the critical path
+//! (`V41_SUB_ADMIT`, default on): the hub queues `layer << 16 | e` as a box-2
+//! PREFETCH word on the same request (`remote_experts::push_prefetch_words`).
+//! Box 2's background readers fetch it (yielding to demand misses) and admit
+//! it at that layer's next `ensure`, so the mirror shows it resident next time
+//! and the swap rate falls back to the first-touch miss rate. Without it, a
+//! swapped expert is never read, never admitted, and swapped again on every
+//! later pick (measured live: 3-5x the swaps).
+//!
 //! Which picks may be swapped:
 //! * `V41_SUB_MIN_RANK` (1..=6, default 6): only picks at this rank or lower
 //!   (6 = the 6th pick only).
@@ -93,6 +102,14 @@ pub fn pending_on() -> bool {
     static P: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("V41_SUB_PENDING").as_deref() != Ok("0"));
     *P
+}
+
+/// `V41_SUB_ADMIT` (default on): queue swapped-away box-2 experts as box-2
+/// prefetch words so they are read in the background (module doc).
+pub fn admit_on() -> bool {
+    static A: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_SUB_ADMIT").as_deref() != Ok("0"));
+    *A
 }
 
 /// `V41_SUB_MAX_W`: cap on the weight moved by a swap (see the module doc).
@@ -161,20 +178,27 @@ static N_AVOIDED: AtomicU64 = AtomicU64::new(0);
 static N_SLOTS: AtomicU64 = AtomicU64::new(0);
 static N_BLOCKED: AtomicU64 = AtomicU64::new(0);
 static N_FAILED: AtomicU64 = AtomicU64::new(0);
+static N_ADMITS: AtomicU64 = AtomicU64::new(0);
+
+/// Background admissions queued (`V41_SUB_ADMIT`), for the profile.
+pub fn note_admits(n: usize) {
+    N_ADMITS.fetch_add(n as u64, Ordering::Relaxed);
+}
 
 /// `(predicted box-2 misses, reads avoided, picks substituted, misses left
-/// alone, planner failures)` since the last call. Failures should be 0 (see
-/// `SubOutcome::failed`). The first, second and fourth count distinct
+/// alone, planner failures, background admissions queued)` since the last
+/// call. Failures should be 0 (see `SubOutcome::failed`). The first, second and fourth count distinct
 /// experts per lane-layer; box 2 counts a miss once per (possibly merged)
 /// pass, so compare with `box2.misses_x1e6` as an upper bound. In dry-run mode
 /// "avoided" and "substituted" are what WOULD have happened.
-pub fn take_sub_stats() -> (u64, u64, u64, u64, u64) {
+pub fn take_sub_stats() -> (u64, u64, u64, u64, u64, u64) {
     (
         N_PREDICTED.swap(0, Ordering::Relaxed),
         N_AVOIDED.swap(0, Ordering::Relaxed),
         N_SLOTS.swap(0, Ordering::Relaxed),
         N_BLOCKED.swap(0, Ordering::Relaxed),
         N_FAILED.swap(0, Ordering::Relaxed),
+        N_ADMITS.swap(0, Ordering::Relaxed),
     )
 }
 
