@@ -2393,6 +2393,7 @@ impl HeterogeneousEngine {
     ) -> eyre::Result<RowTables> {
         // Decode-phase link window (the rows are decode rows of live streams).
         self.remote_set_phase_busy_poll(true);
+        super::b2_mirror::begin_step();
         let b = tokens.len();
         if b == 0 {
             return Ok(RowTables::default());
@@ -2497,6 +2498,7 @@ impl HeterogeneousEngine {
         mut pager: Option<&mut super::expert_pager::ExpertPager>,
     ) -> eyre::Result<(RowTables, RowTables)> {
         self.remote_set_phase_busy_poll(true);
+        super::b2_mirror::begin_step();
         let b = tokens.len();
         if b < 2 {
             return Err(eyre!("forward_step_arena_pipelined: needs >= 2 rows (got {b})"));
@@ -2681,6 +2683,7 @@ impl HeterogeneousEngine {
         mut pager: Option<&mut super::expert_pager::ExpertPager>,
     ) -> eyre::Result<Vec<RowTables>> {
         self.remote_set_phase_busy_poll(true);
+        super::b2_mirror::begin_step();
         let b = tokens.len();
         let n = lanes.len();
         if n < 2 || n > Self::MAX_LANES || b < n {
@@ -2831,6 +2834,7 @@ impl HeterogeneousEngine {
         mut pager: Option<&mut super::expert_pager::ExpertPager>,
     ) -> eyre::Result<Vec<RowTables>> {
         self.remote_set_phase_busy_poll(true);
+        super::b2_mirror::begin_step();
         let b = tokens.len();
         let n = lanes.len();
         if n < 2 || n > Self::MAX_LANES || b < n {
@@ -6514,12 +6518,13 @@ impl HeterogeneousEngine {
                         // alternatives' weights and the picks' weights, both on
                         // `d_ew`'s scale (sum 1.5); then one char per pick then
                         // alternative for residency at route time: box 2's mirror
-                        // R held / P not held but in a sent, unanswered request /
-                        // I not held but a queued background read covers it
-                        // (INCOMING) / M missing / ? not yet reported, box 1's
-                        // pager r held / m missing. Enough to replay any
-                        // substitution gate offline. Parsers keyed on `P`/`D`
-                        // skip it.
+                        // R held / I not held but a queued background read covers
+                        // it (INCOMING; counts as resident, so it wins over P) / P
+                        // not held but in a sent, unanswered request (resident only
+                        // with `V41_SUB_PENDING`) / M missing / ? not yet reported,
+                        // box 1's pager r held / m missing. Enough to replay any
+                        // substitution gate offline. Parsers keyed on `P`/`D` skip
+                        // it.
                         if na > 0 {
                             let alts = &alts_host[r * na..(r + 1) * na];
                             let a: Vec<String> = alts.iter().map(|v| v.to_string()).collect();
@@ -6540,8 +6545,8 @@ impl HeterogeneousEngine {
                                 } else if box2 {
                                     match super::b2_mirror::lookup(layer, e as u32) {
                                         Some(r) if r.held => 'R',
-                                        Some(r) if r.pending => 'P',
                                         Some(r) if r.incoming => 'I',
+                                        Some(r) if r.pending => 'P',
                                         Some(_) => 'M',
                                         None => '?',
                                     }
@@ -6561,16 +6566,17 @@ impl HeterogeneousEngine {
                     }
                 }
                 // INCOMING (het::b2_mirror): the router's box-2 picks that box 2's
-                // last reply calls missing but a queued background read covers,
-                // i.e. kept instead of swapped away again. The router's own picks:
-                // a live prior's are in `orig_host`.
+                // last reply calls missing but a queued background read covers --
+                // an upper bound on the picks the overlay kept from being swapped
+                // away again. The router's own picks: a live prior's are in
+                // `orig_host`.
                 if sub_on || (sub3 && prior_on) {
                     let router: &[i32] = if sub3 && prior_on && !super::b2_mirror::dry() && orig_host.len() == sel_host.len() {
                         &orig_host
                     } else {
                         &sel_host
                     };
-                    super::b2_mirror::note_incoming_kept(layer, router, |e| super::expert_pager::partition_box2(layer, e));
+                    super::b2_mirror::note_incoming_covered(layer, router, |e| super::expert_pager::partition_box2(layer, e));
                 }
                 // Cache-prior accounting: what the router's prior displaced, and
                 // background admission of displaced box-2 experts (as in mode 2).

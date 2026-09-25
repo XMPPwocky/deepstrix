@@ -11,9 +11,12 @@
 //! by the time the other lane's request for the same layer is served, so the
 //! other lane must neither avoid them (it would pay the quality cost of a
 //! swap for a read box 2 is making anyway) nor count them as misses. `update`
-//! clears the layer's pending row: a layer's replies are consumed (`wait`)
-//! only after both lanes have routed it, and the next route of that layer is
-//! the next step. `V41_SUB_PENDING=0` turns the overlay off. Do that when box
+//! clears the layer's pending row: under the lockstep and round-robin lane
+//! drivers a layer's replies are consumed (`wait`) only after both lanes have
+//! routed it, and the next route of that layer is the next step. (The
+//! ready-first driver can consume one lane's reply before the other lane
+//! routes; the map it brings then shows the read done, so the overlay is
+//! merely not needed.) `V41_SUB_PENDING=0` turns the overlay off. Do that when box
 //! 2 PARKs (`knobs::park`): there it serves the other lane while this lane's
 //! read is parked, so an expert "being read" is NOT free for the other lane,
 //! and swapping it away is what lets that lane skip the wait. Known leftovers:
@@ -31,32 +34,6 @@
 //!   `V41_ROUTER_ALTS`) held by either box. The row is renormalized exactly
 //!   (ref.Gate).
 //!
-//! Swapped-away box-2 experts are still READ, just not on the critical path
-//! (`V41_SUB_ADMIT`, default on): the hub queues `layer << 16 | e` as a box-2
-//! PREFETCH word on the same request (`remote_experts::push_prefetch_words`).
-//! Box 2's background readers fetch it (yielding to demand misses) and admit
-//! it at that layer's next `ensure`, so the mirror shows it resident soon after
-//! and the swap rate falls back to the first-touch miss rate. Without it, a
-//! swapped expert is never read, never admitted, and swapped again on every
-//! later pick (measured live: 3-5x the swaps).
-//!
-//! INCOMING (`V41_SUB_INCOMING`, default 4 replies; 0 = off). Box 2's map
-//! counts only LANDED slots, and the reply that follows an admission leaves
-//! before its read lands, so at the layer's next route the mirror still says
-//! "missing": an expert the router picks again on the next token is swapped
-//! away again, for a read already under way (measured live 2026-09-25: 3.9% of
-//! swapped-away experts are re-picked on the next token, 71% of those were
-//! swapped again, ~2.8% of all swaps). `note_incoming` marks each queued
-//! admission, and the mark counts as resident from the layer's NEXT reply for
-//! the next N replies, or until a reply shows the expert held. Not before that
-//! reply: the other lane of the same step routes before any reply is consumed
-//! (see PENDING above), and it must not ride on a read queued a moment ago. If
-//! the read has not landed when a request needs it, box 2 promotes it and
-//! waits (`ensure`'s in-flight wait): at most one read, already queued, never
-//! a second. A mark box 2 dropped expires after N replies (each costs one
-//! demand read at most). Marked experts are also acceptable substitutes
-//! (mode 2) and are boosted by the prior (mode 3), like any resident expert.
-//!
 //! * 3 = CACHE-PRIOR (Skliar et al. 2024, arXiv 2412.00099): no host-side
 //!   rewrite. The router itself adds `lambda * Delta_layer` to the selection
 //!   score of every expert held by the box that computes it (box 2's mirror,
@@ -66,6 +43,40 @@
 //!   one knob, `V41_SUB_LAMBDA`, is a per-layer gap gate: a missing pick is
 //!   displaced only by a held expert within lambda * Delta of it. Displaced
 //!   box-2 experts are admitted in the background as in mode 2.
+//!
+//! Swapped-away box-2 experts are still READ, just not on the critical path
+//! (`V41_SUB_ADMIT`, default on; modes 2 and 3): the hub queues `layer << 16 |
+//! e` as a box-2 PREFETCH word on the same request
+//! (`remote_experts::push_prefetch_words`). Box 2's background readers fetch
+//! it (yielding to demand misses) and admit it at that layer's next `ensure`,
+//! so the mirror shows it resident soon after and the swap rate falls back to
+//! the first-touch miss rate. Without it, a swapped expert is never read,
+//! never admitted, and swapped again on every later pick (measured live: 3-5x
+//! the swaps).
+//!
+//! INCOMING (`V41_SUB_INCOMING`, default 2 decode steps; 0 = off). Box 2's map
+//! counts only LANDED slots, and the reply that follows an admission leaves
+//! before its read lands, so at the layer's next route the mirror still says
+//! "missing": an expert the router picks again on the next token was swapped
+//! away again, for a read already under way (measured live 2026-09-25: 3.9% of
+//! swapped-away experts are re-picked on the next token, 71% of those were
+//! swapped again, ~2.8% of all swaps). `note_incoming` marks each admission
+//! actually queued, and the mark counts as resident from the NEXT decode step
+//! (`begin_step`, called first by every arena decode driver) for N steps. Not
+//! in the same step: the other lane may route this layer after the mark --
+//! under the ready-first driver even after this lane's reply is consumed --
+//! and must not ride on a read queued a moment ago. By the next step every
+//! request of this one has been answered, so the word has reached box 2. If
+//! the read has not landed when a request needs it, box 2 promotes it and
+//! waits (`ensure`'s in-flight wait): at most one read, already queued, never a
+//! second. A mark is NOT cleared when a reply shows the expert held: under
+//! PARK an older map can be consumed after a newer one. The price of a stale
+//! mark is bounded by the window: an eviction inside it, or a word box 2
+//! dropped (its speculative queue drops words when at most 2x the reserve of
+//! staging sets is free, and it ignores them without a prefetch reader), costs
+//! one demand read, and under mode 3 may steer a row onto that expert. Marked
+//! experts are acceptable substitutes (mode 2) and are boosted by the prior
+//! (mode 3), like any resident expert.
 //!
 //! Which picks may be swapped (modes 1-2):
 //! * `V41_SUB_MIN_RANK` (1..=6, default 6): only picks at this rank or lower
@@ -89,13 +100,13 @@ const MAX_ALT: usize = ROUTER_MAX_ALT as usize;
 static BITS: [[AtomicU64; WORDS]; LAYERS] = [const { [const { AtomicU64::new(0) }; WORDS] }; LAYERS];
 static PENDING: [[AtomicU64; WORDS]; LAYERS] = [const { [const { AtomicU64::new(0) }; WORDS] }; LAYERS];
 static SEEN: [AtomicBool; LAYERS] = [const { AtomicBool::new(false) }; LAYERS];
-/// Replies consumed per layer: the INCOMING overlay's clock.
-static REPLIES: [AtomicU32; LAYERS] = [const { AtomicU32::new(0) }; LAYERS];
-/// Per (layer, expert): the `REPLIES` count from which a queued admission
-/// counts as resident (module doc, INCOMING); 0 = no mark.
+/// Decode steps begun (`begin_step`): the INCOMING overlay's clock.
+static STEP: AtomicU32 = AtomicU32::new(0);
+/// Per (layer, expert): the `STEP` from which a queued admission counts as
+/// resident (module doc, INCOMING); 0 = no mark.
 static INCOMING: [[AtomicU32; NE]; LAYERS] = [const { [const { AtomicU32::new(0) }; NE] }; LAYERS];
 
-/// `V41_SUB`: 0 off, 1 dry run, 2 on.
+/// `V41_SUB`: 0 off, 1 dry run, 2 host planner, 3 cache-prior.
 pub fn mode() -> u32 {
     static M: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
         let m = std::env::var("V41_SUB").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0).min(3);
@@ -240,25 +251,31 @@ pub fn max_w() -> Option<f32> {
     *W
 }
 
-/// `V41_SUB_INCOMING` (default 4; 0 = off): for how many of a layer's replies
-/// a queued background admission counts as resident (module doc, INCOMING).
-pub fn incoming_replies() -> u32 {
+/// `V41_SUB_INCOMING` (default 2; 0 = off): for how many decode steps a
+/// queued background admission counts as resident (module doc, INCOMING).
+pub fn incoming_steps() -> u32 {
     static N: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-        std::env::var("V41_SUB_INCOMING").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(4)
+        std::env::var("V41_SUB_INCOMING").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(2)
     });
     *N
 }
 
+/// A decode step begins: advance the INCOMING clock. Every arena decode
+/// driver calls this first; a path that never does leaves marks inactive.
+pub fn begin_step() {
+    STEP.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Admissions `(layer << 16) | e` were just queued for box 2: count them as
-/// resident from the layer's next reply (module doc, INCOMING).
+/// resident from the next decode step (module doc, INCOMING).
 pub fn note_incoming(words: &[u32]) {
-    if incoming_replies() == 0 {
+    if incoming_steps() == 0 {
         return;
     }
+    let from = STEP.load(Ordering::Relaxed).wrapping_add(1).max(1);
     for &w in words {
         let (l, e) = ((w >> 16) as usize, (w & 0xffff) as usize);
         if l < LAYERS && e < NE {
-            let from = REPLIES[l].load(Ordering::Acquire).wrapping_add(1).max(1);
             INCOMING[l][e].store(from, Ordering::Relaxed);
         }
     }
@@ -266,14 +283,14 @@ pub fn note_incoming(words: &[u32]) {
 
 /// Is `(l, e)`'s admission mark inside its window?
 fn incoming(l: usize, e: usize) -> bool {
-    let n = incoming_replies();
+    let n = incoming_steps();
     let from = INCOMING[l][e].load(Ordering::Relaxed);
-    n > 0 && from != 0 && REPLIES[l].load(Ordering::Acquire).wrapping_sub(from) < n
+    n > 0 && from != 0 && STEP.load(Ordering::Relaxed).wrapping_sub(from) < n
 }
 
 /// Overwrite `layer`'s row from a reply's residency map
-/// (`proto::RESID_WORDS` u32s, bit e = expert e), drop its pending row, and
-/// advance the layer's INCOMING clock.
+/// (`proto::RESID_WORDS` u32s, bit e = expert e), and drop its pending row.
+/// INCOMING marks are left alone (module doc).
 pub fn update(layer: u32, words: &[u32]) {
     let l = layer as usize;
     if l >= LAYERS {
@@ -282,19 +299,9 @@ pub fn update(layer: u32, words: &[u32]) {
     for (i, slot) in BITS[l].iter().enumerate() {
         let lo = words.get(2 * i).copied().unwrap_or(0) as u64;
         let hi = words.get(2 * i + 1).copied().unwrap_or(0) as u64;
-        let held = lo | (hi << 32);
-        slot.store(held, Ordering::Relaxed);
+        slot.store(lo | (hi << 32), Ordering::Relaxed);
         PENDING[l][i].store(0, Ordering::Relaxed);
-        // A landed admission is plainly held now: drop its mark, so that it
-        // cannot outlive an eviction inside its window.
-        for b in 0..64 {
-            let e = i * 64 + b;
-            if e < NE && (held >> b) & 1 == 1 && INCOMING[l][e].load(Ordering::Relaxed) != 0 {
-                INCOMING[l][e].store(0, Ordering::Relaxed);
-            }
-        }
     }
-    REPLIES[l].fetch_add(1, Ordering::Release);
     SEEN[l].store(true, Ordering::Release);
 }
 
@@ -329,8 +336,8 @@ pub struct Residency {
     /// In a sent, unanswered request (`note_submitted`), whether or not
     /// `V41_SUB_PENDING` counts it.
     pub pending: bool,
-    /// A queued background admission inside its window (`note_incoming`;
-    /// false when `V41_SUB_INCOMING=0`).
+    /// A queued background admission inside its step window
+    /// (`note_incoming`; false when `V41_SUB_INCOMING=0`).
     pub incoming: bool,
 }
 
@@ -365,10 +372,12 @@ pub fn note_admits(n: usize) {
 
 /// Count one lane-layer's distinct box-2 picks (`is_box2`) that box 2's last
 /// reply calls missing (and no counted PENDING covers) but a queued admission
-/// does (INCOMING): each would otherwise be a predicted miss, swapped away
-/// again. Pass the ROUTER's picks.
-pub fn note_incoming_kept(layer: i32, picks: &[i32], is_box2: impl Fn(u32) -> bool) {
-    if incoming_replies() == 0 {
+/// does (INCOMING). Each would otherwise be a predicted miss, but not every
+/// one would have been swapped (protected ranks, no held alternative within
+/// reach), so this is an UPPER BOUND on the swaps the overlay prevented. Pass
+/// the ROUTER's picks.
+pub fn note_incoming_covered(layer: i32, picks: &[i32], is_box2: impl Fn(u32) -> bool) {
+    if incoming_steps() == 0 {
         return;
     }
     let mut seen: Vec<i32> = Vec::new();
@@ -386,7 +395,7 @@ pub fn note_incoming_kept(layer: i32, picks: &[i32], is_box2: impl Fn(u32) -> bo
 }
 
 /// `(predicted box-2 misses, reads avoided, picks substituted, misses left
-/// alone, planner failures, background admissions queued, picks kept by
+/// alone, planner failures, background admissions queued, picks covered by
 /// INCOMING)` since the last call. Failures should be 0 (see
 /// `SubOutcome::failed`). The first, second, fourth and last count distinct
 /// experts per lane-layer; box 2 counts a miss once per (possibly merged)
@@ -872,8 +881,8 @@ mod tests {
         assert!((delta(l).unwrap() - 3.1).abs() < 1e-6);
     }
 
-    /// The mirror is process-global; this is its only test, on a layer no
-    /// other test touches.
+    /// The mirror is process-global; each mirror test uses a layer no other
+    /// test touches.
     #[test]
     fn mirror_update_pending_and_lookup() {
         let l = (LAYERS - 1) as u32;
@@ -899,45 +908,47 @@ mod tests {
         assert_eq!(resident(l as i32, 4), Some(false));
     }
 
-    /// INCOMING: a queued admission counts as resident from the layer's next
-    /// reply, for `incoming_replies()` replies; a reply that shows it held
-    /// clears the mark. Own layer (the mirror is process-global).
+    /// INCOMING: a queued admission counts as resident from the NEXT decode
+    /// step, for `incoming_steps()` steps, whatever replies arrive meanwhile.
+    /// Own layer; the only test that advances the step clock.
     #[test]
-    fn incoming_window_clear_and_count() {
+    fn incoming_window_and_count() {
         let l = (LAYERS - 3) as u32;
-        let n = incoming_replies();
-        assert!(n >= 1, "test assumes V41_SUB_INCOMING is on (default 4)");
+        let n = incoming_steps();
+        assert!(n >= 1, "test assumes V41_SUB_INCOMING is on (default 2)");
         let empty = vec![0u32; NE.div_ceil(32)];
         update(l, &empty);
         // Out-of-range words are ignored.
         note_incoming(&[(l << 16) | 7, (LAYERS as u32) << 16, (l << 16) | 9999]);
-        assert_eq!(resident(l as i32, 7), Some(false), "not before the layer's next reply");
+        assert_eq!(resident(l as i32, 7), Some(false), "not in the step that queued it");
+        update(l, &empty);
+        assert_eq!(resident(l as i32, 7), Some(false), "a reply in the same step does not activate it");
         for k in 0..n {
-            update(l, &empty);
-            assert_eq!(resident(l as i32, 7), Some(true), "inside the window, reply {k}");
+            begin_step();
+            assert_eq!(resident(l as i32, 7), Some(true), "inside the window, step {k}");
             assert!(lookup(l as i32, 7).is_some_and(|r| r.incoming && !r.held));
         }
-        update(l, &empty);
-        assert_eq!(resident(l as i32, 7), Some(false), "expired after {n} replies");
+        begin_step();
+        assert_eq!(resident(l as i32, 7), Some(false), "expired after {n} steps");
 
-        // Landed: the mark goes, so an eviction inside the old window is a miss.
+        // A reply showing it held does not clear the mark: an OLDER map
+        // consumed after it (PARK) must not make it a miss again.
         note_incoming(&[(l << 16) | 8]);
-        update(l, &empty);
-        assert_eq!(resident(l as i32, 8), Some(true));
+        begin_step();
         let mut w = empty.clone();
         w[0] = 1 << 8;
         update(l, &w);
-        assert_eq!(lookup(l as i32, 8), Some(Residency { held: true, pending: false, incoming: false }));
+        assert_eq!(lookup(l as i32, 8), Some(Residency { held: true, pending: false, incoming: true }));
         update(l, &empty);
-        assert_eq!(resident(l as i32, 8), Some(false), "evicted: a miss again");
+        assert_eq!(resident(l as i32, 8), Some(true), "still covered by its mark");
 
-        // Kept picks: distinct, box 2's only, in-window marks only.
+        // Covered picks: distinct, box 2's only, in-window marks only.
         note_incoming(&[(l << 16) | 10]);
-        update(l, &empty);
+        begin_step();
         let _ = take_sub_stats();
-        note_incoming_kept(l as i32, &[10, 10, 11, -1, 9999], |_| true);
+        note_incoming_covered(l as i32, &[10, 10, 11, -1, 9999], |_| true);
         assert_eq!(take_sub_stats().6, 1);
-        note_incoming_kept(l as i32, &[10], |_| false);
+        note_incoming_covered(l as i32, &[10], |_| false);
         assert_eq!(take_sub_stats().6, 0, "box-1 picks are not counted");
     }
 }
