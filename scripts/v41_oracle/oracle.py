@@ -80,6 +80,10 @@ def main():
     ap.add_argument("--swap-frac", type=float, default=1.0,
                     help="apply the swap to only this fraction of eligible token-layers (deterministic, --swap-seed)")
     ap.add_argument("--swap-seed", type=int, default=0)
+    ap.add_argument("--swap-rand-dtype", choices=("float32", "bfloat16"), default="float32",
+                    help="dtype of the --swap-frac draws. The default dtype here is bf16, and a bf16 uniform "
+                         "overshoots small fractions (0.001 realises ~0.003, 0.032 ~0.034); bfloat16 reproduces "
+                         "the runs made before this flag existed (their manifests have no swap_rand_dtype)")
     ap.add_argument("--swap-mode", choices=("seventh", "drop", "bf16"), default="seventh",
                     help="seventh: route to the 7th instead; drop: drop the 6th and renormalise over the other 5; "
                          "bf16 (null control): keep routing, round the 6th expert's contribution to bf16")
@@ -99,6 +103,7 @@ def main():
                          "(recomputes those rows' FFN with the original routing) to swap_checks.json")
     ap.add_argument("--no-layer-dumps", action="store_true", help="skip per-layer residual/routing files")
     a = ap.parse_args()
+    rand_dtype = getattr(torch, a.swap_rand_dtype)
     if a.swap_eps is not None:
         a.golden = True
     hot_sets = None
@@ -255,7 +260,7 @@ def main():
                         allowed[torch.tensor(swap_pos, dtype=torch.long)] = True
                         cold &= allowed[:, None]
                     g = torch.Generator().manual_seed(a.swap_seed * 1000003 + L)
-                    sw = cold & (torch.rand(idx.shape, generator=g) < a.swap_frac)
+                    sw = cold & (torch.rand(idx.shape, generator=g, dtype=rand_dtype) < a.swap_frac)
                     w_ref, idx_ref = w.clone(), idx.clone()
                     if a.swap_mode == "bf16":
                         # matched-count null: same sites, no substitution; each marked pick's
@@ -307,7 +312,7 @@ def main():
                     if a.swap_frac < 1.0:
                         # Deterministic per (seed, layer, position): a seeded generator over the rows.
                         g = torch.Generator().manual_seed(a.swap_seed * 1000003 + L)
-                        swap = swap & (torch.rand(swap.shape[0], generator=g) < a.swap_frac)
+                        swap = swap & (torch.rand(swap.shape[0], generator=g, dtype=rand_dtype) < a.swap_frac)
                     idx = top.indices[:, :k].clone()
                     col = (a.swap_rank or k) - 1
                     w_ref, idx_ref = w.clone(), idx.clone()
@@ -433,6 +438,7 @@ def main():
         json.dump({"tokens": len(ids), "layers": n_layers, "engram": layout is not None,
                    "swap_eps": a.swap_eps, "swap_cold_only": a.swap_cold_only, "swap_positions": a.swap_positions,
                    "swap_sixth_cold": a.swap_sixth_cold, "swap_frac": a.swap_frac, "swap_seed": a.swap_seed,
+                   "swap_rand_dtype": a.swap_rand_dtype,
                    "swap_mode": a.swap_mode, "swap_rank": a.swap_rank or 6,
                    "swap_anyrank_cold": a.swap_anyrank_cold, "swap_rank_counts": swap_rank_counts,
                    "swap_weights": a.swap_weights,
