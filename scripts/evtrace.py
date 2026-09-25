@@ -318,13 +318,16 @@ def cmd_report(a):
     rd = recs.get('b2_read', [])
     if rd:
         names = {0: 'demand', 1: 'bg certain', 2: 'bg spec->certain', 3: 'bg speculative'}
+        routes = {0: 'split (both drives)', 1: 'mirror only (SN5000)', 2: 'primary only (E100)'}
         print(f'\n===== b2_read ({len(rd)} expert reads)')
         by = defaultdict(list)
         for r in rd:
-            by[r['src']].append(r)
-        for src in sorted(by):
-            g = by[src]
-            print(f'\n-- src={src:g} {names.get(int(src), "?")} ({len(g)})')
+            # `route` exists from the urgency-routing build on; older files: split.
+            rt = r.get('route', 0.0)
+            by[(r['src'], 0.0 if rt is None or math.isnan(rt) else rt)].append(r)
+        for src, rt in sorted(by):
+            g = by[(src, rt)]
+            print(f'\n-- src={src:g} {names.get(int(src), "?")}, route {routes.get(int(rt), "?")} ({len(g)})')
             show('read ms (read_start -> read_end)', [ms(r['t_read_start'], r['t_read_end']) for r in g], bins)
             show('slowest role ms', [max(ms(r[f'r{i}_start'], r[f'r{i}_end']) for i in range(3)) for r in g], hist=False)
             show('queue ms (hint -> pop)', [ms(r['t_hint'], r['t_pop']) for r in g], hist=False)

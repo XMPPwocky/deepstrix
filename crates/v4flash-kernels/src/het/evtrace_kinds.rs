@@ -151,14 +151,16 @@ pub static B2_REQ: Kind = Kind {
 /// One `ensure_layer_inner` call (a request's paging for one layer).
 /// `admit_*` = landing finished background reads first (`wait_ns` blocked on
 /// this request's own in-flight picks); then hit/miss + victim search, the
-/// demand reads, and the remap uploads.
+/// demand reads, and the remap uploads. `admit_skipped_spec` = wanted experts
+/// whose speculative read was running on the primary and NOT waited for
+/// (`route=urgency`: read from the mirror instead).
 pub static B2_ENSURE: Kind = Kind {
     id: 22,
     name: "b2_ensure",
     fields: &[
         "seq", "layer", "n_ids", "n_want", "n_hits", "n_miss", "prefill_shaped",
         "t_start", "t_admit_end", "t_dirty_end", "t_victims_end", "t_reads_end", "t_end",
-        "admit_wait_ns", "admit_landed", "admit_landed_wanted", "admit_blocking_recvs",
+        "admit_wait_ns", "admit_landed", "admit_landed_wanted", "admit_blocking_recvs", "admit_skipped_spec",
         "victim_scan_ns", "evicted_foreign", "took_free", "k_par", "n_chunks",
         "dirty_upload", "remap_upload_ns",
         "pf_run_certain", "pf_run_spec", "pf_q_certain", "pf_q_spec",
@@ -176,7 +178,8 @@ pub static B2_ENSURE: Kind = Kind {
 /// starts. The concurrency fields are sampled at READ START (after the yield);
 /// `demand_reads_at_start` is NaN for demand reads (only their own thread
 /// changes it). Demand: `set` = its staging set (= index in the chunk),
-/// `chunk_idx` = the chunk's number. `wanted`/`blocked_on` = the request being served
+/// `chunk_idx` = the chunk's number. `route` = the drives it read from:
+/// 0 split (both), 1 mirror only (SN5000), 2 primary only (E100). `wanted`/`blocked_on` = the request being served
 /// needed it / the compute thread was blocked waiting for it.
 pub static B2_READ: Kind = Kind {
     id: 21,
@@ -187,6 +190,7 @@ pub static B2_READ: Kind = Kind {
         "yield_ns", "pause_ns", "demand_reads_at_start", "run_certain_at_start", "run_spec_at_start",
         "r0_start", "r0_end", "r1_start", "r1_end", "r2_start", "r2_end",
         "wanted", "blocked_on", "coalesced", "victim_scan_ns", "repack_ns", "chunk_n", "chunk_idx", "already_resident",
+        "route",
     ],
 };
 

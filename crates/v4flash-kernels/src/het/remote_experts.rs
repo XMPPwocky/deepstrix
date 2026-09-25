@@ -1337,9 +1337,9 @@ struct PfDone {
     read_ns: u64,
     /// `evtrace` (NaN when off): t_hint, t_pop, t_read_start, t_read_end,
     /// yield_ns, pause_ns, certain at pop, certain at read, DEMAND_READS and
-    /// running certain / speculative at READ START (after the yield), then
-    /// the role (start, end) x3.
-    ev: [f64; 17],
+    /// running certain / speculative at READ START (after the yield), the
+    /// role (start, end) x3, then the drive route (`ExpertRoute::code`).
+    ev: [f64; 18],
 }
 
 /// One background read for the prefetch readers.
@@ -1378,11 +1378,22 @@ struct PfQueueInner {
     /// At most this many speculative jobs run at once: the rest of the readers
     /// (`V41_B2_PREFETCH_RESERVE`) are kept for certain ones.
     max_spec: usize,
+    /// Reader threads; under urgency routing speculative jobs may use at most
+    /// `n_readers - 1` of them, so a certain read always finds one.
+    n_readers: usize,
     closed: bool,
+    /// `knobs::route_urgency`: keys whose SPECULATIVE read a reader is running
+    /// (on the primary drive); a request that needs one does not wait for it.
+    spec_keys: std::collections::HashSet<(u32, u32)>,
 }
 
 impl PfQueue {
+    #[cfg(test)]
     fn new(max_spec: usize) -> Self {
+        Self::with_readers(max_spec, max_spec + 1)
+    }
+
+    fn with_readers(max_spec: usize, n_readers: usize) -> Self {
         Self {
             inner: std::sync::Mutex::new(PfQueueInner {
                 jobs: Default::default(),
@@ -1390,7 +1401,9 @@ impl PfQueue {
                 running_spec: 0,
                 running_certain: 0,
                 max_spec: max_spec.max(1),
+                n_readers: n_readers.max(1),
                 closed: false,
+                spec_keys: Default::default(),
             }),
             cv: std::sync::Condvar::new(),
         }
@@ -1426,6 +1439,10 @@ impl PfQueue {
                 g.jobs.insert(at, job);
                 true
             }
+            // A speculative read already running on the primary under urgency
+            // routing is not made urgent: the request reads the expert from
+            // the mirror instead (see `admit_prefetched`).
+            None if g.spec_keys.contains(&(layer, e)) => false,
             None => g.urgent.insert((layer, e)),
         };
         drop(g);
@@ -1467,11 +1484,21 @@ impl PfQueue {
     }
 
     /// Blocks for the next job the caller may run; `None` once closed and
-    /// drained. A certain job is always handed out. A speculative one only
-    /// while fewer than `max_spec` run and no certain job is running or
-    /// waiting, so the reserved readers, and the drives, are free for urgent
-    /// reads. The caller must call `finished` with the returned `certain`.
+    /// drained. A certain job is always handed out. Under `route=split` a
+    /// speculative one only while fewer than `max_spec` run and no certain job
+    /// is running or waiting, so the reserved readers, and the drives, are
+    /// free for urgent reads; under `route=urgency` see `pop_mode`. The caller
+    /// must call `finished` with the returned `certain`.
+    #[cfg(test)]
     fn pop(&self) -> Option<PfJob> {
+        self.pop_mode(false)
+    }
+
+    /// `pop`, under a drive routing. `urgency` (`knobs::route_urgency`):
+    /// speculative jobs read from the OTHER drive, so they no longer wait for
+    /// running certain ones (still at most `max_spec`), and a speculative job
+    /// handed out is recorded in `spec_keys` until `finish_spec_key`.
+    fn pop_mode(&self, urgency: bool) -> Option<PfJob> {
         let mut g = self.inner.lock().unwrap();
         loop {
             if g.closed {
@@ -1485,14 +1512,34 @@ impl PfQueue {
                     g.running_certain += 1;
                     return g.jobs.pop_front();
                 }
-                Some(_) if g.running_spec < g.max_spec && g.running_certain == 0 => {
+                Some(_) if g.running_spec < Self::spec_cap(&g, urgency) && (urgency || g.running_certain == 0) => {
                     g.running_spec += 1;
-                    return g.jobs.pop_front();
+                    let j = g.jobs.pop_front()?;
+                    if urgency {
+                        g.spec_keys.insert((j.layer, j.e));
+                    }
+                    return Some(j);
                 }
                 _ => {}
             }
             g = self.cv.wait(g).unwrap();
         }
+    }
+
+    /// Speculative jobs allowed at once: `max_spec`, and under urgency routing
+    /// (where they no longer wait for certain ones) never every reader.
+    fn spec_cap(g: &PfQueueInner, urgency: bool) -> usize {
+        if urgency { g.max_spec.min(g.n_readers.saturating_sub(1)).max(1) } else { g.max_spec }
+    }
+
+    /// A speculative read recorded by `pop_mode(true)` is done.
+    fn finish_spec_key(&self, layer: u32, e: u32) {
+        self.inner.lock().unwrap().spec_keys.remove(&(layer, e));
+    }
+
+    /// The keys whose speculative read is running now (urgency routing).
+    fn spec_keys_snapshot(&self) -> std::collections::HashSet<(u32, u32)> {
+        self.inner.lock().unwrap().spec_keys.clone()
     }
 
     /// A job popped as speculative turned out to be needed (`urgent`) before
@@ -1556,16 +1603,47 @@ fn b2_background_pause(token: u64) {
     }
 }
 
+/// Must `admit_prefetched` block for one of `want` (layer `layer`)? Only for
+/// a key still pending whose read is NOT a speculative one running on the
+/// primary under urgency routing (`skip`, empty under `split`).
+fn wanted_in_flight(
+    want: &[u32],
+    layer: u32,
+    pending: &std::collections::HashSet<(u32, u32)>,
+    skip: &std::collections::HashSet<(u32, u32)>,
+) -> bool {
+    want.iter().any(|&e| pending.contains(&(layer, e)) && !skip.contains(&(layer, e)))
+}
+
+/// Does the park loop keep waiting for `key`? While pending -- except, under
+/// urgency routing, a speculative read running on the primary (the request
+/// reads it from the mirror itself) or a key already resident (made so by a
+/// mirror read of an interleaved request; its late copy is discarded).
+fn park_waits_for(
+    key: (u32, u32),
+    pending: &std::collections::HashSet<(u32, u32)>,
+    spec: &std::collections::HashSet<(u32, u32)>,
+    resident: impl Fn(&(u32, u32)) -> bool,
+    urgency: bool,
+) -> bool {
+    pending.contains(&key) && !(urgency && (spec.contains(&key) || resident(&key)))
+}
+
 /// Calls `PfQueue::finished` when a reader is done with a job, including by
 /// panic, so a failed read can never leave the gate counters raised (which
 /// would keep speculative reads off for good).
 struct PfFinish<'a> {
     q: &'a PfQueue,
     certain: bool,
+    /// A speculative key `pop_mode(true)` recorded, released with the job.
+    spec_key: Option<(u32, u32)>,
 }
 
 impl Drop for PfFinish<'_> {
     fn drop(&mut self) {
+        if let Some((l, e)) = self.spec_key {
+            self.q.finish_spec_key(l, e);
+        }
         self.q.finished(self.certain);
     }
 }
@@ -1678,6 +1756,9 @@ pub mod knobs {
     static MERGE_WAIT_US: AtomicU64 = AtomicU64::new(400);
     static MISS_PAR: AtomicUsize = AtomicUsize::new(1);
     static PARK: AtomicBool = AtomicBool::new(false);
+    static ROUTE_URGENCY: AtomicBool = AtomicBool::new(false);
+    /// Every shard's mirror opened (`set_mirror_ok`, at `enable_paging`).
+    static MIRROR_OK: AtomicBool = AtomicBool::new(false);
     static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     fn init() {
         INIT.get_or_init(|| {
@@ -1695,6 +1776,7 @@ pub mod knobs {
                 Relaxed,
             );
             PARK.store(std::env::var("V41_B2_PARK").as_deref() == Ok("1"), Relaxed);
+            ROUTE_URGENCY.store(std::env::var("V41_B2_ROUTE").as_deref() == Ok("urgency"), Relaxed);
         });
     }
     pub fn merge() -> bool { init(); MERGE.load(Relaxed) }
@@ -1719,6 +1801,26 @@ pub mod knobs {
     /// out the whole NVMe read: measured 2026-09-23 at 4 rows, ~131 ms/step of
     /// box-2 queueing, ~as much as box 2's own page time.
     pub fn park() -> bool { init(); PARK.load(Relaxed) }
+    /// `route=urgency` (`V41_B2_ROUTE=urgency`; default `split`): which drive
+    /// each expert read uses. `split` = every read split across both drives by
+    /// `mirror_frac`, scales from the primary. `urgency` = reads a request is
+    /// or will soon be waiting on (demand misses, CERTAIN background reads)
+    /// come WHOLLY from the mirror (box 2's SN5000), speculative background
+    /// reads wholly from the primary (the E100, also the OS disk, whose reads
+    /// stall 5-20x under any write burst: evtrace 2026-09-25). The two classes
+    /// then share no drive, so speculative reads neither yield to demand reads
+    /// nor wait behind certain ones; and a request never waits on a
+    /// speculative read already running on the E100 -- it reads the expert
+    /// itself from the SN5000 and the late copy is discarded on landing.
+    /// Needs a usable mirror on EVERY shard (`set_mirror_ok`); otherwise it
+    /// is `split` (a mirror-only read would silently fall back to the primary).
+    pub fn route_urgency() -> bool {
+        init();
+        ROUTE_URGENCY.load(Relaxed) && MIRROR_OK.load(Relaxed)
+    }
+    pub fn set_mirror_ok(ok: bool) {
+        MIRROR_OK.store(ok, Relaxed);
+    }
     pub fn path() -> String {
         std::env::var("V41_B2_KNOBS").unwrap_or_else(|_| {
             format!("{}/expertd-knobs.txt", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
@@ -1740,12 +1842,16 @@ pub mod knobs {
                 ("miss_par", v) => { if let Ok(n) = v.parse::<usize>() { MISS_PAR.store(n.clamp(1, 16), Relaxed) } }
                 ("coalesce", v) => COALESCE.store(v != "0", Relaxed),
                 ("park", v) => PARK.store(v != "0", Relaxed),
+                ("route", "urgency") => ROUTE_URGENCY.store(true, Relaxed),
+                ("route", "split") => ROUTE_URGENCY.store(false, Relaxed),
+                ("route", v) => eprintln!("expertd: knobs: unknown route={v:?} (want split|urgency); unchanged"),
                 ("mirror_frac", v) => { if let Ok(f) = v.parse::<f32>() { v4flash_core::hf_v41::set_expert_mirror_frac(f) } }
                 _ => {}
             }
         }
-        format!("knobs reloaded from {p}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3}", park(),
-            merge(), merge_wait_us(), miss_par(), coalesce(), v4flash_core::hf_v41::expert_mirror_frac())
+        format!("knobs reloaded from {p}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={}", park(),
+            merge(), merge_wait_us(), miss_par(), coalesce(), v4flash_core::hf_v41::expert_mirror_frac(),
+            if route_urgency() { "urgency" } else { "split" })
     }
 }
 
@@ -1764,9 +1870,9 @@ pub fn install_knobs_toggle() -> String {
     // it while passing `V41_B2_MISS_PAR=4` on the command line runs at 4 and looks
     // like it is running at 1 (found by the 2026-09-22 audit, B4).
     let _ = knobs::reload();
-    let init = format!("knobs: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} (SIGUSR2 reloads {})",
+    let init = format!("knobs: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} (SIGUSR2 reloads {})",
         knobs::merge(), knobs::merge_wait_us(), knobs::miss_par(), knobs::coalesce(),
-        v4flash_core::hf_v41::expert_mirror_frac(), knobs::path());
+        v4flash_core::hf_v41::expert_mirror_frac(), if knobs::route_urgency() { "urgency" } else { "split" }, knobs::path());
     unsafe { signal(SIGUSR2, knobs_signal); }
     init
 }
@@ -1785,8 +1891,11 @@ fn b2_prefetch_par() -> usize {
 /// speculative ones (look-ahead, substitution admissions), which are dropped
 /// instead. Clamped so at least one reader stays for speculative work.
 /// `RESERVE=0` keeps the certain-first gate (no speculative read starts while a
-/// certain one runs or waits); `RESERVE >= sets / 2` drops every speculative
-/// word.
+/// certain one runs or waits) under `route=split`; under `route=urgency` the
+/// two classes use different drives, speculative jobs do not wait for certain
+/// ones, and (with more than one reader) at least one reader is always left
+/// for certain jobs.
+/// `RESERVE >= sets / 2` drops every speculative word.
 fn b2_prefetch_reserve() -> usize {
     static R: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         std::env::var("V41_B2_PREFETCH_RESERVE").ok().and_then(|v| v.parse().ok()).unwrap_or(1usize).min(8)
@@ -1832,8 +1941,9 @@ pub struct ExpertShard {
     /// added to the layer's `read_ns`, see the note there.
     pub prefetch_wait_ns: u64,
     /// `evtrace`: the last `admit_prefetched` call's blocked wait ns, landed
-    /// reads, landed reads this request wanted, blocking receives.
-    pub ev_admit: [u64; 4],
+    /// reads, landed reads this request wanted, blocking receives, and wanted
+    /// keys NOT waited for (speculative reads running on the primary, urgency).
+    pub ev_admit: [u64; 5],
     /// Persistent staging, one per role, in `hipHostMalloc` memory.
     ///
     /// Two things at once. It is persistent, so the miss path no longer
@@ -2516,7 +2626,7 @@ impl ExpertShard {
             parked_pins: Vec::new(),
             park_words: Vec::new(),
             prefetch_wait_ns: 0,
-            ev_admit: [0; 4],
+            ev_admit: [0; 5],
         })
     }
 
@@ -2540,7 +2650,7 @@ impl ExpertShard {
                 return;
             }
             let n_par_q = b2_prefetch_par().min(self.pf_stages_spare.len().max(1));
-            let queue = std::sync::Arc::new(PfQueue::new(n_par_q.saturating_sub(b2_prefetch_reserve())));
+            let queue = std::sync::Arc::new(PfQueue::with_readers(n_par_q.saturating_sub(b2_prefetch_reserve()), n_par_q));
             let _ = PF_QUEUE.set(std::sync::Arc::clone(&queue));
             v4flash_core::io_throttle::set_chunk_bytes(b2_spec_chunk_bytes());
             v4flash_core::io_throttle::install_pause(b2_background_pause);
@@ -2564,12 +2674,15 @@ impl ExpertShard {
             readers.push(std::thread::Builder::new().name("b2-prefetch".into()).spawn(move || {
                 let ptrs = ptrs;
                 loop {
-                    let Some(PfJob { layer, e, set, certain, t_hint }) = queue_r.pop() else { break };
+                    let urgency = knobs::route_urgency();
+                    let Some(PfJob { layer, e, set, certain, t_hint }) = queue_r.pop_mode(urgency) else { break };
                     let ev_on = super::evtrace::enabled();
                     let ev_t_pop = if ev_on { super::evtrace::now() } else { f64::NAN };
                     let mut ev_yield_ns = 0u64;
-                    let mut done = PfFinish { q: &queue_r, certain };
-                    if !certain {
+                    let mut done = PfFinish { q: &queue_r, certain, spec_key: (urgency && !certain).then_some((layer, e)) };
+                    // Urgency routing: a speculative read goes to the OTHER
+                    // drive from demand reads, so it neither yields nor chunks.
+                    if !certain && !urgency {
                         // Yield the drives to demand misses (bounded: a hint that
                         // waits longer than a layer is late anyway) -- unless a
                         // request needs this very expert, in which case it IS the
@@ -2602,11 +2715,18 @@ impl ExpertShard {
                     let queue_ns = (t_read - t_hint).as_nanos() as u64;
                     // A job still speculative at read start reads in chunks and
                     // yields to urgent reads (io_throttle); certain ones do not.
-                    v4flash_core::io_throttle::set_background((!done.certain).then_some(((layer as u64) << 16) | e as u64));
-                    let r = Self::read_miss_into(&owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2);
+                    // Under urgency routing: certain -> the mirror, speculative
+                    // -> the primary, and neither is throttled.
+                    let route = match (urgency, done.certain) {
+                        (false, _) => v4flash_core::hf_v41::ExpertRoute::split(),
+                        (true, true) => v4flash_core::hf_v41::ExpertRoute::mirror_only(),
+                        (true, false) => v4flash_core::hf_v41::ExpertRoute::primary_only(),
+                    };
+                    v4flash_core::io_throttle::set_background((!done.certain && !urgency).then_some(((layer as u64) << 16) | e as u64));
+                    let r = Self::read_miss_into(&owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2, route);
                     v4flash_core::io_throttle::set_background(None);
                     let read_ns = t_read.elapsed().as_nanos() as u64;
-                    let mut ev = [f64::NAN; 17];
+                    let mut ev = [f64::NAN; 18];
                     if ev_on {
                         let roles = EV_ROLES.with(|c| c.replace([f64::NAN; 6]));
                         let pause = EV_PAUSE.lock().unwrap().remove(&(((layer as u64) << 16) | e as u64)).unwrap_or(0);
@@ -2615,7 +2735,8 @@ impl ExpertShard {
                             ev_yield_ns as f64, pause as f64, f64::from(u8::from(certain)), f64::from(u8::from(done.certain)),
                             ev_demand, ev_q[0], ev_q[1],
                         ]);
-                        ev[11..].copy_from_slice(&roles);
+                        ev[11..17].copy_from_slice(&roles);
+                        ev[17] = route.code();
                     }
                     drop(done);
                     let msg = match r {
@@ -2676,7 +2797,11 @@ impl ExpertShard {
     /// Is any of `words` (`layer << 16 | expert`) still being read by the
     /// prefetch readers (hinted, not yet admitted)?
     pub fn prefetch_pending_any(&self, words: &[u32]) -> bool {
-        self.prefetch.as_ref().is_some_and(|pf| words.iter().any(|&w| pf.pending.contains(&((w >> 16), (w & 0xFFFF)))))
+        let Some(pf) = self.prefetch.as_ref() else { return false };
+        let urgency = knobs::route_urgency();
+        let spec = if urgency { pf.queue.spec_keys_snapshot() } else { Default::default() };
+        let resident = |k: &(u32, u32)| self.pool.as_ref().is_some_and(|p| p.slot_of.contains_key(k));
+        words.iter().any(|&w| park_waits_for(((w >> 16), (w & 0xFFFF)), &pf.pending, &spec, resident, urgency))
     }
 
     /// `(queue_ns, read_ns, n_read)` summed over completed prefetch reads.
@@ -2712,7 +2837,9 @@ impl ExpertShard {
         // not know about `pending`, so it would page it again into a NEW slot
         // and the prefetch would land as a duplicate). In flight means a few
         // ms at most.
-        let in_flight = |pf: &B2Prefetch| want.iter().any(|&e| pf.pending.contains(&(cur_layer, e)));
+        // Urgency routing: the wanted keys whose SPECULATIVE read is running on
+        // the primary (taken after the promotions below) are not waited for.
+        let mut spec_running: std::collections::HashSet<(u32, u32)> = Default::default();
         // TIME the blocking wait (2026-09-22). It happens inside `run_path`, so
         // it was landing in the request's `t_compute_us` while contributing
         // nothing to `t_page_us` -- i.e. the hub's `box2.compute_ms` (service
@@ -2736,7 +2863,7 @@ impl ExpertShard {
             v.extend_from_slice(&d.ev[11..17]);
             v.extend_from_slice(&[
                 f64::from(u8::from(wanted)), f64::from(u8::from(blocked)), f64::from(u8::from(d.coalesced)),
-                scan_ns, repack_ns, f64::NAN, f64::NAN, f64::from(u8::from(already)),
+                scan_ns, repack_ns, f64::NAN, f64::NAN, f64::from(u8::from(already)), d.ev[17],
             ]);
             super::evtrace::emit(&super::evtrace_kinds::B2_READ, &v);
         };
@@ -2748,6 +2875,17 @@ impl ExpertShard {
                 pf.promoted += 1;
             }
         }
+        // Under urgency routing a request never waits on a speculative read
+        // already running on the primary (the E100, which stalls under
+        // writes): it reads the expert itself from the mirror (the miss loop
+        // below does not know `pending`) and the late copy is discarded when it
+        // lands (`slot_of` already holds the key). Queued speculative reads
+        // were just promoted to certain, i.e. to the mirror, and are waited for.
+        if knobs::route_urgency() {
+            spec_running = pf.queue.spec_keys_snapshot();
+        }
+        let ev_skipped = want.iter().filter(|&&e| pf.pending.contains(&(cur_layer, e)) && spec_running.contains(&(cur_layer, e))).count() as u64;
+        let in_flight = |pf: &B2Prefetch| wanted_in_flight(want, cur_layer, &pf.pending, &spec_running);
         loop {
             let must_wait = in_flight(pf);
             let t_w = must_wait.then(std::time::Instant::now);
@@ -2850,7 +2988,7 @@ impl ExpertShard {
         // hub's `box2.page_ms` covers it and `box2.compute_ms` (service minus
         // page) stops counting disk waits as compute. Also tracked separately
         // in `prefetch_wait_ns` for the stats line.
-        self.ev_admit = [wait_ns, ev_landed, ev_wanted, ev_blocking];
+        self.ev_admit = [wait_ns, ev_landed, ev_wanted, ev_blocking, ev_skipped];
         if wait_ns > 0 {
             self.prefetch_wait_ns += wait_ns;
             if let Some(pg) = self
@@ -2936,6 +3074,12 @@ impl ExpertShard {
     /// can serve any expert) and [`Self::ensure_layer`] pages in whatever the hub
     /// asks for, from this box's own disk.
     pub fn enable_paging(&mut self) -> eyre::Result<()> {
+        // `route=urgency` needs the mirror on every shard.
+        let mirror_ok = self.owner.mirror_complete();
+        knobs::set_mirror_ok(mirror_ok);
+        if !mirror_ok && std::env::var_os("V41_EXPERT_MIRROR_DIR").is_some() {
+            eprintln!("expertd: expert mirror incomplete: route=urgency will act as route=split");
+        }
         for l in self.layers.iter_mut().flatten() {
             let cap = l.ids.len();
 
@@ -3121,7 +3265,7 @@ impl ExpertShard {
             (true, Some(p)) => p.queue.counts(),
             _ => [nan; 4],
         };
-        self.ev_admit = [0; 4];
+        self.ev_admit = [0; 5];
         // Land completed look-ahead prefetches first (any layer): nothing reads
         // the pool here, and this layer's picks are protected from eviction.
         if self.prefetch.is_some() {
@@ -3306,7 +3450,8 @@ impl ExpertShard {
         // startup by `V41_B2_MISS_PAR`, but the CONCURRENCY can be lowered live.
         // The E100 loses ~25% of its aggregate bandwidth past ~8 outstanding reads
         // and a single miss already issues 3 role reads split across both drives,
-        // so 4 concurrent misses put ~24 on the primary drive (2026-09-22).
+        // so 4 concurrent misses put ~24 on the primary drive (2026-09-22). Under
+        // `route=urgency` demand misses read wholly from the mirror instead.
         let k = knobs::miss_par().min(stages.len()).max(1);
         let ev_t_victims = if ev_on { super::evtrace::now() } else { nan };
         let mut ev_chunks = 0u32;
@@ -3324,6 +3469,12 @@ impl ExpertShard {
             };
             // (offsets, coalesced, evtrace: read start, read end, role (start, end) x3)
             type R = Result<([Option<(usize, usize, u32, u32)>; 3], bool, [f64; 8]), String>;
+            // Demand reads: wholly from the mirror under urgency routing.
+            let route = if knobs::route_urgency() {
+                v4flash_core::hf_v41::ExpertRoute::mirror_only()
+            } else {
+                v4flash_core::hf_v41::ExpertRoute::split()
+            };
             // Raw pointers into the persistent pinned staging (like the prefetch
             // thread's `SetPtr`): the reader threads must not BORROW `stages`, or
             // the borrow lasts for the whole scope and no expert can repack until
@@ -3344,7 +3495,7 @@ impl ExpertShard {
                             (std::slice::from_raw_parts_mut(sp.p[0], sp.n[0]), std::slice::from_raw_parts_mut(sp.p[1], sp.n[1]), std::slice::from_raw_parts_mut(sp.p[2], sp.n[2]))
                         };
                         let t0 = if ev_on { super::evtrace::now() } else { f64::NAN };
-                        let r = Self::read_miss_into(owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2);
+                        let r = Self::read_miss_into(owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2, route);
                         let mut ev = [f64::NAN; 8];
                         if ev_on {
                             ev[0] = t0;
@@ -3395,7 +3546,7 @@ impl ExpertShard {
                         v.extend_from_slice(&ev_rd[2..8]);
                         v.extend_from_slice(&[
                             1.0, 1.0, f64::from(u8::from(coalesced)), scan, ev_repack_ns as f64,
-                            chunk.len() as f64, ev_ci as f64, 0.0,
+                            chunk.len() as f64, ev_ci as f64, 0.0, route.code(),
                         ]);
                         super::evtrace::emit(&super::evtrace_kinds::B2_READ, &v);
                     }
@@ -3445,7 +3596,7 @@ impl ExpertShard {
                 ev_cur_seq(), f64::from(layer), ids.len() as f64, want.len() as f64, f64::from(ev_hits), n_miss as f64,
                 f64::from(u8::from(prefill_shaped)),
                 ev_t0, ev_t_admit, ev_t_dirty, ev_t_victims, ev_t_reads, super::evtrace::now(),
-                ev_admit[0] as f64, ev_admit[1] as f64, ev_admit[2] as f64, ev_admit[3] as f64,
+                ev_admit[0] as f64, ev_admit[1] as f64, ev_admit[2] as f64, ev_admit[3] as f64, ev_admit[4] as f64,
                 ev_scan_ns, f64::from(ev_foreign), f64::from(ev_free), k as f64, f64::from(ev_chunks),
                 f64::from(u8::from(ev_dirty_upload)), if dirty { ev_t_up.elapsed().as_nanos() as f64 } else { 0.0 },
                 ev_q0[0], ev_q0[1], ev_q0[2], ev_q0[3],
@@ -3470,6 +3621,7 @@ impl ExpertShard {
         b0: &mut [u8],
         b1: &mut [u8],
         b2: &mut [u8],
+        route: v4flash_core::hf_v41::ExpertRoute,
     ) -> eyre::Result<([Option<(usize, usize, u32, u32)>; 3], bool)> {
         {
             let names = [
@@ -3502,7 +3654,9 @@ impl ExpertShard {
             // per-role path when disabled, when this build has no GPU repack /
             // O_DIRECT, or when the run-time contiguity check fails.
             let mut coalesced = false;
-            if gpu_repack && direct && b2_coalesce() {
+            // The coalesced span read is primary-only: never for a read routed
+            // to the mirror (split and primary-only reads may coalesce).
+            if gpu_repack && direct && b2_coalesce() && route.code() != 1.0 {
                 let (dw, ds) = (&mut *b0, &mut *b1);
                 let src0 = WeightSrc::from(owner);
                 // All three ROLE tensors: the run's physical order is derived from
@@ -3585,7 +3739,7 @@ impl ExpertShard {
                                     // Zero-copy: O_DIRECT lands each region at its
                                     // own 4096-residue, straight into GTT staging.
                                     if let Some(o) = src
-                                        .read_expert_hf_layout_direct(t, e as usize, buf)
+                                        .read_expert_hf_layout_direct_routed(t, e as usize, buf, route)
                                         .map_err(|err| format!("{name}: {err}"))?
                                     {
                                         return Ok(Some(o));
@@ -6468,6 +6622,107 @@ mod tests {
         drained.sort();
         assert_eq!(drained, vec![7, 8, 9]);
         assert!(q.pop().is_none());
+    }
+
+    /// The wait decisions under urgency routing, as pure functions.
+    #[test]
+    fn urgency_wait_decisions() {
+        use std::collections::HashSet;
+        let pending: HashSet<(u32, u32)> = [(4, 1), (4, 2), (4, 3)].into_iter().collect();
+        let none: HashSet<(u32, u32)> = HashSet::new();
+        let spec: HashSet<(u32, u32)> = [(4, 2)].into_iter().collect();
+        // admit: split (empty skip) waits for any pending wanted key.
+        assert!(wanted_in_flight(&[2], 4, &pending, &none));
+        // urgency: not for one running speculatively on the primary...
+        assert!(!wanted_in_flight(&[2], 4, &pending, &spec));
+        // ...but still for any other pending one, and never for non-pending.
+        assert!(wanted_in_flight(&[2, 3], 4, &pending, &spec));
+        assert!(!wanted_in_flight(&[9], 4, &pending, &spec));
+        assert!(!wanted_in_flight(&[1], 5, &pending, &none), "other layer");
+        // park: split waits for every pending key, resident or not.
+        let resident = |k: &(u32, u32)| *k == (4, 3);
+        assert!(park_waits_for((4, 2), &pending, &spec, resident, false));
+        assert!(park_waits_for((4, 3), &pending, &spec, resident, false));
+        // urgency: not for a running speculative one, nor an already-resident one.
+        assert!(!park_waits_for((4, 2), &pending, &spec, resident, true));
+        assert!(!park_waits_for((4, 3), &pending, &spec, resident, true));
+        assert!(park_waits_for((4, 1), &pending, &spec, resident, true));
+        assert!(!park_waits_for((4, 9), &pending, &spec, resident, true));
+    }
+
+    /// `PfFinish` releases a recorded speculative key and the reader slot on
+    /// drop, and `promote` leaves a running speculative key un-urgent.
+    #[test]
+    fn prefetch_finish_releases_spec_key() {
+        use std::time::Instant;
+        let q = PfQueue::with_readers(2, 3);
+        q.push(PfJob { layer: 6, e: 1, set: 0, certain: false, t_hint: Instant::now() });
+        let j = q.pop_mode(true).unwrap();
+        assert!(q.spec_keys_snapshot().contains(&(6, 1)));
+        assert!(!q.promote(6, 1), "a running speculative key must not be promoted/urgent");
+        assert!(!q.is_urgent(6, 1));
+        assert_eq!(q.counts()[1], 1.0, "one speculative job running");
+        {
+            let _f = PfFinish { q: &q, certain: j.certain, spec_key: Some((j.layer, j.e)) };
+        }
+        assert!(q.spec_keys_snapshot().is_empty());
+        assert_eq!(q.counts()[1], 0.0, "PfFinish released the reader slot");
+        // Urgency cap: max_spec 2 but 3 readers -> 2 may run; with 2 readers -> 1.
+        let q2 = PfQueue::with_readers(2, 2);
+        for e in 0..3 {
+            q2.push(PfJob { layer: 6, e, set: 0, certain: false, t_hint: Instant::now() });
+        }
+        let _a = q2.pop_mode(true).unwrap();
+        let g = q2.inner.lock().unwrap();
+        assert_eq!(PfQueue::spec_cap(&g, true), 1, "urgency must leave one reader for certain jobs");
+        assert_eq!(PfQueue::spec_cap(&g, false), 2);
+    }
+
+    /// Urgency routing (`pop_mode(true)`): a speculative job reads from the
+    /// OTHER drive, so it is handed out while a certain job runs (still capped
+    /// at `max_spec`), and its key is recorded until `finish_spec_key`;
+    /// split mode's gate is unchanged.
+    #[test]
+    fn prefetch_queue_urgency_routing() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let job = |e: u32, certain: bool| PfJob { layer: 5, e, set: e as usize, certain, t_hint: Instant::now() };
+        let q = Arc::new(PfQueue::new(1));
+        q.push(job(1, true));
+        q.push(job(2, false));
+        q.push(job(3, false));
+        let a = q.pop_mode(true).unwrap();
+        assert_eq!((a.e, a.certain), (1, true));
+        assert!(q.spec_keys_snapshot().is_empty(), "a certain job is not a speculative key");
+        // Certain job running: speculative still handed out under urgency.
+        let b = q.pop_mode(true).unwrap();
+        assert_eq!((b.e, b.certain), (2, false));
+        assert!(q.spec_keys_snapshot().contains(&(5, 2)));
+        // max_spec = 1 still caps speculative jobs.
+        let q2 = Arc::clone(&q);
+        let h = std::thread::spawn(move || q2.pop_mode(true).map(|j| j.e));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!h.is_finished(), "second speculative job exceeded max_spec under urgency");
+        // Releasing the first (as PfFinish does) lets the next one go and records it.
+        q.finish_spec_key(5, 2);
+        q.finished(false);
+        assert_eq!(h.join().unwrap(), Some(3));
+        let keys = q.spec_keys_snapshot();
+        assert!(!keys.contains(&(5, 2)) && keys.contains(&(5, 3)), "{keys:?}");
+        q.finish_spec_key(5, 3);
+        q.finished(false);
+        assert!(q.spec_keys_snapshot().is_empty());
+        // Split mode: a speculative job waits for the running certain one and
+        // records no key.
+        q.push(job(4, false));
+        let q3 = Arc::clone(&q);
+        let h = std::thread::spawn(move || q3.pop_mode(false).map(|j| j.e));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!h.is_finished(), "split mode handed out a speculative job beside a certain one");
+        q.finished(true);
+        assert_eq!(h.join().unwrap(), Some(4));
+        assert!(q.spec_keys_snapshot().is_empty(), "split mode recorded a speculative key");
+        q.finished(false);
     }
 
     /// `REQ_FLAG_RESID`: the residency map rides behind the partial, flagged by

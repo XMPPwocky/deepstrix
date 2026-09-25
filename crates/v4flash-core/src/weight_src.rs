@@ -122,6 +122,20 @@ impl<'a> WeightSrc<'a> {
         }
     }
 
+    /// [`Self::read_expert_hf_layout_direct`] with an explicit drive route.
+    pub fn read_expert_hf_layout_direct_routed(
+        &self,
+        t: &GgufTensor,
+        e: usize,
+        dst: &mut [u8],
+        route: crate::hf_v41::ExpertRoute,
+    ) -> eyre::Result<Option<(usize, usize, u32, u32)>> {
+        match *self {
+            Self::Gguf(_) => Ok(None),
+            Self::V41(v) => v.read_expert_hf_layout_direct_routed(v.get(&t.name)?, e, dst, route),
+        }
+    }
+
     /// Zero-copy O_DIRECT read of ALL THREE roles of one expert in TWO preads.
     /// `Ok(None)` = unavailable (GGUF source, no O_DIRECT handle, or the
     /// checkpoint's expert planes are not contiguous); caller falls back to the

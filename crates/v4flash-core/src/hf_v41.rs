@@ -177,7 +177,9 @@ pub fn expert_odirect() -> bool {
 /// Runtime-settable (`set_expert_mirror_frac`) so box 2's daemon can A/B it on a
 /// warm pool; the env value is only the seed. The QD1 optimum is
 /// 5.4/(4.5+5.4) = 0.545, but the E100 sheds bandwidth faster under concurrency,
-/// so the best value under load is an open question (2026-09-22).
+/// so the best value under load is an open question (2026-09-22). EXACTLY 1.0 /
+/// 0.0 read the whole weight plane from the mirror / primary (no block on the
+/// other drive).
 static MIRROR_FRAC_MILLI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 
 pub fn expert_mirror_frac() -> f32 {
@@ -193,6 +195,38 @@ pub fn expert_mirror_frac() -> f32 {
         .clamp(0.0, 1.0);
     MIRROR_FRAC_MILLI.store((seed * 1000.0) as u32, Relaxed);
     seed
+}
+
+/// Which drive(s) one direct expert read uses (box 2's two NVMe copies).
+/// `split()` is the default: the weight plane split by [`expert_mirror_frac`],
+/// the scale plane from the primary. `mirror_only()` / `primary_only()` put the
+/// WHOLE expert -- both planes -- on one drive (box 2's urgency routing).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExpertRoute {
+    /// Share of the weight plane read from the mirror (exactly 0 / 1 = one drive).
+    pub weight_mirror_frac: f32,
+    /// Scale plane from the mirror instead of the primary.
+    pub scale_from_mirror: bool,
+}
+
+impl ExpertRoute {
+    pub fn split() -> Self {
+        Self { weight_mirror_frac: expert_mirror_frac(), scale_from_mirror: false }
+    }
+    pub fn mirror_only() -> Self {
+        Self { weight_mirror_frac: 1.0, scale_from_mirror: true }
+    }
+    pub fn primary_only() -> Self {
+        Self { weight_mirror_frac: 0.0, scale_from_mirror: false }
+    }
+    /// For traces: 0 split, 1 mirror only, 2 primary only.
+    pub fn code(&self) -> f64 {
+        match (self.weight_mirror_frac, self.scale_from_mirror) {
+            (f, true) if f >= 1.0 => 1.0,
+            (f, false) if f <= 0.0 => 2.0,
+            _ => 0.0,
+        }
+    }
 }
 
 pub fn set_expert_mirror_frac(f: f32) {
@@ -1024,11 +1058,27 @@ impl V41HfWeights {
         Ok((out * nb * 16 * 3, out * nb * 3))
     }
 
+    /// Every checkpoint shard has a usable mirror (`V41_EXPERT_MIRROR_DIR`).
+    pub fn mirror_complete(&self) -> bool {
+        self.st.mirror_complete()
+    }
+
     pub fn read_expert_hf_layout_direct(
         &self,
         vt: &VTensor,
         e: usize,
         dst: &mut [u8],
+    ) -> eyre::Result<Option<(usize, usize, u32, u32)>> {
+        self.read_expert_hf_layout_direct_routed(vt, e, dst, ExpertRoute::split())
+    }
+
+    /// [`Self::read_expert_hf_layout_direct`] with an explicit drive `route`.
+    pub fn read_expert_hf_layout_direct_routed(
+        &self,
+        vt: &VTensor,
+        e: usize,
+        dst: &mut [u8],
+        route: ExpertRoute,
     ) -> eyre::Result<Option<(usize, usize, u32, u32)>> {
         let Kind::Experts { prefix, which, n } = &vt.kind else {
             return Err(eyre!("{}: not a stacked expert tensor", vt.name));
@@ -1056,14 +1106,16 @@ impl V41HfWeights {
         let (region_w, region_s) = dst.split_at_mut(cap_w);
         let t_w = std::time::Instant::now();
         // Mirror split (`V41_EXPERT_MIRROR_DIR`): the packed weights, ~6 MB per
-        // role, come half from each drive; the scale plane stays on the primary.
-        let Some(pad_w) = self.st.read_range_into_direct_split(wt, 0, packed_len, region_w, expert_mirror_frac())? else {
+        // role, come from the two drives per `route` (default: split by the
+        // mirror fraction); the scale plane from the primary unless the route
+        // puts the whole expert on the mirror.
+        let Some(pad_w) = self.st.read_range_into_direct_split(wt, 0, packed_len, region_w, route.weight_mirror_frac)? else {
             return Ok(None);
         };
         EXPERT_READ_PROF.weight_ns.fetch_add(t_w.elapsed().as_nanos() as u64, Relaxed);
         EXPERT_READ_PROF.weight_bytes.fetch_add(wt.len, Relaxed);
         let t_s = std::time::Instant::now();
-        let Some(pad_s) = self.st.read_range_into_direct_padded(sc, 0, scale_len, region_s)? else {
+        let Some(pad_s) = self.st.read_range_into_direct_padded_on(sc, 0, scale_len, region_s, route.scale_from_mirror)? else {
             return Ok(None);
         };
         EXPERT_READ_PROF.scale_ns.fetch_add(t_s.elapsed().as_nanos() as u64, Relaxed);

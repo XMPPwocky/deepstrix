@@ -556,12 +556,18 @@ impl SafetensorsDir {
         matches!(self.mirror_files.get(shard), Some(Some(_)))
     }
 
+    /// Every shard has a usable mirror handle (same name, same size, O_DIRECT).
+    pub fn mirror_complete(&self) -> bool {
+        !self.mirror_files.is_empty() && self.mirror_files.iter().all(|m| m.is_some())
+    }
+
     /// `read_range_into_direct_padded`, with the range split at a 4096-aligned
     /// point: the head `[0, p)` read from the primary handle and the tail
     /// `[p, len)` from the mirror handle CONCURRENTLY (`mirror_frac` = share of
-    /// the bytes on the mirror, e.g. 0.6 for a faster mirror drive). Falls back
-    /// to the single read when there is no mirror. Same padded layout and
-    /// return value as the unsplit read.
+    /// the bytes on the mirror, e.g. 0.6 for a faster mirror drive). EXACTLY
+    /// 1.0 / 0.0 reads the whole range from the mirror / primary alone. Falls
+    /// back to the single primary read when there is no mirror. Same padded
+    /// layout and return value as the unsplit read.
     pub fn read_range_into_direct_split(
         &self,
         t: &StTensor,
@@ -578,8 +584,9 @@ impl SafetensorsDir {
         if end > t.len {
             return Err(eyre!("{}: range [{byte_off},{end}) exceeds tensor length {}", t.name, t.len));
         }
+        let mf = mirror_frac.clamp(0.0, 1.0);
         if len < 2 * A as usize {
-            return self.read_range_into_direct_padded(t, byte_off, len, dst);
+            return self.read_range_into_direct_padded_on(t, byte_off, len, dst, mf >= 1.0);
         }
         let abs = t.offset + byte_off;
         let pad = (abs & (A - 1)) as usize;
@@ -591,10 +598,18 @@ impl SafetensorsDir {
             return Err(eyre!("{}: direct dst is not {A}-aligned", t.name));
         }
         // Split point in the padded span, 4096-aligned: the primary reads
-        // [0, cut) of the span, the mirror [cut, span).
-        let frac = (1.0 - mirror_frac.clamp(0.0, 1.0)) as f64;
-        let mut cut = ((span as f64 * frac) as usize / A as usize) * A as usize;
-        cut = cut.clamp(A as usize, span - A as usize);
+        // [0, cut) of the span, the mirror [cut, span). EXACTLY 0 or 1 routes
+        // the whole read to one drive (box 2's urgency routing: demand reads
+        // all from the mirror, background ones all from the primary); anything
+        // between splits it with at least one block on each side.
+        let cut = if mf >= 1.0 {
+            0
+        } else if mf <= 0.0 {
+            span
+        } else {
+            let frac = (1.0 - mf) as f64;
+            (((span as f64 * frac) as usize / A as usize) * A as usize).clamp(A as usize, span - A as usize)
+        };
         let base = abs - pad as u64;
         let (head, tail) = dst[..span].split_at_mut(cut);
         // A BACKGROUND read (`io_throttle`) goes in page-aligned chunks with the
@@ -630,22 +645,45 @@ impl SafetensorsDir {
             }
             Ok(())
         };
-        let (ra, rb) = std::thread::scope(|sc| {
-            let hb = sc.spawn(move || read_all(mirror, tail, base + cut as u64, need_tail));
-            let ra = read_all(file, head, base, need_head);
-            (ra, hb.join().unwrap_or_else(|_| Err(eyre!("mirror reader panicked"))))
-        });
+        // One side empty (an exact 0 / 1 fraction): read on this thread only.
+        let (ra, rb) = if cut == 0 {
+            (Ok(()), read_all(mirror, tail, base, need_tail))
+        } else if cut == span {
+            (read_all(file, head, base, need_head), Ok(()))
+        } else {
+            std::thread::scope(|sc| {
+                let hb = sc.spawn(move || read_all(mirror, tail, base + cut as u64, need_tail));
+                let ra = read_all(file, head, base, need_head);
+                (ra, hb.join().unwrap_or_else(|_| Err(eyre!("mirror reader panicked"))))
+            })
+        };
         ra?;
         rb?;
         Ok(Some(pad))
     }
 
+    /// [`Self::read_range_into_direct_padded`] from the PRIMARY drive.
     pub fn read_range_into_direct_padded(
         &self,
         t: &StTensor,
         byte_off: u64,
         len: usize,
         dst: &mut [u8],
+    ) -> eyre::Result<Option<usize>> {
+        self.read_range_into_direct_padded_on(t, byte_off, len, dst, false)
+    }
+
+    /// One unsplit O_DIRECT read of `[byte_off, byte_off + len)` into padded,
+    /// 4096-aligned `dst`, from the primary drive, or from the mirror
+    /// (`V41_EXPERT_MIRROR_DIR`) when `from_mirror` and the shard has one
+    /// (else the primary). Returns the pad before the first requested byte.
+    pub fn read_range_into_direct_padded_on(
+        &self,
+        t: &StTensor,
+        byte_off: u64,
+        len: usize,
+        dst: &mut [u8],
+        from_mirror: bool,
     ) -> eyre::Result<Option<usize>> {
         const A: u64 = 4096;
         let end = byte_off
@@ -654,8 +692,12 @@ impl SafetensorsDir {
         if end > t.len {
             return Err(eyre!("{}: range [{byte_off},{end}) exceeds tensor length {}", t.name, t.len));
         }
-        let Some(Some(file)) = self.direct_files.get(t.shard) else {
+        let Some(Some(primary)) = self.direct_files.get(t.shard) else {
             return Ok(None);
+        };
+        let file = match (from_mirror, self.mirror_files.get(t.shard)) {
+            (true, Some(Some(m))) => m,
+            _ => primary,
         };
         if len == 0 {
             return Ok(Some(0));
