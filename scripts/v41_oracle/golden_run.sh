@@ -159,6 +159,11 @@ for c in "$@"; do
         v0)  extra=(--expert-rt q8_0) ;;
         v2b) extra=(--expert-rt "cache:$RT_ROOT/iq2xxs_imx") ;;
         v3b) extra=(--expert-rt "cache:$RT_ROOT/iq2s_imx") ;;
+        # *_zb: caches built with balanced zero signs (expert_rt.balance_zero_signs). The v1b/v3b
+        # caches above predate it: every exact MXFP4 zero became positive, a coherent bias that made
+        # v3b collapse (KL 15 nats) and inflated v1b. Use these.
+        v1b_zb) extra=(--expert-rt "cache:$RT_ROOT/iq2xxs_imx_zb" --expert-rt-cover "$HOT") ;;
+        v3b_zb) extra=(--expert-rt "cache:$RT_ROOT/iq2s_imx_zb") ;;
         *) echo "unknown quant case $q"; exit 2 ;;
       esac
       run_case "quant_$q" --no-layer-dumps "${extra[@]}" \

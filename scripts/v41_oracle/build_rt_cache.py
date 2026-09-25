@@ -30,7 +30,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 import ggml_rt as G  # noqa: E402
-from expert_rt import WHICH, expert_path, load_cover, quantize_expert  # noqa: E402
+from expert_rt import NO_ZERO, WHICH, expert_path, load_cover, quantize_expert  # noqa: E402
 
 FREE_FLOOR = 50 << 30  # never fill the cache disk past this much free space
 
@@ -58,7 +58,7 @@ def _work(job):
         wt = torch.from_numpy(wb).view(getattr(torch, wdt)).view(wsh)
         st = torch.from_numpy(sb).view(getattr(torch, sdt)).view(ssh)
         ws[w] = dequant_fp4(wt, st).numpy()
-    return L, e, quantize_expert(t, ws, imx_in, imx_down)
+    return L, e, quantize_expert(t, ws, imx_in, imx_down, key=(L, e))
 
 
 def write_atomic(path: str, blob: bytes):
@@ -88,11 +88,14 @@ def main():
     cover = load_cover(a.cover)
     keys = [(L, e) for L in range(a.layers) for e in range(384) if cover is None or (L, e) in cover]
     os.makedirs(a.out, exist_ok=True)
-    meta = {"type": a.type, "imatrix": a.imatrix, "ggml_lib": os.environ.get("GGML_LIB", G._DEFAULT)}
+    # zero_signs: how MXFP4's exact zeros were fed to a grid without zero (see expert_rt.balance_zero_signs);
+    # a cache without the key was built before the fix, with every zero positive
+    meta = {"type": a.type, "imatrix": a.imatrix, "ggml_lib": os.environ.get("GGML_LIB", G._DEFAULT),
+            "zero_signs": "balanced" if t in NO_ZERO else "n/a"}
     mp = os.path.join(a.out, "meta.json")
     if os.path.exists(mp):
         old = json.load(open(mp))
-        if (old["type"], old["imatrix"]) != (meta["type"], meta["imatrix"]):
+        if (old["type"], old["imatrix"], old.get("zero_signs", "positive")) != (meta["type"], meta["imatrix"], meta["zero_signs"]):
             sys.exit(f"{mp} was built as {old['type']} / {old['imatrix']}; refusing to mix")
     json.dump(meta, open(mp, "w"), indent=1)
     for L in range(a.layers):
