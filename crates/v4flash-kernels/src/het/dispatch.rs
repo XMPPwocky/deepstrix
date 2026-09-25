@@ -405,6 +405,45 @@ pub fn moe_gate_up_chunked(
     n_rows: u32,
     n_blocks: u32,
 ) -> eyre::Result<bool> {
+    moe_gate_up_chunked_ex(
+        e, dt, s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
+        gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks, None,
+    )
+}
+
+/// Can the MoE work-item count stay on the device (`V41_MOE_WI_DEVCOUNT`)?
+/// Only the MXFP4 kwide gate/up + MXFP4 kwide2 down pair checks a device count.
+pub fn moe_wi_devcount_supported(gate: GgufType, down: GgufType) -> bool {
+    gate == GgufType::MXFP4 && down == GgufType::MXFP4 && pair_kwide_selected(GgufType::MXFP4, pair_variant_rollback())
+}
+
+/// As `moe_gate_up_chunked`. With `n_wi_dev` (the builder's device-side count)
+/// `n_work_items` is only an upper bound for the grid; only the MXFP4 kwide
+/// kernel checks a device count, so any other kernel is an error.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gate_up_chunked_ex(
+    e: &DeviceEngine,
+    dt: GgufType,
+    s: &Stream,
+    mid: &mut DeviceBuffer<f32>,
+    gate: &DeviceBuffer<u8>,
+    up: &DeviceBuffer<u8>,
+    xq: &DeviceBuffer<u8>,
+    ew: &DeviceBuffer<f32>,
+    group_count: &DeviceBuffer<i32>,
+    expert_members: &DeviceBuffer<i32>,
+    work_items: &DeviceBuffer<i32>,
+    n_work_items: u32,
+    gbpe: u32,
+    ubpe: u32,
+    n_used: u32,
+    max_per_expert: u32,
+    chunk: u32,
+    clamp: f32,
+    n_rows: u32,
+    n_blocks: u32,
+    n_wi_dev: Option<&DeviceBuffer<i32>>,
+) -> eyre::Result<bool> {
     // IQ2_S / IQ2_XS / IQ3_XXS / IQ3_S pair kwide (2026-08-15; IQ3_S 2026-09-03;
     // IQ2_S 2026-09-04): default prefill kernel is the M51-structure kwide port
     // (weights dequantized once per lane and amortized across chunk members).
@@ -415,6 +454,9 @@ pub fn moe_gate_up_chunked(
     // the format list lives in exactly one place and `pair_prefill_stage`
     // (the trace label) and the unit tests below cannot drift from it.
     let use_kwide = pair_kwide_selected(dt, pair_variant_rollback());
+    if n_wi_dev.is_some() && !(dt == GgufType::MXFP4 && use_kwide) {
+        return Err(eyre!("moe gate/up: a device-side work-item count needs the MXFP4 kwide kernel, not {dt:?} (kwide={use_kwide})"));
+    }
     match dt {
         GgufType::IQ2_S if use_kwide => e.iq2s.launch_fused_swiglu_kwide(
             s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
@@ -450,9 +492,9 @@ pub fn moe_gate_up_chunked(
         )?,
         // MXFP4 (DeepSeek-V4.1-Flash's native routed experts, 2026-09-12):
         // same two-kernel family, contracts identical to iq3_s.
-        GgufType::MXFP4 if use_kwide => e.mxfp4pair.launch_fused_swiglu_kwide(
+        GgufType::MXFP4 if use_kwide => e.mxfp4pair.launch_fused_swiglu_kwide_ex(
             s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,
-            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks,
+            gbpe, ubpe, n_used, max_per_expert, chunk, clamp, n_rows, n_blocks, n_wi_dev,
         )?,
         GgufType::MXFP4 => e.mxfp4pair.launch_fused_swiglu_chunked(
             s, mid, gate, up, xq, ew, group_count, expert_members, work_items, n_work_items,

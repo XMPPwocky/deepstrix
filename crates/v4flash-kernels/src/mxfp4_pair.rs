@@ -235,6 +235,44 @@ impl Mxfp4PairMatvec {
         n_rows: u32,
         n_blocks: u32,
     ) -> eyre::Result<()> {
+        self.launch_fused_swiglu_kwide_ex(
+            stream, mid, gate_w_base, up_w_base, xq, expert_w, group_count, expert_members,
+            work_items, n_work_items, gate_bpe, up_bpe, n_used, max_per_expert, chunk_size,
+            clamp, n_rows, n_blocks, None,
+        )
+    }
+
+    /// As `launch_fused_swiglu_kwide`. With `n_work_items_dev` (the builder's
+    /// device-side count) `n_work_items` is only an UPPER BOUND for grid.y
+    /// (<= `work_items.len()`): work-groups past the device count exit at once,
+    /// so the host never reads the count back (`V41_MOE_WI_DEVCOUNT`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_swiglu_kwide_ex(
+        &self,
+        stream: &Stream,
+        mid: &mut DeviceBuffer<f32>,
+        gate_w_base: &DeviceBuffer<u8>,
+        up_w_base: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<u8>,
+        expert_w: &DeviceBuffer<f32>,
+        group_count: &DeviceBuffer<i32>,
+        expert_members: &DeviceBuffer<i32>,
+        work_items: &DeviceBuffer<i32>,
+        n_work_items: u32,
+        gate_bpe: u32,
+        up_bpe: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        clamp: f32,
+        n_rows: u32,
+        n_blocks: u32,
+        n_work_items_dev: Option<&DeviceBuffer<i32>>,
+    ) -> eyre::Result<()> {
+        if n_work_items_dev.is_some() && n_work_items as usize > work_items.len() {
+            return Err(eyre!("mxfp4 pair kwide: grid bound {n_work_items} > work_items {}", work_items.len()));
+        }
+        let n_wi_dev = n_work_items_dev.map_or(std::ptr::null_mut(), |c| c.raw());
         if n_rows % 8 != 0 {
             return Err(eyre!("mxfp4 pair kwide: n_rows={n_rows} not %8"));
         }
@@ -256,7 +294,8 @@ impl Mxfp4PairMatvec {
             [
                 mid.raw(), gate_w_base.raw(), up_w_base.raw(), xq.raw(), expert_w.raw(),
                 group_count.raw(), expert_members.raw(), work_items.raw(),
-                gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp, n_rows, n_blocks
+                gate_bpe, up_bpe, n_used, max_per_expert, chunk_size, clamp, n_rows, n_blocks,
+                n_wi_dev
             ]
         )
     }

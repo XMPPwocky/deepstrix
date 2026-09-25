@@ -3996,8 +3996,10 @@ impl MoeExecutor {
     }
 
     /// One by-expert pass over whatever `d_selected`/`d_ew` hold right now: group
-    /// build -> work items (host readback) -> gate/up -> q8k(mid) -> down into
-    /// `partials`. `first` zeroes `partials` (once per request; a second pass adds
+    /// build -> work items (host readback; under `V41_MOE_WI_DEVCOUNT` none: an
+    /// upper-bound grid and kernels that exit past the device-side count, so the
+    /// GPU never idles for a host round trip) -> gate/up -> q8k(mid) -> down into
+    /// `partials`. The returned work-item count is then that upper bound. `first` zeroes `partials` (once per request; a second pass adds
     /// its own slots beside the first's). Returns (work items, diagnostic-done):
     /// under `V41_B2_DECODE_DOWN` the decode down kernel writes `ffn_moe` directly
     /// and there is nothing to reduce.
@@ -4029,10 +4031,19 @@ impl MoeExecutor {
         e.moe_group_builder.launch_work_items(
             s, &mut self.work_items, &mut self.n_work_items, &self.group_count, g.gbound, CHUNK_SIZE, max_items,
         )?;
-        s.synchronize()?;
-        let mut n_wi = [0i32; 1];
-        self.n_work_items.copy_to_host(&mut n_wi)?;
-        let n_wi = n_wi[0] as u32;
+        let devcount = super::forward_prefill::moe_wi_devcount()
+            && !b2_decode_down()
+            && super::dispatch::moe_wi_devcount_supported(g.gdt, g.ddt);
+        let n_wi = if devcount {
+            // A work item holds >= 1 member; every member is one (row, pick) pair.
+            ((b * nu) as u32).min(max_items)
+        } else {
+            s.synchronize()?;
+            let mut n_wi = [0i32; 1];
+            self.n_work_items.copy_to_host(&mut n_wi)?;
+            n_wi[0] as u32
+        };
+        let n_wi_dev: Option<&DeviceBuffer<i32>> = if devcount { Some(&self.n_work_items) } else { None };
         let mut mid_v = self.d_mid_cat.slice_view_mut(0, b * nu * N_FF_EXP as usize);
         // Under the decode-down diagnostic, zero mid first (as the decode
         // gate/up does): the chunked gate/up writes only MEMBER slots, and
@@ -4042,10 +4053,10 @@ impl MoeExecutor {
         if b2_decode_down() {
             mid_v.fill_zero_async(s)?;
         }
-        let handled = super::dispatch::moe_gate_up_chunked(
+        let handled = super::dispatch::moe_gate_up_chunked_ex(
             e, g.gdt, s, &mut mid_v, gate, up, &xq_v, &ew_v, &self.group_count, &self.expert_members,
             &self.work_items, n_wi, g.gbpe, g.ubpe, nu as u32, max_per_expert, CHUNK_SIZE, SWIGLU_CLAMP_EXP,
-            N_FF_EXP, BLOCKS_Q8K_GATE_IN,
+            N_FF_EXP, BLOCKS_Q8K_GATE_IN, n_wi_dev,
         )?;
         if !handled {
             return Err(eyre!("executor: no prefill gate/up kernel for {:?}", g.gdt));
@@ -4088,10 +4099,10 @@ impl MoeExecutor {
             part_v.fill_zero_async(s)?;
         }
         match g.ddt {
-            GgufType::MXFP4 => e.mxfp4.launch_by_expert_kwide2(
+            GgufType::MXFP4 => e.mxfp4.launch_by_expert_kwide2_ex(
                 s, &mut part_v, down, &midq_v, &self.group_count, &self.expert_members, &self.work_items,
                 n_wi, g.dbpe, MIDQ_BYTES_PER_SLOT as u32, nu as u32, max_per_expert, CHUNK_SIZE, N_EMBD,
-                BLOCKS_Q8K_DOWN_IN,
+                BLOCKS_Q8K_DOWN_IN, n_wi_dev,
             )?,
             GgufType::IQ3_XXS => e.iq3.launch_by_expert_kwide2(
                 s, &mut part_v, down, &midq_v, &self.group_count, &self.expert_members, &self.work_items,

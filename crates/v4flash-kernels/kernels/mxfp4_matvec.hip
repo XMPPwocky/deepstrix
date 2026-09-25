@@ -229,7 +229,13 @@ extern "C" __global__ void mxfp4_matvec_par_by_expert_kwide2(
         unsigned int     max_per_expert,
         unsigned int     chunk_size,
         unsigned int     n_rows,
-        unsigned int     n_blocks_in) {
+        unsigned int     n_blocks_in,
+        const int      * __restrict__ n_work_items_dev) { // nullptr = grid.y is exact
+    // DEVICE-SIDE COUNT (`V41_MOE_WI_DEVCOUNT`): the grid is an upper bound and
+    // work items past the builder's count hold stale entries from earlier
+    // layers. Uniform per work-group (blockIdx only), so it may precede any
+    // barrier.
+    if (n_work_items_dev != nullptr && (int)blockIdx.y >= *n_work_items_dev) return;
     __shared__ int8_t s_lut[16];
     MXFP4_STAGE_LUT(s_lut);
 

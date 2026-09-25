@@ -132,6 +132,41 @@ impl Mxfp4Matvec {
         n_rows: u32,
         n_blocks_in: u32,
     ) -> eyre::Result<()> {
+        self.launch_by_expert_kwide2_ex(
+            stream, partials, w_base, xq_base, group_count, expert_members, work_items,
+            n_work_items, dbpe, xq_slot_stride, n_used, max_per_expert, chunk_size, n_rows,
+            n_blocks_in, None,
+        )
+    }
+
+    /// As `launch_by_expert_kwide2`. With `n_work_items_dev` (the builder's
+    /// device-side count) `n_work_items` is only an UPPER BOUND for grid.y
+    /// (<= `work_items.len()`): work-groups past the device count exit at once
+    /// (`V41_MOE_WI_DEVCOUNT`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_by_expert_kwide2_ex(
+        &self,
+        stream: &Stream,
+        partials: &mut DeviceBuffer<f32>,
+        w_base: &DeviceBuffer<u8>,
+        xq_base: &DeviceBuffer<u8>,
+        group_count: &DeviceBuffer<i32>,
+        expert_members: &DeviceBuffer<i32>,
+        work_items: &DeviceBuffer<i32>,
+        n_work_items: u32,
+        dbpe: u32,
+        xq_slot_stride: u32,
+        n_used: u32,
+        max_per_expert: u32,
+        chunk_size: u32,
+        n_rows: u32,
+        n_blocks_in: u32,
+        n_work_items_dev: Option<&DeviceBuffer<i32>>,
+    ) -> eyre::Result<()> {
+        if n_work_items_dev.is_some() && n_work_items as usize > work_items.len() {
+            return Err(eyre!("mxfp4 kwide2: grid bound {n_work_items} > work_items {}", work_items.len()));
+        }
+        let n_wi_dev = n_work_items_dev.map_or(std::ptr::null_mut(), |c| c.raw());
         if n_rows % 16 != 0 {
             return Err(eyre!("mxfp4 kwide2: n_rows={n_rows} not %16"));
         }
@@ -153,7 +188,7 @@ impl Mxfp4Matvec {
             partials.raw(), w_base.raw(), xq_base.raw(),
             group_count.raw(), expert_members.raw(), work_items.raw(),
             dbpe, xq_slot_stride, n_used, max_per_expert, chunk_size,
-            n_rows, n_blocks_in
+            n_rows, n_blocks_in, n_wi_dev
         ])
     }
 }

@@ -762,6 +762,18 @@ pub fn lookahead_topk() -> usize {
 /// written to the pick trace as `A` lines. Groundwork for box-2 miss
 /// substitution (docs/v41/BOX2_MISS_SUBSTITUTION.md); picks and weights are
 /// bit-identical with it on.
+/// `V41_MOE_WI_DEVCOUNT` (default on; `0` = the host readback): keep the iGPU
+/// MoE work-item count on the device. The gate/up and down kernels are launched
+/// with an upper-bound grid right behind the builder and exit past the count,
+/// instead of the host draining the iGPU (and the OTHER lane's MoE queued ahead
+/// of this one) to read one integer. MXFP4 kwide pair + kwide2 down only
+/// (`dispatch::moe_wi_devcount_supported`).
+pub fn moe_wi_devcount() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_MOE_WI_DEVCOUNT").as_deref() != Ok("0"));
+    *D
+}
+
 pub fn router_alts() -> u32 {
     static M: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
         std::env::var("V41_ROUTER_ALTS")
@@ -7820,7 +7832,9 @@ impl HeterogeneousEngine {
         // Chunked by-expert iq2. Three pre-passes then main kernel:
         //   1. moe_group_builder: invert d_selected → group_count + expert_members.
         //   2. moe_work_items_builder: chunk popular groups → work_items + n_work_items.
-        //   3. host sync + readback n_work_items to set main kernel grid.y.
+        //   3. host sync + readback n_work_items to set main kernel grid.y
+        //      (`V41_MOE_WI_DEVCOUNT`: none -- an upper-bound grid.y, and the
+        //      kernels exit past the device-side count).
         //   4. iq2 chunked main kernel.
         // Chunk size = how many members per WG the iq2/q2k kernels handle.
         // tile8_row32 caps at 8 (ejpir-style block8 unpack); others use 32.
@@ -7849,8 +7863,9 @@ impl HeterogeneousEngine {
         {
             // Growing FREES the old buffers, and the previous layer's by-expert
             // kernels can still be queued on them (the chain's only sync is the
-            // work-item readback, ahead of the main kernel). Grow-only, so this
-            // drains at most once per process.
+            // work-item readback, ahead of the main kernel -- and under
+            // `V41_MOE_WI_DEVCOUNT` there is none). Grow-only, so this drains at
+            // most once per process.
             ie.compute.synchronize()?;
         }
         bi.ensure_group_bound(moe_group_bound)?;
@@ -7864,7 +7879,18 @@ impl HeterogeneousEngine {
                 );
             });
         }
-        bi.group_count.fill_zero()?;
+        // DEVICE-SIDE WORK-ITEM COUNT (`moe_wi_devcount`): nothing below blocks
+        // the host on the iGPU, so the zero-fills go on `ie.compute` too (a
+        // blocking memset would drain it instead).
+        let wi_devcount = moe_wi_devcount()
+            && !wmma_path
+            && variant_peek != "hybrid"
+            && super::dispatch::moe_wi_devcount_supported(routed_src.gate.dtype, routed_src.down.dtype);
+        if wi_devcount {
+            bi.group_count.fill_zero_async(&ie.compute)?;
+        } else {
+            bi.group_count.fill_zero()?;
+        }
         {
             let _t_grp = ie.events.stage("igpu.moe_group_builder", &ie.compute)?;
             let BatchIgpuScratch {
@@ -8085,7 +8111,11 @@ impl HeterogeneousEngine {
                 }
             }
         } else {
-            bi.n_work_items.fill_zero()?;
+            if wi_devcount {
+                bi.n_work_items.fill_zero_async(&ie.compute)?;
+            } else {
+                bi.n_work_items.fill_zero()?;
+            }
             {
                 let BatchIgpuScratch {
                     n_work_items,
@@ -8107,19 +8137,27 @@ impl HeterogeneousEngine {
             // Host readback of the work-item COUNT to size the kwide launch: a
             // full iGPU drain per lane-layer that also waits for the OTHER lane's
             // MoE queued ahead of it (profile audit 2026-09-21; untimed until now).
-            probe_stream_busy(&ie.compute, &LH_WIC_BUSY, &LH_WIC_IDLE);
-            let _t_wic = LayerHostTimer::start(&LH_WORK_ITEMS_COUNT);
-            ie.compute.synchronize()?;
-            let mut n_wi_host = [0i32; 1];
-            bi.n_work_items.copy_to_host(&mut n_wi_host)?;
-            drop(_t_wic);
-            n_work_items = n_wi_host[0] as u32;
+            if wi_devcount {
+                // Upper bound: a work item holds >= 1 member and every member is
+                // one (row, pick) pair; the kernels exit past `bi.n_work_items`.
+                n_work_items = ((b as usize) * (cs_n_used as usize)).min(si.work_items.len()) as u32;
+            } else {
+                probe_stream_busy(&ie.compute, &LH_WIC_BUSY, &LH_WIC_IDLE);
+                let _t_wic = LayerHostTimer::start(&LH_WORK_ITEMS_COUNT);
+                ie.compute.synchronize()?;
+                let mut n_wi_host = [0i32; 1];
+                bi.n_work_items.copy_to_host(&mut n_wi_host)?;
+                drop(_t_wic);
+                n_work_items = n_wi_host[0] as u32;
+            }
             {
                 let BatchIgpuScratch {
                     d_ew,
                     group_count,
+                    n_work_items: n_wi_dev_buf,
                     ..
                 } = bi;
+                let n_wi_dev: Option<&DeviceBuffer<i32>> = if wi_devcount { Some(&*n_wi_dev_buf) } else { None };
                 let BatchIgpuShared {
                     d_mid_cat,
                     d_xq_q8k,
@@ -8169,7 +8207,7 @@ impl HeterogeneousEngine {
                         super::dispatch::pair_prefill_stage(routed_src.gate.dtype),
                         &ie.compute,
                     )?;
-                    super::dispatch::moe_gate_up_chunked(
+                    super::dispatch::moe_gate_up_chunked_ex(
                         ie, routed_src.gate.dtype, &ie.compute, d_mid_cat,
                         &routed_src.gate.buffer, &routed_src.up.buffer,
                         d_xq_q8k, d_ew,
@@ -8179,6 +8217,7 @@ impl HeterogeneousEngine {
                         crate::config::SWIGLU_CLAMP_EXP,
                         crate::config::N_FF_EXP,
                         crate::config::BLOCKS_Q8K_GATE_IN,
+                        n_wi_dev,
                     )?
                 };
                 if handled {
@@ -8334,13 +8373,14 @@ impl HeterogeneousEngine {
                         N_EMBD, crate::config::BLOCKS_Q8K_DOWN_IN,
                     )?;
                 } else if use_kwide2 && down_dt == v4flash_core::gguf::GgufType::MXFP4 {
-                    ie.mxfp4.launch_by_expert_kwide2(
+                    ie.mxfp4.launch_by_expert_kwide2_ex(
                         &ie.compute, &mut si.q2k_partials,
                         &routed_src.down.buffer, &si.d_midq_cat,
                         &bi.group_count, &si.expert_members, &si.work_items,
                         n_work_items, dbpe, mid_blocks_bytes as u32,
                         cs_n_used as u32, max_per_expert, CHUNK_SIZE,
                         N_EMBD, crate::config::BLOCKS_Q8K_DOWN_IN,
+                        if wi_devcount { Some(&bi.n_work_items) } else { None },
                     )?;
                 } else if use_kwide2 {
                     ie.q2k.launch_by_expert_kwide2(

@@ -408,7 +408,13 @@ extern "C" __global__ void mxfp4_pair_matvec_fused_swiglu_kwide(
         unsigned int    chunk_size,
         float           clamp,
         unsigned int    n_rows,
-        unsigned int    n_blocks) {
+        unsigned int    n_blocks,
+        const int    * __restrict__ n_work_items_dev) { // nullptr = grid.y is exact
+    // DEVICE-SIDE COUNT (`V41_MOE_WI_DEVCOUNT`): the grid is an upper bound and
+    // work items past the builder's count hold stale entries from earlier
+    // layers. Uniform per work-group (blockIdx only), so it may precede any
+    // barrier.
+    if (n_work_items_dev != nullptr && (int)blockIdx.y >= *n_work_items_dev) return;
     const unsigned int w_idx = blockIdx.y;
     const int packed_item = work_items[w_idx];
     const unsigned int e            = (unsigned int)(packed_item >> 16) & 0xffffu;
