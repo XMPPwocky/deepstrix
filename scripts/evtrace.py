@@ -182,10 +182,14 @@ def cmd_summary(a):
     for h in headers:
         print(f"{h['_path']}: role={h.get('role')} pid={h.get('pid')} devices={h.get('sys_devices')}")
     for k in sorted(recs):
-        v = recs[k]
-        ts = finite([r.get('t') or r.get('t_start') or r.get('t_submit') or r.get('t_dequeue') or r.get('t_mono_raw') or r.get('t_hint') or r.get('t_written') or NAN for r in v])
-        span = (max(ts) - min(ts)) / 1e9 if len(ts) > 1 else 0
-        print(f'  {k:<10} {len(v):>9} records over {span:8.1f} s')
+        # Per role: each box's stamps are its own RAW clock (different epochs).
+        by_role = defaultdict(list)
+        for r in recs[k]:
+            by_role[r['_role']].append(r)
+        for role, v in sorted(by_role.items()):
+            ts = finite([r.get('t') or r.get('t_start') or r.get('t_submit') or r.get('t_dequeue') or r.get('t_mono_raw') or r.get('t_hint') or r.get('t_written') or NAN for r in v])
+            span = (max(ts) - min(ts)) / 1e9 if len(ts) > 1 else 0
+            print(f'  {k:<10} {role:<4} {len(v):>9} records over {span:8.1f} s')
     for m in recs.get('meta', [])[-1:]:
         print(f"  last meta: written={m['written']:.0f} dropped={m['dropped']:.0f} files={m['files']:.0f}")
 
@@ -369,8 +373,8 @@ def cmd_report(a):
         print(f"\nmeta: dropped={max(m['dropped'] for m in meta):.0f} written={max(m['written'] for m in meta):.0f}")
 
 
-def smoothed_offset(hub, bucket_ns=30e9):
-    """Box-2-minus-hub clock offset as a function of hub time: in each bucket
+def smoothed_offset(hub, bucket_ns=2e9):
+    """Box-2-minus-hub clock offset as a function of hub time: in each 2 s bucket
     the sample with the smallest link delay (least queueing, so the most
     symmetric path), linearly interpolated between buckets and extrapolated
     along the end segments (the RAW clocks drift apart by tens of ppm)."""
