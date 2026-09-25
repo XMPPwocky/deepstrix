@@ -103,7 +103,10 @@ for c in "$@"; do
       esac
       posf="$HERE/agentic_generated_positions.json"
       case $pol in *_turn3) posf="$HERE/agentic_turn3_positions.json" ;; esac
-      run_case "policy_$pol" --no-layer-dumps "${extra[@]}" --swap-positions "$posf" \
+      # Every policy case above was published with bf16 --swap-frac draws; pin that so each
+      # name keeps reproducing its numbers bit for bit (a new case wanting exact fractions
+      # appends --swap-rand-dtype float32 to its extra, which wins as the later flag).
+      run_case "policy_$pol" --no-layer-dumps --swap-rand-dtype bfloat16 "${extra[@]}" --swap-positions "$posf" \
         --prompt-ids "$(tr -d '[] \n' < "$HERE/agentic_tokens.json")" ;;
     *) echo "unknown case $c"; exit 2 ;;
   esac || { echo "[$(date -u +%T)] stopping after $c failed"; exit 1; }
