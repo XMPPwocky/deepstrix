@@ -1425,6 +1425,15 @@ impl PfQueue {
         }
     }
 
+    /// A job popped as speculative turned out to be needed (`urgent`) before
+    /// its read started: count it as certain from now on, so the gate keeps
+    /// new speculative reads off the drives while it runs.
+    fn reclassify_certain(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.running_spec = g.running_spec.saturating_sub(1);
+        g.running_certain += 1;
+    }
+
     /// A reader finished a job it popped as `certain` (or not).
     fn finished(&self, certain: bool) {
         let mut g = self.inner.lock().unwrap();
@@ -1440,6 +1449,20 @@ impl PfQueue {
     fn close(&self) {
         self.inner.lock().unwrap().closed = true;
         self.cv.notify_all();
+    }
+}
+
+/// Calls `PfQueue::finished` when a reader is done with a job, including by
+/// panic, so a failed read can never leave the gate counters raised (which
+/// would keep speculative reads off for good).
+struct PfFinish<'a> {
+    q: &'a PfQueue,
+    certain: bool,
+}
+
+impl Drop for PfFinish<'_> {
+    fn drop(&mut self) {
+        self.q.finished(self.certain);
     }
 }
 
@@ -1635,8 +1658,14 @@ fn b2_prefetch_par() -> usize {
 /// reads (a request's own picks); twice as many staging sets are kept free of
 /// speculative ones (look-ahead, substitution admissions), which are dropped
 /// instead. Clamped so at least one reader stays for speculative work.
+/// `RESERVE=0` keeps the certain-first gate (no speculative read starts while a
+/// certain one runs or waits); `RESERVE >= sets / 2` drops every speculative
+/// word.
 fn b2_prefetch_reserve() -> usize {
-    std::env::var("V41_B2_PREFETCH_RESERVE").ok().and_then(|v| v.parse().ok()).unwrap_or(1usize).min(8)
+    static R: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_B2_PREFETCH_RESERVE").ok().and_then(|v| v.parse().ok()).unwrap_or(1usize).min(8)
+    });
+    *R
 }
 
 /// `V41_B2_PREFETCH_SETS`: staging sets = max prefetch reads in flight (default 8).
@@ -2399,6 +2428,7 @@ impl ExpertShard {
                 let ptrs = ptrs;
                 loop {
                     let Some(PfJob { layer, e, set, certain, t_hint }) = queue_r.pop() else { break };
+                    let mut done = PfFinish { q: &queue_r, certain };
                     if !certain {
                         // Yield the drives to demand misses (bounded: a hint that
                         // waits longer than a layer is late anyway) -- unless a
@@ -2410,6 +2440,10 @@ impl ExpertShard {
                             && !queue_r.is_urgent(layer, e)
                         {
                             std::thread::sleep(std::time::Duration::from_micros(50));
+                        }
+                        if queue_r.is_urgent(layer, e) {
+                            queue_r.reclassify_certain();
+                            done.certain = true;
                         }
                     }
                     let sp = ptrs[set];
@@ -2423,7 +2457,7 @@ impl ExpertShard {
                     let queue_ns = (t_read - t_hint).as_nanos() as u64;
                     let r = Self::read_miss_into(&owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2);
                     let read_ns = t_read.elapsed().as_nanos() as u64;
-                    queue_r.finished(certain);
+                    drop(done);
                     let msg = match r {
                         Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, offs, coalesced, queue_ns, read_ns }),
                         Err(err) => Err((set, layer, e, format!("{err:#}"))),
