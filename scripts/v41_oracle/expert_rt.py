@@ -45,9 +45,36 @@ def expert_f32(ckpt, L: int, e: int, io_lock=None) -> dict:
     return out
 
 
-def quantize_expert(t: int, ws: dict, imx_in=None, imx_down=None) -> bytes:
-    """w1/w3 share the FFN-input importance, w2 takes the down-input one; None = uniform."""
-    return b"".join(G.quantize(t, ws[w], imx_down if w == "w2" else imx_in) for w in WHICH)
+NO_ZERO = (G.IQ2_XXS, G.IQ2_XS, G.IQ2_S)  # grids with no zero value
+
+
+def balance_zero_signs(w: np.ndarray, seed: int) -> np.ndarray:
+    """IQ2 grids have no zero, and ggml gives +0.0 a positive sign, so MXFP4's exact zeros
+    (~12% of V4.1's expert weights) would all become the same small POSITIVE value: a
+    coherent per-column bias. An input aligned with it is amplified layer over layer. With
+    IQ2_S every zero went positive and the model collapsed (the first V3b run, KL 15 nats);
+    IQ2_XXS, whose sign parity flips some, went 67% positive. Give the zeros balanced
+    random signs at 1e-7 (far below any grid step): the bias falls to the random-error level
+    and the error RMS is unchanged."""
+    z = w == 0
+    if not z.any():
+        return w
+    w = w.copy()
+    w[z] = np.where(np.random.default_rng(seed).random(int(z.sum())) < 0.5, -1e-7, 1e-7).astype(np.float32)
+    return w
+
+
+def quantize_expert(t: int, ws: dict, imx_in=None, imx_down=None, key=None) -> bytes:
+    """w1/w3 share the FFN-input importance, w2 takes the down-input one; None = uniform.
+    key = (layer, expert) seeds the zero-sign balancing for the IQ2 types."""
+    out = []
+    for i, w in enumerate(WHICH):
+        src = ws[w]
+        if t in NO_ZERO:
+            L, e = key if key is not None else (0, 0)
+            src = balance_zero_signs(src, (L * 1009 + e) * 3 + i)
+        out.append(G.quantize(t, src, imx_down if w == "w2" else imx_in))
+    return b"".join(out)
 
 
 def dequantize_expert(t: int, blob: bytes, shapes: dict) -> dict:

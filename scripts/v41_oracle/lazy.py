@@ -18,6 +18,8 @@ from loader import Checkpoint
 
 # ----------------------------------------------------------------- MoE
 
+_RT_DEBUG = float(__import__("os").environ.get("ORACLE_RT_DEBUG", "0") or 0)
+
 
 class LazyMoE(torch.nn.Module):
     """Same forward contract as ref.MoE, with routed experts streamed."""
@@ -91,6 +93,15 @@ class LazyMoE(torch.nn.Module):
                     W = self.rt.get(self.layer_id, e)
                     self.rt.stats["rt_calls"] += idx.numel()
             out = self._expert(e, x[idx], weights[idx, top, None], W=W, capture=self.imx is not None)
+            if W is not None and _RT_DEBUG:
+                # ORACLE_RT_DEBUG=THR: rows whose round-tripped output departs from the exact
+                # one by more than THR x its norm, with the input's largest channel
+                ex = self._expert(e, x[idx], weights[idx, top, None])
+                rel = (out.float() - ex.float()).norm(dim=-1) / ex.float().norm(dim=-1).clamp_min(1e-30)
+                for i in (rel > _RT_DEBUG).nonzero().flatten().tolist():
+                    xi = x[idx][i].float()
+                    print(f"RTDBG L{self.layer_id} e{e} row {int(idx[i])} rel {rel[i]:.2f} |ex| {ex[i].float().norm():.3g} "
+                          f"|x| {xi.norm():.3g} max|x| {xi.abs().max():.3g} @ {int(xi.abs().argmax())}", flush=True)
             if rnd is not None:
                 rows, experts = rnd
                 if rows.dim() == 2:  # [n, k] site mask over the picks (any-rank null)
