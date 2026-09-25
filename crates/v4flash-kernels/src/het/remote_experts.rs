@@ -185,20 +185,26 @@ fn set_opt_i32(s: &TcpStream, level: i32, name: i32, v: i32) -> bool {
 /// request per layer, ~3.5-4 ms apart at 1-3 rows, far past the base 500 us
 /// window, so the reader sleeps and every request pays an idle wake-up (the
 /// ~60 us link measured with both ends hot was ~170-280 us live, 2026-09-25).
-/// After a request whose REPLY fits one 64 KB segment (<= 3 rows of f32, the
-/// decode case) the reader spins `V41_B2_DECODE_BUSY_POLL_US` (default 5000,
-/// the sysctl cap; 0 = never adapt). After a bigger one it returns to `base_us`:
-/// a spinning daemon reader slowed its own large sends (1.3 MB: 1.9 -> 6.6 ms,
-/// LINK_IDLE_LATENCY.md). Calls `setsockopt` only when the value changes; the
-/// new window applies from the reader's next `recv`.
-pub fn b2_adapt_busy_poll(s: &TcpStream, decode_phase: bool, base_us: u32) {
+/// While the hub says it is decoding (`REQ_FLAG_DECODE`) AND the request frame
+/// and its reply each fit one ~64 KB segment (<= 3 rows of f32 replies, <= 11
+/// rows of requests), the reader spins `V41_B2_DECODE_BUSY_POLL_US` (default
+/// 5000, the sysctl cap; 0 = never adapt). Otherwise it uses `base_us`: a
+/// multi-segment message is held on a spinning receiver for about the window,
+/// and a spinning daemon reader slowed its own large sends (1.3 MB: 1.9 ->
+/// 6.6 ms, LINK_IDLE_LATENCY.md). Calls `setsockopt` only when the value
+/// changes; the new window applies from the reader's next `recv`.
+pub fn b2_adapt_busy_poll(s: &TcpStream, decode_phase: bool, request_bytes: usize, reply_bytes: usize, base_us: u32) {
     static DECODE_US: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
         std::env::var("V41_B2_DECODE_BUSY_POLL_US").ok().and_then(|v| v.parse().ok()).unwrap_or(5000)
     });
     if *DECODE_US == 0 || base_us == 0 {
         return;
     }
-    let want = if decode_phase { *DECODE_US } else { base_us };
+    // One TCP segment on the thunderbolt0 64 KB MTU (MSS ~65,468), with room
+    // for the frame header.
+    const ONE_SEGMENT: usize = 65_000;
+    let small = request_bytes <= ONE_SEGMENT && reply_bytes <= ONE_SEGMENT;
+    let want = if decode_phase && small { *DECODE_US } else { base_us };
     if B2_SPIN_CUR.load(std::sync::atomic::Ordering::Relaxed) == want {
         return;
     }
@@ -4616,7 +4622,11 @@ pub fn serve_connection(
                 };
                 let bb = reqb.as_ref().map(|r| r.b as usize).unwrap_or(0);
                 // Reader spin window for the next request, by the hub's phase.
-                b2_adapt_busy_poll(&stream, req.flags & proto::REQ_FLAG_DECODE != 0, opts.socket.busy_poll_us);
+                {
+                    let elem_out = if req.flags & proto::REQ_FLAG_RESP_F32 != 0 { 4 } else { 2 };
+                    let reply = proto::RESP_DATA_OFF + b.max(bb) * N_EMBD as usize * elem_out;
+                    b2_adapt_busy_poll(&stream, req.flags & proto::REQ_FLAG_DECODE != 0, buf.len(), reply, opts.socket.busy_poll_us);
+                }
                 if let Some(rb) = reqb.as_ref() {
                     if !rb.hint_admit.is_empty() {
                         shard.hint_evict_first(rb.hint_admit);
@@ -4758,7 +4768,9 @@ pub fn serve_connection(
                             let resp = rx_resp_recycle_ref.try_recv().unwrap_or_else(|_| AlignedBuf::with_capacity(proto::RESP_DATA_OFF + exec_rows * N_EMBD as usize * 4));
                             let t_serve = Instant::now();
                             if let Ok(r) = proto::decode_request(&buf) {
-                                b2_adapt_busy_poll(&stream, r.flags & proto::REQ_FLAG_DECODE != 0, opts.socket.busy_poll_us);
+                                let elem_out = if r.flags & proto::REQ_FLAG_RESP_F32 != 0 { 4 } else { 2 };
+                                let reply = proto::RESP_DATA_OFF + r.b as usize * N_EMBD as usize * elem_out;
+                                b2_adapt_busy_poll(&stream, r.flags & proto::REQ_FLAG_DECODE != 0, buf.len(), reply, opts.socket.busy_poll_us);
                             }
                             let out = serve_interleaved(ex2, shard, &hdr, &buf, t_first, t_done, t2, resp);
                             let _ = tx_req_recycle_ref.send(buf);
@@ -5412,16 +5424,16 @@ impl RemoteExpertClient {
         self.dead
     }
 
-    /// Change the socket's `SO_BUSY_POLL` window (microseconds) in place; a
-    /// plain `setsockopt`, safe from any thread while the reader spins. Returns
-    /// whether the kernel accepted it. Above `net.core.busy_read` it is refused
-    /// for an unprivileged process: logged ONCE, and the window stays as it was.
-    /// Why the window is phase-dependent: `HetEngine::remote_set_phase_busy_poll`.
     /// Record the hub's phase; requests carry `REQ_FLAG_DECODE` while decoding.
     pub fn set_decode_phase(&mut self, decode: bool) {
         self.decode_phase = decode;
     }
 
+    /// Change the socket's `SO_BUSY_POLL` window (microseconds) in place; a
+    /// plain `setsockopt`, safe from any thread while the reader spins. Returns
+    /// whether the kernel accepted it. Above `net.core.busy_read` it is refused
+    /// for an unprivileged process: logged ONCE, and the window stays as it was.
+    /// Why the window is phase-dependent: `HetEngine::remote_set_phase_busy_poll`.
     pub fn set_busy_poll_us(&mut self, us: u32) -> bool {
         if us == self.busy_poll_now {
             return true;
