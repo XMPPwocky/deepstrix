@@ -761,6 +761,15 @@ pub fn lookahead_topk() -> usize {
 /// path's twin (`V41_MHC_SPLIT`) LOST (DECODE_TO_30_BRIEF: 2 graph launches + 6
 /// record/wait pairs per layer > the ~58 us it hid); here the mixes are ~60 us
 /// (attn) + ~50 us (ffn) per LANE-layer and two lanes interleave, so measure.
+///
+/// MEASURED LIVE 2026-09-25, 4 rows, LOST -- keep OFF: step 134 ms (off) ->
+/// 247 (on, default 4 HW queues) -> 205 (on, `GPU_MAX_HW_QUEUES=8`). Output
+/// stayed exact (echo2 4/4). With `de.hc` active every compute-stream stage ran
+/// 1.3-3.5x slower (q_chain 11 -> 35 / 18 ms, router 4 -> 15 / 8, router
+/// readback wait 12 -> 84 / 30); sharing a HW queue explains part of it, the
+/// rest is the concurrent small kernels slowing the main chain. Taking the
+/// mixes off the critical path is worth ~4 ms/step here; making the chain
+/// itself cheaper on ONE stream is the lever left.
 pub fn ms_mhc_split() -> bool {
     static D: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("V41_MS_MHC_SPLIT").as_deref() == Ok("1"));
