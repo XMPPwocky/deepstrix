@@ -58,10 +58,25 @@ These runs are teacher-forced over the whole transcript, which OVERSTATES
 production: there a turn is re-prefilled exactly (invariant 6), so a swap only
 affects the rest of its own turn. The any-rank tail maxima (1.2-1.9 nats) were
 bimodal sharpenings with top-1 unchanged, or prompt positions after a perturbed
-turn, which production re-prefills. **Pending** (decides rank < 6): the
-count-matched null for any-rank, and a turn-local any-rank pair (swaps and KL
-confined to one 217-prediction turn). Free-running generation is still
-unmeasured.
+turn, which production re-prefills.
+
+**Excess over each run's count-matched null** (the number that matters):
+
+| policy | regime | sites/token | mean-KL ratio to null |
+|---|---|---|---|
+| cold rank-6 -> 7th | teacher-forced, whole transcript | 1.4 | 1.15x |
+| cold any rank | teacher-forced, whole transcript | 2.6 | 1.88x |
+| **cold any rank** | **turn-local (production-faithful)** | 2.6 | **1.20x** (paired 95% CI 0.97-1.50) |
+
+Turn-local = exact context through turn 3, swaps and KL confined to that turn's
+217 predictions. That's what production does (invariant 6). There, any-rank:
+mean 0.0070 vs null 0.0058, p50 0.0023 vs 0.0020, p99 / max / top-1 no worse
+than the null (top-1 98.2% both). Paired bootstrap: excess +0.0012, CI
+[-0.0002, +0.0025]. The 1.88x was perturbed KV carried across turns. **Any rank
+is viable on this evidence.** Caveats: one transcript, one turn, tokens still
+fixed within the turn (free-running unmeasured), hot-set proxy rather than
+box 2's live LRU. Hence the staged `sub_min_rank` rollout: 6, then 5, then 1,
+with a free-running quality check at each step.
 
 ## Policy (v1)
 
