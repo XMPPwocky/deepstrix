@@ -5953,6 +5953,7 @@ impl HeterogeneousEngine {
                 b,
                 if n_alt > 0 { Some(&mut bd.d_alts) } else { None },
                 n_alt,
+                if n_alt > 0 { Some(&mut bd.d_alt_w) } else { None },
             )?;
         if let Some(nl) = look_next {
             let _t = de.events.stage("k.router.lookahead", &de.compute)?;
@@ -6043,6 +6044,7 @@ impl HeterogeneousEngine {
                 // text-bias ranking under image-bias picks.
                 let n_alt = router_alts() as usize;
                 let mut alts_v = bd.d_alts.slice_view_mut(r0 * n_alt, n * n_alt);
+                let mut alt_w_v = bd.d_alt_w.slice_view_mut(r0 * n_alt, n * n_alt);
                 de.router_topk.launch_batched_alts(
                     &de.compute,
                     &mut sel_v,
@@ -6056,6 +6058,7 @@ impl HeterogeneousEngine {
                     n as u32,
                     if n_alt > 0 { Some(&mut alts_v) } else { None },
                     n_alt as u32,
+                    if n_alt > 0 { Some(&mut alt_w_v) } else { None },
                 )?;
             }
         }
@@ -6351,9 +6354,12 @@ impl HeterogeneousEngine {
                 // Ranks 7..6+n_alt per row, same sync (a few bytes).
                 let na = n_alt as usize;
                 let mut alts_host: Vec<i32> = Vec::new();
+                let mut alt_w_host: Vec<f32> = Vec::new();
                 if na > 0 {
                     alts_host = vec![0i32; (b as usize) * na];
                     bd.d_alts.slice_view(0, alts_host.len()).copy_to_host(&mut alts_host)?;
+                    alt_w_host = vec![0f32; (b as usize) * na];
+                    bd.d_alt_w.slice_view(0, alt_w_host.len()).copy_to_host(&mut alt_w_host)?;
                 }
                 drop(_t_d2h);
                 if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} A after readback"); }
@@ -6362,14 +6368,17 @@ impl HeterogeneousEngine {
                         let row = &sel_host[r * cs_n_used..(r + 1) * cs_n_used];
                         let ids: Vec<String> = row.iter().map(|v| v.to_string()).collect();
                         super::expert_pager::pick_trace(&format!("P {layer} {b} {}", ids.join(" ")));
-                        // `A <layer> <b> <alts...> / <owner>`: this row's
-                        // alternatives in rank order, then one char per pick
-                        // and alternative (6 + n_alt): 2 = box 2 owns it under
-                        // the partition, 1 = box 1. Parsers keyed on `P`/`D`
-                        // skip it.
+                        // `A <layer> <b> <alts...> / <owner> / <alt_w...>`:
+                        // this row's alternatives in rank order, then one char
+                        // per pick and alternative (6 + n_alt; 2 = box 2 owns it
+                        // under the partition, 1 = box 1), then each
+                        // alternative's weight on `d_ew`'s scale. Parsers keyed
+                        // on `P`/`D` skip it.
                         if na > 0 {
                             let alts = &alts_host[r * na..(r + 1) * na];
                             let a: Vec<String> = alts.iter().map(|v| v.to_string()).collect();
+                            let aw: Vec<String> =
+                                alt_w_host[r * na..(r + 1) * na].iter().map(|w| format!("{w:.4}")).collect();
                             let owner: String = row
                                 .iter()
                                 .chain(alts.iter())
@@ -6383,7 +6392,11 @@ impl HeterogeneousEngine {
                                     }
                                 })
                                 .collect();
-                            super::expert_pager::pick_trace(&format!("A {layer} {b} {} / {owner}", a.join(" ")));
+                            super::expert_pager::pick_trace(&format!(
+                                "A {layer} {b} {} / {owner} / {}",
+                                a.join(" "),
+                                aw.join(" ")
+                            ));
                         }
                     }
                 }

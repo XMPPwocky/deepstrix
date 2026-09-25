@@ -37,6 +37,7 @@ struct Out {
     sel: Vec<i32>,
     ew: Vec<f32>,
     alts: Vec<i32>,
+    alt_w: Vec<f32>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -46,16 +47,19 @@ fn run(r: &RouterTopk, s: &Stream, dev: i32, logits: &DeviceBuffer<f32>, bias: &
     let mut ew = DeviceBuffer::<f32>::new(dev, B * nu)?;
     let mut alts = DeviceBuffer::<i32>::new(dev, B * ROUTER_MAX_ALT as usize)?;
     alts.copy_from_host(&vec![-7; B * ROUTER_MAX_ALT as usize])?;
+    let mut alt_w = DeviceBuffer::<f32>::new(dev, B * ROUTER_MAX_ALT as usize)?;
     r.launch_batched_alts(
         s, &mut sel, &mut ew, logits, Some(bias), N_EXPERT, nu as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, B as u32,
         if n_alt > 0 { Some(&mut alts) } else { None }, n_alt,
+        if n_alt > 0 { Some(&mut alt_w) } else { None },
     )?;
     s.synchronize()?;
-    let mut o = Out { sel: vec![0; B * nu], ew: vec![0.0; B * nu], alts: vec![0; B * n_alt as usize] };
+    let mut o = Out { sel: vec![0; B * nu], ew: vec![0.0; B * nu], alts: vec![0; B * n_alt as usize], alt_w: vec![0.0; B * n_alt as usize] };
     sel.copy_to_host(&mut o.sel)?;
     ew.copy_to_host(&mut o.ew)?;
     if n_alt > 0 {
         alts.slice_view(0, o.alts.len()).copy_to_host(&mut o.alts)?;
+        alt_w.slice_view(0, o.alt_w.len()).copy_to_host(&mut o.alt_w)?;
     }
     Ok(o)
 }
@@ -93,11 +97,12 @@ fn alts_leave_picks_bit_identical_and_are_the_next_ranks() -> eyre::Result<()> {
         // 2. Alternatives are the next ranks by the host's f64 selection score.
         let na = n_alt as usize;
         for t in 0..B {
-            let score = |e: usize| -> f64 {
+            let prob = |e: usize| -> f64 {
                 let x = logits_h[t * ne + e] as f64;
                 let sp = if x > 20.0 { x } else if x < -20.0 { x.exp() } else { x.exp().ln_1p() };
-                sp.sqrt() + bias_h[e] as f64
+                sp.sqrt()
             };
+            let score = |e: usize| -> f64 { prob(e) + bias_h[e] as f64 };
             let row = &o.sel[t * nu..(t + 1) * nu];
             let alts = &o.alts[t * na..(t + 1) * na];
             let mut order: Vec<usize> = (0..ne).collect();
@@ -112,6 +117,18 @@ fn alts_leave_picks_bit_identical_and_are_the_next_ranks() -> eyre::Result<()> {
                     let gap = (score(a as usize) - score(want)).abs();
                     assert!(gap < 1e-5, "t={t} rank {}: got {a}, want {want} (gap {gap:e})", nu + k + 1);
                 }
+                // alt_w = prob(alt) / (sum of the picks' probs) * scale.
+                let sum: f64 = row.iter().map(|&e| prob(e as usize)).sum();
+                let want_w = prob(a as usize) / sum * EXPERT_WEIGHT_SCALE as f64;
+                let got_w = o.alt_w[t * na + k] as f64;
+                assert!((got_w - want_w).abs() <= 1e-5 * want_w.max(1e-3), "t={t} alt {k}: alt_w {got_w} vs {want_w}");
+                // Swapping the 6th for this alternative and dividing by
+                // 1 - w6/scale + alt_w/scale gives weights that sum to scale.
+                let ew = &o.ew[t * nu..(t + 1) * nu];
+                let sc = EXPERT_WEIGHT_SCALE as f64;
+                let f = 1.0 - ew[nu - 1] as f64 / sc + got_w / sc;
+                let new_sum: f64 = ew[..nu - 1].iter().map(|&w| w as f64 / f).sum::<f64>() + got_w / f;
+                assert!((new_sum - sc).abs() < 1e-4, "t={t}: renormalized sum {new_sum}");
             }
         }
     }
@@ -159,10 +176,16 @@ fn alts_slice_views_land_at_the_right_rows() -> eyre::Result<()> {
     let mut sv = sel.slice_view_mut(r0 * nu, n * nu);
     let mut ev = ew.slice_view_mut(r0 * nu, n * nu);
     let mut av = alts.slice_view_mut(r0 * na, n * na);
-    par.launch_batched_alts(&s, &mut sv, &mut ev, &lv, Some(&bias), N_EXPERT, nu as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, n as u32, Some(&mut av), na as u32)?;
+    let mut aw = DeviceBuffer::<f32>::new(dev.id, B * na)?;
+    let mut awv = aw.slice_view_mut(r0 * na, n * na);
+    par.launch_batched_alts(&s, &mut sv, &mut ev, &lv, Some(&bias), N_EXPERT, nu as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, n as u32, Some(&mut av), na as u32, Some(&mut awv))?;
     s.synchronize()?;
     let mut got = vec![0i32; n * na];
     av.copy_to_host(&mut got)?;
     assert_eq!(got, full.alts[r0 * na..(r0 + n) * na], "sub-range alternatives");
+    let mut got_w = vec![0f32; n * na];
+    awv.copy_to_host(&mut got_w)?;
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&got_w), bits(&full.alt_w[r0 * na..(r0 + n) * na]), "sub-range alt weights");
     Ok(())
 }

@@ -309,6 +309,9 @@ pub struct BatchDgpuScratch {
     /// order, `router_alts()` of them per row. Box 2's miss-substitution
     /// candidates (docs/v41/BOX2_MISS_SUBSTITUTION.md).
     pub d_alts: DeviceBuffer<i32>,
+    /// `[B, ROUTER_MAX_ALT]` — each alternative's weight on `d_ew`'s scale
+    /// (prob / top-6 prob sum x 1.5), for exact renormalization on a swap.
+    pub d_alt_w: DeviceBuffer<f32>,
 
     // ---- Shared expert output ----
     /// `[B, N_EMBD]` — P10 output, read by P12 `vec_add`.
@@ -1170,6 +1173,7 @@ impl BatchDgpuScratch {
             d_selected: mk_i32(N_EXPERT_USED)?,
             d_ew: mk_f32(N_EXPERT_USED)?,
             d_alts: mk_i32(crate::router_topk::ROUTER_MAX_ALT as usize)?,
+            d_alt_w: mk_f32(crate::router_topk::ROUTER_MAX_ALT as usize)?,
             ffn_shared: mk_f32(N_EMBD as usize)?,
             ffn_moe_recv: mk_f32(N_EMBD as usize)?,
             pos_per_b: mk_i32(1)?,

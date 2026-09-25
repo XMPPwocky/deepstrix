@@ -45,7 +45,8 @@ extern "C" __global__ void router_topk(
         float          expert_weight_scale,
         float          weight_eps,
         int          * __restrict__ alts,          // may be nullptr; [n_alt]
-        unsigned int   n_alt) {
+        unsigned int   n_alt,
+        float        * __restrict__ alt_w) {       // may be nullptr; see router_topk_par.hip
     __shared__ float s_probs[ROUTER_MAX_EXPERTS];
     __shared__ float s_select[ROUTER_MAX_EXPERTS];
     __shared__ int   s_sel[ROUTER_MAX_USED + ROUTER_MAX_ALT];
@@ -103,6 +104,10 @@ extern "C" __global__ void router_topk(
         selected[tid] = s_sel[tid];
         weights[tid]  = s_w[tid] / s_sum * expert_weight_scale;
     } else if (tid < n_used + n_alt) {
-        alts[tid - n_used] = s_sel[tid];
+        const int a = s_sel[tid];
+        alts[tid - n_used] = a;
+        if (alt_w != nullptr) {
+            alt_w[tid - n_used] = ((a >= 0) ? s_probs[a] : 0.0f) / s_sum * expert_weight_scale;
+        }
     }
 }

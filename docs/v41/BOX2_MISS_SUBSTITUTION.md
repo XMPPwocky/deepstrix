@@ -95,9 +95,16 @@ expert, whoever owns it". So box 1 should make the decision itself:
   missing to that row's best-ranked unused alternative. A box-1-owned substitute
   that box 1 holds becomes an ordinary local pick: the pager ensures it and the
   local MoE computes it. A box-2-owned one the mirror holds goes to box 2 as
-  usual. Weights are inherited, so `d_ew` is untouched. Only `d_selected` is
-  rewritten, with a blocking H2D into `bd.d_selected` before `pre_moe_prep`'s
-  peer push carries the picks to the iGPU (`forward_prefill.rs` ~7138).
+  usual. **Weights are renormalized exactly (ref.Gate), not inherited.** Box 1
+  hasn't dispatched anything yet, so it can rewrite the row's `d_ew` too. The
+  router's `alt_w` output puts each alternative on `d_ew`'s scale, so swapping
+  pick j for alternative k divides the row's weights, and `alt_w[k]`, by
+  `1 - w_j/1.5 + alt_w[k]/1.5`. Any-rank inherit was measured +8% mean / +23%
+  p99 over refgate, with per-site weight errors up to 1.2 when a rank-1 weight
+  goes to a weak substitute. Box 1 rewrites `d_selected` and `d_ew` with a
+  blocking H2D before `pre_moe_prep`'s peer push carries them to the iGPU
+  (`forward_prefill.rs` ~7138). Inherit remains only for the box-2-side
+  fallback, rank 6.
 - **No round trip and no second MoE pass on box 1.** The round-trip alternative
   (box 2 replies "compute X") arrives after box 1's local MoE is launched, and
   would need a deferred pass plus accumulate on box 1's graph-captured chain.
@@ -224,10 +231,13 @@ profile can show `box2.subs_per_step` next to `box2.page_ms`.
 
 1. **Router alternatives + trace.** DONE on branch `worktree-b2-miss-substitution`:
    `V41_ROUTER_ALTS=m` (0..=4, default 0). `router_topk{,_par}` emit ranks
-   7..6+m into `bd.d_alts`; they're read back with the picks and written as `A <layer>
-   <b> <alts> / <owner chars>` after each `P` trace row. The test
+   7..6+m into `bd.d_alts`, with their weights on `d_ew`'s scale in `bd.d_alt_w`.
+   Both are read back with the picks and written as `A <layer> <b> <alts> /
+   <owner chars> / <alt_w>` after each `P` trace row. The test
    `tests/router_topk_alts.rs` shows picks and weights bit-identical for
-   m = 1..4 and the alternatives are the next ranks (up to float near-ties).
+   m = 1..4, the alternatives are the next ranks (up to float near-ties),
+   `alt_w` matches a host f64 computation, and the renormalized weights sum to
+   1.5.
    Cost when on: m extra argmax passes per token-layer.
 2. **Mirror, dry run.** Pool changes in box-2 responses (VERSION 5) plus the
    box-1 mirror. Log would-substitute counts, and mirror accuracy against box 2's

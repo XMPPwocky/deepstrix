@@ -129,9 +129,10 @@ impl RouterTopk {
             shared_mem_bytes: 0,
         };
         let no_alts: sys::hipDeviceptr_t = std::ptr::null_mut();
+        let no_alt_w: sys::hipDeviceptr_t = std::ptr::null_mut();
         launch_kernel!(function, cfg, stream, [
             selected.raw(), weights.raw(), logits.raw(), b_ptr,
-            n_expert, n_used, expert_weight_scale, weight_eps, no_alts, 0u32
+            n_expert, n_used, expert_weight_scale, weight_eps, no_alts, 0u32, no_alt_w
         ])
     }
 
@@ -154,7 +155,7 @@ impl RouterTopk {
         b: u32,
     ) -> eyre::Result<()> {
         self.launch_batched_alts(
-            stream, selected, weights, logits, bias, n_expert, n_used, expert_weight_scale, weight_eps, b, None, 0,
+            stream, selected, weights, logits, bias, n_expert, n_used, expert_weight_scale, weight_eps, b, None, 0, None,
         )
     }
 
@@ -163,6 +164,12 @@ impl RouterTopk {
     /// bit-identical to `n_alt = 0`: the alternatives are extra argmax passes
     /// after the first `n_used`. `alts = None` or `n_alt = 0` is exactly
     /// `launch_batched`.
+    ///
+    /// `alt_w` (optional, needs `alts`): each alternative's prob divided by the
+    /// top-`n_used` prob sum, times the scale. That's the same scale as
+    /// `weights`, so swapping pick j for alternative k renormalizes exactly
+    /// (ref.Gate) by dividing every weight in the row, and `alt_w[k]`, by
+    /// `1 - weights[j]/scale + alt_w[k]/scale`.
     #[allow(clippy::too_many_arguments)]
     pub fn launch_batched_alts(
         &self,
@@ -178,6 +185,7 @@ impl RouterTopk {
         b: u32,
         alts: Option<&mut DeviceBuffer<i32>>,
         n_alt: u32,
+        alt_w: Option<&mut DeviceBuffer<f32>>,
     ) -> eyre::Result<()> {
         if b == 0 {
             return Ok(());
@@ -231,8 +239,17 @@ impl RouterTopk {
                 return Err(eyre!("router_topk batched: alts len {} < b*n_alt {}", a.len(), bn * n_alt as usize));
             }
         }
+        if let Some(w) = alt_w.as_ref() {
+            if w.len() < bn * n_alt as usize {
+                return Err(eyre!("router_topk batched: alt_w len {} < b*n_alt {}", w.len(), bn * n_alt as usize));
+            }
+        }
         let a_ptr: sys::hipDeviceptr_t = match alts {
             Some(a) if n_alt > 0 => a.raw(),
+            _ => std::ptr::null_mut(),
+        };
+        let aw_ptr: sys::hipDeviceptr_t = match alt_w {
+            Some(w) if n_alt > 0 => w.raw(),
             _ => std::ptr::null_mut(),
         };
         // Batched path needs the par kernel's blockIdx.x offsetting.
@@ -250,7 +267,7 @@ impl RouterTopk {
         };
         launch_kernel!(function, cfg, stream, [
             selected.raw(), weights.raw(), logits.raw(), b_ptr,
-            n_expert, n_used, expert_weight_scale, weight_eps, a_ptr, n_alt
+            n_expert, n_used, expert_weight_scale, weight_eps, a_ptr, n_alt, aw_ptr
         ])
     }
 }

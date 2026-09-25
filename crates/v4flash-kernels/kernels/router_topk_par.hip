@@ -37,7 +37,12 @@ extern "C" __global__ void router_topk_par(
         float          expert_weight_scale,
         float          weight_eps,
         int          * __restrict__ alts,          // may be nullptr; [n_alt] per token
-        unsigned int   n_alt) {
+        unsigned int   n_alt,
+        // May be nullptr; [n_alt] per token. prob(alt) / (top-n_used prob sum)
+        // * scale: on the SAME scale as `weights`, so a caller that swaps pick
+        // j for alt k renormalizes exactly (ref.Gate) by dividing everything by
+        // 1 - weights[j]/scale + alt_w[k]/scale.
+        float        * __restrict__ alt_w) {
     __shared__ float s_probs[ROUTER_MAX_EXPERTS];
     __shared__ float s_scores[ROUTER_MAX_EXPERTS]; // mutable; winners set to -INF
     __shared__ float buf[ROUTER_MAX_EXPERTS];
@@ -58,6 +63,7 @@ extern "C" __global__ void router_topk_par(
     if (alts == nullptr) n_alt = 0;
     if (n_alt > ROUTER_MAX_ALT) n_alt = ROUTER_MAX_ALT;
     if (alts != nullptr) alts += (size_t)blockIdx.x * (size_t)n_alt;
+    if (alt_w != nullptr) alt_w += (size_t)blockIdx.x * (size_t)n_alt;
 
     // Phase 1: probs + selection scores.
     if (tid < n_expert) {
@@ -128,6 +134,10 @@ extern "C" __global__ void router_topk_par(
         selected[tid] = s_sel[tid];
         weights[tid]  = s_w[tid] / s_sum * expert_weight_scale;
     } else if (tid < n_used + n_alt) {
-        alts[tid - n_used] = s_sel[tid];
+        const int a = s_sel[tid];
+        alts[tid - n_used] = a;
+        if (alt_w != nullptr) {
+            alt_w[tid - n_used] = ((a >= 0) ? s_probs[a] : 0.0f) / s_sum * expert_weight_scale;
+        }
     }
 }
