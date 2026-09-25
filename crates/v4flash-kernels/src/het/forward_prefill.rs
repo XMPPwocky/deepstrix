@@ -355,6 +355,29 @@ fn prefill_presubmit() -> bool {
     *B
 }
 
+/// `V41_RB_PACK` (default on): the router readback is ONE `ReadbackPack`
+/// kernel into pinned memory ahead of `selected_ready` (see the launch in
+/// `pre_moe_chain`); `=0` restores the async copy batch on `rb_stream`.
+fn rb_pack_on() -> bool {
+    static B: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_RB_PACK").as_deref() != Ok("0")
+    });
+    *B
+}
+
+/// Largest lane `b` the readback pack serves (`V41_RB_PACK_MAX_ROWS`, default
+/// 16). Box 2's `xq` is 5840 B/row, written over PCIe by the pack on
+/// `de.compute` AHEAD of `selected_ready` -- in front of the shared expert and
+/// the iGPU peer push. At decode sizes that is ~10 us; a 512-row prefill chunk
+/// would serialize ~3 MB there, so big chunks keep the async copy, which runs
+/// beside them.
+pub(crate) fn rb_pack_max_rows() -> u32 {
+    static N: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_RB_PACK_MAX_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(16)
+    });
+    *N
+}
+
 fn prefill_f32_matvec(b: u32) -> bool {
     match std::env::var("V41_PREFILL_F32_MATVEC").ok().as_deref() {
         Some("0") => false,
@@ -2316,6 +2339,34 @@ impl HeterogeneousEngine {
     }
 }
 
+/// Where the ROUTER READBACK PACK put each host-bound router output in this
+/// lane's `rb_pack`, as `(word offset, words)`; `None` = not packed. Built once
+/// by the launch in `pre_moe_chain` and read by `pre_moe_route`, so writer and
+/// reader cannot disagree on the layout.
+#[derive(Default, Clone, Copy, Debug)]
+struct RbLayout {
+    packed: bool,
+    sel: Option<(u32, u32)>,
+    look: Option<(u32, u32)>,
+    look2: Option<(u32, u32)>,
+    alts: Option<(u32, u32)>,
+    alt_w: Option<(u32, u32)>,
+    orig: Option<(u32, u32)>,
+    range: Option<(u32, u32)>,
+    ew: Option<(u32, u32)>,
+    xq: Option<(u32, u32)>,
+}
+
+impl RbLayout {
+    /// Segment `s` of the packed words `w`, which must be exactly `n` words.
+    fn seg<'a>(w: &'a [u32], s: Option<(u32, u32)>, what: &str, n: usize) -> eyre::Result<&'a [u32]> {
+        match s {
+            Some((o, len)) if len as usize == n && (o + len) as usize <= w.len() => Ok(&w[o as usize..(o + len) as usize]),
+            _ => Err(eyre!("readback pack segment `{what}` is {s:?}, expected {n} words")),
+        }
+    }
+}
+
 /// State carried between the four phases of one lane-layer's pre-MoE work
 /// (`pre_moe_chain` -> `pre_moe_route` -> `pre_moe_prep` -> `pre_moe_launch`).
 /// Owned values only: no phase borrows the pager or the weights across a phase
@@ -2342,7 +2393,9 @@ pub struct PreMoeCarry {
     pub drain_before_ensure: bool,
     /// May `pre_moe_route` emit box-2 look-ahead prefetch hints? Only on the
     /// SEQUENTIAL path: they are read from shared scratch (`sd.look_sel*`) that
-    /// the other lane's chain clobbers in the pipelined order.
+    /// the other lane's chain clobbers in the pipelined order. (That race is
+    /// the copy path's; the readback pack captures them in stream order. The
+    /// lane drivers keep them off regardless -- they measured a loss.)
     pub lookahead_hints_ok: bool,
     /// Promise the daemon (`REQ_FLAG_PARTNER`) that another request for this
     /// same layer follows immediately, so it can merge the two lanes' passes
@@ -2357,6 +2410,8 @@ pub struct PreMoeCarry {
     /// (`router_alts()`, or 0 on a hash-router layer, whose picks come from
     /// the host and leave `d_alts` stale).
     n_alt: u32,
+    /// Readback pack layout for this lane-layer (`packed == false`: the copy batch).
+    rb: RbLayout,
     // route -> prep
     sel_host_remote: Vec<i32>,
     sel_host_audit: Vec<i32>,
@@ -2699,7 +2754,8 @@ impl HeterogeneousEngine {
                 // The look-ahead prefetch hints are read from SHARED scratch
                 // (`sd.look_sel*`) that the other lane's chain has already
                 // overwritten here, so this path does not emit them (they are
-                // default OFF and measured a loss anyway).
+                // default OFF and measured a loss anyway). The readback pack
+                // captures them in stream order, so only the copy path races.
                 ca.lookahead_hints_ok = false;
                 cb.lookahead_hints_ok = false;
                 // Lane A's request is followed immediately by lane B's for the
@@ -2998,7 +3054,8 @@ impl HeterogeneousEngine {
                         sev, pager.as_deref_mut(), CedMode::Exact, &rl)
                 })?;
                 // Look-ahead hints read SHARED scratch (`sd.look_sel*`) that the
-                // other lane's chain may overwrite before this lane routes.
+                // other lane's chain may overwrite before this lane routes (the
+                // copy path; the readback pack captures them in stream order).
                 c.lookahead_hints_ok = false;
                 // Lanes are not in lockstep: never hold the daemon for a partner.
                 c.partner_follows = false;
@@ -6421,6 +6478,61 @@ impl HeterogeneousEngine {
                 )?;
             }
         }
+        // ROUTER READBACK PACK (2026-09-25, `V41_RB_PACK`, default on). Every
+        // host-bound router output -- picks, look-ahead picks, alternatives, the
+        // prior's picks and ranges, weights, box 2's `xq` -- gathered by ONE
+        // kernel into this lane's pinned `rb_pack`, in stream order before
+        // `selected_ready`. The event's system-scope release makes the words
+        // host-visible, so `pre_moe_route`'s event wait IS the readback.
+        //
+        // It replaces the batch of async copies on `rb_stream` behind this
+        // event, which MEASURED live (09-25, `ms.stage` per deploy) still
+        // finished ~0.6 ms/step after the shared expert queued behind the
+        // router, while the shared expert ran 2.4x slower beside it (3.7 -> 9.0
+        // ms/step at 1 row): tests/bench_router_readback_ab.rs.
+        //
+        // `sd.look_sel*` is shared between lanes, but the pack reads it in
+        // stream order right after this lane's look-ahead router, so what it
+        // packs is always this lane's.
+        //
+        // Only where `pre_moe_route` reads it back (a pager with union paging),
+        // and only up to `rb_pack_max_rows()` rows.
+        let rb = if rb_pack_on() && b <= rb_pack_max_rows() && pager.is_some() && super::expert_pager::pager_union_prefill() {
+            use crate::readback_pack::{PackPlan, PackSeg};
+            self.set_current_cached(self.dgpu.device)?;
+            let _t = de.events.stage("dgpu.rb_pack", &de.compute)?;
+            let (nb, n_sel, na) = (b as usize, (b as usize) * cs_n_used, n_alt_layer as usize);
+            let mut plan = PackPlan::default();
+            let mut l = RbLayout { packed: true, ..Default::default() };
+            l.sel = Some(plan.push(PackSeg::words(&bd.d_selected, n_sel)?));
+            if look_next.is_some() {
+                l.look = Some(plan.push(PackSeg::words(&sd.look_sel, n_sel)?));
+            }
+            if look_next2.is_some() {
+                l.look2 = Some(plan.push(PackSeg::words(&sd.look_sel2, n_sel)?));
+            }
+            if na > 0 {
+                l.alts = Some(plan.push(PackSeg::words(&bd.d_alts, nb * na)?));
+                l.alt_w = Some(plan.push(PackSeg::words(&bd.d_alt_w, nb * na)?));
+            }
+            if sub3 {
+                l.orig = Some(plan.push(PackSeg::words(&bd.d_orig_sel, n_sel)?));
+                l.range = Some(plan.push(PackSeg::words(&bd.d_range, nb)?));
+            }
+            l.ew = Some(plan.push(PackSeg::words(&bd.d_ew, n_sel)?));
+            // `rb_u8` exists exactly when a box 2 is configured, and so does
+            // `rb_pack`'s room for `xq`.
+            if remote_split_on && bd.rb_u8.is_some() {
+                if let Some(xq_dev) = bd.remote_xq_lane.as_ref() {
+                    let xq_bytes = nb * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES;
+                    l.xq = Some(plan.push(PackSeg::bytes(xq_dev, xq_bytes)?));
+                }
+            }
+            de.rb_pack.launch(&de.compute, &mut bd.rb_pack, plan.segs())?;
+            l
+        } else {
+            RbLayout::default()
+        };
         sev.selected_ready.record(&de.compute)?;
 
         // M62: accumulate the chunk's picks into the prefill stats bank
@@ -6612,6 +6724,7 @@ impl HeterogeneousEngine {
             n_alt: n_alt_layer,
             sub3,
             prior_on,
+            rb,
             ..Default::default()
         })
     }
@@ -6631,7 +6744,7 @@ impl HeterogeneousEngine {
         rows: &RowLayout<'_>,
     ) -> eyre::Result<()> {
         if !c.advance(PreMoePhase::Chained, PreMoePhase::Routed)? { return Ok(()); }
-        let PreMoeCarry { layer, b, cs_n_used, cs_n_embd, remote_split_on, sparse_resid_layer, moe_group_bound, split_cap, lookahead_hints_ok, partner_follows, n_alt, sub3, prior_on, .. } = *c;
+        let PreMoeCarry { layer, b, cs_n_used, cs_n_embd, remote_split_on, sparse_resid_layer, moe_group_bound, split_cap, lookahead_hints_ok, partner_follows, n_alt, sub3, prior_on, rb, .. } = *c;
         let _ = (cs_n_embd, split_cap, moe_group_bound);
         let _ = &self.dgpu;
         let look_next: Option<&DgpuLayerWeights> = match &rows {
@@ -6705,81 +6818,132 @@ impl HeterogeneousEngine {
                 // this lane's router -- picks, look-ahead picks, alternatives, the
                 // prior's original picks and ranges, the weights, and box 2's `xq`
                 // (quantized on the chain right after the router, so also covered
-                // by `selected_ready`) -- in ONE batch of async copies on the
-                // lane's NON-blocking `rb_stream`, behind `selected_ready` only.
-                // These were blocking `hipMemcpy`s on the null stream, which waits
-                // for every blocking stream, i.e. for the OTHER lane's whole chain
-                // queued on `de.compute` (probe at 4 rows: dGPU still busy in 48
-                // of 80 lane-layers, 36.7 ms/step). The probe stays: it now counts
-                // work we no longer wait for.
+                // by `selected_ready`). Two paths:
+                //   - READBACK PACK (`c.rb.packed`, the default up to
+                //     `rb_pack_max_rows()`): already in `rb_pack`, written by one
+                //     kernel ahead of `selected_ready` -- `lh.sel_d2h` is then
+                //     only the host unpack.
+                //   - otherwise ONE batch of async copies on the lane's
+                //     NON-blocking `rb_stream`, behind `selected_ready` only.
+                // Both replaced blocking `hipMemcpy`s on the null stream, which
+                // waits for every blocking stream, i.e. for the OTHER lane's whole
+                // chain queued on `de.compute` (probe at 4 rows: dGPU still busy in
+                // 48 of 80 lane-layers, 36.7 ms/step). The probe stays: it now
+                // counts work we no longer wait for.
                 probe_stream_busy(&self.dgpu.compute, &LH_SEL_D2H_BUSY, &LH_SEL_D2H_IDLE);
                 let _t_d2h = LayerHostTimer::start(&LH_SEL_D2H);
                 let na = n_alt as usize;
                 let nb = b as usize;
                 let xq_bytes_rb = nb * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES;
                 let want_xq = remote_split_on && self.remote.is_some() && bd.remote_xq_lane.is_some() && bd.rb_u8.is_some();
-                // Staging offsets: i32 [sel | look | look2 | alts | orig],
-                // f32 [alt_w | range | ew].
-                let (o_look, o_look2, o_alts) = (n_sel, 2 * n_sel, 3 * n_sel);
-                let o_orig = o_alts + nb * na;
-                let (o_range, o_ew) = (nb * na, nb * na + nb);
                 // Look-ahead picks only where they are used: `sd.look_sel*` is
                 // SHARED, and in the lane drivers (which run with look-ahead hints
                 // off) the other lane's queued chain can overwrite it under an
-                // async copy.
+                // async copy. (The pack reads it in stream order, so its copy is
+                // always this lane's; the gate stays for the copy path.)
                 let (look_on, look_on2) = (lookahead_hints_ok && look_next.is_some(), lookahead_hints_ok && look_next2.is_some());
-                {
-                    let rs = &bd.rb_stream;
-                    // Queue the whole batch, then ALWAYS sync the stream, so an
-                    // error part-way never leaves a DMA into the staging in flight.
-                    let queued = (|| -> eyre::Result<()> {
-                        rs.wait_event(&sev.selected_ready)?;
-                        bd.d_selected.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, 0, rs)?;
-                        if look_on {
-                            sd.look_sel.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, o_look, rs)?;
-                        }
-                        if look_on2 {
-                            sd.look_sel2.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, o_look2, rs)?;
-                        }
-                        if na > 0 {
-                            bd.d_alts.slice_view(0, nb * na).copy_to_pinned_async(&mut bd.rb_i32, o_alts, rs)?;
-                            bd.d_alt_w.slice_view(0, nb * na).copy_to_pinned_async(&mut bd.rb_f32, 0, rs)?;
-                        }
-                        if sub3 {
-                            bd.d_orig_sel.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, o_orig, rs)?;
-                            bd.d_range.slice_view(0, nb).copy_to_pinned_async(&mut bd.rb_f32, o_range, rs)?;
-                        }
-                        bd.d_ew.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_f32, o_ew, rs)?;
-                        if want_xq {
-                            if let (Some(xq_dev), Some(pin)) = (bd.remote_xq_lane.as_ref(), bd.rb_u8.as_mut()) {
-                                xq_dev.slice_view(0, xq_bytes_rb).copy_to_pinned_async(pin, 0, rs)?;
-                            }
-                        }
-                        Ok(())
-                    })();
-                    let synced = rs.synchronize();
-                    queued?;
-                    synced?;
-                }
-                let (ri, rf) = (bd.rb_i32.as_slice(), bd.rb_f32.as_slice());
-                let mut sel_host: Vec<i32> = ri[..n_sel].to_vec();
-                let look_host: Vec<i32> = if look_on { ri[o_look..o_look + n_sel].to_vec() } else { Vec::new() };
-                let look_host2: Vec<i32> = if look_on2 { ri[o_look2..o_look2 + n_sel].to_vec() } else { Vec::new() };
-                // Ranks 7..6+n_alt per row.
-                let (alts_host, alt_w_host): (Vec<i32>, Vec<f32>) = if na > 0 {
-                    (ri[o_alts..o_alts + nb * na].to_vec(), rf[..nb * na].to_vec())
+                #[allow(clippy::type_complexity)]
+                let (mut sel_host, look_host, look_host2, alts_host, alt_w_host, orig_host, range_host, ew_read, mut xq_read): (
+                    Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>, Option<Vec<u8>>,
+                ) = if rb.packed {
+                    // READBACK PACK: the words landed in `rb_pack` ahead of
+                    // `selected_ready`, which the wait above covered. Each
+                    // segment is checked against the length read here.
+                    let w = bd.rb_pack.as_slice();
+                    let i32s = |v: &[u32]| -> Vec<i32> { v.iter().map(|&x| x as i32).collect() };
+                    let f32s = |v: &[u32]| -> Vec<f32> { v.iter().map(|&x| f32::from_bits(x)).collect() };
+                    let sel = i32s(RbLayout::seg(w, rb.sel, "sel", n_sel)?);
+                    let look = if look_on { i32s(RbLayout::seg(w, rb.look, "look", n_sel)?) } else { Vec::new() };
+                    let look2 = if look_on2 { i32s(RbLayout::seg(w, rb.look2, "look2", n_sel)?) } else { Vec::new() };
+                    // Ranks 7..6+n_alt per row.
+                    let (alts, alt_w) = if na > 0 {
+                        (i32s(RbLayout::seg(w, rb.alts, "alts", nb * na)?), f32s(RbLayout::seg(w, rb.alt_w, "alt_w", nb * na)?))
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                    let (orig, range) = if sub3 {
+                        (i32s(RbLayout::seg(w, rb.orig, "orig", n_sel)?), f32s(RbLayout::seg(w, rb.range, "range", nb)?))
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                    let ew = f32s(RbLayout::seg(w, rb.ew, "ew", n_sel)?);
+                    // Box 2's `xq`, as bytes in one memcpy. Packed whenever it is
+                    // wanted (same predicate at the launch); a miss would send the
+                    // submit to a blocking null-stream copy, so it is an error.
+                    let xq: Option<Vec<u8>> = if want_xq {
+                        let ws = RbLayout::seg(w, rb.xq, "xq", xq_bytes_rb / 4)?;
+                        // SAFETY: `ws` is a live, initialized `&[u32]`; viewing
+                        // its bytes as `u8` (alignment 1) is always valid.
+                        Some(unsafe { std::slice::from_raw_parts(ws.as_ptr().cast::<u8>(), ws.len() * 4) }.to_vec())
+                    } else {
+                        None
+                    };
+                    (sel, look, look2, alts, alt_w, orig, range, ew, xq)
                 } else {
-                    (Vec::new(), Vec::new())
+                    // Staging offsets: i32 [sel | look | look2 | alts | orig],
+                    // f32 [alt_w | range | ew].
+                    let (o_look, o_look2, o_alts) = (n_sel, 2 * n_sel, 3 * n_sel);
+                    let o_orig = o_alts + nb * na;
+                    let (o_range, o_ew) = (nb * na, nb * na + nb);
+                    {
+                        let rs = &bd.rb_stream;
+                        // Queue the whole batch, then ALWAYS sync the stream, so an
+                        // error part-way never leaves a DMA into the staging in flight.
+                        let queued = (|| -> eyre::Result<()> {
+                            rs.wait_event(&sev.selected_ready)?;
+                            bd.d_selected.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, 0, rs)?;
+                            if look_on {
+                                sd.look_sel.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, o_look, rs)?;
+                            }
+                            if look_on2 {
+                                sd.look_sel2.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, o_look2, rs)?;
+                            }
+                            if na > 0 {
+                                bd.d_alts.slice_view(0, nb * na).copy_to_pinned_async(&mut bd.rb_i32, o_alts, rs)?;
+                                bd.d_alt_w.slice_view(0, nb * na).copy_to_pinned_async(&mut bd.rb_f32, 0, rs)?;
+                            }
+                            if sub3 {
+                                bd.d_orig_sel.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, o_orig, rs)?;
+                                bd.d_range.slice_view(0, nb).copy_to_pinned_async(&mut bd.rb_f32, o_range, rs)?;
+                            }
+                            bd.d_ew.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_f32, o_ew, rs)?;
+                            if want_xq {
+                                if let (Some(xq_dev), Some(pin)) = (bd.remote_xq_lane.as_ref(), bd.rb_u8.as_mut()) {
+                                    xq_dev.slice_view(0, xq_bytes_rb).copy_to_pinned_async(pin, 0, rs)?;
+                                }
+                            }
+                            Ok(())
+                        })();
+                        let synced = rs.synchronize();
+                        queued?;
+                        synced?;
+                    }
+                    let (ri, rf) = (bd.rb_i32.as_slice(), bd.rb_f32.as_slice());
+                    let sel: Vec<i32> = ri[..n_sel].to_vec();
+                    let look: Vec<i32> = if look_on { ri[o_look..o_look + n_sel].to_vec() } else { Vec::new() };
+                    let look2: Vec<i32> = if look_on2 { ri[o_look2..o_look2 + n_sel].to_vec() } else { Vec::new() };
+                    // Ranks 7..6+n_alt per row.
+                    let (alts, alt_w): (Vec<i32>, Vec<f32>) = if na > 0 {
+                        (ri[o_alts..o_alts + nb * na].to_vec(), rf[..nb * na].to_vec())
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                    let (orig, range): (Vec<i32>, Vec<f32>) = if sub3 {
+                        (ri[o_orig..o_orig + n_sel].to_vec(), rf[o_range..o_range + nb].to_vec())
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                    let ew: Vec<f32> = rf[o_ew..o_ew + n_sel].to_vec();
+                    let xq: Option<Vec<u8>> =
+                        if want_xq { bd.rb_u8.as_ref().map(|p| p.as_slice()[..xq_bytes_rb].to_vec()) } else { None };
+                    (sel, look, look2, alts, alt_w, orig, range, ew, xq)
                 };
-                // Cache-prior (`V41_SUB=3`): the picks without the prior, and the
-                // score ranges that feed the layer's running Delta.
-                let orig_host: Vec<i32> = if sub3 { ri[o_orig..o_orig + n_sel].to_vec() } else { Vec::new() };
+                // Cache-prior (`V41_SUB=3`): the picks without the prior
+                // (`orig_host`), and the score ranges that feed the layer's
+                // running Delta.
                 if sub3 {
-                    super::b2_mirror::observe_range(layer, &rf[o_range..o_range + nb]);
+                    super::b2_mirror::observe_range(layer, &range_host);
                 }
-                let ew_read: Vec<f32> = rf[o_ew..o_ew + n_sel].to_vec();
-                let mut xq_read: Option<Vec<u8>> =
-                    if want_xq { bd.rb_u8.as_ref().map(|p| p.as_slice()[..xq_bytes_rb].to_vec()) } else { None };
                 drop(_t_d2h);
                 if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} A after readback"); }
                 // BOX-2 MISS SUBSTITUTION (`V41_SUB`, het::b2_mirror,

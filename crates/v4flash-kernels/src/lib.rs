@@ -85,6 +85,7 @@ pub mod q8_0;
 pub mod q8_k;
 pub mod mhc_pre_fused;
 pub mod mhc_arena;
+pub mod readback_pack;
 pub mod rms_norm;
 pub mod rope;
 pub mod sampler;
@@ -129,6 +130,7 @@ pub use q8_0::{Q8_0GroupedMatvec, Q8_0Matvec, Q8_0MatvecWmma};
 pub use q8_k::{Q8KQuantize, BLOCK_Q8_K_BYTES, QK_K};
 pub use mhc_pre_fused::MhcPreFused;
 pub use mhc_arena::MhcArena;
+pub use readback_pack::ReadbackPack;
 pub use rms_norm::{RmsNorm, RmsNormNoWeight, RmsNormNoWeightMultiWG};
 pub use rope::{RopeParams, RopeTail};
 pub use sampler::{

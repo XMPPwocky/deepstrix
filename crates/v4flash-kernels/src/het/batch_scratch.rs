@@ -323,13 +323,14 @@ pub struct BatchDgpuScratch {
     pub d_orig_sel: DeviceBuffer<i32>,
     /// `[B]` each row's selection-score range (max - min).
     pub d_range: DeviceBuffer<f32>,
-    /// ROUTER READBACK (2026-09-25): everything the host reads after this
-    /// lane's router -- picks, look-ahead picks, alternatives, the prior's
-    /// original picks, ranges, weights, box 2's `xq` -- goes as ONE batch of
-    /// async copies on this NON-blocking stream, behind this lane's
-    /// `selected_ready` only. A blocking `hipMemcpy` runs on the null stream,
-    /// which waits for every blocking stream: for the other lane's whole chain
-    /// queued on `de.compute`.
+    /// ROUTER READBACK (2026-09-25), the COPY path (above
+    /// `V41_RB_PACK_MAX_ROWS` rows, or with `V41_RB_PACK=0`; else see
+    /// `rb_pack`): everything the host reads after this lane's router -- picks,
+    /// look-ahead picks, alternatives, the prior's original picks, ranges,
+    /// weights, box 2's `xq` -- goes as ONE batch of async copies on this
+    /// NON-blocking stream, behind this lane's `selected_ready` only. A
+    /// blocking `hipMemcpy` runs on the null stream, which waits for every
+    /// blocking stream: for the other lane's whole chain queued on `de.compute`.
     pub rb_stream: v4flash_hip::Stream,
     /// Pinned staging for the batch: i32 `[sel | look | look2 | alts | orig]`,
     /// f32 `[alt_w | range | ew]` (offsets per call, from the call's `b`), u8
@@ -337,6 +338,15 @@ pub struct BatchDgpuScratch {
     pub rb_i32: v4flash_hip::PinnedBuffer<i32>,
     pub rb_f32: v4flash_hip::PinnedBuffer<f32>,
     pub rb_u8: Option<v4flash_hip::PinnedBuffer<u8>>,
+    /// READBACK PACK staging (`V41_RB_PACK`, default on): the same outputs as
+    /// 32-bit words, written by the `ReadbackPack` kernel on the compute
+    /// stream ahead of `selected_ready`; layout per lane-layer in the carry.
+    /// Room for `xq` only with a box 2 (as `rb_u8`), and for at most
+    /// `V41_RB_PACK_MAX_ROWS` rows (the pack's own limit; `launch` checks).
+    /// Host visibility after the event wait relies on this being COHERENT
+    /// (`hipHostMalloc` flags 0, snooped): with `HIP_HOST_MALLOC_NON_COHERENT`
+    /// the GPU's writes could leave stale lines in the CPU cache.
+    pub rb_pack: v4flash_hip::PinnedBuffer<u32>,
 
     // ---- Shared expert output ----
     /// `[B, N_EMBD]` — P10 output, read by P12 `vec_add`.
@@ -1234,6 +1244,17 @@ impl BatchDgpuScratch {
                 )?)
             } else {
                 None
+            },
+            rb_pack: {
+                let rp = b.min(super::forward_prefill::rb_pack_max_rows() as usize);
+                v4flash_hip::PinnedBuffer::new(
+                    rp * (5 * N_EXPERT_USED + 2 * crate::router_topk::ROUTER_MAX_ALT as usize + 1)
+                        + if std::env::var("V41_REMOTE_ADDR").is_ok() {
+                            rp * (crate::config::BLOCKS_Q8K_GATE_IN as usize) * crate::q8_k::BLOCK_Q8_K_BYTES / 4
+                        } else {
+                            0
+                        },
+                )?
             },
             ffn_shared: mk_f32(N_EMBD as usize)?,
             ffn_moe_recv: mk_f32(N_EMBD as usize)?,
