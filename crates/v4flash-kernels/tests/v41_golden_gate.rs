@@ -48,10 +48,11 @@
 //! HIP_VISIBLE_DEVICES=0,1 CARGO_TARGET_DIR=target-v41 nix develop -c \
 //!   cargo test -p v4flash-kernels --release --test v41_golden_gate -- --ignored --nocapture
 //! ```
-//! Env: GOLDEN_CASE (fixture dir, default ~/.cache/deepstrix/goldens/agentic),
+//! Env: GOLDEN_CASE (comma list of fixture names under ~/.cache/deepstrix/goldens or
+//! paths; default short,agentic; all run on one engine, one weight load),
 //! GOLDEN_PATHS (serial,arena), GOLDEN_ROUTING (free,pinned), GOLDEN_DECODE_FROM
 //! (first decoded position; default the first span's `<think>`, 0 without spans),
-//! GOLDEN_MAX_STEPS, GOLDEN_REPORT (JSON path),
+//! GOLDEN_MAX_STEPS, GOLDEN_REPORT_DIR (default target/; writes golden_gate_<case>.json),
 //! V41_HF_DIR, V41_ENGRAM_DIR, V41_PAGER_POOL_GB (default 40 here).
 
 use std::path::{Path, PathBuf};
@@ -404,42 +405,61 @@ fn v41_golden_gate() -> eyre::Result<()> {
         }
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    let case = PathBuf::from(std::env::var("GOLDEN_CASE").unwrap_or_else(|_| format!("{home}/.cache/deepstrix/goldens/agentic")));
+    let goldens = PathBuf::from(format!("{home}/.cache/deepstrix/goldens"));
     let dir = std::env::var("V41_HF_DIR").unwrap_or_else(|_| HF_DIR_DEFAULT.to_string());
     let engram_dir = std::env::var("V41_ENGRAM_DIR").unwrap_or_else(|_| format!("{home}/.cache/deepstrix/v41/engram"));
-
-    let fx = Fixture::load(&case)?;
-    let t_n = fx.tokens.len();
-    // With spans, the prompt is everything before the first `<think>` and the
-    // `<think>` itself is the first decode step, as production does.
-    let decode_from: usize = match std::env::var("GOLDEN_DECODE_FROM") {
-        Ok(v) => v.parse().map_err(|e| eyre!("GOLDEN_DECODE_FROM={v}: {e}"))?,
-        Err(_) => fx.spans.first().map_or(0, |s| s.0),
-    };
-    if decode_from + 2 > t_n {
-        return Err(eyre!("GOLDEN_DECODE_FROM={decode_from} leaves nothing to decode (T={t_n})"));
-    }
-    let prompt = &fx.tokens[..decode_from];
     let list = |k: &str, d: &str| -> Vec<String> {
-        std::env::var(k).unwrap_or_else(|_| d.into()).split(',').map(|s| s.trim().to_string()).collect()
+        std::env::var(k).unwrap_or_else(|_| d.into()).split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
     };
-    let paths = list("GOLDEN_PATHS", if prompt.is_empty() { "serial" } else { "serial,arena" });
-    if prompt.is_empty() && paths.iter().any(|p| p != "serial") {
-        return Err(eyre!("GOLDEN_DECODE_FROM=0 has no prompt to prefill: serial path only"));
-    }
     let routings = list("GOLDEN_ROUTING", "free,pinned");
     if let Some(r) = routings.iter().find(|r| !matches!(r.as_str(), "free" | "pinned")) {
         return Err(eyre!("unknown GOLDEN_ROUTING entry {r}"));
     }
-    let runs: Vec<(String, bool)> =
-        paths.iter().flat_map(|p| routings.iter().map(move |r| (p.clone(), r == "pinned"))).collect();
     let max_steps = std::env::var("GOLDEN_MAX_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
-    let last_pos = (t_n - 2).min(decode_from + max_steps.saturating_sub(1));
-    eprintln!(
-        "golden gate: case {} T={t_n}, prompt {} tokens, decode positions {decode_from}..={last_pos}, paths {paths:?}, \
-         routing {routings:?}, residuals {}",
-        case.display(), prompt.len(), fx.residuals.is_some()
-    );
+
+    // Every case is loaded and planned before the model is, so a bad fixture or
+    // setting fails in seconds, not after the weight load; then ONE engine runs
+    // them all.
+    struct Case {
+        name: String,
+        fx: Fixture,
+        decode_from: usize,
+        last_pos: usize,
+        runs: Vec<(String, bool)>,
+    }
+    let mut cases = Vec::new();
+    for c in list("GOLDEN_CASE", "short,agentic") {
+        let case_dir = if c.contains('/') { PathBuf::from(&c) } else { goldens.join(&c) };
+        let name = case_dir.file_name().and_then(|s| s.to_str()).unwrap_or("case").to_string();
+        let fx = Fixture::load(&case_dir)?;
+        let t_n = fx.tokens.len();
+        // With spans, the prompt is everything before the first `<think>` and the
+        // `<think>` itself is the first decode step, as production does.
+        let decode_from: usize = match std::env::var("GOLDEN_DECODE_FROM") {
+            Ok(v) => v.parse().map_err(|e| eyre!("GOLDEN_DECODE_FROM={v}: {e}"))?,
+            Err(_) => fx.spans.first().map_or(0, |s| s.0),
+        };
+        if decode_from + 2 > t_n {
+            return Err(eyre!("[{name}] GOLDEN_DECODE_FROM={decode_from} leaves nothing to decode (T={t_n})"));
+        }
+        let paths = list("GOLDEN_PATHS", if decode_from == 0 { "serial" } else { "serial,arena" });
+        if let Some(p) = paths.iter().find(|p| !matches!(p.as_str(), "serial" | "arena")) {
+            return Err(eyre!("unknown GOLDEN_PATHS entry {p}"));
+        }
+        if decode_from == 0 && paths.iter().any(|p| p != "serial") {
+            return Err(eyre!("[{name}] decoding from position 0 leaves no prompt to prefill: serial path only"));
+        }
+        let runs: Vec<(String, bool)> =
+            paths.iter().flat_map(|p| routings.iter().map(move |r| (p.clone(), r == "pinned"))).collect();
+        let last_pos = (t_n - 2).min(decode_from + max_steps.saturating_sub(1));
+        eprintln!(
+            "golden gate: case {name} T={t_n}, prompt {decode_from} tokens, decode positions {decode_from}..={last_pos}, \
+             paths {paths:?}, routing {routings:?}, residuals {}",
+            fx.residuals.is_some()
+        );
+        cases.push(Case { name, fx, decode_from, last_pos, runs });
+    }
+    let t_max = cases.iter().map(|c| c.fx.tokens.len()).max().ok_or_else(|| eyre!("GOLDEN_CASE names no case"))?;
 
     let dgpu = pick("gfx1201")?;
     let igpu = pick("gfx1151")?;
@@ -459,7 +479,7 @@ fn v41_golden_gate() -> eyre::Result<()> {
     let engine = HeterogeneousEngine::new(dgpu, &darch, igpu, &iarch, ExecMode::HetParallel)?;
     let mut ds = DgpuScratch::alloc(dgpu)?;
     let mut is = IgpuScratch::alloc(igpu)?;
-    let n_kv_max: u32 = ((t_n + 64).next_power_of_two().max(1024)) as u32;
+    let n_kv_max: u32 = ((t_max + 64).next_power_of_two().max(1024)) as u32;
     let lane_rows = v4flash_kernels::het::batch_scratch::B_MAX.div_ceil(2);
     let mut bd_a = BatchDgpuScratch::alloc_rows(dgpu, lane_rows)?;
     let mut bi_a = BatchIgpuScratch::alloc_rows(igpu, lane_rows)?;
@@ -475,137 +495,139 @@ fn v41_golden_gate() -> eyre::Result<()> {
         tables.push(EngramTable::open(pg.raw(), l as usize)?);
     }
     let engram = Engram { hasher, tables };
-    let hcs_prompt: Vec<Vec<f32>> = prompt.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
-    let rows_prompt = if prompt.is_empty() { Vec::new() } else { engram.rows_for_prompt(pg.raw(), prompt)? };
+    let report_dir = std::env::var("GOLDEN_REPORT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"));
+    let mut failures = Vec::new();
 
-    let mut report = serde_json::Map::new();
-    report.insert("case".into(), case.display().to_string().into());
-    report.insert("tokens".into(), t_n.into());
-    report.insert("prompt_tokens".into(), prompt.len().into());
-    report.insert("remote".into(), std::env::var("V41_REMOTE_ADDR").is_ok().into());
+    for c in &cases {
+        let (fx, t_n, decode_from, last_pos) = (&c.fx, c.fx.tokens.len(), c.decode_from, c.last_pos);
+        let prompt = &fx.tokens[..decode_from];
+        let hcs_prompt: Vec<Vec<f32>> = prompt.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
+        let rows_prompt = if prompt.is_empty() { Vec::new() } else { engram.rows_for_prompt(pg.raw(), prompt)? };
 
-    for (path, pinned) in &runs {
-        let name = if *pinned { format!("{path}+pin") } else { path.clone() };
-        pin_set(if *pinned { Some(PinTable::new(N_LAYER as usize, t_n, fx.topk.clone())?) } else { None });
-        let t0 = std::time::Instant::now();
-        let mut st = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
-        let mut steps = StepStats::default();
-        let mut flips = FlipStats::new();
-        // ---- prefill: last-position logits predict prompt.len()
-        let mut prefill_stats = StepStats::default();
-        if !prompt.is_empty() {
-            let prefill_logits = match path.as_str() {
-                "serial" => engine.forward_prefill_pipelined(
-                    &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights,
-                    &hcs_prompt, prompt, 0, true, None, None, None, None, Some(&mut pg), Some(&rows_prompt),
-                )?,
-                "arena" => {
+        let mut report = serde_json::Map::new();
+        report.insert("case".into(), c.name.clone().into());
+        report.insert("tokens".into(), t_n.into());
+        report.insert("prompt_tokens".into(), prompt.len().into());
+        report.insert("remote".into(), std::env::var("V41_REMOTE_ADDR").is_ok().into());
+
+        for (path, pinned) in &c.runs {
+            let name = if *pinned { format!("{}/{path}+pin", c.name) } else { format!("{}/{path}", c.name) };
+            pin_set(if *pinned { Some(PinTable::new(N_LAYER as usize, t_n, fx.topk.clone())?) } else { None });
+            let t0 = std::time::Instant::now();
+            let mut st = HetModelState::alloc(dgpu, igpu, n_kv_max)?;
+            let mut steps = StepStats::default();
+            let mut flips = FlipStats::new();
+            // ---- prefill: last-position logits predict prompt.len()
+            let mut prefill_stats = StepStats::default();
+            if !prompt.is_empty() {
+                let prefill_logits = if path == "serial" {
+                    engine.forward_prefill_pipelined(
+                        &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights,
+                        &hcs_prompt, prompt, 0, true, None, None, None, None, Some(&mut pg), Some(&rows_prompt),
+                    )?
+                } else {
                     let mut job = PrefillJob::new(prompt.to_vec(), hcs_prompt.clone(), Some(rows_prompt.clone()), None, 0, 1024)?;
                     while !job.chunks_done() {
                         engine.prefill_job_chunk(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut pg))?;
                     }
                     engine.prefill_job_finish(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut pg))?
-                }
-                other => return Err(eyre!("unknown GOLDEN_PATHS entry {other}")),
-            };
-            st.restore_compressor_lending();
-            engine.dgpu.compute.synchronize()?;
-            prefill_stats.push(&fx, prompt.len() - 1, &prefill_logits)?;
-        }
-        flips.pin_overrides.0 = pin_overrides_take();
-        let t_prefill = t0.elapsed().as_secs_f64();
-
-        // ---- teacher-forced decode over the rest of the transcript
-        let mut arena = None;
-        let mut slot = 0u32;
-        let mut dev = None;
-        if path == "arena" {
-            let mut a = KvArena::alloc(dgpu, 1, n_kv_max)?;
-            slot = a.admit_from_state(&st, n_kv_max, prompt.len() as u32, &engine.dgpu.compute)?;
-            engine.dgpu.compute.synchronize()?;
-            arena = Some(a);
-            dev = Some(RowTablesDev::alloc(dgpu, 1, KV_SOURCE_LAYERS.len())?);
-        }
-        let nv = N_VOCAB as usize;
-        let mut resid = ResidualStats::new();
-        let tap_resid = path == "serial" && fx.residuals.is_some();
-        residual_sink_enable(tap_resid);
-        let _ = residual_sink_take();
-        pick_sink_enable(true);
-        let _ = pick_sink_take();
-        for pos in decode_from..=last_pos {
-            let tok = fx.tokens[pos];
-            pg.drain_prefetched()?;
-            let rows = engram.rows_at(pg.raw(), &fx.tokens, pos)?;
-            let hc = embed(tok)?;
-            if let Some(e) = fx.ref_embed(pos) {
-                resid.embed.push(rel_l2(&hc, e));
-            }
-            let logits = if path == "serial" {
-                engine.forward_token_paged(&mut ds, &mut is, &mut st, &weights, &hc, pos as u32, tok, &mut pg, Some(&rows))?;
+                };
+                st.restore_compressor_lending();
                 engine.dgpu.compute.synchronize()?;
-                let mut l = vec![0f32; nv];
-                ds.logits.slice_view(0, nv).copy_to_host(&mut l)?;
-                l
-            } else {
-                engine.forward_step_arena(
-                    &mut bd_a, &mut bi_a, &mut sd, &mut si, arena.as_mut().unwrap(), dev.as_mut().unwrap(), &[slot], &weights,
-                    &[hc], &[tok], &mut LazyEngramRows::ready(Some(rows)), Some(&mut pg),
-                )?;
-                engine.head_rows(&mut ds, &bd_a, 1, &weights)?
-            };
-            steps.push(&fx, pos, &logits)?;
-            flips.observe(&fx, pos, &pick_sink_take())?;
+                prefill_stats.push(fx, prompt.len() - 1, &prefill_logits)?;
+            }
+            flips.pin_overrides.0 = pin_overrides_take();
+            let t_prefill = t0.elapsed().as_secs_f64();
+
+            // ---- teacher-forced decode over the rest of the transcript
+            let mut arena = None;
+            let mut slot = 0u32;
+            let mut dev = None;
+            if path == "arena" {
+                let mut a = KvArena::alloc(dgpu, 1, n_kv_max)?;
+                slot = a.admit_from_state(&st, n_kv_max, prompt.len() as u32, &engine.dgpu.compute)?;
+                engine.dgpu.compute.synchronize()?;
+                arena = Some(a);
+                dev = Some(RowTablesDev::alloc(dgpu, 1, KV_SOURCE_LAYERS.len())?);
+            }
+            let nv = N_VOCAB as usize;
+            let mut resid = ResidualStats::new();
+            let tap_resid = path == "serial" && fx.residuals.is_some();
+            residual_sink_enable(tap_resid);
+            let _ = residual_sink_take();
+            pick_sink_enable(true);
+            let _ = pick_sink_take();
+            for pos in decode_from..=last_pos {
+                let tok = fx.tokens[pos];
+                pg.drain_prefetched()?;
+                let rows = engram.rows_at(pg.raw(), &fx.tokens, pos)?;
+                let hc = embed(tok)?;
+                if let Some(e) = fx.ref_embed(pos) {
+                    resid.embed.push(rel_l2(&hc, e));
+                }
+                let logits = if path == "serial" {
+                    engine.forward_token_paged(&mut ds, &mut is, &mut st, &weights, &hc, pos as u32, tok, &mut pg, Some(&rows))?;
+                    engine.dgpu.compute.synchronize()?;
+                    let mut l = vec![0f32; nv];
+                    ds.logits.slice_view(0, nv).copy_to_host(&mut l)?;
+                    l
+                } else {
+                    engine.forward_step_arena(
+                        &mut bd_a, &mut bi_a, &mut sd, &mut si, arena.as_mut().unwrap(), dev.as_mut().unwrap(), &[slot], &weights,
+                        &[hc], &[tok], &mut LazyEngramRows::ready(Some(rows)), Some(&mut pg),
+                    )?;
+                    engine.head_rows(&mut ds, &bd_a, 1, &weights)?
+                };
+                steps.push(fx, pos, &logits)?;
+                flips.observe(fx, pos, &pick_sink_take())?;
+                if tap_resid {
+                    resid.observe(fx, pos, &residual_sink_take())?;
+                }
+                if (pos - decode_from) % 100 == 0 {
+                    eprintln!("  [{name}] pos {pos}: KL {:.5} top1 {}", steps.kl.last().unwrap(), steps.top1.last().unwrap());
+                }
+            }
+            pick_sink_enable(false);
+            residual_sink_enable(false);
+            flips.pin_overrides.1 = pin_overrides_take();
+            pin_set(None);
+            if let Some(a) = arena.as_mut() {
+                a.release(slot)?;
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            let mut r = serde_json::json!({
+                "prefill_last": prefill_stats.summary(false),
+                "decode_generated": steps.summary(true),
+                "decode_all": steps.summary(false),
+                "routing": flips.summary(),
+                "seconds": {"prefill": t_prefill, "total": secs},
+            });
             if tap_resid {
-                resid.observe(&fx, pos, &residual_sink_take())?;
+                r["residual"] = resid.summary();
             }
-            if (pos - decode_from) % 100 == 0 {
-                eprintln!("  [{name}] pos {pos}: KL {:.5} top1 {}", steps.kl.last().unwrap(), steps.top1.last().unwrap());
+            eprintln!("[{name}] {}", serde_json::to_string_pretty(&r)?);
+            // Hard failures only for now; thresholds tighten once a baseline exists.
+            let d = &r["decode_all"];
+            let (mean, top1) = (d["kl_mean"].as_f64().unwrap_or(f64::NAN), d["top1_agree"].as_f64().unwrap_or(0.0));
+            if !(mean < 0.5) || top1 < 0.8 {
+                failures.push(format!("[{name}] gross divergence from the reference: KL mean {mean:.4}, top-1 {top1:.3}"));
             }
+            let differing = r["routing"]["differing"].as_u64().unwrap_or(u64::MAX);
+            if *pinned && differing != 0 {
+                failures.push(format!("[{name}] the pin did not hold: {differing} token-layers differ from the reference picks"));
+            }
+            report.insert(if *pinned { format!("{path}+pin") } else { path.clone() }, r);
         }
-        pick_sink_enable(false);
-        residual_sink_enable(false);
-        flips.pin_overrides.1 = pin_overrides_take();
-        pin_set(None);
-        if let Some(a) = arena.as_mut() {
-            a.release(slot)?;
-        }
-        let secs = t0.elapsed().as_secs_f64();
-        let mut r = serde_json::json!({
-            "prefill_last": prefill_stats.summary(false),
-            "decode_generated": steps.summary(true),
-            "decode_all": steps.summary(false),
-            "routing": flips.summary(),
-            "seconds": {"prefill": t_prefill, "total": secs},
-        });
-        if tap_resid {
-            r["residual"] = resid.summary();
-        }
-        eprintln!("[{name}] {}", serde_json::to_string_pretty(&r)?);
-        report.insert(name, r);
+
+        let out = report_dir.join(format!("golden_gate_{}.json", c.name));
+        std::fs::write(&out, serde_json::to_string_pretty(&serde_json::Value::Object(report))?)?;
+        eprintln!("report: {}", out.display());
     }
-
-    let out = std::env::var("GOLDEN_REPORT").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target").join(format!(
-            "golden_gate_{}.json",
-            case.file_name().and_then(|s| s.to_str()).unwrap_or("case")
-        ))
-    });
-    std::fs::write(&out, serde_json::to_string_pretty(&serde_json::Value::Object(report.clone()))?)?;
-    eprintln!("report: {}", out.display());
     engine.shutdown()?;
-
-    // Hard failures only for now; thresholds tighten once a baseline exists.
-    for (name, r) in &report {
-        let Some(d) = r.get("decode_all") else { continue };
-        let (mean, top1) = (d["kl_mean"].as_f64().unwrap_or(f64::NAN), d["top1_agree"].as_f64().unwrap_or(0.0));
-        if !(mean < 0.5) || top1 < 0.8 {
-            return Err(eyre!("[{name}] gross divergence from the reference: KL mean {mean:.4}, top-1 {top1:.3}"));
-        }
-        let differing = r["routing"]["differing"].as_u64().unwrap_or(u64::MAX);
-        if name.ends_with("+pin") && differing != 0 {
-            return Err(eyre!("[{name}] the pin did not hold: {differing} token-layers differ from the reference picks"));
-        }
+    if !failures.is_empty() {
+        return Err(eyre!("{}", failures.join("\n")));
     }
     Ok(())
 }
