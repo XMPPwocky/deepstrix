@@ -191,26 +191,33 @@ fn set_opt_i32(s: &TcpStream, level: i32, name: i32, v: i32) -> bool {
 /// a spinning daemon reader slowed its own large sends (1.3 MB: 1.9 -> 6.6 ms,
 /// LINK_IDLE_LATENCY.md). Calls `setsockopt` only when the value changes; the
 /// new window applies from the reader's next `recv`.
-pub fn b2_adapt_busy_poll(s: &TcpStream, reply_bytes: usize, base_us: u32) {
+pub fn b2_adapt_busy_poll(s: &TcpStream, decode_phase: bool, base_us: u32) {
     static DECODE_US: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
         std::env::var("V41_B2_DECODE_BUSY_POLL_US").ok().and_then(|v| v.parse().ok()).unwrap_or(5000)
     });
     if *DECODE_US == 0 || base_us == 0 {
         return;
     }
-    const ONE_SEGMENT: usize = 64 * 1024;
-    let want = if reply_bytes <= ONE_SEGMENT { *DECODE_US } else { base_us };
-    if B2_SPIN_CUR.swap(want, std::sync::atomic::Ordering::Relaxed) != want {
-        let _ = set_opt_i32(s, SOL_SOCKET, SO_BUSY_POLL, want as i32);
+    let want = if decode_phase { *DECODE_US } else { base_us };
+    if B2_SPIN_CUR.load(std::sync::atomic::Ordering::Relaxed) == want {
+        return;
+    }
+    if set_opt_i32(s, SOL_SOCKET, SO_BUSY_POLL, want as i32) {
+        B2_SPIN_CUR.store(want, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("expertd: SO_BUSY_POLL={want} refused (raise net.core.busy_read, scripts/link_latency_step.sh 4s); reader window not adapted");
+        }
     }
 }
 
-/// The window `b2_adapt_busy_poll` last set. Reset by `apply_socket_options`,
-/// which puts a (new) connection's socket back at the base window.
+/// The window `b2_adapt_busy_poll` last set on the connection being served.
+/// `serve_connection` resets it for each new connection (whose socket starts
+/// at the base window).
 static B2_SPIN_CUR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 
 pub fn apply_socket_options(s: &TcpStream, o: &SocketOptions) -> eyre::Result<()> {
-    B2_SPIN_CUR.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
     s.set_nodelay(true)?;
     if o.sndbuf > 0 && !set_opt_i32(s, SOL_SOCKET, SO_SNDBUF, o.sndbuf as i32) {
         eprintln!("remote_experts: SO_SNDBUF={} refused (net.core.wmem_max?)", o.sndbuf);
@@ -389,6 +396,12 @@ pub mod proto {
     /// flag but not that bit, and appends nothing, so either side can be
     /// deployed first.
     pub const REQ_FLAG_RESID: u32 = 64;
+    /// Request flag: the hub is in its DECODE phase (small, frequent
+    /// requests, `HetEngine::remote_set_phase_busy_poll(true)`). The daemon
+    /// spins its reader long between such requests (`b2_adapt_busy_poll`) and
+    /// uses its base window otherwise. An older hub never sets it, so the
+    /// daemon keeps the base window.
+    pub const REQ_FLAG_DECODE: u32 = 128;
     /// RESPONSE flag: the residency map is appended (see `REQ_FLAG_RESID`).
     /// Bit 15: requests use the low bits and the miss mask the high 16.
     pub const RESP_FLAG_RESID: u32 = 1 << 15;
@@ -1411,11 +1424,19 @@ impl PfQueue {
         changed
     }
 
-    /// Is a certain job running or waiting? A speculative reader that has not
-    /// started its read yet keeps yielding while this holds.
-    fn certain_active(&self) -> bool {
+    /// Should a background read of `(layer, e)` hold off? Yes while an urgent
+    /// read is actually RUNNING: a certain job on a reader, or a speculative
+    /// one promoted in flight (`urgent`, which `ensure` may be blocked on) --
+    /// unless `(layer, e)` is itself urgent. A certain job that is merely
+    /// QUEUED does not count: it gets a reserved reader within microseconds,
+    /// and with no reader free, pausing the readers it is waiting for would
+    /// only idle the drives. One lock per check.
+    fn background_should_wait(&self, layer: u32, e: u32) -> bool {
         let g = self.inner.lock().unwrap();
-        g.running_certain > 0 || g.jobs.front().is_some_and(|j| j.certain)
+        if g.urgent.contains(&(layer, e)) {
+            return false;
+        }
+        g.running_certain > 0 || !g.urgent.is_empty()
     }
 
     fn is_urgent(&self, layer: u32, e: u32) -> bool {
@@ -1493,7 +1514,7 @@ static PF_QUEUE: std::sync::OnceLock<std::sync::Arc<PfQueue>> = std::sync::OnceL
 /// so an urgent read waits for at most the pieces already in flight instead
 /// of whole 18.8 MB reads (io_throttle).
 fn b2_spec_chunk_bytes() -> usize {
-    std::env::var("V41_B2_SPEC_CHUNK_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024) * 1024
+    std::env::var("V41_B2_SPEC_CHUNK_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024).saturating_mul(1024)
 }
 
 /// Before each chunk of a background read: wait while a demand read runs or an
@@ -1503,7 +1524,7 @@ fn b2_background_pause(token: u64) {
     let (layer, e) = ((token >> 16) as u32, (token & 0xFFFF) as u32);
     let Some(q) = PF_QUEUE.get() else { return };
     let t = std::time::Instant::now();
-    while (DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) > 0 || q.certain_active())
+    while (DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) > 0 || q.background_should_wait(layer, e))
         && !q.is_urgent(layer, e)
         && t.elapsed() < std::time::Duration::from_millis(20)
     {
@@ -2497,7 +2518,7 @@ impl ExpertShard {
                         // request needs this very expert, in which case it IS the
                         // demand read.
                         let t = std::time::Instant::now();
-                        while (DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) > 0 || queue_r.certain_active())
+                        while (DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) > 0 || queue_r.background_should_wait(layer, e))
                             && t.elapsed() < std::time::Duration::from_millis(20)
                             && !queue_r.is_urgent(layer, e)
                         {
@@ -4352,6 +4373,7 @@ pub fn serve_connection(
     tracer: Option<&ExpertdTracer>,
 ) -> eyre::Result<(Vec<RequestRecord>, u64)> {
     apply_socket_options(&stream, &opts.socket)?;
+    B2_SPIN_CUR.store(opts.socket.busy_poll_us, std::sync::atomic::Ordering::Relaxed);
     let max_payload = proto::REQ_FIXED + exec.rows() * (XQ_BYTES_PER_TOKEN + 8 * N_EXPERT_USED) + 64;
     // HELLO first.
     {
@@ -4593,9 +4615,8 @@ pub fn serve_connection(
                     None => None,
                 };
                 let bb = reqb.as_ref().map(|r| r.b as usize).unwrap_or(0);
-                // Reader spin window for the NEXT request, by this reply's size.
-                let elem_out = if req.flags & proto::REQ_FLAG_RESP_F32 != 0 { 4 } else { 2 };
-                b2_adapt_busy_poll(&stream, b.max(bb) * N_EMBD as usize * elem_out, opts.socket.busy_poll_us);
+                // Reader spin window for the next request, by the hub's phase.
+                b2_adapt_busy_poll(&stream, req.flags & proto::REQ_FLAG_DECODE != 0, opts.socket.busy_poll_us);
                 if let Some(rb) = reqb.as_ref() {
                     if !rb.hint_admit.is_empty() {
                         shard.hint_evict_first(rb.hint_admit);
@@ -4736,6 +4757,9 @@ pub fn serve_connection(
                             let Some(Inbound::Frame { hdr, buf, t_first, t_done, t2 }) = pending_ref.pop_front() else { unreachable!() };
                             let resp = rx_resp_recycle_ref.try_recv().unwrap_or_else(|_| AlignedBuf::with_capacity(proto::RESP_DATA_OFF + exec_rows * N_EMBD as usize * 4));
                             let t_serve = Instant::now();
+                            if let Ok(r) = proto::decode_request(&buf) {
+                                b2_adapt_busy_poll(&stream, r.flags & proto::REQ_FLAG_DECODE != 0, opts.socket.busy_poll_us);
+                            }
                             let out = serve_interleaved(ex2, shard, &hdr, &buf, t_first, t_done, t2, resp);
                             let _ = tx_req_recycle_ref.send(buf);
                             *serve_acc += t_serve.elapsed().as_nanos() as u64;
@@ -5336,6 +5360,9 @@ pub struct RemoteExpertClient {
     /// The `SO_BUSY_POLL` window currently on `stream`, so the per-phase switch
     /// (`HetEngine::remote_set_phase_busy_poll`) is a no-op when unchanged.
     busy_poll_now: u32,
+    /// The hub's phase (`HetEngine::remote_set_phase_busy_poll`): requests
+    /// carry `REQ_FLAG_DECODE` while true.
+    decode_phase: bool,
     /// Set when the link is known broken. The request that discovers it still
     /// fails -- its in-flight tickets can never be answered -- but the NEXT
     /// request redials instead of inheriting the corpse.
@@ -5390,6 +5417,11 @@ impl RemoteExpertClient {
     /// whether the kernel accepted it. Above `net.core.busy_read` it is refused
     /// for an unprivileged process: logged ONCE, and the window stays as it was.
     /// Why the window is phase-dependent: `HetEngine::remote_set_phase_busy_poll`.
+    /// Record the hub's phase; requests carry `REQ_FLAG_DECODE` while decoding.
+    pub fn set_decode_phase(&mut self, decode: bool) {
+        self.decode_phase = decode;
+    }
+
     pub fn set_busy_poll_us(&mut self, us: u32) -> bool {
         if us == self.busy_poll_now {
             return true;
@@ -5487,6 +5519,7 @@ impl RemoteExpertClient {
             opts: opts.clone(),
             dead: false,
             busy_poll_now: opts.busy_poll_us,
+            decode_phase: false,
             sel_scratch: vec![NO_PICK; info.max_batch as usize * nu],
             ew_scratch: vec![0.0; info.max_batch as usize * nu],
             clock,
@@ -5674,6 +5707,7 @@ impl RemoteExpertClient {
         let flags = if pf.is_empty() { flags } else { flags | proto::REQ_FLAG_PREFETCH };
         // `wait` matches by seq, so any reply order is fine from here.
         let flags = flags | proto::REQ_FLAG_OOO;
+        let flags = if self.decode_phase { flags | proto::REQ_FLAG_DECODE } else { flags };
         proto::encode_request(
             &mut buf, seq, layer, b as u32, flags, nu as u32, XQ_BYTES_PER_TOKEN as u32, xq,
             &self.sel_scratch[..b * nu], &self.ew_scratch[..b * nu], (&ha, &he), &pf,

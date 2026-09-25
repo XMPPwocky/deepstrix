@@ -601,12 +601,20 @@ impl SafetensorsDir {
         // pause hook before each, so an urgent read never queues behind more
         // than the chunks already at the drive. Read the mark HERE: the mirror
         // half runs on a thread spawned below, which would not inherit it.
-        let bg = crate::io_throttle::background();
-        let chunk = match bg {
-            Some(_) if crate::io_throttle::chunk_bytes() > 0 => crate::io_throttle::chunk_bytes(),
-            _ => usize::MAX,
+        // Chunk size 0 means chunking is OFF: then no pause either, so
+        // `V41_B2_SPEC_CHUNK_KB=0` is exactly the unchunked read. Loaded once
+        // and clamped to a page, so it can never be 0 inside the loop.
+        let (bg, chunk) = match (crate::io_throttle::background(), crate::io_throttle::chunk_bytes()) {
+            (Some(token), c) if c > 0 => (Some(token), c.max(A as usize)),
+            _ => (None, usize::MAX),
         };
-        let read_all = move |f: &File, buf: &mut [u8], off: u64| -> eyre::Result<()> {
+        // Bytes each half must land: only [pad, pad + len) of the span matters
+        // (the file's last block may be short), so the head needs its part of
+        // that range and the tail the rest. A half that stops early is an
+        // error, never stale staging returned as data.
+        let need_head = cut.min(pad + len);
+        let need_tail = (pad + len).saturating_sub(cut);
+        let read_all = move |f: &File, buf: &mut [u8], off: u64, need: usize| -> eyre::Result<()> {
             let mut got = 0usize;
             while got < buf.len() {
                 if let Some(token) = bg {
@@ -617,13 +625,14 @@ impl SafetensorsDir {
                 if n == 0 { break; }
                 got += n;
             }
-            // The last block of the file may be short: only the bytes inside
-            // [pad, pad + len) of the span must have landed.
+            if got < need {
+                return Err(eyre!("{}: O_DIRECT split read at {off} got {got} of {need} needed bytes (short file?)", t.name));
+            }
             Ok(())
         };
         let (ra, rb) = std::thread::scope(|sc| {
-            let hb = sc.spawn(move || read_all(mirror, tail, base + cut as u64));
-            let ra = read_all(file, head, base);
+            let hb = sc.spawn(move || read_all(mirror, tail, base + cut as u64, need_tail));
+            let ra = read_all(file, head, base, need_head);
             (ra, hb.join().unwrap_or_else(|_| Err(eyre!("mirror reader panicked"))))
         });
         ra?;

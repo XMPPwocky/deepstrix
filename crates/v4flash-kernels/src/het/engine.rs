@@ -552,11 +552,14 @@ impl HeterogeneousEngine {
         static BATCH_US: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
             std::env::var("V41_BATCH_BUSY_POLL_US").ok().and_then(|v| v.parse().ok()).unwrap_or(50)
         });
+        let Some(m) = self.remote.as_ref() else { return };
+        let Ok(mut c) = m.lock() else { return };
+        // The daemon adapts its own reader window to this (REQ_FLAG_DECODE),
+        // whether or not the hub's switch is enabled.
+        c.set_decode_phase(decode);
         if *DECODE_US == 0 {
             return;
         }
-        let Some(m) = self.remote.as_ref() else { return };
-        let Ok(mut c) = m.lock() else { return };
         c.set_busy_poll_us(if decode { *DECODE_US } else { *BATCH_US });
     }
 
