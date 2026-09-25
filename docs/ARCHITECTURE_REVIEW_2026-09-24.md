@@ -610,7 +610,11 @@ Run each case through serial prefill, serial decode, multistream rows at S=1/2/4
 - `b40174d`: the hash router removed.
 
 *Deferred.* These touch the prefill hot path or on-disk formats, so they should land behind the step-0 golden gate:
-- **V4-only quant kernel families:** IQ2_XXS/IQ2_S/IQ2_XS/IQ3_XXS/IQ3_S, Q2_K matvec (keep `q2_k_reduce_partials*`, which MXFP4 uses), Q5_K dense, `DenseGemmDp4a`, and the Q4_K/Q6_K arms in the *het* engine (Laguna keeps its own). The prefill MoE launch (`forward_prefill.rs` ~7040–7700) interleaves the IQ2/Q2_K variant selection with the live MXFP4 path, so it needs a careful restructure. Also delete their oracle and bench tests and `v4flash-core/src/iq3_s_ref.rs`.
+- **V4-only quant kernel families (delete):** Q5_K dense, `DenseGemmDp4a`, and the Q4_K/Q6_K arms in the *het* engine (Laguna keeps its own).
+- **Low-bit expert kernels: KEEP (owner, 2026-09-25).** IQ2_XXS/IQ2_S/IQ2_XS, IQ3_XXS/IQ3_S, Q2_K matvec and `v4flash-core/src/iq3_s_ref.rs` stay. They are the candidate formats for an imatrix-calibrated requant of all 15,360 V4.1 experts: IQ2_S fits them in ~175 GB, which would end expert paging. An imatrix sized from production routing needs ~1M prefill tokens (~3M to be thorough), with shrinkage toward the layer mean for cold experts (29 were never picked in 6.3M tokens).
+  - Their oracle tests run against V4 dumps. Re-fixture them from the V4.1 golden corpus; don't delete them.
+  - Still do the restructure: the prefill MoE launch (`forward_prefill.rs` ~7040–7700) interleaves IQ2/Q2_K variant selection with the live MXFP4 path. Give it one format dispatch that keeps these families.
+  - The dead-variant deletions in §6 (garbage `iq2_xs` wmma modes, unused `iq2_xxs` launch variants) still apply. They are not the families' production launches.
 - **`ratio == 4` indexer-compressor:**
   - the `CompKvStore::{Fp8, E2m1}` stores
   - `CompKvFp8` and `CompressorStateShuffleR4`
