@@ -143,6 +143,14 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
         }
     };
     tracing::info!(n_slots, ctx_rows, chunk_rows, prefill_burst_ms = env_usize("V41_MS_PREFILL_BURST_MS", 120_000), decode_burst_ms = env_usize("V41_MS_DECODE_BURST_MS", 30_000), "multistream scheduler ON");
+    // Event trace (`V41_EVTRACE_DIR`): every V41_* knob goes in the header.
+    {
+        let knobs: serde_json::Map<String, serde_json::Value> = std::env::vars()
+            .filter(|(k, _)| k.starts_with("V41_") || k.starts_with("GPU_") || k.starts_with("HIP_"))
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        v4flash_kernels::het::evtrace::init("hub", serde_json::json!({ "n_slots": n_slots, "ctx_rows": ctx_rows, "chunk_rows": chunk_rows, "env": knobs }));
+    }
     let n_jobs = env_usize("V41_MS_PREFILL_JOBS", 2).max(1);
     let mut spare_states = Vec::with_capacity(n_jobs);
     for _ in 0..n_jobs {
@@ -454,6 +462,12 @@ impl Sched {
         if next != self.phase {
             tracing::info!(from = ?self.phase, to = ?next, live = self.streams.len(), prefills = self.prefills.len(), queued = self.queue.len(),
                 burst_ms = self.phase_since.elapsed().as_millis() as u64, next_budget_ms = budget(next).as_millis() as u64, starved, "ms.phase");
+            let code = |p: &Phase| match p { Phase::Decode => 0.0, Phase::Prefill => 1.0 };
+            v4flash_kernels::het::evtrace::emit(&v4flash_kernels::het::evtrace_kinds::HUB_PHASE, &[
+                v4flash_kernels::het::evtrace::now(), code(&self.phase), code(&next), self.streams.len() as f64,
+                self.prefills.len() as f64, self.queue.len() as f64, self.phase_since.elapsed().as_secs_f64() * 1e3,
+                budget(next).as_secs_f64() * 1e3, f64::from(u8::from(starved)),
+            ]);
             self.phase = next;
             self.phase_since = Instant::now();
         }
@@ -566,6 +580,9 @@ impl Sched {
     /// the prompt, admit the stream.
     fn prefill_tick(&mut self, state: &mut WorkerState) -> eyre::Result<()> {
         if self.prefills.is_empty() { return Ok(()); }
+        // Prefill requests carry no decode step (also after a failed step,
+        // whose own clear never ran).
+        v4flash_kernels::het::evtrace_kinds::clear_step();
         let i = self.rr % self.prefills.len();
         self.rr = self.rr.wrapping_add(1);
         let mut pf = self.prefills.remove(i);
@@ -786,6 +803,22 @@ impl Sched {
         if let Some(pg) = state.pager.as_mut() { pg.drain_prefetched()?; }
         let t0 = Instant::now();
         let b = self.streams.len();
+        // Event trace: one `hub_step` per step, fields filled BY NAME (see
+        // `evtrace_kinds::HUB_STEP`); `hub_req` records carry this step number.
+        let ev_on = v4flash_kernels::het::evtrace::enabled();
+        let mut ev: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        if ev_on {
+            use std::sync::atomic::AtomicU64;
+            static EV_STEP: AtomicU64 = AtomicU64::new(0);
+            let step = EV_STEP.fetch_add(1, Ordering::Relaxed);
+            v4flash_kernels::het::evtrace_kinds::set_step(step, b as u64);
+            ev.insert("t_start".into(), v4flash_kernels::het::evtrace::now());
+            ev.insert("step".into(), step as f64);
+            ev.insert("rows".into(), b as f64);
+            let pos = self.streams.iter().map(|s| s.seq.len() as f64);
+            ev.insert("pos_min".into(), pos.clone().fold(f64::INFINITY, f64::min));
+            ev.insert("pos_max".into(), pos.fold(f64::NEG_INFINITY, f64::max));
+        }
         let slots: Vec<u32> = self.streams.iter().map(|s| s.slot).collect();
         let toks: Vec<i32> = self.streams.iter().map(|s| s.next).collect();
         let mut hcs: Vec<Vec<f32>> = Vec::with_capacity(b);
@@ -962,6 +995,45 @@ impl Sched {
                 e.0 += ns as f64 / 1e6;
                 e.1 += 1;
             }
+            if ev_on {
+                for (name, key) in [("host.remote_wait", "remote_wait_ms"), ("host.remote_rtt", "remote_rtt_ms"), ("host.remote_srv", "remote_srv_ms"),
+                    ("box2.page_ms", "b2_page_ms"), ("box2.service_ms", "b2_service_ms"), ("box2.misses_x1e6", "b2_misses"),
+                    ("box2.paged_x1e6", "b2_paged_replies")] {
+                    if let Some(&(_, ns)) = host.iter().find(|h| h.0 == name) {
+                        ev.insert(key.into(), ns as f64 / 1e6);
+                    }
+                }
+                ev.insert("profiled".into(), 1.0);
+                let mut busy = (0.0f64, 0.0f64);
+                let mut other = (0.0f64, 0.0f64);
+                let named = &v4flash_kernels::het::evtrace_kinds::HUB_STEP.fields;
+                for (pre, short, r) in [("dgpu.", "d_", &dg), ("igpu.", "i_", &ig)] {
+                    for &(name, ms, _) in r.iter() {
+                        if let Some(rest) = name.strip_prefix(pre) {
+                            let key = format!("{short}{}", rest.replace('.', "_"));
+                            let d = pre == "dgpu.";
+                            if d { busy.0 += ms as f64 } else { busy.1 += ms as f64 }
+                            if named.contains(&key.as_str()) {
+                                *ev.entry(key).or_insert(0.0) += ms as f64;
+                            } else {
+                                if d { other.0 += ms as f64 } else { other.1 += ms as f64 }
+                                // Name the unlisted stages once, so the kind can grow.
+                                static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                                if let Ok(mut seen) = SEEN.lock() {
+                                    if !seen.contains(&key) {
+                                        tracing::info!(stage = name, "evtrace: hub_step stages not named (in d_other / i_other)");
+                                        seen.push(key);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ev.insert("dgpu_busy_ms".into(), busy.0);
+                ev.insert("igpu_busy_ms".into(), busy.1);
+                ev.insert("d_other".into(), other.0);
+                ev.insert("i_other".into(), other.1);
+            }
             // Per-wait phase split (remote_experts::take_hop_stats): of the
             // box-2 waits this step, how many found the reply already in the
             // channel (slack: box 2 finished under local work) vs. blocked
@@ -969,6 +1041,11 @@ impl Sched {
             // per-call means, so they are folded as ms-per-step means too.
             {
                 let (a, wake, slack, nb, n) = v4flash_kernels::het::remote_experts::take_hop_stats();
+                if ev_on {
+                    for (k, v) in [("hop_submit_to_write_us", a), ("hop_wake_us", wake), ("hop_slack_us", slack), ("hop_blocked", nb as f64), ("hop_waits", n as f64)] {
+                        ev.insert(k.into(), v);
+                    }
+                }
                 for (name, v) in [("hop.waits_per_step", n as f64), ("hop.blocked_per_step", nb as f64), ("hop.wake_us_mean", wake), ("hop.slack_us_mean", slack), ("hop.submit_to_write_us_mean", a)] {
                     let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
                     e.0 += v; e.1 += 1;
@@ -979,6 +1056,12 @@ impl Sched {
             // accuracy (dry run: `V41_SUB=1`).
             if v4flash_kernels::het::b2_mirror::wanted() {
                 let (p, av, sw, bl, fl, ad, inc) = v4flash_kernels::het::b2_mirror::take_sub_stats();
+                if ev_on {
+                    for (k, v) in [("sub_predicted_miss", p), ("sub_reads_avoided", av), ("sub_picks_swapped", sw), ("sub_blocked", bl),
+                        ("sub_plan_failed", fl), ("sub_admits_queued", ad), ("sub_incoming_covered", inc)] {
+                        ev.insert(k.into(), v as f64);
+                    }
+                }
                 for (name, v) in [("sub.predicted_miss", p as f64), ("sub.reads_avoided", av as f64), ("sub.picks_swapped", sw as f64), ("sub.blocked", bl as f64), ("sub.plan_failed", fl as f64), ("sub.admits_queued", ad as f64), ("sub.incoming_covered", inc as f64)] {
                     let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
                     e.0 += v; e.1 += 1;
@@ -988,6 +1071,11 @@ impl Sched {
                 if let Some((q, a, df, ams)) = pg.prefetch_stats() {
                     let (dq, da, ddf, dms) = (q.saturating_sub(acc.pf_last.0), a.saturating_sub(acc.pf_last.1), df.saturating_sub(acc.pf_last.2), ams.saturating_sub(acc.pf_last.3));
                     acc.pf_last = (q, a, df, ams);
+                    if ev_on {
+                        for (k, v) in [("b1_pf_queued", dq), ("b1_pf_admitted", da), ("b1_pf_dropped_full", ddf), ("b1_pf_admit_ms", dms)] {
+                            ev.insert(k.into(), v as f64);
+                        }
+                    }
                     for (name, v) in [("prefetch.queued", dq as f64), ("prefetch.admitted", da as f64), ("prefetch.dropped_full", ddf as f64), ("prefetch.admit_ms", dms as f64)] {
                         let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
                         e.0 += v; e.1 += 1;
@@ -1005,6 +1093,10 @@ impl Sched {
                 let (dm, dr) = (c.prefill_misses.saturating_sub(acc.last_misses), c.prefill_read_ns.saturating_sub(acc.last_read_ns));
                 acc.last_misses = c.prefill_misses;
                 acc.last_read_ns = c.prefill_read_ns;
+                if ev_on {
+                    ev.insert("b1_misses".into(), dm as f64);
+                    ev.insert("b1_read_ms".into(), dr as f64 / 1e6);
+                }
                 let e = acc.stages.entry(("host", "pager.misses_per_step")).or_insert((0.0, 0));
                 e.0 += dm as f64; e.1 += 1;
                 let e = acc.stages.entry(("host", "pager.read_ms")).or_insert((0.0, 0));
@@ -1014,6 +1106,9 @@ impl Sched {
                 let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
                 e.0 += us as f64 / 1e3;
                 e.1 += 1;
+                if ev_on {
+                    ev.insert(name.replacen("lh.", "lh_", 1), us as f64 / 1e3);
+                }
             }
             {
                 let e = acc.stages.entry(("host", "step.fwd_wall")).or_insert((0.0, 0));
@@ -1061,6 +1156,19 @@ impl Sched {
         }
         tracing::info!(rows = b, step_ms = format!("{:.1}", t0.elapsed().as_secs_f64() * 1e3), fwd_ms = format!("{fwd_ms:.1}"),
             engram_ms = format!("{engram_ms:.1}"), sample_ms = format!("{sample_ms:.1}"), live = self.streams.len(), "ms.step");
+        if ev_on {
+            let lanes = if lanes3 { 3.0 } else if stagger2 || pipelined { 2.0 } else { 1.0 };
+            for (k, v) in [("t_end", v4flash_kernels::het::evtrace::now()), ("live", self.streams.len() as f64), ("lanes", lanes),
+                ("fwd_ms", fwd_only_ms), ("fwd_all_ms", fwd_ms), ("engram_ms", engram_ms), ("sample_ms", sample_ms),
+                ("step_ms", t0.elapsed().as_secs_f64() * 1e3)] {
+                ev.insert(k.into(), v);
+            }
+            ev.entry("profiled".into()).or_insert(0.0);
+            let k = &v4flash_kernels::het::evtrace_kinds::HUB_STEP;
+            let v: Vec<f64> = k.fields.iter().map(|f| ev.get(*f).copied().unwrap_or(f64::NAN)).collect();
+            v4flash_kernels::het::evtrace::emit(k, &v);
+            v4flash_kernels::het::evtrace_kinds::clear_step();
+        }
         Ok(())
     }
 }

@@ -224,6 +224,8 @@ uses it); the hub decides at decode time to send us anything it does not hold.",
         if hits_first { "ON" } else { "OFF" }, std::process::id());
     eprintln!("expertd: {} (`kill -USR2 {}` after editing it)",
         v4flash_kernels::het::remote_experts::install_knobs_toggle(), std::process::id());
+    // Event trace (`V41_EVTRACE_DIR`; per request / read / ensure / write).
+    v4flash_kernels::het::evtrace::init_env("b2");
     let listener = TcpListener::bind(&args.listen)?;
     let opts = ServeOptions {
         socket: args.socket,

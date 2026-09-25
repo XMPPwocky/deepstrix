@@ -419,6 +419,10 @@ pub struct BatchDgpuScratch {
     /// (as the first cut did) serialises the ~74 ms round trip at B=1024 in front
     /// of local compute and throws away the whole point of overlapping.
     pub remote_ticket: Option<crate::het::remote_experts::Ticket>,
+    /// `evtrace` submit-time fields of `remote_ticket` (see `HUB_REQ`):
+    /// t_submit, t_submit_end, partner, unmasked, n_picks, n_distinct,
+    /// n_pred_miss, n_pred_incoming, n_pred_pending.
+    pub ev_req: [f64; 9],
 }
 
 /// Lane rows up to which `V41_MS_MHC_SPLIT` runs the mHC mixes on the side
@@ -1277,6 +1281,7 @@ impl BatchDgpuScratch {
             remote_ffn_moe_layer: -1,
             mhc_ffn_split_pending: false,
             remote_ticket: None,
+            ev_req: [f64::NAN; 9],
         })
     }
 }

@@ -7552,6 +7552,28 @@ impl HeterogeneousEngine {
                         }
                         // `sel_host` above is this chunk's router picks; reuse it.
                         let t_sub = super::perfetto::now_ns();
+                        // `HUB_REQ` submit-side fields. The mirror is read BEFORE the
+                        // submit: `submit` marks every sent pick PENDING
+                        // (`b2_mirror::note_submitted`), which would read as zero
+                        // predicted misses. Decode-sized requests only: a prefill
+                        // chunk's hundreds of picks would cost tens of us here.
+                        let ev_pred: Option<[f64; 5]> = (super::evtrace::enabled() && b <= 16).then(|| {
+                            let sent: &[i32] = if sel_for_remote.is_empty() { &sel_host_remote } else { &sel_for_remote };
+                            let mut ids: Vec<i32> = sent.iter().copied().filter(|&e| e >= 0 && e < N_EXPERT as i32).collect();
+                            let n_picks = ids.len();
+                            ids.sort_unstable();
+                            ids.dedup();
+                            let (mut miss, mut inc, mut pend) = (0u32, 0u32, 0u32);
+                            for &e in &ids {
+                                if let Some(r) = super::b2_mirror::lookup(layer, e as u32) {
+                                    miss += u32::from(!r.held && !r.pending && !r.incoming);
+                                    inc += u32::from(!r.held && r.incoming);
+                                    pend += u32::from(!r.held && r.pending);
+                                }
+                            }
+                            [n_picks as f64, ids.len() as f64, f64::from(miss), f64::from(inc), f64::from(pend)]
+                        });
+                        let ev_t_submit = super::evtrace::now();
                         let ticket = remote
                             .lock()
                             .map_err(|_| eyre!("remote expert client mutex poisoned"))?
@@ -7603,7 +7625,15 @@ impl HeterogeneousEngine {
                                 // sequential path, where nothing follows.
                                 partner_follows,
                             )?;
+                        let ev_t_submit_end = super::evtrace::now();
                         let t_sub_end = super::perfetto::now_ns();
+                        if super::evtrace::enabled() {
+                            let pr = ev_pred.unwrap_or([f64::NAN; 5]);
+                            bd.ev_req = [
+                                ev_t_submit, ev_t_submit_end, f64::from(u8::from(partner_follows)),
+                                f64::from(u8::from(!sel_for_remote.is_empty())), pr[0], pr[1], pr[2], pr[3], pr[4],
+                            ];
+                        }
                         // Stash, don't wait: the local iGPU MoE for this layer is issued
                         // right after this block, and post-MoE collects the reply. The
                         // gap between the `submit` and `wait` slices on the
@@ -9058,6 +9088,8 @@ impl HeterogeneousEngine {
         if let Some(t) = bd.remote_ticket.take() {
             let layer = bd.remote_ffn_moe_layer;
             let t_wait = super::perfetto::now_ns();
+            let ev_wait_enter = super::evtrace::now();
+            let ev_ticket = (t.seq, t.flags, t.n_hints, t.n_pf_words);
             let remote = self
                 .remote
                 .as_ref()
@@ -9076,6 +9108,29 @@ impl HeterogeneousEngine {
                 std::thread::sleep(std::time::Duration::from_micros(ticks / 100));
             }
             let t_wait_end = super::perfetto::now_ns();
+            if super::evtrace::enabled() {
+                let ev_exit = super::evtrace::now();
+                let e = &bd.ev_req;
+                let (t1, t2, t3, t4, off, delay) = match partial.clock {
+                    Some(c) => (c.t1 as f64, c.t2 as f64, c.t3 as f64, c.t4 as f64, c.offset_ns() as f64, c.delay_ns() as f64),
+                    None => (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN),
+                };
+                let (seq, flags, n_hints, n_pf) = ev_ticket;
+                super::evtrace::emit(&super::evtrace_kinds::HUB_REQ, &[
+                    e[0], e[1], t1, t4, ev_wait_enter, ev_exit, t2, t3,
+                    super::evtrace_kinds::step_f64(),
+                    super::evtrace::small_id(&*bd as *const BatchDgpuScratch as usize),
+                    f64::from(partial.layer), f64::from(partial.b), f64::from(seq), f64::from(flags), e[2], e[3],
+                    f64::from(n_hints), f64::from(n_pf),
+                    e[4], e[5], e[6], e[7], e[8],
+                    f64::from(partial.rtt_us), f64::from(partial.t_remote_server_us), f64::from(partial.t_remote_page_us),
+                    f64::from(partial.t_remote_compute_us), f64::from(partial.n_remote_miss),
+                    f64::from(partial.miss_mask.count_ones()), partial.bytes_out as f64, partial.bytes_in as f64,
+                    if t4.is_nan() { f64::NAN } else { f64::from(u8::from(t4 >= ev_wait_enter)) }, off, delay,
+                    super::evtrace_kinds::step_rows_f64(),
+                ]);
+                bd.ev_req = [f64::NAN; 9];
+            }
             if let Some(pf) = self.perfetto.as_ref() {
                 if let Ok(pf) = pf.lock() {
                     let _ = pf.emit_host_slice(

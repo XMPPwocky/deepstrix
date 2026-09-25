@@ -1335,6 +1335,11 @@ struct PfDone {
     queue_ns: u64,
     /// The read itself (`read_miss_into` wall).
     read_ns: u64,
+    /// `evtrace` (NaN when off): t_hint, t_pop, t_read_start, t_read_end,
+    /// yield_ns, pause_ns, certain at pop, certain at read, DEMAND_READS and
+    /// running certain / speculative at READ START (after the yield), then
+    /// the role (start, end) x3.
+    ev: [f64; 17],
 }
 
 /// One background read for the prefetch readers.
@@ -1449,6 +1454,14 @@ impl PfQueue {
         self.inner.lock().unwrap().urgent.contains(&(layer, e))
     }
 
+    /// `evtrace`: running certain, running speculative, queued certain,
+    /// queued speculative.
+    fn counts(&self) -> [f64; 4] {
+        let g = self.inner.lock().unwrap();
+        let qc = g.jobs.iter().filter(|j| j.certain).count();
+        [g.running_certain as f64, g.running_spec as f64, qc as f64, (g.jobs.len() - qc) as f64]
+    }
+
     fn clear_urgent(&self, layer: u32, e: u32) {
         self.inner.lock().unwrap().urgent.remove(&(layer, e));
     }
@@ -1530,11 +1543,16 @@ fn b2_background_pause(token: u64) {
     let (layer, e) = ((token >> 16) as u32, (token & 0xFFFF) as u32);
     let Some(q) = PF_QUEUE.get() else { return };
     let t = std::time::Instant::now();
+    let mut slept = false;
     while (DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) > 0 || q.background_should_wait(layer, e))
         && !q.is_urgent(layer, e)
         && t.elapsed() < std::time::Duration::from_millis(20)
     {
         std::thread::sleep(std::time::Duration::from_micros(50));
+        slept = true;
+    }
+    if slept && super::evtrace::enabled() {
+        *EV_PAUSE.lock().unwrap().entry(token).or_insert(0) += t.elapsed().as_nanos() as u64;
     }
 }
 
@@ -1598,6 +1616,28 @@ impl Drop for B2Prefetch {
 /// queued request's own non-resident picks, see the compute loop) is a demand
 /// read that merely started early and never waits.
 static DEMAND_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `evtrace`: the request the compute thread is serving (its `seq`), stamped
+/// into the `b2_read` / `b2_ensure` records emitted under it.
+pub static EV_CUR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+fn ev_cur_seq() -> f64 {
+    match EV_CUR_SEQ.load(std::sync::atomic::Ordering::Relaxed) {
+        u64::MAX => f64::NAN,
+        s => s as f64,
+    }
+}
+
+thread_local! {
+    /// `evtrace`: (start, end) raw ns of the three role reader threads of the
+    /// last `read_miss_into` called on THIS thread (NaN = not measured).
+    static EV_ROLES: std::cell::Cell<[f64; 6]> = const { std::cell::Cell::new([f64::NAN; 6]) };
+}
+
+/// `evtrace`: io_throttle pause ns per background read (`layer << 16 | e`
+/// token), taken by the reader when its read ends.
+static EV_PAUSE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, u64>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// `V41_B2_EARLY_PAGE=0`: do not start a queued request's misses under the
 /// current request's tail (default on).
@@ -1791,6 +1831,9 @@ pub struct ExpertShard {
     /// waiting for a prefetch read it needs this request (2026-09-22). Also
     /// added to the layer's `read_ns`, see the note there.
     pub prefetch_wait_ns: u64,
+    /// `evtrace`: the last `admit_prefetched` call's blocked wait ns, landed
+    /// reads, landed reads this request wanted, blocking receives.
+    pub ev_admit: [u64; 4],
     /// Persistent staging, one per role, in `hipHostMalloc` memory.
     ///
     /// Two things at once. It is persistent, so the miss path no longer
@@ -2473,6 +2516,7 @@ impl ExpertShard {
             parked_pins: Vec::new(),
             park_words: Vec::new(),
             prefetch_wait_ns: 0,
+            ev_admit: [0; 4],
         })
     }
 
@@ -2521,6 +2565,9 @@ impl ExpertShard {
                 let ptrs = ptrs;
                 loop {
                     let Some(PfJob { layer, e, set, certain, t_hint }) = queue_r.pop() else { break };
+                    let ev_on = super::evtrace::enabled();
+                    let ev_t_pop = if ev_on { super::evtrace::now() } else { f64::NAN };
+                    let mut ev_yield_ns = 0u64;
                     let mut done = PfFinish { q: &queue_r, certain };
                     if !certain {
                         // Yield the drives to demand misses (bounded: a hint that
@@ -2534,6 +2581,7 @@ impl ExpertShard {
                         {
                             std::thread::sleep(std::time::Duration::from_micros(50));
                         }
+                        ev_yield_ns = t.elapsed().as_nanos() as u64;
                         if queue_r.is_urgent(layer, e) {
                             queue_r.reclassify_certain();
                             done.certain = true;
@@ -2547,6 +2595,10 @@ impl ExpertShard {
                         (std::slice::from_raw_parts_mut(sp.p[0], sp.n[0]), std::slice::from_raw_parts_mut(sp.p[1], sp.n[1]), std::slice::from_raw_parts_mut(sp.p[2], sp.n[2]))
                     };
                     let t_read = std::time::Instant::now();
+                    let ev_t_read = if ev_on { super::evtrace::now() } else { f64::NAN };
+                    // Concurrency as this read STARTS (after any yield).
+                    let ev_q = if ev_on { queue_r.counts() } else { [f64::NAN; 4] };
+                    let ev_demand = DEMAND_READS.load(std::sync::atomic::Ordering::Relaxed) as f64;
                     let queue_ns = (t_read - t_hint).as_nanos() as u64;
                     // A job still speculative at read start reads in chunks and
                     // yields to urgent reads (io_throttle); certain ones do not.
@@ -2554,9 +2606,20 @@ impl ExpertShard {
                     let r = Self::read_miss_into(&owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2);
                     v4flash_core::io_throttle::set_background(None);
                     let read_ns = t_read.elapsed().as_nanos() as u64;
+                    let mut ev = [f64::NAN; 17];
+                    if ev_on {
+                        let roles = EV_ROLES.with(|c| c.replace([f64::NAN; 6]));
+                        let pause = EV_PAUSE.lock().unwrap().remove(&(((layer as u64) << 16) | e as u64)).unwrap_or(0);
+                        ev[..11].copy_from_slice(&[
+                            super::evtrace::inst_to_raw(t_hint), ev_t_pop, ev_t_read, super::evtrace::now(),
+                            ev_yield_ns as f64, pause as f64, f64::from(u8::from(certain)), f64::from(u8::from(done.certain)),
+                            ev_demand, ev_q[0], ev_q[1],
+                        ]);
+                        ev[11..].copy_from_slice(&roles);
+                    }
                     drop(done);
                     let msg = match r {
-                        Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, offs, coalesced, queue_ns, read_ns }),
+                        Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, offs, coalesced, queue_ns, read_ns, ev }),
                         Err(err) => Err((set, layer, e, format!("{err:#}"))),
                     };
                     if tx_done.send(msg).is_err() {
@@ -2658,6 +2721,25 @@ impl ExpertShard {
         // every prefetched expert was blocked on. Folded into the layer's page
         // accounting below so "compute" means compute.
         let mut wait_ns = 0u64;
+        let ev_on = super::evtrace::enabled();
+        let (mut ev_landed, mut ev_wanted, mut ev_blocking) = (0u64, 0u64, 0u64);
+        // `b2_read` for a background read the compute thread just handled.
+        #[allow(clippy::too_many_arguments)]
+        let ev_read = |d: &PfDone, slot: f64, victim: Option<(u32, u32)>, t_recv: f64, t_land0: f64, wanted: bool, blocked: bool, scan_ns: f64, repack_ns: f64, already: bool| {
+            let src = if d.ev[6] == 1.0 { 1.0 } else if d.ev[7] == 1.0 { 2.0 } else { 3.0 };
+            let (vl, ve) = victim.map_or((f64::NAN, f64::NAN), |(l, e)| (f64::from(l), f64::from(e)));
+            let mut v = vec![
+                src, ev_cur_seq(), f64::from(d.layer), f64::from(d.e), slot, vl, ve, d.set as f64,
+                d.ev[0], d.ev[1], d.ev[2], d.ev[3], t_recv, t_land0, super::evtrace::now(),
+                d.ev[4], d.ev[5], d.ev[8], d.ev[9], d.ev[10],
+            ];
+            v.extend_from_slice(&d.ev[11..17]);
+            v.extend_from_slice(&[
+                f64::from(u8::from(wanted)), f64::from(u8::from(blocked)), f64::from(u8::from(d.coalesced)),
+                scan_ns, repack_ns, f64::NAN, f64::NAN, f64::from(u8::from(already)),
+            ]);
+            super::evtrace::emit(&super::evtrace_kinds::B2_READ, &v);
+        };
         // About to block on this request's own picks: whatever of them is still
         // pending as a speculative read becomes urgent, so the wait is one read,
         // not the speculative queue ahead of it plus its yield.
@@ -2673,6 +2755,9 @@ impl ExpertShard {
                 Ok(Ok(d)) => {
                     if let Some(t) = t_w { wait_ns += t.elapsed().as_nanos() as u64; }
                     if must_wait && d.layer == cur_layer && want.contains(&d.e) { pf.waited += 1; }
+                    ev_landed += 1;
+                    ev_blocking += u64::from(must_wait);
+                    ev_wanted += u64::from(d.layer == cur_layer && want.contains(&d.e));
                     pf.queue_ns += d.queue_ns;
                     pf.read_ns += d.read_ns;
                     pf.n_read += 1;
@@ -2689,9 +2774,14 @@ impl ExpertShard {
                 Err(_) => break,
             };
             let key = (d.layer, d.e);
+            let ev_t_recv = if ev_on { super::evtrace::now() } else { f64::NAN };
+            let ev_wanted_this = d.layer == cur_layer && want.contains(&d.e);
             pf.pending.remove(&key);
             pf.queue.clear_urgent(d.layer, d.e);
             if pool.slot_of.contains_key(&key) {
+                if ev_on {
+                    ev_read(&d, f64::NAN, None, ev_t_recv, ev_t_recv, ev_wanted_this, must_wait && ev_wanted_this, f64::NAN, f64::NAN, true);
+                }
                 pf.free.push(d.set);
                 continue;
             }
@@ -2718,13 +2808,17 @@ impl ExpertShard {
                 }
                 best.map(|(_, sl)| sl)
             };
+            let ev_t_scan = std::time::Instant::now();
             let Some(victim) = pick(global, pool).or_else(|| pick(true, pool)) else { pf.free.push(d.set); continue };
+            let ev_scan_ns = ev_t_scan.elapsed().as_nanos() as f64;
+            let ev_victim = pool.owner_of[victim as usize];
             if let Some((ol, oe)) = pool.owner_of[victim as usize].take() {
                 pool.slot_of.remove(&(ol, oe));
                 pool.remap_hosts[ol as usize][oe as usize] = 0;
                 pool.held[ol as usize] -= 1;
                 if ol != cur_layer { pool.dirty[ol as usize] = true; }
             }
+            let ev_t_repack = std::time::Instant::now();
             let landed: eyre::Result<()> = match (repack, repack_stream) {
                 (Some(rp), Some(rs)) => Self::repack_in_place(rp, rs, r, victim, &pf.stages[d.set], &d.offs, d.coalesced).map(|_| ()),
                 _ => (0..3).try_for_each(|i| {
@@ -2747,11 +2841,16 @@ impl ExpertShard {
             pool.dirty[d.layer as usize] = true;
             pf.admitted += 1;
             pf.free.push(d.set);
+            if ev_on {
+                ev_read(&d, f64::from(victim), ev_victim, ev_t_recv, ev_t_recv, ev_wanted_this, must_wait && ev_wanted_this,
+                    ev_scan_ns, ev_t_repack.elapsed().as_nanos() as f64, false);
+            }
         }
         // Attribute the blocking wait to the LAYER's page accounting, so the
         // hub's `box2.page_ms` covers it and `box2.compute_ms` (service minus
         // page) stops counting disk waits as compute. Also tracked separately
         // in `prefetch_wait_ns` for the stats line.
+        self.ev_admit = [wait_ns, ev_landed, ev_wanted, ev_blocking];
         if wait_ns > 0 {
             self.prefetch_wait_ns += wait_ns;
             if let Some(pg) = self
@@ -2787,6 +2886,31 @@ impl ExpertShard {
     }
 
     /// Snapshot around a request and difference it to get that request's paging.
+    /// `evtrace`: the layer's cumulative page stats as separate components:
+    /// misses, read_ns, h2d_ns, repack_gpu_ns, pread_ns, repack_cpu_ns.
+    pub fn layer_page_detail(&self, layer: u32) -> [u64; 6] {
+        match self.layers.get(layer as usize).and_then(|l| l.as_ref()).and_then(|l| l.page.as_ref()) {
+            Some(pg) => [pg.misses, pg.read_ns, pg.h2d_ns, pg.repack_gpu_ns, pg.pread_ns, pg.repack_cpu_ns],
+            None => [0; 6],
+        }
+    }
+
+    /// `evtrace`: the background readers (running certain / speculative,
+    /// queued certain / speculative, free staging sets, pending keys), their
+    /// cumulative hinted / admitted / dropped / waited / promoted, and the
+    /// pool's resident count.
+    pub fn ev_pf_snapshot(&self) -> [f64; 12] {
+        let mut v = [f64::NAN; 12];
+        if let Some(p) = self.prefetch.as_ref() {
+            v[..4].copy_from_slice(&p.queue.counts());
+            v[4] = p.free.len() as f64;
+            v[5] = p.pending.len() as f64;
+            v[6..11].copy_from_slice(&[p.hinted as f64, p.admitted as f64, p.dropped as f64, p.waited as f64, p.promoted as f64]);
+        }
+        v[11] = self.pool.as_ref().map_or(f64::NAN, |p| p.slot_of.len() as f64);
+        v
+    }
+
     pub fn layer_page_counters(&self, layer: u32) -> (u64, u64) {
         match self.layers.get(layer as usize).and_then(|l| l.as_ref()).and_then(|l| l.page.as_ref()) {
             Some(pg) => (pg.misses, pg.read_ns + pg.h2d_ns + pg.repack_gpu_ns),
@@ -2989,12 +3113,23 @@ impl ExpertShard {
 
     fn ensure_layer_inner(&mut self, layer: u32, ids: &[i32], mut missed: Option<&mut Vec<u32>>, prefill_shaped: bool) -> eyre::Result<()> {
         let pinned: Vec<(u32, u32)> = self.pinned.iter().chain(self.parked_pins.iter()).copied().collect();
+        // `evtrace` (`b2_ensure` + one `b2_read` per demand miss): NaN when off.
+        let ev_on = super::evtrace::enabled();
+        let nan = f64::NAN;
+        let ev_t0 = if ev_on { super::evtrace::now() } else { nan };
+        let ev_q0 = match (ev_on, self.prefetch.as_ref()) {
+            (true, Some(p)) => p.queue.counts(),
+            _ => [nan; 4],
+        };
+        self.ev_admit = [0; 4];
         // Land completed look-ahead prefetches first (any layer): nothing reads
         // the pool here, and this layer's picks are protected from eviction.
         if self.prefetch.is_some() {
             let want_pre: Vec<u32> = ids.iter().filter(|&&e| (0..N_EXPERT as i32).contains(&e)).map(|&e| e as u32).collect();
             self.admit_prefetched(layer, &want_pre)?;
         }
+        let ev_admit = self.ev_admit;
+        let ev_t_admit = if ev_on { super::evtrace::now() } else { nan };
         let Some(l) = self.layers.get_mut(layer as usize).and_then(|l| l.as_mut()) else {
             // Catch-all needs a region on EVERY layer the hub can send. An
             // encoder-only assignment (e.g. `L0-L19:...`) has none for layers
@@ -3015,10 +3150,12 @@ impl ExpertShard {
         // This layer's remap may be stale because ANOTHER layer evicted one of its
         // slots. Re-upload before anything reads it. Lazy on purpose: an eviction
         // never touches a foreign device buffer, only the host mirror + this flag.
+        let ev_dirty_upload = pool.dirty[layer as usize];
         if pool.dirty[layer as usize] {
             l.remap_dev.copy_from_host(&pool.remap_hosts[layer as usize])?;
             pool.dirty[layer as usize] = false;
         }
+        let ev_t_dirty = if ev_on { super::evtrace::now() } else { nan };
         // ONE POOL for all layers. The per-layer carve was never load-bearing: it
         // is just the ownership count spread evenly across 40 layers, and grouping
         // residency by layer is not what the working set looks like -- a layer that
@@ -3046,6 +3183,7 @@ impl ExpertShard {
         let repack_stream = self.repack_stream.as_ref();
         let stages = &mut self.stages;
         let direct = self.direct;
+        let prefetch_q = self.prefetch.as_ref().map(|p| &*p.queue);
         let mut dirty = false;
         let mut want: Vec<u32> = Vec::with_capacity(ids.len());
         for &e in ids {
@@ -3055,6 +3193,9 @@ impl ExpertShard {
         }
         let bpe = [r.gate_bytes_per_expert, r.up_bytes_per_expert, r.down_bytes_per_expert];
         let mut pending: Vec<(u32, u32)> = Vec::new();
+        // `evtrace`, parallel to `pending`: victim-search ns and the evicted owner.
+        let mut ev_miss: Vec<(f64, Option<(u32, u32)>)> = Vec::new();
+        let (mut ev_hits, mut ev_scan_ns, mut ev_foreign, mut ev_free) = (0u32, 0f64, 0u32, 0u32);
         // First error of the call. Victim search and reads stop on it, and every
         // slot claimed but not yet landed is rolled back below, so the pool never
         // reports an expert resident that nobody wrote.
@@ -3070,6 +3211,7 @@ impl ExpertShard {
                 } else {
                     *lu = pool.tick + PREFILL_AGE;
                 }
+                ev_hits += 1;
                 continue;
             }
             pg.misses += 1;
@@ -3115,7 +3257,11 @@ impl ExpertShard {
             // union exceeds its own share used to die with "no evictable slot"
             // while thousands of slots sat evictable in other layers' regions.
             // Borrowing is always better than failing the request.
-            let Some(victim) = pick(global, pool).or_else(|| pick(true, pool)) else {
+            let ev_t_scan = std::time::Instant::now();
+            let victim_found = pick(global, pool).or_else(|| pick(true, pool));
+            let ev_scan = ev_t_scan.elapsed().as_nanos() as f64;
+            ev_scan_ns += ev_scan;
+            let Some(victim) = victim_found else {
                 failed = Some(eyre!(
                     "expert shard: layer {layer} has no evictable slot anywhere \
                      (want {} > region {n_region}, pool {} slots)",
@@ -3126,6 +3272,12 @@ impl ExpertShard {
             };
             // Detach from whoever held it — possibly a DIFFERENT layer, whose
             // device remap is then stale until its next `ensure_layer`.
+            let ev_victim = pool.owner_of[victim as usize];
+            match ev_victim {
+                Some((ol, _)) => ev_foreign += u32::from(ol != layer),
+                None => ev_free += 1,
+            }
+            ev_miss.push((ev_scan, ev_victim));
             if let Some((ol, oe)) = pool.owner_of[victim as usize].take() {
                 pool.slot_of.remove(&(ol, oe));
                 pool.remap_hosts[ol as usize][oe as usize] = 0;
@@ -3156,13 +3308,22 @@ impl ExpertShard {
         // and a single miss already issues 3 role reads split across both drives,
         // so 4 concurrent misses put ~24 on the primary drive (2026-09-22).
         let k = knobs::miss_par().min(stages.len()).max(1);
-        for chunk in pending.chunks(k) {
+        let ev_t_victims = if ev_on { super::evtrace::now() } else { nan };
+        let mut ev_chunks = 0u32;
+        for (ev_ci, chunk) in pending.chunks(k).enumerate() {
             if failed.is_some() {
                 break;
             }
+            ev_chunks += 1;
             let rp0 = v4flash_core::hf_v41::expert_read_profile();
             let t_r = std::time::Instant::now();
-            type R = Result<([Option<(usize, usize, u32, u32)>; 3], bool), String>;
+            let ev_t_chunk = if ev_on { super::evtrace::now() } else { nan };
+            let ev_q_chunk = match (ev_on, prefetch_q) {
+                (true, Some(q)) => q.counts(),
+                _ => [nan; 4],
+            };
+            // (offsets, coalesced, evtrace: read start, read end, role (start, end) x3)
+            type R = Result<([Option<(usize, usize, u32, u32)>; 3], bool, [f64; 8]), String>;
             // Raw pointers into the persistent pinned staging (like the prefetch
             // thread's `SetPtr`): the reader threads must not BORROW `stages`, or
             // the borrow lasts for the whole scope and no expert can repack until
@@ -3182,8 +3343,15 @@ impl ExpertShard {
                         let (b0, b1, b2) = unsafe {
                             (std::slice::from_raw_parts_mut(sp.p[0], sp.n[0]), std::slice::from_raw_parts_mut(sp.p[1], sp.n[1]), std::slice::from_raw_parts_mut(sp.p[2], sp.n[2]))
                         };
-                        Self::read_miss_into(owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2)
-                            .map_err(|err| format!("{err:#}"))
+                        let t0 = if ev_on { super::evtrace::now() } else { f64::NAN };
+                        let r = Self::read_miss_into(owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2);
+                        let mut ev = [f64::NAN; 8];
+                        if ev_on {
+                            ev[0] = t0;
+                            ev[1] = super::evtrace::now();
+                            ev[2..].copy_from_slice(&EV_ROLES.with(|c| c.replace([f64::NAN; 6])));
+                        }
+                        r.map(|(offs, coalesced)| (offs, coalesced, ev)).map_err(|err| format!("{err:#}"))
                     }));
                 }
                 // Join in spawn order and repack each expert as soon as ITS read
@@ -3194,9 +3362,10 @@ impl ExpertShard {
                 for (j, h) in hs.into_iter().enumerate() {
                     let (e, victim) = chunk[j];
                     let res: R = h.join().unwrap_or_else(|_| Err("miss reader panicked".into()));
-                    let (offs, coalesced) = res.map_err(|m| eyre!("expert shard: layer {layer} expert {e}: {m}"))?;
+                    let (offs, coalesced, ev_rd) = res.map_err(|m| eyre!("expert shard: layer {layer} expert {e}: {m}"))?;
                     let st = &stages[j];
                     let t_h = std::time::Instant::now();
+                    let ev_t_h = if ev_on { super::evtrace::now() } else { f64::NAN };
                     match (repack, repack_stream) {
                         (Some(rp), Some(rs)) => {
                             pg.repack_gpu_ns += Self::repack_in_place(rp, rs, r, victim, st, &offs, coalesced)?;
@@ -3211,9 +3380,25 @@ impl ExpertShard {
                             }
                         }
                     }
-                    h2d_ns += t_h.elapsed().as_nanos() as u64;
+                    let ev_repack_ns = t_h.elapsed().as_nanos() as u64;
+                    h2d_ns += ev_repack_ns;
                     pool.remap_hosts[layer as usize][e as usize] = -(victim as i32) - 1;
                     dirty = true;
+                    if ev_on {
+                        let (scan, vic) = ev_miss.get(ev_ci * k + j).copied().unwrap_or((f64::NAN, None));
+                        let (vl, ve) = vic.map_or((f64::NAN, f64::NAN), |(l, e)| (f64::from(l), f64::from(e)));
+                        let mut v = vec![
+                            0.0, ev_cur_seq(), f64::from(layer), f64::from(e), f64::from(victim), vl, ve, j as f64,
+                            ev_t0, ev_t_chunk, ev_rd[0], ev_rd[1], ev_t_h, ev_t_h, super::evtrace::now(),
+                            f64::NAN, f64::NAN, f64::NAN, ev_q_chunk[0], ev_q_chunk[1],
+                        ];
+                        v.extend_from_slice(&ev_rd[2..8]);
+                        v.extend_from_slice(&[
+                            1.0, 1.0, f64::from(u8::from(coalesced)), scan, ev_repack_ns as f64,
+                            chunk.len() as f64, ev_ci as f64, 0.0,
+                        ]);
+                        super::evtrace::emit(&super::evtrace_kinds::B2_READ, &v);
+                    }
                 }
                 Ok(())
             });
@@ -3248,9 +3433,23 @@ impl ExpertShard {
             pool.dirty[layer as usize] = true;
             return Err(err);
         }
+        let ev_t_reads = if ev_on { super::evtrace::now() } else { nan };
+        let ev_t_up = std::time::Instant::now();
         if dirty {
             l.remap_dev.copy_from_host(&pool.remap_hosts[layer as usize])?;
             pool.dirty[layer as usize] = false;
+        }
+        if ev_on {
+            let n_miss = pending.len();
+            super::evtrace::emit(&super::evtrace_kinds::B2_ENSURE, &[
+                ev_cur_seq(), f64::from(layer), ids.len() as f64, want.len() as f64, f64::from(ev_hits), n_miss as f64,
+                f64::from(u8::from(prefill_shaped)),
+                ev_t0, ev_t_admit, ev_t_dirty, ev_t_victims, ev_t_reads, super::evtrace::now(),
+                ev_admit[0] as f64, ev_admit[1] as f64, ev_admit[2] as f64, ev_admit[3] as f64,
+                ev_scan_ns, f64::from(ev_foreign), f64::from(ev_free), k as f64, f64::from(ev_chunks),
+                f64::from(u8::from(ev_dirty_upload)), if dirty { ev_t_up.elapsed().as_nanos() as f64 } else { 0.0 },
+                ev_q0[0], ev_q0[1], ev_q0[2], ev_q0[3],
+            ]);
         }
         Ok(())
     }
@@ -3362,6 +3561,10 @@ impl ExpertShard {
                 // The caller's background mark (io_throttle) must reach the role
                 // threads: thread-locals do not cross `spawn`.
                 let bg = v4flash_core::io_throttle::background();
+                // `evtrace`: each role thread's (start, end) raw ns.
+                let ev_on = super::evtrace::enabled();
+                let ev_roles: [std::sync::atomic::AtomicU64; 6] = Default::default();
+                let ev_roles_ref = &ev_roles;
                 std::thread::scope(|sc| {
                     let h: Vec<_> = bufs
                         .into_iter()
@@ -3372,6 +3575,10 @@ impl ExpertShard {
                             let bi = bpe[i];
                             type R = Result<Option<(usize, usize, u32, u32)>, String>;
                             sc.spawn(move || -> R {
+                                if ev_on {
+                                    ev_roles_ref[2 * i].store(monotonic_raw_ns(), std::sync::atomic::Ordering::Relaxed);
+                                }
+                                let r = (move || -> R {
                                 v4flash_core::io_throttle::set_background(bg);
                                 let t = src.tensor(&name).ok_or(format!("missing {name}"))?;
                                 if gpu_repack && direct {
@@ -3394,6 +3601,11 @@ impl ExpertShard {
                                         .map(|_| None)
                                         .map_err(|err| format!("{name}: {err}"))
                                 }
+                                })();
+                                if ev_on {
+                                    ev_roles_ref[2 * i + 1].store(monotonic_raw_ns(), std::sync::atomic::Ordering::Relaxed);
+                                }
+                                r
                             })
                         })
                         .collect();
@@ -3405,6 +3617,14 @@ impl ExpertShard {
                         }
                     }
                 });
+                if ev_on {
+                    let mut t = [f64::NAN; 6];
+                    for (d, a) in t.iter_mut().zip(ev_roles.iter()) {
+                        let v = a.load(std::sync::atomic::Ordering::Relaxed);
+                        if v != 0 { *d = v as f64; }
+                    }
+                    EV_ROLES.with(|c| c.set(t));
+                }
                 if let Some(msg) = errs.first() {
                     return Err(eyre!("expert shard: layer {layer} expert {e}: {msg}"));
                 }
@@ -4467,15 +4687,19 @@ pub fn serve_connection(
         // threads (a t3 taken in the compute thread would include the handoff).
         sc.spawn(move || {
             for (mut buf, _t_ready, seq) in rx_out {
+                let mut ev_t3 = f64::NAN;
                 if buf.len() >= proto::RESP_T3_OFF + 8
                     && matches!(proto::parse_header(buf.as_bytes()), Ok(h) if h.kind == proto::KIND_RESPONSE)
                 {
-                    proto::patch_u64(&mut buf, proto::RESP_T3_OFF, monotonic_raw_ns());
+                    let t3 = monotonic_raw_ns();
+                    ev_t3 = t3 as f64;
+                    proto::patch_u64(&mut buf, proto::RESP_T3_OFF, t3);
                 }
                 if let Err(e) = wr.write_all(buf.as_bytes()) {
                     eprintln!("expertd: write error: {e}");
                     return;
                 }
+                super::evtrace::emit(&super::evtrace_kinds::B2_WRITE, &[f64::from(seq), ev_t3, super::evtrace::now(), buf.len() as f64]);
                 let _ = tx_written.send((seq, Instant::now()));
                 let _ = tx_resp_recycle.send(buf);
             }
@@ -4544,6 +4768,17 @@ pub fn serve_connection(
                 eprintln!("expertd: {}", knobs::reload());
             }
             let t_start = Instant::now();
+            // `evtrace` (`b2_req`): stamps + reader state at dequeue.
+            let ev_on = super::evtrace::enabled();
+            let nan = f64::NAN;
+            let ev_t_dequeue = if ev_on { super::evtrace::now() } else { nan };
+            let (ev_t_hdr, ev_t_frame) = if ev_on { (super::evtrace::inst_to_raw(t_first), t2 as f64) } else { (nan, nan) };
+            let ev_idle_us = t_prev_ready.map_or(nan, |p| t_start.saturating_duration_since(p).as_secs_f64() * 1e6);
+            let ev_pf0 = if ev_on { shard.ev_pf_snapshot() } else { [nan; 12] };
+            let mut ev_promised = nan;
+            if ev_on {
+                EV_CUR_SEQ.store(u64::from(hdr.seq), std::sync::atomic::Ordering::Relaxed);
+            }
             if let Some(p) = t_prev_ready {
                 w_idle_ns += t_start.saturating_duration_since(p).as_nanos() as u64;
             }
@@ -4593,6 +4828,7 @@ pub fn serve_connection(
                 let partner_promised = proto::decode_request(&buf)
                     .map(|r| r.flags & proto::REQ_FLAG_PARTNER != 0)
                     .unwrap_or(false);
+                ev_promised = f64::from(u8::from(partner_promised));
                 let from_pending = matches!(pending.front(),
                     Some(Inbound::Frame { hdr: h2, buf: buf2, .. }) if h2.kind == proto::KIND_REQUEST && mergeable(buf2));
                 if !pending.is_empty() && !from_pending {
@@ -4633,6 +4869,8 @@ pub fn serve_connection(
                     }
                 }
             }
+            let ev_t_merge = if ev_on { super::evtrace::now() } else { nan };
+            let ev_partner = partner.as_ref().map(|p| (f64::from(p.0.seq), p.1.len()));
             let outcome: eyre::Result<(RequestRecord, u32, Option<(RequestRecord, u32, AlignedBuf)>)> = (|| {
                 let req = proto::decode_request(&buf)?;
                 if req.n_used != N_EXPERT_USED as u32 || req.xq_bpt != XQ_BYTES_PER_TOKEN as u32 {
@@ -4670,6 +4908,9 @@ pub fn serve_connection(
                 if !req.prefetch.is_empty() {
                     shard.prefetch_words(req.prefetch);
                 }
+                let ev_t_hints = if ev_on { super::evtrace::now() } else { nan };
+                let ev_pd0 = shard.layer_page_detail(req.layer);
+                let ev_pw0 = shard.prefetch_wait_ns;
                 let (miss0, page_ns0) = shard.layer_page_counters(req.layer);
                 // Early paging for the NEXT queued request: the daemon used to
                 // start B's misses only after A's reply, so with two hub lanes
@@ -4857,7 +5098,9 @@ pub fn serve_connection(
                     }
                     None => (req.xq, req.sel, req.ew),
                 };
+                let ev_t_run0 = if ev_on { super::evtrace::now() } else { nan };
                 let timing = exec.run_path(shard, req.layer, b + bb, xq_run, sel_run, ew_run, req.flags & proto::REQ_FLAG_BATCHED != 0, &mut overlap)?;
+                let ev_t_run1 = if ev_on { super::evtrace::now() } else { nan };
                 drop(overlap);
                 w_park_wait_ns += this_park_wait_ns;
                 w_park_serve_ns += this_park_serve_ns;
@@ -4880,6 +5123,7 @@ pub fn serve_connection(
                 } else {
                     exec.read_f16_at(0, b, resp.view_mut::<u16>(proto::RESP_DATA_OFF, n))?;
                 }
+                let ev_t_d2h = if ev_on { super::evtrace::now() } else { nan };
                 if req.flags & proto::REQ_FLAG_RESID != 0 {
                     proto::append_residency(&mut resp, &shard.residency_words(req.layer));
                 }
@@ -4972,6 +5216,63 @@ pub fn serve_connection(
                     t1: req.t1,
                     t2,
                 };
+                if ev_on {
+                    let pd1 = shard.layer_page_detail(req.layer);
+                    let pf1 = shard.ev_pf_snapshot();
+                    let d = |i: usize| pd1[i].saturating_sub(ev_pd0[i]) as f64;
+                    let mut sel: Vec<i32> = req.sel.iter().copied().filter(|&e| e >= 0).collect();
+                    let n_sel = sel.len();
+                    sel.sort_unstable();
+                    sel.dedup();
+                    let (pseq, pb) = ev_partner.map_or((nan, nan), |(s, _)| (s, bb as f64));
+                    let mut v = vec![
+                        f64::from(hdr.seq), f64::from(req.layer), f64::from(req.b), f64::from(req.flags),
+                        f64::from(u8::from(ev_partner.is_some())), pseq, pb, ev_promised, nan,
+                        ev_t_hdr, ev_t_frame, ev_t_dequeue, ev_t_merge, ev_t_hints, ev_t_run0, ev_t_run1, ev_t_d2h,
+                        super::evtrace::inst_to_raw(t_ready),
+                        depth_on_take as f64, pending_ref.len() as f64, ev_idle_us,
+                        n_sel as f64, sel.len() as f64, req.hint_admit.len() as f64, req.prefetch.len() as f64,
+                        f64::from(n_miss_req), f64::from(t_page_us), f64::from(t_compute_us), f64::from(t_server_us),
+                        d(0), d(1), d(2), d(3), d(4), d(5), shard.prefetch_wait_ns.saturating_sub(ev_pw0) as f64,
+                        this_park_wait_ns as f64, this_park_serve_ns as f64,
+                        f64::from(u8::from(timing.path_decode)), f64::from(u8::from(timing.two_pass)),
+                        f64::from(timing.n_work_items), f64::from(timing.n_missing),
+                        timing.h2d.as_secs_f64() * 1e6, timing.gpu.as_secs_f64() * 1e6,
+                    ];
+                    v.extend_from_slice(&ev_pf0[..6]);
+                    for i in 6..11 {
+                        v.push(pf1[i] - ev_pf0[i]);
+                    }
+                    v.push(pf1[11]);
+                    super::evtrace::emit(&super::evtrace_kinds::B2_REQ, &v);
+                    // The merged partner: same pass, its own identity and arrival.
+                    if let (Some(rb), Some((hb, _, tfb, _, t2b))) = (reqb.as_ref(), partner.as_ref()) {
+                        let k = &super::evtrace_kinds::B2_REQ;
+                        let mut sel_b: Vec<i32> = rb.sel.iter().copied().filter(|&e| e >= 0).collect();
+                        let n_sel_b = sel_b.len();
+                        sel_b.sort_unstable();
+                        sel_b.dedup();
+                        for (name, x) in [
+                            ("seq", f64::from(hb.seq)), ("b", f64::from(rb.b)), ("flags", f64::from(rb.flags)), ("merged", 2.0),
+                            ("partner_seq", f64::from(hdr.seq)), ("partner_b", b as f64),
+                            ("t_hdr", super::evtrace::inst_to_raw(*tfb)), ("t_frame", *t2b as f64),
+                            ("n_sel", n_sel_b as f64), ("n_distinct", sel_b.len() as f64),
+                            ("n_hint_admit", rb.hint_admit.len() as f64), ("n_prefetch_words", rb.prefetch.len() as f64),
+                            ("n_miss", 0.0), ("page_us", 0.0), ("server_us", nan),
+                            // Per-PASS quantities are the carrier's: NaN here so
+                            // a sum over rows counts each pass once.
+                            ("d_misses", nan), ("d_read_ns", nan), ("d_h2d_ns", nan), ("d_repack_gpu_ns", nan),
+                            ("d_pread_ns", nan), ("d_repack_cpu_ns", nan), ("d_prefetch_wait_ns", nan),
+                            ("park_wait_ns", nan), ("park_serve_ns", nan), ("n_work_items", nan), ("n_missing", nan),
+                            ("exec_h2d_us", nan), ("exec_gpu_us", nan),
+                            ("pf_d_hinted", nan), ("pf_d_admitted", nan), ("pf_d_dropped", nan), ("pf_d_waited", nan),
+                            ("pf_d_promoted", nan),
+                        ] {
+                            super::evtrace::set_named(k, &mut v, name, x);
+                        }
+                        super::evtrace::emit(k, &v);
+                    }
+                }
                 Ok((rec, hdr.seq, extra))
             })();
             let _ = tx_req_recycle.send(buf);
@@ -5123,6 +5424,17 @@ fn serve_interleaved(
     mut resp: AlignedBuf,
 ) -> eyre::Result<(RequestRecord, AlignedBuf)> {
     let t_start = Instant::now();
+    // `evtrace`: records under this request carry ITS seq; the parked
+    // request's is restored on every exit (the guard), incl. errors.
+    struct SeqGuard(u64);
+    impl Drop for SeqGuard {
+        fn drop(&mut self) {
+            EV_CUR_SEQ.store(self.0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let ev_on = super::evtrace::enabled();
+    let ev_t_dequeue = if ev_on { super::evtrace::now() } else { f64::NAN };
+    let ev_guard = ev_on.then(|| SeqGuard(EV_CUR_SEQ.swap(u64::from(hdr.seq), std::sync::atomic::Ordering::Relaxed)));
     let req = proto::decode_request(buf)?;
     if req.n_used != N_EXPERT_USED as u32 || req.xq_bpt != XQ_BYTES_PER_TOKEN as u32 {
         return Err(eyre!("request geometry n_used={} xq_bpt={} != {}/{}", req.n_used, req.xq_bpt, N_EXPERT_USED, XQ_BYTES_PER_TOKEN));
@@ -5134,8 +5446,12 @@ fn serve_interleaved(
     if !req.prefetch.is_empty() {
         shard.prefetch_words(req.prefetch);
     }
+    let ev_pd0 = shard.layer_page_detail(req.layer);
+    let ev_pw0 = shard.prefetch_wait_ns;
+    let ev_t_run0 = if ev_on { super::evtrace::now() } else { f64::NAN };
     let (miss0, page_ns0) = shard.layer_page_counters(req.layer);
     let timing = exec.run_path(shard, req.layer, b, req.xq, req.sel, req.ew, req.flags & proto::REQ_FLAG_BATCHED != 0, &mut |_, _| Ok(()))?;
+    let ev_t_run1 = if ev_on { super::evtrace::now() } else { f64::NAN };
     let (miss1, page_ns1) = shard.layer_page_counters(req.layer);
     let t_page_us = (page_ns1.saturating_sub(page_ns0) / 1000).min(u32::MAX as u64) as u32;
     let n_miss_req = miss1.saturating_sub(miss0).min(u32::MAX as u64) as u32;
@@ -5153,12 +5469,37 @@ fn serve_interleaved(
     } else {
         exec.read_f16_at(0, b, resp.view_mut::<u16>(proto::RESP_DATA_OFF, n))?;
     }
+    let ev_t_d2h = if ev_on { super::evtrace::now() } else { f64::NAN };
     if req.flags & proto::REQ_FLAG_RESID != 0 {
         proto::append_residency(&mut resp, &shard.residency_words(req.layer));
     }
     proto::patch_len(&mut resp);
     let t_ready = Instant::now();
     let t_server_us = (t_ready - t_done).as_micros() as u32;
+    if let Some(g) = ev_guard.as_ref() {
+        let pd1 = shard.layer_page_detail(req.layer);
+        let d = |i: usize| pd1[i].saturating_sub(ev_pd0[i]) as f64;
+        let mut sel: Vec<i32> = req.sel.iter().copied().filter(|&e| e >= 0).collect();
+        let n_sel = sel.len();
+        sel.sort_unstable();
+        sel.dedup();
+        let under = if g.0 == u64::MAX { f64::NAN } else { g.0 as f64 };
+        super::evtrace::emit_named(&super::evtrace_kinds::B2_REQ, &[
+            ("seq", f64::from(hdr.seq)), ("layer", f64::from(req.layer)), ("b", f64::from(req.b)), ("flags", f64::from(req.flags)),
+            ("merged", 0.0), ("served_under", under),
+            ("t_hdr", super::evtrace::inst_to_raw(t_first)), ("t_frame", t2 as f64), ("t_dequeue", ev_t_dequeue),
+            ("t_run_start", ev_t_run0), ("t_run_end", ev_t_run1), ("t_d2h_end", ev_t_d2h), ("t_ready", super::evtrace::inst_to_raw(t_ready)),
+            ("n_sel", n_sel as f64), ("n_distinct", sel.len() as f64),
+            ("n_hint_admit", req.hint_admit.len() as f64), ("n_prefetch_words", req.prefetch.len() as f64),
+            ("n_miss", f64::from(n_miss_req)), ("page_us", f64::from(t_page_us)), ("compute_us", f64::from(t_compute_us)),
+            ("server_us", f64::from(t_server_us)),
+            ("d_misses", d(0)), ("d_read_ns", d(1)), ("d_h2d_ns", d(2)), ("d_repack_gpu_ns", d(3)), ("d_pread_ns", d(4)),
+            ("d_repack_cpu_ns", d(5)), ("d_prefetch_wait_ns", shard.prefetch_wait_ns.saturating_sub(ev_pw0) as f64),
+            ("path_decode", f64::from(u8::from(timing.path_decode))), ("two_pass", f64::from(u8::from(timing.two_pass))),
+            ("n_work_items", f64::from(timing.n_work_items)), ("n_missing", f64::from(timing.n_missing)),
+            ("exec_h2d_us", timing.h2d.as_secs_f64() * 1e6), ("exec_gpu_us", timing.gpu.as_secs_f64() * 1e6),
+        ]);
+    }
     resp.as_bytes_mut()[proto::HDR_LEN + 20..proto::HDR_LEN + 24].copy_from_slice(&t_server_us.to_le_bytes());
     resp.as_bytes_mut()[proto::RESP_PAGE_OFF..proto::RESP_PAGE_OFF + 4].copy_from_slice(&t_page_us.to_le_bytes());
     resp.as_bytes_mut()[proto::RESP_MISSN_OFF..proto::RESP_MISSN_OFF + 4].copy_from_slice(&n_miss_req.to_le_bytes());
@@ -5256,6 +5597,11 @@ pub struct Ticket {
     pub b: u32,
     pub bytes_out: usize,
     pub t_submit: Instant,
+    /// The flags as SENT (incl. HINTS / PREFETCH / OOO / DECODE), and how many
+    /// residency hints and prefetch words rode on the frame (`evtrace`).
+    pub flags: u32,
+    pub n_hints: u32,
+    pub n_pf_words: u32,
 }
 
 /// One layer's remote partial sums: `b × N_EMBD` elements of f16 (default) or
@@ -5747,7 +6093,10 @@ impl RemoteExpertClient {
             &mut buf, seq, layer, b as u32, flags, nu as u32, XQ_BYTES_PER_TOKEN as u32, xq,
             &self.sel_scratch[..b * nu], &self.ew_scratch[..b * nu], (&ha, &he), &pf,
         );
-        let ticket = Ticket { seq, layer, b: b as u32, bytes_out: buf.len(), t_submit: Instant::now() };
+        let ticket = Ticket {
+            seq, layer, b: b as u32, bytes_out: buf.len(), t_submit: Instant::now(),
+            flags, n_hints: (ha.len() + he.len()) as u32, n_pf_words: pf.len() as u32,
+        };
         let sent = match self.tx_req.as_ref() {
             Some(tx) => tx
                 .send((buf, monotonic_raw_ns()))
