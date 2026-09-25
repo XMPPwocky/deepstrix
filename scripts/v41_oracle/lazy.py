@@ -33,25 +33,41 @@ class LazyMoE(torch.nn.Module):
         self.gate = ref.Gate(layer_id, args)
         self.shared_experts = ref.Expert(args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit)
         self.touched: dict[int, int] = {}  # expert -> tokens (stats)
+        # oracle.py --expert-rt: an expert_rt.ExpertRT serving round-tripped weights for
+        # the experts it covers (shared across layers). None = the checkpoint's weights.
+        self.rt = None
+        # oracle.py --imatrix-capture: {"x2": [E, dim], "h2": [E, inter], "n": [E]} sums of
+        # squares of each expert's two GEMM inputs over its routed rows. None = off.
+        self.imx = None
 
     def _w(self, e: int, which: str) -> torch.Tensor:
         p = f"{self.prefix}experts.{e}.{which}."
         return dequant_fp4(self.ckpt.get(p + "weight"), self.ckpt.get(p + "scale"))
 
-    def _expert(self, e: int, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        """ref.Expert.forward with dequant-on-demand weights. x [n,dim] bf16."""
+    def _expert(self, e: int, x: torch.Tensor, w: torch.Tensor, W: dict | None = None,
+                capture: bool = False) -> torch.Tensor:
+        """ref.Expert.forward with dequant-on-demand weights. x [n,dim] bf16.
+        W: replacement f32 weights {"w1","w3","w2"} (--expert-rt); capture: accumulate
+        the imatrix sums for this expert (--imatrix-capture)."""
         dtype = x.dtype
+        wt = (lambda which: W[which]) if W is not None else (lambda which: self._w(e, which))
         xq, xs = act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu)
         xf = (xq.float().view(*xq.shape[:-1], -1, 32) * xs.float().unsqueeze(-1)).view(*xq.shape)
-        gate = xf @ self._w(e, "w1").t()
-        up = xf @ self._w(e, "w3").t()
+        gate = xf @ wt("w1").t()
+        up = xf @ wt("w3").t()
         if self.swiglu_limit > 0:
             up = up.clamp(-self.swiglu_limit, self.swiglu_limit)
             gate = gate.clamp(max=self.swiglu_limit)
         h = (w * (F.silu(gate) * up)).to(dtype)
         hq, hs = act_quant(h, 32, "ue8m0", torch.float8_e8m0fnu)
         hf = (hq.float().view(*hq.shape[:-1], -1, 32) * hs.float().unsqueeze(-1)).view(*hq.shape)
-        return hf @ self._w(e, "w2").t()
+        if capture:
+            # the two GEMM inputs exactly as the experts see them (FP8-act-quantised; the
+            # routing weight is already folded into h, so hf is w2's real input)
+            self.imx["x2"][e] += xf.pow(2).sum(0)
+            self.imx["h2"][e] += hf.pow(2).sum(0)
+            self.imx["n"][e] += xf.shape[0]
+        return hf @ wt("w2").t()
 
     def forward(self, x: torch.Tensor, image_mask=None) -> torch.Tensor:
         shape = x.size()
@@ -62,10 +78,19 @@ class LazyMoE(torch.nn.Module):
         # Null-control hook (oracle.py --swap-mode bf16): rows whose rank-k expert's
         # contribution is rounded to bf16 instead of being swapped. None = off.
         rnd = getattr(self, "bf16_round", None)
-        for e in torch.unique(indices).tolist():
+        order = torch.unique(indices).tolist()
+        if self.rt is not None:
+            self.rt.begin_layer(self.layer_id, order)
+        for e in order:
             idx, top = torch.where(indices == e)
             self.touched[e] = self.touched.get(e, 0) + idx.numel()
-            out = self._expert(e, x[idx], weights[idx, top, None])
+            W = None
+            if self.rt is not None:
+                self.rt.stats["calls"] += idx.numel()
+                if self.rt.covers(self.layer_id, e):
+                    W = self.rt.get(self.layer_id, e)
+                    self.rt.stats["rt_calls"] += idx.numel()
+            out = self._expert(e, x[idx], weights[idx, top, None], W=W, capture=self.imx is not None)
             if rnd is not None:
                 rows, experts = rnd
                 if rows.dim() == 2:  # [n, k] site mask over the picks (any-rank null)

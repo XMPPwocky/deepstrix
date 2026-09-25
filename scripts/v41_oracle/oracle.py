@@ -102,6 +102,13 @@ def main():
                     help="per layer, log this many swapped rows: routing before/after and ||dFFN|| "
                          "(recomputes those rows' FFN with the original routing) to swap_checks.json")
     ap.add_argument("--no-layer-dumps", action="store_true", help="skip per-layer residual/routing files")
+    ap.add_argument("--expert-rt", help="replace covered routed experts' weights by a ggml round trip: "
+                    "q8_0 (quantized on the fly) or cache:DIR (pre-quantized by build_rt_cache.py)")
+    ap.add_argument("--expert-rt-cover", default="all",
+                    help="'all', or a hot-set JSON (one id list per layer): cover only the experts NOT in it")
+    ap.add_argument("--expert-rt-threads", type=int, default=8, help="dequant threads for --expert-rt")
+    ap.add_argument("--imatrix-capture", help="write the in-sample imatrix (per expert, sums of squares of its "
+                    "two GEMM inputs over its routed rows, plus row counts) to this .pt")
     a = ap.parse_args()
     rand_dtype = getattr(torch, a.swap_rand_dtype)
     if a.swap_eps is not None:
@@ -125,6 +132,11 @@ def main():
     os.makedirs(a.out, exist_ok=True)
 
     ckpt = Checkpoint(MODEL)
+    rt = None
+    if a.expert_rt:
+        from expert_rt import ExpertRT, load_cover
+        rt = ExpertRT(a.expert_rt, ckpt, load_cover(a.expert_rt_cover), threads=a.expert_rt_threads)
+    imx_all = {} if a.imatrix_capture else None
     tok = _TokShim(os.path.join(MODEL, "tokenizer.json"))
     if a.prompt_ids:
         ids = [int(x) for x in a.prompt_ids.split(",")]  # verbatim token ids (incl. BOS)
@@ -178,6 +190,12 @@ def main():
             from lazy import _assign
             _assign(getattr(block, nm), ckpt.get(pfx + nm), pfx + nm)
         block.ffn = LazyMoE(L, args, ckpt, pfx + "ffn.")
+        block.ffn.rt = rt
+        if imx_all is not None:
+            E_, f32 = args.n_routed_experts, torch.float32
+            block.ffn.imx = imx_all[L] = {"x2": torch.zeros(E_, args.dim, dtype=f32),
+                                          "h2": torch.zeros(E_, args.moe_inter_dim, dtype=f32),
+                                          "n": torch.zeros(E_, dtype=torch.int64)}
         missing += load_module(block.ffn.gate, ckpt, pfx + "ffn.gate.")
         missing += load_module(block.ffn.shared_experts, ckpt, pfx + "ffn.shared_experts.")
         if layout is not None and L in layout.layer_ids:
@@ -418,6 +436,14 @@ def main():
                 chunks.append(head(norm(x[:, c0:c0 + 32]), full_logits=True).float()[0].cpu())
             torch.save(torch.cat(chunks), os.path.join(a.out, "logits_all.pt"))
     torch.save(logits.float(), os.path.join(a.out, "logits_last.pt"))
+    if imx_all is not None:
+        torch.save(imx_all, a.imatrix_capture)
+        print(f"imatrix capture: {len(imx_all)} layers, "
+              f"{sum(int((v['n'] > 0).sum()) for v in imx_all.values())} experts with data -> {a.imatrix_capture}")
+    if rt is not None:
+        st = rt.stats
+        print(f"expert-rt {a.expert_rt} cover={a.expert_rt_cover}: {st['rt_calls']} of {st['calls']} expert calls "
+              f"({st['rt_calls'] / max(1, st['calls']):.1%}) used round-tripped weights, {st['experts']} expert loads")
     if a.golden:
         import hashlib, subprocess
         files = {}
@@ -446,6 +472,9 @@ def main():
                        "mean": sum(v) / len(v), "p50": sorted(v)[len(v) // 2], "p90": sorted(v)[int(len(v) * .9)],
                        "p99": sorted(v)[int(len(v) * .99)], "max": max(v)})})(inherit_absdiff),
                    "swap_counts_per_layer": swap_counts,
+                   "expert_rt": a.expert_rt, "expert_rt_cover": a.expert_rt_cover,
+                   "expert_rt_stats": None if rt is None else rt.stats,
+                   "expert_rt_meta": getattr(rt, "meta", None), "imatrix_capture": a.imatrix_capture,
                    "model_dir": MODEL, "config_sha256": cfg_sha, "reference_model_py_sha256": model_py_sha,
                    "oracle_rev": rev or os.environ.get("V41_ORACLE_REV", ""), "files": files},
                   open(os.path.join(a.out, "manifest.json"), "w"), indent=1)
