@@ -11,7 +11,11 @@ fn pinned_readback_on_non_blocking_stream() {
         eprintln!("skip: no HIP devices");
         return;
     };
-    for dev in devices {
+    for (i, &dev) in devices.iter().enumerate() {
+        // The route runs with the pager's device (the iGPU) possibly current:
+        // make ANOTHER device current, so the copy must follow its stream.
+        let other = devices[(i + 1) % devices.len()];
+        other.set_current().expect("set_current other");
         let src: Vec<i32> = (0..64).map(|i| i * 7 - 100).collect();
         let mut d = DeviceBuffer::<i32>::new(dev.id, src.len()).expect("alloc");
         d.copy_from_host(&src).expect("h2d");

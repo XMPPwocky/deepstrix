@@ -6463,36 +6463,48 @@ impl HeterogeneousEngine {
                 let (o_look, o_look2, o_alts) = (n_sel, 2 * n_sel, 3 * n_sel);
                 let o_orig = o_alts + nb * na;
                 let (o_range, o_ew) = (nb * na, nb * na + nb);
+                // Look-ahead picks only where they are used: `sd.look_sel*` is
+                // SHARED, and in the lane drivers (which run with look-ahead hints
+                // off) the other lane's queued chain can overwrite it under an
+                // async copy.
+                let (look_on, look_on2) = (lookahead_hints_ok && look_next.is_some(), lookahead_hints_ok && look_next2.is_some());
                 {
                     let rs = &bd.rb_stream;
-                    rs.wait_event(&sev.selected_ready)?;
-                    bd.d_selected.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, 0, rs)?;
-                    if look_next.is_some() {
-                        sd.look_sel.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, o_look, rs)?;
-                    }
-                    if look_next2.is_some() {
-                        sd.look_sel2.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, o_look2, rs)?;
-                    }
-                    if na > 0 {
-                        bd.d_alts.slice_view(0, nb * na).copy_to_pinned_async(&mut bd.rb_i32, o_alts, rs)?;
-                        bd.d_alt_w.slice_view(0, nb * na).copy_to_pinned_async(&mut bd.rb_f32, 0, rs)?;
-                    }
-                    if sub3 {
-                        bd.d_orig_sel.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, o_orig, rs)?;
-                        bd.d_range.slice_view(0, nb).copy_to_pinned_async(&mut bd.rb_f32, o_range, rs)?;
-                    }
-                    bd.d_ew.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_f32, o_ew, rs)?;
-                    if want_xq {
-                        if let (Some(xq_dev), Some(pin)) = (bd.remote_xq_lane.as_ref(), bd.rb_u8.as_mut()) {
-                            xq_dev.slice_view(0, xq_bytes_rb).copy_to_pinned_async(pin, 0, rs)?;
+                    // Queue the whole batch, then ALWAYS sync the stream, so an
+                    // error part-way never leaves a DMA into the staging in flight.
+                    let queued = (|| -> eyre::Result<()> {
+                        rs.wait_event(&sev.selected_ready)?;
+                        bd.d_selected.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, 0, rs)?;
+                        if look_on {
+                            sd.look_sel.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, o_look, rs)?;
                         }
-                    }
-                    rs.synchronize()?;
+                        if look_on2 {
+                            sd.look_sel2.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, o_look2, rs)?;
+                        }
+                        if na > 0 {
+                            bd.d_alts.slice_view(0, nb * na).copy_to_pinned_async(&mut bd.rb_i32, o_alts, rs)?;
+                            bd.d_alt_w.slice_view(0, nb * na).copy_to_pinned_async(&mut bd.rb_f32, 0, rs)?;
+                        }
+                        if sub3 {
+                            bd.d_orig_sel.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_i32, o_orig, rs)?;
+                            bd.d_range.slice_view(0, nb).copy_to_pinned_async(&mut bd.rb_f32, o_range, rs)?;
+                        }
+                        bd.d_ew.slice_view(0, n_sel).copy_to_pinned_async(&mut bd.rb_f32, o_ew, rs)?;
+                        if want_xq {
+                            if let (Some(xq_dev), Some(pin)) = (bd.remote_xq_lane.as_ref(), bd.rb_u8.as_mut()) {
+                                xq_dev.slice_view(0, xq_bytes_rb).copy_to_pinned_async(pin, 0, rs)?;
+                            }
+                        }
+                        Ok(())
+                    })();
+                    let synced = rs.synchronize();
+                    queued?;
+                    synced?;
                 }
                 let (ri, rf) = (bd.rb_i32.as_slice(), bd.rb_f32.as_slice());
                 let mut sel_host: Vec<i32> = ri[..n_sel].to_vec();
-                let look_host: Vec<i32> = if look_next.is_some() { ri[o_look..o_look + n_sel].to_vec() } else { Vec::new() };
-                let look_host2: Vec<i32> = if look_next2.is_some() { ri[o_look2..o_look2 + n_sel].to_vec() } else { Vec::new() };
+                let look_host: Vec<i32> = if look_on { ri[o_look..o_look + n_sel].to_vec() } else { Vec::new() };
+                let look_host2: Vec<i32> = if look_on2 { ri[o_look2..o_look2 + n_sel].to_vec() } else { Vec::new() };
                 // Ranks 7..6+n_alt per row.
                 let (alts_host, alt_w_host): (Vec<i32>, Vec<f32>) = if na > 0 {
                     (ri[o_alts..o_alts + nb * na].to_vec(), rf[..nb * na].to_vec())
