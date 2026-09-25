@@ -227,7 +227,7 @@ clearly worse.
 ## Wire protocol for the box-2-side fallback (NOT built)
 
 What is built is the residency map (`REQ_FLAG_RESID` = 64, see above); this
-section is the fallback's own design. New request flag `REQ_FLAG_ALTS = 128`. After the prefetch block: `u32 m`, then
+section is the fallback's own design. New request flag `REQ_FLAG_ALTS = 256` (64 is `REQ_FLAG_RESID`, 128 `REQ_FLAG_DECODE`). After the prefetch block: `u32 m`, then
 `b * m` `i32` alternative ids, per row in rank order (ranks 7..6+m), `NO_PICK`
 for an unusable slot. The frame length changes when the flag is set, and a daemon
 that does not know the flag rejects the length, so the hub may set it only once
@@ -330,7 +330,7 @@ profile can show `box2.subs_per_step` next to `box2.page_ms`.
    6 -> 5 -> 1. ABBA on a warm pool (`box2.page_ms`, step wall, subs/step), with
    free-running quality at each step: echo2 at 1.5K/6K under >= 4 rows, needle,
    and the golden fidelity gate once it exists.
-4. **Box-2-side fallback** (policy above, `REQ_FLAG_ALTS` = 128), only if mirror errors
+4. **Box-2-side fallback** (policy above, `REQ_FLAG_ALTS` = 256), only if mirror errors
    leave material paging. `sub_admit` background reads can come with step 3 or 4.
 
 ## Expected gain
