@@ -6408,6 +6408,77 @@ impl HeterogeneousEngine {
                         }
                     }
                 }
+                // BOX-2 MISS SUBSTITUTION (`V41_SUB`, het::b2_mirror,
+                // docs/v41/BOX2_MISS_SUBSTITUTION.md). Decode rows only (Arena), under
+                // the T2 partition, with router alternatives. A pick bound for box 2
+                // that the mirror says box 2 does not hold is swapped for the row's
+                // best-ranked alternative that one box holds, and the row is
+                // renormalized exactly. Placed AFTER the pick trace (which keeps the
+                // router's own picks) and BEFORE the pick loop, ownership split and
+                // box-2 submit, so everything below sees ordinary picks. The device
+                // copies are rewritten here as well: `pre_moe_prep` peer-pushes them
+                // to the iGPU, and the box-2 submit reads `d_ew` back further down.
+                // Nothing already queued reads them after this point
+                // (`record_sel_stats` finished under the blocking readback above).
+                let mut sel_orig: Vec<i32> = Vec::new();
+                if super::b2_mirror::mode() > 0
+                    && na > 0
+                    && matches!(rows, RowLayout::Arena { .. })
+                    && remote_split_on
+                    && super::expert_pager::t2_partition()
+                {
+                    // Uncached bind: the pager may have switched devices behind the
+                    // engine's cache (see the box-2 submit below).
+                    self.dgpu.device.set_current()?;
+                    self.current_device.store(self.dgpu.device.id, std::sync::atomic::Ordering::Relaxed);
+                    let mut ew_sub = vec![0f32; n_sel];
+                    bd.d_ew.slice_view(0, n_sel).copy_to_host(&mut ew_sub)?;
+                    let mut sel_sub = sel_host.clone();
+                    let pg_ref: &super::expert_pager::ExpertPager = pg;
+                    let predicted_miss = |e: i32| {
+                        (0..N_EXPERT as i32).contains(&e)
+                            && super::expert_pager::partition_box2(layer, e as u32)
+                            && super::b2_mirror::resident(layer, e as u32) == Some(false)
+                    };
+                    let acceptable = |a: i32| {
+                        (0..N_EXPERT as i32).contains(&a)
+                            && if super::expert_pager::partition_box2(layer, a as u32) {
+                                super::b2_mirror::resident(layer, a as u32) == Some(true)
+                            } else {
+                                pg_ref.is_resident(layer, a as u32)
+                            }
+                    };
+                    let o = super::b2_mirror::substitute(
+                        &mut sel_sub,
+                        &mut ew_sub,
+                        &alts_host,
+                        &alt_w_host,
+                        cs_n_used,
+                        na,
+                        super::b2_mirror::min_rank(),
+                        EXPERT_WEIGHT_SCALE,
+                        predicted_miss,
+                        acceptable,
+                    );
+                    super::b2_mirror::record(&o);
+                    if o.slots > 0 && super::b2_mirror::mode() == 2 {
+                        if super::expert_pager::pick_trace_on() {
+                            // `S <layer> <b> <row> <rank> <from> <to>` per rewritten pick.
+                            for (i, (&f, &t)) in sel_host.iter().zip(sel_sub.iter()).enumerate() {
+                                if f != t {
+                                    super::expert_pager::pick_trace(&format!(
+                                        "S {layer} {b} {} {} {f} {t}",
+                                        i / cs_n_used,
+                                        i % cs_n_used + 1
+                                    ));
+                                }
+                            }
+                        }
+                        bd.d_selected.slice_view_mut(0, n_sel).copy_from_host(&sel_sub)?;
+                        bd.d_ew.slice_view_mut(0, n_sel).copy_from_host(&ew_sub)?;
+                        sel_orig = std::mem::replace(&mut sel_host, sel_sub);
+                    }
+                }
                 // C3: with the split active, box 2 OWNS half of this layer's
                 // experts and computes them itself — so this box must not page
                 // them at all. That is the whole point of the split: the working
@@ -6469,12 +6540,19 @@ impl HeterogeneousEngine {
                 let mut ids: Vec<u32> = Vec::with_capacity(N_EXPERT as usize);
                 let mut skipped_remote = 0usize;
                 let note_hot = super::expert_pager::hot_set::enabled() && (b as usize) <= small_b_catchall_max().max(8);
-                for &sv in &sel_host {
-                    if note_hot && (0..N_EXPERT as i32).contains(&sv) {
-                        // Every pick (not just the first per expert): the mass
-                        // is what the hot set is ranked by.
-                        super::expert_pager::hot_set::note_pick(layer as usize, sv as u32);
+                if note_hot {
+                    // Every pick (not just the first per expert): the mass is what
+                    // the hot set is ranked by. The ROUTER's picks, not the
+                    // substituted ones, or substitutes (resident by construction)
+                    // would inflate their own rank.
+                    let src: &[i32] = if sel_orig.is_empty() { &sel_host } else { &sel_orig };
+                    for &sv in src {
+                        if (0..N_EXPERT as i32).contains(&sv) {
+                            super::expert_pager::hot_set::note_pick(layer as usize, sv as u32);
+                        }
                     }
+                }
+                for &sv in &sel_host {
                     if (0..N_EXPERT as i32).contains(&sv) && !seen[sv as usize] {
                         seen[sv as usize] = true;
                         if let Some(o) = owns_remote.as_ref() {

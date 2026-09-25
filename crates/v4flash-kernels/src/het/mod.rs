@@ -16,6 +16,7 @@
 //! forward_full_logits oracle. M13.4 turns on real concurrency via
 //! `ExecMode::HetParallel`. M13.5 migrates the compressor to iGPU.
 
+pub mod b2_mirror;
 pub mod batch_scratch;
 pub mod dispatch;
 pub mod engine;

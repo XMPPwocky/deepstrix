@@ -351,6 +351,18 @@ pub mod proto {
     /// misses read in the background, and a request queued behind it is served
     /// and answered in the meantime instead of waiting out the NVMe read.
     pub const REQ_FLAG_OOO: u32 = 32;
+    /// Request flag: append box 2's residency map for the request's layer
+    /// (`RESID_WORDS` u32s, bit e = expert e resident and landed, AFTER this
+    /// request's own paging) behind the partial, for the hub's mirror
+    /// (`het::b2_mirror`, box-2 miss substitution). A daemon that appended it
+    /// sets `RESP_FLAG_RESID` in the reply. An older daemon echoes the request
+    /// flag but not that bit, and appends nothing, so either side can be
+    /// deployed first.
+    pub const REQ_FLAG_RESID: u32 = 64;
+    /// RESPONSE flag: the residency map is appended (see `REQ_FLAG_RESID`).
+    /// Bit 15: requests use the low bits and the miss mask the high 16.
+    pub const RESP_FLAG_RESID: u32 = 1 << 15;
+    pub const RESID_WORDS: usize = (super::N_EXPERT as usize).div_ceil(32);
 
     /// Fixed request fields after the header (bytes):
     /// layer, b, flags, n_used, xq_bpt, reserved (6 × u32) then `t1` (u64,
@@ -393,6 +405,28 @@ pub mod proto {
     pub fn patch_len(buf: &mut AlignedBuf) {
         let n = (buf.len() - HDR_LEN) as u32;
         buf.as_bytes_mut()[12..16].copy_from_slice(&n.to_le_bytes());
+    }
+
+    /// Append the residency map to a RESPONSE whose payload is complete, and
+    /// set `RESP_FLAG_RESID`. Call before `patch_len`.
+    pub fn append_residency(buf: &mut AlignedBuf, words: &[u32; RESID_WORDS]) {
+        const FLAGS_OFF: usize = HDR_LEN + 8;
+        let mut f = [0u8; 4];
+        f.copy_from_slice(&buf.as_bytes()[FLAGS_OFF..FLAGS_OFF + 4]);
+        let flags = u32::from_le_bytes(f) | RESP_FLAG_RESID;
+        buf.as_bytes_mut()[FLAGS_OFF..FLAGS_OFF + 4].copy_from_slice(&flags.to_le_bytes());
+        for &w in words {
+            buf.put_u32(w);
+        }
+    }
+
+    /// The residency map appended to a RESPONSE (`RESP_FLAG_RESID`), if any.
+    pub fn response_residency<'a>(buf: &'a AlignedBuf, m: &ResponseMeta) -> Option<&'a [u32]> {
+        if m.flags & RESP_FLAG_RESID == 0 {
+            return None;
+        }
+        let off = RESP_DATA_OFF + (m.b as usize) * (m.n_embd as usize) * (m.elem_bytes as usize);
+        Some(buf.view::<u32>(off, RESID_WORDS))
     }
 
     pub fn parse_header(h: &[u8]) -> eyre::Result<Header> {
@@ -767,7 +801,9 @@ pub mod proto {
                 p[RESP_MISSN_OFF], p[RESP_MISSN_OFF + 1], p[RESP_MISSN_OFF + 2], p[RESP_MISSN_OFF + 3],
             ]),
         };
-        let want = RESP_DATA_OFF + (m.b as usize) * (m.n_embd as usize) * (m.elem_bytes as usize);
+        let want = RESP_DATA_OFF
+            + (m.b as usize) * (m.n_embd as usize) * (m.elem_bytes as usize)
+            + if m.flags & RESP_FLAG_RESID != 0 { RESID_WORDS * 4 } else { 0 };
         if p.len() != want {
             return Err(eyre!("response: frame len {} != expected {want}", p.len()));
         }
@@ -2566,6 +2602,29 @@ impl ExpertShard {
     pub fn layer_is_paged(&self, layer: u32) -> bool {
         self.pool.is_some()
             && self.layers.get(layer as usize).and_then(|l| l.as_ref()).is_some_and(|l| l.page.is_some())
+    }
+
+    /// `REQ_FLAG_RESID`: which experts of `layer` this box could serve RIGHT NOW
+    /// without a read, as `RESID_WORDS` u32s (bit e = expert e). Paged layers:
+    /// a landed pool slot (`remap_hosts[layer][e] != 0`; a claimed but unlanded
+    /// slot is still 0). Unpaged layers: the static assignment.
+    pub fn residency_words(&self, layer: u32) -> [u32; proto::RESID_WORDS] {
+        let mut w = [0u32; proto::RESID_WORDS];
+        let paged = if self.layer_is_paged(layer) {
+            self.pool.as_ref().and_then(|p| p.remap_hosts.get(layer as usize))
+        } else {
+            None
+        };
+        for e in 0..N_EXPERT as usize {
+            let here = match paged {
+                Some(r) => r[e] != 0,
+                None => self.owns(layer, e as i32),
+            };
+            if here {
+                w[e / 32] |= 1 << (e % 32);
+            }
+        }
+        w
     }
 
     /// Which of `ids` are resident on `layer` RIGHT NOW, reading nothing. `NO_PICK`
@@ -4455,6 +4514,9 @@ pub fn serve_connection(
                 } else {
                     exec.read_f16_at(0, b, resp.view_mut::<u16>(proto::RESP_DATA_OFF, n))?;
                 }
+                if req.flags & proto::REQ_FLAG_RESID != 0 {
+                    proto::append_residency(&mut resp, &shard.residency_words(req.layer));
+                }
                 // The partner's reply: rows [b, b + bb) of the same pass. Page
                 // time and miss count are reported on THIS request only, so the
                 // hub's per-step sums are unchanged.
@@ -4468,6 +4530,9 @@ pub fn serve_connection(
                             exec.read_f32_at(b, bb, resp_b.view_mut::<f32>(proto::RESP_DATA_OFF, nb))?;
                         } else {
                             exec.read_f16_at(b, bb, resp_b.view_mut::<u16>(proto::RESP_DATA_OFF, nb))?;
+                        }
+                        if rb.flags & proto::REQ_FLAG_RESID != 0 {
+                            proto::append_residency(&mut resp_b, &shard.residency_words(rb.layer));
                         }
                         proto::patch_len(&mut resp_b);
                         let t_ready_b = Instant::now();
@@ -4722,6 +4787,9 @@ fn serve_interleaved(
     } else {
         exec.read_f16_at(0, b, resp.view_mut::<u16>(proto::RESP_DATA_OFF, n))?;
     }
+    if req.flags & proto::REQ_FLAG_RESID != 0 {
+        proto::append_residency(&mut resp, &shard.residency_words(req.layer));
+    }
     proto::patch_len(&mut resp);
     let t_ready = Instant::now();
     let t_server_us = (t_ready - t_done).as_micros() as u32;
@@ -4857,8 +4925,12 @@ impl RemotePartial {
         assert!(self.is_f32, "partial is f16");
         self.frame.view::<f32>(proto::RESP_DATA_OFF, self.b as usize * N_EMBD as usize)
     }
+    /// The partial's payload bytes only. A `RESP_FLAG_RESID` residency map
+    /// may follow them in the frame.
     pub fn bytes(&self) -> &[u8] {
-        &self.frame.as_bytes()[proto::RESP_DATA_OFF..]
+        let elem = if self.is_f32 { 4 } else { 2 };
+        let n = self.b as usize * N_EMBD as usize * elem;
+        &self.frame.as_bytes()[proto::RESP_DATA_OFF..proto::RESP_DATA_OFF + n]
     }
     /// Link time = round trip minus the daemon's own frame→response time.
     pub fn link_us(&self) -> u32 {
@@ -5193,7 +5265,8 @@ impl RemoteExpertClient {
     #[allow(clippy::too_many_arguments)]
     pub fn submit_dispatch(&mut self, unmasked: bool, layer: u32, b: usize, xq: &[u8], sel: &[i32], ew: &[f32], resp_f32: bool, partner: bool) -> eyre::Result<Option<Ticket>> {
         let extra = if partner { proto::REQ_FLAG_PARTNER } else { 0 };
-        let f = if resp_f32 { proto::REQ_FLAG_RESP_F32 } else { 0 } | extra;
+        let resid = if super::b2_mirror::wanted() { proto::REQ_FLAG_RESID } else { 0 };
+        let f = if resp_f32 { proto::REQ_FLAG_RESP_F32 } else { 0 } | extra | resid;
         if unmasked {
             self.submit_unmasked_flags(layer, b, xq, sel, ew, f)
         } else {
@@ -5417,6 +5490,9 @@ impl RemoteExpertClient {
         if m.layer != ticket.layer || m.b != ticket.b {
             return Err(eyre!("response (L{} B{}) does not match ticket (L{} B{})", m.layer, m.b, ticket.layer, ticket.b));
         }
+        if let Some(words) = proto::response_residency(&buf, &m) {
+            super::b2_mirror::update(m.layer, words);
+        }
         // NTP quadruple for this exchange. t1 is what the WRITER stamped (echoed
         // back by the daemon), not the submit time, so encoding is excluded.
         let sample = ClockSample { seq: h.seq, layer: m.layer, b: m.b, t1: m.t1, t2: m.t2, t3: m.t3, t4 };
@@ -5609,6 +5685,37 @@ mod tests {
         let mut err = AlignedBuf::with_capacity(64);
         proto::encode_error(&mut err, 7, 9, "nope");
         assert_eq!(proto::decode_error(&err), (9, "nope".to_string()));
+    }
+
+    /// `REQ_FLAG_RESID`: the residency map rides behind the partial, flagged by
+    /// `RESP_FLAG_RESID`. The payload and the length check are unaffected, and
+    /// a frame WITHOUT the bit but with the echoed request flag (an older
+    /// daemon) still parses.
+    #[test]
+    fn response_residency_roundtrip() {
+        let (b, n) = (2usize, 2 * N_EMBD as usize);
+        let mut resp = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 64);
+        proto::begin_response(&mut resp, 5, 21, b as u32, proto::REQ_FLAG_RESID, 0, 1, 2, N_EMBD, 2, 3, 4);
+        resp.resize(proto::RESP_DATA_OFF + n * 2);
+        for (i, v) in resp.view_mut::<u16>(proto::RESP_DATA_OFF, n).iter_mut().enumerate() {
+            *v = i as u16;
+        }
+        // Older daemon: echoes the flag, appends nothing.
+        let mut old = AlignedBuf::with_capacity(resp.len());
+        old.extend_from_slice(resp.as_bytes());
+        proto::patch_len(&mut old);
+        let m = proto::decode_response_meta(&old).unwrap();
+        assert!(proto::response_residency(&old, &m).is_none());
+
+        let mut words = [0u32; proto::RESID_WORDS];
+        words[0] = 0b1010;
+        words[proto::RESID_WORDS - 1] = 1 << 31;
+        proto::append_residency(&mut resp, &words);
+        proto::patch_len(&mut resp);
+        let m = proto::decode_response_meta(&resp).unwrap();
+        assert_ne!(m.flags & proto::RESP_FLAG_RESID, 0);
+        assert_eq!(proto::response_residency(&resp, &m).unwrap(), &words[..]);
+        assert_eq!(resp.view::<u16>(proto::RESP_DATA_OFF, n)[n - 1], (n - 1) as u16);
     }
 
     /// The NTP estimator: a synthetic exchange with a KNOWN offset and a known

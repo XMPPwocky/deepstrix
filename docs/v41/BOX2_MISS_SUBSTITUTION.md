@@ -117,6 +117,37 @@ expert, whoever owns it". So box 1 should make the decision itself:
 
 The box-2-side policy below stays as the fallback for mirror errors.
 
+### Implemented 2026-09-25 (not yet deployed)
+
+- **Mirror via per-layer residency maps, not deltas.** A request with
+  `REQ_FLAG_RESID` (64) gets box 2's map for that request's layer (384 bits
+  from `remap_hosts[layer]`, i.e. landed slots) appended behind the partial,
+  flagged by `RESP_FLAG_RESID` (bit 15). `het::b2_mirror::update` overwrites
+  that layer's row: last writer wins, one request stale at most, nothing to
+  reorder. An older daemon echoes the flag without the bit and appends
+  nothing, so either box can be deployed first. The hub sets the flag on every
+  `submit_dispatch` when `V41_SUB > 0`.
+- **Substitution** in `pre_moe_route`, after the pick trace and before the pick
+  loop: `het::b2_mirror::substitute`, a pure function with unit tests. It runs
+  only for `RowLayout::Arena` rows (decode), under `t2_partition()`, with
+  router alternatives. Predicted miss = `partition_box2(e)` and the mirror says
+  not resident; an unseen layer counts as "unknown", so nothing is
+  substituted. Acceptable alternative = box-2-owned and in the mirror, or
+  box-1-owned and `pg.is_resident`. The all-rows rule and `min_rank` apply,
+  and rows are renormalized on the running scale. The rewritten
+  `d_selected`/`d_ew` are written back before the peer push. The hot-set
+  counter sees the router's original picks.
+- **Knobs:** `V41_SUB` = 0 off / 1 dry run (plan and count, no rewrite) / 2 on;
+  `V41_SUB_MIN_RANK` (default 6); needs `V41_ROUTER_ALTS > 0`.
+- **Profile** (`ms.stage`, per step): `sub.predicted_miss`,
+  `sub.reads_avoided`, `sub.picks_swapped`, `sub.blocked`. Compare
+  `sub.predicted_miss` with `box2.misses_x1e6` for mirror accuracy. The pick
+  trace gets an `S <layer> <b> <row> <rank> <from> <to>` line per rewritten
+  pick.
+- Not yet: DSpark verify rows (Contiguous + `speculative_append`, excluded),
+  the fidelity-pin skip (the pin lives on `worktree-architecture-review`), and
+  the box-2-side fallback.
+
 ## Box-2-side policy (fallback)
 
 Per request, per layer, on box 2:

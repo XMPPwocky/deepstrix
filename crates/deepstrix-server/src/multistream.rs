@@ -972,6 +972,16 @@ impl Sched {
                     e.0 += v; e.1 += 1;
                 }
             }
+            // Box-2 miss substitution (`V41_SUB`), counts per step. Compare
+            // `sub.predicted_miss` with `box2.misses_x1e6` for the mirror's
+            // accuracy (dry run: `V41_SUB=1`).
+            if v4flash_kernels::het::b2_mirror::wanted() {
+                let (p, av, sw, bl) = v4flash_kernels::het::b2_mirror::take_sub_stats();
+                for (name, v) in [("sub.predicted_miss", p as f64), ("sub.reads_avoided", av as f64), ("sub.picks_swapped", sw as f64), ("sub.blocked", bl as f64)] {
+                    let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
+                    e.0 += v; e.1 += 1;
+                }
+            }
             if let Some(pg) = pager.as_ref() {
                 if let Some((q, a, df, ams)) = pg.prefetch_stats() {
                     let (dq, da, ddf, dms) = (q.saturating_sub(acc.pf_last.0), a.saturating_sub(acc.pf_last.1), df.saturating_sub(acc.pf_last.2), ams.saturating_sub(acc.pf_last.3));
