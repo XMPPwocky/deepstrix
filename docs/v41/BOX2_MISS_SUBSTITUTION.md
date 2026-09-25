@@ -39,13 +39,29 @@ positions only, prompt KV exact:
 | cold rank-6 dropped, renormalized | 1.38 | 0.0030 | 0.025 | 0.067 | 97.3% |
 | rank-**1** -> 7th (positive control) | 1.37 | 0.0050 | 0.040 | 0.105 | 96.1% |
 
+| **v1: cold rank-6 -> 7th, INHERITED weight** | 1.37 | 0.0030 | 0.026 | 0.085 | 97.0% |
+| null: bf16-round the 6th's output, same sites | 1.39 | 0.0026 | 0.023 | 0.059 | 97.2% |
+| null: random rank-6 swaps | 0.14 | 0.0011 | 0.017 | 0.045 | 97.9% |
+| any rank -> next unused, rate ~2.5/token | 2.66 | 0.0038 | 0.033 | 0.137 | 95.5% |
+| any rank, ~5/token | 5.05 | 0.0047 | 0.038 | 0.147 | 96.4% |
+
 Controls: zero swaps is bit-identical to the baseline; re-runs are bit-identical;
 every swap changes that layer's routed output (median 21% for rank 6, 66% for
-rank 1). Dropping instead of swapping costs transcript likelihood (+0.012 nats/
-token, +0.041 on the final turn); swapping does not. **Pending:** a bf16-rounding
-null and a random-0.1% null (is ~0.01 a compounding floor?), any-rank swaps at
-~2.5 and ~5 per token, and the inherit-weight rule this design actually uses.
-Teacher forcing understates the damage free-running generation would see.
+rank 1). **KL saturates:** any perturbation at ~1-2 sites/token, even a 0.4%
+bf16 rounding, compounds through later tokens to mean ~0.008. So a policy's cost
+is its EXCESS over a count-matched null. Mean excess: rank-6 refgate +0.0012,
+**rank-6 inherit (v1) +0.0019**, drop +0.0018 (with worse NLL: +0.012 nats/token,
++0.041 on the final turn), rank-1 +0.0064. The inherited weight differs from the
+ref.Gate weight by a median 0.007 (p90 0.028). **v1 passes.**
+
+These runs are teacher-forced over the whole transcript, which OVERSTATES
+production: there a turn is re-prefilled exactly (invariant 6), so a swap only
+affects the rest of its own turn. The any-rank tail maxima (1.2-1.9 nats) were
+bimodal sharpenings with top-1 unchanged, or prompt positions after a perturbed
+turn, which production re-prefills. **Pending** (decides rank < 6): the
+count-matched null for any-rank, and a turn-local any-rank pair (swaps and KL
+confined to one 217-prediction turn). Free-running generation is still
+unmeasured.
 
 ## Policy (v1)
 
