@@ -78,7 +78,39 @@ fixed within the turn (free-running unmeasured), hot-set proxy rather than
 box 2's live LRU. Hence the staged `sub_min_rank` rollout: 6, then 5, then 1,
 with a free-running quality check at each step.
 
-## Policy (v1)
+## Revision 2026-09-25: box 1 decides, from a mirror of box 2's pool
+
+The box-2-side policy below can only substitute a **box-2-owned, box-2-resident**
+alternative. Box 1 has already dispatched its own experts by the time box 2
+looks. About 60% of 7th picks are box-1-owned (hot), so that caps coverage at
+~1 - 0.6^m (~78% at m = 3). The validated policy was "best-ranked unused
+expert, whoever owns it". So box 1 should make the decision itself:
+
+- **Mirror.** Each box-2 response carries the pool changes that request caused:
+  admitted and evicted `layer << 16 | expert` words (box 2 knows them in
+  `ensure`; about 2 words per miss). Box 1 keeps the set. It lags by at most the
+  requests in flight (two lanes).
+- **Decide at route time.** In `pre_moe_route`, right after the pick readback and
+  BEFORE the ownership split, box 1 rewrites each box-2 pick the mirror says is
+  missing to that row's best-ranked unused alternative. A box-1-owned substitute
+  that box 1 holds becomes an ordinary local pick: the pager ensures it and the
+  local MoE computes it. A box-2-owned one the mirror holds goes to box 2 as
+  usual. Weights are inherited, so `d_ew` is untouched. Only `d_selected` is
+  rewritten, with a blocking H2D into `bd.d_selected` before `pre_moe_prep`'s
+  peer push carries the picks to the iGPU (`forward_prefill.rs` ~7138).
+- **No round trip and no second MoE pass on box 1.** The round-trip alternative
+  (box 2 replies "compute X") arrives after box 1's local MoE is launched, and
+  would need a deferred pass plus accumulate on box 1's graph-captured chain.
+- **When the mirror is wrong.** Thinks resident, but evicted: box 2 misses and
+  reads, as today (or applies the box-2-side policy below as a fallback). Thinks
+  missing, but admitted: an unneeded substitution, a small quality cost and no
+  time cost.
+- **Coverage** is then nearly every box-2 miss: the 7th is resident on one box
+  or the other almost always.
+
+The box-2-side policy below stays as the fallback for mirror errors.
+
+## Box-2-side policy (fallback)
 
 Per request, per layer, on box 2:
 
@@ -188,18 +220,24 @@ profile can show `box2.subs_per_step` next to `box2.page_ms`.
    (KL 0.8-1.3 at tool-result openings after a perturbed turn) becomes part of
    the price.
 
-## Rollout
+## Rollout (revised 2026-09-25)
 
-1. **Box 1 alternatives + `DA` trace only** (no behavior change, invariant 2).
-   Collect a production trace, then replay with the box-2 LRU for the real
-   substitutable fraction at each `sub_min_rank` and m, **before** touching box 2.
-2. Box 2 decision + knobs, deployed with `sub=0`. Invariant 1 on production traffic.
-3. ABBA `sub=0/1` by SIGUSR2 on a **warm** pool, never across a restart (box-2
-   warming dominates A/Bs): `box2.page_ms`, step wall, subs/step, and
-   `sub_admit` on/off (background reads share the drives with foreground misses).
-4. Free-running quality with `sub=1` vs `0`: echo2 at 1.5K/6K under >= 4 rows,
-   needle, and the golden fidelity gate once it exists (engine vs reference KL is
-   the scale these numbers still lack).
+1. **Router alternatives + trace.** DONE on branch `worktree-b2-miss-substitution`:
+   `V41_ROUTER_ALTS=m` (0..=4, default 0). `router_topk{,_par}` emit ranks
+   7..6+m into `bd.d_alts`; they're read back with the picks and written as `A <layer>
+   <b> <alts> / <owner chars>` after each `P` trace row. The test
+   `tests/router_topk_alts.rs` shows picks and weights bit-identical for
+   m = 1..4 and the alternatives are the next ranks (up to float near-ties).
+   Cost when on: m extra argmax passes per token-layer.
+2. **Mirror, dry run.** Pool changes in box-2 responses (VERSION 5) plus the
+   box-1 mirror. Log would-substitute counts, and mirror accuracy against box 2's
+   actual misses. No output change.
+3. **Box-1 route-time substitution** behind a knob, `sub_min_rank` staged
+   6 -> 5 -> 1. ABBA on a warm pool (`box2.page_ms`, step wall, subs/step), with
+   free-running quality at each step: echo2 at 1.5K/6K under >= 4 rows, needle,
+   and the golden fidelity gate once it exists.
+4. **Box-2-side fallback** (policy above, `REQ_FLAG_ALTS`), only if mirror errors
+   leave material paging. `sub_admit` background reads can come with step 3 or 4.
 
 ## Expected gain
 

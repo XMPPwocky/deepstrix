@@ -756,6 +756,22 @@ pub fn lookahead_topk() -> usize {
 /// box 2's two drives and their admits/waits sit on the request path; the
 /// daemon's CERTAIN early paging of the queued request gets the overlap
 /// without the waste.
+/// `V41_ROUTER_ALTS=m` (0..=4, default 0 = off): the router also emits each
+/// row's next `m` ranks (7..6+m) into `d_alts`, read back with the picks and
+/// written to the pick trace as `A` lines. Groundwork for box-2 miss
+/// substitution (docs/v41/BOX2_MISS_SUBSTITUTION.md); picks and weights are
+/// bit-identical with it on.
+pub fn router_alts() -> u32 {
+    static M: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_ROUTER_ALTS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(crate::router_topk::ROUTER_MAX_ALT)
+    });
+    *M
+}
+
 pub fn lookahead_prefetch() -> bool {
     static B: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("V41_LOOKAHEAD_PREFETCH").as_deref() == Ok("1"));
@@ -2212,6 +2228,10 @@ pub struct PreMoeCarry {
     /// instead of streaming the layer's experts twice. Set by the pipelined
     /// driver on the lane it routes FIRST; false everywhere else.
     pub partner_follows: bool,
+    /// Alternatives per row the router wrote to `bd.d_alts` for THIS layer
+    /// (`router_alts()`, or 0 on a hash-router layer, whose picks come from
+    /// the host and leave `d_alts` stale).
+    n_alt: u32,
     // route -> prep
     sel_host_remote: Vec<i32>,
     sel_host_audit: Vec<i32>,
@@ -5919,7 +5939,8 @@ impl HeterogeneousEngine {
             // (Image rows are recomputed with bias_vl right below — same
             // stream, FIFO — so this full-batch launch stays as-is.)
             let _t = de.events.stage("k.router.topk", &de.compute)?;
-            de.router_topk.launch_batched(
+            let n_alt = router_alts();
+            de.router_topk.launch_batched_alts(
                 &de.compute,
                 &mut bd.d_selected,
                 &mut bd.d_ew,
@@ -5930,6 +5951,8 @@ impl HeterogeneousEngine {
                 EXPERT_WEIGHT_SCALE,
                 ROUTER_WEIGHT_EPS,
                 b,
+                if n_alt > 0 { Some(&mut bd.d_alts) } else { None },
+                n_alt,
             )?;
         if let Some(nl) = look_next {
             let _t = de.events.stage("k.router.lookahead", &de.compute)?;
@@ -6016,7 +6039,11 @@ impl HeterogeneousEngine {
                 let logits_v = sd.router_logits.slice_view(r0 * n_exp, n * n_exp);
                 let mut sel_v = bd.d_selected.slice_view_mut(r0 * cs_n_used, n * cs_n_used);
                 let mut ew_v = bd.d_ew.slice_view_mut(r0 * cs_n_used, n * cs_n_used);
-                de.router_topk.launch_batched(
+                // Rewrite these rows' alternatives too, or they would be the
+                // text-bias ranking under image-bias picks.
+                let n_alt = router_alts() as usize;
+                let mut alts_v = bd.d_alts.slice_view_mut(r0 * n_alt, n * n_alt);
+                de.router_topk.launch_batched_alts(
                     &de.compute,
                     &mut sel_v,
                     &mut ew_v,
@@ -6027,6 +6054,8 @@ impl HeterogeneousEngine {
                     EXPERT_WEIGHT_SCALE,
                     ROUTER_WEIGHT_EPS,
                     n as u32,
+                    if n_alt > 0 { Some(&mut alts_v) } else { None },
+                    n_alt as u32,
                 )?;
             }
         }
@@ -6209,6 +6238,7 @@ impl HeterogeneousEngine {
             drain_before_ensure: true,
             lookahead_hints_ok: true,
             partner_follows: false,
+            n_alt: if dlw.is_hash_router { 0 } else { router_alts() },
             ..Default::default()
         })
     }
@@ -6228,7 +6258,7 @@ impl HeterogeneousEngine {
         rows: &RowLayout<'_>,
     ) -> eyre::Result<()> {
         if !c.advance(PreMoePhase::Chained, PreMoePhase::Routed)? { return Ok(()); }
-        let PreMoeCarry { layer, b, cs_n_used, cs_n_embd, remote_split_on, sparse_resid_layer, moe_group_bound, split_cap, lookahead_hints_ok, partner_follows, .. } = *c;
+        let PreMoeCarry { layer, b, cs_n_used, cs_n_embd, remote_split_on, sparse_resid_layer, moe_group_bound, split_cap, lookahead_hints_ok, partner_follows, n_alt, .. } = *c;
         let _ = (cs_n_embd, split_cap, moe_group_bound);
         let _ = &self.dgpu;
         let look_next: Option<&DgpuLayerWeights> = match &rows {
@@ -6318,6 +6348,13 @@ impl HeterogeneousEngine {
                     look_host2 = vec![0i32; n_sel];
                     sd.look_sel2.slice_view(0, n_sel).copy_to_host(&mut look_host2)?;
                 }
+                // Ranks 7..6+n_alt per row, same sync (a few bytes).
+                let na = n_alt as usize;
+                let mut alts_host: Vec<i32> = Vec::new();
+                if na > 0 {
+                    alts_host = vec![0i32; (b as usize) * na];
+                    bd.d_alts.slice_view(0, alts_host.len()).copy_to_host(&mut alts_host)?;
+                }
                 drop(_t_d2h);
                 if std::env::var("V41_GROUP_AUDIT_VERBOSE").as_deref() == Ok("1") { eprintln!("[trace] L{layer} A after readback"); }
                 if super::expert_pager::pick_trace_on() {
@@ -6325,6 +6362,29 @@ impl HeterogeneousEngine {
                         let row = &sel_host[r * cs_n_used..(r + 1) * cs_n_used];
                         let ids: Vec<String> = row.iter().map(|v| v.to_string()).collect();
                         super::expert_pager::pick_trace(&format!("P {layer} {b} {}", ids.join(" ")));
+                        // `A <layer> <b> <alts...> / <owner>`: this row's
+                        // alternatives in rank order, then one char per pick
+                        // and alternative (6 + n_alt): 2 = box 2 owns it under
+                        // the partition, 1 = box 1. Parsers keyed on `P`/`D`
+                        // skip it.
+                        if na > 0 {
+                            let alts = &alts_host[r * na..(r + 1) * na];
+                            let a: Vec<String> = alts.iter().map(|v| v.to_string()).collect();
+                            let owner: String = row
+                                .iter()
+                                .chain(alts.iter())
+                                .map(|&e| {
+                                    if (0..N_EXPERT as i32).contains(&e)
+                                        && super::expert_pager::partition_box2(layer, e as u32)
+                                    {
+                                        '2'
+                                    } else {
+                                        '1'
+                                    }
+                                })
+                                .collect();
+                            super::expert_pager::pick_trace(&format!("A {layer} {b} {} / {owner}", a.join(" ")));
+                        }
                     }
                 }
                 // C3: with the split active, box 2 OWNS half of this layer's

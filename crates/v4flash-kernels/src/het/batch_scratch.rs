@@ -305,6 +305,10 @@ pub struct BatchDgpuScratch {
     // ---- Router output (consumed by de.xfer + the hot leg) ----
     pub d_selected: DeviceBuffer<i32>,
     pub d_ew: DeviceBuffer<f32>,
+    /// `[B, ROUTER_MAX_ALT]` — ranks 7.. per row (`V41_ROUTER_ALTS`), rank
+    /// order, `router_alts()` of them per row. Box 2's miss-substitution
+    /// candidates (docs/v41/BOX2_MISS_SUBSTITUTION.md).
+    pub d_alts: DeviceBuffer<i32>,
 
     // ---- Shared expert output ----
     /// `[B, N_EMBD]` — P10 output, read by P12 `vec_add`.
@@ -1165,6 +1169,7 @@ impl BatchDgpuScratch {
             ffn_input_norm: mk_f32(N_EMBD as usize)?,
             d_selected: mk_i32(N_EXPERT_USED)?,
             d_ew: mk_f32(N_EXPERT_USED)?,
+            d_alts: mk_i32(crate::router_topk::ROUTER_MAX_ALT as usize)?,
             ffn_shared: mk_f32(N_EMBD as usize)?,
             ffn_moe_recv: mk_f32(N_EMBD as usize)?,
             pos_per_b: mk_i32(1)?,

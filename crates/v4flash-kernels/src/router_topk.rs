@@ -23,6 +23,9 @@ pub const ROUTER_MAX_EXPERTS: u32 = 256;
 #[cfg(feature = "v41")]
 pub const ROUTER_MAX_EXPERTS: u32 = 512;
 pub const ROUTER_MAX_USED: u32 = 8;
+/// Max alternatives (ranks `n_used+1..=n_used+n_alt`) per token. Matches
+/// `ROUTER_MAX_ALT` in both kernels.
+pub const ROUTER_MAX_ALT: u32 = 4;
 
 pub struct RouterTopk {
     module: Module,
@@ -125,9 +128,10 @@ impl RouterTopk {
             block: (ROUTER_MAX_EXPERTS, 1, 1),
             shared_mem_bytes: 0,
         };
+        let no_alts: sys::hipDeviceptr_t = std::ptr::null_mut();
         launch_kernel!(function, cfg, stream, [
             selected.raw(), weights.raw(), logits.raw(), b_ptr,
-            n_expert, n_used, expert_weight_scale, weight_eps
+            n_expert, n_used, expert_weight_scale, weight_eps, no_alts, 0u32
         ])
     }
 
@@ -148,6 +152,32 @@ impl RouterTopk {
         expert_weight_scale: f32,
         weight_eps: f32,
         b: u32,
+    ) -> eyre::Result<()> {
+        self.launch_batched_alts(
+            stream, selected, weights, logits, bias, n_expert, n_used, expert_weight_scale, weight_eps, b, None, 0,
+        )
+    }
+
+    /// [`Self::launch_batched`] that also writes each token's next `n_alt`
+    /// ranks to `alts` (`[B, n_alt]`, rank order). `selected` / `weights` are
+    /// bit-identical to `n_alt = 0`: the alternatives are extra argmax passes
+    /// after the first `n_used`. `alts = None` or `n_alt = 0` is exactly
+    /// `launch_batched`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched_alts(
+        &self,
+        stream: &Stream,
+        selected: &mut DeviceBuffer<i32>,
+        weights: &mut DeviceBuffer<f32>,
+        logits: &DeviceBuffer<f32>,
+        bias: Option<&DeviceBuffer<f32>>,
+        n_expert: u32,
+        n_used: u32,
+        expert_weight_scale: f32,
+        weight_eps: f32,
+        b: u32,
+        alts: Option<&mut DeviceBuffer<i32>>,
+        n_alt: u32,
     ) -> eyre::Result<()> {
         if b == 0 {
             return Ok(());
@@ -192,6 +222,19 @@ impl RouterTopk {
                 ));
             }
         }
+        let n_alt = if alts.is_some() { n_alt } else { 0 };
+        if n_alt > ROUTER_MAX_ALT || n_used + n_alt > n_expert {
+            return Err(eyre!("router_topk batched: n_alt {n_alt} must be <= {ROUTER_MAX_ALT} and n_used+n_alt <= n_expert"));
+        }
+        if let Some(a) = alts.as_ref() {
+            if a.len() < bn * n_alt as usize {
+                return Err(eyre!("router_topk batched: alts len {} < b*n_alt {}", a.len(), bn * n_alt as usize));
+            }
+        }
+        let a_ptr: sys::hipDeviceptr_t = match alts {
+            Some(a) if n_alt > 0 => a.raw(),
+            _ => std::ptr::null_mut(),
+        };
         // Batched path needs the par kernel's blockIdx.x offsetting.
         let function = self.module.get_function("router_topk_par")?;
         let b_ptr: sys::hipDeviceptr_t = match bias {
@@ -207,7 +250,7 @@ impl RouterTopk {
         };
         launch_kernel!(function, cfg, stream, [
             selected.raw(), weights.raw(), logits.raw(), b_ptr,
-            n_expert, n_used, expert_weight_scale, weight_eps
+            n_expert, n_used, expert_weight_scale, weight_eps, a_ptr, n_alt
         ])
     }
 }

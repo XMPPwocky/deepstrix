@@ -26,6 +26,8 @@
 #define ROUTER_MAX_EXPERTS 256   // V4.1 build passes 512 (384 experts, padded)
 #endif
 #define ROUTER_MAX_USED    8
+// Alternatives (ranks n_used+1..n_used+n_alt) -- see router_topk_par.hip.
+#define ROUTER_MAX_ALT     4
 
 __device__ inline float softplus_stable(float x) {
     if (x > 20.0f) return x;
@@ -41,14 +43,21 @@ extern "C" __global__ void router_topk(
         unsigned int   n_expert,
         unsigned int   n_used,
         float          expert_weight_scale,
-        float          weight_eps) {
+        float          weight_eps,
+        int          * __restrict__ alts,          // may be nullptr; [n_alt]
+        unsigned int   n_alt) {
     __shared__ float s_probs[ROUTER_MAX_EXPERTS];
     __shared__ float s_select[ROUTER_MAX_EXPERTS];
-    __shared__ int   s_sel[ROUTER_MAX_USED];
+    __shared__ int   s_sel[ROUTER_MAX_USED + ROUTER_MAX_ALT];
     __shared__ float s_w[ROUTER_MAX_USED];
     __shared__ float s_sum;
 
     const unsigned int tid = threadIdx.x;
+    if (alts == nullptr) n_alt = 0;
+    if (n_alt > ROUTER_MAX_ALT) n_alt = ROUTER_MAX_ALT;
+    // Sorting into n_used + n_alt slots leaves the first n_used unchanged: an
+    // element that lands at slot >= n_used never shifts an earlier one.
+    const unsigned int n_keep = n_used + n_alt;
 
     if (tid < n_expert) {
         const float p = sqrtf(softplus_stable(logits[tid]));
@@ -59,18 +68,18 @@ extern "C" __global__ void router_topk(
 
     if (tid == 0) {
         // Initialize.
-        for (unsigned int j = 0; j < n_used; ++j) {
+        for (unsigned int j = 0; j < n_keep; ++j) {
             s_sel[j] = -1;
         }
         // Descending insertion sort over n_expert items (mirrors
         // forward.rs::topk_desc).
         for (unsigned int i = 0; i < n_expert; ++i) {
-            for (unsigned int j = 0; j < n_used; ++j) {
+            for (unsigned int j = 0; j < n_keep; ++j) {
                 const bool slot_empty = (s_sel[j] < 0);
                 const bool greater = !slot_empty && (s_select[i] > s_select[s_sel[j]]);
                 if (slot_empty || greater) {
                     // Shift [j+1, n_used) right by one.
-                    for (int m = (int)n_used - 1; m > (int)j; --m) {
+                    for (int m = (int)n_keep - 1; m > (int)j; --m) {
                         s_sel[m] = s_sel[m - 1];
                     }
                     s_sel[j] = (int)i;
@@ -93,5 +102,7 @@ extern "C" __global__ void router_topk(
     if (tid < n_used) {
         selected[tid] = s_sel[tid];
         weights[tid]  = s_w[tid] / s_sum * expert_weight_scale;
+    } else if (tid < n_used + n_alt) {
+        alts[tid - n_used] = s_sel[tid];
     }
 }

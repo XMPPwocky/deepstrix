@@ -15,6 +15,11 @@
 #define ROUTER_MAX_EXPERTS 256   // V4.1 build passes 512 (384 experts, padded)
 #endif
 #define ROUTER_MAX_USED    8
+// Ranks n_used+1 .. n_used+n_alt ("alternatives"), written to `alts` when it
+// is non-null: box 2 substitutes one for a pick it does not hold resident
+// (docs/v41/BOX2_MISS_SUBSTITUTION.md). They are extra argmax passes AFTER the
+// first n_used, so `selected` / `weights` are bit-identical whatever n_alt is.
+#define ROUTER_MAX_ALT     4
 
 __device__ inline float softplus_stable(float x) {
     if (x > 20.0f) return x;
@@ -30,12 +35,14 @@ extern "C" __global__ void router_topk_par(
         unsigned int   n_expert,
         unsigned int   n_used,
         float          expert_weight_scale,
-        float          weight_eps) {
+        float          weight_eps,
+        int          * __restrict__ alts,          // may be nullptr; [n_alt] per token
+        unsigned int   n_alt) {
     __shared__ float s_probs[ROUTER_MAX_EXPERTS];
     __shared__ float s_scores[ROUTER_MAX_EXPERTS]; // mutable; winners set to -INF
     __shared__ float buf[ROUTER_MAX_EXPERTS];
     __shared__ int   idxs[ROUTER_MAX_EXPERTS];
-    __shared__ int   s_sel[ROUTER_MAX_USED];
+    __shared__ int   s_sel[ROUTER_MAX_USED + ROUTER_MAX_ALT];
     __shared__ float s_w[ROUTER_MAX_USED];
     __shared__ float s_sum;
 
@@ -48,6 +55,9 @@ extern "C" __global__ void router_topk_par(
     logits   += (size_t)blockIdx.x * (size_t)n_expert;
     selected += (size_t)blockIdx.x * (size_t)n_used;
     weights  += (size_t)blockIdx.x * (size_t)n_used;
+    if (alts == nullptr) n_alt = 0;
+    if (n_alt > ROUTER_MAX_ALT) n_alt = ROUTER_MAX_ALT;
+    if (alts != nullptr) alts += (size_t)blockIdx.x * (size_t)n_alt;
 
     // Phase 1: probs + selection scores.
     if (tid < n_expert) {
@@ -59,8 +69,9 @@ extern "C" __global__ void router_topk_par(
 
     // Phase 2: K passes of parallel argmax.
     // The reduce is in [0, n_expert) so we pad with -INF for tid in
-    // [n_expert, ROUTER_MAX_EXPERTS).
-    for (unsigned int k = 0; k < n_used; ++k) {
+    // [n_expert, ROUTER_MAX_EXPERTS). Passes n_used.. are the alternatives;
+    // they only mask further winners, so the first n_used are unchanged.
+    for (unsigned int k = 0; k < n_used + n_alt; ++k) {
         // Init buf + idxs.
         if (tid < n_expert) {
             buf[tid] = s_scores[tid];
@@ -116,5 +127,7 @@ extern "C" __global__ void router_topk_par(
     if (tid < n_used) {
         selected[tid] = s_sel[tid];
         weights[tid]  = s_w[tid] / s_sum * expert_weight_scale;
+    } else if (tid < n_used + n_alt) {
+        alts[tid - n_used] = s_sel[tid];
     }
 }
