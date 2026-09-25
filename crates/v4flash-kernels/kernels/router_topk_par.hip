@@ -90,6 +90,11 @@ extern "C" __global__ void router_topk_par(
         // final set: exact ref.Gate renormalization.
         const float  * __restrict__ prior,
         unsigned int   n_protect,
+        // DRY RUN: compute the prior's selection but emit the PLAIN picks and
+        // weights in `selected`/`weights`, and the prior's picks in `orig_sel`
+        // (roles swapped), so the caller can count would-be swaps without
+        // changing any numerics.
+        unsigned int   prior_dry,
         // May be nullptr; [n_used] per token: the ORIGINAL top-n_used (no
         // prior), so the caller can see what the prior displaced.
         int          * __restrict__ orig_sel,
@@ -187,6 +192,21 @@ extern "C" __global__ void router_topk_par(
             const int w = argmax_pass(s_boost, buf, idxs, &s_win, n_expert, tid);
             if (tid == 0) s_sel[k] = w;
         }
+        __syncthreads();
+    }
+
+    // DRY RUN: swap roles, so the plain picks are emitted (and weighted) and
+    // `orig_sel` carries what the prior would have chosen.
+    if (prior != nullptr && prior_dry != 0) {
+        if (tid == 0) {
+            for (unsigned int j = 0; j < n_used; ++j) {
+                const int t = s_sel[j];
+                s_sel[j] = s_orig[j];
+                s_orig[j] = t;
+            }
+        }
+        __syncthreads();
+        if (orig_sel != nullptr && tid < n_used) orig_sel[tid] = s_orig[tid];
         __syncthreads();
     }
 

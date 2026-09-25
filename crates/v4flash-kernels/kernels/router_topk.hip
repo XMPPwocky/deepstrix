@@ -52,6 +52,7 @@ extern "C" __global__ void router_topk(
         // (= the plain picks) and `range_out` are filled when given.
         const float  * __restrict__ prior,
         unsigned int   n_protect,
+        unsigned int   prior_dry,
         int          * __restrict__ orig_sel,
         float        * __restrict__ range_out) {
     __shared__ float s_probs[ROUTER_MAX_EXPERTS];
@@ -113,6 +114,7 @@ extern "C" __global__ void router_topk(
         }
         (void)prior;
         (void)n_protect;
+        (void)prior_dry;
         s_sum = sum;
     }
     __syncthreads();

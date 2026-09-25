@@ -41,6 +41,9 @@ pub struct RouterEx<'a> {
     /// from the unbiased probs of the final set. `None` = off (bit-identical).
     pub prior: Option<&'a DeviceBuffer<f32>>,
     pub n_protect: u32,
+    /// Dry run: emit the PLAIN picks/weights and put the prior's picks in
+    /// `orig_sel` instead (roles swapped). Numerics unchanged.
+    pub prior_dry: bool,
     /// The ORIGINAL top-n_used per token (`[B, n_used]`), without the prior.
     pub orig_sel: Option<&'a mut DeviceBuffer<i32>>,
     /// max - min of each token's selection scores (`[B]`).
@@ -152,7 +155,7 @@ impl RouterTopk {
         launch_kernel!(function, cfg, stream, [
             selected.raw(), weights.raw(), logits.raw(), b_ptr,
             n_expert, n_used, expert_weight_scale, weight_eps, null, 0u32, null,
-            null, 0u32, null, null
+            null, 0u32, 0u32, null, null
         ])
     }
 
@@ -230,7 +233,7 @@ impl RouterTopk {
         b: u32,
         ex: RouterEx<'_>,
     ) -> eyre::Result<()> {
-        let RouterEx { alts, n_alt, alt_w, prior, n_protect, orig_sel, range_out } = ex;
+        let RouterEx { alts, n_alt, alt_w, prior, n_protect, prior_dry, orig_sel, range_out } = ex;
         if b == 0 {
             return Ok(());
         }
@@ -331,7 +334,7 @@ impl RouterTopk {
         launch_kernel!(function, cfg, stream, [
             selected.raw(), weights.raw(), logits.raw(), b_ptr,
             n_expert, n_used, expert_weight_scale, weight_eps, a_ptr, n_alt, aw_ptr,
-            pr_ptr, n_protect, os_ptr, ro_ptr
+            pr_ptr, n_protect, prior_dry as u32, os_ptr, ro_ptr
         ])
     }
 }

@@ -222,7 +222,7 @@ fn cache_prior_protects_top_j_and_renormalizes_exactly() -> eyre::Result<()> {
     let score = |t: usize, e: usize| prob(t, e) + bias_h[e] as f64;
 
     // Runs the router with an optional prior; returns (sel, ew, orig, range).
-    let go = |prior_h: Option<&[f32]>, n_protect: u32| -> eyre::Result<(Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>)> {
+    let go = |prior_h: Option<&[f32]>, n_protect: u32, prior_dry: bool| -> eyre::Result<(Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>)> {
         let mut sel = DeviceBuffer::<i32>::new(dev.id, B * nu)?;
         let mut ew = DeviceBuffer::<f32>::new(dev.id, B * nu)?;
         let mut orig = DeviceBuffer::<i32>::new(dev.id, B * nu)?;
@@ -233,7 +233,7 @@ fn cache_prior_protects_top_j_and_renormalizes_exactly() -> eyre::Result<()> {
         }
         par.launch_batched_ex(
             &s, &mut sel, &mut ew, &logits, Some(&bias), N_EXPERT, nu as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, B as u32,
-            RouterEx { prior: prior_h.map(|_| &pr), n_protect, orig_sel: Some(&mut orig), range_out: Some(&mut range), ..Default::default() },
+            RouterEx { prior: prior_h.map(|_| &pr), n_protect, prior_dry, orig_sel: Some(&mut orig), range_out: Some(&mut range), ..Default::default() },
         )?;
         s.synchronize()?;
         let (mut a, mut b, mut c, mut d) = (vec![0i32; B * nu], vec![0f32; B * nu], vec![0i32; B * nu], vec![0f32; B]);
@@ -246,14 +246,14 @@ fn cache_prior_protects_top_j_and_renormalizes_exactly() -> eyre::Result<()> {
     let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
 
     // 1. No prior: orig == sel, range matches the host; zero prior is bit-identical.
-    let (sel0, ew0, orig0, range0) = go(None, 2)?;
+    let (sel0, ew0, orig0, range0) = go(None, 2, false)?;
     assert_eq!(orig0, sel0, "orig_sel without a prior");
     for t in 0..B {
         let (mx, mn) = (0..ne).fold((f64::MIN, f64::MAX), |(a, b), e| (a.max(score(t, e)), b.min(score(t, e))));
         assert!((range0[t] as f64 - (mx - mn)).abs() < 1e-4, "t={t}: range {} vs {}", range0[t], mx - mn);
     }
     let zeros = vec![0f32; ne];
-    let (sel_z, ew_z, _, _) = go(Some(&zeros), 2)?;
+    let (sel_z, ew_z, _, _) = go(Some(&zeros), 2, false)?;
     assert_eq!(sel_z, sel0, "zero prior moved picks");
     assert_eq!(bits(&ew_z), bits(&ew0), "zero prior moved weights");
 
@@ -263,8 +263,13 @@ fn cache_prior_protects_top_j_and_renormalizes_exactly() -> eyre::Result<()> {
     for (n_protect, boost) in [(2u32, 0.05f32), (1, 0.3), (2, 10.0)] {
         let held: Vec<bool> = (0..ne).map(|e| (e * 2654435761usize) % 7 < 3).collect();
         let prior_h: Vec<f32> = held.iter().map(|&h| if h { boost } else { 0.0 }).collect();
-        let (sel, ew, orig, _) = go(Some(&prior_h), n_protect)?;
+        let (sel, ew, orig, _) = go(Some(&prior_h), n_protect, false)?;
         assert_eq!(orig, orig0, "orig_sel must ignore the prior");
+        // DRY RUN: plain picks and weights out, the prior's picks in orig_sel.
+        let (dsel, dew, dorig, _) = go(Some(&prior_h), n_protect, true)?;
+        assert_eq!(dsel, sel0, "dry run changed the picks");
+        assert_eq!(bits(&dew), bits(&ew0), "dry run changed the weights");
+        assert_eq!(dorig, sel, "dry run's orig_sel must be the prior's picks");
         for t in 0..B {
             let row = &sel[t * nu..(t + 1) * nu];
             let j = n_protect as usize;

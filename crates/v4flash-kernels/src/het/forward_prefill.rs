@@ -776,7 +776,7 @@ pub fn router_alts() -> u32 {
 /// Decode rows only (`RowLayout::Arena`: prefill chunks, the CED replay and the
 /// DSpark verify are `Contiguous`), with the box split under the T2 partition
 /// (the only ownership mode it predicts), and router alternatives present.
-/// A fidelity-gate routing pin must also switch it off here.
+/// Fidelity/determinism runs must leave `V41_SUB` unset.
 fn substitution_active(rows: &RowLayout<'_>, remote_split_on: bool, n_alt: usize) -> bool {
     matches!(super::b2_mirror::mode(), 1 | 2)
         && n_alt > 0
@@ -787,7 +787,7 @@ fn substitution_active(rows: &RowLayout<'_>, remote_split_on: bool, n_alt: usize
 
 /// Is the CACHE-PRIOR (`V41_SUB=3`) live for this lane-layer's router launch?
 /// Decode rows only, learned router, under the T2 partition with a remote
-/// that owns this layer. A fidelity-gate routing pin must also switch it off.
+/// that owns this layer. Fidelity/determinism runs must leave `V41_SUB` unset.
 fn cache_prior_active(rows: &RowLayout<'_>, hash_router: bool, remote_owns_layer: bool) -> bool {
     super::b2_mirror::mode() == 3
         && !hash_router
@@ -5974,19 +5974,24 @@ impl HeterogeneousEngine {
         // rows (box-2 miss substitution) or when the pick trace records them.
         // Prefill chunks otherwise skip the extra argmax passes and readbacks.
         let n_alt_layer: u32 = if !dlw.is_hash_router
-            && (matches!(rows, RowLayout::Arena { .. }) || super::expert_pager::pick_trace_on())
+            && ((matches!(rows, RowLayout::Arena { .. }) && super::b2_mirror::mode() != 3)
+                || super::expert_pager::pick_trace_on())
         {
             router_alts()
         } else {
             0
         };
         let image_runs = image_spans::image_runs(tokens);
-        let remote_owns_layer_early = self
-            .remote
-            .as_ref()
-            .and_then(|r| r.lock().ok().map(|c| c.info().owned_count(layer as u32) > 0))
-            .unwrap_or(false);
-        let sub3 = cache_prior_active(rows, dlw.is_hash_router, remote_owns_layer_early);
+        let sub3 = super::b2_mirror::mode() == 3
+            && image_runs.is_empty()
+            && cache_prior_active(
+                rows,
+                dlw.is_hash_router,
+                self.remote
+                    .as_ref()
+                    .and_then(|r| r.lock().ok().map(|c| c.info().owned_count(layer as u32) > 0))
+                    .unwrap_or(false),
+            );
         let mut prior_on = false;
         if !dlw.is_hash_router {
             // Top-k: one block per token in a single launch (B→1 launches).
@@ -6040,6 +6045,7 @@ impl HeterogeneousEngine {
                     alt_w: if n_alt > 0 { Some(&mut bd.d_alt_w) } else { None },
                     prior: if prior_on { Some(&bd.d_prior) } else { None },
                     n_protect: super::b2_mirror::protect(),
+                    prior_dry: super::b2_mirror::dry(),
                     orig_sel: if sub3 { Some(&mut bd.d_orig_sel) } else { None },
                     range_out: if sub3 { Some(&mut bd.d_range) } else { None },
                 },
@@ -6180,7 +6186,10 @@ impl HeterogeneousEngine {
 
         // M62: accumulate the chunk's picks into the prefill stats bank
         // (one tiny atomicAdd kernel on de.compute, no readback).
-        self.record_sel_stats(true, &bd.d_selected, layer as u32, b)?;
+        // The router's own picks: under a live cache-prior `d_selected` holds the
+        // prior's choice and `d_orig_sel` the plain one.
+        let plain_sel = if prior_on && !super::b2_mirror::dry() { &bd.d_orig_sel } else { &bd.d_selected };
+        self.record_sel_stats(true, plain_sel, layer as u32, b)?;
 
         // Stats collection (optional). Copies d_selected to host — sync,
         // fences the device. Don't enable in production prefill.
@@ -6552,40 +6561,68 @@ impl HeterogeneousEngine {
                 // background admission of displaced box-2 experts (as in mode 2).
                 if sub3 && prior_on && orig_host.len() == sel_host.len() {
                     let _t_sub = LayerHostTimer::start(&LH_SUB);
+                    // Live: `sel_host` holds the prior's picks, `orig_host` the plain
+                    // ones. Dry run: the kernel swapped the roles.
+                    let dry = super::b2_mirror::dry();
+                    let (plain, boosted): (&[i32], &[i32]) = if dry { (&sel_host, &orig_host) } else { (&orig_host, &sel_host) };
                     let box2_missing = |e: i32| {
                         (0..N_EXPERT as i32).contains(&e)
                             && super::expert_pager::partition_box2(layer, e as u32)
                             && super::b2_mirror::resident(layer, e as u32) == Some(false)
                     };
+                    // `predicted`, `avoided`, `blocked` count box-2 misses; `slots`
+                    // counts every displaced pick, box 1's included.
                     let mut predicted: Vec<i32> = Vec::new();
-                    for &e in &orig_host {
+                    for &e in plain {
                         if box2_missing(e) && !predicted.contains(&e) {
                             predicted.push(e);
                         }
                     }
                     let mut slots = 0u32;
                     let mut admit: Vec<u32> = Vec::new();
+                    let mut touch: Vec<u32> = Vec::new();
                     for r in 0..b as usize {
-                        let orow = &orig_host[r * cs_n_used..(r + 1) * cs_n_used];
-                        let frow = &sel_host[r * cs_n_used..(r + 1) * cs_n_used];
-                        let gone: Vec<i32> = orow.iter().copied().filter(|e| !frow.contains(e)).collect();
-                        let added: Vec<i32> = frow.iter().copied().filter(|e| !orow.contains(e)).collect();
+                        let prow = &plain[r * cs_n_used..(r + 1) * cs_n_used];
+                        let brow = &boosted[r * cs_n_used..(r + 1) * cs_n_used];
+                        let gone: Vec<i32> = prow.iter().copied().filter(|e| !brow.contains(e)).collect();
+                        let added: Vec<i32> = brow.iter().copied().filter(|e| !prow.contains(e)).collect();
                         slots += gone.len() as u32;
+                        if trace_on && !gone.is_empty() {
+                            // `O <layer> <b> <row> <ids>`: the router's own picks for a
+                            // row the prior changed (P lines show what ran).
+                            let ids: Vec<String> = prow.iter().map(|v| v.to_string()).collect();
+                            super::expert_pager::pick_trace(&format!("O {layer} {b} {r} {}", ids.join(" ")));
+                        }
                         for (k, &f) in gone.iter().enumerate() {
                             if trace_on {
-                                // `C <layer> <b> <row> <from> <to>`: a cache-prior swap.
+                                // `C|c <layer> <b> <row> <from> <to>`: a cache-prior swap
+                                // (`c` = dry run, would-be). The pairing is arbitrary: the
+                                // whole row is renormalized, no slot is inherited.
                                 let t = added.get(k).copied().unwrap_or(-1);
-                                super::expert_pager::pick_trace(&format!("C {layer} {b} {r} {f} {t}"));
+                                let tag = if dry { 'c' } else { 'C' };
+                                super::expert_pager::pick_trace(&format!("{tag} {layer} {b} {r} {f} {t}"));
                             }
-                            if super::b2_mirror::admit_on() && box2_missing(f) {
+                            // Admit a displaced box-2 miss in the background, unless
+                            // another row still runs it (then box 2 reads it anyway).
+                            if !dry && super::b2_mirror::admit_on() && box2_missing(f) && !boosted.contains(&f) {
                                 let w = ((layer as u32) << 16) | f as u32;
                                 if !admit.contains(&w) {
                                     admit.push(w);
                                 }
                             }
                         }
+                        // Box-1 experts the prior brought in were held at CHAIN time;
+                        // the other lane's `ensure` runs before ours, so make them MRU.
+                        for &t in &added {
+                            if !dry && (0..N_EXPERT as i32).contains(&t) && !super::expert_pager::partition_box2(layer, t as u32) {
+                                touch.push(t as u32);
+                            }
+                        }
                     }
-                    let avoided = predicted.iter().filter(|e| !sel_host.contains(e)).count() as u32;
+                    for t in touch {
+                        pg.touch_resident(layer, t);
+                    }
+                    let avoided = predicted.iter().filter(|e| !boosted.contains(e)).count() as u32;
                     super::b2_mirror::record(&super::b2_mirror::SubOutcome {
                         predicted: predicted.len() as u32,
                         avoided,
@@ -6753,6 +6790,12 @@ impl HeterogeneousEngine {
                 let mut seen = vec![false; N_EXPERT as usize];
                 let mut ids: Vec<u32> = Vec::with_capacity(N_EXPERT as usize);
                 let mut skipped_remote = 0usize;
+                // Under a live cache-prior, rank the hot set by the ROUTER's picks,
+                // not the prior's (held experts would inflate their own rank and
+                // lock box 1's set in).
+                if sub3 && prior_on && !super::b2_mirror::dry() && sel_orig.is_empty() && orig_host.len() == sel_host.len() {
+                    sel_orig = orig_host.clone();
+                }
                 let note_hot = super::expert_pager::hot_set::enabled() && (b as usize) <= small_b_catchall_max().max(8);
                 if note_hot {
                     // Every pick (not just the first per expert): the mass is what

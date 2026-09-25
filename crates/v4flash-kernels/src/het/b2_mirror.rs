@@ -77,7 +77,12 @@ pub fn mode() -> u32 {
     static M: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
         let m = std::env::var("V41_SUB").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0).min(3);
         if m == 3 {
-            eprintln!("b2 mirror: V41_SUB=3 CACHE-PRIOR, lambda {}, protect top {}", lambda(), protect());
+            eprintln!(
+            "b2 mirror: V41_SUB=3 CACHE-PRIOR{}, lambda {}, protect top {}",
+            if dry() { " (DRY RUN: counted, not applied)" } else { "" },
+            lambda(),
+            protect()
+        );
         } else if m > 0 {
             eprintln!(
                 "b2 mirror: V41_SUB={m} ({}), min rank {}, max weight {}",
@@ -110,11 +115,42 @@ pub fn min_rank() -> usize {
 
 /// `V41_SUB_LAMBDA` (mode 3; default 0.1, clamped to [0, 1]): the cache-prior
 /// strength, as a fraction of the layer's running selection-score range.
+/// `V41_SUB_LAMBDA_FILE=<path>`: re-read the value from that file (a bare
+/// number) at most once a second, so lambda can be swept live without a
+/// restart (every hub restart cools box 1's pool). A missing or unparsable
+/// file keeps the last value.
 pub fn lambda() -> f32 {
-    static L: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+    static BASE: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
         std::env::var("V41_SUB_LAMBDA").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.1).clamp(0.0, 1.0)
     });
-    *L
+    static FILE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| std::env::var("V41_SUB_LAMBDA_FILE").ok());
+    static CUR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let Some(path) = FILE.as_ref() else { return *BASE };
+    if let Ok(mut last) = LAST.try_lock() {
+        if last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+            *last = Some(std::time::Instant::now());
+            if let Some(v) = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<f32>().ok()) {
+                let v = v.clamp(0.0, 1.0);
+                if CUR.swap(v.to_bits(), Ordering::Relaxed) != v.to_bits() {
+                    eprintln!("b2 mirror: cache-prior lambda = {v} (from {path})");
+                }
+            }
+        }
+    }
+    match CUR.load(Ordering::Relaxed) {
+        u32::MAX => *BASE,
+        bits => f32::from_bits(bits),
+    }
+}
+
+/// `V41_SUB_DRY=1` (mode 3): compute the cache-prior's selection but route
+/// with the PLAIN picks; the would-be swaps are counted (`sub.*`) and traced
+/// (`c` lines). Numerics unchanged. Use it to sweep lambda to a swap rate.
+pub fn dry() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| matches!(std::env::var("V41_SUB_DRY").as_deref(), Ok("1") | Ok("on")));
+    *D
 }
 
 /// `V41_SUB_PROTECT` (mode 3; default 2): the original top picks the prior
@@ -137,10 +173,11 @@ pub fn observe_range(layer: i32, ranges: &[f32]) {
     if l >= LAYERS || ranges.is_empty() {
         return;
     }
-    let mean = ranges.iter().copied().filter(|r| r.is_finite() && *r > 0.0).sum::<f32>() / ranges.len() as f32;
-    if !(mean.is_finite() && mean > 0.0) {
+    let kept: Vec<f32> = ranges.iter().copied().filter(|r| r.is_finite() && *r > 0.0).collect();
+    if kept.is_empty() {
         return;
     }
+    let mean = kept.iter().sum::<f32>() / kept.len() as f32;
     let old = f32::from_bits(DELTA_BITS[l].load(Ordering::Relaxed));
     let new = if old > 0.0 { old + 0.05 * (mean - old) } else { mean };
     DELTA_BITS[l].store(new.to_bits(), Ordering::Relaxed);
