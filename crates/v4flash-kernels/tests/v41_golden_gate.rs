@@ -19,11 +19,20 @@
 //! Routing modes (`GOLDEN_ROUTING`, default both):
 //!   * `free`: the engine routes itself, as in production;
 //!   * `pinned`: every routing decision, prompt and decode, is forced to the
-//!     reference's top-6 (`het::routing_tap` PIN), weighted from the engine's own
+//!     reference's top-6 (`het::fidelity_tap` PIN), weighted from the engine's own
 //!     router scores. Selection is the one discontinuity in the forward pass, so
 //!     pinned KL prices the engine's numerics alone; free minus pinned is what
 //!     the routing flips cost. A pinned run must show zero differing picks (the
 //!     pin is checked, not assumed) and reports how many rows it overrode.
+//!
+//! Residuals: a fixture captured with layer dumps (`short`) also carries the
+//! reference's residual stream after every layer. Serial decode then reads the
+//! engine's residual back after each layer (`het::fidelity_tap` residual sink)
+//! and reports the relative L2 per layer, which names the first layer that
+//! departs instead of only showing the logits. `GOLDEN_DECODE_FROM=0` (the
+//! default for a fixture with no generated spans) skips prefill and decodes
+//! every position, so every layer runs the exact all-stage path the reference
+//! runs; that is the cleanest per-layer comparison (serial path only).
 //!
 //! Reports KL(ref || engine) mean / p50 / p90 / p99 / max, top-1 agreement and the
 //! transcript NLL, over generated positions (the assistant spans) and over all
@@ -40,7 +49,9 @@
 //!   cargo test -p v4flash-kernels --release --test v41_golden_gate -- --ignored --nocapture
 //! ```
 //! Env: GOLDEN_CASE (fixture dir, default ~/.cache/deepstrix/goldens/agentic),
-//! GOLDEN_PATHS (serial,arena), GOLDEN_ROUTING (free,pinned), GOLDEN_MAX_STEPS, GOLDEN_REPORT (JSON path),
+//! GOLDEN_PATHS (serial,arena), GOLDEN_ROUTING (free,pinned), GOLDEN_DECODE_FROM
+//! (first decoded position; default the first span's `<think>`, 0 without spans),
+//! GOLDEN_MAX_STEPS, GOLDEN_REPORT (JSON path),
 //! V41_HF_DIR, V41_ENGRAM_DIR, V41_PAGER_POOL_GB (default 40 here).
 
 use std::path::{Path, PathBuf};
@@ -52,8 +63,9 @@ use v4flash_kernels::config::{
     COMPRESS_RATIOS, ENGRAM_IN, ENGRAM_LAYERS, HC_DIM, KV_SOURCE_LAYERS, N_EXPERT, N_EXPERT_USED, N_LAYER, N_VOCAB,
 };
 use v4flash_kernels::embed::embed_lookup;
-use v4flash_kernels::het::routing_tap::{
-    pick_sink_enable, pick_sink_take, pin_overrides_take, pin_set, PickRecord, PinTable,
+use v4flash_kernels::het::fidelity_tap::{
+    pick_sink_enable, pick_sink_take, pin_overrides_take, pin_set, residual_sink_enable, residual_sink_take,
+    PickRecord, PinTable,
 };
 use v4flash_kernels::het::forward_prefill::{LazyEngramRows, PrefillJob};
 use v4flash_kernels::het::kv_arena::{KvArena, RowTablesDev};
@@ -102,6 +114,9 @@ struct Fixture {
     logits: Vec<f32>,     // [T, V]
     topk: Vec<i32>,       // [L, T, 6]
     sel: Vec<f32>,        // [L, T, 384]
+    /// Present when the capture kept layer dumps: residual after each layer, and the embedded input.
+    residuals: Option<Vec<f32>>, // [L, T, HC_DIM]
+    embed_hc: Option<Vec<f32>>,  // [T, HC_DIM]
 }
 
 fn read_f32(p: &Path) -> eyre::Result<Vec<f32>> {
@@ -130,7 +145,25 @@ impl Fixture {
         if vocab != N_VOCAB as usize {
             return Err(eyre!("fixture vocab {vocab} != engine {N_VOCAB}"));
         }
-        Ok(Self { tokens, spans, vocab, logits, topk, sel })
+        let hc = HC_DIM as usize;
+        let residuals = if dir.join("residual_L00.f32").exists() {
+            let mut r = Vec::with_capacity(l * t * hc);
+            for layer in 0..l {
+                let v = read_f32(&dir.join(format!("residual_L{layer:02}.f32")))?;
+                if v.len() != t * hc {
+                    return Err(eyre!("residual_L{layer:02}: {} values, expected T={t} x {hc}", v.len()));
+                }
+                r.extend(v);
+            }
+            Some(r)
+        } else {
+            None
+        };
+        let embed_hc = match dir.join("embed_hc.f32") {
+            f if f.exists() => Some(read_f32(&f)?).filter(|v| v.len() == t * hc),
+            _ => None,
+        };
+        Ok(Self { tokens, spans, vocab, logits, topk, sel, residuals, embed_hc })
     }
     fn ref_logits(&self, pos: usize) -> &[f32] {
         &self.logits[pos * self.vocab..(pos + 1) * self.vocab]
@@ -142,6 +175,14 @@ impl Fixture {
     fn ref_sel(&self, layer: usize, pos: usize) -> &[f32] {
         let (t, e) = (self.tokens.len(), N_EXPERT as usize);
         &self.sel[(layer * t + pos) * e..(layer * t + pos + 1) * e]
+    }
+    fn ref_residual(&self, layer: usize, pos: usize) -> Option<&[f32]> {
+        let (t, hc) = (self.tokens.len(), HC_DIM as usize);
+        self.residuals.as_ref().map(|r| &r[(layer * t + pos) * hc..(layer * t + pos + 1) * hc])
+    }
+    fn ref_embed(&self, pos: usize) -> Option<&[f32]> {
+        let hc = HC_DIM as usize;
+        self.embed_hc.as_ref().map(|e| &e[pos * hc..(pos + 1) * hc])
     }
     fn generated_pred(&self, pos: usize) -> bool {
         self.spans.iter().any(|&(a, b)| pos >= a && pos < b)
@@ -303,6 +344,52 @@ impl FlipStats {
     }
 }
 
+fn rel_l2(a: &[f32], b: &[f32]) -> f64 {
+    let (mut d, mut n) = (0f64, 0f64);
+    for (&x, &y) in a.iter().zip(b) {
+        d += (x as f64 - y as f64).powi(2);
+        n += (y as f64).powi(2);
+    }
+    (d / n.max(f64::MIN_POSITIVE)).sqrt()
+}
+
+/// Relative L2 of the engine's residual against the reference's, per layer and
+/// position (serial decode), plus the embedded input.
+struct ResidualStats {
+    per_layer: Vec<Vec<f64>>,
+    embed: Vec<f64>,
+}
+
+impl ResidualStats {
+    fn new() -> Self {
+        Self { per_layer: vec![Vec::new(); N_LAYER as usize], embed: Vec::new() }
+    }
+    fn observe(&mut self, fx: &Fixture, pos: usize, recs: &[(u16, Vec<f32>)]) -> eyre::Result<()> {
+        if recs.len() != N_LAYER as usize {
+            return Err(eyre!("position {pos}: {} residual records, expected one per layer ({N_LAYER})", recs.len()));
+        }
+        for (l, h) in recs {
+            let r = fx.ref_residual(*l as usize, pos).ok_or_else(|| eyre!("fixture has no residuals"))?;
+            self.per_layer[*l as usize].push(rel_l2(h, r));
+        }
+        Ok(())
+    }
+    fn summary(&self) -> serde_json::Value {
+        let stat = |v: &[f64], f: fn(f64, f64) -> f64, init: f64| v.iter().copied().fold(init, f);
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+        let max: Vec<f64> = self.per_layer.iter().map(|v| stat(v, f64::max, 0.0)).collect();
+        let first_over = |thr: f64| max.iter().position(|&m| m > thr);
+        serde_json::json!({
+            "positions": self.per_layer[0].len(),
+            "embed_rel_l2_max": stat(&self.embed, f64::max, 0.0),
+            "per_layer_rel_l2_mean": self.per_layer.iter().map(|v| mean(v)).collect::<Vec<_>>(),
+            "per_layer_rel_l2_max": max,
+            "first_layer_max_over_1e-3": first_over(1e-3),
+            "first_layer_max_over_1e-2": first_over(1e-2),
+        })
+    }
+}
+
 // ------------------------------------------------------------------ test
 
 #[test]
@@ -318,28 +405,40 @@ fn v41_golden_gate() -> eyre::Result<()> {
     }
     let home = std::env::var("HOME").unwrap_or_default();
     let case = PathBuf::from(std::env::var("GOLDEN_CASE").unwrap_or_else(|_| format!("{home}/.cache/deepstrix/goldens/agentic")));
+    let dir = std::env::var("V41_HF_DIR").unwrap_or_else(|_| HF_DIR_DEFAULT.to_string());
+    let engram_dir = std::env::var("V41_ENGRAM_DIR").unwrap_or_else(|_| format!("{home}/.cache/deepstrix/v41/engram"));
+
+    let fx = Fixture::load(&case)?;
+    let t_n = fx.tokens.len();
+    // With spans, the prompt is everything before the first `<think>` and the
+    // `<think>` itself is the first decode step, as production does.
+    let decode_from: usize = match std::env::var("GOLDEN_DECODE_FROM") {
+        Ok(v) => v.parse().map_err(|e| eyre!("GOLDEN_DECODE_FROM={v}: {e}"))?,
+        Err(_) => fx.spans.first().map_or(0, |s| s.0),
+    };
+    if decode_from + 2 > t_n {
+        return Err(eyre!("GOLDEN_DECODE_FROM={decode_from} leaves nothing to decode (T={t_n})"));
+    }
+    let prompt = &fx.tokens[..decode_from];
     let list = |k: &str, d: &str| -> Vec<String> {
         std::env::var(k).unwrap_or_else(|_| d.into()).split(',').map(|s| s.trim().to_string()).collect()
     };
-    let paths = list("GOLDEN_PATHS", "serial,arena");
+    let paths = list("GOLDEN_PATHS", if prompt.is_empty() { "serial" } else { "serial,arena" });
+    if prompt.is_empty() && paths.iter().any(|p| p != "serial") {
+        return Err(eyre!("GOLDEN_DECODE_FROM=0 has no prompt to prefill: serial path only"));
+    }
     let routings = list("GOLDEN_ROUTING", "free,pinned");
     if let Some(r) = routings.iter().find(|r| !matches!(r.as_str(), "free" | "pinned")) {
         return Err(eyre!("unknown GOLDEN_ROUTING entry {r}"));
     }
     let runs: Vec<(String, bool)> =
         paths.iter().flat_map(|p| routings.iter().map(move |r| (p.clone(), r == "pinned"))).collect();
-    let dir = std::env::var("V41_HF_DIR").unwrap_or_else(|_| HF_DIR_DEFAULT.to_string());
-    let engram_dir = std::env::var("V41_ENGRAM_DIR").unwrap_or_else(|_| format!("{home}/.cache/deepstrix/v41/engram"));
-
-    let fx = Fixture::load(&case)?;
-    let t_n = fx.tokens.len();
-    let (think, _) = *fx.spans.first().ok_or_else(|| eyre!("fixture has no generated spans"))?;
-    let prompt = &fx.tokens[..think]; // the trailing <think> is the first decode step
     let max_steps = std::env::var("GOLDEN_MAX_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
-    let last_pos = (t_n - 2).min(think + max_steps.saturating_sub(1));
+    let last_pos = (t_n - 2).min(decode_from + max_steps.saturating_sub(1));
     eprintln!(
-        "golden gate: case {} T={t_n}, prompt {} tokens, decode positions {think}..={last_pos}, paths {paths:?}",
-        case.display(), prompt.len()
+        "golden gate: case {} T={t_n}, prompt {} tokens, decode positions {decode_from}..={last_pos}, paths {paths:?}, \
+         routing {routings:?}, residuals {}",
+        case.display(), prompt.len(), fx.residuals.is_some()
     );
 
     let dgpu = pick("gfx1201")?;
@@ -377,7 +476,7 @@ fn v41_golden_gate() -> eyre::Result<()> {
     }
     let engram = Engram { hasher, tables };
     let hcs_prompt: Vec<Vec<f32>> = prompt.iter().map(|&t| embed(t)).collect::<eyre::Result<_>>()?;
-    let rows_prompt = engram.rows_for_prompt(pg.raw(), prompt)?;
+    let rows_prompt = if prompt.is_empty() { Vec::new() } else { engram.rows_for_prompt(pg.raw(), prompt)? };
 
     let mut report = serde_json::Map::new();
     report.insert("case".into(), case.display().to_string().into());
@@ -393,24 +492,26 @@ fn v41_golden_gate() -> eyre::Result<()> {
         let mut steps = StepStats::default();
         let mut flips = FlipStats::new();
         // ---- prefill: last-position logits predict prompt.len()
-        let prefill_logits = match path.as_str() {
-            "serial" => engine.forward_prefill_pipelined(
-                &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights,
-                &hcs_prompt, prompt, 0, true, None, None, None, None, Some(&mut pg), Some(&rows_prompt),
-            )?,
-            "arena" => {
-                let mut job = PrefillJob::new(prompt.to_vec(), hcs_prompt.clone(), Some(rows_prompt.clone()), None, 0, 1024)?;
-                while !job.chunks_done() {
-                    engine.prefill_job_chunk(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut pg))?;
-                }
-                engine.prefill_job_finish(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut pg))?
-            }
-            other => return Err(eyre!("unknown GOLDEN_PATHS entry {other}")),
-        };
-        st.restore_compressor_lending();
-        engine.dgpu.compute.synchronize()?;
         let mut prefill_stats = StepStats::default();
-        prefill_stats.push(&fx, prompt.len() - 1, &prefill_logits)?;
+        if !prompt.is_empty() {
+            let prefill_logits = match path.as_str() {
+                "serial" => engine.forward_prefill_pipelined(
+                    &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights,
+                    &hcs_prompt, prompt, 0, true, None, None, None, None, Some(&mut pg), Some(&rows_prompt),
+                )?,
+                "arena" => {
+                    let mut job = PrefillJob::new(prompt.to_vec(), hcs_prompt.clone(), Some(rows_prompt.clone()), None, 0, 1024)?;
+                    while !job.chunks_done() {
+                        engine.prefill_job_chunk(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut pg))?;
+                    }
+                    engine.prefill_job_finish(&mut job, &mut bd_a, &mut bi_a, &mut bd_b, &mut bi_b, &mut sd, &mut si, &mut ds, &mut st, &weights, Some(&mut pg))?
+                }
+                other => return Err(eyre!("unknown GOLDEN_PATHS entry {other}")),
+            };
+            st.restore_compressor_lending();
+            engine.dgpu.compute.synchronize()?;
+            prefill_stats.push(&fx, prompt.len() - 1, &prefill_logits)?;
+        }
         flips.pin_overrides.0 = pin_overrides_take();
         let t_prefill = t0.elapsed().as_secs_f64();
 
@@ -426,13 +527,20 @@ fn v41_golden_gate() -> eyre::Result<()> {
             dev = Some(RowTablesDev::alloc(dgpu, 1, KV_SOURCE_LAYERS.len())?);
         }
         let nv = N_VOCAB as usize;
+        let mut resid = ResidualStats::new();
+        let tap_resid = path == "serial" && fx.residuals.is_some();
+        residual_sink_enable(tap_resid);
+        let _ = residual_sink_take();
         pick_sink_enable(true);
         let _ = pick_sink_take();
-        for pos in think..=last_pos {
+        for pos in decode_from..=last_pos {
             let tok = fx.tokens[pos];
             pg.drain_prefetched()?;
             let rows = engram.rows_at(pg.raw(), &fx.tokens, pos)?;
             let hc = embed(tok)?;
+            if let Some(e) = fx.ref_embed(pos) {
+                resid.embed.push(rel_l2(&hc, e));
+            }
             let logits = if path == "serial" {
                 engine.forward_token_paged(&mut ds, &mut is, &mut st, &weights, &hc, pos as u32, tok, &mut pg, Some(&rows))?;
                 engine.dgpu.compute.synchronize()?;
@@ -448,24 +556,31 @@ fn v41_golden_gate() -> eyre::Result<()> {
             };
             steps.push(&fx, pos, &logits)?;
             flips.observe(&fx, pos, &pick_sink_take())?;
-            if (pos - think) % 100 == 0 {
+            if tap_resid {
+                resid.observe(&fx, pos, &residual_sink_take())?;
+            }
+            if (pos - decode_from) % 100 == 0 {
                 eprintln!("  [{name}] pos {pos}: KL {:.5} top1 {}", steps.kl.last().unwrap(), steps.top1.last().unwrap());
             }
         }
         pick_sink_enable(false);
+        residual_sink_enable(false);
         flips.pin_overrides.1 = pin_overrides_take();
         pin_set(None);
         if let Some(a) = arena.as_mut() {
             a.release(slot)?;
         }
         let secs = t0.elapsed().as_secs_f64();
-        let r = serde_json::json!({
+        let mut r = serde_json::json!({
             "prefill_last": prefill_stats.summary(false),
             "decode_generated": steps.summary(true),
             "decode_all": steps.summary(false),
             "routing": flips.summary(),
             "seconds": {"prefill": t_prefill, "total": secs},
         });
+        if tap_resid {
+            r["residual"] = resid.summary();
+        }
         eprintln!("[{name}] {}", serde_json::to_string_pretty(&r)?);
         report.insert(name, r);
     }

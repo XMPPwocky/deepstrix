@@ -1,7 +1,10 @@
-//! Routing taps for the fidelity gate (`tests/v41_golden_gate.rs`).
+//! Taps for the fidelity gate (`tests/v41_golden_gate.rs`).
 //!
-//! - The SINK records every expert pick the engine makes, so the gate can
+//! - The pick SINK records every expert pick the engine makes, so the gate can
 //!   compare each routing decision against the CPU reference's.
+//! - The residual SINK records the residual stream (the mHC state, `HC_DIM`)
+//!   after every layer of a serial decode step, so the gate can name the first
+//!   layer that departs from the reference instead of only seeing the logits.
 //! - The PIN forces the engine's picks to the reference's. Top-k selection is
 //!   discontinuous: a 1e-4 difference in a router score near the boundary swaps
 //!   an expert, and the swap compounds through every later layer and position.
@@ -54,6 +57,31 @@ pub fn pick_sink_push(batched: bool, layer: usize, row: u32, rows: u32, ids: &[i
 /// Everything recorded since the last take, in call order.
 pub fn pick_sink_take() -> Vec<PickRecord> {
     std::mem::take(&mut *PICK_SINK.lock().unwrap())
+}
+
+static RESIDUAL_SINK_ON: AtomicBool = AtomicBool::new(false);
+static RESIDUAL_SINK: Mutex<Vec<(u16, Vec<f32>)>> = Mutex::new(Vec::new());
+
+/// Residual sink, serial decode only (`forward_token_impl`). On, it costs a
+/// stream drain and an 80 KB readback per layer.
+pub fn residual_sink_enable(on: bool) {
+    RESIDUAL_SINK_ON.store(on, Ordering::Relaxed);
+}
+#[inline]
+pub fn residual_sink_on() -> bool {
+    RESIDUAL_SINK_ON.load(Ordering::Relaxed)
+}
+/// Record `layer`'s output residual; drains `stream` first.
+pub fn residual_sink_push(stream: &Stream, layer: usize, residual: &DeviceBuffer<f32>) -> eyre::Result<()> {
+    stream.synchronize()?;
+    let mut h = vec![0f32; crate::config::HC_DIM as usize];
+    residual.slice_view(0, h.len()).copy_to_host(&mut h)?;
+    RESIDUAL_SINK.lock().unwrap().push((layer as u16, h));
+    Ok(())
+}
+/// `(layer, residual after that layer)` since the last take, in call order.
+pub fn residual_sink_take() -> Vec<(u16, Vec<f32>)> {
+    std::mem::take(&mut *RESIDUAL_SINK.lock().unwrap())
 }
 
 /// The reference's picks, `[layer][pos][k]` for absolute positions `0..n_pos`
