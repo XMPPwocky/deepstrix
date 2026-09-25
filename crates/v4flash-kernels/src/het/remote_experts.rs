@@ -2098,10 +2098,14 @@ static HITS_FIRST_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 /// drained into the next `submit`.
 static PREFETCH_WORDS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
-pub fn push_prefetch_words(words: &[u32]) {
+/// False (nothing queued) when 4096 words are already waiting.
+pub fn push_prefetch_words(words: &[u32]) -> bool {
     let mut g = PREFETCH_WORDS.lock().unwrap();
     if g.len() < 4096 {
         g.extend_from_slice(words);
+        true
+    } else {
+        false
     }
 }
 

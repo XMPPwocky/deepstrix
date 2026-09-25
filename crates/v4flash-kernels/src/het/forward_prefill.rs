@@ -6515,9 +6515,11 @@ impl HeterogeneousEngine {
                         // `d_ew`'s scale (sum 1.5); then one char per pick then
                         // alternative for residency at route time: box 2's mirror
                         // R held / P not held but in a sent, unanswered request /
-                        // M missing / ? not yet reported, box 1's pager r held /
-                        // m missing. Enough to replay any substitution gate
-                        // offline. Parsers keyed on `P`/`D` skip it.
+                        // I not held but a queued background read covers it
+                        // (INCOMING) / M missing / ? not yet reported, box 1's
+                        // pager r held / m missing. Enough to replay any
+                        // substitution gate offline. Parsers keyed on `P`/`D`
+                        // skip it.
                         if na > 0 {
                             let alts = &alts_host[r * na..(r + 1) * na];
                             let a: Vec<String> = alts.iter().map(|v| v.to_string()).collect();
@@ -6537,9 +6539,10 @@ impl HeterogeneousEngine {
                                     '-'
                                 } else if box2 {
                                     match super::b2_mirror::lookup(layer, e as u32) {
-                                        Some((true, _)) => 'R',
-                                        Some((false, true)) => 'P',
-                                        Some((false, false)) => 'M',
+                                        Some(r) if r.held => 'R',
+                                        Some(r) if r.pending => 'P',
+                                        Some(r) if r.incoming => 'I',
+                                        Some(_) => 'M',
                                         None => '?',
                                     }
                                 } else if pg.is_resident(layer, e as u32) {
@@ -6556,6 +6559,18 @@ impl HeterogeneousEngine {
                             ));
                         }
                     }
+                }
+                // INCOMING (het::b2_mirror): the router's box-2 picks that box 2's
+                // last reply calls missing but a queued background read covers,
+                // i.e. kept instead of swapped away again. The router's own picks:
+                // a live prior's are in `orig_host`.
+                if sub_on || (sub3 && prior_on) {
+                    let router: &[i32] = if sub3 && prior_on && !super::b2_mirror::dry() && orig_host.len() == sel_host.len() {
+                        &orig_host
+                    } else {
+                        &sel_host
+                    };
+                    super::b2_mirror::note_incoming_kept(layer, router, |e| super::expert_pager::partition_box2(layer, e));
                 }
                 // Cache-prior accounting: what the router's prior displaced, and
                 // background admission of displaced box-2 experts (as in mode 2).
@@ -6630,8 +6645,8 @@ impl HeterogeneousEngine {
                         blocked: predicted.len() as u32 - avoided,
                         failed: 0,
                     });
-                    if !admit.is_empty() {
-                        super::remote_experts::push_prefetch_words(&admit);
+                    if !admit.is_empty() && super::remote_experts::push_prefetch_words(&admit) {
+                        super::b2_mirror::note_incoming(&admit);
                         super::b2_mirror::note_admits(admit.len());
                     }
                 }
@@ -6722,8 +6737,8 @@ impl HeterogeneousEngine {
                         self.current_device.store(self.dgpu.device.id, std::sync::atomic::Ordering::Relaxed);
                         bd.d_selected.slice_view_mut(0, n_sel).copy_from_host(&sel_sub)?;
                         bd.d_ew.slice_view_mut(0, n_sel).copy_from_host(&ew_sub)?;
-                        if !admit.is_empty() {
-                            super::remote_experts::push_prefetch_words(&admit);
+                        if !admit.is_empty() && super::remote_experts::push_prefetch_words(&admit) {
+                            super::b2_mirror::note_incoming(&admit);
                             super::b2_mirror::note_admits(admit.len());
                         }
                         sel_orig = std::mem::replace(&mut sel_host, sel_sub);

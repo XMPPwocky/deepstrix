@@ -978,8 +978,8 @@ impl Sched {
             // `sub.predicted_miss` with `box2.misses_x1e6` for the mirror's
             // accuracy (dry run: `V41_SUB=1`).
             if v4flash_kernels::het::b2_mirror::wanted() {
-                let (p, av, sw, bl, fl, ad) = v4flash_kernels::het::b2_mirror::take_sub_stats();
-                for (name, v) in [("sub.predicted_miss", p as f64), ("sub.reads_avoided", av as f64), ("sub.picks_swapped", sw as f64), ("sub.blocked", bl as f64), ("sub.plan_failed", fl as f64), ("sub.admits_queued", ad as f64)] {
+                let (p, av, sw, bl, fl, ad, inc) = v4flash_kernels::het::b2_mirror::take_sub_stats();
+                for (name, v) in [("sub.predicted_miss", p as f64), ("sub.reads_avoided", av as f64), ("sub.picks_swapped", sw as f64), ("sub.blocked", bl as f64), ("sub.plan_failed", fl as f64), ("sub.admits_queued", ad as f64), ("sub.incoming_kept", inc as f64)] {
                     let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
                     e.0 += v; e.1 += 1;
                 }

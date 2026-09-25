@@ -166,8 +166,9 @@ The box-2-side policy below stays as the fallback for mirror errors.
   - The hub's reply size limit allows for the map.
 - **Trace:** `A <layer> <b> <alts> / <owner> / <alt_w> / <pick_w> / <state>`,
   where state is one char per pick then alternative: box 2's mirror R held /
-  P in a sent, unanswered request / M missing / ? not reported yet, box 1's
-  pager r/m. Plus `S <layer> <b> <row> <rank> <from> <to> <w_from> <w_to>` per
+  P in a sent, unanswered request / I a queued background read covers it
+  (incoming overlay, below) / M missing / ? not reported yet, box 1's pager
+  r/m. Plus `S <layer> <b> <row> <rank> <from> <to> <w_from> <w_to>` per
   swap, and `s` (same fields) per swap the DRY RUN would have made. Enough to
   replay any gate (rank, weight cap) offline. `P` is recorded even with
   `V41_SUB_PENDING=0`, so a replay must apply that knob itself.
@@ -176,6 +177,24 @@ The box-2-side policy below stays as the fallback for mirror errors.
   for the other. Under PARK (`knobs::park`, OOO replies) box 2 serves the other
   lane while the read is parked, so that lane would WAIT on the read the
   overlay told it not to avoid. Run `V41_SUB_PENDING=0` whenever park is on.
+- **Incoming overlay (2026-09-25, `V41_SUB_INCOMING`, default 4 replies, 0 =
+  off; modes 2 and 3).** Box 2's map counts only landed slots, and the reply
+  after an admission leaves before its read lands. So at the layer's next route
+  the mirror still says "missing", and an expert the router picks again on the
+  next token is swapped away again for a read already under way. Live trace,
+  λ=0.25: 3.9% of swapped-away experts were re-picked on the next token, and
+  71% of those were swapped again, about 2.8% of all swaps. `note_incoming`
+  marks each admission that was actually queued (`push_prefetch_words` returns
+  false when 4096 words already wait). The mark counts as resident from the
+  layer's NEXT reply, not before: the other lane of the same step routes
+  before any reply and must not ride on a read queued a moment ago. It lasts N
+  replies, or until a reply shows the expert held (then it is cleared, so a
+  later eviction is a miss again). Unlike PENDING it is safe under PARK. A
+  request that needs an unlanded marked expert makes box 2 promote the queued
+  read and wait for it (`ensure`'s in-flight wait): one read already queued,
+  never a second. Marked experts are also acceptable substitutes (mode 2) and
+  are boosted by the prior (mode 3). Profile: `sub.incoming_kept` = the
+  router's box-2 picks per step kept because of a mark; trace state `I`.
 - **Known limitation:** lanes are planned one at a time. Lane A can swap away an
   expert that lane B then reads anyway (B picked it above `min_rank`, or had no
   alternative), so A pays the quality cost for no time saved. Fixing it means

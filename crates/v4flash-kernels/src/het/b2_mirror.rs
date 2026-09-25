@@ -35,10 +35,27 @@
 //! (`V41_SUB_ADMIT`, default on): the hub queues `layer << 16 | e` as a box-2
 //! PREFETCH word on the same request (`remote_experts::push_prefetch_words`).
 //! Box 2's background readers fetch it (yielding to demand misses) and admit
-//! it at that layer's next `ensure`, so the mirror shows it resident next time
+//! it at that layer's next `ensure`, so the mirror shows it resident soon after
 //! and the swap rate falls back to the first-touch miss rate. Without it, a
 //! swapped expert is never read, never admitted, and swapped again on every
 //! later pick (measured live: 3-5x the swaps).
+//!
+//! INCOMING (`V41_SUB_INCOMING`, default 4 replies; 0 = off). Box 2's map
+//! counts only LANDED slots, and the reply that follows an admission leaves
+//! before its read lands, so at the layer's next route the mirror still says
+//! "missing": an expert the router picks again on the next token is swapped
+//! away again, for a read already under way (measured live 2026-09-25: 3.9% of
+//! swapped-away experts are re-picked on the next token, 71% of those were
+//! swapped again, ~2.8% of all swaps). `note_incoming` marks each queued
+//! admission, and the mark counts as resident from the layer's NEXT reply for
+//! the next N replies, or until a reply shows the expert held. Not before that
+//! reply: the other lane of the same step routes before any reply is consumed
+//! (see PENDING above), and it must not ride on a read queued a moment ago. If
+//! the read has not landed when a request needs it, box 2 promotes it and
+//! waits (`ensure`'s in-flight wait): at most one read, already queued, never
+//! a second. A mark box 2 dropped expires after N replies (each costs one
+//! demand read at most). Marked experts are also acceptable substitutes
+//! (mode 2) and are boosted by the prior (mode 3), like any resident expert.
 //!
 //! * 3 = CACHE-PRIOR (Skliar et al. 2024, arXiv 2412.00099): no host-side
 //!   rewrite. The router itself adds `lambda * Delta_layer` to the selection
@@ -62,15 +79,21 @@
 
 use crate::config::{N_EXPERT, N_LAYER};
 use crate::router_topk::ROUTER_MAX_ALT;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 const WORDS: usize = (N_EXPERT as usize).div_ceil(64);
 const LAYERS: usize = N_LAYER as usize;
+const NE: usize = N_EXPERT as usize;
 const MAX_ALT: usize = ROUTER_MAX_ALT as usize;
 
 static BITS: [[AtomicU64; WORDS]; LAYERS] = [const { [const { AtomicU64::new(0) }; WORDS] }; LAYERS];
 static PENDING: [[AtomicU64; WORDS]; LAYERS] = [const { [const { AtomicU64::new(0) }; WORDS] }; LAYERS];
 static SEEN: [AtomicBool; LAYERS] = [const { AtomicBool::new(false) }; LAYERS];
+/// Replies consumed per layer: the INCOMING overlay's clock.
+static REPLIES: [AtomicU32; LAYERS] = [const { AtomicU32::new(0) }; LAYERS];
+/// Per (layer, expert): the `REPLIES` count from which a queued admission
+/// counts as resident (module doc, INCOMING); 0 = no mark.
+static INCOMING: [[AtomicU32; NE]; LAYERS] = [const { [const { AtomicU32::new(0) }; NE] }; LAYERS];
 
 /// `V41_SUB`: 0 off, 1 dry run, 2 on.
 pub fn mode() -> u32 {
@@ -217,8 +240,40 @@ pub fn max_w() -> Option<f32> {
     *W
 }
 
+/// `V41_SUB_INCOMING` (default 4; 0 = off): for how many of a layer's replies
+/// a queued background admission counts as resident (module doc, INCOMING).
+pub fn incoming_replies() -> u32 {
+    static N: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_SUB_INCOMING").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(4)
+    });
+    *N
+}
+
+/// Admissions `(layer << 16) | e` were just queued for box 2: count them as
+/// resident from the layer's next reply (module doc, INCOMING).
+pub fn note_incoming(words: &[u32]) {
+    if incoming_replies() == 0 {
+        return;
+    }
+    for &w in words {
+        let (l, e) = ((w >> 16) as usize, (w & 0xffff) as usize);
+        if l < LAYERS && e < NE {
+            let from = REPLIES[l].load(Ordering::Acquire).wrapping_add(1).max(1);
+            INCOMING[l][e].store(from, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Is `(l, e)`'s admission mark inside its window?
+fn incoming(l: usize, e: usize) -> bool {
+    let n = incoming_replies();
+    let from = INCOMING[l][e].load(Ordering::Relaxed);
+    n > 0 && from != 0 && REPLIES[l].load(Ordering::Acquire).wrapping_sub(from) < n
+}
+
 /// Overwrite `layer`'s row from a reply's residency map
-/// (`proto::RESID_WORDS` u32s, bit e = expert e), and drop its pending row.
+/// (`proto::RESID_WORDS` u32s, bit e = expert e), drop its pending row, and
+/// advance the layer's INCOMING clock.
 pub fn update(layer: u32, words: &[u32]) {
     let l = layer as usize;
     if l >= LAYERS {
@@ -227,9 +282,19 @@ pub fn update(layer: u32, words: &[u32]) {
     for (i, slot) in BITS[l].iter().enumerate() {
         let lo = words.get(2 * i).copied().unwrap_or(0) as u64;
         let hi = words.get(2 * i + 1).copied().unwrap_or(0) as u64;
-        slot.store(lo | (hi << 32), Ordering::Relaxed);
+        let held = lo | (hi << 32);
+        slot.store(held, Ordering::Relaxed);
         PENDING[l][i].store(0, Ordering::Relaxed);
+        // A landed admission is plainly held now: drop its mark, so that it
+        // cannot outlive an eviction inside its window.
+        for b in 0..64 {
+            let e = i * 64 + b;
+            if e < NE && (held >> b) & 1 == 1 && INCOMING[l][e].load(Ordering::Relaxed) != 0 {
+                INCOMING[l][e].store(0, Ordering::Relaxed);
+            }
+        }
     }
+    REPLIES[l].fetch_add(1, Ordering::Release);
     SEEN[l].store(true, Ordering::Release);
 }
 
@@ -248,24 +313,39 @@ pub fn note_submitted(layer: u32, sel: &[i32]) {
     }
 }
 
-/// Will box 2 serve `(layer, e)` without a read? Its last reply for `layer`
-/// says it holds `e`, or a request already sent will bring it in. `None`
-/// until box 2 has reported `layer` at all.
+/// Will box 2 serve `(layer, e)` without a new read? Its last reply for `layer`
+/// says it holds `e`, or a request already sent will bring it in (PENDING), or
+/// a background read of it is already queued (INCOMING). `None` until box 2
+/// has reported `layer` at all.
 pub fn resident(layer: i32, e: u32) -> Option<bool> {
-    lookup(layer, e).map(|(held, pending)| held || (pending && pending_on()))
+    lookup(layer, e).map(|r| r.held || (r.pending && pending_on()) || r.incoming)
 }
 
-/// `(held per box 2's last reply, in a sent unanswered request)`; `None` until
-/// box 2 has reported `layer`. For the trace, which keeps the two apart.
-pub fn lookup(layer: i32, e: u32) -> Option<(bool, bool)> {
+/// Box 1's view of one box-2 expert, the sources kept apart (for the trace).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Residency {
+    /// Held per box 2's last reply for the layer.
+    pub held: bool,
+    /// In a sent, unanswered request (`note_submitted`), whether or not
+    /// `V41_SUB_PENDING` counts it.
+    pub pending: bool,
+    /// A queued background admission inside its window (`note_incoming`;
+    /// false when `V41_SUB_INCOMING=0`).
+    pub incoming: bool,
+}
+
+/// `(layer, e)`'s residency sources; `None` until box 2 has reported `layer`.
+pub fn lookup(layer: i32, e: u32) -> Option<Residency> {
     let l = layer as usize;
     if l >= LAYERS || e >= N_EXPERT || !SEEN[l].load(Ordering::Acquire) {
         return None;
     }
     let (w, b) = ((e / 64) as usize, e % 64);
-    let held = (BITS[l][w].load(Ordering::Relaxed) >> b) & 1 == 1;
-    let pending = (PENDING[l][w].load(Ordering::Relaxed) >> b) & 1 == 1;
-    Some((held, pending))
+    Some(Residency {
+        held: (BITS[l][w].load(Ordering::Relaxed) >> b) & 1 == 1,
+        pending: (PENDING[l][w].load(Ordering::Relaxed) >> b) & 1 == 1,
+        incoming: incoming(l, e as usize),
+    })
 }
 
 // ---- per-step counters (drained by the multistream profile) ----
@@ -276,19 +356,43 @@ static N_SLOTS: AtomicU64 = AtomicU64::new(0);
 static N_BLOCKED: AtomicU64 = AtomicU64::new(0);
 static N_FAILED: AtomicU64 = AtomicU64::new(0);
 static N_ADMITS: AtomicU64 = AtomicU64::new(0);
+static N_INCOMING: AtomicU64 = AtomicU64::new(0);
 
 /// Background admissions queued (`V41_SUB_ADMIT`), for the profile.
 pub fn note_admits(n: usize) {
     N_ADMITS.fetch_add(n as u64, Ordering::Relaxed);
 }
 
+/// Count one lane-layer's distinct box-2 picks (`is_box2`) that box 2's last
+/// reply calls missing (and no counted PENDING covers) but a queued admission
+/// does (INCOMING): each would otherwise be a predicted miss, swapped away
+/// again. Pass the ROUTER's picks.
+pub fn note_incoming_kept(layer: i32, picks: &[i32], is_box2: impl Fn(u32) -> bool) {
+    if incoming_replies() == 0 {
+        return;
+    }
+    let mut seen: Vec<i32> = Vec::new();
+    for &e in picks {
+        if !(0..N_EXPERT as i32).contains(&e) || seen.contains(&e) {
+            continue;
+        }
+        seen.push(e);
+        if let Some(r) = lookup(layer, e as u32) {
+            if is_box2(e as u32) && !r.held && !(r.pending && pending_on()) && r.incoming {
+                N_INCOMING.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// `(predicted box-2 misses, reads avoided, picks substituted, misses left
-/// alone, planner failures, background admissions queued)` since the last
-/// call. Failures should be 0 (see `SubOutcome::failed`). The first, second and fourth count distinct
+/// alone, planner failures, background admissions queued, picks kept by
+/// INCOMING)` since the last call. Failures should be 0 (see
+/// `SubOutcome::failed`). The first, second, fourth and last count distinct
 /// experts per lane-layer; box 2 counts a miss once per (possibly merged)
 /// pass, so compare with `box2.misses_x1e6` as an upper bound. In dry-run mode
 /// "avoided" and "substituted" are what WOULD have happened.
-pub fn take_sub_stats() -> (u64, u64, u64, u64, u64, u64) {
+pub fn take_sub_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
     (
         N_PREDICTED.swap(0, Ordering::Relaxed),
         N_AVOIDED.swap(0, Ordering::Relaxed),
@@ -296,6 +400,7 @@ pub fn take_sub_stats() -> (u64, u64, u64, u64, u64, u64) {
         N_BLOCKED.swap(0, Ordering::Relaxed),
         N_FAILED.swap(0, Ordering::Relaxed),
         N_ADMITS.swap(0, Ordering::Relaxed),
+        N_INCOMING.swap(0, Ordering::Relaxed),
     )
 }
 
@@ -784,9 +889,55 @@ mod tests {
         // A request already sent for this layer brings 4 in.
         note_submitted(l, &[4, -1, 9999]);
         assert_eq!(resident(l as i32, 4), Some(true));
-        assert_eq!(lookup(l as i32, 4), Some((false, true)), "pending, not held");
+        assert_eq!(
+            lookup(l as i32, 4),
+            Some(Residency { held: false, pending: true, incoming: false }),
+            "pending, not held"
+        );
         // The next reply is authoritative again.
         update(l, &w);
         assert_eq!(resident(l as i32, 4), Some(false));
+    }
+
+    /// INCOMING: a queued admission counts as resident from the layer's next
+    /// reply, for `incoming_replies()` replies; a reply that shows it held
+    /// clears the mark. Own layer (the mirror is process-global).
+    #[test]
+    fn incoming_window_clear_and_count() {
+        let l = (LAYERS - 3) as u32;
+        let n = incoming_replies();
+        assert!(n >= 1, "test assumes V41_SUB_INCOMING is on (default 4)");
+        let empty = vec![0u32; NE.div_ceil(32)];
+        update(l, &empty);
+        // Out-of-range words are ignored.
+        note_incoming(&[(l << 16) | 7, (LAYERS as u32) << 16, (l << 16) | 9999]);
+        assert_eq!(resident(l as i32, 7), Some(false), "not before the layer's next reply");
+        for k in 0..n {
+            update(l, &empty);
+            assert_eq!(resident(l as i32, 7), Some(true), "inside the window, reply {k}");
+            assert!(lookup(l as i32, 7).is_some_and(|r| r.incoming && !r.held));
+        }
+        update(l, &empty);
+        assert_eq!(resident(l as i32, 7), Some(false), "expired after {n} replies");
+
+        // Landed: the mark goes, so an eviction inside the old window is a miss.
+        note_incoming(&[(l << 16) | 8]);
+        update(l, &empty);
+        assert_eq!(resident(l as i32, 8), Some(true));
+        let mut w = empty.clone();
+        w[0] = 1 << 8;
+        update(l, &w);
+        assert_eq!(lookup(l as i32, 8), Some(Residency { held: true, pending: false, incoming: false }));
+        update(l, &empty);
+        assert_eq!(resident(l as i32, 8), Some(false), "evicted: a miss again");
+
+        // Kept picks: distinct, box 2's only, in-window marks only.
+        note_incoming(&[(l << 16) | 10]);
+        update(l, &empty);
+        let _ = take_sub_stats();
+        note_incoming_kept(l as i32, &[10, 10, 11, -1, 9999], |_| true);
+        assert_eq!(take_sub_stats().6, 1);
+        note_incoming_kept(l as i32, &[10], |_| false);
+        assert_eq!(take_sub_stats().6, 0, "box-1 picks are not counted");
     }
 }
