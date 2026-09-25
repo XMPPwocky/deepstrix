@@ -625,3 +625,12 @@ Run each case through serial prefill, serial decode, multistream rows at S=1/2/4
 
 *Found during removal (not yet fixed):*
 - **DSpark drafter KV quantisation may be V4-style.** `het/mtp.rs:1085,1122` calls `Fp8E4m3fnQuantize::launch_kv_post_fused`. `forward_layer.rs` documents that this kernel bakes V4-Flash's window quantisation (E4M3 over the 448 non-RoPE dims, block 64), while V4.1 quantises the whole post-RoPE row at block 32. Check this before re-enabling DSpark.
+
+**2026-09-25:**
+
+*Golden gate (step 0), code complete through milestone 2, not yet run on GPU:*
+- **Corpus:** `oracle.py --golden` captures the reference's routing (the tap re-derives top-k and asserts it matches), logits, compressor picks and, for `short`, per-layer residuals. `export_golden.py` (`dfd843c`) packs one fixture per case. The fixtures live on box 1 at `~/.cache/deepstrix/goldens/{agentic,short}`.
+- **`f78c581` (milestone 1):** in-process pick sink plus `tests/v41_golden_gate.rs`. Serial and arena paths are teacher-forced over the golden transcript. It reports KL, top-1 and NLL, plus every routing difference classified by the reference's own score gap.
+- **`9191d50` (milestone 2a):** routing PIN (`het/fidelity_tap.rs`). It forces the reference's top-6 at every serial-decode and batched row, weighting those experts from the engine's own router logits. Rows whose pick set already matches are untouched. Pinned KL isolates the engine's numerics; free KL minus pinned KL is the cost of routing flips. A pinned run hard-fails unless every pick matches.
+- **`0e47b83` (milestone 2b):** residual sink plus per-layer relative L2 against the reference. `GOLDEN_DECODE_FROM=0` runs every layer on the exact path the reference runs.
+- **Next:** first run (server down, ~45 min: `short` with decode-from-0 free+pinned, then `agentic` serial+arena free+pinned) to set the baseline thresholds. Then milestone 3: the restore path and an indexer pin (`compress_idxs`).
