@@ -597,8 +597,20 @@ __device__ __forceinline__ static void bitonic_sort_keys2048(unsigned int* keys)
     }
 }
 
-extern "C" __global__ __launch_bounds__(TOPK_BLOCK)
-void indexer_topk_select_batched(
+// TOPK_SEL_ILP (2026-09-26): loads in flight per thread in the two O(n) scans
+// (count, compact). With U = 1 each thread walks its ~n/1024 strided scores one
+// dependent-issue iteration at a time: at a decode row's n = 235K that is ~230
+// serial round trips per pass, ~185 us per launch for ~1 MB of scores
+// (tests/bench_decode_latency_breakdown.rs, gfx1201). U > 1 issues U loads,
+// then consumes them in the same order. The selection is IDENTICAL: the counts
+// are integer sums, and the compact pass already placed candidates in atomic
+// (nondeterministic) slot order ahead of a full sort by the total order
+// (score desc, index asc). `indexer_topk_select_batched` keeps U = 1 for
+// rollback (V41_TOPK_SELECT_ILP=0).
+#define TOPK_SEL_ILP 16u
+
+template <unsigned int U>
+__device__ __forceinline__ static void topk_select_impl(
         int          * __restrict__ selected_b,     // [B, top_k]
         unsigned int * __restrict__ done_b,         // [B]
         const float  * __restrict__ scores_b,       // [B, n_idx_stride]
@@ -654,7 +666,20 @@ void indexer_topk_select_batched(
             t = s_t;
             // count > t and >= t
             unsigned int c_gt = 0u, c_ge = 0u;
-            for (unsigned int i = tid; i < n; i += TOPK_BLOCK) {
+            unsigned int i = tid;
+            if (U > 1u) {
+                for (; i + (U - 1u) * TOPK_BLOCK < n; i += U * TOPK_BLOCK) {
+                    float f[U];
+                    #pragma unroll
+                    for (unsigned int u = 0; u < U; u++) f[u] = scores[i + u * TOPK_BLOCK];
+                    #pragma unroll
+                    for (unsigned int u = 0; u < U; u++) {
+                        const unsigned int k = topk_key(f[u]);
+                        c_gt += (k > t); c_ge += (k >= t);
+                    }
+                }
+            }
+            for (; i < n; i += TOPK_BLOCK) {
                 const unsigned int k = topk_key(scores[i]);
                 c_gt += (k > t); c_ge += (k >= t);
             }
@@ -696,11 +721,28 @@ void indexer_topk_select_batched(
         if (tid == 0u) s_count = 0u;
         for (unsigned int i = tid; i < TOPK_SORT_N; i += TOPK_BLOCK) { vals[i] = TOPK_NEG_INF; idxs[i] = 0xFFFFFFFFu; }
         __syncthreads();
-        for (unsigned int i = tid; i < n; i += TOPK_BLOCK) {
-            const float f = scores[i];
-            if (topk_key(f) > t) {
-                const unsigned int slot = atomicAdd(&s_count, 1u);
-                vals[slot] = f; idxs[slot] = i;
+        {
+            unsigned int i = tid;
+            if (U > 1u) {
+                for (; i + (U - 1u) * TOPK_BLOCK < n; i += U * TOPK_BLOCK) {
+                    float f[U];
+                    #pragma unroll
+                    for (unsigned int u = 0; u < U; u++) f[u] = scores[i + u * TOPK_BLOCK];
+                    #pragma unroll
+                    for (unsigned int u = 0; u < U; u++) {
+                        if (topk_key(f[u]) > t) {
+                            const unsigned int slot = atomicAdd(&s_count, 1u);
+                            vals[slot] = f[u]; idxs[slot] = i + u * TOPK_BLOCK;
+                        }
+                    }
+                }
+            }
+            for (; i < n; i += TOPK_BLOCK) {
+                const float f = scores[i];
+                if (topk_key(f) > t) {
+                    const unsigned int slot = atomicAdd(&s_count, 1u);
+                    vals[slot] = f; idxs[slot] = i;
+                }
             }
         }
         __syncthreads();
@@ -738,4 +780,26 @@ void indexer_topk_select_batched(
         selected[i] = (i < n_cand) ? (int)idxs[i] : -1;
     }
     if (tid == 0u) done_b[bi] = 1u;
+}
+
+extern "C" __global__ __launch_bounds__(TOPK_BLOCK)
+void indexer_topk_select_batched(
+        int          * __restrict__ selected_b,
+        unsigned int * __restrict__ done_b,
+        const float  * __restrict__ scores_b,
+        const unsigned int * __restrict__ n_idx_per,
+        unsigned int                n_idx_stride,
+        unsigned int                top_k) {
+    topk_select_impl<1u>(selected_b, done_b, scores_b, n_idx_per, n_idx_stride, top_k);
+}
+
+extern "C" __global__ __launch_bounds__(TOPK_BLOCK)
+void indexer_topk_select_batched_ilp(
+        int          * __restrict__ selected_b,
+        unsigned int * __restrict__ done_b,
+        const float  * __restrict__ scores_b,
+        const unsigned int * __restrict__ n_idx_per,
+        unsigned int                n_idx_stride,
+        unsigned int                top_k) {
+    topk_select_impl<TOPK_SEL_ILP>(selected_b, done_b, scores_b, n_idx_per, n_idx_stride, top_k);
 }

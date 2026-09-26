@@ -112,3 +112,72 @@ fn indexer_topk_select_matches_chain() -> eyre::Result<()> {
     eprintln!("PASS (total fallbacks across cases: {total_fallback})");
     Ok(())
 }
+
+/// `indexer_topk_select_batched_ilp` (V41_TOPK_SELECT_ILP, 16 loads in flight
+/// per thread) vs the original select kernel vs the bitonic chain alone:
+/// `selected` AND `done` bit-identical, at the decode shapes it was made for
+/// (B = 1..3 rows per lane, n = 65K / 131K / 235K / 300K: ratio-2 and ratio-1
+/// index sources at 130K-300K context) plus the small / tie / masked cases.
+/// Bounded VRAM (< 20 MB), so it can run next to a live server.
+#[test]
+#[ignore]
+fn indexer_topk_select_ilp_matches() -> eyre::Result<()> {
+    install_panic_handler()?;
+    let dgpu = pick_dgpu()?;
+    dgpu.set_current()?;
+    let arch = dgpu.properties()?.gcn_arch_name;
+    let stream = Stream::new(dgpu.id)?;
+    let k = IndexerTopkBitonic::for_arch(&arch)?;
+    let top_k = INDEXER_TOP_K;
+    let mut rng = Lcg(0x11F0_2026_0926);
+    let ragged = |n_max: u32, b: u32| -> Vec<u32> { (0..b).map(|i| match i % 7 { 0 => n_max, 1 => n_max - 1, 2 => 4096, 3 => 4097, 4 => 511, 5 => 1, _ => n_max / 2 + i }).collect() };
+    let mut cases = vec![
+        gen(&mut rng, "random ragged 9K", 40, 9000, ragged(9000, 40), 0, false),
+        gen(&mut rng, "64-value ties 9K", 40, 9000, ragged(9000, 40), 1, false),
+        gen(&mut rng, "all-equal 9K", 24, 9000, ragged(9000, 24), 2, false),
+        gen(&mut rng, "masked -inf 9K", 40, 9000, ragged(9000, 40), 3, false),
+        gen(&mut rng, "tie cluster 9K", 40, 9000, ragged(9000, 40), 4, false),
+        gen(&mut rng, "random 49K x64", 64, 49152, (0..64).map(|i| 49152 - i * 7).collect(), 0, false),
+    ];
+    for &n in &[65_536u32, 131_072, 235_000, 300_001] {
+        for b in 1..=3u32 {
+            let nn: Vec<u32> = (0..b).map(|i| n - i * 13).collect();
+            for kind in [0u32, 1, 3, 4] {
+                cases.push(gen(&mut rng, "decode", b, n, nn.clone(), kind, false));
+            }
+        }
+    }
+    let mut total_fallback = 0usize;
+    for case in &cases {
+        let (b, nmax, stride) = (case.batch, case.n_idx_max, case.n_idx_max);
+        let mut d_scores: DeviceBuffer<f32> = DeviceBuffer::new(dgpu.id, case.scores.len())?;
+        d_scores.copy_from_host(&case.scores)?;
+        let mut d_n: DeviceBuffer<u32> = DeviceBuffer::new(dgpu.id, b as usize)?;
+        d_n.copy_from_host(&case.n_idx)?;
+        let per_row: usize = v4flash_kernels::indexer::topk_merge_levels(nmax, top_k).iter().map(|&v| v as usize).sum::<usize>().max(1);
+        let mut scratch: DeviceBuffer<u32> = DeviceBuffer::new(dgpu.id, b as usize * per_row)?;
+        let nsel = (b * top_k) as usize;
+        let mut sels: Vec<DeviceBuffer<i32>> = (0..3).map(|_| DeviceBuffer::new(dgpu.id, nsel)).collect::<Result<_, _>>()?;
+        let mut dones: Vec<DeviceBuffer<u32>> = (0..2).map(|_| DeviceBuffer::new(dgpu.id, b as usize)).collect::<Result<_, _>>()?;
+        for s in sels.iter_mut() { s.fill_zero()?; }
+        for d in dones.iter_mut() { d.fill_zero()?; }
+        // [0] chain alone, [1] old select (+ guarded chain), [2] ILP select (+ guarded chain)
+        k.launch_batched_sel(&stream, &mut sels[0], None, &mut scratch, &d_scores, &d_n, nmax, stride, 0, top_k, b, None, false)?;
+        k.launch_batched_sel(&stream, &mut sels[1], None, &mut scratch, &d_scores, &d_n, nmax, stride, 0, top_k, b, Some(&mut dones[0]), false)?;
+        k.launch_batched_sel(&stream, &mut sels[2], None, &mut scratch, &d_scores, &d_n, nmax, stride, 0, top_k, b, Some(&mut dones[1]), true)?;
+        stream.synchronize()?;
+        let mut h: Vec<Vec<i32>> = vec![vec![0i32; nsel]; 3];
+        for (i, s) in sels.iter().enumerate() { s.copy_to_host(&mut h[i])?; }
+        let mut hd: Vec<Vec<u32>> = vec![vec![0u32; b as usize]; 2];
+        for (i, d) in dones.iter().enumerate() { d.copy_to_host(&mut hd[i])?; }
+        let fallbacks = hd[1].iter().filter(|&&d| d == 0).count();
+        total_fallback += fallbacks;
+        eprintln!("{:20} B={b:2} n_idx_max={nmax:6}: chain==old {} old==ilp {} done old==ilp {} (fallbacks {fallbacks})",
+            case.name, h[0] == h[1], h[1] == h[2], hd[0] == hd[1]);
+        if h[0] != h[1] || h[1] != h[2] || hd[0] != hd[1] {
+            return Err(eyre!("ILP select diverges on {} B={b} n={nmax}", case.name));
+        }
+    }
+    eprintln!("PASS (total fallbacks across cases: {total_fallback})");
+    Ok(())
+}

@@ -656,6 +656,22 @@ impl IndexerTopk {
 /// Bitonic-merge sort width. A single workgroup sorts this many candidates.
 pub const TOPK_SORT_N: u32 = 4096;
 
+/// `V41_TOPK_SELECT_ILP` (default ON; `0` = the original kernel): the batched
+/// threshold top-k select issues 16 score loads per thread per iteration in
+/// its count and compact scans (`indexer_topk_select_batched_ilp`) instead of
+/// one. The select is ONE workgroup per row, so at a decode row it was a
+/// latency-bound walk. tests/bench_decode_latency_ab.rs (gfx1201, paired, 1000
+/// rounds, the whole launcher incl. the early-out chain launches): -9.5 / -20.5
+/// / -56 us per call at n = 65K / 131K / 235K, flat in B (one WG per row).
+/// What remains (~65 us) is mostly the two single-WG bitonic sorts.
+/// Identical selection (tests/indexer_topk_select_oracle.rs::
+/// indexer_topk_select_ilp_matches).
+pub fn topk_select_ilp() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_TOPK_SELECT_ILP").as_deref() != Ok("0"));
+    *D
+}
+
 /// Candidate counts at each level of the bitonic merge ladder.
 ///
 /// `[0]` is the L0 chunk output (`ceil(n_comp / SORT_N) * top_k`); each later
@@ -879,6 +895,34 @@ impl IndexerTopkBitonic {
         batch: u32,
         done: Option<&mut DeviceBuffer<u32>>,
     ) -> eyre::Result<()> {
+        self.launch_batched_sel(
+            stream, selected, allowed_bits, scratch, scores, n_idx_per, n_idx_max, n_idx_stride,
+            n_words_per_b, top_k, batch, done, topk_select_ilp(),
+        )
+    }
+
+    /// [`Self::launch_batched`] with the threshold-select kernel chosen
+    /// explicitly: `select_ilp` = `indexer_topk_select_batched_ilp` (16 score
+    /// loads in flight per thread in its two O(n) scans), else the original
+    /// one-load-per-iteration kernel. Same selection either way
+    /// (tests/indexer_topk_select_oracle.rs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_batched_sel(
+        &self,
+        stream: &Stream,
+        selected: &mut DeviceBuffer<i32>,
+        allowed_bits: Option<&mut DeviceBuffer<u32>>,
+        scratch: &mut DeviceBuffer<u32>,
+        scores: &DeviceBuffer<f32>,
+        n_idx_per: &DeviceBuffer<u32>,
+        n_idx_max: u32,
+        n_idx_stride: u32,
+        n_words_per_b: u32,
+        top_k: u32,
+        batch: u32,
+        done: Option<&mut DeviceBuffer<u32>>,
+        select_ilp: bool,
+    ) -> eyre::Result<()> {
         if batch == 0 || top_k == 0 {
             return Ok(());
         }
@@ -897,7 +941,11 @@ impl IndexerTopkBitonic {
                 if d.len() < batch as usize {
                     return Err(eyre!("indexer_topk: done buffer {} < batch {batch}", d.len()));
                 }
-                let f = self.module.get_function("indexer_topk_select_batched")?;
+                let f = self.module.get_function(if select_ilp {
+                    "indexer_topk_select_batched_ilp"
+                } else {
+                    "indexer_topk_select_batched"
+                })?;
                 let cfg = LaunchConfig { grid: (batch, 1, 1), block: (BLOCK, 1, 1), shared_mem_bytes: 0 };
                 launch_kernel!(f, cfg, stream, [
                     selected.raw(), d.raw(), scores.raw(), n_idx_per.raw(), n_idx_stride, top_k
