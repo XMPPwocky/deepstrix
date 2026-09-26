@@ -833,6 +833,19 @@ pub fn mhc_fast() -> bool {
     *D
 }
 
+/// `V41_ATTN_META_FILL` (default ON; `0` = the per-array H2D copies): the
+/// attention stage's per-row metadata (n_raw_per, n_raw_offset_per, final
+/// n_comp_per, and on index-source layers n_index_comp_per_b) as ONE
+/// `AttnMetaFill` launch carrying the values in its kernel arguments, for
+/// lanes of <= 16 rows. Replaces 4 (reuse layers) / 5 (index sources) / 3
+/// (ratio 0) pageable hipMemcpyAsync copies of 4-12 bytes, each ~4.1 us of
+/// device timeline; the device bytes the kernels read are identical.
+pub fn attn_meta_fill() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_ATTN_META_FILL").as_deref() != Ok("0"));
+    *D
+}
+
 /// `V41_MHC_FFN_LATE` (default ON; arena decode, V4.1, fused mixes): queue the
 /// pre-ffn MIXES after the router instead of before it, on the same stream.
 /// V4.1 collapses with the carry, so the router path (collapse -> rms_w ->
@@ -5061,7 +5074,60 @@ impl HeterogeneousEngine {
             n_raw_offset_after.iter().map(|&v| v as i32).collect();
         let n_comp_per_host: Vec<i32> =
             n_comp_after.iter().map(|&v| v as i32).collect();
+        // Which compressed-KV path attention takes (host data only). Ratio-0
+        // layers have no compressor, so all three come out off there.
+        // V4.1 CSA2 (S1, PREFILL): keys live on the KV-SOURCE's compressor state
+        // (`cs.index_k`, packed E2M1), there is no `indexer_compressor`, and the
+        // scoring layers are `index_source_layer_ids`, not `ratio == 4`.
+        let v41_idx_keys = ls
+            .compressor
+            .as_ref()
+            .and_then(|c| c.index_k.as_ref())
+            .filter(|_| index_k_enabled() && is_index_source_layer(layer));
+        let v41_force = std::env::var("V41_INDEXER_FORCE").as_deref() == Ok("1");
+        // A non-source layer may reuse the last source's selection iff it shares the
+        // same compressed store AND this lane actually has one saved.
+        let s2_reuse = index_k_enabled()
+            && v41_idx_keys.is_none()
+            && ls.compressor.is_some()
+            && bd.indexer_saved_store >= 0
+            && bd.indexer_saved_store
+                == crate::config::index_source_of(layer as usize).unwrap_or(layer as usize) as i32
+            && n_comp_after.iter().any(|&v| v > 0);
+        let need_mask = if v41_idx_keys.is_some() {
+            n_comp_after.iter().any(|&v| v > if v41_force { 0 } else { INDEXER_TOP_K })
+        } else {
+            ratio == 4
+                && ls.indexer_compressor.is_some()
+                && n_comp_after.iter().any(|&v| v > INDEXER_TOP_K)
+        };
         let _t_attn = de.events.stage("dgpu.attn_compute", &de.compute)?;
+        // `V41_ATTN_META_FILL`: the per-row metadata as ONE kernel-argument
+        // launch, with n_comp_per already in its FINAL form (min(n, TOP_K) when
+        // the indexer fires or the S2 selection is reused -- the dense values the
+        // copy path uploads first are never read on those paths: the indexer
+        // kernels read n_index_comp_per_b, and the sparse re-upload lands before
+        // the gather / score / smwsum) and the indexer's n_index_comp_per_b
+        // included. The device bytes every kernel reads are the same.
+        let meta_fill = attn_meta_fill() && (b as usize) <= crate::attn_meta::ATTN_META_MAX_ROWS;
+        if meta_fill {
+            use crate::attn_meta::MetaDst;
+            let sparse = need_mask || s2_reuse;
+            let n_comp_final: Vec<i32> = n_comp_after
+                .iter()
+                .map(|&v| (if sparse { v.min(INDEXER_TOP_K) } else { v }) as i32)
+                .collect();
+            let n_idx: Vec<i32> = n_comp_after.iter().map(|&v| v as i32).collect();
+            de.attn_meta.launch(
+                &de.compute,
+                [
+                    Some(MetaDst::new(&mut sd.n_raw_per, &n_raw_per_host)?),
+                    Some(MetaDst::new(&mut sd.n_raw_offset_per, &n_raw_offset_per_host)?),
+                    Some(MetaDst::new(&mut sd.n_comp_per, &n_comp_final)?),
+                    if need_mask { Some(MetaDst::new(&mut sd.n_index_comp_per_b, &n_idx)?) } else { None },
+                ],
+            )?;
+        } else {
         // Async copies on de.compute so they FIFO with the subsequent
         // attention launch. Avoids the bulk-sync that copy_from_host
         // would impose (~5us each blocks the host AND fences the device).
@@ -5076,6 +5142,7 @@ impl HeterogeneousEngine {
         {
             let mut ncp_v = sd.n_comp_per.slice_view_mut(0, b as usize);
             ncp_v.copy_from_host_async(&n_comp_per_host, &de.compute)?;
+        }
         }
         let nrp_view = sd.n_raw_per.slice_view(0, b as usize);
         let nrop_view = sd.n_raw_offset_per.slice_view(0, b as usize);
@@ -5249,28 +5316,8 @@ impl HeterogeneousEngine {
             // THIS is the long-context prefill lever: attention is ~30% of prefill at
             // 32K and ~59% at 100K because every query scores the WHOLE compressed
             // store; the indexer makes it 512 rows + a 128 window, flat in context.
-            let v41_idx_keys = ls
-                .compressor
-                .as_ref()
-                .and_then(|c| c.index_k.as_ref())
-                .filter(|_| index_k_enabled() && is_index_source_layer(layer));
-            let v41_force = std::env::var("V41_INDEXER_FORCE").as_deref() == Ok("1");
-            // A non-source layer may reuse the last source's selection iff it shares the
-            // same compressed store AND this lane actually has one saved.
-            let s2_reuse = index_k_enabled()
-                && v41_idx_keys.is_none()
-                && ls.compressor.is_some()
-                && bd.indexer_saved_store >= 0
-                && bd.indexer_saved_store
-                    == crate::config::index_source_of(layer as usize).unwrap_or(layer as usize) as i32
-                && n_comp_after.iter().any(|&v| v > 0);
-            let need_mask = if v41_idx_keys.is_some() {
-                n_comp_after.iter().any(|&v| v > if v41_force { 0 } else { INDEXER_TOP_K })
-            } else {
-                ratio == 4
-                    && ls.indexer_compressor.is_some()
-                    && n_comp_after.iter().any(|&v| v > INDEXER_TOP_K)
-            };
+            // (`v41_idx_keys`, `s2_reuse`, `need_mask`: computed before the stage's
+            // metadata upload, see there.)
             let indexer_fired = if need_mask {
                 let _t_ix = de.events.stage("dgpu.prefill_indexer", &de.compute)?;
                 let iw = dlw.indexer.as_ref().ok_or_else(|| {
@@ -5291,7 +5338,7 @@ impl HeterogeneousEngine {
                 // Tokens with n_idx ≤ INDEXER_TOP_K are handled correctly
                 // by the batched topk degenerating to all-valid selection.
                 let n_idx_max: u32 = n_comp_after.iter().copied().max().unwrap_or(0);
-                {
+                if !meta_fill {
                     let mut v = sd
                         .n_index_comp_per_b
                         .slice_view_mut(0, b as usize);
@@ -5597,7 +5644,8 @@ impl HeterogeneousEngine {
                 }
                 // Re-upload sparse n_comp_per (= min(actual, INDEXER_TOP_K))
                 // so score+smwsum iterate only over the gathered top-K rows.
-                {
+                // (`meta_fill` wrote these values up front.)
+                if !meta_fill {
                     let sparse_n_comp_host: Vec<i32> = n_comp_after
                         .iter()
                         .map(|&v| v.min(INDEXER_TOP_K) as i32)
@@ -5631,7 +5679,7 @@ impl HeterogeneousEngine {
                             "S2 shared selection ACTIVE (reuse layer skipped score+topk)");
                     });
                 }
-                {
+                if !meta_fill {
                     let sparse_n_comp_host: Vec<i32> = n_comp_after
                         .iter()
                         .map(|&v| v.min(INDEXER_TOP_K) as i32)

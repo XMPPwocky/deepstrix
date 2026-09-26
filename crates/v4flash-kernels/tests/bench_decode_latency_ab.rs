@@ -339,5 +339,90 @@ fn bench_decode_latency_ab() -> eyre::Result<()> {
     if section == "all" || section == "topk" {
         section_topk(&e, &mut h, rounds, &mut rng)?;
     }
+    if section == "all" || section == "attnmeta" {
+        section_attnmeta(&e, &mut h, rounds, &mut rng)?;
+    }
+    Ok(())
+}
+
+/// V41_ATTN_META_FILL: the attention stage's per-row metadata uploads, followed
+/// by the kernels that read them (gather + score + smwsum), as production
+/// queues them on a decode lane. A = the pageable copies (reuse layer: n_raw,
+/// n_raw_off, dense n_comp, sparse n_comp; index source: + n_index_comp),
+/// B = one `AttnMetaFill` launch.
+fn section_attnmeta(e: &DeviceEngine, h: &mut Harness, rounds: usize, rng: &mut Lcg) -> eyre::Result<()> {
+    use v4flash_kernels::attn_meta::MetaDst;
+    use v4flash_kernels::config::{N_HEAD, N_HEAD_DIM};
+    let id = e.device.id;
+    let bmax = 3usize;
+    let (nh, hd) = (N_HEAD as usize, N_HEAD_DIM as usize);
+    let (n_raw, n_comp, raw_slots, stride) = (128u32, INDEXER_TOP_K, 256usize, 3072u32);
+    let f16v = |rng: &mut Lcg, n: usize| -> Vec<u16> { (0..n).map(|_| f16_bits((rng.unit() - 0.5) * 2.0)).collect() };
+    let q = up(id, &(0..bmax * nh * hd).map(|_| (rng.unit() - 0.5) * 0.1).collect::<Vec<f32>>())?;
+    let raw_kv = up(id, &f16v(rng, bmax * raw_slots * hd))?;
+    let store_rows = 16384usize;
+    let store = up(id, &f16v(rng, store_rows * hd))?;
+    let active = RefCell::new(up(id, &f16v(rng, bmax * n_comp as usize * hd))?);
+    let sinks = up(id, &(0..nh).map(|_| rng.unit()).collect::<Vec<f32>>())?;
+    let scores = RefCell::new(DeviceBuffer::<f32>::new(id, bmax * nh * stride as usize)?);
+    let heads = RefCell::new(DeviceBuffer::<f32>::new(id, bmax * nh * hd)?);
+    let sel = up(id, &(0..bmax * n_comp as usize).map(|_| (rng.next() % store_rows as u64) as i32).collect::<Vec<i32>>())?;
+    let nrp = RefCell::new(DeviceBuffer::<i32>::new(id, 16)?);
+    let nrop = RefCell::new(DeviceBuffer::<i32>::new(id, 16)?);
+    let ncp = RefCell::new(DeviceBuffer::<i32>::new(id, 16)?);
+    let nidx = RefCell::new(DeviceBuffer::<u32>::new(id, 16)?);
+    eprintln!("\n== attention metadata: pageable copies (A) vs one kernel-argument launch (B), + gather/score/smwsum ==");
+    for b in 1..=bmax as u32 {
+        let bu = b as usize;
+        let h_nrp: Vec<i32> = vec![n_raw as i32; bu];
+        let h_nrop: Vec<i32> = (0..bu).map(|r| (r * raw_slots) as i32).collect();
+        let n_full: Vec<u32> = (0..bu).map(|r| 180_000 + r as u32).collect();
+        let h_ncp_dense: Vec<i32> = n_full.iter().map(|&v| v as i32).collect();
+        let h_ncp: Vec<i32> = n_full.iter().map(|&v| v.min(n_comp) as i32).collect();
+        let h_nidx_i: Vec<i32> = n_full.iter().map(|&v| v as i32).collect();
+        let kernels = |s: &Stream| -> eyre::Result<()> {
+            e.indexer_gather.launch_batched_rows(s, &mut active.borrow_mut(), &store, &sel, INDEXER_TOP_K, N_HEAD_DIM, b, None)?;
+            let (nr, no, nc) = (nrp.borrow().slice_view(0, bu), nrop.borrow().slice_view(0, bu), ncp.borrow().slice_view(0, bu));
+            e.attn_mixed.launch_score_batched_htiled_wmma_f16s_rows(
+                s, &mut scores.borrow_mut(), &q, &raw_kv, Some(&active.borrow()), &nr, &no, &nc, None, N_HEAD, N_HEAD_DIM,
+                n_raw + n_comp, b, n_comp, stride, None,
+            )?;
+            e.attn_mixed.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s_rows(
+                s, &mut heads.borrow_mut(), &mut scores.borrow_mut(), &sinks, &raw_kv, Some(&active.borrow()), &nr, &no, &nc,
+                N_HEAD, N_HEAD_DIM, b, n_comp, stride, None,
+            )
+        };
+        let copies = |s: &Stream, source: bool| -> eyre::Result<()> {
+            nrp.borrow_mut().slice_view_mut(0, bu).copy_from_host_async(&h_nrp, s)?;
+            nrop.borrow_mut().slice_view_mut(0, bu).copy_from_host_async(&h_nrop, s)?;
+            ncp.borrow_mut().slice_view_mut(0, bu).copy_from_host_async(&h_ncp_dense, s)?;
+            if source {
+                nidx.borrow_mut().slice_view_mut(0, bu).copy_from_host_async(&n_full, s)?;
+            }
+            ncp.borrow_mut().slice_view_mut(0, bu).copy_from_host_async(&h_ncp, s)
+        };
+        let fill = |s: &Stream, source: bool| -> eyre::Result<()> {
+            let (mut a, mut bb, mut c, mut d) = (nrp.borrow_mut(), nrop.borrow_mut(), ncp.borrow_mut(), nidx.borrow_mut());
+            e.attn_meta.launch(
+                s,
+                [
+                    Some(MetaDst::new(&mut a, &h_nrp)?),
+                    Some(MetaDst::new(&mut bb, &h_nrop)?),
+                    Some(MetaDst::new(&mut c, &h_ncp)?),
+                    if source { Some(MetaDst::new(&mut d, &h_nidx_i)?) } else { None },
+                ],
+            )
+        };
+        eprintln!(" b = {b}");
+        for source in [false, true] {
+            let tag = if source { "index source" } else { "reuse layer" };
+            let mut ra: Run = Box::new(|s: &Stream| copies(s, source));
+            let mut rb: Run = Box::new(|s: &Stream| fill(s, source));
+            paired(h, rng, rounds, &format!("uploads only, {tag}"), &mut ra, &mut rb)?;
+            let mut ra: Run = Box::new(|s: &Stream| { copies(s, source)?; kernels(s) });
+            let mut rb: Run = Box::new(|s: &Stream| { fill(s, source)?; kernels(s) });
+            paired(h, rng, rounds, &format!("uploads + attn, {tag}"), &mut ra, &mut rb)?;
+        }
+    }
     Ok(())
 }
