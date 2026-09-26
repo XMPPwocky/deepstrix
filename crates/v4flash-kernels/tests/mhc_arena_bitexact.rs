@@ -14,6 +14,12 @@ use v4flash_kernels::config::{HC_DIM, HC_MIX_DIM, N_HC, RMS_EPS, SINKHORN_EPS, S
 use v4flash_kernels::mhc_arena::{MIX_KSPLIT, MIX_NORMED, MIX_PRE_SCALED};
 use v4flash_kernels::{F16Matvec, HcSinkhorn, MhcArena, RmsNormNoWeight, RmsNormNoWeightMultiWG};
 
+/// The tests run on parallel threads of one process; a graph capture on one
+/// test's blocking stream and a legacy-stream memset / copy on another
+/// (`fill_zero`, `copy_to_host`) invalidate each other
+/// (hipErrorStreamCaptureImplicit). Serialize them.
+static GPU_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Lcg(u64);
 impl Lcg {
     fn next(&mut self) -> u32 {
@@ -130,6 +136,7 @@ fn run_on(dev: Device) -> eyre::Result<()> {
 #[test]
 #[ignore]
 fn mhc_arena_is_bit_identical() -> eyre::Result<()> {
+    let _gpu = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     install_panic_handler()?;
     let mut ran = 0;
     for d in Device::all()? {
@@ -150,6 +157,7 @@ fn mhc_arena_is_bit_identical() -> eyre::Result<()> {
 #[test]
 #[ignore]
 fn mhc_arena_ksplit_error() -> eyre::Result<()> {
+    let _gpu = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     install_panic_handler()?;
     let dev = Device::all()?
         .into_iter()
@@ -378,6 +386,7 @@ fn fast_run_on(dev: Device) -> eyre::Result<()> {
 #[test]
 #[ignore]
 fn mhc_fast_is_bit_identical() -> eyre::Result<()> {
+    let _gpu = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     install_panic_handler()?;
     let mut ran = 0;
     for d in Device::all()? {
