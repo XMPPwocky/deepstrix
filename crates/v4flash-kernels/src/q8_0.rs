@@ -28,6 +28,11 @@ const Q8_0_MATVEC_WMMA_GFX1201: &[u8] =
 const Q8_0_MATVEC_WMMA_GFX1151: &[u8] =
     include_bytes!(env!("KERNEL_Q8_0_MATVEC_WMMA_GFX1151"));
 
+const SHARED_EXPERT_FUSED_GFX1201: &[u8] =
+    include_bytes!(env!("KERNEL_SHARED_EXPERT_FUSED_GFX1201"));
+const SHARED_EXPERT_FUSED_GFX1151: &[u8] =
+    include_bytes!(env!("KERNEL_SHARED_EXPERT_FUSED_GFX1151"));
+
 /// Q8_0 packs 32 int8 quants per 2-byte f16 scale → 34 bytes per block,
 /// identical layout to ds4 / llama.cpp.
 pub const Q8_0_BLOCK_ELEMS: u32 = 32;
@@ -47,6 +52,101 @@ fn bpack_ok(batch: u32) -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("V41_GEMV_BPACK").as_deref() != Ok("0"))
+}
+
+/// `V41_GEMV_TB` (default ON; `0` = the runtime-batch kernels
+/// `q8_0_gemv_bpack_warp8` / `q8_0_grouped_gemv_bpack` at every batch): the
+/// B-packed GEMVs run the COMPILE-TIME-batch twins `q8_0_gemv_bpack_tB<b>`
+/// (b = 1..10) and `q8_0_grouped_gemv_bpack_tB<b>` (b = 2..8), BIT-IDENTICAL
+/// to the runtime kernel (tests/q8_0_tb_bitexact.rs; same expression, same
+/// block striding, same warp-sum tree). The runtime kernel's b-loop indexes
+/// acc[16] through v_movrel and waits for its loads inside the loop; the
+/// unrolled twin issues all activation loads with the weight loads.
+/// 2026-09-26 sweep (C1_dense_decode/tB_compile_time_batch, dGPU, cold, graph):
+/// at b = 4 ratios vs runtime q_a 0.80, kv 0.74, wo_a 0.74, wo_b 0.84, shared
+/// gate/up 0.81, down 0.88, Engram 0.86, head 0.88 (x1.25, reviewer x1.248);
+/// b = 1 neutral (0.97-1.00), so it pays only in multi-row decode. ~69 us per
+/// lane-layer at 4 rows -> ~3 ms of dGPU time per step per lane.
+fn gemv_tb_on() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_GEMV_TB").as_deref() != Ok("0"));
+    *D
+}
+
+/// `q8_0_gemv_bpack_tB<b>` symbols, index b-1. Every production batch of the
+/// dp4a arm (1..=8, SMALL_B_DENSE_MAX) plus 9/10 has an instantiation; above
+/// that the runtime kernel runs (GEMV_BPACK_MAX = 16).
+const GEMV_TB_SYMBOLS: [&str; 10] = [
+    "q8_0_gemv_bpack_tB1", "q8_0_gemv_bpack_tB2", "q8_0_gemv_bpack_tB3",
+    "q8_0_gemv_bpack_tB4", "q8_0_gemv_bpack_tB5", "q8_0_gemv_bpack_tB6",
+    "q8_0_gemv_bpack_tB7", "q8_0_gemv_bpack_tB8", "q8_0_gemv_bpack_tB9",
+    "q8_0_gemv_bpack_tB10",
+];
+/// `q8_0_grouped_gemv_bpack_tB<b>` symbols, index b-1 (1..=8 instantiated).
+const GROUPED_TB_SYMBOLS: [&str; 8] = [
+    "q8_0_grouped_gemv_bpack_tB1", "q8_0_grouped_gemv_bpack_tB2",
+    "q8_0_grouped_gemv_bpack_tB3", "q8_0_grouped_gemv_bpack_tB4",
+    "q8_0_grouped_gemv_bpack_tB5", "q8_0_grouped_gemv_bpack_tB6",
+    "q8_0_grouped_gemv_bpack_tB7", "q8_0_grouped_gemv_bpack_tB8",
+];
+
+/// Symbol for `matvec_bpack` at `batch`: the tB twin for 1 <= b <= 10 under
+/// `V41_GEMV_TB`, else the runtime kernel.
+pub fn gemv_bpack_symbol(batch: u32) -> &'static str {
+    if gemv_tb_on() && (1..=GEMV_TB_SYMBOLS.len() as u32).contains(&batch) {
+        GEMV_TB_SYMBOLS[(batch - 1) as usize]
+    } else {
+        "q8_0_gemv_bpack_warp8"
+    }
+}
+
+/// Symbol for `matvec_grouped_bpack` at `batch`: the tB twin for 2 <= b <= 8
+/// under `V41_GEMV_TB`, else the runtime kernel. b = 1 keeps the runtime
+/// kernel: the sweep review measured grouped tB1 2.5% SLOWER (76.8 -> 78.7 us,
+/// 6/6 runs) on wo_a.
+pub fn grouped_bpack_symbol(batch: u32) -> &'static str {
+    if gemv_tb_on() && (2..=GROUPED_TB_SYMBOLS.len() as u32).contains(&batch) {
+        GROUPED_TB_SYMBOLS[(batch - 1) as usize]
+    } else {
+        "q8_0_grouped_gemv_bpack"
+    }
+}
+
+/// `V41_Q8_QUANT_WAVE` (default ON; `0` = `q8_0_quantize_f32`, one 32-thread
+/// WG per block where every thread walks all 32 elements): the activation
+/// quantize runs `q8_0_quantize_f32_wave`, one wave per block (lane i owns
+/// element i, amax by shfl_xor fmaxf), 8 blocks per 256-thread WG. xq and
+/// xscale BIT-IDENTICAL (tests/q8_0_tb_bitexact.rs; sweep review 7 shapes x 3
+/// runs + 18 adversarial cases; the only deviation is an ALL-NaN block, whose
+/// xscale is NaN instead of 0). 2026-09-26 sweep (C1_dense_decode/
+/// quantize_wave, warm graph node): K=5120 b=4 4.46 -> 3.56 us (x1.25), K=32768
+/// b=4 8.2 -> 4.5 us with the grid pad; ~5-7 us per lane-layer.
+fn q8_quant_wave() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_Q8_QUANT_WAVE").as_deref() != Ok("0"));
+    *D
+}
+
+/// `V41_Q8_QUANT_GRID_PAD` (default ON; `0` = the exact grid): the quantize
+/// grid gets ONE extra work-group, which the kernel's `if (b >= blocks) return`
+/// guard makes a no-op (the `blocks` argument is unchanged, so the outputs are
+/// byte-identical -- reviewer-verified at 22 shapes incl. 2047/2049/4095/4097).
+///
+/// DO NOT REMOVE THE PAD. It is real hardware dispatch behaviour, not a
+/// harness artefact: q8_0_quantize_f32 at K=32768 (the wo_a input, FP:6126)
+/// launches exactly 1024*b WGs, and rocprofv3 kernel-trace timestamps put the
+/// DISPATCH ITSELF at 14.24 us on a 2048-WG grid vs 3.40 us at 2049, and 17.08
+/// vs 5.68 us at 4096/4097 (2026-09-26 sweep, C1_dense_decode/quantize_grid_pad,
+/// reviewer runs x10; not address aliasing, not graph capture, persists with a
+/// producer kernel in between). 2047/4095 are equally slow and 3072 is bimodal;
+/// +1 fixes every production grid 1024*b (b = 1..8) and 256*b, and the wave
+/// kernel's ceil(blocks/8) grids (512+1: 4.49 us, 256+1: 3.84 us). Worth
+/// ~10-11 us per lane-layer at 2 or 4 rows per lane (~0.4 ms/step per lane).
+fn q8_quant_grid_pad() -> u32 {
+    static D: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_Q8_QUANT_GRID_PAD").as_deref() != Ok("0")
+    });
+    if *D { 1 } else { 0 }
 }
 
 
@@ -94,11 +194,43 @@ impl Q8_0Matvec {
                 xscale.len()
             ));
         }
-        let function = self.module.get_function("q8_0_quantize_f32")?;
-        let cfg = LaunchConfig {
-            grid: (blocks, 1, 1),
-            block: (32, 1, 1),
-            shared_mem_bytes: 0,
+        self.launch_quantize(stream, xq, xscale, x, blocks)
+    }
+
+    /// The one quantize launch behind `quantize_input` / `quantize_input_batched`
+    /// (every call site in the tree goes through those two): the wave kernel
+    /// under `V41_Q8_QUANT_WAVE`, and the `+1` work-group grid pad under
+    /// `V41_Q8_QUANT_GRID_PAD` -- see both knobs for the measurements. `blocks`
+    /// is always the true block count; only the grid carries the pad.
+    fn launch_quantize(
+        &self,
+        stream: &Stream,
+        xq: &mut DeviceBuffer<i8>,
+        xscale: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        blocks: u32,
+    ) -> eyre::Result<()> {
+        // One idle WG: the exact power-of-two grid dispatches 3-4x slower
+        // (14.2 us vs 3.4 us at 2048 WGs). See `q8_quant_grid_pad`.
+        let pad = q8_quant_grid_pad();
+        let (function, cfg) = if q8_quant_wave() {
+            (
+                self.module.get_function("q8_0_quantize_f32_wave")?,
+                LaunchConfig {
+                    grid: (blocks.div_ceil(8) + pad, 1, 1),
+                    block: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+            )
+        } else {
+            (
+                self.module.get_function("q8_0_quantize_f32")?,
+                LaunchConfig {
+                    grid: (blocks + pad, 1, 1),
+                    block: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+            )
         };
         launch_kernel!(function, cfg, stream, [xq.raw(), xscale.raw(), x.raw(), blocks])
     }
@@ -130,13 +262,7 @@ impl Q8_0Matvec {
                 x.len(), xq.len(), xscale.len()
             ));
         }
-        let function = self.module.get_function("q8_0_quantize_f32")?;
-        let cfg = LaunchConfig {
-            grid: (total_blocks, 1, 1),
-            block: (32, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        launch_kernel!(function, cfg, stream, [xq.raw(), xscale.raw(), x.raw(), total_blocks])
+        self.launch_quantize(stream, xq, xscale, x, total_blocks)
     }
 
     /// `out[i] = sum_b f16_scale_w[i, b] * xscale[b] * dot_i8x32(qs_w[i, b], xq[b])`
@@ -336,7 +462,9 @@ impl Q8_0Matvec {
         {
             return Err(eyre!("q8_0 matvec_bpack: out/xq/xscale too small for batch={batch}"));
         }
-        let function = self.module.get_function("q8_0_gemv_bpack_warp8")?;
+        // Compile-time-batch twin for b <= 10 (`V41_GEMV_TB`), same args and grid;
+        // 2026-09-26 sweep: x1.25 at b = 4, bit-exact. The module caches the lookup.
+        let function = self.module.get_function(gemv_bpack_symbol(batch))?;
         let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
         let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
         let cfg = LaunchConfig {
@@ -683,6 +811,9 @@ impl Q8_0GroupedMatvec {
         Ok(Self { module })
     }
 
+    /// The loaded module (tests: explicit-symbol launches).
+    pub fn module(&self) -> &Module { &self.module }
+
     /// `out[idx] = sum_b f16(scale_w[idx,b]) * xscale[g,b] * dot_i8x32(qs_w[idx,b], xq[g,b])`
     /// for `idx` in `0..n_groups*rank`, where `g = idx/rank`.
     pub fn matvec_grouped(
@@ -804,7 +935,9 @@ impl Q8_0GroupedMatvec {
             ));
         }
 
-        let function = self.module.get_function("q8_0_grouped_gemv_bpack")?;
+        // Compile-time-batch twin for 2 <= b <= 8 (`V41_GEMV_TB`), same args and
+        // grid; 2026-09-26 sweep: wo_a 0.74 of the runtime kernel at b = 4, bit-exact.
+        let function = self.module.get_function(grouped_bpack_symbol(batch))?;
         let grid_x = out_dim.div_ceil(GEMV_ROWS_PER_BLOCK);
         let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
         let cfg = LaunchConfig {
@@ -949,6 +1082,112 @@ impl Q8_0GroupedMatvec {
             out_a.raw(), out_b.raw(), weight.raw(),
             xq_a.raw(), xq_b.raw(), xscale_a.raw(), xscale_b.raw(),
             group_dim, rank, blocks_per_group, n_groups
+        ])
+    }
+}
+
+/// Fused shared-expert front half for dGPU decode:
+/// `shared_gateup_swiglu_q8_tB<b>_r1` (kernels/shared_expert_fused.hip) =
+/// gate GEMV + up GEMV + clamped swiglu + Q8_0 quantize of `mid` in ONE launch,
+/// writing `(mid_xq, mid_xscale)` for the down GEMV. Replaces the 4 launches
+/// `matvec_batched(gate)`, `matvec_batched(up)`, `swiglu.launch_clamped`,
+/// `quantize_input_batched(mid)` of `issue_shared_expert_prefill`, BIT-IDENTICAL
+/// (tests/q8_0_tb_bitexact.rs: b = 1..10, saturating and non-saturating
+/// activations). One 1024-thread WG per 32 FFN rows: grid n_ff/32.
+/// 2026-09-26 sweep (C1_dense_decode/shared_expert_fused_chain, dGPU, cold):
+/// 5-node chain 105.9 -> 78.6 us at b = 4 with the tB down (x1.35; 4-7 us of
+/// that is the fusion, the rest the tB GEMVs), b = 1 x1.12, b = 3 x1.27,
+/// b = 5 x1.42. Selected by `forward_prefill::shared_fused_for(b)`.
+pub struct SharedExpertFused {
+    module: Module,
+}
+
+/// Largest batch with an instantiation (`_tB1_r1` .. `_tB10_r1`).
+pub const SHARED_FUSED_MAX_B: u32 = 10;
+const SHARED_FUSED_SYMBOLS: [&str; SHARED_FUSED_MAX_B as usize] = [
+    "shared_gateup_swiglu_q8_tB1_r1", "shared_gateup_swiglu_q8_tB2_r1",
+    "shared_gateup_swiglu_q8_tB3_r1", "shared_gateup_swiglu_q8_tB4_r1",
+    "shared_gateup_swiglu_q8_tB5_r1", "shared_gateup_swiglu_q8_tB6_r1",
+    "shared_gateup_swiglu_q8_tB7_r1", "shared_gateup_swiglu_q8_tB8_r1",
+    "shared_gateup_swiglu_q8_tB9_r1", "shared_gateup_swiglu_q8_tB10_r1",
+];
+
+impl SharedExpertFused {
+    pub fn for_arch(arch: &str) -> eyre::Result<Self> {
+        let image: &[u8] = if arch.starts_with("gfx1201") {
+            SHARED_EXPERT_FUSED_GFX1201
+        } else if arch.starts_with("gfx1151") {
+            SHARED_EXPERT_FUSED_GFX1151
+        } else {
+            return Err(eyre!("unsupported arch for shared_expert_fused: {arch}"));
+        };
+        let module = Module::load_data(image)?;
+        Ok(Self { module })
+    }
+
+    /// `mid_xq[b, n_ff]`, `mid_xscale[b, n_ff/32]` = Q8_0(swiglu_clamp(
+    /// gate_w . x[b], up_w . x[b], clamp)) for b in 0..batch, from the Q8_0
+    /// activation pair `xq[b, k]`, `xscale[b, k/32]`. `gate_w` / `up_w` are
+    /// `[n_ff, k]` Q8_0 (row pitch `(k/32)*34`). Requires `k % 32 == 0`,
+    /// `n_ff % 32 == 0` (a WG's 32 rows are quantized unguarded) and
+    /// `1 <= batch <= SHARED_FUSED_MAX_B`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch(
+        &self,
+        stream: &Stream,
+        mid_xq: &mut DeviceBuffer<i8>,
+        mid_xscale: &mut DeviceBuffer<f32>,
+        gate_w: &DeviceBuffer<u8>,
+        up_w: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        k: u32,
+        n_ff: u32,
+        batch: u32,
+        clamp: f32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        if batch > SHARED_FUSED_MAX_B {
+            return Err(eyre!(
+                "shared_expert_fused: batch={batch} exceeds SHARED_FUSED_MAX_B={SHARED_FUSED_MAX_B}"
+            ));
+        }
+        if k % Q8_0_BLOCK_ELEMS != 0 || n_ff % 32 != 0 || n_ff == 0 {
+            return Err(eyre!("shared_expert_fused: k={k} and n_ff={n_ff} must be multiples of 32"));
+        }
+        let blocks = k / Q8_0_BLOCK_ELEMS;
+        let expected_weight_bytes =
+            (n_ff as usize) * (blocks as usize) * (Q8_0_BLOCK_BYTES as usize);
+        if gate_w.byte_len() != expected_weight_bytes || up_w.byte_len() != expected_weight_bytes {
+            return Err(eyre!(
+                "shared_expert_fused weight bytes: gate {} up {}, expected {} (n_ff={n_ff}, k={k})",
+                gate_w.byte_len(),
+                up_w.byte_len(),
+                expected_weight_bytes
+            ));
+        }
+        let b = batch as usize;
+        if xq.len() < b * (k as usize)
+            || xscale.len() < b * (blocks as usize)
+            || mid_xq.len() < b * (n_ff as usize)
+            || mid_xscale.len() < b * (n_ff as usize / 32)
+        {
+            return Err(eyre!(
+                "shared_expert_fused: buffers too small for batch={batch} (xq {} xs {} mid_xq {} mid_xs {})",
+                xq.len(), xscale.len(), mid_xq.len(), mid_xscale.len()
+            ));
+        }
+        let function = self.module.get_function(SHARED_FUSED_SYMBOLS[b - 1])?;
+        let cfg = LaunchConfig {
+            grid: (n_ff / 32, 1, 1),
+            block: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        launch_kernel!(function, cfg, stream, [
+            mid_xq.raw(), mid_xscale.raw(), gate_w.raw(), up_w.raw(), xq.raw(), xscale.raw(),
+            k, n_ff, blocks, clamp
         ])
     }
 }

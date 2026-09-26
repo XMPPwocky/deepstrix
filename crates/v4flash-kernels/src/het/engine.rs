@@ -28,7 +28,7 @@ use crate::comp_kv_append::CompKvAppend;
 use crate::iq2_xxs::Iq2XxsPairMatvec;
 use crate::kv_cache_append::KvCacheAppend;
 use crate::q2_k::Q2KAccumulateMatvec;
-use crate::q8_0::{Q8_0GroupedMatvec, Q8_0Matvec, Q8_0MatvecWmma};
+use crate::q8_0::{Q8_0GroupedMatvec, Q8_0Matvec, Q8_0MatvecWmma, SharedExpertFused};
 use crate::q8_k::Q8KQuantize;
 use crate::rms_norm::{RmsNorm, RmsNormNoWeight};
 use crate::rope::RopeTail;
@@ -112,6 +112,9 @@ pub struct DeviceEngine {
     /// via the matrix cores. Used for the prefill qb up-projection.
     pub q8_wmma: Q8_0MatvecWmma,
     pub q8_grouped: Q8_0GroupedMatvec,
+    /// Fused shared-expert gate+up+swiglu+quantize for dGPU decode
+    /// (`V41_SHARED_FUSED`, `shared_fused_for(b)` in forward_prefill.rs).
+    pub shared_fused: SharedExpertFused,
     pub f16: F16Matvec,
     pub rope: RopeTail,
     pub attn_swa: AttentionSwa,
@@ -228,6 +231,7 @@ impl DeviceEngine {
             q8: Q8_0Matvec::for_arch(arch)?,
             q8_wmma: Q8_0MatvecWmma::for_arch(arch)?,
             q8_grouped: Q8_0GroupedMatvec::for_arch(arch)?,
+            shared_fused: SharedExpertFused::for_arch(arch)?,
             f16: F16Matvec::for_arch(arch)?,
             rope: RopeTail::for_arch(arch)?,
             attn_swa: AttentionSwa::for_arch(arch)?,

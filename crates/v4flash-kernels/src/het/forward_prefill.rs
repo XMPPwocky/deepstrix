@@ -833,6 +833,32 @@ pub fn mhc_fast() -> bool {
     *D
 }
 
+/// `V41_SHARED_FUSED` (default ON; `0` = the 4-launch gate/up/swiglu/quantize_mid
+/// chain): on the shared expert's dp4a arm (`small_b_dense_dp4a(b)`, all three
+/// shared weights Q8_0) lanes of <= `SHARED_FUSED_MAX_ROWS` rows run
+/// `SharedExpertFused::launch` (kernels/shared_expert_fused.hip): gate GEMV +
+/// up GEMV + clamped swiglu + Q8_0 quantize of `mid` as ONE 1024-thread-WG
+/// launch writing `sd.mid_sh_xq / mid_sh_xscale`, BIT-IDENTICAL to the chain
+/// (tests/q8_0_tb_bitexact.rs, b = 1..10, saturating and non-saturating
+/// activations; sweep review 3 runs). The down GEMV stays as is (tB via
+/// `matvec_batched`). 2026-09-26 sweep (C1_dense_decode/shared_expert_fused_chain,
+/// dGPU, cold weights, graph): chain 105.9 -> 78.6 us at b = 4 (x1.35,
+/// reviewer x1.347), b = 1 x1.12, b = 3 x1.27, b = 5 x1.42; 3 graph nodes and
+/// the f32 gate/up/mid round trips removed (~4-7 us of the 27 us is the fusion
+/// itself, the rest the tB GEMVs). Stages k.shared_expert.gate_matvec/
+/// up_matvec/swiglu/quantize_mid collapse into k.shared_expert.fused_gateup.
+/// Rows > 5 keep the chain: at b = 8 the kernel's 100 VGPRs leave one 32-wave
+/// WG per WGP (72 WGs on 32 WGPs = tail) and the tB 5-node chain is faster
+/// (92.5 vs 100.7 us, reviewer); b = 6/7 were not measured. Production lanes
+/// are 1-5 rows.
+pub fn shared_fused_for(b: u32) -> bool {
+    /// Largest lane the fused kernel is selected for (measured wins b = 1..5).
+    const SHARED_FUSED_MAX_ROWS: u32 = 5;
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_SHARED_FUSED").as_deref() != Ok("0"));
+    *D && (1..=SHARED_FUSED_MAX_ROWS).contains(&b)
+}
+
 /// `V41_ATTN_META_FILL` (default ON; `0` = the per-array H2D copies): the
 /// attention stage's per-row metadata (n_raw_per, n_raw_offset_per, final
 /// n_comp_per, and on index-source layers n_index_comp_per_b) as ONE
@@ -1893,58 +1919,80 @@ impl HeterogeneousEngine {
                 )?;
             }
         }
-        {
-            let _t = de.events.stage("k.shared_expert.gate_matvec", &de.compute)?;
-            super::dispatch::dense_gemm_prefill(
-                de, &de.compute, &mut sd.gate_sh, &dlw.shared.gate,
-                &sd.xq_n_embd, &sd.xscale_n_embd, &sd.kq_ffn_q8k,
-                Some((&sd.x16_n_embd, super::batch_scratch::f16_pitch(N_EMBD))),
-                b, N_FF_SHARED, N_EMBD,
+        // 2026-09-26 sweep (C1_dense_decode/shared_expert_fused_chain): the four
+        // launches gate_matvec / up_matvec / swiglu / quantize_mid as ONE fused
+        // kernel writing (mid_sh_xq, mid_sh_xscale) directly; bit-identical, chain
+        // 105.9 -> 78.6 us at b = 4 (with the tB down). `V41_SHARED_FUSED=0` or
+        // b > 5 or any non-Q8_0 shared weight or the WMMA arm -> the chain below.
+        // The input prep above already produced (xq_n_embd, xscale_n_embd) under
+        // exactly these conditions (any_q8(gate, up) && small_b_dense_dp4a(b)).
+        let shared_fused = shared_fused_for(b)
+            && dlw.shared.gate.dtype == v4flash_core::gguf::GgufType::Q8_0
+            && dlw.shared.up.dtype == v4flash_core::gguf::GgufType::Q8_0
+            && dlw.shared.down.dtype == v4flash_core::gguf::GgufType::Q8_0
+            && super::dispatch::small_b_dense_dp4a(b);
+        if shared_fused {
+            let _t = de.events.stage("k.shared_expert.fused_gateup", &de.compute)?;
+            de.shared_fused.launch(
+                &de.compute, &mut sd.mid_sh_xq, &mut sd.mid_sh_xscale,
+                &dlw.shared.gate.buffer, &dlw.shared.up.buffer,
+                &sd.xq_n_embd, &sd.xscale_n_embd,
+                N_EMBD, N_FF_SHARED, b, crate::config::SWIGLU_CLAMP_EXP,
             )?;
-        }
-        {
-            let _t = de.events.stage("k.shared_expert.up_matvec", &de.compute)?;
-            super::dispatch::dense_gemm_prefill(
-                de, &de.compute, &mut sd.up_sh, &dlw.shared.up,
-                &sd.xq_n_embd, &sd.xscale_n_embd, &sd.kq_ffn_q8k,
-                Some((&sd.x16_n_embd, super::batch_scratch::f16_pitch(N_EMBD))),
-                b, N_FF_SHARED, N_EMBD,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.shared_expert.swiglu", &de.compute)?;
-            // swiglu — elementwise; stretch n to B * N_FF_SHARED.
-            // ds4 5bc1e6d: shared experts use the same swiglu_limit clamp
-            // as routed experts (official V4-Flash graph).
-            de.swiglu.launch_clamped(
-                &de.compute,
-                &mut sd.mid_sh,
-                &sd.gate_sh,
-                &sd.up_sh,
-                b * N_FF_SHARED,
-                crate::config::SWIGLU_CLAMP_EXP,
-            )?;
-        }
-        {
-            let _t = de.events.stage("k.shared_expert.quantize_mid", &de.compute)?;
-            if super::dispatch::any_q8(&[&dlw.shared.down]) {
-                // Same fork as the gate/up input above, for `down`'s activation.
-                if super::dispatch::small_b_dense_dp4a(b) {
-                    de.q8.quantize_input_batched(
-                        &de.compute, &mut sd.mid_sh_xq, &mut sd.mid_sh_xscale,
-                        &sd.mid_sh, N_FF_SHARED, b,
-                    )?;
-                } else {
-                    de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.mid_sh16, &sd.mid_sh,
-                        b, N_FF_SHARED, super::batch_scratch::f16_pitch(N_FF_SHARED))?;
-                }
-            } else {
-                de.q8k.launch(
-                    &de.compute,
-                    &mut sd.kq_mid_q8k,
-                    &sd.mid_sh,
-                    crate::config::BLOCKS_Q8K_DOWN_IN * b,
+        } else {
+            {
+                let _t = de.events.stage("k.shared_expert.gate_matvec", &de.compute)?;
+                super::dispatch::dense_gemm_prefill(
+                    de, &de.compute, &mut sd.gate_sh, &dlw.shared.gate,
+                    &sd.xq_n_embd, &sd.xscale_n_embd, &sd.kq_ffn_q8k,
+                    Some((&sd.x16_n_embd, super::batch_scratch::f16_pitch(N_EMBD))),
+                    b, N_FF_SHARED, N_EMBD,
                 )?;
+            }
+            {
+                let _t = de.events.stage("k.shared_expert.up_matvec", &de.compute)?;
+                super::dispatch::dense_gemm_prefill(
+                    de, &de.compute, &mut sd.up_sh, &dlw.shared.up,
+                    &sd.xq_n_embd, &sd.xscale_n_embd, &sd.kq_ffn_q8k,
+                    Some((&sd.x16_n_embd, super::batch_scratch::f16_pitch(N_EMBD))),
+                    b, N_FF_SHARED, N_EMBD,
+                )?;
+            }
+            {
+                let _t = de.events.stage("k.shared_expert.swiglu", &de.compute)?;
+                // swiglu — elementwise; stretch n to B * N_FF_SHARED.
+                // ds4 5bc1e6d: shared experts use the same swiglu_limit clamp
+                // as routed experts (official V4-Flash graph).
+                de.swiglu.launch_clamped(
+                    &de.compute,
+                    &mut sd.mid_sh,
+                    &sd.gate_sh,
+                    &sd.up_sh,
+                    b * N_FF_SHARED,
+                    crate::config::SWIGLU_CLAMP_EXP,
+                )?;
+            }
+            {
+                let _t = de.events.stage("k.shared_expert.quantize_mid", &de.compute)?;
+                if super::dispatch::any_q8(&[&dlw.shared.down]) {
+                    // Same fork as the gate/up input above, for `down`'s activation.
+                    if super::dispatch::small_b_dense_dp4a(b) {
+                        de.q8.quantize_input_batched(
+                            &de.compute, &mut sd.mid_sh_xq, &mut sd.mid_sh_xscale,
+                            &sd.mid_sh, N_FF_SHARED, b,
+                        )?;
+                    } else {
+                        de.q8k.launch_cast_f16_2d(&de.compute, &mut sd.mid_sh16, &sd.mid_sh,
+                            b, N_FF_SHARED, super::batch_scratch::f16_pitch(N_FF_SHARED))?;
+                    }
+                } else {
+                    de.q8k.launch(
+                        &de.compute,
+                        &mut sd.kq_mid_q8k,
+                        &sd.mid_sh,
+                        crate::config::BLOCKS_Q8K_DOWN_IN * b,
+                    )?;
+                }
             }
         }
         {

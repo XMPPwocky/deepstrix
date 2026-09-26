@@ -252,3 +252,93 @@ extern "C" __global__ void q8_0_grouped_gemv_bpack(
         if (lane == 0) out[(size_t)b * (size_t)out_dim + row] = a;
     }
 }
+
+// ---------------------------------------------------------------------------
+// COMPILE-TIME-BATCH twins of q8_0_grouped_gemv_bpack: `q8_0_grouped_gemv_bpack_tB<B>`,
+// B = 1..8. Same argument list (`batch` ignored; the wrapper picks the symbol), same grid
+// ((out_dim/8) x 256), SAME arithmetic per (row, b) -> BIT-IDENTICAL to the runtime kernel
+// (tests/q8_0_tb_bitexact.rs; sweep review incl. rank=1000 WGs crossing groups, G=3).
+// Mechanism as in q8_0_matvec.hip (`q8_0_gemv_bpack_tB<B>`): the unrolled b-loop issues all
+// activation loads with the weight loads, one wait per block, no v_movrel.
+// 2026-09-26 sweep (C1_dense_decode/tB_compile_time_batch, wo_a 8 x (1024 x 4096), cold,
+// graph): b=4 ratio 0.74 (reviewer 0.735), b=5 0.75, b=8 similar; b=1 tB1 is 2.5% SLOWER
+// than the runtime kernel (76.8 -> 78.7 us, 6/6 runs) so the wrapper keeps the runtime
+// kernel at b=1. `V41_GEMV_TB=0` (src/q8_0.rs) restores the runtime kernel at every batch.
+__device__ __forceinline__ int32_t gdot8_regs(const uint4& a0, const uint4& a1,
+                                              const uint4& b0, const uint4& b1) {
+    int32_t dot = 0;
+    dot = gdp4a_sudot((int32_t)a0.x, (int32_t)b0.x, dot);
+    dot = gdp4a_sudot((int32_t)a0.y, (int32_t)b0.y, dot);
+    dot = gdp4a_sudot((int32_t)a0.z, (int32_t)b0.z, dot);
+    dot = gdp4a_sudot((int32_t)a0.w, (int32_t)b0.w, dot);
+    dot = gdp4a_sudot((int32_t)a1.x, (int32_t)b1.x, dot);
+    dot = gdp4a_sudot((int32_t)a1.y, (int32_t)b1.y, dot);
+    dot = gdp4a_sudot((int32_t)a1.z, (int32_t)b1.z, dot);
+    dot = gdp4a_sudot((int32_t)a1.w, (int32_t)b1.w, dot);
+    return dot;
+}
+
+template <int B>
+__device__ __forceinline__ void q8_0_grouped_gemv_bpack_tb_body(
+    float* __restrict__ out, const unsigned char* __restrict__ w,
+    const int8_t* __restrict__ xq, const float* __restrict__ xscale,
+    unsigned group_dim, unsigned rank, unsigned bpg, unsigned n_groups)
+{
+    uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    uint32_t out_dim = n_groups * rank;
+    if (row >= out_dim) return;
+    uint32_t g = row / rank;
+    const unsigned char* wr = w + (size_t)row * (size_t)bpg * 34u;
+    const __half* scales = (const __half*)wr;
+    const int8_t* quants = (const int8_t*)(wr + (size_t)bpg * 2u);
+    const uint32_t xq_stride = n_groups * group_dim, xs_stride = n_groups * bpg;
+    const int8_t* xq_g = xq + (size_t)g * group_dim;
+    const float* xs_g = xscale + (size_t)g * bpg;
+    float acc[B];
+#pragma unroll
+    for (int b = 0; b < B; ++b) acc[b] = 0.0f;
+    for (uint32_t bl = lane; bl < bpg; bl += WARP_LANES) {
+        uint4 av0, av1;
+        __builtin_memcpy(&av0, quants + (size_t)bl * 32u, 16);
+        __builtin_memcpy(&av1, quants + (size_t)bl * 32u + 16, 16);
+        const float ws = __half2float(scales[bl]);
+        uint4 bv0[B], bv1[B];
+        float xs[B];
+#pragma unroll
+        for (int b = 0; b < B; ++b) {
+            const int8_t* xqb = xq_g + (size_t)b * xq_stride + (size_t)bl * 32u;
+            __builtin_memcpy(&bv0[b], xqb, 16);
+            __builtin_memcpy(&bv1[b], xqb + 16, 16);
+            xs[b] = xs_g[(size_t)b * xs_stride + bl];
+        }
+#pragma unroll
+        for (int b = 0; b < B; ++b) {
+            int32_t dot = gdot8_regs(av0, av1, bv0[b], bv1[b]);
+            acc[b] += ws * xs[b] * (float)dot;
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < B; ++b) {
+        float a = gwarp_sum_f32(acc[b]);
+        if (lane == 0) out[(size_t)b * (size_t)out_dim + row] = a;
+    }
+}
+#define Q8_0_GROUPED_GEMV_BPACK_TB(NAME, B)                                                \
+    extern "C" __global__ void NAME(float* __restrict__ out,                               \
+                                    const unsigned char* __restrict__ w,                   \
+                                    const int8_t* __restrict__ xq,                         \
+                                    const float* __restrict__ xscale,                      \
+                                    unsigned group_dim, unsigned rank, unsigned bpg,       \
+                                    unsigned n_groups, unsigned batch) {                   \
+        (void)batch;                                                                       \
+        q8_0_grouped_gemv_bpack_tb_body<B>(out, w, xq, xscale, group_dim, rank, bpg, n_groups); \
+    }
+Q8_0_GROUPED_GEMV_BPACK_TB(q8_0_grouped_gemv_bpack_tB1, 1)
+Q8_0_GROUPED_GEMV_BPACK_TB(q8_0_grouped_gemv_bpack_tB2, 2)
+Q8_0_GROUPED_GEMV_BPACK_TB(q8_0_grouped_gemv_bpack_tB3, 3)
+Q8_0_GROUPED_GEMV_BPACK_TB(q8_0_grouped_gemv_bpack_tB4, 4)
+Q8_0_GROUPED_GEMV_BPACK_TB(q8_0_grouped_gemv_bpack_tB5, 5)
+Q8_0_GROUPED_GEMV_BPACK_TB(q8_0_grouped_gemv_bpack_tB6, 6)
+Q8_0_GROUPED_GEMV_BPACK_TB(q8_0_grouped_gemv_bpack_tB7, 7)
+Q8_0_GROUPED_GEMV_BPACK_TB(q8_0_grouped_gemv_bpack_tB8, 8)

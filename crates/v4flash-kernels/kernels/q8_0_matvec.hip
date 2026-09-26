@@ -267,6 +267,139 @@ extern "C" __global__ void q8_0_gemv_bpack_warp8(
     }
 }
 
+// ---------------------------------------------------------------------------
+// COMPILE-TIME-BATCH twins of q8_0_gemv_bpack_warp8: `q8_0_gemv_bpack_tB<B>`, B = 1..10.
+//
+// Same argument list (`batch` is ignored -- the wrapper picks the symbol by batch), same
+// grid ((M/8) x 256), and the SAME arithmetic per (row, b): same `bl = lane; bl += 32`
+// striding, same `ws * xscale * (float)dot`, same warp_sum tree -> BIT-IDENTICAL to the
+// runtime kernel (tests/q8_0_tb_bitexact.rs; sweep review 315/315 compares incl. row
+// tails, K=32, int8 extremes, sentinel-guarded outputs).
+//
+// Why it is faster: with a runtime `batch` the b-loop indexes acc[16] through
+// v_movrels/v_movreld (M0-relative) and the ISA waits for its loads INSIDE the loop, i.e.
+// one L2 round trip per (block, b). With B a compile-time constant the loop unrolls, all
+// 2B+B activation loads are issued together with the 2 weight loads, one wait per block.
+// 2026-09-26 sweep (C1_dense_decode/tB_compile_time_batch, dGPU, cold weights, graph):
+// b=4 ratio vs the runtime kernel q_a 0.80, kv 0.74, wo_b 0.84, gate/up 0.81, down 0.88,
+// Engram 0.86, head 0.88 (headline x1.25, reviewer x1.248); b=5 0.70-0.86; b=1 0.97-1.00
+// (already at 89-98% of roof). VGPRs 30/41/65/73/95/98 at B = 1/2/4/5/8/10 (runtime: 51).
+// `V41_GEMV_TB=0` (src/q8_0.rs) restores the runtime kernel at every batch.
+__device__ __forceinline__ int32_t dot8_regs(const uint4& a0, const uint4& a1,
+                                             const uint4& b0, const uint4& b1) {
+    int32_t dot = 0;
+    dot = dp4a_sudot((int32_t)a0.x, (int32_t)b0.x, dot);
+    dot = dp4a_sudot((int32_t)a0.y, (int32_t)b0.y, dot);
+    dot = dp4a_sudot((int32_t)a0.z, (int32_t)b0.z, dot);
+    dot = dp4a_sudot((int32_t)a0.w, (int32_t)b0.w, dot);
+    dot = dp4a_sudot((int32_t)a1.x, (int32_t)b1.x, dot);
+    dot = dp4a_sudot((int32_t)a1.y, (int32_t)b1.y, dot);
+    dot = dp4a_sudot((int32_t)a1.z, (int32_t)b1.z, dot);
+    dot = dp4a_sudot((int32_t)a1.w, (int32_t)b1.w, dot);
+    return dot;
+}
+
+template <int B>
+__device__ __forceinline__ void q8_0_gemv_bpack_tb_body(
+    float* __restrict__ out, const unsigned char* __restrict__ w,
+    const int8_t* __restrict__ xq, const float* __restrict__ xscale,
+    uint32_t in_dim, uint32_t out_dim, uint32_t blocks)
+{
+    uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char* wr = w + (size_t)row * blocks * 34u;
+    const __half* scales = (const __half*)wr;
+    const int8_t* quants = (const int8_t*)(wr + (size_t)blocks * 2u);
+
+    float acc[B];
+#pragma unroll
+    for (int b = 0; b < B; ++b) acc[b] = 0.0f;
+
+    for (uint32_t bl = lane; bl < blocks; bl += WARP_LANES) {
+        uint4 av0, av1;
+        __builtin_memcpy(&av0, quants + (size_t)bl * 32u, 16);
+        __builtin_memcpy(&av1, quants + (size_t)bl * 32u + 16, 16);
+        const float ws = __half2float(scales[bl]);
+        uint4 bv0[B], bv1[B];
+        float xs[B];
+#pragma unroll
+        for (int b = 0; b < B; ++b) {
+            const int8_t* xqb = xq + (size_t)b * in_dim + (size_t)bl * 32u;
+            __builtin_memcpy(&bv0[b], xqb, 16);
+            __builtin_memcpy(&bv1[b], xqb + 16, 16);
+            xs[b] = xscale[(size_t)b * blocks + bl];
+        }
+#pragma unroll
+        for (int b = 0; b < B; ++b) {
+            int32_t dot = dot8_regs(av0, av1, bv0[b], bv1[b]);
+            acc[b] += ws * xs[b] * (float)dot;
+        }
+    }
+
+#pragma unroll
+    for (int b = 0; b < B; ++b) {
+        float a = warp_sum_f32(acc[b]);
+        if (lane == 0) out[(size_t)b * out_dim + row] = a;
+    }
+}
+
+#define Q8_0_GEMV_BPACK_TB(NAME, B)                                                        \
+    extern "C" __global__ void NAME(float* __restrict__ out,                               \
+                                    const unsigned char* __restrict__ w,                   \
+                                    const int8_t* __restrict__ xq,                         \
+                                    const float* __restrict__ xscale,                      \
+                                    uint32_t in_dim, uint32_t out_dim, uint32_t blocks,    \
+                                    uint32_t batch) {                                      \
+        (void)batch;                                                                       \
+        q8_0_gemv_bpack_tb_body<B>(out, w, xq, xscale, in_dim, out_dim, blocks);           \
+    }
+Q8_0_GEMV_BPACK_TB(q8_0_gemv_bpack_tB1, 1)
+Q8_0_GEMV_BPACK_TB(q8_0_gemv_bpack_tB2, 2)
+Q8_0_GEMV_BPACK_TB(q8_0_gemv_bpack_tB3, 3)
+Q8_0_GEMV_BPACK_TB(q8_0_gemv_bpack_tB4, 4)
+Q8_0_GEMV_BPACK_TB(q8_0_gemv_bpack_tB5, 5)
+Q8_0_GEMV_BPACK_TB(q8_0_gemv_bpack_tB6, 6)
+Q8_0_GEMV_BPACK_TB(q8_0_gemv_bpack_tB7, 7)
+Q8_0_GEMV_BPACK_TB(q8_0_gemv_bpack_tB8, 8)
+Q8_0_GEMV_BPACK_TB(q8_0_gemv_bpack_tB9, 9)
+Q8_0_GEMV_BPACK_TB(q8_0_gemv_bpack_tB10, 10)
+
+// Quantize, one WAVE per 32-element block (lane i owns element i; amax via shfl_xor
+// fmaxf, which is order-free so d/id are bit-identical), 8 blocks per 256-thread WG:
+// grid = ceil(blocks/8) x 256. `q8_0_quantize_f32` above launches one 32-thread WG per
+// block in which EVERY thread serially loads and stores all 32 elements (32x redundant).
+// Same d = amax/127, id, lrintf, clamp -> bit-identical xq and xscale
+// (tests/q8_0_tb_bitexact.rs; sweep review: 7 shapes x 3 runs + 18 adversarial cases).
+// Only known difference: an ALL-NaN block gives xscale = NaN here vs 0 in the serial
+// kernel (fmaxf(0, NaN) drops NaNs; the xor tree keeps NaN only when every lane is NaN);
+// xq is identical even then. 2026-09-26 sweep (C1_dense_decode/quantize_wave, warm graph
+// node): K=5120 b=4 4.46 -> 3.56 us (x1.25), K=32768 b=4 8.2 -> 4.5 us WITH the grid pad
+// (src/q8_0.rs: the exact-power-of-two grids are slow for this kernel too). Assumes
+// wave32 (threadIdx.x >> 5): true for gfx1201 and gfx1151 under build.rs.
+// `V41_Q8_QUANT_WAVE=0` restores q8_0_quantize_f32.
+static_assert(sizeof(float) == 4, "q8_0_quantize_f32_wave: 4-byte floats");
+extern "C" __global__ void q8_0_quantize_f32_wave(
+    int8_t* __restrict__ xq,
+    float* __restrict__ xscale,
+    const float* __restrict__ x,
+    uint32_t blocks)
+{
+    uint32_t b = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (b >= blocks) return;
+    float v = x[(size_t)b * 32u + lane];
+    float amax = fabsf(v);
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(FULL_WARP_MASK, amax, off));
+    float d = amax / 127.0f;
+    float id = d != 0.0f ? 1.0f / d : 0.0f;
+    if (lane == 0) xscale[b] = d;
+    int q = (int)lrintf(v * id);
+    if (q > 127) q = 127;
+    if (q < -128) q = -128;
+    xq[(size_t)b * 32u + lane] = (int8_t)q;
+}
+
 extern "C" __global__ void q8_0_gemv_batched_warp8(
     float* __restrict__ out,             // [B, M]
     const unsigned char* __restrict__ w, // [M * blocks * 34] — shared across B
