@@ -107,3 +107,11 @@ iGPU gfx1151 = Strix Halo 8060S, 40 CUs (HIP reports 20 WGPs), 256 GB/s theoreti
   them**: check SQ_WAVES equals your dispatch's wave count and discard polluted dispatches.
   <= 4 counters per pass: `… -- bash _infra/prof.sh pmc "SQ_WAVES SQ_INSTS_VALU …" OUTDIR -- ./harness`.
 * `bash _infra/prof.sh trace OUTDIR -- ./harness` (under gpu_run.sh) for plain per-dispatch durations.
+
+## Real-time reporting (added 19:40 UTC)
+
+The moment you have a measured win (>= 5% at the kernel level, correctness checked, >= 2 runs),
+append ONE line to `_infra/WINS.log` in the format its header shows (`echo "..." >> _infra/WINS.log`).
+Also append a line for a notable NEGATIVE result (an idea from the brief that lost) and for any new
+idea you consider high-value even before measuring (`status=idea`). Reviewers append their verdicts
+the same way. The orchestrator tails this file and relays it to the user live; keep lines short.

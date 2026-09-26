@@ -1,0 +1,5 @@
+# Append ONE line per measured win (>=5% kernel-level, correctness checked, >=2 runs), the moment you have it:
+# <UTC time> | <family/idea> | <kernel> | speedup=<baseline/candidate> | runs=<n> | bitexact=<yes/no> | <one line: what + shape + est ms/token or prefill %>
+# Also one line for a notable NEGATIVE result (an idea from the brief that lost) and for a new high-value idea
+# before measuring (status=idea). Reviewers: same format with verdict=CONFIRMED|REFUTED and why.
+# This file is tailed by the orchestrator and relayed to the user in real time. Keep lines short.

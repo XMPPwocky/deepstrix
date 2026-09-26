@@ -13,6 +13,7 @@ for t in "$@"; do
     done
     rc=$(cat "$Q/done/$t.rc")
     echo "== $t rc=$rc"
+    echo "[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to $KI_ROOT/_infra/WINS.log (format in its header). It is relayed to the user in real time."
     cat "$Q/done/$t.out"
     last=$rc
 done
