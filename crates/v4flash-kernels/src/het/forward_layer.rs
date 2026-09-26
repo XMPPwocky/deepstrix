@@ -516,7 +516,7 @@ impl HeterogeneousEngine {
         next_dlw: Option<&DgpuLayerWeights>,
         ilw: &IgpuLayerWeights,
         pos: u32,
-        _token_id: i32, // was the hash router's input (removed with V4-Flash); still in the public wrappers
+        token_id: i32,
         standalone_graphs: bool,
         igpu_moe_preissued: bool,
         mut pager: Option<&mut ExpertPager>,
