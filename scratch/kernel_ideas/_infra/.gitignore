@@ -1,0 +1,4 @@
+example/*.hsaco
+example/*.elf
+example/*.s
+example/harness_*
