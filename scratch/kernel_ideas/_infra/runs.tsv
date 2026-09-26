@@ -473,3 +473,6 @@
 2026-09-26T20:08:07Z	review/B_moe_prefill	igpu	8500MB	rc=0	8.2s	busy_before=92	busy_after=96	bash run_full.sh 1  
 2026-09-26T20:08:43Z	review/B_moe_prefill	igpu	8500MB	rc=0	8.8s	busy_before=0	busy_after=97	bash run_full.sh 2  
 2026-09-26T20:08:51Z	review/B_moe_prefill	igpu	8500MB	rc=0	8.4s	busy_before=94	busy_after=96	bash run_full.sh 3  
+2026-09-26T20:27:11Z	D_attention/integ_check	dgpu	96MB	rc=0	1.0s	busy_before=NA	busy_after=10	env CANDS=attention_dec_fused_vt_qreg_sp_d4\,attention_dec_score_blk128 ./attn_harness2_gfx1201 gfx1201 /tmp/d_intree check  
+2026-09-26T20:27:24Z	D_attention/integ_check2	dgpu	96MB	rc=0	1.0s	busy_before=NA	busy_after=10	env CANDS=attention_dec_fused_vt_qreg_sp_d4\,attention_dec_score_blk128 ./attn_harness2_gfx1201 gfx1201 /tmp/d_intree check  
+2026-09-26T20:27:25Z	D_attention/integ_check3	dgpu	96MB	rc=0	0.3s	busy_before=0	busy_after=11	env CANDS=attention_dec_fused_vt_qreg_sp_d4\,attention_dec_score_blk128 ./attn_harness2_gfx1201 gfx1201 /tmp/d_intree check  
