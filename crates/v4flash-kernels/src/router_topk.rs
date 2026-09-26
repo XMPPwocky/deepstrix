@@ -50,6 +50,26 @@ pub struct RouterEx<'a> {
     pub range_out: Option<&'a mut DeviceBuffer<f32>>,
 }
 
+/// Largest batch that runs `router_topk_wfred` (see [`topk_batched_symbol`]).
+pub const TOPK_WFRED_MAX_B: u32 = 16;
+
+/// `V41_TOPK_WFRED` (default ON; `0` = `router_topk_par` at every batch): the
+/// batched router top-k at `b <= TOPK_WFRED_MAX_B` (decode, look-ahead) runs
+/// `router_topk_wfred`, which does each argmax pass as one hardware wave
+/// reduction on a 64-bit (monotonic score, ~index) key + a 16-slot LDS merge,
+/// ONE barrier per pass instead of ten. Same args and grid, BIT-IDENTICAL on
+/// every output (selected, weights, alts, alt_w, orig_sel, range; the sweep
+/// review ran 243 config x input classes incl. ties, all-equal, all -INF and
+/// -0.0; tests/mhc_glue_bitexact.rs). 2026-09-26 sweep (F_mhc_glue/topk_wfred,
+/// dGPU): cache-prior config b=1 11.15 -> 9.20 us, b=4 11.15 -> 9.05; plain b=1
+/// neutral; plain b=512 a 10% LOSS (33.0 -> 36.5), hence the batch gate --
+/// prefill (b=512) and replay (~64) keep `router_topk_par`.
+pub fn topk_batched_symbol(b: u32) -> &'static str {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_TOPK_WFRED").as_deref() != Ok("0"));
+    if *D && b <= TOPK_WFRED_MAX_B { "router_topk_wfred" } else { "router_topk_par" }
+}
+
 pub struct RouterTopk {
     module: Module,
 }
@@ -82,6 +102,9 @@ impl RouterTopk {
         let module = Module::load_data(image)?;
         Ok(Self { module })
     }
+
+    /// The loaded module (tests: explicit-symbol launches).
+    pub fn module(&self) -> &Module { &self.module }
 
     /// Selected: `[n_used]` i32. Weights: `[n_used]` f32. Logits:
     /// `[n_expert]` f32. Bias: optional `[n_expert]` f32.
@@ -319,7 +342,9 @@ impl RouterTopk {
         let ro_ptr: sys::hipDeviceptr_t = range_out.map_or(std::ptr::null_mut(), |r| r.raw());
         let n_protect = n_protect.min(n_used);
         // Batched path needs the par kernel's blockIdx.x offsetting.
-        let function = self.module.get_function("router_topk_par")?;
+        // `V41_TOPK_WFRED`: the wave-reduction twin at decode sizes (b <= 16),
+        // same args and grid, bit-identical; prefill keeps the par kernel.
+        let function = self.module.get_function(topk_batched_symbol(b))?;
         let b_ptr: sys::hipDeviceptr_t = match bias {
             Some(bs) => bs.raw(),
             None => std::ptr::null_mut(),

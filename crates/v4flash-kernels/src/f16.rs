@@ -33,6 +33,43 @@ const NARROW_BLOCK_THREADS: u32 = 256;
 /// the larger compressor matvecs (n_rows≥256) still take the wide path.
 const NARROW_ROWS_THRESHOLD: u32 = 64;
 
+/// `V41_ROUTER_MV_H20` (default ON; `0` = `f16_matvec_batched`): the router
+/// logits matvec at decode / replay ([`F16Matvec::matvec_batched_router`],
+/// W [384, 5120] f16, grid (48, 1, b)) runs `f16_matvec_batched_h20`, which
+/// keeps every lane's element order and the single f32 accumulator but loads
+/// 20 elements per lane per chunk into registers with the next chunk's loads
+/// in flight (double buffer). BIT-IDENTICAL (tests/mhc_glue_bitexact.rs; the
+/// sweep review: 72 + 45 compares incl. tails and the other matvec_batched
+/// shapes). 2026-09-26 sweep (F_mhc_glue/router_mv_h20, dGPU, W cold as in
+/// production): b=1 21.7 -> 10.4 us, b=4 21.9 -> 13.4, b=8 41.9 -> 18.4.
+/// Only when k % 640 == 0 (else the kernel would run the production loop anyway).
+fn router_mv_h20_for(k: u32) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_ROUTER_MV_H20").as_deref() != Ok("0"));
+    *D && k % (GEMV_WARP_LANES * 20) == 0
+}
+
+/// `V41_MHC_GEMM_NARROW` (default ON; `0` = `f16_gemm_wmma_lds_tiled` at every
+/// shape): [`F16Matvec::gemm_batched_wmma`] with `n_rows <= 32`, `k % 128 == 0`
+/// and 16-byte aligned `x` / `weight` -- the prefill mHC pre-mix GEMMs (M =
+/// HC_MIX_DIM = 24, K = HC_DIM = 20480; pre-attn and pre-ffn at b > 64) -- runs
+/// `f16_gemm_narrow_n16_bk128_pf2`, grid (1, ceil(b/16)) x 256: one 16-column
+/// n-tile per WG, all 8 waves streaming BK=128 K-chunks with b128 loads, PF=2,
+/// double-buffered LDS. The same WMMA chain in the same K order with the same
+/// f16 fragments: BIT-IDENTICAL (tests/mhc_glue_bitexact.rs; the sweep review
+/// 108/108 at B = 1..1024). 2026-09-26 sweep (F_mhc_glue/gemm_narrow_m24, dGPU):
+/// B=512 476 -> 80 us (x5.4-6.0 over three cache regimes), B=65..128 ~7x;
+/// 160 calls per 1024-row chunk. The kernel writes NOTHING outside its shape
+/// preconditions, so this gate is the only thing routing to it.
+fn mhc_gemm_narrow_for(n_rows: u32, k: u32, weight: &DeviceBuffer<u8>, x: &DeviceBuffer<f32>) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_MHC_GEMM_NARROW").as_deref() != Ok("0"));
+    *D && n_rows <= 32
+        && k % 128 == 0
+        && (weight.raw() as usize) % 16 == 0
+        && (x.raw() as usize) % 16 == 0
+}
+
 pub struct F16Matvec {
     wide: Module,
     narrow: Module,
@@ -106,6 +143,19 @@ impl F16Matvec {
         }
         if out.len() < (batch as usize) * (n_rows as usize) {
             return Err(eyre!("f16 gemm_batched_wmma out too small: {}", out.len()));
+        }
+        if mhc_gemm_narrow_for(n_rows, k, weight, x) {
+            // `V41_MHC_GEMM_NARROW`: narrow-M re-tiling, bit-identical; 2026-09-26
+            // sweep: 476 -> 80 us at the B=512 mHC pre-mix. NT = 16 columns per WG.
+            let function = module.get_function("f16_gemm_narrow_n16_bk128_pf2")?;
+            let cfg = LaunchConfig {
+                grid: (1, batch.div_ceil(16), 1),
+                block: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            return launch_kernel!(function, cfg, stream, [
+                out.raw(), weight.raw(), x.raw(), k, n_rows, batch
+            ]);
         }
         // Must match BM/BN in kernels/f16_gemm_wmma.hip.
         const BM: u32 = 64;
@@ -475,6 +525,47 @@ impl F16Matvec {
         k: u32,
         batch: u32,
     ) -> eyre::Result<()> {
+        self.matvec_batched_sym(stream, out, weight, x, n_rows, k, batch, "f16_matvec_batched")
+    }
+
+    /// [`Self::matvec_batched`] for the ROUTER logits (decode / replay, and the
+    /// look-ahead router): `f16_matvec_batched_h20` under `V41_ROUTER_MV_H20`
+    /// when `k % 640 == 0`, same args and grid, bit-identical. The other
+    /// `matvec_batched` callers (compressor, indexer) keep the old kernel: the
+    /// sweep measured only the router shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_batched_router(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        x: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        let sym = if router_mv_h20_for(k) { "f16_matvec_batched_h20" } else { "f16_matvec_batched" };
+        self.matvec_batched_sym(stream, out, weight, x, n_rows, k, batch, sym)
+    }
+
+    /// The loaded wide matvec module (tests: explicit-symbol launches).
+    pub fn wide_module(&self) -> &Module { &self.wide }
+
+    /// The loaded WMMA GEMM module, if any (tests: explicit-symbol launches).
+    pub fn gemm_module(&self) -> Option<&Module> { self.gemm_wmma.as_ref() }
+
+    #[allow(clippy::too_many_arguments)]
+    fn matvec_batched_sym(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        x: &DeviceBuffer<f32>,
+        n_rows: u32,
+        k: u32,
+        batch: u32,
+        sym: &str,
+    ) -> eyre::Result<()> {
         if batch == 0 {
             return Ok(());
         }
@@ -492,7 +583,7 @@ impl F16Matvec {
         if out.len() < (batch as usize) * (n_rows as usize) {
             return Err(eyre!("f16 matvec_batched out too small: {}", out.len()));
         }
-        let function = self.wide.get_function("f16_matvec_batched")?;
+        let function = self.wide.get_function(sym)?;
         let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
         let block_x = GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES;
         let cfg = LaunchConfig {

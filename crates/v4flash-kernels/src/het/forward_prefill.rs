@@ -6618,7 +6618,8 @@ impl HeterogeneousEngine {
                     b,
                 )?;
             } else {
-                de.f16.matvec_batched(
+                // `V41_ROUTER_MV_H20` (f16.rs): hoisted-load twin, bit-identical.
+                de.f16.matvec_batched_router(
                     &de.compute,
                     &mut sd.router_logits,
                     &dlw.ffn_gate_inp.buffer,
@@ -6730,13 +6731,13 @@ impl HeterogeneousEngine {
             )?;
         if let Some(nl) = look_next {
             let _t = de.events.stage("k.router.lookahead", &de.compute)?;
-            de.f16.matvec_batched(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
+            de.f16.matvec_batched_router(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
             de.router_topk.launch_batched(&de.compute, &mut sd.look_sel, &mut sd.look_ew, &sd.router_logits, nl.router_bias_dev.as_ref(),
                 N_EXPERT, cs_n_used as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, b)?;
         }
         if let Some(nl) = look_next2 {
             let _t = de.events.stage("k.router.lookahead2", &de.compute)?;
-            de.f16.matvec_batched(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
+            de.f16.matvec_batched_router(&de.compute, &mut sd.router_logits, &nl.ffn_gate_inp.buffer, &bd.ffn_input_norm, N_EXPERT, N_EMBD, b)?;
             de.router_topk.launch_batched(&de.compute, &mut sd.look_sel2, &mut sd.look_ew2, &sd.router_logits, nl.router_bias_dev.as_ref(),
                 N_EXPERT, cs_n_used as u32, EXPERT_WEIGHT_SCALE, ROUTER_WEIGHT_EPS, b)?;
         }

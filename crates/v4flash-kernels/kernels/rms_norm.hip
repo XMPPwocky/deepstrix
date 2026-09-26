@@ -81,6 +81,87 @@ extern "C" __global__ void rms_norm_weighted_batched(
     }
 }
 
+// rms_norm_weighted_batched_fast — rms_norm_weighted_batched with every load
+// issued up front. 2026-09-26 sweep (F_mhc_glue/rms_fast): n=5120 b=1 10.46 ->
+// 4.07 us, n=1280 4.91 -> 3.38, n=512 3.82 -> 3.25 (graph, dGPU), B=512 n=5120
+// 31.9 -> 25.5; bit-exact (reviewer: 90 + 511 compares, incl. inf/denormal rows).
+//
+// The production loop `for (i = tid; i < n; i += 256) partial += (double)x*x`
+// has a runtime n, so the compiler cannot hoist the loads: each iteration is one
+// dependent global load (~1 us round trip at decode occupancy, one WG per row)
+// then one DFMA, and the output pass RE-READS x. Here n == NPT * 256 dispatches
+// to a template holding NPT x and NPT weight values per thread in registers (all
+// loads issued first), the double accumulation runs in the SAME order i = tid,
+// tid+256, ..., the LDS tree is the same, and the output uses the x values in
+// registers (the same f32 the second pass re-read). Any other n (or a block that
+// is not 256) runs the production loop. Same signature and grid as
+// rms_norm_weighted_batched; grid (1) is the per-row rms_norm_weighted.
+// Selected by RmsNorm (src/rms_norm.rs) under V41_RMS_FAST for n in
+// {512, 1280, 5120} only.
+template <unsigned NPT>
+__device__ __forceinline__ void rms_w_fast(float* __restrict__ ob, const float* __restrict__ xb,
+                                           const float* __restrict__ weight, unsigned int n, float eps,
+                                           float* sdata) {
+    const unsigned int tid = threadIdx.x;
+    float xv[NPT], wv[NPT];
+    #pragma unroll
+    for (unsigned j = 0; j < NPT; ++j) xv[j] = xb[tid + 256u * j];
+    #pragma unroll
+    for (unsigned j = 0; j < NPT; ++j) wv[j] = weight[tid + 256u * j];
+    double partial = 0.0;
+    #pragma unroll
+    for (unsigned j = 0; j < NPT; ++j) {
+        const float v = xv[j];
+        partial += (double)v * (double)v;
+    }
+    sdata[tid] = (float)partial;
+    __syncthreads();
+    for (unsigned int stride = 128u; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] += sdata[tid + stride];
+        __syncthreads();
+    }
+    const float mean_sq = sdata[0] / (float)n;
+    const float scale = rsqrtf(mean_sq + eps);
+    #pragma unroll
+    for (unsigned j = 0; j < NPT; ++j) ob[tid + 256u * j] = xv[j] * scale * wv[j];
+}
+
+__device__ __forceinline__ void rms_w_generic(float* __restrict__ ob, const float* __restrict__ xb,
+                                              const float* __restrict__ weight, unsigned int n, float eps,
+                                              float* sdata) {
+    const unsigned int tid = threadIdx.x;
+    const unsigned int block = blockDim.x;
+    double partial = 0.0;
+    for (unsigned int i = tid; i < n; i += block) {
+        float v = xb[i];
+        partial += (double)v * (double)v;
+    }
+    sdata[tid] = (float)partial;
+    __syncthreads();
+    for (unsigned int stride = block / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] += sdata[tid + stride];
+        __syncthreads();
+    }
+    const float mean_sq = sdata[0] / (float)n;
+    const float scale = rsqrtf(mean_sq + eps);
+    for (unsigned int i = tid; i < n; i += block) ob[i] = xb[i] * scale * weight[i];
+}
+
+extern "C" __global__ __launch_bounds__(256) void rms_norm_weighted_batched_fast(
+        float* out, const float* x, const float* weight, unsigned int n, float eps) {
+    __shared__ float sdata[256];
+    const unsigned int b = blockIdx.x;
+    const float* xb = x + (size_t)b * (size_t)n;
+    float* ob = out + (size_t)b * (size_t)n;
+    if (blockDim.x != 256u) { rms_w_generic(ob, xb, weight, n, eps, sdata); return; }
+    switch (n) {
+        case 512u:  rms_w_fast<2>(ob, xb, weight, n, eps, sdata); break;    // kv / comp norms
+        case 1280u: rms_w_fast<5>(ob, xb, weight, n, eps, sdata); break;    // q_a norm
+        case 5120u: rms_w_fast<20>(ob, xb, weight, n, eps, sdata); break;   // attn/ffn input norm, head prep
+        default:    rms_w_generic(ob, xb, weight, n, eps, sdata); break;
+    }
+}
+
 // M55: fused rms_norm_weighted + q8_0 input quantization. The decode
 // q_chain runs rms_norm_weighted(qr_normed ← qr) immediately followed by
 // q8_0_quantize_f32(qr_xq ← qr_normed) — two ~6 µs single-WG kernels per

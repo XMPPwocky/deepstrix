@@ -177,6 +177,78 @@ extern "C" __global__ void f16_matvec_batched(
     if (lane == 0) out[(size_t)bz * (size_t)n_rows + row] = acc;
 }
 
+// f16_matvec_batched_h20 — f16_matvec_batched with the loads hoisted, for the
+// decode/replay router logits (W [384, 5120] f16, grid (48, 1, b) x 256).
+// 2026-09-26 sweep (F_mhc_glue/router_mv_h20): COLD W (production regime)
+// b=1 21.7 -> 10.4 us, b=4 21.9 -> 13.4, b=8 41.9 -> 18.4; bit-exact.
+//
+// The production loop has a runtime k, one u16 + one f32 load + one FMA per
+// iteration, and the compiler keeps only a few iterations in flight (ATT: 94%
+// of the stall on ONE s_wait_loadcnt 0 per iteration). Here the per-lane
+// element sequence is UNCHANGED (i = lane + 32 j, j ascending, one f32
+// accumulator, the same h2f(w) * x FMA expression), so the result is
+// bit-identical; only the schedule differs: when k % (32 * CH) == 0 each chunk
+// of CH elements per lane is loaded into registers before its CH FMAs, with the
+// next chunk's loads issued before the current chunk's FMAs (double buffer).
+// Other k run the production loop. CH=40 measured equal, CH=80 spills.
+// Selected by F16Matvec::matvec_batched_router under V41_ROUTER_MV_H20.
+template <unsigned CH>
+__device__ __forceinline__ float mv_row_hoisted(const __half* __restrict__ wr, const float* __restrict__ xb,
+                                                uint32_t k, uint32_t lane) {
+    const uint32_t nchunks = k / (F16_WARP_LANES * CH);
+    __half wv[2][CH];
+    float xv[2][CH];
+    auto issue = [&](uint32_t c, uint32_t slot) {
+        const uint32_t base = c * (F16_WARP_LANES * CH) + lane;
+        #pragma unroll
+        for (unsigned j = 0; j < CH; ++j) wv[slot][j] = wr[base + F16_WARP_LANES * j];
+        #pragma unroll
+        for (unsigned j = 0; j < CH; ++j) xv[slot][j] = xb[base + F16_WARP_LANES * j];
+    };
+    float acc = 0.0f;
+    issue(0, 0);
+    for (uint32_t c = 0; c < nchunks; c += 2) {
+        if (c + 1 < nchunks) issue(c + 1, 1);
+        #pragma unroll
+        for (unsigned j = 0; j < CH; ++j) acc += __half2float(wv[0][j]) * xv[0][j];
+        if (c + 1 < nchunks) {
+            if (c + 2 < nchunks) issue(c + 2, 0);
+            #pragma unroll
+            for (unsigned j = 0; j < CH; ++j) acc += __half2float(wv[1][j]) * xv[1][j];
+        }
+    }
+    return acc;
+}
+
+template <unsigned CH>
+__device__ __forceinline__ void mv_body(float* __restrict__ out, const __half* __restrict__ weight,
+                                        const float* __restrict__ x, unsigned int k, unsigned int n_rows) {
+    uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= n_rows) return;
+    const uint32_t bz = blockIdx.z;
+    const __half* wr = weight + (size_t)row * (size_t)k;
+    const float* xb = x + (size_t)bz * (size_t)k;
+    float acc;
+    if (k % (F16_WARP_LANES * CH) == 0u) {
+        acc = mv_row_hoisted<CH>(wr, xb, k, lane);
+    } else {
+        acc = 0.0f;
+        for (uint32_t i = lane; i < k; i += F16_WARP_LANES) acc += __half2float(wr[i]) * xb[i];
+    }
+    acc = f16_warp_sum_f32(acc);
+    if (lane == 0) out[(size_t)bz * (size_t)n_rows + row] = acc;
+}
+
+extern "C" __global__ __launch_bounds__(256) void f16_matvec_batched_h20(
+        float          * __restrict__ out,        // [B, n_rows]
+        const __half   * __restrict__ weight,     // [n_rows, k]
+        const float    * __restrict__ x,          // [B, k]
+        unsigned int     k,
+        unsigned int     n_rows) {
+    mv_body<20>(out, weight, x, k, n_rows);       // 8 chunks of 20 at k = 5120
+}
+
 // M40-P4.5: 2-wide pair variant. One weight matrix, two input vectors,
 // two output vectors. Per-lane: load W[i] once, multiply by x_a[i] and
 // x_b[i], accumulate into two scalars. Halves W bandwidth.

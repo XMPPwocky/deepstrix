@@ -22,6 +22,22 @@ const RMS_NORM_NO_WEIGHT_GFX1201: &[u8] =
 const RMS_NORM_NO_WEIGHT_GFX1151: &[u8] =
     include_bytes!(env!("KERNEL_RMS_NORM_NO_WEIGHT_GFX1151"));
 
+/// `V41_RMS_FAST` (default ON; `0` = `rms_norm_weighted_batched` /
+/// `rms_norm_weighted` at every n): for n in {512, 1280, 5120} both weighted
+/// launches run `rms_norm_weighted_batched_fast` (same signature and grid; the
+/// per-row `launch_weighted` is its grid-(1) case), which issues all x and
+/// weight loads up front instead of one dependent load per loop iteration.
+/// BIT-IDENTICAL (same double accumulation order, same LDS tree, output from
+/// the same f32 values; tests/mhc_glue_bitexact.rs). 2026-09-26 sweep
+/// (F_mhc_glue/rms_fast, dGPU graph): q_a n=1280 4.91 -> 3.38 us, kv/comp
+/// n=512 3.82 -> 3.25, head prep n=5120 10.46 -> 4.07; prefill B=512 n=5120
+/// 31.9 -> 25.5. Other n keep the old kernels.
+fn rms_fast_for(n: u32) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_RMS_FAST").as_deref() != Ok("0"));
+    *D && matches!(n, 512 | 1280 | 5120)
+}
+
 /// Loaded RMSNorm kernel for one device. Bind the current HIP device
 /// before calling [`RmsNorm::for_arch`], then re-use the resulting
 /// handle across launches.
@@ -45,6 +61,9 @@ impl RmsNorm {
         let module = Module::load_data(image)?;
         Ok(Self { module })
     }
+
+    /// The loaded module (tests: explicit-symbol launches).
+    pub fn module(&self) -> &Module { &self.module }
 
     /// Launch the `rms_norm_weighted` kernel asynchronously on `stream`.
     /// `n` must equal `out.len() == x.len() == weight.len()` and is also
@@ -71,7 +90,12 @@ impl RmsNorm {
             return Err(eyre!("rms_norm_weighted n={n} exceeds the wrapper cap HC_DIM"));
         }
 
-        let function = self.module.get_function("rms_norm_weighted")?;
+        // `V41_RMS_FAST`: the loads-up-front kernel at grid (1), bit-identical.
+        let function = self.module.get_function(if rms_fast_for(n) {
+            "rms_norm_weighted_batched_fast"
+        } else {
+            "rms_norm_weighted"
+        })?;
 
         // Kernel signature: (float *out, const float *x, const float *weight,
         //                   unsigned int n, float eps)
@@ -159,9 +183,12 @@ impl RmsNorm {
         if n > HC_DIM as u32 {
             return Err(eyre!("rms_norm_weighted_batched: n={n} > HC_DIM"));
         }
-        let function = self
-            .module
-            .get_function("rms_norm_weighted_batched")?;
+        // `V41_RMS_FAST`: loads-up-front twin for n in {512, 1280, 5120}, bit-identical.
+        let function = self.module.get_function(if rms_fast_for(n) {
+            "rms_norm_weighted_batched_fast"
+        } else {
+            "rms_norm_weighted_batched"
+        })?;
         let cfg = LaunchConfig {
             grid: (batch, 1, 1),
             block: (256, 1, 1),
