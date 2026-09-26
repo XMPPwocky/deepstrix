@@ -1,0 +1,35 @@
+== 1790451146.000081.D_attention.dgpu rc=0
+W20260926 19:32:29.470348 129978073090688 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.038413 sec
+W20260926 19:32:29.470578 129978073090688 simple_timer.cpp:55] [rocprofv3] './attn_harness2_gfx1201 gfx1201 . prof 8 none' ::     0.000000 sec
+W20260926 19:32:29.510932 129978073090688 tool.cpp:2424] HSA version 1.18.0 initialized (instance=0)
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+E20260926 19:32:29.513980 129978073090688 output_stream.cpp:111] Opened result file: results/att_smwsum_b8/run_gfx1201_code_object_id_1.out
+E20260926 19:32:29.515406 129978073090688 output_stream.cpp:111] Opened result file: results/att_smwsum_b8/run_gfx1201_code_object_id_2.out
+E20260926 19:32:29.516646 129978073090688 output_stream.cpp:111] Opened result file: results/att_smwsum_b8/run_gfx1201_code_object_id_3.out
+E20260926 19:32:29.518425 129978073090688 output_stream.cpp:111] Opened result file: results/att_smwsum_b8/run_gfx1201_code_object_id_4.out
+E20260926 19:32:29.519717 129978073090688 output_stream.cpp:111] Opened result file: results/att_smwsum_b8/run_gfx1201_code_object_id_5.out
+E20260926 19:32:29.521809 129978073090688 output_stream.cpp:111] Opened result file: results/att_smwsum_b8/run_gfx1201_code_object_id_6.out
+E20260926 19:32:29.534283 129978073090688 output_stream.cpp:111] Opened result file: results/att_smwsum_b8/run_gfx1201_code_object_id_7.out
+E20260926 19:32:29.535777 129977957742272 output_stream.cpp:111] Opened result file: results/att_smwsum_b8/run_11803_shader_engine_0_14.att
+E20260926 19:32:29.536058 129977957742272 output_stream.cpp:111] Opened result file: results/att_smwsum_b8/run_11803_shader_engine_0_16.att
+W20260926 19:32:29.536185 129978073090688 simple_timer.cpp:55] [rocprofv3] './attn_harness2_gfx1201 gfx1201 . prof 8 none' ::     0.065607 sec
+W20260926 19:32:29.546165 129978073090688 generateRocpd.cpp:583] writing SQL database for process 49712 on node 868250506
+E20260926 19:32:29.546432 129978073090688 generateRocpd.cpp:606] Opened result file: results/att_smwsum_b8/run_results.db (UUID=00000029-8dc2-7dc2-a379-6a33e973af6e)
+W20260926 19:32:30.308164 129978073090688 simple_timer.cpp:55] SQLite3 generation :: rocpd_string             ::     0.016369 sec
+W20260926 19:32:30.320199 129978073090688 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_node          ::     0.012015 sec
+W20260926 19:32:30.333148 129978073090688 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_process       ::     0.012942 sec
+W20260926 19:32:30.368152 129978073090688 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_agent         ::     0.012035 sec
+W20260926 19:32:30.368168 129978073090688 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_pmc           ::     0.000008 sec
+W20260926 19:32:30.381132 129978073090688 simple_timer.cpp:55] SQLite3 generation :: rocpd kernel info        ::     0.012960 sec
+W20260926 19:32:30.381139 129978073090688 simple_timer.cpp:55] SQLite3 generation :: rocpd_region             ::     0.000001 sec
+W20260926 19:32:30.381142 129978073090688 simple_timer.cpp:55] SQLite3 generation :: rocpd_kernel_dispatch    ::     0.000000 sec
+W20260926 19:32:30.381145 129978073090688 simple_timer.cpp:55] SQLite3 generation :: rocpd_pmc_event          ::     0.000000 sec
+W20260926 19:32:30.381147 129978073090688 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_copy        ::     0.000000 sec
+W20260926 19:32:30.381149 129978073090688 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_allocate    ::     0.000000 sec
+W20260926 19:32:30.381230 129978073090688 simple_timer.cpp:55] SQLite3 generation :: SQL indexing             ::     0.000079 sec
+W20260926 19:32:30.381694 129978073090688 simple_timer.cpp:55] SQLite3 generation :: total                    ::     0.835530 sec
+W20260926 19:32:30.444854 129978073090688 simple_timer.cpp:55] [rocprofv3] output generation ::     0.907071 sec
+W20260926 19:32:30.444900 129978073090688 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.907122 sec
+prof done b=8
+results/att_smwsum_b8/stats_ui_output_agent_11803_dispatch_14.csv
+results/att_smwsum_b8/stats_ui_output_agent_11803_dispatch_16.csv

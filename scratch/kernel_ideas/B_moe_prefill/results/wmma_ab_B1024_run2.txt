@@ -1,0 +1,19 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[setup] B=1024 n_exp=96 members=1559 touched=96 max_group=28 n_wi_exact=96 n_wi_bound=576  mean members/expert=16.2
+ROOFLINE gate+up: 1.227 GB (weights 1.203 GB) -> 5.33 ms at 230 GB/s; 73.6 GFLOP
+ROOFLINE down:    0.638 GB (weights 0.602 GB) -> 2.77 ms at 230 GB/s; 36.8 GFLOP
+SCALE: x4.00 to a full 384-expert layer (this launch touches 96 experts)
+
+== gate+up A/B B=1024 n_exp=96 members=1559 touched=96  (rounds=20 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide gate+up (prod)                       12067.17   11988.97   12247.60    1.000     101.7    6096.1
+gu_wmma gate+up (cand)                      7269.05    7225.10    7371.25    0.602     168.8   10120.0
+KBJSON {"tag":"gate+up A/B B=1024 n_exp=96 members=1559 touched=96","variant":"kwide gate+up (prod)","med_us":12067.165,"p10_us":11988.968,"p90_us":12247.600,"ratio":1.0000,"gbps":101.66,"graph":0,"flush":0}
+KBJSON {"tag":"gate+up A/B B=1024 n_exp=96 members=1559 touched=96","variant":"gu_wmma gate+up (cand)","med_us":7269.054,"p10_us":7225.095,"p90_us":7371.251,"ratio":0.6024,"gbps":168.76,"graph":0,"flush":0}
+
+== down A/B B=1024 n_exp=96 members=1559 touched=96  (rounds=20 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide2 down (prod)                          9677.76    9564.42    9825.02    1.000      65.9    3800.6
+down_wmma (cand)                            3446.81    3363.32    3513.33    0.356     185.0   10671.1
+KBJSON {"tag":"down A/B B=1024 n_exp=96 members=1559 touched=96","variant":"kwide2 down (prod)","med_us":9677.759,"p10_us":9564.422,"p90_us":9825.015,"ratio":1.0000,"gbps":65.89,"graph":0,"flush":0}
+KBJSON {"tag":"down A/B B=1024 n_exp=96 members=1559 touched=96","variant":"down_wmma (cand)","med_us":3446.814,"p10_us":3363.316,"p90_us":3513.331,"ratio":0.3562,"gbps":185.00,"graph":0,"flush":0}

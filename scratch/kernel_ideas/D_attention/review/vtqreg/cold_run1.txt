@@ -1,0 +1,58 @@
+== 1790452786.000301.review.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+q in [-0.5, 0.5], kv in [-1, 1], sinks in [-2, 2]
+
+== decode b=1 n_total=640 direct inner=1 COLD (256 MB flush before every call)  (rounds=80 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base pair: dec_score + smwsum                 51.68      51.16      52.12    1.000       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d4             27.24      26.40      27.72    0.527       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d8             27.76      27.28      28.40    0.537       0.0       0.0
+KBJSON {"tag":"decode b=1 n_total=640 direct inner=1 COLD (256 MB flush before every call)","variant":"base pair: dec_score + smwsum","med_us":51.680,"p10_us":51.159,"p90_us":52.119,"ratio":1.0000,"gbps":0.00,"graph":0,"flush":1}
+KBJSON {"tag":"decode b=1 n_total=640 direct inner=1 COLD (256 MB flush before every call)","variant":"attention_dec_fused_vt_qreg_sp_d4","med_us":27.240,"p10_us":26.399,"p90_us":27.719,"ratio":0.5271,"gbps":0.00,"graph":0,"flush":1}
+KBJSON {"tag":"decode b=1 n_total=640 direct inner=1 COLD (256 MB flush before every call)","variant":"attention_dec_fused_vt_qreg_sp_d8","med_us":27.759,"p10_us":27.279,"p90_us":28.400,"ratio":0.5371,"gbps":0.00,"graph":0,"flush":1}
+
+== decode b=1 n_total=640 direct inner=1 warm  (rounds=80 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base pair: dec_score + smwsum                 47.72      47.36      48.04    1.000       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d4             24.84      24.68      25.00    0.521       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d8             25.36      25.20      25.52    0.531       0.0       0.0
+KBJSON {"tag":"decode b=1 n_total=640 direct inner=1 warm","variant":"base pair: dec_score + smwsum","med_us":47.719,"p10_us":47.359,"p90_us":48.039,"ratio":1.0000,"gbps":0.00,"graph":0,"flush":0}
+KBJSON {"tag":"decode b=1 n_total=640 direct inner=1 warm","variant":"attention_dec_fused_vt_qreg_sp_d4","med_us":24.840,"p10_us":24.679,"p90_us":24.999,"ratio":0.5205,"gbps":0.00,"graph":0,"flush":0}
+KBJSON {"tag":"decode b=1 n_total=640 direct inner=1 warm","variant":"attention_dec_fused_vt_qreg_sp_d8","med_us":25.360,"p10_us":25.199,"p90_us":25.520,"ratio":0.5314,"gbps":0.00,"graph":0,"flush":0}
+
+== decode b=4 n_total=640 direct inner=1 COLD (256 MB flush before every call)  (rounds=80 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base pair: dec_score + smwsum                 68.20      67.64      69.32    1.000       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d4             35.00      34.40      35.64    0.513       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d8             35.16      34.16      35.88    0.516       0.0       0.0
+KBJSON {"tag":"decode b=4 n_total=640 direct inner=1 COLD (256 MB flush before every call)","variant":"base pair: dec_score + smwsum","med_us":68.199,"p10_us":67.639,"p90_us":69.319,"ratio":1.0000,"gbps":0.00,"graph":0,"flush":1}
+KBJSON {"tag":"decode b=4 n_total=640 direct inner=1 COLD (256 MB flush before every call)","variant":"attention_dec_fused_vt_qreg_sp_d4","med_us":35.000,"p10_us":34.399,"p90_us":35.639,"ratio":0.5132,"gbps":0.00,"graph":0,"flush":1}
+KBJSON {"tag":"decode b=4 n_total=640 direct inner=1 COLD (256 MB flush before every call)","variant":"attention_dec_fused_vt_qreg_sp_d8","med_us":35.159,"p10_us":34.159,"p90_us":35.879,"ratio":0.5155,"gbps":0.00,"graph":0,"flush":1}
+
+== decode b=4 n_total=640 direct inner=1 warm  (rounds=80 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base pair: dec_score + smwsum                 53.52      53.20      53.84    1.000       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d4             25.24      25.04      25.44    0.472       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d8             25.96      25.80      26.20    0.485       0.0       0.0
+KBJSON {"tag":"decode b=4 n_total=640 direct inner=1 warm","variant":"base pair: dec_score + smwsum","med_us":53.519,"p10_us":53.199,"p90_us":53.839,"ratio":1.0000,"gbps":0.00,"graph":0,"flush":0}
+KBJSON {"tag":"decode b=4 n_total=640 direct inner=1 warm","variant":"attention_dec_fused_vt_qreg_sp_d4","med_us":25.239,"p10_us":25.039,"p90_us":25.439,"ratio":0.4716,"gbps":0.00,"graph":0,"flush":0}
+KBJSON {"tag":"decode b=4 n_total=640 direct inner=1 warm","variant":"attention_dec_fused_vt_qreg_sp_d8","med_us":25.960,"p10_us":25.799,"p90_us":26.199,"ratio":0.4851,"gbps":0.00,"graph":0,"flush":0}
+
+== decode b=8 n_total=640 direct inner=1 COLD (256 MB flush before every call)  (rounds=80 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base pair: dec_score + smwsum                 83.88      82.76      85.28    1.000       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d4             48.48      47.52      49.32    0.578       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d8             49.36      48.64      50.36    0.588       0.0       0.0
+KBJSON {"tag":"decode b=8 n_total=640 direct inner=1 COLD (256 MB flush before every call)","variant":"base pair: dec_score + smwsum","med_us":83.879,"p10_us":82.759,"p90_us":85.278,"ratio":1.0000,"gbps":0.00,"graph":0,"flush":1}
+KBJSON {"tag":"decode b=8 n_total=640 direct inner=1 COLD (256 MB flush before every call)","variant":"attention_dec_fused_vt_qreg_sp_d4","med_us":48.479,"p10_us":47.519,"p90_us":49.319,"ratio":0.5780,"gbps":0.00,"graph":0,"flush":1}
+KBJSON {"tag":"decode b=8 n_total=640 direct inner=1 COLD (256 MB flush before every call)","variant":"attention_dec_fused_vt_qreg_sp_d8","med_us":49.359,"p10_us":48.639,"p90_us":50.359,"ratio":0.5885,"gbps":0.00,"graph":0,"flush":1}
+
+== decode b=8 n_total=640 direct inner=1 warm  (rounds=80 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base pair: dec_score + smwsum                 59.32      59.04      59.68    1.000       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d4             26.48      26.28      26.72    0.446       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d8             27.40      27.24      27.64    0.462       0.0       0.0
+KBJSON {"tag":"decode b=8 n_total=640 direct inner=1 warm","variant":"base pair: dec_score + smwsum","med_us":59.319,"p10_us":59.039,"p90_us":59.679,"ratio":1.0000,"gbps":0.00,"graph":0,"flush":0}
+KBJSON {"tag":"decode b=8 n_total=640 direct inner=1 warm","variant":"attention_dec_fused_vt_qreg_sp_d4","med_us":26.480,"p10_us":26.280,"p90_us":26.720,"ratio":0.4464,"gbps":0.00,"graph":0,"flush":0}
+KBJSON {"tag":"decode b=8 n_total=640 direct inner=1 warm","variant":"attention_dec_fused_vt_qreg_sp_d8","med_us":27.399,"p10_us":27.240,"p90_us":27.639,"ratio":0.4619,"gbps":0.00,"graph":0,"flush":0}

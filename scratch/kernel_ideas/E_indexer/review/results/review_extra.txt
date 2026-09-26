@@ -1,0 +1,128 @@
+[review] keys 235.9 MB (368640 rows x 8 stores)
+CMP ds0 b1 n=17                        n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds0 b1 n=17","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=1007 got=1007   untouched(sentinel) ref=2952192 got=2952192   written per row=1024
+CMP ds0 b1 n=1000                      n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds0 b1 n=1000","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=24 got=24   untouched(sentinel) ref=2952192 got=2952192   written per row=1024
+CMP ds0 b1 n=1023                      n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds0 b1 n=1023","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=1 got=1   untouched(sentinel) ref=2952192 got=2952192   written per row=1024
+CMP ds0 b1 n=1025                      n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds0 b1 n=1025","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=1023 got=1023   untouched(sentinel) ref=2951168 got=2951168   written per row=2048
+CMP ds0 b1 n=4097                      n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds0 b1 n=4097","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=1023 got=1023   untouched(sentinel) ref=2948096 got=2948096   written per row=5120
+CMP ds0 b1 n=100003                    n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds0 b1 n=100003","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=349 got=349   untouched(sentinel) ref=2852864 got=2852864   written per row=100352
+CMP ds0 b1 n=235001                    n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds0 b1 n=235001","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=519 got=519   untouched(sentinel) ref=2717696 got=2717696   written per row=235520
+CMP ds0 b1 n=368640 (max ctx)          n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds0 b1 n=368640 (max ctx)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=0 got=0   untouched(sentinel) ref=2584576 got=2584576   written per row=368640
+CMP ds0 b3 n=100003 uniform            n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds0 b3 n=100003 uniform","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=1047 got=1047   untouched(sentinel) ref=2652160 got=2652160   written per row=100352
+CMP ds0 b8 n=235000 uniform (max prod b) n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds0 b8 n=235000 uniform (max prod b)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=4160 got=4160   untouched(sentinel) ref=1069056 got=1069056   written per row=235520
+CMP ds0 b8 varying n_comp {235000,1,0,17,1024,1025,100003,65536} shuffled bases n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds0 b8 varying n_comp {235000,1,0,17,1024,1025,100003,65536} shuffled bases","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=1481554 got=1481554   untouched(sentinel) ref=1069056 got=1069056   written per row=235520
+CMP ds0 b4 varying n_comp {368640,512,2049,235001} n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds0 b4 varying n_comp {368640,512,2049,235001}","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=868358 got=868358   untouched(sentinel) ref=1478656 got=1478656   written per row=368640
+CMP ds0 b3 NULL keys_base n=4097       n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds0 b3 NULL keys_base n=4097","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=3069 got=3069   untouched(sentinel) ref=2937856 got=2937856   written per row=5120
+CMP ds0 b1 NULL keys_base n=235000     n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds0 b1 NULL keys_base n=235000","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=520 got=520   untouched(sentinel) ref=2717696 got=2717696   written per row=235520
+CMP ds1 b1 n=17                        n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds1 b1 n=17","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=1007 got=1007   untouched(sentinel) ref=2952192 got=2952192   written per row=1024
+CMP ds1 b1 n=1000                      n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds1 b1 n=1000","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=24 got=24   untouched(sentinel) ref=2952192 got=2952192   written per row=1024
+CMP ds1 b1 n=1023                      n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds1 b1 n=1023","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=1 got=1   untouched(sentinel) ref=2952192 got=2952192   written per row=1024
+CMP ds1 b1 n=1025                      n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds1 b1 n=1025","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=1023 got=1023   untouched(sentinel) ref=2951168 got=2951168   written per row=2048
+CMP ds1 b1 n=4097                      n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds1 b1 n=4097","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=1023 got=1023   untouched(sentinel) ref=2948096 got=2948096   written per row=5120
+CMP ds1 b1 n=100003                    n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds1 b1 n=100003","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=349 got=349   untouched(sentinel) ref=2852864 got=2852864   written per row=100352
+CMP ds1 b1 n=235001                    n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds1 b1 n=235001","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=519 got=519   untouched(sentinel) ref=2717696 got=2717696   written per row=235520
+CMP ds1 b1 n=368640 (max ctx)          n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds1 b1 n=368640 (max ctx)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=0 got=0   untouched(sentinel) ref=2584576 got=2584576   written per row=368640
+CMP ds1 b3 n=100003 uniform            n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds1 b3 n=100003 uniform","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=1047 got=1047   untouched(sentinel) ref=2652160 got=2652160   written per row=100352
+CMP ds1 b8 n=235000 uniform (max prod b) n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds1 b8 n=235000 uniform (max prod b)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=4160 got=4160   untouched(sentinel) ref=1069056 got=1069056   written per row=235520
+CMP ds1 b8 varying n_comp {235000,1,0,17,1024,1025,100003,65536} shuffled bases n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds1 b8 varying n_comp {235000,1,0,17,1024,1025,100003,65536} shuffled bases","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=1481554 got=1481554   untouched(sentinel) ref=1069056 got=1069056   written per row=235520
+CMP ds1 b4 varying n_comp {368640,512,2049,235001} n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds1 b4 varying n_comp {368640,512,2049,235001}","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=868358 got=868358   untouched(sentinel) ref=1478656 got=1478656   written per row=368640
+CMP ds1 b3 NULL keys_base n=4097       n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds1 b3 NULL keys_base n=4097","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=3069 got=3069   untouched(sentinel) ref=2937856 got=2937856   written per row=5120
+CMP ds1 b1 NULL keys_base n=235000     n=2953216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"ds1 b1 NULL keys_base n=235000","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+  stamps: -inf ref=520 got=520   untouched(sentinel) ref=2717696 got=2717696   written per row=235520
+REVIEW correctness failures: 0
+
+== review score n=235000 b=8 COLD keys (flush 64MB), direct inner=1  (rounds=40 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         540.88     540.40     541.45    1.000     292.0   28473.6
+cand s2_w8n8_pf_hw                           268.72     268.12     269.36    0.497     587.7   57311.7
+KBJSON {"tag":"review score n=235000 b=8 COLD keys (flush 64MB), direct inner=1","variant":"base batched_mw_e2m1","med_us":540.885,"p10_us":540.405,"p90_us":541.445,"ratio":1.0000,"gbps":292.00,"graph":0,"flush":1}
+KBJSON {"tag":"review score n=235000 b=8 COLD keys (flush 64MB), direct inner=1","variant":"cand s2_w8n8_pf_hw","med_us":268.723,"p10_us":268.123,"p90_us":269.363,"ratio":0.4968,"gbps":587.73,"graph":0,"flush":1}
+
+== review score n=235000 b=8 COLD keys (flush 64MB), GRAPH inner=1  (rounds=40 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         549.72     549.25     550.13    1.000     287.3   28015.8
+cand s2_w8n8_pf_hw                           278.52     277.72     279.28    0.507     567.1   55295.1
+KBJSON {"tag":"review score n=235000 b=8 COLD keys (flush 64MB), GRAPH inner=1","variant":"base batched_mw_e2m1","med_us":549.725,"p10_us":549.246,"p90_us":550.126,"ratio":1.0000,"gbps":287.30,"graph":1,"flush":1}
+KBJSON {"tag":"review score n=235000 b=8 COLD keys (flush 64MB), GRAPH inner=1","variant":"cand s2_w8n8_pf_hw","med_us":278.523,"p10_us":277.722,"p90_us":279.283,"ratio":0.5067,"gbps":567.05,"graph":1,"flush":1}
+
+== review score n=100003 b=3 COLD keys (flush 64MB), direct inner=1  (rounds=40 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         101.28     100.88     101.64    1.000     248.9   24265.9
+cand s2_w8n8_pf_hw                            49.48      48.48      49.80    0.489     509.4   49669.0
+KBJSON {"tag":"review score n=100003 b=3 COLD keys (flush 64MB), direct inner=1","variant":"base batched_mw_e2m1","med_us":101.281,"p10_us":100.881,"p90_us":101.641,"ratio":1.0000,"gbps":248.86,"graph":0,"flush":1}
+KBJSON {"tag":"review score n=100003 b=3 COLD keys (flush 64MB), direct inner=1","variant":"cand s2_w8n8_pf_hw","med_us":49.481,"p10_us":48.481,"p90_us":49.800,"ratio":0.4886,"gbps":509.39,"graph":0,"flush":1}
+
+== review score n=100003 b=3 COLD keys (flush 64MB), GRAPH inner=1  (rounds=40 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         110.88     110.48     111.28    1.000     227.3   22165.0
+cand s2_w8n8_pf_hw                            55.32      54.64      55.72    0.499     455.6   44425.7
+KBJSON {"tag":"review score n=100003 b=3 COLD keys (flush 64MB), GRAPH inner=1","variant":"base batched_mw_e2m1","med_us":110.881,"p10_us":110.481,"p90_us":111.281,"ratio":1.0000,"gbps":227.32,"graph":1,"flush":1}
+KBJSON {"tag":"review score n=100003 b=3 COLD keys (flush 64MB), GRAPH inner=1","variant":"cand s2_w8n8_pf_hw","med_us":55.321,"p10_us":54.641,"p90_us":55.721,"ratio":0.4989,"gbps":455.61,"graph":1,"flush":1}
+
+== review score n=368640 b=1 COLD keys (flush 64MB), direct inner=1  (rounds=40 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         119.24     119.12     119.44    1.000     259.7   25326.0
+cand s2_w8n8_pf_hw                            59.80      59.36      60.08    0.502     517.8   50499.1
+KBJSON {"tag":"review score n=368640 b=1 COLD keys (flush 64MB), direct inner=1","variant":"base batched_mw_e2m1","med_us":119.241,"p10_us":119.121,"p90_us":119.442,"ratio":1.0000,"gbps":259.69,"graph":0,"flush":1}
+KBJSON {"tag":"review score n=368640 b=1 COLD keys (flush 64MB), direct inner=1","variant":"cand s2_w8n8_pf_hw","med_us":59.801,"p10_us":59.360,"p90_us":60.081,"ratio":0.5015,"gbps":517.81,"graph":0,"flush":1}
+
+== review score n=368640 b=1 COLD keys (flush 64MB), GRAPH inner=1  (rounds=40 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         128.96     128.76     129.28    1.000     240.1   23417.0
+cand s2_w8n8_pf_hw                            66.52      66.08      66.80    0.516     465.5   45398.4
+KBJSON {"tag":"review score n=368640 b=1 COLD keys (flush 64MB), GRAPH inner=1","variant":"base batched_mw_e2m1","med_us":128.962,"p10_us":128.761,"p90_us":129.282,"ratio":1.0000,"gbps":240.12,"graph":1,"flush":1}
+KBJSON {"tag":"review score n=368640 b=1 COLD keys (flush 64MB), GRAPH inner=1","variant":"cand s2_w8n8_pf_hw","med_us":66.520,"p10_us":66.081,"p90_us":66.800,"ratio":0.5158,"gbps":465.51,"graph":1,"flush":1}

@@ -1,0 +1,59 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[kb] LDS/CU 65536 B, regs/block 196608, L2 8388608 B
+[kb] shape engram b=64 M=25600 K=6144 G=1 ldx=0 working set ~172 MB
+CMP engram b=64 q8_0_gemm_wmma_i8x     n=1638400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=64 q8_0_gemm_wmma_i8x","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=64 q8_0_gemm_wmma_i8x_grd n=1638400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=64 q8_0_gemm_wmma_i8x_grd","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=64 q8_0_gemm_wmma_i8x_pf2 n=1638400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=64 q8_0_gemm_wmma_i8x_pf2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=64 q8_0_gemm_wmma_i8x_db  n=1638400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=64 q8_0_gemm_wmma_i8x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=64 q8_0_gemm_wmma_i8x_db_grd n=1638400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=64 q8_0_gemm_wmma_i8x_db_grd","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=1 q8_0_gemm_wmma_i8x      n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=1 q8_0_gemm_wmma_i8x","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=1 q8_0_gemm_wmma_i8x_grd  n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=1 q8_0_gemm_wmma_i8x_grd","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=1 q8_0_gemm_wmma_i8x_pf2  n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=1 q8_0_gemm_wmma_i8x_pf2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=1 q8_0_gemm_wmma_i8x_db   n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=1 q8_0_gemm_wmma_i8x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=1 q8_0_gemm_wmma_i8x_db_grd n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=1 q8_0_gemm_wmma_i8x_db_grd","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=17 q8_0_gemm_wmma_i8x     n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=17 q8_0_gemm_wmma_i8x","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=17 q8_0_gemm_wmma_i8x_grd n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=17 q8_0_gemm_wmma_i8x_grd","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=17 q8_0_gemm_wmma_i8x_pf2 n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=17 q8_0_gemm_wmma_i8x_pf2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=17 q8_0_gemm_wmma_i8x_db  n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=1[kb] flush 96 MB per timed block (total device ~268 MB)
+7 q8_0_gemm_wmma_i8x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=17 q8_0_gemm_wmma_i8x_db_grd n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=17 q8_0_gemm_wmma_i8x_db_grd","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=63 q8_0_gemm_wmma_i8x     n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=63 q8_0_gemm_wmma_i8x","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=63 q8_0_gemm_wmma_i8x_grd n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=63 q8_0_gemm_wmma_i8x_grd","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=63 q8_0_gemm_wmma_i8x_pf2 n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=63 q8_0_gemm_wmma_i8x_pf2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=63 q8_0_gemm_wmma_i8x_db  n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=63 q8_0_gemm_wmma_i8x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=63 q8_0_gemm_wmma_i8x_db_grd n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=63 q8_0_gemm_wmma_i8x_db_grd","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== engram b=64 M=25600 K=6144 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemm_wmma_lds_tiled                910.96     905.88    1108.35    1.000     191.1   22100.6
+cand q8_0_gemm_wmma_i8x                     1100.59    1063.19    1110.15    1.208     158.2   18292.5
+cand q8_0_gemm_wmma_i8x_grd                 1084.27    1069.03    1095.99    1.190     160.6   18567.9
+cand q8_0_gemm_wmma_i8x_pf2                 1014.03     972.96    1027.84    1.113     171.7   19854.0
+cand q8_0_gemm_wmma_i8x_db                   509.76     507.84     512.76    0.560     341.6   39494.6
+cand q8_0_gemm_wmma_i8x_db_grd               517.28     515.12     519.92    0.568     336.6   38920.5
+KBJSON {"tag":"engram b=64 M=25600 K=6144 G=1 flush96MB","variant":"base q8_0_gemm_wmma_lds_tiled","med_us":910.955,"p10_us":905.875,"p90_us":1108.354,"ratio":1.0000,"gbps":191.13,"graph":0,"flush":1}
+KBJSON {"tag":"engram b=64 M=25600 K=6144 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_i8x","med_us":1100.595,"p10_us":1063.195,"p90_us":1110.154,"ratio":1.2082,"gbps":158.20,"graph":0,"flush":1}
+KBJSON {"tag":"engram b=64 M=25600 K=6144 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_i8x_grd","med_us":1084.274,"p10_us":1069.034,"p90_us":1095.994,"ratio":1.1903,"gbps":160.58,"graph":0,"flush":1}
+KBJSON {"tag":"engram b=64 M=25600 K=6144 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_i8x_pf2","med_us":1014.035,"p10_us":972.956,"p90_us":1027.835,"ratio":1.1132,"gbps":171.70,"graph":0,"flush":1}
+KBJSON {"tag":"engram b=64 M=25600 K=6144 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_i8x_db","med_us":509.757,"p10_us":507.838,"p90_us":512.757,"ratio":0.5596,"gbps":341.56,"graph":0,"flush":1}
+KBJSON {"tag":"engram b=64 M=25600 K=6144 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_i8x_db_grd","med_us":517.277,"p10_us":515.118,"p90_us":519.918,"ratio":0.5678,"gbps":336.59,"graph":0,"flush":1}

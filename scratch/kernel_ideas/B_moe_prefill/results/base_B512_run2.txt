@@ -1,0 +1,25 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[setup] B=512 n_exp=96 members=756 touched=96 max_group=15 n_wi_exact=96 n_wi_bound=480  mean members/expert=7.9
+ROOFLINE gate+up: 1.215 GB (weights 1.203 GB) -> 5.28 ms at 230 GB/s; 35.7 GFLOP
+ROOFLINE down:    0.619 GB (weights 0.602 GB) -> 2.69 ms at 230 GB/s; 17.8 GFLOP
+SCALE: x4.00 to a full 384-expert layer (this launch touches 96 experts)
+device n_work_items=96 (host expected 96, bound 480)
+SPOTCHECK baseline vs CPU reference: 48 samples, worst rel gate/up=3.409e-06 down=1.370e-06
+SPOTCHECK reduce: worst abs 0.000e+00
+
+== B=512 n_exp=96 members=756 touched=96 cold-weights direct-launch  (rounds=25 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide gate+up (prod grid bound)             8138.74    8087.76    8191.22    1.000     149.2    4383.1
+kwide2 down (prod grid bound)               5618.97    5537.44    5675.97    0.690     110.2    3174.3
+q8_k_quantize pre (B x 20)                   121.92     119.86     124.66    0.015     110.5       0.0
+q8_k_quantize mid (B x 54)                   254.15     250.91     268.61    0.031     143.2       0.0
+group_builder_hetsplit (+memset)               7.90       7.64       8.12    0.001       4.7       0.0
+work_items_builder (+memset)                   7.06       6.76       7.26    0.001       0.7       0.0
+reduce_partials_hetsplit                     403.61     399.09     415.65    0.050     181.9       0.0
+KBJSON {"tag":"B=512 n_exp=96 members=756 touched=96 cold-weights direct-launch","variant":"kwide gate+up (prod grid bound)","med_us":8138.737,"p10_us":8087.760,"p90_us":8191.216,"ratio":1.0000,"gbps":149.24,"graph":0,"flush":0}
+KBJSON {"tag":"B=512 n_exp=96 members=756 touched=96 cold-weights direct-launch","variant":"kwide2 down (prod grid bound)","med_us":5618.974,"p10_us":5537.436,"p90_us":5675.972,"ratio":0.6904,"gbps":110.18,"graph":0,"flush":0}
+KBJSON {"tag":"B=512 n_exp=96 members=756 touched=96 cold-weights direct-launch","variant":"q8_k_quantize pre (B x 20)","med_us":121.918,"p10_us":119.857,"p90_us":124.657,"ratio":0.0150,"gbps":110.53,"graph":0,"flush":0}
+KBJSON {"tag":"B=512 n_exp=96 members=756 touched=96 cold-weights direct-launch","variant":"q8_k_quantize mid (B x 54)","med_us":254.155,"p10_us":250.915,"p90_us":268.614,"ratio":0.0312,"gbps":143.16,"graph":0,"flush":0}
+KBJSON {"tag":"B=512 n_exp=96 members=756 touched=96 cold-weights direct-launch","variant":"group_builder_hetsplit (+memset)","med_us":7.900,"p10_us":7.640,"p90_us":8.120,"ratio":0.0010,"gbps":4.67,"graph":0,"flush":0}
+KBJSON {"tag":"B=512 n_exp=96 members=756 touched=96 cold-weights direct-launch","variant":"work_items_builder (+memset)","med_us":7.060,"p10_us":6.760,"p90_us":7.260,"ratio":0.0009,"gbps":0.65,"graph":0,"flush":0}
+KBJSON {"tag":"B=512 n_exp=96 members=756 touched=96 cold-weights direct-launch","variant":"reduce_partials_hetsplit","med_us":403.611,"p10_us":399.091,"p90_us":415.651,"ratio":0.0496,"gbps":181.86,"graph":0,"flush":0}

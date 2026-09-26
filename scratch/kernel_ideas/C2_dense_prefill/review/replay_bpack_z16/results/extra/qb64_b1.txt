@@ -1,0 +1,9 @@
+CMP qb64 b=1 q8_0_gemv_bpack_z16       n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb64 b=1 q8_0_gemv_bpack_z16","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== qb64 b=1 M=32768 K=1280 G=1 flush96MB  (rounds=20 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemv_batched_warp8                 135.96     135.56     136.40    1.000     328.7     617.0
+cand q8_0_gemv_bpack_z16                     136.68     136.36     137.04    1.005     327.0     613.7
+KBJSON {"tag":"qb64 b=1 M=32768 K=1280 G=1 flush96MB","variant":"base q8_0_gemv_batched_warp8","med_us":135.961,"p10_us":135.561,"p90_us":136.401,"ratio":1.0000,"gbps":328.75,"graph":0,"flush":1}
+KBJSON {"tag":"qb64 b=1 M=32768 K=1280 G=1 flush96MB","variant":"cand q8_0_gemv_bpack_z16","med_us":136.682,"p10_us":136.361,"p90_us":137.042,"ratio":1.0053,"gbps":327.01,"graph":0,"flush":1}

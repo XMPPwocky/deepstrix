@@ -1,0 +1,83 @@
+== 1790451116.000078.D_attention.dgpu rc=0
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[cand] attention_dec_flash2_part1_k32 (flash)
+[cand] attention_dec_flash2_part1_k64 (flash)
+[cand] attention_dec_flash2_part1_k128 (flash)
+
+######## b=1 128+512 gathered (production main)  b=1 n_total_max=640 comp=gathered(512) stride=3072
+CMP dec_score vs mixed_score (prod twin)     n=196608 bitexact=YES bit_diff=0
+KBJSON {"cmp":"dec_score vs mixed_score (prod twin)","bitexact":1,"bit_diff":0}
+REF production pair                          row0 vs f64 CPU: rel_rmse=2.133e-04 max_abs=2.124e-05
+KBJSON {"ref":"production pair","rel_rmse":2.1332e-04,"max_abs":2.1239e-05}
+CMP attention_dec_flash2_part1_k32 out n=32768 bitexact=no bit_diff=31635 nonfinite=0 max_abs=2.618e-05 max_rel=5.747e+00 rmse=5.097e-06 rel_rmse=2.124e-04 worst_idx=22691
+KBJSON {"cmp":"attention_dec_flash2_part1_k32 out","bitexact":0,"bit_diff":31635,"nonfinite":0,"max_abs":2.6184e-05,"rel_rmse":2.1236e-04}
+REF attention_dec_flash2_part1_k32           row0 vs f64 CPU: rel_rmse=1.987e-04 max_abs=2.065e-05
+KBJSON {"ref":"attention_dec_flash2_part1_k32","rel_rmse":1.9868e-04,"max_abs":2.0650e-05}
+CMP attention_dec_flash2_part1_k64 out n=32768 bitexact=no bit_diff=31607 nonfinite=0 max_abs=2.730e-05 max_rel=6.363e+00 rmse=5.047e-06 rel_rmse=2.103e-04 worst_idx=14198
+KBJSON {"cmp":"attention_dec_flash2_part1_k64 out","bitexact":0,"bit_diff":31607,"nonfinite":0,"max_abs":2.7301e-05,"rel_rmse":2.1028e-04}
+REF attention_dec_flash2_part1_k64           row0 vs f64 CPU: rel_rmse=2.043e-04 max_abs=2.516e-05
+KBJSON {"ref":"attention_dec_flash2_part1_k64","rel_rmse":2.0426e-04,"max_abs":2.5161e-05}
+CMP attention_dec_flash2_part1_k128 out n=32768 bitexact=no bit_diff=31590 nonfinite=0 max_abs=2.473e-05 max_rel=6.426e+00 rmse=4.791e-06 rel_rmse=1.996e-04 worst_idx=21575
+KBJSON {"cmp":"attention_dec_flash2_part1_k128 out","bitexact":0,"bit_diff":31590,"nonfinite":0,"max_abs":2.4730e-05,"rel_rmse":1.9962e-04}
+REF attention_dec_flash2_part1_k128          row0 vs f64 CPU: rel_rmse=2.067e-04 max_abs=2.286e-05
+KBJSON {"ref":"attention_dec_flash2_part1_k128","rel_rmse":2.0675e-04,"max_abs":2.2865e-05}
+
+######## b=4 128+512 gathered  b=4 n_total_max=640 comp=gathered(512) stride=3072
+CMP dec_score vs mixed_score (prod twin)     n=786432 bitexact=YES bit_diff=0
+KBJSON {"cmp":"dec_score vs mixed_score (prod twin)","bitexact":1,"bit_diff":0}
+CMP attention_dec_flash2_part1_k32 out n=131072 bitexact=no bit_diff=126595 nonfinite=0 max_abs=3.038e-05 max_rel=5.747e+00 rmse=5.073e-06 rel_rmse=2.118e-04 worst_idx=42400
+KBJSON {"cmp":"attention_dec_flash2_part1_k32 out","bitexact":0,"bit_diff":126595,"nonfinite":0,"max_abs":3.0376e-05,"rel_rmse":2.1181e-04}
+CMP attention_dec_flash2_part1_k64 out n=131072 bitexact=no bit_diff=126378 nonfinite=0 max_abs=2.774e-05 max_rel=6.363e+00 rmse=5.029e-06 rel_rmse=2.100e-04 worst_idx=42400
+KBJSON {"cmp":"attention_dec_flash2_part1_k64 out","bitexact":0,"bit_diff":126378,"nonfinite":0,"max_abs":2.7742e-05,"rel_rmse":2.0999e-04}
+CMP attention_dec_flash2_part1_k128 out n=131072 bitexact=no bit_diff=126082 nonfinite=0 max_abs=2.969e-05 max_rel=6.426e+00 rmse=4.781e-06 rel_rmse=1.996e-04 worst_idx=75235
+KBJSON {"cmp":"attention_dec_flash2_part1_k128 out","bitexact":0,"bit_diff":126082,"nonfinite":0,"max_abs":2.9692e-05,"rel_rmse":1.9964e-04}
+
+######## b=4 mixed tails gathered  b=4 n_total_max=640 comp=gathered(512) stride=3072
+CMP dec_score vs mixed_score (prod twin)     n=786432 bitexact=YES bit_diff=0
+KBJSON {"cmp":"dec_score vs mixed_score (prod twin)","bitexact":1,"bit_diff":0}
+CMP attention_dec_flash2_part1_k32 out n=131072 bitexact=no bit_diff=123636 nonfinite=0 max_abs=7.027e-05 max_rel=1.085e+01 rmse=7.172e-06 rel_rmse=1.573e-04 worst_idx=129535
+KBJSON {"cmp":"attention_dec_flash2_part1_k32 out","bitexact":0,"bit_diff":123636,"nonfinite":0,"max_abs":7.0265e-05,"rel_rmse":1.5733e-04}
+CMP attention_dec_flash2_part1_k64 out n=131072 bitexact=no bit_diff=115270 nonfinite=0 max_abs=2.917e-05 max_rel=1.085e+01 rmse=4.385e-06 rel_rmse=9.620e-05 worst_idx=45926
+KBJSON {"cmp":"attention_dec_flash2_part1_k64 out","bitexact":0,"bit_diff":115270,"nonfinite":0,"max_abs":2.9169e-05,"rel_rmse":9.6197e-05}
+CMP attention_dec_flash2_part1_k128 out n=131072 bitexact=no bit_diff=115254 nonfinite=0 max_abs=2.739e-05 max_rel=9.828e+00 rmse=4.187e-06 rel_rmse=9.186e-05 worst_idx=95937
+KBJSON {"cmp":"attention_dec_flash2_part1_k128 out","bitexact":0,"bit_diff":115254,"nonfinite":0,"max_abs":2.7391e-05,"rel_rmse":9.1858e-05}
+
+######## b=5 n_comp 0 / tiny rows gathered  b=5 n_total_max=639 comp=gathered(512) stride=3072
+CMP dec_score vs mixed_score (prod twin)     n=983040 bitexact=YES bit_diff=0
+KBJSON {"cmp":"dec_score vs mixed_score (prod twin)","bitexact":1,"bit_diff":0}
+CMP attention_dec_flash2_part1_k32 out n=163840 bitexact=no bit_diff=118268 nonfinite=0 max_abs=5.093e-05 max_rel=1.871e+01 rmse=5.503e-06 rel_rmse=3.550e-05 worst_idx=1722
+KBJSON {"cmp":"attention_dec_flash2_part1_k32 out","bitexact":0,"bit_diff":118268,"nonfinite":0,"max_abs":5.0932e-05,"rel_rmse":3.5496e-05}
+CMP attention_dec_flash2_part1_k64 out n=163840 bitexact=no bit_diff=117959 nonfinite=0 max_abs=4.161e-05 max_rel=1.759e+01 rmse=4.922e-06 rel_rmse=3.175e-05 worst_idx=4687
+KBJSON {"cmp":"attention_dec_flash2_part1_k64 out","bitexact":0,"bit_diff":117959,"nonfinite":0,"max_abs":4.1611e-05,"rel_rmse":3.1745e-05}
+CMP attention_dec_flash2_part1_k128 out n=163840 bitexact=no bit_diff=101616 nonfinite=0 max_abs=2.984e-05 max_rel=9.660e+00 rmse=3.212e-06 rel_rmse=2.072e-05 worst_idx=73252
+KBJSON {"cmp":"attention_dec_flash2_part1_k128 out","bitexact":0,"bit_diff":101616,"nonfinite":0,"max_abs":2.9843e-05,"rel_rmse":2.0716e-05}
+
+######## b=3 dense comp store (comp_base_per)  b=3 n_total_max=640 comp=dense(base_per) stride=3072
+CMP dec_score vs mixed_score (prod twin)     n=589824 bitexact=YES bit_diff=0
+KBJSON {"cmp":"dec_score vs mixed_score (prod twin)","bitexact":1,"bit_diff":0}
+CMP attention_dec_flash2_part1_k32 out n=98304 bitexact=no bit_diff=92778 nonfinite=0 max_abs=5.563e-05 max_rel=1.110e+01 rmse=6.965e-06 rel_rmse=1.975e-04 worst_idx=84595
+KBJSON {"cmp":"attention_dec_flash2_part1_k32 out","bitexact":0,"bit_diff":92778,"nonfinite":0,"max_abs":5.5631e-05,"rel_rmse":1.9752e-04}
+CMP attention_dec_flash2_part1_k64 out n=98304 bitexact=no bit_diff=92581 nonfinite=0 max_abs=5.512e-05 max_rel=2.517e+01 rmse=6.433e-06 rel_rmse=1.824e-04 worst_idx=81697
+KBJSON {"cmp":"attention_dec_flash2_part1_k64 out","bitexact":0,"bit_diff":92581,"nonfinite":0,"max_abs":5.5122e-05,"rel_rmse":1.8243e-04}
+CMP attention_dec_flash2_part1_k128 out n=98304 bitexact=no bit_diff=90734 nonfinite=0 max_abs=4.808e-05 max_rel=5.966e+00 rmse=4.951e-06 rel_rmse=1.404e-04 worst_idx=84764
+KBJSON {"cmp":"attention_dec_flash2_part1_k128 out","bitexact":0,"bit_diff":90734,"nonfinite":0,"max_abs":4.8084e-05,"rel_rmse":1.4041e-04}
+
+######## b=8 gathered  b=8 n_total_max=640 comp=gathered(512) stride=3072
+CMP dec_score vs mixed_score (prod twin)     n=1572864 bitexact=YES bit_diff=0
+KBJSON {"cmp":"dec_score vs mixed_score (prod twin)","bitexact":1,"bit_diff":0}
+CMP attention_dec_flash2_part1_k32 out n=262144 bitexact=no bit_diff=251857 nonfinite=0 max_abs=3.835e-05 max_rel=1.334e+01 rmse=5.470e-06 rel_rmse=2.112e-04 worst_idx=115729
+KBJSON {"cmp":"attention_dec_flash2_part1_k32 out","bitexact":0,"bit_diff":251857,"nonfinite":0,"max_abs":3.8352e-05,"rel_rmse":2.1117e-04}
+CMP attention_dec_flash2_part1_k64 out n=262144 bitexact=no bit_diff=251376 nonfinite=0 max_abs=4.097e-05 max_rel=1.273e+01 rmse=5.358e-06 rel_rmse=2.068e-04 worst_idx=114577
+KBJSON {"cmp":"attention_dec_flash2_part1_k64 out","bitexact":0,"bit_diff":251376,"nonfinite":0,"max_abs":4.0969e-05,"rel_rmse":2.0684e-04}
+CMP attention_dec_flash2_part1_k128 out n=262144 bitexact=no bit_diff=250821 nonfinite=0 max_abs=3.300e-05 max_rel=1.165e+01 rmse=4.981e-06 rel_rmse=1.923e-04 worst_idx=93659
+KBJSON {"cmp":"attention_dec_flash2_part1_k128 out","bitexact":0,"bit_diff":250821,"nonfinite":0,"max_abs":3.2999e-05,"rel_rmse":1.9231e-04}
+
+######## b=2 with an EMPTY row (n_total=0)  b=2 n_total_max=640 comp=gathered(512) stride=3072
+CMP dec_score vs mixed_score (prod twin)     n=393216 bitexact=YES bit_diff=0
+KBJSON {"cmp":"dec_score vs mixed_score (prod twin)","bitexact":1,"bit_diff":0}
+CMP attention_dec_flash2_part1_k32 out n=65536 bitexact=no bit_diff=31635 nonfinite=0 max_abs=2.618e-05 max_rel=5.747e+00 rmse=3.604e-06 rel_rmse=2.124e-04 worst_idx=22691
+KBJSON {"cmp":"attention_dec_flash2_part1_k32 out","bitexact":0,"bit_diff":31635,"nonfinite":0,"max_abs":2.6184e-05,"rel_rmse":2.1236e-04}
+CMP attention_dec_flash2_part1_k64 out n=65536 bitexact=no bit_diff=31607 nonfinite=0 max_abs=2.730e-05 max_rel=6.363e+00 rmse=3.569e-06 rel_rmse=2.103e-04 worst_idx=14198
+KBJSON {"cmp":"attention_dec_flash2_part1_k64 out","bitexact":0,"bit_diff":31607,"nonfinite":0,"max_abs":2.7301e-05,"rel_rmse":2.1028e-04}
+CMP attention_dec_flash2_part1_k128 out n=65536 bitexact=no bit_diff=31590 nonfinite=0 max_abs=2.473e-05 max_rel=6.426e+00 rmse=3.388e-06 rel_rmse=1.996e-04 worst_idx=21575
+KBJSON {"cmp":"attention_dec_flash2_part1_k128 out","bitexact":0,"bit_diff":31590,"nonfinite":0,"max_abs":2.4730e-05,"rel_rmse":1.9962e-04}

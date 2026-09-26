@@ -1,0 +1,7 @@
+
+== kv64 b=64 M=512 K=5120 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemv_batched_warp8                  51.88      51.24      64.72    1.000      62.5    6467.6
+cand q8_0_gemv_bpack_z16                      47.40      47.08      47.84    0.914      68.4    7078.8
+KBJSON {"tag":"kv64 b=64 M=512 K=5120 G=1 flush96MB","variant":"base q8_0_gemv_batched_warp8","med_us":51.881,"p10_us":51.241,"p90_us":64.721,"ratio":1.0000,"gbps":62.53,"graph":0,"flush":1}
+KBJSON {"tag":"kv64 b=64 M=512 K=5120 G=1 flush96MB","variant":"cand q8_0_gemv_bpack_z16","med_us":47.401,"p10_us":47.081,"p90_us":47.840,"ratio":0.9136,"gbps":68.44,"graph":0,"flush":1}

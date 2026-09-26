@@ -1,0 +1,342 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP n=16384 b=1 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=00000000/00000000  OK
+CMP n=16384 b=1 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=00000000/00000000  OK
+CMP n=16384 b=1 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=00000000/00000000  OK
+CMP n=16384 b=1 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=00000000/00000000  OK
+CMP n=16384 b=1 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=00000000/00000000  OK
+CMP n=16384 b=1 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=00000000/00000000  OK
+
+== review threshold n=16384 b=1 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                 4.40       4.36       4.46    1.000       7.4       0.0
+cand candidate_threshold_ilp (1024)            4.42       4.37       4.48    1.004       7.4       0.0
+KBJSON {"tag":"review threshold n=16384 b=1 graph inner=5","variant":"base candidate_threshold (256)","med_us":4.400,"p10_us":4.360,"p90_us":4.456,"ratio":1.0000,"gbps":7.45,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=16384 b=1 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":4.416,"p10_us":4.368,"p90_us":4.480,"ratio":1.0036,"gbps":7.42,"graph":1,"flush":0}
+
+== review threshold n=16384 b=1 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                 7.56       7.40       7.76    1.000       4.3       0.0
+cand candidate_threshold_ilp (1024)            7.68       7.44       7.88    1.016       4.3       0.0
+KBJSON {"tag":"review threshold n=16384 b=1 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":7.560,"p10_us":7.400,"p90_us":7.760,"ratio":1.0000,"gbps":4.33,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=16384 b=1 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":7.680,"p10_us":7.440,"p90_us":7.880,"ratio":1.0159,"gbps":4.27,"graph":0,"flush":0}
+CMP n=16385 b=1 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=3eb6969b/3eb6969b  OK
+CMP n=16385 b=1 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=3eb7ffff/3eb7ffff  OK
+CMP n=16385 b=1 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=16385 b=1 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=007fffff/007fffff  OK
+CMP n=16385 b=1 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=403fffff/403fffff  OK
+CMP n=16385 b=1 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=0ccb490f/0ccb490f  OK
+
+== review threshold n=16385 b=1 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                21.96      21.86      22.02    1.000       1.5       0.0
+cand candidate_threshold_ilp (1024)           19.07      19.02      19.11    0.868       1.7       0.0
+KBJSON {"tag":"review threshold n=16385 b=1 graph inner=5","variant":"base candidate_threshold (256)","med_us":21.960,"p10_us":21.864,"p90_us":22.024,"ratio":1.0000,"gbps":1.49,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=16385 b=1 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":19.072,"p10_us":19.016,"p90_us":19.112,"ratio":0.8685,"gbps":1.72,"graph":1,"flush":0}
+
+== review threshold n=16385 b=1 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                25.08      24.88      25.32    1.000       1.3       0.0
+cand candidate_threshold_ilp (1024)           22.28      22.08      22.44    0.888       1.5       0.0
+KBJSON {"tag":"review threshold n=16385 b=1 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":25.080,"p10_us":24.880,"p90_us":25.320,"ratio":1.0000,"gbps":1.31,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=16385 b=1 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":22.280,"p10_us":22.080,"p90_us":22.440,"ratio":0.8884,"gbps":1.47,"graph":0,"flush":0}
+CMP n=16392 b=4 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=3eacd792/3eacd792  OK
+CMP n=16392 b=4 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=3eafffff/3eafffff  OK
+CMP n=16392 b=4 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=16392 b=4 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=007fffff/007fffff  OK
+CMP n=16392 b=4 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=403fffff/403fffff  OK
+CMP n=16392 b=4 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=0ce3fee8/0ce3fee8  OK
+
+== review threshold n=16392 b=4 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                35.04      35.00      35.08    1.000       3.7       0.0
+cand candidate_threshold_ilp (1024)           32.05      32.00      32.10    0.915       4.1       0.0
+KBJSON {"tag":"review threshold n=16392 b=4 graph inner=5","variant":"base candidate_threshold (256)","med_us":35.040,"p10_us":35.000,"p90_us":35.080,"ratio":1.0000,"gbps":3.74,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=16392 b=4 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":32.048,"p10_us":32.000,"p90_us":32.104,"ratio":0.9146,"gbps":4.09,"graph":1,"flush":0}
+
+== review threshold n=16392 b=4 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                38.28      38.12      38.44    1.000       3.4       0.0
+cand candidate_threshold_ilp (1024)           35.24      35.04      35.44    0.921       3.7       0.0
+KBJSON {"tag":"review threshold n=16392 b=4 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":38.280,"p10_us":38.120,"p90_us":38.440,"ratio":1.0000,"gbps":3.43,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=16392 b=4 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":35.240,"p10_us":35.041,"p90_us":35.440,"ratio":0.9206,"gbps":3.72,"graph":0,"flush":0}
+CMP n=17000 b=8 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=3f1dc44d/3f1dc44d  OK
+CMP n=17000 b=8 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=3f0fffff/3f0fffff  OK
+CMP n=17000 b=8 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=17000 b=8 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=007fffff/007fffff  OK
+CMP n=17000 b=8 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=403fffff/403fffff  OK
+CMP n=17000 b=8 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=0d48aee9/0d48aee9  OK
+
+== review threshold n=17000 b=8 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                43.20      43.17      43.24    1.000       6.3       0.0
+cand candidate_threshold_ilp (1024)           40.44      40.38      40.49    0.936       6.7       0.0
+KBJSON {"tag":"review threshold n=17000 b=8 graph inner=5","variant":"base candidate_threshold (256)","med_us":43.200,"p10_us":43.168,"p90_us":43.240,"ratio":1.0000,"gbps":6.30,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=17000 b=8 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":40.440,"p10_us":40.376,"p90_us":40.488,"ratio":0.9361,"gbps":6.73,"graph":1,"flush":0}
+
+== review threshold n=17000 b=8 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                46.36      46.12      46.64    1.000       5.9       0.0
+cand candidate_threshold_ilp (1024)           43.64      43.44      43.88    0.941       6.2       0.0
+KBJSON {"tag":"review threshold n=17000 b=8 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":46.361,"p10_us":46.120,"p90_us":46.640,"ratio":1.0000,"gbps":5.87,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=17000 b=8 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":43.641,"p10_us":43.441,"p90_us":43.880,"ratio":0.9413,"gbps":6.23,"graph":0,"flush":0}
+CMP n=65536 b=1 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0272930/c0272930  OK
+CMP n=65536 b=1 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0200000/c0200000  OK
+CMP n=65536 b=1 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=65536 b=1 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=430094d3/430094d3  OK
+CMP n=65536 b=1 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMP n=65536 b=1 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f204cf2e/f204cf2e  OK
+
+== review threshold n=65536 b=1 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                40.76      40.48      40.94    1.000       3.2       0.0
+cand candidate_threshold_ilp (1024)           26.90      26.86      26.96    0.660       4.9       0.0
+KBJSON {"tag":"review threshold n=65536 b=1 graph inner=5","variant":"base candidate_threshold (256)","med_us":40.760,"p10_us":40.480,"p90_us":40.944,"ratio":1.0000,"gbps":3.22,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=1 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":26.904,"p10_us":26.864,"p90_us":26.960,"ratio":0.6601,"gbps":4.87,"graph":1,"flush":0}
+
+== review threshold n=65536 b=1 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                43.96      43.52      44.36    1.000       3.0       0.0
+cand candidate_threshold_ilp (1024)           30.16      29.92      30.32    0.686       4.3       0.0
+KBJSON {"tag":"review threshold n=65536 b=1 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":43.961,"p10_us":43.520,"p90_us":44.360,"ratio":1.0000,"gbps":2.98,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=1 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":30.160,"p10_us":29.920,"p90_us":30.320,"ratio":0.6861,"gbps":4.35,"graph":0,"flush":0}
+CMP n=65536 b=4 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c02f6a4e/c02f6a4e  OK
+CMP n=65536 b=4 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0400000/c0400000  OK
+CMP n=65536 b=4 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=65536 b=4 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bca7af81/bca7af81  OK
+CMP n=65536 b=4 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMP n=65536 b=4 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f203adaf/f203adaf  OK
+
+== review threshold n=65536 b=4 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                43.26      43.23      43.31    1.000      12.1       0.0
+cand candidate_threshold_ilp (1024)           29.24      29.22      29.29    0.676      17.9       0.0
+KBJSON {"tag":"review threshold n=65536 b=4 graph inner=5","variant":"base candidate_threshold (256)","med_us":43.264,"p10_us":43.232,"p90_us":43.312,"ratio":1.0000,"gbps":12.12,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=4 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":29.240,"p10_us":29.216,"p90_us":29.288,"ratio":0.6759,"gbps":17.93,"graph":1,"flush":0}
+
+== review threshold n=65536 b=4 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                46.52      45.88      46.88    1.000      11.3       0.0
+cand candidate_threshold_ilp (1024)           32.40      32.16      32.60    0.696      16.2       0.0
+KBJSON {"tag":"review threshold n=65536 b=4 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":46.520,"p10_us":45.880,"p90_us":46.880,"ratio":1.0000,"gbps":11.27,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=4 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":32.400,"p10_us":32.161,"p90_us":32.601,"ratio":0.6965,"gbps":16.18,"graph":0,"flush":0}
+CMP n=65536 b=8 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c02de3db/c02de3db  OK
+CMP n=65536 b=8 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0200000/c0200000  OK
+CMP n=65536 b=8 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=65536 b=8 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bcf5c7d2/bcf5c7d2  OK
+CMP n=65536 b=8 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bf000000/bf000000  OK
+CMP n=65536 b=8 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f2076c49/f2076c49  OK
+
+== review threshold n=65536 b=8 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                48.91      48.86      48.95    1.000      21.4       0.0
+cand candidate_threshold_ilp (1024)           34.83      34.78      34.88    0.712      30.1       0.0
+KBJSON {"tag":"review threshold n=65536 b=8 graph inner=5","variant":"base candidate_threshold (256)","med_us":48.912,"p10_us":48.864,"p90_us":48.952,"ratio":1.0000,"gbps":21.44,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=8 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":34.832,"p10_us":34.776,"p90_us":34.880,"ratio":0.7121,"gbps":30.10,"graph":1,"flush":0}
+
+== review threshold n=65536 b=8 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                51.72      51.44      52.00    1.000      20.3       0.0
+cand candidate_threshold_ilp (1024)           37.88      37.68      38.04    0.732      27.7       0.0
+KBJSON {"tag":"review threshold n=65536 b=8 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":51.721,"p10_us":51.440,"p90_us":52.001,"ratio":1.0000,"gbps":20.27,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=8 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":37.881,"p10_us":37.680,"p90_us":38.040,"ratio":0.7324,"gbps":27.68,"graph":0,"flush":0}
+CMP n=100003 b=1 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c07e4a41/c07e4a41  OK
+CMP n=100003 b=1 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0800000/c0800000  OK
+CMP n=100003 b=1 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=100003 b=1 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfe38d75/bfe38d75  OK
+CMP n=100003 b=1 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMP n=100003 b=1 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f2465c18/f2465c18  OK
+
+== review threshold n=100003 b=1 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                50.87      50.44      51.19    1.000       3.9       0.0
+cand candidate_threshold_ilp (1024)           29.38      29.32      29.42    0.577       6.8       0.0
+KBJSON {"tag":"review threshold n=100003 b=1 graph inner=5","variant":"base candidate_threshold (256)","med_us":50.872,"p10_us":50.440,"p90_us":51.192,"ratio":1.0000,"gbps":3.93,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=100003 b=1 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":29.376,"p10_us":29.320,"p90_us":29.424,"ratio":0.5774,"gbps":6.81,"graph":1,"flush":0}
+
+== review threshold n=100003 b=1 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                54.04      53.40      54.72    1.000       3.7       0.0
+cand candidate_threshold_ilp (1024)           32.60      32.40      32.84    0.603       6.1       0.0
+KBJSON {"tag":"review threshold n=100003 b=1 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":54.040,"p10_us":53.401,"p90_us":54.720,"ratio":1.0000,"gbps":3.70,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=100003 b=1 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":32.600,"p10_us":32.400,"p90_us":32.840,"ratio":0.6033,"gbps":6.14,"graph":0,"flush":0}
+CMP n=100003 b=4 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c07883bb/c07883bb  OK
+CMP n=100003 b=4 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0800000/c0800000  OK
+CMP n=100003 b=4 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=100003 b=4 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfde1be5/bfde1be5  OK
+CMP n=100003 b=4 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMP n=100003 b=4 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f242ad4e/f242ad4e  OK
+
+== review threshold n=100003 b=4 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                51.03      50.98      51.12    1.000      15.7       0.0
+cand candidate_threshold_ilp (1024)           30.45      30.39      30.48    0.597      26.3       0.0
+KBJSON {"tag":"review threshold n=100003 b=4 graph inner=5","variant":"base candidate_threshold (256)","med_us":51.032,"p10_us":50.976,"p90_us":51.120,"ratio":1.0000,"gbps":15.68,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=100003 b=4 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":30.448,"p10_us":30.392,"p90_us":30.480,"ratio":0.5966,"gbps":26.28,"graph":1,"flush":0}
+
+== review threshold n=100003 b=4 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                54.40      54.20      54.68    1.000      14.7       0.0
+cand candidate_threshold_ilp (1024)           33.52      33.32      33.72    0.616      23.9       0.0
+KBJSON {"tag":"review threshold n=100003 b=4 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":54.401,"p10_us":54.200,"p90_us":54.681,"ratio":1.0000,"gbps":14.71,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=100003 b=4 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":33.520,"p10_us":33.321,"p90_us":33.721,"ratio":0.6162,"gbps":23.87,"graph":0,"flush":0}
+CMP n=131072 b=8 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c095a397/c095a397  OK
+CMP n=131072 b=8 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0900000/c0900000  OK
+CMP n=131072 b=8 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=131072 b=8 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c02de4b1/c02de4b1  OK
+CMP n=131072 b=8 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMP n=131072 b=8 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f2680c89/f2680c89  OK
+
+== review threshold n=131072 b=8 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                59.96      59.83      60.05    1.000      35.0       0.0
+cand candidate_threshold_ilp (1024)           31.49      31.45      31.53    0.525      66.6       0.0
+KBJSON {"tag":"review threshold n=131072 b=8 graph inner=5","variant":"base candidate_threshold (256)","med_us":59.960,"p10_us":59.833,"p90_us":60.048,"ratio":1.0000,"gbps":34.98,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=131072 b=8 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":31.488,"p10_us":31.448,"p90_us":31.528,"ratio":0.5251,"gbps":66.60,"graph":1,"flush":0}
+
+== review threshold n=131072 b=8 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                63.84      63.04      64.12    1.000      32.9       0.0
+cand candidate_threshold_ilp (1024)           35.00      34.84      35.16    0.548      59.9       0.0
+KBJSON {"tag":"review threshold n=131072 b=8 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":63.840,"p10_us":63.041,"p90_us":64.120,"ratio":1.0000,"gbps":32.85,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=131072 b=8 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":35.000,"p10_us":34.840,"p90_us":35.160,"ratio":0.5482,"gbps":59.92,"graph":0,"flush":0}
+CMP n=235000 b=1 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0bb4c1d/c0bb4c1d  OK
+CMP n=235000 b=1 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0c00000/c0c00000  OK
+CMP n=235000 b=1 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=235000 b=1 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c08c04db/c08c04db  OK
+CMP n=235000 b=1 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMP n=235000 b=1 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f294794f/f294794f  OK
+
+== review threshold n=235000 b=1 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                82.31      81.40      83.06    1.000       5.7       0.0
+cand candidate_threshold_ilp (1024)           31.85      31.78      31.90    0.387      14.8       0.0
+KBJSON {"tag":"review threshold n=235000 b=1 graph inner=5","variant":"base candidate_threshold (256)","med_us":82.313,"p10_us":81.401,"p90_us":83.057,"ratio":1.0000,"gbps":5.71,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":31.848,"p10_us":31.784,"p90_us":31.904,"ratio":0.3869,"gbps":14.76,"graph":1,"flush":0}
+
+== review threshold n=235000 b=1 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                85.76      84.32      87.08    1.000       5.5       0.0
+cand candidate_threshold_ilp (1024)           35.36      35.16      35.60    0.412      13.3       0.0
+KBJSON {"tag":"review threshold n=235000 b=1 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":85.760,"p10_us":84.321,"p90_us":87.080,"ratio":1.0000,"gbps":5.48,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":35.360,"p10_us":35.160,"p90_us":35.601,"ratio":0.4123,"gbps":13.29,"graph":0,"flush":0}
+CMP n=235000 b=4 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0bda67a/c0bda67a  OK
+CMP n=235000 b=4 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0c00000/c0c00000  OK
+CMP n=235000 b=4 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=235000 b=4 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c08acd70/c08acd70  OK
+CMP n=235000 b=4 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMP n=235000 b=4 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f29612c9/f29612c9  OK
+
+== review threshold n=235000 b=4 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                83.11      82.96      83.24    1.000      22.6       0.0
+cand candidate_threshold_ilp (1024)           32.50      32.45      32.54    0.391      57.8       0.0
+KBJSON {"tag":"review threshold n=235000 b=4 graph inner=5","variant":"base candidate_threshold (256)","med_us":83.113,"p10_us":82.961,"p90_us":83.241,"ratio":1.0000,"gbps":22.62,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=4 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":32.504,"p10_us":32.448,"p90_us":32.544,"ratio":0.3911,"gbps":57.84,"graph":1,"flush":0}
+
+== review threshold n=235000 b=4 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                86.92      84.84      87.84    1.000      21.6       0.0
+cand candidate_threshold_ilp (1024)           35.88      35.72      36.04    0.413      52.4       0.0
+KBJSON {"tag":"review threshold n=235000 b=4 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":86.921,"p10_us":84.841,"p90_us":87.840,"ratio":1.0000,"gbps":21.63,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=4 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":35.880,"p10_us":35.720,"p90_us":36.040,"ratio":0.4128,"gbps":52.40,"graph":0,"flush":0}
+CMP n=235000 b=8 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0bde016/c0bde016  OK
+CMP n=235000 b=8 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0c00000/c0c00000  OK
+CMP n=235000 b=8 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=235000 b=8 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c08a44a5/c08a44a5  OK
+CMP n=235000 b=8 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMP n=235000 b=8 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f2964bcc/f2964bcc  OK
+
+== review threshold n=235000 b=8 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                87.71      87.46      87.78    1.000      42.9       0.0
+cand candidate_threshold_ilp (1024)           38.05      38.00      38.10    0.434      98.8       0.0
+KBJSON {"tag":"review threshold n=235000 b=8 graph inner=5","variant":"base candidate_threshold (256)","med_us":87.713,"p10_us":87.457,"p90_us":87.785,"ratio":1.0000,"gbps":42.87,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=8 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":38.048,"p10_us":38.000,"p90_us":38.104,"ratio":0.4338,"gbps":98.82,"graph":1,"flush":0}
+
+== review threshold n=235000 b=8 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                90.64      88.96      90.84    1.000      41.5       0.0
+cand candidate_threshold_ilp (1024)           41.36      41.24      41.52    0.456      90.9       0.0
+KBJSON {"tag":"review threshold n=235000 b=8 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":90.640,"p10_us":88.961,"p90_us":90.841,"ratio":1.0000,"gbps":41.48,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=8 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":41.361,"p10_us":41.240,"p90_us":41.520,"ratio":0.4563,"gbps":90.91,"graph":0,"flush":0}
+CMP n=368640 b=8 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0d7c3e5/c0d7c3e5  OK
+CMP n=368640 b=8 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0e00000/c0e00000  OK
+CMP n=368640 b=8 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=368640 b=8 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0ad1385/c0ad1385  OK
+CMP n=368640 b=8 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMP n=368640 b=8 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f2abd512/f2abd512  OK
+
+== review threshold n=368640 b=8 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               125.87     125.35     126.65    1.000      46.9       0.0
+cand candidate_threshold_ilp (1024)           45.18      45.14      45.22    0.359     130.5       0.0
+KBJSON {"tag":"review threshold n=368640 b=8 graph inner=5","variant":"base candidate_threshold (256)","med_us":125.873,"p10_us":125.345,"p90_us":126.649,"ratio":1.0000,"gbps":46.86,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=368640 b=8 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":45.184,"p10_us":45.136,"p90_us":45.216,"ratio":0.3590,"gbps":130.54,"graph":1,"flush":0}
+
+== review threshold n=368640 b=8 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               129.32     126.72     129.64    1.000      45.6       0.0
+cand candidate_threshold_ilp (1024)           48.44      48.28      48.64    0.375     121.8       0.0
+KBJSON {"tag":"review threshold n=368640 b=8 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":129.321,"p10_us":126.721,"p90_us":129.641,"ratio":1.0000,"gbps":45.61,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=368640 b=8 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":48.440,"p10_us":48.281,"p90_us":48.640,"ratio":0.3746,"gbps":121.76,"graph":0,"flush":0}
+CMP n=65536 b=512 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c02f9113/c02f9113  OK
+CMP n=65536 b=512 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0200000/c0200000  OK
+CMP n=65536 b=512 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=65536 b=512 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bc809cb1/bc809cb1  OK
+CMP n=65536 b=512 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMP n=65536 b=512 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f20789c3/f20789c3  OK
+
+== review threshold n=65536 b=512 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               117.63     117.18     118.06    1.000     570.5       0.0
+cand candidate_threshold_ilp (1024)          240.26     239.42     240.68    2.042     279.3       0.0
+KBJSON {"tag":"review threshold n=65536 b=512 graph inner=5","variant":"base candidate_threshold (256)","med_us":117.633,"p10_us":117.185,"p90_us":118.057,"ratio":1.0000,"gbps":570.49,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=512 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":240.258,"p10_us":239.418,"p90_us":240.682,"ratio":2.0424,"gbps":279.32,"graph":1,"flush":0}
+
+== review threshold n=65536 b=512 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               120.32     119.56     121.24    1.000     557.7       0.0
+cand candidate_threshold_ilp (1024)          241.60     240.40     243.40    2.008     277.8       0.0
+KBJSON {"tag":"review threshold n=65536 b=512 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":120.321,"p10_us":119.561,"p90_us":121.241,"ratio":1.0000,"gbps":557.75,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=512 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":241.602,"p10_us":240.402,"p90_us":243.402,"ratio":2.0080,"gbps":277.77,"graph":0,"flush":0}
+CMP n=235000 b=512 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0bbbf76/c0bbbf76  OK
+CMP n=235000 b=512 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0c00000/c0c00000  OK
+CMP n=235000 b=512 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=235000 b=512 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0881812/c0881812  OK
+CMP n=235000 b=512 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMP n=235000 b=512 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f29531d6/f29531d6  OK
+
+== review threshold n=235000 b=512 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               274.85     273.85     276.66    1.000     875.5       0.0
+cand candidate_threshold_ilp (1024)          313.61     312.14     315.52    1.141     767.3       0.0
+KBJSON {"tag":"review threshold n=235000 b=512 graph inner=5","variant":"base candidate_threshold (256)","med_us":274.850,"p10_us":273.850,"p90_us":276.658,"ratio":1.0000,"gbps":875.53,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=512 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":313.611,"p10_us":312.139,"p90_us":315.523,"ratio":1.1410,"gbps":767.32,"graph":1,"flush":0}
+
+== review threshold n=235000 b=512 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               274.60     271.92     276.64    1.000     876.3       0.0
+cand candidate_threshold_ilp (1024)          314.12     312.32     319.60    1.144     766.1       0.0
+KBJSON {"tag":"review threshold n=235000 b=512 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":274.602,"p10_us":271.922,"p90_us":276.642,"ratio":1.0000,"gbps":876.32,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=512 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":314.123,"p10_us":312.323,"p90_us":319.603,"ratio":1.1439,"gbps":766.07,"graph":0,"flush":0}
+CMP n=235000 b=1024 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0bdfdd3/c0bdfdd3  OK
+CMP n=235000 b=1024 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0c00000/c0c00000  OK
+CMP n=235000 b=1024 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMP n=235000 b=1024 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c088773e/c088773e  OK
+CMP n=235000 b=1024 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMP n=235000 b=1024 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f294d725/f294d725  OK
+
+== review threshold n=235000 b=1024 graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               532.54     530.96     534.32    1.000     903.7       0.0
+cand candidate_threshold_ilp (1024)          599.63     595.83     604.24    1.126     802.6       0.0
+KBJSON {"tag":"review threshold n=235000 b=1024 graph inner=5","variant":"base candidate_threshold (256)","med_us":532.540,"p10_us":530.965,"p90_us":534.324,"ratio":1.0000,"gbps":903.74,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1024 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":599.629,"p10_us":595.829,"p90_us":604.245,"ratio":1.1260,"gbps":802.63,"graph":1,"flush":0}
+
+== review threshold n=235000 b=1024 DIRECT inner=1  (rounds=50 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               528.60     525.04     534.68    1.000     910.5       0.0
+cand candidate_threshold_ilp (1024)          597.08     591.45     598.52    1.130     806.0       0.0
+KBJSON {"tag":"review threshold n=235000 b=1024 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":528.605,"p10_us":525.044,"p90_us":534.684,"ratio":1.0000,"gbps":910.47,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1024 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":597.085,"p10_us":591.445,"p90_us":598.525,"ratio":1.1295,"gbps":806.05,"graph":0,"flush":0}
+SUMMARY correctness: 12654 row-checks, 0 cand-vs-base mismatches

@@ -1,0 +1,85 @@
+CMP qb b=512 q8_0_gemm_wmma_f16x_pf2   n=16777216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=512 q8_0_gemm_wmma_f16x_pf2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=512 q8_0_gemm_wmma_f16x_pf2_w0 n=16777216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=512 q8_0_gemm_wmma_f16x_pf2_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=512 q8_0_gemm_wmma_f16x_db    n=16777216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=512 q8_0_gemm_wmma_f16x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=512 q8_0_gemm_wmma_f16x_db_w0 n=16777216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=512 q8_0_gemm_wmma_f16x_db_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=1 q8_0_gemm_wmma_f16x_pf2     n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=1 q8_0_gemm_wmma_f16x_pf2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=1 q8_0_gemm_wmma_f16x_pf2_w0  n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=1 q8_0_gemm_wmma_f16x_pf2_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=1 q8_0_gemm_wmma_f16x_db      n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=1 q8_0_gemm_wmma_f16x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=1 q8_0_gemm_wmma_f16x_db_w0   n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=1 q8_0_gemm_wmma_f16x_db_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=3 q8_0_gemm_wmma_f16x_pf2     n=98304 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=3 q8_0_gemm_wmma_f16x_pf2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=3 q8_0_gemm_wmma_f16x_pf2_w0  n=98304 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=3 q8_0_gemm_wmma_f16x_pf2_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=3 q8_0_gemm_wmma_f16x_db      n=98304 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=3 q8_0_gemm_wmma_f16x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=3 q8_0_gemm_wmma_f16x_db_w0   n=98304 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=3 q8_0_gemm_wmma_f16x_db_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=17 q8_0_gemm_wmma_f16x_pf2    n=557056 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=17 q8_0_gemm_wmma_f16x_pf2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=17 q8_0_gemm_wmma_f16x_pf2_w0 n=557056 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=17 q8_0_gemm_wmma_f16x_pf2_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=17 q8_0_gemm_wmma_f16x_db     n=557056 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=17 q8_0_gemm_wmma_f16x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=17 q8_0_gemm_wmma_f16x_db_w0  n=557056 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=17 q8_0_gemm_wmma_f16x_db_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=100 q8_0_gemm_wmma_f16x_pf2   n=3276800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=100 q8_0_gemm_wmma_f16x_pf2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=100 q8_0_gemm_wmma_f16x_pf2_w0 n=3276800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=100 q8_0_gemm_wmma_f16x_pf2_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=100 q8_0_gemm_wmma_f16x_db    n=3276800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=100 q8_0_gemm_wmma_f16x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=100 q8_0_gemm_wmma_f16x_db_w0 n=3276800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=100 q8_0_gemm_wmma_f16x_db_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=129 q8_0_gemm_wmma_f16x_pf2   n=4227072 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=129 q8_0_gemm_wmma_f16x_pf2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=129 q8_0_gemm_wmma_f16x_pf2_w0 n=4227072 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=129 q8_0_gemm_wmma_f16x_pf2_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=129 q8_0_gemm_wmma_f16x_db    n=4227072 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=129 q8_0_gemm_wmma_f16x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=129 q8_0_gemm_wmma_f16x_db_w0 n=4227072 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=129 q8_0_gemm_wmma_f16x_db_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=255 q8_0_gemm_wmma_f16x_pf2   n=8355840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=255 q8_0_gemm_wmma_f16x_pf2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=255 q8_0_gemm_wmma_f16x_pf2_w0 n=8355840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=255 q8_0_gemm_wmma_f16x_pf2_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=255 q8_0_gemm_wmma_f16x_db    n=8355840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=255 q8_0_gemm_wmma_f16x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=255 q8_0_gemm_wmma_f16x_db_w0 n=8355840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=255 q8_0_gemm_wmma_f16x_db_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=256 q8_0_gemm_wmma_f16x_pf2   n=8388608 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=256 q8_0_gemm_wmma_f16x_pf2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=256 q8_0_gemm_wmma_f16x_pf2_w0 n=8388608 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=256 q8_0_gemm_wmma_f16x_pf2_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=256 q8_0_gemm_wmma_f16x_db    n=8388608 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=256 q8_0_gemm_wmma_f16x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=256 q8_0_gemm_wmma_f16x_db_w0 n=8388608 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=256 q8_0_gemm_wmma_f16x_db_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=500 q8_0_gemm_wmma_f16x_pf2   n=16384000 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=500 q8_0_gemm_wmma_f16x_pf2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=500 q8_0_gemm_wmma_f16x_pf2_w0 n=16384000 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=500 q8_0_gemm_wmma_f16x_pf2_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=500 q8_0_gemm_wmma_f16x_db    n=16384000 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=500 q8_0_gemm_wmma_f16x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb b=500 q8_0_gemm_wmma_f16x_db_w0 n=16384000 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb b=500 q8_0_gemm_wmma_f16x_db_w0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== qb b=512 M=32768 K=1280 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemm_wmma_f16x                     454.93     444.93     465.60    1.000     248.4   94410.4
+cand q8_0_gemm_wmma_f16x_pf2                 434.24     422.61     442.00    0.955     260.2   98906.8
+cand q8_0_gemm_wmma_f16x_pf2_w0              456.21     446.81     465.16    1.003     247.7   94145.6
+cand q8_0_gemm_wmma_f16x_db                  450.37     442.76     469.40    0.990     250.9   95366.4
+cand q8_0_gemm_wmma_f16x_db_w0               470.45     462.92     490.09    1.034     240.2   91295.8
+KBJSON {"tag":"qb b=512 M=32768 K=1280 G=1 flush96MB","variant":"base q8_0_gemm_wmma_f16x","med_us":454.925,"p10_us":444.925,"p90_us":465.605,"ratio":1.0000,"gbps":248.36,"graph":0,"flush":1}
+KBJSON {"tag":"qb b=512 M=32768 K=1280 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_pf2","med_us":434.244,"p10_us":422.605,"p90_us":442.004,"ratio":0.9545,"gbps":260.19,"graph":0,"flush":1}
+KBJSON {"tag":"qb b=512 M=32768 K=1280 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_pf2_w0","med_us":456.205,"p10_us":446.805,"p90_us":465.165,"ratio":1.0028,"gbps":247.66,"graph":0,"flush":1}
+KBJSON {"tag":"qb b=512 M=32768 K=1280 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_db","med_us":450.365,"p10_us":442.765,"p90_us":469.405,"ratio":0.9900,"gbps":250.87,"graph":0,"flush":1}
+KBJSON {"tag":"qb b=512 M=32768 K=1280 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_db_w0","med_us":470.445,"p10_us":462.925,"p90_us":490.085,"ratio":1.0341,"gbps":240.16,"graph":0,"flush":1}

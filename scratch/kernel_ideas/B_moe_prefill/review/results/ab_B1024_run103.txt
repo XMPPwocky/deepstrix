@@ -1,0 +1,20 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[cand] ./cand_wmma_gfx1151.hsaco
+[setup] B=1024 n_exp=96 members=1555 touched=96 max_group=27 n_wi_exact=96 n_wi_bound=576  mean members/expert=16.2
+ROOFLINE gate+up: 1.227 GB (weights 1.203 GB) -> 5.33 ms at 230 GB/s; 73.4 GFLOP
+ROOFLINE down:    0.638 GB (weights 0.602 GB) -> 2.77 ms at 230 GB/s; 36.7 GFLOP
+SCALE: x4.00 to a full 384-expert layer (this launch touches 96 experts)
+
+== gate+up A/B B=1024 n_exp=96 members=1555 touched=96  (rounds=20 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide gate+up (prod)                       12226.74   12188.92   12269.64    1.000     100.3    6001.1
+gu_wmma gate+up (cand)                      7290.60    7257.36    7361.59    0.596     168.3   10064.2
+KBJSON {"tag":"gate+up A/B B=1024 n_exp=96 members=1555 touched=96","variant":"kwide gate+up (prod)","med_us":12226.736,"p10_us":12188.917,"p90_us":12269.635,"ratio":1.0000,"gbps":100.33,"graph":0,"flush":0}
+KBJSON {"tag":"gate+up A/B B=1024 n_exp=96 members=1555 touched=96","variant":"gu_wmma gate+up (cand)","med_us":7290.596,"p10_us":7257.359,"p90_us":7361.592,"ratio":0.5963,"gbps":168.25,"graph":0,"flush":0}
+
+== down A/B B=1024 n_exp=96 members=1555 touched=96  (rounds=20 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide2 down (prod)                          9735.73    9583.79    9789.48    1.000      65.5    3768.3
+down_wmma (cand)                            3444.31    3335.25    3464.31    0.354     185.1   10651.5
+KBJSON {"tag":"down A/B B=1024 n_exp=96 members=1555 touched=96","variant":"kwide2 down (prod)","med_us":9735.726,"p10_us":9583.794,"p90_us":9789.485,"ratio":1.0000,"gbps":65.49,"graph":0,"flush":0}
+KBJSON {"tag":"down A/B B=1024 n_exp=96 members=1555 touched=96","variant":"down_wmma (cand)","med_us":3444.307,"p10_us":3335.252,"p90_us":3464.306,"ratio":0.3538,"gbps":185.10,"graph":0,"flush":0}

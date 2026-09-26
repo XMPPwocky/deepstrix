@@ -1,0 +1,4 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[kb] LDS/CU 65536 B, regs/block 196608, L2 8388608 B
+[kb] shape engram b=127 M=25600 K=6144 G=1 ldx=0 working set ~185 MB
+[kb] flush 96 MB per timed block (total device ~281 MB)

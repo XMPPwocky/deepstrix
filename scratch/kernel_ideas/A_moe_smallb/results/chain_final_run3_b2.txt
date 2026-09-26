@@ -1,0 +1,60 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[h] pool: 16 experts x 18.8 MB = 301 MB on device
+[h] b=2 E=4 ppr=3: members/call=6.0 distinct experts/call=4 n_wi exact=4 bound=12
+[h] distinct experts actually read per call (avg over 8 selections): 3.75
+base out: 10240/10240 nonzero, 0 nonfinite, out[0..3]=132.093 -64.9207 195.69 -131.129
+CMP twin(hetsplit b=1 per row) mid vs base n=27648 bitexact=no bit_diff=9159 nonfinite=0 max_abs=2.670e-05 max_rel=5.319e-04 rmse=1.710e-06 rel_rmse=1.861e-07 worst_idx=25587
+KBJSON {"cmp":"twin(hetsplit b=1 per row) mid vs base","bitexact":0,"bit_diff":9159,"nonfinite":0,"max_abs":2.6703e-05,"rel_rmse":1.8609e-07}
+CMP twin(hetsplit b=1 per row) out vs base n=10240 bitexact=no bit_diff=7324 nonfinite=0 max_abs=2.441e-04 max_rel=1.337e-03 rmse=3.276e-05 rel_rmse=1.003e-07 worst_idx=5160
+KBJSON {"cmp":"twin(hetsplit b=1 per row) out vs base","bitexact":0,"bit_diff":7324,"nonfinite":0,"max_abs":2.4414e-04,"rel_rmse":1.0033e-07}
+CMP wl.wl mid vs base                  n=27648 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wl.wl mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP wl.wl partials vs base             n=61440 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wl.wl partials vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP wl.wl out vs base                  n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wl.wl out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP wl.wl out over 8 selections: worst bit_diff=0 worst rel_rmse=0.000e+00
+CMP wl_dn2.wl mid vs base              n=27648 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wl_dn2.wl mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP wl_dn2.wl partials vs base         n=61440 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wl_dn2.wl partials vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP wl_dn2.wl out vs base              n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wl_dn2.wl out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP wl_dn2.wl out over 8 selections: worst bit_diff=0 worst rel_rmse=0.000e+00
+CMP wl_c8dn2.wl.c8 mid vs base         n=27648 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wl_c8dn2.wl.c8 mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP wl_c8dn2.wl.c8 partials vs base    n=61440 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wl_c8dn2.wl.c8 partials vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP wl_c8dn2.wl.c8 out vs base         n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wl_c8dn2.wl.c8 out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP wl_c8dn2.wl.c8 out over 8 selections: worst bit_diff=0 worst rel_rmse=0.000e+00
+CMP dn2_r2 mid vs base                 n=27648 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"dn2_r2 mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP dn2_r2 partials vs base            n=61440 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"dn2_r2 partials vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP dn2_r2 out vs base                 n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"dn2_r2 out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP dn2_r2 out over 8 selections: worst bit_diff=0 worst rel_rmse=0.000e+00
+CMP kwide_c8.c8 mid vs base            n=27648 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"kwide_c8.c8 mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP kwide_c8.c8 partials vs base       n=61440 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"kwide_c8.c8 partials vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP kwide_c8.c8 out vs base            n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"kwide_c8.c8 out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP kwide_c8.c8 out over 8 selections: worst bit_diff=0 worst rel_rmse=0.000e+00
+
+== b=2 E=4 ppr=3 P=16 gbound=384 bound-grid cold-rotating  (rounds=40 inner=8 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base chain (builders+kwide+q8k+kwide2+reduce)     403.77     399.58     405.93    1.000     174.6    1051.8
+cand wl.wl                                   412.35     407.56     414.41    1.021     171.0    1029.9
+cand wl_dn2.wl                               391.60     388.96     393.72    0.970     180.0    1084.5
+cand wl_c8dn2.wl.c8                          376.54     374.49     378.85    0.933     187.2    1127.8
+cand dn2_r2                                  385.82     382.60     387.43    0.956     182.7    1100.7
+cand kwide_c8.c8                             402.55     398.89     405.01    0.997     175.1    1055.0
+KBJSON {"tag":"b=2 E=4 ppr=3 P=16 gbound=384 bound-grid cold-rotating","variant":"base chain (builders+kwide+q8k+kwide2+reduce)","med_us":403.767,"p10_us":399.582,"p90_us":405.932,"ratio":1.0000,"gbps":174.61,"graph":1,"flush":0}
+KBJSON {"tag":"b=2 E=4 ppr=3 P=16 gbound=384 bound-grid cold-rotating","variant":"cand wl.wl","med_us":412.351,"p10_us":407.562,"p90_us":414.406,"ratio":1.0213,"gbps":170.98,"graph":1,"flush":0}
+KBJSON {"tag":"b=2 E=4 ppr=3 P=16 gbound=384 bound-grid cold-rotating","variant":"cand wl_dn2.wl","med_us":391.597,"p10_us":388.957,"p90_us":393.717,"ratio":0.9699,"gbps":180.04,"graph":1,"flush":0}
+KBJSON {"tag":"b=2 E=4 ppr=3 P=16 gbound=384 bound-grid cold-rotating","variant":"cand wl_c8dn2.wl.c8","med_us":376.538,"p10_us":374.488,"p90_us":378.852,"ratio":0.9326,"gbps":187.24,"graph":1,"flush":0}
+KBJSON {"tag":"b=2 E=4 ppr=3 P=16 gbound=384 bound-grid cold-rotating","variant":"cand dn2_r2","med_us":385.822,"p10_us":382.597,"p90_us":387.427,"ratio":0.9556,"gbps":182.73,"graph":1,"flush":0}
+KBJSON {"tag":"b=2 E=4 ppr=3 P=16 gbound=384 bound-grid cold-rotating","variant":"cand kwide_c8.c8","med_us":402.552,"p10_us":398.887,"p90_us":405.007,"ratio":0.9970,"gbps":175.14,"graph":1,"flush":0}
+roofline: 3.75 distinct experts x 18.8 MB = 70.5 MB/call -> 329.5 us at 214 GB/s (305.2 us at 231)

@@ -1,0 +1,122 @@
+== 1790451481.000108.C2_dense_prefill.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+CMP kv64 b=64 q8_0_gemv_bpack_z16      n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP kv64 b=64 q8_0_gemv_bpack64_warp8  n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP kv64 b=64 f16x_at_b                n=32768 bitexact=no bit_diff=32765 nonfinite=0 max_abs=9.105e-02 max_rel=6.541e+00 rmse=1.695e-02 rel_rmse=2.949e-04 worst_idx=21982
+CMP kv64 b=64 f16x_bn64_at_b           n=32768 bitexact=no bit_diff=32765 nonfinite=0 max_abs=9.105e-02 max_rel=6.541e+00 rmse=1.695e-02 rel_rmse=2.949e-04 worst_idx=21982
+CMP kv64 b=1 q8_0_gemv_bpack_z16       n=512 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP kv64 b=1 q8_0_gemv_bpack64_warp8   n=512 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP kv64 b=1 f16x_at_b                 n=512 bitexact=no bit_diff=512 nonfinite=0 max_abs=5.405e-02 max_rel=2.796e-01 rmse=1.774e-02 rel_rmse=3.046e-04 worst_idx=34
+CMP kv64 b=1 f16x_bn64_at_b            n=512 bitexact=no bit_diff=512 nonfinite=0 max_abs=5.405e-02 max_rel=2.796e-01 rmse=1.774e-02 rel_rmse=3.046e-04 worst_idx=34
+CMP kv64 b=5 q8_0_gemv_bpack_z16       n=2560 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP kv64 b=5 q8_0_gemv_bpack64_warp8   n=2560 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP kv64 b=5 f16x_at_b                 n=2560 bitexact=no bit_diff=2559 nonfinite=0 max_abs=5.965e-02 max_rel=2.380e+00 rmse=1.698e-02 rel_rmse=2.950e-04 worst_idx=831
+CMP kv64 b=5 f16x_bn64_at_b            n=2560 bitexact=no bit_diff=2559 nonfinite=0 max_abs=5.965e-02 max_rel=2.380e+00 rmse=1.698e-02 rel_rmse=2.950e-04 worst_idx=831
+CMP kv64 b=17 q8_0_gemv_bpack_z16      n=8704 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP kv64 b=17 q8_0_gemv_bpack64_warp8  n=8704 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP kv64 b=17 f16x_at_b                n=8704 bitexact=no bit_diff=8702 nonfinite=0 max_abs=6.624e-02 max_rel=5.856e+00 rmse=1.674e-02 rel_rmse=2.941e-04 worst_idx=3233
+CMP kv64 b=17 f16x_bn64_at_b           n=8704 bitexact=no bit_diff=8702 nonfinite=0 max_abs=6.624e-02 max_rel=5.856e+00 rmse=1.674e-02 rel_rmse=2.941e-04 worst_idx=3233
+CMP kv64 b=33 q8_0_gemv_bpack_z16      n=16896 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP kv64 b=33 q8_0_gemv_bpack64_warp8  n=16896 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP kv64 b=33 f16x_at_b                n=16896 bitexact=no bit_diff=16893 nonfinite=0 max_abs=6.762e-02 max_rel=5.856e+00 rmse=1.682e-02 rel_rmse=2.946e-04 worst_idx=14791
+CMP kv64 b=33 f16x_bn64_at_b           n=16896 bitexact=no bit_diff=16893 nonfinite=0 max_abs=6.762e-02 max_rel=5.856e+00 rmse=1.682e-02 rel_rmse=2.946e-04 worst_idx=14791
+CMP kv64 b=63 q8_0_gemv_bpack_z16      n=32256 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP kv64 b=63 q8_0_gemv_bpack64_warp8  n=32256 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP kv64 b=63 f16x_at_b                n=32256 bitexact=no bit_diff=32253 nonfinite=0 max_abs=9.105e-02 max_rel=6.541e+00 rmse=1.696e-02 rel_rmse=2.948e-04 worst_idx=21982
+CMP kv64 b=63 f16x_bn64_at_b           n=32256 bitexact=no bit_diff=32253 nonfinite=0 max_abs=9.105e-02 max_rel=6.541e+00 rmse=1.696e-02 rel_rmse=2.948e-04 worst_idx=21982
+== kv64 b=64 M=512 K=5120 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+base q8_0_gemv_batched_warp8                  52.72      52.24      65.68    1.000      61.5    6364.6
+cand q8_0_gemv_bpack_z16                      47.52      47.24      47.80    0.901      68.3    7061.0
+cand q8_0_gemv_bpack64_warp8                 189.16     188.60     189.84    3.588      17.1    1773.9
+cand f16x_at_b                                97.04      96.60      97.60    1.841      33.4    3457.8
+cand f16x_bn64_at_b                           64.00      63.32      64.40    1.214      50.7    5242.9
+CMP qb64 b=64 q8_0_gemv_bpack_z16      n=2097152 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP qb64 b=64 q8_0_gemv_bpack64_warp8  n=2097152 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP qb64 b=64 f16x_at_b                n=2097152 bitexact=no bit_diff=2096920 nonfinite=0 max_abs=4.647e-02 max_rel=1.270e+02 rmse=8.382e-03 rel_rmse=2.924e-04 worst_idx=1613331
+CMP qb64 b=64 f16x_bn64_at_b           n=2097152 bitexact=no bit_diff=2096920 nonfinite=0 max_abs=4.647e-02 max_rel=1.270e+02 rmse=8.382e-03 rel_rmse=2.924e-04 worst_idx=1613331
+CMP qb64 b=1 q8_0_gemv_bpack_z16       n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP qb64 b=1 q8_0_gemv_bpack64_warp8   n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP qb64 b=1 f16x_at_b                 n=32768 bitexact=no bit_diff=32766 nonfinite=0 max_abs=3.663e-02 max_rel=6.385e+00 rmse=8.367e-03 rel_rmse=2.957e-04 worst_idx=21287
+CMP qb64 b=1 f16x_bn64_at_b            n=32768 bitexact=no bit_diff=32766 nonfinite=0 max_abs=3.663e-02 max_rel=6.385e+00 rmse=8.367e-03 rel_rmse=2.957e-04 worst_idx=21287
+CMP qb64 b=5 q8_0_gemv_bpack_z16       n=163840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP qb64 b=5 q8_0_gemv_bpack64_warp8   n=163840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP qb64 b=5 f16x_at_b                 n=163840 bitexact=no bit_diff=163822 nonfinite=0 max_abs=3.991e-02 max_rel=8.254e+01 rmse=8.519e-03 rel_rmse=2.917e-04 worst_idx=160626
+CMP qb64 b=5 f16x_bn64_at_b            n=163840 bitexact=no bit_diff=163822 nonfinite=0 max_abs=3.991e-02 max_rel=8.254e+01 rmse=8.519e-03 rel_rmse=2.917e-04 worst_idx=160626
+CMP qb64 b=17 q8_0_gemv_bpack_z16      n=557056 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP qb64 b=17 q8_0_gemv_bpack64_warp8  n=557056 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP qb64 b=17 f16x_at_b                n=557056 bitexact=no bit_diff=556997 nonfinite=0 max_abs=4.646e-02 max_rel=8.254e+01 rmse=8.419e-03 rel_rmse=2.943e-04 worst_idx=238701
+CMP qb64 b=17 f16x_bn64_at_b           n=557056 bitexact=no bit_diff=556997 nonfinite=0 max_abs=4.646e-02 max_rel=8.254e+01 rmse=8.419e-03 rel_rmse=2.943e-04 worst_idx=238701
+CMP qb64 b=33 q8_0_gemv_bpack_z16      n=1081344 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP qb64 b=33 q8_0_gemv_bpack64_warp8  n=1081344 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP qb64 b=33 f16x_at_b                n=1081344 bitexact=no bit_diff=1081232 nonfinite=0 max_abs=4.646e-02 max_rel=8.254e+01 rmse=8.381e-03 rel_rmse=2.933e-04 worst_idx=238701
+CMP qb64 b=33 f16x_bn64_at_b           n=1081344 bitexact=no bit_diff=1081232 nonfinite=0 max_abs=4.646e-02 max_rel=8.254e+01 rmse=8.381e-03 rel_rmse=2.933e-04 worst_idx=238701
+CMP qb64 b=63 q8_0_gemv_bpack_z16      n=2064384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP qb64 b=63 q8_0_gemv_bpack64_warp8  n=2064384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP qb64 b=63 f16x_at_b                n=2064384 bitexact=no bit_diff=2064155 nonfinite=0 max_abs=4.647e-02 max_rel=1.270e+02 rmse=8.379e-03 rel_rmse=2.925e-04 worst_idx=1613331
+CMP qb64 b=63 f16x_bn64_at_b           n=2064384 bitexact=no bit_diff=2064155 nonfinite=0 max_abs=4.647e-02 max_rel=1.270e+02 rmse=8.379e-03 rel_rmse=2.925e-04 worst_idx=1613331
+== qb64 b=64 M=32768 K=1280 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+base q8_0_gemv_batched_warp8                1518.61    1515.05    1524.13    1.000      34.9    3535.3
+cand q8_0_gemv_bpack_z16                     590.76     587.20     597.08    0.389      89.8    9087.7
+cand q8_0_gemv_bpack64_warp8                1028.25    1022.57    1034.09    0.677      51.6    5221.2
+cand f16x_at_b                               269.04     264.80     271.24    0.177     197.1   19954.9
+cand f16x_bn64_at_b                          372.04     369.60     375.60    0.245     142.6   14430.4
+CMP woa64 b=64 q8_0_grouped_gemv_bpack_z16 n=524288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP woa64 b=64 q8_0_grouped_gemv_bpack64 n=524288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP woa64 b=64 f16x_at_b               n=524288 bitexact=no bit_diff=524232 nonfinite=0 max_abs=7.494e-02 max_rel=1.317e+02 rmse=1.513e-02 rel_rmse=2.926e-04 worst_idx=457344
+CMP woa64 b=64 f16x_bn64_at_b          n=524288 bitexact=no bit_diff=524232 nonfinite=0 max_abs=7.494e-02 max_rel=1.317e+02 rmse=1.513e-02 rel_rmse=2.926e-04 worst_idx=457344
+CMP woa64 b=1 q8_0_grouped_gemv_bpack_z16 n=8192 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP woa64 b=1 q8_0_grouped_gemv_bpack64 n=8192 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP woa64 b=1 f16x_at_b                n=8192 bitexact=no bit_diff=8188 nonfinite=0 max_abs=5.752e-02 max_rel=1.850e+01 rmse=1.505e-02 rel_rmse=2.950e-04 worst_idx=7258
+CMP woa64 b=1 f16x_bn64_at_b           n=8192 bitexact=no bit_diff=8188 nonfinite=0 max_abs=5.752e-02 max_rel=1.850e+01 rmse=1.505e-02 rel_rmse=2.950e-04 worst_idx=7258
+CMP woa64 b=5 q8_0_grouped_gemv_bpack_z16 n=40960 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP woa64 b=5 q8_0_grouped_gemv_bpack64 n=40960 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP woa64 b=5 f16x_at_b                n=40960 bitexact=no bit_diff=40952 nonfinite=0 max_abs=6.596e-02 max_rel=1.850e+01 rmse=1.507e-02 rel_rmse=2.939e-04 worst_idx=17648
+CMP woa64 b=5 f16x_bn64_at_b           n=40960 bitexact=no bit_diff=40952 nonfinite=0 max_abs=6.596e-02 max_rel=1.850e+01 rmse=1.507e-02 rel_rmse=2.939e-04 worst_idx=17648
+CMP woa64 b=17 q8_0_grouped_gemv_bpack_z16 n=139264 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP woa64 b=17 q8_0_grouped_gemv_bpack64 n=139264 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP woa64 b=17 f16x_at_b               n=139264 bitexact=no bit_diff=139246 nonfinite=0 max_abs=7.033e-02 max_rel=3.411e+01 rmse=1.519e-02 rel_rmse=2.926e-04 worst_idx=87887
+CMP woa64 b=17 f16x_bn64_at_b          n=139264 bitexact=no bit_diff=139246 nonfinite=0 max_abs=7.033e-02 max_rel=3.411e+01 rmse=1.519e-02 rel_rmse=2.926e-04 worst_idx=87887
+CMP woa64 b=33 q8_0_grouped_gemv_bpack_z16 n=270336 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP woa64 b=33 q8_0_grouped_gemv_bpack64 n=270336 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP woa64 b=33 f16x_at_b               n=270336 bitexact=no bit_diff=270311 nonfinite=0 max_abs=7.087e-02 max_rel=3.411e+01 rmse=1.515e-02 rel_rmse=2.923e-04 worst_idx=177388
+CMP woa64 b=33 f16x_bn64_at_b          n=270336 bitexact=no bit_diff=270311 nonfinite=0 max_abs=7.087e-02 max_rel=3.411e+01 rmse=1.515e-02 rel_rmse=2.923e-04 worst_idx=177388
+CMP woa64 b=63 q8_0_grouped_gemv_bpack_z16 n=516096 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP woa64 b=63 q8_0_grouped_gemv_bpack64 n=516096 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP woa64 b=63 f16x_at_b               n=516096 bitexact=no bit_diff=516041 nonfinite=0 max_abs=7.494e-02 max_rel=1.317e+02 rmse=1.513e-02 rel_rmse=2.926e-04 worst_idx=457344
+CMP woa64 b=63 f16x_bn64_at_b          n=516096 bitexact=no bit_diff=516041 nonfinite=0 max_abs=7.494e-02 max_rel=1.317e+02 rmse=1.513e-02 rel_rmse=2.926e-04 worst_idx=457344
+== woa64 b=64 M=1024 K=4096 G=8 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+base q8_0_grouped_gemv_batched              1203.69    1201.37    1208.85    1.000      33.1    3568.2
+cand q8_0_grouped_gemv_bpack_z16             535.48     526.44     541.52    0.445      74.4    8020.7
+cand q8_0_grouped_gemv_bpack64               673.40     668.00     680.05    0.559      59.2    6378.0
+cand f16x_at_b                               168.76     164.52     176.48    0.140     236.1   25450.0
+cand f16x_bn64_at_b                          147.52     141.48     149.92    0.123     270.1   29114.3
+CMP wob64 b=64 q8_0_gemv_bpack_z16     n=327680 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP wob64 b=64 q8_0_gemv_bpack64_warp8 n=327680 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP wob64 b=64 f16x_at_b               n=327680 bitexact=no bit_diff=327646 nonfinite=0 max_abs=1.031e-01 max_rel=1.692e+02 rmse=2.142e-02 rel_rmse=2.934e-04 worst_idx=111614
+CMP wob64 b=64 f16x_bn64_at_b          n=327680 bitexact=no bit_diff=327646 nonfinite=0 max_abs=1.031e-01 max_rel=1.692e+02 rmse=2.142e-02 rel_rmse=2.934e-04 worst_idx=111614
+CMP wob64 b=1 q8_0_gemv_bpack_z16      n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP wob64 b=1 q8_0_gemv_bpack64_warp8  n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP wob64 b=1 f16x_at_b                n=5120 bitexact=no bit_diff=5120 nonfinite=0 max_abs=8.405e-02 max_rel=6.463e-01 rmse=2.212e-02 rel_rmse=2.963e-04 worst_idx=413
+CMP wob64 b=1 f16x_bn64_at_b           n=5120 bitexact=no bit_diff=5120 nonfinite=0 max_abs=8.405e-02 max_rel=6.463e-01 rmse=2.212e-02 rel_rmse=2.963e-04 worst_idx=413
+CMP wob64 b=5 q8_0_gemv_bpack_z16      n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP wob64 b=5 q8_0_gemv_bpack64_warp8  n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP wob64 b=5 f16x_at_b                n=25600 bitexact=no bit_diff=25598 nonfinite=0 max_abs=9.182e-02 max_rel=8.921e+00 rmse=2.132e-02 rel_rmse=2.954e-04 worst_idx=25281
+CMP wob64 b=5 f16x_bn64_at_b           n=25600 bitexact=no bit_diff=25598 nonfinite=0 max_abs=9.182e-02 max_rel=8.921e+00 rmse=2.132e-02 rel_rmse=2.954e-04 worst_idx=25281
+CMP wob64 b=17 q8_0_gemv_bpack_z16     n=87040 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP wob64 b=17 q8_0_gemv_bpack64_warp8 n=87040 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP wob64 b=17 f16x_at_b               n=87040 bitexact=no bit_diff=87034 nonfinite=0 max_abs=1.018e-01 max_rel=1.692e+02 rmse=2.129e-02 rel_rmse=2.951e-04 worst_idx=56452
+CMP wob64 b=17 f16x_bn64_at_b          n=87040 bitexact=no bit_diff=87034 nonfinite=0 max_abs=1.018e-01 max_rel=1.692e+02 rmse=2.129e-02 rel_rmse=2.951e-04 worst_idx=56452
+CMP wob64 b=33 q8_0_gemv_bpack_z16     n=168960 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP wob64 b=33 q8_0_gemv_bpack64_warp8 n=168960 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP wob64 b=33 f16x_at_b               n=168960 bitexact=no bit_diff=168950 nonfinite=0 max_abs=1.031e-01 max_rel=1.692e+02 rmse=2.144e-02 rel_rmse=2.942e-04 worst_idx=111614
+CMP wob64 b=33 f16x_bn64_at_b          n=168960 bitexact=no bit_diff=168950 nonfinite=0 max_abs=1.031e-01 max_rel=1.692e+02 rmse=2.144e-02 rel_rmse=2.942e-04 worst_idx=111614
+CMP wob64 b=63 q8_0_gemv_bpack_z16     n=322560 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP wob64 b=63 q8_0_gemv_bpack64_warp8 n=322560 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP wob64 b=63 f16x_at_b               n=322560 bitexact=no bit_diff=322527 nonfinite=0 max_abs=1.031e-01 max_rel=1.692e+02 rmse=2.142e-02 rel_rmse=2.935e-04 worst_idx=111614
+CMP wob64 b=63 f16x_bn64_at_b          n=322560 bitexact=no bit_diff=322527 nonfinite=0 max_abs=1.031e-01 max_rel=1.692e+02 rmse=2.142e-02 rel_rmse=2.935e-04 worst_idx=111614
+== wob64 b=64 M=5120 K=8192 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+base q8_0_gemv_batched_warp8                1492.49    1489.81    1497.81    1.000      31.1    3597.1
+cand q8_0_gemv_bpack_z16                     538.92     534.96     541.84    0.361      86.1    9961.9
+cand q8_0_gemv_bpack64_warp8                 984.61     980.33     987.85    0.660      47.1    5452.6
+cand f16x_at_b                               232.52     227.28     238.12    0.156     199.5   23089.0
+cand f16x_bn64_at_b                          206.84     205.56     208.52    0.139     224.3   25955.7

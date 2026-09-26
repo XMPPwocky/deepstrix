@@ -1,0 +1,27 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[setup] B=37 n_exp=96 members=62 touched=49 max_group=3 n_wi_exact=49 n_wi_bound=222  mean members/expert=0.6
+CMP down_wmma vs kwide2 B=37 n_rows=16 random mid n=1136640 bitexact=no bit_diff=832 nonfinite=0 max_abs=1.465e-03 max_rel=5.439e-04 rmse=8.575e-06 rel_rmse=6.949e-10 worst_idx=487
+KBJSON {"cmp":"down_wmma vs kwide2 B=37 n_rows=16 random mid","bitexact":0,"bit_diff":832,"nonfinite":0,"max_abs":1.4648e-03,"rel_rmse":6.9489e-10}
+WRITTEN prod=992 cand=992 expected=992 (ok)
+CMP down_wmma vs kwide2 B=37 n_rows=5008 random mid n=1136640 bitexact=no bit_diff=256453 nonfinite=0 max_abs=4.883e-03 max_rel=1.050e-02 rmse=1.582e-04 rel_rmse=1.497e-08 worst_idx=404593
+KBJSON {"cmp":"down_wmma vs kwide2 B=37 n_rows=5008 random mid","bitexact":0,"bit_diff":256453,"nonfinite":0,"max_abs":4.8828e-03,"rel_rmse":1.4967e-08}
+WRITTEN prod=310496 cand=310496 expected=310496 (ok)
+CMP down_wmma vs kwide2 B=37 n_rows=5104 random mid n=1136640 bitexact=no bit_diff=261373 nonfinite=0 max_abs=4.883e-03 max_rel=1.050e-02 rmse=1.596e-04 rel_rmse=1.516e-08 worst_idx=412273
+KBJSON {"cmp":"down_wmma vs kwide2 B=37 n_rows=5104 random mid","bitexact":0,"bit_diff":261373,"nonfinite":0,"max_abs":4.8828e-03,"rel_rmse":1.5157e-08}
+WRITTEN prod=316448 cand=316448 expected=316448 (ok)
+CMP down_wmma vs kwide2 B=37 n_rows=5120 random mid n=1136640 bitexact=no bit_diff=262196 nonfinite=0 max_abs=5.859e-03 max_rel=1.050e-02 rmse=1.599e-04 rel_rmse=1.520e-08 worst_idx=414719
+KBJSON {"cmp":"down_wmma vs kwide2 B=37 n_rows=5120 random mid","bitexact":0,"bit_diff":262196,"nonfinite":0,"max_abs":5.8594e-03,"rel_rmse":1.5197e-08}
+WRITTEN prod=317440 cand=317440 expected=317440 (ok)
+CMP down_wmma vs kwide2 B=37 n_rows=16 DC-offset mid n=1136640 bitexact=no bit_diff=848 nonfinite=0 max_abs=4.578e-05 max_rel=2.646e-05 rmse=3.363e-07 rel_rmse=2.725e-11 worst_idx=304
+KBJSON {"cmp":"down_wmma vs kwide2 B=37 n_rows=16 DC-offset mid","bitexact":0,"bit_diff":848,"nonfinite":0,"max_abs":4.5776e-05,"rel_rmse":2.7253e-11}
+WRITTEN prod=992 cand=992 expected=992 (ok)
+CMP down_wmma vs kwide2 B=37 n_rows=5008 DC-offset mid n=1136640 bitexact=no bit_diff=257098 nonfinite=0 max_abs=1.526e-04 max_rel=1.517e+00 rmse=6.000e-06 rel_rmse=5.700e-10 worst_idx=650605
+KBJSON {"cmp":"down_wmma vs kwide2 B=37 n_rows=5008 DC-offset mid","bitexact":0,"bit_diff":257098,"nonfinite":0,"max_abs":1.5259e-04,"rel_rmse":5.7004e-10}
+WRITTEN prod=310496 cand=310496 expected=310496 (ok)
+CMP down_wmma vs kwide2 B=37 n_rows=5104 DC-offset mid n=1136640 bitexact=no bit_diff=262000 nonfinite=0 max_abs=1.526e-04 max_rel=1.517e+00 rmse=6.055e-06 rel_rmse=5.774e-10 worst_idx=662989
+KBJSON {"cmp":"down_wmma vs kwide2 B=37 n_rows=5104 DC-offset mid","bitexact":0,"bit_diff":262000,"nonfinite":0,"max_abs":1.5259e-04,"rel_rmse":5.7741e-10}
+WRITTEN prod=316448 cand=316448 expected=316448 (ok)
+CMP down_wmma vs kwide2 B=37 n_rows=5120 DC-offset mid n=1136640 bitexact=no bit_diff=262822 nonfinite=0 max_abs=1.526e-04 max_rel=1.517e+00 rmse=6.063e-06 rel_rmse=5.785e-10 worst_idx=665053
+KBJSON {"cmp":"down_wmma vs kwide2 B=37 n_rows=5120 DC-offset mid","bitexact":0,"bit_diff":262822,"nonfinite":0,"max_abs":1.5259e-04,"rel_rmse":5.7852e-10}
+WRITTEN prod=317440 cand=317440 expected=317440 (ok)
+tail mode rc=0

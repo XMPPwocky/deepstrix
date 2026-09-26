@@ -1,0 +1,76 @@
+== 1790451704.000160.C2_dense_prefill.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+CMP engram b=128 i8x_r1                n=3276800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=128 r1c_i8x               n=3276800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=128 r1c_i8x_unc           n=3276800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=128 r1c_i8x_aonc          n=3276800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=128 r1c_i8x_both          n=3276800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=128 q8_0_gemm_wmma_i8x    n=3276800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=128 q8_0_gemm_wmma_i8x_db n=3276800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 i8x_r1                  n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 r1c_i8x                 n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 r1c_i8x_unc             n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 r1c_i8x_aonc            n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 r1c_i8x_both            n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 q8_0_gemm_wmma_i8x      n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 q8_0_gemm_wmma_i8x_db   n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 i8x_r1                 n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 r1c_i8x                n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 r1c_i8x_unc            n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 r1c_i8x_aonc           n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 r1c_i8x_both           n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 q8_0_gemm_wmma_i8x     n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 q8_0_gemm_wmma_i8x_db  n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 i8x_r1                 n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 r1c_i8x                n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 r1c_i8x_unc            n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 r1c_i8x_aonc           n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 r1c_i8x_both           n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 q8_0_gemm_wmma_i8x     n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 q8_0_gemm_wmma_i8x_db  n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== engram b=128 M=25600 K=6144 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+base q8_0_gemm_wmma_lds_tiled               2060.66    1636.14    2377.06    1.000      87.9   19540.0
+cand i8x_r1                                  674.37     670.69     678.81    0.327     268.6   59708.3
+cand r1c_i8x                                1031.45    1020.77    1065.17    0.501     175.6   39037.5
+cand r1c_i8x_unc                            1035.17    1026.29    1070.13    0.502     175.0   38897.3
+cand r1c_i8x_aonc                           1121.05    1112.29    1130.45    0.544     161.6   35917.4
+cand r1c_i8x_both                           1116.93    1108.69    1126.77    0.542     162.1   36050.0
+cand q8_0_gemm_wmma_i8x                     1116.77    1107.09    1123.29    0.542     162.2   36055.1
+cand q8_0_gemm_wmma_i8x_db                   513.57     505.69     522.89    0.249     352.6   78403.4
+CMP engram b=64 i8x_r1                 n=1638400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=64 r1c_i8x                n=1638400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=64 r1c_i8x_unc            n=1638400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=64 r1c_i8x_aonc           n=1638400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=64 r1c_i8x_both           n=1638400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=64 q8_0_gemm_wmma_i8x     n=1638400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=64 q8_0_gemm_wmma_i8x_db  n=1638400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 i8x_r1                  n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 r1c_i8x                 n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 r1c_i8x_unc             n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 r1c_i8x_aonc            n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 r1c_i8x_both            n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 q8_0_gemm_wmma_i8x      n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 q8_0_gemm_wmma_i8x_db   n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 i8x_r1                 n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 r1c_i8x                n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 r1c_i8x_unc            n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 r1c_i8x_aonc           n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 r1c_i8x_both           n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 q8_0_gemm_wmma_i8x     n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 q8_0_gemm_wmma_i8x_db  n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 i8x_r1                 n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 r1c_i8x                n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 r1c_i8x_unc            n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 r1c_i8x_aonc           n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 r1c_i8x_both           n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 q8_0_gemm_wmma_i8x     n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 q8_0_gemm_wmma_i8x_db  n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== engram b=64 M=25600 K=6144 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+base q8_0_gemm_wmma_lds_tiled                889.89     888.13    1170.37    1.000     195.7   22623.8
+cand i8x_r1                                  622.69     618.45     625.57    0.700     279.6   32332.0
+cand r1c_i8x                                 982.61     947.89    1021.45    1.104     177.2   20489.0
+cand r1c_i8x_unc                             993.21     956.97    1032.73    1.116     175.3   20270.3
+cand r1c_i8x_aonc                           1072.33    1057.89    1081.57    1.205     162.4   18774.7
+cand r1c_i8x_both                           1078.29    1071.29    1084.77    1.212     161.5   18670.9
+cand q8_0_gemm_wmma_i8x                     1077.97    1064.21    1086.65    1.211     161.5   18676.4
+cand q8_0_gemm_wmma_i8x_db                   484.08     482.24     486.05    0.544     359.7   41589.1

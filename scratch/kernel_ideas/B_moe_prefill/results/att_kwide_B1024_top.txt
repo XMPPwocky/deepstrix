@@ -1,1 +1,34 @@
-no rows parsed from prof_att_kwide/stats_ui_output_agent_31204_dispatch_24.csv
+rows=959 hitcount=9163632 latency=79866828 stall=44365122 idle=36263218 (stall/latency=55.5%)
+
+# top 30 by stall
+ %stall    %lat        hit          lat        stall  insn
+  29.03   16.14       9340     12887411     12878071  s_waitcnt vmcnt(3)
+   4.23    2.35       3760      1878316      1874556  s_waitcnt vmcnt(14)
+   2.45    1.37       9340      1096905      1087565  s_waitcnt vmcnt(0)
+   2.11    1.22      35480       971446       935966  s_waitcnt lgkmcnt(2)
+   1.69    0.98      35480       783140       747660  s_waitcnt lgkmcnt(0)
+   1.43    0.81      15396       648054       632658  s_waitcnt lgkmcnt(0)
+   1.29    0.73       9340       582344       573004  s_waitcnt lgkmcnt(0)
+   1.11    0.66      35480       528989       493509  s_waitcnt lgkmcnt(0)
+   1.09    0.65      35480       520127       484647  s_waitcnt lgkmcnt(0)
+   0.87    0.50      15396       401345       385949  s_waitcnt lgkmcnt(0)
+   0.87    0.53      35480       420678       385198  v_mul_f32_e32 v96, v80, v98
+   0.84    0.51      35480       409968       374488  v_add_nc_u32_e32 v91, 0x800, v91
+   0.83    0.51      35480       405603       370123  v_movreld_b32_e32 v1, v100
+   0.80    0.49      35480       392133       356653  v_movrels_b32_e32 v98, v1
+   0.79    0.46      15396       367488       352092  s_waitcnt lgkmcnt(0)
+   0.79    0.48      35480       387015       351535  v_movrels_b32_e32 v97, v33
+   0.79    0.46      15396       365639       350243  s_waitcnt lgkmcnt(0)
+   0.78    0.47      35480       379344       343864  v_movrels_b32_e32 v100, v1
+   0.77    0.47      35480       376566       341086  v_movrels_b32_e32 v100, v1
+   0.77    0.45      15396       355844       340448  s_waitcnt lgkmcnt(0)
+   0.77    0.44      15396       354820       339424  s_waitcnt lgkmcnt(0)
+   0.73    0.45      35480       359164       323684  v_dot4_i32_iu8 v96, v81, v92, 0 neg_lo:[1,1,0]
+   0.73    0.45      35480       358184       322704  v_dot4_i32_iu8 v101, v81, v92, 0 neg_lo:[1,1,0]
+   0.72    0.45      35480       355861       320381  v_dot4_i32_iu8 v102, v81, v92, 0 neg_lo:[1,1,0]
+   0.69    0.40      12040       318802       306762  s_waitcnt lgkmcnt(1)
+   0.69    0.43      35480       340844       305364  v_mul_f32_e32 v103, v80, v96
+   0.66    0.39      15396       308828       293432  s_waitcnt lgkmcnt(0)
+   0.65    0.40      35480       323004       287524  v_dot4_i32_iu8 v102, v81, v92, 0 neg_lo:[1,1,0]
+   0.63    0.37      15396       292731       277335  s_waitcnt lgkmcnt(0)
+   0.62    0.39      35480       308869       273389  v_mul_f32_e32 v94, v80, v99

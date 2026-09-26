@@ -1,0 +1,14 @@
+W20260926 19:35:51.860347 130515799915136 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.067380 sec
+W20260926 19:35:51.860511 130515799915136 simple_timer.cpp:55] [rocprofv3] './harness prof_down 1024 96' ::     0.000000 sec
+W20260926 19:35:51.881863 130515799915136 tool.cpp:2424] HSA version 1.18.0 initialized (instance=0)
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[setup] B=1024 n_exp=96 members=1570 touched=96 max_group=27 n_wi_exact=96 n_wi_bound=576  mean members/expert=16.4
+W20260926 19:35:52.368595 130515799915136 simple_timer.cpp:55] [rocprofv3] './harness prof_down 1024 96' ::     0.508084 sec
+E20260926 19:35:52.369781 130515799915136 output_stream.cpp:111] Opened result file: prof_pmcA_down/run_counter_collection.csv
+E20260926 19:35:52.371520 130515799915136 output_stream.cpp:111] Opened result file: prof_pmcA_down/run_agent_info.csv
+W20260926 19:35:52.371698 130515799915136 simple_timer.cpp:55] [rocprofv3] output generation ::     0.002940 sec
+W20260926 19:35:52.371738 130515799915136 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.002983 sec
+ROOFLINE gate+up: 1.227 GB (weights 1.203 GB) -> 5.33 ms at 230 GB/s; 74.1 GFLOP
+ROOFLINE down:    0.638 GB (weights 0.602 GB) -> 2.77 ms at 230 GB/s; 37.0 GFLOP
+SCALE: x4.00 to a full 384-expert layer (this launch touches 96 experts)
+prof down done (6 launches)

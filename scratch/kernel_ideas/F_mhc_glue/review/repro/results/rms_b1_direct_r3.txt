@@ -1,0 +1,50 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP rms_fast vs prod n=5120 b=1 seed0  n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"rms_fast vs prod n=5120 b=1 seed0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP rms_fast vs prod n=1280 b=1 seed0  n=1280 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"rms_fast vs prod n=1280 b=1 seed0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP rms_fast vs prod n=512 b=1 seed0   n=512 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"rms_fast vs prod n=512 b=1 seed0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP rms_fast vs prod n=4864 b=1 seed0  n=4864 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"rms_fast vs prod n=4864 b=1 seed0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP rms_fast(1) vs rms_norm_weighted seed0 n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"rms_fast(1) vs rms_norm_weighted seed0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP rms_fast vs prod n=5120 b=1 seed1  n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"rms_fast vs prod n=5120 b=1 seed1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP rms_fast vs prod n=1280 b=1 seed1  n=1280 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"rms_fast vs prod n=1280 b=1 seed1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP rms_fast vs prod n=512 b=1 seed1   n=512 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"rms_fast vs prod n=512 b=1 seed1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP rms_fast vs prod n=4864 b=1 seed1  n=4864 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"rms_fast vs prod n=4864 b=1 seed1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP rms_fast(1) vs rms_norm_weighted seed1 n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"rms_fast(1) vs rms_norm_weighted seed1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP rms_fast vs prod n=5120 b=1 seed2  n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"rms_fast vs prod n=5120 b=1 seed2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP rms_fast vs prod n=1280 b=1 seed2  n=1280 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"rms_fast vs prod n=1280 b=1 seed2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP rms_fast vs prod n=512 b=1 seed2   n=512 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"rms_fast vs prod n=512 b=1 seed2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP rms_fast vs prod n=4864 b=1 seed2  n=4864 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"rms_fast vs prod n=4864 b=1 seed2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP rms_fast(1) vs rms_norm_weighted seed2 n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"rms_fast(1) vs rms_norm_weighted seed2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== rms_norm_weighted b=1 warm direct  (rounds=40 inner=20 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+rms_norm_weighted_batched (b) n=5120          10.77      10.76      10.79    1.000       5.7       0.0
+cand rms_fast (b) n=5120                       4.42       4.40       4.46    0.411      13.9       0.0
+rms_norm_weighted_batched (b) n=1280           5.25       5.23       5.29    0.488       2.9       0.0
+cand rms_fast (b) n=1280                       3.73       3.71       3.75    0.346       4.1       0.0
+rms_norm_weighted_batched (b) n=512            4.16       4.15       4.18    0.386       1.5       0.0
+cand rms_fast (b) n=512                        3.60       3.59       3.62    0.335       1.7       0.0
+head rms_norm_weighted 1 row (1)              10.78      10.75      10.81    1.001       5.7       0.0
+cand rms_fast 1 row (1)                        4.42       4.41       4.43    0.410      13.9       0.0
+KBJSON {"tag":"rms_norm_weighted b=1 warm direct","variant":"rms_norm_weighted_batched (b) n=5120","med_us":10.772,"p10_us":10.756,"p90_us":10.794,"ratio":1.0000,"gbps":5.70,"graph":0,"flush":0}
+KBJSON {"tag":"rms_norm_weighted b=1 warm direct","variant":"cand rms_fast (b) n=5120","med_us":4.424,"p10_us":4.404,"p90_us":4.458,"ratio":0.4107,"gbps":13.89,"graph":0,"flush":0}
+KBJSON {"tag":"rms_norm_weighted b=1 warm direct","variant":"rms_norm_weighted_batched (b) n=1280","med_us":5.254,"p10_us":5.234,"p90_us":5.292,"ratio":0.4877,"gbps":2.92,"graph":0,"flush":0}
+KBJSON {"tag":"rms_norm_weighted b=1 warm direct","variant":"cand rms_fast (b) n=1280","med_us":3.730,"p10_us":3.712,"p90_us":3.748,"ratio":0.3463,"gbps":4.12,"graph":0,"flush":0}
+KBJSON {"tag":"rms_norm_weighted b=1 warm direct","variant":"rms_norm_weighted_batched (b) n=512","med_us":4.162,"p10_us":4.146,"p90_us":4.182,"ratio":0.3864,"gbps":1.48,"graph":0,"flush":0}
+KBJSON {"tag":"rms_norm_weighted b=1 warm direct","variant":"cand rms_fast (b) n=512","med_us":3.604,"p10_us":3.590,"p90_us":3.622,"ratio":0.3346,"gbps":1.70,"graph":0,"flush":0}
+KBJSON {"tag":"rms_norm_weighted b=1 warm direct","variant":"head rms_norm_weighted 1 row (1)","med_us":10.778,"p10_us":10.750,"p90_us":10.808,"ratio":1.0006,"gbps":5.70,"graph":0,"flush":0}
+KBJSON {"tag":"rms_norm_weighted b=1 warm direct","variant":"cand rms_fast 1 row (1)","med_us":4.418,"p10_us":4.408,"p90_us":4.434,"ratio":0.4101,"gbps":13.91,"graph":0,"flush":0}

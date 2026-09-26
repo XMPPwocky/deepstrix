@@ -1,0 +1,26 @@
+== 1790451481.000107.C2_dense_prefill.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+CMP engram b=128 i8x_r1                n=3276800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=128 q8_0_gemm_wmma_i8x_db n=3276800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 i8x_r1                  n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 q8_0_gemm_wmma_i8x_db   n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 i8x_r1                 n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 q8_0_gemm_wmma_i8x_db  n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 i8x_r1                 n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 q8_0_gemm_wmma_i8x_db  n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== engram b=128 M=25600 K=6144 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+base q8_0_gemm_wmma_lds_tiled               1682.97    1662.89    2376.74    1.000     107.6   23925.1
+cand i8x_r1                                  679.72     673.92     684.08    0.404     266.4   59237.7
+cand q8_0_gemm_wmma_i8x_db                   511.40     504.96     517.64    0.304     354.1   78734.9
+CMP engram b=64 i8x_r1                 n=1638400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=64 q8_0_gemm_wmma_i8x_db  n=1638400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 i8x_r1                  n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=1 q8_0_gemm_wmma_i8x_db   n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 i8x_r1                 n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=17 q8_0_gemm_wmma_i8x_db  n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 i8x_r1                 n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+CMP engram b=63 q8_0_gemm_wmma_i8x_db  n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== engram b=64 M=25600 K=6144 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+base q8_0_gemm_wmma_lds_tiled                902.29     898.73     913.05    1.000     193.0   22312.9
+cand i8x_r1                                  626.40     622.40     630.12    0.694     278.0   32140.1
+cand q8_0_gemm_wmma_i8x_db                   484.28     481.64     487.72    0.537     359.5   41572.0

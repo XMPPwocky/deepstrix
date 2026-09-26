@@ -1,0 +1,15 @@
+KFLAGS_V41=-O3 -DDEEPSTRIX_V41=1 -DMHC_N_EMBD=5120 -DMHC_HC_DIM=20480 -DROUTER_MAX_EXPERTS=512
+-rw-r--r-- 1 claude-code users  10011 Sep 26 19:46 base_down_gfx1151.hsaco
+-rw-r--r-- 1 claude-code users   2671 Sep 26 19:46 base_grp_gfx1151.hsaco
+-rw-r--r-- 1 claude-code users  18635 Sep 26 19:46 base_pair_gfx1151.hsaco
+-rw-r--r-- 1 claude-code users  13275 Sep 26 19:46 base_q2k_gfx1151.hsaco
+-rw-r--r-- 1 claude-code users   3152 Sep 26 19:46 base_q8k_gfx1151.hsaco
+-rw-r--r-- 1 claude-code users   2835 Sep 26 19:46 base_wi_gfx1151.hsaco
+-rw-r--r-- 1 claude-code users  18185 Sep 26 19:46 cand_kwide_c8_gfx1151.hsaco
+-rw-r--r-- 1 claude-code users  26065 Sep 26 19:46 cand_wl_gfx1151.hsaco
+-rwxr-xr-x 1 claude-code users 122056 Sep 26 19:47 harness_gfx1151
+base_pair identical to engineer's
+base_down identical to engineer's
+cand_wl_gfx1151.hsaco ../cand_wl_gfx1151.hsaco differ: byte 9, line 1
+cand_wl DIFFERS from engineer's
+build ok

@@ -1,0 +1,245 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CORR prod b=1                             rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,102,128 w0=0.250868
+CORR prod b=1                             rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.257211
+CORR prod b=1                             ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,4,46 w0=0.25
+CORR prod b=1                             allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prod b=1                             allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR prod b=1                             extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,153 w0=0.25
+CORR prod b=1                             negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR prod b=1                             bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,108,134 w0=0.258321
+CORR prod b=1                             ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prod b=3 (odd)                       rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,102,128 w0=0.250868
+CORR prod b=3 (odd)                       rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.257211
+CORR prod b=3 (odd)                       ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,4,46 w0=0.25
+CORR prod b=3 (odd)                       allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prod b=3 (odd)                       allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR prod b=3 (odd)                       extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,153 w0=0.25
+CORR prod b=3 (odd)                       negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR prod b=3 (odd)                       bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,108,134 w0=0.258321
+CORR prod b=3 (odd)                       ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prod b=4                             rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,102,128 w0=0.250868
+CORR prod b=4                             rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.257211
+CORR prod b=4                             ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,4,46 w0=0.25
+CORR prod b=4                             allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prod b=4                             allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR prod b=4                             extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,153 w0=0.25
+CORR prod b=4                             negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR prod b=4                             bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,108,134 w0=0.258321
+CORR prod b=4                             ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prod b=5 (odd)                       rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,102,128 w0=0.250868
+CORR prod b=5 (odd)                       rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.257211
+CORR prod b=5 (odd)                       ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,4,46 w0=0.25
+CORR prod b=5 (odd)                       allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prod b=5 (odd)                       allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR prod b=5 (odd)                       extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,153 w0=0.25
+CORR prod b=5 (odd)                       negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR prod b=5 (odd)                       bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,108,134 w0=0.258321
+CORR prod b=5 (odd)                       ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prod b=8 (max decode)                rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,102,128 w0=0.250868
+CORR prod b=8 (max decode)                rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.257211
+CORR prod b=8 (max decode)                ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,4,46 w0=0.25
+CORR prod b=8 (max decode)                allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prod b=8 (max decode)                allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR prod b=8 (max decode)                extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,153 w0=0.25
+CORR prod b=8 (max decode)                negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR prod b=8 (max decode)                bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,108,134 w0=0.258321
+CORR prod b=8 (max decode)                ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prod b=512 (prefill w/ prior)        rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,102,128 w0=0.250868
+CORR prod b=512 (prefill w/ prior)        rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.257211
+CORR prod b=512 (prefill w/ prior)        ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,4,46 w0=0.25
+CORR prod b=512 (prefill w/ prior)        allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prod b=512 (prefill w/ prior)        allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR prod b=512 (prefill w/ prior)        extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,153 w0=0.25
+CORR prod b=512 (prefill w/ prior)        negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR prod b=512 (prefill w/ prior)        bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,108,134 w0=0.258321
+CORR prod b=512 (prefill w/ prior)        ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR plain b=1 (prefill form)             rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,340,207 w0=0.250692
+CORR plain b=1 (prefill form)             rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.255618
+CORR plain b=1 (prefill form)             ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,3,4 w0=0.25
+CORR plain b=1 (prefill form)             allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR plain b=1 (prefill form)             allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR plain b=1 (prefill form)             extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,336 w0=0.25
+CORR plain b=1 (prefill form)             negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR plain b=1 (prefill form)             bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,336,108 w0=0.254402
+CORR plain b=1 (prefill form)             ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR plain b=7                            rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,340,207 w0=0.250692
+CORR plain b=7                            rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.255618
+CORR plain b=7                            ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,3,4 w0=0.25
+CORR plain b=7                            allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR plain b=7                            allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR plain b=7                            extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,336 w0=0.25
+CORR plain b=7                            negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR plain b=7                            bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,336,108 w0=0.254402
+CORR plain b=7                            ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR plain b=1024                         rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,340,207 w0=0.250692
+CORR plain b=1024                         rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.255618
+CORR plain b=1024                         ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,3,4 w0=0.25
+CORR plain b=1024                         allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR plain b=1024                         allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR plain b=1024                         extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,336 w0=0.25
+CORR plain b=1024                         negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR plain b=1024                         bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,336,108 w0=0.254402
+CORR plain b=1024                         ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR plain + orig + range b=4             rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,340,207 w0=0.250692
+CORR plain + orig + range b=4             rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.255618
+CORR plain + orig + range b=4             ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,3,4 w0=0.25
+CORR plain + orig + range b=4             allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR plain + orig + range b=4             allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR plain + orig + range b=4             extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,336 w0=0.25
+CORR plain + orig + range b=4             negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR plain + orig + range b=4             bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,336,108 w0=0.254402
+CORR plain + orig + range b=4             ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR plain + alts=4 + alt_w b=4           rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,340,207 w0=0.250692
+CORR plain + alts=4 + alt_w b=4           rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.255618
+CORR plain + alts=4 + alt_w b=4           ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,3,4 w0=0.25
+CORR plain + alts=4 + alt_w b=4           allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR plain + alts=4 + alt_w b=4           allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR plain + alts=4 + alt_w b=4           extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,336 w0=0.25
+CORR plain + alts=4 + alt_w b=4           negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR plain + alts=4 + alt_w b=4           bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,336,108 w0=0.254402
+CORR plain + alts=4 + alt_w b=4           ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prior + alts=2 + alt_w b=4           rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,102,128 w0=0.250868
+CORR prior + alts=2 + alt_w b=4           rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.257211
+CORR prior + alts=2 + alt_w b=4           ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,4,46 w0=0.25
+CORR prior + alts=2 + alt_w b=4           allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prior + alts=2 + alt_w b=4           allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR prior + alts=2 + alt_w b=4           extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,153 w0=0.25
+CORR prior + alts=2 + alt_w b=4           negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR prior + alts=2 + alt_w b=4           bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,108,134 w0=0.258321
+CORR prior + alts=2 + alt_w b=4           ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prior + alts=2 no alt_w b=3          rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,102,128 w0=0.250868
+CORR prior + alts=2 no alt_w b=3          rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.257211
+CORR prior + alts=2 no alt_w b=3          ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,4,46 w0=0.25
+CORR prior + alts=2 no alt_w b=3          allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prior + alts=2 no alt_w b=3          allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR prior + alts=2 no alt_w b=3          extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,153 w0=0.25
+CORR prior + alts=2 no alt_w b=3          negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR prior + alts=2 no alt_w b=3          bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,108,134 w0=0.258321
+CORR prior + alts=2 no alt_w b=3          ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prior dry b=4                        rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,340,207 w0=0.250692
+CORR prior dry b=4                        rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.255618
+CORR prior dry b=4                        ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,3,4 w0=0.25
+CORR prior dry b=4                        allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prior dry b=4                        allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR prior dry b=4                        extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,336 w0=0.25
+CORR prior dry b=4                        negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR prior dry b=4                        bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,336,108 w0=0.254402
+CORR prior dry b=4                        ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prior dry + alts=1 b=2               rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,340,207 w0=0.250692
+CORR prior dry + alts=1 b=2               rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.255618
+CORR prior dry + alts=1 b=2               ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,3,4 w0=0.25
+CORR prior dry + alts=1 b=2               allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prior dry + alts=1 b=2               allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR prior dry + alts=1 b=2               extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,336 w0=0.25
+CORR prior dry + alts=1 b=2               negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR prior dry + alts=1 b=2               bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,336,108 w0=0.254402
+CORR prior dry + alts=1 b=2               ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prior n_protect=0 b=4                rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=102,128,331,330 w0=0.247611
+CORR prior n_protect=0 b=4                rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.257211
+CORR prior n_protect=0 b=4                ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,4,46,49 w0=0.25
+CORR prior n_protect=0 b=4                allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prior n_protect=0 b=4                allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=373,241,39,286 w0=0
+CORR prior n_protect=0 b=4                extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=11,1,153,325 w0=0.25
+CORR prior n_protect=0 b=4                negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=166,201,102,200 w0=0.256856
+CORR prior n_protect=0 b=4                bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,108,134 w0=0.258321
+CORR prior n_protect=0 b=4                ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=7,10,14,17 w0=0.25
+CORR prior n_protect=6 b=4                rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,340,207 w0=0.250692
+CORR prior n_protect=6 b=4                rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.255618
+CORR prior n_protect=6 b=4                ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,3,4 w0=0.25
+CORR prior n_protect=6 b=4                allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prior n_protect=6 b=4                allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR prior n_protect=6 b=4                extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,336 w0=0.25
+CORR prior n_protect=6 b=4                negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR prior n_protect=6 b=4                bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,336,108 w0=0.254402
+CORR prior n_protect=6 b=4                ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prior n_protect=9>n_used b=2         rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,340,207 w0=0.250692
+CORR prior n_protect=9>n_used b=2         rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.255618
+CORR prior n_protect=9>n_used b=2         ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,3,4 w0=0.25
+CORR prior n_protect=9>n_used b=2         allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prior n_protect=9>n_used b=2         allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR prior n_protect=9>n_used b=2         extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,336 w0=0.25
+CORR prior n_protect=9>n_used b=2         negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR prior n_protect=9>n_used b=2         bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,336,108 w0=0.254402
+CORR prior n_protect=9>n_used b=2         ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prior no orig/range b=4              rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,102,128 w0=0.250868
+CORR prior no orig/range b=4              rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.257211
+CORR prior no orig/range b=4              ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,4,46 w0=0.25
+CORR prior no orig/range b=4              allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prior no orig/range b=4              allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR prior no orig/range b=4              extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,153 w0=0.25
+CORR prior no orig/range b=4              negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR prior no orig/range b=4              bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,108,134 w0=0.258321
+CORR prior no orig/range b=4              ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prior n_used=8 b=2                   rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,102,128 w0=0.187581
+CORR prior n_used=8 b=2                   rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.193594
+CORR prior n_used=8 b=2                   ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,4,46 w0=0.1875
+CORR prior n_used=8 b=2                   allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.1875
+CORR prior n_used=8 b=2                   allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR prior n_used=8 b=2                   extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,153 w0=0.1875
+CORR prior n_used=8 b=2                   negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.190005
+CORR prior n_used=8 b=2                   bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,108,134 w0=0.192416
+CORR prior n_used=8 b=2                   ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.1875
+CORR prior n_used=1 b=2                   rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,254,-9,-9 w0=1.5
+CORR prior n_used=1 b=2                   rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,186,-9,-9 w0=1.5
+CORR prior n_used=1 b=2                   ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,25,-9,-9 w0=1.5
+CORR prior n_used=1 b=2                   allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,0,-9,-9 w0=1.5
+CORR prior n_used=1 b=2                   allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,181,-9,-9 w0=0
+CORR prior n_used=1 b=2                   extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,327,-9,-9 w0=1.5
+CORR prior n_used=1 b=2                   negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,206,-9,-9 w0=1.5
+CORR prior n_used=1 b=2                   bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,288,-9,-9 w0=1.5
+CORR prior n_used=1 b=2                   ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,2,-9,-9 w0=1.5
+CORR prior n_used=8 alts=4 b=2            rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,102,128 w0=0.187581
+CORR prior n_used=8 alts=4 b=2            rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,351,363,156 w0=0.193594
+CORR prior n_used=8 alts=4 b=2            ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,4,46 w0=0.1875
+CORR prior n_used=8 alts=4 b=2            allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.1875
+CORR prior n_used=8 alts=4 b=2            allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,373,241,39 w0=0
+CORR prior n_used=8 alts=4 b=2            extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,153 w0=0.1875
+CORR prior n_used=8 alts=4 b=2            negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.190005
+CORR prior n_used=8 alts=4 b=2            bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,108,134 w0=0.192416
+CORR prior n_used=8 alts=4 b=2            ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.1875
+CORR prior n_expert=512 (full) b=2        rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=330,378,409,102 w0=0.251486
+CORR prior n_expert=512 (full) b=2        rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,509,351,363 w0=0.254284
+CORR prior n_expert=512 (full) b=2        ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,4,46 w0=0.25
+CORR prior n_expert=512 (full) b=2        allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prior n_expert=512 (full) b=2        allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,444,373,241 w0=0
+CORR prior n_expert=512 (full) b=2        extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,153 w0=0.25
+CORR prior n_expert=512 (full) b=2        negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,495,166,201 w0=0.252766
+CORR prior n_expert=512 (full) b=2        bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=283,305,507,108 w0=0.250309
+CORR prior n_expert=512 (full) b=2        ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prior n_expert=256 b=2               rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=207,102,128,14 w0=0.248435
+CORR prior n_expert=256 b=2               rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=171,156,250,69 w0=0.257355
+CORR prior n_expert=256 b=2               ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,4,46 w0=0.25
+CORR prior n_expert=256 b=2               allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prior n_expert=256 b=2               allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=181,241,39,26 w0=0
+CORR prior n_expert=256 b=2               extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,153 w0=0.25
+CORR prior n_expert=256 b=2               negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=200,67,166,201 w0=0.252673
+CORR prior n_expert=256 b=2               bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=108,134,244,137 w0=0.298048
+CORR prior n_expert=256 b=2               ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prior n_expert=100 (odd) b=3         rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=38,14,98,13 w0=0.249136
+CORR prior n_expert=100 (odd) b=3         rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=69,59,40,70 w0=0.255699
+CORR prior n_expert=100 (odd) b=3         ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,4,46 w0=0.25
+CORR prior n_expert=100 (odd) b=3         allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prior n_expert=100 (odd) b=3         allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=39,44,26,82 w0=0
+CORR prior n_expert=100 (odd) b=3         extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,11,1,92 w0=0.25
+CORR prior n_expert=100 (odd) b=3         negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=67,69,33,99 w0=0.257718
+CORR prior n_expert=100 (odd) b=3         bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=51,32,69,50 w0=0.284682
+CORR prior n_expert=100 (odd) b=3         ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR prior n_expert=33 b=2                rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=14,13,17,27 w0=0.264999
+CORR prior n_expert=33 b=2                rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=15,3,20,23 w0=0.278778
+CORR prior n_expert=33 b=2                ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,4,3 w0=0.25
+CORR prior n_expert=33 b=2                allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR prior n_expert=33 b=2                allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=26,1,11,24 w0=0
+CORR prior n_expert=33 b=2                extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=11,1,21,31 w0=0.3
+CORR prior n_expert=33 b=2                negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,8,4,7 w0=0.297439
+CORR prior n_expert=33 b=2                bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=32,20,1,26 w0=0.409043
+CORR prior n_expert=33 b=2                ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,7,10 w0=0.25
+CORR plain n_expert=7 n_used=6 alts=1 b=2 rand0      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,5,1,4 w0=0.522493
+CORR plain n_expert=7 n_used=6 alts=1 b=2 rand1      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,1,4,2 w0=0.356748
+CORR plain n_expert=7 n_used=6 alts=1 b=2 ties7      OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,3,4 w0=0.25
+CORR plain n_expert=7 n_used=6 alts=1 b=2 allequal   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=0,1,2,3 w0=0.25
+CORR plain n_expert=7 n_used=6 alts=1 b=2 allneginf  OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,4,6,5 w0=0
+CORR plain n_expert=7 n_used=6 alts=1 b=2 extreme    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,3,5 w0=0.756529
+CORR plain n_expert=7 n_used=6 alts=1 b=2 negzero    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,4,0,6 w0=0.422014
+CORR plain n_expert=7 n_used=6 alts=1 b=2 bigbias    OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=1,2,6,5 w0=0.276011
+CORR plain n_expert=7 n_used=6 alts=1 b=2 ulp-ties   OK   sel=0 w=0 orig=0 range=0 alts=0 alt_w=0 | base sel[0..]=3,6,0,1 w0=0.25
+CORR SUMMARY: 243 configs x classes, 0 with any difference

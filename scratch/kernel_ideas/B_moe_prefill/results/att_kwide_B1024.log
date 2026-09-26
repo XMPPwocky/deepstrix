@@ -1,31 +1,39 @@
-W20260926 04:00:36.235148 129533494700672 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.043199 sec
-W20260926 04:00:36.235383 129533494700672 simple_timer.cpp:55] [rocprofv3] './harness prof_kwide 1024 32' ::     0.000000 sec
-W20260926 04:00:36.283714 129533494700672 tool.cpp:2424] HSA version 1.18.0 initialized (instance=0)
+W20260926 19:00:16.308826 123484411931264 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.038074 sec
+W20260926 19:00:16.309078 123484411931264 simple_timer.cpp:55] [rocprofv3] './harness prof_kwide 1024 32' ::     0.000000 sec
+W20260926 19:00:16.494587 123484411931264 tool.cpp:2424] HSA version 1.18.0 initialized (instance=0)
 [kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
-E20260926 04:00:36.299055 129533494700672 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_1.out
-E20260926 04:00:36.300935 129533494700672 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_2.out
-E20260926 04:00:36.302303 129533494700672 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_3.out
-E20260926 04:00:36.303613 129533494700672 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_4.out
-E20260926 04:00:36.304773 129533494700672 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_5.out
-E20260926 04:00:36.305870 129533494700672 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_6.out
-E20260926 04:00:36.319020 129533494700672 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_7.out
-E20260926 04:00:36.458387 129533494700672 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_8.out
+E20260926 19:00:16.502354 123484411931264 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_1.out
+E20260926 19:00:16.503935 123484411931264 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_2.out
+E20260926 19:00:16.505308 123484411931264 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_3.out
+E20260926 19:00:16.506911 123484411931264 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_4.out
+E20260926 19:00:16.508217 123484411931264 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_5.out
+E20260926 19:00:16.509352 123484411931264 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_6.out
+E20260926 19:00:16.523042 123484411931264 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_7.out
+E20260926 19:00:16.532840 123484411931264 output_stream.cpp:111] Opened result file: prof_att_kwide/run_gfx1151_code_object_id_8.out
 [setup] B=1024 n_exp=32 members=533 touched=32 max_group=26 n_wi_exact=32 n_wi_bound=576  mean members/expert=16.7
-E20260926 04:00:36.783190 129533315380928 output_stream.cpp:111] Opened result file: prof_att_kwide/run_31204_shader_engine_0_23.att
-E20260926 04:00:36.896195 129533315380928 output_stream.cpp:111] Opened result file: prof_att_kwide/run_31204_shader_engine_0_24.att
-W20260926 04:00:36.910549 129533494700672 simple_timer.cpp:55] [rocprofv3] './harness prof_kwide 1024 32' ::     0.675167 sec
-W20260926 04:00:36.936225 129533494700672 generateRocpd.cpp:583] writing SQL database for process 883225 on node 868250506
-E20260926 04:00:36.938601 129533494700672 generateRocpd.cpp:606] Opened result file: prof_att_kwide/run_results.db (UUID=000075db-5245-7245-8c59-755a9088e4bf)
-W20260926 04:00:37.639063 129533494700672 simple_timer.cpp:55] SQLite3 generation :: rocpd_string             ::     0.016404 sec
-W20260926 04:00:37.650088 129533494700672 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_node          ::     0.010984 sec
-W20260926 04:00:37.662104 129533494700672 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_process       ::     0.011983 sec
-W20260926 04:00:37.695036 129533494700672 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_agent         ::     0.011961 sec
-W20260926 04:00:37.695073 129533494700672 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_pmc           ::     0.000013 sec
-W20260926 04:00:37.706997 129533494700672 simple_timer.cpp:55] SQLite3 generation :: rocpd kernel info        ::     0.011917 sec
-W20260926 04:00:37.707019 129533494700672 simple_timer.cpp:55] SQLite3 generation :: rocpd_region             ::     0.000002 sec
-W20260926 04:00:37.707023 129533494700672 simple_timer.cpp:55] SQLite3 generation :: rocpd_kernel_dispatch    ::     0.000000 sec
-W20260926 04:00:37.707027 129533494700672 simple_timer.cpp:55] SQLite3 generation :: rocpd_pmc_event          ::     0.000000 sec
-W20260926 04:00:37.707030 129533494700672 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_copy        ::     0.000000 sec
-W20260926 04:00:37.707034 129533494700672 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_allocate    ::     0.000001 sec
-W20260926 04:00:37.707154 129533494700672 simple_timer.cpp:55] SQLite3 generation :: SQL indexing             ::     0.000116 sec
-W20260926 04:00:37.707879 129533494700672 simple_timer.cpp:55] SQLite3 generation :: total                    ::     0.771656 sec
+E20260926 19:00:16.965639 123484290152128 output_stream.cpp:111] Opened result file: prof_att_kwide/run_53627_shader_engine_0_23.att
+E20260926 19:00:16.977845 123484290152128 output_stream.cpp:111] Opened result file: prof_att_kwide/run_53627_shader_engine_0_24.att
+W20260926 19:00:16.992775 123484411931264 simple_timer.cpp:55] [rocprofv3] './harness prof_kwide 1024 32' ::     0.683697 sec
+W20260926 19:00:17.011867 123484411931264 generateRocpd.cpp:583] writing SQL database for process 4839 on node 868250506
+E20260926 19:00:17.017018 123484411931264 generateRocpd.cpp:606] Opened result file: prof_att_kwide/run_results.db (UUID=0000000c-0e53-7e53-8eb2-872357eba468)
+W20260926 19:00:17.727021 123484411931264 simple_timer.cpp:55] SQLite3 generation :: rocpd_string             ::     0.015445 sec
+W20260926 19:00:17.738156 123484411931264 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_node          ::     0.011113 sec
+W20260926 19:00:17.751124 123484411931264 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_process       ::     0.012957 sec
+W20260926 19:00:17.784144 123484411931264 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_agent         ::     0.011086 sec
+W20260926 19:00:17.784167 123484411931264 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_pmc           ::     0.000010 sec
+W20260926 19:00:17.796142 123484411931264 simple_timer.cpp:55] SQLite3 generation :: rocpd kernel info        ::     0.011970 sec
+W20260926 19:00:17.796152 123484411931264 simple_timer.cpp:55] SQLite3 generation :: rocpd_region             ::     0.000002 sec
+W20260926 19:00:17.796155 123484411931264 simple_timer.cpp:55] SQLite3 generation :: rocpd_kernel_dispatch    ::     0.000000 sec
+W20260926 19:00:17.796158 123484411931264 simple_timer.cpp:55] SQLite3 generation :: rocpd_pmc_event          ::     0.000000 sec
+W20260926 19:00:17.796162 123484411931264 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_copy        ::     0.000000 sec
+W20260926 19:00:17.796165 123484411931264 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_allocate    ::     0.000001 sec
+W20260926 19:00:17.796281 123484411931264 simple_timer.cpp:55] SQLite3 generation :: SQL indexing             ::     0.000114 sec
+W20260926 19:00:17.796699 123484411931264 simple_timer.cpp:55] SQLite3 generation :: total                    ::     0.784832 sec
+W20260926 19:00:37.307177 123484411931264 simple_timer.cpp:55] [rocprofv3] output generation ::    20.303308 sec
+W20260926 19:00:37.307261 123484411931264 simple_timer.cpp:55] [rocprofv3] tool finalization ::    20.303400 sec
+ROOFLINE gate+up: 0.409 GB (weights 0.401 GB) -> 1.78 ms at 230 GB/s; 25.2 GFLOP
+ROOFLINE down:    0.213 GB (weights 0.201 GB) -> 0.93 ms at 230 GB/s; 12.6 GFLOP
+SCALE: x12.00 to a full 384-expert layer (this launch touches 32 experts)
+prof kwide done (6 launches)
+prof_att_kwide/stats_ui_output_agent_53627_dispatch_23.csv
+prof_att_kwide/stats_ui_output_agent_53627_dispatch_24.csv

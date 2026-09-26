@@ -1,0 +1,35 @@
+== 1790451013.000068.D_attention.dgpu rc=0
+W20260926 19:30:14.963419 129859275889280 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.037632 sec
+W20260926 19:30:14.963649 129859275889280 simple_timer.cpp:55] [rocprofv3] './attn_harness2_gfx1201 gfx1201 . prof 1 attention_dec_fused_direct_g16' ::     0.000000 sec
+W20260926 19:30:15.006007 129859275889280 tool.cpp:2424] HSA version 1.18.0 initialized (instance=0)
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+E20260926 19:30:15.009059 129859275889280 output_stream.cpp:111] Opened result file: results/att_g16/run_gfx1201_code_object_id_1.out
+E20260926 19:30:15.010358 129859275889280 output_stream.cpp:111] Opened result file: results/att_g16/run_gfx1201_code_object_id_2.out
+E20260926 19:30:15.011646 129859275889280 output_stream.cpp:111] Opened result file: results/att_g16/run_gfx1201_code_object_id_3.out
+E20260926 19:30:15.013484 129859275889280 output_stream.cpp:111] Opened result file: results/att_g16/run_gfx1201_code_object_id_4.out
+[cand] attention_dec_fused_direct_g16 (fused)
+E20260926 19:30:15.014878 129859275889280 output_stream.cpp:111] Opened result file: results/att_g16/run_gfx1201_code_object_id_5.out
+E20260926 19:30:15.026468 129859275889280 output_stream.cpp:111] Opened result file: results/att_g16/run_gfx1201_code_object_id_6.out
+E20260926 19:30:15.027982 129859154081472 output_stream.cpp:111] Opened result file: results/att_g16/run_45341_shader_engine_0_17.att
+E20260926 19:30:15.028255 129859154081472 output_stream.cpp:111] Opened result file: results/att_g16/run_45341_shader_engine_0_20.att
+W20260926 19:30:15.028440 129859275889280 simple_timer.cpp:55] [rocprofv3] './attn_harness2_gfx1201 gfx1201 . prof 1 attention_dec_fused_direct_g16' ::     0.064791 sec
+W20260926 19:30:15.038358 129859275889280 generateRocpd.cpp:583] writing SQL database for process 44357 on node 868250506
+E20260926 19:30:15.038621 129859275889280 generateRocpd.cpp:606] Opened result file: results/att_g16/run_results.db (UUID=00000027-8057-7057-b971-3fc217f424aa)
+W20260926 19:30:15.785283 129859275889280 simple_timer.cpp:55] SQLite3 generation :: rocpd_string             ::     0.015539 sec
+W20260926 19:30:15.796216 129859275889280 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_node          ::     0.010913 sec
+W20260926 19:30:15.807301 129859275889280 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_process       ::     0.011074 sec
+W20260926 19:30:15.840240 129859275889280 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_agent         ::     0.010908 sec
+W20260926 19:30:15.840256 129859275889280 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_pmc           ::     0.000008 sec
+W20260926 19:30:15.852241 129859275889280 simple_timer.cpp:55] SQLite3 generation :: rocpd kernel info        ::     0.011981 sec
+W20260926 19:30:15.852248 129859275889280 simple_timer.cpp:55] SQLite3 generation :: rocpd_region             ::     0.000001 sec
+W20260926 19:30:15.852251 129859275889280 simple_timer.cpp:55] SQLite3 generation :: rocpd_kernel_dispatch    ::     0.000000 sec
+W20260926 19:30:15.852253 129859275889280 simple_timer.cpp:55] SQLite3 generation :: rocpd_pmc_event          ::     0.000000 sec
+W20260926 19:30:15.852255 129859275889280 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_copy        ::     0.000000 sec
+W20260926 19:30:15.852258 129859275889280 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_allocate    ::     0.000001 sec
+W20260926 19:30:15.852341 129859275889280 simple_timer.cpp:55] SQLite3 generation :: SQL indexing             ::     0.000081 sec
+W20260926 19:30:15.852735 129859275889280 simple_timer.cpp:55] SQLite3 generation :: total                    ::     0.814377 sec
+W20260926 19:30:15.857427 129859275889280 simple_timer.cpp:55] [rocprofv3] output generation ::     0.827433 sec
+W20260926 19:30:15.857461 129859275889280 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.827470 sec
+prof done b=1
+results/att_g16/stats_ui_output_agent_45341_dispatch_17.csv
+results/att_g16/stats_ui_output_agent_45341_dispatch_20.csv

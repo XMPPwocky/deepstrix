@@ -1,0 +1,406 @@
+kernel                                                            vgpr  sgpr   lds_B scratch vspill wave
+attention_dec_smwsum_pf2                                           100    54   37184       0      0   32
+attention_dec_smwsum_regpf                                          74    54   53568       0      0   32
+attention_dec_fused_f16s                                           226    54       0       0      0   32
+attention_dec_score_blk256                                         212    27               0      0   32
+disassembly: ../cand_attn_gfx1201.s (11215 lines)
+0000000000002900 <attention_dec_smwsum_pf2>:
+	s_load_b32 s20, s[0:1], 0x40                               
+	s_lshl_b32 s22, ttmp9, 4                                   
+	s_wait_kmcnt 0x0                                           
+	s_cmp_le_u32 s20, s22                                      
+	s_cbranch_scc1 4346                                        
+	s_clause 0x1                                               
+	s_load_b512 s[36:51], s[0:1], 0x0                          
+	s_load_b128 s[0:3], s[0:1], 0x48                           
+	s_mov_b32 s24, ttmp7                                       
+	s_mov_b32 s25, 0                                           
+	s_delay_alu instid0(SALU_CYCLE_1)                          
+	s_lshl_b64 s[4:5], s[24:25], 2                             
+	s_wait_kmcnt 0x0                                           
+	s_cmp_lg_u64 s[44:45], 0                                   
+	s_cselect_b32 s6, -1, 0                                    
+	s_cmp_eq_u64 s[44:45], 0                                   
+	s_cselect_b32 s7, -1, 0                                    
+	s_cmp_eq_u64 s[2:3], 0                                     
+	s_cselect_b32 s8, -1, 0                                    
+	s_delay_alu instid0(SALU_CYCLE_1) | instskip(NEXT) | instid1(SALU_CYCLE_1)
+	s_or_b32 s7, s7, s8                                        
+	s_and_b32 vcc_lo, exec_lo, s7                              
+	s_cbranch_vccz 17                                          
+	s_cmp_eq_u32 s1, 0                                         
+	s_mov_b64 s[26:27], s[44:45]                               
+	s_cselect_b32 s7, -1, 0                                    
+	s_xor_b32 s6, s6, -1                                       
+	s_delay_alu instid0(SALU_CYCLE_1) | instskip(NEXT) | instid1(SALU_CYCLE_1)
+	s_or_b32 s6, s6, s7                                        
+	s_and_b32 vcc_lo, exec_lo, s6                              
+	s_cbranch_vccnz 7                                          
+	s_mov_b32 s7, 0                                            
+	s_mov_b32 s6, s1                                           
+	s_delay_alu instid0(SALU_CYCLE_1) | instskip(NEXT) | instid1(SALU_CYCLE_1)
+	s_mul_u64 s[6:7], s[24:25], s[6:7]                         
+	s_lshl_b64 s[6:7], s[6:7], 10                              
+	s_delay_alu instid0(SALU_CYCLE_1)                          
+	s_add_nc_u64 s[26:27], s[44:45], s[6:7]                    
+	s_mov_b32 s1, 0                                            
+	s_branch 1                                                 
+	s_mov_b32 s1, -1                                           
+	s_add_nc_u64 s[6:7], s[46:47], s[4:5]                      
+	s_add_nc_u64 s[8:9], s[48:49], s[4:5]                      
+	s_and_not1_b32 vcc_lo, exec_lo, s1                         
+	s_add_nc_u64 s[10:11], s[50:51], s[4:5]                    
+	s_cbranch_vccnz 8                                          
+	s_add_nc_u64 s[2:3], s[2:3], s[4:5]                        
+	s_load_b32 s2, s[2:3], 0x0                                 
+	s_mov_b32 s3, 0                                            
+	s_wait_kmcnt 0x0                                           
+	s_lshl_b64 s[2:3], s[2:3], 10                              
+	s_delay_alu instid0(SALU_CYCLE_1)                          
+	s_add_nc_u64 s[26:27], s[44:45], s[2:3]                    
+	s_load_b32 s21, s[6:7], 0x0                                
+	s_load_b32 s23, s[8:9], 0x0                                
+	s_load_b32 s29, s[10:11], 0x0                              
+	s_add_co_i32 s1, s22, 16                                   
+	s_sub_co_i32 s2, s20, s22                                  
+	v_lshrrev_b32_e32 v1, 5, v0                                
+	s_cmp_gt_u32 s1, s20                                       
+	s_mov_b32 s30, exec_lo                                     
+	s_cselect_b32 s28, s2, 16                                  
+	s_delay_alu instid0(VALU_DEP_1) | instid1(SALU_CYCLE_1)    
+	v_cmpx_gt_u32_e64 s28, v1                                  
+	s_cbranch_execz 1705                                       
+	v_dual_mov_b32 v3, 0 :: v_dual_add_nc_u32 v2, s22, v1      
+	s_wait_kmcnt 0x0                                           
+	s_add_co_i32 s10, s29, s21                                 
+	v_mov_b32_e32 v28, 0xff800000                              
+	v_mov_b32_e32 v30, 0xff800000                              
+	v_lshlrev_b64_e32 v[2:3], 2, v[2:3]                        
+	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_add_co_u32 v2, vcc_lo, s40, v2                           
+	v_add_co_ci_u32_e64 v3, null, s41, v3, vcc_lo              
+	global_load_b32 v20, v[2:3], off                           
+	v_add_co_u32 v2, s1, v1, s22                               
+	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_add_co_ci_u32_e64 v3, null, 0, 0, s1                     
+	v_mad_co_u64_u32 v[2:3], null, s20, s24, v[2:3]            
+	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_mad_co_u64_u32 v[4:5], null, v2, s0, 0                   
+	v_mov_b32_e32 v2, v5                                       
+	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_mad_co_u64_u32 v[2:3], null, v3, s0, v[2:3]              
+	v_dual_mov_b32 v5, v2 :: v_dual_and_b32 v2, 31, v0         
+	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_2)
+	v_lshlrev_b64_e32 v[3:4], 1, v[4:5]                        
+	v_cmp_gt_u32_e64 s19, s10, v2                              
+	s_delay_alu instid0(VALU_DEP_2) | instskip(SKIP_1) | instid1(VALU_DEP_3)
+	v_add_co_u32 v9, vcc_lo, s38, v3                           
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v10, null, s39, v4, vcc_lo             
+	s_and_saveexec_b32 s0, s19                                 
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off                            
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v30, v3                                  
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 32, v2                                    
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_cmp_gt_u32_e64 s18, s10, v3                              
+	s_and_saveexec_b32 s0, s18                                 
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:64                  
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v28, v3                                  
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 64, v2                                    
+	v_dual_mov_b32 v26, 0xff800000 :: v_dual_mov_b32 v29, 0xff800000
+	s_delay_alu instid0(VALU_DEP_2)                            
+	v_cmp_gt_u32_e64 s17, s10, v3                              
+	s_and_saveexec_b32 s0, s17                                 
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:128                 
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v29, v3                                  
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 0x60, v2                                  
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_cmp_gt_u32_e64 s16, s10, v3                              
+	s_and_saveexec_b32 s0, s16                                 
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:192                 
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v26, v3                                  
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 0x80, v2                                  
+	v_mov_b32_e32 v23, 0xff800000                              
+	v_mov_b32_e32 v27, 0xff800000                              
+	s_delay_alu instid0(VALU_DEP_3)                            
+	v_cmp_gt_u32_e64 s15, s10, v3                              
+	s_and_saveexec_b32 s0, s15                                 
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:256                 
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v27, v3                                  
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 0xa0, v2                                  
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_cmp_gt_u32_e64 s14, s10, v3                              
+	s_and_saveexec_b32 s0, s14                                 
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:320                 
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v23, v3                                  
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 0xc0, v2                                  
+	v_mov_b32_e32 v19, 0xff800000                              
+	v_mov_b32_e32 v25, 0xff800000                              
+	s_delay_alu instid0(VALU_DEP_3)                            
+	v_cmp_gt_u32_e64 s13, s10, v3                              
+	s_and_saveexec_b32 s0, s13                                 
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:384                 
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v25, v3                                  
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 0xe0, v2                                  
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_cmp_gt_u32_e64 s12, s10, v3                              
+	s_and_saveexec_b32 s0, s12                                 
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:448                 
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v19, v3                                  
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 0x100, v2                                 
+	v_mov_b32_e32 v17, 0xff800000                              
+	v_mov_b32_e32 v21, 0xff800000                              
+	s_delay_alu instid0(VALU_DEP_3)                            
+	v_cmp_gt_u32_e64 s11, s10, v3                              
+	s_and_saveexec_b32 s0, s11                                 
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:512                 
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v21, v3                                  
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 0x120, v2                                 
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_cmp_gt_u32_e64 s9, s10, v3                               
+	s_and_saveexec_b32 s0, s9                                  
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:576                 
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v17, v3                                  
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 0x140, v2                                 
+	v_mov_b32_e32 v12, 0xff800000                              
+	v_mov_b32_e32 v18, 0xff800000                              
+	s_delay_alu instid0(VALU_DEP_3)                            
+	v_cmp_gt_u32_e64 s8, s10, v3                               
+	s_and_saveexec_b32 s0, s8                                  
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:640                 
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v18, v3                                  
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 0x160, v2                                 
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_cmp_gt_u32_e64 s7, s10, v3                               
+	s_and_saveexec_b32 s0, s7                                  
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:704                 
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v12, v3                                  
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 0x180, v2                                 
+	v_dual_mov_b32 v8, 0xff800000 :: v_dual_mov_b32 v15, 0xff800000
+	s_delay_alu instid0(VALU_DEP_2)                            
+	v_cmp_gt_u32_e64 s6, s10, v3                               
+	s_and_saveexec_b32 s0, s6                                  
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:768                 
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v15, v3                                  
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 0x1a0, v2                                 
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_cmp_gt_u32_e64 s5, s10, v3                               
+	s_and_saveexec_b32 s0, s5                                  
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:832                 
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v8, v3                                   
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 0x1c0, v2                                 
+	v_dual_mov_b32 v6, 0xff800000 :: v_dual_mov_b32 v11, 0xff800000
+	s_delay_alu instid0(VALU_DEP_2)                            
+	v_cmp_gt_u32_e64 s4, s10, v3                               
+	s_and_saveexec_b32 s0, s4                                  
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:896                 
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v11, v3                                  
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 0x1e0, v2                                 
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_cmp_gt_u32_e64 s3, s10, v3                               
+	s_and_saveexec_b32 s0, s3                                  
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:960                 
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v6, v3                                   
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 0x200, v2                                 
+	v_dual_mov_b32 v4, 0xff800000 :: v_dual_mov_b32 v7, 0xff800000
+	s_delay_alu instid0(VALU_DEP_2)                            
+	v_cmp_gt_u32_e64 s2, s10, v3                               
+	s_and_saveexec_b32 s0, s2                                  
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v13, vcc_lo, v9, v3                           
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v14, null, 0, v10, vcc_lo              
+	global_load_u16 v3, v[13:14], off offset:1024              
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v7, v3                                   
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v3, 0x220, v2                                 
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_cmp_gt_u32_e64 s1, s10, v3                               
+	s_and_saveexec_b32 s0, s1                                  
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v3, vcc_lo, v9, v3                            
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v4, null, 0, v10, vcc_lo               
+	global_load_u16 v3, v[3:4], off offset:1088                
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v4, v3                                   
+	s_wait_alu 0xfffe                                          
+	s_or_b32 exec_lo, exec_lo, s0                              
+	v_or_b32_e32 v5, 0x240, v2                                 
+	v_mov_b32_e32 v3, 0xff800000                               
+	s_delay_alu instid0(VALU_DEP_2)                            
+	v_cmp_gt_u32_e64 s0, s10, v5                               
+	v_mov_b32_e32 v5, 0xff800000                               
+	s_and_saveexec_b32 s31, s0                                 
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v5, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v13, vcc_lo, v9, v5                           
+	s_wait_alu 0xfffd                                          
+	v_add_co_ci_u32_e64 v14, null, 0, v10, vcc_lo              
+	global_load_u16 v5, v[13:14], off offset:1152              
+	s_wait_loadcnt 0x0                                         
+	v_cvt_f32_f16_e32 v5, v5                                   
+	s_or_b32 exec_lo, exec_lo, s31                             
+	v_or_b32_e32 v13, 0x260, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_cmp_gt_u32_e32 vcc_lo, s10, v13                          
+	s_and_saveexec_b32 s31, vcc_lo                             
+	s_cbranch_execz 12                                         
+	v_lshlrev_b32_e32 v3, 1, v2                                
+	s_delay_alu instid0(VALU_DEP_1)                            
+	v_add_co_u32 v9, s10, v9, v3                               
+	s_wait_alu 0xf1ff                                          
+	v_add_co_ci_u32_e64 v10, null, 0, v10, s10                 
+	global_load_u16 v3, v[9:10], off offset:1216               
+	s_wait_loadcnt 0x0                                         

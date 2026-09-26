@@ -1,0 +1,22 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[cand] ./cand_wmma_gfx1151.hsaco
+[review] E8M0 scale bytes in [116, 129)
+[setup] B=1024 n_exp=96 members=1570 touched=96 max_group=27 n_wi_exact=96 n_wi_bound=576  mean members/expert=16.4
+[review] ab grid.y=96 (EXACT)
+ROOFLINE gate+up: 1.227 GB (weights 1.203 GB) -> 5.33 ms at 230 GB/s; 74.1 GFLOP
+ROOFLINE down:    0.638 GB (weights 0.602 GB) -> 2.77 ms at 230 GB/s; 37.0 GFLOP
+SCALE: x4.00 to a full 384-expert layer (this launch touches 96 experts)
+
+== gate+up A/B B=1024 n_exp=96 members=1570 touched=96  (rounds=20 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide gate+up (prod)                       11575.21   11491.05   11771.76    1.000     106.0    6400.0
+gu_wmma gate+up (cand)                      7336.79    7283.40    7401.15    0.634     167.2   10097.3
+KBJSON {"tag":"gate+up A/B B=1024 n_exp=96 members=1570 touched=96","variant":"kwide gate+up (prod)","med_us":11575.210,"p10_us":11491.055,"p90_us":11771.762,"ratio":1.0000,"gbps":105.99,"graph":0,"flush":0}
+KBJSON {"tag":"gate+up A/B B=1024 n_exp=96 members=1570 touched=96","variant":"gu_wmma gate+up (cand)","med_us":7336.795,"p10_us":7283.397,"p90_us":7401.152,"ratio":0.6338,"gbps":167.22,"graph":0,"flush":0}
+
+== down A/B B=1024 n_exp=96 members=1570 touched=96  (rounds=20 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide2 down (prod)                          9199.42    9046.87    9313.02    1.000      69.3    4026.4
+down_wmma (cand)                            3393.73    3361.83    3449.69    0.369     188.0   10914.5
+KBJSON {"tag":"down A/B B=1024 n_exp=96 members=1570 touched=96","variant":"kwide2 down (prod)","med_us":9199.422,"p10_us":9046.868,"p90_us":9313.018,"ratio":1.0000,"gbps":69.34,"graph":0,"flush":0}
+KBJSON {"tag":"down A/B B=1024 n_exp=96 members=1570 touched=96","variant":"down_wmma (cand)","med_us":3393.728,"p10_us":3361.830,"p90_us":3449.686,"ratio":0.3689,"gbps":187.96,"graph":0,"flush":0}

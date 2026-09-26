@@ -1,0 +1,15 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[cand] ./cand_wmma_gfx1151.hsaco
+[setup] B=512 n_exp=96 members=783 touched=96 max_group=15 n_wi_exact=96 n_wi_bound=480  mean members/expert=8.2
+ROOFLINE gate+up: 1.215 GB (weights 1.203 GB) -> 5.28 ms at 230 GB/s; 36.9 GFLOP
+ROOFLINE down:    0.620 GB (weights 0.602 GB) -> 2.69 ms at 230 GB/s; 18.5 GFLOP
+SCALE: x4.00 to a full 384-expert layer (this launch touches 96 experts)
+device n_work_items=96 (host expected 96, bound 480)
+SPOTCHECK baseline vs CPU reference: 48 samples, worst rel gate/up=7.276e-06 down=1.100e-05
+SPOTCHECK reduce: worst abs 0.000e+00
+CMP gu_wmma vs kwide B=512             n=7077888 bitexact=no bit_diff=790073 nonfinite=0 max_abs=4.692e-04 max_rel=6.762e-01 rmse=5.639e-06 rel_rmse=5.427e-07 worst_idx=3224655
+KBJSON {"cmp":"gu_wmma vs kwide B=512","bitexact":0,"bit_diff":790073,"nonfinite":0,"max_abs":4.6921e-04,"rel_rmse":5.4273e-07}
+CMP down_wmma vs kwide2 B=512          n=15728640 bitexact=no bit_diff=3313436 nonfinite=0 max_abs=6.836e-03 max_rel=9.616e-01 rmse=1.558e-04 rel_rmse=1.666e-07 worst_idx=7166962
+KBJSON {"cmp":"down_wmma vs kwide2 B=512","bitexact":0,"bit_diff":3313436,"nonfinite":0,"max_abs":6.8359e-03,"rel_rmse":1.6660e-07}
+CMP gu_wmma(exact grid) vs kwide B=512 n=7077888 bitexact=no bit_diff=790073 nonfinite=0 max_abs=4.692e-04 max_rel=6.762e-01 rmse=5.639e-06 rel_rmse=5.427e-07 worst_idx=3224655
+KBJSON {"cmp":"gu_wmma(exact grid) vs kwide B=512","bitexact":0,"bit_diff":790073,"nonfinite":0,"max_abs":4.6921e-04,"rel_rmse":5.4273e-07}

@@ -1,0 +1,156 @@
+== 1790452195.000251.D_attention.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[cand] attention_dec_fused_vt_qreg_sp_d8 (fused)
+[cand] attention_dec_fused_vt_qreg_sp_d4 (fused)
+[cand] attention_dec_fused_vt_qreg_d8 (fused)
+
+######## decode b=1 128+512 gathered  b=1 n_total_max=640 comp=gathered(512) stride=3072
+CMP dec_score vs mixed_score (prod twin)     n=196608 bitexact=YES bit_diff=0
+KBJSON {"cmp":"dec_score vs mixed_score (prod twin)","bitexact":1,"bit_diff":0}
+CMP attention_dec_fused_vt_qreg_sp_d8 out n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_sp_d8 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP attention_dec_fused_vt_qreg_sp_d4 out n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_sp_d4 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP attention_dec_fused_vt_qreg_d8 out n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_d8 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== decode b=1 n_total=640 graph warm  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base pair: dec_score + smwsum                 41.07      40.98      41.18    1.000      44.3    2042.4
+base dec_score alone                           9.54       9.50       9.58    0.232       0.0       0.0
+base smwsum alone                             32.77      32.68      32.88    0.798       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d8             20.36      20.30      20.45    0.496      89.3    4119.3
+attention_dec_fused_vt_qreg_sp_d4             19.82      19.75      19.87    0.482      91.8    4233.2
+attention_dec_fused_vt_qreg_d8                20.21      20.14      20.30    0.492      90.0    4150.3
+KBJSON {"tag":"decode b=1 n_total=640 graph warm","variant":"base pair: dec_score + smwsum","med_us":41.072,"p10_us":40.977,"p90_us":41.176,"ratio":1.0000,"gbps":44.28,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=1 n_total=640 graph warm","variant":"base dec_score alone","med_us":9.536,"p10_us":9.504,"p90_us":9.584,"ratio":0.2322,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=1 n_total=640 graph warm","variant":"base smwsum alone","med_us":32.772,"p10_us":32.676,"p90_us":32.884,"ratio":0.7979,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=1 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_sp_d8","med_us":20.364,"p10_us":20.296,"p90_us":20.452,"ratio":0.4958,"gbps":89.30,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=1 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_sp_d4","med_us":19.816,"p10_us":19.748,"p90_us":19.868,"ratio":0.4825,"gbps":91.77,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=1 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_d8","med_us":20.212,"p10_us":20.140,"p90_us":20.300,"ratio":0.4921,"gbps":89.98,"graph":1,"flush":0}
+
+######## decode b=2 128+512 gathered  b=2 n_total_max=640 comp=gathered(512) stride=3072
+CMP dec_score vs mixed_score (prod twin)     n=393216 bitexact=YES bit_diff=0
+KBJSON {"cmp":"dec_score vs mixed_score (prod twin)","bitexact":1,"bit_diff":0}
+CMP attention_dec_fused_vt_qreg_sp_d8 out n=65536 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_sp_d8 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP attention_dec_fused_vt_qreg_sp_d4 out n=65536 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_sp_d4 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP attention_dec_fused_vt_qreg_d8 out n=65536 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_d8 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== decode b=2 n_total=640 graph warm  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base pair: dec_score + smwsum                 41.22      41.17      41.29    1.000      88.2    4069.7
+base dec_score alone                           9.69       9.66       9.70    0.235       0.0       0.0
+base smwsum alone                             32.56      32.51      32.61    0.790       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d8             20.29      20.25      20.36    0.492     179.2    8267.8
+attention_dec_fused_vt_qreg_sp_d4             19.76      19.72      19.81    0.479     184.1    8490.4
+attention_dec_fused_vt_qreg_d8                20.15      20.10      20.20    0.489     180.5    8325.3
+KBJSON {"tag":"decode b=2 n_total=640 graph warm","variant":"base pair: dec_score + smwsum","med_us":41.225,"p10_us":41.168,"p90_us":41.293,"ratio":1.0000,"gbps":88.23,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=2 n_total=640 graph warm","variant":"base dec_score alone","med_us":9.688,"p10_us":9.664,"p90_us":9.700,"ratio":0.2350,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=2 n_total=640 graph warm","variant":"base smwsum alone","med_us":32.556,"p10_us":32.512,"p90_us":32.608,"ratio":0.7897,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=2 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_sp_d8","med_us":20.292,"p10_us":20.252,"p90_us":20.360,"ratio":0.4922,"gbps":179.24,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=2 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_sp_d4","med_us":19.760,"p10_us":19.716,"p90_us":19.808,"ratio":0.4793,"gbps":184.07,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=2 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_d8","med_us":20.152,"p10_us":20.104,"p90_us":20.200,"ratio":0.4888,"gbps":180.49,"graph":1,"flush":0}
+
+######## decode b=3 128+512 gathered  b=3 n_total_max=640 comp=gathered(512) stride=3072
+CMP dec_score vs mixed_score (prod twin)     n=589824 bitexact=YES bit_diff=0
+KBJSON {"cmp":"dec_score vs mixed_score (prod twin)","bitexact":1,"bit_diff":0}
+CMP attention_dec_fused_vt_qreg_sp_d8 out n=98304 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_sp_d8 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP attention_dec_fused_vt_qreg_sp_d4 out n=98304 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_sp_d4 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP attention_dec_fused_vt_qreg_d8 out n=98304 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_d8 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== decode b=3 n_total=640 graph warm  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base pair: dec_score + smwsum                 43.53      43.47      43.61    1.000     125.3    5781.5
+base dec_score alone                          12.06      12.03      12.09    0.277       0.0       0.0
+base smwsum alone                             32.51      32.41      32.67    0.747       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d8             20.50      20.48      20.54    0.471     266.1   12275.8
+attention_dec_fused_vt_qreg_sp_d4             19.99      19.96      20.02    0.459     273.0   12590.3
+attention_dec_fused_vt_qreg_d8                20.38      20.33      20.43    0.468     267.7   12348.2
+KBJSON {"tag":"decode b=3 n_total=640 graph warm","variant":"base pair: dec_score + smwsum","med_us":43.529,"p10_us":43.472,"p90_us":43.608,"ratio":1.0000,"gbps":125.34,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=3 n_total=640 graph warm","variant":"base dec_score alone","med_us":12.056,"p10_us":12.028,"p90_us":12.092,"ratio":0.2770,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=3 n_total=640 graph warm","variant":"base smwsum alone","med_us":32.512,"p10_us":32.412,"p90_us":32.672,"ratio":0.7469,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=3 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_sp_d8","med_us":20.500,"p10_us":20.476,"p90_us":20.540,"ratio":0.4710,"gbps":266.14,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=3 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_sp_d4","med_us":19.988,"p10_us":19.960,"p90_us":20.016,"ratio":0.4592,"gbps":272.95,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=3 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_d8","med_us":20.380,"p10_us":20.332,"p90_us":20.428,"ratio":0.4682,"gbps":267.70,"graph":1,"flush":0}
+
+######## decode b=4 128+512 gathered  b=4 n_total_max=640 comp=gathered(512) stride=3072
+CMP dec_score vs mixed_score (prod twin)     n=786432 bitexact=YES bit_diff=0
+KBJSON {"cmp":"dec_score vs mixed_score (prod twin)","bitexact":1,"bit_diff":0}
+CMP attention_dec_fused_vt_qreg_sp_d8 out n=131072 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_sp_d8 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP attention_dec_fused_vt_qreg_sp_d4 out n=131072 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_sp_d4 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP attention_dec_fused_vt_qreg_d8 out n=131072 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_d8 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== decode b=4 n_total=640 graph warm  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base pair: dec_score + smwsum                 46.88      46.80      46.94    1.000     155.2    7158.0
+base dec_score alone                          15.38      15.36      15.41    0.328       0.0       0.0
+base smwsum alone                             32.60      32.45      32.78    0.696       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d8             20.97      20.80      21.04    0.447     346.9   16002.5
+attention_dec_fused_vt_qreg_sp_d4             20.27      20.22      20.33    0.432     358.8   16551.9
+attention_dec_fused_vt_qreg_d8                20.70      20.63      20.79    0.442     351.4   16206.6
+KBJSON {"tag":"decode b=4 n_total=640 graph warm","variant":"base pair: dec_score + smwsum","med_us":46.876,"p10_us":46.797,"p90_us":46.937,"ratio":1.0000,"gbps":155.18,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=4 n_total=640 graph warm","variant":"base dec_score alone","med_us":15.384,"p10_us":15.360,"p90_us":15.408,"ratio":0.3282,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=4 n_total=640 graph warm","variant":"base smwsum alone","med_us":32.604,"p10_us":32.452,"p90_us":32.780,"ratio":0.6955,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=4 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_sp_d8","med_us":20.968,"p10_us":20.804,"p90_us":21.040,"ratio":0.4473,"gbps":346.93,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=4 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_sp_d4","med_us":20.272,"p10_us":20.224,"p90_us":20.328,"ratio":0.4325,"gbps":358.84,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=4 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_d8","med_us":20.704,"p10_us":20.632,"p90_us":20.792,"ratio":0.4417,"gbps":351.35,"graph":1,"flush":0}
+
+######## decode b=5 128+512 gathered  b=5 n_total_max=640 comp=gathered(512) stride=3072
+CMP dec_score vs mixed_score (prod twin)     n=983040 bitexact=YES bit_diff=0
+KBJSON {"cmp":"dec_score vs mixed_score (prod twin)","bitexact":1,"bit_diff":0}
+CMP attention_dec_fused_vt_qreg_sp_d8 out n=163840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_sp_d8 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP attention_dec_fused_vt_qreg_sp_d4 out n=163840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_sp_d4 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP attention_dec_fused_vt_qreg_d8 out n=163840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_d8 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== decode b=5 n_total=640 graph warm  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base pair: dec_score + smwsum                 47.16      47.09      47.24    1.000     192.8    8892.9
+base dec_score alone                          15.63      15.61      15.65    0.331       0.0       0.0
+base smwsum alone                             32.64      32.49      32.84    0.692       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d8             21.27      21.19      21.32    0.451     427.5   19717.2
+attention_dec_fused_vt_qreg_sp_d4             20.54      20.50      20.60    0.436     442.7   20419.9
+attention_dec_fused_vt_qreg_d8                20.96      20.91      21.01    0.444     433.9   20014.6
+KBJSON {"tag":"decode b=5 n_total=640 graph warm","variant":"base pair: dec_score + smwsum","med_us":47.164,"p10_us":47.093,"p90_us":47.240,"ratio":1.0000,"gbps":192.80,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=5 n_total=640 graph warm","variant":"base dec_score alone","med_us":15.628,"p10_us":15.608,"p90_us":15.648,"ratio":0.3314,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=5 n_total=640 graph warm","variant":"base smwsum alone","med_us":32.644,"p10_us":32.492,"p90_us":32.836,"ratio":0.6921,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=5 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_sp_d8","med_us":21.272,"p10_us":21.192,"p90_us":21.316,"ratio":0.4510,"gbps":427.46,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=5 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_sp_d4","med_us":20.540,"p10_us":20.504,"p90_us":20.596,"ratio":0.4355,"gbps":442.70,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=5 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_d8","med_us":20.956,"p10_us":20.912,"p90_us":21.008,"ratio":0.4443,"gbps":433.91,"graph":1,"flush":0}
+
+######## decode b=8 128+512 gathered  b=8 n_total_max=640 comp=gathered(512) stride=3072
+CMP dec_score vs mixed_score (prod twin)     n=1572864 bitexact=YES bit_diff=0
+KBJSON {"cmp":"dec_score vs mixed_score (prod twin)","bitexact":1,"bit_diff":0}
+CMP attention_dec_fused_vt_qreg_sp_d8 out n=262144 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_sp_d8 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP attention_dec_fused_vt_qreg_sp_d4 out n=262144 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_sp_d4 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP attention_dec_fused_vt_qreg_d8 out n=262144 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"attention_dec_fused_vt_qreg_d8 out","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== decode b=8 n_total=640 graph warm  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base pair: dec_score + smwsum                 53.26      53.19      53.36    1.000     273.2   12601.0
+base dec_score alone                          21.42      21.39      21.60    0.402       0.0       0.0
+base smwsum alone                             32.98      32.78      33.16    0.619       0.0       0.0
+attention_dec_fused_vt_qreg_sp_d8             22.69      22.62      22.75    0.426     641.1   29573.5
+attention_dec_fused_vt_qreg_sp_d4             21.79      21.74      21.88    0.409     667.6   30794.8
+attention_dec_fused_vt_qreg_d8                22.36      22.27      22.41    0.420     650.8   30017.9
+KBJSON {"tag":"decode b=8 n_total=640 graph warm","variant":"base pair: dec_score + smwsum","med_us":53.257,"p10_us":53.189,"p90_us":53.357,"ratio":1.0000,"gbps":273.19,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=8 n_total=640 graph warm","variant":"base dec_score alone","med_us":21.416,"p10_us":21.392,"p90_us":21.596,"ratio":0.4021,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=8 n_total=640 graph warm","variant":"base smwsum alone","med_us":32.976,"p10_us":32.776,"p90_us":33.156,"ratio":0.6192,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=8 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_sp_d8","med_us":22.692,"p10_us":22.624,"p90_us":22.748,"ratio":0.4261,"gbps":641.15,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=8 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_sp_d4","med_us":21.792,"p10_us":21.744,"p90_us":21.880,"ratio":0.4092,"gbps":667.62,"graph":1,"flush":0}
+KBJSON {"tag":"decode b=8 n_total=640 graph warm","variant":"attention_dec_fused_vt_qreg_d8","med_us":22.356,"p10_us":22.268,"p90_us":22.412,"ratio":0.4198,"gbps":650.78,"graph":1,"flush":0}

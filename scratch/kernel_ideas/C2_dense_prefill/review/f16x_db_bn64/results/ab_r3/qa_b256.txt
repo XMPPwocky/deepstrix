@@ -1,0 +1,11 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[kb] LDS/CU 65536 B, regs/block 196608, L2 8388608 B
+[kb] shape qa b=256 M=1280 K=5120 G=1 ldx=5184 working set ~10 MB
+[kb] flush 96 MB per timed block (total device ~106 MB)
+
+== qa b=256 M=1280 K=5120 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemm_wmma_f16x                     108.92     106.84     110.36    1.000     100.0   30806.2
+cand q8_0_gemm_wmma_f16x_db_bn64              71.48      70.92      71.80    0.656     152.4   46941.8
+KBJSON {"tag":"qa b=256 M=1280 K=5120 G=1 flush96MB","variant":"base q8_0_gemm_wmma_f16x","med_us":108.921,"p10_us":106.842,"p90_us":110.361,"ratio":1.0000,"gbps":100.03,"graph":0,"flush":1}
+KBJSON {"tag":"qa b=256 M=1280 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_db_bn64","med_us":71.481,"p10_us":70.921,"p90_us":71.801,"ratio":0.6563,"gbps":152.42,"graph":0,"flush":1}

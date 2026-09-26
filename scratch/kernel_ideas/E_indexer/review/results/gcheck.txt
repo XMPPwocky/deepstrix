@@ -1,0 +1,34 @@
+CASE b1 k512 random, base=null                          base-vs-CPU diff=0 ok
+CMP  b1 k512 random, base=null                          gather_u4_r1   bitexact=YES diff=0
+CMP  b1 k512 random, base=null                          gather_u4_r4   bitexact=YES diff=0
+CASE b1 k512 random, 30% sentinels, base                base-vs-CPU diff=0 ok
+CMP  b1 k512 random, 30% sentinels, base                gather_u4_r1   bitexact=YES diff=0
+CMP  b1 k512 random, 30% sentinels, base                gather_u4_r4   bitexact=YES diff=0
+CASE b4 k512 random, 10% sentinels, base                base-vs-CPU diff=0 ok
+CMP  b4 k512 random, 10% sentinels, base                gather_u4_r1   bitexact=YES diff=0
+CMP  b4 k512 random, 10% sentinels, base                gather_u4_r4   bitexact=YES diff=0
+CASE b5 k512 random, base (max one-lane rows)           base-vs-CPU diff=0 ok
+CMP  b5 k512 random, base (max one-lane rows)           gather_u4_r1   bitexact=YES diff=0
+CMP  b5 k512 random, base (max one-lane rows)           gather_u4_r4   bitexact=YES diff=0
+CASE b8 k512 random, 2% sentinels, base                 base-vs-CPU diff=0 ok
+CMP  b8 k512 random, 2% sentinels, base                 gather_u4_r1   bitexact=YES diff=0
+CMP  b8 k512 random, 2% sentinels, base                 gather_u4_r4   bitexact=YES diff=0
+CASE b7 k333 random, 5% sentinels, base (odd)           base-vs-CPU diff=0 ok
+CMP  b7 k333 random, 5% sentinels, base (odd)           gather_u4_r1   bitexact=YES diff=0
+CMP  b7 k333 random, 5% sentinels, base (odd)           gather_u4_r4   bitexact=YES diff=0
+CASE b2 k1 random, base                                 base-vs-CPU diff=0 ok
+CMP  b2 k1 random, base                                 gather_u4_r1   bitexact=YES diff=0
+CMP  b2 k1 random, base                                 gather_u4_r4   bitexact=YES diff=0
+CASE b2 k512 ALL sentinels, base                        base-vs-CPU diff=0 ok
+CMP  b2 k512 ALL sentinels, base                        gather_u4_r1   bitexact=YES diff=0
+CMP  b2 k512 ALL sentinels, base                        gather_u4_r4   bitexact=YES diff=0
+CASE b3 k512 trailing sentinels (n_comp<top_k), null    base-vs-CPU diff=0 ok
+CMP  b3 k512 trailing sentinels (n_comp<top_k), null    gather_u4_r1   bitexact=YES diff=0
+CMP  b3 k512 trailing sentinels (n_comp<top_k), null    gather_u4_r4   bitexact=YES diff=0
+CASE b512 k512 local, base (prefill lane)               base-vs-CPU diff=0 ok
+CMP  b512 k512 local, base (prefill lane)               gather_u4_r1   bitexact=YES diff=0
+CMP  b512 k512 local, base (prefill lane)               gather_u4_r4   bitexact=YES diff=0
+CASE b1024 k512 local, base=null (max prefill chunk)    base-vs-CPU diff=0 ok
+CMP  b1024 k512 local, base=null (max prefill chunk)    gather_u4_r1   bitexact=YES diff=0
+CMP  b1024 k512 local, base=null (max prefill chunk)    gather_u4_r4   bitexact=YES diff=0
+GCHECK checks=33 fails=0 PASS

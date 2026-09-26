@@ -1,0 +1,261 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP B=1 s1 cur  (hcw vs collapse)      n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1 s1 cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=1 s1 norm (rmsw vs collapse)     n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1 s1 norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=1 s1 carry (after copy)          n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1 s1 carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=1 s1 norm nonfinite=0 zeros=0 of 5120
+CMP B=1 s2 wide/neg cur  (hcw vs collapse) n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1 s2 wide/neg cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=1 s2 wide/neg norm (rmsw vs collapse) n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1 s2 wide/neg norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=1 s2 wide/neg carry (after copy) n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1 s2 wide/neg carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=1 s2 wide/neg norm nonfinite=0 zeros=0 of 5120
+CMP B=2 s1 cur  (hcw vs collapse)      n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=2 s1 cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=2 s1 norm (rmsw vs collapse)     n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=2 s1 norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=2 s1 carry (after copy)          n=48 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=2 s1 carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=2 s1 norm nonfinite=0 zeros=0 of 10240
+CMP B=2 s2 wide/neg cur  (hcw vs collapse) n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=2 s2 wide/neg cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=2 s2 wide/neg norm (rmsw vs collapse) n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=2 s2 wide/neg norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=2 s2 wide/neg carry (after copy) n=48 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=2 s2 wide/neg carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=2 s2 wide/neg norm nonfinite=0 zeros=0 of 10240
+CMP B=5 s1 cur  (hcw vs collapse)      n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=5 s1 cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=5 s1 norm (rmsw vs collapse)     n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=5 s1 norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=5 s1 carry (after copy)          n=120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=5 s1 carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=5 s1 norm nonfinite=0 zeros=0 of 25600
+CMP B=5 s2 wide/neg cur  (hcw vs collapse) n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=5 s2 wide/neg cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=5 s2 wide/neg norm (rmsw vs collapse) n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=5 s2 wide/neg norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=5 s2 wide/neg carry (after copy) n=120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=5 s2 wide/neg carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=5 s2 wide/neg norm nonfinite=0 zeros=0 of 25600
+CMP B=8 s1 cur  (hcw vs collapse)      n=40960 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=8 s1 cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=8 s1 norm (rmsw vs collapse)     n=40960 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=8 s1 norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=8 s1 carry (after copy)          n=192 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=8 s1 carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=8 s1 norm nonfinite=0 zeros=0 of 40960
+CMP B=8 s2 wide/neg cur  (hcw vs collapse) n=40960 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=8 s2 wide/neg cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=8 s2 wide/neg norm (rmsw vs collapse) n=40960 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=8 s2 wide/neg norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=8 s2 wide/neg carry (after copy) n=192 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=8 s2 wide/neg carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=8 s2 wide/neg norm nonfinite=0 zeros=0 of 40960
+CMP B=9 s1 cur  (hcw vs collapse)      n=46080 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=9 s1 cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=9 s1 norm (rmsw vs collapse)     n=46080 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=9 s1 norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=9 s1 carry (after copy)          n=216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=9 s1 carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=9 s1 norm nonfinite=0 zeros=0 of 46080
+CMP B=9 s2 wide/neg cur  (hcw vs collapse) n=46080 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=9 s2 wide/neg cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=9 s2 wide/neg norm (rmsw vs collapse) n=46080 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=9 s2 wide/neg norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=9 s2 wide/neg carry (after copy) n=216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=9 s2 wide/neg carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=9 s2 wide/neg norm nonfinite=0 zeros=0 of 46080
+CMP B=65 s1 cur  (hcw vs collapse)     n=332800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=65 s1 cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=65 s1 norm (rmsw vs collapse)    n=332800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=65 s1 norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=65 s1 carry (after copy)         n=1560 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=65 s1 carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=65 s1 norm nonfinite=0 zeros=0 of 332800
+CMP B=65 s2 wide/neg cur  (hcw vs collapse) n=332800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=65 s2 wide/neg cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=65 s2 wide/neg norm (rmsw vs collapse) n=332800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=65 s2 wide/neg norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=65 s2 wide/neg carry (after copy) n=1560 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=65 s2 wide/neg carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=65 s2 wide/neg norm nonfinite=0 zeros=0 of 332800
+CMP B=100 s1 cur  (hcw vs collapse)    n=512000 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=100 s1 cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=100 s1 norm (rmsw vs collapse)   n=512000 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=100 s1 norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=100 s1 carry (after copy)        n=2400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=100 s1 carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=100 s1 norm nonfinite=0 zeros=0 of 512000
+CMP B=100 s2 wide/neg cur  (hcw vs collapse) n=512000 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=100 s2 wide/neg cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=100 s2 wide/neg norm (rmsw vs collapse) n=512000 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=100 s2 wide/neg norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=100 s2 wide/neg carry (after copy) n=2400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=100 s2 wide/neg carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=100 s2 wide/neg norm nonfinite=0 zeros=0 of 512000
+CMP B=512 s1 cur  (hcw vs collapse)    n=2621440 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=512 s1 cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=512 s1 norm (rmsw vs collapse)   n=2621440 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=512 s1 norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=512 s1 carry (after copy)        n=12288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=512 s1 carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=512 s1 norm nonfinite=0 zeros=0 of 2621440
+CMP B=512 s2 wide/neg cur  (hcw vs collapse) n=2621440 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=512 s2 wide/neg cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=512 s2 wide/neg norm (rmsw vs collapse) n=2621440 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=512 s2 wide/neg norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=512 s2 wide/neg carry (after copy) n=12288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=512 s2 wide/neg carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=512 s2 wide/neg norm nonfinite=0 zeros=0 of 2621440
+CMP B=513 s1 cur  (hcw vs collapse)    n=2626560 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=513 s1 cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=513 s1 norm (rmsw vs collapse)   n=2626560 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=513 s1 norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=513 s1 carry (after copy)        n=12312 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=513 s1 carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=513 s1 norm nonfinite=0 zeros=0 of 2626560
+CMP B=513 s2 wide/neg cur  (hcw vs collapse) n=2626560 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=513 s2 wide/neg cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=513 s2 wide/neg norm (rmsw vs collapse) n=2626560 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=513 s2 wide/neg norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=513 s2 wide/neg carry (after copy) n=12312 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=513 s2 wide/neg carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=513 s2 wide/neg norm nonfinite=0 zeros=0 of 2626560
+CMP B=1023 s1 cur  (hcw vs collapse)   n=5237760 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1023 s1 cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=1023 s1 norm (rmsw vs collapse)  n=5237760 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1023 s1 norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=1023 s1 carry (after copy)       n=24552 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1023 s1 carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=1023 s1 norm nonfinite=0 zeros=0 of 5237760
+CMP B=1023 s2 wide/neg cur  (hcw vs collapse) n=5237760 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1023 s2 wide/neg cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=1023 s2 wide/neg norm (rmsw vs collapse) n=5237760 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1023 s2 wide/neg norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=1023 s2 wide/neg carry (after copy) n=24552 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1023 s2 wide/neg carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=1023 s2 wide/neg norm nonfinite=0 zeros=0 of 5237760
+CMP B=1024 s1 cur  (hcw vs collapse)   n=5242880 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1024 s1 cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=1024 s1 norm (rmsw vs collapse)  n=5242880 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1024 s1 norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=1024 s1 carry (after copy)       n=24576 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1024 s1 carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=1024 s1 norm nonfinite=0 zeros=0 of 5242880
+CMP B=1024 s2 wide/neg cur  (hcw vs collapse) n=5242880 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1024 s2 wide/neg cur  (hcw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=1024 s2 wide/neg norm (rmsw vs collapse) n=5242880 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1024 s2 wide/neg norm (rmsw vs collapse)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B=1024 s2 wide/neg carry (after copy) n=24576 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B=1024 s2 wide/neg carry (after copy)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+REF B=1024 s2 wide/neg norm nonfinite=0 zeros=0 of 5242880
+CORRECTNESS_FAILS 0
+
+== review prefill collapse B=512 direct warm inner=3  (rounds=30 inner=3 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+hc_weighted_sum_batched (20,1,B)              37.07      36.99      37.19    1.000    1414.4       0.0
+rms_norm_weighted_batched (B) 5120            34.37      34.20      36.41    0.927     610.1       0.0
+carry:=split D2D copy alone                    4.69       4.67       4.76    0.127      20.9       0.0
+TRIO hcw+copy+rmsw (production b>8)           72.35      72.09      73.67    1.952    1015.9       0.0
+mhc_fast collapse-only (1,1,B)                37.15      36.93      41.56    1.002    1693.7       0.0
+CAND collapse-only + copy (integration)       40.00      39.80      40.16    1.079    1575.3       0.0
+KBJSON {"tag":"review prefill collapse B=512 direct warm inner=3","variant":"hc_weighted_sum_batched (20,1,B)","med_us":37.067,"p10_us":36.987,"p90_us":37.187,"ratio":1.0000,"gbps":1414.42,"graph":0,"flush":0}
+KBJSON {"tag":"review prefill collapse B=512 direct warm inner=3","variant":"rms_norm_weighted_batched (B) 5120","med_us":34.374,"p10_us":34.200,"p90_us":36.414,"ratio":0.9273,"gbps":610.10,"graph":0,"flush":0}
+KBJSON {"tag":"review prefill collapse B=512 direct warm inner=3","variant":"carry:=split D2D copy alone","med_us":4.693,"p10_us":4.667,"p90_us":4.760,"ratio":0.1266,"gbps":20.95,"graph":0,"flush":0}
+KBJSON {"tag":"review prefill collapse B=512 direct warm inner=3","variant":"TRIO hcw+copy+rmsw (production b>8)","med_us":72.347,"p10_us":72.094,"p90_us":73.668,"ratio":1.9518,"gbps":1015.91,"graph":0,"flush":0}
+KBJSON {"tag":"review prefill collapse B=512 direct warm inner=3","variant":"mhc_fast collapse-only (1,1,B)","med_us":37.147,"p10_us":36.934,"p90_us":41.560,"ratio":1.0021,"gbps":1693.66,"graph":0,"flush":0}
+KBJSON {"tag":"review prefill collapse B=512 direct warm inner=3","variant":"CAND collapse-only + copy (integration)","med_us":40.000,"p10_us":39.800,"p90_us":40.160,"ratio":1.0791,"gbps":1575.31,"graph":0,"flush":0}
+
+== review prefill collapse B=512 direct flush40MB inner=3  (rounds=30 inner=3 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+hc_weighted_sum_batched (20,1,B)              58.25      56.41      59.71    1.000     900.0       0.0
+rms_norm_weighted_batched (B) 5120            36.19      35.95      36.44    0.621     579.5       0.0
+carry:=split D2D copy alone                    4.81       4.76       4.92    0.083      20.4       0.0
+TRIO hcw+copy+rmsw (production b>8)          103.75      94.56     105.56    1.781     708.4       0.0
+mhc_fast collapse-only (1,1,B)                67.63      63.45      73.19    1.161     930.3       0.0
+CAND collapse-only + copy (integration)       69.49      66.15      71.97    1.193     906.7       0.0
+KBJSON {"tag":"review prefill collapse B=512 direct flush40MB inner=3","variant":"hc_weighted_sum_batched (20,1,B)","med_us":58.254,"p10_us":56.414,"p90_us":59.707,"ratio":1.0000,"gbps":900.00,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=512 direct flush40MB inner=3","variant":"rms_norm_weighted_batched (B) 5120","med_us":36.187,"p10_us":35.947,"p90_us":36.440,"ratio":0.6212,"gbps":579.53,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=512 direct flush40MB inner=3","variant":"carry:=split D2D copy alone","med_us":4.813,"p10_us":4.760,"p90_us":4.920,"ratio":0.0826,"gbps":20.42,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=512 direct flush40MB inner=3","variant":"TRIO hcw+copy+rmsw (production b>8)","med_us":103.748,"p10_us":94.561,"p90_us":105.561,"ratio":1.7810,"gbps":708.43,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=512 direct flush40MB inner=3","variant":"mhc_fast collapse-only (1,1,B)","med_us":67.627,"p10_us":63.454,"p90_us":73.187,"ratio":1.1609,"gbps":930.31,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=512 direct flush40MB inner=3","variant":"CAND collapse-only + copy (integration)","med_us":69.494,"p10_us":66.148,"p90_us":71.974,"ratio":1.1930,"gbps":906.73,"graph":0,"flush":1}
+
+== review prefill collapse B=512 direct flush40MB inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+hc_weighted_sum_batched (20,1,B)             138.28     135.64     139.64    1.000     379.1       0.0
+rms_norm_weighted_batched (B) 5120            42.00      41.00      55.72    0.304     499.3       0.0
+carry:=split D2D copy alone                    7.60       7.36       8.56    0.055      12.9       0.0
+TRIO hcw+copy+rmsw (production b>8)          167.00     156.60     170.16    1.208     440.1       0.0
+mhc_fast collapse-only (1,1,B)               156.16     146.20     157.20    1.129     402.9       0.0
+CAND collapse-only + copy (integration)      166.28     162.36     167.44    1.202     379.0       0.0
+KBJSON {"tag":"review prefill collapse B=512 direct flush40MB inner=1","variant":"hc_weighted_sum_batched (20,1,B)","med_us":138.282,"p10_us":135.642,"p90_us":139.641,"ratio":1.0000,"gbps":379.14,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=512 direct flush40MB inner=1","variant":"rms_norm_weighted_batched (B) 5120","med_us":42.000,"p10_us":41.001,"p90_us":55.720,"ratio":0.3037,"gbps":499.32,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=512 direct flush40MB inner=1","variant":"carry:=split D2D copy alone","med_us":7.600,"p10_us":7.360,"p90_us":8.560,"ratio":0.0550,"gbps":12.93,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=512 direct flush40MB inner=1","variant":"TRIO hcw+copy+rmsw (production b>8)","med_us":167.002,"p10_us":156.602,"p90_us":170.162,"ratio":1.2077,"gbps":440.11,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=512 direct flush40MB inner=1","variant":"mhc_fast collapse-only (1,1,B)","med_us":156.161,"p10_us":146.202,"p90_us":157.202,"ratio":1.1293,"gbps":402.88,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=512 direct flush40MB inner=1","variant":"CAND collapse-only + copy (integration)","med_us":166.282,"p10_us":162.362,"p90_us":167.442,"ratio":1.2025,"gbps":378.95,"graph":0,"flush":1}
+
+== review prefill collapse B=1024 direct warm inner=3  (rounds=30 inner=3 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+hc_weighted_sum_batched (20,1,B)             178.95     178.74     179.15    1.000     586.0       0.0
+rms_norm_weighted_batched (B) 5120            54.91      52.80      58.80    0.307     763.9       0.0
+carry:=split D2D copy alone                    4.77       4.71       4.87    0.027      41.2       0.0
+TRIO hcw+copy+rmsw (production b>8)          236.40     234.15     238.88    1.321     621.8       0.0
+mhc_fast collapse-only (1,1,B)               213.08     212.40     213.23    1.191     590.5       0.0
+CAND collapse-only + copy (integration)      219.70     217.35     220.12    1.228     573.6       0.0
+KBJSON {"tag":"review prefill collapse B=1024 direct warm inner=3","variant":"hc_weighted_sum_batched (20,1,B)","med_us":178.949,"p10_us":178.735,"p90_us":179.149,"ratio":1.0000,"gbps":585.96,"graph":0,"flush":0}
+KBJSON {"tag":"review prefill collapse B=1024 direct warm inner=3","variant":"rms_norm_weighted_batched (B) 5120","med_us":54.907,"p10_us":52.801,"p90_us":58.801,"ratio":0.3068,"gbps":763.89,"graph":0,"flush":0}
+KBJSON {"tag":"review prefill collapse B=1024 direct warm inner=3","variant":"carry:=split D2D copy alone","med_us":4.773,"p10_us":4.707,"p90_us":4.867,"ratio":0.0267,"gbps":41.19,"graph":0,"flush":0}
+KBJSON {"tag":"review prefill collapse B=1024 direct warm inner=3","variant":"TRIO hcw+copy+rmsw (production b>8)","med_us":236.403,"p10_us":234.149,"p90_us":238.883,"ratio":1.3211,"gbps":621.81,"graph":0,"flush":0}
+KBJSON {"tag":"review prefill collapse B=1024 direct warm inner=3","variant":"mhc_fast collapse-only (1,1,B)","med_us":213.082,"p10_us":212.402,"p90_us":213.229,"ratio":1.1907,"gbps":590.52,"graph":0,"flush":0}
+KBJSON {"tag":"review prefill collapse B=1024 direct warm inner=3","variant":"CAND collapse-only + copy (integration)","med_us":219.696,"p10_us":217.349,"p90_us":220.122,"ratio":1.2277,"gbps":573.64,"graph":0,"flush":0}
+
+== review prefill collapse B=1024 direct flush40MB inner=3  (rounds=30 inner=3 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+hc_weighted_sum_batched (20,1,B)             195.22     194.99     195.28    1.000     537.1       0.0
+rms_norm_weighted_batched (B) 5120            62.24      61.65      64.37    0.319     673.9       0.0
+carry:=split D2D copy alone                    4.89       4.84       4.96    0.025      40.2       0.0
+TRIO hcw+copy+rmsw (production b>8)          257.83     254.24     260.32    1.321     570.1       0.0
+mhc_fast collapse-only (1,1,B)               232.48     232.04     234.95    1.191     541.2       0.0
+CAND collapse-only + copy (integration)      238.52     236.46     239.08    1.222     528.4       0.0
+KBJSON {"tag":"review prefill collapse B=1024 direct flush40MB inner=3","variant":"hc_weighted_sum_batched (20,1,B)","med_us":195.215,"p10_us":194.989,"p90_us":195.282,"ratio":1.0000,"gbps":537.14,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=1024 direct flush40MB inner=3","variant":"rms_norm_weighted_batched (B) 5120","med_us":62.241,"p10_us":61.654,"p90_us":64.374,"ratio":0.3188,"gbps":673.88,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=1024 direct flush40MB inner=3","variant":"carry:=split D2D copy alone","med_us":4.893,"p10_us":4.840,"p90_us":4.960,"ratio":0.0251,"gbps":40.18,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=1024 direct flush40MB inner=3","variant":"TRIO hcw+copy+rmsw (production b>8)","med_us":257.830,"p10_us":254.243,"p90_us":260.323,"ratio":1.3207,"gbps":570.13,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=1024 direct flush40MB inner=3","variant":"mhc_fast collapse-only (1,1,B)","med_us":232.483,"p10_us":232.043,"p90_us":234.949,"ratio":1.1909,"gbps":541.24,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=1024 direct flush40MB inner=3","variant":"CAND collapse-only + copy (integration)","med_us":238.523,"p10_us":236.456,"p90_us":239.083,"ratio":1.2218,"gbps":528.36,"graph":0,"flush":1}
+
+== review prefill collapse B=1024 direct flush40MB inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+hc_weighted_sum_batched (20,1,B)             232.04     231.00     232.52    1.000     451.9       0.0
+rms_norm_weighted_batched (B) 5120            96.52      95.40     100.16    0.416     434.5       0.0
+carry:=split D2D copy alone                    7.60       7.56       7.68    0.033      25.9       0.0
+TRIO hcw+copy+rmsw (production b>8)          308.48     294.20     320.92    1.329     476.5       0.0
+mhc_fast collapse-only (1,1,B)               270.08     267.20     273.96    1.164     465.9       0.0
+CAND collapse-only + copy (integration)      278.88     277.40     280.64    1.202     451.9       0.0
+KBJSON {"tag":"review prefill collapse B=1024 direct flush40MB inner=1","variant":"hc_weighted_sum_batched (20,1,B)","med_us":232.042,"p10_us":231.003,"p90_us":232.522,"ratio":1.0000,"gbps":451.89,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=1024 direct flush40MB inner=1","variant":"rms_norm_weighted_batched (B) 5120","med_us":96.521,"p10_us":95.401,"p90_us":100.161,"ratio":0.4160,"gbps":434.55,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=1024 direct flush40MB inner=1","variant":"carry:=split D2D copy alone","med_us":7.600,"p10_us":7.560,"p90_us":7.680,"ratio":0.0328,"gbps":25.87,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=1024 direct flush40MB inner=1","variant":"TRIO hcw+copy+rmsw (production b>8)","med_us":308.484,"p10_us":294.203,"p90_us":320.924,"ratio":1.3294,"gbps":476.52,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=1024 direct flush40MB inner=1","variant":"mhc_fast collapse-only (1,1,B)","med_us":270.083,"p10_us":267.203,"p90_us":273.963,"ratio":1.1639,"gbps":465.89,"graph":0,"flush":1}
+KBJSON {"tag":"review prefill collapse B=1024 direct flush40MB inner=1","variant":"CAND collapse-only + copy (integration)","med_us":278.884,"p10_us":277.403,"p90_us":280.643,"ratio":1.2019,"gbps":451.89,"graph":0,"flush":1}
+
+== review prefill collapse B=1 direct warm inner=3  (rounds=20 inner=3 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+hc_weighted_sum_batched (20,1,B)               4.89       4.84       4.93    1.000      20.9       0.0
+rms_norm_weighted_batched (B) 5120            11.88      11.80      11.99    2.428       3.4       0.0
+carry:=split D2D copy alone                    4.51       4.47       4.55    0.921       0.0       0.0
+TRIO hcw+copy+rmsw (production b>8)           17.92      17.77      18.03    3.662       8.0       0.0
+mhc_fast collapse-only (1,1,B)                 5.89       5.85       5.93    1.204      20.9       0.0
+CAND collapse-only + copy (integration)        8.71       8.68       8.80    1.779      14.1       0.0
+KBJSON {"tag":"review prefill collapse B=1 direct warm inner=3","variant":"hc_weighted_sum_batched (20,1,B)","med_us":4.893,"p10_us":4.840,"p90_us":4.933,"ratio":1.0000,"gbps":20.93,"graph":0,"flush":0}
+KBJSON {"tag":"review prefill collapse B=1 direct warm inner=3","variant":"rms_norm_weighted_batched (B) 5120","med_us":11.880,"p10_us":11.800,"p90_us":11.987,"ratio":2.4278,"gbps":3.45,"graph":0,"flush":0}
+KBJSON {"tag":"review prefill collapse B=1 direct warm inner=3","variant":"carry:=split D2D copy alone","med_us":4.507,"p10_us":4.467,"p90_us":4.547,"ratio":0.9210,"gbps":0.04,"graph":0,"flush":0}
+KBJSON {"tag":"review prefill collapse B=1 direct warm inner=3","variant":"TRIO hcw+copy+rmsw (production b>8)","med_us":17.920,"p10_us":17.774,"p90_us":18.027,"ratio":3.6622,"gbps":8.01,"graph":0,"flush":0}
+KBJSON {"tag":"review prefill collapse B=1 direct warm inner=3","variant":"mhc_fast collapse-only (1,1,B)","med_us":5.893,"p10_us":5.853,"p90_us":5.934,"ratio":1.2044,"gbps":20.85,"graph":0,"flush":0}
+KBJSON {"tag":"review prefill collapse B=1 direct warm inner=3","variant":"CAND collapse-only + copy (integration)","med_us":8.707,"p10_us":8.680,"p90_us":8.800,"ratio":1.7794,"gbps":14.13,"graph":0,"flush":0}

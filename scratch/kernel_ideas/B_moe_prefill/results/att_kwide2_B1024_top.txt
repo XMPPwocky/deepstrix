@@ -1,0 +1,34 @@
+rows=1185 hitcount=7350796 latency=46853265 stall=30590174 idle=23320694 (stall/latency=65.3%)
+
+# top 30 by stall
+ %stall    %lat        hit          lat        stall  insn
+  21.00   13.74      16420      6438903      6422483  s_waitcnt vmcnt(3)
+  19.10   12.50      16420      5858598      5842178  s_waitcnt vmcnt(3)
+   9.83    6.42       3272      3009800      3006528  s_waitcnt vmcnt(5)
+   1.67    1.10       3272       513613       510341  s_waitcnt vmcnt(2)
+   1.61    1.09      17030       508771       491741  s_waitcnt lgkmcnt(0)
+   1.56    1.05      16420       494004       477584  s_waitcnt lgkmcnt(0)
+   1.49    1.01      16420       473230       456810  s_waitcnt lgkmcnt(0)
+   1.42    0.93       1220       436658       435438  s_waitcnt vmcnt(4)
+   1.01    0.69      17030       324609       307579  s_waitcnt lgkmcnt(0)
+   0.71    0.50      17030       233921       216891  s_waitcnt lgkmcnt(0)
+   0.69    0.49      17030       228654       211624  s_waitcnt lgkmcnt(0)
+   0.66    0.47      17030       220083       203053  s_waitcnt lgkmcnt(0)
+   0.65    0.46      17030       215642       198612  s_waitcnt lgkmcnt(0)
+   0.64    0.45      17030       211666       194636  s_waitcnt lgkmcnt(0)
+   0.62    0.44      17030       207799       190769  s_waitcnt lgkmcnt(0)
+   0.56    0.40      17030       189324       172294  s_waitcnt lgkmcnt(0)
+   0.46    0.34      17030       159234       142204  s_waitcnt lgkmcnt(0)
+   0.29    0.23      16420       105704        89284  s_waitcnt vmcnt(2)
+   0.29    0.22      16420       104047        87627  v_dot4_i32_iu8 v103, v76, v84, 0 neg_lo:[1,1,0]
+   0.28    0.22      16420       101207        84787  v_movrels_b32_e32 v102, v32
+   0.28    0.22      16420       100928        84508  s_waitcnt vmcnt(2)
+   0.27    0.21      16420        99135        82715  v_movreld_b32_e32 v32, v102
+   0.27    0.21      16420        98458        82038  v_fmac_f32_e32 v88, v100, v87
+   0.27    0.21      16420        97742        81322  v_dot4_i32_iu8 v101, v76, v84, 0 neg_lo:[1,1,0]
+   0.26    0.21      16420        96866        80446  v_add_co_ci_u32_e64 v85, null, s4, v2, vcc_lo
+   0.26    0.21      16420        96459        80039  v_fmac_f32_e32 v101, v100, v87
+   0.26    0.20      16420        94468        78048  v_dot4_i32_iu8 v104, v72, v88, 0 neg_lo:[1,1,0]
+   0.26    0.20      16420        94433        78013  v_dot4_i32_iu8 v103, v65, v85, v103 neg_lo:[1,1,0]
+   0.25    0.20      16420        92892        76472  v_movreld_b32_e32 v16, v88
+   0.25    0.20      16420        92598        76178  v_movrels_b32_e32 v88, v16

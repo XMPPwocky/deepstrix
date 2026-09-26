@@ -1,0 +1,8 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+== REVIEW router mv 384x5120 b=4 ncopy=32 graph  (rounds=40 inner=20 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+prod f16_matvec_batched (48,1,b)              22.85      22.75      23.07    1.000     175.7       0.0
+cand f16_matvec_batched_h20                   13.19      13.11      13.31    0.577     304.4       0.0
+KBJSON {"tag":"REVIEW router mv 384x5120 b=4 ncopy=32 graph","variant":"prod f16_matvec_batched (48,1,b)","med_us":22.850,"p10_us":22.750,"p90_us":23.066,"ratio":1.0000,"gbps":175.67,"graph":1,"flush":0}
+KBJSON {"tag":"REVIEW router mv 384x5120 b=4 ncopy=32 graph","variant":"cand f16_matvec_batched_h20","med_us":13.186,"p10_us":13.114,"p90_us":13.308,"ratio":0.5771,"gbps":304.42,"graph":1,"flush":0}

@@ -18,5 +18,5 @@ if [ "$what" = all ] || [ "$what" = cand ]; then
     done
 fi
 if [ "$what" = all ] || [ "$what" = harness ]; then
-    ../_infra/kcc.sh -O2 --offload-arch=$ARCH harness.cpp -o harness_$ARCH
+    ../_infra/kcc.sh -O2 --offload-arch=$ARCH harness.cpp -o harness_$ARCH.tmp && mv harness_$ARCH.tmp harness_$ARCH
 fi

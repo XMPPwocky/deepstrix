@@ -1,0 +1,31 @@
+== 1790452566.000276.review.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[kb] LDS/CU 65536 B, regs/block 196608, L2 8388608 B
+[kb] shape engram b=200 M=25600 K=6144 G=1 ldx=0 working set ~200 MB
+[kb] flush 96 MB per timed block (total device ~296 MB)
+CMP engram b=200 q8_0_gemm_wmma_i8x_db n=5120000 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=200 q8_0_gemm_wmma_i8x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=1 q8_0_gemm_wmma_i8x_db   n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=1 q8_0_gemm_wmma_i8x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=9 q8_0_gemm_wmma_i8x_db   n=230400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=9 q8_0_gemm_wmma_i8x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=17 q8_0_gemm_wmma_i8x_db  n=435200 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=17 q8_0_gemm_wmma_i8x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=33 q8_0_gemm_wmma_i8x_db  n=844800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=33 q8_0_gemm_wmma_i8x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=63 q8_0_gemm_wmma_i8x_db  n=1612800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=63 q8_0_gemm_wmma_i8x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=65 q8_0_gemm_wmma_i8x_db  n=1664000 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=65 q8_0_gemm_wmma_i8x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=100 q8_0_gemm_wmma_i8x_db n=2560000 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=100 q8_0_gemm_wmma_i8x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram b=129 q8_0_gemm_wmma_i8x_db n=3302400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram b=129 q8_0_gemm_wmma_i8x_db","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== engram b=200 M=25600 K=6144 G=1 flush96MB  (rounds=2 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemm_wmma_lds_tiled               4672.21    4618.66    4672.21    1.000      40.4   13465.7
+cand q8_0_gemm_wmma_i8x_db                   769.89     766.05     769.89    0.165     245.5   81719.0
+KBJSON {"tag":"engram b=200 M=25600 K=6144 G=1 flush96MB","variant":"base q8_0_gemm_wmma_lds_tiled","med_us":4672.215,"p10_us":4618.655,"p90_us":4672.215,"ratio":1.0000,"gbps":40.45,"graph":0,"flush":1}
+KBJSON {"tag":"engram b=200 M=25600 K=6144 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_i8x_db","med_us":769.889,"p10_us":766.049,"p90_us":769.889,"ratio":0.1648,"gbps":245.46,"graph":0,"flush":1}

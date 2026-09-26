@@ -1,0 +1,4 @@
+912a1246cb716178755aac9e625ffa4d60b2bbff0620f8428fb637e3a87f30e0  /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/crates/v4flash-kernels/kernels/q8_0_matvec.hip
+36557d31753bced4a799573301c6449f752c006bd58487347083e4ac30da49ab  /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/crates/v4flash-kernels/kernels/q8_0_grouped_matvec.hip
+7f6241d2a184d378f308d08a86218d9bbb74900d07e425fab7d1ab17a23f8188  cand.hip
+7037fbddd2700e393558cc86ab1a89a048a79bff13c7a3ca43655d7ef5f65979  harness.cpp

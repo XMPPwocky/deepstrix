@@ -1,0 +1,130 @@
+== 1790451068.000071.C1_dense_decode.dgpu rc=0
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+#### quant 32768 2
+quant ptrs: x=0x75b8a4a00000 xq=0x75b797400000 xs=0x75b797000000 xq2=0x75b796c00000 xs2=0x75b796800000 (offs 0 0 0)
+quant grid: base 2048+0 WGs x 32, wave 256+0 WGs x 256
+CMP quant_wave xq K=32768 b=2 int8_diff=0
+CMP quant_wave xscale vs base          n=2048 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"quant_wave xscale vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== quantize K=32768 b=2 offs=0/0/0 WARM(inner10,no flush) graph  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_quantize_f32 (blocks x 32thr)       16.83      16.77      16.84    1.000      19.5       0.0
+cand q8_0_quantize_f32_wave                   16.54      16.51      16.58    0.983      19.8       0.0
+null 1-WG kernel (launch floor)                3.26       3.25       3.28    0.194       0.0       0.0
+KBJSON {"tag":"quantize K=32768 b=2 offs=0/0/0 WARM(inner10,no flush) graph","variant":"base q8_0_quantize_f32 (blocks x 32thr)","med_us":16.828,"p10_us":16.768,"p90_us":16.844,"ratio":1.0000,"gbps":19.47,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=2 offs=0/0/0 WARM(inner10,no flush) graph","variant":"cand q8_0_quantize_f32_wave","med_us":16.540,"p10_us":16.508,"p90_us":16.576,"ratio":0.9829,"gbps":19.81,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=2 offs=0/0/0 WARM(inner10,no flush) graph","variant":"null 1-WG kernel (launch floor)","med_us":3.264,"p10_us":3.252,"p90_us":3.276,"ratio":0.1940,"gbps":0.00,"graph":1,"flush":0}
+
+#### quant 32768 4
+quant ptrs: x=0x75b796800000 xq=0x75b8a4a00000 xs=0x75b796c00000 xq2=0x75b797000000 xs2=0x75b797400000 (offs 0 0 0)
+quant grid: base 4096+0 WGs x 32, wave 512+0 WGs x 256
+CMP quant_wave xq K=32768 b=4 int8_diff=0
+CMP quant_wave xscale vs base          n=4096 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"quant_wave xscale vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== quantize K=32768 b=4 offs=0/0/0 WARM(inner10,no flush) graph  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_quantize_f32 (blocks x 32thr)       18.61      17.42      19.75    1.000      35.2       0.0
+cand q8_0_quantize_f32_wave                   17.63      17.60      17.67    0.948      37.2       0.0
+null 1-WG kernel (launch floor)                3.26       3.25       3.27    0.175       0.0       0.0
+KBJSON {"tag":"quantize K=32768 b=4 offs=0/0/0 WARM(inner10,no flush) graph","variant":"base q8_0_quantize_f32 (blocks x 32thr)","med_us":18.608,"p10_us":17.424,"p90_us":19.752,"ratio":1.0000,"gbps":35.22,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=4 offs=0/0/0 WARM(inner10,no flush) graph","variant":"cand q8_0_quantize_f32_wave","med_us":17.632,"p10_us":17.600,"p90_us":17.668,"ratio":0.9475,"gbps":37.17,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=4 offs=0/0/0 WARM(inner10,no flush) graph","variant":"null 1-WG kernel (launch floor)","med_us":3.260,"p10_us":3.252,"p90_us":3.272,"ratio":0.1752,"gbps":0.00,"graph":1,"flush":0}
+
+#### quant 32768 1
+quant ptrs: x=0x75b8a4a00000 xq=0x75b797400000 xs=0x75b797000000 xq2=0x75b796c00000 xs2=0x75b796800000 (offs 0 0 0)
+quant grid: base 1024+0 WGs x 32, wave 128+0 WGs x 256
+CMP quant_wave xq K=32768 b=1 int8_diff=0
+CMP quant_wave xscale vs base          n=1024 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"quant_wave xscale vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== quantize K=32768 b=1 offs=0/0/0 WARM(inner10,no flush) graph  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_quantize_f32 (blocks x 32thr)        4.80       4.76       4.83    1.000      34.1       0.0
+cand q8_0_quantize_f32_wave                    3.68       3.66       3.70    0.767      44.5       0.0
+null 1-WG kernel (launch floor)                3.25       3.23       3.27    0.677       0.0       0.0
+KBJSON {"tag":"quantize K=32768 b=1 offs=0/0/0 WARM(inner10,no flush) graph","variant":"base q8_0_quantize_f32 (blocks x 32thr)","med_us":4.800,"p10_us":4.764,"p90_us":4.832,"ratio":1.0000,"gbps":34.13,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=1 offs=0/0/0 WARM(inner10,no flush) graph","variant":"cand q8_0_quantize_f32_wave","med_us":3.680,"p10_us":3.660,"p90_us":3.704,"ratio":0.7667,"gbps":44.52,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=1 offs=0/0/0 WARM(inner10,no flush) graph","variant":"null 1-WG kernel (launch floor)","med_us":3.248,"p10_us":3.228,"p90_us":3.268,"ratio":0.6767,"gbps":0.00,"graph":1,"flush":0}
+
+#### quant 65536 1
+quant ptrs: x=0x75b8a4a00000 xq=0x75b796800000 xs=0x75b796c00000 xq2=0x75b797000000 xs2=0x75b797400000 (offs 0 0 0)
+quant grid: base 2048+0 WGs x 32, wave 256+0 WGs x 256
+CMP quant_wave xq K=65536 b=1 int8_diff=0
+CMP quant_wave xscale vs base          n=2048 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"quant_wave xscale vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== quantize K=65536 b=1 offs=0/0/0 WARM(inner10,no flush) graph  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_quantize_f32 (blocks x 32thr)       16.74      16.71      16.77    1.000      19.6       0.0
+cand q8_0_quantize_f32_wave                   16.49      16.46      16.52    0.985      19.9       0.0
+null 1-WG kernel (launch floor)                3.23       3.21       3.24    0.193       0.0       0.0
+KBJSON {"tag":"quantize K=65536 b=1 offs=0/0/0 WARM(inner10,no flush) graph","variant":"base q8_0_quantize_f32 (blocks x 32thr)","med_us":16.744,"p10_us":16.708,"p90_us":16.772,"ratio":1.0000,"gbps":19.57,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=65536 b=1 offs=0/0/0 WARM(inner10,no flush) graph","variant":"cand q8_0_quantize_f32_wave","med_us":16.492,"p10_us":16.456,"p90_us":16.520,"ratio":0.9849,"gbps":19.87,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=65536 b=1 offs=0/0/0 WARM(inner10,no flush) graph","variant":"null 1-WG kernel (launch floor)","med_us":3.228,"p10_us":3.212,"p90_us":3.240,"ratio":0.1928,"gbps":0.00,"graph":1,"flush":0}
+
+#### quant 32800 2
+quant ptrs: x=0x75b797400000 xq=0x75b8a4a00000 xs=0x75b797000000 xq2=0x75b796c00000 xs2=0x75b796800000 (offs 0 0 0)
+quant grid: base 2050+0 WGs x 32, wave 257+0 WGs x 256
+CMP quant_wave xq K=32800 b=2 int8_diff=0
+CMP quant_wave xscale vs base          n=2050 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"quant_wave xscale vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== quantize K=32800 b=2 offs=0/0/0 WARM(inner10,no flush) graph  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_quantize_f32 (blocks x 32thr)        6.01       5.98       6.04    1.000      54.6       0.0
+cand q8_0_quantize_f32_wave                    4.05       4.02       4.07    0.673      81.0       0.0
+null 1-WG kernel (launch floor)                3.22       3.20       3.23    0.535       0.0       0.0
+KBJSON {"tag":"quantize K=32800 b=2 offs=0/0/0 WARM(inner10,no flush) graph","variant":"base q8_0_quantize_f32 (blocks x 32thr)","med_us":6.012,"p10_us":5.976,"p90_us":6.036,"ratio":1.0000,"gbps":54.56,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32800 b=2 offs=0/0/0 WARM(inner10,no flush) graph","variant":"cand q8_0_quantize_f32_wave","med_us":4.048,"p10_us":4.024,"p90_us":4.068,"ratio":0.6733,"gbps":81.03,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32800 b=2 offs=0/0/0 WARM(inner10,no flush) graph","variant":"null 1-WG kernel (launch floor)","med_us":3.216,"p10_us":3.196,"p90_us":3.232,"ratio":0.5349,"gbps":0.00,"graph":1,"flush":0}
+
+#### quant 16384 4
+quant ptrs: x=0x75b8a4a00000 xq=0x75b796800000 xs=0x75b796c00000 xq2=0x75b797000000 xs2=0x75b797400000 (offs 0 0 0)
+quant grid: base 2048+0 WGs x 32, wave 256+0 WGs x 256
+CMP quant_wave xq K=16384 b=4 int8_diff=0
+CMP quant_wave xscale vs base          n=2048 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"quant_wave xscale vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== quantize K=16384 b=4 offs=0/0/0 WARM(inner10,no flush) graph  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_quantize_f32 (blocks x 32thr)       16.65      16.61      16.68    1.000      19.7       0.0
+cand q8_0_quantize_f32_wave                   16.39      16.36      16.42    0.984      20.0       0.0
+null 1-WG kernel (launch floor)                3.20       3.18       3.20    0.192       0.0       0.0
+KBJSON {"tag":"quantize K=16384 b=4 offs=0/0/0 WARM(inner10,no flush) graph","variant":"base q8_0_quantize_f32 (blocks x 32thr)","med_us":16.652,"p10_us":16.608,"p90_us":16.676,"ratio":1.0000,"gbps":19.68,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=16384 b=4 offs=0/0/0 WARM(inner10,no flush) graph","variant":"cand q8_0_quantize_f32_wave","med_us":16.388,"p10_us":16.360,"p90_us":16.416,"ratio":0.9842,"gbps":19.99,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=16384 b=4 offs=0/0/0 WARM(inner10,no flush) graph","variant":"null 1-WG kernel (launch floor)","med_us":3.196,"p10_us":3.180,"p90_us":3.204,"ratio":0.1919,"gbps":0.00,"graph":1,"flush":0}
+
+#### quant 5120 4
+quant ptrs: x=0x75b8a4a00000 xq=0x75b797400000 xs=0x75b797000000 xq2=0x75b796c00000 xs2=0x75b796800000 (offs 0 0 0)
+quant grid: base 640+0 WGs x 32, wave 80+0 WGs x 256
+CMP quant_wave xq K=5120 b=4 int8_diff=0
+CMP quant_wave xscale vs base          n=640 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"quant_wave xscale vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== quantize K=5120 b=4 offs=0/0/0 WARM(inner10,no flush) graph  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_quantize_f32 (blocks x 32thr)        4.38       4.35       4.40    1.000      23.4       0.0
+cand q8_0_quantize_f32_wave                    3.56       3.53       3.58    0.813      28.8       0.0
+null 1-WG kernel (launch floor)                3.19       3.18       3.21    0.729       0.0       0.0
+KBJSON {"tag":"quantize K=5120 b=4 offs=0/0/0 WARM(inner10,no flush) graph","variant":"base q8_0_quantize_f32 (blocks x 32thr)","med_us":4.376,"p10_us":4.348,"p90_us":4.400,"ratio":1.0000,"gbps":23.40,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=5120 b=4 offs=0/0/0 WARM(inner10,no flush) graph","variant":"cand q8_0_quantize_f32_wave","med_us":3.556,"p10_us":3.532,"p90_us":3.576,"ratio":0.8126,"gbps":28.80,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=5120 b=4 offs=0/0/0 WARM(inner10,no flush) graph","variant":"null 1-WG kernel (launch floor)","med_us":3.188,"p10_us":3.176,"p90_us":3.208,"ratio":0.7285,"gbps":0.00,"graph":1,"flush":0}
+
+#### quant 8192 4
+quant ptrs: x=0x75b8a4a00000 xq=0x75b796800000 xs=0x75b796c00000 xq2=0x75b797000000 xs2=0x75b797400000 (offs 0 0 0)
+quant grid: base 1024+0 WGs x 32, wave 128+0 WGs x 256
+CMP quant_wave xq K=8192 b=4 int8_diff=0
+CMP quant_wave xscale vs base          n=1024 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"quant_wave xscale vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== quantize K=8192 b=4 offs=0/0/0 WARM(inner10,no flush) graph  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_quantize_f32 (blocks x 32thr)        4.76       4.69       4.78    1.000      34.4       0.0
+cand q8_0_quantize_f32_wave                    3.60       3.58       3.62    0.758      45.5       0.0
+null 1-WG kernel (launch floor)                3.18       3.16       3.20    0.668       0.0       0.0
+KBJSON {"tag":"quantize K=8192 b=4 offs=0/0/0 WARM(inner10,no flush) graph","variant":"base q8_0_quantize_f32 (blocks x 32thr)","med_us":4.756,"p10_us":4.692,"p90_us":4.780,"ratio":1.0000,"gbps":34.45,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=8192 b=4 offs=0/0/0 WARM(inner10,no flush) graph","variant":"cand q8_0_quantize_f32_wave","med_us":3.604,"p10_us":3.584,"p90_us":3.620,"ratio":0.7578,"gbps":45.46,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=8192 b=4 offs=0/0/0 WARM(inner10,no flush) graph","variant":"null 1-WG kernel (launch floor)","med_us":3.176,"p10_us":3.156,"p90_us":3.196,"ratio":0.6678,"gbps":0.00,"graph":1,"flush":0}

@@ -1,0 +1,114 @@
+== 1790452713.000294.review.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+######## b=16 128+512 gathered (max production b)  b=16 n_total_max=640 comp=gathered(512) mask=null
+CMP dec_score vs mixed_score (prod twin)       bitexact=YES bit_diff=0 written=655360 expected=655360 neg_inf=0
+CMP attention_dec_score_blk256                 bitexact=YES bit_diff=0 written=655360 (ref 655360)
+KBJSON {"cmp":"attention_dec_score_blk256 b=16 128+512 gathered (max production b)","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk128                 bitexact=YES bit_diff=0 written=655360 (ref 655360)
+KBJSON {"cmp":"attention_dec_score_blk128 b=16 128+512 gathered (max production b)","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk64                  bitexact=YES bit_diff=0 written=655360 (ref 655360)
+KBJSON {"cmp":"attention_dec_score_blk64 b=16 128+512 gathered (max production b)","bitexact":1,"bit_diff":0,"written_ok":1}
+
+######## b=16 128+512 dense store  b=16 n_total_max=640 comp=dense(base_per) mask=null
+CMP dec_score vs mixed_score (prod twin)       bitexact=YES bit_diff=0 written=655360 expected=655360 neg_inf=0
+CMP attention_dec_score_blk256                 bitexact=YES bit_diff=0 written=655360 (ref 655360)
+KBJSON {"cmp":"attention_dec_score_blk256 b=16 128+512 dense store","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk128                 bitexact=YES bit_diff=0 written=655360 (ref 655360)
+KBJSON {"cmp":"attention_dec_score_blk128 b=16 128+512 dense store","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk64                  bitexact=YES bit_diff=0 written=655360 (ref 655360)
+KBJSON {"cmp":"attention_dec_score_blk64 b=16 128+512 dense store","bitexact":1,"bit_diff":0,"written_ok":1}
+
+######## b=1 128+1 (n_total_max=129: 3 blk128 WGs vs 1 base WG)  b=1 n_total_max=129 comp=gathered(512) mask=null
+CMP dec_score vs mixed_score (prod twin)       bitexact=YES bit_diff=0 written=8256 expected=8256 neg_inf=0
+CMP attention_dec_score_blk256                 bitexact=YES bit_diff=0 written=8256 (ref 8256)
+KBJSON {"cmp":"attention_dec_score_blk256 b=1 128+1 (n_total_max=129: 3 blk128 WGs vs 1 base WG)","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk128                 bitexact=YES bit_diff=0 written=8256 (ref 8256)
+KBJSON {"cmp":"attention_dec_score_blk128 b=1 128+1 (n_total_max=129: 3 blk128 WGs vs 1 base WG)","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk64                  bitexact=YES bit_diff=0 written=8256 (ref 8256)
+KBJSON {"cmp":"attention_dec_score_blk64 b=1 128+1 (n_total_max=129: 3 blk128 WGs vs 1 base WG)","bitexact":1,"bit_diff":0,"written_ok":1}
+
+######## b=7 odd rows, ragged tails  b=7 n_total_max=639 comp=gathered(512) mask=null
+CMP dec_score vs mixed_score (prod twin)       bitexact=YES bit_diff=0 written=112576 expected=112576 neg_inf=0
+CMP attention_dec_score_blk256                 bitexact=YES bit_diff=0 written=112576 (ref 112576)
+KBJSON {"cmp":"attention_dec_score_blk256 b=7 odd rows, ragged tails","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk128                 bitexact=YES bit_diff=0 written=112576 (ref 112576)
+KBJSON {"cmp":"attention_dec_score_blk128 b=7 odd rows, ragged tails","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk64                  bitexact=YES bit_diff=0 written=112576 (ref 112576)
+KBJSON {"cmp":"attention_dec_score_blk64 b=7 odd rows, ragged tails","bitexact":1,"bit_diff":0,"written_ok":1}
+
+######## b=13 128+33 (n_total_max=161)  b=13 n_total_max=161 comp=gathered(512) mask=null
+CMP dec_score vs mixed_score (prod twin)       bitexact=YES bit_diff=0 written=133952 expected=133952 neg_inf=0
+CMP attention_dec_score_blk256                 bitexact=YES bit_diff=0 written=133952 (ref 133952)
+KBJSON {"cmp":"attention_dec_score_blk256 b=13 128+33 (n_total_max=161)","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk128                 bitexact=YES bit_diff=0 written=133952 (ref 133952)
+KBJSON {"cmp":"attention_dec_score_blk128 b=13 128+33 (n_total_max=161)","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk64                  bitexact=YES bit_diff=0 written=133952 (ref 133952)
+KBJSON {"cmp":"attention_dec_score_blk64 b=13 128+33 (n_total_max=161)","bitexact":1,"bit_diff":0,"written_ok":1}
+
+######## b=3 128+512 with comp_allowed_bits mask  b=3 n_total_max=640 comp=gathered(512) mask=yes
+CMP dec_score vs mixed_score (prod twin)       bitexact=YES bit_diff=0 written=122880 expected=122880 neg_inf=47744
+CMP attention_dec_score_blk256                 bitexact=YES bit_diff=0 written=122880 (ref 122880)
+KBJSON {"cmp":"attention_dec_score_blk256 b=3 128+512 with comp_allowed_bits mask","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk128                 bitexact=YES bit_diff=0 written=122880 (ref 122880)
+KBJSON {"cmp":"attention_dec_score_blk128 b=3 128+512 with comp_allowed_bits mask","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk64                  bitexact=YES bit_diff=0 written=122880 (ref 122880)
+KBJSON {"cmp":"attention_dec_score_blk64 b=3 128+512 with comp_allowed_bits mask","bitexact":1,"bit_diff":0,"written_ok":1}
+
+######## b=3 dense store + mask, ragged  b=3 n_total_max=640 comp=dense(base_per) mask=yes
+CMP dec_score vs mixed_score (prod twin)       bitexact=YES bit_diff=0 written=69696 expected=69696 neg_inf=27264
+CMP attention_dec_score_blk256                 bitexact=YES bit_diff=0 written=69696 (ref 69696)
+KBJSON {"cmp":"attention_dec_score_blk256 b=3 dense store + mask, ragged","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk128                 bitexact=YES bit_diff=0 written=69696 (ref 69696)
+KBJSON {"cmp":"attention_dec_score_blk128 b=3 dense store + mask, ragged","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk64                  bitexact=YES bit_diff=0 written=69696 (ref 69696)
+KBJSON {"cmp":"attention_dec_score_blk64 b=3 dense store + mask, ragged","bitexact":1,"bit_diff":0,"written_ok":1}
+
+######## b=1 no raw window (0+512)  b=1 n_total_max=512 comp=gathered(512) mask=null
+CMP dec_score vs mixed_score (prod twin)       bitexact=YES bit_diff=0 written=32768 expected=32768 neg_inf=0
+CMP attention_dec_score_blk256                 bitexact=YES bit_diff=0 written=32768 (ref 32768)
+KBJSON {"cmp":"attention_dec_score_blk256 b=1 no raw window (0+512)","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk128                 bitexact=YES bit_diff=0 written=32768 (ref 32768)
+KBJSON {"cmp":"attention_dec_score_blk128 b=1 no raw window (0+512)","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk64                  bitexact=YES bit_diff=0 written=32768 (ref 32768)
+KBJSON {"cmp":"attention_dec_score_blk64 b=1 no raw window (0+512)","bitexact":1,"bit_diff":0,"written_ok":1}
+
+######## b=2 128+64 (n_total=192 = 3x64, not a multiple of 256)  b=2 n_total_max=192 comp=gathered(512) mask=null
+CMP dec_score vs mixed_score (prod twin)       bitexact=YES bit_diff=0 written=24576 expected=24576 neg_inf=0
+CMP attention_dec_score_blk256                 bitexact=YES bit_diff=0 written=24576 (ref 24576)
+KBJSON {"cmp":"attention_dec_score_blk256 b=2 128+64 (n_total=192 = 3x64, not a multiple of 256)","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk128                 bitexact=YES bit_diff=0 written=24576 (ref 24576)
+KBJSON {"cmp":"attention_dec_score_blk128 b=2 128+64 (n_total=192 = 3x64, not a multiple of 256)","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk64                  bitexact=YES bit_diff=0 written=24576 (ref 24576)
+KBJSON {"cmp":"attention_dec_score_blk64 b=2 128+64 (n_total=192 = 3x64, not a multiple of 256)","bitexact":1,"bit_diff":0,"written_ok":1}
+
+######## b=16 with an empty row and ragged tails  b=16 n_total_max=640 comp=gathered(512) mask=null
+CMP dec_score vs mixed_score (prod twin)       bitexact=YES bit_diff=0 written=520320 expected=520320 neg_inf=0
+CMP attention_dec_score_blk256                 bitexact=YES bit_diff=0 written=520320 (ref 520320)
+KBJSON {"cmp":"attention_dec_score_blk256 b=16 with an empty row and ragged tails","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk128                 bitexact=YES bit_diff=0 written=520320 (ref 520320)
+KBJSON {"cmp":"attention_dec_score_blk128 b=16 with an empty row and ragged tails","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk64                  bitexact=YES bit_diff=0 written=520320 (ref 520320)
+KBJSON {"cmp":"attention_dec_score_blk64 b=16 with an empty row and ragged tails","bitexact":1,"bit_diff":0,"written_ok":1}
+
+######## b=1 128+17 masked (n_total=145, 16-key tile partially past n_total)  b=1 n_total_max=145 comp=gathered(512) mask=yes
+CMP dec_score vs mixed_score (prod twin)       bitexact=YES bit_diff=0 written=9280 expected=9280 neg_inf=448
+CMP attention_dec_score_blk256                 bitexact=YES bit_diff=0 written=9280 (ref 9280)
+KBJSON {"cmp":"attention_dec_score_blk256 b=1 128+17 masked (n_total=145, 16-key tile partially past n_total)","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk128                 bitexact=YES bit_diff=0 written=9280 (ref 9280)
+KBJSON {"cmp":"attention_dec_score_blk128 b=1 128+17 masked (n_total=145, 16-key tile partially past n_total)","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk64                  bitexact=YES bit_diff=0 written=9280 (ref 9280)
+KBJSON {"cmp":"attention_dec_score_blk64 b=1 128+17 masked (n_total=145, 16-key tile partially past n_total)","bitexact":1,"bit_diff":0,"written_ok":1}
+
+######## b=1 9 keys only (single partial tile)  b=1 n_total_max=9 comp=gathered(512) mask=null
+CMP dec_score vs mixed_score (prod twin)       bitexact=YES bit_diff=0 written=576 expected=576 neg_inf=0
+CMP attention_dec_score_blk256                 bitexact=YES bit_diff=0 written=576 (ref 576)
+KBJSON {"cmp":"attention_dec_score_blk256 b=1 9 keys only (single partial tile)","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk128                 bitexact=YES bit_diff=0 written=576 (ref 576)
+KBJSON {"cmp":"attention_dec_score_blk128 b=1 9 keys only (single partial tile)","bitexact":1,"bit_diff":0,"written_ok":1}
+CMP attention_dec_score_blk64                  bitexact=YES bit_diff=0 written=576 (ref 576)
+KBJSON {"cmp":"attention_dec_score_blk64 b=1 9 keys only (single partial tile)","bitexact":1,"bit_diff":0,"written_ok":1}
+
+TOTAL_BAD=0
+KBJSON {"cmp":"reviewer extra shapes all candidates","bitexact":1,"bit_diff":0}

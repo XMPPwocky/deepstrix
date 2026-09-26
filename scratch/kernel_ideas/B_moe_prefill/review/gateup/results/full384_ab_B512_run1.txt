@@ -1,0 +1,22 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[cand] ./cand_wmma_gfx1151.hsaco
+[review] E8M0 scale bytes in [116, 129)
+[setup] B=512 n_exp=384 members=3072 touched=384 max_group=18 n_wi_exact=384 n_wi_bound=480  mean members/expert=8.0
+[review] ab grid.y=480 (bound+devcount)
+ROOFLINE gate+up: 4.859 GB (weights 4.813 GB) -> 21.13 ms at 230 GB/s; 145.0 GFLOP
+ROOFLINE down:    2.477 GB (weights 2.406 GB) -> 10.77 ms at 230 GB/s; 72.5 GFLOP
+SCALE: x1.00 to a full 384-expert layer (this launch touches 384 experts)
+
+== gate+up A/B B=512 n_exp=384 members=3072 touched=384  (rounds=10 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide gate+up (prod)                       31763.30   30883.43   32123.45    1.000     153.0    4563.6
+gu_wmma gate+up (cand)                     26960.80   25957.96   27558.38    0.849     180.2    5376.5
+KBJSON {"tag":"gate+up A/B B=512 n_exp=384 members=3072 touched=384","variant":"kwide gate+up (prod)","med_us":31763.298,"p10_us":30883.429,"p90_us":32123.447,"ratio":1.0000,"gbps":152.98,"graph":0,"flush":0}
+KBJSON {"tag":"gate+up A/B B=512 n_exp=384 members=3072 touched=384","variant":"gu_wmma gate+up (cand)","med_us":26960.800,"p10_us":25957.962,"p90_us":27558.378,"ratio":0.8488,"gbps":180.23,"graph":0,"flush":0}
+
+== down A/B B=512 n_exp=384 members=3072 touched=384  (rounds=10 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide2 down (prod)                         21786.12   20904.45   22077.89    1.000     113.7    3326.8
+down_wmma (cand)                           11827.64   11653.39   11917.30    0.543     209.5    6127.8
+KBJSON {"tag":"down A/B B=512 n_exp=384 members=3072 touched=384","variant":"kwide2 down (prod)","med_us":21786.119,"p10_us":20904.453,"p90_us":22077.890,"ratio":1.0000,"gbps":113.72,"graph":0,"flush":0}
+KBJSON {"tag":"down A/B B=512 n_exp=384 members=3072 touched=384","variant":"down_wmma (cand)","med_us":11827.644,"p10_us":11653.391,"p90_us":11917.301,"ratio":0.5429,"gbps":209.46,"graph":0,"flush":0}

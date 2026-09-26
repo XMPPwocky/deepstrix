@@ -1,0 +1,14 @@
+== 1790452072.000222.review.igpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+== b=4
+[h] pool: 16 experts x 18.8 MB = 301 MB on device
+[h] b=4 E=4 ppr=3: members/call=12.0 distinct experts/call=4 n_wi exact=4 bound=24
+[h] distinct experts actually read per call (avg over 8 selections): 4.00
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+roofline (4.00 distinct experts): gate/up 50.1 MB -> 234.3 us; down 25.1 MB -> 117.1 us at 214 GB/s
+== b=8
+[h] pool: 16 experts x 18.8 MB = 301 MB on device
+[h] b=8 E=4 ppr=3: members/call=24.0 distinct experts/call=4 n_wi exact=4 bound=48
+[h] distinct experts actually read per call (avg over 8 selections): 4.00
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+roofline (4.00 distinct experts): gate/up 50.1 MB -> 234.3 us; down 25.1 MB -> 117.1 us at 214 GB/s

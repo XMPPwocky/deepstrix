@@ -1,0 +1,19 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[setup] B=512 n_exp=96 members=756 touched=96 max_group=15 n_wi_exact=96 n_wi_bound=480  mean members/expert=7.9
+ROOFLINE gate+up: 1.215 GB (weights 1.203 GB) -> 5.28 ms at 230 GB/s; 35.7 GFLOP
+ROOFLINE down:    0.619 GB (weights 0.602 GB) -> 2.69 ms at 230 GB/s; 17.8 GFLOP
+SCALE: x4.00 to a full 384-expert layer (this launch touches 96 experts)
+
+== gate+up A/B B=512 n_exp=96 members=756 touched=96  (rounds=20 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide gate+up (prod)                        8281.00    8228.16    8319.48    1.000     146.7    4307.8
+gu_wmma gate+up (cand)                      6710.53    6657.99    6791.93    0.810     181.0    5315.9
+KBJSON {"tag":"gate+up A/B B=512 n_exp=96 members=756 touched=96","variant":"kwide gate+up (prod)","med_us":8281.002,"p10_us":8228.165,"p90_us":8319.482,"ratio":1.0000,"gbps":146.68,"graph":0,"flush":0}
+KBJSON {"tag":"gate+up A/B B=512 n_exp=96 members=756 touched=96","variant":"gu_wmma gate+up (cand)","med_us":6710.533,"p10_us":6657.993,"p90_us":6791.929,"ratio":0.8104,"gbps":181.00,"graph":0,"flush":0}
+
+== down A/B B=512 n_exp=96 members=756 touched=96  (rounds=20 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide2 down (prod)                          5807.16    5671.76    5878.94    1.000     106.6    3071.4
+down_wmma (cand)                            3042.35    3000.71    3128.40    0.524     203.5    5862.7
+KBJSON {"tag":"down A/B B=512 n_exp=96 members=756 touched=96","variant":"kwide2 down (prod)","med_us":5807.160,"p10_us":5671.764,"p90_us":5878.937,"ratio":1.0000,"gbps":106.61,"graph":0,"flush":0}
+KBJSON {"tag":"down A/B B=512 n_exp=96 members=756 touched=96","variant":"down_wmma (cand)","med_us":3042.346,"p10_us":3000.706,"p90_us":3128.403,"ratio":0.5239,"gbps":203.49,"graph":0,"flush":0}

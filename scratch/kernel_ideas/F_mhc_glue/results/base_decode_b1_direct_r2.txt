@@ -1,0 +1,26 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+== decode glue b=1 warm direct  (rounds=40 inner=20 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+mhc_fast pre_attn (26,1,b) mode0              11.87      11.84      11.89    1.000     100.1       0.0
+mhc_fast pre_ffn collapse (1,1,b)              4.63       4.61       4.67    0.390      26.6       0.0
+mhc_fast late mix (24,1,b) mode1              11.70      11.68      11.73    0.986      91.0       0.0
+router f16_matvec_batched (48,1,b)            20.83      20.78      20.87    1.755     189.8       0.0
+router_topk_par plain (b)x512                  7.58       7.57       7.60    0.639       0.0       0.0
+router_topk_par prior (b)x512                 11.60      11.57      11.63    0.977       0.0       0.0
+hc_post_from_split (20,4,b)                    3.79       3.77       3.81    0.319      48.7       0.0
+vec_add_inplace 5120b                          3.12       3.10       3.31    0.263      19.7       0.0
+rms_norm_weighted_batched (b) 5120            10.92      10.87      10.96    0.920       3.8       0.0
+head hc_weighted_sum 1 row (20)                3.56       3.55       3.57    0.300      28.8       0.0
+head rms_norm_weighted 1 row (1)              10.92      10.86      10.98    0.920       5.6       0.0
+KBJSON {"tag":"decode glue b=1 warm direct","variant":"mhc_fast pre_attn (26,1,b) mode0","med_us":11.868,"p10_us":11.836,"p90_us":11.890,"ratio":1.0000,"gbps":100.09,"graph":0,"flush":0}
+KBJSON {"tag":"decode glue b=1 warm direct","variant":"mhc_fast pre_ffn collapse (1,1,b)","med_us":4.626,"p10_us":4.610,"p90_us":4.672,"ratio":0.3898,"gbps":26.56,"graph":0,"flush":0}
+KBJSON {"tag":"decode glue b=1 warm direct","variant":"mhc_fast late mix (24,1,b) mode1","med_us":11.698,"p10_us":11.676,"p90_us":11.726,"ratio":0.9857,"gbps":91.04,"graph":0,"flush":0}
+KBJSON {"tag":"decode glue b=1 warm direct","variant":"router f16_matvec_batched (48,1,b)","med_us":20.830,"p10_us":20.782,"p90_us":20.866,"ratio":1.7551,"gbps":189.76,"graph":0,"flush":0}
+KBJSON {"tag":"decode glue b=1 warm direct","variant":"router_topk_par plain (b)x512","med_us":7.580,"p10_us":7.568,"p90_us":7.604,"ratio":0.6387,"gbps":0.00,"graph":0,"flush":0}
+KBJSON {"tag":"decode glue b=1 warm direct","variant":"router_topk_par prior (b)x512","med_us":11.598,"p10_us":11.574,"p90_us":11.630,"ratio":0.9772,"gbps":0.00,"graph":0,"flush":0}
+KBJSON {"tag":"decode glue b=1 warm direct","variant":"hc_post_from_split (20,4,b)","med_us":3.786,"p10_us":3.772,"p90_us":3.806,"ratio":0.3190,"gbps":48.68,"graph":0,"flush":0}
+KBJSON {"tag":"decode glue b=1 warm direct","variant":"vec_add_inplace 5120b","med_us":3.116,"p10_us":3.102,"p90_us":3.312,"ratio":0.2626,"gbps":19.72,"graph":0,"flush":0}
+KBJSON {"tag":"decode glue b=1 warm direct","variant":"rms_norm_weighted_batched (b) 5120","med_us":10.920,"p10_us":10.874,"p90_us":10.962,"ratio":0.9201,"gbps":3.75,"graph":0,"flush":0}
+KBJSON {"tag":"decode glue b=1 warm direct","variant":"head hc_weighted_sum 1 row (20)","med_us":3.560,"p10_us":3.548,"p90_us":3.574,"ratio":0.3000,"gbps":28.76,"graph":0,"flush":0}
+KBJSON {"tag":"decode glue b=1 warm direct","variant":"head rms_norm_weighted 1 row (1)","med_us":10.916,"p10_us":10.864,"p90_us":10.984,"ratio":0.9198,"gbps":5.63,"graph":0,"flush":0}

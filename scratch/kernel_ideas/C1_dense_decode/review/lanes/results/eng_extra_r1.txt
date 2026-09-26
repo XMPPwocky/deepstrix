@@ -1,0 +1,103 @@
+== 1790451900.000187.review.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+#### lanes kv 4 4
+CMP kv merged tB8 vs 2 lanes           n=4096 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"kv merged tB8 vs 2 lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== lanes kv 512x5120 b0=4 b1=4 cold(readflush72MB) graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base lane0 b=4                                23.40      23.28      23.64    1.000     119.0       0.0
+base lane1 b=4                                23.36      23.20      23.60    0.998     119.2       0.0
+base merged b=8 (runtime loop)                29.64      29.52      29.88    1.267      94.0       0.0
+cand merged tB8                               21.04      20.80      21.28    0.899     132.4       0.0
+cand merged tB8_w4                            20.84      20.68      21.08    0.891     133.7       0.0
+null 1-WG kernel (launch floor)               13.16      13.04      13.28    0.562       0.0       0.0
+KBJSON {"tag":"lanes kv 512x5120 b0=4 b1=4 cold(readflush72MB) graph","variant":"base lane0 b=4","med_us":23.401,"p10_us":23.280,"p90_us":23.640,"ratio":1.0000,"gbps":119.02,"graph":1,"flush":1}
+KBJSON {"tag":"lanes kv 512x5120 b0=4 b1=4 cold(readflush72MB) graph","variant":"base lane1 b=4","med_us":23.360,"p10_us":23.200,"p90_us":23.600,"ratio":0.9982,"gbps":119.23,"graph":1,"flush":1}
+KBJSON {"tag":"lanes kv 512x5120 b0=4 b1=4 cold(readflush72MB) graph","variant":"base merged b=8 (runtime loop)","med_us":29.640,"p10_us":29.520,"p90_us":29.881,"ratio":1.2666,"gbps":93.97,"graph":1,"flush":1}
+KBJSON {"tag":"lanes kv 512x5120 b0=4 b1=4 cold(readflush72MB) graph","variant":"cand merged tB8","med_us":21.040,"p10_us":20.800,"p90_us":21.280,"ratio":0.8991,"gbps":132.38,"graph":1,"flush":1}
+KBJSON {"tag":"lanes kv 512x5120 b0=4 b1=4 cold(readflush72MB) graph","variant":"cand merged tB8_w4","med_us":20.840,"p10_us":20.681,"p90_us":21.081,"ratio":0.8906,"gbps":133.65,"graph":1,"flush":1}
+KBJSON {"tag":"lanes kv 512x5120 b0=4 b1=4 cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":13.160,"p10_us":13.040,"p90_us":13.281,"ratio":0.5624,"gbps":0.00,"graph":1,"flush":1}
+
+#### lanes qa 4 3
+
+== lanes q_a 1280x5120 b0=4 b1=3 cold(readflush72MB) graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base lane0 b=4                                33.28      30.88      33.44    1.000     209.2       0.0
+base lane1 b=3                                31.36      29.00      31.60    0.942     222.0       0.0
+base merged b=7 (runtime loop)                38.72      36.28      38.96    1.163     179.8       0.0
+null 1-WG kernel (launch floor)               15.60      13.12      15.72    0.469       0.0       0.0
+KBJSON {"tag":"lanes q_a 1280x5120 b0=4 b1=3 cold(readflush72MB) graph","variant":"base lane0 b=4","med_us":33.280,"p10_us":30.881,"p90_us":33.440,"ratio":1.0000,"gbps":209.23,"graph":1,"flush":1}
+KBJSON {"tag":"lanes q_a 1280x5120 b0=4 b1=3 cold(readflush72MB) graph","variant":"base lane1 b=3","med_us":31.360,"p10_us":29.000,"p90_us":31.600,"ratio":0.9423,"gbps":222.04,"graph":1,"flush":1}
+KBJSON {"tag":"lanes q_a 1280x5120 b0=4 b1=3 cold(readflush72MB) graph","variant":"base merged b=7 (runtime loop)","med_us":38.721,"p10_us":36.281,"p90_us":38.960,"ratio":1.1635,"gbps":179.83,"graph":1,"flush":1}
+KBJSON {"tag":"lanes q_a 1280x5120 b0=4 b1=3 cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":15.600,"p10_us":13.120,"p90_us":15.720,"ratio":0.4687,"gbps":0.00,"graph":1,"flush":1}
+
+#### lanes qa 1 1
+CMP qa merged tB2 vs 2 lanes           n=2560 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qa merged tB2 vs 2 lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== lanes q_a 1280x5120 b0=1 b1=1 cold(readflush72MB) graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base lane0 b=1                                27.72      25.24      27.92    1.000     251.2       0.0
+base lane1 b=1                                27.64      25.08      27.84    0.997     251.9       0.0
+base merged b=2 (runtime loop)                29.36      26.96      29.68    1.059     237.2       0.0
+cand merged tB2                               27.36      24.84      27.52    0.987     254.5       0.0
+cand merged tB2_w4                            27.28      24.84      27.44    0.984     255.2       0.0
+null 1-WG kernel (launch floor)               15.48      12.96      15.64    0.558       0.0       0.0
+KBJSON {"tag":"lanes q_a 1280x5120 b0=1 b1=1 cold(readflush72MB) graph","variant":"base lane0 b=1","med_us":27.720,"p10_us":25.240,"p90_us":27.920,"ratio":1.0000,"gbps":251.20,"graph":1,"flush":1}
+KBJSON {"tag":"lanes q_a 1280x5120 b0=1 b1=1 cold(readflush72MB) graph","variant":"base lane1 b=1","med_us":27.640,"p10_us":25.080,"p90_us":27.841,"ratio":0.9971,"gbps":251.92,"graph":1,"flush":1}
+KBJSON {"tag":"lanes q_a 1280x5120 b0=1 b1=1 cold(readflush72MB) graph","variant":"base merged b=2 (runtime loop)","med_us":29.361,"p10_us":26.961,"p90_us":29.680,"ratio":1.0592,"gbps":237.16,"graph":1,"flush":1}
+KBJSON {"tag":"lanes q_a 1280x5120 b0=1 b1=1 cold(readflush72MB) graph","variant":"cand merged tB2","med_us":27.360,"p10_us":24.841,"p90_us":27.521,"ratio":0.9870,"gbps":254.50,"graph":1,"flush":1}
+KBJSON {"tag":"lanes q_a 1280x5120 b0=1 b1=1 cold(readflush72MB) graph","variant":"cand merged tB2_w4","med_us":27.280,"p10_us":24.840,"p90_us":27.440,"ratio":0.9841,"gbps":255.25,"graph":1,"flush":1}
+KBJSON {"tag":"lanes q_a 1280x5120 b0=1 b1=1 cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":15.480,"p10_us":12.961,"p90_us":15.641,"ratio":0.5584,"gbps":0.00,"graph":1,"flush":1}
+
+#### lanes gate 4 4
+CMP gate merged tB8 vs 2 lanes         n=18432 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"gate merged tB8 vs 2 lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== lanes sh_gate 2304x5120 b0=4 b1=4 cold(readflush72MB) graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base lane0 b=4                                43.64      41.20      44.04    1.000     287.2       0.0
+base lane1 b=4                                43.64      41.36      44.08    1.000     287.2       0.0
+base merged b=8 (runtime loop)                53.20      50.84      53.88    1.219     235.6       0.0
+cand merged tB8                               37.24      34.88      38.04    0.853     336.6       0.0
+cand merged tB8_w4                            37.48      35.00      38.08    0.859     334.4       0.0
+null 1-WG kernel (launch floor)               15.40      12.96      15.64    0.353       0.0       0.0
+KBJSON {"tag":"lanes sh_gate 2304x5120 b0=4 b1=4 cold(readflush72MB) graph","variant":"base lane0 b=4","med_us":43.641,"p10_us":41.200,"p90_us":44.040,"ratio":1.0000,"gbps":287.20,"graph":1,"flush":1}
+KBJSON {"tag":"lanes sh_gate 2304x5120 b0=4 b1=4 cold(readflush72MB) graph","variant":"base lane1 b=4","med_us":43.640,"p10_us":41.361,"p90_us":44.080,"ratio":1.0000,"gbps":287.21,"graph":1,"flush":1}
+KBJSON {"tag":"lanes sh_gate 2304x5120 b0=4 b1=4 cold(readflush72MB) graph","variant":"base merged b=8 (runtime loop)","med_us":53.200,"p10_us":50.841,"p90_us":53.880,"ratio":1.2190,"gbps":235.60,"graph":1,"flush":1}
+KBJSON {"tag":"lanes sh_gate 2304x5120 b0=4 b1=4 cold(readflush72MB) graph","variant":"cand merged tB8","med_us":37.240,"p10_us":34.880,"p90_us":38.040,"ratio":0.8533,"gbps":336.57,"graph":1,"flush":1}
+KBJSON {"tag":"lanes sh_gate 2304x5120 b0=4 b1=4 cold(readflush72MB) graph","variant":"cand merged tB8_w4","med_us":37.480,"p10_us":35.000,"p90_us":38.080,"ratio":0.8588,"gbps":334.41,"graph":1,"flush":1}
+KBJSON {"tag":"lanes sh_gate 2304x5120 b0=4 b1=4 cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":15.401,"p10_us":12.960,"p90_us":15.640,"ratio":0.3529,"gbps":0.00,"graph":1,"flush":1}
+
+#### lanes wob 3 3
+CMP wob merged tB6 vs 2 lanes          n=30720 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wob merged tB6 vs 2 lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== lanes wo_b 5120x8192 b0=3 b1=3 cold(readflush72MB) graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base lane0 b=3                                98.08      97.48      99.16    1.000     454.4       0.0
+base lane1 b=3                                98.08      97.28      98.92    1.000     454.4       0.0
+base merged b=6 (runtime loop)               119.16     117.88     119.64    1.215     374.0       0.0
+cand merged tB6                               89.56      89.32      89.92    0.913     497.6       0.0
+null 1-WG kernel (launch floor)               13.12      13.00      13.24    0.134       0.0       0.0
+KBJSON {"tag":"lanes wo_b 5120x8192 b0=3 b1=3 cold(readflush72MB) graph","variant":"base lane0 b=3","med_us":98.081,"p10_us":97.481,"p90_us":99.161,"ratio":1.0000,"gbps":454.36,"graph":1,"flush":1}
+KBJSON {"tag":"lanes wo_b 5120x8192 b0=3 b1=3 cold(readflush72MB) graph","variant":"base lane1 b=3","med_us":98.081,"p10_us":97.281,"p90_us":98.921,"ratio":1.0000,"gbps":454.36,"graph":1,"flush":1}
+KBJSON {"tag":"lanes wo_b 5120x8192 b0=3 b1=3 cold(readflush72MB) graph","variant":"base merged b=6 (runtime loop)","med_us":119.161,"p10_us":117.882,"p90_us":119.642,"ratio":1.2149,"gbps":373.99,"graph":1,"flush":1}
+KBJSON {"tag":"lanes wo_b 5120x8192 b0=3 b1=3 cold(readflush72MB) graph","variant":"cand merged tB6","med_us":89.562,"p10_us":89.321,"p90_us":89.921,"ratio":0.9131,"gbps":497.58,"graph":1,"flush":1}
+KBJSON {"tag":"lanes wo_b 5120x8192 b0=3 b1=3 cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":13.120,"p10_us":13.000,"p90_us":13.240,"ratio":0.1338,"gbps":0.00,"graph":1,"flush":1}
+
+#### lanes wob 4 3
+
+== lanes wo_b 5120x8192 b0=4 b1=3 cold(readflush72MB) graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base lane0 b=4                               106.00     103.96     108.24    1.000     420.4       0.0
+base lane1 b=3                                97.68      96.96      98.80    0.922     456.2       0.0
+base merged b=7 (runtime loop)               125.76     123.00     126.40    1.186     354.4       0.0
+null 1-WG kernel (launch floor)               13.12      13.00      13.48    0.124       0.0       0.0
+KBJSON {"tag":"lanes wo_b 5120x8192 b0=4 b1=3 cold(readflush72MB) graph","variant":"base lane0 b=4","med_us":106.001,"p10_us":103.961,"p90_us":108.242,"ratio":1.0000,"gbps":420.42,"graph":1,"flush":1}
+KBJSON {"tag":"lanes wo_b 5120x8192 b0=4 b1=3 cold(readflush72MB) graph","variant":"base lane1 b=3","med_us":97.681,"p10_us":96.961,"p90_us":98.802,"ratio":0.9215,"gbps":456.22,"graph":1,"flush":1}
+KBJSON {"tag":"lanes wo_b 5120x8192 b0=4 b1=3 cold(readflush72MB) graph","variant":"base merged b=7 (runtime loop)","med_us":125.762,"p10_us":123.001,"p90_us":126.401,"ratio":1.1864,"gbps":354.36,"graph":1,"flush":1}
+KBJSON {"tag":"lanes wo_b 5120x8192 b0=4 b1=3 cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":13.120,"p10_us":13.000,"p90_us":13.480,"ratio":0.1238,"gbps":0.00,"graph":1,"flush":1}

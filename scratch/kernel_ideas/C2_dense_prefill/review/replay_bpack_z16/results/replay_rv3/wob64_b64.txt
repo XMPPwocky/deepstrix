@@ -1,0 +1,7 @@
+
+== wob64 b=64 M=5120 K=8192 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemv_batched_warp8                1499.06    1491.02    1502.10    1.000      31.0    3581.4
+cand q8_0_gemv_bpack_z16                     536.61     533.45     538.81    0.358      86.5   10004.9
+KBJSON {"tag":"wob64 b=64 M=5120 K=8192 G=1 flush96MB","variant":"base q8_0_gemv_batched_warp8","med_us":1499.058,"p10_us":1491.018,"p90_us":1502.098,"ratio":1.0000,"gbps":30.95,"graph":0,"flush":1}
+KBJSON {"tag":"wob64 b=64 M=5120 K=8192 G=1 flush96MB","variant":"cand q8_0_gemv_bpack_z16","med_us":536.607,"p10_us":533.447,"p90_us":538.806,"ratio":0.3580,"gbps":86.47,"graph":0,"flush":1}

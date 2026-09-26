@@ -1,0 +1,30 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[h] pool: 32 experts x 18.8 MB = 602 MB on device
+[h] b=4 E=24 ppr=6: members/call=24.0 distinct experts/call=24 n_wi exact=18 bound=24
+[h] distinct experts actually read per call (avg over 8 selections): 15.75
+
+== b=4 E=24 ppr=6 P=32 gbound=384 bound-grid cold-rotating  (rounds=40 inner=8 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+builders (2 memset + 2 kernels)               11.74      11.26      12.24    1.000       0.0       0.0
+kwide gate/up (bound grid, devcount)        1022.63    1008.20    1028.89   87.072     193.0       0.0
+kwide gate/up (exact grid)                  1019.31    1007.07    1029.00   86.790     193.7       0.0
+q8k (9*6*b blocks)                             5.76       5.47       6.37    0.491      49.3       0.0
+partials memset                                3.80       3.64       3.89    0.324     129.2       0.0
+kwide2 down (bound grid, devcount)           514.82     504.72     519.71   43.834     191.7       0.0
+kwide2 down (exact grid)                     509.69     500.41     512.81   43.397     193.7       0.0
+reduce hetsplit                                5.99       5.74       6.04    0.510      82.1       0.0
+twin pair_hetsplit b=1 (E experts)           361.87     357.58     364.51   30.811     545.5       0.0
+twin down_hetsplit b=1 (E experts)           165.90     164.39     167.71   14.125     595.0       0.0
+cand dn2_r2 down                             440.15     433.99     443.38   37.477     224.2       0.0
+KBJSON {"tag":"b=4 E=24 ppr=6 P=32 gbound=384 bound-grid cold-rotating","variant":"builders (2 memset + 2 kernels)","med_us":11.745,"p10_us":11.265,"p90_us":12.240,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"b=4 E=24 ppr=6 P=32 gbound=384 bound-grid cold-rotating","variant":"kwide gate/up (bound grid, devcount)","med_us":1022.628,"p10_us":1008.199,"p90_us":1028.893,"ratio":87.0720,"gbps":193.04,"graph":1,"flush":0}
+KBJSON {"tag":"b=4 E=24 ppr=6 P=32 gbound=384 bound-grid cold-rotating","variant":"kwide gate/up (exact grid)","med_us":1019.313,"p10_us":1007.069,"p90_us":1029.003,"ratio":86.7898,"gbps":193.67,"graph":1,"flush":0}
+KBJSON {"tag":"b=4 E=24 ppr=6 P=32 gbound=384 bound-grid cold-rotating","variant":"q8k (9*6*b blocks)","med_us":5.765,"p10_us":5.475,"p90_us":6.370,"ratio":0.4909,"gbps":49.31,"graph":1,"flush":0}
+KBJSON {"tag":"b=4 E=24 ppr=6 P=32 gbound=384 bound-grid cold-rotating","variant":"partials memset","med_us":3.805,"p10_us":3.640,"p90_us":3.885,"ratio":0.3240,"gbps":129.18,"graph":1,"flush":0}
+KBJSON {"tag":"b=4 E=24 ppr=6 P=32 gbound=384 bound-grid cold-rotating","variant":"kwide2 down (bound grid, devcount)","med_us":514.817,"p10_us":504.722,"p90_us":519.706,"ratio":43.8342,"gbps":191.73,"graph":1,"flush":0}
+KBJSON {"tag":"b=4 E=24 ppr=6 P=32 gbound=384 bound-grid cold-rotating","variant":"kwide2 down (exact grid)","med_us":509.687,"p10_us":500.412,"p90_us":512.806,"ratio":43.3974,"gbps":193.65,"graph":1,"flush":0}
+KBJSON {"tag":"b=4 E=24 ppr=6 P=32 gbound=384 bound-grid cold-rotating","variant":"reduce hetsplit","med_us":5.990,"p10_us":5.740,"p90_us":6.045,"ratio":0.5100,"gbps":82.06,"graph":1,"flush":0}
+KBJSON {"tag":"b=4 E=24 ppr=6 P=32 gbound=384 bound-grid cold-rotating","variant":"twin pair_hetsplit b=1 (E experts)","med_us":361.865,"p10_us":357.581,"p90_us":364.505,"ratio":30.8112,"gbps":545.53,"graph":1,"flush":0}
+KBJSON {"tag":"b=4 E=24 ppr=6 P=32 gbound=384 bound-grid cold-rotating","variant":"twin down_hetsplit b=1 (E experts)","med_us":165.896,"p10_us":164.386,"p90_us":167.706,"ratio":14.1252,"gbps":594.97,"graph":1,"flush":0}
+KBJSON {"tag":"b=4 E=24 ppr=6 P=32 gbound=384 bound-grid cold-rotating","variant":"cand dn2_r2 down","med_us":440.154,"p10_us":433.989,"p90_us":443.383,"ratio":37.4770,"gbps":224.25,"graph":1,"flush":0}
+roofline (15.75 distinct experts): gate/up 197.4 MB -> 922.5 us; down 98.7 MB -> 461.2 us at 214 GB/s

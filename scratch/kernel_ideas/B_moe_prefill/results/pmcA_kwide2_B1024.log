@@ -1,0 +1,14 @@
+W20260926 19:35:54.792192 130439434656384 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.084885 sec
+W20260926 19:35:54.792371 130439434656384 simple_timer.cpp:55] [rocprofv3] './harness prof_kwide2 1024 96' ::     0.000000 sec
+W20260926 19:35:54.818169 130439434656384 tool.cpp:2424] HSA version 1.18.0 initialized (instance=0)
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[setup] B=1024 n_exp=96 members=1570 touched=96 max_group=27 n_wi_exact=96 n_wi_bound=576  mean members/expert=16.4
+W20260926 19:35:55.344054 130439434656384 simple_timer.cpp:55] [rocprofv3] './harness prof_kwide2 1024 96' ::     0.551683 sec
+E20260926 19:35:55.345510 130439434656384 output_stream.cpp:111] Opened result file: prof_pmcA_kwide2/run_counter_collection.csv
+E20260926 19:35:55.347639 130439434656384 output_stream.cpp:111] Opened result file: prof_pmcA_kwide2/run_agent_info.csv
+W20260926 19:35:55.347852 130439434656384 simple_timer.cpp:55] [rocprofv3] output generation ::     0.003620 sec
+W20260926 19:35:55.347915 130439434656384 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.003686 sec
+ROOFLINE gate+up: 1.227 GB (weights 1.203 GB) -> 5.33 ms at 230 GB/s; 74.1 GFLOP
+ROOFLINE down:    0.638 GB (weights 0.602 GB) -> 2.77 ms at 230 GB/s; 37.0 GFLOP
+SCALE: x4.00 to a full 384-expert layer (this launch touches 96 experts)
+prof kwide2 done (6 launches)

@@ -1,0 +1,144 @@
+
+== A decode b=1 RANDOM picks, 235K-row store COLD, direct inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256      10.04       9.64      11.72    1.000     104.4       0.0
+cand gather_u4_r1                              8.68       8.36      10.08    0.865     120.8       0.0
+cand gather_u4_r4                              8.64       8.36       8.84    0.861     121.4       0.0
+KBJSON {"tag":"A decode b=1 RANDOM picks, 235K-row store COLD, direct inner=1","variant":"base indexer_gather_batched (512,b,2)x256","med_us":10.040,"p10_us":9.640,"p90_us":11.721,"ratio":1.0000,"gbps":104.44,"graph":0,"flush":1}
+KBJSON {"tag":"A decode b=1 RANDOM picks, 235K-row store COLD, direct inner=1","variant":"cand gather_u4_r1","med_us":8.680,"p10_us":8.360,"p90_us":10.080,"ratio":0.8645,"gbps":120.80,"graph":0,"flush":1}
+KBJSON {"tag":"A decode b=1 RANDOM picks, 235K-row store COLD, direct inner=1","variant":"cand gather_u4_r4","med_us":8.640,"p10_us":8.360,"p90_us":8.840,"ratio":0.8606,"gbps":121.36,"graph":0,"flush":1}
+
+== A decode b=1 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)  (rounds=30 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256      15.76      15.56      17.16    1.000      66.5       0.0
+cand gather_u4_r1                             14.48      14.24      14.92    0.919      72.4       0.0
+cand gather_u4_r4                             14.52      14.28      16.36    0.921      72.2       0.0
+KBJSON {"tag":"A decode b=1 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)","variant":"base indexer_gather_batched (512,b,2)x256","med_us":15.760,"p10_us":15.560,"p90_us":17.160,"ratio":1.0000,"gbps":66.53,"graph":1,"flush":1}
+KBJSON {"tag":"A decode b=1 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)","variant":"cand gather_u4_r1","med_us":14.480,"p10_us":14.240,"p90_us":14.921,"ratio":0.9188,"gbps":72.42,"graph":1,"flush":1}
+KBJSON {"tag":"A decode b=1 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)","variant":"cand gather_u4_r4","med_us":14.520,"p10_us":14.280,"p90_us":16.360,"ratio":0.9213,"gbps":72.22,"graph":1,"flush":1}
+
+== A decode b=2 RANDOM picks, 235K-row store COLD, direct inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256      13.96      12.44      14.68    1.000     150.2       0.0
+cand gather_u4_r1                             21.20      20.48      23.00    1.519      98.9       0.0
+cand gather_u4_r4                             21.04      20.44      22.96    1.507      99.7       0.0
+KBJSON {"tag":"A decode b=2 RANDOM picks, 235K-row store COLD, direct inner=1","variant":"base indexer_gather_batched (512,b,2)x256","med_us":13.961,"p10_us":12.440,"p90_us":14.681,"ratio":1.0000,"gbps":150.22,"graph":0,"flush":1}
+KBJSON {"tag":"A decode b=2 RANDOM picks, 235K-row store COLD, direct inner=1","variant":"cand gather_u4_r1","med_us":21.200,"p10_us":20.480,"p90_us":23.000,"ratio":1.5185,"gbps":98.92,"graph":0,"flush":1}
+KBJSON {"tag":"A decode b=2 RANDOM picks, 235K-row store COLD, direct inner=1","variant":"cand gather_u4_r4","med_us":21.040,"p10_us":20.440,"p90_us":22.961,"ratio":1.5071,"gbps":99.67,"graph":0,"flush":1}
+
+== A decode b=2 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)  (rounds=30 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256      18.04      17.88      18.32    1.000     116.3       0.0
+cand gather_u4_r1                             27.68      27.52      28.88    1.534      75.8       0.0
+cand gather_u4_r4                             27.64      27.44      28.72    1.532      75.9       0.0
+KBJSON {"tag":"A decode b=2 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)","variant":"base indexer_gather_batched (512,b,2)x256","med_us":18.040,"p10_us":17.880,"p90_us":18.321,"ratio":1.0000,"gbps":116.25,"graph":1,"flush":1}
+KBJSON {"tag":"A decode b=2 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)","variant":"cand gather_u4_r1","med_us":27.681,"p10_us":27.520,"p90_us":28.880,"ratio":1.5344,"gbps":75.76,"graph":1,"flush":1}
+KBJSON {"tag":"A decode b=2 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)","variant":"cand gather_u4_r4","med_us":27.641,"p10_us":27.441,"p90_us":28.720,"ratio":1.5322,"gbps":75.87,"graph":1,"flush":1}
+
+== A decode b=4 RANDOM picks, 235K-row store COLD, direct inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256      18.16      17.76      20.36    1.000     231.0       0.0
+cand gather_u4_r1                             11.84      11.48      14.12    0.652     354.2       0.0
+cand gather_u4_r4                             12.00      11.72      25.00    0.661     349.5       0.0
+KBJSON {"tag":"A decode b=4 RANDOM picks, 235K-row store COLD, direct inner=1","variant":"base indexer_gather_batched (512,b,2)x256","med_us":18.160,"p10_us":17.760,"p90_us":20.360,"ratio":1.0000,"gbps":230.96,"graph":0,"flush":1}
+KBJSON {"tag":"A decode b=4 RANDOM picks, 235K-row store COLD, direct inner=1","variant":"cand gather_u4_r1","med_us":11.840,"p10_us":11.481,"p90_us":14.120,"ratio":0.6520,"gbps":354.25,"graph":0,"flush":1}
+KBJSON {"tag":"A decode b=4 RANDOM picks, 235K-row store COLD, direct inner=1","variant":"cand gather_u4_r4","med_us":12.000,"p10_us":11.720,"p90_us":25.000,"ratio":0.6608,"gbps":349.53,"graph":0,"flush":1}
+
+== A decode b=4 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)  (rounds=30 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256      23.24      22.92      25.24    1.000     180.5       0.0
+cand gather_u4_r1                             17.04      16.80      30.20    0.733     246.1       0.0
+cand gather_u4_r4                             18.48      16.84      19.32    0.795     227.0       0.0
+KBJSON {"tag":"A decode b=4 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)","variant":"base indexer_gather_batched (512,b,2)x256","med_us":23.240,"p10_us":22.920,"p90_us":25.241,"ratio":1.0000,"gbps":180.48,"graph":1,"flush":1}
+KBJSON {"tag":"A decode b=4 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)","variant":"cand gather_u4_r1","med_us":17.040,"p10_us":16.800,"p90_us":30.200,"ratio":0.7332,"gbps":246.14,"graph":1,"flush":1}
+KBJSON {"tag":"A decode b=4 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)","variant":"cand gather_u4_r4","med_us":18.480,"p10_us":16.840,"p90_us":19.320,"ratio":0.7952,"gbps":226.96,"graph":1,"flush":1}
+
+== A decode b=5 RANDOM picks, 235K-row store COLD, direct inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256      20.28      20.16      20.40    1.000     258.5       0.0
+cand gather_u4_r1                             12.48      12.36      12.64    0.615     420.1       0.0
+cand gather_u4_r4                             12.48      12.32      12.64    0.615     420.1       0.0
+KBJSON {"tag":"A decode b=5 RANDOM picks, 235K-row store COLD, direct inner=1","variant":"base indexer_gather_batched (512,b,2)x256","med_us":20.281,"p10_us":20.160,"p90_us":20.401,"ratio":1.0000,"gbps":258.51,"graph":0,"flush":1}
+KBJSON {"tag":"A decode b=5 RANDOM picks, 235K-row store COLD, direct inner=1","variant":"cand gather_u4_r1","med_us":12.480,"p10_us":12.360,"p90_us":12.640,"ratio":0.6154,"gbps":420.10,"graph":0,"flush":1}
+KBJSON {"tag":"A decode b=5 RANDOM picks, 235K-row store COLD, direct inner=1","variant":"cand gather_u4_r4","med_us":12.480,"p10_us":12.320,"p90_us":12.640,"ratio":0.6154,"gbps":420.10,"graph":0,"flush":1}
+
+== A decode b=5 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)  (rounds=30 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256      25.40      25.12      27.80    1.000     206.4       0.0
+cand gather_u4_r1                             17.92      17.28      25.12    0.706     292.6       0.0
+cand gather_u4_r4                             17.52      17.40      23.32    0.690     299.2       0.0
+KBJSON {"tag":"A decode b=5 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)","variant":"base indexer_gather_batched (512,b,2)x256","med_us":25.400,"p10_us":25.120,"p90_us":27.800,"ratio":1.0000,"gbps":206.41,"graph":1,"flush":1}
+KBJSON {"tag":"A decode b=5 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)","variant":"cand gather_u4_r1","med_us":17.920,"p10_us":17.280,"p90_us":25.121,"ratio":0.7055,"gbps":292.57,"graph":1,"flush":1}
+KBJSON {"tag":"A decode b=5 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)","variant":"cand gather_u4_r4","med_us":17.521,"p10_us":17.400,"p90_us":23.321,"ratio":0.6898,"gbps":299.23,"graph":1,"flush":1}
+
+== A decode b=8 RANDOM picks, 235K-row store COLD, direct inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256      32.16      29.60      32.48    1.000     260.8       0.0
+cand gather_u4_r1                             19.28      17.92      19.44    0.599     435.1       0.0
+cand gather_u4_r4                             19.20      16.68      19.40    0.597     436.9       0.0
+KBJSON {"tag":"A decode b=8 RANDOM picks, 235K-row store COLD, direct inner=1","variant":"base indexer_gather_batched (512,b,2)x256","med_us":32.161,"p10_us":29.600,"p90_us":32.480,"ratio":1.0000,"gbps":260.83,"graph":0,"flush":1}
+KBJSON {"tag":"A decode b=8 RANDOM picks, 235K-row store COLD, direct inner=1","variant":"cand gather_u4_r1","med_us":19.280,"p10_us":17.920,"p90_us":19.441,"ratio":0.5995,"gbps":435.09,"graph":0,"flush":1}
+KBJSON {"tag":"A decode b=8 RANDOM picks, 235K-row store COLD, direct inner=1","variant":"cand gather_u4_r4","med_us":19.200,"p10_us":16.681,"p90_us":19.400,"ratio":0.5970,"gbps":436.91,"graph":0,"flush":1}
+
+== A decode b=8 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)  (rounds=30 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256      34.24      34.04      36.76    1.000     245.0       0.0
+cand gather_u4_r1                             20.92      20.72      23.68    0.611     401.0       0.0
+cand gather_u4_r4                             20.92      20.64      23.48    0.611     401.0       0.0
+KBJSON {"tag":"A decode b=8 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)","variant":"base indexer_gather_batched (512,b,2)x256","med_us":34.241,"p10_us":34.040,"p90_us":36.760,"ratio":1.0000,"gbps":244.99,"graph":1,"flush":1}
+KBJSON {"tag":"A decode b=8 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)","variant":"cand gather_u4_r1","med_us":20.920,"p10_us":20.720,"p90_us":23.680,"ratio":0.6110,"gbps":400.99,"graph":1,"flush":1}
+KBJSON {"tag":"A decode b=8 RANDOM picks, 235K-row store COLD, GRAPH inner=1 (prod)","variant":"cand gather_u4_r4","med_us":20.920,"p10_us":20.640,"p90_us":23.480,"ratio":0.6110,"gbps":400.99,"graph":1,"flush":1}
+
+== B prefill b=512 engineer-style 1536-row window per 8 tokens, COLD flush, direct  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256    1325.62    1320.50    1330.86    1.000     405.0       0.0
+cand gather_u4_r1                            468.41     467.20     469.25    0.353    1146.2       0.0
+cand gather_u4_r4                            469.05     468.09     469.92    0.354    1144.6       0.0
+KBJSON {"tag":"B prefill b=512 engineer-style 1536-row window per 8 tokens, COLD flush, direct","variant":"base indexer_gather_batched (512,b,2)x256","med_us":1325.615,"p10_us":1320.496,"p90_us":1330.856,"ratio":1.0000,"gbps":405.00,"graph":0,"flush":1}
+KBJSON {"tag":"B prefill b=512 engineer-style 1536-row window per 8 tokens, COLD flush, direct","variant":"cand gather_u4_r1","med_us":468.405,"p10_us":467.205,"p90_us":469.246,"ratio":0.3533,"gbps":1146.17,"graph":0,"flush":1}
+KBJSON {"tag":"B prefill b=512 engineer-style 1536-row window per 8 tokens, COLD flush, direct","variant":"cand gather_u4_r4","med_us":469.045,"p10_us":468.086,"p90_us":469.925,"ratio":0.3538,"gbps":1144.60,"graph":0,"flush":1}
+
+== B prefill b=512 4K-row window shared by all 512 tokens, COLD flush, direct  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256    1167.69    1164.29    1173.49    1.000     459.8       0.0
+cand gather_u4_r1                            367.28     365.92     368.76    0.315    1461.7       0.0
+cand gather_u4_r4                            368.92     367.20     369.84    0.316    1455.2       0.0
+KBJSON {"tag":"B prefill b=512 4K-row window shared by all 512 tokens, COLD flush, direct","variant":"base indexer_gather_batched (512,b,2)x256","med_us":1167.693,"p10_us":1164.294,"p90_us":1173.493,"ratio":1.0000,"gbps":459.77,"graph":0,"flush":1}
+KBJSON {"tag":"B prefill b=512 4K-row window shared by all 512 tokens, COLD flush, direct","variant":"cand gather_u4_r1","med_us":367.284,"p10_us":365.924,"p90_us":368.764,"ratio":0.3145,"gbps":1461.73,"graph":0,"flush":1}
+KBJSON {"tag":"B prefill b=512 4K-row window shared by all 512 tokens, COLD flush, direct","variant":"cand gather_u4_r4","med_us":368.924,"p10_us":367.204,"p90_us":369.844,"ratio":0.3159,"gbps":1455.23,"graph":0,"flush":1}
+
+== B prefill b=512 4K-row window shared by all 512 tokens, WARM (no flush), direct  (rounds=30 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256    1205.73    1200.41    1210.61    1.000     445.3       0.0
+cand gather_u4_r1                            440.52     438.96     447.52    0.365    1218.7       0.0
+cand gather_u4_r4                            448.40     440.52     449.76    0.372    1197.3       0.0
+KBJSON {"tag":"B prefill b=512 4K-row window shared by all 512 tokens, WARM (no flush), direct","variant":"base indexer_gather_batched (512,b,2)x256","med_us":1205.734,"p10_us":1200.414,"p90_us":1210.614,"ratio":1.0000,"gbps":445.26,"graph":0,"flush":0}
+KBJSON {"tag":"B prefill b=512 4K-row window shared by all 512 tokens, WARM (no flush), direct","variant":"cand gather_u4_r1","med_us":440.525,"p10_us":438.965,"p90_us":447.525,"ratio":0.3654,"gbps":1218.71,"graph":0,"flush":0}
+KBJSON {"tag":"B prefill b=512 4K-row window shared by all 512 tokens, WARM (no flush), direct","variant":"cand gather_u4_r4","med_us":448.405,"p10_us":440.525,"p90_us":449.765,"ratio":0.3719,"gbps":1197.29,"graph":0,"flush":0}
+
+== B prefill b=512 16K-row window shared by all 512 tokens, COLD flush, direct  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256    1280.22    1275.53    1286.54    1.000     419.4       0.0
+cand gather_u4_r1                            408.48     407.80     409.16    0.319    1314.3       0.0
+cand gather_u4_r4                            408.52     408.00     409.25    0.319    1314.2       0.0
+KBJSON {"tag":"B prefill b=512 16K-row window shared by all 512 tokens, COLD flush, direct","variant":"base indexer_gather_batched (512,b,2)x256","med_us":1280.215,"p10_us":1275.534,"p90_us":1286.535,"ratio":1.0000,"gbps":419.36,"graph":0,"flush":1}
+KBJSON {"tag":"B prefill b=512 16K-row window shared by all 512 tokens, COLD flush, direct","variant":"cand gather_u4_r1","med_us":408.485,"p10_us":407.805,"p90_us":409.165,"ratio":0.3191,"gbps":1314.30,"graph":0,"flush":1}
+KBJSON {"tag":"B prefill b=512 16K-row window shared by all 512 tokens, COLD flush, direct","variant":"cand gather_u4_r4","med_us":408.525,"p10_us":408.005,"p90_us":409.245,"ratio":0.3191,"gbps":1314.17,"graph":0,"flush":1}
+
+== B prefill b=512 64K-row window shared by all 512 tokens, COLD flush, direct  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256    1643.70    1640.58    1646.38    1.000     326.6       0.0
+cand gather_u4_r1                            715.05     714.13     716.49    0.435     750.8       0.0
+cand gather_u4_r4                            714.65     713.45     715.49    0.435     751.2       0.0
+KBJSON {"tag":"B prefill b=512 64K-row window shared by all 512 tokens, COLD flush, direct","variant":"base indexer_gather_batched (512,b,2)x256","med_us":1643.699,"p10_us":1640.579,"p90_us":1646.379,"ratio":1.0000,"gbps":326.62,"graph":0,"flush":1}
+KBJSON {"tag":"B prefill b=512 64K-row window shared by all 512 tokens, COLD flush, direct","variant":"cand gather_u4_r1","med_us":715.048,"p10_us":714.128,"p90_us":716.488,"ratio":0.4350,"gbps":750.82,"graph":0,"flush":1}
+KBJSON {"tag":"B prefill b=512 64K-row window shared by all 512 tokens, COLD flush, direct","variant":"cand gather_u4_r4","med_us":714.648,"p10_us":713.448,"p90_us":715.488,"ratio":0.4348,"gbps":751.24,"graph":0,"flush":1}
+
+== B prefill b=512 64K-row window shared by all 512 tokens, WARM (no flush), direct  (rounds=30 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_gather_batched (512,b,2)x256    1677.82    1672.46    1682.18    1.000     320.0       0.0
+cand gather_u4_r1                            723.05     719.25     747.69    0.431     742.5       0.0
+cand gather_u4_r4                            746.73     719.49     752.37    0.445     719.0       0.0
+KBJSON {"tag":"B prefill b=512 64K-row window shared by all 512 tokens, WARM (no flush), direct","variant":"base indexer_gather_batched (512,b,2)x256","med_us":1677.820,"p10_us":1672.459,"p90_us":1682.179,"ratio":1.0000,"gbps":319.98,"graph":0,"flush":0}
+KBJSON {"tag":"B prefill b=512 64K-row window shared by all 512 tokens, WARM (no flush), direct","variant":"cand gather_u4_r1","med_us":723.049,"p10_us":719.248,"p90_us":747.688,"ratio":0.4309,"gbps":742.51,"graph":0,"flush":0}
+KBJSON {"tag":"B prefill b=512 64K-row window shared by all 512 tokens, WARM (no flush), direct","variant":"cand gather_u4_r4","med_us":746.729,"p10_us":719.488,"p90_us":752.369,"ratio":0.4451,"gbps":718.96,"graph":0,"flush":0}

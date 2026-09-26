@@ -1,0 +1,20 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+== prefill mHC chain B=512 direct flush40MB  (rounds=30 inner=3 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+rms_norm_no_weight_batched (B,1)             147.64     145.05     149.11    1.000     568.2       0.0
+f16_gemm_wmma_lds_tiled M=24 (1,B/64)        477.08     470.53     490.21    3.231      90.0       0.0
+hc_sinkhorn_par_batched (B)x16                 8.91       8.85       8.96    0.060      11.0       0.0
+hc_weighted_sum_batched (20,1,B)              74.25      61.88      74.63    0.503     706.1       0.0
+rms_norm_weighted_batched (B) 5120            35.75      35.43      36.60    0.242     586.7       0.0
+CHAIN rms_nw+gemm+sink+hcw+copy+rmsw         744.72     742.03     748.57    5.044     267.5       0.0
+mhc_fast collapse-only (1,1,B) [hcw+rmsw fused, prod kernel]      72.08      71.75      75.87    0.488     872.8       0.0
+KBJSON {"tag":"prefill mHC chain B=512 direct flush40MB","variant":"rms_norm_no_weight_batched (B,1)","med_us":147.642,"p10_us":145.055,"p90_us":149.108,"ratio":1.0000,"gbps":568.17,"graph":0,"flush":1}
+KBJSON {"tag":"prefill mHC chain B=512 direct flush40MB","variant":"f16_gemm_wmma_lds_tiled M=24 (1,B/64)","med_us":477.085,"p10_us":470.525,"p90_us":490.206,"ratio":3.2314,"gbps":89.98,"graph":0,"flush":1}
+KBJSON {"tag":"prefill mHC chain B=512 direct flush40MB","variant":"hc_sinkhorn_par_batched (B)x16","med_us":8.907,"p10_us":8.853,"p90_us":8.960,"ratio":0.0603,"gbps":11.04,"graph":0,"flush":1}
+KBJSON {"tag":"prefill mHC chain B=512 direct flush40MB","variant":"hc_weighted_sum_batched (20,1,B)","med_us":74.254,"p10_us":61.881,"p90_us":74.628,"ratio":0.5029,"gbps":706.07,"graph":0,"flush":1}
+KBJSON {"tag":"prefill mHC chain B=512 direct flush40MB","variant":"rms_norm_weighted_batched (B) 5120","med_us":35.747,"p10_us":35.427,"p90_us":36.600,"ratio":0.2421,"gbps":586.66,"graph":0,"flush":1}
+KBJSON {"tag":"prefill mHC chain B=512 direct flush40MB","variant":"CHAIN rms_nw+gemm+sink+hcw+copy+rmsw","med_us":744.715,"p10_us":742.035,"p90_us":748.569,"ratio":5.0441,"gbps":267.52,"graph":0,"flush":1}
+KBJSON {"tag":"prefill mHC chain B=512 direct flush40MB","variant":"mhc_fast collapse-only (1,1,B) [hcw+rmsw fused, prod kernel]","med_us":72.081,"p10_us":71.747,"p90_us":75.868,"ratio":0.4882,"gbps":872.84,"graph":0,"flush":1}
+CMP mhc_fast collapse vs hcw+rmsw (norm) n=2621440 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"mhc_fast collapse vs hcw+rmsw (norm)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}

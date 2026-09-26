@@ -1,0 +1,23 @@
+== 1790451955.000194.review.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CASE random[-3,3] blocks=1              blocks=     1 WGs(cand)=    1  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE random[-3,3] blocks=7              blocks=     7 WGs(cand)=    1  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE random[-3,3] blocks=9              blocks=     9 WGs(cand)=    2  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE random[-3,3] blocks=41             blocks=    41 WGs(cand)=    6  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE random[-3,3] blocks=160            blocks=   160 WGs(cand)=   20  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE random[-3,3] blocks=480            blocks=   480 WGs(cand)=   60  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE random[-3,3] blocks=800            blocks=   800 WGs(cand)=  100  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE random[-3,3] blocks=1280           blocks=  1280 WGs(cand)=  160  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE random[-3,3] blocks=40             blocks=    40 WGs(cand)=    5  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE random[-3,3] blocks=360            blocks=   360 WGs(cand)=   45  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE random[-3,3] blocks=1280           blocks=  1280 WGs(cand)=  160  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE random[-3,3] blocks=5120           blocks=  5120 WGs(cand)=  640  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE random[-3,3] blocks=4096           blocks=  4096 WGs(cand)=  512  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE random[-3,3] blocks=8192           blocks=  8192 WGs(cand)= 1024  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE random[-3,3] blocks=6149           blocks=  6149 WGs(cand)=  769  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE adversarial blocks (K=5120 b=5)    blocks=   800 WGs(cand)=  100  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+CASE all-NaN block (informational)      blocks=    16 WGs(cand)=    2  xq_diff=0 xscale_bitdiff=1 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> DIFF (expected)
+   first diff block 3: xs base=0 cand=nan; x[0..3]=nan nan nan nan
+CASE clamp boundary (x ~ amax)          blocks=    64 WGs(cand)=    8  xq_diff=0 xscale_bitdiff=0 guard_q=0 guard_s=0 | base-vs-cpu xq=0 xs=0  -> BITEXACT
+ODD SUMMARY: PASS (0 failing cases)

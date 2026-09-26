@@ -1,0 +1,376 @@
+== 1790451698.000158.review.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+#### shared 1
+shared b=1: |mid| max 78.03 (clamp 10.0)  REVIEW census: n=2304 |mid|==100: 0  ==0: 0  0<|mid|<50: 2300
+shared b=1: REVIEW |gate| max 11.75
+CMP shared_gateup_swiglu_tB1+quant+down mid vs base n=2304 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB1+quant+down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB1+quant+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_tB1+quant+down mid_xs vs base n=72 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB1+quant+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB1+quant+down out vs base n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB1+quant+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB1+quant_wave+down mid vs base n=2304 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB1+quant_wave+down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB1+quant_wave+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_tB1+quant_wave+down mid_xs vs base n=72 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB1+quant_wave+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB1+quant_wave+down out vs base n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB1+quant_wave+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB1_r1+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_q8_tB1_r1+down mid_xs vs base n=72 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB1_r1+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB1_r1+down out vs base n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB1_r1+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB1_r2+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_q8_tB1_r2+down mid_xs vs base n=72 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB1_r2+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB1_r2+down out vs base n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB1_r2+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB1_r4+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_q8_tB1_r4+down mid_xs vs base n=72 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB1_r4+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB1_r4+down out vs base n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB1_r4+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tB chain (5 nodes) mid vs base     n=2304 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tB chain (5 nodes) mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tB chain (5 nodes) mid_xq int8_diff=0
+CMP tB chain (5 nodes) mid_xs vs base  n=72 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tB chain (5 nodes) mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tB chain (5 nodes) out vs base     n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tB chain (5 nodes) out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B r1 + tB down mid_xq int8_diff=0
+CMP B r1 + tB down mid_xs vs base      n=72 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B r1 + tB down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B r1 + tB down out vs base         n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B r1 + tB down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP A2 + tB down mid vs base           n=2304 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"A2 + tB down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP A2 + tB down mid_xq int8_diff=0
+CMP A2 + tB down mid_xs vs base        n=72 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"A2 + tB down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP A2 + tB down out vs base           n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"A2 + tB down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph  (rounds=5 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base chain gate,up,swiglu,quant,down (5 nodes)      85.96      80.40      86.40    1.000     437.4       0.0
+cand A: fused gate+up+swiglu, quant, down (3 nodes)      80.68      80.40      80.76    0.939     466.1       0.0
+cand A2: fused gate+up+swiglu, quant_wave, down (3 nodes)      79.28      78.28      80.60    0.922     474.3       0.0
+base gate,up,swiglu only (3 nodes)            58.96      58.04      59.76    0.686     425.2       0.0
+cand A only: fused gate+up+swiglu (1 node)      53.20      51.48      53.32    0.619     471.2       0.0
+cand B r1: fused gate+up+swiglu+quant (WG 1024thr), down (2 nodes)      75.36      74.72      76.60    0.877     499.0       0.0
+cand B r1 only: fused gate+up+swiglu+quant (1 node)      52.96      51.84      54.08    0.616     473.3       0.0
+cand B r2: fused gate+up+swiglu+quant (WG 512thr), down (2 nodes)      75.72      73.00      76.00    0.881     496.6       0.0
+cand B r2 only: fused gate+up+swiglu+quant (1 node)      53.28      52.92      53.92    0.620     470.5       0.0
+cand B r4: fused gate+up+swiglu+quant (WG 256thr), down (2 nodes)      75.68      74.64      75.84    0.880     496.8       0.0
+cand B r4 only: fused gate+up+swiglu+quant (1 node)      53.36      53.36      54.80    0.621     469.8       0.0
+cand tB chain: tB gate, tB up, swiglu, quant, tB down (5 nodes)      82.80      82.56      84.08    0.963     454.1       0.0
+cand B r1 + tB down (2 nodes)                 76.68      76.44      77.08    0.892     490.4       0.0
+cand A2 + tB down (3 nodes)                   79.48      78.64      80.08    0.925     473.1       0.0
+null 1-WG kernel (launch floor)               13.84      13.72      14.08    0.161       0.0       0.0
+KBJSON {"tag":"shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"base chain gate,up,swiglu,quant,down (5 nodes)","med_us":85.960,"p10_us":80.401,"p90_us":86.401,"ratio":1.0000,"gbps":437.43,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A: fused gate+up+swiglu, quant, down (3 nodes)","med_us":80.680,"p10_us":80.401,"p90_us":80.761,"ratio":0.9386,"gbps":466.05,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A2: fused gate+up+swiglu, quant_wave, down (3 nodes)","med_us":79.281,"p10_us":78.281,"p90_us":80.601,"ratio":0.9223,"gbps":474.28,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"base gate,up,swiglu only (3 nodes)","med_us":58.961,"p10_us":58.040,"p90_us":59.760,"ratio":0.6859,"gbps":425.15,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A only: fused gate+up+swiglu (1 node)","med_us":53.201,"p10_us":51.481,"p90_us":53.321,"ratio":0.6189,"gbps":471.19,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1: fused gate+up+swiglu+quant (WG 1024thr), down (2 nodes)","med_us":75.360,"p10_us":74.721,"p90_us":76.601,"ratio":0.8767,"gbps":498.96,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1 only: fused gate+up+swiglu+quant (1 node)","med_us":52.961,"p10_us":51.840,"p90_us":54.080,"ratio":0.6161,"gbps":473.32,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r2: fused gate+up+swiglu+quant (WG 512thr), down (2 nodes)","med_us":75.721,"p10_us":73.001,"p90_us":76.001,"ratio":0.8809,"gbps":496.58,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r2 only: fused gate+up+swiglu+quant (1 node)","med_us":53.280,"p10_us":52.921,"p90_us":53.921,"ratio":0.6198,"gbps":470.49,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r4: fused gate+up+swiglu+quant (WG 256thr), down (2 nodes)","med_us":75.681,"p10_us":74.640,"p90_us":75.841,"ratio":0.8804,"gbps":496.84,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r4 only: fused gate+up+swiglu+quant (1 node)","med_us":53.361,"p10_us":53.360,"p90_us":54.801,"ratio":0.6208,"gbps":469.77,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand tB chain: tB gate, tB up, swiglu, quant, tB down (5 nodes)","med_us":82.801,"p10_us":82.561,"p90_us":84.081,"ratio":0.9633,"gbps":454.12,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1 + tB down (2 nodes)","med_us":76.681,"p10_us":76.441,"p90_us":77.081,"ratio":0.8921,"gbps":490.36,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A2 + tB down (3 nodes)","med_us":79.481,"p10_us":78.641,"p90_us":80.081,"ratio":0.9246,"gbps":473.09,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":13.840,"p10_us":13.720,"p90_us":14.080,"ratio":0.1610,"gbps":0.00,"graph":1,"flush":1}
+
+#### shared 3
+shared b=3: |mid| max 71.1 (clamp 10.0)  REVIEW census: n=6912 |mid|==100: 0  ==0: 0  0<|mid|<50: 6904
+shared b=3: REVIEW |gate| max 13.19
+CMP shared_gateup_swiglu_tB3+quant+down mid vs base n=6912 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB3+quant+down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB3+quant+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_tB3+quant+down mid_xs vs base n=216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB3+quant+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB3+quant+down out vs base n=15360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB3+quant+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB3+quant_wave+down mid vs base n=6912 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB3+quant_wave+down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB3+quant_wave+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_tB3+quant_wave+down mid_xs vs base n=216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB3+quant_wave+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB3+quant_wave+down out vs base n=15360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB3+quant_wave+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB3_r1+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_q8_tB3_r1+down mid_xs vs base n=216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB3_r1+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB3_r1+down out vs base n=15360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB3_r1+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB3_r2+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_q8_tB3_r2+down mid_xs vs base n=216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB3_r2+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB3_r2+down out vs base n=15360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB3_r2+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tB chain (5 nodes) mid vs base     n=6912 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tB chain (5 nodes) mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tB chain (5 nodes) mid_xq int8_diff=0
+CMP tB chain (5 nodes) mid_xs vs base  n=216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tB chain (5 nodes) mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tB chain (5 nodes) out vs base     n=15360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tB chain (5 nodes) out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B r1 + tB down mid_xq int8_diff=0
+CMP B r1 + tB down mid_xs vs base      n=216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B r1 + tB down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B r1 + tB down out vs base         n=15360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B r1 + tB down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP A2 + tB down mid vs base           n=6912 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"A2 + tB down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP A2 + tB down mid_xq int8_diff=0
+CMP A2 + tB down mid_xs vs base        n=216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"A2 + tB down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP A2 + tB down out vs base           n=15360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"A2 + tB down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== shared-expert chain b=3 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph  (rounds=5 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base chain gate,up,swiglu,quant,down (5 nodes)      99.92      94.28     100.40    1.000     376.3       0.0
+cand A: fused gate+up+swiglu, quant, down (3 nodes)      85.64      85.44      85.96    0.857     439.1       0.0
+cand A2: fused gate+up+swiglu, quant_wave, down (3 nodes)      84.68      84.04      85.16    0.847     444.0       0.0
+base gate,up,swiglu only (3 nodes)            69.20      68.60      69.44    0.693     362.2       0.0
+cand A only: fused gate+up+swiglu (1 node)      53.72      53.68      54.20    0.538     466.6       0.0
+cand B r1: fused gate+up+swiglu+quant (WG 1024thr), down (2 nodes)      80.60      80.40      80.76    0.807     466.5       0.0
+cand B r1 only: fused gate+up+swiglu+quant (1 node)      53.60      53.36      54.12    0.536     467.7       0.0
+cand B r2: fused gate+up+swiglu+quant (WG 512thr), down (2 nodes)      81.44      81.12      81.76    0.815     461.7       0.0
+cand B r2 only: fused gate+up+swiglu+quant (1 node)      53.40      53.16      54.08    0.534     469.4       0.0
+cand tB chain: tB gate, tB up, swiglu, quant, tB down (5 nodes)      84.40      84.16      84.92    0.845     445.5       0.0
+cand B r1 + tB down (2 nodes)                 78.40      78.32      78.88    0.785     479.6       0.0
+cand A2 + tB down (3 nodes)                   81.20      81.04      81.60    0.813     463.1       0.0
+null 1-WG kernel (launch floor)               13.68      13.40      13.88    0.137       0.0       0.0
+KBJSON {"tag":"shared-expert chain b=3 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"base chain gate,up,swiglu,quant,down (5 nodes)","med_us":99.921,"p10_us":94.281,"p90_us":100.401,"ratio":1.0000,"gbps":376.31,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=3 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A: fused gate+up+swiglu, quant, down (3 nodes)","med_us":85.641,"p10_us":85.441,"p90_us":85.961,"ratio":0.8571,"gbps":439.06,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=3 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A2: fused gate+up+swiglu, quant_wave, down (3 nodes)","med_us":84.681,"p10_us":84.041,"p90_us":85.161,"ratio":0.8475,"gbps":444.03,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=3 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"base gate,up,swiglu only (3 nodes)","med_us":69.201,"p10_us":68.601,"p90_us":69.441,"ratio":0.6926,"gbps":362.24,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=3 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A only: fused gate+up+swiglu (1 node)","med_us":53.721,"p10_us":53.680,"p90_us":54.200,"ratio":0.5376,"gbps":466.62,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=3 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1: fused gate+up+swiglu+quant (WG 1024thr), down (2 nodes)","med_us":80.601,"p10_us":80.401,"p90_us":80.760,"ratio":0.8066,"gbps":466.51,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=3 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1 only: fused gate+up+swiglu+quant (1 node)","med_us":53.601,"p10_us":53.360,"p90_us":54.121,"ratio":0.5364,"gbps":467.67,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=3 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r2: fused gate+up+swiglu+quant (WG 512thr), down (2 nodes)","med_us":81.441,"p10_us":81.121,"p90_us":81.761,"ratio":0.8151,"gbps":461.70,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=3 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r2 only: fused gate+up+swiglu+quant (1 node)","med_us":53.401,"p10_us":53.160,"p90_us":54.081,"ratio":0.5344,"gbps":469.42,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=3 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand tB chain: tB gate, tB up, swiglu, quant, tB down (5 nodes)","med_us":84.400,"p10_us":84.161,"p90_us":84.921,"ratio":0.8447,"gbps":445.51,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=3 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1 + tB down (2 nodes)","med_us":78.401,"p10_us":78.320,"p90_us":78.881,"ratio":0.7846,"gbps":479.60,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=3 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A2 + tB down (3 nodes)","med_us":81.201,"p10_us":81.041,"p90_us":81.601,"ratio":0.8127,"gbps":463.06,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=3 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":13.680,"p10_us":13.400,"p90_us":13.880,"ratio":0.1369,"gbps":0.00,"graph":1,"flush":1}
+
+#### shared 4
+shared b=4: |mid| max 81.59 (clamp 10.0)  REVIEW census: n=9216 |mid|==100: 0  ==0: 0  0<|mid|<50: 9190
+shared b=4: REVIEW |gate| max 13.77
+CMP shared_gateup_swiglu_tB4+quant+down mid vs base n=9216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB4+quant+down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB4+quant+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_tB4+quant+down mid_xs vs base n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB4+quant+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB4+quant+down out vs base n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB4+quant+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB4+quant_wave+down mid vs base n=9216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB4+quant_wave+down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB4+quant_wave+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_tB4+quant_wave+down mid_xs vs base n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB4+quant_wave+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB4+quant_wave+down out vs base n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB4+quant_wave+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB4_r1+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_q8_tB4_r1+down mid_xs vs base n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB4_r1+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB4_r1+down out vs base n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB4_r1+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB4_r2+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_q8_tB4_r2+down mid_xs vs base n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB4_r2+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB4_r2+down out vs base n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB4_r2+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB4_r4+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_q8_tB4_r4+down mid_xs vs base n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB4_r4+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB4_r4+down out vs base n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB4_r4+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tB chain (5 nodes) mid vs base     n=9216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tB chain (5 nodes) mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tB chain (5 nodes) mid_xq int8_diff=0
+CMP tB chain (5 nodes) mid_xs vs base  n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tB chain (5 nodes) mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tB chain (5 nodes) out vs base     n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tB chain (5 nodes) out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B r1 + tB down mid_xq int8_diff=0
+CMP B r1 + tB down mid_xs vs base      n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B r1 + tB down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B r1 + tB down out vs base         n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B r1 + tB down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP A2 + tB down mid vs base           n=9216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"A2 + tB down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP A2 + tB down mid_xq int8_diff=0
+CMP A2 + tB down mid_xs vs base        n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"A2 + tB down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP A2 + tB down out vs base           n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"A2 + tB down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph  (rounds=5 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base chain gate,up,swiglu,quant,down (5 nodes)     106.80     100.04     107.36    1.000     352.1       0.0
+cand A: fused gate+up+swiglu, quant, down (3 nodes)      87.76      87.64      87.96    0.822     428.5       0.0
+cand A2: fused gate+up+swiglu, quant_wave, down (3 nodes)      86.32      86.16      87.72    0.808     435.6       0.0
+base gate,up,swiglu only (3 nodes)            74.36      73.84      74.60    0.696     337.1       0.0
+cand A only: fused gate+up+swiglu (1 node)      54.60      53.76      54.80    0.511     459.1       0.0
+cand B r1: fused gate+up+swiglu+quant (WG 1024thr), down (2 nodes)      82.92      82.64      83.12    0.776     453.5       0.0
+cand B r1 only: fused gate+up+swiglu+quant (1 node)      54.44      53.88      54.72    0.510     460.5       0.0
+cand B r2: fused gate+up+swiglu+quant (WG 512thr), down (2 nodes)      84.80      84.44      84.84    0.794     443.4       0.0
+cand B r2 only: fused gate+up+swiglu+quant (1 node)      55.32      54.80      55.64    0.518     453.1       0.0
+cand B r4: fused gate+up+swiglu+quant (WG 256thr), down (2 nodes)      84.24      83.80      84.28    0.789     446.4       0.0
+cand B r4 only: fused gate+up+swiglu+quant (1 node)      57.48      57.28      57.96    0.538     436.1       0.0
+cand tB chain: tB gate, tB up, swiglu, quant, tB down (5 nodes)      84.44      84.00      85.12    0.791     445.3       0.0
+cand B r1 + tB down (2 nodes)                 79.28      79.24      79.48    0.742     474.3       0.0
+cand A2 + tB down (3 nodes)                   81.84      81.56      82.24    0.766     459.4       0.0
+null 1-WG kernel (launch floor)               13.80      13.60      13.88    0.129       0.0       0.0
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"base chain gate,up,swiglu,quant,down (5 nodes)","med_us":106.801,"p10_us":100.041,"p90_us":107.361,"ratio":1.0000,"gbps":352.07,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A: fused gate+up+swiglu, quant, down (3 nodes)","med_us":87.761,"p10_us":87.641,"p90_us":87.961,"ratio":0.8217,"gbps":428.45,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A2: fused gate+up+swiglu, quant_wave, down (3 nodes)","med_us":86.321,"p10_us":86.161,"p90_us":87.721,"ratio":0.8082,"gbps":435.60,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"base gate,up,swiglu only (3 nodes)","med_us":74.361,"p10_us":73.840,"p90_us":74.601,"ratio":0.6963,"gbps":337.11,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A only: fused gate+up+swiglu (1 node)","med_us":54.601,"p10_us":53.760,"p90_us":54.801,"ratio":0.5112,"gbps":459.10,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1: fused gate+up+swiglu+quant (WG 1024thr), down (2 nodes)","med_us":82.921,"p10_us":82.641,"p90_us":83.121,"ratio":0.7764,"gbps":453.46,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1 only: fused gate+up+swiglu+quant (1 node)","med_us":54.440,"p10_us":53.881,"p90_us":54.721,"ratio":0.5097,"gbps":460.46,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r2: fused gate+up+swiglu+quant (WG 512thr), down (2 nodes)","med_us":84.801,"p10_us":84.441,"p90_us":84.841,"ratio":0.7940,"gbps":443.41,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r2 only: fused gate+up+swiglu+quant (1 node)","med_us":55.321,"p10_us":54.800,"p90_us":55.640,"ratio":0.5180,"gbps":453.13,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r4: fused gate+up+swiglu+quant (WG 256thr), down (2 nodes)","med_us":84.241,"p10_us":83.801,"p90_us":84.281,"ratio":0.7888,"gbps":446.35,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r4 only: fused gate+up+swiglu+quant (1 node)","med_us":57.480,"p10_us":57.281,"p90_us":57.960,"ratio":0.5382,"gbps":436.11,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand tB chain: tB gate, tB up, swiglu, quant, tB down (5 nodes)","med_us":84.441,"p10_us":84.001,"p90_us":85.121,"ratio":0.7906,"gbps":445.30,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1 + tB down (2 nodes)","med_us":79.280,"p10_us":79.241,"p90_us":79.481,"ratio":0.7423,"gbps":474.28,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A2 + tB down (3 nodes)","med_us":81.841,"p10_us":81.560,"p90_us":82.241,"ratio":0.7663,"gbps":459.44,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":13.800,"p10_us":13.600,"p90_us":13.880,"ratio":0.1292,"gbps":0.00,"graph":1,"flush":1}
+
+#### shared 5
+shared b=5: |mid| max 84.21 (clamp 10.0)  REVIEW census: n=11520 |mid|==100: 0  ==0: 0  0<|mid|<50: 11490
+shared b=5: REVIEW |gate| max 13.73
+CMP shared_gateup_swiglu_tB5+quant+down mid vs base n=11520 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB5+quant+down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB5+quant+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_tB5+quant+down mid_xs vs base n=360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB5+quant+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB5+quant+down out vs base n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB5+quant+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB5+quant_wave+down mid vs base n=11520 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB5+quant_wave+down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB5+quant_wave+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_tB5+quant_wave+down mid_xs vs base n=360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB5+quant_wave+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB5+quant_wave+down out vs base n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB5+quant_wave+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB5_r1+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_q8_tB5_r1+down mid_xs vs base n=360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB5_r1+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB5_r1+down out vs base n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB5_r1+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB5_r2+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_q8_tB5_r2+down mid_xs vs base n=360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB5_r2+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB5_r2+down out vs base n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB5_r2+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB5_r4+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_q8_tB5_r4+down mid_xs vs base n=360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB5_r4+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB5_r4+down out vs base n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB5_r4+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tB chain (5 nodes) mid vs base     n=11520 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tB chain (5 nodes) mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tB chain (5 nodes) mid_xq int8_diff=0
+CMP tB chain (5 nodes) mid_xs vs base  n=360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tB chain (5 nodes) mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tB chain (5 nodes) out vs base     n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tB chain (5 nodes) out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B r1 + tB down mid_xq int8_diff=0
+CMP B r1 + tB down mid_xs vs base      n=360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B r1 + tB down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B r1 + tB down out vs base         n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B r1 + tB down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP A2 + tB down mid vs base           n=11520 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"A2 + tB down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP A2 + tB down mid_xq int8_diff=0
+CMP A2 + tB down mid_xs vs base        n=360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"A2 + tB down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP A2 + tB down out vs base           n=25600 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"A2 + tB down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph  (rounds=5 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base chain gate,up,swiglu,quant,down (5 nodes)     114.44     107.20     115.04    1.000     328.6       0.0
+cand A: fused gate+up+swiglu, quant, down (3 nodes)      89.76      89.24      90.16    0.784     418.9       0.0
+cand A2: fused gate+up+swiglu, quant_wave, down (3 nodes)      88.44      88.12      89.36    0.773     425.2       0.0
+base gate,up,swiglu only (3 nodes)            79.28      79.12      80.00    0.693     316.2       0.0
+cand A only: fused gate+up+swiglu (1 node)      54.84      54.48      55.08    0.479     457.1       0.0
+cand B r1: fused gate+up+swiglu+quant (WG 1024thr), down (2 nodes)      84.80      84.60      85.24    0.741     443.4       0.0
+cand B r1 only: fused gate+up+swiglu+quant (1 node)      54.68      54.24      55.28    0.478     458.4       0.0
+cand B r2: fused gate+up+swiglu+quant (WG 512thr), down (2 nodes)      87.88      87.40      88.04    0.768     427.9       0.0
+cand B r2 only: fused gate+up+swiglu+quant (1 node)      57.04      56.84      57.36    0.498     439.5       0.0
+cand B r4: fused gate+up+swiglu+quant (WG 256thr), down (2 nodes)      94.36      94.28      94.88    0.825     398.5       0.0
+cand B r4 only: fused gate+up+swiglu+quant (1 node)      64.52      64.40      64.92    0.564     388.5       0.0
+cand tB chain: tB gate, tB up, swiglu, quant, tB down (5 nodes)      87.60      86.80      88.12    0.765     429.2       0.0
+cand B r1 + tB down (2 nodes)                 80.36      80.28      80.84    0.702     467.9       0.0
+cand A2 + tB down (3 nodes)                   82.84      82.76      83.04    0.724     453.9       0.0
+null 1-WG kernel (launch floor)               13.64      13.60      13.76    0.119       0.0       0.0
+KBJSON {"tag":"shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"base chain gate,up,swiglu,quant,down (5 nodes)","med_us":114.442,"p10_us":107.201,"p90_us":115.042,"ratio":1.0000,"gbps":328.56,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A: fused gate+up+swiglu, quant, down (3 nodes)","med_us":89.761,"p10_us":89.241,"p90_us":90.161,"ratio":0.7843,"gbps":418.90,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A2: fused gate+up+swiglu, quant_wave, down (3 nodes)","med_us":88.441,"p10_us":88.121,"p90_us":89.361,"ratio":0.7728,"gbps":425.16,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"base gate,up,swiglu only (3 nodes)","med_us":79.281,"p10_us":79.121,"p90_us":80.001,"ratio":0.6928,"gbps":316.19,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A only: fused gate+up+swiglu (1 node)","med_us":54.841,"p10_us":54.480,"p90_us":55.081,"ratio":0.4792,"gbps":457.09,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1: fused gate+up+swiglu+quant (WG 1024thr), down (2 nodes)","med_us":84.801,"p10_us":84.600,"p90_us":85.241,"ratio":0.7410,"gbps":443.41,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1 only: fused gate+up+swiglu+quant (1 node)","med_us":54.681,"p10_us":54.240,"p90_us":55.280,"ratio":0.4778,"gbps":458.43,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r2: fused gate+up+swiglu+quant (WG 512thr), down (2 nodes)","med_us":87.881,"p10_us":87.400,"p90_us":88.041,"ratio":0.7679,"gbps":427.87,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r2 only: fused gate+up+swiglu+quant (1 node)","med_us":57.041,"p10_us":56.840,"p90_us":57.360,"ratio":0.4984,"gbps":439.46,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r4: fused gate+up+swiglu+quant (WG 256thr), down (2 nodes)","med_us":94.361,"p10_us":94.281,"p90_us":94.881,"ratio":0.8245,"gbps":398.48,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r4 only: fused gate+up+swiglu+quant (1 node)","med_us":64.520,"p10_us":64.401,"p90_us":64.920,"ratio":0.5638,"gbps":388.52,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand tB chain: tB gate, tB up, swiglu, quant, tB down (5 nodes)","med_us":87.601,"p10_us":86.801,"p90_us":88.121,"ratio":0.7655,"gbps":429.23,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1 + tB down (2 nodes)","med_us":80.361,"p10_us":80.280,"p90_us":80.841,"ratio":0.7022,"gbps":467.90,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A2 + tB down (3 nodes)","med_us":82.841,"p10_us":82.761,"p90_us":83.041,"ratio":0.7239,"gbps":453.90,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":13.640,"p10_us":13.600,"p90_us":13.760,"ratio":0.1192,"gbps":0.00,"graph":1,"flush":1}
+
+#### shared 7
+shared b=7: |mid| max 83.6 (clamp 10.0)  REVIEW census: n=16128 |mid|==100: 0  ==0: 0  0<|mid|<50: 16104
+shared b=7: REVIEW |gate| max 12.7
+CMP shared_gateup_swiglu_tB7+quant+down mid vs base n=16128 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB7+quant+down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB7+quant+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_tB7+quant+down mid_xs vs base n=504 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB7+quant+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB7+quant+down out vs base n=35840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB7+quant+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB7+quant_wave+down mid vs base n=16128 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB7+quant_wave+down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB7+quant_wave+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_tB7+quant_wave+down mid_xs vs base n=504 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB7+quant_wave+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB7+quant_wave+down out vs base n=35840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB7+quant_wave+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB7_r1+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_q8_tB7_r1+down mid_xs vs base n=504 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB7_r1+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB7_r1+down out vs base n=35840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB7_r1+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== shared-expert chain b=7 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph  (rounds=5 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base chain gate,up,swiglu,quant,down (5 nodes)     128.60     122.52     129.80    1.000     292.4       0.0
+cand A: fused gate+up+swiglu, quant, down (3 nodes)      97.96      97.76      99.44    0.762     383.8       0.0
+cand A2: fused gate+up+swiglu, quant_wave, down (3 nodes)      95.92      95.44      96.76    0.746     392.0       0.0
+base gate,up,swiglu only (3 nodes)            89.20      88.72      89.64    0.694     281.0       0.0
+cand A only: fused gate+up+swiglu (1 node)      57.08      56.92      57.60    0.444     439.2       0.0
+cand B r1: fused gate+up+swiglu+quant (WG 1024thr), down (2 nodes)      92.28      91.68      97.52    0.718     407.5       0.0
+cand B r1 only: fused gate+up+swiglu+quant (1 node)      57.24      56.64      63.12    0.445     437.9       0.0
+null 1-WG kernel (launch floor)               13.24      13.16      14.40    0.103       0.0       0.0
+KBJSON {"tag":"shared-expert chain b=7 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"base chain gate,up,swiglu,quant,down (5 nodes)","med_us":128.602,"p10_us":122.521,"p90_us":129.802,"ratio":1.0000,"gbps":292.38,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=7 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A: fused gate+up+swiglu, quant, down (3 nodes)","med_us":97.961,"p10_us":97.761,"p90_us":99.441,"ratio":0.7617,"gbps":383.84,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=7 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A2: fused gate+up+swiglu, quant_wave, down (3 nodes)","med_us":95.921,"p10_us":95.441,"p90_us":96.762,"ratio":0.7459,"gbps":392.00,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=7 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"base gate,up,swiglu only (3 nodes)","med_us":89.201,"p10_us":88.721,"p90_us":89.641,"ratio":0.6936,"gbps":281.02,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=7 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A only: fused gate+up+swiglu (1 node)","med_us":57.081,"p10_us":56.921,"p90_us":57.601,"ratio":0.4439,"gbps":439.16,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=7 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1: fused gate+up+swiglu+quant (WG 1024thr), down (2 nodes)","med_us":92.281,"p10_us":91.681,"p90_us":97.521,"ratio":0.7176,"gbps":407.47,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=7 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1 only: fused gate+up+swiglu+quant (1 node)","med_us":57.241,"p10_us":56.640,"p90_us":63.121,"ratio":0.4451,"gbps":437.93,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=7 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":13.241,"p10_us":13.160,"p90_us":14.400,"ratio":0.1030,"gbps":0.00,"graph":1,"flush":1}

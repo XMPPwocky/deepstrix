@@ -1,0 +1,13 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[kb] LDS/CU 65536 B, regs/block 196608, L2 8388608 B
+[kb] shape engram b=128 M=25600 K=6144 G=1 ldx=0 working set ~173 MB
+[kb] flush 96 MB per timed block (total device ~269 MB)
+
+== engram b=128 M=25600 K=6144 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemm_wmma_lds_tiled               2253.97    1641.89    2398.45    1.000      80.4   17864.1
+cand i8x_r1                                  675.28     670.76     681.60    0.300     268.2   59627.1
+cand q8_0_gemm_wmma_i8x_db                   509.96     504.80     516.88    0.226     355.1   78957.3
+KBJSON {"tag":"engram b=128 M=25600 K=6144 G=1 flush96MB","variant":"base q8_0_gemm_wmma_lds_tiled","med_us":2253.974,"p10_us":1641.891,"p90_us":2398.455,"ratio":1.0000,"gbps":80.35,"graph":0,"flush":1}
+KBJSON {"tag":"engram b=128 M=25600 K=6144 G=1 flush96MB","variant":"cand i8x_r1","med_us":675.285,"p10_us":670.764,"p90_us":681.604,"ratio":0.2996,"gbps":268.20,"graph":0,"flush":1}
+KBJSON {"tag":"engram b=128 M=25600 K=6144 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_i8x_db","med_us":509.963,"p10_us":504.803,"p90_us":516.883,"ratio":0.2263,"gbps":355.14,"graph":0,"flush":1}

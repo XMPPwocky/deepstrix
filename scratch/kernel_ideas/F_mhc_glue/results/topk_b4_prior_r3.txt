@@ -1,0 +1,72 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP router_topk_wfred prior seed0 sel            sel_diff=0 orig_diff=0 (of 24)
+CMP router_topk_wfred prior seed0 weights n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wfred prior seed0 weights","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wfred prior seed0 range n=4 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wfred prior seed0 range","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave prior seed0 sel             sel_diff=0 orig_diff=0 (of 24)
+CMP router_topk_wave prior seed0 weights n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave prior seed0 weights","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave prior seed0 range n=4 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave prior seed0 range","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave_b2 prior seed0 sel          sel_diff=0 orig_diff=0 (of 24)
+CMP router_topk_wave_b2 prior seed0 weights n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave_b2 prior seed0 weights","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave_b2 prior seed0 range n=4 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave_b2 prior seed0 range","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wfred prior seed1 sel            sel_diff=0 orig_diff=0 (of 24)
+CMP router_topk_wfred prior seed1 weights n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wfred prior seed1 weights","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wfred prior seed1 range n=4 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wfred prior seed1 range","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave prior seed1 sel             sel_diff=0 orig_diff=0 (of 24)
+CMP router_topk_wave prior seed1 weights n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave prior seed1 weights","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave prior seed1 range n=4 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave prior seed1 range","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave_b2 prior seed1 sel          sel_diff=0 orig_diff=0 (of 24)
+CMP router_topk_wave_b2 prior seed1 weights n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave_b2 prior seed1 weights","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave_b2 prior seed1 range n=4 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave_b2 prior seed1 range","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wfred prior seed2 sel            sel_diff=0 orig_diff=0 (of 24)
+CMP router_topk_wfred prior seed2 weights n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wfred prior seed2 weights","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wfred prior seed2 range n=4 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wfred prior seed2 range","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave prior seed2 sel             sel_diff=0 orig_diff=0 (of 24)
+CMP router_topk_wave prior seed2 weights n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave prior seed2 weights","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave prior seed2 range n=4 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave prior seed2 range","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave_b2 prior seed2 sel          sel_diff=0 orig_diff=0 (of 24)
+CMP router_topk_wave_b2 prior seed2 weights n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave_b2 prior seed2 weights","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave_b2 prior seed2 range n=4 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave_b2 prior seed2 range","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wfred prior seed3 sel            sel_diff=0 orig_diff=0 (of 24)
+CMP router_topk_wfred prior seed3 weights n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wfred prior seed3 weights","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wfred prior seed3 range n=4 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wfred prior seed3 range","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave prior seed3 sel             sel_diff=0 orig_diff=0 (of 24)
+CMP router_topk_wave prior seed3 weights n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave prior seed3 weights","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave prior seed3 range n=4 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave prior seed3 range","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave_b2 prior seed3 sel          sel_diff=0 orig_diff=0 (of 24)
+CMP router_topk_wave_b2 prior seed3 weights n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave_b2 prior seed3 weights","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP router_topk_wave_b2 prior seed3 range n=4 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"router_topk_wave_b2 prior seed3 range","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== router_topk b=4 prior graph warm  (rounds=40 inner=20 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+router_topk_par prior (b)x512                 11.15      11.13      11.16    1.000       0.0       0.0
+router_topk_wfred prior                        9.05       9.04       9.07    0.812       0.0       0.0
+router_topk_wave prior                        15.75      15.74      15.77    1.413       0.0       0.0
+router_topk_wave_b2 prior                     22.74      22.72      22.76    2.040       0.0       0.0
+KBJSON {"tag":"router_topk b=4 prior graph warm","variant":"router_topk_par prior (b)x512","med_us":11.148,"p10_us":11.134,"p90_us":11.164,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"router_topk b=4 prior graph warm","variant":"router_topk_wfred prior","med_us":9.054,"p10_us":9.044,"p90_us":9.068,"ratio":0.8122,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"router_topk b=4 prior graph warm","variant":"router_topk_wave prior","med_us":15.754,"p10_us":15.736,"p90_us":15.768,"ratio":1.4132,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"router_topk b=4 prior graph warm","variant":"router_topk_wave_b2 prior","med_us":22.744,"p10_us":22.716,"p90_us":22.760,"ratio":2.0402,"gbps":0.00,"graph":1,"flush":0}

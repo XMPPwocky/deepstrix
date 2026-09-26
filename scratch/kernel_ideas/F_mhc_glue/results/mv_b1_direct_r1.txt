@@ -1,0 +1,48 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP f16_matvec_batched_h20 k=5120 b=1 seed0 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h20 k=5120 b=1 seed0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h40 k=5120 b=1 seed0 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h40 k=5120 b=1 seed0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h80 k=5120 b=1 seed0 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h80 k=5120 b=1 seed0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h20 k=4992 b=1 seed0 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h20 k=4992 b=1 seed0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h40 k=4992 b=1 seed0 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h40 k=4992 b=1 seed0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h80 k=4992 b=1 seed0 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h80 k=4992 b=1 seed0","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h20 k=5120 b=1 seed1 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h20 k=5120 b=1 seed1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h40 k=5120 b=1 seed1 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h40 k=5120 b=1 seed1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h80 k=5120 b=1 seed1 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h80 k=5120 b=1 seed1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h20 k=4992 b=1 seed1 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h20 k=4992 b=1 seed1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h40 k=4992 b=1 seed1 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h40 k=4992 b=1 seed1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h80 k=4992 b=1 seed1 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h80 k=4992 b=1 seed1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h20 k=5120 b=1 seed2 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h20 k=5120 b=1 seed2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h40 k=5120 b=1 seed2 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h40 k=5120 b=1 seed2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h80 k=5120 b=1 seed2 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h80 k=5120 b=1 seed2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h20 k=4992 b=1 seed2 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h20 k=4992 b=1 seed2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h40 k=4992 b=1 seed2 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h40 k=4992 b=1 seed2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP f16_matvec_batched_h80 k=4992 b=1 seed2 n=384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"f16_matvec_batched_h80 k=4992 b=1 seed2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== router matvec 384x5120 b=1 warm direct  (rounds=40 inner=20 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+router f16_matvec_batched (48,1,b)            20.61      20.57      20.71    1.000     191.8       0.0
+cand f16_matvec_batched_h20                    5.85       5.84       5.87    0.284     675.2       0.0
+cand f16_matvec_batched_h40                    6.76       6.74       6.79    0.328     584.7       0.0
+cand f16_matvec_batched_h80                   20.34      20.29      20.41    0.987     194.3       0.0
+KBJSON {"tag":"router matvec 384x5120 b=1 warm direct","variant":"router f16_matvec_batched (48,1,b)","med_us":20.612,"p10_us":20.566,"p90_us":20.712,"ratio":1.0000,"gbps":191.76,"graph":0,"flush":0}
+KBJSON {"tag":"router matvec 384x5120 b=1 warm direct","variant":"cand f16_matvec_batched_h20","med_us":5.854,"p10_us":5.844,"p90_us":5.872,"ratio":0.2840,"gbps":675.20,"graph":0,"flush":0}
+KBJSON {"tag":"router matvec 384x5120 b=1 warm direct","variant":"cand f16_matvec_batched_h40","med_us":6.760,"p10_us":6.742,"p90_us":6.792,"ratio":0.3280,"gbps":584.71,"graph":0,"flush":0}
+KBJSON {"tag":"router matvec 384x5120 b=1 warm direct","variant":"cand f16_matvec_batched_h80","med_us":20.344,"p10_us":20.286,"p90_us":20.414,"ratio":0.9870,"gbps":194.29,"graph":0,"flush":0}

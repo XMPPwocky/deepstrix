@@ -1,0 +1,57 @@
+== 1790452757.000295.review.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[no module ./cand_attn_gfx1201.hsaco]
+[no module ./cand3_attn_gfx1201.hsaco]
+[no module ./cand4_attn_gfx1201.hsaco]
+[no module ./cand5_attn_gfx1201.hsaco]
+f16rt mag=1e-06: fp8 rows where roundtrip CHANGED f32 value: 106010 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=0.0001: fp8 rows where roundtrip CHANGED f32 value: 107767 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=0.003: fp8 rows where roundtrip CHANGED f32 value: 106930 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=0.02: fp8 rows where roundtrip CHANGED f32 value: 89760 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=0.3: fp8 rows where roundtrip CHANGED f32 value: 50065 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=1: fp8 rows where roundtrip CHANGED f32 value: 32863 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=30: fp8 rows where roundtrip CHANGED f32 value: 1869 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=3000: fp8 rows where roundtrip CHANGED f32 value: 24 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=60000: fp8 rows where roundtrip CHANGED f32 value: 1 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=1e+06: fp8 rows where roundtrip CHANGED f32 value: 34038 of 262144; f16 cache bits differ (with vs without f16rt): 0
+KBJSON {"cmp":"f16_roundtrip no-op on kv_cache_append output","bitexact":1,"bit_diff":0,"f32_changed_by_rt":529327}
+
+== kv chain b=1 graph warm  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kv chain: fp8_act_quant + f16_roundtrip + kv_cache_append       9.70       9.62       9.76    1.000       0.0       0.0
+kv chain without f16_roundtrip                 7.23       7.18       7.28    0.745       0.0       0.0
+f16_roundtrip alone                            3.62       3.60       3.64    0.374       0.0       0.0
+fp8_act_quant_inplace alone                    4.80       4.76       4.84    0.495       0.0       0.0
+kv_cache_append_batched alone                  3.59       3.56       3.62    0.370       0.0       0.0
+KBJSON {"tag":"kv chain b=1 graph warm","variant":"kv chain: fp8_act_quant + f16_roundtrip + kv_cache_append","med_us":9.696,"p10_us":9.624,"p90_us":9.764,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"kv chain b=1 graph warm","variant":"kv chain without f16_roundtrip","med_us":7.228,"p10_us":7.176,"p90_us":7.284,"ratio":0.7455,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"kv chain b=1 graph warm","variant":"f16_roundtrip alone","med_us":3.624,"p10_us":3.596,"p90_us":3.644,"ratio":0.3738,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"kv chain b=1 graph warm","variant":"fp8_act_quant_inplace alone","med_us":4.796,"p10_us":4.756,"p90_us":4.844,"ratio":0.4946,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"kv chain b=1 graph warm","variant":"kv_cache_append_batched alone","med_us":3.588,"p10_us":3.564,"p90_us":3.624,"ratio":0.3701,"gbps":0.00,"graph":1,"flush":0}
+
+== kv chain b=4 graph warm  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kv chain: fp8_act_quant + f16_roundtrip + kv_cache_append       8.66       8.64       8.68    1.000       0.0       0.0
+kv chain without f16_roundtrip                 6.40       6.39       6.42    0.739       0.0       0.0
+f16_roundtrip alone                            3.26       3.24       3.28    0.376       0.0       0.0
+fp8_act_quant_inplace alone                    4.24       4.22       4.25    0.489       0.0       0.0
+kv_cache_append_batched alone                  3.24       3.22       3.26    0.374       0.0       0.0
+KBJSON {"tag":"kv chain b=4 graph warm","variant":"kv chain: fp8_act_quant + f16_roundtrip + kv_cache_append","med_us":8.660,"p10_us":8.636,"p90_us":8.684,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"kv chain b=4 graph warm","variant":"kv chain without f16_roundtrip","med_us":6.404,"p10_us":6.388,"p90_us":6.424,"ratio":0.7395,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"kv chain b=4 graph warm","variant":"f16_roundtrip alone","med_us":3.260,"p10_us":3.244,"p90_us":3.276,"ratio":0.3764,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"kv chain b=4 graph warm","variant":"fp8_act_quant_inplace alone","med_us":4.236,"p10_us":4.216,"p90_us":4.248,"ratio":0.4891,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"kv chain b=4 graph warm","variant":"kv_cache_append_batched alone","med_us":3.236,"p10_us":3.216,"p90_us":3.256,"ratio":0.3737,"gbps":0.00,"graph":1,"flush":0}
+
+== kv chain b=8 graph warm  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kv chain: fp8_act_quant + f16_roundtrip + kv_cache_append       8.79       8.77       8.82    1.000       0.0       0.0
+kv chain without f16_roundtrip                 6.50       6.49       6.52    0.740       0.0       0.0
+f16_roundtrip alone                            3.33       3.31       3.35    0.379       0.0       0.0
+fp8_act_quant_inplace alone                    4.31       4.29       4.32    0.490       0.0       0.0
+kv_cache_append_batched alone                  3.30       3.28       3.32    0.375       0.0       0.0
+KBJSON {"tag":"kv chain b=8 graph warm","variant":"kv chain: fp8_act_quant + f16_roundtrip + kv_cache_append","med_us":8.792,"p10_us":8.768,"p90_us":8.816,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"kv chain b=8 graph warm","variant":"kv chain without f16_roundtrip","med_us":6.504,"p10_us":6.488,"p90_us":6.524,"ratio":0.7398,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"kv chain b=8 graph warm","variant":"f16_roundtrip alone","med_us":3.328,"p10_us":3.308,"p90_us":3.352,"ratio":0.3785,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"kv chain b=8 graph warm","variant":"fp8_act_quant_inplace alone","med_us":4.312,"p10_us":4.292,"p90_us":4.324,"ratio":0.4904,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"kv chain b=8 graph warm","variant":"kv_cache_append_batched alone","med_us":3.296,"p10_us":3.280,"p90_us":3.320,"ratio":0.3749,"gbps":0.00,"graph":1,"flush":0}

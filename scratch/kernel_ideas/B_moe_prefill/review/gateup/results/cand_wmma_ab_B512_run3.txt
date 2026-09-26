@@ -1,0 +1,20 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[cand] ./cand_wmma_gfx1151.hsaco
+[setup] B=512 n_exp=96 members=726 touched=96 max_group=16 n_wi_exact=96 n_wi_bound=480  mean members/expert=7.6
+ROOFLINE gate+up: 1.214 GB (weights 1.203 GB) -> 5.28 ms at 230 GB/s; 34.3 GFLOP
+ROOFLINE down:    0.618 GB (weights 0.602 GB) -> 2.69 ms at 230 GB/s; 17.1 GFLOP
+SCALE: x4.00 to a full 384-expert layer (this launch touches 96 experts)
+
+== gate+up A/B B=512 n_exp=96 members=726 touched=96  (rounds=20 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide gate+up (prod)                        8117.89    7988.67    8184.54    1.000     149.6    4219.9
+gu_wmma gate+up (cand)                      6715.29    6645.77    6912.80    0.827     180.8    5101.3
+KBJSON {"tag":"gate+up A/B B=512 n_exp=96 members=726 touched=96","variant":"kwide gate+up (prod)","med_us":8117.887,"p10_us":7988.673,"p90_us":8184.543,"ratio":1.0000,"gbps":149.57,"graph":0,"flush":0}
+KBJSON {"tag":"gate+up A/B B=512 n_exp=96 members=726 touched=96","variant":"gu_wmma gate+up (cand)","med_us":6715.292,"p10_us":6645.773,"p90_us":6912.801,"ratio":0.8272,"gbps":180.81,"graph":0,"flush":0}
+
+== down A/B B=512 n_exp=96 members=726 touched=96  (rounds=20 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide2 down (prod)                          5525.27    5419.33    5564.38    1.000     111.9    3100.0
+down_wmma (cand)                            2997.04    2954.38    3014.60    0.542     206.3    5715.1
+KBJSON {"tag":"down A/B B=512 n_exp=96 members=726 touched=96","variant":"kwide2 down (prod)","med_us":5525.265,"p10_us":5419.330,"p90_us":5564.384,"ratio":1.0000,"gbps":111.92,"graph":0,"flush":0}
+KBJSON {"tag":"down A/B B=512 n_exp=96 members=726 touched=96","variant":"down_wmma (cand)","med_us":2997.041,"p10_us":2954.384,"p90_us":3014.601,"ratio":0.5424,"gbps":206.34,"graph":0,"flush":0}

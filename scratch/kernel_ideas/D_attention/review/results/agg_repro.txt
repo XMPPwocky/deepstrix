@@ -1,0 +1,36 @@
+
+== decode b=1 n_total=640 graph warm   (3 runs)
+  base pair: dec_score + smwsum                        n=3 med   41.45 [ 40.74.. 50.77]  p10   41.11  x1.000
+  base dec_score alone                                 n=3 med    9.57 [  9.48.. 13.00]  p10    9.52  x0.231
+  base smwsum alone                                    n=3 med   32.80 [ 32.41.. 38.42]  p10   32.73  x0.791
+  pair: dec_score + attention_dec_smwsum_pf2           n=3 med   30.53 [ 30.16.. 39.21]  p10   30.46  x0.737
+
+== decode b=2 n_total=640 graph warm   (3 runs)
+  base pair: dec_score + smwsum                        n=3 med   41.40 [ 40.68.. 42.55]  p10   41.15  x1.000
+  base dec_score alone                                 n=3 med    9.72 [  9.68..  9.99]  p10    9.69  x0.235
+  base smwsum alone                                    n=3 med   32.62 [ 32.28.. 33.24]  p10   32.57  x0.788
+  pair: dec_score + attention_dec_smwsum_pf2           n=3 med   30.62 [ 30.31.. 31.51]  p10   30.59  x0.740
+
+== decode b=3 n_total=640 graph warm   (3 runs)
+  base pair: dec_score + smwsum                        n=3 med   43.44 [ 43.31.. 44.92]  p10   43.40  x1.000
+  base dec_score alone                                 n=3 med   12.05 [ 12.03.. 12.52]  p10   12.01  x0.277
+  base smwsum alone                                    n=3 med   32.52 [ 32.40.. 33.56]  p10   32.38  x0.748
+  pair: dec_score + attention_dec_smwsum_pf2           n=3 med   32.93 [ 32.74.. 34.01]  p10   32.88  x0.758
+
+== decode b=4 n_total=640 graph warm   (3 runs)
+  base pair: dec_score + smwsum                        n=3 med   46.71 [ 46.69.. 47.80]  p10   46.64  x1.000
+  base dec_score alone                                 n=3 med   15.36 [ 15.34.. 15.75]  p10   15.33  x0.329
+  base smwsum alone                                    n=3 med   32.50 [ 32.47.. 33.22]  p10   32.34  x0.696
+  pair: dec_score + attention_dec_smwsum_pf2           n=3 med   36.21 [ 36.13.. 37.02]  p10   36.18  x0.775
+
+== decode b=5 n_total=640 graph warm   (3 runs)
+  base pair: dec_score + smwsum                        n=3 med   47.06 [ 47.04.. 47.56]  p10   46.98  x1.000
+  base dec_score alone                                 n=3 med   15.64 [ 15.62.. 15.82]  p10   15.62  x0.332
+  base smwsum alone                                    n=3 med   32.58 [ 32.53.. 32.97]  p10   32.45  x0.692
+  pair: dec_score + attention_dec_smwsum_pf2           n=3 med   36.56 [ 36.48.. 36.87]  p10   36.52  x0.777
+
+== decode b=8 n_total=640 graph warm   (3 runs)
+  base pair: dec_score + smwsum                        n=3 med   53.17 [ 53.17.. 53.26]  p10   53.10  x1.000
+  base dec_score alone                                 n=3 med   21.41 [ 21.40.. 21.45]  p10   21.37  x0.403
+  base smwsum alone                                    n=3 med   32.88 [ 32.87.. 33.02]  p10   32.74  x0.618
+  pair: dec_score + attention_dec_smwsum_pf2           n=3 med   42.48 [ 42.42.. 42.51]  p10   42.41  x0.799

@@ -1,0 +1,26 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CASE ragged b=8 random                  b=8 n_max=235000  giveup_rows=0  done_diff=0 sel_diff_alone=0 sel_diff_chain=0 base_vs_cpu_diff=0  -> PASS
+KBJSON {"case":"ragged b=8 random","b":8,"giveups":0,"done_diff":0,"sel_diff_alone":0,"sel_diff_chain":0,"cpu_diff":0,"ok":1}
+CASE ragged b=8 ties                    b=8 n_max=235000  giveup_rows=0  done_diff=0 sel_diff_alone=0 sel_diff_chain=0 base_vs_cpu_diff=0  -> PASS
+KBJSON {"case":"ragged b=8 ties","b":8,"giveups":0,"done_diff":0,"sel_diff_alone":0,"sel_diff_chain":0,"cpu_diff":0,"ok":1}
+CASE ragged b=8 ties+mask               b=8 n_max=235000  giveup_rows=0  done_diff=0 sel_diff_alone=0 sel_diff_chain=0 base_vs_cpu_diff=391  -> FAIL
+KBJSON {"case":"ragged b=8 ties+mask","b":8,"giveups":0,"done_diff":0,"sel_diff_alone":0,"sel_diff_chain":0,"cpu_diff":391,"ok":0}
+CASE edges b=8 random                   b=8 n_max=100003  giveup_rows=0  done_diff=0 sel_diff_alone=0 sel_diff_chain=0 base_vs_cpu_diff=0  -> PASS
+KBJSON {"case":"edges b=8 random","b":8,"giveups":0,"done_diff":0,"sel_diff_alone":0,"sel_diff_chain":0,"cpu_diff":0,"ok":1}
+CASE n=0 row + b=3                      b=3 n_max=65537   giveup_rows=0  done_diff=0 sel_diff_alone=0 sel_diff_chain=0 base_vs_cpu_diff=0  -> PASS
+KBJSON {"case":"n=0 row + b=3","b":3,"giveups":0,"done_diff":0,"sel_diff_alone":0,"sel_diff_chain":0,"cpu_diff":0,"ok":1}
+CASE all-equal b=4                      b=4 n_max=235000  giveup_rows=0  done_diff=0 sel_diff_alone=0 sel_diff_chain=0 base_vs_cpu_diff=0  -> PASS
+KBJSON {"case":"all-equal b=4","b":4,"giveups":0,"done_diff":0,"sel_diff_alone":0,"sel_diff_chain":0,"cpu_diff":0,"ok":1}
+CASE -inf dominated b=4                 b=4 n_max=235000  giveup_rows=0  done_diff=0 sel_diff_alone=0 sel_diff_chain=0 base_vs_cpu_diff=1649  -> FAIL
+KBJSON {"case":"-inf dominated b=4","b":4,"giveups":0,"done_diff":0,"sel_diff_alone":0,"sel_diff_chain":0,"cpu_diff":1649,"ok":0}
+CASE give-up trap b=4                   b=4 n_max=235000  giveup_rows=4  done_diff=0 sel_diff_alone=0 sel_diff_chain=0 base_vs_cpu_diff=0  -> PASS
+KBJSON {"case":"give-up trap b=4","b":4,"giveups":4,"done_diff":0,"sel_diff_alone":0,"sel_diff_chain":0,"cpu_diff":0,"ok":1}
+CASE odd b=1 100003                     b=1 n_max=100003  giveup_rows=0  done_diff=0 sel_diff_alone=0 sel_diff_chain=0 base_vs_cpu_diff=0  -> PASS
+KBJSON {"case":"odd b=1 100003","b":1,"giveups":0,"done_diff":0,"sel_diff_alone":0,"sel_diff_chain":0,"cpu_diff":0,"ok":1}
+CASE odd b=1 100003 ties                b=1 n_max=100003  giveup_rows=0  done_diff=0 sel_diff_alone=0 sel_diff_chain=0 base_vs_cpu_diff=0  -> PASS
+KBJSON {"case":"odd b=1 100003 ties","b":1,"giveups":0,"done_diff":0,"sel_diff_alone":0,"sel_diff_chain":0,"cpu_diff":0,"ok":1}
+CASE b=8 235000 random                  b=8 n_max=235000  giveup_rows=0  done_diff=0 sel_diff_alone=0 sel_diff_chain=0 base_vs_cpu_diff=0  -> PASS
+KBJSON {"case":"b=8 235000 random","b":8,"giveups":0,"done_diff":0,"sel_diff_alone":0,"sel_diff_chain":0,"cpu_diff":0,"ok":1}
+CASE NaN sprinkle b=4 (report only)     b=4 n_max=235000  giveup_rows=0  done_diff=0 sel_diff_alone=1871 sel_diff_chain=1833 base_vs_cpu_diff=0  -> DIFF (report only)
+KBJSON {"case":"NaN sprinkle b=4 (report only)","b":4,"giveups":0,"done_diff":0,"sel_diff_alone":1871,"sel_diff_chain":1833,"cpu_diff":0,"ok":0}
+EXTRA_RESULT fails=2

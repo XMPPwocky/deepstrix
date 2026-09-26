@@ -1,0 +1,72 @@
+== 1790452863.000302.review.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+== review combine split b=1 n_total=640 graph warm  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base pair: dec_score + smwsum                 48.36      46.74      50.30    1.000       0.0       0.0
+attention_dec_flash3_part1_k128 part1 + combine      13.36      12.96      13.82    0.276       0.0       0.0
+attention_dec_flash3_part1_k128 part1 alone       9.18       8.88       9.51    0.190       0.0       0.0
+attention_dec_flash3_part1_k128 combine alone       5.38       5.25       5.52    0.111       0.0       0.0
+attention_dec_flash3_part1_k64 part1 + combine      14.70      14.22      15.17    0.304       0.0       0.0
+attention_dec_flash3_part1_k64 part1 alone       9.00       8.73       9.33    0.186       0.0       0.0
+attention_dec_flash3_part1_k64 combine alone       6.98       6.80       7.14    0.144       0.0       0.0
+attention_dec_flash2_part1_k128 part1 + combine      14.99      14.51      15.54    0.310       0.0       0.0
+attention_dec_flash2_part1_k128 part1 alone      10.85      10.48      11.28    0.224       0.0       0.0
+attention_dec_flash2_part1_k128 combine alone       5.37       5.23       5.51    0.111       0.0       0.0
+KBJSON {"tag":"review combine split b=1 n_total=640 graph warm","variant":"base pair: dec_score + smwsum","med_us":48.355,"p10_us":46.735,"p90_us":50.299,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=1 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k128 part1 + combine","med_us":13.364,"p10_us":12.964,"p90_us":13.816,"ratio":0.2764,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=1 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k128 part1 alone","med_us":9.180,"p10_us":8.880,"p90_us":9.508,"ratio":0.1898,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=1 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k128 combine alone","med_us":5.380,"p10_us":5.252,"p90_us":5.524,"ratio":0.1113,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=1 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k64 part1 + combine","med_us":14.704,"p10_us":14.224,"p90_us":15.172,"ratio":0.3041,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=1 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k64 part1 alone","med_us":9.004,"p10_us":8.732,"p90_us":9.332,"ratio":0.1862,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=1 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k64 combine alone","med_us":6.976,"p10_us":6.804,"p90_us":7.144,"ratio":0.1443,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=1 n_total=640 graph warm","variant":"attention_dec_flash2_part1_k128 part1 + combine","med_us":14.988,"p10_us":14.508,"p90_us":15.540,"ratio":0.3100,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=1 n_total=640 graph warm","variant":"attention_dec_flash2_part1_k128 part1 alone","med_us":10.852,"p10_us":10.476,"p90_us":11.276,"ratio":0.2244,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=1 n_total=640 graph warm","variant":"attention_dec_flash2_part1_k128 combine alone","med_us":5.368,"p10_us":5.228,"p90_us":5.508,"ratio":0.1110,"gbps":0.00,"graph":1,"flush":0}
+
+== review combine split b=4 n_total=640 graph warm  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base pair: dec_score + smwsum                 48.79      48.13      49.18    1.000       0.0       0.0
+attention_dec_flash3_part1_k128 part1 + combine      36.18      35.84      36.45    0.741       0.0       0.0
+attention_dec_flash3_part1_k128 part1 alone      18.23      18.12      18.38    0.374       0.0       0.0
+attention_dec_flash3_part1_k128 combine alone      19.06      18.99      19.38    0.391       0.0       0.0
+attention_dec_flash3_part1_k64 part1 + combine      35.73      35.41      36.00    0.732       0.0       0.0
+attention_dec_flash3_part1_k64 part1 alone      15.93      15.81      16.05    0.327       0.0       0.0
+attention_dec_flash3_part1_k64 combine alone      20.72      20.60      20.97    0.425       0.0       0.0
+attention_dec_flash2_part1_k128 part1 + combine      40.31      40.01      40.64    0.826       0.0       0.0
+attention_dec_flash2_part1_k128 part1 alone      22.42      22.26      22.56    0.460       0.0       0.0
+attention_dec_flash2_part1_k128 combine alone      19.23      18.99      19.36    0.394       0.0       0.0
+KBJSON {"tag":"review combine split b=4 n_total=640 graph warm","variant":"base pair: dec_score + smwsum","med_us":48.787,"p10_us":48.131,"p90_us":49.175,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=4 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k128 part1 + combine","med_us":36.176,"p10_us":35.839,"p90_us":36.448,"ratio":0.7415,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=4 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k128 part1 alone","med_us":18.228,"p10_us":18.120,"p90_us":18.384,"ratio":0.3736,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=4 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k128 combine alone","med_us":19.056,"p10_us":18.988,"p90_us":19.376,"ratio":0.3906,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=4 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k64 part1 + combine","med_us":35.728,"p10_us":35.408,"p90_us":36.004,"ratio":0.7323,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=4 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k64 part1 alone","med_us":15.932,"p10_us":15.812,"p90_us":16.052,"ratio":0.3266,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=4 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k64 combine alone","med_us":20.716,"p10_us":20.600,"p90_us":20.972,"ratio":0.4246,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=4 n_total=640 graph warm","variant":"attention_dec_flash2_part1_k128 part1 + combine","med_us":40.308,"p10_us":40.007,"p90_us":40.635,"ratio":0.8262,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=4 n_total=640 graph warm","variant":"attention_dec_flash2_part1_k128 part1 alone","med_us":22.424,"p10_us":22.264,"p90_us":22.556,"ratio":0.4596,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=4 n_total=640 graph warm","variant":"attention_dec_flash2_part1_k128 combine alone","med_us":19.228,"p10_us":18.988,"p90_us":19.364,"ratio":0.3941,"gbps":0.00,"graph":1,"flush":0}
+
+== review combine split b=8 n_total=640 graph warm  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base pair: dec_score + smwsum                 54.78      54.50      55.02    1.000       0.0       0.0
+attention_dec_flash3_part1_k128 part1 + combine      50.26      50.10      50.39    0.917       0.0       0.0
+attention_dec_flash3_part1_k128 part1 alone      28.31      28.18      28.49    0.517       0.0       0.0
+attention_dec_flash3_part1_k128 combine alone      22.90      22.86      22.96    0.418       0.0       0.0
+attention_dec_flash3_part1_k64 part1 + combine      53.54      53.36      53.83    0.977       0.0       0.0
+attention_dec_flash3_part1_k64 part1 alone      26.45      26.30      26.67    0.483       0.0       0.0
+attention_dec_flash3_part1_k64 combine alone      27.31      27.26      27.38    0.499       0.0       0.0
+attention_dec_flash2_part1_k128 part1 + combine      56.82      56.61      57.06    1.037       0.0       0.0
+attention_dec_flash2_part1_k128 part1 alone      34.78      34.59      35.03    0.635       0.0       0.0
+attention_dec_flash2_part1_k128 combine alone      22.90      22.86      22.95    0.418       0.0       0.0
+KBJSON {"tag":"review combine split b=8 n_total=640 graph warm","variant":"base pair: dec_score + smwsum","med_us":54.775,"p10_us":54.499,"p90_us":55.023,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=8 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k128 part1 + combine","med_us":50.255,"p10_us":50.099,"p90_us":50.391,"ratio":0.9175,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=8 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k128 part1 alone","med_us":28.308,"p10_us":28.184,"p90_us":28.488,"ratio":0.5168,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=8 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k128 combine alone","med_us":22.904,"p10_us":22.864,"p90_us":22.960,"ratio":0.4181,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=8 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k64 part1 + combine","med_us":53.535,"p10_us":53.359,"p90_us":53.827,"ratio":0.9774,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=8 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k64 part1 alone","med_us":26.452,"p10_us":26.296,"p90_us":26.672,"ratio":0.4829,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=8 n_total=640 graph warm","variant":"attention_dec_flash3_part1_k64 combine alone","med_us":27.312,"p10_us":27.256,"p90_us":27.380,"ratio":0.4986,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=8 n_total=640 graph warm","variant":"attention_dec_flash2_part1_k128 part1 + combine","med_us":56.819,"p10_us":56.611,"p90_us":57.059,"ratio":1.0373,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=8 n_total=640 graph warm","variant":"attention_dec_flash2_part1_k128 part1 alone","med_us":34.776,"p10_us":34.591,"p90_us":35.028,"ratio":0.6349,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"review combine split b=8 n_total=640 graph warm","variant":"attention_dec_flash2_part1_k128 combine alone","med_us":22.896,"p10_us":22.856,"p90_us":22.952,"ratio":0.4180,"gbps":0.00,"graph":1,"flush":0}

@@ -1,0 +1,17 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[kb] LDS/CU 65536 B, regs/block 196608, L2 8388608 B
+[kb] shape qa b=256 M=1280 K=5120 G=1 ldx=5184 working set ~10 MB
+[kb] flush 96 MB per timed block (total device ~106 MB)
+
+== qa b=256 M=1280 K=5120 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemm_wmma_f16x                     109.56     107.68     111.72    1.000      99.4   30626.5
+cand q8_0_gemm_wmma_f16x_pf2                  87.04      83.48      90.72    0.794     125.2   38550.1
+cand q8_0_gemm_wmma_f16x_db                   77.40      76.84      78.44    0.706     140.8   43352.0
+cand q8_0_gemm_wmma_f16x_db_bn64              72.48      71.64      72.88    0.662     150.3   46294.7
+cand q8_0_gemm_wmma_f16x_256x128             118.96     114.76     119.84    1.086      91.6   28206.2
+KBJSON {"tag":"qa b=256 M=1280 K=5120 G=1 flush96MB","variant":"base q8_0_gemm_wmma_f16x","med_us":109.560,"p10_us":107.680,"p90_us":111.721,"ratio":1.0000,"gbps":99.45,"graph":0,"flush":1}
+KBJSON {"tag":"qa b=256 M=1280 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_pf2","med_us":87.041,"p10_us":83.481,"p90_us":90.721,"ratio":0.7945,"gbps":125.18,"graph":0,"flush":1}
+KBJSON {"tag":"qa b=256 M=1280 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_db","med_us":77.400,"p10_us":76.840,"p90_us":78.441,"ratio":0.7065,"gbps":140.77,"graph":0,"flush":1}
+KBJSON {"tag":"qa b=256 M=1280 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_db_bn64","med_us":72.480,"p10_us":71.641,"p90_us":72.881,"ratio":0.6616,"gbps":150.32,"graph":0,"flush":1}
+KBJSON {"tag":"qa b=256 M=1280 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_256x128","med_us":118.961,"p10_us":114.760,"p90_us":119.840,"ratio":1.0858,"gbps":91.59,"graph":0,"flush":1}

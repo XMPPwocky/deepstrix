@@ -1,0 +1,30 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP cand narrow n16 bk64 pf4 B=512     n=12288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"cand narrow n16 bk64 pf4 B=512","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP cand narrow n16 bk128 pf3 B=512    n=12288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"cand narrow n16 bk128 pf3 B=512","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP cand narrow n16 bk128 pf2 B=512    n=12288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"cand narrow n16 bk128 pf2 B=512","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP cand narrow n16 bk64 pf6 B=512     n=12288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"cand narrow n16 bk64 pf6 B=512","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP cand narrow n32 bk64 pf4 B=512     n=12288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"cand narrow n32 bk64 pf4 B=512","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP cand narrow n32 bk128 pf2 B=512    n=12288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"cand narrow n32 bk128 pf2 B=512","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== prefill pre-mix GEMM K=20480 M=24 B=512 direct coldfull160MB_inner1  (rounds=40 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+f16_gemm_wmma_lds_tiled M=24 (1,B/64)        634.25     606.41     679.05    1.000      67.7       0.0
+cand narrow n16 bk64 pf4                     214.80     209.04     219.04    0.339     199.8       0.0
+cand narrow n16 bk128 pf3                    217.44     208.68     226.84    0.343     197.4       0.0
+cand narrow n16 bk128 pf2                    214.88     202.24     223.60    0.339     199.8       0.0
+cand narrow n16 bk64 pf6                     220.60     216.00     223.56    0.348     194.6       0.0
+cand narrow n32 bk64 pf4                     237.32     232.76     240.44    0.374     180.9       0.0
+cand narrow n32 bk128 pf2                    212.72     203.20     225.00    0.335     201.8       0.0
+KBJSON {"tag":"prefill pre-mix GEMM K=20480 M=24 B=512 direct coldfull160MB_inner1","variant":"f16_gemm_wmma_lds_tiled M=24 (1,B/64)","med_us":634.246,"p10_us":606.406,"p90_us":679.046,"ratio":1.0000,"gbps":67.68,"graph":0,"flush":1}
+KBJSON {"tag":"prefill pre-mix GEMM K=20480 M=24 B=512 direct coldfull160MB_inner1","variant":"cand narrow n16 bk64 pf4","med_us":214.802,"p10_us":209.042,"p90_us":219.042,"ratio":0.3387,"gbps":199.84,"graph":0,"flush":1}
+KBJSON {"tag":"prefill pre-mix GEMM K=20480 M=24 B=512 direct coldfull160MB_inner1","variant":"cand narrow n16 bk128 pf3","med_us":217.442,"p10_us":208.682,"p90_us":226.842,"ratio":0.3428,"gbps":197.41,"graph":0,"flush":1}
+KBJSON {"tag":"prefill pre-mix GEMM K=20480 M=24 B=512 direct coldfull160MB_inner1","variant":"cand narrow n16 bk128 pf2","med_us":214.882,"p10_us":202.242,"p90_us":223.602,"ratio":0.3388,"gbps":199.77,"graph":0,"flush":1}
+KBJSON {"tag":"prefill pre-mix GEMM K=20480 M=24 B=512 direct coldfull160MB_inner1","variant":"cand narrow n16 bk64 pf6","med_us":220.602,"p10_us":216.002,"p90_us":223.562,"ratio":0.3478,"gbps":194.59,"graph":0,"flush":1}
+KBJSON {"tag":"prefill pre-mix GEMM K=20480 M=24 B=512 direct coldfull160MB_inner1","variant":"cand narrow n32 bk64 pf4","med_us":237.323,"p10_us":232.762,"p90_us":240.442,"ratio":0.3742,"gbps":180.88,"graph":0,"flush":1}
+KBJSON {"tag":"prefill pre-mix GEMM K=20480 M=24 B=512 direct coldfull160MB_inner1","variant":"cand narrow n32 bk128 pf2","med_us":212.722,"p10_us":203.201,"p90_us":225.002,"ratio":0.3354,"gbps":201.79,"graph":0,"flush":1}

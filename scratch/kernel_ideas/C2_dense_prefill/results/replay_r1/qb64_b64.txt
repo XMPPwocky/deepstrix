@@ -1,0 +1,65 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[kb] LDS/CU 65536 B, regs/block 196608, L2 8388608 B
+[kb] shape qb64 b=64 M=32768 K=1280 G=1 ldx=1344 working set ~59 MB
+CMP qb64 b=64 q8_0_gemv_bpack_z16      n=2097152 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb64 b=64 q8_0_gemv_bpack_z16","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb64 b=64 q8_0_gemv_bpack64_warp8  n=2097152 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb64 b=64 q8_0_gemv_bpack64_warp8","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb64 b=64 f16x_at_b                n=2097152 bitexact=no bit_diff=2096920 nonfinite=0 max_abs=4.647e-02 max_rel=1.270e+02 rmse=8.382e-03 rel_rmse=2.924e-04 worst_idx=1613331
+KBJSON {"cmp":"qb64 b=64 f16x_at_b","bitexact":0,"bit_diff":2096920,"nonfinite":0,"max_abs":4.6472e-02,"rel_rmse":2.9240e-04}
+CMP qb64 b=64 f16x_bn64_at_b           n=2097152 bitexact=no bit_diff=2096920 nonfinite=0 max_abs=4.647e-02 max_rel=1.270e+02 rmse=8.382e-03 rel_rmse=2.924e-04 worst_idx=1613331
+KBJSON {"cmp":"qb64 b=64 f16x_bn64_at_b","bitexact":0,"bit_diff":2096920,"nonfinite":0,"max_abs":4.6472e-02,"rel_rmse":2.9240e-04}
+CMP qb64 b=1 q8_0_gemv_bpack_z16       n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb64 b=1 q8_0_gemv_bpack_z16","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb64 b=1 q8_0_gemv_bpack64_warp8   n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb64 b=1 q8_0_gemv_bpack64_warp8","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb64 b=1 f16x_at_b                 n=32768 bitexact=no bit_diff=32766 nonfinite=0 max_abs=3.663e-02 max_rel=6.385e+00 rmse=8.367e-03 rel_rmse=2.957e-04 worst_idx=21287
+KBJSON {"cmp":"qb64 b=1 f16x_at_b","bitexact":0,"bit_diff":32766,"nonfinite":0,"max_abs":3.6633e-02,"rel_rmse":2.9565e-04}
+CMP qb64 b=1 f16x_bn64_at_b            n=32768 bitexact=no bit_diff=32766 nonfinite=0 max_abs=3.663e-02 max_rel=6.385e+00 rmse=8.367e-03 rel_rmse=2.957e-04 worst_idx=21287
+KBJSON {"cmp":"qb64 b=1 f16x_bn64_at_b","bitexact":0,"bit_diff":32766,"nonfinite":0,"max_abs":3.6633e-02,"rel_rmse":2.9565e-04}
+CMP qb64 b=5 q8_0_gemv_bpack_z16       n=163840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb64 b=5 q8_0_gemv_bpack_z16","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb64 b=5 q8_0_gemv_bpack64_warp8   n=163840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb64 b=5 q8_0_gemv_bpack64_warp8","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb64 b=5 f16x_at_b                 n=163840 bitexact=no bit_diff=163822 nonfinite=0 max_abs=3.991e-02 max_rel=8.254e+01 rmse=8.519e-03 rel_rmse=2.917e-04 worst_idx=160626
+KBJSON {"cmp":"qb64 b=5 f16x_at_b","bitexact":0,"bit_diff":163822,"nonfinite":0,"max_abs":3.9907e-02,"rel_rmse":2.9170e-04}
+CMP qb64 b=5 f16x_bn64_at_b            n=163840 bitexact=no bit_diff=163822 nonfinite=0 max_abs=3.991e-02 max_rel=8.254e+01 rmse=8.519e-03 rel_rmse=2.917e-04 worst_idx=160626
+KBJSON {"cmp":"qb64 b=5 f16x_bn64_at_b","bitexact":0,"bit_diff":163822,"nonfinite":0,"max_abs":3.9907e-02,"rel_rmse":2.9170e-04}
+CMP qb64 b=17 q8_0_gemv_bpack_z16      n=557056 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb64 b=17 q8_0_gemv_bpack_z16","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb64 b=17 q8_0_gemv_bpack64_warp8  n=557056 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb64 b=17 q8_0_gemv_bpac[kb] flush 96 MB per timed block (total device ~155 MB)
+k64_warp8","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb64 b=17 f16x_at_b                n=557056 bitexact=no bit_diff=556997 nonfinite=0 max_abs=4.646e-02 max_rel=8.254e+01 rmse=8.419e-03 rel_rmse=2.943e-04 worst_idx=238701
+KBJSON {"cmp":"qb64 b=17 f16x_at_b","bitexact":0,"bit_diff":556997,"nonfinite":0,"max_abs":4.6465e-02,"rel_rmse":2.9427e-04}
+CMP qb64 b=17 f16x_bn64_at_b           n=557056 bitexact=no bit_diff=556997 nonfinite=0 max_abs=4.646e-02 max_rel=8.254e+01 rmse=8.419e-03 rel_rmse=2.943e-04 worst_idx=238701
+KBJSON {"cmp":"qb64 b=17 f16x_bn64_at_b","bitexact":0,"bit_diff":556997,"nonfinite":0,"max_abs":4.6465e-02,"rel_rmse":2.9427e-04}
+CMP qb64 b=33 q8_0_gemv_bpack_z16      n=1081344 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb64 b=33 q8_0_gemv_bpack_z16","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb64 b=33 q8_0_gemv_bpack64_warp8  n=1081344 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb64 b=33 q8_0_gemv_bpack64_warp8","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb64 b=33 f16x_at_b                n=1081344 bitexact=no bit_diff=1081232 nonfinite=0 max_abs=4.646e-02 max_rel=8.254e+01 rmse=8.381e-03 rel_rmse=2.933e-04 worst_idx=238701
+KBJSON {"cmp":"qb64 b=33 f16x_at_b","bitexact":0,"bit_diff":1081232,"nonfinite":0,"max_abs":4.6465e-02,"rel_rmse":2.9330e-04}
+CMP qb64 b=33 f16x_bn64_at_b           n=1081344 bitexact=no bit_diff=1081232 nonfinite=0 max_abs=4.646e-02 max_rel=8.254e+01 rmse=8.381e-03 rel_rmse=2.933e-04 worst_idx=238701
+KBJSON {"cmp":"qb64 b=33 f16x_bn64_at_b","bitexact":0,"bit_diff":1081232,"nonfinite":0,"max_abs":4.6465e-02,"rel_rmse":2.9330e-04}
+CMP qb64 b=63 q8_0_gemv_bpack_z16      n=2064384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb64 b=63 q8_0_gemv_bpack_z16","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb64 b=63 q8_0_gemv_bpack64_warp8  n=2064384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb64 b=63 q8_0_gemv_bpack64_warp8","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb64 b=63 f16x_at_b                n=2064384 bitexact=no bit_diff=2064155 nonfinite=0 max_abs=4.647e-02 max_rel=1.270e+02 rmse=8.379e-03 rel_rmse=2.925e-04 worst_idx=1613331
+KBJSON {"cmp":"qb64 b=63 f16x_at_b","bitexact":0,"bit_diff":2064155,"nonfinite":0,"max_abs":4.6472e-02,"rel_rmse":2.9247e-04}
+CMP qb64 b=63 f16x_bn64_at_b           n=2064384 bitexact=no bit_diff=2064155 nonfinite=0 max_abs=4.647e-02 max_rel=1.270e+02 rmse=8.379e-03 rel_rmse=2.925e-04 worst_idx=1613331
+KBJSON {"cmp":"qb64 b=63 f16x_bn64_at_b","bitexact":0,"bit_diff":2064155,"nonfinite":0,"max_abs":4.6472e-02,"rel_rmse":2.9247e-04}
+
+== qb64 b=64 M=32768 K=1280 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemv_batched_warp8                1519.14    1515.26    1523.98    1.000      34.9    3534.0
+cand q8_0_gemv_bpack_z16                     589.21     586.01     593.89    0.388      90.0    9111.8
+cand q8_0_gemv_bpack64_warp8                1023.13    1018.93    1028.97    0.673      51.8    5247.3
+cand f16x_at_b                               268.72     265.32     272.20    0.177     197.4   19978.6
+cand f16x_bn64_at_b                          375.76     372.29     379.80    0.247     141.1   14287.4
+KBJSON {"tag":"qb64 b=64 M=32768 K=1280 G=1 flush96MB","variant":"base q8_0_gemv_batched_warp8","med_us":1519.138,"p10_us":1515.259,"p90_us":1523.979,"ratio":1.0000,"gbps":34.91,"graph":0,"flush":1}
+KBJSON {"tag":"qb64 b=64 M=32768 K=1280 G=1 flush96MB","variant":"cand q8_0_gemv_bpack_z16","med_us":589.207,"p10_us":586.007,"p90_us":593.887,"ratio":0.3879,"gbps":90.01,"graph":0,"flush":1}
+KBJSON {"tag":"qb64 b=64 M=32768 K=1280 G=1 flush96MB","variant":"cand q8_0_gemv_bpack64_warp8","med_us":1023.132,"p10_us":1018.933,"p90_us":1028.973,"ratio":0.6735,"gbps":51.84,"graph":0,"flush":1}
+KBJSON {"tag":"qb64 b=64 M=32768 K=1280 G=1 flush96MB","variant":"cand f16x_at_b","med_us":268.723,"p10_us":265.324,"p90_us":272.204,"ratio":0.1769,"gbps":197.36,"graph":0,"flush":1}
+KBJSON {"tag":"qb64 b=64 M=32768 K=1280 G=1 flush96MB","variant":"cand f16x_bn64_at_b","med_us":375.764,"p10_us":372.285,"p90_us":379.805,"ratio":0.2474,"gbps":141.14,"graph":0,"flush":1}

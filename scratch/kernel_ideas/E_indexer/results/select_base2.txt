@@ -1,0 +1,44 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[harness] (no ./cand_topk_gfx1201.hsaco)
+
+== topk n=65536 b=1 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base select_ilp + chain early-outs (prod)      65.89      65.86      65.96    1.000       4.0       0.0
+base select_ilp alone                         59.58      59.53      59.62    0.904       4.4       0.0
+KBJSON {"tag":"topk n=65536 b=1 WARM scores, graph inner=5","variant":"base select_ilp + chain early-outs (prod)","med_us":65.889,"p10_us":65.857,"p90_us":65.961,"ratio":1.0000,"gbps":3.98,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=65536 b=1 WARM scores, graph inner=5","variant":"base select_ilp alone","med_us":59.585,"p10_us":59.529,"p90_us":59.617,"ratio":0.9043,"gbps":4.40,"graph":1,"flush":0}
+
+== topk n=65536 b=4 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base select_ilp + chain early-outs (prod)      80.05      79.91      80.17    1.000      13.1       0.0
+base select_ilp alone                         59.95      59.84      60.06    0.749      17.5       0.0
+KBJSON {"tag":"topk n=65536 b=4 WARM scores, graph inner=5","variant":"base select_ilp + chain early-outs (prod)","med_us":80.049,"p10_us":79.913,"p90_us":80.169,"ratio":1.0000,"gbps":13.10,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=65536 b=4 WARM scores, graph inner=5","variant":"base select_ilp alone","med_us":59.953,"p10_us":59.841,"p90_us":60.057,"ratio":0.7490,"gbps":17.49,"graph":1,"flush":0}
+
+== topk n=131072 b=1 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base select_ilp + chain early-outs (prod)      71.37      71.32      71.42    1.000       7.3       0.0
+base select_ilp alone                         66.22      66.17      66.28    0.928       7.9       0.0
+KBJSON {"tag":"topk n=131072 b=1 WARM scores, graph inner=5","variant":"base select_ilp + chain early-outs (prod)","med_us":71.369,"p10_us":71.321,"p90_us":71.417,"ratio":1.0000,"gbps":7.35,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=131072 b=1 WARM scores, graph inner=5","variant":"base select_ilp alone","med_us":66.217,"p10_us":66.169,"p90_us":66.281,"ratio":0.9278,"gbps":7.92,"graph":1,"flush":0}
+
+== topk n=131072 b=4 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base select_ilp + chain early-outs (prod)      75.56      75.51      75.60    1.000      27.8       0.0
+base select_ilp alone                         67.49      67.46      67.54    0.893      31.1       0.0
+KBJSON {"tag":"topk n=131072 b=4 WARM scores, graph inner=5","variant":"base select_ilp + chain early-outs (prod)","med_us":75.561,"p10_us":75.513,"p90_us":75.601,"ratio":1.0000,"gbps":27.75,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=131072 b=4 WARM scores, graph inner=5","variant":"base select_ilp alone","med_us":67.489,"p10_us":67.465,"p90_us":67.545,"ratio":0.8932,"gbps":31.07,"graph":1,"flush":0}
+
+== topk n=235000 b=1 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base select_ilp + chain early-outs (prod)      89.84      89.79      89.90    1.000      10.5       0.0
+base select_ilp alone                         83.01      82.88      83.07    0.924      11.3       0.0
+KBJSON {"tag":"topk n=235000 b=1 WARM scores, graph inner=5","variant":"base select_ilp + chain early-outs (prod)","med_us":89.841,"p10_us":89.793,"p90_us":89.905,"ratio":1.0000,"gbps":10.46,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=235000 b=1 WARM scores, graph inner=5","variant":"base select_ilp alone","med_us":83.009,"p10_us":82.881,"p90_us":83.073,"ratio":0.9240,"gbps":11.32,"graph":1,"flush":0}
+
+== topk n=235000 b=4 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base select_ilp + chain early-outs (prod)      92.43      92.34      92.48    1.000      40.7       0.0
+base select_ilp alone                         85.15      85.10      85.22    0.921      44.2       0.0
+KBJSON {"tag":"topk n=235000 b=4 WARM scores, graph inner=5","variant":"base select_ilp + chain early-outs (prod)","med_us":92.433,"p10_us":92.337,"p90_us":92.481,"ratio":1.0000,"gbps":40.68,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=235000 b=4 WARM scores, graph inner=5","variant":"base select_ilp alone","med_us":85.153,"p10_us":85.097,"p90_us":85.225,"ratio":0.9212,"gbps":44.16,"graph":1,"flush":0}

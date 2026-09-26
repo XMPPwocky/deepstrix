@@ -1,0 +1,13 @@
+== 1790450783.000046.D_attention.dgpu rc=0
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+f16rt mag=1e-06: fp8 rows where roundtrip CHANGED f32 value: 106010 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=0.0001: fp8 rows where roundtrip CHANGED f32 value: 107767 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=0.003: fp8 rows where roundtrip CHANGED f32 value: 106930 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=0.02: fp8 rows where roundtrip CHANGED f32 value: 89760 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=0.3: fp8 rows where roundtrip CHANGED f32 value: 50065 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=1: fp8 rows where roundtrip CHANGED f32 value: 32863 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=30: fp8 rows where roundtrip CHANGED f32 value: 1869 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=3000: fp8 rows where roundtrip CHANGED f32 value: 24 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=60000: fp8 rows where roundtrip CHANGED f32 value: 1 of 262144; f16 cache bits differ (with vs without f16rt): 0
+f16rt mag=1e+06: fp8 rows where roundtrip CHANGED f32 value: 34038 of 262144; f16 cache bits differ (with vs without f16rt): 0
+KBJSON {"cmp":"f16_roundtrip no-op on kv_cache_append output","bitexact":1,"bit_diff":0,"f32_changed_by_rt":529327}

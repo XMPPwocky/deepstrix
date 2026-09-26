@@ -175,8 +175,13 @@ static void l_kwide(hipFunction_t fn, Chain& c, float* mid, unsigned grid_y, con
                (const uint8_t*)c.xq, (const float*)c.ew, (const int*)c.group_count, (const int*)c.members,
                (const int*)c.work_items, GBPE, GBPE, N_USED, c.max_per_expert, CHUNK, CLAMP, N_FF, NB_GATE, n_wi_dev);
 }
+static unsigned gu_rows_per_wg() {   // KB_GU_RPW: rows per work-group of the gate+up candidate (default 128)
+    static unsigned v = 0;
+    if (!v) { const char* e = getenv("KB_GU_RPW"); v = e ? (unsigned)atoi(e) : 128u; }
+    return v;
+}
 static void l_gu_wmma(hipFunction_t fn, Chain& c, float* mid, unsigned grid_y, const int* n_wi_dev, hipStream_t s) {
-    kb::launch(fn, dim3(N_FF / 128, grid_y), dim3(256), 0, s, mid, (const uint8_t*)c.gate, (const uint8_t*)c.up,
+    kb::launch(fn, dim3((N_FF + gu_rows_per_wg() - 1) / gu_rows_per_wg(), grid_y), dim3(256), 0, s, mid, (const uint8_t*)c.gate, (const uint8_t*)c.up,
                (const uint8_t*)c.xq, (const float*)c.ew, (const int*)c.group_count, (const int*)c.members,
                (const int*)c.work_items, GBPE, GBPE, N_USED, c.max_per_expert, CHUNK, CLAMP, N_FF, NB_GATE, n_wi_dev);
 }
@@ -286,12 +291,28 @@ int main(int argc, char** argv) {
     f.red = m_q2k.fn("q2_k_reduce_partials_hetsplit");
     kb::Module* m_cand = nullptr;
     {
-        FILE* t = fopen((dir + "/cand_wmma_gfx1151.hsaco").c_str(), "rb");
+        // KB_CAND selects the candidate code object (default cand_wmma); every candidate
+        // module exports the same two symbols so cmp/ab/prof_gu/prof_down work unchanged.
+        const char* cand_env = getenv("KB_CAND");
+        const std::string cand = dir + "/" + (cand_env ? cand_env : "cand_wmma") + "_gfx1151.hsaco";
+        FILE* t = fopen(cand.c_str(), "rb");
         if (t) {
             fclose(t);
-            m_cand = new kb::Module(dir + "/cand_wmma_gfx1151.hsaco");
+            fprintf(stderr, "[cand] %s\n", cand.c_str());
+            m_cand = new kb::Module(cand);
             f.gu_wmma = m_cand->fn("mxfp4_pair_matvec_fused_swiglu_wmma");
             f.down_wmma = m_cand->fn("mxfp4_matvec_par_by_expert_wmma");
+        }
+    }
+    kb::Module* m_abl = nullptr;
+    std::vector<std::pair<std::string, hipFunction_t>> abl_fns;
+    {
+        FILE* t = fopen((dir + "/cand_ablate_gfx1151.hsaco").c_str(), "rb");
+        if (t) {
+            fclose(t);
+            m_abl = new kb::Module(dir + "/cand_ablate_gfx1151.hsaco");
+            for (const char* n : {"kw_abl_full", "kw_abl_nodot", "kw_abl_noload", "kw_abl_nostage", "kw_abl_nolut", "kw_abl_noload_nodot"})
+                abl_fns.emplace_back(n, m_abl->fn(n));
         }
     }
     const bool need_refs = (mode == "cmp");
@@ -382,6 +403,19 @@ int main(int argc, char** argv) {
         snprintf(tag, sizeof tag, "down A/B B=%u n_exp=%u members=%u touched=%u", B, n_exp, c.members_total, c.touched);
         o.tag = tag;
         kb::ab(vd, o);
+    } else if (mode == "ablate") {
+        if (abl_fns.empty()) { fprintf(stderr, "no ablation module\n"); return 3; }
+        std::vector<kb::Variant> vs = {
+            {"kwide gate+up (prod)", [&](hipStream_t s) { l_kwide(f.kwide, c, c.mid, c.n_wi_bound, c.n_wi_dev, s); }, gu_bytes, gu_flops},
+        };
+        for (auto& p : abl_fns) {
+            hipFunction_t fn = p.second;
+            vs.push_back({p.first, [&, fn](hipStream_t s) { l_kwide(fn, c, c.mid, c.n_wi_bound, c.n_wi_dev, s); }, gu_bytes, gu_flops});
+        }
+        kb::AbOpts o; o.rounds = rounds; o.inner = 2;
+        snprintf(tag, sizeof tag, "kwide ablations B=%u n_exp=%u members=%u touched=%u", B, n_exp, c.members_total, c.touched);
+        o.tag = tag;
+        kb::ab(vs, o);
     } else if (mode.rfind("prof_", 0) == 0) {
         std::string k = mode.substr(5);
         kb::warm(200);

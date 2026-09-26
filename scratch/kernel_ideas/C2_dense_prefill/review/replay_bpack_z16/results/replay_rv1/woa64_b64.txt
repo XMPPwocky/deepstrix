@@ -1,0 +1,19 @@
+CMP woa64 b=64 q8_0_grouped_gemv_bpack_z16 n=524288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"woa64 b=64 q8_0_grouped_gemv_bpack_z16","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP woa64 b=1 q8_0_grouped_gemv_bpack_z16 n=8192 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"woa64 b=1 q8_0_grouped_gemv_bpack_z16","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP woa64 b=5 q8_0_grouped_gemv_bpack_z16 n=40960 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"woa64 b=5 q8_0_grouped_gemv_bpack_z16","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP woa64 b=17 q8_0_grouped_gemv_bpack_z16 n=139264 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"woa64 b=17 q8_0_grouped_gemv_bpack_z16","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP woa64 b=33 q8_0_grouped_gemv_bpack_z16 n=270336 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"woa64 b=33 q8_0_grouped_gemv_bpack_z16","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP woa64 b=63 q8_0_grouped_gemv_bpack_z16 n=516096 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"woa64 b=63 q8_0_grouped_gemv_bpack_z16","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== woa64 b=64 M=1024 K=4096 G=8 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_grouped_gemv_batched              1210.41    1207.65    1214.17    1.000      32.9    3548.3
+cand q8_0_grouped_gemv_bpack_z16             536.53     531.97     539.49    0.443      74.3    8005.1
+KBJSON {"tag":"woa64 b=64 M=1024 K=4096 G=8 flush96MB","variant":"base q8_0_grouped_gemv_batched","med_us":1210.414,"p10_us":1207.654,"p90_us":1214.174,"ratio":1.0000,"gbps":32.92,"graph":0,"flush":1}
+KBJSON {"tag":"woa64 b=64 M=1024 K=4096 G=8 flush96MB","variant":"cand q8_0_grouped_gemv_bpack_z16","med_us":536.527,"p10_us":531.966,"p90_us":539.486,"ratio":0.4433,"gbps":74.27,"graph":0,"flush":1}

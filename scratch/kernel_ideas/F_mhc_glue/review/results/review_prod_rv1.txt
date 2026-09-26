@@ -1,0 +1,31 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+== review PROD regime (rms_nw+gemm prefix untimed) B=512 direct inner=1  (rounds=40 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+hc_weighted_sum_batched (20,1,B)              86.40      85.88      87.16    1.000     606.8       0.0
+rms_norm_weighted_batched (B) 5120            46.68      45.72      47.44    0.540     449.3       0.0
+carry:=split D2D copy alone                   11.04      10.32      11.28    0.128       8.9       0.0
+TRIO hcw+copy+rmsw (production b>8)          124.36     123.48     125.40    1.439     591.0       0.0
+mhc_fast collapse-only (1,1,B)                99.48      98.84     100.28    1.151     632.4       0.0
+CAND collapse-only + copy (integration)      107.68     106.20     110.36    1.246     585.2       0.0
+KBJSON {"tag":"review PROD regime (rms_nw+gemm prefix untimed) B=512 direct inner=1","variant":"hc_weighted_sum_batched (20,1,B)","med_us":86.401,"p10_us":85.881,"p90_us":87.161,"ratio":1.0000,"gbps":606.81,"graph":0,"flush":1}
+KBJSON {"tag":"review PROD regime (rms_nw+gemm prefix untimed) B=512 direct inner=1","variant":"rms_norm_weighted_batched (B) 5120","med_us":46.680,"p10_us":45.720,"p90_us":47.440,"ratio":0.5403,"gbps":449.26,"graph":0,"flush":1}
+KBJSON {"tag":"review PROD regime (rms_nw+gemm prefix untimed) B=512 direct inner=1","variant":"carry:=split D2D copy alone","med_us":11.040,"p10_us":10.320,"p90_us":11.281,"ratio":0.1278,"gbps":8.90,"graph":0,"flush":1}
+KBJSON {"tag":"review PROD regime (rms_nw+gemm prefix untimed) B=512 direct inner=1","variant":"TRIO hcw+copy+rmsw (production b>8)","med_us":124.362,"p10_us":123.482,"p90_us":125.401,"ratio":1.4394,"gbps":591.01,"graph":0,"flush":1}
+KBJSON {"tag":"review PROD regime (rms_nw+gemm prefix untimed) B=512 direct inner=1","variant":"mhc_fast collapse-only (1,1,B)","med_us":99.481,"p10_us":98.841,"p90_us":100.281,"ratio":1.1514,"gbps":632.43,"graph":0,"flush":1}
+KBJSON {"tag":"review PROD regime (rms_nw+gemm prefix untimed) B=512 direct inner=1","variant":"CAND collapse-only + copy (integration)","med_us":107.682,"p10_us":106.201,"p90_us":110.361,"ratio":1.2463,"gbps":585.18,"graph":0,"flush":1}
+
+== review PROD regime (rms_nw+gemm prefix untimed) B=1024 direct inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+hc_weighted_sum_batched (20,1,B)             178.44     177.88     178.76    1.000     587.6       0.0
+rms_norm_weighted_batched (B) 5120            84.00      83.12      95.68    0.471     499.3       0.0
+carry:=split D2D copy alone                   11.12      10.36      11.40    0.062      17.7       0.0
+TRIO hcw+copy+rmsw (production b>8)          246.88     246.12     247.72    1.384     595.4       0.0
+mhc_fast collapse-only (1,1,B)               209.28     208.68     209.72    1.173     601.2       0.0
+CAND collapse-only + copy (integration)      215.52     214.76     216.52    1.208     584.7       0.0
+KBJSON {"tag":"review PROD regime (rms_nw+gemm prefix untimed) B=1024 direct inner=1","variant":"hc_weighted_sum_batched (20,1,B)","med_us":178.443,"p10_us":177.883,"p90_us":178.762,"ratio":1.0000,"gbps":587.63,"graph":0,"flush":1}
+KBJSON {"tag":"review PROD regime (rms_nw+gemm prefix untimed) B=1024 direct inner=1","variant":"rms_norm_weighted_batched (B) 5120","med_us":84.001,"p10_us":83.121,"p90_us":95.681,"ratio":0.4707,"gbps":499.32,"graph":0,"flush":1}
+KBJSON {"tag":"review PROD regime (rms_nw+gemm prefix untimed) B=1024 direct inner=1","variant":"carry:=split D2D copy alone","med_us":11.120,"p10_us":10.360,"p90_us":11.400,"ratio":0.0623,"gbps":17.68,"graph":0,"flush":1}
+KBJSON {"tag":"review PROD regime (rms_nw+gemm prefix untimed) B=1024 direct inner=1","variant":"TRIO hcw+copy+rmsw (production b>8)","med_us":246.883,"p10_us":246.122,"p90_us":247.723,"ratio":1.3835,"gbps":595.41,"graph":0,"flush":1}
+KBJSON {"tag":"review PROD regime (rms_nw+gemm prefix untimed) B=1024 direct inner=1","variant":"mhc_fast collapse-only (1,1,B)","med_us":209.282,"p10_us":208.683,"p90_us":209.722,"ratio":1.1728,"gbps":601.24,"graph":0,"flush":1}
+KBJSON {"tag":"review PROD regime (rms_nw+gemm prefix untimed) B=1024 direct inner=1","variant":"CAND collapse-only + copy (integration)","med_us":215.523,"p10_us":214.763,"p90_us":216.522,"ratio":1.2078,"gbps":584.74,"graph":0,"flush":1}

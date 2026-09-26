@@ -1,0 +1,40 @@
+== 1790452054.000212.D_attention.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+W20260926 19:47:35.330437 132052788284032 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.035192 sec
+W20260926 19:47:35.330652 132052788284032 simple_timer.cpp:55] [rocprofv3] './attn_harness2_gfx1201 gfx1201 . prof 8 attention_dec_fused_vt_qreg_d8' ::     0.000000 sec
+W20260926 19:47:35.373340 132052788284032 tool.cpp:2424] HSA version 1.18.0 initialized (instance=0)
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+E20260926 19:47:35.376122 132052788284032 output_stream.cpp:111] Opened result file: results/att_vtqreg_b8/run_gfx1201_code_object_id_1.out
+E20260926 19:47:35.377280 132052788284032 output_stream.cpp:111] Opened result file: results/att_vtqreg_b8/run_gfx1201_code_object_id_2.out
+E20260926 19:47:35.378438 132052788284032 output_stream.cpp:111] Opened result file: results/att_vtqreg_b8/run_gfx1201_code_object_id_3.out
+E20260926 19:47:35.380075 132052788284032 output_stream.cpp:111] Opened result file: results/att_vtqreg_b8/run_gfx1201_code_object_id_4.out
+E20260926 19:47:35.381294 132052788284032 output_stream.cpp:111] Opened result file: results/att_vtqreg_b8/run_gfx1201_code_object_id_5.out
+E20260926 19:47:35.382672 132052788284032 output_stream.cpp:111] Opened result file: results/att_vtqreg_b8/run_gfx1201_code_object_id_6.out
+E20260926 19:47:35.383875 132052788284032 output_stream.cpp:111] Opened result file: results/att_vtqreg_b8/run_gfx1201_code_object_id_7.out
+E20260926 19:47:35.385037 132052788284032 output_stream.cpp:111] Opened result file: results/att_vtqreg_b8/run_gfx1201_code_object_id_8.out
+[cand] attention_dec_fused_vt_qreg_d8 (fused)
+E20260926 19:47:35.387149 132052788284032 output_stream.cpp:111] Opened result file: results/att_vtqreg_b8/run_gfx1201_code_object_id_9.out
+E20260926 19:47:35.398959 132052788284032 output_stream.cpp:111] Opened result file: results/att_vtqreg_b8/run_gfx1201_code_object_id_10.out
+E20260926 19:47:35.400569 132052460500672 output_stream.cpp:111] Opened result file: results/att_vtqreg_b8/run_26309_shader_engine_0_17.att
+E20260926 19:47:35.400835 132052460500672 output_stream.cpp:111] Opened result file: results/att_vtqreg_b8/run_26309_shader_engine_0_20.att
+W20260926 19:47:35.401234 132052788284032 simple_timer.cpp:55] [rocprofv3] './attn_harness2_gfx1201 gfx1201 . prof 8 attention_dec_fused_vt_qreg_d8' ::     0.070582 sec
+W20260926 19:47:35.411799 132052788284032 generateRocpd.cpp:583] writing SQL database for process 99032 on node 868250506
+E20260926 19:47:35.412054 132052788284032 generateRocpd.cpp:606] Opened result file: results/att_vtqreg_b8/run_results.db (UUID=00000037-604b-704b-9c18-33adb349a672)
+W20260926 19:47:36.137288 132052788284032 simple_timer.cpp:55] SQLite3 generation :: rocpd_string             ::     0.016225 sec
+W20260926 19:47:36.149352 132052788284032 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_node          ::     0.012038 sec
+W20260926 19:47:36.162291 132052788284032 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_process       ::     0.012930 sec
+W20260926 19:47:36.195333 132052788284032 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_agent         ::     0.011116 sec
+W20260926 19:47:36.195355 132052788284032 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_pmc           ::     0.000011 sec
+W20260926 19:47:36.207335 132052788284032 simple_timer.cpp:55] SQLite3 generation :: rocpd kernel info        ::     0.011977 sec
+W20260926 19:47:36.207346 132052788284032 simple_timer.cpp:55] SQLite3 generation :: rocpd_region             ::     0.000002 sec
+W20260926 19:47:36.207349 132052788284032 simple_timer.cpp:55] SQLite3 generation :: rocpd_kernel_dispatch    ::     0.000001 sec
+W20260926 19:47:36.207351 132052788284032 simple_timer.cpp:55] SQLite3 generation :: rocpd_pmc_event          ::     0.000000 sec
+W20260926 19:47:36.207353 132052788284032 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_copy        ::     0.000000 sec
+W20260926 19:47:36.207356 132052788284032 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_allocate    ::     0.000001 sec
+W20260926 19:47:36.207477 132052788284032 simple_timer.cpp:55] SQLite3 generation :: SQL indexing             ::     0.000119 sec
+W20260926 19:47:36.208290 132052788284032 simple_timer.cpp:55] SQLite3 generation :: total                    ::     0.796491 sec
+W20260926 19:47:36.311794 132052788284032 simple_timer.cpp:55] [rocprofv3] output generation ::     0.908839 sec
+W20260926 19:47:36.311871 132052788284032 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.908923 sec
+prof done b=8
+results/att_vtqreg_b8/stats_ui_output_agent_26309_dispatch_17.csv
+results/att_vtqreg_b8/stats_ui_output_agent_26309_dispatch_20.csv

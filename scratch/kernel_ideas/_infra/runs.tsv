@@ -163,3 +163,313 @@
 2026-09-26T19:11:05Z	_other/example	igpu	16MB	rc=0	0.7s	busy_before=44	busy_after=67	./harness_gfx1151 gfx1151 .  
 2026-09-26T19:11:06Z	_infra/example	igpu	16MB	rc=66	0.0s	busy_before=24	busy_after=23	bash ../prof.sh att igpu vec_add out_x -- ./harness_gfx1151 gfx1151 .  
 2026-09-26T19:11:09Z	_infra/example	dgpu	16MB	rc=0	1.3s	busy_before=0	busy_after=27	bash ../prof.sh att dgpu vec_add_inplace_v4 /home/claude-code/.claude/jobs/6b27263e/tmp/att_sched_test -- ./harness_gfx1201 gfx1201 .  
+2026-09-26T19:15:12Z	A_moe_smallb/smallb-chain	igpu	450MB	rc=0	5.7s	busy_before=0	busy_after=95	bash run_chain.sh smallb_run1 smallb\,smallb.nobuild\,kwide_c8.c8\,base.c8 2\ 4\ 8  
+2026-09-26T19:15:16Z	C2_dense_prefill/corr_f16x	dgpu	400MB	rc=0	3.6s	busy_before=0	busy_after=61	bash run_corr_f16x.sh  
+2026-09-26T19:17:08Z	C2_dense_prefill/ab_f16x	dgpu	500MB	rc=0	8.9s	busy_before=NA	busy_after=86	bash run_ab_f16x.sh r1  
+2026-09-26T19:17:08Z	C2_dense_prefill/replay	dgpu	500MB	rc=0	0.3s	busy_before=10	busy_after=10	bash run_replay.sh r1 --corr  
+2026-09-26T19:17:11Z	C2_dense_prefill/engram	dgpu	700MB	rc=0	2.5s	busy_before=4	busy_after=89	bash run_engram.sh r1 --corr  
+2026-09-26T19:17:37Z	F_mhc_glue/baseline	dgpu	400MB	rc=0	3.8s	busy_before=NA	busy_after=79	bash jobs/base_all.sh r2  
+2026-09-26T19:18:00Z	E_indexer/score_base2	dgpu	156MB	rc=0	5.1s	busy_before=NA	busy_after=94	bash run_score.sh base2 30  
+2026-09-26T19:18:09Z	E_indexer/rest_base2	dgpu	156MB	rc=0	8.6s	busy_before=16	busy_after=96	bash run_rest.sh base2 30  
+2026-09-26T19:18:40Z	D_attention/baseline_quiet	dgpu	64MB	rc=0	3.1s	busy_before=NA	busy_after=91	./attn_harness_gfx1201 gfx1201 . decode 1 2 4 5 8  
+2026-09-26T19:21:25Z	F_mhc_glue/cands_r1	dgpu	600MB	rc=0	6.5s	busy_before=NA	busy_after=80	bash jobs/cands.sh r1 all  
+2026-09-26T19:22:20Z	C1_dense_decode/shared_r3	dgpu	250MB	rc=0	3.2s	busy_before=NA	busy_after=86	./harness shared 1 : shared 2 : shared 4 : shared 5 : shared 8  
+2026-09-26T19:22:36Z	C1_dense_decode/gemv_sweep_r3	dgpu	1000MB	rc=0	15.8s	busy_before=9	busy_after=85	./harness gemv qa 1 : gemv qa 2 : gemv qa 4 : gemv qa 5 : gemv qa 8 : gemv qb 1 : gemv qb 4 : gemv qb 5 : gemv qb 8 : gemv kv 1 : gemv kv 4 : gemv kv 5 : gemv wob 1 : gemv wob 4 : gemv wob 5 : gemv wo
+2026-09-26T19:22:40Z	C2_dense_prefill/replay	dgpu	500MB	rc=0	3.8s	busy_before=8	busy_after=86	bash run_replay.sh r1 --corr  
+2026-09-26T19:22:47Z	C1_dense_decode/small_r3	dgpu	250MB	rc=0	7.1s	busy_before=3	busy_after=95	./harness grouped 1 : grouped 2 : grouped 4 : grouped 5 : grouped 8 : quant 5120 1 : quant 5120 4 : quant 5120 8 : quant 1280 4 : quant 8192 4 : quant 32768 4 : quant 2304 4 : swiglu 1 : swiglu 4 : la
+2026-09-26T19:22:50Z	C2_dense_prefill/corr_pf	dgpu	400MB	rc=0	3.4s	busy_before=8	busy_after=61	bash run_corr_f16x.sh q8_0_gemm_wmma_f16x_pf2\,q8_0_gemm_wmma_f16x_pf3\,q8_0_gemm_wmma_f16x_pf4  
+2026-09-26T19:22:58Z	A_moe_smallb/v2-chain	igpu	450MB	rc=0	38.7s	busy_before=0	busy_after=96	bash run_chain.sh v2_run1 gu2_mb8\,gu2_mb8_d2\,dn2_r2\,dn2_r1.r1\,gu2_mb8.w16 2\ 4\ 8  
+2026-09-26T19:22:59Z	C2_dense_prefill/ab_f16x	dgpu	500MB	rc=0	8.9s	busy_before=6	busy_after=84	bash run_ab_f16x.sh r2 q8_0_gemm_wmma_f16x_pf2\,q8_0_gemm_wmma_f16x_pf3\,q8_0_gemm_wmma_f16x_pf4\,q8_0_gemm_wmma_f16x_abl_noglobal\,q8_0_gemm_wmma_f16x_abl_nolds\,q8_0_gemm_wmma_f16x_abl_nowmma  
+2026-09-26T19:23:02Z	C2_dense_prefill/engram	dgpu	700MB	rc=0	3.0s	busy_before=3	busy_after=89	bash run_engram.sh r2 --corr  
+2026-09-26T19:23:09Z	E_indexer/topk_gather_cand1	dgpu	156MB	rc=0	6.0s	busy_before=1	busy_after=94	bash run_rest.sh cand1 30 select gather  
+2026-09-26T19:23:17Z	A_moe_smallb/v2-chain-mb4	igpu	450MB	rc=0	18.2s	busy_before=92	busy_after=97	bash run_chain.sh v2mb4_run1 gu2_mb4\,gu2_mb4_d2\,gu2_mb4.w16 2\ 4  
+2026-09-26T19:23:21Z	A_moe_smallb/baseline-parts-idle	igpu	450MB	rc=0	4.2s	busy_before=93	busy_after=93	bash run_parts.sh idle_run1 - 1\ 2\ 4\ 8  
+2026-09-26T19:24:03Z	B_moe_prefill/base	igpu	2100MB	rc=0	5.4s	busy_before=0	busy_after=94	bash run_base.sh 2  
+2026-09-26T19:24:17Z	F_mhc_glue/winners_r2	dgpu	600MB	rc=1	3.1s	busy_before=NA	busy_after=77	bash jobs/winners.sh r2  
+2026-09-26T19:24:22Z	F_mhc_glue/winners_r3	dgpu	600MB	rc=1	2.4s	busy_before=0	busy_after=81	bash jobs/winners.sh r3  
+2026-09-26T19:25:08Z	C2_dense_prefill/att_pf3	dgpu	400MB	rc=0	3.3s	busy_before=NA	busy_after=38	bash ../_infra/prof.sh att dgpu q8_0_gemm_wmma_f16x_pf3 results/att_pf3_qb -- ./harness_gfx1201 gfx1201 . qb --short --cand q8_0_gemm_wmma_f16x_pf3  
+2026-09-26T19:25:49Z	C1_dense_decode/shared_r4	dgpu	250MB	rc=0	3.4s	busy_before=NA	busy_after=88	./harness shared 1 : shared 2 : shared 4 : shared 5 : shared 8  
+2026-09-26T19:26:05Z	C1_dense_decode/gemv_sweep_r4	dgpu	1000MB	rc=0	15.7s	busy_before=8	busy_after=85	./harness gemv qa 1 : gemv qa 2 : gemv qa 4 : gemv qa 5 : gemv qa 8 : gemv qb 1 : gemv qb 4 : gemv qb 5 : gemv qb 8 : gemv kv 1 : gemv kv 4 : gemv kv 5 : gemv wob 1 : gemv wob 4 : gemv wob 5 : gemv wo
+2026-09-26T19:26:12Z	C1_dense_decode/small_r4	dgpu	250MB	rc=0	7.2s	busy_before=9	busy_after=94	./harness grouped 1 : grouped 2 : grouped 4 : grouped 5 : grouped 8 : quant 5120 1 : quant 5120 4 : quant 5120 8 : quant 1280 4 : quant 8192 4 : quant 32768 4 : quant 2304 4 : swiglu 1 : swiglu 4 : la
+2026-09-26T19:26:20Z	E_indexer/score2_cand2	dgpu	156MB	rc=0	7.7s	busy_before=9	busy_after=95	bash run_rest.sh cand2 30 score cand  
+2026-09-26T19:26:21Z	C1_dense_decode/att_q8_0_gemv_bpack_tB8	dgpu	400MB	rc=0	1.6s	busy_before=5	busy_after=27	bash ../_infra/prof.sh att dgpu q8_0_gemv_bpack_tB8 results/att_tB8_qa_b8 -- ./harness gemv qa 8  
+2026-09-26T19:26:23Z	C1_dense_decode/att_shared_gateup_swiglu_q8_tB4_r1	dgpu	400MB	rc=0	1.7s	busy_before=9	busy_after=34	bash ../_infra/prof.sh att dgpu shared_gateup_swiglu_q8_tB4_r1 results/att_sharedB1_b4 -- ./harness shared 4  
+2026-09-26T19:26:23Z	D_attention/check2	dgpu	96MB	rc=0	0.3s	busy_before=8	busy_after=17	./attn_harness2_gfx1201 gfx1201 . check  
+2026-09-26T19:26:23Z	D_attention/f16rt	dgpu	96MB	rc=0	0.1s	busy_before=6	busy_after=17	./attn_harness2_gfx1201 gfx1201 . f16rt  
+2026-09-26T19:26:29Z	B_moe_prefill/ablate	igpu	2100MB	rc=0	6.1s	busy_before=0	busy_after=97	bash run_ablate.sh 1  
+2026-09-26T19:26:32Z	C1_dense_decode/quant32k_q1	dgpu	100MB	rc=0	3.7s	busy_before=0	busy_after=97	./harness quant 32768 1 : quant 32768 2 : quant 32768 4 : quant 32768 5 : quant 32768 8 : quant 16384 4 : quant 16384 8 : quant 65536 1 : quant 65536 2 : quant 8192 8 : quant 32768 4  
+2026-09-26T19:26:56Z	C2_dense_prefill/corr_db	dgpu	400MB	rc=0	3.9s	busy_before=NA	busy_after=61	bash run_corr_f16x.sh q8_0_gemm_wmma_f16x_db\,q8_0_gemm_wmma_f16x_db_pf1\,q8_0_gemm_wmma_f16x_db_pf3\,q8_0_gemm_wmma_f16x_db_bn64  
+2026-09-26T19:27:05Z	C2_dense_prefill/ab_f16x	dgpu	500MB	rc=0	8.2s	busy_before=12	busy_after=87	bash run_ab_f16x.sh r3 q8_0_gemm_wmma_f16x_pf3\,q8_0_gemm_wmma_f16x_db\,q8_0_gemm_wmma_f16x_db_pf1\,q8_0_gemm_wmma_f16x_db_pf3\,q8_0_gemm_wmma_f16x_db_bn64  
+2026-09-26T19:27:08Z	C2_dense_prefill/engram	dgpu	700MB	rc=0	3.0s	busy_before=9	busy_after=89	bash run_engram.sh r3 --corr  
+2026-09-26T19:27:11Z	C1_dense_decode/shared_r5	dgpu	250MB	rc=0	2.7s	busy_before=1	busy_after=92	./harness shared 1 : shared 2 : shared 4 : shared 5 : shared 8  
+2026-09-26T19:27:27Z	C1_dense_decode/gemv_sweep_r5	dgpu	1000MB	rc=0	15.7s	busy_before=9	busy_after=85	./harness gemv qa 1 : gemv qa 2 : gemv qa 4 : gemv qa 5 : gemv qa 8 : gemv qb 1 : gemv qb 4 : gemv qb 5 : gemv qb 8 : gemv kv 1 : gemv kv 4 : gemv kv 5 : gemv wob 1 : gemv wob 4 : gemv wob 5 : gemv wo
+2026-09-26T19:27:34Z	C1_dense_decode/small_r5	dgpu	250MB	rc=0	7.2s	busy_before=10	busy_after=94	./harness grouped 1 : grouped 2 : grouped 4 : grouped 5 : grouped 8 : quant 5120 1 : quant 5120 4 : quant 5120 8 : quant 1280 4 : quant 8192 4 : quant 32768 4 : quant 2304 4 : swiglu 1 : swiglu 4 : la
+2026-09-26T19:27:39Z	D_attention/decode2	dgpu	96MB	rc=0	3.6s	busy_before=0	busy_after=93	./attn_harness2_gfx1201 gfx1201 . decode 1 2 4 5 8  
+2026-09-26T19:28:18Z	E_indexer/gather_cand2	dgpu	720MB	rc=0	5.6s	busy_before=NA	busy_after=94	bash run_rest.sh cand2 30 gather  
+2026-09-26T19:28:21Z	F_mhc_glue/mv_topk_r1	dgpu	300MB	rc=1	3.3s	busy_before=13	busy_after=81	bash jobs/mv_topk.sh r1  
+2026-09-26T19:28:23Z	E_indexer/att_topk_v3	dgpu	60MB	rc=0	1.0s	busy_before=3	busy_after=5	bash ../_infra/prof.sh att dgpu topk_select_v3_u8 results/att_topk_v3 -- ./harness_gfx1201 select . short n=235000 b=1  
+2026-09-26T19:29:41Z	C1_dense_decode/quant_alias_a1	dgpu	100MB	rc=0	6.0s	busy_before=NA	busy_after=96	./harness_q quant 32768 2 0 0 0 : quant 32768 2 65536 0 0 : quant 32768 2 0 65536 0 : quant 32768 2 0 0 4096 : quant 32768 2 4096 8192 0 : quant 32768 2 131072 0 0 : quant 32768 2 0 4096 0 : quant 327
+2026-09-26T19:29:44Z	A_moe_smallb/gu2d2-chain-b24	igpu	450MB	rc=0	3.3s	busy_before=0	busy_after=92	bash run_chain.sh gu2d2_run1 gu2_mb4_d2\,gu2_mb8_d2\,gu2_mb8_d2.w16\,combo_c8dn2.c8\,dn2_r2 2\ 4  
+2026-09-26T19:29:46Z	A_moe_smallb/gu2d2-chain-b8	igpu	450MB	rc=0	1.8s	busy_before=89	busy_after=94	bash run_chain.sh gu2d2_run1 gu2_mb8_d2\,gu2_mb8_d2.w16\,combo_c8dn2.c8\,dn2_r2 8  
+2026-09-26T19:30:01Z	E_indexer/gather_b512	dgpu	720MB	rc=0	6.1s	busy_before=NA	busy_after=93	env GATHER_B512=1 GATHER_CANDS=gather_u4_r1\,gather_u4_r4\,gather_u4_r4_2ipt\,gather_u4_r32_8ipt bash run_rest.sh b512 30 gather  
+2026-09-26T19:30:14Z	C2_dense_prefill/corr_big	dgpu	400MB	rc=0	4.2s	busy_before=NA	busy_after=60	bash run_corr_f16x.sh q8_0_gemm_wmma_f16x_256x128\,q8_0_gemm_wmma_f16x_256x128_pf2\,q8_0_gemm_wmma_f16x_256x256\,q8_0_gemm_wmma_f16x_256x256_pf2\,q8_0_gemm_wmma_f16x_256x128_db  
+2026-09-26T19:30:15Z	D_attention/att_g16	dgpu	96MB	rc=0	1.0s	busy_before=9	busy_after=5	bash ../_infra/prof.sh att dgpu fused_direct_g16 results/att_g16 -- ./attn_harness2_gfx1201 gfx1201 . prof 1 attention_dec_fused_direct_g16  
+2026-09-26T19:30:19Z	F_mhc_glue/mv_topk_r2	dgpu	500MB	rc=0	3.7s	busy_before=5	busy_after=81	bash jobs/mv_topk.sh r2  
+2026-09-26T19:30:23Z	F_mhc_glue/mv_topk_r3	dgpu	500MB	rc=0	3.7s	busy_before=3	busy_after=81	bash jobs/mv_topk.sh r3  
+2026-09-26T19:31:04Z	E_indexer/confirm	dgpu	156MB	rc=0	40.9s	busy_before=3	busy_after=97	bash run_confirm.sh confirm 3  
+2026-09-26T19:31:10Z	F_mhc_glue/att_cands	dgpu	500MB	rc=0	6.3s	busy_before=5	busy_after=20	bash jobs/att_cands.sh  
+2026-09-26T19:31:19Z	C2_dense_prefill/ab_f16x	dgpu	500MB	rc=0	8.8s	busy_before=3	busy_after=87	bash run_ab_f16x.sh r4 q8_0_gemm_wmma_f16x_pf3\,q8_0_gemm_wmma_f16x_256x128\,q8_0_gemm_wmma_f16x_256x128_pf2\,q8_0_gemm_wmma_f16x_256x256\,q8_0_gemm_wmma_f16x_256x256_pf2\,q8_0_gemm_wmma_f16x_256x128_
+2026-09-26T19:31:22Z	C2_dense_prefill/engram	dgpu	700MB	rc=0	2.6s	busy_before=4	busy_after=88	bash run_engram.sh r4 --corr  
+2026-09-26T19:31:25Z	C2_dense_prefill/replay	dgpu	500MB	rc=0	3.5s	busy_before=19	busy_after=88	bash run_replay.sh r2  
+2026-09-26T19:31:28Z	C1_dense_decode/quant_grid0_g1	dgpu	100MB	rc=0	2.7s	busy_before=10	busy_after=96	./harness quant 32768 2 : quant 32768 4 : quant 32768 1 : quant 65536 1 : quant 32800 2 : quant 16384 4 : quant 5120 4 : quant 8192 4  
+2026-09-26T19:31:31Z	C1_dense_decode/quant_grid1_g1	dgpu	100MB	rc=0	2.6s	busy_before=4	busy_after=96	env C1_GPAD=1 ./harness quant 32768 2 : quant 32768 4 : quant 32768 1 : quant 65536 1 : quant 32800 2 : quant 16384 4 : quant 5120 4 : quant 8192 4  
+2026-09-26T19:31:33Z	C1_dense_decode/quant_grid3_g1	dgpu	100MB	rc=0	2.6s	busy_before=4	busy_after=96	env C1_GPAD=3 ./harness quant 32768 2 : quant 32768 4 : quant 32768 1 : quant 65536 1 : quant 32800 2 : quant 16384 4 : quant 5120 4 : quant 8192 4  
+2026-09-26T19:31:36Z	C1_dense_decode/quant_nograph_g1	dgpu	100MB	rc=0	2.7s	busy_before=4	busy_after=96	env C1_NOGRAPH=1 ./harness quant 32768 2 : quant 32768 4 : quant 32768 1 : quant 65536 1 : quant 32800 2 : quant 16384 4 : quant 5120 4 : quant 8192 4  
+2026-09-26T19:31:38Z	A_moe_smallb/wl-chain	igpu	450MB	rc=0	4.9s	busy_before=0	busy_after=95	bash run_chain.sh wl_run1 wl\,wl.wl\,wl_dn2.wl\,wl_c8dn2.wl.c8\,combo_c8dn2.c8 2\ 4\ 8 wl=8  
+2026-09-26T19:31:42Z	A_moe_smallb/wl-parts	igpu	450MB	rc=0	3.6s	busy_before=91	busy_after=96	bash run_parts.sh wl_run1 wl.wl\,wl_c8dn2.wl.c8\,combo_c8dn2.c8\,gu2_mb4_d2 4\ 8 wl=8  
+2026-09-26T19:31:54Z	F_mhc_glue/rms_b512	dgpu	300MB	rc=0	1.3s	busy_before=NA	busy_after=65	env HARNESS_DIR=/home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/F_mhc_glue ./harness_gfx1201 rms 512 direct  
+2026-09-26T19:31:57Z	D_attention/check3	dgpu	96MB	rc=0	0.3s	busy_before=0	busy_after=11	env CANDS=attention_dec_flash2_part1_k32\,attention_dec_flash2_part1_k64\,attention_dec_flash2_part1_k128 ./attn_harness2_gfx1201 gfx1201 . check  
+2026-09-26T19:32:00Z	D_attention/decode3	dgpu	96MB	rc=0	2.6s	busy_before=6	busy_after=96	env CANDS=attention_dec_score_blk128\,attention_dec_flash2_part1_k32\,attention_dec_flash2_part1_k64\,attention_dec_flash2_part1_k128\,attention_dec_fused_f16s\,attention_dec_smwsum_pf2 ./attn_harness
+2026-09-26T19:32:29Z	D_attention/att_g16_b8	dgpu	96MB	rc=0	1.9s	busy_before=NA	busy_after=5	bash ../_infra/prof.sh att dgpu fused_direct_g16 results/att_g16_b8 -- ./attn_harness2_gfx1201 gfx1201 . prof 8 attention_dec_fused_direct_g16  
+2026-09-26T19:32:30Z	D_attention/att_smwsum_b8	dgpu	96MB	rc=0	1.1s	busy_before=7	busy_after=4	bash ../_infra/prof.sh att dgpu softmax_wsum_batched_htiled_wmma_ldsv_f16s results/att_smwsum_b8 -- ./attn_harness2_gfx1201 gfx1201 . prof 8 none  
+2026-09-26T19:32:31Z	D_attention/att_flash2_b4	dgpu	96MB	rc=0	1.1s	busy_before=6	busy_after=4	bash ../_infra/prof.sh att dgpu flash2_part1_k32 results/att_flash2_b4 -- ./attn_harness2_gfx1201 gfx1201 . prof 4 attention_dec_flash2_part1_k32  
+2026-09-26T19:33:03Z	B_moe_prefill/wmma	igpu	2300MB	rc=0	7.1s	busy_before=0	busy_after=96	bash run_wmma.sh 1  
+2026-09-26T19:33:13Z	C1_dense_decode/gemv_gpad0	dgpu	300MB	rc=0	2.8s	busy_before=1	busy_after=92	env C1_DIR=/home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/C1_dense_decode ./harness gemv qb 1 : gemv qb 4 : gemv kv 1 : gemv kv 4 : grouped 1 : grouped 4 : 
+2026-09-26T19:33:16Z	A_moe_smallb/wl-sens	igpu	450MB	rc=0	12.6s	busy_before=93	busy_after=96	bash run_wlsens.sh  
+2026-09-26T19:33:17Z	C1_dense_decode/gemv_gpad1	dgpu	300MB	rc=0	2.8s	busy_before=1	busy_after=91	env C1_DIR=/home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/C1_dense_decode C1_GPAD=1 ./harness gemv qb 1 : gemv qb 4 : gemv kv 1 : gemv kv 4 : grouped 1 : gr
+2026-09-26T19:33:20Z	A_moe_smallb/final-run2	igpu	450MB	rc=0	4.3s	busy_before=93	busy_after=94	bash run_chain.sh final_run2 wl.wl\,wl_dn2.wl\,wl_c8dn2.wl.c8\,dn2_r2\,kwide_c8.c8 2\ 4\ 8 wl=8  
+2026-09-26T19:33:25Z	A_moe_smallb/final-run3	igpu	450MB	rc=0	4.9s	busy_before=90	busy_after=95	bash run_chain.sh final_run3 wl.wl\,wl_dn2.wl\,wl_c8dn2.wl.c8\,dn2_r2\,kwide_c8.c8 2\ 4\ 8 wl=8  
+2026-09-26T19:34:09Z	B_moe_prefill/ablate	igpu	2100MB	rc=0	7.7s	busy_before=0	busy_after=97	bash run_ablate.sh 2  
+2026-09-26T19:34:16Z	C2_dense_prefill/corr_p6	dgpu	400MB	rc=0	4.3s	busy_before=0	busy_after=58	bash run_corr_f16x.sh q8_0_gemm_wmma_f16x_lb\,q8_0_gemm_wmma_f16x_pf2\,q8_0_gemm_wmma_f16x_pf3\,q8_0_gemm_wmma_f16x_db\,q8_0_gemm_wmma_f16x_db_bn64\,q8_0_gemm_wmma_f16x_256x128\,q8_0_gemm_wmma_f16x_bn
+2026-09-26T19:34:24Z	C2_dense_prefill/ab_f16x	dgpu	500MB	rc=0	8.4s	busy_before=12	busy_after=87	bash run_ab_f16x.sh r5 q8_0_gemm_wmma_f16x_lb\,q8_0_gemm_wmma_f16x_pf2\,q8_0_gemm_wmma_f16x_pf3\,q8_0_gemm_wmma_f16x_db\,q8_0_gemm_wmma_f16x_db_bn64\,q8_0_gemm_wmma_f16x_256x128  
+2026-09-26T19:34:28Z	C2_dense_prefill/engram	dgpu	700MB	rc=0	3.5s	busy_before=11	busy_after=89	bash run_engram.sh r5 --corr  
+2026-09-26T19:34:31Z	C2_dense_prefill/replay	dgpu	500MB	rc=0	3.5s	busy_before=22	busy_after=88	bash run_replay.sh r3  
+2026-09-26T19:34:36Z	A_moe_smallb/gu3-chain	igpu	450MB	rc=0	3.8s	busy_before=0	busy_after=91	bash run_chain.sh gu3_run1 gu3_c8dn2.wl.c8\,gu3_dn2.wl\,wl_c8dn2.wl.c8 2\ 4\ 8 wl=8  
+2026-09-26T19:35:43Z	A_moe_smallb/tails	igpu	450MB	rc=0	8.0s	busy_before=0	busy_after=96	bash run_chain.sh tails_run1 wl_c8dn2.wl.c8\,dn2_r2\,kwide_c8.c8\,wl.wl 1\ 3\ 5\ 6\ 7 wl=8  
+2026-09-26T19:35:43Z	C2_dense_prefill/ab_f16x	dgpu	500MB	rc=0	8.1s	busy_before=6	busy_after=85	bash run_ab_f16x.sh r6 q8_0_gemm_wmma_f16x_pf2\,q8_0_gemm_wmma_f16x_db\,q8_0_gemm_wmma_f16x_db_bn64\,q8_0_gemm_wmma_f16x_256x128  
+2026-09-26T19:35:50Z	B_moe_prefill/wmma	igpu	2600MB	rc=0	7.1s	busy_before=92	busy_after=70	bash run_wmma_confirm.sh 2  
+2026-09-26T19:35:51Z	C2_dense_prefill/ab_f16x	dgpu	500MB	rc=0	8.0s	busy_before=6	busy_after=86	bash run_ab_f16x.sh r7 q8_0_gemm_wmma_f16x_pf2\,q8_0_gemm_wmma_f16x_db\,q8_0_gemm_wmma_f16x_db_bn64\,q8_0_gemm_wmma_f16x_256x128  
+2026-09-26T19:35:54Z	C2_dense_prefill/engram	dgpu	700MB	rc=0	2.3s	busy_before=11	busy_after=90	bash run_engram.sh r6  
+2026-09-26T19:35:56Z	B_moe_prefill/pmc_wmma	igpu	2300MB	rc=0	5.9s	busy_before=67	busy_after=72	bash run_pmc_wmma.sh  
+2026-09-26T19:35:56Z	C2_dense_prefill/engram	dgpu	700MB	rc=0	2.3s	busy_before=14	busy_after=90	bash run_engram.sh r7  
+2026-09-26T19:36:01Z	A_moe_smallb/regime-E6	igpu	450MB	rc=0	4.9s	busy_before=69	busy_after=96	bash run_chain.sh E6ppr6_run1 wl_c8dn2.wl.c8\,wl_dn2.wl\,dn2_r2 2\ 4\ 8 wl=8 E=6 ppr=6  
+2026-09-26T19:36:03Z	A_moe_smallb/u8-knob	igpu	450MB	rc=0	2.2s	busy_before=92	busy_after=93	bash run_chain.sh u8_run1 wl_c8u8dn2.wl.c8\,wl_c8dn2.wl.c8 4\ 8 wl=8  
+2026-09-26T19:37:52Z	D_attention/check4	dgpu	96MB	rc=0	1.0s	busy_before=NA	busy_after=11	env CANDS=attention_dec_fused_qlds_pf2r2\,attention_dec_fused_qlds_pf2r4\,attention_dec_fused_qlds_pf1r4\,attention_dec_fused_qlds_pf1r8\,attention_dec_flash3_part1_k64\,attention_dec_flash3_part1_k12
+2026-09-26T19:37:55Z	D_attention/decode4	dgpu	96MB	rc=0	3.0s	busy_before=6	busy_after=96	env CANDS=attention_dec_score_blk128\,attention_dec_fused_qlds_pf2r2\,attention_dec_fused_qlds_pf2r4\,attention_dec_fused_qlds_pf1r4\,attention_dec_fused_qlds_pf1r8\,attention_dec_flash3_part1_k64\,at
+2026-09-26T19:38:05Z	C2_dense_prefill/corr_final	dgpu	400MB	rc=0	4.4s	busy_before=NA	busy_after=58	bash run_corr_f16x.sh q8_0_gemm_wmma_f16x_pf2\,q8_0_gemm_wmma_f16x_pf3\,q8_0_gemm_wmma_f16x_db\,q8_0_gemm_wmma_f16x_db_bn64\,q8_0_gemm_wmma_f16x_256x128\,q8_0_gemm_wmma_f16x_lb  
+2026-09-26T19:38:08Z	C2_dense_prefill/engram	dgpu	700MB	rc=0	2.4s	busy_before=12	busy_after=89	bash run_engram.sh corr_final --corr  
+2026-09-26T19:38:11Z	C2_dense_prefill/replay	dgpu	500MB	rc=0	3.6s	busy_before=23	busy_after=87	bash run_replay.sh corr_final --corr  
+2026-09-26T19:39:04Z	review/E_indexer	dgpu	156MB	rc=0	7.6s	busy_before=NA	busy_after=94	bash run_repro.sh 3  
+2026-09-26T19:39:26Z	review/E_indexer	dgpu	260MB	rc=1	22.0s	busy_before=3	busy_after=41	bash run_review.sh run1 50  
+2026-09-26T19:39:34Z	review/F_mhc_glue	dgpu	600MB	rc=1	7.8s	busy_before=15	busy_after=81	bash jobs/review_gemm.sh r1 full  
+2026-09-26T19:39:35Z	review/F_mhc_glue	dgpu	600MB	rc=1	1.6s	busy_before=8	busy_after=83	bash jobs/review_gemm.sh r2  
+2026-09-26T19:39:37Z	review/F_mhc_glue	dgpu	600MB	rc=1	1.6s	busy_before=3	busy_after=82	bash jobs/review_gemm.sh r3  
+2026-09-26T19:39:40Z	review/F_mhc_glue	dgpu	600MB	rc=0	3.1s	busy_before=12	busy_after=77	bash jobs/review_rms.sh r1  
+2026-09-26T19:39:43Z	review/F_mhc_glue	dgpu	600MB	rc=0	3.0s	busy_before=3	busy_after=78	bash jobs/review_rms.sh r2  
+2026-09-26T19:39:46Z	review/F_mhc_glue	dgpu	600MB	rc=0	3.0s	busy_before=3	busy_after=78	bash jobs/review_rms.sh r3  
+2026-09-26T19:40:02Z	review/F_mhc_glue	dgpu	500MB	rc=0	2.6s	busy_before=NA	busy_after=76	bash job_repro.sh v1  
+2026-09-26T19:40:04Z	review/F_mhc_glue	dgpu	500MB	rc=0	1.9s	busy_before=8	busy_after=81	bash job_repro.sh v2  
+2026-09-26T19:40:06Z	review/F_mhc_glue	dgpu	500MB	rc=0	1.9s	busy_before=4	busy_after=81	bash job_repro.sh v3  
+2026-09-26T19:40:10Z	review/F_mhc_glue	dgpu	600MB	rc=0	4.0s	busy_before=11	busy_after=79	bash job_review.sh v1  
+2026-09-26T19:40:10Z	B_moe_prefill/wmma2	igpu	2600MB	rc=0	9.1s	busy_before=0	busy_after=96	bash run_cand.sh cand_wmma2 1 all 1024 512 128  
+2026-09-26T19:40:23Z	review/E_indexer	dgpu	156MB	rc=0	12.8s	busy_before=16	busy_after=98	bash E_indexer/review/run_confirm_review.sh  
+2026-09-26T19:40:25Z	review/E_indexer	dgpu	340MB	rc=0	2.5s	busy_before=14	busy_after=88	bash E_indexer/review/run_extra_review.sh  
+2026-09-26T19:40:30Z	review/E_indexer	dgpu	156MB	rc=0	4.7s	busy_before=22	busy_after=97	bash /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/E_indexer/review/run_repro.sh 1  
+2026-09-26T19:40:35Z	review/E_indexer	dgpu	156MB	rc=0	4.7s	busy_before=17	busy_after=97	bash /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/E_indexer/review/run_repro.sh 2  
+2026-09-26T19:40:39Z	review/E_indexer	dgpu	156MB	rc=0	4.7s	busy_before=13	busy_after=97	bash /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/E_indexer/review/run_repro.sh 3  
+2026-09-26T19:40:46Z	review/E_indexer	dgpu	156MB	rc=0	6.6s	busy_before=14	busy_after=98	bash /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/E_indexer/review/run_repro.sh 4 b=1\,4\,8  
+2026-09-26T19:40:47Z	review/E_indexer	dgpu	1300MB	rc=0	1.4s	busy_before=12	busy_after=33	bash /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/E_indexer/review/run_gcheck.sh  
+2026-09-26T19:40:53Z	review/E_indexer	dgpu	720MB	rc=0	5.2s	busy_before=35	busy_after=96	bash /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/E_indexer/review/run_b512.sh  
+2026-09-26T19:40:54Z	review/F_mhc_glue	dgpu	700MB	rc=0	1.5s	busy_before=26	busy_after=81	bash jobs/review_rotate.sh  
+2026-09-26T19:40:54Z	review/F_mhc_glue	dgpu	64MB	rc=0	0.2s	busy_before=3	busy_after=56	bash job.sh corr  
+2026-09-26T19:40:59Z	review/F_mhc_glue	dgpu	64MB	rc=0	4.4s	busy_before=4	busy_after=91	bash job.sh rev1  
+2026-09-26T19:41:03Z	review/F_mhc_glue	dgpu	64MB	rc=0	4.4s	busy_before=3	busy_after=91	bash job.sh rev2  
+2026-09-26T19:41:08Z	review/F_mhc_glue	dgpu	64MB	rc=0	4.4s	busy_before=3	busy_after=91	bash job.sh rev3  
+2026-09-26T19:41:15Z	review/E_indexer	dgpu	60MB	rc=0	7.3s	busy_before=3	busy_after=96	bash run_confirm.sh review 3  
+2026-09-26T19:41:18Z	review/E_indexer	dgpu	60MB	rc=0	2.6s	busy_before=6	busy_after=82	bash run_extra.sh  
+2026-09-26T19:41:34Z	review/C1_dense_decode	dgpu	100MB	rc=0	2.7s	busy_before=1	busy_after=96	./harness quant 32768 2 : quant 32768 4 : quant 32768 1 : quant 65536 1 : quant 32800 2 : quant 16384 4 : quant 5120 4 : quant 8192 4  
+2026-09-26T19:41:36Z	review/C1_dense_decode	dgpu	100MB	rc=0	2.6s	busy_before=4	busy_after=96	env C1_GPAD=1 ./harness quant 32768 2 : quant 32768 4 : quant 32768 1 : quant 65536 1 : quant 32800 2 : quant 16384 4 : quant 5120 4 : quant 8192 4  
+2026-09-26T19:41:38Z	B_moe_prefill/wmma2	igpu	2600MB	rc=0	7.8s	busy_before=0	busy_after=96	bash run_cand.sh cand_wmma2 2 ab 1024 512  
+2026-09-26T19:41:38Z	B_moe_prefill/probe	igpu	2600MB	rc=0	0.4s	busy_before=93	busy_after=77	bash run_cand.sh cand_wmma_probe 1 cmp 1024  
+2026-09-26T19:41:39Z	review/C1_dense_decode	dgpu	100MB	rc=0	2.7s	busy_before=4	busy_after=96	./harness quant 32768 2 : quant 32768 4 : quant 32768 1 : quant 65536 1 : quant 32800 2 : quant 16384 4 : quant 5120 4 : quant 8192 4  
+2026-09-26T19:41:42Z	review/C1_dense_decode	dgpu	100MB	rc=0	2.6s	busy_before=4	busy_after=96	env C1_GPAD=1 ./harness quant 32768 2 : quant 32768 4 : quant 32768 1 : quant 65536 1 : quant 32800 2 : quant 16384 4 : quant 5120 4 : quant 8192 4  
+2026-09-26T19:41:44Z	review/C1_dense_decode	dgpu	100MB	rc=0	2.7s	busy_before=4	busy_after=96	./harness quant 32768 2 : quant 32768 4 : quant 32768 1 : quant 65536 1 : quant 32800 2 : quant 16384 4 : quant 5120 4 : quant 8192 4  
+2026-09-26T19:41:47Z	review/C1_dense_decode	dgpu	100MB	rc=0	2.6s	busy_before=4	busy_after=96	env C1_GPAD=1 ./harness quant 32768 2 : quant 32768 4 : quant 32768 1 : quant 65536 1 : quant 32800 2 : quant 16384 4 : quant 5120 4 : quant 8192 4  
+2026-09-26T19:41:50Z	C2_dense_prefill/engram	dgpu	700MB	rc=0	3.4s	busy_before=4	busy_after=89	bash run_engram.sh bisect --corr  
+2026-09-26T19:41:51Z	D_attention/check5	dgpu	96MB	rc=0	0.3s	busy_before=14	busy_after=11	env CANDS=attention_dec_fused_wpriv_d8\,attention_dec_fused_wpriv_s2_d8\,attention_dec_fused_wpriv_d4 ./attn_harness2_gfx1201 gfx1201 . check  
+2026-09-26T19:41:53Z	D_attention/decode5	dgpu	96MB	rc=0	2.6s	busy_before=5	busy_after=95	env CANDS=attention_dec_score_blk128\,attention_dec_fused_wpriv_d8\,attention_dec_fused_wpriv_s2_d8\,attention_dec_fused_wpriv_d4\,attention_dec_flash3_part1_k128\,attention_dec_fused_f16s ./attn_harn
+2026-09-26T19:41:56Z	review/C1_dense_decode	dgpu	100MB	rc=0	2.6s	busy_before=5	busy_after=96	env C1_GPAD=3 ./harness quant 32768 2 : quant 32768 4 : quant 32768 1 : quant 65536 1 : quant 32800 2 : quant 16384 4 : quant 5120 4 : quant 8192 4  
+2026-09-26T19:41:59Z	review/C1_dense_decode	dgpu	100MB	rc=0	2.7s	busy_before=4	busy_after=96	env C1_NOGRAPH=1 ./harness quant 32768 2 : quant 32768 4 : quant 32768 1 : quant 65536 1 : quant 32800 2 : quant 16384 4 : quant 5120 4 : quant 8192 4  
+2026-09-26T19:42:02Z	review/C1_dense_decode	dgpu	100MB	rc=0	2.7s	busy_before=4	busy_after=96	./harness quant 32768 2 : quant 32768 4 : quant 32768 1 : quant 65536 1 : quant 32800 2 : quant 16384 4 : quant 5120 4 : quant 8192 4  
+2026-09-26T19:42:04Z	review/C1_dense_decode	dgpu	100MB	rc=0	2.6s	busy_before=3	busy_after=96	env C1_GPAD=1 ./harness quant 32768 2 : quant 32768 4 : quant 32768 1 : quant 65536 1 : quant 32800 2 : quant 16384 4 : quant 5120 4 : quant 8192 4  
+2026-09-26T19:42:10Z	review/C1_dense_decode	dgpu	100MB	rc=0	5.6s	busy_before=4	busy_after=98	./gpad_check 32768 1 32768 2 32768 3 32768 4 32768 5 8192 8 8192 5 5120 1 5120 5 2304 4 65504 1 65568 1 131040 1 131104 1 262144 1 32 1 1024 1  
+2026-09-26T19:42:16Z	review/C1_dense_decode	dgpu	100MB	rc=0	5.6s	busy_before=3	busy_after=98	./gpad_check 32768 1 32768 2 32768 3 32768 4 32768 5 8192 8 8192 5 5120 1 5120 5 2304 4 65504 1 65568 1 131040 1 131104 1 262144 1 32 1 1024 1  
+2026-09-26T19:42:21Z	review/C1_dense_decode	dgpu	100MB	rc=0	5.6s	busy_before=3	busy_after=98	./gpad_check 32768 1 32768 2 32768 3 32768 4 32768 5 8192 8 8192 5 5120 1 5120 5 2304 4 65504 1 65568 1 131040 1 131104 1 262144 1 32 1 1024 1  
+2026-09-26T19:42:27Z	review/C1_dense_decode	dgpu	100MB	rc=0	5.6s	busy_before=4	busy_after=98	env GC_NOGRAPH=1 ./gpad_check 32768 1 32768 2 32768 3 32768 4 32768 5 8192 8 8192 5 5120 1 5120 5 2304 4 65504 1 65568 1 131040 1 131104 1 262144 1 32 1 1024 1  
+2026-09-26T19:42:52Z	review/E_indexer	dgpu	260MB	rc=1	24.8s	busy_before=3	busy_after=46	bash run_review.sh extra_run1 rounds=30 nolarge extra shapes=20000:512\,30000:512\,50000:512\,65536:512\,235000:512\,30000:1024\,65536:1024\,235000:1024\,65536:4\,131072:4\,235000:1\,235000:4\,235000:
+2026-09-26T19:43:17Z	review/E_indexer	dgpu	260MB	rc=1	25.0s	busy_before=13	busy_after=46	bash run_review.sh extra_run2 rounds=30 nolarge extra shapes=20000:512\,30000:512\,50000:512\,65536:512\,235000:512\,30000:1024\,65536:1024\,235000:1024\,65536:4\,131072:4\,235000:1\,235000:4\,235000:
+2026-09-26T19:43:20Z	review/C1_dense_decode	dgpu	250MB	rc=0	3.4s	busy_before=12	busy_after=88	./harness shared 1 : shared 2 : shared 3 : shared 4 : shared 5 : shared 8  
+2026-09-26T19:43:24Z	review/C1_dense_decode	dgpu	250MB	rc=0	3.3s	busy_before=8	busy_after=92	./harness shared 1 : shared 2 : shared 3 : shared 4 : shared 5 : shared 8  
+2026-09-26T19:43:27Z	review/C1_dense_decode	dgpu	250MB	rc=0	3.2s	busy_before=7	busy_after=93	./harness shared 1 : shared 2 : shared 3 : shared 4 : shared 5 : shared 8  
+2026-09-26T19:43:29Z	review/C1_dense_decode	dgpu	250MB	rc=0	1.9s	busy_before=8	busy_after=88	env C1_XS_SCALE=0.01 C1_ROUNDS=5 ./harness shared 1 : shared 3 : shared 4 : shared 5 : shared 7  
+2026-09-26T19:43:31Z	review/C1_dense_decode	dgpu	250MB	rc=0	1.8s	busy_before=7	busy_after=89	env C1_XS_SCALE=0.003 C1_ROUNDS=5 ./harness shared 1 : shared 2 : shared 3 : shared 4 : shared 5  
+2026-09-26T19:43:32Z	review/F_mhc_glue	dgpu	400MB	rc=0	1.2s	busy_before=7	busy_after=82	bash review/jobs/repro.sh rv1  
+2026-09-26T19:43:33Z	review/F_mhc_glue	dgpu	400MB	rc=0	1.1s	busy_before=9	busy_after=82	bash review/jobs/repro.sh rv2  
+2026-09-26T19:43:34Z	review/F_mhc_glue	dgpu	400MB	rc=0	1.1s	busy_before=9	busy_after=82	bash review/jobs/repro.sh rv3  
+2026-09-26T19:43:35Z	review/C1_dense_decode	dgpu	400MB	rc=0	0.8s	busy_before=9	busy_after=13	./odd /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/C1_dense_decode/review/tB  
+2026-09-26T19:43:51Z	review/C1_dense_decode	dgpu	1000MB	rc=0	15.7s	busy_before=4	busy_after=85	./harness gemv qa 1 : gemv qa 2 : gemv qa 4 : gemv qa 5 : gemv qa 8 : gemv qb 1 : gemv qb 4 : gemv qb 5 : gemv qb 8 : gemv kv 1 : gemv kv 4 : gemv kv 5 : gemv wob 1 : gemv wob 4 : gemv wob 5 : gemv wo
+2026-09-26T19:43:56Z	C2_dense_prefill/modtest	dgpu	700MB	rc=1	5.3s	busy_before=7	busy_after=78	bash run_modtest.sh r1  
+2026-09-26T19:43:58Z	review/C1_dense_decode	dgpu	250MB	rc=0	1.9s	busy_before=7	busy_after=89	./harness grouped 1 : grouped 2 : grouped 4 : grouped 5 : grouped 8  
+2026-09-26T19:44:00Z	review/F_mhc_glue	dgpu	700MB	rc=0	1.4s	busy_before=7	busy_after=81	bash jobs/review_rotate.sh  
+2026-09-26T19:44:02Z	review/F_mhc_glue	dgpu	400MB	rc=0	2.8s	busy_before=3	busy_after=91	bash review/jobs/review.sh rv1  
+2026-09-26T19:44:05Z	review/F_mhc_glue	dgpu	400MB	rc=0	2.8s	busy_before=4	busy_after=91	bash review/jobs/review.sh rv2  
+2026-09-26T19:44:08Z	review/F_mhc_glue	dgpu	400MB	rc=0	2.8s	busy_before=3	busy_after=91	bash review/jobs/review.sh rv3  
+2026-09-26T19:44:14Z	review/E_indexer	dgpu	900MB	rc=0	5.6s	busy_before=3	busy_after=98	bash /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/E_indexer/review/run_gtime.sh 1  
+2026-09-26T19:44:19Z	review/E_indexer	dgpu	900MB	rc=0	5.6s	busy_before=36	busy_after=98	bash /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/E_indexer/review/run_gtime.sh 2  
+2026-09-26T19:44:35Z	review/C1_dense_decode	dgpu	1000MB	rc=0	15.7s	busy_before=33	busy_after=85	./harness gemv qa 1 : gemv qa 2 : gemv qa 4 : gemv qa 5 : gemv qa 8 : gemv qb 1 : gemv qb 4 : gemv qb 5 : gemv qb 8 : gemv kv 1 : gemv kv 4 : gemv kv 5 : gemv wob 1 : gemv wob 4 : gemv wob 5 : gemv wo
+2026-09-26T19:44:37Z	review/C1_dense_decode	dgpu	250MB	rc=0	2.1s	busy_before=8	busy_after=83	./harness grouped 1 : grouped 2 : grouped 4 : grouped 5 : grouped 8  
+2026-09-26T19:44:53Z	review/C1_dense_decode	dgpu	1000MB	rc=0	15.7s	busy_before=8	busy_after=85	./harness gemv qa 1 : gemv qa 2 : gemv qa 4 : gemv qa 5 : gemv qa 8 : gemv qb 1 : gemv qb 4 : gemv qb 5 : gemv qb 8 : gemv kv 1 : gemv kv 4 : gemv kv 5 : gemv wob 1 : gemv wob 4 : gemv wob 5 : gemv wo
+2026-09-26T19:44:55Z	C2_dense_prefill/modtest2	dgpu	700MB	rc=1	1.9s	busy_before=8	busy_after=79	bash run_modtest2.sh  
+2026-09-26T19:44:57Z	review/C1_dense_decode	dgpu	250MB	rc=0	1.9s	busy_before=10	busy_after=89	./harness grouped 1 : grouped 2 : grouped 4 : grouped 5 : grouped 8  
+2026-09-26T19:44:59Z	review/C1_dense_decode	dgpu	100MB	rc=0	1.7s	busy_before=9	busy_after=90	env GC_ROUNDS=5 bash /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/prof.sh trace /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-
+2026-09-26T19:45:01Z	review/C1_dense_decode	dgpu	100MB	rc=0	1.8s	busy_before=4	busy_after=94	env GC_MIX=1 ./gpad_check 32768 1 32768 2 32768 3 32768 4 65568 1  
+2026-09-26T19:45:02Z	review/C1_dense_decode	dgpu	100MB	rc=0	1.8s	busy_before=3	busy_after=94	env GC_MIX=1 ./gpad_check 32768 1 32768 2 32768 3 32768 4 65568 1  
+2026-09-26T19:45:05Z	review/C1_dense_decode	dgpu	250MB	rc=0	2.4s	busy_before=3	busy_after=93	./harness lanes qa 4 4 : lanes qa 5 5 : lanes wob 4 4 : lanes gate 3 3 : lanes down 4 4 : lanes qb 4 4  
+2026-09-26T19:45:07Z	review/C1_dense_decode	dgpu	250MB	rc=0	2.4s	busy_before=9	busy_after=93	./harness lanes qa 4 4 : lanes qa 5 5 : lanes wob 4 4 : lanes gate 3 3 : lanes down 4 4 : lanes qb 4 4  
+2026-09-26T19:45:10Z	review/C1_dense_decode	dgpu	250MB	rc=0	2.4s	busy_before=9	busy_after=93	./harness lanes qa 4 4 : lanes qa 5 5 : lanes wob 4 4 : lanes gate 3 3 : lanes down 4 4 : lanes qb 4 4  
+2026-09-26T19:45:12Z	review/C1_dense_decode	dgpu	250MB	rc=0	2.3s	busy_before=9	busy_after=93	./harness lanes kv 4 4 : lanes qa 4 3 : lanes qa 1 1 : lanes gate 4 4 : lanes wob 3 3 : lanes wob 4 3  
+2026-09-26T19:45:43Z	B_moe_prefill/wmma3	igpu	2600MB	rc=0	9.1s	busy_before=0	busy_after=96	bash run_cand.sh cand_wmma3 1 all 64 1024 512 128  
+2026-09-26T19:46:03Z	review/C1_dense_decode	dgpu	250MB	rc=0	7.7s	busy_before=NA	busy_after=94	./harness grouped 1 : grouped 2 : grouped 4 : grouped 5 : grouped 8 : quant 5120 1 : quant 5120 4 : quant 5120 8 : quant 1280 4 : quant 8192 4 : quant 32768 4 : quant 2304 4 : swiglu 1 : swiglu 4 : la
+2026-09-26T19:46:10Z	review/C1_dense_decode	dgpu	250MB	rc=0	7.2s	busy_before=9	busy_after=94	./harness grouped 1 : grouped 2 : grouped 4 : grouped 5 : grouped 8 : quant 5120 1 : quant 5120 4 : quant 5120 8 : quant 1280 4 : quant 8192 4 : quant 32768 4 : quant 2304 4 : swiglu 1 : swiglu 4 : la
+2026-09-26T19:46:17Z	review/C1_dense_decode	dgpu	250MB	rc=0	7.2s	busy_before=9	busy_after=94	./harness grouped 1 : grouped 2 : grouped 4 : grouped 5 : grouped 8 : quant 5120 1 : quant 5120 4 : quant 5120 8 : quant 1280 4 : quant 8192 4 : quant 32768 4 : quant 2304 4 : swiglu 1 : swiglu 4 : la
+2026-09-26T19:46:19Z	B_moe_prefill/wmma3np	igpu	2600MB	rc=0	5.1s	busy_before=0	busy_after=96	bash run_cand.sh tmp_w3np 1 ab 64 1024 512  
+2026-09-26T19:46:22Z	review/C1_dense_decode	dgpu	100MB	rc=0	4.8s	busy_before=9	busy_after=98	./harness quant 5120 1 : quant 1280 1 : quant 2304 1 : quant 8192 1 : quant 32768 1 : quant 5120 5 : quant 1280 5 : quant 2304 5 : quant 8192 5 : quant 32768 5 : quant 5120 2 : quant 32768 2 : quant 1
+2026-09-26T19:46:23Z	review/C1_dense_decode	dgpu	100MB	rc=0	1.0s	busy_before=3	busy_after=91	env C1_GPAD=1 ./harness quant 32768 4 : quant 32768 2 : quant 5120 4  
+2026-09-26T19:46:23Z	review/C1_dense_decode	dgpu	100MB	rc=0	0.1s	busy_before=4	busy_after=14	./odd  
+2026-09-26T19:46:30Z	review/E_indexer	dgpu	156MB	rc=0	6.6s	busy_before=4	busy_after=98	bash /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/E_indexer/review/run_repro.sh 5 b=2\,3\,6  
+2026-09-26T19:46:30Z	D_attention/check6	dgpu	96MB	rc=0	0.4s	busy_before=12	busy_after=8	env CANDS=attention_dec_fused_vt_d8\,attention_dec_fused_vt_qreg_d8\,attention_dec_fused_vt_d4 ./attn_harness2_gfx1201 gfx1201 . check  
+2026-09-26T19:46:33Z	D_attention/decode6	dgpu	96MB	rc=0	2.5s	busy_before=6	busy_after=95	env CANDS=attention_dec_score_blk128\,attention_dec_fused_vt_d8\,attention_dec_fused_vt_qreg_d8\,attention_dec_fused_vt_d4\,attention_dec_flash3_part1_k128\,attention_dec_fused_f16s ./attn_harness2_gf
+2026-09-26T19:46:34Z	review/C1_dense_decode	dgpu	100MB	rc=0	1.8s	busy_before=6	busy_after=94	./gpad_check 32768 6 32768 7 32768 8 8192 6 8192 7  
+2026-09-26T19:46:36Z	review/F_mhc_glue	dgpu	400MB	rc=0	1.1s	busy_before=4	busy_after=90	bash review/jobs/prod.sh rv1  
+2026-09-26T19:46:37Z	review/F_mhc_glue	dgpu	400MB	rc=0	1.1s	busy_before=4	busy_after=91	bash review/jobs/prod.sh rv2  
+2026-09-26T19:46:38Z	review/F_mhc_glue	dgpu	400MB	rc=0	1.1s	busy_before=4	busy_after=91	bash review/jobs/prod.sh rv3  
+2026-09-26T19:47:22Z	B_moe_prefill/wmma_abl	igpu	2600MB	rc=0	6.0s	busy_before=0	busy_after=96	bash run_cand.sh tmp_wNC 1 ab 128 1024 512  
+2026-09-26T19:47:27Z	B_moe_prefill/wmma_abl	igpu	2600MB	rc=0	5.1s	busy_before=93	busy_after=96	bash run_cand.sh tmp_wNL 1 ab 128 1024 512  
+2026-09-26T19:47:31Z	review/A_moe_smallb	igpu	450MB	rc=0	3.4s	busy_before=93	busy_after=93	bash run_chain.sh c8_run1 kwide_c8.c8\,base.c8 2\ 4\ 8  
+2026-09-26T19:47:35Z	review/A_moe_smallb	igpu	450MB	rc=0	3.7s	busy_before=90	busy_after=94	bash run_chain.sh c8_run2 kwide_c8.c8\,base.c8 2\ 4\ 8  
+2026-09-26T19:47:36Z	D_attention/att_vtqreg_b8	dgpu	96MB	rc=0	1.1s	busy_before=0	busy_after=5	bash ../_infra/prof.sh att dgpu fused_vt_qreg_d8 results/att_vtqreg_b8 -- ./attn_harness2_gfx1201 gfx1201 . prof 8 attention_dec_fused_vt_qreg_d8  
+2026-09-26T19:47:38Z	review/A_moe_smallb	igpu	450MB	rc=0	3.4s	busy_before=91	busy_after=94	bash run_chain.sh c8_run3 kwide_c8.c8\,base.c8 2\ 4\ 8  
+2026-09-26T19:47:41Z	review/C1_dense_decode	dgpu	300MB	rc=0	4.9s	busy_before=6	busy_after=88	./harness_lanes lanes2 qa 4 4 : lanes2 qa 5 5 : lanes2 wob 4 4 : lanes2 gate 3 3 : lanes2 down 4 4 : lanes2 qb 4 4 : lanes2 kv 4 4 : lanes2 qa 4 3 : lanes2 wob 4 3 : lanes2 wob 5 4 : lanes2 gate 4 4  
+2026-09-26T19:47:42Z	review/A_moe_smallb	igpu	450MB	rc=0	4.2s	busy_before=90	busy_after=94	bash run_chain.sh c8_tails kwide_c8.c8\,base.c8 1\ 3\ 5\ 7  
+2026-09-26T19:47:46Z	review/A_moe_smallb	igpu	600MB	rc=0	3.2s	busy_before=91	busy_after=95	bash run_chain.sh c8_E8ppr6 kwide_c8.c8\,base.c8 4\ 8 E=8 ppr=6  
+2026-09-26T19:47:46Z	review/C1_dense_decode	dgpu	300MB	rc=0	5.0s	busy_before=7	busy_after=87	./harness_lanes lanes2 qa 4 4 : lanes2 qa 5 5 : lanes2 wob 4 4 : lanes2 gate 3 3 : lanes2 down 4 4 : lanes2 qb 4 4 : lanes2 kv 4 4 : lanes2 qa 4 3 : lanes2 wob 4 3 : lanes2 wob 5 4 : lanes2 gate 4 4  
+2026-09-26T19:47:46Z	review/A_moe_smallb	igpu	450MB	rc=0	0.7s	busy_before=90	busy_after=88	bash run_chain.sh c8_E1ppr1 kwide_c8.c8\,base.c8 8 E=1 ppr=1  
+2026-09-26T19:47:49Z	review/A_moe_smallb	igpu	450MB	rc=0	2.5s	busy_before=86	busy_after=94	bash run_parts.sh c8_parts kwide_c8.c8 4\ 8  
+2026-09-26T19:47:51Z	review/C1_dense_decode	dgpu	300MB	rc=0	4.9s	busy_before=9	busy_after=88	./harness_lanes lanes2 qa 4 4 : lanes2 qa 5 5 : lanes2 wob 4 4 : lanes2 gate 3 3 : lanes2 down 4 4 : lanes2 qb 4 4 : lanes2 kv 4 4 : lanes2 qa 4 3 : lanes2 wob 4 3 : lanes2 wob 5 4 : lanes2 gate 4 4  
+2026-09-26T19:47:54Z	review/C1_dense_decode	dgpu	300MB	rc=0	2.7s	busy_before=8	busy_after=66	./harness_lanes chain2 4 4 : chain2 3 3 : chain2 4 3 : chain2 5 5  
+2026-09-26T19:47:56Z	review/A_moe_smallb	igpu	450MB	rc=0	2.8s	busy_before=2	busy_after=88	bash run_chain_dn2.sh rep1 dn2_r2 2\ 4\ 8  
+2026-09-26T19:47:56Z	review/C1_dense_decode	dgpu	300MB	rc=0	2.7s	busy_before=8	busy_after=66	./harness_lanes chain2 4 4 : chain2 3 3 : chain2 4 3 : chain2 5 5  
+2026-09-26T19:47:57Z	review/C1_dense_decode	dgpu	300MB	rc=0	0.2s	busy_before=9	busy_after=12	env C1_ROUNDS=5 ./harness_lanes tail 1004 5120 4 4 : tail 1000 5120 4 3 : tail 8 5120 1 1 : tail 2312 2304 5 3 : tail 1280 5120 1 7 : tail 1280 5120 2 6 : tail 1280 5120 1 1 : tail 520 5120 3 3  
+2026-09-26T19:47:59Z	review/A_moe_smallb	igpu	450MB	rc=0	2.8s	busy_before=85	busy_after=91	bash run_chain_dn2.sh rep2 dn2_r2 2\ 4\ 8  
+2026-09-26T19:48:02Z	review/A_moe_smallb	igpu	450MB	rc=0	3.1s	busy_before=87	busy_after=93	bash run_chain_dn2.sh rep3 dn2_r2 2\ 4\ 8  
+2026-09-26T19:48:04Z	review/A_moe_smallb	igpu	450MB	rc=0	2.4s	busy_before=90	busy_after=94	bash run_parts_dn2.sh parts1 dn2_r2 4\ 8  
+2026-09-26T19:48:08Z	review/A_moe_smallb	igpu	450MB	rc=0	3.5s	busy_before=90	busy_after=91	bash run_chain_dn2.sh tails dn2_r2 1\ 3\ 5\ 7  
+2026-09-26T19:48:10Z	review/A_moe_smallb	igpu	450MB	rc=0	2.5s	busy_before=88	busy_after=94	bash run_chain_dn2.sh E12 dn2_r2 4\ 8 E=12 ppr=3  
+2026-09-26T19:48:14Z	review/A_moe_smallb	igpu	800MB	rc=0	3.7s	busy_before=91	busy_after=96	bash run_chain_dn2.sh E24 dn2_r2 4\ 8 E=24 ppr=6 P=32  
+2026-09-26T19:48:15Z	review/A_moe_smallb	igpu	450MB	rc=0	1.1s	busy_before=90	busy_after=87	bash run_chain_dn2.sh E1 dn2_r2 5\ 8 E=1 ppr=1  
+2026-09-26T19:48:20Z	review/A_moe_smallb	igpu	800MB	rc=0	4.4s	busy_before=84	busy_after=96	bash run_parts_dn2.sh E24parts dn2_r2 4\ 8 E=24 ppr=6 P=32  
+2026-09-26T19:48:24Z	review/A_moe_smallb	igpu	450MB	rc=0	4.6s	busy_before=91	busy_after=95	bash review/run_chain.sh rev_run1 wl.wl\,wl_dn2.wl\,wl_c8dn2.wl.c8\,dn2_r2\,kwide_c8.c8 2\ 4\ 8 wl=8  
+2026-09-26T19:48:29Z	C2_dense_prefill/w0	dgpu	700MB	rc=1	6.3s	busy_before=1	busy_after=80	bash run_w0.sh r1  
+2026-09-26T19:48:29Z	review/A_moe_smallb	igpu	450MB	rc=0	4.9s	busy_before=89	busy_after=95	bash review/run_chain.sh rev_run2 wl.wl\,wl_dn2.wl\,wl_c8dn2.wl.c8\,dn2_r2\,kwide_c8.c8 2\ 4\ 8 wl=8  
+2026-09-26T19:48:34Z	review/A_moe_smallb	igpu	450MB	rc=0	4.9s	busy_before=90	busy_after=95	bash review/run_chain.sh rev_run3 wl.wl\,wl_dn2.wl\,wl_c8dn2.wl.c8\,dn2_r2\,kwide_c8.c8 2\ 4\ 8 wl=8  
+2026-09-26T19:48:37Z	review/A_moe_smallb	igpu	450MB	rc=0	2.6s	busy_before=89	busy_after=92	bash run_review.sh chain rep1 wl.wl 2\ 4\ 8 wl=8  
+2026-09-26T19:48:40Z	review/A_moe_smallb	igpu	450MB	rc=0	3.2s	busy_before=88	busy_after=93	bash run_review.sh chain rep2 wl.wl 2\ 4\ 8 wl=8  
+2026-09-26T19:48:43Z	review/A_moe_smallb	igpu	450MB	rc=0	2.6s	busy_before=90	busy_after=91	bash run_review.sh chain rep3 wl.wl 2\ 4\ 8 wl=8  
+2026-09-26T19:48:43Z	D_attention/final_run1	dgpu	96MB	rc=0	3.3s	busy_before=1	busy_after=96	env CANDS=attention_dec_score_blk256\,attention_dec_score_blk128\,attention_dec_fused_vt_qreg_d8\,attention_dec_fused_vt_d8\,attention_dec_fused_f16s\,attention_dec_smwsum_pf2\,attention_dec_flash3_pa
+2026-09-26T19:48:46Z	D_attention/final_run2	dgpu	96MB	rc=0	3.3s	busy_before=7	busy_after=96	env CANDS=attention_dec_score_blk256\,attention_dec_score_blk128\,attention_dec_fused_vt_qreg_d8\,attention_dec_fused_vt_d8\,attention_dec_fused_f16s\,attention_dec_smwsum_pf2\,attention_dec_flash3_pa
+2026-09-26T19:48:47Z	review/A_moe_smallb	igpu	450MB	rc=0	4.4s	busy_before=88	busy_after=95	bash run_review.sh parts parts1 wl.wl 1\ 2\ 4\ 8 wl=8  
+2026-09-26T19:48:50Z	D_attention/final_run3	dgpu	96MB	rc=0	3.3s	busy_before=7	busy_after=96	env CANDS=attention_dec_score_blk256\,attention_dec_score_blk128\,attention_dec_fused_vt_qreg_d8\,attention_dec_fused_vt_d8\,attention_dec_fused_f16s\,attention_dec_smwsum_pf2\,attention_dec_flash3_pa
+2026-09-26T19:48:51Z	review/A_moe_smallb	igpu	450MB	rc=0	4.1s	busy_before=92	busy_after=93	bash run_review.sh parts partsx1 wl.wl 1\ 2\ 4\ 8 wl=8 exact=1  
+2026-09-26T19:48:57Z	review/A_moe_smallb	igpu	450MB	rc=0	5.2s	busy_before=89	busy_after=93	bash run_review.sh chain tails1 wl.wl 1\ 3\ 5\ 6\ 7 wl=8  
+2026-09-26T19:48:58Z	review/A_moe_smallb	igpu	450MB	rc=0	1.8s	busy_before=89	busy_after=94	bash run_review.sh chain hubE16 wl.wl 5 wl=8 E=16 ppr=6  
+2026-09-26T19:49:00Z	review/A_moe_smallb	igpu	450MB	rc=0	1.4s	busy_before=91	busy_after=93	bash run_review.sh chain E12 wl.wl 8 wl=8 E=12 ppr=6  
+2026-09-26T19:49:01Z	review/A_moe_smallb	igpu	450MB	rc=0	1.1s	busy_before=90	busy_after=91	bash run_review.sh chain E6 wl.wl 8 wl=8 E=6 ppr=6  
+2026-09-26T19:49:19Z	review/A_moe_smallb	igpu	1100MB	rc=0	17.7s	busy_before=88	busy_after=93	bash review/run_extra.sh  
+2026-09-26T19:49:21Z	review/A_moe_smallb	igpu	450MB	rc=0	2.5s	busy_before=90	busy_after=94	bash run_chain.sh c8_exact kwide_c8.c8\,base.c8 4\ 8 exact=1  
+2026-09-26T19:49:56Z	B_moe_prefill/wmma_knobs	igpu	2600MB	rc=0	7.2s	busy_before=0	busy_after=96	bash run_cand.sh tmp_wNT 1 all 128 1024 512  
+2026-09-26T19:49:56Z	D_attention/check7	dgpu	96MB	rc=0	0.4s	busy_before=0	busy_after=9	env CANDS=attention_dec_fused_vt_qreg_sp_d8\,attention_dec_fused_vt_qreg_sp_d4 ./attn_harness2_gfx1201 gfx1201 . check  
+2026-09-26T19:49:59Z	D_attention/sp_run1	dgpu	96MB	rc=0	2.6s	busy_before=7	busy_after=96	env CANDS=attention_dec_fused_vt_qreg_sp_d8\,attention_dec_fused_vt_qreg_sp_d4\,attention_dec_fused_vt_qreg_d8 ./attn_harness2_gfx1201 gfx1201 . decode 1 2 3 4 5 8  
+2026-09-26T19:50:01Z	B_moe_prefill/wmma_abl	igpu	2600MB	rc=0	4.8s	busy_before=93	busy_after=96	bash run_cand.sh tmp_wNCS 1 ab 128 1024 512  
+2026-09-26T19:50:01Z	D_attention/sp_run2	dgpu	96MB	rc=0	2.6s	busy_before=8	busy_after=95	env CANDS=attention_dec_fused_vt_qreg_sp_d8\,attention_dec_fused_vt_qreg_sp_d4\,attention_dec_fused_vt_qreg_d8 ./attn_harness2_gfx1201 gfx1201 . decode 1 2 3 4 5 8  
+2026-09-26T19:50:04Z	D_attention/sp_run3	dgpu	96MB	rc=0	2.6s	busy_before=6	busy_after=95	env CANDS=attention_dec_fused_vt_qreg_sp_d8\,attention_dec_fused_vt_qreg_sp_d4\,attention_dec_fused_vt_qreg_d8 ./attn_harness2_gfx1201 gfx1201 . decode 1 2 3 4 5 8  
+2026-09-26T19:50:51Z	D_attention/f16rt_timing	dgpu	96MB	rc=0	1.8s	busy_before=NA	busy_after=80	./attn_harness2_gfx1201 gfx1201 . f16rt  
+2026-09-26T19:54:02Z	B_moe_prefill/wmma5	igpu	2600MB	rc=0	6.4s	busy_before=0	busy_after=95	bash run_cand.sh tmp_w5 1 all 128 1024 512  
+2026-09-26T19:54:07Z	B_moe_prefill/wmma5p	igpu	2600MB	rc=0	5.4s	busy_before=92	busy_after=96	bash run_cand.sh tmp_w5p 1 all 128 1024 512  
+2026-09-26T19:55:27Z	B_moe_prefill/wmma	igpu	2600MB	rc=0	7.2s	busy_before=0	busy_after=96	bash run_cand.sh cand_wmma 3 ab 128 1024 512 128  
+2026-09-26T19:55:33Z	B_moe_prefill/wmma5	igpu	2600MB	rc=0	5.1s	busy_before=93	busy_after=96	bash run_cand.sh tmp_w5 2 ab 128 1024 512  
+2026-09-26T19:55:37Z	B_moe_prefill/wmma5	igpu	2600MB	rc=0	4.4s	busy_before=93	busy_after=95	bash run_cand.sh tmp_w5 3 ab 128 1024 512  
+2026-09-26T19:55:48Z	review/C2_dense_prefill	dgpu	500MB	rc=0	2.5s	busy_before=NA	busy_after=83	bash run_ab.sh r1 512  
+2026-09-26T19:55:49Z	review/C2_dense_prefill	dgpu	200MB	rc=0	1.8s	busy_before=10	busy_after=81	bash run_ab.sh r1  
+2026-09-26T19:55:51Z	review/C2_dense_prefill	dgpu	200MB	rc=0	1.8s	busy_before=9	busy_after=81	bash run_ab.sh r2  
+2026-09-26T19:55:53Z	review/C2_dense_prefill	dgpu	200MB	rc=0	1.8s	busy_before=10	busy_after=81	bash run_ab.sh r3  
+2026-09-26T19:55:55Z	review/C2_dense_prefill	dgpu	500MB	rc=0	1.8s	busy_before=9	busy_after=89	bash run_ab.sh r2 512  
+2026-09-26T19:55:59Z	review/C2_dense_prefill	dgpu	500MB	rc=0	3.8s	busy_before=10	busy_after=65	bash run_corr.sh  
+2026-09-26T19:56:00Z	review/C2_dense_prefill	dgpu	200MB	rc=0	0.9s	busy_before=11	busy_after=81	bash run_warm.sh  
+2026-09-26T19:56:02Z	review/C2_dense_prefill	dgpu	500MB	rc=0	1.8s	busy_before=5	busy_after=89	bash run_ab.sh r3 512  
+2026-09-26T19:56:04Z	review/C2_dense_prefill	dgpu	500MB	rc=0	1.9s	busy_before=12	busy_after=90	bash run_ab.sh b1024 1024  
+2026-09-26T19:56:16Z	review/C2_dense_prefill	dgpu	500MB	rc=0	12.3s	busy_before=12	busy_after=70	bash run_corr.sh  
+2026-09-26T19:56:18Z	review/C2_dense_prefill	dgpu	700MB	rc=0	2.3s	busy_before=11	busy_after=88	bash run_timing.sh r1  
+2026-09-26T19:56:21Z	review/C2_dense_prefill	dgpu	700MB	rc=0	2.3s	busy_before=10	busy_after=88	bash run_timing.sh r2  
+2026-09-26T19:56:23Z	review/C2_dense_prefill	dgpu	700MB	rc=0	2.2s	busy_before=19	busy_after=88	bash run_timing.sh r3  
+2026-09-26T19:56:30Z	review/C2_dense_prefill	dgpu	700MB	rc=0	6.8s	busy_before=19	busy_after=86	bash run_shapes.sh  
+2026-09-26T19:56:31Z	review/C2_dense_prefill	dgpu	700MB	rc=0	1.1s	busy_before=15	busy_after=87	./harness_gfx1201 gfx1201 . engram --m 25600 --corr --cand q8_0_gemm_wmma_i8x_db  
+2026-09-26T19:56:32Z	review/C2_dense_prefill	dgpu	700MB	rc=0	1.1s	busy_before=20	busy_after=87	./harness_gfx1201 gfx1201 . engram --m 25600 --corr --cand q8_0_gemm_wmma_i8x_db  
+2026-09-26T19:56:33Z	review/C2_dense_prefill	dgpu	700MB	rc=0	1.1s	busy_before=18	busy_after=87	./harness_gfx1201 gfx1201 . engram --m 25600 --corr --cand q8_0_gemm_wmma_i8x_db  
+2026-09-26T19:56:34Z	review/C2_dense_prefill	dgpu	700MB	rc=0	1.2s	busy_before=19	busy_after=88	./harness_gfx1201 gfx1201 . engram --m 25600 --b 128 --corr --cand q8_0_gemm_wmma_i8x_db  
+2026-09-26T19:56:35Z	review/C2_dense_prefill	dgpu	700MB	rc=0	1.0s	busy_before=20	busy_after=70	./harness_dn_gfx1201 gfx1201 . engram --m 25600 --b 200 --corr --short --cand q8_0_gemm_wmma_i8x_db  
+2026-09-26T19:56:39Z	review/C2_dense_prefill	dgpu	500MB	rc=0	3.2s	busy_before=22	busy_after=86	bash run_review.sh rv1 --corr  
+2026-09-26T19:56:42Z	review/C2_dense_prefill	dgpu	500MB	rc=0	3.1s	busy_before=13	busy_after=87	bash run_review.sh rv2  
+2026-09-26T19:56:45Z	review/C2_dense_prefill	dgpu	500MB	rc=0	3.1s	busy_before=8	busy_after=87	bash run_review.sh rv3  
+2026-09-26T19:56:56Z	review/C2_dense_prefill	dgpu	600MB	rc=0	11.1s	busy_before=11	busy_after=86	bash run_extra.sh  
+2026-09-26T19:56:57Z	review/C2_dense_prefill	dgpu	250MB	rc=0	0.9s	busy_before=13	busy_after=80	bash run_b1024.sh  
+2026-09-26T19:57:10Z	review/D_attention	dgpu	96MB	rc=0	1.0s	busy_before=NA	busy_after=10	env CANDS=attention_dec_fused_vt_qreg_sp_d4\,attention_dec_fused_vt_qreg_sp_d8 ./attn_harness2_gfx1201 gfx1201 . check  
+2026-09-26T19:57:13Z	review/D_attention	dgpu	96MB	rc=0	2.6s	busy_before=6	busy_after=96	env CANDS=attention_dec_fused_vt_qreg_sp_d8\,attention_dec_fused_vt_qreg_sp_d4\,attention_dec_fused_vt_qreg_d8 ./attn_harness2_gfx1201 gfx1201 . decode 1 2 3 4 5 8  
+2026-09-26T19:57:15Z	review/D_attention	dgpu	96MB	rc=0	2.6s	busy_before=6	busy_after=95	env CANDS=attention_dec_fused_vt_qreg_sp_d8\,attention_dec_fused_vt_qreg_sp_d4\,attention_dec_fused_vt_qreg_d8 ./attn_harness2_gfx1201 gfx1201 . decode 1 2 3 4 5 8  
+2026-09-26T19:57:18Z	review/D_attention	dgpu	96MB	rc=0	2.6s	busy_before=6	busy_after=96	env CANDS=attention_dec_fused_vt_qreg_sp_d8\,attention_dec_fused_vt_qreg_sp_d4\,attention_dec_fused_vt_qreg_d8 ./attn_harness2_gfx1201 gfx1201 . decode 1 2 3 4 5 8  
+2026-09-26T19:58:12Z	review/D_attention	dgpu	96MB	rc=0	3.4s	busy_before=NA	busy_after=92	env CANDS=attention_dec_flash3_part1_k128\,attention_dec_flash3_part1_k64\,attention_dec_flash2_part1_k128 ./attn_harness2_gfx1201 gfx1201 . decode 1 2 3 4 5 8  
+2026-09-26T19:58:15Z	review/D_attention	dgpu	96MB	rc=0	2.7s	busy_before=6	busy_after=96	env CANDS=attention_dec_flash3_part1_k128\,attention_dec_flash3_part1_k64\,attention_dec_flash2_part1_k128 ./attn_harness2_gfx1201 gfx1201 . decode 1 2 3 4 5 8  
+2026-09-26T19:58:18Z	review/D_attention	dgpu	96MB	rc=0	2.7s	busy_before=6	busy_after=96	env CANDS=attention_dec_flash3_part1_k128\,attention_dec_flash3_part1_k64\,attention_dec_flash2_part1_k128 ./attn_harness2_gfx1201 gfx1201 . decode 1 2 3 4 5 8  
+2026-09-26T19:58:18Z	review/D_attention	dgpu	96MB	rc=0	0.3s	busy_before=6	busy_after=11	env CANDS=attention_dec_flash3_part1_k128\,attention_dec_flash3_part1_k64\,attention_dec_flash2_part1_k128 ./attn_harness2_gfx1201 gfx1201 . check  
+2026-09-26T19:58:36Z	review/D_attention	dgpu	96MB	rc=0	3.1s	busy_before=NA	busy_after=91	env CANDS=attention_dec_score_blk256\,attention_dec_score_blk128 ./attn_harness2_gfx1201 gfx1201 . decode 1 2 3 4 5 8  
+2026-09-26T19:58:39Z	review/D_attention	dgpu	96MB	rc=0	2.4s	busy_before=6	busy_after=95	env CANDS=attention_dec_score_blk256\,attention_dec_score_blk128 ./attn_harness2_gfx1201 gfx1201 . decode 1 2 3 4 5 8  
+2026-09-26T19:58:41Z	review/D_attention	dgpu	96MB	rc=0	2.4s	busy_before=6	busy_after=95	env CANDS=attention_dec_score_blk256\,attention_dec_score_blk128 ./attn_harness2_gfx1201 gfx1201 . decode 1 2 3 4 5 8  
+2026-09-26T19:58:42Z	review/D_attention	dgpu	96MB	rc=0	0.3s	busy_before=6	busy_after=11	env CANDS=attention_dec_score_blk256\,attention_dec_score_blk128 ./attn_harness2_gfx1201 gfx1201 . check  
+2026-09-26T19:58:42Z	review/D_attention	dgpu	160MB	rc=0	0.2s	busy_before=6	busy_after=29	./check_extra_gfx1201 gfx1201 .  
+2026-09-26T19:59:19Z	review/D_attention	dgpu	96MB	rc=0	1.8s	busy_before=NA	busy_after=80	./attn_harness2_gfx1201 gfx1201 . f16rt  
+2026-09-26T19:59:20Z	review/D_attention	dgpu	96MB	rc=0	1.1s	busy_before=4	busy_after=89	./attn_harness2_gfx1201 gfx1201 . f16rt  
+2026-09-26T19:59:21Z	review/D_attention	dgpu	96MB	rc=0	1.1s	busy_before=4	busy_after=89	./attn_harness2_gfx1201 gfx1201 . f16rt  
+2026-09-26T19:59:22Z	review/D_attention	dgpu	96MB	rc=0	0.1s	busy_before=4	busy_after=15	./review_f16rt_gfx1201 gfx1201 .  
+2026-09-26T19:59:47Z	review/D_attention	dgpu	160MB	rc=0	1.3s	busy_before=NA	busy_after=8	./harness_review_gfx1201 gfx1201 . check2  
+2026-09-26T19:59:48Z	review/D_attention	dgpu	160MB	rc=0	0.6s	busy_before=5	busy_after=8	./harness_review_gfx1201 gfx1201 . check2 8  
+2026-09-26T19:59:50Z	review/D_attention	dgpu	420MB	rc=0	2.3s	busy_before=6	busy_after=96	./harness_review_gfx1201 gfx1201 . cold 1 4 8  
+2026-09-26T20:01:06Z	review/D_attention	dgpu	96MB	rc=0	2.2s	busy_before=NA	busy_after=86	./review_harness_gfx1201 gfx1201 . combine 1 4 8  
+2026-09-26T20:01:18Z	review/D_attention	dgpu	96MB	rc=0	12.6s	busy_before=6	busy_after=4	./review_harness_gfx1201 gfx1201 . check2  
+2026-09-26T20:01:49Z	review/D_attention	dgpu	96MB	rc=0	3.1s	busy_before=NA	busy_after=91	env CANDS=attention_dec_smwsum_pf2 ./attn_harness2_gfx1201 gfx1201 . decode 1 2 3 4 5 8  
+2026-09-26T20:01:51Z	review/D_attention	dgpu	96MB	rc=0	2.4s	busy_before=6	busy_after=96	env CANDS=attention_dec_smwsum_pf2 ./attn_harness2_gfx1201 gfx1201 . decode 1 2 3 4 5 8  
+2026-09-26T20:01:54Z	review/D_attention	dgpu	96MB	rc=0	2.4s	busy_before=7	busy_after=95	env CANDS=attention_dec_smwsum_pf2 ./attn_harness2_gfx1201 gfx1201 . decode 1 2 3 4 5 8  
+2026-09-26T20:01:54Z	review/D_attention	dgpu	160MB	rc=0	0.5s	busy_before=6	busy_after=11	env CANDS=attention_dec_smwsum_pf2 ./attn_harness_rv_gfx1201 gfx1201 . check  
+2026-09-26T20:01:56Z	review/D_attention	dgpu	160MB	rc=0	1.3s	busy_before=8	busy_after=92	env CANDS=attention_dec_smwsum_pf2 ./attn_harness_rv_gfx1201 gfx1201 . decode 1 4 16  
+2026-09-26T20:03:05Z	review/B_moe_prefill	igpu	2600MB	rc=0	8.7s	busy_before=0	busy_after=96	bash run_cand.sh cand_wmma 1 all 128 1024 512 128  
+2026-09-26T20:03:12Z	review/B_moe_prefill	igpu	2600MB	rc=0	7.7s	busy_before=93	busy_after=96	bash run_cand.sh cand_wmma 2 all 128 1024 512 128  
+2026-09-26T20:03:19Z	review/B_moe_prefill	igpu	2600MB	rc=0	7.1s	busy_before=93	busy_after=94	bash run_cand.sh cand_wmma 3 all 128 1024 512 128  
+2026-09-26T20:03:29Z	review/B_moe_prefill	igpu	4200MB	rc=0	9.8s	busy_before=91	busy_after=96	bash run_extra.sh 1  
+2026-09-26T20:03:57Z	review/B_moe_prefill	igpu	2600MB	rc=0	8.4s	busy_before=0	busy_after=96	bash B_moe_prefill/review/run_review.sh 101  
+2026-09-26T20:04:04Z	review/B_moe_prefill	igpu	2600MB	rc=0	7.5s	busy_before=93	busy_after=95	bash B_moe_prefill/review/run_review.sh 102  
+2026-09-26T20:04:13Z	review/B_moe_prefill	igpu	2600MB	rc=0	8.4s	busy_before=93	busy_after=96	bash B_moe_prefill/review/run_review.sh 103  
+2026-09-26T20:04:23Z	review/B_moe_prefill	igpu	8200MB	rc=0	10.3s	busy_before=93	busy_after=97	bash B_moe_prefill/review/run_extra.sh  
+2026-09-26T20:07:47Z	review/B_moe_prefill	igpu	2600MB	rc=0	4.7s	busy_before=0	busy_after=74	bash run_realistic.sh 1  
+2026-09-26T20:07:50Z	review/B_moe_prefill	igpu	4200MB	rc=0	3.0s	busy_before=72	busy_after=28	bash run_extra.sh 1  
+2026-09-26T20:07:58Z	review/B_moe_prefill	igpu	2600MB	rc=0	8.8s	busy_before=27	busy_after=95	bash run_exact.sh 1  
+2026-09-26T20:08:07Z	review/B_moe_prefill	igpu	8500MB	rc=0	8.2s	busy_before=92	busy_after=96	bash run_full.sh 1  
+2026-09-26T20:08:43Z	review/B_moe_prefill	igpu	8500MB	rc=0	8.8s	busy_before=0	busy_after=97	bash run_full.sh 2  
+2026-09-26T20:08:51Z	review/B_moe_prefill	igpu	8500MB	rc=0	8.4s	busy_before=94	busy_after=96	bash run_full.sh 3  

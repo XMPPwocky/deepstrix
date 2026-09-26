@@ -1,0 +1,68 @@
+== 1790451830.000179.review.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+#### grouped 1
+CMP wo_a q8_0_grouped_gemv_bpack_tB1 vs base b=1 n=8192 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wo_a q8_0_grouped_gemv_bpack_tB1 vs base b=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== grouped wo_a 8x(1024x4096) b=1 cold(readflush72MB) graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_grouped_gemv_bpack                  76.64      76.04      77.80    1.000     465.2       0.0
+cand q8_0_grouped_gemv_bpack_tB1              78.68      77.68      79.60    1.027     453.1       0.0
+null 1-WG kernel (launch floor)               14.08      13.36      15.04    0.184       0.0       0.0
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=1 cold(readflush72MB) graph","variant":"base q8_0_grouped_gemv_bpack","med_us":76.641,"p10_us":76.041,"p90_us":77.801,"ratio":1.0000,"gbps":465.18,"graph":1,"flush":1}
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=1 cold(readflush72MB) graph","variant":"cand q8_0_grouped_gemv_bpack_tB1","med_us":78.681,"p10_us":77.681,"p90_us":79.601,"ratio":1.0266,"gbps":453.12,"graph":1,"flush":1}
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=1 cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":14.080,"p10_us":13.360,"p90_us":15.041,"ratio":0.1837,"gbps":0.00,"graph":1,"flush":1}
+
+#### grouped 2
+CMP wo_a q8_0_grouped_gemv_bpack_tB2 vs base b=2 n=16384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wo_a q8_0_grouped_gemv_bpack_tB2 vs base b=2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== grouped wo_a 8x(1024x4096) b=2 cold(readflush72MB) graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_grouped_gemv_bpack                  77.36      76.56      78.40    1.000     460.8       0.0
+cand q8_0_grouped_gemv_bpack_tB2              70.72      70.32      72.00    0.914     504.1       0.0
+null 1-WG kernel (launch floor)               13.44      13.28      14.84    0.174       0.0       0.0
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=2 cold(readflush72MB) graph","variant":"base q8_0_grouped_gemv_bpack","med_us":77.361,"p10_us":76.560,"p90_us":78.401,"ratio":1.0000,"gbps":460.85,"graph":1,"flush":1}
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=2 cold(readflush72MB) graph","variant":"cand q8_0_grouped_gemv_bpack_tB2","med_us":70.721,"p10_us":70.321,"p90_us":72.001,"ratio":0.9142,"gbps":504.12,"graph":1,"flush":1}
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=2 cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":13.440,"p10_us":13.280,"p90_us":14.840,"ratio":0.1737,"gbps":0.00,"graph":1,"flush":1}
+
+#### grouped 4
+CMP wo_a q8_0_grouped_gemv_bpack_tB4 vs base b=4 n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wo_a q8_0_grouped_gemv_bpack_tB4 vs base b=4","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== grouped wo_a 8x(1024x4096) b=4 cold(readflush72MB) graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_grouped_gemv_bpack                  98.80      97.36     100.00    1.000     360.8       0.0
+cand q8_0_grouped_gemv_bpack_tB4              72.20      71.64      73.60    0.731     493.8       0.0
+null 1-WG kernel (launch floor)               13.68      13.28      15.12    0.138       0.0       0.0
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=4 cold(readflush72MB) graph","variant":"base q8_0_grouped_gemv_bpack","med_us":98.801,"p10_us":97.361,"p90_us":100.001,"ratio":1.0000,"gbps":360.84,"graph":1,"flush":1}
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=4 cold(readflush72MB) graph","variant":"cand q8_0_grouped_gemv_bpack_tB4","med_us":72.201,"p10_us":71.641,"p90_us":73.601,"ratio":0.7308,"gbps":493.78,"graph":1,"flush":1}
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=4 cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":13.680,"p10_us":13.280,"p90_us":15.120,"ratio":0.1385,"gbps":0.00,"graph":1,"flush":1}
+
+#### grouped 5
+CMP wo_a q8_0_grouped_gemv_bpack_tB5 vs base b=5 n=40960 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wo_a q8_0_grouped_gemv_bpack_tB5 vs base b=5","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== grouped wo_a 8x(1024x4096) b=5 cold(readflush72MB) graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_grouped_gemv_bpack                  96.80      96.64      97.48    1.000     368.3       0.0
+cand q8_0_grouped_gemv_bpack_tB5              72.72      72.28      73.88    0.751     490.3       0.0
+null 1-WG kernel (launch floor)               13.64      13.32      15.12    0.141       0.0       0.0
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=5 cold(readflush72MB) graph","variant":"base q8_0_grouped_gemv_bpack","med_us":96.801,"p10_us":96.641,"p90_us":97.481,"ratio":1.0000,"gbps":368.30,"graph":1,"flush":1}
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=5 cold(readflush72MB) graph","variant":"cand q8_0_grouped_gemv_bpack_tB5","med_us":72.720,"p10_us":72.281,"p90_us":73.880,"ratio":0.7512,"gbps":490.26,"graph":1,"flush":1}
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=5 cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":13.640,"p10_us":13.320,"p90_us":15.120,"ratio":0.1409,"gbps":0.00,"graph":1,"flush":1}
+
+#### grouped 8
+CMP wo_a q8_0_grouped_gemv_bpack_tB8 vs base b=8 n=65536 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wo_a q8_0_grouped_gemv_bpack_tB8 vs base b=8","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== grouped wo_a 8x(1024x4096) b=8 cold(readflush72MB) graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_grouped_gemv_bpack                 119.96     118.52     121.60    1.000     297.2       0.0
+cand q8_0_grouped_gemv_bpack_tB8              81.68      81.16      82.28    0.681     436.5       0.0
+null 1-WG kernel (launch floor)               13.84      13.28      15.16    0.115       0.0       0.0
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=8 cold(readflush72MB) graph","variant":"base q8_0_grouped_gemv_bpack","med_us":119.962,"p10_us":118.521,"p90_us":121.601,"ratio":1.0000,"gbps":297.19,"graph":1,"flush":1}
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=8 cold(readflush72MB) graph","variant":"cand q8_0_grouped_gemv_bpack_tB8","med_us":81.681,"p10_us":81.161,"p90_us":82.281,"ratio":0.6809,"gbps":436.47,"graph":1,"flush":1}
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=8 cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":13.841,"p10_us":13.280,"p90_us":15.160,"ratio":0.1154,"gbps":0.00,"graph":1,"flush":1}

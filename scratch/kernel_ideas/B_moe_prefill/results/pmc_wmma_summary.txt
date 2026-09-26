@@ -1,0 +1,109 @@
+prof_pmcA_down: mxfp4_matvec_par_by_expert_kwide2 dispatches=1
+    SQ_INSTS_LDS                 med=1.34595e+08  min=1.34595e+08 max=1.34595e+08
+    SQ_INSTS_SALU                med=5.65094e+08  min=5.65094e+08 max=5.65094e+08
+    SQ_INSTS_VALU                med=7.46061e+08  min=7.46061e+08 max=7.46061e+08
+    SQ_WAVES                     med=1.47456e+06  min=1.47456e+06 max=1.47456e+06
+prof_pmcA_down: mxfp4_matvec_par_by_expert_wmma dispatches=4
+    SQ_INSTS_LDS                 med=1.60861e+07  min=1.60861e+07 max=1.60861e+07
+    SQ_INSTS_SALU                med=7.66464e+06  min=7.66464e+06 max=7.66464e+06
+    SQ_INSTS_VALU                med=2.90351e+08  min=2.90351e+08 max=2.90351e+08
+    SQ_WAVES                     med=184320  min=184320 max=184320
+prof_pmcA_down: mxfp4_pair_matvec_fused_swiglu_kwide dispatches=1
+    SQ_INSTS_LDS                 med=1.78396e+08  min=1.78396e+08 max=1.78396e+08
+    SQ_INSTS_SALU                med=4.90379e+08  min=4.90379e+08 max=4.90379e+08
+    SQ_INSTS_VALU                med=1.17388e+09  min=1.17388e+09 max=1.17388e+09
+    SQ_WAVES                     med=1.3271e+06  min=1.3271e+06 max=1.3271e+06
+prof_pmcA_down: patch_scales(unsigned char*, unsigned long, unsigned int, un dispatches=1
+--
+prof_pmcA_gu: mxfp4_matvec_par_by_expert_kwide2 dispatches=1
+    SQ_INSTS_LDS                 med=1.34595e+08  min=1.34595e+08 max=1.34595e+08
+    SQ_INSTS_SALU                med=5.65094e+08  min=5.65094e+08 max=5.65094e+08
+    SQ_INSTS_VALU                med=7.46061e+08  min=7.46061e+08 max=7.46061e+08
+    SQ_WAVES                     med=1.47456e+06  min=1.47456e+06 max=1.47456e+06
+prof_pmcA_gu: mxfp4_pair_matvec_fused_swiglu_kwide dispatches=1
+    SQ_INSTS_LDS                 med=1.78396e+08  min=1.78396e+08 max=1.78396e+08
+    SQ_INSTS_SALU                med=4.90379e+08  min=4.90379e+08 max=4.90379e+08
+    SQ_INSTS_VALU                med=1.17388e+09  min=1.17388e+09 max=1.17388e+09
+    SQ_WAVES                     med=1.3271e+06  min=1.3271e+06 max=1.3271e+06
+prof_pmcA_gu: mxfp4_pair_matvec_fused_swiglu_wmma dispatches=4
+    SQ_INSTS_LDS                 med=1.6058e+07  min=1.6058e+07 max=1.6058e+07
+    SQ_INSTS_SALU                med=7.54632e+06  min=7.54632e+06 max=7.54632e+06
+    SQ_INSTS_VALU                med=5.76456e+08  min=5.76456e+08 max=5.76456e+08
+    SQ_WAVES                     med=82944  min=82944 max=82944
+prof_pmcA_gu: patch_scales(unsigned char*, unsigned long, unsigned int, un dispatches=1
+--
+prof_pmcA_kwide: mxfp4_matvec_par_by_expert_kwide2 dispatches=1
+    SQ_INSTS_LDS                 med=1.34595e+08  min=1.34595e+08 max=1.34595e+08
+    SQ_INSTS_SALU                med=5.65094e+08  min=5.65094e+08 max=5.65094e+08
+    SQ_INSTS_VALU                med=7.46061e+08  min=7.46061e+08 max=7.46061e+08
+    SQ_WAVES                     med=1.47456e+06  min=1.47456e+06 max=1.47456e+06
+prof_pmcA_kwide: mxfp4_pair_matvec_fused_swiglu_kwide dispatches=5
+    SQ_INSTS_LDS                 med=1.78396e+08  min=1.78396e+08 max=1.78396e+08
+    SQ_INSTS_SALU                med=4.90379e+08  min=4.90379e+08 max=4.90379e+08
+    SQ_INSTS_VALU                med=1.17388e+09  min=1.17388e+09 max=1.17388e+09
+    SQ_WAVES                     med=1.3271e+06  min=1.3271e+06 max=1.3271e+06
+prof_pmcA_kwide: patch_scales(unsigned char*, unsigned long, unsigned int, un dispatches=1
+--
+prof_pmcA_kwide2: mxfp4_matvec_par_by_expert_kwide2 dispatches=5
+    SQ_INSTS_LDS                 med=1.34595e+08  min=1.34595e+08 max=1.34595e+08
+    SQ_INSTS_SALU                med=5.65094e+08  min=5.65094e+08 max=5.65094e+08
+    SQ_INSTS_VALU                med=7.46061e+08  min=7.46061e+08 max=7.46061e+08
+    SQ_WAVES                     med=1.47456e+06  min=1.47456e+06 max=1.47456e+06
+prof_pmcA_kwide2: mxfp4_pair_matvec_fused_swiglu_kwide dispatches=1
+    SQ_INSTS_LDS                 med=1.78396e+08  min=1.78396e+08 max=1.78396e+08
+    SQ_INSTS_SALU                med=4.90379e+08  min=4.90379e+08 max=4.90379e+08
+    SQ_INSTS_VALU                med=1.17388e+09  min=1.17388e+09 max=1.17388e+09
+    SQ_WAVES                     med=1.3271e+06  min=1.3271e+06 max=1.3271e+06
+prof_pmcA_kwide2: patch_scales(unsigned char*, unsigned long, unsigned int, un dispatches=1
+--
+prof_pmcB_down: mxfp4_matvec_par_by_expert_kwide2 dispatches=1
+    MemUnitBusy                  med=89.1679  min=89.1679 max=89.1679
+    SQ_BUSY_CYCLES               med=4.82671e+08  min=4.82671e+08 max=4.82671e+08
+    SQ_WAVE_CYCLES               med=1.26494e+10  min=1.26494e+10 max=1.26494e+10
+prof_pmcB_down: mxfp4_matvec_par_by_expert_wmma dispatches=4
+    MemUnitBusy                  med=48.7899  min=47.3702 max=49.6116
+    SQ_BUSY_CYCLES               med=1.55429e+08  min=1.55327e+08 max=1.55535e+08
+    SQ_WAVE_CYCLES               med=6.06216e+09  min=6.04324e+09 max=6.10912e+09
+prof_pmcB_down: mxfp4_pair_matvec_fused_swiglu_kwide dispatches=1
+    MemUnitBusy                  med=72.3739  min=72.3739 max=72.3739
+    SQ_BUSY_CYCLES               med=6.02779e+08  min=6.02779e+08 max=6.02779e+08
+    SQ_WAVE_CYCLES               med=2.53493e+10  min=2.53493e+10 max=2.53493e+10
+prof_pmcB_down: patch_scales(unsigned char*, unsigned long, unsigned int, un dispatches=1
+    MemUnitBusy                  med=99.2795  min=99.2795 max=99.2795
+--
+prof_pmcB_gu: mxfp4_matvec_par_by_expert_kwide2 dispatches=1
+    MemUnitBusy                  med=89.2218  min=89.2218 max=89.2218
+    SQ_BUSY_CYCLES               med=4.81415e+08  min=4.81415e+08 max=4.81415e+08
+    SQ_WAVE_CYCLES               med=1.27507e+10  min=1.27507e+10 max=1.27507e+10
+prof_pmcB_gu: mxfp4_pair_matvec_fused_swiglu_kwide dispatches=1
+    MemUnitBusy                  med=72.6524  min=72.6524 max=72.6524
+    SQ_BUSY_CYCLES               med=5.9506e+08  min=5.9506e+08 max=5.9506e+08
+    SQ_WAVE_CYCLES               med=2.48541e+10  min=2.48541e+10 max=2.48541e+10
+prof_pmcB_gu: mxfp4_pair_matvec_fused_swiglu_wmma dispatches=4
+    MemUnitBusy                  med=47.0513  min=46.6011 max=48.1778
+    SQ_BUSY_CYCLES               med=3.34081e+08  min=3.33528e+08 max=3.35889e+08
+    SQ_WAVE_CYCLES               med=7.96521e+09  min=7.95554e+09 max=7.97835e+09
+prof_pmcB_gu: patch_scales(unsigned char*, unsigned long, unsigned int, un dispatches=1
+    MemUnitBusy                  med=99.5754  min=99.5754 max=99.5754
+--
+prof_pmcB_kwide: mxfp4_matvec_par_by_expert_kwide2 dispatches=1
+    MemUnitBusy                  med=89.0453  min=89.0453 max=89.0453
+    SQ_BUSY_CYCLES               med=4.81819e+08  min=4.81819e+08 max=4.81819e+08
+    SQ_WAVE_CYCLES               med=1.27171e+10  min=1.27171e+10 max=1.27171e+10
+prof_pmcB_kwide: mxfp4_pair_matvec_fused_swiglu_kwide dispatches=5
+    MemUnitBusy                  med=73.1762  min=71.4195 max=75.3256
+    SQ_BUSY_CYCLES               med=5.62034e+08  min=5.59918e+08 max=5.62216e+08
+    SQ_WAVE_CYCLES               med=2.33626e+10  min=2.27991e+10 max=2.37253e+10
+prof_pmcB_kwide: patch_scales(unsigned char*, unsigned long, unsigned int, un dispatches=1
+    MemUnitBusy                  med=99.7927  min=99.7927 max=99.7927
+--
+prof_pmcB_kwide2: mxfp4_matvec_par_by_expert_kwide2 dispatches=5
+    MemUnitBusy                  med=1.84924  min=1.84104 max=1.85441
+    SQ_BUSY_CYCLES               med=4.81446e+08  min=4.80559e+08 max=4.82671e+08
+    SQ_WAVE_CYCLES               med=1.27392e+10  min=1.26539e+10 max=1.27611e+10
+prof_pmcB_kwide2: mxfp4_pair_matvec_fused_swiglu_kwide dispatches=1
+    MemUnitBusy                  med=73.8204  min=73.8204 max=73.8204
+    SQ_BUSY_CYCLES               med=5.74562e+08  min=5.74562e+08 max=5.74562e+08
+    SQ_WAVE_CYCLES               med=2.36155e+10  min=2.36155e+10 max=2.36155e+10
+prof_pmcB_kwide2: patch_scales(unsigned char*, unsigned long, unsigned int, un dispatches=1
+    MemUnitBusy                  med=99.594  min=99.594 max=99.594

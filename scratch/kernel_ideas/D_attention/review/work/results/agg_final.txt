@@ -1,0 +1,48 @@
+
+== decode b=1 n_total=640 graph warm   (3 runs)
+  base pair: dec_score + smwsum                        n=3 med   41.73 [ 41.43.. 48.55]  p10   41.39  x1.000
+  base dec_score alone                                 n=3 med    9.69 [  9.60.. 11.26]  p10    9.66  x0.232
+  base smwsum alone                                    n=3 med   33.09 [ 32.79.. 38.33]  p10   33.02  x0.793
+  attention_dec_flash2_part1_k128 (+combine)           n=3 med   13.23 [ 13.12.. 15.16]  p10   13.19  x0.317
+  attention_dec_flash3_part1_k64 (+combine)            n=3 med   13.17 [ 13.08.. 14.91]  p10   13.14  x0.316
+  attention_dec_flash3_part1_k128 (+combine)           n=3 med   11.87 [ 11.77.. 13.48]  p10   11.84  x0.285
+
+== decode b=2 n_total=640 graph warm   (3 runs)
+  base pair: dec_score + smwsum                        n=3 med   41.44 [ 41.10.. 42.32]  p10   41.16  x1.000
+  base dec_score alone                                 n=3 med    9.84 [  9.78.. 10.11]  p10    9.81  x0.237
+  base smwsum alone                                    n=3 med   32.86 [ 32.64.. 33.48]  p10   32.71  x0.793
+  attention_dec_flash2_part1_k128 (+combine)           n=3 med   30.86 [ 30.75.. 31.25]  p10   30.79  x0.745
+  attention_dec_flash3_part1_k64 (+combine)            n=3 med   26.07 [ 26.00.. 26.23]  p10   26.02  x0.629
+  attention_dec_flash3_part1_k128 (+combine)           n=3 med   28.18 [ 28.11.. 28.43]  p10   28.14  x0.680
+
+== decode b=3 n_total=640 graph warm   (3 runs)
+  base pair: dec_score + smwsum                        n=3 med   43.62 [ 43.56.. 45.31]  p10   43.56  x1.000
+  base dec_score alone                                 n=3 med   12.13 [ 12.12.. 12.61]  p10   12.10  x0.278
+  base smwsum alone                                    n=3 med   32.55 [ 32.51.. 33.80]  p10   32.45  x0.746
+  attention_dec_flash2_part1_k128 (+combine)           n=3 med   21.07 [ 21.05.. 21.88]  p10   21.04  x0.483
+  attention_dec_flash3_part1_k64 (+combine)            n=3 med   20.90 [ 20.90.. 21.62]  p10   20.86  x0.479
+  attention_dec_flash3_part1_k128 (+combine)           n=3 med   18.48 [ 18.47.. 19.14]  p10   18.47  x0.424
+
+== decode b=4 n_total=640 graph warm   (3 runs)
+  base pair: dec_score + smwsum                        n=3 med   46.90 [ 46.84.. 48.20]  p10   46.84  x1.000
+  base dec_score alone                                 n=3 med   15.44 [ 15.43.. 15.86]  p10   15.41  x0.329
+  base smwsum alone                                    n=3 med   32.60 [ 32.56.. 33.50]  p10   32.45  x0.695
+  attention_dec_flash2_part1_k128 (+combine)           n=3 med   39.26 [ 39.24.. 40.02]  p10   39.23  x0.837
+  attention_dec_flash3_part1_k64 (+combine)            n=3 med   35.12 [ 35.05.. 35.67]  p10   35.02  x0.749
+  attention_dec_flash3_part1_k128 (+combine)           n=3 med   35.30 [ 35.28.. 35.92]  p10   35.25  x0.753
+
+== decode b=5 n_total=640 graph warm   (3 runs)
+  base pair: dec_score + smwsum                        n=3 med   47.25 [ 47.24.. 47.86]  p10   47.18  x1.000
+  base dec_score alone                                 n=3 med   15.70 [ 15.70.. 15.88]  p10   15.68  x0.332
+  base smwsum alone                                    n=3 med   32.68 [ 32.66.. 33.15]  p10   32.54  x0.692
+  attention_dec_flash2_part1_k128 (+combine)           n=3 med   34.61 [ 34.59.. 35.04]  p10   34.55  x0.732
+  attention_dec_flash3_part1_k64 (+combine)            n=3 med   31.86 [ 31.84.. 32.14]  p10   31.81  x0.674
+  attention_dec_flash3_part1_k128 (+combine)           n=3 med   29.42 [ 29.26.. 29.64]  p10   29.36  x0.623
+
+== decode b=8 n_total=640 graph warm   (3 runs)
+  base pair: dec_score + smwsum                        n=3 med   53.33 [ 53.32.. 53.37]  p10   53.26  x1.000
+  base dec_score alone                                 n=3 med   21.46 [ 21.44.. 21.46]  p10   21.42  x0.402
+  base smwsum alone                                    n=3 med   32.99 [ 32.97.. 33.08]  p10   32.82  x0.619
+  attention_dec_flash2_part1_k128 (+combine)           n=3 med   55.72 [ 55.62.. 56.02]  p10   55.69  x1.045
+  attention_dec_flash3_part1_k64 (+combine)            n=3 med   52.88 [ 52.62.. 53.52]  p10   52.80  x0.992
+  attention_dec_flash3_part1_k128 (+combine)           n=3 med   49.41 [ 49.27.. 49.55]  p10   49.39  x0.927

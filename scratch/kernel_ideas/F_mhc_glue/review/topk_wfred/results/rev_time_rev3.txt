@@ -1,0 +1,64 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+== REVIEW router_topk b=1 prior graph warm  (rounds=40 inner=20 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+router_topk_par prior                         10.97      10.95      11.00    1.000       0.0       0.0
+router_topk_wfred prior                        9.03       8.99       9.05    0.823       0.0       0.0
+KBJSON {"tag":"REVIEW router_topk b=1 prior graph warm","variant":"router_topk_par prior","med_us":10.974,"p10_us":10.950,"p90_us":11.000,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"REVIEW router_topk b=1 prior graph warm","variant":"router_topk_wfred prior","med_us":9.034,"p10_us":8.988,"p90_us":9.050,"ratio":0.8232,"gbps":0.00,"graph":1,"flush":0}
+
+== REVIEW router_topk b=1 prior direct warm  (rounds=40 inner=20 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+router_topk_par prior                         11.30      11.28      11.32    1.000       0.0       0.0
+router_topk_wfred prior                        9.30       9.28       9.33    0.823       0.0       0.0
+KBJSON {"tag":"REVIEW router_topk b=1 prior direct warm","variant":"router_topk_par prior","med_us":11.304,"p10_us":11.282,"p90_us":11.324,"ratio":1.0000,"gbps":0.00,"graph":0,"flush":0}
+KBJSON {"tag":"REVIEW router_topk b=1 prior direct warm","variant":"router_topk_wfred prior","med_us":9.304,"p10_us":9.282,"p90_us":9.330,"ratio":0.8231,"gbps":0.00,"graph":0,"flush":0}
+
+== REVIEW router_topk b=4 prior graph warm  (rounds=40 inner=20 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+router_topk_par prior                         10.74      10.69      10.79    1.000       0.0       0.0
+router_topk_wfred prior                        8.83       8.79       8.86    0.822       0.0       0.0
+KBJSON {"tag":"REVIEW router_topk b=4 prior graph warm","variant":"router_topk_par prior","med_us":10.744,"p10_us":10.690,"p90_us":10.792,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"REVIEW router_topk b=4 prior graph warm","variant":"router_topk_wfred prior","med_us":8.830,"p10_us":8.794,"p90_us":8.862,"ratio":0.8219,"gbps":0.00,"graph":1,"flush":0}
+
+== REVIEW router_topk b=4 prior direct warm  (rounds=40 inner=20 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+router_topk_par prior                         11.05      11.00      11.09    1.000       0.0       0.0
+router_topk_wfred prior                        9.11       9.09       9.14    0.825       0.0       0.0
+KBJSON {"tag":"REVIEW router_topk b=4 prior direct warm","variant":"router_topk_par prior","med_us":11.052,"p10_us":10.996,"p90_us":11.088,"ratio":1.0000,"gbps":0.00,"graph":0,"flush":0}
+KBJSON {"tag":"REVIEW router_topk b=4 prior direct warm","variant":"router_topk_wfred prior","med_us":9.114,"p10_us":9.094,"p90_us":9.140,"ratio":0.8246,"gbps":0.00,"graph":0,"flush":0}
+
+== REVIEW router_topk b=8 prior graph warm  (rounds=40 inner=20 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+router_topk_par prior                         10.51      10.48      10.54    1.000       0.0       0.0
+router_topk_wfred prior                        8.71       8.69       8.73    0.829       0.0       0.0
+KBJSON {"tag":"REVIEW router_topk b=8 prior graph warm","variant":"router_topk_par prior","med_us":10.508,"p10_us":10.480,"p90_us":10.540,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"REVIEW router_topk b=8 prior graph warm","variant":"router_topk_wfred prior","med_us":8.714,"p10_us":8.694,"p90_us":8.734,"ratio":0.8293,"gbps":0.00,"graph":1,"flush":0}
+
+== REVIEW router_topk b=8 prior direct warm  (rounds=40 inner=20 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+router_topk_par prior                         10.84      10.81      10.85    1.000       0.0       0.0
+router_topk_wfred prior                        9.02       9.01       9.03    0.832       0.0       0.0
+KBJSON {"tag":"REVIEW router_topk b=8 prior direct warm","variant":"router_topk_par prior","med_us":10.836,"p10_us":10.808,"p90_us":10.854,"ratio":1.0000,"gbps":0.00,"graph":0,"flush":0}
+KBJSON {"tag":"REVIEW router_topk b=8 prior direct warm","variant":"router_topk_wfred prior","med_us":9.018,"p10_us":9.008,"p90_us":9.034,"ratio":0.8322,"gbps":0.00,"graph":0,"flush":0}
+
+== REVIEW router_topk b=1 plain graph warm  (rounds=40 inner=20 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+router_topk_par plain                          6.87       6.83       6.89    1.000       0.0       0.0
+router_topk_wfred plain                        6.79       6.75       6.91    0.989       0.0       0.0
+KBJSON {"tag":"REVIEW router_topk b=1 plain graph warm","variant":"router_topk_par plain","med_us":6.870,"p10_us":6.834,"p90_us":6.888,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"REVIEW router_topk b=1 plain graph warm","variant":"router_topk_wfred plain","med_us":6.794,"p10_us":6.750,"p90_us":6.908,"ratio":0.9889,"gbps":0.00,"graph":1,"flush":0}
+
+== REVIEW router_topk b=1 plain direct warm  (rounds=40 inner=20 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+router_topk_par plain                          7.24       7.20       7.26    1.000       0.0       0.0
+router_topk_wfred plain                        7.09       7.06       7.17    0.979       0.0       0.0
+KBJSON {"tag":"REVIEW router_topk b=1 plain direct warm","variant":"router_topk_par plain","med_us":7.242,"p10_us":7.196,"p90_us":7.262,"ratio":1.0000,"gbps":0.00,"graph":0,"flush":0}
+KBJSON {"tag":"REVIEW router_topk b=1 plain direct warm","variant":"router_topk_wfred plain","med_us":7.088,"p10_us":7.062,"p90_us":7.166,"ratio":0.9787,"gbps":0.00,"graph":0,"flush":0}
+
+== REVIEW router_topk b=512 plain direct warm  (rounds=40 inner=20 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+router_topk_par plain                         31.72      31.70      31.74    1.000       0.0       0.0
+router_topk_wfred plain                       34.96      34.93      35.00    1.102       0.0       0.0
+KBJSON {"tag":"REVIEW router_topk b=512 plain direct warm","variant":"router_topk_par plain","med_us":31.718,"p10_us":31.696,"p90_us":31.744,"ratio":1.0000,"gbps":0.00,"graph":0,"flush":0}
+KBJSON {"tag":"REVIEW router_topk b=512 plain direct warm","variant":"router_topk_wfred plain","med_us":34.962,"p10_us":34.928,"p90_us":34.996,"ratio":1.1023,"gbps":0.00,"graph":0,"flush":0}

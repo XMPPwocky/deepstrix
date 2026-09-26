@@ -1,0 +1,27 @@
+kernel                                                            vgpr  sgpr   lds_B scratch vspill wave
+shared_gateup_swiglu_tB1                                            44    20       0       0      0   32
+shared_gateup_swiglu_tB2                                            56    24       0       0      0   32
+shared_gateup_swiglu_tB3                                            70    24       0       0      0   32
+shared_gateup_swiglu_tB4                                            81    22       0       0      0   32
+shared_gateup_swiglu_tB5                                            92    22       0       0      0   32
+shared_gateup_swiglu_tB8                                            98    22     128       0      0   32
+shared_gateup_swiglu_q8_tB1_r1                                      44    22     128       0      0   32
+shared_gateup_swiglu_q8_tB1_r2                                      71    22     128       0      0   32
+shared_gateup_swiglu_q8_tB1_r4                                      96    24     256       0      0   32
+shared_gateup_swiglu_q8_tB2_r1                                      56    26     256       0      0   32
+shared_gateup_swiglu_q8_tB2_r2                                      90    26     256       0      0   32
+shared_gateup_swiglu_q8_tB2_r4                                      97    32     512       0      0   32
+shared_gateup_swiglu_q8_tB4_r1                                      81    24     512       0      0   32
+shared_gateup_swiglu_q8_tB4_r2                                     106    26     512       0      0   32
+shared_gateup_swiglu_q8_tB4_r4                                     134    33     640       0      0   32
+shared_gateup_swiglu_q8_tB5_r1                                      92    26     640       0      0   32
+shared_gateup_swiglu_q8_tB5_r2                                     103    26     640       0      0   32
+shared_gateup_swiglu_q8_tB5_r4                                     166    29    1024       0      0   32
+shared_gateup_swiglu_q8_tB8_r1                                     100    24    1024       0      0   32
+shared_gateup_swiglu_q8_tB8_r2                                     127    28       0       0      0   32
+shared_gateup_swiglu_tB6                                            96    22       0       0      0   32
+shared_gateup_swiglu_tB7                                            91    22     384       0      0   32
+shared_gateup_swiglu_q8_tB3_r1                                      70    28     384       0      0   32
+shared_gateup_swiglu_q8_tB3_r2                                      92    34     768       0      0   32
+shared_gateup_swiglu_q8_tB6_r1                                      96    26     896       0      0   32
+shared_gateup_swiglu_q8_tB7_r1                                      94    24               0      0   32

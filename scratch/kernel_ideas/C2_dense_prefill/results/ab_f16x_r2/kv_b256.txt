@@ -1,0 +1,21 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[kb] LDS/CU 65536 B, regs/block 196608, L2 8388608 B
+[kb] shape kv b=256 M=512 K=5120 G=1 ldx=5184 working set ~6 MB
+[kb] flush 96 MB per timed block (total device ~102 MB)
+
+== kv b=256 M=512 K=5120 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemm_wmma_f16x                     105.32     104.60     106.08    1.000      56.3   12743.7
+cand q8_0_gemm_wmma_f16x_pf2                  95.72      95.20      96.44    0.909      62.0   14021.5
+cand q8_0_gemm_wmma_f16x_pf3                  95.28      94.68      96.00    0.905      62.2   14086.4
+cand q8_0_gemm_wmma_f16x_pf4                  95.04      94.44      95.84    0.902      62.4   14121.9
+cand q8_0_gemm_wmma_f16x_abl_noglobal         72.08      71.80      72.80    0.684      82.3   18620.4
+cand q8_0_gemm_wmma_f16x_abl_nolds            66.76      65.96      67.64    0.634      88.8   20104.2
+cand q8_0_gemm_wmma_f16x_abl_nowmma           78.44      77.72      78.92    0.745      75.6   17110.7
+KBJSON {"tag":"kv b=256 M=512 K=5120 G=1 flush96MB","variant":"base q8_0_gemm_wmma_f16x","med_us":105.321,"p10_us":104.602,"p90_us":106.082,"ratio":1.0000,"gbps":56.31,"graph":0,"flush":1}
+KBJSON {"tag":"kv b=256 M=512 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_pf2","med_us":95.723,"p10_us":95.201,"p90_us":96.442,"ratio":0.9089,"gbps":61.96,"graph":0,"flush":1}
+KBJSON {"tag":"kv b=256 M=512 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_pf3","med_us":95.282,"p10_us":94.682,"p90_us":96.002,"ratio":0.9047,"gbps":62.25,"graph":0,"flush":1}
+KBJSON {"tag":"kv b=256 M=512 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_pf4","med_us":95.042,"p10_us":94.442,"p90_us":95.841,"ratio":0.9024,"gbps":62.40,"graph":0,"flush":1}
+KBJSON {"tag":"kv b=256 M=512 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_abl_noglobal","med_us":72.081,"p10_us":71.801,"p90_us":72.801,"ratio":0.6844,"gbps":82.28,"graph":0,"flush":1}
+KBJSON {"tag":"kv b=256 M=512 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_abl_nolds","med_us":66.761,"p10_us":65.961,"p90_us":67.641,"ratio":0.6339,"gbps":88.84,"graph":0,"flush":1}
+KBJSON {"tag":"kv b=256 M=512 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_abl_nowmma","med_us":78.441,"p10_us":77.721,"p90_us":78.922,"ratio":0.7448,"gbps":75.61,"graph":0,"flush":1}

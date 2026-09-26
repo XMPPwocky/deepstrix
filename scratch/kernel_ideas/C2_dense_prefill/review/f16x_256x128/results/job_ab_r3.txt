@@ -1,0 +1,6 @@
+== qb b=512 M=32768 K=1280 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+base q8_0_gemm_wmma_f16x                     449.73     443.33     458.53    1.000     251.2   95502.1
+cand q8_0_gemm_wmma_f16x_256x128             403.80     399.17     411.48    0.898     279.8  106362.4
+== woa b=512 M=1024 K=4096 G=8 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+base q8_0_gemm_wmma_f16x                     362.80     355.24     370.76    1.000     237.0   94706.1
+cand q8_0_gemm_wmma_f16x_256x128             322.48     315.24     329.48    0.889     266.6  106547.1

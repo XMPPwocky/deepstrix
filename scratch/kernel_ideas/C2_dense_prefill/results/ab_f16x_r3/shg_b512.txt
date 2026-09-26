@@ -1,0 +1,19 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[kb] LDS/CU 65536 B, regs/block 196608, L2 8388608 B
+[kb] shape shg b=512 M=2304 K=5120 G=1 ldx=5184 working set ~22 MB
+[kb] flush 96 MB per timed block (total device ~118 MB)
+
+== shg b=512 M=2304 K=5120 G=1 flush96MB  (rounds=60 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemm_wmma_f16x                     165.28     164.32     166.68    1.000     136.1   73086.1
+cand q8_0_gemm_wmma_f16x_pf3                 151.68     151.00     153.12    0.918     148.3   79639.2
+cand q8_0_gemm_wmma_f16x_db                  155.44     154.24     156.76    0.940     144.7   77712.8
+cand q8_0_gemm_wmma_f16x_db_pf1              162.44     161.64     164.88    0.983     138.5   74363.9
+cand q8_0_gemm_wmma_f16x_db_pf3              162.64     161.64     164.56    0.984     138.3   74272.4
+cand q8_0_gemm_wmma_f16x_db_bn64             165.04     163.68     166.56    0.999     136.3   73192.4
+KBJSON {"tag":"shg b=512 M=2304 K=5120 G=1 flush96MB","variant":"base q8_0_gemm_wmma_f16x","med_us":165.279,"p10_us":164.319,"p90_us":166.679,"ratio":1.0000,"gbps":136.10,"graph":0,"flush":1}
+KBJSON {"tag":"shg b=512 M=2304 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_pf3","med_us":151.679,"p10_us":150.999,"p90_us":153.119,"ratio":0.9177,"gbps":148.31,"graph":0,"flush":1}
+KBJSON {"tag":"shg b=512 M=2304 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_db","med_us":155.439,"p10_us":154.239,"p90_us":156.759,"ratio":0.9405,"gbps":144.72,"graph":0,"flush":1}
+KBJSON {"tag":"shg b=512 M=2304 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_db_pf1","med_us":162.439,"p10_us":161.639,"p90_us":164.879,"ratio":0.9828,"gbps":138.48,"graph":0,"flush":1}
+KBJSON {"tag":"shg b=512 M=2304 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_db_pf3","med_us":162.639,"p10_us":161.639,"p90_us":164.559,"ratio":0.9840,"gbps":138.31,"graph":0,"flush":1}
+KBJSON {"tag":"shg b=512 M=2304 K=5120 G=1 flush96MB","variant":"cand q8_0_gemm_wmma_f16x_db_bn64","med_us":165.039,"p10_us":163.679,"p90_us":166.559,"ratio":0.9985,"gbps":136.30,"graph":0,"flush":1}

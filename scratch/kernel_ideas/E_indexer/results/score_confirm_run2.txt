@@ -1,0 +1,134 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[score] keys 75.2 MB (235000 rows x 4 stores), scores 5.9 MB, flush 64 MB
+CMP score_mw_pf_qreg n=65536 b=1       n=65536 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"score_mw_pf_qreg n=65536 b=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP s2_w8n8_pf_hw n=65536 b=1          n=65536 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"s2_w8n8_pf_hw n=65536 b=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== score n=65536 b=1 COLD keys (flush 64MB), direct inner=1  (rounds=50 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                          32.76      32.16      33.76    1.000     168.0   16388.0
+cand score_mw_pf_qreg                         22.84      22.52      23.80    0.697     241.0   23505.7
+cand s2_w8n8_pf_hw                            20.80      19.72      22.16    0.635     264.7   25811.1
+KBJSON {"tag":"score n=65536 b=1 COLD keys (flush 64MB), direct inner=1","variant":"base batched_mw_e2m1","med_us":32.760,"p10_us":32.160,"p90_us":33.760,"ratio":1.0000,"gbps":168.04,"graph":0,"flush":1}
+KBJSON {"tag":"score n=65536 b=1 COLD keys (flush 64MB), direct inner=1","variant":"cand score_mw_pf_qreg","med_us":22.840,"p10_us":22.520,"p90_us":23.800,"ratio":0.6972,"gbps":241.03,"graph":0,"flush":1}
+KBJSON {"tag":"score n=65536 b=1 COLD keys (flush 64MB), direct inner=1","variant":"cand s2_w8n8_pf_hw","med_us":20.800,"p10_us":19.720,"p90_us":22.160,"ratio":0.6349,"gbps":264.66,"graph":0,"flush":1}
+
+== score n=65536 b=1 WARM keys (bound), graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                          25.87      25.70      26.02    1.000     212.8   20751.0
+cand score_mw_pf_qreg                         15.65      15.62      15.70    0.605     351.8   34309.2
+cand s2_w8n8_pf_hw                            14.43      14.38      14.50    0.558     381.4   37200.0
+KBJSON {"tag":"score n=65536 b=1 WARM keys (bound), graph inner=5","variant":"base batched_mw_e2m1","med_us":25.872,"p10_us":25.704,"p90_us":26.024,"ratio":1.0000,"gbps":212.78,"graph":1,"flush":0}
+KBJSON {"tag":"score n=65536 b=1 WARM keys (bound), graph inner=5","variant":"cand score_mw_pf_qreg","med_us":15.648,"p10_us":15.616,"p90_us":15.704,"ratio":0.6048,"gbps":351.80,"graph":1,"flush":0}
+KBJSON {"tag":"score n=65536 b=1 WARM keys (bound), graph inner=5","variant":"cand s2_w8n8_pf_hw","med_us":14.432,"p10_us":14.384,"p90_us":14.496,"ratio":0.5578,"gbps":381.45,"graph":1,"flush":0}
+CMP score_mw_pf_qreg n=65536 b=4       n=262144 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"score_mw_pf_qreg n=65536 b=4","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP s2_w8n8_pf_hw n=65536 b=4          n=262144 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"s2_w8n8_pf_hw n=65536 b=4","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== score n=65536 b=4 COLD keys (flush 64MB), direct inner=1  (rounds=50 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                          84.76      83.68      85.52    1.000     259.8   25336.0
+cand score_mw_pf_qreg                         49.84      48.00      50.40    0.588     441.8   43087.6
+cand s2_w8n8_pf_hw                            45.08      42.96      46.00    0.532     488.5   47636.1
+KBJSON {"tag":"score n=65536 b=4 COLD keys (flush 64MB), direct inner=1","variant":"base batched_mw_e2m1","med_us":84.760,"p10_us":83.681,"p90_us":85.520,"ratio":1.0000,"gbps":259.79,"graph":0,"flush":1}
+KBJSON {"tag":"score n=65536 b=4 COLD keys (flush 64MB), direct inner=1","variant":"cand score_mw_pf_qreg","med_us":49.840,"p10_us":48.000,"p90_us":50.401,"ratio":0.5880,"gbps":441.82,"graph":0,"flush":1}
+KBJSON {"tag":"score n=65536 b=4 COLD keys (flush 64MB), direct inner=1","variant":"cand s2_w8n8_pf_hw","med_us":45.081,"p10_us":42.960,"p90_us":46.000,"ratio":0.5319,"gbps":488.46,"graph":0,"flush":1}
+
+== score n=65536 b=4 WARM keys (bound), graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                          79.46      79.38      79.51    1.000     277.1   27027.3
+cand score_mw_pf_qreg                         37.12      37.06      37.19    0.467     593.2   57852.5
+cand s2_w8n8_pf_hw                            34.58      34.54      34.66    0.435     636.7   62094.7
+KBJSON {"tag":"score n=65536 b=4 WARM keys (bound), graph inner=5","variant":"base batched_mw_e2m1","med_us":79.456,"p10_us":79.376,"p90_us":79.512,"ratio":1.0000,"gbps":277.14,"graph":1,"flush":0}
+KBJSON {"tag":"score n=65536 b=4 WARM keys (bound), graph inner=5","variant":"cand score_mw_pf_qreg","med_us":37.120,"p10_us":37.056,"p90_us":37.192,"ratio":0.4672,"gbps":593.21,"graph":1,"flush":0}
+KBJSON {"tag":"score n=65536 b=4 WARM keys (bound), graph inner=5","variant":"cand s2_w8n8_pf_hw","med_us":34.584,"p10_us":34.536,"p90_us":34.656,"ratio":0.4353,"gbps":636.71,"graph":1,"flush":0}
+CMP score_mw_pf_qreg n=131072 b=1      n=131072 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"score_mw_pf_qreg n=131072 b=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP s2_w8n8_pf_hw n=131072 b=1         n=131072 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"s2_w8n8_pf_hw n=131072 b=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== score n=131072 b=1 COLD keys (flush 64MB), direct inner=1  (rounds=50 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                          46.08      45.92      46.36    1.000     238.9   23301.7
+cand score_mw_pf_qreg                         27.04      26.84      27.32    0.587     407.2   39709.4
+cand s2_w8n8_pf_hw                            25.16      25.04      25.32    0.546     437.6   42676.5
+KBJSON {"tag":"score n=131072 b=1 COLD keys (flush 64MB), direct inner=1","variant":"base batched_mw_e2m1","med_us":46.080,"p10_us":45.920,"p90_us":46.360,"ratio":1.0000,"gbps":238.93,"graph":0,"flush":1}
+KBJSON {"tag":"score n=131072 b=1 COLD keys (flush 64MB), direct inner=1","variant":"cand score_mw_pf_qreg","med_us":27.040,"p10_us":26.841,"p90_us":27.320,"ratio":0.5868,"gbps":407.18,"graph":0,"flush":1}
+KBJSON {"tag":"score n=131072 b=1 COLD keys (flush 64MB), direct inner=1","variant":"cand s2_w8n8_pf_hw","med_us":25.160,"p10_us":25.040,"p90_us":25.320,"ratio":0.5460,"gbps":437.60,"graph":0,"flush":1}
+
+== score n=131072 b=1 WARM keys (bound), graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                          42.15      42.09      42.26    1.000     261.2   25473.1
+cand score_mw_pf_qreg                         22.74      22.69      22.78    0.539     484.3   47226.1
+cand s2_w8n8_pf_hw                            21.38      21.34      21.42    0.507     514.9   50211.9
+KBJSON {"tag":"score n=131072 b=1 WARM keys (bound), graph inner=5","variant":"base batched_mw_e2m1","med_us":42.152,"p10_us":42.088,"p90_us":42.256,"ratio":1.0000,"gbps":261.20,"graph":1,"flush":0}
+KBJSON {"tag":"score n=131072 b=1 WARM keys (bound), graph inner=5","variant":"cand score_mw_pf_qreg","med_us":22.736,"p10_us":22.688,"p90_us":22.776,"ratio":0.5394,"gbps":484.25,"graph":1,"flush":0}
+KBJSON {"tag":"score n=131072 b=1 WARM keys (bound), graph inner=5","variant":"cand s2_w8n8_pf_hw","med_us":21.384,"p10_us":21.336,"p90_us":21.424,"ratio":0.5073,"gbps":514.87,"graph":1,"flush":0}
+CMP score_mw_pf_qreg n=131072 b=4      n=524288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"score_mw_pf_qreg n=131072 b=4","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP s2_w8n8_pf_hw n=131072 b=4         n=524288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"s2_w8n8_pf_hw n=131072 b=4","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== score n=131072 b=4 COLD keys (flush 64MB), direct inner=1  (rounds=50 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         157.72     157.16     158.20    1.000     279.2   27231.6
+cand score_mw_pf_qreg                         87.52      85.92      88.92    0.555     503.2   49074.1
+cand s2_w8n8_pf_hw                            83.32      82.16      84.68    0.528     528.6   51547.9
+KBJSON {"tag":"score n=131072 b=4 COLD keys (flush 64MB), direct inner=1","variant":"base batched_mw_e2m1","med_us":157.720,"p10_us":157.161,"p90_us":158.200,"ratio":1.0000,"gbps":279.23,"graph":0,"flush":1}
+KBJSON {"tag":"score n=131072 b=4 COLD keys (flush 64MB), direct inner=1","variant":"cand score_mw_pf_qreg","med_us":87.520,"p10_us":85.920,"p90_us":88.920,"ratio":0.5549,"gbps":503.20,"graph":0,"flush":1}
+KBJSON {"tag":"score n=131072 b=4 COLD keys (flush 64MB), direct inner=1","variant":"cand s2_w8n8_pf_hw","med_us":83.320,"p10_us":82.160,"p90_us":84.680,"ratio":0.5283,"gbps":528.57,"graph":0,"flush":1}
+
+== score n=131072 b=4 WARM keys (bound), graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         152.90     152.67     153.09    1.000     288.0   28090.7
+cand score_mw_pf_qreg                         66.69      66.45      66.82    0.436     660.4   64403.7
+cand s2_w8n8_pf_hw                            60.94      60.57      61.07    0.399     722.7   70483.0
+KBJSON {"tag":"score n=131072 b=4 WARM keys (bound), graph inner=5","variant":"base batched_mw_e2m1","med_us":152.896,"p10_us":152.672,"p90_us":153.088,"ratio":1.0000,"gbps":288.04,"graph":1,"flush":0}
+KBJSON {"tag":"score n=131072 b=4 WARM keys (bound), graph inner=5","variant":"cand score_mw_pf_qreg","med_us":66.688,"p10_us":66.448,"p90_us":66.816,"ratio":0.4362,"gbps":660.39,"graph":1,"flush":0}
+KBJSON {"tag":"score n=131072 b=4 WARM keys (bound), graph inner=5","variant":"cand s2_w8n8_pf_hw","med_us":60.936,"p10_us":60.568,"p90_us":61.072,"ratio":0.3985,"gbps":722.73,"graph":1,"flush":0}
+CMP score_mw_pf_qreg n=235000 b=1      n=235520 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"score_mw_pf_qreg n=235000 b=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP s2_w8n8_pf_hw n=235000 b=1         n=235520 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"s2_w8n8_pf_hw n=235000 b=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== score n=235000 b=1 COLD keys (flush 64MB), direct inner=1  (rounds=50 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                          84.12      82.88      84.56    1.000     234.7   22885.4
+cand score_mw_pf_qreg                         46.44      45.24      46.88    0.552     425.1   41453.0
+cand s2_w8n8_pf_hw                            43.80      42.48      44.20    0.521     450.7   43951.5
+KBJSON {"tag":"score n=235000 b=1 COLD keys (flush 64MB), direct inner=1","variant":"base batched_mw_e2m1","med_us":84.120,"p10_us":82.881,"p90_us":84.561,"ratio":1.0000,"gbps":234.69,"graph":0,"flush":1}
+KBJSON {"tag":"score n=235000 b=1 COLD keys (flush 64MB), direct inner=1","variant":"cand score_mw_pf_qreg","med_us":46.441,"p10_us":45.241,"p90_us":46.880,"ratio":0.5521,"gbps":425.10,"graph":0,"flush":1}
+KBJSON {"tag":"score n=235000 b=1 COLD keys (flush 64MB), direct inner=1","variant":"cand s2_w8n8_pf_hw","med_us":43.801,"p10_us":42.480,"p90_us":44.200,"ratio":0.5207,"gbps":450.72,"graph":0,"flush":1}
+
+== score n=235000 b=1 WARM keys (bound), graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                          79.44      79.31      79.64    1.000     248.5   24233.6
+cand score_mw_pf_qreg                         36.66      36.54      36.73    0.462     538.5   52506.8
+cand s2_w8n8_pf_hw                            34.14      34.06      34.24    0.430     578.3   56395.6
+KBJSON {"tag":"score n=235000 b=1 WARM keys (bound), graph inner=5","variant":"base batched_mw_e2m1","med_us":79.440,"p10_us":79.312,"p90_us":79.640,"ratio":1.0000,"gbps":248.51,"graph":1,"flush":0}
+KBJSON {"tag":"score n=235000 b=1 WARM keys (bound), graph inner=5","variant":"cand score_mw_pf_qreg","med_us":36.664,"p10_us":36.536,"p90_us":36.728,"ratio":0.4615,"gbps":538.46,"graph":1,"flush":0}
+KBJSON {"tag":"score n=235000 b=1 WARM keys (bound), graph inner=5","variant":"cand s2_w8n8_pf_hw","med_us":34.136,"p10_us":34.056,"p90_us":34.240,"ratio":0.4297,"gbps":578.34,"graph":1,"flush":0}
+CMP score_mw_pf_qreg n=235000 b=4      n=942080 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"score_mw_pf_qreg n=235000 b=4","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP s2_w8n8_pf_hw n=235000 b=4         n=942080 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"s2_w8n8_pf_hw n=235000 b=4","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== score n=235000 b=4 COLD keys (flush 64MB), direct inner=1  (rounds=50 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         275.80     275.56     276.08    1.000     286.3   27920.4
+cand score_mw_pf_qreg                        143.68     143.24     144.48    0.521     549.6   53594.3
+cand s2_w8n8_pf_hw                           139.48     138.84     140.52    0.506     566.2   55208.5
+KBJSON {"tag":"score n=235000 b=4 COLD keys (flush 64MB), direct inner=1","variant":"base batched_mw_e2m1","med_us":275.801,"p10_us":275.561,"p90_us":276.080,"ratio":1.0000,"gbps":286.32,"graph":0,"flush":1}
+KBJSON {"tag":"score n=235000 b=4 COLD keys (flush 64MB), direct inner=1","variant":"cand score_mw_pf_qreg","med_us":143.681,"p10_us":143.241,"p90_us":144.480,"ratio":0.5210,"gbps":549.61,"graph":0,"flush":1}
+KBJSON {"tag":"score n=235000 b=4 COLD keys (flush 64MB), direct inner=1","variant":"cand s2_w8n8_pf_hw","med_us":139.480,"p10_us":138.841,"p90_us":140.521,"ratio":0.5057,"gbps":566.16,"graph":0,"flush":1}
+
+== score n=235000 b=4 WARM keys (bound), graph inner=5  (rounds=50 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         273.44     273.00     274.72    1.000     288.8   28161.4
+cand score_mw_pf_qreg                        132.38     131.49     134.04    0.484     596.5   58171.1
+cand s2_w8n8_pf_hw                           127.49     126.71     129.29    0.466     619.4   60401.5
+KBJSON {"tag":"score n=235000 b=4 WARM keys (bound), graph inner=5","variant":"base batched_mw_e2m1","med_us":273.441,"p10_us":273.001,"p90_us":274.721,"ratio":1.0000,"gbps":288.80,"graph":1,"flush":0}
+KBJSON {"tag":"score n=235000 b=4 WARM keys (bound), graph inner=5","variant":"cand score_mw_pf_qreg","med_us":132.376,"p10_us":131.488,"p90_us":134.040,"ratio":0.4841,"gbps":596.54,"graph":1,"flush":0}
+KBJSON {"tag":"score n=235000 b=4 WARM keys (bound), graph inner=5","variant":"cand s2_w8n8_pf_hw","med_us":127.488,"p10_us":126.712,"p90_us":129.288,"ratio":0.4662,"gbps":619.42,"graph":1,"flush":0}

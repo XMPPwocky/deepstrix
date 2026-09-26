@@ -1,0 +1,20 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[setup] B=512 n_exp=96 members=793 touched=96 max_group=17 n_wi_exact=96 n_wi_bound=480  mean members/expert=8.3
+ROOFLINE gate+up: 1.215 GB (weights 1.203 GB) -> 5.28 ms at 230 GB/s; 37.4 GFLOP
+ROOFLINE down:    0.620 GB (weights 0.602 GB) -> 2.70 ms at 230 GB/s; 18.7 GFLOP
+SCALE: x4.00 to a full 384-expert layer (this launch touches 96 experts)
+
+== kwide ablations B=512 n_exp=96 members=793 touched=96  (rounds=20 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide gate+up (prod)                        8408.77    8325.56    8459.61    1.000     144.5    4449.9
+kw_abl_full                                 8435.83    8355.72    8506.71    1.003     144.0    4435.7
+kw_abl_nodot                                7552.41    7509.47    7622.25    0.898     160.9    4954.5
+kw_abl_noload                               6229.23    6103.59    6339.58    0.741     195.1    6006.9
+kw_abl_nostage                              1813.36    1718.43    1825.50    0.216     670.1   20634.8
+kw_abl_nolut                                8008.59    7924.34    8114.01    0.952     151.7    4672.3
+KBJSON {"tag":"kwide ablations B=512 n_exp=96 members=793 touched=96","variant":"kwide gate+up (prod)","med_us":8408.774,"p10_us":8325.559,"p90_us":8459.612,"ratio":1.0000,"gbps":144.51,"graph":0,"flush":0}
+KBJSON {"tag":"kwide ablations B=512 n_exp=96 members=793 touched=96","variant":"kw_abl_full","med_us":8435.834,"p10_us":8355.720,"p90_us":8506.712,"ratio":1.0032,"gbps":144.05,"graph":0,"flush":0}
+KBJSON {"tag":"kwide ablations B=512 n_exp=96 members=793 touched=96","variant":"kw_abl_nodot","med_us":7552.412,"p10_us":7509.474,"p90_us":7622.250,"ratio":0.8982,"gbps":160.90,"graph":0,"flush":0}
+KBJSON {"tag":"kwide ablations B=512 n_exp=96 members=793 touched=96","variant":"kw_abl_noload","med_us":6229.230,"p10_us":6103.595,"p90_us":6339.585,"ratio":0.7408,"gbps":195.08,"graph":0,"flush":0}
+KBJSON {"tag":"kwide ablations B=512 n_exp=96 members=793 touched=96","variant":"kw_abl_nostage","med_us":1813.362,"p10_us":1718.426,"p90_us":1825.501,"ratio":0.2157,"gbps":670.13,"graph":0,"flush":0}
+KBJSON {"tag":"kwide ablations B=512 n_exp=96 members=793 touched=96","variant":"kw_abl_nolut","med_us":8008.593,"p10_us":7924.336,"p90_us":8114.008,"ratio":0.9524,"gbps":151.73,"graph":0,"flush":0}

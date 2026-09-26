@@ -1,0 +1,33 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[h] pool: 16 experts x 18.8 MB = 301 MB on device
+[h] b=1 E=4 ppr=3: members/call=3.0 distinct experts/call=4 n_wi exact=3 bound=6
+[h] distinct experts actually read per call (avg over 8 selections): 3.00
+base out: 5120/5120 nonzero, 0 nonfinite, out[0..3]=132.093 -64.9207 195.69 -131.129
+CMP twin(hetsplit b=1 per row) mid vs base n=13824 bitexact=no bit_diff=4623 nonfinite=0 max_abs=1.717e-05 max_rel=4.916e-04 rmse=1.272e-06 rel_rmse=1.923e-07 worst_idx=5372
+KBJSON {"cmp":"twin(hetsplit b=1 per row) mid vs base","bitexact":0,"bit_diff":4623,"nonfinite":0,"max_abs":1.7166e-05,"rel_rmse":1.9234e-07}
+CMP twin(hetsplit b=1 per row) out vs base n=5120 bitexact=no bit_diff=3762 nonfinite=0 max_abs=1.831e-04 max_rel=5.171e-04 rmse=2.469e-05 rel_rmse=1.055e-07 worst_idx=1199
+KBJSON {"cmp":"twin(hetsplit b=1 per row) out vs base","bitexact":0,"bit_diff":3762,"nonfinite":0,"max_abs":1.8311e-04,"rel_rmse":1.0548e-07}
+CMP kwide_c8.c8 mid vs base            n=13824 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"kwide_c8.c8 mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP kwide_c8.c8 partials vs base       n=30720 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"kwide_c8.c8 partials vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP kwide_c8.c8 out vs base            n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"kwide_c8.c8 out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP kwide_c8.c8 out over 8 selections: worst bit_diff=0 worst rel_rmse=0.000e+00
+CMP base.c8 mid vs base                n=13824 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"base.c8 mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP base.c8 partials vs base           n=30720 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"base.c8 partials vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP base.c8 out vs base                n=5120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"base.c8 out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP base.c8 out over 8 selections: worst bit_diff=0 worst rel_rmse=0.000e+00
+
+== b=1 E=4 ppr=3 P=16 gbound=384 bound-grid cold-rotating  (rounds=40 inner=8 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base chain (builders+kwide+q8k+kwide2+reduce)     319.45     317.60     322.17    1.000     176.6     664.7
+cand kwide_c8.c8                             320.26     318.33     324.11    1.003     176.1     663.0
+cand base.c8                                 319.30     317.72     322.58    1.000     176.6     665.0
+KBJSON {"tag":"b=1 E=4 ppr=3 P=16 gbound=384 bound-grid cold-rotating","variant":"base chain (builders+kwide+q8k+kwide2+reduce)","med_us":319.447,"p10_us":317.602,"p90_us":322.167,"ratio":1.0000,"gbps":176.56,"graph":1,"flush":0}
+KBJSON {"tag":"b=1 E=4 ppr=3 P=16 gbound=384 bound-grid cold-rotating","variant":"cand kwide_c8.c8","med_us":320.262,"p10_us":318.327,"p90_us":324.111,"ratio":1.0026,"gbps":176.11,"graph":1,"flush":0}
+KBJSON {"tag":"b=1 E=4 ppr=3 P=16 gbound=384 bound-grid cold-rotating","variant":"cand base.c8","med_us":319.297,"p10_us":317.722,"p90_us":322.576,"ratio":0.9995,"gbps":176.64,"graph":1,"flush":0}
+roofline: 3.00 distinct experts x 18.8 MB = 56.4 MB/call -> 263.6 us at 214 GB/s (244.2 us at 231)

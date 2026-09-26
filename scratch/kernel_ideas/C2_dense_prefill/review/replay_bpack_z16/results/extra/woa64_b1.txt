@@ -1,0 +1,9 @@
+CMP woa64 b=1 q8_0_grouped_gemv_bpack_z16 n=8192 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"woa64 b=1 q8_0_grouped_gemv_bpack_z16","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== woa64 b=1 M=1024 K=4096 G=8 flush96MB  (rounds=20 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_grouped_gemv_batched               113.60     112.96     115.24    1.000     314.4     590.7
+cand q8_0_grouped_gemv_bpack_z16             115.76     112.16     117.20    1.019     308.5     579.7
+KBJSON {"tag":"woa64 b=1 M=1024 K=4096 G=8 flush96MB","variant":"base q8_0_grouped_gemv_batched","med_us":113.602,"p10_us":112.962,"p90_us":115.241,"ratio":1.0000,"gbps":314.41,"graph":0,"flush":1}
+KBJSON {"tag":"woa64 b=1 M=1024 K=4096 G=8 flush96MB","variant":"cand q8_0_grouped_gemv_bpack_z16","med_us":115.762,"p10_us":112.161,"p90_us":117.202,"ratio":1.0190,"gbps":308.54,"graph":0,"flush":1}

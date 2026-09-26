@@ -1,0 +1,652 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMPX eng ilp512 (512) n=20000 b=512 dist=0 diff=0 OK
+CMPX probe ilp256 U8 (256) n=20000 b=512 dist=0 diff=0 OK
+CMPX probe ilp256 U4 (256) n=20000 b=512 dist=0 diff=0 OK
+CMP n=20000 b=512 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=3f92e9c4/3f92e9c4  OK
+CMPX eng ilp512 (512) n=20000 b=512 dist=1 diff=0 OK
+CMPX probe ilp256 U8 (256) n=20000 b=512 dist=1 diff=0 OK
+CMPX probe ilp256 U4 (256) n=20000 b=512 dist=1 diff=0 OK
+CMP n=20000 b=512 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=3f9fffff/3f9fffff  OK
+CMPX eng ilp512 (512) n=20000 b=512 dist=2 diff=0 OK
+CMPX probe ilp256 U8 (256) n=20000 b=512 dist=2 diff=0 OK
+CMPX probe ilp256 U4 (256) n=20000 b=512 dist=2 diff=0 OK
+CMP n=20000 b=512 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMPX eng ilp512 (512) n=20000 b=512 dist=3 diff=0 OK
+CMPX probe ilp256 U8 (256) n=20000 b=512 dist=3 diff=0 OK
+CMPX probe ilp256 U4 (256) n=20000 b=512 dist=3 diff=0 OK
+CMP n=20000 b=512 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=007fffff/007fffff  OK
+CMPX eng ilp512 (512) n=20000 b=512 dist=4 diff=0 OK
+CMPX probe ilp256 U8 (256) n=20000 b=512 dist=4 diff=0 OK
+CMPX probe ilp256 U4 (256) n=20000 b=512 dist=4 diff=0 OK
+CMP n=20000 b=512 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=403fffff/403fffff  OK
+CMPX eng ilp512 (512) n=20000 b=512 dist=5 diff=0 OK
+CMPX probe ilp256 U8 (256) n=20000 b=512 dist=5 diff=0 OK
+CMPX probe ilp256 U4 (256) n=20000 b=512 dist=5 diff=0 OK
+CMP n=20000 b=512 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=0dc779e7/0dc779e7  OK
+
+== review threshold n=20000 b=512 graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                79.53      79.37      79.84    1.000     257.5       0.0
+cand candidate_threshold_ilp (1024)          213.90     213.36     214.96    2.690      95.7       0.0
+eng ilp512 (512)                             125.19     124.86     125.57    1.574     163.6       0.0
+probe ilp256 U8 (256)                         75.34      75.18      75.62    0.947     271.8       0.0
+probe ilp256 U4 (256)                         76.22      76.05      76.42    0.958     268.7       0.0
+KBJSON {"tag":"review threshold n=20000 b=512 graph inner=5","variant":"base candidate_threshold (256)","med_us":79.529,"p10_us":79.369,"p90_us":79.841,"ratio":1.0000,"gbps":257.52,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=20000 b=512 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":213.898,"p10_us":213.362,"p90_us":214.962,"ratio":2.6896,"gbps":95.75,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=20000 b=512 graph inner=5","variant":"eng ilp512 (512)","med_us":125.193,"p10_us":124.857,"p90_us":125.569,"ratio":1.5742,"gbps":163.59,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=20000 b=512 graph inner=5","variant":"probe ilp256 U8 (256)","med_us":75.345,"p10_us":75.185,"p90_us":75.617,"ratio":0.9474,"gbps":271.82,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=20000 b=512 graph inner=5","variant":"probe ilp256 U4 (256)","med_us":76.217,"p10_us":76.049,"p90_us":76.417,"ratio":0.9584,"gbps":268.71,"graph":1,"flush":0}
+
+== review threshold n=20000 b=512 DIRECT inner=1  (rounds=30 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                82.16      81.88      82.56    1.000     249.3       0.0
+cand candidate_threshold_ilp (1024)          215.20     214.72     217.08    2.619      95.2       0.0
+eng ilp512 (512)                             127.20     126.88     127.60    1.548     161.0       0.0
+probe ilp256 U8 (256)                         78.04      77.72      78.24    0.950     262.4       0.0
+probe ilp256 U4 (256)                         78.92      78.52      79.24    0.961     259.5       0.0
+KBJSON {"tag":"review threshold n=20000 b=512 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":82.161,"p10_us":81.880,"p90_us":82.561,"ratio":1.0000,"gbps":249.27,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=20000 b=512 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":215.203,"p10_us":214.722,"p90_us":217.083,"ratio":2.6193,"gbps":95.17,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=20000 b=512 DIRECT inner=1","variant":"eng ilp512 (512)","med_us":127.201,"p10_us":126.882,"p90_us":127.601,"ratio":1.5482,"gbps":161.01,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=20000 b=512 DIRECT inner=1","variant":"probe ilp256 U8 (256)","med_us":78.041,"p10_us":77.721,"p90_us":78.241,"ratio":0.9499,"gbps":262.43,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=20000 b=512 DIRECT inner=1","variant":"probe ilp256 U4 (256)","med_us":78.921,"p10_us":78.521,"p90_us":79.241,"ratio":0.9606,"gbps":259.50,"graph":0,"flush":0}
+CMPX eng ilp512 (512) n=30000 b=512 dist=0 diff=0 OK
+CMPX probe ilp256 U8 (256) n=30000 b=512 dist=0 diff=0 OK
+CMPX probe ilp256 U4 (256) n=30000 b=512 dist=0 diff=0 OK
+CMP n=30000 b=512 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=40d8f5b7/40d8f5b7  OK
+CMPX eng ilp512 (512) n=30000 b=512 dist=1 diff=0 OK
+CMPX probe ilp256 U8 (256) n=30000 b=512 dist=1 diff=0 OK
+CMPX probe ilp256 U4 (256) n=30000 b=512 dist=1 diff=0 OK
+CMP n=30000 b=512 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=40ffffff/40ffffff  OK
+CMPX eng ilp512 (512) n=30000 b=512 dist=2 diff=0 OK
+CMPX probe ilp256 U8 (256) n=30000 b=512 dist=2 diff=0 OK
+CMPX probe ilp256 U4 (256) n=30000 b=512 dist=2 diff=0 OK
+CMP n=30000 b=512 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMPX eng ilp512 (512) n=30000 b=512 dist=3 diff=0 OK
+CMPX probe ilp256 U8 (256) n=30000 b=512 dist=3 diff=0 OK
+CMPX probe ilp256 U4 (256) n=30000 b=512 dist=3 diff=0 OK
+CMP n=30000 b=512 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=007fffff/007fffff  OK
+CMPX eng ilp512 (512) n=30000 b=512 dist=4 diff=0 OK
+CMPX probe ilp256 U8 (256) n=30000 b=512 dist=4 diff=0 OK
+CMPX probe ilp256 U4 (256) n=30000 b=512 dist=4 diff=0 OK
+CMP n=30000 b=512 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=40ffffff/40ffffff  OK
+CMPX eng ilp512 (512) n=30000 b=512 dist=5 diff=0 OK
+CMPX probe ilp256 U8 (256) n=30000 b=512 dist=5 diff=0 OK
+CMPX probe ilp256 U4 (256) n=30000 b=512 dist=5 diff=0 OK
+CMP n=30000 b=512 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=0f52d005/0f52d005  OK
+
+== review threshold n=30000 b=512 graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                96.01      95.79      96.46    1.000     320.0       0.0
+cand candidate_threshold_ilp (1024)          241.86     240.69     242.71    2.519     127.0       0.0
+eng ilp512 (512)                             144.71     144.07     145.55    1.507     212.3       0.0
+probe ilp256 U8 (256)                         91.00      90.70      91.25    0.948     337.6       0.0
+probe ilp256 U4 (256)                         90.56      90.16      90.90    0.943     339.2       0.0
+KBJSON {"tag":"review threshold n=30000 b=512 graph inner=5","variant":"base candidate_threshold (256)","med_us":96.009,"p10_us":95.793,"p90_us":96.465,"ratio":1.0000,"gbps":319.97,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=512 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":241.859,"p10_us":240.691,"p90_us":242.715,"ratio":2.5191,"gbps":127.02,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=512 graph inner=5","variant":"eng ilp512 (512)","med_us":144.706,"p10_us":144.074,"p90_us":145.554,"ratio":1.5072,"gbps":212.29,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=512 graph inner=5","variant":"probe ilp256 U8 (256)","med_us":91.001,"p10_us":90.697,"p90_us":91.249,"ratio":0.9478,"gbps":337.58,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=512 graph inner=5","variant":"probe ilp256 U4 (256)","med_us":90.561,"p10_us":90.161,"p90_us":90.905,"ratio":0.9433,"gbps":339.22,"graph":1,"flush":0}
+
+== review threshold n=30000 b=512 DIRECT inner=1  (rounds=30 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                98.20      97.76      98.64    1.000     312.8       0.0
+cand candidate_threshold_ilp (1024)          241.36     239.92     244.84    2.458     127.3       0.0
+eng ilp512 (512)                             145.76     145.28     147.36    1.484     210.8       0.0
+probe ilp256 U8 (256)                         93.32      92.92      93.96    0.950     329.2       0.0
+probe ilp256 U4 (256)                         92.84      92.36      93.44    0.945     330.9       0.0
+KBJSON {"tag":"review threshold n=30000 b=512 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":98.200,"p10_us":97.761,"p90_us":98.641,"ratio":1.0000,"gbps":312.83,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=512 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":241.363,"p10_us":239.922,"p90_us":244.842,"ratio":2.4579,"gbps":127.28,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=512 DIRECT inner=1","variant":"eng ilp512 (512)","med_us":145.761,"p10_us":145.281,"p90_us":147.361,"ratio":1.4843,"gbps":210.76,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=512 DIRECT inner=1","variant":"probe ilp256 U8 (256)","med_us":93.321,"p10_us":92.921,"p90_us":93.961,"ratio":0.9503,"gbps":329.19,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=512 DIRECT inner=1","variant":"probe ilp256 U4 (256)","med_us":92.841,"p10_us":92.361,"p90_us":93.441,"ratio":0.9454,"gbps":330.89,"graph":0,"flush":0}
+CMPX eng ilp512 (512) n=50000 b=512 dist=0 diff=0 OK
+CMPX probe ilp256 U8 (256) n=50000 b=512 dist=0 diff=0 OK
+CMPX probe ilp256 U4 (256) n=50000 b=512 dist=0 diff=0 OK
+CMP n=50000 b=512 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfe18ef0/bfe18ef0  OK
+CMPX eng ilp512 (512) n=50000 b=512 dist=1 diff=0 OK
+CMPX probe ilp256 U8 (256) n=50000 b=512 dist=1 diff=0 OK
+CMPX probe ilp256 U4 (256) n=50000 b=512 dist=1 diff=0 OK
+CMP n=50000 b=512 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0000000/c0000000  OK
+CMPX eng ilp512 (512) n=50000 b=512 dist=2 diff=0 OK
+CMPX probe ilp256 U8 (256) n=50000 b=512 dist=2 diff=0 OK
+CMPX probe ilp256 U4 (256) n=50000 b=512 dist=2 diff=0 OK
+CMP n=50000 b=512 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMPX eng ilp512 (512) n=50000 b=512 dist=3 diff=0 OK
+CMPX probe ilp256 U8 (256) n=50000 b=512 dist=3 diff=0 OK
+CMPX probe ilp256 U4 (256) n=50000 b=512 dist=3 diff=0 OK
+CMP n=50000 b=512 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=4038639c/4038639c  OK
+CMPX eng ilp512 (512) n=50000 b=512 dist=4 diff=0 OK
+CMPX probe ilp256 U8 (256) n=50000 b=512 dist=4 diff=0 OK
+CMPX probe ilp256 U4 (256) n=50000 b=512 dist=4 diff=0 OK
+CMP n=50000 b=512 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bf000000/bf000000  OK
+CMPX eng ilp512 (512) n=50000 b=512 dist=5 diff=0 OK
+CMPX probe ilp256 U8 (256) n=50000 b=512 dist=5 diff=0 OK
+CMPX probe ilp256 U4 (256) n=50000 b=512 dist=5 diff=0 OK
+CMP n=50000 b=512 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f1ad5fbe/f1ad5fbe  OK
+
+== review threshold n=50000 b=512 graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                86.06      85.57      86.34    1.000     595.0       0.0
+cand candidate_threshold_ilp (1024)          182.24     181.62     183.59    2.118     280.9       0.0
+eng ilp512 (512)                             110.98     110.47     111.48    1.290     461.4       0.0
+probe ilp256 U8 (256)                         74.65      74.29      74.84    0.867     685.9       0.0
+probe ilp256 U4 (256)                         75.26      75.02      75.50    0.875     680.3       0.0
+KBJSON {"tag":"review threshold n=50000 b=512 graph inner=5","variant":"base candidate_threshold (256)","med_us":86.057,"p10_us":85.569,"p90_us":86.345,"ratio":1.0000,"gbps":594.96,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=50000 b=512 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":182.242,"p10_us":181.618,"p90_us":183.594,"ratio":2.1177,"gbps":280.95,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=50000 b=512 graph inner=5","variant":"eng ilp512 (512)","med_us":110.977,"p10_us":110.465,"p90_us":111.481,"ratio":1.2896,"gbps":461.36,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=50000 b=512 graph inner=5","variant":"probe ilp256 U8 (256)","med_us":74.649,"p10_us":74.289,"p90_us":74.841,"ratio":0.8674,"gbps":685.88,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=50000 b=512 graph inner=5","variant":"probe ilp256 U4 (256)","med_us":75.257,"p10_us":75.025,"p90_us":75.505,"ratio":0.8745,"gbps":680.34,"graph":1,"flush":0}
+
+== review threshold n=50000 b=512 DIRECT inner=1  (rounds=30 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                88.72      88.32      89.24    1.000     577.1       0.0
+cand candidate_threshold_ilp (1024)          184.08     182.60     185.44    2.075     278.1       0.0
+eng ilp512 (512)                             113.28     112.28     114.04    1.277     452.0       0.0
+probe ilp256 U8 (256)                         77.20      76.80      77.52    0.870     663.2       0.0
+probe ilp256 U4 (256)                         78.08      77.52      78.36    0.880     655.7       0.0
+KBJSON {"tag":"review threshold n=50000 b=512 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":88.721,"p10_us":88.321,"p90_us":89.241,"ratio":1.0000,"gbps":577.09,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=50000 b=512 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":184.082,"p10_us":182.602,"p90_us":185.442,"ratio":2.0748,"gbps":278.14,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=50000 b=512 DIRECT inner=1","variant":"eng ilp512 (512)","med_us":113.282,"p10_us":112.281,"p90_us":114.041,"ratio":1.2768,"gbps":451.97,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=50000 b=512 DIRECT inner=1","variant":"probe ilp256 U8 (256)","med_us":77.200,"p10_us":76.801,"p90_us":77.521,"ratio":0.8701,"gbps":663.21,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=50000 b=512 DIRECT inner=1","variant":"probe ilp256 U4 (256)","med_us":78.081,"p10_us":77.521,"p90_us":78.360,"ratio":0.8801,"gbps":655.73,"graph":0,"flush":0}
+CMPX eng ilp512 (512) n=65536 b=512 dist=0 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=512 dist=0 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=512 dist=0 diff=0 OK
+CMP n=65536 b=512 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c02630fb/c02630fb  OK
+CMPX eng ilp512 (512) n=65536 b=512 dist=1 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=512 dist=1 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=512 dist=1 diff=0 OK
+CMP n=65536 b=512 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0200000/c0200000  OK
+CMPX eng ilp512 (512) n=65536 b=512 dist=2 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=512 dist=2 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=512 dist=2 diff=0 OK
+CMP n=65536 b=512 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMPX eng ilp512 (512) n=65536 b=512 dist=3 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=512 dist=3 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=512 dist=3 diff=0 OK
+CMP n=65536 b=512 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bd3b9c87/bd3b9c87  OK
+CMPX eng ilp512 (512) n=65536 b=512 dist=4 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=512 dist=4 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=512 dist=4 diff=0 OK
+CMP n=65536 b=512 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMPX eng ilp512 (512) n=65536 b=512 dist=5 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=512 dist=5 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=512 dist=5 diff=0 OK
+CMP n=65536 b=512 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f208820e/f208820e  OK
+
+== review threshold n=65536 b=512 graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               114.74     114.20     115.23    1.000     584.9       0.0
+cand candidate_threshold_ilp (1024)          237.17     236.53     238.38    2.067     283.0       0.0
+eng ilp512 (512)                             147.12     146.67     147.74    1.282     456.1       0.0
+probe ilp256 U8 (256)                         96.70      96.46      97.29    0.843     694.0       0.0
+probe ilp256 U4 (256)                         98.24      97.95      98.54    0.856     683.1       0.0
+KBJSON {"tag":"review threshold n=65536 b=512 graph inner=5","variant":"base candidate_threshold (256)","med_us":114.737,"p10_us":114.201,"p90_us":115.225,"ratio":1.0000,"gbps":584.89,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=512 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":237.171,"p10_us":236.530,"p90_us":238.379,"ratio":2.0671,"gbps":282.96,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=512 graph inner=5","variant":"eng ilp512 (512)","med_us":147.122,"p10_us":146.666,"p90_us":147.738,"ratio":1.2822,"gbps":456.15,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=512 graph inner=5","variant":"probe ilp256 U8 (256)","med_us":96.697,"p10_us":96.457,"p90_us":97.289,"ratio":0.8428,"gbps":694.01,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=512 graph inner=5","variant":"probe ilp256 U4 (256)","med_us":98.241,"p10_us":97.953,"p90_us":98.537,"ratio":0.8562,"gbps":683.10,"graph":1,"flush":0}
+
+== review threshold n=65536 b=512 DIRECT inner=1  (rounds=30 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               116.72     116.12     117.96    1.000     575.0       0.0
+cand candidate_threshold_ilp (1024)          238.68     237.12     240.96    2.045     281.2       0.0
+eng ilp512 (512)                             148.68     147.92     150.48    1.274     451.4       0.0
+probe ilp256 U8 (256)                         99.40      98.84      99.96    0.852     675.1       0.0
+probe ilp256 U4 (256)                        100.80     100.08     101.40    0.864     665.8       0.0
+KBJSON {"tag":"review threshold n=65536 b=512 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":116.721,"p10_us":116.121,"p90_us":117.962,"ratio":1.0000,"gbps":574.95,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=512 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":238.682,"p10_us":237.123,"p90_us":240.962,"ratio":2.0449,"gbps":281.16,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=512 DIRECT inner=1","variant":"eng ilp512 (512)","med_us":148.682,"p10_us":147.921,"p90_us":150.482,"ratio":1.2738,"gbps":451.36,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=512 DIRECT inner=1","variant":"probe ilp256 U8 (256)","med_us":99.401,"p10_us":98.841,"p90_us":99.961,"ratio":0.8516,"gbps":675.13,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=512 DIRECT inner=1","variant":"probe ilp256 U4 (256)","med_us":100.801,"p10_us":100.081,"p90_us":101.401,"ratio":0.8636,"gbps":665.76,"graph":0,"flush":0}
+CMPX eng ilp512 (512) n=235000 b=512 dist=0 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=512 dist=0 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=512 dist=0 diff=0 OK
+CMP n=235000 b=512 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0bcb860/c0bcb860  OK
+CMPX eng ilp512 (512) n=235000 b=512 dist=1 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=512 dist=1 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=512 dist=1 diff=0 OK
+CMP n=235000 b=512 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0c00000/c0c00000  OK
+CMPX eng ilp512 (512) n=235000 b=512 dist=2 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=512 dist=2 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=512 dist=2 diff=0 OK
+CMP n=235000 b=512 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMPX eng ilp512 (512) n=235000 b=512 dist=3 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=512 dist=3 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=512 dist=3 diff=0 OK
+CMP n=235000 b=512 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c08b5ee4/c08b5ee4  OK
+CMPX eng ilp512 (512) n=235000 b=512 dist=4 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=512 dist=4 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=512 dist=4 diff=0 OK
+CMP n=235000 b=512 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMPX eng ilp512 (512) n=235000 b=512 dist=5 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=512 dist=5 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=512 dist=5 diff=0 OK
+CMP n=235000 b=512 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f2965e00/f2965e00  OK
+
+== review threshold n=235000 b=512 graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               277.42     276.11     279.52    1.000     867.4       0.0
+cand candidate_threshold_ilp (1024)          317.67     315.87     319.02    1.145     757.5       0.0
+eng ilp512 (512)                             238.51     237.08     239.37    0.860    1008.9       0.0
+probe ilp256 U8 (256)                        200.28     199.87     201.15    0.722    1201.5       0.0
+probe ilp256 U4 (256)                        204.07     203.38     204.84    0.736    1179.2       0.0
+KBJSON {"tag":"review threshold n=235000 b=512 graph inner=5","variant":"base candidate_threshold (256)","med_us":277.419,"p10_us":276.115,"p90_us":279.523,"ratio":1.0000,"gbps":867.42,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=512 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":317.667,"p10_us":315.867,"p90_us":319.019,"ratio":1.1451,"gbps":757.52,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=512 graph inner=5","variant":"eng ilp512 (512)","med_us":238.514,"p10_us":237.083,"p90_us":239.371,"ratio":0.8598,"gbps":1008.91,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=512 graph inner=5","variant":"probe ilp256 U8 (256)","med_us":200.282,"p10_us":199.874,"p90_us":201.154,"ratio":0.7219,"gbps":1201.50,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=512 graph inner=5","variant":"probe ilp256 U4 (256)","med_us":204.066,"p10_us":203.378,"p90_us":204.842,"ratio":0.7356,"gbps":1179.23,"graph":1,"flush":0}
+
+== review threshold n=235000 b=512 DIRECT inner=1  (rounds=30 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               278.32     275.60     281.12    1.000     864.6       0.0
+cand candidate_threshold_ilp (1024)          317.72     314.88     319.88    1.142     757.4       0.0
+eng ilp512 (512)                             239.44     237.08     242.44    0.860    1005.0       0.0
+probe ilp256 U8 (256)                        202.24     201.36     202.92    0.727    1189.9       0.0
+probe ilp256 U4 (256)                        205.88     205.00     206.88    0.740    1168.8       0.0
+KBJSON {"tag":"review threshold n=235000 b=512 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":278.323,"p10_us":275.603,"p90_us":281.123,"ratio":1.0000,"gbps":864.61,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=512 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":317.723,"p10_us":314.884,"p90_us":319.883,"ratio":1.1416,"gbps":757.39,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=512 DIRECT inner=1","variant":"eng ilp512 (512)","med_us":239.443,"p10_us":237.083,"p90_us":242.442,"ratio":0.8603,"gbps":1005.00,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=512 DIRECT inner=1","variant":"probe ilp256 U8 (256)","med_us":202.243,"p10_us":201.363,"p90_us":202.922,"ratio":0.7266,"gbps":1189.86,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=512 DIRECT inner=1","variant":"probe ilp256 U4 (256)","med_us":205.882,"p10_us":205.003,"p90_us":206.882,"ratio":0.7397,"gbps":1168.82,"graph":0,"flush":0}
+CMPX eng ilp512 (512) n=30000 b=1024 dist=0 diff=0 OK
+CMPX probe ilp256 U8 (256) n=30000 b=1024 dist=0 diff=0 OK
+CMPX probe ilp256 U4 (256) n=30000 b=1024 dist=0 diff=0 OK
+CMP n=30000 b=1024 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=40f34601/40f34601  OK
+CMPX eng ilp512 (512) n=30000 b=1024 dist=1 diff=0 OK
+CMPX probe ilp256 U8 (256) n=30000 b=1024 dist=1 diff=0 OK
+CMPX probe ilp256 U4 (256) n=30000 b=1024 dist=1 diff=0 OK
+CMP n=30000 b=1024 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=40ffffff/40ffffff  OK
+CMPX eng ilp512 (512) n=30000 b=1024 dist=2 diff=0 OK
+CMPX probe ilp256 U8 (256) n=30000 b=1024 dist=2 diff=0 OK
+CMPX probe ilp256 U4 (256) n=30000 b=1024 dist=2 diff=0 OK
+CMP n=30000 b=1024 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMPX eng ilp512 (512) n=30000 b=1024 dist=3 diff=0 OK
+CMPX probe ilp256 U8 (256) n=30000 b=1024 dist=3 diff=0 OK
+CMPX probe ilp256 U4 (256) n=30000 b=1024 dist=3 diff=0 OK
+CMP n=30000 b=1024 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=007fffff/007fffff  OK
+CMPX eng ilp512 (512) n=30000 b=1024 dist=4 diff=0 OK
+CMPX probe ilp256 U8 (256) n=30000 b=1024 dist=4 diff=0 OK
+CMPX probe ilp256 U4 (256) n=30000 b=1024 dist=4 diff=0 OK
+CMP n=30000 b=1024 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=40ffffff/40ffffff  OK
+CMPX eng ilp512 (512) n=30000 b=1024 dist=5 diff=0 OK
+CMPX probe ilp256 U8 (256) n=30000 b=1024 dist=5 diff=0 OK
+CMPX probe ilp256 U4 (256) n=30000 b=1024 dist=5 diff=0 OK
+CMP n=30000 b=1024 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=0f1ad5a9/0f1ad5a9  OK
+
+== review threshold n=30000 b=1024 graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               172.97     172.12     174.47    1.000     355.2       0.0
+cand candidate_threshold_ilp (1024)          482.14     479.73     485.11    2.787     127.4       0.0
+eng ilp512 (512)                             274.59     273.01     275.76    1.587     223.8       0.0
+probe ilp256 U8 (256)                        163.57     162.81     164.68    0.946     375.6       0.0
+probe ilp256 U4 (256)                        162.29     161.43     163.75    0.938     378.6       0.0
+KBJSON {"tag":"review threshold n=30000 b=1024 graph inner=5","variant":"base candidate_threshold (256)","med_us":172.970,"p10_us":172.122,"p90_us":174.466,"ratio":1.0000,"gbps":355.21,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=1024 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":482.141,"p10_us":479.725,"p90_us":485.109,"ratio":2.7874,"gbps":127.43,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=1024 graph inner=5","variant":"eng ilp512 (512)","med_us":274.587,"p10_us":273.011,"p90_us":275.755,"ratio":1.5875,"gbps":223.75,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=1024 graph inner=5","variant":"probe ilp256 U8 (256)","med_us":163.570,"p10_us":162.810,"p90_us":164.682,"ratio":0.9457,"gbps":375.62,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=1024 graph inner=5","variant":"probe ilp256 U4 (256)","med_us":162.290,"p10_us":161.426,"p90_us":163.746,"ratio":0.9383,"gbps":378.58,"graph":1,"flush":0}
+
+== review threshold n=30000 b=1024 DIRECT inner=1  (rounds=30 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               173.76     173.28     174.68    1.000     353.6       0.0
+cand candidate_threshold_ilp (1024)          477.36     476.09     481.12    2.747     128.7       0.0
+eng ilp512 (512)                             274.32     272.56     276.52    1.579     224.0       0.0
+probe ilp256 U8 (256)                        164.76     163.84     165.68    0.948     372.9       0.0
+probe ilp256 U4 (256)                        163.52     162.72     164.56    0.941     375.7       0.0
+KBJSON {"tag":"review threshold n=30000 b=1024 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":173.762,"p10_us":173.282,"p90_us":174.682,"ratio":1.0000,"gbps":353.59,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=1024 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":477.365,"p10_us":476.085,"p90_us":481.125,"ratio":2.7472,"gbps":128.71,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=1024 DIRECT inner=1","variant":"eng ilp512 (512)","med_us":274.323,"p10_us":272.563,"p90_us":276.523,"ratio":1.5787,"gbps":223.97,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=1024 DIRECT inner=1","variant":"probe ilp256 U8 (256)","med_us":164.762,"p10_us":163.842,"p90_us":165.682,"ratio":0.9482,"gbps":372.90,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=30000 b=1024 DIRECT inner=1","variant":"probe ilp256 U4 (256)","med_us":163.522,"p10_us":162.722,"p90_us":164.562,"ratio":0.9411,"gbps":375.73,"graph":0,"flush":0}
+CMPX eng ilp512 (512) n=65536 b=1024 dist=0 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=1024 dist=0 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=1024 dist=0 diff=0 OK
+CMP n=65536 b=1024 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c02efcec/c02efcec  OK
+CMPX eng ilp512 (512) n=65536 b=1024 dist=1 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=1024 dist=1 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=1024 dist=1 diff=0 OK
+CMP n=65536 b=1024 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0200000/c0200000  OK
+CMPX eng ilp512 (512) n=65536 b=1024 dist=2 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=1024 dist=2 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=1024 dist=2 diff=0 OK
+CMP n=65536 b=1024 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMPX eng ilp512 (512) n=65536 b=1024 dist=3 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=1024 dist=3 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=1024 dist=3 diff=0 OK
+CMP n=65536 b=1024 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bddd2b86/bddd2b86  OK
+CMPX eng ilp512 (512) n=65536 b=1024 dist=4 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=1024 dist=4 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=1024 dist=4 diff=0 OK
+CMP n=65536 b=1024 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMPX eng ilp512 (512) n=65536 b=1024 dist=5 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=1024 dist=5 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=1024 dist=5 diff=0 OK
+CMP n=65536 b=1024 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f20c3354/f20c3354  OK
+
+== review threshold n=65536 b=1024 graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               212.74     212.21     214.23    1.000     630.9       0.0
+cand candidate_threshold_ilp (1024)          457.25     454.50     458.99    2.149     293.5       0.0
+eng ilp512 (512)                             274.98     273.79     275.84    1.293     488.1       0.0
+probe ilp256 U8 (256)                        181.85     180.43     182.95    0.855     738.1       0.0
+probe ilp256 U4 (256)                        183.63     182.43     184.80    0.863     730.9       0.0
+KBJSON {"tag":"review threshold n=65536 b=1024 graph inner=5","variant":"base candidate_threshold (256)","med_us":212.738,"p10_us":212.210,"p90_us":214.234,"ratio":1.0000,"gbps":630.91,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=1024 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":457.245,"p10_us":454.501,"p90_us":458.989,"ratio":2.1493,"gbps":293.54,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=1024 graph inner=5","variant":"eng ilp512 (512)","med_us":274.979,"p10_us":273.787,"p90_us":275.843,"ratio":1.2926,"gbps":488.10,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=1024 graph inner=5","variant":"probe ilp256 U8 (256)","med_us":181.850,"p10_us":180.426,"p90_us":182.946,"ratio":0.8548,"gbps":738.07,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=1024 graph inner=5","variant":"probe ilp256 U4 (256)","med_us":183.634,"p10_us":182.434,"p90_us":184.802,"ratio":0.8632,"gbps":730.90,"graph":1,"flush":0}
+
+== review threshold n=65536 b=1024 DIRECT inner=1  (rounds=30 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               213.28     212.36     214.52    1.000     629.3       0.0
+cand candidate_threshold_ilp (1024)          454.48     452.24     457.53    2.131     295.3       0.0
+eng ilp512 (512)                             274.60     273.60     275.76    1.288     488.8       0.0
+probe ilp256 U8 (256)                        182.60     181.72     184.24    0.856     735.0       0.0
+probe ilp256 U4 (256)                        184.24     183.32     185.52    0.864     728.5       0.0
+KBJSON {"tag":"review threshold n=65536 b=1024 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":213.282,"p10_us":212.362,"p90_us":214.523,"ratio":1.0000,"gbps":629.30,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=1024 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":454.485,"p10_us":452.245,"p90_us":457.525,"ratio":2.1309,"gbps":295.32,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=1024 DIRECT inner=1","variant":"eng ilp512 (512)","med_us":274.603,"p10_us":273.603,"p90_us":275.763,"ratio":1.2875,"gbps":488.77,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=1024 DIRECT inner=1","variant":"probe ilp256 U8 (256)","med_us":182.602,"p10_us":181.722,"p90_us":184.242,"ratio":0.8562,"gbps":735.03,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=1024 DIRECT inner=1","variant":"probe ilp256 U4 (256)","med_us":184.242,"p10_us":183.322,"p90_us":185.522,"ratio":0.8638,"gbps":728.49,"graph":0,"flush":0}
+CMPX eng ilp512 (512) n=235000 b=1024 dist=0 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=1024 dist=0 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=1024 dist=0 diff=0 OK
+CMP n=235000 b=1024 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0bb0f61/c0bb0f61  OK
+CMPX eng ilp512 (512) n=235000 b=1024 dist=1 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=1024 dist=1 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=1024 dist=1 diff=0 OK
+CMP n=235000 b=1024 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0c00000/c0c00000  OK
+CMPX eng ilp512 (512) n=235000 b=1024 dist=2 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=1024 dist=2 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=1024 dist=2 diff=0 OK
+CMP n=235000 b=1024 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMPX eng ilp512 (512) n=235000 b=1024 dist=3 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=1024 dist=3 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=1024 dist=3 diff=0 OK
+CMP n=235000 b=1024 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c08a08fa/c08a08fa  OK
+CMPX eng ilp512 (512) n=235000 b=1024 dist=4 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=1024 dist=4 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=1024 dist=4 diff=0 OK
+CMP n=235000 b=1024 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMPX eng ilp512 (512) n=235000 b=1024 dist=5 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=1024 dist=5 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=1024 dist=5 diff=0 OK
+CMP n=235000 b=1024 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f2975172/f2975172  OK
+
+== review threshold n=235000 b=1024 graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               533.76     530.67     534.86    1.000     901.7       0.0
+cand candidate_threshold_ilp (1024)          601.29     598.94     602.89    1.127     800.4       0.0
+eng ilp512 (512)                             446.35     443.57     449.38    0.836    1078.3       0.0
+probe ilp256 U8 (256)                        368.20     365.83     371.32    0.690    1307.1       0.0
+probe ilp256 U4 (256)                        373.87     372.14     375.07    0.700    1287.3       0.0
+KBJSON {"tag":"review threshold n=235000 b=1024 graph inner=5","variant":"base candidate_threshold (256)","med_us":533.758,"p10_us":530.670,"p90_us":534.862,"ratio":1.0000,"gbps":901.68,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1024 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":601.295,"p10_us":598.942,"p90_us":602.887,"ratio":1.1265,"gbps":800.41,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1024 graph inner=5","variant":"eng ilp512 (512)","med_us":446.349,"p10_us":443.573,"p90_us":449.381,"ratio":0.8362,"gbps":1078.26,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1024 graph inner=5","variant":"probe ilp256 U8 (256)","med_us":368.204,"p10_us":365.828,"p90_us":371.324,"ratio":0.6898,"gbps":1307.10,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1024 graph inner=5","variant":"probe ilp256 U4 (256)","med_us":373.868,"p10_us":372.140,"p90_us":375.068,"ratio":0.7004,"gbps":1287.30,"graph":1,"flush":0}
+
+== review threshold n=235000 b=1024 DIRECT inner=1  (rounds=30 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)               534.80     532.89     537.17    1.000     899.9       0.0
+cand candidate_threshold_ilp (1024)          597.21     595.61     601.33    1.117     805.9       0.0
+eng ilp512 (512)                             442.45     440.72     445.92    0.827    1087.8       0.0
+probe ilp256 U8 (256)                        366.12     364.00     368.88    0.685    1314.5       0.0
+probe ilp256 U4 (256)                        376.04     374.48     377.32    0.703    1279.9       0.0
+KBJSON {"tag":"review threshold n=235000 b=1024 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":534.805,"p10_us":532.886,"p90_us":537.166,"ratio":1.0000,"gbps":899.92,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1024 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":597.206,"p10_us":595.607,"p90_us":601.327,"ratio":1.1167,"gbps":805.89,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1024 DIRECT inner=1","variant":"eng ilp512 (512)","med_us":442.445,"p10_us":440.724,"p90_us":445.925,"ratio":0.8273,"gbps":1087.77,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1024 DIRECT inner=1","variant":"probe ilp256 U8 (256)","med_us":366.124,"p10_us":364.004,"p90_us":368.884,"ratio":0.6846,"gbps":1314.53,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1024 DIRECT inner=1","variant":"probe ilp256 U4 (256)","med_us":376.044,"p10_us":374.485,"p90_us":377.324,"ratio":0.7031,"gbps":1279.85,"graph":0,"flush":0}
+CMPX eng ilp512 (512) n=65536 b=4 dist=0 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=4 dist=0 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=4 dist=0 diff=0 OK
+CMP n=65536 b=4 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c02fee00/c02fee00  OK
+CMPX eng ilp512 (512) n=65536 b=4 dist=1 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=4 dist=1 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=4 dist=1 diff=0 OK
+CMP n=65536 b=4 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0200000/c0200000  OK
+CMPX eng ilp512 (512) n=65536 b=4 dist=2 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=4 dist=2 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=4 dist=2 diff=0 OK
+CMP n=65536 b=4 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMPX eng ilp512 (512) n=65536 b=4 dist=3 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=4 dist=3 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=4 dist=3 diff=0 OK
+CMP n=65536 b=4 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bddab7da/bddab7da  OK
+CMPX eng ilp512 (512) n=65536 b=4 dist=4 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=4 dist=4 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=4 dist=4 diff=0 OK
+CMP n=65536 b=4 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMPX eng ilp512 (512) n=65536 b=4 dist=5 diff=0 OK
+CMPX probe ilp256 U8 (256) n=65536 b=4 dist=5 diff=0 OK
+CMPX probe ilp256 U4 (256) n=65536 b=4 dist=5 diff=0 OK
+CMP n=65536 b=4 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f2069557/f2069557  OK
+
+== review threshold n=65536 b=4 graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                45.17      45.06      45.29    1.000      11.6       0.0
+cand candidate_threshold_ilp (1024)           30.87      30.84      30.93    0.683      17.0       0.0
+eng ilp512 (512)                              31.47      31.38      31.53    0.697      16.7       0.0
+probe ilp256 U8 (256)                         33.17      33.12      33.22    0.734      15.8       0.0
+probe ilp256 U4 (256)                         34.36      34.30      34.45    0.761      15.3       0.0
+KBJSON {"tag":"review threshold n=65536 b=4 graph inner=5","variant":"base candidate_threshold (256)","med_us":45.169,"p10_us":45.065,"p90_us":45.288,"ratio":1.0000,"gbps":11.61,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=4 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":30.872,"p10_us":30.840,"p90_us":30.928,"ratio":0.6835,"gbps":16.98,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=4 graph inner=5","variant":"eng ilp512 (512)","med_us":31.472,"p10_us":31.376,"p90_us":31.528,"ratio":0.6968,"gbps":16.66,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=4 graph inner=5","variant":"probe ilp256 U8 (256)","med_us":33.168,"p10_us":33.120,"p90_us":33.216,"ratio":0.7343,"gbps":15.81,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=4 graph inner=5","variant":"probe ilp256 U4 (256)","med_us":34.360,"p10_us":34.304,"p90_us":34.448,"ratio":0.7607,"gbps":15.26,"graph":1,"flush":0}
+
+== review threshold n=65536 b=4 DIRECT inner=1  (rounds=30 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                48.48      48.12      48.64    1.000      10.8       0.0
+cand candidate_threshold_ilp (1024)           34.24      34.08      34.40    0.706      15.3       0.0
+eng ilp512 (512)                              34.72      34.56      34.88    0.716      15.1       0.0
+probe ilp256 U8 (256)                         36.40      36.28      36.60    0.751      14.4       0.0
+probe ilp256 U4 (256)                         37.60      37.48      37.64    0.776      13.9       0.0
+KBJSON {"tag":"review threshold n=65536 b=4 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":48.481,"p10_us":48.120,"p90_us":48.641,"ratio":1.0000,"gbps":10.81,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=4 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":34.240,"p10_us":34.081,"p90_us":34.400,"ratio":0.7063,"gbps":15.31,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=4 DIRECT inner=1","variant":"eng ilp512 (512)","med_us":34.721,"p10_us":34.561,"p90_us":34.880,"ratio":0.7162,"gbps":15.10,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=4 DIRECT inner=1","variant":"probe ilp256 U8 (256)","med_us":36.400,"p10_us":36.280,"p90_us":36.600,"ratio":0.7508,"gbps":14.40,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=65536 b=4 DIRECT inner=1","variant":"probe ilp256 U4 (256)","med_us":37.600,"p10_us":37.481,"p90_us":37.641,"ratio":0.7756,"gbps":13.94,"graph":0,"flush":0}
+CMPX eng ilp512 (512) n=131072 b=4 dist=0 diff=0 OK
+CMPX probe ilp256 U8 (256) n=131072 b=4 dist=0 diff=0 OK
+CMPX probe ilp256 U4 (256) n=131072 b=4 dist=0 diff=0 OK
+CMP n=131072 b=4 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c09250e8/c09250e8  OK
+CMPX eng ilp512 (512) n=131072 b=4 dist=1 diff=0 OK
+CMPX probe ilp256 U8 (256) n=131072 b=4 dist=1 diff=0 OK
+CMPX probe ilp256 U4 (256) n=131072 b=4 dist=1 diff=0 OK
+CMP n=131072 b=4 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0900000/c0900000  OK
+CMPX eng ilp512 (512) n=131072 b=4 dist=2 diff=0 OK
+CMPX probe ilp256 U8 (256) n=131072 b=4 dist=2 diff=0 OK
+CMPX probe ilp256 U4 (256) n=131072 b=4 dist=2 diff=0 OK
+CMP n=131072 b=4 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMPX eng ilp512 (512) n=131072 b=4 dist=3 diff=0 OK
+CMPX probe ilp256 U8 (256) n=131072 b=4 dist=3 diff=0 OK
+CMPX probe ilp256 U4 (256) n=131072 b=4 dist=3 diff=0 OK
+CMP n=131072 b=4 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c02dde8d/c02dde8d  OK
+CMPX eng ilp512 (512) n=131072 b=4 dist=4 diff=0 OK
+CMPX probe ilp256 U8 (256) n=131072 b=4 dist=4 diff=0 OK
+CMPX probe ilp256 U4 (256) n=131072 b=4 dist=4 diff=0 OK
+CMP n=131072 b=4 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMPX eng ilp512 (512) n=131072 b=4 dist=5 diff=0 OK
+CMPX probe ilp256 U8 (256) n=131072 b=4 dist=5 diff=0 OK
+CMPX probe ilp256 U4 (256) n=131072 b=4 dist=5 diff=0 OK
+CMP n=131072 b=4 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f26a84a1/f26a84a1  OK
+
+== review threshold n=131072 b=4 graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                60.02      59.78      60.22    1.000      17.5       0.0
+cand candidate_threshold_ilp (1024)           31.06      30.98      31.14    0.518      33.8       0.0
+eng ilp512 (512)                              32.40      32.29      32.50    0.540      32.4       0.0
+probe ilp256 U8 (256)                         35.78      35.68      35.90    0.596      29.3       0.0
+probe ilp256 U4 (256)                         37.98      37.84      38.11    0.633      27.6       0.0
+KBJSON {"tag":"review threshold n=131072 b=4 graph inner=5","variant":"base candidate_threshold (256)","med_us":60.025,"p10_us":59.777,"p90_us":60.225,"ratio":1.0000,"gbps":17.47,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=131072 b=4 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":31.064,"p10_us":30.976,"p90_us":31.136,"ratio":0.5175,"gbps":33.75,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=131072 b=4 graph inner=5","variant":"eng ilp512 (512)","med_us":32.400,"p10_us":32.288,"p90_us":32.504,"ratio":0.5398,"gbps":32.36,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=131072 b=4 graph inner=5","variant":"probe ilp256 U8 (256)","med_us":35.784,"p10_us":35.680,"p90_us":35.896,"ratio":0.5962,"gbps":29.30,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=131072 b=4 graph inner=5","variant":"probe ilp256 U4 (256)","med_us":37.984,"p10_us":37.840,"p90_us":38.112,"ratio":0.6328,"gbps":27.61,"graph":1,"flush":0}
+
+== review threshold n=131072 b=4 DIRECT inner=1  (rounds=30 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                62.96      62.60      63.72    1.000      16.7       0.0
+cand candidate_threshold_ilp (1024)           34.36      34.24      34.48    0.546      30.5       0.0
+eng ilp512 (512)                              35.60      35.48      35.68    0.565      29.5       0.0
+probe ilp256 U8 (256)                         39.00      38.80      39.16    0.619      26.9       0.0
+probe ilp256 U4 (256)                         41.20      40.96      41.36    0.654      25.5       0.0
+KBJSON {"tag":"review threshold n=131072 b=4 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":62.961,"p10_us":62.601,"p90_us":63.720,"ratio":1.0000,"gbps":16.65,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=131072 b=4 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":34.361,"p10_us":34.241,"p90_us":34.481,"ratio":0.5458,"gbps":30.52,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=131072 b=4 DIRECT inner=1","variant":"eng ilp512 (512)","med_us":35.600,"p10_us":35.480,"p90_us":35.681,"ratio":0.5654,"gbps":29.45,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=131072 b=4 DIRECT inner=1","variant":"probe ilp256 U8 (256)","med_us":39.000,"p10_us":38.801,"p90_us":39.161,"ratio":0.6194,"gbps":26.89,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=131072 b=4 DIRECT inner=1","variant":"probe ilp256 U4 (256)","med_us":41.200,"p10_us":40.960,"p90_us":41.360,"ratio":0.6544,"gbps":25.45,"graph":0,"flush":0}
+CMPX eng ilp512 (512) n=235000 b=1 dist=0 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=1 dist=0 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=1 dist=0 diff=0 OK
+CMP n=235000 b=1 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0bf71ba/c0bf71ba  OK
+CMPX eng ilp512 (512) n=235000 b=1 dist=1 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=1 dist=1 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=1 dist=1 diff=0 OK
+CMP n=235000 b=1 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0c00000/c0c00000  OK
+CMPX eng ilp512 (512) n=235000 b=1 dist=2 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=1 dist=2 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=1 dist=2 diff=0 OK
+CMP n=235000 b=1 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMPX eng ilp512 (512) n=235000 b=1 dist=3 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=1 dist=3 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=1 dist=3 diff=0 OK
+CMP n=235000 b=1 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c08b9a06/c08b9a06  OK
+CMPX eng ilp512 (512) n=235000 b=1 dist=4 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=1 dist=4 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=1 dist=4 diff=0 OK
+CMP n=235000 b=1 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMPX eng ilp512 (512) n=235000 b=1 dist=5 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=1 dist=5 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=1 dist=5 diff=0 OK
+CMP n=235000 b=1 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f2947731/f2947731  OK
+
+== review threshold n=235000 b=1 graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                82.83      82.50      83.39    1.000       5.7       0.0
+cand candidate_threshold_ilp (1024)           31.68      31.61      31.73    0.382      14.8       0.0
+eng ilp512 (512)                              33.54      33.50      33.58    0.405      14.0       0.0
+probe ilp256 U8 (256)                         40.11      40.04      40.18    0.484      11.7       0.0
+probe ilp256 U4 (256)                         44.14      43.95      44.30    0.533      10.6       0.0
+KBJSON {"tag":"review threshold n=235000 b=1 graph inner=5","variant":"base candidate_threshold (256)","med_us":82.833,"p10_us":82.497,"p90_us":83.385,"ratio":1.0000,"gbps":5.67,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":31.680,"p10_us":31.608,"p90_us":31.728,"ratio":0.3825,"gbps":14.84,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1 graph inner=5","variant":"eng ilp512 (512)","med_us":33.544,"p10_us":33.496,"p90_us":33.584,"ratio":0.4050,"gbps":14.01,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1 graph inner=5","variant":"probe ilp256 U8 (256)","med_us":40.112,"p10_us":40.040,"p90_us":40.176,"ratio":0.4843,"gbps":11.72,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1 graph inner=5","variant":"probe ilp256 U4 (256)","med_us":44.136,"p10_us":43.952,"p90_us":44.297,"ratio":0.5328,"gbps":10.65,"graph":1,"flush":0}
+
+== review threshold n=235000 b=1 DIRECT inner=1  (rounds=30 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                85.76      84.76      87.60    1.000       5.5       0.0
+cand candidate_threshold_ilp (1024)           35.24      35.04      35.40    0.411      13.3       0.0
+eng ilp512 (512)                              36.88      36.72      37.12    0.430      12.7       0.0
+probe ilp256 U8 (256)                         43.52      43.28      43.72    0.507      10.8       0.0
+probe ilp256 U4 (256)                         47.56      47.04      47.88    0.555       9.9       0.0
+KBJSON {"tag":"review threshold n=235000 b=1 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":85.761,"p10_us":84.761,"p90_us":87.601,"ratio":1.0000,"gbps":5.48,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":35.240,"p10_us":35.040,"p90_us":35.400,"ratio":0.4109,"gbps":13.34,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1 DIRECT inner=1","variant":"eng ilp512 (512)","med_us":36.881,"p10_us":36.720,"p90_us":37.121,"ratio":0.4300,"gbps":12.74,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1 DIRECT inner=1","variant":"probe ilp256 U8 (256)","med_us":43.521,"p10_us":43.280,"p90_us":43.721,"ratio":0.5075,"gbps":10.80,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=1 DIRECT inner=1","variant":"probe ilp256 U4 (256)","med_us":47.560,"p10_us":47.041,"p90_us":47.881,"ratio":0.5546,"gbps":9.88,"graph":0,"flush":0}
+CMPX eng ilp512 (512) n=235000 b=4 dist=0 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=4 dist=0 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=4 dist=0 diff=0 OK
+CMP n=235000 b=4 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0bcbd73/c0bcbd73  OK
+CMPX eng ilp512 (512) n=235000 b=4 dist=1 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=4 dist=1 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=4 dist=1 diff=0 OK
+CMP n=235000 b=4 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0c00000/c0c00000  OK
+CMPX eng ilp512 (512) n=235000 b=4 dist=2 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=4 dist=2 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=4 dist=2 diff=0 OK
+CMP n=235000 b=4 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMPX eng ilp512 (512) n=235000 b=4 dist=3 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=4 dist=3 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=4 dist=3 diff=0 OK
+CMP n=235000 b=4 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c08b9de4/c08b9de4  OK
+CMPX eng ilp512 (512) n=235000 b=4 dist=4 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=4 dist=4 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=4 dist=4 diff=0 OK
+CMP n=235000 b=4 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMPX eng ilp512 (512) n=235000 b=4 dist=5 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=4 dist=5 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=4 dist=5 diff=0 OK
+CMP n=235000 b=4 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f294adb0/f294adb0  OK
+
+== review threshold n=235000 b=4 graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                88.09      87.88      88.47    1.000      21.3       0.0
+cand candidate_threshold_ilp (1024)           37.15      37.12      37.19    0.422      50.6       0.0
+eng ilp512 (512)                              39.00      38.97      39.03    0.443      48.2       0.0
+probe ilp256 U8 (256)                         45.40      45.34      45.44    0.515      41.4       0.0
+probe ilp256 U4 (256)                         49.38      49.30      49.45    0.561      38.1       0.0
+KBJSON {"tag":"review threshold n=235000 b=4 graph inner=5","variant":"base candidate_threshold (256)","med_us":88.089,"p10_us":87.881,"p90_us":88.473,"ratio":1.0000,"gbps":21.34,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=4 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":37.152,"p10_us":37.120,"p90_us":37.192,"ratio":0.4218,"gbps":50.60,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=4 graph inner=5","variant":"eng ilp512 (512)","med_us":39.000,"p10_us":38.968,"p90_us":39.032,"ratio":0.4427,"gbps":48.20,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=4 graph inner=5","variant":"probe ilp256 U8 (256)","med_us":45.401,"p10_us":45.337,"p90_us":45.440,"ratio":0.5154,"gbps":41.41,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=4 graph inner=5","variant":"probe ilp256 U4 (256)","med_us":49.376,"p10_us":49.297,"p90_us":49.448,"ratio":0.5605,"gbps":38.07,"graph":1,"flush":0}
+
+== review threshold n=235000 b=4 DIRECT inner=1  (rounds=30 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                91.64      90.92      92.64    1.000      20.5       0.0
+cand candidate_threshold_ilp (1024)           40.60      40.44      40.76    0.443      46.3       0.0
+eng ilp512 (512)                              42.36      42.28      42.56    0.462      44.4       0.0
+probe ilp256 U8 (256)                         48.80      48.52      49.00    0.533      38.5       0.0
+probe ilp256 U4 (256)                         52.88      52.52      53.24    0.577      35.6       0.0
+KBJSON {"tag":"review threshold n=235000 b=4 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":91.641,"p10_us":90.921,"p90_us":92.641,"ratio":1.0000,"gbps":20.51,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=4 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":40.601,"p10_us":40.441,"p90_us":40.761,"ratio":0.4430,"gbps":46.30,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=4 DIRECT inner=1","variant":"eng ilp512 (512)","med_us":42.361,"p10_us":42.280,"p90_us":42.561,"ratio":0.4622,"gbps":44.38,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=4 DIRECT inner=1","variant":"probe ilp256 U8 (256)","med_us":48.800,"p10_us":48.521,"p90_us":49.001,"ratio":0.5325,"gbps":38.52,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=4 DIRECT inner=1","variant":"probe ilp256 U4 (256)","med_us":52.880,"p10_us":52.521,"p90_us":53.240,"ratio":0.5770,"gbps":35.55,"graph":0,"flush":0}
+CMPX eng ilp512 (512) n=235000 b=8 dist=0 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=8 dist=0 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=8 dist=0 diff=0 OK
+CMP n=235000 b=8 dist=0  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0bd0dce/c0bd0dce  OK
+CMPX eng ilp512 (512) n=235000 b=8 dist=1 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=8 dist=1 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=8 dist=1 diff=0 OK
+CMP n=235000 b=8 dist=1  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c0c00000/c0c00000  OK
+CMPX eng ilp512 (512) n=235000 b=8 dist=2 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=8 dist=2 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=8 dist=2 diff=0 OK
+CMP n=235000 b=8 dist=2  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfa00000/bfa00000  OK
+CMPX eng ilp512 (512) n=235000 b=8 dist=3 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=8 dist=3 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=8 dist=3 diff=0 OK
+CMP n=235000 b=8 dist=3  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=c08a1763/c08a1763  OK
+CMPX eng ilp512 (512) n=235000 b=8 dist=4 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=8 dist=4 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=8 dist=4 diff=0 OK
+CMP n=235000 b=8 dist=4  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=bfc00000/bfc00000  OK
+CMPX eng ilp512 (512) n=235000 b=8 dist=5 diff=0 OK
+CMPX probe ilp256 U8 (256) n=235000 b=8 dist=5 diff=0 OK
+CMPX probe ilp256 U4 (256) n=235000 b=8 dist=5 diff=0 OK
+CMP n=235000 b=8 dist=5  cand_vs_base_diff=0  base_vs_ref_diff=0  cand_vs_ref_diff=0  thr0=f2954c72/f2954c72  OK
+
+== review threshold n=235000 b=8 graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                88.97      88.87      89.10    1.000      42.3       0.0
+cand candidate_threshold_ilp (1024)           38.23      38.19      38.26    0.430      98.3       0.0
+eng ilp512 (512)                              40.11      40.07      40.13    0.451      93.7       0.0
+probe ilp256 U8 (256)                         46.56      46.54      46.60    0.523      80.8       0.0
+probe ilp256 U4 (256)                         50.46      50.42      50.51    0.567      74.5       0.0
+KBJSON {"tag":"review threshold n=235000 b=8 graph inner=5","variant":"base candidate_threshold (256)","med_us":88.969,"p10_us":88.865,"p90_us":89.105,"ratio":1.0000,"gbps":42.26,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=8 graph inner=5","variant":"cand candidate_threshold_ilp (1024)","med_us":38.232,"p10_us":38.192,"p90_us":38.264,"ratio":0.4297,"gbps":98.35,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=8 graph inner=5","variant":"eng ilp512 (512)","med_us":40.112,"p10_us":40.072,"p90_us":40.129,"ratio":0.4509,"gbps":93.74,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=8 graph inner=5","variant":"probe ilp256 U8 (256)","med_us":46.561,"p10_us":46.545,"p90_us":46.601,"ratio":0.5233,"gbps":80.75,"graph":1,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=8 graph inner=5","variant":"probe ilp256 U4 (256)","med_us":50.465,"p10_us":50.417,"p90_us":50.513,"ratio":0.5672,"gbps":74.51,"graph":1,"flush":0}
+
+== review threshold n=235000 b=8 DIRECT inner=1  (rounds=30 inner=1 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base candidate_threshold (256)                92.36      91.36      93.12    1.000      40.7       0.0
+cand candidate_threshold_ilp (1024)           41.68      41.52      41.80    0.451      90.2       0.0
+eng ilp512 (512)                              43.48      43.32      43.64    0.471      86.5       0.0
+probe ilp256 U8 (256)                         49.96      49.64      50.08    0.541      75.3       0.0
+probe ilp256 U4 (256)                         53.88      53.44      54.08    0.583      69.8       0.0
+KBJSON {"tag":"review threshold n=235000 b=8 DIRECT inner=1","variant":"base candidate_threshold (256)","med_us":92.361,"p10_us":91.361,"p90_us":93.121,"ratio":1.0000,"gbps":40.71,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=8 DIRECT inner=1","variant":"cand candidate_threshold_ilp (1024)","med_us":41.681,"p10_us":41.520,"p90_us":41.800,"ratio":0.4513,"gbps":90.21,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=8 DIRECT inner=1","variant":"eng ilp512 (512)","med_us":43.481,"p10_us":43.320,"p90_us":43.640,"ratio":0.4708,"gbps":86.47,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=8 DIRECT inner=1","variant":"probe ilp256 U8 (256)","med_us":49.961,"p10_us":49.640,"p90_us":50.081,"ratio":0.5409,"gbps":75.26,"graph":0,"flush":0}
+KBJSON {"tag":"review threshold n=235000 b=8 DIRECT inner=1","variant":"probe ilp256 U4 (256)","med_us":53.880,"p10_us":53.441,"p90_us":54.080,"ratio":0.5834,"gbps":69.78,"graph":0,"flush":0}
+SUMMARY correctness: 33918 row-checks, 0 cand-vs-base mismatches

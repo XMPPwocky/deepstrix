@@ -1,0 +1,124 @@
+== 1790450764.000042.C1_dense_decode.dgpu rc=0
+W20260926 19:26:21.848268 134900288772736 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.037579 sec
+W20260926 19:26:21.848508 134900288772736 simple_timer.cpp:55] [rocprofv3] './harness shared 4' ::     0.000000 sec
+W20260926 19:26:21.885058 134900288772736 tool.cpp:2424] HSA version 1.18.0 initialized (instance=0)
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+E20260926 19:26:21.887534 134900288772736 output_stream.cpp:111] Opened result file: results/att_sharedB1_b4/run_gfx1201_code_object_id_1.out
+E20260926 19:26:21.888869 134900288772736 output_stream.cpp:111] Opened result file: results/att_sharedB1_b4/run_gfx1201_code_object_id_2.out
+E20260926 19:26:21.889990 134900288772736 output_stream.cpp:111] Opened result file: results/att_sharedB1_b4/run_gfx1201_code_object_id_3.out
+E20260926 19:26:21.892128 134900288772736 output_stream.cpp:111] Opened result file: results/att_sharedB1_b4/run_gfx1201_code_object_id_4.out
+E20260926 19:26:21.894722 134900288772736 output_stream.cpp:111] Opened result file: results/att_sharedB1_b4/run_gfx1201_code_object_id_5.out
+E20260926 19:26:21.896832 134900288772736 output_stream.cpp:111] Opened result file: results/att_sharedB1_b4/run_gfx1201_code_object_id_6.out
+E20260926 19:26:21.898942 134900288772736 output_stream.cpp:111] Opened result file: results/att_sharedB1_b4/run_gfx1201_code_object_id_7.out
+
+#### shared 4
+E20260926 19:26:21.934285 134900288772736 output_stream.cpp:111] Opened result file: results/att_sharedB1_b4/run_gfx1201_code_object_id_8.out
+shared b=4: |mid| max 100 (clamp 10.0)
+CMP shared_gateup_swiglu_tB4+quant+down mid vs base n=9216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB4+quant+down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB4+quant+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_tB4+quant+down mid_xs vs base n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB4+quant+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB4+quant+down out vs base n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB4+quant+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB4+quant_wave+down mid vs base n=9216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB4+quant_wave+down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB4+quant_wave+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_tB4+quant_wave+down mid_xs vs base n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB4+quant_wave+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_tB4+quant_wave+down out vs base n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_tB4+quant_wave+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB4_r1+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_q8_tB4_r1+down mid_xs vs base n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB4_r1+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB4_r1+down out vs base n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB4_r1+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB4_r2+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_q8_tB4_r2+down mid_xs vs base n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB4_r2+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB4_r2+down out vs base n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB4_r2+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB4_r4+down mid_xq int8_diff=0
+CMP shared_gateup_swiglu_q8_tB4_r4+down mid_xs vs base n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB4_r4+down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP shared_gateup_swiglu_q8_tB4_r4+down out vs base n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0E20260926 19:26:21.951260 134900288772736 output_stream.cpp:111] Opened result file: results/att_sharedB1_b4/run_gfx1201_code_object_id_9.out
+E20260926 19:26:22.252786 134899956709056 output_stream.cpp:111] Opened result file: results/att_sharedB1_b4/run_26406_shader_engine_0_96.att
+E20260926 19:26:22.253089 134899956709056 output_stream.cpp:111] Opened result file: results/att_sharedB1_b4/run_26406_shader_engine_0_98.att
+.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"shared_gateup_swiglu_q8_tB4_r4+down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tB chain (5 nodes) mid vs base     n=9216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tB chain (5 nodes) mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tB chain (5 nodes) mid_xq int8_diff=0
+CMP tB chain (5 nodes) mid_xs vs base  n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tB chain (5 nodes) mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tB chain (5 nodes) out vs base     n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tB chain (5 nodes) out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B r1 + tB down mid_xq int8_diff=0
+CMP B r1 + tB down mid_xs vs base      n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B r1 + tB down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP B r1 + tB down out vs base         n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"B r1 + tB down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP A2 + tB down mid vs base           n=9216 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"A2 + tB down mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP A2 + tB down mid_xq int8_diff=0
+CMP A2 + tB down mid_xs vs base        n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"A2 + tB down mid_xs vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP A2 + tB down out vs base           n=20480 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"A2 + tB down out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base chain gate,up,swiglu,quant,down (5 nodes)     119.32     119.00     119.68    1.000     315.1       0.0
+cand A: fused gate+up+swiglu, quant, down (3 nodes)      95.52      95.28      95.68    0.801     393.7       0.0
+cand A2: fused gate+up+swiglu, quant_wave, down (3 nodes)      94.36      94.08      94.84    0.791     398.5       0.0
+base gate,up,swiglu only (3 nodes)            82.08      81.60      82.48    0.688     305.4       0.0
+cand A only: fused gate+up+swiglu (1 node)      58.20      56.08      58.60    0.488     430.7       0.0
+cand B r1: fused gate+up+swiglu+quant (WG 1024thr), down (2 nodes)      87.80      87.48      88.36    0.736     428.3       0.0
+cand B r1 only: fused gate+up+swiglu+quant (1 node)      58.80      56.40      59.12    0.493     426.3       0.0
+cand B r2: fused gate+up+swiglu+quant (WG 512thr), down (2 nodes)      90.24      89.80      90.80    0.756     416.7       0.0
+cand B r2 only: fused gate+up+swiglu+quant (1 node)      58.92      57.16      59.60    0.494     425.5       0.0
+cand B r4: fused gate+up+swiglu+quant (WG 256thr), down (2 nodes)      90.04      89.48      91.04    0.755     417.6       0.0
+cand B r4 only: fused gate+up+swiglu+quant (1 node)      60.68      59.48      62.52    0.509     413.1       0.0
+cand tB chain: tB gate, tB up, swiglu, quant, tB down (5 nodes)      95.92      95.40      98.16    0.804     392.0       0.0
+cand B r1 + tB down (2 nodes)                 84.84      84.52      85.08    0.711     443.2       0.0
+cand A2 + tB down (3 nodes)                   89.88      89.44      90.24    0.753     418.4       0.0
+null 1-WG kernel (launch floor)               15.80      15.56      17.72    0.132       0.0       0.0
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"base chain gate,up,swiglu,quant,down (5 nodes)","med_us":119.319,"p10_us":119.000,"p90_us":119.680,"ratio":1.0000,"gbps":315.13,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A: fused gate+up+swiglu, quant, down (3 nodes)","med_us":95.519,"p10_us":95.279,"p90_us":95.680,"ratio":0.8005,"gbps":393.65,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A2: fused gate+up+swiglu, quant_wave, down (3 nodes)","med_us":94.360,"p10_us":94.079,"p90_us":94.840,"ratio":0.7908,"gbps":398.49,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"base gate,up,swiglu only (3 nodes)","med_us":82.079,"p10_us":81.600,"p90_us":82.479,"ratio":0.6879,"gbps":305.41,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A only: fused gate+up+swiglu (1 node)","med_us":58.200,"p10_us":56.079,"p90_us":58.600,"ratio":0.4878,"gbps":430.71,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1: fused gate+up+swiglu+quant (WG 1024thr), down (2 nodes)","med_us":87.799,"p10_us":87.479,"p90_us":88.360,"ratio":0.7358,"gbps":428.27,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1 only: fused gate+up+swiglu+quant (1 node)","med_us":58.800,"p10_us":56.399,"p90_us":59.119,"ratio":0.4928,"gbps":426.32,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r2: fused gate+up+swiglu+quant (WG 512thr), down (2 nodes)","med_us":90.240,"p10_us":89.800,"p90_us":90.799,"ratio":0.7563,"gbps":416.68,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r2 only: fused gate+up+swiglu+quant (1 node)","med_us":58.920,"p10_us":57.159,"p90_us":59.599,"ratio":0.4938,"gbps":425.45,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r4: fused gate+up+swiglu+quant (WG 256thr), down (2 nodes)","med_us":90.039,"p10_us":89.480,"p90_us":91.039,"ratio":0.7546,"gbps":417.61,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r4 only: fused gate+up+swiglu+quant (1 node)","med_us":60.680,"p10_us":59.480,"p90_us":62.519,"ratio":0.5086,"gbps":413.11,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand tB chain: tB gate, tB up, swiglu, quant, tB down (5 nodes)","med_us":95.920,"p10_us":95.399,"p90_us":98.160,"ratio":0.8039,"gbps":392.01,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand B r1 + tB down (2 nodes)","med_us":84.839,"p10_us":84.520,"p90_us":85.080,"ratio":0.7110,"gbps":443.21,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"cand A2 + tB down (3 nodes)","med_us":89.879,"p10_us":89.440,"p90_us":90.239,"ratio":0.7533,"gbps":418.35,"graph":1,"flush":1}
+KBJSON {"tag":"shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) cold(readflush72MB) graph","variant":"null 1-WG kernel (launch floor)","med_us":15.800,"p10_us":15.560,"p90_us":17.720,"ratio":0.1324,"gbps":0.00,"graph":1,"flush":1}
+W20260926 19:26:22.463573 134900288772736 simple_timer.cpp:55] [rocprofv3] './harness shared 4' ::     0.615065 sec
+W20260926 19:26:22.474911 134900288772736 generateRocpd.cpp:583] writing SQL database for process 36682 on node 868250506
+E20260926 19:26:22.475181 134900288772736 generateRocpd.cpp:606] Opened result file: results/att_sharedB1_b4/run_results.db (UUID=00000023-f1bb-71bb-b6a0-0503a82f8338)
+W20260926 19:26:23.180235 134900288772736 simple_timer.cpp:55] SQLite3 generation :: rocpd_string             ::     0.015604 sec
+W20260926 19:26:23.191159 134900288772736 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_node          ::     0.010908 sec
+W20260926 19:26:23.203180 134900288772736 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_process       ::     0.012014 sec
+W20260926 19:26:23.236217 134900288772736 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_agent         ::     0.011077 sec
+W20260926 19:26:23.236234 134900288772736 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_pmc           ::     0.000007 sec
+W20260926 19:26:23.249168 134900288772736 simple_timer.cpp:55] SQLite3 generation :: rocpd kernel info        ::     0.012928 sec
+W20260926 19:26:23.249189 134900288772736 simple_timer.cpp:55] SQLite3 generation :: rocpd_region             ::     0.000002 sec
+W20260926 19:26:23.249192 134900288772736 simple_timer.cpp:55] SQLite3 generation :: rocpd_kernel_dispatch    ::     0.000000 sec
+W20260926 19:26:23.249194 134900288772736 simple_timer.cpp:55] SQLite3 generation :: rocpd_pmc_event          ::     0.000000 sec
+W20260926 19:26:23.249197 134900288772736 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_copy        ::     0.000000 sec
+W20260926 19:26:23.249199 134900288772736 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_allocate    ::     0.000001 sec
+W20260926 19:26:23.249322 134900288772736 simple_timer.cpp:55] SQLite3 generation :: SQL indexing             ::     0.000119 sec
+W20260926 19:26:23.249866 134900288772736 simple_timer.cpp:55] SQLite3 generation :: total                    ::     0.774955 sec
+E20260926 19:26:23.290686 134900288772736 att_lib_wrapper.cpp:66] unable to delete codeobj 5
+E20260926 19:26:23.290734 134900288772736 att_lib_wrapper.cpp:66] unable to delete codeobj 7
+E20260926 19:26:23.326796 134900288772736 att_lib_wrapper.cpp:66] unable to delete codeobj 5
+E20260926 19:26:23.326837 134900288772736 att_lib_wrapper.cpp:66] unable to delete codeobj 7
+W20260926 19:26:23.333737 134900288772736 simple_timer.cpp:55] [rocprofv3] output generation ::     0.867935 sec
+W20260926 19:26:23.333830 134900288772736 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.868031 sec
+results/att_sharedB1_b4/stats_ui_output_agent_26406_dispatch_96.csv
+results/att_sharedB1_b4/stats_ui_output_agent_26406_dispatch_98.csv

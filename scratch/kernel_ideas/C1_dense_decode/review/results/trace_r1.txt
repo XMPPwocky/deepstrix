@@ -1,0 +1,87 @@
+== 1790451831.000180.review.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+W20260926 19:44:57.677034 126309986749056 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000493 sec
+W20260926 19:44:57.677156 126309986749056 simple_timer.cpp:55] [rocprofv3] './gpad_check 32768 1 32768 2 32768 3 32768 4 65568 1' ::     0.000000 sec
+W20260926 19:44:57.700497 126309986749056 tool.cpp:2424] HSA version 1.18.0 initialized (instance=0)
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+SHAPE K=32768 b=1 blocks=1024 grid0=1024 | base vs CPU ref: xq_diff=0 xs_bitdiff=0 xs_unwritten(0xAAAAAAAA)=0
+CMP pad=1 grid=1025 vs grid=1024: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=7 grid=1031 vs grid=1024: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=64 grid=1088 vs grid=1024: xq_bytediff=0 xscale_bitdiff=0 bitexact
+
+== quantize K=32768 b=1 blocks=1024 WARM  (rounds=5 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+q8_0_quantize_f32 grid=blocks+0                7.21       7.17       7.30    1.000      22.7       0.0
+q8_0_quantize_f32 grid=blocks+1                7.22       7.19       7.26    1.002      22.7       0.0
+q8_0_quantize_f32 grid=blocks+7                7.20       7.18       7.29    0.998      22.8       0.0
+q8_0_quantize_f32 grid=blocks+64               7.20       7.18       7.22    0.998      22.8       0.0
+KBJSON {"tag":"quantize K=32768 b=1 blocks=1024 WARM","variant":"q8_0_quantize_f32 grid=blocks+0","med_us":7.208,"p10_us":7.168,"p90_us":7.300,"ratio":1.0000,"gbps":22.73,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=1 blocks=1024 WARM","variant":"q8_0_quantize_f32 grid=blocks+1","med_us":7.220,"p10_us":7.192,"p90_us":7.260,"ratio":1.0017,"gbps":22.69,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=1 blocks=1024 WARM","variant":"q8_0_quantize_f32 grid=blocks+7","med_us":7.196,"p10_us":7.184,"p90_us":7.288,"ratio":0.9983,"gbps":22.77,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=1 blocks=1024 WARM","variant":"q8_0_quantize_f32 grid=blocks+64","med_us":7.196,"p10_us":7.180,"p90_us":7.224,"ratio":0.9983,"gbps":22.77,"graph":1,"flush":0}
+SHAPE K=32768 b=2 blocks=2048 grid0=2048 | base vs CPU ref: xq_diff=0 xs_bitdiff=0 xs_unwritten(0xAAAAAAAA)=0
+CMP pad=1 grid=2049 vs grid=2048: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=7 grid=2055 vs grid=2048: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=64 grid=2112 vs grid=2048: xq_bytediff=0 xscale_bitdiff=0 bitexact
+
+== quantize K=32768 b=2 blocks=2048 WARM  (rounds=5 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+q8_0_quantize_f32 grid=blocks+0               19.35      19.31      19.38    1.000      16.9       0.0
+q8_0_quantize_f32 grid=blocks+1                8.36       8.31       8.42    0.432      39.2       0.0
+q8_0_quantize_f32 grid=blocks+7                8.39       8.36       8.41    0.433      39.1       0.0
+q8_0_quantize_f32 grid=blocks+64               8.34       8.32       8.34    0.431      39.3       0.0
+KBJSON {"tag":"quantize K=32768 b=2 blocks=2048 WARM","variant":"q8_0_quantize_f32 grid=blocks+0","med_us":19.352,"p10_us":19.312,"p90_us":19.376,"ratio":1.0000,"gbps":16.93,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=2 blocks=2048 WARM","variant":"q8_0_quantize_f32 grid=blocks+1","med_us":8.364,"p10_us":8.308,"p90_us":8.416,"ratio":0.4322,"gbps":39.18,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=2 blocks=2048 WARM","variant":"q8_0_quantize_f32 grid=blocks+7","med_us":8.388,"p10_us":8.360,"p90_us":8.408,"ratio":0.4334,"gbps":39.06,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=2 blocks=2048 WARM","variant":"q8_0_quantize_f32 grid=blocks+64","med_us":8.340,"p10_us":8.320,"p90_us":8.344,"ratio":0.4310,"gbps":39.29,"graph":1,"flush":0}
+SHAPE K=32768 b=3 blocks=3072 grid0=3072 | base vs CPU ref: xq_diff=0 xs_bitdiff=0 xs_unwritten(0xAAAAAAAA)=0
+CMP pad=1 grid=3073 vs grid=3072: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=7 grid=3079 vs grid=3072: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=64 grid=3136 vs grid=3072: xq_bytediff=0 xscale_bitdiff=0 bitexact
+
+== quantize K=32768 b=3 blocks=3072 WARM  (rounds=5 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+q8_0_quantize_f32 grid=blocks+0               15.28      12.93      15.39    1.000      32.2       0.0
+q8_0_quantize_f32 grid=blocks+1                9.51       9.50       9.54    0.622      51.7       0.0
+q8_0_quantize_f32 grid=blocks+7                9.52       9.50       9.52    0.623      51.7       0.0
+q8_0_quantize_f32 grid=blocks+64               9.49       9.45       9.51    0.621      51.8       0.0
+KBJSON {"tag":"quantize K=32768 b=3 blocks=3072 WARM","variant":"q8_0_quantize_f32 grid=blocks+0","med_us":15.276,"p10_us":12.928,"p90_us":15.388,"ratio":1.0000,"gbps":32.18,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=3 blocks=3072 WARM","variant":"q8_0_quantize_f32 grid=blocks+1","med_us":9.508,"p10_us":9.500,"p90_us":9.540,"ratio":0.6224,"gbps":51.69,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=3 blocks=3072 WARM","variant":"q8_0_quantize_f32 grid=blocks+7","med_us":9.516,"p10_us":9.496,"p90_us":9.524,"ratio":0.6229,"gbps":51.65,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=3 blocks=3072 WARM","variant":"q8_0_quantize_f32 grid=blocks+64","med_us":9.488,"p10_us":9.448,"p90_us":9.508,"ratio":0.6211,"gbps":51.80,"graph":1,"flush":0}
+SHAPE K=32768 b=4 blocks=4096 grid0=4096 | base vs CPU ref: xq_diff=0 xs_bitdiff=0 xs_unwritten(0xAAAAAAAA)=0
+CMP pad=1 grid=4097 vs grid=4096: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=7 grid=4103 vs grid=4096: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=64 grid=4160 vs grid=4096: xq_bytediff=0 xscale_bitdiff=0 bitexact
+
+== quantize K=32768 b=4 blocks=4096 WARM  (rounds=5 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+q8_0_quantize_f32 grid=blocks+0               22.11      21.01      22.18    1.000      29.6       0.0
+q8_0_quantize_f32 grid=blocks+1               10.70      10.66      10.72    0.484      61.3       0.0
+q8_0_quantize_f32 grid=blocks+7               10.65      10.63      10.68    0.482      61.5       0.0
+q8_0_quantize_f32 grid=blocks+64              10.66      10.64      10.72    0.482      61.5       0.0
+KBJSON {"tag":"quantize K=32768 b=4 blocks=4096 WARM","variant":"q8_0_quantize_f32 grid=blocks+0","med_us":22.108,"p10_us":21.012,"p90_us":22.184,"ratio":1.0000,"gbps":29.64,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=4 blocks=4096 WARM","variant":"q8_0_quantize_f32 grid=blocks+1","med_us":10.696,"p10_us":10.660,"p90_us":10.724,"ratio":0.4838,"gbps":61.27,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=4 blocks=4096 WARM","variant":"q8_0_quantize_f32 grid=blocks+7","med_us":10.652,"p10_us":10.632,"p90_us":10.680,"ratio":0.4818,"gbps":61.52,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=32768 b=4 blocks=4096 WARM","variant":"q8_0_quantize_f32 grid=blocks+64","med_us":10.660,"p10_us":10.640,"p90_us":10.716,"ratio":0.4822,"gbps":61.48,"graph":1,"flush":0}
+SHAPE K=65568 b=1 blocks=2049 grid0=2049 | base vs CPU ref: xq_diff=0 xs_bitdiff=0 xs_unwritten(0xAAAAAAAA)=0
+CMP pad=1 grid=2050 vs grid=2049: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=7 grid=2056 vs grid=2049: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=64 grid=2113 vs grid=2049: xq_bytediff=0 xscale_bitdiff=0 bitexact
+
+== quantize K=65568 b=1 blocks=2049 WARM  (rounds=5 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+q8_0_quantize_f32 grid=blocks+0                8.36       8.35       8.44    1.000      39.2       0.0
+q8_0_quantize_f32 grid=blocks+1                8.38       8.31       8.40    1.002      39.1       0.0
+q8_0_quantize_f32 grid=blocks+7                8.38       8.24       8.39    1.002      39.1       0.0
+q8_0_quantize_f32 grid=blocks+64               8.38       8.32       8.39    1.001      39.1       0.0
+KBJSON {"tag":"quantize K=65568 b=1 blocks=2049 WARM","variant":"q8_0_quantize_f32 grid=blocks+0","med_us":8.364,"p10_us":8.352,"p90_us":8.436,"ratio":1.0000,"gbps":39.20,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=65568 b=1 blocks=2049 WARM","variant":"q8_0_quantize_f32 grid=blocks+1","med_us":8.384,"p10_us":8.308,"p90_us":8.404,"ratio":1.0024,"gbps":39.10,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=65568 b=1 blocks=2049 WARM","variant":"q8_0_quantize_W20260926 19:44:59.257821 126309986749056 simple_timer.cpp:55] [rocprofv3] './gpad_check 32768 1 32768 2 32768 3 32768 4 65568 1' ::     1.580665 sec
+E20260926 19:44:59.259269 126309986749056 output_stream.cpp:111] Opened result file: /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/C1_dense_decode/review/trace_r1/run_kernel_trace.csv
+E20260926 19:44:59.264444 126309986749056 output_stream.cpp:111] Opened result file: /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/C1_dense_decode/review/trace_r1/run_agent_info.csv
+W20260926 19:44:59.264630 126309986749056 simple_timer.cpp:55] [rocprofv3] output generation ::     0.006650 sec
+W20260926 19:44:59.264661 126309986749056 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.006700 sec
+f32 grid=blocks+7","med_us":8.380,"p10_us":8.240,"p90_us":8.388,"ratio":1.0019,"gbps":39.12,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=65568 b=1 blocks=2049 WARM","variant":"q8_0_quantize_f32 grid=blocks+64","med_us":8.376,"p10_us":8.324,"p90_us":8.388,"ratio":1.0014,"gbps":39.14,"graph":1,"flush":0}
+RESULT: all padded launches bit-exact vs production grid

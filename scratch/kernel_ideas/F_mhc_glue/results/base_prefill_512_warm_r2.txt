@@ -1,0 +1,20 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+== prefill mHC chain B=512 direct warm  (rounds=30 inner=3 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+rms_norm_no_weight_batched (B,1)             123.84     122.69     126.77    1.000     677.4       0.0
+f16_gemm_wmma_lds_tiled M=24 (1,B/64)        445.27     440.66     475.99    3.596      96.4       0.0
+hc_sinkhorn_par_batched (B)x16                 8.75       8.63       8.85    0.071      11.2       0.0
+hc_weighted_sum_batched (20,1,B)              58.65      42.31      59.44    0.474     893.9       0.0
+rms_norm_weighted_batched (B) 5120            34.64      34.29      36.25    0.280     605.4       0.0
+CHAIN rms_nw+gemm+sink+hcw+copy+rmsw         719.95     716.66     723.75    5.814     276.7       0.0
+mhc_fast collapse-only (1,1,B) [hcw+rmsw fused, prod kernel]      37.68      37.35      37.84    0.304    1669.7       0.0
+KBJSON {"tag":"prefill mHC chain B=512 direct warm","variant":"rms_norm_no_weight_batched (B,1)","med_us":123.841,"p10_us":122.695,"p90_us":126.775,"ratio":1.0000,"gbps":677.37,"graph":0,"flush":0}
+KBJSON {"tag":"prefill mHC chain B=512 direct warm","variant":"f16_gemm_wmma_lds_tiled M=24 (1,B/64)","med_us":445.271,"p10_us":440.658,"p90_us":475.991,"ratio":3.5955,"gbps":96.40,"graph":0,"flush":0}
+KBJSON {"tag":"prefill mHC chain B=512 direct warm","variant":"hc_sinkhorn_par_batched (B)x16","med_us":8.747,"p10_us":8.627,"p90_us":8.853,"ratio":0.0706,"gbps":11.24,"graph":0,"flush":0}
+KBJSON {"tag":"prefill mHC chain B=512 direct warm","variant":"hc_weighted_sum_batched (20,1,B)","med_us":58.654,"p10_us":42.307,"p90_us":59.440,"ratio":0.4736,"gbps":893.87,"graph":0,"flush":0}
+KBJSON {"tag":"prefill mHC chain B=512 direct warm","variant":"rms_norm_weighted_batched (B) 5120","med_us":34.640,"p10_us":34.294,"p90_us":36.254,"ratio":0.2797,"gbps":605.41,"graph":0,"flush":0}
+KBJSON {"tag":"prefill mHC chain B=512 direct warm","variant":"CHAIN rms_nw+gemm+sink+hcw+copy+rmsw","med_us":719.953,"p10_us":716.660,"p90_us":723.753,"ratio":5.8135,"gbps":276.73,"graph":0,"flush":0}
+KBJSON {"tag":"prefill mHC chain B=512 direct warm","variant":"mhc_fast collapse-only (1,1,B) [hcw+rmsw fused, prod kernel]","med_us":37.680,"p10_us":37.347,"p90_us":37.840,"ratio":0.3043,"gbps":1669.69,"graph":0,"flush":0}
+CMP mhc_fast collapse vs hcw+rmsw (norm) n=2621440 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"mhc_fast collapse vs hcw+rmsw (norm)","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}

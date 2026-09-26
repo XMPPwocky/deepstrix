@@ -1,0 +1,187 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+SEL topk_select_regsort n=4097 real                    b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_regsort n=4097 real","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=4097 real                         b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3 n=4097 real","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=4097 real                      b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3_u8 n=4097 real","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_regsort n=4097 ties                    b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_regsort n=4097 ties","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=4097 ties                         b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3 n=4097 ties","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=4097 ties                      b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3_u8 n=4097 ties","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_regsort n=4097 ties+mask               b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_regsort n=4097 ties+mask","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=4097 ties+mask                    b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3 n=4097 ties+mask","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=4097 ties+mask                 b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3_u8 n=4097 ties+mask","b":1,"exact":1,"diff":0,"done_diff":0}
+
+== topk n=4097 b=1 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base select_ilp + chain early-outs (prod)      58.74      58.58      58.86    1.000       0.3       0.0
+base select_ilp alone                         54.48      54.41      54.59    0.928       0.3       0.0
+cand topk_select_regsort alone                34.04      33.94      34.09    0.580       0.5       0.0
+cand topk_select_v3 alone                     33.47      33.40      33.54    0.570       0.5       0.0
+cand topk_select_v3_u8 alone                  33.30      33.22      33.38    0.567       0.5       0.0
+KBJSON {"tag":"topk n=4097 b=1 WARM scores, graph inner=5","variant":"base select_ilp + chain early-outs (prod)","med_us":58.737,"p10_us":58.585,"p90_us":58.865,"ratio":1.0000,"gbps":0.28,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=4097 b=1 WARM scores, graph inner=5","variant":"base select_ilp alone","med_us":54.481,"p10_us":54.409,"p90_us":54.593,"ratio":0.9275,"gbps":0.30,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=4097 b=1 WARM scores, graph inner=5","variant":"cand topk_select_regsort alone","med_us":34.040,"p10_us":33.936,"p90_us":34.088,"ratio":0.5795,"gbps":0.48,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=4097 b=1 WARM scores, graph inner=5","variant":"cand topk_select_v3 alone","med_us":33.472,"p10_us":33.400,"p90_us":33.536,"ratio":0.5699,"gbps":0.49,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=4097 b=1 WARM scores, graph inner=5","variant":"cand topk_select_v3_u8 alone","med_us":33.296,"p10_us":33.224,"p90_us":33.384,"ratio":0.5669,"gbps":0.49,"graph":1,"flush":0}
+SEL topk_select_regsort n=4097 real                    b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_regsort n=4097 real","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=4097 real                         b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3 n=4097 real","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=4097 real                      b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3_u8 n=4097 real","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_regsort n=4097 ties                    b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_regsort n=4097 ties","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=4097 ties                         b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3 n=4097 ties","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=4097 ties                      b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3_u8 n=4097 ties","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_regsort n=4097 ties+mask               b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_regsort n=4097 ties+mask","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=4097 ties+mask                    b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3 n=4097 ties+mask","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=4097 ties+mask                 b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3_u8 n=4097 ties+mask","b":8,"exact":1,"diff":0,"done_diff":0}
+
+== topk n=4097 b=8 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base select_ilp + chain early-outs (prod)      58.57      58.40      58.74    1.000       2.2       0.0
+base select_ilp alone                         54.36      54.20      54.50    0.928       2.4       0.0
+cand topk_select_regsort alone                33.98      33.89      34.08    0.580       3.9       0.0
+cand topk_select_v3 alone                     33.41      33.26      33.51    0.570       3.9       0.0
+cand topk_select_v3_u8 alone                  33.26      33.17      33.36    0.568       3.9       0.0
+KBJSON {"tag":"topk n=4097 b=8 WARM scores, graph inner=5","variant":"base select_ilp + chain early-outs (prod)","med_us":58.569,"p10_us":58.401,"p90_us":58.737,"ratio":1.0000,"gbps":2.24,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=4097 b=8 WARM scores, graph inner=5","variant":"base select_ilp alone","med_us":54.361,"p10_us":54.201,"p90_us":54.504,"ratio":0.9282,"gbps":2.41,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=4097 b=8 WARM scores, graph inner=5","variant":"cand topk_select_regsort alone","med_us":33.984,"p10_us":33.888,"p90_us":34.080,"ratio":0.5802,"gbps":3.86,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=4097 b=8 WARM scores, graph inner=5","variant":"cand topk_select_v3 alone","med_us":33.408,"p10_us":33.264,"p90_us":33.512,"ratio":0.5704,"gbps":3.92,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=4097 b=8 WARM scores, graph inner=5","variant":"cand topk_select_v3_u8 alone","med_us":33.256,"p10_us":33.168,"p90_us":33.360,"ratio":0.5678,"gbps":3.94,"graph":1,"flush":0}
+SEL topk_select_regsort n=100003 real                  b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_regsort n=100003 real","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=100003 real                       b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3 n=100003 real","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=100003 real                    b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3_u8 n=100003 real","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_regsort n=100003 ties                  b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_regsort n=100003 ties","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=100003 ties                       b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3 n=100003 ties","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=100003 ties                    b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3_u8 n=100003 ties","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_regsort n=100003 ties+mask             b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_regsort n=100003 ties+mask","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=100003 ties+mask                  b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3 n=100003 ties+mask","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=100003 ties+mask               b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3_u8 n=100003 ties+mask","b":1,"exact":1,"diff":0,"done_diff":0}
+
+== topk n=100003 b=1 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base select_ilp + chain early-outs (prod)      69.25      69.14      69.33    1.000       5.8       0.0
+base select_ilp alone                         62.82      62.77      62.88    0.907       6.4       0.0
+cand topk_select_regsort alone                42.09      42.02      42.11    0.608       9.5       0.0
+cand topk_select_v3 alone                     42.22      42.18      42.29    0.610       9.5       0.0
+cand topk_select_v3_u8 alone                  40.76      40.73      40.81    0.589       9.8       0.0
+KBJSON {"tag":"topk n=100003 b=1 WARM scores, graph inner=5","variant":"base select_ilp + chain early-outs (prod)","med_us":69.249,"p10_us":69.137,"p90_us":69.329,"ratio":1.0000,"gbps":5.78,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=100003 b=1 WARM scores, graph inner=5","variant":"base select_ilp alone","med_us":62.817,"p10_us":62.769,"p90_us":62.881,"ratio":0.9071,"gbps":6.37,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=100003 b=1 WARM scores, graph inner=5","variant":"cand topk_select_regsort alone","med_us":42.088,"p10_us":42.016,"p90_us":42.112,"ratio":0.6078,"gbps":9.50,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=100003 b=1 WARM scores, graph inner=5","variant":"cand topk_select_v3 alone","med_us":42.224,"p10_us":42.176,"p90_us":42.288,"ratio":0.6098,"gbps":9.47,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=100003 b=1 WARM scores, graph inner=5","variant":"cand topk_select_v3_u8 alone","med_us":40.760,"p10_us":40.728,"p90_us":40.808,"ratio":0.5886,"gbps":9.81,"graph":1,"flush":0}
+SEL topk_select_regsort n=100003 real                  b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_regsort n=100003 real","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=100003 real                       b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3 n=100003 real","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=100003 real                    b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3_u8 n=100003 real","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_regsort n=100003 ties                  b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_regsort n=100003 ties","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=100003 ties                       b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3 n=100003 ties","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=100003 ties                    b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3_u8 n=100003 ties","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_regsort n=100003 ties+mask             b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_regsort n=100003 ties+mask","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=100003 ties+mask                  b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3 n=100003 ties+mask","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=100003 ties+mask               b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3_u8 n=100003 ties+mask","b":8,"exact":1,"diff":0,"done_diff":0}
+
+== topk n=100003 b=8 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base select_ilp + chain early-outs (prod)      71.90      71.84      71.94    1.000      44.5       0.0
+base select_ilp alone                         66.22      66.16      66.34    0.921      48.3       0.0
+cand topk_select_regsort alone                43.49      43.47      43.54    0.605      73.6       0.0
+cand topk_select_v3 alone                     43.69      43.63      43.75    0.608      73.2       0.0
+cand topk_select_v3_u8 alone                  42.26      42.21      42.31    0.588      75.7       0.0
+KBJSON {"tag":"topk n=100003 b=8 WARM scores, graph inner=5","variant":"base select_ilp + chain early-outs (prod)","med_us":71.897,"p10_us":71.841,"p90_us":71.945,"ratio":1.0000,"gbps":44.51,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=100003 b=8 WARM scores, graph inner=5","variant":"base select_ilp alone","med_us":66.217,"p10_us":66.161,"p90_us":66.337,"ratio":0.9210,"gbps":48.33,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=100003 b=8 WARM scores, graph inner=5","variant":"cand topk_select_regsort alone","med_us":43.489,"p10_us":43.472,"p90_us":43.536,"ratio":0.6049,"gbps":73.58,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=100003 b=8 WARM scores, graph inner=5","variant":"cand topk_select_v3 alone","med_us":43.689,"p10_us":43.632,"p90_us":43.752,"ratio":0.6077,"gbps":73.25,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=100003 b=8 WARM scores, graph inner=5","variant":"cand topk_select_v3_u8 alone","med_us":42.257,"p10_us":42.208,"p90_us":42.313,"ratio":0.5877,"gbps":75.73,"graph":1,"flush":0}
+SEL topk_select_regsort n=235001 real                  b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_regsort n=235001 real","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=235001 real                       b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3 n=235001 real","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=235001 real                    b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3_u8 n=235001 real","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_regsort n=235001 ties                  b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_regsort n=235001 ties","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=235001 ties                       b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3 n=235001 ties","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=235001 ties                    b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3_u8 n=235001 ties","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_regsort n=235001 ties+mask             b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_regsort n=235001 ties+mask","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=235001 ties+mask                  b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3 n=235001 ties+mask","b":1,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=235001 ties+mask               b=1 exact=YES diff=0 first_diff=-1 done_diff=0 done=[1]
+KBJSON {"sel":"topk_select_v3_u8 n=235001 ties+mask","b":1,"exact":1,"diff":0,"done_diff":0}
+
+== topk n=235001 b=1 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base select_ilp + chain early-outs (prod)      91.24      91.15      91.34    1.000      10.3       0.0
+base select_ilp alone                         84.33      84.22      84.40    0.924      11.1       0.0
+cand topk_select_regsort alone                62.37      62.30      62.42    0.684      15.1       0.0
+cand topk_select_v3 alone                     61.26      61.18      61.34    0.671      15.3       0.0
+cand topk_select_v3_u8 alone                  57.94      57.90      58.02    0.635      16.2       0.0
+KBJSON {"tag":"topk n=235001 b=1 WARM scores, graph inner=5","variant":"base select_ilp + chain early-outs (prod)","med_us":91.241,"p10_us":91.145,"p90_us":91.337,"ratio":1.0000,"gbps":10.30,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=235001 b=1 WARM scores, graph inner=5","variant":"base select_ilp alone","med_us":84.329,"p10_us":84.225,"p90_us":84.401,"ratio":0.9242,"gbps":11.15,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=235001 b=1 WARM scores, graph inner=5","variant":"cand topk_select_regsort alone","med_us":62.369,"p10_us":62.297,"p90_us":62.425,"ratio":0.6836,"gbps":15.07,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=235001 b=1 WARM scores, graph inner=5","variant":"cand topk_select_v3 alone","med_us":61.265,"p10_us":61.177,"p90_us":61.337,"ratio":0.6715,"gbps":15.34,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=235001 b=1 WARM scores, graph inner=5","variant":"cand topk_select_v3_u8 alone","med_us":57.945,"p10_us":57.897,"p90_us":58.017,"ratio":0.6351,"gbps":16.22,"graph":1,"flush":0}
+SEL topk_select_regsort n=235001 real                  b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_regsort n=235001 real","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=235001 real                       b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3 n=235001 real","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=235001 real                    b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3_u8 n=235001 real","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_regsort n=235001 ties                  b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_regsort n=235001 ties","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=235001 ties                       b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3 n=235001 ties","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=235001 ties                    b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3_u8 n=235001 ties","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_regsort n=235001 ties+mask             b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_regsort n=235001 ties+mask","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3 n=235001 ties+mask                  b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3 n=235001 ties+mask","b":8,"exact":1,"diff":0,"done_diff":0}
+SEL topk_select_v3_u8 n=235001 ties+mask               b=8 exact=YES diff=0 first_diff=-1 done_diff=0 done=[11111111]
+KBJSON {"sel":"topk_select_v3_u8 n=235001 ties+mask","b":8,"exact":1,"diff":0,"done_diff":0}
+
+== topk n=235001 b=8 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base select_ilp + chain early-outs (prod)     108.01     107.83     108.12    1.000      69.6       0.0
+base select_ilp alone                         86.65      86.54      86.77    0.802      86.8       0.0
+cand topk_select_regsort alone                66.13      65.99      66.18    0.612     113.7       0.0
+cand topk_select_v3 alone                     63.05      62.91      63.13    0.584     119.3       0.0
+cand topk_select_v3_u8 alone                  59.76      59.70      59.84    0.553     125.8       0.0
+KBJSON {"tag":"topk n=235001 b=8 WARM scores, graph inner=5","variant":"base select_ilp + chain early-outs (prod)","med_us":108.009,"p10_us":107.825,"p90_us":108.121,"ratio":1.0000,"gbps":69.62,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=235001 b=8 WARM scores, graph inner=5","variant":"base select_ilp alone","med_us":86.649,"p10_us":86.545,"p90_us":86.769,"ratio":0.8022,"gbps":86.79,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=235001 b=8 WARM scores, graph inner=5","variant":"cand topk_select_regsort alone","med_us":66.129,"p10_us":65.993,"p90_us":66.185,"ratio":0.6122,"gbps":113.72,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=235001 b=8 WARM scores, graph inner=5","variant":"cand topk_select_v3 alone","med_us":63.049,"p10_us":62.913,"p90_us":63.129,"ratio":0.5837,"gbps":119.27,"graph":1,"flush":0}
+KBJSON {"tag":"topk n=235001 b=8 WARM scores, graph inner=5","variant":"cand topk_select_v3_u8 alone","med_us":59.761,"p10_us":59.697,"p90_us":59.841,"ratio":0.5533,"gbps":125.84,"graph":1,"flush":0}

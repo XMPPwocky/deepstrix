@@ -1,0 +1,33 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[h] pool: 16 experts x 18.8 MB = 301 MB on device
+[h] b=8 E=8 ppr=6: members/call=48.0 distinct experts/call=8 n_wi exact=8 bound=48
+[h] distinct experts actually read per call (avg over 8 selections): 8.00
+base out: 40960/40960 nonzero, 0 nonfinite, out[0..3]=-111.829 -207.262 96.0366 -89.0476
+CMP twin(hetsplit b=1 per row) mid vs base n=110592 bitexact=no bit_diff=74041 nonfinite=0 max_abs=2.670e-05 max_rel=7.173e-03 rmse=2.408e-06 rel_rmse=1.864e-07 worst_idx=18193
+KBJSON {"cmp":"twin(hetsplit b=1 per row) mid vs base","bitexact":0,"bit_diff":74041,"nonfinite":0,"max_abs":2.6703e-05,"rel_rmse":1.8643e-07}
+CMP twin(hetsplit b=1 per row) out vs base n=40960 bitexact=no bit_diff=31740 nonfinite=0 max_abs=4.170e-01 max_rel=3.449e-01 rmse=2.992e-02 rel_rmse=6.598e-05 worst_idx=6596
+KBJSON {"cmp":"twin(hetsplit b=1 per row) out vs base","bitexact":0,"bit_diff":31740,"nonfinite":0,"max_abs":4.1699e-01,"rel_rmse":6.5979e-05}
+CMP kwide_c8.c8 mid vs base            n=110592 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"kwide_c8.c8 mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP kwide_c8.c8 partials vs base       n=245760 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"kwide_c8.c8 partials vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP kwide_c8.c8 out vs base            n=40960 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"kwide_c8.c8 out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP kwide_c8.c8 out over 8 selections: worst bit_diff=0 worst rel_rmse=0.000e+00
+CMP base.c8 mid vs base                n=110592 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"base.c8 mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP base.c8 partials vs base           n=245760 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"base.c8 partials vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP base.c8 out vs base                n=40960 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"base.c8 out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP base.c8 out over 8 selections: worst bit_diff=0 worst rel_rmse=0.000e+00
+
+== b=8 E=8 ppr=6 P=16 gbound=384 bound-grid cold-rotating  (rounds=40 inner=8 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base chain (builders+kwide+q8k+kwide2+reduce)    1122.48    1092.74    1144.26    1.000     134.0    3026.7
+cand kwide_c8.c8                            1060.06    1032.63    1075.46    0.944     141.9    3204.9
+cand base.c8                                1128.48    1094.37    1145.36    1.005     133.3    3010.6
+KBJSON {"tag":"b=8 E=8 ppr=6 P=16 gbound=384 bound-grid cold-rotating","variant":"base chain (builders+kwide+q8k+kwide2+reduce)","med_us":1122.476,"p10_us":1092.736,"p90_us":1144.255,"ratio":1.0000,"gbps":133.99,"graph":1,"flush":0}
+KBJSON {"tag":"b=8 E=8 ppr=6 P=16 gbound=384 bound-grid cold-rotating","variant":"cand kwide_c8.c8","med_us":1060.062,"p10_us":1032.628,"p90_us":1075.457,"ratio":0.9444,"gbps":141.88,"graph":1,"flush":0}
+KBJSON {"tag":"b=8 E=8 ppr=6 P=16 gbound=384 bound-grid cold-rotating","variant":"cand base.c8","med_us":1128.480,"p10_us":1094.366,"p90_us":1145.365,"ratio":1.0053,"gbps":133.28,"graph":1,"flush":0}
+roofline: 8.00 distinct experts x 18.8 MB = 150.4 MB/call -> 702.8 us at 214 GB/s (651.1 us at 231)

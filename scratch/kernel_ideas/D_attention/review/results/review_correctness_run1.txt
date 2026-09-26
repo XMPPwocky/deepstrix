@@ -1,0 +1,19 @@
+== 1790452757.000298.review.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+b=1 mixed-mag fp8                                rows=1  f32 changed by roundtrip: 0 / 512 (nan in 0)   f16 cache bits differ: 0
+b=3 odd, n_raw_before=5 fp8                      rows=3  f32 changed by roundtrip: 0 / 1536 (nan in 0)   f16 cache bits differ: 0
+b=5 n_raw_before=127 fp8                         rows=5  f32 changed by roundtrip: 0 / 2560 (nan in 0)   f16 cache bits differ: 0
+b=7 fp8                                          rows=7  f32 changed by roundtrip: 0 / 3584 (nan in 0)   f16 cache bits differ: 0
+b=8 arena slot_per fp8                           rows=8  f32 changed by roundtrip: 0 / 4096 (nan in 0)   f16 cache bits differ: 0
+b=4 arena slot_per fp8                           rows=4  f32 changed by roundtrip: 0 / 2048 (nan in 0)   f16 cache bits differ: 0
+b=512 prefill n_raw_before=128 fp8               rows=512  f32 changed by roundtrip: 33120 / 262144 (nan in 0)   f16 cache bits differ: 0
+b=8 f16 rounding TIES, raw (no fp8)              rows=8  f32 changed by roundtrip: 4096 / 4096 (nan in 0)   f16 cache bits differ: 0
+b=8 f16 rounding ties, fp8                       rows=8  f32 changed by roundtrip: 0 / 4096 (nan in 0)   f16 cache bits differ: 0
+b=8 f16 subnormal range, raw                     rows=8  f32 changed by roundtrip: 4096 / 4096 (nan in 0)   f16 cache bits differ: 0
+b=8 f16 subnormal range, fp8                     rows=8  f32 changed by roundtrip: 2037 / 4096 (nan in 0)   f16 cache bits differ: 0
+b=8 |x| up to 70000 (f16 overflow), raw          rows=8  f32 changed by roundtrip: 4095 / 4096 (nan in 0)   f16 cache bits differ: 0
+b=8 |x| up to 70000, fp8                         rows=8  f32 changed by roundtrip: 375 / 4096 (nan in 0)   f16 cache bits differ: 0
+b=8 specials -0/inf/nan/65520, raw               rows=8  f32 changed by roundtrip: 1364 / 4096 (nan in 658)   f16 cache bits differ: 0
+b=512 ties raw slot_per                          rows=512  f32 changed by roundtrip: 262144 / 262144 (nan in 0)   f16 cache bits differ: 0
+KBJSON {"cmp":"review f16_roundtrip no-op (cache bits)","cases":15,"bitexact":1,"bit_diff":0,"f32_changed_by_rt":311327}

@@ -1,0 +1,85 @@
+== 1790452056.000218.review.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+#### tail 1004 5120 4 4
+CMP tail 1004x5120 merged tB8 vs 2 production lanes n=8032 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 1004x5120 merged tB8 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tail 1004x5120 2 production lanes vs cpu_ref n=8032 bitexact=no bit_diff=4909 nonfinite=0 max_abs=1.831e-04 max_rel=5.749e-04 rmse=2.844e-05 rel_rmse=8.762e-08 worst_idx=7609
+KBJSON {"cmp":"tail 1004x5120 2 production lanes vs cpu_ref","bitexact":0,"bit_diff":4909,"nonfinite":0,"max_abs":1.8311e-04,"rel_rmse":8.7622e-08}
+CMP tail 1004x5120 merged tB8 vs cpu_ref n=8032 bitexact=no bit_diff=4909 nonfinite=0 max_abs=1.831e-04 max_rel=5.749e-04 rmse=2.844e-05 rel_rmse=8.762e-08 worst_idx=7609
+KBJSON {"cmp":"tail 1004x5120 merged tB8 vs cpu_ref","bitexact":0,"bit_diff":4909,"nonfinite":0,"max_abs":1.8311e-04,"rel_rmse":8.7622e-08}
+CMP tail 1004x5120 tB4+tB4 vs 2 production lanes n=8032 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 1004x5120 tB4+tB4 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+#### tail 1000 5120 4 3
+CMP tail 1000x5120 merged tB7 vs 2 production lanes n=7000 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 1000x5120 merged tB7 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tail 1000x5120 2 production lanes vs cpu_ref n=7000 bitexact=no bit_diff=4274 nonfinite=0 max_abs=1.221e-04 max_rel=2.163e-04 rmse=2.909e-05 rel_rmse=8.598e-08 worst_idx=125
+KBJSON {"cmp":"tail 1000x5120 2 production lanes vs cpu_ref","bitexact":0,"bit_diff":4274,"nonfinite":0,"max_abs":1.2207e-04,"rel_rmse":8.5980e-08}
+CMP tail 1000x5120 merged tB7 vs cpu_ref n=7000 bitexact=no bit_diff=4274 nonfinite=0 max_abs=1.221e-04 max_rel=2.163e-04 rmse=2.909e-05 rel_rmse=8.598e-08 worst_idx=125
+KBJSON {"cmp":"tail 1000x5120 merged tB7 vs cpu_ref","bitexact":0,"bit_diff":4274,"nonfinite":0,"max_abs":1.2207e-04,"rel_rmse":8.5980e-08}
+CMP tail 1000x5120 tB4+tB3 vs 2 production lanes n=7000 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 1000x5120 tB4+tB3 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+#### tail 8 5120 1 1
+CMP tail 8x5120 merged tB2 vs 2 production lanes n=16 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 8x5120 merged tB2 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tail 8x5120 2 production lanes vs cpu_ref n=16 bitexact=no bit_diff=11 nonfinite=0 max_abs=6.104e-05 max_rel=7.307e-07 rmse=3.412e-05 rel_rmse=1.133e-07 worst_idx=1
+KBJSON {"cmp":"tail 8x5120 2 production lanes vs cpu_ref","bitexact":0,"bit_diff":11,"nonfinite":0,"max_abs":6.1035e-05,"rel_rmse":1.1327e-07}
+CMP tail 8x5120 merged tB2 vs cpu_ref  n=16 bitexact=no bit_diff=11 nonfinite=0 max_abs=6.104e-05 max_rel=7.307e-07 rmse=3.412e-05 rel_rmse=1.133e-07 worst_idx=1
+KBJSON {"cmp":"tail 8x5120 merged tB2 vs cpu_ref","bitexact":0,"bit_diff":11,"nonfinite":0,"max_abs":6.1035e-05,"rel_rmse":1.1327e-07}
+CMP tail 8x5120 tB1+tB1 vs 2 production lanes n=16 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 8x5120 tB1+tB1 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+#### tail 2312 2304 5 3
+CMP tail 2312x2304 merged tB8 vs 2 production lanes n=18496 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 2312x2304 merged tB8 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tail 2312x2304 2 production lanes vs cpu_ref n=18496 bitexact=no bit_diff=9107 nonfinite=0 max_abs=1.221e-04 max_rel=6.863e-04 rmse=1.562e-05 rel_rmse=6.992e-08 worst_idx=6323
+KBJSON {"cmp":"tail 2312x2304 2 production lanes vs cpu_ref","bitexact":0,"bit_diff":9107,"nonfinite":0,"max_abs":1.2207e-04,"rel_rmse":6.9918e-08}
+CMP tail 2312x2304 merged tB8 vs cpu_ref n=18496 bitexact=no bit_diff=9107 nonfinite=0 max_abs=1.221e-04 max_rel=6.863e-04 rmse=1.562e-05 rel_rmse=6.992e-08 worst_idx=6323
+KBJSON {"cmp":"tail 2312x2304 merged tB8 vs cpu_ref","bitexact":0,"bit_diff":9107,"nonfinite":0,"max_abs":1.2207e-04,"rel_rmse":6.9918e-08}
+CMP tail 2312x2304 tB5+tB3 vs 2 production lanes n=18496 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 2312x2304 tB5+tB3 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+#### tail 1280 5120 1 7
+CMP tail 1280x5120 merged tB8 vs 2 production lanes n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 1280x5120 merged tB8 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tail 1280x5120 2 production lanes vs cpu_ref n=10240 bitexact=no bit_diff=6255 nonfinite=0 max_abs=2.441e-04 max_rel=1.159e-03 rmse=2.922e-05 rel_rmse=8.738e-08 worst_idx=2034
+KBJSON {"cmp":"tail 1280x5120 2 production lanes vs cpu_ref","bitexact":0,"bit_diff":6255,"nonfinite":0,"max_abs":2.4414e-04,"rel_rmse":8.7383e-08}
+CMP tail 1280x5120 merged tB8 vs cpu_ref n=10240 bitexact=no bit_diff=6255 nonfinite=0 max_abs=2.441e-04 max_rel=1.159e-03 rmse=2.922e-05 rel_rmse=8.738e-08 worst_idx=2034
+KBJSON {"cmp":"tail 1280x5120 merged tB8 vs cpu_ref","bitexact":0,"bit_diff":6255,"nonfinite":0,"max_abs":2.4414e-04,"rel_rmse":8.7383e-08}
+CMP tail 1280x5120 tB1+tB7 vs 2 production lanes n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 1280x5120 tB1+tB7 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+#### tail 1280 5120 2 6
+CMP tail 1280x5120 merged tB8 vs 2 production lanes n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 1280x5120 merged tB8 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tail 1280x5120 2 production lanes vs cpu_ref n=10240 bitexact=no bit_diff=6345 nonfinite=0 max_abs=1.526e-04 max_rel=9.381e-04 rmse=2.900e-05 rel_rmse=8.773e-08 worst_idx=3123
+KBJSON {"cmp":"tail 1280x5120 2 production lanes vs cpu_ref","bitexact":0,"bit_diff":6345,"nonfinite":0,"max_abs":1.5259e-04,"rel_rmse":8.7731e-08}
+CMP tail 1280x5120 merged tB8 vs cpu_ref n=10240 bitexact=no bit_diff=6345 nonfinite=0 max_abs=1.526e-04 max_rel=9.381e-04 rmse=2.900e-05 rel_rmse=8.773e-08 worst_idx=3123
+KBJSON {"cmp":"tail 1280x5120 merged tB8 vs cpu_ref","bitexact":0,"bit_diff":6345,"nonfinite":0,"max_abs":1.5259e-04,"rel_rmse":8.7731e-08}
+CMP tail 1280x5120 tB2+tB6 vs 2 production lanes n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 1280x5120 tB2+tB6 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+#### tail 1280 5120 1 1
+CMP tail 1280x5120 merged tB2 vs 2 production lanes n=2560 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 1280x5120 merged tB2 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tail 1280x5120 2 production lanes vs cpu_ref n=2560 bitexact=no bit_diff=1598 nonfinite=0 max_abs=1.221e-04 max_rel=6.302e-04 rmse=2.974e-05 rel_rmse=8.749e-08 worst_idx=718
+KBJSON {"cmp":"tail 1280x5120 2 production lanes vs cpu_ref","bitexact":0,"bit_diff":1598,"nonfinite":0,"max_abs":1.2207e-04,"rel_rmse":8.7486e-08}
+CMP tail 1280x5120 merged tB2 vs cpu_ref n=2560 bitexact=no bit_diff=1598 nonfinite=0 max_abs=1.221e-04 max_rel=6.302e-04 rmse=2.974e-05 rel_rmse=8.749e-08 worst_idx=718
+KBJSON {"cmp":"tail 1280x5120 merged tB2 vs cpu_ref","bitexact":0,"bit_diff":1598,"nonfinite":0,"max_abs":1.2207e-04,"rel_rmse":8.7486e-08}
+CMP tail 1280x5120 tB1+tB1 vs 2 production lanes n=2560 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 1280x5120 tB1+tB1 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+#### tail 520 5120 3 3
+CMP tail 520x5120 merged tB6 vs 2 production lanes n=3120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 520x5120 merged tB6 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP tail 520x5120 2 production lanes vs cpu_ref n=3120 bitexact=no bit_diff=1902 nonfinite=0 max_abs=1.297e-04 max_rel=1.909e-04 rmse=3.044e-05 rel_rmse=9.032e-08 worst_idx=1679
+KBJSON {"cmp":"tail 520x5120 2 production lanes vs cpu_ref","bitexact":0,"bit_diff":1902,"nonfinite":0,"max_abs":1.2970e-04,"rel_rmse":9.0317e-08}
+CMP tail 520x5120 merged tB6 vs cpu_ref n=3120 bitexact=no bit_diff=1902 nonfinite=0 max_abs=1.297e-04 max_rel=1.909e-04 rmse=3.044e-05 rel_rmse=9.032e-08 worst_idx=1679
+KBJSON {"cmp":"tail 520x5120 merged tB6 vs cpu_ref","bitexact":0,"bit_diff":1902,"nonfinite":0,"max_abs":1.2970e-04,"rel_rmse":9.0317e-08}
+CMP tail 520x5120 tB3+tB3 vs 2 production lanes n=3120 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"tail 520x5120 tB3+tB3 vs 2 production lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+RESULT rc=0

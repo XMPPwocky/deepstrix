@@ -1,0 +1,7 @@
+kernel                                                            vgpr  sgpr   lds_B scratch vspill wave
+q8_0_gemv_warp8                                                     30    16       0       0      0   32
+q8_0_gemv_pair_warp8                                                42    22       0       0      0   32
+q8_0_quantize_f32                                                   21    54       0       0      0   32
+q8_0_gemv_bpack_warp8                                               51    30       0       0      0   32
+q8_0_gemv_batched_warp8                                             31    22       0       0      0   32
+slack_probe_spin                                                     1     8               0      0   32

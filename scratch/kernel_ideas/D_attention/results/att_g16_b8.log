@@ -1,0 +1,36 @@
+== 1790451146.000080.D_attention.dgpu rc=0
+W20260926 19:32:28.068497 140403945343616 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.038501 sec
+W20260926 19:32:28.068741 140403945343616 simple_timer.cpp:55] [rocprofv3] './attn_harness2_gfx1201 gfx1201 . prof 8 attention_dec_fused_direct_g16' ::     0.000000 sec
+W20260926 19:32:28.270293 140403945343616 tool.cpp:2424] HSA version 1.18.0 initialized (instance=0)
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+E20260926 19:32:28.273145 140403945343616 output_stream.cpp:111] Opened result file: results/att_g16_b8/run_gfx1201_code_object_id_1.out
+E20260926 19:32:28.274331 140403945343616 output_stream.cpp:111] Opened result file: results/att_g16_b8/run_gfx1201_code_object_id_2.out
+E20260926 19:32:28.275558 140403945343616 output_stream.cpp:111] Opened result file: results/att_g16_b8/run_gfx1201_code_object_id_3.out
+E20260926 19:32:28.277452 140403945343616 output_stream.cpp:111] Opened result file: results/att_g16_b8/run_gfx1201_code_object_id_4.out
+E20260926 19:32:28.278832 140403945343616 output_stream.cpp:111] Opened result file: results/att_g16_b8/run_gfx1201_code_object_id_5.out
+[cand] attention_dec_fused_direct_g16 (fused)
+E20260926 19:32:28.281533 140403945343616 output_stream.cpp:111] Opened result file: results/att_g16_b8/run_gfx1201_code_object_id_6.out
+E20260926 19:32:28.294247 140403945343616 output_stream.cpp:111] Opened result file: results/att_g16_b8/run_gfx1201_code_object_id_7.out
+E20260926 19:32:28.296249 140403617560256 output_stream.cpp:111] Opened result file: results/att_g16_b8/run_10699_shader_engine_0_17.att
+E20260926 19:32:28.296669 140403617560256 output_stream.cpp:111] Opened result file: results/att_g16_b8/run_10699_shader_engine_0_20.att
+W20260926 19:32:28.297131 140403945343616 simple_timer.cpp:55] [rocprofv3] './attn_harness2_gfx1201 gfx1201 . prof 8 attention_dec_fused_direct_g16' ::     0.228389 sec
+W20260926 19:32:28.306821 140403945343616 generateRocpd.cpp:583] writing SQL database for process 49637 on node 868250506
+E20260926 19:32:28.307077 140403945343616 generateRocpd.cpp:606] Opened result file: results/att_g16_b8/run_results.db (UUID=00000029-8849-7849-92fe-85bbdc6ef0f9)
+W20260926 19:32:29.026118 140403945343616 simple_timer.cpp:55] SQLite3 generation :: rocpd_string             ::     0.015482 sec
+W20260926 19:32:29.037091 140403945343616 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_node          ::     0.010960 sec
+W20260926 19:32:29.049132 140403945343616 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_process       ::     0.012035 sec
+W20260926 19:32:29.082051 140403945343616 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_agent         ::     0.010940 sec
+W20260926 19:32:29.082066 140403945343616 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_pmc           ::     0.000007 sec
+W20260926 19:32:29.094076 140403945343616 simple_timer.cpp:55] SQLite3 generation :: rocpd kernel info        ::     0.012007 sec
+W20260926 19:32:29.094084 140403945343616 simple_timer.cpp:55] SQLite3 generation :: rocpd_region             ::     0.000001 sec
+W20260926 19:32:29.094087 140403945343616 simple_timer.cpp:55] SQLite3 generation :: rocpd_kernel_dispatch    ::     0.000000 sec
+W20260926 19:32:29.094089 140403945343616 simple_timer.cpp:55] SQLite3 generation :: rocpd_pmc_event          ::     0.000000 sec
+W20260926 19:32:29.094091 140403945343616 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_copy        ::     0.000000 sec
+W20260926 19:32:29.094093 140403945343616 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_allocate    ::     0.000001 sec
+W20260926 19:32:29.094159 140403945343616 simple_timer.cpp:55] SQLite3 generation :: SQL indexing             ::     0.000064 sec
+W20260926 19:32:29.094433 140403945343616 simple_timer.cpp:55] SQLite3 generation :: total                    ::     0.787613 sec
+W20260926 19:32:29.265552 140403945343616 simple_timer.cpp:55] [rocprofv3] output generation ::     0.966579 sec
+W20260926 19:32:29.265615 140403945343616 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.966649 sec
+prof done b=8
+results/att_g16_b8/stats_ui_output_agent_10699_dispatch_17.csv
+results/att_g16_b8/stats_ui_output_agent_10699_dispatch_20.csv

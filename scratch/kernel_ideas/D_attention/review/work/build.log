@@ -1,0 +1,3 @@
+KFLAGS_V41=-O3 -DDEEPSTRIX_V41=1 -DMHC_N_EMBD=5120 -DMHC_HC_DIM=20480 -DROUTER_MAX_EXPERTS=512
+KERNELS_DIR=/home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/crates/v4flash-kernels/kernels
+build ok

@@ -1,0 +1,79 @@
+== 1790451831.000181.review.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+SHAPE K=32768 b=1 blocks=1024 grid0=1024 | base vs CPU ref: xq_diff=32614 xs_bitdiff=1024 xs_unwritten(0xAAAAAAAA)=0
+CMP pad=1 grid=1025 vs grid=1024: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=7 grid=1031 vs grid=1024: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=64 grid=1088 vs grid=1024: xq_bytediff=0 xscale_bitdiff=0 bitexact
+
+== MIX(fill x + quantize) quantize K=32768 b=1 blocks=1024 WARM  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+q8_0_quantize_f32 grid=blocks+0                7.71       7.68       7.73    1.000      21.2       0.0
+q8_0_quantize_f32 grid=blocks+1                7.72       7.70       7.74    1.001      21.2       0.0
+q8_0_quantize_f32 grid=blocks+7                7.72       7.70       7.73    1.001      21.2       0.0
+q8_0_quantize_f32 grid=blocks+64               7.71       7.70       7.73    1.000      21.2       0.0
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=1 blocks=1024 WARM","variant":"q8_0_quantize_f32 grid=blocks+0","med_us":7.712,"p10_us":7.684,"p90_us":7.728,"ratio":1.0000,"gbps":21.24,"graph":1,"flush":0}
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=1 blocks=1024 WARM","variant":"q8_0_quantize_f32 grid=blocks+1","med_us":7.716,"p10_us":7.704,"p90_us":7.740,"ratio":1.0005,"gbps":21.23,"graph":1,"flush":0}
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=1 blocks=1024 WARM","variant":"q8_0_quantize_f32 grid=blocks+7","med_us":7.720,"p10_us":7.696,"p90_us":7.728,"ratio":1.0010,"gbps":21.22,"graph":1,"flush":0}
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=1 blocks=1024 WARM","variant":"q8_0_quantize_f32 grid=blocks+64","med_us":7.712,"p10_us":7.700,"p90_us":7.728,"ratio":1.0000,"gbps":21.24,"graph":1,"flush":0}
+SHAPE K=32768 b=2 blocks=2048 grid0=2048 | base vs CPU ref: xq_diff=65316 xs_bitdiff=2048 xs_unwritten(0xAAAAAAAA)=0
+CMP pad=1 grid=2049 vs grid=2048: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=7 grid=2055 vs grid=2048: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=64 grid=2112 vs grid=2048: xq_bytediff=0 xscale_bitdiff=0 bitexact
+
+== MIX(fill x + quantize) quantize K=32768 b=2 blocks=2048 WARM  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+q8_0_quantize_f32 grid=blocks+0               20.06      20.05      20.08    1.000      16.3       0.0
+q8_0_quantize_f32 grid=blocks+1                8.85       8.83       8.87    0.441      37.0       0.0
+q8_0_quantize_f32 grid=blocks+7                8.85       8.84       8.86    0.441      37.0       0.0
+q8_0_quantize_f32 grid=blocks+64               8.85       8.84       8.87    0.441      37.0       0.0
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=2 blocks=2048 WARM","variant":"q8_0_quantize_f32 grid=blocks+0","med_us":20.060,"p10_us":20.048,"p90_us":20.076,"ratio":1.0000,"gbps":16.33,"graph":1,"flush":0}
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=2 blocks=2048 WARM","variant":"q8_0_quantize_f32 grid=blocks+1","med_us":8.852,"p10_us":8.832,"p90_us":8.872,"ratio":0.4413,"gbps":37.02,"graph":1,"flush":0}
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=2 blocks=2048 WARM","variant":"q8_0_quantize_f32 grid=blocks+7","med_us":8.848,"p10_us":8.836,"p90_us":8.864,"ratio":0.4411,"gbps":37.03,"graph":1,"flush":0}
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=2 blocks=2048 WARM","variant":"q8_0_quantize_f32 grid=blocks+64","med_us":8.848,"p10_us":8.836,"p90_us":8.868,"ratio":0.4411,"gbps":37.03,"graph":1,"flush":0}
+SHAPE K=32768 b=3 blocks=3072 grid0=3072 | base vs CPU ref: xq_diff=97863 xs_bitdiff=3072 xs_unwritten(0xAAAAAAAA)=0
+CMP pad=1 grid=3073 vs grid=3072: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=7 grid=3079 vs grid=3072: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=64 grid=3136 vs grid=3072: xq_bytediff=0 xscale_bitdiff=0 bitexact
+
+== MIX(fill x + quantize) quantize K=32768 b=3 blocks=3072 WARM  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+q8_0_quantize_f32 grid=blocks+0               14.72      12.40      15.92    1.000      33.4       0.0
+q8_0_quantize_f32 grid=blocks+1               10.00       9.98      10.02    0.679      49.2       0.0
+q8_0_quantize_f32 grid=blocks+7               10.01      10.00      10.02    0.680      49.1       0.0
+q8_0_quantize_f32 grid=blocks+64              10.01       9.98      10.04    0.680      49.1       0.0
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=3 blocks=3072 WARM","variant":"q8_0_quantize_f32 grid=blocks+0","med_us":14.720,"p10_us":12.396,"p90_us":15.920,"ratio":1.0000,"gbps":33.39,"graph":1,"flush":0}
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=3 blocks=3072 WARM","variant":"q8_0_quantize_f32 grid=blocks+1","med_us":10.000,"p10_us":9.984,"p90_us":10.020,"ratio":0.6793,"gbps":49.15,"graph":1,"flush":0}
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=3 blocks=3072 WARM","variant":"q8_0_quantize_f32 grid=blocks+7","med_us":10.012,"p10_us":10.000,"p90_us":10.020,"ratio":0.6802,"gbps":49.09,"graph":1,"flush":0}
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=3 blocks=3072 WARM","variant":"q8_0_quantize_f32 grid=blocks+64","med_us":10.012,"p10_us":9.980,"p90_us":10.040,"ratio":0.6802,"gbps":49.09,"graph":1,"flush":0}
+SHAPE K=32768 b=4 blocks=4096 grid0=4096 | base vs CPU ref: xq_diff=130503 xs_bitdiff=4096 xs_unwritten(0xAAAAAAAA)=0
+CMP pad=1 grid=4097 vs grid=4096: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=7 grid=4103 vs grid=4096: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=64 grid=4160 vs grid=4096: xq_bytediff=0 xscale_bitdiff=0 bitexact
+
+== MIX(fill x + quantize) quantize K=32768 b=4 blocks=4096 WARM  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+q8_0_quantize_f32 grid=blocks+0               20.49      19.26      21.65    1.000      32.0       0.0
+q8_0_quantize_f32 grid=blocks+1               11.15      11.12      11.18    0.544      58.8       0.0
+q8_0_quantize_f32 grid=blocks+7               11.15      11.13      11.18    0.544      58.8       0.0
+q8_0_quantize_f32 grid=blocks+64              11.16      11.13      11.19    0.545      58.7       0.0
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=4 blocks=4096 WARM","variant":"q8_0_quantize_f32 grid=blocks+0","med_us":20.488,"p10_us":19.260,"p90_us":21.652,"ratio":1.0000,"gbps":31.99,"graph":1,"flush":0}
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=4 blocks=4096 WARM","variant":"q8_0_quantize_f32 grid=blocks+1","med_us":11.148,"p10_us":11.116,"p90_us":11.180,"ratio":0.5441,"gbps":58.79,"graph":1,"flush":0}
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=4 blocks=4096 WARM","variant":"q8_0_quantize_f32 grid=blocks+7","med_us":11.152,"p10_us":11.128,"p90_us":11.180,"ratio":0.5443,"gbps":58.77,"graph":1,"flush":0}
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=32768 b=4 blocks=4096 WARM","variant":"q8_0_quantize_f32 grid=blocks+64","med_us":11.156,"p10_us":11.128,"p90_us":11.188,"ratio":0.5445,"gbps":58.74,"graph":1,"flush":0}
+SHAPE K=65568 b=1 blocks=2049 grid0=2049 | base vs CPU ref: xq_diff=65264 xs_bitdiff=2049 xs_unwritten(0xAAAAAAAA)=0
+CMP pad=1 grid=2050 vs grid=2049: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=7 grid=2056 vs grid=2049: xq_bytediff=0 xscale_bitdiff=0 bitexact
+CMP pad=64 grid=2113 vs grid=2049: xq_bytediff=0 xscale_bitdiff=0 bitexact
+
+== MIX(fill x + quantize) quantize K=65568 b=1 blocks=2049 WARM  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+q8_0_quantize_f32 grid=blocks+0                8.78       8.75       8.80    1.000      37.4       0.0
+q8_0_quantize_f32 grid=blocks+1                8.78       8.76       8.80    1.000      37.3       0.0
+q8_0_quantize_f32 grid=blocks+7                8.79       8.76       8.81    1.001      37.3       0.0
+q8_0_quantize_f32 grid=blocks+64               8.78       8.77       8.80    1.000      37.3       0.0
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=65568 b=1 blocks=2049 WARM","variant":"q8_0_quantize_f32 grid=blocks+0","med_us":8.776,"p10_us":8.752,"p90_us":8.804,"ratio":1.0000,"gbps":37.36,"graph":1,"flush":0}
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=65568 b=1 blocks=2049 WARM","variant":"q8_0_quantize_f32 grid=blocks+1","med_us":8.780,"p10_us":8.764,"p90_us":8.800,"ratio":1.0005,"gbps":37.34,"graph":1,"flush":0}
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=65568 b=1 blocks=2049 WARM","variant":"q8_0_quantize_f32 grid=blocks+7","med_us":8.788,"p10_us":8.760,"p90_us":8.812,"ratio":1.0014,"gbps":37.30,"graph":1,"flush":0}
+KBJSON {"tag":"MIX(fill x + quantize) quantize K=65568 b=1 blocks=2049 WARM","variant":"q8_0_quantize_f32 grid=blocks+64","med_us":8.780,"p10_us":8.768,"p90_us":8.796,"ratio":1.0005,"gbps":37.34,"graph":1,"flush":0}
+RESULT: all padded launches bit-exact vs production grid

@@ -1,0 +1,30 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP cand narrow n16 bk64 pf4 B=1       n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"cand narrow n16 bk64 pf4 B=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP cand narrow n16 bk128 pf3 B=1      n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"cand narrow n16 bk128 pf3 B=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP cand narrow n16 bk128 pf2 B=1      n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"cand narrow n16 bk128 pf2 B=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP cand narrow n16 bk64 pf6 B=1       n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"cand narrow n16 bk64 pf6 B=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP cand narrow n32 bk64 pf4 B=1       n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"cand narrow n32 bk64 pf4 B=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP cand narrow n32 bk128 pf2 B=1      n=24 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"cand narrow n32 bk128 pf2 B=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== prefill pre-mix GEMM K=20480 M=24 B=1 direct warm  (rounds=30 inner=3 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+f16_gemm_wmma_lds_tiled M=24 (1,B/64)        389.98     385.16     393.31    1.000       2.7       0.0
+cand narrow n16 bk64 pf4                      89.40      88.53      90.13    0.229      11.9       0.0
+cand narrow n16 bk128 pf3                     59.91      59.40      60.33    0.154      17.8       0.0
+cand narrow n16 bk128 pf2                     57.67      57.19      58.01    0.148      18.5       0.0
+cand narrow n16 bk64 pf6                     100.11      99.23     101.01    0.257      10.6       0.0
+cand narrow n32 bk64 pf4                      95.03      93.73      97.15    0.244      11.2       0.0
+cand narrow n32 bk128 pf2                     63.48      63.07      63.93    0.163      16.8       0.0
+KBJSON {"tag":"prefill pre-mix GEMM K=20480 M=24 B=1 direct warm","variant":"f16_gemm_wmma_lds_tiled M=24 (1,B/64)","med_us":389.977,"p10_us":385.163,"p90_us":393.310,"ratio":1.0000,"gbps":2.73,"graph":0,"flush":0}
+KBJSON {"tag":"prefill pre-mix GEMM K=20480 M=24 B=1 direct warm","variant":"cand narrow n16 bk64 pf4","med_us":89.401,"p10_us":88.534,"p90_us":90.134,"ratio":0.2292,"gbps":11.91,"graph":0,"flush":0}
+KBJSON {"tag":"prefill pre-mix GEMM K=20480 M=24 B=1 direct warm","variant":"cand narrow n16 bk128 pf3","med_us":59.907,"p10_us":59.401,"p90_us":60.334,"ratio":0.1536,"gbps":17.78,"graph":0,"flush":0}
+KBJSON {"tag":"prefill pre-mix GEMM K=20480 M=24 B=1 direct warm","variant":"cand narrow n16 bk128 pf2","med_us":57.667,"p10_us":57.187,"p90_us":58.014,"ratio":0.1479,"gbps":18.47,"graph":0,"flush":0}
+KBJSON {"tag":"prefill pre-mix GEMM K=20480 M=24 B=1 direct warm","variant":"cand narrow n16 bk64 pf6","med_us":100.107,"p10_us":99.228,"p90_us":101.014,"ratio":0.2567,"gbps":10.64,"graph":0,"flush":0}
+KBJSON {"tag":"prefill pre-mix GEMM K=20480 M=24 B=1 direct warm","variant":"cand narrow n32 bk64 pf4","med_us":95.027,"p10_us":93.734,"p90_us":97.147,"ratio":0.2437,"gbps":11.21,"graph":0,"flush":0}
+KBJSON {"tag":"prefill pre-mix GEMM K=20480 M=24 B=1 direct warm","variant":"cand narrow n32 bk128 pf2","med_us":63.481,"p10_us":63.067,"p90_us":63.934,"ratio":0.1628,"gbps":16.78,"graph":0,"flush":0}
