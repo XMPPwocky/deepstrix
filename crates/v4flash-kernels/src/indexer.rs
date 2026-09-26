@@ -214,6 +214,24 @@ pub struct IndexerScoreWmma {
     module: Module,
 }
 
+/// `V41_IDX_SCORE_QREG` (default ON; `0` = `indexer_score_wmma_batched_mw_e2m1`):
+/// the decode arena indexer score ([`IndexerScoreWmma::launch_batched_mw_e2m1_rows`])
+/// runs its twin `s2_w8n8_pf_hw` (same args, grid, block), which keeps each
+/// wave's Q A-fragments and head weights in registers instead of re-reading
+/// them from LDS per 16-key tile and prefetches the next tile's key words.
+/// Same WMMA k order, relu*hw order and reduce: BIT-IDENTICAL
+/// (tests/indexer_sweep_bitexact.rs; the sweep review: 12 + 28 shapes incl.
+/// per-row n_comp 0/1 and keys_base_per). 2026-09-26 sweep (E_indexer/
+/// score_qreg_hw, dGPU, keys cold): 235K b=4 275.8 -> 139.5 us, b=1 82.9 ->
+/// 42.5; 131K b=4 157.7 -> 83.1; 65K b=4 84.8 -> 45.1. The twin loads the head
+/// weights as float4, so a `head_weights` base that is not 16-B aligned keeps
+/// the production kernel.
+fn idx_score_qreg_for(head_weights: &DeviceBuffer<f32>) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_IDX_SCORE_QREG").as_deref() != Ok("0"));
+    *D && (head_weights.raw() as usize) % 16 == 0
+}
+
 impl IndexerScoreWmma {
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
         let image: &[u8] = if arch.starts_with("gfx1201") {
@@ -226,6 +244,9 @@ impl IndexerScoreWmma {
         let module = Module::load_data(image)?;
         Ok(Self { module })
     }
+
+    /// The loaded module (tests: explicit-symbol launches).
+    pub fn module(&self) -> &Module { &self.module }
 
     pub fn launch(
         &self,
@@ -420,7 +441,13 @@ impl IndexerScoreWmma {
         if keys_base_per.is_none() && index_comp_kv.len() < (n_idx_max as usize) * crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES {
             return Err(eyre!("indexer_score_wmma_batched_mw_e2m1: packed keys too small for n_idx_max={n_idx_max}"));
         }
-        let function = self.module.get_function("indexer_score_wmma_batched_mw_e2m1")?;
+        // `V41_IDX_SCORE_QREG`: register-resident Q / head-weight twin, same
+        // grid, bit-identical; 2026-09-26 sweep: x1.98 at 235K b=4.
+        let function = self.module.get_function(if idx_score_qreg_for(head_weights) {
+            "s2_w8n8_pf_hw"
+        } else {
+            "indexer_score_wmma_batched_mw_e2m1"
+        })?;
         const COLS_PER_WG: u32 = 8 * 8 * 16; // 1024
         let n_chunks_x = (n_idx_max + COLS_PER_WG - 1) / COLS_PER_WG;
         let cfg = LaunchConfig {
@@ -672,6 +699,24 @@ pub fn topk_select_ilp() -> bool {
     *D
 }
 
+/// `V41_IDX_TOPK_HYBRID` (default ON; `0` = `indexer_topk_select_batched_ilp`):
+/// the ILP threshold select runs its twin `topk_select_v3_u8` (same args and
+/// grid): both bitonic sorts as hybrid networks (j < 32 stages by __shfl_xor in
+/// registers, no LDS / barrier; 144 -> 56 barriers per row) and float4 count /
+/// compact passes. Identical selection, order and done[] (tests/
+/// indexer_sweep_bitexact.rs; the sweep review: ragged n, chunk edges, n = 0,
+/// all-equal, -inf-dominated and a forced give-up row). 2026-09-26 sweep
+/// (E_indexer/topk_select_hybrid_sort_vec4, dGPU): select alone 235K 85.4 ->
+/// 58.8 us, 131K 67.6 -> 43.4, 65K 60.1 -> 38.3 (b = 1 and 4). Applies only
+/// under `V41_TOPK_SELECT_ILP` and only when the scores rows are 16-B aligned
+/// (base aligned and `n_idx_stride % 4 == 0`: the float4 loads); otherwise the
+/// ILP kernel runs.
+fn idx_topk_hybrid_for(scores: &DeviceBuffer<f32>, n_idx_stride: u32) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_IDX_TOPK_HYBRID").as_deref() != Ok("0"));
+    *D && n_idx_stride % 4 == 0 && (scores.raw() as usize) % 16 == 0
+}
+
 /// Candidate counts at each level of the bitonic merge ladder.
 ///
 /// `[0]` is the L0 chunk output (`ceil(n_comp / SORT_N) * top_k`); each later
@@ -732,6 +777,9 @@ impl IndexerTopkBitonic {
         let module = Module::load_data(image)?;
         Ok(Self { module })
     }
+
+    /// The loaded module (tests: explicit-symbol launches).
+    pub fn module(&self) -> &Module { &self.module }
 
     /// `selected[top_k]` i32 (sorted descending by score, sentinel -1
     /// past the valid range). `allowed_bits[ceil(n_comp/32)]` u32
@@ -941,7 +989,11 @@ impl IndexerTopkBitonic {
                 if d.len() < batch as usize {
                     return Err(eyre!("indexer_topk: done buffer {} < batch {batch}", d.len()));
                 }
-                let f = self.module.get_function(if select_ilp {
+                // `V41_IDX_TOPK_HYBRID`: the ILP select's hybrid-sort / float4
+                // twin, same grid, identical selection; 2026-09-26 sweep x1.45.
+                let f = self.module.get_function(if select_ilp && idx_topk_hybrid_for(scores, n_idx_stride) {
+                    "topk_select_v3_u8"
+                } else if select_ilp {
                     "indexer_topk_select_batched_ilp"
                 } else {
                     "indexer_topk_select_batched"
@@ -1072,6 +1124,30 @@ pub struct IndexerGather {
     module: Module,
 }
 
+/// Smallest batch that runs `gather_u4_r1` (see [`idx_gather_b128_for`]).
+pub const GATHER_B128_MIN_B: u32 = 4;
+
+/// `V41_IDX_GATHER_B128` (default ON; `0` = `indexer_gather_batched` at every
+/// batch): [`IndexerGather::launch_batched_rows`] at `batch >= 4` runs
+/// `gather_u4_r1`, one 16-B load/store per thread (grid (top_k, B) x
+/// head_dim/8) instead of one f16, BIT-IDENTICAL pure copy incl. sentinel rows
+/// (tests/indexer_sweep_bitexact.rs; the sweep review: 51 checks incl.
+/// comp_base_per null / per-row, odd b / top_k, all-sentinel rows).
+/// 2026-09-26 sweep (E_indexer/gather_b128, dGPU, cold store): b=4 25.0 ->
+/// 18.6 us, b=8 40.8 -> 24.4, prefill b=512 1417 -> 522 (x2.7). The batch gate
+/// is the review's: at b=2 the b128 kernel is 1.5-1.8x SLOWER (not root-caused),
+/// b=1 barely wins, so b < 4 keeps the production kernel. Also needs head_dim
+/// % 8 == 0 and <= 512 (the kernel's launch bound) and 16-B aligned buffers.
+fn idx_gather_b128_for(batch: u32, head_dim: u32, dst: &DeviceBuffer<u16>, comp_kv: &DeviceBuffer<u16>) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_IDX_GATHER_B128").as_deref() != Ok("0"));
+    *D && batch >= GATHER_B128_MIN_B
+        && head_dim % 8 == 0
+        && head_dim <= 512
+        && (dst.raw() as usize) % 16 == 0
+        && (comp_kv.raw() as usize) % 16 == 0
+}
+
 impl IndexerGather {
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
         let image: &[u8] = if arch.starts_with("gfx1201") {
@@ -1084,6 +1160,9 @@ impl IndexerGather {
         let module = Module::load_data(image)?;
         Ok(Self { module })
     }
+
+    /// The loaded module (tests: explicit-symbol launches).
+    pub fn module(&self) -> &Module { &self.module }
 
     /// `active_comp_kv[i, d] = comp_kv[selected[i], d]` for i in 0..top_k,
     /// d in 0..head_dim. Sentinel `selected[i] == -1` rows are skipped
@@ -1177,6 +1256,19 @@ impl IndexerGather {
                 selected_b.len(),
                 (batch as usize) * (top_k as usize)
             ));
+        }
+        if idx_gather_b128_for(batch, head_dim, active_comp_kv_b, comp_kv) {
+            // `V41_IDX_GATHER_B128`: 16 B per thread, (top_k, B) x head_dim/8;
+            // 2026-09-26 sweep: b=4 x1.35, b=512 x2.7, bit-identical (b >= 4 only).
+            let function = self.module.get_function("gather_u4_r1")?;
+            let cfg = LaunchConfig {
+                grid: (top_k, batch, 1),
+                block: (head_dim * 2 / 16, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            return launch_kernel!(function, cfg, stream, [
+                active_comp_kv_b.raw(), comp_kv.raw(), selected_b.raw(), top_k, head_dim, comp_base_per_ptr
+            ]);
         }
         let function = self.module.get_function("indexer_gather_batched")?;
         const BLOCK: u32 = 256;

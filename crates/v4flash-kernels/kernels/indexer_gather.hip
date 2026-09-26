@@ -64,3 +64,62 @@ extern "C" __global__ void indexer_gather_batched(
     const size_t dst_base = ((size_t)b * top_k + i) * head_dim;
     active_comp_kv_b[dst_base + d] = comp_kv[src_base + d];
 }
+
+// gather_u4_r1 — indexer_gather_batched moving 16 B (b128) per thread instead
+// of one f16: grid (top_k, B) x (head_dim*2/16) = 64 threads per 1 KB row.
+// Same signature; pure copy, sentinel rows (selected < 0) skipped exactly as
+// production (destination row untouched): bit-identical. 2026-09-26 sweep
+// (E_indexer/gather_b128, dGPU, cold store): b=4 graph 25.0 -> 18.6 us, b=8
+// 40.8 -> 24.4, b=512 prefill LOCAL picks 1417 -> 522 (x2.7). BUT at b=2 it is
+// 1.5-1.8x SLOWER (reviewer, both u4 variants, not root-caused), so
+// IndexerGather::launch_batched_rows selects it only for batch >= 4
+// (V41_IDX_GATHER_B128). Requires head_dim*2 % 16 == 0, head_dim <= 512 (the
+// launch bound) and 16-B aligned comp_kv / destination (checked in Rust).
+// A sentinel / out-of-range row reads row `base` harmlessly and is not stored.
+template <unsigned VEC, unsigned ROWS, unsigned IPT>
+__device__ __forceinline__ void gather_body(
+        _Float16* __restrict__ dst_b, const _Float16* __restrict__ comp_kv,
+        const int* __restrict__ selected_b, unsigned top_k, unsigned head_dim,
+        const int* __restrict__ comp_base_per) {
+    const unsigned row_bytes = head_dim * 2u;
+    const unsigned tpr       = row_bytes / VEC;              // threads per row (64 at b128)
+    const unsigned rows_per_pass = ROWS / IPT;               // rows covered by one block pass
+    const unsigned tid = threadIdx.x;
+    const unsigned b   = blockIdx.y;
+    const unsigned r_in = tid / tpr, seg = tid % tpr;
+    const unsigned row0 = blockIdx.x * ROWS;
+    const size_t base = (size_t)(comp_base_per ? (unsigned)comp_base_per[b] : 0u);
+    const int* sel = selected_b + (size_t)b * top_k;
+
+    // branch-free: all IPT index loads, then all IPT data loads (a sentinel / out-of-range row
+    // reads row `base` harmlessly and is not stored), then the stores.
+    uint4 v[IPT]; unsigned long long v2[IPT];
+    bool ok[IPT]; unsigned rr[IPT]; int src[IPT];
+    #pragma unroll
+    for (unsigned i = 0; i < IPT; i++) {
+        rr[i] = row0 + r_in + i * rows_per_pass;
+        src[i] = (rr[i] < top_k) ? sel[rr[i]] : -1;
+    }
+    #pragma unroll
+    for (unsigned i = 0; i < IPT; i++) {
+        ok[i] = src[i] >= 0;
+        const unsigned s = ok[i] ? (unsigned)src[i] : 0u;
+        const unsigned char* p = reinterpret_cast<const unsigned char*>(comp_kv + (base + s) * head_dim) + seg * VEC;
+        if (VEC == 16) v[i] = *reinterpret_cast<const uint4*>(p);
+        else           v2[i] = *reinterpret_cast<const unsigned long long*>(p);
+    }
+    #pragma unroll
+    for (unsigned i = 0; i < IPT; i++) {
+        if (!ok[i]) continue;
+        unsigned char* d = reinterpret_cast<unsigned char*>(dst_b + ((size_t)b * top_k + rr[i]) * head_dim) + seg * VEC;
+        if (VEC == 16) *reinterpret_cast<uint4*>(d) = v[i];
+        else           *reinterpret_cast<unsigned long long*>(d) = v2[i];
+    }
+}
+
+extern "C" __global__ __launch_bounds__(64)
+void gather_u4_r1(_Float16* __restrict__ dst, const _Float16* __restrict__ comp_kv,
+                  const int* __restrict__ selected, unsigned top_k, unsigned head_dim,
+                  const int* __restrict__ comp_base_per) {
+    gather_body<16, 1, 1>(dst, comp_kv, selected, top_k, head_dim, comp_base_per);
+}

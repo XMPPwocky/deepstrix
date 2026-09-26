@@ -116,6 +116,25 @@ pub struct CandidateBlocks {
     module: Module,
 }
 
+/// Largest batch that runs `candidate_threshold_ilp` (see [`cand_thresh_ilp_for`]).
+pub const CAND_THRESH_ILP_MAX_B: u32 = 8;
+
+/// `V41_CAND_THRESH_ILP` (default ON; `0` = `candidate_threshold` at every
+/// batch): the level-one threshold at `batch <= 8` (decode lanes at L20) runs
+/// `candidate_threshold_ilp`, block 1024 with 8 independent block-score loads
+/// per thread per radix pass; same passes / histogram / scan, so the threshold
+/// is BIT-IDENTICAL (tests/indexer_sweep_bitexact.rs; the sweep review: 12654 +
+/// 67836 row checks vs production and a CPU nth_element). 2026-09-26 sweep
+/// (E_indexer/candidate_threshold_ilp, dGPU): 235K 87.4 -> 43.8 us, 131K 57.3
+/// -> 32.4, 65K 41.9 -> 30.0. The batch gate is the review's: at prefill shapes
+/// (b = 512/1024) the 1024-wide kernel is 2.0-2.7x SLOWER (15 waves idle through
+/// the serial bin scan), so those keep the 256-thread production kernel.
+pub fn cand_thresh_ilp_for(batch: u32) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_CAND_THRESH_ILP").as_deref() != Ok("0"));
+    *D && batch <= CAND_THRESH_ILP_MAX_B
+}
+
 impl CandidateBlocks {
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
         let image: &[u8] = if arch.starts_with("gfx1201") {
@@ -157,10 +176,25 @@ impl CandidateBlocks {
         let f = self.module.get_function("candidate_block_max")?;
         let cfg = LaunchConfig { grid: (nb_max.div_ceil(T), batch, 1), block: (T, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(f, cfg, stream, [block_score.raw(), scores.raw(), n_per, stride, nb_stride, CANDIDATE_BLOCK_SIZE])?;
-        let f = self.module.get_function("candidate_threshold")?;
-        let cfg = LaunchConfig { grid: (batch, 1, 1), block: (T, 1, 1), shared_mem_bytes: 0 };
+        let (f, cfg) = self.threshold_kernel(batch)?;
         launch_kernel!(f, cfg, stream, [threshold.raw(), block_score.raw(), n_per, nb_stride, CANDIDATE_BLOCK_SIZE, CANDIDATE_TOPK_BLOCKS])
     }
+
+    /// The threshold kernel and its launch for `batch` rows: the ILP twin at
+    /// block 1024 under `V41_CAND_THRESH_ILP` for `batch <= 8`, else
+    /// `candidate_threshold` at block 256 (its own size, not the shared `T`).
+    fn threshold_kernel(&self, batch: u32) -> eyre::Result<(v4flash_hip::Function<'_>, LaunchConfig)> {
+        let (sym, block) = if cand_thresh_ilp_for(batch) {
+            ("candidate_threshold_ilp", 1024)
+        } else {
+            ("candidate_threshold", 256)
+        };
+        let cfg = LaunchConfig { grid: (batch, 1, 1), block: (block, 1, 1), shared_mem_bytes: 0 };
+        Ok((self.module.get_function(sym)?, cfg))
+    }
+
+    /// The loaded module (tests: explicit-symbol launches).
+    pub fn module(&self) -> &Module { &self.module }
 
     /// LEVEL TWO, at an index source ABOVE the candidate source (24/28/32/36):
     /// `-inf` every position outside the published candidate blocks, so the
@@ -217,8 +251,7 @@ impl CandidateBlocks {
         let cfg = LaunchConfig { grid: (nb_max.div_ceil(T), batch, 1), block: (T, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(f, cfg, stream, [block_score.raw(), scores.raw(), n_per, stride, nb_stride, cb])?;
 
-        let f = self.module.get_function("candidate_threshold")?;
-        let cfg = LaunchConfig { grid: (batch, 1, 1), block: (T, 1, 1), shared_mem_bytes: 0 };
+        let (f, cfg) = self.threshold_kernel(batch)?;
         launch_kernel!(f, cfg, stream, [threshold.raw(), block_score.raw(), n_per, nb_stride, cb, CANDIDATE_TOPK_BLOCKS])?;
 
         let f = self.module.get_function("candidate_mask_apply")?;
