@@ -521,6 +521,10 @@ pub struct BatchDgpuShared {
     /// `MhcArena::launch_mix` last-WG counters, one per row; zero between
     /// launches (the kernel resets them). Used only on `de.compute`.
     pub mhc_counters: DeviceBuffer<u32>,
+    /// `MhcArena::launch_fast` pre-scaled RMS scalar, one per row: written and
+    /// read inside ONE launch (the RMS WG -> the last WG), so no lifetime
+    /// beyond it. Used only on `de.compute`.
+    pub mhc_inv_rows: DeviceBuffer<f32>,
     /// `[B, N_EMBD]` — hc_weighted output for attention input (P1).
     pub attn_cur: DeviceBuffer<f32>,
     /// `[B, N_EMBD]` — attention input norm. Written P1; last read by the
@@ -1471,6 +1475,7 @@ impl BatchDgpuShared {
                 c.fill_zero()?;
                 c
             },
+            mhc_inv_rows: DeviceBuffer::new(id, rows)?,
 
             mhc_rms_partials: DeviceBuffer::new(id, 16)?,
             mix: mk_f32(HC_MIX_DIM as usize)?,

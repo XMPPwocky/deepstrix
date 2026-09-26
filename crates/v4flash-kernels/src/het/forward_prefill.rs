@@ -811,6 +811,28 @@ pub fn mhc_arena_fused() -> bool {
     *D
 }
 
+/// `V41_MHC_FAST` (default ON; `0` = the `V41_MHC_ARENA_FUSED` chains): each
+/// arena mHC stage as ONE `MhcArena::launch_fast` (kernels/mhc_fast.hip),
+/// BIT-IDENTICAL to what it replaces (tests/mhc_arena_bitexact.rs::
+/// mhc_fast_is_bit_identical, gfx1201 + gfx1151, b = 1..8, graph replay):
+///   g.mhc_pre_attn    [mix, hc_weighted, carry memcpy, rms_w] -> 1 launch
+///   g.mhc_pre_ffn     [hc_weighted, rms_w]                    -> 1 launch
+///   g.mhc_mix_ffn_late [mix, carry memcpy]                    -> 1 launch
+/// The replaced kernels were latency-bound (one load round trip per loop
+/// iteration per thread: mix ~25/35 us, rms_w ~10 us per node) and every
+/// extra graph node costs ~2.2 us; the fast kernel issues each thread's loads
+/// up front and keeps the old arithmetic order, the collapse WG and (pre-attn)
+/// one RMS WG run beside the 24 mix WGs. tests/bench_decode_latency_ab.rs
+/// (gfx1201, paired, 1000 rounds, 95% CI within +-0.2 us): -65 / -60 / -57 us
+/// per lane-layer at b = 1 / 2 / 3 (pre-attn -29, pre-ffn -9, mix_ffn_late
+/// -27 / -23 / -20). Requires `mhc_arena_fused` (same eligibility) and V4.1
+/// (carry collapse).
+pub fn mhc_fast() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_MHC_FAST").as_deref() != Ok("0"));
+    *D
+}
+
 /// `V41_MHC_FFN_LATE` (default ON; arena decode, V4.1, fused mixes): queue the
 /// pre-ffn MIXES after the router instead of before it, on the same stream.
 /// V4.1 collapses with the carry, so the router path (collapse -> rms_w ->
@@ -3538,6 +3560,53 @@ impl HeterogeneousEngine {
         } else {
         let cap = self.stage_cap(de, "g.mhc_pre_attn", layer as usize, b, lane_ptr, cap_ok)?;
         if !cap.skip {
+        // `V41_MHC_FAST`: the whole sub-block (mixes, collapse, rms_w, carry
+        // copy) as ONE bit-identical launch. The collapse reads the OLD carry;
+        // the launch's last WG then writes carry := split, except on a CED
+        // source-only call, which leaves the carry as it entered the layer.
+        let fast_attn = mhc_fast()
+            && cfg!(feature = "v41")
+            && mhc_arena_fused()
+            && mhc_pre_scaled_for(b)
+            && (b as usize) <= sd.mhc_counters.len();
+        if fast_attn {
+            let _t = de.events.stage("k.mhc_pre_attn.fast", &de.compute)?;
+            de.mhc_arena.launch_fast(
+                &de.compute,
+                Some(crate::mhc_arena::FastMix {
+                    weight: &dlw.hc_attn_fn.buffer,
+                    x: &bd.residual,
+                    scale: &dlw.hc_attn_scale,
+                    base: &dlw.hc_attn_base,
+                    mode: crate::mhc_arena::MIX_PRE_SCALED,
+                    split_out: &mut bd.split,
+                    mix_out: &mut sd.mix,
+                    counters: &mut sd.mhc_counters,
+                    inv_rows: &mut sd.mhc_inv_rows,
+                }),
+                Some(crate::mhc_arena::FastCollapse {
+                    x: &bd.residual,
+                    cur_out: &mut sd.attn_cur,
+                    norm_out: &mut sd.attn_input_norm,
+                    norm_w: &dlw.attn_norm,
+                }),
+                &mut bd.hc_pre_carry,
+                ced != CedMode::KvSourceOnly,
+                HC_DIM,
+                RMS_EPS,
+                SINKHORN_ITERS,
+                SINKHORN_EPS,
+                b,
+            )?;
+            if super::engine::subtensor_dump_armed(layer as usize) {
+                de.compute.synchronize()?;
+                super::engine::maybe_dump_subtensor_f32_view(
+                    layer as usize,
+                    &format!("pf_attn_cur_p{dump_pos}"),
+                    &sd.attn_cur.slice_view(0, N_EMBD as usize),
+                )?;
+            }
+        } else {
         // `flat` feeds only the batched matvecs below; the decode-exact path
         // (`mhc_pre_scaled_for`) reads the raw residual and was paying a dead
         // 31 us single-WG pass here (bench_mhc_arena_v41: chain 98.5 -> 72.5 us
@@ -3682,6 +3751,7 @@ impl HeterogeneousEngine {
                 b,
             )?;
         }
+        } // !fast_attn
 
         }
         cap.end()?;
@@ -6082,6 +6152,44 @@ impl HeterogeneousEngine {
         ffn_mix_late = fused_ffn && mhc_ffn_late() && cap_ok && cfg!(feature = "v41") && ced != CedMode::KvSourceOnly;
         let cap = self.stage_cap(de, "g.mhc_pre_ffn", layer as usize, b, lane_ptr, cap_ok)?;
         if !cap.skip {
+        // `V41_MHC_FAST`: collapse + rms_w as one launch (the mixes follow the
+        // router under `mhc_ffn_late`), or the whole sub-block inline.
+        let fast_ffn = fused_ffn && mhc_fast() && cfg!(feature = "v41");
+        if fast_ffn {
+            let _t = de.events.stage("k.mhc_pre_ffn.fast", &de.compute)?;
+            let mix = if ffn_mix_late {
+                None
+            } else {
+                Some(crate::mhc_arena::FastMix {
+                    weight: &dlw.hc_ffn_fn.buffer,
+                    x: &bd.after_attn_hc,
+                    scale: &dlw.hc_ffn_scale,
+                    base: &dlw.hc_ffn_base,
+                    mode: crate::mhc_arena::MIX_NORMED,
+                    split_out: &mut bd.split,
+                    mix_out: &mut sd.mix,
+                    counters: &mut sd.mhc_counters,
+                    inv_rows: &mut sd.mhc_inv_rows,
+                })
+            };
+            de.mhc_arena.launch_fast(
+                &de.compute,
+                mix,
+                Some(crate::mhc_arena::FastCollapse {
+                    x: &bd.after_attn_hc,
+                    cur_out: &mut sd.ffn_cur,
+                    norm_out: &mut bd.ffn_input_norm,
+                    norm_w: &dlw.ffn_norm,
+                }),
+                &mut bd.hc_pre_carry,
+                !ffn_mix_late,
+                HC_DIM,
+                RMS_EPS,
+                SINKHORN_ITERS,
+                SINKHORN_EPS,
+                b,
+            )?;
+        } else {
         if fused_ffn {
             if !ffn_mix_late {
                 let _t = de.events.stage("k.mhc_pre_ffn.mix_fused", &de.compute)?;
@@ -6177,6 +6285,7 @@ impl HeterogeneousEngine {
                 b,
             )?;
         }
+        } // !fast_ffn
         }
         cap.end()?;
         }
@@ -6568,7 +6677,31 @@ impl HeterogeneousEngine {
         if ffn_mix_late {
             let _t = de.events.stage("dgpu.mhc_mix_ffn_late", &de.compute)?;
             let cap = self.stage_cap(de, "g.mhc_mix_ffn_late", layer as usize, b, lane_ptr, cap_ok)?;
-            if !cap.skip {
+            if !cap.skip && mhc_fast() {
+                // `V41_MHC_FAST`: mixes + carry := split in one launch.
+                de.mhc_arena.launch_fast(
+                    &de.compute,
+                    Some(crate::mhc_arena::FastMix {
+                        weight: &dlw.hc_ffn_fn.buffer,
+                        x: &bd.after_attn_hc,
+                        scale: &dlw.hc_ffn_scale,
+                        base: &dlw.hc_ffn_base,
+                        mode: crate::mhc_arena::MIX_NORMED,
+                        split_out: &mut bd.split,
+                        mix_out: &mut sd.mix,
+                        counters: &mut sd.mhc_counters,
+                        inv_rows: &mut sd.mhc_inv_rows,
+                    }),
+                    None,
+                    &mut bd.hc_pre_carry,
+                    true,
+                    HC_DIM,
+                    RMS_EPS,
+                    SINKHORN_ITERS,
+                    SINKHORN_EPS,
+                    b,
+                )?;
+            } else if !cap.skip {
                 de.mhc_arena.launch_mix(
                     &de.compute,
                     &mut bd.split,
