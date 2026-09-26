@@ -342,6 +342,62 @@ fn bench_decode_latency_ab() -> eyre::Result<()> {
     if section == "all" || section == "attnmeta" {
         section_attnmeta(&e, &mut h, rounds, &mut rng)?;
     }
+    if section == "all" || section == "attnscore" {
+        section_attnscore(&e, &mut h, rounds, &mut rng)?;
+    }
+    Ok(())
+}
+
+/// V41_ATTN_DEC_SCORE: the batched htiled f16s score kernel (A) vs its
+/// decode-shape twin (B), alone and followed by the smwsum that consumes the
+/// scores, at the decode shape (128 window + 512 gathered keys per row).
+fn section_attnscore(e: &DeviceEngine, h: &mut Harness, rounds: usize, rng: &mut Lcg) -> eyre::Result<()> {
+    use v4flash_kernels::config::{N_HEAD, N_HEAD_DIM};
+    let id = e.device.id;
+    let bmax = 3usize;
+    let (nh, hd) = (N_HEAD as usize, N_HEAD_DIM as usize);
+    let (n_raw, n_comp, raw_slots, stride) = (128u32, INDEXER_TOP_K, 256usize, 3072u32);
+    let f16v = |rng: &mut Lcg, n: usize| -> Vec<u16> { (0..n).map(|_| f16_bits((rng.unit() - 0.5) * 2.0)).collect() };
+    let q = up(id, &(0..bmax * nh * hd).map(|_| (rng.unit() - 0.5) * 0.1).collect::<Vec<f32>>())?;
+    let raw_kv = up(id, &f16v(rng, bmax * raw_slots * hd))?;
+    let active = up(id, &f16v(rng, bmax * n_comp as usize * hd))?;
+    let sinks = up(id, &(0..nh).map(|_| rng.unit()).collect::<Vec<f32>>())?;
+    let scores = RefCell::new(DeviceBuffer::<f32>::new(id, bmax * nh * stride as usize)?);
+    let heads = RefCell::new(DeviceBuffer::<f32>::new(id, bmax * nh * hd)?);
+    let nrp = up(id, &vec![n_raw as i32; bmax])?;
+    let nrop = up(id, &(0..bmax).map(|r| (r * raw_slots) as i32).collect::<Vec<i32>>())?;
+    let ncp = up(id, &vec![n_comp as i32; bmax])?;
+    eprintln!("\n== attention score: batched htiled f16s (A) vs decode twin (B); n_raw {n_raw} + {n_comp} gathered ==");
+    for b in 1..=bmax as u32 {
+        let bu = b as usize;
+        let (nr, no, nc) = (nrp.slice_view(0, bu), nrop.slice_view(0, bu), ncp.slice_view(0, bu));
+        let score = |s: &Stream, dec: bool| -> eyre::Result<()> {
+            if dec {
+                e.attn_dec.launch_score_f16s_rows(
+                    s, &mut scores.borrow_mut(), &q, &raw_kv, Some(&active), &nr, &no, &nc, None, N_HEAD, N_HEAD_DIM, n_raw + n_comp, b, n_comp,
+                    stride, None,
+                )
+            } else {
+                e.attn_mixed.launch_score_batched_htiled_wmma_f16s_rows(
+                    s, &mut scores.borrow_mut(), &q, &raw_kv, Some(&active), &nr, &no, &nc, None, N_HEAD, N_HEAD_DIM, n_raw + n_comp, b, n_comp,
+                    stride, None,
+                )
+            }
+        };
+        let smwsum = |s: &Stream| -> eyre::Result<()> {
+            e.attn_mixed.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s_rows(
+                s, &mut heads.borrow_mut(), &mut scores.borrow_mut(), &sinks, &raw_kv, Some(&active), &nr, &no, &nc, N_HEAD, N_HEAD_DIM, b,
+                n_comp, stride, None,
+            )
+        };
+        eprintln!(" b = {b}");
+        let mut ra: Run = Box::new(|s: &Stream| score(s, false));
+        let mut rb: Run = Box::new(|s: &Stream| score(s, true));
+        paired(h, rng, rounds, "score", &mut ra, &mut rb)?;
+        let mut ra: Run = Box::new(|s: &Stream| { score(s, false)?; smwsum(s) });
+        let mut rb: Run = Box::new(|s: &Stream| { score(s, true)?; smwsum(s) });
+        paired(h, rng, rounds, "score + smwsum", &mut ra, &mut rb)?;
+    }
     Ok(())
 }
 

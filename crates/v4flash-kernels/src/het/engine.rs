@@ -151,6 +151,8 @@ pub struct DeviceEngine {
     pub rb_pack: crate::ReadbackPack,
     /// Attention per-row metadata as one kernel-argument launch (`V41_ATTN_META_FILL`).
     pub attn_meta: crate::attn_meta::AttnMetaFill,
+    /// Decode-shape attention score twin (`V41_ATTN_DEC_SCORE`).
+    pub attn_dec: crate::attention_dec::AttentionDec,
     pub rms_nw_mw: crate::RmsNormNoWeightMultiWG,
     /// On-device sampler. Used only on dGPU (logits live there) but
     /// instantiated on both arches so the engine struct stays symmetric.
@@ -256,6 +258,7 @@ impl DeviceEngine {
             mhc_arena: crate::MhcArena::for_arch(arch)?,
             rb_pack: crate::ReadbackPack::for_arch(arch)?,
             attn_meta: crate::attn_meta::AttnMetaFill::for_arch(arch)?,
+            attn_dec: crate::attention_dec::AttentionDec::for_arch(arch)?,
             rms_nw_mw: crate::RmsNormNoWeightMultiWG::for_arch(arch)?,
             sampler: crate::Sampler::for_arch(arch)?,
             hc_post: HcPost::for_arch(arch)?,

@@ -846,6 +846,21 @@ pub fn attn_meta_fill() -> bool {
     *D
 }
 
+/// `V41_ATTN_DEC_SCORE` (default ON; `0` = the batched kernel): lanes of
+/// <= 16 rows score attention with `AttentionDec::launch_score_f16s_rows`
+/// (kernels/attention_dec.hip), BIT-IDENTICAL to
+/// `launch_score_batched_htiled_wmma_f16s_rows` (tests/attention_dec_bitexact.rs)
+/// with the head tile as a grid dimension and each warp's K-chunk loads issued
+/// 16 at a time: the batched kernel's 3 WGs per decode row each walked 32
+/// load round trips. tests/bench_decode_latency_ab.rs (paired, 1000 rounds):
+/// -7.5 / -7.4 / -5.5 us per lane-layer at b = 1 / 2 / 3. Prefill chunks
+/// (> 16 rows) keep the batched kernel.
+fn attn_dec_score_for(b: u32) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_ATTN_DEC_SCORE").as_deref() != Ok("0"));
+    *D && b <= 16 && N_HEAD_DIM == 512 && N_HEAD % 16 == 0
+}
+
 /// `V41_MHC_FFN_LATE` (default ON; arena decode, V4.1, fused mixes): queue the
 /// pre-ffn MIXES after the router instead of before it, on the same stream.
 /// V4.1 collapses with the carry, so the router path (collapse -> rms_w ->
@@ -5157,6 +5172,26 @@ impl HeterogeneousEngine {
                 let scores_stride = sd.attn_scores_stride(b, n_total_max)?;
                 {
                     let _t = de.events.stage("k.attn.score", &de.compute)?;
+                    if attn_dec_score_for(b) {
+                        de.attn_dec.launch_score_f16s_rows(
+                            &de.compute,
+                            &mut sd.attn_scores,
+                            &sd.q_normed,
+                            &ls.kv_cache,
+                            None,
+                            &nrp_view,
+                            &nrop_view,
+                            &ncp_view,
+                            None,
+                            N_HEAD,
+                            N_HEAD_DIM,
+                            n_total_max,
+                            b,
+                            0,
+                            scores_stride,
+                            None,
+                        )?;
+                    } else {
                     de.attn_mixed.launch_score_batched_htiled_wmma_f16s(
                         &de.compute,
                         &mut sd.attn_scores,
@@ -5174,6 +5209,7 @@ impl HeterogeneousEngine {
                         0,
                         scores_stride,
                     )?;
+                    }
                 }
                 {
                     let _t = de.events.stage("k.attn.smwsum", &de.compute)?;
@@ -5764,6 +5800,25 @@ impl HeterogeneousEngine {
                         eff_n_total_max,
                         b,
                         scores_stride,
+                    )?;
+                } else if attn_dec_score_for(b) {
+                    de.attn_dec.launch_score_f16s_rows(
+                        &de.compute,
+                        &mut sd.attn_scores,
+                        &sd.q_normed,
+                        &ls.kv_cache,
+                        eff_comp_kv_buf,
+                        &nrp_view,
+                        &nrop_view,
+                        &ncp_view,
+                        None, // gather handles sparsity; no -INF mask needed
+                        N_HEAD,
+                        N_HEAD_DIM,
+                        eff_n_total_max,
+                        b,
+                        eff_comp_kv_batch_stride,
+                        scores_stride,
+                        attn_comp_base,
                     )?;
                 } else {
                     de.attn_mixed.launch_score_batched_htiled_wmma_f16s_rows(
