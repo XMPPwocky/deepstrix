@@ -10,11 +10,13 @@ ledger for a later, deliberate integration.
 1. **Never** kill / signal / restart `deepstrix-server` or `deepstrix-expertd`, never write
    sysfs (DPM clocks etc.), never ssh to box 2 (10.99.0.2), never `pkill` anything you did not
    start. Another job is A/B-testing iGPU clocks on production; `gpu_run.sh` waits for it.
-2. **Every command that touches a GPU goes through `_infra/gpu_run.sh`** with an honest
-   `--mb` (device memory you allocate). Caps: dGPU **256 MB** (the hub leaves ~440 MB of
-   the 16 GB free; exceeding it makes TTM silently evict the SERVER to GTT = 100x slower
-   production), iGPU **3 GB** (host RAM has ~6 GB available). Size working sets accordingly
-   (e.g. rotate over a few copies of an expert rather than allocating 384 of them).
+2. **Every command that touches a GPU goes through the scheduler** (`_infra/gpu_submit.sh` /
+   `gpu_wait.sh`, or `gpu_run.sh` = both) with an honest `--mb` (device memory you allocate).
+   The scheduler refuses a job that would not leave the production hub its memory (dGPU: free
+   VRAM − 270 MB; iGPU: host MemAvailable − 3 GB). While the hub is DOWN (as on 2026-09-26
+   evening) that is ~15 GB / ~80 GB, but keep jobs ≤ 4 GB dGPU / ≤ 16 GB iGPU so a hub restart
+   (which takes ~15.5 GB of VRAM and ~80 GB of host RAM) does not strand your harness: still
+   rotate over a few copies of an expert rather than allocating 384 of them.
 3. **No weight loads, no cargo.** Do not run `cargo build`/`cargo test`/the server/bench
    binaries of the workspace (each is a 50-100 s, 86 GB load + ~150 hipcc jobs; RAM cannot take
    it). Work with standalone harnesses on synthetic data at production shapes.
@@ -31,7 +33,27 @@ ledger for a later, deliberate integration.
 |---|---|
 | `_infra/env.sh` | sourced by the others: hipcc on PATH, `$KFLAGS_V41` (= exact build.rs flags: `-O3 -DDEEPSTRIX_V41=1 -DMHC_N_EMBD=5120 -DMHC_HC_DIM=20480 -DROUTER_MAX_EXPERTS=512`), `$KERNELS_DIR`, `$ROCPROFV3`, `$ATT_DECODER_DIR` |
 | `_infra/kcc.sh <hipcc args>` | hipcc behind a 2-slot compile semaphore (RAM). Baseline code object: `kcc.sh $KFLAGS_V41 --genco --offload-arch=gfx1151 $KERNELS_DIR/foo.hip -o base_gfx1151.hsaco` |
-| `_infra/gpu_run.sh --dev igpu\|dgpu --mb N --label fam/idea [--timeout S] -- cmd` | serialised, guarded GPU run; logs to `_infra/runs.tsv` with device busy% before/after |
+| `_infra/gpu_submit.sh --dev igpu\|dgpu --mb N --label <family>/<idea> [--timeout S] -- cmd` | **enqueue** a GPU job on the per-device scheduler; prints a ticket at once. Runs later from your cwd with the GPU as HIP device 0 |
+| `_infra/gpu_wait.sh TICKET...` | block until done; prints the job's output; exits with its rc |
+| `_infra/gpu_run.sh …` (same args as submit) | = submit + wait, for when you need the number now |
+| `_infra/gpu_queue.sh` | who is running / waiting per device, device-seconds per family in the last 10 min |
+
+**How the GPUs are shared (read this).** Two GPUs, seven engineers. A scheduler per device
+(`gpu_sched.sh`, run by the orchestrator) executes ONE job at a time per device and picks the next
+job from the family that has used the least device time recently (FIFO within a family), so nobody
+can monopolise a GPU and nobody's timing is contaminated by a concurrent kernel. Consequences for
+you: (1) **batch**: put all shapes/variants of a measurement into ONE harness process and ONE job
+(a job costs a queue round-trip + ~0.3 s ROCm init; 20 one-shape jobs are 20x the overhead and
+20x the queueing); (2) **submit and keep working**: `gpu_submit.sh` returns immediately — write the
+next candidate, read ISA, update NOTES.md, then `gpu_wait.sh`; only use `gpu_run.sh` when the next
+step really needs the number; (3) check `gpu_queue.sh` before a long job — if your family already
+has jobs queued or the queue is deep, do CPU work first; (4) keep jobs short (`--timeout` <= 300 s,
+hard cap 900): a >300 s job blocks every other family on that device; (5) never run a GPU binary
+outside the scheduler (`ROCR_VISIBLE_DEVICES`, direct `./harness`, rocprofv3) — a bare run is
+invisible to the scheduler and contaminates someone else's measurement. The scheduler also enforces:
+memory guards, **NO rocprofv3 ATT on the iGPU** (refused, rc 66), and at most ONE rocprofv3
+session machine-wide — both because the box hung during the first attempt of this sweep
+(2026-09-26 04:01 UTC, 15 h of downtime) while an iGPU ATT and a dGPU ATT ran concurrently.
 | `_infra/kbench.h` | harness helpers: `kb::Module` (load .hsaco), `kb::launch`, random fills, `kb::ab` (interleaved A/B, graph mode, flush hook, warm-up spin, med/p10/p90, GB/s, `KBJSON` lines), `kb::compare_f32` / `print_cmp` |
 | `_infra/isa.sh file.hsaco gfx1151 [--dis substr]` | VGPR/SGPR/LDS/scratch/spills per kernel + disassembly |
 | `_infra/in_env.sh cmd` | run llvm-objdump / llvm-readelf / hipcc etc. in the dev env |
