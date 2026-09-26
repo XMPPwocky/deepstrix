@@ -1,0 +1,18 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP qa base vs cpu_ref b=5             n=6400 bitexact=no bit_diff=3932 nonfinite=0 max_abs=1.526e-04 max_rel=1.521e-04 rmse=2.876e-05 rel_rmse=8.715e-08 worst_idx=5876
+KBJSON {"cmp":"qa base vs cpu_ref b=5","bitexact":0,"bit_diff":3932,"nonfinite":0,"max_abs":1.5259e-04,"rel_rmse":8.7151e-08}
+CMP qa q8_0_gemv_bpack_tB5 vs base b=5 n=6400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qa q8_0_gemv_bpack_tB5 vs base b=5","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qa q8_0_gemv_bpack_tB5_ku2 vs base b=5 n=6400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qa q8_0_gemv_bpack_tB5_ku2 vs base b=5","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== gemv q_a 1280x5120 b=5 cold(readflush72MB) copies=5 graph  (rounds=60 inner=5 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemv_bpack_warp8                    51.49      22.58      71.09    1.000     135.2       0.0
+cand q8_0_gemv_bpack_tB5                      47.37      16.90      65.22    0.920     147.0       0.0
+cand q8_0_gemv_bpack_tB5_ku2                  49.25      18.67      65.27    0.956     141.4       0.0
+null 1-WG kernel (launch floor)               36.43       4.82      56.94    0.708       0.0       0.0
+KBJSON {"tag":"gemv q_a 1280x5120 b=5 cold(readflush72MB) copies=5 graph","variant":"base q8_0_gemv_bpack_warp8","med_us":51.488,"p10_us":22.576,"p90_us":71.088,"ratio":1.0000,"gbps":135.24,"graph":1,"flush":1}
+KBJSON {"tag":"gemv q_a 1280x5120 b=5 cold(readflush72MB) copies=5 graph","variant":"cand q8_0_gemv_bpack_tB5","med_us":47.368,"p10_us":16.896,"p90_us":65.224,"ratio":0.9200,"gbps":147.00,"graph":1,"flush":1}
+KBJSON {"tag":"gemv q_a 1280x5120 b=5 cold(readflush72MB) copies=5 graph","variant":"cand q8_0_gemv_bpack_tB5_ku2","med_us":49.248,"p10_us":18.672,"p90_us":65.272,"ratio":0.9565,"gbps":141.39,"graph":1,"flush":1}
+KBJSON {"tag":"gemv q_a 1280x5120 b=5 cold(readflush72MB) copies=5 graph","variant":"null 1-WG kernel (launch floor)","med_us":36.432,"p10_us":4.824,"p90_us":56.944,"ratio":0.7076,"gbps":0.00,"graph":1,"flush":1}

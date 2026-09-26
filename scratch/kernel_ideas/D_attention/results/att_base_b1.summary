@@ -1,0 +1,37 @@
+rc=0
+== results/att_base_b1/stats_ui_output_agent_24253_dispatch_12.csv
+rows=1313 hitcount=3424 latency=18156 stall=12477 idle=17220 (stall/latency=68.7%)
+
+# top 25 by stall
+ %stall    %lat        hit          lat        stall  insn
+  64.58   44.40          4         8062         8058  s_wait_kmcnt 0x0
+  10.45    7.20          4         1308         1304  s_wait_kmcnt 0x0
+   6.67    4.60          4          836          832  s_wait_loadcnt 0xc
+   3.27    2.27          4          412          408  v_cvt_f16_f32_e64 v138, v138
+   2.22    1.54          2          279          277  s_wait_kmcnt 0x0
+   1.04    0.74          4          134          130  s_wait_loadcnt 0x7
+   0.63    0.46          4           83           79  v_cvt_f16_f32_e64 v175, v175
+   0.60    0.44          4           79           75  v_cvt_f16_f32_e64 v181, v181
+   0.59    0.43          4           78           74  v_cvt_f16_f32_e64 v199, v199
+   0.56    0.41          4           74           70  v_cvt_f16_f32_e64 v187, v187
+   0.44    0.32          4           59           55  v_cvt_f16_f32_e64 v145, v145
+   0.44    0.32          4           59           55  v_cvt_f16_f32_e64 v157, v157
+   0.44    0.32          4           59           55  v_cvt_f16_f32_e64 v163, v163
+   0.44    0.32          4           59           55  v_cvt_f16_f32_e64 v193, v193
+   0.43    0.32          4           58           54  v_cvt_f16_f32_e64 v169, v169
+   0.43    0.32          4           58           54  v_pack_b32_f16 v11, v203, v204
+   0.41    0.30          4           55           51  v_cvt_f16_f32_e64 v151, v151
+   0.27    0.21          4           38           34  v_cvt_f16_f32_e64 v139, v139
+   0.19    0.15          4           28           24  v_cvt_f16_f32_e64 v162, v162
+   0.18    0.14          4           26           22  v_pack_b32_f16 v10, v142, v143
+   0.18    0.14          4           26           22  v_add_co_ci_u32_e64 v9, null, v74, v69, vcc_lo
+   0.16    0.13          4           24           20  v_cvt_f16_f32_e64 v131, v131
+   0.15    0.13          4           23           19  v_cvt_f16_f32_e64 v137, v137
+   0.15    0.13          4           23           19  v_cvt_f16_f32_e64 v143, v143
+   0.15    0.46          4           83           19  v_wmma_f32_16x16x16_f16 v[0:7], v[8:11], v[56:59], v[0:7]
+== results/att_base_b1/stats_ui_output_agent_24253_dispatch_13.csv
+no rows parsed from results/att_base_b1/stats_ui_output_agent_24253_dispatch_13.csv
+== results/att_base_b1/stats_ui_output_agent_24253_dispatch_14.csv
+no rows parsed from results/att_base_b1/stats_ui_output_agent_24253_dispatch_14.csv
+== results/att_base_b1/stats_ui_output_agent_24253_dispatch_15.csv
+no rows parsed from results/att_base_b1/stats_ui_output_agent_24253_dispatch_15.csv

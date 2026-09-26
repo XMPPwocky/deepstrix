@@ -1,0 +1,16 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP qb q8_0_gemv_bpack_tB5 vs base b=5 n=163840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb q8_0_gemv_bpack_tB5 vs base b=5","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qb q8_0_gemv_bpack_tB5_ku2 vs base b=5 n=163840 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qb q8_0_gemv_bpack_tB5_ku2 vs base b=5","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== gemv qb 32768x1280 b=5 cold(readflush72MB) copies=1 graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemv_bpack_warp8                   210.12     139.16     243.12    1.000     212.1       0.0
+cand q8_0_gemv_bpack_tB5                     207.32     127.08     240.48    0.987     215.0       0.0
+cand q8_0_gemv_bpack_tB5_ku2                 205.76     130.16     214.64    0.979     216.6       0.0
+null 1-WG kernel (launch floor)              131.08      40.84     178.56    0.624       0.0       0.0
+KBJSON {"tag":"gemv qb 32768x1280 b=5 cold(readflush72MB) copies=1 graph","variant":"base q8_0_gemv_bpack_warp8","med_us":210.121,"p10_us":139.160,"p90_us":243.122,"ratio":1.0000,"gbps":212.09,"graph":1,"flush":1}
+KBJSON {"tag":"gemv qb 32768x1280 b=5 cold(readflush72MB) copies=1 graph","variant":"cand q8_0_gemv_bpack_tB5","med_us":207.321,"p10_us":127.081,"p90_us":240.482,"ratio":0.9867,"gbps":214.95,"graph":1,"flush":1}
+KBJSON {"tag":"gemv qb 32768x1280 b=5 cold(readflush72MB) copies=1 graph","variant":"cand q8_0_gemv_bpack_tB5_ku2","med_us":205.761,"p10_us":130.161,"p90_us":214.641,"ratio":0.9793,"gbps":216.58,"graph":1,"flush":1}
+KBJSON {"tag":"gemv qb 32768x1280 b=5 cold(readflush72MB) copies=1 graph","variant":"null 1-WG kernel (launch floor)","med_us":131.081,"p10_us":40.840,"p90_us":178.561,"ratio":0.6238,"gbps":0.00,"graph":1,"flush":1}

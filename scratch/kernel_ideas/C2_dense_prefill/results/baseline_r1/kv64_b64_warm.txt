@@ -1,0 +1,8 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[kb] LDS/CU 65536 B, regs/block 196608, L2 8388608 B
+[kb] shape kv64 b=64 M=512 K=5120 G=1 ldx=5184 working set ~5 MB
+
+== kv64 b=64 M=512 K=5120 G=1 WARM  (rounds=60 inner=5 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemv_batched_warp8                  38.49      37.01      64.22    1.000      84.3    8718.1
+KBJSON {"tag":"kv64 b=64 M=512 K=5120 G=1 WARM","variant":"base q8_0_gemv_batched_warp8","med_us":38.488,"p10_us":37.008,"p90_us":64.224,"ratio":1.0000,"gbps":84.29,"graph":0,"flush":0}

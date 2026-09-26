@@ -1,0 +1,40 @@
+   0.08    0.07        316         2122         1806  v_dot4_i32_iu8 v103, v76, v84, 0 neg_lo:[1,1,0]
+   0.07    0.06        316         2051         1735  v_dot4_i32_iu8 v85, v15, v98, v85 neg_lo:[1,1,0]
+   0.07    0.06        316         2007         1691  v_fmac_f32_e32 v101, v100, v87
+   0.07    0.06        316         2002         1686  v_dot4_i32_iu8 v89, v62, v86, v103 neg_lo:[1,1,0]
+== prof/att_kwide2/stats_ui_output_agent_10528_dispatch_91.csv
+rows=1185 hitcount=272280 latency=2764836 stall=2156981 idle=659702 (stall/latency=78.0%)
+rows=1185 hitcount=272280 latency=2764836 stall=2156981 idle=659702 (stall/latency=78.0%)
+
+# top 30 by stall
+ %stall    %lat        hit          lat        stall  insn
+  32.07   25.03        256       691935       691679  s_waitcnt vmcnt(5)
+  20.10   15.69        320       433915       433595  s_waitcnt vmcnt(3)
+  11.55    9.02        320       249376       249056  s_waitcnt vmcnt(3)
+   6.34    4.96        256       137036       136780  s_waitcnt vmcnt(2)
+   2.22    1.74        136        48060        47924  s_waitcnt vmcnt(4)
+   1.14    0.90        320        24997        24677  s_waitcnt lgkmcnt(0)
+   0.68    0.54        128        14847        14719  s_waitcnt lgkmcnt(0)
+   0.51    0.41        388        11471        11083  s_waitcnt lgkmcnt(0)
+   0.45    0.36        128         9929         9801  s_waitcnt lgkmcnt(0)
+   0.43    0.34        128         9433         9305  s_waitcnt lgkmcnt(0)
+   0.40    0.32        320         8862         8542  s_waitcnt lgkmcnt(0)
+   0.32    0.27        388         7340         6952  s_waitcnt lgkmcnt(0)
+   0.31    0.25        128         6906         6778  s_waitcnt lgkmcnt(0)
+   0.23    0.19        388         5327         4939  s_waitcnt lgkmcnt(0)
+   0.23    0.19        388         5284         4896  s_waitcnt lgkmcnt(0)
+   0.22    0.19        388         5186         4798  s_waitcnt lgkmcnt(0)
+   0.21    0.18        388         4867         4479  s_waitcnt lgkmcnt(0)
+   0.21    0.17        388         4835         4447  s_waitcnt lgkmcnt(0)
+   0.20    0.17        388         4710         4322  s_waitcnt lgkmcnt(0)
+   0.20    0.17        388         4601         4213  s_waitcnt lgkmcnt(0)
+   0.18    0.14        136         3912         3776  s_waitcnt lgkmcnt(0)
+   0.16    0.13        128         3587         3459  s_waitcnt lgkmcnt(0)
+   0.15    0.13        388         3661         3273  s_waitcnt lgkmcnt(0)
+   0.13    0.10        128         2859         2731  s_waitcnt lgkmcnt(0)
+   0.10    0.08        256         2323         2067  ds_load_u8 v101, v101
+   0.10    0.08        256         2306         2050  ds_load_u8 v172, v8
+   0.09    0.08        256         2127         1871  ds_load_u8 v98, v98
+   0.09    0.08        256         2097         1841  ds_load_u8 v104, v104
+   0.08    0.08        256         2086         1830  ds_load_u8 v111, v111
+   0.08    0.08        320         2142         1822  v_dot4_i32_iu8 v103, v76, v84, 0 neg_lo:[1,1,0]

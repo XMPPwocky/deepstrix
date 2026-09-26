@@ -1,0 +1,22 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP qa base vs cpu_ref b=1             n=1280 bitexact=no bit_diff=791 nonfinite=0 max_abs=1.221e-04 max_rel=7.163e-04 rmse=2.868e-05 rel_rmse=8.714e-08 worst_idx=253
+KBJSON {"cmp":"qa base vs cpu_ref b=1","bitexact":0,"bit_diff":791,"nonfinite":0,"max_abs":1.2207e-04,"rel_rmse":8.7138e-08}
+CMP qa q8_0_gemv_bpack_tB1 vs base b=1 n=1280 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qa q8_0_gemv_bpack_tB1 vs base b=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qa q8_0_gemv_bpack_tB1_ku2 vs base b=1 n=1280 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qa q8_0_gemv_bpack_tB1_ku2 vs base b=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qa q8_0_gemv_bpack_tB1_ku4 vs base b=1 n=1280 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qa q8_0_gemv_bpack_tB1_ku4 vs base b=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== gemv q_a 1280x5120 b=1 WARM(inner10,no flush) copies=1 graph  (rounds=60 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemv_bpack_warp8                     7.72       7.47      18.34    1.000     902.4       0.0
+base q8_0_gemv_warp8 (b=1 kernel)              7.42       7.00       9.83    0.962     938.4       0.0
+cand q8_0_gemv_bpack_tB1                       7.27       6.94      25.63    0.942     958.1       0.0
+cand q8_0_gemv_bpack_tB1_ku2                   7.50       7.16      12.82    0.972     928.9       0.0
+cand q8_0_gemv_bpack_tB1_ku4                   7.35       7.04      11.02    0.952     947.6       0.0
+KBJSON {"tag":"gemv q_a 1280x5120 b=1 WARM(inner10,no flush) copies=1 graph","variant":"base q8_0_gemv_bpack_warp8","med_us":7.716,"p10_us":7.468,"p90_us":18.344,"ratio":1.0000,"gbps":902.44,"graph":1,"flush":0}
+KBJSON {"tag":"gemv q_a 1280x5120 b=1 WARM(inner10,no flush) copies=1 graph","variant":"base q8_0_gemv_warp8 (b=1 kernel)","med_us":7.420,"p10_us":7.004,"p90_us":9.832,"ratio":0.9616,"gbps":938.44,"graph":1,"flush":0}
+KBJSON {"tag":"gemv q_a 1280x5120 b=1 WARM(inner10,no flush) copies=1 graph","variant":"cand q8_0_gemv_bpack_tB1","med_us":7.268,"p10_us":6.944,"p90_us":25.628,"ratio":0.9419,"gbps":958.06,"graph":1,"flush":0}
+KBJSON {"tag":"gemv q_a 1280x5120 b=1 WARM(inner10,no flush) copies=1 graph","variant":"cand q8_0_gemv_bpack_tB1_ku2","med_us":7.496,"p10_us":7.160,"p90_us":12.816,"ratio":0.9715,"gbps":928.91,"graph":1,"flush":0}
+KBJSON {"tag":"gemv q_a 1280x5120 b=1 WARM(inner10,no flush) copies=1 graph","variant":"cand q8_0_gemv_bpack_tB1_ku4","med_us":7.348,"p10_us":7.044,"p90_us":11.016,"ratio":0.9523,"gbps":947.63,"graph":1,"flush":0}

@@ -1,0 +1,16 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[h] pool: 16 experts x 18.8 MB = 301 MB on device
+[h] b=4 E=4 ppr=3: members/call=12.0 distinct experts/call=4 n_wi exact=4 bound=24
+base out: 20480/20480 nonzero, 0 nonfinite, out[0..3]=132.093 -64.9207 195.69 -131.129
+CMP twin(hetsplit b=1 per row) mid vs base n=55296 bitexact=no bit_diff=18308 nonfinite=0 max_abs=3.147e-05 max_rel=9.778e-04 rmse=1.615e-06 rel_rmse=1.799e-07 worst_idx=35669
+KBJSON {"cmp":"twin(hetsplit b=1 per row) mid vs base","bitexact":0,"bit_diff":18308,"nonfinite":0,"max_abs":3.1471e-05,"rel_rmse":1.7992e-07}
+CMP twin(hetsplit b=1 per row) out vs base n=20480 bitexact=no bit_diff=14565 nonfinite=0 max_abs=2.441e-04 max_rel=4.003e-03 rmse=3.186e-05 rel_rmse=1.004e-07 worst_idx=5160
+KBJSON {"cmp":"twin(hetsplit b=1 per row) out vs base","bitexact":0,"bit_diff":14565,"nonfinite":0,"max_abs":2.4414e-04,"rel_rmse":1.0037e-07}
+
+== b=4 E=4 ppr=3 P=16 gbound=384 bound-grid cold-rotating  (rounds=40 inner=8 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base chain (builders+kwide+q8k+kwide2+reduce)     714.84     577.64     784.18    1.000     105.2    1188.2
+twin: hetsplit b=1 chain x b rows           1429.89    1341.82    1475.23    2.000      52.6     594.0
+KBJSON {"tag":"b=4 E=4 ppr=3 P=16 gbound=384 bound-grid cold-rotating","variant":"base chain (builders+kwide+q8k+kwide2+reduce)","med_us":714.837,"p10_us":577.641,"p90_us":784.185,"ratio":1.0000,"gbps":105.20,"graph":1,"flush":0}
+KBJSON {"tag":"b=4 E=4 ppr=3 P=16 gbound=384 bound-grid cold-rotating","variant":"twin: hetsplit b=1 chain x b rows","med_us":1429.889,"p10_us":1341.822,"p90_us":1475.227,"ratio":2.0003,"gbps":52.59,"graph":1,"flush":0}
+roofline: 75.2 MB/call -> 351.4 us at 214 GB/s (325.6 us at 231)

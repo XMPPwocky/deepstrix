@@ -1,0 +1,29 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+== idx-q matvec b=1 COLD weight (10.5 MB), direct inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base f16_matvec_batched idx-q 4096x1280 (512,1,b)      32.08      30.92      35.92    1.000     326.9       0.0
+KBJSON {"tag":"idx-q matvec b=1 COLD weight (10.5 MB), direct inner=1","variant":"base f16_matvec_batched idx-q 4096x1280 (512,1,b)","med_us":32.080,"p10_us":30.920,"p90_us":35.920,"ratio":1.0000,"gbps":326.86,"graph":0,"flush":1}
+
+== small indexer kernels b=1 WARM, graph inner=10  (rounds=30 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_fp4 (32b)x128                    29.00      14.31      47.10    1.000       1.1       0.0
+base f16_matvec_batched proj 32x5120 (4,1,b)      46.25      36.96      55.50    1.595       7.1       0.0
+base vec_scale_inplace (32b)                  35.30      12.69      48.11    1.217       0.0       0.0
+KBJSON {"tag":"small indexer kernels b=1 WARM, graph inner=10","variant":"base indexer_fp4 (32b)x128","med_us":29.004,"p10_us":14.308,"p90_us":47.096,"ratio":1.0000,"gbps":1.13,"graph":1,"flush":0}
+KBJSON {"tag":"small indexer kernels b=1 WARM, graph inner=10","variant":"base f16_matvec_batched proj 32x5120 (4,1,b)","med_us":46.248,"p10_us":36.964,"p90_us":55.504,"ratio":1.5945,"gbps":7.09,"graph":1,"flush":0}
+KBJSON {"tag":"small indexer kernels b=1 WARM, graph inner=10","variant":"base vec_scale_inplace (32b)","med_us":35.300,"p10_us":12.692,"p90_us":48.112,"ratio":1.2171,"gbps":0.01,"graph":1,"flush":0}
+
+== idx-q matvec b=4 COLD weight (10.5 MB), direct inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base f16_matvec_batched idx-q 4096x1280 (512,1,b)      64.20      57.92     123.28    1.000     163.3       0.0
+KBJSON {"tag":"idx-q matvec b=4 COLD weight (10.5 MB), direct inner=1","variant":"base f16_matvec_batched idx-q 4096x1280 (512,1,b)","med_us":64.200,"p10_us":57.920,"p90_us":123.281,"ratio":1.0000,"gbps":163.33,"graph":0,"flush":1}
+
+== small indexer kernels b=4 WARM, graph inner=10  (rounds=30 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base indexer_fp4 (32b)x128                     3.96       3.84       4.40    1.000      33.1       0.0
+base f16_matvec_batched proj 32x5120 (4,1,b)      21.72      21.42      30.65    5.491      15.1       0.0
+base vec_scale_inplace (32b)                   3.56       3.35       3.94    0.900       0.3       0.0
+KBJSON {"tag":"small indexer kernels b=4 WARM, graph inner=10","variant":"base indexer_fp4 (32b)x128","med_us":3.956,"p10_us":3.844,"p90_us":4.400,"ratio":1.0000,"gbps":33.13,"graph":1,"flush":0}
+KBJSON {"tag":"small indexer kernels b=4 WARM, graph inner=10","variant":"base f16_matvec_batched proj 32x5120 (4,1,b)","med_us":21.724,"p10_us":21.424,"p90_us":30.652,"ratio":5.4913,"gbps":15.08,"graph":1,"flush":0}
+KBJSON {"tag":"small indexer kernels b=4 WARM, graph inner=10","variant":"base vec_scale_inplace (32b)","med_us":3.560,"p10_us":3.352,"p90_us":3.944,"ratio":0.8999,"gbps":0.29,"graph":1,"flush":0}

@@ -1,0 +1,11 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP quant_wave xq K=2304 b=1 int8_diff=0
+CMP quant_wave xscale vs base          n=72 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"quant_wave xscale vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== quantize K=2304 b=1 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_quantize_f32 (blocks x 32thr)        4.08       3.91       5.08    1.000       2.8       0.0
+cand q8_0_quantize_f32_wave                    3.89       3.57      10.60    0.953       3.0       0.0
+KBJSON {"tag":"quantize K=2304 b=1 warm graph(10 nodes)","variant":"base q8_0_quantize_f32 (blocks x 32thr)","med_us":4.080,"p10_us":3.908,"p90_us":5.080,"ratio":1.0000,"gbps":2.82,"graph":1,"flush":0}
+KBJSON {"tag":"quantize K=2304 b=1 warm graph(10 nodes)","variant":"cand q8_0_quantize_f32_wave","med_us":3.888,"p10_us":3.572,"p90_us":10.604,"ratio":0.9529,"gbps":2.96,"graph":1,"flush":0}

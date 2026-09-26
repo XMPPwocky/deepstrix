@@ -1,0 +1,56 @@
+W20260926 03:59:21.111685 126766094031488 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.033669 sec
+W20260926 03:59:21.111910 126766094031488 simple_timer.cpp:55] [rocprofv3] './harness gemv qa 8' ::     0.000000 sec
+W20260926 03:59:21.148944 126766094031488 tool.cpp:2424] HSA version 1.18.0 initialized (instance=0)
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+E20260926 03:59:21.152669 126766094031488 output_stream.cpp:111] Opened result file: results/att_base_qa_b8/run_gfx1201_code_object_id_1.out
+E20260926 03:59:21.157085 126766094031488 output_stream.cpp:111] Opened result file: results/att_base_qa_b8/run_gfx1201_code_object_id_2.out
+E20260926 03:59:21.157940 126766094031488 output_stream.cpp:111] Opened result file: results/att_base_qa_b8/run_gfx1201_code_object_id_3.out
+E20260926 03:59:21.159455 126766094031488 output_stream.cpp:111] Opened result file: results/att_base_qa_b8/run_gfx1201_code_object_id_4.out
+E20260926 03:59:21.161290 126766094031488 output_stream.cpp:111] Opened result file: results/att_base_qa_b8/run_gfx1201_code_object_id_5.out
+E20260926 03:59:21.240114 126766094031488 output_stream.cpp:111] Opened result file: results/att_base_qa_b8/run_gfx1201_code_object_id_6.out
+E20260926 03:59:21.286023 126766094031488 output_stream.cpp:111] Opened result file: results/att_base_qa_b8/run_gfx1201_code_object_id_7.out
+E20260926 03:59:21.587793 126765978613440 output_stream.cpp:111] Opened result file: results/att_base_qa_b8/run_32234_shader_engine_0_14.att
+E20260926 03:59:21.588115 126765978613440 output_stream.cpp:111] Opened result file: results/att_base_qa_b8/run_32234_shader_engine_0_15.att
+W20260926 03:59:21.594422 126766094031488 simple_timer.cpp:55] [rocprofv3] './harness gemv qa 8' ::     0.482512 sec
+W20260926 03:59:21.604871 126766094031488 generateRocpd.cpp:583] writing SQL database for process 840045 on node 868250506
+E20260926 03:59:21.607345 126766094031488 generateRocpd.cpp:606] Opened result file: results/att_base_qa_b8/run_results.db (UUID=000075da-2cdd-7cdd-a480-7f8ffcd8883c)
+W20260926 03:59:22.317841 126766094031488 simple_timer.cpp:55] SQLite3 generation :: rocpd_string             ::     0.014273 sec
+W20260926 03:59:22.328921 126766094031488 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_node          ::     0.011040 sec
+W20260926 03:59:22.340868 126766094031488 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_process       ::     0.011909 sec
+W20260926 03:59:22.374847 126766094031488 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_agent         ::     0.011981 sec
+W20260926 03:59:22.374873 126766094031488 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_pmc           ::     0.000009 sec
+W20260926 03:59:22.386859 126766094031488 simple_timer.cpp:55] SQLite3 generation :: rocpd kernel info        ::     0.011980 sec
+W20260926 03:59:22.386876 126766094031488 simple_timer.cpp:55] SQLite3 generation :: rocpd_region             ::     0.000001 sec
+W20260926 03:59:22.386880 126766094031488 simple_timer.cpp:55] SQLite3 generation :: rocpd_kernel_dispatch    ::     0.000000 sec
+W20260926 03:59:22.386883 126766094031488 simple_timer.cpp:55] SQLite3 generation :: rocpd_pmc_event          ::     0.000000 sec
+W20260926 03:59:22.386887 126766094031488 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_copy        ::     0.000000 sec
+W20260926 03:59:22.386890 126766094031488 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_allocate    ::     0.000001 sec
+W20260926 03:59:22.387036 126766094031488 simple_timer.cpp:55] SQLite3 generation :: SQL indexing             ::     0.000143 sec
+W20260926 03:59:22.387665 126766094031488 simple_timer.cpp:55] SQLite3 generation :: total                    ::     0.782795 sec
+E20260926 03:59:22.409491 126766094031488 att_lib_wrapper.cpp:66] unable to delete codeobj 7
+E20260926 03:59:22.429177 126766094031488 att_lib_wrapper.cpp:66] unable to delete codeobj 7
+W20260926 03:59:22.431955 126766094031488 simple_timer.cpp:55] [rocprofv3] output generation ::     0.835812 sec
+W20260926 03:59:22.432009 126766094031488 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.835870 sec
+CMP qa base vs cpu_ref b=8             n=10240 bitexact=no bit_diff=6280 nonfinite=0 max_abs=1.221e-04 max_rel=1.931e-04 rmse=2.920e-05 rel_rmse=8.737e-08 worst_idx=48
+KBJSON {"cmp":"qa base vs cpu_ref b=8","bitexact":0,"bit_diff":6280,"nonfinite":0,"max_abs":1.2207e-04,"rel_rmse":8.7366e-08}
+CMP qa q8_0_gemv_bpack_tB8 vs base b=8 n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qa q8_0_gemv_bpack_tB8 vs base b=8","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qa q8_0_gemv_bpack_tB8_ku2 vs base b=8 n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qa q8_0_gemv_bpack_tB8_ku2 vs base b=8","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qa q8_0_gemv_bpack_tB8_ku4 vs base b=8 n=10240 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qa q8_0_gemv_bpack_tB8_ku4 vs base b=8","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== gemv q_a 1280x5120 b=8 cold(readflush72MB) copies=5 graph  (rounds=2 inner=5 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemv_bpack_warp8                    37.01      29.38      37.01    1.000     188.2       0.0
+cand q8_0_gemv_bpack_tB8                      22.00      20.61      22.00    0.594     316.5       0.0
+cand q8_0_gemv_bpack_tB8_ku2                  37.42      24.20      37.42    1.011     186.1       0.0
+cand q8_0_gemv_bpack_tB8_ku4                  40.85      38.51      40.85    1.104     170.5       0.0
+null 1-WG kernel (launch floor)               12.06       7.95      12.06    0.326       0.0       0.0
+KBJSON {"tag":"gemv q_a 1280x5120 b=8 cold(readflush72MB) copies=5 graph","variant":"base q8_0_gemv_bpack_warp8","med_us":37.008,"p10_us":29.376,"p90_us":37.008,"ratio":1.0000,"gbps":188.15,"graph":1,"flush":1}
+KBJSON {"tag":"gemv q_a 1280x5120 b=8 cold(readflush72MB) copies=5 graph","variant":"cand q8_0_gemv_bpack_tB8","med_us":22.000,"p10_us":20.608,"p90_us":22.000,"ratio":0.5945,"gbps":316.51,"graph":1,"flush":1}
+KBJSON {"tag":"gemv q_a 1280x5120 b=8 cold(readflush72MB) copies=5 graph","variant":"cand q8_0_gemv_bpack_tB8_ku2","med_us":37.416,"p10_us":24.200,"p90_us":37.416,"ratio":1.0110,"gbps":186.10,"graph":1,"flush":1}
+KBJSON {"tag":"gemv q_a 1280x5120 b=8 cold(readflush72MB) copies=5 graph","variant":"cand q8_0_gemv_bpack_tB8_ku4","med_us":40.848,"p10_us":38.512,"p90_us":40.848,"ratio":1.1038,"gbps":170.47,"graph":1,"flush":1}
+KBJSON {"tag":"gemv q_a 1280x5120 b=8 cold(readflush72MB) copies=5 graph","variant":"null 1-WG kernel (launch floor)","med_us":12.064,"p10_us":7.952,"p90_us":12.064,"ratio":0.3260,"gbps":0.00,"graph":1,"flush":1}
+results/att_base_qa_b8/stats_ui_output_agent_32234_dispatch_14.csv
+results/att_base_qa_b8/stats_ui_output_agent_32234_dispatch_15.csv

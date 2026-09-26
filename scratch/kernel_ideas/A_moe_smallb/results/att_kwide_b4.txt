@@ -1,0 +1,50 @@
+   0.35    0.18       1180        13822        12642  v_mov_b16_e32 v88.l, v80.h
+   0.34    0.20       2440        14958        12518  ds_load_b128 v[92:95], v91
+   0.34    0.20       2440        14904        12464  v_dot4_i32_iu8 v92, v85, v92, 0 neg_lo:[1,1,0]
+   0.32    0.16        348        11957        11609  s_waitcnt lgkmcnt(0)
+   0.31    0.17       1180        12636        11456  v_add_co_ci_u32_e64 v83, null, 0, v67, vcc_lo
+   0.31    0.17       1180        12588        11408  v_add_nc_u32_e32 v83, v88, v81
+   0.30    0.16       1180        12319        11139  v_lshrrev_b32_e32 v108, 8, v84
+   0.30    0.16       1180        12317        11137  s_set_inst_prefetch_distance 0x2
+   0.30    0.16       1180        12096        10916  v_bfe_u32 v104, v111, v72, 4
+   0.26    0.13        152         9777         9625  s_waitcnt lgkmcnt(0)
+   0.26    0.14       1180        10671         9491  v_dual_mov_b32 v81, 0 :: v_dual_mov_b32 v82, 0
+   0.26    0.14       1180        10562         9382  v_bfe_u32 v82, v88, v72, 4
+   0.25    0.13       1180        10226         9046  v_lshrrev_b32_e32 v112, 24, v85
+   0.23    0.13       1180         9712         8532  ds_load_u8 v87, v107 offset:16768
+== prof/att_kwide/stats_ui_output_agent_37544_dispatch_97.csv
+rows=959 hitcount=436564 latency=6471819 stall=3016358 idle=1210630 (stall/latency=46.6%)
+rows=959 hitcount=436564 latency=6471819 stall=3016358 idle=1210630 (stall/latency=46.6%)
+
+# top 30 by stall
+ %stall    %lat        hit          lat        stall  insn
+  63.34   29.54       1140      1911642      1910502  s_waitcnt vmcnt(3)
+   5.37    2.52       1140       163264       162124  s_waitcnt vmcnt(0)
+   2.48    1.19       2180        76989        74809  s_waitcnt lgkmcnt(1)
+   1.61    0.76        420        49009        48589  s_waitcnt lgkmcnt(0)
+   1.37    0.65        420        41893        41473  s_waitcnt lgkmcnt(0)
+   1.01    0.47        114        30469        30355  s_waitcnt lgkmcnt(0)
+   0.55    0.26        114        16841        16727  s_waitcnt lgkmcnt(0)
+   0.42    0.21       1140        13686        12546  s_waitcnt vmcnt(2)
+   0.38    0.18        338        11945        11607  s_waitcnt lgkmcnt(0)
+   0.38    0.21       2180        13661        11481  v_mul_f32_e32 v97, v80, v96
+   0.36    0.18       1140        11971        10831  s_set_inst_prefetch_distance 0x2
+   0.34    0.16        300        10512        10212  s_waitcnt lgkmcnt(2)
+   0.34    0.19       2180        12385        10205  v_dot4_i32_iu8 v97, v81, v92, 0 neg_lo:[1,1,0]
+   0.33    0.19       2180        12193        10013  v_add_nc_u32_e32 v90, 8, v90
+   0.33    0.19       2180        12091         9911  v_dot4_i32_iu8 v92, v89, v95, v92 neg_lo:[1,1,0]
+   0.32    0.18       2180        11682         9502  v_movreld_b32_e32 v1, v94
+   0.29    0.17       2180        10831         8651  v_dot4_i32_iu8 v92, v87, v94, v92 neg_lo:[1,1,0]
+   0.27    0.14       1140         9357         8217  v_add_nc_u32_e32 v83, v88, v81
+   0.25    0.12        300         7954         7654  s_waitcnt lgkmcnt(0)
+   0.25    0.12        338         7770         7432  s_waitcnt lgkmcnt(0)
+   0.25    0.15       2180         9581         7401  v_dot4_i32_iu8 v97, v82, v93, v97 neg_lo:[1,1,0]
+   0.24    0.14       2180         9327         7147  v_movrels_b32_e32 v95, v33
+   0.23    0.14       2180         9204         7024  v_dot4_i32_iu8 v93, v83, v94, v97 neg_lo:[1,1,0]
+   0.23    0.11        338         7231         6893  s_waitcnt lgkmcnt(0)
+   0.22    0.12       1140         7778         6638  v_add_co_ci_u32_e64 v83, null, 0, v67, vcc_lo
+   0.21    0.11        338         6820         6482  s_waitcnt lgkmcnt(0)
+   0.21    0.10        338         6621         6283  s_waitcnt lgkmcnt(0)
+   0.21    0.11       1140         7344         6204  v_dual_mov_b32 v81, 0 :: v_dual_mov_b32 v82, 0
+   0.20    0.10        338         6464         6126  s_waitcnt lgkmcnt(0)
+   0.20    0.10        338         6323         5985  s_waitcnt lgkmcnt(0)

@@ -1,0 +1,18 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP gate base vs cpu_ref b=5           n=11520 bitexact=no bit_diff=7123 nonfinite=0 max_abs=1.221e-04 max_rel=5.236e-03 rmse=2.888e-05 rel_rmse=8.717e-08 worst_idx=26
+KBJSON {"cmp":"gate base vs cpu_ref b=5","bitexact":0,"bit_diff":7123,"nonfinite":0,"max_abs":1.2207e-04,"rel_rmse":8.7171e-08}
+CMP gate q8_0_gemv_bpack_tB5 vs base b=5 n=11520 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"gate q8_0_gemv_bpack_tB5 vs base b=5","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP gate q8_0_gemv_bpack_tB5_ku2 vs base b=5 n=11520 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"gate q8_0_gemv_bpack_tB5_ku2 vs base b=5","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== gemv sh_gate 2304x5120 b=5 cold(readflush72MB) copies=3 graph  (rounds=60 inner=3 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemv_bpack_warp8                    37.25      36.48      58.29    1.000     336.4       0.0
+cand q8_0_gemv_bpack_tB5                      28.67      27.92      58.57    0.770     437.2       0.0
+cand q8_0_gemv_bpack_tB5_ku2                  29.85      29.27      54.00    0.801     419.8       0.0
+null 1-WG kernel (launch floor)                6.55       6.36      12.89    0.176       0.0       0.0
+KBJSON {"tag":"gemv sh_gate 2304x5120 b=5 cold(readflush72MB) copies=3 graph","variant":"base q8_0_gemv_bpack_warp8","med_us":37.253,"p10_us":36.480,"p90_us":58.294,"ratio":1.0000,"gbps":336.45,"graph":1,"flush":1}
+KBJSON {"tag":"gemv sh_gate 2304x5120 b=5 cold(readflush72MB) copies=3 graph","variant":"cand q8_0_gemv_bpack_tB5","med_us":28.667,"p10_us":27.920,"p90_us":58.574,"ratio":0.7695,"gbps":437.22,"graph":1,"flush":1}
+KBJSON {"tag":"gemv sh_gate 2304x5120 b=5 cold(readflush72MB) copies=3 graph","variant":"cand q8_0_gemv_bpack_tB5_ku2","med_us":29.854,"p10_us":29.267,"p90_us":54.000,"ratio":0.8014,"gbps":419.84,"graph":1,"flush":1}
+KBJSON {"tag":"gemv sh_gate 2304x5120 b=5 cold(readflush72MB) copies=3 graph","variant":"null 1-WG kernel (launch floor)","med_us":6.547,"p10_us":6.360,"p90_us":12.894,"ratio":0.1757,"gbps":0.00,"graph":1,"flush":1}

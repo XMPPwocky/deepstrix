@@ -1,0 +1,16 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP gate merged tB5 vs 2 lanes         n=11520 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"gate merged tB5 vs 2 lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== lanes sh_gate 2304x5120 b0=2 b1=3 cold graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base lane0 b=2                               146.40      69.96     167.80    1.000      85.6       0.0
+base lane1 b=3                               147.40      40.88     155.84    1.007      85.0       0.0
+base merged b=5 (runtime loop)               154.12      72.36     197.88    1.053      81.3       0.0
+cand merged tB5                              143.40      36.12     177.32    0.980      87.4       0.0
+cand merged tB5_ku2                          146.92      53.80     180.12    1.004      85.3       0.0
+KBJSON {"tag":"lanes sh_gate 2304x5120 b0=2 b1=3 cold graph","variant":"base lane0 b=2","med_us":146.401,"p10_us":69.960,"p90_us":167.801,"ratio":1.0000,"gbps":85.61,"graph":1,"flush":1}
+KBJSON {"tag":"lanes sh_gate 2304x5120 b0=2 b1=3 cold graph","variant":"base lane1 b=3","med_us":147.400,"p10_us":40.881,"p90_us":155.841,"ratio":1.0068,"gbps":85.03,"graph":1,"flush":1}
+KBJSON {"tag":"lanes sh_gate 2304x5120 b0=2 b1=3 cold graph","variant":"base merged b=5 (runtime loop)","med_us":154.121,"p10_us":72.360,"p90_us":197.882,"ratio":1.0527,"gbps":81.32,"graph":1,"flush":1}
+KBJSON {"tag":"lanes sh_gate 2304x5120 b0=2 b1=3 cold graph","variant":"cand merged tB5","med_us":143.401,"p10_us":36.121,"p90_us":177.321,"ratio":0.9795,"gbps":87.40,"graph":1,"flush":1}
+KBJSON {"tag":"lanes sh_gate 2304x5120 b0=2 b1=3 cold graph","variant":"cand merged tB5_ku2","med_us":146.921,"p10_us":53.800,"p90_us":180.121,"ratio":1.0036,"gbps":85.31,"graph":1,"flush":1}

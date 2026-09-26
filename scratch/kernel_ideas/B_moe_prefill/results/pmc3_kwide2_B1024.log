@@ -1,0 +1,1 @@
+gpu_run: REFUSED igpu run: MemAvailable 4647 MB < 1600 MB + 3 GB margin

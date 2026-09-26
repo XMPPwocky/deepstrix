@@ -1,0 +1,22 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP engram q8_0_gemv_bpack_tB1 vs base b=1 n=6400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram q8_0_gemv_bpack_tB1 vs base b=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram q8_0_gemv_bpack_tB1_ku2 vs base b=1 n=6400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram q8_0_gemv_bpack_tB1_ku2 vs base b=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram q8_0_gemv_bpack_tB1_ku4 vs base b=1 n=6400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram q8_0_gemv_bpack_tB1_ku4 vs base b=1","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== gemv engram_proxy 6400x6144 b=1 cold(readflush72MB) copies=1 graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemv_bpack_warp8                    83.28      80.36     111.44    1.000     501.7       0.0
+base q8_0_gemv_warp8 (b=1 kernel)             82.72      80.20      91.56    0.993     505.1       0.0
+cand q8_0_gemv_bpack_tB1                      83.32      79.64     149.44    1.000     501.4       0.0
+cand q8_0_gemv_bpack_tB1_ku2                  83.04      80.08     167.20    0.997     503.1       0.0
+cand q8_0_gemv_bpack_tB1_ku4                  83.40      80.80     133.88    1.001     500.9       0.0
+null 1-WG kernel (launch floor)               14.16      13.32      16.80    0.170       0.0       0.0
+KBJSON {"tag":"gemv engram_proxy 6400x6144 b=1 cold(readflush72MB) copies=1 graph","variant":"base q8_0_gemv_bpack_warp8","med_us":83.280,"p10_us":80.361,"p90_us":111.441,"ratio":1.0000,"gbps":501.67,"graph":1,"flush":1}
+KBJSON {"tag":"gemv engram_proxy 6400x6144 b=1 cold(readflush72MB) copies=1 graph","variant":"base q8_0_gemv_warp8 (b=1 kernel)","med_us":82.720,"p10_us":80.201,"p90_us":91.560,"ratio":0.9933,"gbps":505.07,"graph":1,"flush":1}
+KBJSON {"tag":"gemv engram_proxy 6400x6144 b=1 cold(readflush72MB) copies=1 graph","variant":"cand q8_0_gemv_bpack_tB1","med_us":83.321,"p10_us":79.640,"p90_us":149.441,"ratio":1.0005,"gbps":501.42,"graph":1,"flush":1}
+KBJSON {"tag":"gemv engram_proxy 6400x6144 b=1 cold(readflush72MB) copies=1 graph","variant":"cand q8_0_gemv_bpack_tB1_ku2","med_us":83.041,"p10_us":80.081,"p90_us":167.201,"ratio":0.9971,"gbps":503.12,"graph":1,"flush":1}
+KBJSON {"tag":"gemv engram_proxy 6400x6144 b=1 cold(readflush72MB) copies=1 graph","variant":"cand q8_0_gemv_bpack_tB1_ku4","med_us":83.401,"p10_us":80.801,"p90_us":133.881,"ratio":1.0015,"gbps":500.94,"graph":1,"flush":1}
+KBJSON {"tag":"gemv engram_proxy 6400x6144 b=1 cold(readflush72MB) copies=1 graph","variant":"null 1-WG kernel (launch floor)","med_us":14.160,"p10_us":13.320,"p90_us":16.801,"ratio":0.1700,"gbps":0.00,"graph":1,"flush":1}

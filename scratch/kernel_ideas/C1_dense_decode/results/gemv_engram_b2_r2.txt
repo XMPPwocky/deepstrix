@@ -1,0 +1,16 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP engram q8_0_gemv_bpack_tB2 vs base b=2 n=12800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram q8_0_gemv_bpack_tB2 vs base b=2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP engram q8_0_gemv_bpack_tB2_ku2 vs base b=2 n=12800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"engram q8_0_gemv_bpack_tB2_ku2 vs base b=2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== gemv engram_proxy 6400x6144 b=2 cold(readflush72MB) copies=1 graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemv_bpack_warp8                    89.16      85.56     121.24    1.000     468.6       0.0
+cand q8_0_gemv_bpack_tB2                     100.48      81.24     131.56    1.127     415.8       0.0
+cand q8_0_gemv_bpack_tB2_ku2                  84.52      81.68     111.56    0.948     494.3       0.0
+null 1-WG kernel (launch floor)               15.32      13.36      41.44    0.172       0.0       0.0
+KBJSON {"tag":"gemv engram_proxy 6400x6144 b=2 cold(readflush72MB) copies=1 graph","variant":"base q8_0_gemv_bpack_warp8","med_us":89.160,"p10_us":85.561,"p90_us":121.241,"ratio":1.0000,"gbps":468.59,"graph":1,"flush":1}
+KBJSON {"tag":"gemv engram_proxy 6400x6144 b=2 cold(readflush72MB) copies=1 graph","variant":"cand q8_0_gemv_bpack_tB2","med_us":100.481,"p10_us":81.240,"p90_us":131.561,"ratio":1.1270,"gbps":415.79,"graph":1,"flush":1}
+KBJSON {"tag":"gemv engram_proxy 6400x6144 b=2 cold(readflush72MB) copies=1 graph","variant":"cand q8_0_gemv_bpack_tB2_ku2","med_us":84.521,"p10_us":81.680,"p90_us":111.561,"ratio":0.9480,"gbps":494.31,"graph":1,"flush":1}
+KBJSON {"tag":"gemv engram_proxy 6400x6144 b=2 cold(readflush72MB) copies=1 graph","variant":"null 1-WG kernel (launch floor)","med_us":15.320,"p10_us":13.360,"p90_us":41.440,"ratio":0.1718,"gbps":0.00,"graph":1,"flush":1}

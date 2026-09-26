@@ -1,0 +1,4 @@
+gpu_run: holding (another job's clock A/B is measuring production, or HOLD set) ...
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+timeout: the monitored command dumped core
+../_infra/gpu_run.sh: line 66: 656673 Segmentation fault         ROCR_VISIBLE_DEVICES=$ROCR timeout --kill-after=10 "$TMO" "$@"

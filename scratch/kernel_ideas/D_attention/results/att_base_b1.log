@@ -1,0 +1,36 @@
+W20260926 03:55:08.544446 140093771881088 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.031208 sec
+W20260926 03:55:08.544652 140093771881088 simple_timer.cpp:55] [rocprofv3] './attn_harness_gfx1201 gfx1201 . prof 1' ::     0.000000 sec
+W20260926 03:55:08.732040 140093771881088 tool.cpp:2424] HSA version 1.18.0 initialized (instance=0)
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+E20260926 03:55:08.738188 140093771881088 output_stream.cpp:111] Opened result file: results/att_base_b1/run_gfx1201_code_object_id_1.out
+E20260926 03:55:08.739419 140093771881088 output_stream.cpp:111] Opened result file: results/att_base_b1/run_gfx1201_code_object_id_2.out
+[no candidate module ./cand_attn_gfx1201.hsaco]
+E20260926 03:55:08.742229 140093771881088 output_stream.cpp:111] Opened result file: results/att_base_b1/run_gfx1201_code_object_id_3.out
+E20260926 03:55:08.754620 140093771881088 output_stream.cpp:111] Opened result file: results/att_base_b1/run_gfx1201_code_object_id_4.out
+E20260926 03:55:08.862567 140093444585152 output_stream.cpp:111] Opened result file: results/att_base_b1/run_24253_shader_engine_0_12.att
+E20260926 03:55:08.862830 140093444585152 output_stream.cpp:111] Opened result file: results/att_base_b1/run_24253_shader_engine_0_13.att
+E20260926 03:55:08.863018 140093444585152 output_stream.cpp:111] Opened result file: results/att_base_b1/run_24253_shader_engine_0_14.att
+E20260926 03:55:08.863229 140093444585152 output_stream.cpp:111] Opened result file: results/att_base_b1/run_24253_shader_engine_0_15.att
+W20260926 03:55:08.863319 140093771881088 simple_timer.cpp:55] [rocprofv3] './attn_harness_gfx1201 gfx1201 . prof 1' ::     0.318667 sec
+W20260926 03:55:08.872705 140093771881088 generateRocpd.cpp:583] writing SQL database for process 674558 on node 868250506
+E20260926 03:55:08.873216 140093771881088 generateRocpd.cpp:606] Opened result file: results/att_base_b1/run_results.db (UUID=000075d6-5247-7247-84cf-5c48f2c57031)
+W20260926 03:55:09.579302 140093771881088 simple_timer.cpp:55] SQLite3 generation :: rocpd_string             ::     0.015293 sec
+W20260926 03:55:09.591308 140093771881088 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_node          ::     0.011977 sec
+W20260926 03:55:09.603204 140093771881088 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_process       ::     0.011880 sec
+W20260926 03:55:09.636273 140093771881088 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_agent         ::     0.011030 sec
+W20260926 03:55:09.636302 140093771881088 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_pmc           ::     0.000011 sec
+W20260926 03:55:09.648273 140093771881088 simple_timer.cpp:55] SQLite3 generation :: rocpd kernel info        ::     0.011965 sec
+W20260926 03:55:09.648287 140093771881088 simple_timer.cpp:55] SQLite3 generation :: rocpd_region             ::     0.000002 sec
+W20260926 03:55:09.648291 140093771881088 simple_timer.cpp:55] SQLite3 generation :: rocpd_kernel_dispatch    ::     0.000000 sec
+W20260926 03:55:09.648293 140093771881088 simple_timer.cpp:55] SQLite3 generation :: rocpd_pmc_event          ::     0.000000 sec
+W20260926 03:55:09.648296 140093771881088 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_copy        ::     0.000000 sec
+W20260926 03:55:09.648299 140093771881088 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_allocate    ::     0.000001 sec
+W20260926 03:55:09.648440 140093771881088 simple_timer.cpp:55] SQLite3 generation :: SQL indexing             ::     0.000138 sec
+W20260926 03:55:09.649148 140093771881088 simple_timer.cpp:55] SQLite3 generation :: total                    ::     0.776443 sec
+W20260926 03:55:09.666695 140093771881088 simple_timer.cpp:55] [rocprofv3] output generation ::     0.801835 sec
+W20260926 03:55:09.666734 140093771881088 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.801878 sec
+prof done b=1
+results/att_base_b1/stats_ui_output_agent_24253_dispatch_12.csv
+results/att_base_b1/stats_ui_output_agent_24253_dispatch_13.csv
+results/att_base_b1/stats_ui_output_agent_24253_dispatch_14.csv
+results/att_base_b1/stats_ui_output_agent_24253_dispatch_15.csv

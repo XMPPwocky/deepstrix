@@ -1,0 +1,12 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP wo_a q8_0_grouped_gemv_bpack_tB5 vs base b=5 n=40960 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"wo_a q8_0_grouped_gemv_bpack_tB5 vs base b=5","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== grouped wo_a 8x(1024x4096) b=5 cold graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_grouped_gemv_bpack                 116.32      96.40     140.48    1.000     306.5       0.0
+cand q8_0_grouped_gemv_bpack_tB5              93.96      74.48     113.12    0.808     379.4       0.0
+null 1-WG kernel (launch floor)               24.40      14.04      42.00    0.210       0.0       0.0
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=5 cold graph","variant":"base q8_0_grouped_gemv_bpack","med_us":116.321,"p10_us":96.400,"p90_us":140.481,"ratio":1.0000,"gbps":306.49,"graph":1,"flush":1}
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=5 cold graph","variant":"cand q8_0_grouped_gemv_bpack_tB5","med_us":93.960,"p10_us":74.481,"p90_us":113.121,"ratio":0.8078,"gbps":379.43,"graph":1,"flush":1}
+KBJSON {"tag":"grouped wo_a 8x(1024x4096) b=5 cold graph","variant":"null 1-WG kernel (launch floor)","med_us":24.400,"p10_us":14.040,"p90_us":42.000,"ratio":0.2098,"gbps":0.00,"graph":1,"flush":1}

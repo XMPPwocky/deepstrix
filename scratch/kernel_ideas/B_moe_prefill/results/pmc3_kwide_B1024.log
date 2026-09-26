@@ -1,0 +1,15 @@
+W20260926 03:59:15.814697 139378490186368 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.074483 sec
+W20260926 03:59:15.814889 139378490186368 simple_timer.cpp:55] [rocprofv3] './harness prof_kwide 1024 64' ::     0.000000 sec
+W20260926 03:59:15.841633 139378490186368 tool.cpp:2424] HSA version 1.18.0 initialized (instance=0)
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+W20260926 03:59:16.003528 139378490186368 tool.cpp:1190] Unable to find all counters for agent 2 (gpu-1, gfx1151) in [SQ_INST_CYCLES_VALU, SQ_INST_CYCLES_VMEM, SQ_WAIT_INST_ANY, SQ_WAVE_CYCLES]. Found: [SQ_WAVE_CYCLES]. Missing: [SQ_INST_CYCLES_VALU, SQ_INST_CYCLES_VMEM, SQ_WAIT_INST_ANY]
+[setup] B=1024 n_exp=64 members=1040 touched=64 max_group=27 n_wi_exact=64 n_wi_bound=576  mean members/expert=16.2
+W20260926 03:59:16.391948 139378490186368 simple_timer.cpp:55] [rocprofv3] './harness prof_kwide 1024 64' ::     0.577059 sec
+E20260926 03:59:16.439059 139378490186368 output_stream.cpp:111] Opened result file: prof_pmc3_kwide/run_counter_collection.csv
+E20260926 03:59:16.444174 139378490186368 output_stream.cpp:111] Opened result file: prof_pmc3_kwide/run_agent_info.csv
+W20260926 03:59:16.444593 139378490186368 simple_timer.cpp:55] [rocprofv3] output generation ::     0.052493 sec
+W20260926 03:59:16.444633 139378490186368 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.052535 sec
+ROOFLINE gate+up: 0.818 GB (weights 0.802 GB) -> 3.56 ms at 230 GB/s; 49.1 GFLOP
+ROOFLINE down:    0.425 GB (weights 0.401 GB) -> 1.85 ms at 230 GB/s; 24.5 GFLOP
+SCALE: x6.00 to a full 384-expert layer (this launch touches 64 experts)
+prof kwide done (6 launches)

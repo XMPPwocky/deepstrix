@@ -1,0 +1,16 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP qa base vs cpu_ref b=5             n=6400 bitexact=no bit_diff=3932 nonfinite=0 max_abs=1.526e-04 max_rel=1.521e-04 rmse=2.876e-05 rel_rmse=8.715e-08 worst_idx=5876
+KBJSON {"cmp":"qa base vs cpu_ref b=5","bitexact":0,"bit_diff":3932,"nonfinite":0,"max_abs":1.5259e-04,"rel_rmse":8.7151e-08}
+CMP qa q8_0_gemv_bpack_tB5 vs base b=5 n=6400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qa q8_0_gemv_bpack_tB5 vs base b=5","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP qa q8_0_gemv_bpack_tB5_ku2 vs base b=5 n=6400 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qa q8_0_gemv_bpack_tB5_ku2 vs base b=5","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== gemv q_a 1280x5120 b=5 cold(flush80MB) copies=1 graph  (rounds=40 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemv_bpack_warp8                    50.36      44.64      98.64    1.000     138.3       0.0
+cand q8_0_gemv_bpack_tB5                      41.08      37.44      74.52    0.816     169.5       0.0
+cand q8_0_gemv_bpack_tB5_ku2                  45.24      39.52      88.96    0.898     153.9       0.0
+KBJSON {"tag":"gemv q_a 1280x5120 b=5 cold(flush80MB) copies=1 graph","variant":"base q8_0_gemv_bpack_warp8","med_us":50.360,"p10_us":44.640,"p90_us":98.640,"ratio":1.0000,"gbps":138.27,"graph":1,"flush":1}
+KBJSON {"tag":"gemv q_a 1280x5120 b=5 cold(flush80MB) copies=1 graph","variant":"cand q8_0_gemv_bpack_tB5","med_us":41.081,"p10_us":37.440,"p90_us":74.521,"ratio":0.8157,"gbps":169.50,"graph":1,"flush":1}
+KBJSON {"tag":"gemv q_a 1280x5120 b=5 cold(flush80MB) copies=1 graph","variant":"cand q8_0_gemv_bpack_tB5_ku2","med_us":45.241,"p10_us":39.520,"p90_us":88.960,"ratio":0.8984,"gbps":153.91,"graph":1,"flush":1}

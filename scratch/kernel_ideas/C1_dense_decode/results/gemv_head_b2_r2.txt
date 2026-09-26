@@ -1,0 +1,16 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP head q8_0_gemv_bpack_tB2 vs base b=2 n=12928 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"head q8_0_gemv_bpack_tB2 vs base b=2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP head q8_0_gemv_bpack_tB2_ku2 vs base b=2 n=12928 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"head q8_0_gemv_bpack_tB2_ku2 vs base b=2","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== gemv head_proxy 6464x5120 b=2 cold(readflush72MB) copies=1 graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemv_bpack_warp8                    84.36      72.20     111.24    1.000     416.8       0.0
+cand q8_0_gemv_bpack_tB2                      77.32      69.60     107.64    0.917     454.8       0.0
+cand q8_0_gemv_bpack_tB2_ku2                  75.08      69.52     103.16    0.890     468.3       0.0
+null 1-WG kernel (launch floor)               15.76      13.64      43.08    0.187       0.0       0.0
+KBJSON {"tag":"gemv head_proxy 6464x5120 b=2 cold(readflush72MB) copies=1 graph","variant":"base q8_0_gemv_bpack_warp8","med_us":84.361,"p10_us":72.200,"p90_us":111.240,"ratio":1.0000,"gbps":416.83,"graph":1,"flush":1}
+KBJSON {"tag":"gemv head_proxy 6464x5120 b=2 cold(readflush72MB) copies=1 graph","variant":"cand q8_0_gemv_bpack_tB2","med_us":77.321,"p10_us":69.601,"p90_us":107.640,"ratio":0.9165,"gbps":454.78,"graph":1,"flush":1}
+KBJSON {"tag":"gemv head_proxy 6464x5120 b=2 cold(readflush72MB) copies=1 graph","variant":"cand q8_0_gemv_bpack_tB2_ku2","med_us":75.081,"p10_us":69.520,"p90_us":103.161,"ratio":0.8900,"gbps":468.35,"graph":1,"flush":1}
+KBJSON {"tag":"gemv head_proxy 6464x5120 b=2 cold(readflush72MB) copies=1 graph","variant":"null 1-WG kernel (launch floor)","med_us":15.760,"p10_us":13.640,"p90_us":43.080,"ratio":0.1868,"gbps":0.00,"graph":1,"flush":1}

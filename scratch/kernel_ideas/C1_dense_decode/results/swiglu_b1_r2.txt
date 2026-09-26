@@ -1,0 +1,6 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+== swiglu n=2304*1 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base swiglu                                    3.40       3.27       6.04    1.000       8.1       0.0
+KBJSON {"tag":"swiglu n=2304*1 warm graph(10 nodes)","variant":"base swiglu","med_us":3.404,"p10_us":3.268,"p90_us":6.044,"ratio":1.0000,"gbps":8.12,"graph":1,"flush":0}

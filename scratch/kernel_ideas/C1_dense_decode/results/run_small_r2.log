@@ -1,0 +1,106 @@
+CMP wo_a q8_0_grouped_gemv_bpack_tB1 vs base b=1 n=8192 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== grouped wo_a 8x(1024x4096) b=1 cold graph  (rounds=60 inner=1 graph=1 flush=1)
+base q8_0_grouped_gemv_bpack                  81.48      72.28     104.20    1.000     437.5       0.0
+cand q8_0_grouped_gemv_bpack_tB1              83.36      71.84     107.84    1.023     427.7       0.0
+null 1-WG kernel (launch floor)               14.76      13.52      41.60    0.181       0.0       0.0
+CMP wo_a q8_0_grouped_gemv_bpack_tB2 vs base b=2 n=16384 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== grouped wo_a 8x(1024x4096) b=2 cold graph  (rounds=60 inner=1 graph=1 flush=1)
+base q8_0_grouped_gemv_bpack                  79.32      75.12     149.20    1.000     449.5       0.0
+cand q8_0_grouped_gemv_bpack_tB2              72.08      70.76     104.44    0.909     494.6       0.0
+null 1-WG kernel (launch floor)               14.52      13.12      26.04    0.183       0.0       0.0
+CMP wo_a q8_0_grouped_gemv_bpack_tB4 vs base b=4 n=32768 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== grouped wo_a 8x(1024x4096) b=4 cold graph  (rounds=60 inner=1 graph=1 flush=1)
+base q8_0_grouped_gemv_bpack                 211.52     110.08     244.92    1.000     168.5       0.0
+cand q8_0_grouped_gemv_bpack_tB4             171.36      73.80     201.64    0.810     208.0       0.0
+null 1-WG kernel (launch floor)              126.60      15.72     156.12    0.599       0.0       0.0
+CMP wo_a q8_0_grouped_gemv_bpack_tB5 vs base b=5 n=40960 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== grouped wo_a 8x(1024x4096) b=5 cold graph  (rounds=60 inner=1 graph=1 flush=1)
+base q8_0_grouped_gemv_bpack                 116.32      96.40     140.48    1.000     306.5       0.0
+cand q8_0_grouped_gemv_bpack_tB5              93.96      74.48     113.12    0.808     379.4       0.0
+null 1-WG kernel (launch floor)               24.40      14.04      42.00    0.210       0.0       0.0
+CMP wo_a q8_0_grouped_gemv_bpack_tB8 vs base b=8 n=65536 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== grouped wo_a 8x(1024x4096) b=8 cold graph  (rounds=60 inner=1 graph=1 flush=1)
+base q8_0_grouped_gemv_bpack                 127.84     116.04     150.20    1.000     278.9       0.0
+cand q8_0_grouped_gemv_bpack_tB8              96.20      78.40     119.88    0.752     370.6       0.0
+null 1-WG kernel (launch floor)               17.12      13.72      42.68    0.134       0.0       0.0
+CMP quant_wave xq K=5120 b=1 int8_diff=0
+CMP quant_wave xscale vs base          n=160 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== quantize K=5120 b=1 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base q8_0_quantize_f32 (blocks x 32thr)        5.29       3.97      12.92    1.000       4.8       0.0
+cand q8_0_quantize_f32_wave                    5.20       3.61      12.82    0.983       4.9       0.0
+CMP quant_wave xq K=5120 b=4 int8_diff=0
+CMP quant_wave xscale vs base          n=640 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== quantize K=5120 b=4 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base q8_0_quantize_f32 (blocks x 32thr)        5.27       4.63      15.39    1.000      19.4       0.0
+cand q8_0_quantize_f32_wave                    5.53       3.83      13.05    1.049      18.5       0.0
+CMP quant_wave xq K=5120 b=8 int8_diff=0
+CMP quant_wave xscale vs base          n=1280 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== quantize K=5120 b=8 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base q8_0_quantize_f32 (blocks x 32thr)        5.31       5.26      47.84    1.000      38.6       0.0
+cand q8_0_quantize_f32_wave                    3.76       3.72      41.55    0.709      54.4       0.0
+CMP quant_wave xq K=1280 b=1 int8_diff=0
+CMP quant_wave xscale vs base          n=40 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== quantize K=1280 b=1 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base q8_0_quantize_f32 (blocks x 32thr)        3.90       3.88       3.95    1.000       1.6       0.0
+cand q8_0_quantize_f32_wave                    3.56       3.53       3.63    0.914       1.8       0.0
+CMP quant_wave xq K=1280 b=4 int8_diff=0
+CMP quant_wave xscale vs base          n=160 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== quantize K=1280 b=4 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base q8_0_quantize_f32 (blocks x 32thr)       31.40      12.90      47.61    1.000       0.8       0.0
+cand q8_0_quantize_f32_wave                   26.90      11.32      44.20    0.857       1.0       0.0
+CMP quant_wave xq K=1280 b=8 int8_diff=0
+CMP quant_wave xscale vs base          n=320 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== quantize K=1280 b=8 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base q8_0_quantize_f32 (blocks x 32thr)        4.24       4.02      45.93    1.000      12.1       0.0
+cand q8_0_quantize_f32_wave                    3.66       3.55      32.32    0.865      14.0       0.0
+CMP quant_wave xq K=8192 b=1 int8_diff=0
+CMP quant_wave xscale vs base          n=256 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== quantize K=8192 b=1 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base q8_0_quantize_f32 (blocks x 32thr)        4.36       4.06       9.26    1.000       9.4       0.0
+cand q8_0_quantize_f32_wave                    3.75       3.58       4.31    0.861      10.9       0.0
+CMP quant_wave xq K=8192 b=4 int8_diff=0
+CMP quant_wave xscale vs base          n=1024 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== quantize K=8192 b=4 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base q8_0_quantize_f32 (blocks x 32thr)        4.95       4.90       5.32    1.000      33.1       0.0
+cand q8_0_quantize_f32_wave                    3.73       3.60       4.26    0.753      43.9       0.0
+CMP quant_wave xq K=8192 b=8 int8_diff=0
+CMP quant_wave xscale vs base          n=2048 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== quantize K=8192 b=8 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base q8_0_quantize_f32 (blocks x 32thr)       17.07      11.74      22.21    1.000      19.2       0.0
+cand q8_0_quantize_f32_wave                   16.79       9.02      27.44    0.984      19.5       0.0
+CMP quant_wave xq K=32768 b=1 int8_diff=0
+CMP quant_wave xscale vs base          n=1024 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== quantize K=32768 b=1 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base q8_0_quantize_f32 (blocks x 32thr)        5.37       4.99      14.06    1.000      30.5       0.0
+cand q8_0_quantize_f32_wave                    3.83       3.69       5.91    0.714      42.8       0.0
+CMP quant_wave xq K=32768 b=4 int8_diff=0
+CMP quant_wave xscale vs base          n=4096 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== quantize K=32768 b=4 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base q8_0_quantize_f32 (blocks x 32thr)       30.55      17.60      65.34    1.000      21.5       0.0
+cand q8_0_quantize_f32_wave                   37.85      17.72      75.17    1.239      17.3       0.0
+CMP quant_wave xq K=32768 b=8 int8_diff=0
+CMP quant_wave xscale vs base          n=8192 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== quantize K=32768 b=8 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base q8_0_quantize_f32 (blocks x 32thr)       13.22      13.15      15.76    1.000      99.1       0.0
+cand q8_0_quantize_f32_wave                    5.81       5.78       6.27    0.440     225.5       0.0
+CMP quant_wave xq K=2304 b=1 int8_diff=0
+CMP quant_wave xscale vs base          n=72 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== quantize K=2304 b=1 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base q8_0_quantize_f32 (blocks x 32thr)        4.08       3.91       5.08    1.000       2.8       0.0
+cand q8_0_quantize_f32_wave                    3.89       3.57      10.60    0.953       3.0       0.0
+CMP quant_wave xq K=2304 b=4 int8_diff=0
+CMP quant_wave xscale vs base          n=288 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== quantize K=2304 b=4 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base q8_0_quantize_f32 (blocks x 32thr)       19.42       4.06      46.84    1.000       2.4       0.0
+cand q8_0_quantize_f32_wave                   13.10       3.56      45.84    0.675       3.5       0.0
+CMP quant_wave xq K=2304 b=8 int8_diff=0
+CMP quant_wave xscale vs base          n=576 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+== quantize K=2304 b=8 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base q8_0_quantize_f32 (blocks x 32thr)        4.50       4.23      12.94    1.000      20.5       0.0
+cand q8_0_quantize_f32_wave                    3.68       3.49       4.92    0.819      25.0       0.0
+== swiglu n=2304*1 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base swiglu                                    3.40       3.27       6.04    1.000       8.1       0.0
+== swiglu n=2304*4 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base swiglu                                    3.76       3.32      12.47    1.000      29.4       0.0
+== swiglu n=2304*8 warm graph(10 nodes)  (rounds=40 inner=10 graph=1 flush=0)
+base swiglu                                    3.56       3.34       8.37    1.000      62.2       0.0

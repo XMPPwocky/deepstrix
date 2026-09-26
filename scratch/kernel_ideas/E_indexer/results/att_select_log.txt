@@ -1,0 +1,31 @@
+W20260926 03:57:29.850875 132408035433088 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.034873 sec
+W20260926 03:57:29.851161 132408035433088 simple_timer.cpp:55] [rocprofv3] './harness_gfx1201 select . short n=235000 b=4' ::     0.000000 sec
+W20260926 03:57:29.883548 132408035433088 tool.cpp:2424] HSA version 1.18.0 initialized (instance=0)
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+E20260926 03:57:29.888524 132408035433088 output_stream.cpp:111] Opened result file: results/att_select/run_gfx1201_code_object_id_1.out
+E20260926 03:57:29.889871 132408035433088 output_stream.cpp:111] Opened result file: results/att_select/run_gfx1201_code_object_id_2.out
+[harness] (no ./cand_topk_gfx1201.hsaco)
+E20260926 03:57:29.891241 132408035433088 output_stream.cpp:111] Opened result file: results/att_select/run_gfx1201_code_object_id_3.out
+E20260926 03:57:29.909187 132408035433088 output_stream.cpp:111] Opened result file: results/att_select/run_gfx1201_code_object_id_4.out
+E20260926 03:57:29.913058 132407913084608 output_stream.cpp:111] Opened result file: results/att_select/run_17292_shader_engine_0_10.att
+W20260926 03:57:29.913650 132408035433088 simple_timer.cpp:55] [rocprofv3] './harness_gfx1201 select . short n=235000 b=4' ::     0.062489 sec
+E20260926 03:57:29.913983 132407913084608 output_stream.cpp:111] Opened result file: results/att_select/run_17292_shader_engine_0_11.att
+W20260926 03:57:29.922930 132408035433088 generateRocpd.cpp:583] writing SQL database for process 769962 on node 868250506
+E20260926 03:57:29.923225 132408035433088 generateRocpd.cpp:606] Opened result file: results/att_select/run_results.db (UUID=000075d8-7a3e-7a3e-969a-445553f3cf31)
+W20260926 03:57:30.677646 132408035433088 simple_timer.cpp:55] SQLite3 generation :: rocpd_string             ::     0.017064 sec
+W20260926 03:57:30.688576 132408035433088 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_node          ::     0.010892 sec
+W20260926 03:57:30.700708 132408035433088 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_process       ::     0.012096 sec
+W20260926 03:57:30.732599 132408035433088 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_agent         ::     0.010864 sec
+W20260926 03:57:30.732660 132408035433088 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_pmc           ::     0.000024 sec
+W20260926 03:57:30.744706 132408035433088 simple_timer.cpp:55] SQLite3 generation :: rocpd kernel info        ::     0.012031 sec
+W20260926 03:57:30.744746 132408035433088 simple_timer.cpp:55] SQLite3 generation :: rocpd_region             ::     0.000002 sec
+W20260926 03:57:30.744750 132408035433088 simple_timer.cpp:55] SQLite3 generation :: rocpd_kernel_dispatch    ::     0.000000 sec
+W20260926 03:57:30.744754 132408035433088 simple_timer.cpp:55] SQLite3 generation :: rocpd_pmc_event          ::     0.000000 sec
+W20260926 03:57:30.744757 132408035433088 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_copy        ::     0.000000 sec
+W20260926 03:57:30.744761 132408035433088 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_allocate    ::     0.000001 sec
+W20260926 03:57:30.744932 132408035433088 simple_timer.cpp:55] SQLite3 generation :: SQL indexing             ::     0.000168 sec
+W20260926 03:57:30.745698 132408035433088 simple_timer.cpp:55] SQLite3 generation :: total                    ::     0.822768 sec
+W20260926 03:57:30.998247 132408035433088 simple_timer.cpp:55] [rocprofv3] output generation ::     1.082635 sec
+W20260926 03:57:30.998305 132408035433088 simple_timer.cpp:55] [rocprofv3] tool finalization ::     1.082700 sec
+results/att_select/stats_ui_output_agent_17292_dispatch_10.csv
+results/att_select/stats_ui_output_agent_17292_dispatch_11.csv

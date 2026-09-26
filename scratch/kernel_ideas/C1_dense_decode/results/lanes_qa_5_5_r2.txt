@@ -1,0 +1,16 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP qa merged tB10 vs 2 lanes          n=12800 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"qa merged tB10 vs 2 lanes","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+
+== lanes q_a 1280x5120 b0=5 b1=5 cold graph  (rounds=60 inner=1 graph=1 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base lane0 b=5                                34.32      31.40      48.16    1.000     202.9       0.0
+base lane1 b=5                                33.60      31.48      74.20    0.979     207.2       0.0
+base merged b=10 (runtime loop)               43.00      41.20      63.68    1.253     161.9       0.0
+cand merged tB10                              30.48      28.52      90.16    0.888     228.5       0.0
+cand merged tB10_ku2                          33.92      31.48      50.60    0.988     205.3       0.0
+KBJSON {"tag":"lanes q_a 1280x5120 b0=5 b1=5 cold graph","variant":"base lane0 b=5","med_us":34.320,"p10_us":31.400,"p90_us":48.161,"ratio":1.0000,"gbps":202.89,"graph":1,"flush":1}
+KBJSON {"tag":"lanes q_a 1280x5120 b0=5 b1=5 cold graph","variant":"base lane1 b=5","med_us":33.600,"p10_us":31.480,"p90_us":74.201,"ratio":0.9790,"gbps":207.24,"graph":1,"flush":1}
+KBJSON {"tag":"lanes q_a 1280x5120 b0=5 b1=5 cold graph","variant":"base merged b=10 (runtime loop)","med_us":43.000,"p10_us":41.200,"p90_us":63.681,"ratio":1.2529,"gbps":161.93,"graph":1,"flush":1}
+KBJSON {"tag":"lanes q_a 1280x5120 b0=5 b1=5 cold graph","variant":"cand merged tB10","med_us":30.480,"p10_us":28.520,"p90_us":90.161,"ratio":0.8881,"gbps":228.45,"graph":1,"flush":1}
+KBJSON {"tag":"lanes q_a 1280x5120 b0=5 b1=5 cold graph","variant":"cand merged tB10_ku2","med_us":33.921,"p10_us":31.480,"p90_us":50.600,"ratio":0.9884,"gbps":205.28,"graph":1,"flush":1}

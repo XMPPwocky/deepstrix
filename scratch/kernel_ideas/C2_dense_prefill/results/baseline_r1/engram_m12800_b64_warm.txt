@@ -1,0 +1,8 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[kb] LDS/CU 65536 B, regs/block 196608, L2 8388608 B
+[kb] shape engram b=64 M=12800 K=6144 G=1 ldx=0 working set ~85 MB
+
+== engram b=64 M=12800 K=6144 G=1 WARM  (rounds=60 inner=5 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base q8_0_gemm_wmma_lds_tiled                537.76     482.87     577.06    1.000     162.3   18719.2
+KBJSON {"tag":"engram b=64 M=12800 K=6144 G=1 WARM","variant":"base q8_0_gemm_wmma_lds_tiled","med_us":537.755,"p10_us":482.867,"p90_us":577.060,"ratio":1.0000,"gbps":162.30,"graph":0,"flush":0}

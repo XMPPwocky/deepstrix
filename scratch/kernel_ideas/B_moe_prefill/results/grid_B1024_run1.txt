@@ -1,0 +1,16 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[setup] B=1024 n_exp=64 members=1040 touched=64 max_group=27 n_wi_exact=64 n_wi_bound=576  mean members/expert=16.2
+ROOFLINE gate+up: 0.818 GB (weights 0.802 GB) -> 3.56 ms at 230 GB/s; 49.1 GFLOP
+ROOFLINE down:    0.425 GB (weights 0.401 GB) -> 1.85 ms at 230 GB/s; 24.5 GFLOP
+SCALE: x6.00 to a full 384-expert layer (this launch touches 64 experts)
+
+== grid bound vs exact B=1024 n_exp=64  (rounds=25 inner=2 graph=0 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+kwide gate+up grid bound                    9207.16    9093.93    9265.26    1.000      88.8    5329.9
+kwide gate+up grid exact                    8685.26    8622.30    8725.32    0.943      94.2    5650.2
+kwide2 down grid bound                      9139.35    8493.65    9832.78    0.993      46.5    2684.7
+kwide2 down grid exact                      8488.95    7705.91    9086.87    0.922      50.1    2890.4
+KBJSON {"tag":"grid bound vs exact B=1024 n_exp=64","variant":"kwide gate+up grid bound","med_us":9207.162,"p10_us":9093.928,"p90_us":9265.260,"ratio":1.0000,"gbps":88.82,"graph":0,"flush":0}
+KBJSON {"tag":"grid bound vs exact B=1024 n_exp=64","variant":"kwide gate+up grid exact","med_us":8685.260,"p10_us":8622.303,"p90_us":8725.320,"ratio":0.9433,"gbps":94.16,"graph":0,"flush":0}
+KBJSON {"tag":"grid bound vs exact B=1024 n_exp=64","variant":"kwide2 down grid bound","med_us":9139.346,"p10_us":8493.646,"p90_us":9832.782,"ratio":0.9926,"gbps":46.51,"graph":0,"flush":0}
+KBJSON {"tag":"grid bound vs exact B=1024 n_exp=64","variant":"kwide2 down grid exact","med_us":8488.947,"p10_us":7705.911,"p90_us":9086.868,"ratio":0.9220,"gbps":50.08,"graph":0,"flush":0}

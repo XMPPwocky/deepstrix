@@ -1,0 +1,152 @@
+2026-09-26T03:54:13Z	C1_dense_decode/gemv_qa_b1	dgpu	160MB	rc=139	0.7s	busy_before=56	busy_after=98	./harness gemv qa 1 1
+2026-09-26T03:54:14Z	C1_dense_decode/gemv_qa_b2	dgpu	160MB	rc=0	0.7s	busy_before=98	busy_after=70	./harness gemv qa 2 1
+2026-09-26T03:54:15Z	C1_dense_decode/gemv_qa_b4	dgpu	160MB	rc=0	0.6s	busy_before=6	busy_after=87	./harness gemv qa 4 1
+2026-09-26T03:54:15Z	C1_dense_decode/gemv_qa_b5	dgpu	160MB	rc=0	0.6s	busy_before=95	busy_after=98	./harness gemv qa 5 1
+2026-09-26T03:54:16Z	C1_dense_decode/gemv_qa_b8	dgpu	160MB	rc=0	0.6s	busy_before=94	busy_after=92	./harness gemv qa 8 1
+2026-09-26T03:54:17Z	C2_dense_prefill/qa	dgpu	120MB	rc=0	0.5s	busy_before=3	busy_after=68	./harness_gfx1201 gfx1201 . qa
+2026-09-26T03:54:17Z	C2_dense_prefill/qa	dgpu	120MB	rc=0	0.5s	busy_before=85	busy_after=98	./harness_gfx1201 gfx1201 . qa --warm
+2026-09-26T03:54:19Z	C2_dense_prefill/qb	dgpu	160MB	rc=0	1.4s	busy_before=99	busy_after=97	./harness_gfx1201 gfx1201 . qb
+2026-09-26T03:54:20Z	C2_dense_prefill/qb	dgpu	160MB	rc=0	1.5s	busy_before=5	busy_after=91	./harness_gfx1201 gfx1201 . qb --warm
+2026-09-26T03:54:21Z	C2_dense_prefill/kv	dgpu	112MB	rc=0	0.6s	busy_before=99	busy_after=94	./harness_gfx1201 gfx1201 . kv
+2026-09-26T03:54:22Z	C2_dense_prefill/kv	dgpu	112MB	rc=0	0.5s	busy_before=99	busy_after=79	./harness_gfx1201 gfx1201 . kv --warm
+2026-09-26T03:54:22Z	C2_dense_prefill/woa	dgpu	160MB	rc=0	0.7s	busy_before=4	busy_after=82	./harness_gfx1201 gfx1201 . woa
+2026-09-26T03:54:22Z	_infra/example	igpu	16MB	rc=0	0.6s	busy_before=42	busy_after=65	./harness_gfx1151 gfx1151 .
+2026-09-26T03:54:23Z	F_mhc_glue/base_decode_b1_r1	dgpu	24MB	rc=0	0.8s	busy_before=100	busy_after=99	./harness_gfx1201 decode 1
+2026-09-26T03:54:24Z	C2_dense_prefill/woa	dgpu	160MB	rc=0	0.9s	busy_before=95	busy_after=94	./harness_gfx1201 gfx1201 . woa --warm
+2026-09-26T03:54:24Z	_infra/example	dgpu	16MB	rc=0	0.4s	busy_before=3	busy_after=78	./harness_gfx1201 gfx1201 .
+2026-09-26T03:54:25Z	C2_dense_prefill/wob	dgpu	155MB	rc=0	0.9s	busy_before=100	busy_after=93	./harness_gfx1201 gfx1201 . wob
+2026-09-26T03:54:28Z	D_attention/baseline_decode	dgpu	48MB	rc=0	2.2s	busy_before=92	busy_after=96	./attn_harness_gfx1201 gfx1201 . decode 1 2 4 5 8
+2026-09-26T03:54:28Z	C2_dense_prefill/wob	dgpu	155MB	rc=0	0.7s	busy_before=11	busy_after=83	./harness_gfx1201 gfx1201 . wob --warm
+2026-09-26T03:54:29Z	C2_dense_prefill/shg	dgpu	130MB	rc=0	0.5s	busy_before=30	busy_after=80	./harness_gfx1201 gfx1201 . shg
+2026-09-26T03:54:29Z	C2_dense_prefill/shg	dgpu	130MB	rc=0	0.6s	busy_before=38	busy_after=74	./harness_gfx1201 gfx1201 . shg --warm
+2026-09-26T03:54:30Z	C2_dense_prefill/shd	dgpu	130MB	rc=0	0.5s	busy_before=5	busy_after=83	./harness_gfx1201 gfx1201 . shd
+2026-09-26T03:54:31Z	C2_dense_prefill/shd	dgpu	130MB	rc=0	0.6s	busy_before=8	busy_after=76	./harness_gfx1201 gfx1201 . shd --warm
+2026-09-26T03:54:31Z	C2_dense_prefill/qa	dgpu	120MB	rc=0	0.5s	busy_before=4	busy_after=81	./harness_gfx1201 gfx1201 . qa --b 256
+2026-09-26T03:54:32Z	C2_dense_prefill/qa	dgpu	120MB	rc=0	0.5s	busy_before=12	busy_after=78	./harness_gfx1201 gfx1201 . qa --b 1024
+2026-09-26T03:54:32Z	C2_dense_prefill/kv	dgpu	112MB	rc=0	0.5s	busy_before=7	busy_after=71	./harness_gfx1201 gfx1201 . kv --b 256
+2026-09-26T03:54:33Z	C2_dense_prefill/kv	dgpu	112MB	rc=0	0.4s	busy_before=9	busy_after=78	./harness_gfx1201 gfx1201 . kv --b 1024
+2026-09-26T03:54:33Z	C2_dense_prefill/shg	dgpu	130MB	rc=0	0.6s	busy_before=8	busy_after=75	./harness_gfx1201 gfx1201 . shg --b 256
+2026-09-26T03:54:34Z	C2_dense_prefill/shg	dgpu	130MB	rc=0	0.5s	busy_before=8	busy_after=81	./harness_gfx1201 gfx1201 . shg --b 1024
+2026-09-26T03:54:34Z	C2_dense_prefill/shd	dgpu	130MB	rc=0	0.7s	busy_before=15	busy_after=71	./harness_gfx1201 gfx1201 . shd --b 256
+2026-09-26T03:54:35Z	C2_dense_prefill/shd	dgpu	130MB	rc=0	0.6s	busy_before=3	busy_after=70	./harness_gfx1201 gfx1201 . shd --b 1024
+2026-09-26T03:54:36Z	C2_dense_prefill/wob	dgpu	155MB	rc=0	0.6s	busy_before=40	busy_after=84	./harness_gfx1201 gfx1201 . wob --b 256
+2026-09-26T03:54:36Z	C2_dense_prefill/wob	dgpu	155MB	rc=0	0.7s	busy_before=56	busy_after=91	./harness_gfx1201 gfx1201 . wob --b 1024
+2026-09-26T03:54:37Z	C2_dense_prefill/engram	dgpu	160MB	rc=0	0.8s	busy_before=60	busy_after=89	./harness_gfx1201 gfx1201 . engram --m 12800
+2026-09-26T03:54:38Z	C2_dense_prefill/engram	dgpu	160MB	rc=0	0.7s	busy_before=63	busy_after=87	./harness_gfx1201 gfx1201 . engram --m 6400
+2026-09-26T03:54:39Z	C2_dense_prefill/engram	dgpu	160MB	rc=0	1.1s	busy_before=47	busy_after=92	./harness_gfx1201 gfx1201 . engram --m 12800 --warm
+2026-09-26T03:54:40Z	C2_dense_prefill/cast_5120	dgpu	120MB	rc=0	0.5s	busy_before=100	busy_after=90	./harness_gfx1201 gfx1201 . cast_5120
+2026-09-26T03:54:40Z	C2_dense_prefill/cast_32768	dgpu	120MB	rc=0	0.4s	busy_before=72	busy_after=87	./harness_gfx1201 gfx1201 . cast_32768
+2026-09-26T03:54:41Z	C2_dense_prefill/cast_8192	dgpu	120MB	rc=0	0.5s	busy_before=74	busy_after=84	./harness_gfx1201 gfx1201 . cast_8192
+2026-09-26T03:54:42Z	C2_dense_prefill/qb64	dgpu	155MB	rc=0	1.7s	busy_before=64	busy_after=96	./harness_gfx1201 gfx1201 . qb64
+2026-09-26T03:54:44Z	C2_dense_prefill/qb64	dgpu	155MB	rc=0	1.7s	busy_before=54	busy_after=97	./harness_gfx1201 gfx1201 . qb64 --warm
+2026-09-26T03:54:44Z	C2_dense_prefill/kv64	dgpu	110MB	rc=0	0.5s	busy_before=58	busy_after=92	./harness_gfx1201 gfx1201 . kv64
+2026-09-26T03:54:45Z	C2_dense_prefill/kv64	dgpu	110MB	rc=0	0.5s	busy_before=63	busy_after=87	./harness_gfx1201 gfx1201 . kv64 --warm
+2026-09-26T03:54:46Z	C2_dense_prefill/wob64	dgpu	155MB	rc=0	0.7s	busy_before=70	busy_after=94	./harness_gfx1201 gfx1201 . wob64
+2026-09-26T03:54:47Z	C2_dense_prefill/wob64	dgpu	155MB	rc=0	1.1s	busy_before=96	busy_after=95	./harness_gfx1201 gfx1201 . wob64 --warm
+2026-09-26T03:54:48Z	C2_dense_prefill/woa64	dgpu	150MB	rc=0	0.8s	busy_before=70	busy_after=97	./harness_gfx1201 gfx1201 . woa64
+2026-09-26T03:54:49Z	C2_dense_prefill/woa64	dgpu	150MB	rc=0	1.0s	busy_before=76	busy_after=93	./harness_gfx1201 gfx1201 . woa64 --warm
+2026-09-26T03:54:56Z	F_mhc_glue/base_decode_b4_r1	dgpu	24MB	rc=0	0.9s	busy_before=76	busy_after=98	./harness_gfx1201 decode 4
+2026-09-26T03:54:56Z	F_mhc_glue/base_decode_b1_direct_r1	dgpu	24MB	rc=0	0.6s	busy_before=95	busy_after=95	./harness_gfx1201 decode 1 direct
+2026-09-26T03:54:57Z	F_mhc_glue/base_prefill_512_warm_r1	dgpu	150MB	rc=0	0.7s	busy_before=92	busy_after=92	./harness_gfx1201 prefill 512
+2026-09-26T03:55:09Z	D_attention/att_baseline	dgpu	48MB	rc=0	1.3s	busy_before=83	busy_after=82	bash ../_infra/prof.sh att dgpu attention_(dec_score|mixed_softmax_wsum) results/att_base_b1 -- ./attn_harness_gfx1201 gfx1201 . prof 1
+2026-09-26T03:55:12Z	A_moe_smallb/baseline	igpu	400MB	rc=0	1.2s	busy_before=44	busy_after=78	./harness_gfx1151 gfx1151 . twin b=4 E=4 ppr=3 rounds=40 inner=8
+2026-09-26T03:55:13Z	C1_dense_decode/gemv_qa_1	dgpu	160MB	rc=0	0.5s	busy_before=84	busy_after=96	./harness gemv qa 1
+2026-09-26T03:55:14Z	C1_dense_decode/gemv_qa_1	dgpu	160MB	rc=0	0.6s	busy_before=71	busy_after=88	./harness gemv qa 1
+2026-09-26T03:55:14Z	C1_dense_decode/gemv_qa_8	dgpu	160MB	rc=0	0.6s	busy_before=84	busy_after=92	./harness gemv qa 8
+2026-09-26T03:55:29Z	A_moe_smallb/baseline-parts	igpu	400MB	rc=0	1.3s	busy_before=40	busy_after=73	./harness_gfx1151 gfx1151 . parts b=4 E=4 ppr=3 rounds=40 inner=8
+2026-09-26T03:55:30Z	A_moe_smallb/baseline	igpu	400MB	rc=0	0.9s	busy_before=71	busy_after=79	./harness_gfx1151 gfx1151 . twin b=1 E=4 ppr=3 rounds=40 inner=8
+2026-09-26T03:55:32Z	A_moe_smallb/baseline	igpu	400MB	rc=0	1.2s	busy_before=77	busy_after=80	./harness_gfx1151 gfx1151 . twin b=2 E=4 ppr=3 rounds=40 inner=8
+2026-09-26T03:55:34Z	A_moe_smallb/baseline	igpu	400MB	rc=0	1.8s	busy_before=79	busy_after=91	./harness_gfx1151 gfx1151 . twin b=8 E=4 ppr=3 rounds=40 inner=8
+2026-09-26T03:56:09Z	C2_dense_prefill/att_qb	dgpu	160MB	rc=0	3.2s	busy_before=84	busy_after=89	bash ../_infra/prof.sh att dgpu q8_0_gemm_wmma_f16x results/att_qb -- ./harness_gfx1201 gfx1201 . qb --short
+2026-09-26T03:56:20Z	C2_dense_prefill/att_kv	dgpu	112MB	rc=0	1.3s	busy_before=82	busy_after=71	bash ../_infra/prof.sh att dgpu q8_0_gemm_wmma_f16x results/att_kv -- ./harness_gfx1201 gfx1201 . kv --short
+2026-09-26T03:56:35Z	A_moe_smallb/att-kwide	igpu	400MB	rc=0	2.3s	busy_before=42	busy_after=39	bash ../_infra/prof.sh att igpu swiglu_kwide prof/att_kwide -- ./harness_gfx1151 gfx1151 . prof b=4 E=4 ppr=3 n=6 inner=8
+2026-09-26T03:56:39Z	F_mhc_glue/att_gemm	dgpu	100MB	rc=0	1.4s	busy_before=82	busy_after=78	bash ../_infra/prof.sh att dgpu f16_gemm_wmma results/att_gemm -- ./harness_gfx1201 prof gemm 512
+2026-09-26T03:56:45Z	C1_dense_decode/gemv_qa_1	dgpu	160MB	rc=0	0.8s	busy_before=83	busy_after=91	./harness gemv qa 1
+2026-09-26T03:56:52Z	E_indexer/score	dgpu	156MB	rc=0	4.1s	busy_before=82	busy_after=96	./harness_gfx1201 score . rounds=30
+2026-09-26T03:56:53Z	F_mhc_glue/att_mhc	dgpu	24MB	rc=0	1.2s	busy_before=69	busy_after=83	bash ../_infra/prof.sh att dgpu mhc_fast results/att_mhc -- ./harness_gfx1201 prof mhc 1
+2026-09-26T03:56:55Z	A_moe_smallb/att-kwide2	igpu	400MB	rc=0	2.1s	busy_before=35	busy_after=38	bash ../_infra/prof.sh att igpu by_expert_kwide2 prof/att_kwide2 -- ./harness_gfx1151 gfx1151 . prof b=4 E=4 ppr=3 n=6 inner=8
+2026-09-26T03:57:17Z	E_indexer/select	dgpu	40MB	rc=0	2.5s	busy_before=75	busy_after=97	./harness_gfx1201 select . rounds=30
+2026-09-26T03:57:17Z	C1_dense_decode/gemv_qa_b1	dgpu	115MB	rc=0	0.6s	busy_before=100	busy_after=98	./harness gemv qa 1
+2026-09-26T03:57:21Z	E_indexer/gather	dgpu	150MB	rc=0	3.5s	busy_before=81	busy_after=96	./harness_gfx1201 gather . rounds=30
+2026-09-26T03:57:21Z	C1_dense_decode/gemv_qa_b2	dgpu	115MB	rc=0	0.5s	busy_before=60	busy_after=92	./harness gemv qa 2
+2026-09-26T03:57:24Z	E_indexer/cand	dgpu	48MB	rc=0	2.5s	busy_before=44	busy_after=91	./harness_gfx1201 cand . rounds=30
+2026-09-26T03:57:24Z	C1_dense_decode/gemv_qa_b4	dgpu	115MB	rc=0	0.6s	busy_before=99	busy_after=83	./harness gemv qa 4
+2026-09-26T03:57:26Z	E_indexer/small	dgpu	90MB	rc=0	1.7s	busy_before=43	busy_after=86	./harness_gfx1201 small . rounds=30
+2026-09-26T03:57:27Z	C1_dense_decode/gemv_qa_b5	dgpu	115MB	rc=0	0.8s	busy_before=72	busy_after=76	./harness gemv qa 5
+2026-09-26T03:57:29Z	E_indexer/att_score	dgpu	156MB	rc=0	1.5s	busy_before=78	busy_after=78	bash ../_infra/prof.sh att dgpu indexer_score_wmma_batched_mw_e2m1 results/att_score -- ./harness_gfx1201 score . short n=235000 b=4
+2026-09-26T03:57:29Z	C1_dense_decode/gemv_qb_b1	dgpu	115MB	rc=0	0.7s	busy_before=91	busy_after=88	./harness gemv qb 1
+2026-09-26T03:57:31Z	E_indexer/att_select	dgpu	40MB	rc=0	1.3s	busy_before=100	busy_after=90	bash ../_infra/prof.sh att dgpu indexer_topk_select_batched_ilp results/att_select -- ./harness_gfx1201 select . short n=235000 b=4
+2026-09-26T03:57:31Z	C1_dense_decode/gemv_qb_b2	dgpu	115MB	rc=0	0.6s	busy_before=82	busy_after=95	./harness gemv qb 2
+2026-09-26T03:57:32Z	C1_dense_decode/gemv_qb_b4	dgpu	115MB	rc=0	0.6s	busy_before=66	busy_after=95	./harness gemv qb 4
+2026-09-26T03:57:33Z	C1_dense_decode/gemv_qb_b5	dgpu	115MB	rc=0	0.7s	busy_before=88	busy_after=92	./harness gemv qb 5
+2026-09-26T03:57:33Z	C1_dense_decode/gemv_qb_b8	dgpu	115MB	rc=0	0.7s	busy_before=72	busy_after=89	./harness gemv qb 8
+2026-09-26T03:57:34Z	C1_dense_decode/gemv_kv_b1	dgpu	115MB	rc=0	0.6s	busy_before=92	busy_after=83	./harness gemv kv 1
+2026-09-26T03:57:35Z	C1_dense_decode/gemv_kv_b2	dgpu	115MB	rc=0	0.6s	busy_before=88	busy_after=93	./harness gemv kv 2
+2026-09-26T03:57:35Z	C1_dense_decode/gemv_kv_b4	dgpu	115MB	rc=0	0.5s	busy_before=77	busy_after=97	./harness gemv kv 4
+2026-09-26T03:57:36Z	C1_dense_decode/gemv_kv_b5	dgpu	115MB	rc=0	0.6s	busy_before=89	busy_after=91	./harness gemv kv 5
+2026-09-26T03:57:36Z	C1_dense_decode/gemv_kv_b8	dgpu	115MB	rc=0	0.6s	busy_before=56	busy_after=96	./harness gemv kv 8
+2026-09-26T03:57:37Z	C1_dense_decode/gemv_wob_b1	dgpu	115MB	rc=0	0.6s	busy_before=70	busy_after=94	./harness gemv wob 1
+2026-09-26T03:57:38Z	C1_dense_decode/gemv_wob_b2	dgpu	115MB	rc=0	0.5s	busy_before=79	busy_after=95	./harness gemv wob 2
+2026-09-26T03:57:38Z	C1_dense_decode/gemv_wob_b4	dgpu	115MB	rc=0	0.5s	busy_before=87	busy_after=94	./harness gemv wob 4
+2026-09-26T03:57:39Z	C1_dense_decode/gemv_wob_b5	dgpu	115MB	rc=0	0.5s	busy_before=81	busy_after=93	./harness gemv wob 5
+2026-09-26T03:57:39Z	C1_dense_decode/gemv_wob_b8	dgpu	115MB	rc=0	0.6s	busy_before=96	busy_after=96	./harness gemv wob 8
+2026-09-26T03:57:40Z	C1_dense_decode/gemv_gate_b1	dgpu	115MB	rc=0	0.6s	busy_before=69	busy_after=91	./harness gemv gate 1
+2026-09-26T03:57:40Z	B_moe_prefill/base	igpu	2300MB	rc=2	0.1s	busy_before=37	busy_after=35	./B_moe_prefill/harness base 1024 96 1 25
+2026-09-26T03:57:41Z	C1_dense_decode/gemv_gate_b2	dgpu	115MB	rc=0	0.5s	busy_before=65	busy_after=94	./harness gemv gate 2
+2026-09-26T03:57:41Z	C1_dense_decode/gemv_gate_b4	dgpu	115MB	rc=0	0.6s	busy_before=85	busy_after=81	./harness gemv gate 4
+2026-09-26T03:57:42Z	C1_dense_decode/gemv_gate_b5	dgpu	115MB	rc=0	0.6s	busy_before=67	busy_after=87	./harness gemv gate 5
+2026-09-26T03:57:43Z	C1_dense_decode/gemv_gate_b8	dgpu	115MB	rc=0	0.7s	busy_before=67	busy_after=90	./harness gemv gate 8
+2026-09-26T03:57:43Z	C1_dense_decode/gemv_down_b1	dgpu	115MB	rc=0	0.6s	busy_before=61	busy_after=93	./harness gemv down 1
+2026-09-26T03:57:44Z	C1_dense_decode/gemv_down_b2	dgpu	115MB	rc=0	0.5s	busy_before=80	busy_after=97	./harness gemv down 2
+2026-09-26T03:57:45Z	C1_dense_decode/gemv_down_b4	dgpu	115MB	rc=0	0.7s	busy_before=80	busy_after=87	./harness gemv down 4
+2026-09-26T03:57:45Z	C1_dense_decode/gemv_down_b5	dgpu	115MB	rc=0	0.5s	busy_before=77	busy_after=97	./harness gemv down 5
+2026-09-26T03:57:46Z	C1_dense_decode/gemv_down_b8	dgpu	115MB	rc=0	0.7s	busy_before=97	busy_after=88	./harness gemv down 8
+2026-09-26T03:57:47Z	C1_dense_decode/gemv_engram_b1	dgpu	115MB	rc=0	0.6s	busy_before=52	busy_after=90	./harness gemv engram 1
+2026-09-26T03:57:47Z	C1_dense_decode/gemv_engram_b2	dgpu	115MB	rc=0	0.5s	busy_before=74	busy_after=93	./harness gemv engram 2
+2026-09-26T03:57:48Z	C1_dense_decode/gemv_engram_b4	dgpu	115MB	rc=0	0.6s	busy_before=78	busy_after=98	./harness gemv engram 4
+2026-09-26T03:57:48Z	C1_dense_decode/gemv_engram_b5	dgpu	115MB	rc=0	0.5s	busy_before=95	busy_after=93	./harness gemv engram 5
+2026-09-26T03:57:49Z	C1_dense_decode/gemv_engram_b8	dgpu	115MB	rc=0	0.6s	busy_before=99	busy_after=94	./harness gemv engram 8
+2026-09-26T03:57:50Z	C1_dense_decode/gemv_head_b1	dgpu	115MB	rc=0	0.6s	busy_before=69	busy_after=92	./harness gemv head 1
+2026-09-26T03:57:50Z	C1_dense_decode/gemv_head_b2	dgpu	115MB	rc=0	0.6s	busy_before=71	busy_after=93	./harness gemv head 2
+2026-09-26T03:57:51Z	C1_dense_decode/gemv_head_b4	dgpu	115MB	rc=0	0.6s	busy_before=73	busy_after=96	./harness gemv head 4
+2026-09-26T03:57:51Z	C1_dense_decode/gemv_head_b5	dgpu	115MB	rc=0	0.5s	busy_before=96	busy_after=94	./harness gemv head 5
+2026-09-26T03:57:52Z	C1_dense_decode/gemv_head_b8	dgpu	115MB	rc=0	0.6s	busy_before=79	busy_after=95	./harness gemv head 8
+2026-09-26T03:57:57Z	B_moe_prefill/base	igpu	1600MB	rc=0	2.0s	busy_before=38	busy_after=84	./harness base 1024 64 1 25
+2026-09-26T03:58:47Z	B_moe_prefill/counters	igpu	64MB	rc=0	0.5s	busy_before=38	busy_after=41	bash list_counters.sh
+2026-09-26T03:59:13Z	B_moe_prefill/grid	igpu	1600MB	rc=0	3.0s	busy_before=39	busy_after=92	./harness grid 1024 64 1 25
+2026-09-26T03:59:14Z	B_moe_prefill/pmc_kwide	igpu	1600MB	rc=0	0.8s	busy_before=90	busy_after=74	bash ../_infra/prof.sh pmc SQ_WAVES SQ_INSTS_VALU SQ_INSTS_LDS GRBM_GUI_ACTIVE prof_pmc1_kwide -- ./harness prof_kwide 1024 64
+2026-09-26T03:59:15Z	B_moe_prefill/pmc_kwide	igpu	1600MB	rc=0	0.8s	busy_before=73	busy_after=65	bash ../_infra/prof.sh pmc SQ_BUSY_CYCLES SQ_INSTS_TEX_LOAD SQ_INSTS_SALU MemUnitBusy prof_pmc2_kwide -- ./harness prof_kwide 1024 64
+2026-09-26T03:59:16Z	B_moe_prefill/pmc_kwide	igpu	1600MB	rc=0	0.8s	busy_before=64	busy_after=63	bash ../_infra/prof.sh pmc SQ_WAVE_CYCLES SQ_WAIT_INST_ANY SQ_INST_CYCLES_VALU SQ_INST_CYCLES_VMEM prof_pmc3_kwide -- ./harness prof_kwide 1024 64
+2026-09-26T03:59:17Z	B_moe_prefill/pmc_kwide	igpu	1600MB	rc=0	0.9s	busy_before=62	busy_after=60	bash ../_infra/prof.sh pmc VALUBusy MemUnitStalled prof_pmc4_kwide -- ./harness prof_kwide 1024 64
+2026-09-26T03:59:22Z	C1_dense_decode/att_q8_0_gemv_bpack_warp8	dgpu	115MB	rc=0	1.5s	busy_before=81	busy_after=83	bash ../_infra/prof.sh att dgpu q8_0_gemv_bpack_warp8 results/att_base_qa_b8 -- ./harness gemv qa 8
+2026-09-26T03:59:23Z	C1_dense_decode/grouped_b1	dgpu	115MB	rc=0	0.6s	busy_before=88	busy_after=92	./harness grouped 1
+2026-09-26T03:59:23Z	C1_dense_decode/grouped_b2	dgpu	115MB	rc=0	0.5s	busy_before=51	busy_after=90	./harness grouped 2
+2026-09-26T03:59:24Z	C1_dense_decode/grouped_b4	dgpu	115MB	rc=0	0.6s	busy_before=78	busy_after=93	./harness grouped 4
+2026-09-26T03:59:25Z	C1_dense_decode/grouped_b5	dgpu	115MB	rc=0	0.8s	busy_before=100	busy_after=78	./harness grouped 5
+2026-09-26T03:59:25Z	C1_dense_decode/grouped_b8	dgpu	115MB	rc=0	0.5s	busy_before=95	busy_after=98	./harness grouped 8
+2026-09-26T03:59:26Z	C1_dense_decode/quant_K5120_b1	dgpu	64MB	rc=0	0.5s	busy_before=100	busy_after=95	./harness quant 5120 1
+2026-09-26T03:59:26Z	C1_dense_decode/quant_K5120_b4	dgpu	64MB	rc=0	0.4s	busy_before=85	busy_after=91	./harness quant 5120 4
+2026-09-26T03:59:27Z	C1_dense_decode/quant_K5120_b8	dgpu	64MB	rc=0	0.7s	busy_before=65	busy_after=86	./harness quant 5120 8
+2026-09-26T03:59:28Z	C1_dense_decode/quant_K1280_b1	dgpu	64MB	rc=0	0.6s	busy_before=99	busy_after=91	./harness quant 1280 1
+2026-09-26T03:59:28Z	C1_dense_decode/quant_K1280_b4	dgpu	64MB	rc=0	0.4s	busy_before=94	busy_after=97	./harness quant 1280 4
+2026-09-26T03:59:29Z	C1_dense_decode/quant_K1280_b8	dgpu	64MB	rc=0	0.4s	busy_before=86	busy_after=93	./harness quant 1280 8
+2026-09-26T03:59:29Z	C1_dense_decode/quant_K8192_b1	dgpu	64MB	rc=0	0.6s	busy_before=61	busy_after=84	./harness quant 8192 1
+2026-09-26T03:59:30Z	C1_dense_decode/quant_K8192_b4	dgpu	64MB	rc=0	0.4s	busy_before=89	busy_after=96	./harness quant 8192 4
+2026-09-26T03:59:30Z	C1_dense_decode/quant_K8192_b8	dgpu	64MB	rc=0	0.7s	busy_before=89	busy_after=84	./harness quant 8192 8
+2026-09-26T03:59:31Z	C1_dense_decode/quant_K32768_b1	dgpu	64MB	rc=0	0.4s	busy_before=87	busy_after=94	./harness quant 32768 1
+2026-09-26T03:59:32Z	C1_dense_decode/quant_K32768_b4	dgpu	64MB	rc=0	0.6s	busy_before=84	busy_after=91	./harness quant 32768 4
+2026-09-26T03:59:32Z	C1_dense_decode/quant_K32768_b8	dgpu	64MB	rc=0	0.4s	busy_before=68	busy_after=94	./harness quant 32768 8
+2026-09-26T03:59:33Z	C1_dense_decode/quant_K2304_b1	dgpu	64MB	rc=0	0.5s	busy_before=74	busy_after=92	./harness quant 2304 1
+2026-09-26T03:59:33Z	C1_dense_decode/quant_K2304_b4	dgpu	64MB	rc=0	0.5s	busy_before=96	busy_after=95	./harness quant 2304 4
+2026-09-26T03:59:35Z	D_attention/cand1_decode	dgpu	48MB	rc=0	1.8s	busy_before=65	busy_after=98	./attn_harness_gfx1201 gfx1201 . decode 1 4 8
+2026-09-26T03:59:35Z	C1_dense_decode/quant_K2304_b8	dgpu	64MB	rc=0	0.6s	busy_before=100	busy_after=95	./harness quant 2304 8
+2026-09-26T03:59:36Z	C1_dense_decode/swiglu_b1	dgpu	64MB	rc=0	0.5s	busy_before=92	busy_after=98	./harness swiglu 1
+2026-09-26T03:59:36Z	C1_dense_decode/swiglu_b4	dgpu	64MB	rc=0	0.4s	busy_before=72	busy_after=96	./harness swiglu 4
+2026-09-26T03:59:37Z	C1_dense_decode/swiglu_b8	dgpu	64MB	rc=0	0.5s	busy_before=82	busy_after=90	./harness swiglu 8
+2026-09-26T04:00:28Z	C1_dense_decode/lanes_qa_4_4	dgpu	115MB	rc=0	0.8s	busy_before=85	busy_after=90	./harness lanes qa 4 4
+2026-09-26T04:00:28Z	C1_dense_decode/lanes_gate_4_4	dgpu	115MB	rc=0	0.5s	busy_before=99	busy_after=85	./harness lanes gate 4 4
+2026-09-26T04:00:29Z	C1_dense_decode/lanes_wob_4_4	dgpu	115MB	rc=0	0.8s	busy_before=98	busy_after=83	./harness lanes wob 4 4
+2026-09-26T04:00:30Z	C1_dense_decode/lanes_qa_5_5	dgpu	115MB	rc=0	0.5s	busy_before=89	busy_after=97	./harness lanes qa 5 5
+2026-09-26T04:00:30Z	C1_dense_decode/lanes_gate_2_3	dgpu	115MB	rc=0	0.6s	busy_before=99	busy_after=95	./harness lanes gate 2 3
+2026-09-26T18:56:58Z	_infra/example	dgpu	16MB	rc=0	1.5s	busy_before=NA	busy_after=46	./harness_gfx1201 gfx1201 .
+2026-09-26T18:56:59Z	_infra/example	igpu	16MB	rc=0	0.7s	busy_before=0	busy_after=45	./harness_gfx1151 gfx1151 .

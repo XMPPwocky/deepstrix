@@ -1,0 +1,5 @@
+*.hsaco
+*.elf
+*.s
+harness
+prof_*/

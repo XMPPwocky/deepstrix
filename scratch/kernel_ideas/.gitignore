@@ -1,0 +1,9 @@
+*.hsaco
+*.elf
+*.s
+*/prof_att_*/
+*/results/att_*/
+*/review/att_*/
+harness
+harness_*
+*.o

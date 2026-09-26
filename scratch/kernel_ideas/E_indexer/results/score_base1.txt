@@ -1,0 +1,63 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[harness] (no ./cand_score_gfx1201.hsaco)
+[score] keys 75.2 MB (235000 rows x 4 stores), scores 5.9 MB, flush 64 MB
+
+== score n=65536 b=1 COLD keys (flush 64MB), direct inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                          76.80      47.52     126.56    1.000      71.7    6990.5
+KBJSON {"tag":"score n=65536 b=1 COLD keys (flush 64MB), direct inner=1","variant":"base batched_mw_e2m1","med_us":76.800,"p10_us":47.520,"p90_us":126.561,"ratio":1.0000,"gbps":71.68,"graph":0,"flush":1}
+
+== score n=65536 b=1 WARM keys (bound), graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                          31.94      27.32      48.46    1.000     172.3   16806.5
+KBJSON {"tag":"score n=65536 b=1 WARM keys (bound), graph inner=5","variant":"base batched_mw_e2m1","med_us":31.944,"p10_us":27.320,"p90_us":48.456,"ratio":1.0000,"gbps":172.33,"graph":1,"flush":0}
+
+== score n=65536 b=4 COLD keys (flush 64MB), direct inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                          89.24      87.84     107.36    1.000     246.8   24064.1
+KBJSON {"tag":"score n=65536 b=4 COLD keys (flush 64MB), direct inner=1","variant":"base batched_mw_e2m1","med_us":89.240,"p10_us":87.841,"p90_us":107.360,"ratio":1.0000,"gbps":246.75,"graph":0,"flush":1}
+
+== score n=65536 b=4 WARM keys (bound), graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         128.38     101.38     146.38    1.000     171.5   16728.0
+KBJSON {"tag":"score n=65536 b=4 WARM keys (bound), graph inner=5","variant":"base batched_mw_e2m1","med_us":128.377,"p10_us":101.377,"p90_us":146.385,"ratio":1.0000,"gbps":171.53,"graph":1,"flush":0}
+
+== score n=131072 b=1 COLD keys (flush 64MB), direct inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                          59.40      48.84      66.36    1.000     185.4   18076.5
+KBJSON {"tag":"score n=131072 b=1 COLD keys (flush 64MB), direct inner=1","variant":"base batched_mw_e2m1","med_us":59.400,"p10_us":48.841,"p90_us":66.361,"ratio":1.0000,"gbps":185.35,"graph":0,"flush":1}
+
+== score n=131072 b=1 WARM keys (bound), graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                          76.19      62.84      91.70    1.000     144.5   14092.5
+KBJSON {"tag":"score n=131072 b=1 WARM keys (bound), graph inner=5","variant":"base batched_mw_e2m1","med_us":76.192,"p10_us":62.840,"p90_us":91.705,"ratio":1.0000,"gbps":144.50,"graph":1,"flush":0}
+
+== score n=131072 b=4 COLD keys (flush 64MB), direct inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         160.84     157.96     200.24    1.000     273.8   26703.2
+KBJSON {"tag":"score n=131072 b=4 COLD keys (flush 64MB), direct inner=1","variant":"base batched_mw_e2m1","med_us":160.841,"p10_us":157.961,"p90_us":200.241,"ratio":1.0000,"gbps":273.81,"graph":0,"flush":1}
+
+== score n=131072 b=4 WARM keys (bound), graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         178.99     152.74     200.41    1.000     246.1   23996.2
+KBJSON {"tag":"score n=131072 b=4 WARM keys (bound), graph inner=5","variant":"base batched_mw_e2m1","med_us":178.985,"p10_us":152.737,"p90_us":200.409,"ratio":1.0000,"gbps":246.05,"graph":1,"flush":0}
+
+== score n=235000 b=1 COLD keys (flush 64MB), direct inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         123.08      99.20     154.04    1.000     160.4   15641.2
+KBJSON {"tag":"score n=235000 b=1 COLD keys (flush 64MB), direct inner=1","variant":"base batched_mw_e2m1","med_us":123.080,"p10_us":99.200,"p90_us":154.041,"ratio":1.0000,"gbps":160.40,"graph":0,"flush":1}
+
+== score n=235000 b=1 WARM keys (bound), graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                          83.43      79.30      93.04    1.000     236.6   23074.0
+KBJSON {"tag":"score n=235000 b=1 WARM keys (bound), graph inner=5","variant":"base batched_mw_e2m1","med_us":83.433,"p10_us":79.297,"p90_us":93.041,"ratio":1.0000,"gbps":236.62,"graph":1,"flush":0}
+
+== score n=235000 b=4 COLD keys (flush 64MB), direct inner=1  (rounds=30 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         278.56     276.40     307.76    1.000     283.5   27643.7
+KBJSON {"tag":"score n=235000 b=4 COLD keys (flush 64MB), direct inner=1","variant":"base batched_mw_e2m1","med_us":278.562,"p10_us":276.402,"p90_us":307.762,"ratio":1.0000,"gbps":283.49,"graph":0,"flush":1}
+
+== score n=235000 b=4 WARM keys (bound), graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base batched_mw_e2m1                         311.37     305.84     323.06    1.000     253.6   24731.0
+KBJSON {"tag":"score n=235000 b=4 WARM keys (bound), graph inner=5","variant":"base batched_mw_e2m1","med_us":311.370,"p10_us":305.842,"p90_us":323.058,"ratio":1.0000,"gbps":253.62,"graph":1,"flush":0}

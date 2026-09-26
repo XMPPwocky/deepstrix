@@ -1,0 +1,1 @@
+gpu_run: REFUSED dgpu run: VRAM free 409 MB < 160 MB + 270 MB margin (hub owns the rest)
