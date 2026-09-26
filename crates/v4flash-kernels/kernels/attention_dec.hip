@@ -123,3 +123,103 @@ extern "C" __global__ __launch_bounds__(512) void attention_dec_score_htiled_wmm
     (void)raw_off; (void)tid;
 #endif
 }
+
+// ---------------------------------------------------------------------------
+// attention_dec_score_blk128 -- the SAME body with 4 warps per WG instead of
+// 16 (block 128, grid.x = ceil(n_total / 64)): 4x more WGs spread the
+// per-warp K/q load traffic over more CUs. BIT-IDENTICAL scores
+// (tests/attention_dec_bitexact.rs::attention_dec_score_blk128_is_bit_identical).
+// 2026-09-26 sweep (D_attention/score_blk128, dGPU, 640 keys, 64 heads),
+// score alone: 9.8/9.7/12.3/15.4/15.9/21.4 -> 7.0/8.4/10.1/11.7/15.3/20.1 us
+// at b = 1/2/3/4/5/8 (x1.32 at b = 4, reviewer x1.33; ~x1.05 at b >= 5).
+// Used only when the fused kernel (attention_dec_fused.hip) is not.
+// `n0 = blockIdx.x * (WARPS * 16) + warp * 16` is the only line that differs
+// from the kernel above; the chain, mask and stores are the same.
+// ---------------------------------------------------------------------------
+#if defined(__gfx1200__) || defined(__gfx1201__)
+template <int WARPS>
+__device__ __forceinline__ void dec_score_body(
+        _Float16* scores_g, const float* q, const _Float16* raw_kv, const _Float16* comp_kv,
+        const int* n_raw_per, const int* n_raw_offset_per, const int* n_comp_per,
+        const unsigned int* comp_allowed_bits, unsigned max_keys_words, unsigned n_head,
+        unsigned max_keys, float kq_scale, unsigned comp_kv_batch_stride, const int* comp_base_per) {
+    const unsigned b = blockIdx.z, mt = blockIdx.y, tid = threadIdx.x;
+    const unsigned warp = tid >> 5, lane = tid & 31u;
+    const unsigned n_raw = (unsigned)n_raw_per[b];
+    const unsigned raw_off = (unsigned)n_raw_offset_per[b];
+    const unsigned n_comp = (unsigned)n_comp_per[b];
+    const unsigned n_total = n_raw + n_comp;
+    const unsigned n0 = blockIdx.x * ((unsigned)WARPS * 16u) + warp * 16u;
+    if (n0 >= n_total) return;
+    const unsigned col = lane & 15u;
+    const unsigned kh = (lane >> 4) * 8u;
+    const unsigned bkey = n0 + col;
+    const size_t comp_kv_b_off = comp_base_per ? (size_t)(unsigned)comp_base_per[b] : (size_t)b * comp_kv_batch_stride;
+    const _Float16* brow = nullptr;
+    if (bkey < n_total) {
+        brow = (bkey < n_raw) ? raw_kv + (size_t)(bkey + raw_off) * SCD_HEAD_DIM
+                              : comp_kv + (comp_kv_b_off + (bkey - n_raw)) * SCD_HEAD_DIM;
+    }
+    bool key_masked = false;
+    if (comp_allowed_bits != nullptr && bkey >= n_raw && bkey < n_total) {
+        const unsigned c = bkey - n_raw;
+        const unsigned word_idx = (size_t)b * max_keys_words + (c >> 5);
+        key_masked = ((comp_allowed_bits[word_idx] >> (c & 31)) & 1u) == 0u;
+    }
+    const float* qh = q + ((size_t)b * n_head + mt * 16u + col) * SCD_HEAD_DIM;
+    float8 c = (float8){0,0,0,0,0,0,0,0};
+    #pragma unroll 1
+    for (unsigned g = 0; g < SCD_N_KC; g += SCD_GROUP) {
+        half8 bf[SCD_GROUP], af[SCD_GROUP];
+        #pragma unroll
+        for (unsigned u = 0; u < SCD_GROUP; u++) {
+            const unsigned dim0 = (g + u) * 16u + kh;
+            half8 t = {0,0,0,0,0,0,0,0};
+            if (brow) {
+                #pragma unroll
+                for (int e = 0; e < 8; e++) t[e] = brow[dim0 + (unsigned)e];
+            }
+            bf[u] = t;
+            half8 a;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) a[e] = (_Float16)qh[dim0 + (unsigned)e];
+            af[u] = a;
+        }
+        #pragma unroll
+        for (unsigned u = 0; u < SCD_GROUP; u++) c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(af[u], bf[u], c);
+    }
+    const _Float16 NEG_INF_F16 = (_Float16)(-INFINITY);
+    #pragma unroll
+    for (int e = 0; e < 8; e++) {
+        const unsigned h = mt * 16u + (lane >> 4) * 8u + (unsigned)e;
+        if (h < n_head && bkey < n_total)
+            scores_g[((size_t)b * n_head + h) * max_keys + bkey] = key_masked ? NEG_INF_F16 : (_Float16)(c[e] * kq_scale);
+    }
+}
+#endif  // gfx12
+
+extern "C" __global__ __launch_bounds__(128) void attention_dec_score_blk128(
+        _Float16       * scores_g,
+        const float    * q,
+        const _Float16 * raw_kv,
+        const _Float16 * comp_kv,
+        const int      * n_raw_per,
+        const int      * n_raw_offset_per,
+        const int      * n_comp_per,
+        const unsigned int * comp_allowed_bits,
+        unsigned int     max_keys_words,
+        unsigned int     n_head,
+        unsigned int     max_keys,
+        float            kq_scale,
+        unsigned int     comp_kv_batch_stride,
+        const int      * comp_base_per) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    dec_score_body<4>(scores_g, q, raw_kv, comp_kv, n_raw_per, n_raw_offset_per, n_comp_per,
+                      comp_allowed_bits, max_keys_words, n_head, max_keys, kq_scale,
+                      comp_kv_batch_stride, comp_base_per);
+#else
+    (void)scores_g; (void)q; (void)raw_kv; (void)comp_kv; (void)n_raw_per; (void)n_raw_offset_per;
+    (void)n_comp_per; (void)comp_allowed_bits; (void)max_keys_words; (void)n_head; (void)max_keys;
+    (void)kq_scale; (void)comp_kv_batch_stride; (void)comp_base_per;
+#endif
+}

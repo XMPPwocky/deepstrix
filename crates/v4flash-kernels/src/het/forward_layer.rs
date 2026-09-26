@@ -906,7 +906,9 @@ impl HeterogeneousEngine {
                         .launch(&de.compute, &mut dgpu_scratch.kv_normed, N_HEAD_DIM - N_ROT)?;
                 }
             }
-            {
+            if super::forward_prefill::kv_f16_roundtrip() {
+                // OFF by default since 2026-09-26: a no-op on the cache bits
+                // (the append below casts to f16 itself; see `kv_f16_roundtrip`).
                 let _t = de.events.stage("k.kv_chain.f16rt", &de.compute)?;
                 de.f16rt
                     .launch(&de.compute, &mut dgpu_scratch.kv_normed, N_HEAD_DIM)?;

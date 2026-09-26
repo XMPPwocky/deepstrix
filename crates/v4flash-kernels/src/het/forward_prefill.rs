@@ -861,6 +861,57 @@ fn attn_dec_score_for(b: u32) -> bool {
     *D && b <= 16 && N_HEAD_DIM == 512 && N_HEAD % 16 == 0
 }
 
+/// `V41_ATTN_DEC_FUSED` (default ON; `0` = the score + smwsum pair): lanes on
+/// the `attn_dec_score_for(b)` path run attention as ONE
+/// `AttentionDec::launch_fused_f16s_rows` (kernels/attention_dec_fused.hip),
+/// BIT-IDENTICAL to the pair (tests/attention_dec_bitexact.rs). 2026-09-26
+/// sweep (D_attention/fused_vt_qreg_sp, dGPU, 640 keys, 64 heads): pair
+/// 46.9 -> 20.4 us at b = 4 (x2.30, reviewer x2.31), 41.9 -> 19.9 at b = 1;
+/// ~25 us per lane-layer (~1 ms per lane per step) plus one fewer stage
+/// event pair. The call sites fall back to the pair when a row could exceed
+/// `ATTN_DEC_FUSED_MAX_KEYS` (640) keys (the kernel has no guard), when a
+/// `comp_allowed_bits` mask is passed (none on the decode path), or under
+/// `V41_VERIFY_DECODE_ATTN` (the fused kernel does not write the softmax
+/// weights back to `sd.attn_scores`; nothing else reads them). The stage is
+/// `k.attn.dec_fused` in place of `k.attn.score` + `k.attn.smwsum`.
+fn attn_dec_fused() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_ATTN_DEC_FUSED").as_deref() != Ok("0"));
+    *D
+}
+
+/// `V41_ATTN_DEC_SCORE_BLK128` (default ON; `0` = the 16-warp WG): when the
+/// `attn_dec_score_for(b)` path runs the PAIR (fused off or not applicable),
+/// score with `attention_dec_score_blk128` (kernels/attention_dec.hip): the
+/// same body with 4 warps x 16 keys per WG, grid.x = ceil(n / 64), so 4x more
+/// WGs spread the per-warp K/q loads over more CUs. BIT-IDENTICAL scores
+/// (tests/attention_dec_bitexact.rs). 2026-09-26 sweep (D_attention/
+/// score_blk128, dGPU, 640 keys): score 15.4 -> 11.7 us at b = 4 (x1.32),
+/// x1.42 at b = 1, tapering to ~x1.05 at b >= 5.
+fn attn_dec_score_blk128() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_ATTN_DEC_SCORE_BLK128").as_deref() != Ok("0"));
+    *D
+}
+
+/// `V41_KV_F16_ROUNDTRIP` (default OFF; `1` = the previous chain). NOTE the
+/// INVERTED sense: this knob RESTORES a launch. The `f16_roundtrip` node after
+/// the FP8 window quant (`k.kv_chain.f16rt`, here and in forward_layer.rs) is
+/// a numeric no-op: the only consumers of `sd.kv_normed` after it are the
+/// `kv_cache_append*` kernels, which store `(_Float16)x` themselves, and
+/// f16(f32(f16(x))) == f16(x) under round-to-nearest (both casts compile to
+/// the same v_cvt_f16_f32). 2026-09-26 sweep (D_attention/drop_f16_roundtrip):
+/// kv chain 8.6 -> 6.4 us at b = 4 (-2.3 us per lane-layer = one graph node);
+/// cache bits identical over 2.6M values incl. f16 ties, subnormals, overflow
+/// and NaN (reviewer). If a new f32 consumer of `sd.kv_normed` is ever added
+/// after the quant, or the append changes its rounding, the roundtrip must
+/// come back (set this to `1`).
+pub fn kv_f16_roundtrip() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_KV_F16_ROUNDTRIP").as_deref() == Ok("1"));
+    *D
+}
+
 /// `V41_MHC_FFN_LATE` (default ON; arena decode, V4.1, fused mixes): queue the
 /// pre-ffn MIXES after the router instead of before it, on the same stream.
 /// V4.1 collapses with the carry, so the router path (collapse -> rms_w ->
@@ -4032,8 +4083,10 @@ impl HeterogeneousEngine {
                 )?;
             }
         }
-        {
+        if kv_f16_roundtrip() {
             // f16rt is pure elementwise — stretch n by B for a single launch.
+            // OFF by default since 2026-09-26: a no-op on the cache bits (the
+            // appends below cast to f16 themselves; see `kv_f16_roundtrip`).
             let _t = de.events.stage("k.kv_chain.f16rt", &de.compute)?;
             de.f16rt.launch(&de.compute, &mut sd.kv_normed, b * N_HEAD_DIM)?;
         }
@@ -5170,10 +5223,42 @@ impl HeterogeneousEngine {
             let n_total_max = n_raw_after.iter().copied().max().unwrap_or(0);
             if n_total_max > 0 {
                 let scores_stride = sd.attn_scores_stride(b, n_total_max)?;
-                {
+                // 2026-09-26: the pair as ONE bit-identical launch (see
+                // `attn_dec_fused`); comp_kv None here. Image rows can widen
+                // the raw window to 128 + 384 keys, still under the 640 cap.
+                let dec_fused = attn_dec_score_for(b)
+                    && attn_dec_fused()
+                    && n_total_max <= crate::attention_dec::ATTN_DEC_FUSED_MAX_KEYS
+                    && !verify_decode_attn();
+                if dec_fused {
+                    let _t = de.events.stage("k.attn.dec_fused", &de.compute)?;
+                    de.attn_dec.launch_fused_f16s_rows(
+                        &de.compute,
+                        &mut sd.heads,
+                        &dlw.attn_sinks,
+                        &sd.q_normed,
+                        &ls.kv_cache,
+                        None,
+                        &nrp_view,
+                        &nrop_view,
+                        &ncp_view,
+                        N_HEAD,
+                        N_HEAD_DIM,
+                        n_total_max,
+                        b,
+                        0,
+                        None,
+                    )?;
+                }
+                if !dec_fused {
                     let _t = de.events.stage("k.attn.score", &de.compute)?;
                     if attn_dec_score_for(b) {
-                        de.attn_dec.launch_score_f16s_rows(
+                        de.attn_dec.launch_score_f16s_rows_with(
+                            if attn_dec_score_blk128() {
+                                crate::attention_dec::DecScoreKernel::Blk128
+                            } else {
+                                crate::attention_dec::DecScoreKernel::Blk256
+                            },
                             &de.compute,
                             &mut sd.attn_scores,
                             &sd.q_normed,
@@ -5211,7 +5296,7 @@ impl HeterogeneousEngine {
                     )?;
                     }
                 }
-                {
+                if !dec_fused {
                     let _t = de.events.stage("k.attn.smwsum", &de.compute)?;
                     de.attn_mixed.launch_softmax_wsum_batched_htiled_wmma_ldsv_f16s(
                         &de.compute,
@@ -5783,7 +5868,39 @@ impl HeterogeneousEngine {
             if arena.is_some() && (fused || f32_scores) {
                 return Err(eyre!("L{layer}: arena rows need the f16-scores split attention (no ATTN_FUSED / f32 scores)"));
             }
-            if !fused {
+            // 2026-09-26: the `attn_dec_score_for(b)` score + smwsum pair as
+            // ONE bit-identical launch (see `attn_dec_fused`). Falls back to
+            // the pair when a row could exceed the kernel's 640 keys (reuse
+            // layers with the indexer not fired and n_comp > 512; image rows
+            // in a <= 16-row chunk), and under the verify replay. Both sites
+            // pass no comp_allowed_bits mask (the gather handles sparsity).
+            let dec_fused = !fused
+                && !f32_scores
+                && attn_dec_score_for(b)
+                && attn_dec_fused()
+                && eff_n_total_max <= crate::attention_dec::ATTN_DEC_FUSED_MAX_KEYS
+                && !verify_decode_attn();
+            if dec_fused {
+                let _t = de.events.stage("k.attn.dec_fused", &de.compute)?;
+                de.attn_dec.launch_fused_f16s_rows(
+                    &de.compute,
+                    &mut sd.heads,
+                    &dlw.attn_sinks,
+                    &sd.q_normed,
+                    &ls.kv_cache,
+                    eff_comp_kv_buf,
+                    &nrp_view,
+                    &nrop_view,
+                    &ncp_view,
+                    N_HEAD,
+                    N_HEAD_DIM,
+                    eff_n_total_max,
+                    b,
+                    eff_comp_kv_batch_stride,
+                    attn_comp_base,
+                )?;
+            }
+            if !fused && !dec_fused {
                 let _t = de.events.stage("k.attn.score", &de.compute)?;
                 if f32_scores {
                     de.attn_mixed.launch_score_batched_htiled_wmma(
@@ -5802,7 +5919,12 @@ impl HeterogeneousEngine {
                         scores_stride,
                     )?;
                 } else if attn_dec_score_for(b) {
-                    de.attn_dec.launch_score_f16s_rows(
+                    de.attn_dec.launch_score_f16s_rows_with(
+                        if attn_dec_score_blk128() {
+                            crate::attention_dec::DecScoreKernel::Blk128
+                        } else {
+                            crate::attention_dec::DecScoreKernel::Blk256
+                        },
                         &de.compute,
                         &mut sd.attn_scores,
                         &sd.q_normed,
@@ -5848,7 +5970,7 @@ impl HeterogeneousEngine {
             // Phase A score-DRAM round-trip — together −23% over `_ldsv`
             // at depth 32k, B=256 (13.05 → 10.09 ms p50). The score writer
             // upstream must match the chain (both are f16-only here).
-            {
+            if !dec_fused {
                 let _t = de.events.stage(
                     if fused { "k.attn.fused" } else { "k.attn.smwsum" },
                     &de.compute,
