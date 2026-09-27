@@ -3906,11 +3906,20 @@ impl ExpertShard {
         if !p.pins.on {
             return;
         }
+        // Every release word advances the epoch (the hub counts them all).
         for &w in release {
             p.pins.release(w);
         }
+        // A grant only for a layer this shard pages and reports: a word for
+        // any other layer (unvalidated client input) would sit eligible and
+        // on `fresh` for the life of the connection.
         for &w in prefetch {
-            p.pins.grant(w >> 16, w & 0xFFFF);
+            let layer = w >> 16;
+            if self.layer_is_paged(layer) {
+                if let Some(p) = self.pool.as_mut() {
+                    p.pins.grant(layer, w & 0xFFFF);
+                }
+            }
         }
     }
 
@@ -6032,13 +6041,22 @@ pub fn serve_connection(
                 // plus what the early-page hook found not landed when the
                 // frame(s) arrived (a read it finished before the pass began
                 // was still a page the hub did not expect).
+                // Per REQUEST: the pass's bits are shared, each request's
+                // arrival bits are its own (a merged partner is scored against
+                // what was missing when ITS frame arrived, not its lane mate's).
                 let mut paged = timing.paged;
+                let mut paged_b = timing.paged;
                 if req.flags & proto::REQ_FLAG_PIN != 0 {
                     or_words(&mut paged, &shard.take_early_paged(hdr.seq));
-                    if let Some((hb, ..)) = partner.as_ref() {
-                        or_words(&mut paged, &shard.take_early_paged(hb.seq));
+                }
+                if let (Some(rb), Some((hb, ..))) = (reqb.as_ref(), partner.as_ref()) {
+                    if rb.flags & proto::REQ_FLAG_PIN != 0 {
+                        or_words(&mut paged_b, &shard.take_early_paged(hb.seq));
                     }
                 }
+                // One report per pass: the partner (same layer, `mergeable`)
+                // reuses it, so a merged pass ages the layer's grants once and
+                // scans it once.
                 let pin_a = if req.flags & proto::REQ_FLAG_PIN != 0 { shard.pin_report(req.layer, &[], false) } else { None };
                 match pin_a {
                     Some((map, [epoch, pinned, budget])) => {
@@ -6064,11 +6082,15 @@ pub fn serve_connection(
                         } else {
                             exec.read_f16_at(b, bb, resp_b.view_mut::<u16>(proto::RESP_DATA_OFF, nb))?;
                         }
-                        let pin_b = if rb.flags & proto::REQ_FLAG_PIN != 0 { shard.pin_report(rb.layer, &[], false) } else { None };
+                        let pin_b = if rb.flags & proto::REQ_FLAG_PIN != 0 {
+                            pin_a.or_else(|| shard.pin_report(rb.layer, &[], false))
+                        } else {
+                            None
+                        };
                         match pin_b {
                             Some((map, [epoch, pinned, budget])) => {
                                 proto::append_residency(&mut resp_b, &map);
-                                proto::append_pin(&mut resp_b, epoch, pinned, budget, &paged);
+                                proto::append_pin(&mut resp_b, epoch, pinned, budget, &paged_b);
                             }
                             None if rb.flags & proto::REQ_FLAG_RESID != 0 => {
                                 proto::append_residency(&mut resp_b, &shard.residency_words(rb.layer));
@@ -6201,6 +6223,7 @@ pub fn serve_connection(
                             ("pf_d_promoted", nan),
                             ("pin_release_words", rb.release.len() as f64), ("pin_new", nan), ("pin_denied", nan),
                             ("pin_drops_no_victim", nan), ("pin_evictions", nan),
+                            ("n_paged", paged_b.iter().map(|w| w.count_ones()).sum::<u32>() as f64),
                         ] {
                             super::evtrace::set_named(k, &mut v, name, x);
                         }
@@ -7872,6 +7895,9 @@ mod tests {
     #[derive(Debug, Default)]
     struct PinSimStats {
         c: PinCounters,
+        /// Merged passes where the partner held an expert its lane mate found
+        /// missing at arrival (a false surprise if the bits were shared).
+        partner_split: u64,
         surprises: u32,
         subset_violations: u64,
         held_checked: u64,
@@ -7933,6 +7959,9 @@ mod tests {
         global: bool,
         /// Arrival-time paged bits per queued frame (the early-page hook).
         early: EarlyPaged,
+        /// Deterministic: always merge a same-layer front frame, never park,
+        /// no early background reads (the scripted scenario tests).
+        scripted: bool,
         st: PinSimStats,
     }
 
@@ -8073,7 +8102,7 @@ mod tests {
             let Some(a) = wire.pop_front() else { return };
             self.words_in(&a);
             let partner = match wire.front() {
-                Some(nb) if rng.below(2) == 0 && nb.layer == a.layer && a.b > 4 && nb.b > 4 && a.b + nb.b <= 64 => wire.pop_front(),
+                Some(nb) if (self.scripted || rng.below(2) == 0) && nb.layer == a.layer && a.b > 4 && nb.b > 4 && a.b + nb.b <= 64 => wire.pop_front(),
                 _ => None,
             };
             if let Some(b) = partner.as_ref() {
@@ -8081,7 +8110,7 @@ mod tests {
                 self.st.merged += 1;
             }
             if let Some(nx) = wire.front() {
-                if rng.below(2) == 0 {
+                if !self.scripted && rng.below(2) == 0 {
                     let w: Vec<u32> = Self::distinct(&nx.sel).into_iter().map(|e| (nx.layer << 16) | e).collect();
                     self.queue_bg(&w);
                 }
@@ -8092,7 +8121,7 @@ mod tests {
             }
             let bt = a.b + partner.as_ref().map_or(0, |b| b.b);
             let paged = self.paged_bits(a.layer, &sel);
-            if partner.is_none() && paged.iter().any(|&w| w != 0) && rng.below(3) == 0 {
+            if !self.scripted && partner.is_none() && paged.iter().any(|&w| w != 0) && rng.below(3) == 0 {
                 self.st.parked += 1;
                 let parked: Vec<(u32, u32)> = Self::distinct(&sel).into_iter().map(|e| (a.layer, e)).collect();
                 let w: Vec<u32> = parked.iter().filter(|k| !self.pool.slot_of.contains_key(k)).map(|k| (k.0 << 16) | k.1).collect();
@@ -8117,18 +8146,92 @@ mod tests {
             self.ensure(rng, a.layer, &sel, &[], bt > 16);
             // Per REQUEST shape (`PIN_DECODE_MAX_ROWS`), as `serve_connection`.
             let dec = |r: &SimReq| r.b as u32 <= proto::PIN_DECODE_MAX_ROWS;
-            let mut paged = paged;
-            or_words(&mut paged, &self.early.take(a.seq));
+            // Per request, as `serve_connection`: the pass's bits are shared,
+            // each request's arrival bits are its own.
+            let ea = self.early.take(a.seq);
+            let mut paged_a = paged;
+            or_words(&mut paged_a, &ea);
+            let mut paged_b = paged;
             if let Some(b) = partner.as_ref() {
-                or_words(&mut paged, &self.early.take(b.seq));
+                let eb = self.early.take(b.seq);
+                or_words(&mut paged_b, &eb);
+                // The partner held something that was missing when its lane
+                // mate's frame arrived (and had landed by the pass): charged
+                // to the mate only. Counted so the case is known to occur.
+                if crate::het::b2_mirror::surprise_count(&b.held, &ea) > 0
+                    && crate::het::b2_mirror::surprise_count(&b.held, &paged) == 0
+                {
+                    self.st.partner_split += 1;
+                }
             }
-            let r = self.reply(&a, &a.sel, dec(&a), paged);
+            let r = self.reply(&a, &a.sel, dec(&a), paged_a);
             replies.push(r);
             if let Some(b) = partner.as_ref() {
-                let r = self.reply(b, &b.sel, dec(b), paged);
+                let r = self.reply(b, &b.sel, dec(b), paged_b);
                 replies.push(r);
             }
         }
+    }
+
+    /// Review round 3's interleaving, scripted through the same sim: R(L) is
+    /// served while A(L) waits with hot expert e not landed (A's arrival bit
+    /// e set); R's pass lands e and its report pins it; the hub applies R's
+    /// map and holds e; B(L) is submitted with e held and MERGES with A. B's
+    /// reply must be scored against ITS OWN arrival (e was landed: no bit),
+    /// not its lane mate's: with one shared word the hub would count a
+    /// surprise that never happened (and panic under the assert knob).
+    #[test]
+    fn merged_partner_arrival_bits_are_per_request() {
+        use crate::het::b2_mirror::{surprise_count, PinLedger};
+        const PER: u32 = 8;
+        let region_ids: Vec<u32> = (0..PER).collect();
+        let regions: Vec<(u32, u32, &[u32])> = (0..2).map(|l| (l, l * PER, &region_ids[..])).collect();
+        let mut b2 = Box2Sim {
+            pool: ShardPool::seeded(2 * PER as usize, &regions, 0.0),
+            bg: Vec::new(),
+            budget: 4,
+            per: PER,
+            global: true,
+            early: EarlyPaged::default(),
+            scripted: true,
+            st: PinSimStats::default(),
+        };
+        let mut rng = SimRng(7);
+        let mut ledger = PinLedger::new();
+        let e = 20i32;
+        let row = |first: i32| -> Vec<i32> { vec![first, 0, 1, 2, 3, 4] };
+        let req = |seq: u32, b: usize, sel: Vec<i32>, held: [u32; proto::RESID_WORDS]| SimReq {
+            seq, layer: 0, b, sel, prefetch: Vec::new(), release: Vec::new(), held, pulled: false,
+        };
+        let none = [0u32; proto::RESID_WORDS];
+        let r = req(1, 1, vec![e, 21, 22, 23, 24, 25], none);
+        let a = req(2, 6, (0..6).flat_map(|_| row(e)).collect(), none);
+        let mut wire: std::collections::VecDeque<SimReq> = [r, a].into_iter().collect();
+        let mut replies = Vec::new();
+        // R served alone (A is noted at pull with e missing, and left queued).
+        b2.serve(&mut rng, &mut wire, &mut replies);
+        assert_eq!((replies.len(), wire.len()), (1, 1));
+        let rr = replies.remove(0);
+        assert_eq!(rr.seq, 1);
+        assert!(rr.map[0] & (1 << e) != 0, "R's pass landed e and its report pinned it");
+        assert!(b2.pool.pins.is_pinned(0, e as u32));
+        // The hub applies R's map: e is held from now on; B is submitted with it.
+        ledger.apply_map(0, &rr.map, rr.epoch);
+        assert!(ledger.held(0, e as u32));
+        let mut held_b = none;
+        held_b[0] |= 1 << e;
+        let b = req(3, 6, (0..6).flat_map(|_| row(e)).collect(), held_b);
+        wire.push_back(b);
+        b2.serve(&mut rng, &mut wire, &mut replies);
+        assert_eq!(b2.st.merged, 1, "A and B were served as one pass");
+        assert_eq!(replies.len(), 2);
+        let ra = replies.iter().find(|r| r.seq == 2).unwrap();
+        let rb = replies.iter().find(|r| r.seq == 3).unwrap();
+        assert!(ra.paged[0] & (1 << e) != 0, "A found e missing when its frame arrived");
+        assert_eq!(rb.paged[0] & (1 << e), 0, "B did not: e had landed before B arrived");
+        assert_eq!(surprise_count(&held_b, &rb.paged), 0, "no surprise for B");
+        assert_eq!(surprise_count(&held_b, &ra.paged), 1, "one shared word would have charged B with A's miss");
+        assert_eq!(b2.st.partner_split, 1);
     }
 
     /// One randomized run of the pin protocol (see `pin_protocol_randomized`).
@@ -8144,7 +8247,7 @@ mod tests {
         // experts of one layer, a parked request's picks are <= RANGE more.
         const R: usize = 2 * RANGE as usize;
         const HEADROOM: u32 = 8;
-        const MAX_IN_FLIGHT: usize = 4;
+        const MAX_IN_FLIGHT: usize = 6;
         let mut rng = SimRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         // Zipf(1.1) over 0..RANGE by inverse CDF, hot ids permuted per layer.
         let cdf: Vec<f64> = {
@@ -8167,6 +8270,7 @@ mod tests {
             per: PER,
             global: seed % 2 == 1,
             early: EarlyPaged::default(),
+            scripted: false,
             st: PinSimStats::default(),
         };
         let mut ledger = PinLedger::new();
@@ -8206,7 +8310,11 @@ mod tests {
             }
             check(&mut b2, &ledger, &mut subset_violations);
             for layer in 0..L {
-                for _lane in 0..2 {
+                // Two lanes, sometimes a third (`V41_MS_LANES=3`): a third
+                // same-layer request can then queue behind an unserved one
+                // and merge with it.
+                let lanes = 2 + usize::from(rng.below(3) == 0);
+                for _lane in 0..lanes {
                     let b = match rng.below(20) {
                         0..=12 => 1,
                         13..=14 => 2 + rng.below(3) as usize,
