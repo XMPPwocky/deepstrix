@@ -2867,77 +2867,87 @@ fn save_and_forward_marker(
 // token will be written at — equals live.pos after byte-aligned
 // extend; differs from prompt_tokens when live's token count for the
 // matched byte prefix differs from the request's.
-/// Replay the drafter over the prompt's last captured positions so its KV ring
-/// is warm when generation starts. See the call site in `finish_decode`.
+/// Write the prompt's last captured positions into the drafter's KV ring so it
+/// is warm when generation starts, as the reference's prefill does
+/// (`DSparkAttention.forward` at `start_pos == 0` writes the window rows of the
+/// whole prompt; only the last `MTP_WINDOW` survive). See the call site in
+/// `finish_decode`.
 ///
-/// `tokens` is the CANONICAL live sequence (index == absolute position) and
-/// `start_pos` the position the
-/// first generated token will occupy, so the captured rows cover absolute
-/// positions `[pos0, pos0 + n)` with `pos0` recorded by the capture itself.
-/// For each captured position p we need (residual @ p, token @ p+1) -- the same
-/// pairing `dspark_draft` and the accept path use -- so the LAST captured row
-/// is skipped: the token after it is the one generation is about to produce.
+/// Rows come from BOTH prefill lanes, merged by absolute position. The
+/// two-lane prefill splits every chunk, so the most recent positions are spread
+/// over both lanes (a 40-token prompt: lane A 0..19, lane B 20..39). The old
+/// code took ONE lane and seeded about half the window (09-18 log:
+/// `seeded=19 n=20` on a 40-token prompt). Each lane keeps only the last rows of
+/// the last forward it ran, so rows of an earlier chunk survive only where a
+/// lane sat out the final chunk; the contiguous run ending at the latest
+/// captured position is used. (A prompt whose final chunk is shorter than the
+/// window still under-seeds; the arena prefill path gets a position-indexed
+/// capture instead, plan DSPARK_ARENA_PLAN.md 4.5.)
+///
+/// Every row of that run is written, INCLUDING the last prompt position: the
+/// first draft happens at `start_pos` (after the bootstrap decode step), so no
+/// draft ever writes the prompt's rows. A ring row depends only on the main
+/// residual at its position, so the cheap `ring_write_only` is state-identical
+/// to a full `advance_ring` (`embed()` resets the hidden stream and the markov
+/// carry on every forward) and needs no next token. The old code ran a full
+/// drafter forward per row (up to ~1.4 s of TTFT) and skipped the last row for
+/// want of its next token.
+///
+/// `tokens` (the canonical live sequence) is kept for the log line only.
 #[cfg(feature = "v41")]
 fn seed_mtp_ring(state: &mut WorkerState, tokens: &[i32], start_pos: u32) -> eyre::Result<()> {
-    use v4flash_kernels::config::{HC_DIM, N_EMBD};
+    use v4flash_kernels::config::N_EMBD;
     let ne = N_EMBD as usize;
     let nsrc = v4flash_kernels::het::mtp::MTP_SRC_LAYERS.len();
     let cap = v4flash_kernels::het::batch_scratch::MTP_CAP_ROWS;
+    let win = v4flash_kernels::het::mtp::MTP_WINDOW as u32;
 
-    // Both lanes may have captured; take whichever holds the LATER positions.
-    let (n, pos0, from_b) = {
-        let (na, pa) = (state.bd_a.mtp_captured, state.bd_a.mtp_captured_pos0);
-        let (nb, pb) = (state.bd_b.mtp_captured, state.bd_b.mtp_captured_pos0);
-        if nb > 0 && (na == 0 || pb >= pa) { (nb, pb, true) } else { (na, pa, false) }
-    };
-    if n == 0 {
-        return Ok(());
-    }
-    // The capture must lie inside the COMMITTED context, i.e. end at or before
-    // the position the first generated token will take. It need not end exactly
-    // there: `save_and_forward_marker` can forward a few more tokens after the
-    // prefill, which is the common chat case -- requiring equality there
-    // silently disabled seeding entirely. Anything ENDING PAST `start_pos` is a
-    // stale buffer from an earlier request and must not be used.
-    if pos0 as usize + n > start_pos as usize {
-        tracing::info!(n, pos0, start_pos, "dspark: capture ends past start_pos, not seeding");
-        return Ok(());
-    }
-
-    // `whole` is read at `sl * cap * ne + r * ne` for r in [0, n), so the
-    // capture count the driver recorded must fit the buffer it wrote into.
-    assert!(
-        n <= cap,
-        "dspark seed: prefill recorded {n} captured mtp_src rows but the buffer holds {cap}"
-    );
-    let mut whole = vec![0.0f32; nsrc * cap * ne];
-    if from_b {
-        state.bd_b.mtp_src.copy_to_host(&mut whole)?;
-    } else {
-        state.bd_a.mtp_src.copy_to_host(&mut whole)?;
-    }
-
-    let mut seeded = 0usize;
-    let mut no_token = 0usize;
-    // Skip the last row: its (p+1) token has not been generated yet.
-    for r in 0..n.saturating_sub(1) {
-        let p = pos0 + r as u32;
-        // Token AT p+1, from the request's own sequence.
-        let idx = (p + 1) as usize;
-        let Some(&tok) = tokens.get(idx) else { no_token += 1; break };
-        let mut mh = Vec::with_capacity(nsrc * ne);
-        for sl in 0..nsrc {
-            let o = sl * cap * ne + r * ne;
-            mh.extend_from_slice(&whole[o..o + ne]);
+    let mut by_pos: std::collections::BTreeMap<u32, Vec<f32>> = std::collections::BTreeMap::new();
+    let mut lanes_used = 0usize;
+    for (lane_name, lane) in [("a", &state.bd_a), ("b", &state.bd_b)] {
+        let (n, pos0) = (lane.mtp_captured, lane.mtp_captured_pos0);
+        if n == 0 {
+            continue;
         }
-        let mut tr = vec![0.0f32; HC_DIM as usize];
-        embed_lookup(&state.token_embd_bytes, state.token_embd_dtype, tok, &mut tr);
-        let m = state.mtp.as_mut().expect("mtp");
-        state.engine.dspark_advance_ring(&mut m.state, &m.w, p, &mh, &tr, &m.noise_row)?;
-        seeded += 1;
+        // The capture must lie inside the COMMITTED context, i.e. end at or
+        // before the position the first generated token will take. It need not
+        // end exactly there: `save_and_forward_marker` can forward a few more
+        // tokens after the prefill. Anything ENDING PAST `start_pos` is a stale
+        // buffer and must not be used (the arm site also zeroes both counts).
+        if pos0 as usize + n > start_pos as usize {
+            tracing::info!(lane = lane_name, n, pos0, start_pos, "dspark: lane capture ends past start_pos, skipped");
+            continue;
+        }
+        // `whole` is read at `sl * cap * ne + r * ne` for r in [0, n), so the
+        // capture count the driver recorded must fit the buffer it wrote into.
+        assert!(n <= cap, "dspark seed: lane {lane_name} recorded {n} captured mtp_src rows but the buffer holds {cap}");
+        let mut whole = vec![0.0f32; nsrc * cap * ne];
+        lane.mtp_src.copy_to_host(&mut whole)?;
+        for r in 0..n {
+            let mut mh = Vec::with_capacity(nsrc * ne);
+            for sl in 0..nsrc {
+                let o = sl * cap * ne + r * ne;
+                mh.extend_from_slice(&whole[o..o + ne]);
+            }
+            by_pos.insert(pos0 + r as u32, mh);
+        }
+        lanes_used += 1;
+    }
+    let Some(&last) = by_pos.keys().next_back() else {
+        return Ok(());
+    };
+    // The contiguous run ending at the latest captured position, at most one
+    // window long.
+    let mut first = last;
+    while first > 0 && last - first + 1 < win && by_pos.contains_key(&(first - 1)) {
+        first -= 1;
+    }
+    let m = state.mtp.as_mut().expect("mtp");
+    for p in first..=last {
+        state.engine.dspark_ring_write_only(&mut m.state, &m.w, p, &by_pos[&p])?;
     }
     tracing::info!(
-        seeded, n, pos0, start_pos, no_token,
+        seeded = last - first + 1, first, last, captured = by_pos.len(), lanes_used, start_pos,
         seq_len = tokens.len(),
         "dspark: seeded drafter ring from prefill"
     );
