@@ -597,3 +597,4 @@
 2026-09-27T02:15:38Z	round2/e_i8x_r1	dgpu	128MB	rc=0	11.2s	busy_before=46	busy_after=79	bash run_job.sh r1  
 2026-09-27T02:16:11Z	round2/e_i8x_r2	dgpu	128MB	rc=0	11.3s	busy_before=71	busy_after=84	bash run_job.sh r2  
 2026-09-27T02:16:23Z	round2/e_i8x_r3	dgpu	128MB	rc=0	12.1s	busy_before=88	busy_after=74	bash run_job.sh r3  
+2026-09-27T02:17:59Z	round2/final_tests	dgpu	125MB	rc=0	14.6s	busy_before=52	busy_after=82	bash round2/run_tests.sh grid\ pad\|\|grid_pad_bitexact round2\ gates\|\|round2_gates z16\|\|f16_mv_z16_bitexact decode\ fusion\|\|decode_fusion_bitexact indexer\ sweep\|\|indexer_sweep_bitexact c2\ s

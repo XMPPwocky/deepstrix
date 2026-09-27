@@ -1,0 +1,90 @@
+== 1790475464.000447.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+### grid pad (grid_pad_bitexact)
+test cast_f16_2d_pad_bit_exact ... cast_f16_2d rows=16 cols=32768 pitch=32768: diff=0 pitch/tail touched=0 both-unwritten=32
+PASS: f32_to_f16_cast_2d grid pad bit-exact
+test fp8_window_and_indexer_fp4_pad_bit_exact ... arch gfx1201, V41_GRID_PAD on
+PASS: fp8 window / indexer_fp4 grid pad bit-exact
+test rope_batched_pad_bit_exact ... rope_tail_batched n_head=64 head_dim=512 b=1 inverse=false: bit_diff=0
+PASS: rope_tail_batched grid pad bit-exact
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+### rc=0
+### round2 gates (round2_gates)
+test newly_gated_paths_are_bit_exact ... gather b=2 per_row=false: wrapper vs indexer_gather_batched diff=0
+PASS: round-2 gated paths bit-exact
+test selectors_follow_the_round2_gates ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+### rc=0
+### z16 (f16_mv_z16_bitexact)
+test z16_matches_grid_z_batched_matvec ... mv 4096x1280 b=1: z16 n1..n16 x pad 0/1 bit-exact, wrapper bit_diff=0, router wrapper bit_diff=0
+PASS: 72 (shape, b) cases, every NB symbol + wrapper bit-exact
+test z16_site_gates ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.36s
+### rc=0
+### decode fusion (decode_fusion_bitexact)
+test decode_fusions_match_their_chains ... b=1: kv / q copy / heads (plain + yarn), q_a rms_quant, hc_post_add bit-exact
+PASS: 32 rope-param cases + 16 rms_quant / hc_post_add batches bit-exact
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.32s
+### rc=0
+### indexer sweep (indexer_sweep_bitexact)
+test cand_threshold_ilp_matches_candidate_threshold ... PASS: 24 threshold cases bit-identical
+test gather_b128_matches_indexer_gather ... gather b=1 top_k=512 per_row=false: b128 diff=0, wrapper diff=0 (73733 sentinel-row halves untouched)
+PASS: 10 gather cases bit-exact (whole destination)
+test score_qreg_matches_mw_e2m1 ... score b=1 n=[65536] stride=65636 base=false: twin bit_diff=0, wrapper bit_diff=0 (65536 nonzero finite scores in row 0)
+PASS: 6 score cases bit-exact (incl. -inf stamps and untouched tails)
+test topk_hybrid_matches_select_ilp ... select class=0 n=[1]: identical (done=[1])
+PASS: 52 select cases identical (selected + done)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
+### rc=0
+### c2 sweep (q8_0_sweep_c2_bitexact)
+test bpack_z16_matches_grid_z ... gemv 32768x1280 b=17: z16 bit_diff=0, matvec_batched bit_diff=0
+PASS: 15 z16 cases bit-exact
+test engram_i8x_db_matches_lds_tiled ... pass rule: rows take identical arms with 64- and 128-row passes for b = 1..700
+PASS: 12 i8x_db cases bit-exact
+test f16x_tiles_match_base ... f16x kv 512x5120x1 b=1 DbBn64: bit_diff=0
+PASS: 30 f16x tile cases bit-exact
+test replay_f16x_numerics_vs_dp4a ... replay f16x vs dp4a at 4096x1280 b=64: rel_rmse=3.777e-3 max_abs=1.937e1 differing=262143 of 262144 (NOT bit-exact by design; ledger 2.9e-4)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.62s
+### rc=0
+### mhc glue (mhc_glue_bitexact)
+test mhc_gemm_narrow_matches_lds_tiled ... gemm 24x20480 B=1: narrow bit_diff=0, wrapper bit_diff=0
+PASS: 16 gemm cases bit-exact
+test rms_fast_matches_rms_norm_weighted ... rms n=512 b=1: fast bit_diff=0, wrapper bit_diff=0
+PASS: 27 rms cases bit-exact
+test router_mv_h20_matches_f16_matvec_batched ... mv 384x5120 b=1: h20 bit_diff=0, router wrapper bit_diff=0
+PASS: 34 matvec cases bit-exact
+test topk_wfred_matches_router_topk_par ... PASS: 147 topk configs bit-exact (selected, weights, alts, alt_w, orig_sel, range)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.53s
+### rc=0
+### c1 tb (q8_0_tb_bitexact)
+test gemv_bpack_tb_matches_runtime_kernel ... gemv 1280x5120 b=1: q8_0_gemv_bpack_tB1 bit_diff=0, wrapper bit_diff=0
+PASS: 60 (shape, b) cases bit-exact
+test grouped_bpack_tb_matches_runtime_kernel ... grouped 8x(1024x4096) b=1: q8_0_grouped_gemv_bpack_tB1 bit_diff=0, wrapper bit_diff=0
+PASS: 16 grouped cases bit-exact
+test quantize_wave_and_grid_pad_match_serial_kernel ... quantize blocks=1 q8_0_quantize_f32 grid=2: xq int8_diff=0 xscale bit_diff=0
+PASS: quantize wave / grid pad bit-exact
+test shared_fused_matches_four_launch_chain ... shared b=1 xs_scale=1: clamp hits 2304/2304; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+PASS: fused shared chain bit-exact b=1..10 x 3 activation regimes
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.29s
+### rc=0
+### ALL round-2 knobs off (grid pad) (grid_pad_bitexact, V41_GRID_PAD=0 V41_F16_MV_Z16=0 V41_DEC_SKIP_DEAD=0 V41_DEC_FUSE=0)
+test cast_f16_2d_pad_bit_exact ... cast_f16_2d rows=16 cols=32768 pitch=32768: diff=0 pitch/tail touched=0 both-unwritten=32
+PASS: f32_to_f16_cast_2d grid pad bit-exact
+test fp8_window_and_indexer_fp4_pad_bit_exact ... arch gfx1201, V41_GRID_PAD off
+PASS: fp8 window / indexer_fp4 grid pad bit-exact
+test rope_batched_pad_bit_exact ... rope_tail_batched n_head=64 head_dim=512 b=1 inverse=false: bit_diff=0
+PASS: rope_tail_batched grid pad bit-exact
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s
+### rc=0
+### ALL round-2 knobs off (decode fusion) (decode_fusion_bitexact, V41_GRID_PAD=0 V41_F16_MV_Z16=0 V41_DEC_SKIP_DEAD=0 V41_DEC_FUSE=0)
+test decode_fusions_match_their_chains ... b=1: kv / q copy / heads (plain + yarn), q_a rms_quant, hc_post_add bit-exact
+PASS: 32 rope-param cases + 16 rms_quant / hc_post_add batches bit-exact
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s
+### rc=0
+### ALL round-2 knobs off (z16) (f16_mv_z16_bitexact, V41_GRID_PAD=0 V41_F16_MV_Z16=0 V41_DEC_SKIP_DEAD=0 V41_DEC_FUSE=0)
+test z16_matches_grid_z_batched_matvec ... mv 4096x1280 b=1: z16 n1..n16 x pad 0/1 bit-exact, wrapper bit_diff=0, router wrapper bit_diff=0
+PASS: 72 (shape, b) cases, every NB symbol + wrapper bit-exact
+test z16_site_gates ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.32s
+### rc=0
+### overall rc=0
