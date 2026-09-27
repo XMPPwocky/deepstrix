@@ -2063,12 +2063,9 @@ pub struct ExpertShard {
     /// The parked request's non-resident picks as `layer << 16 | expert`, for
     /// the park hook to hand to the prefetch readers.
     pub park_words: Vec<u32>,
-    /// Pin mode: per queued request (by seq), the picks NOT landed when its
-    /// frame ARRIVED (the early-page hook sees every frame first). OR-ed into
-    /// the reply's PAGED bits, so a read that hook finished before the pass
-    /// started still counts as "box 2 had to page it" for the hub's surprise
-    /// check. Bounded (`EARLY_PAGED_MAX`); empty unless pins are on.
-    pub early_paged: Vec<(u32, [u32; proto::RESID_WORDS])>,
+    /// Pin mode: each queued request's picks NOT landed when its frame
+    /// ARRIVED (see [`EarlyPaged`]). Empty unless pins are on.
+    pub early_paged: EarlyPaged,
     /// Cumulative time the compute thread spent BLOCKED in `admit_prefetched`
     /// waiting for a prefetch read it needs this request (2026-09-22). Also
     /// added to the layer's `read_ns`, see the note there.
@@ -2158,8 +2155,11 @@ struct ShardPool {
 //
 // * PIN on report (`pin_report`): the reply's residency map is the layer's
 //   PINNED set, and reporting is what pins: an ELIGIBLE expert (a pick of a
-//   decode-shaped pass, or a hub prefetch/admission word) that is landed at
-//   reply time is pinned if the budget allows. `pinned ⇒ landed` always.
+//   decode-shaped request, or a hub prefetch/admission word) that is landed at
+//   reply time is pinned if the budget allows -- the pass's own grants first,
+//   then the rest of the layer. A grant refused for budget is dropped (the
+//   hub sees "not held" and may grant again); one not landed expires after
+//   `PIN_GRANT_TTL` reports of its layer. `pinned ⇒ landed` always.
 // * NEVER evicted while pinned: every replacement of a slot's occupant goes
 //   through `ShardPool::evict` (the choke point), and every victim search
 //   through `ShardPool::pick_victim`, which skips pinned slots. Evicting a
@@ -2265,10 +2265,17 @@ pub struct PinCounters {
 }
 
 const PIN_NONE: u8 = 0;
-const PIN_ELIGIBLE: u8 = 1;
-/// Eligible, refused for budget once (so `denied` counts each once).
-const PIN_DENIED: u8 = 2;
-const PIN_HELD: u8 = 3;
+const PIN_HELD: u8 = 1;
+/// `PIN_ELIGIBLE_LAST ..= PIN_ELIGIBLE_FIRST`: eligible (granted, not yet
+/// landed at a report), counting DOWN one per report of its layer that finds
+/// it not landed; `PIN_ELIGIBLE_LAST` is the last report it survives. A grant
+/// therefore lives `PIN_GRANT_TTL` reports of its layer (~ as many decode
+/// steps): long enough for the background read it usually comes with, short
+/// enough that a grant whose read was dropped does not pin the expert when a
+/// prefill scan happens to land it much later.
+const PIN_ELIGIBLE_LAST: u8 = 2;
+const PIN_GRANT_TTL: u8 = 8;
+const PIN_ELIGIBLE_FIRST: u8 = PIN_ELIGIBLE_LAST + PIN_GRANT_TTL - 1;
 
 /// Box 2's half of the pin contract, per connection (the block comment above).
 /// Pure bookkeeping, no device state: `ShardPool` consults it in every victim
@@ -2283,12 +2290,17 @@ struct PinBook {
     epoch: u32,
     /// Per `layer * N_EXPERT + e`: `PIN_*`.
     state: Vec<u8>,
+    /// Grants since their layer's last report, as `layer << 16 | e`: a
+    /// report pins THESE first (the request's own picks, its admissions),
+    /// then scans the layer, so an old eligible expert with a low index cannot
+    /// take the last budget slot from the pick the pass just used.
+    fresh: Vec<u32>,
     c: PinCounters,
 }
 
 impl PinBook {
     fn off() -> Self {
-        Self { on: false, budget: 0, pinned: 0, epoch: 0, state: Vec::new(), c: PinCounters::default() }
+        Self { on: false, budget: 0, pinned: 0, epoch: 0, state: Vec::new(), fresh: Vec::new(), c: PinCounters::default() }
     }
 
     fn enable(&mut self, budget: u32) {
@@ -2299,6 +2311,7 @@ impl PinBook {
                 pinned: 0,
                 epoch: 0,
                 state: vec![PIN_NONE; N_LAYER as usize * N_EXPERT as usize],
+                fresh: Vec::new(),
                 c: PinCounters::default(),
             };
         }
@@ -2315,15 +2328,47 @@ impl PinBook {
     }
 
     /// The hub wants `(layer, e)` resident (a decode-shaped pick, a prefetch
-    /// word): pin it at its layer's next report, budget allowing.
+    /// word): pin it at its layer's next report, budget allowing. A repeat
+    /// grant restarts the eligibility clock.
     fn grant(&mut self, layer: u32, e: u32) {
         if !self.on {
             return;
         }
         if let Some(i) = Self::idx(layer, e) {
-            if self.state[i] == PIN_NONE {
-                self.state[i] = PIN_ELIGIBLE;
+            if self.state[i] != PIN_HELD {
+                self.state[i] = PIN_ELIGIBLE_FIRST;
+                self.fresh.push((layer << 16) | e);
             }
+        }
+    }
+
+    /// `report`'s per-expert step. `landed` = in the pool now. Pins an eligible
+    /// landed expert within budget, else drops the grant (`denied`: a fresh
+    /// grant is needed to try again); ages an eligible unlanded one unless
+    /// `age` is false (the fresh pass, so the scan ages each once); reports a
+    /// pinned expert that is not landed (a violation).
+    #[inline]
+    fn visit(&mut self, layer: u32, e: usize, landed: bool, age: bool) {
+        let i = layer as usize * N_EXPERT as usize + e;
+        let s = self.state[i];
+        if s >= PIN_ELIGIBLE_LAST {
+            if landed {
+                if self.pinned < self.budget {
+                    self.state[i] = PIN_HELD;
+                    self.pinned += 1;
+                    self.c.new_pins += 1;
+                } else {
+                    self.state[i] = PIN_NONE;
+                    self.c.denied += 1;
+                }
+            } else if age {
+                self.state[i] = if s > PIN_ELIGIBLE_LAST { s - 1 } else { PIN_NONE };
+            }
+        } else if s == PIN_HELD && !landed {
+            self.state[i] = PIN_NONE;
+            self.pinned -= 1;
+            self.c.pinned_evictions += 1;
+            pin_violation("pinned but not landed at report", layer, e as u32);
         }
     }
 
@@ -2359,44 +2404,88 @@ impl PinBook {
         was
     }
 
-    /// Pin every eligible expert of `layer` that is landed now (`row` = the
-    /// layer's `remap_hosts`, nonzero = landed), budget allowing, and return
-    /// the layer's pinned set as a residency map. A pinned expert found NOT
-    /// landed is a violation (it left the pool around the choke point):
-    /// unpinned, reported, and absent from the map.
+    /// Pin the layer's FRESH grants that are landed now (`row` = the layer's
+    /// `remap_hosts`, nonzero = landed) first, then every other eligible
+    /// landed expert of `layer`, budget allowing; age the eligible unlanded
+    /// ones; return the layer's pinned set as a residency map. A pinned expert
+    /// found NOT landed is a violation (it left the pool around the choke
+    /// point): unpinned, reported, and absent from the map.
     fn report(&mut self, layer: u32, row: &[i32]) -> [u32; proto::RESID_WORDS] {
         let mut w = [0u32; proto::RESID_WORDS];
         if !self.on || layer >= N_LAYER as u32 {
             return w;
         }
+        let landed = |e: usize| row.get(e).is_some_and(|&r| r != 0);
+        // The pass's own grants first, in grant order (no aging: the scan
+        // below ages each eligible expert exactly once).
+        let mut fresh = std::mem::take(&mut self.fresh);
+        for &f in &fresh {
+            if f >> 16 == layer {
+                let e = (f & 0xFFFF) as usize;
+                if e < N_EXPERT as usize {
+                    self.visit(layer, e, landed(e), false);
+                }
+            }
+        }
+        fresh.retain(|f| f >> 16 != layer);
+        self.fresh = fresh;
         let base = layer as usize * N_EXPERT as usize;
         for e in 0..N_EXPERT as usize {
-            let landed = row.get(e).is_some_and(|&r| r != 0);
-            let s = &mut self.state[base + e];
-            match *s {
-                PIN_ELIGIBLE | PIN_DENIED if landed => {
-                    if self.pinned < self.budget {
-                        *s = PIN_HELD;
-                        self.pinned += 1;
-                        self.c.new_pins += 1;
-                    } else if *s == PIN_ELIGIBLE {
-                        *s = PIN_DENIED;
-                        self.c.denied += 1;
-                    }
-                }
-                PIN_HELD if !landed => {
-                    *s = PIN_NONE;
-                    self.pinned -= 1;
-                    self.c.pinned_evictions += 1;
-                    pin_violation("pinned but not landed at report", layer, e as u32);
-                }
-                _ => {}
-            }
-            if *s == PIN_HELD {
+            self.visit(layer, e, landed(e), true);
+            if self.state[base + e] == PIN_HELD {
                 w[e / 32] |= 1 << (e % 32);
             }
         }
         w
+    }
+}
+
+/// Pin mode: per queued request (by seq), the picks NOT landed when its frame
+/// ARRIVED (the early-page hook sees every frame first, before any of its
+/// reads). OR-ed into the reply's PAGED bits, so a read that hook (or a park)
+/// finished before the pass started still counts as "box 2 had to page it"
+/// for the hub's surprise check. A bounded ring: the reader keeps at most a
+/// few frames queued, and a dropped entry only weakens the check.
+#[derive(Clone, Debug, Default)]
+pub struct EarlyPaged {
+    ring: Vec<(u32, [u32; proto::RESID_WORDS])>,
+}
+
+impl EarlyPaged {
+    /// Most queued frames whose arrival-time bits are kept.
+    pub const MAX: usize = 32;
+
+    /// Frame `seq` arrived with `bits` not landed (all-zero bits keep nothing).
+    /// Beyond `MAX` entries the OLDEST is dropped.
+    pub fn note(&mut self, seq: u32, bits: [u32; proto::RESID_WORDS]) {
+        if bits.iter().all(|&w| w == 0) {
+            return;
+        }
+        if self.ring.len() >= Self::MAX {
+            self.ring.remove(0);
+        }
+        self.ring.push((seq, bits));
+    }
+
+    /// The arrival-time bits of request `seq` (all zero if none were kept),
+    /// consumed.
+    pub fn take(&mut self, seq: u32) -> [u32; proto::RESID_WORDS] {
+        match self.ring.iter().position(|(s, _)| *s == seq) {
+            Some(i) => self.ring.swap_remove(i).1,
+            None => [0; proto::RESID_WORDS],
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.ring.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.ring.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ring.is_empty()
     }
 }
 
@@ -3232,7 +3321,7 @@ impl ExpertShard {
             pinned: Vec::new(),
             parked_pins: Vec::new(),
             park_words: Vec::new(),
-            early_paged: Vec::new(),
+            early_paged: EarlyPaged::default(),
             prefetch_wait_ns: 0,
             ev_admit: [0; 5],
         })
@@ -3888,10 +3977,6 @@ impl ExpertShard {
         w
     }
 
-    /// Most queued frames whose arrival-time paged bits are kept
-    /// (`early_paged`); the reader keeps at most a few frames queued.
-    const EARLY_PAGED_MAX: usize = 32;
-
     /// A request frame arrived (the early-page hook): remember which of its
     /// picks were not landed, for its reply's PAGED bits. Pin mode only.
     pub fn note_early_paged(&mut self, seq: u32, layer: u32, sel: &[i32]) {
@@ -3899,22 +3984,13 @@ impl ExpertShard {
             return;
         }
         let bits = self.paged_bits(layer, sel);
-        if bits.iter().all(|&w| w == 0) {
-            return;
-        }
-        if self.early_paged.len() >= Self::EARLY_PAGED_MAX {
-            self.early_paged.remove(0);
-        }
-        self.early_paged.push((seq, bits));
+        self.early_paged.note(seq, bits);
     }
 
     /// The arrival-time paged bits of request `seq` (all zero if none were
     /// kept), consumed.
     pub fn take_early_paged(&mut self, seq: u32) -> [u32; proto::RESID_WORDS] {
-        match self.early_paged.iter().position(|(s, _)| *s == seq) {
-            Some(i) => self.early_paged.swap_remove(i).1,
-            None => [0; proto::RESID_WORDS],
-        }
+        self.early_paged.take(seq)
     }
 
     /// This connection's pin counters and `(pinned, budget, epoch)`.
@@ -7583,8 +7659,10 @@ mod tests {
         assert!(proto::response_residency(&old, &m).is_some());
     }
 
-    /// `PinBook`: eligibility, pin on report within budget, a denial counted
-    /// once, release (every word advances the epoch), eviction.
+    /// `PinBook`: eligibility, pin on report within budget (the pass's own
+    /// grants first), a denial drops the grant, a grant expires after
+    /// `PIN_GRANT_TTL` reports, release (every word advances the epoch),
+    /// eviction.
     #[test]
     fn pin_book_budget_release_eligibility() {
         let mut p = PinBook::off();
@@ -7599,36 +7677,113 @@ mod tests {
             p.grant(1, e);
         }
         let w = p.report(1, &row);
-        assert_eq!(w[0], (1 << 2) | (1 << 3), "budget 2: the first two landed eligible experts");
+        assert_eq!(w[0], (1 << 2) | (1 << 3), "budget 2: the first two landed grants, in grant order");
         assert_eq!((p.pinned, p.c.new_pins, p.c.denied), (2, 2, 1));
         assert!(!p.is_pinned(1, 5), "5 is eligible but not landed");
         let _ = p.report(1, &row);
-        assert_eq!(p.c.denied, 1, "a denial is counted once per eligibility");
+        assert_eq!(p.c.denied, 1, "a denial drops the grant: counted once per grant");
         // Resident but never used / granted: never pinned.
         row[6] = -7;
         assert_eq!(p.report(1, &row)[0] & (1 << 6), 0);
-        // Release 2: epoch 1, and 4 (denied) gets the freed budget.
+        // Release 2: epoch 1; 4 was denied (grant dropped) so the freed budget
+        // stays free until it is granted again.
         p.release((1 << 16) | 2);
         assert_eq!((p.epoch, p.pinned), (1, 1));
+        assert_eq!(p.report(1, &row)[0], 1 << 3);
+        p.grant(1, 4);
         assert_eq!(p.report(1, &row)[0], (1 << 3) | (1 << 4));
         assert!(!p.is_pinned(1, 2), "a released expert needs a new grant to pin again");
         // Words for unknown / unpinned keys still advance the epoch.
         p.release((1 << 16) | 300);
         p.release((99 << 16) | 1);
         assert_eq!(p.epoch, 3);
-        // 5 lands: pinnable only once the budget frees.
+        // 5 lands (still within its TTL): budget full, so its grant is dropped.
         row[5] = -9;
         let _ = p.report(1, &row);
         assert!(!p.is_pinned(1, 5));
+        assert_eq!(p.c.denied, 2);
         assert!(p.on_evict(1, 3), "evicting a pinned expert is reported");
         assert_eq!((p.pinned, p.c.pinned_evictions), (1, 1));
         row[3] = 0;
+        assert_eq!(p.report(1, &row)[0], 1 << 4, "5 needs a fresh grant");
+        p.grant(1, 5);
         assert_eq!(p.report(1, &row)[0], (1 << 4) | (1 << 5));
         assert!(!p.on_evict(1, 6));
         assert_eq!(p.pinned, 2);
         // Enabling again keeps the state; `off` resets it.
         p.enable(100);
         assert_eq!(p.budget, 2);
+
+        // TTL: a grant survives PIN_GRANT_TTL - 1 reports without landing and
+        // expires on the next; a repeat grant restarts the clock.
+        let mut q = PinBook::off();
+        q.enable(10);
+        let mut row = vec![0i32; REMAP_LEN];
+        q.grant(2, 7);
+        for _ in 0..PIN_GRANT_TTL - 1 {
+            let _ = q.report(2, &row);
+        }
+        row[7] = -1;
+        assert_eq!(q.report(2, &row)[0], 1 << 7, "landed on its last report: pinned");
+        q.grant(2, 8);
+        for _ in 0..PIN_GRANT_TTL {
+            let _ = q.report(2, &row);
+        }
+        row[8] = -2;
+        assert_eq!(q.report(2, &row)[0] & (1 << 8), 0, "expired: never pinned");
+        q.grant(2, 9);
+        for _ in 0..PIN_GRANT_TTL - 1 {
+            let _ = q.report(2, &row);
+        }
+        q.grant(2, 9);
+        for _ in 0..PIN_GRANT_TTL - 1 {
+            let _ = q.report(2, &row);
+        }
+        row[9] = -3;
+        assert_eq!(q.report(2, &row)[0] & (1 << 9), 1 << 9, "re-granted: clock restarted");
+        assert_eq!(q.c.denied, 0);
+
+        // Fresh first: with one budget slot, the pass's own pick (300) beats an
+        // older eligible expert with a lower index (10) that landed meanwhile.
+        let mut f = PinBook::off();
+        f.enable(1);
+        let mut row = vec![0i32; REMAP_LEN];
+        f.grant(3, 10);
+        let _ = f.report(3, &row);
+        row[10] = -1;
+        row[300] = -2;
+        f.grant(3, 300);
+        let w = f.report(3, &row);
+        assert!(f.is_pinned(3, 300) && !f.is_pinned(3, 10), "{w:?}");
+        assert_eq!((f.pinned, f.c.denied), (1, 1));
+    }
+
+    /// The arrival-time PAGED ring: zero bits keep nothing, entries leave by
+    /// seq in any order, the oldest is dropped past `MAX`, `clear` empties.
+    #[test]
+    fn early_paged_ring() {
+        let bits = |e: u32| {
+            let mut w = [0u32; proto::RESID_WORDS];
+            w[(e / 32) as usize] |= 1 << (e % 32);
+            w
+        };
+        let mut r = EarlyPaged::default();
+        r.note(1, [0; proto::RESID_WORDS]);
+        assert!(r.is_empty(), "all-zero bits keep nothing");
+        for seq in 1..=EarlyPaged::MAX as u32 + 8 {
+            r.note(seq, bits(seq % 384));
+        }
+        assert_eq!(r.len(), EarlyPaged::MAX);
+        for seq in 1..=8u32 {
+            assert_eq!(r.take(seq), [0; proto::RESID_WORDS], "seq {seq} was the oldest: dropped");
+        }
+        assert_eq!(r.take(20), bits(20));
+        assert_eq!(r.take(20), [0; proto::RESID_WORDS], "consumed");
+        assert_eq!(r.take(EarlyPaged::MAX as u32 + 8), bits((EarlyPaged::MAX as u32 + 8) % 384));
+        assert_eq!(r.len(), EarlyPaged::MAX - 2);
+        r.clear();
+        assert!(r.is_empty());
+        assert_eq!(r.take(9), [0; proto::RESID_WORDS]);
     }
 
     /// The victim search never takes a hub-pinned slot, a wanted one, or a
@@ -7752,6 +7907,8 @@ mod tests {
         release: Vec<u32>,
         /// Hub side: the sent picks the ledger held at submit.
         held: [u32; proto::RESID_WORDS],
+        /// Box 2 has pulled this frame off the wire (its arrival bits noted).
+        pulled: bool,
     }
 
     struct SimReply {
@@ -7774,6 +7931,8 @@ mod tests {
         budget: u32,
         per: u32,
         global: bool,
+        /// Arrival-time paged bits per queued frame (the early-page hook).
+        early: EarlyPaged,
         st: PinSimStats,
     }
 
@@ -7902,6 +8061,15 @@ mod tests {
         /// frame, or PARK (misses to the readers, queued servable requests
         /// served and answered inside with this one's picks pinned).
         fn serve(&mut self, rng: &mut SimRng, wire: &mut std::collections::VecDeque<SimReq>, replies: &mut Vec<SimReply>) {
+            // `pull`: every frame on the wire is seen once as it arrives, and
+            // its not-landed picks are noted for its reply's PAGED bits.
+            for r in wire.iter_mut() {
+                if !r.pulled {
+                    r.pulled = true;
+                    let bits = self.paged_bits(r.layer, &r.sel);
+                    self.early.note(r.seq, bits);
+                }
+            }
             let Some(a) = wire.pop_front() else { return };
             self.words_in(&a);
             let partner = match wire.front() {
@@ -7933,9 +8101,10 @@ mod tests {
                     if wire.front().is_some_and(|nx| nx.b <= PARK_MAX_ROWS) {
                         let c = wire.pop_front().unwrap();
                         self.words_in(&c);
-                        let p = self.paged_bits(c.layer, &c.sel);
+                        let mut p = self.paged_bits(c.layer, &c.sel);
+                        or_words(&mut p, &self.early.take(c.seq));
                         self.ensure(rng, c.layer, &c.sel, &parked, c.b > 16);
-                        let r = self.reply(&c, &c.sel, c.b <= 16, p);
+                        let r = self.reply(&c, &c.sel, c.b as u32 <= proto::PIN_DECODE_MAX_ROWS, p);
                         replies.push(r);
                         self.st.served_inside += 1;
                     }
@@ -7948,6 +8117,11 @@ mod tests {
             self.ensure(rng, a.layer, &sel, &[], bt > 16);
             // Per REQUEST shape (`PIN_DECODE_MAX_ROWS`), as `serve_connection`.
             let dec = |r: &SimReq| r.b as u32 <= proto::PIN_DECODE_MAX_ROWS;
+            let mut paged = paged;
+            or_words(&mut paged, &self.early.take(a.seq));
+            if let Some(b) = partner.as_ref() {
+                or_words(&mut paged, &self.early.take(b.seq));
+            }
             let r = self.reply(&a, &a.sel, dec(&a), paged);
             replies.push(r);
             if let Some(b) = partner.as_ref() {
@@ -7992,6 +8166,7 @@ mod tests {
             budget: (N - R) as u32,
             per: PER,
             global: seed % 2 == 1,
+            early: EarlyPaged::default(),
             st: PinSimStats::default(),
         };
         let mut ledger = PinLedger::new();
@@ -8068,7 +8243,7 @@ mod tests {
                         .collect();
                     let release = if pin_active { ledger.take_words(128) } else { Vec::new() };
                     seq += 1;
-                    let r = SimReq { seq, layer, b, sel, prefetch, release, held };
+                    let r = SimReq { seq, layer, b, sel, prefetch, release, held, pulled: false };
                     sent.push(r.clone());
                     wire.push_back(r);
                     // Box 2 and the hub's reply consumption interleave at random;
