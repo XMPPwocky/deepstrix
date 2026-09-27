@@ -58,3 +58,46 @@ Test: `crates/v4flash-kernels/tests/grid_pad_bitexact.rs` (3 tests: fp8 13 row c
 10, rope 3 shapes x 8 b x fwd/inv, cast 8 shapes incl. a pitched destination; sentinel rows /
 pitch padding checked untouched) passes with defaults and `V41_GRID_PAD=0`;
 `q8_0_sweep_c2_bitexact` (cast_2d user) passes. Results: `a_gridpad/results/intree_tests.txt`.
+
+## (b) Crossover scan of the deployed round-1 knobs — 4 gates changed
+
+Family harnesses (copied where a limit had to move: `b_crossover/xattn.cpp` = D harness with 16-row
+buffers, `xe.cpp` = E harness with a configurable scores stride, `xc2.cpp` = C2 harness + q_a /
+shared replay shapes) and a new `xover_f.cpp` (F kernels, old vs new symbol from the SAME in-tree
+code object). 5 separate scheduler jobs per family (r1..r5), interleaved kb::ab, production regime
+per kernel (cold weights for GEMVs, cold comp-KV store for the gather, warm activations for glue).
+Full table: `b_crossover/table.txt` (`bash b_crossover/table.sh`). Ratio = new/old median over runs
+(p10 ratio in brackets where it matters); **bold = the new kernel loses > 5% or a gate moved**.
+
+| knob (kernel) | gate before | b = 1 | 2 | 3 | 4 | 5 | 6 | 8 | 12 | 16 | 24-32 | 48-64 | 128-192 | 512 | 1024 | action |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| V41_ATTN_DEC_FUSED (fused_vt_qreg_sp_d4) | b<=16 | .48 | .48 | .46 | .43 | .44 | .42 | .41 | .58 | .54 | | | | | | none |
+| V41_ATTN_DEC_SCORE_BLK128 | pair only | .71 | .86 | .82 | .76 | .96 | .94 | .93 | .92 | .94 | | | | | | none |
+| V41_GEMV_TB q_a (tB<b>) | b<=10 | .97 | .94 | .89 | .81 | .78 | .76 | .74 | (9: .72, 10: .70) | | | | | | | none (kv/gate/down same shape of curve, all < 1) |
+| V41_GEMV_TB grouped wo_a | 2<=b<=8 | 1.02 (gated out) | .88 | .84 | .85 | .78 | .81 | .67 | | | | | | | | none (tB1 still +2%: stays gated) |
+| V41_Q8_QUANT_WAVE (both padded) | all | .90 | | | .80 | | | .71 | | .64 | | .41-.42 | .35 | .40 | | none |
+| V41_SHARED_FUSED (vs the tB chain) | b<=5 | .91 | .91 | .90 | .89 | .93 | .92 | **1.07** | | | | | | | | none (b=6/7 .92/.91 would win ~8%: not worth a rare lane size; b=8 loses, gated out) |
+| V41_RMS_FAST n=5120/1280/512 | n in set | .42/.73/.88 | | | .43/.73/.88 | | | .44/.73/.88 | | .45/.74/.88 | | .53/.78/.90 | | .75/.57/.98 | .84/.51/.38 | none |
+| V41_ROUTER_MV_H20 | b<=64 | .43 | .44 | .51 | .55 | .61 | .43 | .44 | .40 | .42 | .42 | .40 | | | | none |
+| V41_TOPK_WFRED prior / plain | b<=16 | .81/.97 | .80 | .81 | .81/.98 | .81 | .81 | .81 | .82 | .82/.98 | .82/.99 | .89/**1.02** | 1.00/1.00 | **1.03/1.09** | | none (gate right; plain loses from 64) |
+| V41_IDX_SCORE_QREG (n=32K; 12/16 at 12K) | all | .68 | .63 | .60 | .55 | .52 | .50 | .54 | .51 | .49 | | | | | | none |
+| V41_IDX_TOPK_HYBRID (n=131K; 64/512 at 32K) | all | .66 | .66 | .66 | .65 | .65 | .65 | .65 | .66 | .66 | | .67 | | .63 | | none |
+| **V41_CAND_THRESH_ILP** (n=131K / 32K) | **b<=8** | .57 | .61 | .61 | .60 | .62 | .60 | .60 | .60 | .61/.87 | .87-.88 | .94/.92 | **1.50** | | | **gate -> b<=32** |
+| **V41_IDX_GATHER_B128** (cold store) | **b>=4** | .93 (+pad) | **1.35**, +pad .94 [.86] | **.80** | .76 | .75 | .75 | .73 | .66 | .60 | | | | | | **gate -> b>=3, launch padded** |
+| V41_MOE_DOWN_DN2 (iGPU, chain, E=16 ppr=6) | rows<=8 | .94 | .88 | .94 | .92 | .86 | .93 | .97 | .94 | .93 | .89-.90 | .90 | | | | none (would win to 64: next list, regime not reproducible under the 600 MB cap) |
+| **V41_GEMV_BPACK_Z16** kv (M=512) | 16<b<=64 | | | | | | | | | | (17: **1.72**) **1.04 / 1.11** | .88 / .83 | | | | **gate: n_rows>=2048 or b>=48** |
+| V41_GEMV_BPACK_Z16 q_a (M=1280) | 16<b<=64 | | | | | | | | | | (17: **1.14**) .96 / .96 | .80 / .89 | | | | same gate |
+| V41_GEMV_BPACK_Z16 q_b / wo_a / wo_b / shared | 16<b<=64 | | | | | | | | | | .38-.54 | .31-.43 | | | | none |
+| V41_F16X_DB_BN64 kv / q_a | kv b>64; q_a b<=512 | | | | | | | | | | | (65) .57/.55 | .56/.54 | .55/.79 | .70/**1.07** | none (q_a at 1024 gated out; 768 1.00) |
+| **V41_F16X_256** q_b / wo_a | **b>64** | | | | | | | | | | | (65) **1.27** / .98 | (128) **1.18** / 1.01; (192) .96 / .89 | | | **gate -> b>=192** |
+| V41_ENGRAM_I8X (M=6400 slice) | b>8 | | | | | | | | | .54 | .55 | .54 | .32 | | | none |
+| V41_MOE_WMMA_GATEUP / _DOWN | rows>=256 / >=128 | not re-measured: the regime needs all 384 experts (7.2 GB), over the live-hub iGPU cap; round-1 full-layer numbers stand | | | | | | | | | | | | | | none |
+
+Gates changed (commit (b)): **F16X_256 >= 192 rows** (removes a 1.18-1.27x loss on every 65..191-row
+prefill tail), **z16 only for M >= 2048 or b >= 48** (removes 1.11-1.72x on kv / q_a at 17..47
+replay rows), **gather_b128 from b = 3 with the grid pad** (b=3 0.80; the b=2 "not root-caused"
+loss IS the 2048-wave dispatch window of item a), **threshold ILP to b <= 32** (0.60-0.88).
+Tests: `tests/round2_gates.rs` (selector asserts, knob-aware; padded gather at b = 2/3/4 and the ILP
+threshold at b = 12/24/32 vs the production kernels) passes with defaults and all five knobs = 0;
+`indexer_sweep_bitexact` and `q8_0_sweep_c2_bitexact` pass with defaults and knobs = 0
+(`b_crossover/results/intree_tests.txt`).

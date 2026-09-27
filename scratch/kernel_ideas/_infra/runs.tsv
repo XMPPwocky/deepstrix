@@ -538,3 +538,43 @@
 2026-09-27T01:09:04Z	round2/a_igpu_quant	igpu	100MB	rc=0	1.0s	busy_before=14	busy_after=52	env GP_ARCH=gfx1151 GP_ALL=1 ./gpad_real_gfx1151 quant 1 2 3 4 8  
 2026-09-27T01:09:10Z	round2/a_igpu_sweep	igpu	130MB	rc=0	0.7s	busy_before=25	busy_after=56	env GP_ARCH=gfx1151 GP_ALL=1 ./gpad_real_gfx1151 fp4 1 4 16 64 128  
 2026-09-27T01:13:10Z	round2/a_intree	dgpu	120MB	rc=0	3.5s	busy_before=54	busy_after=83	bash round2/run_tests.sh defaults\|\|grid_pad_bitexact V41_GRID_PAD=0\|V41_GRID_PAD=0\|grid_pad_bitexact c2\ defaults\ \(cast_2d\ user\)\|\|q8_0_sweep_c2_bitexact  
+2026-09-27T01:20:09Z	round2/b_F_r1	dgpu	128MB	rc=0	7.4s	busy_before=38	busy_after=62	bash run_job.sh F r1  
+2026-09-27T01:20:14Z	round2/b_D_r1	dgpu	128MB	rc=0	4.9s	busy_before=79	busy_after=82	bash run_job.sh D r1  
+2026-09-27T01:20:26Z	round2/b_A_r1	igpu	450MB	rc=0	23.8s	busy_before=15	busy_after=82	bash run_job.sh A r1  
+2026-09-27T01:20:35Z	round2/b_E_r1	dgpu	128MB	rc=0	20.2s	busy_before=5	busy_after=68	bash run_job.sh E r1  
+2026-09-27T01:20:36Z	round2/b_G_r1	dgpu	128MB	rc=0	1.0s	busy_before=8	busy_after=40	bash run_job.sh G r1  
+2026-09-27T01:20:58Z	round2/b_C1_r1	dgpu	128MB	rc=0	21.8s	busy_before=33	busy_after=94	bash run_job.sh C1 r1  
+2026-09-27T01:22:07Z	round2/b_C2_r1	dgpu	128MB	rc=0	69.6s	busy_before=96	busy_after=76	bash run_job.sh C2 r1  
+2026-09-27T01:25:06Z	round2/b_F_r2	dgpu	128MB	rc=0	9.2s	busy_before=66	busy_after=56	bash run_job.sh F r2  
+2026-09-27T01:25:11Z	round2/b_D_r2	dgpu	128MB	rc=0	5.2s	busy_before=3	busy_after=75	bash run_job.sh D r2  
+2026-09-27T01:25:35Z	round2/b_E_r2	dgpu	128MB	rc=0	23.7s	busy_before=56	busy_after=77	bash run_job.sh E r2  
+2026-09-27T01:25:36Z	round2/b_A_r2	igpu	450MB	rc=0	38.6s	busy_before=12	busy_after=81	bash run_job.sh A r2  
+2026-09-27T01:25:38Z	round2/b_G_r2	dgpu	128MB	rc=0	3.0s	busy_before=21	busy_after=64	bash run_job.sh G r2  
+2026-09-27T01:26:00Z	round2/b_C1_r2	dgpu	128MB	rc=0	21.9s	busy_before=76	busy_after=93	bash run_job.sh C1 r2  
+2026-09-27T01:26:13Z	round2/b_A_r3	igpu	450MB	rc=0	36.7s	busy_before=76	busy_after=94	bash run_job.sh A r3  
+2026-09-27T01:27:43Z	round2/b_C2_r2	dgpu	128MB	rc=0	103.2s	busy_before=96	busy_after=53	bash run_job.sh C2 r2  
+2026-09-27T01:27:54Z	round2/b_F_r3	dgpu	128MB	rc=0	10.9s	busy_before=8	busy_after=68	bash run_job.sh F r3  
+2026-09-27T01:28:00Z	round2/b_D_r3	dgpu	128MB	rc=0	5.5s	busy_before=61	busy_after=93	bash run_job.sh D r3  
+2026-09-27T01:28:24Z	round2/b_E_r3	dgpu	128MB	rc=0	24.0s	busy_before=48	busy_after=92	bash run_job.sh E r3  
+2026-09-27T01:28:27Z	round2/b_G_r3	dgpu	128MB	rc=0	3.0s	busy_before=85	busy_after=89	bash run_job.sh G r3  
+2026-09-27T01:28:49Z	round2/b_C1_r3	dgpu	128MB	rc=0	22.4s	busy_before=100	busy_after=96	bash run_job.sh C1 r3  
+2026-09-27T01:30:35Z	round2/b_C2_r3	dgpu	128MB	rc=0	105.3s	busy_before=92	busy_after=86	bash run_job.sh C2 r3  
+2026-09-27T01:31:00Z	round2/c_z16_r1	dgpu	110MB	rc=0	25.8s	busy_before=62	busy_after=95	bash run_job.sh r1  
+2026-09-27T01:31:56Z	round2/c_z16_c1	dgpu	110MB	rc=0	9.2s	busy_before=83	busy_after=93	bash run_confirm.sh c1  
+2026-09-27T01:32:06Z	round2/c_z16_c2	dgpu	110MB	rc=0	10.5s	busy_before=42	busy_after=90	bash run_confirm.sh c2  
+2026-09-27T01:32:17Z	round2/c_z16_c3	dgpu	110MB	rc=0	10.5s	busy_before=100	busy_after=93	bash run_confirm.sh c3  
+2026-09-27T01:32:27Z	round2/b_F_r4	dgpu	128MB	rc=0	10.7s	busy_before=94	busy_after=92	bash run_job.sh F r4  
+2026-09-27T01:32:31Z	round2/b_A_r4	igpu	450MB	rc=0	38.9s	busy_before=51	busy_after=97	bash run_job.sh A r4  
+2026-09-27T01:32:33Z	round2/b_D_r4	dgpu	128MB	rc=0	5.4s	busy_before=56	busy_after=96	bash run_job.sh D r4  
+2026-09-27T01:32:57Z	round2/b_E_r4	dgpu	128MB	rc=0	24.0s	busy_before=78	busy_after=93	bash run_job.sh E r4  
+2026-09-27T01:33:01Z	round2/b_G_r4	dgpu	128MB	rc=0	3.7s	busy_before=73	busy_after=88	bash run_job.sh G r4  
+2026-09-27T01:33:09Z	round2/b_A_r5	igpu	450MB	rc=0	38.3s	busy_before=95	busy_after=95	bash run_job.sh A r5  
+2026-09-27T01:33:23Z	round2/b_C1_r4	dgpu	128MB	rc=0	21.8s	busy_before=70	busy_after=87	bash run_job.sh C1 r4  
+2026-09-27T01:35:05Z	round2/b_C2_r4	dgpu	128MB	rc=0	102.5s	busy_before=4	busy_after=69	bash run_job.sh C2 r4  
+2026-09-27T01:35:14Z	round2/b_F_r5	dgpu	128MB	rc=0	9.1s	busy_before=5	busy_after=55	bash run_job.sh F r5  
+2026-09-27T01:35:19Z	round2/b_D_r5	dgpu	128MB	rc=0	4.9s	busy_before=72	busy_after=78	bash run_job.sh D r5  
+2026-09-27T01:35:42Z	round2/b_E_r5	dgpu	128MB	rc=0	22.2s	busy_before=6	busy_after=73	bash run_job.sh E r5  
+2026-09-27T01:35:45Z	round2/b_G_r5	dgpu	128MB	rc=0	3.0s	busy_before=51	busy_after=84	bash run_job.sh G r5  
+2026-09-27T01:36:06Z	round2/b_C1_r5	dgpu	128MB	rc=0	21.4s	busy_before=56	busy_after=97	bash run_job.sh C1 r5  
+2026-09-27T01:37:48Z	round2/b_C2_r5	dgpu	128MB	rc=0	102.0s	busy_before=46	busy_after=56	bash run_job.sh C2 r5  
+2026-09-27T01:45:15Z	round2/b_intree	dgpu	120MB	rc=0	9.5s	busy_before=67	busy_after=73	bash round2/run_tests.sh gates\ defaults\|\|round2_gates gates\ knobs=0\|V41_F16X_256=0\ V41_GEMV_BPACK_Z16=0\ V41_CAND_THRESH_ILP=0\ V41_IDX_GATHER_B128=0\ V41_GRID_PAD=0\|round2_gates indexer\ sweep

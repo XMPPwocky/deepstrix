@@ -1131,7 +1131,9 @@ pub struct IndexerGather {
 }
 
 /// Smallest batch that runs `gather_u4_r1` (see [`idx_gather_b128_for`]).
-pub const GATHER_B128_MIN_B: u32 = 4;
+/// 3 since the 2026-09-27 round-2 crossover scan (was 4): at b = 3 the b128
+/// kernel is 0.80x (cold store, 4 runs, p10 0.79).
+pub const GATHER_B128_MIN_B: u32 = 3;
 
 /// `V41_IDX_GATHER_B128` (default ON; `0` = `indexer_gather_batched` at every
 /// batch): [`IndexerGather::launch_batched_rows`] at `batch >= 4` runs
@@ -1141,8 +1143,15 @@ pub const GATHER_B128_MIN_B: u32 = 4;
 /// comp_base_per null / per-row, odd b / top_k, all-sentinel rows).
 /// 2026-09-26 sweep (E_indexer/gather_b128, dGPU, cold store): b=4 25.0 ->
 /// 18.6 us, b=8 40.8 -> 24.4, prefill b=512 1417 -> 522 (x2.7). The batch gate
-/// is the review's: at b=2 the b128 kernel is 1.5-1.8x SLOWER (not root-caused),
-/// b=1 barely wins, so b < 4 keeps the production kernel. Also needs head_dim
+/// is the review's: at b=2 the b128 kernel is 1.5-1.8x SLOWER, b=1 barely wins,
+/// so b < 3 keeps the production kernel. ROOT CAUSE of the b=2 loss (2026-09-27
+/// round 2): the (512, 2) x 64-thread grid is 2048 waves, gfx1201's slow-dispatch
+/// window (`crate::grid_pad`); so is b=4 (4096 waves). The launch therefore carries
+/// the `V41_GRID_PAD` idle column: warm store b=2 16.8 -> 4.6 us, b=4 18.2 -> 8.8;
+/// on a cold store (production: each layer's weight stream evicts the MALL) the
+/// natural time already exceeds the floor, so the pad is neutral there, and b=2
+/// padded is 0.94 of the old kernel (p10 0.86, unresolved) -- b <= 2 stays on the
+/// old kernel. b = 3 (was on the old kernel) is 0.80 cold. Also needs head_dim
 /// % 8 == 0 and <= 512 (the kernel's launch bound) and 16-B aligned buffers.
 fn idx_gather_b128_for(batch: u32, head_dim: u32, dst: &DeviceBuffer<u16>, comp_kv: &DeviceBuffer<u16>) -> bool {
     static D: std::sync::LazyLock<bool> =
@@ -1265,10 +1274,14 @@ impl IndexerGather {
         }
         if idx_gather_b128_for(batch, head_dim, active_comp_kv_b, comp_kv) {
             // `V41_IDX_GATHER_B128`: 16 B per thread, (top_k, B) x head_dim/8;
-            // 2026-09-26 sweep: b=4 x1.35, b=512 x2.7, bit-identical (b >= 4 only).
+            // 2026-09-26 sweep: b=4 x1.35, b=512 x2.7, bit-identical (b >= 3 only).
+            // `V41_GRID_PAD`: one idle top-k column -- a row >= top_k is a sentinel
+            // in the kernel (reads row `base`, stores nothing). DO NOT REMOVE: the
+            // exact (512, b) x 64 grid is 2048 / 4096 waves at b = 2 / 4, the
+            // slow-dispatch window (see `crate::grid_pad`, idx_gather_b128_for).
             let function = self.module.get_function("gather_u4_r1")?;
             let cfg = LaunchConfig {
-                grid: (top_k, batch, 1),
+                grid: (top_k + crate::grid_pad(), batch, 1),
                 block: (head_dim * 2 / 16, 1, 1),
                 shared_mem_bytes: 0,
             };

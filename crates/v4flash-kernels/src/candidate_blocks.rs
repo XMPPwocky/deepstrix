@@ -117,10 +117,13 @@ pub struct CandidateBlocks {
 }
 
 /// Largest batch that runs `candidate_threshold_ilp` (see [`cand_thresh_ilp_for`]).
-pub const CAND_THRESH_ILP_MAX_B: u32 = 8;
+/// 32 since the 2026-09-27 round-2 crossover scan (was 8): graph, warm scores,
+/// 4-5 runs -- n = 131072 b = 12/16 0.60 / 0.61; n = 32768 b = 16/24/32
+/// 0.87/0.87/0.88; b = 48/64 0.94/0.92 (unresolved, not taken); b = 128 LOSES x1.50.
+pub const CAND_THRESH_ILP_MAX_B: u32 = 32;
 
 /// `V41_CAND_THRESH_ILP` (default ON; `0` = `candidate_threshold` at every
-/// batch): the level-one threshold at `batch <= 8` (decode lanes at L20) runs
+/// batch): the level-one threshold at `batch <= CAND_THRESH_ILP_MAX_B` (decode lanes at L20) runs
 /// `candidate_threshold_ilp`, block 1024 with 8 independent block-score loads
 /// per thread per radix pass; same passes / histogram / scan, so the threshold
 /// is BIT-IDENTICAL (tests/indexer_sweep_bitexact.rs; the sweep review: 12654 +
@@ -181,7 +184,7 @@ impl CandidateBlocks {
     }
 
     /// The threshold kernel and its launch for `batch` rows: the ILP twin at
-    /// block 1024 under `V41_CAND_THRESH_ILP` for `batch <= 8`, else
+    /// block 1024 under `V41_CAND_THRESH_ILP` for `batch <= CAND_THRESH_ILP_MAX_B` (32), else
     /// `candidate_threshold` at block 256 (its own size, not the shared `T`).
     fn threshold_kernel(&self, batch: u32) -> eyre::Result<(v4flash_hip::Function<'_>, LaunchConfig)> {
         let (sym, block) = if cand_thresh_ilp_for(batch) {

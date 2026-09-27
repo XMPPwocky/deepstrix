@@ -1,0 +1,89 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP router b=1 bit_diff=0
+
+== router 384x5120 b=1 COLD W (21 copies) graph  (rounds=40 inner=21 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old f16_matvec_batched (48,1,b)               22.98      22.86      34.15    1.000       0.0       0.0
+h20                                           10.07      10.02      12.02    0.438       0.0       0.0
+KBJSON {"tag":"router 384x5120 b=1 COLD W (21 copies) graph","variant":"old f16_matvec_batched (48,1,b)","med_us":22.975,"p10_us":22.855,"p90_us":34.153,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"router 384x5120 b=1 COLD W (21 copies) graph","variant":"h20","med_us":10.071,"p10_us":10.025,"p90_us":12.017,"ratio":0.4383,"gbps":0.00,"graph":1,"flush":0}
+CMP router b=2 bit_diff=0
+
+== router 384x5120 b=2 COLD W (21 copies) graph  (rounds=40 inner=21 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old f16_matvec_batched (48,1,b)               23.07      22.99      34.85    1.000       0.0       0.0
+h20                                           10.36      10.23      14.55    0.449       0.0       0.0
+KBJSON {"tag":"router 384x5120 b=2 COLD W (21 copies) graph","variant":"old f16_matvec_batched (48,1,b)","med_us":23.074,"p10_us":22.991,"p90_us":34.848,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"router 384x5120 b=2 COLD W (21 copies) graph","variant":"h20","med_us":10.362,"p10_us":10.231,"p90_us":14.552,"ratio":0.4491,"gbps":0.00,"graph":1,"flush":0}
+CMP router b=3 bit_diff=0
+
+== router 384x5120 b=3 COLD W (21 copies) graph  (rounds=40 inner=21 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old f16_matvec_batched (48,1,b)               23.15      23.02      34.54    1.000       0.0       0.0
+h20                                           12.04      11.87      18.39    0.520       0.0       0.0
+KBJSON {"tag":"router 384x5120 b=3 COLD W (21 copies) graph","variant":"old f16_matvec_batched (48,1,b)","med_us":23.149,"p10_us":23.025,"p90_us":34.537,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"router 384x5120 b=3 COLD W (21 copies) graph","variant":"h20","med_us":12.042,"p10_us":11.874,"p90_us":18.387,"ratio":0.5202,"gbps":0.00,"graph":1,"flush":0}
+CMP router b=4 bit_diff=0
+
+== router 384x5120 b=4 COLD W (21 copies) graph  (rounds=40 inner=21 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old f16_matvec_batched (48,1,b)               23.53      23.01      33.54    1.000       0.0       0.0
+h20                                           13.05      12.75      17.26    0.555       0.0       0.0
+KBJSON {"tag":"router 384x5120 b=4 COLD W (21 copies) graph","variant":"old f16_matvec_batched (48,1,b)","med_us":23.532,"p10_us":23.006,"p90_us":33.541,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"router 384x5120 b=4 COLD W (21 copies) graph","variant":"h20","med_us":13.050,"p10_us":12.752,"p90_us":17.265,"ratio":0.5546,"gbps":0.00,"graph":1,"flush":0}
+CMP router b=5 bit_diff=0
+
+== router 384x5120 b=5 COLD W (21 copies) graph  (rounds=40 inner=21 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old f16_matvec_batched (48,1,b)               44.97      23.42      51.80    1.000       0.0       0.0
+h20                                           35.55      14.50      41.35    0.790       0.0       0.0
+KBJSON {"tag":"router 384x5120 b=5 COLD W (21 copies) graph","variant":"old f16_matvec_batched (48,1,b)","med_us":44.968,"p10_us":23.425,"p90_us":51.797,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"router 384x5120 b=5 COLD W (21 copies) graph","variant":"h20","med_us":35.545,"p10_us":14.497,"p90_us":41.351,"ratio":0.7905,"gbps":0.00,"graph":1,"flush":0}
+CMP router b=6 bit_diff=0
+
+== router 384x5120 b=6 COLD W (21 copies) graph  (rounds=40 inner=21 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old f16_matvec_batched (48,1,b)               58.00      42.80      62.24    1.000       0.0       0.0
+h20                                           45.88      15.89      48.91    0.791       0.0       0.0
+KBJSON {"tag":"router 384x5120 b=6 COLD W (21 copies) graph","variant":"old f16_matvec_batched (48,1,b)","med_us":58.002,"p10_us":42.804,"p90_us":62.240,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"router 384x5120 b=6 COLD W (21 copies) graph","variant":"h20","med_us":45.884,"p10_us":15.892,"p90_us":48.911,"ratio":0.7911,"gbps":0.00,"graph":1,"flush":0}
+CMP router b=8 bit_diff=0
+
+== router 384x5120 b=8 COLD W (21 copies) graph  (rounds=40 inner=21 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old f16_matvec_batched (48,1,b)               65.15      40.92      70.89    1.000       0.0       0.0
+h20                                           43.36      18.08      50.87    0.666       0.0       0.0
+KBJSON {"tag":"router 384x5120 b=8 COLD W (21 copies) graph","variant":"old f16_matvec_batched (48,1,b)","med_us":65.149,"p10_us":40.918,"p90_us":70.886,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"router 384x5120 b=8 COLD W (21 copies) graph","variant":"h20","med_us":43.360,"p10_us":18.078,"p90_us":50.869,"ratio":0.6656,"gbps":0.00,"graph":1,"flush":0}
+CMP router b=12 bit_diff=0
+
+== router 384x5120 b=12 COLD W (21 copies) graph  (rounds=40 inner=21 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old f16_matvec_batched (48,1,b)               82.13      73.63      88.94    1.000       0.0       0.0
+h20                                           52.20      38.31      56.07    0.636       0.0       0.0
+KBJSON {"tag":"router 384x5120 b=12 COLD W (21 copies) graph","variant":"old f16_matvec_batched (48,1,b)","med_us":82.130,"p10_us":73.631,"p90_us":88.940,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"router 384x5120 b=12 COLD W (21 copies) graph","variant":"h20","med_us":52.197,"p10_us":38.307,"p90_us":56.067,"ratio":0.6355,"gbps":0.00,"graph":1,"flush":0}
+CMP router b=16 bit_diff=0
+
+== router 384x5120 b=16 COLD W (21 copies) graph  (rounds=40 inner=21 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old f16_matvec_batched (48,1,b)               84.83      66.57     109.78    1.000       0.0       0.0
+h20                                           58.15      28.04      63.25    0.686       0.0       0.0
+KBJSON {"tag":"router 384x5120 b=16 COLD W (21 copies) graph","variant":"old f16_matvec_batched (48,1,b)","med_us":84.827,"p10_us":66.574,"p90_us":109.776,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"router 384x5120 b=16 COLD W (21 copies) graph","variant":"h20","med_us":58.155,"p10_us":28.036,"p90_us":63.250,"ratio":0.6856,"gbps":0.00,"graph":1,"flush":0}
+CMP router b=32 bit_diff=0
+
+== router 384x5120 b=32 COLD W (21 copies) graph  (rounds=40 inner=21 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old f16_matvec_batched (48,1,b)              127.54     114.30     134.54    1.000       0.0       0.0
+h20                                           48.30      48.08      62.64    0.379       0.0       0.0
+KBJSON {"tag":"router 384x5120 b=32 COLD W (21 copies) graph","variant":"old f16_matvec_batched (48,1,b)","med_us":127.538,"p10_us":114.302,"p90_us":134.540,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"router 384x5120 b=32 COLD W (21 copies) graph","variant":"h20","med_us":48.299,"p10_us":48.084,"p90_us":62.637,"ratio":0.3787,"gbps":0.00,"graph":1,"flush":0}
+CMP router b=64 bit_diff=0
+
+== router 384x5120 b=64 COLD W (21 copies) graph  (rounds=40 inner=21 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old f16_matvec_batched (48,1,b)              250.10     242.61     255.08    1.000       0.0       0.0
+h20                                          124.93     119.93     127.93    0.500       0.0       0.0
+KBJSON {"tag":"router 384x5120 b=64 COLD W (21 copies) graph","variant":"old f16_matvec_batched (48,1,b)","med_us":250.097,"p10_us":242.615,"p90_us":255.084,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"router 384x5120 b=64 COLD W (21 copies) graph","variant":"h20","med_us":124.934,"p10_us":119.934,"p90_us":127.932,"ratio":0.4995,"gbps":0.00,"graph":1,"flush":0}

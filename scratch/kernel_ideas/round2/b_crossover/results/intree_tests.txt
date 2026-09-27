@@ -1,0 +1,60 @@
+== 1790473505.000427.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+### gates defaults (round2_gates)
+test newly_gated_paths_are_bit_exact ... gather b=2 per_row=false: wrapper vs indexer_gather_batched diff=0
+PASS: round-2 gated paths bit-exact
+test selectors_follow_the_round2_gates ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+### rc=0
+### gates knobs=0 (round2_gates, V41_F16X_256=0 V41_GEMV_BPACK_Z16=0 V41_CAND_THRESH_ILP=0 V41_IDX_GATHER_B128=0 V41_GRID_PAD=0)
+test newly_gated_paths_are_bit_exact ... gather b=2 per_row=false: wrapper vs indexer_gather_batched diff=0
+PASS: round-2 gated paths bit-exact
+test selectors_follow_the_round2_gates ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.17s
+### rc=0
+### indexer sweep defaults (indexer_sweep_bitexact)
+test cand_threshold_ilp_matches_candidate_threshold ... PASS: 24 threshold cases bit-identical
+test gather_b128_matches_indexer_gather ... gather b=1 top_k=512 per_row=false: b128 diff=0, wrapper diff=0 (73733 sentinel-row halves untouched)
+PASS: 10 gather cases bit-exact (whole destination)
+test score_qreg_matches_mw_e2m1 ... score b=1 n=[65536] stride=65636 base=false: twin bit_diff=0, wrapper bit_diff=0 (65536 nonzero finite scores in row 0)
+PASS: 6 score cases bit-exact (incl. -inf stamps and untouched tails)
+test topk_hybrid_matches_select_ilp ... select class=0 n=[1]: identical (done=[1])
+PASS: 52 select cases identical (selected + done)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.36s
+### rc=0
+### indexer sweep knobs=0 (indexer_sweep_bitexact, V41_IDX_SCORE_QREG=0 V41_IDX_TOPK_HYBRID=0 V41_CAND_THRESH_ILP=0 V41_IDX_GATHER_B128=0 V41_GRID_PAD=0)
+test cand_threshold_ilp_matches_candidate_threshold ... PASS: 24 threshold cases bit-identical
+test gather_b128_matches_indexer_gather ... gather b=1 top_k=512 per_row=false: b128 diff=0, wrapper diff=0 (73733 sentinel-row halves untouched)
+PASS: 10 gather cases bit-exact (whole destination)
+test score_qreg_matches_mw_e2m1 ... score b=1 n=[65536] stride=65636 base=false: twin bit_diff=0, wrapper bit_diff=0 (65536 nonzero finite scores in row 0)
+PASS: 6 score cases bit-exact (incl. -inf stamps and untouched tails)
+test topk_hybrid_matches_select_ilp ... select class=0 n=[1]: identical (done=[1])
+PASS: 52 select cases identical (selected + done)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.28s
+### rc=0
+### c2 sweep defaults (q8_0_sweep_c2_bitexact)
+test bpack_z16_matches_grid_z ... gemv 32768x1280 b=17: z16 bit_diff=0, matvec_batched bit_diff=0
+PASS: 15 z16 cases bit-exact
+test engram_i8x_db_matches_lds_tiled ... pass rule: rows take identical arms with 64- and 128-row passes for b = 1..700
+PASS: 12 i8x_db cases bit-exact
+test f16x_tiles_match_base ... f16x kv 512x5120x1 b=1 DbBn64: bit_diff=0
+PASS: 30 f16x tile cases bit-exact
+test replay_f16x_numerics_vs_dp4a ... replay f16x vs dp4a at 4096x1280 b=64: rel_rmse=3.777e-3 max_abs=1.937e1 differing=262143 of 262144 (NOT bit-exact by design; ledger 2.9e-4)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.69s
+### rc=0
+### c2 sweep z16/256 off (q8_0_sweep_c2_bitexact, V41_GEMV_BPACK_Z16=0 V41_F16X_256=0)
+test bpack_z16_matches_grid_z ... gemv 32768x1280 b=17: z16 bit_diff=0, matvec_batched bit_diff=0
+PASS: 15 z16 cases bit-exact
+test engram_i8x_db_matches_lds_tiled ... pass rule: rows take identical arms with 64- and 128-row passes for b = 1..700
+PASS: 12 i8x_db cases bit-exact
+test f16x_tiles_match_base ... f16x kv 512x5120x1 b=1 DbBn64: bit_diff=0
+PASS: 30 f16x tile cases bit-exact
+test replay_f16x_numerics_vs_dp4a ... replay f16x vs dp4a at 4096x1280 b=64: rel_rmse=3.777e-3 max_abs=1.937e1 differing=262143 of 262144 (NOT bit-exact by design; ledger 2.9e-4)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.85s
+### rc=0
+### z16 (item c) defaults (f16_mv_z16_bitexact)
+test z16_matches_grid_z_batched_matvec ... mv 4096x1280 b=1: z16 n1..n16 x pad 0/1 bit-exact, wrapper bit_diff=0
+PASS: 72 (shape, b) cases, every NB symbol + wrapper bit-exact
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.30s
+### rc=0
+### overall rc=0

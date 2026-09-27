@@ -1,0 +1,323 @@
+## any correctness failure:
+      5 CMP down base vs cpu_ref b=10          n=51200 bitexact=no bit_diff=25179 nonfinite=0 max_abs=1.221e-04 max_rel=6.369e-03 rmse=1.549e-05 rel_rmse=7.015e-08 worst_idx=2749
+      5 CMP down base vs cpu_ref b=1           n=5120 bitexact=no bit_diff=2662 nonfinite=0 max_abs=1.221e-04 max_rel=8.965e-04 rmse=1.654e-05 rel_rmse=7.239e-08 worst_idx=1018
+      5 CMP down base vs cpu_ref b=6           n=30720 bitexact=no bit_diff=15257 nonfinite=0 max_abs=1.221e-04 max_rel=1.805e-03 rmse=1.546e-05 rel_rmse=7.027e-08 worst_idx=2777
+      5 CMP down base vs cpu_ref b=9           n=46080 bitexact=no bit_diff=22701 nonfinite=0 max_abs=1.221e-04 max_rel=4.594e-03 rmse=1.556e-05 rel_rmse=7.041e-08 worst_idx=1477
+      5 CMP gate base vs cpu_ref b=10          n=23040 bitexact=no bit_diff=14033 nonfinite=0 max_abs=1.831e-04 max_rel=6.349e-02 rmse=2.830e-05 rel_rmse=8.620e-08 worst_idx=4864
+      5 CMP gate base vs cpu_ref b=1           n=2304 bitexact=no bit_diff=1449 nonfinite=0 max_abs=1.221e-04 max_rel=3.354e-04 rmse=2.704e-05 rel_rmse=8.674e-08 worst_idx=859
+      5 CMP gate base vs cpu_ref b=6           n=13824 bitexact=no bit_diff=8504 nonfinite=0 max_abs=2.441e-04 max_rel=4.496e-04 rmse=2.908e-05 rel_rmse=8.868e-08 worst_idx=13405
+      5 CMP gate base vs cpu_ref b=9           n=20736 bitexact=no bit_diff=12725 nonfinite=0 max_abs=1.526e-04 max_rel=2.688e-03 rmse=2.880e-05 rel_rmse=8.720e-08 worst_idx=5999
+      5 CMP kv base vs cpu_ref b=10            n=5120 bitexact=no bit_diff=3112 nonfinite=0 max_abs=1.526e-04 max_rel=9.460e-05 rmse=2.910e-05 rel_rmse=8.894e-08 worst_idx=521
+      5 CMP kv base vs cpu_ref b=1             n=512 bitexact=no bit_diff=315 nonfinite=0 max_abs=1.221e-04 max_rel=2.913e-05 rmse=2.786e-05 rel_rmse=8.814e-08 worst_idx=69
+## F rms_fast
+rms b=1 | fast n=5120 vs old n=5120 n=5 old= 11.01 new= 4.67 r=0.424 [0.423..0.429] p10r=0.422
+rms b=1 | fast n=1280 vs old n=1280 n=5 old= 5.46 new= 3.97 r=0.726 [0.726..0.730] p10r=0.725
+rms b=1 | fast n=512 vs old n=512 n=5 old= 4.40 new= 3.86 r=0.876 [0.865..0.879] p10r=0.876
+rms b=1 | fast head (1) vs old head rms_norm_weighted ( n=5 old= 11.03 new= 4.65 r=0.423 [0.422..0.432] p10r=0.423
+rms b=2 | fast n=5120 vs old n=5120 n=5 old= 10.91 new= 4.66 r=0.429 [0.427..0.435] p10r=0.427
+rms b=2 | fast n=1280 vs old n=1280 n=5 old= 5.44 new= 3.97 r=0.727 [0.708..0.738] p10r=0.728
+rms b=2 | fast n=512 vs old n=512 n=5 old= 4.36 new= 3.82 r=0.876 [0.876..0.968] p10r=0.877
+rms b=3 | fast n=5120 vs old n=5120 n=5 old= 10.93 new= 4.75 r=0.434 [0.429..0.444] p10r=0.429
+rms b=3 | fast n=1280 vs old n=1280 n=5 old= 5.50 new= 4.05 r=0.731 [0.725..0.753] p10r=0.730
+rms b=3 | fast n=512 vs old n=512 n=5 old= 4.46 new= 3.93 r=0.881 [0.875..0.906] p10r=0.878
+rms b=4 | fast n=5120 vs old n=5120 n=5 old= 10.84 new= 4.67 r=0.431 [0.430..0.447] p10r=0.431
+rms b=4 | fast n=1280 vs old n=1280 n=5 old= 5.43 new= 3.97 r=0.731 [0.718..0.732] p10r=0.730
+rms b=4 | fast n=512 vs old n=512 n=5 old= 4.35 new= 3.82 r=0.877 [0.877..0.880] p10r=0.877
+rms b=5 | fast n=5120 vs old n=5120 n=5 old= 10.86 new= 4.71 r=0.434 [0.433..0.437] p10r=0.432
+rms b=5 | fast n=1280 vs old n=1280 n=5 old= 5.45 new= 4.01 r=0.736 [0.733..0.754] p10r=0.733
+rms b=5 | fast n=512 vs old n=512 n=5 old= 4.37 new= 3.84 r=0.878 [0.878..0.889] p10r=0.878
+rms b=6 | fast n=5120 vs old n=5120 n=5 old= 10.85 new= 4.73 r=0.437 [0.436..0.447] p10r=0.434
+rms b=6 | fast n=1280 vs old n=1280 n=5 old= 5.45 new= 4.00 r=0.741 [0.733..0.744] p10r=0.733
+rms b=6 | fast n=512 vs old n=512 n=5 old= 4.38 new= 3.88 r=0.879 [0.874..0.888] p10r=0.879
+rms b=8 | fast n=5120 vs old n=5120 n=5 old= 10.81 new= 4.73 r=0.437 [0.436..0.446] p10r=0.438
+rms b=8 | fast n=1280 vs old n=1280 n=5 old= 5.43 new= 4.00 r=0.733 [0.731..0.742] p10r=0.734
+rms b=8 | fast n=512 vs old n=512 n=5 old= 4.36 new= 3.90 r=0.878 [0.878..0.893] p10r=0.878
+rms b=12 | fast n=5120 vs old n=5120 n=5 old= 10.79 new= 4.76 r=0.441 [0.367..0.458] p10r=0.441
+rms b=12 | fast n=1280 vs old n=1280 n=5 old= 5.43 new= 3.99 r=0.736 [0.735..1.161] p10r=0.737
+rms b=12 | fast n=512 vs old n=512 n=5 old= 4.36 new= 3.83 r=0.879 [0.799..0.887] p10r=0.880
+rms b=16 | fast n=5120 vs old n=5120 n=5 old= 10.78 new= 4.80 r=0.447 [0.446..0.807] p10r=0.446
+rms b=16 | fast n=1280 vs old n=1280 n=5 old= 5.42 new= 4.00 r=0.739 [0.531..0.739] p10r=0.738
+rms b=16 | fast n=512 vs old n=512 n=5 old= 4.35 new= 3.82 r=0.879 [0.512..0.883] p10r=0.880
+rms b=64 | fast n=5120 vs old n=5120 n=5 old= 11.08 new= 5.83 r=0.527 [0.527..0.529] p10r=0.527
+rms b=64 | fast n=1280 vs old n=1280 n=5 old= 5.52 new= 4.31 r=0.781 [0.778..0.786] p10r=0.781
+rms b=64 | fast n=512 vs old n=512 n=5 old= 4.40 new= 3.97 r=0.899 [0.899..0.920] p10r=0.899
+rms b=512 | fast n=5120 vs old n=5120 n=5 old= 32.28 new= 24.40 r=0.749 [0.683..0.770] p10r=0.725
+rms b=512 | fast n=1280 vs old n=1280 n=5 old= 21.32 new= 12.19 r=0.570 [0.543..0.605] p10r=0.492
+rms b=512 | fast n=512 vs old n=512 n=5 old= 19.09 new= 18.75 r=0.984 [0.982..0.984] p10r=0.983
+rms b=1024 | fast n=5120 vs old n=5120 n=5 old= 48.96 new= 40.06 r=0.837 [0.739..0.854] p10r=0.849
+rms b=1024 | fast n=1280 vs old n=1280 n=5 old= 27.93 new= 13.50 r=0.507 [0.453..0.631] p10r=0.480
+rms b=1024 | fast n=512 vs old n=512 n=5 old= 23.08 new= 8.70 r=0.379 [0.373..0.637] p10r=0.389
+## F router h20
+router 384x5120 b=1 cold | h20 vs old f16_matvec_batched (48,1 n=5 old= 23.20 new= 10.13 r=0.434 [0.430..0.449] p10r=0.434
+router 384x5120 b=2 cold | h20 vs old f16_matvec_batched (48,1 n=5 old= 23.60 new= 10.36 r=0.440 [0.415..0.449] p10r=0.436
+router 384x5120 b=3 cold | h20 vs old f16_matvec_batched (48,1 n=5 old= 23.58 new= 12.06 r=0.514 [0.511..0.520] p10r=0.514
+router 384x5120 b=4 cold | h20 vs old f16_matvec_batched (48,1 n=5 old= 23.53 new= 13.05 r=0.550 [0.542..0.559] p10r=0.547
+router 384x5120 b=5 cold | h20 vs old f16_matvec_batched (48,1 n=5 old= 23.91 new= 14.62 r=0.612 [0.600..0.790] p10r=0.613
+router 384x5120 b=6 cold | h20 vs old f16_matvec_batched (48,1 n=5 old= 37.39 new= 16.03 r=0.429 [0.416..0.791] p10r=0.427
+router 384x5120 b=8 cold | h20 vs old f16_matvec_batched (48,1 n=5 old= 42.09 new= 18.48 r=0.440 [0.422..0.666] p10r=0.438
+router 384x5120 b=12 cold | h20 vs old f16_matvec_batched (48,1 n=5 old= 60.39 new= 23.55 r=0.395 [0.388..0.636] p10r=0.392
+router 384x5120 b=16 cold | h20 vs old f16_matvec_batched (48,1 n=5 old= 67.94 new= 28.46 r=0.424 [0.416..0.686] p10r=0.428
+router 384x5120 b=32 cold | h20 vs old f16_matvec_batched (48,1 n=5 old= 117.53 new= 49.23 r=0.420 [0.379..0.473] p10r=0.415
+router 384x5120 b=64 cold | h20 vs old f16_matvec_batched (48,1 n=5 old= 228.57 new= 90.77 r=0.400 [0.396..0.500] p10r=0.399
+## F topk_wfred prior
+topk prior b=1 | wfred prior (b)x512 vs old router_topk_par prior (b n=5 old= 11.74 new= 9.53 r=0.811 [0.808..0.909] p10r=0.811
+topk prior b=2 | wfred prior (b)x512 vs old router_topk_par prior (b n=5 old= 11.74 new= 9.45 r=0.803 [0.802..0.811] p10r=0.804
+topk prior b=3 | wfred prior (b)x512 vs old router_topk_par prior (b n=5 old= 11.74 new= 9.54 r=0.808 [0.807..0.873] p10r=0.807
+topk prior b=4 | wfred prior (b)x512 vs old router_topk_par prior (b n=5 old= 11.83 new= 9.56 r=0.810 [0.695..1.046] p10r=0.812
+topk prior b=5 | wfred prior (b)x512 vs old router_topk_par prior (b n=5 old= 11.60 new= 9.42 r=0.812 [0.810..0.964] p10r=0.811
+topk prior b=6 | wfred prior (b)x512 vs old router_topk_par prior (b n=5 old= 11.63 new= 9.46 r=0.814 [0.811..1.038] p10r=0.811
+topk prior b=8 | wfred prior (b)x512 vs old router_topk_par prior (b n=5 old= 11.67 new= 9.53 r=0.814 [0.795..1.061] p10r=0.814
+topk prior b=12 | wfred prior (b)x512 vs old router_topk_par prior (b n=5 old= 11.58 new= 9.42 r=0.815 [0.814..0.980] p10r=0.814
+topk prior b=16 | wfred prior (b)x512 vs old router_topk_par prior (b n=5 old= 11.61 new= 9.50 r=0.818 [0.814..0.994] p10r=0.818
+topk prior b=24 | wfred prior (b)x512 vs old router_topk_par prior (b n=5 old= 11.55 new= 9.45 r=0.819 [0.817..0.876] p10r=0.818
+topk prior b=32 | wfred prior (b)x512 vs old router_topk_par prior (b n=5 old= 11.56 new= 9.48 r=0.825 [0.820..1.042] p10r=0.822
+topk prior b=64 | wfred prior (b)x512 vs old router_topk_par prior (b n=5 old= 12.03 new= 10.69 r=0.889 [0.871..1.015] p10r=0.871
+topk prior b=128 | wfred prior (b)x512 vs old router_topk_par prior (b n=5 old= 16.67 new= 16.69 r=1.001 [0.978..1.083] p10r=1.002
+topk prior b=512 | wfred prior (b)x512 vs old router_topk_par prior (b n=5 old= 45.37 new= 46.91 r=1.034 [0.976..1.036] p10r=1.031
+## F topk_wfred plain
+topk plain b=1 | wfred plain (b)x512 vs old router_topk_par plain (b n=4 old= 7.88 new= 7.67 r=0.971 [0.804..0.975] p10r=0.975
+topk plain b=4 | wfred plain (b)x512 vs old router_topk_par plain (b n=4 old= 7.99 new= 7.79 r=0.979 [0.965..1.365] p10r=0.973
+topk plain b=16 | wfred plain (b)x512 vs old router_topk_par plain (b n=4 old= 8.10 new= 7.82 r=0.982 [0.947..0.985] p10r=0.981
+topk plain b=24 | wfred plain (b)x512 vs old router_topk_par plain (b n=4 old= 7.86 new= 7.77 r=0.988 [0.984..1.349] p10r=0.987
+topk plain b=32 | wfred plain (b)x512 vs old router_topk_par plain (b n=4 old= 7.79 new= 7.69 r=0.991 [0.982..0.995] p10r=0.988
+topk plain b=48 | wfred plain (b)x512 vs old router_topk_par plain (b n=4 old= 8.04 new= 7.73 r=0.961 [0.956..0.965] p10r=0.964
+topk plain b=64 | wfred plain (b)x512 vs old router_topk_par plain (b n=4 old= 8.05 new= 8.24 r=1.024 [1.022..1.026] p10r=1.024
+topk plain b=96 | wfred plain (b)x512 vs old router_topk_par plain (b n=4 old= 8.34 new= 9.00 r=1.080 [1.073..1.081] p10r=1.077
+topk plain b=128 | wfred plain (b)x512 vs old router_topk_par plain (b n=4 old= 16.90 new= 16.97 r=1.003 [0.999..1.009] p10r=1.000
+topk plain b=512 | wfred plain (b)x512 vs old router_topk_par plain (b n=4 old= 33.16 new= 36.20 r=1.094 [1.085..1.097] p10r=1.096
+## D fused / blk128
+decode b=1 n_total=640 | attention_dec_fused_vt_qreg_sp_d4 vs base pair: dec_score + smwsu n=5 old= 42.79 new= 20.72 r=0.483 [0.482..0.486] p10r=0.484
+decode b=1 n_total=640 | attention_dec_score_blk128 alone vs base dec_score alone n=5 old= 10.00 new= 7.08 r=0.708 [0.702..1.008] p10r=0.702
+decode b=2 n_total=640 | attention_dec_fused_vt_qreg_sp_d4 vs base pair: dec_score + smwsu n=5 old= 42.94 new= 20.87 r=0.483 [0.482..0.486] p10r=0.482
+decode b=2 n_total=640 | attention_dec_score_blk128 alone vs base dec_score alone n=5 old= 10.22 new= 8.87 r=0.862 [0.847..0.869] p10r=0.860
+decode b=3 n_total=640 | attention_dec_fused_vt_qreg_sp_d4 vs base pair: dec_score + smwsu n=5 old= 45.10 new= 20.74 r=0.461 [0.460..0.569] p10r=0.460
+decode b=3 n_total=640 | attention_dec_score_blk128 alone vs base dec_score alone n=5 old= 12.62 new= 10.39 r=0.824 [0.821..1.777] p10r=0.819
+decode b=4 n_total=640 | attention_dec_fused_vt_qreg_sp_d4 vs base pair: dec_score + smwsu n=5 old= 48.28 new= 20.92 r=0.433 [0.432..0.462] p10r=0.431
+decode b=4 n_total=640 | attention_dec_score_blk128 alone vs base dec_score alone n=5 old= 15.90 new= 12.04 r=0.757 [0.755..0.882] p10r=0.755
+decode b=5 n_total=640 | attention_dec_fused_vt_qreg_sp_d4 vs base pair: dec_score + smwsu n=5 old= 48.98 new= 21.33 r=0.435 [0.424..0.436] p10r=0.435
+decode b=5 n_total=640 | attention_dec_score_blk128 alone vs base dec_score alone n=5 old= 16.32 new= 15.58 r=0.956 [0.943..0.959] p10r=0.957
+decode b=6 n_total=640 | attention_dec_fused_vt_qreg_sp_d4 vs base pair: dec_score + smwsu n=5 old= 50.78 new= 21.33 r=0.421 [0.417..0.443] p10r=0.419
+decode b=6 n_total=640 | attention_dec_score_blk128 alone vs base dec_score alone n=5 old= 18.58 new= 17.48 r=0.942 [0.941..1.027] p10r=0.939
+decode b=8 n_total=640 | attention_dec_fused_vt_qreg_sp_d4 vs base pair: dec_score + smwsu n=5 old= 54.02 new= 22.06 r=0.409 [0.373..0.410] p10r=0.410
+decode b=8 n_total=640 | attention_dec_score_blk128 alone vs base dec_score alone n=5 old= 21.72 new= 20.27 r=0.933 [0.933..0.938] p10r=0.934
+decode b=12 n_total=640 | attention_dec_fused_vt_qreg_sp_d4 vs base pair: dec_score + smwsu n=5 old= 65.69 new= 38.12 r=0.582 [0.482..0.584] p10r=0.582
+decode b=12 n_total=640 | attention_dec_score_blk128 alone vs base dec_score alone n=5 old= 29.67 new= 27.38 r=0.922 [0.916..0.928] p10r=0.927
+decode b=16 n_total=640 | attention_dec_fused_vt_qreg_sp_d4 vs base pair: dec_score + smwsu n=5 old= 72.58 new= 39.00 r=0.536 [0.488..0.540] p10r=0.539
+decode b=16 n_total=640 | attention_dec_score_blk128 alone vs base dec_score alone n=5 old= 36.35 new= 34.21 r=0.939 [0.838..0.950] p10r=0.947
+## E score qreg
+score n=32768 b=1 COLD keys (flush 64MB), direct inner=1 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 23.28 new= 16.40 r=0.676 [0.662..0.926] p10r=0.673
+score n=32768 b=1 WARM keys (bound), graph inner=5 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 18.73 new= 11.76 r=0.630 [0.626..0.658] p10r=0.630
+score n=32768 b=2 COLD keys (flush 64MB), direct inner=1 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 36.60 new= 21.00 r=0.630 [0.552..0.774] p10r=0.643
+score n=32768 b=2 WARM keys (bound), graph inner=5 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 26.94 new= 14.86 r=0.552 [0.528..0.559] p10r=0.556
+score n=32768 b=3 COLD keys (flush 64MB), direct inner=1 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 40.80 new= 24.88 r=0.602 [0.576..0.613] p10r=0.583
+score n=32768 b=3 WARM keys (bound), graph inner=5 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 34.74 new= 18.79 r=0.541 [0.480..0.550] p10r=0.537
+score n=32768 b=4 COLD keys (flush 64MB), direct inner=1 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 47.36 new= 26.84 r=0.552 [0.544..0.696] p10r=0.540
+score n=32768 b=4 WARM keys (bound), graph inner=5 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 43.34 new= 21.81 r=0.504 [0.499..0.549] p10r=0.501
+score n=32768 b=5 COLD keys (flush 64MB), direct inner=1 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 57.24 new= 29.76 r=0.515 [0.507..0.561] p10r=0.506
+score n=32768 b=5 WARM keys (bound), graph inner=5 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 53.12 new= 24.94 r=0.474 [0.413..0.488] p10r=0.473
+score n=32768 b=6 COLD keys (flush 64MB), direct inner=1 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 67.12 new= 33.80 r=0.497 [0.492..0.750] p10r=0.490
+score n=32768 b=6 WARM keys (bound), graph inner=5 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 61.73 new= 28.50 r=0.459 [0.454..0.623] p10r=0.458
+score n=32768 b=8 COLD keys (flush 64MB), direct inner=1 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 86.00 new= 47.24 r=0.541 [0.509..0.665] p10r=0.509
+score n=32768 b=8 WARM keys (bound), graph inner=5 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 80.87 new= 34.96 r=0.434 [0.428..0.555] p10r=0.434
+score n=12288 b=12 COLD keys (flush 64MB), direct inner=1 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 62.52 new= 31.64 r=0.505 [0.433..0.741] p10r=0.506
+score n=12288 b=12 WARM keys (bound), graph inner=5 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 66.62 new= 32.66 r=0.472 [0.466..0.603] p10r=0.464
+score n=12288 b=16 COLD keys (flush 64MB), direct inner=1 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 67.36 new= 33.00 r=0.492 [0.490..0.787] p10r=0.493
+score n=12288 b=16 WARM keys (bound), graph inner=5 | cand s2_w8n8_pf_hw vs base batched_mw_e2m1 n=5 old= 62.84 new= 28.51 r=0.455 [0.454..0.681] p10r=0.454
+## E select hybrid
+topk n=131072 b=1 WARM scores, graph inner=5 | cand topk_select_v3_u8 alone vs base select_ilp alone n=5 old= 69.27 new= 45.14 r=0.656 [0.650..0.735] p10r=0.651
+topk n=131072 b=2 WARM scores, graph inner=5 | cand topk_select_v3_u8 alone vs base select_ilp alone n=5 old= 68.82 new= 45.14 r=0.656 [0.615..0.755] p10r=0.655
+topk n=131072 b=3 WARM scores, graph inner=5 | cand topk_select_v3_u8 alone vs base select_ilp alone n=5 old= 69.06 new= 45.27 r=0.656 [0.644..0.838] p10r=0.648
+topk n=131072 b=4 WARM scores, graph inner=5 | cand topk_select_v3_u8 alone vs base select_ilp alone n=5 old= 70.47 new= 45.63 r=0.649 [0.645..0.660] p10r=0.649
+topk n=131072 b=5 WARM scores, graph inner=5 | cand topk_select_v3_u8 alone vs base select_ilp alone n=5 old= 70.46 new= 45.62 r=0.647 [0.646..0.717] p10r=0.650
+topk n=131072 b=6 WARM scores, graph inner=5 | cand topk_select_v3_u8 alone vs base select_ilp alone n=5 old= 70.34 new= 46.09 r=0.647 [0.620..0.663] p10r=0.649
+topk n=131072 b=8 WARM scores, graph inner=5 | cand topk_select_v3_u8 alone vs base select_ilp alone n=5 old= 69.26 new= 46.30 r=0.650 [0.649..0.669] p10r=0.650
+topk n=131072 b=12 WARM scores, graph inner=5 | cand topk_select_v3_u8 alone vs base select_ilp alone n=5 old= 76.26 new= 51.87 r=0.657 [0.656..0.706] p10r=0.664
+topk n=131072 b=16 WARM scores, graph inner=5 | cand topk_select_v3_u8 alone vs base select_ilp alone n=5 old= 74.33 new= 49.13 r=0.661 [0.604..0.734] p10r=0.668
+topk n=32768 b=64 WARM scores, graph inner=5 | cand topk_select_v3_u8 alone vs base select_ilp alone n=5 old= 84.27 new= 55.78 r=0.665 [0.640..0.681] p10r=0.642
+topk n=32768 b=512 WARM scores, graph inner=5 | cand topk_select_v3_u8 alone vs base select_ilp alone n=5 old= 567.04 new= 356.11 r=0.627 [0.612..0.673] p10r=0.613
+## E threshold ilp
+candidate pool n=131072 b=1 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=5 old= 60.62 new= 34.40 r=0.566 [0.473..0.671] p10r=0.568
+candidate pool n=131072 b=2 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=5 old= 68.32 new= 41.91 r=0.608 [0.595..0.617] p10r=0.608
+candidate pool n=131072 b=3 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=5 old= 67.87 new= 41.18 r=0.606 [0.605..0.699] p10r=0.606
+candidate pool n=131072 b=4 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=5 old= 72.38 new= 53.88 r=0.604 [0.589..0.744] p10r=0.606
+candidate pool n=131072 b=5 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=5 old= 66.80 new= 40.33 r=0.616 [0.603..0.635] p10r=0.613
+candidate pool n=131072 b=6 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=5 old= 66.23 new= 40.05 r=0.603 [0.602..0.693] p10r=0.612
+candidate pool n=131072 b=8 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=5 old= 65.96 new= 40.30 r=0.602 [0.547..0.678] p10r=0.620
+candidate pool n=131072 b=12 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=5 old= 66.00 new= 39.90 r=0.601 [0.536..0.617] p10r=0.617
+candidate pool n=131072 b=16 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=5 old= 66.33 new= 39.69 r=0.605 [0.598..0.704] p10r=0.615
+candidate pool n=32768 b=8 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=4 old= 40.75 new= 35.36 r=0.868 [0.866..0.892] p10r=0.867
+candidate pool n=32768 b=16 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=4 old= 39.82 new= 34.85 r=0.873 [0.843..0.876] p10r=0.876
+candidate pool n=32768 b=24 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=4 old= 47.10 new= 37.33 r=0.873 [0.731..0.936] p10r=0.874
+candidate pool n=32768 b=32 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=4 old= 43.63 new= 39.78 r=0.882 [0.876..0.941] p10r=0.878
+candidate pool n=32768 b=48 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=4 old= 50.16 new= 48.72 r=0.936 [0.873..1.006] p10r=0.905
+candidate pool n=32768 b=64 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=4 old= 51.02 new= 43.63 r=0.917 [0.780..0.935] p10r=0.918
+candidate pool n=32768 b=128 WARM scores, graph inner=5 | cand candidate_threshold_ilp vs base candidate_threshold n=4 old= 46.42 new= 69.94 r=1.503 [1.482..1.510] p10r=1.512
+## G gather u4 vs old (+ pads)
+gather b=1 COLD store (flush 64MB), graph inner=1 | old (513,b,2)x256 +1 vs old (512,b,2)x256 exact n=4 old= 23.26 new= 39.44 r=0.999 [0.966..2.196] p10r=0.995
+gather b=1 COLD store (flush 64MB), graph inner=1 | u4 (512,b)x64 exact vs old (512,b,2)x256 exact n=4 old= 23.26 new= 28.42 r=1.185 [0.892..1.899] p10r=0.928
+gather b=1 COLD store (flush 64MB), graph inner=1 | u4 (513,b)x64 +1 vs old (512,b,2)x256 exact n=4 old= 23.26 new= 21.18 r=0.928 [0.877..0.942] p10r=0.916
+gather b=2 COLD store (flush 64MB), graph inner=1 | old (513,b,2)x256 +1 vs old (512,b,2)x256 exact n=4 old= 24.12 new= 23.36 r=0.969 [0.947..0.995] p10r=0.989
+gather b=2 COLD store (flush 64MB), graph inner=1 | u4 (512,b)x64 exact vs old (512,b,2)x256 exact n=4 old= 24.12 new= 32.12 r=1.349 [1.278..1.359] p10r=1.348
+gather b=2 COLD store (flush 64MB), graph inner=1 | u4 (513,b)x64 +1 vs old (512,b,2)x256 exact n=4 old= 24.12 new= 23.22 r=0.940 [0.910..1.279] p10r=0.861
+gather b=3 COLD store (flush 64MB), graph inner=1 | old (513,b,2)x256 +1 vs old (512,b,2)x256 exact n=4 old= 57.10 new= 51.86 r=0.937 [0.800..1.001] p10r=0.990
+gather b=3 COLD store (flush 64MB), graph inner=1 | u4 (512,b)x64 exact vs old (512,b,2)x256 exact n=4 old= 57.10 new= 41.44 r=0.791 [0.703..0.816] p10r=0.793
+gather b=3 COLD store (flush 64MB), graph inner=1 | u4 (513,b)x64 +1 vs old (512,b,2)x256 exact n=4 old= 57.10 new= 40.40 r=0.798 [0.680..0.816] p10r=0.790
+gather b=4 COLD store (flush 64MB), graph inner=1 | old (513,b,2)x256 +1 vs old (512,b,2)x256 exact n=4 old= 34.44 new= 33.64 r=0.977 [0.666..1.003] p10r=0.989
+gather b=4 COLD store (flush 64MB), graph inner=1 | u4 (512,b)x64 exact vs old (512,b,2)x256 exact n=4 old= 34.44 new= 27.38 r=0.765 [0.609..0.816] p10r=0.749
+gather b=4 COLD store (flush 64MB), graph inner=1 | u4 (513,b)x64 +1 vs old (512,b,2)x256 exact n=4 old= 34.44 new= 26.20 r=0.762 [0.749..0.893] p10r=0.748
+gather b=5 COLD store (flush 64MB), graph inner=1 | old (513,b,2)x256 +1 vs old (512,b,2)x256 exact n=4 old= 37.60 new= 38.08 r=1.007 [0.996..1.016] p10r=1.002
+gather b=5 COLD store (flush 64MB), graph inner=1 | u4 (512,b)x64 exact vs old (512,b,2)x256 exact n=4 old= 37.60 new= 28.18 r=0.749 [0.691..0.794] p10r=0.727
+gather b=5 COLD store (flush 64MB), graph inner=1 | u4 (513,b)x64 +1 vs old (512,b,2)x256 exact n=4 old= 37.60 new= 28.04 r=0.745 [0.690..0.762] p10r=0.720
+gather b=6 COLD store (flush 64MB), graph inner=1 | old (513,b,2)x256 +1 vs old (512,b,2)x256 exact n=4 old= 42.20 new= 42.22 r=0.991 [0.968..1.041] p10r=0.982
+gather b=6 COLD store (flush 64MB), graph inner=1 | u4 (512,b)x64 exact vs old (512,b,2)x256 exact n=4 old= 42.20 new= 30.80 r=0.736 [0.685..0.743] p10r=0.700
+gather b=6 COLD store (flush 64MB), graph inner=1 | u4 (513,b)x64 +1 vs old (512,b,2)x256 exact n=4 old= 42.20 new= 31.48 r=0.746 [0.680..0.786] p10r=0.677
+gather b=8 COLD store (flush 64MB), graph inner=1 | old (513,b,2)x256 +1 vs old (512,b,2)x256 exact n=4 old= 52.60 new= 53.12 r=1.005 [0.996..1.033] p10r=1.005
+gather b=8 COLD store (flush 64MB), graph inner=1 | u4 (512,b)x64 exact vs old (512,b,2)x256 exact n=4 old= 52.60 new= 36.62 r=0.699 [0.690..0.704] p10r=0.685
+gather b=8 COLD store (flush 64MB), graph inner=1 | u4 (513,b)x64 +1 vs old (512,b,2)x256 exact n=4 old= 52.60 new= 38.52 r=0.733 [0.694..0.801] p10r=0.689
+gather b=12 COLD store (flush 64MB), graph inner=1 | old (513,b,2)x256 +1 vs old (512,b,2)x256 exact n=4 old= 73.30 new= 74.40 r=1.002 [0.805..1.029] p10r=1.012
+gather b=12 COLD store (flush 64MB), graph inner=1 | u4 (512,b)x64 exact vs old (512,b,2)x256 exact n=4 old= 73.30 new= 48.22 r=0.652 [0.590..0.665] p10r=0.635
+gather b=12 COLD store (flush 64MB), graph inner=1 | u4 (513,b)x64 +1 vs old (512,b,2)x256 exact n=4 old= 73.30 new= 49.46 r=0.663 [0.619..0.693] p10r=0.639
+gather b=16 COLD store (flush 64MB), graph inner=1 | old (513,b,2)x256 +1 vs old (512,b,2)x256 exact n=4 old= 93.50 new= 94.50 r=0.999 [0.703..1.018] p10r=1.016
+gather b=16 COLD store (flush 64MB), graph inner=1 | u4 (512,b)x64 exact vs old (512,b,2)x256 exact n=4 old= 93.50 new= 56.78 r=0.604 [0.400..0.618] p10r=0.572
+gather b=16 COLD store (flush 64MB), graph inner=1 | u4 (513,b)x64 +1 vs old (512,b,2)x256 exact n=4 old= 93.50 new= 56.48 r=0.604 [0.477..0.610] p10r=0.608
+## C1 gemv tB
+gemv q_a 1280x5120 b=1 copies=1 cold(readflush72MB) graph | cand q8_0_gemv_bpack_tB1 vs base q8_0_gemv_bpack_warp8 n=5 old= 28.08 new= 27.12 r=0.966 [0.921..1.009] p10r=0.979
+gemv q_a 1280x5120 b=2 copies=1 cold(readflush72MB) graph | cand q8_0_gemv_bpack_tB2 vs base q8_0_gemv_bpack_warp8 n=5 old= 29.56 new= 27.04 r=0.944 [0.915..1.224] p10r=0.914
+gemv q_a 1280x5120 b=3 copies=1 cold(readflush72MB) graph | cand q8_0_gemv_bpack_tB3 vs base q8_0_gemv_bpack_warp8 n=5 old= 32.08 new= 28.44 r=0.887 [0.875..0.965] p10r=0.867
+gemv q_a 1280x5120 b=4 copies=1 cold(readflush72MB) graph | cand q8_0_gemv_bpack_tB4 vs base q8_0_gemv_bpack_warp8 n=5 old= 31.96 new= 26.20 r=0.810 [0.545..0.820] p10r=0.815
+gemv q_a 1280x5120 b=5 copies=1 cold(readflush72MB) graph | cand q8_0_gemv_bpack_tB5 vs base q8_0_gemv_bpack_warp8 n=5 old= 34.48 new= 27.04 r=0.777 [0.641..0.889] p10r=0.772
+gemv q_a 1280x5120 b=6 copies=1 cold(readflush72MB) graph | cand q8_0_gemv_bpack_tB6 vs base q8_0_gemv_bpack_warp8 n=5 old= 36.64 new= 27.72 r=0.755 [0.646..0.883] p10r=0.739
+gemv q_a 1280x5120 b=8 copies=1 cold(readflush72MB) graph | cand q8_0_gemv_bpack_tB8 vs base q8_0_gemv_bpack_warp8 n=5 old= 40.04 new= 29.48 r=0.736 [0.717..0.756] p10r=0.729
+gemv q_a 1280x5120 b=9 copies=1 cold(readflush72MB) graph | cand q8_0_gemv_bpack_tB9 vs base q8_0_gemv_bpack_warp8 n=5 old= 41.84 new= 29.92 r=0.716 [0.711..0.734] p10r=0.709
+gemv q_a 1280x5120 b=10 copies=1 cold(readflush72MB) graph | cand q8_0_gemv_bpack_tB10 vs base q8_0_gemv_bpack_warp8 n=5 old= 45.16 new= 31.76 r=0.699 [0.622..0.731] p10r=0.696
+gemv kv 512x5120 b=1 copies=8 cold(readflush72MB) graph | cand q8_0_gemv_bpack_tB1 vs base q8_0_gemv_bpack_warp8 n=5 old= 9.11 new= 8.95 r=0.977 [0.969..0.991] p10r=0.970
+gemv kv 512x5120 b=3 copies=8 cold(readflush72MB) graph | cand q8_0_gemv_bpack_tB3 vs base q8_0_gemv_bpack_warp8 n=5 old= 11.16 new= 9.29 r=0.836 [0.807..0.851] p10r=0.810
+gemv kv 512x5120 b=6 copies=8 cold(readflush72MB) graph | cand q8_0_gemv_bpack_tB6 vs base q8_0_gemv_bpack_warp8 n=5 old= 14.86 new= 9.77 r=0.659 [0.657..0.668] p10r=0.659
+gemv kv 512x5120 b=9 copies=8 cold(readflush72MB) graph | cand q8_0_gemv_bpack_tB9 vs base q8_0_gemv_bpack_warp8 n=5 old= 18.66 new= 10.82 r=0.582 [0.455..0.613] p10r=0.595
+gemv kv 512x5120 b=10 copies=8 cold(readflush72MB) graph | cand q8_0_gemv_bpack_tB10 vs base q8_0_gemv_bpack_warp8 n=5 old= 19.39 new= 11.45 r=0.591 [0.576..0.724] p10r=0.575
+gemv sh_gate 2304x5120 b=1 copies=3 cold(readflush72MB) grap | cand q8_0_gemv_bpack_tB1 vs base q8_0_gemv_bpack_warp8 n=5 old= 33.01 new= 30.24 r=0.983 [0.818..1.006] p10r=0.986
+gemv sh_gate 2304x5120 b=6 copies=3 cold(readflush72MB) grap | cand q8_0_gemv_bpack_tB6 vs base q8_0_gemv_bpack_warp8 n=5 old= 39.16 new= 29.36 r=0.750 [0.725..0.915] p10r=0.730
+gemv sh_gate 2304x5120 b=9 copies=3 cold(readflush72MB) grap | cand q8_0_gemv_bpack_tB9 vs base q8_0_gemv_bpack_warp8 n=5 old= 51.07 new= 35.93 r=0.704 [0.640..0.908] p10r=0.644
+gemv sh_gate 2304x5120 b=10 copies=3 cold(readflush72MB) gra | cand q8_0_gemv_bpack_tB10 vs base q8_0_gemv_bpack_warp8 n=5 old= 50.63 new= 33.89 r=0.674 [0.646..0.848] p10r=0.650
+gemv sh_down 5120x2304 b=1 copies=3 cold(readflush72MB) grap | cand q8_0_gemv_bpack_tB1 vs base q8_0_gemv_bpack_warp8 n=5 old= 28.39 new= 27.91 r=0.997 [0.959..1.003] p10r=0.999
+gemv sh_down 5120x2304 b=6 copies=3 cold(readflush72MB) grap | cand q8_0_gemv_bpack_tB6 vs base q8_0_gemv_bpack_warp8 n=5 old= 37.31 new= 29.63 r=0.825 [0.774..0.942] p10r=0.829
+gemv sh_down 5120x2304 b=9 copies=3 cold(readflush72MB) grap | cand q8_0_gemv_bpack_tB9 vs base q8_0_gemv_bpack_warp8 n=5 old= 46.25 new= 33.17 r=0.757 [0.703..0.929] p10r=0.761
+gemv sh_down 5120x2304 b=10 copies=3 cold(readflush72MB) gra | cand q8_0_gemv_bpack_tB10 vs base q8_0_gemv_bpack_warp8 n=5 old= 48.25 new= 35.20 r=0.754 [0.729..0.941] p10r=0.762
+## C1 grouped tB
+grouped wo_a 8x(1024x4096) b=1 cold(readflush72MB) graph | cand q8_0_grouped_gemv_bpack_tB1 vs base q8_0_grouped_gemv_bpack n=5 old= 80.48 new= 83.32 r=1.022 [0.994..1.186] p10r=1.011
+grouped wo_a 8x(1024x4096) b=2 cold(readflush72MB) graph | cand q8_0_grouped_gemv_bpack_tB2 vs base q8_0_grouped_gemv_bpack n=5 old= 205.64 new= 181.32 r=0.882 [0.831..0.927] p10r=0.918
+grouped wo_a 8x(1024x4096) b=3 cold(readflush72MB) graph | cand q8_0_grouped_gemv_bpack_tB3 vs base q8_0_grouped_gemv_bpack n=5 old= 136.92 new= 163.32 r=0.839 [0.763..1.193] p10r=0.878
+grouped wo_a 8x(1024x4096) b=4 cold(readflush72MB) graph | cand q8_0_grouped_gemv_bpack_tB4 vs base q8_0_grouped_gemv_bpack n=5 old= 211.92 new= 182.36 r=0.846 [0.731..0.861] p10r=0.823
+grouped wo_a 8x(1024x4096) b=5 cold(readflush72MB) graph | cand q8_0_grouped_gemv_bpack_tB5 vs base q8_0_grouped_gemv_bpack n=5 old= 107.80 new= 81.56 r=0.777 [0.680..0.919] p10r=0.700
+grouped wo_a 8x(1024x4096) b=6 cold(readflush72MB) graph | cand q8_0_grouped_gemv_bpack_tB6 vs base q8_0_grouped_gemv_bpack n=5 old= 225.92 new= 183.52 r=0.812 [0.655..0.817] p10r=0.781
+grouped wo_a 8x(1024x4096) b=7 cold(readflush72MB) graph | cand q8_0_grouped_gemv_bpack_tB7 vs base q8_0_grouped_gemv_bpack n=5 old= 117.80 new= 81.60 r=0.702 [0.633..0.814] p10r=0.696
+grouped wo_a 8x(1024x4096) b=8 cold(readflush72MB) graph | cand q8_0_grouped_gemv_bpack_tB8 vs base q8_0_grouped_gemv_bpack n=5 old= 121.04 new= 81.60 r=0.674 [0.638..0.814] p10r=0.660
+## C1 shared fused (B r1 + tB down) vs tB chain
+shared-expert chain b=1 (gate/up 2304x5120, down 5120x2304) | cand B r1 + tB down (2 nodes) vs cand tB chain: tB gate, tB u n=5 old= 86.36 new= 79.16 r=0.910 [0.678..0.917] p10r=0.909
+shared-expert chain b=2 (gate/up 2304x5120, down 5120x2304) | cand B r1 + tB down (2 nodes) vs cand tB chain: tB gate, tB u n=5 old= 89.68 new= 81.48 r=0.909 [0.887..0.918] p10r=0.916
+shared-expert chain b=3 (gate/up 2304x5120, down 5120x2304) | cand B r1 + tB down (2 nodes) vs cand tB chain: tB gate, tB u n=5 old= 90.48 new= 81.24 r=0.898 [0.721..0.915] p10r=0.910
+shared-expert chain b=4 (gate/up 2304x5120, down 5120x2304) | cand B r1 + tB down (2 nodes) vs cand tB chain: tB gate, tB u n=5 old= 91.56 new= 81.32 r=0.892 [0.885..0.917] p10r=0.914
+shared-expert chain b=5 (gate/up 2304x5120, down 5120x2304) | cand B r1 + tB down (2 nodes) vs cand tB chain: tB gate, tB u n=5 old= 93.64 new= 87.40 r=0.933 [0.909..0.972] p10r=0.910
+shared-expert chain b=6 (gate/up 2304x5120, down 5120x2304) | cand B r1 + tB down (2 nodes) vs cand tB chain: tB gate, tB u n=5 old= 93.12 new= 86.16 r=0.921 [0.694..0.932] p10r=0.911
+shared-expert chain b=7 (gate/up 2304x5120, down 5120x2304) | cand B r1 + tB down (2 nodes) vs cand tB chain: tB gate, tB u n=5 old= 99.20 new= 89.04 r=0.912 [0.700..1.146] p10r=0.917
+shared-expert chain b=8 (gate/up 2304x5120, down 5120x2304) | cand B r1 + tB down (2 nodes) vs cand tB chain: tB gate, tB u n=5 old= 97.08 new= 104.12 r=1.073 [1.056..1.099] p10r=1.068
+## C1 quant wave (both padded)
+quantize K=5120 b=1 offs=0/0/0 WARM(inner10,no flush) graph | cand q8_0_quantize_f32_wave vs base q8_0_quantize_f32 (bloc n=5 old= 4.22 new= 3.74 r=0.902 [0.657..0.910] p10r=0.904
+quantize K=5120 b=4 offs=0/0/0 WARM(inner10,no flush) graph | cand q8_0_quantize_f32_wave vs base q8_0_quantize_f32 (bloc n=5 old= 4.64 new= 3.74 r=0.801 [0.789..1.210] p10r=0.801
+quantize K=5120 b=8 offs=0/0/0 WARM(inner10,no flush) graph | cand q8_0_quantize_f32_wave vs base q8_0_quantize_f32 (bloc n=5 old= 5.32 new= 3.82 r=0.714 [0.667..0.740] p10r=0.709
+quantize K=5120 b=16 offs=0/0/0 WARM(inner10,no flush) graph | cand q8_0_quantize_f32_wave vs base q8_0_quantize_f32 (bloc n=5 old= 6.41 new= 4.10 r=0.639 [0.631..0.642] p10r=0.635
+quantize K=1280 b=4 offs=0/0/0 WARM(inner10,no flush) graph | cand q8_0_quantize_f32_wave vs base q8_0_quantize_f32 (bloc n=5 old= 4.42 new= 4.30 r=0.945 [0.899..0.992] p10r=0.903
+quantize K=2304 b=4 offs=0/0/0 WARM(inner10,no flush) graph | cand q8_0_quantize_f32_wave vs base q8_0_quantize_f32 (bloc n=5 old= 4.64 new= 4.01 r=0.865 [0.781..0.886] p10r=0.887
+quantize K=6144 b=16 offs=0/0/0 WARM(inner10,no flush) graph | cand q8_0_quantize_f32_wave vs base q8_0_quantize_f32 (bloc n=5 old= 7.54 new= 4.54 r=0.602 [0.595..0.734] p10r=0.598
+quantize K=6144 b=64 offs=0/0/0 WARM(inner10,no flush) graph | cand q8_0_quantize_f32_wave vs base q8_0_quantize_f32 (bloc n=5 old= 17.77 new= 7.39 r=0.407 [0.391..0.416] p10r=0.392
+quantize K=6144 b=128 offs=0/0/0 WARM(inner10,no flush) grap | cand q8_0_quantize_f32_wave vs base q8_0_quantize_f32 (bloc n=5 old= 32.67 new= 11.48 r=0.351 [0.328..0.486] p10r=0.331
+quantize K=5120 b=64 offs=0/0/0 WARM(inner10,no flush) graph | cand q8_0_quantize_f32_wave vs base q8_0_quantize_f32 (bloc n=5 old= 15.28 new= 6.46 r=0.421 [0.413..0.571] p10r=0.413
+quantize K=5120 b=512 offs=0/0/0 WARM(inner10,no flush) grap | cand q8_0_quantize_f32_wave vs base q8_0_quantize_f32 (bloc n=5 old= 108.81 new= 40.84 r=0.399 [0.276..0.502] p10r=0.278
+quantize K=32768 b=4 offs=0/0/0 WARM(inner10,no flush) graph | cand q8_0_quantize_f32_wave vs base q8_0_quantize_f32 (bloc n=5 old= 12.84 new= 11.86 r=0.602 [0.546..0.923] p10r=0.551
+quantize K=8192 b=16 offs=0/0/0 WARM(inner10,no flush) graph | cand q8_0_quantize_f32_wave vs base q8_0_quantize_f32 (bloc n=5 old= 8.69 new= 4.70 r=0.548 [0.511..0.567] p10r=0.547
+## C2
+kv b=65 M=512 K=5120 G=1 flush64MB | cand q8_0_gemm_wmma_f16x_db_bn64 vs base q8_0_gemm_wmma_f16x n=5 old= 109.44 new= 62.36 r=0.570 [0.263..0.672] p10r=0.554
+kv b=128 M=512 K=5120 G=1 flush64MB | cand q8_0_gemm_wmma_f16x_db_bn64 vs base q8_0_gemm_wmma_f16x n=5 old= 101.04 new= 54.64 r=0.563 [0.526..0.690] p10r=0.542
+kv b=256 M=512 K=5120 G=1 flush64MB | cand q8_0_gemm_wmma_f16x_db_bn64 vs base q8_0_gemm_wmma_f16x n=5 old= 104.00 new= 58.84 r=0.560 [0.434..0.635] p10r=0.579
+kv b=512 M=512 K=5120 G=1 flush64MB | cand q8_0_gemm_wmma_f16x_db_bn64 vs base q8_0_gemm_wmma_f16x n=5 old= 103.92 new= 57.56 r=0.553 [0.530..0.615] p10r=0.533
+kv b=1024 M=512 K=5120 G=1 flush64MB | cand q8_0_gemm_wmma_f16x_db_bn64 vs base q8_0_gemm_wmma_f16x n=5 old= 105.80 new= 74.48 r=0.704 [0.699..0.785] p10r=0.704
+qa b=65 M=1280 K=5120 G=1 flush64MB | cand q8_0_gemm_wmma_f16x_db_bn64 vs base q8_0_gemm_wmma_f16x n=5 old= 95.96 new= 53.36 r=0.552 [0.487..0.568] p10r=0.561
+qa b=128 M=1280 K=5120 G=1 flush64MB | cand q8_0_gemm_wmma_f16x_db_bn64 vs base q8_0_gemm_wmma_f16x n=5 old= 111.08 new= 59.00 r=0.543 [0.531..0.744] p10r=0.543
+qa b=256 M=1280 K=5120 G=1 flush64MB | cand q8_0_gemm_wmma_f16x_db_bn64 vs base q8_0_gemm_wmma_f16x n=5 old= 101.92 new= 68.80 r=0.664 [0.645..0.693] p10r=0.672
+qa b=512 M=1280 K=5120 G=1 flush64MB | cand q8_0_gemm_wmma_f16x_db_bn64 vs base q8_0_gemm_wmma_f16x n=5 old= 123.36 new= 97.76 r=0.792 [0.776..0.824] p10r=0.794
+qa b=768 M=1280 K=5120 G=1 flush64MB | cand q8_0_gemm_wmma_f16x_db_bn64 vs base q8_0_gemm_wmma_f16x n=5 old= 125.16 new= 125.80 r=1.000 [0.787..1.005] p10r=1.006
+qa b=1024 M=1280 K=5120 G=1 flush64MB | cand q8_0_gemm_wmma_f16x_db_bn64 vs base q8_0_gemm_wmma_f16x n=5 old= 164.16 new= 175.40 r=1.068 [1.064..1.075] p10r=1.043
+qb b=65 M=32768 K=1280 G=1 flush64MB | cand q8_0_gemm_wmma_f16x_256x128 vs base q8_0_gemm_wmma_f16x n=1 old= 254.84 new= 321.72 r=1.262 [1.262..1.262] p10r=1.235
+qb b=128 M=32768 K=1280 G=1 flush64MB | cand q8_0_gemm_wmma_f16x_256x128 vs base q8_0_gemm_wmma_f16x n=1 old= 335.08 new= 355.76 r=1.062 [1.062..1.062] p10r=1.148
+woa b=65 M=1024 K=4096 G=8 flush64MB | cand q8_0_gemm_wmma_f16x_256x128 vs base q8_0_gemm_wmma_f16x n=1 old= 177.12 new= 253.48 r=1.431 [1.431..1.431] p10r=1.010
+woa b=128 M=1024 K=4096 G=8 flush64MB | cand q8_0_gemm_wmma_f16x_256x128 vs base q8_0_gemm_wmma_f16x n=1 old= 237.04 new= 304.36 r=1.284 [1.284..1.284] p10r=1.037
+woa b=256 M=1024 K=4096 G=8 flush64MB | cand q8_0_gemm_wmma_f16x_256x128 vs base q8_0_gemm_wmma_f16x n=1 old= 223.12 new= 205.00 r=0.919 [0.919..0.919] p10r=0.908
+qb64 b=17 M=32768 K=1280 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=5 old= 446.36 new= 181.28 r=0.403 [0.394..0.544] p10r=0.400
+wob64 b=17 M=5120 K=8192 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=1 old= 441.08 new= 188.72 r=0.428 [0.428..0.428] p10r=0.420
+woa64 b=17 M=1024 K=4096 G=8 flush64MB | cand q8_0_grouped_gemv_bpack_z16 vs base q8_0_grouped_gemv_batch n=5 old= 360.84 new= 185.12 r=0.511 [0.486..0.519] p10r=0.505
+kv64 b=17 M=512 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=5 old= 19.24 new= 34.12 r=1.724 [1.525..1.783] p10r=1.712
+qb64 b=24 M=32768 K=1280 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=5 old= 611.08 new= 237.36 r=0.390 [0.379..0.441] p10r=0.381
+wob64 b=24 M=5120 K=8192 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=1 old= 657.24 new= 274.80 r=0.418 [0.418..0.418] p10r=0.402
+woa64 b=24 M=1024 K=4096 G=8 flush64MB | cand q8_0_grouped_gemv_bpack_z16 vs base q8_0_grouped_gemv_batch n=5 old= 508.44 new= 245.32 r=0.472 [0.425..0.540] p10r=0.439
+kv64 b=24 M=512 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=5 old= 40.16 new= 42.36 r=1.042 [0.797..1.087] p10r=1.051
+qb64 b=32 M=32768 K=1280 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=5 old= 806.04 new= 306.92 r=0.381 [0.372..0.384] p10r=0.379
+wob64 b=32 M=5120 K=8192 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=1 old= 821.45 new= 313.28 r=0.381 [0.381..0.381] p10r=0.347
+woa64 b=32 M=1024 K=4096 G=8 flush64MB | cand q8_0_grouped_gemv_bpack_z16 vs base q8_0_grouped_gemv_batch n=5 old= 653.12 new= 297.96 r=0.428 [0.408..0.472] p10r=0.412
+kv64 b=32 M=512 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=5 old= 38.72 new= 41.40 r=1.110 [0.896..1.302] p10r=1.259
+qb64 b=48 M=32768 K=1280 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=5 old= 1266.61 new= 447.64 r=0.378 [0.353..0.392] p10r=0.377
+wob64 b=48 M=5120 K=8192 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=1 old= 1271.73 new= 479.60 r=0.377 [0.377..0.377] p10r=0.321
+woa64 b=48 M=1024 K=4096 G=8 flush64MB | cand q8_0_grouped_gemv_bpack_z16 vs base q8_0_grouped_gemv_batch n=5 old= 944.57 new= 403.84 r=0.433 [0.410..0.451] p10r=0.423
+kv64 b=48 M=512 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=5 old= 54.84 new= 48.24 r=0.880 [0.795..1.051] p10r=0.945
+qb64 b=64 M=32768 K=1280 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=5 old= 1640.17 new= 623.28 r=0.381 [0.362..0.403] p10r=0.384
+wob64 b=64 M=5120 K=8192 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=1 old= 1650.01 new= 510.04 r=0.309 [0.309..0.309] p10r=0.302
+woa64 b=64 M=1024 K=4096 G=8 flush64MB | cand q8_0_grouped_gemv_bpack_z16 vs base q8_0_grouped_gemv_batch n=5 old= 1309.73 new= 544.80 r=0.416 [0.394..0.440] p10r=0.417
+kv64 b=64 M=512 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=5 old= 56.00 new= 47.88 r=0.832 [0.664..0.942] p10r=0.918
+engram b=9 M=6400 K=6144 G=1 flush64MB | cand q8_0_gemm_wmma_i8x_db vs base q8_0_gemm_wmma_lds_tile n=5 old= 372.12 new= 176.88 r=0.508 [0.441..0.565] p10r=0.510
+engram b=16 M=6400 K=6144 G=1 flush64MB | cand q8_0_gemm_wmma_i8x_db vs base q8_0_gemm_wmma_lds_tile n=5 old= 293.68 new= 158.80 r=0.538 [0.402..0.542] p10r=0.505
+engram b=32 M=6400 K=6144 G=1 flush64MB | cand q8_0_gemm_wmma_i8x_db vs base q8_0_gemm_wmma_lds_tile n=5 old= 296.56 new= 171.04 r=0.546 [0.456..0.601] p10r=0.513
+engram b=64 M=6400 K=6144 G=1 flush64MB | cand q8_0_gemm_wmma_i8x_db vs base q8_0_gemm_wmma_lds_tile n=5 old= 299.64 new= 164.16 r=0.539 [0.508..0.573] p10r=0.533
+engram b=128 M=6400 K=6144 G=1 flush64MB | cand q8_0_gemm_wmma_i8x_db vs base q8_0_gemm_wmma_lds_tile n=5 old= 525.20 new= 160.92 r=0.318 [0.306..0.393] p10r=0.304
+qb b=65 M=32768 K=1280 G=1 flush48MB | cand q8_0_gemm_wmma_f16x_256x128 vs base q8_0_gemm_wmma_f16x n=4 old= 250.62 new= 317.30 r=1.271 [1.232..1.275] p10r=1.252
+qb b=128 M=32768 K=1280 G=1 flush48MB | cand q8_0_gemm_wmma_f16x_256x128 vs base q8_0_gemm_wmma_f16x n=4 old= 275.34 new= 325.54 r=1.178 [1.167..1.183] p10r=1.174
+qb b=192 M=32768 K=1280 G=1 flush48MB | cand q8_0_gemm_wmma_f16x_256x128 vs base q8_0_gemm_wmma_f16x n=4 old= 233.82 new= 224.04 r=0.958 [0.953..0.998] p10r=0.956
+woa b=65 M=1024 K=4096 G=8 flush48MB | cand q8_0_gemm_wmma_f16x_256x128 vs base q8_0_gemm_wmma_f16x n=4 old= 156.56 new= 152.86 r=0.978 [0.944..0.999] p10r=0.966
+woa b=128 M=1024 K=4096 G=8 flush48MB | cand q8_0_gemm_wmma_f16x_256x128 vs base q8_0_gemm_wmma_f16x n=4 old= 165.92 new= 167.20 r=1.010 [0.999..1.164] p10r=1.001
+woa b=192 M=1024 K=4096 G=8 flush48MB | cand q8_0_gemm_wmma_f16x_256x128 vs base q8_0_gemm_wmma_f16x n=4 old= 212.06 new= 188.76 r=0.891 [0.878..1.208] p10r=0.891
+woa b=256 M=1024 K=4096 G=8 flush48MB | cand q8_0_gemm_wmma_f16x_256x128 vs base q8_0_gemm_wmma_f16x n=4 old= 217.00 new= 204.16 r=0.936 [0.894..0.976] p10r=0.898
+woa b=384 M=1024 K=4096 G=8 flush48MB | cand q8_0_gemm_wmma_f16x_256x128 vs base q8_0_gemm_wmma_f16x n=4 old= 285.04 new= 253.74 r=0.890 [0.883..0.910] p10r=0.856
+qa64 b=17 M=1280 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 44.46 new= 50.40 r=1.139 [1.096..1.181] p10r=1.167
+shg64 b=17 M=2304 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 108.02 new= 58.92 r=0.524 [0.492..0.565] p10r=0.524
+shd64 b=17 M=5120 K=2304 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 123.86 new= 53.90 r=0.464 [0.406..0.668] p10r=0.456
+qa64 b=24 M=1280 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 51.68 new= 49.54 r=0.961 [0.957..0.963] p10r=0.963
+shg64 b=24 M=2304 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 194.36 new= 100.56 r=0.501 [0.461..0.578] p10r=0.458
+shd64 b=24 M=5120 K=2304 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 157.54 new= 75.22 r=0.479 [0.470..0.516] p10r=0.471
+qa64 b=32 M=1280 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 63.20 new= 61.90 r=0.956 [0.862..1.012] p10r=1.027
+shg64 b=32 M=2304 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 210.02 new= 102.24 r=0.483 [0.417..0.539] p10r=0.428
+shd64 b=32 M=5120 K=2304 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 266.40 new= 142.84 r=0.536 [0.446..0.615] p10r=0.466
+kv64 b=40 M=512 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 52.30 new= 42.48 r=0.854 [0.779..1.076] p10r=0.970
+qa64 b=40 M=1280 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 65.82 new= 63.62 r=0.950 [0.675..0.979] p10r=0.920
+shg64 b=40 M=2304 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 272.18 new= 117.84 r=0.451 [0.386..0.509] p10r=0.410
+shd64 b=40 M=5120 K=2304 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 295.92 new= 124.34 r=0.422 [0.411..0.562] p10r=0.399
+qa64 b=48 M=1280 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 112.42 new= 90.42 r=0.804 [0.738..0.922] p10r=0.891
+shg64 b=48 M=2304 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 303.38 new= 132.12 r=0.436 [0.413..0.486] p10r=0.396
+shd64 b=48 M=5120 K=2304 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 367.84 new= 155.32 r=0.419 [0.417..0.489] p10r=0.421
+kv64 b=56 M=512 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 55.06 new= 41.56 r=0.766 [0.634..0.908] p10r=0.860
+qa64 b=56 M=1280 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 92.52 new= 86.44 r=0.906 [0.874..0.952] p10r=0.907
+shg64 b=56 M=2304 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 340.30 new= 137.68 r=0.389 [0.376..0.428] p10r=0.372
+shd64 b=56 M=5120 K=2304 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 372.22 new= 154.02 r=0.392 [0.375..0.426] p10r=0.366
+qa64 b=64 M=1280 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 142.50 new= 125.82 r=0.885 [0.863..0.897] p10r=0.890
+shg64 b=64 M=2304 K=5120 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 384.90 new= 151.46 r=0.389 [0.382..0.399] p10r=0.368
+shd64 b=64 M=5120 K=2304 G=1 flush64MB | cand q8_0_gemv_bpack_z16 vs base q8_0_gemv_batched_warp8 n=4 old= 412.02 new= 168.80 r=0.411 [0.389..0.488] p10r=0.379
+## A dn2 chain
+b=12 E=16 ppr=6 P=16 gbound=384 bound-grid cold-rotating | cand dn2_r2 vs base chain (builders+kwide+q n=5 old= 2533.13 new= 2262.66 r=0.937 [0.874..0.937] p10r=0.929
+b=16 E=16 ppr=6 P=16 gbound=384 bound-grid cold-rotating | cand dn2_r2 vs base chain (builders+kwide+q n=5 old= 2730.08 new= 2554.23 r=0.930 [0.890..0.938] p10r=0.935
+b=1 E=16 ppr=6 P=16 gbound=384 bound-grid cold-rotating | cand dn2_r2 vs base chain (builders+kwide+q n=5 old= 878.14 new= 820.43 r=0.944 [0.874..0.972] p10r=0.967
+b=24 E=16 ppr=6 P=16 gbound=384 bound-grid cold-rotating | cand dn2_r2 vs base chain (builders+kwide+q n=4 old= 3713.18 new= 3305.35 r=0.893 [0.842..0.929] p10r=0.894
+b=2 E=16 ppr=6 P=16 gbound=384 bound-grid cold-rotating | cand dn2_r2 vs base chain (builders+kwide+q n=5 old= 1466.51 new= 1197.40 r=0.876 [0.585..0.973] p10r=0.962
+b=32 E=16 ppr=6 P=16 gbound=384 bound-grid cold-rotating | cand dn2_r2 vs base chain (builders+kwide+q n=4 old= 4120.43 new= 3697.72 r=0.900 [0.791..0.928] p10r=0.921
+b=3 E=16 ppr=6 P=16 gbound=384 bound-grid cold-rotating | cand dn2_r2 vs base chain (builders+kwide+q n=5 old= 1630.48 new= 1530.10 r=0.938 [0.882..0.955] p10r=0.951
+b=4 E=16 ppr=6 P=16 gbound=384 bound-grid cold-rotating | cand dn2_r2 vs base chain (builders+kwide+q n=5 old= 1956.44 new= 1808.18 r=0.924 [0.908..0.952] p10r=0.949
+b=5 E=16 ppr=6 P=16 gbound=384 bound-grid cold-rotating | cand dn2_r2 vs base chain (builders+kwide+q n=5 old= 2090.10 new= 2032.87 r=0.855 [0.747..0.973] p10r=0.944
+b=64 E=16 ppr=6 P=16 gbound=384 bound-grid cold-rotating | cand dn2_r2 vs base chain (builders+kwide+q n=4 old= 5873.58 new= 5302.64 r=0.902 [0.748..0.904] p10r=0.900
+b=6 E=16 ppr=6 P=16 gbound=384 bound-grid cold-rotating | cand dn2_r2 vs base chain (builders+kwide+q n=5 old= 2510.35 new= 2191.24 r=0.931 [0.766..0.978] p10r=0.940
+b=8 E=16 ppr=6 P=16 gbound=384 bound-grid cold-rotating | cand dn2_r2 vs base chain (builders+kwide+q n=5 old= 2424.16 new= 2354.84 r=0.971 [0.784..1.031] p10r=0.942

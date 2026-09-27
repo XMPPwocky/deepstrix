@@ -11,7 +11,7 @@ for spec in "$@"; do
     label=${spec%%|*}; rest=${spec#*|}; envs=${rest%%|*}; stem=${rest#*|}
     echo "### $label ($stem${envs:+, $envs})"
     # shellcheck disable=SC2086
-    out=$(env $envs "$(bin "$stem")" --ignored --test-threads=1 --nocapture 2>&1); r=$?
+    out=$(env $envs "$(bin "$stem")" --include-ignored --test-threads=1 --nocapture 2>&1); r=$?
     echo "$out" | grep -E "$filt" | tail -40
     echo "### rc=$r"
     [ $r -eq 0 ] || rc=1

@@ -1,0 +1,221 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP rms n=5120 b=1 bit_diff=0
+CMP rms n=1280 b=1 bit_diff=0
+CMP rms n=512 b=1 bit_diff=0
+
+== rms b=1 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old n=5120                                    11.01      10.93      11.40    1.000       0.0       0.0
+fast n=5120                                    4.67       4.63       5.02    0.424       0.0       0.0
+old n=1280                                     5.46       5.42       5.96    0.496       0.0       0.0
+fast n=1280                                    3.97       3.93       4.34    0.361       0.0       0.0
+old n=512                                      4.40       4.36       4.95    0.400       0.0       0.0
+fast n=512                                     3.86       3.82       4.35    0.350       0.0       0.0
+old head rms_norm_weighted (1)                11.03      10.94      11.67    1.002       0.0       0.0
+fast head (1)                                  4.65       4.62       5.32    0.422       0.0       0.0
+KBJSON {"tag":"rms b=1 warm graph","variant":"old n=5120","med_us":11.012,"p10_us":10.928,"p90_us":11.400,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=1 warm graph","variant":"fast n=5120","med_us":4.668,"p10_us":4.628,"p90_us":5.024,"ratio":0.4239,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=1 warm graph","variant":"old n=1280","med_us":5.464,"p10_us":5.420,"p90_us":5.964,"ratio":0.4962,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=1 warm graph","variant":"fast n=1280","med_us":3.972,"p10_us":3.932,"p90_us":4.340,"ratio":0.3607,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=1 warm graph","variant":"old n=512","med_us":4.400,"p10_us":4.356,"p90_us":4.952,"ratio":0.3996,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=1 warm graph","variant":"fast n=512","med_us":3.856,"p10_us":3.816,"p90_us":4.348,"ratio":0.3502,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=1 warm graph","variant":"old head rms_norm_weighted (1)","med_us":11.032,"p10_us":10.944,"p90_us":11.672,"ratio":1.0018,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=1 warm graph","variant":"fast head (1)","med_us":4.652,"p10_us":4.624,"p90_us":5.320,"ratio":0.4224,"gbps":0.00,"graph":1,"flush":0}
+CMP rms n=5120 b=2 bit_diff=0
+CMP rms n=1280 b=2 bit_diff=0
+CMP rms n=512 b=2 bit_diff=0
+
+== rms b=2 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old n=5120                                    11.03      10.87      21.71    1.000       0.0       0.0
+fast n=5120                                    4.80       4.66      11.52    0.435       0.0       0.0
+old n=1280                                     5.56       5.43       8.04    0.505       0.0       0.0
+fast n=1280                                    4.11       3.95      11.66    0.373       0.0       0.0
+old n=512                                      4.46       4.36      12.89    0.404       0.0       0.0
+fast n=512                                     3.94       3.81       7.17    0.358       0.0       0.0
+KBJSON {"tag":"rms b=2 warm graph","variant":"old n=5120","med_us":11.028,"p10_us":10.872,"p90_us":21.712,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=2 warm graph","variant":"fast n=5120","med_us":4.796,"p10_us":4.656,"p90_us":11.524,"ratio":0.4349,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=2 warm graph","variant":"old n=1280","med_us":5.564,"p10_us":5.432,"p90_us":8.044,"ratio":0.5045,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=2 warm graph","variant":"fast n=1280","med_us":4.108,"p10_us":3.952,"p90_us":11.656,"ratio":0.3725,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=2 warm graph","variant":"old n=512","med_us":4.456,"p10_us":4.364,"p90_us":12.892,"ratio":0.4041,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=2 warm graph","variant":"fast n=512","med_us":3.944,"p10_us":3.808,"p90_us":7.172,"ratio":0.3576,"gbps":0.00,"graph":1,"flush":0}
+CMP rms n=5120 b=3 bit_diff=0
+CMP rms n=1280 b=3 bit_diff=0
+CMP rms n=512 b=3 bit_diff=0
+
+== rms b=3 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old n=5120                                    10.94      10.87      16.19    1.000       0.0       0.0
+fast n=5120                                    4.75       4.65       5.24    0.434       0.0       0.0
+old n=1280                                     5.59       5.43       6.25    0.511       0.0       0.0
+fast n=1280                                    4.05       3.96       5.50    0.370       0.0       0.0
+old n=512                                      4.49       4.35       5.07    0.410       0.0       0.0
+fast n=512                                     3.96       3.82       4.27    0.362       0.0       0.0
+KBJSON {"tag":"rms b=3 warm graph","variant":"old n=5120","med_us":10.944,"p10_us":10.872,"p90_us":16.192,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=3 warm graph","variant":"fast n=5120","med_us":4.748,"p10_us":4.652,"p90_us":5.244,"ratio":0.4338,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=3 warm graph","variant":"old n=1280","med_us":5.588,"p10_us":5.432,"p90_us":6.248,"ratio":0.5106,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=3 warm graph","variant":"fast n=1280","med_us":4.052,"p10_us":3.960,"p90_us":5.500,"ratio":0.3702,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=3 warm graph","variant":"old n=512","med_us":4.488,"p10_us":4.352,"p90_us":5.072,"ratio":0.4101,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=3 warm graph","variant":"fast n=512","med_us":3.960,"p10_us":3.820,"p90_us":4.268,"ratio":0.3618,"gbps":0.00,"graph":1,"flush":0}
+CMP rms n=5120 b=4 bit_diff=0
+CMP rms n=1280 b=4 bit_diff=0
+CMP rms n=512 b=4 bit_diff=0
+
+== rms b=4 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old n=5120                                    10.83      10.80      10.86    1.000       0.0       0.0
+fast n=5120                                    4.66       4.64       4.68    0.431       0.0       0.0
+old n=1280                                     5.42       5.40       5.43    0.500       0.0       0.0
+fast n=1280                                    3.96       3.94       3.98    0.366       0.0       0.0
+old n=512                                      4.34       4.32       4.36    0.401       0.0       0.0
+fast n=512                                     3.81       3.80       3.82    0.352       0.0       0.0
+KBJSON {"tag":"rms b=4 warm graph","variant":"old n=5120","med_us":10.832,"p10_us":10.804,"p90_us":10.856,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=4 warm graph","variant":"fast n=5120","med_us":4.664,"p10_us":4.644,"p90_us":4.684,"ratio":0.4306,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=4 warm graph","variant":"old n=1280","med_us":5.416,"p10_us":5.396,"p90_us":5.432,"ratio":0.5000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=4 warm graph","variant":"fast n=1280","med_us":3.960,"p10_us":3.940,"p90_us":3.980,"ratio":0.3656,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=4 warm graph","variant":"old n=512","med_us":4.340,"p10_us":4.316,"p90_us":4.364,"ratio":0.4007,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=4 warm graph","variant":"fast n=512","med_us":3.808,"p10_us":3.796,"p90_us":3.824,"ratio":0.3516,"gbps":0.00,"graph":1,"flush":0}
+CMP rms n=5120 b=5 bit_diff=0
+CMP rms n=1280 b=5 bit_diff=0
+CMP rms n=512 b=5 bit_diff=0
+
+== rms b=5 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old n=5120                                    10.98      10.83      11.74    1.000       0.0       0.0
+fast n=5120                                    4.80       4.71       5.22    0.437       0.0       0.0
+old n=1280                                     5.54       5.43       5.85    0.505       0.0       0.0
+fast n=1280                                    4.13       4.00       4.70    0.376       0.0       0.0
+old n=512                                      4.47       4.37       4.86    0.407       0.0       0.0
+fast n=512                                     3.93       3.83       4.27    0.358       0.0       0.0
+KBJSON {"tag":"rms b=5 warm graph","variant":"old n=5120","med_us":10.980,"p10_us":10.832,"p90_us":11.736,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=5 warm graph","variant":"fast n=5120","med_us":4.800,"p10_us":4.708,"p90_us":5.224,"ratio":0.4372,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=5 warm graph","variant":"old n=1280","med_us":5.540,"p10_us":5.428,"p90_us":5.852,"ratio":0.5046,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=5 warm graph","variant":"fast n=1280","med_us":4.132,"p10_us":4.004,"p90_us":4.696,"ratio":0.3763,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=5 warm graph","variant":"old n=512","med_us":4.472,"p10_us":4.372,"p90_us":4.864,"ratio":0.4073,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=5 warm graph","variant":"fast n=512","med_us":3.928,"p10_us":3.828,"p90_us":4.272,"ratio":0.3577,"gbps":0.00,"graph":1,"flush":0}
+CMP rms n=5120 b=6 bit_diff=0
+CMP rms n=1280 b=6 bit_diff=0
+CMP rms n=512 b=6 bit_diff=0
+
+== rms b=6 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old n=5120                                    11.07      10.82      15.96    1.000       0.0       0.0
+fast n=5120                                    4.95       4.70      11.40    0.447       0.0       0.0
+old n=1280                                     5.66       5.41      10.72    0.512       0.0       0.0
+fast n=1280                                    4.21       3.98       6.92    0.381       0.0       0.0
+old n=512                                      4.50       4.35       9.98    0.407       0.0       0.0
+fast n=512                                     4.00       3.82      11.06    0.361       0.0       0.0
+KBJSON {"tag":"rms b=6 warm graph","variant":"old n=5120","med_us":11.068,"p10_us":10.816,"p90_us":15.960,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=6 warm graph","variant":"fast n=5120","med_us":4.948,"p10_us":4.696,"p90_us":11.396,"ratio":0.4471,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=6 warm graph","variant":"old n=1280","med_us":5.664,"p10_us":5.412,"p90_us":10.716,"ratio":0.5117,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=6 warm graph","variant":"fast n=1280","med_us":4.212,"p10_us":3.976,"p90_us":6.920,"ratio":0.3806,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=6 warm graph","variant":"old n=512","med_us":4.500,"p10_us":4.352,"p90_us":9.976,"ratio":0.4066,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=6 warm graph","variant":"fast n=512","med_us":3.996,"p10_us":3.824,"p90_us":11.056,"ratio":0.3610,"gbps":0.00,"graph":1,"flush":0}
+CMP rms n=5120 b=8 bit_diff=0
+CMP rms n=1280 b=8 bit_diff=0
+CMP rms n=512 b=8 bit_diff=0
+
+== rms b=8 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old n=5120                                    10.90      10.78      11.13    1.000       0.0       0.0
+fast n=5120                                    4.82       4.72       5.05    0.443       0.0       0.0
+old n=1280                                     5.50       5.43       5.79    0.505       0.0       0.0
+fast n=1280                                    4.08       3.96       4.30    0.375       0.0       0.0
+old n=512                                      4.45       4.34       4.75    0.408       0.0       0.0
+fast n=512                                     3.92       3.81       4.28    0.360       0.0       0.0
+KBJSON {"tag":"rms b=8 warm graph","variant":"old n=5120","med_us":10.900,"p10_us":10.784,"p90_us":11.128,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=8 warm graph","variant":"fast n=5120","med_us":4.824,"p10_us":4.720,"p90_us":5.052,"ratio":0.4426,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=8 warm graph","variant":"old n=1280","med_us":5.504,"p10_us":5.432,"p90_us":5.788,"ratio":0.5050,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=8 warm graph","variant":"fast n=1280","med_us":4.084,"p10_us":3.960,"p90_us":4.296,"ratio":0.3747,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=8 warm graph","variant":"old n=512","med_us":4.452,"p10_us":4.340,"p90_us":4.752,"ratio":0.4084,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=8 warm graph","variant":"fast n=512","med_us":3.924,"p10_us":3.812,"p90_us":4.276,"ratio":0.3600,"gbps":0.00,"graph":1,"flush":0}
+CMP rms n=5120 b=12 bit_diff=0
+CMP rms n=1280 b=12 bit_diff=0
+CMP rms n=512 b=12 bit_diff=0
+
+== rms b=12 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old n=5120                                    11.02      10.79      16.60    1.000       0.0       0.0
+fast n=5120                                    5.05       4.81       6.19    0.458       0.0       0.0
+old n=1280                                     5.87       5.46       8.47    0.533       0.0       0.0
+fast n=1280                                    4.35       4.05       9.84    0.395       0.0       0.0
+old n=512                                      4.72       4.38      15.10    0.429       0.0       0.0
+fast n=512                                     4.19       3.86      13.74    0.381       0.0       0.0
+KBJSON {"tag":"rms b=12 warm graph","variant":"old n=5120","med_us":11.016,"p10_us":10.788,"p90_us":16.600,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=12 warm graph","variant":"fast n=5120","med_us":5.048,"p10_us":4.812,"p90_us":6.192,"ratio":0.4582,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=12 warm graph","variant":"old n=1280","med_us":5.872,"p10_us":5.456,"p90_us":8.472,"ratio":0.5331,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=12 warm graph","variant":"fast n=1280","med_us":4.348,"p10_us":4.048,"p90_us":9.836,"ratio":0.3947,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=12 warm graph","variant":"old n=512","med_us":4.724,"p10_us":4.384,"p90_us":15.100,"ratio":0.4288,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=12 warm graph","variant":"fast n=512","med_us":4.192,"p10_us":3.856,"p90_us":13.744,"ratio":0.3805,"gbps":0.00,"graph":1,"flush":0}
+CMP rms n=5120 b=16 bit_diff=0
+CMP rms n=1280 b=16 bit_diff=0
+CMP rms n=512 b=16 bit_diff=0
+
+== rms b=16 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old n=5120                                    10.94      10.77      11.62    1.000       0.0       0.0
+fast n=5120                                    4.97       4.81       5.46    0.454       0.0       0.0
+old n=1280                                     5.61       5.44       6.01    0.513       0.0       0.0
+fast n=1280                                    4.10       4.00       4.36    0.375       0.0       0.0
+old n=512                                      4.45       4.36       4.86    0.407       0.0       0.0
+fast n=512                                     3.93       3.81       4.24    0.359       0.0       0.0
+KBJSON {"tag":"rms b=16 warm graph","variant":"old n=5120","med_us":10.940,"p10_us":10.772,"p90_us":11.620,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=16 warm graph","variant":"fast n=5120","med_us":4.972,"p10_us":4.808,"p90_us":5.456,"ratio":0.4545,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=16 warm graph","variant":"old n=1280","med_us":5.608,"p10_us":5.444,"p90_us":6.008,"ratio":0.5126,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=16 warm graph","variant":"fast n=1280","med_us":4.104,"p10_us":4.000,"p90_us":4.360,"ratio":0.3751,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=16 warm graph","variant":"old n=512","med_us":4.452,"p10_us":4.356,"p90_us":4.856,"ratio":0.4070,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=16 warm graph","variant":"fast n=512","med_us":3.932,"p10_us":3.812,"p90_us":4.240,"ratio":0.3594,"gbps":0.00,"graph":1,"flush":0}
+CMP rms n=5120 b=64 bit_diff=0
+CMP rms n=1280 b=64 bit_diff=0
+CMP rms n=512 b=64 bit_diff=0
+
+== rms b=64 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old n=5120                                    11.02      10.98      11.07    1.000       0.0       0.0
+fast n=5120                                    5.81       5.77       5.83    0.527       0.0       0.0
+old n=1280                                     5.50       5.47       5.52    0.499       0.0       0.0
+fast n=1280                                    4.28       4.25       4.30    0.388       0.0       0.0
+old n=512                                      4.38       4.35       4.41    0.397       0.0       0.0
+fast n=512                                     3.94       3.91       3.96    0.357       0.0       0.0
+KBJSON {"tag":"rms b=64 warm graph","variant":"old n=5120","med_us":11.020,"p10_us":10.980,"p90_us":11.072,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=64 warm graph","variant":"fast n=5120","med_us":5.812,"p10_us":5.772,"p90_us":5.832,"ratio":0.5274,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=64 warm graph","variant":"old n=1280","med_us":5.500,"p10_us":5.468,"p90_us":5.524,"ratio":0.4991,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=64 warm graph","variant":"fast n=1280","med_us":4.280,"p10_us":4.248,"p90_us":4.300,"ratio":0.3884,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=64 warm graph","variant":"old n=512","med_us":4.376,"p10_us":4.352,"p90_us":4.408,"ratio":0.3971,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=64 warm graph","variant":"fast n=512","med_us":3.936,"p10_us":3.912,"p90_us":3.964,"ratio":0.3572,"gbps":0.00,"graph":1,"flush":0}
+CMP rms n=5120 b=512 bit_diff=0
+CMP rms n=1280 b=512 bit_diff=0
+CMP rms n=512 b=512 bit_diff=0
+
+== rms b=512 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old n=5120                                    32.28      32.04      35.36    1.000       0.0       0.0
+fast n=5120                                   24.87      23.32      26.21    0.770       0.0       0.0
+old n=1280                                    21.32      21.23      22.38    0.660       0.0       0.0
+fast n=1280                                   12.89      10.46      15.36    0.399       0.0       0.0
+old n=512                                     19.09      19.02      20.09    0.591       0.0       0.0
+fast n=512                                    18.75      18.70      19.66    0.581       0.0       0.0
+KBJSON {"tag":"rms b=512 warm graph","variant":"old n=5120","med_us":32.284,"p10_us":32.036,"p90_us":35.364,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=512 warm graph","variant":"fast n=5120","med_us":24.868,"p10_us":23.324,"p90_us":26.212,"ratio":0.7703,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=512 warm graph","variant":"old n=1280","med_us":21.316,"p10_us":21.228,"p90_us":22.376,"ratio":0.6603,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=512 warm graph","variant":"fast n=1280","med_us":12.892,"p10_us":10.464,"p90_us":15.364,"ratio":0.3993,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=512 warm graph","variant":"old n=512","med_us":19.092,"p10_us":19.020,"p90_us":20.088,"ratio":0.5914,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=512 warm graph","variant":"fast n=512","med_us":18.752,"p10_us":18.696,"p90_us":19.664,"ratio":0.5808,"gbps":0.00,"graph":1,"flush":0}
+CMP rms n=5120 b=1024 bit_diff=0
+CMP rms n=1280 b=1024 bit_diff=0
+CMP rms n=512 b=1024 bit_diff=0
+
+== rms b=1024 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old n=5120                                    49.30      47.89      51.86    1.000       0.0       0.0
+fast n=5120                                   40.06      39.79      41.12    0.813       0.0       0.0
+old n=1280                                    27.93      25.82      28.80    0.567       0.0       0.0
+fast n=1280                                   13.47      12.16      14.85    0.273       0.0       0.0
+old n=512                                     23.08      22.92      24.14    0.468       0.0       0.0
+fast n=512                                     8.67       8.62       9.42    0.176       0.0       0.0
+KBJSON {"tag":"rms b=1024 warm graph","variant":"old n=5120","med_us":49.300,"p10_us":47.892,"p90_us":51.860,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=1024 warm graph","variant":"fast n=5120","med_us":40.060,"p10_us":39.788,"p90_us":41.124,"ratio":0.8126,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=1024 warm graph","variant":"old n=1280","med_us":27.932,"p10_us":25.820,"p90_us":28.796,"ratio":0.5666,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=1024 warm graph","variant":"fast n=1280","med_us":13.468,"p10_us":12.160,"p90_us":14.852,"ratio":0.2732,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=1024 warm graph","variant":"old n=512","med_us":23.076,"p10_us":22.916,"p90_us":24.136,"ratio":0.4681,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms b=1024 warm graph","variant":"fast n=512","med_us":8.672,"p10_us":8.616,"p90_us":9.416,"ratio":0.1759,"gbps":0.00,"graph":1,"flush":0}

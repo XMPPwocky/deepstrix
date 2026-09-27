@@ -1,0 +1,24 @@
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+[h] pool: 16 experts x 18.8 MB = 301 MB on device
+[h] b=3 E=16 ppr=6: members/call=18.0 distinct experts/call=16 n_wi exact=11 bound=18
+[h] distinct experts actually read per call (avg over 8 selections): 12.12
+base out: 15360/15360 nonzero, 0 nonfinite, out[0..3]=271.854 -57.6155 542.718 -634.08
+CMP twin(hetsplit b=1 per row) mid vs base n=41472 bitexact=no bit_diff=27675 nonfinite=0 max_abs=3.052e-05 max_rel=3.880e-03 rmse=2.463e-06 rel_rmse=1.897e-07 worst_idx=41019
+KBJSON {"cmp":"twin(hetsplit b=1 per row) mid vs base","bitexact":0,"bit_diff":27675,"nonfinite":0,"max_abs":3.0518e-05,"rel_rmse":1.8971e-07}
+CMP twin(hetsplit b=1 per row) out vs base n=15360 bitexact=no bit_diff=12551 nonfinite=0 max_abs=4.146e-01 max_rel=7.107e-01 rmse=4.857e-02 rel_rmse=1.069e-04 worst_idx=8784
+KBJSON {"cmp":"twin(hetsplit b=1 per row) out vs base","bitexact":0,"bit_diff":12551,"nonfinite":0,"max_abs":4.1455e-01,"rel_rmse":1.0695e-04}
+CMP dn2_r2 mid vs base                 n=41472 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"dn2_r2 mid vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP dn2_r2 partials vs base            n=92160 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"dn2_r2 partials vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP dn2_r2 out vs base                 n=15360 bitexact=YES bit_diff=0 nonfinite=0 max_abs=0.000e+00 max_rel=0.000e+00 rmse=0.000e+00 rel_rmse=0.000e+00 worst_idx=0
+KBJSON {"cmp":"dn2_r2 out vs base","bitexact":1,"bit_diff":0,"nonfinite":0,"max_abs":0.0000e+00,"rel_rmse":0.0000e+00}
+CMP dn2_r2 out over 8 selections: worst bit_diff=0 worst rel_rmse=0.000e+00
+
+== b=3 E=16 ppr=6 P=16 gbound=384 bound-grid cold-rotating  (rounds=30 inner=8 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base chain (builders+kwide+q8k+kwide2+reduce)    1352.22    1338.05    5466.23    1.000     168.6     942.2
+cand dn2_r2                                 1291.74    1273.81    1973.32    0.955     176.5     986.3
+KBJSON {"tag":"b=3 E=16 ppr=6 P=16 gbound=384 bound-grid cold-rotating","variant":"base chain (builders+kwide+q8k+kwide2+reduce)","med_us":1352.217,"p10_us":1338.052,"p90_us":5466.226,"ratio":1.0000,"gbps":168.58,"graph":1,"flush":0}
+KBJSON {"tag":"b=3 E=16 ppr=6 P=16 gbound=384 bound-grid cold-rotating","variant":"cand dn2_r2","med_us":1291.739,"p10_us":1273.814,"p90_us":1973.317,"ratio":0.9553,"gbps":176.47,"graph":1,"flush":0}
+roofline: 12.12 distinct experts x 18.8 MB = 228.0 MB/call -> 1065.2 us at 214 GB/s (986.8 us at 231)

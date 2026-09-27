@@ -1,0 +1,113 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP topk b=1 diff=0
+
+== topk prior b=1 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old router_topk_par prior (b)x512             11.74      11.67      11.92    1.000       0.0       0.0
+wfred prior (b)x512                            9.58       9.46       9.69    0.816       0.0       0.0
+KBJSON {"tag":"topk prior b=1 warm graph","variant":"old router_topk_par prior (b)x512","med_us":11.740,"p10_us":11.672,"p90_us":11.920,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"topk prior b=1 warm graph","variant":"wfred prior (b)x512","med_us":9.584,"p10_us":9.464,"p90_us":9.692,"ratio":0.8164,"gbps":0.00,"graph":1,"flush":0}
+CMP topk b=2 diff=0
+
+== topk prior b=2 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old router_topk_par prior (b)x512             11.85      11.73      12.00    1.000       0.0       0.0
+wfred prior (b)x512                            9.50       9.42       9.71    0.802       0.0       0.0
+KBJSON {"tag":"topk prior b=2 warm graph","variant":"old router_topk_par prior (b)x512","med_us":11.852,"p10_us":11.728,"p90_us":12.000,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"topk prior b=2 warm graph","variant":"wfred prior (b)x512","med_us":9.504,"p10_us":9.424,"p90_us":9.708,"ratio":0.8019,"gbps":0.00,"graph":1,"flush":0}
+CMP topk b=3 diff=0
+
+== topk prior b=3 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old router_topk_par prior (b)x512             11.74      11.64      12.16    1.000       0.0       0.0
+wfred prior (b)x512                            9.54       9.40       9.82    0.813       0.0       0.0
+KBJSON {"tag":"topk prior b=3 warm graph","variant":"old router_topk_par prior (b)x512","med_us":11.740,"p10_us":11.640,"p90_us":12.156,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"topk prior b=3 warm graph","variant":"wfred prior (b)x512","med_us":9.544,"p10_us":9.396,"p90_us":9.816,"ratio":0.8129,"gbps":0.00,"graph":1,"flush":0}
+CMP topk b=4 diff=0
+
+== topk prior b=4 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old router_topk_par prior (b)x512             11.83      11.63      12.18    1.000       0.0       0.0
+wfred prior (b)x512                            9.56       9.42       9.84    0.808       0.0       0.0
+KBJSON {"tag":"topk prior b=4 warm graph","variant":"old router_topk_par prior (b)x512","med_us":11.832,"p10_us":11.632,"p90_us":12.180,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"topk prior b=4 warm graph","variant":"wfred prior (b)x512","med_us":9.556,"p10_us":9.424,"p90_us":9.840,"ratio":0.8076,"gbps":0.00,"graph":1,"flush":0}
+CMP topk b=5 diff=0
+
+== topk prior b=5 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old router_topk_par prior (b)x512             11.59      11.54      11.63    1.000       0.0       0.0
+wfred prior (b)x512                            9.39       9.36       9.42    0.810       0.0       0.0
+KBJSON {"tag":"topk prior b=5 warm graph","variant":"old router_topk_par prior (b)x512","med_us":11.592,"p10_us":11.540,"p90_us":11.628,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"topk prior b=5 warm graph","variant":"wfred prior (b)x512","med_us":9.388,"p10_us":9.356,"p90_us":9.420,"ratio":0.8099,"gbps":0.00,"graph":1,"flush":0}
+CMP topk b=6 diff=0
+
+== topk prior b=6 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old router_topk_par prior (b)x512             11.58      11.53      11.62    1.000       0.0       0.0
+wfred prior (b)x512                            9.39       9.36       9.42    0.811       0.0       0.0
+KBJSON {"tag":"topk prior b=6 warm graph","variant":"old router_topk_par prior (b)x512","med_us":11.576,"p10_us":11.532,"p90_us":11.624,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"topk prior b=6 warm graph","variant":"wfred prior (b)x512","med_us":9.388,"p10_us":9.356,"p90_us":9.416,"ratio":0.8110,"gbps":0.00,"graph":1,"flush":0}
+CMP topk b=8 diff=0
+
+== topk prior b=8 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old router_topk_par prior (b)x512             12.18      11.58      12.45    1.000       0.0       0.0
+wfred prior (b)x512                            9.68       9.41      10.34    0.795       0.0       0.0
+KBJSON {"tag":"topk prior b=8 warm graph","variant":"old router_topk_par prior (b)x512","med_us":12.184,"p10_us":11.584,"p90_us":12.448,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"topk prior b=8 warm graph","variant":"wfred prior (b)x512","med_us":9.684,"p10_us":9.412,"p90_us":10.344,"ratio":0.7948,"gbps":0.00,"graph":1,"flush":0}
+CMP topk b=12 diff=0
+
+== topk prior b=12 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old router_topk_par prior (b)x512             11.58      11.54      11.62    1.000       0.0       0.0
+wfred prior (b)x512                            9.42       9.40       9.46    0.814       0.0       0.0
+KBJSON {"tag":"topk prior b=12 warm graph","variant":"old router_topk_par prior (b)x512","med_us":11.580,"p10_us":11.540,"p90_us":11.616,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"topk prior b=12 warm graph","variant":"wfred prior (b)x512","med_us":9.424,"p10_us":9.396,"p90_us":9.464,"ratio":0.8138,"gbps":0.00,"graph":1,"flush":0}
+CMP topk b=16 diff=0
+
+== topk prior b=16 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old router_topk_par prior (b)x512             11.90      11.57      42.90    1.000       0.0       0.0
+wfred prior (b)x512                            9.69       9.45      22.70    0.814       0.0       0.0
+KBJSON {"tag":"topk prior b=16 warm graph","variant":"old router_topk_par prior (b)x512","med_us":11.904,"p10_us":11.572,"p90_us":42.900,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"topk prior b=16 warm graph","variant":"wfred prior (b)x512","med_us":9.692,"p10_us":9.448,"p90_us":22.700,"ratio":0.8142,"gbps":0.00,"graph":1,"flush":0}
+CMP topk b=24 diff=0
+
+== topk prior b=24 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old router_topk_par prior (b)x512             11.55      11.53      11.57    1.000       0.0       0.0
+wfred prior (b)x512                            9.45       9.43       9.46    0.818       0.0       0.0
+KBJSON {"tag":"topk prior b=24 warm graph","variant":"old router_topk_par prior (b)x512","med_us":11.548,"p10_us":11.528,"p90_us":11.568,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"topk prior b=24 warm graph","variant":"wfred prior (b)x512","med_us":9.448,"p10_us":9.432,"p90_us":9.464,"ratio":0.8182,"gbps":0.00,"graph":1,"flush":0}
+CMP topk b=32 diff=0
+
+== topk prior b=32 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old router_topk_par prior (b)x512             11.53      11.50      11.58    1.000       0.0       0.0
+wfred prior (b)x512                            9.46       9.42       9.50    0.820       0.0       0.0
+KBJSON {"tag":"topk prior b=32 warm graph","variant":"old router_topk_par prior (b)x512","med_us":11.532,"p10_us":11.500,"p90_us":11.576,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"topk prior b=32 warm graph","variant":"wfred prior (b)x512","med_us":9.456,"p10_us":9.424,"p90_us":9.504,"ratio":0.8200,"gbps":0.00,"graph":1,"flush":0}
+CMP topk b=64 diff=0
+
+== topk prior b=64 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old router_topk_par prior (b)x512             12.03      11.82      12.38    1.000       0.0       0.0
+wfred prior (b)x512                           10.69      10.34      19.01    0.889       0.0       0.0
+KBJSON {"tag":"topk prior b=64 warm graph","variant":"old router_topk_par prior (b)x512","med_us":12.028,"p10_us":11.824,"p90_us":12.376,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"topk prior b=64 warm graph","variant":"wfred prior (b)x512","med_us":10.688,"p10_us":10.340,"p90_us":19.008,"ratio":0.8886,"gbps":0.00,"graph":1,"flush":0}
+CMP topk b=128 diff=0
+
+== topk prior b=128 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old router_topk_par prior (b)x512             16.61      16.58      16.72    1.000       0.0       0.0
+wfred prior (b)x512                           16.63      16.60      16.72    1.001       0.0       0.0
+KBJSON {"tag":"topk prior b=128 warm graph","variant":"old router_topk_par prior (b)x512","med_us":16.612,"p10_us":16.584,"p90_us":16.716,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"topk prior b=128 warm graph","variant":"wfred prior (b)x512","med_us":16.628,"p10_us":16.604,"p90_us":16.724,"ratio":1.0010,"gbps":0.00,"graph":1,"flush":0}
+CMP topk b=512 diff=0
+
+== topk prior b=512 warm graph  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+old router_topk_par prior (b)x512             44.99      44.85      47.41    1.000       0.0       0.0
+wfred prior (b)x512                           46.58      46.25      47.78    1.035       0.0       0.0
+KBJSON {"tag":"topk prior b=512 warm graph","variant":"old router_topk_par prior (b)x512","med_us":44.992,"p10_us":44.848,"p90_us":47.408,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"topk prior b=512 warm graph","variant":"wfred prior (b)x512","med_us":46.584,"p10_us":46.252,"p90_us":47.776,"ratio":1.0354,"gbps":0.00,"graph":1,"flush":0}

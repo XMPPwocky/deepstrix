@@ -164,12 +164,26 @@ pub const GEMV_BPACK_Z16_MAX: u32 = 64;
 /// 1498 -> 537, wo_a 1210 -> 535, kv 52 -> 47; -2.57 ms per replay lane-layer.
 /// Also off under `V41_GEMV_BPACK=0` (the b-packing rollback). The head's
 /// `matvec_bpack` keeps its 16-row cap (its scratch is sized on it).
-fn bpack_z16_for(batch: u32) -> bool {
+///
+/// Shape gate (2026-09-27 round-2 crossover scan, b_crossover, cold, 4-5 runs):
+/// the z16 grid has ceil(b/16) x fewer WGs than grid.z = b, which starves the
+/// small-M projections below ~48 rows: kv (M = 512) LOSES x1.72 at b = 17 and
+/// x1.11 at 32 (wins 0.83-0.88 from 48), q_a (M = 1280) LOSES x1.14 at 17 (0.80
+/// at 48). M >= 2048 (q_b, wo_b, shared gate/up/down, grouped wo_a) wins at
+/// every 17..64 (0.31-0.54). So: z16 when `n_rows >= Z16_MIN_ROWS_ANY_B` or
+/// `batch >= Z16_MIN_BATCH_SMALL_M`.
+pub fn bpack_z16_for(batch: u32, n_rows: u32) -> bool {
     static D: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("V41_GEMV_BPACK_Z16").as_deref() != Ok("0"));
     // bpack_ok(1) == "V41_GEMV_BPACK is not 0".
     *D && batch > GEMV_BPACK_MAX && batch <= GEMV_BPACK_Z16_MAX && bpack_ok(1)
+        && (n_rows >= Z16_MIN_ROWS_ANY_B || batch >= Z16_MIN_BATCH_SMALL_M)
 }
+
+/// See [`bpack_z16_for`]: output rows from which z16 wins at every 16 < b <= 64.
+pub const Z16_MIN_ROWS_ANY_B: u32 = 2048;
+/// See [`bpack_z16_for`]: batch from which z16 also wins on kv / q_a.
+pub const Z16_MIN_BATCH_SMALL_M: u32 = 48;
 
 /// `V41_ENGRAM_I8X` (default ON; `0` = `q8_0_gemm_wmma_lds_tiled`): the prefill
 /// Engram wkv GEMM (M = 25600, K = 6144, int8 + xscale activations) runs
@@ -241,11 +255,20 @@ pub fn f16x_tile_q_a(m: u32, batch: u32) -> F16xTile {
     if f16x_db_bn64_on() && m <= 1280 && batch <= 512 { F16xTile::DbBn64 } else { F16xTile::Base }
 }
 
-/// Tile for the q_b / wo_a prefill projections: `T256x128` above 64 rows when
-/// M % 256 == 0.
+/// Tile for the q_b / wo_a prefill projections: `T256x128` from
+/// `F16X_256_MIN_ROWS` rows when M % 256 == 0.
+///
+/// 2026-09-27 round-2 crossover scan (b_crossover, cold, 4 runs): below ~192
+/// rows the 256x128 tile LOSES on q_b (x1.27 at b = 65, x1.18 at 128; 0.96 at
+/// 192) and is neutral on wo_a (0.98 / 1.01 at 65 / 128; 0.89 at 192, 0.89 at
+/// 384) -- the round-1 gate was `b > 64`, which put every 65..191-row prefill
+/// tail chunk on the slower tile.
 pub fn f16x_tile_qb_wo_a(m: u32, batch: u32) -> F16xTile {
-    if f16x_256_on() && m % 256 == 0 && batch > 64 { F16xTile::T256x128 } else { F16xTile::Base }
+    if f16x_256_on() && m % 256 == 0 && batch >= F16X_256_MIN_ROWS { F16xTile::T256x128 } else { F16xTile::Base }
 }
+
+/// See [`f16x_tile_qb_wo_a`].
+pub const F16X_256_MIN_ROWS: u32 = 192;
 
 
 #[allow(non_camel_case_types)]
@@ -482,7 +505,7 @@ impl Q8_0Matvec {
         if bpack_ok(batch) {
             return self.matvec_bpack(stream, out, weight, xq, xscale, n_rows, k, batch);
         }
-        if bpack_z16_for(batch) {
+        if bpack_z16_for(batch, n_rows) {
             // `V41_GEMV_BPACK_Z16`: the bpack16 body over 16-row slices on grid.z
             // (replay b <= 64), bit-identical; 2026-09-26 sweep: q_b 1508 -> 576 us at b=64.
             let function = self.module.get_function("q8_0_gemv_bpack_z16")?;
@@ -1192,7 +1215,7 @@ impl Q8_0GroupedMatvec {
                 stream, out, weight, xq, xscale, group_dim, rank, n_groups, batch,
             );
         }
-        if bpack_z16_for(batch) {
+        if bpack_z16_for(batch, out_dim) {
             // `V41_GEMV_BPACK_Z16`: grouped bpack16 body over 16-row grid.z slices
             // (replay b <= 64), bit-identical; 2026-09-26 sweep: wo_a 1210 -> 535 us at b=64.
             let function = self.module.get_function("q8_0_grouped_gemv_bpack_z16")?;

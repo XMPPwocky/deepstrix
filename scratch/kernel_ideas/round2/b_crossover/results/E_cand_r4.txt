@@ -1,0 +1,172 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP candidate_threshold_ilp            n=131072 b=1 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp n=131072 b=1","bitexact":1,"bit_diff":0}
+CMP candidate_threshold_ilp512         n=131072 b=1 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp512 n=131072 b=1","bitexact":1,"bit_diff":0}
+
+== candidate pool n=131072 b=1 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base L20 build: block_max + threshold         86.10      62.50     139.11    1.000       6.1       0.0
+base candidate_block_max                       9.83       5.38      55.93    0.114      53.3       0.0
+base candidate_threshold                      78.94      60.58     132.77    0.917       3.3       0.0
+cand candidate_threshold_ilp                  52.95      34.30      78.14    0.615       5.0       0.0
+cand candidate_threshold_ilp512               53.76      35.56      61.21    0.624       4.9       0.0
+base L24+ candidate_mask_apply                20.78      20.21      50.10    0.241      25.2       0.0
+KBJSON {"tag":"candidate pool n=131072 b=1 WARM scores, graph inner=5","variant":"base L20 build: block_max + threshold","med_us":86.097,"p10_us":62.496,"p90_us":139.113,"ratio":1.0000,"gbps":6.09,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=1 WARM scores, graph inner=5","variant":"base candidate_block_max","med_us":9.832,"p10_us":5.384,"p90_us":55.928,"ratio":0.1142,"gbps":53.32,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=1 WARM scores, graph inner=5","variant":"base candidate_threshold","med_us":78.945,"p10_us":60.584,"p90_us":132.769,"ratio":0.9169,"gbps":3.32,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=1 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp","med_us":52.952,"p10_us":34.296,"p90_us":78.145,"ratio":0.6150,"gbps":4.95,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=1 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp512","med_us":53.760,"p10_us":35.560,"p90_us":61.208,"ratio":0.6244,"gbps":4.88,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=1 WARM scores, graph inner=5","variant":"base L24+ candidate_mask_apply","med_us":20.784,"p10_us":20.208,"p90_us":50.096,"ratio":0.2414,"gbps":25.23,"graph":1,"flush":0}
+CMP candidate_threshold_ilp            n=131072 b=2 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp n=131072 b=2","bitexact":1,"bit_diff":0}
+CMP candidate_threshold_ilp512         n=131072 b=2 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp512 n=131072 b=2","bitexact":1,"bit_diff":0}
+
+== candidate pool n=131072 b=2 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base L20 build: block_max + threshold         72.07      71.27     136.33    1.000      14.5       0.0
+base candidate_block_max                       5.84       5.45       7.30    0.081     179.6       0.0
+base candidate_threshold                      68.18      67.31     117.51    0.946       7.7       0.0
+cand candidate_threshold_ilp                  42.06      41.48      56.85    0.584      12.5       0.0
+cand candidate_threshold_ilp512               43.22      42.72      53.28    0.600      12.1       0.0
+base L24+ candidate_mask_apply                20.13      16.02      22.81    0.279      52.1       0.0
+KBJSON {"tag":"candidate pool n=131072 b=2 WARM scores, graph inner=5","variant":"base L20 build: block_max + threshold","med_us":72.072,"p10_us":71.272,"p90_us":136.329,"ratio":1.0000,"gbps":14.55,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=2 WARM scores, graph inner=5","variant":"base candidate_block_max","med_us":5.840,"p10_us":5.448,"p90_us":7.296,"ratio":0.0810,"gbps":179.55,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=2 WARM scores, graph inner=5","variant":"base candidate_threshold","med_us":68.176,"p10_us":67.312,"p90_us":117.513,"ratio":0.9459,"gbps":7.69,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=2 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp","med_us":42.064,"p10_us":41.480,"p90_us":56.848,"ratio":0.5836,"gbps":12.46,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=2 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp512","med_us":43.224,"p10_us":42.720,"p90_us":53.280,"ratio":0.5997,"gbps":12.13,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=2 WARM scores, graph inner=5","variant":"base L24+ candidate_mask_apply","med_us":20.128,"p10_us":16.024,"p90_us":22.808,"ratio":0.2793,"gbps":52.09,"graph":1,"flush":0}
+CMP candidate_threshold_ilp            n=131072 b=3 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp n=131072 b=3","bitexact":1,"bit_diff":0}
+CMP candidate_threshold_ilp512         n=131072 b=3 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp512 n=131072 b=3","bitexact":1,"bit_diff":0}
+
+== candidate pool n=131072 b=3 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base L20 build: block_max + threshold         95.29      71.50     165.64    1.000      16.5       0.0
+base candidate_block_max                      25.96       5.70      50.78    0.272      60.6       0.0
+base candidate_threshold                      87.50      67.74     137.76    0.918       9.0       0.0
+cand candidate_threshold_ilp                  61.20      41.00      82.98    0.642      12.9       0.0
+cand candidate_threshold_ilp512               61.72      42.22      93.81    0.648      12.7       0.0
+base L24+ candidate_mask_apply                43.05      21.01      92.42    0.452      36.5       0.0
+KBJSON {"tag":"candidate pool n=131072 b=3 WARM scores, graph inner=5","variant":"base L20 build: block_max + threshold","med_us":95.289,"p10_us":71.504,"p90_us":165.641,"ratio":1.0000,"gbps":16.51,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=3 WARM scores, graph inner=5","variant":"base candidate_block_max","med_us":25.960,"p10_us":5.704,"p90_us":50.776,"ratio":0.2724,"gbps":60.59,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=3 WARM scores, graph inner=5","variant":"base candidate_threshold","med_us":87.505,"p10_us":67.744,"p90_us":137.761,"ratio":0.9183,"gbps":8.99,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=3 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp","med_us":61.200,"p10_us":41.000,"p90_us":82.976,"ratio":0.6423,"gbps":12.85,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=3 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp512","med_us":61.720,"p10_us":42.224,"p90_us":93.809,"ratio":0.6477,"gbps":12.74,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=3 WARM scores, graph inner=5","variant":"base L24+ candidate_mask_apply","med_us":43.048,"p10_us":21.008,"p90_us":92.425,"ratio":0.4518,"gbps":36.54,"graph":1,"flush":0}
+CMP candidate_threshold_ilp            n=131072 b=4 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp n=131072 b=4","bitexact":1,"bit_diff":0}
+CMP candidate_threshold_ilp512         n=131072 b=4 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp512 n=131072 b=4","bitexact":1,"bit_diff":0}
+
+== candidate pool n=131072 b=4 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base L20 build: block_max + threshold        128.72      86.77     192.03    1.000      16.3       0.0
+base candidate_block_max                      48.53      17.85      86.97    0.377      43.2       0.0
+base candidate_threshold                      85.66      67.42     138.65    0.665      12.2       0.0
+cand candidate_threshold_ilp                  60.05      40.84      91.82    0.467      17.5       0.0
+cand candidate_threshold_ilp512               60.82      42.05      86.08    0.473      17.2       0.0
+base L24+ candidate_mask_apply                34.25      16.50      68.67    0.266      61.2       0.0
+KBJSON {"tag":"candidate pool n=131072 b=4 WARM scores, graph inner=5","variant":"base L20 build: block_max + threshold","med_us":128.721,"p10_us":86.769,"p90_us":192.025,"ratio":1.0000,"gbps":16.29,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=4 WARM scores, graph inner=5","variant":"base candidate_block_max","med_us":48.528,"p10_us":17.848,"p90_us":86.969,"ratio":0.3770,"gbps":43.22,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=4 WARM scores, graph inner=5","variant":"base candidate_threshold","med_us":85.657,"p10_us":67.416,"p90_us":138.649,"ratio":0.6654,"gbps":12.24,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=4 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp","med_us":60.048,"p10_us":40.840,"p90_us":91.825,"ratio":0.4665,"gbps":17.46,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=4 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp512","med_us":60.824,"p10_us":42.048,"p90_us":86.081,"ratio":0.4725,"gbps":17.24,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=4 WARM scores, graph inner=5","variant":"base L24+ candidate_mask_apply","med_us":34.248,"p10_us":16.504,"p90_us":68.672,"ratio":0.2661,"gbps":61.23,"graph":1,"flush":0}
+CMP candidate_threshold_ilp            n=131072 b=5 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp n=131072 b=5","bitexact":1,"bit_diff":0}
+CMP candidate_threshold_ilp512         n=131072 b=5 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp512 n=131072 b=5","bitexact":1,"bit_diff":0}
+
+== candidate pool n=131072 b=5 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base L20 build: block_max + threshold         74.46      69.15     116.75    1.000      35.2       0.0
+base candidate_block_max                       6.78       6.36      25.72    0.091     386.4       0.0
+base candidate_threshold                      67.01      65.26     114.82    0.900      19.6       0.0
+cand candidate_threshold_ilp                  42.53      40.38      59.54    0.571      30.8       0.0
+cand candidate_threshold_ilp512               44.80      41.65      62.90    0.602      29.3       0.0
+base L24+ candidate_mask_apply                18.02      14.98      41.33    0.242     145.4       0.0
+KBJSON {"tag":"candidate pool n=131072 b=5 WARM scores, graph inner=5","variant":"base L20 build: block_max + threshold","med_us":74.456,"p10_us":69.153,"p90_us":116.753,"ratio":1.0000,"gbps":35.21,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=5 WARM scores, graph inner=5","variant":"base candidate_block_max","med_us":6.784,"p10_us":6.360,"p90_us":25.720,"ratio":0.0911,"gbps":386.40,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=5 WARM scores, graph inner=5","variant":"base candidate_threshold","med_us":67.008,"p10_us":65.264,"p90_us":114.825,"ratio":0.9000,"gbps":19.56,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=5 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp","med_us":42.528,"p10_us":40.376,"p90_us":59.544,"ratio":0.5712,"gbps":30.82,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=5 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp512","med_us":44.800,"p10_us":41.648,"p90_us":62.905,"ratio":0.6017,"gbps":29.26,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=5 WARM scores, graph inner=5","variant":"base L24+ candidate_mask_apply","med_us":18.024,"p10_us":14.976,"p90_us":41.328,"ratio":0.2421,"gbps":145.44,"graph":1,"flush":0}
+CMP candidate_threshold_ilp            n=131072 b=6 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp n=131072 b=6","bitexact":1,"bit_diff":0}
+CMP candidate_threshold_ilp512         n=131072 b=6 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp512 n=131072 b=6","bitexact":1,"bit_diff":0}
+
+== candidate pool n=131072 b=6 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base L20 build: block_max + threshold         94.04      83.66     112.43    1.000      33.5       0.0
+base candidate_block_max                      26.51       7.12      27.08    0.282     118.7       0.0
+base candidate_threshold                      84.00      69.02     122.30    0.893      18.7       0.0
+cand candidate_threshold_ilp                  58.25      41.60      59.91    0.619      27.0       0.0
+cand candidate_threshold_ilp512               59.48      41.63      61.94    0.632      26.4       0.0
+base L24+ candidate_mask_apply                41.02      12.78      42.74    0.436      76.7       0.0
+KBJSON {"tag":"candidate pool n=131072 b=6 WARM scores, graph inner=5","variant":"base L20 build: block_max + threshold","med_us":94.041,"p10_us":83.664,"p90_us":112.433,"ratio":1.0000,"gbps":33.45,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=6 WARM scores, graph inner=5","variant":"base candidate_block_max","med_us":26.512,"p10_us":7.120,"p90_us":27.080,"ratio":0.2819,"gbps":118.65,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=6 WARM scores, graph inner=5","variant":"base candidate_threshold","med_us":84.001,"p10_us":69.016,"p90_us":122.305,"ratio":0.8932,"gbps":18.72,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=6 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp","med_us":58.248,"p10_us":41.600,"p90_us":59.912,"ratio":0.6194,"gbps":27.00,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=6 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp512","med_us":59.480,"p10_us":41.632,"p90_us":61.936,"ratio":0.6325,"gbps":26.44,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=6 WARM scores, graph inner=5","variant":"base L24+ candidate_mask_apply","med_us":41.024,"p10_us":12.784,"p90_us":42.744,"ratio":0.4362,"gbps":76.68,"graph":1,"flush":0}
+CMP candidate_threshold_ilp            n=131072 b=8 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp n=131072 b=8","bitexact":1,"bit_diff":0}
+CMP candidate_threshold_ilp512         n=131072 b=8 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp512 n=131072 b=8","bitexact":1,"bit_diff":0}
+
+== candidate pool n=131072 b=8 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base L20 build: block_max + threshold         92.99      73.92     134.75    1.000      45.1       0.0
+base candidate_block_max                      13.98       8.31      29.36    0.150     300.1       0.0
+base candidate_threshold                      77.17      64.54     104.42    0.830      27.2       0.0
+cand candidate_threshold_ilp                  52.34      40.12      60.06    0.563      40.1       0.0
+cand candidate_threshold_ilp512               51.20      41.14      60.90    0.551      41.0       0.0
+base L24+ candidate_mask_apply                17.98      12.14      43.57    0.193     233.2       0.0
+KBJSON {"tag":"candidate pool n=131072 b=8 WARM scores, graph inner=5","variant":"base L20 build: block_max + threshold","med_us":92.993,"p10_us":73.921,"p90_us":134.753,"ratio":1.0000,"gbps":45.10,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=8 WARM scores, graph inner=5","variant":"base candidate_block_max","med_us":13.976,"p10_us":8.312,"p90_us":29.360,"ratio":0.1503,"gbps":300.11,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=8 WARM scores, graph inner=5","variant":"base candidate_threshold","med_us":77.168,"p10_us":64.536,"p90_us":104.425,"ratio":0.8298,"gbps":27.18,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=8 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp","med_us":52.344,"p10_us":40.120,"p90_us":60.064,"ratio":0.5629,"gbps":40.06,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=8 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp512","med_us":51.200,"p10_us":41.144,"p90_us":60.896,"ratio":0.5506,"gbps":40.96,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=8 WARM scores, graph inner=5","variant":"base L24+ candidate_mask_apply","med_us":17.984,"p10_us":12.136,"p90_us":43.568,"ratio":0.1934,"gbps":233.22,"graph":1,"flush":0}
+CMP candidate_threshold_ilp            n=131072 b=12 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp n=131072 b=12","bitexact":1,"bit_diff":0}
+CMP candidate_threshold_ilp512         n=131072 b=12 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp512 n=131072 b=12","bitexact":1,"bit_diff":0}
+
+== candidate pool n=131072 b=12 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base L20 build: block_max + threshold         93.97      70.46     112.18    1.000      67.0       0.0
+base candidate_block_max                       8.90       8.50      31.03    0.095     707.2       0.0
+base candidate_threshold                      80.71      64.52      98.72    0.859      39.0       0.0
+cand candidate_threshold_ilp                  47.22      39.81      58.80    0.502      66.6       0.0
+cand candidate_threshold_ilp512               57.62      41.21      60.27    0.613      54.6       0.0
+base L24+ candidate_mask_apply                25.22      15.66      47.02    0.268     249.4       0.0
+KBJSON {"tag":"candidate pool n=131072 b=12 WARM scores, graph inner=5","variant":"base L20 build: block_max + threshold","med_us":93.969,"p10_us":70.457,"p90_us":112.177,"ratio":1.0000,"gbps":66.95,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=12 WARM scores, graph inner=5","variant":"base candidate_block_max","med_us":8.896,"p10_us":8.504,"p90_us":31.032,"ratio":0.0947,"gbps":707.22,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=12 WARM scores, graph inner=5","variant":"base candidate_threshold","med_us":80.713,"p10_us":64.520,"p90_us":98.721,"ratio":0.8589,"gbps":38.97,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=12 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp","med_us":47.216,"p10_us":39.808,"p90_us":58.800,"ratio":0.5025,"gbps":66.62,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=12 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp512","med_us":57.624,"p10_us":41.208,"p90_us":60.272,"ratio":0.6132,"gbps":54.59,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=12 WARM scores, graph inner=5","variant":"base L24+ candidate_mask_apply","med_us":25.224,"p10_us":15.656,"p90_us":47.024,"ratio":0.2684,"gbps":249.42,"graph":1,"flush":0}
+CMP candidate_threshold_ilp            n=131072 b=16 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp n=131072 b=16","bitexact":1,"bit_diff":0}
+CMP candidate_threshold_ilp512         n=131072 b=16 bitexact=YES diff=0 thr0=c15dc162/c15dc162
+KBJSON {"cmp":"candidate_threshold_ilp512 n=131072 b=16","bitexact":1,"bit_diff":0}
+
+== candidate pool n=131072 b=16 WARM scores, graph inner=5  (rounds=30 inner=5 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+base L20 build: block_max + threshold        118.16      74.47     123.30    1.000      71.0       0.0
+base candidate_block_max                      28.11       9.89      40.85    0.238     298.4       0.0
+base candidate_threshold                      82.58      65.65      97.25    0.699      50.8       0.0
+cand candidate_threshold_ilp                  58.14      40.34      61.25    0.492      72.1       0.0
+cand candidate_threshold_ilp512               54.99      41.22      60.11    0.465      76.3       0.0
+base L24+ candidate_mask_apply                33.65      19.24      50.70    0.285     249.3       0.0
+KBJSON {"tag":"candidate pool n=131072 b=16 WARM scores, graph inner=5","variant":"base L20 build: block_max + threshold","med_us":118.161,"p10_us":74.473,"p90_us":123.305,"ratio":1.0000,"gbps":70.99,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=16 WARM scores, graph inner=5","variant":"base candidate_block_max","med_us":28.112,"p10_us":9.888,"p90_us":40.848,"ratio":0.2379,"gbps":298.40,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=16 WARM scores, graph inner=5","variant":"base candidate_threshold","med_us":82.585,"p10_us":65.648,"p90_us":97.249,"ratio":0.6989,"gbps":50.79,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=16 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp","med_us":58.144,"p10_us":40.344,"p90_us":61.248,"ratio":0.4921,"gbps":72.14,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=16 WARM scores, graph inner=5","variant":"cand candidate_threshold_ilp512","med_us":54.992,"p10_us":41.216,"p90_us":60.112,"ratio":0.4654,"gbps":76.27,"graph":1,"flush":0}
+KBJSON {"tag":"candidate pool n=131072 b=16 WARM scores, graph inner=5","variant":"base L24+ candidate_mask_apply","med_us":33.648,"p10_us":19.240,"p90_us":50.704,"ratio":0.2848,"gbps":249.30,"graph":1,"flush":0}

@@ -1,0 +1,2 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+HIP error hipModuleLoad(&m, path.c_str()) at /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/kbench.h:52: file not found
