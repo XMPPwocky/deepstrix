@@ -408,6 +408,49 @@ fn no_routed() -> bool {
     *V.get_or_init(|| matches!(std::env::var("V41_DSPARK_NO_ROUTED").as_deref(), Ok("1")))
 }
 
+/// `V41_MTP_KV_QUANT=v4` selects the LEGACY ring/block KV quantizer
+/// (`kv_post_fused`: E4M3 with an f32 scale per 64 over the first 448 dims, the
+/// 64-dim RoPE tail left unquantized). That is NOT what the reference does:
+/// `DSparkAttention` runs `act_quant(kv, fp8_block_size, scale_fmt, ...)` on the
+/// WHOLE 512-dim row, E4M3 with a power-of-two (ue8m0) scale per 32, RoPE tail
+/// included -- exactly the main model's V4.1 window KV. The default (`v41`) is
+/// therefore the reference's quantizer: rms_w -> rope -> `launch_fp8_window` ->
+/// f16 append at the device-staged slot. Under rejection sampling the drafter's
+/// numerics can only move ACCEPTANCE, so the choice is judged by
+/// `tests/dspark_parity.rs`, never by output fidelity.
+fn kv_quant_legacy_v4() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("V41_MTP_KV_QUANT").as_deref(), Ok("v4")))
+}
+
+/// One drafter KV row (ring or block): weighted RMS norm, RoPE of the last
+/// `N_ROT` dims at `pos`, fake quantisation, f16 append into `ring` at the slot
+/// held in `slot_dev` (already staged on `s`). `pos_dev` carries the same `pos`
+/// for the legacy fused kernel; the V4.1 path passes `pos` as a kernel argument.
+#[allow(clippy::too_many_arguments)]
+fn kv_post_row(
+    e: &DeviceEngine,
+    s: &Stream,
+    kv_normed: &mut DeviceBuffer<f32>,
+    ring: &mut DeviceBuffer<u16>,
+    kv_raw_row: &DeviceBuffer<f32>,
+    norm_w: &DeviceBuffer<f32>,
+    pos: u32,
+    pos_dev: &DeviceBuffer<u32>,
+    slot_dev: &DeviceBuffer<u32>,
+    rope: &crate::RopeParams,
+) -> eyre::Result<()> {
+    if kv_quant_legacy_v4() {
+        return e.fp8.launch_kv_post_fused(
+            s, kv_normed, ring, kv_raw_row, norm_w, pos_dev, slot_dev, N_HEAD_DIM, N_ROT, RMS_EPS, rope,
+        );
+    }
+    e.rms_w.launch_weighted(s, kv_normed, kv_raw_row, norm_w, N_HEAD_DIM, RMS_EPS)?;
+    e.rope.launch_forward(s, kv_normed, 1, N_HEAD_DIM, N_ROT, pos, rope)?;
+    e.fp4kv.launch_fp8_window(s, kv_normed, 1, N_HEAD_DIM)?;
+    e.kv_append.launch_slotdev(s, ring, kv_normed, slot_dev, N_HEAD_DIM)
+}
+
 /// Batch every drafter kernel runs at.
 const B: u32 = MTP_BLOCK as u32;
 /// Ring slots: the window, plus the block's own transient KV packed right after
@@ -1082,10 +1125,9 @@ impl MtpState {
             self.slot_dev.copy_from_host_async(&self.stage_slots[si], s)?;
             self.pos_dev.copy_from_host_async(&self.stage_poss[si], s)?;
         }
-        e.fp8.launch_kv_post_fused(
-            s, &mut self.kv_normed, &mut self.rings[li], &self.main_kv_raw, &w.kv_a_norm,
-            &self.pos_dev.slice_view(0, 1), &self.slot_dev.slice_view(0, 1), N_HEAD_DIM, N_ROT,
-            RMS_EPS, rope,
+        kv_post_row(
+            e, s, &mut self.kv_normed, &mut self.rings[li], &self.main_kv_raw, &w.kv_a_norm, pos,
+            &self.pos_dev.slice_view(0, 1), &self.slot_dev.slice_view(0, 1), rope,
         )?;
         Ok(())
     }
@@ -1119,10 +1161,10 @@ impl MtpState {
         )?;
         for j in 0..MTP_BLOCK {
             let row = self.kv_raw.slice_view(j * N_HEAD_DIM as usize, N_HEAD_DIM as usize);
-            e.fp8.launch_kv_post_fused(
-                s, &mut self.kv_normed, &mut self.rings[li], &row, &w.kv_a_norm,
-                &self.pos_dev.slice_view(j + 1, 1), &self.slot_dev.slice_view(j + 1, 1),
-                N_HEAD_DIM, N_ROT, RMS_EPS, rope,
+            kv_post_row(
+                e, s, &mut self.kv_normed, &mut self.rings[li], &row, &w.kv_a_norm,
+                pos + 1 + j as u32, &self.pos_dev.slice_view(j + 1, 1),
+                &self.slot_dev.slice_view(j + 1, 1), rope,
             )?;
         }
 

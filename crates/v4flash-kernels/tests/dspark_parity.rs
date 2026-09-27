@@ -31,6 +31,15 @@
 //!      reference, i.e. ~4.2 for `base`; d1 draft agreement >= 0.90),
 //!      PARITY_OUT = csv path for our per-step drafts.
 //!
+//! `PARITY_ASSERT` is meaningful for `base` / `incseed` only. `noseed` is NOT like
+//! for like (the reference attends 127 zeroed window rows; ours attends only the
+//! written ones). 89 overlapping blocks are few (effective n ~19), so read the
+//! PAIRED numbers first: draft agreement given identical earlier drafts, and the
+//! moving-block bootstrap interval of E(ours) - E(ref).
+//! The exit runs on the iGPU here; production runs it on the dGPU (gfx1201), so
+//! this does not cover production exit numerics (M-A A3 / M3 do).
+//! `V41_MTP_KV_QUANT=v4` selects the legacy ring quantizer for an A/B.
+//!
 //! Needs the checkpoint and the iGPU (drafter + exit on gfx1151, ~8.7 GB), so
 //! run it with the hub DOWN:
 //!
@@ -137,10 +146,18 @@ fn drafter_matches_reference() {
     let refs = load_ref(&dir, &refname);
     let seed = refs[0].i;
     println!(
-        "parity: ref={refname} T={t} seed={seed} steps={} seeded={seeded} markov={} mh_bf16={mh_bf16}",
+        "parity: ref={refname} T={t} seed={seed} steps={} seeded={seeded} markov={} mh_bf16={mh_bf16} kv_quant={} mh={mh_path}",
         refs.len(),
-        !use_plain
+        !use_plain,
+        std::env::var("V41_MTP_KV_QUANT").unwrap_or_else(|_| "v41".into())
     );
+    if refname == "noseed" {
+        println!(
+            "  NOTE: not like for like. The reference's unseeded window attends all 128 slots \
+             (127 zero rows: get_dspark_topk_idxs uses min(win, start_pos+1) over a zeroed cache); \
+             ours attends only the rows actually written."
+        );
+    }
 
     let hf = V41HfWeights::open(&model, None).expect("open checkpoint");
     let dev = pick_igpu().expect("igpu");
@@ -178,6 +195,11 @@ fn drafter_matches_reference() {
     let mut prefix = [0usize; MTP_BLOCK];
     let mut ref_prefix = [0usize; MTP_BLOCK];
     let mut conf_err = [0.0f64; MTP_BLOCK];
+    // Paired per-step statistics (89 overlapping blocks are too few for an
+    // absolute bar: lag-1 autocorrelation ~0.65, effective n ~19).
+    let mut agree_cond = [0usize; MTP_BLOCK]; // draft k equal GIVEN drafts < k equal
+    let mut agree_cond_n = [0usize; MTP_BLOCK];
+    let mut diff_per_step: Vec<f64> = Vec::with_capacity(refs.len()); // accepted(ours) - accepted(ref)
     let mut csv = String::from("i,d0,d1,d2,d3,d4,p0,p1,p2,p3,p4,c0,c1,c2,c3,c4\n");
     let mut token_row = vec![0.0f32; HC_DIM as usize];
     let mut h_host = vec![0.0f32; st.h.len()];
@@ -199,9 +221,18 @@ fn drafter_matches_reference() {
         let ours = if use_plain { plain } else { ids };
 
         let (mut ok, mut rok) = (true, true);
+        let mut same_so_far = true;
+        let (mut n_ours, mut n_ref) = (0usize, 0usize);
         for k in 0..MTP_BLOCK {
+            if same_so_far {
+                agree_cond_n[k] += 1;
+                agree_cond[k] += usize::from(ours[k] == r.drafts[k]);
+            }
+            same_so_far &= ours[k] == r.drafts[k];
             let g = argmax[i + 1 + k];
-            debug_assert_eq!(g, r.greedy[k], "argmax.bin and the record disagree at i={i} k={k}");
+            // Hard assert (the run script builds --release): misaligned targets
+            // would push BOTH E values down and pass the relative bar vacuously.
+            assert_eq!(g, r.greedy[k], "argmax.bin and the record disagree at i={i} k={k}");
             agree[k] += usize::from(ours[k] == r.drafts[k]);
             acc[k] += usize::from(ours[k] == g);
             ref_acc[k] += usize::from(r.drafts[k] == g);
@@ -209,8 +240,11 @@ fn drafter_matches_reference() {
             rok &= r.drafts[k] == g;
             prefix[k] += usize::from(ok);
             ref_prefix[k] += usize::from(rok);
+            n_ours += usize::from(ok);
+            n_ref += usize::from(rok);
             conf_err[k] += (ex.conf[k] as f64 - r.conf[k] as f64).abs();
         }
+        diff_per_step.push(n_ours as f64 - n_ref as f64);
         if n < show {
             println!(
                 "  i={i} next={next}\n    ours  {ours:?} conf {:?}\n    ref   {:?} conf {:?}\n    greedy {:?}",
@@ -245,6 +279,53 @@ fn drafter_matches_reference() {
     }
     let (eo, er) = (e_of(&prefix), e_of(&ref_prefix));
     println!("E (K=5): ours {eo:.3}   reference {er:.3}   gap {:.3}", er - eo);
+    println!(
+        "draft agreement given identical earlier drafts: {}",
+        (0..MTP_BLOCK)
+            .map(|k| format!("d{} {:.3} (n={})", k + 1, agree_cond[k] as f64 / agree_cond_n[k].max(1) as f64, agree_cond_n[k]))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
+    // Moving-block bootstrap (block 6 >= the block overlap) of the PAIRED
+    // per-step difference: accepted(ours) - accepted(reference).
+    let (lo, hi) = {
+        let d = &diff_per_step;
+        let (m, bl) = (d.len(), 6usize.min(d.len().max(1)));
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut means: Vec<f64> = (0..4000)
+            .map(|_| {
+                let (mut s, mut c) = (0.0, 0usize);
+                while c < m {
+                    let start = (next() % (m - bl + 1) as u64) as usize;
+                    for x in &d[start..start + bl] {
+                        if c < m {
+                            s += x;
+                            c += 1;
+                        }
+                    }
+                }
+                s / m as f64
+            })
+            .collect();
+        means.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (means[(0.05 * means.len() as f64) as usize], means[(0.95 * means.len() as f64) as usize])
+    };
+    println!("E(ours) - E(ref), 90% moving-block bootstrap: [{lo:+.3}, {hi:+.3}]");
+    // The reference's E recomputed from its records must equal what its JSON
+    // recorded; otherwise the targets or the record parsing are off.
+    let json = format!("{dir}/../dspark_accept_{refname}.json");
+    if let Ok(bytes) = std::fs::read(&json) {
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("reference json");
+        if let Some(want) = v["expected_tokens"].get(MTP_BLOCK - 1).and_then(|x| x.as_f64()) {
+            assert!((want - er).abs() < 1e-6, "reference E from records {er:.6} != its JSON {want:.6}");
+        }
+    }
     if let Ok(p) = std::env::var("PARITY_OUT") {
         std::fs::write(&p, csv).expect("write PARITY_OUT");
         println!("per-step drafts written to {p}");
