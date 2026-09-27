@@ -1425,6 +1425,8 @@ struct PfDone {
     layer: u32,
     e: u32,
     set: usize,
+    /// `PfJob::stage`: lands in the prefill staging band.
+    stage: bool,
     offs: [Option<(usize, usize, u32, u32)>; 3],
     coalesced: bool,
     /// Hint sent -> a reader picked it up (queueing behind other reads).
@@ -1446,6 +1448,9 @@ struct PfJob {
     /// A request needs it now (a parked request's own pick), as opposed to a
     /// guess (look-ahead) or a background admission (box-2 miss substitution).
     certain: bool,
+    /// A PREFILL-shaped request's own pick (its early page / park): lands in
+    /// the staging band, and reads by `knobs::prefill_route_split`.
+    stage: bool,
     t_hint: std::time::Instant,
 }
 
@@ -1833,6 +1838,17 @@ fn ev_pin_fields(
     ]
 }
 
+/// `evtrace` `b2_req` prefill-staging fields, `stage_claims` .. `stage_spills`
+/// in `B2_REQ` order: counter deltas across the request.
+fn ev_stage_fields(before: StageCounters, after: StageCounters) -> [f64; 3] {
+    let d = |a: u64, b: u64| a.saturating_sub(b) as f64;
+    [
+        d(after.claims, before.claims),
+        d(after.hits, before.hits),
+        d(after.spill_in + after.spill_out, before.spill_in + before.spill_out),
+    ]
+}
+
 thread_local! {
     /// `evtrace`: (start, end) raw ns of the three role reader threads of the
     /// last `read_miss_into` called on THIS thread (NaN = not measured).
@@ -1884,6 +1900,8 @@ pub mod knobs {
     static MISS_PAR: AtomicUsize = AtomicUsize::new(1);
     static PARK: AtomicBool = AtomicBool::new(false);
     static ROUTE_URGENCY: AtomicBool = AtomicBool::new(false);
+    /// `V41_B2_PREFILL_ROUTE` (`split` default | `mirror`): see `prefill_route_split`.
+    static PREFILL_ROUTE_SPLIT: AtomicBool = AtomicBool::new(true);
     /// Every shard's mirror opened (`set_mirror_ok`, at `enable_paging`).
     static MIRROR_OK: AtomicBool = AtomicBool::new(false);
     static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -1904,8 +1922,18 @@ pub mod knobs {
             );
             PARK.store(std::env::var("V41_B2_PARK").as_deref() == Ok("1"), Relaxed);
             ROUTE_URGENCY.store(std::env::var("V41_B2_ROUTE").as_deref() == Ok("urgency"), Relaxed);
+            PREFILL_ROUTE_SPLIT.store(std::env::var("V41_B2_PREFILL_ROUTE").as_deref() != Ok("mirror"), Relaxed);
         });
     }
+    /// `V41_B2_PREFILL_ROUTE=split` (default) | `mirror`; file key
+    /// `prefill_route`. Under `route=urgency` a PREFILL-shaped pass's demand
+    /// reads (and its early-page / park reads, `PfJob::stage`) are STRIPED
+    /// across both drives (`ExpertRoute::split`) instead of going wholly to
+    /// the mirror like decode's demand reads: a prefill chunk's ~200 reads
+    /// per layer otherwise monopolise the SN5000 alongside decode's demand
+    /// reads while the E100 idles (owner's decision, 2026-09-27). `mirror`
+    /// restores the pre-09-27 routing. No effect under `route=split`.
+    pub fn prefill_route_split() -> bool { init(); PREFILL_ROUTE_SPLIT.load(Relaxed) }
     pub fn merge() -> bool { init(); MERGE.load(Relaxed) }
     pub fn merge_wait_us() -> u64 { init(); MERGE_WAIT_US.load(Relaxed) }
     pub fn miss_par() -> usize { init(); MISS_PAR.load(Relaxed).clamp(1, 16) }
@@ -1972,13 +2000,16 @@ pub mod knobs {
                 ("route", "urgency") => ROUTE_URGENCY.store(true, Relaxed),
                 ("route", "split") => ROUTE_URGENCY.store(false, Relaxed),
                 ("route", v) => eprintln!("expertd: knobs: unknown route={v:?} (want split|urgency); unchanged"),
+                ("prefill_route", "split") => PREFILL_ROUTE_SPLIT.store(true, Relaxed),
+                ("prefill_route", "mirror") => PREFILL_ROUTE_SPLIT.store(false, Relaxed),
+                ("prefill_route", v) => eprintln!("expertd: knobs: unknown prefill_route={v:?} (want split|mirror); unchanged"),
                 ("mirror_frac", v) => { if let Ok(f) = v.parse::<f32>() { v4flash_core::hf_v41::set_expert_mirror_frac(f) } }
                 _ => {}
             }
         }
-        format!("knobs reloaded from {p}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={}", park(),
+        format!("knobs reloaded from {p}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={}", park(),
             merge(), merge_wait_us(), miss_par(), coalesce(), v4flash_core::hf_v41::expert_mirror_frac(),
-            if route_urgency() { "urgency" } else { "split" })
+            if route_urgency() { "urgency" } else { "split" }, if prefill_route_split() { "split" } else { "mirror" })
     }
 }
 
@@ -1997,9 +2028,10 @@ pub fn install_knobs_toggle() -> String {
     // it while passing `V41_B2_MISS_PAR=4` on the command line runs at 4 and looks
     // like it is running at 1 (found by the 2026-09-22 audit, B4).
     let _ = knobs::reload();
-    let init = format!("knobs: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} (SIGUSR2 reloads {})",
+    let init = format!("knobs: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} (SIGUSR2 reloads {})",
         knobs::merge(), knobs::merge_wait_us(), knobs::miss_par(), knobs::coalesce(),
-        v4flash_core::hf_v41::expert_mirror_frac(), if knobs::route_urgency() { "urgency" } else { "split" }, knobs::path());
+        v4flash_core::hf_v41::expert_mirror_frac(), if knobs::route_urgency() { "urgency" } else { "split" },
+        if knobs::prefill_route_split() { "split" } else { "mirror" }, knobs::path());
     unsafe { signal(SIGUSR2, knobs_signal); }
     init
 }
@@ -2063,6 +2095,9 @@ pub struct ExpertShard {
     /// The parked request's non-resident picks as `layer << 16 | expert`, for
     /// the park hook to hand to the prefetch readers.
     pub park_words: Vec<u32>,
+    /// ... and whether that request is PREFILL-shaped (its reads then land in
+    /// the staging band: `prefetch_words_cls`).
+    pub park_prefill: bool,
     /// Pin mode: each queued request's picks NOT landed when its frame
     /// ARRIVED (see [`EarlyPaged`]). Empty unless pins are on.
     pub early_paged: EarlyPaged,
@@ -2136,6 +2171,39 @@ struct ShardPool {
     /// The hub's pins on this connection (`proto::REQ_FLAG_PIN`). Off (and
     /// empty) unless the hub asked for them.
     pins: PinBook,
+    /// First slot of the prefill STAGING band `[stage, n)` (`= n` when off).
+    /// See "PREFILL STAGING" in the pinning block below.
+    stage: u32,
+    sc: StageCounters,
+}
+
+/// Prefill-staging counters (cumulative since `enable_paging`; `b2_req`
+/// reports deltas per request). All zero with staging off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageCounters {
+    /// Prefill-shaped claims that took a staging slot.
+    pub claims: u64,
+    /// Hits on an expert resident in staging (any pass).
+    pub hits: u64,
+    /// Non-prefill claims that found no main-band victim and took a staging
+    /// slot instead (a parked prefill chunk's main hits crowding the band).
+    pub spill_in: u64,
+    /// Prefill claims that found staging full of their own union and took a
+    /// main-band victim (only with `STAGE < N_EXPERT`).
+    pub spill_out: u64,
+    /// Staged background landings (prefill's early-page / park reads) dropped
+    /// for want of a staging victim.
+    pub drops: u64,
+}
+
+/// Which band a victim search may take from (`ShardPool::pick_victim_any`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Band {
+    /// `[0, stage)`: decode-shaped and served-inside claims, decode's
+    /// background landings. Region first (non-global), then the whole band.
+    Main,
+    /// `[stage, n)`: prefill-shaped claims and prefill's background landings.
+    Stage,
 }
 
 // ---------------------------------------------------------------------------
@@ -2177,45 +2245,117 @@ struct ShardPool {
 //   which the hub reads as "not held": it may page them, never be surprised.
 //
 // BUDGET / RESERVE and why nothing can deadlock. `pinned <= budget = n_slots -
-// R - sum(floor)` at all times; new pins beyond it are refused (`denied`) and
-// reported not held. What a victim search must find is at most
+// STAGE - R - sum(floor)` at all times; new pins beyond it are refused
+// (`denied`) and reported not held. What a victim search must find is at most
 // `|W \ resident|` free-able slots, where W is the pass's distinct picks of one
 // layer (<= N_EXPERT = 384, a merged prefill union) and the slots it may not
 // take are the hub's pins (<= budget), W's own resident experts, a PARKED
-// request's picks P (<= 384, one layer), and, under `V41_B2_POOL_FLOOR`, at most
-// `floor[l]` slots of each foreign layer. A request served inside a park has
-// at most `PARK_MAX_ROWS` = 16 rows (W <= 96). So with
-// `R >= max(|W| + |P|) = 384 + 96 = 480` (`PIN_RESERVE_MIN`, the default) a
-// demand / certain / prefill claim always finds an unpinned victim without any
-// hub action. In-flight background reads hold no slot until they land; a
-// landing with no unpinned victim is DROPPED (counted), and whoever needs that
-// expert demand-reads it, which the reserve covers. Early-page `pinned` is only
-// set around `prefetch_words_ex`, which searches no victim. If a reserve below
-// the minimum ever leaves a demand claim with no unpinned victim, it REVOKES
-// a pin (an error the counters show) rather than failing the request: today's
-// behaviour there was "no evictable slot" and an outage.
+// request's picks P (<= 384, one layer: the hub sets `REQ_FLAG_OOO` on every
+// request, so a 1024-row prefill chunk parks like any other), and, under
+// `V41_B2_POOL_FLOOR`, at most `floor[l]` slots of each foreign layer. A
+// request served inside a park has at most `PARK_MAX_ROWS` = 16 rows (W <= 96).
+// So with `R >= max(|W| + |P|) = 384 + 96 = 480` (`PIN_RESERVE_MIN`, the default
+// without staging) a demand / certain / prefill claim always finds an unpinned
+// victim without any hub action (the claimed expert is a miss, so at most
+// `|W| - 1` of W is resident). In-flight background reads hold no slot until
+// they land; a landing with no unpinned victim is DROPPED (counted), and
+// whoever needs that expert demand-reads it, which the reserve covers.
+// Early-page `pinned` is only set around `prefetch_words_ex`, which searches
+// no victim. If a reserve below the minimum ever leaves a demand claim with no
+// unpinned victim, it REVOKES a pin (an error the counters show) rather than
+// failing the request: today's behaviour there was "no evictable slot" and an
+// outage.
+//
+// PREFILL STAGING (2026-09-27, `V41_B2_PREFILL_STAGE`, `ShardPool::stage`).
+// Measured 09-27 with ~5300-5600 of 6160 slots pinned: prefill unions and
+// speculative admits fought over the few unpinned slots, prefill re-read its
+// per-layer unions from disk and box 2 sat at 83-87% busy for 2-minute
+// stretches. So the LAST `STAGE` slots `[n - STAGE, n)` are a staging band
+// with its own rules, all enforced by `pick_victim_any`'s `Band` (the one
+// victim search) and by `PinBook::report`:
+// * A PREFILL-shaped pass (`prefill_shaped`, b > 16) claims victims ONLY in
+//   staging (LRU within it). Its own wanted ids are excluded as always, so
+//   with `STAGE >= N_EXPERT >= |W|` a victim always exists: after k claims the
+//   band holds at most `hits + k` wanted experts and the next miss still has
+//   `STAGE - |W| + 1 >= 1` candidates. A smaller STAGE (tiny test pools) is
+//   allowed: a prefill claim that finds staging full of its own union SPILLS
+//   into the main band (`stage_spill_out`, the pre-staging behaviour) rather
+//   than failing. Prefill's early-page / park reads (`PfJob::stage`) land in
+//   staging too, and are dropped when it has no victim. A prefill pass is
+//   never served inside a park (`PARK_MAX_ROWS`), so P is empty for it.
+// * Every other victim search (decode-shaped and served-inside claims,
+//   background landings of decode's reads) stays in the MAIN band
+//   `[0, n - STAGE)`. A pick that HITS an expert resident in staging is a hit
+//   (the slot map is global), but `PinBook::report` never PINS an expert whose
+//   slot is in staging: it is reported not held, decode re-pages it into the
+//   main band once prefill evicts it, and the hub pins it there. So
+//   `pinned => landed in main`, and prefill's victim search can never run out
+//   of unpinned slots.
+// * Floors protect the main band only (`pick_victim`): a staging slot holding
+//   layer L's expert still counts in `held[L]`, so a layer with experts in
+//   staging is floor-protected in main by that much less. Floors default 0.
+// * BUDGET with staging: a non-prefill claim searches main first. Main has at
+//   least `n - STAGE - budget - floors = R` unpinned, unfloored slots, of
+//   which W's resident (<= |W| - 1) and P's main-resident picks are excluded.
+//   With a parked DECODE request `|P| <= 96`, so `R >= 2 * PARK_MAX_ROWS *
+//   N_EXPERT_USED = 192` (`PIN_RESERVE_STAGED`, the default with staging)
+//   keeps every such claim in main. With a parked PREFILL chunk (`|P| <= 384`,
+//   mostly resident in staging, but its hits in main are protected too) main
+//   can run dry; the claim then SPILLS into staging (`stage_spill_in`: no
+//   pins there, only W and P excluded), and the two bands together always
+//   hold a victim when `R + STAGE >= |W| + |P| = 480 = PIN_RESERVE_MIN`
+//   (candidates(main) + candidates(staging) >= R + STAGE - (|W| - 1) - |P|
+//   >= 1). Defaults: STAGE 384 + R 192 = 576 >= 480, budget = 6160 - 576 -
+//   floors = 5584. Only below that bound does a claim revoke a pin, as
+//   without staging.
 
-/// No-deadlock minimum of `V41_B2_PIN_RESERVE` (see the block above).
+/// No-deadlock minimum of `V41_B2_PIN_RESERVE` WITHOUT staging (see the block
+/// above), and the minimum of `reserve + STAGE` with it.
 pub const PIN_RESERVE_MIN: usize = N_EXPERT as usize + PARK_MAX_ROWS * N_EXPERT_USED;
+/// Default `V41_B2_PIN_RESERVE` WITH staging: a served-inside pass (<= 96
+/// picks) never spills into staging while a decode-shaped request (<= 96
+/// picks) is parked. Below it a claim may spill; the no-deadlock bound is
+/// `reserve + STAGE >= PIN_RESERVE_MIN`.
+pub const PIN_RESERVE_STAGED: usize = 2 * PARK_MAX_ROWS * N_EXPERT_USED;
 /// Most rows a request served INSIDE a parked one may have (the park
 /// executor's size); `PIN_RESERVE_MIN` depends on it.
 pub const PARK_MAX_ROWS: usize = 16;
 
-/// `V41_B2_PIN_RESERVE` (default `PIN_RESERVE_MIN` = 480): slots box 2 never
-/// lets the hub pin. Below the minimum the no-deadlock argument holds only if
-/// the workload's per-layer working set fits (tests with tiny pools); logged.
-pub fn b2_pin_reserve() -> usize {
-    static R: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        let r = std::env::var("V41_B2_PIN_RESERVE").ok().and_then(|v| v.parse().ok()).unwrap_or(PIN_RESERVE_MIN);
-        if r < PIN_RESERVE_MIN {
-            eprintln!(
-                "expertd: WARNING V41_B2_PIN_RESERVE={r} < {PIN_RESERVE_MIN}: a pass whose layer union + parked \
-                 picks exceed {r} slots will REVOKE pins (hub surprises) instead of finding an unpinned victim"
-            );
-        }
-        r
+/// `V41_B2_PREFILL_STAGE` (default `N_EXPERT` = 384 = one full layer union;
+/// 0 = off = one band, the pre-09-27 behaviour): slots at the END of the
+/// pool that prefill-shaped passes claim in and nothing else does (the
+/// staging block above `PIN_RESERVE_MIN`). Raw value; `ShardPool::set_stage`
+/// clamps it to the pool.
+pub fn b2_prefill_stage() -> usize {
+    static S: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_B2_PREFILL_STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(N_EXPERT as usize)
     });
-    *R
+    *S
+}
+
+/// `V41_B2_PIN_RESERVE`: slots of the MAIN band box 2 never lets the hub pin.
+/// Default `PIN_RESERVE_STAGED` (192) with staging, `PIN_RESERVE_MIN` (480)
+/// without. `stage` = the pool's staging slots (0 = off). Below the
+/// no-deadlock bound (`reserve + stage >= PIN_RESERVE_MIN`) the argument holds
+/// only if the workload's per-layer working set fits (tests with tiny pools);
+/// logged. Called once per `pin_enable` (a warning per connection is fine).
+pub fn b2_pin_reserve(stage: usize) -> usize {
+    static R: std::sync::LazyLock<Option<usize>> =
+        std::sync::LazyLock::new(|| std::env::var("V41_B2_PIN_RESERVE").ok().and_then(|v| v.parse().ok()));
+    let default = if stage > 0 { PIN_RESERVE_STAGED } else { PIN_RESERVE_MIN };
+    let r = R.unwrap_or(default);
+    if r + stage < PIN_RESERVE_MIN {
+        eprintln!(
+            "expertd: WARNING V41_B2_PIN_RESERVE={r} + staging {stage} < {PIN_RESERVE_MIN}: a pass whose layer union + parked \
+             picks exceed that will REVOKE pins (hub surprises) instead of finding an unpinned victim"
+        );
+    } else if stage > 0 && r < PIN_RESERVE_STAGED {
+        eprintln!(
+            "expertd: note V41_B2_PIN_RESERVE={r} < {PIN_RESERVE_STAGED}: a request served inside a parked one may \
+             SPILL its claims into the prefill staging band (counted, no surprise)"
+        );
+    }
+    r
 }
 
 /// `V41_B2_ASSERT_PINNED=1`: evicting a pinned expert panics (verification
@@ -2342,17 +2482,19 @@ impl PinBook {
         }
     }
 
-    /// `report`'s per-expert step. `landed` = in the pool now. Pins an eligible
-    /// landed expert within budget, else drops the grant (`denied`: a fresh
-    /// grant is needed to try again); ages an eligible unlanded one unless
-    /// `age` is false (the fresh pass, so the scan ages each once); reports a
-    /// pinned expert that is not landed (a violation).
+    /// `report`'s per-expert step. `landed` = in the pool now; `pinnable` =
+    /// landed in the MAIN band (a staging slot is never pinned: it is treated
+    /// as not landed for eligibility, and reported not held). Pins an
+    /// eligible pinnable expert within budget, else drops the grant
+    /// (`denied`: a fresh grant is needed to try again); ages an eligible
+    /// unpinnable one unless `age` is false (the fresh pass, so the scan ages
+    /// each once); reports a pinned expert that is not landed (a violation).
     #[inline]
-    fn visit(&mut self, layer: u32, e: usize, landed: bool, age: bool) {
+    fn visit(&mut self, layer: u32, e: usize, landed: bool, pinnable: bool, age: bool) {
         let i = layer as usize * N_EXPERT as usize + e;
         let s = self.state[i];
         if s >= PIN_ELIGIBLE_LAST {
-            if landed {
+            if landed && pinnable {
                 if self.pinned < self.budget {
                     self.state[i] = PIN_HELD;
                     self.pinned += 1;
@@ -2405,17 +2547,24 @@ impl PinBook {
     }
 
     /// Pin the layer's FRESH grants that are landed now (`row` = the layer's
-    /// `remap_hosts`, nonzero = landed) first, then every other eligible
-    /// landed expert of `layer`, budget allowing; age the eligible unlanded
-    /// ones; return the layer's pinned set as a residency map. A pinned expert
+    /// `remap_hosts`, nonzero = landed, `-(slot) - 1`) in the MAIN band
+    /// (slot < `stage`) first, then every other eligible such expert of
+    /// `layer`, budget allowing; age the eligible unlanded (or staged) ones;
+    /// return the layer's pinned set as a residency map. A pinned expert
     /// found NOT landed is a violation (it left the pool around the choke
     /// point): unpinned, reported, and absent from the map.
-    fn report(&mut self, layer: u32, row: &[i32]) -> [u32; proto::RESID_WORDS] {
+    fn report(&mut self, layer: u32, row: &[i32], stage: u32) -> [u32; proto::RESID_WORDS] {
         let mut w = [0u32; proto::RESID_WORDS];
         if !self.on || layer >= N_LAYER as u32 {
             return w;
         }
-        let landed = |e: usize| row.get(e).is_some_and(|&r| r != 0);
+        // (landed, pinnable): a staging slot is landed but never pinned.
+        let state = |e: usize| -> (bool, bool) {
+            match row.get(e) {
+                Some(&r) if r != 0 => (true, ((-r - 1) as u32) < stage),
+                _ => (false, false),
+            }
+        };
         // The pass's own grants first, in grant order (no aging: the scan
         // below ages each eligible expert exactly once).
         let mut fresh = std::mem::take(&mut self.fresh);
@@ -2423,7 +2572,8 @@ impl PinBook {
             if f >> 16 == layer {
                 let e = (f & 0xFFFF) as usize;
                 if e < N_EXPERT as usize {
-                    self.visit(layer, e, landed(e), false);
+                    let (landed, pinnable) = state(e);
+                    self.visit(layer, e, landed, pinnable, false);
                 }
             }
         }
@@ -2431,7 +2581,8 @@ impl PinBook {
         self.fresh = fresh;
         let base = layer as usize * N_EXPERT as usize;
         for e in 0..N_EXPERT as usize {
-            self.visit(layer, e, landed(e), true);
+            let (landed, pinnable) = state(e);
+            self.visit(layer, e, landed, pinnable, true);
             if self.state[base + e] == PIN_HELD {
                 w[e / 32] |= 1 << (e % 32);
             }
@@ -2535,14 +2686,46 @@ impl ShardPool {
             held,
             floor,
             pins: PinBook::off(),
+            stage: n_slots as u32,
+            sc: StageCounters::default(),
         }
+    }
+
+    /// Reserve the LAST `want` slots as the prefill staging band (0 = off).
+    /// Clamped to half the pool (a decode claim must have a main band);
+    /// below `N_EXPERT` a prefill union may not fit and spills (logged).
+    /// Returns the staging slots actually reserved. Slot CONTENTS are
+    /// untouched: whatever `load` placed there stays until evicted.
+    fn set_stage(&mut self, want: usize) -> usize {
+        let n = self.owner_of.len();
+        let mut stage = want.min(n / 2);
+        if stage != want {
+            eprintln!("expertd: V41_B2_PREFILL_STAGE={want} clamped to {stage} (half of the {n}-slot pool)");
+        }
+        if stage > 0 && stage < N_EXPERT as usize {
+            eprintln!(
+                "expertd: note prefill staging {stage} < N_EXPERT {N_EXPERT}: a layer union larger than the band \
+                 spills into the main band (counted as stage_spill_out)"
+            );
+        }
+        if want == 0 {
+            stage = 0;
+        }
+        self.stage = (n - stage) as u32;
+        stage
+    }
+
+    /// Staging slots (0 = off).
+    fn stage_slots(&self) -> usize {
+        self.owner_of.len() - self.stage as usize
     }
 
     /// THE victim search: the least recently used slot in `range` that is
     /// free, or whose occupant is not one of `want` on `want_layer`, not in
     /// `extra`, not pinned by the hub (unless `ignore_hub_pins`), and not a
     /// foreign layer at its floor (`for_layer` is the layer taking the slot;
-    /// its own slots are never floor-protected).
+    /// its own slots are never floor-protected; staging slots are never
+    /// floor-protected either -- floors guard the main band).
     #[allow(clippy::too_many_arguments)]
     fn pick_victim(
         &self,
@@ -2565,8 +2748,8 @@ impl ShardPool {
                     {
                         false
                     } else {
-                        // Never take a foreign layer below its floor.
-                        ol == for_layer || self.held[ol as usize] > self.floor[ol as usize]
+                        // Never take a foreign layer below its floor (main band).
+                        ol == for_layer || sl >= self.stage || self.held[ol as usize] > self.floor[ol as usize]
                     }
                 }
                 None => true,
@@ -2582,12 +2765,16 @@ impl ShardPool {
         best.map(|(_, sl)| sl)
     }
 
-    /// Region first, then the whole pool (`global` skips the region).
+    /// `Band::Main`: the region (clipped to the main band) first, then the
+    /// whole main band (`global` skips the region). `Band::Stage`: the staging
+    /// band only. With staging off `Main` is the whole pool and `Stage` is
+    /// empty (and never asked for: every staged path checks `stage_slots`).
     #[allow(clippy::too_many_arguments)]
     fn pick_victim_any(
         &self,
         region: (u32, u32),
         global: bool,
+        band: Band,
         want_layer: u32,
         want: &[u32],
         extra: ExtraPins<'_>,
@@ -2595,9 +2782,14 @@ impl ShardPool {
         ignore_hub_pins: bool,
     ) -> Option<u32> {
         let n = self.owner_of.len() as u32;
-        let first = if global { 0..n } else { region.0..region.1 };
-        self.pick_victim(first, want_layer, want, extra, for_layer, ignore_hub_pins)
-            .or_else(|| self.pick_victim(0..n, want_layer, want, extra, for_layer, ignore_hub_pins))
+        match band {
+            Band::Main => {
+                let first = if global { 0..self.stage } else { region.0.min(self.stage)..region.1.min(self.stage) };
+                self.pick_victim(first, want_layer, want, extra, for_layer, ignore_hub_pins)
+                    .or_else(|| self.pick_victim(0..self.stage, want_layer, want, extra, for_layer, ignore_hub_pins))
+            }
+            Band::Stage => self.pick_victim(self.stage..n, want_layer, want, extra, for_layer, ignore_hub_pins),
+        }
     }
 
     /// THE CHOKE POINT: detach whoever holds `slot` (possibly another layer,
@@ -2623,6 +2815,7 @@ impl ShardPool {
     fn touch_hit(&mut self, layer: u32, e: u32, scan_class: bool) -> bool {
         let Some(&slot) = self.slot_of.get(&(layer, e)) else { return false };
         self.tick += 1;
+        self.sc.hits += u64::from(slot >= self.stage);
         let lu = &mut self.last_use[slot as usize];
         if scan_class {
             if *lu < PREFILL_AGE {
@@ -2636,15 +2829,18 @@ impl ShardPool {
 
     /// `ensure`: claim a slot for the miss `(layer, e)` of a pass wanting
     /// `want`. Victim, least-recently-used first, never one of `want` on this
-    /// layer, never `extra`, never hub-pinned; region first (a prefill sweep
-    /// should not evict its neighbours as a matter of course), but the region
-    /// is a PREFERENCE, not a bound: a layer whose union exceeds its 154-slot
-    /// share used to die with "no evictable slot" while thousands of slots sat
-    /// evictable elsewhere. With no unpinned victim left (a reserve below
-    /// `PIN_RESERVE_MIN`), a pin is REVOKED rather than failing the request
-    /// (reported by the choke point). The slot is claimed NOW (so the next pick
-    /// cannot choose it again); its remap entry is written only once the data
-    /// has landed (`commit`). Returns the slot and whoever was evicted from it.
+    /// layer, never `extra`, never hub-pinned; a PREFILL-shaped pass searches
+    /// the staging band, any other the main band, region first (a prefill
+    /// sweep should not evict its neighbours as a matter of course), but the
+    /// region is a PREFERENCE, not a bound: a layer whose union exceeds its
+    /// 154-slot share used to die with "no evictable slot" while thousands of
+    /// slots sat evictable elsewhere. A band with no victim SPILLS into the
+    /// other (counted; the pinning block says when that can happen), and
+    /// with no unpinned victim anywhere (a reserve below the bound) a pin is
+    /// REVOKED rather than failing the request (reported by the choke point).
+    /// The slot is claimed NOW (so the next pick cannot choose it again); its
+    /// remap entry is written only once the data has landed (`commit`).
+    /// Returns the slot and whoever was evicted from it.
     #[allow(clippy::too_many_arguments)]
     fn claim_miss(
         &mut self,
@@ -2654,16 +2850,28 @@ impl ShardPool {
         extra: ExtraPins<'_>,
         region: (u32, u32),
         global: bool,
+        prefill_shaped: bool,
         scan_class: bool,
     ) -> Option<(u32, Option<(u32, u32)>)> {
-        let victim = match self.pick_victim_any(region, global, layer, want, extra, layer, false) {
-            Some(v) => v,
-            None if self.pins.on => {
-                let v = self.pick_victim_any(region, global, layer, want, extra, layer, true)?;
-                self.pins.c.revokes += 1;
+        let staged = prefill_shaped && self.stage_slots() > 0;
+        let (own, other) = if staged { (Band::Stage, Band::Main) } else { (Band::Main, Band::Stage) };
+        let victim = match self.pick_victim_any(region, global, own, layer, want, extra, layer, false) {
+            Some(v) => {
+                self.sc.claims += u64::from(staged);
                 v
             }
-            None => return None,
+            None => match (self.stage_slots() > 0).then(|| self.pick_victim_any(region, global, other, layer, want, extra, layer, false)).flatten() {
+                Some(v) => {
+                    if staged { self.sc.spill_out += 1 } else { self.sc.spill_in += 1 }
+                    v
+                }
+                None if self.pins.on => {
+                    let v = self.pick_victim_any(region, global, Band::Main, layer, want, extra, layer, true)?;
+                    self.pins.c.revokes += 1;
+                    v
+                }
+                None => return None,
+            },
         };
         let evicted = self.evict(victim, layer);
         self.owner_of[victim as usize] = Some((layer, e));
@@ -2681,13 +2889,15 @@ impl ShardPool {
 
     /// A background read of `key` has been repacked into `slot` (already
     /// detached by `evict`): own, map and age it. Background admissions are
-    /// stamped as decode-class, like the reads that asked for them.
-    fn land(&mut self, slot: u32, key: (u32, u32)) {
+    /// stamped as decode-class, like the reads that asked for them, unless
+    /// `prefill` (a prefill chunk's early-page / park read: prefill-class,
+    /// like its demand claims).
+    fn land(&mut self, slot: u32, key: (u32, u32), prefill: bool) {
         self.owner_of[slot as usize] = Some(key);
         self.slot_of.insert(key, slot);
         self.held[key.0 as usize] += 1;
         self.tick += 1;
-        self.last_use[slot as usize] = self.tick + PREFILL_AGE;
+        self.last_use[slot as usize] = if prefill { self.tick } else { self.tick + PREFILL_AGE };
         self.remap_hosts[key.0 as usize][key.1 as usize] = -(slot as i32) - 1;
         self.dirty[key.0 as usize] = true;
     }
@@ -3327,6 +3537,7 @@ impl ExpertShard {
             pinned: Vec::new(),
             parked_pins: Vec::new(),
             park_words: Vec::new(),
+            park_prefill: false,
             early_paged: EarlyPaged::default(),
             prefetch_wait_ns: 0,
             ev_admit: [0; 5],
@@ -3345,9 +3556,17 @@ impl ExpertShard {
     /// `certain`: the words are a queued request's own picks (not a guess):
     /// read at demand priority, i.e. without waiting for in-flight misses.
     pub fn prefetch_words_ex(&mut self, words: &[u32], certain: bool) {
+        self.prefetch_words_cls(words, certain, false)
+    }
+
+    /// `stage`: the words are a PREFILL-shaped request's own picks (its early
+    /// page or park): the reads land in the staging band, prefill-class, and
+    /// route by `knobs::prefill_route_split`. Ignored with staging off.
+    pub fn prefetch_words_cls(&mut self, words: &[u32], certain: bool, stage: bool) {
         if words.is_empty() || self.pool.is_none() {
             return;
         }
+        let stage = stage && self.stage_slots() > 0;
         if self.prefetch.is_none() {
             if self.pf_stages_spare.is_empty() {
                 return;
@@ -3378,7 +3597,7 @@ impl ExpertShard {
                 let ptrs = ptrs;
                 loop {
                     let urgency = knobs::route_urgency();
-                    let Some(PfJob { layer, e, set, certain, t_hint }) = queue_r.pop_mode(urgency) else { break };
+                    let Some(PfJob { layer, e, set, certain, stage, t_hint }) = queue_r.pop_mode(urgency) else { break };
                     let ev_on = super::evtrace::enabled();
                     let ev_t_pop = if ev_on { super::evtrace::now() } else { f64::NAN };
                     let mut ev_yield_ns = 0u64;
@@ -3419,11 +3638,13 @@ impl ExpertShard {
                     // A job still speculative at read start reads in chunks and
                     // yields to urgent reads (io_throttle); certain ones do not.
                     // Under urgency routing: certain -> the mirror, speculative
-                    // -> the primary, and neither is throttled.
-                    let route = match (urgency, done.certain) {
-                        (false, _) => v4flash_core::hf_v41::ExpertRoute::split(),
-                        (true, true) => v4flash_core::hf_v41::ExpertRoute::mirror_only(),
-                        (true, false) => v4flash_core::hf_v41::ExpertRoute::primary_only(),
+                    // -> the primary, and neither is throttled; a PREFILL
+                    // chunk's own reads (`stage`) are striped across both
+                    // drives like its demand reads (`knobs::prefill_route_split`).
+                    let route = match (urgency, done.certain, stage && knobs::prefill_route_split()) {
+                        (false, _, _) | (true, _, true) => v4flash_core::hf_v41::ExpertRoute::split(),
+                        (true, true, false) => v4flash_core::hf_v41::ExpertRoute::mirror_only(),
+                        (true, false, false) => v4flash_core::hf_v41::ExpertRoute::primary_only(),
                     };
                     v4flash_core::io_throttle::set_background((!done.certain && !urgency).then_some(((layer as u64) << 16) | e as u64));
                     let r = Self::read_miss_into(&owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2, route);
@@ -3443,7 +3664,7 @@ impl ExpertShard {
                     }
                     drop(done);
                     let msg = match r {
-                        Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, offs, coalesced, queue_ns, read_ns, ev }),
+                        Ok((offs, coalesced)) => Ok(PfDone { layer, e, set, stage, offs, coalesced, queue_ns, read_ns, ev }),
                         Err(err) => Err((set, layer, e, format!("{err:#}"))),
                     };
                     if tx_done.send(msg).is_err() {
@@ -3485,7 +3706,7 @@ impl ExpertShard {
             let Some(set) = pf.free.pop() else { pf.dropped += 1; continue };
             pf.pending.insert(key);
             pf.hinted += 1;
-            pf.queue.push(PfJob { layer: key.0, e: key.1, set, certain, t_hint: std::time::Instant::now() });
+            pf.queue.push(PfJob { layer: key.0, e: key.1, set, certain, stage, t_hint: std::time::Instant::now() });
         }
     }
 
@@ -3630,9 +3851,14 @@ impl ExpertShard {
             let ev_t_scan = std::time::Instant::now();
             // Never a hub-pinned victim: a background landing is optional, so
             // with every candidate pinned it is DROPPED (whoever needs the
-            // expert demand-reads it; the pin reserve covers that claim).
-            let Some(victim) = pool.pick_victim_any(region, global, cur_layer, want, &pinned, d.layer, false) else {
-                if pool.pins.on && pool.pick_victim_any(region, global, cur_layer, want, &pinned, d.layer, true).is_some() {
+            // expert demand-reads it; the pin reserve covers that claim). A
+            // prefill chunk's read (`stage`) lands in the staging band only
+            // and is dropped when that has no victim.
+            let band = if d.stage { Band::Stage } else { Band::Main };
+            let Some(victim) = pool.pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, false) else {
+                if d.stage {
+                    pool.sc.drops += 1;
+                } else if pool.pins.on && pool.pick_victim_any(region, global, band, cur_layer, want, &pinned, d.layer, true).is_some() {
                     pool.pins.c.no_victim_drops += 1;
                 }
                 pf.free.push(d.set);
@@ -3654,7 +3880,7 @@ impl ExpertShard {
                 pf.free.push(d.set);
                 return Err(err);
             }
-            pool.land(victim, key);
+            pool.land(victim, key, d.stage);
             pf.admitted += 1;
             pf.free.push(d.set);
             if ev_on {
@@ -3784,7 +4010,20 @@ impl ExpertShard {
             frac,
             (260.0 * frac) as u32
         );
-        self.pool = Some(ShardPool::seeded(n_slots, &seeded, frac));
+        let mut pool = ShardPool::seeded(n_slots, &seeded, frac);
+        // Prefill staging band (the block above `PIN_RESERVE_MIN`): the pin
+        // budget a connection will get is stated here once, at startup.
+        let stage = pool.set_stage(b2_prefill_stage());
+        let floors: usize = pool.floor.iter().map(|&f| f as usize).sum();
+        let reserve = b2_pin_reserve(stage);
+        eprintln!(
+            "expertd: prefill staging {} ({stage} slots [{}, {n_slots}) of {n_slots}; main band {}; pin budget {} = {n_slots} - {stage} - reserve {reserve} - floors {floors})",
+            if stage > 0 { "ON" } else { "OFF" },
+            n_slots - stage,
+            n_slots - stage,
+            n_slots.saturating_sub(stage + reserve + floors),
+        );
+        self.pool = Some(pool);
         // Do NOT touch the advertised HELLO bitmap. `info.owned` is what the hub's
         // PREFILL path uses for its remote exclusion, and prefill's per-layer union
         // (~203 experts at B=1024) would not fit a catch-all region (154 slots), so
@@ -3843,6 +4082,16 @@ impl ExpertShard {
         self.pool.as_ref().is_some_and(|p| p.slot_of.contains_key(&(layer, e)))
     }
 
+    /// Prefill staging slots (0 = off / no pool).
+    pub fn stage_slots(&self) -> usize {
+        self.pool.as_ref().map_or(0, |p| p.stage_slots())
+    }
+
+    /// Cumulative prefill-staging counters (zero without a pool).
+    pub fn stage_counters(&self) -> StageCounters {
+        self.pool.as_ref().map_or_else(StageCounters::default, |p| p.sc)
+    }
+
     pub fn layer_is_paged(&self, layer: u32) -> bool {
         self.pool.is_some()
             && self.layers.get(layer as usize).and_then(|l| l.as_ref()).is_some_and(|l| l.page.is_some())
@@ -3881,19 +4130,22 @@ impl ExpertShard {
     }
 
     /// The hub asked for pins (`REQ_FLAG_PIN`): turn them on for this
-    /// connection (idempotent). Budget = pool slots - `b2_pin_reserve()` - the
-    /// layer floors. False for an unpaged shard, which never evicts anyway.
+    /// connection (idempotent). Budget = pool slots - the prefill staging band
+    /// - `b2_pin_reserve()` - the layer floors (the pinning block above
+    /// `PIN_RESERVE_MIN`). False for an unpaged shard, which never evicts
+    /// anyway.
     pub fn pin_enable(&mut self) -> bool {
         let Some(p) = self.pool.as_mut() else { return false };
         if !p.pins.on {
             let n = p.owner_of.len();
+            let stage = p.stage_slots();
             let floors: usize = p.floor.iter().map(|&f| f as usize).sum();
-            let r = b2_pin_reserve();
-            let budget = n.saturating_sub(r + floors) as u32;
+            let r = b2_pin_reserve(stage);
+            let budget = n.saturating_sub(stage + r + floors) as u32;
             p.pins.enable(budget);
             eprintln!(
-                "expertd: pinning ON for this connection: budget {budget} of {n} slots (reserve {r}, floors {floors}; \
-                 no-deadlock minimum {PIN_RESERVE_MIN}){}",
+                "expertd: pinning ON for this connection: budget {budget} of {n} slots (staging {stage}, reserve {r}, floors {floors}; \
+                 no-deadlock minimum reserve + staging >= {PIN_RESERVE_MIN}){}",
                 if b2_assert_pinned() { ", V41_B2_ASSERT_PINNED" } else { "" }
             );
         }
@@ -3969,7 +4221,7 @@ impl ExpertShard {
                     }
                 }
                 let row = &p.remap_hosts[layer as usize];
-                p.pins.report(layer, row)
+                p.pins.report(layer, row, p.stage)
             }
         };
         Some((map, [p.pins.epoch, p.pins.pinned, p.pins.budget]))
@@ -4093,6 +4345,8 @@ impl ExpertShard {
             pool.dirty[layer as usize] = false;
         }
         let ev_t_dirty = if ev_on { super::evtrace::now() } else { nan };
+        // `evtrace`: staging claims / hits / spills across this call.
+        let ev_sc0 = pool.sc;
         // ONE POOL for all layers. The per-layer carve was never load-bearing: it
         // is just the ownership count spread evenly across 40 layers, and grouping
         // residency by layer is not what the working set looks like -- a layer that
@@ -4148,7 +4402,7 @@ impl ExpertShard {
                 m.push(e);
             }
             let ev_t_scan = std::time::Instant::now();
-            let claim = pool.claim_miss(layer, e, &want, &pinned, region, global, scan_class);
+            let claim = pool.claim_miss(layer, e, &want, &pinned, region, global, prefill_shaped, scan_class);
             let ev_scan = ev_t_scan.elapsed().as_nanos() as f64;
             ev_scan_ns += ev_scan;
             let Some((victim, ev_victim)) = claim else {
@@ -4197,8 +4451,12 @@ impl ExpertShard {
             };
             // (offsets, coalesced, evtrace: read start, read end, role (start, end) x3)
             type R = Result<([Option<(usize, usize, u32, u32)>; 3], bool, [f64; 8]), String>;
-            // Demand reads: wholly from the mirror under urgency routing.
-            let route = if knobs::route_urgency() {
+            // Demand reads: wholly from the mirror under urgency routing --
+            // except a PREFILL-shaped pass's, striped across both drives
+            // (`knobs::prefill_route_split`, default): a chunk's ~200 reads
+            // per layer otherwise monopolise the SN5000 alongside decode's
+            // demand reads while the E100 idles.
+            let route = if knobs::route_urgency() && !(prefill_shaped && knobs::prefill_route_split()) {
                 v4flash_core::hf_v41::ExpertRoute::mirror_only()
             } else {
                 v4flash_core::hf_v41::ExpertRoute::split()
@@ -4325,6 +4583,8 @@ impl ExpertShard {
                 ev_scan_ns, f64::from(ev_foreign), f64::from(ev_free), k as f64, f64::from(ev_chunks),
                 f64::from(u8::from(ev_dirty_upload)), if dirty { ev_t_up.elapsed().as_nanos() as f64 } else { 0.0 },
                 ev_q0[0], ev_q0[1], ev_q0[2], ev_q0[3],
+                (pool.sc.claims - ev_sc0.claims) as f64, (pool.sc.hits - ev_sc0.hits) as f64,
+                (pool.sc.spill_in + pool.sc.spill_out - ev_sc0.spill_in - ev_sc0.spill_out) as f64,
             ]);
         }
         Ok(())
@@ -5037,6 +5297,7 @@ impl MoeExecutor {
                     for &e in &self.missing_scratch {
                         shard.park_words.push((layer << 16) | e as u32);
                     }
+                    shard.park_prefill = b > 16;
                     shard.parked_pins.clear();
                     for &e in sel.iter().filter(|&&e| e != NO_PICK && (0..N_EXPERT as i32).contains(&e)) {
                         shard.parked_pins.push((layer, e as u32));
@@ -5801,6 +6062,7 @@ pub fn serve_connection(
                     shard.pin_enable();
                 }
                 let ev_pin0 = shard.pin_counters();
+                let ev_sc0 = shard.stage_counters();
                 shard.pin_apply_words(req.release, req.prefetch);
                 if let Some(rb) = reqb.as_ref() {
                     shard.pin_apply_words(rb.release, rb.prefetch);
@@ -5890,7 +6152,8 @@ pub fn serve_connection(
                         }
                         if !words.is_empty() {
                             shard.pinned = cur_pins.clone();
-                            shard.prefetch_words_ex(&words, true);
+                            // A prefill chunk's reads land in the staging band.
+                            shard.prefetch_words_cls(&words, true, nreq.b > proto::PIN_DECODE_MAX_ROWS);
                             shard.pinned.clear();
                         }
                     };
@@ -5925,7 +6188,8 @@ pub fn serve_connection(
                     // the reads have landed, serve every servable frame that
                     // arrives. `ensure` afterwards admits what is left.
                     let words = std::mem::take(&mut shard.park_words);
-                    shard.prefetch_words_ex(&words, true);
+                    let park_prefill = shard.park_prefill;
+                    shard.prefetch_words_cls(&words, true, park_prefill);
                     static PARK_LOG: std::sync::LazyLock<bool> =
                         std::sync::LazyLock::new(|| std::env::var("V41_B2_PARK_LOG").as_deref() == Ok("1"));
                     // Bound: a lost read (dropped hint, failed prefetch) falls
@@ -6218,6 +6482,7 @@ pub fn serve_connection(
                     }
                     v.push(pf1[11]);
                     v.extend_from_slice(&ev_pin_fields(ev_pin0, shard.pin_counters(), req.release.len(), &paged));
+                    v.extend_from_slice(&ev_stage_fields(ev_sc0, shard.stage_counters()));
                     super::evtrace::emit(&super::evtrace_kinds::B2_REQ, &v);
                     // The merged partner: same pass, its own identity and arrival.
                     if let (Some(rb), Some((hb, _, tfb, _, t2b))) = (reqb.as_ref(), partner.as_ref()) {
@@ -6244,6 +6509,7 @@ pub fn serve_connection(
                             ("pin_release_words", rb.release.len() as f64), ("pin_new", nan), ("pin_denied", nan),
                             ("pin_drops_no_victim", nan), ("pin_evictions", nan),
                             ("n_paged", paged_b.iter().map(|w| w.count_ones()).sum::<u32>() as f64),
+                            ("stage_claims", nan), ("stage_hits", nan), ("stage_spills", nan),
                         ] {
                             super::evtrace::set_named(k, &mut v, name, x);
                         }
@@ -6316,6 +6582,13 @@ pub fn serve_connection(
                                 pfs.push_str(&format!(
                                     " | pins {pinned}/{budget} released={} new={} denied={} drops_no_victim={} pinned_evictions={} revokes={}",
                                     c.releases, c.new_pins, c.denied, c.no_victim_drops, c.pinned_evictions, c.revokes
+                                ));
+                            }
+                            if shard.stage_slots() > 0 {
+                                let s = shard.stage_counters();
+                                pfs.push_str(&format!(
+                                    " | stage {} claims={} hits={} spill_in={} spill_out={} drops={}",
+                                    shard.stage_slots(), s.claims, s.hits, s.spill_in, s.spill_out, s.drops
                                 ));
                             }
                             // `pread` here is the PROCESS-WIDE read counter differenced
@@ -6429,6 +6702,7 @@ fn serve_interleaved(
         shard.pin_enable();
     }
     let ev_pin0 = shard.pin_counters();
+    let ev_sc0 = shard.stage_counters();
     shard.pin_apply_words(req.release, req.prefetch);
     if !req.hint_admit.is_empty() {
         shard.hint_evict_first(req.hint_admit);
@@ -6489,10 +6763,12 @@ fn serve_interleaved(
         sel.dedup();
         let under = if g.0 == u64::MAX { f64::NAN } else { g.0 as f64 };
         let pf = ev_pin_fields(ev_pin0, shard.pin_counters(), req.release.len(), &paged);
+        let sf = ev_stage_fields(ev_sc0, shard.stage_counters());
         super::evtrace::emit_named(&super::evtrace_kinds::B2_REQ, &[
             ("pin_on", pf[0]), ("pin_pinned", pf[1]), ("pin_budget", pf[2]), ("pin_epoch", pf[3]),
             ("pin_release_words", pf[4]), ("pin_new", pf[5]), ("pin_denied", pf[6]), ("pin_drops_no_victim", pf[7]),
             ("pin_evictions", pf[8]), ("n_paged", pf[9]),
+            ("stage_claims", sf[0]), ("stage_hits", sf[1]), ("stage_spills", sf[2]),
             ("seq", f64::from(hdr.seq)), ("layer", f64::from(req.layer)), ("b", f64::from(req.b)), ("flags", f64::from(req.flags)),
             ("merged", 0.0), ("served_under", under),
             ("t_hdr", super::evtrace::inst_to_raw(t_first)), ("t_frame", t2 as f64), ("t_dequeue", ev_t_dequeue),
@@ -7481,7 +7757,7 @@ mod tests {
     fn prefetch_queue_priority_and_reservation() {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
-        let job = |e: u32, certain: bool| PfJob { layer: 3, e, set: e as usize, certain, t_hint: Instant::now() };
+        let job = |e: u32, certain: bool| PfJob { layer: 3, e, set: e as usize, certain, stage: false, t_hint: Instant::now() };
         let q = Arc::new(PfQueue::new(1));
         q.push(job(1, false));
         q.push(job(2, false));
@@ -7555,7 +7831,7 @@ mod tests {
     fn prefetch_finish_releases_spec_key() {
         use std::time::Instant;
         let q = PfQueue::with_readers(2, 3);
-        q.push(PfJob { layer: 6, e: 1, set: 0, certain: false, t_hint: Instant::now() });
+        q.push(PfJob { layer: 6, e: 1, set: 0, certain: false, stage: false, t_hint: Instant::now() });
         let j = q.pop_mode(true).unwrap();
         assert!(q.spec_keys_snapshot().contains(&(6, 1)));
         assert!(!q.promote(6, 1), "a running speculative key must not be promoted/urgent");
@@ -7569,7 +7845,7 @@ mod tests {
         // Urgency cap: max_spec 2 but 3 readers -> 2 may run; with 2 readers -> 1.
         let q2 = PfQueue::with_readers(2, 2);
         for e in 0..3 {
-            q2.push(PfJob { layer: 6, e, set: 0, certain: false, t_hint: Instant::now() });
+            q2.push(PfJob { layer: 6, e, set: 0, certain: false, stage: false, t_hint: Instant::now() });
         }
         let _a = q2.pop_mode(true).unwrap();
         let g = q2.inner.lock().unwrap();
@@ -7585,7 +7861,7 @@ mod tests {
     fn prefetch_queue_urgency_routing() {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
-        let job = |e: u32, certain: bool| PfJob { layer: 5, e, set: e as usize, certain, t_hint: Instant::now() };
+        let job = |e: u32, certain: bool| PfJob { layer: 5, e, set: e as usize, certain, stage: false, t_hint: Instant::now() };
         let q = Arc::new(PfQueue::new(1));
         q.push(job(1, true));
         q.push(job(2, false));
@@ -7719,22 +7995,22 @@ mod tests {
         for e in [2, 3, 4, 5] {
             p.grant(1, e);
         }
-        let w = p.report(1, &row);
+        let w = p.report(1, &row, u32::MAX);
         assert_eq!(w[0], (1 << 2) | (1 << 3), "budget 2: the first two landed grants, in grant order");
         assert_eq!((p.pinned, p.c.new_pins, p.c.denied), (2, 2, 1));
         assert!(!p.is_pinned(1, 5), "5 is eligible but not landed");
-        let _ = p.report(1, &row);
+        let _ = p.report(1, &row, u32::MAX);
         assert_eq!(p.c.denied, 1, "a denial drops the grant: counted once per grant");
         // Resident but never used / granted: never pinned.
         row[6] = -7;
-        assert_eq!(p.report(1, &row)[0] & (1 << 6), 0);
+        assert_eq!(p.report(1, &row, u32::MAX)[0] & (1 << 6), 0);
         // Release 2: epoch 1; 4 was denied (grant dropped) so the freed budget
         // stays free until it is granted again.
         p.release((1 << 16) | 2);
         assert_eq!((p.epoch, p.pinned), (1, 1));
-        assert_eq!(p.report(1, &row)[0], 1 << 3);
+        assert_eq!(p.report(1, &row, u32::MAX)[0], 1 << 3);
         p.grant(1, 4);
-        assert_eq!(p.report(1, &row)[0], (1 << 3) | (1 << 4));
+        assert_eq!(p.report(1, &row, u32::MAX)[0], (1 << 3) | (1 << 4));
         assert!(!p.is_pinned(1, 2), "a released expert needs a new grant to pin again");
         // Words for unknown / unpinned keys still advance the epoch.
         p.release((1 << 16) | 300);
@@ -7742,15 +8018,15 @@ mod tests {
         assert_eq!(p.epoch, 3);
         // 5 lands (still within its TTL): budget full, so its grant is dropped.
         row[5] = -9;
-        let _ = p.report(1, &row);
+        let _ = p.report(1, &row, u32::MAX);
         assert!(!p.is_pinned(1, 5));
         assert_eq!(p.c.denied, 2);
         assert!(p.on_evict(1, 3), "evicting a pinned expert is reported");
         assert_eq!((p.pinned, p.c.pinned_evictions), (1, 1));
         row[3] = 0;
-        assert_eq!(p.report(1, &row)[0], 1 << 4, "5 needs a fresh grant");
+        assert_eq!(p.report(1, &row, u32::MAX)[0], 1 << 4, "5 needs a fresh grant");
         p.grant(1, 5);
-        assert_eq!(p.report(1, &row)[0], (1 << 4) | (1 << 5));
+        assert_eq!(p.report(1, &row, u32::MAX)[0], (1 << 4) | (1 << 5));
         assert!(!p.on_evict(1, 6));
         assert_eq!(p.pinned, 2);
         // Enabling again keeps the state; `off` resets it.
@@ -7764,26 +8040,26 @@ mod tests {
         let mut row = vec![0i32; REMAP_LEN];
         q.grant(2, 7);
         for _ in 0..PIN_GRANT_TTL - 1 {
-            let _ = q.report(2, &row);
+            let _ = q.report(2, &row, u32::MAX);
         }
         row[7] = -1;
-        assert_eq!(q.report(2, &row)[0], 1 << 7, "landed on its last report: pinned");
+        assert_eq!(q.report(2, &row, u32::MAX)[0], 1 << 7, "landed on its last report: pinned");
         q.grant(2, 8);
         for _ in 0..PIN_GRANT_TTL {
-            let _ = q.report(2, &row);
+            let _ = q.report(2, &row, u32::MAX);
         }
         row[8] = -2;
-        assert_eq!(q.report(2, &row)[0] & (1 << 8), 0, "expired: never pinned");
+        assert_eq!(q.report(2, &row, u32::MAX)[0] & (1 << 8), 0, "expired: never pinned");
         q.grant(2, 9);
         for _ in 0..PIN_GRANT_TTL - 1 {
-            let _ = q.report(2, &row);
+            let _ = q.report(2, &row, u32::MAX);
         }
         q.grant(2, 9);
         for _ in 0..PIN_GRANT_TTL - 1 {
-            let _ = q.report(2, &row);
+            let _ = q.report(2, &row, u32::MAX);
         }
         row[9] = -3;
-        assert_eq!(q.report(2, &row)[0] & (1 << 9), 1 << 9, "re-granted: clock restarted");
+        assert_eq!(q.report(2, &row, u32::MAX)[0] & (1 << 9), 1 << 9, "re-granted: clock restarted");
         assert_eq!(q.c.denied, 0);
 
         // Fresh first: with one budget slot, the pass's own pick (300) beats an
@@ -7792,11 +8068,11 @@ mod tests {
         f.enable(1);
         let mut row = vec![0i32; REMAP_LEN];
         f.grant(3, 10);
-        let _ = f.report(3, &row);
+        let _ = f.report(3, &row, u32::MAX);
         row[10] = -1;
         row[300] = -2;
         f.grant(3, 300);
-        let w = f.report(3, &row);
+        let w = f.report(3, &row, u32::MAX);
         assert!(f.is_pinned(3, 300) && !f.is_pinned(3, 10), "{w:?}");
         assert_eq!((f.pinned, f.c.denied), (1, 1));
     }
@@ -7841,14 +8117,14 @@ mod tests {
             pool.pins.grant(1, e);
         }
         let row = pool.remap_hosts[1].clone();
-        let _ = pool.pins.report(1, &row);
+        let _ = pool.pins.report(1, &row, pool.stage);
         assert!(pool.pins.is_pinned(1, 0) && pool.pins.is_pinned(1, 2));
         // Oldest slots are layer 1's (seeded first); 0-2 pinned, 3 is next.
-        let (slot, ev) = pool.claim_miss(2, 10, &[10], &[], (4, 8), true, false).unwrap();
+        let (slot, ev) = pool.claim_miss(2, 10, &[10], &[], (4, 8), true, false, false).unwrap();
         assert_eq!((slot, ev), (3, Some((1, 3))));
         pool.commit(2, 10, slot);
         // Then layer 2's, oldest first, minus wanted and parked ones.
-        let (slot, ev) = pool.claim_miss(2, 11, &[11, 0], &[(2, 1)], (4, 8), true, false).unwrap();
+        let (slot, ev) = pool.claim_miss(2, 11, &[11, 0], &[(2, 1)], (4, 8), true, false, false).unwrap();
         assert_eq!((slot, ev), (6, Some((2, 2))), "skips wanted 2/0 and parked 2/1");
         pool.commit(2, 11, slot);
         assert_eq!(pool.pins.c.pinned_evictions, 0);
@@ -7856,8 +8132,8 @@ mod tests {
         // without a revoke; a background landing would be dropped.
         let want = [10u32, 11, 0, 3];
         let extra = [(2u32, 1u32)];
-        assert!(pool.pick_victim_any((4, 8), true, 2, &want, &extra, 2, false).is_none());
-        assert!(pool.pick_victim_any((4, 8), true, 2, &want, &extra, 2, true).is_some(), "only pins stand in the way");
+        assert!(pool.pick_victim_any((4, 8), true, Band::Main, 2, &want, &extra, 2, false).is_none());
+        assert!(pool.pick_victim_any((4, 8), true, Band::Main, 2, &want, &extra, 2, true).is_some(), "only pins stand in the way");
         for (l, e) in [(1u32, 0u32), (1, 1), (1, 2)] {
             assert!(pool.slot_of.contains_key(&(l, e)) && pool.remap_hosts[l as usize][e as usize] != 0);
         }
@@ -7875,12 +8151,105 @@ mod tests {
         pool.pins.grant(1, 0);
         pool.pins.grant(1, 1);
         let row = pool.remap_hosts[1].clone();
-        let _ = pool.pins.report(1, &row);
+        let _ = pool.pins.report(1, &row, pool.stage);
         let v0 = PIN_VIOLATIONS.load(std::sync::atomic::Ordering::Relaxed);
-        let (_, ev) = pool.claim_miss(1, 5, &[5], &[], (0, 2), true, false).expect("revoke, not fail");
+        let (_, ev) = pool.claim_miss(1, 5, &[5], &[], (0, 2), true, false, false).expect("revoke, not fail");
         assert!(ev.is_some());
         assert_eq!((pool.pins.c.revokes, pool.pins.c.pinned_evictions, pool.pins.pinned), (1, 1, 1));
         assert!(PIN_VIOLATIONS.load(std::sync::atomic::Ordering::Relaxed) > v0);
+    }
+
+    /// PREFILL STAGING on a seeded pool (the block above `PIN_RESERVE_MIN`):
+    /// a prefill-shaped claim takes a staging slot and nothing else does; a
+    /// staged landing lands inside and a decode landing outside; `report`
+    /// never pins an expert resident in staging (it is reported not held);
+    /// the two spill directions are counted and never revoke a pin.
+    #[test]
+    fn pool_prefill_stage_bands() {
+        let ids: Vec<u32> = (0..4).collect();
+        // 12 slots: layer 1 at 0..4, layer 2 at 4..8, layer 3 at 8..12.
+        let mut pool = ShardPool::seeded(12, &[(1, 0, &ids), (2, 4, &ids), (3, 8, &ids)], 0.0);
+        assert_eq!(pool.set_stage(4), 4, "the last 4 slots");
+        assert_eq!((pool.stage, pool.stage_slots()), (8, 4));
+        assert_eq!(pool.set_stage(100), 6, "clamped to half the pool");
+        assert_eq!(pool.set_stage(4), 4);
+        let region = (0, 4);
+        // Prefill claims: LRU within staging, never outside, whatever the LRU
+        // says about the main band (layer 1's slots are the oldest).
+        for (k, e) in (20..23).enumerate() {
+            let (slot, ev) = pool.claim_miss(1, e, &[20, 21, 22, 23], &[], region, true, true, true).unwrap();
+            assert_eq!((slot, ev), (8 + k as u32, Some((3, k as u32))), "prefill claim {k} in staging");
+            pool.commit(1, e, slot);
+        }
+        assert_eq!((pool.sc.claims, pool.sc.spill_out), (3, 0));
+        // A decode claim: the main band only (the free-est staging slot, 11,
+        // holds 3/3 and is older than everything in main, but is off limits).
+        let (slot, ev) = pool.claim_miss(2, 30, &[30], &[], (4, 8), true, false, false).unwrap();
+        assert_eq!((slot, ev), (0, Some((1, 0))), "decode claim in main");
+        pool.commit(2, 30, slot);
+        assert_eq!(pool.sc.claims, 3);
+        // Landings: a staged one inside, a decode one outside.
+        let v = pool.pick_victim_any(region, true, Band::Stage, 2, &[], &[], 1, false).unwrap();
+        assert_eq!(v, 11);
+        pool.evict(v, 2);
+        pool.land(v, (1, 40), true);
+        assert!(pool.last_use[11] < PREFILL_AGE, "a staged landing is prefill-class");
+        let v = pool.pick_victim_any(region, true, Band::Main, 2, &[], &[], 1, false).unwrap();
+        assert!(v < 8, "a decode landing stays in main (got {v})");
+        pool.evict(v, 2);
+        pool.land(v, (1, 41), false);
+        assert!(pool.last_use[v as usize] >= PREFILL_AGE);
+        // Hits on staged experts are counted; pins never land in staging.
+        assert!(pool.touch_hit(1, 40, false) && pool.touch_hit(1, 41, false));
+        assert_eq!(pool.sc.hits, 1);
+        pool.pins.enable(8);
+        pool.pins.grant(1, 40); // staged
+        pool.pins.grant(1, 41); // main
+        pool.pins.grant(1, 20); // staged (a prefill claim)
+        let row = pool.remap_hosts[1].clone();
+        let map = pool.pins.report(1, &row, pool.stage);
+        assert!(pool.pins.is_pinned(1, 41) && map[1] & (1 << 9) != 0);
+        assert!(!pool.pins.is_pinned(1, 40) && !pool.pins.is_pinned(1, 20), "never pinned in staging");
+        assert_eq!(map[1] & (1 << 8), 0);
+        assert_eq!((pool.pins.pinned, pool.pins.c.denied), (1, 0), "a staged grant ages, it is not denied");
+        for sl in pool.stage..12 {
+            let (l, e) = pool.owner_of[sl as usize].unwrap();
+            assert!(!pool.pins.is_pinned(l, e));
+        }
+        // Spill OUT: a prefill union that fills staging (4 wanted, all
+        // resident there) claims its 5th expert in main, counted, no revoke.
+        for sl in 8..12 {
+            pool.evict(sl, 1);
+            pool.owner_of[sl as usize] = Some((1, 50 + sl - 8));
+            pool.slot_of.insert((1, 50 + sl - 8), sl);
+            pool.held[1] += 1;
+        }
+        let (slot, _) = pool.claim_miss(1, 54, &[50, 51, 52, 53, 54], &[], region, true, true, true).unwrap();
+        assert!(slot < 8, "spilled into main (got {slot})");
+        pool.commit(1, 54, slot);
+        assert_eq!((pool.sc.spill_out, pool.pins.c.revokes), (1, 0));
+        // Spill IN: every main slot pinned, wanted or parked -> a decode claim
+        // takes a staging slot rather than revoking a pin.
+        for sl in 0..8u32 {
+            if let Some((l, e)) = pool.owner_of[sl as usize] {
+                pool.pins.grant(l, e);
+            }
+        }
+        for l in 1..=3u32 {
+            let row = pool.remap_hosts[l as usize].clone();
+            let _ = pool.pins.report(l, &row, pool.stage);
+        }
+        assert_eq!(pool.pins.pinned, 8);
+        let (slot, ev) = pool.claim_miss(2, 60, &[60], &[], (4, 8), true, false, false).unwrap();
+        assert!(slot >= 8 && ev.is_some(), "spilled into staging (got {slot})");
+        assert_eq!((pool.sc.spill_in, pool.pins.c.revokes, pool.pins.c.pinned_evictions), (1, 0, 0));
+        // Staging off: one band again, every search sees the whole pool.
+        assert_eq!(pool.set_stage(0), 0);
+        assert_eq!(pool.stage, 12);
+        let sc = pool.sc;
+        let (slot, _) = pool.claim_miss(2, 61, &[61], &[], (4, 8), true, true, true).unwrap();
+        assert!(slot >= 8, "with staging off the LRU (a staging slot) wins: {slot}");
+        assert_eq!(pool.sc, sc, "no staging counters move with staging off");
     }
 
     /// THE PIN PROTOCOL, randomized: box 2's real pool, victim search, choke
@@ -7905,6 +8274,10 @@ mod tests {
             assert!(s.c.releases > 100 && s.c.new_pins > 300 && s.evictions > 500, "seed {seed}: {s:?}");
             assert!(s.merged > 5 && s.parked > 20 && s.served_inside > 20 && s.prefill > 20, "seed {seed}: {s:?}");
             assert!(s.bg_landed > 100 && s.stale_maps > 50, "seed {seed}: {s:?}");
+            // Prefill staging was exercised: prefill chunks claimed in the
+            // band and hit there across chunks, never spilled out (STAGE >=
+            // the union); the per-event invariants live in `Box2Sim`.
+            assert!(s.sc.claims > 100 && s.sc.hits > 50 && s.sc.spill_out == 0, "seed {seed}: {s:?}");
             eprintln!("pin sim seed {seed}: {s:?}");
         }
         // Mutation: a hub that applies maps without masking later releases.
@@ -7930,6 +8303,8 @@ mod tests {
         bg_dropped: u64,
         stale_maps: u64,
         max_pinned: u32,
+        /// The pool's prefill-staging counters at the end.
+        sc: StageCounters,
     }
 
     /// xorshift64.
@@ -7972,8 +8347,9 @@ mod tests {
     /// Only the reads are instant and the kernels absent.
     struct Box2Sim {
         pool: ShardPool,
-        /// Background reads in flight (prefetch words, early page, park).
-        bg: Vec<(u32, u32)>,
+        /// Background reads in flight (prefetch words, early page, park), and
+        /// whether each is a PREFILL-shaped request's own (`PfJob::stage`).
+        bg: Vec<((u32, u32), bool)>,
         budget: u32,
         per: u32,
         global: bool,
@@ -8002,19 +8378,20 @@ mod tests {
             v
         }
 
-        /// `prefetch_words_ex`: skip resident / in flight; bounded sets.
-        fn queue_bg(&mut self, words: &[u32]) {
+        /// `prefetch_words_cls`: skip resident / in flight; bounded sets.
+        fn queue_bg(&mut self, words: &[u32], stage: bool) {
+            let stage = stage && self.pool.stage_slots() > 0;
             for &w in words {
                 let key = (w >> 16, w & 0xFFFF);
-                if !self.pool.slot_of.contains_key(&key) && !self.bg.contains(&key) && self.bg.len() < Self::BG_SETS {
-                    self.bg.push(key);
+                if !self.pool.slot_of.contains_key(&key) && !self.bg.iter().any(|b| b.0 == key) && self.bg.len() < Self::BG_SETS {
+                    self.bg.push((key, stage));
                 }
             }
         }
 
         /// `admit_prefetched`: a random subset has completed; land it in random
         /// order, protecting `want` of `layer` and `extra`; drop the landing
-        /// when every victim is pinned.
+        /// when every victim is pinned (or, staged, when staging has none).
         fn admit(&mut self, rng: &mut SimRng, layer: u32, want: &[u32], extra: &[(u32, u32)]) {
             let mut i = 0;
             while i < self.bg.len() {
@@ -8023,19 +8400,24 @@ mod tests {
                     continue;
                 }
                 let j = i + rng.below((self.bg.len() - i) as u64) as usize;
-                let key = self.bg.swap_remove(j);
+                let (key, stage) = self.bg.swap_remove(j);
                 if self.pool.slot_of.contains_key(&key) {
                     continue;
                 }
                 let region = self.region(key.0);
-                match self.pool.pick_victim_any(region, self.global, layer, want, extra, key.0, false) {
+                let band = if stage { Band::Stage } else { Band::Main };
+                match self.pool.pick_victim_any(region, self.global, band, layer, want, extra, key.0, false) {
                     Some(v) => {
+                        // STAGING INVARIANT: a landing takes a slot of its own band.
+                        assert_eq!(v >= self.pool.stage, stage, "landing of {key:?} (stage {stage}) at slot {v}");
                         self.st.evictions += u64::from(self.pool.evict(v, layer).is_some());
-                        self.pool.land(v, key);
+                        self.pool.land(v, key, stage);
                         self.st.bg_landed += 1;
                     }
                     None => {
-                        if self.pool.pick_victim_any(region, self.global, layer, want, extra, key.0, true).is_some() {
+                        if stage {
+                            self.pool.sc.drops += 1;
+                        } else if self.pool.pick_victim_any(region, self.global, band, layer, want, extra, key.0, true).is_some() {
                             self.pool.pins.c.no_victim_drops += 1;
                         }
                         self.st.bg_dropped += 1;
@@ -8055,10 +8437,25 @@ mod tests {
                 if self.pool.touch_hit(layer, e, prefill) {
                     continue;
                 }
+                let sc0 = self.pool.sc;
                 let (slot, ev) = self
                     .pool
-                    .claim_miss(layer, e, &want, extra, region, self.global, prefill)
+                    .claim_miss(layer, e, &want, extra, region, self.global, prefill, prefill)
                     .expect("the reserve guarantees an unpinned victim");
+                // STAGING INVARIANTS (with staging on): a prefill claim takes a
+                // staging slot; a decode claim takes a main slot unless it
+                // SPILLED (main exhausted: counted, and only ever while a
+                // request is parked -- W alone never exhausts the reserve).
+                if self.pool.stage_slots() > 0 {
+                    let staged = slot >= self.pool.stage;
+                    if prefill {
+                        assert!(staged, "prefill claim L{layer} e{e} took main slot {slot}");
+                        assert_eq!(self.pool.sc.spill_out, sc0.spill_out, "STAGE >= the union: no spill out");
+                    } else if staged {
+                        assert_eq!(self.pool.sc.spill_in, sc0.spill_in + 1, "decode claim L{layer} e{e} in staging without a spill");
+                        assert!(!extra.is_empty(), "a decode claim spilled with nothing parked");
+                    }
+                }
                 self.st.evictions += u64::from(ev.is_some());
                 claims.push((e, slot));
             }
@@ -8087,7 +8484,7 @@ mod tests {
             for &w in &r.prefetch {
                 self.pool.pins.grant(w >> 16, w & 0xFFFF);
             }
-            self.queue_bg(&r.prefetch);
+            self.queue_bg(&r.prefetch, false);
         }
 
         /// `pin_grant` for each decode-shaped request of a pass, then ONE
@@ -8104,7 +8501,7 @@ mod tests {
                 }
             }
             let row = self.pool.remap_hosts[layer as usize].clone();
-            let map = self.pool.pins.report(layer, &row);
+            let map = self.pool.pins.report(layer, &row, self.pool.stage);
             let p = &self.pool.pins;
             (map, p.epoch, p.pinned, p.budget)
         }
@@ -8119,7 +8516,7 @@ mod tests {
                 }
             }
             let row = self.pool.remap_hosts[r.layer as usize].clone();
-            let map = self.pool.pins.report(r.layer, &row);
+            let map = self.pool.pins.report(r.layer, &row, self.pool.stage);
             let p = &self.pool.pins;
             SimReply { seq: r.seq, layer: r.layer, map, epoch: p.epoch, pinned: p.pinned, budget: p.budget, paged }
         }
@@ -8154,7 +8551,8 @@ mod tests {
             if let Some(nx) = wire.front() {
                 if !self.scripted && rng.below(2) == 0 {
                     let w: Vec<u32> = Self::distinct(&nx.sel).into_iter().map(|e| (nx.layer << 16) | e).collect();
-                    self.queue_bg(&w);
+                    // The early-page hook: a prefill frame's reads are staged.
+                    self.queue_bg(&w, nx.b > 16);
                 }
             }
             let mut sel = a.sel.clone();
@@ -8167,7 +8565,8 @@ mod tests {
                 self.st.parked += 1;
                 let parked: Vec<(u32, u32)> = Self::distinct(&sel).into_iter().map(|e| (a.layer, e)).collect();
                 let w: Vec<u32> = parked.iter().filter(|k| !self.pool.slot_of.contains_key(k)).map(|k| (k.0 << 16) | k.1).collect();
-                self.queue_bg(&w);
+                // The park hook: a parked prefill chunk's reads are staged.
+                self.queue_bg(&w, a.b > 16);
                 for _ in 0..1 + rng.below(3) {
                     if wire.front().is_some_and(|nx| nx.b <= PARK_MAX_ROWS) {
                         let c = wire.pop_front().unwrap();
@@ -8289,9 +8688,14 @@ mod tests {
         const RANGE: u32 = 32; // experts 0..RANGE per layer, Zipf-picked
         const PER: u32 = 20; // seeded slots per layer
         const N: usize = (L * PER) as usize;
-        // The no-deadlock reserve for this workload: a pass wants <= RANGE
-        // experts of one layer, a parked request's picks are <= RANGE more.
-        const R: usize = 2 * RANGE as usize;
+        // The no-deadlock bound for this workload: a pass wants <= RANGE
+        // experts of one layer, a parked request's picks are <= RANGE more,
+        // so `R + STAGE >= 2 * RANGE`. Split as the production defaults are
+        // (staging = one union, the rest as reserve): prefill claims never
+        // spill out (STAGE >= RANGE), served-inside claims may spill IN under
+        // a park (R < 2 * RANGE), nothing ever revokes.
+        const STAGE: usize = RANGE as usize;
+        const R: usize = RANGE as usize;
         const HEADROOM: u32 = 8;
         const MAX_IN_FLIGHT: usize = 6;
         let mut rng = SimRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -8309,10 +8713,12 @@ mod tests {
         };
         let region_ids: Vec<u32> = (0..PER).collect();
         let regions: Vec<(u32, u32, &[u32])> = (0..L).map(|l| (l, l * PER, &region_ids[..])).collect();
+        let mut pool = ShardPool::seeded(N, &regions, 0.0);
+        assert_eq!(pool.set_stage(STAGE), STAGE);
         let mut b2 = Box2Sim {
-            pool: ShardPool::seeded(N, &regions, 0.0),
+            pool,
             bg: Vec::new(),
-            budget: (N - R) as u32,
+            budget: (N - STAGE - R) as u32,
             per: PER,
             global: seed % 2 == 1,
             early: EarlyPaged::default(),
@@ -8339,7 +8745,10 @@ mod tests {
                     if ledger.held(l, e) && !pinned {
                         *subset_violations += 1;
                     }
-                    assert!(!pinned || b2.pool.remap_hosts[l as usize][e as usize] != 0, "pinned but not landed: L{l} e{e}");
+                    let r = b2.pool.remap_hosts[l as usize][e as usize];
+                    assert!(!pinned || r != 0, "pinned but not landed: L{l} e{e}");
+                    // STAGING INVARIANT: pinned => landed in the MAIN band.
+                    assert!(!pinned || ((-r - 1) as u32) < b2.pool.stage, "pinned in staging: L{l} e{e} slot {}", -r - 1);
                 }
             }
             if b2.pool.pins.on {
@@ -8432,6 +8841,7 @@ mod tests {
             subset_violations,
             held_checked,
             stale_maps,
+            sc: b2.pool.sc,
             ..b2.st
         }
     }

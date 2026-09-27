@@ -16,10 +16,12 @@
 //!
 //! Sizing (why these numbers): 4 layers x 5 seeded experts = 20 pool slots
 //! (376 MB of GTT); picks over 6 experts per layer (24 > 20, so it evicts).
-//! The no-deadlock reserve is max(pass wants) + max(parked picks) = 6 + 6 = 12
-//! here, so the budget is 8; the production default (480) is sized the same
-//! way for 384 experts per layer and 16-row park passes. Each miss reads one
-//! 18.8 MB expert from this box's disk (O_DIRECT): a few hundred per run.
+//! The no-deadlock bound is reserve + prefill staging >= max(pass wants) +
+//! max(parked picks) = 6 + 6 = 12 here, split like production (staging = one
+//! layer union = 6, reserve 6), so the budget is 20 - 6 - 6 = 8; the
+//! production defaults (384 + 192 >= 480) are sized the same way for 384
+//! experts per layer and 16-row park passes. Each miss reads one 18.8 MB
+//! expert from this box's disk (O_DIRECT): a few hundred per run.
 //!
 //! Run (box 1, one GPU test process at a time):
 //!   CARGO_TARGET_DIR=target-v41 nix develop -c cargo test --release -p v4flash-kernels \
@@ -35,7 +37,7 @@ use v4flash_kernels::config::{BLOCKS_Q8K_GATE_IN, N_EMBD, N_EXPERT_USED};
 use v4flash_kernels::het::b2_mirror;
 use v4flash_kernels::het::remote_experts::{
     push_prefetch_words, serve_connection, Assignment, ExpertShard, MoeExecutor, PinCounters, RemoteExpertClient,
-    ServeOptions, SocketOptions, NO_PICK, XQ_BYTES_PER_TOKEN,
+    ServeOptions, SocketOptions, StageCounters, NO_PICK, XQ_BYTES_PER_TOKEN,
 };
 
 const LAYERS: [u32; 4] = [3, 7, 11, 15];
@@ -223,7 +225,8 @@ fn remote_experts_pin_loopback() -> eyre::Result<()> {
     install_panic_handler()?;
     // Knobs are read once, before anything below touches them.
     for (k, v) in [
-        ("V41_B2_PIN_RESERVE", "12"),
+        ("V41_B2_PIN_RESERVE", "6"),
+        ("V41_B2_PREFILL_STAGE", "6"),
         ("V41_B2_PIN_HEADROOM", "2"),
         ("V41_B2_PIN_DECAY_STEPS", "8"),
         ("V41_B2_PREFETCH_SETS", "4"),
@@ -249,7 +252,8 @@ fn remote_experts_pin_loopback() -> eyre::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?.to_string();
     let (tx_ready, rx_ready) = mpsc::channel::<eyre::Result<()>>();
-    let (tx_pins, rx_pins) = mpsc::channel::<Option<(PinCounters, u32, u32, u32)>>();
+    // Per connection: the pin counters, and the pool's staging counters + size.
+    let (tx_pins, rx_pins) = mpsc::channel::<(Option<(PinCounters, u32, u32, u32)>, StageCounters, usize)>();
     let daemon = std::thread::spawn(move || -> eyre::Result<()> {
         let setup = (|| -> eyre::Result<(ExpertShard, MoeExecutor)> {
             let hf = V41HfWeights::open(&dir, None)?;
@@ -274,7 +278,7 @@ fn remote_experts_pin_loopback() -> eyre::Result<()> {
         for _ in 0..2 {
             let (stream, _) = listener.accept()?;
             serve_connection(stream, &mut shard, &mut exec, &opts, None)?;
-            tx_pins.send(shard.pin_counters()).unwrap();
+            tx_pins.send((shard.pin_counters(), shard.stage_counters(), shard.stage_slots())).unwrap();
         }
         Ok(())
     });
@@ -283,18 +287,22 @@ fn remote_experts_pin_loopback() -> eyre::Result<()> {
     let stream = gen_stream(0x5eed_0001_b2b2_0001);
     let n_req: usize = stream.iter().map(|s| 2 * s.len()).sum();
     let off = run(&addr, &stream, false)?;
-    let pins_off = rx_pins.recv()?;
+    let (pins_off, sc_off, stage_slots) = rx_pins.recv()?;
     let (s0, h0, r0) = b2_mirror::pin_totals();
     let on = run(&addr, &stream, true)?;
-    let pins_on = rx_pins.recv()?;
+    let (pins_on, sc_on, _) = rx_pins.recv()?;
     let (s1, h1, r1) = b2_mirror::pin_totals();
     daemon.join().map_err(|_| eyre!("daemon panicked"))??;
     let _ = tx_done.send(());
 
-    eprintln!("pin OFF: box 2 pins {pins_off:?}");
+    eprintln!("pin OFF: box 2 pins {pins_off:?}; staging {stage_slots} slots {sc_off:?}");
     eprintln!(
-        "pin ON : {} replies, held picks {} surprises {} paged {} max pinned {}/{}; mirror totals: surprises {} held {} released {}; box 2 {pins_on:?}",
-        on.pin_replies, on.held, on.surprises, on.paged, on.max_pinned, on.budget, s1 - s0, h1 - h0, r1 - r0
+        "pin ON : {} replies, held picks {} surprises {} paged {} max pinned {}/{}; mirror totals: surprises {} held {} released {}; box 2 {pins_on:?}; staging {:?}",
+        on.pin_replies, on.held, on.surprises, on.paged, on.max_pinned, on.budget, s1 - s0, h1 - h0, r1 - r0,
+        StageCounters {
+            claims: sc_on.claims - sc_off.claims, hits: sc_on.hits - sc_off.hits, spill_in: sc_on.spill_in - sc_off.spill_in,
+            spill_out: sc_on.spill_out - sc_off.spill_out, drops: sc_on.drops - sc_off.drops,
+        }
     );
     assert!(pins_off.is_none(), "pinning must stay off without the flag");
     assert_eq!(off.partials.len(), n_req);
@@ -302,8 +310,14 @@ fn remote_experts_pin_loopback() -> eyre::Result<()> {
     let mismatched = off.partials.iter().zip(&on.partials).filter(|(a, b)| a != b).count();
     assert_eq!(mismatched, 0, "pinning changed {mismatched} of {n_req} partials");
     assert!(off.partials.iter().all(|p| p.len() % N_EMBD as usize == 0));
+    // Prefill staging (V41_B2_PREFILL_STAGE=6 = the picks range, so a prefill
+    // union always fits): the 20-row chunks claimed in the band and never
+    // spilled out of it; the budget is slots - staging - reserve.
+    assert_eq!(stage_slots, 6);
+    assert!(sc_on.claims > 10 && sc_on.hits > 0, "staging never used: {sc_on:?}");
+    assert_eq!(sc_on.spill_out, 0, "{sc_on:?}");
     let (c, _pinned, budget, _epoch) = pins_on.ok_or_else(|| eyre!("pinning never turned on"))?;
-    assert_eq!(budget, 20 - 12);
+    assert_eq!(budget, 20 - 6 - 6);
     assert_eq!(on.surprises, 0);
     assert_eq!(s1 - s0, 0, "mirror counted surprises");
     assert_eq!((c.pinned_evictions, c.revokes), (0, 0), "{c:?}");
