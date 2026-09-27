@@ -164,6 +164,12 @@ pub static B2_REQ: Kind = Kind {
         // `n_paged` = the pass's experts not landed when it started.
         "pin_on", "pin_pinned", "pin_budget", "pin_epoch", "pin_release_words",
         "pin_new", "pin_denied", "pin_drops_no_victim", "pin_evictions", "n_paged",
+        // prefill staging (`V41_B2_PREFILL_STAGE`), deltas across the request:
+        // prefill claims into the staging band, hits on staged experts (any
+        // pass), and claims that SPILLED into the other band (a served-inside
+        // claim into staging, or a prefill claim into main; 0 by design at the
+        // default sizes).
+        "stage_claims", "stage_hits", "stage_spills",
     ],
 };
 
@@ -183,6 +189,9 @@ pub static B2_ENSURE: Kind = Kind {
         "victim_scan_ns", "evicted_foreign", "took_free", "k_par", "n_chunks",
         "dirty_upload", "remap_upload_ns",
         "pf_run_certain", "pf_run_spec", "pf_q_certain", "pf_q_spec",
+        // prefill staging, this call: claims into the staging band, hits on
+        // staged experts, claims spilled into the other band.
+        "stage_claims", "stage_hits", "stage_spills",
     ],
 };
 
