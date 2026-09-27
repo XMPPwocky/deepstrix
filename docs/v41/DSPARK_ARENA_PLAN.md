@@ -667,7 +667,23 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
     | base, legacy quantizer | 3.719 | 4.382 | [-0.99, -0.32] | 0.854 |
     | nomarkov | 1.831 | 2.382 | [-0.97, -0.20] | 0.573 |
 
-    FAILS the bar. The quantizer fix is neutral (+0.045, noise). The drafter's own
+    **A1 PASSED after the shared-expert fix (dca8467; window 20:02-20:04, hub
+    only, logs ~/logs/dspark_parity_20260927_fix):**
+
+    | run | E ours | E ref | 90% paired interval | d1 draft == ref | agreement given identical earlier drafts, d1..d5 |
+    |---|---|---|---|---|---|
+    | base | 4.348 | 4.382 | [-0.101, +0.000] | 0.989 | 0.989 0.966 0.976 0.988 1.000 |
+    | nomarkov | 2.427 | 2.382 | [+0.011, +0.090] | 0.978 | 0.978 0.920 0.963 0.948 0.959 |
+
+    |conf - ref| fell from 3.7 to 0.15-0.21 per depth. The bug: `MtpState::moe` fed
+    the shared expert through `dense_matvec`, which for Q8_0 weights reads only the
+    quantized (`xq`, `xscale`) pair, and nothing in `moe()` requantized it, so the
+    shared expert of all three layers ran on `attn()`'s quantization of the
+    ATTENTION input. Found by static review against `model.py` after the first run
+    localised the gap inside the drafter's layers. The pre-fix results below are
+    kept for the record.
+
+    Pre-fix: FAILS the bar. The quantizer fix is neutral (+0.045, noise). The drafter's own
     transformer output diverges from the reference inside its three layers: the
     transformer-only first draft matches the reference's only 57% of the time, and
     our confidence is systematically LOW (ours - ref mean -3.33 at d1, -1.95 d2,
