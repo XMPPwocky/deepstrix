@@ -1797,6 +1797,13 @@ fn ev_cur_seq() -> f64 {
     }
 }
 
+/// `a |= b` over residency words.
+fn or_words(a: &mut [u32; proto::RESID_WORDS], b: &[u32; proto::RESID_WORDS]) {
+    for (x, y) in a.iter_mut().zip(b) {
+        *x |= *y;
+    }
+}
+
 /// `evtrace` `b2_req` pin fields, `pin_on` .. `n_paged` in `B2_REQ` order:
 /// the pin state after the request, counter deltas across it (`before` =
 /// `ExpertShard::pin_counters` at its start), its release words, and how many
@@ -2051,6 +2058,12 @@ pub struct ExpertShard {
     /// The parked request's non-resident picks as `layer << 16 | expert`, for
     /// the park hook to hand to the prefetch readers.
     pub park_words: Vec<u32>,
+    /// Pin mode: per queued request (by seq), the picks NOT landed when its
+    /// frame ARRIVED (the early-page hook sees every frame first). OR-ed into
+    /// the reply's PAGED bits, so a read that hook finished before the pass
+    /// started still counts as "box 2 had to page it" for the hub's surprise
+    /// check. Bounded (`EARLY_PAGED_MAX`); empty unless pins are on.
+    pub early_paged: Vec<(u32, [u32; proto::RESID_WORDS])>,
     /// Cumulative time the compute thread spent BLOCKED in `admit_prefetched`
     /// waiting for a prefetch read it needs this request (2026-09-22). Also
     /// added to the layer's `read_ns`, see the note there.
@@ -3214,6 +3227,7 @@ impl ExpertShard {
             pinned: Vec::new(),
             parked_pins: Vec::new(),
             park_words: Vec::new(),
+            early_paged: Vec::new(),
             prefetch_wait_ns: 0,
             ev_admit: [0; 5],
         })
@@ -3763,6 +3777,7 @@ impl ExpertShard {
         if let Some(p) = self.pool.as_mut() {
             p.pins = PinBook::off();
         }
+        self.early_paged.clear();
     }
 
     /// The hub asked for pins (`REQ_FLAG_PIN`): turn them on for this
@@ -3850,6 +3865,35 @@ impl ExpertShard {
             }
         }
         w
+    }
+
+    /// Most queued frames whose arrival-time paged bits are kept
+    /// (`early_paged`); the reader keeps at most a few frames queued.
+    const EARLY_PAGED_MAX: usize = 32;
+
+    /// A request frame arrived (the early-page hook): remember which of its
+    /// picks were not landed, for its reply's PAGED bits. Pin mode only.
+    pub fn note_early_paged(&mut self, seq: u32, layer: u32, sel: &[i32]) {
+        if !self.pin_on() {
+            return;
+        }
+        let bits = self.paged_bits(layer, sel);
+        if bits.iter().all(|&w| w == 0) {
+            return;
+        }
+        if self.early_paged.len() >= Self::EARLY_PAGED_MAX {
+            self.early_paged.remove(0);
+        }
+        self.early_paged.push((seq, bits));
+    }
+
+    /// The arrival-time paged bits of request `seq` (all zero if none were
+    /// kept), consumed.
+    pub fn take_early_paged(&mut self, seq: u32) -> [u32; proto::RESID_WORDS] {
+        match self.early_paged.iter().position(|(s, _)| *s == seq) {
+            Some(i) => self.early_paged.swap_remove(i).1,
+            None => [0; proto::RESID_WORDS],
+        }
     }
 
     /// This connection's pin counters and `(pinned, budget, epoch)`.
@@ -5710,6 +5754,7 @@ pub fn serve_connection(
                         if !shard.layer_is_paged(nreq.layer) {
                             return;
                         }
+                        shard.note_early_paged(hdr.seq, nreq.layer, nreq.sel);
                         let mut words: Vec<u32> = Vec::with_capacity(nreq.sel.len());
                         for &e in nreq.sel {
                             if (0..N_EXPERT as i32).contains(&e) && !shard.is_resident_pool(nreq.layer, e as u32) {
@@ -5876,11 +5921,22 @@ pub fn serve_connection(
                 // pin block with this pass's paged bits. A decode-shaped pass's
                 // picks (both requests' when merged) become pinnable here.
                 let decode_shaped = b + bb <= 16;
+                // PAGED bits: what the pass found not landed when it started,
+                // plus what the early-page hook found not landed when the
+                // frame(s) arrived (a read it finished before the pass began
+                // was still a page the hub did not expect).
+                let mut paged = timing.paged;
+                if req.flags & proto::REQ_FLAG_PIN != 0 {
+                    or_words(&mut paged, &shard.take_early_paged(hdr.seq));
+                    if let Some((hb, ..)) = partner.as_ref() {
+                        or_words(&mut paged, &shard.take_early_paged(hb.seq));
+                    }
+                }
                 let pin_a = if req.flags & proto::REQ_FLAG_PIN != 0 { shard.pin_report(req.layer, sel_run, decode_shaped) } else { None };
                 match pin_a {
                     Some((map, [epoch, pinned, budget])) => {
                         proto::append_residency(&mut resp, &map);
-                        proto::append_pin(&mut resp, epoch, pinned, budget, &timing.paged);
+                        proto::append_pin(&mut resp, epoch, pinned, budget, &paged);
                     }
                     None if req.flags & proto::REQ_FLAG_RESID != 0 => {
                         proto::append_residency(&mut resp, &shard.residency_words(req.layer));
@@ -5905,7 +5961,7 @@ pub fn serve_connection(
                         match pin_b {
                             Some((map, [epoch, pinned, budget])) => {
                                 proto::append_residency(&mut resp_b, &map);
-                                proto::append_pin(&mut resp_b, epoch, pinned, budget, &timing.paged);
+                                proto::append_pin(&mut resp_b, epoch, pinned, budget, &paged);
                             }
                             None if rb.flags & proto::REQ_FLAG_RESID != 0 => {
                                 proto::append_residency(&mut resp_b, &shard.residency_words(rb.layer));
@@ -6012,7 +6068,7 @@ pub fn serve_connection(
                         v.push(pf1[i] - ev_pf0[i]);
                     }
                     v.push(pf1[11]);
-                    v.extend_from_slice(&ev_pin_fields(ev_pin0, shard.pin_counters(), req.release.len(), &timing.paged));
+                    v.extend_from_slice(&ev_pin_fields(ev_pin0, shard.pin_counters(), req.release.len(), &paged));
                     super::evtrace::emit(&super::evtrace_kinds::B2_REQ, &v);
                     // The merged partner: same pass, its own identity and arrival.
                     if let (Some(rb), Some((hb, _, tfb, _, t2b))) = (reqb.as_ref(), partner.as_ref()) {
@@ -6254,11 +6310,17 @@ fn serve_interleaved(
         exec.read_f16_at(0, b, resp.view_mut::<u16>(proto::RESP_DATA_OFF, n))?;
     }
     let ev_t_d2h = if ev_on { super::evtrace::now() } else { f64::NAN };
+    // PAGED bits: the pass's own plus the early-page hook's at arrival (see
+    // `serve_connection`).
+    let mut paged = timing.paged;
+    if req.flags & proto::REQ_FLAG_PIN != 0 {
+        or_words(&mut paged, &shard.take_early_paged(hdr.seq));
+    }
     let pin = if req.flags & proto::REQ_FLAG_PIN != 0 { shard.pin_report(req.layer, req.sel, b <= 16) } else { None };
     match pin {
         Some((map, [epoch, pinned, budget])) => {
             proto::append_residency(&mut resp, &map);
-            proto::append_pin(&mut resp, epoch, pinned, budget, &timing.paged);
+            proto::append_pin(&mut resp, epoch, pinned, budget, &paged);
         }
         None if req.flags & proto::REQ_FLAG_RESID != 0 => {
             proto::append_residency(&mut resp, &shard.residency_words(req.layer));
@@ -6276,7 +6338,7 @@ fn serve_interleaved(
         sel.sort_unstable();
         sel.dedup();
         let under = if g.0 == u64::MAX { f64::NAN } else { g.0 as f64 };
-        let pf = ev_pin_fields(ev_pin0, shard.pin_counters(), req.release.len(), &timing.paged);
+        let pf = ev_pin_fields(ev_pin0, shard.pin_counters(), req.release.len(), &paged);
         super::evtrace::emit_named(&super::evtrace_kinds::B2_REQ, &[
             ("pin_on", pf[0]), ("pin_pinned", pf[1]), ("pin_budget", pf[2]), ("pin_epoch", pf[3]),
             ("pin_release_words", pf[4]), ("pin_new", pf[5]), ("pin_denied", pf[6]), ("pin_drops_no_victim", pf[7]),
