@@ -59,6 +59,11 @@ pub static HUB_REQ: Kind = Kind {
         "n_picks", "n_distinct", "n_pred_miss", "n_pred_incoming", "n_pred_pending",
         "rtt_us", "srv_us", "page_us", "compute_us", "n_miss", "miss_bits", "bytes_out", "bytes_in",
         "blocked", "clock_offset_ns", "clock_delay_ns", "step_rows",
+        // pinning (`V41_B2_PIN`; NaN when the reply has no pin block): distinct
+        // sent picks the mirror held at submit, how many of those box 2 had to
+        // page anyway (SURPRISES: must be 0), box 2's paged experts for the
+        // pass, and its pinned count / release epoch.
+        "n_held", "n_surprise", "n_paged", "pinned", "pin_epoch",
     ],
 };
 
@@ -79,6 +84,11 @@ pub static HUB_STEP: Kind = Kind {
         "hop_submit_to_write_us", "hop_wake_us", "hop_slack_us", "hop_blocked", "hop_waits",
         // cache-prior / substitution (b2_mirror::take_sub_stats)
         "sub_predicted_miss", "sub_reads_avoided", "sub_picks_swapped", "sub_blocked", "sub_plan_failed", "sub_admits_queued", "sub_incoming_covered",
+        // pinning (b2_mirror::take_pin_stats; NaN when `V41_B2_PIN` is off):
+        // SURPRISES = sent picks the mirror held that box 2 paged anyway (must
+        // be 0), held picks sent, release words queued, box 2's pinned count
+        // (estimated net of releases in flight) and its budget
+        "b2_surprises", "b2_held_picks", "b2_pin_released", "b2_pinned", "b2_pin_budget",
         // box-1 pager (deltas; a prefill between steps lands in the next step)
         "b1_misses", "b1_read_ms", "b1_pf_queued", "b1_pf_admitted", "b1_pf_dropped_full", "b1_pf_admit_ms",
         // layer-host timers (lh.*, ms)
@@ -145,6 +155,15 @@ pub static B2_REQ: Kind = Kind {
         "pf_run_certain", "pf_run_spec", "pf_q_certain", "pf_q_spec", "pf_free_sets", "pf_pending",
         "pf_d_hinted", "pf_d_admitted", "pf_d_dropped", "pf_d_waited", "pf_d_promoted",
         "pool_resident",
+        // pinning (`REQ_FLAG_PIN`; `pin_on` 0 = off on this connection): state
+        // after the request, then deltas across it. `pin_denied` = eligible
+        // landed experts refused for budget (reported not held),
+        // `pin_drops_no_victim` = background landings dropped because every
+        // candidate victim was pinned, `pin_evictions` = pinned experts that
+        // left the pool (a BUG unless the reserve is below its minimum),
+        // `n_paged` = the pass's experts not landed when it started.
+        "pin_on", "pin_pinned", "pin_budget", "pin_epoch", "pin_release_words",
+        "pin_new", "pin_denied", "pin_drops_no_victim", "pin_evictions", "n_paged",
     ],
 };
 

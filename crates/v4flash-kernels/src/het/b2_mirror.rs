@@ -80,6 +80,37 @@
 //! experts are acceptable substitutes (mode 2) and are boosted by the prior
 //! (mode 3), like any resident expert.
 //!
+//! PINNING (`V41_B2_PIN=1`, default off; 2026-09-26): the hub is never
+//! surprised. Without it "held" is box 2's landed map as of the layer's last
+//! reply, and box 2 evicts ~20 experts between two replies of a layer: half of
+//! decode's box-2 paging was on picks the mirror called held (measured
+//! 2026-09-26), which the substitution never gets to avoid. With it:
+//! * every request carries `proto::REQ_FLAG_PIN`; box 2 PINS what it reports
+//!   (a reply's map is then its pinned set for the layer, never merely
+//!   resident) and never evicts a pinned expert (`remote_experts`, the block
+//!   above `PinBook`, has box 2's side and the no-deadlock budget);
+//! * the hub RELEASES its coldest held experts (decayed decode pick counts)
+//!   once box 2's pinned count nears its budget: `begin_step` clears them here
+//!   at once and queues `layer << 16 | e` RELEASE words that ride on the next
+//!   requests (`REQ_FLAG_RELEASE`). No request is routed-but-unsent at
+//!   `begin_step`, so no pick can be routed as held and served released;
+//! * box 2 applies release words in wire order and echoes how many it has
+//!   applied (`epoch`); `update_pinned` masks every release queued after that
+//!   epoch out of the map, so a map built before a release cannot bring the
+//!   expert back. Hence `held ⊆ pinned ⊆ resident` at every submit;
+//! * the reply also carries the pass's PAGED bits, and `check_surprises`
+//!   counts `held at submit & paged` (must be 0): ERROR log, rate-limited,
+//!   and a panic under `V41_B2_ASSERT_NO_SURPRISE=1`;
+//! * negotiation: until a reply shows `RESP_FLAG_PIN` no release word is sent;
+//!   a reply to a pin request without it (an older daemon) turns pinning off
+//!   for the connection and the mirror works as before. A (re)connect resets
+//!   the mirror (`on_connect`); box 2 drops a connection's pins with it.
+//! `V41_SUB=0` + `V41_B2_PIN=1` keeps the mirror (maps are requested) but
+//! routes exactly as without it: pinning only changes which slot box 2 evicts.
+//! Knobs: `V41_B2_PIN_HEADROOM` (default 256 slots below box 2's budget before
+//! releasing, down to twice that), `V41_B2_PIN_DECAY_STEPS` (default 256: pick
+//! counts halve), `V41_B2_ASSERT_NO_SURPRISE`.
+//!
 //! Which picks may be swapped (modes 1-2):
 //! * `V41_SUB_MIN_RANK` (1..=6, default 6): only picks at this rank or lower
 //!   (6 = the 6th pick only).
@@ -135,9 +166,10 @@ pub fn mode() -> u32 {
     *M
 }
 
-/// Ask box 2 for residency maps (`proto::REQ_FLAG_RESID`)?
+/// Ask box 2 for residency maps (`proto::REQ_FLAG_RESID`)? Pinning needs them
+/// too, with or without a substitution mode.
 pub fn wanted() -> bool {
-    mode() > 0
+    mode() > 0 || pin_wanted()
 }
 
 /// `V41_SUB_MIN_RANK`, 1-based: the highest-weight rank eligible for
@@ -264,8 +296,11 @@ pub fn incoming_steps() -> u32 {
 
 /// A decode step begins: advance the INCOMING clock. Every arena decode
 /// driver calls this first; a path that never does leaves marks inactive.
+/// Pinning releases happen here too (module doc: nothing is routed but
+/// unsent at this point).
 pub fn begin_step() {
     STEP.fetch_add(1, Ordering::Relaxed);
+    pin_begin_step();
 }
 
 /// A prefill-shaped pass begins (every prefill entry calls this after
@@ -364,6 +399,443 @@ pub fn lookup(layer: i32, e: u32) -> Option<Residency> {
         pending: (PENDING[l][w].load(Ordering::Relaxed) >> b) & 1 == 1,
         incoming: incoming(l, e as usize),
     })
+}
+
+// ---- pinning (module doc, PINNING) ----
+
+use super::remote_experts::proto::{RESID_WORDS, REQ_FLAG_PIN};
+
+/// `V41_B2_PIN` (0 = unread, 1 = off, 2 = on); `set_pin_wanted` overrides.
+static PIN_KNOB: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `V41_B2_PIN=1`: ask box 2 to pin what it reports (default off).
+pub fn pin_wanted() -> bool {
+    match PIN_KNOB.load(Ordering::Relaxed) {
+        0 => {
+            let on = matches!(std::env::var("V41_B2_PIN").as_deref(), Ok("1") | Ok("on"));
+            if on {
+                eprintln!(
+                    "b2 mirror: V41_B2_PIN=1 PINNING (headroom {}, decay every {} steps{})",
+                    pin_headroom(),
+                    pin_decay_steps(),
+                    if assert_no_surprise() { ", V41_B2_ASSERT_NO_SURPRISE" } else { "" }
+                );
+            }
+            let _ = PIN_KNOB.compare_exchange(0, if on { 2 } else { 1 }, Ordering::Relaxed, Ordering::Relaxed);
+            PIN_KNOB.load(Ordering::Relaxed) == 2
+        }
+        k => k == 2,
+    }
+}
+
+/// Override `V41_B2_PIN` (tests; takes effect at the next connect).
+pub fn set_pin_wanted(on: bool) {
+    PIN_KNOB.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+}
+
+/// `V41_B2_PIN_HEADROOM` (default 256): release once box 2's pinned count
+/// (net of releases in flight) exceeds `budget - headroom`, down to
+/// `budget - 2 * headroom`.
+pub fn pin_headroom() -> u32 {
+    static H: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_B2_PIN_HEADROOM").ok().and_then(|v| v.parse().ok()).unwrap_or(256)
+    });
+    *H
+}
+
+/// `V41_B2_PIN_DECAY_STEPS` (default 256; 0 = never): the decode pick counts
+/// that rank experts for release halve every this many steps.
+pub fn pin_decay_steps() -> u32 {
+    static D: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("V41_B2_PIN_DECAY_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(256)
+    });
+    *D
+}
+
+/// `V41_B2_ASSERT_NO_SURPRISE=1`: a surprise panics (verification runs).
+/// Default: counted and logged. A surprise costs a few ms of box-2 paging; a
+/// panic costs an outage for every agent on the server.
+pub fn assert_no_surprise() -> bool {
+    static A: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| matches!(std::env::var("V41_B2_ASSERT_NO_SURPRISE").as_deref(), Ok("1") | Ok("on")));
+    *A
+}
+
+/// Most release words planned per step.
+const PIN_RELEASE_MAX_PER_STEP: usize = 512;
+
+/// Connection's pin state: 0 off (knob off), 1 asked (no reply yet), 2 on
+/// (box 2 answered with a pin block), 3 unsupported (it answered without).
+static PIN_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+static LEDGER: std::sync::LazyLock<std::sync::Mutex<PinLedger>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(PinLedger::new()));
+
+static N_SURPRISES: AtomicU64 = AtomicU64::new(0);
+static N_HELD_PICKS: AtomicU64 = AtomicU64::new(0);
+static N_RELEASED: AtomicU64 = AtomicU64::new(0);
+/// Cumulative (never drained): for tests and the surprise log.
+static TOT_SURPRISES: AtomicU64 = AtomicU64::new(0);
+static TOT_HELD_PICKS: AtomicU64 = AtomicU64::new(0);
+static TOT_RELEASED: AtomicU64 = AtomicU64::new(0);
+
+/// Is release index `idx` later than box 2's `epoch` (wrapping)?
+#[inline]
+fn after(idx: u32, epoch: u32) -> bool {
+    (idx.wrapping_sub(epoch) as i32) > 0
+}
+
+/// The hub's side of the pin contract: which box-2 experts it may treat as
+/// HELD, the releases it has queued (and their wire indices), and the decayed
+/// decode pick counts that choose what to release. Pure bookkeeping; the
+/// process-wide instance is `LEDGER`, whose held rows are mirrored into `BITS`.
+#[derive(Clone, Debug)]
+pub struct PinLedger {
+    /// Per `layer * NE + e`: index of the last release word queued for it (0
+    /// = never).
+    rel_idx: Vec<u32>,
+    /// Release words queued so far (the last one's index; wrapping, skips 0).
+    rel_sent: u32,
+    /// Queued, not yet on the wire.
+    queue: std::collections::VecDeque<u32>,
+    /// Per layer, `WORDS` u64s: HELD.
+    held: Vec<u64>,
+    /// Per `layer * NE + e`: decode picks sent, halved every
+    /// `decay_steps` steps.
+    counts: Vec<u32>,
+    steps: u32,
+    /// `(epoch, pinned, budget)` of the reply with the newest epoch.
+    last: Option<(u32, u32, u32)>,
+}
+
+impl Default for PinLedger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PinLedger {
+    pub fn new() -> Self {
+        Self {
+            rel_idx: vec![0; LAYERS * NE],
+            rel_sent: 0,
+            queue: Default::default(),
+            held: vec![0; LAYERS * WORDS],
+            counts: vec![0; LAYERS * NE],
+            steps: 0,
+            last: None,
+        }
+    }
+
+    /// A pin-mode reply's map for `layer` (box 2's PINNED set when it had
+    /// applied `epoch` release words): the layer's held row is the map minus
+    /// every expert released after that epoch. Returns the row.
+    pub fn apply_map(&mut self, layer: u32, words: &[u32], epoch: u32) -> [u64; WORDS] {
+        let mut row = [0u64; WORDS];
+        let l = layer as usize;
+        if l >= LAYERS {
+            return row;
+        }
+        for (i, r) in row.iter_mut().enumerate() {
+            let lo = words.get(2 * i).copied().unwrap_or(0) as u64;
+            let hi = words.get(2 * i + 1).copied().unwrap_or(0) as u64;
+            let mut m = lo | (hi << 32);
+            let mut bits = m;
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let e = i * 64 + b;
+                if e >= NE || {
+                    let idx = self.rel_idx[l * NE + e];
+                    idx != 0 && after(idx, epoch)
+                } {
+                    m &= !(1u64 << b);
+                }
+            }
+            *r = m;
+        }
+        self.held[l * WORDS..(l + 1) * WORDS].copy_from_slice(&row);
+        row
+    }
+
+    /// Box 2's pin counters from a reply; the newest epoch wins.
+    pub fn note_reply(&mut self, epoch: u32, pinned: u32, budget: u32) {
+        if self.last.is_none_or(|(e, _, _)| !after(e, epoch)) {
+            self.last = Some((epoch, pinned, budget));
+        }
+    }
+
+    /// `(box 2's pinned count net of the releases it has not applied yet,
+    /// its budget)`; `None` before any pin reply.
+    pub fn est_pinned(&self) -> Option<(u32, u32)> {
+        let (epoch, pinned, budget) = self.last?;
+        let in_flight = if after(self.rel_sent, epoch) { self.rel_sent.wrapping_sub(epoch) } else { 0 };
+        Some((pinned.saturating_sub(in_flight), budget))
+    }
+
+    pub fn held(&self, layer: u32, e: u32) -> bool {
+        let (l, e) = (layer as usize, e as usize);
+        l < LAYERS && e < NE && (self.held[l * WORDS + e / 64] >> (e % 64)) & 1 == 1
+    }
+
+    /// A decode pick sent to box 2 (ranks it for release).
+    pub fn note_pick(&mut self, layer: u32, e: u32) {
+        let (l, e) = (layer as usize, e as usize);
+        if l < LAYERS && e < NE {
+            let c = &mut self.counts[l * NE + e];
+            *c = c.saturating_add(1);
+        }
+    }
+
+    /// One decode step: decay the pick counts, and if box 2 is within
+    /// `headroom` of its budget, RELEASE the coldest held experts (at most
+    /// `max`) down to `budget - 2 * headroom`: each is not held from now on,
+    /// gets the next release index, and its word is queued. Returns the words.
+    pub fn step(&mut self, headroom: u32, decay_steps: u32, max: usize) -> Vec<u32> {
+        self.steps = self.steps.wrapping_add(1);
+        if decay_steps > 0 && self.steps % decay_steps == 0 {
+            for c in self.counts.iter_mut() {
+                *c /= 2;
+            }
+        }
+        let Some((est, budget)) = self.est_pinned() else { return Vec::new() };
+        if est <= budget.saturating_sub(headroom) {
+            return Vec::new();
+        }
+        let want = (est - budget.saturating_sub(2 * headroom)) as usize;
+        let mut cand: Vec<(u32, u32)> = Vec::new();
+        for (wi, &w) in self.held.iter().enumerate() {
+            let mut bits = w;
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let (l, e) = (wi / WORDS, (wi % WORDS) * 64 + b);
+                cand.push((self.counts[l * NE + e], (l * NE + e) as u32));
+            }
+        }
+        let n = want.min(max).min(cand.len());
+        if n == 0 {
+            return Vec::new();
+        }
+        if n < cand.len() {
+            cand.select_nth_unstable(n - 1);
+        }
+        let mut out = Vec::with_capacity(n);
+        for &(_, k) in &cand[..n] {
+            let (l, e) = (k as usize / NE, k as usize % NE);
+            self.held[l * WORDS + e / 64] &= !(1u64 << (e % 64));
+            // Skips 0 (= never released): after 2^32 words the indices run one
+            // ahead of box 2's epoch, which only masks a release one word
+            // longer -- the safe direction.
+            self.rel_sent = self.rel_sent.wrapping_add(1);
+            if self.rel_sent == 0 {
+                self.rel_sent = 1;
+            }
+            self.rel_idx[k as usize] = self.rel_sent;
+            let w = ((l as u32) << 16) | e as u32;
+            self.queue.push_back(w);
+            out.push(w);
+        }
+        out
+    }
+
+    /// Up to `max` queued release words, in queue (= index) order.
+    pub fn take_words(&mut self, max: usize) -> Vec<u32> {
+        let n = self.queue.len().min(max);
+        self.queue.drain(..n).collect()
+    }
+
+    pub fn queued(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+/// `held & paged`, counted: the hub's surprises for one reply.
+pub fn surprise_count(held: &[u32; RESID_WORDS], paged: &[u32; RESID_WORDS]) -> u32 {
+    held.iter().zip(paged).map(|(h, p)| (h & p).count_ones()).sum()
+}
+
+/// A (re)connect: the new connection has no pins and no maps yet. Resets the
+/// mirror (held, pending, seen) and the pin ledger; asks for pins again if the
+/// knob is on.
+pub fn on_connect() {
+    let mut g = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+    *g = PinLedger::new();
+    for l in 0..LAYERS {
+        SEEN[l].store(false, Ordering::Release);
+        for i in 0..WORDS {
+            BITS[l][i].store(0, Ordering::Relaxed);
+            PENDING[l][i].store(0, Ordering::Relaxed);
+        }
+    }
+    PIN_MODE.store(if pin_wanted() { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// `REQ_FLAG_PIN` while pinning is asked for or on.
+pub fn pin_request_flag() -> u32 {
+    match PIN_MODE.load(Ordering::Relaxed) {
+        1 | 2 => REQ_FLAG_PIN,
+        _ => 0,
+    }
+}
+
+/// Box 2 answered a pin request with a pin block: release words may be sent.
+pub fn pin_active() -> bool {
+    PIN_MODE.load(Ordering::Relaxed) == 2
+}
+
+/// A reply to a pin request did (`supported`) or did not carry a pin block.
+pub fn pin_reply_seen(supported: bool) {
+    let to = if supported { 2 } else { 3 };
+    if PIN_MODE.compare_exchange(1, to, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        if supported {
+            eprintln!("b2 mirror: box 2 pins what it reports: the mirror's held set is exact");
+        } else {
+            eprintln!("b2 mirror: WARNING box 2 does not support pinning (older expertd): V41_B2_PIN falls back to the plain mirror");
+        }
+    }
+}
+
+/// A pin-mode reply: overwrite `layer`'s row with the pinned map minus the
+/// releases box 2 had not applied (`epoch`), drop its pending row.
+pub fn update_pinned(layer: u32, words: &[u32], epoch: u32, pinned: u32, budget: u32) {
+    let l = layer as usize;
+    if l >= LAYERS {
+        return;
+    }
+    // BITS are written under the ledger lock, so a map and a release can
+    // never interleave between the ledger and the mirror.
+    let mut g = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+    g.note_reply(epoch, pinned, budget);
+    let row = g.apply_map(layer, words, epoch);
+    for (i, slot) in BITS[l].iter().enumerate() {
+        slot.store(row[i], Ordering::Relaxed);
+        PENDING[l][i].store(0, Ordering::Relaxed);
+    }
+    SEEN[l].store(true, Ordering::Release);
+}
+
+/// At submit (pin mode): which of the sent picks `sel` the mirror HOLDS, as
+/// `RESID_WORDS` bits, and how many distinct ones. `b <= 16` requests also
+/// count their picks for release ranking.
+pub fn pin_note_submit(layer: u32, sel: &[i32], decode_shaped: bool) -> ([u32; RESID_WORDS], u32) {
+    let mut held = [0u32; RESID_WORDS];
+    let l = layer as usize;
+    if l >= LAYERS {
+        return (held, 0);
+    }
+    for &e in sel {
+        if (0..N_EXPERT as i32).contains(&e) && (BITS[l][e as usize / 64].load(Ordering::Relaxed) >> (e % 64)) & 1 == 1 {
+            held[e as usize / 32] |= 1 << (e % 32);
+        }
+    }
+    if decode_shaped {
+        if let Ok(mut g) = LEDGER.lock() {
+            for &e in sel {
+                if (0..N_EXPERT as i32).contains(&e) {
+                    g.note_pick(layer, e as u32);
+                }
+            }
+        }
+    }
+    let n: u32 = held.iter().map(|w| w.count_ones()).sum();
+    N_HELD_PICKS.fetch_add(u64::from(n), Ordering::Relaxed);
+    TOT_HELD_PICKS.fetch_add(u64::from(n), Ordering::Relaxed);
+    (held, n)
+}
+
+/// Up to `max` queued release words for the next request (pin mode on).
+pub fn take_release_words(max: usize) -> Vec<u32> {
+    if !pin_active() {
+        return Vec::new();
+    }
+    match LEDGER.lock() {
+        Ok(mut g) if g.queued() > 0 => g.take_words(max),
+        _ => Vec::new(),
+    }
+}
+
+/// `begin_step`'s pin maintenance: decay and plan releases, clearing the
+/// released experts from the mirror at once.
+fn pin_begin_step() {
+    if !pin_active() {
+        return;
+    }
+    let mut g = LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+    let words = g.step(pin_headroom(), pin_decay_steps(), PIN_RELEASE_MAX_PER_STEP);
+    for &w in &words {
+        let (l, e) = ((w >> 16) as usize, (w & 0xFFFF) as usize);
+        BITS[l][e / 64].fetch_and(!(1u64 << (e % 64)), Ordering::Relaxed);
+    }
+    drop(g);
+    N_RELEASED.fetch_add(words.len() as u64, Ordering::Relaxed);
+    TOT_RELEASED.fetch_add(words.len() as u64, Ordering::Relaxed);
+}
+
+/// The end-to-end check on a pin-mode reply: sent picks the mirror held at
+/// submit (`held`) that box 2 had to page or wait for anyway (`paged`).
+/// Must be 0. Counted; ERROR-logged (the first 20, then at most every 10 s);
+/// a panic under `V41_B2_ASSERT_NO_SURPRISE=1`. Returns the count.
+pub fn check_surprises(layer: u32, seq: u32, held: &[u32; RESID_WORDS], paged: &[u32; RESID_WORDS]) -> u32 {
+    let n = surprise_count(held, paged);
+    if n == 0 {
+        return 0;
+    }
+    N_SURPRISES.fetch_add(u64::from(n), Ordering::Relaxed);
+    let tot = TOT_SURPRISES.fetch_add(u64::from(n), Ordering::Relaxed) + u64::from(n);
+    let ids: Vec<usize> = (0..NE).filter(|&e| (held[e / 32] & paged[e / 32]) >> (e % 32) & 1 == 1).collect();
+    static LAST_LOG: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let log = tot <= 20
+        || LAST_LOG.lock().map(|g| g.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10))).unwrap_or(false);
+    if log {
+        if let Ok(mut g) = LAST_LOG.lock() {
+            *g = Some(std::time::Instant::now());
+        }
+        tracing::error!(
+            layer, seq, n, total = tot, experts = ?ids,
+            "b2 pin SURPRISE: box 2 paged experts the hub mirror held (the pin invariant is broken)"
+        );
+    }
+    if assert_no_surprise() {
+        panic!("b2 pin SURPRISE (V41_B2_ASSERT_NO_SURPRISE): L{layer} seq {seq}: held experts {ids:?} were paged by box 2");
+    }
+    n
+}
+
+/// `(surprises, held picks sent, release words queued, box 2's pinned count
+/// net of releases in flight, its budget)` since the last call; `None` unless
+/// pinning is on.
+pub fn take_pin_stats() -> Option<[f64; 5]> {
+    if !pin_wanted() {
+        return None;
+    }
+    let (est, budget) = LEDGER
+        .lock()
+        .ok()
+        .and_then(|g| g.est_pinned())
+        .map_or((f64::NAN, f64::NAN), |(p, b)| (f64::from(p), f64::from(b)));
+    Some([
+        N_SURPRISES.swap(0, Ordering::Relaxed) as f64,
+        N_HELD_PICKS.swap(0, Ordering::Relaxed) as f64,
+        N_RELEASED.swap(0, Ordering::Relaxed) as f64,
+        est,
+        budget,
+    ])
+}
+
+/// Cumulative `(surprises, held picks sent, release words queued)` (tests).
+pub fn pin_totals() -> (u64, u64, u64) {
+    (
+        TOT_SURPRISES.load(Ordering::Relaxed),
+        TOT_HELD_PICKS.load(Ordering::Relaxed),
+        TOT_RELEASED.load(Ordering::Relaxed),
+    )
+}
+
+/// Is `(layer, e)` HELD by the mirror (pin mode: pinned on box 2)?
+pub fn held(layer: u32, e: u32) -> bool {
+    let l = layer as usize;
+    l < LAYERS && e < N_EXPERT && (BITS[l][(e / 64) as usize].load(Ordering::Relaxed) >> (e % 64)) & 1 == 1
 }
 
 // ---- per-step counters (drained by the multistream profile) ----
@@ -622,6 +1094,10 @@ pub fn substitute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mirror's rows, marks and the pin ledger are process-wide statics:
+    /// tests that touch them run one at a time.
+    static STATICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     const S: f32 = 1.5;
     const R6: SubRules = SubRules { min_rank: 6, max_w: None, scale: S };
@@ -896,6 +1372,7 @@ mod tests {
     /// test touches.
     #[test]
     fn mirror_update_pending_and_lookup() {
+        let _g = STATICS.lock().unwrap_or_else(|p| p.into_inner());
         let l = (LAYERS - 1) as u32;
         assert_eq!(resident(l as i32, 3), None, "unseen layer is unknown");
         let mut w = vec![0u32; (N_EXPERT as usize).div_ceil(32)];
@@ -924,6 +1401,7 @@ mod tests {
     /// Own layer; the only test that advances the step clock.
     #[test]
     fn incoming_window_and_count() {
+        let _g = STATICS.lock().unwrap_or_else(|p| p.into_inner());
         let l = (LAYERS - 3) as u32;
         let n = incoming_steps();
         assert!(n >= 1, "test assumes V41_SUB_INCOMING is on (default 2)");
@@ -964,5 +1442,167 @@ mod tests {
         assert_eq!(take_sub_stats().6, 1);
         note_incoming_covered(l as i32, &[10], |_| false);
         assert_eq!(take_sub_stats().6, 0, "box-1 picks are not counted");
+    }
+
+    fn map(ids: &[u32]) -> Vec<u32> {
+        let mut w = vec![0u32; RESID_WORDS];
+        for &e in ids {
+            w[e as usize / 32] |= 1 << (e % 32);
+        }
+        w
+    }
+
+    /// PinLedger: releases pick the coldest held experts, clear them at once
+    /// and get wire indices; a map built before a release (older epoch)
+    /// cannot bring the expert back, one built after it can; the pinned
+    /// estimate nets out releases in flight; words leave in index order.
+    #[test]
+    fn pin_ledger_masks_releases_after_epoch() {
+        let mut g = PinLedger::new();
+        assert_eq!(g.step(1, 0, 512), Vec::<u32>::new(), "no reply yet: no releases");
+        g.apply_map(2, &map(&[3, 5, 7]), 0);
+        assert!(g.held(2, 3) && g.held(2, 5) && g.held(2, 7) && !g.held(2, 4));
+        g.note_reply(0, 3, 3);
+        for _ in 0..5 {
+            g.note_pick(2, 5);
+        }
+        g.note_pick(2, 7);
+        // est 3 > budget 3 - headroom 1: release down to 3 - 2 = 1, coldest
+        // first (3 has no picks, then 7).
+        let words = g.step(1, 0, 512);
+        let mut sorted = words.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![(2 << 16) | 3, (2 << 16) | 7]);
+        assert!(!g.held(2, 3) && g.held(2, 5) && !g.held(2, 7));
+        assert_eq!(g.est_pinned(), Some((1, 3)), "3 pinned minus 2 releases in flight");
+        assert_eq!(g.step(1, 0, 512), Vec::<u32>::new(), "at target: nothing more");
+        // A stale map (epoch 0: box 2 applied neither release) must not
+        // resurrect them.
+        g.apply_map(2, &map(&[3, 5, 7]), 0);
+        assert!(!g.held(2, 3) && g.held(2, 5) && !g.held(2, 7));
+        // Box 2 applied the first release (epoch 1), and the expert released
+        // FIRST was re-pinned since: held again; the second is still masked.
+        let first = words[0] & 0xFFFF;
+        let second = words[1] & 0xFFFF;
+        g.apply_map(2, &map(&[first, second, 5]), 1);
+        assert!(g.held(2, first) && g.held(2, 5) && !g.held(2, second));
+        g.note_reply(1, 2, 3);
+        assert_eq!(g.est_pinned(), Some((1, 3)), "one release still in flight");
+        // An older reply never replaces the newest epoch's counters.
+        g.note_reply(0, 3, 3);
+        assert_eq!(g.est_pinned(), Some((1, 3)));
+        assert_eq!(g.take_words(1), vec![words[0]]);
+        assert_eq!(g.take_words(10), vec![words[1]]);
+        assert!(g.take_words(10).is_empty());
+        // Decay halves the counts.
+        let mut d = PinLedger::new();
+        d.note_pick(1, 1);
+        d.note_pick(1, 1);
+        let _ = d.step(0, 1, 0);
+        assert_eq!(d.counts[NE + 1], 1);
+        // Surprises are `held & paged`.
+        let mut h = [0u32; RESID_WORDS];
+        let mut p = [0u32; RESID_WORDS];
+        h[0] = 0b1110;
+        p[0] = 0b0111;
+        p[11] = 1;
+        assert_eq!(surprise_count(&h, &p), 2);
+    }
+
+    /// The hub's REAL pin glue, end to end on the statics (the randomized
+    /// protocol test in `remote_experts` drives a bare `PinLedger`): connect
+    /// -> negotiation -> a pin reply holds -> `begin_step` releases the
+    /// coldest, clearing the mirror's BITS at once -> the words leave in
+    /// index order, 128 per request -> a stale map (old epoch) cannot bring a
+    /// released expert back, a later one can -> the surprise check counts
+    /// `held & paged` and the per-step stats drain -> an older daemon (no pin
+    /// block) turns pinning off for the connection.
+    #[test]
+    fn pin_statics_end_to_end() {
+        let _g = STATICS.lock().unwrap_or_else(|p| p.into_inner());
+        let l = (LAYERS - 2) as u32;
+        set_pin_wanted(true);
+        on_connect();
+        assert_eq!(pin_request_flag(), REQ_FLAG_PIN, "asked from the first request");
+        assert!(!pin_active() && take_release_words(8).is_empty(), "no words before box 2 answers");
+        // Box 2 answers with a pin block: 300 experts of the layer pinned,
+        // 745 of 1000 overall (above budget - headroom 256: a release is due).
+        let all: Vec<u32> = (0..300).collect();
+        update_pinned(l, &map(&all), 0, 745, 1000);
+        pin_reply_seen(true);
+        assert!(pin_active() && pin_request_flag() == REQ_FLAG_PIN);
+        let (h, n) = pin_note_submit(l, &[3, 5, 301, -1], true);
+        assert_eq!(n, 2);
+        assert!(h[0] & (1 << 3) != 0 && h[0] & (1 << 5) != 0 && h[9] & (1 << (301 % 32)) == 0);
+        assert!(held(l, 7) && !held(l, 301));
+        // 3, 5, 7 are hot; everything else in the layer is cold.
+        for _ in 0..4 {
+            let _ = pin_note_submit(l, &[3, 5, 7], true);
+        }
+        let _ = take_pin_stats();
+        // A step: release the 257 coldest (745 - (1000 - 512)) at once.
+        begin_step();
+        let mut words = Vec::new();
+        for want in [128usize, 128, 1, 0] {
+            let w = take_release_words(128);
+            assert_eq!(w.len(), want);
+            words.extend(w);
+        }
+        assert_eq!(words.len(), 257);
+        let released: Vec<u32> = words.iter().map(|w| w & 0xFFFF).collect();
+        assert!(words.iter().all(|w| w >> 16 == l));
+        assert!(!released.iter().any(|e| [3, 5, 7].contains(e)), "the hot ones stay");
+        for e in 0..300u32 {
+            assert_eq!(held(l, e), !released.contains(&e), "BITS cleared at release for e{e}");
+            assert_eq!(pin_note_submit(l, &[e as i32], false).1, u32::from(!released.contains(&e)));
+        }
+        let st = take_pin_stats().unwrap();
+        assert_eq!((st[2], st[3], st[4]), (257.0, 488.0, 1000.0), "released, est pinned net of in-flight, budget");
+        // Nothing more to release now that the estimate is at target.
+        begin_step();
+        assert!(take_release_words(128).is_empty());
+        // A map built before box 2 applied the releases (epoch 0) must not
+        // resurrect them; one built after all 257 (epoch 257) does.
+        update_pinned(l, &map(&all), 0, 745, 1000);
+        assert!(!held(l, released[0]) && held(l, 3));
+        update_pinned(l, &map(&all), 257, 745, 1000);
+        assert!(held(l, released[0]) && held(l, released[256]) && held(l, 3));
+        // Surprise: held-at-submit 3 paged anyway (with 301, which was not held).
+        let (h, _) = pin_note_submit(l, &[3, 301], true);
+        let mut paged = [0u32; RESID_WORDS];
+        paged[0] = 1 << 3;
+        paged[301 / 32] = 1 << (301 % 32);
+        assert_eq!(check_surprises(l, 42, &h, &paged), 1);
+        let st = take_pin_stats().unwrap();
+        assert_eq!(st[0], 1.0, "one surprise drained");
+        assert_eq!(take_pin_stats().unwrap()[0], 0.0);
+        // Reconnect: everything forgotten; an older daemon turns pinning off.
+        on_connect();
+        assert!(!held(l, 3) && !pin_active() && take_release_words(8).is_empty());
+        pin_reply_seen(false);
+        assert!(!pin_active() && pin_request_flag() == 0, "fell back to the plain mirror");
+        set_pin_wanted(false);
+        on_connect();
+        assert_eq!(pin_request_flag(), 0);
+    }
+
+    /// Release indices wrap without ever becoming 0 (= never released), and
+    /// the epoch comparison is wrapping.
+    #[test]
+    fn pin_ledger_index_wraps() {
+        assert!(after(5, 4) && !after(4, 4) && !after(3, 4));
+        assert!(after(2, u32::MAX - 1), "wrapped index is later");
+        let mut g = PinLedger::new();
+        g.rel_sent = u32::MAX - 1;
+        g.apply_map(0, &map(&[1, 2, 3]), 0);
+        g.note_reply(u32::MAX - 1, 3, 3);
+        let w = g.step(1, 0, 512);
+        assert_eq!(w.len(), 2);
+        assert!(g.rel_idx.iter().all(|&i| i == 0 || i == u32::MAX || i == 1), "{:?}", g.rel_idx.iter().filter(|&&i| i != 0).collect::<Vec<_>>());
+        // A map at the pre-wrap epoch masks both; at epoch 1 neither.
+        g.apply_map(0, &map(&[1, 2, 3]), u32::MAX - 1);
+        assert_eq!((1..4).filter(|&e| g.held(0, e)).count(), 1);
+        g.apply_map(0, &map(&[1, 2, 3]), 1);
+        assert_eq!((1..4).filter(|&e| g.held(0, e)).count(), 3);
     }
 }

@@ -9793,6 +9793,12 @@ impl HeterogeneousEngine {
                     f64::from(partial.miss_mask.count_ones()), partial.bytes_out as f64, partial.bytes_in as f64,
                     if t4.is_nan() { f64::NAN } else { f64::from(u8::from(t4 >= ev_wait_enter)) }, off, delay,
                     super::evtrace_kinds::step_rows_f64(),
+                    // pinning: NaN without a pin block on the reply
+                    partial.pin.map_or(f64::NAN, |_| f64::from(partial.n_held)),
+                    partial.pin.map_or(f64::NAN, |_| f64::from(partial.n_surprise)),
+                    partial.pin.map_or(f64::NAN, |_| f64::from(partial.n_paged)),
+                    partial.pin.map_or(f64::NAN, |p| f64::from(p.1)),
+                    partial.pin.map_or(f64::NAN, |p| f64::from(p.0)),
                 ]);
                 bd.ev_req = [f64::NAN; 9];
             }
