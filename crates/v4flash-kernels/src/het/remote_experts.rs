@@ -412,6 +412,30 @@ pub mod proto {
     /// Bit 15: requests use the low bits and the miss mask the high 16.
     pub const RESP_FLAG_RESID: u32 = 1 << 15;
     pub const RESID_WORDS: usize = (super::N_EXPERT as usize).div_ceil(32);
+    /// Request flag (2026-09-26): PIN MODE (`b2_mirror` pinning, hub knob
+    /// `V41_B2_PIN`). Box 2 turns pinning on for the connection: an expert
+    /// it reports held is never evicted until the hub RELEASES it
+    /// (`REQ_FLAG_RELEASE`), so the hub's mirror is exact where it says "held"
+    /// (`ExpertShard::pin_report`). The reply's residency map is then the
+    /// PINNED set of the layer (never merely resident) and a pin block follows
+    /// it (`RESP_FLAG_PIN`). An older daemon ignores the bit and echoes it but
+    /// never sets `RESP_FLAG_PIN`, which is how the hub learns to fall back.
+    pub const REQ_FLAG_PIN: u32 = 256;
+    /// Request flag: after the prefetch block (present or not), `n u32` then n
+    /// RELEASE words `(layer << 16) | expert` box 2 unpins, in order, before
+    /// serving the request. Sent only once the peer has answered with
+    /// `RESP_FLAG_PIN`: an older daemon would fail the frame-length check.
+    pub const REQ_FLAG_RELEASE: u32 = 512;
+    /// RESPONSE flag: a pin block (`PIN_WORDS` u32s) follows the residency map
+    /// (so it is only ever set together with `RESP_FLAG_RESID`):
+    /// `epoch` = release words box 2 had applied on this connection when it
+    /// built the map, `pinned` / `budget` = its pinned count and cap, a
+    /// reserved word, then `RESID_WORDS` words of PAGED bits: bit e = this
+    /// request's pass had to page or wait for expert e (not landed when the
+    /// pass started). The hub's surprise check is `held at submit & paged`.
+    pub const RESP_FLAG_PIN: u32 = 1 << 14;
+    pub const PIN_HDR_WORDS: usize = 4;
+    pub const PIN_WORDS: usize = PIN_HDR_WORDS + RESID_WORDS;
 
     /// Fixed request fields after the header (bytes):
     /// layer, b, flags, n_used, xq_bpt, reserved (6 × u32) then `t1` (u64,
@@ -476,6 +500,44 @@ pub mod proto {
         }
         let off = RESP_DATA_OFF + (m.b as usize) * (m.n_embd as usize) * (m.elem_bytes as usize);
         Some(buf.view::<u32>(off, RESID_WORDS))
+    }
+
+    /// The pin block of a RESPONSE (`RESP_FLAG_PIN`), parsed.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct PinReply {
+        pub epoch: u32,
+        pub pinned: u32,
+        pub budget: u32,
+        pub paged: [u32; RESID_WORDS],
+    }
+
+    /// Append the pin block after `append_residency` and set `RESP_FLAG_PIN`.
+    /// Call before `patch_len`.
+    pub fn append_pin(buf: &mut AlignedBuf, epoch: u32, pinned: u32, budget: u32, paged: &[u32; RESID_WORDS]) {
+        const FLAGS_OFF: usize = HDR_LEN + 8;
+        let mut f = [0u8; 4];
+        f.copy_from_slice(&buf.as_bytes()[FLAGS_OFF..FLAGS_OFF + 4]);
+        debug_assert!(u32::from_le_bytes(f) & RESP_FLAG_RESID != 0, "pin block without the residency map");
+        let flags = u32::from_le_bytes(f) | RESP_FLAG_PIN;
+        buf.as_bytes_mut()[FLAGS_OFF..FLAGS_OFF + 4].copy_from_slice(&flags.to_le_bytes());
+        for w in [epoch, pinned, budget, 0] {
+            buf.put_u32(w);
+        }
+        for &w in paged {
+            buf.put_u32(w);
+        }
+    }
+
+    /// The pin block appended to a RESPONSE (`RESP_FLAG_PIN`), if any.
+    pub fn response_pin(buf: &AlignedBuf, m: &ResponseMeta) -> Option<PinReply> {
+        if m.flags & RESP_FLAG_PIN == 0 || m.flags & RESP_FLAG_RESID == 0 {
+            return None;
+        }
+        let off = RESP_DATA_OFF + (m.b as usize) * (m.n_embd as usize) * (m.elem_bytes as usize) + RESID_WORDS * 4;
+        let w = buf.view::<u32>(off, PIN_WORDS);
+        let mut paged = [0u32; RESID_WORDS];
+        paged.copy_from_slice(&w[PIN_HDR_WORDS..]);
+        Some(PinReply { epoch: w[0], pinned: w[1], budget: w[2], paged })
     }
 
     pub fn parse_header(h: &[u8]) -> eyre::Result<Header> {
@@ -625,6 +687,7 @@ pub mod proto {
         ew: &[f32],
         hints: (&[u32], &[u32]),
         prefetch: &[u32],
+        release: &[u32],
     ) -> u64 {
         debug_assert_eq!(xq.len(), (b * xq_bpt) as usize);
         debug_assert_eq!(sel.len(), (b * n_used) as usize);
@@ -662,6 +725,12 @@ pub mod proto {
                 buf.put_u32(w);
             }
         }
+        if flags & REQ_FLAG_RELEASE != 0 {
+            buf.put_u32(release.len() as u32);
+            for &w in release {
+                buf.put_u32(w);
+            }
+        }
         patch_len(buf);
         0
     }
@@ -693,6 +762,8 @@ pub mod proto {
         pub hint_evict: &'a [u32],
         /// `REQ_FLAG_PREFETCH` words; empty otherwise.
         pub prefetch: &'a [u32],
+        /// `REQ_FLAG_RELEASE` words; empty otherwise.
+        pub release: &'a [u32],
     }
 
     /// Parse a REQUEST frame held in `buf` (header included).
@@ -744,6 +815,21 @@ pub mod proto {
         } else {
             expect_len
         };
+        let mut release: &[u32] = &[];
+        let expect_len = if flags & REQ_FLAG_RELEASE != 0 {
+            if expect_len + 4 > p.len() {
+                return Err(eyre!("request: release flagged but frame too short"));
+            }
+            let n = u32::from_le_bytes([p[expect_len], p[expect_len + 1], p[expect_len + 2], p[expect_len + 3]]) as usize;
+            let end = expect_len + 4 + n * 4;
+            if end > p.len() {
+                return Err(eyre!("request: release n={n} overruns frame"));
+            }
+            release = buf.view::<u32>(expect_len + 4, n);
+            end
+        } else {
+            expect_len
+        };
         if expect_len != p.len() {
             return Err(eyre!(
                 "request: frame len {} != expected {} (b={b}, xq_bpt={xq_bpt}, n_used={n_used})",
@@ -765,6 +851,7 @@ pub mod proto {
             hint_admit,
             hint_evict,
             prefetch,
+            release,
         })
     }
 
@@ -850,9 +937,13 @@ pub mod proto {
                 p[RESP_MISSN_OFF], p[RESP_MISSN_OFF + 1], p[RESP_MISSN_OFF + 2], p[RESP_MISSN_OFF + 3],
             ]),
         };
+        if m.flags & RESP_FLAG_PIN != 0 && m.flags & RESP_FLAG_RESID == 0 {
+            return Err(eyre!("response: pin block without a residency map (flags {:#x})", m.flags));
+        }
         let want = RESP_DATA_OFF
             + (m.b as usize) * (m.n_embd as usize) * (m.elem_bytes as usize)
-            + if m.flags & RESP_FLAG_RESID != 0 { RESID_WORDS * 4 } else { 0 };
+            + if m.flags & RESP_FLAG_RESID != 0 { RESID_WORDS * 4 } else { 0 }
+            + if m.flags & RESP_FLAG_PIN != 0 { PIN_WORDS * 4 } else { 0 };
         if p.len() != want {
             return Err(eyre!("response: frame len {} != expected {want}", p.len()));
         }
@@ -1706,6 +1797,30 @@ fn ev_cur_seq() -> f64 {
     }
 }
 
+/// `evtrace` `b2_req` pin fields, `pin_on` .. `n_paged` in `B2_REQ` order:
+/// the pin state after the request, counter deltas across it (`before` =
+/// `ExpertShard::pin_counters` at its start), its release words, and how many
+/// of its pass's experts were PAGED.
+fn ev_pin_fields(
+    before: Option<(PinCounters, u32, u32, u32)>,
+    after: Option<(PinCounters, u32, u32, u32)>,
+    n_release: usize,
+    paged: &[u32; proto::RESID_WORDS],
+) -> [f64; 10] {
+    let nan = f64::NAN;
+    let n_paged = paged.iter().map(|w| w.count_ones()).sum::<u32>() as f64;
+    let Some((c1, pinned, budget, epoch)) = after else {
+        return [0.0, nan, nan, nan, n_release as f64, nan, nan, nan, nan, n_paged];
+    };
+    let c0 = before.map(|b| b.0).unwrap_or_default();
+    let d = |a: u64, b: u64| a.saturating_sub(b) as f64;
+    [
+        1.0, f64::from(pinned), f64::from(budget), f64::from(epoch), n_release as f64,
+        d(c1.new_pins, c0.new_pins), d(c1.denied, c0.denied), d(c1.no_victim_drops, c0.no_victim_drops),
+        d(c1.pinned_evictions, c0.pinned_evictions), n_paged,
+    ]
+}
+
 thread_local! {
     /// `evtrace`: (start, end) raw ns of the three role reader threads of the
     /// last `read_miss_into` called on THIS thread (NaN = not measured).
@@ -2003,7 +2118,481 @@ struct ShardPool {
     /// lazily at the START of that layer's next `ensure_layer`, which is what
     /// lets an eviction touch another layer without touching its device buffer.
     dirty: Vec<bool>,
+    /// The hub's pins on this connection (`proto::REQ_FLAG_PIN`). Off (and
+    /// empty) unless the hub asked for them.
+    pins: PinBook,
 }
+
+// ---------------------------------------------------------------------------
+// Pinning: the hub is never surprised by this pool (2026-09-26)
+// ---------------------------------------------------------------------------
+//
+// THE INVARIANT. When box 2 serves a request, every pick the hub treated as
+// HELD when it routed and sent that request is resident here: no read, no
+// wait. `hub_held ⊆ pinned ⊆ resident`.
+//
+// Before this, the hub's mirror was box 2's LANDED map as of the layer's
+// previous reply (~1 step), while this pool made ~20 local LRU evictions per
+// such interval: decode requests needed 2.27 reads per token where the hub
+// expected 1.12, and the difference was paging the substitution never got a
+// chance to avoid (91% of it experts evicted here earlier). Measured from
+// evtrace 2026-09-26.
+//
+// * PIN on report (`pin_report`): the reply's residency map is the layer's
+//   PINNED set, and reporting is what pins: an ELIGIBLE expert (a pick of a
+//   decode-shaped pass, or a hub prefetch/admission word) that is landed at
+//   reply time is pinned if the budget allows. `pinned ⇒ landed` always.
+// * NEVER evicted while pinned: every replacement of a slot's occupant goes
+//   through `ShardPool::evict` (the choke point), and every victim search
+//   through `ShardPool::pick_victim`, which skips pinned slots. Evicting a
+//   pinned expert is a bug: counted, logged, fatal under `V41_B2_ASSERT_PINNED`.
+// * RELEASE words from the hub (`REQ_FLAG_RELEASE`) unpin, in wire order, when
+//   the request carrying them is SERVED (served order = arrival order: a
+//   parked request's words were applied before the requests served inside
+//   it). The reply's `epoch` counts the words applied, and the hub masks
+//   every release it queued after that epoch out of the map (`b2_mirror`),
+//   so an old map can never resurrect a released expert.
+// * PREFILL-shaped passes (`b > 16`) grant no eligibility: a 1024-row chunk
+//   touches most of a layer once, and pinning its scan admissions would fill
+//   the budget with experts decode may never pick (and override the two-class
+//   LRU that exists to evict them first). They stay unpinned and unreported,
+//   which the hub reads as "not held": it may page them, never be surprised.
+//
+// BUDGET / RESERVE and why nothing can deadlock. `pinned <= budget = n_slots -
+// R - sum(floor)` at all times; new pins beyond it are refused (`denied`) and
+// reported not held. What a victim search must find is at most
+// `|W \ resident|` free-able slots, where W is the pass's distinct picks of one
+// layer (<= N_EXPERT = 384, a merged prefill union) and the slots it may not
+// take are the hub's pins (<= budget), W's own resident experts, a PARKED
+// request's picks P (<= 384, one layer), and, under `V41_B2_POOL_FLOOR`, at most
+// `floor[l]` slots of each foreign layer. A request served inside a park has
+// at most `PARK_MAX_ROWS` = 16 rows (W <= 96). So with
+// `R >= max(|W| + |P|) = 384 + 96 = 480` (`PIN_RESERVE_MIN`, the default) a
+// demand / certain / prefill claim always finds an unpinned victim without any
+// hub action. In-flight background reads hold no slot until they land; a
+// landing with no unpinned victim is DROPPED (counted), and whoever needs that
+// expert demand-reads it, which the reserve covers. Early-page `pinned` is only
+// set around `prefetch_words_ex`, which searches no victim. If a reserve below
+// the minimum ever leaves a demand claim with no unpinned victim, it REVOKES
+// a pin (an error the counters show) rather than failing the request: today's
+// behaviour there was "no evictable slot" and an outage.
+
+/// No-deadlock minimum of `V41_B2_PIN_RESERVE` (see the block above).
+pub const PIN_RESERVE_MIN: usize = N_EXPERT as usize + PARK_MAX_ROWS * N_EXPERT_USED;
+/// Most rows a request served INSIDE a parked one may have (the park
+/// executor's size); `PIN_RESERVE_MIN` depends on it.
+pub const PARK_MAX_ROWS: usize = 16;
+
+/// `V41_B2_PIN_RESERVE` (default `PIN_RESERVE_MIN` = 480): slots box 2 never
+/// lets the hub pin. Below the minimum the no-deadlock argument holds only if
+/// the workload's per-layer working set fits (tests with tiny pools); logged.
+pub fn b2_pin_reserve() -> usize {
+    static R: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let r = std::env::var("V41_B2_PIN_RESERVE").ok().and_then(|v| v.parse().ok()).unwrap_or(PIN_RESERVE_MIN);
+        if r < PIN_RESERVE_MIN {
+            eprintln!(
+                "expertd: WARNING V41_B2_PIN_RESERVE={r} < {PIN_RESERVE_MIN}: a pass whose layer union + parked \
+                 picks exceed {r} slots will REVOKE pins (hub surprises) instead of finding an unpinned victim"
+            );
+        }
+        r
+    });
+    *R
+}
+
+/// `V41_B2_ASSERT_PINNED=1`: evicting a pinned expert panics (verification
+/// runs). Default: counted and logged. A violation costs the hub one read; a
+/// panic here costs a cold 116 GB pool and an outage for every agent.
+pub fn b2_assert_pinned() -> bool {
+    static B: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| matches!(std::env::var("V41_B2_ASSERT_PINNED").as_deref(), Ok("1") | Ok("on")));
+    *B
+}
+
+/// Pin violations since start (all connections), for the stats line.
+pub static PIN_VIOLATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A pinned expert left the pool: count, log (rate-limited), and panic under
+/// `V41_B2_ASSERT_PINNED` / in debug builds.
+fn pin_violation(what: &str, layer: u32, e: u32) {
+    let n = PIN_VIOLATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 20 || n.is_power_of_two() {
+        eprintln!("expertd: ERROR pin violation #{n}: {what} L{layer} e{e} (the hub treats it as held)");
+    }
+    if b2_assert_pinned() {
+        panic!("pin violation: {what} L{layer} e{e} (V41_B2_ASSERT_PINNED)");
+    }
+    debug_assert!(false, "pin violation: {what} L{layer} e{e}");
+}
+
+/// Per-connection pin counters (cumulative since the connection's first
+/// `REQ_FLAG_PIN` request).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PinCounters {
+    /// Release words applied (the reply `epoch`, not wrapped).
+    pub releases: u64,
+    /// Experts pinned at a report.
+    pub new_pins: u64,
+    /// Eligible, landed experts refused for budget (counted once per
+    /// eligibility; reported not held).
+    pub denied: u64,
+    /// Background landings dropped because every victim was pinned (a victim
+    /// existed ignoring the pins).
+    pub no_victim_drops: u64,
+    /// Pinned experts that left the pool: 0 unless something is wrong.
+    pub pinned_evictions: u64,
+    /// ... of which a demand claim took on purpose (no unpinned victim left:
+    /// the reserve is too small for the workload).
+    pub revokes: u64,
+}
+
+const PIN_NONE: u8 = 0;
+const PIN_ELIGIBLE: u8 = 1;
+/// Eligible, refused for budget once (so `denied` counts each once).
+const PIN_DENIED: u8 = 2;
+const PIN_HELD: u8 = 3;
+
+/// Box 2's half of the pin contract, per connection (the block comment above).
+/// Pure bookkeeping, no device state: `ShardPool` consults it in every victim
+/// search and tells it about every eviction.
+#[derive(Clone, Debug)]
+struct PinBook {
+    on: bool,
+    budget: u32,
+    pinned: u32,
+    /// Release words applied on this connection (wrapping; the reply's
+    /// `epoch`).
+    epoch: u32,
+    /// Per `layer * N_EXPERT + e`: `PIN_*`.
+    state: Vec<u8>,
+    c: PinCounters,
+}
+
+impl PinBook {
+    fn off() -> Self {
+        Self { on: false, budget: 0, pinned: 0, epoch: 0, state: Vec::new(), c: PinCounters::default() }
+    }
+
+    fn enable(&mut self, budget: u32) {
+        if !self.on {
+            *self = Self {
+                on: true,
+                budget,
+                pinned: 0,
+                epoch: 0,
+                state: vec![PIN_NONE; N_LAYER as usize * N_EXPERT as usize],
+                c: PinCounters::default(),
+            };
+        }
+    }
+
+    #[inline]
+    fn idx(layer: u32, e: u32) -> Option<usize> {
+        (layer < N_LAYER as u32 && e < N_EXPERT).then(|| layer as usize * N_EXPERT as usize + e as usize)
+    }
+
+    #[inline]
+    fn is_pinned(&self, layer: u32, e: u32) -> bool {
+        self.on && Self::idx(layer, e).is_some_and(|i| self.state[i] == PIN_HELD)
+    }
+
+    /// The hub wants `(layer, e)` resident (a decode-shaped pick, a prefetch
+    /// word): pin it at its layer's next report, budget allowing.
+    fn grant(&mut self, layer: u32, e: u32) {
+        if !self.on {
+            return;
+        }
+        if let Some(i) = Self::idx(layer, e) {
+            if self.state[i] == PIN_NONE {
+                self.state[i] = PIN_ELIGIBLE;
+            }
+        }
+    }
+
+    /// One RELEASE word (in wire order). Every word advances the epoch, known
+    /// key or not, so the hub's count of words sent stays comparable.
+    fn release(&mut self, w: u32) {
+        if !self.on {
+            return;
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        self.c.releases += 1;
+        if let Some(i) = Self::idx(w >> 16, w & 0xFFFF) {
+            if self.state[i] == PIN_HELD {
+                self.pinned -= 1;
+            }
+            self.state[i] = PIN_NONE;
+        }
+    }
+
+    /// `(layer, e)` left the pool. Returns whether it was pinned (a
+    /// violation, which the caller reports).
+    fn on_evict(&mut self, layer: u32, e: u32) -> bool {
+        if !self.on {
+            return false;
+        }
+        let Some(i) = Self::idx(layer, e) else { return false };
+        let was = self.state[i] == PIN_HELD;
+        if was {
+            self.pinned -= 1;
+            self.c.pinned_evictions += 1;
+        }
+        self.state[i] = PIN_NONE;
+        was
+    }
+
+    /// Pin every eligible expert of `layer` that is landed now (`row` = the
+    /// layer's `remap_hosts`, nonzero = landed), budget allowing, and return
+    /// the layer's pinned set as a residency map. A pinned expert found NOT
+    /// landed is a violation (it left the pool around the choke point):
+    /// unpinned, reported, and absent from the map.
+    fn report(&mut self, layer: u32, row: &[i32]) -> [u32; proto::RESID_WORDS] {
+        let mut w = [0u32; proto::RESID_WORDS];
+        if !self.on || layer >= N_LAYER as u32 {
+            return w;
+        }
+        let base = layer as usize * N_EXPERT as usize;
+        for e in 0..N_EXPERT as usize {
+            let landed = row.get(e).is_some_and(|&r| r != 0);
+            let s = &mut self.state[base + e];
+            match *s {
+                PIN_ELIGIBLE | PIN_DENIED if landed => {
+                    if self.pinned < self.budget {
+                        *s = PIN_HELD;
+                        self.pinned += 1;
+                        self.c.new_pins += 1;
+                    } else if *s == PIN_ELIGIBLE {
+                        *s = PIN_DENIED;
+                        self.c.denied += 1;
+                    }
+                }
+                PIN_HELD if !landed => {
+                    *s = PIN_NONE;
+                    self.pinned -= 1;
+                    self.c.pinned_evictions += 1;
+                    pin_violation("pinned but not landed at report", layer, e as u32);
+                }
+                _ => {}
+            }
+            if *s == PIN_HELD {
+                w[e / 32] |= 1 << (e % 32);
+            }
+        }
+        w
+    }
+}
+
+/// `(layer, e)` pairs a victim search must not take besides the hub's pins
+/// and the pass's own wanted ids: a parked request's picks (`parked_pins`)
+/// and the early-page `pinned` set.
+type ExtraPins<'a> = &'a [(u32, u32)];
+
+impl ShardPool {
+    /// A pool of `n_slots`, seeded with `(layer, base_slot, ids)` regions as
+    /// `load` placed them (slot `base + i` holds `ids[i]`, all landed, oldest
+    /// first), each layer keeping `floor_frac` of its region under global
+    /// eviction. Pins off.
+    fn seeded(n_slots: usize, layers: &[(u32, u32, &[u32])], floor_frac: f32) -> Self {
+        let mut owner_of: Vec<Option<(u32, u32)>> = vec![None; n_slots];
+        let mut slot_of = std::collections::HashMap::with_capacity(n_slots);
+        let mut last_use = vec![0u64; n_slots];
+        let mut tick = 0u64;
+        let mut remap_hosts = vec![vec![0i32; REMAP_LEN]; N_LAYER as usize];
+        let mut held = vec![0u32; N_LAYER as usize];
+        let mut floor = vec![0u32; N_LAYER as usize];
+        for &(li, base, ids) in layers {
+            for (local, &e) in ids.iter().enumerate() {
+                let abs = base + local as u32;
+                owner_of[abs as usize] = Some((li, e));
+                slot_of.insert((li, e), abs);
+                tick += 1;
+                last_use[abs as usize] = tick;
+                remap_hosts[li as usize][e as usize] = -(abs as i32) - 1;
+            }
+            held[li as usize] = ids.len() as u32;
+            floor[li as usize] = (ids.len() as f32 * floor_frac) as u32;
+        }
+        Self {
+            owner_of,
+            slot_of,
+            last_use,
+            tick,
+            remap_hosts,
+            dirty: vec![false; N_LAYER as usize],
+            held,
+            floor,
+            pins: PinBook::off(),
+        }
+    }
+
+    /// THE victim search: the least recently used slot in `range` that is
+    /// free, or whose occupant is not one of `want` on `want_layer`, not in
+    /// `extra`, not pinned by the hub (unless `ignore_hub_pins`), and not a
+    /// foreign layer at its floor (`for_layer` is the layer taking the slot;
+    /// its own slots are never floor-protected).
+    #[allow(clippy::too_many_arguments)]
+    fn pick_victim(
+        &self,
+        range: std::ops::Range<u32>,
+        want_layer: u32,
+        want: &[u32],
+        extra: ExtraPins<'_>,
+        for_layer: u32,
+        ignore_hub_pins: bool,
+    ) -> Option<u32> {
+        let n = self.owner_of.len() as u32;
+        let range = range.start.min(n)..range.end.min(n);
+        let mut best: Option<(u64, u32)> = None;
+        for sl in range {
+            let ok = match self.owner_of[sl as usize] {
+                Some((ol, oe)) => {
+                    if (ol == want_layer && want.contains(&oe))
+                        || extra.contains(&(ol, oe))
+                        || (!ignore_hub_pins && self.pins.is_pinned(ol, oe))
+                    {
+                        false
+                    } else {
+                        // Never take a foreign layer below its floor.
+                        ol == for_layer || self.held[ol as usize] > self.floor[ol as usize]
+                    }
+                }
+                None => true,
+            };
+            if !ok {
+                continue;
+            }
+            let t = self.last_use[sl as usize];
+            if best.is_none_or(|(bt, _)| t < bt) {
+                best = Some((t, sl));
+            }
+        }
+        best.map(|(_, sl)| sl)
+    }
+
+    /// Region first, then the whole pool (`global` skips the region).
+    #[allow(clippy::too_many_arguments)]
+    fn pick_victim_any(
+        &self,
+        region: (u32, u32),
+        global: bool,
+        want_layer: u32,
+        want: &[u32],
+        extra: ExtraPins<'_>,
+        for_layer: u32,
+        ignore_hub_pins: bool,
+    ) -> Option<u32> {
+        let n = self.owner_of.len() as u32;
+        let first = if global { 0..n } else { region.0..region.1 };
+        self.pick_victim(first, want_layer, want, extra, for_layer, ignore_hub_pins)
+            .or_else(|| self.pick_victim(0..n, want_layer, want, extra, for_layer, ignore_hub_pins))
+    }
+
+    /// THE CHOKE POINT: detach whoever holds `slot` (possibly another layer,
+    /// whose device remap is then stale until its next `ensure`) and return
+    /// it. Every replacement of a slot's occupant goes through here. Evicting a
+    /// hub-pinned expert is a violation of the pin invariant (reported).
+    fn evict(&mut self, slot: u32, cur_layer: u32) -> Option<(u32, u32)> {
+        let (ol, oe) = self.owner_of[slot as usize].take()?;
+        self.slot_of.remove(&(ol, oe));
+        self.remap_hosts[ol as usize][oe as usize] = 0;
+        self.held[ol as usize] -= 1;
+        if ol != cur_layer {
+            self.dirty[ol as usize] = true;
+        }
+        if self.pins.on_evict(ol, oe) {
+            pin_violation("evicted", ol, oe);
+        }
+        Some((ol, oe))
+    }
+
+    /// `ensure`: is `(layer, e)` resident? If so, touch its recency (a prefill
+    /// hit refreshes only within the prefill class, a decode hit promotes).
+    fn touch_hit(&mut self, layer: u32, e: u32, scan_class: bool) -> bool {
+        let Some(&slot) = self.slot_of.get(&(layer, e)) else { return false };
+        self.tick += 1;
+        let lu = &mut self.last_use[slot as usize];
+        if scan_class {
+            if *lu < PREFILL_AGE {
+                *lu = self.tick;
+            }
+        } else {
+            *lu = self.tick + PREFILL_AGE;
+        }
+        true
+    }
+
+    /// `ensure`: claim a slot for the miss `(layer, e)` of a pass wanting
+    /// `want`. Victim, least-recently-used first, never one of `want` on this
+    /// layer, never `extra`, never hub-pinned; region first (a prefill sweep
+    /// should not evict its neighbours as a matter of course), but the region
+    /// is a PREFERENCE, not a bound: a layer whose union exceeds its 154-slot
+    /// share used to die with "no evictable slot" while thousands of slots sat
+    /// evictable elsewhere. With no unpinned victim left (a reserve below
+    /// `PIN_RESERVE_MIN`), a pin is REVOKED rather than failing the request
+    /// (reported by the choke point). The slot is claimed NOW (so the next pick
+    /// cannot choose it again); its remap entry is written only once the data
+    /// has landed (`commit`). Returns the slot and whoever was evicted from it.
+    #[allow(clippy::too_many_arguments)]
+    fn claim_miss(
+        &mut self,
+        layer: u32,
+        e: u32,
+        want: &[u32],
+        extra: ExtraPins<'_>,
+        region: (u32, u32),
+        global: bool,
+        scan_class: bool,
+    ) -> Option<(u32, Option<(u32, u32)>)> {
+        let victim = match self.pick_victim_any(region, global, layer, want, extra, layer, false) {
+            Some(v) => v,
+            None if self.pins.on => {
+                let v = self.pick_victim_any(region, global, layer, want, extra, layer, true)?;
+                self.pins.c.revokes += 1;
+                v
+            }
+            None => return None,
+        };
+        let evicted = self.evict(victim, layer);
+        self.owner_of[victim as usize] = Some((layer, e));
+        self.slot_of.insert((layer, e), victim);
+        self.held[layer as usize] += 1;
+        self.tick += 1;
+        self.last_use[victim as usize] = if scan_class { self.tick } else { self.tick + PREFILL_AGE };
+        Some((victim, evicted))
+    }
+
+    /// A claimed slot's data has landed: map it.
+    fn commit(&mut self, layer: u32, e: u32, slot: u32) {
+        self.remap_hosts[layer as usize][e as usize] = -(slot as i32) - 1;
+    }
+
+    /// A background read of `key` has been repacked into `slot` (already
+    /// detached by `evict`): own, map and age it. Background admissions are
+    /// stamped as decode-class, like the reads that asked for them.
+    fn land(&mut self, slot: u32, key: (u32, u32)) {
+        self.owner_of[slot as usize] = Some(key);
+        self.slot_of.insert(key, slot);
+        self.held[key.0 as usize] += 1;
+        self.tick += 1;
+        self.last_use[slot as usize] = self.tick + PREFILL_AGE;
+        self.remap_hosts[key.0 as usize][key.1 as usize] = -(slot as i32) - 1;
+        self.dirty[key.0 as usize] = true;
+    }
+
+    /// Roll back a claim whose data never landed: free and age the slot.
+    /// Never pinned (a pin needs a landed slot at report time).
+    fn unclaim(&mut self, layer: u32, e: u32, slot: u32) {
+        debug_assert!(!self.pins.is_pinned(layer, e), "a claim is never pinned");
+        self.owner_of[slot as usize] = None;
+        self.slot_of.remove(&(layer, e));
+        self.held[layer as usize] -= 1;
+        self.last_use[slot as usize] = 0;
+    }
+}
+
+/// Recency offset of decode-class slots over prefill-class ones (the two-class
+/// LRU, `ensure_layer_inner`).
+const PREFILL_AGE: u64 = 1u64 << 40;
 
 /// ONE pool across all layers -- the victim search is a single global LRU and the
 /// per-layer regions are only where a layer's experts happen to be loaded, not a
@@ -2826,7 +3415,6 @@ impl ExpertShard {
         let pinned: Vec<(u32, u32)> = self.pinned.iter().chain(self.parked_pins.iter()).copied().collect();
         let Some(pf) = self.prefetch.as_mut() else { return Ok(()) };
         let Some(pool) = self.pool.as_mut() else { return Ok(()) };
-        const PREFILL_AGE: u64 = 1u64 << 40;
         let global = b2_global_pool();
         let repack = self.repack.as_ref();
         let repack_stream = self.repack_stream.as_ref();
@@ -2924,38 +3512,20 @@ impl ExpertShard {
                 continue;
             }
             let Some(l) = self.layers.get(d.layer as usize).and_then(|l| l.as_ref()) else { pf.free.push(d.set); continue };
-            let (lo, hi) = (l.base_slot as u32, l.base_slot as u32 + l.ids.len() as u32);
-            let pick = |global: bool, pool: &ShardPool| -> Option<u32> {
-                let n = pool.owner_of.len() as u32;
-                let range = if global { 0..n } else { lo.min(n)..hi.min(n) };
-                let mut best: Option<(u64, u32)> = None;
-                for sl in range {
-                    let ok = match pool.owner_of[sl as usize] {
-                        Some((ol, oe)) => {
-                            if (ol == cur_layer && want.contains(&oe)) || pinned.contains(&(ol, oe)) {
-                                false
-                            } else {
-                                ol == d.layer || pool.held[ol as usize] > pool.floor[ol as usize]
-                            }
-                        }
-                        None => true,
-                    };
-                    if !ok { continue; }
-                    let t = pool.last_use[sl as usize];
-                    if best.is_none_or(|(bt, _)| t < bt) { best = Some((t, sl)); }
-                }
-                best.map(|(_, sl)| sl)
-            };
+            let region = (l.base_slot as u32, l.base_slot as u32 + l.ids.len() as u32);
             let ev_t_scan = std::time::Instant::now();
-            let Some(victim) = pick(global, pool).or_else(|| pick(true, pool)) else { pf.free.push(d.set); continue };
+            // Never a hub-pinned victim: a background landing is optional, so
+            // with every candidate pinned it is DROPPED (whoever needs the
+            // expert demand-reads it; the pin reserve covers that claim).
+            let Some(victim) = pool.pick_victim_any(region, global, cur_layer, want, &pinned, d.layer, false) else {
+                if pool.pins.on && pool.pick_victim_any(region, global, cur_layer, want, &pinned, d.layer, true).is_some() {
+                    pool.pins.c.no_victim_drops += 1;
+                }
+                pf.free.push(d.set);
+                continue;
+            };
             let ev_scan_ns = ev_t_scan.elapsed().as_nanos() as f64;
-            let ev_victim = pool.owner_of[victim as usize];
-            if let Some((ol, oe)) = pool.owner_of[victim as usize].take() {
-                pool.slot_of.remove(&(ol, oe));
-                pool.remap_hosts[ol as usize][oe as usize] = 0;
-                pool.held[ol as usize] -= 1;
-                if ol != cur_layer { pool.dirty[ol as usize] = true; }
-            }
+            let ev_victim = pool.evict(victim, cur_layer);
             let ev_t_repack = std::time::Instant::now();
             let landed: eyre::Result<()> = match (repack, repack_stream) {
                 (Some(rp), Some(rs)) => Self::repack_in_place(rp, rs, r, victim, &pf.stages[d.set], &d.offs, d.coalesced).map(|_| ()),
@@ -2970,13 +3540,7 @@ impl ExpertShard {
                 pf.free.push(d.set);
                 return Err(err);
             }
-            pool.owner_of[victim as usize] = Some(key);
-            pool.slot_of.insert(key, victim);
-            pool.held[d.layer as usize] += 1;
-            pool.tick += 1;
-            pool.last_use[victim as usize] = pool.tick + PREFILL_AGE;
-            pool.remap_hosts[d.layer as usize][d.e as usize] = -(victim as i32) - 1;
-            pool.dirty[d.layer as usize] = true;
+            pool.land(victim, key);
             pf.admitted += 1;
             pf.free.push(d.set);
             if ev_on {
@@ -3093,53 +3657,20 @@ impl ExpertShard {
         // ABSOLUTE throughout; `remap` holds `-(abs_slot)-1` so the kernel can be
         // handed the whole buffer (see `layer_views`).
         let n_slots = self.info.n_resident as usize;
-        let mut owner_of: Vec<Option<(u32, u32)>> = vec![None; n_slots];
-        let mut slot_of = std::collections::HashMap::with_capacity(n_slots);
-        let mut last_use = vec![0u64; n_slots];
-        let mut tick = 0u64;
-        let mut remap_hosts = vec![vec![0i32; REMAP_LEN]; N_LAYER as usize];
-        for (li, l) in self.layers.iter().enumerate() {
-            let Some(l) = l.as_ref() else { continue };
-            if l.page.is_none() {
-                continue;
-            }
-            let base = l.base_slot;
-            for (local, &e) in l.ids.iter().enumerate() {
-                let abs = base + local as u32;
-                owner_of[abs as usize] = Some((li as u32, e));
-                slot_of.insert((li as u32, e), abs);
-                tick += 1;
-                last_use[abs as usize] = tick;
-                remap_hosts[li][e as usize] = -(abs as i32) - 1;
-            }
-        }
         let frac = b2_pool_floor();
-        let mut held = vec![0u32; N_LAYER as usize];
-        let mut floor = vec![0u32; N_LAYER as usize];
-        for (li, l) in self.layers.iter().enumerate() {
-            if let Some(l) = l.as_ref() {
-                if l.page.is_some() {
-                    held[li] = l.ids.len() as u32;
-                    floor[li] = (l.ids.len() as f32 * frac) as u32;
-                }
-            }
-        }
+        let seeded: Vec<(u32, u32, &[u32])> = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(li, l)| l.as_ref().filter(|l| l.page.is_some()).map(|l| (li as u32, l.base_slot, &l.ids[..])))
+            .collect();
         eprintln!(
             "expert shard: global pool {} (floor {:.2} = {} slots on a 260-slot layer)",
             if b2_global_pool() { "ON" } else { "OFF" },
             frac,
             (260.0 * frac) as u32
         );
-        self.pool = Some(ShardPool {
-            owner_of,
-            slot_of,
-            last_use,
-            tick,
-            remap_hosts,
-            dirty: vec![false; N_LAYER as usize],
-            held,
-            floor,
-        });
+        self.pool = Some(ShardPool::seeded(n_slots, &seeded, frac));
         // Do NOT touch the advertised HELLO bitmap. `info.owned` is what the hub's
         // PREFILL path uses for its remote exclusion, and prefill's per-layer union
         // (~203 experts at B=1024) would not fit a catch-all region (154 slots), so
@@ -3224,6 +3755,112 @@ impl ExpertShard {
             }
         }
         w
+    }
+
+    /// A new connection: the previous hub's pins are void (pinning block
+    /// comment above `PinBook`).
+    pub fn pin_reset(&mut self) {
+        if let Some(p) = self.pool.as_mut() {
+            p.pins = PinBook::off();
+        }
+    }
+
+    /// The hub asked for pins (`REQ_FLAG_PIN`): turn them on for this
+    /// connection (idempotent). Budget = pool slots - `b2_pin_reserve()` - the
+    /// layer floors. False for an unpaged shard, which never evicts anyway.
+    pub fn pin_enable(&mut self) -> bool {
+        let Some(p) = self.pool.as_mut() else { return false };
+        if !p.pins.on {
+            let n = p.owner_of.len();
+            let floors: usize = p.floor.iter().map(|&f| f as usize).sum();
+            let r = b2_pin_reserve();
+            let budget = n.saturating_sub(r + floors) as u32;
+            p.pins.enable(budget);
+            eprintln!(
+                "expertd: pinning ON for this connection: budget {budget} of {n} slots (reserve {r}, floors {floors}; \
+                 no-deadlock minimum {PIN_RESERVE_MIN}){}",
+                if b2_assert_pinned() { ", V41_B2_ASSERT_PINNED" } else { "" }
+            );
+        }
+        true
+    }
+
+    pub fn pin_on(&self) -> bool {
+        self.pool.as_ref().is_some_and(|p| p.pins.on)
+    }
+
+    /// A request's RELEASE words (unpin, in order), then its PREFETCH words
+    /// (the hub wants them resident: eligible to pin once landed). Call when
+    /// the request is served, in arrival order.
+    pub fn pin_apply_words(&mut self, release: &[u32], prefetch: &[u32]) {
+        let Some(p) = self.pool.as_mut() else { return };
+        if !p.pins.on {
+            return;
+        }
+        for &w in release {
+            p.pins.release(w);
+        }
+        for &w in prefetch {
+            p.pins.grant(w >> 16, w & 0xFFFF);
+        }
+    }
+
+    /// Build the pin-mode reply for `layer` after its pass: a DECODE-shaped
+    /// pass's `picks` become eligible (a prefill chunk's do not: see the block
+    /// comment), eligible landed experts are pinned within budget, and the
+    /// layer's pinned set is returned as the map, with `[epoch, pinned,
+    /// budget]`. An unpaged layer is its static assignment (never evicted).
+    /// `None` unless pinning is on.
+    pub fn pin_report(&mut self, layer: u32, picks: &[i32], decode_shaped: bool) -> Option<([u32; proto::RESID_WORDS], [u32; 3])> {
+        let paged = self.layer_is_paged(layer);
+        let static_map = if paged { None } else { Some(self.residency_words(layer)) };
+        let p = self.pool.as_mut()?;
+        if !p.pins.on {
+            return None;
+        }
+        let map = match static_map {
+            Some(m) => m,
+            None => {
+                if decode_shaped {
+                    for &e in picks {
+                        if (0..N_EXPERT as i32).contains(&e) {
+                            p.pins.grant(layer, e as u32);
+                        }
+                    }
+                }
+                let row = &p.remap_hosts[layer as usize];
+                p.pins.report(layer, row)
+            }
+        };
+        Some((map, [p.pins.epoch, p.pins.pinned, p.pins.budget]))
+    }
+
+    /// Experts of `layer` among `sel` that are NOT landed right now: the ones
+    /// a pass starting now has to page or wait for (the reply's PAGED bits).
+    /// Empty for an unpaged layer.
+    pub fn paged_bits(&self, layer: u32, sel: &[i32]) -> [u32; proto::RESID_WORDS] {
+        let mut w = [0u32; proto::RESID_WORDS];
+        if !self.layer_is_paged(layer) {
+            return w;
+        }
+        let Some(row) = self.pool.as_ref().and_then(|p| p.remap_hosts.get(layer as usize)) else { return w };
+        for &e in sel {
+            if (0..N_EXPERT as i32).contains(&e) && row[e as usize] == 0 {
+                w[e as usize / 32] |= 1 << (e % 32);
+            }
+        }
+        w
+    }
+
+    /// This connection's pin counters and `(pinned, budget, epoch)`.
+    pub fn pin_counters(&self) -> Option<(PinCounters, u32, u32, u32)> {
+        let p = self.pool.as_ref()?;
+        p.pins.on.then(|| (p.pins.c, p.pins.pinned, p.pins.budget, p.pins.epoch))
+    }
+
+    /// Is `(layer, e)` pinned by the hub?
+    pub fn is_pinned(&self, layer: u32, e: u32) -> bool {
+        self.pool.as_ref().is_some_and(|p| p.pins.is_pinned(layer, e))
     }
 
     /// Which of `ids` are resident on `layer` RIGHT NOW, reading nothing. `NO_PICK`
@@ -3317,7 +3954,6 @@ impl ExpertShard {
         // only then from decode's, so decode's set survives a burst intact.
         // `V41_B2_SCAN_CLASS=0` restores the single LRU.
         let scan_class = prefill_shaped && b2_scan_class();
-        const PREFILL_AGE: u64 = 1u64 << 40;
         let global = b2_global_pool();
         let r = &mut self.routed;
         // Disjoint field borrows, hoisted: the per-role read closures below must
@@ -3344,17 +3980,10 @@ impl ExpertShard {
         // slot claimed but not yet landed is rolled back below, so the pool never
         // reports an expert resident that nobody wrote.
         let mut failed: Option<eyre::Report> = None;
+        let region = (base as u32, base as u32 + n_region as u32);
         for &e in &want {
             pg.requests += 1;
-            if let Some(&slot) = pool.slot_of.get(&(layer, e)) {
-                pool.tick += 1;
-                let lu = &mut pool.last_use[slot as usize];
-                if scan_class {
-                    // Prefill hit: refresh only within the prefill class.
-                    if *lu < PREFILL_AGE { *lu = pool.tick; }
-                } else {
-                    *lu = pool.tick + PREFILL_AGE;
-                }
+            if pool.touch_hit(layer, e, scan_class) {
                 ev_hits += 1;
                 continue;
             }
@@ -3362,50 +3991,11 @@ impl ExpertShard {
             if let Some(m) = missed.as_deref_mut() {
                 m.push(e);
             }
-            // Victim, least-recently-used first. Never a slot holding an id we are
-            // about to need on THIS layer in THIS call. Region-restricted unless
-            // the request is decode-shaped and the global pool is enabled.
-            let lo = base as u32;
-            let hi = lo + n_region as u32;
-            let pick = |global: bool, pool: &ShardPool| -> Option<u32> {
-                // Least recently used candidate = smallest tick. Same predicate
-                // as the old front-to-back deque scan.
-                let n = pool.owner_of.len() as u32;
-                let range = if global { 0..n } else { lo.min(n)..hi.min(n) };
-                let mut best: Option<(u64, u32)> = None;
-                for sl in range {
-                    let ok = match pool.owner_of[sl as usize] {
-                        Some((ol, oe)) => {
-                            if (ol == layer && want.contains(&oe)) || pinned.contains(&(ol, oe)) {
-                                false
-                            } else {
-                                // Never take a foreign layer below its floor.
-                                ol == layer || pool.held[ol as usize] > pool.floor[ol as usize]
-                            }
-                        }
-                        None => true,
-                    };
-                    if !ok {
-                        continue;
-                    }
-                    let t = pool.last_use[sl as usize];
-                    if best.is_none_or(|(bt, _)| t < bt) {
-                        best = Some((t, sl));
-                    }
-                }
-                best.map(|(_, sl)| sl)
-            };
-            // Region first (a prefill sweep should not evict its neighbours as a
-            // matter of course), but the region is a PREFERENCE, not a bound. The
-            // per-layer carve is arbitrary -- 154 slots each -- so a layer whose
-            // union exceeds its own share used to die with "no evictable slot"
-            // while thousands of slots sat evictable in other layers' regions.
-            // Borrowing is always better than failing the request.
             let ev_t_scan = std::time::Instant::now();
-            let victim_found = pick(global, pool).or_else(|| pick(true, pool));
+            let claim = pool.claim_miss(layer, e, &want, &pinned, region, global, scan_class);
             let ev_scan = ev_t_scan.elapsed().as_nanos() as f64;
             ev_scan_ns += ev_scan;
-            let Some(victim) = victim_found else {
+            let Some((victim, ev_victim)) = claim else {
                 failed = Some(eyre!(
                     "expert shard: layer {layer} has no evictable slot anywhere \
                      (want {} > region {n_region}, pool {} slots)",
@@ -3414,29 +4004,11 @@ impl ExpertShard {
                 ));
                 break;
             };
-            // Detach from whoever held it — possibly a DIFFERENT layer, whose
-            // device remap is then stale until its next `ensure_layer`.
-            let ev_victim = pool.owner_of[victim as usize];
             match ev_victim {
                 Some((ol, _)) => ev_foreign += u32::from(ol != layer),
                 None => ev_free += 1,
             }
             ev_miss.push((ev_scan, ev_victim));
-            if let Some((ol, oe)) = pool.owner_of[victim as usize].take() {
-                pool.slot_of.remove(&(ol, oe));
-                pool.remap_hosts[ol as usize][oe as usize] = 0;
-                pool.held[ol as usize] -= 1;
-                if ol != layer {
-                    pool.dirty[ol as usize] = true;
-                }
-            }
-            // Slot claimed NOW (so the next pick cannot choose it again); the
-            // remap entry is written only once the data has landed.
-            pool.owner_of[victim as usize] = Some((layer, e));
-            pool.slot_of.insert((layer, e), victim);
-            pool.held[layer as usize] += 1;
-            pool.tick += 1;
-            pool.last_use[victim as usize] = if scan_class { pool.tick } else { pool.tick + PREFILL_AGE };
             pending.push((e, victim));
         }
         // Read the misses `stages.len()` at a time, concurrently (MEASURED on box
@@ -3533,7 +4105,7 @@ impl ExpertShard {
                     }
                     let ev_repack_ns = t_h.elapsed().as_nanos() as u64;
                     h2d_ns += ev_repack_ns;
-                    pool.remap_hosts[layer as usize][e as usize] = -(victim as i32) - 1;
+                    pool.commit(layer, e, victim);
                     dirty = true;
                     if ev_on {
                         let (scan, vic) = ev_miss.get(ev_ci * k + j).copied().unwrap_or((f64::NAN, None));
@@ -3572,10 +4144,7 @@ impl ExpertShard {
             // half-written, but nothing maps it any more).
             for &(e, victim) in &pending {
                 if pool.remap_hosts[layer as usize][e as usize] != -(victim as i32) - 1 {
-                    pool.owner_of[victim as usize] = None;
-                    pool.slot_of.remove(&(layer, e));
-                    pool.held[layer as usize] -= 1;
-                    pool.last_use[victim as usize] = 0;
+                    pool.unclaim(layer, e, victim);
                 }
             }
             // This layer's device remap may still name an evicted victim whose
@@ -3924,6 +4493,10 @@ pub struct ExecTiming {
     /// two-pass path ran (misses > 0 on the batched path).
     pub n_missing: u32,
     pub two_pass: bool,
+    /// Pin mode's PAGED bits (`proto::RESP_FLAG_PIN`): experts of the layer
+    /// this pass picked that were not landed when it started, i.e. that it had
+    /// to page or wait for. Taken before anything can land or evict.
+    pub paged: [u32; proto::RESID_WORDS],
 }
 
 /// Per-request kernel geometry shared by the by-expert passes.
@@ -4152,6 +4725,10 @@ impl MoeExecutor {
         if xq.len() != b * XQ_BYTES_PER_TOKEN || sel.len() != b * nu || ew.len() != b * nu {
             return Err(eyre!("executor: payload sizes do not match b={b}"));
         }
+        // Pin mode's surprise evidence: what this pass must page or wait for,
+        // judged BEFORE the first `ensure` / admission can change residency.
+        // Array lookups only (b * 6 of them).
+        let paged = shard.paged_bits(layer, sel);
         // Catch-all tier: make every requested expert resident first. A paged
         // shard's `remap[e]` is 0 ("the other device takes it") until it is,
         // which the kernel would silently honour and drop the expert.
@@ -4247,6 +4824,7 @@ impl MoeExecutor {
             miss_mask,
             n_missing: self.missing_scratch.len() as u32,
             two_pass,
+            paged,
             ..Default::default()
         };
         if path_decode {
@@ -4777,7 +5355,11 @@ pub fn serve_connection(
 ) -> eyre::Result<(Vec<RequestRecord>, u64)> {
     apply_socket_options(&stream, &opts.socket)?;
     B2_SPIN_CUR.store(opts.socket.busy_poll_us, std::sync::atomic::Ordering::Relaxed);
-    let max_payload = proto::REQ_FIXED + exec.rows() * (XQ_BYTES_PER_TOKEN + 8 * N_EXPERT_USED) + 64;
+    // Pins belong to the hub that asked for them: a new connection starts with
+    // none (the hub resets its mirror on connect too).
+    shard.pin_reset();
+    // + the word lists (hints 2 x 64, prefetch 128, release 128) at any `b`.
+    let max_payload = proto::REQ_FIXED + exec.rows() * (XQ_BYTES_PER_TOKEN + 8 * N_EXPERT_USED) + 4096;
     // HELLO first.
     {
         let mut hello = AlignedBuf::with_capacity(4096);
@@ -5042,6 +5624,17 @@ pub fn serve_connection(
                     let reply = proto::RESP_DATA_OFF + b.max(bb) * N_EMBD as usize * elem_out;
                     b2_adapt_busy_poll(&stream, req.flags & proto::REQ_FLAG_DECODE != 0, buf.len(), reply, opts.socket.busy_poll_us);
                 }
+                // PINNING (`REQ_FLAG_PIN`): release, then grant, in ARRIVAL
+                // order -- this request's words before its partner's -- so the
+                // reply epochs count a prefix of the words the hub sent.
+                if req.flags & proto::REQ_FLAG_PIN != 0 || reqb.as_ref().is_some_and(|rb| rb.flags & proto::REQ_FLAG_PIN != 0) {
+                    shard.pin_enable();
+                }
+                let ev_pin0 = shard.pin_counters();
+                shard.pin_apply_words(req.release, req.prefetch);
+                if let Some(rb) = reqb.as_ref() {
+                    shard.pin_apply_words(rb.release, rb.prefetch);
+                }
                 if let Some(rb) = reqb.as_ref() {
                     if !rb.hint_admit.is_empty() {
                         shard.hint_evict_first(rb.hint_admit);
@@ -5142,7 +5735,8 @@ pub fn serve_connection(
                     if !(park && may_park) {
                         return Ok(());
                     }
-                    let rows2 = 16usize.min(exec_rows);
+                    // `PARK_MAX_ROWS`: the pin reserve counts on it.
+                    let rows2 = PARK_MAX_ROWS.min(exec_rows);
                     let servable = |m: &Inbound| -> bool {
                         match m {
                             Inbound::Frame { hdr, buf, .. } if hdr.kind == proto::KIND_REQUEST => {
@@ -5278,8 +5872,20 @@ pub fn serve_connection(
                     exec.read_f16_at(0, b, resp.view_mut::<u16>(proto::RESP_DATA_OFF, n))?;
                 }
                 let ev_t_d2h = if ev_on { super::evtrace::now() } else { nan };
-                if req.flags & proto::REQ_FLAG_RESID != 0 {
-                    proto::append_residency(&mut resp, &shard.residency_words(req.layer));
+                // Pin mode: the map is the PINNED set (reporting pins), then the
+                // pin block with this pass's paged bits. A decode-shaped pass's
+                // picks (both requests' when merged) become pinnable here.
+                let decode_shaped = b + bb <= 16;
+                let pin_a = if req.flags & proto::REQ_FLAG_PIN != 0 { shard.pin_report(req.layer, sel_run, decode_shaped) } else { None };
+                match pin_a {
+                    Some((map, [epoch, pinned, budget])) => {
+                        proto::append_residency(&mut resp, &map);
+                        proto::append_pin(&mut resp, epoch, pinned, budget, &timing.paged);
+                    }
+                    None if req.flags & proto::REQ_FLAG_RESID != 0 => {
+                        proto::append_residency(&mut resp, &shard.residency_words(req.layer));
+                    }
+                    None => {}
                 }
                 // The partner's reply: rows [b, b + bb) of the same pass. Page
                 // time and miss count are reported on THIS request only, so the
@@ -5295,8 +5901,16 @@ pub fn serve_connection(
                         } else {
                             exec.read_f16_at(b, bb, resp_b.view_mut::<u16>(proto::RESP_DATA_OFF, nb))?;
                         }
-                        if rb.flags & proto::REQ_FLAG_RESID != 0 {
-                            proto::append_residency(&mut resp_b, &shard.residency_words(rb.layer));
+                        let pin_b = if rb.flags & proto::REQ_FLAG_PIN != 0 { shard.pin_report(rb.layer, &[], decode_shaped) } else { None };
+                        match pin_b {
+                            Some((map, [epoch, pinned, budget])) => {
+                                proto::append_residency(&mut resp_b, &map);
+                                proto::append_pin(&mut resp_b, epoch, pinned, budget, &timing.paged);
+                            }
+                            None if rb.flags & proto::REQ_FLAG_RESID != 0 => {
+                                proto::append_residency(&mut resp_b, &shard.residency_words(rb.layer));
+                            }
+                            None => {}
                         }
                         proto::patch_len(&mut resp_b);
                         let t_ready_b = Instant::now();
@@ -5398,6 +6012,7 @@ pub fn serve_connection(
                         v.push(pf1[i] - ev_pf0[i]);
                     }
                     v.push(pf1[11]);
+                    v.extend_from_slice(&ev_pin_fields(ev_pin0, shard.pin_counters(), req.release.len(), &timing.paged));
                     super::evtrace::emit(&super::evtrace_kinds::B2_REQ, &v);
                     // The merged partner: same pass, its own identity and arrival.
                     if let (Some(rb), Some((hb, _, tfb, _, t2b))) = (reqb.as_ref(), partner.as_ref()) {
@@ -5421,6 +6036,8 @@ pub fn serve_connection(
                             ("exec_h2d_us", nan), ("exec_gpu_us", nan),
                             ("pf_d_hinted", nan), ("pf_d_admitted", nan), ("pf_d_dropped", nan), ("pf_d_waited", nan),
                             ("pf_d_promoted", nan),
+                            ("pin_release_words", rb.release.len() as f64), ("pin_new", nan), ("pin_denied", nan),
+                            ("pin_drops_no_victim", nan), ("pin_evictions", nan),
                         ] {
                             super::evtrace::set_named(k, &mut v, name, x);
                         }
@@ -5488,7 +6105,13 @@ pub fn serve_connection(
                         if miss > 0 {
                             let (pread_ns, rcpu_ns, rgpu_ns) = shard.page_read_split();
                             let per = |ns: u64| ns as f64 / miss as f64 / 1e6;
-                            let pfs = shard.prefetch_stats().map(|(h, a, d, w)| format!(" prefetch hinted={h} admitted={a} dropped={d} waited={w} promoted={} wait_ms={:.0}", shard.prefetch_promoted(), shard.prefetch_wait_ns as f64 / 1e6)).unwrap_or_default();
+                            let mut pfs = shard.prefetch_stats().map(|(h, a, d, w)| format!(" prefetch hinted={h} admitted={a} dropped={d} waited={w} promoted={} wait_ms={:.0}", shard.prefetch_promoted(), shard.prefetch_wait_ns as f64 / 1e6)).unwrap_or_default();
+                            if let Some((c, pinned, budget, _)) = shard.pin_counters() {
+                                pfs.push_str(&format!(
+                                    " | pins {pinned}/{budget} released={} new={} denied={} drops_no_victim={} pinned_evictions={} revokes={}",
+                                    c.releases, c.new_pins, c.denied, c.no_victim_drops, c.pinned_evictions, c.revokes
+                                ));
+                            }
                             // `pread` here is the PROCESS-WIDE read counter differenced
                             // around demand chunks, so concurrent prefetch reads inflate
                             // it; read `read` (per-miss wall) instead.
@@ -5594,6 +6217,13 @@ fn serve_interleaved(
         return Err(eyre!("request geometry n_used={} xq_bpt={} != {}/{}", req.n_used, req.xq_bpt, N_EXPERT_USED, XQ_BYTES_PER_TOKEN));
     }
     let b = req.b as usize;
+    // Pin words: served in arrival order right after the parked request, whose
+    // own words were applied before it parked.
+    if req.flags & proto::REQ_FLAG_PIN != 0 {
+        shard.pin_enable();
+    }
+    let ev_pin0 = shard.pin_counters();
+    shard.pin_apply_words(req.release, req.prefetch);
     if !req.hint_admit.is_empty() {
         shard.hint_evict_first(req.hint_admit);
     }
@@ -5624,8 +6254,16 @@ fn serve_interleaved(
         exec.read_f16_at(0, b, resp.view_mut::<u16>(proto::RESP_DATA_OFF, n))?;
     }
     let ev_t_d2h = if ev_on { super::evtrace::now() } else { f64::NAN };
-    if req.flags & proto::REQ_FLAG_RESID != 0 {
-        proto::append_residency(&mut resp, &shard.residency_words(req.layer));
+    let pin = if req.flags & proto::REQ_FLAG_PIN != 0 { shard.pin_report(req.layer, req.sel, b <= 16) } else { None };
+    match pin {
+        Some((map, [epoch, pinned, budget])) => {
+            proto::append_residency(&mut resp, &map);
+            proto::append_pin(&mut resp, epoch, pinned, budget, &timing.paged);
+        }
+        None if req.flags & proto::REQ_FLAG_RESID != 0 => {
+            proto::append_residency(&mut resp, &shard.residency_words(req.layer));
+        }
+        None => {}
     }
     proto::patch_len(&mut resp);
     let t_ready = Instant::now();
@@ -5638,7 +6276,11 @@ fn serve_interleaved(
         sel.sort_unstable();
         sel.dedup();
         let under = if g.0 == u64::MAX { f64::NAN } else { g.0 as f64 };
+        let pf = ev_pin_fields(ev_pin0, shard.pin_counters(), req.release.len(), &timing.paged);
         super::evtrace::emit_named(&super::evtrace_kinds::B2_REQ, &[
+            ("pin_on", pf[0]), ("pin_pinned", pf[1]), ("pin_budget", pf[2]), ("pin_epoch", pf[3]),
+            ("pin_release_words", pf[4]), ("pin_new", pf[5]), ("pin_denied", pf[6]), ("pin_drops_no_victim", pf[7]),
+            ("pin_evictions", pf[8]), ("n_paged", pf[9]),
             ("seq", f64::from(hdr.seq)), ("layer", f64::from(req.layer)), ("b", f64::from(req.b)), ("flags", f64::from(req.flags)),
             ("merged", 0.0), ("served_under", under),
             ("t_hdr", super::evtrace::inst_to_raw(t_first)), ("t_frame", t2 as f64), ("t_dequeue", ev_t_dequeue),
@@ -5756,6 +6398,10 @@ pub struct Ticket {
     pub flags: u32,
     pub n_hints: u32,
     pub n_pf_words: u32,
+    /// Pin mode (`REQ_FLAG_PIN`): the sent picks the mirror HELD at submit
+    /// (bit e = expert e of `layer`), for the surprise check on the reply.
+    pub held: [u32; proto::RESID_WORDS],
+    pub n_held: u32,
 }
 
 /// One layer's remote partial sums: `b × N_EMBD` elements of f16 (default) or
@@ -5779,6 +6425,14 @@ pub struct RemotePartial {
     pub bytes_out: usize,
     /// This exchange's clock quadruple (`None` if a peer did not stamp).
     pub clock: Option<ClockSample>,
+    /// Pin mode: box 2's `(epoch, pinned, budget)` from the reply's pin block.
+    pub pin: Option<(u32, u32, u32)>,
+    /// Pin mode: distinct sent picks the mirror held at submit, how many of
+    /// them box 2 paged anyway (SURPRISES, `b2_mirror::check_surprises`), and
+    /// how many experts the pass paged.
+    pub n_held: u32,
+    pub n_surprise: u32,
+    pub n_paged: u32,
     frame: AlignedBuf,
 }
 
@@ -6020,8 +6674,9 @@ impl RemoteExpertClient {
                 let _ = tx_req_recycle.send(buf);
             }
         })?;
-        // + the optional residency map (`REQ_FLAG_RESID`) behind the partial.
-        let max_resp = proto::RESP_DATA_OFF + info.max_batch as usize * N_EMBD as usize * 4 + proto::RESID_WORDS * 4;
+        // + the optional residency map (`REQ_FLAG_RESID`) and pin block
+        // (`REQ_FLAG_PIN`) behind the partial.
+        let max_resp = proto::RESP_DATA_OFF + info.max_batch as usize * N_EMBD as usize * 4 + proto::RESID_WORDS * 4 + proto::PIN_WORDS * 4;
         let sock_opts = opts.clone();
         let reader = std::thread::Builder::new().name("rexp-reader".into()).spawn(move || {
             loop {
@@ -6049,6 +6704,9 @@ impl RemoteExpertClient {
         // 16 / 32 / 64 / 256 / 1024. 32 keeps the median error at 1.6 µs while
         // still rejecting a queued outlier.
         let clock = ClockSync::new(info.clock, 32, 200_000);
+        // A new connection has no pins and no maps: the mirror starts over
+        // (box 2 dropped the old connection's pins with it).
+        super::b2_mirror::on_connect();
         Ok(Self {
             addr: addr.to_string(),
             opts: opts.clone(),
@@ -6145,7 +6803,7 @@ impl RemoteExpertClient {
             // These picks will be resident on box 2 by the time the other lane's
             // request for this layer is served: overlay them until the reply.
             super::b2_mirror::note_submitted(layer, sel);
-            proto::REQ_FLAG_RESID
+            proto::REQ_FLAG_RESID | super::b2_mirror::pin_request_flag()
         } else {
             0
         };
@@ -6240,16 +6898,27 @@ impl RemoteExpertClient {
         let flags = if ha.is_empty() && he.is_empty() { flags } else { flags | proto::REQ_FLAG_HINTS };
         let pf = take_prefetch_words(128);
         let flags = if pf.is_empty() { flags } else { flags | proto::REQ_FLAG_PREFETCH };
+        // Pin mode: what the mirror HOLDS among the picks actually sent (the
+        // surprise check on the reply), and the queued RELEASE words, which
+        // only go out once box 2 has shown it understands them.
+        let (held, n_held) = if flags & proto::REQ_FLAG_PIN != 0 {
+            super::b2_mirror::pin_note_submit(layer, &self.sel_scratch[..b * nu], b <= 16)
+        } else {
+            ([0u32; proto::RESID_WORDS], 0)
+        };
+        let rel = if flags & proto::REQ_FLAG_PIN != 0 { super::b2_mirror::take_release_words(128) } else { Vec::new() };
+        let flags = if rel.is_empty() { flags } else { flags | proto::REQ_FLAG_RELEASE };
         // `wait` matches by seq, so any reply order is fine from here.
         let flags = flags | proto::REQ_FLAG_OOO;
         let flags = if self.decode_phase { flags | proto::REQ_FLAG_DECODE } else { flags };
         proto::encode_request(
             &mut buf, seq, layer, b as u32, flags, nu as u32, XQ_BYTES_PER_TOKEN as u32, xq,
-            &self.sel_scratch[..b * nu], &self.ew_scratch[..b * nu], (&ha, &he), &pf,
+            &self.sel_scratch[..b * nu], &self.ew_scratch[..b * nu], (&ha, &he), &pf, &rel,
         );
         let ticket = Ticket {
             seq, layer, b: b as u32, bytes_out: buf.len(), t_submit: Instant::now(),
             flags, n_hints: (ha.len() + he.len()) as u32, n_pf_words: pf.len() as u32,
+            held, n_held,
         };
         let sent = match self.tx_req.as_ref() {
             Some(tx) => tx
@@ -6377,8 +7046,22 @@ impl RemoteExpertClient {
         if m.layer != ticket.layer || m.b != ticket.b {
             return Err(eyre!("response (L{} B{}) does not match ticket (L{} B{})", m.layer, m.b, ticket.layer, ticket.b));
         }
+        // Pin mode: the map is box 2's PINNED set as of `epoch` release words;
+        // the reply also says what the pass had to page, which must not
+        // include anything the mirror held when this request was sent.
+        let pin = proto::response_pin(&buf, &m);
         if let Some(words) = proto::response_residency(&buf, &m) {
-            super::b2_mirror::update(m.layer, words);
+            match pin.as_ref() {
+                Some(p) => super::b2_mirror::update_pinned(m.layer, words, p.epoch, p.pinned, p.budget),
+                None => super::b2_mirror::update(m.layer, words),
+            }
+        }
+        let mut n_surprise = 0;
+        if ticket.flags & proto::REQ_FLAG_PIN != 0 {
+            super::b2_mirror::pin_reply_seen(pin.is_some());
+            if let Some(p) = pin.as_ref() {
+                n_surprise = super::b2_mirror::check_surprises(m.layer, h.seq, &ticket.held, &p.paged);
+            }
         }
         // NTP quadruple for this exchange. t1 is what the WRITER stamped (echoed
         // back by the daemon), not the submit time, so encoding is excluded.
@@ -6400,6 +7083,10 @@ impl RemoteExpertClient {
             bytes_in: buf.len(),
             bytes_out: ticket.bytes_out,
             clock: valid.then_some(sample),
+            pin: pin.as_ref().map(|p| (p.epoch, p.pinned, p.budget)),
+            n_held: ticket.n_held,
+            n_surprise,
+            n_paged: pin.as_ref().map_or(0, |p| p.paged.iter().map(|w| w.count_ones()).sum()),
             frame: buf,
         };
         // Every partial passes through here, so this is the one place the link
@@ -6538,7 +7225,7 @@ mod tests {
         let sel: Vec<i32> = (0..b * nu).map(|i| if i % 4 == 0 { NO_PICK } else { (i * 13 % 384) as i32 }).collect();
         let ew: Vec<f32> = (0..b * nu).map(|i| i as f32 * 0.125).collect();
         let mut buf = AlignedBuf::with_capacity(1 << 16);
-        proto::encode_request(&mut buf, 42, 17, b as u32, proto::REQ_FLAG_RESP_F32, nu as u32, XQ_BYTES_PER_TOKEN as u32, &xq, &sel, &ew, (&[], &[]), &[]);
+        proto::encode_request(&mut buf, 42, 17, b as u32, proto::REQ_FLAG_RESP_F32, nu as u32, XQ_BYTES_PER_TOKEN as u32, &xq, &sel, &ew, (&[], &[]), &[], &[]);
         proto::patch_u64(&mut buf, proto::REQ_T1_OFF, 111_222_333);
         let h = proto::parse_header(buf.as_bytes()).unwrap();
         assert_eq!((h.kind, h.seq), (proto::KIND_REQUEST, 42));
@@ -6754,6 +7441,575 @@ mod tests {
         assert_ne!(m.flags & proto::RESP_FLAG_RESID, 0);
         assert_eq!(proto::response_residency(&resp, &m).unwrap(), &words[..]);
         assert_eq!(resp.view::<u16>(proto::RESP_DATA_OFF, n)[n - 1], (n - 1) as u16);
+    }
+
+    /// Pin mode on the wire: RELEASE words after the prefetch block, the pin
+    /// block after the residency map, and an older daemon's reply (the
+    /// request's PIN bit echoed, no pin block) parsing as "no pin support".
+    #[test]
+    fn pin_proto_roundtrip() {
+        let nu = N_EXPERT_USED;
+        let xq = vec![7u8; XQ_BYTES_PER_TOKEN];
+        let sel: Vec<i32> = (0..nu as i32).collect();
+        let ew = vec![0.25f32; nu];
+        let (pf, rel) = ([(3u32 << 16) | 5], [(3u32 << 16) | 7, (4u32 << 16) | 9]);
+        let mut buf = AlignedBuf::with_capacity(1 << 16);
+        let f = proto::REQ_FLAG_PIN | proto::REQ_FLAG_PREFETCH | proto::REQ_FLAG_RELEASE;
+        proto::encode_request(&mut buf, 1, 3, 1, f, nu as u32, XQ_BYTES_PER_TOKEN as u32, &xq, &sel, &ew, (&[], &[]), &pf, &rel);
+        let r = proto::decode_request(&buf).unwrap();
+        assert_eq!((r.prefetch, r.release), (&pf[..], &rel[..]));
+        // Release without prefetch; and neither (an older hub's frame).
+        proto::encode_request(&mut buf, 2, 3, 1, proto::REQ_FLAG_RELEASE, nu as u32, XQ_BYTES_PER_TOKEN as u32, &xq, &sel, &ew, (&[], &[]), &[], &rel);
+        let r = proto::decode_request(&buf).unwrap();
+        assert!(r.prefetch.is_empty() && r.release == &rel[..]);
+        proto::encode_request(&mut buf, 3, 3, 1, proto::REQ_FLAG_PIN, nu as u32, XQ_BYTES_PER_TOKEN as u32, &xq, &sel, &ew, (&[], &[]), &[], &rel);
+        assert!(proto::decode_request(&buf).unwrap().release.is_empty(), "no RELEASE flag, no words");
+
+        let (b, n) = (1usize, N_EMBD as usize);
+        let mut resp = AlignedBuf::with_capacity(proto::RESP_DATA_OFF + n * 2 + 256);
+        proto::begin_response(&mut resp, 1, 3, b as u32, proto::REQ_FLAG_PIN | proto::REQ_FLAG_RESID, 0, 1, 2, N_EMBD, 2, 3, 4);
+        resp.resize(proto::RESP_DATA_OFF + n * 2);
+        let mut old = AlignedBuf::with_capacity(resp.len() + 64);
+        old.extend_from_slice(resp.as_bytes());
+        let mut map = [0u32; proto::RESID_WORDS];
+        map[0] = 0b1001;
+        let mut paged = [0u32; proto::RESID_WORDS];
+        paged[proto::RESID_WORDS - 1] = 1 << 31;
+        proto::append_residency(&mut resp, &map);
+        proto::append_pin(&mut resp, 5, 7, 9, &paged);
+        proto::patch_len(&mut resp);
+        let m = proto::decode_response_meta(&resp).unwrap();
+        assert_eq!(proto::response_residency(&resp, &m).unwrap(), &map[..]);
+        assert_eq!(proto::response_pin(&resp, &m), Some(proto::PinReply { epoch: 5, pinned: 7, budget: 9, paged }));
+        // Older daemon: residency map only, PIN request bit merely echoed.
+        proto::append_residency(&mut old, &map);
+        proto::patch_len(&mut old);
+        let m = proto::decode_response_meta(&old).unwrap();
+        assert_ne!(m.flags & proto::REQ_FLAG_PIN, 0, "echoed");
+        assert!(proto::response_pin(&old, &m).is_none());
+        assert!(proto::response_residency(&old, &m).is_some());
+    }
+
+    /// `PinBook`: eligibility, pin on report within budget, a denial counted
+    /// once, release (every word advances the epoch), eviction.
+    #[test]
+    fn pin_book_budget_release_eligibility() {
+        let mut p = PinBook::off();
+        p.grant(1, 2);
+        assert!(!p.is_pinned(1, 2), "off: nothing pins");
+        p.enable(2);
+        let mut row = vec![0i32; REMAP_LEN];
+        for (e, s) in [(2usize, 0i32), (3, 1), (4, 2)] {
+            row[e] = -s - 1;
+        }
+        for e in [2, 3, 4, 5] {
+            p.grant(1, e);
+        }
+        let w = p.report(1, &row);
+        assert_eq!(w[0], (1 << 2) | (1 << 3), "budget 2: the first two landed eligible experts");
+        assert_eq!((p.pinned, p.c.new_pins, p.c.denied), (2, 2, 1));
+        assert!(!p.is_pinned(1, 5), "5 is eligible but not landed");
+        let _ = p.report(1, &row);
+        assert_eq!(p.c.denied, 1, "a denial is counted once per eligibility");
+        // Resident but never used / granted: never pinned.
+        row[6] = -7;
+        assert_eq!(p.report(1, &row)[0] & (1 << 6), 0);
+        // Release 2: epoch 1, and 4 (denied) gets the freed budget.
+        p.release((1 << 16) | 2);
+        assert_eq!((p.epoch, p.pinned), (1, 1));
+        assert_eq!(p.report(1, &row)[0], (1 << 3) | (1 << 4));
+        assert!(!p.is_pinned(1, 2), "a released expert needs a new grant to pin again");
+        // Words for unknown / unpinned keys still advance the epoch.
+        p.release((1 << 16) | 300);
+        p.release((99 << 16) | 1);
+        assert_eq!(p.epoch, 3);
+        // 5 lands: pinnable only once the budget frees.
+        row[5] = -9;
+        let _ = p.report(1, &row);
+        assert!(!p.is_pinned(1, 5));
+        assert!(p.on_evict(1, 3), "evicting a pinned expert is reported");
+        assert_eq!((p.pinned, p.c.pinned_evictions), (1, 1));
+        row[3] = 0;
+        assert_eq!(p.report(1, &row)[0], (1 << 4) | (1 << 5));
+        assert!(!p.on_evict(1, 6));
+        assert_eq!(p.pinned, 2);
+        // Enabling again keeps the state; `off` resets it.
+        p.enable(100);
+        assert_eq!(p.budget, 2);
+    }
+
+    /// The victim search never takes a hub-pinned slot, a wanted one, or a
+    /// parked one; the choke point detaches exactly what it takes; a
+    /// background landing with only pinned candidates is dropped.
+    #[test]
+    fn pool_victims_skip_pins() {
+        let ids: Vec<u32> = (0..4).collect();
+        let mut pool = ShardPool::seeded(8, &[(1, 0, &ids), (2, 4, &ids)], 0.0);
+        pool.pins.enable(3);
+        for e in 0..3 {
+            pool.pins.grant(1, e);
+        }
+        let row = pool.remap_hosts[1].clone();
+        let _ = pool.pins.report(1, &row);
+        assert!(pool.pins.is_pinned(1, 0) && pool.pins.is_pinned(1, 2));
+        // Oldest slots are layer 1's (seeded first); 0-2 pinned, 3 is next.
+        let (slot, ev) = pool.claim_miss(2, 10, &[10], &[], (4, 8), true, false).unwrap();
+        assert_eq!((slot, ev), (3, Some((1, 3))));
+        pool.commit(2, 10, slot);
+        // Then layer 2's, oldest first, minus wanted and parked ones.
+        let (slot, ev) = pool.claim_miss(2, 11, &[11, 0], &[(2, 1)], (4, 8), true, false).unwrap();
+        assert_eq!((slot, ev), (6, Some((2, 2))), "skips wanted 2/0 and parked 2/1");
+        pool.commit(2, 11, slot);
+        assert_eq!(pool.pins.c.pinned_evictions, 0);
+        // Everything left unpinned is wanted or parked: nothing to take
+        // without a revoke; a background landing would be dropped.
+        let want = [10u32, 11, 0, 3];
+        let extra = [(2u32, 1u32)];
+        assert!(pool.pick_victim_any((4, 8), true, 2, &want, &extra, 2, false).is_none());
+        assert!(pool.pick_victim_any((4, 8), true, 2, &want, &extra, 2, true).is_some(), "only pins stand in the way");
+        for (l, e) in [(1u32, 0u32), (1, 1), (1, 2)] {
+            assert!(pool.slot_of.contains_key(&(l, e)) && pool.remap_hosts[l as usize][e as usize] != 0);
+        }
+    }
+
+    /// With a reserve below the workload (misconfiguration), a demand claim
+    /// REVOKES a pin rather than failing; the choke point reports it. Release
+    /// builds only: in debug the violation is a `debug_assert`.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn pool_revokes_rather_than_fails() {
+        let ids: Vec<u32> = (0..2).collect();
+        let mut pool = ShardPool::seeded(2, &[(1, 0, &ids)], 0.0);
+        pool.pins.enable(2);
+        pool.pins.grant(1, 0);
+        pool.pins.grant(1, 1);
+        let row = pool.remap_hosts[1].clone();
+        let _ = pool.pins.report(1, &row);
+        let v0 = PIN_VIOLATIONS.load(std::sync::atomic::Ordering::Relaxed);
+        let (_, ev) = pool.claim_miss(1, 5, &[5], &[], (0, 2), true, false).expect("revoke, not fail");
+        assert!(ev.is_some());
+        assert_eq!((pool.pins.c.revokes, pool.pins.c.pinned_evictions, pool.pins.pinned), (1, 1, 1));
+        assert!(PIN_VIOLATIONS.load(std::sync::atomic::Ordering::Relaxed) > v0);
+    }
+
+    /// THE PIN PROTOCOL, randomized: box 2's real pool, victim search, choke
+    /// point and `PinBook` (driven in `serve_connection`'s order: words at
+    /// service in arrival order, merged partners, parked requests with others
+    /// served inside, background reads landing in random order and dropped
+    /// when every victim is pinned, early-page reads, prefill-shaped chunks),
+    /// against the hub's real `PinLedger` (releases at step start, replies
+    /// consumed in random order, Zipf decode picks, admission words). After
+    /// every event: `held ⊆ pinned ⊆ landed` and `pinned <= budget`; every
+    /// reply: zero surprises; every claim: a victim without revoking. Then the
+    /// same stream with a hub that forgets the epoch mask must be CAUGHT.
+    #[test]
+    fn pin_protocol_randomized() {
+        for seed in 1..=6u64 {
+            let s = pin_sim(seed, false);
+            assert_eq!(s.surprises, 0, "seed {seed}: {s:?}");
+            assert_eq!(s.subset_violations, 0, "seed {seed}: {s:?}");
+            assert_eq!(s.c.pinned_evictions + s.c.revokes, 0, "seed {seed}: {s:?}");
+            // Not vacuous: the protocol was exercised hard.
+            assert!(s.held_checked > 2_000, "seed {seed}: {s:?}");
+            assert!(s.c.releases > 100 && s.c.new_pins > 300 && s.evictions > 500, "seed {seed}: {s:?}");
+            assert!(s.merged > 5 && s.parked > 20 && s.served_inside > 20 && s.prefill > 20, "seed {seed}: {s:?}");
+            assert!(s.bg_landed > 100 && s.stale_maps > 50, "seed {seed}: {s:?}");
+            eprintln!("pin sim seed {seed}: {s:?}");
+        }
+        // Mutation: a hub that applies maps without masking later releases.
+        let caught = (1..=6u64).map(|seed| pin_sim(seed, true)).map(|s| s.subset_violations + s.surprises as u64).sum::<u64>();
+        assert!(caught > 0, "the checks did not catch a hub that ignores the release epoch");
+    }
+
+    #[derive(Debug, Default)]
+    struct PinSimStats {
+        c: PinCounters,
+        surprises: u32,
+        subset_violations: u64,
+        held_checked: u64,
+        evictions: u64,
+        merged: u64,
+        parked: u64,
+        served_inside: u64,
+        prefill: u64,
+        bg_landed: u64,
+        bg_dropped: u64,
+        stale_maps: u64,
+        max_pinned: u32,
+    }
+
+    /// xorshift64.
+    struct SimRng(u64);
+    impl SimRng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n.max(1)
+        }
+    }
+
+    #[derive(Clone)]
+    struct SimReq {
+        seq: u32,
+        layer: u32,
+        b: usize,
+        sel: Vec<i32>,
+        prefetch: Vec<u32>,
+        release: Vec<u32>,
+        /// Hub side: the sent picks the ledger held at submit.
+        held: [u32; proto::RESID_WORDS],
+    }
+
+    struct SimReply {
+        seq: u32,
+        layer: u32,
+        map: [u32; proto::RESID_WORDS],
+        epoch: u32,
+        pinned: u32,
+        budget: u32,
+        paged: [u32; proto::RESID_WORDS],
+    }
+
+    /// Box 2 for `pin_sim`: the REAL `ShardPool` (victim search, choke point,
+    /// claims, landings) and `PinBook`, driven in `serve_connection`'s order.
+    /// Only the reads are instant and the kernels absent.
+    struct Box2Sim {
+        pool: ShardPool,
+        /// Background reads in flight (prefetch words, early page, park).
+        bg: Vec<(u32, u32)>,
+        budget: u32,
+        per: u32,
+        global: bool,
+        st: PinSimStats,
+    }
+
+    impl Box2Sim {
+        const BG_SETS: usize = 8;
+
+        fn region(&self, l: u32) -> (u32, u32) {
+            (l * self.per, (l + 1) * self.per)
+        }
+
+        fn distinct(sel: &[i32]) -> Vec<u32> {
+            let mut v: Vec<u32> = Vec::new();
+            for &e in sel {
+                if e >= 0 && !v.contains(&(e as u32)) {
+                    v.push(e as u32);
+                }
+            }
+            v
+        }
+
+        /// `prefetch_words_ex`: skip resident / in flight; bounded sets.
+        fn queue_bg(&mut self, words: &[u32]) {
+            for &w in words {
+                let key = (w >> 16, w & 0xFFFF);
+                if !self.pool.slot_of.contains_key(&key) && !self.bg.contains(&key) && self.bg.len() < Self::BG_SETS {
+                    self.bg.push(key);
+                }
+            }
+        }
+
+        /// `admit_prefetched`: a random subset has completed; land it in random
+        /// order, protecting `want` of `layer` and `extra`; drop the landing
+        /// when every victim is pinned.
+        fn admit(&mut self, rng: &mut SimRng, layer: u32, want: &[u32], extra: &[(u32, u32)]) {
+            let mut i = 0;
+            while i < self.bg.len() {
+                if rng.below(2) == 0 {
+                    i += 1;
+                    continue;
+                }
+                let j = i + rng.below((self.bg.len() - i) as u64) as usize;
+                let key = self.bg.swap_remove(j);
+                if self.pool.slot_of.contains_key(&key) {
+                    continue;
+                }
+                let region = self.region(key.0);
+                match self.pool.pick_victim_any(region, self.global, layer, want, extra, key.0, false) {
+                    Some(v) => {
+                        self.st.evictions += u64::from(self.pool.evict(v, layer).is_some());
+                        self.pool.land(v, key);
+                        self.st.bg_landed += 1;
+                    }
+                    None => {
+                        if self.pool.pick_victim_any(region, self.global, layer, want, extra, key.0, true).is_some() {
+                            self.pool.pins.c.no_victim_drops += 1;
+                        }
+                        self.st.bg_dropped += 1;
+                    }
+                }
+            }
+        }
+
+        /// `ensure_layer_inner`: admit, then hit or claim every wanted id, then
+        /// the demand reads land.
+        fn ensure(&mut self, rng: &mut SimRng, layer: u32, sel: &[i32], extra: &[(u32, u32)], prefill: bool) {
+            let want = Self::distinct(sel);
+            self.admit(rng, layer, &want, extra);
+            let region = self.region(layer);
+            let mut claims = Vec::new();
+            for &e in &want {
+                if self.pool.touch_hit(layer, e, prefill) {
+                    continue;
+                }
+                let (slot, ev) = self
+                    .pool
+                    .claim_miss(layer, e, &want, extra, region, self.global, prefill)
+                    .expect("the reserve guarantees an unpinned victim");
+                self.st.evictions += u64::from(ev.is_some());
+                claims.push((e, slot));
+            }
+            for (e, slot) in claims {
+                self.pool.commit(layer, e, slot);
+            }
+        }
+
+        fn paged_bits(&self, layer: u32, sel: &[i32]) -> [u32; proto::RESID_WORDS] {
+            let mut w = [0u32; proto::RESID_WORDS];
+            for &e in sel {
+                if e >= 0 && self.pool.remap_hosts[layer as usize][e as usize] == 0 {
+                    w[e as usize / 32] |= 1 << (e % 32);
+                }
+            }
+            w
+        }
+
+        /// A request's words at service: `pin_enable`, `pin_apply_words`, then
+        /// the prefetch readers.
+        fn words_in(&mut self, r: &SimReq) {
+            self.pool.pins.enable(self.budget);
+            for &w in &r.release {
+                self.pool.pins.release(w);
+            }
+            for &w in &r.prefetch {
+                self.pool.pins.grant(w >> 16, w & 0xFFFF);
+            }
+            self.queue_bg(&r.prefetch);
+        }
+
+        /// `pin_report` + the reply's pin block.
+        fn reply(&mut self, r: &SimReq, picks: &[i32], decode_shaped: bool, paged: [u32; proto::RESID_WORDS]) -> SimReply {
+            if decode_shaped {
+                for &e in picks {
+                    if e >= 0 {
+                        self.pool.pins.grant(r.layer, e as u32);
+                    }
+                }
+            }
+            let row = self.pool.remap_hosts[r.layer as usize].clone();
+            let map = self.pool.pins.report(r.layer, &row);
+            let p = &self.pool.pins;
+            SimReply { seq: r.seq, layer: r.layer, map, epoch: p.epoch, pinned: p.pinned, budget: p.budget, paged }
+        }
+
+        /// Serve the wire's front request as `serve_connection` does: words in
+        /// arrival order, a same-layer partner merged, early page for the next
+        /// frame, or PARK (misses to the readers, queued servable requests
+        /// served and answered inside with this one's picks pinned).
+        fn serve(&mut self, rng: &mut SimRng, wire: &mut std::collections::VecDeque<SimReq>, replies: &mut Vec<SimReply>) {
+            let Some(a) = wire.pop_front() else { return };
+            self.words_in(&a);
+            let partner = match wire.front() {
+                Some(nb) if rng.below(2) == 0 && nb.layer == a.layer && a.b > 4 && nb.b > 4 && a.b + nb.b <= 64 => wire.pop_front(),
+                _ => None,
+            };
+            if let Some(b) = partner.as_ref() {
+                self.words_in(b);
+                self.st.merged += 1;
+            }
+            if let Some(nx) = wire.front() {
+                if rng.below(2) == 0 {
+                    let w: Vec<u32> = Self::distinct(&nx.sel).into_iter().map(|e| (nx.layer << 16) | e).collect();
+                    self.queue_bg(&w);
+                }
+            }
+            let mut sel = a.sel.clone();
+            if let Some(b) = partner.as_ref() {
+                sel.extend_from_slice(&b.sel);
+            }
+            let bt = a.b + partner.as_ref().map_or(0, |b| b.b);
+            let paged = self.paged_bits(a.layer, &sel);
+            if partner.is_none() && paged.iter().any(|&w| w != 0) && rng.below(3) == 0 {
+                self.st.parked += 1;
+                let parked: Vec<(u32, u32)> = Self::distinct(&sel).into_iter().map(|e| (a.layer, e)).collect();
+                let w: Vec<u32> = parked.iter().filter(|k| !self.pool.slot_of.contains_key(k)).map(|k| (k.0 << 16) | k.1).collect();
+                self.queue_bg(&w);
+                for _ in 0..1 + rng.below(3) {
+                    if wire.front().is_some_and(|nx| nx.b <= PARK_MAX_ROWS) {
+                        let c = wire.pop_front().unwrap();
+                        self.words_in(&c);
+                        let p = self.paged_bits(c.layer, &c.sel);
+                        self.ensure(rng, c.layer, &c.sel, &parked, c.b > 16);
+                        let r = self.reply(&c, &c.sel, c.b <= 16, p);
+                        replies.push(r);
+                        self.st.served_inside += 1;
+                    }
+                    self.admit(rng, a.layer, &[], &parked);
+                }
+            }
+            if bt > 16 {
+                self.st.prefill += 1;
+            }
+            self.ensure(rng, a.layer, &sel, &[], bt > 16);
+            let r = self.reply(&a, &sel, bt <= 16, paged);
+            replies.push(r);
+            if let Some(b) = partner.as_ref() {
+                let r = self.reply(b, &[], bt <= 16, paged);
+                replies.push(r);
+            }
+        }
+    }
+
+    /// One randomized run of the pin protocol (see `pin_protocol_randomized`).
+    /// `forget_mask`: the hub applies every map as if it post-dated every
+    /// release (the bug the epoch exists to prevent).
+    fn pin_sim(seed: u64, forget_mask: bool) -> PinSimStats {
+        use crate::het::b2_mirror::{surprise_count, PinLedger};
+        const L: u32 = 6; // layers 0..L
+        const RANGE: u32 = 32; // experts 0..RANGE per layer, Zipf-picked
+        const PER: u32 = 20; // seeded slots per layer
+        const N: usize = (L * PER) as usize;
+        // The no-deadlock reserve for this workload: a pass wants <= RANGE
+        // experts of one layer, a parked request's picks are <= RANGE more.
+        const R: usize = 2 * RANGE as usize;
+        const HEADROOM: u32 = 8;
+        const MAX_IN_FLIGHT: usize = 4;
+        let mut rng = SimRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        // Zipf(1.1) over 0..RANGE by inverse CDF, hot ids permuted per layer.
+        let cdf: Vec<f64> = {
+            let w: Vec<f64> = (1..=RANGE).map(|k| 1.0 / (k as f64).powf(1.1)).collect();
+            let s: f64 = w.iter().sum();
+            let mut acc = 0.0;
+            w.iter().map(|x| { acc += x / s; acc }).collect()
+        };
+        let zipf = |u: u64, l: u32| -> u32 {
+            let x = (u % 1_000_000) as f64 / 1e6;
+            let rank = cdf.iter().position(|&c| x < c).unwrap_or(RANGE as usize - 1) as u32;
+            (rank * 7 + l * 5) % RANGE
+        };
+        let region_ids: Vec<u32> = (0..PER).collect();
+        let regions: Vec<(u32, u32, &[u32])> = (0..L).map(|l| (l, l * PER, &region_ids[..])).collect();
+        let mut b2 = Box2Sim {
+            pool: ShardPool::seeded(N, &regions, 0.0),
+            bg: Vec::new(),
+            budget: (N - R) as u32,
+            per: PER,
+            global: seed % 2 == 1,
+            st: PinSimStats::default(),
+        };
+        let mut ledger = PinLedger::new();
+        let mut wire: std::collections::VecDeque<SimReq> = Default::default();
+        let mut replies: Vec<SimReply> = Vec::new();
+        let mut sent: Vec<SimReq> = Vec::new();
+        let (mut pin_active, mut seq) = (false, 0u32);
+        let mut surprises = 0u32;
+        let mut subset_violations = 0u64;
+        let mut held_checked = 0u64;
+        let mut stale_maps = 0u64;
+
+        // held ⊆ pinned ⊆ landed, and the pinned count / budget.
+        let check = |b2: &mut Box2Sim, ledger: &PinLedger, subset_violations: &mut u64| {
+            let mut n_pinned = 0u32;
+            for l in 0..L {
+                for e in 0..RANGE {
+                    let pinned = b2.pool.pins.is_pinned(l, e);
+                    n_pinned += u32::from(pinned);
+                    if ledger.held(l, e) && !pinned {
+                        *subset_violations += 1;
+                    }
+                    assert!(!pinned || b2.pool.remap_hosts[l as usize][e as usize] != 0, "pinned but not landed: L{l} e{e}");
+                }
+            }
+            if b2.pool.pins.on {
+                assert_eq!(n_pinned, b2.pool.pins.pinned, "pinned count drifted");
+                assert!(b2.pool.pins.pinned <= b2.pool.pins.budget);
+            }
+            b2.st.max_pinned = b2.st.max_pinned.max(b2.pool.pins.pinned);
+        };
+
+        for _step in 0..300 {
+            // Releases at step start, when nothing is routed but unsent.
+            if pin_active {
+                let _ = ledger.step(HEADROOM, 64, 512);
+            }
+            check(&mut b2, &ledger, &mut subset_violations);
+            for layer in 0..L {
+                for _lane in 0..2 {
+                    let b = match rng.below(20) {
+                        0..=12 => 1,
+                        13..=14 => 2 + rng.below(3) as usize,
+                        15..=17 => 6,
+                        _ => 17 + rng.below(24) as usize,
+                    };
+                    let mut sel = Vec::with_capacity(b * N_EXPERT_USED);
+                    for _ in 0..b {
+                        let mut row: Vec<i32> = Vec::new();
+                        while row.len() < N_EXPERT_USED {
+                            let e = zipf(rng.below(u64::MAX), layer) as i32;
+                            if !row.contains(&e) {
+                                row.push(e);
+                            }
+                        }
+                        sel.extend(row);
+                    }
+                    let mut held = [0u32; proto::RESID_WORDS];
+                    for &e in &sel {
+                        if ledger.held(layer, e as u32) {
+                            held[e as usize / 32] |= 1 << (e % 32);
+                        }
+                        if b <= 16 {
+                            ledger.note_pick(layer, e as u32);
+                        }
+                    }
+                    held_checked += held.iter().map(|w| w.count_ones() as u64).sum::<u64>();
+                    // Admission words for a few experts the hub does not hold.
+                    let n_pf = rng.below(3);
+                    let prefetch: Vec<u32> = (0..n_pf)
+                        .map(|_| zipf(rng.below(u64::MAX), layer))
+                        .filter(|&e| !ledger.held(layer, e))
+                        .map(|e| (layer << 16) | e)
+                        .collect();
+                    let release = if pin_active { ledger.take_words(128) } else { Vec::new() };
+                    seq += 1;
+                    let r = SimReq { seq, layer, b, sel, prefetch, release, held };
+                    sent.push(r.clone());
+                    wire.push_back(r);
+                    // Box 2 and the hub's reply consumption interleave at random;
+                    // at most MAX_IN_FLIGHT requests stay unanswered.
+                    loop {
+                        let must = sent.len() > MAX_IN_FLIGHT;
+                        let act = if must { 1 + rng.below(2) } else { rng.below(4) };
+                        if act == 1 && !wire.is_empty() {
+                            b2.serve(&mut rng, &mut wire, &mut replies);
+                        } else if act == 2 && !replies.is_empty() {
+                            let rp = replies.swap_remove(rng.below(replies.len() as u64) as usize);
+                            let i = sent.iter().position(|q| q.seq == rp.seq).expect("a reply to a sent request");
+                            let q = sent.swap_remove(i);
+                            stale_maps += u64::from(rp.epoch != b2.pool.pins.epoch);
+                            assert!(rp.pinned <= rp.budget);
+                            ledger.note_reply(rp.epoch, rp.pinned, rp.budget);
+                            let epoch = if forget_mask { u32::MAX / 2 } else { rp.epoch };
+                            let _ = ledger.apply_map(rp.layer, &rp.map, epoch);
+                            surprises += surprise_count(&q.held, &rp.paged);
+                            pin_active = true;
+                        } else if act == 0 && !must {
+                            break;
+                        }
+                        check(&mut b2, &ledger, &mut subset_violations);
+                    }
+                }
+            }
+        }
+        PinSimStats {
+            c: b2.pool.pins.c,
+            surprises,
+            subset_violations,
+            held_checked,
+            stale_maps,
+            ..b2.st
+        }
     }
 
     /// The NTP estimator: a synthetic exchange with a KNOWN offset and a known

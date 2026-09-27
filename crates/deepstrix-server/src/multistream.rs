@@ -950,6 +950,15 @@ impl Sched {
         Ok::<_, eyre::Report>(logits)
         })?;
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
+        // Box-2 pinning (`V41_B2_PIN`), drained EVERY step so `hub_step`
+        // carries them with or without the profile: `b2_surprises` must stay
+        // 0 -- a held pick box 2 paged anyway (ERROR-logged where it happens).
+        let pin_stats = v4flash_kernels::het::b2_mirror::take_pin_stats();
+        if let (true, Some([sur, held, rel, pinned, budget])) = (ev_on, pin_stats) {
+            for (k, v) in [("b2_surprises", sur), ("b2_held_picks", held), ("b2_pin_released", rel), ("b2_pinned", pinned), ("b2_pin_budget", budget)] {
+                ev.insert(k.into(), v);
+            }
+        }
         if profile {
             use v4flash_kernels::het::trace::{phase as counters, rollup_by_name};
             let dg = rollup_by_name(&engine.dgpu.events.harvest()?);
@@ -1065,6 +1074,15 @@ impl Sched {
                 for (name, v) in [("sub.predicted_miss", p as f64), ("sub.reads_avoided", av as f64), ("sub.picks_swapped", sw as f64), ("sub.blocked", bl as f64), ("sub.plan_failed", fl as f64), ("sub.admits_queued", ad as f64), ("sub.incoming_covered", inc as f64)] {
                     let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
                     e.0 += v; e.1 += 1;
+                }
+            }
+            // Box-2 pinning, per step (drained above).
+            if let Some([sur, held, rel, pinned, _budget]) = pin_stats {
+                for (name, v) in [("pin.surprises", sur), ("pin.held_picks", held), ("pin.released", rel), ("pin.pinned", pinned)] {
+                    if v.is_finite() {
+                        let e = acc.stages.entry(("host", name)).or_insert((0.0, 0));
+                        e.0 += v; e.1 += 1;
+                    }
                 }
             }
             if let Some(pg) = pager.as_ref() {
