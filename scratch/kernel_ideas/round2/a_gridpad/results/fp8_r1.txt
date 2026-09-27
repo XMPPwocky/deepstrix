@@ -1,0 +1,27 @@
+== 1790470942.000347.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP fp8_act_quant_inplace pad1 vs exact b=128: bytes-identical (diff=0 of 65536)
+
+== fp8_act_quant_inplace b=128 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (b)x512                                 21.91      15.88      46.28    1.000       0.0       0.0
++1 (b+1)x512                                   6.32       4.95      18.33    0.288       0.0       0.0
+KBJSON {"tag":"fp8_act_quant_inplace b=128 warm, graph inner=10","variant":"exact (b)x512","med_us":21.912,"p10_us":15.876,"p90_us":46.276,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"fp8_act_quant_inplace b=128 warm, graph inner=10","variant":"+1 (b+1)x512","med_us":6.320,"p10_us":4.952,"p90_us":18.332,"ratio":0.2884,"gbps":0.00,"graph":1,"flush":0}
+CMP fp8_act_quant_inplace pad1 vs exact b=256: bytes-identical (diff=0 of 131072)
+
+== fp8_act_quant_inplace b=256 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (b)x512                                 18.72      18.12      20.11    1.000       0.0       0.0
++1 (b+1)x512                                   6.39       6.33      12.94    0.341       0.0       0.0
+KBJSON {"tag":"fp8_act_quant_inplace b=256 warm, graph inner=10","variant":"exact (b)x512","med_us":18.716,"p10_us":18.124,"p90_us":20.108,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"fp8_act_quant_inplace b=256 warm, graph inner=10","variant":"+1 (b+1)x512","med_us":6.388,"p10_us":6.328,"p90_us":12.936,"ratio":0.3413,"gbps":0.00,"graph":1,"flush":0}
+CMP fp8_act_quant_inplace pad1 vs exact b=512: bytes-identical (diff=0 of 262144)
+
+== fp8_act_quant_inplace b=512 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (b)x512                                 22.50      21.25      33.10    1.000       0.0       0.0
++1 (b+1)x512                                   9.81       9.34      19.00    0.436       0.0       0.0
+KBJSON {"tag":"fp8_act_quant_inplace b=512 warm, graph inner=10","variant":"exact (b)x512","med_us":22.496,"p10_us":21.252,"p90_us":33.100,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"fp8_act_quant_inplace b=512 warm, graph inner=10","variant":"+1 (b+1)x512","med_us":9.812,"p10_us":9.340,"p90_us":19.000,"ratio":0.4362,"gbps":0.00,"graph":1,"flush":0}

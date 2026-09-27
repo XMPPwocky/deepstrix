@@ -1,0 +1,24 @@
+== 1790471112.000359.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+== vec_add_inplace 5120 b=16 grid=320 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          4.14       3.83       6.27    1.000       0.0       0.0
++1                                             4.10       3.84       9.89    0.991       0.0       0.0
+KBJSON {"tag":"vec_add_inplace 5120 b=16 grid=320 warm, graph inner=10","variant":"exact","med_us":4.136,"p10_us":3.832,"p90_us":6.272,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"vec_add_inplace 5120 b=16 grid=320 warm, graph inner=10","variant":"+1","med_us":4.100,"p10_us":3.840,"p90_us":9.888,"ratio":0.9913,"gbps":0.00,"graph":1,"flush":0}
+
+== vec_add_inplace 5120 b=64 grid=1280 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          7.12       5.54      12.86    1.000       0.0       0.0
++1                                             6.44       5.26      15.44    0.906       0.0       0.0
+KBJSON {"tag":"vec_add_inplace 5120 b=64 grid=1280 warm, graph inner=10","variant":"exact","med_us":7.116,"p10_us":5.536,"p90_us":12.864,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"vec_add_inplace 5120 b=64 grid=1280 warm, graph inner=10","variant":"+1","med_us":6.444,"p10_us":5.256,"p90_us":15.440,"ratio":0.9056,"gbps":0.00,"graph":1,"flush":0}
+
+== vec_add_inplace 5120 b=128 grid=2560 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          7.50       7.04      15.97    1.000       0.0       0.0
++1                                             7.32       6.99      14.88    0.976       0.0       0.0
+KBJSON {"tag":"vec_add_inplace 5120 b=128 grid=2560 warm, graph inner=10","variant":"exact","med_us":7.504,"p10_us":7.040,"p90_us":15.968,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"vec_add_inplace 5120 b=128 grid=2560 warm, graph inner=10","variant":"+1","med_us":7.324,"p10_us":6.992,"p90_us":14.884,"ratio":0.9760,"gbps":0.00,"graph":1,"flush":0}

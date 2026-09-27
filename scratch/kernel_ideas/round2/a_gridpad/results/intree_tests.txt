@@ -1,0 +1,31 @@
+== 1790471586.000387.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+### defaults (grid_pad_bitexact)
+test cast_f16_2d_pad_bit_exact ... cast_f16_2d rows=16 cols=32768 pitch=32768: diff=0 pitch/tail touched=0 both-unwritten=32
+PASS: f32_to_f16_cast_2d grid pad bit-exact
+test fp8_window_and_indexer_fp4_pad_bit_exact ... arch gfx1201, V41_GRID_PAD on
+PASS: fp8 window / indexer_fp4 grid pad bit-exact
+test rope_batched_pad_bit_exact ... rope_tail_batched n_head=64 head_dim=512 b=1 inverse=false: bit_diff=0
+PASS: rope_tail_batched grid pad bit-exact
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+### rc=0
+### V41_GRID_PAD=0 (grid_pad_bitexact, V41_GRID_PAD=0)
+test cast_f16_2d_pad_bit_exact ... cast_f16_2d rows=16 cols=32768 pitch=32768: diff=0 pitch/tail touched=0 both-unwritten=32
+PASS: f32_to_f16_cast_2d grid pad bit-exact
+test fp8_window_and_indexer_fp4_pad_bit_exact ... arch gfx1201, V41_GRID_PAD off
+PASS: fp8 window / indexer_fp4 grid pad bit-exact
+test rope_batched_pad_bit_exact ... rope_tail_batched n_head=64 head_dim=512 b=1 inverse=false: bit_diff=0
+PASS: rope_tail_batched grid pad bit-exact
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.28s
+### rc=0
+### c2 defaults (cast_2d user) (q8_0_sweep_c2_bitexact)
+test bpack_z16_matches_grid_z ... gemv 32768x1280 b=17: z16 bit_diff=0, matvec_batched bit_diff=0
+PASS: 15 z16 cases bit-exact
+test engram_i8x_db_matches_lds_tiled ... pass rule: rows take identical arms with 64- and 128-row passes for b = 1..700
+PASS: 12 i8x_db cases bit-exact
+test f16x_tiles_match_base ... f16x kv 512x5120x1 b=1 DbBn64: bit_diff=0
+PASS: 30 f16x tile cases bit-exact
+test replay_f16x_numerics_vs_dp4a ... replay f16x vs dp4a at 4096x1280 b=64: rel_rmse=3.777e-3 max_abs=1.937e1 differing=262143 of 262144 (NOT bit-exact by design; ledger 2.9e-4)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.65s
+### rc=0
+### overall rc=0

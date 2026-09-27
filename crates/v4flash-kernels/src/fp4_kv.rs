@@ -13,6 +13,8 @@ pub struct Fp4KvQuant {
 }
 
 impl Fp4KvQuant {
+    pub fn module(&self) -> &Module { &self.module }
+
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
         let image: &[u8] = if arch.starts_with("gfx1201") {
             FP4KV_GFX1201
@@ -55,7 +57,10 @@ impl Fp4KvQuant {
             return Err(eyre!("fp8_act_quant: buffer has {} floats, need {}", x.len(), n_rows * width));
         }
         let function = self.module.get_function("fp8_act_quant_inplace")?;
-        let cfg = LaunchConfig { grid: (n_rows, 1, 1), block: (width, 1, 1), shared_mem_bytes: 0 };
+        // `V41_GRID_PAD`: one idle WG (the kernel's `row >= n_rows` guard). At
+        // prefill b = 128/256/512 the exact grid dispatches 2.4-3.6x slower on
+        // gfx1201 (17-22 us vs 4.7-9.3). DO NOT REMOVE; see `crate::grid_pad`.
+        let cfg = LaunchConfig { grid: (n_rows + crate::grid_pad(), 1, 1), block: (width, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(function, cfg, stream, [x.raw(), n_rows, width])
     }
 }

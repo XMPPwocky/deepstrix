@@ -1,0 +1,35 @@
+== 1790471112.000360.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP hc_post pad1 vs exact b=4: bytes-identical (diff=0 of 81920)
+
+== hc_post_from_split_batched b=4 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (20,4,b)                                 4.91       4.88       4.94    1.000       0.0       0.0
++1 (21,4,b)                                    4.90       4.87       4.92    0.998       0.0       0.0
+KBJSON {"tag":"hc_post_from_split_batched b=4 warm, graph inner=10","variant":"exact (20,4,b)","med_us":4.908,"p10_us":4.876,"p90_us":4.936,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"hc_post_from_split_batched b=4 warm, graph inner=10","variant":"+1 (21,4,b)","med_us":4.900,"p10_us":4.872,"p90_us":4.924,"ratio":0.9984,"gbps":0.00,"graph":1,"flush":0}
+CMP hc_post pad1 vs exact b=8: bytes-identical (diff=0 of 163840)
+
+== hc_post_from_split_batched b=8 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (20,4,b)                                 5.94       5.91      21.64    1.000       0.0       0.0
++1 (21,4,b)                                    5.96       5.92      22.30    1.003       0.0       0.0
+KBJSON {"tag":"hc_post_from_split_batched b=8 warm, graph inner=10","variant":"exact (20,4,b)","med_us":5.940,"p10_us":5.912,"p90_us":21.640,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"hc_post_from_split_batched b=8 warm, graph inner=10","variant":"+1 (21,4,b)","med_us":5.956,"p10_us":5.920,"p90_us":22.296,"ratio":1.0027,"gbps":0.00,"graph":1,"flush":0}
+CMP hc_post pad1 vs exact b=16: bytes-identical (diff=0 of 327680)
+
+== hc_post_from_split_batched b=16 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (20,4,b)                                 8.08       7.97      50.75    1.000       0.0       0.0
++1 (21,4,b)                                    8.02       7.96      42.29    0.993       0.0       0.0
+KBJSON {"tag":"hc_post_from_split_batched b=16 warm, graph inner=10","variant":"exact (20,4,b)","med_us":8.084,"p10_us":7.968,"p90_us":50.748,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"hc_post_from_split_batched b=16 warm, graph inner=10","variant":"+1 (21,4,b)","med_us":8.024,"p10_us":7.964,"p90_us":42.292,"ratio":0.9926,"gbps":0.00,"graph":1,"flush":0}
+CMP hc_post pad1 vs exact b=64: bytes-identical (diff=0 of 1310720)
+
+== hc_post_from_split_batched b=64 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (20,4,b)                                58.82      50.64      68.07    1.000       0.0       0.0
++1 (21,4,b)                                   59.30      50.40      65.85    1.008       0.0       0.0
+KBJSON {"tag":"hc_post_from_split_batched b=64 warm, graph inner=10","variant":"exact (20,4,b)","med_us":58.816,"p10_us":50.644,"p90_us":68.068,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"hc_post_from_split_batched b=64 warm, graph inner=10","variant":"+1 (21,4,b)","med_us":59.304,"p10_us":50.404,"p90_us":65.848,"ratio":1.0083,"gbps":0.00,"graph":1,"flush":0}

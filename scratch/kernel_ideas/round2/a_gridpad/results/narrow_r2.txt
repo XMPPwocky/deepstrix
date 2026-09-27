@@ -1,0 +1,19 @@
+== 1790471112.000358.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP mhc narrow f16_matvec_narrow_batched pad1 vs exact b=32: bytes-identical (diff=0 of 768)
+
+== mhc narrow f16_matvec_narrow_batched 24x20480 b=32 COLD W (86 copies), graph inner=86  (rounds=40 inner=86 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (24,1,b)                                56.85      49.26      60.17    1.000      17.3       0.0
++1 (25,1,b)                                   63.94      54.95      68.28    1.125      15.4       0.0
+KBJSON {"tag":"mhc narrow f16_matvec_narrow_batched 24x20480 b=32 COLD W (86 copies), graph inner=86","variant":"exact (24,1,b)","med_us":56.852,"p10_us":49.256,"p90_us":60.167,"ratio":1.0000,"gbps":17.29,"graph":1,"flush":0}
+KBJSON {"tag":"mhc narrow f16_matvec_narrow_batched 24x20480 b=32 COLD W (86 copies), graph inner=86","variant":"+1 (25,1,b)","med_us":63.940,"p10_us":54.946,"p90_us":68.282,"ratio":1.1247,"gbps":15.37,"graph":1,"flush":0}
+CMP mhc narrow f16_matvec_narrow_batched pad1 vs exact b=64: bytes-identical (diff=0 of 1536)
+
+== mhc narrow f16_matvec_narrow_batched 24x20480 b=64 COLD W (86 copies), graph inner=86  (rounds=40 inner=86 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (24,1,b)                               102.05      96.25     105.92    1.000       9.6       0.0
++1 (25,1,b)                                  103.26      95.97     106.12    1.012       9.5       0.0
+KBJSON {"tag":"mhc narrow f16_matvec_narrow_batched 24x20480 b=64 COLD W (86 copies), graph inner=86","variant":"exact (24,1,b)","med_us":102.046,"p10_us":96.250,"p90_us":105.916,"ratio":1.0000,"gbps":9.63,"graph":1,"flush":0}
+KBJSON {"tag":"mhc narrow f16_matvec_narrow_batched 24x20480 b=64 COLD W (86 copies), graph inner=86","variant":"+1 (25,1,b)","med_us":103.256,"p10_us":95.974,"p90_us":106.121,"ratio":1.0119,"gbps":9.52,"graph":1,"flush":0}

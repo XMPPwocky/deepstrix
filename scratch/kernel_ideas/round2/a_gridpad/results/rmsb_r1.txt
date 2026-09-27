@@ -1,0 +1,87 @@
+== 1790470943.000351.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+== rms_norm_weighted_batched_fast n=512 b=64 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+b rows (exact grid b)                          3.95       3.92       4.17    1.000       0.0       0.0
+b+1 rows (grid b+1)                            4.02       3.99       4.07    1.017       0.0       0.0
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=512 b=64 warm, graph inner=10","variant":"b rows (exact grid b)","med_us":3.952,"p10_us":3.924,"p90_us":4.168,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=512 b=64 warm, graph inner=10","variant":"b+1 rows (grid b+1)","med_us":4.020,"p10_us":3.988,"p90_us":4.072,"ratio":1.0172,"gbps":0.00,"graph":1,"flush":0}
+
+== rms_norm_weighted_batched_fast n=1280 b=64 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+b rows (exact grid b)                          4.75       4.38       8.58    1.000       0.0       0.0
+b+1 rows (grid b+1)                            4.89       4.55      10.84    1.029       0.0       0.0
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=1280 b=64 warm, graph inner=10","variant":"b rows (exact grid b)","med_us":4.752,"p10_us":4.376,"p90_us":8.584,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=1280 b=64 warm, graph inner=10","variant":"b+1 rows (grid b+1)","med_us":4.892,"p10_us":4.548,"p90_us":10.840,"ratio":1.0295,"gbps":0.00,"graph":1,"flush":0}
+
+== rms_norm_weighted_batched_fast n=5120 b=64 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+b rows (exact grid b)                          5.83       5.79       6.02    1.000       0.0       0.0
+b+1 rows (grid b+1)                            6.55       6.53       7.30    1.124       0.0       0.0
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=5120 b=64 warm, graph inner=10","variant":"b rows (exact grid b)","med_us":5.828,"p10_us":5.788,"p90_us":6.016,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=5120 b=64 warm, graph inner=10","variant":"b+1 rows (grid b+1)","med_us":6.552,"p10_us":6.528,"p90_us":7.304,"ratio":1.1242,"gbps":0.00,"graph":1,"flush":0}
+
+== rms_norm_weighted_batched_fast n=512 b=128 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+b rows (exact grid b)                          4.19       4.13       4.51    1.000       0.0       0.0
+b+1 rows (grid b+1)                            4.28       4.26       4.55    1.023       0.0       0.0
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=512 b=128 warm, graph inner=10","variant":"b rows (exact grid b)","med_us":4.188,"p10_us":4.132,"p90_us":4.508,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=512 b=128 warm, graph inner=10","variant":"b+1 rows (grid b+1)","med_us":4.284,"p10_us":4.260,"p90_us":4.548,"ratio":1.0229,"gbps":0.00,"graph":1,"flush":0}
+
+== rms_norm_weighted_batched_fast n=1280 b=128 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+b rows (exact grid b)                         22.06      16.21      48.06    1.000       0.0       0.0
+b+1 rows (grid b+1)                           37.01      16.64      47.89    1.678       0.0       0.0
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=1280 b=128 warm, graph inner=10","variant":"b rows (exact grid b)","med_us":22.060,"p10_us":16.212,"p90_us":48.060,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=1280 b=128 warm, graph inner=10","variant":"b+1 rows (grid b+1)","med_us":37.012,"p10_us":16.644,"p90_us":47.888,"ratio":1.6778,"gbps":0.00,"graph":1,"flush":0}
+
+== rms_norm_weighted_batched_fast n=5120 b=128 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+b rows (exact grid b)                         12.88       7.62      41.23    1.000       0.0       0.0
+b+1 rows (grid b+1)                           21.78       8.40      48.86    1.691       0.0       0.0
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=5120 b=128 warm, graph inner=10","variant":"b rows (exact grid b)","med_us":12.884,"p10_us":7.624,"p90_us":41.228,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=5120 b=128 warm, graph inner=10","variant":"b+1 rows (grid b+1)","med_us":21.784,"p10_us":8.404,"p90_us":48.860,"ratio":1.6908,"gbps":0.00,"graph":1,"flush":0}
+
+== rms_norm_weighted_batched_fast n=512 b=256 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+b rows (exact grid b)                         16.74      16.72      45.84    1.000       0.0       0.0
+b+1 rows (grid b+1)                            4.92       4.87      19.91    0.294       0.0       0.0
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=512 b=256 warm, graph inner=10","variant":"b rows (exact grid b)","med_us":16.744,"p10_us":16.720,"p90_us":45.844,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=512 b=256 warm, graph inner=10","variant":"b+1 rows (grid b+1)","med_us":4.916,"p10_us":4.868,"p90_us":19.908,"ratio":0.2936,"gbps":0.00,"graph":1,"flush":0}
+
+== rms_norm_weighted_batched_fast n=1280 b=256 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+b rows (exact grid b)                         47.09      17.07      75.07    1.000       0.0       0.0
+b+1 rows (grid b+1)                           22.14       8.49      53.19    0.470       0.0       0.0
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=1280 b=256 warm, graph inner=10","variant":"b rows (exact grid b)","med_us":47.092,"p10_us":17.072,"p90_us":75.068,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=1280 b=256 warm, graph inner=10","variant":"b+1 rows (grid b+1)","med_us":22.136,"p10_us":8.492,"p90_us":53.188,"ratio":0.4701,"gbps":0.00,"graph":1,"flush":0}
+
+== rms_norm_weighted_batched_fast n=5120 b=256 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+b rows (exact grid b)                         16.97      16.92      77.71    1.000       0.0       0.0
+b+1 rows (grid b+1)                           20.44      16.31      53.11    1.205       0.0       0.0
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=5120 b=256 warm, graph inner=10","variant":"b rows (exact grid b)","med_us":16.968,"p10_us":16.920,"p90_us":77.709,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=5120 b=256 warm, graph inner=10","variant":"b+1 rows (grid b+1)","med_us":20.440,"p10_us":16.308,"p90_us":53.108,"ratio":1.2046,"gbps":0.00,"graph":1,"flush":0}
+
+== rms_norm_weighted_batched_fast n=512 b=512 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+b rows (exact grid b)                         46.50      18.68      76.45    1.000       0.0       0.0
+b+1 rows (grid b+1)                           25.00       8.72      57.41    0.538       0.0       0.0
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=512 b=512 warm, graph inner=10","variant":"b rows (exact grid b)","med_us":46.500,"p10_us":18.680,"p90_us":76.448,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=512 b=512 warm, graph inner=10","variant":"b+1 rows (grid b+1)","med_us":25.000,"p10_us":8.720,"p90_us":57.408,"ratio":0.5376,"gbps":0.00,"graph":1,"flush":0}
+
+== rms_norm_weighted_batched_fast n=1280 b=512 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+b rows (exact grid b)                         27.78      11.59      57.33    1.000       0.0       0.0
+b+1 rows (grid b+1)                           23.91       8.08      51.38    0.861       0.0       0.0
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=1280 b=512 warm, graph inner=10","variant":"b rows (exact grid b)","med_us":27.776,"p10_us":11.588,"p90_us":57.332,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=1280 b=512 warm, graph inner=10","variant":"b+1 rows (grid b+1)","med_us":23.908,"p10_us":8.076,"p90_us":51.384,"ratio":0.8607,"gbps":0.00,"graph":1,"flush":0}
+
+== rms_norm_weighted_batched_fast n=5120 b=512 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+b rows (exact grid b)                         48.34      25.21      86.82    1.000       0.0       0.0
+b+1 rows (grid b+1)                           43.98      20.48      63.84    0.910       0.0       0.0
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=5120 b=512 warm, graph inner=10","variant":"b rows (exact grid b)","med_us":48.340,"p10_us":25.212,"p90_us":86.825,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rms_norm_weighted_batched_fast n=5120 b=512 warm, graph inner=10","variant":"b+1 rows (grid b+1)","med_us":43.980,"p10_us":20.476,"p90_us":63.844,"ratio":0.9098,"gbps":0.00,"graph":1,"flush":0}

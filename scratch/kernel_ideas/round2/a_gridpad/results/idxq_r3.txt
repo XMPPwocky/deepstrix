@@ -1,0 +1,51 @@
+== 1790471112.000362.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP idx-q f16_matvec_batched pad1 vs exact b=1: bytes-identical (diff=0 of 4096)
+
+== idx-q f16_matvec_batched 4096x1280 b=1 COLD W (9 copies), graph inner=9  (rounds=40 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (512,1,b)                               58.33      27.73      88.96    1.000     179.8       0.0
++1 (513,1,b)                                  47.98      22.12      61.83    0.823     218.5       0.0
+KBJSON {"tag":"idx-q f16_matvec_batched 4096x1280 b=1 COLD W (9 copies), graph inner=9","variant":"exact (512,1,b)","med_us":58.334,"p10_us":27.729,"p90_us":88.961,"ratio":1.0000,"gbps":179.75,"graph":1,"flush":0}
+KBJSON {"tag":"idx-q f16_matvec_batched 4096x1280 b=1 COLD W (9 copies), graph inner=9","variant":"+1 (513,1,b)","med_us":47.983,"p10_us":22.116,"p90_us":61.827,"ratio":0.8226,"gbps":218.53,"graph":1,"flush":0}
+CMP idx-q f16_matvec_batched pad1 vs exact b=2: bytes-identical (diff=0 of 8192)
+
+== idx-q f16_matvec_batched 4096x1280 b=2 COLD W (9 copies), graph inner=9  (rounds=40 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (512,1,b)                               95.29      56.89     102.29    1.000     110.0       0.0
++1 (513,1,b)                                  68.74      57.68      75.07    0.721     152.5       0.0
+KBJSON {"tag":"idx-q f16_matvec_batched 4096x1280 b=2 COLD W (9 copies), graph inner=9","variant":"exact (512,1,b)","med_us":95.285,"p10_us":56.889,"p90_us":102.294,"ratio":1.0000,"gbps":110.05,"graph":1,"flush":0}
+KBJSON {"tag":"idx-q f16_matvec_batched 4096x1280 b=2 COLD W (9 copies), graph inner=9","variant":"+1 (513,1,b)","med_us":68.738,"p10_us":57.680,"p90_us":75.067,"ratio":0.7214,"gbps":152.55,"graph":1,"flush":0}
+CMP idx-q f16_matvec_batched pad1 vs exact b=3: bytes-identical (diff=0 of 12288)
+
+== idx-q f16_matvec_batched 4096x1280 b=3 COLD W (9 copies), graph inner=9  (rounds=40 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (512,1,b)                               97.07      48.74     110.73    1.000     108.0       0.0
++1 (513,1,b)                                  77.84      40.74      87.66    0.802     134.7       0.0
+KBJSON {"tag":"idx-q f16_matvec_batched 4096x1280 b=3 COLD W (9 copies), graph inner=9","variant":"exact (512,1,b)","med_us":97.067,"p10_us":48.743,"p90_us":110.725,"ratio":1.0000,"gbps":108.03,"graph":1,"flush":0}
+KBJSON {"tag":"idx-q f16_matvec_batched 4096x1280 b=3 COLD W (9 copies), graph inner=9","variant":"+1 (513,1,b)","med_us":77.845,"p10_us":40.743,"p90_us":87.658,"ratio":0.8020,"gbps":134.70,"graph":1,"flush":0}
+CMP idx-q f16_matvec_batched pad1 vs exact b=4: bytes-identical (diff=0 of 16384)
+
+== idx-q f16_matvec_batched 4096x1280 b=4 COLD W (9 copies), graph inner=9  (rounds=40 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (512,1,b)                              112.00      77.37     121.37    1.000      93.6       0.0
++1 (513,1,b)                                  85.65      78.97      92.02    0.765     122.4       0.0
+KBJSON {"tag":"idx-q f16_matvec_batched 4096x1280 b=4 COLD W (9 copies), graph inner=9","variant":"exact (512,1,b)","med_us":111.996,"p10_us":77.374,"p90_us":121.365,"ratio":1.0000,"gbps":93.63,"graph":1,"flush":0}
+KBJSON {"tag":"idx-q f16_matvec_batched 4096x1280 b=4 COLD W (9 copies), graph inner=9","variant":"+1 (513,1,b)","med_us":85.654,"p10_us":78.969,"p90_us":92.023,"ratio":0.7648,"gbps":122.42,"graph":1,"flush":0}
+CMP idx-q f16_matvec_batched pad1 vs exact b=5: bytes-identical (diff=0 of 20480)
+
+== idx-q f16_matvec_batched 4096x1280 b=5 COLD W (9 copies), graph inner=9  (rounds=40 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (512,1,b)                               70.49      65.89      95.36    1.000     148.8       0.0
++1 (513,1,b)                                  64.80      57.60      92.48    0.919     161.8       0.0
+KBJSON {"tag":"idx-q f16_matvec_batched 4096x1280 b=5 COLD W (9 copies), graph inner=9","variant":"exact (512,1,b)","med_us":70.489,"p10_us":65.894,"p90_us":95.356,"ratio":1.0000,"gbps":148.76,"graph":1,"flush":0}
+KBJSON {"tag":"idx-q f16_matvec_batched 4096x1280 b=5 COLD W (9 copies), graph inner=9","variant":"+1 (513,1,b)","med_us":64.805,"p10_us":57.605,"p90_us":92.481,"ratio":0.9194,"gbps":161.81,"graph":1,"flush":0}
+CMP idx-q f16_matvec_batched pad1 vs exact b=8: bytes-identical (diff=0 of 32768)
+
+== idx-q f16_matvec_batched 4096x1280 b=8 COLD W (9 copies), graph inner=9  (rounds=40 inner=9 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (512,1,b)                               99.48      91.52     124.37    1.000     105.4       0.0
++1 (513,1,b)                                  90.53      83.40     117.85    0.910     115.8       0.0
+KBJSON {"tag":"idx-q f16_matvec_batched 4096x1280 b=8 COLD W (9 copies), graph inner=9","variant":"exact (512,1,b)","med_us":99.481,"p10_us":91.516,"p90_us":124.370,"ratio":1.0000,"gbps":105.41,"graph":1,"flush":0}
+KBJSON {"tag":"idx-q f16_matvec_batched 4096x1280 b=8 COLD W (9 copies), graph inner=9","variant":"+1 (513,1,b)","med_us":90.534,"p10_us":83.401,"p90_us":117.850,"ratio":0.9101,"gbps":115.82,"graph":1,"flush":0}

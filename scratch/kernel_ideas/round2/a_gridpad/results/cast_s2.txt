@@ -1,0 +1,67 @@
+== 1790471302.000376.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP cast_2d b=16 cols=32768 grid=256 pad1 vs exact: bytes-identical (diff=0 of 524288)
+
+== cast_2d b=16 cols=32768 grid=256 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         16.76      16.70      16.82    1.000     187.6       0.0
++1                                             4.40       4.38       4.42    0.263     714.3       0.0
+KBJSON {"tag":"cast_2d b=16 cols=32768 grid=256 warm, graph inner=10","variant":"exact","med_us":16.764,"p10_us":16.700,"p90_us":16.820,"ratio":1.0000,"gbps":187.65,"graph":1,"flush":0}
+KBJSON {"tag":"cast_2d b=16 cols=32768 grid=256 warm, graph inner=10","variant":"+1","med_us":4.404,"p10_us":4.380,"p90_us":4.420,"ratio":0.2627,"gbps":714.29,"graph":1,"flush":0}
+CMP cast_2d b=64 cols=32768 grid=1024 pad1 vs exact: bytes-identical (diff=0 of 2097152)
+
+== cast_2d b=64 cols=32768 grid=1024 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         11.02       9.70      12.31    1.000    1142.2       0.0
++1                                             9.72       9.70      11.06    0.883    1294.0       0.0
+KBJSON {"tag":"cast_2d b=64 cols=32768 grid=1024 warm, graph inner=10","variant":"exact","med_us":11.016,"p10_us":9.700,"p90_us":12.312,"ratio":1.0000,"gbps":1142.23,"graph":1,"flush":0}
+KBJSON {"tag":"cast_2d b=64 cols=32768 grid=1024 warm, graph inner=10","variant":"+1","med_us":9.724,"p10_us":9.700,"p90_us":11.064,"ratio":0.8827,"gbps":1293.99,"graph":1,"flush":0}
+CMP cast_2d b=64 cols=8192 grid=256 pad1 vs exact: bytes-identical (diff=0 of 524288)
+
+== cast_2d b=64 cols=8192 grid=256 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         16.77      16.74      16.79    1.000     187.6       0.0
++1                                             4.40       4.39       4.42    0.262     714.9       0.0
+KBJSON {"tag":"cast_2d b=64 cols=8192 grid=256 warm, graph inner=10","variant":"exact","med_us":16.768,"p10_us":16.736,"p90_us":16.792,"ratio":1.0000,"gbps":187.60,"graph":1,"flush":0}
+KBJSON {"tag":"cast_2d b=64 cols=8192 grid=256 warm, graph inner=10","variant":"+1","med_us":4.400,"p10_us":4.388,"p90_us":4.416,"ratio":0.2624,"gbps":714.92,"graph":1,"flush":0}
+CMP cast_2d b=128 cols=32768 grid=2048 pad1 vs exact: bytes-identical (diff=0 of 4194304)
+
+== cast_2d b=128 cols=32768 grid=2048 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         16.60      16.56      16.63    1.000    1516.0       0.0
++1                                            16.60      16.56      16.63    1.000    1516.4       0.0
+KBJSON {"tag":"cast_2d b=128 cols=32768 grid=2048 warm, graph inner=10","variant":"exact","med_us":16.600,"p10_us":16.564,"p90_us":16.628,"ratio":1.0000,"gbps":1516.00,"graph":1,"flush":0}
+KBJSON {"tag":"cast_2d b=128 cols=32768 grid=2048 warm, graph inner=10","variant":"+1","med_us":16.596,"p10_us":16.560,"p90_us":16.628,"ratio":0.9998,"gbps":1516.37,"graph":1,"flush":0}
+CMP cast_2d b=128 cols=8192 grid=512 pad1 vs exact: bytes-identical (diff=0 of 1048576)
+
+== cast_2d b=128 cols=8192 grid=512 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          5.75       5.49       6.04    1.000    1093.8       0.0
++1                                             5.77       5.50       6.10    1.003    1090.7       0.0
+KBJSON {"tag":"cast_2d b=128 cols=8192 grid=512 warm, graph inner=10","variant":"exact","med_us":5.752,"p10_us":5.492,"p90_us":6.040,"ratio":1.0000,"gbps":1093.77,"graph":1,"flush":0}
+KBJSON {"tag":"cast_2d b=128 cols=8192 grid=512 warm, graph inner=10","variant":"+1","med_us":5.768,"p10_us":5.500,"p90_us":6.096,"ratio":1.0028,"gbps":1090.73,"graph":1,"flush":0}
+CMP cast_2d b=256 cols=8192 grid=1024 pad1 vs exact: bytes-identical (diff=0 of 2097152)
+
+== cast_2d b=256 cols=8192 grid=1024 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         10.06      10.02      11.43    1.000    1250.8       0.0
++1                                            10.04      10.01      11.39    0.998    1253.3       0.0
+KBJSON {"tag":"cast_2d b=256 cols=8192 grid=1024 warm, graph inner=10","variant":"exact","med_us":10.060,"p10_us":10.020,"p90_us":11.428,"ratio":1.0000,"gbps":1250.77,"graph":1,"flush":0}
+KBJSON {"tag":"cast_2d b=256 cols=8192 grid=1024 warm, graph inner=10","variant":"+1","med_us":10.040,"p10_us":10.008,"p90_us":11.388,"ratio":0.9980,"gbps":1253.27,"graph":1,"flush":0}
+CMP cast_2d b=512 cols=8192 grid=2048 pad1 vs exact: bytes-identical (diff=0 of 4194304)
+
+== cast_2d b=512 cols=8192 grid=2048 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         16.59      16.56      16.60    1.000    1517.1       0.0
++1                                            16.58      16.56      16.60    1.000    1517.8       0.0
+KBJSON {"tag":"cast_2d b=512 cols=8192 grid=2048 warm, graph inner=10","variant":"exact","med_us":16.588,"p10_us":16.560,"p90_us":16.604,"ratio":1.0000,"gbps":1517.10,"graph":1,"flush":0}
+KBJSON {"tag":"cast_2d b=512 cols=8192 grid=2048 warm, graph inner=10","variant":"+1","med_us":16.580,"p10_us":16.560,"p90_us":16.604,"ratio":0.9995,"gbps":1517.82,"graph":1,"flush":0}
+CMP cast_2d b=512 cols=5120 grid=1280 pad1 vs exact: bytes-identical (diff=0 of 2621440)
+
+== cast_2d b=512 cols=5120 grid=1280 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         11.58      11.50      31.47    1.000    1357.8       0.0
++1                                            12.25      11.50      23.72    1.057    1284.2       0.0
+KBJSON {"tag":"cast_2d b=512 cols=5120 grid=1280 warm, graph inner=10","variant":"exact","med_us":11.584,"p10_us":11.496,"p90_us":31.468,"ratio":1.0000,"gbps":1357.79,"graph":1,"flush":0}
+KBJSON {"tag":"cast_2d b=512 cols=5120 grid=1280 warm, graph inner=10","variant":"+1","med_us":12.248,"p10_us":11.500,"p90_us":23.720,"ratio":1.0573,"gbps":1284.17,"graph":1,"flush":0}

@@ -1,0 +1,650 @@
+== 1790470528.000340.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+== rw block=32 G=128 waves=128  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=128+0                                     3.56       3.34       5.86    1.000       0.0       0.0
+grid=128+1                                     3.67       3.33       6.94    1.030       0.0       0.0
+grid=128+7                                     3.60       3.34       8.51    1.011       0.0       0.0
+grid=127 (valid-1)                             3.56       3.34       6.68    0.998       0.0       0.0
+KBJSON {"tag":"rw block=32 G=128 waves=128","variant":"grid=128+0","med_us":3.564,"p10_us":3.344,"p90_us":5.860,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=128 waves=128","variant":"grid=128+1","med_us":3.672,"p10_us":3.332,"p90_us":6.940,"ratio":1.0303,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=128 waves=128","variant":"grid=128+7","med_us":3.604,"p10_us":3.344,"p90_us":8.512,"ratio":1.0112,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=128 waves=128","variant":"grid=127 (valid-1)","med_us":3.556,"p10_us":3.344,"p90_us":6.676,"ratio":0.9978,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=32 G=256 waves=256  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=256+0                                     3.36       3.30      41.44    1.000       0.0       0.0
+grid=256+1                                     3.48       3.31      41.28    1.036       0.0       0.0
+grid=256+7                                     3.49       3.31      27.63    1.041       0.0       0.0
+grid=255 (valid-1)                             3.44       3.32      20.50    1.026       0.0       0.0
+KBJSON {"tag":"rw block=32 G=256 waves=256","variant":"grid=256+0","med_us":3.356,"p10_us":3.304,"p90_us":41.436,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=256 waves=256","variant":"grid=256+1","med_us":3.476,"p10_us":3.312,"p90_us":41.280,"ratio":1.0358,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=256 waves=256","variant":"grid=256+7","med_us":3.492,"p10_us":3.312,"p90_us":27.628,"ratio":1.0406,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=256 waves=256","variant":"grid=255 (valid-1)","med_us":3.444,"p10_us":3.316,"p90_us":20.496,"ratio":1.0262,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=32 G=512 waves=512  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=512+0                                     3.68       3.37      12.97    1.000       0.0       0.0
+grid=512+1                                     3.63       3.40      11.66    0.986       0.0       0.0
+grid=512+7                                     3.66       3.42      12.46    0.993       0.0       0.0
+grid=511 (valid-1)                             3.65       3.38      11.35    0.992       0.0       0.0
+KBJSON {"tag":"rw block=32 G=512 waves=512","variant":"grid=512+0","med_us":3.680,"p10_us":3.368,"p90_us":12.972,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=512 waves=512","variant":"grid=512+1","med_us":3.628,"p10_us":3.400,"p90_us":11.660,"ratio":0.9859,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=512 waves=512","variant":"grid=512+7","med_us":3.656,"p10_us":3.424,"p90_us":12.464,"ratio":0.9935,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=512 waves=512","variant":"grid=511 (valid-1)","med_us":3.652,"p10_us":3.376,"p90_us":11.352,"ratio":0.9924,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=32 G=1024 waves=1024  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=1024+0                                    3.42       3.40       4.15    1.000       0.0       0.0
+grid=1024+1                                    3.42       3.39       4.32    0.998       0.0       0.0
+grid=1024+7                                    3.44       3.40       5.48    1.006       0.0       0.0
+grid=1023 (valid-1)                            3.44       3.40       6.42    1.004       0.0       0.0
+KBJSON {"tag":"rw block=32 G=1024 waves=1024","variant":"grid=1024+0","med_us":3.424,"p10_us":3.396,"p90_us":4.152,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=1024 waves=1024","variant":"grid=1024+1","med_us":3.416,"p10_us":3.392,"p90_us":4.320,"ratio":0.9977,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=1024 waves=1024","variant":"grid=1024+7","med_us":3.444,"p10_us":3.396,"p90_us":5.480,"ratio":1.0058,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=1024 waves=1024","variant":"grid=1023 (valid-1)","med_us":3.436,"p10_us":3.404,"p90_us":6.420,"ratio":1.0035,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=32 G=2048 waves=2048  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=2048+0                                   17.06       9.91      33.79    1.000       0.0       0.0
+grid=2048+1                                    4.71       3.78      13.28    0.276       0.0       0.0
+grid=2048+7                                    4.26       3.74      10.24    0.250       0.0       0.0
+grid=2047 (valid-1)                           17.00      10.69      33.10    0.996       0.0       0.0
+KBJSON {"tag":"rw block=32 G=2048 waves=2048","variant":"grid=2048+0","med_us":17.056,"p10_us":9.908,"p90_us":33.788,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=2048 waves=2048","variant":"grid=2048+1","med_us":4.712,"p10_us":3.776,"p90_us":13.284,"ratio":0.2763,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=2048 waves=2048","variant":"grid=2048+7","med_us":4.264,"p10_us":3.740,"p90_us":10.236,"ratio":0.2500,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=2048 waves=2048","variant":"grid=2047 (valid-1)","med_us":16.996,"p10_us":10.692,"p90_us":33.104,"ratio":0.9965,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=32 G=4096 waves=4096  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=4096+0                                    5.60       4.10      13.95    1.000       0.0       0.0
+grid=4096+1                                    4.88       4.15      13.80    0.873       0.0       0.0
+grid=4096+7                                    4.69       4.12      13.97    0.838       0.0       0.0
+grid=4095 (valid-1)                            5.46       4.14      14.58    0.975       0.0       0.0
+KBJSON {"tag":"rw block=32 G=4096 waves=4096","variant":"grid=4096+0","med_us":5.596,"p10_us":4.100,"p90_us":13.952,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=4096 waves=4096","variant":"grid=4096+1","med_us":4.884,"p10_us":4.148,"p90_us":13.796,"ratio":0.8728,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=4096 waves=4096","variant":"grid=4096+7","med_us":4.688,"p10_us":4.124,"p90_us":13.968,"ratio":0.8377,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=4096 waves=4096","variant":"grid=4095 (valid-1)","med_us":5.456,"p10_us":4.136,"p90_us":14.576,"ratio":0.9750,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=32 G=8192 waves=8192  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=8192+0                                    8.47       4.87      17.54    1.000       0.0       0.0
+grid=8192+1                                    6.39       4.80      16.21    0.754       0.0       0.0
+grid=8192+7                                    8.86       4.85      17.69    1.045       0.0       0.0
+grid=8191 (valid-1)                            5.89       4.80      16.20    0.695       0.0       0.0
+KBJSON {"tag":"rw block=32 G=8192 waves=8192","variant":"grid=8192+0","med_us":8.472,"p10_us":4.872,"p90_us":17.544,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=8192 waves=8192","variant":"grid=8192+1","med_us":6.392,"p10_us":4.804,"p90_us":16.212,"ratio":0.7545,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=8192 waves=8192","variant":"grid=8192+7","med_us":8.856,"p10_us":4.848,"p90_us":17.688,"ratio":1.0453,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=8192 waves=8192","variant":"grid=8191 (valid-1)","med_us":5.888,"p10_us":4.804,"p90_us":16.204,"ratio":0.6950,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=32 G=16384 waves=16384  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=16384+0                                   6.96       6.24      18.62    1.000       0.0       0.0
+grid=16384+1                                   7.28       6.23      18.78    1.047       0.0       0.0
+grid=16384+7                                   7.10       6.19      18.71    1.020       0.0       0.0
+grid=16383 (valid-1)                           7.20       6.23      15.94    1.036       0.0       0.0
+KBJSON {"tag":"rw block=32 G=16384 waves=16384","variant":"grid=16384+0","med_us":6.956,"p10_us":6.244,"p90_us":18.620,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=16384 waves=16384","variant":"grid=16384+1","med_us":7.284,"p10_us":6.232,"p90_us":18.780,"ratio":1.0472,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=16384 waves=16384","variant":"grid=16384+7","med_us":7.096,"p10_us":6.192,"p90_us":18.708,"ratio":1.0201,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=16384 waves=16384","variant":"grid=16383 (valid-1)","med_us":7.204,"p10_us":6.228,"p90_us":15.944,"ratio":1.0357,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=32 G=32768 waves=32768  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=32768+0                                  10.69       8.93      22.59    1.000       0.0       0.0
+grid=32768+1                                   9.98       8.91      25.54    0.934       0.0       0.0
+grid=32768+7                                  10.10       8.93      25.83    0.945       0.0       0.0
+grid=32767 (valid-1)                          13.60       8.92      27.11    1.272       0.0       0.0
+KBJSON {"tag":"rw block=32 G=32768 waves=32768","variant":"grid=32768+0","med_us":10.688,"p10_us":8.928,"p90_us":22.592,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=32768 waves=32768","variant":"grid=32768+1","med_us":9.980,"p10_us":8.908,"p90_us":25.540,"ratio":0.9338,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=32768 waves=32768","variant":"grid=32768+7","med_us":10.104,"p10_us":8.928,"p90_us":25.828,"ratio":0.9454,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=32768 waves=32768","variant":"grid=32767 (valid-1)","med_us":13.596,"p10_us":8.924,"p90_us":27.112,"ratio":1.2721,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=32 G=65536 waves=65536  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=65536+0                                  16.56      14.28      35.30    1.000       0.0       0.0
+grid=65536+1                                  16.50      14.26      29.12    0.996       0.0       0.0
+grid=65536+7                                  16.77      14.27      26.90    1.013       0.0       0.0
+grid=65535 (valid-1)                          17.72      14.27      29.60    1.070       0.0       0.0
+KBJSON {"tag":"rw block=32 G=65536 waves=65536","variant":"grid=65536+0","med_us":16.560,"p10_us":14.276,"p90_us":35.304,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=65536 waves=65536","variant":"grid=65536+1","med_us":16.496,"p10_us":14.264,"p90_us":29.116,"ratio":0.9961,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=65536 waves=65536","variant":"grid=65536+7","med_us":16.768,"p10_us":14.272,"p90_us":26.904,"ratio":1.0126,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=32 G=65536 waves=65536","variant":"grid=65535 (valid-1)","med_us":17.716,"p10_us":14.268,"p90_us":29.600,"ratio":1.0698,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=64 G=128 waves=256  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=128+0                                     3.34       3.31       4.24    1.000       0.0       0.0
+grid=128+1                                     3.44       3.32       7.74    1.030       0.0       0.0
+grid=128+7                                     3.33       3.30       4.99    0.995       0.0       0.0
+grid=127 (valid-1)                             3.34       3.31       4.30    0.999       0.0       0.0
+KBJSON {"tag":"rw block=64 G=128 waves=256","variant":"grid=128+0","med_us":3.344,"p10_us":3.308,"p90_us":4.236,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=128 waves=256","variant":"grid=128+1","med_us":3.444,"p10_us":3.316,"p90_us":7.744,"ratio":1.0299,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=128 waves=256","variant":"grid=128+7","med_us":3.328,"p10_us":3.304,"p90_us":4.988,"ratio":0.9952,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=128 waves=256","variant":"grid=127 (valid-1)","med_us":3.340,"p10_us":3.308,"p90_us":4.296,"ratio":0.9988,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=64 G=256 waves=512  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=256+0                                     3.68       3.33      12.52    1.000       0.0       0.0
+grid=256+1                                     3.51       3.33      11.88    0.954       0.0       0.0
+grid=256+7                                     3.68       3.34      12.92    1.002       0.0       0.0
+grid=255 (valid-1)                             3.58       3.35      12.52    0.974       0.0       0.0
+KBJSON {"tag":"rw block=64 G=256 waves=512","variant":"grid=256+0","med_us":3.676,"p10_us":3.332,"p90_us":12.516,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=256 waves=512","variant":"grid=256+1","med_us":3.508,"p10_us":3.332,"p90_us":11.876,"ratio":0.9543,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=256 waves=512","variant":"grid=256+7","med_us":3.684,"p10_us":3.340,"p90_us":12.920,"ratio":1.0022,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=256 waves=512","variant":"grid=255 (valid-1)","med_us":3.580,"p10_us":3.352,"p90_us":12.520,"ratio":0.9739,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=64 G=512 waves=1024  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=512+0                                     3.95       3.54      13.04    1.000       0.0       0.0
+grid=512+1                                     4.96       3.52      13.14    1.255       0.0       0.0
+grid=512+7                                     4.36       3.36      13.28    1.103       0.0       0.0
+grid=511 (valid-1)                             4.02       3.54      12.87    1.017       0.0       0.0
+KBJSON {"tag":"rw block=64 G=512 waves=1024","variant":"grid=512+0","med_us":3.948,"p10_us":3.540,"p90_us":13.036,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=512 waves=1024","variant":"grid=512+1","med_us":4.956,"p10_us":3.524,"p90_us":13.140,"ratio":1.2553,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=512 waves=1024","variant":"grid=512+7","med_us":4.356,"p10_us":3.364,"p90_us":13.280,"ratio":1.1033,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=512 waves=1024","variant":"grid=511 (valid-1)","med_us":4.016,"p10_us":3.540,"p90_us":12.868,"ratio":1.0172,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=64 G=1024 waves=2048  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=1024+0                                   21.61      10.16      58.69    1.000       0.0       0.0
+grid=1024+1                                    9.81       3.85      41.73    0.454       0.0       0.0
+grid=1024+7                                    7.84       4.01      41.84    0.363       0.0       0.0
+grid=1023 (valid-1)                           17.48      10.93      76.88    0.809       0.0       0.0
+KBJSON {"tag":"rw block=64 G=1024 waves=2048","variant":"grid=1024+0","med_us":21.612,"p10_us":10.164,"p90_us":58.692,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=1024 waves=2048","variant":"grid=1024+1","med_us":9.812,"p10_us":3.852,"p90_us":41.728,"ratio":0.4540,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=1024 waves=2048","variant":"grid=1024+7","med_us":7.844,"p10_us":4.012,"p90_us":41.844,"ratio":0.3629,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=1024 waves=2048","variant":"grid=1023 (valid-1)","med_us":17.484,"p10_us":10.932,"p90_us":76.881,"ratio":0.8090,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=64 G=2048 waves=4096  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=2048+0                                   48.01      17.32      79.94    1.000       0.0       0.0
+grid=2048+1                                   14.15       4.00      48.78    0.295       0.0       0.0
+grid=2048+7                                   17.30       4.01      44.09    0.360       0.0       0.0
+grid=2047 (valid-1)                           26.65      17.32      72.88    0.555       0.0       0.0
+KBJSON {"tag":"rw block=64 G=2048 waves=4096","variant":"grid=2048+0","med_us":48.008,"p10_us":17.316,"p90_us":79.940,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=2048 waves=4096","variant":"grid=2048+1","med_us":14.152,"p10_us":4.004,"p90_us":48.784,"ratio":0.2948,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=2048 waves=4096","variant":"grid=2048+7","med_us":17.296,"p10_us":4.012,"p90_us":44.088,"ratio":0.3603,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=2048 waves=4096","variant":"grid=2047 (valid-1)","med_us":26.652,"p10_us":17.320,"p90_us":72.877,"ratio":0.5552,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=64 G=4096 waves=8192  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=4096+0                                   25.42      11.44      58.51    1.000       0.0       0.0
+grid=4096+1                                   32.36       4.68      48.30    1.273       0.0       0.0
+grid=4096+7                                   21.51       4.69      46.48    0.846       0.0       0.0
+grid=4095 (valid-1)                           25.04      11.38      54.94    0.985       0.0       0.0
+KBJSON {"tag":"rw block=64 G=4096 waves=8192","variant":"grid=4096+0","med_us":25.420,"p10_us":11.436,"p90_us":58.512,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=4096 waves=8192","variant":"grid=4096+1","med_us":32.364,"p10_us":4.676,"p90_us":48.296,"ratio":1.2732,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=4096 waves=8192","variant":"grid=4096+7","med_us":21.508,"p10_us":4.692,"p90_us":46.480,"ratio":0.8461,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=4096 waves=8192","variant":"grid=4095 (valid-1)","med_us":25.040,"p10_us":11.380,"p90_us":54.940,"ratio":0.9851,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=64 G=8192 waves=16384  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=8192+0                                   21.07       5.94      47.98    1.000       0.0       0.0
+grid=8192+1                                   21.24       5.95      44.74    1.008       0.0       0.0
+grid=8192+7                                   24.12       6.02      51.04    1.145       0.0       0.0
+grid=8191 (valid-1)                           21.68       5.99      45.88    1.029       0.0       0.0
+KBJSON {"tag":"rw block=64 G=8192 waves=16384","variant":"grid=8192+0","med_us":21.068,"p10_us":5.940,"p90_us":47.980,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=8192 waves=16384","variant":"grid=8192+1","med_us":21.236,"p10_us":5.948,"p90_us":44.740,"ratio":1.0080,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=8192 waves=16384","variant":"grid=8192+7","med_us":24.116,"p10_us":6.020,"p90_us":51.044,"ratio":1.1447,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=8192 waves=16384","variant":"grid=8191 (valid-1)","med_us":21.684,"p10_us":5.992,"p90_us":45.884,"ratio":1.0292,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=64 G=16384 waves=32768  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=16384+0                                  33.02       8.76      50.46    1.000       0.0       0.0
+grid=16384+1                                   8.96       8.73      48.63    0.271       0.0       0.0
+grid=16384+7                                  29.59       8.77      55.28    0.896       0.0       0.0
+grid=16383 (valid-1)                           8.97       8.75      50.57    0.272       0.0       0.0
+KBJSON {"tag":"rw block=64 G=16384 waves=32768","variant":"grid=16384+0","med_us":33.016,"p10_us":8.756,"p90_us":50.460,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=16384 waves=32768","variant":"grid=16384+1","med_us":8.960,"p10_us":8.732,"p90_us":48.628,"ratio":0.2714,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=16384 waves=32768","variant":"grid=16384+7","med_us":29.588,"p10_us":8.772,"p90_us":55.284,"ratio":0.8962,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=16384 waves=32768","variant":"grid=16383 (valid-1)","med_us":8.972,"p10_us":8.752,"p90_us":50.572,"ratio":0.2717,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=64 G=32768 waves=65536  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=32768+0                                  48.60      14.41      62.42    1.000       0.0       0.0
+grid=32768+1                                  49.00      14.42      62.33    1.008       0.0       0.0
+grid=32768+7                                  50.16      14.29      66.83    1.032       0.0       0.0
+grid=32767 (valid-1)                          51.74      14.32      62.54    1.065       0.0       0.0
+KBJSON {"tag":"rw block=64 G=32768 waves=65536","variant":"grid=32768+0","med_us":48.600,"p10_us":14.408,"p90_us":62.424,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=32768 waves=65536","variant":"grid=32768+1","med_us":49.000,"p10_us":14.416,"p90_us":62.328,"ratio":1.0082,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=32768 waves=65536","variant":"grid=32768+7","med_us":50.156,"p10_us":14.288,"p90_us":66.828,"ratio":1.0320,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=32768 waves=65536","variant":"grid=32767 (valid-1)","med_us":51.744,"p10_us":14.324,"p90_us":62.536,"ratio":1.0647,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=64 G=65536 waves=131072  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=65536+0                                  62.95      24.84      70.82    1.000       0.0       0.0
+grid=65536+1                                  63.42      56.11      75.44    1.008       0.0       0.0
+grid=65536+7                                  62.71      35.31      70.55    0.996       0.0       0.0
+grid=65535 (valid-1)                          63.90      35.07      72.39    1.015       0.0       0.0
+KBJSON {"tag":"rw block=64 G=65536 waves=131072","variant":"grid=65536+0","med_us":62.948,"p10_us":24.844,"p90_us":70.816,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=65536 waves=131072","variant":"grid=65536+1","med_us":63.424,"p10_us":56.108,"p90_us":75.437,"ratio":1.0076,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=65536 waves=131072","variant":"grid=65536+7","med_us":62.708,"p10_us":35.312,"p90_us":70.552,"ratio":0.9962,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=64 G=65536 waves=131072","variant":"grid=65535 (valid-1)","med_us":63.896,"p10_us":35.068,"p90_us":72.392,"ratio":1.0151,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=128 G=128 waves=512  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=128+0                                    12.03       3.31      42.02    1.000       0.0       0.0
+grid=128+1                                    12.92       3.30      43.85    1.074       0.0       0.0
+grid=128+7                                    13.40       3.30      47.57    1.114       0.0       0.0
+grid=127 (valid-1)                            12.87       3.31      45.16    1.070       0.0       0.0
+KBJSON {"tag":"rw block=128 G=128 waves=512","variant":"grid=128+0","med_us":12.028,"p10_us":3.308,"p90_us":42.016,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=128 waves=512","variant":"grid=128+1","med_us":12.924,"p10_us":3.304,"p90_us":43.852,"ratio":1.0745,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=128 waves=512","variant":"grid=128+7","med_us":13.404,"p10_us":3.304,"p90_us":47.568,"ratio":1.1144,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=128 waves=512","variant":"grid=127 (valid-1)","med_us":12.868,"p10_us":3.308,"p90_us":45.156,"ratio":1.0698,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=128 G=256 waves=1024  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=256+0                                    17.51       3.34      48.84    1.000       0.0       0.0
+grid=256+1                                    14.16       3.34      47.96    0.809       0.0       0.0
+grid=256+7                                    22.99       3.35      47.93    1.313       0.0       0.0
+grid=255 (valid-1)                            16.18       3.34      46.56    0.924       0.0       0.0
+KBJSON {"tag":"rw block=128 G=256 waves=1024","variant":"grid=256+0","med_us":17.508,"p10_us":3.336,"p90_us":48.840,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=256 waves=1024","variant":"grid=256+1","med_us":14.164,"p10_us":3.340,"p90_us":47.960,"ratio":0.8090,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=256 waves=1024","variant":"grid=256+7","med_us":22.988,"p10_us":3.348,"p90_us":47.928,"ratio":1.3130,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=256 waves=1024","variant":"grid=255 (valid-1)","med_us":16.180,"p10_us":3.336,"p90_us":46.564,"ratio":0.9241,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=128 G=512 waves=2048  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=512+0                                    49.13      16.59      73.58    1.000       0.0       0.0
+grid=512+1                                    16.49       3.65      47.88    0.336       0.0       0.0
+grid=512+7                                    13.65       3.66      41.34    0.278       0.0       0.0
+grid=511 (valid-1)                            49.08      16.62      76.39    0.999       0.0       0.0
+KBJSON {"tag":"rw block=128 G=512 waves=2048","variant":"grid=512+0","med_us":49.128,"p10_us":16.592,"p90_us":73.585,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=512 waves=2048","variant":"grid=512+1","med_us":16.488,"p10_us":3.652,"p90_us":47.884,"ratio":0.3356,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=512 waves=2048","variant":"grid=512+7","med_us":13.648,"p10_us":3.664,"p90_us":41.344,"ratio":0.2778,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=512 waves=2048","variant":"grid=511 (valid-1)","med_us":49.076,"p10_us":16.624,"p90_us":76.393,"ratio":0.9989,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=128 G=1024 waves=4096  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=1024+0                                   25.45      17.24      68.99    1.000       0.0       0.0
+grid=1024+1                                   13.34       3.96      44.24    0.524       0.0       0.0
+grid=1024+7                                   13.84       3.98      43.00    0.544       0.0       0.0
+grid=1023 (valid-1)                           25.72      17.24      73.44    1.011       0.0       0.0
+KBJSON {"tag":"rw block=128 G=1024 waves=4096","variant":"grid=1024+0","med_us":25.448,"p10_us":17.236,"p90_us":68.988,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=1024 waves=4096","variant":"grid=1024+1","med_us":13.344,"p10_us":3.956,"p90_us":44.240,"ratio":0.5244,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=1024 waves=4096","variant":"grid=1024+7","med_us":13.836,"p10_us":3.980,"p90_us":42.996,"ratio":0.5437,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=1024 waves=4096","variant":"grid=1023 (valid-1)","med_us":25.724,"p10_us":17.236,"p90_us":73.436,"ratio":1.0108,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=128 G=2048 waves=8192  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=2048+0                                   51.88      31.37      78.68    1.000       0.0       0.0
+grid=2048+1                                   38.74      18.56      48.04    0.747       0.0       0.0
+grid=2048+7                                   41.48      17.56      52.00    0.800       0.0       0.0
+grid=2047 (valid-1)                           63.45      32.76      78.91    1.223       0.0       0.0
+KBJSON {"tag":"rw block=128 G=2048 waves=8192","variant":"grid=2048+0","med_us":51.880,"p10_us":31.368,"p90_us":78.685,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=2048 waves=8192","variant":"grid=2048+1","med_us":38.744,"p10_us":18.560,"p90_us":48.044,"ratio":0.7468,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=2048 waves=8192","variant":"grid=2048+7","med_us":41.484,"p10_us":17.556,"p90_us":52.000,"ratio":0.7996,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=2048 waves=8192","variant":"grid=2047 (valid-1)","med_us":63.452,"p10_us":32.764,"p90_us":78.913,"ratio":1.2231,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=128 G=4096 waves=16384  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=4096+0                                   34.64      22.81      57.04    1.000       0.0       0.0
+grid=4096+1                                   44.53      22.93      53.89    1.286       0.0       0.0
+grid=4096+7                                   44.69      22.71      52.13    1.290       0.0       0.0
+grid=4095 (valid-1)                           44.56      22.60      53.38    1.286       0.0       0.0
+KBJSON {"tag":"rw block=128 G=4096 waves=16384","variant":"grid=4096+0","med_us":34.640,"p10_us":22.812,"p90_us":57.036,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=4096 waves=16384","variant":"grid=4096+1","med_us":44.532,"p10_us":22.932,"p90_us":53.892,"ratio":1.2856,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=4096 waves=16384","variant":"grid=4096+7","med_us":44.692,"p10_us":22.708,"p90_us":52.128,"ratio":1.2902,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=4096 waves=16384","variant":"grid=4095 (valid-1)","med_us":44.556,"p10_us":22.596,"p90_us":53.380,"ratio":1.2863,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=128 G=8192 waves=32768  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=8192+0                                   39.74       8.52      55.55    1.000       0.0       0.0
+grid=8192+1                                   41.56       8.52      52.78    1.046       0.0       0.0
+grid=8192+7                                   42.40       8.52      56.34    1.067       0.0       0.0
+grid=8191 (valid-1)                           44.24       8.52      54.70    1.113       0.0       0.0
+KBJSON {"tag":"rw block=128 G=8192 waves=32768","variant":"grid=8192+0","med_us":39.736,"p10_us":8.520,"p90_us":55.548,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=8192 waves=32768","variant":"grid=8192+1","med_us":41.560,"p10_us":8.524,"p90_us":52.776,"ratio":1.0459,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=8192 waves=32768","variant":"grid=8192+7","med_us":42.404,"p10_us":8.520,"p90_us":56.336,"ratio":1.0671,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=8192 waves=32768","variant":"grid=8191 (valid-1)","med_us":44.244,"p10_us":8.524,"p90_us":54.704,"ratio":1.1134,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=128 G=16384 waves=65536  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=16384+0                                  52.50      14.10      59.56    1.000       0.0       0.0
+grid=16384+1                                  51.68      14.02      61.28    0.984       0.0       0.0
+grid=16384+7                                  52.05      14.01      60.32    0.991       0.0       0.0
+grid=16383 (valid-1)                          51.77      14.04      59.74    0.986       0.0       0.0
+KBJSON {"tag":"rw block=128 G=16384 waves=65536","variant":"grid=16384+0","med_us":52.496,"p10_us":14.100,"p90_us":59.564,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=16384 waves=65536","variant":"grid=16384+1","med_us":51.680,"p10_us":14.020,"p90_us":61.284,"ratio":0.9845,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=16384 waves=65536","variant":"grid=16384+7","med_us":52.048,"p10_us":14.008,"p90_us":60.316,"ratio":0.9915,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=16384 waves=65536","variant":"grid=16383 (valid-1)","med_us":51.772,"p10_us":14.044,"p90_us":59.744,"ratio":0.9862,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=128 G=32768 waves=131072  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=32768+0                                  62.26      24.52      70.38    1.000       0.0       0.0
+grid=32768+1                                  62.65      24.55      70.58    1.006       0.0       0.0
+grid=32768+7                                  61.39      24.54      70.01    0.986       0.0       0.0
+grid=32767 (valid-1)                          63.24      24.52      70.74    1.016       0.0       0.0
+KBJSON {"tag":"rw block=128 G=32768 waves=131072","variant":"grid=32768+0","med_us":62.264,"p10_us":24.520,"p90_us":70.376,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=32768 waves=131072","variant":"grid=32768+1","med_us":62.648,"p10_us":24.548,"p90_us":70.584,"ratio":1.0062,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=32768 waves=131072","variant":"grid=32768+7","med_us":61.388,"p10_us":24.536,"p90_us":70.012,"ratio":0.9859,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=128 G=32768 waves=131072","variant":"grid=32767 (valid-1)","med_us":63.244,"p10_us":24.516,"p90_us":70.736,"ratio":1.0157,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=256 G=128 waves=1024  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=128+0                                    16.36       3.29      47.97    1.000       0.0       0.0
+grid=128+1                                    16.68       3.29      47.72    1.020       0.0       0.0
+grid=128+7                                    16.42       3.29      46.16    1.004       0.0       0.0
+grid=127 (valid-1)                            16.83       3.29      47.66    1.029       0.0       0.0
+KBJSON {"tag":"rw block=256 G=128 waves=1024","variant":"grid=128+0","med_us":16.360,"p10_us":3.292,"p90_us":47.968,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=128 waves=1024","variant":"grid=128+1","med_us":16.684,"p10_us":3.292,"p90_us":47.716,"ratio":1.0198,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=128 waves=1024","variant":"grid=128+7","med_us":16.424,"p10_us":3.292,"p90_us":46.156,"ratio":1.0039,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=128 waves=1024","variant":"grid=127 (valid-1)","med_us":16.828,"p10_us":3.292,"p90_us":47.656,"ratio":1.0286,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=256 G=256 waves=2048  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=256+0                                    60.94      43.61      76.31    1.000       0.0       0.0
+grid=256+1                                    21.92      13.28      44.00    0.360       0.0       0.0
+grid=256+7                                    25.32      13.37      46.04    0.416       0.0       0.0
+grid=255 (valid-1)                            54.66      43.78      76.02    0.897       0.0       0.0
+KBJSON {"tag":"rw block=256 G=256 waves=2048","variant":"grid=256+0","med_us":60.936,"p10_us":43.612,"p90_us":76.309,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=256 waves=2048","variant":"grid=256+1","med_us":21.920,"p10_us":13.284,"p90_us":44.000,"ratio":0.3597,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=256 waves=2048","variant":"grid=256+7","med_us":25.324,"p10_us":13.368,"p90_us":46.040,"ratio":0.4156,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=256 waves=2048","variant":"grid=255 (valid-1)","med_us":54.660,"p10_us":43.780,"p90_us":76.016,"ratio":0.8970,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=256 G=512 waves=4096  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=512+0                                    51.49      18.08      81.58    1.000       0.0       0.0
+grid=512+1                                    17.01       4.00      47.48    0.330       0.0       0.0
+grid=512+7                                    17.44       4.04      50.89    0.339       0.0       0.0
+grid=511 (valid-1)                            51.04      18.24      81.76    0.991       0.0       0.0
+KBJSON {"tag":"rw block=256 G=512 waves=4096","variant":"grid=512+0","med_us":51.492,"p10_us":18.084,"p90_us":81.581,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=512 waves=4096","variant":"grid=512+1","med_us":17.012,"p10_us":4.000,"p90_us":47.480,"ratio":0.3304,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=512 waves=4096","variant":"grid=512+7","med_us":17.436,"p10_us":4.036,"p90_us":50.888,"ratio":0.3386,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=512 waves=4096","variant":"grid=511 (valid-1)","med_us":51.036,"p10_us":18.240,"p90_us":81.757,"ratio":0.9911,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=256 G=1024 waves=8192  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=1024+0                                   46.41      18.77      80.04    1.000       0.0       0.0
+grid=1024+1                                   21.19       4.62      51.65    0.457       0.0       0.0
+grid=1024+7                                   22.24       4.68      51.35    0.479       0.0       0.0
+grid=1023 (valid-1)                           46.65      18.84      80.16    1.005       0.0       0.0
+KBJSON {"tag":"rw block=256 G=1024 waves=8192","variant":"grid=1024+0","med_us":46.408,"p10_us":18.772,"p90_us":80.045,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=1024 waves=8192","variant":"grid=1024+1","med_us":21.188,"p10_us":4.624,"p90_us":51.652,"ratio":0.4566,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=1024 waves=8192","variant":"grid=1024+7","med_us":22.240,"p10_us":4.684,"p90_us":51.348,"ratio":0.4792,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=1024 waves=8192","variant":"grid=1023 (valid-1)","med_us":46.648,"p10_us":18.844,"p90_us":80.157,"ratio":1.0052,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=256 G=2048 waves=16384  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=2048+0                                   26.21       5.91      53.93    1.000       0.0       0.0
+grid=2048+1                                   23.27       5.88      51.14    0.888       0.0       0.0
+grid=2048+7                                   22.04       5.92      45.63    0.841       0.0       0.0
+grid=2047 (valid-1)                           24.76       5.87      49.55    0.945       0.0       0.0
+KBJSON {"tag":"rw block=256 G=2048 waves=16384","variant":"grid=2048+0","med_us":26.208,"p10_us":5.908,"p90_us":53.932,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=2048 waves=16384","variant":"grid=2048+1","med_us":23.272,"p10_us":5.876,"p90_us":51.136,"ratio":0.8880,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=2048 waves=16384","variant":"grid=2048+7","med_us":22.036,"p10_us":5.924,"p90_us":45.628,"ratio":0.8408,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=2048 waves=16384","variant":"grid=2047 (valid-1)","med_us":24.760,"p10_us":5.868,"p90_us":49.552,"ratio":0.9447,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=256 G=4096 waves=32768  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=4096+0                                   38.62       8.51      53.29    1.000       0.0       0.0
+grid=4096+1                                   41.05       8.52      55.08    1.063       0.0       0.0
+grid=4096+7                                   38.36       8.56      53.58    0.993       0.0       0.0
+grid=4095 (valid-1)                           39.32       8.50      53.83    1.018       0.0       0.0
+KBJSON {"tag":"rw block=256 G=4096 waves=32768","variant":"grid=4096+0","med_us":38.624,"p10_us":8.512,"p90_us":53.292,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=4096 waves=32768","variant":"grid=4096+1","med_us":41.052,"p10_us":8.516,"p90_us":55.076,"ratio":1.0629,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=4096 waves=32768","variant":"grid=4096+7","med_us":38.360,"p10_us":8.560,"p90_us":53.576,"ratio":0.9932,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=4096 waves=32768","variant":"grid=4095 (valid-1)","med_us":39.320,"p10_us":8.504,"p90_us":53.828,"ratio":1.0180,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=256 G=8192 waves=65536  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=8192+0                                   51.94      14.16      64.11    1.000       0.0       0.0
+grid=8192+1                                   50.85      14.16      59.36    0.979       0.0       0.0
+grid=8192+7                                   52.23      14.15      60.41    1.006       0.0       0.0
+grid=8191 (valid-1)                           49.84      14.14      59.50    0.960       0.0       0.0
+KBJSON {"tag":"rw block=256 G=8192 waves=65536","variant":"grid=8192+0","med_us":51.940,"p10_us":14.156,"p90_us":64.112,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=8192 waves=65536","variant":"grid=8192+1","med_us":50.852,"p10_us":14.160,"p90_us":59.360,"ratio":0.9791,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=8192 waves=65536","variant":"grid=8192+7","med_us":52.228,"p10_us":14.152,"p90_us":60.412,"ratio":1.0055,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=8192 waves=65536","variant":"grid=8191 (valid-1)","med_us":49.840,"p10_us":14.144,"p90_us":59.496,"ratio":0.9596,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=256 G=16384 waves=131072  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=16384+0                                  63.04      24.93      71.55    1.000       0.0       0.0
+grid=16384+1                                  61.86      51.36      71.78    0.981       0.0       0.0
+grid=16384+7                                  62.85      24.96      70.46    0.997       0.0       0.0
+grid=16383 (valid-1)                          64.30      26.35      71.15    1.020       0.0       0.0
+KBJSON {"tag":"rw block=256 G=16384 waves=131072","variant":"grid=16384+0","med_us":63.041,"p10_us":24.932,"p90_us":71.548,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=16384 waves=131072","variant":"grid=16384+1","med_us":61.860,"p10_us":51.364,"p90_us":71.781,"ratio":0.9813,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=16384 waves=131072","variant":"grid=16384+7","med_us":62.848,"p10_us":24.960,"p90_us":70.456,"ratio":0.9970,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=256 G=16384 waves=131072","variant":"grid=16383 (valid-1)","med_us":64.300,"p10_us":26.348,"p90_us":71.153,"ratio":1.0200,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=512 G=128 waves=2048  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=128+0                                    47.33      17.11      78.95    1.000       0.0       0.0
+grid=128+1                                    16.51       3.67      45.10    0.349       0.0       0.0
+grid=128+7                                    14.33       3.66      45.39    0.303       0.0       0.0
+grid=127 (valid-1)                            46.04      17.14      80.22    0.973       0.0       0.0
+KBJSON {"tag":"rw block=512 G=128 waves=2048","variant":"grid=128+0","med_us":47.328,"p10_us":17.112,"p90_us":78.952,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=128 waves=2048","variant":"grid=128+1","med_us":16.508,"p10_us":3.672,"p90_us":45.100,"ratio":0.3488,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=128 waves=2048","variant":"grid=128+7","med_us":14.332,"p10_us":3.660,"p90_us":45.388,"ratio":0.3028,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=128 waves=2048","variant":"grid=127 (valid-1)","med_us":46.036,"p10_us":17.144,"p90_us":80.221,"ratio":0.9727,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=512 G=256 waves=4096  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=256+0                                    53.05      18.06      81.47    1.000       0.0       0.0
+grid=256+1                                    25.33       4.05      51.21    0.477       0.0       0.0
+grid=256+7                                    17.71       4.12      47.12    0.334       0.0       0.0
+grid=255 (valid-1)                            57.08      18.06      82.06    1.076       0.0       0.0
+KBJSON {"tag":"rw block=512 G=256 waves=4096","variant":"grid=256+0","med_us":53.048,"p10_us":18.060,"p90_us":81.468,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=256 waves=4096","variant":"grid=256+1","med_us":25.328,"p10_us":4.052,"p90_us":51.212,"ratio":0.4775,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=256 waves=4096","variant":"grid=256+7","med_us":17.712,"p10_us":4.120,"p90_us":47.116,"ratio":0.3339,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=256 waves=4096","variant":"grid=255 (valid-1)","med_us":57.076,"p10_us":18.064,"p90_us":82.064,"ratio":1.0759,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=512 G=512 waves=8192  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=512+0                                    46.40      17.87      79.54    1.000       0.0       0.0
+grid=512+1                                    20.12       4.61      50.29    0.434       0.0       0.0
+grid=512+7                                    20.58       4.65      51.72    0.443       0.0       0.0
+grid=511 (valid-1)                            45.62      17.86      82.62    0.983       0.0       0.0
+KBJSON {"tag":"rw block=512 G=512 waves=8192","variant":"grid=512+0","med_us":46.404,"p10_us":17.872,"p90_us":79.536,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=512 waves=8192","variant":"grid=512+1","med_us":20.124,"p10_us":4.608,"p90_us":50.292,"ratio":0.4337,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=512 waves=8192","variant":"grid=512+7","med_us":20.580,"p10_us":4.652,"p90_us":51.724,"ratio":0.4435,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=512 waves=8192","variant":"grid=511 (valid-1)","med_us":45.620,"p10_us":17.864,"p90_us":82.621,"ratio":0.9831,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=512 G=1024 waves=16384  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=1024+0                                   30.91      10.19      64.00    1.000       0.0       0.0
+grid=1024+1                                   23.70       7.43      55.09    0.767       0.0       0.0
+grid=1024+7                                   23.73       6.05      47.55    0.768       0.0       0.0
+grid=1023 (valid-1)                           28.42       8.80      62.35    0.920       0.0       0.0
+KBJSON {"tag":"rw block=512 G=1024 waves=16384","variant":"grid=1024+0","med_us":30.908,"p10_us":10.192,"p90_us":63.996,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=1024 waves=16384","variant":"grid=1024+1","med_us":23.704,"p10_us":7.428,"p90_us":55.092,"ratio":0.7669,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=1024 waves=16384","variant":"grid=1024+7","med_us":23.728,"p10_us":6.052,"p90_us":47.552,"ratio":0.7677,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=1024 waves=16384","variant":"grid=1023 (valid-1)","med_us":28.420,"p10_us":8.796,"p90_us":62.348,"ratio":0.9195,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=512 G=2048 waves=32768  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=2048+0                                   48.26      38.97      55.12    1.000       0.0       0.0
+grid=2048+1                                   49.44      41.13      56.49    1.024       0.0       0.0
+grid=2048+7                                   47.86      39.11      55.18    0.992       0.0       0.0
+grid=2047 (valid-1)                           48.47      41.32      56.83    1.004       0.0       0.0
+KBJSON {"tag":"rw block=512 G=2048 waves=32768","variant":"grid=2048+0","med_us":48.264,"p10_us":38.972,"p90_us":55.124,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=2048 waves=32768","variant":"grid=2048+1","med_us":49.436,"p10_us":41.132,"p90_us":56.492,"ratio":1.0243,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=2048 waves=32768","variant":"grid=2048+7","med_us":47.864,"p10_us":39.112,"p90_us":55.180,"ratio":0.9917,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=2048 waves=32768","variant":"grid=2047 (valid-1)","med_us":48.468,"p10_us":41.316,"p90_us":56.828,"ratio":1.0042,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=512 G=4096 waves=65536  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=4096+0                                   49.76      14.35      63.36    1.000       0.0       0.0
+grid=4096+1                                   46.59      14.37      60.58    0.936       0.0       0.0
+grid=4096+7                                   51.02      14.45      64.21    1.025       0.0       0.0
+grid=4095 (valid-1)                           47.22      14.38      60.62    0.949       0.0       0.0
+KBJSON {"tag":"rw block=512 G=4096 waves=65536","variant":"grid=4096+0","med_us":49.764,"p10_us":14.352,"p90_us":63.364,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=4096 waves=65536","variant":"grid=4096+1","med_us":46.592,"p10_us":14.372,"p90_us":60.580,"ratio":0.9363,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=4096 waves=65536","variant":"grid=4096+7","med_us":51.024,"p10_us":14.448,"p90_us":64.208,"ratio":1.0253,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=4096 waves=65536","variant":"grid=4095 (valid-1)","med_us":47.216,"p10_us":14.380,"p90_us":60.616,"ratio":0.9488,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=512 G=8192 waves=131072  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=8192+0                                   64.06      25.64      73.50    1.000       0.0       0.0
+grid=8192+1                                   63.08      25.60      72.90    0.985       0.0       0.0
+grid=8192+7                                   65.06      25.61      73.79    1.016       0.0       0.0
+grid=8191 (valid-1)                           63.91      25.58      73.22    0.998       0.0       0.0
+KBJSON {"tag":"rw block=512 G=8192 waves=131072","variant":"grid=8192+0","med_us":64.060,"p10_us":25.636,"p90_us":73.497,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=8192 waves=131072","variant":"grid=8192+1","med_us":63.085,"p10_us":25.604,"p90_us":72.896,"ratio":0.9848,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=8192 waves=131072","variant":"grid=8192+7","med_us":65.057,"p10_us":25.608,"p90_us":73.788,"ratio":1.0155,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=512 G=8192 waves=131072","variant":"grid=8191 (valid-1)","med_us":63.908,"p10_us":25.576,"p90_us":73.216,"ratio":0.9976,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=1024 G=128 waves=4096  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=128+0                                    18.49      18.15      81.39    1.000       0.0       0.0
+grid=128+1                                     4.19       4.09      44.48    0.227       0.0       0.0
+grid=128+7                                     4.24       4.12      44.34    0.229       0.0       0.0
+grid=127 (valid-1)                            18.52      18.16      66.96    1.002       0.0       0.0
+KBJSON {"tag":"rw block=1024 G=128 waves=4096","variant":"grid=128+0","med_us":18.488,"p10_us":18.152,"p90_us":81.388,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=128 waves=4096","variant":"grid=128+1","med_us":4.192,"p10_us":4.092,"p90_us":44.476,"ratio":0.2267,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=128 waves=4096","variant":"grid=128+7","med_us":4.236,"p10_us":4.116,"p90_us":44.336,"ratio":0.2291,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=128 waves=4096","variant":"grid=127 (valid-1)","med_us":18.524,"p10_us":18.156,"p90_us":66.956,"ratio":1.0019,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=1024 G=256 waves=8192  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=256+0                                    56.80      19.02      81.21    1.000       0.0       0.0
+grid=256+1                                    22.66       4.85      49.20    0.399       0.0       0.0
+grid=256+7                                    21.40       4.88      47.66    0.377       0.0       0.0
+grid=255 (valid-1)                            50.13      19.01      79.87    0.883       0.0       0.0
+KBJSON {"tag":"rw block=1024 G=256 waves=8192","variant":"grid=256+0","med_us":56.804,"p10_us":19.020,"p90_us":81.208,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=256 waves=8192","variant":"grid=256+1","med_us":22.660,"p10_us":4.848,"p90_us":49.204,"ratio":0.3989,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=256 waves=8192","variant":"grid=256+7","med_us":21.396,"p10_us":4.876,"p90_us":47.656,"ratio":0.3767,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=256 waves=8192","variant":"grid=255 (valid-1)","med_us":50.132,"p10_us":19.008,"p90_us":79.873,"ratio":0.8825,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=1024 G=512 waves=16384  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=512+0                                    43.97      19.64      79.49    1.000       0.0       0.0
+grid=512+1                                    26.64      10.24      57.95    0.606       0.0       0.0
+grid=512+7                                    26.26       6.24      49.78    0.597       0.0       0.0
+grid=511 (valid-1)                            49.59      18.30      76.85    1.128       0.0       0.0
+KBJSON {"tag":"rw block=1024 G=512 waves=16384","variant":"grid=512+0","med_us":43.972,"p10_us":19.640,"p90_us":79.492,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=512 waves=16384","variant":"grid=512+1","med_us":26.640,"p10_us":10.240,"p90_us":57.952,"ratio":0.6058,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=512 waves=16384","variant":"grid=512+7","med_us":26.256,"p10_us":6.240,"p90_us":49.776,"ratio":0.5971,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=512 waves=16384","variant":"grid=511 (valid-1)","med_us":49.588,"p10_us":18.300,"p90_us":76.849,"ratio":1.1277,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=1024 G=1024 waves=32768  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=1024+0                                   42.37      13.22      62.70    1.000       0.0       0.0
+grid=1024+1                                   44.41      10.53      56.36    1.048       0.0       0.0
+grid=1024+7                                   39.64       9.10      54.03    0.935       0.0       0.0
+grid=1023 (valid-1)                           44.52      11.80      58.24    1.051       0.0       0.0
+KBJSON {"tag":"rw block=1024 G=1024 waves=32768","variant":"grid=1024+0","med_us":42.372,"p10_us":13.216,"p90_us":62.704,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=1024 waves=32768","variant":"grid=1024+1","med_us":44.408,"p10_us":10.528,"p90_us":56.356,"ratio":1.0481,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=1024 waves=32768","variant":"grid=1024+7","med_us":39.636,"p10_us":9.100,"p90_us":54.028,"ratio":0.9354,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=1024 waves=32768","variant":"grid=1023 (valid-1)","med_us":44.520,"p10_us":11.796,"p90_us":58.240,"ratio":1.0507,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=1024 G=2048 waves=65536  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=2048+0                                   52.57      14.94      59.86    1.000       0.0       0.0
+grid=2048+1                                   48.94      14.96      59.69    0.931       0.0       0.0
+grid=2048+7                                   50.34      14.92      64.74    0.958       0.0       0.0
+grid=2047 (valid-1)                           52.59      16.45      59.78    1.000       0.0       0.0
+KBJSON {"tag":"rw block=1024 G=2048 waves=65536","variant":"grid=2048+0","med_us":52.568,"p10_us":14.940,"p90_us":59.856,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=2048 waves=65536","variant":"grid=2048+1","med_us":48.944,"p10_us":14.960,"p90_us":59.688,"ratio":0.9311,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=2048 waves=65536","variant":"grid=2048+7","med_us":50.344,"p10_us":14.924,"p90_us":64.740,"ratio":0.9577,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=2048 waves=65536","variant":"grid=2047 (valid-1)","med_us":52.592,"p10_us":16.448,"p90_us":59.776,"ratio":1.0005,"gbps":0.00,"graph":1,"flush":0}
+
+== rw block=1024 G=4096 waves=131072  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+grid=4096+0                                   63.92      55.06      72.70    1.000       0.0       0.0
+grid=4096+1                                   64.27      53.89      76.92    1.005       0.0       0.0
+grid=4096+7                                   62.90      50.97      71.88    0.984       0.0       0.0
+grid=4095 (valid-1)                           64.37      53.56      76.08    1.007       0.0       0.0
+KBJSON {"tag":"rw block=1024 G=4096 waves=131072","variant":"grid=4096+0","med_us":63.924,"p10_us":55.064,"p90_us":72.704,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=4096 waves=131072","variant":"grid=4096+1","med_us":64.272,"p10_us":53.892,"p90_us":76.925,"ratio":1.0054,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=4096 waves=131072","variant":"grid=4096+7","med_us":62.896,"p10_us":50.972,"p90_us":71.881,"ratio":0.9839,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw block=1024 G=4096 waves=131072","variant":"grid=4095 (valid-1)","med_us":64.368,"p10_us":53.564,"p90_us":76.085,"ratio":1.0069,"gbps":0.00,"graph":1,"flush":0}
+
+== rw 3d 512x2x1 block=256  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         50.66      39.77      77.91    1.000       0.0       0.0
+x+1                                           27.37      16.16      49.06    0.540       0.0       0.0
+y+1                                           39.79      16.89      48.37    0.785       0.0       0.0
+KBJSON {"tag":"rw 3d 512x2x1 block=256","variant":"exact","med_us":50.656,"p10_us":39.768,"p90_us":77.912,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 512x2x1 block=256","variant":"x+1","med_us":27.368,"p10_us":16.156,"p90_us":49.060,"ratio":0.5403,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 512x2x1 block=256","variant":"y+1","med_us":39.788,"p10_us":16.888,"p90_us":48.368,"ratio":0.7855,"gbps":0.00,"graph":1,"flush":0}
+
+== rw 3d 512x4x1 block=256  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          8.60       5.88      47.40    1.000       0.0       0.0
+x+1                                            5.92       5.89      42.18    0.688       0.0       0.0
+y+1                                            6.29       6.26      43.49    0.732       0.0       0.0
+KBJSON {"tag":"rw 3d 512x4x1 block=256","variant":"exact","med_us":8.600,"p10_us":5.880,"p90_us":47.396,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 512x4x1 block=256","variant":"x+1","med_us":5.916,"p10_us":5.892,"p90_us":42.184,"ratio":0.6879,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 512x4x1 block=256","variant":"y+1","med_us":6.292,"p10_us":6.264,"p90_us":43.492,"ratio":0.7316,"gbps":0.00,"graph":1,"flush":0}
+
+== rw 3d 512x8x1 block=256  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         38.89       8.56      53.77    1.000       0.0       0.0
+x+1                                           40.10       8.61      53.64    1.031       0.0       0.0
+y+1                                           39.98       8.91      53.95    1.028       0.0       0.0
+KBJSON {"tag":"rw 3d 512x8x1 block=256","variant":"exact","med_us":38.888,"p10_us":8.560,"p90_us":53.772,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 512x8x1 block=256","variant":"x+1","med_us":40.100,"p10_us":8.608,"p90_us":53.636,"ratio":1.0312,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 512x8x1 block=256","variant":"y+1","med_us":39.984,"p10_us":8.908,"p90_us":53.952,"ratio":1.0282,"gbps":0.00,"graph":1,"flush":0}
+
+== rw 3d 512x1x4 block=256  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         35.00      21.41      55.60    1.000       0.0       0.0
+x+1                                           28.65      20.46      47.75    0.819       0.0       0.0
+z+1                                           35.82      19.79      50.14    1.023       0.0       0.0
+KBJSON {"tag":"rw 3d 512x1x4 block=256","variant":"exact","med_us":35.000,"p10_us":21.408,"p90_us":55.596,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 512x1x4 block=256","variant":"x+1","med_us":28.652,"p10_us":20.464,"p90_us":47.748,"ratio":0.8186,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 512x1x4 block=256","variant":"z+1","med_us":35.820,"p10_us":19.788,"p90_us":50.144,"ratio":1.0234,"gbps":0.00,"graph":1,"flush":0}
+
+== rw 3d 64x1x16 block=32  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         14.45       3.29      41.02    1.000       0.0       0.0
+x+1                                           13.14       3.31      47.59    0.909       0.0       0.0
+z+1                                           14.23       3.29      43.88    0.985       0.0       0.0
+KBJSON {"tag":"rw 3d 64x1x16 block=32","variant":"exact","med_us":14.452,"p10_us":3.292,"p90_us":41.024,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 64x1x16 block=32","variant":"x+1","med_us":13.140,"p10_us":3.308,"p90_us":47.592,"ratio":0.9092,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 64x1x16 block=32","variant":"z+1","med_us":14.228,"p10_us":3.292,"p90_us":43.880,"ratio":0.9845,"gbps":0.00,"graph":1,"flush":0}
+
+== rw 3d 64x1x32 block=32  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         48.29      17.42      79.56    1.000       0.0       0.0
+x+1                                           17.74       3.64      43.93    0.367       0.0       0.0
+z+1                                           17.73       3.64      48.50    0.367       0.0       0.0
+KBJSON {"tag":"rw 3d 64x1x32 block=32","variant":"exact","med_us":48.288,"p10_us":17.424,"p90_us":79.564,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 64x1x32 block=32","variant":"x+1","med_us":17.744,"p10_us":3.636,"p90_us":43.928,"ratio":0.3675,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 64x1x32 block=32","variant":"z+1","med_us":17.732,"p10_us":3.644,"p90_us":48.504,"ratio":0.3672,"gbps":0.00,"graph":1,"flush":0}
+
+== rw 3d 64x1x64 block=32  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          4.02       3.97      47.87    1.000       0.0       0.0
+x+1                                            4.02       3.98      42.99    1.001       0.0       0.0
+z+1                                            4.03       4.00      38.56    1.003       0.0       0.0
+KBJSON {"tag":"rw 3d 64x1x64 block=32","variant":"exact","med_us":4.016,"p10_us":3.968,"p90_us":47.868,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 64x1x64 block=32","variant":"x+1","med_us":4.020,"p10_us":3.984,"p90_us":42.992,"ratio":1.0010,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 64x1x64 block=32","variant":"z+1","med_us":4.028,"p10_us":3.996,"p90_us":38.564,"ratio":1.0030,"gbps":0.00,"graph":1,"flush":0}
+
+== rw 3d 64x1x512 block=32  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         46.62      39.93      55.54    1.000       0.0       0.0
+x+1                                           48.43      39.40      54.92    1.039       0.0       0.0
+z+1                                           47.80      40.11      57.22    1.025       0.0       0.0
+KBJSON {"tag":"rw 3d 64x1x512 block=32","variant":"exact","med_us":46.624,"p10_us":39.932,"p90_us":55.544,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 64x1x512 block=32","variant":"x+1","med_us":48.432,"p10_us":39.396,"p90_us":54.916,"ratio":1.0388,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 64x1x512 block=32","variant":"z+1","med_us":47.796,"p10_us":40.112,"p90_us":57.224,"ratio":1.0251,"gbps":0.00,"graph":1,"flush":0}
+
+== rw 3d 512x4x1 block=64  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         54.70      44.13      80.38    1.000       0.0       0.0
+x+1                                           43.06      17.66      49.92    0.787       0.0       0.0
+y+1                                           23.41      17.29      43.77    0.428       0.0       0.0
+KBJSON {"tag":"rw 3d 512x4x1 block=64","variant":"exact","med_us":54.696,"p10_us":44.128,"p90_us":80.377,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 512x4x1 block=64","variant":"x+1","med_us":43.060,"p10_us":17.660,"p90_us":49.920,"ratio":0.7873,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 512x4x1 block=64","variant":"y+1","med_us":23.408,"p10_us":17.292,"p90_us":43.768,"ratio":0.4280,"gbps":0.00,"graph":1,"flush":0}
+
+== rw 3d 512x8x1 block=64  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         18.55      15.09      60.61    1.000       0.0       0.0
+x+1                                            4.68       4.62      49.40    0.252       0.0       0.0
+y+1                                            4.80       4.74      45.76    0.259       0.0       0.0
+KBJSON {"tag":"rw 3d 512x8x1 block=64","variant":"exact","med_us":18.552,"p10_us":15.088,"p90_us":60.608,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 512x8x1 block=64","variant":"x+1","med_us":4.676,"p10_us":4.620,"p90_us":49.400,"ratio":0.2521,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 512x8x1 block=64","variant":"y+1","med_us":4.800,"p10_us":4.744,"p90_us":45.760,"ratio":0.2587,"gbps":0.00,"graph":1,"flush":0}
+
+== rw 3d 4096x1x1 block=256  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          8.72       8.55      54.84    1.000       0.0       0.0
+x+1                                            8.71       8.55      50.96    0.998       0.0       0.0
+KBJSON {"tag":"rw 3d 4096x1x1 block=256","variant":"exact","med_us":8.724,"p10_us":8.552,"p90_us":54.844,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rw 3d 4096x1x1 block=256","variant":"x+1","med_us":8.708,"p10_us":8.548,"p90_us":50.964,"ratio":0.9982,"gbps":0.00,"graph":1,"flush":0}

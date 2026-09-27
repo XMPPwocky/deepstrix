@@ -1,0 +1,19 @@
+== 1790471112.000356.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP idx proj f16_matvec_batched pad1 vs exact b=16: bytes-identical (diff=0 of 512)
+
+== idx proj f16_matvec_batched 32x5120 b=16 COLD W (257 copies), graph inner=257  (rounds=40 inner=257 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (4,1,b)                                 27.77      24.27      28.96    1.000      11.8       0.0
++1 (5,1,b)                                    27.85      25.37      28.87    1.003      11.8       0.0
+KBJSON {"tag":"idx proj f16_matvec_batched 32x5120 b=16 COLD W (257 copies), graph inner=257","variant":"exact (4,1,b)","med_us":27.765,"p10_us":24.270,"p90_us":28.960,"ratio":1.0000,"gbps":11.80,"graph":1,"flush":0}
+KBJSON {"tag":"idx proj f16_matvec_batched 32x5120 b=16 COLD W (257 copies), graph inner=257","variant":"+1 (5,1,b)","med_us":27.845,"p10_us":25.374,"p90_us":28.875,"ratio":1.0029,"gbps":11.77,"graph":1,"flush":0}
+CMP idx proj f16_matvec_batched pad1 vs exact b=64: bytes-identical (diff=0 of 2048)
+
+== idx proj f16_matvec_batched 32x5120 b=64 COLD W (257 copies), graph inner=257  (rounds=40 inner=257 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (4,1,b)                                 35.10      31.79      37.31    1.000       9.3       0.0
++1 (5,1,b)                                    44.47      39.35      45.23    1.267       7.4       0.0
+KBJSON {"tag":"idx proj f16_matvec_batched 32x5120 b=64 COLD W (257 copies), graph inner=257","variant":"exact (4,1,b)","med_us":35.099,"p10_us":31.788,"p90_us":37.310,"ratio":1.0000,"gbps":9.34,"graph":1,"flush":0}
+KBJSON {"tag":"idx proj f16_matvec_batched 32x5120 b=64 COLD W (257 copies), graph inner=257","variant":"+1 (5,1,b)","med_us":44.469,"p10_us":39.350,"p90_us":45.232,"ratio":1.2670,"gbps":7.37,"graph":1,"flush":0}

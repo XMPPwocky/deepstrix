@@ -111,13 +111,19 @@ impl IndexerQat {
             return Ok(());
         }
         let function = self.module.get_function("indexer_fp4")?;
+        // `V41_GRID_PAD`: one idle WG (the kernel's `row >= n_rows` guard). At
+        // n_rows = 32*b, b = 16/32/64/128 (replay b = 64) the exact grid
+        // dispatches 1.5-3.8x slower on gfx1201 (17-20 us vs 4.6-14). DO NOT
+        // REMOVE; see `crate::grid_pad`.
         let cfg = LaunchConfig {
-            grid: (n_rows, 1, 1),
+            grid: (n_rows + crate::grid_pad(), 1, 1),
             block: (128, 1, 1),
             shared_mem_bytes: 0,
         };
         launch_kernel!(function, cfg, stream, [x.raw(), n_rows])
     }
+
+    pub fn module(&self) -> &Module { &self.module }
 }
 
 /// Per-comp-row scoring kernel.

@@ -1,0 +1,51 @@
+== 1790470942.000346.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP ratio-1 compressor f16_matvec_batched pad1 vs exact b=1: bytes-identical (diff=0 of 512)
+
+== ratio-1 compressor f16_matvec_batched 512x5120 b=1 COLD W (17 copies), graph inner=17  (rounds=40 inner=17 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (64,1,b)                                23.92      23.66      39.55    1.000     219.2       0.0
++1 (65,1,b)                                   23.81      23.68      28.53    0.995     220.2       0.0
+KBJSON {"tag":"ratio-1 compressor f16_matvec_batched 512x5120 b=1 COLD W (17 copies), graph inner=17","variant":"exact (64,1,b)","med_us":23.923,"p10_us":23.661,"p90_us":39.549,"ratio":1.0000,"gbps":219.16,"graph":1,"flush":0}
+KBJSON {"tag":"ratio-1 compressor f16_matvec_batched 512x5120 b=1 COLD W (17 copies), graph inner=17","variant":"+1 (65,1,b)","med_us":23.807,"p10_us":23.675,"p90_us":28.532,"ratio":0.9952,"gbps":220.22,"graph":1,"flush":0}
+CMP ratio-1 compressor f16_matvec_batched pad1 vs exact b=2: bytes-identical (diff=0 of 1024)
+
+== ratio-1 compressor f16_matvec_batched 512x5120 b=2 COLD W (17 copies), graph inner=17  (rounds=40 inner=17 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (64,1,b)                                28.61      23.79      41.28    1.000     183.2       0.0
++1 (65,1,b)                                   24.13      24.00      29.10    0.843     217.2       0.0
+KBJSON {"tag":"ratio-1 compressor f16_matvec_batched 512x5120 b=2 COLD W (17 copies), graph inner=17","variant":"exact (64,1,b)","med_us":28.614,"p10_us":23.793,"p90_us":41.280,"ratio":1.0000,"gbps":183.23,"graph":1,"flush":0}
+KBJSON {"tag":"ratio-1 compressor f16_matvec_batched 512x5120 b=2 COLD W (17 copies), graph inner=17","variant":"+1 (65,1,b)","med_us":24.134,"p10_us":23.998,"p90_us":29.097,"ratio":0.8434,"gbps":217.24,"graph":1,"flush":0}
+CMP ratio-1 compressor f16_matvec_batched pad1 vs exact b=3: bytes-identical (diff=0 of 1536)
+
+== ratio-1 compressor f16_matvec_batched 512x5120 b=3 COLD W (17 copies), graph inner=17  (rounds=40 inner=17 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (64,1,b)                                24.16      23.86      36.99    1.000     217.0       0.0
++1 (65,1,b)                                   24.88      24.47      37.63    1.030     210.7       0.0
+KBJSON {"tag":"ratio-1 compressor f16_matvec_batched 512x5120 b=3 COLD W (17 copies), graph inner=17","variant":"exact (64,1,b)","med_us":24.155,"p10_us":23.861,"p90_us":36.988,"ratio":1.0000,"gbps":217.05,"graph":1,"flush":0}
+KBJSON {"tag":"ratio-1 compressor f16_matvec_batched 512x5120 b=3 COLD W (17 copies), graph inner=17","variant":"+1 (65,1,b)","med_us":24.885,"p10_us":24.468,"p90_us":37.626,"ratio":1.0302,"gbps":210.69,"graph":1,"flush":0}
+CMP ratio-1 compressor f16_matvec_batched pad1 vs exact b=4: bytes-identical (diff=0 of 2048)
+
+== ratio-1 compressor f16_matvec_batched 512x5120 b=4 COLD W (17 copies), graph inner=17  (rounds=40 inner=17 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (64,1,b)                                38.84      29.71      42.69    1.000     135.0       0.0
++1 (65,1,b)                                   35.28      26.41      53.11    0.909     148.6       0.0
+KBJSON {"tag":"ratio-1 compressor f16_matvec_batched 512x5120 b=4 COLD W (17 copies), graph inner=17","variant":"exact (64,1,b)","med_us":38.836,"p10_us":29.711,"p90_us":42.694,"ratio":1.0000,"gbps":135.00,"graph":1,"flush":0}
+KBJSON {"tag":"ratio-1 compressor f16_matvec_batched 512x5120 b=4 COLD W (17 copies), graph inner=17","variant":"+1 (65,1,b)","med_us":35.285,"p10_us":26.410,"p90_us":53.109,"ratio":0.9086,"gbps":148.59,"graph":1,"flush":0}
+CMP ratio-1 compressor f16_matvec_batched pad1 vs exact b=5: bytes-identical (diff=0 of 2560)
+
+== ratio-1 compressor f16_matvec_batched 512x5120 b=5 COLD W (17 copies), graph inner=17  (rounds=40 inner=17 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (64,1,b)                                62.04      41.87      70.76    1.000      84.5       0.0
++1 (65,1,b)                                   64.41      42.77      73.66    1.038      81.4       0.0
+KBJSON {"tag":"ratio-1 compressor f16_matvec_batched 512x5120 b=5 COLD W (17 copies), graph inner=17","variant":"exact (64,1,b)","med_us":62.043,"p10_us":41.871,"p90_us":70.756,"ratio":1.0000,"gbps":84.50,"graph":1,"flush":0}
+KBJSON {"tag":"ratio-1 compressor f16_matvec_batched 512x5120 b=5 COLD W (17 copies), graph inner=17","variant":"+1 (65,1,b)","med_us":64.415,"p10_us":42.774,"p90_us":73.657,"ratio":1.0382,"gbps":81.39,"graph":1,"flush":0}
+CMP ratio-1 compressor f16_matvec_batched pad1 vs exact b=8: bytes-identical (diff=0 of 4096)
+
+== ratio-1 compressor f16_matvec_batched 512x5120 b=8 COLD W (17 copies), graph inner=17  (rounds=40 inner=17 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (64,1,b)                                54.09      50.57      69.92    1.000      96.9       0.0
++1 (65,1,b)                                   54.25      51.48      76.32    1.003      96.6       0.0
+KBJSON {"tag":"ratio-1 compressor f16_matvec_batched 512x5120 b=8 COLD W (17 copies), graph inner=17","variant":"exact (64,1,b)","med_us":54.087,"p10_us":50.570,"p90_us":69.918,"ratio":1.0000,"gbps":96.93,"graph":1,"flush":0}
+KBJSON {"tag":"ratio-1 compressor f16_matvec_batched 512x5120 b=8 COLD W (17 copies), graph inner=17","variant":"+1 (65,1,b)","med_us":54.254,"p10_us":51.478,"p90_us":76.316,"ratio":1.0031,"gbps":96.63,"graph":1,"flush":0}

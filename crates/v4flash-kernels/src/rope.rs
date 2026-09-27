@@ -62,6 +62,8 @@ pub struct RopeTail {
 }
 
 impl RopeTail {
+    pub fn module(&self) -> &Module { &self.module }
+
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
         let image: &[u8] = if arch.starts_with("gfx1201") {
             ROPE_TAIL_GFX1201
@@ -255,8 +257,12 @@ impl RopeTail {
         };
         let function = self.module.get_function("rope_tail_batched")?;
         let inverse_i: i32 = if inverse { 1 } else { 0 };
+        // `V41_GRID_PAD`: one idle head column (the kernel's `head >= n_head`
+        // guard, b idle WGs). The exact (64,1,32) q grid and the (32,1,64)
+        // replay idx-q grid dispatch 3.4x slower on gfx1201 (17 us vs 5.0 /
+        // 4.9). DO NOT REMOVE; see `crate::grid_pad`.
         let cfg = LaunchConfig {
-            grid: (n_head, 1, b),
+            grid: (n_head + crate::grid_pad(), 1, b),
             block: (n_rot / 2, 1, 1),
             shared_mem_bytes: 0,
         };

@@ -1,0 +1,27 @@
+== 1790470942.000349.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP indexer_fp4 pad1 vs exact b=16: bytes-identical (diff=0 of 65536)
+
+== indexer_fp4 b=16 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (32b)x128                               17.46      14.18      42.42    1.000       0.0       0.0
++1                                             6.01       4.59      16.90    0.344       0.0       0.0
+KBJSON {"tag":"indexer_fp4 b=16 warm, graph inner=10","variant":"exact (32b)x128","med_us":17.464,"p10_us":14.184,"p90_us":42.416,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"indexer_fp4 b=16 warm, graph inner=10","variant":"+1","med_us":6.008,"p10_us":4.592,"p90_us":16.904,"ratio":0.3440,"gbps":0.00,"graph":1,"flush":0}
+CMP indexer_fp4 pad1 vs exact b=64: bytes-identical (diff=0 of 262144)
+
+== indexer_fp4 b=64 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (32b)x128                               20.40      16.30      47.99    1.000       0.0       0.0
++1                                            12.44       7.75      24.58    0.610       0.0       0.0
+KBJSON {"tag":"indexer_fp4 b=64 warm, graph inner=10","variant":"exact (32b)x128","med_us":20.400,"p10_us":16.304,"p90_us":47.988,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"indexer_fp4 b=64 warm, graph inner=10","variant":"+1","med_us":12.436,"p10_us":7.748,"p90_us":24.576,"ratio":0.6096,"gbps":0.00,"graph":1,"flush":0}
+CMP indexer_fp4 pad1 vs exact b=512: bytes-identical (diff=0 of 2097152)
+
+== indexer_fp4 b=512 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (32b)x128                               72.08      63.13      86.59    1.000       0.0       0.0
++1                                            74.09      66.10      80.78    1.028       0.0       0.0
+KBJSON {"tag":"indexer_fp4 b=512 warm, graph inner=10","variant":"exact (32b)x128","med_us":72.080,"p10_us":63.132,"p90_us":86.589,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"indexer_fp4 b=512 warm, graph inner=10","variant":"+1","med_us":74.089,"p10_us":66.105,"p90_us":80.777,"ratio":1.0279,"gbps":0.00,"graph":1,"flush":0}

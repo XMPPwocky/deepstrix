@@ -1,0 +1,113 @@
+== 1790471302.000375.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP rope q (64,1,b) b=1 pad1 vs exact: bytes-identical (diff=0 of 32768)
+
+== rope q (64,1,b) b=1 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          3.70       3.64       4.01    1.000       0.0       0.0
++1 in x                                        3.74       3.65       4.00    1.010       0.0       0.0
+KBJSON {"tag":"rope q (64,1,b) b=1 warm, graph inner=10","variant":"exact","med_us":3.704,"p10_us":3.644,"p90_us":4.012,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rope q (64,1,b) b=1 warm, graph inner=10","variant":"+1 in x","med_us":3.740,"p10_us":3.652,"p90_us":4.000,"ratio":1.0097,"gbps":0.00,"graph":1,"flush":0}
+CMP rope idx-q (32,1,b) b=1 pad1 vs exact: bytes-identical (diff=0 of 4096)
+
+== rope idx-q (32,1,b) b=1 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          3.62       3.60       3.63    1.000       0.0       0.0
++1 in x                                        3.62       3.61       3.63    1.001       0.0       0.0
+KBJSON {"tag":"rope idx-q (32,1,b) b=1 warm, graph inner=10","variant":"exact","med_us":3.616,"p10_us":3.604,"p90_us":3.632,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rope idx-q (32,1,b) b=1 warm, graph inner=10","variant":"+1 in x","med_us":3.620,"p10_us":3.608,"p90_us":3.632,"ratio":1.0011,"gbps":0.00,"graph":1,"flush":0}
+CMP rope q (64,1,b) b=4 pad1 vs exact: bytes-identical (diff=0 of 131072)
+
+== rope q (64,1,b) b=4 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          3.72       3.71       3.74    1.000       0.0       0.0
++1 in x                                        3.72       3.71       3.74    1.000       0.0       0.0
+KBJSON {"tag":"rope q (64,1,b) b=4 warm, graph inner=10","variant":"exact","med_us":3.724,"p10_us":3.712,"p90_us":3.736,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rope q (64,1,b) b=4 warm, graph inner=10","variant":"+1 in x","med_us":3.724,"p10_us":3.712,"p90_us":3.744,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+CMP rope idx-q (32,1,b) b=4 pad1 vs exact: bytes-identical (diff=0 of 16384)
+
+== rope idx-q (32,1,b) b=4 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          3.65       3.64       3.67    1.000       0.0       0.0
++1 in x                                        3.65       3.64       3.66    1.000       0.0       0.0
+KBJSON {"tag":"rope idx-q (32,1,b) b=4 warm, graph inner=10","variant":"exact","med_us":3.652,"p10_us":3.640,"p90_us":3.672,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rope idx-q (32,1,b) b=4 warm, graph inner=10","variant":"+1 in x","med_us":3.652,"p10_us":3.640,"p90_us":3.664,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+CMP rope q (64,1,b) b=8 pad1 vs exact: bytes-identical (diff=0 of 262144)
+
+== rope q (64,1,b) b=8 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          3.91       3.90       3.93    1.000       0.0       0.0
++1 in x                                        3.91       3.90       3.93    1.001       0.0       0.0
+KBJSON {"tag":"rope q (64,1,b) b=8 warm, graph inner=10","variant":"exact","med_us":3.908,"p10_us":3.900,"p90_us":3.932,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rope q (64,1,b) b=8 warm, graph inner=10","variant":"+1 in x","med_us":3.912,"p10_us":3.900,"p90_us":3.932,"ratio":1.0010,"gbps":0.00,"graph":1,"flush":0}
+CMP rope idx-q (32,1,b) b=8 pad1 vs exact: bytes-identical (diff=0 of 32768)
+
+== rope idx-q (32,1,b) b=8 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          3.71       3.70       3.81    1.000       0.0       0.0
++1 in x                                        3.71       3.70       3.81    1.001       0.0       0.0
+KBJSON {"tag":"rope idx-q (32,1,b) b=8 warm, graph inner=10","variant":"exact","med_us":3.708,"p10_us":3.696,"p90_us":3.812,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rope idx-q (32,1,b) b=8 warm, graph inner=10","variant":"+1 in x","med_us":3.712,"p10_us":3.696,"p90_us":3.808,"ratio":1.0011,"gbps":0.00,"graph":1,"flush":0}
+CMP rope q (64,1,b) b=16 pad1 vs exact: bytes-identical (diff=0 of 524288)
+
+== rope q (64,1,b) b=16 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          4.76       4.71       9.32    1.000       0.0       0.0
++1 in x                                        4.75       4.72      16.64    0.998       0.0       0.0
+KBJSON {"tag":"rope q (64,1,b) b=16 warm, graph inner=10","variant":"exact","med_us":4.756,"p10_us":4.712,"p90_us":9.316,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rope q (64,1,b) b=16 warm, graph inner=10","variant":"+1 in x","med_us":4.748,"p10_us":4.724,"p90_us":16.644,"ratio":0.9983,"gbps":0.00,"graph":1,"flush":0}
+CMP rope idx-q (32,1,b) b=16 pad1 vs exact: bytes-identical (diff=0 of 65536)
+
+== rope idx-q (32,1,b) b=16 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          3.88       3.87       3.90    1.000       0.0       0.0
++1 in x                                        3.88       3.87       3.90    1.000       0.0       0.0
+KBJSON {"tag":"rope idx-q (32,1,b) b=16 warm, graph inner=10","variant":"exact","med_us":3.884,"p10_us":3.872,"p90_us":3.904,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rope idx-q (32,1,b) b=16 warm, graph inner=10","variant":"+1 in x","med_us":3.884,"p10_us":3.872,"p90_us":3.900,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+CMP rope q (64,1,b) b=32 pad1 vs exact: bytes-identical (diff=0 of 1048576)
+
+== rope q (64,1,b) b=32 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         17.05      17.02      17.07    1.000       0.0       0.0
++1 in x                                        4.98       4.95       5.00    0.292       0.0       0.0
+KBJSON {"tag":"rope q (64,1,b) b=32 warm, graph inner=10","variant":"exact","med_us":17.052,"p10_us":17.020,"p90_us":17.068,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rope q (64,1,b) b=32 warm, graph inner=10","variant":"+1 in x","med_us":4.980,"p10_us":4.952,"p90_us":5.004,"ratio":0.2920,"gbps":0.00,"graph":1,"flush":0}
+CMP rope idx-q (32,1,b) b=32 pad1 vs exact: bytes-identical (diff=0 of 131072)
+
+== rope idx-q (32,1,b) b=32 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          4.28       4.26       4.30    1.000       0.0       0.0
++1 in x                                        4.28       4.27       4.30    1.001       0.0       0.0
+KBJSON {"tag":"rope idx-q (32,1,b) b=32 warm, graph inner=10","variant":"exact","med_us":4.280,"p10_us":4.264,"p90_us":4.300,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rope idx-q (32,1,b) b=32 warm, graph inner=10","variant":"+1 in x","med_us":4.284,"p10_us":4.268,"p90_us":4.304,"ratio":1.0009,"gbps":0.00,"graph":1,"flush":0}
+CMP rope q (64,1,b) b=64 pad1 vs exact: bytes-identical (diff=0 of 2097152)
+
+== rope q (64,1,b) b=64 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                          6.51       6.49       6.54    1.000       0.0       0.0
++1 in x                                        6.57       6.55       6.60    1.009       0.0       0.0
+KBJSON {"tag":"rope q (64,1,b) b=64 warm, graph inner=10","variant":"exact","med_us":6.512,"p10_us":6.492,"p90_us":6.540,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rope q (64,1,b) b=64 warm, graph inner=10","variant":"+1 in x","med_us":6.568,"p10_us":6.548,"p90_us":6.600,"ratio":1.0086,"gbps":0.00,"graph":1,"flush":0}
+CMP rope idx-q (32,1,b) b=64 pad1 vs exact: bytes-identical (diff=0 of 262144)
+
+== rope idx-q (32,1,b) b=64 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         16.98      16.95      16.99    1.000       0.0       0.0
++1 in x                                        4.93       4.92       4.94    0.290       0.0       0.0
+KBJSON {"tag":"rope idx-q (32,1,b) b=64 warm, graph inner=10","variant":"exact","med_us":16.976,"p10_us":16.952,"p90_us":16.992,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rope idx-q (32,1,b) b=64 warm, graph inner=10","variant":"+1 in x","med_us":4.928,"p10_us":4.916,"p90_us":4.944,"ratio":0.2903,"gbps":0.00,"graph":1,"flush":0}
+
+== rope q (64,1,b) b=512 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         26.74      26.24      52.26    1.000       0.0       0.0
++1 in x                                       26.70      26.25      35.97    0.998       0.0       0.0
+KBJSON {"tag":"rope q (64,1,b) b=512 warm, graph inner=10","variant":"exact","med_us":26.744,"p10_us":26.240,"p90_us":52.256,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rope q (64,1,b) b=512 warm, graph inner=10","variant":"+1 in x","med_us":26.700,"p10_us":26.248,"p90_us":35.968,"ratio":0.9984,"gbps":0.00,"graph":1,"flush":0}
+
+== rope idx-q (32,1,b) b=512 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact                                         15.10      14.98      15.32    1.000       0.0       0.0
++1 in x                                       15.18      15.06      15.40    1.005       0.0       0.0
+KBJSON {"tag":"rope idx-q (32,1,b) b=512 warm, graph inner=10","variant":"exact","med_us":15.096,"p10_us":14.984,"p90_us":15.316,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"rope idx-q (32,1,b) b=512 warm, graph inner=10","variant":"+1 in x","med_us":15.176,"p10_us":15.064,"p90_us":15.396,"ratio":1.0053,"gbps":0.00,"graph":1,"flush":0}

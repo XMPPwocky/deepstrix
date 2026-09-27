@@ -1,0 +1,24 @@
+== 1790470943.000352.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+== kv_cache_append_batched b=128 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+b rows                                        54.10      43.32      76.73    1.000       0.0       0.0
+b+1 rows                                      14.34      13.00      46.04    0.265       0.0       0.0
+KBJSON {"tag":"kv_cache_append_batched b=128 warm, graph inner=10","variant":"b rows","med_us":54.095,"p10_us":43.323,"p90_us":76.734,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"kv_cache_append_batched b=128 warm, graph inner=10","variant":"b+1 rows","med_us":14.340,"p10_us":12.996,"p90_us":46.035,"ratio":0.2651,"gbps":0.00,"graph":1,"flush":0}
+
+== kv_cache_append_batched b=256 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+b rows                                        17.35      17.31      39.30    1.000       0.0       0.0
+b+1 rows                                       4.11       4.08      13.49    0.237       0.0       0.0
+KBJSON {"tag":"kv_cache_append_batched b=256 warm, graph inner=10","variant":"b rows","med_us":17.348,"p10_us":17.308,"p90_us":39.296,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"kv_cache_append_batched b=256 warm, graph inner=10","variant":"b+1 rows","med_us":4.112,"p10_us":4.084,"p90_us":13.492,"ratio":0.2370,"gbps":0.00,"graph":1,"flush":0}
+
+== kv_cache_append_batched b=512 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+b rows                                        18.06      18.02      68.02    1.000       0.0       0.0
+b+1 rows                                       4.81       4.77      29.91    0.266       0.0       0.0
+KBJSON {"tag":"kv_cache_append_batched b=512 warm, graph inner=10","variant":"b rows","med_us":18.064,"p10_us":18.016,"p90_us":68.020,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"kv_cache_append_batched b=512 warm, graph inner=10","variant":"b+1 rows","med_us":4.812,"p10_us":4.768,"p90_us":29.908,"ratio":0.2664,"gbps":0.00,"graph":1,"flush":0}

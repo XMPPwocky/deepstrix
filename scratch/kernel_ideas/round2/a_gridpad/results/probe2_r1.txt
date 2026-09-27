@@ -1,0 +1,245 @@
+== 1790470666.000342.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+
+== window block=32  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+G=1024                                         3.64       3.43       4.26    1.000       0.0       0.0
+G=1025                                         3.67       3.40       6.39    1.008       0.0       0.0
+G=1280                                         3.66       3.42       6.32    1.003       0.0       0.0
+G=1536                                         3.61       3.48       4.17    0.991       0.0       0.0
+G=1792                                         3.81       3.50       6.41    1.045       0.0       0.0
+G=1920                                         3.68       3.53       6.11    1.010       0.0       0.0
+G=2000                                         3.73       3.52       4.36    1.024       0.0       0.0
+G=2040                                        17.42      11.74      19.07    4.779       0.0       0.0
+G=2046                                        17.30      13.40      17.88    4.748       0.0       0.0
+G=2047                                        17.28      10.77      17.78    4.741       0.0       0.0
+G=2048                                        17.29      11.81      19.02    4.744       0.0       0.0
+G=2049                                         4.19       3.78       7.20    1.149       0.0       0.0
+G=2050                                         4.01       3.70       9.06    1.100       0.0       0.0
+G=2056                                         4.00       3.77       6.16    1.097       0.0       0.0
+G=2304                                         4.30       3.77      11.79    1.181       0.0       0.0
+G=2560                                         4.08       3.86       7.97    1.121       0.0       0.0
+G=3072                                         4.37       3.91       7.63    1.199       0.0       0.0
+G=3584                                         4.39       4.01      12.43    1.204       0.0       0.0
+G=4095                                         4.36       4.08       5.90    1.198       0.0       0.0
+G=4096                                         4.32       4.09       5.40    1.186       0.0       0.0
+G=4097                                         4.29       4.08       8.20    1.177       0.0       0.0
+KBJSON {"tag":"window block=32","variant":"G=1024","med_us":3.644,"p10_us":3.428,"p90_us":4.260,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=1025","med_us":3.672,"p10_us":3.396,"p90_us":6.392,"ratio":1.0077,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=1280","med_us":3.656,"p10_us":3.420,"p90_us":6.316,"ratio":1.0033,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=1536","med_us":3.612,"p10_us":3.484,"p90_us":4.168,"ratio":0.9912,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=1792","med_us":3.808,"p10_us":3.500,"p90_us":6.408,"ratio":1.0450,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=1920","med_us":3.680,"p10_us":3.532,"p90_us":6.112,"ratio":1.0099,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=2000","med_us":3.732,"p10_us":3.520,"p90_us":4.356,"ratio":1.0241,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=2040","med_us":17.416,"p10_us":11.740,"p90_us":19.068,"ratio":4.7794,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=2046","med_us":17.300,"p10_us":13.404,"p90_us":17.876,"ratio":4.7476,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=2047","med_us":17.276,"p10_us":10.772,"p90_us":17.776,"ratio":4.7410,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=2048","med_us":17.288,"p10_us":11.812,"p90_us":19.020,"ratio":4.7443,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=2049","med_us":4.188,"p10_us":3.776,"p90_us":7.196,"ratio":1.1493,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=2050","med_us":4.008,"p10_us":3.700,"p90_us":9.056,"ratio":1.0999,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=2056","med_us":3.996,"p10_us":3.768,"p90_us":6.156,"ratio":1.0966,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=2304","med_us":4.304,"p10_us":3.772,"p90_us":11.792,"ratio":1.1811,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=2560","med_us":4.084,"p10_us":3.856,"p90_us":7.968,"ratio":1.1208,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=3072","med_us":4.368,"p10_us":3.908,"p90_us":7.628,"ratio":1.1987,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=3584","med_us":4.388,"p10_us":4.008,"p90_us":12.428,"ratio":1.2042,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=4095","med_us":4.364,"p10_us":4.084,"p90_us":5.900,"ratio":1.1976,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=4096","med_us":4.320,"p10_us":4.088,"p90_us":5.400,"ratio":1.1855,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=32","variant":"G=4097","med_us":4.288,"p10_us":4.084,"p90_us":8.196,"ratio":1.1767,"gbps":0.00,"graph":1,"flush":0}
+
+== window block=64  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+G=512                                          3.86       3.48       9.83    1.000       0.0       0.0
+G=513                                          3.91       3.52       5.94    1.015       0.0       0.0
+G=768                                          3.89       3.52      12.63    1.008       0.0       0.0
+G=896                                          3.96       3.56      13.42    1.027       0.0       0.0
+G=1000                                         3.89       3.59       7.17    1.009       0.0       0.0
+G=1023                                        17.37      11.62      28.20    4.505       0.0       0.0
+G=1024                                        17.26      10.88      17.69    4.476       0.0       0.0
+G=1025                                         4.09       3.82      12.70    1.060       0.0       0.0
+G=1100                                         3.98       3.82       4.88    1.033       0.0       0.0
+G=1536                                         4.18       3.95       6.11    1.083       0.0       0.0
+G=2047                                        17.81      12.87      18.60    4.619       0.0       0.0
+G=2048                                        18.06      11.75      20.50    4.683       0.0       0.0
+G=2049                                         4.38       4.08       6.73    1.135       0.0       0.0
+G=3072                                        15.52      11.17      17.18    4.025       0.0       0.0
+G=4096                                        10.85       7.99      12.60    2.813       0.0       0.0
+G=4097                                         5.31       4.76       8.48    1.378       0.0       0.0
+G=6144                                         5.98       5.48      15.04    1.552       0.0       0.0
+G=8192                                         6.82       6.24      17.93    1.768       0.0       0.0
+KBJSON {"tag":"window block=64","variant":"G=512","med_us":3.856,"p10_us":3.484,"p90_us":9.828,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=513","med_us":3.912,"p10_us":3.524,"p90_us":5.940,"ratio":1.0145,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=768","med_us":3.888,"p10_us":3.520,"p90_us":12.628,"ratio":1.0083,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=896","med_us":3.960,"p10_us":3.560,"p90_us":13.416,"ratio":1.0270,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=1000","med_us":3.892,"p10_us":3.588,"p90_us":7.168,"ratio":1.0093,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=1023","med_us":17.372,"p10_us":11.624,"p90_us":28.196,"ratio":4.5052,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=1024","med_us":17.260,"p10_us":10.876,"p90_us":17.688,"ratio":4.4762,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=1025","med_us":4.088,"p10_us":3.820,"p90_us":12.704,"ratio":1.0602,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=1100","med_us":3.984,"p10_us":3.824,"p90_us":4.876,"ratio":1.0332,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=1536","med_us":4.176,"p10_us":3.952,"p90_us":6.112,"ratio":1.0830,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=2047","med_us":17.812,"p10_us":12.868,"p90_us":18.604,"ratio":4.6193,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=2048","med_us":18.056,"p10_us":11.748,"p90_us":20.496,"ratio":4.6826,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=2049","med_us":4.376,"p10_us":4.080,"p90_us":6.728,"ratio":1.1349,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=3072","med_us":15.520,"p10_us":11.172,"p90_us":17.176,"ratio":4.0249,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=4096","med_us":10.848,"p10_us":7.988,"p90_us":12.596,"ratio":2.8133,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=4097","med_us":5.312,"p10_us":4.764,"p90_us":8.480,"ratio":1.3776,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=6144","med_us":5.984,"p10_us":5.484,"p90_us":15.044,"ratio":1.5519,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=64","variant":"G=8192","med_us":6.816,"p10_us":6.244,"p90_us":17.928,"ratio":1.7677,"gbps":0.00,"graph":1,"flush":0}
+
+== window block=256  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+G=128                                         11.98       3.40      41.92    1.000       0.0       0.0
+G=129                                          5.46       3.38      44.02    0.456       0.0       0.0
+G=160                                         12.38       3.39      46.89    1.033       0.0       0.0
+G=192                                         12.54       3.43      40.70    1.046       0.0       0.0
+G=224                                          8.83       3.46      41.29    0.737       0.0       0.0
+G=240                                          9.28       3.49      40.49    0.775       0.0       0.0
+G=250                                          4.78       3.47      26.62    0.399       0.0       0.0
+G=255                                         42.31      16.53      47.72    3.531       0.0       0.0
+G=256                                         42.49      16.56      62.41    3.545       0.0       0.0
+G=257                                          8.00       3.72      41.16    0.668       0.0       0.0
+G=320                                         13.14       3.80      42.45    1.096       0.0       0.0
+G=384                                         13.38       3.83      42.02    1.116       0.0       0.0
+G=448                                         11.06       3.87      42.02    0.923       0.0       0.0
+G=500                                         14.20       3.89      48.53    1.185       0.0       0.0
+G=511                                         38.31      17.21      77.75    3.197       0.0       0.0
+G=512                                         23.32      17.19      67.30    1.946       0.0       0.0
+G=513                                          4.64       4.06      41.86    0.388       0.0       0.0
+G=640                                         14.52       4.18      42.30    1.211       0.0       0.0
+G=768                                         19.60      17.57      74.17    1.636       0.0       0.0
+G=1000                                         6.97       4.53      20.25    0.581       0.0       0.0
+G=1023                                        21.05      16.08      46.82    1.756       0.0       0.0
+G=1024                                        19.20      16.69      40.81    1.602       0.0       0.0
+G=1025                                         6.82       4.73      39.40    0.569       0.0       0.0
+G=1280                                        26.44      13.32      67.11    2.206       0.0       0.0
+G=1536                                        25.34      10.87      67.87    2.114       0.0       0.0
+G=2048                                        15.13       6.08      50.87    1.263       0.0       0.0
+KBJSON {"tag":"window block=256","variant":"G=128","med_us":11.984,"p10_us":3.396,"p90_us":41.916,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=129","med_us":5.464,"p10_us":3.384,"p90_us":44.024,"ratio":0.4559,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=160","med_us":12.376,"p10_us":3.392,"p90_us":46.892,"ratio":1.0327,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=192","med_us":12.536,"p10_us":3.432,"p90_us":40.700,"ratio":1.0461,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=224","med_us":8.832,"p10_us":3.456,"p90_us":41.288,"ratio":0.7370,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=240","med_us":9.284,"p10_us":3.488,"p90_us":40.492,"ratio":0.7747,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=250","med_us":4.780,"p10_us":3.472,"p90_us":26.624,"ratio":0.3989,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=255","med_us":42.312,"p10_us":16.532,"p90_us":47.724,"ratio":3.5307,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=256","med_us":42.488,"p10_us":16.560,"p90_us":62.408,"ratio":3.5454,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=257","med_us":8.000,"p10_us":3.720,"p90_us":41.156,"ratio":0.6676,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=320","med_us":13.136,"p10_us":3.796,"p90_us":42.452,"ratio":1.0961,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=384","med_us":13.376,"p10_us":3.832,"p90_us":42.016,"ratio":1.1161,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=448","med_us":11.064,"p10_us":3.872,"p90_us":42.024,"ratio":0.9232,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=500","med_us":14.200,"p10_us":3.892,"p90_us":48.532,"ratio":1.1849,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=511","med_us":38.308,"p10_us":17.212,"p90_us":77.749,"ratio":3.1966,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=512","med_us":23.316,"p10_us":17.192,"p90_us":67.296,"ratio":1.9456,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=513","med_us":4.644,"p10_us":4.056,"p90_us":41.856,"ratio":0.3875,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=640","med_us":14.516,"p10_us":4.180,"p90_us":42.304,"ratio":1.2113,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=768","med_us":19.600,"p10_us":17.572,"p90_us":74.168,"ratio":1.6355,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=1000","med_us":6.968,"p10_us":4.528,"p90_us":20.252,"ratio":0.5814,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=1023","med_us":21.048,"p10_us":16.080,"p90_us":46.820,"ratio":1.7563,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=1024","med_us":19.204,"p10_us":16.688,"p90_us":40.808,"ratio":1.6025,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=1025","med_us":6.824,"p10_us":4.732,"p90_us":39.396,"ratio":0.5694,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=1280","med_us":26.440,"p10_us":13.316,"p90_us":67.112,"ratio":2.2063,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=1536","med_us":25.340,"p10_us":10.872,"p90_us":67.868,"ratio":2.1145,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=256","variant":"G=2048","med_us":15.132,"p10_us":6.084,"p90_us":50.872,"ratio":1.2627,"gbps":0.00,"graph":1,"flush":0}
+
+== window block=512  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+G=64                                          12.98       3.37      46.51    1.000       0.0       0.0
+G=100                                         11.30       3.40      40.46    0.871       0.0       0.0
+G=127                                         44.12      16.50      70.48    3.399       0.0       0.0
+G=128                                         43.31      16.50      70.23    3.337       0.0       0.0
+G=129                                         12.91       3.72      48.10    0.995       0.0       0.0
+G=192                                         14.76       3.76      41.30    1.137       0.0       0.0
+G=255                                         36.97      17.16      68.62    2.848       0.0       0.0
+G=256                                         40.06      17.17      76.12    3.087       0.0       0.0
+G=257                                         15.95       4.06      41.54    1.229       0.0       0.0
+G=384                                         33.76      17.60      76.86    2.601       0.0       0.0
+G=512                                         32.08      17.93      69.59    2.471       0.0       0.0
+G=513                                         16.98       4.75      44.65    1.308       0.0       0.0
+G=768                                         29.91      16.06      70.52    2.304       0.0       0.0
+G=1024                                        24.58       8.74      51.42    1.894       0.0       0.0
+G=1025                                        21.82       7.52      53.87    1.681       0.0       0.0
+KBJSON {"tag":"window block=512","variant":"G=64","med_us":12.980,"p10_us":3.372,"p90_us":46.512,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=512","variant":"G=100","med_us":11.300,"p10_us":3.404,"p90_us":40.460,"ratio":0.8706,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=512","variant":"G=127","med_us":44.120,"p10_us":16.504,"p90_us":70.485,"ratio":3.3991,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=512","variant":"G=128","med_us":43.308,"p10_us":16.496,"p90_us":70.232,"ratio":3.3365,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=512","variant":"G=129","med_us":12.912,"p10_us":3.720,"p90_us":48.104,"ratio":0.9948,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=512","variant":"G=192","med_us":14.764,"p10_us":3.760,"p90_us":41.296,"ratio":1.1374,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=512","variant":"G=255","med_us":36.972,"p10_us":17.164,"p90_us":68.620,"ratio":2.8484,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=512","variant":"G=256","med_us":40.064,"p10_us":17.172,"p90_us":76.124,"ratio":3.0866,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=512","variant":"G=257","med_us":15.948,"p10_us":4.064,"p90_us":41.544,"ratio":1.2287,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=512","variant":"G=384","med_us":33.756,"p10_us":17.600,"p90_us":76.856,"ratio":2.6006,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=512","variant":"G=512","med_us":32.080,"p10_us":17.928,"p90_us":69.592,"ratio":2.4715,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=512","variant":"G=513","med_us":16.976,"p10_us":4.748,"p90_us":44.652,"ratio":1.3079,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=512","variant":"G=768","med_us":29.912,"p10_us":16.060,"p90_us":70.525,"ratio":2.3045,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=512","variant":"G=1024","med_us":24.584,"p10_us":8.744,"p90_us":51.416,"ratio":1.8940,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"window block=512","variant":"G=1025","med_us":21.824,"p10_us":7.520,"p90_us":53.872,"ratio":1.6814,"gbps":0.00,"graph":1,"flush":0}
+
+== spin G=2048 block=32 iters=0  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+G=2048+0                                      16.96       8.79      33.91    1.000       0.0       0.0
+G=2048+1                                       3.86       3.63      48.15    0.227       0.0       0.0
+KBJSON {"tag":"spin G=2048 block=32 iters=0","variant":"G=2048+0","med_us":16.956,"p10_us":8.792,"p90_us":33.908,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"spin G=2048 block=32 iters=0","variant":"G=2048+1","med_us":3.856,"p10_us":3.632,"p90_us":48.152,"ratio":0.2274,"gbps":0.00,"graph":1,"flush":0}
+
+== spin G=2048 block=32 iters=64  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+G=2048+0                                      16.81      12.53      24.64    1.000       0.0       0.0
+G=2048+1                                       5.70       4.87      18.38    0.339       0.0       0.0
+KBJSON {"tag":"spin G=2048 block=32 iters=64","variant":"G=2048+0","med_us":16.812,"p10_us":12.528,"p90_us":24.636,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"spin G=2048 block=32 iters=64","variant":"G=2048+1","med_us":5.704,"p10_us":4.872,"p90_us":18.376,"ratio":0.3393,"gbps":0.00,"graph":1,"flush":0}
+
+== spin G=2048 block=32 iters=256  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+G=2048+0                                      17.43      16.79      40.61    1.000       0.0       0.0
+G=2048+1                                       9.83       9.18      32.17    0.564       0.0       0.0
+KBJSON {"tag":"spin G=2048 block=32 iters=256","variant":"G=2048+0","med_us":17.428,"p10_us":16.792,"p90_us":40.608,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"spin G=2048 block=32 iters=256","variant":"G=2048+1","med_us":9.832,"p10_us":9.184,"p90_us":32.168,"ratio":0.5642,"gbps":0.00,"graph":1,"flush":0}
+
+== spin G=2048 block=32 iters=1024  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+G=2048+0                                      29.10      26.60      40.49    1.000       0.0       0.0
+G=2048+1                                      28.24      26.39      34.77    0.970       0.0       0.0
+KBJSON {"tag":"spin G=2048 block=32 iters=1024","variant":"G=2048+0","med_us":29.104,"p10_us":26.596,"p90_us":40.488,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"spin G=2048 block=32 iters=1024","variant":"G=2048+1","med_us":28.244,"p10_us":26.388,"p90_us":34.768,"ratio":0.9705,"gbps":0.00,"graph":1,"flush":0}
+
+== spin G=2048 block=32 iters=4096  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+G=2048+0                                      99.20      92.85     105.22    1.000       0.0       0.0
+G=2048+1                                      97.60      93.41     103.79    0.984       0.0       0.0
+KBJSON {"tag":"spin G=2048 block=32 iters=4096","variant":"G=2048+0","med_us":99.205,"p10_us":92.849,"p90_us":105.221,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"spin G=2048 block=32 iters=4096","variant":"G=2048+1","med_us":97.605,"p10_us":93.409,"p90_us":103.793,"ratio":0.9839,"gbps":0.00,"graph":1,"flush":0}
+
+== spin G=1024 block=256 iters=0  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+G=1024+0                                      16.55      11.33      30.54    1.000       0.0       0.0
+G=1024+1                                       5.84       4.76      16.72    0.353       0.0       0.0
+KBJSON {"tag":"spin G=1024 block=256 iters=0","variant":"G=1024+0","med_us":16.552,"p10_us":11.328,"p90_us":30.540,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"spin G=1024 block=256 iters=0","variant":"G=1024+1","med_us":5.836,"p10_us":4.764,"p90_us":16.720,"ratio":0.3526,"gbps":0.00,"graph":1,"flush":0}
+
+== spin G=1024 block=256 iters=64  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+G=1024+0                                      10.75       8.44      27.81    1.000       0.0       0.0
+G=1024+1                                       9.24       8.38      20.93    0.860       0.0       0.0
+KBJSON {"tag":"spin G=1024 block=256 iters=64","variant":"G=1024+0","med_us":10.748,"p10_us":8.436,"p90_us":27.808,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"spin G=1024 block=256 iters=64","variant":"G=1024+1","med_us":9.244,"p10_us":8.384,"p90_us":20.932,"ratio":0.8601,"gbps":0.00,"graph":1,"flush":0}
+
+== spin G=1024 block=256 iters=256  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+G=1024+0                                      24.62      22.58      42.01    1.000       0.0       0.0
+G=1024+1                                      24.29      22.62      41.27    0.987       0.0       0.0
+KBJSON {"tag":"spin G=1024 block=256 iters=256","variant":"G=1024+0","med_us":24.620,"p10_us":22.584,"p90_us":42.012,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"spin G=1024 block=256 iters=256","variant":"G=1024+1","med_us":24.292,"p10_us":22.624,"p90_us":41.272,"ratio":0.9867,"gbps":0.00,"graph":1,"flush":0}
+
+== spin G=1024 block=256 iters=1024  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+G=1024+0                                      90.50      85.50      96.06    1.000       0.0       0.0
+G=1024+1                                      89.82      85.21      95.33    0.993       0.0       0.0
+KBJSON {"tag":"spin G=1024 block=256 iters=1024","variant":"G=1024+0","med_us":90.497,"p10_us":85.505,"p90_us":96.061,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"spin G=1024 block=256 iters=1024","variant":"G=1024+1","med_us":89.825,"p10_us":85.208,"p90_us":95.333,"ratio":0.9926,"gbps":0.00,"graph":1,"flush":0}
+
+== spin G=1024 block=256 iters=4096  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+G=1024+0                                     319.09     307.04     321.84    1.000       0.0       0.0
+G=1024+1                                     319.15     307.31     322.03    1.000       0.0       0.0
+KBJSON {"tag":"spin G=1024 block=256 iters=4096","variant":"G=1024+0","med_us":319.094,"p10_us":307.038,"p90_us":321.838,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"spin G=1024 block=256 iters=4096","variant":"G=1024+1","med_us":319.154,"p10_us":307.306,"p90_us":322.034,"ratio":1.0002,"gbps":0.00,"graph":1,"flush":0}

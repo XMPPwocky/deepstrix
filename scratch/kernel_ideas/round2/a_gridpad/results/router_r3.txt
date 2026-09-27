@@ -1,0 +1,27 @@
+== 1790471112.000365.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP router f16_matvec_batched_h20 pad1 vs exact b=16: bytes-identical (diff=0 of 6144)
+
+== router f16_matvec_batched_h20 384x5120 b=16 COLD W (22 copies), graph inner=22  (rounds=40 inner=22 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (48,1,b)                                36.06      27.56      41.61    1.000     109.1       0.0
++1 (49,1,b)                                   36.22      27.76      43.49    1.004     108.6       0.0
+KBJSON {"tag":"router f16_matvec_batched_h20 384x5120 b=16 COLD W (22 copies), graph inner=22","variant":"exact (48,1,b)","med_us":36.057,"p10_us":27.557,"p90_us":41.613,"ratio":1.0000,"gbps":109.05,"graph":1,"flush":0}
+KBJSON {"tag":"router f16_matvec_batched_h20 384x5120 b=16 COLD W (22 copies), graph inner=22","variant":"+1 (49,1,b)","med_us":36.218,"p10_us":27.760,"p90_us":43.491,"ratio":1.0045,"gbps":108.57,"graph":1,"flush":0}
+CMP router f16_matvec_batched_h20 pad1 vs exact b=32: bytes-identical (diff=0 of 12288)
+
+== router f16_matvec_batched_h20 384x5120 b=32 COLD W (22 copies), graph inner=22  (rounds=40 inner=22 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (48,1,b)                                58.29      49.23      65.54    1.000      67.5       0.0
++1 (49,1,b)                                   58.59      49.31      63.86    1.005      67.1       0.0
+KBJSON {"tag":"router f16_matvec_batched_h20 384x5120 b=32 COLD W (22 copies), graph inner=22","variant":"exact (48,1,b)","med_us":58.293,"p10_us":49.226,"p90_us":65.535,"ratio":1.0000,"gbps":67.45,"graph":1,"flush":0}
+KBJSON {"tag":"router f16_matvec_batched_h20 384x5120 b=32 COLD W (22 copies), graph inner=22","variant":"+1 (49,1,b)","med_us":58.588,"p10_us":49.315,"p90_us":63.859,"ratio":1.0051,"gbps":67.12,"graph":1,"flush":0}
+CMP router f16_matvec_batched_h20 pad1 vs exact b=64: bytes-identical (diff=0 of 24576)
+
+== router f16_matvec_batched_h20 384x5120 b=64 COLD W (22 copies), graph inner=22  (rounds=40 inner=22 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (48,1,b)                               111.24      95.66     116.46    1.000      35.3       0.0
++1 (49,1,b)                                  110.92      95.85     115.31    0.997      35.5       0.0
+KBJSON {"tag":"router f16_matvec_batched_h20 384x5120 b=64 COLD W (22 copies), graph inner=22","variant":"exact (48,1,b)","med_us":111.237,"p10_us":95.655,"p90_us":116.459,"ratio":1.0000,"gbps":35.35,"graph":1,"flush":0}
+KBJSON {"tag":"router f16_matvec_batched_h20 384x5120 b=64 COLD W (22 copies), graph inner=22","variant":"+1 (49,1,b)","med_us":110.919,"p10_us":95.852,"p90_us":115.310,"ratio":0.9971,"gbps":35.45,"graph":1,"flush":0}

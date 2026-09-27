@@ -1,0 +1,59 @@
+== 1790471302.000381.round2.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+CMP fp8_act_quant_inplace pad1 vs exact b=1: bytes-identical (diff=0 of 512)
+
+== fp8_act_quant_inplace b=1 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (b)x512                                  4.37       4.32       4.44    1.000       0.0       0.0
++1 (b+1)x512                                   4.36       4.32       4.45    0.997       0.0       0.0
+KBJSON {"tag":"fp8_act_quant_inplace b=1 warm, graph inner=10","variant":"exact (b)x512","med_us":4.368,"p10_us":4.324,"p90_us":4.440,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"fp8_act_quant_inplace b=1 warm, graph inner=10","variant":"+1 (b+1)x512","med_us":4.356,"p10_us":4.324,"p90_us":4.452,"ratio":0.9972,"gbps":0.00,"graph":1,"flush":0}
+CMP fp8_act_quant_inplace pad1 vs exact b=4: bytes-identical (diff=0 of 2048)
+
+== fp8_act_quant_inplace b=4 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (b)x512                                  4.33       4.30       4.35    1.000       0.0       0.0
++1 (b+1)x512                                   4.32       4.30       4.35    0.998       0.0       0.0
+KBJSON {"tag":"fp8_act_quant_inplace b=4 warm, graph inner=10","variant":"exact (b)x512","med_us":4.328,"p10_us":4.296,"p90_us":4.348,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"fp8_act_quant_inplace b=4 warm, graph inner=10","variant":"+1 (b+1)x512","med_us":4.320,"p10_us":4.300,"p90_us":4.352,"ratio":0.9982,"gbps":0.00,"graph":1,"flush":0}
+CMP fp8_act_quant_inplace pad1 vs exact b=8: bytes-identical (diff=0 of 4096)
+
+== fp8_act_quant_inplace b=8 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (b)x512                                  4.42       4.31      12.71    1.000       0.0       0.0
++1 (b+1)x512                                   4.42       4.31      36.19    1.000       0.0       0.0
+KBJSON {"tag":"fp8_act_quant_inplace b=8 warm, graph inner=10","variant":"exact (b)x512","med_us":4.416,"p10_us":4.308,"p90_us":12.708,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"fp8_act_quant_inplace b=8 warm, graph inner=10","variant":"+1 (b+1)x512","med_us":4.416,"p10_us":4.308,"p90_us":36.192,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+CMP fp8_act_quant_inplace pad1 vs exact b=64: bytes-identical (diff=0 of 32768)
+
+== fp8_act_quant_inplace b=64 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (b)x512                                  4.39       4.36       4.42    1.000       0.0       0.0
++1 (b+1)x512                                   4.39       4.36       4.42    0.999       0.0       0.0
+KBJSON {"tag":"fp8_act_quant_inplace b=64 warm, graph inner=10","variant":"exact (b)x512","med_us":4.392,"p10_us":4.360,"p90_us":4.420,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"fp8_act_quant_inplace b=64 warm, graph inner=10","variant":"+1 (b+1)x512","med_us":4.388,"p10_us":4.356,"p90_us":4.424,"ratio":0.9991,"gbps":0.00,"graph":1,"flush":0}
+CMP fp8_act_quant_inplace pad1 vs exact b=128: bytes-identical (diff=0 of 65536)
+
+== fp8_act_quant_inplace b=128 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (b)x512                                 16.55      16.52      16.58    1.000       0.0       0.0
++1 (b+1)x512                                   4.68       4.66       4.69    0.283       0.0       0.0
+KBJSON {"tag":"fp8_act_quant_inplace b=128 warm, graph inner=10","variant":"exact (b)x512","med_us":16.552,"p10_us":16.524,"p90_us":16.580,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"fp8_act_quant_inplace b=128 warm, graph inner=10","variant":"+1 (b+1)x512","med_us":4.676,"p10_us":4.660,"p90_us":4.692,"ratio":0.2825,"gbps":0.00,"graph":1,"flush":0}
+CMP fp8_act_quant_inplace pad1 vs exact b=256: bytes-identical (diff=0 of 131072)
+
+== fp8_act_quant_inplace b=256 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (b)x512                                 18.64      18.61      18.67    1.000       0.0       0.0
++1 (b+1)x512                                   6.27       6.24       6.29    0.336       0.0       0.0
+KBJSON {"tag":"fp8_act_quant_inplace b=256 warm, graph inner=10","variant":"exact (b)x512","med_us":18.636,"p10_us":18.608,"p90_us":18.672,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"fp8_act_quant_inplace b=256 warm, graph inner=10","variant":"+1 (b+1)x512","med_us":6.268,"p10_us":6.240,"p90_us":6.292,"ratio":0.3363,"gbps":0.00,"graph":1,"flush":0}
+CMP fp8_act_quant_inplace pad1 vs exact b=512: bytes-identical (diff=0 of 262144)
+
+== fp8_act_quant_inplace b=512 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact (b)x512                                 22.34      21.60      24.62    1.000       0.0       0.0
++1 (b+1)x512                                   9.25       9.08      17.54    0.414       0.0       0.0
+KBJSON {"tag":"fp8_act_quant_inplace b=512 warm, graph inner=10","variant":"exact (b)x512","med_us":22.344,"p10_us":21.600,"p90_us":24.620,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"fp8_act_quant_inplace b=512 warm, graph inner=10","variant":"+1 (b+1)x512","med_us":9.248,"p10_us":9.080,"p90_us":17.544,"ratio":0.4139,"gbps":0.00,"graph":1,"flush":0}

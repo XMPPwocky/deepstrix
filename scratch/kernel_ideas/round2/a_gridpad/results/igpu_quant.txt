@@ -1,0 +1,43 @@
+== 1790471342.000385.round2.igpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+[kb] device 0 = AMD Radeon 8060S Graphics (gfx1151), 20 CUs, 2900 MHz
+CMP quantize xq pad1 vs exact b=1: bytes-identical (diff=0 of 32768)
+
+== q8_0_quantize_f32 K=32768 b=1 blocks=1024 gfx1151 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact grid=blocks                              5.22       4.92       6.86    1.000       0.0       0.0
++1                                             5.22       4.93       9.42    1.002       0.0       0.0
+KBJSON {"tag":"q8_0_quantize_f32 K=32768 b=1 blocks=1024 gfx1151 warm, graph inner=10","variant":"exact grid=blocks","med_us":5.216,"p10_us":4.924,"p90_us":6.856,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"q8_0_quantize_f32 K=32768 b=1 blocks=1024 gfx1151 warm, graph inner=10","variant":"+1","med_us":5.224,"p10_us":4.932,"p90_us":9.420,"ratio":1.0015,"gbps":0.00,"graph":1,"flush":0}
+CMP quantize xq pad1 vs exact b=2: bytes-identical (diff=0 of 65536)
+
+== q8_0_quantize_f32 K=32768 b=2 blocks=2048 gfx1151 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact grid=blocks                              8.61       8.02      15.30    1.000       0.0       0.0
++1                                             8.56       8.05      17.50    0.995       0.0       0.0
+KBJSON {"tag":"q8_0_quantize_f32 K=32768 b=2 blocks=2048 gfx1151 warm, graph inner=10","variant":"exact grid=blocks","med_us":8.608,"p10_us":8.016,"p90_us":15.296,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"q8_0_quantize_f32 K=32768 b=2 blocks=2048 gfx1151 warm, graph inner=10","variant":"+1","med_us":8.564,"p10_us":8.052,"p90_us":17.503,"ratio":0.9949,"gbps":0.00,"graph":1,"flush":0}
+CMP quantize xq pad1 vs exact b=3: bytes-identical (diff=0 of 98304)
+
+== q8_0_quantize_f32 K=32768 b=3 blocks=3072 gfx1151 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact grid=blocks                             11.14      10.34      17.93    1.000       0.0       0.0
++1                                            11.30      10.34      19.21    1.015       0.0       0.0
+KBJSON {"tag":"q8_0_quantize_f32 K=32768 b=3 blocks=3072 gfx1151 warm, graph inner=10","variant":"exact grid=blocks","med_us":11.140,"p10_us":10.336,"p90_us":17.932,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"q8_0_quantize_f32 K=32768 b=3 blocks=3072 gfx1151 warm, graph inner=10","variant":"+1","med_us":11.304,"p10_us":10.340,"p90_us":19.211,"ratio":1.0147,"gbps":0.00,"graph":1,"flush":0}
+CMP quantize xq pad1 vs exact b=4: bytes-identical (diff=0 of 131072)
+
+== q8_0_quantize_f32 K=32768 b=4 blocks=4096 gfx1151 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact grid=blocks                             13.22      12.40      22.21    1.000       0.0       0.0
++1                                            13.16      12.44      26.51    0.996       0.0       0.0
+KBJSON {"tag":"q8_0_quantize_f32 K=32768 b=4 blocks=4096 gfx1151 warm, graph inner=10","variant":"exact grid=blocks","med_us":13.216,"p10_us":12.396,"p90_us":22.211,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"q8_0_quantize_f32 K=32768 b=4 blocks=4096 gfx1151 warm, graph inner=10","variant":"+1","med_us":13.164,"p10_us":12.440,"p90_us":26.511,"ratio":0.9961,"gbps":0.00,"graph":1,"flush":0}
+CMP quantize xq pad1 vs exact b=8: bytes-identical (diff=0 of 262144)
+
+== q8_0_quantize_f32 K=32768 b=8 blocks=8192 gfx1151 warm, graph inner=10  (rounds=40 inner=10 graph=1 flush=0)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+exact grid=blocks                             23.36      20.36      53.81    1.000       0.0       0.0
++1                                            26.03      20.58     440.60    1.114       0.0       0.0
+KBJSON {"tag":"q8_0_quantize_f32 K=32768 b=8 blocks=8192 gfx1151 warm, graph inner=10","variant":"exact grid=blocks","med_us":23.363,"p10_us":20.355,"p90_us":53.814,"ratio":1.0000,"gbps":0.00,"graph":1,"flush":0}
+KBJSON {"tag":"q8_0_quantize_f32 K=32768 b=8 blocks=8192 gfx1151 warm, graph inner=10","variant":"+1","med_us":26.031,"p10_us":20.579,"p90_us":440.598,"ratio":1.1142,"gbps":0.00,"graph":1,"flush":0}

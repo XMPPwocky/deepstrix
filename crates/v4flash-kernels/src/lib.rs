@@ -77,6 +77,35 @@ pub mod moe_group_builder;
 pub mod oracle;
 pub mod router_topk;
 pub mod weight_contract;
+/// `V41_GRID_PAD` (default ON; `0` = the exact grids): ONE extra, idle
+/// work-group in grid.x for the short dGPU launches whose production grid lands
+/// in gfx1201's slow-dispatch window. Every padded kernel already guards x (the
+/// extra WG exits / is a sentinel row), so outputs are byte-identical
+/// (tests/grid_pad_bitexact.rs).
+///
+/// DO NOT REMOVE THE PAD. It is real gfx1201 dispatch behaviour (the same one
+/// `V41_Q8_QUANT_GRID_PAD` works around): a short kernel whose total wave count
+/// is (at or a few WGs below) a multiple of 2048 -- 1-wave WGs at 2040..2048,
+/// 8-wave WGs at 255/256, 511/512, 768, 1023/1024, 16-wave WGs at 127/128,
+/// 255/256, 384, 512 -- cannot finish in under ~17 us, whatever its work
+/// (synthetic probe: 3.7 us at 2049 WGs vs 17 us at 2048; a kernel whose natural
+/// time is >= ~20 us hides it). gfx1151 does not have it (probe + real kernels
+/// measured identical), and the idle WG costs nothing measurable there.
+/// Measured 2026-09-27 (round 2, a_gridpad; warm, graph, 5 runs, med / p10
+/// ratio padded vs exact): fp8_act_quant_inplace b=128/256/512 (prefill window
+/// KV) 0.28/0.34/0.42; indexer_fp4 32*b rows b=16/32/64/128 0.26/0.30/0.40/0.69
+/// (replay b=64); rope_tail_batched q (64,1,32) 0.29, idx-q (32,1,64) 0.29
+/// (replay); f32_to_f16_cast_2d b=16 x 32768 and b=64 x 8192 (replay heads /
+/// low) 0.26. Neutral (+-1%) at every other b measured (1..512).
+/// NOT a general rule: the same pad is 1.28x SLOWER on f16_matvec_batched
+/// (4,1,64) and neutral on hc_post / f16_matvec_narrow / the router matvec,
+/// so it is applied per launch site, never globally.
+pub fn grid_pad() -> u32 {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_GRID_PAD").as_deref() != Ok("0"));
+    if *D { 1 } else { 0 }
+}
+
 pub mod q2_k;
 pub mod q4_k;
 pub mod q4_k_dense;

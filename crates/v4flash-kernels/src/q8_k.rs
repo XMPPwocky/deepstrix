@@ -16,6 +16,8 @@ pub struct Q8KQuantize {
 }
 
 impl Q8KQuantize {
+    pub fn module(&self) -> &Module { &self.module }
+
     pub fn for_arch(arch: &str) -> eyre::Result<Self> {
         let image: &[u8] = if arch.starts_with("gfx1201") {
             Q8_K_QUANTIZE_GFX1201
@@ -123,7 +125,15 @@ impl Q8KQuantize {
         if rows == 0 { return Ok(()); }
         let function = self.module.get_function("f32_to_f16_cast_2d")?;
         let threads = (rows as usize) * (cols as usize / 8);
-        let cfg = LaunchConfig { grid: (threads.div_ceil(256) as u32, 1, 1), block: (256, 1, 1), shared_mem_bytes: 0 };
+        // `V41_GRID_PAD`: one idle WG (the kernel's `r >= rows` guard). The
+        // exact 256-WG grids of the replay casts (16 x 32768 heads, 64 x 8192
+        // low) dispatch 3.8x slower on gfx1201 (16.5 us vs 4.4). DO NOT REMOVE;
+        // see `crate::grid_pad`.
+        let cfg = LaunchConfig {
+            grid: (threads.div_ceil(256) as u32 + crate::grid_pad(), 1, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         launch_kernel!(function, cfg, stream, [out.raw(), x.raw(), rows, cols, out_pitch])
     }
 }

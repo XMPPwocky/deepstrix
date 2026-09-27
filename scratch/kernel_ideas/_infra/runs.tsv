@@ -490,3 +490,51 @@
 2026-09-26T23:53:45Z	E_indexer/intree_igpu	igpu	300MB	rc=0	3.0s	busy_before=10	busy_after=36	bash intree/run_tests.sh igpu  
 2026-09-27T00:06:42Z	B_moe_prefill/intree	igpu	600MB	rc=0	11.9s	busy_before=63	busy_after=59	bash intree/run_tests.sh  
 2026-09-27T00:20:49Z	C2_dense_prefill/intree	dgpu	120MB	rc=0	10.5s	busy_before=56	busy_after=48	bash intree/run_tests.sh  
+2026-09-27T00:55:34Z	round2/a_probe_igpu	igpu	80MB	rc=0	5.0s	busy_before=51	busy_after=94	./probe_harness_gfx1151 probe_gfx1151.hsaco rw  
+2026-09-27T00:55:35Z	round2/a_probe	dgpu	80MB	rc=0	6.4s	busy_before=58	busy_after=98	./probe_harness_gfx1201 probe_gfx1201.hsaco rw 3d  
+2026-09-27T00:57:49Z	round2/a_probe2_r1	dgpu	80MB	rc=0	2.4s	busy_before=78	busy_after=95	./probe2_gfx1201 probe_gfx1201.hsaco  
+2026-09-27T00:57:52Z	round2/a_probe2_r2	dgpu	80MB	rc=0	2.8s	busy_before=75	busy_after=89	./probe2_gfx1201 probe_gfx1201.hsaco  
+2026-09-27T01:02:25Z	round2/a_gather_r1	dgpu	125MB	rc=0	1.9s	busy_before=78	busy_after=96	./gpad_real gather  
+2026-09-27T01:02:27Z	round2/a_idxq_r1	dgpu	125MB	rc=0	1.9s	busy_before=89	busy_after=84	./gpad_real idxq  
+2026-09-27T01:02:29Z	round2/a_comp1_r1	dgpu	125MB	rc=0	1.9s	busy_before=90	busy_after=91	./gpad_real comp1  
+2026-09-27T01:02:30Z	round2/a_fp8_r1	dgpu	125MB	rc=0	1.4s	busy_before=69	busy_after=74	./gpad_real fp8  
+2026-09-27T01:02:32Z	round2/a_rope_r1	dgpu	125MB	rc=0	1.9s	busy_before=87	busy_after=82	./gpad_real rope  
+2026-09-27T01:02:34Z	round2/a_fp4_r1	dgpu	125MB	rc=0	1.4s	busy_before=68	busy_after=75	./gpad_real fp4  
+2026-09-27T01:02:35Z	round2/a_cast_r1	dgpu	125MB	rc=0	1.7s	busy_before=54	busy_after=83	./gpad_real cast  
+2026-09-27T01:02:38Z	round2/a_rmsb_r1	dgpu	125MB	rc=0	2.2s	busy_before=44	busy_after=86	./gpad_real rmsb  
+2026-09-27T01:02:39Z	round2/a_kvapp_r1	dgpu	125MB	rc=0	1.4s	busy_before=79	busy_after=80	./gpad_real kvapp  
+2026-09-27T01:05:14Z	round2/a_gather_r2	dgpu	125MB	rc=0	1.7s	busy_before=72	busy_after=95	./gpad_real gather  
+2026-09-27T01:05:15Z	round2/a_idxq_r2	dgpu	125MB	rc=0	1.8s	busy_before=51	busy_after=86	./gpad_real idxq  
+2026-09-27T01:05:17Z	round2/a_comp1_r2	dgpu	125MB	rc=0	1.8s	busy_before=85	busy_after=89	./gpad_real comp1  
+2026-09-27T01:05:20Z	round2/a_proj_r2	dgpu	125MB	rc=0	2.7s	busy_before=96	busy_after=92	./gpad_real proj  
+2026-09-27T01:05:22Z	round2/a_router_r2	dgpu	125MB	rc=0	1.8s	busy_before=86	busy_after=88	./gpad_real router  
+2026-09-27T01:05:24Z	round2/a_narrow_r2	dgpu	125MB	rc=0	2.5s	busy_before=81	busy_after=91	./gpad_real narrow  
+2026-09-27T01:05:26Z	round2/a_vecadd_r2	dgpu	125MB	rc=0	1.3s	busy_before=78	busy_after=84	./gpad_real vecadd  
+2026-09-27T01:05:27Z	round2/a_hcpost_r2	dgpu	125MB	rc=0	1.5s	busy_before=69	busy_after=83	./gpad_real hcpost  
+2026-09-27T01:05:30Z	round2/a_gather_r3	dgpu	125MB	rc=0	2.5s	busy_before=62	busy_after=86	./gpad_real gather  
+2026-09-27T01:05:32Z	round2/a_idxq_r3	dgpu	125MB	rc=0	2.0s	busy_before=67	busy_after=90	./gpad_real idxq  
+2026-09-27T01:05:34Z	round2/a_comp1_r3	dgpu	125MB	rc=0	1.8s	busy_before=99	busy_after=88	./gpad_real comp1  
+2026-09-27T01:05:37Z	round2/a_proj_r3	dgpu	125MB	rc=0	2.9s	busy_before=82	busy_after=92	./gpad_real proj  
+2026-09-27T01:05:38Z	round2/a_router_r3	dgpu	125MB	rc=0	1.7s	busy_before=49	busy_after=83	./gpad_real router  
+2026-09-27T01:05:41Z	round2/a_narrow_r3	dgpu	125MB	rc=0	2.5s	busy_before=81	busy_after=91	./gpad_real narrow  
+2026-09-27T01:05:42Z	round2/a_vecadd_r3	dgpu	125MB	rc=0	1.3s	busy_before=55	busy_after=79	./gpad_real vecadd  
+2026-09-27T01:05:44Z	round2/a_hcpost_r3	dgpu	125MB	rc=0	1.5s	busy_before=74	busy_after=83	./gpad_real hcpost  
+2026-09-27T01:07:27Z	round2/a_fp8_s1	dgpu	125MB	rc=0	1.2s	busy_before=23	busy_after=71	./gpad_real fp8 1 2 3 4 5 8 16 64 128 256 512  
+2026-09-27T01:07:29Z	round2/a_fp4_s1	dgpu	125MB	rc=0	1.9s	busy_before=38	busy_after=55	./gpad_real fp4 1 2 4 8 16 32 64 128 512  
+2026-09-27T01:07:32Z	round2/a_rope_s1	dgpu	125MB	rc=0	2.5s	busy_before=4	busy_after=65	./gpad_real rope 1 2 4 8 16 32 64 128 512  
+2026-09-27T01:07:33Z	round2/a_cast_s1	dgpu	125MB	rc=0	1.8s	busy_before=6	busy_after=40	./gpad_real cast 1 2 4 8 16 32 64 128 256 512  
+2026-09-27T01:08:23Z	round2/a_fp8_s2	dgpu	125MB	rc=0	1.0s	busy_before=43	busy_after=55	./gpad_real fp8 1 4 8 64 128 256 512  
+2026-09-27T01:08:25Z	round2/a_fp4_s2	dgpu	125MB	rc=0	1.8s	busy_before=7	busy_after=40	./gpad_real fp4 1 4 8 16 32 64 128 512  
+2026-09-27T01:08:27Z	round2/a_rope_s2	dgpu	125MB	rc=0	2.2s	busy_before=4	busy_after=50	./gpad_real rope 1 4 8 16 32 64 512  
+2026-09-27T01:08:29Z	round2/a_cast_s2	dgpu	125MB	rc=0	1.8s	busy_before=25	busy_after=39	./gpad_real cast 1 4 8 16 64 128 256 512  
+2026-09-27T01:08:31Z	round2/a_fp8_s3	dgpu	125MB	rc=0	1.7s	busy_before=4	busy_after=34	./gpad_real fp8 1 4 8 64 128 256 512  
+2026-09-27T01:08:33Z	round2/a_fp4_s3	dgpu	125MB	rc=0	1.8s	busy_before=3	busy_after=42	./gpad_real fp4 1 4 8 16 32 64 128 512  
+2026-09-27T01:08:35Z	round2/a_rope_s3	dgpu	125MB	rc=0	2.2s	busy_before=22	busy_after=52	./gpad_real rope 1 4 8 16 32 64 512  
+2026-09-27T01:08:37Z	round2/a_cast_s3	dgpu	125MB	rc=0	1.8s	busy_before=5	busy_after=40	./gpad_real cast 1 4 8 16 64 128 256 512  
+2026-09-27T01:08:39Z	round2/a_fp8_s4	dgpu	125MB	rc=0	1.7s	busy_before=5	busy_after=41	./gpad_real fp8 1 4 8 64 128 256 512  
+2026-09-27T01:08:41Z	round2/a_fp4_s4	dgpu	125MB	rc=0	1.8s	busy_before=28	busy_after=41	./gpad_real fp4 1 4 8 16 32 64 128 512  
+2026-09-27T01:08:43Z	round2/a_rope_s4	dgpu	125MB	rc=0	2.3s	busy_before=4	busy_after=52	./gpad_real rope 1 4 8 16 32 64 512  
+2026-09-27T01:08:45Z	round2/a_cast_s4	dgpu	125MB	rc=0	1.8s	busy_before=6	busy_after=44	./gpad_real cast 1 4 8 16 64 128 256 512  
+2026-09-27T01:09:04Z	round2/a_igpu_quant	igpu	100MB	rc=0	1.0s	busy_before=14	busy_after=52	env GP_ARCH=gfx1151 GP_ALL=1 ./gpad_real_gfx1151 quant 1 2 3 4 8  
+2026-09-27T01:09:10Z	round2/a_igpu_sweep	igpu	130MB	rc=0	0.7s	busy_before=25	busy_after=56	env GP_ARCH=gfx1151 GP_ALL=1 ./gpad_real_gfx1151 fp4 1 4 16 64 128  
+2026-09-27T01:13:10Z	round2/a_intree	dgpu	120MB	rc=0	3.5s	busy_before=54	busy_after=83	bash round2/run_tests.sh defaults\|\|grid_pad_bitexact V41_GRID_PAD=0\|V41_GRID_PAD=0\|grid_pad_bitexact c2\ defaults\ \(cast_2d\ user\)\|\|q8_0_sweep_c2_bitexact  
