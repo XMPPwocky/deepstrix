@@ -2440,12 +2440,18 @@ impl PinBook {
     }
 }
 
-/// Pin mode: per queued request (by seq), the picks NOT landed when its frame
-/// ARRIVED (the early-page hook sees every frame first, before any of its
-/// reads). OR-ed into the reply's PAGED bits, so a read that hook (or a park)
-/// finished before the pass started still counts as "box 2 had to page it"
-/// for the hub's surprise check. A bounded ring: the reader keeps at most a
-/// few frames queued, and a dropped entry only weakens the check.
+/// Pin mode: per queued request (by seq), the picks NOT landed when the
+/// compute thread first SAW its frame (the early-page hook's `pull`, the merge
+/// look-ahead, or the dequeue itself, always before that frame's own reads).
+/// OR-ed into the reply's PAGED bits, so a read that hook (or a park) finished
+/// before the pass started still counts as "box 2 had to page it" for the
+/// hub's surprise check. Not quite the wire arrival: a frame that lands in the
+/// socket while a pass is in `ensure` is first seen after that pass's
+/// background admissions, so a violation those landings happen to cover is
+/// not counted -- the check errs only towards silence, never a false
+/// surprise (a held pick is pinned, hence landed, at every instant before its
+/// own words are applied). A bounded ring: the reader keeps at most a few
+/// frames queued, and a dropped entry only weakens the check.
 #[derive(Clone, Debug, Default)]
 pub struct EarlyPaged {
     ring: Vec<(u32, [u32; proto::RESID_WORDS])>,
@@ -5747,6 +5753,16 @@ pub fn serve_connection(
                                     partner = Some((h2, buf2, tf2, td2, t22));
                                 }
                             } else {
+                                // Pin mode: note its arrival now. It is served
+                                // later from `pending`, and `pull`'s hook only
+                                // sees frames it receives itself.
+                                if let Inbound::Frame { hdr: h2, buf: buf2, .. } = &m {
+                                    if h2.kind == proto::KIND_REQUEST {
+                                        if let Ok(nr) = proto::decode_request(buf2) {
+                                            shard.note_early_paged(h2.seq, nr.layer, nr.sel);
+                                        }
+                                    }
+                                }
                                 w_merge_unmergeable += 1;
                                 pending.push_back(m);
                             }
@@ -8070,7 +8086,26 @@ mod tests {
             self.queue_bg(&r.prefetch);
         }
 
-        /// `pin_report` + the reply's pin block.
+        /// `pin_grant` for each decode-shaped request of a pass, then ONE
+        /// `report` of the layer: `(map, epoch, pinned, budget)` for every
+        /// reply of the pass.
+        fn report_pass(&mut self, layer: u32, reqs: &[(&SimReq, bool)]) -> ([u32; proto::RESID_WORDS], u32, u32, u32) {
+            for &(r, decode_shaped) in reqs {
+                if decode_shaped {
+                    for &e in &r.sel {
+                        if e >= 0 {
+                            self.pool.pins.grant(layer, e as u32);
+                        }
+                    }
+                }
+            }
+            let row = self.pool.remap_hosts[layer as usize].clone();
+            let map = self.pool.pins.report(layer, &row);
+            let p = &self.pool.pins;
+            (map, p.epoch, p.pinned, p.budget)
+        }
+
+        /// `pin_report` + the reply's pin block (a pass of one request).
         fn reply(&mut self, r: &SimReq, picks: &[i32], decode_shaped: bool, paged: [u32; proto::RESID_WORDS]) -> SimReply {
             if decode_shaped {
                 for &e in picks {
@@ -8091,7 +8126,10 @@ mod tests {
         /// served and answered inside with this one's picks pinned).
         fn serve(&mut self, rng: &mut SimRng, wire: &mut std::collections::VecDeque<SimReq>, replies: &mut Vec<SimReply>) {
             // `pull`: every frame on the wire is seen once as it arrives, and
-            // its not-landed picks are noted for its reply's PAGED bits.
+            // its not-landed picks are noted for its reply's PAGED bits. The
+            // sim notes them before this serve's admissions; the daemon may
+            // first see a frame after them (`EarlyPaged` doc), so this is the
+            // check at its most sensitive.
             for r in wire.iter_mut() {
                 if !r.pulled {
                     r.pulled = true;
@@ -8164,10 +8202,14 @@ mod tests {
                     self.st.partner_split += 1;
                 }
             }
-            let r = self.reply(&a, &a.sel, dec(&a), paged_a);
-            replies.push(r);
+            // ONE report per pass, as `serve_connection`: both requests'
+            // grants first, then the layer's report, reused by the partner.
             if let Some(b) = partner.as_ref() {
-                let r = self.reply(b, &b.sel, dec(b), paged_b);
+                let (map, epoch, pinned, budget) = self.report_pass(a.layer, &[(&a, dec(&a)), (b, dec(b))]);
+                replies.push(SimReply { seq: a.seq, layer: a.layer, map, epoch, pinned, budget, paged: paged_a });
+                replies.push(SimReply { seq: b.seq, layer: b.layer, map, epoch, pinned, budget, paged: paged_b });
+            } else {
+                let r = self.reply(&a, &a.sel, dec(&a), paged_a);
                 replies.push(r);
             }
         }
