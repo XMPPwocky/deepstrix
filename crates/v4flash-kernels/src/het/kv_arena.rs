@@ -50,7 +50,8 @@ use crate::index_kv_e2m1::E2M1_KEY_ROW_BYTES;
 /// room (`state::KV_CACHE_ROWS` = 128 + 1024): 1152 -> 256 rows saves ~37 MB of
 /// dGPU per slot (40 layers x 896 rows x 1 KiB). A full region costs one
 /// `compact_raw` (40 layers x two <=128 KiB D2D copies) every
-/// `ARENA_RAW_SLACK` tokens of that stream.
+/// `ARENA_RAW_SLACK` tokens of that stream. Must be >= the rows one stream
+/// appends per step (`tables` refuses a window at its region end).
 pub const ARENA_RAW_SLACK: usize = 128;
 /// Raw rows per slot per layer (`raw_region_base`, `needs_compaction`).
 pub const ARENA_RAW_ROWS: usize = SWA_WINDOW as usize + ARENA_RAW_SLACK;
@@ -201,6 +202,24 @@ fn plan_compact_around(regs: &[(u32, u32)], x: usize, rows_cap: u32) -> (Vec<(us
         moves.push((i, top));
     }
     (moves, (free_base, top - free_base))
+}
+
+/// The free runs of a store of `rows_cap` rows holding the regions `regs`
+/// (`(base, cap)`, any order; overlaps tolerated): the complement, ascending.
+fn free_runs(mut regs: Vec<(u32, u32)>, rows_cap: u32) -> Vec<(u32, u32)> {
+    regs.sort_unstable();
+    let mut free = Vec::new();
+    let mut at = 0u32;
+    for (b, c) in regs {
+        if b > at {
+            free.push((at, b - at));
+        }
+        at = at.max(b + c);
+    }
+    if rows_cap > at {
+        free.push((at, rows_cap - at));
+    }
+    free
 }
 
 /// How `KvArena::grow` found the rows (the most expensive store's way).
@@ -535,6 +554,22 @@ impl KvArena {
         })
     }
 
+    /// Could `reserve(ctx_cap)` EVER fit (every store empty)?
+    pub fn could_fit(&self, ctx_cap: u32) -> bool {
+        self.stores.iter().all(|st| ctx_cap.div_ceil(st.ratio).max(1) <= st.rows_cap)
+    }
+
+    /// Rebuild every store's free list as the complement of the live regions.
+    /// `grow` / `compact_stores` call it when a move fails midway (the list is
+    /// only rebuilt at their end, and a carved relocation target is not yet
+    /// owned); the scheduler calls it after aborting everything.
+    pub fn rebuild_free_lists(&mut self) {
+        for (si, st) in self.stores.iter_mut().enumerate() {
+            let regs: Vec<(u32, u32)> = self.streams.iter().flatten().map(|s| (s.comp[si].base, s.comp[si].cap)).collect();
+            st.free = RowFreeList { free: free_runs(regs, st.rows_cap) };
+        }
+    }
+
     /// Would `reserve(ctx_cap)` fit right now, without compaction?
     pub fn fits_now(&self, ctx_cap: u32) -> bool {
         self.stores.iter().all(|st| st.free.fits(ctx_cap.div_ceil(st.ratio).max(1)))
@@ -548,6 +583,21 @@ impl KvArena {
     /// the bounce buffers on `stream`, which is synchronized before return.
     /// Call between steps, like `compact_stores`.
     pub fn grow(
+        &mut self,
+        slot: u32,
+        ctx_cap: u32,
+        stream: &Stream,
+        bounce_f16: &mut DeviceBuffer<u16>,
+        bounce_u8: &mut DeviceBuffer<u8>,
+    ) -> eyre::Result<Option<GrowHow>> {
+        let r = self.grow_inner(slot, ctx_cap, stream, bounce_f16, bounce_u8);
+        if r.is_err() {
+            self.rebuild_free_lists();
+        }
+        r
+    }
+
+    fn grow_inner(
         &mut self,
         slot: u32,
         ctx_cap: u32,
@@ -857,6 +907,14 @@ impl KvArena {
     /// between steps, on the scheduler thread); `stream` is synchronized before
     /// return. Accumulator blocks are per slot and do not move.
     pub fn compact_stores(&mut self, stream: &Stream, bounce_f16: &mut DeviceBuffer<u16>, bounce_u8: &mut DeviceBuffer<u8>) -> eyre::Result<()> {
+        let r = self.compact_stores_inner(stream, bounce_f16, bounce_u8);
+        if r.is_err() {
+            self.rebuild_free_lists();
+        }
+        r
+    }
+
+    fn compact_stores_inner(&mut self, stream: &Stream, bounce_f16: &mut DeviceBuffer<u16>, bounce_u8: &mut DeviceBuffer<u8>) -> eyre::Result<()> {
         self.dgpu.set_current()?;
         let n_stores = self.stores.len();
         for si in 0..n_stores {
@@ -907,6 +965,11 @@ impl KvArena {
                 return Err(eyre!("kv arena: slot {slot} appears twice in the step"));
             }
             let s = self.stream(slot).ok_or_else(|| eyre!("kv arena: slot {slot} not live"))?;
+            // The append would land past the slot's raw region, in the NEXT
+            // slot's window (the layer buffer's own bound would not catch it).
+            if (s.raw_off + s.n_raw) as usize >= ARENA_RAW_ROWS || (s.raw_off_dec + s.n_raw_dec) as usize >= ARENA_RAW_ROWS {
+                return Err(eyre!("kv arena: slot {slot} raw window is at its region end (compact_raw first)"));
+            }
             let region = Self::raw_region_base(slot);
             t.pos_per.push(s.pos as i32);
             t.n_raw_per.push(s.n_raw as i32);
@@ -1039,6 +1102,14 @@ mod tests {
         assert_eq!(fl.free, vec![(0, 60)]);
         assert_eq!(fl.free_rows(), 60);
         assert!(fl.fits(60) && !fl.fits(61));
+    }
+
+    #[test]
+    fn free_runs_is_the_complement() {
+        assert_eq!(free_runs(vec![], 10), vec![(0, 10)]);
+        assert_eq!(free_runs(vec![(3, 2), (0, 1)], 10), vec![(1, 2), (5, 5)]);
+        assert_eq!(free_runs(vec![(0, 4), (4, 6)], 10), vec![]);
+        assert_eq!(free_runs(vec![(2, 5), (4, 2)], 9), vec![(0, 2), (7, 2)], "overlap tolerated");
     }
 
     #[test]

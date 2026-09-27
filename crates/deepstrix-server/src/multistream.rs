@@ -351,6 +351,8 @@ impl Sched {
         for p in self.queue.drain(..) {
             let _ = p.tx.try_send(WorkerEvent::Error(why.to_string()));
         }
+        // A failed step may have left a grow/compaction half done.
+        self.arena.rebuild_free_lists();
     }
 
     /// One scheduler tick: a prefill chunk (or its start/finish) or a decode step.
@@ -470,14 +472,31 @@ impl Sched {
                 // one scratch state sat in a parked request while the queue
                 // behind it waited, 19-38% of all queue time). The final
                 // position is the prompt plus at most the trailing marker.
-                let pos = p.req.tokens.len() as u32 + 1;
-                let max_new = match effective_max_new(&p.req, pos, state.n_kv_max) {
+                // Admission lands at the prompt length, or one past it when a
+                // restored snapshot covers the whole prompt and the trailing
+                // marker is prefilled: check the context at the LOWER bound
+                // (as admission does -- never refuse what it would accept),
+                // size the reservation at the upper one.
+                let pos_lo = p.req.tokens.len() as u32;
+                let pos = pos_lo + u32::from(p.trailing_marker.is_some());
+                let max_new = match effective_max_new(&p.req, pos_lo, state.n_kv_max) {
                     Ok(m) => m,
                     Err(e) => { let _ = p.tx.try_send(WorkerEvent::Error(format!("{e:#}"))); continue; }
                 };
                 let cap = reservation(pos, max_new);
-                let spare = if self.streams.is_empty() { 0 } else { kv_spare() };
-                if !self.arena.fits_with_spare(cap, spare) {
+                if !self.arena.could_fit(cap) {
+                    // Bigger than the whole arena (V41_MS_CTX_ROWS below the
+                    // context): it would wait for room forever.
+                    let _ = p.tx.try_send(WorkerEvent::Error(format!(
+                        "prompt needs {cap} KV positions, more than the arena holds (V41_MS_CTX_ROWS)")));
+                    continue;
+                }
+                // Stalled streams get freed rows first: no new reservation
+                // while one waits for room to grow (a finishing stream's rows
+                // would otherwise be re-reserved before it could take them).
+                let stalled = self.streams.iter().any(|s| s.stalled_since.is_some());
+                let spare = if self.streams.is_empty() || kv_headroom() == 0 { 0 } else { kv_spare() };
+                if stalled || !self.arena.fits_with_spare(cap, spare) {
                     let mut p = p;
                     if p.room_wait.is_none() {
                         p.room_wait = Some(Instant::now());
@@ -542,7 +561,10 @@ impl Sched {
         // alternating bursts. `V41_MS_BURST_SCALE=1` additionally scales the
         // bursts with the other side's backlog (decode / (1 + waiting
         // prefills), prefill / (1 + live streams), floored).
-        let starved = self.queue.iter().any(|p| p.queued.elapsed() >= starve)
+        // A request waiting for KV ROOM is not helped by prefilling (only
+        // decoding frees rows): it holds new admissions in the queue loop
+        // instead of forcing the prefill phase.
+        let starved = self.queue.iter().any(|p| p.room_wait.is_none() && p.queued.elapsed() >= starve)
             || self.prefills.iter().any(|pf| !pf.job.chunks_done() && pf.p.queued.elapsed() >= starve);
         let scale = env_usize("V41_MS_BURST_SCALE", 0) == 1;
         let waiting_pf = if scale { self.prefills.len() + self.queue.len() } else { 0 };
@@ -898,7 +920,19 @@ impl Sched {
     /// its next position (`take_stalled`).
     fn decode_step(&mut self, state: &mut WorkerState) -> eyre::Result<()> {
         let stalled = self.take_stalled(state)?;
-        let r = if self.streams.is_empty() { Ok(()) } else { self.decode_rows(state) };
+        let r = if self.streams.is_empty() {
+            // Every stream is stalled behind an in-flight prefill's
+            // reservation: run the prefill (it becomes a runnable stream)
+            // instead of spinning here until the decode burst ends.
+            if !self.prefills.is_empty() && self.phase == Phase::Decode {
+                tracing::info!(stalled = stalled.len(), prefills = self.prefills.len(), "multistream: every stream stalled; prefill phase");
+                self.phase = Phase::Prefill;
+                self.phase_since = Instant::now();
+            }
+            Ok(())
+        } else {
+            self.decode_rows(state)
+        };
         // Back into the live set whatever happened: a failed step's
         // `abort_all` must reach them too.
         self.streams.extend(stalled);
@@ -946,7 +980,10 @@ impl Sched {
                 }
                 stalled.push(s);
             }
-            if !self.streams.is_empty() || stalled.is_empty() {
+            // A prefill in flight holds a reservation that fits its first
+            // step: it becomes a stream that runs, finishes and frees rows,
+            // so that is not a deadlock. (A PARKED request cannot run.)
+            if !self.streams.is_empty() || stalled.is_empty() || !self.prefills.is_empty() {
                 return Ok(stalled);
             }
             let k = (0..stalled.len()).max_by_key(|&k| stalled[k].completion_tokens).expect("non-empty");
