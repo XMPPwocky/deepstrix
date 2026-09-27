@@ -664,6 +664,15 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
     about half its rows (the 09-18 log: `seeded=19 n=20` on a 40-token prompt).
     Fix: capture across both lanes and across chunk boundaries, the last <= 128
     positions; ring-only writes. This is the same code M3 needs in `PrefillJob`.
+    **Legacy path DONE (2026-09-27, builds; unrun):** `seed_mtp_ring` merges BOTH
+    lanes by absolute position, takes the contiguous run ending at the latest
+    captured row (<= 128), writes every row with `ring_write_only` INCLUDING the
+    last prompt position (the first draft is at `start_pos`, after the bootstrap
+    decode step, so no draft writes prompt rows; the old code skipped that row
+    for want of its next token), and no longer runs a full drafter forward per
+    row (up to ~1.4 s of TTFT). Remaining limit: a final chunk shorter than 128
+    rows still under-seeds, because each lane keeps only its last forward's rows;
+    the arena path gets a position-indexed capture (4.5).
   * **A3, engine end to end**: teacher-force the gen2 transcript through the
     engine and score our drafter on OUR residuals. Route: export a gen2 golden case
     from the oracle's gen2 dump (`scripts/v41_oracle/export_golden.py`; the
