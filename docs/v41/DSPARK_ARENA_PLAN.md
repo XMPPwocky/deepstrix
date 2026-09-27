@@ -25,9 +25,19 @@ the text at 100% of scored positions; T=1 rejection-sampling E 4.13 on it). On
 same reference drafter scores E 1.99 (RS at T=1: 1.82), BUT that run could seed
 only 74 rows (the whole prompt) against gen2's 128, and seeding alone is worth
 3.28 -> 4.38 on gen2; each figure is one 89-step transcript (effective n ~19).
-So the prose gap mixes content with a thin window and must not be quoted as a
-content effect until a prose run with a >= 128-token prompt exists (a CPU
-reference run, RAM-bound; queued with R3-1's extra positions). M-A is a PARITY bar
+The reference's own CONFIDENCE HEAD settles most of it (`scripts/v41_oracle/dspark_conf_look.py` over
+the recorded `conf`/`hit`): within the prose run, steps with the window still
+filling (i < 127, 53 steps) score E 1.74 and steps with a full window (i >= 127,
+36 steps) 2.36, against gen2's 4.38; the chain of sigmoid(conf) predicts E 1.96
+on prose (actual 1.99) and 4.57 on gen2 (actual 4.38); mean conf at d1-d5 is
++0.8 .. -1.4 on prose vs +8.8 .. +4.0 on gen2. The main model's entropy is NOT
+lower on gen2 (0.55 vs 0.45 nats), so the gap is what the drafter can predict
+(tool-call structure), not main-model certainty. So: the content effect is real
+and large, the thin window costs part of prose's number. Rejection sampling at
+T=1 costs little on either (RS-acc ~= greedy hit per depth). Unseeded, the head
+is OVERCONFIDENT (gen2 noseed: predicts 4.34, actual 3.28), so realized E far
+below the conf-predicted E is a cheap production alarm for a broken or cold
+ring (M4 observability). M-A is a PARITY bar
 (our drafter vs the reference drafter on the same input); production acceptance
 is lower for the reference drafter too, and M0 prices production with the
 realized E of the drafter that passed parity, measured on production-like,
