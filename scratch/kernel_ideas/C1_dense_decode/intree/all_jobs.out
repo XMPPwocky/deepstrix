@@ -1,0 +1,172 @@
+== 1790465015.000327.C1_dense_decode.dgpu rc=66
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+REFUSED: dGPU VRAM free 504 MB < 250 MB + 270 MB margin (production hub may own it)
+== 1790465015.000328.C1_dense_decode.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+
+running 4 tests
+test gemv_bpack_tb_matches_runtime_kernel ... gemv 1280x5120 b=1: q8_0_gemv_bpack_tB1 bit_diff=0, wrapper bit_diff=0
+gemv 1280x5120 b=2: q8_0_gemv_bpack_tB2 bit_diff=0, wrapper bit_diff=0
+gemv 1280x5120 b=3: q8_0_gemv_bpack_tB3 bit_diff=0, wrapper bit_diff=0
+gemv 1280x5120 b=4: q8_0_gemv_bpack_tB4 bit_diff=0, wrapper bit_diff=0
+gemv 1280x5120 b=5: q8_0_gemv_bpack_tB5 bit_diff=0, wrapper bit_diff=0
+gemv 1280x5120 b=6: q8_0_gemv_bpack_tB6 bit_diff=0, wrapper bit_diff=0
+gemv 1280x5120 b=7: q8_0_gemv_bpack_tB7 bit_diff=0, wrapper bit_diff=0
+gemv 1280x5120 b=8: q8_0_gemv_bpack_tB8 bit_diff=0, wrapper bit_diff=0
+gemv 1280x5120 b=9: q8_0_gemv_bpack_tB9 bit_diff=0, wrapper bit_diff=0
+gemv 1280x5120 b=10: q8_0_gemv_bpack_tB10 bit_diff=0, wrapper bit_diff=0
+gemv 512x5120 b=1: q8_0_gemv_bpack_tB1 bit_diff=0, wrapper bit_diff=0
+gemv 512x5120 b=2: q8_0_gemv_bpack_tB2 bit_diff=0, wrapper bit_diff=0
+gemv 512x5120 b=3: q8_0_gemv_bpack_tB3 bit_diff=0, wrapper bit_diff=0
+gemv 512x5120 b=4: q8_0_gemv_bpack_tB4 bit_diff=0, wrapper bit_diff=0
+gemv 512x5120 b=5: q8_0_gemv_bpack_tB5 bit_diff=0, wrapper bit_diff=0
+gemv 512x5120 b=6: q8_0_gemv_bpack_tB6 bit_diff=0, wrapper bit_diff=0
+gemv 512x5120 b=7: q8_0_gemv_bpack_tB7 bit_diff=0, wrapper bit_diff=0
+gemv 512x5120 b=8: q8_0_gemv_bpack_tB8 bit_diff=0, wrapper bit_diff=0
+gemv 512x5120 b=9: q8_0_gemv_bpack_tB9 bit_diff=0, wrapper bit_diff=0
+gemv 512x5120 b=10: q8_0_gemv_bpack_tB10 bit_diff=0, wrapper bit_diff=0
+gemv 1001x2304 b=1: q8_0_gemv_bpack_tB1 bit_diff=0, wrapper bit_diff=0
+gemv 1001x2304 b=2: q8_0_gemv_bpack_tB2 bit_diff=0, wrapper bit_diff=0
+gemv 1001x2304 b=3: q8_0_gemv_bpack_tB3 bit_diff=0, wrapper bit_diff=0
+gemv 1001x2304 b=4: q8_0_gemv_bpack_tB4 bit_diff=0, wrapper bit_diff=0
+gemv 1001x2304 b=5: q8_0_gemv_bpack_tB5 bit_diff=0, wrapper bit_diff=0
+gemv 1001x2304 b=6: q8_0_gemv_bpack_tB6 bit_diff=0, wrapper bit_diff=0
+gemv 1001x2304 b=7: q8_0_gemv_bpack_tB7 bit_diff=0, wrapper bit_diff=0
+gemv 1001x2304 b=8: q8_0_gemv_bpack_tB8 bit_diff=0, wrapper bit_diff=0
+gemv 1001x2304 b=9: q8_0_gemv_bpack_tB9 bit_diff=0, wrapper bit_diff=0
+gemv 1001x2304 b=10: q8_0_gemv_bpack_tB10 bit_diff=0, wrapper bit_diff=0
+gemv 523x1280 b=1: q8_0_gemv_bpack_tB1 bit_diff=0, wrapper bit_diff=0
+gemv 523x1280 b=2: q8_0_gemv_bpack_tB2 bit_diff=0, wrapper bit_diff=0
+gemv 523x1280 b=3: q8_0_gemv_bpack_tB3 bit_diff=0, wrapper bit_diff=0
+gemv 523x1280 b=4: q8_0_gemv_bpack_tB4 bit_diff=0, wrapper bit_diff=0
+gemv 523x1280 b=5: q8_0_gemv_bpack_tB5 bit_diff=0, wrapper bit_diff=0
+gemv 523x1280 b=6: q8_0_gemv_bpack_tB6 bit_diff=0, wrapper bit_diff=0
+gemv 523x1280 b=7: q8_0_gemv_bpack_tB7 bit_diff=0, wrapper bit_diff=0
+gemv 523x1280 b=8: q8_0_gemv_bpack_tB8 bit_diff=0, wrapper bit_diff=0
+gemv 523x1280 b=9: q8_0_gemv_bpack_tB9 bit_diff=0, wrapper bit_diff=0
+gemv 523x1280 b=10: q8_0_gemv_bpack_tB10 bit_diff=0, wrapper bit_diff=0
+gemv 33x32 b=1: q8_0_gemv_bpack_tB1 bit_diff=0, wrapper bit_diff=0
+gemv 33x32 b=2: q8_0_gemv_bpack_tB2 bit_diff=0, wrapper bit_diff=0
+gemv 33x32 b=3: q8_0_gemv_bpack_tB3 bit_diff=0, wrapper bit_diff=0
+gemv 33x32 b=4: q8_0_gemv_bpack_tB4 bit_diff=0, wrapper bit_diff=0
+gemv 33x32 b=5: q8_0_gemv_bpack_tB5 bit_diff=0, wrapper bit_diff=0
+gemv 33x32 b=6: q8_0_gemv_bpack_tB6 bit_diff=0, wrapper bit_diff=0
+gemv 33x32 b=7: q8_0_gemv_bpack_tB7 bit_diff=0, wrapper bit_diff=0
+gemv 33x32 b=8: q8_0_gemv_bpack_tB8 bit_diff=0, wrapper bit_diff=0
+gemv 33x32 b=9: q8_0_gemv_bpack_tB9 bit_diff=0, wrapper bit_diff=0
+gemv 33x32 b=10: q8_0_gemv_bpack_tB10 bit_diff=0, wrapper bit_diff=0
+gemv 1x1280 b=1: q8_0_gemv_bpack_tB1 bit_diff=0, wrapper bit_diff=0
+gemv 1x1280 b=2: q8_0_gemv_bpack_tB2 bit_diff=0, wrapper bit_diff=0
+gemv 1x1280 b=3: q8_0_gemv_bpack_tB3 bit_diff=0, wrapper bit_diff=0
+gemv 1x1280 b=4: q8_0_gemv_bpack_tB4 bit_diff=0, wrapper bit_diff=0
+gemv 1x1280 b=5: q8_0_gemv_bpack_tB5 bit_diff=0, wrapper bit_diff=0
+gemv 1x1280 b=6: q8_0_gemv_bpack_tB6 bit_diff=0, wrapper bit_diff=0
+gemv 1x1280 b=7: q8_0_gemv_bpack_tB7 bit_diff=0, wrapper bit_diff=0
+gemv 1x1280 b=8: q8_0_gemv_bpack_tB8 bit_diff=0, wrapper bit_diff=0
+gemv 1x1280 b=9: q8_0_gemv_bpack_tB9 bit_diff=0, wrapper bit_diff=0
+gemv 1x1280 b=10: q8_0_gemv_bpack_tB10 bit_diff=0, wrapper bit_diff=0
+PASS: 60 (shape, b) cases bit-exact
+ok
+test grouped_bpack_tb_matches_runtime_kernel ... grouped 8x(1024x4096) b=1: q8_0_grouped_gemv_bpack_tB1 bit_diff=0, wrapper bit_diff=0
+grouped 8x(1024x4096) b=2: q8_0_grouped_gemv_bpack_tB2 bit_diff=0, wrapper bit_diff=0
+grouped 8x(1024x4096) b=3: q8_0_grouped_gemv_bpack_tB3 bit_diff=0, wrapper bit_diff=0
+grouped 8x(1024x4096) b=4: q8_0_grouped_gemv_bpack_tB4 bit_diff=0, wrapper bit_diff=0
+grouped 8x(1024x4096) b=5: q8_0_grouped_gemv_bpack_tB5 bit_diff=0, wrapper bit_diff=0
+grouped 8x(1024x4096) b=6: q8_0_grouped_gemv_bpack_tB6 bit_diff=0, wrapper bit_diff=0
+grouped 8x(1024x4096) b=7: q8_0_grouped_gemv_bpack_tB7 bit_diff=0, wrapper bit_diff=0
+grouped 8x(1024x4096) b=8: q8_0_grouped_gemv_bpack_tB8 bit_diff=0, wrapper bit_diff=0
+grouped 3x(1000x2048) b=1: q8_0_grouped_gemv_bpack_tB1 bit_diff=0, wrapper bit_diff=0
+grouped 3x(1000x2048) b=2: q8_0_grouped_gemv_bpack_tB2 bit_diff=0, wrapper bit_diff=0
+grouped 3x(1000x2048) b=3: q8_0_grouped_gemv_bpack_tB3 bit_diff=0, wrapper bit_diff=0
+grouped 3x(1000x2048) b=4: q8_0_grouped_gemv_bpack_tB4 bit_diff=0, wrapper bit_diff=0
+grouped 3x(1000x2048) b=5: q8_0_grouped_gemv_bpack_tB5 bit_diff=0, wrapper bit_diff=0
+grouped 3x(1000x2048) b=6: q8_0_grouped_gemv_bpack_tB6 bit_diff=0, wrapper bit_diff=0
+grouped 3x(1000x2048) b=7: q8_0_grouped_gemv_bpack_tB7 bit_diff=0, wrapper bit_diff=0
+grouped 3x(1000x2048) b=8: q8_0_grouped_gemv_bpack_tB8 bit_diff=0, wrapper bit_diff=0
+PASS: 16 grouped cases bit-exact
+ok
+test quantize_wave_and_grid_pad_match_serial_kernel ... quantize blocks=1 q8_0_quantize_f32 grid=2: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=1 q8_0_quantize_f32_wave grid=1: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=1 q8_0_quantize_f32_wave grid=2: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=7 q8_0_quantize_f32 grid=8: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=7 q8_0_quantize_f32_wave grid=1: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=7 q8_0_quantize_f32_wave grid=2: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=9 q8_0_quantize_f32 grid=10: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=9 q8_0_quantize_f32_wave grid=2: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=9 q8_0_quantize_f32_wave grid=3: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=41 q8_0_quantize_f32 grid=42: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=41 q8_0_quantize_f32_wave grid=6: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=41 q8_0_quantize_f32_wave grid=7: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=160 q8_0_quantize_f32 grid=161: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=160 q8_0_quantize_f32_wave grid=20: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=160 q8_0_quantize_f32_wave grid=21: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=640 q8_0_quantize_f32 grid=641: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=640 q8_0_quantize_f32_wave grid=80: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=640 q8_0_quantize_f32_wave grid=81: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=2047 q8_0_quantize_f32 grid=2048: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=2047 q8_0_quantize_f32_wave grid=256: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=2047 q8_0_quantize_f32_wave grid=257: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=2048 q8_0_quantize_f32 grid=2049: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=2048 q8_0_quantize_f32_wave grid=256: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=2048 q8_0_quantize_f32_wave grid=257: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=3072 q8_0_quantize_f32 grid=3073: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=3072 q8_0_quantize_f32_wave grid=384: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=3072 q8_0_quantize_f32_wave grid=385: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=4096 q8_0_quantize_f32 grid=4097: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=4096 q8_0_quantize_f32_wave grid=512: xq int8_diff=0 xscale bit_diff=0
+quantize blocks=4096 q8_0_quantize_f32_wave grid=513: xq int8_diff=0 xscale bit_diff=0
+PASS: quantize wave / grid pad bit-exact
+ok
+test shared_fused_matches_four_launch_chain ... shared b=1 xs_scale=1: clamp hits 2304/2304; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=2 xs_scale=1: clamp hits 4608/4608; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=3 xs_scale=1: clamp hits 6912/6912; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=4 xs_scale=1: clamp hits 9216/9216; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=5 xs_scale=1: clamp hits 11520/11520; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=6 xs_scale=1: clamp hits 13824/13824; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=7 xs_scale=1: clamp hits 16128/16128; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=8 xs_scale=1: clamp hits 18431/18432; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=9 xs_scale=1: clamp hits 20736/20736; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=10 xs_scale=1: clamp hits 23040/23040; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=1 xs_scale=0.0001: clamp hits 980/2304; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=2 xs_scale=0.0001: clamp hits 1913/4608; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=3 xs_scale=0.0001: clamp hits 3044/6912; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=4 xs_scale=0.0001: clamp hits 3815/9216; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=5 xs_scale=0.0001: clamp hits 4618/11520; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=6 xs_scale=0.0001: clamp hits 5792/13824; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=7 xs_scale=0.0001: clamp hits 6793/16128; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=8 xs_scale=0.0001: clamp hits 7899/18432; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=9 xs_scale=0.0001: clamp hits 8785/20736; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=10 xs_scale=0.0001: clamp hits 9606/23040; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=1 xs_scale=0.00002: clamp hits 0/2304; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=2 xs_scale=0.00002: clamp hits 46/4608; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=3 xs_scale=0.00002: clamp hits 69/6912; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=4 xs_scale=0.00002: clamp hits 0/9216; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=5 xs_scale=0.00002: clamp hits 0/11520; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=6 xs_scale=0.00002: clamp hits 46/13824; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=7 xs_scale=0.00002: clamp hits 23/16128; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=8 xs_scale=0.00002: clamp hits 1/18432; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=9 xs_scale=0.00002: clamp hits 69/20736; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+shared b=10 xs_scale=0.00002: clamp hits 69/23040; mid_xq int8_diff=0 mid_xscale bit_diff=0 down bit_diff=0
+PASS: fused shared chain bit-exact b=1..10 x 3 activation regimes
+ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+== 1790465015.000329.C1_dense_decode.dgpu rc=0
+[ORCHESTRATOR NOTICE] Report live: the moment you have a measured win (>=5%, correctness checked, >=2 runs), a notable loss, or a new high-value idea, append ONE line to /home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/_infra/WINS.log (format in its header). It is relayed to the user in real time.
+### q8_0_tb_bitexact with V41_GEMV_TB=0 V41_Q8_QUANT_WAVE=0 V41_Q8_QUANT_GRID_PAD=0 V41_SHARED_FUSED=0
+test gemv_bpack_tb_matches_runtime_kernel ... ok
+test grouped_bpack_tb_matches_runtime_kernel ... ok
+test quantize_wave_and_grid_pad_match_serial_kernel ... ok
+test shared_fused_matches_four_launch_chain ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.33s
+### q8_0_matvec_batched (defaults)
+test q8_0_matvec_batched_matches_single ... device: 0 (gfx1201)
+overall max diff = 0.000000e0
+PASS: q8_0_matvec_batched matches single matvec
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+### q8_0_matvec_batched with V41_GEMV_TB=0
+test q8_0_matvec_batched_matches_single ... device: 0 (gfx1201)
+overall max diff = 0.000000e0
+PASS: q8_0_matvec_batched matches single matvec
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.11s

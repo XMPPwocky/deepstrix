@@ -482,3 +482,11 @@
 2026-09-26T23:23:40Z	C1_dense_decode/intree_test_knobs0	dgpu	120MB	rc=0	3.7s	busy_before=53	busy_after=73	bash intree/run_tests_knobs0.sh  
 2026-09-26T23:24:37Z	C1_dense_decode/intree_harness	dgpu	130MB	rc=0	11.8s	busy_before=72	busy_after=98	./harness gemv qa 1 1 : gemv qa 2 1 : gemv qa 3 1 : gemv qa 4 1 : gemv qa 5 1 : gemv qa 8 1 : gemv kv 4 1 : gemv gate 3 1 : gemv gate 5 1 : gemv down 4 1 : gemv wob 4 1 : grouped 1 : grouped 2 : group
 2026-09-26T23:25:12Z	C1_dense_decode/intree_harness	dgpu	130MB	rc=0	11.0s	busy_before=70	busy_after=94	env C1_DIR=/home/claude-code/deepstrix/.claude/worktrees/kernel-ideas-2026-09-26/scratch/kernel_ideas/C1_dense_decode/intree ./harness gemv qa 1 1 : gemv qa 2 1 : gemv qa 3 1 : gemv qa 4 1 : gemv qa 5
+2026-09-26T23:40:06Z	F_mhc_glue/intree	dgpu	120MB	rc=1	8.0s	busy_before=58	busy_after=24	bash intree/run_tests.sh  
+2026-09-26T23:40:29Z	F_mhc_glue/intree_igpu	igpu	200MB	rc=1	7.7s	busy_before=29	busy_after=35	bash intree/run_tests.sh  
+2026-09-26T23:52:16Z	E_indexer/intree	dgpu	130MB	rc=1	18.9s	busy_before=58	busy_after=85	bash intree/run_tests.sh  
+2026-09-26T23:52:44Z	E_indexer/intree_dbg	dgpu	90MB	rc=101	0.5s	busy_before=75	busy_after=82	/home/claude-code/deepstrix/target-v41-ki/release/deps/indexer_sweep_bitexact-f555104ee0c99b06 --ignored --test-threads=1 --nocapture  
+2026-09-26T23:53:30Z	E_indexer/intree	dgpu	110MB	rc=0	12.4s	busy_before=80	busy_after=44	bash intree/run_tests.sh  
+2026-09-26T23:53:45Z	E_indexer/intree_igpu	igpu	300MB	rc=0	3.0s	busy_before=10	busy_after=36	bash intree/run_tests.sh igpu  
+2026-09-27T00:06:42Z	B_moe_prefill/intree	igpu	600MB	rc=0	11.9s	busy_before=63	busy_after=59	bash intree/run_tests.sh  
+2026-09-27T00:20:49Z	C2_dense_prefill/intree	dgpu	120MB	rc=0	10.5s	busy_before=56	busy_after=48	bash intree/run_tests.sh  
