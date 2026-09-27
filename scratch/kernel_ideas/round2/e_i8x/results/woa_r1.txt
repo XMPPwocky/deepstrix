@@ -1,0 +1,51 @@
+[kb] device 0 = AMD Radeon RX 9070 XT (gfx1201), 32 CUs, 2520 MHz
+[e] woa M=1024 K=4096 G=8 b=256: weight 35.7 MB, out 8.4 MB, x 33.6 MB, flush 24 MB
+CMP woa prod f16x vs f64 ref           n=262144 bitexact=no bit_diff=262110 nonfinite=0 max_abs=2.842e-02 max_rel=5.423e+01 rmse=6.369e-03 rel_rmse=2.802e-04 worst_idx=138024
+KBJSON {"cmp":"woa prod f16x vs f64 ref","bitexact":0,"bit_diff":262110,"nonfinite":0,"max_abs":2.8421e-02,"rel_rmse":2.8016e-04}
+CMP woa i8x_db_ld vs f64 ref           n=262144 bitexact=no bit_diff=262142 nonfinite=0 max_abs=3.709e-01 max_rel=5.077e+02 rmse=8.581e-02 rel_rmse=3.775e-03 worst_idx=46461
+KBJSON {"cmp":"woa i8x_db_ld vs f64 ref","bitexact":0,"bit_diff":262142,"nonfinite":0,"max_abs":3.7088e-01,"rel_rmse":3.7748e-03}
+CMP woa i8x_db_ld vs prod f16x         n=2097152 bitexact=no bit_diff=2097141 nonfinite=0 max_abs=4.283e-01 max_rel=3.382e+03 rmse=8.565e-02 rel_rmse=3.765e-03 worst_idx=401552
+KBJSON {"cmp":"woa i8x_db_ld vs prod f16x","bitexact":0,"bit_diff":2097141,"nonfinite":0,"max_abs":4.2830e-01,"rel_rmse":3.7649e-03}
+CMP woa i8x_128_ld vs f64 ref          n=262144 bitexact=no bit_diff=262142 nonfinite=0 max_abs=3.709e-01 max_rel=5.077e+02 rmse=8.581e-02 rel_rmse=3.775e-03 worst_idx=46461
+KBJSON {"cmp":"woa i8x_128_ld vs f64 ref","bitexact":0,"bit_diff":262142,"nonfinite":0,"max_abs":3.7088e-01,"rel_rmse":3.7748e-03}
+CMP woa i8x_128_ld vs prod f16x        n=2097152 bitexact=no bit_diff=2097141 nonfinite=0 max_abs=4.283e-01 max_rel=3.382e+03 rmse=8.565e-02 rel_rmse=3.765e-03 worst_idx=401552
+KBJSON {"cmp":"woa i8x_128_ld vs prod f16x","bitexact":0,"bit_diff":2097141,"nonfinite":0,"max_abs":4.2830e-01,"rel_rmse":3.7649e-03}
+CMP woa i8x_256x128_ld vs f64 ref      n=262144 bitexact=no bit_diff=262142 nonfinite=0 max_abs=3.709e-01 max_rel=5.077e+02 rmse=8.581e-02 rel_rmse=3.775e-03 worst_idx=46461
+KBJSON {"cmp":"woa i8x_256x128_ld vs f64 ref","bitexact":0,"bit_diff":262142,"nonfinite":0,"max_abs":3.7088e-01,"rel_rmse":3.7748e-03}
+CMP woa i8x_256x128_ld vs prod f16x    n=2097152 bitexact=no bit_diff=2097141 nonfinite=0 max_abs=4.283e-01 max_rel=3.382e+03 rmse=8.565e-02 rel_rmse=3.765e-03 worst_idx=401552
+KBJSON {"cmp":"woa i8x_256x128_ld vs prod f16x","bitexact":0,"bit_diff":2097141,"nonfinite":0,"max_abs":4.2830e-01,"rel_rmse":3.7649e-03}
+CMP woa i8x_256x128_db_ld vs f64 ref   n=262144 bitexact=no bit_diff=262142 nonfinite=0 max_abs=3.709e-01 max_rel=5.077e+02 rmse=8.581e-02 rel_rmse=3.775e-03 worst_idx=46461
+KBJSON {"cmp":"woa i8x_256x128_db_ld vs f64 ref","bitexact":0,"bit_diff":262142,"nonfinite":0,"max_abs":3.7088e-01,"rel_rmse":3.7748e-03}
+CMP woa i8x_256x128_db_ld vs prod f16x n=2097152 bitexact=no bit_diff=2097141 nonfinite=0 max_abs=4.283e-01 max_rel=3.382e+03 rmse=8.565e-02 rel_rmse=3.765e-03 worst_idx=401552
+KBJSON {"cmp":"woa i8x_256x128_db_ld vs prod f16x","bitexact":0,"bit_diff":2097141,"nonfinite":0,"max_abs":4.2830e-01,"rel_rmse":3.7649e-03}
+CMP woa i8x_bn64_ld vs f64 ref         n=262144 bitexact=no bit_diff=262142 nonfinite=0 max_abs=3.709e-01 max_rel=5.077e+02 rmse=8.581e-02 rel_rmse=3.775e-03 worst_idx=46461
+KBJSON {"cmp":"woa i8x_bn64_ld vs f64 ref","bitexact":0,"bit_diff":262142,"nonfinite":0,"max_abs":3.7088e-01,"rel_rmse":3.7748e-03}
+CMP woa i8x_bn64_ld vs prod f16x       n=2097152 bitexact=no bit_diff=2097141 nonfinite=0 max_abs=4.283e-01 max_rel=3.382e+03 rmse=8.565e-02 rel_rmse=3.765e-03 worst_idx=401552
+KBJSON {"cmp":"woa i8x_bn64_ld vs prod f16x","bitexact":0,"bit_diff":2097141,"nonfinite":0,"max_abs":4.2830e-01,"rel_rmse":3.7649e-03}
+
+== woa M=1024 K=4096 G=8 b=256 cold(flush 24MB) direct  (rounds=20 inner=1 graph=0 flush=1)
+variant                                      med_us     p10_us     p90_us  vs_base      GB/s   GFLOP/s
+prod: cast + q8_0_gemm_wmma_f16x_256x128     284.32     268.48     405.36    1.000     125.4       0.0
+prod GEMM alone q8_0_gemm_wmma_f16x_256x128     200.64     168.20     289.44    0.706     177.7       0.0
+cand: quant + i8x_db_ld                      389.80     341.28     474.97    1.371      91.5       0.0
+cand GEMM alone i8x_db_ld                    272.20     241.68     383.68    0.957     131.0       0.0
+cand: quant + i8x_128_ld                     374.76     335.48     479.49    1.318      95.1       0.0
+cand GEMM alone i8x_128_ld                   233.68     222.68     330.20    0.822     152.6       0.0
+cand: quant + i8x_256x128_ld                 309.04     280.20     395.09    1.087     115.4       0.0
+cand GEMM alone i8x_256x128_ld               203.60     169.84     325.12    0.716     175.1       0.0
+cand: quant + i8x_256x128_db_ld              304.36     288.84     465.33    1.070     117.1       0.0
+cand GEMM alone i8x_256x128_db_ld            220.88     180.96     293.48    0.777     161.4       0.0
+cand: quant + i8x_bn64_ld                    411.33     385.56     503.13    1.447      86.7       0.0
+cand GEMM alone i8x_bn64_ld                  291.00     281.28     334.28    1.023     122.5       0.0
+KBJSON {"tag":"woa M=1024 K=4096 G=8 b=256 cold(flush 24MB) direct","variant":"prod: cast + q8_0_gemm_wmma_f16x_256x128","med_us":284.323,"p10_us":268.484,"p90_us":405.364,"ratio":1.0000,"gbps":125.39,"graph":0,"flush":1}
+KBJSON {"tag":"woa M=1024 K=4096 G=8 b=256 cold(flush 24MB) direct","variant":"prod GEMM alone q8_0_gemm_wmma_f16x_256x128","med_us":200.642,"p10_us":168.202,"p90_us":289.444,"ratio":0.7057,"gbps":177.69,"graph":0,"flush":1}
+KBJSON {"tag":"woa M=1024 K=4096 G=8 b=256 cold(flush 24MB) direct","variant":"cand: quant + i8x_db_ld","med_us":389.805,"p10_us":341.284,"p90_us":474.966,"ratio":1.3710,"gbps":91.46,"graph":0,"flush":1}
+KBJSON {"tag":"woa M=1024 K=4096 G=8 b=256 cold(flush 24MB) direct","variant":"cand GEMM alone i8x_db_ld","med_us":272.203,"p10_us":241.683,"p90_us":383.684,"ratio":0.9574,"gbps":130.97,"graph":0,"flush":1}
+KBJSON {"tag":"woa M=1024 K=4096 G=8 b=256 cold(flush 24MB) direct","variant":"cand: quant + i8x_128_ld","med_us":374.764,"p10_us":335.484,"p90_us":479.486,"ratio":1.3181,"gbps":95.13,"graph":0,"flush":1}
+KBJSON {"tag":"woa M=1024 K=4096 G=8 b=256 cold(flush 24MB) direct","variant":"cand GEMM alone i8x_128_ld","med_us":233.683,"p10_us":222.683,"p90_us":330.204,"ratio":0.8219,"gbps":152.56,"graph":0,"flush":1}
+KBJSON {"tag":"woa M=1024 K=4096 G=8 b=256 cold(flush 24MB) direct","variant":"cand: quant + i8x_256x128_ld","med_us":309.044,"p10_us":280.204,"p90_us":395.085,"ratio":1.0869,"gbps":115.36,"graph":0,"flush":1}
+KBJSON {"tag":"woa M=1024 K=4096 G=8 b=256 cold(flush 24MB) direct","variant":"cand GEMM alone i8x_256x128_ld","med_us":203.603,"p10_us":169.842,"p90_us":325.123,"ratio":0.7161,"gbps":175.10,"graph":0,"flush":1}
+KBJSON {"tag":"woa M=1024 K=4096 G=8 b=256 cold(flush 24MB) direct","variant":"cand: quant + i8x_256x128_db_ld","med_us":304.364,"p10_us":288.843,"p90_us":465.326,"ratio":1.0705,"gbps":117.13,"graph":0,"flush":1}
+KBJSON {"tag":"woa M=1024 K=4096 G=8 b=256 cold(flush 24MB) direct","variant":"cand GEMM alone i8x_256x128_db_ld","med_us":220.883,"p10_us":180.963,"p90_us":293.484,"ratio":0.7769,"gbps":161.40,"graph":0,"flush":1}
+KBJSON {"tag":"woa M=1024 K=4096 G=8 b=256 cold(flush 24MB) direct","variant":"cand: quant + i8x_bn64_ld","med_us":411.325,"p10_us":385.564,"p90_us":503.126,"ratio":1.4467,"gbps":86.67,"graph":0,"flush":1}
+KBJSON {"tag":"woa M=1024 K=4096 G=8 b=256 cold(flush 24MB) direct","variant":"cand GEMM alone i8x_bn64_ld","med_us":291.004,"p10_us":281.284,"p90_us":334.284,"ratio":1.0235,"gbps":122.51,"graph":0,"flush":1}

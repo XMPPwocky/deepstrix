@@ -174,3 +174,75 @@ next list).
 Test: `tests/decode_fusion_bitexact.rs` (each fused wrapper vs its chain of production wrappers,
 b = 1..16, plain + YaRN rope, sentinel-filled outputs) passes with defaults and `V41_GRID_PAD=0`;
 `grid_pad_bitexact` passes after the RopeTail arg refactor; server + expertd build.
+
+## (e) int8-activation WMMA GEMM for the dense prefill sites — LOSS, NOT WIRED
+
+Candidates `e_i8x/cand_i8x.hip`: the in-tree `f16x_core` (included verbatim) with int8 xq + per-32
+xscale activations (Q8_0, dequantised at stage as i8x_db / lds_tiled do) and an explicit activation
+pitch (grouped wo_a), in five geometries (i8x_db_ld = the Engram 128x128 DB PF2; 128x128 PF2;
+256x128 PF1; 256x128 DB; 128x64 DB PF2). Harness `e_i8x/harness.cpp`: production = cast_2d + the
+production f16x tile at that b (db_bn64 for q_a / kv, 256x128 for q_b / wo_a, base elsewhere),
+candidate = q8_0_quantize_f32_wave (+pad) + i8x; cold weights (flush), direct launches, 3 runs;
+b = 512 except wo_a at 256 (its f32 heads input alone is 67 MB at 512, over the 130 MB cap) and
+q_a also at 1024. Best i8x geometry per site, ratio vs production (med / p10), GEMM alone and
+with the activation prep:
+
+| site | best i8x | GEMM alone | chain (prep + GEMM) |
+|---|---|---|---|
+| q_a 1280x5120 b=512 | bn64 | 1.08 / 1.07 | 1.08 / 1.05 |
+| q_a b=1024 | db | 1.01 / 1.00 | 1.04 / 1.01 (128x128) |
+| kv 512x5120 | bn64 | 1.05 / 1.06 | 0.99 / 0.97 |
+| q_b 32768x1280 | 256x128 | 1.02 / 1.05 | 1.03 / 1.01 |
+| wo_a 8x1024x4096 (b=256) | 256x128 | 1.03 / 1.03 | 1.09 / 1.05 |
+| wo_b 5120x8192 | 256x128 | 1.09 / 1.08 | 1.02 / 1.15 (128x128) |
+| shared gate/up 2304x5120 | db | 0.89 / 0.98 | 0.98 / 0.99 (128x128) |
+| shared down 5120x2304 | 256x128 | 0.95 / 1.00 | 1.01 / 1.00 |
+
+No site wins by >= 8% on both median and p10; most lose. Numerics (vs a double-accumulated
+reference of dequantised weights x f32 activations, 32 rows): f16x rel_rmse 2.78-2.83e-4 at every
+site; i8x 3.74-3.79e-3 (13x worse, the Q8_0 activation error the decode dp4a arm already carries);
+i8x vs f16x 3.77e-3; all five i8x geometries give identical outputs. Why it loses: at b = 512 the
+f16x GEMMs are not activation-bandwidth bound (the weight tile and the WMMA/LDS phases dominate), so
+halving the activation bytes buys nothing, while the int8 -> f16 dequant moves into the staging
+path; Engram's 1.87x came from replacing lds_tiled's core, not from the int8 activations.
+`V41_DENSE_I8X` therefore not added (nothing to gate).
+
+## Knobs on the branch after round 2 (value that restores the OLD path)
+
+Round 1 (24): V41_ATTN_DEC_FUSED=0, V41_KV_F16_ROUNDTRIP=1 (inverted), V41_ATTN_DEC_SCORE_BLK128=0,
+V41_GEMV_TB=0, V41_Q8_QUANT_WAVE=0, V41_Q8_QUANT_GRID_PAD=0, V41_SHARED_FUSED=0, V41_RMS_FAST=0,
+V41_ROUTER_MV_H20=0, V41_TOPK_WFRED=0, V41_MHC_GEMM_NARROW=0, V41_IDX_SCORE_QREG=0,
+V41_IDX_TOPK_HYBRID=0, V41_CAND_THRESH_ILP=0, V41_IDX_GATHER_B128=0, V41_MOE_DOWN_DN2=0,
+V41_MOE_WMMA_GATEUP=0, V41_MOE_WMMA_DOWN=0, V41_ENGRAM_I8X=0, V41_ENGRAM_CHUNK128=0,
+V41_GEMV_BPACK_Z16=0, V41_F16X_DB_BN64=0, V41_F16X_256=0, V41_REPLAY_F16X=0.
+Round 2 (4 new): V41_GRID_PAD=0 (also un-pads the gather_b128, z16 idx-q and fused-rope launches),
+V41_F16_MV_Z16=0, V41_DEC_SKIP_DEAD=0, V41_DEC_FUSE=0. Round-2 gate moves live under existing knobs
+(V41_F16X_256 >= 192 rows, V41_GEMV_BPACK_Z16 M >= 2048 or b >= 48, V41_IDX_GATHER_B128 b >= 3,
+V41_CAND_THRESH_ILP b <= 32): `=0` still restores the pre-round-1 kernel; there is no knob for the
+round-1 gate values themselves. Non-bit-exact knobs unchanged: V41_MOE_WMMA_GATEUP/_DOWN,
+V41_REPLAY_F16X (round 2 added none).
+
+## Next (seen, not done), ranked by expected value / effort
+
+1. **Gather dedupe at the S2 reuse layers.** Every reuse layer re-gathers the SAME top-512 rows from
+   the SAME comp-KV store as its index source (30 of 38 gathers per lane-step), into the shared
+   `sd.attn_active_comp_kv`. A per-lane (or per-index-group) destination would skip them: cold
+   gather is 20-28 us at b = 1..5 -> ~0.6-0.8 ms per lane-step. Needs scratch per lane + a validity
+   key (index group, lane).
+2. **Root-cause / systematise the 2048-wave dispatch window** (item a): a wrapper-level helper that
+   pads any short launch whose wave count lands at / just below a multiple of 2048 would catch the
+   next occurrence (gather b=2/4, idx-q, rope b=32/64 were all found by accident); worth one probe
+   of the HSA dispatch path (grid-size vs workgroup-count registers) and a note to AMD.
+3. **Guarded twins for rms_norm_weighted_batched(_fast) and kv_cache_append_batched** so the pad can
+   reach them: b+1-row runs 0.27-0.50x at prefill b >= 256 (n = 512 rms 18.7 -> 8.7 us, kv append
+   18 -> 4.8 us); ~1 ms per 1024-row chunk, prefill-only.
+4. **dn2 gate extension to rows < 128** (chain 0.89-0.94 at 12..64 rows in a 16-expert regime;
+   the production 384-expert regime needs > the 600 MB iGPU cap: measure with the hub down).
+5. **Router matvec + topk + readback_pack** in one launch via a last-WG-done ticket (the 48-WG h20
+   matvec must stay multi-WG): ~2 graph nodes per lane-layer.
+6. **Per-row head prep** (forward_head.rs hc_weighted_sum (20) + rms (1) per row): batch the rows
+   bit-identically per row and hoist the loads (rms_fast already did the rms half).
+7. **Shared-fused gate to b <= 7** (0.92 / 0.91 at 6 / 7 rows), **threshold ILP to 64**
+   (0.92-0.94, unresolved), **vec_add pad at replay b = 64** (0.87 med / 0.98 p10, unresolved).
+8. **Ratio-1 compressor at b = 3..4** still on grid.z = b (z16 1.05-1.08 there): a split-row
+   variant with more WGs per row would need a re-associated sum (not bit-exact).

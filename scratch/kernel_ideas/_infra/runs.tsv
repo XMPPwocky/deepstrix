@@ -594,3 +594,6 @@
 2026-09-27T02:09:42Z	round2/d_chain_i3	dgpu	40MB	rc=0	2.4s	busy_before=81	busy_after=88	env CH_INTREE=1 ./chain_harness 1 2 3 4 5 8  
 2026-09-27T02:10:07Z	round2/d_chain_i4	dgpu	40MB	rc=0	1.1s	busy_before=35	busy_after=74	env CH_INTREE=1 ./chain_harness 1 2 3 4 5 8  
 2026-09-27T02:10:09Z	round2/d_chain_i5	dgpu	40MB	rc=0	2.0s	busy_before=4	busy_after=49	env CH_INTREE=1 ./chain_harness 1 2 3 4 5 8  
+2026-09-27T02:15:38Z	round2/e_i8x_r1	dgpu	128MB	rc=0	11.2s	busy_before=46	busy_after=79	bash run_job.sh r1  
+2026-09-27T02:16:11Z	round2/e_i8x_r2	dgpu	128MB	rc=0	11.3s	busy_before=71	busy_after=84	bash run_job.sh r2  
+2026-09-27T02:16:23Z	round2/e_i8x_r3	dgpu	128MB	rc=0	12.1s	busy_before=88	busy_after=74	bash run_job.sh r3  
