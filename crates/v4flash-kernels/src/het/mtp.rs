@@ -409,8 +409,8 @@ fn no_routed() -> bool {
 }
 
 /// `V41_MTP_KV_QUANT=v4` selects the LEGACY ring/block KV quantizer
-/// (`kv_post_fused`: E4M3 with an f32 scale per 64 over the first 448 dims, the
-/// 64-dim RoPE tail left unquantized). That is NOT what the reference does:
+/// (`kv_post_fused`: E4M3 with a power-of-two scale per 64 over the first 448
+/// dims, the 64-dim RoPE tail left unquantized). That is NOT what the reference does:
 /// `DSparkAttention` runs `act_quant(kv, fp8_block_size, scale_fmt, ...)` on the
 /// WHOLE 512-dim row, E4M3 with a power-of-two (ue8m0) scale per 32, RoPE tail
 /// included -- exactly the main model's V4.1 window KV. The default (`v41`) is
