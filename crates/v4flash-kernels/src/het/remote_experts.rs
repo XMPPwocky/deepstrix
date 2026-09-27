@@ -436,6 +436,11 @@ pub mod proto {
     pub const RESP_FLAG_PIN: u32 = 1 << 14;
     pub const PIN_HDR_WORDS: usize = 4;
     pub const PIN_WORDS: usize = PIN_HDR_WORDS + RESID_WORDS;
+    /// A REQUEST of at most this many rows is DECODE-SHAPED for pinning: box 2
+    /// makes its picks pin-eligible at the reply, the hub counts them for
+    /// release ranking. Per request, never per merged pass (two mergeable
+    /// 9-32-row lanes are still decode).
+    pub const PIN_DECODE_MAX_ROWS: u32 = 16;
 
     /// Fixed request fields after the header (bytes):
     /// layer, b, flags, n_used, xq_bpt, reserved (6 × u32) then `t1` (u64,
@@ -3820,9 +3825,25 @@ impl ExpertShard {
         }
     }
 
+    /// A decode-shaped REQUEST's picks (`proto::PIN_DECODE_MAX_ROWS`, per
+    /// request: a merged partner grants its own) become eligible to pin at
+    /// the layer's next report. No-op unless pinning is on.
+    pub fn pin_grant(&mut self, layer: u32, picks: &[i32]) {
+        if !self.pin_on() || !self.layer_is_paged(layer) {
+            return;
+        }
+        let Some(p) = self.pool.as_mut() else { return };
+        for &e in picks {
+            if (0..N_EXPERT as i32).contains(&e) {
+                p.pins.grant(layer, e as u32);
+            }
+        }
+    }
+
     /// Build the pin-mode reply for `layer` after its pass: a DECODE-shaped
     /// pass's `picks` become eligible (a prefill chunk's do not: see the block
-    /// comment), eligible landed experts are pinned within budget, and the
+    /// comment; a merged pass grants per request via `pin_grant` and passes
+    /// none here), eligible landed experts are pinned within budget, and the
     /// layer's pinned set is returned as the map, with `[epoch, pinned,
     /// budget]`. An unpaged layer is its static assignment (never evicted).
     /// `None` unless pinning is on.
@@ -5918,9 +5939,19 @@ pub fn serve_connection(
                 }
                 let ev_t_d2h = if ev_on { super::evtrace::now() } else { nan };
                 // Pin mode: the map is the PINNED set (reporting pins), then the
-                // pin block with this pass's paged bits. A decode-shaped pass's
-                // picks (both requests' when merged) become pinnable here.
-                let decode_shaped = b + bb <= 16;
+                // pin block with this pass's paged bits. Each decode-shaped
+                // REQUEST's picks become pinnable here (per request, like the
+                // hub's release ranking: two mergeable 9-32-row lanes make a
+                // pass of up to 64 rows that is still decode), before either
+                // report so both maps carry them.
+                if req.flags & proto::REQ_FLAG_PIN != 0 && req.b <= proto::PIN_DECODE_MAX_ROWS {
+                    shard.pin_grant(req.layer, req.sel);
+                }
+                if let Some(rb) = reqb.as_ref() {
+                    if rb.flags & proto::REQ_FLAG_PIN != 0 && rb.b <= proto::PIN_DECODE_MAX_ROWS {
+                        shard.pin_grant(rb.layer, rb.sel);
+                    }
+                }
                 // PAGED bits: what the pass found not landed when it started,
                 // plus what the early-page hook found not landed when the
                 // frame(s) arrived (a read it finished before the pass began
@@ -5932,7 +5963,7 @@ pub fn serve_connection(
                         or_words(&mut paged, &shard.take_early_paged(hb.seq));
                     }
                 }
-                let pin_a = if req.flags & proto::REQ_FLAG_PIN != 0 { shard.pin_report(req.layer, sel_run, decode_shaped) } else { None };
+                let pin_a = if req.flags & proto::REQ_FLAG_PIN != 0 { shard.pin_report(req.layer, &[], false) } else { None };
                 match pin_a {
                     Some((map, [epoch, pinned, budget])) => {
                         proto::append_residency(&mut resp, &map);
@@ -5957,7 +5988,7 @@ pub fn serve_connection(
                         } else {
                             exec.read_f16_at(b, bb, resp_b.view_mut::<u16>(proto::RESP_DATA_OFF, nb))?;
                         }
-                        let pin_b = if rb.flags & proto::REQ_FLAG_PIN != 0 { shard.pin_report(rb.layer, &[], decode_shaped) } else { None };
+                        let pin_b = if rb.flags & proto::REQ_FLAG_PIN != 0 { shard.pin_report(rb.layer, &[], false) } else { None };
                         match pin_b {
                             Some((map, [epoch, pinned, budget])) => {
                                 proto::append_residency(&mut resp_b, &map);
@@ -6316,7 +6347,7 @@ fn serve_interleaved(
     if req.flags & proto::REQ_FLAG_PIN != 0 {
         or_words(&mut paged, &shard.take_early_paged(hdr.seq));
     }
-    let pin = if req.flags & proto::REQ_FLAG_PIN != 0 { shard.pin_report(req.layer, req.sel, b <= 16) } else { None };
+    let pin = if req.flags & proto::REQ_FLAG_PIN != 0 { shard.pin_report(req.layer, req.sel, req.b <= proto::PIN_DECODE_MAX_ROWS) } else { None };
     match pin {
         Some((map, [epoch, pinned, budget])) => {
             proto::append_residency(&mut resp, &map);
@@ -6964,7 +6995,7 @@ impl RemoteExpertClient {
         // surprise check on the reply), and the queued RELEASE words, which
         // only go out once box 2 has shown it understands them.
         let (held, n_held) = if flags & proto::REQ_FLAG_PIN != 0 {
-            super::b2_mirror::pin_note_submit(layer, &self.sel_scratch[..b * nu], b <= 16)
+            super::b2_mirror::pin_note_submit(layer, &self.sel_scratch[..b * nu], b as u32 <= proto::PIN_DECODE_MAX_ROWS)
         } else {
             ([0u32; proto::RESID_WORDS], 0)
         };
@@ -7915,10 +7946,12 @@ mod tests {
                 self.st.prefill += 1;
             }
             self.ensure(rng, a.layer, &sel, &[], bt > 16);
-            let r = self.reply(&a, &sel, bt <= 16, paged);
+            // Per REQUEST shape (`PIN_DECODE_MAX_ROWS`), as `serve_connection`.
+            let dec = |r: &SimReq| r.b as u32 <= proto::PIN_DECODE_MAX_ROWS;
+            let r = self.reply(&a, &a.sel, dec(&a), paged);
             replies.push(r);
             if let Some(b) = partner.as_ref() {
-                let r = self.reply(b, &[], bt <= 16, paged);
+                let r = self.reply(b, &b.sel, dec(b), paged);
                 replies.push(r);
             }
         }

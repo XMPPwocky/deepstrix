@@ -1095,6 +1095,10 @@ pub fn substitute(
 mod tests {
     use super::*;
 
+    /// The mirror's rows, marks and the pin ledger are process-wide statics:
+    /// tests that touch them run one at a time.
+    static STATICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     const S: f32 = 1.5;
     const R6: SubRules = SubRules { min_rank: 6, max_w: None, scale: S };
 
@@ -1368,6 +1372,7 @@ mod tests {
     /// test touches.
     #[test]
     fn mirror_update_pending_and_lookup() {
+        let _g = STATICS.lock().unwrap_or_else(|p| p.into_inner());
         let l = (LAYERS - 1) as u32;
         assert_eq!(resident(l as i32, 3), None, "unseen layer is unknown");
         let mut w = vec![0u32; (N_EXPERT as usize).div_ceil(32)];
@@ -1396,6 +1401,7 @@ mod tests {
     /// Own layer; the only test that advances the step clock.
     #[test]
     fn incoming_window_and_count() {
+        let _g = STATICS.lock().unwrap_or_else(|p| p.into_inner());
         let l = (LAYERS - 3) as u32;
         let n = incoming_steps();
         assert!(n >= 1, "test assumes V41_SUB_INCOMING is on (default 2)");
@@ -1501,6 +1507,83 @@ mod tests {
         p[0] = 0b0111;
         p[11] = 1;
         assert_eq!(surprise_count(&h, &p), 2);
+    }
+
+    /// The hub's REAL pin glue, end to end on the statics (the randomized
+    /// protocol test in `remote_experts` drives a bare `PinLedger`): connect
+    /// -> negotiation -> a pin reply holds -> `begin_step` releases the
+    /// coldest, clearing the mirror's BITS at once -> the words leave in
+    /// index order, 128 per request -> a stale map (old epoch) cannot bring a
+    /// released expert back, a later one can -> the surprise check counts
+    /// `held & paged` and the per-step stats drain -> an older daemon (no pin
+    /// block) turns pinning off for the connection.
+    #[test]
+    fn pin_statics_end_to_end() {
+        let _g = STATICS.lock().unwrap_or_else(|p| p.into_inner());
+        let l = (LAYERS - 2) as u32;
+        set_pin_wanted(true);
+        on_connect();
+        assert_eq!(pin_request_flag(), REQ_FLAG_PIN, "asked from the first request");
+        assert!(!pin_active() && take_release_words(8).is_empty(), "no words before box 2 answers");
+        // Box 2 answers with a pin block: 300 experts of the layer pinned,
+        // 745 of 1000 overall (above budget - headroom 256: a release is due).
+        let all: Vec<u32> = (0..300).collect();
+        update_pinned(l, &map(&all), 0, 745, 1000);
+        pin_reply_seen(true);
+        assert!(pin_active() && pin_request_flag() == REQ_FLAG_PIN);
+        let (h, n) = pin_note_submit(l, &[3, 5, 301, -1], true);
+        assert_eq!(n, 2);
+        assert!(h[0] & (1 << 3) != 0 && h[0] & (1 << 5) != 0 && h[9] & (1 << (301 % 32)) == 0);
+        assert!(held(l, 7) && !held(l, 301));
+        // 3, 5, 7 are hot; everything else in the layer is cold.
+        for _ in 0..4 {
+            let _ = pin_note_submit(l, &[3, 5, 7], true);
+        }
+        let _ = take_pin_stats();
+        // A step: release the 257 coldest (745 - (1000 - 512)) at once.
+        begin_step();
+        let mut words = Vec::new();
+        for want in [128usize, 128, 1, 0] {
+            let w = take_release_words(128);
+            assert_eq!(w.len(), want);
+            words.extend(w);
+        }
+        assert_eq!(words.len(), 257);
+        let released: Vec<u32> = words.iter().map(|w| w & 0xFFFF).collect();
+        assert!(words.iter().all(|w| w >> 16 == l));
+        assert!(!released.iter().any(|e| [3, 5, 7].contains(e)), "the hot ones stay");
+        for e in 0..300u32 {
+            assert_eq!(held(l, e), !released.contains(&e), "BITS cleared at release for e{e}");
+            assert_eq!(pin_note_submit(l, &[e as i32], false).1, u32::from(!released.contains(&e)));
+        }
+        let st = take_pin_stats().unwrap();
+        assert_eq!((st[2], st[3], st[4]), (257.0, 488.0, 1000.0), "released, est pinned net of in-flight, budget");
+        // Nothing more to release now that the estimate is at target.
+        begin_step();
+        assert!(take_release_words(128).is_empty());
+        // A map built before box 2 applied the releases (epoch 0) must not
+        // resurrect them; one built after all 257 (epoch 257) does.
+        update_pinned(l, &map(&all), 0, 745, 1000);
+        assert!(!held(l, released[0]) && held(l, 3));
+        update_pinned(l, &map(&all), 257, 745, 1000);
+        assert!(held(l, released[0]) && held(l, released[256]) && held(l, 3));
+        // Surprise: held-at-submit 3 paged anyway (with 301, which was not held).
+        let (h, _) = pin_note_submit(l, &[3, 301], true);
+        let mut paged = [0u32; RESID_WORDS];
+        paged[0] = 1 << 3;
+        paged[301 / 32] = 1 << (301 % 32);
+        assert_eq!(check_surprises(l, 42, &h, &paged), 1);
+        let st = take_pin_stats().unwrap();
+        assert_eq!(st[0], 1.0, "one surprise drained");
+        assert_eq!(take_pin_stats().unwrap()[0], 0.0);
+        // Reconnect: everything forgotten; an older daemon turns pinning off.
+        on_connect();
+        assert!(!held(l, 3) && !pin_active() && take_release_words(8).is_empty());
+        pin_reply_seen(false);
+        assert!(!pin_active() && pin_request_flag() == 0, "fell back to the plain mirror");
+        set_pin_wanted(false);
+        on_connect();
+        assert_eq!(pin_request_flag(), 0);
     }
 
     /// Release indices wrap without ever becoming 0 (= never released), and
