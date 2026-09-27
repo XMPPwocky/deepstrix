@@ -253,6 +253,63 @@ extern "C" __global__ void q8_0_grouped_gemv_bpack(
     }
 }
 
+// q8_0_grouped_gemv_bpack_z16 — the q8_0_grouped_gemv_bpack body above with the
+// batch split into chunks of 16 on grid.z = ceil(batch/16) (slice z offsets
+// xq / xscale / out by 16 z rows): BIT-IDENTICAL per (row, b) to
+// q8_0_grouped_gemv_batched, weight re-read ceil(b/16) times instead of b.
+// 2026-09-26 sweep (C2_dense_prefill/replay_bpack_z16, cold, b = 64): wo_a 1210
+// -> 535 us. Selected by Q8_0GroupedMatvec for 16 < b <= 64 on the dp4a arm
+// (V41_GEMV_BPACK_Z16). grid (out_dim/8, 1, ceil(b/16)) x 256.
+extern "C" __global__ void q8_0_grouped_gemv_bpack_z16(
+    float* __restrict__ out, const unsigned char* __restrict__ w, const int8_t* __restrict__ xq,
+    const float* __restrict__ xscale, unsigned int group_dim, unsigned int rank,
+    unsigned int blocks_per_group, unsigned int n_groups, unsigned int batch)
+{
+    uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    uint32_t out_dim = n_groups * rank;
+    if (row >= out_dim) return;
+    const uint32_t b0 = blockIdx.z * GGEMV_BPACK_MAX;
+    if (b0 >= batch) return;
+    const uint32_t nb = (batch - b0 < GGEMV_BPACK_MAX) ? (batch - b0) : GGEMV_BPACK_MAX;
+    const uint32_t xq_stride = n_groups * group_dim;
+    const uint32_t xs_stride = n_groups * blocks_per_group;
+    xq += (size_t)b0 * xq_stride; xscale += (size_t)b0 * xs_stride; out += (size_t)b0 * out_dim;
+    uint32_t g = row / rank;
+    const unsigned char* wr = w + (size_t)row * (size_t)blocks_per_group * 34u;
+    const __half* scales = (const __half*)wr;
+    const int8_t* quants = (const int8_t*)(wr + (size_t)blocks_per_group * 2u);
+    float acc[GGEMV_BPACK_MAX];
+    for (uint32_t b = 0; b < nb; ++b) acc[b] = 0.0f;
+    for (uint32_t bl = lane; bl < blocks_per_group; bl += WARP_LANES) {
+        const int8_t* qs = quants + (size_t)bl * 32u;
+        uint4 av0, av1;
+        __builtin_memcpy(&av0, qs, 16);
+        __builtin_memcpy(&av1, qs + 16, 16);
+        const float ws = __half2float(scales[bl]);
+        for (uint32_t b = 0; b < nb; ++b) {
+            const int8_t* xqb = xq + (size_t)b * xq_stride + (size_t)g * group_dim + (size_t)bl * 32u;
+            uint4 bv0, bv1;
+            __builtin_memcpy(&bv0, xqb, 16);
+            __builtin_memcpy(&bv1, xqb + 16, 16);
+            int32_t dot = 0;
+            dot = gdp4a_sudot((int32_t)av0.x, (int32_t)bv0.x, dot);
+            dot = gdp4a_sudot((int32_t)av0.y, (int32_t)bv0.y, dot);
+            dot = gdp4a_sudot((int32_t)av0.z, (int32_t)bv0.z, dot);
+            dot = gdp4a_sudot((int32_t)av0.w, (int32_t)bv0.w, dot);
+            dot = gdp4a_sudot((int32_t)av1.x, (int32_t)bv1.x, dot);
+            dot = gdp4a_sudot((int32_t)av1.y, (int32_t)bv1.y, dot);
+            dot = gdp4a_sudot((int32_t)av1.z, (int32_t)bv1.z, dot);
+            dot = gdp4a_sudot((int32_t)av1.w, (int32_t)bv1.w, dot);
+            acc[b] += ws * xscale[(size_t)b * xs_stride + (size_t)g * blocks_per_group + bl] * (float)dot;
+        }
+    }
+    for (uint32_t b = 0; b < nb; ++b) {
+        float a = gwarp_sum_f32(acc[b]);
+        if (lane == 0) out[(size_t)b * (size_t)out_dim + row] = a;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // COMPILE-TIME-BATCH twins of q8_0_grouped_gemv_bpack: `q8_0_grouped_gemv_bpack_tB<B>`,
 // B = 1..8. Same argument list (`batch` ignored; the wrapper picks the symbol), same grid

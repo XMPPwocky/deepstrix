@@ -386,6 +386,60 @@ fn prefill_f32_matvec(b: u32) -> bool {
     }
 }
 
+/// Rows at or below which q_b / wo_a / wo_b keep the dp4a arm under
+/// `V41_REPLAY_F16X` (the kv projection keeps [`prefill_f32_matvec`]'s 64).
+const REPLAY_F16X_DP4A_MAX: u32 = 16;
+
+/// `V41_REPLAY_F16X` (default ON; `0` = [`prefill_f32_matvec`], i.e. dp4a up to
+/// 64 rows): the dp4a/f16x switch of the q_b, wo_a and wo_b projections moves
+/// from 64 to 16 rows, so the CED replay (~64 rows per lane) runs the f16x WMMA
+/// GEMM instead of the dp4a GEMV. NOT BIT-EXACT: f16 activations, the numerics
+/// every prefill pass above 64 rows already uses (rel_rmse 2.9e-4 vs dp4a);
+/// covered by the golden gate. 2026-09-26 sweep (C2_dense_prefill/
+/// replay_f16x_b64, cold, b = 64): q_b 1519 -> 269 us, wo_b 1493 -> 232, wo_a
+/// 1204 -> 168; -3.5 ms per replay lane-layer (on top of V41_GEMV_BPACK_Z16's
+/// dp4a gain it replaces for these three). kv stays on dp4a (f16x loses there,
+/// 52 -> 97 us). Decode (<= 8 rows) and DSpark verifies (<= 16) are unaffected.
+/// An explicit `V41_PREFILL_F32_MATVEC=0|1` still wins.
+fn prefill_f32_matvec_qb_wo(b: u32) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_REPLAY_F16X").as_deref() != Ok("0"));
+    match std::env::var("V41_PREFILL_F32_MATVEC").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ if *D => b <= REPLAY_F16X_DP4A_MAX,
+        _ => b <= 64,
+    }
+}
+
+/// `V41_ENGRAM_CHUNK128` (default ON; `0` = 64-row passes): the prefill Engram
+/// wkv GEMM + gate run on 128-row passes instead of 64, halving the 167 MB
+/// weight re-reads per lane (with `V41_ENGRAM_I8X`: 2 x 484 -> 511 us per 128
+/// rows; lds_tiled is correct at 128 rows too). Passes are formed so that every
+/// row takes the SAME kernel it takes under 64-row chunking (a 64-row sub-chunk
+/// the 64-row scheme sends to the dp4a GEMV arm, i.e. a <= 8-row tail, stays a
+/// separate pass), so the result is BIT-IDENTICAL to 64-row chunking. The
+/// Engram scratch (`engram_xq/xscale/kv`, batch_scratch.rs) is sized by this
+/// value: +6.6 MB of dGPU memory per batch-scratch set at 128.
+pub fn engram_chunk_rows() -> u32 {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_ENGRAM_CHUNK128").as_deref() != Ok("0"));
+    if *D { 2 * ENGRAM_CHUNK } else { ENGRAM_CHUNK }
+}
+
+/// Rows of the next Engram pass with `remaining` rows left and passes of up to
+/// `chunk` rows (a multiple of ENGRAM_CHUNK = 64). A pass longer than 64 rows is
+/// cut back to 64 when its trailing 64-row sub-chunk would, under 64-row
+/// chunking, be a <= 8-row pass that takes the dp4a GEMV arm
+/// (`small_b_dense_dp4a`) -- so every row runs the same kernel arm as with
+/// 64-row passes, and the WMMA arms are per-row independent of the pass size
+/// (tests/q8_0_sweep_c2_bitexact.rs checks both).
+pub fn engram_pass_rows(remaining: usize, chunk: usize) -> usize {
+    let c = ENGRAM_CHUNK as usize;
+    let n = remaining.min(chunk);
+    if n > c && super::dispatch::small_b_dense_dp4a((n - c) as u32) { c } else { n }
+}
+
 /// Use DECODE'S EXACT mHC mix kernel (`launch_inv_only` + `matvec_pre_scaled`,
 /// one row at a time) instead of the batched form.
 ///
@@ -3598,7 +3652,9 @@ impl HeterogeneousEngine {
             let (ein, eout, hcd) = (ENGRAM_IN as usize, ENGRAM_OUT as usize, HC_DIM as usize);
             let mut c0 = 0usize;
             while c0 < b as usize {
-                let n = (b as usize - c0).min(ENGRAM_CHUNK as usize);
+                // `V41_ENGRAM_CHUNK128`: up to 128 rows per pass, bit-identical to
+                // 64-row passes (see `engram_pass_rows`).
+                let n = engram_pass_rows(b as usize - c0, engram_chunk_rows() as usize);
                 let rows = bd.engram_rows.slice_view(c0 * ein, n * ein);
                 let mut xq = bd.engram_xq.slice_view_mut(0, n * ein);
                 let mut xs = bd.engram_xscale.slice_view_mut(0, n * ein / 32);
@@ -3621,6 +3677,10 @@ impl HeterogeneousEngine {
                 // ~1 ms per Engram layer (dgpu.engram 2.15 ms/step, 2 layers).
                 if engram_gemv_fallback() || super::dispatch::small_b_dense_dp4a(n as u32) {
                     de.q8.matvec_batched(&de.compute, &mut kv, &eg.wkv.buffer, &xq, &xs, ENGRAM_OUT, ENGRAM_IN, n as u32)?;
+                } else if crate::q8_0::engram_i8x_for(ENGRAM_OUT, ENGRAM_IN) {
+                    // `V41_ENGRAM_I8X`: f16x-tile twin of lds_tiled, bit-identical;
+                    // 2026-09-26 sweep: 905 -> 484 us per 64 rows.
+                    de.q8_wmma.gemm_i8x_db(&de.compute, &mut kv, &eg.wkv.buffer, &xq, &xs, ENGRAM_OUT, ENGRAM_IN, n as u32)?;
                 } else {
                     de.q8_wmma.gemm_lds_tiled(&de.compute, &mut kv, &eg.wkv.buffer, &xq, &xs, ENGRAM_OUT, ENGRAM_IN, n as u32)?;
                 }
@@ -3974,8 +4034,9 @@ impl HeterogeneousEngine {
         // and the KLD it was scored against (2.026 -> 1.631 nats) was measured
         // through #0b. `QB_WMMA` / `Q8_GROUPED_VARIANT` / `Q8_OUT_VARIANT` set
         // explicitly still win.
+        // `V41_REPLAY_F16X` (prefill_f32_matvec_qb_wo): f16x above 16 rows, not 64.
         let qb_variant = std::env::var("QB_WMMA")
-            .unwrap_or_else(|_| if prefill_f32_matvec(b) { "dp4a".into() } else { "f16x".into() });
+            .unwrap_or_else(|_| if prefill_f32_matvec_qb_wo(b) { "dp4a".into() } else { "f16x".into() });
         if qb_variant != "f16x" {
             // legacy variants consume the Q8_0 quantization of qr
             de.q8.quantize_input_batched(&de.compute, &mut sd.qr_xq, &mut sd.qr_xscale, &sd.qr_normed, N_LORA_Q, b)?;
@@ -3983,7 +4044,9 @@ impl HeterogeneousEngine {
         match qb_variant.as_str() {
             "f16x" => {
                 let _t = de.events.stage("k.q_chain.qb_f16x", &de.compute)?;
-                de.q8_wmma.gemm_f16x(&de.compute, &mut sd.q, &dlw.attn_q_b.buffer, &sd.qr16,
+                // `V41_F16X_256`: 256x128 tile above 64 rows (bit-identical, x1.11 at 512).
+                de.q8_wmma.gemm_f16x_tile(crate::q8_0::f16x_tile_qb_wo_a(Q_FLAT, b),
+                    &de.compute, &mut sd.q, &dlw.attn_q_b.buffer, &sd.qr16,
                     N_LORA_Q, Q_FLAT, 1, b, super::batch_scratch::f16_pitch(N_LORA_Q))?;
             }
             "0" | "dp4a" => {
@@ -4086,7 +4149,10 @@ impl HeterogeneousEngine {
                 )?;
             } else {
                 let _t = de.events.stage("k.kv_chain.gemm_f16x", &de.compute)?;
-                de.q8_wmma.gemm_f16x(&de.compute, &mut sd.kv_raw, &dlw.attn_kv.buffer, &sd.x16_n_embd,
+                // `V41_F16X_DB_BN64`: 128x64 double-buffered tile above 64 rows
+                // (bit-identical, x1.79 at 512).
+                de.q8_wmma.gemm_f16x_tile(crate::q8_0::f16x_tile_kv(b),
+                    &de.compute, &mut sd.kv_raw, &dlw.attn_kv.buffer, &sd.x16_n_embd,
                     N_EMBD, N_HEAD_DIM, 1, b, super::batch_scratch::f16_pitch(N_EMBD))?;
             }
         }
@@ -6290,13 +6356,16 @@ impl HeterogeneousEngine {
             // `q8_grouped.matvec_grouped_batched`, the batched twin of decode's
             // `matvec_grouped`. Guarded quantize at the branch above writes
             // heads_xq/heads_xscale, so this arm has its input.
+            // `V41_REPLAY_F16X` (prefill_f32_matvec_qb_wo): f16x above 16 rows, not 64.
             let grp_variant = std::env::var("Q8_GROUPED_VARIANT")
-                .unwrap_or_else(|_| if prefill_f32_matvec(b) { "dp4a".into() } else { "f16x".into() });
+                .unwrap_or_else(|_| if prefill_f32_matvec_qb_wo(b) { "dp4a".into() } else { "f16x".into() });
             if grp_variant != "f16x" {
                 de.q8.quantize_input_batched(&de.compute, &mut sd.heads_xq, &mut sd.heads_xscale, &sd.heads, Q_FLAT, b)?;
             }
             if grp_variant == "f16x" {
-                de.q8_wmma.gemm_f16x(&de.compute, &mut sd.low, &dlw.attn_output_a.buffer, &sd.heads16,
+                // `V41_F16X_256`: 256x128 tile above 64 rows (bit-identical, x1.13 at 512).
+                de.q8_wmma.gemm_f16x_tile(crate::q8_0::f16x_tile_qb_wo_a(RANK, b),
+                    &de.compute, &mut sd.low, &dlw.attn_output_a.buffer, &sd.heads16,
                     GROUP_DIM, RANK, N_GROUPS, b, super::batch_scratch::f16_pitch(Q_FLAT))?;
             } else if grp_variant == "dp4a" {
                 de.q8_grouped.matvec_grouped_batched(
@@ -6325,8 +6394,9 @@ impl HeterogeneousEngine {
             // (8.82 → 1.42 ms). Q8_OUT_VARIANT=dp4a rolls back.
             // Same: the "dp4a" arm is `q8.matvec_batched`, decode's kernel with a
             // row dimension. The guarded quantize below writes low_xq/low_xscale.
+            // `V41_REPLAY_F16X` (prefill_f32_matvec_qb_wo): f16x above 16 rows, not 64.
             let out_variant = std::env::var("Q8_OUT_VARIANT")
-                .unwrap_or_else(|_| if prefill_f32_matvec(b) { "dp4a".into() } else { "f16x".into() });
+                .unwrap_or_else(|_| if prefill_f32_matvec_qb_wo(b) { "dp4a".into() } else { "f16x".into() });
             if out_variant != "f16x" {
                 de.q8.quantize_input_batched(&de.compute, &mut sd.low_xq, &mut sd.low_xscale, &sd.low, OUT_LOW, b)?;
             }

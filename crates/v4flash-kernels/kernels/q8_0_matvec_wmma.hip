@@ -704,3 +704,376 @@ extern "C" __global__ void q8_0_gemm_wmma_f16x(
     (void)out; (void)w; (void)x16; (void)K; (void)M; (void)n_groups; (void)batch; (void)blocks; (void)ldx;
 #endif
 }
+
+// =============================================================================
+// 2026-09-26 sweep (C2_dense_prefill): per-shape twins of q8_0_gemm_wmma_f16x /
+// q8_0_gemm_wmma_lds_tiled built on ONE generic core (f16x_core, verbatim from
+// scratch/kernel_ideas/C2_dense_prefill/cand.hip incl. its ablation template
+// parameters, which default off). All BIT-EXACT vs the kernels they replace:
+// same perm-trick weight dequant, same activation expression, same per-
+// accumulator k order (k_outer ascending, two 16-wide inner steps), same WMMA;
+// only the tile / wave geometry, barrier and prefetch change.
+//   q8_0_gemm_wmma_i8x_db        Engram wkv (lds_tiled drop-in): 128x128 tile,
+//                                int8 + xscale activations dequantised at stage
+//                                as lds_tiled does ((f16)((float)q*xs)), double-
+//                                buffered LDS (40 KB), 2-deep register prefetch.
+//                                905 -> 484 us per 64-row chunk; 511 us per 128.
+//   q8_0_gemm_wmma_f16x_db_bn64  kv / q_a: 128x64 tile (8 waves 4x2), DB LDS
+//                                (30 KB -> 2 WGs/WGP), pf2. kv 106 -> 59 us, q_a
+//                                125 -> 97 us at b=512 (q_a LOSES 4% at 1024).
+//   q8_0_gemm_wmma_f16x_256x128  q_b / wo_a: 256x128 tile (wave tile 64x64, 216
+//                                VGPR, 30 KB LDS), halves the activation-tile re-
+//                                reads. q_b 458 -> 410 us, wo_a 367 -> 325 at 512.
+// Selected in src/q8_0.rs (V41_ENGRAM_I8X, V41_F16X_DB_BN64, V41_F16X_256).
+// Mechanisms worth keeping (NOTES.md): the B (activation) loads are branch-free
+// (an out-of-range token reads the last valid row, zeroed by a select AFTER the
+// barrier -- selecting right after the load made the compiler wait on it and
+// turned the prefetch synchronous: "the load-select trap"); the barrier is
+// LDS-only (sync_lds) so global prefetches stay in flight across it. The i8x
+// kernel's speed was seen to be codegen-sensitive: re-measure this exact file.
+// gfx12 only; other archs compile stubs (like the kernels above).
+// =============================================================================
+#if defined(__gfx1200__) || defined(__gfx1201__)
+// LDS-only workgroup barrier: release/acquire fences restricted to the local address space so the
+// compiler emits s_wait_dscnt 0 (not s_wait_loadcnt_dscnt 0) and no global_inv. Global loads issued
+// before it stay in flight across the barrier. Valid here because the only data exchanged through
+// the barrier is LDS.
+__device__ __forceinline__ void sync_lds() {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#else
+    __syncthreads();
+#endif
+}
+
+// ---------------------------------------------------------------------------------------------
+// Generic core. BM x BN x 32 tile, WM x WN waves, wave tile (BM/WM) x (BN/WN), PF-deep register
+// prefetch. A (weights) staged as 16-byte int8 slots (BM*2 slots), dequantised into LDS f16 [row][40].
+// B (activations): F16 -> 16-byte f16 slots (BN*4); I8 -> 16-byte int8 slots (BN*2) + f32 xscale,
+// dequantised as (f16)((float)q * xscale) exactly like q8_0_gemm_wmma_lds_tiled.
+// ---------------------------------------------------------------------------------------------
+// ABL (ablation, NOT correct, for pricing the parts): 0 = none; 1 = no global loads after k-outer 0
+// (registers reused); 2 = no LDS traffic after k-outer 0 (fragments reused; the global loads are
+// still consumed through a cheap xor so they are not dead); 3 = no WMMAs (fragments xor-folded).
+// BRF: branch-free B loads (clamped row + select) vs execz-guarded loads (production style).
+// DB: double-buffered LDS tiles; per k-outer: [frag ds_loads from buf cur] [stage next -> buf cur^1]
+//     [reload regs] [WMMAs] [ONE barrier]. Register prefetch PF stages deep = PF iterations of
+//     global latency hiding. LDS 2x.
+template <int BM, int BN, int WM, int WN, int PF, bool BI8, bool LB, int ABL = 0, bool BRF = true, bool DB = false, bool AON = false, bool W0 = false>
+__device__ __forceinline__ void f16x_core(
+    float* __restrict__ out, const unsigned char* __restrict__ w,
+    const uint16_t* __restrict__ x16, const int8_t* __restrict__ xq, const float* __restrict__ xscale,
+    uint32_t K, uint32_t M, uint32_t n_groups, uint32_t batch, uint32_t blocks, uint32_t ldx)
+{
+    constexpr int BK = 32;
+    constexpr int LDS_STRIDE = BK + 8;               // 40 halves = 80 B
+    constexpr int NT_ = WM * WN * 32;                // threads
+    constexpr int MT = (BM / WM) / 16, NTL = (BN / WN) / 16;
+    constexpr int A_SLOTS = BM * 2;                  // 16 B int8 slots per k-outer
+    constexpr int A_PER = (A_SLOTS + NT_ - 1) / NT_;
+    constexpr int B_SLOTS = BI8 ? BN * 2 : BN * 4;   // 16 B slots
+    constexpr int B_PER = (B_SLOTS + NT_ - 1) / NT_;
+    static_assert(A_SLOTS % NT_ == 0 || NT_ % A_SLOTS == 0, "A slots");
+    static_assert(B_SLOTS % NT_ == 0 || NT_ % B_SLOTS == 0, "B slots");
+
+    __shared__ __attribute__((aligned(16))) _Float16 A_tile[(DB ? 2 : 1) * BM * LDS_STRIDE];
+    __shared__ __attribute__((aligned(16))) _Float16 B_tile[(DB ? 2 : 1) * BN * LDS_STRIDE];
+
+    const uint32_t tid  = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5;
+    const uint32_t wave_m0 = (wave / WN) * (BM / WM);
+    const uint32_t wave_n0 = (wave % WN) * (BN / WN);
+    const uint32_t n0 = blockIdx.x * BN;
+    const uint32_t m0 = blockIdx.y * BM;
+    const uint32_t g  = blockIdx.z;
+    if (m0 >= M) return;
+    const uint32_t ldo = n_groups * M;
+    const size_t rowbytes   = (size_t)blocks * 34u;
+    const size_t scalebytes = (size_t)blocks * 2u;
+    const unsigned char* w_g = w + (size_t)g * (size_t)M * rowbytes;
+
+    // staging roles
+    const unsigned char* a_src[A_PER]; uint32_t a_row[A_PER], a_koff[A_PER]; bool a_on[A_PER];
+    #pragma unroll
+    for (int i = 0; i < A_PER; ++i) {
+        const uint32_t slot = tid + i * NT_;
+        a_on[i] = (AON || A_SLOTS % NT_ != 0) ? (slot < A_SLOTS) : true;   // AON: runtime predicate (r1 style)
+        a_row[i] = a_on[i] ? slot >> 1 : 0u;
+        a_koff[i] = (slot & 1u) * 16u;
+        a_src[i] = w_g + (size_t)(m0 + a_row[i]) * rowbytes;    // m0+row < M by M % BM == 0
+    }
+    const void* b_src[B_PER]; uint32_t b_row[B_PER], b_koff[B_PER]; bool b_on[B_PER];
+    const float* bs_src[B_PER];
+    #pragma unroll
+    for (int i = 0; i < B_PER; ++i) {
+        const uint32_t slot = tid + i * NT_;
+        const bool in = (B_SLOTS % NT_ == 0) ? true : (slot < B_SLOTS);
+        if (BI8) { b_row[i] = in ? slot >> 1 : 0u; b_koff[i] = (slot & 1u) * 16u; }
+        else     { b_row[i] = in ? slot >> 2 : 0u; b_koff[i] = (slot & 3u) * 8u; }
+        b_on[i] = in && (n0 + b_row[i]) < batch;
+        // Branch-free loads: an out-of-range token reads the LAST valid row (always mapped) and the
+        // register is zeroed by a select afterwards, so the waitcnt pass sees straight-line loads
+        // and can count them (an execz-guarded load forced s_wait_loadcnt 0 at every stage).
+        const uint32_t brow = (n0 + b_row[i] < batch) ? (n0 + b_row[i]) : (batch - 1u);
+        if (BI8) {
+            b_src[i] = xq + (size_t)brow * (size_t)ldx + (size_t)g * K;
+            bs_src[i] = xscale + (size_t)brow * (size_t)(ldx / 32u) + (size_t)g * blocks;
+        } else {
+            b_src[i] = x16 + (size_t)brow * (size_t)ldx + (size_t)g * K;
+            bs_src[i] = nullptr;
+        }
+    }
+
+    float8 acc[MT][NTL];
+    #pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+        #pragma unroll
+        for (int nt = 0; nt < NTL; ++nt)
+            acc[mt][nt] = (float8){0,0,0,0,0,0,0,0};
+
+    // prefetch registers, PF stages deep
+    uint4 qa[PF][A_PER]; uint16_t sbits[PF][A_PER];
+    uint4 vb[PF][B_PER]; float xs[PF][B_PER];
+    auto load_raw = [&](int p, uint32_t ko) {
+        #pragma unroll
+        for (int i = 0; i < A_PER; ++i) if (a_on[i]) {
+            __builtin_memcpy(&qa[p][i], a_src[i] + scalebytes + ko + a_koff[i], 16);
+            __builtin_memcpy(&sbits[p][i], a_src[i] + 2u * (ko >> 5), 2);
+        }
+        #pragma unroll
+        for (int i = 0; i < B_PER; ++i) {
+            const uint32_t slot = tid + i * NT_;
+            if ((B_SLOTS % NT_ != 0) && slot >= B_SLOTS) { vb[p][i] = make_uint4(0u, 0u, 0u, 0u); if (BI8) xs[p][i] = 0.f; continue; }
+            if (!BRF) {   // production style: guarded load
+                vb[p][i] = make_uint4(0u, 0u, 0u, 0u);
+                if (BI8) xs[p][i] = 0.f;
+                if (b_on[i]) {
+                    if (BI8) { __builtin_memcpy(&vb[p][i], (const int8_t*)b_src[i] + ko + b_koff[i], 16); xs[p][i] = bs_src[i][ko >> 5]; }
+                    else     { __builtin_memcpy(&vb[p][i], (const uint16_t*)b_src[i] + ko + b_koff[i], 16); }
+                }
+                continue;
+            }
+            uint4 t; float ts = 0.f;
+            if (BI8) {
+                __builtin_memcpy(&t, (const int8_t*)b_src[i] + ko + b_koff[i], 16);
+                ts = bs_src[i][ko >> 5];
+            } else {
+                __builtin_memcpy(&t, (const uint16_t*)b_src[i] + ko + b_koff[i], 16);
+            }
+            vb[p][i] = t;                 // raw; masked at stage time (see patch6 note)
+            if (BI8) xs[p][i] = ts;
+        }
+    };
+    auto stage = [&](int p, uint32_t buf) {
+        _Float16* At = A_tile + buf * (BM * LDS_STRIDE);
+        _Float16* Bt = B_tile + buf * (BN * LDS_STRIDE);
+        #pragma unroll
+        for (int i = 0; i < A_PER; ++i) if (a_on[i]) {
+            _Float16 d; __builtin_memcpy(&d, &sbits[p][i], 2);
+            uint32_t o[8];
+            q8x_magic4(qa[p][i].x, d, o[0], o[1]);
+            q8x_magic4(qa[p][i].y, d, o[2], o[3]);
+            q8x_magic4(qa[p][i].z, d, o[4], o[5]);
+            q8x_magic4(qa[p][i].w, d, o[6], o[7]);
+            uint4* dst = (uint4*)(&At[a_row[i] * LDS_STRIDE + a_koff[i]]);
+            dst[0] = make_uint4(o[0], o[1], o[2], o[3]);
+            dst[1] = make_uint4(o[4], o[5], o[6], o[7]);
+        }
+        #pragma unroll
+        for (int i = 0; i < B_PER; ++i) {
+            const uint32_t slot = tid + i * NT_;
+            if (slot >= B_SLOTS) continue;
+            uint4 vraw = vb[p][i];
+            if (BRF && !b_on[i]) vraw = make_uint4(0u, 0u, 0u, 0u);   // select AFTER the barrier
+            if (BI8) {
+                // (f16)((float)q * xscale), the lds_tiled expression, 16 values -> 2 x b128
+                int8_t q[16]; __builtin_memcpy(q, &vraw, 16);
+                const float sc = (BRF && !b_on[i]) ? 0.f : xs[p][i];
+                _Float16 v[16];
+                #pragma unroll
+                for (int e = 0; e < 16; ++e) v[e] = (_Float16)((float)q[e] * sc);
+                uint4* dst = (uint4*)(&Bt[b_row[i] * LDS_STRIDE + b_koff[i]]);
+                __builtin_memcpy(&dst[0], &v[0], 16);
+                __builtin_memcpy(&dst[1], &v[8], 16);
+            } else {
+                uint4* dst = (uint4*)(&Bt[b_row[i] * LDS_STRIDE + b_koff[i]]);
+                dst[0] = vraw;
+            }
+        }
+    };
+    auto compute = [&]() {
+        if (W0) asm volatile("s_wait_loadcnt 0x0" ::: "memory");
+        #pragma unroll
+        for (uint32_t k_inner = 0; k_inner < (uint32_t)BK; k_inner += 16u) {
+            const uint32_t kf = k_inner + (lane >> 4) * 8u;
+            half8 a_frags[MT];
+            #pragma unroll
+            for (int mt = 0; mt < MT; ++mt) {
+                const uint32_t r = wave_m0 + mt * 16u + (lane & 15u);
+                __builtin_memcpy(&a_frags[mt], &A_tile[r * LDS_STRIDE + kf], 16);
+            }
+            half8 b_frags[NTL];
+            #pragma unroll
+            for (int nt = 0; nt < NTL; ++nt) {
+                const uint32_t r = wave_n0 + nt * 16u + (lane & 15u);
+                __builtin_memcpy(&b_frags[nt], &B_tile[r * LDS_STRIDE + kf], 16);
+            }
+            #pragma unroll
+            for (int mt = 0; mt < MT; ++mt)
+                #pragma unroll
+                for (int nt = 0; nt < NTL; ++nt)
+                    acc[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_frags[mt], b_frags[nt], acc[mt][nt]);
+        }
+    };
+    auto sync = [&]() { if (LB) sync_lds(); else __syncthreads(); };
+
+    if (DB) {
+        #pragma unroll
+        for (int p = 0; p < PF; ++p) if ((uint32_t)p * BK < K) load_raw(p, p * BK);
+        stage(0, 0);
+        if ((uint32_t)PF * BK < K) load_raw(0, PF * BK);
+        sync();
+        for (uint32_t k0 = 0; k0 < K; k0 += PF * BK) {
+            #pragma unroll
+            for (int p = 0; p < PF; ++p) {
+                const uint32_t ko = k0 + p * BK;
+                if (ko >= K) break;
+                const uint32_t cur = (ko / BK) & 1u;
+                const _Float16* At = A_tile + cur * (BM * LDS_STRIDE);
+                const _Float16* Bt = B_tile + cur * (BN * LDS_STRIDE);
+                half8 a_frags[2][MT], b_frags[2][NTL];
+                #pragma unroll
+                for (int ki = 0; ki < 2; ++ki) {
+                    const uint32_t kf = ki * 16u + (lane >> 4) * 8u;
+                    #pragma unroll
+                    for (int mt = 0; mt < MT; ++mt) __builtin_memcpy(&a_frags[ki][mt], &At[(wave_m0 + mt * 16u + (lane & 15u)) * LDS_STRIDE + kf], 16);
+                    #pragma unroll
+                    for (int nt = 0; nt < NTL; ++nt) __builtin_memcpy(&b_frags[ki][nt], &Bt[(wave_n0 + nt * 16u + (lane & 15u)) * LDS_STRIDE + kf], 16);
+                }
+                const uint32_t kn = ko + BK;
+                if (kn < K) {
+                    stage((p + 1) % PF, cur ^ 1u);
+                    if (kn + PF * BK < K) load_raw((p + 1) % PF, kn + PF * BK);
+                }
+                if (W0) asm volatile("s_wait_loadcnt 0x0" ::: "memory");
+                #pragma unroll
+                for (int ki = 0; ki < 2; ++ki)
+                    #pragma unroll
+                    for (int mt = 0; mt < MT; ++mt)
+                        #pragma unroll
+                        for (int nt = 0; nt < NTL; ++nt)
+                            acc[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_frags[ki][mt], b_frags[ki][nt], acc[mt][nt]);
+                sync();
+            }
+        }
+    } else {
+    uint32_t sink = 0u;   // ABL 2/3: keeps loads/fragments alive
+    half8 keep_a[MT], keep_b[NTL];
+    #pragma unroll
+    for (int p = 0; p < PF; ++p) if ((uint32_t)p * BK < K) load_raw(p, p * BK);
+    if (ABL == 2 || ABL == 3) {   // one real stage so the fragments are defined
+        stage(0, 0); __syncthreads();
+        #pragma unroll
+        for (int mt = 0; mt < MT; ++mt) __builtin_memcpy(&keep_a[mt], &A_tile[(wave_m0 + mt * 16u + (lane & 15u)) * LDS_STRIDE + (lane >> 4) * 8u], 16);
+        #pragma unroll
+        for (int nt = 0; nt < NTL; ++nt) __builtin_memcpy(&keep_b[nt], &B_tile[(wave_n0 + nt * 16u + (lane & 15u)) * LDS_STRIDE + (lane >> 4) * 8u], 16);
+        __syncthreads();
+    }
+    for (uint32_t k0 = 0; k0 < K; k0 += PF * BK) {
+        #pragma unroll
+        for (int p = 0; p < PF; ++p) {
+            const uint32_t ko = k0 + p * BK;
+            if (ko >= K) break;
+            if (ABL == 0 || ABL == 1) { stage(p, 0); sync(); }
+            if (ABL == 2) {   // consume the raw loads without LDS
+                #pragma unroll
+                for (int i = 0; i < A_PER; ++i) sink ^= qa[p][i].x ^ qa[p][i].w ^ (uint32_t)sbits[p][i];
+                #pragma unroll
+                for (int i = 0; i < B_PER; ++i) sink ^= vb[p][i].x ^ vb[p][i].w;
+            }
+            if (ABL == 3) {   // stage + sync, then fold the fragments into acc without WMMA
+                stage(p, 0); sync();
+                #pragma unroll
+                for (uint32_t k_inner = 0; k_inner < (uint32_t)BK; k_inner += 16u) {
+                    const uint32_t kf = k_inner + (lane >> 4) * 8u;
+                    #pragma unroll
+                    for (int mt = 0; mt < MT; ++mt) { half8 a; __builtin_memcpy(&a, &A_tile[(wave_m0 + mt * 16u + (lane & 15u)) * LDS_STRIDE + kf], 16); acc[mt][0][0] += (float)a[0]; }
+                    #pragma unroll
+                    for (int nt = 0; nt < NTL; ++nt) { half8 b; __builtin_memcpy(&b, &B_tile[(wave_n0 + nt * 16u + (lane & 15u)) * LDS_STRIDE + kf], 16); acc[0][nt][1] += (float)b[0]; }
+                }
+            }
+            if (ABL != 1 || ko == 0) { if (ko + PF * BK < K) load_raw(p, ko + PF * BK); }
+            if (ABL == 0 || ABL == 1) compute();
+            if (ABL == 2) {
+                #pragma unroll
+                for (int k_inner = 0; k_inner < BK; k_inner += 16)
+                    #pragma unroll
+                    for (int mt = 0; mt < MT; ++mt)
+                        #pragma unroll
+                        for (int nt = 0; nt < NTL; ++nt)
+                            acc[mt][nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(keep_a[mt], keep_b[nt], acc[mt][nt]);
+            }
+            if (ABL == 0 || ABL == 1 || ABL == 3) sync();
+        }
+    }
+    if (ABL == 2 && sink == 0xFFFFFFFFu) acc[0][0][0] += 1.f;   // practically never true; keeps sink live
+    }
+
+    #pragma unroll
+    for (int nt = 0; nt < NTL; ++nt) {
+        const uint32_t n_idx = n0 + wave_n0 + nt * 16u + (lane & 15u);
+        if (n_idx >= batch) continue;
+        #pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+            const uint32_t m_idx = m0 + wave_m0 + mt * 16u + (lane >> 4) * 8u;
+            float* dst = out + (size_t)n_idx * (size_t)ldo + (size_t)g * M + m_idx;
+            const float8 c = acc[mt][nt];
+            const float4 c0 = {c[0], c[1], c[2], c[3]};
+            const float4 c1 = {c[4], c[5], c[6], c[7]};
+            __builtin_memcpy(dst, &c0, 16);
+            __builtin_memcpy(dst + 4, &c1, 16);
+        }
+    }
+}
+#endif  // gfx12: sync_lds + f16x_core
+
+// Engram wkv (drop-in for q8_0_gemm_wmma_lds_tiled's inputs): xq [B, K] int8 (ldx = K, plain
+// rows), xscale [B, K/32] f32. Grid (ceil(batch/128), M/128, n_groups) x 256; needs M % 128 == 0
+// and K % 256 == 0 (b128 loads of xq rows and weight rows at blocks*34 + ko).
+extern "C" __global__ void __launch_bounds__(256) q8_0_gemm_wmma_i8x_db(
+    float* __restrict__ out, const unsigned char* __restrict__ w, const int8_t* __restrict__ xq,
+    const float* __restrict__ xscale, uint32_t K, uint32_t M, uint32_t n_groups, uint32_t batch, uint32_t blocks)
+{
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    f16x_core<128, 128, 2, 4, 2, true, true, 0, true, true>(out, w, nullptr, xq, xscale, K, M, n_groups, batch, blocks, K);
+#else
+    (void)out; (void)w; (void)xq; (void)xscale; (void)K; (void)M; (void)n_groups; (void)batch; (void)blocks;
+#endif
+}
+
+// kv / q_a: f16x signature; grid (ceil(batch/64), M/128, n_groups) x 256.
+extern "C" __global__ void __launch_bounds__(256) q8_0_gemm_wmma_f16x_db_bn64(
+    float* __restrict__ out, const unsigned char* __restrict__ w, const uint16_t* __restrict__ x16,
+    uint32_t K, uint32_t M, uint32_t n_groups, uint32_t batch, uint32_t blocks, uint32_t ldx)
+{
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    f16x_core<128, 64, 4, 2, 2, false, true, 0, true, true>(out, w, x16, nullptr, nullptr, K, M, n_groups, batch, blocks, ldx);
+#else
+    (void)out; (void)w; (void)x16; (void)K; (void)M; (void)n_groups; (void)batch; (void)blocks; (void)ldx;
+#endif
+}
+
+// q_b / wo_a: f16x signature; grid (ceil(batch/128), M/256, n_groups) x 256; needs M % 256 == 0.
+extern "C" __global__ void __launch_bounds__(256) q8_0_gemm_wmma_f16x_256x128(
+    float* __restrict__ out, const unsigned char* __restrict__ w, const uint16_t* __restrict__ x16,
+    uint32_t K, uint32_t M, uint32_t n_groups, uint32_t batch, uint32_t blocks, uint32_t ldx)
+{
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    f16x_core<256, 128, 4, 2, 1, false, true>(out, w, x16, nullptr, nullptr, K, M, n_groups, batch, blocks, ldx);
+#else
+    (void)out; (void)w; (void)x16; (void)K; (void)M; (void)n_groups; (void)batch; (void)blocks; (void)ldx;
+#endif
+}

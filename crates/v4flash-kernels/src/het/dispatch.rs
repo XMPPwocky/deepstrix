@@ -302,7 +302,12 @@ pub fn dense_gemm_prefill(
             e.q8.matvec_batched(s, out, &w.buffer, xq_i8, xscale, n_rows, k, b)
         }
         GgufType::Q8_0 => match x16 {
-            Some((x, pitch)) if n_rows % 128 == 0 => e.q8_wmma.gemm_f16x(s, out, &w.buffer, x, k, n_rows, 1, b, pitch),
+            // `V41_F16X_DB_BN64`: q_a (M = 1280) at b <= 512 takes the 128x64 double-
+            // buffered tile (bit-identical, x1.28 at 512); the shared expert (M = 2304 /
+            // 5120) and 1024-row q_a keep the base tile.
+            Some((x, pitch)) if n_rows % 128 == 0 => e.q8_wmma.gemm_f16x_tile(
+                crate::q8_0::f16x_tile_q_a(n_rows, b), s, out, &w.buffer, x, k, n_rows, 1, b, pitch,
+            ),
             _ => e.q8_wmma.gemm_lds_tiled(s, out, &w.buffer, xq_i8, xscale, n_rows, k, b),
         },
         GgufType::Q4_K | GgufType::Q5_K | GgufType::Q6_K => {

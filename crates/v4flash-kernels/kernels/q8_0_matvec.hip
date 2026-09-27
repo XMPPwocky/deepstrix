@@ -267,6 +267,61 @@ extern "C" __global__ void q8_0_gemv_bpack_warp8(
     }
 }
 
+// q8_0_gemv_bpack_z16 — the q8_0_gemv_bpack_warp8 body above (GEMV_BPACK_MAX = 16,
+// runtime batch loop, same bl = lane + 32 i striding, same ws * xscale * dot
+// expression, same warp_sum tree) with the batch split into chunks of 16 on
+// grid.z = ceil(batch/16): slice z offsets xq / xscale / out by 16 z rows.
+// BIT-IDENTICAL per (row, b) to q8_0_gemv_batched_warp8 / _bpack_warp8. The
+// weight is re-read ceil(b/16) times (4 at b = 64) instead of b times (the
+// grid.z = b kernel). 2026-09-26 sweep (C2_dense_prefill/replay_bpack_z16,
+// cold weights, b = 64): q_b 1508 -> 576 us, wo_b 1498 -> 537, kv 52 -> 47.
+// Selected by Q8_0Matvec::matvec_batched for 16 < b <= 64 (V41_GEMV_BPACK_Z16).
+// grid (M/8, 1, ceil(b/16)) x 256.
+extern "C" __global__ void q8_0_gemv_bpack_z16(
+    float* __restrict__ out, const unsigned char* __restrict__ w, const int8_t* __restrict__ xq,
+    const float* __restrict__ xscale, uint32_t in_dim, uint32_t out_dim, uint32_t blocks, uint32_t batch)
+{
+    uint32_t row = blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const uint32_t b0 = blockIdx.z * GEMV_BPACK_MAX;
+    if (b0 >= batch) return;
+    const uint32_t nb = (batch - b0 < GEMV_BPACK_MAX) ? (batch - b0) : GEMV_BPACK_MAX;
+    xq += (size_t)b0 * in_dim; xscale += (size_t)b0 * blocks; out += (size_t)b0 * out_dim;
+    const unsigned char* wr = w + (size_t)row * blocks * 34u;
+    const __half*  scales = (const __half*)wr;
+    const int8_t*  quants = (const int8_t*)(wr + (size_t)blocks * 2u);
+    float acc[GEMV_BPACK_MAX];
+    for (uint32_t b = 0; b < nb; ++b) acc[b] = 0.0f;
+    for (uint32_t bl = lane; bl < blocks; bl += WARP_LANES) {
+        const int8_t* qs = quants + (size_t)bl * 32u;
+        uint4 av0, av1;
+        __builtin_memcpy(&av0, qs, 16);
+        __builtin_memcpy(&av1, qs + 16, 16);
+        const float ws = __half2float(scales[bl]);
+        for (uint32_t b = 0; b < nb; ++b) {
+            const int8_t* xqb = xq + (size_t)b * in_dim + (size_t)bl * 32u;
+            uint4 bv0, bv1;
+            __builtin_memcpy(&bv0, xqb, 16);
+            __builtin_memcpy(&bv1, xqb + 16, 16);
+            int32_t dot = 0;
+            dot = dp4a_sudot((int32_t)av0.x, (int32_t)bv0.x, dot);
+            dot = dp4a_sudot((int32_t)av0.y, (int32_t)bv0.y, dot);
+            dot = dp4a_sudot((int32_t)av0.z, (int32_t)bv0.z, dot);
+            dot = dp4a_sudot((int32_t)av0.w, (int32_t)bv0.w, dot);
+            dot = dp4a_sudot((int32_t)av1.x, (int32_t)bv1.x, dot);
+            dot = dp4a_sudot((int32_t)av1.y, (int32_t)bv1.y, dot);
+            dot = dp4a_sudot((int32_t)av1.z, (int32_t)bv1.z, dot);
+            dot = dp4a_sudot((int32_t)av1.w, (int32_t)bv1.w, dot);
+            acc[b] += ws * xscale[(size_t)b * blocks + bl] * (float)dot;
+        }
+    }
+    for (uint32_t b = 0; b < nb; ++b) {
+        float a = warp_sum_f32(acc[b]);
+        if (lane == 0) out[(size_t)b * out_dim + row] = a;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // COMPILE-TIME-BATCH twins of q8_0_gemv_bpack_warp8: `q8_0_gemv_bpack_tB<B>`, B = 1..10.
 //

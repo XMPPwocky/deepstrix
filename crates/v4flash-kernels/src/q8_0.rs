@@ -149,6 +149,104 @@ fn q8_quant_grid_pad() -> u32 {
     if *D { 1 } else { 0 }
 }
 
+/// Largest batch the grid.z-chunked bpack GEMVs serve (`V41_GEMV_BPACK_Z16`).
+pub const GEMV_BPACK_Z16_MAX: u32 = 64;
+
+/// `V41_GEMV_BPACK_Z16` (default ON; `0` = the grid.z = batch kernels
+/// `q8_0_gemv_batched_warp8` / `q8_0_grouped_gemv_batched`): a batched dp4a
+/// GEMV of 16 < b <= 64 rows -- the CED replay regime (~64 rows per lane),
+/// which exceeds the 16-row bpack cap -- runs `q8_0_gemv_bpack_z16` /
+/// `q8_0_grouped_gemv_bpack_z16`: the bpack16 body with the batch split into
+/// 16-row slices on grid.z, so the weight is read ceil(b/16) times instead of
+/// b times. BIT-IDENTICAL per (row, b) (tests/q8_0_sweep_c2_bitexact.rs; the
+/// sweep review 24 + 60 compares incl. 7/49/63/128). 2026-09-26 sweep
+/// (C2_dense_prefill/replay_bpack_z16, cold, b = 64): q_b 1508 -> 576 us, wo_b
+/// 1498 -> 537, wo_a 1210 -> 535, kv 52 -> 47; -2.57 ms per replay lane-layer.
+/// Also off under `V41_GEMV_BPACK=0` (the b-packing rollback). The head's
+/// `matvec_bpack` keeps its 16-row cap (its scratch is sized on it).
+fn bpack_z16_for(batch: u32) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_GEMV_BPACK_Z16").as_deref() != Ok("0"));
+    // bpack_ok(1) == "V41_GEMV_BPACK is not 0".
+    *D && batch > GEMV_BPACK_MAX && batch <= GEMV_BPACK_Z16_MAX && bpack_ok(1)
+}
+
+/// `V41_ENGRAM_I8X` (default ON; `0` = `q8_0_gemm_wmma_lds_tiled`): the prefill
+/// Engram wkv GEMM (M = 25600, K = 6144, int8 + xscale activations) runs
+/// `q8_0_gemm_wmma_i8x_db` ([`Q8_0MatvecWmma::gemm_i8x_db`], same inputs,
+/// grid (ceil(b/128), M/128) x 256): the f16x 128x128 tile with the int8
+/// activations dequantised at stage exactly as lds_tiled does, double-buffered
+/// LDS, 2-deep register prefetch. BIT-IDENTICAL (tests/q8_0_sweep_c2_bitexact.rs;
+/// the sweep review 17 + 48 compares incl. denormal scales). 2026-09-26 sweep
+/// (C2_dense_prefill/engram_i8x_db, cold weight): 905 -> 484 us per 64-row
+/// chunk, 511 us per 128-row chunk (`V41_ENGRAM_CHUNK128`). Needs M % 128 == 0
+/// and K % 256 == 0 (b128 loads); other shapes keep lds_tiled.
+pub fn engram_i8x_for(n_rows: u32, k: u32) -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_ENGRAM_I8X").as_deref() != Ok("0"));
+    *D && n_rows % 128 == 0 && k % 256 == 0
+}
+
+/// Tile variant of the f16x WMMA GEMM ([`Q8_0MatvecWmma::gemm_f16x_tile`]).
+/// Every variant is BIT-IDENTICAL to `Base` (same dequant, same per-output k
+/// order, same WMMA; tests/q8_0_sweep_c2_bitexact.rs); they differ in speed per
+/// shape, so the call sites pick one per projection (the selectors below).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum F16xTile {
+    /// `q8_0_gemm_wmma_f16x`, 128x128, grid (ceil(b/128), M/128, G).
+    Base,
+    /// `q8_0_gemm_wmma_f16x_db_bn64`, 128x64 double-buffered, grid (ceil(b/64), M/128, G).
+    DbBn64,
+    /// `q8_0_gemm_wmma_f16x_256x128`, grid (ceil(b/128), M/256, G); needs M % 256 == 0.
+    T256x128,
+}
+
+/// `V41_F16X_DB_BN64` (default ON; `0` = `q8_0_gemm_wmma_f16x` at kv / q_a):
+/// the occupancy-starved small-M prefill projections run the 128x64 double-
+/// buffered tile (2x the WGs, 2 WGs/WGP). 2026-09-26 sweep (C2_dense_prefill/
+/// f16x_db_bn64, cold weights, b = 512): kv 106 -> 59 us (x1.79), q_a 125 -> 97
+/// (x1.28); at 256 rows 0.54 / 0.65. It LOSES on the big shapes (q_b / wo_a /
+/// wo_b / shared, -9..25%) and on q_a at 1024 rows (+4%), hence per-site gates:
+/// kv at b > 64 ([`f16x_tile_kv`]), q_a only for M <= 1280 and b <= 512
+/// ([`f16x_tile_q_a`]).
+fn f16x_db_bn64_on() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_F16X_DB_BN64").as_deref() != Ok("0"));
+    *D
+}
+
+/// `V41_F16X_256` (default ON; `0` = `q8_0_gemm_wmma_f16x` at q_b / wo_a): the
+/// q_b (32768 x 1280) and wo_a (8 x 1024 x 4096) prefill GEMMs run the 256x128
+/// tile (halves the activation-tile re-reads). 2026-09-26 sweep (C2_dense_prefill/
+/// f16x_256x128, cold, b = 512): q_b 458 -> 410 us (x1.11), wo_a 367 -> 325
+/// (x1.13); b = 1024 q_b x1.26, wo_a x1.09. Neutral on wo_b / shared down, LOSES
+/// on kv / q_a / shared gate-up (fewer WGs), so only those two sites use it, and
+/// only above 64 rows ([`f16x_tile_qb_wo_a`]): replay-sized passes were measured
+/// on the base tile only.
+fn f16x_256_on() -> bool {
+    static D: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("V41_F16X_256").as_deref() != Ok("0"));
+    *D
+}
+
+/// Tile for the prefill kv projection (M = 512): `DbBn64` above 64 rows.
+pub fn f16x_tile_kv(batch: u32) -> F16xTile {
+    if f16x_db_bn64_on() && batch > 64 { F16xTile::DbBn64 } else { F16xTile::Base }
+}
+
+/// Tile for a small-M dense prefill projection through `dense_gemm_prefill`
+/// (q_a, M = 1280; the shared expert's M = 2304 / 5120 stay `Base`): `DbBn64`
+/// only while M <= 1280 and b <= 512 (q_a loses 4% at 1024 rows).
+pub fn f16x_tile_q_a(m: u32, batch: u32) -> F16xTile {
+    if f16x_db_bn64_on() && m <= 1280 && batch <= 512 { F16xTile::DbBn64 } else { F16xTile::Base }
+}
+
+/// Tile for the q_b / wo_a prefill projections: `T256x128` above 64 rows when
+/// M % 256 == 0.
+pub fn f16x_tile_qb_wo_a(m: u32, batch: u32) -> F16xTile {
+    if f16x_256_on() && m % 256 == 0 && batch > 64 { F16xTile::T256x128 } else { F16xTile::Base }
+}
+
 
 #[allow(non_camel_case_types)]
 pub struct Q8_0Matvec {
@@ -383,6 +481,19 @@ impl Q8_0Matvec {
         // 16-wide accumulator would cost registers for nothing.
         if bpack_ok(batch) {
             return self.matvec_bpack(stream, out, weight, xq, xscale, n_rows, k, batch);
+        }
+        if bpack_z16_for(batch) {
+            // `V41_GEMV_BPACK_Z16`: the bpack16 body over 16-row slices on grid.z
+            // (replay b <= 64), bit-identical; 2026-09-26 sweep: q_b 1508 -> 576 us at b=64.
+            let function = self.module.get_function("q8_0_gemv_bpack_z16")?;
+            let cfg = LaunchConfig {
+                grid: (n_rows.div_ceil(GEMV_ROWS_PER_BLOCK), 1, batch.div_ceil(GEMV_BPACK_MAX)),
+                block: (GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            return launch_kernel!(function, cfg, stream, [
+                out.raw(), weight.raw(), xq.raw(), xscale.raw(), k, n_rows, blocks, batch
+            ]);
         }
         let function = self.module.get_function("q8_0_gemv_batched_warp8")?;
         let grid_x = n_rows.div_ceil(GEMV_ROWS_PER_BLOCK);
@@ -705,8 +816,35 @@ impl Q8_0MatvecWmma {
         batch: u32,
         x_pitch: u32,
     ) -> eyre::Result<()> {
+        self.gemm_f16x_tile(F16xTile::Base, stream, out, weight, x16, k, m, n_groups, batch, x_pitch)
+    }
+
+    /// The loaded module (tests: explicit-symbol launches).
+    pub fn module(&self) -> &Module { &self.module }
+
+    /// [`Self::gemm_f16x`] with an explicit tile variant (2026-09-26 sweep,
+    /// C2_dense_prefill): same arguments and checks, bit-identical outputs; the
+    /// call sites pick the variant per projection with `f16x_tile_*`.
+    /// `T256x128` additionally requires m % 256 == 0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16x_tile(
+        &self,
+        tile: F16xTile,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        x16: &DeviceBuffer<u16>,
+        k: u32,
+        m: u32,
+        n_groups: u32,
+        batch: u32,
+        x_pitch: u32,
+    ) -> eyre::Result<()> {
         if batch == 0 || n_groups == 0 {
             return Ok(());
+        }
+        if tile == F16xTile::T256x128 && m % 256 != 0 {
+            return Err(eyre!("gemm_f16x 256x128: m={m} not %256"));
         }
         if k % Q8_0_BLOCK_ELEMS != 0 {
             return Err(eyre!("gemm_f16x: k={k} not %32"));
@@ -728,14 +866,69 @@ impl Q8_0MatvecWmma {
         if out.len() < (batch as usize) * (n_groups as usize) * (m as usize) {
             return Err(eyre!("gemm_f16x: out too small"));
         }
-        let function = self.module.get_function("q8_0_gemm_wmma_f16x")?;
-        let cfg = LaunchConfig {
-            grid: (batch.div_ceil(128), m / 128, n_groups),   // N-blocks fastest (weight-tile L2 reuse)
-            block: (256, 1, 1),
-            shared_mem_bytes: 0,
+        // N-blocks fastest (weight-tile L2 reuse); the variants keep that order.
+        let (sym, grid) = match tile {
+            F16xTile::Base => ("q8_0_gemm_wmma_f16x", (batch.div_ceil(128), m / 128, n_groups)),
+            F16xTile::DbBn64 => ("q8_0_gemm_wmma_f16x_db_bn64", (batch.div_ceil(64), m / 128, n_groups)),
+            F16xTile::T256x128 => ("q8_0_gemm_wmma_f16x_256x128", (batch.div_ceil(128), m / 256, n_groups)),
         };
+        let function = self.module.get_function(sym)?;
+        let cfg = LaunchConfig { grid, block: (256, 1, 1), shared_mem_bytes: 0 };
         launch_kernel!(function, cfg, stream, [
             out.raw(), weight.raw(), x16.raw(), k, m, n_groups, batch, blocks, x_pitch
+        ])
+    }
+
+    /// `q8_0_gemm_wmma_i8x_db` -- drop-in for [`Self::gemm_lds_tiled`] (same
+    /// inputs: `xq[B, K]` int8, `xscale[B, K/32]`, out `[B, M]`), BIT-IDENTICAL
+    /// to it; grid (ceil(b/128), M/128, 1) x 256. Requires M % 128 == 0 and
+    /// K % 256 == 0 (b128 loads of the xq rows and of the weight rows).
+    /// Selected for the Engram wkv under `V41_ENGRAM_I8X` ([`engram_i8x_for`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_i8x_db(
+        &self,
+        stream: &Stream,
+        out: &mut DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u8>,
+        xq: &DeviceBuffer<i8>,
+        xscale: &DeviceBuffer<f32>,
+        n_rows: u32, // M
+        k: u32,
+        batch: u32,
+    ) -> eyre::Result<()> {
+        if batch == 0 {
+            return Ok(());
+        }
+        if k % 256 != 0 {
+            return Err(eyre!("q8_0 gemm_i8x_db: k={k} not a multiple of 256"));
+        }
+        if n_rows % 128 != 0 {
+            return Err(eyre!("q8_0 gemm_i8x_db: n_rows={n_rows} not a multiple of 128"));
+        }
+        let blocks = k / Q8_0_BLOCK_ELEMS;
+        let expected_weight_bytes =
+            (n_rows as usize) * (blocks as usize) * (Q8_0_BLOCK_BYTES as usize);
+        if weight.byte_len() != expected_weight_bytes {
+            return Err(eyre!(
+                "q8_0 gemm_i8x_db weight bytes: have {}, expected {} (n_rows={n_rows}, k={k})",
+                weight.byte_len(), expected_weight_bytes
+            ));
+        }
+        let b = batch as usize;
+        if xq.len() < b * (k as usize) || xscale.len() < b * (blocks as usize) || out.len() < b * (n_rows as usize) {
+            return Err(eyre!(
+                "q8_0 gemm_i8x_db: buffers too small for batch={batch} (xq {} xs {} out {})",
+                xq.len(), xscale.len(), out.len()
+            ));
+        }
+        let function = self.module.get_function("q8_0_gemm_wmma_i8x_db")?;
+        let cfg = LaunchConfig {
+            grid: (batch.div_ceil(128), n_rows / 128, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,                   // 40 KB static LDS
+        };
+        launch_kernel!(function, cfg, stream, [
+            out.raw(), weight.raw(), xq.raw(), xscale.raw(), k, n_rows, 1u32, batch, blocks
         ])
     }
 
@@ -998,6 +1191,20 @@ impl Q8_0GroupedMatvec {
             return self.matvec_grouped_bpack(
                 stream, out, weight, xq, xscale, group_dim, rank, n_groups, batch,
             );
+        }
+        if bpack_z16_for(batch) {
+            // `V41_GEMV_BPACK_Z16`: grouped bpack16 body over 16-row grid.z slices
+            // (replay b <= 64), bit-identical; 2026-09-26 sweep: wo_a 1210 -> 535 us at b=64.
+            let function = self.module.get_function("q8_0_grouped_gemv_bpack_z16")?;
+            let cfg = LaunchConfig {
+                grid: (out_dim.div_ceil(GEMV_ROWS_PER_BLOCK), 1, batch.div_ceil(GEMV_BPACK_MAX)),
+                block: (GEMV_ROWS_PER_BLOCK * GEMV_WARP_LANES, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            return launch_kernel!(function, cfg, stream, [
+                out.raw(), weight.raw(), xq.raw(), xscale.raw(),
+                group_dim, rank, blocks_per_group, n_groups, batch
+            ]);
         }
         let function = self.module.get_function("q8_0_grouped_gemv_batched")?;
         let grid_x = out_dim.div_ceil(GEMV_ROWS_PER_BLOCK);

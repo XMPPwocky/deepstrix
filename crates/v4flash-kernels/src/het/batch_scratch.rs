@@ -36,7 +36,7 @@ use color_eyre::eyre::{self, eyre};
 use v4flash_hip::{Device, DeviceBuffer};
 
 use crate::attention::{ATTN_MIXED_MAX_KEYS, ATTN_SCORES_STRIDE};
-use crate::config::{ENGRAM_CHUNK, ENGRAM_IN, ENGRAM_OUT, 
+use crate::config::{ENGRAM_IN, ENGRAM_OUT,
     BLOCKS_GROUPED_OUT, BLOCKS_N_EMBD, BLOCKS_N_FF_SHARED, BLOCKS_N_LORA_Q, BLOCKS_OUT_LOW,
     BLOCKS_Q8K_DOWN_IN, BLOCKS_Q8K_GATE_IN, HC_DIM, HC_MIX_DIM, INDEXER_TOP_K, N_EMBD, N_EXPERT,
     N_EXPERT_USED, N_FF_EXP, N_FF_SHARED, N_HEAD, N_HEAD_DIM, N_INDEXER_HEAD,
@@ -1209,9 +1209,11 @@ impl BatchDgpuScratch {
             split: mk_f32(HC_MIX_DIM as usize)?,
             hc_pre_carry: mk_f32(HC_MIX_DIM as usize)?,
             engram_rows: if cfg!(feature = "v41") { mk_f32(ENGRAM_IN as usize)? } else { DeviceBuffer::new(id, 32)? },
-            engram_xq: DeviceBuffer::new(id, if cfg!(feature = "v41") { (ENGRAM_CHUNK * ENGRAM_IN) as usize } else { 32 })?,
-            engram_xscale: DeviceBuffer::new(id, if cfg!(feature = "v41") { (ENGRAM_CHUNK * ENGRAM_IN / 32) as usize } else { 32 })?,
-            engram_kv: DeviceBuffer::new(id, if cfg!(feature = "v41") { (ENGRAM_CHUNK * ENGRAM_OUT) as usize } else { 32 })?,
+            // Rows per Engram pass: ENGRAM_CHUNK, or 2x under `V41_ENGRAM_CHUNK128`
+            // (forward_prefill::engram_chunk_rows; +6.6 MB here at 128 rows).
+            engram_xq: DeviceBuffer::new(id, if cfg!(feature = "v41") { (super::forward_prefill::engram_chunk_rows() * ENGRAM_IN) as usize } else { 32 })?,
+            engram_xscale: DeviceBuffer::new(id, if cfg!(feature = "v41") { (super::forward_prefill::engram_chunk_rows() * ENGRAM_IN / 32) as usize } else { 32 })?,
+            engram_kv: DeviceBuffer::new(id, if cfg!(feature = "v41") { (super::forward_prefill::engram_chunk_rows() * ENGRAM_OUT) as usize } else { 32 })?,
             engram_rows_ready: false,
             mtp_src: DeviceBuffer::new(
                 id,
