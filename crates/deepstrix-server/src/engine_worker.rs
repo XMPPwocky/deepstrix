@@ -774,6 +774,11 @@ fn worker_main(
     worker_loop(state, &mut rx);
 }
 
+/// Context of the stub single-sequence state multistream mode allocates when
+/// DSpark is off (`initialize_state`): ~11 MB of comp rows instead of ~1 GB.
+#[cfg(feature = "v41")]
+pub(crate) const LEGACY_STUB_CTX: u32 = 4096;
+
 pub struct WorkerState {
     pub dgpu: Device,
     pub igpu: Device,
@@ -1083,7 +1088,17 @@ fn initialize_state(cfg: &WorkerConfig) -> eyre::Result<WorkerState> {
             ));
         }
     }
-    let state = HetModelState::alloc(dgpu, igpu, cfg.n_kv_max)?;
+    // The single-sequence state serves the SERIAL paths. The multistream
+    // scheduler prefills in its own scratch states (`V41_MS_PREFILL_JOBS`) and
+    // decodes in its arena; only a DSpark request (legacy serial handler) uses
+    // this one. Without DSpark a full-context copy is ~1.07 GB of idle dGPU at
+    // --ctx 368640 (921,600 comp rows x 1,104 B + raw windows) = ~390K arena
+    // positions, so allocate a stub; the legacy handler refuses to run on it.
+    #[cfg(feature = "v41")]
+    let legacy_ctx = if crate::multistream::enabled() && mtp.is_none() { LEGACY_STUB_CTX.min(cfg.n_kv_max) } else { cfg.n_kv_max };
+    #[cfg(not(feature = "v41"))]
+    let legacy_ctx = cfg.n_kv_max;
+    let state = HetModelState::alloc(dgpu, igpu, legacy_ctx)?;
     // Two-lane pipelined prefill: each lane holds at most ceil(B_MAX/2)
     // rows of a chunk (forward_prompt_batch_v2_pipelined), so size the
     // per-lane scratch at that instead of the full chunk. The shared set

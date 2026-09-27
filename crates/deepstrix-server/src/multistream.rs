@@ -40,6 +40,44 @@ fn env_usize(k: &str, d: usize) -> usize {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
 
+/// Positions reserved beyond the prompt when a request is admitted
+/// (`V41_MS_KV_HEADROOM`, default 16384; 0 = reserve the whole `max_new`, the
+/// pre-2026-09-27 rule). Every client sends no `max_tokens`, so the whole
+/// `max_new` was the 64K default: a ~170K agent turn reserved ~235K positions
+/// and the 844,800-row arena held ~3.6 of them. 09-27 (942 streams):
+/// completions p50 542, p99 5016, max 14,343, none hit the limit. A stream
+/// that runs past its reservation grows (`KvArena::grow`).
+fn kv_headroom() -> u32 { env_usize("V41_MS_KV_HEADROOM", 16384) as u32 }
+/// Positions a growing stream adds per growth (`V41_MS_KV_GROW`).
+fn kv_grow_step() -> u32 { (env_usize("V41_MS_KV_GROW", 16384) as u32).max(1) }
+/// Grow when this few positions are left in the reservation (`V41_MS_KV_GROW_AT`).
+fn kv_grow_at() -> u32 { env_usize("V41_MS_KV_GROW_AT", 256) as u32 }
+/// Positions of rows a new reservation must leave free while streams are live
+/// (`V41_MS_KV_SPARE`, default one grow step): the room they grow into.
+fn kv_spare() -> u32 { env_usize("V41_MS_KV_SPARE", kv_grow_step() as usize) as u32 }
+
+/// `max_new` for a request whose context will be `pos`: a defaulted one is
+/// shrunk to what the context leaves (never fail a long prompt for the
+/// server's own default); `Err` if an explicit one does not fit.
+fn effective_max_new(req: &GenerateReq, pos: u32, n_kv_max: u32) -> eyre::Result<usize> {
+    let mut max_new = req.max_new;
+    if req.max_new_defaulted {
+        let room = n_kv_max.saturating_sub(pos + 2) as usize;
+        max_new = max_new.min(room).max(1);
+    }
+    if pos as usize + max_new + 2 > n_kv_max as usize {
+        return Err(eyre!("prompt {pos} + max_tokens {max_new} exceeds the context {n_kv_max}"));
+    }
+    Ok(max_new)
+}
+
+/// Positions to reserve for a stream at `pos` that may generate `max_new`.
+fn reservation(pos: u32, max_new: usize) -> u32 {
+    let h = kv_headroom();
+    let tail = if h == 0 { max_new as u32 } else { (max_new as u32).min(h) };
+    pos + tail + 2
+}
+
 /// One live decode stream (a request that has been prefilled and admitted).
 struct Stream {
     slot: u32,
@@ -61,6 +99,12 @@ struct Stream {
     send_failures: u32,
     started: Instant,
     session_id: Option<String>,
+    /// Context positions this turn may reach (`prompt + max_new + 2`): the
+    /// most its reservation ever grows to.
+    ctx_full: u32,
+    /// Set while the stream sits steps out because its reservation is full and
+    /// the arena has no rows to grow it (`Sched::take_stalled`).
+    stalled_since: Option<Instant>,
 }
 
 /// A request waiting for its prefill.
@@ -72,6 +116,8 @@ struct Pending {
     trailing_marker: Option<i32>,
     prompt_tokens: u32,
     queued: Instant,
+    /// First time it stepped aside because its KV reservation did not fit.
+    room_wait: Option<Instant>,
 }
 
 /// A prefill in flight. Each job owns a scratch single-sequence state (from
@@ -79,6 +125,10 @@ struct Pending {
 /// round-robin, chunk by chunk — a short prompt is not stuck behind a 100K one.
 struct Prefill {
     p: Pending,
+    /// Arena slot RESERVED for this request before its prefill started
+    /// (`KvArena::reserve`); filled at admission. Every path that drops a
+    /// `Prefill` without admitting it must release it.
+    slot: u32,
     job: PrefillJob,
     kv: v4flash_kernels::het::HetModelState,
     /// Tokens already in the scratch state (restored prefix), then the suffix.
@@ -173,7 +223,9 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
     let mut worked = false;
     loop {
         // 1. Intake: never block while there is work; block when idle.
-        let idle = sched.streams.is_empty() && sched.prefills.is_empty() && sched.queue.is_empty();
+        // Parked requests are work too: blocking here with one parked left it
+        // waiting for the NEXT request to arrive before it was retried.
+        let idle = sched.streams.is_empty() && sched.prefills.is_empty() && sched.queue.is_empty() && sched.parked.is_empty();
         if idle && worked {
             // The serial loop trims after every request; here streams overlap,
             // so trim only when the last one has drained and nothing waits.
@@ -201,7 +253,7 @@ pub fn worker_loop_ms(mut state: WorkerState, rx: &mut mpsc::Receiver<EngineRequ
             None if idle => break, // channel closed
             None => {}
         }
-        if sched.streams.is_empty() && sched.prefills.is_empty() && sched.queue.is_empty() {
+        if sched.streams.is_empty() && sched.prefills.is_empty() && sched.queue.is_empty() && sched.parked.is_empty() {
             state.progress.end();
             continue;
         }
@@ -278,7 +330,7 @@ impl Sched {
         if trailing_marker.is_some() {
             req.tokens.truncate(req.tokens.len() - 1);
         }
-        self.queue.push_back(Pending { req, tx, session_id, cancel, trailing_marker, prompt_tokens, queued: Instant::now() });
+        self.queue.push_back(Pending { req, tx, session_id, cancel, trailing_marker, prompt_tokens, queued: Instant::now(), room_wait: None });
     }
 
     fn abort_all(&mut self, why: &str) {
@@ -288,10 +340,12 @@ impl Sched {
         }
         for p in self.prefills.drain(..) {
             let _ = p.p.tx.try_send(WorkerEvent::Error(why.to_string()));
+            let _ = self.arena.release(p.slot);
             self.spare_states.push(p.kv);
         }
         for (p, _) in self.parked.drain(..) {
             let _ = p.p.tx.try_send(WorkerEvent::Error(why.to_string()));
+            let _ = self.arena.release(p.slot);
             self.spare_states.push(p.kv);
         }
         for p in self.queue.drain(..) {
@@ -314,29 +368,23 @@ impl Sched {
                 i += 1;
             }
         }
-        // Parked (prefilled, no room yet): retry admission now that streams may
-        // have finished. Oldest first.
-        if !self.parked.is_empty() {
-            let mut i = 0;
-            while i < self.parked.len() {
-                let (pf, _) = &self.parked[i];
-                if pf.p.cancel.load(Ordering::Relaxed) || pf.p.tx.is_closed() {
-                    let (pf, _) = self.parked.remove(i);
-                    self.spare_states.push(pf.kv);
-                    continue;
-                }
-                let ctx_cap = pf.prefix.len() as u32 + pf.p.req.max_new as u32 + 2;
-                if self.arena.live() < self.arena.n_slots as usize && self.arena.fits_after_compaction(ctx_cap) {
-                    let (pf, logits) = self.parked.remove(i);
-                    let tx = pf.p.tx.clone();
-                    if let Err((kv, e)) = self.try_admit(state, pf, logits) {
-                        tracing::error!(error = %e, "multistream: parked admission failed");
-                        let _ = tx.try_send(WorkerEvent::Error(format!("{e:#}")));
-                        if let Some(kv) = kv { self.spare_states.push(kv); }
-                    }
-                    continue;
-                }
-                i += 1;
+        // Parked (prefilled, but its reservation cannot hold the prompt's first
+        // step -- only if a prefill ran past its prompt-length reservation and
+        // the arena had no rows to grow it): retry admission (which retries the
+        // growth) now that streams may have finished. Oldest first; each is
+        // tried once per tick (`try_admit` re-parks it).
+        for (pf, logits) in std::mem::take(&mut self.parked) {
+            if pf.p.cancel.load(Ordering::Relaxed) || pf.p.tx.is_closed() {
+                let _ = self.arena.release(pf.slot);
+                self.spare_states.push(pf.kv);
+                continue;
+            }
+            let (tx, slot) = (pf.p.tx.clone(), pf.slot);
+            if let Err((kv, e)) = self.try_admit(state, pf, logits) {
+                tracing::error!(error = %e, "multistream: parked admission failed");
+                let _ = tx.try_send(WorkerEvent::Error(format!("{e:#}")));
+                // `Some(kv)`: the error came before the stream owned the slot.
+                if let Some(kv) = kv { let _ = self.arena.release(slot); self.spare_states.push(kv); }
             }
         }
         // Start prefills while scratch states are spare. Shortest prompt first
@@ -344,6 +392,7 @@ impl Sched {
         // before the snapshot probe), with aging: a request that has waited
         // longer than `V41_MS_AGING_S` (default 60 s) goes first regardless.
         let aging = std::time::Duration::from_secs(env_usize("V41_MS_AGING_S", 60) as u64);
+        let starve = std::time::Duration::from_secs(env_usize("V41_MS_STARVE_S", 600) as u64);
         let mtp_on = state.mtp.is_some();
         // Images ride the multistream path since 2026-09-21 (tower rows spliced
         // into the chunk inputs); only DSpark still needs the legacy driver.
@@ -377,6 +426,13 @@ impl Sched {
                     // Legacy serial path (vision / DSpark): only with an empty arena
                     // and no prefill in flight.
                     if self.streams.is_empty() && self.prefills.is_empty() {
+                        if state.state.n_kv_max < state.n_kv_max {
+                            // `initialize_state` only stubs the state when DSpark is
+                            // off, which is when nothing is legacy: unreachable.
+                            let _ = p.tx.try_send(WorkerEvent::Error(format!(
+                                "legacy serial path needs the full single-sequence state ({} < {} positions)", state.state.n_kv_max, state.n_kv_max)));
+                            continue;
+                        }
                         let Pending { req, tx, session_id, cancel, trailing_marker, .. } = p;
                         let mut req = req;
                         if let Some(m) = trailing_marker { req.tokens.push(m); }
@@ -391,7 +447,7 @@ impl Sched {
                         for d in deferred.drain(..) { self.queue.push_front(d); }
                         return Ok(());
                     }
-                    if deferred.is_empty() && self.legacy_wait_logged.is_none_or(|t| t.elapsed().as_secs() >= 60) {
+                    if !deferred.iter().any(is_legacy) && self.legacy_wait_logged.is_none_or(|t| t.elapsed().as_secs() >= 60) {
                         self.legacy_wait_logged = Some(Instant::now());
                         tracing::info!(queued = self.queue.len(), live = self.streams.len(), waited_s = p.queued.elapsed().as_secs(),
                             "multistream: legacy (DSpark) request waits for an empty arena; others proceed");
@@ -408,10 +464,63 @@ impl Sched {
                     self.queue.push_front(p);
                     break;
                 }
+                // Reserve the stream's KV BEFORE its prefill: a request that
+                // does not fit waits here holding nothing, instead of being
+                // prefilled and then parked with the scratch state (09-27: the
+                // one scratch state sat in a parked request while the queue
+                // behind it waited, 19-38% of all queue time). The final
+                // position is the prompt plus at most the trailing marker.
+                let pos = p.req.tokens.len() as u32 + 1;
+                let max_new = match effective_max_new(&p.req, pos, state.n_kv_max) {
+                    Ok(m) => m,
+                    Err(e) => { let _ = p.tx.try_send(WorkerEvent::Error(format!("{e:#}"))); continue; }
+                };
+                let cap = reservation(pos, max_new);
+                let spare = if self.streams.is_empty() { 0 } else { kv_spare() };
+                if !self.arena.fits_with_spare(cap, spare) {
+                    let mut p = p;
+                    if p.room_wait.is_none() {
+                        p.room_wait = Some(Instant::now());
+                        tracing::info!(prompt = p.req.tokens.len(), reserve = cap, live = self.streams.len(), prefills = self.prefills.len(),
+                            free_rows = self.arena.stores.iter().map(|st| st.free.free_rows() * st.ratio).min().unwrap_or(0),
+                            "multistream: request waits for KV room");
+                    }
+                    if p.queued.elapsed() >= starve {
+                        // Starved: stop admitting others until it fits, or
+                        // short requests could pass it forever.
+                        self.queue.push_front(p);
+                        break;
+                    }
+                    deferred.push(p);
+                    continue;
+                }
+                let reserved = (|| -> eyre::Result<u32> {
+                    if !self.arena.fits_now(cap) {
+                        let t = Instant::now();
+                        self.arena.compact_stores(&state.engine.dgpu.compute, &mut self.bounce_f16, &mut self.bounce_u8)?;
+                        tracing::info!(ms = t.elapsed().as_millis() as u64, live = self.streams.len(), "multistream: stores compacted");
+                    }
+                    self.arena.reserve(cap)
+                })();
+                let slot = match reserved {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // Device error: the step-failure path aborts everything
+                        // in the queue, so put this request (and the ones that
+                        // stepped aside) back where it can be told.
+                        self.queue.push_front(p);
+                        for d in deferred.drain(..).rev() { self.queue.push_front(d); }
+                        return Err(e);
+                    }
+                };
+                if let Some(t) = p.room_wait {
+                    tracing::info!(slot, reserve = cap, waited_ms = t.elapsed().as_millis() as u64, "multistream: KV room found");
+                }
                 let kv = self.spare_states.pop().expect("checked");
-                match self.start_prefill(state, p, kv) {
+                match self.start_prefill(state, p, kv, slot) {
                     Ok(pf) => { self.prefills.push(pf); started = true; break; }
                     Err((p, kv, e)) => {
+                        let _ = self.arena.release(slot);
                         self.spare_states.push(kv);
                         let _ = p.tx.try_send(WorkerEvent::Error(format!("{e:#}")));
                     }
@@ -433,7 +542,6 @@ impl Sched {
         // alternating bursts. `V41_MS_BURST_SCALE=1` additionally scales the
         // bursts with the other side's backlog (decode / (1 + waiting
         // prefills), prefill / (1 + live streams), floored).
-        let starve = std::time::Duration::from_secs(env_usize("V41_MS_STARVE_S", 600) as u64);
         let starved = self.queue.iter().any(|p| p.queued.elapsed() >= starve)
             || self.prefills.iter().any(|pf| !pf.job.chunks_done() && pf.p.queued.elapsed() >= starve);
         let scale = env_usize("V41_MS_BURST_SCALE", 0) == 1;
@@ -480,7 +588,9 @@ impl Sched {
 
     /// Probe the snapshot index, restore the longest prefix into the scratch
     /// state, and build the suffix job.
-    fn start_prefill(&mut self, state: &mut WorkerState, p: Pending, mut kv: v4flash_kernels::het::HetModelState) -> Result<Prefill, (Pending, v4flash_kernels::het::HetModelState, eyre::Report)> {
+    /// `slot` = the request's arena reservation (the caller releases it if
+    /// this fails).
+    fn start_prefill(&mut self, state: &mut WorkerState, p: Pending, mut kv: v4flash_kernels::het::HetModelState, slot: u32) -> Result<Prefill, (Pending, v4flash_kernels::het::HetModelState, eyre::Report)> {
         let t0 = Instant::now();
         save_live_if_dirty(state);
         state.live = None;
@@ -566,7 +676,7 @@ impl Sched {
             Ok(v) => v,
             Err(e) => return Err((p, kv, e)),
         };
-        let mut pf = Prefill { p, job, kv, prefix, compressed, started: t0, vl, save_at_finish: !marker_in_prefill };
+        let mut pf = Prefill { p, slot, job, kv, prefix, compressed, started: t0, vl, save_at_finish: !marker_in_prefill };
         if marker_in_prefill {
             pf.p.trailing_marker = None; // consumed
             pf.prefix.push(suffix[0]);
@@ -616,19 +726,22 @@ impl Sched {
             } else {
                 tracing::info!(done, total = pf.job.total(), "multistream: prefill cancelled");
             }
+            let _ = self.arena.release(pf.slot);
             self.spare_states.push(pf.kv);
             return Ok(());
         }
         // A failure in ONE job (paging, admission, box 2) fails that request
         // only; the live streams keep going. The engine-level drain/redial is
         // still done, since a box-2 fault leaves tickets in flight.
-        let tx = pf.p.tx.clone();
+        let (tx, slot) = (pf.p.tx.clone(), pf.slot);
         match self.prefill_job_tick(state, pf, i) {
             Ok(()) => Ok(()),
             Err((kv, e)) => {
                 tracing::error!(error = %e, "multistream: prefill failed; failing that request only");
                 let _ = tx.try_send(WorkerEvent::Error(format!("{e:#}")));
-                if let Some(kv) = kv { self.spare_states.push(kv); }
+                // `Some(kv)`: the request still owned its reservation (errors
+                // after `admit_stream` took the slot carry `None`).
+                if let Some(kv) = kv { let _ = self.arena.release(slot); self.spare_states.push(kv); }
                 let _ = state.engine.remote_drain_in_flight();
                 let _ = state.engine.remote_reconnect_if_dead();
                 Ok(())
@@ -704,41 +817,36 @@ impl Sched {
         self.try_admit(state, pf, logits)
     }
 
-    /// Admit a prefilled request: `ctx_cap` = what this turn can grow to; the
-    /// arena carves that many comp rows per store (first fit). Fragmented =>
-    /// compact the stores first. No room at all => park it (its scratch state
-    /// stays with it) and retry as streams finish.
+    /// Admit a prefilled request into the slot it reserved before its prefill
+    /// (`reservation`, grown here if the prompt ended past it). A reservation
+    /// that cannot hold even the first step and cannot grow parks the request
+    /// (its scratch state stays with it) until a stream finishes.
     fn try_admit(&mut self, state: &mut WorkerState, mut pf: Prefill, logits: Vec<f32>) -> Result<(), (Option<v4flash_kernels::het::HetModelState>, eyre::Report)> {
         let pos = pf.prefix.len() as u32;
-        if pf.p.req.max_new_defaulted {
-            // The client sent no max_tokens: never fail a long prompt for the
-            // server's own default. Shrink it to what the context leaves.
-            let room = state.n_kv_max.saturating_sub(pos + 2) as usize;
-            pf.p.req.max_new = pf.p.req.max_new.min(room).max(1);
-        }
-        let ctx_cap = pos + pf.p.req.max_new as u32 + 2;
-        if ctx_cap > state.n_kv_max {
-            return Err((Some(pf.kv), eyre!("prompt {pos} + max_tokens {} exceeds the context {}", pf.p.req.max_new, state.n_kv_max)));
-        }
-        let mut slot = self.arena.admit_from_state(&pf.kv, ctx_cap, pos, &state.engine.dgpu.compute);
-        if slot.is_err() && self.arena.live() < self.arena.n_slots as usize && self.arena.fits_after_compaction(ctx_cap) {
-            let t = Instant::now();
-            if let Err(e) = self.arena.compact_stores(&state.engine.dgpu.compute, &mut self.bounce_f16, &mut self.bounce_u8) {
-                return Err((Some(pf.kv), e));
-            }
-            tracing::info!(ms = t.elapsed().as_millis() as u64, live = self.streams.len(), "multistream: stores compacted");
-            slot = self.arena.admit_from_state(&pf.kv, ctx_cap, pos, &state.engine.dgpu.compute);
-        }
-        let slot = match slot {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(ctx_cap, live = self.streams.len(), parked = self.parked.len() + 1, error = %e, "multistream: no room; parking the request until a stream finishes");
-                self.parked.push((pf, logits));
-                return Ok(());
-            }
+        let max_new = match effective_max_new(&pf.p.req, pos, state.n_kv_max) {
+            Ok(m) => m,
+            Err(e) => return Err((Some(pf.kv), e)),
         };
+        pf.p.req.max_new = max_new;
+        let slot = pf.slot;
+        let want = reservation(pos, max_new);
+        let have = self.arena.reserved_positions(slot);
+        if have < want {
+            match self.arena.grow(slot, want, &state.engine.dgpu.compute, &mut self.bounce_f16, &mut self.bounce_u8) {
+                Ok(Some(how)) => tracing::info!(slot, from = have, to = want, how = ?how, "multistream: reservation grown at admission"),
+                Ok(None) => {}
+                Err(e) => return Err((Some(pf.kv), e)),
+            }
+        }
+        if self.arena.reserved_positions(slot) < pos + 1 {
+            tracing::warn!(slot, pos, reserved = self.arena.reserved_positions(slot), live = self.streams.len(), parked = self.parked.len() + 1,
+                "multistream: no room; parking the request until a stream finishes");
+            self.parked.push((pf, logits));
+            return Ok(());
+        }
+        if let Err(e) = self.arena.fill_reserved(slot, &pf.kv, pos, &state.engine.dgpu.compute) { return Err((Some(pf.kv), e)); }
         if let Err(e) = state.engine.dgpu.compute.synchronize() { return Err((Some(pf.kv), e)); }
-        let Prefill { p: pp, job, kv: kv_done, prefix, compressed, started, vl: _, save_at_finish: _ } = pf;
+        let Prefill { p: pp, slot: _, job, kv: kv_done, prefix, compressed, started, vl: _, save_at_finish: _ } = pf;
         self.spare_states.push(kv_done);
         let pf = PrefillDone { p: pp, job, prefix, compressed, started };
         self.admit_stream(state, pf, slot, logits).map_err(|e| (None, e))
@@ -754,6 +862,7 @@ impl Sched {
             slot, tx: pf.p.tx.clone(), cancel: pf.p.cancel.clone(), next: 0, seq: pf.prefix.clone(), compressed: pf.compressed.clone(),
             prompt_tokens: pf.p.prompt_tokens, completion_tokens: 0, max_new: pf.p.req.max_new, sample_mode, rng,
             in_think: false, send_failures: 0, started: pf.started, session_id: pf.p.session_id.clone(),
+            ctx_full: pf.prefix.len() as u32 + pf.p.req.max_new as u32 + 2, stalled_since: None,
         };
         // Ensure `compressed` covers `seq` (a marker forwarded in the prefill was hashed above).
         if let Some(ec) = state.engram.as_ref() {
@@ -780,13 +889,77 @@ impl Sched {
             }
         }
         tracing::info!(slot, prompt = pf.prefix.len(), restored = pf.prefix.len() - pf.job.total(), prefill_ms = pf.started.elapsed().as_millis() as u64,
-            live = self.streams.len() + 1, "multistream: stream admitted");
+            reserved = self.arena.reserved_positions(slot), live = self.streams.len() + 1, "multistream: stream admitted");
         self.streams.push(s);
         Ok(())
     }
 
-    /// One batched decode step over every live stream.
+    /// One batched decode step over every live stream that has KV room for
+    /// its next position (`take_stalled`).
     fn decode_step(&mut self, state: &mut WorkerState) -> eyre::Result<()> {
+        let stalled = self.take_stalled(state)?;
+        let r = if self.streams.is_empty() { Ok(()) } else { self.decode_rows(state) };
+        // Back into the live set whatever happened: a failed step's
+        // `abort_all` must reach them too.
+        self.streams.extend(stalled);
+        r
+    }
+
+    /// Grow every stream whose reservation is nearly used up (`KvArena::grow`,
+    /// `V41_MS_KV_GROW` positions at a time, never past `ctx_full`). A stream
+    /// that cannot run its next position and could not grow sits the step out:
+    /// it is returned, and `decode_step` puts it back afterwards, so it resumes
+    /// once a finishing stream frees rows. If NO stream can run, nothing would
+    /// ever finish: the stalled stream with the most completion tokens is
+    /// ended with `Length` (logged as an error) and the rest retried.
+    fn take_stalled(&mut self, state: &mut WorkerState) -> eyre::Result<Vec<Stream>> {
+        let (step, at) = (kv_grow_step(), kv_grow_at());
+        loop {
+            for s in &mut self.streams {
+                let pos = self.arena.stream(s.slot).map(|k| k.pos).unwrap_or(0);
+                let have = self.arena.reserved_positions(s.slot);
+                if have >= s.ctx_full || have > pos.saturating_add(at) {
+                    continue;
+                }
+                let want = have.saturating_add(step).min(s.ctx_full);
+                let t = Instant::now();
+                if let Some(how) = self.arena.grow(s.slot, want, &state.engine.dgpu.compute, &mut self.bounce_f16, &mut self.bounce_u8)? {
+                    tracing::info!(slot = s.slot, pos, from = have, to = want, how = ?how, ms = t.elapsed().as_millis() as u64,
+                        completion_tokens = s.completion_tokens, "multistream: stream reservation grown");
+                    if let Some(t0) = s.stalled_since.take() {
+                        tracing::info!(slot = s.slot, stalled_ms = t0.elapsed().as_millis() as u64, "multistream: stalled stream resumes");
+                    }
+                }
+            }
+            let mut stalled = Vec::new();
+            let mut i = 0;
+            while i < self.streams.len() {
+                if self.arena.can_step(self.streams[i].slot) {
+                    i += 1;
+                    continue;
+                }
+                let mut s = self.streams.remove(i);
+                if s.stalled_since.is_none() {
+                    s.stalled_since = Some(Instant::now());
+                    tracing::warn!(slot = s.slot, reserved = self.arena.reserved_positions(s.slot), completion_tokens = s.completion_tokens,
+                        live = self.streams.len(), "multistream: stream out of KV room; it waits for a stream to finish");
+                }
+                stalled.push(s);
+            }
+            if !self.streams.is_empty() || stalled.is_empty() {
+                return Ok(stalled);
+            }
+            let k = (0..stalled.len()).max_by_key(|&k| stalled[k].completion_tokens).expect("non-empty");
+            let s = stalled.remove(k);
+            tracing::error!(slot = s.slot, completion_tokens = s.completion_tokens, stalled = stalled.len() + 1,
+                "multistream: EVERY stream is out of KV room; ending the longest with finish=length");
+            self.streams.append(&mut stalled);
+            finish(state, &mut self.arena, s, FinishReason::Length)?;
+        }
+    }
+
+    /// The batched step over `self.streams` (all of them can step).
+    fn decode_rows(&mut self, state: &mut WorkerState) -> eyre::Result<()> {
         // Hot-set ownership refresh (see expert_pager::hot_set); `tick` is
         // advanced once per scheduler tick.
         if self.tick % env_usize("V41_B1_HOT_REFRESH", 500) as u64 == 0 {
@@ -1425,4 +1598,32 @@ fn gather_engram_rows(
         Ok::<(), eyre::Report>(())
     })?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::{effective_max_new, reservation};
+    use crate::engine_worker::GenerateReq;
+
+    fn req(max_new: usize, defaulted: bool) -> GenerateReq {
+        GenerateReq { tokens: Vec::new(), images: Vec::new(), image_spans: Vec::new(), max_new, max_new_defaulted: defaulted,
+            temperature: 0.0, min_p_rel: 0.0, top_p: 1.0, seed: 0 }
+    }
+
+    #[test]
+    fn defaulted_max_new_shrinks_to_the_context_explicit_overflow_fails() {
+        assert_eq!(effective_max_new(&req(65536, true), 100_000, 368_640).unwrap(), 65536);
+        assert_eq!(effective_max_new(&req(65536, true), 330_000, 368_640).unwrap(), 38_638);
+        assert!(effective_max_new(&req(65536, false), 330_000, 368_640).is_err());
+        assert!(effective_max_new(&req(65536, true), 368_640, 368_640).is_err(), "no room at all");
+    }
+
+    #[test]
+    fn reservation_caps_the_tail_at_the_headroom() {
+        if std::env::var_os("V41_MS_KV_HEADROOM").is_some() {
+            return; // the default is what is under test
+        }
+        assert_eq!(reservation(170_000, 65536), 170_000 + 16384 + 2);
+        assert_eq!(reservation(170_000, 500), 170_502);
+    }
 }

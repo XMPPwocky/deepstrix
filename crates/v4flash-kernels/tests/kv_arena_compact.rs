@@ -91,6 +91,119 @@ fn compaction_makes_free_space_contiguous_and_preserves_rows() -> eyre::Result<(
     Ok(())
 }
 
+fn bases(arena: &KvArena, slot: u32) -> Vec<(u32, u32)> {
+    arena.stream(slot).unwrap().comp.iter().map(|r| (r.base, r.cap)).collect()
+}
+
+/// `KvArena::grow` (2026-09-27): in place into the run after the region, by
+/// relocation to a run that holds the grown size, and by compacting the store
+/// AROUND the region (lower regions pack down, higher ones pack up, both with
+/// overlapping moves through a small bounce). Every stream's comp rows and
+/// index keys must survive each of them byte for byte; a growth that cannot
+/// fit changes nothing.
+#[test]
+fn grow_in_place_relocated_and_compacted_preserves_rows() -> eyre::Result<()> {
+    use v4flash_kernels::het::kv_arena::GrowHow;
+    color_eyre::install().ok();
+    let dgpu = Device::new(std::env::var("DGPU").ok().and_then(|s| s.parse().ok()).unwrap_or(1));
+    dgpu.set_current()?;
+    let stream = Stream::new(dgpu.id)?;
+    let mut bounce_f16 = DeviceBuffer::<u16>::new(dgpu.id, 300 * 512)?; // small: forces chunked, overlapping moves
+    let mut bounce_u8 = DeviceBuffer::<u8>::new(dgpu.id, 300 * E2M1_KEY_ROW_BYTES)?;
+    // 4096 rows per store; stores are ratio 2, 2, 2, 1 (V4.1 KV sources).
+    let mut arena = KvArena::alloc(dgpu, 4, 4096)?;
+    let a = arena.reserve(1000)?;
+    let b = arena.reserve(1000)?;
+    let c = arena.reserve(1000)?;
+    assert_eq!(arena.reserved_positions(a), 1000);
+    for _ in 0..900 { arena.advance(a)?; }
+    for _ in 0..950 { arena.advance(b)?; }
+    for _ in 0..100 { arena.advance(c)?; }
+    let da = fill(&mut arena, a, 11)?;
+    let _ = fill(&mut arena, c, 29)?;
+    arena.release(c)?;
+
+    // 1. In place: c's rows freed the run right after b in every store.
+    let before = bases(&arena, b);
+    assert_eq!(arena.grow(b, 1500, &stream, &mut bounce_f16, &mut bounce_u8)?, Some(GrowHow::InPlace));
+    for (si, (&(b0, _), &(b1, c1))) in before.iter().zip(&bases(&arena, b)).enumerate() {
+        assert_eq!(b1, b0, "store {si}: in-place growth moved the region");
+        assert_eq!(c1, 1500u32.div_ceil(arena.stores[si].ratio));
+    }
+    assert_eq!(arena.reserved_positions(b), 1500);
+    for _ in 0..400 { arena.advance(b)?; } // 1350 positions: past the old cap
+    assert!(arena.can_step(b));
+    let db = fill(&mut arena, b, 17)?;
+    check(&arena, a, &da)?;
+
+    // 2. Relocated: b sits right after a, and a run elsewhere holds a's grown size.
+    let before = bases(&arena, a);
+    assert_eq!(arena.grow(a, 1200, &stream, &mut bounce_f16, &mut bounce_u8)?, Some(GrowHow::Relocated));
+    assert!(bases(&arena, a).iter().zip(&before).all(|(n, o)| n.0 != o.0), "every store must have moved a");
+    check(&arena, a, &da)?;
+    check(&arena, b, &db)?;
+
+    // 3. Too big for the free rows: refused, nothing changes.
+    let (ba, bb) = (bases(&arena, a), bases(&arena, b));
+    let free: Vec<u32> = arena.stores.iter().map(|s| s.free.free_rows()).collect();
+    assert_eq!(arena.grow(b, 4000, &stream, &mut bounce_f16, &mut bounce_u8)?, None);
+    assert_eq!((bases(&arena, a), bases(&arena, b)), (ba, bb));
+    assert_eq!(arena.stores.iter().map(|s| s.free.free_rows()).collect::<Vec<_>>(), free);
+
+    // 4. Compacted: in the ratio-1 store the free rows are split [0,1000) +
+    // [3700,4096) around a at 2500, so b (at 1000, 1350 rows written) must
+    // move DOWN over itself and a UP over itself.
+    assert_eq!(arena.grow(b, 2700, &stream, &mut bounce_f16, &mut bounce_u8)?, Some(GrowHow::Compacted));
+    let last = arena.stores.len() - 1;
+    assert_eq!(arena.stores[last].ratio, 1);
+    let (nb, na) = (bases(&arena, b)[last], bases(&arena, a)[last]);
+    assert_eq!(nb, (0, 2700), "b packs down to row 0 and grows");
+    assert_eq!(na.0 + na.1, 4096, "a packs up against the end");
+    assert_eq!(arena.stores[last].free.free_rows(), arena.stores[last].free.largest_run(), "free space is one run");
+    check(&arena, a, &da)?;
+    check(&arena, b, &db)?;
+    assert_eq!(arena.reserved_positions(b), 2700);
+    println!("grow_in_place_relocated_and_compacted_preserves_rows: OK");
+    Ok(())
+}
+
+/// `reserve` + `fill_reserved` (2026-09-27): the slot is carved before the
+/// prefill and filled after it; a reservation that cannot hold the prompt, or
+/// one already filled, is refused and left for the caller to release.
+#[test]
+fn reserve_then_fill() -> eyre::Result<()> {
+    use v4flash_kernels::het::state::HetModelState;
+    color_eyre::install().ok();
+    let dgpu = Device::new(std::env::var("DGPU").ok().and_then(|s| s.parse().ok()).unwrap_or(1));
+    dgpu.set_current()?;
+    let stream = Stream::new(dgpu.id)?;
+    let mut arena = KvArena::alloc(dgpu, 4, 4096)?;
+    let mut src = HetModelState::alloc(dgpu, dgpu, 4096)?;
+    let pos = 400u32;
+    for si in 0..arena.stores.len() {
+        let l = arena.stores[si].layer;
+        let ratio = arena.stores[si].ratio;
+        let cs = src.layers[l].compressor.as_mut().unwrap();
+        cs.n_comp = pos / ratio;
+        cs.n_index_comp = cs.n_comp;
+    }
+    let small = arena.reserve(300)?;
+    assert!(arena.fill_reserved(small, &src, pos, &stream).is_err(), "300 positions cannot hold a 400-token prompt");
+    assert_eq!(arena.live(), 1, "a refused fill leaves the reservation to the caller");
+    arena.release(small)?;
+    let slot = arena.reserve(1000)?;
+    arena.fill_reserved(slot, &src, pos, &stream)?;
+    stream.synchronize()?;
+    let s = arena.stream(slot).unwrap();
+    assert_eq!(s.pos, pos);
+    for (si, r) in s.comp.iter().enumerate() {
+        assert_eq!(r.n_comp, pos / arena.stores[si].ratio);
+    }
+    assert!(arena.fill_reserved(slot, &src, pos, &stream).is_err(), "a filled slot is not a fresh reservation");
+    println!("reserve_then_fill: OK");
+    Ok(())
+}
+
 /// Regression (2026-09-23 review): a failed `admit_from_state` used to leave
 /// its freshly admitted slot allocated with no Stream owning it, and a parked
 /// request retried every tick. Also the stricter key check: a source whose
