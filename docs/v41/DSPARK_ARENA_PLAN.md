@@ -1,9 +1,18 @@
 # DSpark on the multistream arena — build plan
 
-rev 0, 2026-09-27. Base: production branch `worktree-b2-pin-deploy` @ 04c00f3.
-Status: PLAN, not reviewed. Supersedes the verify-path economics in
-`DSPARK_VERIFY_ECONOMICS.md` / `DSPARK_WHAT_IS_LEFT.md` (they priced a prefill-shaped
-verify that no longer needs to exist).
+rev 1, 2026-09-27. Base: production branch `worktree-b2-pin-deploy` @ 04c00f3.
+Status: PLAN. Review round 1: APPROVE WITH CHANGES (15 findings, all addressed
+below; one pushed back: the production row mix, section 1.3). Supersedes the
+verify-path economics in `DSPARK_VERIFY_ECONOMICS.md` / `DSPARK_WHAT_IS_LEFT.md`
+(they priced a prefill-shaped verify that no longer needs to exist).
+
+rev 1 changes: per-store stash indexed (slot, j) (3.2); the rule for what may
+decide K (2.4); M0 is a hard go/no-go with traffic-weighted pricing (9); drafter
+gap vs the reference as M0b (9); exact renewal replay replaces the M4 estimator
+(9); ring-write ownership (4.1); dp4a regime at 8 rows and a default 8-row lane
+cap (3.7); K clamps, lane count from streams, fairness, observability (5, 6, 10);
+the acceptance-rate curve on the current step costs (1.2); the prompt-lookup
+drafter measured on production outputs (7.6).
 
 ## 0. Ground rules
 
@@ -50,25 +59,62 @@ experts/layer for k consecutive tokens of ONE stream 6.00 / 11.00 / 15.57 / 19.8
 23.89 / 27.77 (k=1..6) vs real cross-stream lane requests 11.74 (k=2) / 14.51 (k=3).
 **A verify block's rows cost the same as rows of different streams.**
 
-Speedup by acceptance profile (best K; temp-0 profiles unless noted; production
-default is temperature 1.0, which lowers E — 09-17 one prompt lost 23% of DSpark
-tok/s going 0 -> 1):
+### 1.1 The step-cost curve today
 
-| acceptance profile | E at K=5 | 1 stream, t_draft 17 ms | 1 stream, drafter hidden | 3 streams |
+After the 09-27 05:37 restart (log 05:44-05:54) the arena step by rows is, p10 /
+p50 ms: 1: 50 / 68, 2: 79 / 100, 3: 83 / 101, 4: 94 / 112; the 04:32-05:31 window
+adds 5 rows 114 / 125. p10 is the zero-paging step
+(`project_v41_step_variance_capacity_floor`). The owner's "44 tok/s at 4 rows" is
+a 91 ms step = the warm (p10) ladder. Note the flat 2-4 row stretch on it: +12 ms
+for two more rows.
+
+A lone stream's block could run nearer the warm ladder than 4 separate streams
+do (its rows share one warm working set in the pool), even though it touches as
+many distinct experts. Unmeasured; M0(d) measures a real single-stream multi-row
+step.
+
+### 1.2 Per-stream decode speed against acceptance rate
+
+One stream, i.i.d. per-draft acceptance `alpha`, `E = (1 - alpha^(K+1)) /
+(1 - alpha)`, tok/s = `E / (t(1+K) + t_draft)`, best K per cell
+(tmp `curve.py`):
+
+| alpha | warm, drafter hidden | warm, 20 ms drafter | p50, drafter hidden | p50, 20 ms drafter |
 |---|---|---|---|---|
-| in-engine 09-18 warm | 2.35 | 1.15x | 1.32x | 1.20x |
-| in-engine 09-17 best prompt | 2.91 | 1.26x | 1.43x | 1.22x |
-| reference drafter, seeded (09-13 CPU oracle) | 4.38 | 1.73x | 1.90x | 1.42x |
-| 0.90 per position | 4.69 | 1.85x | 2.03x | 1.51x |
-| 0.95 per position | 5.30 | 2.10x | 2.30x | 1.69x |
+| plain decode | 20.0 | 20.0 | 14.7 | 14.7 |
+| 0.6 | 23.9 (1.20x) | 19.6 (0.98x) | 19.4 (1.32x) | 16.5 (1.12x) |
+| 0.7 | 27.8 (1.39x) | 22.8 (1.14x) | 22.6 (1.54x) | 19.2 (1.30x) |
+| 0.8 | 32.4 (1.62x) | 26.6 (1.33x) | 26.9 (1.83x) | 23.2 (1.58x) |
+| 0.9 | 37.8 (1.89x) | 32.5 (1.63x) | 33.5 (2.28x) | 29.3 (1.99x) |
+| 0.95 | 42.7 (2.14x) | 36.8 (1.84x) | 37.8 (2.57x) | 33.1 (2.25x) |
+| 1.0 | 48.4 (2.42x) | 41.7 (2.08x) | 42.9 (2.91x) | 37.5 (2.55x) |
 
-2x on one stream needs E ~4.3 (drafter hidden) to ~5.0 (17 ms drafter) at K=5.
-All-accepted ceiling is 2.4-2.6x. So there are exactly three levers, and the plan
-pulls all three: **acceptance** (seeding, drafter temperature, K policy),
-**drafter latency** (batch, hide, shrink), **per-row cost** (section 7.3).
+Read it as: **a lone stream's ceiling is the multi-stream aggregate at 1+K rows**
+(alpha = 1 at K=3 on the warm ladder IS the 44 tok/s), scaled by the efficiency
+`E / (1+K)`. Break-even alpha on the warm ladder: ~0.45-0.5 with the drafter
+hidden, ~0.6 with a 20 ms serial drafter. Where we are: in-engine E 2.35-2.91 at
+K=5 (temp 0) = alpha 0.59-0.70; the seeded reference drafter's 4.38 = alpha 0.87.
+Acceptance is clustered in practice, so realized E sits below the i.i.d. curve
+at the same mean alpha (review finding 5); M0/M4 measure realized E directly.
+
+So there are exactly three levers, and the plan pulls all three: **acceptance**
+(the drafter gap to the reference, seeding, drafter temperature, K policy),
+**drafter latency** (a 20 ms serial drafter costs 15-20% at every alpha: batch,
+hide, shrink), **per-row cost** (7.3).
+
+### 1.3 Several streams
+
+With S streams already in the step, a draft row pays only if its acceptance
+probability beats its marginal cost relative to the tokens the step already
+yields: `P(accept) > dc(R) * S / c(R)` for the next row. Measured row mix
+(share of steps): 20:57-00:37 1 row 41%, 3 rows 31%, 4 rows 19%, 5+ 7%;
+04:32-05:31 3 rows 59%, 4 rows 34%, 5 rows 3%; 05:44-05:54 1 row 15%, 4 rows 57%.
+Production is 1-4 streams almost all the time (the review's "5-8 most of the
+time" does not match these logs). M0(b) turns this into time share by live-stream
+count from the `hub_step` evtrace.
 
 UNMEASURED: E at the production recipe (T=1.0, top_p 0.95) on real agent traffic.
-Milestone M0/M4 measure it; every number above moves with it.
+M0 measures it before anything expensive is built.
 
 ## 2. Acceptance: the exact rule and what it must consume
 
@@ -119,6 +165,45 @@ injection in `multistream.rs`), so there is no forced-token case.
 Seeds: outputs for a fixed seed differ from non-speculative runs (different RNG
 consumption); the DISTRIBUTION is identical. Document it on the API.
 
+Implementation details that the exactness depends on:
+* **Zero-mass residual.** When `p ~= q`, `p/q` can round below 1, a reject can then
+  meet `sum (p - q)+ ~= 0`; fall back to drawing from `p` (never normalize ~0).
+* **Bit-identity of the plain path.** `SparseDist` keeps `sample_row`'s
+  unnormalized f32 weights, its `z` summed in sorted order, and its vocab-order
+  cumulative walk (`multistream.rs` ~1262-1289), so `draw` reproduces today's
+  sampler exactly (G-RS2); f64 probabilities are derived only for the RS ratio
+  and the residual.
+* **Device-side draft sampling is tested**: a chi-square that the exported
+  `(id, q)` pairs match the device's empirical draw frequencies (G-RS3).
+
+### 2.4 What may decide K (and what may not)
+
+Choosing how many drafts to verify is lossless only under this rule: whether
+`d_j` is verified may depend on the prefix, on `d_{<j}`, on drafter state that is
+not derived from the draw of `d_j`, and on independent randomness, never on the
+drawn value of `d_j` itself. Counter-example (review finding 2): `p = q`, verify
+`d` only when `d = a`; then `P(emit a) = p(a)(2 - p(a)) != p(a)`.
+
+* Allowed: `P_s(k)` from calibrated confidence (conf_i reads the markov row of
+  `d_{i-1}`, not `d_i`), the stream's acceptance history, load, stop/length caps.
+* Forbidden for sampled drafts: gating on `q_j(d_j)`, dropping unlikely draws,
+  "don't verify d_j because it is EOS".
+* Point-mass drafts are a deterministic function of drafter state, so gating on
+  the draft value is allowed there (the conditional emitted distribution is `p`
+  whether or not the row is verified). Keep the policy code draft-value-blind
+  anyway, so switching to sampled drafts cannot silently break it.
+* G-RS1 carries a negative control: a draft-value-dependent K rule must FAIL the
+  chi-square (proves the test has power).
+
+### 2.5 Invariant: `p_j` must not depend on `d_j`
+
+It holds today: a stream's rows stay in one lane, the cache prior reads the
+mirror as it was before the call (`b2_mirror.rs` ~239-262), and the pending
+overlay only comes from other lanes. The one LSB-level exception is the kernel
+regime set by the lane's row count (3.7), which depends on K. Rule for future
+work: no batch-level decision (catch-all, substitution overlays, pin grants) may
+read a stream's own later rows in the same step.
+
 ## 3. Arena: several rows of one stream in one step
 
 Facts (V4.1, `config.rs` ~128-146): layers 0-1 dense, 2-19 ratio 2, 20-39 ratio 1;
@@ -149,8 +234,13 @@ is the compressor accumulator.
 3.2 **Compressor accumulator: stash, gather, pool, commit.** Today every row of a
     stream would state-write into, and pool out of, the stream's ONE block
     (`state_base_per = slot*ratio*width`); at ratio 1 even K=1 races. Replace:
-    (a) state-write into a per-ROW stash `[rows_cap x ratio x width]`
-    (`state_base_per[row] = row*ratio*width`, same launch count);
+    (a) state-write into a stash, ONE PER RATIO-2 STORE (L2/8/14), owned by
+    `KvArena` next to that store's `state_kv` and indexed by (slot, j):
+    `base = (slot * (1 + K_max) + j) * ratio * width`. Not by lane-local row: lanes
+    interleave per layer and both have a row 0, and a single shared stash would be
+    overwritten by the next KV-source layer before the post-accept commit (review
+    finding 1; the KNOWN_BUGS #27 class). The ratio-1 store (L20) needs no stash:
+    its pool reads only the row itself;
     (b) build per-fire snapshots with the existing `compressor_snapshot_gather`
     (`compressor_state_snapshot.hip` ~49-85: slot r of boundary k takes the stash
     row when `p >= pos0`, else the carried block), as a `_rows` variant or one
@@ -180,12 +270,19 @@ is the compressor accumulator.
     ~500-511), i.e. about half of all ratio-2 accepts. Do not use the
     process-global `SpeculativeAppend` flag either; it changes pager policy.
 
-3.5 **A stream's rows stay in one lane.** Each lane's tables are built from
-    pre-step arena state, `sd.kv_cur` is shared scratch, and `ready_first` gives no
-    cross-lane layer ordering, so a split stream is wrong. Pass explicit
-    stream-aligned cut points into all three drivers (pipelined `b.div_ceil(2)`
-    ~2900; lanes/ready_first `offs` ~3087 / ~3238) and back to the server's logits
-    slicing (`multistream.rs` ~913-941), balancing rows.
+3.5 **A stream's rows stay in one lane (default).** Per-row tables are pure
+    functions of pre-step counters and the row's offset j, so a lane-B slice built
+    with the global j would be correct; the real blockers are the gather reading
+    the shared `sd.kv_cur` and `ready_first`'s missing per-layer ordering between
+    lanes. Pass explicit stream-aligned cut points into all three drivers
+    (pipelined `b.div_ceil(2)` ~2900; lanes/ready_first `offs` ~3087 / ~3238) and
+    back to the server's logits slicing (`multistream.rs` ~913-941), balancing rows.
+    Choose the lane count from the number of STREAMS, not rows:
+    `V41_MS_PIPELINE_MIN_ROWS` counts rows and would split a lone stream's block.
+    Option, after M0(d) measures a single-lane 6-row step: if the gather reads the
+    per-store stash instead of `kv_cur`, a lone stream's block can span two lanes
+    in the lockstep `pipelined` driver, recovering the box-2 overlap exactly where
+    DSpark is worth most.
 
 3.6 **Head.** `head_rows` returns full logits per row. `forward_head_batch` covers
     <= 16 rows per lane (`HEAD_BATCH_MAX`); above that each row falls back to its
@@ -193,9 +290,14 @@ is the compressor accumulator.
     head by 16. ~0.5 MB of logits per row to the host.
 
 3.7 **Numerics, stated honestly.** Kernel families switch on lane row count
-    (`mhc_pre_scaled_for` <= 8, `attn_dec_score_for` / dp4a / head <= 16,
-    `prefill_f32_matvec` <= 64, and the indexer's gathered path for the whole lane
-    once any row passes 512 comp rows). A verify row is bit-identical to a one-row
+    (`mhc_pre_scaled_for` <= 8; `small_b_dense_dp4a` <= 8 for q_a, the shared
+    expert and Engram, which switch to non-bit-exact f16x WMMA above
+    (`dispatch.rs` ~256-262); the q_b/wo_a/wo_b dp4a arm and `attn_dec_score_for`
+    and the head <= 16; `prefill_f32_matvec` <= 64; the indexer's gathered path
+    for the whole lane once any row passes 512 comp rows). Production lanes are
+    <= 8 rows today, so 9-16-row lanes would be a numerics regime decode never
+    runs: **cap rows per lane at 8 by default** (G5f covers 9 rows for when the cap
+    is lifted). A verify row is bit-identical to a one-row
     step only while its lane stays in the one-row regime; otherwise it differs at
     LSB level, the same difference a stream already sees today between running
     alone and beside co-rows. Rejection sampling is exact with respect to the `p`
@@ -224,11 +326,24 @@ mHC 1.0), wall `19.8 + 2.55 n` ms. It is single-sequence (`MtpCtx` on
     ring (128 window + 5 transient block rows); `embed()` overwrites the hidden
     and the markov carry on every forward, so nothing else persists. The ring row
     for position `t` is written from the entry output of `main_hidden(t)`.
-    ACTION: one A/B confirming `ring_write_only` == `advance_ring` state (the
-    legacy code still spends a full forward on the last accepted row "for the
-    carry"); if it holds, every ring update is a cheap row write. Arena layout:
-    one `[n_slots x 133 x 512]` buffer per drafter layer (~3.4 MB for 8 slots),
-    per-stream base + `ring_writes`, in `KvArena` next to the stream's KV.
+    The review confirmed from code that `embed()` resets h and the carry and that
+    `ring_write_only` runs `entry()` first, so ring rows + `ring_writes` are the
+    only persistent state; make it a deterministic bitwise test (ring after N
+    steps == a pure `ring_write_only` replay), not an A/B.
+    **Who writes which row** (else the last kept row is written twice: a duplicate
+    key and a drifting slot, invisible in output, visible only as lower E): the
+    draft forward itself writes the row for its own `pos` (`mtp.rs` ~1110) and
+    bumps `ring_writes` (~935). So after a block with `keep` kept rows,
+    `ring_write_only` writes rows 0..keep-2 and the next draft writes row keep-1;
+    a stream that will NOT draft next step writes all `keep` rows; seeding writes
+    every captured prefill row except the last (the legacy pairing,
+    `engine_worker.rs` ~2921). A ring write is not free: `entry()` runs
+    `main_proj` (~83 MB of weights) per row, so batch ring writes across rows and
+    streams with `matvec_bpack`.
+    Layout: one `[n_slots x 133 x 512]` f16 buffer per drafter layer (~3.4 MB for
+    8 slots), per-stream base + `ring_writes`. It lives on the iGPU with the
+    drafter, not in `KvArena`'s dGPU allocation; `KvArena` only owns the
+    per-stream indices.
 
 4.2 **One drafter launch for all speculating streams.** B = 5 x S_spec rows.
     Dense GEMVs already B-pack (`GEMV_BPACK_MAX` = 16, so 3 streams per chunk;
@@ -266,10 +381,18 @@ mHC 1.0), wall `19.8 + 2.55 n` ms. It is single-sequence (`MtpCtx` on
     routed MoE, the ~17 ms/row term of the arena step; for a lone stream it runs
     after the step (no overlap), with 2+ lanes it can overlap the other lane but
     will contend — measure in M4. Its 7.93 GB comes out of box 1's expert pool:
-    ~420 slots, ~9.5% of 4,450 (pool 78 -> ~70 GiB); M4's shadow run prices the
-    extra misses for every stream. dGPU cost ~40 MB.
+    ~420 slots, ~9.5% of 4,450 (pool 78 -> ~70 GiB); M0(c) prices that with no
+    drafter at all (a live A/B of a 420-slot smaller pool). dGPU cost: ~40 MB
+    today, plus ~66 MB once the markov embedding (129,280 x 256 f16, host-side
+    today) moves to the device for on-device draft sampling (4.3).
 
-4.8 **Drafter latency levers** (section 7.2): its attention is a per-query loop
+4.8 **Drafter KV quantization is unverified for V4.1.** The drafter's ring and
+    block KV go through the V4-style `fp8.launch_kv_post_fused` (`mtp.rs` ~1085 /
+    ~1122), flagged in the 09-24 architecture review and never checked against
+    V4.1's `fp4kv.launch_fp8_window`. A mismatch would only lower acceptance
+    (rule 3), which is exactly why it could have hidden. M0b checks it.
+
+4.9 **Drafter latency levers** (section 7.2): its attention is a per-query loop
     because the batched attention kernels compile out the weighted sum on gfx1151;
     a 133-key B=5 attention should cost well under 1 ms, not 8.5. That alone takes
     the draft from ~20 to ~12 ms.
@@ -296,6 +419,14 @@ mHC 1.0), wall `19.8 + 2.55 n` ms. It is single-sequence (`MtpCtx` on
     exactly this bug on a mid-block stop — do not port it).
 5.6 **Trap**: a legacy prefill leaves `mtp_capture_rows` = 128 on the scratch;
     only the verify clears it, and the arena guard would then fail a step.
+5.7 **Clamp K before `tables()`**: `K_s <= max_new - completion - 1` and <= the
+    stream's region headroom (raw and every store). `tables()` returns `Err` on a
+    full region, and a failed step aborts every stream (`multistream.rs` ~210).
+5.8 **Failure domain**: a drafter error sets that stream's K to 0 (plain decode),
+    never `abort_all`; a drafter that keeps failing is disabled with a log line.
+5.9 **Snapshots without residuals**: checkpoint snapshots taken under CED carry
+    no layer 37-39 residuals; save them as "no ring" and let the stream start
+    cold (seeded by its next prefill).
 
 ## 6. K policy
 
@@ -308,11 +439,23 @@ Per step, choose `K_s` for every stream to maximize expected tokens per ms:
 `P_s(k)` = probability the first k drafts are all accepted, from the drafter's
 confidence head, calibrated ONLINE at the production temperature (bucket conf ->
 observed acceptance, EWMA; the 09-17 temp-0 calibration was [4,inf) 0.97,
-[0,1) 0.46). Greedy: add candidate rows (s, k) in decreasing `P_s(k)` order while
-the step's tokens/ms rises. Consequences: a lone stream gets deep blocks; as
-streams arrive K shrinks toward 0, so speculation only ever fills spare batch
-capacity; an unconfident stream gets K=0 while a confident one next to it gets 5.
-Choosing K from anything known before the verify is lossless.
+[0,1) 0.46). Every input obeys the rule of 2.4.
+
+Two stages, because `t_draft` is paid before conf exists:
+1. **Draft or not**, per stream, from its recent realized acceptance and the
+   current load (a stream whose recent blocks accept little is not drafted, and
+   saves its share of the drafter launch).
+2. **How deep**, per drafted stream, from conf: evaluate the step's tokens/ms at
+   every candidate R rather than stopping at the first decrease, because `c(R)` has
+   jumps (the lane split, the 8- and 16-row kernel switches) and flat stretches
+   (warm ladder: 2-4 rows cost +12 ms).
+
+Consequences: a lone stream gets deep blocks; as streams arrive K shrinks toward
+0; an unconfident stream gets K=0 beside a confident one at 5. **Fairness**: the
+objective is aggregate tokens/ms, so one confident stream's K lengthens every
+other stream's step. Bound it: no stream's expected per-token latency may rise
+more than a set fraction (start 10%) over its K=0 value, and report the
+per-stream tok/s distribution, not only the aggregate.
 
 Hard caps: K <= 5 (block size), rows per lane request <= `PIN_DECODE_MAX_ROWS` =
 16 (above it box 2 treats the request as prefill-shaped: staging band, no pins —
@@ -331,6 +474,17 @@ Hard caps: K <= 5 (block size), rows per lane request <= `PIN_DECODE_MAX_ROWS` =
 7.4 **Issue draft rows' Engram gathers at draft time** (inputs known one step early).
 7.5 Later: several candidate drafts per position with recursive rejection sampling
     (still exact); only worth it once misses are near zero.
+7.6 **A prompt-lookup (n-gram) drafter, MEASURED on production outputs: weak.**
+    Point-mass drafts that are a deterministic function of the prefix can be
+    replayed exactly over sampled outputs (a block accepts exactly the leading
+    drafts that equal the realized tokens). Replay over the 254 production
+    snapshots (32 conversations, 912 unique assistant spans, 830K generated
+    tokens including reasoning; tmp `ngram_replay.py`, `ngram_cond.py`), priced on
+    the 20:57-00:37 mean ladder: fixed K gives E 1.2-1.7 and at best 1.08x on a
+    lone stream; conditioning K on the suffix-match length (none 51% of positions,
+    3-5 tokens 31% with P(first accepted) 0.49, >= 24 tokens 3.8% with 0.93) gives
+    at best E 1.35 / 1.10x. So it is a zero-cost TEST VEHICLE for M2 on real
+    traffic (M2.5), not a fallback worth shipping for speed.
 
 ## 8. Fidelity gates
 
@@ -338,9 +492,16 @@ Hard caps: K <= 5 (block size), rows per lane request <= `PIN_DECODE_MAX_ROWS` =
   families (point-mass q, disjoint supports, p == q, truncated q, K = 1..5, stops
   mid-block) — the emitted-sequence distribution matches direct sampling from `p`
   (chi-square over >= 1e6 draws per case).
+  Includes the 2.4 negative control (a draft-value-dependent K rule must fail)
+  and the zero-mass residual case.
 * **G-RS2**: refactored plain sampler bit-identical to today's `sample_row`.
+* **G-RS3** (GPU): device-side draft sampling, exported `(id, q)` vs empirical
+  draw frequencies, chi-square.
+* **G-RING** (GPU): after N accept/reject steps the drafter rings are bitwise equal
+  to a pure `ring_write_only` replay of the kept rows (catches the double write
+  of 4.1).
 * **G5f** (GPU, server down; extends `tests/multistream_step.rs`): same-stream
-  block invariance in three runs: `spec` (each step feeds `[next, d_1..d_K]`,
+  block invariance in three runs: `spec` (each step feeds `[next, d_0..d_{K-1}]`,
   drafts = the forced continuation), `alone` (one-row steps), `spec-reject` (rows
   past a scheduled `keep` are wrong tokens, then commit + truncate). Row j of
   `spec` equals `alone` at that position (bit-exact within a kernel regime,
@@ -351,7 +512,9 @@ Hard caps: K <= 5 (block size), rows per lane request <= `PIN_DECODE_MAX_ROWS` =
   a block crossing `KV_CACHE_ROWS` (compaction), positions crossing 512 comp rows
   (pos 512 at ratio 1, 1024 at ratio 2) so the indexer fires mid-stream, the CED
   decoder window, every index-source layer, mixed steps (A at K=3 beside B, C at
-  K=0) equal to their alone runs, all three lane drivers with streams whole.
+  K=0) equal to their alone runs, all three lane drivers with streams whole,
+  **two lanes that both commit at odd P in the same step** (the stash-collision
+  case of 3.2), and a 9-row lane (the regime above the 8-row cap).
   Plus a CPU unit test of the multi-row tables.
 * **Golden gate** (`tests/v41_golden_gate.rs`, arena path): a speculative block
   with teacher-forced drafts is the golden transcript, so K>0 must report the same
@@ -367,30 +530,57 @@ Hard caps: K <= 5 (block size), rows per lane request <= `PIN_DECODE_MAX_ROWS` =
 Each milestone ends in a measurement or a gate. GPU gates load the model, so they
 need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
 
-* **M0: acceptance at the production recipe** (parallel with M1; one server-down
-  window; the existing legacy driver plus a small hook). Agentic suite at
-  T=1.0/top_p 0.95 and at T=0; per depth, log `p(d)` (point-mass acceptance) and
-  `sum min(p, q_tau)` for a `tau_d` sweep from the on-device exit logits; seeded
-  vs cold ring. Also the one A/B of section 4.1 (`ring_write_only` ==
-  `advance_ring`). Output: the E(K) distribution that says how far M5-M7 are
-  worth taking. Skippable if the owner's acceptance data already covers T=1.
+* **M0: go/no-go, before M2 or M3** (parallel with M1). Nothing expensive is built
+  until these are in hand:
+  (a) **realized E(K)** at T=1.0/top_p 0.95 and at T=0 on an agentic suite, with
+  full seeding, from the existing legacy driver plus a small hook (one
+  server-down window): per block the accepted count, `p(d)`, and `sum min(p,
+  q_tau)` for a `tau_d` sweep from the on-device exit logits;
+  (b) **the traffic mix**: time share by live-stream count, from the `hub_step`
+  evtrace (no server change);
+  (c) **the price of the drafter's memory with no drafter built**: a live A/B of
+  box 1's pool 420 slots smaller (`V41_PAGER_POOL_GB` 78 vs ~70; a restart,
+  owner's call);
+  (d) **a real single-stream multi-row step**: `V41_MS_PIPELINE_MIN_ROWS=7` so
+  1-6-row steps stay single-lane, costed on live traffic or in the window;
+  (e) the traffic-weighted expected gain from (a)-(d) against a stated threshold
+  (start: >= 1.2x on one-stream time, and no loss at the measured mix).
+  If the owner's own acceptance data already covers (a) at T=1, (a) shrinks to a
+  check; (b)-(e) still gate.
+* **M0b: close the drafter gap to the reference** (CPU oracle, no GPU window
+  beyond M0's): score the engine drafter against DeepSeek's unmodified drafter
+  on the same transcript, seeded, per depth d1-d5 (`DSPARK_DRAFTER_GAP.md`:
+  engine 2.789 vs oracle 3.281 unseeded / 4.382 seeded; the markov head gives
+  +0.82 in the engine vs +2.00 in the reference); check the drafter KV
+  quantization (4.8). Free for fidelity (rule 3), up to ~+50% on E.
+* **M0c: price the per-row cost** (7.3): pure measurement from `ms.stage` and a
+  microbench; it also speeds plain multi-stream decode, so it is not DSpark-only.
 * **M1: rejection-sampling core** (host only): `target_dist` + `draw` refactor of
-  `sample_row`, the block procedure of 2.3, G-RS1 and G-RS2.
+  `sample_row`, the block procedure of 2.3, G-RS1 (with its negative control),
+  G-RS2.
 * **M2: arena multi-row streams, no drafter**: 3.1-3.6; G5f, the tables unit
   test, the golden gate with teacher-forced blocks (K>0 must equal K=0 KL).
-* **M3: drafter in the arena**: rings in `KvArena`, batched multi-stream drafter,
+* **M2.5: prompt-lookup drafter in production** (7.6): point-mass, zero drafter
+  cost, exact under rule 1. Validates the multi-row path end to end on real
+  traffic before the drafter build; expected ~1.1x, so it is a test, not a win.
+* **M3: drafter in the arena**: rings on the iGPU (indices in `KvArena`), batched multi-stream drafter,
   capture on arena rows, device-side sampling exit exporting top-M `q`, seeding in
   `PrefillJob` (both lanes, ring-only), ring in snapshots. Tests: batched drafter
   == per-stream drafter; point-mass drafts == the legacy drafter's for identical
   inputs.
-* **M4: shadow in production** (`V41_MS_DSPARK=shadow`): drafts and `q` computed,
-  nothing acted on. Acceptance on REAL traffic at the production temperature from
-  an unbiased estimator: with emitted tokens `y_i` and drafts `d_i`,
-  `X_k = prod_{i<k-1} [1{y_i = d_i} * a_i / p_i(d_i)] * a_{k-1}`, where
-  `a_i = min(1, p_i(d_i)/q_i(d_i))` (point-mass: `prod_{i<k-1} 1{y_i = d_i} *
-  p_{k-1}(d_{k-1})`); `E[X_k]` = P(first k drafts accepted). Also measures the
-  drafter's wall cost, iGPU contention, and what the smaller box-1 pool costs
-  every stream. Go/no-go for M5.
+* **M4: shadow in production** (`V41_MS_DSPARK=shadow`, time-boxed or sampled,
+  since shadow costs throughput): drafts computed, nothing acted on. **Exact
+  renewal replay** for point-mass drafts: along the realized path `y`, a block
+  started at t accepts exactly the leading drafts equal to `y`, so the shadow runs
+  the drafter only at the block starts accept mode would have used (next start =
+  t + accepted + 1) and reports realized E and the K policy's step times with zero
+  variance given the path. Per-position estimators overstate realized E when
+  acceptance is clustered (review finding 5: 50% easy / 50% hard gives 3.5 per
+  position vs 1.71 realized). For sampled `q`: `min(1, q_i(y_i | y_{i-1}) /
+  p_i(y_i))` with a teacher-forced markov prev, plus a dynamic program over block
+  starts. The per-position `X_k` estimator is kept only for confidence
+  calibration. Also measures the drafter's wall cost and iGPU contention.
+  Go/no-go for M5.
 * **M5: accept mode, simple K**: point-mass drafts; K=5 for a lone stream and a
   fixed row budget otherwise; A/B against off per `feedback_e2e_tokps_noise_floor`
   (suites at production temperature, the distribution of E, never one prompt).
@@ -408,8 +598,8 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
 * **R1 Acceptance at T=1 on real agent traffic is unmeasured** (M0/M4). Every
   speedup in section 1 moves with it.
 * **R2 The drafter costs every stream ~9.5% of box 1's pool.** Net value depends
-  on the traffic mix (how much time one stream runs alone). M4 prices it; drafter
-  quantization (7.2) shrinks it.
+  on the traffic mix (how much time one stream runs alone). M0(c) prices it before
+  anything is built; drafter quantization (7.2) shrinks it.
 * **R3 iGPU contention** between the drafter and box 1's routed MoE.
 * **R4 Kernel-regime switches with larger lanes** (3.7): LSB numerics, plus perf
   cliffs above 16 rows per lane in the head (3.6) and in box 2's pin eligibility
@@ -418,7 +608,18 @@ need the hub down (`tests/v41_golden_gate.rs`, `tests/multistream_step.rs`).
   growth, the stash, and per-lane scratch sized for more rows must be counted
   before M2.
 * **R6 Snapshot format** gains the drafter ring (versioned).
-* **R7 Wasted paging**: rejected rows still page their experts and take cache-prior
-  swaps; only the K policy's cost curve sees it.
-* **Open**: DSpark on by default for every request, or per-request opt-out? Does
-  the drafter's markov bias make `q_i` depend on `d_{i-1}` only (assumed in 2.2)?
+* **R7 Wasted paging**: rejected rows still page their experts, take cache-prior
+  swaps and count toward box-2 pins, which pollutes later steps; `c(R)` does not
+  capture that, so the shadow replay (M4) must report pool churn with and
+  without speculation.
+* **R8 Host RS cost**: each row is a ~0.5 MB D2H plus a survivor scan; at 30-48
+  rows that can reach 10+ ms. Measure `sample_ms` against rows in M2; move the
+  survivor extraction on device if it binds.
+* **R9 Graph cache**: keyed by (layer, rows, lane) (`forward_prefill.rs` ~1199), it
+  grows with the new range of row counts; count its memory with R5.
+* **Observability** (needed by M4 anyway): new `HUB_STEP` fields spec_streams,
+  spec_rows, accepted, emitted, draft_ms, ring_ms, commit_ms, rs_host_ms; a per-
+  block event kind with K, accepted, conf, `p(d)`, `q(d)`.
+* **Resolved**: `q_i` depends on `d_{i-1}` only, through the markov row; the
+  transformer logits are computed once per block (review).
+* **Open**: DSpark on by default for every request, or per-request opt-out?
