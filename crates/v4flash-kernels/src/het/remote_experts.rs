@@ -1900,6 +1900,8 @@ pub mod knobs {
     static MISS_PAR: AtomicUsize = AtomicUsize::new(1);
     static PARK: AtomicBool = AtomicBool::new(false);
     static ROUTE_URGENCY: AtomicBool = AtomicBool::new(false);
+    /// `V41_B2_PREFILL_ROUTE` (`split` default | `mirror`): see `prefill_route_split`.
+    static PREFILL_ROUTE_SPLIT: AtomicBool = AtomicBool::new(true);
     /// Every shard's mirror opened (`set_mirror_ok`, at `enable_paging`).
     static MIRROR_OK: AtomicBool = AtomicBool::new(false);
     static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -1920,8 +1922,18 @@ pub mod knobs {
             );
             PARK.store(std::env::var("V41_B2_PARK").as_deref() == Ok("1"), Relaxed);
             ROUTE_URGENCY.store(std::env::var("V41_B2_ROUTE").as_deref() == Ok("urgency"), Relaxed);
+            PREFILL_ROUTE_SPLIT.store(std::env::var("V41_B2_PREFILL_ROUTE").as_deref() != Ok("mirror"), Relaxed);
         });
     }
+    /// `V41_B2_PREFILL_ROUTE=split` (default) | `mirror`; file key
+    /// `prefill_route`. Under `route=urgency` a PREFILL-shaped pass's demand
+    /// reads (and its early-page / park reads, `PfJob::stage`) are STRIPED
+    /// across both drives (`ExpertRoute::split`) instead of going wholly to
+    /// the mirror like decode's demand reads: a prefill chunk's ~200 reads
+    /// per layer otherwise monopolise the SN5000 alongside decode's demand
+    /// reads while the E100 idles (owner's decision, 2026-09-27). `mirror`
+    /// restores the pre-09-27 routing. No effect under `route=split`.
+    pub fn prefill_route_split() -> bool { init(); PREFILL_ROUTE_SPLIT.load(Relaxed) }
     pub fn merge() -> bool { init(); MERGE.load(Relaxed) }
     pub fn merge_wait_us() -> u64 { init(); MERGE_WAIT_US.load(Relaxed) }
     pub fn miss_par() -> usize { init(); MISS_PAR.load(Relaxed).clamp(1, 16) }
@@ -1988,13 +2000,16 @@ pub mod knobs {
                 ("route", "urgency") => ROUTE_URGENCY.store(true, Relaxed),
                 ("route", "split") => ROUTE_URGENCY.store(false, Relaxed),
                 ("route", v) => eprintln!("expertd: knobs: unknown route={v:?} (want split|urgency); unchanged"),
+                ("prefill_route", "split") => PREFILL_ROUTE_SPLIT.store(true, Relaxed),
+                ("prefill_route", "mirror") => PREFILL_ROUTE_SPLIT.store(false, Relaxed),
+                ("prefill_route", v) => eprintln!("expertd: knobs: unknown prefill_route={v:?} (want split|mirror); unchanged"),
                 ("mirror_frac", v) => { if let Ok(f) = v.parse::<f32>() { v4flash_core::hf_v41::set_expert_mirror_frac(f) } }
                 _ => {}
             }
         }
-        format!("knobs reloaded from {p}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={}", park(),
+        format!("knobs reloaded from {p}: park={} merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={}", park(),
             merge(), merge_wait_us(), miss_par(), coalesce(), v4flash_core::hf_v41::expert_mirror_frac(),
-            if route_urgency() { "urgency" } else { "split" })
+            if route_urgency() { "urgency" } else { "split" }, if prefill_route_split() { "split" } else { "mirror" })
     }
 }
 
@@ -2013,9 +2028,10 @@ pub fn install_knobs_toggle() -> String {
     // it while passing `V41_B2_MISS_PAR=4` on the command line runs at 4 and looks
     // like it is running at 1 (found by the 2026-09-22 audit, B4).
     let _ = knobs::reload();
-    let init = format!("knobs: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} (SIGUSR2 reloads {})",
+    let init = format!("knobs: merge={} wait_us={} miss_par={} coalesce={} mirror_frac={:.3} route={} prefill_route={} (SIGUSR2 reloads {})",
         knobs::merge(), knobs::merge_wait_us(), knobs::miss_par(), knobs::coalesce(),
-        v4flash_core::hf_v41::expert_mirror_frac(), if knobs::route_urgency() { "urgency" } else { "split" }, knobs::path());
+        v4flash_core::hf_v41::expert_mirror_frac(), if knobs::route_urgency() { "urgency" } else { "split" },
+        if knobs::prefill_route_split() { "split" } else { "mirror" }, knobs::path());
     unsafe { signal(SIGUSR2, knobs_signal); }
     init
 }
@@ -3622,11 +3638,13 @@ impl ExpertShard {
                     // A job still speculative at read start reads in chunks and
                     // yields to urgent reads (io_throttle); certain ones do not.
                     // Under urgency routing: certain -> the mirror, speculative
-                    // -> the primary, and neither is throttled.
-                    let route = match (urgency, done.certain) {
-                        (false, _) => v4flash_core::hf_v41::ExpertRoute::split(),
-                        (true, true) => v4flash_core::hf_v41::ExpertRoute::mirror_only(),
-                        (true, false) => v4flash_core::hf_v41::ExpertRoute::primary_only(),
+                    // -> the primary, and neither is throttled; a PREFILL
+                    // chunk's own reads (`stage`) are striped across both
+                    // drives like its demand reads (`knobs::prefill_route_split`).
+                    let route = match (urgency, done.certain, stage && knobs::prefill_route_split()) {
+                        (false, _, _) | (true, _, true) => v4flash_core::hf_v41::ExpertRoute::split(),
+                        (true, true, false) => v4flash_core::hf_v41::ExpertRoute::mirror_only(),
+                        (true, false, false) => v4flash_core::hf_v41::ExpertRoute::primary_only(),
                     };
                     v4flash_core::io_throttle::set_background((!done.certain && !urgency).then_some(((layer as u64) << 16) | e as u64));
                     let r = Self::read_miss_into(&owner, direct, gpu_repack, layer, e, bpe, b0, b1, b2, route);
@@ -4433,8 +4451,12 @@ impl ExpertShard {
             };
             // (offsets, coalesced, evtrace: read start, read end, role (start, end) x3)
             type R = Result<([Option<(usize, usize, u32, u32)>; 3], bool, [f64; 8]), String>;
-            // Demand reads: wholly from the mirror under urgency routing.
-            let route = if knobs::route_urgency() {
+            // Demand reads: wholly from the mirror under urgency routing --
+            // except a PREFILL-shaped pass's, striped across both drives
+            // (`knobs::prefill_route_split`, default): a chunk's ~200 reads
+            // per layer otherwise monopolise the SN5000 alongside decode's
+            // demand reads while the E100 idles.
+            let route = if knobs::route_urgency() && !(prefill_shaped && knobs::prefill_route_split()) {
                 v4flash_core::hf_v41::ExpertRoute::mirror_only()
             } else {
                 v4flash_core::hf_v41::ExpertRoute::split()
